@@ -1,5 +1,3 @@
-# LogicTest: default distsql
-
 # Check that the various things in a table definition are properly escaped when
 # printed out.
 statement ok
@@ -23,11 +21,11 @@ query TT
 SHOW CREATE TABLE ";--notbetter"
 ----
 ";--notbetter"  CREATE TABLE ";--notbetter" (
-                x INT NOT NULL,
-                y INT NULL,
+                x INT8 NOT NULL,
+                y INT8 NULL,
                 "welp INT); -- concerning much
 DROP USER dumpty;
-CREATE TABLE unused (x " INT NULL,
+CREATE TABLE unused (x " INT8 NULL,
   CONSTRAINT "getmeoutofhere PRIMARY KEY (x ASC)); -- saveme!
 DROP USER madhatter;
 CREATE TABLE unused4(x INT, CONSTRAINT woo " PRIMARY KEY (x ASC),
@@ -43,23 +41,23 @@ CREATE TABLE unused (x ")
 
 # Check that view creates handle strange things properly.
 statement ok
-CREATE VIEW ";--alsoconcerning" AS SELECT @1, @2, @3 FROM ";--notbetter"
+CREATE VIEW ";--alsoconcerning" AS SELECT @1 AS a, @2 AS b, @3 AS c FROM ";--notbetter"
 
 query TT
 SHOW CREATE VIEW ";--alsoconcerning"
 ----
-";--alsoconcerning"  CREATE VIEW ";--alsoconcerning" ("@1", "@2", "@3") AS SELECT @1, @2, @3 FROM test.";--notbetter"
+";--alsoconcerning"  CREATE VIEW ";--alsoconcerning" (a, b, c) AS SELECT @1 AS a, @2 AS b, @3 AS c FROM test.public.";--notbetter"
 
 # Check that "create table as" handles strange things properly.
 statement ok
-CREATE TABLE ";--dontask" AS SELECT @1, @2, @3 FROM ";--notbetter"
+CREATE TABLE ";--dontask" AS SELECT @1 AS a, @2 AS b, @3 AS c FROM ";--notbetter"
 
 query TT
 SHOW CREATE TABLE ";--dontask"
 ----
 ";--dontask"  CREATE TABLE ";--dontask" (
-              "@1" INT NULL,
-              "@2" INT NULL,
-              "@3" INT NULL,
-              FAMILY "primary" ("@1", "@2", "@3", rowid)
+              a INT8 NULL,
+              b INT8 NULL,
+              c INT8 NULL,
+              FAMILY "primary" (a, b, c, rowid)
 )

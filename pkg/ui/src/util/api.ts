@@ -1,9 +1,18 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 /**
  * This module contains all the REST endpoints for communicating with the admin UI.
  */
 
 import _ from "lodash";
-import "whatwg-fetch"; // needed for jsdom?
 import moment from "moment";
 
 import * as protos from "src/js/protos";
@@ -20,6 +29,9 @@ export type TableDetailsResponseMessage = protos.cockroach.server.serverpb.Table
 
 export type EventsRequestMessage = protos.cockroach.server.serverpb.EventsRequest;
 export type EventsResponseMessage = protos.cockroach.server.serverpb.EventsResponse;
+
+export type LocationsRequestMessage = protos.cockroach.server.serverpb.LocationsRequest;
+export type LocationsResponseMessage = protos.cockroach.server.serverpb.LocationsResponse;
 
 export type NodesRequestMessage = protos.cockroach.server.serverpb.NodesRequest;
 export type NodesResponseMessage = protos.cockroach.server.serverpb.NodesResponse;
@@ -44,6 +56,9 @@ export type ClusterResponseMessage = protos.cockroach.server.serverpb.ClusterRes
 
 export type TableStatsRequestMessage = protos.cockroach.server.serverpb.TableStatsRequest;
 export type TableStatsResponseMessage = protos.cockroach.server.serverpb.TableStatsResponse;
+
+export type NonTableStatsRequestMessage = protos.cockroach.server.serverpb.NonTableStatsRequest;
+export type NonTableStatsResponseMessage = protos.cockroach.server.serverpb.NonTableStatsResponse;
 
 export type LogsRequestMessage = protos.cockroach.server.serverpb.LogsRequest;
 export type LogEntriesResponseMessage = protos.cockroach.server.serverpb.LogEntriesResponse;
@@ -74,8 +89,35 @@ export type RangeLogRequestMessage =
 export type RangeLogResponseMessage =
   protos.cockroach.server.serverpb.RangeLogResponse;
 
-export type CommandQueueRequestMessage = protos.cockroach.server.serverpb.CommandQueueRequest;
-export type CommandQueueResponseMessage = protos.cockroach.server.serverpb.CommandQueueResponse;
+export type SettingsRequestMessage = protos.cockroach.server.serverpb.SettingsRequest;
+export type SettingsResponseMessage = protos.cockroach.server.serverpb.SettingsResponse;
+
+export type UserLoginRequestMessage = protos.cockroach.server.serverpb.UserLoginRequest;
+export type UserLoginResponseMessage = protos.cockroach.server.serverpb.UserLoginResponse;
+
+export type StoresRequestMessage = protos.cockroach.server.serverpb.StoresRequest;
+export type StoresResponseMessage = protos.cockroach.server.serverpb.StoresResponse;
+
+export type UserLogoutResponseMessage = protos.cockroach.server.serverpb.UserLogoutResponse;
+
+export type StatementsResponseMessage = protos.cockroach.server.serverpb.StatementsResponse;
+
+export type DataDistributionResponseMessage = protos.cockroach.server.serverpb.DataDistributionResponse;
+
+export type EnqueueRangeRequestMessage = protos.cockroach.server.serverpb.EnqueueRangeRequest;
+export type EnqueueRangeResponseMessage = protos.cockroach.server.serverpb.EnqueueRangeResponse;
+
+export type MetricMetadataRequestMessage = protos.cockroach.server.serverpb.MetricMetadataRequest;
+export type MetricMetadataResponseMessage = protos.cockroach.server.serverpb.MetricMetadataResponse;
+
+export type StatementDiagnosticsReportsRequestMessage = protos.cockroach.server.serverpb.StatementDiagnosticsReportsRequest;
+export type StatementDiagnosticsReportsResponseMessage = protos.cockroach.server.serverpb.StatementDiagnosticsReportsResponse;
+
+export type CreateStatementDiagnosticsReportRequestMessage = protos.cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest;
+export type CreateStatementDiagnosticsReportResponseMessage = protos.cockroach.server.serverpb.CreateStatementDiagnosticsReportResponse;
+
+export type StatementDiagnosticsRequestMessage = protos.cockroach.server.serverpb.StatementDiagnosticsRequest;
+export type StatementDiagnosticsResponseMessage = protos.cockroach.server.serverpb.StatementDiagnosticsResponse;
 
 // API constants
 
@@ -109,6 +151,15 @@ export function toArrayBuffer(encodedRequest: Uint8Array): ArrayBuffer {
   return encodedRequest.buffer.slice(encodedRequest.byteOffset, encodedRequest.byteOffset + encodedRequest.byteLength);
 }
 
+export class RequestError extends Error {
+  status: number;
+  constructor(statusText: string, status: number) {
+    super(statusText);
+    this.status = status;
+    this.name = "RequestError";
+  }
+}
+
 // timeoutFetch is a wrapper around fetch that provides timeout and protocol
 // buffer marshaling and unmarshalling.
 //
@@ -140,13 +191,13 @@ function timeoutFetch<TResponse$Properties, TResponse, TResponseBuilder extends 
 
   return withTimeout(fetch(url, params), timeout).then((res) => {
     if (!res.ok) {
-      throw Error(res.statusText);
+      throw new RequestError(res.statusText, res.status);
     }
     return res.arrayBuffer().then((buffer) => builder.decode(new Uint8Array(buffer)));
   });
 }
 
-export type APIRequestFn<TRequest, TResponse> = (req: TRequest, timeout?: moment.Duration) => Promise<TResponse>;
+export type APIRequestFn<TReq, TResponse> = (req: TReq, timeout?: moment.Duration) => Promise<TResponse>;
 
 // propsToQueryString is a helper function that converts a set of object
 // properties to a query string
@@ -191,7 +242,11 @@ export function setUIData(req: SetUIDataRequestMessage, timeout?: moment.Duratio
 // getEvents gets event data
 export function getEvents(req: EventsRequestMessage, timeout?: moment.Duration): Promise<EventsResponseMessage> {
   const queryString = propsToQueryString(_.pick(req, ["type", "target_id"]));
-  return timeoutFetch(serverpb.EventsResponse, `${API_PREFIX}/events?${queryString}`, null, timeout);
+  return timeoutFetch(serverpb.EventsResponse, `${API_PREFIX}/events?unredacted_events=true&${queryString}`, null, timeout);
+}
+
+export function getLocations(_req: LocationsRequestMessage, timeout?: moment.Duration): Promise<LocationsResponseMessage> {
+  return timeoutFetch(serverpb.LocationsResponse, `${API_PREFIX}/locations`, null, timeout);
 }
 
 // getNodes gets node data
@@ -223,9 +278,15 @@ export function getCluster(_req: ClusterRequestMessage, timeout?: moment.Duratio
   return timeoutFetch(serverpb.ClusterResponse, `${API_PREFIX}/cluster`, null, timeout);
 }
 
-// getTableStats gets details stats about the current table
+// getTableStats gets detailed stats about the current table
 export function getTableStats(req: TableStatsRequestMessage, timeout?: moment.Duration): Promise<TableStatsResponseMessage> {
   return timeoutFetch(serverpb.TableStatsResponse, `${API_PREFIX}/databases/${req.database}/tables/${req.table}/stats`, null, timeout);
+}
+
+// getNonTableStats gets detailed stats about non-table data ranges on the
+// cluster.
+export function getNonTableStats(_req: NonTableStatsRequestMessage, timeout?: moment.Duration): Promise<NonTableStatsResponseMessage> {
+  return timeoutFetch(serverpb.NonTableStatsResponse, `${API_PREFIX}/nontablestats`, null, timeout);
 }
 
 // TODO (maxlang): add filtering
@@ -235,7 +296,7 @@ export function getLogs(req: LogsRequestMessage, timeout?: moment.Duration): Pro
 }
 
 // getLiveness gets cluster liveness information from the current node.
-export function getLiveness(_: LivenessRequestMessage, timeout?: moment.Duration): Promise<LivenessResponseMessage> {
+export function getLiveness(_req: LivenessRequestMessage, timeout?: moment.Duration): Promise<LivenessResponseMessage> {
   return timeoutFetch(serverpb.LivenessResponse, `${API_PREFIX}/liveness`, null, timeout);
 }
 
@@ -281,7 +342,52 @@ export function getRangeLog(
   );
 }
 
-// getCommandQueue returns a representation of the command queue for a given range id
-export function getCommandQueue(req: CommandQueueRequestMessage, timeout?: moment.Duration): Promise<CommandQueueResponseMessage> {
-  return timeoutFetch(serverpb.CommandQueueResponse, `${STATUS_PREFIX}/range/${req.range_id}/cmdqueue`, null, timeout);
+// getSettings gets all cluster settings. We request unredacted_values, which will attempt
+// to obtain all values from the server. The server will only accept to do so if
+// the user also happens to have admin privilege.
+export function getSettings(_req: SettingsRequestMessage, timeout?: moment.Duration): Promise<SettingsResponseMessage> {
+  return timeoutFetch(serverpb.SettingsResponse, `${API_PREFIX}/settings?unredacted_values=true`, null, timeout);
+}
+
+export function userLogin(req: UserLoginRequestMessage, timeout?: moment.Duration): Promise<UserLoginResponseMessage> {
+  return timeoutFetch(serverpb.UserLoginResponse, `login`, req as any, timeout);
+}
+
+export function userLogout(timeout?: moment.Duration): Promise<UserLogoutResponseMessage> {
+  return timeoutFetch(serverpb.UserLogoutResponse, `logout`, null, timeout);
+}
+
+// getStores returns information about a node's stores.
+export function getStores(req: StoresRequestMessage, timeout?: moment.Duration): Promise<StoresResponseMessage> {
+  return timeoutFetch(serverpb.StoresResponse, `${STATUS_PREFIX}/stores/${req.node_id}`, null, timeout);
+}
+
+// getStatements returns statements the cluster has recently executed, and some stats about them.
+export function getStatements(timeout?: moment.Duration): Promise<StatementsResponseMessage> {
+  return timeoutFetch(serverpb.StatementsResponse, `${STATUS_PREFIX}/statements`, null, timeout);
+}
+
+export function getStatementDiagnosticsReports(timeout?: moment.Duration): Promise<StatementDiagnosticsReportsResponseMessage> {
+  return timeoutFetch(serverpb.StatementDiagnosticsReportsResponse, `${STATUS_PREFIX}/stmtdiagreports`, null, timeout);
+}
+
+export function createStatementDiagnosticsReport(req: CreateStatementDiagnosticsReportRequestMessage, timeout?: moment.Duration): Promise<CreateStatementDiagnosticsReportResponseMessage> {
+  return timeoutFetch(serverpb.CreateStatementDiagnosticsReportResponse, `${STATUS_PREFIX}/stmtdiagreports`, req as any, timeout);
+}
+
+export function getStatementDiagnostics(req: StatementDiagnosticsRequestMessage, timeout?: moment.Duration): Promise<StatementDiagnosticsResponseMessage> {
+  return timeoutFetch(serverpb.StatementDiagnosticsResponse, `${STATUS_PREFIX}/stmtdiag/${req.statement_diagnostics_id}`, null, timeout);
+}
+
+// getDataDistribution returns information about how replicas are distributed across nodes.
+export function getDataDistribution(timeout?: moment.Duration): Promise<DataDistributionResponseMessage> {
+  return timeoutFetch(serverpb.DataDistributionResponse, `${API_PREFIX}/data_distribution`, null, timeout);
+}
+
+export function enqueueRange(req: EnqueueRangeRequestMessage, timeout?: moment.Duration): Promise<EnqueueRangeResponseMessage> {
+  return timeoutFetch(serverpb.EnqueueRangeResponse, `${API_PREFIX}/enqueue_range`, req as any, timeout);
+}
+
+export function getAllMetricMetadata(_req: MetricMetadataRequestMessage = null, timeout?: moment.Duration): Promise<MetricMetadataResponseMessage> {
+  return timeoutFetch(serverpb.MetricMetadataResponse, `${API_PREFIX}/metricmetadata`, null, timeout);
 }

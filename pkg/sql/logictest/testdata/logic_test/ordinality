@@ -1,7 +1,7 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: local fakedist fakedist-metadata fakedist-disk fakedist-vec
 
 query TI colnames
-SELECT * FROM (VALUES ('a'), ('b')) WITH ORDINALITY AS X(name, i)
+SELECT * FROM (VALUES ('a'), ('b')) WITH ORDINALITY AS x(name, i)
 ----
 name i
 a 1
@@ -29,11 +29,11 @@ SELECT * FROM foo WITH ORDINALITY LIMIT 1
 a 1
 
 query I
-SELECT MAX(ordinality) FROM foo WITH ORDINALITY
+SELECT max(ordinality) FROM foo WITH ORDINALITY
 ----
 2
 
-query TITI
+query TITI rowsort
 SELECT * FROM foo WITH ORDINALITY AS a, foo WITH ORDINALITY AS b
 ----
 a 1 a 1
@@ -47,11 +47,26 @@ SELECT * FROM (SELECT x||x FROM foo) WITH ORDINALITY
 aa 1
 bb 2
 
-query TII
+query TII rowsort
 SELECT * FROM (SELECT x, ordinality*2 FROM foo WITH ORDINALITY AS a) JOIN foo WITH ORDINALITY AS b USING(x)
 ----
 a 2 1
 b 4 2
+
+query TI
+SELECT * FROM (SELECT * FROM foo ORDER BY x DESC) WITH ORDINALITY LIMIT 1
+----
+b 1
+
+query TI
+SELECT * FROM (SELECT * FROM foo ORDER BY x) WITH ORDINALITY ORDER BY x DESC LIMIT 1
+----
+b 2
+
+query TI
+SELECT * FROM (SELECT * FROM foo ORDER BY x) WITH ORDINALITY ORDER BY ordinality DESC LIMIT 1
+----
+b 2
 
 statement ok
 INSERT INTO foo(x) VALUES ('c')
@@ -81,22 +96,12 @@ true
 true
 true
 
-# Show that the primary key is used under ordinalityNode.
-query TITTTTT
-EXPLAIN (METADATA) SELECT * FROM (SELECT * FROM foo WHERE x > 'a') WITH ORDINALITY
-----
-ordinality  0  ordinality  ·      ·            (x, "ordinality")  x!=NULL; key(x); weak-key("ordinality")
- └── scan   1  scan        ·      ·            (x, "ordinality")  x!=NULL; key(x); weak-key("ordinality")
-·           1  ·           table  foo@primary  ·                  ·
-·           1  ·           spans  /"a\x00"-    ·                  ·
+# Regression test for #33659
+statement ok
+TABLE [SHOW ZONE CONFIGURATIONS] WITH ORDINALITY
 
-# Show that the primary key cannot be used with a PK predicate
-# outside of ordinalityNode.
-query TITTTTT
-EXPLAIN (METADATA) SELECT * FROM foo WITH ORDINALITY WHERE x > 'a'
+# Regression test for #41760
+query TI
+SELECT * FROM (SELECT * FROM foo LIMIT 1) WITH ORDINALITY
 ----
-filter           0  filter      ·      ·            (x, "ordinality")  x!=NULL; key(x); weak-key("ordinality")
- └── ordinality  1  ordinality  ·      ·            (x, "ordinality")  x!=NULL; key(x); weak-key("ordinality")
-      └── scan   2  scan        ·      ·            (x, "ordinality")  x!=NULL; key(x); weak-key("ordinality")
-·                2  ·           table  foo@primary  ·                  ·
-·                2  ·           spans  ALL          ·                  ·
+a 1

@@ -1,0 +1,127 @@
+# Reconstructed from:
+# https://github.com/jordanlewis/pgjdbc/blob/462d505f01ec6180b30eaffabe51839dd126b90c/pgjdbc/src/main/java/org/postgresql/jdbc/PgDatabaseMetaData.java#L2391-L2408
+
+# For testing, create the schema for the builtin tables.
+exec-ddl
+CREATE TABLE pg_type (
+    oid OID NULL,
+    typname NAME NOT NULL,
+    typnamespace OID NULL,
+    typowner OID NULL,
+    typlen INT NULL,
+    typbyval BOOL NULL,
+    typtype STRING NULL,
+    typcategory STRING NULL,
+    typispreferred BOOL NULL,
+    typisdefined BOOL NULL,
+    typdelim STRING NULL,
+    typrelid OID NULL,
+    typelem OID NULL,
+    typarray OID NULL,
+    typinput OID NULL,
+    typoutput OID NULL,
+    typreceive OID NULL,
+    typsend OID NULL,
+    typmodin OID NULL,
+    typmodout OID NULL,
+    typanalyze OID NULL,
+    typalign STRING NULL,
+    typstorage STRING NULL,
+    typnotnull BOOL NULL,
+    typbasetype OID NULL,
+    typtypmod INT NULL,
+    typndims INT NULL,
+    typcollation OID NULL,
+    typdefaultbin STRING NULL,
+    typdefault STRING NULL,
+    typacl STRING[] NULL
+)
+----
+
+exec-ddl
+CREATE TABLE pg_namespace (
+    oid OID NULL,
+    nspname NAME NOT NULL,
+    nspowner OID NULL,
+    nspacl STRING[] NULL
+)
+----
+
+opt
+SELECT
+    NULL AS type_cat,
+    n.nspname AS type_schem,
+    t.typname AS type_name,
+    NULL AS class_name,
+    CASE
+    WHEN t.typtype = 'c' THEN 'STRUCT'
+    ELSE 'DISTINCT'
+    END
+        AS data_type,
+    pg_catalog.obj_description(t.oid, 'pg_type') AS remarks,
+    CASE
+    WHEN t.typtype = 'd'
+    THEN (
+        SELECT
+            CASE
+            WHEN typname = 'pgType' THEN 'sqlType'
+            ELSE 'OTHER'
+            END
+        FROM
+            pg_type
+        WHERE
+            oid = t.typbasetype
+    )
+    ELSE NULL
+    END
+        AS base_type
+FROM
+    pg_type AS t, pg_namespace AS n
+WHERE
+    t.typnamespace = n.oid AND n.nspname != 'pg_catalog';
+----
+project
+ ├── columns: type_cat:71 type_schem:34!null type_name:2!null class_name:71 data_type:72 remarks:73 base_type:74
+ ├── fd: ()-->(71)
+ ├── left-join-apply
+ │    ├── columns: t.oid:1 t.typname:2!null t.typnamespace:3!null t.typtype:7 t.typbasetype:25 n.oid:33!null nspname:34!null case:70
+ │    ├── fd: (3)==(33), (33)==(3)
+ │    ├── inner-join (hash)
+ │    │    ├── columns: t.oid:1 t.typname:2!null t.typnamespace:3!null t.typtype:7 t.typbasetype:25 n.oid:33!null nspname:34!null
+ │    │    ├── fd: (3)==(33), (33)==(3)
+ │    │    ├── scan t
+ │    │    │    └── columns: t.oid:1 t.typname:2!null t.typnamespace:3 t.typtype:7 t.typbasetype:25
+ │    │    ├── select
+ │    │    │    ├── columns: n.oid:33 nspname:34!null
+ │    │    │    ├── scan n
+ │    │    │    │    └── columns: n.oid:33 nspname:34!null
+ │    │    │    └── filters
+ │    │    │         └── nspname:34 != 'pg_catalog' [outer=(34), constraints=(/34: (/NULL - /'pg_catalog') [/e'pg_catalog\x00' - ]; tight)]
+ │    │    └── filters
+ │    │         └── t.typnamespace:3 = n.oid:33 [outer=(3,33), constraints=(/3: (/NULL - ]; /33: (/NULL - ]), fd=(3)==(33), (33)==(3)]
+ │    ├── max1-row
+ │    │    ├── columns: case:70!null
+ │    │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    │    ├── outer: (25)
+ │    │    ├── cardinality: [0 - 1]
+ │    │    ├── key: ()
+ │    │    ├── fd: ()-->(70)
+ │    │    └── project
+ │    │         ├── columns: case:70!null
+ │    │         ├── outer: (25)
+ │    │         ├── select
+ │    │         │    ├── columns: pg_type.oid:38!null pg_type.typname:39!null
+ │    │         │    ├── outer: (25)
+ │    │         │    ├── fd: ()-->(38)
+ │    │         │    ├── scan pg_type
+ │    │         │    │    └── columns: pg_type.oid:38 pg_type.typname:39!null
+ │    │         │    └── filters
+ │    │         │         └── pg_type.oid:38 = t.typbasetype:25 [outer=(25,38), constraints=(/25: (/NULL - ]; /38: (/NULL - ]), fd=(25)==(38), (38)==(25)]
+ │    │         └── projections
+ │    │              └── CASE WHEN pg_type.typname:39 = 'pgType' THEN 'sqlType' ELSE 'OTHER' END [as=case:70, outer=(39)]
+ │    └── filters (true)
+ └── projections
+      ├── NULL [as=type_cat:71]
+      ├── CASE WHEN t.typtype:7 = 'c' THEN 'STRUCT' ELSE 'DISTINCT' END [as=data_type:72, outer=(7)]
+      ├── obj_description(t.oid:1, 'pg_type') [as=remarks:73, outer=(1)]
+      └── CASE WHEN t.typtype:7 = 'd' THEN case:70 END [as=base_type:74, outer=(7,70)]

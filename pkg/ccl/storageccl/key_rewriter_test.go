@@ -12,10 +12,10 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
@@ -68,14 +68,16 @@ func TestKeyRewriter(t *testing.T) {
 		},
 	}
 
-	kr, err := MakeKeyRewriter(rekeys)
+	const notSpan = false
+
+	kr, err := MakeKeyRewriterFromRekeys(rekeys)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	t.Run("normal", func(t *testing.T) {
 		key := sqlbase.MakeIndexKeyPrefix(&sqlbase.NamespaceTable, desc.PrimaryIndex.ID)
-		newKey, ok, err := kr.RewriteKey(key)
+		newKey, ok, err := kr.RewriteKey(key, notSpan)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -93,7 +95,7 @@ func TestKeyRewriter(t *testing.T) {
 
 	t.Run("prefix end", func(t *testing.T) {
 		key := roachpb.Key(sqlbase.MakeIndexKeyPrefix(&sqlbase.NamespaceTable, desc.PrimaryIndex.ID)).PrefixEnd()
-		newKey, ok, err := kr.RewriteKey(key)
+		newKey, ok, err := kr.RewriteKey(key, notSpan)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -113,22 +115,16 @@ func TestKeyRewriter(t *testing.T) {
 		desc.ID = oldID + 10
 		desc2 := sqlbase.DescriptorTable
 		desc2.ID += 10
-		newKr, err := MakeKeyRewriter([]roachpb.ImportRequest_TableRekey{
-			{
-				OldID:   uint32(oldID),
-				NewDesc: mustMarshalDesc(t, &desc),
-			},
-			{
-				OldID:   uint32(sqlbase.DescriptorTable.ID),
-				NewDesc: mustMarshalDesc(t, &desc2),
-			},
+		newKr, err := MakeKeyRewriterFromRekeys([]roachpb.ImportRequest_TableRekey{
+			{OldID: uint32(oldID), NewDesc: mustMarshalDesc(t, &desc)},
+			{OldID: uint32(sqlbase.DescriptorTable.ID), NewDesc: mustMarshalDesc(t, &desc2)},
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		key := sqlbase.MakeIndexKeyPrefix(&sqlbase.NamespaceTable, desc.PrimaryIndex.ID)
-		newKey, ok, err := newKr.RewriteKey(key)
+		newKey, ok, err := newKr.RewriteKey(key, notSpan)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -143,28 +139,13 @@ func TestKeyRewriter(t *testing.T) {
 			t.Fatalf("got %d expected %d", id, desc.ID+1)
 		}
 	})
-
-	t.Run("span", func(t *testing.T) {
-		span := roachpb.Span{
-			Key:    makeKeyRewriterPrefixIgnoringInterleaved(oldID, 1),
-			EndKey: makeKeyRewriterPrefixIgnoringInterleaved(oldID, 2),
-		}
-		newSpan, err := kr.RewriteSpan(span)
-		if err != nil {
-			t.Fatal(err)
-		}
-		expect := roachpb.Span{
-			Key:    keys.MakeTablePrefix(uint32(newID)),
-			EndKey: makeKeyRewriterPrefixIgnoringInterleaved(newID, 2),
-		}
-		if !newSpan.EqualValue(expect) {
-			t.Fatalf("got %s, expected %s", newSpan, expect)
-		}
-	})
 }
 
-func mustMarshalDesc(t *testing.T, desc *sqlbase.TableDescriptor) []byte {
-	bytes, err := protoutil.Marshal(sqlbase.WrapDescriptor(desc))
+func mustMarshalDesc(t *testing.T, tableDesc *sqlbase.TableDescriptor) []byte {
+	desc := sqlbase.WrapDescriptor(tableDesc)
+	// Set the timestamp to a non-zero value.
+	desc.Table(hlc.Timestamp{WallTime: 1})
+	bytes, err := protoutil.Marshal(desc)
 	if err != nil {
 		t.Fatal(err)
 	}

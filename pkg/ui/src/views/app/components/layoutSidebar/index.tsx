@@ -1,61 +1,75 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
-import { Link } from "react-router";
-import { cockroachIcon, databaseIcon } from "src/views/shared/components/icons";
-import { trustIcon } from "src/util/trust";
+import { connect } from "react-redux";
+import { Link, withRouter, RouteComponentProps } from "react-router-dom";
 
-import homeIcon from "!!raw-loader!assets/home.svg";
-import metricsIcon from "!!raw-loader!assets/metrics.svg";
-import jobsIcon from "!!raw-loader!assets/jobs.svg";
+import { SideNavigation } from "src/components";
+import "./navigation-bar.styl";
 
-interface IconLinkProps {
-  icon?: string;
-  title?: string;
-  to: string;
-  onlyActiveOnIndex?: boolean;
-  className?: string;
+interface RouteParam {
+  path: string;
+  text: string;
+  activeFor: string[];
+  // ignoreFor allows exclude specific paths from been recognized as active
+  // even if path is matched with activeFor paths.
+  ignoreFor?: string[];
 }
 
 /**
- * IconLink creats a react router Link which contains both a graphical icon and
- * a string title.
+ * Sidebar represents the static navigation sidebar available on all pages. It
+ * displays a number of graphic icons representing available pages; the icon of
+ * the page which is currently active will be highlighted.
  */
-class IconLink extends React.Component<IconLinkProps, {}> {
-  static defaultProps = {
-    className: "normal",
-    onlyActiveOnIndex: false,
-  };
+class Sidebar extends React.Component<RouteComponentProps> {
+  readonly routes: RouteParam[] = [
+    { path: "/overview", text: "Overview", activeFor: ["/node"] },
+    { path: "/metrics", text: "Metrics", activeFor: [] },
+    { path: "/databases", text: "Databases", activeFor: ["/database"] },
+    { path: "/statements", text: "Statements", activeFor: ["/statement"] },
+    { path: "/reports/network", text: "Network Latency", activeFor: ["/reports/network"] },
+    { path: "/jobs", text: "Jobs", activeFor: [] },
+    {
+      path: "/debug",
+      text: "Advanced Debug",
+      activeFor: ["/reports", "/data-distribution", "/raft"],
+      ignoreFor: ["/reports/network"],
+    },
+  ];
+
+  isActiveNavigationItem = (path: string): boolean => {
+    const { pathname } = this.props.location;
+    const { activeFor, ignoreFor = []} = this.routes.find(route => route.path === path);
+    return [...activeFor, path].some(p => {
+      const isMatchedToIgnoredPaths = ignoreFor.some(ignorePath => pathname.startsWith(ignorePath));
+      const isMatchedToActiveFor = pathname.startsWith(p);
+      return isMatchedToActiveFor && !isMatchedToIgnoredPaths;
+    });
+  }
 
   render() {
-    const { icon, title, to, onlyActiveOnIndex, className } = this.props;
+    const navigationItems = this.routes.map(({ path, text }, idx) => (
+      <SideNavigation.Item
+        isActive={this.isActiveNavigationItem(path)}
+        key={idx}
+      >
+        <Link to={path}>{text}</Link>
+      </SideNavigation.Item>
+    ));
     return (
-      <li className={className} >
-        <Link to={to} activeClassName="active" onlyActiveOnIndex={onlyActiveOnIndex}>
-          <div className="image-container"
-               dangerouslySetInnerHTML={trustIcon(icon)}/>
-          <div>{title}</div>
-        </Link>
-      </li>
+      <SideNavigation>
+        {navigationItems}
+      </SideNavigation>
     );
   }
 }
 
-/**
- * SideBar represents the static navigation sidebar available on all pages. It
- * displays a number of graphic icons representing available pages; the icon of
- * the page which is currently active will be highlighted.
- */
-export default class extends React.Component<{}, {}> {
-  render() {
-    return <nav className="navigation-bar">
-      <ul className="navigation-bar__list">
-        <IconLink to="/overview" icon={homeIcon} title="Overview" />
-        <IconLink to="/cluster" icon={metricsIcon} title="Cluster" />
-        <IconLink to="/databases" icon={databaseIcon} title="Databases"/>
-        <IconLink to="/jobs" icon={jobsIcon} title="Jobs"/>
-      </ul>
-      <ul className="navigation-bar__list navigation-bar__list--bottom">
-        <IconLink to="/" icon={cockroachIcon} className="cockroach" />
-      </ul>
-    </nav>;
-  }
-}
+export default withRouter(connect(null, null)(Sidebar));

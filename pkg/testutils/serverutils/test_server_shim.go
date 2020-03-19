@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // This file provides generic interfaces that allow tests to set up test servers
 // without importing the server package (avoiding circular dependencies).
@@ -22,14 +18,13 @@
 package serverutils
 
 import (
+	"context"
 	gosql "database/sql"
 	"net/http"
 	"net/url"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -52,21 +47,25 @@ type TestServerInterface interface {
 	// NodeID returns the ID of this node within its cluster.
 	NodeID() roachpb.NodeID
 
-	// ServingAddr returns the server's advertised address.
-	ServingAddr() string
+	// ServingRPCAddr returns the server's advertised address.
+	ServingRPCAddr() string
+
+	// ServingSQLAddr returns the server's advertised SQL address.
+	ServingSQLAddr() string
 
 	// HTTPAddr returns the server's http address.
 	HTTPAddr() string
 
-	// Addr returns the server's address.
-	Addr() string
+	// RPCAddr returns the server's RPC address.
+	// Note: use ServingRPCAddr() instead unless specific reason not to.
+	RPCAddr() string
 
-	// KVClient() returns a *client.DB instance for talking to this KV server,
-	// as an interface{}.
-	KVClient() interface{}
+	// SQLAddr returns the server's SQL address.
+	// Note: use ServingSQLAddr() instead unless specific reason not to.
+	SQLAddr() string
 
-	// KVDB() returns the *kv.DB instance as an interface{}.
-	KVDB() interface{}
+	// DB returns a *client.DB instance for talking to this KV server.
+	DB() *kv.DB
 
 	// RPCContext returns the rpc context used by the test server.
 	RPCContext() *rpc.Context
@@ -74,29 +73,36 @@ type TestServerInterface interface {
 	// LeaseManager() returns the *sql.LeaseManager as an interface{}.
 	LeaseManager() interface{}
 
-	// Executor() returns the *sql.Executor as an interface{}.
-	Executor() interface{}
-
-	// InternalExecutor returns a sqlutil.InternalExecutor as an interface{}.
+	// InternalExecutor returns a *sql.InternalExecutor as an interface{} (which
+	// also implements sqlutil.InternalExecutor if the test cannot depend on sql).
 	InternalExecutor() interface{}
 
-	// Gossip returns the gossip used by the TestServer.
-	Gossip() *gossip.Gossip
+	// ExecutorConfig returns a copy of the server's ExecutorConfig.
+	// The real return type is sql.ExecutorConfig.
+	ExecutorConfig() interface{}
+
+	// GossipI returns the gossip used by the TestServer.
+	// The real return type is *gossip.Gossip.
+	GossipI() interface{}
 
 	// Clock returns the clock used by the TestServer.
 	Clock() *hlc.Clock
 
-	// DistSender returns the DistSender used by the TestServer.
-	DistSender() *kv.DistSender
+	// DistSenderI returns the DistSender used by the TestServer.
+	// The real return type is *kv.DistSender.
+	DistSenderI() interface{}
 
-	// DistSQLServer returns the *distsqlrun.ServerImpl as an interface{}.
+	// SQLServer returns the *sql.Server as an interface{}.
+	SQLServer() interface{}
+
+	// DistSQLServer returns the *distsql.ServerImpl as an interface{}.
 	DistSQLServer() interface{}
 
 	// JobRegistry returns the *jobs.Registry as an interface{}.
 	JobRegistry() interface{}
 
 	// SetDistSQLSpanResolver changes the SpanResolver used for DistSQL inside the
-	// server's executor. The argument must be a distsqlplan.SpanResolver
+	// server's executor. The argument must be a physicalplan.SpanResolver
 	// instance.
 	//
 	// This method exists because we cannot pass the fake span resolver with the
@@ -113,9 +119,13 @@ type TestServerInterface interface {
 	// GetHTTPClient returns an http client configured with the client TLS
 	// config required by the TestServer's configuration.
 	GetHTTPClient() (http.Client, error)
+	// GetAdminAuthenticatedHTTPClient returns an http client which has been
+	// authenticated to access Admin API methods (via a cookie).
+	// The user has admin privileges.
+	GetAdminAuthenticatedHTTPClient() (http.Client, error)
 	// GetAuthenticatedHTTPClient returns an http client which has been
 	// authenticated to access Admin API methods (via a cookie).
-	GetAuthenticatedHTTPClient() (http.Client, error)
+	GetAuthenticatedHTTPClient(isAdmin bool) (http.Client, error)
 
 	// MustGetSQLCounter returns the value of a counter metric from the server's
 	// SQL Executor. Runs in O(# of metrics) time, which is fine for test code.
@@ -145,11 +155,21 @@ type TestServerInterface interface {
 		splitKey roachpb.Key,
 	) (left roachpb.RangeDescriptor, right roachpb.RangeDescriptor, err error)
 
+	// MergeRanges merges the range containing leftKey with the following adjacent
+	// range.
+	MergeRanges(leftKey roachpb.Key) (merged roachpb.RangeDescriptor, err error)
+
 	// ExpectedInitialRangeCount returns the expected number of ranges that should
 	// be on the server after initial (asynchronous) splits have been completed,
 	// assuming no additional information is added outside of the normal bootstrap
 	// process.
 	ExpectedInitialRangeCount() (int, error)
+
+	// ForceTableGC sends a GCRequest for the ranges corresponding to a table.
+	//
+	// An error will be returned if the same table name exists in multiple schemas
+	// inside the specified database.
+	ForceTableGC(ctx context.Context, database, table string, timestamp hlc.Timestamp) error
 }
 
 // TestServerFactory encompasses the actual implementation of the shim
@@ -172,16 +192,18 @@ func InitTestServerFactory(impl TestServerFactory) {
 // The server should be stopped by calling server.Stopper().Stop().
 func StartServer(
 	t testing.TB, params base.TestServerArgs,
-) (TestServerInterface, *gosql.DB, *client.DB) {
+) (TestServerInterface, *gosql.DB, *kv.DB) {
 	server, err := StartServerRaw(params)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	kvClient := server.KVClient().(*client.DB)
 	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, server.ServingAddr(), "StartServer", url.User(security.RootUser))
+		t, server.ServingSQLAddr(), "StartServer" /* prefix */, url.User(security.RootUser))
 	pgURL.Path = params.UseDatabase
+	if params.Insecure {
+		pgURL.RawQuery = "sslmode=disable"
+	}
 	goDB, err := gosql.Open("postgres", pgURL.String())
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +213,7 @@ func StartServer(
 			_ = goDB.Close()
 			cleanupGoDB()
 		}))
-	return server, goDB, kvClient
+	return server, goDB, server.DB()
 }
 
 // StartServerRaw creates and starts a TestServer.
@@ -212,17 +234,34 @@ func StartServerRaw(args base.TestServerArgs) (TestServerInterface, error) {
 // GetJSONProto uses the supplied client to GET the URL specified by the parameters
 // and unmarshals the result into response.
 func GetJSONProto(ts TestServerInterface, path string, response protoutil.Message) error {
-	httpClient, err := ts.GetAuthenticatedHTTPClient()
+	return GetJSONProtoWithAdminOption(ts, path, response, true)
+}
+
+// GetJSONProtoWithAdminOption is like GetJSONProto but the caller can customize
+// whether the request is performed with admin privilege
+func GetJSONProtoWithAdminOption(
+	ts TestServerInterface, path string, response protoutil.Message, isAdmin bool,
+) error {
+	httpClient, err := ts.GetAuthenticatedHTTPClient(isAdmin)
 	if err != nil {
 		return err
 	}
 	return httputil.GetJSON(httpClient, ts.AdminURL()+path, response)
 }
 
-// PostJSONProto uses the supplied client to POST request to the URL specified by
-// the parameters and unmarshals the result into response.
+// PostJSONProto uses the supplied client to POST the URL specified by the parameters
+// and unmarshals the result into response.
 func PostJSONProto(ts TestServerInterface, path string, request, response protoutil.Message) error {
-	httpClient, err := ts.GetAuthenticatedHTTPClient()
+	return PostJSONProtoWithAdminOption(ts, path, request, response, true)
+}
+
+// PostJSONProtoWithAdminOption is like PostJSONProto but the caller
+// can customize whether the request is performed with admin
+// privilege.
+func PostJSONProtoWithAdminOption(
+	ts TestServerInterface, path string, request, response protoutil.Message, isAdmin bool,
+) error {
+	httpClient, err := ts.GetAuthenticatedHTTPClient(isAdmin)
 	if err != nil {
 		return err
 	}

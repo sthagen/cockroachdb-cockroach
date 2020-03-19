@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server_test
 
@@ -22,8 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -31,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/pkg/errors"
 )
 
 const strKey = "testing.str"
@@ -39,32 +34,32 @@ const durationKey = "testing.duration"
 const byteSizeKey = "testing.bytesize"
 const enumKey = "testing.enum"
 
-var strA = settings.RegisterValidatedStringSetting(strKey, "", "<default>", func(v string) error {
+var strA = settings.RegisterValidatedStringSetting(strKey, "desc", "<default>", func(sv *settings.Values, v string) error {
 	if len(v) > 15 {
 		return errors.Errorf("can't set %s to string longer than 15: %s", strKey, v)
 	}
 	return nil
 })
-var intA = settings.RegisterValidatedIntSetting(intKey, "", 1, func(v int64) error {
+var intA = settings.RegisterValidatedIntSetting(intKey, "desc", 1, func(v int64) error {
 	if v < 0 {
 		return errors.Errorf("can't set %s to a negative value: %d", intKey, v)
 	}
 	return nil
 
 })
-var durationA = settings.RegisterValidatedDurationSetting(durationKey, "", time.Minute, func(v time.Duration) error {
+var durationA = settings.RegisterValidatedDurationSetting(durationKey, "desc", time.Minute, func(v time.Duration) error {
 	if v < 0 {
 		return errors.Errorf("can't set %s to a negative duration: %s", durationKey, v)
 	}
 	return nil
 })
-var byteSizeA = settings.RegisterValidatedByteSizeSetting(byteSizeKey, "", 1024*1024, func(v int64) error {
+var byteSizeA = settings.RegisterValidatedByteSizeSetting(byteSizeKey, "desc", 1024*1024, func(v int64) error {
 	if v < 0 {
 		return errors.Errorf("can't set %s to a negative value: %d", byteSizeKey, v)
 	}
 	return nil
 })
-var enumA = settings.RegisterEnumSetting(enumKey, "", "foo", map[int64]string{1: "foo", 2: "bar"})
+var enumA = settings.RegisterEnumSetting(enumKey, "desc", "foo", map[int64]string{1: "foo", 2: "bar"})
 
 func TestSettingsRefresh(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -78,7 +73,7 @@ func TestSettingsRefresh(t *testing.T) {
 	db := sqlutils.MakeSQLRunner(rawDB)
 
 	insertQ := `UPSERT INTO system.settings (name, value, "lastUpdated", "valueType")
-		VALUES ($1, $2, NOW(), $3)`
+		VALUES ($1, $2, now(), $3)`
 	deleteQ := "DELETE FROM system.settings WHERE name = $1"
 
 	if expected, actual := "<default>", strA.Get(&st.SV); expected != actual {
@@ -206,93 +201,63 @@ func TestSettingsSetAndShow(t *testing.T) {
 	showQ := `SHOW CLUSTER SETTING "%s"`
 
 	db.Exec(t, fmt.Sprintf(setQ, strKey, "'via-set'"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := "via-set", db.QueryStr(t, fmt.Sprintf(showQ, strKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
+	if expected, actual := "via-set", db.QueryStr(t, fmt.Sprintf(showQ, strKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
 
 	db.Exec(t, fmt.Sprintf(setQ, intKey, "5"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := "5", db.QueryStr(t, fmt.Sprintf(showQ, intKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
+	if expected, actual := "5", db.QueryStr(t, fmt.Sprintf(showQ, intKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
 
 	db.Exec(t, fmt.Sprintf(setQ, durationKey, "'2h'"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := time.Hour*2, durationA.Get(&st.SV); expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		if expected, actual := "2h", db.QueryStr(t, fmt.Sprintf(showQ, durationKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
+	if expected, actual := time.Hour*2, durationA.Get(&st.SV); expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
+	if expected, actual := "02:00:00", db.QueryStr(t, fmt.Sprintf(showQ, durationKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
 
 	db.Exec(t, fmt.Sprintf(setQ, byteSizeKey, "'1500MB'"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := int64(1500000000), byteSizeA.Get(&st.SV); expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		if expected, actual := "1.4 GiB", db.QueryStr(t, fmt.Sprintf(showQ, byteSizeKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
+	if expected, actual := int64(1500000000), byteSizeA.Get(&st.SV); expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
+	if expected, actual := "1.4 GiB", db.QueryStr(t, fmt.Sprintf(showQ, byteSizeKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
 
 	db.Exec(t, fmt.Sprintf(setQ, byteSizeKey, "'1450MB'"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := "1.4 GiB", db.QueryStr(t, fmt.Sprintf(showQ, byteSizeKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
-
-	if _, err := db.DB.Exec(fmt.Sprintf(setQ, intKey, "'a-str'")); !testutils.IsError(
-		err, `could not parse "a-str" as type int`,
-	) {
-		t.Fatal(err)
+	if expected, actual := "1.4 GiB", db.QueryStr(t, fmt.Sprintf(showQ, byteSizeKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
 	}
+
+	db.ExpectErr(t, `could not parse "a-str" as type int`, fmt.Sprintf(setQ, intKey, "'a-str'"))
 
 	db.Exec(t, fmt.Sprintf(setQ, enumKey, "2"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := int64(2), enumA.Get(&st.SV); expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		if expected, actual := "2", db.QueryStr(t, fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
+	if expected, actual := int64(2), enumA.Get(&st.SV); expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
+	if expected, actual := "bar", db.QueryStr(t, fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
 
 	db.Exec(t, fmt.Sprintf(setQ, enumKey, "'foo'"))
-	testutils.SucceedsSoon(t, func() error {
-		if expected, actual := int64(1), enumA.Get(&st.SV); expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		if expected, actual := "1", db.QueryStr(t, fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
-
-	if _, err := db.DB.Exec(fmt.Sprintf(setQ, enumKey, "'unknown'")); !testutils.IsError(err,
-		`invalid string value 'unknown' for enum setting`,
-	) {
-		t.Fatal(err)
+	if expected, actual := int64(1), enumA.Get(&st.SV); expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
+	if expected, actual := "foo", db.QueryStr(t, fmt.Sprintf(showQ, enumKey))[0][0]; expected != actual {
+		t.Fatalf("expected %v, got %v", expected, actual)
 	}
 
-	if _, err := db.DB.Exec(fmt.Sprintf(setQ, enumKey, "7")); !testutils.IsError(err,
-		`invalid integer value '7' for enum setting`,
-	) {
-		t.Fatal(err)
-	}
+	db.ExpectErr(
+		t, `invalid string value 'unknown' for enum setting`,
+		fmt.Sprintf(setQ, enumKey, "'unknown'"),
+	)
+
+	db.ExpectErr(t, `invalid integer value '7' for enum setting`, fmt.Sprintf(setQ, enumKey, "7"))
 
 	db.Exec(t, `CREATE USER testuser`)
-	pgURL, cleanupFunc := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User("testuser"))
+	pgURL, cleanupFunc := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User("testuser"))
 	defer cleanupFunc()
 	testuser, err := gosql.Open("postgres", pgURL.String())
 	if err != nil {
@@ -301,22 +266,27 @@ func TestSettingsSetAndShow(t *testing.T) {
 	defer testuser.Close()
 
 	if _, err := testuser.Exec(`SET CLUSTER SETTING foo = 'bar'`); !testutils.IsError(err,
-		`only root is allowed to SET CLUSTER SETTING`,
+		`only users with the admin role are allowed to SET CLUSTER SETTING`,
 	) {
 		t.Fatal(err)
 	}
 	if _, err := testuser.Exec(`SHOW CLUSTER SETTING foo`); !testutils.IsError(err,
-		`only root is allowed to SHOW CLUSTER SETTINGS`,
+		`only users with the admin role are allowed to SHOW CLUSTER SETTING`,
 	) {
 		t.Fatal(err)
 	}
 	if _, err := testuser.Exec(`SHOW ALL CLUSTER SETTINGS`); !testutils.IsError(err,
-		`only root is allowed to SHOW CLUSTER SETTINGS`,
+		`only users with the admin role are allowed to SHOW CLUSTER SETTINGS`,
+	) {
+		t.Fatal(err)
+	}
+	if _, err := testuser.Exec(`SHOW CLUSTER SETTINGS`); !testutils.IsError(err,
+		`only users with the admin role are allowed to SHOW CLUSTER SETTINGS`,
 	) {
 		t.Fatal(err)
 	}
 	if _, err := testuser.Exec(`SELECT * FROM crdb_internal.cluster_settings`); !testutils.IsError(err,
-		`only root is allowed to read crdb_internal.cluster_settings`,
+		`only users with the admin role are allowed to read crdb_internal.cluster_settings`,
 	) {
 		t.Fatal(err)
 	}
@@ -338,8 +308,9 @@ func TestSettingsShowAll(t *testing.T) {
 	if len(rows) < 2 {
 		t.Fatalf("show all returned too few rows (%d)", len(rows))
 	}
-	if len(rows[0]) != 4 {
-		t.Fatalf("show all must return 4 columns, found %d", len(rows[0]))
+	const expColumns = 5
+	if len(rows[0]) != expColumns {
+		t.Fatalf("show all must return %d columns, found %d", expColumns, len(rows[0]))
 	}
 	hasIntKey := false
 	hasStrKey := false

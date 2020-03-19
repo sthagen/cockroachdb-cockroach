@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package retry
 
@@ -21,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 // Options provides reusable configuration of Retry objects.
@@ -127,11 +124,20 @@ func (r *Retry) Next() bool {
 	}
 }
 
+// closedC is returned from Retry.NextCh whenever a retry
+// can begin immediately.
+var closedC = func() chan time.Time {
+	c := make(chan time.Time)
+	close(c)
+	return c
+}()
+
 // NextCh returns a channel which will receive when the next retry
 // interval has expired.
 func (r *Retry) NextCh() <-chan time.Time {
 	if r.isReset {
 		r.isReset = false
+		return closedC
 	}
 	r.currentAttempt++
 	if r.opts.MaxRetries > 0 && r.currentAttempt > r.opts.MaxRetries {
@@ -141,7 +147,12 @@ func (r *Retry) NextCh() <-chan time.Time {
 }
 
 // WithMaxAttempts is a helper that runs fn N times and collects the last err.
+// It guarantees fn will run at least once. Otherwise, an error will be returned.
 func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) error {
+	if n <= 0 {
+		return errors.Errorf("max attempts should not be 0 or below, got: %d", n)
+	}
+
 	opts.MaxRetries = n - 1
 	var err error
 	for r := StartWithCtx(ctx, opts); r.Next(); {
@@ -150,6 +161,9 @@ func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) 
 			return nil
 		}
 	}
+	if err == nil {
+		err = errors.Wrap(ctx.Err(), "did not run function")
+	}
 	return err
 }
 
@@ -157,6 +171,12 @@ func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) 
 // without error, or the given duration has elapsed. The function is invoked
 // immediately at first and then successively with an exponential backoff
 // starting at 1ns and ending at the specified duration.
+//
+// This function is DEPRECATED! Please use one of the other functions in this
+// package that takes context cancellation into account.
+//
+// TODO(benesch): remove this function and port its callers to a context-
+// sensitive API.
 func ForDuration(duration time.Duration, fn func() error) error {
 	deadline := timeutil.Now().Add(duration)
 	var lastErr error

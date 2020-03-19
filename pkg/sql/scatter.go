@@ -1,31 +1,25 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/pkg/errors"
-
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/pkg/errors"
 )
 
 type scatterNode struct {
@@ -38,7 +32,7 @@ type scatterNode struct {
 // (`ALTER TABLE/INDEX ... SCATTER ...` statement)
 // Privileges: INSERT on table.
 func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error) {
-	tableDesc, index, err := p.getTableAndIndex(ctx, n.Table, n.Index, privilege.INSERT)
+	tableDesc, index, err := p.getTableAndIndex(ctx, &n.TableOrIndex, privilege.INSERT)
 	if err != nil {
 		return nil, err
 	}
@@ -62,13 +56,13 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 		// Calculate the desired types for the select statement:
 		//  - column values; it is OK if the select statement returns fewer columns
 		//  (the relevant prefix is used).
-		desiredTypes := make([]types.T, len(index.ColumnIDs))
+		desiredTypes := make([]*types.T, len(index.ColumnIDs))
 		for i, colID := range index.ColumnIDs {
 			c, err := tableDesc.FindColumnByID(colID)
 			if err != nil {
 				return nil, err
 			}
-			desiredTypes[i] = c.Type.ToDatumType()
+			desiredTypes[i] = &c.Type
 		}
 		fromVals := make([]tree.Datum, len(n.From))
 		for i, expr := range n.From {
@@ -78,7 +72,7 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 			if err != nil {
 				return nil, err
 			}
-			fromVals[i], err = typedExpr.Eval(&p.evalCtx)
+			fromVals[i], err = typedExpr.Eval(p.EvalContext())
 			if err != nil {
 				return nil, err
 			}
@@ -91,24 +85,28 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 			if err != nil {
 				return nil, err
 			}
-			toVals[i], err = typedExpr.Eval(&p.evalCtx)
+			toVals[i], err = typedExpr.Eval(p.EvalContext())
 			if err != nil {
 				return nil, err
 			}
 		}
 
-		span.Key, err = getRowKey(tableDesc, index, fromVals)
+		span.Key, err = getRowKey(tableDesc.TableDesc(), index, fromVals)
 		if err != nil {
 			return nil, err
 		}
-		span.EndKey, err = getRowKey(tableDesc, index, toVals)
+		span.EndKey, err = getRowKey(tableDesc.TableDesc(), index, toVals)
 		if err != nil {
 			return nil, err
 		}
 		// Tolerate reversing FROM and TO; this can be useful for descending
 		// indexes.
-		if span.Key.Compare(span.EndKey) > 0 {
+		if cmp := span.Key.Compare(span.EndKey); cmp > 0 {
 			span.Key, span.EndKey = span.EndKey, span.Key
+		} else if cmp == 0 {
+			// Key==EndKey is invalid, so special-case when the user's FROM and
+			// TO are the same tuple.
+			span.EndKey = span.EndKey.Next()
 		}
 	}
 
@@ -130,9 +128,10 @@ type scatterRun struct {
 func (n *scatterNode) startExec(params runParams) error {
 	db := params.p.ExecCfg().DB
 	req := &roachpb.AdminScatterRequest{
-		Span: roachpb.Span{Key: n.run.span.Key, EndKey: n.run.span.EndKey},
+		RequestHeader:   roachpb.RequestHeader{Key: n.run.span.Key, EndKey: n.run.span.EndKey},
+		RandomizeLeases: true,
 	}
-	res, pErr := client.SendWrapped(params.ctx, db.GetSender(), req)
+	res, pErr := kv.SendWrapped(params.ctx, db.NonTransactionalSender(), req)
 	if pErr != nil {
 		return pErr.GoError()
 	}
@@ -145,17 +144,6 @@ func (n *scatterNode) Next(params runParams) (bool, error) {
 	n.run.rangeIdx++
 	hasNext := n.run.rangeIdx < len(n.run.ranges)
 	return hasNext, nil
-}
-
-var scatterNodeColumns = sqlbase.ResultColumns{
-	{
-		Name: "key",
-		Typ:  types.Bytes,
-	},
-	{
-		Name: "pretty",
-		Typ:  types.String,
-	},
 }
 
 func (n *scatterNode) Values() tree.Datums {

@@ -7,23 +7,17 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This code was derived from https://github.com/youtube/vitess.
 
 package tree
-
-import "bytes"
 
 // DropBehavior represents options for dropping schema elements.
 type DropBehavior int
@@ -53,124 +47,115 @@ type DropDatabase struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *DropDatabase) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("DROP DATABASE ")
+func (node *DropDatabase) Format(ctx *FmtCtx) {
+	ctx.WriteString("DROP DATABASE ")
 	if node.IfExists {
-		buf.WriteString("IF EXISTS ")
+		ctx.WriteString("IF EXISTS ")
 	}
-	FormatNode(buf, f, node.Name)
+	ctx.FormatNode(&node.Name)
 	if node.DropBehavior != DropDefault {
-		buf.WriteByte(' ')
-		buf.WriteString(node.DropBehavior.String())
+		ctx.WriteByte(' ')
+		ctx.WriteString(node.DropBehavior.String())
 	}
 }
 
 // DropIndex represents a DROP INDEX statement.
 type DropIndex struct {
-	IndexList    TableNameWithIndexList
+	IndexList    TableIndexNames
 	IfExists     bool
 	DropBehavior DropBehavior
 }
 
 // Format implements the NodeFormatter interface.
-func (node *DropIndex) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("DROP INDEX ")
+func (node *DropIndex) Format(ctx *FmtCtx) {
+	ctx.WriteString("DROP INDEX ")
 	if node.IfExists {
-		buf.WriteString("IF EXISTS ")
+		ctx.WriteString("IF EXISTS ")
 	}
-	FormatNode(buf, f, node.IndexList)
+	ctx.FormatNode(&node.IndexList)
 	if node.DropBehavior != DropDefault {
-		buf.WriteByte(' ')
-		buf.WriteString(node.DropBehavior.String())
+		ctx.WriteByte(' ')
+		ctx.WriteString(node.DropBehavior.String())
 	}
 }
 
 // DropTable represents a DROP TABLE statement.
 type DropTable struct {
-	Names        TableNameReferences
+	Names        TableNames
 	IfExists     bool
 	DropBehavior DropBehavior
 }
 
 // Format implements the NodeFormatter interface.
-func (node *DropTable) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("DROP TABLE ")
+func (node *DropTable) Format(ctx *FmtCtx) {
+	ctx.WriteString("DROP TABLE ")
 	if node.IfExists {
-		buf.WriteString("IF EXISTS ")
+		ctx.WriteString("IF EXISTS ")
 	}
-	FormatNode(buf, f, node.Names)
+	ctx.FormatNode(&node.Names)
 	if node.DropBehavior != DropDefault {
-		buf.WriteByte(' ')
-		buf.WriteString(node.DropBehavior.String())
+		ctx.WriteByte(' ')
+		ctx.WriteString(node.DropBehavior.String())
 	}
 }
 
 // DropView represents a DROP VIEW statement.
 type DropView struct {
-	Names        TableNameReferences
+	Names        TableNames
 	IfExists     bool
 	DropBehavior DropBehavior
 }
 
 // Format implements the NodeFormatter interface.
-func (node *DropView) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("DROP VIEW ")
+func (node *DropView) Format(ctx *FmtCtx) {
+	ctx.WriteString("DROP VIEW ")
 	if node.IfExists {
-		buf.WriteString("IF EXISTS ")
+		ctx.WriteString("IF EXISTS ")
 	}
-	FormatNode(buf, f, node.Names)
+	ctx.FormatNode(&node.Names)
 	if node.DropBehavior != DropDefault {
-		buf.WriteByte(' ')
-		buf.WriteString(node.DropBehavior.String())
+		ctx.WriteByte(' ')
+		ctx.WriteString(node.DropBehavior.String())
 	}
 }
 
 // DropSequence represents a DROP SEQUENCE statement.
 type DropSequence struct {
-	Names        TableNameReferences
+	Names        TableNames
 	IfExists     bool
 	DropBehavior DropBehavior
 }
 
 // Format implements the NodeFormatter interface.
-func (node *DropSequence) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("DROP SEQUENCE ")
+func (node *DropSequence) Format(ctx *FmtCtx) {
+	ctx.WriteString("DROP SEQUENCE ")
 	if node.IfExists {
-		buf.WriteString("IF EXISTS ")
+		ctx.WriteString("IF EXISTS ")
 	}
-	FormatNode(buf, f, node.Names)
+	ctx.FormatNode(&node.Names)
 	if node.DropBehavior != DropDefault {
-		buf.WriteByte(' ')
-		buf.WriteString(node.DropBehavior.String())
+		ctx.WriteByte(' ')
+		ctx.WriteString(node.DropBehavior.String())
 	}
-}
-
-// DropUser represents a DROP USER statement
-type DropUser struct {
-	Names    Exprs
-	IfExists bool
-}
-
-// Format implements the NodeFormatter interface.
-func (node *DropUser) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("DROP USER ")
-	if node.IfExists {
-		buf.WriteString("IF EXISTS ")
-	}
-	FormatNode(buf, f, node.Names)
 }
 
 // DropRole represents a DROP ROLE statement
 type DropRole struct {
 	Names    Exprs
+	IsRole   bool
 	IfExists bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *DropRole) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("DROP ROLE ")
-	if node.IfExists {
-		buf.WriteString("IF EXISTS ")
+func (node *DropRole) Format(ctx *FmtCtx) {
+	ctx.WriteString("DROP")
+	if node.IsRole {
+		ctx.WriteString(" ROLE ")
+	} else {
+		ctx.WriteString(" USER ")
 	}
-	FormatNode(buf, f, node.Names)
+	if node.IfExists {
+		ctx.WriteString("IF EXISTS ")
+	}
+	ctx.FormatNode(&node.Names)
 }

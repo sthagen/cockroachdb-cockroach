@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 syntax = "proto3";
 package cockroach.pgerror;
@@ -21,6 +17,8 @@ option go_package = "pgerror";
 // for a list of all Postgres error fields, most of which are optional and can
 // be used to provide auxiliary error information.
 message Error {
+  // standard pg error fields. This can be passed
+  // over the pg wire protocol.
   string code = 1;
   string message = 2;
   string detail = 3;
@@ -33,6 +31,43 @@ message Error {
   }
   Source source = 5;
 
-  // "Internal query: the text of a failed internally-generated command."
-  string internalCommand = 6;
+  // Internal CockroachDB fields. These are used
+  // for internal error management.
+
+  // a telemetry key, used as telemetry counter name.
+  // Typically of the form [<prefix>.]#issuenum[.details]
+  //
+  // Note: this field is obsolete. It is preserved for compatibility
+  // with nodes running 19.1:
+  //
+  // - when an error with this field populated is received on a
+  //   post-19.1 node, the field is replaced by uses of
+  //   errors.WithTelemetryKey. This data is then subsequently used for
+  //   troubleshooting reports and telemetry.
+  // - Conversely, errors sent towards a 19.1 node will get this field
+  //   populated with the first key found in errors.GetTelemetryKeys().
+  //
+  // TODO(knz): Remove in 19.3.
+  string telemetry_key = 6;
+
+  message SafeDetail {
+	  string safe_message = 1;
+	  string encoded_stack_trace = 2;
+  }
+
+  // complement to the detail field that can be reported
+  // in sentry reports. This is scrubbed of PII.
+  //
+  // Note: this field is obsolete. It is preserved for compatibility
+  // with nodes running 19.1:
+  //
+  // - when an error with this field populated is received on a
+  //   post-19.1 node, the field is replaced by uses of
+  //   errors.WithSafeDetail. This data is then subsequently used for
+  //   troubleshooting reports.
+  // - Conversely, errors sent towards a 19.1 node will get this field
+  //   populated with the data from errors.GetSafeDetails().
+  //
+  // TODO(knz): Remove in 19.3.
+  repeated SafeDetail safe_detail = 7;
 };

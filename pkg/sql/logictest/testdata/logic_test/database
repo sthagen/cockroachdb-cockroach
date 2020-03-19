@@ -1,4 +1,4 @@
-# LogicTest: default
+# LogicTest: local
 
 statement ok
 CREATE DATABASE a
@@ -15,13 +15,34 @@ CREATE DATABASE ""
 query T colnames
 SHOW DATABASES
 ----
-Database
+database_name
 a
+defaultdb
+postgres
+system
+test
+
+statement ok
+COMMENT ON DATABASE a IS 'A'
+
+query TT colnames
+SHOW DATABASES WITH COMMENT
+----
+database_name  comment
+a              A
+defaultdb      NULL
+postgres       NULL
+system         NULL
+test           NULL
+
+query T colnames
+SHOW SCHEMAS FROM a
+----
+schema_name
 crdb_internal
 information_schema
 pg_catalog
-system
-test
+public
 
 statement ok
 CREATE DATABASE b TEMPLATE=template0
@@ -79,9 +100,8 @@ b4
 b5
 b6
 c
-crdb_internal
-information_schema
-pg_catalog
+defaultdb
+postgres
 system
 test
 
@@ -104,7 +124,7 @@ DROP DATABASE b RESTRICT
 statement ok
 DROP DATABASE b CASCADE
 
-statement error database "b" does not exist
+statement error pgcode 42P01 relation "b.a" does not exist
 SELECT * FROM b.a
 
 statement error database "b" does not exist
@@ -126,19 +146,18 @@ DROP DATABASE ""
 query T colnames
 SHOW DATABASES
 ----
-Database
+database_name
 a
 c
-crdb_internal
-information_schema
-pg_catalog
+defaultdb
+postgres
 system
 test
 
 statement ok
 CREATE DATABASE b
 
-statement error relation "b.a" does not exist
+statement error pgcode 42P01 relation "b.a" does not exist
 SELECT * FROM b.a
 
 statement ok
@@ -150,7 +169,7 @@ SELECT * FROM b.a
 
 user testuser
 
-statement error only root is allowed to CREATE DATABASE
+statement error only users with the admin role are allowed to CREATE DATABASE
 CREATE DATABASE privs
 
 user root

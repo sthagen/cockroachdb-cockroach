@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import React from "react";
 
@@ -7,7 +17,7 @@ import Print from "src/views/reports/containers/range/print";
 import RangeInfo from "src/views/reports/containers/range/rangeInfo";
 
 interface LeaseTableProps {
-  info: protos.cockroach.server.serverpb.RangeInfo$Properties;
+  info: protos.cockroach.server.serverpb.IRangeInfo;
 }
 
 export default class LeaseTable extends React.Component<LeaseTableProps, {}> {
@@ -18,7 +28,11 @@ export default class LeaseTable extends React.Component<LeaseTableProps, {}> {
     return <td className="lease-table__cell" title={title}>{value}</td>;
   }
 
-  renderLeaseTimestampCell(timestamp: protos.cockroach.util.hlc.Timestamp$Properties) {
+  renderLeaseTimestampCell(timestamp: protos.cockroach.util.hlc.ITimestamp) {
+    if (_.isNil(timestamp)) {
+      return this.renderLeaseCell("<no value>");
+    }
+
     const value = Print.Timestamp(timestamp);
     return this.renderLeaseCell(value, `${value}\n${timestamp.wall_time.toString()}`);
   }
@@ -29,7 +43,7 @@ export default class LeaseTable extends React.Component<LeaseTableProps, {}> {
     // leader?
     const rangeID = info.state.state.desc.range_id;
     const header = (
-      <h2>
+      <h2 className="base-heading">
         Lease History (from {Print.ReplicaID(rangeID, RangeInfo.GetLocalReplica(info))})
       </h2>
     );
@@ -64,8 +78,8 @@ export default class LeaseTable extends React.Component<LeaseTableProps, {}> {
             </tr>
             {
               _.map(leaseHistory, (lease, key) => {
-                let prevProposedTimestamp: protos.cockroach.util.hlc.Timestamp$Properties = null;
-                let prevStart: protos.cockroach.util.hlc.Timestamp$Properties = null;
+                let prevProposedTimestamp: protos.cockroach.util.hlc.ITimestamp = null;
+                let prevStart: protos.cockroach.util.hlc.ITimestamp = null;
                 if (key < leaseHistory.length - 1) {
                   prevProposedTimestamp = leaseHistory[key + 1].proposed_ts;
                   prevStart = leaseHistory[key + 1].start;

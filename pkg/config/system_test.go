@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package config_test
 
@@ -18,16 +14,19 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/gogo/protobuf/proto"
 )
+
+// TODO(benesch): Don't reinvent the key encoding here.
 
 func plainKV(k, v string) roachpb.KeyValue {
 	return kv([]byte(k), []byte(v))
@@ -50,21 +49,21 @@ func sqlKV(tableID uint32, indexID, descriptorID uint64) roachpb.KeyValue {
 }
 
 func descriptor(descriptorID uint64) roachpb.KeyValue {
-	return sqlKV(uint32(keys.DescriptorTableID), 1, descriptorID)
+	return kv(sqlbase.MakeDescMetadataKey(sqlbase.ID(descriptorID)), nil)
 }
 
-func zoneConfig(descriptorID uint32, spans ...config.SubzoneSpan) roachpb.KeyValue {
+func zoneConfig(descriptorID uint32, spans ...zonepb.SubzoneSpan) roachpb.KeyValue {
 	kv := roachpb.KeyValue{
 		Key: config.MakeZoneKey(descriptorID),
 	}
-	if err := kv.Value.SetProto(&config.ZoneConfig{SubzoneSpans: spans}); err != nil {
+	if err := kv.Value.SetProto(&zonepb.ZoneConfig{SubzoneSpans: spans}); err != nil {
 		panic(err)
 	}
 	return kv
 }
 
-func subzone(start, end string) config.SubzoneSpan {
-	return config.SubzoneSpan{Key: []byte(start), EndKey: []byte(end)}
+func subzone(start, end string) zonepb.SubzoneSpan {
+	return zonepb.SubzoneSpan{Key: []byte(start), EndKey: []byte(end)}
 }
 
 func kv(k, v []byte) roachpb.KeyValue {
@@ -109,7 +108,7 @@ func TestGet(t *testing.T) {
 		{someKeys, "d", &cVal},
 	}
 
-	cfg := config.SystemConfig{}
+	cfg := config.NewSystemConfig(zonepb.DefaultZoneConfigRef())
 	for tcNum, tc := range testCases {
 		cfg.Values = tc.values
 		if val := cfg.GetValue([]byte(tc.key)); !proto.Equal(val, tc.value) {
@@ -120,12 +119,15 @@ func TestGet(t *testing.T) {
 
 func TestGetLargestID(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	testCases := []struct {
+
+	type testCase struct {
 		values  []roachpb.KeyValue
 		largest uint32
 		maxID   uint32
 		errStr  string
-	}{
+	}
+
+	testCases := []testCase{
 		// No data.
 		{nil, 0, 0, "descriptor table not found"},
 
@@ -159,7 +161,13 @@ func TestGetLargestID(t *testing.T) {
 		}, 12, 0, ""},
 
 		// Real SQL layout.
-		{sqlbase.MakeMetadataSchema().GetInitialValues(), keys.MaxSystemConfigDescID + 4, 0, ""},
+		func() testCase {
+			ms := sqlbase.MakeMetadataSchema(zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
+			descIDs := ms.DescriptorIDs()
+			maxDescID := descIDs[len(descIDs)-1]
+			kvs, _ /* splits */ := ms.GetInitialValues(clusterversion.TestingClusterVersion)
+			return testCase{kvs, uint32(maxDescID), 0, ""}
+		}(),
 
 		// Test non-zero max.
 		{[]roachpb.KeyValue{
@@ -178,7 +186,7 @@ func TestGetLargestID(t *testing.T) {
 		}, 5, 7, ""},
 	}
 
-	cfg := config.SystemConfig{}
+	cfg := config.NewSystemConfig(zonepb.DefaultZoneConfigRef())
 	for tcNum, tc := range testCases {
 		cfg.Values = tc.values
 		ret, err := cfg.GetLargestObjectID(tc.maxID)
@@ -216,17 +224,19 @@ func TestComputeSplitKeySystemRanges(t *testing.T) {
 		start, end roachpb.RKey
 		split      roachpb.Key
 	}{
-		{roachpb.RKeyMin, roachpb.RKeyMax, keys.SystemPrefix},
-		{roachpb.RKeyMin, tkey(1), keys.SystemPrefix},
-		{roachpb.RKeyMin, roachpb.RKey(keys.TimeseriesPrefix), keys.SystemPrefix},
-		{roachpb.RKeyMin, roachpb.RKey(keys.SystemPrefix.Next()), keys.SystemPrefix},
+		{roachpb.RKeyMin, roachpb.RKeyMax, keys.NodeLivenessPrefix},
+		{roachpb.RKeyMin, tkey(1), keys.NodeLivenessPrefix},
+		{roachpb.RKeyMin, roachpb.RKey(keys.TimeseriesPrefix), keys.NodeLivenessPrefix},
+		{roachpb.RKeyMin, roachpb.RKey(keys.SystemPrefix.Next()), nil},
 		{roachpb.RKeyMin, roachpb.RKey(keys.SystemPrefix), nil},
 		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), nil},
 		{roachpb.RKeyMin, roachpb.RKey(keys.Meta2KeyMax), nil},
 		{roachpb.RKeyMin, roachpb.RKey(keys.Meta1KeyMax), nil},
 		{roachpb.RKey(keys.Meta1KeyMax), roachpb.RKey(keys.SystemPrefix), nil},
-		{roachpb.RKey(keys.Meta1KeyMax), roachpb.RKey(keys.SystemPrefix.Next()), keys.SystemPrefix},
-		{roachpb.RKey(keys.Meta1KeyMax), roachpb.RKeyMax, keys.SystemPrefix},
+		{roachpb.RKey(keys.Meta1KeyMax), roachpb.RKey(keys.SystemPrefix.Next()), nil},
+		{roachpb.RKey(keys.Meta1KeyMax), roachpb.RKey(keys.NodeLivenessPrefix), nil},
+		{roachpb.RKey(keys.Meta1KeyMax), roachpb.RKey(keys.NodeLivenessPrefix.Next()), keys.NodeLivenessPrefix},
+		{roachpb.RKey(keys.Meta1KeyMax), roachpb.RKeyMax, keys.NodeLivenessPrefix},
 		{roachpb.RKey(keys.SystemPrefix), roachpb.RKey(keys.SystemPrefix), nil},
 		{roachpb.RKey(keys.SystemPrefix), roachpb.RKey(keys.SystemPrefix.Next()), nil},
 		{roachpb.RKey(keys.SystemPrefix), roachpb.RKeyMax, keys.NodeLivenessPrefix},
@@ -247,8 +257,10 @@ func TestComputeSplitKeySystemRanges(t *testing.T) {
 		{roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd()), roachpb.RKeyMax, keys.SystemConfigSplitKey},
 	}
 
-	cfg := config.SystemConfig{
-		Values: sqlbase.MakeMetadataSchema().GetInitialValues(),
+	cfg := config.NewSystemConfig(zonepb.DefaultZoneConfigRef())
+	kvs, _ /* splits */ := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, zonepb.DefaultSystemZoneConfigRef()).GetInitialValues(clusterversion.TestingClusterVersion)
+	cfg.SystemConfigEntries = config.SystemConfigEntries{
+		Values: kvs,
 	}
 	for tcNum, tc := range testCases {
 		splitKey := cfg.ComputeSplitKey(tc.start, tc.end)
@@ -266,7 +278,7 @@ func TestComputeSplitKeyTableIDs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	const (
-		start         = keys.MaxReservedDescID + 1
+		start         = keys.MinUserDescID
 		reservedStart = keys.MaxSystemConfigDescID + 1
 	)
 
@@ -276,14 +288,16 @@ func TestComputeSplitKeyTableIDs(t *testing.T) {
 	// separately above.
 	minKey := roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd())
 
-	schema := sqlbase.MakeMetadataSchema()
+	schema := sqlbase.MakeMetadataSchema(zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
 	// Real system tables only.
-	baseSql := schema.GetInitialValues()
+	baseSql, _ /* splits */ := schema.GetInitialValues(clusterversion.TestingClusterVersion)
 	// Real system tables plus some user stuff.
-	userSQL := append(schema.GetInitialValues(),
-		descriptor(start), descriptor(start+1), descriptor(start+5))
+	kvs, _ /* splits */ := schema.GetInitialValues(clusterversion.TestingClusterVersion)
+	userSQL := append(kvs, descriptor(start), descriptor(start+1), descriptor(start+5))
 	// Real system tables and partitioned user tables.
-	subzoneSQL := append(userSQL,
+	var subzoneSQL = make([]roachpb.KeyValue, len(userSQL))
+	copy(subzoneSQL, userSQL)
+	subzoneSQL = append(subzoneSQL,
 		zoneConfig(start+1, subzone("a", ""), subzone("c", "e")),
 		zoneConfig(start+5, subzone("b", ""), subzone("c", "d"), subzone("d", "")))
 
@@ -349,9 +363,13 @@ func TestComputeSplitKeyTableIDs(t *testing.T) {
 		{subzoneSQL, tkey(start+5, "c"), tkey(start + 6), tkey(start+5, "d")},
 		{subzoneSQL, tkey(start+5, "d"), tkey(start + 6), tkey(start+5, "e")},
 		{subzoneSQL, tkey(start+5, "e"), tkey(start + 6), nil},
+
+		// Testing that no splits are required for IDs that
+		// that do not map to descriptors.
+		{userSQL, tkey(start + 1), tkey(start + 5), nil},
 	}
 
-	cfg := config.SystemConfig{}
+	cfg := config.NewSystemConfig(zonepb.DefaultZoneConfigRef())
 	for tcNum, tc := range testCases {
 		cfg.Values = tc.values
 		splitKey := cfg.ComputeSplitKey(tc.start, tc.end)
@@ -388,13 +406,25 @@ func TestGetZoneConfigForKey(t *testing.T) {
 		{roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd()), keys.SystemRangesID},
 		{roachpb.RKey(keys.TableDataMin), keys.SystemDatabaseID},
 		{roachpb.RKey(keys.SystemConfigSplitKey), keys.SystemDatabaseID},
-		{tkey(keys.NamespaceTableID), keys.SystemDatabaseID},
+
+		// Gossiped system tables should refer to the SystemDatabaseID.
 		{tkey(keys.ZonesTableID), keys.SystemDatabaseID},
-		{tkey(keys.LeaseTableID), keys.SystemDatabaseID},
-		{tkey(keys.JobsTableID), keys.SystemDatabaseID},
-		{tkey(keys.LocationsTableID), keys.SystemDatabaseID},
-		{tkey(keys.MaxReservedDescID + 1), keys.MaxReservedDescID + 1},
-		{tkey(keys.MaxReservedDescID + 23), keys.MaxReservedDescID + 23},
+
+		// Non-gossiped system tables should refer to themselves.
+		{tkey(keys.LeaseTableID), keys.LeaseTableID},
+		{tkey(keys.JobsTableID), keys.JobsTableID},
+		{tkey(keys.LocationsTableID), keys.LocationsTableID},
+		{tkey(keys.NamespaceTableID), keys.NamespaceTableID},
+
+		// Pseudo-tables should refer to the SystemDatabaseID.
+		{tkey(keys.MetaRangesID), keys.SystemDatabaseID},
+		{tkey(keys.SystemRangesID), keys.SystemDatabaseID},
+		{tkey(keys.TimeseriesRangesID), keys.SystemDatabaseID},
+		{tkey(keys.LivenessRangesID), keys.SystemDatabaseID},
+
+		// User tables should refer to themselves.
+		{tkey(keys.MinUserDescID), keys.MinUserDescID},
+		{tkey(keys.MinUserDescID + 22), keys.MinUserDescID + 22},
 		{roachpb.RKeyMax, keys.RootNamespaceID},
 	}
 
@@ -402,14 +432,19 @@ func TestGetZoneConfigForKey(t *testing.T) {
 	defer func() {
 		config.ZoneConfigHook = originalZoneConfigHook
 	}()
-	cfg := config.SystemConfig{
-		Values: sqlbase.MakeMetadataSchema().GetInitialValues(),
+	cfg := config.NewSystemConfig(zonepb.DefaultZoneConfigRef())
+
+	kvs, _ /* splits */ := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, zonepb.DefaultSystemZoneConfigRef()).GetInitialValues(clusterversion.TestingClusterVersion)
+	cfg.SystemConfigEntries = config.SystemConfigEntries{
+		Values: kvs,
 	}
 	for tcNum, tc := range testCases {
 		var objectID uint32
-		config.ZoneConfigHook = func(_ config.SystemConfig, id uint32, _ []byte) (config.ZoneConfig, bool, error) {
+		config.ZoneConfigHook = func(
+			_ *config.SystemConfig, id uint32,
+		) (*zonepb.ZoneConfig, *zonepb.ZoneConfig, bool, error) {
 			objectID = id
-			return config.ZoneConfig{}, false, nil
+			return &zonepb.ZoneConfig{}, nil, false, nil
 		}
 		_, err := cfg.GetZoneConfigForKey(tc.key)
 		if err != nil {

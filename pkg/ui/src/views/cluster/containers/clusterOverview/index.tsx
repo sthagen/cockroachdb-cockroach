@@ -1,31 +1,32 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import classNames from "classnames";
 import d3 from "d3";
 import React from "react";
+import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 
 import { AdminUIState } from "src/redux/state";
 import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
 import { Bytes as formatBytes } from "src/util/format";
-import { NodesOverview } from "src/views/cluster/containers/nodesOverview";
 import createChartComponent from "src/views/shared/util/d3-react";
 import capacityChart from "./capacity";
-
-import "./cluster.styl";
 import spinner from "assets/spinner.gif";
+import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
+import EmailSubscription from "src/views/dashboard/emailSubscription";
+import "./cluster.styl";
 
 // tslint:disable-next-line:variable-name
-const CapacityChart = createChartComponent(capacityChart);
-
-class ClusterTicker extends React.Component<{}, {}> {
-  render() {
-    return (
-      <section className="section cluster-ticker">
-        <h1>Cluster Overview</h1>
-      </section>
-    );
-  }
-}
+const CapacityChart = createChartComponent("svg", capacityChart());
 
 interface CapacityUsageProps {
   usedCapacity: number;
@@ -39,25 +40,25 @@ function renderCapacityUsage(props: CapacityUsageProps) {
   const usedPercentage = usableCapacity !== 0 ? usedCapacity / usableCapacity : 0;
   return [
     <h3 className="capacity-usage cluster-summary__title">Capacity Usage</h3>,
-    <div className="capacity-usage cluster-summary__metric">{ formatPercentage(usedPercentage) }</div>,
+    <div className="capacity-usage cluster-summary__label storage-percent">Used<br />Percent</div>,
+    <div className="capacity-usage cluster-summary__metric storage-percent">{ formatPercentage(usedPercentage) }</div>,
     <div className="capacity-usage cluster-summary__chart">
       <CapacityChart used={usedCapacity} usable={usableCapacity} />
     </div>,
-    <div className="capacity-usage cluster-summary__aside">
-      <span className="label">Current Usage</span>
-      <span className="value">{ formatBytes(usedCapacity) }</span>
-    </div>,
+    <div className="capacity-usage cluster-summary__label storage-used">Used<br />Capacity</div>,
+    <div className="capacity-usage cluster-summary__metric storage-used">{ formatBytes(usedCapacity) }</div>,
+    <div className="capacity-usage cluster-summary__label storage-usable">Usable<br />Capacity</div>,
+    <div className="capacity-usage cluster-summary__metric storage-usable">{ formatBytes(usableCapacity) }</div>,
   ];
 }
 
 const mapStateToCapacityUsageProps = createSelector(
   nodesSummarySelector,
   function (nodesSummary: NodesSummary) {
-    const { capacityAvailable, capacityUsed } = nodesSummary.nodeSums;
-    const usableCapacity = capacityAvailable + capacityUsed;
+    const { capacityUsed, capacityUsable } = nodesSummary.nodeSums;
     return {
       usedCapacity: capacityUsed,
-      usableCapacity: usableCapacity,
+      usableCapacity: capacityUsable,
     };
   },
 );
@@ -74,16 +75,22 @@ function renderNodeLiveness(props: NodeLivenessProps) {
     "node-liveness",
     "cluster-summary__metric",
     "suspect-nodes",
-    { "warning": suspectNodes > 0 },
+    {
+      "warning": suspectNodes > 0,
+      "disabled": suspectNodes === 0,
+    },
   );
   const deadClasses = classNames(
     "node-liveness",
     "cluster-summary__metric",
     "dead-nodes",
-    { "alert": deadNodes > 0 },
+    {
+      "alert": deadNodes > 0,
+      "disabled": deadNodes === 0,
+    },
   );
   return [
-    <h3 className="node-liveness cluster-summary__title">Node Liveness</h3>,
+    <h3 className="node-liveness cluster-summary__title">Node Status</h3>,
     <div className="node-liveness cluster-summary__metric live-nodes">{ liveNodes }</div>,
     <div className="node-liveness cluster-summary__label live-nodes">Live<br />Nodes</div>,
     <div className={suspectClasses}>{ suspectNodes }</div>,
@@ -117,13 +124,19 @@ function renderReplicationStatus(props: ReplicationStatusProps) {
     "replication-status",
     "cluster-summary__metric",
     "under-replicated-ranges",
-    { "warning": underReplicatedRanges > 0 },
+    {
+      "warning": underReplicatedRanges > 0,
+      "disabled": underReplicatedRanges === 0,
+    },
   );
   const unavailableClasses = classNames(
     "replication-status",
     "cluster-summary__metric",
     "unavailable-ranges",
-    { "alert": unavailableRanges > 0 },
+    {
+      "alert": unavailableRanges > 0,
+      "disabled": unavailableRanges === 0,
+    },
   );
   return [
     <h3 className="replication-status cluster-summary__title">Replication Status</h3>,
@@ -148,14 +161,33 @@ const mapStateToReplicationStatusProps = createSelector(
   },
 );
 
-interface ClusterSummaryProps {
+interface ClusterSummaryStateProps {
   capacityUsage: CapacityUsageProps;
   nodeLiveness: NodeLivenessProps;
   replicationStatus: ReplicationStatusProps;
   loading: boolean;
 }
+interface ClusterSummaryActionsProps {
+  refreshLiveness: () => void;
+  refreshNodes: () => void;
+}
+
+type ClusterSummaryProps = ClusterSummaryStateProps & ClusterSummaryActionsProps;
 
 class ClusterSummary extends React.Component<ClusterSummaryProps, {}> {
+  componentWillMount() {
+    this.refresh();
+  }
+
+  componentWillReceiveProps() {
+    this.refresh();
+  }
+
+  refresh() {
+    this.props.refreshLiveness();
+    this.props.refreshNodes();
+  }
+
   render() {
     const children = [];
 
@@ -169,11 +201,11 @@ class ClusterSummary extends React.Component<ClusterSummaryProps, {}> {
       );
     }
 
-    return <section className="cluster-summary" children={children} />;
+    return <section className="cluster-summary" children={React.Children.toArray(children)} />;
   }
 }
 
-function mapStateToClusterSummaryProps (state: AdminUIState) {
+function mapStateToClusterSummaryProps(state: AdminUIState) {
   return {
     capacityUsage: mapStateToCapacityUsageProps(state),
     nodeLiveness: mapStateToNodeLivenessProps(state),
@@ -182,24 +214,30 @@ function mapStateToClusterSummaryProps (state: AdminUIState) {
   };
 }
 
+const actions = {
+  refreshLiveness: refreshLiveness,
+  refreshNodes: refreshNodes,
+};
+
 // tslint:disable-next-line:variable-name
-const ClusterSummaryConnected = connect(mapStateToClusterSummaryProps)(ClusterSummary);
+const ClusterSummaryConnected = connect(mapStateToClusterSummaryProps, actions)(ClusterSummary);
 
 /**
  * Renders the main content of the cluster visualization page.
  */
-class ClusterOverview extends React.Component<{}, {}> {
+export default class ClusterOverview extends React.Component<any, any> {
   render() {
     return (
-      <div>
-        <div className="cluster-overview">
-          <ClusterTicker />
+      <div className="cluster-page">
+        <Helmet title="Cluster Overview" />
+        <EmailSubscription />
+        <section className="section cluster-overview">
           <ClusterSummaryConnected />
-        </div>
-        <NodesOverview />
+        </section>
+        <section className="cluster-overview--fixed">
+          { this.props.children }
+        </section>
       </div>
     );
   }
 }
-
-export { ClusterOverview as default };

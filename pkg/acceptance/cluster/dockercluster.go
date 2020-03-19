@@ -1,22 +1,19 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cluster
 
 import (
 	"bytes"
 	"context"
+	gosql "database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,7 +21,6 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -33,6 +29,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
@@ -41,22 +46,6 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 	"github.com/pkg/errors"
-
-	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
-	roachClient "github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 const (
@@ -75,14 +64,11 @@ const CockroachBinaryInContainer = "/cockroach/cockroach"
 var cockroachImage = flag.String("i", defaultImage, "the docker image to run")
 var cockroachEntry = flag.String("e", "", "the entry point for the image")
 var waitOnStop = flag.Bool("w", false, "wait for the user to interrupt before tearing down the cluster")
-var maxRangeBytes = config.DefaultZoneConfig().RangeMaxBytes
-
-// keyLen is the length (in bits) of the generated CA and node certs.
-const keyLen = 1024
+var maxRangeBytes = *zonepb.DefaultZoneConfig().RangeMaxBytes
 
 // CockroachBinary is the path to the host-side binary to use.
 var CockroachBinary = flag.String("b", func() string {
-	rootPkg, err := build.Import("github.com/cockroachdb/cockroach", "", 0)
+	rootPkg, err := build.Import("github.com/cockroachdb/cockroach", "", build.FindOnly)
 	if err != nil {
 		panic(err)
 	}
@@ -144,7 +130,6 @@ type DockerCluster struct {
 	events               chan Event
 	expectedEvents       chan Event
 	oneshot              *Container
-	CertsDir             string
 	stopper              *stop.Stopper
 	monitorCtx           context.Context
 	monitorCtxCancelFunc func()
@@ -174,7 +159,7 @@ func CreateDocker(
 		log.Fatalf(ctx, "\"%s\": does not exist", *CockroachBinary)
 	}
 
-	cli, err := client.NewEnvClient()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
 	maybePanic(err)
 
 	cli.NegotiateAPIVersion(ctx)
@@ -331,17 +316,13 @@ func (l *DockerCluster) initCluster(ctx context.Context) {
 	pwd, err := os.Getwd()
 	maybePanic(err)
 
-	// Create the temporary certs directory in the current working
-	// directory. Boot2docker's handling of binding local directories
-	// into the container is very confusing. If the directory being
-	// bound has a parent directory that exists in the boot2docker VM
-	// then that directory is bound into the container. In particular,
-	// that means that binds of /tmp and /var will be problematic.
-	l.CertsDir, err = ioutil.TempDir(pwd, ".localcluster.certs.")
-	maybePanic(err)
-
+	// Boot2docker's handling of binding local directories into the container is
+	// very confusing. If the directory being bound has a parent directory that
+	// exists in the boot2docker VM then that directory is bound into the
+	// container. In particular, that means that binds of /tmp and /var will be
+	// problematic.
 	binds := []string{
-		l.CertsDir + ":/certs",
+		filepath.Join(pwd, certsDir) + ":/certs",
 		filepath.Join(pwd, "..") + ":/go/src/github.com/cockroachdb/cockroach",
 		filepath.Join(l.volumesDir, "logs") + ":/logs",
 	}
@@ -460,21 +441,15 @@ func (l *DockerCluster) createRoach(
 	maybePanic(err)
 }
 
-func (l *DockerCluster) createCACert() {
-	maybePanic(security.CreateCAPair(
-		l.CertsDir, filepath.Join(l.CertsDir, security.EmbeddedCAKey),
-		keyLen, 96*time.Hour, false, false))
-}
-
 func (l *DockerCluster) createNodeCerts() {
 	nodes := []string{"localhost", dockerIP().String()}
 	for _, node := range l.Nodes {
 		nodes = append(nodes, node.nodeStr)
 	}
 	maybePanic(security.CreateNodePair(
-		l.CertsDir,
-		filepath.Join(l.CertsDir, security.EmbeddedCAKey),
-		keyLen, 48*time.Hour, false, nodes))
+		certsDir,
+		filepath.Join(certsDir, security.EmbeddedCAKey),
+		keyLen, 48*time.Hour, true /* overwrite */, nodes))
 }
 
 // startNode starts a Docker container to run testNode. It may be called in
@@ -483,8 +458,8 @@ func (l *DockerCluster) startNode(ctx context.Context, node *testNode) {
 	cmd := []string{
 		"start",
 		"--certs-dir=/certs/",
-		"--host=" + node.nodeStr,
-		"--verbosity=1",
+		"--listen-addr=" + node.nodeStr,
+		"--vmodule=*=1",
 	}
 
 	// Forward the vmodule flag to the nodes.
@@ -495,8 +470,8 @@ func (l *DockerCluster) startNode(ctx context.Context, node *testNode) {
 
 	for _, store := range node.stores {
 		storeSpec := base.StoreSpec{
-			Path:        store.dir,
-			SizeInBytes: int64(store.config.MaxRanges) * maxRangeBytes,
+			Path: store.dir,
+			Size: base.SizeSpec{InBytes: int64(store.config.MaxRanges) * maxRangeBytes},
 		}
 		cmd = append(cmd, fmt.Sprintf("--store=%s", storeSpec))
 	}
@@ -513,8 +488,8 @@ func (l *DockerCluster) startNode(ctx context.Context, node *testNode) {
 		"--log-dir="+dockerLogDir)
 	env := []string{
 		"COCKROACH_SCAN_MAX_IDLE_TIME=200ms",
-		"COCKROACH_CONSISTENCY_CHECK_PANIC_ON_FAILURE=true",
 		"COCKROACH_SKIP_UPDATE_CHECK=1",
+		"COCKROACH_CRASH_REPORTS=",
 	}
 	l.createRoach(ctx, node, l.vols, env, cmd...)
 	maybePanic(node.Start(ctx))
@@ -527,9 +502,9 @@ func (l *DockerCluster) startNode(ctx context.Context, node *testNode) {
   pprof:     docker exec -it %[4]s pprof https+insecure://$(hostname):%[5]s/debug/pprof/heap
   cockroach: %[6]s
 
-  cli-env:   COCKROACH_INSECURE=false COCKROACH_CERTS_DIR=%[7]s COCKROACH_HOST=%s COCKROACH_PORT=%d`,
+  cli-env:   COCKROACH_INSECURE=false COCKROACH_CERTS_DIR=%[7]s COCKROACH_HOST=%s:%d`,
 		node.Name(), "https://"+httpAddr.String(), localLogDir, node.Container.id[:5],
-		base.DefaultHTTPPort, cmd, l.CertsDir, httpAddr.IP, httpAddr.Port)
+		base.DefaultHTTPPort, cmd, certsDir, httpAddr.IP, httpAddr.Port)
 }
 
 // RunInitCommand runs the `cockroach init` command. Normally called
@@ -548,37 +523,8 @@ func (l *DockerCluster) RunInitCommand(ctx context.Context, nodeIdx int) {
 	}
 
 	log.Infof(ctx, "trying to initialize via %v", containerConfig.Cmd)
-	// This is called early in the bootstrap sequence, and the node may not have
-	// opened its ports yet. Retry appropriately.
-	//
-	// TODO(tschottdorf): production code wouldn't do it like this. Instead,
-	// you'd wait until the healthz endpoint indicates that the init command
-	// should be tried. Perhaps these subtleties should simply be folded into
-	// `./cockroach init` as users are likely to get this wrong.
-	//
-	// See #19791.
-	maybePanic(retry.ForDuration(time.Minute, func() error {
-		err := l.OneShot(
-			ctx, defaultImage, types.ImagePullOptions{}, containerConfig, container.HostConfig{}, "init-command",
-		)
-
-		if err != nil {
-			// Run a health check in the hope that Init failed because a
-			// previously issued Init actually went through just fine.
-			url := l.URL(ctx, nodeIdx) + "/health"
-			resp, httpErr := HTTPClient.Get(url)
-			if httpErr != nil {
-				return errors.Wrap(err, httpErr.Error())
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				log.Warning(ctx, "init failed and server not healthy; retrying")
-				return err
-			}
-		}
-		return nil
-	}))
+	maybePanic(l.OneShot(ctx, defaultImage, types.ImagePullOptions{},
+		containerConfig, container.HostConfig{}, "init-command"))
 	log.Info(ctx, "cluster successfully initialized")
 }
 
@@ -681,12 +627,8 @@ func (l *DockerCluster) Start(ctx context.Context) {
 
 	l.createNetwork(ctx)
 	l.initCluster(ctx)
-	log.Infof(ctx, "creating certs (%dbit) in: %s", keyLen, l.CertsDir)
-	l.createCACert()
+	log.Infof(ctx, "creating node certs (%dbit) in: %s", keyLen, certsDir)
 	l.createNodeCerts()
-	maybePanic(security.CreateClientPair(
-		l.CertsDir, filepath.Join(l.CertsDir, security.EmbeddedCAKey),
-		512, 48*time.Hour, false, security.RootUser))
 
 	l.monitorCtx, l.monitorCtxCancelFunc = context.WithCancel(context.Background())
 	go l.monitor(ctx)
@@ -769,10 +711,6 @@ func (l *DockerCluster) stop(ctx context.Context) {
 		maybePanic(l.vols.Remove(ctx))
 		l.vols = nil
 	}
-	if l.CertsDir != "" {
-		_ = os.RemoveAll(l.CertsDir)
-		l.CertsDir = ""
-	}
 	for i, n := range l.Nodes {
 		if n.Container == nil {
 			continue
@@ -806,18 +744,9 @@ func (l *DockerCluster) stop(ctx context.Context) {
 	}
 }
 
-// NewClient implements the Cluster interface.
-func (l *DockerCluster) NewClient(ctx context.Context, i int) (*roachClient.DB, error) {
-	clock := hlc.NewClock(hlc.UnixNano, 0)
-	rpcContext := rpc.NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, &base.Config{
-		User:        security.NodeUser,
-		SSLCertsDir: l.CertsDir,
-	}, clock, l.stopper, &cluster.MakeTestingClusterSettings().Version)
-	conn, err := rpcContext.GRPCDial(l.Nodes[i].Addr(ctx, DefaultTCP).String()).Connect(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return roachClient.NewDB(roachClient.NewSender(conn), clock), nil
+// NewDB implements the Cluster interface.
+func (l *DockerCluster) NewDB(ctx context.Context, i int) (*gosql.DB, error) {
+	return gosql.Open("postgres", l.PGUrl(ctx, i))
 }
 
 // InternalIP returns the IP address used for inter-node communication.
@@ -835,9 +764,9 @@ func (l *DockerCluster) PGUrl(ctx context.Context, i int) string {
 	certUser := security.RootUser
 	options := url.Values{}
 	options.Add("sslmode", "verify-full")
-	options.Add("sslcert", filepath.Join(l.CertsDir, security.EmbeddedRootCert))
-	options.Add("sslkey", filepath.Join(l.CertsDir, security.EmbeddedRootKey))
-	options.Add("sslrootcert", filepath.Join(l.CertsDir, security.EmbeddedCACert))
+	options.Add("sslcert", filepath.Join(certsDir, security.EmbeddedRootCert))
+	options.Add("sslkey", filepath.Join(certsDir, security.EmbeddedRootKey))
+	options.Add("sslrootcert", filepath.Join(certsDir, security.EmbeddedCACert))
 	pgURL := url.URL{
 		Scheme:   "postgres",
 		User:     url.User(certUser),

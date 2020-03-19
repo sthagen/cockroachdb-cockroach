@@ -1,49 +1,53 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
-	"strconv"
+	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 type stmtKey struct {
 	stmt        string
 	failed      bool
 	distSQLUsed bool
+	implicitTxn bool
 }
 
 // appStats holds per-application statistics.
 type appStats struct {
-	st *cluster.Settings
-
 	syncutil.Mutex
+
+	st    *cluster.Settings
 	stmts map[stmtKey]*stmtStats
+	txns  transactionStats
 }
 
 // stmtStats holds per-statement statistics.
@@ -53,24 +57,50 @@ type stmtStats struct {
 	data roachpb.StatementStatistics
 }
 
+// transactionStats holds per-application transaction statistics.
+type transactionStats struct {
+	mu struct {
+		syncutil.Mutex
+		roachpb.TxnStats
+	}
+}
+
 // stmtStatsEnable determines whether to collect per-statement
 // statistics.
-var stmtStatsEnable = settings.RegisterBoolSetting(
+var stmtStatsEnable = settings.RegisterPublicBoolSetting(
 	"sql.metrics.statement_details.enabled", "collect per-statement query statistics", true,
+)
+
+// txnStatsEnable determines whether to collect per-application transaction
+// statistics.
+var txnStatsEnable = settings.RegisterPublicBoolSetting(
+	"sql.metrics.transaction_details.enabled", "collect per-application transaction statistics", true,
 )
 
 // sqlStatsCollectionLatencyThreshold specifies the minimum amount of time
 // consumed by a SQL statement before it is collected for statistics reporting.
-var sqlStatsCollectionLatencyThreshold = settings.RegisterDurationSetting(
+var sqlStatsCollectionLatencyThreshold = settings.RegisterPublicDurationSetting(
 	"sql.metrics.statement_details.threshold",
 	"minimum execution time to cause statistics to be collected",
 	0,
 )
 
-var dumpStmtStatsToLogBeforeReset = settings.RegisterBoolSetting(
+var dumpStmtStatsToLogBeforeReset = settings.RegisterPublicBoolSetting(
 	"sql.metrics.statement_details.dump_to_logs",
 	"dump collected statement statistics to node logs when periodically cleared",
 	false,
+)
+
+var sampleLogicalPlans = settings.RegisterPublicBoolSetting(
+	"sql.metrics.statement_details.plan_collection.enabled",
+	"periodically save a logical plan for each fingerprint",
+	true,
+)
+
+var logicalPlanCollectionPeriod = settings.RegisterPublicNonNegativeDurationSetting(
+	"sql.metrics.statement_details.plan_collection.period",
+	"the time until a new logical plan is collected",
+	5*time.Minute,
 )
 
 func (s stmtKey) String() string {
@@ -88,15 +118,21 @@ func (s stmtKey) flags() string {
 	return b.String()
 }
 
+// recordStatement saves per-statement statistics.
+//
+// samplePlanDescription can be nil, as these are only sampled periodically per unique fingerprint.
 func (a *appStats) recordStatement(
-	stmt Statement,
+	stmt *Statement,
+	samplePlanDescription *roachpb.ExplainTreePlanNode,
 	distSQLUsed bool,
+	implicitTxn bool,
 	automaticRetryCount int,
 	numRows int,
 	err error,
 	parseLat, planLat, runLat, svcLat, ovhLat float64,
+	bytesRead, rowsRead int64,
 ) {
-	if a == nil || !stmtStatsEnable.Get(&a.st.SV) {
+	if !stmtStatsEnable.Get(&a.st.SV) {
 		return
 	}
 
@@ -104,32 +140,19 @@ func (a *appStats) recordStatement(
 		return
 	}
 
-	// Some statements like SET, SHOW etc are not useful to collect
-	// stats about. Ignore them.
-	if _, ok := stmt.AST.(tree.HiddenFromStats); ok {
-		return
-	}
-
-	// Extend the statement key with a character that indicated whether
-	// there was an error and/or whether the query was distributed, so
-	// that we use separate buckets for the different situations.
-	key := stmtKey{failed: err != nil, distSQLUsed: distSQLUsed}
-
-	if stmt.AnonymizedStr != "" {
-		// Use the cached anonymized string.
-		key.stmt = stmt.AnonymizedStr
-	} else {
-		key.stmt = a.getStrForStmt(stmt)
-	}
-
 	// Get the statistics object.
-	s := a.getStatsForStmt(key)
+	s := a.getStatsForStmt(stmt, distSQLUsed, implicitTxn, err, true /* createIfNonexistent */)
 
 	// Collect the per-statement statistics.
 	s.Lock()
 	s.data.Count++
 	if err != nil {
-		s.data.LastErr = err.Error()
+		s.data.SensitiveInfo.LastErr = err.Error()
+	}
+	// Only update MostRecentPlanDescription if we sampled a new PlanDescription.
+	if samplePlanDescription != nil {
+		s.data.SensitiveInfo.MostRecentPlanDescription = *samplePlanDescription
+		s.data.SensitiveInfo.MostRecentPlanTimestamp = timeutil.Now()
 	}
 	if automaticRetryCount == 0 {
 		s.data.FirstAttemptCount++
@@ -142,16 +165,34 @@ func (a *appStats) recordStatement(
 	s.data.RunLat.Record(s.data.Count, runLat)
 	s.data.ServiceLat.Record(s.data.Count, svcLat)
 	s.data.OverheadLat.Record(s.data.Count, ovhLat)
+	s.data.BytesRead = bytesRead
+	s.data.RowsRead = rowsRead
 	s.Unlock()
 }
 
 // getStatsForStmt retrieves the per-stmt stat object.
-func (a *appStats) getStatsForStmt(key stmtKey) *stmtStats {
+func (a *appStats) getStatsForStmt(
+	stmt *Statement, distSQLUsed bool, implicitTxn bool, err error, createIfNonexistent bool,
+) *stmtStats {
+	// Extend the statement key with various characteristics, so
+	// that we use separate buckets for the different situations.
+	key := stmtKey{failed: err != nil, distSQLUsed: distSQLUsed, implicitTxn: implicitTxn}
+	if stmt.AnonymizedStr != "" {
+		// Use the cached anonymized string.
+		key.stmt = stmt.AnonymizedStr
+	} else {
+		key.stmt = anonymizeStmt(stmt.AST)
+	}
+
+	return a.getStatsForStmtWithKey(key, createIfNonexistent)
+}
+
+func (a *appStats) getStatsForStmtWithKey(key stmtKey, createIfNonexistent bool) *stmtStats {
 	a.Lock()
 	// Retrieve the per-statement statistic object, and create it if it
 	// doesn't exist yet.
 	s, ok := a.stmts[key]
-	if !ok {
+	if !ok && createIfNonexistent {
 		s = &stmtStats{}
 		a.stmts[key] = s
 	}
@@ -159,33 +200,118 @@ func (a *appStats) getStatsForStmt(key stmtKey) *stmtStats {
 	return s
 }
 
-func (a *appStats) getStrForStmt(stmt Statement) string {
-	var buf bytes.Buffer
-	tree.FormatNode(&buf, tree.FmtHideConstants, stmt.AST)
-	return buf.String()
+// Add combines one appStats into another. Add manages locks on a, so taking
+// a lock on a will cause a deadlock.
+func (a *appStats) Add(other *appStats) {
+	other.Lock()
+	statMap := make(map[stmtKey]*stmtStats)
+	for k, v := range other.stmts {
+		statMap[k] = v
+	}
+	other.Unlock()
+
+	// Copy the statement stats for each statement key.
+	for k, v := range statMap {
+		v.Lock()
+		statCopy := &stmtStats{data: v.data}
+		v.Unlock()
+		statMap[k] = statCopy
+	}
+
+	// Merge the statement stats.
+	for k, v := range statMap {
+		s := a.getStatsForStmtWithKey(k, true)
+		s.Lock()
+		// Note that we don't need to take a lock on v because
+		// no other thread knows about v yet.
+		s.data.Add(&v.data)
+		s.Unlock()
+	}
+
+	// Create a copy of the other's transactions statistics.
+	other.txns.mu.Lock()
+	txnStats := other.txns.mu.TxnStats
+	other.txns.mu.Unlock()
+
+	// Merge the transaction stats.
+	a.txns.mu.Lock()
+	a.txns.mu.TxnStats.Add(txnStats)
+	a.txns.mu.Unlock()
 }
 
-// sqlStats carries per-application statistics for all applications on
-// each node. It hangs off Executor.
+func anonymizeStmt(ast tree.Statement) string {
+	return tree.AsStringWithFlags(ast, tree.FmtHideConstants)
+}
+
+func (s *transactionStats) getStats() (
+	txnCount int64,
+	txnTimeAvg float64,
+	txnTimeVar float64,
+	committedCount int64,
+	implicitCount int64,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	txnCount = s.mu.TxnCount
+	txnTimeAvg = s.mu.TxnTimeSec.Mean
+	txnTimeVar = s.mu.TxnTimeSec.GetVariance(txnCount)
+	committedCount = s.mu.CommittedCount
+	implicitCount = s.mu.ImplicitCount
+	return txnCount, txnTimeAvg, txnTimeVar, committedCount, implicitCount
+}
+
+func (s *transactionStats) recordTransaction(txnTimeSec float64, ev txnEvent, implicit bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.TxnCount++
+	s.mu.TxnTimeSec.Record(s.mu.TxnCount, txnTimeSec)
+	if ev == txnCommit {
+		s.mu.CommittedCount++
+	}
+	if implicit {
+		s.mu.ImplicitCount++
+	}
+}
+
+func (a *appStats) recordTransaction(txnTimeSec float64, ev txnEvent, implicit bool) {
+	if !txnStatsEnable.Get(&a.st.SV) {
+		return
+	}
+	a.txns.recordTransaction(txnTimeSec, ev, implicit)
+}
+
+// shouldSaveLogicalPlanDescription returns whether we should save this as a
+// sample logical plan for its corresponding fingerprint. We use
+// `logicalPlanCollectionPeriod` to assess how frequently to sample logical
+// plans.
+func (a *appStats) shouldSaveLogicalPlanDescription(
+	stmt *Statement, useDistSQL bool, implicitTxn bool, err error,
+) bool {
+	if !sampleLogicalPlans.Get(&a.st.SV) {
+		return false
+	}
+	stats := a.getStatsForStmt(stmt, useDistSQL, implicitTxn, err, false /* createIfNonexistent */)
+	if stats == nil {
+		// Save logical plan the first time we see new statement fingerprint.
+		return true
+	}
+	now := timeutil.Now()
+	period := logicalPlanCollectionPeriod.Get(&a.st.SV)
+	stats.Lock()
+	defer stats.Unlock()
+	timeLastSampled := stats.data.SensitiveInfo.MostRecentPlanTimestamp
+	return now.Sub(timeLastSampled) >= period
+}
+
+// sqlStats carries per-application statistics for all applications.
 type sqlStats struct {
-	st *cluster.Settings
 	syncutil.Mutex
 
-	// apps is the container for all the per-application statistics
-	// objects.
+	st *cluster.Settings
+	// lastReset is the time at which the app containers were reset.
+	lastReset time.Time
+	// apps is the container for all the per-application statistics objects.
 	apps map[string]*appStats
-}
-
-// resetApplicationName initializes both Session.mu.ApplicationName and
-// the cached pointer to per-application statistics. It is meant to be
-// used upon session initialization and upon SET APPLICATION_NAME.
-func (s *Session) resetApplicationName(appName string) {
-	s.mu.Lock()
-	s.mu.ApplicationName = appName
-	s.mu.Unlock()
-	if s.sqlStats != nil {
-		s.appStats = s.sqlStats.getStatsForApplication(appName)
-	}
 }
 
 func (s *sqlStats) getStatsForApplication(appName string) *appStats {
@@ -194,9 +320,26 @@ func (s *sqlStats) getStatsForApplication(appName string) *appStats {
 	if a, ok := s.apps[appName]; ok {
 		return a
 	}
-	a := &appStats{st: s.st, stmts: make(map[stmtKey]*stmtStats)}
+	a := &appStats{
+		st:    s.st,
+		stmts: make(map[stmtKey]*stmtStats),
+	}
 	s.apps[appName] = a
 	return a
+}
+
+func (s *sqlStats) Add(other *sqlStats) {
+	other.Lock()
+	appStatsCopy := make(map[string]*appStats)
+	for k, v := range other.apps {
+		appStatsCopy[k] = v
+	}
+	other.Unlock()
+	for k, v := range appStatsCopy {
+		stats := s.getStatsForApplication(k)
+		// Add manages locks for itself, so we don't need to guard it with locks.
+		stats.Add(v)
+	}
 }
 
 // resetStats clears all the stored per-app and per-statement
@@ -230,12 +373,19 @@ func (s *sqlStats) resetStats(ctx context.Context) {
 			dumpStmtStats(ctx, appName, a.stmts)
 		}
 
-		// Clear the map, to release the memory; make the new map somewhat
-		// already large for the likely future workload.
+		// Clear the map, to release the memory; make the new map somewhat already
+		// large for the likely future workload.
 		a.stmts = make(map[stmtKey]*stmtStats, len(a.stmts)/2)
 		a.Unlock()
 	}
+	s.lastReset = timeutil.Now()
 	s.Unlock()
+}
+
+func (s *sqlStats) getLastReset() time.Time {
+	s.Lock()
+	defer s.Unlock()
+	return s.lastReset
 }
 
 // Save the existing data for an application to the info log.
@@ -258,7 +408,7 @@ func dumpStmtStats(ctx context.Context, appName string, stats map[stmtKey]*stmtS
 	log.Info(ctx, buf.String())
 }
 
-func scrubStmtStatKey(vt virtualSchemaHolder, key string) (string, bool) {
+func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
 	// Re-parse the statement to obtain its AST.
 	stmt, err := parser.ParseOne(key)
 	if err != nil {
@@ -266,98 +416,131 @@ func scrubStmtStatKey(vt virtualSchemaHolder, key string) (string, bool) {
 	}
 
 	// Re-format to remove most names.
-	formatter := tree.FmtReformatTableNames(tree.FmtAnonymize,
-		func(t *tree.NormalizableTableName, buf *bytes.Buffer, f tree.FmtFlags) {
-			tn, err := t.Normalize()
-			if err != nil {
-				buf.WriteByte('_')
-				return
-			}
-			virtual, err := vt.getVirtualTableEntry(tn)
-			if err != nil || virtual.desc == nil {
-				buf.WriteByte('_')
-				return
-			}
-			// Virtual table: we want to keep the name.
-			tn.Format(buf, tree.FmtParsable)
+	f := tree.NewFmtCtx(tree.FmtAnonymize)
+
+	reformatFn := func(ctx *tree.FmtCtx, tn *tree.TableName) {
+		virtual, err := vt.getVirtualTableEntry(tn)
+		if err != nil || virtual.desc == nil {
+			ctx.WriteByte('_')
+			return
+		}
+		// Virtual table: we want to keep the name; however
+		// we need to scrub the database name prefix.
+		newTn := *tn
+		newTn.CatalogName = "_"
+
+		ctx.WithFlags(tree.FmtParsable, func() {
+			ctx.WithReformatTableNames(nil, func() {
+				ctx.FormatNode(&newTn)
+			})
 		})
-	return tree.AsStringWithFlags(stmt, formatter), true
+	}
+	f.SetReformatTableNames(reformatFn)
+	f.FormatNode(stmt.AST)
+	return f.CloseAndGetString(), true
 }
 
-// GetScrubbedStmtStats returns the statement statistics by app, with the
-// queries scrubbed of their identifiers. Any statements which cannot be
-// scrubbed will be omitted from the returned map.
-func (e *Executor) GetScrubbedStmtStats() []roachpb.CollectedStatementStatistics {
+func (s *sqlStats) getScrubbedStmtStats(
+	vt *VirtualSchemaHolder,
+) []roachpb.CollectedStatementStatistics {
+	return s.getStmtStats(vt, true /* scrub */)
+}
+
+func (s *sqlStats) getUnscrubbedStmtStats(
+	vt *VirtualSchemaHolder,
+) []roachpb.CollectedStatementStatistics {
+	return s.getStmtStats(vt, false /* scrub */)
+}
+
+func (s *sqlStats) getStmtStats(
+	vt *VirtualSchemaHolder, scrub bool,
+) []roachpb.CollectedStatementStatistics {
+	s.Lock()
+	defer s.Unlock()
 	var ret []roachpb.CollectedStatementStatistics
-	vt := e.virtualSchemas
-	e.sqlStats.Lock()
-	for appName, a := range e.sqlStats.apps {
-		if cap(ret) == 0 {
-			// guesitmate that we'll need apps*(queries-per-app).
-			ret = make([]roachpb.CollectedStatementStatistics, 0, len(a.stmts)*len(e.sqlStats.apps))
-		}
-		hashedApp := HashAppName(appName)
+	salt := ClusterSecret.Get(&s.st.SV)
+	for appName, a := range s.apps {
 		a.Lock()
+		if cap(ret) == 0 {
+			// guesstimate that we'll need apps*(queries-per-app).
+			ret = make([]roachpb.CollectedStatementStatistics, 0, len(a.stmts)*len(s.apps))
+		}
 		for q, stats := range a.stmts {
-			scrubbed, ok := scrubStmtStatKey(vt, q.stmt)
+			maybeScrubbed := q.stmt
+			maybeHashedAppName := appName
+			ok := true
+			if scrub {
+				maybeScrubbed, ok = scrubStmtStatKey(vt, q.stmt)
+				if !strings.HasPrefix(appName, sqlbase.ReportableAppNamePrefix) {
+					maybeHashedAppName = HashForReporting(salt, appName)
+				}
+			}
 			if ok {
 				k := roachpb.StatementStatisticsKey{
-					Query:   scrubbed,
-					DistSQL: q.distSQLUsed,
-					Failed:  q.failed,
-					App:     hashedApp,
+					Query:       maybeScrubbed,
+					DistSQL:     q.distSQLUsed,
+					Opt:         true,
+					ImplicitTxn: q.implicitTxn,
+					Failed:      q.failed,
+					App:         maybeHashedAppName,
 				}
 				stats.Lock()
-				ret = append(ret, roachpb.CollectedStatementStatistics{Key: k, Stats: stats.data})
+				data := stats.data
 				stats.Unlock()
+
+				if scrub {
+					// Quantize the counts to avoid leaking information that way.
+					quantizeCounts(&data)
+					data.SensitiveInfo = data.SensitiveInfo.GetScrubbedCopy()
+				}
+
+				ret = append(ret, roachpb.CollectedStatementStatistics{Key: k, Stats: data})
 			}
 		}
 		a.Unlock()
 	}
-	e.sqlStats.Unlock()
 	return ret
 }
 
-// HashAppName 1-way hashes an application names for use in stat reporting.
-func HashAppName(appName string) string {
-	hash := fnv.New64a()
+// quantizeCounts ensures that the counts are bucketed into "simple" values.
+func quantizeCounts(d *roachpb.StatementStatistics) {
+	oldCount := d.Count
+	newCount := telemetry.Bucket10(oldCount)
+	d.Count = newCount
+	// The SquaredDiffs values are meant to enable computing the variance
+	// via the formula variance = squareddiffs / (count - 1).
+	// Since we're adjusting the count, we must re-compute a value
+	// for SquaredDiffs that keeps the same variance with the new count.
+	oldCountMinusOne := float64(oldCount - 1)
+	newCountMinusOne := float64(newCount - 1)
+	d.NumRows.SquaredDiffs = (d.NumRows.SquaredDiffs / oldCountMinusOne) * newCountMinusOne
+	d.ParseLat.SquaredDiffs = (d.ParseLat.SquaredDiffs / oldCountMinusOne) * newCountMinusOne
+	d.PlanLat.SquaredDiffs = (d.PlanLat.SquaredDiffs / oldCountMinusOne) * newCountMinusOne
+	d.RunLat.SquaredDiffs = (d.RunLat.SquaredDiffs / oldCountMinusOne) * newCountMinusOne
+	d.ServiceLat.SquaredDiffs = (d.ServiceLat.SquaredDiffs / oldCountMinusOne) * newCountMinusOne
+	d.OverheadLat.SquaredDiffs = (d.OverheadLat.SquaredDiffs / oldCountMinusOne) * newCountMinusOne
 
+	d.MaxRetries = telemetry.Bucket10(d.MaxRetries)
+
+	d.FirstAttemptCount = int64((float64(d.FirstAttemptCount) / float64(oldCount)) * float64(newCount))
+}
+
+// FailedHashedValue is used as a default return value for when HashForReporting
+// cannot hash a value correctly.
+const FailedHashedValue = "unknown"
+
+// HashForReporting 1-way hashes values for use in stat reporting. The secret
+// should be the cluster.secret setting.
+func HashForReporting(secret, appName string) string {
+	// If no secret is provided, we cannot irreversibly hash the value, so return
+	// a default value.
+	if len(secret) == 0 {
+		return FailedHashedValue
+	}
+	hash := hmac.New(sha256.New, []byte(secret))
 	if _, err := hash.Write([]byte(appName)); err != nil {
-		panic(errors.Wrap(err, `"It never returns an error." -- https://golang.org/pkg/hash`))
+		panic(errors.NewAssertionErrorWithWrappedErrf(err,
+			`"It never returns an error." -- https://golang.org/pkg/hash`))
 	}
-	return strconv.Itoa(int(hash.Sum64()))
-}
-
-// ResetStatementStats resets the executor's collected statement statistics.
-func (e *Executor) ResetStatementStats(ctx context.Context) {
-	e.sqlStats.resetStats(ctx)
-}
-
-// FillUnimplementedErrorCounts fills the passed map with the executor's current
-// counts of how often individual unimplemented features have been encountered.
-func (e *Executor) FillUnimplementedErrorCounts(fill map[string]int64) {
-	e.unimplementedErrors.Lock()
-	for k, v := range e.unimplementedErrors.counts {
-		fill[k] = v
-	}
-	e.unimplementedErrors.Unlock()
-}
-
-func (e *Executor) recordUnimplementedFeature(feature string) {
-	if feature == "" {
-		return
-	}
-	e.unimplementedErrors.Lock()
-	if e.unimplementedErrors.counts == nil {
-		e.unimplementedErrors.counts = make(map[string]int64)
-	}
-	e.unimplementedErrors.counts[feature]++
-	e.unimplementedErrors.Unlock()
-}
-
-// ResetUnimplementedCounts resets counting of unimplemented errors.
-func (e *Executor) ResetUnimplementedCounts() {
-	e.unimplementedErrors.Lock()
-	e.unimplementedErrors.counts = make(map[string]int64, len(e.unimplementedErrors.counts))
-	e.unimplementedErrors.Unlock()
+	return hex.EncodeToString(hash.Sum(nil)[:4])
 }

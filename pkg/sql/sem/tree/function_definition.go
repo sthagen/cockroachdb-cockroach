@@ -1,54 +1,136 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
-import (
-	"bytes"
-	"strings"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-)
+import "github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 
 // FunctionDefinition implements a reference to the (possibly several)
 // overloads for a built-in function.
 type FunctionDefinition struct {
 	// Name is the short name of the function.
 	Name string
-	// HasOverloadsNeedingRepeatedEvaluation is true if one or more of
-	// the overload definitions has needsRepeatedEvaluation set.
-	// Set e.g. for aggregate functions.
-	HasOverloadsNeedingRepeatedEvaluation bool
+
 	// Definition is the set of overloads for this function name.
+	// We use []overloadImpl here although all the uses of this struct
+	// could actually write a []Overload, because we want to share
+	// the code with typeCheckOverloadedExprs().
 	Definition []overloadImpl
+
+	// FunctionProperties are the properties common to all overloads.
+	FunctionProperties
 }
+
+// FunctionProperties defines the properties of the built-in
+// functions that are common across all overloads.
+type FunctionProperties struct {
+	// UnsupportedWithIssue, if non-zero indicates the built-in is not
+	// really supported; the name is a placeholder. Value -1 just says
+	// "not supported" without an issue to link; values > 0 provide an
+	// issue number to link.
+	UnsupportedWithIssue int
+
+	// NullableArgs is set to true when a function's definition can
+	// handle NULL arguments. When set, the function will be given the
+	// chance to see NULL arguments. When not, the function will
+	// evaluate directly to NULL in the presence of any NULL arguments.
+	//
+	// NOTE: when set, a function should be prepared for any of its arguments to
+	// be NULL and should act accordingly.
+	NullableArgs bool
+
+	// Private, when set to true, indicates the built-in function is not
+	// available for use by user queries. This is currently used by some
+	// aggregates due to issue #10495.
+	Private bool
+
+	// NeedsRepeatedEvaluation is set to true when a function may change
+	// at every row whether or not it is applied to an expression that
+	// contains row-dependent variables. Used e.g. by `random` and
+	// aggregate functions.
+	NeedsRepeatedEvaluation bool
+
+	// Impure is set to true when a function potentially returns a
+	// different value when called in the same statement with the same
+	// parameters. e.g.: random(), clock_timestamp(). Some functions
+	// like now() return the same value in the same statement, but
+	// different values in separate statements, and should not be marked
+	// as impure.
+	Impure bool
+
+	// DistsqlBlacklist is set to true when a function depends on
+	// members of the EvalContext that are not marshaled by DistSQL
+	// (e.g. planner). Currently used for DistSQL to determine if
+	// expressions can be evaluated on a different node without sending
+	// over the EvalContext.
+	//
+	// TODO(andrei): Get rid of the planner from the EvalContext and then we can
+	// get rid of this blacklist.
+	DistsqlBlacklist bool
+
+	// Class is the kind of built-in function (normal/aggregate/window/etc.)
+	Class FunctionClass
+
+	// Category is used to generate documentation strings.
+	Category string
+
+	// ReturnLabels can be used to override the return column name of a
+	// function in a FROM clause.
+	// This satisfies a Postgres quirk where some json functions have
+	// different return labels when used in SELECT or FROM clause.
+	ReturnLabels []string
+
+	// AmbiguousReturnType is true if the builtin's return type can't be
+	// determined without extra context. This is used for formatting builtins
+	// with the FmtParsable directive.
+	AmbiguousReturnType bool
+}
+
+// FunctionClass specifies the class of the builtin function.
+type FunctionClass int
+
+const (
+	// NormalClass is a standard builtin function.
+	NormalClass FunctionClass = iota
+	// AggregateClass is a builtin aggregate function.
+	AggregateClass
+	// WindowClass is a builtin window function.
+	WindowClass
+	// GeneratorClass is a builtin generator function.
+	GeneratorClass
+)
+
+// Avoid vet warning about unused enum value.
+var _ = NormalClass
 
 // NewFunctionDefinition allocates a function definition corresponding
 // to the given built-in definition.
-func NewFunctionDefinition(name string, def []Builtin) *FunctionDefinition {
-	hasRowDependentOverloads := false
+func NewFunctionDefinition(
+	name string, props *FunctionProperties, def []Overload,
+) *FunctionDefinition {
 	overloads := make([]overloadImpl, len(def))
-	for i, d := range def {
-		overloads[i] = d
-		if d.NeedsRepeatedEvaluation {
-			hasRowDependentOverloads = true
+
+	for i := range def {
+		if def[i].PreferredOverload {
+			// Builtins with a preferred overload are always ambiguous.
+			props.AmbiguousReturnType = true
 		}
+		// Produce separate telemetry for each overload.
+		def[i].counter = sqltelemetry.BuiltinCounter(name, def[i].Signature(false))
+
+		overloads[i] = &def[i]
 	}
 	return &FunctionDefinition{
-		Name: name,
-		HasOverloadsNeedingRepeatedEvaluation: hasRowDependentOverloads,
-		Definition:                            overloads,
+		Name:               name,
+		Definition:         overloads,
+		FunctionProperties: *props,
 	}
 }
 
@@ -57,69 +139,7 @@ func NewFunctionDefinition(name string, def []Builtin) *FunctionDefinition {
 var FunDefs map[string]*FunctionDefinition
 
 // Format implements the NodeFormatter interface.
-func (fd *FunctionDefinition) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString(fd.Name)
+func (fd *FunctionDefinition) Format(ctx *FmtCtx) {
+	ctx.WriteString(fd.Name)
 }
-
 func (fd *FunctionDefinition) String() string { return AsString(fd) }
-
-// ResolveFunction transforms an UnresolvedName to a FunctionDefinition.
-func (n UnresolvedName) ResolveFunction(searchPath SearchPath) (*FunctionDefinition, error) {
-	fn, err := n.normalizeFunctionName()
-	if err != nil {
-		return nil, err
-	}
-
-	if len(fn.selector) > 0 {
-		// We do not support selectors at this point.
-		return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError, "invalid function name: %s", n)
-	}
-
-	if d, ok := FunDefs[fn.function()]; ok && fn.prefix() == "" {
-		// Fast path: return early.
-		return d, nil
-	}
-
-	// Although the conversion from Name to string should go via
-	// Name.Normalize(), functions are special in that they are
-	// guaranteed to not contain special Unicode characters. So we can
-	// use ToLower directly.
-	// TODO(knz): this will need to be revisited once we allow
-	// function names to exist in custom namespaces, whose names
-	// may contain special characters.
-	prefix := strings.ToLower(fn.prefix())
-	smallName := strings.ToLower(fn.function())
-	fullName := smallName
-
-	if prefix == "pg_catalog" {
-		// If the user specified e.g. `pg_catalog.max()` we want to find
-		// it in the global namespace.
-		prefix = ""
-	}
-
-	if prefix != "" {
-		fullName = prefix + "." + smallName
-	}
-	def, ok := FunDefs[fullName]
-	if !ok {
-		found := false
-		if prefix == "" {
-			// The function wasn't qualified, so we must search for it via
-			// the search path first.
-			iter := searchPath.Iter()
-			for alt, ok := iter(); ok; alt, ok = iter() {
-				fullName = alt + "." + smallName
-				if def, ok = FunDefs[fullName]; ok {
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			return nil, pgerror.NewErrorf(
-				pgerror.CodeUndefinedFunctionError, "unknown function: %s()", n)
-		}
-	}
-
-	return def, nil
-}

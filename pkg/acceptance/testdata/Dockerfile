@@ -1,4 +1,4 @@
-FROM ubuntu:artful-20170916
+FROM ubuntu:18.04
 
 # This Dockerfile bundles several language runtimes and test frameworks into one
 # container for our acceptance tests.
@@ -31,8 +31,8 @@ RUN apt-get update \
 # The forward reference version is the oldest version from which we support
 # upgrading. The bidirectional reference version is the oldest version that we
 # support upgrading from and downgrading to.
-ENV FORWARD_REFERENCE_VERSION="beta-20170413"
-ENV BIDIRECTIONAL_REFERENCE_VERSION="beta-20170413"
+ENV FORWARD_REFERENCE_VERSION="v2.0.0"
+ENV BIDIRECTIONAL_REFERENCE_VERSION="v2.0.0"
 RUN mkdir /opt/forward-reference-version /opt/bidirectional-reference-version \
  && curl -fsSL https://binaries.cockroachdb.com/cockroach-${FORWARD_REFERENCE_VERSION}.linux-amd64.tgz \
     | tar xz -C /opt/forward-reference-version --strip-components=1 \
@@ -49,14 +49,21 @@ RUN apt-get install --yes --no-install-recommends openjdk-8-jdk \
 RUN curl -fsSL https://dl.yarnpkg.com/debian/pubkey.gpg > /etc/apt/trusted.gpg.d/yarn.asc \
  && echo "deb https://dl.yarnpkg.com/debian/ stable main" > /etc/apt/sources.list.d/yarn.list \
  && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc > /etc/apt/trusted.gpg.d/microsoft.asc \
- && echo "deb https://packages.microsoft.com/repos/microsoft-ubuntu-zesty-prod zesty main" > /etc/apt/sources.list.d/microsoft.list \
+ && echo "deb https://packages.microsoft.com/repos/microsoft-ubuntu-bionic-prod/ bionic main" > /etc/apt/sources.list.d/microsoft.list \
+ && apt-get install --yes --no-install-recommends gnupg \
+ && curl https://packages.erlang-solutions.com/erlang-solutions_2.0_all.deb > erlang-solutions_2.0_all.deb && dpkg -i erlang-solutions_2.0_all.deb \
  && apt-get update \
  && apt-get install --yes --no-install-recommends \
-    dotnet-sdk-2.0.0 \
+    dotnet-sdk-2.1 \
+    dotnet-runtime-2.1 \
     expect \
+    elixir \
+    esl-erlang \
     libc6-dev \
+    libcurl4 \
     libpq-dev \
     libpqtypes-dev \
+    make \
     maven \
     nodejs \
     gcc \

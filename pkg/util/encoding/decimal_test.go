@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package encoding
 
@@ -436,6 +432,43 @@ func TestNonsortingEncodeDecimalRand(t *testing.T) {
 		if est := UpperBoundNonsortingDecimalSize(cur); est < len(enc) {
 			t.Fatalf("expected estimate of %d for %v to be greater than or equal to the encoded length, found [% x]", est, cur, enc)
 		}
+	}
+}
+
+// TestNonsortingEncodeDecimalRoundtrip tests that decimals can round trip
+// through EncodeNonsortingDecimal and DecodeNonsortingDecimal with an expected
+// coefficient and exponent.
+func TestNonsortingEncodeDecimalRoundtrip(t *testing.T) {
+	tests := map[string]string{
+		"0":         "0E+0",
+		"0.0":       "0E-1",
+		"0.00":      "0E-2",
+		"0e-10":     "0E-10",
+		"0.00e-10":  "0E-12",
+		"00":        "0E+0",
+		"-0":        "-0E+0",
+		"-0.0":      "-0E-1",
+		"-0.00":     "-0E-2",
+		"-0e-10":    "-0E-10",
+		"-0.00e-10": "-0E-12",
+		"-00":       "-0E+0",
+	}
+	for tc, expect := range tests {
+		t.Run(tc, func(t *testing.T) {
+			d, _, err := apd.NewFromString(tc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			enc := EncodeNonsortingDecimal(nil, d)
+			res, err := DecodeNonsortingDecimal(enc, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := res.Text('E')
+			if expect != s {
+				t.Fatalf("expected %s, got %s", expect, s)
+			}
+		})
 	}
 }
 

@@ -1,5 +1,6 @@
-# LogicTest: default parallel-stmts distsql
-
+# NOTE: Keep this table at the beginning of the file to ensure that its numeric
+#       reference is 53 (the numeric reference of the first table). If the
+#       numbering scheme in cockroach changes, this test will break.
 statement ok
 CREATE TABLE t (a INT PRIMARY KEY, b INT)
 
@@ -15,8 +16,12 @@ CREATE VIEW v1 AS SELECT a, b FROM t
 statement error pgcode 42P07 relation \"t\" already exists
 CREATE VIEW t AS SELECT a, b FROM t
 
+# view statement ignored if other way around.
 statement ok
-CREATE VIEW v2 (x, y) AS SELECT a, b FROM t
+CREATE VIEW IF NOT EXISTS v1 AS SELECT b, a FROM v1
+
+statement ok
+CREATE VIEW IF NOT EXISTS v2 (x, y) AS SELECT a, b FROM t
 
 statement error pgcode 42601 CREATE VIEW specifies 1 column name, but data source has 2 columns
 CREATE VIEW v3 (x) AS SELECT a, b FROM t
@@ -178,27 +183,27 @@ x y
 query TT
 SHOW CREATE VIEW v1
 ----
-v1 CREATE VIEW v1 (a, b) AS SELECT a, b FROM test.t
+v1  CREATE VIEW v1 (a, b) AS SELECT a, b FROM test.public.t
 
 query TT
 SHOW CREATE VIEW v2
 ----
-v2 CREATE VIEW v2 (x, y) AS SELECT a, b FROM test.t
+v2  CREATE VIEW v2 (x, y) AS SELECT a, b FROM test.public.t
 
 query TT
 SHOW CREATE VIEW v6
 ----
-v6 CREATE VIEW v6 (x, y) AS SELECT a, b FROM test.v1
+v6  CREATE VIEW v6 (x, y) AS SELECT a, b FROM test.public.v1
 
 query TT
 SHOW CREATE VIEW v7
 ----
-v7 CREATE VIEW v7 (x, y) AS SELECT a, b FROM test.v1 ORDER BY a DESC LIMIT 2
+v7  CREATE VIEW v7 (x, y) AS SELECT a, b FROM test.public.v1 ORDER BY a DESC LIMIT 2
 
 query TT
 SHOW CREATE VIEW test2.v1
 ----
-test2.v1 CREATE VIEW v1 (x, y) AS SELECT x, y FROM test.v2
+test2.public.v1  CREATE VIEW v1 (x, y) AS SELECT x, y FROM test.public.v2
 
 statement ok
 GRANT SELECT ON t TO testuser
@@ -247,7 +252,7 @@ SELECT * FROM v6
 query TT
 SHOW CREATE VIEW v1
 ----
-v1 CREATE VIEW v1 (a, b) AS SELECT a, b FROM test.t
+v1  CREATE VIEW v1 (a, b) AS SELECT a, b FROM test.public.t
 
 user root
 
@@ -274,6 +279,27 @@ SELECT * FROM v6
 
 user root
 
+# Ensure that views work over tables identified by numeric reference.
+statement ok
+CREATE VIEW num_ref_view AS SELECT a, b FROM [53 AS t]
+
+statement ok
+GRANT SELECT ON num_ref_view TO testuser
+
+user testuser
+
+query II rowsort
+SELECT * FROM num_ref_view
+----
+1 99
+2 98
+3 97
+
+user root
+
+statement ok
+DROP VIEW num_ref_view
+
 statement error pgcode 42809 "v1" is not a table
 DROP TABLE v1
 
@@ -283,7 +309,7 @@ DROP VIEW t
 statement error cannot drop relation "v1" because view "v6" depends on it
 DROP VIEW v1
 
-statement error cannot drop relation "v2" because view "test2.v1" depends on it
+statement error cannot drop relation "v2" because view "test2.public.v1" depends on it
 DROP VIEW v2
 
 statement ok
@@ -304,6 +330,20 @@ DROP VIEW v1
 statement error pgcode 42P01 relation "v1" does not exist
 DROP VIEW v1
 
+# Verify that we can depend on virtual tables.
+statement ok
+CREATE VIEW virt1 AS SELECT table_schema FROM information_schema.columns
+
+statement ok
+DROP VIEW virt1
+
+# Verify that we can depend on virtual views.
+statement ok
+CREATE VIEW virt2 AS SELECT range_id, lease_holder FROM crdb_internal.ranges
+
+statement ok
+DROP VIEW virt2
+
 # Verify correct rejection of star expressions
 # TODO(a-robinson): Support star expressions as soon as we can (#10028)
 
@@ -317,7 +357,7 @@ statement error views do not currently support \* expressions
 create view s1 AS SELECT a FROM t ORDER BY t.*
 
 statement error views do not currently support \* expressions
-create view s1 AS SELECT COUNT(1) FROM t GROUP BY t.*
+create view s1 AS SELECT count(1) FROM t GROUP BY t.*
 
 statement error views do not currently support \* expressions
 create view s1 AS SELECT alias.* FROM t AS alias
@@ -356,16 +396,16 @@ statement error views do not currently support \* expressions
 create view s1 AS SELECT t1.a, t2.a FROM t AS t1 JOIN t AS t2 ON t1.a IN (SELECT a FROM (SELECT * FROM t))
 
 statement ok
-create view s1 AS SELECT COUNT(*) FROM t
+create view s1 AS SELECT count(*) FROM t
 
 statement ok
-create view s2 AS SELECT a FROM t WHERE a IN (SELECT COUNT(*) FROM t)
+create view s2 AS SELECT a FROM t WHERE a IN (SELECT count(*) FROM t)
 
 statement ok
-create view s3 AS SELECT a, COUNT(*) FROM t GROUP BY a
+create view s3 AS SELECT a, count(*) FROM t GROUP BY a
 
 statement ok
-create view s4 AS SELECT a, COUNT(*) FROM t GROUP BY a HAVING a > (SELECT COUNT(*) FROM t)
+create view s4 AS SELECT a, count(*) FROM t GROUP BY a HAVING a > (SELECT count(*) FROM t)
 
 statement ok
 DROP VIEW s4
@@ -475,3 +515,55 @@ SELECT sum ("QuotedCaps15951". a) FROM "QuotedCaps15951" GROUP BY b ORDER BY b
 1
 3
 6
+
+# Regression tests for #23833
+
+statement ok
+CREATE VIEW w AS WITH a AS (SELECT 1 AS x) SELECT x FROM a
+
+query T
+SELECT create_statement FROM [SHOW CREATE w]
+----
+CREATE VIEW w (x) AS WITH a AS (SELECT 1 AS x) SELECT x FROM a
+
+statement ok
+CREATE VIEW w2 AS WITH t AS (SELECT x FROM w) SELECT x FROM t
+
+query T
+SELECT create_statement FROM [SHOW CREATE w2]
+----
+CREATE VIEW w2 (x) AS WITH t AS (SELECT x FROM test.public.w) SELECT x FROM t
+
+statement ok
+CREATE VIEW w3 AS (WITH t AS (SELECT x FROM w) SELECT x FROM t)
+
+query T
+SELECT create_statement FROM [SHOW CREATE w3]
+----
+CREATE VIEW w3 (x) AS (WITH t AS (SELECT x FROM test.public.w) SELECT x FROM t)
+
+statement ok
+CREATE TABLE ab (a INT PRIMARY KEY, b INT)
+
+statement error INSERT cannot be used inside a view definition
+CREATE VIEW crud_view AS SELECT a, b FROM [INSERT INTO ab VALUES (100, 100) RETURNING a, b]
+
+statement ok
+CREATE TABLE cd (c INT PRIMARY KEY, b INT)
+
+statement ok
+INSERT INTO ab VALUES (1, 1), (2, 2), (3, 3)
+
+statement ok
+INSERT INTO cd VALUES (2, 2), (3, 3), (4, 4)
+
+# View containing a correlated subquery.
+statement ok
+CREATE VIEW v1 AS SELECT a, b, EXISTS(SELECT c FROM cd WHERE cd.c=ab.a) FROM ab;
+
+query IIB rowsort
+SELECT * FROM v1
+----
+1  1  false
+2  2  true
+3  3  true

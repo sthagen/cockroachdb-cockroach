@@ -1,36 +1,32 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package netutil
 
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
-	"google.golang.org/grpc"
-
-	"golang.org/x/net/http2"
-
 	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
+	"golang.org/x/net/http2"
+	"google.golang.org/grpc"
 )
 
 // ListenAndServeGRPC creates a listener and serves the specified grpc Server
@@ -58,15 +54,26 @@ func ListenAndServeGRPC(
 	return ln, nil
 }
 
-var httpLogger = log.NewStdLogger(log.Severity_ERROR)
+var httpLogger = log.NewStdLogger(log.Severity_ERROR, "httpLogger")
 
 // Server is a thin wrapper around http.Server. See MakeServer for more detail.
 type Server struct {
 	*http.Server
 }
 
-// MakeServer constructs a Server that tracks active connections, closing them
-// when signaled by stopper.
+// MakeServer constructs a Server that tracks active connections,
+// closing them when signaled by stopper.
+//
+// It can serve two different purposes simultaneously:
+//
+// - to serve as actual HTTP server, using the .Serve(net.Listener) method.
+// - to serve as plain TCP server, using the .ServeWith(...) method.
+//
+// The latter is used e.g. to accept SQL client connections.
+//
+// When the HTTP facility is not used, the Go HTTP server object is
+// still used internally to maintain/register the connections via the
+// ConnState() method, for convenience.
 func MakeServer(stopper *stop.Stopper, tlsConfig *tls.Config, handler http.Handler) Server {
 	var mu syncutil.Mutex
 	activeConns := make(map[net.Conn]struct{})
@@ -157,5 +164,39 @@ func IsClosedConnection(err error) bool {
 func FatalIfUnexpected(err error) {
 	if err != nil && !IsClosedConnection(err) {
 		log.Fatal(context.TODO(), err)
+	}
+}
+
+// InitialHeartbeatFailedError indicates that while attempting a GRPC
+// connection to a node, we aren't successful and have never seen a
+// heartbeat over that connection before.
+type InitialHeartbeatFailedError struct {
+	WrappedErr error
+}
+
+var _ error = (*InitialHeartbeatFailedError)(nil)
+var _ fmt.Formatter = (*InitialHeartbeatFailedError)(nil)
+var _ errors.Formatter = (*InitialHeartbeatFailedError)(nil)
+
+// Note: Error is not a causer. If this is changed to implement
+// Cause()/Unwrap(), change the type assertions in package cli and
+// elsewhere to use errors.As() or equivalent.
+
+// Error implements error.
+func (e *InitialHeartbeatFailedError) Error() string { return fmt.Sprintf("%v", e) }
+
+// Format implements fmt.Formatter.
+func (e *InitialHeartbeatFailedError) Format(s fmt.State, verb rune) { errors.FormatError(e, s, verb) }
+
+// FormatError implements errors.FormatError.
+func (e *InitialHeartbeatFailedError) FormatError(p errors.Printer) error {
+	p.Print("initial connection heartbeat failed")
+	return e.WrappedErr
+}
+
+// NewInitialHeartBeatFailedError creates a new InitialHeartbeatFailedError.
+func NewInitialHeartBeatFailedError(cause error) *InitialHeartbeatFailedError {
+	return &InitialHeartbeatFailedError{
+		WrappedErr: cause,
 	}
 }

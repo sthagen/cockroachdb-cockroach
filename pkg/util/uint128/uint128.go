@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package uint128
 
@@ -78,7 +74,23 @@ func (u Uint128) Sub(n uint64) Uint128 {
 	return Uint128{hi, lo}
 }
 
+// And returns a new Uint128 that is the bitwise AND of two Uint128 values.
+func (u Uint128) And(o Uint128) Uint128 {
+	return Uint128{u.Hi & o.Hi, u.Lo & o.Lo}
+}
+
+// Or returns a new Uint128 that is the bitwise OR of two Uint128 values.
+func (u Uint128) Or(o Uint128) Uint128 {
+	return Uint128{u.Hi | o.Hi, u.Lo | o.Lo}
+}
+
+// Xor returns a new Uint128 that is the bitwise XOR of two Uint128 values.
+func (u Uint128) Xor(o Uint128) Uint128 {
+	return Uint128{u.Hi ^ o.Hi, u.Lo ^ o.Lo}
+}
+
 // FromBytes parses the byte slice as a 128 bit big-endian unsigned integer.
+// The caller is responsible for ensuring the byte slice contains 16 bytes.
 func FromBytes(b []byte) Uint128 {
 	hi := binary.BigEndian.Uint64(b[:8])
 	lo := binary.BigEndian.Uint64(b[8:])

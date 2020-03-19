@@ -1,0 +1,112 @@
+subtest regression_42858
+
+statement ok
+CREATE TABLE TEST2 (COL1 SERIAL PRIMARY KEY, COL2 INT8)
+
+statement error pq: duplicate constraint name: "duplicate_name"
+CREATE TABLE TEST1 (COL1 SERIAL PRIMARY KEY, COL2 INT8, COL3 INT8, CONSTRAINT duplicate_name FOREIGN KEY (col2) REFERENCES TEST2(COL1), CONSTRAINT duplicate_name FOREIGN KEY (col3) REFERENCES TEST2(COL1))
+
+statement ok
+DROP TABLE TEST2
+
+# Regression for #43894
+subtest regression_43894
+statement ok
+CREATE TABLE IF NOT EXISTS t43894 (PRIMARY KEY (a), a UUID NOT NULL, b JSONB NOT NULL DEFAULT '5')
+
+subtest telemetry_tests
+
+statement ok
+CREATE TABLE new_table (a timetz(3))
+
+statement ok
+ALTER TABLE new_table ADD COLUMN c timetz(4)
+
+# Cannot really get more exact than this (i.e. looking at usage_count), as it increments on each run.
+query T
+SELECT feature_name FROM crdb_internal.feature_usage WHERE feature_name IN ('sql.schema.new_column_type.timetz_3_', 'sql.schema.new_column_type.timetz_4_') AND usage_count > 0 ORDER BY feature_name
+----
+sql.schema.new_column_type.timetz_3_
+sql.schema.new_column_type.timetz_4_
+
+statement ok
+CREATE TABLE sec_col_fam(x INT, y INT, z INT, FAMILY (x), FAMILY (y), FAMILY (z), INDEX (x) STORING (y, z));
+CREATE INDEX ON sec_col_fam (x) STORING (y, z)
+
+query T
+SELECT feature_name FROM crdb_internal.feature_usage WHERE feature_name = 'sql.schema.secondary_index_column_families' AND usage_count >= 2
+----
+sql.schema.secondary_index_column_families
+
+statement ok
+set require_explicit_primary_keys=true
+
+statement error pq: no primary key specified for table t \(require_explicit_primary_keys = true\)
+CREATE TABLE t (x INT, y INT)
+
+# Regression for #45496.
+statement ok
+reset require_explicit_primary_keys;
+DROP TABLE IF EXISTS t;
+CREATE TABLE t (rowid INT, rowid_1 INT, FAMILY (rowid, rowid_1))
+
+query T rowsort
+SELECT column_name FROM [SHOW COLUMNS FROM t]
+----
+rowid
+rowid_1
+rowid_2
+
+query TT
+SELECT index_name, column_name FROM [SHOW INDEXES FROM t]
+----
+primary rowid_2
+
+query TT
+SHOW CREATE t
+----
+t  CREATE TABLE t (
+   rowid INT8 NULL,
+   rowid_1 INT8 NULL,
+   FAMILY fam_0_rowid_rowid_1_rowid_2 (rowid, rowid_1, rowid_2)
+)
+
+subtest regression_qualification_feature_counts
+
+statement ok
+CREATE TABLE telemetry_test (a int DEFAULT 1, b int UNIQUE CHECK(b > 1), c int AS (a + b) STORED)
+
+query T rowsort
+SELECT feature_name FROM crdb_internal.feature_usage
+WHERE feature_name IN (
+  'sql.schema.new_column.qualification.computed',
+  'sql.schema.new_column.qualification.default_expr',
+  'sql.schema.new_column.qualification.unique'
+)
+----
+sql.schema.new_column.qualification.unique
+sql.schema.new_column.qualification.computed
+sql.schema.new_column.qualification.default_expr
+
+statement ok
+DROP TABLE telemetry_test
+
+statement ok
+SET experimental_enable_hash_sharded_indexes = true;
+CREATE TABLE telemetry (
+  x INT PRIMARY KEY,
+  y INT,
+  z JSONB,
+  INVERTED INDEX (z),
+  INDEX (y) USING HASH WITH BUCKET_COUNT = 4
+)
+
+query T rowsort
+SELECT feature_name FROM crdb_internal.feature_usage
+WHERE feature_name IN (
+  'sql.schema.inverted_index',
+  'sql.schema.hash_sharded_index'
+)
+----
+sql.schema.inverted_index
+sql.schema.hash_sharded_index

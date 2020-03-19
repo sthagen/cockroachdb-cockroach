@@ -229,9 +229,10 @@ SHOW GRANTS ON ROLE myrole
 ```
 
 We will also allow the following variants:
-* lookup all roles: `SHOW GRANTS ON ROLE *`
-* show all memberships for a user: `SHOW GRANT ON ROLE * FOR marc`
-* show user membership in a role: `SHOW GRANT ON ROLE myrole FOR marc`
+* lookup all role memberships: `SHOW GRANTS ON ROLE`
+* show all memberships for a user: `SHOW GRANTS ON ROLE FOR marc`
+* show all members of a role: `SHOW GRANTS ON ROLE myrole`
+* show user membership in a role: `SHOW GRANTS ON ROLE myrole FOR marc`
 
 ### Administrators
 
@@ -363,14 +364,11 @@ GRANT rolename TO name [ WITH ADMIN OPTION ]
 ```
 
 * **Behavior**: adds `name` as a member of `rolename`. Member is a role admin if `WITH ADMIN OPTION` is specified.
-Fails if either `rolename` or `name` does not exist, if the membership exists, or if this creates a
-membership loop.
+  - Fails if either `rolename` or `name` does not exist, or if this creates a membership loop.
+  - Existing memberships can have their `WITH ADMIN` option enabled, but never disabled.
+  - The `ADMIN OPTION` is inherited. eg: if `A ∈ B ∈ C` and `B` has `ADMIN OPTION` on `C`, then `A` has `ADMIN OPTION` on `C` (but not necessarily on `B`).
 * **Permissions**: must be an administrator or role admin.
 * **Enterprise requirement**: valid license required.
-
-
-**TODO(mberhault)**: check postgres behavior w.r.t inheritance of `WITH ADMIN` option.
-**TODO(mberhault)**: check postgres behavior: can we add/remove `WITH ADMIN` without changing membership?
 
 #### REVOKE role
 
@@ -378,12 +376,10 @@ membership loop.
 REVOKE [ ADMIN OPTION FOR ] rolename FROM name
 ```
 
-* **Behavior**: removes `name` as a member of `rolename`. Member admin setting is removed if `ADMIN OPTION FOR` is specified.
-Fails if either `rolename` or `name` does not exist, or if the membership does not exist.
+* **Behavior**: removes `name` as a member of `rolename`. Member admin setting is removed if `ADMIN OPTION FOR` is specified, but the membership remains.
+Fails if either `rolename` or `name` does not exist. Succeeds if the membership does not exist.
 * **Permissions**: must be an administrator or role admin.
 * **Enterprise requirement**: valid license required.
-
-**TODO(mberhault)**: check postgres behavior: can we add/remove `WITH ADMIN` without changing membership?
 
 #### SHOW ROLES
 
@@ -398,10 +394,11 @@ SHOW ROLES
 #### SHOW GRANTS ON ROLE
 
 ```
-SHOW GRANTS ON ROLE rolename [ FOR name ]
+SHOW GRANTS ON ROLE [rolename] [ FOR name ]
 ```
 
-Where `rolename` can be one or more role, or `*` and `name` can be one of more user or role.
+Where `rolename` can be one or more role and `name` can be one of more user or role. An unspecified `rolename`
+or `name` returns all roles or members.
 
 * **Behavior**: lists role memberships for matching roles/names.
 * **Permissions**: none required.
@@ -442,8 +439,10 @@ Role membership expansion can be pre-computed (see [Internal representation of m
 Permission checks currently consist of calls to one of:
 ```
 func (p *planner) CheckPrivilege(descriptor sqlbase.DescriptorProto, privilege privilege.Kind) error
-func (p *planner) RequireSuperUser(action string) error
-func (p *planner) anyPrivilege(descriptor sqlbase.DescriptorProto) error
+func (p *planner) CheckAnyPrivilege(descriptor sqlbase.DescriptorProto) error
+func (p *planner) RequireAdminRole(action string) error
+func (p *planner) HasAdminRole() (bool, error)
+func (p *planner) MemberOfWithAdminOption(member string) (map[string]bool, error)
 ```
 
 All methods operate on `p.session.User`.

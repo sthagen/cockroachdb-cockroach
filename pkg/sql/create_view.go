@@ -1,128 +1,90 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // createViewNode represents a CREATE VIEW statement.
 type createViewNode struct {
-	n             *tree.CreateView
-	dbDesc        *sqlbase.DatabaseDescriptor
-	sourceColumns sqlbase.ResultColumns
+	viewName tree.Name
+	// viewQuery contains the view definition, with all table names fully
+	// qualified.
+	viewQuery   string
+	ifNotExists bool
+	temporary   bool
+	dbDesc      *sqlbase.DatabaseDescriptor
+	columns     sqlbase.ResultColumns
+
 	// planDeps tracks which tables and views the view being created
 	// depends on. This is collected during the construction of
 	// the view query's logical plan.
 	planDeps planDependencies
 }
 
-// CreateView creates a view.
-// Privileges: CREATE on database plus SELECT on all the selected columns.
-//   notes: postgres requires CREATE on database plus SELECT on all the
-//						selected columns.
-//          mysql requires CREATE VIEW plus SELECT on all the selected columns.
-func (p *planner) CreateView(ctx context.Context, n *tree.CreateView) (planNode, error) {
-	name, err := n.Name.NormalizeWithDatabaseName(p.session.Database)
-	if err != nil {
-		return nil, err
-	}
-
-	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), name.Database())
-	if err != nil {
-		return nil, err
-	}
-
-	if err := p.CheckPrivilege(dbDesc, privilege.CREATE); err != nil {
-		return nil, err
-	}
-
-	// Ensure that all the table names are properly qualified.  The
-	// traversal will update the NormalizableTableNames in-place, so the
-	// changes are persisted in n.AsSource. We use tree.FormatNode
-	// merely as a traversal method; its output buffer is discarded
-	// immediately after the traversal because it is not needed further.
-	var queryBuf bytes.Buffer
-	var fmtErr error
-	tree.FormatNode(
-		&queryBuf,
-		tree.FmtReformatTableNames(
-			tree.FmtParsable,
-			func(t *tree.NormalizableTableName, buf *bytes.Buffer, f tree.FmtFlags) {
-				tn, err := p.QualifyWithDatabase(ctx, t)
-				if err != nil {
-					log.Warningf(ctx, "failed to qualify table name %q with database name: %v",
-						tree.ErrString(t), err)
-					fmtErr = err
-					return
-				}
-				// Persist the database prefix expansion.
-				tn.DBNameOriginallyOmitted = false
-			},
-		),
-		n.AsSource,
-	)
-	if fmtErr != nil {
-		return nil, fmtErr
-	}
-
-	planDeps, sourceColumns, err := p.analyzeViewQuery(ctx, n.AsSource)
-	if err != nil {
-		return nil, err
-	}
-
-	numColNames := len(n.ColumnNames)
-	numColumns := len(sourceColumns)
-	if numColNames != 0 && numColNames != numColumns {
-		return nil, sqlbase.NewSyntaxError(fmt.Sprintf(
-			"CREATE VIEW specifies %d column name%s, but data source has %d column%s",
-			numColNames, util.Pluralize(int64(numColNames)),
-			numColumns, util.Pluralize(int64(numColumns))))
-	}
-
-	log.VEventf(ctx, 2, "collected view dependencies:\n%s", planDeps.String())
-
-	return &createViewNode{
-		n:             n,
-		dbDesc:        dbDesc,
-		sourceColumns: sourceColumns,
-		planDeps:      planDeps,
-	}, nil
-}
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because CREATE VIEW performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *createViewNode) ReadingOwnWrites() {}
 
 func (n *createViewNode) startExec(params runParams) error {
-	viewName := n.n.Name.TableName().Table()
-	tKey := tableKey{parentID: n.dbDesc.ID, name: viewName}
-	key := tKey.Key()
-	if exists, err := descExists(params.ctx, params.p.txn, key); err == nil && exists {
-		// TODO(a-robinson): Support CREATE OR REPLACE commands.
-		return sqlbase.NewRelationAlreadyExistsError(tKey.Name())
-	} else if err != nil {
+	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("view"))
+
+	viewName := string(n.viewName)
+	isTemporary := n.temporary
+	log.VEventf(params.ctx, 2, "dependencies for view %s:\n%s", viewName, n.planDeps.String())
+
+	// First check the backrefs and see if any of them are temporary.
+	// If so, promote this view to temporary.
+	backRefMutables := make(map[sqlbase.ID]*sqlbase.MutableTableDescriptor, len(n.planDeps))
+	for id, updated := range n.planDeps {
+		backRefMutable := params.p.Tables().getUncommittedTableByID(id).MutableTableDescriptor
+		if backRefMutable == nil {
+			backRefMutable = sqlbase.NewMutableExistingTableDescriptor(*updated.desc.TableDesc())
+		}
+		if !isTemporary && backRefMutable.Temporary {
+			// This notice is sent from pg, let's imitate.
+			params.p.SendClientNotice(params.ctx,
+				pgerror.Noticef(`view "%s" will be a temporary view`, viewName),
+			)
+			isTemporary = true
+		}
+		backRefMutables[id] = backRefMutable
+	}
+
+	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.ID, isTemporary, viewName)
+	if err != nil {
+		if sqlbase.IsRelationAlreadyExistsError(err) && n.ifNotExists {
+			return nil
+		}
 		return err
 	}
 
-	id, err := GenerateUniqueDescID(params.ctx, params.p.session.execCfg.DB)
+	schemaName := tree.PublicSchemaName
+	if isTemporary {
+		telemetry.Inc(sqltelemetry.CreateTempViewCounter)
+		schemaName = tree.Name(params.p.TemporarySchemaName())
+	}
+
+	id, err := GenerateUniqueDescID(params.ctx, params.extendedEvalCtx.ExecCfg.DB)
 	if err != nil {
 		return err
 	}
@@ -130,20 +92,19 @@ func (n *createViewNode) startExec(params runParams) error {
 	// Inherit permissions from the database descriptor.
 	privs := n.dbDesc.GetPrivileges()
 
-	desc, err := n.makeViewTableDesc(
-		params,
+	desc, err := makeViewTableDesc(
 		viewName,
-		n.n.ColumnNames,
+		n.viewQuery,
 		n.dbDesc.ID,
+		schemaID,
 		id,
-		n.sourceColumns,
+		n.columns,
+		params.creationTimeForNewTableDescriptor(),
 		privs,
+		&params.p.semaCtx,
+		isTemporary,
 	)
 	if err != nil {
-		return err
-	}
-
-	if err = desc.ValidateTable(); err != nil {
 		return err
 	}
 
@@ -152,13 +113,18 @@ func (n *createViewNode) startExec(params runParams) error {
 		desc.DependsOn = append(desc.DependsOn, backrefID)
 	}
 
-	if err = params.p.createDescriptorWithID(params.ctx, key, id, &desc); err != nil {
+	// TODO (lucy): I think this needs a NodeFormatter implementation. For now,
+	// do some basic string formatting (not accurate in the general case).
+	if err = params.p.createDescriptorWithID(
+		params.ctx, tKey.Key(), id, &desc, params.EvalContext().Settings,
+		fmt.Sprintf("CREATE VIEW %q AS %q", n.viewName, n.viewQuery),
+	); err != nil {
 		return err
 	}
 
 	// Persist the back-references in all referenced table descriptors.
-	for _, updated := range n.planDeps {
-		backrefDesc := *updated.desc
+	for id, updated := range n.planDeps {
+		backRefMutable := backRefMutables[id]
 		for _, dep := range updated.deps {
 			// The logical plan constructor merely registered the dependencies.
 			// It did not populate the "ID" field of TableDescriptor_Reference,
@@ -166,33 +132,38 @@ func (n *createViewNode) startExec(params runParams) error {
 			// yet known.
 			// We need to do it here.
 			dep.ID = desc.ID
-			backrefDesc.DependedOnBy = append(backrefDesc.DependedOnBy, dep)
+			backRefMutable.DependedOnBy = append(backRefMutable.DependedOnBy, dep)
 		}
-		if err := params.p.saveNonmutationAndNotify(params.ctx, &backrefDesc); err != nil {
+		// TODO (lucy): Have more consistent/informative names for dependent jobs.
+		if err := params.p.writeSchemaChange(
+			params.ctx, backRefMutable, sqlbase.InvalidMutationID, "updating view reference",
+		); err != nil {
 			return err
 		}
 	}
 
-	if desc.Adding() {
-		params.p.notifySchemaChange(&desc, sqlbase.InvalidMutationID)
-	}
 	if err := desc.Validate(params.ctx, params.p.txn); err != nil {
 		return err
 	}
 
 	// Log Create View event. This is an auditable log event and is
 	// recorded in the same transaction as the table descriptor update.
-	return MakeEventLogger(params.p.LeaseMgr()).InsertEventRecord(
+	tn := tree.MakeTableNameWithSchema(tree.Name(n.dbDesc.Name), schemaName, n.viewName)
+	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
 		params.ctx,
 		params.p.txn,
 		EventLogCreateView,
 		int32(desc.ID),
-		int32(params.evalCtx.NodeID),
+		int32(params.extendedEvalCtx.NodeID),
 		struct {
 			ViewName  string
-			Statement string
+			ViewQuery string
 			User      string
-		}{n.n.Name.String(), n.n.String(), params.p.session.User},
+		}{
+			ViewName:  tn.FQString(),
+			ViewQuery: n.viewQuery,
+			User:      params.SessionData().User,
+		},
 	)
 }
 
@@ -207,32 +178,48 @@ func (n *createViewNode) Close(ctx context.Context)  {}
 // dependencies in the same transaction that the view is created and it
 // doesn't matter if reads/writes use a cached descriptor that doesn't
 // include the back-references.
-func (n *createViewNode) makeViewTableDesc(
-	params runParams,
+func makeViewTableDesc(
 	viewName string,
-	columnNames tree.NameList,
+	viewQuery string,
 	parentID sqlbase.ID,
+	schemaID sqlbase.ID,
 	id sqlbase.ID,
 	resultColumns []sqlbase.ResultColumn,
+	creationTime hlc.Timestamp,
 	privileges *sqlbase.PrivilegeDescriptor,
-) (sqlbase.TableDescriptor, error) {
-	desc := initTableDescriptor(id, parentID, viewName, params.p.txn.OrigTimestamp(), privileges)
-	desc.ViewQuery = tree.AsStringWithFlags(n.n.AsSource, tree.FmtParsable)
-	for i, colRes := range resultColumns {
-		colType, err := coltypes.DatumTypeToColumnType(colRes.Typ)
+	semaCtx *tree.SemaContext,
+	temporary bool,
+) (sqlbase.MutableTableDescriptor, error) {
+	desc := InitTableDescriptor(
+		id,
+		parentID,
+		schemaID,
+		viewName,
+		creationTime,
+		privileges,
+		temporary,
+	)
+	desc.ViewQuery = viewQuery
+	for _, colRes := range resultColumns {
+		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colRes.Typ}
+		// The new types in the CREATE VIEW column specs never use
+		// SERIAL so we need not process SERIAL types here.
+		col, _, _, err := sqlbase.MakeColumnDefDescs(&columnTableDef, semaCtx)
 		if err != nil {
 			return desc, err
 		}
-		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colType}
-		if len(columnNames) > i {
-			columnTableDef.Name = columnNames[i]
-		}
-		col, _, err := sqlbase.MakeColumnDefDescs(&columnTableDef, &params.p.semaCtx, params.evalCtx)
-		if err != nil {
-			return desc, err
-		}
-		desc.AddColumn(*col)
+		desc.AddColumn(col)
 	}
+	if err := desc.AllocateIDs(); err != nil {
+		return sqlbase.MutableTableDescriptor{}, err
+	}
+	return desc, nil
+}
 
-	return desc, desc.AllocateIDs()
+func overrideColumnNames(cols sqlbase.ResultColumns, newNames tree.NameList) sqlbase.ResultColumns {
+	res := append(sqlbase.ResultColumns(nil), cols...)
+	for i := range res {
+		res[i].Name = string(newNames[i])
+	}
+	return res
 }

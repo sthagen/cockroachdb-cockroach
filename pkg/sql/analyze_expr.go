@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,7 +14,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // analyzeExpr performs semantic analysis of an expression, including:
@@ -32,49 +29,37 @@ import (
 func (p *planner) analyzeExpr(
 	ctx context.Context,
 	raw tree.Expr,
-	sources multiSourceInfo,
+	source *sqlbase.DataSourceInfo,
 	iVarHelper tree.IndexedVarHelper,
-	expectedType types.T,
+	expectedType *types.T,
 	requireType bool,
 	typingContext string,
 ) (tree.TypedExpr, error) {
-	// Replace the sub-queries.
-	// In all contexts that analyze a single expression, a single value
-	// is expected. Tell this to replaceSubqueries.  (See UPDATE for a
-	// counter-example; cases where a subquery is an operand of a
-	// comparison are handled specially in the subqueryVisitor already.)
-	replaced, err := p.replaceSubqueries(ctx, raw, 1 /* one value expected */)
-	if err != nil {
-		return nil, err
-	}
-
 	// Perform optional name resolution.
-	var resolved tree.Expr
-	if sources == nil {
-		resolved = replaced
-	} else {
-		var hasStar bool
-		resolved, _, hasStar, err = p.resolveNames(replaced, sources, iVarHelper)
+	resolved := raw
+	if source != nil {
+		var err error
+		resolved, _, err = p.resolveNames(raw, source, iVarHelper)
 		if err != nil {
 			return nil, err
 		}
-		p.hasStar = p.hasStar || hasStar
 	}
 
 	// Type check.
 	var typedExpr tree.TypedExpr
-	p.semaCtx.IVarHelper = &iVarHelper
+	var err error
+	p.semaCtx.IVarContainer = iVarHelper.Container()
 	if requireType {
 		typedExpr, err = tree.TypeCheckAndRequire(resolved, &p.semaCtx,
 			expectedType, typingContext)
 	} else {
 		typedExpr, err = tree.TypeCheck(resolved, &p.semaCtx, expectedType)
 	}
-	p.semaCtx.IVarHelper = nil
+	p.semaCtx.IVarContainer = nil
 	if err != nil {
 		return nil, err
 	}
 
 	// Normalize.
-	return p.txCtx.NormalizeExpr(&p.evalCtx, typedExpr)
+	return p.txCtx.NormalizeExpr(p.EvalContext(), typedExpr)
 }

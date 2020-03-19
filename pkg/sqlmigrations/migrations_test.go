@@ -1,47 +1,40 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlmigrations
 
 import (
 	"bytes"
 	"context"
-	gosql "database/sql"
 	"fmt"
-	"os"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sqlmigrations/leasemanager"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/gogo/protobuf/proto"
-	"github.com/kr/pretty"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -71,19 +64,19 @@ type fakeLeaseManager struct {
 
 func (f *fakeLeaseManager) AcquireLease(
 	ctx context.Context, key roachpb.Key,
-) (*client.Lease, error) {
-	return &client.Lease{}, nil
+) (*leasemanager.Lease, error) {
+	return &leasemanager.Lease{}, nil
 }
 
-func (f *fakeLeaseManager) ExtendLease(ctx context.Context, l *client.Lease) error {
+func (f *fakeLeaseManager) ExtendLease(ctx context.Context, l *leasemanager.Lease) error {
 	return f.extendErr
 }
 
-func (f *fakeLeaseManager) ReleaseLease(ctx context.Context, l *client.Lease) error {
+func (f *fakeLeaseManager) ReleaseLease(ctx context.Context, l *leasemanager.Lease) error {
 	return f.releaseErr
 }
 
-func (f *fakeLeaseManager) TimeRemaining(l *client.Lease) time.Duration {
+func (f *fakeLeaseManager) TimeRemaining(l *leasemanager.Lease) time.Duration {
 	// Default to a reasonable amount of time left if the field wasn't set.
 	if f.leaseTimeRemaining == 0 {
 		return leaseRefreshInterval * 2
@@ -99,7 +92,7 @@ type fakeDB struct {
 
 func (f *fakeDB) Scan(
 	ctx context.Context, begin, end interface{}, maxRows int64,
-) ([]client.KeyValue, error) {
+) ([]kv.KeyValue, error) {
 	if f.scanErr != nil {
 		return nil, f.scanErr
 	}
@@ -109,9 +102,9 @@ func (f *fakeDB) Scan(
 	if !bytes.Equal(end.(roachpb.Key), keys.MigrationKeyMax) {
 		return nil, errors.Errorf("expected end key %q, got %q", keys.MigrationKeyMax, end)
 	}
-	var results []client.KeyValue
+	var results []kv.KeyValue
 	for k, v := range f.kvs {
-		results = append(results, client.KeyValue{
+		results = append(results, kv.KeyValue{
 			Key:   []byte(k),
 			Value: &roachpb.Value{RawBytes: v},
 		})
@@ -119,15 +112,21 @@ func (f *fakeDB) Scan(
 	return results, nil
 }
 
+func (f *fakeDB) Get(ctx context.Context, key interface{}) (kv.KeyValue, error) {
+	return kv.KeyValue{}, errors.New("unimplemented")
+}
+
 func (f *fakeDB) Put(ctx context.Context, key, value interface{}) error {
 	if f.putErr != nil {
 		return f.putErr
 	}
-	f.kvs[string(key.(roachpb.Key))] = []byte(value.(string))
+	if f.kvs != nil {
+		f.kvs[string(key.(roachpb.Key))] = []byte(value.(string))
+	}
 	return nil
 }
 
-func (f *fakeDB) Txn(context.Context, func(context.Context, *client.Txn) error) error {
+func (f *fakeDB) Txn(context.Context, func(context.Context, *kv.Txn) error) error {
 	return errors.New("unimplemented")
 }
 
@@ -206,7 +205,7 @@ func TestEnsureMigrations(t *testing.T) {
 			}
 			backwardCompatibleMigrations = tc.migrations
 
-			err := mgr.EnsureMigrations(context.Background())
+			err := mgr.EnsureMigrations(context.Background(), roachpb.Version{} /* bootstrapVersion */)
 			if !testutils.IsError(err, tc.expectedErr) {
 				t.Errorf("expected error %q, got error %v", tc.expectedErr, err)
 			}
@@ -228,6 +227,40 @@ func TestEnsureMigrations(t *testing.T) {
 	if !fnGotCalled {
 		t.Errorf("expected fnGotCalledDescriptor to be run by the migration coordinator, but it wasn't")
 	}
+}
+
+func TestSkipMigrationsIncludedInBootstrap(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	db := &fakeDB{}
+	mgr := Manager{
+		stopper:      stop.NewStopper(),
+		leaseManager: &fakeLeaseManager{},
+		db:           db,
+	}
+	defer mgr.stopper.Stop(ctx)
+	defer func(prev []migrationDescriptor) {
+		backwardCompatibleMigrations = prev
+	}(backwardCompatibleMigrations)
+
+	v := roachpb.MustParseVersion("19.1")
+	fnGotCalled := false
+	backwardCompatibleMigrations = []migrationDescriptor{{
+		name:                "got-called-verifier",
+		includedInBootstrap: v,
+		workFn: func(context.Context, runner) error {
+			fnGotCalled = true
+			return nil
+		},
+	}}
+	// If the cluster has been bootstrapped at an old version, the migration should run.
+	require.NoError(t, mgr.EnsureMigrations(ctx, roachpb.Version{} /* bootstrapVersion */))
+	require.True(t, fnGotCalled)
+	fnGotCalled = false
+	// If the cluster has been bootstrapped at a new version, the migration should
+	// not run.
+	require.NoError(t, mgr.EnsureMigrations(ctx, v /* bootstrapVersion */))
+	require.False(t, fnGotCalled)
 }
 
 func TestDBErrors(t *testing.T) {
@@ -269,7 +302,7 @@ func TestDBErrors(t *testing.T) {
 			db.scanErr = tc.scanErr
 			db.putErr = tc.putErr
 			db.kvs = make(map[string][]byte)
-			err := mgr.EnsureMigrations(context.Background())
+			err := mgr.EnsureMigrations(context.Background(), roachpb.Version{} /* bootstrapVersion */)
 			if !testutils.IsError(err, tc.expectedErr) {
 				t.Errorf("expected error %q, got error %v", tc.expectedErr, err)
 			}
@@ -307,7 +340,7 @@ func TestLeaseErrors(t *testing.T) {
 	migration := noopMigration1
 	defer func(prev []migrationDescriptor) { backwardCompatibleMigrations = prev }(backwardCompatibleMigrations)
 	backwardCompatibleMigrations = []migrationDescriptor{migration}
-	if err := mgr.EnsureMigrations(context.Background()); err != nil {
+	if err := mgr.EnsureMigrations(context.Background(), roachpb.Version{} /* bootstrapVersion */); err != nil {
 		t.Error(err)
 	}
 	if _, ok := db.kvs[string(migrationKey(migration))]; !ok {
@@ -336,8 +369,8 @@ func TestLeaseExpiration(t *testing.T) {
 	defer func() { leaseRefreshInterval = oldLeaseRefreshInterval }()
 
 	exitCalled := make(chan bool)
-	log.SetExitFunc(func(int) { exitCalled <- true })
-	defer log.SetExitFunc(os.Exit)
+	log.SetExitFunc(true /* hideStack */, func(int) { exitCalled <- true })
+	defer log.ResetExitFunc()
 	// Disable stack traces to make the test output in teamcity less deceiving.
 	defer log.DisableTracebacks()()
 
@@ -354,84 +387,95 @@ func TestLeaseExpiration(t *testing.T) {
 	}
 	defer func(prev []migrationDescriptor) { backwardCompatibleMigrations = prev }(backwardCompatibleMigrations)
 	backwardCompatibleMigrations = []migrationDescriptor{waitForExitMigration}
-	if err := mgr.EnsureMigrations(context.Background()); err != nil {
+	if err := mgr.EnsureMigrations(context.Background(), roachpb.Version{} /* bootstrapVersion */); err != nil {
 		t.Error(err)
 	}
 }
 
-// isolatedMigrationTest assists in testing the effects of one migration in
-// isolation.
-//
-// It boots a test server after removing the migration under test from the list
-// of automatically-run migrations. The migration can be triggered manually by
-// calling the runMigration method; its effects can be verified by inspecting
-// the state before and after via the exposed KV and SQL interfaces.
-type isolatedMigrationTest struct {
+// migrationTest assists in testing the effects of a migration. It provides
+// methods to edit the list of migrations run at server startup, start a test
+// server, and run an individual migration. The test server's KV and SQL
+// interfaces are intended to be accessed directly to verify the effect of the
+// migration. Any mutations to the list of migrations run at server startup are
+// reverted at the end of the test.
+type migrationTest struct {
 	oldMigrations []migrationDescriptor
-	migration     migrationDescriptor
 	server        serverutils.TestServerInterface
 	sqlDB         *sqlutils.SQLRunner
-	kvDB          *client.DB
+	kvDB          *kv.DB
 	memMetrics    *sql.MemoryMetrics
 }
 
-// makeIsolatedMigrationTest creates an IsolatedMigrationTest to test the
-// migration whose name starts with namePrefix. It fails the test if the number
-// of migrations that match namePrefix is not exactly one.
+// makeMigrationTest creates a new migrationTest.
 //
 // The caller is responsible for calling the test's close method at the end of
 // the test.
-func makeIsolatedMigrationTest(
-	ctx context.Context, t testing.TB, namePrefix string,
-) isolatedMigrationTest {
+func makeMigrationTest(ctx context.Context, t testing.TB) migrationTest {
 	t.Helper()
 
-	var migration migrationDescriptor
 	oldMigrations := append([]migrationDescriptor(nil), backwardCompatibleMigrations...)
-	backwardCompatibleMigrations = []migrationDescriptor{}
-	for _, m := range oldMigrations {
-		if strings.HasPrefix(m.name, namePrefix) {
-			migration = m
-			continue
-		}
-		backwardCompatibleMigrations = append(backwardCompatibleMigrations, m)
-	}
-	if n := len(oldMigrations) - len(backwardCompatibleMigrations); n != 1 {
-		t.Fatalf("expected prefix %q to match exactly one migration, but matched %d", namePrefix, n)
-	}
-
 	memMetrics := sql.MakeMemMetrics("migration-test-internal", time.Minute)
-
-	return isolatedMigrationTest{
-		migration:     migration,
+	return migrationTest{
 		oldMigrations: oldMigrations,
 		memMetrics:    &memMetrics,
 	}
 }
 
+// pop removes the migration whose name starts with namePrefix from the list of
+// migrations run at server startup. It fails the test if the number of
+// migrations that match namePrefix is not exactly one.
+//
+// You must not call pop after calling start.
+func (mt *migrationTest) pop(t testing.TB, namePrefix string) migrationDescriptor {
+	t.Helper()
+
+	if mt.server != nil {
+		t.Fatal("migrationTest.pop must be called before mt.start")
+	}
+
+	var migration migrationDescriptor
+	var newMigrations []migrationDescriptor
+	for _, m := range backwardCompatibleMigrations {
+		if strings.HasPrefix(m.name, namePrefix) {
+			migration = m
+			continue
+		}
+		newMigrations = append(newMigrations, m)
+	}
+	if n := len(backwardCompatibleMigrations) - len(newMigrations); n != 1 {
+		t.Fatalf("expected prefix %q to match exactly one migration, but matched %d", namePrefix, n)
+	}
+	backwardCompatibleMigrations = newMigrations
+	return migration
+}
+
 // start starts a test server with the given serverArgs.
-func (mt *isolatedMigrationTest) start(t testing.TB, serverArgs base.TestServerArgs) {
+func (mt *migrationTest) start(t testing.TB, serverArgs base.TestServerArgs) {
 	server, sqlDB, kvDB := serverutils.StartServer(t, serverArgs)
 	mt.server = server
 	mt.sqlDB = sqlutils.MakeSQLRunner(sqlDB)
 	mt.kvDB = kvDB
 }
 
-// runMigration triggers a manual run of the migration under test. It does not
-// mark the migration as completed, so subsequent calls will cause the migration
-// to be re-executed. This is useful for verifying idempotency.
+// runMigration triggers a manual run of migration. It does not mark migration
+// as completed, so subsequent calls will cause migration to be re-executed.
+// This is useful for verifying idempotency.
 //
 // You must call start before calling runMigration.
-func (mt *isolatedMigrationTest) runMigration(ctx context.Context) error {
-	return mt.migration.workFn(ctx, runner{
+func (mt *migrationTest) runMigration(ctx context.Context, m migrationDescriptor) error {
+	if m.workFn == nil {
+		// Migration has been baked in. Ignore it.
+		return nil
+	}
+	return m.workFn(ctx, runner{
+		settings:    mt.server.ClusterSettings(),
 		db:          mt.kvDB,
-		memMetrics:  mt.memMetrics,
-		sqlExecutor: mt.server.Executor().(*sql.Executor),
+		sqlExecutor: mt.server.InternalExecutor().(*sql.InternalExecutor),
 	})
 }
 
 // close stops the test server and restores package-global state.
-func (mt *isolatedMigrationTest) close(ctx context.Context) {
+func (mt *migrationTest) close(ctx context.Context) {
 	if mt.server != nil {
 		mt.server.Stopper().Stop(ctx)
 	}
@@ -442,328 +486,79 @@ func TestCreateSystemTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	jobsDesc := sqlbase.JobsTable
-	jobsNameKey := sqlbase.MakeNameMetadataKey(jobsDesc.GetParentID(), jobsDesc.GetName())
-	jobsDescKey := sqlbase.MakeDescMetadataKey(jobsDesc.GetID())
-	jobsDescVal := sqlbase.WrapDescriptor(&jobsDesc)
-	settingsDesc := sqlbase.SettingsTable
-	settingsNameKey := sqlbase.MakeNameMetadataKey(settingsDesc.GetParentID(), settingsDesc.GetName())
-	settingsDescKey := sqlbase.MakeDescMetadataKey(settingsDesc.GetID())
-	settingsDescVal := sqlbase.WrapDescriptor(&settingsDesc)
+	table := sqlbase.NamespaceTable
+	table.ID = keys.MaxReservedDescID
 
-	mt := makeIsolatedMigrationTest(ctx, t, "create system.jobs table")
-	defer mt.close(ctx)
-
-	for i, m := range backwardCompatibleMigrations {
-		if m.doesBackfill {
-			// Disable all migrations after (and including) a backfill, the backfill
-			// needs the jobs table and following migrations may depend on these.
-			backwardCompatibleMigrations = backwardCompatibleMigrations[:i]
-			break
+	prevPrivileges, ok := sqlbase.SystemAllowedPrivileges[table.ID]
+	defer func() {
+		if ok {
+			// Restore value of privileges.
+			sqlbase.SystemAllowedPrivileges[table.ID] = prevPrivileges
+		} else {
+			delete(sqlbase.SystemAllowedPrivileges, table.ID)
 		}
-	}
+	}()
+	sqlbase.SystemAllowedPrivileges[table.ID] = sqlbase.SystemAllowedPrivileges[keys.NamespaceTableID]
+
+	table.Name = "dummy"
+	nameKey := sqlbase.NewPublicTableKey(table.ParentID, table.Name).Key()
+	descKey := sqlbase.MakeDescMetadataKey(table.ID)
+	descVal := sqlbase.WrapDescriptor(&table)
+
+	mt := makeMigrationTest(ctx, t)
+	defer mt.close(ctx)
 
 	mt.start(t, base.TestServerArgs{})
 
-	// Verify that the system.jobs keys were not written, but the system.settings
-	// keys were. This verifies that the migration system table migrations work.
-	if kv, err := mt.kvDB.Get(ctx, jobsNameKey); err != nil {
+	// Verify that the keys were not written.
+	if kv, err := mt.kvDB.Get(ctx, nameKey); err != nil {
 		t.Error(err)
 	} else if kv.Exists() {
-		t.Errorf("expected %q not to exist, got %v", jobsNameKey, kv)
+		t.Errorf("expected %q not to exist, got %v", nameKey, kv)
 	}
-	if kv, err := mt.kvDB.Get(ctx, jobsDescKey); err != nil {
+	if kv, err := mt.kvDB.Get(ctx, descKey); err != nil {
 		t.Error(err)
 	} else if kv.Exists() {
-		t.Errorf("expected %q not to exist, got %v", jobsDescKey, kv)
-	}
-	if kv, err := mt.kvDB.Get(ctx, settingsNameKey); err != nil {
-		t.Error(err)
-	} else if !kv.Exists() {
-		t.Errorf("expected %q to exist, got that it doesn't exist", settingsNameKey)
-	}
-	var descriptor sqlbase.Descriptor
-	if err := mt.kvDB.GetProto(ctx, settingsDescKey, &descriptor); err != nil {
-		t.Error(err)
-	} else if !proto.Equal(settingsDescVal, &descriptor) {
-		t.Errorf("expected %v for key %q, got %v", settingsDescVal, settingsDescKey, descriptor)
+		t.Errorf("expected %q not to exist, got %v", descKey, kv)
 	}
 
-	if err := mt.runMigration(ctx); err != nil {
+	migration := migrationDescriptor{
+		name: "add system.dummy table",
+		workFn: func(ctx context.Context, r runner) error {
+			return createSystemTable(ctx, r, table)
+		},
+	}
+	if err := mt.runMigration(ctx, migration); err != nil {
 		t.Fatal(err)
 	}
 
 	// Verify that the appropriate keys were written.
-	if kv, err := mt.kvDB.Get(ctx, jobsNameKey); err != nil {
+	if kv, err := mt.kvDB.Get(ctx, nameKey); err != nil {
 		t.Error(err)
 	} else if !kv.Exists() {
-		t.Errorf("expected %q to exist, got that it doesn't exist", jobsNameKey)
+		t.Errorf("expected %q to exist, got that it doesn't exist", nameKey)
 	}
-	if err := mt.kvDB.GetProto(ctx, jobsDescKey, &descriptor); err != nil {
+	var descriptor sqlbase.Descriptor
+	if err := mt.kvDB.GetProto(ctx, descKey, &descriptor); err != nil {
 		t.Error(err)
-	} else if !proto.Equal(jobsDescVal, &descriptor) {
-		t.Errorf("expected %v for key %q, got %v", jobsDescVal, jobsDescKey, descriptor)
+	} else if !proto.Equal(descVal, &descriptor) {
+		t.Errorf("expected %v for key %q, got %v", descVal, descKey, descriptor)
 	}
 
 	// Verify the idempotency of the migration.
-	if err := mt.runMigration(ctx); err != nil {
+	if err := mt.runMigration(ctx, migration); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestUpdateViewDependenciesMigration(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-
-	mt := makeIsolatedMigrationTest(ctx, t, "establish conservative dependencies for views")
-	defer mt.close(ctx)
-
-	mt.start(t, base.TestServerArgs{})
-
-	t.Log("create test tables")
-	mt.sqlDB.Exec(t, `
-CREATE DATABASE test;
-CREATE DATABASE test2;
-SET DATABASE=test;
-
-CREATE TABLE t(x INT, y INT);
-CREATE VIEW v1 AS SELECT x FROM t WHERE false;
-CREATE VIEW v2 AS SELECT x FROM v1;
-
-CREATE TABLE u(x INT, y INT);
-CREATE VIEW v3 AS SELECT x FROM (SELECT x, y FROM u);
-
-CREATE VIEW v4 AS SELECT id from system.descriptor;
-
-CREATE TABLE w(x INT);
-CREATE VIEW test2.v5 AS SELECT x FROM w;
-
-CREATE TABLE x(x INT);
-CREATE INDEX y ON x(x);
-CREATE VIEW v6 AS SELECT x FROM x@y;
-`)
-
-	testDesc := []struct {
-		dbName string
-		tname  string
-		desc   *sqlbase.TableDescriptor
-	}{
-		{"test", "t", nil},
-		{"test", "v1", nil},
-		{"test", "u", nil},
-		{"test", "w", nil},
-		{"test", "x", nil},
-		{"system", "descriptor", nil},
-	}
-
-	t.Log("fetch descriptors")
-	for i, td := range testDesc {
-		testDesc[i].desc = sqlbase.GetTableDescriptor(mt.kvDB, td.dbName, td.tname)
-	}
-
-	// Now, corrupt the descriptors by breaking their dependency information.
-	t.Log("break descriptors")
-	if err := mt.kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		if err := txn.SetSystemConfigTrigger(); err != nil {
-			return err
-		}
-		for _, t := range testDesc {
-			t.desc.UpVersion = true
-			t.desc.DependedOnBy = nil
-			t.desc.DependedOnBy = nil
-
-			descKey := sqlbase.MakeDescMetadataKey(t.desc.GetID())
-			descVal := sqlbase.WrapDescriptor(t.desc)
-			if err := txn.Put(ctx, descKey, descVal); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Break further by deleting the referenced tables. This has become possible
-	// because the dependency links have been broken above.
-	t.Log("delete tables")
-	mt.sqlDB.Exec(t, `
-DROP TABLE test.t;
-DROP VIEW test.v1;
-DROP TABLE test.u;
-DROP TABLE test.w;
-DROP INDEX test.x@y;`)
-
-	// Check the views are effectively broken.
-	t.Log("check views are broken")
-
-	for _, vname := range []string{"test.v2", "test.v3", "test2.v5", "test.v6"} {
-		_, err := mt.sqlDB.DB.Exec(fmt.Sprintf(`TABLE %s`, vname))
-		if !testutils.IsError(err,
-			`relation ".*" does not exist|index ".*" not found|table is being dropped`) {
-			t.Fatalf("%s: unexpected error: %v", vname, err)
-		}
-	}
-
-	// Restore missing dependencies for the rest of the test.
-	t.Log("restore dependencies")
-
-	mt.sqlDB.Exec(t, `
-CREATE TABLE test.t(x INT, y INT);
-CREATE TABLE test.u(x INT, y INT);
-CREATE TABLE test.w(x INT);
-CREATE VIEW test.v1 AS SELECT x FROM test.t WHERE false;
-CREATE INDEX y ON test.x(x);
-`)
-
-	t.Log("run migration")
-	if err := mt.runMigration(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// Check that the views are fixed now.
-	t.Log("check views working")
-
-	// Check the views can be queried.
-	for _, vname := range []string{"test.v1", "test.v2", "test.v3", "test.v4", "test2.v5", "test.v6"} {
-		mt.sqlDB.Exec(t, fmt.Sprintf("TABLE %s", vname))
-	}
-
-	// Check that the tables cannot be dropped any more.
-	for _, tn := range []string{"TABLE test.t", "TABLE test.u", "TABLE test.w", "INDEX test.x@y"} {
-		_, err := mt.sqlDB.DB.Exec(fmt.Sprintf(`DROP %s`, tn))
-		if !testutils.IsError(err,
-			`cannot drop (relation|index) .* because view .* depends on it`) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	}
-
-	// Finally, try running the migration and make sure it still succeeds.
-	// This verifies the idempotency of the migration.
-	t.Log("run migration again")
-	if err := mt.runMigration(ctx); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestAddDefaultMetaZoneConfigMigration(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-
-	mt := makeIsolatedMigrationTest(ctx, t, "add default .meta and .liveness zone configs")
-	defer mt.close(ctx)
-
-	mt.start(t, base.TestServerArgs{})
-
-	ids := []uint32{keys.MetaRangesID, keys.LivenessRangesID}
-	for _, id := range ids {
-		var s string
-		err := mt.sqlDB.DB.QueryRow(`SELECT config FROM system.zones WHERE id = $1`, id).Scan(&s)
-		if err != gosql.ErrNoRows {
-			t.Fatalf("expected no rows, but found %v", err)
-		}
-	}
-
-	// Run the migration and verify its effects.
-	if err := mt.runMigration(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	checkZoneConfig := func(id int, expected config.ZoneConfig) {
-		t.Helper()
-
-		var s string
-		mt.sqlDB.QueryRow(t, `SELECT config FROM system.zones WHERE id = $1`, id).Scan(&s)
-		var zone config.ZoneConfig
-		if err := protoutil.Unmarshal([]byte(s), &zone); err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(expected, zone) {
-			t.Fatalf("unexpected .meta zone config: %s", pretty.Diff(expected, zone))
-		}
-	}
-
-	expectedMeta := config.DefaultZoneConfig()
-	expectedMeta.GC.TTLSeconds = 60 * 60
-	checkZoneConfig(keys.MetaRangesID, expectedMeta)
-	expectedLiveness := config.DefaultZoneConfig()
-	expectedLiveness.GC.TTLSeconds = 10 * 60
-	checkZoneConfig(keys.LivenessRangesID, expectedLiveness)
-
-	deleteZoneConfig := func(id int) {
-		mt.sqlDB.Exec(t, `DELETE FROM system.zones WHERE id=$1`, id)
-	}
-
-	setZoneConfig := func(id int, zone config.ZoneConfig) {
-		buf, err := protoutil.Marshal(&zone)
-		if err != nil {
-			t.Fatal(err)
-		}
-		mt.sqlDB.Exec(t, `UPSERT INTO system.zones (id, config) VALUES ($1, $2)`, id, buf)
-	}
-
-	// Set configs for the .meta and .system zones and clear the zone config for
-	// .liveness.
-	testZone := config.DefaultZoneConfig()
-	testZone.GC.TTLSeconds = 819
-	setZoneConfig(keys.MetaRangesID, testZone)
-	setZoneConfig(keys.SystemRangesID, testZone)
-	deleteZoneConfig(keys.LivenessRangesID)
-	if err := mt.runMigration(ctx); err != nil {
-		t.Fatal(err)
-	}
-	checkZoneConfig(keys.MetaRangesID, testZone)
-	checkZoneConfig(keys.LivenessRangesID, testZone)
-	checkZoneConfig(keys.SystemRangesID, testZone)
-
-	// Set configs for the .meta and .liveness zones and clear the zone config
-	// for .system.
-	testZone.GC.TTLSeconds = 834
-	setZoneConfig(keys.MetaRangesID, testZone)
-	setZoneConfig(keys.SystemRangesID, testZone)
-	deleteZoneConfig(keys.LivenessRangesID)
-	if err := mt.runMigration(ctx); err != nil {
-		t.Fatal(err)
-	}
-	checkZoneConfig(keys.MetaRangesID, testZone)
-	checkZoneConfig(keys.LivenessRangesID, testZone)
-	// NB: The .system zone config still doesn't exist.
-
-	// Verify that we'll update the meta/liveness zone config TTLs by migrating
-	// from the default/system zone configs.
-	testZone.RangeMaxBytes *= 2
-	testZone.GC.TTLSeconds = config.DefaultZoneConfig().GC.TTLSeconds
-	setZoneConfig(keys.RootNamespaceID, testZone)
-	setZoneConfig(keys.SystemRangesID, testZone)
-	deleteZoneConfig(keys.MetaRangesID)
-	deleteZoneConfig(keys.LivenessRangesID)
-	if err := mt.runMigration(ctx); err != nil {
-		t.Fatal(err)
-	}
-	testZone.GC.TTLSeconds = 60 * 60
-	checkZoneConfig(keys.MetaRangesID, testZone)
-	testZone.GC.TTLSeconds = 10 * 60
-	checkZoneConfig(keys.LivenessRangesID, testZone)
-
-	// Verify that we'll update the meta zone config even if it already exists as
-	// long as it has the default TTL.
-	testZone.RangeMaxBytes = 863
-	testZone.GC.TTLSeconds = config.DefaultZoneConfig().GC.TTLSeconds
-	setZoneConfig(keys.MetaRangesID, testZone)
-	if err := mt.runMigration(ctx); err != nil {
-		t.Fatal(err)
-	}
-	testZone.GC.TTLSeconds = 60 * 60
-	checkZoneConfig(keys.MetaRangesID, testZone)
 }
 
 func TestAdminUserExists(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	mt := makeIsolatedMigrationTest(ctx, t, "add system.users isRole column and create admin role")
+	mt := makeMigrationTest(ctx, t)
 	defer mt.close(ctx)
 
+	migration := mt.pop(t, "add system.users isRole column and create admin role")
 	mt.start(t, base.TestServerArgs{})
 
 	// Create a user named "admin". We have to do a manual insert as "CREATE USER"
@@ -771,9 +566,48 @@ func TestAdminUserExists(t *testing.T) {
 	mt.sqlDB.Exec(t, `INSERT INTO system.users (username, "hashedPassword") VALUES ($1, '')`,
 		sqlbase.AdminRole)
 
-	e := `cannot create role "admin", a user with that name exists.`
-	if err := mt.runMigration(ctx); !testutils.IsError(err, e) {
-		t.Errorf("expected error %q, got %q", err, e)
+	// The revised migration in v2.1 upserts the admin user, so this should succeed.
+	if err := mt.runMigration(ctx, migration); err != nil {
+		t.Errorf("expected success, got %q", err)
+	}
+}
+
+func TestPublicRoleExists(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	mt := makeMigrationTest(ctx, t)
+	defer mt.close(ctx)
+
+	migration := mt.pop(t, "disallow public user or role name")
+	mt.start(t, base.TestServerArgs{})
+
+	// Create a user (we check for user or role) named "public".
+	// We have to do a manual insert as "CREATE USER" knows to disallow "public".
+	mt.sqlDB.Exec(t, `INSERT INTO system.users (username, "hashedPassword", "isRole") VALUES ($1, '', false)`,
+		sqlbase.PublicRole)
+
+	e := `found a user named public which is now a reserved name.`
+	// The revised migration in v2.1 upserts the admin user, so this should succeed.
+	if err := mt.runMigration(ctx, migration); !testutils.IsError(err, e) {
+		t.Errorf("expected error %q got %q", e, err)
+	}
+
+	// Now try with a role instead of a user.
+	mt.sqlDB.Exec(t, `DELETE FROM system.users WHERE username = $1`, sqlbase.PublicRole)
+	mt.sqlDB.Exec(t, `INSERT INTO system.users (username, "hashedPassword", "isRole") VALUES ($1, '', true)`,
+		sqlbase.PublicRole)
+
+	e = `found a role named public which is now a reserved name.`
+	// The revised migration in v2.1 upserts the admin user, so this should succeed.
+	if err := mt.runMigration(ctx, migration); !testutils.IsError(err, e) {
+		t.Errorf("expected error %q got %q", e, err)
+	}
+
+	// Drop it and try again.
+	mt.sqlDB.Exec(t, `DELETE FROM system.users WHERE username = $1`, sqlbase.PublicRole)
+	if err := mt.runMigration(ctx, migration); err != nil {
+		t.Errorf("expected success, got %q", err)
 	}
 }
 
@@ -781,81 +615,16 @@ func TestReplayMigrations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
-
-	r := runner{
-		db:          kvDB,
-		sqlExecutor: s.Executor().(*sql.Executor),
-		memMetrics:  &sql.MemoryMetrics{},
-	}
-
-	// Test all migrations again. StartServer did the first round.
-	for _, m := range backwardCompatibleMigrations {
-		if err := m.workFn(ctx, r); err != nil {
-			t.Error(err)
-		}
-	}
-}
-
-func TestUpgradeTableDescsToInterleavedFormatVersionMigration(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-
-	mt := makeIsolatedMigrationTest(ctx, t, "upgrade table descs to interleaved format version")
+	mt := makeMigrationTest(ctx, t)
 	defer mt.close(ctx)
 
-	mt.start(t, base.TestServerArgs{
-		Knobs: base.TestingKnobs{
-			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-				// Block schema changes to ensure that our migration sees some table
-				// descriptors in the DROP state. The schema changer might otherwise
-				// erase them before our migration runs.
-				AsyncExecNotification: func() error { return errors.New("schema changes disabled") },
-			},
-		},
-	})
+	mt.start(t, base.TestServerArgs{})
 
-	defer func(prev int64) { upgradeTableDescBatchSize = prev }(upgradeTableDescBatchSize)
-	upgradeTableDescBatchSize = 5
-	n := int(upgradeTableDescBatchSize) * 3
-
-	// Create n tables.
-	mt.sqlDB.Exec(t, `CREATE DATABASE db`)
-	for i := 0; i < n; i++ {
-		mt.sqlDB.Exec(t, fmt.Sprintf(`CREATE TABLE db.t%d ()`, i))
-	}
-
-	// Corrupt every second table's format version, and mark every third table as
-	// dropping.
-	for i := 0; i < n; i++ {
-		tableDesc := sqlbase.GetTableDescriptor(mt.kvDB, "db", fmt.Sprintf("t%d", i))
-		if i%2 == 0 {
-			tableDesc.FormatVersion = sqlbase.FamilyFormatVersion
+	// Test all migrations again. Starting the server did the first round.
+	for _, m := range backwardCompatibleMigrations {
+		if err := mt.runMigration(ctx, m); err != nil {
+			t.Error(err)
 		}
-		if i%3 == 0 {
-			tableDesc.State = sqlbase.TableDescriptor_DROP
-		}
-		tableKey := sqlbase.MakeDescMetadataKey(tableDesc.ID)
-		if err := mt.kvDB.Put(ctx, tableKey, sqlbase.WrapDescriptor(tableDesc)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Ensure the migration upgrades the format of all tables, even those that
-	// are dropping.
-	if err := mt.runMigration(ctx); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < n; i++ {
-		tableDesc := sqlbase.GetTableDescriptor(mt.kvDB, "db", fmt.Sprintf("t%d", i))
-		if e, a := sqlbase.InterleavedFormatVersion, tableDesc.FormatVersion; e != a {
-			t.Errorf("t%d: expected format version %s, but got %s", i, e, a)
-		}
-	}
-
-	// Verify idempotency.
-	if err := mt.runMigration(ctx); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -872,8 +641,8 @@ func TestExpectedInitialRangeCount(t *testing.T) {
 			return errors.New("last migration has not completed")
 		}
 
-		sysCfg, ok := s.Gossip().GetSystemConfig()
-		if !ok {
+		sysCfg := s.GossipI().(*gossip.Gossip).GetSystemConfig()
+		if sysCfg == nil {
 			return errors.New("gossipped system config not available")
 		}
 
@@ -908,4 +677,83 @@ func TestExpectedInitialRangeCount(t *testing.T) {
 
 		return nil
 	})
+}
+
+func TestUpdateSystemLocationData(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	mt := makeMigrationTest(ctx, t)
+	defer mt.close(ctx)
+
+	migration := mt.pop(t, "update system.locations with default location data")
+	mt.start(t, base.TestServerArgs{})
+
+	// Check that we don't have any data in the system.locations table without the migration.
+	var count int
+	mt.sqlDB.QueryRow(t, `SELECT count(*) FROM system.locations`).Scan(&count)
+	if count != 0 {
+		t.Fatalf("Exected to find 0 rows in system.locations. Found  %d instead", count)
+	}
+
+	// Run the migration to insert locations.
+	if err := mt.runMigration(ctx, migration); err != nil {
+		t.Errorf("expected success, got %q", err)
+	}
+
+	// Check that we have all of the expected locations.
+	mt.sqlDB.QueryRow(t, `SELECT count(*) FROM system.locations`).Scan(&count)
+	if count != len(roachpb.DefaultLocationInformation) {
+		t.Fatalf("Exected to find 0 rows in system.locations. Found  %d instead", count)
+	}
+}
+
+func TestMigrateNamespaceTableDescriptors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	mt := makeMigrationTest(ctx, t)
+	defer mt.close(ctx)
+
+	migration := mt.pop(t, "create new system.namespace table")
+	mt.start(t, base.TestServerArgs{})
+
+	// Since we're already on 20.1, mimic the beginning state by deleting the
+	// new namespace descriptor and changing the old one's name to "namespace".
+	key := sqlbase.MakeDescMetadataKey(keys.NamespaceTableID)
+	require.NoError(t, mt.kvDB.Del(ctx, key))
+
+	deprecatedKey := sqlbase.MakeDescMetadataKey(keys.DeprecatedNamespaceTableID)
+	desc := &sqlbase.Descriptor{}
+	require.NoError(t, mt.kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		ts, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
+		require.NoError(t, err)
+		desc.Table(ts).Name = sqlbase.NamespaceTable.Name
+		return txn.Put(ctx, deprecatedKey, desc)
+	}))
+
+	// Run the migration.
+	require.NoError(t, mt.runMigration(ctx, migration))
+
+	require.NoError(t, mt.kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		// Check that the persisted descriptors now match our in-memory versions,
+		// ignoring create and modification times.
+		{
+			ts, err := txn.GetProtoTs(ctx, key, desc)
+			require.NoError(t, err)
+			table := desc.Table(ts)
+			table.CreateAsOfTime = sqlbase.NamespaceTable.CreateAsOfTime
+			table.ModificationTime = sqlbase.NamespaceTable.ModificationTime
+			require.True(t, table.Equal(sqlbase.NamespaceTable))
+		}
+		{
+			ts, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
+			require.NoError(t, err)
+			table := desc.Table(ts)
+			table.CreateAsOfTime = sqlbase.DeprecatedNamespaceTable.CreateAsOfTime
+			table.ModificationTime = sqlbase.DeprecatedNamespaceTable.ModificationTime
+			require.True(t, table.Equal(sqlbase.DeprecatedNamespaceTable))
+		}
+		return nil
+	}))
 }

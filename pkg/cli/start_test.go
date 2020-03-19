@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -24,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -31,7 +28,10 @@ import (
 func TestInitInsecure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	f := StartCmd.Flags()
+	// Avoid leaking configuration changes after the tests end.
+	defer initCLIDefaults()
+
+	f := startCmd.Flags()
 
 	testCases := []struct {
 		args     []string
@@ -42,23 +42,23 @@ func TestInitInsecure(t *testing.T) {
 		{[]string{"--insecure"}, true, ""},
 		{[]string{"--insecure=true"}, true, ""},
 		{[]string{"--insecure=false"}, false, ""},
-		{[]string{"--host", "localhost"}, false, ""},
-		{[]string{"--host", "127.0.0.1"}, false, ""},
-		{[]string{"--host", "::1"}, false, ""},
-		{[]string{"--host", "192.168.1.1"}, false,
+		{[]string{"--listen-addr", "localhost"}, false, ""},
+		{[]string{"--listen-addr", "127.0.0.1"}, false, ""},
+		{[]string{"--listen-addr", "[::1]"}, false, ""},
+		{[]string{"--listen-addr", "192.168.1.1"}, false,
 			`specify --insecure to listen on external address 192\.168\.1\.1`},
-		{[]string{"--insecure", "--host", "192.168.1.1"}, true, ""},
-		{[]string{"--host", "localhost", "--advertise-host", "192.168.1.1"}, false, ""},
-		{[]string{"--host", "127.0.0.1", "--advertise-host", "192.168.1.1"}, false, ""},
-		{[]string{"--host", "127.0.0.1", "--advertise-host", "192.168.1.1", "--advertise-port", "36259"}, false, ""},
-		{[]string{"--host", "::1", "--advertise-host", "192.168.1.1"}, false, ""},
-		{[]string{"--host", "::1", "--advertise-host", "192.168.1.1", "--advertise-port", "36259"}, false, ""},
-		{[]string{"--insecure", "--host", "192.168.1.1", "--advertise-host", "192.168.1.1"}, true, ""},
-		{[]string{"--insecure", "--host", "192.168.1.1", "--advertise-host", "192.168.2.2"}, true, ""},
-		{[]string{"--insecure", "--host", "192.168.1.1", "--advertise-host", "192.168.2.2", "--advertise-port", "36259"}, true, ""},
+		{[]string{"--insecure", "--listen-addr", "192.168.1.1"}, true, ""},
+		{[]string{"--listen-addr", "localhost", "--advertise-addr", "192.168.1.1"}, false, ""},
+		{[]string{"--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.1.1"}, false, ""},
+		{[]string{"--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.1.1", "--advertise-port", "36259"}, false, ""},
+		{[]string{"--listen-addr", "[::1]", "--advertise-addr", "192.168.1.1"}, false, ""},
+		{[]string{"--listen-addr", "[::1]", "--advertise-addr", "192.168.1.1", "--advertise-port", "36259"}, false, ""},
+		{[]string{"--insecure", "--listen-addr", "192.168.1.1", "--advertise-addr", "192.168.1.1"}, true, ""},
+		{[]string{"--insecure", "--listen-addr", "192.168.1.1", "--advertise-addr", "192.168.2.2"}, true, ""},
+		{[]string{"--insecure", "--listen-addr", "192.168.1.1", "--advertise-addr", "192.168.2.2", "--advertise-port", "36259"}, true, ""},
 		// Clear out the flags when done to avoid affecting other tests that rely on the flag state.
-		{[]string{"--host", "", "--advertise-host", ""}, false, ""},
-		{[]string{"--host", "", "--advertise-host", "", "--advertise-port", ""}, false, ""},
+		{[]string{"--listen-addr", "", "--advertise-addr", ""}, false, ""},
+		{[]string{"--listen-addr", "", "--advertise-addr", "", "--advertise-port", ""}, false, ""},
 	}
 	for i, c := range testCases {
 		// Reset the context and for every test case.
@@ -76,7 +76,14 @@ func TestInitInsecure(t *testing.T) {
 func TestStartArgChecking(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	f := StartCmd.Flags()
+	// Avoid leaking configuration changes after the tests end.
+	// In addition to the usual initCLIDefaults, we need to reset
+	// the serverCfg because --store modifies it in a way that
+	// initCLIDefaults does not restore.
+	defer func(save server.Config) { serverCfg = save }(serverCfg)
+	defer initCLIDefaults()
+
+	f := startCmd.Flags()
 
 	testCases := []struct {
 		args     []string
@@ -89,11 +96,11 @@ func TestStartArgChecking(t *testing.T) {
 		{[]string{`--store=path=~/blah`}, `path cannot start with '~': ~/blah`},
 		{[]string{`--store=path=./~/blah`}, ``},
 		{[]string{`--store=size=blih`}, `could not parse store size`},
-		{[]string{`--store=size=0.005`}, `store size \(0.005\) must be between 1% and 100%`},
-		{[]string{`--store=size=100.5`}, `store size \(100.5\) must be between 1% and 100%`},
-		{[]string{`--store=size=0.5%`}, `store size \(0.5%\) must be between 1% and 100%`},
-		{[]string{`--store=size=0.5%`}, `store size \(0.5%\) must be between 1% and 100%`},
-		{[]string{`--store=size=500.0%`}, `store size \(500.0%\) must be between 1% and 100%`},
+		{[]string{`--store=size=0.005`}, `store size \(0.005\) must be between 1.000000% and 100.000000%`},
+		{[]string{`--store=size=100.5`}, `store size \(100.5\) must be between 1.000000% and 100.000000%`},
+		{[]string{`--store=size=0.5%`}, `store size \(0.5%\) must be between 1.000000% and 100.000000%`},
+		{[]string{`--store=size=0.5%`}, `store size \(0.5%\) must be between 1.000000% and 100.000000%`},
+		{[]string{`--store=size=500.0%`}, `store size \(500.0%\) must be between 1.000000% and 100.000000%`},
 		{[]string{`--store=size=.5,path=.`}, ``},
 		{[]string{`--store=size=50.%,path=.`}, ``},
 		{[]string{`--store=size=50%,path=.`}, ``},
@@ -161,5 +168,27 @@ func TestGCProfiles(t *testing.T) {
 				i, strings.Join(e, "\n"), strings.Join(paths, "\n"))
 		}
 		sum -= len(data[:i])
+	}
+}
+
+func TestAddrWithDefaultHost(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testData := []struct {
+		inAddr  string
+		outAddr string
+	}{
+		{"localhost:123", "localhost:123"},
+		{":123", "localhost:123"},
+		{"[::1]:123", "[::1]:123"},
+	}
+
+	for _, test := range testData {
+		addr, err := addrWithDefaultHost(test.inAddr)
+		if err != nil {
+			t.Error(err)
+		} else if addr != test.outAddr {
+			t.Errorf("expected %q, got %q", test.outAddr, addr)
+		}
 	}
 }

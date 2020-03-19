@@ -1,3 +1,13 @@
+// Copyright 2019 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 // Copyright 2013 Google Inc. All Rights Reserved.
 // Copyright 2015 Cockroach Labs.
 //
@@ -32,7 +42,7 @@
 // V-Style
 //
 // The V functions can be used to selectively enable logging at a call
-// site. Invoking the binary with --verbosity=N will enable V functions
+// site. Invoking the binary with --vmodule=*=N will enable V functions
 // at level N or higher. Invoking the binary with --vmodule="glob=N" will
 // enable V functions at level N or higher with a filename matching glob.
 //
@@ -78,15 +88,6 @@
 //
 // Other flags provide aids to debugging.
 //
-//  --log-backtrace-at=""
-//    When set to a file and line number holding a logging statement,
-//    such as
-//      -log_backtrace_at=gopherflakes.go:234
-//    a stack trace will be written to the Info log whenever execution
-//    hits that statement. (Unlike with --vmodule, the ".go" must be
-//    present.)
-//  --verbosity=0
-//    Enable V-leveled logging at the specified level.
 //  --vmodule=""
 //    The syntax of the argument is a comma-separated list of pattern=N,
 //    where pattern is a literal file name (minus the ".go" suffix) or

@@ -2,18 +2,14 @@
 # accordingly.
 set env(TERM) vt100
 
-# If running inside docker, change the home dir to the output log dir
-# so that any HOME-derived artifacts land there.
-if {[pwd] == "/"} {
-  set ::env(HOME) "/logs"
-} else {
-  system "mkdir -p logs"
-}
+system "mkdir -p logs"
 
 # Keep the history in a test location, so as to not override the
 # developer's own history file when running out of Docker.
 set histfile "cockroach_sql_history"
 
+set ::env(COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING) "true"
+set ::env(COCKROACH_CONNECT_TIMEOUT) 15
 set ::env(COCKROACH_SQL_CLI_HISTORY) $histfile
 # Set client commands as insecure. The server uses --insecure.
 set ::env(COCKROACH_INSECURE) "true"
@@ -94,20 +90,49 @@ proc send_eof {} {
 # in `server_pid`.
 proc start_server {argv} {
     report "BEGIN START SERVER"
-    system "mkfifo pid_fifo || true; $argv start --insecure --pid-file=pid_fifo --background -s=path=logs/db >>logs/expect-cmd.log 2>&1 & cat pid_fifo > server_pid"
+    system "$argv start-single-node --insecure --max-sql-memory=128MB --pid-file=server_pid --listening-url-file=server_url --background -s=path=logs/db >>logs/expect-cmd.log 2>&1;
+            $argv sql --insecure -e 'select 1'"
     report "START SERVER DONE"
 }
 proc stop_server {argv} {
     report "BEGIN STOP SERVER"
     # Trigger a normal shutdown.
-    system "$argv quit"
-    # If after 5 seconds the server hasn't shut down, trigger an error.
-    system "for i in `seq 1 5`; do kill -CONT `cat server_pid` 2>/dev/null || exit 0; echo still waiting; sleep 1; done; echo 'server still running?'; exit 1"
+    # If after 30 seconds the server hasn't shut down, kill the process and trigger an error.
+    # Note: kill -CONT tests whether the PID exists (SIGCONT is a no-op for the process).
+    system "kill -TERM `cat server_pid` 2>/dev/null;
+            for i in `seq 1 30`; do
+              kill -CONT `cat server_pid` 2>/dev/null || exit 0
+              echo still waiting
+              sleep 1
+            done
+            echo 'server still running?'
+            # Send an unclean shutdown signal to trigger a stack trace dump.
+            kill -ABRT `cat server_pid` 2>/dev/null
+            # Sleep to increase the probability that the stack trace actually
+            # makes it to disk before we force-kill the process.
+            sleep 1
+            kill -KILL `cat server_pid` 2>/dev/null
+            exit 1"
+
     report "END STOP SERVER"
+}
+
+proc flush_server_logs {} {
+    report "BEGIN FLUSH LOGS"
+    system "kill -HUP `cat server_pid` 2>/dev/null"
+    # Wait for flush to occur.
+    system "for i in `seq 1 3`; do
+              grep 'hangup received, flushing logs' logs/db/logs/cockroach.log && exit 0;
+              echo still waiting
+              sleep 1
+            done
+            echo 'server failed to flush logs?'
+            exit 1"
+    report "END FLUSH LOGS"
 }
 
 proc force_stop_server {argv} {
     report "BEGIN FORCE STOP SERVER"
-    system "$argv quit & sleep 1; if kill -CONT `cat server_pid` 2>/dev/null; then kill -TERM `cat server_pid`; sleep 1; if kill -CONT `cat server_pid` 2>/dev/null; then kill -KILL `cat server_pid`; fi; fi"
+    system "kill -KILL `cat server_pid`"
     report "END FORCE STOP SERVER"
 }

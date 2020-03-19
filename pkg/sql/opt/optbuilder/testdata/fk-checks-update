@@ -1,0 +1,424 @@
+exec-ddl
+CREATE TABLE parent (x INT, p INT PRIMARY KEY, other INT UNIQUE)
+----
+
+exec-ddl
+CREATE TABLE child (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(p))
+----
+
+build
+UPDATE child SET p = 4
+----
+update child
+ ├── columns: <none>
+ ├── fetch columns: c:3 child.p:4
+ ├── update-mapping:
+ │    └── column5:5 => child.p:2
+ ├── input binding: &1
+ ├── project
+ │    ├── columns: column5:5!null c:3!null child.p:4!null
+ │    ├── scan child
+ │    │    └── columns: c:3!null child.p:4!null
+ │    └── projections
+ │         └── 4 [as=column5:5]
+ └── f-k-checks
+      └── f-k-checks-item: child(p) -> parent(p)
+           └── anti-join (hash)
+                ├── columns: column5:6!null
+                ├── with-scan &1
+                │    ├── columns: column5:6!null
+                │    └── mapping:
+                │         └──  column5:5 => column5:6
+                ├── scan parent
+                │    └── columns: parent.p:8!null
+                └── filters
+                     └── column5:6 = parent.p:8
+
+build
+UPDATE parent SET p = p+1
+----
+update parent
+ ├── columns: <none>
+ ├── fetch columns: x:4 parent.p:5 other:6
+ ├── update-mapping:
+ │    └── column7:7 => parent.p:2
+ ├── input binding: &1
+ ├── project
+ │    ├── columns: column7:7!null x:4 parent.p:5!null other:6
+ │    ├── scan parent
+ │    │    └── columns: x:4 parent.p:5!null other:6
+ │    └── projections
+ │         └── parent.p:5 + 1 [as=column7:7]
+ └── f-k-checks
+      └── f-k-checks-item: child(p) -> parent(p)
+           └── semi-join (hash)
+                ├── columns: p:8!null
+                ├── except
+                │    ├── columns: p:8!null
+                │    ├── left columns: p:8!null
+                │    ├── right columns: column7:9
+                │    ├── with-scan &1
+                │    │    ├── columns: p:8!null
+                │    │    └── mapping:
+                │    │         └──  parent.p:5 => p:8
+                │    └── with-scan &1
+                │         ├── columns: column7:9!null
+                │         └── mapping:
+                │              └──  column7:7 => column7:9
+                ├── scan child
+                │    └── columns: child.p:11!null
+                └── filters
+                     └── p:8 = child.p:11
+
+exec-ddl
+CREATE TABLE grandchild (g INT PRIMARY KEY, c INT NOT NULL REFERENCES child(c))
+----
+
+build
+UPDATE child SET c = 4
+----
+update child
+ ├── columns: <none>
+ ├── fetch columns: child.c:3 p:4
+ ├── update-mapping:
+ │    └── column5:5 => child.c:1
+ ├── input binding: &1
+ ├── project
+ │    ├── columns: column5:5!null child.c:3!null p:4!null
+ │    ├── scan child
+ │    │    └── columns: child.c:3!null p:4!null
+ │    └── projections
+ │         └── 4 [as=column5:5]
+ └── f-k-checks
+      └── f-k-checks-item: grandchild(c) -> child(c)
+           └── semi-join (hash)
+                ├── columns: c:6!null
+                ├── except
+                │    ├── columns: c:6!null
+                │    ├── left columns: c:6!null
+                │    ├── right columns: column5:7
+                │    ├── with-scan &1
+                │    │    ├── columns: c:6!null
+                │    │    └── mapping:
+                │    │         └──  child.c:3 => c:6
+                │    └── with-scan &1
+                │         ├── columns: column5:7!null
+                │         └── mapping:
+                │              └──  column5:5 => column5:7
+                ├── scan grandchild
+                │    └── columns: grandchild.c:9!null
+                └── filters
+                     └── c:6 = grandchild.c:9
+
+# This update shouldn't emit checks for c, since it's unchanged.
+build
+UPDATE child SET p = 4
+----
+update child
+ ├── columns: <none>
+ ├── fetch columns: c:3 child.p:4
+ ├── update-mapping:
+ │    └── column5:5 => child.p:2
+ ├── input binding: &1
+ ├── project
+ │    ├── columns: column5:5!null c:3!null child.p:4!null
+ │    ├── scan child
+ │    │    └── columns: c:3!null child.p:4!null
+ │    └── projections
+ │         └── 4 [as=column5:5]
+ └── f-k-checks
+      └── f-k-checks-item: child(p) -> parent(p)
+           └── anti-join (hash)
+                ├── columns: column5:6!null
+                ├── with-scan &1
+                │    ├── columns: column5:6!null
+                │    └── mapping:
+                │         └──  column5:5 => column5:6
+                ├── scan parent
+                │    └── columns: parent.p:8!null
+                └── filters
+                     └── column5:6 = parent.p:8
+
+build
+UPDATE child SET p = p
+----
+update child
+ ├── columns: <none>
+ ├── fetch columns: c:3 child.p:4
+ ├── update-mapping:
+ │    └── child.p:4 => child.p:2
+ ├── input binding: &1
+ ├── scan child
+ │    └── columns: c:3!null child.p:4!null
+ └── f-k-checks
+      └── f-k-checks-item: child(p) -> parent(p)
+           └── anti-join (hash)
+                ├── columns: p:5!null
+                ├── with-scan &1
+                │    ├── columns: p:5!null
+                │    └── mapping:
+                │         └──  child.p:4 => p:5
+                ├── scan parent
+                │    └── columns: parent.p:7!null
+                └── filters
+                     └── p:5 = parent.p:7
+
+build
+UPDATE child SET p = p+1, c = c+1
+----
+update child
+ ├── columns: <none>
+ ├── fetch columns: child.c:3 child.p:4
+ ├── update-mapping:
+ │    ├── column6:6 => child.c:1
+ │    └── column5:5 => child.p:2
+ ├── input binding: &1
+ ├── project
+ │    ├── columns: column5:5!null column6:6!null child.c:3!null child.p:4!null
+ │    ├── scan child
+ │    │    └── columns: child.c:3!null child.p:4!null
+ │    └── projections
+ │         ├── child.p:4 + 1 [as=column5:5]
+ │         └── child.c:3 + 1 [as=column6:6]
+ └── f-k-checks
+      ├── f-k-checks-item: child(p) -> parent(p)
+      │    └── anti-join (hash)
+      │         ├── columns: column5:7!null
+      │         ├── with-scan &1
+      │         │    ├── columns: column5:7!null
+      │         │    └── mapping:
+      │         │         └──  column5:5 => column5:7
+      │         ├── scan parent
+      │         │    └── columns: parent.p:9!null
+      │         └── filters
+      │              └── column5:7 = parent.p:9
+      └── f-k-checks-item: grandchild(c) -> child(c)
+           └── semi-join (hash)
+                ├── columns: c:11!null
+                ├── except
+                │    ├── columns: c:11!null
+                │    ├── left columns: c:11!null
+                │    ├── right columns: column6:12
+                │    ├── with-scan &1
+                │    │    ├── columns: c:11!null
+                │    │    └── mapping:
+                │    │         └──  child.c:3 => c:11
+                │    └── with-scan &1
+                │         ├── columns: column6:12!null
+                │         └── mapping:
+                │              └──  column6:6 => column6:12
+                ├── scan grandchild
+                │    └── columns: grandchild.c:14!null
+                └── filters
+                     └── c:11 = grandchild.c:14
+
+# Multiple grandchild tables
+exec-ddl
+CREATE TABLE grandchild2 (g INT PRIMARY KEY, c INT NOT NULL REFERENCES child(c))
+----
+
+build
+UPDATE child SET p = 4
+----
+update child
+ ├── columns: <none>
+ ├── fetch columns: c:3 child.p:4
+ ├── update-mapping:
+ │    └── column5:5 => child.p:2
+ ├── input binding: &1
+ ├── project
+ │    ├── columns: column5:5!null c:3!null child.p:4!null
+ │    ├── scan child
+ │    │    └── columns: c:3!null child.p:4!null
+ │    └── projections
+ │         └── 4 [as=column5:5]
+ └── f-k-checks
+      └── f-k-checks-item: child(p) -> parent(p)
+           └── anti-join (hash)
+                ├── columns: column5:6!null
+                ├── with-scan &1
+                │    ├── columns: column5:6!null
+                │    └── mapping:
+                │         └──  column5:5 => column5:6
+                ├── scan parent
+                │    └── columns: parent.p:8!null
+                └── filters
+                     └── column5:6 = parent.p:8
+
+exec-ddl
+CREATE TABLE self (x INT PRIMARY KEY, y INT NOT NULL REFERENCES self(x))
+----
+
+build
+UPDATE self SET y = 3
+----
+update self
+ ├── columns: <none>
+ ├── fetch columns: x:3 y:4
+ ├── update-mapping:
+ │    └── column5:5 => y:2
+ ├── input binding: &1
+ ├── project
+ │    ├── columns: column5:5!null x:3!null y:4!null
+ │    ├── scan self
+ │    │    └── columns: x:3!null y:4!null
+ │    └── projections
+ │         └── 3 [as=column5:5]
+ └── f-k-checks
+      └── f-k-checks-item: self(y) -> self(x)
+           └── anti-join (hash)
+                ├── columns: column5:6!null
+                ├── with-scan &1
+                │    ├── columns: column5:6!null
+                │    └── mapping:
+                │         └──  column5:5 => column5:6
+                ├── scan self
+                │    └── columns: x:7!null
+                └── filters
+                     └── column5:6 = x:7
+
+build
+UPDATE self SET x = 3
+----
+update self
+ ├── columns: <none>
+ ├── fetch columns: self.x:3 y:4
+ ├── update-mapping:
+ │    └── column5:5 => self.x:1
+ ├── input binding: &1
+ ├── project
+ │    ├── columns: column5:5!null self.x:3!null y:4!null
+ │    ├── scan self
+ │    │    └── columns: self.x:3!null y:4!null
+ │    └── projections
+ │         └── 3 [as=column5:5]
+ └── f-k-checks
+      └── f-k-checks-item: self(y) -> self(x)
+           └── semi-join (hash)
+                ├── columns: x:6!null
+                ├── except
+                │    ├── columns: x:6!null
+                │    ├── left columns: x:6!null
+                │    ├── right columns: column5:7
+                │    ├── with-scan &1
+                │    │    ├── columns: x:6!null
+                │    │    └── mapping:
+                │    │         └──  self.x:3 => x:6
+                │    └── with-scan &1
+                │         ├── columns: column5:7!null
+                │         └── mapping:
+                │              └──  column5:5 => column5:7
+                ├── scan self
+                │    └── columns: y:9!null
+                └── filters
+                     └── x:6 = y:9
+
+exec-ddl
+CREATE TABLE two (a int, b int, primary key (a, b))
+----
+
+exec-ddl
+CREATE TABLE fam (
+  a INT,
+  b INT,
+  c INT,
+  d INT,
+  e INT,
+  FAMILY (a, b, c),
+  FAMILY (d, e),
+  FOREIGN KEY (c, d) REFERENCES two (a, b)
+)
+----
+
+# Ensure that we fetch all relevant columns for a foreign key.
+
+# NOTE: when we no longer require indexes to be created for FKs, ensure that
+# these still scan all the relevant FK columns.
+norm
+UPDATE fam SET c = 3
+----
+update fam
+ ├── columns: <none>
+ ├── fetch columns: fam.a:7 fam.b:8 c:9 fam.d:10 rowid:12
+ ├── update-mapping:
+ │    └── column13:13 => c:3
+ ├── input binding: &1
+ ├── project
+ │    ├── columns: column13:13!null fam.a:7 fam.b:8 c:9 fam.d:10 rowid:12!null
+ │    ├── scan fam
+ │    │    └── columns: fam.a:7 fam.b:8 c:9 fam.d:10 rowid:12!null
+ │    └── projections
+ │         └── 3 [as=column13:13]
+ └── f-k-checks
+      └── f-k-checks-item: fam(c,d) -> two(a,b)
+           └── anti-join (hash)
+                ├── columns: column13:14!null d:15!null
+                ├── select
+                │    ├── columns: column13:14!null d:15!null
+                │    ├── with-scan &1
+                │    │    ├── columns: column13:14!null d:15
+                │    │    └── mapping:
+                │    │         ├──  column13:13 => column13:14
+                │    │         └──  fam.d:10 => d:15
+                │    └── filters
+                │         └── d:15 IS NOT NULL
+                ├── scan two
+                │    └── columns: two.a:16!null two.b:17!null
+                └── filters
+                     ├── column13:14 = two.a:16
+                     └── d:15 = two.b:17
+
+norm
+UPDATE fam SET d = 3
+----
+update fam
+ ├── columns: <none>
+ ├── fetch columns: fam.c:9 d:10 e:11 rowid:12
+ ├── update-mapping:
+ │    └── column13:13 => d:4
+ ├── input binding: &1
+ ├── project
+ │    ├── columns: column13:13!null fam.c:9 d:10 e:11 rowid:12!null
+ │    ├── scan fam
+ │    │    └── columns: fam.c:9 d:10 e:11 rowid:12!null
+ │    └── projections
+ │         └── 3 [as=column13:13]
+ └── f-k-checks
+      └── f-k-checks-item: fam(c,d) -> two(a,b)
+           └── anti-join (hash)
+                ├── columns: c:14!null column13:15!null
+                ├── select
+                │    ├── columns: c:14!null column13:15!null
+                │    ├── with-scan &1
+                │    │    ├── columns: c:14 column13:15!null
+                │    │    └── mapping:
+                │    │         ├──  fam.c:9 => c:14
+                │    │         └──  column13:13 => column13:15
+                │    └── filters
+                │         └── c:14 IS NOT NULL
+                ├── scan two
+                │    └── columns: two.a:16!null two.b:17!null
+                └── filters
+                     ├── c:14 = two.a:16
+                     └── column13:15 = two.b:17
+
+exec-ddl
+CREATE TABLE child_cascade (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(p) ON UPDATE CASCADE)
+----
+
+# Fall back to the exec-style checks in the presence of CASCADE.
+build
+UPDATE parent SET p = p+1
+----
+update parent
+ ├── columns: <none>
+ ├── fetch columns: x:4 parent.p:5 other:6
+ ├── update-mapping:
+ │    └── column7:7 => parent.p:2
+ ├── fk-fallback
+ └── project
+      ├── columns: column7:7!null x:4 parent.p:5!null other:6
+      ├── scan parent
+      │    └── columns: x:4 parent.p:5!null other:6
+      └── projections
+           └── parent.p:5 + 1 [as=column7:7]

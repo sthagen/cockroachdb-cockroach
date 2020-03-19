@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -31,20 +27,8 @@ type ColumnOrderInfo struct {
 // represents an ordering first by column 3 (descending), then by column 1 (ascending).
 type ColumnOrdering []ColumnOrderInfo
 
-// IsPrefixOf returns true if the receiver ordering matches a prefix of the
-// given ordering. In this case, rows with an order conforming to b
-// automatically conform to a.
-func (a ColumnOrdering) IsPrefixOf(b ColumnOrdering) bool {
-	if len(a) > len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
+// NoOrdering is used to indicate an empty ColumnOrdering.
+var NoOrdering ColumnOrdering
 
 // CompareDatums compares two datum rows according to a column ordering. Returns:
 //  - 0 if lhs and rhs are equal on the ordering columns;

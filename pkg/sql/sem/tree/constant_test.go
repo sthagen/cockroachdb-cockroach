@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -25,23 +21,25 @@ import (
 	"time"
 
 	"github.com/cockroachdb/apd"
-
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 // TestNumericConstantVerifyAndResolveAvailableTypes verifies that test NumVals will
 // all return expected available type sets, and that attempting to resolve the NumVals
 // as each of these types will all succeed with an expected tree.Datum result.
 func TestNumericConstantVerifyAndResolveAvailableTypes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	wantInt := tree.NumValAvailInteger
 	wantDecButCanBeInt := tree.NumValAvailDecimalNoFraction
 	wantDec := tree.NumValAvailDecimalWithFraction
 
 	testCases := []struct {
 		str   string
-		avail []types.T
+		avail []*types.T
 	}{
 		{"1", wantInt},
 		{"0", wantInt},
@@ -63,24 +61,32 @@ func TestNumericConstantVerifyAndResolveAvailableTypes(t *testing.T) {
 		if strings.ContainsAny(test.str, ".eE") {
 			tok = token.FLOAT
 		}
-		val := constant.MakeFromLiteral(test.str, tok, 0)
+
+		str := test.str
+		neg := false
+		if str[0] == '-' {
+			neg = true
+			str = str[1:]
+		}
+
+		val := constant.MakeFromLiteral(str, tok, 0)
 		if val.Kind() == constant.Unknown {
 			t.Fatalf("%d: could not parse value string %q", i, test.str)
 		}
 
 		// Check available types.
-		c := &tree.NumVal{Value: val, OrigString: test.str}
+		c := tree.NewNumVal(val, str, neg)
 		avail := c.AvailableTypes()
 		if !reflect.DeepEqual(avail, test.avail) {
 			t.Errorf("%d: expected the available type set %v for %v, found %v",
-				i, test.avail, c.Value.ExactString(), avail)
+				i, test.avail, c.ExactString(), avail)
 		}
 
 		// Make sure it can be resolved as each of those types.
 		for _, availType := range avail {
 			if res, err := c.ResolveAsType(&tree.SemaContext{}, availType); err != nil {
 				t.Errorf("%d: expected resolving %v as available type %s would succeed, found %v",
-					i, c.Value.ExactString(), availType, err)
+					i, c.ExactString(), availType, err)
 			} else {
 				resErr := func(parsed, resolved interface{}) {
 					t.Errorf("%d: expected resolving %v as available type %s would produce a tree.Datum"+
@@ -139,24 +145,24 @@ func TestNumericConstantVerifyAndResolveAvailableTypes(t *testing.T) {
 // return expected available type sets, and that attempting to resolve the StrVals
 // as each of these types will either succeed or return a parse error.
 func TestStringConstantVerifyAvailableTypes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	wantStringButCanBeAll := tree.StrValAvailAllParsable
-	wantBytesButCanBeString := tree.StrValAvailBytesString
 	wantBytes := tree.StrValAvailBytes
 
 	testCases := []struct {
 		c     *tree.StrVal
-		avail []types.T
+		avail []*types.T
 	}{
 		{tree.NewStrVal("abc 世界"), wantStringButCanBeAll},
 		{tree.NewStrVal("t"), wantStringButCanBeAll},
 		{tree.NewStrVal("2010-09-28"), wantStringButCanBeAll},
 		{tree.NewStrVal("2010-09-28 12:00:00.1"), wantStringButCanBeAll},
 		{tree.NewStrVal("PT12H2M"), wantStringButCanBeAll},
-		{tree.NewBytesStrVal("abc 世界"), wantBytesButCanBeString},
-		{tree.NewBytesStrVal("t"), wantBytesButCanBeString},
-		{tree.NewBytesStrVal("2010-09-28"), wantBytesButCanBeString},
-		{tree.NewBytesStrVal("2010-09-28 12:00:00.1"), wantBytesButCanBeString},
-		{tree.NewBytesStrVal("PT12H2M"), wantBytesButCanBeString},
+		{tree.NewBytesStrVal("abc 世界"), wantBytes},
+		{tree.NewBytesStrVal("t"), wantBytes},
+		{tree.NewBytesStrVal("2010-09-28"), wantBytes},
+		{tree.NewBytesStrVal("2010-09-28 12:00:00.1"), wantBytes},
+		{tree.NewBytesStrVal("PT12H2M"), wantBytes},
 		{tree.NewBytesStrVal(string([]byte{0xff, 0xfe, 0xfd})), wantBytes},
 	}
 
@@ -192,21 +198,35 @@ func mustParseDBool(t *testing.T, s string) tree.Datum {
 	return d
 }
 func mustParseDDate(t *testing.T, s string) tree.Datum {
-	d, err := tree.ParseDDate(s, time.UTC)
+	d, err := tree.ParseDDate(nil, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+func mustParseDTime(t *testing.T, s string) tree.Datum {
+	d, err := tree.ParseDTime(nil, s, time.Microsecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+func mustParseDTimeTZ(t *testing.T, s string) tree.Datum {
+	d, err := tree.ParseDTimeTZ(nil, s, time.Microsecond)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return d
 }
 func mustParseDTimestamp(t *testing.T, s string) tree.Datum {
-	d, err := tree.ParseDTimestamp(s, time.Millisecond)
+	d, err := tree.ParseDTimestamp(nil, s, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return d
 }
 func mustParseDTimestampTZ(t *testing.T, s string) tree.Datum {
-	d, err := tree.ParseDTimestampTZ(s, time.UTC, time.Millisecond)
+	d, err := tree.ParseDTimestampTZ(nil, s, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,20 +246,49 @@ func mustParseDJSON(t *testing.T, s string) tree.Datum {
 	}
 	return d
 }
-
-var parseFuncs = map[types.T]func(*testing.T, string) tree.Datum{
-	types.String:      func(t *testing.T, s string) tree.Datum { return tree.NewDString(s) },
-	types.Bytes:       func(t *testing.T, s string) tree.Datum { return tree.NewDBytes(tree.DBytes(s)) },
-	types.Bool:        mustParseDBool,
-	types.Date:        mustParseDDate,
-	types.Timestamp:   mustParseDTimestamp,
-	types.TimestampTZ: mustParseDTimestampTZ,
-	types.Interval:    mustParseDInterval,
-	types.JSON:        mustParseDJSON,
+func mustParseDStringArray(t *testing.T, s string) tree.Datum {
+	evalContext := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	d, err := tree.ParseDArrayFromString(&evalContext, s, types.String)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+func mustParseDIntArray(t *testing.T, s string) tree.Datum {
+	evalContext := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	d, err := tree.ParseDArrayFromString(&evalContext, s, types.Int)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+func mustParseDDecimalArray(t *testing.T, s string) tree.Datum {
+	evalContext := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	d, err := tree.ParseDArrayFromString(&evalContext, s, types.Decimal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
 }
 
-func typeSet(tys ...types.T) map[types.T]struct{} {
-	set := make(map[types.T]struct{}, len(tys))
+var parseFuncs = map[*types.T]func(*testing.T, string) tree.Datum{
+	types.String:       func(t *testing.T, s string) tree.Datum { return tree.NewDString(s) },
+	types.Bytes:        func(t *testing.T, s string) tree.Datum { return tree.NewDBytes(tree.DBytes(s)) },
+	types.Bool:         mustParseDBool,
+	types.Date:         mustParseDDate,
+	types.Time:         mustParseDTime,
+	types.TimeTZ:       mustParseDTimeTZ,
+	types.Timestamp:    mustParseDTimestamp,
+	types.TimestampTZ:  mustParseDTimestampTZ,
+	types.Interval:     mustParseDInterval,
+	types.Jsonb:        mustParseDJSON,
+	types.DecimalArray: mustParseDDecimalArray,
+	types.IntArray:     mustParseDIntArray,
+	types.StringArray:  mustParseDStringArray,
+}
+
+func typeSet(tys ...*types.T) map[*types.T]struct{} {
+	set := make(map[*types.T]struct{}, len(tys))
 	for _, t := range tys {
 		set[t] = struct{}{}
 	}
@@ -252,9 +301,10 @@ func typeSet(tys ...types.T) map[types.T]struct{} {
 // the expected results which come from running the string literal through a
 // corresponding parseFunc (above).
 func TestStringConstantResolveAvailableTypes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		c            *tree.StrVal
-		parseOptions map[types.T]struct{}
+		parseOptions map[*types.T]struct{}
 	}{
 		{
 			c:            tree.NewStrVal("abc 世界"),
@@ -262,7 +312,7 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 		},
 		{
 			c:            tree.NewStrVal("true"),
-			parseOptions: typeSet(types.String, types.Bytes, types.Bool, types.JSON),
+			parseOptions: typeSet(types.String, types.Bytes, types.Bool, types.Jsonb),
 		},
 		{
 			c:            tree.NewStrVal("2010-09-28"),
@@ -270,11 +320,11 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 		},
 		{
 			c:            tree.NewStrVal("2010-09-28 12:00:00.1"),
-			parseOptions: typeSet(types.String, types.Bytes, types.Timestamp, types.TimestampTZ, types.Date),
+			parseOptions: typeSet(types.String, types.Bytes, types.Time, types.TimeTZ, types.Timestamp, types.TimestampTZ, types.Date),
 		},
 		{
 			c:            tree.NewStrVal("2006-07-08T00:00:00.000000123Z"),
-			parseOptions: typeSet(types.String, types.Bytes, types.Timestamp, types.TimestampTZ, types.Date),
+			parseOptions: typeSet(types.String, types.Bytes, types.Time, types.TimeTZ, types.Timestamp, types.TimestampTZ, types.Date),
 		},
 		{
 			c:            tree.NewStrVal("PT12H2M"),
@@ -302,11 +352,23 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 		},
 		{
 			c:            tree.NewStrVal(`{"a": 1}`),
-			parseOptions: typeSet(types.String, types.Bytes, types.JSON),
+			parseOptions: typeSet(types.String, types.Bytes, types.Jsonb),
+		},
+		{
+			c:            tree.NewStrVal(`{1,2}`),
+			parseOptions: typeSet(types.String, types.Bytes, types.StringArray, types.IntArray, types.DecimalArray),
+		},
+		{
+			c:            tree.NewStrVal(`{1.5,2.0}`),
+			parseOptions: typeSet(types.String, types.Bytes, types.StringArray, types.DecimalArray),
+		},
+		{
+			c:            tree.NewStrVal(`{a,b}`),
+			parseOptions: typeSet(types.String, types.Bytes, types.StringArray),
 		},
 		{
 			c:            tree.NewBytesStrVal(string([]byte{0xff, 0xfe, 0xfd})),
-			parseOptions: typeSet(types.Bytes),
+			parseOptions: typeSet(types.String, types.Bytes),
 		},
 	}
 
@@ -317,7 +379,7 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 		for _, availType := range test.c.AvailableTypes() {
 			res, err := test.c.ResolveAsType(&tree.SemaContext{}, availType)
 			if err != nil {
-				if !strings.Contains(err.Error(), "could not parse") {
+				if !strings.Contains(err.Error(), "could not parse") && !strings.Contains(err.Error(), "parsing") {
 					// Parsing errors are permitted for this test, but the number of correctly
 					// parseable types will be verified. Any other error should throw a failure.
 					t.Errorf("%d: expected resolving %v as available type %s would either succeed"+
@@ -333,7 +395,7 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 					i, availType, test.c, res)
 			} else {
 				expectedDatum := parseFuncs[availType](t, test.c.RawString())
-				evalCtx := tree.NewTestingEvalContext()
+				evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 				defer evalCtx.Stop(context.Background())
 				if res.Compare(evalCtx, expectedDatum) != 0 {
 					t.Errorf("%d: type %s expected to be resolved from the tree.StrVal %v to tree.Datum %v"+
@@ -386,6 +448,7 @@ func testConstantLiteralFolding(t *testing.T, testData []constantLiteralFoldingT
 }
 
 func TestFoldNumericConstants(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testConstantLiteralFolding(t, []constantLiteralFoldingTestCase{
 		// Unary ops.
 		{`+1`, `1`},
@@ -430,11 +493,11 @@ func TestFoldNumericConstants(t *testing.T) {
 		{`2 ^ 3`, `2 ^ 3`},         // Constant folding won't fold power.
 		{`1.3 ^ 3.9`, `1.3 ^ 3.9`},
 		// Shift ops (int only).
-		{`1 << 2`, `4`},
-		{`1 << -2`, `1 << -2`},                                                     // Should be caught during evaluation.
+		{`1 << 2`, `1 << 2`},
+		{`1 << -2`, `1 << -2`}, // Should be caught during evaluation.
 		{`1 << 9999999999999999999999999999`, `1 << 9999999999999999999999999999`}, // Will be caught during type checking.
-		{`1.2 << 2.4`, `1.2 << 2.4`},                                               // Will be caught during type checking.
-		{`4 >> 2`, `1`},
+		{`1.2 << 2.4`, `1.2 << 2.4`}, // Will be caught during type checking.
+		{`4 >> 2`, `4 >> 2`},
 		{`4.1 >> 2.9`, `4.1 >> 2.9`}, // Will be caught during type checking.
 		// Comparison ops.
 		{`4 = 2`, `false`},
@@ -472,7 +535,7 @@ func TestFoldNumericConstants(t *testing.T) {
 		{`(((4)))`, `4`},
 		{`(((9 / 3) * (1 / 3)))`, `1`},
 		{`(((9 / 3) % (1 / 3)))`, `((3 % 0.333333))`},
-		{`(1.0) << ((2) + 3 / (1/9))`, `536870912`},
+		{`(1.0) << ((2) + 3 / (1/9))`, `1.0 << 29`},
 		// With non-constants.
 		{`a + 5 * b`, `a + (5 * b)`},
 		{`a + 5 + b + 7`, `((a + 5) + b) + 7`},
@@ -484,6 +547,7 @@ func TestFoldNumericConstants(t *testing.T) {
 }
 
 func TestFoldStringConstants(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testConstantLiteralFolding(t, []constantLiteralFoldingTestCase{
 		// Binary ops.
 		{`'string' || 'string'`, `'stringstring'`},

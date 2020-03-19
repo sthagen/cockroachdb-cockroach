@@ -7,28 +7,24 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This code was derived from https://github.com/youtube/vitess.
 
 package tree
 
-import "bytes"
-
 // Update represents an UPDATE statement.
 type Update struct {
+	With      *With
 	Table     TableExpr
 	Exprs     UpdateExprs
+	From      TableExprs
 	Where     *Where
 	OrderBy   OrderBy
 	Limit     *Limit
@@ -36,46 +32,63 @@ type Update struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *Update) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("UPDATE ")
-	FormatNode(buf, f, node.Table)
-	buf.WriteString(" SET ")
-	FormatNode(buf, f, node.Exprs)
-	FormatNode(buf, f, node.Where)
-	FormatNode(buf, f, node.OrderBy)
-	FormatNode(buf, f, node.Limit)
-	FormatNode(buf, f, node.Returning)
+func (node *Update) Format(ctx *FmtCtx) {
+	ctx.FormatNode(node.With)
+	ctx.WriteString("UPDATE ")
+	ctx.FormatNode(node.Table)
+	ctx.WriteString(" SET ")
+	ctx.FormatNode(&node.Exprs)
+	if len(node.From) > 0 {
+		ctx.WriteString(" FROM ")
+		ctx.FormatNode(&node.From)
+	}
+	if node.Where != nil {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(node.Where)
+	}
+	if len(node.OrderBy) > 0 {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(&node.OrderBy)
+	}
+	if node.Limit != nil {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(node.Limit)
+	}
+	if HasReturningClause(node.Returning) {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(node.Returning)
+	}
 }
 
 // UpdateExprs represents a list of update expressions.
 type UpdateExprs []*UpdateExpr
 
 // Format implements the NodeFormatter interface.
-func (node UpdateExprs) Format(buf *bytes.Buffer, f FmtFlags) {
-	for i, n := range node {
+func (node *UpdateExprs) Format(ctx *FmtCtx) {
+	for i, n := range *node {
 		if i > 0 {
-			buf.WriteString(", ")
+			ctx.WriteString(", ")
 		}
-		FormatNode(buf, f, n)
+		ctx.FormatNode(n)
 	}
 }
 
 // UpdateExpr represents an update expression.
 type UpdateExpr struct {
 	Tuple bool
-	Names UnresolvedNames
+	Names NameList
 	Expr  Expr
 }
 
 // Format implements the NodeFormatter interface.
-func (node *UpdateExpr) Format(buf *bytes.Buffer, f FmtFlags) {
+func (node *UpdateExpr) Format(ctx *FmtCtx) {
 	open, close := "", ""
 	if node.Tuple {
 		open, close = "(", ")"
 	}
-	buf.WriteString(open)
-	FormatNode(buf, f, node.Names)
-	buf.WriteString(close)
-	buf.WriteString(" = ")
-	FormatNode(buf, f, node.Expr)
+	ctx.WriteString(open)
+	ctx.FormatNode(&node.Names)
+	ctx.WriteString(close)
+	ctx.WriteString(" = ")
+	ctx.FormatNode(node.Expr)
 }

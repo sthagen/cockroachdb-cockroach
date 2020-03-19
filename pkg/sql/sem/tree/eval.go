@@ -1,164 +1,146 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math"
 	"math/big"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/arith"
+	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 var (
-	errIntOutOfRange   = pgerror.NewError(pgerror.CodeNumericValueOutOfRangeError, "integer out of range")
-	errFloatOutOfRange = pgerror.NewError(pgerror.CodeNumericValueOutOfRangeError, "float out of range")
+	// ErrIntOutOfRange is reported when integer arithmetic overflows.
+	ErrIntOutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "integer out of range")
+	// ErrFloatOutOfRange is reported when float arithmetic overflows.
+	ErrFloatOutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "float out of range")
+	errDecOutOfRange   = pgerror.New(pgcode.NumericValueOutOfRange, "decimal out of range")
 
 	// ErrDivByZero is reported on a division by zero.
-	ErrDivByZero = pgerror.NewError(pgerror.CodeDivisionByZeroError, "division by zero")
+	ErrDivByZero = pgerror.New(pgcode.DivisionByZero, "division by zero")
 	// ErrZeroModulus is reported when computing the rest of a division by zero.
-	ErrZeroModulus = pgerror.NewError(pgerror.CodeDivisionByZeroError, "zero modulus")
+	ErrZeroModulus = pgerror.New(pgcode.DivisionByZero, "zero modulus")
 
 	big10E6  = big.NewInt(1e6)
 	big10E10 = big.NewInt(1e10)
 )
 
-// SecondsInDay is the number of seconds in a Day.
-const SecondsInDay = 24 * 60 * 60
-
 // UnaryOp is a unary operator.
 type UnaryOp struct {
-	Typ        types.T
-	ReturnType types.T
-	fn         func(*EvalContext, Datum) (Datum, error)
+	Typ        *types.T
+	ReturnType *types.T
+	Fn         func(*EvalContext, Datum) (Datum, error)
 
 	types   TypeList
 	retType ReturnTyper
+
+	// counter, if non-nil, should be incremented every time the
+	// operator is type checked.
+	counter telemetry.Counter
 }
 
-func (op UnaryOp) params() TypeList {
+func (op *UnaryOp) params() TypeList {
 	return op.types
 }
 
-func (op UnaryOp) returnType() ReturnTyper {
+func (op *UnaryOp) returnType() ReturnTyper {
 	return op.retType
 }
 
-func (UnaryOp) preferred() bool {
+func (*UnaryOp) preferred() bool {
 	return false
 }
 
-func init() {
-	for op, overload := range UnaryOps {
+func unaryOpFixups(ops map[UnaryOperator]unaryOpOverload) map[UnaryOperator]unaryOpOverload {
+	for op, overload := range ops {
 		for i, impl := range overload {
-			casted := impl.(UnaryOp)
+			casted := impl.(*UnaryOp)
 			casted.types = ArgTypes{{"arg", casted.Typ}}
 			casted.retType = FixedReturnType(casted.ReturnType)
-			UnaryOps[op][i] = casted
+			ops[op][i] = casted
 		}
 	}
+	return ops
 }
 
 // unaryOpOverload is an overloaded set of unary operator implementations.
 type unaryOpOverload []overloadImpl
 
 // UnaryOps contains the unary operations indexed by operation type.
-var UnaryOps = map[UnaryOperator]unaryOpOverload{
-	UnaryPlus: {
-		UnaryOp{
-			Typ:        types.Int,
-			ReturnType: types.Int,
-			fn: func(_ *EvalContext, d Datum) (Datum, error) {
-				return d, nil
-			},
-		},
-		UnaryOp{
-			Typ:        types.Float,
-			ReturnType: types.Float,
-			fn: func(_ *EvalContext, d Datum) (Datum, error) {
-				return d, nil
-			},
-		},
-		UnaryOp{
-			Typ:        types.Decimal,
-			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, d Datum) (Datum, error) {
-				return d, nil
-			},
-		},
-	},
-
+var UnaryOps = unaryOpFixups(map[UnaryOperator]unaryOpOverload{
 	UnaryMinus: {
-		UnaryOp{
+		&UnaryOp{
 			Typ:        types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, d Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
 				i := MustBeDInt(d)
 				if i == math.MinInt64 {
-					return nil, errIntOutOfRange
+					return nil, ErrIntOutOfRange
 				}
 				return NewDInt(-i), nil
 			},
 		},
-		UnaryOp{
+		&UnaryOp{
 			Typ:        types.Float,
 			ReturnType: types.Float,
-			fn: func(_ *EvalContext, d Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
 				return NewDFloat(-*d.(*DFloat)), nil
 			},
 		},
-		UnaryOp{
+		&UnaryOp{
 			Typ:        types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, d Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
 				dec := &d.(*DDecimal).Decimal
 				dd := &DDecimal{}
 				dd.Decimal.Neg(dec)
 				return dd, nil
 			},
 		},
-		UnaryOp{
+		&UnaryOp{
 			Typ:        types.Interval,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, d Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
 				i := d.(*DInterval).Duration
-				i.Nanos = -i.Nanos
+				i.SetNanos(-i.Nanos())
 				i.Days = -i.Days
 				i.Months = -i.Months
 				return &DInterval{Duration: i}, nil
@@ -167,47 +149,67 @@ var UnaryOps = map[UnaryOperator]unaryOpOverload{
 	},
 
 	UnaryComplement: {
-		UnaryOp{
+		&UnaryOp{
 			Typ:        types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, d Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
 				return NewDInt(^MustBeDInt(d)), nil
 			},
 		},
+		&UnaryOp{
+			Typ:        types.VarBit,
+			ReturnType: types.VarBit,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				p := MustBeDBitArray(d)
+				return &DBitArray{BitArray: bitarray.Not(p.BitArray)}, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.INet,
+			ReturnType: types.INet,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(d).IPAddr
+				return NewDIPAddr(DIPAddr{ipAddr.Complement()}), nil
+			},
+		},
 	},
-}
+})
 
 // BinOp is a binary operator.
 type BinOp struct {
-	LeftType   types.T
-	RightType  types.T
-	ReturnType types.T
-	fn         func(*EvalContext, Datum, Datum) (Datum, error)
+	LeftType     *types.T
+	RightType    *types.T
+	ReturnType   *types.T
+	NullableArgs bool
+	Fn           func(*EvalContext, Datum, Datum) (Datum, error)
 
-	types        TypeList
-	retType      ReturnTyper
-	nullableArgs bool
+	types   TypeList
+	retType ReturnTyper
+
+	// counter, if non-nil, should be incremented every time the
+	// operator is type checked.
+	counter telemetry.Counter
 }
 
-func (op BinOp) params() TypeList {
+func (op *BinOp) params() TypeList {
 	return op.types
 }
 
-func (op BinOp) matchParams(l, r types.T) bool {
-	return op.params().matchAt(l, 0) && op.params().matchAt(r, 1)
+func (op *BinOp) matchParams(l, r *types.T) bool {
+	return op.params().MatchAt(l, 0) && op.params().MatchAt(r, 1)
 }
 
-func (op BinOp) returnType() ReturnTyper {
+func (op *BinOp) returnType() ReturnTyper {
 	return op.retType
 }
 
-func (BinOp) preferred() bool {
+func (*BinOp) preferred() bool {
 	return false
 }
 
 // AppendToMaybeNullArray appends an element to an array. If the first
 // argument is NULL, an array of one element is created.
-func AppendToMaybeNullArray(typ types.T, left Datum, right Datum) (Datum, error) {
+func AppendToMaybeNullArray(typ *types.T, left Datum, right Datum) (Datum, error) {
 	result := NewDArray(typ)
 	if left != DNull {
 		for _, e := range MustBeDArray(left).Array {
@@ -224,7 +226,7 @@ func AppendToMaybeNullArray(typ types.T, left Datum, right Datum) (Datum, error)
 
 // PrependToMaybeNullArray prepends an element in the front of an arrray.
 // If the argument is NULL, an array of one element is created.
-func PrependToMaybeNullArray(typ types.T, left Datum, right Datum) (Datum, error) {
+func PrependToMaybeNullArray(typ *types.T, left Datum, right Datum) (Datum, error) {
 	result := NewDArray(typ)
 	if err := result.Append(left); err != nil {
 		return nil, err
@@ -244,24 +246,24 @@ func PrependToMaybeNullArray(typ types.T, left Datum, right Datum) (Datum, error
 // existing arrays. This would optimize the common case of appending an element
 // (or array) to an array from O(n) to O(1).
 func initArrayElementConcatenation() {
-	for _, t := range types.AnyNonArray {
+	for _, t := range types.Scalar {
 		typ := t
-		BinOps[Concat] = append(BinOps[Concat], BinOp{
-			LeftType:     types.TArray{Typ: typ},
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
+			LeftType:     types.MakeArray(typ),
 			RightType:    typ,
-			ReturnType:   types.TArray{Typ: typ},
-			nullableArgs: true,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			ReturnType:   types.MakeArray(typ),
+			NullableArgs: true,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return AppendToMaybeNullArray(typ, left, right)
 			},
 		})
 
-		BinOps[Concat] = append(BinOps[Concat], BinOp{
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
 			LeftType:     typ,
-			RightType:    types.TArray{Typ: typ},
-			ReturnType:   types.TArray{Typ: typ},
-			nullableArgs: true,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			RightType:    types.MakeArray(typ),
+			ReturnType:   types.MakeArray(typ),
+			NullableArgs: true,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return PrependToMaybeNullArray(typ, left, right)
 			},
 		})
@@ -269,7 +271,7 @@ func initArrayElementConcatenation() {
 }
 
 // ConcatArrays concatenates two arrays.
-func ConcatArrays(typ types.T, left Datum, right Datum) (Datum, error) {
+func ConcatArrays(typ *types.T, left Datum, right Datum) (Datum, error) {
 	if left == DNull && right == DNull {
 		return DNull, nil
 	}
@@ -291,15 +293,39 @@ func ConcatArrays(typ types.T, left Datum, right Datum) (Datum, error) {
 	return result, nil
 }
 
+// ArrayContains return true if the haystack contains all needles.
+func ArrayContains(ctx *EvalContext, haystack *DArray, needles *DArray) (*DBool, error) {
+	if !haystack.ParamTyp.Equivalent(needles.ParamTyp) {
+		return DBoolFalse, pgerror.New(pgcode.DatatypeMismatch, "cannot compare arrays with different element types")
+	}
+	for _, needle := range needles.Array {
+		// Nulls don't compare to each other in @> syntax.
+		if needle == DNull {
+			return DBoolFalse, nil
+		}
+		var found bool
+		for _, hay := range haystack.Array {
+			if needle.Compare(ctx, hay) == 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return DBoolFalse, nil
+		}
+	}
+	return DBoolTrue, nil
+}
+
 func initArrayToArrayConcatenation() {
-	for _, t := range types.AnyNonArray {
+	for _, t := range types.Scalar {
 		typ := t
-		BinOps[Concat] = append(BinOps[Concat], BinOp{
-			LeftType:     types.TArray{Typ: typ},
-			RightType:    types.TArray{Typ: typ},
-			ReturnType:   types.TArray{Typ: typ},
-			nullableArgs: true,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
+			LeftType:     types.MakeArray(typ),
+			RightType:    types.MakeArray(typ),
+			ReturnType:   types.MakeArray(typ),
+			NullableArgs: true,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return ConcatArrays(typ, left, right)
 			},
 		})
@@ -314,7 +340,7 @@ func init() {
 func init() {
 	for op, overload := range BinOps {
 		for i, impl := range overload {
-			casted := impl.(BinOp)
+			casted := impl.(*BinOp)
 			casted.types = ArgTypes{{"left", casted.LeftType}, {"right", casted.RightType}}
 			casted.retType = FixedReturnType(casted.ReturnType)
 			BinOps[op][i] = casted
@@ -325,25 +351,14 @@ func init() {
 // binOpOverload is an overloaded set of binary operator implementations.
 type binOpOverload []overloadImpl
 
-func (o binOpOverload) lookupImpl(left, right types.T) (BinOp, bool) {
+func (o binOpOverload) lookupImpl(left, right *types.T) (*BinOp, bool) {
 	for _, fn := range o {
-		casted := fn.(BinOp)
+		casted := fn.(*BinOp)
 		if casted.matchParams(left, right) {
 			return casted, true
 		}
 	}
-	return BinOp{}, false
-}
-
-// AddWithOverflow returns a+b. If ok is false, a+b overflowed.
-func AddWithOverflow(a, b int64) (r int64, ok bool) {
-	if b > 0 && a > math.MaxInt64-b {
-		return 0, false
-	}
-	if b < 0 && a < math.MinInt64-b {
-		return 0, false
-	}
-	return a + b, true
+	return nil, false
 }
 
 // getJSONPath is used for the #> and #>> operators.
@@ -352,6 +367,9 @@ func getJSONPath(j DJSON, ary DArray) (Datum, error) {
 	// a new array since the JSON package isn't aware of DArray.
 	path := make([]string, len(ary.Array))
 	for i, v := range ary.Array {
+		if v == DNull {
+			return DNull, nil
+		}
 		path[i] = string(MustBeDString(v))
 	}
 	result, err := json.FetchPath(j.JSON, path)
@@ -364,68 +382,140 @@ func getJSONPath(j DJSON, ary DArray) (Datum, error) {
 	return &DJSON{result}, nil
 }
 
+func newCannotMixBitArraySizesError(op string) error {
+	return pgerror.Newf(pgcode.StringDataLengthMismatch,
+		"cannot %s bit strings of different sizes", op)
+}
+
 // BinOps contains the binary operations indexed by operation type.
 var BinOps = map[BinaryOperator]binOpOverload{
 	Bitand: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDInt(MustBeDInt(left) & MustBeDInt(right)), nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.VarBit,
+			RightType:  types.VarBit,
+			ReturnType: types.VarBit,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				lhs := MustBeDBitArray(left)
+				rhs := MustBeDBitArray(right)
+				if lhs.BitLen() != rhs.BitLen() {
+					return nil, newCannotMixBitArraySizesError("AND")
+				}
+				return &DBitArray{
+					BitArray: bitarray.And(lhs.BitArray, rhs.BitArray),
+				}, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			ReturnType: types.INet,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				newIPAddr, err := ipAddr.And(&other)
+				return NewDIPAddr(DIPAddr{newIPAddr}), err
 			},
 		},
 	},
 
 	Bitor: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDInt(MustBeDInt(left) | MustBeDInt(right)), nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.VarBit,
+			RightType:  types.VarBit,
+			ReturnType: types.VarBit,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				lhs := MustBeDBitArray(left)
+				rhs := MustBeDBitArray(right)
+				if lhs.BitLen() != rhs.BitLen() {
+					return nil, newCannotMixBitArraySizesError("OR")
+				}
+				return &DBitArray{
+					BitArray: bitarray.Or(lhs.BitArray, rhs.BitArray),
+				}, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			ReturnType: types.INet,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				newIPAddr, err := ipAddr.Or(&other)
+				return NewDIPAddr(DIPAddr{newIPAddr}), err
 			},
 		},
 	},
 
 	Bitxor: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDInt(MustBeDInt(left) ^ MustBeDInt(right)), nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.VarBit,
+			RightType:  types.VarBit,
+			ReturnType: types.VarBit,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				lhs := MustBeDBitArray(left)
+				rhs := MustBeDBitArray(right)
+				if lhs.BitLen() != rhs.BitLen() {
+					return nil, newCannotMixBitArraySizesError("XOR")
+				}
+				return &DBitArray{
+					BitArray: bitarray.Xor(lhs.BitArray, rhs.BitArray),
+				}, nil
 			},
 		},
 	},
 
 	Plus: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				a, b := MustBeDInt(left), MustBeDInt(right)
-				r, ok := AddWithOverflow(int64(a), int64(b))
+				r, ok := arith.AddWithOverflow(int64(a), int64(b))
 				if !ok {
-					return nil, errIntOutOfRange
+					return nil, ErrIntOutOfRange
 				}
 				return NewDInt(DInt(r)), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDFloat(*left.(*DFloat) + *right.(*DFloat)), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
@@ -433,179 +523,270 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := MustBeDInt(right)
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(r))
+				dd.SetFinite(int64(r), 0)
 				_, err := ExactCtx.Add(&dd.Decimal, l, &dd.Decimal)
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := MustBeDInt(left)
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(l))
+				dd.SetFinite(int64(l), 0)
 				_, err := ExactCtx.Add(&dd.Decimal, &dd.Decimal, r)
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Date,
 			RightType:  types.Int,
 			ReturnType: types.Date,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return NewDDate(*left.(*DDate) + DDate(MustBeDInt(right))), nil
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				d, err := left.(*DDate).AddDays(int64(MustBeDInt(right)))
+				if err != nil {
+					return nil, err
+				}
+				return NewDDate(d), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Date,
 			ReturnType: types.Date,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return NewDDate(DDate(MustBeDInt(left)) + *right.(*DDate)), nil
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				d, err := right.(*DDate).AddDays(int64(MustBeDInt(left)))
+				if err != nil {
+					return nil, err
+				}
+				return NewDDate(d), nil
+
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Date,
 			RightType:  types.Time,
 			ReturnType: types.Timestamp,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				d := MakeDTimestampTZFromDate(time.UTC, left.(*DDate))
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				leftTime, err := left.(*DDate).ToTime()
+				if err != nil {
+					return nil, err
+				}
 				t := time.Duration(*right.(*DTime)) * time.Microsecond
-				return MakeDTimestamp(d.Add(t), time.Microsecond), nil
+				return MakeDTimestamp(leftTime.Add(t), time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Time,
 			RightType:  types.Date,
 			ReturnType: types.Timestamp,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				d := MakeDTimestampTZFromDate(time.UTC, right.(*DDate))
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				rightTime, err := right.(*DDate).ToTime()
+				if err != nil {
+					return nil, err
+				}
 				t := time.Duration(*left.(*DTime)) * time.Microsecond
-				return MakeDTimestamp(d.Add(t), time.Microsecond), nil
+				return MakeDTimestamp(rightTime.Add(t), time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
+			LeftType:   types.Date,
+			RightType:  types.TimeTZ,
+			ReturnType: types.TimestampTZ,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				leftTime, err := left.(*DDate).ToTime()
+				if err != nil {
+					return nil, err
+				}
+				t := leftTime.Add(right.(*DTimeTZ).ToDuration())
+				return MakeDTimestampTZ(t, time.Microsecond), nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.TimeTZ,
+			RightType:  types.Date,
+			ReturnType: types.TimestampTZ,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				rightTime, err := right.(*DDate).ToTime()
+				if err != nil {
+					return nil, err
+				}
+				t := rightTime.Add(left.(*DTimeTZ).ToDuration())
+				return MakeDTimestampTZ(t, time.Microsecond), nil
+			},
+		},
+		&BinOp{
 			LeftType:   types.Time,
 			RightType:  types.Interval,
 			ReturnType: types.Time,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				t := timeofday.TimeOfDay(*left.(*DTime))
 				return MakeDTime(t.Add(right.(*DInterval).Duration)), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Interval,
 			RightType:  types.Time,
 			ReturnType: types.Time,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				t := timeofday.TimeOfDay(*right.(*DTime))
 				return MakeDTime(t.Add(left.(*DInterval).Duration)), nil
 			},
 		},
-		BinOp{
+		&BinOp{
+			LeftType:   types.TimeTZ,
+			RightType:  types.Interval,
+			ReturnType: types.TimeTZ,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				t := left.(*DTimeTZ)
+				duration := right.(*DInterval).Duration
+				return NewDTimeTZFromOffset(t.Add(duration), t.OffsetSecs), nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.Interval,
+			RightType:  types.TimeTZ,
+			ReturnType: types.TimeTZ,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				t := right.(*DTimeTZ)
+				duration := left.(*DInterval).Duration
+				return NewDTimeTZFromOffset(t.Add(duration), t.OffsetSecs), nil
+			},
+		},
+		&BinOp{
 			LeftType:   types.Timestamp,
 			RightType:  types.Interval,
 			ReturnType: types.Timestamp,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return MakeDTimestamp(duration.Add(left.(*DTimestamp).Time, right.(*DInterval).Duration), time.Microsecond), nil
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				return MakeDTimestamp(duration.Add(
+					left.(*DTimestamp).Time, right.(*DInterval).Duration), time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Interval,
 			RightType:  types.Timestamp,
 			ReturnType: types.Timestamp,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return MakeDTimestamp(duration.Add(right.(*DTimestamp).Time, left.(*DInterval).Duration), time.Microsecond), nil
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				return MakeDTimestamp(duration.Add(
+					right.(*DTimestamp).Time, left.(*DInterval).Duration), time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.TimestampTZ,
 			RightType:  types.Interval,
 			ReturnType: types.TimestampTZ,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				t := duration.Add(left.(*DTimestampTZ).Time, right.(*DInterval).Duration)
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				// Convert time to be in the given timezone, as math relies on matching timezones..
+				t := duration.Add(left.(*DTimestampTZ).Time.In(ctx.GetLocation()), right.(*DInterval).Duration)
 				return MakeDTimestampTZ(t, time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Interval,
 			RightType:  types.TimestampTZ,
 			ReturnType: types.TimestampTZ,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				t := duration.Add(right.(*DTimestampTZ).Time, left.(*DInterval).Duration)
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				// Convert time to be in the given timezone, as math relies on matching timezones..
+				t := duration.Add(right.(*DTimestampTZ).Time.In(ctx.GetLocation()), left.(*DInterval).Duration)
 				return MakeDTimestampTZ(t, time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Interval,
 			RightType:  types.Interval,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return &DInterval{Duration: left.(*DInterval).Duration.Add(right.(*DInterval).Duration)}, nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Date,
 			RightType:  types.Interval,
-			ReturnType: types.TimestampTZ,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
-				leftTZ := MakeDTimestampTZFromDate(ctx.GetLocation(), left.(*DDate))
-				t := duration.Add(leftTZ.Time, right.(*DInterval).Duration)
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+			ReturnType: types.Timestamp,
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				leftTime, err := left.(*DDate).ToTime()
+				if err != nil {
+					return nil, err
+				}
+				t := duration.Add(leftTime, right.(*DInterval).Duration)
+				return MakeDTimestamp(t, time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Interval,
 			RightType:  types.Date,
-			ReturnType: types.TimestampTZ,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
-				rightTZ := MakeDTimestampTZFromDate(ctx.GetLocation(), right.(*DDate))
-				t := duration.Add(rightTZ.Time, left.(*DInterval).Duration)
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+			ReturnType: types.Timestamp,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				rightTime, err := right.(*DDate).ToTime()
+				if err != nil {
+					return nil, err
+				}
+				t := duration.Add(rightTime, left.(*DInterval).Duration)
+				return MakeDTimestamp(t, time.Microsecond), nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.INet,
+			RightType:  types.Int,
+			ReturnType: types.INet,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				i := MustBeDInt(right)
+				newIPAddr, err := ipAddr.Add(int64(i))
+				return NewDIPAddr(DIPAddr{newIPAddr}), err
+			},
+		},
+		&BinOp{
+			LeftType:   types.Int,
+			RightType:  types.INet,
+			ReturnType: types.INet,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				i := MustBeDInt(left)
+				ipAddr := MustBeDIPAddr(right).IPAddr
+				newIPAddr, err := ipAddr.Add(int64(i))
+				return NewDIPAddr(DIPAddr{newIPAddr}), err
 			},
 		},
 	},
 
 	Minus: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				a, b := MustBeDInt(left), MustBeDInt(right)
-				if b < 0 && a > math.MaxInt64+b {
-					return nil, errIntOutOfRange
+				r, ok := arith.SubWithOverflow(int64(a), int64(b))
+				if !ok {
+					return nil, ErrIntOutOfRange
 				}
-				if b > 0 && a < math.MinInt64+b {
-					return nil, errIntOutOfRange
-				}
-				return NewDInt(a - b), nil
+				return NewDInt(DInt(r)), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDFloat(*left.(*DFloat) - *right.(*DFloat)), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
@@ -613,181 +794,260 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := MustBeDInt(right)
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(r))
+				dd.SetFinite(int64(r), 0)
 				_, err := ExactCtx.Sub(&dd.Decimal, l, &dd.Decimal)
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := MustBeDInt(left)
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(l))
+				dd.SetFinite(int64(l), 0)
 				_, err := ExactCtx.Sub(&dd.Decimal, &dd.Decimal, r)
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Date,
 			RightType:  types.Int,
 			ReturnType: types.Date,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return NewDDate(*left.(*DDate) - DDate(MustBeDInt(right))), nil
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				d, err := left.(*DDate).SubDays(int64(MustBeDInt(right)))
+				if err != nil {
+					return nil, err
+				}
+				return NewDDate(d), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Date,
 			RightType:  types.Date,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return NewDInt(DInt(*left.(*DDate) - *right.(*DDate))), nil
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l, r := left.(*DDate).Date, right.(*DDate).Date
+				if !l.IsFinite() || !r.IsFinite() {
+					return nil, pgerror.New(pgcode.DatetimeFieldOverflow, "cannot subtract infinite dates")
+				}
+				a := l.PGEpochDays()
+				b := r.PGEpochDays()
+				// This can't overflow because they are upconverted from int32 to int64.
+				return NewDInt(DInt(int64(a) - int64(b))), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Date,
 			RightType:  types.Time,
 			ReturnType: types.Timestamp,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				d := MakeDTimestampTZFromDate(time.UTC, left.(*DDate))
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				leftTime, err := left.(*DDate).ToTime()
+				if err != nil {
+					return nil, err
+				}
 				t := time.Duration(*right.(*DTime)) * time.Microsecond
-				return MakeDTimestamp(d.Add(-1*t), time.Microsecond), nil
+				return MakeDTimestamp(leftTime.Add(-1*t), time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Time,
 			RightType:  types.Time,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				t1 := timeofday.TimeOfDay(*left.(*DTime))
 				t2 := timeofday.TimeOfDay(*right.(*DTime))
 				diff := timeofday.Difference(t1, t2)
 				return &DInterval{Duration: diff}, nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Timestamp,
 			RightType:  types.Timestamp,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				nanos := left.(*DTimestamp).Sub(right.(*DTimestamp).Time).Nanoseconds()
-				return &DInterval{Duration: duration.Duration{Nanos: nanos}}, nil
+				return &DInterval{Duration: duration.MakeDuration(nanos, 0, 0)}, nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.TimestampTZ,
 			RightType:  types.TimestampTZ,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				nanos := left.(*DTimestampTZ).Sub(right.(*DTimestampTZ).Time).Nanoseconds()
-				return &DInterval{Duration: duration.Duration{Nanos: nanos}}, nil
+				return &DInterval{Duration: duration.MakeDuration(nanos, 0, 0)}, nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Timestamp,
 			RightType:  types.TimestampTZ,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				nanos := left.(*DTimestamp).Sub(right.(*DTimestampTZ).Time).Nanoseconds()
-				return &DInterval{Duration: duration.Duration{Nanos: nanos}}, nil
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				// These two quantities aren't directly comparable. Convert the
+				// TimestampTZ to a timestamp first.
+				nanos := left.(*DTimestamp).Sub(right.(*DTimestampTZ).stripTimeZone(ctx).Time).Nanoseconds()
+				return &DInterval{Duration: duration.MakeDuration(nanos, 0, 0)}, nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.TimestampTZ,
 			RightType:  types.Timestamp,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				nanos := left.(*DTimestampTZ).Sub(right.(*DTimestamp).Time).Nanoseconds()
-				return &DInterval{Duration: duration.Duration{Nanos: nanos}}, nil
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				// These two quantities aren't directly comparable. Convert the
+				// TimestampTZ to a timestamp first.
+				nanos := left.(*DTimestampTZ).stripTimeZone(ctx).Sub(right.(*DTimestamp).Time).Nanoseconds()
+				return &DInterval{Duration: duration.MakeDuration(nanos, 0, 0)}, nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Time,
 			RightType:  types.Interval,
 			ReturnType: types.Time,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				t := timeofday.TimeOfDay(*left.(*DTime))
 				return MakeDTime(t.Add(right.(*DInterval).Duration.Mul(-1))), nil
 			},
 		},
-		BinOp{
+		&BinOp{
+			LeftType:   types.TimeTZ,
+			RightType:  types.Interval,
+			ReturnType: types.TimeTZ,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				t := left.(*DTimeTZ)
+				duration := right.(*DInterval).Duration
+				return NewDTimeTZFromOffset(t.Add(duration.Mul(-1)), t.OffsetSecs), nil
+			},
+		},
+		&BinOp{
 			LeftType:   types.Timestamp,
 			RightType:  types.Interval,
 			ReturnType: types.Timestamp,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return MakeDTimestamp(duration.Add(left.(*DTimestamp).Time, right.(*DInterval).Duration.Mul(-1)), time.Microsecond), nil
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				return MakeDTimestamp(duration.Add(
+					left.(*DTimestamp).Time, right.(*DInterval).Duration.Mul(-1)), time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.TimestampTZ,
 			RightType:  types.Interval,
 			ReturnType: types.TimestampTZ,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				t := duration.Add(left.(*DTimestampTZ).Time, right.(*DInterval).Duration.Mul(-1))
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				t := duration.Add(
+					left.(*DTimestampTZ).Time.In(ctx.GetLocation()),
+					right.(*DInterval).Duration.Mul(-1),
+				)
 				return MakeDTimestampTZ(t, time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Date,
 			RightType:  types.Interval,
-			ReturnType: types.TimestampTZ,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
-				leftTZ := MakeDTimestampTZFromDate(ctx.GetLocation(), left.(*DDate))
-				t := duration.Add(leftTZ.Time, right.(*DInterval).Duration.Mul(-1))
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+			ReturnType: types.Timestamp,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				leftTime, err := left.(*DDate).ToTime()
+				if err != nil {
+					return nil, err
+				}
+				t := duration.Add(leftTime, right.(*DInterval).Duration.Mul(-1))
+				return MakeDTimestamp(t, time.Microsecond), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Interval,
 			RightType:  types.Interval,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return &DInterval{Duration: left.(*DInterval).Duration.Sub(right.(*DInterval).Duration)}, nil
 			},
 		},
-		BinOp{
-			LeftType:   types.JSON,
+		&BinOp{
+			LeftType:   types.Jsonb,
 			RightType:  types.String,
-			ReturnType: types.JSON,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				j, err := left.(*DJSON).JSON.RemoveKey(string(MustBeDString(right)))
+			ReturnType: types.Jsonb,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				j, _, err := left.(*DJSON).JSON.RemoveString(string(MustBeDString(right)))
 				if err != nil {
 					return nil, err
 				}
 				return &DJSON{j}, nil
 			},
 		},
-		BinOp{
-			LeftType:   types.JSON,
+		&BinOp{
+			LeftType:   types.Jsonb,
 			RightType:  types.Int,
-			ReturnType: types.JSON,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				j, err := left.(*DJSON).JSON.RemoveIndex(int(MustBeDInt(right)))
+			ReturnType: types.Jsonb,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				j, _, err := left.(*DJSON).JSON.RemoveIndex(int(MustBeDInt(right)))
 				if err != nil {
 					return nil, err
 				}
 				return &DJSON{j}, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.Jsonb,
+			RightType:  types.MakeArray(types.String),
+			ReturnType: types.Jsonb,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				j := left.(*DJSON).JSON
+				arr := *MustBeDArray(right)
+
+				for _, str := range arr.Array {
+					if str == DNull {
+						continue
+					}
+					var err error
+					j, _, err = j.RemoveString(string(MustBeDString(str)))
+					if err != nil {
+						return nil, err
+					}
+				}
+				return &DJSON{j}, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			ReturnType: types.Int,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				diff, err := ipAddr.SubIPAddr(&other)
+				return NewDInt(DInt(diff)), err
+			},
+		},
+		&BinOp{
+			// Note: postgres ver 10 does NOT have Int - INet. Throws ERROR: 42883.
+			LeftType:   types.INet,
+			RightType:  types.Int,
+			ReturnType: types.INet,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				i := MustBeDInt(right)
+				newIPAddr, err := ipAddr.Sub(int64(i))
+				return NewDIPAddr(DIPAddr{newIPAddr}), err
 			},
 		},
 	},
 
 	Mult: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				// See Rob Pike's implementation from
 				// https://groups.google.com/d/msg/golang-nuts/h5oSN5t3Au4/KaNQREhZh0QJ
 
@@ -797,26 +1057,26 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					// ignore
 				} else if a == math.MinInt64 || b == math.MinInt64 {
 					// This test is required to detect math.MinInt64 * -1.
-					return nil, errIntOutOfRange
+					return nil, ErrIntOutOfRange
 				} else if c/b != a {
-					return nil, errIntOutOfRange
+					return nil, ErrIntOutOfRange
 				}
 				return NewDInt(c), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDFloat(*left.(*DFloat) * *right.(*DFloat)), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
@@ -824,126 +1084,178 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return dd, err
 			},
 		},
-		// The following two overloads are needed becauase DInt/DInt = DDecimal. Due to this
-		// operation, normalization may sometimes create a DInt * DDecimal operation.
-		BinOp{
+		// The following two overloads are needed because DInt/DInt = DDecimal. Due
+		// to this operation, normalization may sometimes create a DInt * DDecimal
+		// operation.
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := MustBeDInt(right)
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(r))
+				dd.SetFinite(int64(r), 0)
 				_, err := ExactCtx.Mul(&dd.Decimal, l, &dd.Decimal)
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := MustBeDInt(left)
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(l))
+				dd.SetFinite(int64(l), 0)
 				_, err := ExactCtx.Mul(&dd.Decimal, &dd.Decimal, r)
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Interval,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return &DInterval{Duration: right.(*DInterval).Duration.Mul(int64(MustBeDInt(left)))}, nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Interval,
 			RightType:  types.Int,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return &DInterval{Duration: left.(*DInterval).Duration.Mul(int64(MustBeDInt(right)))}, nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Interval,
 			RightType:  types.Float,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				r := float64(*right.(*DFloat))
 				return &DInterval{Duration: left.(*DInterval).Duration.MulFloat(r)}, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.Float,
+			RightType:  types.Interval,
+			ReturnType: types.Interval,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := float64(*left.(*DFloat))
+				return &DInterval{Duration: right.(*DInterval).Duration.MulFloat(l)}, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.Decimal,
+			RightType:  types.Interval,
+			ReturnType: types.Interval,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := &left.(*DDecimal).Decimal
+				t, err := l.Float64()
+				if err != nil {
+					return nil, err
+				}
+				return &DInterval{Duration: right.(*DInterval).Duration.MulFloat(t)}, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.Interval,
+			RightType:  types.Decimal,
+			ReturnType: types.Interval,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				r := &right.(*DDecimal).Decimal
+				t, err := r.Float64()
+				if err != nil {
+					return nil, err
+				}
+				return &DInterval{Duration: left.(*DInterval).Duration.MulFloat(t)}, nil
 			},
 		},
 	},
 
 	Div: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				rInt := MustBeDInt(right)
-				div := ctx.getTmpDec().SetCoefficient(int64(rInt)).SetExponent(0)
+				div := ctx.getTmpDec().SetFinite(int64(rInt), 0)
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(MustBeDInt(left)))
-				_, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, div)
+				dd.SetFinite(int64(MustBeDInt(left)), 0)
+				cond, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, div)
+				if cond.DivisionByZero() {
+					return dd, ErrDivByZero
+				}
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return NewDFloat(*left.(*DFloat) / *right.(*DFloat)), nil
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				r := *right.(*DFloat)
+				if r == 0.0 {
+					return nil, ErrDivByZero
+				}
+				return NewDFloat(*left.(*DFloat) / r), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
-				_, err := DecimalCtx.Quo(&dd.Decimal, l, r)
+				cond, err := DecimalCtx.Quo(&dd.Decimal, l, r)
+				if cond.DivisionByZero() {
+					return dd, ErrDivByZero
+				}
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := MustBeDInt(right)
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(r))
-				_, err := DecimalCtx.Quo(&dd.Decimal, l, &dd.Decimal)
+				dd.SetFinite(int64(r), 0)
+				cond, err := DecimalCtx.Quo(&dd.Decimal, l, &dd.Decimal)
+				if cond.DivisionByZero() {
+					return dd, ErrDivByZero
+				}
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := MustBeDInt(left)
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(l))
-				_, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, r)
+				dd.SetFinite(int64(l), 0)
+				cond, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, r)
+				if cond.DivisionByZero() {
+					return dd, ErrDivByZero
+				}
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Interval,
 			RightType:  types.Int,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				rInt := MustBeDInt(right)
 				if rInt == 0 {
 					return nil, ErrDivByZero
@@ -951,11 +1263,11 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return &DInterval{Duration: left.(*DInterval).Duration.Div(int64(rInt))}, nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Interval,
 			RightType:  types.Float,
 			ReturnType: types.Interval,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				r := float64(*right.(*DFloat))
 				if r == 0.0 {
 					return nil, ErrDivByZero
@@ -966,11 +1278,11 @@ var BinOps = map[BinaryOperator]binOpOverload{
 	},
 
 	FloorDiv: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				rInt := MustBeDInt(right)
 				if rInt == 0 {
 					return nil, ErrDivByZero
@@ -978,21 +1290,21 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return NewDInt(MustBeDInt(left) / rInt), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := float64(*left.(*DFloat))
 				r := float64(*right.(*DFloat))
 				return NewDFloat(DFloat(math.Trunc(l / r))), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
@@ -1000,34 +1312,34 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := MustBeDInt(right)
 				if r == 0 {
 					return nil, ErrDivByZero
 				}
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(r))
+				dd.SetFinite(int64(r), 0)
 				_, err := HighPrecisionCtx.QuoInteger(&dd.Decimal, l, &dd.Decimal)
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := MustBeDInt(left)
 				r := &right.(*DDecimal).Decimal
 				if r.Sign() == 0 {
 					return nil, ErrDivByZero
 				}
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(l))
+				dd.SetFinite(int64(l), 0)
 				_, err := HighPrecisionCtx.QuoInteger(&dd.Decimal, &dd.Decimal, r)
 				return dd, err
 			},
@@ -1035,11 +1347,11 @@ var BinOps = map[BinaryOperator]binOpOverload{
 	},
 
 	Mod: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				r := MustBeDInt(right)
 				if r == 0 {
 					return nil, ErrZeroModulus
@@ -1047,19 +1359,19 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return NewDInt(MustBeDInt(left) % r), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDFloat(DFloat(math.Mod(float64(*left.(*DFloat)), float64(*right.(*DFloat))))), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
@@ -1067,28 +1379,28 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := MustBeDInt(right)
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(r))
+				dd.SetFinite(int64(r), 0)
 				_, err := HighPrecisionCtx.Rem(&dd.Decimal, l, &dd.Decimal)
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := MustBeDInt(left)
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(l))
+				dd.SetFinite(int64(l), 0)
 				_, err := HighPrecisionCtx.Rem(&dd.Decimal, &dd.Decimal, r)
 				return dd, err
 			},
@@ -1096,27 +1408,39 @@ var BinOps = map[BinaryOperator]binOpOverload{
 	},
 
 	Concat: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.String,
 			RightType:  types.String,
 			ReturnType: types.String,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDString(string(MustBeDString(left) + MustBeDString(right))), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Bytes,
 			RightType:  types.Bytes,
 			ReturnType: types.Bytes,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDBytes(*left.(*DBytes) + *right.(*DBytes)), nil
 			},
 		},
-		BinOp{
-			LeftType:   types.JSON,
-			RightType:  types.JSON,
-			ReturnType: types.JSON,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+		&BinOp{
+			LeftType:   types.VarBit,
+			RightType:  types.VarBit,
+			ReturnType: types.VarBit,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				lhs := MustBeDBitArray(left)
+				rhs := MustBeDBitArray(right)
+				return &DBitArray{
+					BitArray: bitarray.Concat(lhs.BitArray, rhs.BitArray),
+				}, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.Jsonb,
+			RightType:  types.Jsonb,
+			ReturnType: types.Jsonb,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				j, err := MustBeDJSON(left).JSON.Concat(MustBeDJSON(right).JSON)
 				if err != nil {
 					return nil, err
@@ -1128,50 +1452,104 @@ var BinOps = map[BinaryOperator]binOpOverload{
 
 	// TODO(pmattis): Check that the shift is valid.
 	LShift: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return NewDInt(MustBeDInt(left) << uint(MustBeDInt(right))), nil
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				rval := MustBeDInt(right)
+				if rval < 0 || rval >= 64 {
+					telemetry.Inc(sqltelemetry.LargeLShiftArgumentCounter)
+					return nil, pgerror.Newf(pgcode.InvalidParameterValue, "shift argument out of range")
+				}
+				return NewDInt(MustBeDInt(left) << uint(rval)), nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.VarBit,
+			RightType:  types.Int,
+			ReturnType: types.VarBit,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				lhs := MustBeDBitArray(left)
+				rhs := MustBeDInt(right)
+				return &DBitArray{
+					BitArray: lhs.BitArray.LeftShiftAny(int64(rhs)),
+				}, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			ReturnType: types.Bool,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				return MakeDBool(DBool(ipAddr.ContainedBy(&other))), nil
 			},
 		},
 	},
 
 	RShift: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return NewDInt(MustBeDInt(left) >> uint(MustBeDInt(right))), nil
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				rval := MustBeDInt(right)
+				if rval < 0 || rval >= 64 {
+					telemetry.Inc(sqltelemetry.LargeRShiftArgumentCounter)
+					return nil, pgerror.Newf(pgcode.InvalidParameterValue, "shift argument out of range")
+				}
+				return NewDInt(MustBeDInt(left) >> uint(rval)), nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.VarBit,
+			RightType:  types.Int,
+			ReturnType: types.VarBit,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				lhs := MustBeDBitArray(left)
+				rhs := MustBeDInt(right)
+				return &DBitArray{
+					BitArray: lhs.BitArray.LeftShiftAny(-int64(rhs)),
+				}, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			ReturnType: types.Bool,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				return MakeDBool(DBool(ipAddr.Contains(&other))), nil
 			},
 		},
 	},
 
 	Pow: {
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return IntPow(MustBeDInt(left), MustBeDInt(right))
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				f := math.Pow(float64(*left.(*DFloat)), float64(*right.(*DFloat)))
 				return NewDFloat(DFloat(f)), nil
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
@@ -1179,40 +1557,40 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := &left.(*DDecimal).Decimal
 				r := MustBeDInt(right)
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(r))
+				dd.SetFinite(int64(r), 0)
 				_, err := DecimalCtx.Pow(&dd.Decimal, l, &dd.Decimal)
 				return dd, err
 			},
 		},
-		BinOp{
+		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				l := MustBeDInt(left)
 				r := &right.(*DDecimal).Decimal
 				dd := &DDecimal{}
-				dd.SetCoefficient(int64(l))
+				dd.SetFinite(int64(l), 0)
 				_, err := DecimalCtx.Pow(&dd.Decimal, &dd.Decimal, r)
 				return dd, err
 			},
 		},
 	},
 
-	FetchVal: {
-		BinOp{
-			LeftType:   types.JSON,
+	JSONFetchVal: {
+		&BinOp{
+			LeftType:   types.Jsonb,
 			RightType:  types.String,
-			ReturnType: types.JSON,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			ReturnType: types.Jsonb,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				j, err := left.(*DJSON).JSON.FetchValKey(string(MustBeDString(right)))
 				if err != nil {
 					return nil, err
@@ -1223,11 +1601,11 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return &DJSON{j}, nil
 			},
 		},
-		BinOp{
-			LeftType:   types.JSON,
+		&BinOp{
+			LeftType:   types.Jsonb,
 			RightType:  types.Int,
-			ReturnType: types.JSON,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			ReturnType: types.Jsonb,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				j, err := left.(*DJSON).JSON.FetchValIdx(int(MustBeDInt(right)))
 				if err != nil {
 					return nil, err
@@ -1240,23 +1618,23 @@ var BinOps = map[BinaryOperator]binOpOverload{
 		},
 	},
 
-	FetchValPath: {
-		BinOp{
-			LeftType:   types.JSON,
-			RightType:  types.TArray{Typ: types.String},
-			ReturnType: types.JSON,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+	JSONFetchValPath: {
+		&BinOp{
+			LeftType:   types.Jsonb,
+			RightType:  types.MakeArray(types.String),
+			ReturnType: types.Jsonb,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return getJSONPath(*left.(*DJSON), *MustBeDArray(right))
 			},
 		},
 	},
 
-	FetchText: {
-		BinOp{
-			LeftType:   types.JSON,
+	JSONFetchText: {
+		&BinOp{
+			LeftType:   types.Jsonb,
 			RightType:  types.String,
 			ReturnType: types.String,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				res, err := left.(*DJSON).JSON.FetchValKey(string(MustBeDString(right)))
 				if err != nil {
 					return nil, err
@@ -1274,11 +1652,11 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return NewDString(*text), nil
 			},
 		},
-		BinOp{
-			LeftType:   types.JSON,
+		&BinOp{
+			LeftType:   types.Jsonb,
 			RightType:  types.Int,
 			ReturnType: types.String,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				res, err := left.(*DJSON).JSON.FetchValIdx(int(MustBeDInt(right)))
 				if err != nil {
 					return nil, err
@@ -1298,12 +1676,12 @@ var BinOps = map[BinaryOperator]binOpOverload{
 		},
 	},
 
-	FetchTextPath: {
-		BinOp{
-			LeftType:   types.JSON,
-			RightType:  types.TArray{Typ: types.String},
+	JSONFetchTextPath: {
+		&BinOp{
+			LeftType:   types.Jsonb,
+			RightType:  types.MakeArray(types.String),
 			ReturnType: types.String,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				res, err := getJSONPath(*left.(*DJSON), *MustBeDArray(right))
 				if err != nil {
 					return nil, err
@@ -1326,13 +1704,13 @@ var BinOps = map[BinaryOperator]binOpOverload{
 
 // timestampMinusBinOp is the implementation of the subtraction
 // between types.TimestampTZ operands.
-var timestampMinusBinOp BinOp
+var timestampMinusBinOp *BinOp
 
 // TimestampDifference computes the interval difference between two
 // TimestampTZ datums. The result is a DInterval. The caller must
 // ensure that the arguments are of the proper Datum type.
 func TimestampDifference(ctx *EvalContext, start, end Datum) (Datum, error) {
-	return timestampMinusBinOp.fn(ctx, start, end)
+	return timestampMinusBinOp.Fn(ctx, start, end)
 }
 
 func init() {
@@ -1341,107 +1719,139 @@ func init() {
 
 // CmpOp is a comparison operator.
 type CmpOp struct {
-	LeftType  types.T
-	RightType types.T
+	LeftType  *types.T
+	RightType *types.T
+
+	// If NullableArgs is false, the operator returns NULL
+	// whenever either argument is NULL.
+	NullableArgs bool
 
 	// Datum return type is a union between *DBool and dNull.
-	fn func(*EvalContext, Datum, Datum) (Datum, error)
+	Fn func(*EvalContext, Datum, Datum) (Datum, error)
 
-	types TypeList
+	types       TypeList
+	isPreferred bool
+
+	// counter, if non-nil, should be incremented every time the
+	// operator is type checked.
+	counter telemetry.Counter
 }
 
-func (op CmpOp) params() TypeList {
+func (op *CmpOp) params() TypeList {
 	return op.types
 }
 
-func (op CmpOp) matchParams(l, r types.T) bool {
-	return op.params().matchAt(l, 0) && op.params().matchAt(r, 1)
+func (op *CmpOp) matchParams(l, r *types.T) bool {
+	return op.params().MatchAt(l, 0) && op.params().MatchAt(r, 1)
 }
 
 var cmpOpReturnType = FixedReturnType(types.Bool)
 
-func (op CmpOp) returnType() ReturnTyper {
+func (op *CmpOp) returnType() ReturnTyper {
 	return cmpOpReturnType
 }
 
-func (CmpOp) preferred() bool {
-	return false
+func (op *CmpOp) preferred() bool {
+	return op.isPreferred
 }
 
-func init() {
+func cmpOpFixups(cmpOps map[ComparisonOperator]cmpOpOverload) map[ComparisonOperator]cmpOpOverload {
 	// Array equality comparisons.
-	for _, t := range types.AnyNonArray {
-		CmpOps[EQ] = append(CmpOps[EQ], CmpOp{
-			LeftType:  types.TArray{Typ: t},
-			RightType: types.TArray{Typ: t},
-			fn:        cmpOpScalarEQFn,
+	for _, t := range types.Scalar {
+		cmpOps[EQ] = append(cmpOps[EQ], &CmpOp{
+			LeftType:  types.MakeArray(t),
+			RightType: types.MakeArray(t),
+			Fn:        cmpOpScalarEQFn,
+		})
+		cmpOps[LE] = append(cmpOps[LE], &CmpOp{
+			LeftType:  types.MakeArray(t),
+			RightType: types.MakeArray(t),
+			Fn:        cmpOpScalarLEFn,
+		})
+		cmpOps[LT] = append(cmpOps[LT], &CmpOp{
+			LeftType:  types.MakeArray(t),
+			RightType: types.MakeArray(t),
+			Fn:        cmpOpScalarLTFn,
+		})
+
+		cmpOps[IsNotDistinctFrom] = append(cmpOps[IsNotDistinctFrom], &CmpOp{
+			LeftType:     types.MakeArray(t),
+			RightType:    types.MakeArray(t),
+			Fn:           cmpOpScalarIsFn,
+			NullableArgs: true,
 		})
 	}
-}
 
-func init() {
-	for op, overload := range CmpOps {
+	for op, overload := range cmpOps {
 		for i, impl := range overload {
-			casted := impl.(CmpOp)
+			casted := impl.(*CmpOp)
 			casted.types = ArgTypes{{"left", casted.LeftType}, {"right", casted.RightType}}
-			CmpOps[op][i] = casted
+			cmpOps[op][i] = casted
 		}
 	}
+
+	return cmpOps
 }
 
 // cmpOpOverload is an overloaded set of comparison operator implementations.
 type cmpOpOverload []overloadImpl
 
-func (o cmpOpOverload) lookupImpl(left, right types.T) (CmpOp, bool) {
+func (o cmpOpOverload) LookupImpl(left, right *types.T) (*CmpOp, bool) {
 	for _, fn := range o {
-		casted := fn.(CmpOp)
+		casted := fn.(*CmpOp)
 		if casted.matchParams(left, right) {
 			return casted, true
 		}
 	}
-	return CmpOp{}, false
+	return nil, false
 }
 
 func makeCmpOpOverload(
-	fn func(ctx *EvalContext, left, right Datum) (Datum, error), a, b types.T,
-) CmpOp {
-	return CmpOp{
-		LeftType:  a,
-		RightType: b,
-		fn:        fn,
+	fn func(ctx *EvalContext, left, right Datum) (Datum, error), a, b *types.T, nullableArgs bool,
+) *CmpOp {
+	return &CmpOp{
+		LeftType:     a,
+		RightType:    b,
+		Fn:           fn,
+		NullableArgs: nullableArgs,
 	}
 }
 
-func makeEqFn(a, b types.T) CmpOp {
-	return makeCmpOpOverload(cmpOpScalarEQFn, a, b)
+func makeEqFn(a, b *types.T) *CmpOp {
+	return makeCmpOpOverload(cmpOpScalarEQFn, a, b, false /* NullableArgs */)
 }
-func makeLtFn(a, b types.T) CmpOp {
-	return makeCmpOpOverload(cmpOpScalarLTFn, a, b)
+func makeLtFn(a, b *types.T) *CmpOp {
+	return makeCmpOpOverload(cmpOpScalarLTFn, a, b, false /* NullableArgs */)
 }
-func makeLeFn(a, b types.T) CmpOp {
-	return makeCmpOpOverload(cmpOpScalarLEFn, a, b)
+func makeLeFn(a, b *types.T) *CmpOp {
+	return makeCmpOpOverload(cmpOpScalarLEFn, a, b, false /* NullableArgs */)
+}
+func makeIsFn(a, b *types.T) *CmpOp {
+	return makeCmpOpOverload(cmpOpScalarIsFn, a, b, true /* NullableArgs */)
 }
 
 // CmpOps contains the comparison operations indexed by operation type.
-var CmpOps = map[ComparisonOperator]cmpOpOverload{
+var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 	EQ: {
 		// Single-type comparisons.
 		makeEqFn(types.Bool, types.Bool),
 		makeEqFn(types.Bytes, types.Bytes),
 		makeEqFn(types.Date, types.Date),
 		makeEqFn(types.Decimal, types.Decimal),
-		makeEqFn(types.FamCollatedString, types.FamCollatedString),
+		makeEqFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeEqFn(types.Float, types.Float),
 		makeEqFn(types.INet, types.INet),
 		makeEqFn(types.Int, types.Int),
 		makeEqFn(types.Interval, types.Interval),
-		makeEqFn(types.JSON, types.JSON),
+		makeEqFn(types.Jsonb, types.Jsonb),
 		makeEqFn(types.Oid, types.Oid),
 		makeEqFn(types.String, types.String),
 		makeEqFn(types.Time, types.Time),
+		makeEqFn(types.TimeTZ, types.TimeTZ),
 		makeEqFn(types.Timestamp, types.Timestamp),
 		makeEqFn(types.TimestampTZ, types.TimestampTZ),
-		makeEqFn(types.UUID, types.UUID),
+		makeEqFn(types.Uuid, types.Uuid),
+		makeEqFn(types.VarBit, types.VarBit),
 
 		// Mixed-type comparisons.
 		makeEqFn(types.Date, types.Timestamp),
@@ -1456,12 +1866,14 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeEqFn(types.Timestamp, types.TimestampTZ),
 		makeEqFn(types.TimestampTZ, types.Date),
 		makeEqFn(types.TimestampTZ, types.Timestamp),
+		makeEqFn(types.Time, types.TimeTZ),
+		makeEqFn(types.TimeTZ, types.Time),
 
 		// Tuple comparison.
-		CmpOp{
-			LeftType:  types.FamTuple,
-			RightType: types.FamTuple,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+		&CmpOp{
+			LeftType:  types.AnyTuple,
+			RightType: types.AnyTuple,
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), EQ), nil
 			},
 		},
@@ -1473,7 +1885,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeLtFn(types.Bytes, types.Bytes),
 		makeLtFn(types.Date, types.Date),
 		makeLtFn(types.Decimal, types.Decimal),
-		makeLtFn(types.FamCollatedString, types.FamCollatedString),
+		makeLtFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeLtFn(types.Float, types.Float),
 		makeLtFn(types.INet, types.INet),
 		makeLtFn(types.Int, types.Int),
@@ -1481,9 +1893,11 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeLtFn(types.Oid, types.Oid),
 		makeLtFn(types.String, types.String),
 		makeLtFn(types.Time, types.Time),
+		makeLtFn(types.TimeTZ, types.TimeTZ),
 		makeLtFn(types.Timestamp, types.Timestamp),
 		makeLtFn(types.TimestampTZ, types.TimestampTZ),
-		makeLtFn(types.UUID, types.UUID),
+		makeLtFn(types.Uuid, types.Uuid),
+		makeLtFn(types.VarBit, types.VarBit),
 
 		// Mixed-type comparisons.
 		makeLtFn(types.Date, types.Timestamp),
@@ -1498,12 +1912,14 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeLtFn(types.Timestamp, types.TimestampTZ),
 		makeLtFn(types.TimestampTZ, types.Date),
 		makeLtFn(types.TimestampTZ, types.Timestamp),
+		makeLtFn(types.Time, types.TimeTZ),
+		makeLtFn(types.TimeTZ, types.Time),
 
 		// Tuple comparison.
-		CmpOp{
-			LeftType:  types.FamTuple,
-			RightType: types.FamTuple,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+		&CmpOp{
+			LeftType:  types.AnyTuple,
+			RightType: types.AnyTuple,
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), LT), nil
 			},
 		},
@@ -1515,7 +1931,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeLeFn(types.Bytes, types.Bytes),
 		makeLeFn(types.Date, types.Date),
 		makeLeFn(types.Decimal, types.Decimal),
-		makeLeFn(types.FamCollatedString, types.FamCollatedString),
+		makeLeFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeLeFn(types.Float, types.Float),
 		makeLeFn(types.INet, types.INet),
 		makeLeFn(types.Int, types.Int),
@@ -1523,9 +1939,11 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeLeFn(types.Oid, types.Oid),
 		makeLeFn(types.String, types.String),
 		makeLeFn(types.Time, types.Time),
+		makeLeFn(types.TimeTZ, types.TimeTZ),
 		makeLeFn(types.Timestamp, types.Timestamp),
 		makeLeFn(types.TimestampTZ, types.TimestampTZ),
-		makeLeFn(types.UUID, types.UUID),
+		makeLeFn(types.Uuid, types.Uuid),
+		makeLeFn(types.VarBit, types.VarBit),
 
 		// Mixed-type comparisons.
 		makeLeFn(types.Date, types.Timestamp),
@@ -1540,13 +1958,74 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeLeFn(types.Timestamp, types.TimestampTZ),
 		makeLeFn(types.TimestampTZ, types.Date),
 		makeLeFn(types.TimestampTZ, types.Timestamp),
+		makeLeFn(types.Time, types.TimeTZ),
+		makeLeFn(types.TimeTZ, types.Time),
 
 		// Tuple comparison.
-		CmpOp{
-			LeftType:  types.FamTuple,
-			RightType: types.FamTuple,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+		&CmpOp{
+			LeftType:  types.AnyTuple,
+			RightType: types.AnyTuple,
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), LE), nil
+			},
+		},
+	},
+
+	IsNotDistinctFrom: {
+		&CmpOp{
+			LeftType:     types.Unknown,
+			RightType:    types.Unknown,
+			Fn:           cmpOpScalarIsFn,
+			NullableArgs: true,
+			// Avoids ambiguous comparison error for NULL IS NOT DISTINCT FROM NULL>
+			isPreferred: true,
+		},
+		// Single-type comparisons.
+		makeIsFn(types.Bool, types.Bool),
+		makeIsFn(types.Bytes, types.Bytes),
+		makeIsFn(types.Date, types.Date),
+		makeIsFn(types.Decimal, types.Decimal),
+		makeIsFn(types.AnyCollatedString, types.AnyCollatedString),
+		makeIsFn(types.Float, types.Float),
+		makeIsFn(types.INet, types.INet),
+		makeIsFn(types.Int, types.Int),
+		makeIsFn(types.Interval, types.Interval),
+		makeIsFn(types.Jsonb, types.Jsonb),
+		makeIsFn(types.Oid, types.Oid),
+		makeIsFn(types.String, types.String),
+		makeIsFn(types.Time, types.Time),
+		makeIsFn(types.TimeTZ, types.TimeTZ),
+		makeIsFn(types.Timestamp, types.Timestamp),
+		makeIsFn(types.TimestampTZ, types.TimestampTZ),
+		makeIsFn(types.Uuid, types.Uuid),
+		makeIsFn(types.VarBit, types.VarBit),
+
+		// Mixed-type comparisons.
+		makeIsFn(types.Date, types.Timestamp),
+		makeIsFn(types.Date, types.TimestampTZ),
+		makeIsFn(types.Decimal, types.Float),
+		makeIsFn(types.Decimal, types.Int),
+		makeIsFn(types.Float, types.Decimal),
+		makeIsFn(types.Float, types.Int),
+		makeIsFn(types.Int, types.Decimal),
+		makeIsFn(types.Int, types.Float),
+		makeIsFn(types.Timestamp, types.Date),
+		makeIsFn(types.Timestamp, types.TimestampTZ),
+		makeIsFn(types.TimestampTZ, types.Date),
+		makeIsFn(types.TimestampTZ, types.Timestamp),
+		makeIsFn(types.Time, types.TimeTZ),
+		makeIsFn(types.TimeTZ, types.Time),
+
+		// Tuple comparison.
+		&CmpOp{
+			LeftType:     types.AnyTuple,
+			RightType:    types.AnyTuple,
+			NullableArgs: true,
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				if left == DNull || right == DNull {
+					return MakeDBool(left == DNull && right == DNull), nil
+				}
+				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), IsNotDistinctFrom), nil
 			},
 		},
 	},
@@ -1556,57 +2035,59 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeEvalTupleIn(types.Bytes),
 		makeEvalTupleIn(types.Date),
 		makeEvalTupleIn(types.Decimal),
-		makeEvalTupleIn(types.FamCollatedString),
-		makeEvalTupleIn(types.FamTuple),
+		makeEvalTupleIn(types.AnyCollatedString),
+		makeEvalTupleIn(types.AnyTuple),
 		makeEvalTupleIn(types.Float),
 		makeEvalTupleIn(types.INet),
 		makeEvalTupleIn(types.Int),
 		makeEvalTupleIn(types.Interval),
-		makeEvalTupleIn(types.JSON),
+		makeEvalTupleIn(types.Jsonb),
 		makeEvalTupleIn(types.Oid),
 		makeEvalTupleIn(types.String),
 		makeEvalTupleIn(types.Time),
+		makeEvalTupleIn(types.TimeTZ),
 		makeEvalTupleIn(types.Timestamp),
 		makeEvalTupleIn(types.TimestampTZ),
-		makeEvalTupleIn(types.UUID),
+		makeEvalTupleIn(types.Uuid),
+		makeEvalTupleIn(types.VarBit),
 	},
 
 	Like: {
-		CmpOp{
+		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				return matchLike(ctx, left, right, false)
 			},
 		},
 	},
 
 	ILike: {
-		CmpOp{
+		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				return matchLike(ctx, left, right, true)
 			},
 		},
 	},
 
 	SimilarTo: {
-		CmpOp{
+		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
-				key := similarToKey(MustBeDString(right))
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				key := similarToKey{s: string(MustBeDString(right)), escape: '\\'}
 				return matchRegexpWithKey(ctx, left, key)
 			},
 		},
 	},
 
 	RegMatch: {
-		CmpOp{
+		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				key := regexpKey{s: string(MustBeDString(right)), caseInsensitive: false}
 				return matchRegexpWithKey(ctx, left, key)
 			},
@@ -1614,21 +2095,21 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 	},
 
 	RegIMatch: {
-		CmpOp{
+		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				key := regexpKey{s: string(MustBeDString(right)), caseInsensitive: true}
 				return matchRegexpWithKey(ctx, left, key)
 			},
 		},
 	},
 
-	Existence: {
-		CmpOp{
-			LeftType:  types.JSON,
+	JSONExists: {
+		&CmpOp{
+			LeftType:  types.Jsonb,
 			RightType: types.String,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				e, err := left.(*DJSON).JSON.Exists(string(MustBeDString(right)))
 				if err != nil {
 					return nil, err
@@ -1641,13 +2122,16 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		},
 	},
 
-	SomeExistence: {
-		CmpOp{
-			LeftType:  types.JSON,
-			RightType: types.TArray{Typ: types.String},
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+	JSONSomeExists: {
+		&CmpOp{
+			LeftType:  types.Jsonb,
+			RightType: types.StringArray,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				// TODO(justin): this can be optimized.
 				for _, k := range MustBeDArray(right).Array {
+					if k == DNull {
+						continue
+					}
 					e, err := left.(*DJSON).JSON.Exists(string(MustBeDString(k)))
 					if err != nil {
 						return nil, err
@@ -1661,13 +2145,16 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		},
 	},
 
-	AllExistence: {
-		CmpOp{
-			LeftType:  types.JSON,
-			RightType: types.TArray{Typ: types.String},
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+	JSONAllExists: {
+		&CmpOp{
+			LeftType:  types.Jsonb,
+			RightType: types.StringArray,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				// TODO(justin): this can be optimized.
 				for _, k := range MustBeDArray(right).Array {
+					if k == DNull {
+						continue
+					}
 					e, err := left.(*DJSON).JSON.Exists(string(MustBeDString(k)))
 					if err != nil {
 						return nil, err
@@ -1682,10 +2169,19 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 	},
 
 	Contains: {
-		CmpOp{
-			LeftType:  types.JSON,
-			RightType: types.JSON,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+		&CmpOp{
+			LeftType:  types.AnyArray,
+			RightType: types.AnyArray,
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				haystack := MustBeDArray(left)
+				needles := MustBeDArray(right)
+				return ArrayContains(ctx, haystack, needles)
+			},
+		},
+		&CmpOp{
+			LeftType:  types.Jsonb,
+			RightType: types.Jsonb,
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				c, err := json.Contains(left.(*DJSON).JSON, right.(*DJSON).JSON)
 				if err != nil {
 					return nil, err
@@ -1696,10 +2192,19 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 	},
 
 	ContainedBy: {
-		CmpOp{
-			LeftType:  types.JSON,
-			RightType: types.JSON,
-			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+		&CmpOp{
+			LeftType:  types.AnyArray,
+			RightType: types.AnyArray,
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				needles := MustBeDArray(left)
+				haystack := MustBeDArray(right)
+				return ArrayContains(ctx, haystack, needles)
+			},
+		},
+		&CmpOp{
+			LeftType:  types.Jsonb,
+			RightType: types.Jsonb,
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				c, err := json.Contains(right.(*DJSON).JSON, left.(*DJSON).JSON)
 				if err != nil {
 					return nil, err
@@ -1708,18 +2213,68 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 			},
 		},
 	},
+	Overlaps: {
+		&CmpOp{
+			LeftType:  types.AnyArray,
+			RightType: types.AnyArray,
+			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				array := MustBeDArray(left)
+				other := MustBeDArray(right)
+				if !array.ParamTyp.Equivalent(other.ParamTyp) {
+					return nil, pgerror.New(pgcode.DatatypeMismatch, "cannot compare arrays with different element types")
+				}
+				for _, needle := range array.Array {
+					// Nulls don't compare to each other in && syntax.
+					if needle == DNull {
+						continue
+					}
+					for _, hay := range other.Array {
+						if needle.Compare(ctx, hay) == 0 {
+							return DBoolTrue, nil
+						}
+					}
+				}
+				return DBoolFalse, nil
+			},
+		},
+		&CmpOp{
+			LeftType:  types.INet,
+			RightType: types.INet,
+			Fn: func(_ *EvalContext, left, right Datum) (Datum, error) {
+				ipAddr := MustBeDIPAddr(left).IPAddr
+				other := MustBeDIPAddr(right).IPAddr
+				return MakeDBool(DBool(ipAddr.ContainsOrContainedBy(&other))), nil
+			},
+		},
+	},
+})
+
+// This map contains the inverses for operators in the CmpOps map that have
+// inverses.
+var cmpOpsInverse map[ComparisonOperator]ComparisonOperator
+
+func init() {
+	cmpOpsInverse = make(map[ComparisonOperator]ComparisonOperator)
+	for cmpOpIdx := range comparisonOpName {
+		cmpOp := ComparisonOperator(cmpOpIdx)
+		newOp, _, _, _, _ := foldComparisonExpr(cmpOp, DNull, DNull)
+		if newOp != cmpOp {
+			cmpOpsInverse[newOp] = cmpOp
+			cmpOpsInverse[cmpOp] = newOp
+		}
+	}
 }
 
 func boolFromCmp(cmp int, op ComparisonOperator) *DBool {
 	switch op {
-	case EQ:
+	case EQ, IsNotDistinctFrom:
 		return MakeDBool(cmp == 0)
 	case LT:
 		return MakeDBool(cmp < 0)
 	case LE:
 		return MakeDBool(cmp <= 0)
 	default:
-		panic(fmt.Sprintf("unexpected ComparisonOperator in boolFromCmp: %v", op))
+		panic(errors.AssertionFailedf("unexpected ComparisonOperator in boolFromCmp: %v", errors.Safe(op)))
 	}
 }
 
@@ -1728,8 +2283,14 @@ func cmpOpScalarFn(ctx *EvalContext, left, right Datum, op ComparisonOperator) D
 	// be handled differently during SQL comparison evaluation than they should when
 	// ordering Datum values.
 	if left == DNull || right == DNull {
-		// If either Datum is NULL, the result of the comparison is NULL.
-		return DNull
+		switch op {
+		case IsNotDistinctFrom:
+			return MakeDBool((left == DNull) == (right == DNull))
+
+		default:
+			// If either Datum is NULL, the result of the comparison is NULL.
+			return DNull
+		}
 	}
 	cmp := left.Compare(ctx, right)
 	return boolFromCmp(cmp, op)
@@ -1744,66 +2305,120 @@ func cmpOpScalarLTFn(ctx *EvalContext, left, right Datum) (Datum, error) {
 func cmpOpScalarLEFn(ctx *EvalContext, left, right Datum) (Datum, error) {
 	return cmpOpScalarFn(ctx, left, right, LE), nil
 }
+func cmpOpScalarIsFn(ctx *EvalContext, left, right Datum) (Datum, error) {
+	return cmpOpScalarFn(ctx, left, right, IsNotDistinctFrom), nil
+}
 
 func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op ComparisonOperator) Datum {
 	cmp := 0
+	sawNull := false
 	for i, leftElem := range left.D {
 		rightElem := right.D[i]
 		// Like with cmpOpScalarFn, check for values that need to be handled
 		// differently than when ordering Datums.
 		if leftElem == DNull || rightElem == DNull {
-			// If either Datum is NULL, the result of the comparison is NULL.
-			return DNull
-		}
-		cmp = leftElem.Compare(ctx, rightElem)
-		if cmp != 0 {
-			break
+			switch op {
+			case EQ:
+				// If either Datum is NULL and the op is EQ, we continue the
+				// comparison and the result is only NULL if the other (non-NULL)
+				// elements are equal. This is because NULL is thought of as "unknown",
+				// so a NULL equality comparison does not prevent the equality from
+				// being proven false, but does prevent it from being proven true.
+				sawNull = true
+
+			case IsNotDistinctFrom:
+				// For IS NOT DISTINCT FROM, NULLs are "equal".
+				if leftElem != DNull || rightElem != DNull {
+					return DBoolFalse
+				}
+
+			default:
+				// If either Datum is NULL and the op is not EQ or IS NOT DISTINCT FROM,
+				// we short-circuit the evaluation and the result of the comparison is
+				// NULL. This is because NULL is thought of as "unknown" and tuple
+				// inequality is defined lexicographically, so once a NULL comparison is
+				// seen, the result of the entire tuple comparison is unknown.
+				return DNull
+			}
+		} else {
+			cmp = leftElem.Compare(ctx, rightElem)
+			if cmp != 0 {
+				break
+			}
 		}
 	}
-	return boolFromCmp(cmp, op)
+	b := boolFromCmp(cmp, op)
+	if b == DBoolTrue && sawNull {
+		// The op is EQ and all non-NULL elements are equal, but we saw at least
+		// one NULL element. Since NULL comparisons are treated as unknown, the
+		// result of the comparison becomes unknown (NULL).
+		return DNull
+	}
+	return b
 }
 
-func makeEvalTupleIn(typ types.T) CmpOp {
-	return CmpOp{
+func makeEvalTupleIn(typ *types.T) *CmpOp {
+	return &CmpOp{
 		LeftType:  typ,
-		RightType: types.FamTuple,
-		fn: func(ctx *EvalContext, arg, values Datum) (Datum, error) {
-			if arg == DNull {
+		RightType: types.AnyTuple,
+		Fn: func(ctx *EvalContext, arg, values Datum) (Datum, error) {
+			vtuple := values.(*DTuple)
+			// If the tuple was sorted during normalization, we can perform an
+			// efficient binary search to find if the arg is in the tuple (as
+			// long as the arg doesn't contain any NULLs).
+			if len(vtuple.D) == 0 {
+				// If the rhs tuple is empty, the result is always false (even if arg is
+				// or contains NULL).
 				return DBoolFalse, nil
 			}
-
-			// If the tuple was sorted during normalization, we can perform
-			// an efficient binary search to find if the arg is in the tuple.
-			vtuple := values.(*DTuple)
-			if vtuple.Sorted {
-				_, found := vtuple.SearchSorted(ctx, arg)
-				if !found && len(vtuple.D) > 0 && vtuple.D[0] == DNull {
-					// If the tuple contained any null elements and no matches are found,
-					// the result of IN will be null. The null element will at the front
-					// if the tuple is sorted because null is less than any non-null value.
-					return DNull, nil
-				}
-				return MakeDBool(DBool(found)), nil
+			if arg == DNull {
+				return DNull, nil
+			}
+			argTuple, argIsTuple := arg.(*DTuple)
+			if vtuple.Sorted() && !(argIsTuple && argTuple.ContainsNull()) {
+				// The right-hand tuple is already sorted and contains no NULLs, and the
+				// left side is not NULL (e.g. `NULL IN (1, 2)`) or a tuple that
+				// contains NULL (e.g. `(1, NULL) IN ((1, 2), (3, 4))`).
+				//
+				// We can use binary search to make a determination in this case. This
+				// is the common case when tuples don't contain NULLs.
+				_, result := vtuple.SearchSorted(ctx, arg)
+				return MakeDBool(DBool(result)), nil
 			}
 
-			// If the tuple was not sorted, which happens in cases where it
-			// is not constant across rows, then we must fall back to iterating
-			// through the entire tuple.
 			sawNull := false
-			for _, val := range vtuple.D {
-				if val == DNull {
-					sawNull = true
-				} else if val.Compare(ctx, arg) == 0 {
-					return DBoolTrue, nil
+			if !argIsTuple {
+				// The left-hand side is not a tuple, e.g. `1 IN (1, 2)`.
+				for _, val := range vtuple.D {
+					if val == DNull {
+						sawNull = true
+					} else if val.Compare(ctx, arg) == 0 {
+						return DBoolTrue, nil
+					}
+				}
+			} else {
+				// The left-hand side is a tuple, e.g. `(1, 2) IN ((1, 2), (3, 4))`.
+				for _, val := range vtuple.D {
+					if val == DNull {
+						// We allow for a null value to be in the list of tuples, so we
+						// need to check that upfront.
+						sawNull = true
+					} else {
+						// Use the EQ function which properly handles NULLs.
+						if res := cmpOpTupleFn(ctx, *argTuple, *val.(*DTuple), EQ); res == DNull {
+							sawNull = true
+						} else if res == DBoolTrue {
+							return DBoolTrue, nil
+						}
+					}
 				}
 			}
 			if sawNull {
-				// If the tuple contains any null elements and no matches are found, the
-				// result of IN will be null.
 				return DNull, nil
 			}
 			return DBoolFalse, nil
 		},
+		NullableArgs: true,
 	}
 }
 
@@ -1815,14 +2430,14 @@ func makeEvalTupleIn(typ types.T) CmpOp {
 //   ANY/SOME: no comparisons evaluate to true
 //   ALL: no comparisons evaluate to false
 //
-// For example, given 1 < ANY (SELECT * FROM GENERATE_SERIES(1,3))
+// For example, given 1 < ANY (SELECT * FROM generate_series(1,3))
 // (right is a DTuple), evalTupleCmp would be called with:
 //   evalDatumsCmp(ctx, LT, Any, CmpOp(LT, leftType, rightParamType), leftDatum, rightTuple.D).
 // Similarly, given 1 < ANY (ARRAY[1, 2, 3]) (right is a DArray),
 // evalArrayCmp would be called with:
 //   evalDatumsCmp(ctx, LT, Any, CmpOp(LT, leftType, rightParamType), leftDatum, rightArray.Array).
 func evalDatumsCmp(
-	ctx *EvalContext, op, subOp ComparisonOperator, fn CmpOp, left Datum, right Datums,
+	ctx *EvalContext, op, subOp ComparisonOperator, fn *CmpOp, left Datum, right Datums,
 ) (Datum, error) {
 	all := op == All
 	any := !all
@@ -1834,7 +2449,7 @@ func evalDatumsCmp(
 		}
 
 		_, newLeft, newRight, _, not := foldComparisonExpr(subOp, left, elem)
-		d, err := fn.fn(ctx, newLeft.(Datum), newRight.(Datum))
+		d, err := fn.Fn(ctx, newLeft.(Datum), newRight.(Datum))
 		if err != nil {
 			return nil, err
 		}
@@ -1866,24 +2481,100 @@ func evalDatumsCmp(
 	return DBoolFalse, nil
 }
 
-func matchLike(ctx *EvalContext, left, right Datum, caseInsensitive bool) (Datum, error) {
-	pattern := string(MustBeDString(right))
-	like, err := optimizedLikeFunc(pattern, caseInsensitive)
+// MatchLikeEscape matches 'unescaped' with 'pattern' using custom escape character 'escape' which
+// must be either empty (which disables the escape mechanism) or a single unicode character.
+func MatchLikeEscape(
+	ctx *EvalContext, unescaped, pattern, escape string, caseInsensitive bool,
+) (Datum, error) {
+	var escapeRune rune
+	if len(escape) > 0 {
+		var width int
+		escapeRune, width = utf8.DecodeRuneInString(escape)
+		if len(escape) > width {
+			return DBoolFalse, pgerror.Newf(pgcode.InvalidEscapeSequence, "invalid escape string")
+		}
+	}
+
+	if len(unescaped) == 0 {
+		// An empty string only matches with an empty pattern or a pattern
+		// consisting only of '%' (if this wildcard is not used as a custom escape
+		// character). To match PostgreSQL's behavior, we have a special handling
+		// of this case.
+		for _, c := range pattern {
+			if c != '%' || (c == '%' && escape == `%`) {
+				return DBoolFalse, nil
+			}
+		}
+		return DBoolTrue, nil
+	}
+
+	like, err := optimizedLikeFunc(pattern, caseInsensitive, escapeRune)
 	if err != nil {
-		return DBoolFalse, pgerror.NewErrorf(
-			pgerror.CodeInvalidRegularExpressionError, "LIKE regexp compilation failed: %v", err)
+		return DBoolFalse, pgerror.Newf(
+			pgcode.InvalidRegularExpression, "LIKE regexp compilation failed: %v", err)
 	}
 
 	if like == nil {
-		key := likeKey{s: pattern, caseInsensitive: caseInsensitive}
-		re, err := ctx.ReCache.GetRegexp(key)
+		re, err := ConvertLikeToRegexp(ctx, pattern, caseInsensitive, escapeRune)
 		if err != nil {
-			return DBoolFalse, pgerror.NewErrorf(
-				pgerror.CodeInvalidRegularExpressionError, "LIKE regexp compilation failed: %v", err)
+			return DBoolFalse, err
 		}
-		like = re.MatchString
+		like = func(s string) (bool, error) {
+			return re.MatchString(s), nil
+		}
 	}
-	return MakeDBool(DBool(like(string(MustBeDString(left))))), nil
+	matches, err := like(unescaped)
+	return MakeDBool(DBool(matches)), err
+}
+
+// ConvertLikeToRegexp compiles the specified LIKE pattern as an equivalent
+// regular expression.
+func ConvertLikeToRegexp(
+	ctx *EvalContext, pattern string, caseInsensitive bool, escape rune,
+) (*regexp.Regexp, error) {
+	key := likeKey{s: pattern, caseInsensitive: caseInsensitive, escape: escape}
+	re, err := ctx.ReCache.GetRegexp(key)
+	if err != nil {
+		return nil, pgerror.Newf(
+			pgcode.InvalidRegularExpression, "LIKE regexp compilation failed: %v", err)
+	}
+	return re, nil
+}
+
+func matchLike(ctx *EvalContext, left, right Datum, caseInsensitive bool) (Datum, error) {
+	if left == DNull || right == DNull {
+		return DNull, nil
+	}
+	s, pattern := string(MustBeDString(left)), string(MustBeDString(right))
+	if len(s) == 0 {
+		// An empty string only matches with an empty pattern or a pattern
+		// consisting only of '%'. To match PostgreSQL's behavior, we have a
+		// special handling of this case.
+		for _, c := range pattern {
+			if c != '%' {
+				return DBoolFalse, nil
+			}
+		}
+		return DBoolTrue, nil
+	}
+
+	like, err := optimizedLikeFunc(pattern, caseInsensitive, '\\')
+	if err != nil {
+		return DBoolFalse, pgerror.Newf(
+			pgcode.InvalidRegularExpression, "LIKE regexp compilation failed: %v", err)
+	}
+
+	if like == nil {
+		re, err := ConvertLikeToRegexp(ctx, pattern, caseInsensitive, '\\')
+		if err != nil {
+			return DBoolFalse, err
+		}
+		like = func(s string) (bool, error) {
+			return re.MatchString(s), nil
+		}
+	}
+	matches, err := like(s)
+	return MakeDBool(DBool(matches)), err
 }
 
 func matchRegexpWithKey(ctx *EvalContext, str Datum, key RegexpCacheKey) (Datum, error) {
@@ -1904,26 +2595,110 @@ func (e *MultipleResultsError) Error() string {
 	return fmt.Sprintf("%s: unexpected multiple results", e.SQL)
 }
 
-// EvalPlanner is a limited planner that can be used from EvalContext.
-type EvalPlanner interface {
-	// QueryRow executes a SQL query string where exactly 1 result row is
-	// expected and returns that row.
-	QueryRow(ctx context.Context, sql string, args ...interface{}) (Datums, error)
-
-	// QualifyWithDatabase resolves a possibly unqualified table name into a
-	// normalized table name that is qualified by database.
-	QualifyWithDatabase(ctx context.Context, t *NormalizableTableName) (*TableName, error)
-
+// EvalDatabase consists of functions that reference the session database
+// and is to be used from EvalContext.
+type EvalDatabase interface {
 	// ParseQualifiedTableName parses a SQL string of the form
-	// `[ database_name . ] table_name [ @ index_name ]`.
+	// `[ database_name . ] [ schema_name . ] table_name`.
+	// NB: this is deprecated! Use parser.ParseQualifiedTableName when possible.
+	ParseQualifiedTableName(sql string) (*TableName, error)
+
+	// ResolveTableName expands the given table name and
+	// makes it point to a valid object.
 	// If the database name is not given, it uses the search path to find it, and
 	// sets it on the returned TableName.
-	// It returns an error if the table doesn't exist.
-	ParseQualifiedTableName(ctx context.Context, sql string) (*TableName, error)
+	// It returns the ID of the resolved table, and an error if the table doesn't exist.
+	ResolveTableName(ctx context.Context, tn *TableName) (ID, error)
 
+	// LookupSchema looks up the schema with the given name in the given
+	// database.
+	LookupSchema(ctx context.Context, dbName, scName string) (found bool, scMeta SchemaMeta, err error)
+}
+
+// EvalPlanner is a limited planner that can be used from EvalContext.
+type EvalPlanner interface {
+	EvalDatabase
 	// ParseType parses a column type.
-	ParseType(sql string) (coltypes.CastTargetType, error)
+	ParseType(sql string) (*types.T, error)
 
+	// EvalSubquery returns the Datum for the given subquery node.
+	EvalSubquery(expr *Subquery) (Datum, error)
+}
+
+// EvalSessionAccessor is a limited interface to access session variables.
+type EvalSessionAccessor interface {
+	// SetConfig sets a session variable to a new value.
+	//
+	// This interface only supports strings as this is sufficient for
+	// pg_catalog.set_config().
+	SetSessionVar(ctx context.Context, settingName, newValue string) error
+
+	// GetSessionVar retrieves the current value of a session variable.
+	GetSessionVar(ctx context.Context, settingName string, missingOk bool) (bool, string, error)
+
+	// HasAdminRole returns true iff the current session user has the admin role.
+	HasAdminRole(ctx context.Context) (bool, error)
+}
+
+// ClientNoticeSender is a limited interface to send notices to the
+// client.
+//
+// TODO(knz): as of this writing, the implementations of this
+// interface only work on the gateway node (i.e. not from
+// distributed processors).
+type ClientNoticeSender interface {
+	// SendClientNotice sends a notice out-of-band to the client.
+	SendClientNotice(ctx context.Context, notice error)
+}
+
+// InternalExecutor is a subset of sqlutil.InternalExecutor (which, in turn, is
+// implemented by sql.InternalExecutor) used by this sem/tree package which
+// can't even import sqlutil.
+//
+// Note that the functions offered here should be avoided when possible. They
+// execute the query as root if an user hadn't been previously set on the
+// executor through SetSessionData(). These functions are deprecated in
+// sql.InternalExecutor in favor of a safer interface. Unfortunately, those
+// safer functions cannot be exposed through this interface because they depend
+// on sqlbase, and this package cannot import sqlbase. When possible, downcast
+// this to sqlutil.InternalExecutor or sql.InternalExecutor, and use the
+// alternatives.
+type InternalExecutor interface {
+	// Query is part of the sqlutil.InternalExecutor interface.
+	Query(
+		ctx context.Context, opName string, txn *kv.Txn,
+		stmt string, qargs ...interface{},
+	) ([]Datums, error)
+
+	// QueryRow is part of the sqlutil.InternalExecutor interface.
+	QueryRow(
+		ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
+	) (Datums, error)
+}
+
+// PrivilegedAccessor gives access to certain queries that would otherwise
+// require someone with RootUser access to query a given data source.
+// It is defined independently to prevent a circular dependency on sql, tree and sqlbase.
+type PrivilegedAccessor interface {
+	// LookupNamespaceID returns the id of the namespace given it's parent id and name.
+	// It is meant as a replacement for looking up the system.namespace directly.
+	// Returns the id, a bool representing whether the namespace exists, and an error
+	// if there is one.
+	LookupNamespaceID(
+		ctx context.Context, parentID int64, name string,
+	) (DInt, bool, error)
+
+	// LookupZoneConfig returns the zone config given a namespace id.
+	// It is meant as a replacement for looking up system.zones directly.
+	// Returns the config byte array, a bool representing whether the namespace exists,
+	// and an error if there is one.
+	LookupZoneConfigByNamespaceID(ctx context.Context, id int64) (DBytes, bool, error)
+}
+
+// SequenceOperators is used for various sql related functions that can
+// be used from EvalContext.
+type SequenceOperators interface {
+	EvalDatabase
 	// IncrementSequence increments the given sequence and returns the result.
 	// It returns an error if the given name is not a sequence.
 	// The caller must ensure that seqName is fully qualified already.
@@ -1933,29 +2708,12 @@ type EvalPlanner interface {
 	// nextval() for the given sequence in this session.
 	GetLatestValueInSessionForSequence(ctx context.Context, seqName *TableName) (int64, error)
 
-	// GetLastSequenceValue returns the last sequence value obtained with nextval()
-	// in the current session.
-	GetLastSequenceValue(ctx context.Context) (int64, error)
-
 	// SetSequenceValue sets the sequence's value.
-	SetSequenceValue(ctx context.Context, seqName *TableName, newVal int64) error
+	// If isCalled is false, the sequence is set such that the next time nextval() is called,
+	// `newVal` is returned. Otherwise, the next call to nextval will return
+	// `newVal + seqOpts.Increment`.
+	SetSequenceValue(ctx context.Context, seqName *TableName, newVal int64, isCalled bool) error
 }
-
-// CtxProvider is anything that can return a Context.
-type CtxProvider interface {
-	// Ctx returns this provider's context.
-	Ctx() context.Context
-}
-
-// backgroundCtxProvider returns the background context.
-type backgroundCtxProvider struct{}
-
-// Ctx implements CtxProvider.
-func (s backgroundCtxProvider) Ctx() context.Context {
-	return context.Background()
-}
-
-var _ CtxProvider = backgroundCtxProvider{}
 
 // EvalContextTestingKnobs contains test knobs.
 type EvalContextTestingKnobs struct {
@@ -1971,6 +2729,15 @@ type EvalContextTestingKnobs struct {
 	// evaluations should assert that the returned Datum matches the
 	// expected ReturnType of the function.
 	AssertBinaryExprReturnTypes bool
+	// DisableOptimizerRuleProbability is the probability that any given
+	// transformation rule in the optimizer is disabled.
+	DisableOptimizerRuleProbability float64
+	// OptimizerCostPerturbation is used to randomly perturb the estimated
+	// cost of each expression in the query tree for the purpose of creating
+	// alternate query plans in the optimizer.
+	OptimizerCostPerturbation float64
+
+	CallbackGenerators map[string]*CallbackValueGenerator
 }
 
 var _ base.ModuleTestingKnobs = &EvalContextTestingKnobs{}
@@ -1981,13 +2748,41 @@ func (*EvalContextTestingKnobs) ModuleTestingKnobs() {}
 // EvalContext defines the context in which to evaluate an expression, allowing
 // the retrieval of state such as the node ID or statement start time.
 //
-// ATTENTION: Fields from this struct are also represented in
-// distsqlrun.EvalContext. Make sure to keep the two in sync.
+// ATTENTION: Some fields from this struct (particularly, but not exclusively,
+// from SessionData) are also represented in execinfrapb.EvalContext. Whenever
+// something that affects DistSQL execution is added, it needs to be marshaled
+// through that proto too.
 // TODO(andrei): remove or limit the duplication.
+//
+// NOTE(andrei): EvalContext is dusty; it started as a collection of fields
+// needed by expression evaluation, but it has grown quite large; some of the
+// things in it don't seem to belong in this low-level package (e.g. Planner).
+// In the sql package it is embedded by extendedEvalContext, which adds some
+// more fields from the sql package. Through that extendedEvalContext, this
+// struct now generally used by planNodes.
 type EvalContext struct {
-	Settings  *cluster.Settings
-	ClusterID uuid.UUID
-	NodeID    roachpb.NodeID
+	// Session variables. This is a read-only copy of the values owned by the
+	// Session.
+	SessionData *sessiondata.SessionData
+	// TxnState is a string representation of the current transactional state.
+	TxnState string
+	// TxnReadOnly specifies if the current transaction is read-only.
+	TxnReadOnly bool
+	TxnImplicit bool
+
+	Settings    *cluster.Settings
+	ClusterID   uuid.UUID
+	NodeID      roachpb.NodeID
+	ClusterName string
+
+	// Locality contains the location of the current node as a set of user-defined
+	// key/value pairs, ordered from most inclusive to least inclusive. If there
+	// are no tiers, then the node's location is not known. Example:
+	//
+	//   [region=us,dc=east]
+	//
+	Locality roachpb.Locality
+
 	// The statement timestamp. May be different for every statement.
 	// Used for statement_timestamp().
 	StmtTimestamp time.Time
@@ -1995,19 +2790,6 @@ type EvalContext struct {
 	// of a transaction. Used for now(), current_timestamp(),
 	// transaction_timestamp() and the like.
 	TxnTimestamp time.Time
-	// The cluster timestamp. Needs to be stable for the lifetime of the
-	// transaction. Used for cluster_logical_timestamp().
-	clusterTimestamp hlc.Timestamp
-	// Location references the *Location on the current Session.
-	Location **time.Location
-	// Database is the database in the current Session.
-	Database string
-	// User is the user in the current Session.
-	User string
-	// SearchPath is the search path for databases used when encountering an
-	// unqualified table name. Names in the search path are normalized already.
-	// This must not be modified (this is shared from the session).
-	SearchPath SearchPath
 
 	// Placeholders relates placeholder names to their type and, later, value.
 	// This pointer should always be set to the location of the PlaceholderInfo
@@ -2016,21 +2798,42 @@ type EvalContext struct {
 	// underlying datum, if available.
 	Placeholders *PlaceholderInfo
 
-	IVarHelper *IndexedVarHelper
+	// Annotations augments the AST with extra information. This pointer should
+	// always be set to the location of the Annotations in the corresponding
+	// SemaContext.
+	Annotations *Annotations
 
-	// CtxProvider holds the context in which the expression is evaluated. This
-	// will point to the session, which is itself a provider of contexts.
-	// NOTE: seems a bit lazy to hold a pointer to the session's context here,
-	// instead of making sure the right context is explicitly set before the
-	// EvalContext is used. But there's already precedent with the Location field,
-	// and also at the time of writing, EvalContexts are initialized with the
-	// planner and not mutated.
-	CtxProvider CtxProvider
+	// IVarContainer is used to evaluate IndexedVars.
+	IVarContainer IndexedVarContainer
+	// iVarContainerStack is used when we swap out IVarContainers in order to
+	// evaluate an intermediate expression. This keeps track of those which we
+	// need to restore once we finish evaluating it.
+	iVarContainerStack []IndexedVarContainer
+
+	// Context holds the context in which the expression is evaluated.
+	Context context.Context
+
+	// InternalExecutor gives access to an executor to be used for running
+	// "internal" statements. It may seem bizarre that "expression evaluation" may
+	// need to run a statement, and yet many builtin functions do it.
+	// Note that the executor will be "session-bound" - it will inherit session
+	// variables from a parent session.
+	InternalExecutor InternalExecutor
 
 	Planner EvalPlanner
 
-	// Ths transaction in which the statement is executing.
-	Txn *client.Txn
+	PrivilegedAccessor PrivilegedAccessor
+
+	SessionAccessor EvalSessionAccessor
+
+	ClientNoticeSender ClientNoticeSender
+
+	Sequence SequenceOperators
+
+	// The transaction in which the statement is executing.
+	Txn *kv.Txn
+	// A handle to the database.
+	DB *kv.DB
 
 	ReCache *RegexpCache
 	tmpDec  apd.Decimal
@@ -2044,21 +2847,15 @@ type EvalContext struct {
 	// EXPLAIN(TYPES[, NORMALIZE]).
 	SkipNormalize bool
 
-	collationEnv CollationEnvironment
+	CollationEnv CollationEnvironment
 
 	TestingKnobs EvalContextTestingKnobs
 
 	Mon *mon.BytesMonitor
-
-	// ActiveMemAcc is the account to which values are allocated during
-	// evaluation. It can change over the course of evaluation, such as on a
-	// per-row basis.
-	ActiveMemAcc *mon.BoundAccount
 }
 
 // MakeTestingEvalContext returns an EvalContext that includes a MemoryMonitor.
-func MakeTestingEvalContext() EvalContext {
-	ctx := EvalContext{}
+func MakeTestingEvalContext(st *cluster.Settings) EvalContext {
 	monitor := mon.MakeMonitor(
 		"test-monitor",
 		mon.MemoryResource,
@@ -2066,23 +2863,56 @@ func MakeTestingEvalContext() EvalContext {
 		nil,           /* maxHist */
 		-1,            /* increment */
 		math.MaxInt64, /* noteworthy */
+		st,
 	)
-	monitor.Start(context.Background(), nil, mon.MakeStandaloneBudget(math.MaxInt64))
-	ctx.Mon = &monitor
-	ctx.CtxProvider = backgroundCtxProvider{}
-	acc := monitor.MakeBoundAccount()
-	ctx.ActiveMemAcc = &acc
+	return MakeTestingEvalContextWithMon(st, &monitor)
+}
+
+// MakeTestingEvalContextWithMon returns an EvalContext with the given
+// MemoryMonitor. Ownership of the memory monitor is transferred to the
+// EvalContext so do not start or close the memory monitor.
+func MakeTestingEvalContextWithMon(st *cluster.Settings, monitor *mon.BytesMonitor) EvalContext {
+	ctx := EvalContext{
+		Txn:         &kv.Txn{},
+		SessionData: &sessiondata.SessionData{},
+		Settings:    st,
+	}
+	monitor.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	ctx.Mon = monitor
+	ctx.Context = context.TODO()
 	now := timeutil.Now()
 	ctx.SetTxnTimestamp(now)
 	ctx.SetStmtTimestamp(now)
-	ctx.SetClusterTimestamp(hlc.Timestamp{WallTime: now.Unix()})
 	return ctx
+}
+
+// Copy returns a deep copy of ctx.
+func (ctx *EvalContext) Copy() *EvalContext {
+	ctxCopy := *ctx
+	ctxCopy.iVarContainerStack = make([]IndexedVarContainer, len(ctx.iVarContainerStack), cap(ctx.iVarContainerStack))
+	copy(ctxCopy.iVarContainerStack, ctx.iVarContainerStack)
+	return &ctxCopy
+}
+
+// PushIVarContainer replaces the current IVarContainer with a different one -
+// pushing the current one onto a stack to be replaced later once
+// PopIVarContainer is called.
+func (ctx *EvalContext) PushIVarContainer(c IndexedVarContainer) {
+	ctx.iVarContainerStack = append(ctx.iVarContainerStack, ctx.IVarContainer)
+	ctx.IVarContainer = c
+}
+
+// PopIVarContainer discards the current IVarContainer on the EvalContext,
+// replacing it with an older one.
+func (ctx *EvalContext) PopIVarContainer() {
+	ctx.IVarContainer = ctx.iVarContainerStack[len(ctx.iVarContainerStack)-1]
+	ctx.iVarContainerStack = ctx.iVarContainerStack[:len(ctx.iVarContainerStack)-1]
 }
 
 // NewTestingEvalContext is a convenience version of MakeTestingEvalContext
 // that returns a pointer.
-func NewTestingEvalContext() *EvalContext {
-	ctx := MakeTestingEvalContext()
+func NewTestingEvalContext(st *cluster.Settings) *EvalContext {
+	ctx := MakeTestingEvalContext(st)
 	return &ctx
 }
 
@@ -2097,7 +2927,7 @@ func (ctx *EvalContext) GetStmtTimestamp() time.Time {
 	// TODO(knz): a zero timestamp should never be read, even during
 	// Prepare. This will need to be addressed.
 	if !ctx.PrepareOnly && ctx.StmtTimestamp.IsZero() {
-		panic("zero statement timestamp in EvalContext")
+		panic(errors.AssertionFailedf("zero statement timestamp in EvalContext"))
 	}
 	return ctx.StmtTimestamp
 }
@@ -2105,22 +2935,11 @@ func (ctx *EvalContext) GetStmtTimestamp() time.Time {
 // GetClusterTimestamp retrieves the current cluster timestamp as per
 // the evaluation context. The timestamp is guaranteed to be nonzero.
 func (ctx *EvalContext) GetClusterTimestamp() *DDecimal {
-	// TODO(knz): a zero timestamp should never be read, even during
-	// Prepare. This will need to be addressed.
-	if !ctx.PrepareOnly && ctx.clusterTimestamp == (hlc.Timestamp{}) {
-		panic("zero cluster timestamp in EvalContext")
+	ts := ctx.Txn.CommitTimestamp()
+	if ts == (hlc.Timestamp{}) {
+		panic(errors.AssertionFailedf("zero cluster timestamp in txn"))
 	}
-
-	return TimestampToDecimal(ctx.clusterTimestamp)
-}
-
-// GetClusterTimestampRaw exposes the clusterTimestamp field. Also see
-// GetClusterTimestamp().
-func (ctx *EvalContext) GetClusterTimestampRaw() hlc.Timestamp {
-	if !ctx.PrepareOnly && ctx.clusterTimestamp == (hlc.Timestamp{}) {
-		panic("zero cluster timestamp in EvalContext")
-	}
-	return ctx.clusterTimestamp
+	return TimestampToDecimal(ts)
 }
 
 // HasPlaceholders returns true if this EvalContext's placeholders have been
@@ -2148,15 +2967,31 @@ func TimestampToDecimal(ts hlc.Timestamp) *DDecimal {
 	return &res
 }
 
+// TimestampToInexactDTimestamp converts the logical timestamp into an
+// inexact DTimestamp by dropping the logical counter and using the wall
+// time at the microsecond precision.
+func TimestampToInexactDTimestamp(ts hlc.Timestamp) *DTimestamp {
+	return MakeDTimestamp(timeutil.Unix(0, ts.WallTime), time.Microsecond)
+}
+
+// GetRelativeParseTime implements ParseTimeContext.
+func (ctx *EvalContext) GetRelativeParseTime() time.Time {
+	ret := ctx.TxnTimestamp
+	if ret.IsZero() {
+		ret = timeutil.Now()
+	}
+	return ret.In(ctx.GetLocation())
+}
+
 // GetTxnTimestamp retrieves the current transaction timestamp as per
 // the evaluation context. The timestamp is guaranteed to be nonzero.
 func (ctx *EvalContext) GetTxnTimestamp(precision time.Duration) *DTimestampTZ {
 	// TODO(knz): a zero timestamp should never be read, even during
 	// Prepare. This will need to be addressed.
 	if !ctx.PrepareOnly && ctx.TxnTimestamp.IsZero() {
-		panic("zero transaction timestamp in EvalContext")
+		panic(errors.AssertionFailedf("zero transaction timestamp in EvalContext"))
 	}
-	return MakeDTimestampTZ(ctx.TxnTimestamp, precision)
+	return MakeDTimestampTZ(ctx.GetRelativeParseTime(), precision)
 }
 
 // GetTxnTimestampNoZone retrieves the current transaction timestamp as per
@@ -2165,18 +3000,34 @@ func (ctx *EvalContext) GetTxnTimestampNoZone(precision time.Duration) *DTimesta
 	// TODO(knz): a zero timestamp should never be read, even during
 	// Prepare. This will need to be addressed.
 	if !ctx.PrepareOnly && ctx.TxnTimestamp.IsZero() {
-		panic("zero transaction timestamp in EvalContext")
+		panic(errors.AssertionFailedf("zero transaction timestamp in EvalContext"))
 	}
-	return MakeDTimestamp(ctx.TxnTimestamp, precision)
+	// Move the time to UTC, but keeping the location's time.
+	t := ctx.GetRelativeParseTime()
+	_, offsetSecs := t.Zone()
+	return MakeDTimestamp(t.Add(time.Second*time.Duration(offsetSecs)).In(time.UTC), precision)
 }
 
-// GetTxnTimestampRaw exposes the txnTimestamp field. Also see GetTxnTimestamp()
-// and GetTxnTimestampNoZone().
-func (ctx *EvalContext) GetTxnTimestampRaw() time.Time {
+// GetTxnTime retrieves the current transaction time as per
+// the evaluation context.
+func (ctx *EvalContext) GetTxnTime(precision time.Duration) *DTimeTZ {
+	// TODO(knz): a zero timestamp should never be read, even during
+	// Prepare. This will need to be addressed.
 	if !ctx.PrepareOnly && ctx.TxnTimestamp.IsZero() {
-		panic("zero transaction timestamp in EvalContext")
+		panic(errors.AssertionFailedf("zero transaction timestamp in EvalContext"))
 	}
-	return ctx.TxnTimestamp
+	return NewDTimeTZFromTime(ctx.GetRelativeParseTime().Round(precision))
+}
+
+// GetTxnTimeNoZone retrieves the current transaction time as per
+// the evaluation context.
+func (ctx *EvalContext) GetTxnTimeNoZone(precision time.Duration) *DTime {
+	// TODO(knz): a zero timestamp should never be read, even during
+	// Prepare. This will need to be addressed.
+	if !ctx.PrepareOnly && ctx.TxnTimestamp.IsZero() {
+		panic(errors.AssertionFailedf("zero transaction timestamp in EvalContext"))
+	}
+	return MakeDTime(timeofday.FromTime(ctx.GetRelativeParseTime().Round(precision)))
 }
 
 // SetTxnTimestamp sets the corresponding timestamp in the EvalContext.
@@ -2189,22 +3040,17 @@ func (ctx *EvalContext) SetStmtTimestamp(ts time.Time) {
 	ctx.StmtTimestamp = ts
 }
 
-// SetClusterTimestamp sets the corresponding timestamp in the EvalContext.
-func (ctx *EvalContext) SetClusterTimestamp(ts hlc.Timestamp) {
-	ctx.clusterTimestamp = ts
-}
-
 // GetLocation returns the session timezone.
 func (ctx *EvalContext) GetLocation() *time.Location {
-	if ctx.Location == nil || *ctx.Location == nil {
+	if ctx.SessionData == nil || ctx.SessionData.DataConversion.Location == nil {
 		return time.UTC
 	}
-	return *ctx.Location
+	return ctx.SessionData.DataConversion.Location
 }
 
 // Ctx returns the session's context.
 func (ctx *EvalContext) Ctx() context.Context {
-	return ctx.CtxProvider.Ctx()
+	return ctx.Context
 }
 
 func (ctx *EvalContext) getTmpDec() *apd.Decimal {
@@ -2245,23 +3091,24 @@ func (expr *BinaryExpr) Eval(ctx *EvalContext) (Datum, error) {
 	if err != nil {
 		return nil, err
 	}
-	if left == DNull && !expr.fn.nullableArgs {
+	if left == DNull && !expr.fn.NullableArgs {
 		return DNull, nil
 	}
 	right, err := expr.Right.(TypedExpr).Eval(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if right == DNull && !expr.fn.nullableArgs {
+	if right == DNull && !expr.fn.NullableArgs {
 		return DNull, nil
 	}
-	res, err := expr.fn.fn(ctx, left, right)
+	res, err := expr.fn.Fn(ctx, left, right)
 	if err != nil {
 		return nil, err
 	}
 	if ctx.TestingKnobs.AssertBinaryExprReturnTypes {
 		if err := ensureExpectedType(expr.fn.ReturnType, res); err != nil {
-			return nil, errors.Wrapf(err, "binary op %q", expr.String())
+			return nil, errors.NewAssertionErrorWithWrappedErrf(err,
+				"binary op %q", expr)
 		}
 	}
 	return res, err
@@ -2330,29 +3177,29 @@ type regTypeInfo struct {
 	errType string
 }
 
-// regTypeInfos maps an coltypes.TOid to a regTypeInfo that describes the
-// pg_catalog table that contains the entities of the type of the key.
-var regTypeInfos = map[*coltypes.TOid]regTypeInfo{
-	coltypes.RegClass:     {"pg_class", "relname", "relation", pgerror.CodeUndefinedTableError},
-	coltypes.RegType:      {"pg_type", "typname", "type", pgerror.CodeUndefinedObjectError},
-	coltypes.RegProc:      {"pg_proc", "proname", "function", pgerror.CodeUndefinedFunctionError},
-	coltypes.RegProcedure: {"pg_proc", "proname", "function", pgerror.CodeUndefinedFunctionError},
-	coltypes.RegNamespace: {"pg_namespace", "nspname", "namespace", pgerror.CodeUndefinedObjectError},
+// regTypeInfos maps an oid.Oid to a regTypeInfo that describes the pg_catalog
+// table that contains the entities of the type of the key.
+var regTypeInfos = map[oid.Oid]regTypeInfo{
+	oid.T_regclass:     {"pg_class", "relname", "relation", pgcode.UndefinedTable},
+	oid.T_regtype:      {"pg_type", "typname", "type", pgcode.UndefinedObject},
+	oid.T_regproc:      {"pg_proc", "proname", "function", pgcode.UndefinedFunction},
+	oid.T_regprocedure: {"pg_proc", "proname", "function", pgcode.UndefinedFunction},
+	oid.T_regnamespace: {"pg_namespace", "nspname", "namespace", pgcode.UndefinedObject},
 }
 
 // queryOidWithJoin looks up the name or OID of an input OID or string in the
-// pg_catalog table that the input coltypes.TOid belongs to. If the input Datum
+// pg_catalog table that the input oid.Oid belongs to. If the input Datum
 // is a DOid, the relevant table will be queried by OID; if the input is a
 // DString, the table will be queried by its name column.
 //
-// The return value is a fresh DOid of the input coltypes.TOid with name and OID
+// The return value is a fresh DOid of the input oid.Oid with name and OID
 // set to the result of the query. If there was not exactly one result to the
 // query, an error will be returned.
 func queryOidWithJoin(
-	ctx *EvalContext, typ *coltypes.TOid, d Datum, joinClause string, additionalWhere string,
+	ctx *EvalContext, typ *types.T, d Datum, joinClause string, additionalWhere string,
 ) (*DOid, error) {
 	ret := &DOid{semanticType: typ}
-	info := regTypeInfos[typ]
+	info := regTypeInfos[typ.Oid()]
 	var queryCol string
 	switch d.(type) {
 	case *DOid:
@@ -2360,30 +3207,31 @@ func queryOidWithJoin(
 	case *DString:
 		queryCol = info.nameCol
 	default:
-		panic(fmt.Sprintf("invalid argument to OID cast: %s", d))
+		return nil, errors.AssertionFailedf("invalid argument to OID cast: %s", d)
 	}
-	results, err := ctx.Planner.QueryRow(
-		ctx.Ctx(),
+	results, err := ctx.InternalExecutor.QueryRow(
+		ctx.Ctx(), "queryOidWithJoin",
+		ctx.Txn,
 		fmt.Sprintf(
 			"SELECT %s.oid, %s FROM pg_catalog.%s %s WHERE %s = $1 %s",
 			info.tableName, info.nameCol, info.tableName, joinClause, queryCol, additionalWhere),
 		d)
 	if err != nil {
-		if _, ok := err.(*MultipleResultsError); ok {
-			return nil, pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+		if _, ok := errors.UnwrapAll(err).(*MultipleResultsError); ok {
+			return nil, pgerror.Newf(pgcode.AmbiguousAlias,
 				"more than one %s named %s", info.objName, d)
 		}
 		return nil, err
 	}
 	if results.Len() == 0 {
-		return nil, pgerror.NewErrorf(info.errType, "%s %s does not exist", info.objName, d)
+		return nil, pgerror.Newf(info.errType, "%s %s does not exist", info.objName, d)
 	}
 	ret.DInt = results[0].(*DOid).DInt
 	ret.name = AsStringWithFlags(results[1], FmtBareStrings)
 	return ret, nil
 }
 
-func queryOid(ctx *EvalContext, typ *coltypes.TOid, d Datum) (*DOid, error) {
+func queryOid(ctx *EvalContext, typ *types.T, d Datum) (*DOid, error) {
 	return queryOidWithJoin(ctx, typ, d, "", "")
 }
 
@@ -2399,12 +3247,45 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 		return d, nil
 	}
 	d = UnwrapDatum(ctx, d)
-	return performCast(ctx, d, expr.Type)
+	return PerformCast(ctx, d, expr.Type)
 }
 
-func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, error) {
-	switch typ := t.(type) {
-	case *coltypes.TBool:
+// PerformCast performs a cast from the provided Datum to the specified
+// types.T.
+func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
+	switch t.Family() {
+	case types.BitFamily:
+		switch v := d.(type) {
+		case *DBitArray:
+			if t.Width() == 0 || v.BitLen() == uint(t.Width()) {
+				return d, nil
+			}
+			var a DBitArray
+			a.BitArray = v.BitArray.ToWidth(uint(t.Width()))
+			return &a, nil
+		case *DInt:
+			return NewDBitArrayFromInt(int64(*v), uint(t.Width()))
+		case *DString:
+			res, err := bitarray.Parse(string(*v))
+			if err != nil {
+				return nil, err
+			}
+			if t.Width() > 0 {
+				res = res.ToWidth(uint(t.Width()))
+			}
+			return &DBitArray{BitArray: res}, nil
+		case *DCollatedString:
+			res, err := bitarray.Parse(v.Contents)
+			if err != nil {
+				return nil, err
+			}
+			if t.Width() > 0 {
+				res = res.ToWidth(uint(t.Width()))
+			}
+			return &DBitArray{BitArray: res}, nil
+		}
+
+	case types.BoolFamily:
 		switch v := d.(type) {
 		case *DBool:
 			return d, nil
@@ -2420,9 +3301,11 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			return ParseDBool(v.Contents)
 		}
 
-	case *coltypes.TInt:
+	case types.IntFamily:
 		var res *DInt
 		switch v := d.(type) {
+		case *DBitArray:
+			res = v.AsDInt(uint(t.Width()))
 		case *DBool:
 			if *v {
 				res = NewDInt(1)
@@ -2430,6 +3313,7 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 				res = DZero
 			}
 		case *DInt:
+			// TODO(knz): enforce the coltype width here.
 			res = v
 		case *DFloat:
 			f := float64(*v)
@@ -2442,7 +3326,7 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			// is 9223372036854774784 (= float64(math.MaxInt64)-513), and both are
 			// convertible to int without overflow.
 			if math.IsNaN(f) || f <= float64(math.MinInt64) || f >= float64(math.MaxInt64) {
-				return nil, errIntOutOfRange
+				return nil, ErrIntOutOfRange
 			}
 			res = NewDInt(DInt(f))
 		case *DDecimal:
@@ -2453,7 +3337,7 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			}
 			i, err := d.Int64()
 			if err != nil {
-				return nil, errIntOutOfRange
+				return nil, ErrIntOutOfRange
 			}
 			res = NewDInt(DInt(i))
 		case *DString:
@@ -2471,15 +3355,25 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 		case *DTimestampTZ:
 			res = NewDInt(DInt(v.Unix()))
 		case *DDate:
-			res = NewDInt(DInt(int64(*v)))
+			// TODO(mjibson): This cast is unsupported by postgres. Should we remove ours?
+			if !v.IsFinite() {
+				return nil, ErrIntOutOfRange
+			}
+			res = NewDInt(DInt(v.UnixEpochDays()))
 		case *DInterval:
-			res = NewDInt(DInt(v.Nanos / 1000000000))
+			iv, ok := v.AsInt64()
+			if !ok {
+				return nil, ErrIntOutOfRange
+			}
+			res = NewDInt(DInt(iv))
 		case *DOid:
 			res = &v.DInt
 		}
-		return res, nil
+		if res != nil {
+			return res, nil
+		}
 
-	case *coltypes.TFloat:
+	case types.FloatFamily:
 		switch v := d.(type) {
 		case *DBool:
 			if *v {
@@ -2493,7 +3387,7 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 		case *DDecimal:
 			f, err := v.Float64()
 			if err != nil {
-				return nil, errFloatOutOfRange
+				return nil, ErrFloatOutOfRange
 			}
 			return NewDFloat(DFloat(f)), nil
 		case *DString:
@@ -2507,33 +3401,40 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			micros := float64(v.Nanosecond() / int(time.Microsecond))
 			return NewDFloat(DFloat(float64(v.Unix()) + micros*1e-6)), nil
 		case *DDate:
-			return NewDFloat(DFloat(float64(*v))), nil
+			// TODO(mjibson): This cast is unsupported by postgres. Should we remove ours?
+			if !v.IsFinite() {
+				return nil, ErrFloatOutOfRange
+			}
+			return NewDFloat(DFloat(float64(v.UnixEpochDays()))), nil
 		case *DInterval:
-			micros := v.Nanos / 1000
-			return NewDFloat(DFloat(float64(micros) / 1e-6)), nil
+			return NewDFloat(DFloat(v.AsFloat64())), nil
 		}
 
-	case *coltypes.TDecimal:
+	case types.DecimalFamily:
 		var dd DDecimal
 		var err error
 		unset := false
 		switch v := d.(type) {
 		case *DBool:
 			if *v {
-				dd.SetCoefficient(1)
+				dd.SetFinite(1, 0)
 			}
 		case *DInt:
-			dd.SetCoefficient(int64(*v))
+			dd.SetFinite(int64(*v), 0)
 		case *DDate:
-			dd.SetCoefficient(int64(*v))
+			// TODO(mjibson): This cast is unsupported by postgres. Should we remove ours?
+			if !v.IsFinite() {
+				return nil, errDecOutOfRange
+			}
+			dd.SetFinite(v.UnixEpochDays(), 0)
 		case *DFloat:
 			_, err = dd.SetFloat64(float64(*v))
 		case *DDecimal:
 			// Small optimization to avoid copying into dd in normal case.
-			if typ.Prec == 0 {
+			if t.Precision() == 0 {
 				return d, nil
 			}
-			dd = *v
+			dd.Set(&v.Decimal)
 		case *DString:
 			err = dd.SetString(string(*v))
 		case *DCollatedString:
@@ -2553,9 +3454,8 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			val.Add(val, big.NewInt(int64(micros)))
 			dd.Exponent = -6
 		case *DInterval:
-			val := &dd.Coeff
-			val.SetInt64(v.Nanos / 1000)
-			dd.Exponent = -6
+			v.AsBigInt(&dd.Coeff)
+			dd.Exponent = -9
 		default:
 			unset = true
 		}
@@ -2563,17 +3463,32 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			return nil, err
 		}
 		if !unset {
-			err = LimitDecimalWidth(&dd.Decimal, typ.Prec, typ.Scale)
+			err = LimitDecimalWidth(&dd.Decimal, int(t.Precision()), int(t.Scale()))
 			return &dd, err
 		}
 
-	case *coltypes.TString, *coltypes.TCollatedString, *coltypes.TName:
+	case types.StringFamily, types.CollatedStringFamily:
 		var s string
 		switch t := d.(type) {
-		case *DBool, *DInt, *DFloat, *DDecimal, dNull:
+		case *DBitArray:
+			s = t.BitArray.String()
+		case *DFloat:
+			s = strconv.FormatFloat(float64(*t), 'g',
+				ctx.SessionData.DataConversion.GetFloatPrec(), 64)
+		case *DBool, *DInt, *DDecimal:
 			s = d.String()
-		case *DTimestamp, *DTimestampTZ, *DDate, *DTime:
+		case *DTimestamp, *DDate, *DTime, *DTimeTZ:
 			s = AsStringWithFlags(d, FmtBareStrings)
+		case *DTimestampTZ:
+			// Convert to context timezone for correct display.
+			s = AsStringWithFlags(
+				MakeDTimestampTZ(t.In(ctx.GetLocation()), time.Microsecond),
+				FmtBareStrings,
+			)
+		case *DTuple:
+			s = AsStringWithFlags(d, FmtPgwireText)
+		case *DArray:
+			s = AsStringWithFlags(d, FmtPgwireText)
 		case *DInterval:
 			// When converting an interval to string, we need a string representation
 			// of the duration (e.g. "5s") and not of the interval itself (e.g.
@@ -2582,42 +3497,44 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 		case *DUuid:
 			s = t.UUID.String()
 		case *DIPAddr:
-			s = t.String()
+			s = AsStringWithFlags(d, FmtBareStrings)
 		case *DString:
 			s = string(*t)
 		case *DCollatedString:
 			s = t.Contents
 		case *DBytes:
-			var buf bytes.Buffer
-			buf.WriteString("\\x")
-			lex.HexEncodeString(&buf, string(*t))
-			s = buf.String()
+			s = lex.EncodeByteArrayToRawBytes(string(*t),
+				ctx.SessionData.DataConversion.BytesEncodeFormat, false /* skipHexPrefix */)
 		case *DOid:
-			s = t.name
+			s = t.String()
+		case *DJSON:
+			s = t.JSON.String()
 		}
-		switch c := t.(type) {
-		case *coltypes.TString:
-			// If the CHAR type specifies a limit we truncate to that limit:
+		switch t.Family() {
+		case types.StringFamily:
+			if t.Oid() == oid.T_name {
+				return NewDName(s), nil
+			}
+
+			// If the string type specifies a limit we truncate to that limit:
 			//   'hello'::CHAR(2) -> 'he'
-			if c.N > 0 && c.N < len(s) {
-				s = s[:c.N]
+			// This is true of all the string type variants.
+			if t.Width() > 0 && int(t.Width()) < len(s) {
+				s = s[:t.Width()]
 			}
 			return NewDString(s), nil
-		case *coltypes.TCollatedString:
-			if c.N > 0 && c.N < len(s) {
-				s = s[:c.N]
+		case types.CollatedStringFamily:
+			// Ditto truncation like for TString.
+			if t.Width() > 0 && int(t.Width()) < len(s) {
+				s = s[:t.Width()]
 			}
-			return NewDCollatedString(s, c.Locale, &ctx.collationEnv), nil
-		case *coltypes.TName:
-			return NewDName(s), nil
-		default:
-			panic(fmt.Sprintf("missing case for cast to string: %T", c))
+			return NewDCollatedString(s, t.Locale(), &ctx.CollationEnv)
 		}
 
-	case *coltypes.TBytes:
+	case types.BytesFamily:
 		switch t := d.(type) {
 		case *DString:
-			return ParseDByte(string(*t), true)
+			return ParseDByte(string(*t))
 		case *DCollatedString:
 			return NewDBytes(DBytes(t.Contents)), nil
 		case *DUuid:
@@ -2626,7 +3543,7 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			return d, nil
 		}
 
-	case *coltypes.TUUID:
+	case types.UuidFamily:
 		switch t := d.(type) {
 		case *DString:
 			return ParseDUuidFromString(string(*t))
@@ -2638,7 +3555,7 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			return d, nil
 		}
 
-	case *coltypes.TIPAddr:
+	case types.INetFamily:
 		switch t := d.(type) {
 		case *DString:
 			return ParseDIPAddrFromINetString(string(*t))
@@ -2648,130 +3565,201 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			return d, nil
 		}
 
-	case *coltypes.TDate:
+	case types.DateFamily:
 		switch d := d.(type) {
 		case *DString:
-			return ParseDDate(string(*d), ctx.GetLocation())
+			return ParseDDate(ctx, string(*d))
 		case *DCollatedString:
-			return ParseDDate(d.Contents, ctx.GetLocation())
+			return ParseDDate(ctx, d.Contents)
 		case *DDate:
 			return d, nil
 		case *DInt:
-			return NewDDate(DDate(int64(*d))), nil
+			// TODO(mjibson): This cast is unsupported by postgres. Should we remove ours?
+			t, err := pgdate.MakeDateFromUnixEpoch(int64(*d))
+			return NewDDate(t), err
 		case *DTimestampTZ:
-			return NewDDateFromTime(d.Time, ctx.GetLocation()), nil
+			return NewDDateFromTime(d.Time.In(ctx.GetLocation()))
 		case *DTimestamp:
-			return NewDDateFromTime(d.Time, time.UTC), nil
+			return NewDDateFromTime(d.Time)
 		}
 
-	case *coltypes.TTime:
+	case types.TimeFamily:
+		roundTo := TimeFamilyPrecisionToRoundDuration(t.Precision())
 		switch d := d.(type) {
 		case *DString:
-			return ParseDTime(string(*d))
+			return ParseDTime(ctx, string(*d), roundTo)
 		case *DCollatedString:
-			return ParseDTime(d.Contents)
+			return ParseDTime(ctx, d.Contents, roundTo)
 		case *DTime:
-			return d, nil
+			return d.Round(roundTo), nil
+		case *DTimeTZ:
+			return MakeDTime(d.TimeOfDay.Round(roundTo)), nil
 		case *DTimestamp:
-			return MakeDTime(timeofday.FromTime(d.Time)), nil
+			return MakeDTime(timeofday.FromTime(d.Time).Round(roundTo)), nil
 		case *DTimestampTZ:
-			return MakeDTime(timeofday.FromTime(d.Time)), nil
+			// Strip time zone. Times don't carry their location.
+			return MakeDTime(timeofday.FromTime(d.stripTimeZone(ctx).Time).Round(roundTo)), nil
 		case *DInterval:
-			return MakeDTime(timeofday.Min.Add(d.Duration)), nil
+			return MakeDTime(timeofday.Min.Add(d.Duration).Round(roundTo)), nil
 		}
 
-	case *coltypes.TTimestamp:
+	case types.TimeTZFamily:
+		roundTo := TimeFamilyPrecisionToRoundDuration(t.Precision())
+		switch d := d.(type) {
+		case *DString:
+			return ParseDTimeTZ(ctx, string(*d), roundTo)
+		case *DCollatedString:
+			return ParseDTimeTZ(ctx, d.Contents, roundTo)
+		case *DTime:
+			return NewDTimeTZFromLocation(timeofday.TimeOfDay(*d).Round(roundTo), ctx.GetLocation()), nil
+		case *DTimeTZ:
+			return d.Round(roundTo), nil
+		case *DTimestampTZ:
+			return NewDTimeTZFromTime(d.Time.In(ctx.GetLocation()).Round(roundTo)), nil
+		}
+
+	case types.TimestampFamily:
+		roundTo := TimeFamilyPrecisionToRoundDuration(t.Precision())
 		// TODO(knz): Timestamp from float, decimal.
 		switch d := d.(type) {
 		case *DString:
-			return ParseDTimestamp(string(*d), time.Microsecond)
+			return ParseDTimestamp(ctx, string(*d), roundTo)
 		case *DCollatedString:
-			return ParseDTimestamp(d.Contents, time.Microsecond)
+			return ParseDTimestamp(ctx, d.Contents, roundTo)
 		case *DDate:
-			year, month, day := timeutil.Unix(int64(*d)*SecondsInDay, 0).Date()
-			return MakeDTimestamp(time.Date(year, month, day, 0, 0, 0, 0, time.UTC), time.Microsecond), nil
+			t, err := d.ToTime()
+			return MakeDTimestamp(t, roundTo), err
 		case *DInt:
-			return MakeDTimestamp(timeutil.Unix(int64(*d), 0), time.Second), nil
+			return MakeDTimestamp(timeutil.Unix(int64(*d), 0), roundTo), nil
 		case *DTimestamp:
-			return d, nil
+			return d.Round(roundTo), nil
 		case *DTimestampTZ:
-			return MakeDTimestamp(d.Time.In(ctx.GetLocation()), time.Microsecond), nil
+			// Strip time zone. Timestamps don't carry their location.
+			return d.stripTimeZone(ctx).Round(roundTo), nil
 		}
 
-	case *coltypes.TTimestampTZ:
+	case types.TimestampTZFamily:
+		roundTo := TimeFamilyPrecisionToRoundDuration(t.Precision())
 		// TODO(knz): TimestampTZ from float, decimal.
 		switch d := d.(type) {
 		case *DString:
-			return ParseDTimestampTZ(string(*d), ctx.GetLocation(), time.Microsecond)
+			return ParseDTimestampTZ(ctx, string(*d), roundTo)
 		case *DCollatedString:
-			return ParseDTimestampTZ(d.Contents, ctx.GetLocation(), time.Microsecond)
+			return ParseDTimestampTZ(ctx, d.Contents, roundTo)
 		case *DDate:
-			return MakeDTimestampTZFromDate(ctx.GetLocation(), d), nil
+			t, err := d.ToTime()
+			_, before := t.Zone()
+			_, after := t.In(ctx.GetLocation()).Zone()
+			return MakeDTimestampTZ(t.Add(time.Duration(before-after)*time.Second), roundTo), err
 		case *DTimestamp:
 			_, before := d.Time.Zone()
 			_, after := d.Time.In(ctx.GetLocation()).Zone()
-			return MakeDTimestampTZ(d.Time.Add(time.Duration(before-after)*time.Second), time.Microsecond), nil
+			return MakeDTimestampTZ(d.Time.Add(time.Duration(before-after)*time.Second), roundTo), nil
 		case *DInt:
-			return MakeDTimestampTZ(timeutil.Unix(int64(*d), 0), time.Second), nil
+			return MakeDTimestampTZ(timeutil.Unix(int64(*d), 0), roundTo), nil
 		case *DTimestampTZ:
-			return d, nil
+			return d.Round(roundTo), nil
 		}
 
-	case *coltypes.TInterval:
-		// TODO(knz): Interval from float, decimal.
+	case types.IntervalFamily:
+		itm, err := t.IntervalTypeMetadata()
+		if err != nil {
+			return nil, err
+		}
 		switch v := d.(type) {
 		case *DString:
-			return ParseDInterval(string(*v))
+			return ParseDIntervalWithTypeMetadata(string(*v), itm)
 		case *DCollatedString:
-			return ParseDInterval(v.Contents)
+			return ParseDIntervalWithTypeMetadata(v.Contents, itm)
 		case *DInt:
-			// An integer duration represents a duration in microseconds.
-			return &DInterval{Duration: duration.Duration{Nanos: int64(*v) * 1000}}, nil
+			return NewDInterval(duration.FromInt64(int64(*v)), itm), nil
+		case *DFloat:
+			return NewDInterval(duration.FromFloat64(float64(*v)), itm), nil
 		case *DTime:
-			return &DInterval{Duration: duration.Duration{Nanos: int64(*v) * 1000}}, nil
+			return NewDInterval(duration.MakeDuration(int64(*v)*1000, 0, 0), itm), nil
+		case *DDecimal:
+			d := ctx.getTmpDec()
+			dnanos := v.Decimal
+			dnanos.Exponent += 9
+			// We need HighPrecisionCtx because duration values can contain
+			// upward of 35 decimal digits and DecimalCtx only provides 25.
+			_, err := HighPrecisionCtx.Quantize(d, &dnanos, 0)
+			if err != nil {
+				return nil, err
+			}
+			if dnanos.Negative {
+				d.Coeff.Neg(&d.Coeff)
+			}
+			dv, ok := duration.FromBigInt(&d.Coeff)
+			if !ok {
+				return nil, errDecOutOfRange
+			}
+			return NewDInterval(dv, itm), nil
 		case *DInterval:
-			return d, nil
+			return NewDInterval(v.Duration, itm), nil
 		}
-	case *coltypes.TJSON:
+	case types.JsonFamily:
 		switch v := d.(type) {
 		case *DString:
 			return ParseDJSON(string(*v))
 		case *DJSON:
 			return v, nil
 		}
-	case *coltypes.TArray:
+	case types.ArrayFamily:
 		switch v := d.(type) {
 		case *DString:
-			return ParseDArrayFromString(ctx, string(*v), typ.ParamType)
+			return ParseDArrayFromString(ctx, string(*v), t.ArrayContents())
 		case *DArray:
-			if (*v).ParamTyp == coltypes.CastTargetToDatumType((*typ).ParamType) {
-				return d, nil
+			dcast := NewDArray(t.ArrayContents())
+			for _, e := range v.Array {
+				ecast := DNull
+				if e != DNull {
+					var err error
+					ecast, err = PerformCast(ctx, e, t.ArrayContents())
+					if err != nil {
+						return nil, err
+					}
+				}
+
+				if err := dcast.Append(ecast); err != nil {
+					return nil, err
+				}
 			}
+			return dcast, nil
 		}
-	case *coltypes.TOid:
+	case types.OidFamily:
 		switch v := d.(type) {
 		case *DOid:
-			switch typ {
-			case coltypes.Oid:
-				return &DOid{semanticType: typ, DInt: v.DInt}, nil
+			switch t.Oid() {
+			case oid.T_oid:
+				return &DOid{semanticType: t, DInt: v.DInt}, nil
+			case oid.T_regtype:
+				// Mapping an oid to a regtype is easy: we have a hardcoded map.
+				typ, ok := types.OidToType[oid.Oid(v.DInt)]
+				ret := &DOid{semanticType: t, DInt: v.DInt}
+				if !ok {
+					return ret, nil
+				}
+				ret.name = typ.PGName()
+				return ret, nil
 			default:
-				oid, err := queryOid(ctx, typ, v)
+				oid, err := queryOid(ctx, t, v)
 				if err != nil {
 					oid = NewDOid(v.DInt)
-					oid.semanticType = typ
+					oid.semanticType = t
 				}
 				return oid, nil
 			}
 		case *DInt:
-			switch typ {
-			case coltypes.Oid:
-				return &DOid{semanticType: typ, DInt: *v}, nil
+			switch t.Oid() {
+			case oid.T_oid:
+				return &DOid{semanticType: t, DInt: *v}, nil
 			default:
 				tmpOid := NewDOid(*v)
-				oid, err := queryOid(ctx, typ, tmpOid)
+				oid, err := queryOid(ctx, t, tmpOid)
 				if err != nil {
 					oid = tmpOid
-					oid.semanticType = typ
+					oid.semanticType = t
 				}
 				return oid, nil
 			}
@@ -2785,14 +3773,14 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 				s = s[1 : len(s)-1]
 			}
 
-			switch typ {
-			case coltypes.Oid:
+			switch t.Oid() {
+			case oid.T_oid:
 				i, err := ParseDInt(s)
 				if err != nil {
 					return nil, err
 				}
-				return &DOid{semanticType: typ, DInt: *i}, nil
-			case coltypes.RegProc, coltypes.RegProcedure:
+				return &DOid{semanticType: t, DInt: *i}, nil
+			case oid.T_regproc, oid.T_regprocedure:
 				// Trim procedure type parameters, e.g. `max(int)` becomes `max`.
 				// Postgres only does this when the cast is ::regprocedure, but we're
 				// going to always do it.
@@ -2801,58 +3789,90 @@ func performCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 				s = pgSignatureRegexp.ReplaceAllString(s, "$1")
 				// Resolve function name.
 				substrs := strings.Split(s, ".")
-				name := UnresolvedName{}
-				for _, substr := range substrs {
-					name = append(name, Name(substr))
+				if len(substrs) > 3 {
+					// A fully qualified function name in pg's dialect can contain
+					// at most 3 parts: db.schema.funname.
+					// For example mydb.pg_catalog.max().
+					// Anything longer is always invalid.
+					return nil, pgerror.Newf(pgcode.Syntax,
+						"invalid function name: %s", s)
 				}
-				funcDef, err := name.ResolveFunction(ctx.SearchPath)
+				name := UnresolvedName{NumParts: len(substrs)}
+				for i := 0; i < len(substrs); i++ {
+					name.Parts[i] = substrs[len(substrs)-1-i]
+				}
+				funcDef, err := name.ResolveFunction(ctx.SessionData.SearchPath)
 				if err != nil {
 					return nil, err
 				}
-				return queryOid(ctx, typ, NewDString(funcDef.Name))
-			case coltypes.RegType:
-				colType, err := ctx.Planner.ParseType(s)
+				return queryOid(ctx, t, NewDString(funcDef.Name))
+			case oid.T_regtype:
+				parsedTyp, err := ctx.Planner.ParseType(s)
 				if err == nil {
-					datumType := coltypes.CastTargetToDatumType(colType)
-					return &DOid{semanticType: typ, DInt: DInt(datumType.Oid()), name: datumType.SQLName()}, nil
+					return &DOid{
+						semanticType: t,
+						DInt:         DInt(parsedTyp.Oid()),
+						name:         parsedTyp.SQLStandardName(),
+					}, nil
 				}
 				// Fall back to searching pg_type, since we don't provide syntax for
 				// every postgres type that we understand OIDs for.
 				// Trim type modifiers, e.g. `numeric(10,3)` becomes `numeric`.
 				s = pgSignatureRegexp.ReplaceAllString(s, "$1")
-				return queryOid(ctx, typ, NewDString(s))
+				dOid, missingTypeErr := queryOid(ctx, t, NewDString(s))
+				if missingTypeErr == nil {
+					return dOid, missingTypeErr
+				}
+				// Fall back to some special cases that we support for compatibility
+				// only. Client use syntax like 'sometype'::regtype to produce the oid
+				// for a type that they want to search a catalog table for. Since we
+				// don't support that type, we return an artificial OID that will never
+				// match anything.
+				switch s {
+				// We don't support triggers, but some tools search for them
+				// specifically.
+				case "trigger":
+				default:
+					return nil, missingTypeErr
+				}
+				return &DOid{
+					semanticType: t,
+					// Types we don't support get OID -1, so they won't match anything
+					// in catalogs.
+					DInt: -1,
+					name: s,
+				}, nil
 
-			case coltypes.RegClass:
-				tn, err := ctx.Planner.ParseQualifiedTableName(ctx.Ctx(), origS)
+			case oid.T_regclass:
+				tn, err := ctx.Planner.ParseQualifiedTableName(origS)
 				if err != nil {
 					return nil, err
 				}
-				// Determining the table's OID requires joining against the databases
-				// table because we only have the database name, not its OID, which is
-				// what is stored in pg_class. This extra join means we can't use
-				// queryOid like everyone else.
-				return queryOidWithJoin(ctx, typ, NewDString(tn.Table()),
-					"JOIN pg_catalog.pg_namespace ON relnamespace = pg_namespace.oid",
-					fmt.Sprintf("AND nspname = '%s'", tn.Database()))
+				id, err := ctx.Planner.ResolveTableName(ctx.Ctx(), tn)
+				if err != nil {
+					return nil, err
+				}
+				return &DOid{
+					semanticType: t,
+					DInt:         DInt(id),
+					name:         tn.TableName.String(),
+				}, nil
 			default:
-				return queryOid(ctx, typ, NewDString(s))
+				return queryOid(ctx, t, NewDString(s))
 			}
 		}
 	}
 
-	return nil, pgerror.NewErrorf(
-		pgerror.CodeCannotCoerceError, "invalid cast: %s -> %s", d.ResolvedType(), t)
+	return nil, pgerror.Newf(
+		pgcode.CannotCoerce, "invalid cast: %s -> %s", d.ResolvedType(), t)
 }
 
 // Eval implements the TypedExpr interface.
 func (expr *IndirectionExpr) Eval(ctx *EvalContext) (Datum, error) {
 	var subscriptIdx int
 	for i, t := range expr.Indirection {
-		if t.Slice {
-			return nil, pgerror.UnimplementedWithIssueErrorf(2115, "ARRAY slicing in %s", expr)
-		}
-		if i > 0 {
-			return nil, pgerror.UnimplementedWithIssueErrorf(2115, "multidimensional ARRAY %s", expr)
+		if t.Slice || i > 0 {
+			return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
 		}
 
 		d, err := t.Begin.(TypedExpr).Eval(ctx)
@@ -2876,8 +3896,9 @@ func (expr *IndirectionExpr) Eval(ctx *EvalContext) (Datum, error) {
 	// Index into the DArray, using 1-indexing.
 	arr := MustBeDArray(d)
 
-	// INT2VECTOR uses 0-indexing.
-	if w, ok := d.(*DOidWrapper); ok && w.Oid == oid.T_int2vector {
+	// VECTOR types use 0-indexing.
+	switch arr.customOid {
+	case oid.T_oidvector, oid.T_int2vector:
 		subscriptIdx++
 	}
 	if subscriptIdx < 1 || subscriptIdx > arr.Len() {
@@ -2890,7 +3911,7 @@ func (expr *IndirectionExpr) Eval(ctx *EvalContext) (Datum, error) {
 func (expr *CollateExpr) Eval(ctx *EvalContext) (Datum, error) {
 	d, err := expr.Expr.(TypedExpr).Eval(ctx)
 	if err != nil {
-		return DNull, err
+		return nil, err
 	}
 	unwrapped := UnwrapDatum(ctx, d)
 	if unwrapped == DNull {
@@ -2898,12 +3919,21 @@ func (expr *CollateExpr) Eval(ctx *EvalContext) (Datum, error) {
 	}
 	switch d := unwrapped.(type) {
 	case *DString:
-		return NewDCollatedString(string(*d), expr.Locale, &ctx.collationEnv), nil
+		return NewDCollatedString(string(*d), expr.Locale, &ctx.CollationEnv)
 	case *DCollatedString:
-		return NewDCollatedString(d.Contents, expr.Locale, &ctx.collationEnv), nil
+		return NewDCollatedString(d.Contents, expr.Locale, &ctx.CollationEnv)
 	default:
-		return nil, pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError, "incompatible type for COLLATE: %s", d)
+		return nil, pgerror.Newf(pgcode.DatatypeMismatch, "incompatible type for COLLATE: %s", d)
 	}
+}
+
+// Eval implements the TypedExpr interface.
+func (expr *ColumnAccessExpr) Eval(ctx *EvalContext) (Datum, error) {
+	d, err := expr.Expr.(TypedExpr).Eval(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return d.(*DTuple).D[expr.ColIndex], nil
 }
 
 // Eval implements the TypedExpr interface.
@@ -2931,33 +3961,27 @@ func (expr *ComparisonExpr) Eval(ctx *EvalContext) (Datum, error) {
 		return nil, err
 	}
 
-	if left == DNull || right == DNull {
-		switch expr.Operator {
-		case IsDistinctFrom:
-			return MakeDBool(!DBool(left == DNull && right == DNull)), nil
-		case IsNotDistinctFrom:
-			return MakeDBool(left == DNull && right == DNull), nil
-		default:
-			return DNull, nil
-		}
-	}
-
 	op := expr.Operator
 	if op.hasSubOperator() {
 		var datums Datums
 		// Right is either a tuple or an array of Datums.
-		if tuple, ok := AsDTuple(right); ok {
+		if !expr.fn.NullableArgs && right == DNull {
+			return DNull, nil
+		} else if tuple, ok := AsDTuple(right); ok {
 			datums = tuple.D
 		} else if array, ok := AsDArray(right); ok {
 			datums = array.Array
 		} else {
-			return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unhandled right expression %s", right)
+			return nil, errors.AssertionFailedf("unhandled right expression %s", right)
 		}
 		return evalDatumsCmp(ctx, op, expr.SubOperator, expr.fn, left, datums)
 	}
 
 	_, newLeft, newRight, _, not := foldComparisonExpr(op, left, right)
-	d, err := expr.fn.fn(ctx, newLeft.(Datum), newRight.(Datum))
+	if !expr.fn.NullableArgs && (newLeft == DNull || newRight == DNull) {
+		return DNull, nil
+	}
+	d, err := expr.fn.Fn(ctx, newLeft.(Datum), newRight.(Datum))
 	if err != nil {
 		return nil, err
 	}
@@ -2967,44 +3991,67 @@ func (expr *ComparisonExpr) Eval(ctx *EvalContext) (Datum, error) {
 	return d, nil
 }
 
-// Eval implements the TypedExpr interface.
-func (t *ExistsExpr) Eval(ctx *EvalContext) (Datum, error) {
-	// Exists expressions are handled during subquery expansion.
-	return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unhandled type %T", t)
+// EvalArgsAndGetGenerator evaluates the arguments and instanciates a
+// ValueGenerator for use by set projections.
+func (expr *FuncExpr) EvalArgsAndGetGenerator(ctx *EvalContext) (ValueGenerator, error) {
+	if expr.fn == nil || expr.fnProps.Class != GeneratorClass {
+		return nil, errors.AssertionFailedf("cannot call EvalArgsAndGetGenerator() on non-aggregate function: %q", ErrString(expr))
+	}
+	nullArg, args, err := expr.evalArgs(ctx)
+	if err != nil || nullArg {
+		return nil, err
+	}
+	return expr.fn.Generator(ctx, args)
+}
+
+// evalArgs evaluates just the function application's arguments.
+// The returned bool indicates that the NULL should be propagated.
+func (expr *FuncExpr) evalArgs(ctx *EvalContext) (bool, Datums, error) {
+	args := make(Datums, len(expr.Exprs))
+	for i, e := range expr.Exprs {
+		arg, err := e.(TypedExpr).Eval(ctx)
+		if err != nil {
+			return false, nil, err
+		}
+		if arg == DNull && !expr.fnProps.NullableArgs {
+			return true, nil, nil
+		}
+		args[i] = arg
+	}
+	return false, args, nil
 }
 
 // Eval implements the TypedExpr interface.
 func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
-	args := NewDTupleWithCap(len(expr.Exprs))
-	for _, e := range expr.Exprs {
-		arg, err := e.(TypedExpr).Eval(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if arg == DNull && !expr.fn.NullableArgs {
-			return DNull, nil
-		}
-		args.D = append(args.D, arg)
+	nullResult, args, err := expr.evalArgs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if nullResult {
+		return DNull, err
 	}
 
-	res, err := expr.fn.Fn(ctx, args.D)
+	res, err := expr.fn.Fn(ctx, args)
 	if err != nil {
-		// If we are facing a retry error, in particular those generated
-		// by crdb_internal.force_retry(), propagate it unchanged, so that
-		// the executor can see it with the right type.
-		if _, ok := err.(*roachpb.HandledRetryableTxnError); ok {
-			return nil, err
-		}
 		// If we are facing an explicit error, propagate it unchanged.
 		fName := expr.Func.String()
 		if fName == `crdb_internal.force_error` {
 			return nil, err
 		}
-		return nil, errors.Wrapf(err, "%s()", fName)
+		// Otherwise, wrap it with context.
+		newErr := errors.Wrapf(err, "%s()", errors.Safe(fName))
+		// Count function errors as it flows out of the system.  We need
+		// to have this inside a if because if we are facing a retry
+		// error, in particular those generated by
+		// crdb_internal.force_retry(), Wrap() will propagate it as a
+		// non-pgerror error (so that the executor can see it with the
+		// right type).
+		newErr = errors.WithTelemetry(newErr, fName+"()")
+		return nil, newErr
 	}
 	if ctx.TestingKnobs.AssertFuncExprReturnTypes {
 		if err := ensureExpectedType(expr.fn.FixedReturnType(), res); err != nil {
-			return nil, errors.Wrapf(err, "function %q", expr.String())
+			return nil, errors.NewAssertionErrorWithWrappedErrf(err, "function %q", expr)
 		}
 	}
 	return res, nil
@@ -3013,12 +4060,41 @@ func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
 // ensureExpectedType will return an error if a datum does not match the
 // provided type. If the expected type is Any or if the datum is a Null
 // type, then no error will be returned.
-func ensureExpectedType(exp types.T, d Datum) error {
-	if !(exp.FamilyEqual(types.Any) || d.ResolvedType().Equivalent(types.Null) ||
+func ensureExpectedType(exp *types.T, d Datum) error {
+	if !(exp.Family() == types.AnyFamily || d.ResolvedType().Family() == types.UnknownFamily ||
 		d.ResolvedType().Equivalent(exp)) {
-		return errors.Errorf("expected return type %q, got: %q", exp, d.ResolvedType())
+		return errors.AssertionFailedf(
+			"expected return type %q, got: %q", errors.Safe(exp), errors.Safe(d.ResolvedType()))
 	}
 	return nil
+}
+
+// Eval implements the TypedExpr interface.
+func (expr *IfErrExpr) Eval(ctx *EvalContext) (Datum, error) {
+	cond, evalErr := expr.Cond.(TypedExpr).Eval(ctx)
+	if evalErr == nil {
+		if expr.Else == nil {
+			return DBoolFalse, nil
+		}
+		return cond, nil
+	}
+	if expr.ErrCode != nil {
+		errpat, err := expr.ErrCode.(TypedExpr).Eval(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if errpat == DNull {
+			return nil, evalErr
+		}
+		errpatStr := string(MustBeDString(errpat))
+		if code := pgerror.GetPGCode(evalErr); code != errpatStr {
+			return nil, evalErr
+		}
+	}
+	if expr.Else == nil {
+		return DBoolTrue, nil
+	}
+	return expr.Else.(TypedExpr).Eval(ctx)
 }
 
 // Eval implements the TypedExpr interface.
@@ -3042,8 +4118,7 @@ func (expr *IsOfTypeExpr) Eval(ctx *EvalContext) (Datum, error) {
 	datumTyp := d.ResolvedType()
 
 	for _, t := range expr.Types {
-		wantTyp := coltypes.CastTargetToDatumType(t)
-		if datumTyp.FamilyEqual(wantTyp) {
+		if datumTyp.Equivalent(t) {
 			return MakeDBool(DBool(!expr.Not)), nil
 		}
 	}
@@ -3124,7 +4199,7 @@ func (expr *ParenExpr) Eval(ctx *EvalContext) (Datum, error) {
 
 // Eval implements the TypedExpr interface.
 func (expr *RangeCond) Eval(ctx *EvalContext) (Datum, error) {
-	return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unhandled type %T", expr)
+	return nil, errors.AssertionFailedf("unhandled type %T", expr)
 }
 
 // Eval implements the TypedExpr interface.
@@ -3136,13 +4211,13 @@ func (expr *UnaryExpr) Eval(ctx *EvalContext) (Datum, error) {
 	if d == DNull {
 		return DNull, nil
 	}
-	res, err := expr.fn.fn(ctx, d)
+	res, err := expr.fn.Fn(ctx, d)
 	if err != nil {
 		return nil, err
 	}
 	if ctx.TestingKnobs.AssertUnaryExprReturnTypes {
 		if err := ensureExpectedType(expr.fn.ReturnType, res); err != nil {
-			return nil, errors.Wrapf(err, "unary op %q", expr.String())
+			return nil, errors.NewAssertionErrorWithWrappedErrf(err, "unary op %q", expr)
 		}
 	}
 	return res, err
@@ -3150,53 +4225,56 @@ func (expr *UnaryExpr) Eval(ctx *EvalContext) (Datum, error) {
 
 // Eval implements the TypedExpr interface.
 func (expr DefaultVal) Eval(ctx *EvalContext) (Datum, error) {
-	return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unhandled type %T", expr)
+	return nil, errors.AssertionFailedf("unhandled type %T", expr)
 }
 
 // Eval implements the TypedExpr interface.
 func (expr UnqualifiedStar) Eval(ctx *EvalContext) (Datum, error) {
-	return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unhandled type %T", expr)
+	return nil, errors.AssertionFailedf("unhandled type %T", expr)
 }
 
 // Eval implements the TypedExpr interface.
-func (expr UnresolvedName) Eval(ctx *EvalContext) (Datum, error) {
-	return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unhandled type %T", expr)
+func (expr *UnresolvedName) Eval(ctx *EvalContext) (Datum, error) {
+	return nil, errors.AssertionFailedf("unhandled type %T", expr)
 }
 
 // Eval implements the TypedExpr interface.
 func (expr *AllColumnsSelector) Eval(ctx *EvalContext) (Datum, error) {
-	return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unhandled type %T", expr)
+	return nil, errors.AssertionFailedf("unhandled type %T", expr)
+}
+
+// Eval implements the TypedExpr interface.
+func (expr *TupleStar) Eval(ctx *EvalContext) (Datum, error) {
+	return nil, errors.AssertionFailedf("unhandled type %T", expr)
 }
 
 // Eval implements the TypedExpr interface.
 func (expr *ColumnItem) Eval(ctx *EvalContext) (Datum, error) {
-	return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unhandled type %T", expr)
+	return nil, errors.AssertionFailedf("unhandled type %T", expr)
 }
 
 // Eval implements the TypedExpr interface.
 func (t *Tuple) Eval(ctx *EvalContext) (Datum, error) {
-	tuple := NewDTupleWithCap(len(t.Exprs))
-	for _, v := range t.Exprs {
+	tuple := NewDTupleWithLen(t.typ, len(t.Exprs))
+	for i, v := range t.Exprs {
 		d, err := v.(TypedExpr).Eval(ctx)
 		if err != nil {
 			return nil, err
 		}
-		tuple.D = append(tuple.D, d)
+		tuple.D[i] = d
 	}
 	return tuple, nil
 }
 
 // arrayOfType returns a fresh DArray of the input type.
-func arrayOfType(typ types.T) (*DArray, error) {
-	arrayTyp, ok := typ.(types.TArray)
-	if !ok {
-		return nil, pgerror.NewErrorf(
-			pgerror.CodeInternalError, "array node type (%v) is not types.TArray", typ)
+func arrayOfType(typ *types.T) (*DArray, error) {
+	if typ.Family() != types.ArrayFamily {
+		return nil, errors.AssertionFailedf("array node type (%v) is not types.TArray", typ)
 	}
-	if !types.IsValidArrayElementType(arrayTyp.Typ) {
-		return nil, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "arrays of %s not allowed", arrayTyp.Typ)
+	if err := types.CheckArrayElementType(typ.ArrayContents()); err != nil {
+		return nil, err
 	}
-	return NewDArray(arrayTyp.Typ), nil
+	return NewDArray(typ.ArrayContents()), nil
 }
 
 // Eval implements the TypedExpr interface.
@@ -3219,6 +4297,11 @@ func (t *Array) Eval(ctx *EvalContext) (Datum, error) {
 }
 
 // Eval implements the TypedExpr interface.
+func (expr *Subquery) Eval(ctx *EvalContext) (Datum, error) {
+	return ctx.Planner.EvalSubquery(expr)
+}
+
+// Eval implements the TypedExpr interface.
 func (t *ArrayFlatten) Eval(ctx *EvalContext) (Datum, error) {
 	array, err := arrayOfType(t.ResolvedType())
 	if err != nil {
@@ -3232,11 +4315,15 @@ func (t *ArrayFlatten) Eval(ctx *EvalContext) (Datum, error) {
 
 	tuple, ok := d.(*DTuple)
 	if !ok {
-		return nil, pgerror.NewErrorf(
-			pgerror.CodeInternalError, "array subquery result (%v) is not DTuple", d)
+		return nil, errors.AssertionFailedf("array subquery result (%v) is not DTuple", d)
 	}
 	array.Array = tuple.D
 	return array, nil
+}
+
+// Eval implements the TypedExpr interface.
+func (t *DBitArray) Eval(_ *EvalContext) (Datum, error) {
+	return t, nil
 }
 
 // Eval implements the TypedExpr interface.
@@ -3266,6 +4353,11 @@ func (t *DDate) Eval(_ *EvalContext) (Datum, error) {
 
 // Eval implements the TypedExpr interface.
 func (t *DTime) Eval(_ *EvalContext) (Datum, error) {
+	return t, nil
+}
+
+// Eval implements the TypedExpr interface.
+func (t *DTimeTZ) Eval(_ *EvalContext) (Datum, error) {
 	return t, nil
 }
 
@@ -3330,11 +4422,6 @@ func (t *DArray) Eval(_ *EvalContext) (Datum, error) {
 }
 
 // Eval implements the TypedExpr interface.
-func (t *DTable) Eval(_ *EvalContext) (Datum, error) {
-	return t, nil
-}
-
-// Eval implements the TypedExpr interface.
 func (t *DOid) Eval(_ *EvalContext) (Datum, error) {
 	return t, nil
 }
@@ -3351,16 +4438,17 @@ func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 		// placeholder evaluates to itself at this point.
 		return t, nil
 	}
-	e, ok := ctx.Placeholders.Value(t.Name)
+	e, ok := ctx.Placeholders.Value(t.Idx)
 	if !ok {
-		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "missing value for placeholder %s", t.Name)
+		return nil, pgerror.Newf(pgcode.UndefinedParameter,
+			"no value provided for placeholder: %s", t)
 	}
 	// Placeholder expressions cannot contain other placeholders, so we do
 	// not need to recurse.
-	typ, typed := ctx.Placeholders.Type(t.Name, false)
-	if !typed {
+	typ := ctx.Placeholders.Types[t.Idx]
+	if typ == nil {
 		// All placeholders should be typed at this point.
-		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "missing type for placeholder %s", t.Name)
+		return nil, errors.AssertionFailedf("missing type for placeholder %s", t)
 	}
 	if !e.ResolvedType().Equivalent(typ) {
 		// This happens when we overrode the placeholder's type during type
@@ -3368,11 +4456,7 @@ func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 		// type for the placeholder. In this case, we cast the expression to
 		// the desired type.
 		// TODO(jordan): introduce a restriction on what casts are allowed here.
-		colType, err := coltypes.DatumTypeToColumnType(typ)
-		if err != nil {
-			return nil, err
-		}
-		cast := &CastExpr{Expr: e, Type: colType}
+		cast := &CastExpr{Expr: e, Type: typ}
 		return cast.Eval(ctx)
 	}
 	return e.Eval(ctx)
@@ -3384,11 +4468,11 @@ func evalComparison(ctx *EvalContext, op ComparisonOperator, left, right Datum) 
 	}
 	ltype := left.ResolvedType()
 	rtype := right.ResolvedType()
-	if fn, ok := CmpOps[op].lookupImpl(ltype, rtype); ok {
-		return fn.fn(ctx, left, right)
+	if fn, ok := CmpOps[op].LookupImpl(ltype, rtype); ok {
+		return fn.Fn(ctx, left, right)
 	}
-	return nil, pgerror.NewErrorf(
-		pgerror.CodeUndefinedFunctionError, "unsupported comparison operator: <%s> %s <%s>", ltype, op, rtype)
+	return nil, pgerror.Newf(
+		pgcode.UndefinedFunction, "unsupported comparison operator: <%s> %s <%s>", ltype, op, rtype)
 }
 
 // foldComparisonExpr folds a given comparison operation and its expressions
@@ -3427,118 +4511,165 @@ func foldComparisonExpr(
 		// NotRegIMatch(left, right) is implemented as !RegIMatch(left, right)
 		return RegIMatch, left, right, false, true
 	case IsDistinctFrom:
-		// IsDistinctFrom(left, right) is implemented as !EQ(left, right)
-		//
-		// Note the special handling of NULLs and IS DISTINCT FROM is needed
-		// before this expression fold.
-		return EQ, left, right, false, true
-	case IsNotDistinctFrom:
-		// IsNotDistinctFrom(left, right) is implemented as EQ(left, right)
-		//
-		// Note the special handling of NULLs and IS NOT DISTINCT FROM is needed
-		// before this expression fold.
-		return EQ, left, right, false, false
+		// IsDistinctFrom(left, right) is implemented as !IsNotDistinctFrom(left, right)
+		// Note: this seems backwards, but IS NOT DISTINCT FROM is an extended
+		// version of IS and IS DISTINCT FROM is an extended version of IS NOT.
+		return IsNotDistinctFrom, left, right, false, true
 	}
 	return op, left, right, false, false
+}
+
+// hasUnescapedSuffix returns true if the ending byte is suffix and s has an
+// even number of escapeTokens preceding suffix. Otherwise hasUnescapedSuffix
+// will return false.
+func hasUnescapedSuffix(s string, suffix byte, escapeToken string) bool {
+	if s[len(s)-1] == suffix {
+		var count int
+		idx := len(s) - len(escapeToken) - 1
+		for idx >= 0 && s[idx:idx+len(escapeToken)] == escapeToken {
+			count++
+			idx -= len(escapeToken)
+		}
+		return count%2 == 0
+	}
+	return false
 }
 
 // Simplifies LIKE/ILIKE expressions that do not need full regular expressions to
 // evaluate the condition. For example, when the expression is just checking to see
 // if a string starts with a given pattern.
-func optimizedLikeFunc(pattern string, caseInsensitive bool) (func(string) bool, error) {
+func optimizedLikeFunc(
+	pattern string, caseInsensitive bool, escape rune,
+) (func(string) (bool, error), error) {
 	switch len(pattern) {
 	case 0:
-		return func(s string) bool {
-			return s == ""
+		return func(s string) (bool, error) {
+			return s == "", nil
 		}, nil
 	case 1:
 		switch pattern[0] {
 		case '%':
-			return func(s string) bool {
-				return true
+			if escape == '%' {
+				return nil, pgerror.Newf(pgcode.InvalidEscapeSequence, "LIKE pattern must not end with escape character")
+			}
+			return func(s string) (bool, error) {
+				return true, nil
 			}, nil
 		case '_':
-			return func(s string) bool {
-				return len(s) == 1
+			if escape == '_' {
+				return nil, pgerror.Newf(pgcode.InvalidEscapeSequence, "LIKE pattern must not end with escape character")
+			}
+			return func(s string) (bool, error) {
+				if len(s) == 0 {
+					return false, nil
+				}
+				firstChar, _ := utf8.DecodeRuneInString(s)
+				if firstChar == utf8.RuneError {
+					return false, errors.Errorf("invalid encoding of the first character in string %s", s)
+				}
+				return len(s) == len(string(firstChar)), nil
 			}, nil
 		}
 	default:
 		if !strings.ContainsAny(pattern[1:len(pattern)-1], "_%") {
-			// Cases like "something\%" are not optimized, but this does not affect correctness.
-			anyEnd := pattern[len(pattern)-1] == '%' && pattern[len(pattern)-2] != '\\'
-			anyStart := pattern[0] == '%'
+			// Patterns with even number of escape characters preceding the ending
+			// `%` will have anyEnd set to true (if `%` itself is not an escape
+			// character). Otherwise anyEnd will be set to false.
+			anyEnd := hasUnescapedSuffix(pattern, '%', string(escape)) && escape != '%'
+			// If '%' is the escape character, then it's not a wildcard.
+			anyStart := pattern[0] == '%' && escape != '%'
 
-			// singleAnyEnd and anyEnd are mutually exclusive
-			// (similarly with Start).
-			singleAnyEnd := pattern[len(pattern)-1] == '_' && pattern[len(pattern)-2] != '\\'
-			singleAnyStart := pattern[0] == '_'
+			// Patterns with even number of escape characters preceding the ending
+			// `_` will have singleAnyEnd set to true (if `_` itself is not an escape
+			// character). Otherwise singleAnyEnd will be set to false.
+			singleAnyEnd := hasUnescapedSuffix(pattern, '_', string(escape)) && escape != '_'
+			// If '_' is the escape character, then it's not a wildcard.
+			singleAnyStart := pattern[0] == '_' && escape != '_'
 
 			// Since we've already checked for escaped characters
 			// at the end, we can un-escape every character.
 			// This is required since we do direct string
 			// comparison.
 			var err error
-			if pattern, err = unescapePattern(pattern, `\`); err != nil {
+			if pattern, err = unescapePattern(pattern, string(escape), true /* emitEscapeCharacterLastError */); err != nil {
 				return nil, err
 			}
 			switch {
 			case anyEnd && anyStart:
-				return func(s string) bool {
+				return func(s string) (bool, error) {
 					substr := pattern[1 : len(pattern)-1]
 					if caseInsensitive {
 						s, substr = strings.ToUpper(s), strings.ToUpper(substr)
 					}
-					return strings.Contains(s, substr)
+					return strings.Contains(s, substr), nil
 				}, nil
 
 			case anyEnd:
-				return func(s string) bool {
+				return func(s string) (bool, error) {
 					prefix := pattern[:len(pattern)-1]
 					if singleAnyStart {
 						if len(s) == 0 {
-							return false
+							return false, nil
 						}
-
 						prefix = prefix[1:]
-						s = s[1:]
+						firstChar, _ := utf8.DecodeRuneInString(s)
+						if firstChar == utf8.RuneError {
+							return false, errors.Errorf("invalid encoding of the first character in string %s", s)
+						}
+						s = s[len(string(firstChar)):]
 					}
 					if caseInsensitive {
 						s, prefix = strings.ToUpper(s), strings.ToUpper(prefix)
 					}
-					return strings.HasPrefix(s, prefix)
+					return strings.HasPrefix(s, prefix), nil
 				}, nil
 
 			case anyStart:
-				return func(s string) bool {
+				return func(s string) (bool, error) {
 					suffix := pattern[1:]
 					if singleAnyEnd {
 						if len(s) == 0 {
-							return false
+							return false, nil
 						}
 
 						suffix = suffix[:len(suffix)-1]
-						s = s[:len(s)-1]
+						lastChar, _ := utf8.DecodeLastRuneInString(s)
+						if lastChar == utf8.RuneError {
+							return false, errors.Errorf("invalid encoding of the last character in string %s", s)
+						}
+						s = s[:len(s)-len(string(lastChar))]
 					}
 					if caseInsensitive {
 						s, suffix = strings.ToUpper(s), strings.ToUpper(suffix)
 					}
-					return strings.HasSuffix(s, suffix)
+					return strings.HasSuffix(s, suffix), nil
 				}, nil
 
 			case singleAnyStart || singleAnyEnd:
-				return func(s string) bool {
-					if len(s) < 1 || (singleAnyStart && singleAnyEnd && len(s) < 2) {
-						return false
+				return func(s string) (bool, error) {
+					if len(s) < 1 {
+						return false, nil
+					}
+					firstChar, _ := utf8.DecodeRuneInString(s)
+					if firstChar == utf8.RuneError {
+						return false, errors.Errorf("invalid encoding of the first character in string %s", s)
+					}
+					lastChar, _ := utf8.DecodeLastRuneInString(s)
+					if lastChar == utf8.RuneError {
+						return false, errors.Errorf("invalid encoding of the last character in string %s", s)
+					}
+					if singleAnyStart && singleAnyEnd && len(string(firstChar))+len(string(lastChar)) > len(s) {
+						return false, nil
 					}
 
 					if singleAnyStart {
 						pattern = pattern[1:]
-						s = s[1:]
+						s = s[len(string(firstChar)):]
 					}
 
 					if singleAnyEnd {
 						pattern = pattern[:len(pattern)-1]
-						s = s[:len(s)-1]
+						s = s[:len(s)-len(string(lastChar))]
 					}
 
 					if caseInsensitive {
@@ -3552,7 +4683,7 @@ func optimizedLikeFunc(pattern string, caseInsensitive bool) (func(string) bool,
 					//    in case anyStart
 					//  - singleAnyStart && anyEnd handled
 					//    in case anyEnd
-					return s == pattern
+					return s == pattern, nil
 				}, nil
 			}
 		}
@@ -3563,6 +4694,7 @@ func optimizedLikeFunc(pattern string, caseInsensitive bool) (func(string) bool,
 type likeKey struct {
 	s               string
 	caseInsensitive bool
+	escape          rune
 }
 
 // unescapePattern unescapes a pattern for a given escape token.
@@ -3580,7 +4712,9 @@ type likeKey struct {
 // We need to convert
 //    `\\` --> ``
 //    `\\\\` --> `\\`
-func unescapePattern(pattern, escapeToken string) (string, error) {
+func unescapePattern(
+	pattern, escapeToken string, emitEscapeCharacterLastError bool,
+) (string, error) {
 	escapedEscapeToken := escapeToken + escapeToken
 
 	// We need to subtract the escaped escape tokens to avoid double
@@ -3595,8 +4729,8 @@ func unescapePattern(pattern, escapeToken string) (string, error) {
 	retWidth := 0
 	for i := 0; i < nEscapes; i++ {
 		nextIdx := strings.Index(pattern, escapeToken)
-		if nextIdx == len(pattern)-len(escapeToken) {
-			return "", errors.Errorf(`pattern ends with escape character`)
+		if nextIdx == len(pattern)-len(escapeToken) && emitEscapeCharacterLastError {
+			return "", pgerror.Newf(pgcode.InvalidEscapeSequence, `LIKE pattern must not end with escape character`)
 		}
 
 		retWidth += copy(ret[retWidth:], pattern[:nextIdx])
@@ -3678,7 +4812,7 @@ OldLoop:
 				break
 			}
 
-			// Token was escaped. Copy eveything over and continue.
+			// Token was escaped. Copy everything over and continue.
 			retWidth += copy(ret[retWidth:], s[start:nextIdx+len(oldStr)])
 			start = nextIdx + len(oldStr)
 
@@ -3697,33 +4831,339 @@ OldLoop:
 	return string(ret[0:retWidth])
 }
 
+// Replaces all custom escape characters in s with `\\` only when they are unescaped.          (1)
+// E.g. original pattern       after QuoteMeta       after replaceCustomEscape with '@' as escape
+//        '@w@w'          ->      '@w@w'        ->        '\\w\\w'
+//        '@\@\'          ->      '@\\@\\'      ->        '\\\\\\\\'
+//
+// When an escape character is escaped, we replace it with its single occurrence.              (2)
+// E.g. original pattern       after QuoteMeta       after replaceCustomEscape with '@' as escape
+//        '@@w@w'         ->      '@@w@w'       ->        '@w\\w'
+//        '@@@\'          ->      '@@@\\'       ->        '@\\\\'
+//
+// At the same time, we do not want to confuse original backslashes (which
+// after QuoteMeta are '\\') with backslashes that replace our custom escape characters,
+// so we escape these original backslashes again by converting '\\' into '\\\\'.               (3)
+// E.g. original pattern       after QuoteMeta       after replaceCustomEscape with '@' as escape
+//        '@\'            ->      '@\\'         ->        '\\\\\\'
+//        '@\@@@\'        ->      '@\\@@@\\'    ->        '\\\\\\@\\\\\\'
+//
+// Explanation of the last example:
+// 1. we replace '@' with '\\' since it's unescaped;
+// 2. we escape single original backslash ('\' is not our escape character, so we want
+// the pattern to understand it) by putting an extra backslash in front of it. However,
+// we later will call unescapePattern, so we need to double our double backslashes.
+// Therefore, '\\' is converted into '\\\\'.
+// 3. '@@' is replaced by '@' because it is escaped escape character.
+// 4. '@' is replaced with '\\' since it's unescaped.
+// 5. Similar logic to step 2: '\\' -> '\\\\'.
+//
+// We always need to keep in mind that later call of unescapePattern
+// to actually unescape '\\' and '\\\\' is necessary and that
+// escape must be a single unicode character and not `\`.
+func replaceCustomEscape(s string, escape rune) (string, error) {
+	changed, retLen, err := calculateLengthAfterReplacingCustomEscape(s, escape)
+	if err != nil {
+		return "", err
+	}
+	if !changed {
+		return s, nil
+	}
+
+	sLen := len(s)
+	ret := make([]byte, retLen)
+	retIndex, sIndex := 0, 0
+	for retIndex < retLen {
+		sRune, w := utf8.DecodeRuneInString(s[sIndex:])
+		if sRune == escape {
+			// We encountered an escape character.
+			if sIndex+w < sLen {
+				// Escape character is not the last character in s, so we need
+				// to look ahead to figure out how to process it.
+				tRune, _ := utf8.DecodeRuneInString(s[(sIndex + w):])
+				if tRune == escape {
+					// Escape character is escaped, so we replace its two occurrences with just one. See (2).
+					// We copied only one escape character to ret, so we advance retIndex only by w.
+					// Since we've already processed two characters in s, we advance sIndex by 2*w.
+					utf8.EncodeRune(ret[retIndex:], escape)
+					retIndex += w
+					sIndex += 2 * w
+				} else {
+					// Escape character is unescaped, so we replace it with `\\`. See (1).
+					// Since we've added two bytes to ret, we advance retIndex by 2.
+					// We processed only a single escape character in s, we advance sIndex by w.
+					ret[retIndex] = '\\'
+					ret[retIndex+1] = '\\'
+					retIndex += 2
+					sIndex += w
+				}
+			} else {
+				// Escape character is the last character in s which is an error
+				// that must have been caught in calculateLengthAfterReplacingCustomEscape.
+				return "", errors.AssertionFailedf(
+					"unexpected: escape character is the last one in replaceCustomEscape.")
+			}
+		} else if s[sIndex] == '\\' {
+			// We encountered a backslash, so we need to look ahead to figure out how
+			// to process it.
+			if sIndex+1 == sLen {
+				// This case should never be reached since it should
+				// have been caught in calculateLengthAfterReplacingCustomEscape.
+				return "", errors.AssertionFailedf(
+					"unexpected: a single backslash encountered in replaceCustomEscape.")
+			} else if s[sIndex+1] == '\\' {
+				// We want to escape '\\' to `\\\\` for correct processing later by unescapePattern. See (3).
+				// Since we've added four characters to ret, we advance retIndex by 4.
+				// Since we've already processed two characters in s, we advance sIndex by 2.
+				ret[retIndex] = '\\'
+				ret[retIndex+1] = '\\'
+				ret[retIndex+2] = '\\'
+				ret[retIndex+3] = '\\'
+				retIndex += 4
+				sIndex += 2
+			} else {
+				// A metacharacter other than a backslash is escaped here.
+				// Note: all metacharacters are encoded as a single byte, so it is
+				// correct to just convert it to string and to compare against a char
+				// in s.
+				if string(s[sIndex+1]) == string(escape) {
+					// The metacharacter is our custom escape character. We need to look
+					// ahead to process it.
+					if sIndex+2 == sLen {
+						// Escape character is the last character in s which is an error
+						// that must have been caught in calculateLengthAfterReplacingCustomEscape.
+						return "", errors.AssertionFailedf(
+							"unexpected: escape character is the last one in replaceCustomEscape.")
+					}
+					if sIndex+4 <= sLen {
+						if s[sIndex+2] == '\\' && string(s[sIndex+3]) == string(escape) {
+							// We have a sequence of `\`+escape+`\`+escape which is replaced
+							// by `\`+escape.
+							ret[retIndex] = '\\'
+							// Note: all metacharacters are encoded as a single byte, so it
+							// is safe to just convert it to string and take the first
+							// character.
+							ret[retIndex+1] = string(escape)[0]
+							retIndex += 2
+							sIndex += 4
+							continue
+						}
+					}
+					// The metacharacter is escaping something different than itself, so
+					// `\`+escape will be replaced by `\`.
+					ret[retIndex] = '\\'
+					retIndex++
+					sIndex += 2
+				} else {
+					// The metacharacter is not our custom escape character, so we're
+					// simply copying the backslash and the metacharacter.
+					ret[retIndex] = '\\'
+					ret[retIndex+1] = s[sIndex+1]
+					retIndex += 2
+					sIndex += 2
+				}
+			}
+		} else {
+			// Regular symbol, so we simply copy it.
+			copy(ret[retIndex:], s[sIndex:sIndex+w])
+			retIndex += w
+			sIndex += w
+		}
+	}
+	return string(ret), nil
+}
+
+// calculateLengthAfterReplacingCustomEscape returns whether the pattern changes, the length
+// of the resulting pattern after calling replaceCustomEscape, and any error if found.
+func calculateLengthAfterReplacingCustomEscape(s string, escape rune) (bool, int, error) {
+	changed := false
+	retLen, sLen := 0, len(s)
+	for i := 0; i < sLen; {
+		sRune, w := utf8.DecodeRuneInString(s[i:])
+		if sRune == escape {
+			// We encountered an escape character.
+			if i+w < sLen {
+				// Escape character is not the last character in s, so we need
+				// to look ahead to figure out how to process it.
+				tRune, _ := utf8.DecodeRuneInString(s[(i + w):])
+				if tRune == escape {
+					// Escape character is escaped, so we'll replace its two occurrences with just one.
+					// See (2) in the comment above replaceCustomEscape.
+					changed = true
+					retLen += w
+					i += 2 * w
+				} else {
+					// Escape character is unescaped, so we'll replace it with `\\`.
+					// See (1) in the comment above replaceCustomEscape.
+					changed = true
+					retLen += 2
+					i += w
+				}
+			} else {
+				// Escape character is the last character in s, so we need to return an error.
+				return false, 0, pgerror.Newf(pgcode.InvalidEscapeSequence, "LIKE pattern must not end with escape character")
+			}
+		} else if s[i] == '\\' {
+			// We encountered a backslash, so we need to look ahead to figure out how
+			// to process it.
+			if i+1 == sLen {
+				// This case should never be reached because the backslash should be
+				// escaping one of regexp metacharacters.
+				return false, 0, pgerror.Newf(pgcode.InvalidEscapeSequence, "Unexpected behavior during processing custom escape character.")
+			} else if s[i+1] == '\\' {
+				// We'll want to escape '\\' to `\\\\` for correct processing later by
+				// unescapePattern. See (3) in the comment above replaceCustomEscape.
+				changed = true
+				retLen += 4
+				i += 2
+			} else {
+				// A metacharacter other than a backslash is escaped here.
+				if string(s[i+1]) == string(escape) {
+					// The metacharacter is our custom escape character. We need to look
+					// ahead to process it.
+					if i+2 == sLen {
+						// Escape character is the last character in s, so we need to return an error.
+						return false, 0, pgerror.Newf(pgcode.InvalidEscapeSequence, "LIKE pattern must not end with escape character")
+					}
+					if i+4 <= sLen {
+						if s[i+2] == '\\' && string(s[i+3]) == string(escape) {
+							// We have a sequence of `\`+escape+`\`+escape which will be
+							// replaced by `\`+escape.
+							changed = true
+							retLen += 2
+							i += 4
+							continue
+						}
+					}
+					// The metacharacter is escaping something different than itself, so
+					// `\`+escape will be replaced by `\`.
+					changed = true
+					retLen++
+					i += 2
+				} else {
+					// The metacharacter is not our custom escape character, so we're
+					// simply copying the backslash and the metacharacter.
+					retLen += 2
+					i += 2
+				}
+			}
+		} else {
+			// Regular symbol, so we'll simply copy it.
+			retLen += w
+			i += w
+		}
+	}
+	return changed, retLen, nil
+}
+
 // Pattern implements the RegexpCacheKey interface.
+// The strategy for handling custom escape character
+// is to convert all unescaped escape character into '\'.
+// k.escape can either be empty or a single character.
 func (k likeKey) Pattern() (string, error) {
-	// QuoteMeta escapes `\` to `\\`.
+	// QuoteMeta escapes all regexp metacharacters (`\.+*?()|[]{}^$`) with a `\`.
 	pattern := regexp.QuoteMeta(k.s)
+	var err error
+	if k.escape == 0 {
+		// Replace all LIKE/ILIKE specific wildcards with standard wildcards
+		// (escape character is empty - escape mechanism is turned off - so
+		// all '%' and '_' are actual wildcards regardless of what precedes them.
+		pattern = strings.Replace(pattern, `%`, `.*`, -1)
+		pattern = strings.Replace(pattern, `_`, `.`, -1)
+	} else if k.escape == '\\' {
+		// Replace LIKE/ILIKE specific wildcards with standard wildcards only when
+		// these wildcards are not escaped by '\\' (equivalent of '\' after QuoteMeta).
+		pattern = replaceUnescaped(pattern, `%`, `.*`, `\\`)
+		pattern = replaceUnescaped(pattern, `_`, `.`, `\\`)
+	} else {
+		// k.escape is non-empty and not `\`.
+		// If `%` is escape character, then it's not a wildcard.
+		if k.escape != '%' {
+			// Replace LIKE/ILIKE specific wildcards '%' only if it's unescaped.
+			if k.escape == '.' {
+				// '.' is the escape character, so for correct processing later by
+				// replaceCustomEscape we need to escape it by itself.
+				pattern = replaceUnescaped(pattern, `%`, `..*`, regexp.QuoteMeta(string(k.escape)))
+			} else if k.escape == '*' {
+				// '*' is the escape character, so for correct processing later by
+				// replaceCustomEscape we need to escape it by itself.
+				pattern = replaceUnescaped(pattern, `%`, `.**`, regexp.QuoteMeta(string(k.escape)))
+			} else {
+				pattern = replaceUnescaped(pattern, `%`, `.*`, regexp.QuoteMeta(string(k.escape)))
+			}
+		}
+		// If `_` is escape character, then it's not a wildcard.
+		if k.escape != '_' {
+			// Replace LIKE/ILIKE specific wildcards '_' only if it's unescaped.
+			if k.escape == '.' {
+				// '.' is the escape character, so for correct processing later by
+				// replaceCustomEscape we need to escape it by itself.
+				pattern = replaceUnescaped(pattern, `_`, `..`, regexp.QuoteMeta(string(k.escape)))
+			} else {
+				pattern = replaceUnescaped(pattern, `_`, `.`, regexp.QuoteMeta(string(k.escape)))
+			}
+		}
 
-	// Replace LIKE/ILIKE specific wildcards with standard wildcards
-	pattern = replaceUnescaped(pattern, `%`, `.*`, `\\`)
-	pattern = replaceUnescaped(pattern, `_`, `.`, `\\`)
+		// If a sequence of symbols ` escape+`\\` ` is unescaped, then that escape
+		// character escapes backslash in the original pattern (we need to use double
+		// backslash because of QuoteMeta behavior), so we want to "consume" the escape character.
+		pattern = replaceUnescaped(pattern, string(k.escape)+`\\`, `\\`, regexp.QuoteMeta(string(k.escape)))
 
-	// After QuoteMeta, our original escape character `\` has become
-	// `\\`.
+		// We want to replace all escape characters with `\\` only
+		// when they are unescaped. When an escape character is escaped,
+		// we replace it with its single occurrence.
+		if pattern, err = replaceCustomEscape(pattern, k.escape); err != nil {
+			return pattern, err
+		}
+	}
+
+	// After QuoteMeta, all '\' were converted to '\\'.
+	// After replaceCustomEscape, our custom unescaped escape characters were converted to `\\`,
+	// so now our pattern contains only '\\' as escape tokens.
 	// We need to unescape escaped escape tokens `\\` (now `\\\\`) and
 	// other escaped characters `\A` (now `\\A`).
-	var err error
-	if pattern, err = unescapePattern(pattern, `\\`); err != nil {
-		return "", err
+	if k.escape != 0 {
+		// We do not want to return an error when pattern ends with the supposed escape character `\`
+		// whereas the actual escape character is not `\`. The case when the pattern ends with
+		// an actual escape character is handled in replaceCustomEscape. For example, with '-' as
+		// the escape character on pattern 'abc\\' we do not want to return an error 'pattern ends
+		// with escape character' because '\\' is not an escape character in this case.
+		if pattern, err = unescapePattern(
+			pattern,
+			`\\`,
+			k.escape == '\\', /* emitEscapeCharacterLastError */
+		); err != nil {
+			return "", err
+		}
 	}
 
 	return anchorPattern(pattern, k.caseInsensitive), nil
 }
 
-type similarToKey string
+type similarToKey struct {
+	s      string
+	escape rune
+}
 
 // Pattern implements the RegexpCacheKey interface.
 func (k similarToKey) Pattern() (string, error) {
-	pattern := SimilarEscape(string(k))
+	pattern := similarEscapeCustomChar(k.s, k.escape, k.escape != 0)
 	return anchorPattern(pattern, false), nil
+}
+
+// SimilarToEscape checks if 'unescaped' is SIMILAR TO 'pattern' using custom escape token 'escape'
+// which must be either empty (which disables the escape mechanism) or a single unicode character.
+func SimilarToEscape(ctx *EvalContext, unescaped, pattern, escape string) (Datum, error) {
+	var escapeRune rune
+	if len(escape) > 0 {
+		var width int
+		escapeRune, width = utf8.DecodeRuneInString(escape)
+		if len(escape) > width {
+			return DBoolFalse, pgerror.Newf(pgcode.InvalidEscapeSequence, "invalid escape string")
+		}
+	}
+	key := similarToKey{s: pattern, escape: escapeRune}
+	return matchRegexpWithKey(ctx, NewDString(unescaped), key)
 }
 
 type regexpKey struct {
@@ -3742,13 +5182,14 @@ func (k regexpKey) Pattern() (string, error) {
 // SimilarEscape converts a SQL:2008 regexp pattern to POSIX style, so it can
 // be used by our regexp engine.
 func SimilarEscape(pattern string) string {
-	return similarEscapeCustomChar(pattern, '\\')
+	return similarEscapeCustomChar(pattern, '\\', true)
 }
 
 // similarEscapeCustomChar converts a SQL:2008 regexp pattern to POSIX style,
 // so it can be used by our regexp engine. This version of the function allows
 // for a custom escape character.
-func similarEscapeCustomChar(pattern string, escapeChar rune) string {
+// 'isEscapeNonEmpty' signals whether 'escapeChar' should be treated as empty.
+func similarEscapeCustomChar(pattern string, escapeChar rune, isEscapeNonEmpty bool) string {
 	patternBuilder := make([]rune, 0, utf8.RuneCountInString(pattern))
 
 	inCharClass := false
@@ -3765,11 +5206,15 @@ func similarEscapeCustomChar(pattern string, escapeChar rune) string {
 					patternBuilder = append(patternBuilder, ')')
 				}
 				numQuotes++
+			} else if c == escapeChar && len(string(escapeChar)) > 1 {
+				// We encountered escaped escape unicode character represented by at least two bytes,
+				// so we keep only its single occurrence and need not to prepend it by '\'.
+				patternBuilder = append(patternBuilder, c)
 			} else {
 				patternBuilder = append(patternBuilder, '\\', c)
 			}
 			afterEscape = false
-		case utf8.ValidRune(escapeChar) && c == escapeChar:
+		case utf8.ValidRune(escapeChar) && c == escapeChar && isEscapeNonEmpty:
 			// SQL99 escape character; do not immediately send to output
 			afterEscape = true
 		case inCharClass:
@@ -3812,7 +5257,7 @@ func caseInsensitive(pattern string) string {
 }
 
 // anchorPattern surrounds the transformed input string with
-//   ^(?: ... )$
+//   ^(?s: ... )$
 // which requires some explanation.  We need "^" and "$" to force
 // the pattern to match the entire input string as per SQL99 spec.
 // The "(?:" and ")" are a non-capturing set of parens; we have to have
@@ -3820,21 +5265,24 @@ func caseInsensitive(pattern string) string {
 // be bound into the first and last alternatives which is not what we
 // want, and the parens must be non capturing because we don't want them
 // to count when selecting output for SUBSTRING.
+// "?s" turns on "dot all" mode meaning a dot will match any single character
+// (without turning this mode on, the dot matches any single character except
+// for line breaks).
 func anchorPattern(pattern string, caseInsensitive bool) string {
 	if caseInsensitive {
-		return fmt.Sprintf("^(?i:%s)$", pattern)
+		return fmt.Sprintf("^(?si:%s)$", pattern)
 	}
-	return fmt.Sprintf("^(?:%s)$", pattern)
+	return fmt.Sprintf("^(?s:%s)$", pattern)
 }
 
 // FindEqualComparisonFunction looks up an overload of the "=" operator
 // for a given pair of input operand types.
 func FindEqualComparisonFunction(
-	leftType, rightType types.T,
+	leftType, rightType *types.T,
 ) (func(*EvalContext, Datum, Datum) (Datum, error), bool) {
-	fn, found := CmpOps[EQ].lookupImpl(leftType, rightType)
+	fn, found := CmpOps[EQ].LookupImpl(leftType, rightType)
 	if found {
-		return fn.fn, true
+		return fn.Fn, true
 	}
 	return nil, false
 }
@@ -3849,7 +5297,7 @@ func IntPow(x, y DInt) (*DInt, error) {
 	}
 	i, err := xd.Int64()
 	if err != nil {
-		return nil, errIntOutOfRange
+		return nil, ErrIntOutOfRange
 	}
 	return NewDInt(DInt(i)), nil
 }
@@ -3876,3 +5324,59 @@ func PickFromTuple(ctx *EvalContext, greatest bool, args Datums) (Datum, error) 
 	}
 	return g, nil
 }
+
+// CallbackValueGenerator is a ValueGenerator that calls a supplied callback for
+// producing the values. To be used with
+// EvalContextTestingKnobs.CallbackGenerators.
+type CallbackValueGenerator struct {
+	// cb is the callback to be called for producing values. It gets passed in 0
+	// as prev initially, and the value it previously returned for subsequent
+	// invocations. Once it returns -1 or an error, it will not be invoked any
+	// more.
+	cb  func(ctx context.Context, prev int, txn *kv.Txn) (int, error)
+	val int
+	txn *kv.Txn
+}
+
+var _ ValueGenerator = &CallbackValueGenerator{}
+
+// NewCallbackValueGenerator creates a new CallbackValueGenerator.
+func NewCallbackValueGenerator(
+	cb func(ctx context.Context, prev int, txn *kv.Txn) (int, error),
+) *CallbackValueGenerator {
+	return &CallbackValueGenerator{
+		cb: cb,
+	}
+}
+
+// ResolvedType is part of the ValueGenerator interface.
+func (c *CallbackValueGenerator) ResolvedType() *types.T {
+	return types.Int
+}
+
+// Start is part of the ValueGenerator interface.
+func (c *CallbackValueGenerator) Start(_ context.Context, txn *kv.Txn) error {
+	c.txn = txn
+	return nil
+}
+
+// Next is part of the ValueGenerator interface.
+func (c *CallbackValueGenerator) Next(ctx context.Context) (bool, error) {
+	var err error
+	c.val, err = c.cb(ctx, c.val, c.txn)
+	if err != nil {
+		return false, err
+	}
+	if c.val == -1 {
+		return false, nil
+	}
+	return true, nil
+}
+
+// Values is part of the ValueGenerator interface.
+func (c *CallbackValueGenerator) Values() Datums {
+	return Datums{NewDInt(DInt(c.val))}
+}
+
+// Close is part of the ValueGenerator interface.
+func (c *CallbackValueGenerator) Close() {}

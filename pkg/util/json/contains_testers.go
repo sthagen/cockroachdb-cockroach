@@ -1,24 +1,18 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This file contains (ha!) helpers to test @>.
 
 package json
 
-import (
-	"math/rand"
-)
+import "math/rand"
 
 type containsTester interface {
 	// slowContains is a slower but simpler implementation of contains to check
@@ -27,6 +21,27 @@ type containsTester interface {
 
 	// subdocument returns a JSON document which is contained by this one.
 	subdocument(isRoot bool, rng *rand.Rand) JSON
+}
+
+func slowContains(a, b JSON) bool {
+	// This is a unique case of contains (and is described as such in the
+	// Postgres docs) - an array contains a scalar which is an element of it.
+	// This contradicts the general rule of contains that the contained object
+	// must have the same "shape" as the containing object.
+	if a.Type() == ArrayJSONType {
+		ary := a.MaybeDecode().(jsonArray)
+		if b.isScalar() {
+			for _, j := range ary {
+				cmp, _ := j.Compare(b)
+				if cmp == 0 {
+					return true
+				}
+			}
+			return false
+		}
+	}
+
+	return a.(containsTester).slowContains(b)
 }
 
 func (j jsonNull) slowContains(other JSON) bool {
@@ -51,15 +66,6 @@ func (j jsonString) slowContains(other JSON) bool {
 }
 
 func (j jsonArray) slowContains(other JSON) bool {
-	if other.isScalar() {
-		for i := 0; i < len(j); i++ {
-			c, _ := j[i].Compare(other)
-			if c == 0 {
-				return true
-			}
-		}
-	}
-
 	other = other.MaybeDecode()
 	if ary, ok := other.(jsonArray); ok {
 		for i := 0; i < len(ary); i++ {

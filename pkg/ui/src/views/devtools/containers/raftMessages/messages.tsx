@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 
 import { LineGraph } from "src/views/cluster/components/linegraph";
@@ -14,7 +24,7 @@ export default function (props: GraphDashboardProps) {
       sources={nodeSources}
       tooltip={`The number of raft app messages ${tooltipSelection}`}
     >
-      <Axis>
+      <Axis label="messages">
         <Metric name="cr.store.raft.rcvd.app" title="App" nonNegativeRate />
         <Metric name="cr.store.raft.rcvd.appresp" title="AppResp" nonNegativeRate />
       </Axis>
@@ -25,7 +35,7 @@ export default function (props: GraphDashboardProps) {
       sources={nodeSources}
       tooltip={`The number of raft heartbeat messages ${tooltipSelection}`}
     >
-      <Axis>
+      <Axis label="heartbeats">
         <Metric name="cr.store.raft.rcvd.heartbeat" title="Heartbeat" nonNegativeRate />
         <Metric name="cr.store.raft.rcvd.heartbeatresp" title="HeartbeatResp" nonNegativeRate />
       </Axis>
@@ -36,7 +46,7 @@ export default function (props: GraphDashboardProps) {
       sources={nodeSources}
       tooltip={`The number of other raft messages ${tooltipSelection}`}
     >
-      <Axis>
+      <Axis label="messages">
         <Metric name="cr.store.raft.rcvd.prop" title="Prop" nonNegativeRate />
         <Metric name="cr.store.raft.rcvd.vote" title="Vote" nonNegativeRate />
         <Metric name="cr.store.raft.rcvd.voteresp" title="VoteResp" nonNegativeRate />
@@ -65,7 +75,7 @@ export default function (props: GraphDashboardProps) {
       sources={nodeSources}
       tooltip={`The number of raft ticks queued ${tooltipSelection}`}
     >
-      <Axis>
+      <Axis label="ticks">
         <Metric name="cr.store.raft.ticks" title="Ticks" nonNegativeRate />
       </Axis>
     </LineGraph>,
@@ -75,7 +85,7 @@ export default function (props: GraphDashboardProps) {
       sources={nodeSources}
       tooltip={`The number of raft heartbeats and responses waiting to be coalesced ${tooltipSelection}`}
     >
-      <Axis>
+      <Axis label="heartbeats">
         <Metric name="cr.store.raft.heartbeats.pending" title="Pending" />
       </Axis>
     </LineGraph>,

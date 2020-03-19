@@ -1,25 +1,41 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import Long from "long";
 import React from "react";
+import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
-import { Link, RouterState } from "react-router";
-
+import { Link, RouteComponentProps, withRouter } from "react-router-dom";
 import * as protos from "src/js/protos";
-import { refreshProblemRanges } from "src/redux/apiReducers";
+import { problemRangesRequestKey, refreshProblemRanges } from "src/redux/apiReducers";
+import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { AdminUIState } from "src/redux/state";
 import { nodeIDAttr } from "src/util/constants";
 import { FixLong } from "src/util/fixLong";
 import ConnectionsTable from "src/views/reports/containers/problemRanges/connectionsTable";
+import Loading from "src/views/shared/components/loading";
+import { getMatchParamByName } from "src/util/query";
 
-type ProblemRangesResponse = protos.cockroach.server.serverpb.ProblemRangesResponse;
-type NodeProblems$Properties = protos.cockroach.server.serverpb.ProblemRangesResponse.NodeProblems$Properties;
+type NodeProblems$Properties = protos.cockroach.server.serverpb.ProblemRangesResponse.INodeProblems;
 
 interface ProblemRangesOwnProps {
-  problemRanges: ProblemRangesResponse;
+  problemRanges: CachedDataReducerState<protos.cockroach.server.serverpb.ProblemRangesResponse>;
   refreshProblemRanges: typeof refreshProblemRanges;
 }
 
-type ProblemRangesProps = ProblemRangesOwnProps & RouterState;
+type ProblemRangesProps = ProblemRangesOwnProps & RouteComponentProps;
+
+function isLoading(state: CachedDataReducerState<any>) {
+  return _.isNil(state) || (_.isNil(state.data) && _.isNil(state.lastError));
+}
 
 function ProblemRangeList(props: {
   name: string,
@@ -39,7 +55,7 @@ function ProblemRangeList(props: {
   }
   return (
     <div>
-      <h2>{props.name}</h2>
+      <h2 className="base-heading">{props.name}</h2>
       <div className="problems-list">
         {
           _.map(ids, id => {
@@ -55,6 +71,12 @@ function ProblemRangeList(props: {
   );
 }
 
+function problemRangeRequestFromProps(props: ProblemRangesProps) {
+  return new protos.cockroach.server.serverpb.ProblemRangesRequest({
+    node_id: getMatchParamByName(props.match, nodeIDAttr),
+  });
+}
+
 /**
  * Renders the Problem Ranges page.
  *
@@ -62,11 +84,9 @@ function ProblemRangeList(props: {
  * per node basis. This page aggregates those lists together and displays all
  * unique range IDs that have problems.
  */
-class ProblemRanges extends React.Component<ProblemRangesProps, {}> {
+export class ProblemRanges extends React.Component<ProblemRangesProps, {}> {
   refresh(props = this.props) {
-    props.refreshProblemRanges(new protos.cockroach.server.serverpb.ProblemRangesRequest({
-      node_id: props.params[nodeIDAttr],
-    }));
+    props.refreshProblemRanges(problemRangeRequestFromProps(props));
   }
 
   componentWillMount() {
@@ -80,53 +100,59 @@ class ProblemRanges extends React.Component<ProblemRangesProps, {}> {
     }
   }
 
-  render() {
-    const { problemRanges } = this.props;
-    if (!problemRanges) {
-      return (
-        <div className="section">
-          <h1>Problem Ranges Report</h1>
-          <h2>Loading cluster status...</h2>
-        </div>
-      );
+  renderReportBody() {
+    const { problemRanges, match } = this.props;
+    const nodeId = getMatchParamByName(match, nodeIDAttr);
+
+    if (isLoading(this.props.problemRanges)) {
+      return null;
     }
 
-    let titleText = "Problem Ranges for ";
-    const validIDs = _.keys(_.pickBy(problemRanges.problems_by_node_id, problems => {
-      return _.isEmpty(problems.error_message);
+    if (!_.isNil(problemRanges.lastError)) {
+      if (nodeId === null) {
+        return (
+          <div>
+            <h2 className="base-heading">Error loading Problem Ranges for the Cluster</h2>
+            {problemRanges.lastError.toString()}
+          </div>
+        );
+      } else {
+        return (
+          <div>
+            <h2 className="base-heading">Error loading Problem Ranges for node n{nodeId}</h2>
+            {problemRanges.lastError.toString()}
+          </div>
+        );
+      }
+    }
+
+    const { data } = problemRanges;
+
+    const validIDs = _.keys(_.pickBy(data.problems_by_node_id, d => {
+      return _.isEmpty(d.error_message);
     }));
-
-    switch (validIDs.length) {
-      case 0:
-        if (_.isEmpty(this.props.params[nodeIDAttr])) {
-          titleText = `No nodes returned any results`;
-        } else {
-          titleText = `No results for node n${this.props.params[nodeIDAttr]}`;
-        }
-        break;
-      case 1:
-        const singleNodeID = _.keys(problemRanges.problems_by_node_id)[0];
-        titleText = `Problem Ranges on Node n${singleNodeID}`;
-        break;
-      default:
-        titleText = "Problem Ranges on the Cluster";
-    }
-
     if (validIDs.length === 0) {
-      return (
-        <div className="section">
-          <h1>Problem Ranges Report</h1>
-          <h2>{titleText}</h2>
-          <ConnectionsTable problemRanges={problemRanges} />
-        </div>
-      );
+      if (nodeId === null) {
+        return <h2 className="base-heading">No nodes returned any results</h2>;
+      } else {
+        return <h2 className="base-heading">No results reported for node n{nodeId}</h2>;
+      }
     }
 
-    const problems = _.values(problemRanges.problems_by_node_id);
+    let titleText: string; // = "Problem Ranges for ";
+    if (validIDs.length === 1) {
+      const singleNodeID = _.keys(data.problems_by_node_id)[0];
+      titleText = `Problem Ranges on Node n${singleNodeID}`;
+    } else {
+      titleText = "Problem Ranges on the Cluster";
+    }
+
+    const problems = _.values(data.problems_by_node_id);
     return (
-      <div className="section">
-        <h1>Problem Ranges Report</h1>
-        <h2>{titleText}</h2>
+      <div>
+        <h2 className="base-heading">
+          {titleText}
+        </h2>
         <ProblemRangeList
           name="Unavailable"
           problems={problems}
@@ -138,7 +164,7 @@ class ProblemRanges extends React.Component<ProblemRangesProps, {}> {
           extract={(problem) => problem.no_raft_leader_range_ids}
         />
         <ProblemRangeList
-          name="No Lease"
+          name="Invalid Lease"
           problems={problems}
           extract={(problem) => problem.no_lease_range_ids}
         />
@@ -152,20 +178,53 @@ class ProblemRanges extends React.Component<ProblemRangesProps, {}> {
           problems={problems}
           extract={(problem) => problem.underreplicated_range_ids}
         />
-        <ConnectionsTable problemRanges={problemRanges} />
+        <ProblemRangeList
+          name="Overreplicated"
+          problems={problems}
+          extract={(problem) => problem.overreplicated_range_ids}
+        />
+        <ProblemRangeList
+          name="Quiescent equals ticking"
+          problems={problems}
+          extract={(problem) => problem.quiescent_equals_ticking_range_ids}
+        />
+      </div>
+    );
+  }
+
+  render() {
+    return (
+      <div className="section">
+        <Helmet title="Problem Ranges | Debug" />
+        <h1 className="base-heading">Problem Ranges Report</h1>
+        <Loading
+          loading={isLoading(this.props.problemRanges)}
+          error={this.props.problemRanges && this.props.problemRanges.lastError}
+          render={() => (
+            <div>
+              {this.renderReportBody()}
+              <ConnectionsTable problemRanges={this.props.problemRanges} />
+            </div>
+          )}
+        />
       </div>
     );
   }
 }
 
-export default connect(
-  (state: AdminUIState, props: ProblemRangesProps) => {
-    const nodeID = props.params[nodeIDAttr];
-    return {
-      problemRanges: state.cachedData.problemRanges[nodeID] && state.cachedData.problemRanges[nodeID].data,
-    };
-  },
-  {
-    refreshProblemRanges,
-  },
-)(ProblemRanges);
+const mapStateToProps = (state: AdminUIState, props: ProblemRangesProps) => {
+  const nodeIDKey = problemRangesRequestKey(problemRangeRequestFromProps(props));
+  return {
+    problemRanges: state.cachedData.problemRanges[nodeIDKey],
+  };
+};
+
+const mapDispatchToProps = {
+  // actionCreators returns objects with type and payload
+  refreshProblemRanges,
+};
+
+export default withRouter(connect(
+  mapStateToProps,
+  mapDispatchToProps,
+)(ProblemRanges));

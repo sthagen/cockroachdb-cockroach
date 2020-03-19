@@ -1,0 +1,149 @@
+# =============================================================================
+# limit.opt contains normalization rules for the Limit and Offset operators.
+# =============================================================================
+
+
+# EliminateLimit discards a Limit operator if its constant limit is greater than
+# or equal to the maximum number of rows that can be returned by the input. In
+# this case, the Limit is just a no-op, because the rows are already limited.
+[EliminateLimit, Normalize]
+(Limit
+    $input:*
+    (Const $limit:*) & (LimitGeMaxRows $limit $input)
+)
+=>
+$input
+
+# EliminateOffset discards an Offset operator if its offset value is zero.
+[EliminateOffset, Normalize]
+(Offset
+    $input:*
+    (Const 0)
+)
+=>
+$input
+
+# PushLimitIntoProject pushes the Limit operator into its Project input. It is
+# desirable to push the Limit operator as low in the query as possible, in order
+# to minimize the number of rows that other operators need to process.
+[PushLimitIntoProject, Normalize]
+(Limit
+    (Project $input:* $projections:* $passthrough:*)
+    $limit:*
+    $ordering:* & (HasColsInOrdering $input $ordering)
+)
+=>
+(Project
+    (Limit $input $limit (PruneOrdering $ordering (OutputCols $input)))
+    $projections
+    $passthrough
+)
+
+# PushOffsetIntoProject pushes the Offset operator into its Project input. It is
+# desirable to push the Offset operator as low in the query as possible, in
+# order to minimize the number of rows that other operators need to process.
+[PushOffsetIntoProject, Normalize]
+(Offset
+    (Project $input:* $projections:* $passthrough:*)
+    $offset:*
+    $ordering:* & (HasColsInOrdering $input $ordering)
+)
+=>
+(Project
+    (Offset $input $offset (PruneOrdering $ordering (OutputCols $input)))
+    $projections
+    $passthrough
+)
+
+# PushLimitIntoOffset pushes the Limit operator into the offset. This should
+# not have a negative impact but it would allow the use of the GenerateLimitedScans
+# rule.
+[PushLimitIntoOffset, Normalize]
+(Limit
+    (Offset
+        $input:*
+        (Const $offset:* & (IsPositiveLimit $offset))
+        $offsetOrdering:*
+    )
+    (Const $limit:* & (IsPositiveLimit $limit))
+    $limitOrdering:* & (IsSameOrdering $offsetOrdering $limitOrdering) &
+        (CanAddConstInts $limit $offset)
+)
+=>
+(Offset
+    (Limit
+        $input
+        (Const (AddConstInts $offset $limit))
+        $limitOrdering
+     )
+    (Const $offset)
+    $offsetOrdering
+)
+
+# PushLimitIntoOrdinality pushes the Limit operator into the Ordinality
+# operator when the ordering associated with both operators allows it.
+#
+# Pushing the limit as far as possible down the tree shouldn't have negative
+# effects, but will reduce the number of rows processed by operators higher up,
+# and if the limit is pushed all the way down to a scan, the scan can be limited
+# directly.
+#
+# In order to prevent this rule from affecting:
+#   1. the set of rows kept by the limit,
+#   2. the ordinals assigned to those rows by the ordinality, and
+#   3. the final ordering of the rows,
+# the new limit's ordering should be "extended" to imply the ordinality's
+# ordering, so it is set to be an intersection of the original limit ordering
+# and the ordinality's ordering (see OrderingChoice.Intersection).
+[PushLimitIntoOrdinality, Normalize]
+(Limit
+    (Ordinality
+        $input:*
+        $private:*
+    )
+    $limit:*
+    $limitOrdering:* &
+        (HasColsInOrdering $input $limitOrdering) &
+        (OrderingIntersects (OrdinalityOrdering $private) $limitOrdering)
+)
+=>
+(Ordinality
+    (Limit
+        $input
+        $limit
+        (OrderingIntersection (OrdinalityOrdering $private) $limitOrdering)
+    )
+    $private
+)
+
+# PushLimitIntoLeftJoin pushes a Limit into the left input of a left join. Since
+# the left join creates an output row for each left input row, we only need that
+# many rows from that input. We can only do this if the limit ordering refers
+# only to the left input columns. We also check that the cardinality of the left
+# input is more than the limit, to prevent repeated applications of the rule.
+[PushLimitIntoLeftJoin, Normalize]
+(Limit
+    $input:(LeftJoin
+        $left:*
+        $right:*
+        $on:*
+        $private:*
+    )
+    (Const $limit:*) & (IsPositiveLimit $limit) & ^(LimitGeMaxRows $limit $left)
+    $ordering:* & (HasColsInOrdering $left $ordering)
+)
+=>
+(Limit
+    (LeftJoin
+        (Limit
+            $left
+            (Const $limit)
+            (PruneOrdering $ordering (OutputCols $left))
+        )
+        $right
+        $on
+        $private
+    )
+    (Const $limit)
+    $ordering
+)

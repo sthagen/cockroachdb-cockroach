@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -21,21 +17,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kr/pretty"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/kr/pretty"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseInitNodeAttributes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	cfg := MakeConfig(context.TODO(), cluster.MakeTestingClusterSettings())
 	cfg.Attrs = "attr1=val1::attr2=val2"
-	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, SizeInBytes: base.MinimumStoreSize * 100}}}
+	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, Size: base.SizeSpec{InBytes: base.MinimumStoreSize * 100}}}}
 	engines, err := cfg.CreateEngines(context.TODO())
 	if err != nil {
 		t.Fatalf("Failed to initialize stores: %s", err)
@@ -55,8 +51,8 @@ func TestParseInitNodeAttributes(t *testing.T) {
 func TestParseJoinUsingAddrs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	cfg := MakeConfig(context.TODO(), cluster.MakeTestingClusterSettings())
-	cfg.JoinList = []string{"localhost:12345,,localhost:23456", "localhost:34567"}
-	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, SizeInBytes: base.MinimumStoreSize * 100}}}
+	cfg.JoinList = []string{"localhost:12345", "localhost:23456", "localhost:34567", "localhost"}
+	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, Size: base.SizeSpec{InBytes: base.MinimumStoreSize * 100}}}}
 	engines, err := cfg.CreateEngines(context.TODO())
 	if err != nil {
 		t.Fatalf("Failed to initialize stores: %s", err)
@@ -77,7 +73,11 @@ func TestParseJoinUsingAddrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := []resolver.Resolver{r1, r2, r3}
+	r4, err := resolver.NewResolver("localhost:26257")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []resolver.Resolver{r1, r2, r3, r4}
 	if !reflect.DeepEqual(cfg.GossipBootstrapResolvers, expected) {
 		t.Fatalf("Unexpected bootstrap addresses: %v, expected: %v", cfg.GossipBootstrapResolvers, expected)
 	}
@@ -90,19 +90,19 @@ func TestReadEnvironmentVariables(t *testing.T) {
 
 	resetEnvVar := func() {
 		// Reset all environment variables in case any were already set.
-		if err := os.Unsetenv("COCKROACH_LINEARIZABLE"); err != nil {
+		if err := os.Unsetenv("COCKROACH_EXPERIMENTAL_LINEARIZABLE"); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Unsetenv("COCKROACH_SCAN_INTERVAL"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Unsetenv("COCKROACH_SCAN_MIN_IDLE_TIME"); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Unsetenv("COCKROACH_SCAN_MAX_IDLE_TIME"); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Unsetenv("COCKROACH_CONSISTENCY_CHECK_INTERVAL"); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Unsetenv("COCKROACH_CONSISTENCY_CHECK_PANIC_ON_FAILURE"); err != nil {
 			t.Fatal(err)
 		}
 		envutil.ClearEnvCache()
@@ -116,13 +116,11 @@ func TestReadEnvironmentVariables(t *testing.T) {
 
 	resetEnvVar()
 	cfg.readEnvironmentVariables()
-	if !reflect.DeepEqual(cfg, cfgExpected) {
-		t.Fatalf("actual context does not match expected: diff(actual, expected) = %s\nactual:\n%+v\nexpected:\n%+v", pretty.Diff(cfg, cfgExpected), cfg, cfgExpected)
-	}
+	require.Equal(t, cfgExpected, cfg)
 
 	// Set all the environment variables to valid values and ensure they are set
 	// correctly.
-	if err := os.Setenv("COCKROACH_LINEARIZABLE", "true"); err != nil {
+	if err := os.Setenv("COCKROACH_EXPERIMENTAL_LINEARIZABLE", "true"); err != nil {
 		t.Fatal(err)
 	}
 	cfgExpected.Linearizable = true
@@ -130,6 +128,10 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgExpected.ScanInterval = time.Hour * 48
+	if err := os.Setenv("COCKROACH_SCAN_MIN_IDLE_TIME", "1h"); err != nil {
+		t.Fatal(err)
+	}
+	cfgExpected.ScanMinIdleTime = time.Hour
 	if err := os.Setenv("COCKROACH_SCAN_MAX_IDLE_TIME", "100ns"); err != nil {
 		t.Fatal(err)
 	}
@@ -142,8 +144,9 @@ func TestReadEnvironmentVariables(t *testing.T) {
 	}
 
 	for _, envVar := range []string{
-		"COCKROACH_LINEARIZABLE",
+		"COCKROACH_EXPERIMENTAL_LINEARIZABLE",
 		"COCKROACH_SCAN_INTERVAL",
+		"COCKROACH_SCAN_MIN_IDLE_TIME",
 		"COCKROACH_SCAN_MAX_IDLE_TIME",
 	} {
 		t.Run("invalid", func(t *testing.T) {

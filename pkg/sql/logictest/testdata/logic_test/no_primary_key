@@ -1,10 +1,3 @@
-# LogicTest: default parallel-stmts distsql
-
-query error duplicate column name: "rowid"
-CREATE TABLE t (
-  rowid INT
-)
-
 statement ok
 CREATE TABLE t (
   a INT,
@@ -59,12 +52,13 @@ SELECT rowid FROM t WHERE a = 10
 ----
 11
 
-query TTBTT
+query TTBTTTB
 SHOW COLUMNS FROM t
 ----
-a  INT     true  NULL {}
-b  INT     true  NULL {}
-c  STRING  true  NULL {}
+a      INT8    true   NULL            ·  {}         false
+b      INT8    true   NULL            ·  {}         false
+rowid  INT8    false  unique_rowid()  ·  {primary}  true
+c      STRING  true   NULL            ·  {}         false
 
 statement ok
 CREATE INDEX a_idx ON t (a)

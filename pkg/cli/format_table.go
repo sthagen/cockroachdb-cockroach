@@ -1,31 +1,32 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
 import (
-	"encoding/csv"
+	"bytes"
 	"fmt"
 	"html"
 	"io"
+	"reflect"
 	"strings"
+	"text/tabwriter"
+	"time"
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding/csv"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/olekukonko/tablewriter"
-	"github.com/pkg/errors"
 )
 
 // rowStrIter is an iterator interface for the printQueryOutput function. It is
@@ -34,6 +35,7 @@ import (
 type rowStrIter interface {
 	Next() (row []string, err error)
 	ToSlice() (allRows [][]string, err error)
+	Align() []int
 }
 
 // rowSliceIter is an implementation of the rowStrIter interface and it is used
@@ -42,6 +44,7 @@ type rowStrIter interface {
 type rowSliceIter struct {
 	allRows [][]string
 	index   int
+	align   []int
 }
 
 func (iter *rowSliceIter) Next() (row []string, err error) {
@@ -57,13 +60,35 @@ func (iter *rowSliceIter) ToSlice() ([][]string, error) {
 	return iter.allRows, nil
 }
 
+func (iter *rowSliceIter) Align() []int {
+	return iter.align
+}
+
+func convertAlign(align string) []int {
+	result := make([]int, len(align))
+	for i, v := range align {
+		switch v {
+		case 'l':
+			result[i] = tablewriter.ALIGN_LEFT
+		case 'r':
+			result[i] = tablewriter.ALIGN_RIGHT
+		case 'c':
+			result[i] = tablewriter.ALIGN_CENTER
+		default:
+			result[i] = tablewriter.ALIGN_DEFAULT
+		}
+	}
+	return result
+}
+
 // newRowSliceIter is an implementation of the rowStrIter interface and it is
 // used when the rows have not been buffered into memory yet and we want to
 // stream them to the row formatters as they arrive over the network.
-func newRowSliceIter(allRows [][]string) *rowSliceIter {
+func newRowSliceIter(allRows [][]string, align string) *rowSliceIter {
 	return &rowSliceIter{
 		allRows: allRows,
 		index:   0,
+		align:   convertAlign(align),
 	}
 }
 
@@ -87,6 +112,28 @@ func (iter *rowIter) ToSlice() ([][]string, error) {
 	return getAllRowStrings(iter.rows, iter.showMoreChars)
 }
 
+func (iter *rowIter) Align() []int {
+	cols := iter.rows.Columns()
+	align := make([]int, len(cols))
+	for i := range align {
+		switch iter.rows.ColumnTypeScanType(i).Kind() {
+		case reflect.String:
+			align[i] = tablewriter.ALIGN_LEFT
+		case reflect.Slice:
+			align[i] = tablewriter.ALIGN_LEFT
+		case reflect.Int64:
+			align[i] = tablewriter.ALIGN_RIGHT
+		case reflect.Float64:
+			align[i] = tablewriter.ALIGN_RIGHT
+		case reflect.Bool:
+			align[i] = tablewriter.ALIGN_CENTER
+		default:
+			align[i] = tablewriter.ALIGN_DEFAULT
+		}
+	}
+	return align
+}
+
 func newRowIter(rows *sqlRows, showMoreChars bool) *rowIter {
 	return &rowIter{
 		rows:          rows,
@@ -105,7 +152,7 @@ func newRowIter(rows *sqlRows, showMoreChars bool) *rowIter {
 //   returns true.
 type rowReporter interface {
 	describe(w io.Writer, cols []string) error
-	beforeFirstRow(w io.Writer) error
+	beforeFirstRow(w io.Writer, allRows rowStrIter) error
 	iter(w io.Writer, rowIdx int, row []string) error
 	doneRows(w io.Writer, seenRows int) error
 	doneNoRows(w io.Writer) error
@@ -113,15 +160,53 @@ type rowReporter interface {
 
 // render iterates using the rowReporter object.
 // The caller can pass a noRowsHook helper that will be called in the
-// case there were no result rows. The helper is guaranteed to be called
+// case there were no result rows and no error.
+// This helper is guaranteed to be called
 // after the iteration through iter.Next(). Used in runQueryAndFormatResults.
+//
+// The completedHook is called after the last row is received/passed to the
+// rendered, but before the final rendering takes place. It is called
+// regardless of whether an error occurred.
 func render(
-	r rowReporter, w io.Writer, cols []string, iter rowStrIter, noRowsHook func() (bool, error),
-) error {
-	if err := r.describe(w, cols); err != nil {
-		return err
-	}
+	r rowReporter,
+	w io.Writer,
+	cols []string,
+	iter rowStrIter,
+	completedHook func(),
+	noRowsHook func() (bool, error),
+) (err error) {
+	described := false
 	nRows := 0
+	defer func() {
+		// If the column headers are not printed yet, do it now.
+		if !described {
+			err = errors.WithSecondaryError(err, r.describe(w, cols))
+		}
+
+		// completedHook, if provided, is called unconditonally of error.
+		if completedHook != nil {
+			completedHook()
+		}
+
+		// We need to call doneNoRows/doneRows also unconditionally.
+		var handled bool
+		if nRows == 0 && noRowsHook != nil {
+			handled, err = noRowsHook()
+			if err != nil {
+				return
+			}
+		}
+		if handled {
+			err = errors.WithSecondaryError(err, r.doneNoRows(w))
+		} else {
+			err = errors.WithSecondaryError(err, r.doneRows(w, nRows))
+		}
+
+		if err != nil && nRows > 0 {
+			fmt.Fprintf(stderr, "(error encountered after some results were delivered)\n")
+		}
+	}()
+
 	for {
 		// Get a next row.
 		row, err := iter.Next()
@@ -135,65 +220,111 @@ func render(
 		}
 		if nRows == 0 {
 			// First row? Report.
-			if err := r.beforeFirstRow(w); err != nil {
+			described = true
+			if err = r.describe(w, cols); err != nil {
+				return err
+			}
+			if err = r.beforeFirstRow(w, iter); err != nil {
 				return err
 			}
 		}
 
 		// Report every row including the first.
-		if err := r.iter(w, nRows, row); err != nil {
+		if err = r.iter(w, nRows, row); err != nil {
 			return err
 		}
 
 		nRows++
 	}
 
-	if nRows == 0 && noRowsHook != nil {
-		handled, err := noRowsHook()
-		if err != nil {
-			return err
-		}
-		if handled {
-			return r.doneNoRows(w)
-		}
-	}
-	return r.doneRows(w, nRows)
+	return nil
 }
 
-type prettyReporter struct {
-	cols  []string
+type asciiTableReporter struct {
+	rows  int
 	table *tablewriter.Table
+	buf   bytes.Buffer
+	w     *tabwriter.Writer
 }
 
-func (p *prettyReporter) describe(w io.Writer, cols []string) error {
-	p.cols = cols
+func newASCIITableReporter() *asciiTableReporter {
+	n := &asciiTableReporter{}
+	// 4-wide columns, 1 character minimum width.
+	n.w = tabwriter.NewWriter(&n.buf, 4, 0, 1, ' ', 0)
+	return n
+}
+
+func (p *asciiTableReporter) describe(w io.Writer, cols []string) error {
 	if len(cols) > 0 {
+		// Ensure that tabs are converted to spaces and newlines are
+		// doubled so they can be recognized in the output.
+		expandedCols := make([]string, len(cols))
+		for i, c := range cols {
+			p.buf.Reset()
+			fmt.Fprint(p.w, c)
+			_ = p.w.Flush()
+			expandedCols[i] = p.buf.String()
+		}
+
 		// Initialize tablewriter and set column names as the header row.
 		p.table = tablewriter.NewWriter(w)
 		p.table.SetAutoFormatHeaders(false)
 		p.table.SetAutoWrapText(false)
-		p.table.SetHeader(p.cols)
+		p.table.SetBorder(false)
+		p.table.SetReflowDuringAutoWrap(false)
+		p.table.SetHeader(expandedCols)
+		p.table.SetTrimWhiteSpaceAtEOL(true)
+		// This width is sufficient to show a "standard text line width"
+		// on the screen when viewed as a single column on a 80-wide terminal.
+		//
+		// It's also wide enough for the output of SHOW CREATE on
+		// moderately long column definitions (e.g. including FK
+		// constraints).
+		p.table.SetColWidth(72)
 	}
 	return nil
 }
 
-func (p *prettyReporter) beforeFirstRow(w io.Writer) error { return nil }
-
-func (p *prettyReporter) iter(_ io.Writer, _ int, row []string) error {
+func (p *asciiTableReporter) beforeFirstRow(w io.Writer, iter rowStrIter) error {
 	if p.table == nil {
 		return nil
 	}
 
-	for i, r := range row {
-		row[i] = expandTabsAndNewLines(r)
-	}
-	p.table.Append(row)
+	p.table.SetColumnAlignment(iter.Align())
 	return nil
 }
 
-func (p *prettyReporter) doneRows(w io.Writer, seenRows int) error {
+// asciiTableWarnRows is the number of rows at which a warning is
+// printed during buffering in memory.
+const asciiTableWarnRows = 10000
+
+func (p *asciiTableReporter) iter(_ io.Writer, _ int, row []string) error {
+	if p.table == nil {
+		return nil
+	}
+
+	if p.rows == asciiTableWarnRows {
+		fmt.Fprintf(stderr,
+			"warning: buffering more than %d result rows in client "+
+				"- RAM usage growing, consider another formatter instead\n",
+			asciiTableWarnRows)
+	}
+
+	for i, r := range row {
+		p.buf.Reset()
+		fmt.Fprint(p.w, r)
+		_ = p.w.Flush()
+		row[i] = p.buf.String()
+	}
+	p.table.Append(row)
+	p.rows++
+	return nil
+}
+
+func (p *asciiTableReporter) doneRows(w io.Writer, seenRows int) error {
 	if p.table != nil {
 		p.table.Render()
+		p.table = nil
 	} else {
 		// A simple delimiter, like in psql.
 		fmt.Fprintln(w, "--")
@@ -203,40 +334,81 @@ func (p *prettyReporter) doneRows(w io.Writer, seenRows int) error {
 	return nil
 }
 
-func (p *prettyReporter) doneNoRows(_ io.Writer) error { return nil }
+func (p *asciiTableReporter) doneNoRows(_ io.Writer) error {
+	p.table = nil
+	return nil
+}
 
 type csvReporter struct {
-	csvWriter *csv.Writer
+	mu struct {
+		syncutil.Mutex
+		csvWriter *csv.Writer
+	}
+	stop chan struct{}
+}
+
+// csvFlushInterval is the maximum time between flushes of the
+// buffered CSV/TSV data.
+const csvFlushInterval = 5 * time.Second
+
+func makeCSVReporter(w io.Writer, format tableDisplayFormat) (*csvReporter, func()) {
+	r := &csvReporter{}
+	r.mu.csvWriter = csv.NewWriter(w)
+	if format == tableDisplayTSV {
+		r.mu.csvWriter.Comma = '\t'
+	}
+
+	// Set up a flush daemon. This is useful when e.g. visualizing data
+	// from change feeds.
+	r.stop = make(chan struct{}, 1)
+	go func() {
+		ticker := time.NewTicker(csvFlushInterval)
+		for {
+			select {
+			case <-ticker.C:
+				r.mu.Lock()
+				r.mu.csvWriter.Flush()
+				r.mu.Unlock()
+			case <-r.stop:
+				return
+			}
+		}
+	}()
+	cleanup := func() {
+		close(r.stop)
+	}
+	return r, cleanup
 }
 
 func (p *csvReporter) describe(w io.Writer, cols []string) error {
-	p.csvWriter = csv.NewWriter(w)
-	if cliCtx.tableDisplayFormat == tableDisplayTSV {
-		p.csvWriter.Comma = '\t'
-	}
+	p.mu.Lock()
 	if len(cols) == 0 {
-		_ = p.csvWriter.Write([]string{"# no columns"})
+		_ = p.mu.csvWriter.Write([]string{"# no columns"})
 	} else {
-		_ = p.csvWriter.Write(cols)
+		_ = p.mu.csvWriter.Write(cols)
 	}
+	p.mu.Unlock()
 	return nil
 }
 
 func (p *csvReporter) iter(_ io.Writer, _ int, row []string) error {
+	p.mu.Lock()
 	if len(row) == 0 {
-		_ = p.csvWriter.Write([]string{"# empty"})
+		_ = p.mu.csvWriter.Write([]string{"# empty"})
 	} else {
-		_ = p.csvWriter.Write(row)
+		_ = p.mu.csvWriter.Write(row)
 	}
+	p.mu.Unlock()
 	return nil
 }
 
-func (p *csvReporter) beforeFirstRow(_ io.Writer) error { return nil }
-func (p *csvReporter) doneNoRows(_ io.Writer) error     { return nil }
+func (p *csvReporter) beforeFirstRow(_ io.Writer, _ rowStrIter) error { return nil }
+func (p *csvReporter) doneNoRows(_ io.Writer) error                   { return nil }
 
 func (p *csvReporter) doneRows(w io.Writer, seenRows int) error {
-	p.csvWriter.Flush()
-	fmt.Fprintf(w, "# %d row%s\n", seenRows, util.Pluralize(int64(seenRows)))
+	p.mu.Lock()
+	p.mu.csvWriter.Flush()
+	p.mu.Unlock()
 	return nil
 }
 
@@ -256,8 +428,8 @@ func (p *rawReporter) iter(w io.Writer, rowIdx int, row []string) error {
 	return nil
 }
 
-func (p *rawReporter) beforeFirstRow(_ io.Writer) error { return nil }
-func (p *rawReporter) doneNoRows(_ io.Writer) error     { return nil }
+func (p *rawReporter) beforeFirstRow(_ io.Writer, _ rowStrIter) error { return nil }
+func (p *rawReporter) doneNoRows(_ io.Writer) error                   { return nil }
 
 func (p *rawReporter) doneRows(w io.Writer, nRows int) error {
 	fmt.Fprintf(w, "# %d row%s\n", nRows, util.Pluralize(int64(nRows)))
@@ -266,28 +438,42 @@ func (p *rawReporter) doneRows(w io.Writer, nRows int) error {
 
 type htmlReporter struct {
 	nCols int
+
+	escape   bool
+	rowStats bool
 }
 
 func (p *htmlReporter) describe(w io.Writer, cols []string) error {
 	p.nCols = len(cols)
 	fmt.Fprint(w, "<table>\n<thead><tr>")
-	fmt.Fprint(w, "<th>row</th>")
-	for _, col := range cols {
-		fmt.Fprintf(w, "<th>%s</th>", html.EscapeString(col))
+	if p.rowStats {
+		fmt.Fprint(w, "<th>row</th>")
 	}
-	fmt.Fprintln(w, "</tr></head>")
+	for _, col := range cols {
+		if p.escape {
+			col = html.EscapeString(col)
+		}
+		fmt.Fprintf(w, "<th>%s</th>", strings.Replace(col, "\n", "<br/>", -1))
+	}
+	fmt.Fprintln(w, "</tr></thead>")
 	return nil
 }
 
-func (p *htmlReporter) beforeFirstRow(w io.Writer) error {
+func (p *htmlReporter) beforeFirstRow(w io.Writer, _ rowStrIter) error {
 	fmt.Fprintln(w, "<tbody>")
 	return nil
 }
 
 func (p *htmlReporter) iter(w io.Writer, rowIdx int, row []string) error {
-	fmt.Fprintf(w, "<tr><td>%d</td>", rowIdx+1)
+	fmt.Fprint(w, "<tr>")
+	if p.rowStats {
+		fmt.Fprintf(w, "<td>%d</td>", rowIdx+1)
+	}
 	for _, r := range row {
-		fmt.Fprintf(w, "<td>%s</td>", strings.Replace(html.EscapeString(r), "\n", "<br/>", -1))
+		if p.escape {
+			r = html.EscapeString(r)
+		}
+		fmt.Fprintf(w, "<td>%s</td>", strings.Replace(r, "\n", "<br/>", -1))
 	}
 	fmt.Fprintln(w, "</tr>")
 	return nil
@@ -300,23 +486,31 @@ func (p *htmlReporter) doneNoRows(w io.Writer) error {
 
 func (p *htmlReporter) doneRows(w io.Writer, nRows int) error {
 	fmt.Fprintln(w, "</tbody>")
-	fmt.Fprintf(w, "<tfoot><tr><td colspan=%d>%d row%s</td></tr></tfoot></table>\n",
-		p.nCols+1, nRows, util.Pluralize(int64(nRows)))
+	if p.rowStats {
+		fmt.Fprintf(w, "<tfoot><tr><td colspan=%d>%d row%s</td></tr></tfoot>",
+			p.nCols+1, nRows, util.Pluralize(int64(nRows)))
+	}
+	fmt.Fprintln(w, "</table>")
 	return nil
 }
 
 type recordReporter struct {
 	cols        []string
+	colRest     [][]string
 	maxColWidth int
 }
 
 func (p *recordReporter) describe(w io.Writer, cols []string) error {
-	p.cols = cols
 	for _, col := range cols {
-		colLen := utf8.RuneCountInString(col)
-		if colLen > p.maxColWidth {
-			p.maxColWidth = colLen
+		parts := strings.Split(col, "\n")
+		for _, part := range parts {
+			colLen := utf8.RuneCountInString(part)
+			if colLen > p.maxColWidth {
+				p.maxColWidth = colLen
+			}
 		}
+		p.cols = append(p.cols, parts[0])
+		p.colRest = append(p.colRest, parts[1:])
 	}
 	return nil
 }
@@ -334,10 +528,25 @@ func (p *recordReporter) iter(w io.Writer, rowIdx int, row []string) error {
 			if l > 0 {
 				colLabel = ""
 			}
+			lineCont := "+"
+			if l == len(lines)-1 {
+				lineCont = ""
+			}
 			// Note: special characters, including a vertical bar, in
 			// the colLabel are not escaped here. This is in accordance
-			// with the same behavior in PostgreSQL.
-			fmt.Fprintf(w, "%-*s | %s\n", p.maxColWidth, colLabel, line)
+			// with the same behavior in PostgreSQL. However there is
+			// special behavior for newlines.
+			contChar := " "
+			if len(p.colRest[j]) > 0 {
+				contChar = "+"
+			}
+			fmt.Fprintf(w, "%-*s%s| %s%s\n", p.maxColWidth, colLabel, contChar, line, lineCont)
+			for k, cont := range p.colRest[j] {
+				if k == len(p.colRest[j])-1 {
+					contChar = " "
+				}
+				fmt.Fprintf(w, "%-*s%s|\n", p.maxColWidth, cont, contChar)
+			}
 		}
 	}
 	return nil
@@ -350,8 +559,8 @@ func (p *recordReporter) doneRows(w io.Writer, seenRows int) error {
 	return nil
 }
 
-func (p *recordReporter) beforeFirstRow(_ io.Writer) error { return nil }
-func (p *recordReporter) doneNoRows(_ io.Writer) error     { return nil }
+func (p *recordReporter) beforeFirstRow(_ io.Writer, _ rowStrIter) error { return nil }
+func (p *recordReporter) doneNoRows(_ io.Writer) error                   { return nil }
 
 type sqlReporter struct {
 	noColumns bool
@@ -390,43 +599,53 @@ func (p *sqlReporter) iter(w io.Writer, _ int, row []string) error {
 	return nil
 }
 
-func (p *sqlReporter) beforeFirstRow(_ io.Writer) error  { return nil }
-func (p *sqlReporter) doneNoRows(_ io.Writer) error      { return nil }
-func (p *sqlReporter) doneRows(_ io.Writer, _ int) error { return nil }
+func (p *sqlReporter) beforeFirstRow(_ io.Writer, _ rowStrIter) error { return nil }
+func (p *sqlReporter) doneNoRows(_ io.Writer) error                   { return nil }
+func (p *sqlReporter) doneRows(w io.Writer, seenRows int) error {
+	fmt.Fprintf(w, "-- %d row%s\n", seenRows, util.Pluralize(int64(seenRows)))
+	return nil
+}
 
-func makeReporter() (rowReporter, error) {
+// makeReporter instantiates a table formatter. It returns the
+// formatter and a cleanup function that must be called in all cases
+// when the formatting completes.
+func makeReporter(w io.Writer) (rowReporter, func(), error) {
 	switch cliCtx.tableDisplayFormat {
-	case tableDisplayPretty:
-		return &prettyReporter{}, nil
+	case tableDisplayTable:
+		return newASCIITableReporter(), nil, nil
 
 	case tableDisplayTSV:
 		fallthrough
 	case tableDisplayCSV:
-		return &csvReporter{}, nil
+		reporter, cleanup := makeCSVReporter(w, cliCtx.tableDisplayFormat)
+		return reporter, cleanup, nil
 
 	case tableDisplayRaw:
-		return &rawReporter{}, nil
+		return &rawReporter{}, nil, nil
 
 	case tableDisplayHTML:
-		return &htmlReporter{}, nil
+		return &htmlReporter{escape: true, rowStats: true}, nil, nil
 
 	case tableDisplayRecords:
-		return &recordReporter{}, nil
+		return &recordReporter{}, nil, nil
 
 	case tableDisplaySQL:
-		return &sqlReporter{}, nil
+		return &sqlReporter{}, nil, nil
 
 	default:
-		return nil, errors.Errorf("unhandled display format: %d", cliCtx.tableDisplayFormat)
+		return nil, nil, errors.Errorf("unhandled display format: %d", cliCtx.tableDisplayFormat)
 	}
 }
 
 // printQueryOutput takes a list of column names and a list of row
 // contents writes a formatted table to 'w'.
 func printQueryOutput(w io.Writer, cols []string, allRows rowStrIter) error {
-	reporter, err := makeReporter()
+	reporter, cleanup, err := makeReporter(w)
 	if err != nil {
 		return err
 	}
-	return render(reporter, w, cols, allRows, nil)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	return render(reporter, w, cols, allRows, nil, nil)
 }

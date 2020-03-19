@@ -1,16 +1,25 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
+import { Tooltip } from "antd";
 import React from "react";
+import { AbstractTooltipProps } from "antd/es/tooltip";
 import classNames from "classnames";
 
 import "./tooltip.styl";
 
-interface ToolTipWrapperProps {
+interface ToolTipWrapperProps extends AbstractTooltipProps {
   text: React.ReactNode;
+  short?: boolean;
+  children?: React.ReactNode;
 }
-
-interface ToolTipWrapperState {
-  hovered: boolean;
-}
-
 /**
  * ToolTipWrapper wraps its children with an area that detects mouseover events
  * and, when hovered, displays a floating tooltip to the immediate right of
@@ -20,43 +29,18 @@ interface ToolTipWrapperState {
  * such as "float" will render parent elements unable to properly wrap their
  * contents.
  */
-export class ToolTipWrapper extends React.Component<ToolTipWrapperProps, ToolTipWrapperState> {
-  constructor(props?: ToolTipWrapperProps, context?: any) {
-    super(props, context);
-    this.state = {
-      hovered: false,
-    };
-  }
 
-  onMouseEnter = () => {
-    this.setState({hovered: true});
-  }
+// tslint:disable-next-line: variable-name
+export const ToolTipWrapper = (props: ToolTipWrapperProps) => {
+  const { text, children, placement } = props;
+  const overlayClassName = classNames("tooltip__preset--white", `tooltip__preset--placement-${placement}`);
+  return (
+    <Tooltip title={ text } placement="bottom" overlayClassName={overlayClassName} {...props}>
+      {children}
+    </Tooltip>
+  );
+};
 
-  onMouseLeave = () => {
-    this.setState({hovered: false});
-  }
-
-  render() {
-    const { text } = this.props;
-    const { hovered } = this.state;
-    const tooltipClassNames = classNames({
-      "hover-tooltip": true,
-      "hover-tooltip--hovered": hovered,
-    });
-
-    return (
-      <div
-        className={tooltipClassNames}
-        onMouseEnter={this.onMouseEnter}
-        onMouseLeave={this.onMouseLeave}
-      >
-        <div className="hover-tooltip__text">
-          { text }
-        </div>
-        <div className="hover-tooltip__content">
-          { this.props.children }
-        </div>
-      </div>
-    );
-  }
-}
+ToolTipWrapper.defaultProps = {
+  placement: "bottom",
+};

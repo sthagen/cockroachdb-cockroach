@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -21,110 +17,120 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
+
+func assertStmt(t *testing.T, cmd Command, exp string) {
+	stmt, ok := cmd.(ExecStmt)
+	if !ok {
+		t.Fatalf("%s: expected ExecStmt, got %T", testutils.Caller(1), cmd)
+	}
+	if stmt.AST.String() != exp {
+		t.Fatalf("%s: expected statement %s, got %s", testutils.Caller(1), exp, stmt)
+	}
+}
+
+func assertPrepareStmt(t *testing.T, cmd Command, expName string) {
+	ps, ok := cmd.(PrepareStmt)
+	if !ok {
+		t.Fatalf("%s: expected PrepareStmt, got %T", testutils.Caller(1), cmd)
+	}
+	if ps.Name != expName {
+		t.Fatalf("%s: expected name %s, got %s", testutils.Caller(1), expName, ps.Name)
+	}
+}
+
+func mustPush(ctx context.Context, t *testing.T, buf *StmtBuf, cmd Command) {
+	if err := buf.Push(ctx, cmd); err != nil {
+		t.Fatalf("%s: %s", testutils.Caller(1), err)
+	}
+}
 
 func TestStmtBuf(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.TODO()
-	batch1, err := parser.Parse("SELECT 1; SELECT 2; SELECT 3;")
+	s1, err := parser.ParseOne("SELECT 1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch2, err := parser.Parse("SELECT 4; SELECT 5; SELECT 6;")
+	s2, err := parser.ParseOne("SELECT 2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf := newStmtBuf()
-	buf.push(ctx, batch1)
-	buf.push(ctx, batch2)
+	s3, err := parser.ParseOne("SELECT 3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s4, err := parser.ParseOne("SELECT 4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := NewStmtBuf()
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s2})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s3})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s4})
 
 	// Check that, while we don't manually advance the cursor, we keep getting the
 	// same statement.
-	expPos := cursorPosition{queryStrPos: 0, stmtIdx: 0}
+	expPos := CmdPos(0)
 	for i := 0; i < 2; i++ {
-		stmt, pos, err := buf.curStmt(ctx)
+		cmd, pos, err := buf.CurCmd()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if pos.compare(expPos) != 0 {
-			t.Fatalf("expected pos to be %s, got: %s", expPos, pos)
+		if pos != expPos {
+			t.Fatalf("expected pos to be %d, got: %d", expPos, pos)
 		}
-		if stmt.String() != "SELECT 1" {
-			t.Fatalf("wrong statement: %s", stmt)
-		}
+		assertStmt(t, cmd, "SELECT 1")
 	}
 
-	buf.advanceOne(ctx)
-	expPos.stmtIdx = 1
-	stmt, pos, err := buf.curStmt(ctx)
+	buf.AdvanceOne()
+	expPos++
+	cmd, pos, err := buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pos.compare(expPos) != 0 {
-		t.Fatalf("expected pos to be %s, got: %s", expPos, pos)
+	if pos != expPos {
+		t.Fatalf("expected pos to be %d, got: %d", expPos, pos)
 	}
-	if stmt.String() != "SELECT 2" {
-		t.Fatalf("wrong statement: %s", stmt)
-	}
+	assertStmt(t, cmd, "SELECT 2")
 
-	buf.advanceOne(ctx)
-	expPos.stmtIdx = 2
-	stmt, pos, err = buf.curStmt(ctx)
+	buf.AdvanceOne()
+	expPos++
+	cmd, pos, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pos.compare(expPos) != 0 {
-		t.Fatalf("expected pos to be %s, got: %s", expPos, pos)
+	if pos != expPos {
+		t.Fatalf("expected pos to be %d, got: %d", expPos, pos)
 	}
-	if stmt.String() != "SELECT 3" {
-		t.Fatalf("wrong statement: %s", stmt)
-	}
+	assertStmt(t, cmd, "SELECT 3")
 
-	buf.advanceOne(ctx)
-	expPos.queryStrPos = 1
-	expPos.stmtIdx = 0
-	stmt, pos, err = buf.curStmt(ctx)
+	buf.AdvanceOne()
+	expPos++
+	cmd, pos, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pos.compare(expPos) != 0 {
-		t.Fatalf("expected pos to be %s, got: %s", expPos, pos)
+	if pos != expPos {
+		t.Fatalf("expected pos to be %d, got: %d", expPos, pos)
 	}
-	if stmt.String() != "SELECT 4" {
-		t.Fatalf("wrong statement: %s", stmt)
-	}
+	assertStmt(t, cmd, "SELECT 4")
 
-	// Now rewind to the middle of the first batch.
-	expPos.queryStrPos = 0
-	expPos.stmtIdx = 1
-	buf.rewind(ctx, expPos)
-	stmt, pos, err = buf.curStmt(ctx)
+	// Now rewind.
+	expPos = 1
+	buf.Rewind(ctx, expPos)
+	cmd, pos, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pos.compare(expPos) != 0 {
-		t.Fatalf("expected pos to be %s, got: %s", expPos, pos)
+	if pos != expPos {
+		t.Fatalf("expected pos to be %d, got: %d", expPos, pos)
 	}
-	if stmt.String() != "SELECT 2" {
-		t.Fatalf("wrong statement: %s", stmt)
-	}
-
-	// Now seek to the beginning of the second batch.
-	expPos.queryStrPos = 1
-	expPos.stmtIdx = 0
-	buf.seekToNextQueryStr()
-	stmt, pos, err = buf.curStmt(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pos.compare(expPos) != 0 {
-		t.Fatalf("expected pos to be %s, got: %s", expPos, pos)
-	}
-	if stmt.String() != "SELECT 4" {
-		t.Fatalf("wrong statement: %s", stmt)
-	}
+	assertStmt(t, cmd, "SELECT 2")
 }
 
 // Test that a reader blocked for an incoming statement is unblocked when that
@@ -133,87 +139,201 @@ func TestStmtBufSignal(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.TODO()
-	buf := newStmtBuf()
-	batch, err := parser.Parse("SELECT 1; SELECT 2; SELECT 3;")
+	buf := NewStmtBuf()
+	s1, err := parser.ParseOne("SELECT 1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	go func() {
-		buf.push(ctx, batch)
+		_ = buf.Push(ctx, ExecStmt{Statement: s1})
 	}()
 
-	expPos := cursorPosition{queryStrPos: 0, stmtIdx: 0}
-	stmt, pos, err := buf.curStmt(ctx)
+	expPos := CmdPos(0)
+	cmd, pos, err := buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pos.compare(expPos) != 0 {
-		t.Fatalf("expected pos to be %s, got: %s", expPos, pos)
+	if pos != expPos {
+		t.Fatalf("expected pos to be %d, got: %d", expPos, pos)
 	}
-	if stmt.String() != "SELECT 1" {
-		t.Fatalf("wrong statement: %s", stmt)
-	}
+	assertStmt(t, cmd, "SELECT 1")
 }
 
 func TestStmtBufLtrim(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.TODO()
-	buf := newStmtBuf()
-	for i := 0; i < 3; i++ {
-		batch, err := parser.Parse(
-			fmt.Sprintf("SELECT %d; SELECT %d;", i*2, i*2+1))
+	buf := NewStmtBuf()
+	for i := 0; i < 5; i++ {
+		stmt, err := parser.ParseOne(
+			fmt.Sprintf("SELECT %d", i))
 		if err != nil {
 			t.Fatal(err)
 		}
-		buf.push(ctx, batch)
+		mustPush(ctx, t, buf, ExecStmt{Statement: stmt})
 	}
 	// Advance the cursor so that we can trim.
-	buf.seekToNextQueryStr()
-	buf.seekToNextQueryStr()
-	trimPos := cursorPosition{queryStrPos: 2, stmtIdx: 0}
+	buf.AdvanceOne()
+	buf.AdvanceOne()
+	trimPos := CmdPos(2)
 	buf.ltrim(ctx, trimPos)
-	if l := len(buf.mu.queryStrings); l != 1 {
-		t.Fatalf("expected 1 query string left, got: %d", l)
+	if l := buf.mu.data.Len(); l != 3 {
+		t.Fatalf("expected 3 left, got: %d", l)
 	}
 	if s := buf.mu.startPos; s != 2 {
 		t.Fatalf("expected start pos 2, got: %d", s)
 	}
 }
 
-// Test that, after Close() is called, buf.curStmt() returns io.EOF even if
-// there were statements queued up.
+// Test that, after Close() is called, buf.CurCmd() returns io.EOF even if
+// there were commands queued up.
 func TestStmtBufClose(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.TODO()
-	buf := newStmtBuf()
-	batch, err := parser.Parse("SELECT 1;")
+	buf := NewStmtBuf()
+	stmt, err := parser.ParseOne("SELECT 1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf.push(ctx, batch)
+	mustPush(ctx, t, buf, ExecStmt{Statement: stmt})
 	buf.Close()
 
-	_, _, err = buf.curStmt(ctx)
+	_, _, err = buf.CurCmd()
 	if err != io.EOF {
 		t.Fatalf("expected EOF, got: %v", err)
 	}
 }
 
-// Test that a call to Close() unblocks a curStmt() call.
+// Test that a call to Close() unblocks a CurCmd() call.
 func TestStmtBufCloseUnblocksReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
-	buf := newStmtBuf()
+	buf := NewStmtBuf()
 
 	go func() {
 		buf.Close()
 	}()
 
-	_, _, err := buf.curStmt(ctx)
+	_, _, err := buf.CurCmd()
 	if err != io.EOF {
 		t.Fatalf("expected EOF, got: %v", err)
+	}
+}
+
+// Test that the buffer can hold and return other kinds of commands intermixed
+// with ExecStmt.
+func TestStmtBufPreparedStmt(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	buf := NewStmtBuf()
+	ctx := context.TODO()
+
+	s1, err := parser.ParseOne("SELECT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+	mustPush(ctx, t, buf, PrepareStmt{Name: "p1"})
+	mustPush(ctx, t, buf, PrepareStmt{Name: "p2"})
+
+	cmd, _, err := buf.CurCmd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStmt(t, cmd, "SELECT 1")
+
+	buf.AdvanceOne()
+	cmd, _, err = buf.CurCmd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrepareStmt(t, cmd, "p1")
+
+	buf.AdvanceOne()
+	cmd, _, err = buf.CurCmd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrepareStmt(t, cmd, "p2")
+
+	// Rewind to the first prepared stmt.
+	buf.Rewind(ctx, CmdPos(1))
+	cmd, _, err = buf.CurCmd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrepareStmt(t, cmd, "p1")
+}
+
+func TestStmtBufBatching(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	buf := NewStmtBuf()
+	ctx := context.TODO()
+
+	s1, err := parser.ParseOne("SELECT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start a new batch.
+	mustPush(ctx, t, buf, Sync{})
+
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+
+	// Start a new batch.
+	mustPush(ctx, t, buf, Sync{})
+
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+
+	// Start a new batch.
+	mustPush(ctx, t, buf, Sync{})
+
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+
+	// Go to 2nd batch.
+	if err := buf.seekToNextBatch(); err != nil {
+		t.Fatal(err)
+	}
+	_, pos, err := buf.CurCmd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pos != CmdPos(3) {
+		t.Fatalf("expected pos to be %d, got: %d", 3, pos)
+	}
+
+	// Go to 3rd batch.
+	if err := buf.seekToNextBatch(); err != nil {
+		t.Fatal(err)
+	}
+	_, pos, err = buf.CurCmd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pos != CmdPos(7) {
+		t.Fatalf("expected pos to be %d, got: %d", 7, pos)
+	}
+
+	// Async start a 4th batch; that will unblock the seek below.
+	go func() {
+		mustPush(ctx, t, buf, Sync{})
+		_ = buf.Push(ctx, ExecStmt{Statement: s1})
+	}()
+
+	// Go to 4th batch.
+	if err := buf.seekToNextBatch(); err != nil {
+		t.Fatal(err)
+	}
+	_, pos, err = buf.CurCmd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pos != CmdPos(9) {
+		t.Fatalf("expected pos to be %d, got: %d", 9, pos)
 	}
 }

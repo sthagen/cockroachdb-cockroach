@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package retry
 
@@ -108,18 +104,37 @@ func TestRetryStop(t *testing.T) {
 func TestRetryNextCh(t *testing.T) {
 	var attempts int
 
-	for r := Start(Options{MaxRetries: 1}); attempts < 2; attempts++ {
+	opts := Options{
+		InitialBackoff: time.Millisecond,
+		Multiplier:     2,
+		MaxRetries:     1,
+	}
+	for r := Start(opts); attempts < 3; attempts++ {
+		c := r.NextCh()
 		if r.currentAttempt != attempts {
 			t.Errorf("expected attempt=%d; got %d", attempts, r.currentAttempt)
 		}
-		if attempts == 0 {
-			if r.NextCh() == nil {
+		switch attempts {
+		case 0:
+			if c == nil {
 				t.Errorf("expected non-nil NextCh() on first attempt")
 			}
-		} else if attempts == 1 {
-			if r.NextCh() != nil {
-				t.Errorf("expected nil NextCh() on second attempt")
+			if _, ok := <-c; ok {
+				t.Errorf("expected closed (immediate) NextCh() on first attempt")
 			}
+		case 1:
+			if c == nil {
+				t.Errorf("expected non-nil NextCh() on second attempt")
+			}
+			if _, ok := <-c; !ok {
+				t.Errorf("expected open (delayed) NextCh() on first attempt")
+			}
+		case 2:
+			if c != nil {
+				t.Errorf("expected nil NextCh() on third attempt")
+			}
+		default:
+			t.Fatalf("unexpected attempt %d", attempts)
 		}
 	}
 }

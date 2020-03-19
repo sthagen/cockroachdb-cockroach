@@ -1,26 +1,25 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 syntax = "proto3";
 package cockroach.server.serverpb;
 option go_package = "serverpb";
 
-import "config/zone.proto";
-import "sql/jobs/jobs.proto";
-import "storage/engine/enginepb/mvcc.proto";
-import "storage/liveness.proto";
-import "storage/log.proto";
+import "config/zonepb/zone.proto";
+import "jobs/jobspb/jobs.proto";
+import "server/serverpb/status.proto";
+import "storage/enginepb/mvcc.proto";
+import "kv/kvserver/storagepb/liveness.proto";
+import "kv/kvserver/storagepb/log.proto";
+import "ts/catalog/chart_catalog.proto";
+import "util/metric/metric.proto";
 import "gogoproto/gogo.proto";
 import "google/api/annotations.proto";
 import "google/protobuf/timestamp.proto";
@@ -77,7 +76,7 @@ message DatabaseDetailsResponse {
   // the 'target_id' field of events.
   int64 descriptor_id = 3 [(gogoproto.customname) = "DescriptorID"];
   // The zone configuration in effect for this database.
-  cockroach.config.ZoneConfig zone_config = 4 [(gogoproto.nullable) = false];
+  cockroach.config.zonepb.ZoneConfig zone_config = 4 [(gogoproto.nullable) = false];
   // The level at which this object's zone configuration is set.
   ZoneConfigurationLevel zone_config_level = 5;
 }
@@ -115,6 +114,12 @@ message TableDetailsResponse {
 
     // default_value is the default value of this column.
     string default_value = 4;
+
+    // generation_expression is the generator expression if the column is computed.
+    string generation_expression = 5;
+
+    // hidden is whether this column is hidden.
+    bool hidden = 6;
   }
 
   message Index {
@@ -152,12 +157,12 @@ message TableDetailsResponse {
   // consider removing or renaming this field to reflect that difference. See
   // Github issue #5435 for more information.
   int64 range_count = 4;
-  // create_table_statement is the output of "SHOW CREATE TABLE" for this table;
+  // create_table_statement is the output of "SHOW CREATE" for this table;
   // it is a SQL statement that would re-create the table's current schema if
   // executed.
   string create_table_statement = 5;
   // The zone configuration in effect for this table.
-  cockroach.config.ZoneConfig zone_config = 6 [(gogoproto.nullable) = false];
+  cockroach.config.zonepb.ZoneConfig zone_config = 6 [(gogoproto.nullable) = false];
   // The level at which this object's zone configuration is set.
   ZoneConfigurationLevel zone_config_level = 7;
   // descriptor_id is an identifier used to uniquely identify this table.
@@ -191,7 +196,7 @@ message TableStatsResponse {
   int64 node_count = 3;
   // stats is the summation of MVCCStats for all replicas of this table
   // across the cluster.
-  cockroach.storage.engine.enginepb.MVCCStats stats = 4 [(gogoproto.nullable) = false];
+  cockroach.storage.enginepb.MVCCStats stats = 4 [(gogoproto.nullable) = false];
   // approximate_disk_bytes is an approximation of the disk space (in bytes)
   // used for all replicas of this table across the cluster.
   uint64 approximate_disk_bytes = 6;
@@ -206,6 +211,21 @@ message TableStatsResponse {
   // A list of nodes which should contain data for this table (according to
   // cluster metadata), but could not be contacted during this request.
   repeated MissingNode missing_nodes = 5 [(gogoproto.nullable) = false];
+}
+
+// NonTableStatsRequest requests statistics on cluster data ranges that do not
+// belong to SQL tables.
+message NonTableStatsRequest {
+}
+
+// NonTableStatsResponse returns statistics on various cluster data ranges
+// that do not belong to SQL tables. The statistics for each range are returned
+// as a TableStatsResponse.
+message NonTableStatsResponse {
+  // Information on time series ranges.
+  TableStatsResponse time_series_stats = 1;
+  // Information for remaining (non-table, non-time-series) ranges.
+  TableStatsResponse internal_use_stats = 2;
 }
 
 // UsersRequest requests a list of users.
@@ -233,6 +253,12 @@ message EventsRequest {
   // returned. When set to > 0, at most only that number of results are
   // returned. When set to < 0, an unlimited number of results are returned.
   int32 limit = 3;
+  // unredacted_events indicates that the values in the events should
+  // not be redacted. The default is to redact, so that older versions
+  // of `cockroach zip` do not see un-redacted values by default.
+  // For good security, this field is only obeyed by the server after
+  // checking that the client of the RPC is an admin user.
+  bool unredacted_events = 4;
 }
 
 // EventsResponse contains a set of event log entries. This is always limited
@@ -362,6 +388,7 @@ message DecommissionStatusResponse {
     int32 node_id = 1 [ (gogoproto.customname) = "NodeID",
                         (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
     bool is_live = 2;
+    // The number of replicas on the node, computed by scanning meta2 ranges.
     int64 replica_count = 3;
     bool decommissioning = 4;
     bool draining = 5;
@@ -375,6 +402,13 @@ message SettingsRequest {
   // The array of setting names to retrieve.
   // An empty keys array means "all".
   repeated string keys = 1;
+
+  // Indicate whether to see unredacted setting values.
+  // This is opt-in so that a previous version `cockroach zip`
+  // does not start reporting values when this becomes active.
+  // For good security, the server only obeys this after it checks
+  // that the logger-in user has admin privilege.
+  bool unredacted_values = 2;
 }
 
 // SettingsResponse is the response to SettingsRequest.
@@ -383,17 +417,37 @@ message SettingsResponse {
       string value = 1;
       string type = 2;
       string description = 3;
+      bool public = 4;
    }
    map<string, Value> key_values = 1 [(gogoproto.nullable) = false];
 }
 
-// HealthRequest inquires whether the addressed node is healthy.
+// HealthRequest requests a liveness or readiness check.
+//
+// A liveness check is triggered via ready set to false. In this mode,
+// an empty response is returned immediately, that is, the caller merely
+// learns that the process is running.
+//
+// A readiness check (ready == true) is suitable for determining whether
+// user traffic should be directed at a given node, for example by a load
+// balancer. In this mode, a successful response is returned only if the
+// node:
+//
+// - is not in the process of shutting down or booting up (including
+//   waiting for cluster bootstrap);
+// - is regarded as healthy by the cluster via the recent broadcast of
+//   a liveness beacon. Absent either of these conditions, an error
+//   code will result.
+//
 message HealthRequest {
+  // ready specifies whether the client wants to know whether the
+  // target node is ready to receive traffic. If a node is unready, an
+  // error will be returned.
+  bool ready = 1;
 }
 
 // HealthResponse is the response to HealthRequest. It currently does not
-// contain any information. The request fails however if the node is not live.
-// TODO(tschottdorf): Should it contain information, and if so, what?
+// contain any information.
 message HealthResponse {
 }
 
@@ -403,14 +457,18 @@ message LivenessRequest {
 
 // LivenessResponse contains the liveness status of each node on the cluster.
 message LivenessResponse {
-  repeated cockroach.storage.Liveness livenesses = 1 [(gogoproto.nullable) = false];
+  repeated cockroach.kv.kvserver.storagepb.Liveness livenesses = 1 [(gogoproto.nullable) = false];
+  map<int32, cockroach.kv.kvserver.storagepb.NodeLivenessStatus> statuses = 2 [
+    (gogoproto.nullable) = false,
+    (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"
+  ];
 }
 
 // JobsRequest requests system job information of the given status and type.
 message JobsRequest {
   int32 limit = 1;
   string status = 2;
-  cockroach.sql.jobs.Type type = 3;
+  cockroach.sql.jobs.jobspb.Type type = 3;
 }
 
 // JobsResponse contains the job record for each matching job.
@@ -419,6 +477,7 @@ message JobsResponse {
     int64 id = 1 [(gogoproto.customname) = "ID"];
     string type = 2;
     string description = 3;
+    string statement = 16;
     string username = 4;
     repeated uint32 descriptor_ids = 5 [
       (gogoproto.customname) = "DescriptorIDs",
@@ -431,6 +490,14 @@ message JobsResponse {
     google.protobuf.Timestamp modified = 10 [(gogoproto.stdtime) = true];
     float fraction_completed = 11;
     string error = 12;
+    // highwater_timestamp is the highwater timestamp returned as normal
+    // timestamp. This is appropriate for display to humans.
+    google.protobuf.Timestamp highwater_timestamp = 13 [(gogoproto.stdtime) = true];
+    // highwater_decimal is the highwater timestamp in the proprietary decimal
+    // form used by logical timestamps internally. This is appropriate to pass
+    // to a "AS OF SYSTEM TIME" SQL statement.
+    string highwater_decimal = 14;
+    string running_status = 15;
   }
 
   repeated Job jobs = 1 [(gogoproto.nullable) = false];
@@ -478,7 +545,7 @@ message RangeLogResponse {
     string details = 6;
   }
   message Event {
-    storage.RangeLogEvent event = 1 [(gogoproto.nullable) = false];
+    cockroach.kv.kvserver.storagepb.RangeLogEvent event = 1 [(gogoproto.nullable) = false];
     PrettyInfo pretty_info = 2 [(gogoproto.nullable) = false];
   }
   reserved 1; // Previously used.
@@ -495,6 +562,90 @@ message QueryPlanRequest {
 // the distsql physical query plan).
 message QueryPlanResponse {
   string distsql_physical_query_plan = 1 [(gogoproto.customname) = "DistSQLPhysicalQueryPlan"];
+}
+
+message DataDistributionRequest {
+}
+
+message DataDistributionResponse {
+  message ZoneConfig {
+    // target is the object the zone config applies to, e.g. "DATABASE db" or
+    // "PARTITION north_america OF TABLE users".
+    string target = 1;
+
+    config.zonepb.ZoneConfig config = 2 [(gogoproto.nullable) = false];
+
+    reserved 3;
+
+    // config_sql is the SQL representation of config.
+    string config_sql = 4 [(gogoproto.customname) = "ConfigSQL"];
+  }
+
+  message TableInfo {
+    map<int32, int64> replica_count_by_node_id = 1 [(gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+
+    int64 zone_config_id = 2;
+    google.protobuf.Timestamp dropped_at = 3 [(gogoproto.stdtime) = true];
+  }
+
+  message DatabaseInfo {
+    // By table name.
+    map<string, TableInfo> table_info = 1 [(gogoproto.nullable) = false];
+  }
+
+  // By database name.
+  map<string, DatabaseInfo> database_info = 1 [(gogoproto.nullable) = false];
+
+  reserved 2;
+
+  // By zone name.
+  map<string, ZoneConfig> zone_configs = 3 [(gogoproto.nullable) = false];
+}
+
+  // MetricMetadataRequest requests metadata for all metrics.
+message MetricMetadataRequest {
+}
+
+// MetricMetadataResponse contains the metadata for all metics.
+message MetricMetadataResponse {
+  map<string, cockroach.util.metric.Metadata> metadata = 1 [(gogoproto.nullable) = false];
+}
+
+message EnqueueRangeRequest {
+  // The node on which the queue should process the range. If node_id is 0,
+  // the request will be forwarded to all other nodes.
+  int32 node_id = 1 [(gogoproto.customname) = "NodeID",
+                     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+  // The name of the replica queue to run the range through. Matched against
+  // each queue's name field. See the implementation of baseQueue for details.
+  string queue = 2;
+  // The ID of the range to run through the queue.
+  int32 range_id = 3 [(gogoproto.customname) = "RangeID",
+                      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.RangeID"];
+  // If set, run the queue's process method without first checking whether the
+  // replica should be processed by calling shouldQueue.
+  bool skip_should_queue = 4;
+}
+
+message EnqueueRangeResponse {
+  message Details {
+    int32 node_id = 1 [(gogoproto.customname) = "NodeID",
+                       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+    // All trace events collected while processing the range in the queue.
+    repeated TraceEvent events = 2;
+    // The error message from the queue's processing, if any.
+    string error = 3;
+  }
+  repeated Details details = 1;
+}
+
+// ChartCatalogRequest requests returns a catalog of Admin UI charts.
+message ChartCatalogRequest {
+}
+
+// ChartCatalogResponse returns a catalog of Admin UI charts useful for debugging.
+message ChartCatalogResponse {
+  repeated cockroach.ts.catalog.ChartSection catalog = 1 [(gogoproto.nullable) = false];
 }
 
 // Admin is the gRPC API for the admin UI. Through grpc-gateway, we offer
@@ -532,6 +683,13 @@ service Admin {
   rpc TableStats(TableStatsRequest) returns (TableStatsResponse) {
     option (google.api.http) = {
       get: "/_admin/v1/databases/{database}/tables/{table}/stats"
+    };
+  }
+
+  // Example URL: /_admin/v1/nontablestats
+  rpc NonTableStats(NonTableStatsRequest) returns (NonTableStatsResponse) {
+    option (google.api.http) = {
+      get: "/_admin/v1/nontablestats"
     };
   }
 
@@ -603,6 +761,7 @@ service Admin {
   rpc Health(HealthRequest) returns (HealthResponse) {
     option (google.api.http) = {
       get: "/_admin/v1/health"
+      additional_bindings {get : "/health"}
     };
   }
 
@@ -636,18 +795,20 @@ service Admin {
 
   // Drain puts the node into the specified drain mode(s) and optionally
   // instructs the process to terminate.
+  // We do not expose this via HTTP unless we have a way to authenticate
+  // + authorize streaming RPC connections. See #42567.
   rpc Drain(DrainRequest) returns (stream DrainResponse) {
-    option (google.api.http) = {
-      post: "/_admin/v1/drain"
-      body: "*"
-    };
   }
 
   // Decommission puts the node(s) into the specified decommissioning state.
+  // If this ever becomes exposed via HTTP, ensure that it performs
+  // authorization. See #42567.
   rpc Decommission(DecommissionRequest) returns (DecommissionStatusResponse) {
   }
 
   // DecommissionStatus retrieves the decommissioning status of the specified nodes.
+  // If this ever becomes exposed via HTTP, ensure that it performs
+  // authorization. See #42567.
   rpc DecommissionStatus(DecommissionStatusRequest) returns (DecommissionStatusResponse) {
   }
 
@@ -661,6 +822,44 @@ service Admin {
       additional_bindings {
         get: "/_admin/v1/rangelog/{range_id}"
      }
+    };
+  }
+
+  rpc DataDistribution(DataDistributionRequest) returns (DataDistributionResponse) {
+    option (google.api.http) = {
+      get: "/_admin/v1/data_distribution"
+    };
+  }
+
+  // URL: /_admin/v1/metricmetadata
+  rpc AllMetricMetadata(MetricMetadataRequest) returns (MetricMetadataResponse) {
+    option (google.api.http) = {
+      get: "/_admin/v1/metricmetadata"
+    };
+  }
+
+  // URL: /_admin/v1/chartcatalog
+  rpc ChartCatalog(ChartCatalogRequest) returns (ChartCatalogResponse) {
+    option (google.api.http) = {
+      get: "/_admin/v1/chartcatalog"
+    };
+  }
+
+
+  // EnqueueRange runs the specified range through the specified queue on the
+  // range's leaseholder store, returning the detailed trace and error
+  // information from doing so. Parameters must be provided in the body of the
+  // POST request.
+  // For example:
+  //
+  // {
+  //   "queue": "raftlog",
+  //   "rangeId": 10
+  // }
+  rpc EnqueueRange(EnqueueRangeRequest) returns (EnqueueRangeResponse) {
+    option (google.api.http) = {
+      post: "/_admin/v1/enqueue_range"
+      body : "*"
     };
   }
 }

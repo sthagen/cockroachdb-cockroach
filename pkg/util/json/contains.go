@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package json
 
@@ -31,6 +27,15 @@ import "sort"
 // also the arrays and objects in separate arrays, so that we can do the fast
 // thing for the subset of the arrays which are scalars.
 func Contains(a, b JSON) (bool, error) {
+	if a.Type() == ArrayJSONType && b.isScalar() {
+		decoded, err := a.tryDecode()
+		if err != nil {
+			return false, err
+		}
+		ary := decoded.(jsonArray)
+		return checkArrayContainsScalar(ary, b)
+	}
+
 	preA, err := a.preprocessForContains()
 	if err != nil {
 		return false, err
@@ -40,6 +45,24 @@ func Contains(a, b JSON) (bool, error) {
 		return false, err
 	}
 	return preA.contains(preB)
+}
+
+// checkArrayContainsScalar performs a unique case of contains (and is
+// described as such in the Postgres docs) - a top-level array contains a
+// scalar which is an element of it.  This contradicts the general rule of
+// contains that the contained object must have the same "shape" as the
+// containing object.
+func checkArrayContainsScalar(ary jsonArray, s JSON) (bool, error) {
+	for _, j := range ary {
+		cmp, err := j.Compare(s)
+		if err != nil {
+			return false, err
+		}
+		if cmp == 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // containsable is an interface used internally for the implementation of @>.
@@ -147,35 +170,6 @@ func (j containsableScalar) contains(other containsable) (bool, error) {
 }
 
 func (j containsableArray) contains(other containsable) (bool, error) {
-	// This is a unique case of contains (and is described as such in the
-	// Postgres docs) - an array contains a scalar which is an element of it.
-	// This contradicts the general rule of contains that the contained object
-	// must have the same "shape" as the containing object.
-	if o, ok := other.(containsableScalar); ok {
-		var err error
-		found := sort.Search(len(j.scalars), func(i int) bool {
-			if err != nil {
-				return false
-			}
-			var c int
-			c, err = j.scalars[i].JSON.Compare(o.JSON)
-			return c >= 0
-		})
-		if err != nil {
-			return false, err
-		}
-
-		if found >= len(j.scalars) {
-			return false, nil
-		}
-
-		c, err := j.scalars[found].JSON.Compare(o.JSON)
-		if err != nil {
-			return false, err
-		}
-		return c == 0, nil
-	}
-
 	if contained, ok := other.(containsableArray); ok {
 		// Since both slices of scalars are sorted via the preprocessing, we can
 		// step through them together via binary search.
@@ -208,7 +202,7 @@ func (j containsableArray) contains(other containsable) (bool, error) {
 		// objects and arrays, but for now just do the quadratic check.
 		objectsMatch, err := quadraticJSONArrayContains(j.objects, contained.objects)
 		if err != nil {
-			return false, nil
+			return false, err
 		}
 		if !objectsMatch {
 			return false, nil
@@ -216,7 +210,7 @@ func (j containsableArray) contains(other containsable) (bool, error) {
 
 		arraysMatch, err := quadraticJSONArrayContains(j.arrays, contained.arrays)
 		if err != nil {
-			return false, nil
+			return false, err
 		}
 		if !arraysMatch {
 			return false, nil

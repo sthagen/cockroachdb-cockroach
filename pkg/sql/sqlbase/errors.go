@@ -1,110 +1,78 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
 import (
-	"context"
-	"fmt"
-	"strings"
-
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
-)
-
-// Cockroach error extensions:
-const (
-	// CodeRangeUnavailable signals that some data from the cluster cannot be
-	// accessed (e.g. because all replicas awol).
-	// We're using the postgres "Internal Error" error class "XX".
-	CodeRangeUnavailable string = "XXC00"
+	"github.com/cockroachdb/errors"
 )
 
 const (
+	// DuplicateUpsertErrText is error text used when a row is modified twice by
+	// an upsert statement.
+	DuplicateUpsertErrText = "UPSERT or INSERT...ON CONFLICT command cannot affect row a second time"
+
 	txnAbortedMsg = "current transaction is aborted, commands ignored " +
 		"until end of transaction block"
 	txnCommittedMsg = "current transaction is committed, commands ignored " +
 		"until end of transaction block"
-	txnRetryMsgPrefix = "restart transaction"
 )
 
-// NewRetryError creates an error signifying that the transaction can be retried.
-// It signals to the user that the SQL txn entered the RESTART_WAIT state after a
-// serialization error, and that a ROLLBACK TO SAVEPOINT COCKROACH_RESTART statement
-// should be issued.
-func NewRetryError(cause error) error {
-	return pgerror.NewErrorf(
-		pgerror.CodeSerializationFailureError, "%s: %s", txnRetryMsgPrefix, cause)
-}
-
 // NewTransactionAbortedError creates an error for trying to run a command in
-// the context of transaction that's already aborted.
+// the context of transaction that's in the aborted state. Any statement other
+// than ROLLBACK TO SAVEPOINT will return this error.
 func NewTransactionAbortedError(customMsg string) error {
 	if customMsg != "" {
-		return pgerror.NewErrorf(
-			pgerror.CodeInFailedSQLTransactionError, "%s: %s", customMsg, txnAbortedMsg)
+		return pgerror.Newf(
+			pgcode.InFailedSQLTransaction, "%s: %s", customMsg, txnAbortedMsg)
 	}
-	return pgerror.NewError(pgerror.CodeInFailedSQLTransactionError, txnAbortedMsg)
+	return pgerror.New(pgcode.InFailedSQLTransaction, txnAbortedMsg)
 }
 
 // NewTransactionCommittedError creates an error that signals that the SQL txn
 // is in the COMMIT_WAIT state and that only a COMMIT statement will be accepted.
 func NewTransactionCommittedError() error {
-	return pgerror.NewError(pgerror.CodeInvalidTransactionStateError, txnCommittedMsg)
+	return pgerror.New(pgcode.InvalidTransactionState, txnCommittedMsg)
 }
 
 // NewNonNullViolationError creates an error for a violation of a non-NULL constraint.
 func NewNonNullViolationError(columnName string) error {
-	return pgerror.NewErrorf(pgerror.CodeNotNullViolationError, "null value in column %q violates not-null constraint", columnName)
-}
-
-// NewUniquenessConstraintViolationError creates an error that represents a
-// violation of a UNIQUE constraint.
-func NewUniquenessConstraintViolationError(index *IndexDescriptor, vals []tree.Datum) error {
-	valStrs := make([]string, 0, len(vals))
-	for _, val := range vals {
-		valStrs = append(valStrs, val.String())
-	}
-
-	return pgerror.NewErrorf(pgerror.CodeUniqueViolationError,
-		"duplicate key value (%s)=(%s) violates unique constraint %q",
-		strings.Join(index.ColumnNames, ","),
-		strings.Join(valStrs, ","),
-		index.Name)
-}
-
-// IsUniquenessConstraintViolationError returns true if the error is for a
-// uniqueness constraint violation.
-func IsUniquenessConstraintViolationError(err error) bool {
-	return errHasCode(err, pgerror.CodeUniqueViolationError)
+	return pgerror.Newf(pgcode.NotNullViolation, "null value in column %q violates not-null constraint", columnName)
 }
 
 // NewInvalidSchemaDefinitionError creates an error for an invalid schema
 // definition such as a schema definition that doesn't parse.
 func NewInvalidSchemaDefinitionError(err error) error {
-	return pgerror.NewError(pgerror.CodeInvalidSchemaDefinitionError, err.Error())
+	return pgerror.WithCandidateCode(err, pgcode.InvalidSchemaDefinition)
 }
 
-// IsPermanentSchemaChangeError returns true if the error results in
-// a permanent failure of a schema change.
-func IsPermanentSchemaChangeError(err error) bool {
-	return errHasCode(err, pgerror.CodeNotNullViolationError) ||
-		errHasCode(err, pgerror.CodeUniqueViolationError) ||
-		errHasCode(err, pgerror.CodeInvalidSchemaDefinitionError)
+// NewUnsupportedSchemaUsageError creates an error for an invalid
+// schema use, e.g. mydb.someschema.tbl.
+func NewUnsupportedSchemaUsageError(name string) error {
+	return pgerror.Newf(pgcode.InvalidSchemaName,
+		"unsupported schema specification: %q", name)
+}
+
+// NewCCLRequiredError creates an error for when a CCL feature is used in an OSS
+// binary.
+func NewCCLRequiredError(err error) error {
+	return pgerror.WithCandidateCode(err, pgcode.CCLRequired)
+}
+
+// IsCCLRequiredError returns whether the error is a CCLRequired error.
+func IsCCLRequiredError(err error) bool {
+	return errHasCode(err, pgcode.CCLRequired)
 }
 
 // NewUndefinedDatabaseError creates an error that represents a missing database.
@@ -114,193 +82,112 @@ func NewUndefinedDatabaseError(name string) error {
 	// return an InvalidCatalogName error when connecting to a database that does
 	// not exist. We've chosen to return this code for all cases where the error cause
 	// is a missing database.
-	return pgerror.NewErrorf(
-		pgerror.CodeInvalidCatalogNameError, "database %q does not exist", name)
+	return pgerror.Newf(
+		pgcode.InvalidCatalogName, "database %q does not exist", name)
 }
 
-// IsUndefinedDatabaseError returns true if the error is for an undefined database.
-func IsUndefinedDatabaseError(err error) bool {
-	return errHasCode(err, pgerror.CodeInvalidCatalogNameError)
+// NewInvalidWildcardError creates an error that represents the result of expanding
+// a table wildcard over an invalid database or schema prefix.
+func NewInvalidWildcardError(name string) error {
+	return pgerror.Newf(
+		pgcode.InvalidCatalogName,
+		"%q does not match any valid database or schema", name)
 }
 
 // NewUndefinedRelationError creates an error that represents a missing database table or view.
 func NewUndefinedRelationError(name tree.NodeFormatter) error {
-	return pgerror.NewErrorf(pgerror.CodeUndefinedTableError,
+	return pgerror.Newf(pgcode.UndefinedTable,
 		"relation %q does not exist", tree.ErrString(name))
 }
 
-// IsUndefinedRelationError returns true if the error is for an undefined table.
-func IsUndefinedRelationError(err error) bool {
-	return errHasCode(err, pgerror.CodeUndefinedTableError)
+// NewUndefinedColumnError creates an error that represents a missing database column.
+func NewUndefinedColumnError(name string) error {
+	return pgerror.Newf(pgcode.UndefinedColumn, "column %q does not exist", name)
 }
 
 // NewDatabaseAlreadyExistsError creates an error for a preexisting database.
 func NewDatabaseAlreadyExistsError(name string) error {
-	return pgerror.NewErrorf(pgerror.CodeDuplicateDatabaseError, "database %q already exists", name)
+	return pgerror.Newf(pgcode.DuplicateDatabase, "database %q already exists", name)
 }
 
 // NewRelationAlreadyExistsError creates an error for a preexisting relation.
 func NewRelationAlreadyExistsError(name string) error {
-	return pgerror.NewErrorf(pgerror.CodeDuplicateRelationError, "relation %q already exists", name)
+	return pgerror.Newf(pgcode.DuplicateRelation, "relation %q already exists", name)
+}
+
+// IsRelationAlreadyExistsError checks whether this is an error for a preexisting relation.
+func IsRelationAlreadyExistsError(err error) bool {
+	return errHasCode(err, pgcode.DuplicateRelation)
 }
 
 // NewWrongObjectTypeError creates a wrong object type error.
-func NewWrongObjectTypeError(name *tree.TableName, desiredObjType string) error {
-	return pgerror.NewErrorf(pgerror.CodeWrongObjectTypeError, "%q is not a %s",
+func NewWrongObjectTypeError(name tree.NodeFormatter, desiredObjType string) error {
+	return pgerror.Newf(pgcode.WrongObjectType, "%q is not a %s",
 		tree.ErrString(name), desiredObjType)
 }
 
 // NewSyntaxError creates a syntax error.
 func NewSyntaxError(msg string) error {
-	return pgerror.NewError(pgerror.CodeSyntaxError, msg)
+	return pgerror.New(pgcode.Syntax, msg)
 }
 
 // NewDependentObjectError creates a dependent object error.
 func NewDependentObjectError(msg string) error {
-	return pgerror.NewError(pgerror.CodeDependentObjectsStillExistError, msg)
+	return pgerror.New(pgcode.DependentObjectsStillExist, msg)
 }
 
 // NewDependentObjectErrorWithHint creates a dependent object error with a hint
 func NewDependentObjectErrorWithHint(msg string, hint string) error {
-	pErr := pgerror.NewError(pgerror.CodeDependentObjectsStillExistError, msg)
-	pErr.Hint = hint
-	return pErr
+	err := pgerror.New(pgcode.DependentObjectsStillExist, msg)
+	return errors.WithHint(err, hint)
 }
 
 // NewRangeUnavailableError creates an unavailable range error.
 func NewRangeUnavailableError(
 	rangeID roachpb.RangeID, origErr error, nodeIDs ...roachpb.NodeID,
 ) error {
-	return pgerror.NewErrorf(CodeRangeUnavailable, "key range id:%d is unavailable; missing nodes: %s. Original error: %v",
+	return pgerror.Newf(pgcode.RangeUnavailable,
+		"key range id:%d is unavailable; missing nodes: %s. Original error: %v",
 		rangeID, nodeIDs, origErr)
 }
 
-// NewWindowingError creates a windowing error.
-func NewWindowingError(in string) error {
-	return pgerror.NewErrorf(pgerror.CodeWindowingError, "window functions are not allowed in %s", in)
+// NewWindowInAggError creates an error for the case when a window function is
+// nested within an aggregate function.
+func NewWindowInAggError() error {
+	return pgerror.New(pgcode.Grouping,
+		"window functions are not allowed in aggregate")
 }
 
-// NewStatementCompletionUnknownError creates an error with the corresponding pg
-// code. This is used to inform the client that it's unknown whether a statement
-// succeeded or not. Of particular interest to clients is when this error is
-// returned for a statement outside of a transaction or for a COMMIT/RELEASE
-// SAVEPOINT - there manual inspection may be necessary to check whether the
-// statement/transaction committed. When this is returned for other
-// transactional statements, the transaction has been rolled back (like it is
-// for any errors).
-//
-// NOTE(andrei): When introducing this error, I haven't verified the exact
-// conditions under which Postgres returns this code, nor its relationship to
-// code CodeTransactionResolutionUnknownError. I couldn't find good
-// documentation on these codes.
-func NewStatementCompletionUnknownError(err *roachpb.AmbiguousResultError) error {
-	return pgerror.NewErrorf(pgerror.CodeStatementCompletionUnknownError, err.Error())
+// NewAggInAggError creates an error for the case when an aggregate function is
+// contained within another aggregate function.
+func NewAggInAggError() error {
+	return pgerror.New(pgcode.Grouping, "aggregate function calls cannot be nested")
 }
 
-// NewQueryCanceledError creates a query cancellation error.
-func NewQueryCanceledError() error {
-	return pgerror.NewErrorf(pgerror.CodeQueryCanceledError, "query execution canceled")
+// QueryCanceledError is an error representing query cancellation.
+var QueryCanceledError = pgerror.New(
+	pgcode.QueryCanceled, "query execution canceled")
+
+// QueryTimeoutError is an error representing a query timeout.
+var QueryTimeoutError = pgerror.New(
+	pgcode.QueryCanceled, "query execution canceled due to statement timeout")
+
+// IsOutOfMemoryError checks whether this is an out of memory error.
+func IsOutOfMemoryError(err error) bool {
+	return errHasCode(err, pgcode.OutOfMemory)
 }
 
-// IsQueryCanceledError checks whether this is a query canceled error.
-func IsQueryCanceledError(err error) bool {
-	return errHasCode(err, pgerror.CodeQueryCanceledError) || strings.Contains(err.Error(), "query execution canceled")
+// IsUndefinedColumnError checks whether this is an undefined column error.
+func IsUndefinedColumnError(err error) bool {
+	return errHasCode(err, pgcode.UndefinedColumn)
 }
 
-func errHasCode(err error, code string) bool {
-	if pgErr, ok := pgerror.GetPGCause(err); ok {
-		return pgErr.Code == code
+func errHasCode(err error, code ...string) bool {
+	pgCode := pgerror.GetPGCode(err)
+	for _, c := range code {
+		if pgCode == c {
+			return true
+		}
 	}
 	return false
-}
-
-// singleKVFetcher is a kvFetcher that returns a single kv.
-type singleKVFetcher struct {
-	kv   roachpb.KeyValue
-	done bool
-}
-
-// nextKV implements the kvFetcher interface.
-func (f *singleKVFetcher) nextKV(ctx context.Context) (bool, roachpb.KeyValue, error) {
-	if f.done {
-		return false, roachpb.KeyValue{}, nil
-	}
-	f.done = true
-	return true, f.kv, nil
-}
-
-// getRangesInfo implements the kvFetcher interface.
-func (f *singleKVFetcher) getRangesInfo() []roachpb.RangeInfo {
-	panic("getRangesInfo() called on singleKVFetcher")
-}
-
-// ConvertBatchError returns a user friendly constraint violation error.
-func ConvertBatchError(ctx context.Context, tableDesc *TableDescriptor, b *client.Batch) error {
-	origPErr := b.MustPErr()
-	if origPErr.Index == nil {
-		return origPErr.GoError()
-	}
-	j := origPErr.Index.Index
-	if j >= int32(len(b.Results)) {
-		panic(fmt.Sprintf("index %d outside of results: %+v", j, b.Results))
-	}
-	result := b.Results[j]
-	if cErr, ok := origPErr.GetDetail().(*roachpb.ConditionFailedError); ok && len(result.Rows) > 0 {
-		key := result.Rows[0].Key
-		// TODO(dan): There's too much internal knowledge of the sql table
-		// encoding here (and this callsite is the only reason
-		// DecodeIndexKeyPrefix is exported). Refactor this bit out.
-		indexID, _, err := DecodeIndexKeyPrefix(tableDesc, key)
-		if err != nil {
-			return err
-		}
-		index, err := tableDesc.FindIndexByID(indexID)
-		if err != nil {
-			return err
-		}
-		var rf MultiRowFetcher
-
-		var valNeededForCol util.FastIntSet
-		valNeededForCol.AddRange(0, len(index.ColumnIDs)-1)
-
-		colIdxMap := make(map[ColumnID]int, len(index.ColumnIDs))
-		cols := make([]ColumnDescriptor, len(index.ColumnIDs))
-		for i, colID := range index.ColumnIDs {
-			colIdxMap[colID] = i
-			col, err := tableDesc.FindColumnByID(colID)
-			if err != nil {
-				return err
-			}
-			cols[i] = *col
-		}
-
-		tableArgs := MultiRowFetcherTableArgs{
-			Desc:             tableDesc,
-			Index:            index,
-			ColIdxMap:        colIdxMap,
-			IsSecondaryIndex: indexID != tableDesc.PrimaryIndex.ID,
-			Cols:             cols,
-			ValNeededForCol:  valNeededForCol,
-		}
-		if err := rf.Init(
-			false /* reverse */, false /* returnRangeInfo */, false /* isCheck */, &DatumAlloc{}, tableArgs,
-		); err != nil {
-			return err
-		}
-		f := singleKVFetcher{kv: roachpb.KeyValue{Key: key}}
-		if cErr.ActualValue != nil {
-			f.kv.Value = *cErr.ActualValue
-		}
-		// Use the RowFetcher to decode the single kv pair above by passing in
-		// this singleKVFetcher implementation, which doesn't actually hit KV.
-		if err := rf.StartScanFrom(ctx, &f); err != nil {
-			return err
-		}
-		datums, _, _, err := rf.NextRowDecoded(ctx)
-		if err != nil {
-			return err
-		}
-		return NewUniquenessConstraintViolationError(index, datums)
-	}
-	return origPErr.GoError()
 }

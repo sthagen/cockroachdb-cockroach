@@ -1,141 +1,319 @@
-// Copyright 2017 The Cockroach Authors.
+// Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package opt
 
 import (
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-type operator uint8
+// Operator describes the type of operation that a memo expression performs.
+// Some operators are relational (join, select, project) and others are scalar
+// (and, or, plus, variable).
+type Operator uint16
 
-const (
-	unknownOp operator = iota
-
-	// TODO(radu): no relational operators yet.
-
-	// -- Scalar operators --
-
-	// variableOp is a leaf expression that represents a non-constant value, like a column
-	// in a table.
-	variableOp
-
-	// constOp is a leaf expression that has a constant value.
-	constOp
-
-	// listOp is an unordered list of expressions. Currently unused.
-	listOp
-
-	// orderedListOp is an ordered list of expressions. Currently unused.
-	orderedListOp
-
-	andOp
-	orOp
-	notOp
-
-	eqOp
-	ltOp
-	gtOp
-	leOp
-	geOp
-	neOp
-	inOp
-	notInOp
-	likeOp
-	notLikeOp
-	iLikeOp
-	notILikeOp
-	similarToOp
-	notSimilarToOp
-	regMatchOp
-	notRegMatchOp
-	regIMatchOp
-	notRegIMatchOp
-
-	isDistinctFromOp
-	isNotDistinctFromOp
-
-	// isOp implements the SQL operator IS, as well as its extended
-	// version IS NOT DISTINCT FROM.
-	isOp
-
-	// isNotOp implements the SQL operator IS NOT, as well as its extended
-	// version IS DISTINCT FROM.
-	isNotOp
-
-	anyOp
-	someOp
-	allOp
-
-	bitandOp
-	bitorOp
-	bitxorOp
-	plusOp
-	minusOp
-	multOp
-	divOp
-	floorDivOp
-	modOp
-	powOp
-	concatOp
-	lShiftOp
-	rShiftOp
-
-	unaryPlusOp
-	unaryMinusOp
-	unaryComplementOp
-
-	functionCallOp
-
-	// This should be last.
-	numOperators
-)
-
-// operatorInfo stores static information about an operator.
-type operatorInfo struct {
-	// name of the operator, used when printing expressions.
-	name string
-	// class of the operator (see operatorClass).
-	class operatorClass
-
-	normalizeFn func(*expr)
-}
-
-// operatorTab stores static information about all operators.
-var operatorTab = [numOperators]operatorInfo{
-	unknownOp: {name: "unknown"},
-}
-
-func (op operator) String() string {
-	if op >= numOperators {
-		return fmt.Sprintf("operator(%d)", op)
+// String returns the name of the operator as a string.
+func (op Operator) String() string {
+	if op >= Operator(len(opNames)-1) {
+		return fmt.Sprintf("Operator(%d)", op)
 	}
-	return operatorTab[op].name
+	return opNames[opNameIndexes[op]:opNameIndexes[op+1]]
 }
 
-// registerOperator initializes the operator's entry in operatorTab.
-// There must be a call to registerOperator in an init() function for every
-// operator.
-func registerOperator(op operator, info operatorInfo) {
-	operatorTab[op] = info
+// SyntaxTag returns the name of the operator using the SQL syntax that most
+// closely matches it.
+func (op Operator) SyntaxTag() string {
+	// Handle any special cases where default codegen tag isn't best choice as
+	// switch cases.
+	switch op {
+	default:
+		// Use default codegen tag, which is mechanically derived from the
+		// operator name.
+		if op >= Operator(len(opNames)-1) {
+			// Use UNKNOWN.
+			op = 0
+		}
+		return opSyntaxTags[opSyntaxTagIndexes[op]:opSyntaxTagIndexes[op+1]]
+	}
 }
 
-// operatorClass implements functionality that is common for a subset of
-// operators.
-type operatorClass interface {
-	// format outputs information about the expr tree to a treePrinter.
-	format(e *expr, tp treeprinter.Node)
+// Expr is a node in an expression tree. It offers methods to traverse and
+// inspect the tree. Each node in the tree has an enumerated operator type, zero
+// or more children, and an optional private value. The entire tree can be
+// easily visited using a pattern like this:
+//
+//   var visit func(e Expr)
+//   visit := func(e Expr) {
+//     for i, n := 0, e.ChildCount(); i < n; i++ {
+//       visit(e.Child(i))
+//     }
+//   }
+//
+type Expr interface {
+	// Op returns the operator type of the expression.
+	Op() Operator
+
+	// ChildCount returns the number of children of the expression.
+	ChildCount() int
+
+	// Child returns the nth child of the expression.
+	Child(nth int) Expr
+
+	// Private returns operator-specific data. Callers are expected to know the
+	// type and format of the data, which will differ from operator to operator.
+	// For example, an operator may choose to return one of its fields, or perhaps
+	// a pointer to itself, or nil if there is nothing useful to return.
+	Private() interface{}
+
+	// String returns a human-readable string representation for the expression
+	// that can be used for debugging and testing.
+	String() string
+}
+
+// ScalarID is the type of the memo-unique identifier given to every scalar
+// expression.
+type ScalarID int
+
+// ScalarExpr is a scalar expression, which is an expression that returns a
+// primitive-typed value like boolean or string rather than rows and columns.
+type ScalarExpr interface {
+	Expr
+
+	// ID is a unique (within the context of a memo) ID that can be
+	// used to define a total order over ScalarExprs.
+	ID() ScalarID
+
+	// DataType is the SQL type of the expression.
+	DataType() *types.T
+}
+
+// MutableExpr is implemented by expressions that allow their children to be
+// updated.
+type MutableExpr interface {
+	// SetChild updates the nth child of the expression to instead be the given
+	// child expression.
+	SetChild(nth int, child Expr)
+}
+
+// ComparisonOpMap maps from a semantic tree comparison operator type to an
+// optimizer operator type.
+var ComparisonOpMap [tree.NumComparisonOperators]Operator
+
+// ComparisonOpReverseMap maps from an optimizer operator type to a semantic
+// tree comparison operator type.
+var ComparisonOpReverseMap = map[Operator]tree.ComparisonOperator{
+	EqOp:             tree.EQ,
+	LtOp:             tree.LT,
+	GtOp:             tree.GT,
+	LeOp:             tree.LE,
+	GeOp:             tree.GE,
+	NeOp:             tree.NE,
+	InOp:             tree.In,
+	NotInOp:          tree.NotIn,
+	LikeOp:           tree.Like,
+	NotLikeOp:        tree.NotLike,
+	ILikeOp:          tree.ILike,
+	NotILikeOp:       tree.NotILike,
+	SimilarToOp:      tree.SimilarTo,
+	NotSimilarToOp:   tree.NotSimilarTo,
+	RegMatchOp:       tree.RegMatch,
+	NotRegMatchOp:    tree.NotRegMatch,
+	RegIMatchOp:      tree.RegIMatch,
+	NotRegIMatchOp:   tree.NotRegIMatch,
+	IsOp:             tree.IsNotDistinctFrom,
+	IsNotOp:          tree.IsDistinctFrom,
+	ContainsOp:       tree.Contains,
+	JsonExistsOp:     tree.JSONExists,
+	JsonSomeExistsOp: tree.JSONSomeExists,
+	JsonAllExistsOp:  tree.JSONAllExists,
+	OverlapsOp:       tree.Overlaps,
+}
+
+// BinaryOpReverseMap maps from an optimizer operator type to a semantic tree
+// binary operator type.
+var BinaryOpReverseMap = map[Operator]tree.BinaryOperator{
+	BitandOp:        tree.Bitand,
+	BitorOp:         tree.Bitor,
+	BitxorOp:        tree.Bitxor,
+	PlusOp:          tree.Plus,
+	MinusOp:         tree.Minus,
+	MultOp:          tree.Mult,
+	DivOp:           tree.Div,
+	FloorDivOp:      tree.FloorDiv,
+	ModOp:           tree.Mod,
+	PowOp:           tree.Pow,
+	ConcatOp:        tree.Concat,
+	LShiftOp:        tree.LShift,
+	RShiftOp:        tree.RShift,
+	FetchValOp:      tree.JSONFetchVal,
+	FetchTextOp:     tree.JSONFetchText,
+	FetchValPathOp:  tree.JSONFetchValPath,
+	FetchTextPathOp: tree.JSONFetchTextPath,
+}
+
+// UnaryOpReverseMap maps from an optimizer operator type to a semantic tree
+// unary operator type.
+var UnaryOpReverseMap = map[Operator]tree.UnaryOperator{
+	UnaryMinusOp:      tree.UnaryMinus,
+	UnaryComplementOp: tree.UnaryComplement,
+}
+
+// AggregateOpReverseMap maps from an optimizer operator type to the name of an
+// aggregation function.
+var AggregateOpReverseMap = map[Operator]string{
+	ArrayAggOp:        "array_agg",
+	AvgOp:             "avg",
+	BitAndAggOp:       "bit_and",
+	BitOrAggOp:        "bit_or",
+	BoolAndOp:         "bool_and",
+	BoolOrOp:          "bool_or",
+	ConcatAggOp:       "concat_agg",
+	CountOp:           "count",
+	CorrOp:            "corr",
+	CountRowsOp:       "count_rows",
+	MaxOp:             "max",
+	MinOp:             "min",
+	SumIntOp:          "sum_int",
+	SumOp:             "sum",
+	SqrDiffOp:         "sqrdiff",
+	VarianceOp:        "variance",
+	StdDevOp:          "stddev",
+	XorAggOp:          "xor_agg",
+	JsonAggOp:         "json_agg",
+	JsonbAggOp:        "jsonb_agg",
+	StringAggOp:       "string_agg",
+	ConstAggOp:        "any_not_null",
+	ConstNotNullAggOp: "any_not_null",
+	AnyNotNullAggOp:   "any_not_null",
+}
+
+// WindowOpReverseMap maps from an optimizer operator type to the name of a
+// window function.
+var WindowOpReverseMap = map[Operator]string{
+	RankOp:        "rank",
+	RowNumberOp:   "row_number",
+	DenseRankOp:   "dense_rank",
+	PercentRankOp: "percent_rank",
+	CumeDistOp:    "cume_dist",
+	NtileOp:       "ntile",
+	LagOp:         "lag",
+	LeadOp:        "lead",
+	FirstValueOp:  "first_value",
+	LastValueOp:   "last_value",
+	NthValueOp:    "nth_value",
+}
+
+// NegateOpMap maps from a comparison operator type to its negated operator
+// type, as if the Not operator was applied to it. Some comparison operators,
+// like Contains and JsonExists, do not have negated versions.
+var NegateOpMap = map[Operator]Operator{
+	EqOp:           NeOp,
+	LtOp:           GeOp,
+	GtOp:           LeOp,
+	LeOp:           GtOp,
+	GeOp:           LtOp,
+	NeOp:           EqOp,
+	InOp:           NotInOp,
+	NotInOp:        InOp,
+	LikeOp:         NotLikeOp,
+	NotLikeOp:      LikeOp,
+	ILikeOp:        NotILikeOp,
+	NotILikeOp:     ILikeOp,
+	SimilarToOp:    NotSimilarToOp,
+	NotSimilarToOp: SimilarToOp,
+	RegMatchOp:     NotRegMatchOp,
+	NotRegMatchOp:  RegMatchOp,
+	RegIMatchOp:    NotRegIMatchOp,
+	NotRegIMatchOp: RegIMatchOp,
+	IsOp:           IsNotOp,
+	IsNotOp:        IsOp,
+}
+
+// BoolOperatorRequiresNotNullArgs returns true if the operator can never
+// evaluate to true if one of its children is NULL.
+func BoolOperatorRequiresNotNullArgs(op Operator) bool {
+	switch op {
+	case
+		EqOp, LtOp, LeOp, GtOp, GeOp, NeOp,
+		LikeOp, NotLikeOp, ILikeOp, NotILikeOp, SimilarToOp, NotSimilarToOp,
+		RegMatchOp, NotRegMatchOp, RegIMatchOp, NotRegIMatchOp:
+		return true
+	}
+	return false
+}
+
+// AggregateIgnoresNulls returns true if the given aggregate operator ignores
+// rows where its first argument evaluates to NULL. In other words, it always
+// evaluates to the same result even if those rows are filtered. For example:
+//
+//   SELECT string_agg(x, y)
+//   FROM (VALUES ('foo', ','), ('bar', ','), (NULL, ',')) t(x, y)
+//
+// In this example, the NULL row can be removed from the input, and the
+// string_agg function still returns the same result. Contrast this to the
+// array_agg function:
+//
+//   SELECT array_agg(x)
+//   FROM (VALUES ('foo'), (NULL), ('bar')) t(x)
+//
+// If the NULL row is removed here, array_agg returns {foo,bar} instead of
+// {foo,NULL,bar}.
+func AggregateIgnoresNulls(op Operator) bool {
+	switch op {
+	case AvgOp, BitAndAggOp, BitOrAggOp, BoolAndOp, BoolOrOp, CorrOp, CountOp, MaxOp, MinOp,
+		SumIntOp, SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, ConstNotNullAggOp,
+		AnyNotNullAggOp, StringAggOp:
+		return true
+	}
+	return false
+}
+
+// AggregateIsNullOnEmpty returns true if the given aggregate operator returns
+// NULL when the input set contains no values. This group of aggregates overlaps
+// considerably with the AggregateIgnoresNulls group, with the notable exception
+// of COUNT, which returns zero instead of NULL when its input is empty.
+func AggregateIsNullOnEmpty(op Operator) bool {
+	switch op {
+	case AvgOp, BitAndAggOp, BitOrAggOp, BoolAndOp, BoolOrOp, CorrOp, MaxOp, MinOp, SumIntOp,
+		SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, ConstAggOp, ConstNotNullAggOp, ArrayAggOp,
+		ConcatAggOp, JsonAggOp, JsonbAggOp, AnyNotNullAggOp, StringAggOp:
+		return true
+	}
+	return false
+}
+
+// AggregateIsNeverNull returns true if the given aggregate operator never
+// returns NULL, even if the input is empty, or one more more inputs are NULL.
+func AggregateIsNeverNull(op Operator) bool {
+	switch op {
+	case CountOp, CountRowsOp:
+		return true
+	}
+	return false
+}
+
+// OpaqueMetadata is an object stored in OpaqueRelExpr and passed
+// through to the exec factory.
+type OpaqueMetadata interface {
+	ImplementsOpaqueMetadata()
+
+	// String is a short description used when printing optimizer trees and when
+	// forming error messages; it should be the SQL statement tag.
+	String() string
+}
+
+func init() {
+	for optOp, treeOp := range ComparisonOpReverseMap {
+		ComparisonOpMap[treeOp] = optOp
+	}
 }

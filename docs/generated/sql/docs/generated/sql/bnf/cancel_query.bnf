@@ -1,2 +1,0 @@
-cancel_query_stmt ::=
-	'CANCEL' 'QUERY' query_id

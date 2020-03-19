@@ -1,16 +1,16 @@
-# LogicTest: default parallel-stmts distsql
-
-statement error relation "t" does not exist
+statement error pgcode 42P01 relation "t" does not exist
 EXPERIMENTAL SCRUB TABLE t
 -----
 
+# TODO(mjibson): remove FAMILY definition after #41002 is fixed.
 statement ok
 CREATE TABLE t (
   id int PRIMARY KEY,
   name STRING,
   data INT DEFAULT 2,
   CONSTRAINT abc CHECK (name > 'he'),
-  INDEX name_idx (name)
+  INDEX name_idx (name),
+  FAMILY "primary" (id, name, data)
 )
 
 statement ok
@@ -111,11 +111,51 @@ EXPERIMENTAL SCRUB TABLE test.fk_parent WITH OPTIONS CONSTRAINT (fkey)
 
 # Test AS OF SYSTEM TIME
 
-statement error database "test" does not exist
+statement error pgcode 42P01 relation "xz" does not exist
 EXPERIMENTAL SCRUB TABLE xz AS OF SYSTEM TIME '2017' WITH OPTIONS PHYSICAL
 
-statement error database "test" does not exist
+statement error pgcode 42P01 relation "xz" does not exist
 EXPERIMENTAL SCRUB TABLE xz AS OF SYSTEM TIME '2017' WITH OPTIONS INDEX ALL
 
-statement error database "test" does not exist
+statement error pgcode 42P01 relation "xz" does not exist
 EXPERIMENTAL SCRUB TABLE xz AS OF SYSTEM TIME '2017' WITH OPTIONS CONSTRAINT ALL
+
+# Test scrubbing sequences.
+
+statement ok
+CREATE DATABASE seq_db
+
+statement ok
+CREATE SEQUENCE seq_db.my_seq
+
+statement ok
+CREATE TABLE seq_db.my_tbl (id INT PRIMARY KEY DEFAULT nextval('seq_db.my_seq'))
+
+statement ok
+EXPERIMENTAL SCRUB DATABASE seq_db
+
+statement error pq: "seq_db.public.my_seq" is not a table
+EXPERIMENTAL SCRUB TABLE seq_db.my_seq
+
+# Test for false positives when checking key order (#32874)
+
+statement ok
+CREATE TABLE test.order (a INT, b INT, c INT, CONSTRAINT "primary" PRIMARY KEY (a, b, c DESC))
+
+statement ok
+INSERT INTO test.order VALUES (0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1), (1, 0, 0);
+
+query TTTTTTTT
+EXPERIMENTAL SCRUB TABLE test.order WITH OPTIONS PHYSICAL
+
+# Test that scrubbing timestamp works as expected.
+subtest regression_44992
+
+statement ok
+CREATE TABLE t0(c0 TIMESTAMP UNIQUE); INSERT INTO t0(c0) VALUES(TIMESTAMP '1969-1-1'); INSERT INTO t0(c0) VALUES(TIMESTAMP '1969-1-2')
+
+statement ok
+EXPERIMENTAL SCRUB TABLE t0
+
+statement ok
+DROP TABLE t0

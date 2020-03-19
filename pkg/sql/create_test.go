@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -18,25 +14,24 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"net/url"
 	"sync"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/jackc/pgx"
 )
 
 func TestDatabaseDescriptor(t *testing.T) {
@@ -45,8 +40,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
-
-	expectedCounter := int64(keys.MaxReservedDescID + 1)
+	expectedCounter := int64(keys.MinNonPredefinedUserDescID)
 
 	// Test values before creating the database.
 	// descriptor ID counter.
@@ -57,7 +51,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 	}
 
 	// Database name.
-	nameKey := sqlbase.MakeNameMetadataKey(keys.RootNamespaceID, "test")
+	nameKey := sqlbase.NewDatabaseKey("test").Key()
 	if gr, err := kvDB.Get(ctx, nameKey); err != nil {
 		t.Fatal(err)
 	} else if gr.Exists() {
@@ -95,14 +89,20 @@ func TestDatabaseDescriptor(t *testing.T) {
 	}
 
 	start := roachpb.Key(keys.MakeTablePrefix(uint32(keys.NamespaceTableID)))
-	if kvs, err := kvDB.Scan(ctx, start, start.PrefixEnd(), 0); err != nil {
+	if kvs, err := kvDB.Scan(ctx, start, start.PrefixEnd(), 0 /* maxRows */); err != nil {
 		t.Fatal(err)
 	} else {
-		descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(ctx, kvDB)
+		descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(ctx, kvDB, &s.(*server.TestServer).Cfg.DefaultZoneConfig, &s.(*server.TestServer).Cfg.DefaultSystemZoneConfig)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if e, a := len(descriptorIDs), len(kvs); a != e {
+		// TODO(arul): Revert this back to to len(descriptorIDs) once the migration
+		//  to the new system.namespace is done.
+		// Every database is initialized with a public schema, which does not have
+		// a descriptor associated with it. There are 3 databases: defaultdb,
+		// system, and postgres.
+		e := len(descriptorIDs) + 3
+		if a := len(kvs); a != e {
 			t.Fatalf("expected %d keys to have been written, found %d keys", e, a)
 		}
 	}
@@ -197,7 +197,10 @@ func createTestTable(
 
 	for {
 		if _, err := db.Exec(tableSQL); err != nil {
-			if testutils.IsSQLRetryableError(err) {
+			// Scenario where an ambiguous commit error happens is described in more
+			// detail in
+			// https://reviewable.io/reviews/cockroachdb/cockroach/10251#-KVGGLbjhbPdlR6EFlfL
+			if testutils.IsError(err, "result is ambiguous") {
 				continue
 			}
 			t.Errorf("table %d: could not be created: %s", id, err)
@@ -225,7 +228,7 @@ func verifyTables(
 	for id := range completed {
 		count++
 		tableName := fmt.Sprintf("table_%d", id)
-		kvDB := tc.Servers[count%tc.NumServers()].KVClient().(*client.DB)
+		kvDB := tc.Servers[count%tc.NumServers()].DB()
 		tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", tableName)
 		if tableDesc.ID < descIDStart {
 			t.Fatalf(
@@ -253,7 +256,7 @@ func verifyTables(
 
 	// Check that no extra descriptors have been written in the range
 	// descIDStart..maxID.
-	kvDB := tc.Servers[0].KVClient().(*client.DB)
+	kvDB := tc.Servers[0].DB()
 	for id := descIDStart; id < maxID; id++ {
 		if _, ok := tableIDs[id]; ok {
 			continue
@@ -286,7 +289,7 @@ func TestParallelCreateTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Get the id descriptor generator count.
-	kvDB := tc.Servers[0].KVClient().(*client.DB)
+	kvDB := tc.Servers[0].DB()
 	var descIDStart sqlbase.ID
 	if descID, err := kvDB.Get(context.Background(), keys.DescIDGenerator); err != nil {
 		t.Fatal(err)
@@ -340,7 +343,7 @@ func TestParallelCreateConflictingTables(t *testing.T) {
 	}
 
 	// Get the id descriptor generator count.
-	kvDB := tc.Servers[0].KVClient().(*client.DB)
+	kvDB := tc.Servers[0].DB()
 	var descIDStart sqlbase.ID
 	if descID, err := kvDB.Get(context.Background(), keys.DescIDGenerator); err != nil {
 		t.Fatal(err)
@@ -426,7 +429,7 @@ SELECT * FROM t.kv%d
 		// This select should not see any data.
 		if _, err := tx.Query(fmt.Sprintf(
 			`SELECT * FROM t.kv%d`, i,
-		)); !testutils.IsError(err, fmt.Sprintf("id %d is not a table", 52+i)) {
+		)); !testutils.IsError(err, fmt.Sprintf("relation \"t.kv%d\" does not exist", i)) {
 			t.Fatalf("err = %v", err)
 		}
 
@@ -438,55 +441,102 @@ SELECT * FROM t.kv%d
 
 func TestCreateStatementType(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	ctx := context.TODO()
+	defer s.Stopper().Stop(ctx)
+
+	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanup()
+	pgxConfig, err := pgx.ParseConnectionString(pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.Connect(pgxConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmdTag, err := conn.Exec("CREATE DATABASE t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmdTag != "CREATE DATABASE" {
+		t.Fatal("expected CREATE DATABASE, got", cmdTag)
+	}
+
+	cmdTag, err = conn.Exec("CREATE TABLE t.foo(x INT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmdTag != "CREATE TABLE" {
+		t.Fatal("expected CREATE TABLE, got", cmdTag)
+	}
+
+	cmdTag, err = conn.Exec("CREATE TABLE t.bar AS SELECT * FROM generate_series(1,10)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmdTag != "CREATE TABLE AS" {
+		t.Fatal("expected CREATE TABLE AS, got", cmdTag)
+	}
+}
+
+// Test that the user's password cannot be set in insecure mode.
+func TestSetUserPasswordInsecure(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
 	defer s.Stopper().Stop(context.TODO())
 
-	ac := log.AmbientContext{Tracer: tracing.NewTracer()}
-	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
-	defer span.Finish()
+	errFail := "setting or updating a password is not supported in insecure mode"
 
-	e := s.Executor().(*sql.Executor)
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, e, nil, &sql.MemoryMetrics{})
-	session.StartUnlimitedMonitor()
-	defer session.Finish(e)
-
-	query := "CREATE DATABASE t; CREATE TABLE t.foo(x INT); CREATE TABLE t.bar AS SELECT * FROM generate_series(1,10)"
-	res, err := e.ExecuteStatementsBuffered(session, query, nil, 3)
-	if err != nil {
-		t.Fatal("expected no error, got", err)
-	}
-	defer res.Close(session.Ctx())
-	if res.Empty {
-		t.Fatal("expected non-empty results")
+	testCases := []struct {
+		sql       string
+		errString string
+	}{
+		{"CREATE USER user1", ""},
+		{"CREATE USER user2 WITH PASSWORD ''", "empty passwords are not permitted"},
+		{"CREATE USER user2 WITH PASSWORD 'cockroach'", errFail},
+		{"CREATE USER user3 WITH PASSWORD NULL", ""},
+		{"ALTER USER user1 WITH PASSWORD 'somepass'", errFail},
+		{"ALTER USER user1 WITH PASSWORD NULL", ""},
 	}
 
-	result := res.ResultList[1]
-	if result.Err != nil {
-		t.Fatal("expected no error, got", err)
-	}
-	if result.PGTag != "CREATE TABLE" {
-		t.Fatal("expected CREATE TABLE, got", result.PGTag)
-	}
-	if result.Type != tree.DDL {
-		t.Fatal("expected result type tree.DDL, got", result.Type)
-	}
-	if result.RowsAffected != 0 {
-		t.Fatal("expected 0 rows affected, got", result.RowsAffected)
+	for _, testCase := range testCases {
+		t.Run(testCase.sql, func(t *testing.T) {
+			_, err := sqlDB.Exec(testCase.sql)
+			if testCase.errString != "" {
+				if !testutils.IsError(err, testCase.errString) {
+					t.Fatal(err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 
-	result = res.ResultList[2]
-	if result.Err != nil {
-		t.Fatal("expected no error, got", err)
+	testCases = []struct {
+		sql       string
+		errString string
+	}{
+		{"CREATE USER $1 WITH PASSWORD $2", errFail},
+		{"ALTER USER $1 WITH PASSWORD $2", errFail},
 	}
-	if result.PGTag != "SELECT" {
-		t.Fatal("expected SELECT, got", result.PGTag)
-	}
-	if result.Type != tree.RowsAffected {
-		t.Fatal("expected result type tree.RowsAffected, got", result.Type)
-	}
-	if result.RowsAffected != 10 {
-		t.Fatal("expected 10 rows affected, got", result.RowsAffected)
+
+	for _, testCase := range testCases {
+		t.Run(testCase.sql, func(t *testing.T) {
+			stmt, err := sqlDB.Prepare(testCase.sql)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = stmt.Exec("user3", "cockroach")
+			if testCase.errString != "" {
+				if !testutils.IsError(err, testCase.errString) {
+					t.Fatal(err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package mon
 
@@ -20,14 +16,14 @@ import (
 	"math"
 	"math/bits"
 
-	"github.com/pkg/errors"
-
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/pkg/errors"
 )
 
 // BoundAccount and BytesMonitor together form the mechanism by which
@@ -41,7 +37,7 @@ import (
 //
 // - components in CockroachDB that wish to have their allocations tracked
 //   declare/register their allocations to an instance of BytesMonitor. To do
-//   this, each component maintains one or more instances of BoundAcount, one
+//   this, each component maintains one or more instances of BoundAccount, one
 //   per "category" of allocation, and issue requests to Grow, Resize or Close
 //   to their monitor. Grow/Resize requests can be denied (return an error),
 //   which indicates the budget has been reached.
@@ -219,8 +215,15 @@ type BytesMonitor struct {
 	// become reported in the logs.
 	noteworthyUsageBytes int64
 
-	curBytesCount *metric.Counter
-	maxBytesHist  *metric.Histogram
+	// curBytesCount is the metric object used to track number of bytes reserved
+	// by the monitor during its lifetime.
+	curBytesCount *metric.Gauge
+
+	// maxBytesHist is the metric object used to track the high watermark of bytes
+	// allocated by the monitor during its lifetime.
+	maxBytesHist *metric.Histogram
+
+	settings *cluster.Settings
 }
 
 // maxAllocatedButUnusedBlocks determines the maximum difference between the
@@ -257,12 +260,14 @@ var DefaultPoolAllocationSize = envutil.EnvOrDefaultInt64("COCKROACH_ALLOCATION_
 func MakeMonitor(
 	name string,
 	res Resource,
-	curCount *metric.Counter,
+	curCount *metric.Gauge,
 	maxHist *metric.Histogram,
 	increment int64,
 	noteworthy int64,
+	settings *cluster.Settings,
 ) BytesMonitor {
-	return MakeMonitorWithLimit(name, res, math.MaxInt64, curCount, maxHist, increment, noteworthy)
+	return MakeMonitorWithLimit(
+		name, res, math.MaxInt64, curCount, maxHist, increment, noteworthy, settings)
 }
 
 // MakeMonitorWithLimit creates a new monitor with a limit local to this
@@ -271,10 +276,11 @@ func MakeMonitorWithLimit(
 	name string,
 	res Resource,
 	limit int64,
-	curCount *metric.Counter,
+	curCount *metric.Gauge,
 	maxHist *metric.Histogram,
 	increment int64,
 	noteworthy int64,
+	settings *cluster.Settings,
 ) BytesMonitor {
 	if increment <= 0 {
 		increment = DefaultPoolAllocationSize
@@ -290,6 +296,7 @@ func MakeMonitorWithLimit(
 		curBytesCount:        curCount,
 		maxBytesHist:         maxHist,
 		poolAllocationSize:   increment,
+		settings:             settings,
 	}
 }
 
@@ -304,6 +311,7 @@ func MakeMonitorInheritWithLimit(name string, limit int64, m *BytesMonitor) Byte
 		m.maxBytesHist,
 		m.poolAllocationSize,
 		m.noteworthyUsageBytes,
+		m.settings,
 	)
 }
 
@@ -343,9 +351,10 @@ func MakeUnlimitedMonitor(
 	ctx context.Context,
 	name string,
 	res Resource,
-	curCount *metric.Counter,
+	curCount *metric.Gauge,
 	maxHist *metric.Histogram,
 	noteworthy int64,
+	settings *cluster.Settings,
 ) BytesMonitor {
 	if log.V(2) {
 		log.InfofDepth(ctx, 1, "%s: starting unlimited monitor", name)
@@ -360,6 +369,7 @@ func MakeUnlimitedMonitor(
 		maxBytesHist:         maxHist,
 		poolAllocationSize:   DefaultPoolAllocationSize,
 		reserved:             MakeStandaloneBudget(math.MaxInt64),
+		settings:             settings,
 	}
 }
 
@@ -384,9 +394,10 @@ func (mm *BytesMonitor) doStop(ctx context.Context, check bool) {
 	}
 
 	if check && mm.mu.curAllocated != 0 {
-		panic(fmt.Sprintf("%s: unexpected %d leftover bytes",
-			mm.name,
-			mm.mu.curAllocated))
+		log.ReportOrPanic(
+			ctx, &mm.settings.SV,
+			fmt.Sprintf("%s: unexpected %d leftover bytes", mm.name, mm.mu.curAllocated))
+		mm.releaseBytes(ctx, mm.mu.curAllocated)
 	}
 
 	mm.releaseBudget(ctx)
@@ -407,6 +418,27 @@ func (mm *BytesMonitor) doStop(ctx context.Context, check bool) {
 	mm.reserved.Clear(ctx)
 }
 
+// MaximumBytes returns the maximum number of bytes that were allocated by this
+// monitor at one time since it was started.
+func (mm *BytesMonitor) MaximumBytes() int64 {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	return mm.mu.maxAllocated
+}
+
+// AllocBytes returns the current number of allocated bytes in this monitor.
+func (mm *BytesMonitor) AllocBytes() int64 {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	return mm.mu.curAllocated
+}
+
+// SetMetrics sets the metric objects for the monitor.
+func (mm *BytesMonitor) SetMetrics(curCount *metric.Gauge, maxHist *metric.Histogram) {
+	mm.curBytesCount = curCount
+	mm.maxBytesHist = maxHist
+}
+
 // BoundAccount tracks the cumulated allocations for one client of a pool or
 // monitor. BytesMonitor has an account to its pool; BytesMonitor clients have
 // an account to the monitor. This allows each client to release all the bytes
@@ -419,7 +451,7 @@ func (mm *BytesMonitor) doStop(ctx context.Context, check bool) {
 type BoundAccount struct {
 	used int64
 	// reserved is a small buffer to amortize the cost of growing an account. It
-	// decreases as curAllocated increases (and vice-versa).
+	// decreases as used increases (and vice-versa).
 	reserved int64
 	mon      *BytesMonitor
 }
@@ -435,6 +467,11 @@ func (b BoundAccount) Used() int64 {
 	return b.used
 }
 
+// Monitor returns the BytesMonitor to which this account is bound.
+func (b BoundAccount) Monitor() *BytesMonitor {
+	return b.mon
+}
+
 func (b BoundAccount) allocated() int64 {
 	return b.used + b.reserved
 }
@@ -442,6 +479,18 @@ func (b BoundAccount) allocated() int64 {
 // MakeBoundAccount creates a BoundAccount connected to the given monitor.
 func (mm *BytesMonitor) MakeBoundAccount() BoundAccount {
 	return BoundAccount{mon: mm}
+}
+
+// Empty shrinks the account to use 0 bytes. Previously used memory is returned
+// to the reserved buffer, which is subsequently released such that at most
+// poolAllocationSize is reserved.
+func (b *BoundAccount) Empty(ctx context.Context) {
+	b.reserved += b.used
+	b.used = 0
+	if b.reserved > b.mon.poolAllocationSize {
+		b.mon.releaseBytes(ctx, b.reserved-b.mon.poolAllocationSize)
+		b.reserved = b.mon.poolAllocationSize
+	}
 }
 
 // Clear releases all the cumulated allocations of an account at once and
@@ -475,6 +524,10 @@ func (b *BoundAccount) Close(ctx context.Context) {
 // error. This is better than calling ClearAccount then GrowAccount because if
 // the Clear succeeds and the Grow fails the original item becomes invisible
 // from the perspective of the monitor.
+//
+// If one is interested in specifying the new size of the account as a whole (as
+// opposed to resizing one object among many in the account), ResizeTo() should
+// be used.
 func (b *BoundAccount) Resize(ctx context.Context, oldSz, newSz int64) error {
 	delta := newSz - oldSz
 	switch {
@@ -484,6 +537,15 @@ func (b *BoundAccount) Resize(ctx context.Context, oldSz, newSz int64) error {
 		b.Shrink(ctx, -delta)
 	}
 	return nil
+}
+
+// ResizeTo resizes (grows or shrinks) the account to a specified size.
+func (b *BoundAccount) ResizeTo(ctx context.Context, newSz int64) error {
+	if newSz == b.used {
+		// Performance optimization to avoid an unnecessary dispatch.
+		return nil
+	}
+	return b.Resize(ctx, b.used, newSz)
 }
 
 // Grow is an accessor for b.mon.GrowAccount.
@@ -508,7 +570,7 @@ func (b *BoundAccount) Shrink(ctx context.Context, delta int64) {
 	}
 	b.used -= delta
 	b.reserved += delta
-	if b.reserved >= b.mon.poolAllocationSize {
+	if b.reserved > b.mon.poolAllocationSize {
 		b.mon.releaseBytes(ctx, b.reserved-b.mon.poolAllocationSize)
 		b.reserved = b.mon.poolAllocationSize
 	}
@@ -516,6 +578,7 @@ func (b *BoundAccount) Shrink(ctx context.Context, delta int64) {
 
 // reserveBytes declares an allocation to this monitor. An error is returned if
 // the allocation is denied.
+// x must be a multiple of `poolAllocationSize`.
 func (mm *BytesMonitor) reserveBytes(ctx context.Context, x int64) error {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
@@ -523,7 +586,9 @@ func (mm *BytesMonitor) reserveBytes(ctx context.Context, x int64) error {
 	// so that it handles overflow correctly. Consider what happens if
 	// x==math.MaxInt64. mm.limit-x will be a large negative number.
 	if mm.mu.curAllocated > mm.limit-x {
-		return errors.Wrap(mm.resource.NewBudgetExceededError(x, mm.limit), mm.name)
+		return errors.Wrap(
+			mm.resource.NewBudgetExceededError(x, mm.mu.curAllocated, mm.limit), mm.name,
+		)
 	}
 	// Check whether we need to request an increase of our budget.
 	if mm.mu.curAllocated > mm.mu.curBudget.used+mm.reserved.used-x {
@@ -540,14 +605,16 @@ func (mm *BytesMonitor) reserveBytes(ctx context.Context, x int64) error {
 	}
 
 	// Report "large" queries to the log for further investigation.
-	if mm.mu.curAllocated > mm.noteworthyUsageBytes {
-		// We only report changes in binary magnitude of the size. This is to
-		// limit the amount of log messages when a size blowup is caused by
-		// many small allocations.
-		if bits.Len64(uint64(mm.mu.curAllocated)) != bits.Len64(uint64(mm.mu.curAllocated-x)) {
-			log.Infof(ctx, "%s: bytes usage increases to %s (+%d)",
-				mm.name,
-				humanizeutil.IBytes(mm.mu.curAllocated), x)
+	if log.V(1) {
+		if mm.mu.curAllocated > mm.noteworthyUsageBytes {
+			// We only report changes in binary magnitude of the size. This is to
+			// limit the amount of log messages when a size blowup is caused by
+			// many small allocations.
+			if bits.Len64(uint64(mm.mu.curAllocated)) != bits.Len64(uint64(mm.mu.curAllocated-x)) {
+				log.Infof(ctx, "%s: bytes usage increases to %s (+%d)",
+					mm.name,
+					humanizeutil.IBytes(mm.mu.curAllocated), x)
+			}
 		}
 	}
 
@@ -566,8 +633,10 @@ func (mm *BytesMonitor) releaseBytes(ctx context.Context, sz int64) {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 	if mm.mu.curAllocated < sz {
-		panic(fmt.Sprintf("%s: no bytes to release, current %d, free %d",
-			mm.name, mm.mu.curAllocated, sz))
+		log.ReportOrPanic(ctx, &mm.settings.SV,
+			"%s: no bytes to release, current %d, free %d",
+			mm.name, mm.mu.curAllocated, sz)
+		sz = mm.mu.curAllocated
 	}
 	mm.mu.curAllocated -= sz
 	if mm.curBytesCount != nil {
@@ -579,17 +648,19 @@ func (mm *BytesMonitor) releaseBytes(ctx context.Context, sz int64) {
 		// We avoid VEventf here because we want to avoid computing the
 		// trace string if there is nothing to log.
 		log.Infof(ctx, "%s: now at %d bytes (-%d) - %s",
-			mm.name, mm.mu.curAllocated, sz, util.GetSmallTrace(3))
+			mm.name, mm.mu.curAllocated, sz, util.GetSmallTrace(5))
 	}
 }
 
 // increaseBudget requests more bytes from the pool.
+// minExtra must be a multiple of `poolAllocationSize`.
 func (mm *BytesMonitor) increaseBudget(ctx context.Context, minExtra int64) error {
 	// NB: mm.mu Already locked by reserveBytes().
 	if mm.mu.curBudget.mon == nil {
-		return errors.Wrap(mm.resource.NewBudgetExceededError(minExtra, mm.reserved.used), mm.name)
+		return errors.Wrap(mm.resource.NewBudgetExceededError(
+			minExtra, mm.mu.curAllocated, mm.reserved.used), mm.name,
+		)
 	}
-	minExtra = mm.roundSize(minExtra)
 	if log.V(2) {
 		log.Infof(ctx, "%s: requesting %d bytes from the pool", mm.name, minExtra)
 	}

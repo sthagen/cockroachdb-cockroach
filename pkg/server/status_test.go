@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -18,41 +14,68 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
+	"math"
+	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
-
-	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
+	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/server/status"
-	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/ts"
+	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/gogo/protobuf/proto"
+	"github.com/kr/pretty"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func getStatusJSONProto(
 	ts serverutils.TestServerInterface, path string, response protoutil.Message,
 ) error {
 	return serverutils.GetJSONProto(ts, statusPrefix+path, response)
+}
+
+func postStatusJSONProto(
+	ts serverutils.TestServerInterface, path string, request, response protoutil.Message,
+) error {
+	return serverutils.PostJSONProto(ts, statusPrefix+path, request, response)
+}
+
+func getStatusJSONProtoWithAdminOption(
+	ts serverutils.TestServerInterface, path string, response protoutil.Message, isAdmin bool,
+) error {
+	return serverutils.GetJSONProtoWithAdminOption(ts, statusPrefix+path, response, isAdmin)
 }
 
 // TestStatusLocalStacks verifies that goroutine stack traces are available
@@ -89,6 +112,10 @@ func TestStatusJson(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sqlAddr, err := ts.Gossip().GetNodeIDSQLAddress(nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var nodes serverpb.NodesResponse
 	testutils.SucceedsSoon(t, func() error {
@@ -103,7 +130,6 @@ func TestStatusJson(t *testing.T) {
 	})
 
 	for _, path := range []string{
-		"/health",
 		statusPrefix + "details/local",
 		statusPrefix + "details/" + strconv.FormatUint(uint64(nodeID), 10),
 	} {
@@ -117,9 +143,86 @@ func TestStatusJson(t *testing.T) {
 		if a, e := details.Address, *addr; a != e {
 			t.Errorf("expected: %v, got: %v", e, a)
 		}
+		if a, e := details.SQLAddress, *sqlAddr; a != e {
+			t.Errorf("expected: %v, got: %v", e, a)
+		}
 		if a, e := details.BuildInfo, build.GetInfo(); a != e {
 			t.Errorf("expected: %v, got: %v", e, a)
 		}
+	}
+}
+
+// TestHealthTelemetry confirms that hits on some status endpoints increment
+// feature telemetry counters.
+func TestHealthTelemetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	rows, err := db.Query("SELECT * FROM crdb_internal.feature_usage WHERE feature_name LIKE 'monitoring%' AND usage_count > 0;")
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	initialCounts := make(map[string]int)
+	for rows.Next() {
+		var featureName string
+		var usageCount int
+
+		if err := rows.Scan(&featureName, &usageCount); err != nil {
+			t.Fatal(err)
+		}
+
+		initialCounts[featureName] = usageCount
+	}
+
+	var details serverpb.DetailsResponse
+	if err := serverutils.GetJSONProto(s, "/health", &details); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := getText(s, s.AdminURL()+statusPrefix+"vars"); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedCounts := map[string]int{
+		"monitoring.prometheus.vars": 1,
+		"monitoring.health.details":  1,
+	}
+
+	rows2, err := db.Query("SELECT feature_name, usage_count FROM crdb_internal.feature_usage WHERE feature_name LIKE 'monitoring%' AND usage_count > 0;")
+	defer func() {
+		if err := rows2.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for rows2.Next() {
+		var featureName string
+		var usageCount int
+
+		if err := rows2.Scan(&featureName, &usageCount); err != nil {
+			t.Fatal(err)
+		}
+
+		usageCount -= initialCounts[featureName]
+		if count, ok := expectedCounts[featureName]; ok {
+			if count != usageCount {
+				t.Fatalf("expected %d count for feature %s, got %d", count, featureName, usageCount)
+			}
+			delete(expectedCounts, featureName)
+		}
+	}
+
+	if len(expectedCounts) > 0 {
+		t.Fatalf("%d expected telemetry counters not emitted", len(expectedCounts))
 	}
 }
 
@@ -145,6 +248,66 @@ func TestStatusGossipJson(t *testing.T) {
 	}
 	if _, ok := data.Infos["system-db"]; !ok {
 		t.Errorf("no system config info returned: %v", data)
+	}
+}
+
+// TestStatusEngineStatsJson ensures that the output response for the engine
+// stats contains the required fields.
+func TestStatusEngineStatsJson(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	dir, cleanupFn := testutils.TempDir(t)
+	defer cleanupFn()
+
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+		StoreSpecs: []base.StoreSpec{{
+			Path: dir,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stopper().Stop(context.TODO())
+
+	var engineStats serverpb.EngineStatsResponse
+	if err := getStatusJSONProto(s, "enginestats/local", &engineStats); err != nil {
+		t.Fatal(err)
+	}
+	if len(engineStats.Stats) != 1 {
+		t.Fatal(errors.Errorf("expected one engine stats, got: %v", engineStats))
+	}
+
+	if engineStats.Stats[0].EngineType == enginepb.EngineTypePebble {
+		// Pebble does not have RocksDB style TickersAnd Histogram.
+		return
+	}
+
+	tickers := engineStats.Stats[0].TickersAndHistograms.Tickers
+	if len(tickers) == 0 {
+		t.Fatal(errors.Errorf("expected non-empty tickers list, got: %v", tickers))
+	}
+	allTickersZero := true
+	for _, ticker := range tickers {
+		if ticker != 0 {
+			allTickersZero = false
+		}
+	}
+	if allTickersZero {
+		t.Fatal(errors.Errorf("expected some tickers nonzero, got: %v", tickers))
+	}
+
+	histograms := engineStats.Stats[0].TickersAndHistograms.Histograms
+	if len(histograms) == 0 {
+		t.Fatal(errors.Errorf("expected non-empty histograms list, got: %v", histograms))
+	}
+	allHistogramsZero := true
+	for _, histogram := range histograms {
+		if histogram.Max == 0 {
+			allHistogramsZero = false
+		}
+	}
+	if allHistogramsZero {
+		t.Fatal(errors.Errorf("expected some histograms nonzero, got: %v", histograms))
 	}
 }
 
@@ -180,6 +343,136 @@ func startServer(t *testing.T) *TestServer {
 	}
 
 	return ts
+}
+
+func newRPCTestContext(ts *TestServer, cfg *base.Config) *rpc.Context {
+	rpcContext := rpc.NewContext(
+		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, cfg, ts.Clock(), ts.Stopper(),
+		ts.ClusterSettings())
+	// Ensure that the RPC client context validates the server cluster ID.
+	// This ensures that a test where the server is restarted will not let
+	// its test RPC client talk to a server started by an unrelated concurrent test.
+	rpcContext.ClusterID.Set(context.TODO(), ts.ClusterID())
+	return rpcContext
+}
+
+// TestStatusGetFiles tests the GetFiles endpoint.
+func TestStatusGetFiles(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	tempDir, cleanupFn := testutils.TempDir(t)
+	defer cleanupFn()
+
+	storeSpec := base.StoreSpec{Path: tempDir}
+
+	tsI, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		StoreSpecs: []base.StoreSpec{
+			storeSpec,
+		},
+	})
+	ts := tsI.(*TestServer)
+	defer ts.Stopper().Stop(context.TODO())
+
+	rootConfig := testutils.NewTestBaseContext(security.RootUser)
+	rpcContext := newRPCTestContext(ts, rootConfig)
+
+	url := ts.ServingRPCAddr()
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := serverpb.NewStatusClient(conn)
+
+	// Test fetching heap files.
+	t.Run("heap", func(t *testing.T) {
+		const testFilesNo = 3
+		for i := 0; i < testFilesNo; i++ {
+			testHeapDir := filepath.Join(storeSpec.Path, "logs", base.HeapProfileDir)
+			testHeapFile := filepath.Join(testHeapDir, fmt.Sprintf("heap%d.pprof", i))
+			if err := os.MkdirAll(testHeapDir, os.ModePerm); err != nil {
+				t.Fatal(err)
+			}
+			if err := ioutil.WriteFile(testHeapFile, []byte(fmt.Sprintf("I'm heap file %d", i)), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		request := serverpb.GetFilesRequest{
+			NodeId: "local", Type: serverpb.FileType_HEAP, Patterns: []string{"*"}}
+		response, err := client.GetFiles(context.Background(), &request)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if a, e := len(response.Files), testFilesNo; a != e {
+			t.Errorf("expected %d files(s), found %d", e, a)
+		}
+
+		for i, file := range response.Files {
+			expectedFileName := fmt.Sprintf("heap%d.pprof", i)
+			if file.Name != expectedFileName {
+				t.Fatalf("expected file name %s, found %s", expectedFileName, file.Name)
+			}
+			expectedFileContents := []byte(fmt.Sprintf("I'm heap file %d", i))
+			if !bytes.Equal(file.Contents, expectedFileContents) {
+				t.Fatalf("expected file contents %s, found %s", expectedFileContents, file.Contents)
+			}
+		}
+	})
+
+	// Test fetching goroutine files.
+	t.Run("goroutines", func(t *testing.T) {
+		const testFilesNo = 3
+		for i := 0; i < testFilesNo; i++ {
+			testFile := filepath.Join(storeSpec.Path, "logs", goroutinesDir, fmt.Sprintf("goroutine_dump%d.txt.gz", i))
+			if err := ioutil.WriteFile(testFile, []byte(fmt.Sprintf("Goroutine dump %d", i)), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		request := serverpb.GetFilesRequest{
+			NodeId: "local", Type: serverpb.FileType_GOROUTINES, Patterns: []string{"*"}}
+		response, err := client.GetFiles(context.Background(), &request)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if a, e := len(response.Files), testFilesNo; a != e {
+			t.Errorf("expected %d files(s), found %d", e, a)
+		}
+
+		for i, file := range response.Files {
+			expectedFileName := fmt.Sprintf("goroutine_dump%d.txt.gz", i)
+			if file.Name != expectedFileName {
+				t.Fatalf("expected file name %s, found %s", expectedFileName, file.Name)
+			}
+			expectedFileContents := []byte(fmt.Sprintf("Goroutine dump %d", i))
+			if !bytes.Equal(file.Contents, expectedFileContents) {
+				t.Fatalf("expected file contents %s, found %s", expectedFileContents, file.Contents)
+			}
+		}
+	})
+
+	// Testing path separators in pattern.
+	t.Run("path separators", func(t *testing.T) {
+		request := serverpb.GetFilesRequest{NodeId: "local", ListOnly: true,
+			Type: serverpb.FileType_HEAP, Patterns: []string{"pattern/with/separators"}}
+		_, err = client.GetFiles(context.Background(), &request)
+		if !testutils.IsError(err, "invalid pattern: cannot have path seperators") {
+			t.Errorf("GetFiles: path separators allowed in pattern")
+		}
+	})
+
+	// Testing invalid filetypes.
+	t.Run("filetypes", func(t *testing.T) {
+		request := serverpb.GetFilesRequest{NodeId: "local", ListOnly: true,
+			Type: -1, Patterns: []string{"*"}}
+		_, err = client.GetFiles(context.Background(), &request)
+		if !testutils.IsError(err, "unknown file type: -1") {
+			t.Errorf("GetFiles: invalid file type allowed")
+		}
+	})
 }
 
 // TestStatusLocalLogs checks to ensure that local/logfiles,
@@ -357,7 +650,7 @@ func TestNodeStatusResponse(t *testing.T) {
 	// Now fetch each one individually. Loop through the nodeStatuses to use the
 	// ids only.
 	for _, oldNodeStatus := range nodeStatuses {
-		nodeStatus := status.NodeStatus{}
+		nodeStatus := statuspb.NodeStatus{}
 		if err := getStatusJSONProto(s, "nodes/"+oldNodeStatus.Desc.NodeID.String(), &nodeStatus); err != nil {
 			t.Fatal(err)
 		}
@@ -410,9 +703,198 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+// TestMetricsMetadata ensures that the server's recorder return metrics and
+// that each metric has a Name, Help, Unit, and DisplayUnit defined.
+func TestMetricsMetadata(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := startServer(t)
+	defer s.Stopper().Stop(context.TODO())
+
+	metricsMetadata := s.recorder.GetMetricsMetadata()
+
+	if len(metricsMetadata) < 200 {
+		t.Fatal("s.recorder.GetMetricsMetadata() failed sanity check; didn't return enough metrics.")
+	}
+
+	for _, v := range metricsMetadata {
+		if v.Name == "" {
+			t.Fatal("metric missing name.")
+		}
+		if v.Help == "" {
+			t.Fatalf("%s missing Help.", v.Name)
+		}
+		if v.Measurement == "" {
+			t.Fatalf("%s missing Measurement.", v.Name)
+		}
+		if v.Unit == 0 {
+			t.Fatalf("%s missing Unit.", v.Name)
+		}
+	}
+}
+
+// TestChartCatalog ensures that the server successfully generates the chart catalog.
+func TestChartCatalogGen(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := startServer(t)
+	defer s.Stopper().Stop(context.TODO())
+
+	metricsMetadata := s.recorder.GetMetricsMetadata()
+
+	chartCatalog, err := catalog.GenerateCatalog(metricsMetadata)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure each of the 7 constant sections of the chart catalog exist.
+	if len(chartCatalog) != 7 {
+		t.Fatal("Chart catalog failed to generate.")
+	}
+
+	for _, section := range chartCatalog {
+		// Ensure that one of the chartSections has defined Subsections.
+		if len(section.Subsections) == 0 {
+			t.Fatalf(`Chart catalog has missing subsections in %v`, section)
+		}
+	}
+}
+
+// findUndefinedMetrics finds metrics listed in pkg/ts/catalog/chart_catalog.go
+// that are not defined. This is most likely caused by a metric being removed.
+func findUndefinedMetrics(c *catalog.ChartSection, metadata map[string]metric.Metadata) []string {
+	var undefinedMetrics []string
+	for _, ic := range c.Charts {
+		for _, metric := range ic.Metrics {
+			_, ok := metadata[metric.Name]
+			if !ok {
+				undefinedMetrics = append(undefinedMetrics, metric.Name)
+			}
+		}
+	}
+
+	for _, x := range c.Subsections {
+		undefinedMetrics = append(undefinedMetrics, findUndefinedMetrics(x, metadata)...)
+	}
+
+	return undefinedMetrics
+}
+
+// deleteSeenMetrics removes all metrics in a section from the metricMetadata map.
+func deleteSeenMetrics(c *catalog.ChartSection, metadata map[string]metric.Metadata, t *testing.T) {
+	// if c.Title == "SQL" {
+	// 	t.Log(c)
+	// }
+	for _, x := range c.Charts {
+		if x.Title == "Connections" || x.Title == "Byte I/O" {
+			t.Log(x)
+		}
+
+		for _, metric := range x.Metrics {
+			if metric.Name == "sql.new_conns" || metric.Name == "sql.bytesin" {
+				t.Logf("found %v\n", metric.Name)
+			}
+			_, ok := metadata[metric.Name]
+			if ok {
+				delete(metadata, metric.Name)
+			}
+		}
+	}
+
+	for _, x := range c.Subsections {
+		deleteSeenMetrics(x, metadata, t)
+	}
+}
+
+// TestChartCatalogMetric ensures that all metrics are included in at least one
+// chart, and that every metric included in a chart is still part of the metrics
+// registry.
+func TestChartCatalogMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := startServer(t)
+	defer s.Stopper().Stop(context.TODO())
+
+	metricsMetadata := s.recorder.GetMetricsMetadata()
+
+	chartCatalog, err := catalog.GenerateCatalog(metricsMetadata)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Each metric referenced in the chartCatalog must have a definition in metricsMetadata
+	var undefinedMetrics []string
+	for _, cs := range chartCatalog {
+		undefinedMetrics = append(undefinedMetrics, findUndefinedMetrics(&cs, metricsMetadata)...)
+	}
+
+	if len(undefinedMetrics) > 0 {
+		t.Fatalf(`The following metrics need are no longer present and need to be removed
+			from the chart catalog (pkg/ts/chart_catalog.go):%v`, undefinedMetrics)
+	}
+
+	// Each metric in metricsMetadata should have at least one entry in
+	// chartCatalog, which we track by deleting the metric from metricsMetadata.
+	for _, v := range chartCatalog {
+		deleteSeenMetrics(&v, metricsMetadata, t)
+	}
+
+	if len(metricsMetadata) > 0 {
+		var metricNames []string
+		for metricName := range metricsMetadata {
+			metricNames = append(metricNames, metricName)
+		}
+		sort.Strings(metricNames)
+		t.Fatalf(`The following metrics need to be added to the chart catalog (pkg/ts/chart_catalog.go):
+		%v`, metricNames)
+	}
+}
+
+func TestHotRangesResponse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ts := startServer(t)
+	defer ts.Stopper().Stop(context.TODO())
+
+	var hotRangesResp serverpb.HotRangesResponse
+	if err := getStatusJSONProto(ts, "hotranges", &hotRangesResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(hotRangesResp.HotRangesByNodeID) == 0 {
+		t.Fatalf("didn't get hot range responses from any nodes")
+	}
+
+	for nodeID, nodeResp := range hotRangesResp.HotRangesByNodeID {
+		if len(nodeResp.Stores) == 0 {
+			t.Errorf("didn't get any stores in hot range response from n%d: %v",
+				nodeID, nodeResp.ErrorMessage)
+		}
+		for _, storeResp := range nodeResp.Stores {
+			// Only the first store will actually have any ranges on it.
+			if storeResp.StoreID != roachpb.StoreID(1) {
+				continue
+			}
+			lastQPS := math.MaxFloat64
+			if len(storeResp.HotRanges) == 0 {
+				t.Errorf("didn't get any hot ranges in response from n%d,s%d: %v",
+					nodeID, storeResp.StoreID, nodeResp.ErrorMessage)
+			}
+			for _, r := range storeResp.HotRanges {
+				if r.Desc.RangeID == 0 || (len(r.Desc.StartKey) == 0 && len(r.Desc.EndKey) == 0) {
+					t.Errorf("unexpected empty/unpopulated range descriptor: %+v", r.Desc)
+				}
+				if r.QueriesPerSecond > lastQPS {
+					t.Errorf("unexpected increase in qps between ranges; prev=%.2f, current=%.2f, desc=%v",
+						lastQPS, r.QueriesPerSecond, r.Desc)
+				}
+				lastQPS = r.QueriesPerSecond
+			}
+		}
+
+	}
+}
+
 func TestRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer storage.EnableLeaseHistory(100)()
+	defer kvserver.EnableLeaseHistory(100)()
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.TODO())
 
@@ -439,8 +921,8 @@ func TestRangesResponse(t *testing.T) {
 			StoreID:   1,
 			ReplicaID: 1,
 		}
-		if len(ri.State.Desc.Replicas) != 1 || ri.State.Desc.Replicas[0] != expReplica {
-			t.Errorf("unexpected replica list %+v", ri.State.Desc.Replicas)
+		if len(ri.State.Desc.InternalReplicas) != 1 || ri.State.Desc.InternalReplicas[0] != expReplica {
+			t.Errorf("unexpected replica list %+v", ri.State.Desc.InternalReplicas)
 		}
 		if ri.State.Lease == nil || *ri.State.Lease == (roachpb.Lease{}) {
 			t.Error("expected a nontrivial Lease")
@@ -522,7 +1004,7 @@ func TestSpanStatsResponse(t *testing.T) {
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.TODO())
 
-	httpClient, err := ts.GetAuthenticatedHTTPClient()
+	httpClient, err := ts.GetAdminAuthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,28 +1031,28 @@ func TestSpanStatsResponse(t *testing.T) {
 
 func TestSpanStatsGRPCResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	ts := startServer(t)
-	defer ts.Stopper().Stop(context.TODO())
+	defer ts.Stopper().Stop(ctx)
 
 	rpcStopper := stop.NewStopper()
-	defer rpcStopper.Stop(context.TODO())
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, ts.RPCContext().Config, ts.Clock(),
-		rpcStopper, &ts.ClusterSettings().Version)
+	defer rpcStopper.Stop(ctx)
+	rpcContext := newRPCTestContext(ts, ts.RPCContext().Config)
 	request := serverpb.SpanStatsRequest{
 		NodeID:   "1",
 		StartKey: []byte(roachpb.RKeyMin),
 		EndKey:   []byte(roachpb.RKeyMax),
 	}
 
-	url := ts.ServingAddr()
-	conn, err := rpcContext.GRPCDial(url).Connect(context.Background())
+	url := ts.ServingRPCAddr()
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	client := serverpb.NewStatusClient(conn)
 
-	response, err := client.SpanStats(context.Background(), &request)
+	response, err := client.SpanStats(ctx, &request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -579,7 +1061,7 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 	if a, e := int(response.RangeCount), initialRanges; a != e {
-		t.Errorf("expected %d ranges, found %d", e, a)
+		t.Fatalf("expected %d ranges, found %d", e, a)
 	}
 }
 
@@ -589,13 +1071,12 @@ func TestNodesGRPCResponse(t *testing.T) {
 	defer ts.Stopper().Stop(context.TODO())
 
 	rootConfig := testutils.NewTestBaseContext(security.RootUser)
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, rootConfig, ts.Clock(), ts.Stopper(),
-		&ts.ClusterSettings().Version)
+	rpcContext := newRPCTestContext(ts, rootConfig)
 	var request serverpb.NodesRequest
 
-	url := ts.ServingAddr()
-	conn, err := rpcContext.GRPCDial(url).Connect(context.Background())
+	url := ts.ServingRPCAddr()
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,8 +1102,8 @@ func TestCertificatesResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// We expect two certificates: CA and node.
-	if a, e := len(response.Certificates), 2; a != e {
+	// We expect 4 certificates: CA, node, and client certs for root, testuser.
+	if a, e := len(response.Certificates), 4; a != e {
 		t.Errorf("expected %d certificates, found %d", e, a)
 	}
 
@@ -660,9 +1141,27 @@ func TestCertificatesResponse(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsResponse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	var resp diagnosticspb.DiagnosticReport
+	if err := getStatusJSONProto(s, "diagnostics/local", &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	// The endpoint just serializes result of getReportingInfo() which is already
+	// tested elsewhere, so simply verify that we have a non-empty reply.
+	if expected, actual := s.NodeID(), resp.Node.NodeID; expected != actual {
+		t.Fatalf("expected %v got %v", expected, actual)
+	}
+}
+
 func TestRangeResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer storage.EnableLeaseHistory(100)()
+	defer kvserver.EnableLeaseHistory(100)()
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.TODO())
 
@@ -701,8 +1200,8 @@ func TestRangeResponse(t *testing.T) {
 	}
 
 	// Check some other values.
-	if len(info.State.Desc.Replicas) != 1 || info.State.Desc.Replicas[0] != expReplica {
-		t.Errorf("unexpected replica list %+v", info.State.Desc.Replicas)
+	if len(info.State.Desc.InternalReplicas) != 1 || info.State.Desc.InternalReplicas[0] != expReplica {
+		t.Errorf("unexpected replica list %+v", info.State.Desc.InternalReplicas)
 	}
 
 	if info.State.Lease == nil || *info.State.Lease == (roachpb.Lease{}) {
@@ -716,4 +1215,430 @@ func TestRangeResponse(t *testing.T) {
 	if len(info.LeaseHistory) == 0 {
 		t.Error("expected at least one lease history entry")
 	}
+}
+
+func TestRemoteDebugModeSetting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		StoreSpecs: []base.StoreSpec{
+			base.DefaultTestStoreSpec,
+			base.DefaultTestStoreSpec,
+			base.DefaultTestStoreSpec,
+		},
+	})
+	ts := s.(*TestServer)
+	defer ts.Stopper().Stop(context.TODO())
+
+	if _, err := db.Exec(`SET CLUSTER SETTING server.remote_debugging.mode = 'off'`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a split so that there's some records in the system.rangelog table.
+	// The test needs them.
+	if _, err := db.Exec(
+		`create table t(x int primary key);
+		alter table t split at values(1);`,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify that the remote debugging mode is respected for HTTP requests.
+	// This needs to be wrapped in SucceedsSoon because settings changes have to
+	// propagate through gossip and thus don't always take effect immediately.
+	testutils.SucceedsSoon(t, func() error {
+		for _, tc := range []struct {
+			path     string
+			response protoutil.Message
+		}{
+			{"gossip/local", &gossip.InfoStatus{}},
+			{"allocator/node/local", &serverpb.AllocatorResponse{}},
+			{"allocator/range/1", &serverpb.AllocatorResponse{}},
+			{"logs/local", &serverpb.LogEntriesResponse{}},
+			{"logfiles/local/cockroach.log", &serverpb.LogEntriesResponse{}},
+			{"local_sessions", &serverpb.ListSessionsResponse{}},
+			{"sessions", &serverpb.ListSessionsResponse{}},
+		} {
+			err := getStatusJSONProto(ts, tc.path, tc.response)
+			if !testutils.IsError(err, "403 Forbidden") {
+				return fmt.Errorf("expected '403 Forbidden' error, but %q returned %+v: %v",
+					tc.path, tc.response, err)
+			}
+		}
+		return nil
+	})
+
+	// But not for grpc requests. The fact that the above gets an error but these
+	// don't indicate that the grpc gateway is correctly adding the necessary
+	// metadata for differentiating between the two (and that we're correctly
+	// interpreting said metadata).
+	rootConfig := testutils.NewTestBaseContext(security.RootUser)
+	rpcContext := newRPCTestContext(ts, rootConfig)
+	url := ts.ServingRPCAddr()
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := serverpb.NewStatusClient(conn)
+	if _, err := client.Gossip(ctx, &serverpb.GossipRequest{}); err != nil {
+		t.Error(err)
+	}
+	if _, err := client.Allocator(ctx, &serverpb.AllocatorRequest{}); err != nil {
+		t.Error(err)
+	}
+	if _, err := client.Allocator(ctx, &serverpb.AllocatorRequest{}); err != nil {
+		t.Error(err)
+	}
+	if _, err := client.AllocatorRange(ctx, &serverpb.AllocatorRangeRequest{}); err != nil {
+		t.Error(err)
+	}
+	if _, err := client.Logs(ctx, &serverpb.LogsRequest{}); err != nil {
+		t.Error(err)
+	}
+	if _, err := client.ListLocalSessions(ctx, &serverpb.ListSessionsRequest{}); err != nil {
+		t.Error(err)
+	}
+	if _, err := client.ListSessions(ctx, &serverpb.ListSessionsRequest{}); err != nil {
+		t.Error(err)
+	}
+
+	// Check that keys are properly omitted from the Ranges, HotRanges, and
+	// RangeLog endpoints.
+	var rangesResp serverpb.RangesResponse
+	if err := getStatusJSONProto(ts, "ranges/local", &rangesResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(rangesResp.Ranges) == 0 {
+		t.Errorf("didn't get any ranges")
+	}
+	for _, ri := range rangesResp.Ranges {
+		if ri.Span.StartKey != omittedKeyStr || ri.Span.EndKey != omittedKeyStr ||
+			ri.State.ReplicaState.Desc.StartKey != nil || ri.State.ReplicaState.Desc.EndKey != nil {
+			t.Errorf("unexpected key value found in RangeInfo: %+v", ri)
+		}
+	}
+
+	var hotRangesResp serverpb.HotRangesResponse
+	if err := getStatusJSONProto(ts, "hotranges", &hotRangesResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(hotRangesResp.HotRangesByNodeID) == 0 {
+		t.Errorf("didn't get hot range responses from any nodes")
+	}
+	for nodeID, nodeResp := range hotRangesResp.HotRangesByNodeID {
+		if len(nodeResp.Stores) == 0 {
+			t.Errorf("didn't get any stores in hot range response from n%d: %v",
+				nodeID, nodeResp.ErrorMessage)
+		}
+		for _, storeResp := range nodeResp.Stores {
+			// Only the first store will actually have any ranges on it.
+			if storeResp.StoreID != roachpb.StoreID(1) {
+				continue
+			}
+			if len(storeResp.HotRanges) == 0 {
+				t.Errorf("didn't get any hot ranges in response from n%d,s%d: %v",
+					nodeID, storeResp.StoreID, nodeResp.ErrorMessage)
+			}
+			for _, r := range storeResp.HotRanges {
+				if r.Desc.StartKey != nil || r.Desc.EndKey != nil {
+					t.Errorf("unexpected key value found in hot ranges range descriptor: %+v", r.Desc)
+				}
+			}
+		}
+	}
+
+	var rangelogResp serverpb.RangeLogResponse
+	if err := getAdminJSONProto(ts, "rangelog", &rangelogResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(rangelogResp.Events) == 0 {
+		t.Errorf("didn't get any Events")
+	}
+	for _, event := range rangelogResp.Events {
+		if event.Event.Info.NewDesc != nil {
+			if event.Event.Info.NewDesc.StartKey != nil || event.Event.Info.NewDesc.EndKey != nil ||
+				event.Event.Info.UpdatedDesc.StartKey != nil || event.Event.Info.UpdatedDesc.EndKey != nil {
+				t.Errorf("unexpected key value found in rangelog event: %+v", event)
+			}
+		}
+		if strings.Contains(event.PrettyInfo.NewDesc, "Min-System") ||
+			strings.Contains(event.PrettyInfo.UpdatedDesc, "Min-System") {
+			t.Errorf("unexpected key value found in rangelog event info: %+v", event.PrettyInfo)
+		}
+	}
+}
+
+func TestStatusAPIStatements(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCluster := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
+	defer testCluster.Stopper().Stop(context.Background())
+
+	firstServerProto := testCluster.Server(0)
+	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
+
+	statements := []struct {
+		stmt          string
+		fingerprinted string
+	}{
+		{stmt: `CREATE DATABASE roachblog`},
+		{stmt: `SET database = roachblog`},
+		{stmt: `CREATE TABLE posts (id INT8 PRIMARY KEY, body STRING)`},
+		{
+			stmt:          `INSERT INTO posts VALUES (1, 'foo')`,
+			fingerprinted: `INSERT INTO posts VALUES (_, _)`,
+		},
+		{stmt: `SELECT * FROM posts`},
+	}
+
+	for _, stmt := range statements {
+		thirdServerSQL.Exec(t, stmt.stmt)
+	}
+
+	// Hit query endpoint.
+	var resp serverpb.StatementsResponse
+	if err := getStatusJSONProto(firstServerProto, "statements", &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	// See if the statements returned are what we executed.
+	var expectedStatements []string
+	for _, stmt := range statements {
+		var expectedStmt = stmt.stmt
+		if stmt.fingerprinted != "" {
+			expectedStmt = stmt.fingerprinted
+		}
+		expectedStatements = append(expectedStatements, expectedStmt)
+	}
+
+	var statementsInResponse []string
+	for _, respStatement := range resp.Statements {
+		if respStatement.Key.KeyData.Failed {
+			// We ignore failed statements here as the INSERT statement can fail and
+			// be automatically retried, confusing the test success check.
+			continue
+		}
+		if strings.HasPrefix(respStatement.Key.KeyData.App, sqlbase.InternalAppNamePrefix) {
+			// We ignore internal queries, these are not relevant for the
+			// validity of this test.
+			continue
+		}
+		statementsInResponse = append(statementsInResponse, respStatement.Key.KeyData.Query)
+	}
+
+	sort.Strings(expectedStatements)
+	sort.Strings(statementsInResponse)
+
+	if !reflect.DeepEqual(expectedStatements, statementsInResponse) {
+		t.Fatalf("expected queries\n\n%v\n\ngot queries\n\n%v\n%s",
+			expectedStatements, statementsInResponse, pretty.Sprint(resp))
+	}
+}
+
+func TestListSessionsSecurity(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	ts := s.(*TestServer)
+	defer ts.Stopper().Stop(context.TODO())
+
+	ctx := context.TODO()
+
+	for _, requestWithAdmin := range []bool{true, false} {
+		t.Run(fmt.Sprintf("admin=%v", requestWithAdmin), func(t *testing.T) {
+			myUser := authenticatedUserNameNoAdmin
+			expectedErrOnListingRootSessions := "does not have permission to view sessions from user"
+			if requestWithAdmin {
+				myUser = authenticatedUserName
+				expectedErrOnListingRootSessions = ""
+			}
+
+			// HTTP requests respect the authenticated username from the HTTP session.
+			testCases := []struct {
+				endpoint    string
+				expectedErr string
+			}{
+				{"local_sessions", ""},
+				{"sessions", ""},
+				{fmt.Sprintf("local_sessions?username=%s", myUser), ""},
+				{fmt.Sprintf("sessions?username=%s", myUser), ""},
+				{"local_sessions?username=root", expectedErrOnListingRootSessions},
+				{"sessions?username=root", expectedErrOnListingRootSessions},
+			}
+			for _, tc := range testCases {
+				var response serverpb.ListSessionsResponse
+				err := getStatusJSONProtoWithAdminOption(ts, tc.endpoint, &response, requestWithAdmin)
+				if tc.expectedErr == "" {
+					if err != nil || len(response.Errors) > 0 {
+						t.Errorf("unexpected failure listing sessions from %s; error: %v; response errors: %v",
+							tc.endpoint, err, response.Errors)
+					}
+				} else {
+					respErr := "<no error>"
+					if len(response.Errors) > 0 {
+						respErr = response.Errors[0].Message
+					}
+					if !testutils.IsError(err, tc.expectedErr) &&
+						!strings.Contains(respErr, tc.expectedErr) {
+						t.Errorf("did not get expected error %q when listing sessions from %s: %v",
+							tc.expectedErr, tc.endpoint, err)
+					}
+				}
+			}
+		})
+	}
+
+	// gRPC requests behave as root and thus are always allowed.
+	rootConfig := testutils.NewTestBaseContext(security.RootUser)
+	rpcContext := newRPCTestContext(ts, rootConfig)
+	url := ts.ServingRPCAddr()
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := serverpb.NewStatusClient(conn)
+
+	for _, user := range []string{"", authenticatedUserName, "root"} {
+		request := &serverpb.ListSessionsRequest{Username: user}
+		if resp, err := client.ListLocalSessions(ctx, request); err != nil || len(resp.Errors) > 0 {
+			t.Errorf("unexpected failure listing local sessions for %q; error: %v; response errors: %v",
+				user, err, resp.Errors)
+		}
+		if resp, err := client.ListSessions(ctx, request); err != nil || len(resp.Errors) > 0 {
+			t.Errorf("unexpected failure listing sessions for %q; error: %v; response errors: %v",
+				user, err, resp.Errors)
+		}
+	}
+}
+
+func TestCreateStatementDiagnosticsReport(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	req := &serverpb.CreateStatementDiagnosticsReportRequest{
+		StatementFingerprint: "INSERT INTO test VALUES (_)",
+	}
+	var resp serverpb.CreateStatementDiagnosticsReportResponse
+	if err := postStatusJSONProto(s, "stmtdiagreports", req, &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	var respGet serverpb.StatementDiagnosticsReportsResponse
+	if err := getStatusJSONProto(s, "stmtdiagreports", &respGet); err != nil {
+		t.Fatal(err)
+	}
+
+	if respGet.Reports[0].StatementFingerprint != req.StatementFingerprint {
+		t.Fatal("statement diagnostics request was not persisted")
+	}
+}
+
+func TestStatementDiagnosticsCompleted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	_, err := db.Exec("CREATE TABLE test (x int PRIMARY KEY)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := &serverpb.CreateStatementDiagnosticsReportRequest{
+		StatementFingerprint: "INSERT INTO test VALUES (_)",
+	}
+	var resp serverpb.CreateStatementDiagnosticsReportResponse
+	if err := postStatusJSONProto(s, "stmtdiagreports", req, &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec("INSERT INTO test VALUES (1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var respGet serverpb.StatementDiagnosticsReportsResponse
+	if err := getStatusJSONProto(s, "stmtdiagreports", &respGet); err != nil {
+		t.Fatal(err)
+	}
+
+	if respGet.Reports[0].Completed != true {
+		t.Fatal("statement diagnostics was not captured")
+	}
+
+	var diagRespGet serverpb.StatementDiagnosticsResponse
+	diagPath := fmt.Sprintf("stmtdiag/%d", respGet.Reports[0].StatementDiagnosticsId)
+	if err := getStatusJSONProto(s, diagPath, &diagRespGet); err != nil {
+		t.Fatal(err)
+	}
+
+	json := diagRespGet.Diagnostics.Trace
+	if json == "" ||
+		!strings.Contains(json, "traced statement") ||
+		!strings.Contains(json, "statement execution committed the txn") {
+		t.Fatal("statement diagnostics did not capture a trace")
+	}
+}
+
+func TestJobStatusResponse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ts := startServer(t)
+	defer ts.Stopper().Stop(context.TODO())
+
+	rootConfig := testutils.NewTestBaseContext(security.RootUser)
+	rpcContext := newRPCTestContext(ts, rootConfig)
+
+	url := ts.ServingRPCAddr()
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := serverpb.NewStatusClient(conn)
+
+	request := &serverpb.JobStatusRequest{JobId: -1}
+	response, err := client.JobStatus(context.Background(), request)
+	require.Regexp(t, `job with ID -1 does not exist`, err)
+	require.Nil(t, response)
+
+	ctx := context.Background()
+	job, err := ts.JobRegistry().(*jobs.Registry).CreateJobWithTxn(
+		ctx,
+		jobs.Record{
+			Description: "testing",
+			Statement:   "SELECT 1",
+			Username:    "root",
+			Details: jobspb.ImportDetails{
+				Tables: []jobspb.ImportDetails_Table{
+					{
+						Desc: &sqlbase.TableDescriptor{
+							ID: 1,
+						},
+					},
+					{
+						Desc: &sqlbase.TableDescriptor{
+							ID: 2,
+						},
+					},
+				},
+				URIs: []string{"a", "b"},
+			},
+			Progress:      jobspb.ImportProgress{},
+			DescriptorIDs: []sqlbase.ID{1, 2, 3},
+		},
+		nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.JobId = *job.ID()
+	response, err = client.JobStatus(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, *job.ID(), response.Job.Id)
+	require.Equal(t, job.Payload(), *response.Job.Payload)
+	require.Equal(t, job.Progress(), *response.Job.Progress)
 }

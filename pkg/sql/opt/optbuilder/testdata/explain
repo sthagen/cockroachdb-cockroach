@@ -1,0 +1,162 @@
+exec-ddl
+CREATE TABLE xy (x INT PRIMARY KEY, y INT)
+----
+
+build
+EXPLAIN SELECT * FROM xy
+----
+explain
+ ├── columns: tree:3 field:4 description:5
+ └── scan xy
+      └── columns: x:1!null y:2
+
+build
+EXPLAIN (PLAN,SYMVARS) SELECT * FROM xy
+----
+explain
+ ├── columns: tree:3 field:4 description:5
+ └── scan xy
+      └── columns: x:1!null y:2
+
+build
+EXPLAIN (TYPES) SELECT * FROM xy
+----
+explain
+ ├── columns: tree:3 field:6 description:7 columns:8 ordering:9  [hidden: level:4 node_type:5]
+ └── scan xy
+      └── columns: x:1!null y:2
+
+build
+EXPLAIN (VERBOSE) SELECT * FROM xy
+----
+explain
+ ├── columns: tree:3 field:6 description:7 columns:8 ordering:9  [hidden: level:4 node_type:5]
+ ├── mode: verbose
+ └── scan xy
+      └── columns: x:1!null y:2
+
+# Verify we preserve the ordering requirement of the explained query.
+build
+EXPLAIN (VERBOSE) SELECT * FROM xy ORDER BY y
+----
+explain
+ ├── columns: tree:3 field:6 description:7 columns:8 ordering:9  [hidden: level:4 node_type:5]
+ ├── mode: verbose
+ └── sort
+      ├── columns: x:1!null y:2
+      ├── ordering: +2
+      └── scan xy
+           └── columns: x:1!null y:2
+
+build
+EXPLAIN (VERBOSE) SELECT * FROM xy INNER JOIN (VALUES (1, 2), (3, 4)) AS t(u,v) ON x=u
+----
+explain
+ ├── columns: tree:5 field:8 description:9 columns:10 ordering:11  [hidden: level:6 node_type:7]
+ ├── mode: verbose
+ └── inner-join (hash)
+      ├── columns: x:1!null y:2 u:3!null v:4!null
+      ├── scan xy
+      │    └── columns: x:1!null y:2
+      ├── values
+      │    ├── columns: column1:3!null column2:4!null
+      │    ├── (1, 2)
+      │    └── (3, 4)
+      └── filters
+           └── x:1 = column1:3
+
+build
+SELECT tree FROM [ EXPLAIN (VERBOSE) SELECT * FROM xy ]
+----
+with &1
+ ├── columns: tree:10
+ ├── explain
+ │    ├── columns: tree:3 level:4 node_type:5 field:6 description:7 columns:8 ordering:9
+ │    ├── mode: verbose
+ │    └── scan xy
+ │         └── columns: x:1!null y:2
+ └── project
+      ├── columns: tree:10
+      └── with-scan &1
+           ├── columns: tree:10 level:11 node_type:12 field:13 description:14 columns:15 ordering:16
+           └── mapping:
+                ├──  tree:3 => tree:10
+                ├──  level:4 => level:11
+                ├──  node_type:5 => node_type:12
+                ├──  field:6 => field:13
+                ├──  description:7 => description:14
+                ├──  columns:8 => columns:15
+                └──  ordering:9 => ordering:16
+
+build
+SELECT tree FROM [ EXPLAIN (VERBOSE) SELECT x, x, y FROM xy ORDER BY y ]
+----
+with &1
+ ├── columns: tree:10
+ ├── explain
+ │    ├── columns: tree:3 level:4 node_type:5 field:6 description:7 columns:8 ordering:9
+ │    ├── mode: verbose
+ │    └── sort
+ │         ├── columns: x:1!null x:1!null y:2
+ │         ├── ordering: +2
+ │         └── scan xy
+ │              └── columns: x:1!null y:2
+ └── project
+      ├── columns: tree:10
+      └── with-scan &1
+           ├── columns: tree:10 level:11 node_type:12 field:13 description:14 columns:15 ordering:16
+           └── mapping:
+                ├──  tree:3 => tree:10
+                ├──  level:4 => level:11
+                ├──  node_type:5 => node_type:12
+                ├──  field:6 => field:13
+                ├──  description:7 => description:14
+                ├──  columns:8 => columns:15
+                └──  ordering:9 => ordering:16
+
+build
+SELECT json FROM [EXPLAIN (DISTSQL) SELECT * FROM xy] WHERE false
+----
+with &1
+ ├── columns: json:8
+ ├── explain
+ │    ├── columns: automatic:3 url:4 json:5
+ │    ├── mode: distsql
+ │    └── scan xy
+ │         └── columns: x:1!null y:2
+ └── project
+      ├── columns: json:8
+      └── select
+           ├── columns: automatic:6 url:7 json:8
+           ├── with-scan &1
+           │    ├── columns: automatic:6 url:7 json:8
+           │    └── mapping:
+           │         ├──  automatic:3 => automatic:6
+           │         ├──  url:4 => url:7
+           │         └──  json:5 => json:8
+           └── filters
+                └── false
+
+# Don't include hidden columns on a SELECT *.
+build
+SELECT * FROM [EXPLAIN (DISTSQL) SELECT * FROM xy] WHERE false
+----
+with &1
+ ├── columns: automatic:6 url:7
+ ├── explain
+ │    ├── columns: automatic:3 url:4 json:5
+ │    ├── mode: distsql
+ │    └── scan xy
+ │         └── columns: x:1!null y:2
+ └── project
+      ├── columns: automatic:6 url:7
+      └── select
+           ├── columns: automatic:6 url:7 json:8
+           ├── with-scan &1
+           │    ├── columns: automatic:6 url:7 json:8
+           │    └── mapping:
+           │         ├──  automatic:3 => automatic:6
+           │         ├──  url:4 => url:7
+           │         └──  json:5 => json:8
+           └── filters
+                └── false

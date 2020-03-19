@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -18,18 +14,19 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -37,6 +34,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
+	"github.com/pkg/errors"
 )
 
 type indexKeyTest struct {
@@ -53,7 +52,10 @@ func makeTableDescForTest(test indexKeyTest) (TableDescriptor, map[ColumnID]int)
 	columns := make([]ColumnDescriptor, len(test.primaryValues)+len(test.secondaryValues))
 	colMap := make(map[ColumnID]int, len(test.secondaryValues))
 	for i := range columns {
-		columns[i] = ColumnDescriptor{ID: ColumnID(i + 1), Type: ColumnType{SemanticType: ColumnType_INT}}
+		columns[i] = ColumnDescriptor{
+			ID:   ColumnID(i + 1),
+			Type: *types.Int,
+		}
 		colMap[columns[i].ID] = i
 		if i < len(test.primaryValues) {
 			primaryColumnIDs[i] = columns[i].ID
@@ -106,14 +108,8 @@ func decodeIndex(
 		return nil, err
 	}
 	values := make([]EncDatum, len(index.ColumnIDs))
-	colDirs := make([]encoding.Direction, len(index.ColumnDirections))
-	for i, dir := range index.ColumnDirections {
-		colDirs[i], err = dir.ToEncodingDirection()
-		if err != nil {
-			return nil, err
-		}
-	}
-	_, ok, err := DecodeIndexKey(tableDesc, index, types, values, colDirs, key)
+	colDirs := index.ColumnDirections
+	_, ok, _, err := DecodeIndexKey(tableDesc, index, types, values, colDirs, key)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +175,7 @@ func TestIndexKey(t *testing.T) {
 		valuesLen := randutil.RandIntInRange(rng, len(t.primaryInterleaves)+1, len(t.primaryInterleaves)+10)
 		t.primaryValues = make([]tree.Datum, valuesLen)
 		for j := range t.primaryValues {
-			t.primaryValues[j] = RandDatum(rng, ColumnType{SemanticType: ColumnType_INT}, true)
+			t.primaryValues[j] = RandDatum(rng, types.Int, true)
 		}
 
 		t.secondaryInterleaves = make([]ID, rng.Intn(10))
@@ -189,16 +185,33 @@ func TestIndexKey(t *testing.T) {
 		valuesLen = randutil.RandIntInRange(rng, len(t.secondaryInterleaves)+1, len(t.secondaryInterleaves)+10)
 		t.secondaryValues = make([]tree.Datum, valuesLen)
 		for j := range t.secondaryValues {
-			t.secondaryValues[j] = RandDatum(rng, ColumnType{SemanticType: ColumnType_INT}, true)
+			t.secondaryValues[j] = RandDatum(rng, types.Int, true)
 		}
 
 		tests = append(tests, t)
 	}
 
 	for i, test := range tests {
-		evalCtx := tree.NewTestingEvalContext()
+		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer evalCtx.Stop(context.Background())
 		tableDesc, colMap := makeTableDescForTest(test)
+		// Add the default family to each test, since secondary indexes support column families.
+		var (
+			colNames []string
+			colIDs   ColumnIDs
+		)
+		for _, c := range tableDesc.Columns {
+			colNames = append(colNames, c.Name)
+			colIDs = append(colIDs, c.ID)
+		}
+		tableDesc.Families = []ColumnFamilyDescriptor{{
+			Name:            "defaultFamily",
+			ID:              0,
+			ColumnNames:     colNames,
+			ColumnIDs:       colIDs,
+			DefaultColumnID: colIDs[0],
+		}}
+
 		testValues := append(test.primaryValues, test.secondaryValues...)
 
 		primaryKeyPrefix := MakeIndexKeyPrefix(&tableDesc, tableDesc.PrimaryIndex.ID)
@@ -208,19 +221,22 @@ func TestIndexKey(t *testing.T) {
 			t.Fatal(err)
 		}
 		primaryValue := roachpb.MakeValueFromBytes(nil)
-		primaryIndexKV := client.KeyValue{Key: primaryKey, Value: &primaryValue}
+		primaryIndexKV := kv.KeyValue{Key: primaryKey, Value: &primaryValue}
 
 		secondaryIndexEntry, err := EncodeSecondaryIndex(
-			&tableDesc, &tableDesc.Indexes[0], colMap, testValues)
+			&tableDesc, &tableDesc.Indexes[0], colMap, testValues, true /* includeEmpty */)
+		if len(secondaryIndexEntry) != 1 {
+			t.Fatalf("expected 1 index entry, got %d. got %#v", len(secondaryIndexEntry), secondaryIndexEntry)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		secondaryIndexKV := client.KeyValue{
-			Key:   secondaryIndexEntry.Key,
-			Value: &secondaryIndexEntry.Value,
+		secondaryIndexKV := kv.KeyValue{
+			Key:   secondaryIndexEntry[0].Key,
+			Value: &secondaryIndexEntry[0].Value,
 		}
 
-		checkEntry := func(index *IndexDescriptor, entry client.KeyValue) {
+		checkEntry := func(index *IndexDescriptor, entry kv.KeyValue) {
 			values, err := decodeIndex(&tableDesc, index, entry.Key)
 			if err != nil {
 				t.Fatal(err)
@@ -292,6 +308,14 @@ func TestArrayEncoding(t *testing.T) {
 			},
 			[]byte{1, 6, 3, 3, 102, 111, 111, 3, 98, 97, 114, 3, 98, 97, 122},
 		}, {
+			"name array",
+			tree.DArray{
+				ParamTyp: types.Name,
+				Array:    tree.Datums{tree.NewDName("foo"), tree.NewDName("bar"), tree.NewDName("baz")},
+			},
+			[]byte{1, 6, 3, 3, 102, 111, 111, 3, 98, 97, 114, 3, 98, 97, 122},
+		},
+		{
 			"bool array",
 			tree.DArray{
 				ParamTyp: types.Bool,
@@ -355,10 +379,15 @@ func TestArrayEncoding(t *testing.T) {
 			enc = append(enc, byte(len(test.encoding)))
 			enc = append(enc, test.encoding...)
 			d, _, err := decodeArray(&DatumAlloc{}, test.datum.ParamTyp, enc)
+			hasNulls := d.(*tree.DArray).HasNulls
+			if test.datum.HasNulls != hasNulls {
+				t.Fatalf("expected %v to have HasNulls=%t, got %t", enc, test.datum.HasNulls, hasNulls)
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			if d.Compare(tree.NewTestingEvalContext(), &test.datum) != 0 {
+			evalContext := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+			if d.Compare(evalContext, &test.datum) != 0 {
 				t.Fatalf("expected %v to decode to %s, got %s", enc, test.datum.String(), d.String())
 			}
 		})
@@ -381,32 +410,32 @@ func TestMarshalColumnValue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	tests := []struct {
-		kind  ColumnType_SemanticType
+		typ   *types.T
 		datum tree.Datum
 		exp   roachpb.Value
 	}{
 		{
-			kind:  ColumnType_BOOL,
+			typ:   types.Bool,
 			datum: tree.MakeDBool(true),
 			exp:   func() (v roachpb.Value) { v.SetBool(true); return }(),
 		},
 		{
-			kind:  ColumnType_BOOL,
+			typ:   types.Bool,
 			datum: tree.MakeDBool(false),
 			exp:   func() (v roachpb.Value) { v.SetBool(false); return }(),
 		},
 		{
-			kind:  ColumnType_INT,
+			typ:   types.Int,
 			datum: tree.NewDInt(314159),
 			exp:   func() (v roachpb.Value) { v.SetInt(314159); return }(),
 		},
 		{
-			kind:  ColumnType_FLOAT,
+			typ:   types.Float,
 			datum: tree.NewDFloat(3.14159),
 			exp:   func() (v roachpb.Value) { v.SetFloat(3.14159); return }(),
 		},
 		{
-			kind: ColumnType_DECIMAL,
+			typ: types.Decimal,
 			datum: func() (v tree.Datum) {
 				v, err := tree.ParseDDecimal("1234567890.123456890")
 				if err != nil {
@@ -427,42 +456,52 @@ func TestMarshalColumnValue(t *testing.T) {
 			}(),
 		},
 		{
-			kind:  ColumnType_DATE,
-			datum: tree.NewDDate(314159),
+			typ:   types.Date,
+			datum: tree.NewDDate(pgdate.MakeCompatibleDateFromDisk(314159)),
 			exp:   func() (v roachpb.Value) { v.SetInt(314159); return }(),
 		},
 		{
-			kind:  ColumnType_TIME,
+			typ:   types.Date,
+			datum: tree.NewDDate(pgdate.MakeCompatibleDateFromDisk(math.MinInt64)),
+			exp:   func() (v roachpb.Value) { v.SetInt(math.MinInt64); return }(),
+		},
+		{
+			typ:   types.Date,
+			datum: tree.NewDDate(pgdate.MakeCompatibleDateFromDisk(math.MaxInt64)),
+			exp:   func() (v roachpb.Value) { v.SetInt(math.MaxInt64); return }(),
+		},
+		{
+			typ:   types.Time,
 			datum: tree.MakeDTime(timeofday.FromInt(314159)),
 			exp:   func() (v roachpb.Value) { v.SetInt(314159); return }(),
 		},
 		{
-			kind:  ColumnType_TIMESTAMP,
+			typ:   types.Timestamp,
 			datum: tree.MakeDTimestamp(timeutil.Unix(314159, 1000), time.Microsecond),
 			exp:   func() (v roachpb.Value) { v.SetTime(timeutil.Unix(314159, 1000)); return }(),
 		},
 		{
-			kind:  ColumnType_TIMESTAMPTZ,
+			typ:   types.TimestampTZ,
 			datum: tree.MakeDTimestampTZ(timeutil.Unix(314159, 1000), time.Microsecond),
 			exp:   func() (v roachpb.Value) { v.SetTime(timeutil.Unix(314159, 1000)); return }(),
 		},
 		{
-			kind:  ColumnType_STRING,
+			typ:   types.String,
 			datum: tree.NewDString("testing123"),
 			exp:   func() (v roachpb.Value) { v.SetString("testing123"); return }(),
 		},
 		{
-			kind:  ColumnType_NAME,
+			typ:   types.Name,
 			datum: tree.NewDName("testingname123"),
 			exp:   func() (v roachpb.Value) { v.SetString("testingname123"); return }(),
 		},
 		{
-			kind:  ColumnType_BYTES,
+			typ:   types.Bytes,
 			datum: tree.NewDBytes(tree.DBytes([]byte{0x31, 0x41, 0x59})),
 			exp:   func() (v roachpb.Value) { v.SetBytes([]byte{0x31, 0x41, 0x59}); return }(),
 		},
 		{
-			kind: ColumnType_UUID,
+			typ: types.Uuid,
 			datum: func() (v tree.Datum) {
 				v, err := tree.ParseDUuidFromString("63616665-6630-3064-6465-616462656562")
 				if err != nil {
@@ -480,7 +519,7 @@ func TestMarshalColumnValue(t *testing.T) {
 			}(),
 		},
 		{
-			kind: ColumnType_INET,
+			typ: types.INet,
 			datum: func() (v tree.Datum) {
 				v, err := tree.ParseDIPAddrFromINetString("192.168.0.1")
 				if err != nil {
@@ -501,13 +540,13 @@ func TestMarshalColumnValue(t *testing.T) {
 	}
 
 	for i, testCase := range tests {
-		typ := ColumnType{SemanticType: testCase.kind}
-		col := ColumnDescriptor{ID: ColumnID(testCase.kind + 1), Type: typ}
+		typ := testCase.typ
+		col := ColumnDescriptor{ID: ColumnID(typ.Family() + 1), Type: *typ}
 
-		if actual, err := MarshalColumnValue(col, testCase.datum); err != nil {
+		if actual, err := MarshalColumnValue(&col, testCase.datum); err != nil {
 			t.Errorf("%d: unexpected error with column type %v: %v", i, typ, err)
 		} else if !reflect.DeepEqual(actual, testCase.exp) {
-			t.Errorf("%d: MarshalColumnValue() got %s, expected %v", i, actual, testCase.exp)
+			t.Errorf("%d: MarshalColumnValue() got %v, expected %v", i, actual, testCase.exp)
 		}
 	}
 }
@@ -1444,6 +1483,41 @@ func TestAdjustEndKeyForInterleave(t *testing.T) {
 			expected := EncodeTestKey(t, kvDB, ShortToLongKeyFmt(tc.expected))
 			if !expected.Equal(actual) {
 				t.Errorf("expected tightened end key %s, got %s", expected, actual)
+			}
+		})
+	}
+}
+
+func TestDecodeTableValue(t *testing.T) {
+	a := &DatumAlloc{}
+	for _, tc := range []struct {
+		in  tree.Datum
+		typ *types.T
+		err string
+	}{
+		// These test cases are not intended to be exhaustive, but rather exercise
+		// the special casing and error handling of DecodeTableValue.
+		{tree.DNull, types.Bool, ""},
+		{tree.DBoolTrue, types.Bool, ""},
+		{tree.NewDInt(tree.DInt(4)), types.Bool, "value type is not True or False: Int"},
+		{tree.DNull, types.Int, ""},
+		{tree.NewDInt(tree.DInt(4)), types.Int, ""},
+		{tree.DBoolTrue, types.Int, "decoding failed"},
+	} {
+		t.Run("", func(t *testing.T) {
+			var prefix, scratch []byte
+			buf, err := EncodeTableValue(prefix, 0 /* colID */, tc.in, scratch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d, _, err := DecodeTableValue(a, tc.typ, buf)
+			if !testutils.IsError(err, tc.err) {
+				t.Fatalf("expected error %q, but got %v", tc.err, err)
+			} else if err != nil {
+				return
+			}
+			if tc.in.Compare(tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()), d) != 0 {
+				t.Fatalf("decoded datum %[1]v (%[1]T) does not match encoded datum %[2]v (%[2]T)", d, tc.in)
 			}
 		})
 	}

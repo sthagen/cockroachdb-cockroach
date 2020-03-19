@@ -1,18 +1,25 @@
-import React from "react";
-import { createSelector } from "reselect";
-import { connect } from "react-redux";
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import Long from "long";
 import moment from "moment";
-
-import * as protos from  "src/js/protos";
+import React from "react";
+import { connect } from "react-redux";
+import { createSelector } from "reselect";
+import * as protos from "src/js/protos";
+import { MetricsQuery, requestMetrics as requestMetricsAction } from "src/redux/metrics";
 import { AdminUIState } from "src/redux/state";
-import { requestMetrics, MetricsQuery } from "src/redux/metrics";
-import {
-  Metric, MetricProps, MetricsDataComponentProps, QueryTimeInfo,
-} from "src/views/shared/components/metricQuery";
-import { findChildrenOfType } from "src/util/find";
 import { MilliToNano } from "src/util/convert";
+import { findChildrenOfType } from "src/util/find";
+import { Metric, MetricProps, MetricsDataComponentProps, QueryTimeInfo } from "src/views/shared/components/metricQuery";
 
 /**
  * queryFromProps is a helper method which generates a TimeSeries Query data
@@ -21,25 +28,31 @@ import { MilliToNano } from "src/util/convert";
 function queryFromProps(
   metricProps: MetricProps,
   graphProps: MetricsDataComponentProps,
-): protos.cockroach.ts.tspb.Query$Properties {
+): protos.cockroach.ts.tspb.IQuery {
     let derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.NONE;
     let sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.SUM;
     let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.AVG;
 
     // Compute derivative function.
-    if (metricProps.rate) {
+    if (!_.isNil(metricProps.derivative)) {
+      derivative = metricProps.derivative;
+    } else if (metricProps.rate) {
       derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.DERIVATIVE;
     } else if (metricProps.nonNegativeRate) {
       derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.NON_NEGATIVE_DERIVATIVE;
     }
     // Compute downsample function.
-    if (metricProps.downsampleMax) {
+    if (!_.isNil(metricProps.downsampler)) {
+      downsampler = metricProps.downsampler;
+    } else if (metricProps.downsampleMax) {
       downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
     } else if (metricProps.downsampleMin) {
       downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MIN;
     }
     // Compute aggregation function.
-    if (metricProps.aggregateMax) {
+    if (!_.isNil(metricProps.aggregator)) {
+      sourceAggregator = metricProps.aggregator;
+    } else if (metricProps.aggregateMax) {
       sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
     } else if (metricProps.aggregateMin) {
       sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MIN;
@@ -63,7 +76,7 @@ function queryFromProps(
 interface MetricsDataProviderConnectProps {
   metrics: MetricsQuery;
   timeInfo: QueryTimeInfo;
-  requestMetrics: typeof requestMetrics;
+  requestMetrics: typeof requestMetricsAction;
 }
 
 /**
@@ -74,6 +87,7 @@ interface MetricsDataProviderExplicitProps {
   id: string;
   // If current is true, uses the current time instead of the global timewindow.
   current?: boolean;
+  children?: React.ReactElement<{}>;
 }
 
 /**
@@ -107,7 +121,7 @@ type MetricsDataProviderProps = MetricsDataProviderConnectProps & MetricsDataPro
  */
 class MetricsDataProvider extends React.Component<MetricsDataProviderProps, {}> {
   private queriesSelector = createSelector(
-    (props: MetricsDataProviderProps & {children?: React.ReactNode}) => props.children,
+    ({ children }: MetricsDataProviderProps) => children,
     (children) => {
       // MetricsDataProvider should contain only one direct child.
       const child: React.ReactElement<MetricsDataComponentProps> = React.Children.only(this.props.children);
@@ -217,13 +231,8 @@ const metricsDataProviderConnected = connect(
     };
   },
   {
-    requestMetrics,
+    requestMetrics: requestMetricsAction,
   },
 )(MetricsDataProvider);
 
-export {
-  // Export original, unconnected MetricsDataProvider for effective unit
-  // testing.
-  MetricsDataProvider as MetricsDataProviderUnconnected,
-  metricsDataProviderConnected as MetricsDataProvider,
-};
+export { MetricsDataProvider as MetricsDataProviderUnconnected, metricsDataProviderConnected as MetricsDataProvider };

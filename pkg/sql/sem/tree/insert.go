@@ -7,71 +7,71 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This code was derived from https://github.com/youtube/vitess.
 
 package tree
 
-import "bytes"
-
 // Insert represents an INSERT statement.
 type Insert struct {
+	With       *With
 	Table      TableExpr
-	Columns    UnresolvedNames
+	Columns    NameList
 	Rows       *Select
 	OnConflict *OnConflict
 	Returning  ReturningClause
 }
 
 // Format implements the NodeFormatter interface.
-func (node *Insert) Format(buf *bytes.Buffer, f FmtFlags) {
+func (node *Insert) Format(ctx *FmtCtx) {
+	ctx.FormatNode(node.With)
 	if node.OnConflict.IsUpsertAlias() {
-		buf.WriteString("UPSERT")
+		ctx.WriteString("UPSERT")
 	} else {
-		buf.WriteString("INSERT")
+		ctx.WriteString("INSERT")
 	}
-	buf.WriteString(" INTO ")
-	FormatNode(buf, f, node.Table)
+	ctx.WriteString(" INTO ")
+	ctx.FormatNode(node.Table)
 	if node.Columns != nil {
-		buf.WriteByte('(')
-		FormatNode(buf, f, node.Columns)
-		buf.WriteByte(')')
+		ctx.WriteByte('(')
+		ctx.FormatNode(&node.Columns)
+		ctx.WriteByte(')')
 	}
 	if node.DefaultValues() {
-		buf.WriteString(" DEFAULT VALUES")
+		ctx.WriteString(" DEFAULT VALUES")
 	} else {
-		buf.WriteByte(' ')
-		FormatNode(buf, f, node.Rows)
+		ctx.WriteByte(' ')
+		ctx.FormatNode(node.Rows)
 	}
 	if node.OnConflict != nil && !node.OnConflict.IsUpsertAlias() {
-		buf.WriteString(" ON CONFLICT")
+		ctx.WriteString(" ON CONFLICT")
 		if len(node.OnConflict.Columns) > 0 {
-			buf.WriteString(" (")
-			FormatNode(buf, f, node.OnConflict.Columns)
-			buf.WriteString(")")
+			ctx.WriteString(" (")
+			ctx.FormatNode(&node.OnConflict.Columns)
+			ctx.WriteString(")")
 		}
 		if node.OnConflict.DoNothing {
-			buf.WriteString(" DO NOTHING")
+			ctx.WriteString(" DO NOTHING")
 		} else {
-			buf.WriteString(" DO UPDATE SET ")
-			FormatNode(buf, f, node.OnConflict.Exprs)
+			ctx.WriteString(" DO UPDATE SET ")
+			ctx.FormatNode(&node.OnConflict.Exprs)
 			if node.OnConflict.Where != nil {
-				FormatNode(buf, f, node.OnConflict.Where)
+				ctx.WriteByte(' ')
+				ctx.FormatNode(node.OnConflict.Where)
 			}
 		}
 	}
-	FormatNode(buf, f, node.Returning)
+	if HasReturningClause(node.Returning) {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(node.Returning)
+	}
 }
 
 // DefaultValues returns true iff only default values are being inserted.

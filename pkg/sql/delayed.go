@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -41,4 +37,23 @@ func (d *delayedNode) Close(ctx context.Context) {
 		d.plan.Close(ctx)
 		d.plan = nil
 	}
+}
+
+// startExec constructs the wrapped planNode now that execution is underway.
+func (d *delayedNode) startExec(params runParams) error {
+	if d.plan != nil {
+		panic("wrapped plan should not yet exist")
+	}
+
+	plan, err := d.constructor(params.ctx, params.p)
+	if err != nil {
+		return err
+	}
+	d.plan = plan
+
+	// Recursively invoke startExec on new plan. Normally, startExec doesn't
+	// recurse - calling children is handled by the planNode walker. The reason
+	// this won't suffice here is that the the child of this node doesn't exist
+	// until after startExec is invoked.
+	return startExec(params, plan)
 }

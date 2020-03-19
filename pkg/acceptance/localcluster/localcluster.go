@@ -1,28 +1,25 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package localcluster
 
 import (
 	"bytes"
 	"context"
+	gosql "database/sql"
 	"net"
 	"os/exec"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/acceptance/cluster"
 	"github.com/pkg/errors"
 )
 
@@ -30,6 +27,8 @@ import (
 type LocalCluster struct {
 	*Cluster
 }
+
+var _ cluster.Cluster = &LocalCluster{}
 
 // Port implements cluster.Cluster.
 func (b *LocalCluster) Port(ctx context.Context, i int) string {
@@ -41,9 +40,9 @@ func (b *LocalCluster) NumNodes() int {
 	return len(b.Nodes)
 }
 
-// NewClient implements cluster.Cluster.
-func (b *LocalCluster) NewClient(ctx context.Context, i int) (*client.DB, error) {
-	return b.Client(i), nil
+// NewDB implements the Cluster interface.
+func (b *LocalCluster) NewDB(ctx context.Context, i int) (*gosql.DB, error) {
+	return gosql.Open("postgres", b.PGUrl(ctx, i))
 }
 
 // PGUrl implements cluster.Cluster.
@@ -74,7 +73,7 @@ func (b *LocalCluster) AssertAndStop(ctx context.Context, t testing.TB) {
 // ExecCLI implements cluster.Cluster.
 func (b *LocalCluster) ExecCLI(ctx context.Context, i int, cmd []string) (string, string, error) {
 	cmd = append([]string{b.Cfg.Binary}, cmd...)
-	cmd = append(cmd, "--insecure", "--port", b.Port(ctx, i))
+	cmd = append(cmd, "--insecure", "--host", ":"+b.Port(ctx, i))
 	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
 	var o, e bytes.Buffer
 	c.Stdout, c.Stderr = &o, &e
@@ -116,8 +115,7 @@ func (b *LocalCluster) RestartAsync(ctx context.Context, i int) <-chan error {
 		// this file. That's why we let *every* node do this (you could try to make
 		// only the first one wait, but if that one is 1.0, bad luck).
 		// Short-circuiting the wait in the case that the listening URL file is
-		// written (i.e. isServing closes) makes restarts work with 1.0 servers for
-		// the most part.
+		// written makes restarts work with 1.0 servers for the most part.
 		for {
 			if gossipAddr := b.Nodes[i].AdvertiseAddr(); gossipAddr != "" {
 				return ch

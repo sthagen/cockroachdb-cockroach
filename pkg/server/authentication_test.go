@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -23,17 +19,20 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -41,9 +40,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
+	"golang.org/x/crypto/bcrypt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 type ctxI interface {
@@ -110,35 +113,35 @@ func TestSSLEnforcement(t *testing.T) {
 		{"", nodeCertsContext, http.StatusOK},
 		{"", testCertsContext, http.StatusOK},
 		{"", noCertsContext, http.StatusOK},
-		{"", insecureContext, http.StatusPermanentRedirect},
+		{"", insecureContext, http.StatusTemporaryRedirect},
 
 		// /_admin/: server.adminServer: no auth.
 		{adminPrefix + "health", rootCertsContext, http.StatusOK},
 		{adminPrefix + "health", nodeCertsContext, http.StatusOK},
 		{adminPrefix + "health", testCertsContext, http.StatusOK},
 		{adminPrefix + "health", noCertsContext, http.StatusOK},
-		{adminPrefix + "health", insecureContext, http.StatusPermanentRedirect},
+		{adminPrefix + "health", insecureContext, http.StatusTemporaryRedirect},
 
 		// /debug/: server.adminServer: no auth.
 		{debug.Endpoint + "vars", rootCertsContext, http.StatusOK},
 		{debug.Endpoint + "vars", nodeCertsContext, http.StatusOK},
 		{debug.Endpoint + "vars", testCertsContext, http.StatusOK},
 		{debug.Endpoint + "vars", noCertsContext, http.StatusOK},
-		{debug.Endpoint + "vars", insecureContext, http.StatusPermanentRedirect},
+		{debug.Endpoint + "vars", insecureContext, http.StatusTemporaryRedirect},
 
 		// /_status/nodes: server.statusServer: no auth.
 		{statusPrefix + "nodes", rootCertsContext, http.StatusOK},
 		{statusPrefix + "nodes", nodeCertsContext, http.StatusOK},
 		{statusPrefix + "nodes", testCertsContext, http.StatusOK},
 		{statusPrefix + "nodes", noCertsContext, http.StatusOK},
-		{statusPrefix + "nodes", insecureContext, http.StatusPermanentRedirect},
+		{statusPrefix + "nodes", insecureContext, http.StatusTemporaryRedirect},
 
 		// /ts/: ts.Server: no auth.
 		{ts.URLPrefix, rootCertsContext, http.StatusNotFound},
 		{ts.URLPrefix, nodeCertsContext, http.StatusNotFound},
 		{ts.URLPrefix, testCertsContext, http.StatusNotFound},
 		{ts.URLPrefix, noCertsContext, http.StatusNotFound},
-		{ts.URLPrefix, insecureContext, http.StatusPermanentRedirect},
+		{ts.URLPrefix, insecureContext, http.StatusTemporaryRedirect},
 	} {
 		t.Run("", func(t *testing.T) {
 			client, err := tc.ctx.GetHTTPClient()
@@ -171,8 +174,11 @@ func TestSSLEnforcement(t *testing.T) {
 
 func TestVerifyPassword(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(ctx)
+
 	ts := s.(*TestServer)
 
 	if util.RaceEnabled {
@@ -182,15 +188,38 @@ func TestVerifyPassword(t *testing.T) {
 		security.BcryptCost = bcrypt.MinCost
 	}
 
+	//location is used for timezone testing.
+	shanghaiLoc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	for _, user := range []struct {
-		username string
-		password string
+		username         string
+		password         string
+		loginFlag        string
+		validUntilClause string
+		qargs            []interface{}
 	}{
-		{"azure_diamond", "hunter2"},
-		{"druidia", "12345"},
+		{"azure_diamond", "hunter2", "", "", nil},
+		{"druidia", "12345", "", "", nil},
+
+		{"richardc", "12345", "NOLOGIN", "", nil},
+		{"before_epoch", "12345", "", "VALID UNTIL '1969-01-01'", nil},
+		{"epoch", "12345", "", "VALID UNTIL '1970-01-01'", nil},
+		{"cockroach", "12345", "", "VALID UNTIL '2100-01-01'", nil},
+		{"cthon98", "12345", "", "VALID UNTIL NULL", nil},
+
+		{"toolate", "12345", "", "VALID UNTIL $1",
+			[]interface{}{timeutil.Now().Add(-10 * time.Minute)}},
+		{"timelord", "12345", "", "VALID UNTIL $1",
+			[]interface{}{timeutil.Now().Add(59 * time.Minute).In(shanghaiLoc)}},
 	} {
-		cmd := fmt.Sprintf("CREATE USER %s WITH PASSWORD '%s'", user.username, user.password)
-		if _, err := db.Exec(cmd); err != nil {
+		cmd := fmt.Sprintf(
+			"CREATE USER %s WITH PASSWORD '%s' %s %s",
+			user.username, user.password, user.loginFlag, user.validUntilClause)
+
+		if _, err := db.Exec(cmd, user.qargs...); err != nil {
 			t.Fatalf("failed to create user: %s", err)
 		}
 	}
@@ -214,9 +243,18 @@ func TestVerifyPassword(t *testing.T) {
 		{"root", "", false, "crypto/bcrypt"},
 		{"", "", false, "does not exist"},
 		{"doesntexist", "zxcvbn", false, "does not exist"},
+
+		{"richardc", "12345", false,
+			"richardc does not have login privilege"},
+		{"before_epoch", "12345", false, ""},
+		{"epoch", "12345", false, ""},
+		{"cockroach", "12345", true, ""},
+		{"toolate", "12345", false, ""},
+		{"timelord", "12345", true, ""},
+		{"cthon98", "12345", true, ""},
 	} {
 		t.Run("", func(t *testing.T) {
-			valid, err := ts.authentication.verifyPassword(context.TODO(), tc.username, tc.password)
+			valid, expired, err := ts.authentication.verifyPassword(context.TODO(), tc.username, tc.password)
 			if err != nil {
 				t.Errorf(
 					"credentials %s/%s failed with error %s, wanted no error",
@@ -225,7 +263,7 @@ func TestVerifyPassword(t *testing.T) {
 					err,
 				)
 			}
-			if valid != tc.shouldAuthenticate {
+			if valid && !expired != tc.shouldAuthenticate {
 				t.Errorf(
 					"credentials %s/%s valid = %t, wanted %t",
 					tc.username,
@@ -285,7 +323,8 @@ WHERE id = $1`
 
 	// Verify hashed secret matches original secret
 	hasher := sha256.New()
-	hashedSecret := hasher.Sum(origSecret)
+	_, _ = hasher.Write(origSecret)
+	hashedSecret := hasher.Sum(nil)
 	if !bytes.Equal(sessHashedSecret, hashedSecret) {
 		t.Fatalf("hashed value of secret: \n%#v\ncomputed as: \n%#v\nwanted: \n%#v", origSecret, hashedSecret, sessHashedSecret)
 	}
@@ -409,9 +448,6 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
-	if err := ts.WaitForInitialSplits(); err != nil {
-		t.Fatal(err)
-	}
 
 	const (
 		validUsername = "testuser"
@@ -427,6 +463,9 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 		// We need to instantiate our own HTTP Request, because we must inspect
 		// the returned headers.
 		httpClient, err := ts.GetHTTPClient()
+		if util.RaceEnabled {
+			httpClient.Timeout += 30 * time.Second
+		}
 		if err != nil {
 			t.Fatalf("could not get HTTP client: %s", err)
 		}
@@ -436,7 +475,7 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 		}
 		var resp serverpb.UserLoginResponse
 		return httputil.PostJSONWithRequest(
-			httpClient, ts.AdminURL()+authPrefix+"login", &req, &resp,
+			httpClient, ts.AdminURL()+loginPath, &req, &resp,
 		)
 	}
 
@@ -482,7 +521,8 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 	}
 
 	hasher := sha256.New()
-	hashedSecret := hasher.Sum(sessionCookie.Secret)
+	_, _ = hasher.Write(sessionCookie.Secret)
+	hashedSecret := hasher.Sum(nil)
 	if a, e := sessHashedSecret, hashedSecret; !bytes.Equal(a, e) {
 		t.Fatalf(
 			"session secret hash was %v, wanted %v (derived from original secret %v)",
@@ -490,6 +530,81 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 			e,
 			sessionCookie.Secret,
 		)
+	}
+}
+
+func TestLogout(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+	ts := s.(*TestServer)
+
+	// Log in.
+	authHTTPClient, cookie, err := ts.getAuthenticatedHTTPClientAndCookie(authenticatedUserName, true)
+	if err != nil {
+		t.Fatal("error opening HTTP client", err)
+	}
+
+	// Log out.
+	var resp serverpb.UserLogoutResponse
+	if err := httputil.GetJSON(authHTTPClient, ts.AdminURL()+logoutPath, &resp); err != nil {
+		t.Fatal("logout request failed:", err)
+	}
+
+	// Verify that revokedAt has been set in the DB.
+	query := `SELECT "revokedAt" FROM system.web_sessions WHERE id = $1`
+	result := db.QueryRow(query, cookie.ID)
+	var revokedAt string
+	if err := result.Scan(&revokedAt); err != nil {
+		t.Fatalf("error querying auth session: %s", err)
+	}
+
+	if revokedAt == "" {
+		t.Fatal("expected revoked at to not be empty; was empty")
+	}
+
+	databasesURL := ts.AdminURL() + "/_admin/v1/databases"
+
+	// Verify that we're unauthorized after logout.
+	response, err := authHTTPClient.Get(databasesURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatal("expected unauthorized response after logout; got", response.StatusCode)
+	}
+
+	// Try to use the revoked cookie; verify that it doesn't work.
+	parsedURL, err := url.Parse(s.AdminURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedCookie, err := EncodeSessionCookie(cookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	invalidAuthClient, err := s.GetHTTPClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidAuthClient.Jar = jar
+	invalidAuthClient.Jar.SetCookies(parsedURL, []*http.Cookie{encodedCookie})
+
+	invalidAuthResp, err := invalidAuthClient.Get(databasesURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer invalidAuthResp.Body.Close()
+
+	if invalidAuthResp.StatusCode != 401 {
+		t.Fatal("expected unauthorized error; got", invalidAuthResp.StatusCode)
 	}
 }
 
@@ -510,7 +625,7 @@ func TestAuthenticationMux(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	authClient, err := tsrv.GetAuthenticatedHTTPClient()
+	authClient, err := tsrv.GetAdminAuthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,6 +682,120 @@ func TestAuthenticationMux(t *testing.T) {
 			// Verify authenticated client returns 200 OK.
 			if err := runRequest(authClient, tc.method, tc.path, tc.body, http.StatusOK); err != nil {
 				t.Fatalf("request %s failed when authorized: %s", tc.path, err)
+			}
+		})
+	}
+}
+
+func TestGRPCAuthentication(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	// For each subsystem we pick a representative RPC. The idea is not to
+	// exhaustively test each RPC but to prevent server startup from being
+	// refactored in such a way that an entire subsystem becomes inadvertently
+	// exempt from authentication checks.
+	subsystems := []struct {
+		name    string
+		sendRPC func(context.Context, *grpc.ClientConn) error
+	}{
+		{"gossip", func(ctx context.Context, conn *grpc.ClientConn) error {
+			stream, err := gossip.NewGossipClient(conn).Gossip(ctx)
+			if err != nil {
+				return err
+			}
+			_ = stream.Send(&gossip.Request{})
+			_, err = stream.Recv()
+			return err
+		}},
+		{"internal", func(ctx context.Context, conn *grpc.ClientConn) error {
+			_, err := roachpb.NewInternalClient(conn).Batch(ctx, &roachpb.BatchRequest{})
+			return err
+		}},
+		{"perReplica", func(ctx context.Context, conn *grpc.ClientConn) error {
+			_, err := kvserver.NewPerReplicaClient(conn).CollectChecksum(ctx, &kvserver.CollectChecksumRequest{})
+			return err
+		}},
+		{"raft", func(ctx context.Context, conn *grpc.ClientConn) error {
+			stream, err := kvserver.NewMultiRaftClient(conn).RaftMessageBatch(ctx)
+			if err != nil {
+				return err
+			}
+			_ = stream.Send(&kvserver.RaftMessageRequestBatch{})
+			_, err = stream.Recv()
+			return err
+		}},
+		{"closedTimestamp", func(ctx context.Context, conn *grpc.ClientConn) error {
+			stream, err := ctpb.NewClosedTimestampClient(conn).Get(ctx)
+			if err != nil {
+				return err
+			}
+			_ = stream.Send(&ctpb.Reaction{})
+			_, err = stream.Recv()
+			return err
+		}},
+		{"distSQL", func(ctx context.Context, conn *grpc.ClientConn) error {
+			stream, err := execinfrapb.NewDistSQLClient(conn).RunSyncFlow(ctx)
+			if err != nil {
+				return err
+			}
+			_ = stream.Send(&execinfrapb.ConsumerSignal{})
+			_, err = stream.Recv()
+			return err
+		}},
+		{"init", func(ctx context.Context, conn *grpc.ClientConn) error {
+			_, err := serverpb.NewInitClient(conn).Bootstrap(ctx, &serverpb.BootstrapRequest{})
+			return err
+		}},
+		{"admin", func(ctx context.Context, conn *grpc.ClientConn) error {
+			_, err := serverpb.NewAdminClient(conn).Databases(ctx, &serverpb.DatabasesRequest{})
+			return err
+		}},
+		{"status", func(ctx context.Context, conn *grpc.ClientConn) error {
+			_, err := serverpb.NewStatusClient(conn).ListSessions(ctx, &serverpb.ListSessionsRequest{})
+			return err
+		}},
+	}
+
+	conn, err := grpc.DialContext(ctx, s.ServingRPCAddr(),
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+			InsecureSkipVerify: true,
+		})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(conn *grpc.ClientConn) { _ = conn.Close() }(conn)
+	for _, subsystem := range subsystems {
+		t.Run(fmt.Sprintf("no-cert/%s", subsystem.name), func(t *testing.T) {
+			err := subsystem.sendRPC(ctx, conn)
+			if exp := "no client certificates in request"; !testutils.IsError(err, exp) {
+				t.Errorf("expected %q error, but got %v", exp, err)
+			}
+		})
+	}
+
+	certManager, err := s.RPCContext().GetCertificateManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsConfig, err := certManager.GetClientTLSConfig("testuser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err = grpc.DialContext(ctx, s.ServingRPCAddr(),
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(conn *grpc.ClientConn) { _ = conn.Close() }(conn)
+	for _, subsystem := range subsystems {
+		t.Run(fmt.Sprintf("bad-user/%s", subsystem.name), func(t *testing.T) {
+			err := subsystem.sendRPC(ctx, conn)
+			if exp := `user \[testuser\] is not allowed to perform this RPC`; !testutils.IsError(err, exp) {
+				t.Errorf("expected %q error, but got %v", exp, err)
 			}
 		})
 	}

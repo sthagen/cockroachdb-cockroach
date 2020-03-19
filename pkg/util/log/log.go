@@ -1,32 +1,29 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package log
 
 import (
 	"context"
 	"fmt"
-	"io"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/petermattis/goid"
 )
 
 func init() {
-	copyStandardLogTo("INFO")
+	errors.SetWarningFn(Warningf)
 }
 
 // FatalOnPanic recovers from a panic and exits the process with a
@@ -37,14 +34,6 @@ func FatalOnPanic() {
 	if r := recover(); r != nil {
 		Fatalf(context.Background(), "unexpected panic: %s", r)
 	}
-}
-
-// SetExitFunc allows setting a function that will be called to exit the
-// process when a Fatal message is generated.
-func SetExitFunc(f func(int)) {
-	logging.mu.Lock()
-	defer logging.mu.Unlock()
-	logging.exitFunc = f
 }
 
 // logDepth uses the PrintWith to format the output string and
@@ -58,11 +47,19 @@ func logDepth(ctx context.Context, depth int, sev Severity, format string, args 
 // Shout logs to the specified severity's log, and also to the real
 // stderr if logging is currently redirected to a file.
 func Shout(ctx context.Context, sev Severity, args ...interface{}) {
-	logDepth(ctx, 1, sev, "", args)
-	if stderrRedirected {
+	if sev == Severity_FATAL {
+		// Fatal error handling later already tries to exit even if I/O should
+		// block, but crash reporting might also be in the way.
+		t := time.AfterFunc(10*time.Second, func() {
+			os.Exit(1)
+		})
+		defer t.Stop()
+	}
+	if mainLog.stderrRedirected() {
 		fmt.Fprintf(OrigStderr, "*\n* %s: %s\n*\n", sev.String(),
 			strings.Replace(MakeMessage(ctx, "", args), "\n", "\n* ", -1))
 	}
+	logDepth(ctx, 1, sev, "", args)
 }
 
 // Infof logs to the INFO log.
@@ -79,6 +76,15 @@ func Infof(ctx context.Context, format string, args ...interface{}) {
 // appended.
 func Info(ctx context.Context, args ...interface{}) {
 	logDepth(ctx, 1, Severity_INFO, "", args)
+}
+
+// InfoDepth logs to the INFO log, offsetting the caller's stack frame by
+// 'depth'.
+// It extracts log tags from the context and logs them along with the given
+// message. Arguments are handled in the manner of fmt.Print; a newline is
+// appended.
+func InfoDepth(ctx context.Context, depth int, args ...interface{}) {
+	logDepth(ctx, depth+1, Severity_INFO, "", args)
 }
 
 // InfofDepth logs to the INFO log, offsetting the caller's stack frame by
@@ -188,7 +194,7 @@ func V(level int32) bool {
 // enabled or whether a trace.EventLog or a trace.Trace (i.e. sp.netTr) is
 // attached to ctx. In particular, if some OpenTracing collection is enabled
 // (e.g. LightStep), that, by itself, does NOT cause the expensive messages to
-// be enabled. SHOW TRACE FOR <stmt> and friends, on the other hand, does cause
+// be enabled. "SET tracing" and friends, on the other hand, does cause
 // these messages to be enabled, as it shows that a user has expressed
 // particular interest in a trace.
 //
@@ -209,29 +215,4 @@ func ExpensiveLogEnabled(ctx context.Context, level int32) bool {
 		return true
 	}
 	return false
-}
-
-// MakeEntry creates an Entry.
-func MakeEntry(s Severity, t int64, file string, line int, msg string) Entry {
-	return Entry{
-		Severity:  s,
-		Time:      t,
-		Goroutine: goid.Get(),
-		File:      file,
-		Line:      int64(line),
-		Message:   msg,
-	}
-}
-
-// Format writes the log entry to the specified writer.
-func (e Entry) Format(w io.Writer) error {
-	buf := formatLogEntry(e, nil, nil)
-	defer logging.putBuffer(buf)
-	_, err := w.Write(buf.Bytes())
-	return err
-}
-
-// SetVModule alters the vmodule logging level to the passed in value.
-func SetVModule(value string) error {
-	return logging.vmodule.Set(value)
 }

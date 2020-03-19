@@ -1,20 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
-
-import "bytes"
 
 // ReturningClause represents the returning clause on a statement.
 type ReturningClause interface {
@@ -33,9 +27,9 @@ var _ ReturningClause = &NoReturningClause{}
 type ReturningExprs SelectExprs
 
 // Format implements the NodeFormatter interface.
-func (r *ReturningExprs) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString(" RETURNING ")
-	FormatNode(buf, f, SelectExprs(*r))
+func (r *ReturningExprs) Format(ctx *FmtCtx) {
+	ctx.WriteString("RETURNING ")
+	ctx.FormatNode((*SelectExprs)(r))
 }
 
 // ReturningNothingClause is a shared instance to avoid unnecessary allocations.
@@ -45,8 +39,8 @@ var ReturningNothingClause = &ReturningNothing{}
 type ReturningNothing struct{}
 
 // Format implements the NodeFormatter interface.
-func (*ReturningNothing) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString(" RETURNING NOTHING")
+func (*ReturningNothing) Format(ctx *FmtCtx) {
+	ctx.WriteString("RETURNING NOTHING")
 }
 
 // AbsentReturningClause is a ReturningClause variant representing the absence of
@@ -57,7 +51,7 @@ var AbsentReturningClause = &NoReturningClause{}
 type NoReturningClause struct{}
 
 // Format implements the NodeFormatter interface.
-func (*NoReturningClause) Format(buf *bytes.Buffer, f FmtFlags) {}
+func (*NoReturningClause) Format(_ *FmtCtx) {}
 
 // used by parent statements to determine their own StatementType.
 func (*ReturningExprs) statementType() StatementType    { return Rows }

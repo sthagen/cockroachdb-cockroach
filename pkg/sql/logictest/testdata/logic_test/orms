@@ -1,4 +1,6 @@
-# LogicTest: default parallel-stmts distsql
+# TODO(mjibson): The fakedist-disk config produces an error. When fixed,
+# remove this config line. See #38985.
+# LogicTest: local fakedist fakedist-metadata
 
 ## This test file contains various complex queries that ORMs issue during
 ## startup or general use.
@@ -17,11 +19,13 @@ SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.a
     AND a.attnum > 0 AND NOT a.attisdropped
     ORDER BY a.attnum
 ----
-id   bigint  NULL  false  20  -1
-name text    NULL  false  25  -1
+id     bigint  NULL            false  20  -1
+name   text    NULL            false  25  -1
+rowid  bigint  unique_rowid()  true   20  -1
 
 
-## 12115
+# Ordered aggregations are possible.
+# #12115
 query TT
 SELECT t.typname enum_name, array_agg(e.enumlabel ORDER BY enumsortorder) enum_value
     FROM pg_type t
@@ -48,8 +52,8 @@ SELECT i.relname AS name,
        ix.indisprimary AS PRIMARY,
        ix.indisunique AS UNIQUE,
        ix.indkey AS indkey,
-       ARRAY_AGG(a.attnum) AS column_indexes,
-       ARRAY_AGG(a.attname) AS column_names,
+       array_agg(a.attnum) AS column_indexes,
+       array_agg(a.attname) AS column_names,
        pg_get_indexdef(ix.indexrelid) AS definition
 FROM pg_class t,
      pg_class i,
@@ -67,9 +71,9 @@ GROUP BY i.relname,
          ix.indkey
 ORDER BY i.relname
 ----
-name              primary  unique  indkey  column_indexes  column_names      definition
-customers_id_idx  false    false   2       {1,2}           {"name","id"}     CREATE INDEX customers_id_idx ON test.customers (id ASC)
-primary           true     true    1       {1,2}           {"name","id"}     CREATE UNIQUE INDEX "primary" ON test.customers ("name" ASC)
+name              primary  unique  indkey  column_indexes  column_names  definition
+customers_id_idx  false    false   2       {1,2}           {name,id}     CREATE INDEX customers_id_idx ON test.public.customers USING btree (id ASC)
+primary           true     true    1       {1,2}           {name,id}     CREATE UNIQUE INDEX "primary" ON test.public.customers USING btree (name ASC)
 
 
 query TT colnames
@@ -81,6 +85,7 @@ JOIN   pg_attribute a ON a.attrelid = i.indrelid
                      AND    i.indisprimary
 ----
 attname  data_type
+rowid    bigint
 
 statement ok
 CREATE TABLE b (id INT, a_id INT, FOREIGN KEY (a_id) REFERENCES a (id))
@@ -108,10 +113,13 @@ SELECT 'decimal(18,2)'::regtype::oid
 ----
 1700
 
+# NOTE: Before 19.2, this returned 25 (oid.T_text), but due to updates to the
+# type system to more correctly handle OIDs, this now returns 1043
+# (oid.T_varchar), which is what PG returns.
 query O
 SELECT 'character varying'::regtype::oid
 ----
-25
+1043
 
 statement ok
 CREATE INDEX b_idx ON b(a_id);
@@ -119,7 +127,7 @@ CREATE INDEX b_idx ON b(a_id);
 # ActiveRecord 4.2.x query for checking if an index exists
 # Relies on OID IN tuple support
 query I
-SELECT COUNT(*)
+SELECT count(*)
 FROM pg_class t
 INNER JOIN pg_index d ON t.oid = d.indrelid
 INNER JOIN pg_class i ON d.indexrelid = i.oid
@@ -129,3 +137,113 @@ AND t.relname = 'b'
 AND i.relnamespace IN (SELECT oid FROM pg_namespace WHERE nspname = ANY (current_schemas(false)))
 ----
 1
+
+statement ok
+CREATE TABLE c (a INT, b INT, PRIMARY KEY (a, b))
+
+# ActiveRecord query for determining primary key cols.
+query T
+SELECT
+    a.attname
+FROM
+    (
+        SELECT
+            indrelid, indkey, generate_subscripts(indkey, 1) AS idx
+        FROM
+            pg_index
+        WHERE
+            indrelid = '"c"'::REGCLASS AND indisprimary
+    )
+        AS i
+    JOIN pg_attribute AS a ON
+            a.attrelid = i.indrelid AND a.attnum = i.indkey[i.idx]
+ORDER BY
+    i.idx
+----
+a
+b
+
+statement ok
+CREATE TABLE metatest (a INT PRIMARY KEY)
+
+# ActiveRecord query that needs apply join.
+query TTTBTITT
+SELECT a.attname,
+  format_type(a.atttypid, a.atttypmod),
+  pg_get_expr(d.adbin, d.adrelid),
+  a.attnotnull,
+  a.atttypid,
+  a.atttypmod,
+  (SELECT c.collname
+   FROM pg_collation c, pg_type t
+   WHERE c.oid = a.attcollation
+   AND t.oid = a.atttypid
+   AND a.attcollation <> t.typcollation),
+   col_description(a.attrelid, a.attnum) AS comment
+FROM pg_attribute a LEFT JOIN pg_attrdef d
+ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+WHERE a.attrelid = '"metatest"'::regclass
+AND a.attnum > 0 AND NOT a.attisdropped
+ORDER BY a.attnum
+----
+a  bigint  NULL  true  20  -1  NULL  NULL
+
+# Navicat metadata query.
+
+query TTBBB
+SELECT
+    attname AS name,
+    attrelid AS tid,
+    COALESCE(
+        (
+            SELECT
+                attnum = ANY conkey
+            FROM
+                pg_constraint
+            WHERE
+                contype = 'p' AND conrelid = attrelid
+        ),
+        false
+    )
+        AS primarykey,
+    NOT (attnotnull) AS allownull,
+    (
+        SELECT
+            seq.oid
+        FROM
+            pg_class AS seq
+            LEFT JOIN pg_depend AS dep
+            ON seq.oid = dep.objid
+        WHERE
+            (
+                seq.relkind = 'S'::CHAR
+                AND dep.refobjsubid = attnum
+            )
+            AND dep.refobjid = attrelid
+    )
+    IS NOT NULL
+        AS autoincrement
+FROM
+    pg_attribute
+WHERE
+    (
+        attisdropped = false
+        AND attrelid
+            = (
+                    SELECT
+                        tbl.oid
+                    FROM
+                        pg_class AS tbl
+                        LEFT JOIN pg_namespace AS sch
+                        ON tbl.relnamespace = sch.oid
+                    WHERE
+                        (
+                            tbl.relkind = 'r'::"char"
+                            AND tbl.relname = 'metatest'
+                        )
+                        AND sch.nspname = 'public'
+                )
+    )
+    AND attname = 'a';
+----
+a  57  true  false  false

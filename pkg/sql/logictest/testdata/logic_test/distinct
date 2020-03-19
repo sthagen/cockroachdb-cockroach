@@ -1,5 +1,3 @@
-# LogicTest: default parallel-stmts distsql distsql-disk
-
 statement ok
 CREATE TABLE xyz (
   x INT PRIMARY KEY,
@@ -47,16 +45,6 @@ SELECT y FROM (SELECT DISTINCT y, z FROM xyz)
 3
 2
 
-# TODO(vivek): Use the secondary index. Use distinct in index selection.
-query TTT
-EXPLAIN SELECT DISTINCT y, z FROM xyz
-----
-distinct        ·      ·
- └── render     ·      ·
-      └── scan  ·      ·
-·               table  xyz@primary
-·               spans  ALL
-
 query II partialsort(2)
 SELECT DISTINCT y, z FROM xyz ORDER BY z
 ----
@@ -65,16 +53,6 @@ SELECT DISTINCT y, z FROM xyz ORDER BY z
 2 6
 5 6
 2 9
-
-query TTT
-EXPLAIN SELECT DISTINCT y, z FROM xyz ORDER BY z
-----
-distinct        ·          ·
- │              order key  y, z
- └── render     ·          ·
-      └── scan  ·          ·
-·               table      xyz@foo
-·               spans      ALL
 
 query II partialsort(1)
 SELECT DISTINCT y, z FROM xyz ORDER BY y
@@ -85,18 +63,6 @@ SELECT DISTINCT y, z FROM xyz ORDER BY y
 3 5
 5 6
 
-query TTT
-EXPLAIN SELECT DISTINCT y, z FROM xyz ORDER BY y
-----
-distinct             ·          ·
- │                   order key  y
- └── sort            ·          ·
-      │              order      +y
-      └── render     ·          ·
-           └── scan  ·          ·
-·                    table      xyz@foo
-·                    spans      ALL
-
 query II
 SELECT DISTINCT y, z FROM xyz ORDER BY y, z
 ----
@@ -106,18 +72,6 @@ SELECT DISTINCT y, z FROM xyz ORDER BY y, z
 3 5
 5 6
 
-query TTT
-EXPLAIN SELECT DISTINCT y, z FROM xyz ORDER BY y, z
-----
-distinct             ·          ·
- │                   order key  y, z
- └── sort            ·          ·
-      │              order      +y,+z
-      └── render     ·          ·
-           └── scan  ·          ·
-·                    table      xyz@foo
-·                    spans      ALL
-
 query I
 SELECT DISTINCT y + z FROM xyz ORDER by (y + z)
 ----
@@ -125,35 +79,14 @@ SELECT DISTINCT y + z FROM xyz ORDER by (y + z)
 8
 11
 
-query TTT
-EXPLAIN SELECT DISTINCT y + z FROM xyz ORDER BY y + z
+query II
+SELECT DISTINCT y AS w, z FROM xyz ORDER by z, w
 ----
-distinct             ·          ·
- │                   order key  y + z
- └── sort            ·          ·
-      │              order      +"y + z"
-      └── render     ·          ·
-           └── scan  ·          ·
-·                    table      xyz@primary
-·                    spans      ALL
-
-query I
-SELECT DISTINCT y AS w FROM xyz ORDER by z
-----
-2
-3
-5
-
-query TTT
-EXPLAIN SELECT DISTINCT y AS w FROM xyz ORDER BY z
-----
-distinct             ·      ·
- └── nosort          ·      ·
-      │              order  +z
-      └── render     ·      ·
-           └── scan  ·      ·
-·                    table  xyz@foo
-·                    spans  ALL
+2  3
+3  5
+2  6
+5  6
+2  9
 
 query I
 SELECT DISTINCT y AS w FROM xyz ORDER by y
@@ -161,18 +94,6 @@ SELECT DISTINCT y AS w FROM xyz ORDER by y
 2
 3
 5
-
-query TTT
-EXPLAIN SELECT DISTINCT y AS w FROM xyz ORDER BY y
-----
-distinct             ·          ·
- │                   order key  w
- └── sort            ·          ·
-      │              order      +w
-      └── render     ·          ·
-           └── scan  ·          ·
-·                    table      xyz@foo
-·                    spans      ALL
 
 # Insert NULL values for z.
 statement ok
@@ -199,85 +120,15 @@ SELECT DISTINCT (y,z) FROM xyz
 (2,)
 
 query I
-SELECT COUNT(*) FROM (SELECT DISTINCT y FROM xyz)
+SELECT count(*) FROM (SELECT DISTINCT y FROM xyz)
 ----
 3
-
-
-query TITTTTT
-EXPLAIN (METADATA) SELECT DISTINCT x FROM xyz
-----
-render     0  render  ·      ·            (x)  x!=NULL; key(x)
- └── scan  1  scan    ·      ·            (x)  x!=NULL; key(x)
-·          1  ·       table  xyz@primary  ·    ·
-·          1  ·       spans  ALL          ·    ·
-
-query TITTTTT
-EXPLAIN (METADATA) SELECT DISTINCT x, y, z FROM xyz
-----
-scan  0  scan  ·      ·            (x, y, z)  x!=NULL; key(x)
-·     0  ·     table  xyz@primary  ·          ·
-·     0  ·     spans  ALL          ·          ·
-
-statement ok
-CREATE TABLE abcd (
-  a INT,
-  b INT,
-  c INT,
-  d INT NOT NULL,
-  PRIMARY KEY (a, b, c),
-  UNIQUE INDEX (d, b)
-)
-
-query TITTTTT
-EXPLAIN (METADATA) SELECT DISTINCT 1, d, b FROM abcd ORDER BY d, b
-----
-render     0  render  ·      ·                  ("1", d, b)  "1"=CONST; d!=NULL; b!=NULL; key(d,b); +d,+b
- └── scan  1  scan    ·      ·                  ("1", d, b)  "1"=CONST; d!=NULL; b!=NULL; key(d,b); +d,+b
-·          1  ·       table  abcd@abcd_d_b_key  ·            ·
-·          1  ·       spans  ALL                ·            ·
-
-query TITTTTT
-EXPLAIN (METADATA) SELECT DISTINCT a, b FROM abcd
-----
-distinct        0  distinct  ·          ·             (a, b)  a!=NULL; b!=NULL; key(a,b); +a,+b
- │              0  ·         order key  a, b          ·       ·
- └── render     1  render    ·          ·             (a, b)  a!=NULL; b!=NULL; key(a,b); +a,+b
-      └── scan  2  scan      ·          ·             (a, b)  a!=NULL; b!=NULL; key(a,b); +a,+b
-·               2  ·         table      abcd@primary  ·       ·
-·               2  ·         spans      ALL           ·       ·
-
-query TITTTTT
-EXPLAIN (METADATA) SELECT DISTINCT a, b, c FROM abcd
-----
-render     0  render  ·      ·             (a, b, c)  a!=NULL; b!=NULL; c!=NULL; key(a,b,c)
- └── scan  1  scan    ·      ·             (a, b, c)  a!=NULL; b!=NULL; c!=NULL; key(a,b,c)
-·          1  ·       table  abcd@primary  ·          ·
-·          1  ·       spans  ALL           ·          ·
-
-query TITTTTT
-EXPLAIN (METADATA) SELECT DISTINCT a, b, c, d FROM abcd
-----
-scan  0  scan  ·      ·             (a, b, c, d)  a!=NULL; b!=NULL; c!=NULL; key(a,b,c)
-·     0  ·     table  abcd@primary  ·             ·
-·     0  ·     spans  ALL           ·             ·
 
 statement ok
 CREATE TABLE kv (k INT PRIMARY KEY, v INT, UNIQUE INDEX idx(v))
 
 statement ok
 INSERT INTO kv VALUES (1, 1), (2, 2), (3, NULL), (4, NULL), (5, 5), (6, NULL)
-
-query TITTTTT colnames
-EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv
-----
-Tree            Level  Type      Field     Description  Columns  Ordering
-distinct        0      distinct  ·         ·            (v)      weak-key(v)
- └── render     1      render    ·         ·            (v)      weak-key(v)
-      │         1      ·         render 0  test.kv.v    ·        ·
-      └── scan  2      scan      ·         ·            (v)      weak-key(v)
-·               2      ·         table     kv@primary   ·        ·
-·               2      ·         spans     ALL          ·        ·
 
 query I rowsort
 SELECT DISTINCT v FROM kv
@@ -287,19 +138,6 @@ NULL
 2
 5
 
-# Verify we don't incorrectly elide the distinct node when we only have a weak key (#19343).
-query TITTTTT colnames
-EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv@idx
-----
-Tree            Level  Type      Field      Description  Columns  Ordering
-distinct        0      distinct  ·          ·            (v)      weak-key(v); +v
- │              0      ·         order key  v            ·        ·
- └── render     1      render    ·          ·            (v)      weak-key(v); +v
-      │         1      ·         render 0   test.kv.v    ·        ·
-      └── scan  2      scan      ·          ·            (v)      weak-key(v); +v
-·               2      ·         table      kv@idx       ·        ·
-·               2      ·         spans      ALL          ·        ·
-
 query I rowsort
 SELECT DISTINCT v FROM kv@idx
 ----
@@ -308,17 +146,6 @@ NULL
 2
 5
 
-# Here we can infer that v is not-NULL so eliding the node is correct.
-query TITTTTT colnames
-EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv@idx WHERE v > 0
-----
-Tree       Level  Type    Field     Description  Columns  Ordering
-render     0      render  ·         ·            (v)      v!=NULL; key(v)
- │         0      ·       render 0  test.kv.v    ·        ·
- └── scan  1      scan    ·         ·            (v)      v!=NULL; key(v)
-·          1      ·       table     kv@idx       ·        ·
-·          1      ·       spans     /1-          ·        ·
-
 query I rowsort
 SELECT DISTINCT v FROM kv@idx WHERE v > 0
 ----
@@ -326,16 +153,60 @@ SELECT DISTINCT v FROM kv@idx WHERE v > 0
 2
 5
 
+# Regression test for #44296.
 statement ok
-CREATE TABLE kv2 (k INT PRIMARY KEY, v INT NOT NULL, UNIQUE INDEX idx(v))
+CREATE TABLE t0(c0 INT UNIQUE);
 
-# In this case it is correct to elide the distinct node.
-query TITTTTT colnames
-EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv2@idx
+statement ok
+CREATE VIEW v0(c0) AS SELECT DISTINCT t0.c0 FROM t0;
+
+statement ok
+INSERT INTO t0 (c0) VALUES (NULL), (NULL);
+
+query I
+SELECT * FROM v0 WHERE v0.c0 IS NULL
 ----
-Tree       Level  Type    Field     Description  Columns  Ordering
-render     0      render  ·         ·            (v)      v!=NULL; key(v)
- │         0      ·       render 0  test.kv2.v   ·        ·
- └── scan  1      scan    ·         ·            (v)      v!=NULL; key(v)
-·          1      ·       table     kv2@idx      ·        ·
-·          1      ·       spans     ALL          ·        ·
+NULL
+
+# Regression test for #44079.
+statement ok
+CREATE TABLE t44079 (x INT[]);
+INSERT INTO t44079 VALUES (NULL), (ARRAY[NULL])
+
+query T rowsort
+SELECT DISTINCT * FROM t44079
+----
+NULL
+{NULL}
+
+statement ok
+DROP TABLE IF EXISTS t;
+CREATE TABLE t (x JSONB);
+INSERT INTO t VALUES
+  ('{"foo" : "bar"}'),
+  ('{"foo" : "bar"}'),
+  ('[1, 2]'),
+  ('[2, 1]'),
+  ('[1, 2]'),
+  ('{"foo": {"bar" : "baz"}}')
+
+query T rowsort
+SELECT DISTINCT (x) FROM t
+----
+[2, 1]
+[1, 2]
+{"foo": {"bar": "baz"}}
+{"foo": "bar"}
+
+statement ok
+DROP TABLE IF EXISTS t;
+CREATE TABLE t (x DECIMAL);
+INSERT INTO t VALUES (1.0), (1.00), (1.000)
+
+# We want to ensure that this only returns 1 element. We don't
+# check the element directly because it returns 1.0, 1.00, or
+# 1.000 non-deterministically in a distributed setting.
+query I
+SELECT COUNT (*) FROM (SELECT DISTINCT (array[x]) FROM t)
+----
+1

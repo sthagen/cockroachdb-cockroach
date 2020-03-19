@@ -1,157 +1,86 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
-	"math"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 )
 
 type alterSequenceNode struct {
 	n       *tree.AlterSequence
-	seqDesc *sqlbase.TableDescriptor
+	seqDesc *sqlbase.MutableTableDescriptor
 }
 
 // AlterSequence transforms a tree.AlterSequence into a plan node.
 func (p *planner) AlterSequence(ctx context.Context, n *tree.AlterSequence) (planNode, error) {
-	tn, err := n.Name.NormalizeWithDatabaseName(p.session.Database)
-	if err != nil {
-		return nil, err
-	}
-
-	seqDesc, err := getSequenceDesc(ctx, p.txn, p.getVirtualTabler(), tn)
+	seqDesc, err := p.ResolveMutableTableDescriptorEx(
+		ctx, n.Name, !n.IfExists, ResolveRequireSequenceDesc,
+	)
 	if err != nil {
 		return nil, err
 	}
 	if seqDesc == nil {
-		if n.IfExists {
-			return &zeroNode{}, nil
-		}
-		return nil, sqlbase.NewUndefinedRelationError(tn)
+		return newZeroNode(nil /* columns */), nil
 	}
 
-	if err := p.CheckPrivilege(seqDesc, privilege.CREATE); err != nil {
+	if err := p.CheckPrivilege(ctx, seqDesc, privilege.CREATE); err != nil {
 		return nil, err
 	}
 
 	return &alterSequenceNode{n: n, seqDesc: seqDesc}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because ALTER SEQUENCE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *alterSequenceNode) ReadingOwnWrites() {}
+
 func (n *alterSequenceNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounter("sequence"))
 	desc := n.seqDesc
 
-	err := assignSequenceOptions(desc.SequenceOpts, n.n.Options, false /* setDefaults */)
+	err := assignSequenceOptions(desc.SequenceOpts, n.n.Options, false /* setDefaults */, &params, desc.GetID())
 	if err != nil {
 		return err
 	}
 
-	if err := params.p.writeTableDesc(params.ctx, n.seqDesc); err != nil {
+	if err := params.p.writeSchemaChange(
+		params.ctx, n.seqDesc, sqlbase.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
+	); err != nil {
 		return err
 	}
 
 	// Record this sequence alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	if err := MakeEventLogger(params.p.LeaseMgr()).InsertEventRecord(
+	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
 		params.ctx,
 		params.p.txn,
 		EventLogAlterSequence,
 		int32(n.seqDesc.ID),
-		int32(params.evalCtx.NodeID),
+		int32(params.extendedEvalCtx.NodeID),
 		struct {
 			SequenceName string
 			Statement    string
 			User         string
-		}{n.seqDesc.Name, n.n.String(), params.p.session.User},
-	); err != nil {
-		return err
-	}
-
-	params.p.notifySchemaChange(n.seqDesc, sqlbase.InvalidMutationID)
-
-	return nil
+		}{params.p.ResolvedName(n.n.Name).FQString(), n.n.String(), params.SessionData().User},
+	)
 }
 
 func (n *alterSequenceNode) Next(runParams) (bool, error) { return false, nil }
 func (n *alterSequenceNode) Values() tree.Datums          { return tree.Datums{} }
 func (n *alterSequenceNode) Close(context.Context)        {}
-
-// assignSequenceOptions moves options from the AST node to the sequence options descriptor.
-func assignSequenceOptions(
-	optsDesc *sqlbase.TableDescriptor_SequenceOpts, optsNode tree.SequenceOptions, setDefaults bool,
-) error {
-	// All other defaults are dependent on the value of increment,
-	// i.e. whether the sequence is ascending or descending.
-	for _, option := range optsNode {
-		if option.Name == tree.SeqOptIncrement {
-			optsDesc.Increment = *option.IntVal
-		}
-	}
-	if optsDesc.Increment == 0 {
-		return pgerror.NewError(
-			pgerror.CodeInvalidParameterValueError, "INCREMENT must not be zero")
-	}
-	isAscending := optsDesc.Increment > 0
-
-	// Set increment-dependent defaults.
-	if setDefaults {
-		if isAscending {
-			optsDesc.MinValue = 1
-			optsDesc.MaxValue = math.MaxInt64
-			optsDesc.Start = optsDesc.MinValue
-		} else {
-			optsDesc.MinValue = math.MinInt64
-			optsDesc.MaxValue = -1
-			optsDesc.Start = optsDesc.MaxValue
-		}
-	}
-
-	// Fill in all other options.
-	optionsSeen := map[string]bool{}
-	for _, option := range optsNode {
-		// Error on duplicate options.
-		_, seenBefore := optionsSeen[option.Name]
-		if seenBefore {
-			return pgerror.NewError(pgerror.CodeSyntaxError, "conflicting or redundant options")
-		}
-		optionsSeen[option.Name] = true
-
-		switch option.Name {
-		case tree.SeqOptIncrement:
-			// Do nothing; this has already been set.
-		case tree.SeqOptMinValue:
-			// A value of nil represents the user explicitly saying `NO MINVALUE`.
-			if option.IntVal != nil {
-				optsDesc.MinValue = *option.IntVal
-			}
-		case tree.SeqOptMaxValue:
-			// A value of nil represents the user explicitly saying `NO MAXVALUE`.
-			if option.IntVal != nil {
-				optsDesc.MaxValue = *option.IntVal
-			}
-		case tree.SeqOptStart:
-			optsDesc.Start = *option.IntVal
-		case tree.SeqOptCycle:
-			optsDesc.Cycle = option.BoolVal
-		}
-	}
-
-	return nil
-}

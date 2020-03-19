@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include <cinttypes>
 #include <cstdint>
@@ -19,16 +15,22 @@
 #include <vector>
 #include "encoding.h"
 
+using namespace cockroach;
+
 TEST(Libroach, Encoding) {
   // clang-format off
   std::vector<uint32_t> cases32{
     0, 1, 2, 3,
     1 << 16, (1 << 16) - 1, (1 << 16) + 1,
     1 << 24, (1 << 24) - 1, (1 << 24) + 1,
-    UINT32_MAX, UINT32_MAX - 1,
+    UINT32_MAX - 1, UINT32_MAX,
   };
 
   std::vector<uint64_t> cases64{
+    0, 1, 2, 3,
+    1 << 16, (1 << 16) - 1, (1 << 16) + 1,
+    1 << 24, (1 << 24) - 1, (1 << 24) + 1,
+    UINT32_MAX - 1, UINT32_MAX,
     (1ULL << 32) + 1,
     1ULL << 40, (1ULL << 40) - 1, (1ULL << 40) + 1,
     1ULL << 48, (1ULL << 48) - 1, (1ULL << 48) + 1,
@@ -62,6 +64,15 @@ TEST(Libroach, Encoding) {
     uint64_t out;
     rocksdb::Slice slice(buf);
     DecodeUint64(&slice, &out);
+    EXPECT_EQ(*it, out);
+  }
+
+  for (auto it = cases64.begin(); it != cases64.end(); it++) {
+    std::string buf;
+    EncodeUvarint64(&buf, *it);
+    uint64_t out;
+    rocksdb::Slice slice(buf);
+    DecodeUvarint64(&slice, &out);
     EXPECT_EQ(*it, out);
   }
 }

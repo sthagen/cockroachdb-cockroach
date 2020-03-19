@@ -5,7 +5,6 @@ source [file join [file dirname $argv0] common.tcl]
 start_server $argv
 
 spawn $argv sql
-eexpect root@
 
 start_test "Check that a syntax error can make suggestions."
 send "select * from;\r"
@@ -109,7 +108,7 @@ start_test "Check that a ?? in a function call context prints help about that fu
 send "select count(??\r"
 eexpect "Function: "
 eexpect "count"
-eexpect "built-in functions"
+eexpect "number of selected elements"
 eexpect "Signature"
 eexpect "See also"
 eexpect root@
@@ -117,7 +116,7 @@ eexpect root@
 send "select count(??\t"
 eexpect "Function: "
 eexpect "count"
-eexpect "built-in functions"
+eexpect "number of selected elements"
 eexpect "Signature"
 eexpect "See also"
 eexpect "select count(??"
@@ -131,5 +130,17 @@ end_test
 # Finally terminate with Ctrl+C.
 interrupt
 eexpect eof
+
+start_test "Check that the hint for a single ? is also printed in non-interactive sessions."
+spawn /bin/bash
+
+send "echo '?' | $argv sql\r"
+eexpect "Note:"
+eexpect JSON
+eexpect "use '??'"
+
+send "exit\r"
+eexpect eof
+end_test
 
 stop_server $argv

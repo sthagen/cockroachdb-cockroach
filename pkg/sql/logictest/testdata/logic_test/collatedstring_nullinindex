@@ -1,5 +1,3 @@
-# LogicTest: default parallel-stmts distsql distsql-disk
-
 statement ok
 CREATE TABLE t (
   a INT PRIMARY KEY,

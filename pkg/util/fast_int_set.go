@@ -1,23 +1,18 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package util
 
 import (
 	"bytes"
 	"fmt"
-	math "math"
 	"math/bits"
 
 	"golang.org/x/tools/container/intsets"
@@ -43,6 +38,7 @@ func MakeFastIntSet(vals ...int) FastIntSet {
 }
 
 // We store bits for values smaller than this cutoff.
+// Note: this can be set to a smaller value, e.g. for testing.
 const smallCutoff = 64
 
 func (s *FastIntSet) toLarge() *intsets.Sparse {
@@ -94,7 +90,7 @@ func (s *FastIntSet) AddRange(from, to int) {
 	if from >= 0 && to < smallCutoff && s.large == nil {
 		nValues := to - from + 1
 		// Fast path.
-		s.small |= (math.MaxUint64 >> uint64(smallCutoff-nValues)) << uint64(from)
+		s.small |= (1<<uint64(nValues) - 1) << uint64(from)
 		return
 	}
 
@@ -200,6 +196,22 @@ func (s FastIntSet) Copy() FastIntSet {
 	return c
 }
 
+// CopyFrom sets the receiver to a copy of other, which can then be modified
+// independently.
+func (s *FastIntSet) CopyFrom(other FastIntSet) {
+	if other.large != nil {
+		if s.large == nil {
+			s.large = new(intsets.Sparse)
+		}
+		s.large.Copy(other.large)
+	} else {
+		s.small = other.small
+		if s.large != nil {
+			s.large.Clear()
+		}
+	}
+}
+
 // UnionWith adds all the elements from rhs to this set.
 func (s *FastIntSet) UnionWith(rhs FastIntSet) {
 	if s.large == nil && rhs.large == nil {
@@ -212,7 +224,13 @@ func (s *FastIntSet) UnionWith(rhs FastIntSet) {
 		s.large = s.toLarge()
 		s.small = 0
 	}
-	s.large.UnionWith(rhs.toLarge())
+	if rhs.large == nil {
+		for i, ok := rhs.Next(0); ok; i, ok = rhs.Next(i + 1) {
+			s.large.Insert(i)
+		}
+	} else {
+		s.large.UnionWith(rhs.large)
+	}
 }
 
 // Union returns the union of s and rhs as a new set.
@@ -336,7 +354,7 @@ func (s *FastIntSet) Shift(delta int) FastIntSet {
 	if s.large == nil {
 		// Fast paths.
 		if delta > 0 {
-			if bits.LeadingZeros64(s.small) >= delta {
+			if bits.LeadingZeros64(s.small)-(64-smallCutoff) >= delta {
 				return FastIntSet{small: s.small << uint32(delta)}
 			}
 		} else {

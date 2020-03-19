@@ -1,2 +1,0 @@
-opt_interleave ::=
-	'INTERLEAVE' 'IN' 'PARENT' qualified_name '(' interleave_prefix ')'

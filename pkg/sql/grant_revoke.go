@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -20,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/pkg/errors"
 )
 
@@ -33,9 +30,20 @@ import (
 //   Notes: postgres requires the object owner.
 //          mysql requires the "grant option" and the same privileges, and sometimes superuser.
 func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
-	return p.changePrivileges(ctx, n.Targets, n.Grantees, func(privDesc *sqlbase.PrivilegeDescriptor, grantee string) {
-		privDesc.Grant(grantee, n.Privileges)
-	})
+	if n.Targets.Databases != nil {
+		sqltelemetry.IncIAMGrantPrivilegesCounter(sqltelemetry.OnDatabase)
+	} else {
+		sqltelemetry.IncIAMGrantPrivilegesCounter(sqltelemetry.OnTable)
+	}
+
+	return &changePrivilegesNode{
+		targets:      n.Targets,
+		grantees:     n.Grantees,
+		desiredprivs: n.Privileges,
+		changePrivilege: func(privDesc *sqlbase.PrivilegeDescriptor, grantee string) {
+			privDesc.Grant(grantee, n.Privileges)
+		},
+	}, nil
 }
 
 // Revoke removes privileges from users.
@@ -48,66 +56,120 @@ func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
 //   Notes: postgres requires the object owner.
 //          mysql requires the "grant option" and the same privileges, and sometimes superuser.
 func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) {
-	return p.changePrivileges(ctx, n.Targets, n.Grantees, func(privDesc *sqlbase.PrivilegeDescriptor, grantee string) {
-		privDesc.Revoke(grantee, n.Privileges)
-	})
+	if n.Targets.Databases != nil {
+		sqltelemetry.IncIAMRevokePrivilegesCounter(sqltelemetry.OnDatabase)
+	} else {
+		sqltelemetry.IncIAMRevokePrivilegesCounter(sqltelemetry.OnTable)
+	}
+
+	return &changePrivilegesNode{
+		targets:      n.Targets,
+		grantees:     n.Grantees,
+		desiredprivs: n.Privileges,
+		changePrivilege: func(privDesc *sqlbase.PrivilegeDescriptor, grantee string) {
+			privDesc.Revoke(grantee, n.Privileges)
+		},
+	}, nil
 }
 
-func (p *planner) changePrivileges(
-	ctx context.Context,
-	targets tree.TargetList,
-	grantees tree.NameList,
-	changePrivilege func(*sqlbase.PrivilegeDescriptor, string),
-) (planNode, error) {
+type changePrivilegesNode struct {
+	targets         tree.TargetList
+	grantees        tree.NameList
+	desiredprivs    privilege.List
+	changePrivilege func(*sqlbase.PrivilegeDescriptor, string)
+}
+
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because GRANT/REVOKE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *changePrivilegesNode) ReadingOwnWrites() {}
+
+func (n *changePrivilegesNode) startExec(params runParams) error {
+	ctx := params.ctx
+	p := params.p
 	// Check whether grantees exists
-	users, err := GetAllUsers(ctx, p)
+	users, err := p.GetAllRoles(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	for _, grantee := range grantees {
+
+	// We're allowed to grant/revoke privileges to/from the "public" role even though
+	// it does not exist: add it to the list of all users and roles.
+	users[sqlbase.PublicRole] = true // isRole
+
+	for _, grantee := range n.grantees {
 		if _, ok := users[string(grantee)]; !ok {
-			return nil, errors.Errorf("user %s does not exist", grantee)
+			return errors.Errorf("user or role %s does not exist", &grantee)
 		}
 	}
 
-	descriptors, err := getDescriptorsFromTargetList(ctx, p.txn, p.getVirtualTabler(), p.session.Database, targets)
+	var descriptors []sqlbase.DescriptorProto
+	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
+	// TODO(vivek): check if the cache can be used.
+	p.runWithOptions(resolveFlags{skipCache: true}, func() {
+		descriptors, err = getDescriptorsFromTargetList(ctx, p, n.targets)
+	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 
+	// First, update the descriptors. We want to catch all errors before
+	// we update them in KV below.
+	b := p.txn.NewBatch()
 	for _, descriptor := range descriptors {
-		if err := p.CheckPrivilege(descriptor, privilege.GRANT); err != nil {
-			return nil, err
+		if err := p.CheckPrivilege(ctx, descriptor, privilege.GRANT); err != nil {
+			return err
 		}
+
+		// Only allow granting/revoking privileges that the requesting
+		// user themselves have on the descriptor.
+		for _, priv := range n.desiredprivs {
+			if err := p.CheckPrivilege(ctx, descriptor, priv); err != nil {
+				return err
+			}
+		}
+
 		privileges := descriptor.GetPrivileges()
-		for _, grantee := range grantees {
-			changePrivilege(privileges, string(grantee))
+		for _, grantee := range n.grantees {
+			n.changePrivilege(privileges, string(grantee))
+		}
+
+		// Validate privilege descriptors directly as the db/table level Validate
+		// may fix up the descriptor.
+		if err := privileges.Validate(descriptor.GetID()); err != nil {
+			return err
 		}
 
 		switch d := descriptor.(type) {
 		case *sqlbase.DatabaseDescriptor:
 			if err := d.Validate(); err != nil {
-				return nil, err
+				return err
 			}
-		case *sqlbase.TableDescriptor:
-			if err := d.Validate(ctx, p.txn); err != nil {
-				return nil, err
+			if err := writeDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(), p.execCfg.Settings, b, descriptor.GetID(), descriptor); err != nil {
+				return err
 			}
-			if err := d.SetUpVersion(); err != nil {
-				return nil, err
+
+		case *sqlbase.MutableTableDescriptor:
+			// TODO (lucy): This should probably have a single consolidated job like
+			// DROP DATABASE.
+			// TODO (lucy): Have more consistent/informative names for dependent jobs.
+			if err := p.createOrUpdateSchemaChangeJob(
+				ctx, d, "updating privileges", sqlbase.InvalidMutationID,
+			); err != nil {
+				return err
 			}
-			p.notifySchemaChange(d, sqlbase.InvalidMutationID)
+			if !d.Dropped() {
+				if err := p.writeSchemaChangeToBatch(ctx, d, b); err != nil {
+					return err
+				}
+			}
 		}
 	}
 
 	// Now update the descriptors transactionally.
-	b := p.txn.NewBatch()
-	for _, descriptor := range descriptors {
-		descKey := sqlbase.MakeDescMetadataKey(descriptor.GetID())
-		b.Put(descKey, sqlbase.WrapDescriptor(descriptor))
-	}
-	if err := p.txn.Run(ctx, b); err != nil {
-		return nil, err
-	}
-	return &zeroNode{}, nil
+	return p.txn.Run(ctx, b)
 }
+
+func (*changePrivilegesNode) Next(runParams) (bool, error) { return false, nil }
+func (*changePrivilegesNode) Values() tree.Datums          { return tree.Datums{} }
+func (*changePrivilegesNode) Close(context.Context)        {}

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cluster
 
@@ -29,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -39,8 +37,6 @@ import (
 	"github.com/docker/go-connections/nat"
 	isatty "github.com/mattn/go-isatty"
 	"github.com/pkg/errors"
-
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // Retrieve the IP address of docker itself.
@@ -257,9 +253,6 @@ func (c *Container) Remove(ctx context.Context) error {
 
 // Kill stops a running container, without removing it.
 func (c *Container) Kill(ctx context.Context) error {
-	// Paused containers cannot be killed. Attempt to unpause it first
-	// (which might fail) before killing.
-	_ = c.Unpause(ctx)
 	if err := c.cluster.client.ContainerKill(ctx, c.id, "9"); err != nil && !strings.Contains(err.Error(), "is not running") {
 		return err
 	}
@@ -272,20 +265,6 @@ func (c *Container) Kill(ctx context.Context) error {
 // TODO(pmattis): Generalize the setting of parameters here.
 func (c *Container) Start(ctx context.Context) error {
 	return c.cluster.client.ContainerStart(ctx, c.id, types.ContainerStartOptions{})
-}
-
-// Pause pauses a running container.
-func (c *Container) Pause(ctx context.Context) error {
-	return c.cluster.client.ContainerPause(ctx, c.id)
-}
-
-// TODO(pmattis): Container.Pause is neither used or tested. Silence unused
-// warning.
-var _ = (*Container).Pause
-
-// Unpause resumes a paused container.
-func (c *Container) Unpause(ctx context.Context) error {
-	return c.cluster.client.ContainerUnpause(ctx, c.id)
 }
 
 // Restart restarts a running container.
@@ -303,19 +282,6 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	c.cluster.expectEvent(c, append(exp, eventRestart)...)
 	return nil
 }
-
-// Stop a running container.
-func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
-	if err := c.cluster.client.ContainerStop(ctx, c.id, timeout); err != nil {
-		return err
-	}
-	c.cluster.expectEvent(c, eventDie)
-	return nil
-}
-
-// TODO(pmattis): Container.Stop is neither used or tested. Silence unused
-// warning.
-var _ = (*Container).Stop
 
 // Wait waits for a running container to exit.
 func (c *Container) Wait(ctx context.Context, condition container.WaitCondition) error {
@@ -416,16 +382,13 @@ func (cli resilientDockerClient) ContainerStart(
 	clientCtx context.Context, id string, opts types.ContainerStartOptions,
 ) error {
 	for {
-		err := func() error {
-			ctx, cancel := context.WithTimeout(clientCtx, 20*time.Second)
-			defer cancel()
-
+		err := contextutil.RunWithTimeout(clientCtx, "start container", 20*time.Second, func(ctx context.Context) error {
 			return cli.APIClient.ContainerStart(ctx, id, opts)
-		}()
+		})
 
 		// Keep going if ContainerStart timed out, but client's context is not
 		// expired.
-		if err == context.DeadlineExceeded && clientCtx.Err() == nil {
+		if errors.Cause(err) == context.DeadlineExceeded && clientCtx.Err() == nil {
 			log.Warningf(clientCtx, "ContainerStart timed out, retrying")
 			continue
 		}

@@ -7,41 +7,35 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This code was derived from https://github.com/youtube/vitess.
 
 package tree
 
-import "bytes"
-
 // Truncate represents a TRUNCATE statement.
 type Truncate struct {
-	Tables       TableNameReferences
+	Tables       TableNames
 	DropBehavior DropBehavior
 }
 
 // Format implements the NodeFormatter interface.
-func (node *Truncate) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("TRUNCATE TABLE ")
-	for i, n := range node.Tables {
-		if i > 0 {
-			buf.WriteString(", ")
-		}
-		FormatNode(buf, f, n)
+func (node *Truncate) Format(ctx *FmtCtx) {
+	ctx.WriteString("TRUNCATE TABLE ")
+	sep := ""
+	for i := range node.Tables {
+		ctx.WriteString(sep)
+		ctx.FormatNode(&node.Tables[i])
+		sep = ", "
 	}
 	if node.DropBehavior != DropDefault {
-		buf.WriteByte(' ')
-		buf.WriteString(node.DropBehavior.String())
+		ctx.WriteByte(' ')
+		ctx.WriteString(node.DropBehavior.String())
 	}
 }

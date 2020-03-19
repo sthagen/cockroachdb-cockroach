@@ -1,35 +1,34 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package base
 
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
+	"net"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/dustin/go-humanize"
-	"github.com/pkg/errors"
-	"github.com/spf13/pflag"
-
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	humanize "github.com/dustin/go-humanize"
+	"github.com/pkg/errors"
+	"github.com/spf13/pflag"
 )
 
 // This file implements method receivers for members of server.Config struct
@@ -56,20 +55,127 @@ func GetAbsoluteStorePath(fieldName string, p string) (string, error) {
 	return ret, nil
 }
 
+// SizeSpec contains size in different kinds of formats supported by CLI(%age, bytes).
+type SizeSpec struct {
+	// InBytes is used for calculating free space and making rebalancing
+	// decisions. Zero indicates that there is no maximum size. This value is not
+	// actually used by the engine and thus not enforced.
+	InBytes int64
+	Percent float64
+}
+
+type intInterval struct {
+	min *int64
+	max *int64
+}
+
+type floatInterval struct {
+	min *float64
+	max *float64
+}
+
+// NewSizeSpec parses the string passed into a --size flag and returns a
+// SizeSpec if it is correctly parsed.
+func NewSizeSpec(
+	value string, bytesRange *intInterval, percentRange *floatInterval,
+) (SizeSpec, error) {
+	var size SizeSpec
+	if fractionRegex.MatchString(value) {
+		percentFactor := 100.0
+		factorValue := value
+		if value[len(value)-1] == '%' {
+			percentFactor = 1.0
+			factorValue = value[:len(value)-1]
+		}
+		var err error
+		size.Percent, err = strconv.ParseFloat(factorValue, 64)
+		size.Percent *= percentFactor
+		if err != nil {
+			return SizeSpec{}, fmt.Errorf("could not parse store size (%s) %s", value, err)
+		}
+		if percentRange != nil {
+			if (percentRange.min != nil && size.Percent < *percentRange.min) ||
+				(percentRange.max != nil && size.Percent > *percentRange.max) {
+				return SizeSpec{}, fmt.Errorf(
+					"store size (%s) must be between %f%% and %f%%",
+					value,
+					*percentRange.min,
+					*percentRange.max,
+				)
+			}
+		}
+	} else {
+		var err error
+		size.InBytes, err = humanizeutil.ParseBytes(value)
+		if err != nil {
+			return SizeSpec{}, fmt.Errorf("could not parse store size (%s) %s", value, err)
+		}
+		if bytesRange != nil {
+			if bytesRange.min != nil && size.InBytes < *bytesRange.min {
+				return SizeSpec{}, fmt.Errorf("store size (%s) must be larger than %s", value,
+					humanizeutil.IBytes(*bytesRange.min))
+			}
+			if bytesRange.max != nil && size.InBytes > *bytesRange.max {
+				return SizeSpec{}, fmt.Errorf("store size (%s) must be smaller than %s", value,
+					humanizeutil.IBytes(*bytesRange.max))
+			}
+		}
+	}
+	return size, nil
+}
+
+// String returns a string representation of the SizeSpec. This is part
+// of pflag's value interface.
+func (ss *SizeSpec) String() string {
+	var buffer bytes.Buffer
+	if ss.InBytes != 0 {
+		fmt.Fprintf(&buffer, "--size=%s,", humanizeutil.IBytes(ss.InBytes))
+	}
+	if ss.Percent != 0 {
+		fmt.Fprintf(&buffer, "--size=%s%%,", humanize.Ftoa(ss.Percent))
+	}
+	return buffer.String()
+}
+
+// Type returns the underlying type in string form. This is part of pflag's
+// value interface.
+func (ss *SizeSpec) Type() string {
+	return "SizeSpec"
+}
+
+var _ pflag.Value = &SizeSpec{}
+
+// Set adds a new value to the StoreSpecValue. It is the important part of
+// pflag's value interface.
+func (ss *SizeSpec) Set(value string) error {
+	spec, err := NewSizeSpec(value, nil, nil)
+	if err != nil {
+		return err
+	}
+	ss.InBytes = spec.InBytes
+	ss.Percent = spec.Percent
+	return nil
+}
+
 // StoreSpec contains the details that can be specified in the cli pertaining
 // to the --store flag.
 type StoreSpec struct {
-	Path string
-	// SizeInBytes is used for calculating free space and making rebalancing
-	// decisions. Zero indicates that there is no maximum size. This value is not
-	// actually used by the engine and thus not enforced.
-	SizeInBytes int64
-	SizePercent float64
-	InMemory    bool
-	Attributes  roachpb.Attributes
-	// UseSwitchingEnv is true if the "switching env" store version is desired.
+	Path       string
+	Size       SizeSpec
+	InMemory   bool
+	Attributes roachpb.Attributes
+	// StickyInMemoryEngineID is a unique identifier associated with a given
+	// store which will remain in memory even after the default Engine close
+	// until it has been explicitly cleaned up by CleanupStickyInMemEngine[s]
+	// or the process has been terminated.
+	// This only applies to in-memory storage engine.
+	StickyInMemoryEngineID string
+	// UseFileRegistry is true if the "file registry" store version is desired.
 	// This is set by CCL code when encryption-at-rest is in use.
-	UseSwitchingEnv bool
+	UseFileRegistry bool
+	// RocksDBOptions contains RocksDB specific options using a semicolon
+	// separated key-value syntax ("key1=value1; key2=value2").
+	RocksDBOptions string
 	// ExtraOptions is a serialized protobuf set by Go CCL code and passed through
 	// to C CCL code.
 	ExtraOptions []byte
@@ -84,11 +190,11 @@ func (ss StoreSpec) String() string {
 	if ss.InMemory {
 		fmt.Fprint(&buffer, "type=mem,")
 	}
-	if ss.SizeInBytes > 0 {
-		fmt.Fprintf(&buffer, "size=%s,", humanizeutil.IBytes(ss.SizeInBytes))
+	if ss.Size.InBytes > 0 {
+		fmt.Fprintf(&buffer, "size=%s,", humanizeutil.IBytes(ss.Size.InBytes))
 	}
-	if ss.SizePercent > 0 {
-		fmt.Fprintf(&buffer, "size=%s%%,", humanize.Ftoa(ss.SizePercent))
+	if ss.Size.Percent > 0 {
+		fmt.Fprintf(&buffer, "size=%s%%,", humanize.Ftoa(ss.Size.Percent))
 	}
 	if len(ss.Attributes.Attrs) > 0 {
 		fmt.Fprint(&buffer, "attrs=")
@@ -96,7 +202,7 @@ func (ss StoreSpec) String() string {
 			if i != 0 {
 				fmt.Fprint(&buffer, ":")
 			}
-			fmt.Fprintf(&buffer, attr)
+			buffer.WriteString(attr)
 		}
 		fmt.Fprintf(&buffer, ",")
 	}
@@ -119,7 +225,7 @@ func (ss StoreSpec) String() string {
 // without a decimal separator.
 // Values smaller than 1% and 100% are rejected after parsing using
 // a separate check.
-var fractionRegex = regexp.MustCompile(`^([0-9]+\.[0-9]*|[0-9]*\.[0-9]+|[0-9]+(\.[0-9]*)?%)$`)
+var fractionRegex = regexp.MustCompile(`^([-]?([0-9]+\.[0-9]*|[0-9]*\.[0-9]+|[0-9]+(\.[0-9]*)?%))$`)
 
 // NewStoreSpec parses the string passed into a --store flag and returns a
 // StoreSpec if it is correctly parsed.
@@ -179,32 +285,17 @@ func NewStoreSpec(value string) (StoreSpec, error) {
 				return StoreSpec{}, err
 			}
 		case "size":
-			if fractionRegex.MatchString(value) {
-				percentFactor := 100.0
-				factorValue := value
-				if value[len(value)-1] == '%' {
-					percentFactor = 1.0
-					factorValue = value[:len(value)-1]
-				}
-				var err error
-				ss.SizePercent, err = strconv.ParseFloat(factorValue, 64)
-				ss.SizePercent *= percentFactor
-				if err != nil {
-					return StoreSpec{}, fmt.Errorf("could not parse store size (%s) %s", value, err)
-				}
-				if ss.SizePercent > 100 || ss.SizePercent < 1 {
-					return StoreSpec{}, fmt.Errorf("store size (%s) must be between 1%% and 100%%", value)
-				}
-			} else {
-				var err error
-				ss.SizeInBytes, err = humanizeutil.ParseBytes(value)
-				if err != nil {
-					return StoreSpec{}, fmt.Errorf("could not parse store size (%s) %s", value, err)
-				}
-				if ss.SizeInBytes < MinimumStoreSize {
-					return StoreSpec{}, fmt.Errorf("store size (%s) must be larger than %s", value,
-						humanizeutil.IBytes(MinimumStoreSize))
-				}
+			var err error
+			var minBytesAllowed int64 = MinimumStoreSize
+			var minPercent float64 = 1
+			var maxPercent float64 = 100
+			ss.Size, err = NewSizeSpec(
+				value,
+				&intInterval{min: &minBytesAllowed},
+				&floatInterval{min: &minPercent, max: &maxPercent},
+			)
+			if err != nil {
+				return StoreSpec{}, err
 			}
 		case "attrs":
 			// Check to make sure there are no duplicate attributes.
@@ -225,6 +316,8 @@ func NewStoreSpec(value string) (StoreSpec, error) {
 			} else {
 				return StoreSpec{}, fmt.Errorf("%s is not a valid store type", value)
 			}
+		case "rocksdb":
+			ss.RocksDBOptions = value
 		default:
 			return StoreSpec{}, fmt.Errorf("%s is not a valid store field", field)
 		}
@@ -234,7 +327,7 @@ func NewStoreSpec(value string) (StoreSpec, error) {
 		if ss.Path != "" {
 			return StoreSpec{}, fmt.Errorf("path specified for in memory store")
 		}
-		if ss.SizePercent == 0 && ss.SizeInBytes == 0 {
+		if ss.Size.Percent == 0 && ss.Size.InBytes == 0 {
 			return StoreSpec{}, fmt.Errorf("size must be specified for an in memory store")
 		}
 	} else if ss.Path == "" {
@@ -264,6 +357,51 @@ func (ssl StoreSpecList) String() string {
 		buffer.Truncate(l - 1)
 	}
 	return buffer.String()
+}
+
+// AuxiliaryDir is the path of the auxiliary dir relative to an engine.Engine's
+// root directory. It must not be changed without a proper migration.
+const AuxiliaryDir = "auxiliary"
+
+// PreventedStartupFile is the filename (relative to 'dir') used for files that
+// can block server startup.
+func PreventedStartupFile(dir string) string {
+	return filepath.Join(dir, "_CRITICAL_ALERT.txt")
+}
+
+// GetPreventedStartupMessage attempts to read the PreventedStartupFile for each
+// store directory and returns their concatenated contents. These files
+// typically request operator intervention after a corruption event by
+// preventing the affected node(s) from starting back up.
+func (ssl StoreSpecList) GetPreventedStartupMessage() (string, error) {
+	var buf strings.Builder
+	for _, ss := range ssl.Specs {
+		path := ss.PreventedStartupFile()
+		if path == "" {
+			continue
+		}
+		b, err := ioutil.ReadFile(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return "", err
+			}
+			continue
+		}
+		fmt.Fprintf(&buf, "From %s:\n\n", path)
+		_, _ = buf.Write(b)
+		fmt.Fprintln(&buf)
+	}
+	return buf.String(), nil
+}
+
+// PreventedStartupFile returns the path to a file which, if it exists, should
+// prevent the server from starting up. Returns an empty string for in-memory
+// engines.
+func (ss StoreSpec) PreventedStartupFile() string {
+	if ss.InMemory {
+		return ""
+	}
+	return PreventedStartupFile(filepath.Join(ss.Path, AuxiliaryDir))
 }
 
 // Type returns the underlying type in string form. This is part of pflag's
@@ -315,6 +453,26 @@ func (jls *JoinListType) Type() string {
 // Set adds a new value to the JoinListType. It is the important part of
 // pflag's value interface.
 func (jls *JoinListType) Set(value string) error {
-	*jls = append(*jls, value)
+	if strings.TrimSpace(value) == "" {
+		// No value, likely user error.
+		return errors.New("no address specified in --join")
+	}
+	for _, v := range strings.Split(value, ",") {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			// --join=a,,b  equivalent to --join=a,b
+			continue
+		}
+		// Try splitting the address. This validates the format
+		// of the address and tolerates a missing delimiter colon
+		// between the address and port number.
+		addr, port, err := netutil.SplitHostPort(v, "")
+		if err != nil {
+			return err
+		}
+		// Re-join the parts. This guarantees an address that
+		// will be valid for net.SplitHostPort().
+		*jls = append(*jls, net.JoinHostPort(addr, port))
+	}
 	return nil
 }

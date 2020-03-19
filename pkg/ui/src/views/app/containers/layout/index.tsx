@@ -1,15 +1,43 @@
-import React from "react";
-import _ from "lodash";
-import { RouterState } from "react-router";
-import { StickyContainer } from "react-sticky";
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
-import { TitledComponent } from "src/interfaces/layout";
+import React from "react";
+import { Helmet } from "react-helmet";
+import { RouteComponentProps, withRouter } from "react-router-dom";
+import { connect } from "react-redux";
+
 import NavigationBar from "src/views/app/components/layoutSidebar";
 import TimeWindowManager from "src/views/app/containers/timewindow";
 import AlertBanner from "src/views/app/containers/alertBanner";
+import RequireLogin from "src/views/login/requireLogin";
+import { clusterIdSelector, clusterNameSelector, singleVersionSelector } from "src/redux/nodes";
+import { AdminUIState } from "src/redux/state";
+import LoginIndicator from "src/views/app/components/loginIndicator";
+import {
+  GlobalNavigation,
+  CockroachLabsLockupIcon,
+  Left,
+  Right,
+  PageHeader,
+  Text,
+  TextTypes,
+  Badge,
+} from "src/components";
 
-function isTitledComponent(obj: Object | TitledComponent): obj is TitledComponent {
-  return obj && _.isFunction((obj as TitledComponent).title);
+import "./layout.styl";
+import "./layoutPanel.styl";
+
+export interface LayoutProps {
+  clusterName: string;
+  clusterVersion: string;
+  clusterId: string;
 }
 
 /**
@@ -18,37 +46,56 @@ function isTitledComponent(obj: Object | TitledComponent): obj is TitledComponen
  *
  * Individual pages provide their content via react-router.
  */
-export default class extends React.Component<RouterState, {}> {
+class Layout extends React.Component<LayoutProps & RouteComponentProps> {
   render() {
-    // Responsibility for rendering a title is decided based on the route;
-    // specifically, the most specific current route for which that route's
-    // component implements a "title" method.
-    const { routes, children } = this.props;
-    let title: React.ReactElement<any>;
-
-    for (let i = routes.length - 1; i >= 0; i--) {
-      const component: Object | TitledComponent = routes[i].component;
-      if (isTitledComponent(component)) {
-        title = component.title(this.props);
-        break;
-      }
-    }
-
-    return <div>
-      <TimeWindowManager/>
-      <AlertBanner/>
-      <NavigationBar/>
-      <StickyContainer className="page">
-        {
-          // TODO(mrtracy): The title can be moved down to individual pages,
-          // it is not always the top element on the page (for example, on
-          // pages with a back button).
-          !!title
-            ? <section className="section"><h1>{ title }</h1></section>
-            : null
-        }
-        { children }
-      </StickyContainer>
-    </div>;
+    const { clusterName, clusterVersion, clusterId } = this.props;
+    return (
+      <RequireLogin>
+        <Helmet
+          titleTemplate="%s | Cockroach Console"
+          defaultTitle="Cockroach Console"
+        />
+        <TimeWindowManager/>
+        <AlertBanner/>
+        <div className="layout-panel">
+          <div className="layout-panel__header">
+            <GlobalNavigation>
+              <Left>
+                <CockroachLabsLockupIcon height={26} />
+              </Left>
+              <Right>
+                <LoginIndicator />
+              </Right>
+            </GlobalNavigation>
+          </div>
+          <div className="layout-panel__navigation-bar">
+            <PageHeader>
+              <Text textType={TextTypes.Heading2} noWrap>
+                {clusterName || `Cluster id: ${clusterId || ""}`}
+              </Text>
+              <Badge text={clusterVersion} />
+            </PageHeader>
+          </div>
+          <div className="layout-panel__body">
+            <div className="layout-panel__sidebar">
+              <NavigationBar/>
+            </div>
+            <div className="layout-panel__content">
+              { this.props.children }
+            </div>
+          </div>
+        </div>
+      </RequireLogin>
+    );
   }
 }
+
+const mapStateToProps = (state: AdminUIState) => {
+  return {
+    clusterName: clusterNameSelector(state),
+    clusterVersion: singleVersionSelector(state),
+    clusterId: clusterIdSelector(state),
+  };
+};
+
+export default withRouter(connect(mapStateToProps)(Layout));

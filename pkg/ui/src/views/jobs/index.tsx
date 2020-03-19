@@ -1,56 +1,52 @@
-import _ from "lodash";
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import moment from "moment";
-import { Line } from "rc-progress";
 import React from "react";
-import { connect } from "react-redux";
+import {Helmet} from "react-helmet";
+import {connect} from "react-redux";
+import {withRouter} from "react-router-dom";
 
-import * as protos from "src/js/protos";
-import { jobsKey, refreshJobs } from "src/redux/apiReducers";
-import { LocalSetting } from "src/redux/localsettings";
-import { AdminUIState } from "src/redux/state";
-import { TimestampToMoment } from "src/util/convert";
-import docsURL from "src/util/docs";
-import Dropdown, { DropdownOption } from "src/views/shared/components/dropdown";
+import {cockroach} from "src/js/protos";
+import {jobsKey, refreshJobs} from "src/redux/apiReducers";
+import {CachedDataReducerState} from "src/redux/cachedDataReducer";
+import {LocalSetting} from "src/redux/localsettings";
+import {AdminUIState} from "src/redux/state";
+import Dropdown, {DropdownOption} from "src/views/shared/components/dropdown";
 import Loading from "src/views/shared/components/loading";
-import { PageConfig, PageConfigItem } from "src/views/shared/components/pageconfig";
-import { SortSetting } from "src/views/shared/components/sortabletable";
-import { ColumnDescriptor, SortedTable } from "src/views/shared/components/sortedtable";
-import { ToolTipWrapper } from "src/views/shared/components/toolTip";
+import {PageConfig, PageConfigItem} from "src/views/shared/components/pageconfig";
+import {SortSetting} from "src/views/shared/components/sortabletable";
+import "./index.styl";
+import {statusOptions} from "./jobStatusOptions";
+import {JobTable} from "oss/src/views/jobs/jobTable";
+import JobType = cockroach.sql.jobs.jobspb.Type;
+import JobsRequest = cockroach.server.serverpb.JobsRequest;
+import JobsResponse = cockroach.server.serverpb.JobsResponse;
 
-import spinner from "assets/spinner.gif";
-import noResults from "assets/noresults.svg";
-
-type Job = protos.cockroach.server.serverpb.JobsResponse.Job;
-
-type JobType = protos.cockroach.sql.jobs.Type;
-const jobType = protos.cockroach.sql.jobs.Type;
-
-const JobsRequest = protos.cockroach.server.serverpb.JobsRequest;
-
-const statusOptions = [
-  { value: "", label: "All" },
-  { value: "pending", label: "Pending" },
-  { value: "running", label: "Running" },
-  { value: "paused", label: "Paused" },
-  { value: "canceled", label: "Canceled" },
-  { value: "succeeded", label: "Succeeded" },
-  { value: "failed", label: "Failed" },
-];
-
-const statusSetting = new LocalSetting<AdminUIState, string>(
+export const statusSetting = new LocalSetting<AdminUIState, string>(
   "jobs/status_setting", s => s.localSettings, statusOptions[0].value,
 );
 
 const typeOptions = [
-  { value: jobType.UNSPECIFIED.toString(), label: "All" },
-  { value: jobType.BACKUP.toString(), label: "Backups" },
-  { value: jobType.RESTORE.toString(), label: "Restores" },
-  { value: jobType.IMPORT.toString(), label: "Imports" },
-  { value: jobType.SCHEMA_CHANGE.toString(), label: "Schema Changes" },
+  { value: JobType.UNSPECIFIED.toString(), label: "All" },
+  { value: JobType.BACKUP.toString(), label: "Backups" },
+  { value: JobType.RESTORE.toString(), label: "Restores" },
+  { value: JobType.IMPORT.toString(), label: "Imports" },
+  { value: JobType.SCHEMA_CHANGE.toString(), label: "Schema Changes" },
+  { value: JobType.CHANGEFEED.toString(), label: "Changefeed"},
+  { value: JobType.CREATE_STATS.toString(), label: "Statistics Creation"},
+  { value: JobType.AUTO_CREATE_STATS.toString(), label: "Auto-Statistics Creation"},
 ];
 
-const typeSetting = new LocalSetting<AdminUIState, number>(
-  "jobs/type_setting", s => s.localSettings, jobType.UNSPECIFIED,
+export const typeSetting = new LocalSetting<AdminUIState, number>(
+  "jobs/type_setting", s => s.localSettings, JobType.UNSPECIFIED,
 );
 
 const showOptions = [
@@ -58,99 +54,20 @@ const showOptions = [
   { value: "0", label: "All" },
 ];
 
-const showSetting = new LocalSetting<AdminUIState, string>(
+export const showSetting = new LocalSetting<AdminUIState, string>(
   "jobs/show_setting", s => s.localSettings, showOptions[0].value,
 );
 
 // Moment cannot render durations (moment/moment#1048). Hack it ourselves.
-const formatDuration = (d: moment.Duration) =>
+export const formatDuration = (d: moment.Duration) =>
   [Math.floor(d.asHours()).toFixed(0), d.minutes(), d.seconds()]
     .map(c => ("0" + c).slice(-2))
     .join(":");
 
-class JobStatusCell extends React.Component<{ job: Job }, {}> {
-  is(...statuses: string[]) {
-    return statuses.indexOf(this.props.job.status) !== -1;
-  }
-
-  renderProgress() {
-    if (this.is("succeeded", "failed", "canceled")) {
-      return <div className="jobs-table__status">{this.props.job.status}</div>;
-    }
-    const percent = this.props.job.fraction_completed * 100;
-    return <div>
-      <Line percent={percent} strokeWidth={10} trailWidth={10} className="jobs-table__progress-bar" />
-      <span title={percent.toFixed(3) + "%"}>{percent.toFixed(1) + "%"}</span>
-    </div>;
-  }
-
-  renderDuration() {
-    const started = TimestampToMoment(this.props.job.started);
-    const finished = TimestampToMoment(this.props.job.finished);
-    const modified = TimestampToMoment(this.props.job.modified);
-    if (this.is("pending", "paused")) {
-      return _.capitalize(this.props.job.status);
-    } else if (this.is("running")) {
-      const fractionCompleted = this.props.job.fraction_completed;
-      if (fractionCompleted > 0) {
-        const duration = modified.diff(started);
-        const remaining = duration / fractionCompleted - duration;
-        return formatDuration(moment.duration(remaining)) + " remaining";
-      }
-    } else if (this.is("succeeded")) {
-      return "Duration: " + formatDuration(moment.duration(finished.diff(started)));
-    }
-  }
-
-  render() {
-    return <div>
-      {this.renderProgress()}
-      <span className="jobs-table__duration">{this.renderDuration()}</span>
-    </div>;
-  }
-}
-
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or JSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-const JobsSortedTable = SortedTable as new () => SortedTable<Job>;
-
-const jobsTableColumns: ColumnDescriptor<Job>[] = [
-  {
-    title: "ID",
-    cell: job => String(job.id),
-    sort: job => job.id,
-  },
-  {
-    title: "Description",
-    cell: job => job.description,
-    sort: job => job.description,
-    className: "jobs-table__cell--description",
-  },
-  {
-    title: "User",
-    cell: job => job.username,
-    sort: job => job.username,
-  },
-  {
-    title: "Creation Time",
-    cell: job => TimestampToMoment(job.created).fromNow(),
-    sort: job => TimestampToMoment(job.created).valueOf(),
-  },
-  {
-    title: "Status",
-    cell: job => <JobStatusCell job={job} />,
-    sort: job => job.fraction_completed,
-  },
-];
-
-const sortSetting = new LocalSetting<AdminUIState, SortSetting>(
+export const sortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "jobs/sort_setting",
   s => s.localSettings,
-  { sortKey: 2 /* creation time */, ascending: false },
+  { sortKey: 3 /* creation time */, ascending: false },
 );
 
 interface JobsTableProps {
@@ -163,34 +80,10 @@ interface JobsTableProps {
   setShow: (value: string) => void;
   setType: (value: JobType) => void;
   refreshJobs: typeof refreshJobs;
-  jobs: Job[];
-  jobsValid: boolean;
+  jobs: CachedDataReducerState<JobsResponse>;
 }
 
-const titleTooltip = (
-  <span>
-    Some jobs can be paused or canceled through SQL. For details, view the docs
-    on the <a href={docsURL("pause-job.html")}><code>PAUSE JOB</code></a> and <a
-    href={docsURL("cancel-job.html")}><code>CANCEL JOB</code></a> statements.
-  </span>
-);
-
-class JobsTable extends React.Component<JobsTableProps, {}> {
-  static title() {
-    return (
-      <div>
-        Jobs
-        <div className="section-heading__tooltip">
-          <ToolTipWrapper text={titleTooltip}>
-            <div className="section-heading__tooltip-hover-area">
-              <div className="section-heading__info-icon">i</div>
-            </div>
-          </ToolTipWrapper>
-        </div>
-      </div>
-    );
-  }
-
+export class JobsTable extends React.Component<JobsTableProps> {
   refresh(props = this.props) {
     props.refreshJobs(new JobsRequest({
       status: props.status,
@@ -220,51 +113,51 @@ class JobsTable extends React.Component<JobsTableProps, {}> {
   }
 
   render() {
-    const data = this.props.jobs && this.props.jobs.length > 0 && this.props.jobs;
-    return <div className="jobs-page">
-      <div>
-        <PageConfig>
-          <PageConfigItem>
-            <Dropdown
-              title="Status"
-              options={statusOptions}
-              selected={this.props.status}
-              onChange={this.onStatusSelected}
-            />
-          </PageConfigItem>
-          <PageConfigItem>
-            <Dropdown
-              title="Type"
-              options={typeOptions}
-              selected={this.props.type.toString()}
-              onChange={this.onTypeSelected}
-            />
-          </PageConfigItem>
-          <PageConfigItem>
-            <Dropdown
-              title="Show"
-              options={showOptions}
-              selected={this.props.show}
-              onChange={this.onShowSelected}
-            />
-          </PageConfigItem>
-        </PageConfig>
+    return (
+      <div className="jobs-page">
+        <Helmet title="Jobs" />
+        <section className="section">
+          <h1 className="base-heading">
+            Jobs
+          </h1>
+        </section>
+        <div>
+          <PageConfig>
+            <PageConfigItem>
+              <Dropdown
+                title="Status"
+                options={statusOptions}
+                selected={this.props.status}
+                onChange={this.onStatusSelected}
+              />
+            </PageConfigItem>
+            <PageConfigItem>
+              <Dropdown
+                title="Type"
+                options={typeOptions}
+                selected={this.props.type.toString()}
+                onChange={this.onTypeSelected}
+              />
+            </PageConfigItem>
+            <PageConfigItem>
+              <Dropdown
+                title="Show"
+                options={showOptions}
+                selected={this.props.show}
+                onChange={this.onShowSelected}
+              />
+            </PageConfigItem>
+          </PageConfig>
+        </div>
+        <section className="section">
+          <Loading
+            loading={!this.props.jobs || !this.props.jobs.data}
+            error={this.props.jobs && this.props.jobs.lastError}
+            render={() => <JobTable isUsedFilter={this.props.status.length > 0 || this.props.type > 0} jobs={this.props.jobs}  setSort={this.props.setSort} sort={this.props.sort}/>}
+          />
+        </section>
       </div>
-      <Loading loading={_.isNil(this.props.jobs)} className="loading-image loading-image__spinner" image={spinner}>
-        <Loading loading={_.isEmpty(data)} className="loading-image" image={noResults}>
-          <section className="section">
-            <JobsSortedTable
-              data={data}
-              sortSetting={this.props.sort}
-              onChangeSortSetting={this.props.setSort}
-              className="jobs-table"
-              rowClass={job => "jobs-table__row--" + job.status}
-              columns={jobsTableColumns}
-            />
-          </section>
-        </Loading>
-      </Loading>
-    </div>;
+    );
   }
 }
 
@@ -276,13 +169,11 @@ const mapStateToProps = (state: AdminUIState) => {
   const key = jobsKey(status, type, parseInt(show, 10));
   const jobs = state.cachedData.jobs[key];
   return {
-    sort, status, show, type,
-    jobs: jobs && jobs.data && jobs.data.jobs,
-    jobsValid: jobs && jobs.valid,
+    sort, status, show, type, jobs,
   };
 };
 
-const actions = {
+const mapDispatchToProps = {
   setSort: sortSetting.set,
   setStatus: statusSetting.set,
   setShow: showSetting.set,
@@ -290,4 +181,4 @@ const actions = {
   refreshJobs,
 };
 
-export default connect(mapStateToProps, actions)(JobsTable);
+export default withRouter(connect(mapStateToProps, mapDispatchToProps)(JobsTable));

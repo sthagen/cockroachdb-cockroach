@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,14 +14,18 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
+
+type renameTableNode struct {
+	n            *tree.RenameTable
+	oldTn, newTn *tree.TableName
+	tableDesc    *sqlbase.MutableTableDescriptor
+}
 
 // RenameTable renames the table, view or sequence.
 // Privileges: DROP on source table/view/sequence, CREATE on destination database.
@@ -33,56 +33,29 @@ import (
 //          mysql requires ALTER, DROP on the original table, and CREATE, INSERT
 //          on the new table (and does not copy privileges over).
 func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNode, error) {
-	oldTn, err := n.Name.NormalizeWithDatabaseName(p.session.Database)
-	if err != nil {
-		return nil, err
-	}
-	newTn, err := n.NewName.NormalizeWithDatabaseName(p.session.Database)
-	if err != nil {
-		return nil, err
-	}
-
-	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), oldTn.Database())
-	if err != nil {
-		return nil, err
-	}
-
-	// Check if source table, view or sequence exists.
-	// Note that Postgres's behavior here is a little lenient - it'll let you
-	// modify views by running ALTER TABLE, but won't let you modify tables
-	// by running ALTER VIEW. Our behavior is strict for now, but can be
-	// made more lenient down the road if needed.
-	var tableDesc *sqlbase.TableDescriptor
+	oldTn := n.Name.ToTableName()
+	newTn := n.NewName.ToTableName()
+	toRequire := ResolveRequireTableOrViewDesc
 	if n.IsView {
-		tableDesc, err = getViewDesc(ctx, p.txn, p.getVirtualTabler(), oldTn)
-		if err != nil {
-			return nil, err
-		}
+		toRequire = ResolveRequireViewDesc
 	} else if n.IsSequence {
-		tableDesc, err = getSequenceDesc(ctx, p.txn, p.getVirtualTabler(), oldTn)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		tableDesc, err = getTableDesc(ctx, p.txn, p.getVirtualTabler(), oldTn)
-		if err != nil {
-			return nil, err
-		}
+		toRequire = ResolveRequireSequenceDesc
 	}
 
+	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &oldTn, !n.IfExists, toRequire)
+	if err != nil {
+		return nil, err
+	}
 	if tableDesc == nil {
-		if n.IfExists {
-			// Noop.
-			return &zeroNode{}, nil
-		}
-		// Key does not exist, but we want it to: error out.
-		return nil, sqlbase.NewUndefinedRelationError(oldTn)
-	}
-	if tableDesc.State != sqlbase.TableDescriptor_PUBLIC {
-		return nil, sqlbase.NewUndefinedRelationError(oldTn)
+		// Noop.
+		return newZeroNode(nil /* columns */), nil
 	}
 
-	if err := p.CheckPrivilege(tableDesc, privilege.DROP); err != nil {
+	if tableDesc.State != sqlbase.TableDescriptor_PUBLIC {
+		return nil, sqlbase.NewUndefinedRelationError(&oldTn)
+	}
+
+	if err := p.CheckPrivilege(ctx, tableDesc, privilege.DROP); err != nil {
 		return nil, err
 	}
 
@@ -95,74 +68,98 @@ func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNod
 			ctx, tableDesc.TypeName(), oldTn.String(), tableDesc.ParentID, tableDesc.DependedOnBy[0].ID)
 	}
 
-	// Check if target database exists.
-	targetDbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), newTn.Database())
+	return &renameTableNode{n: n, oldTn: &oldTn, newTn: &newTn, tableDesc: tableDesc}, nil
+}
+
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because RENAME DATABASE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *renameTableNode) ReadingOwnWrites() {}
+
+func (n *renameTableNode) startExec(params runParams) error {
+	p := params.p
+	ctx := params.ctx
+	oldTn := n.oldTn
+	newTn := n.newTn
+	tableDesc := n.tableDesc
+
+	prevDbDesc, err := p.ResolveUncachedDatabase(ctx, oldTn)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	if err := p.CheckPrivilege(targetDbDesc, privilege.CREATE); err != nil {
-		return nil, err
+	// Check if target database exists.
+	// We also look at uncached descriptors here.
+	targetDbDesc, err := p.ResolveUncachedDatabase(ctx, newTn)
+	if err != nil {
+		return err
+	}
+
+	if err := p.CheckPrivilege(ctx, targetDbDesc, privilege.CREATE); err != nil {
+		return err
 	}
 
 	// oldTn and newTn are already normalized, so we can compare directly here.
-	if oldTn.Database() == newTn.Database() && oldTn.Table() == newTn.Table() {
+	if oldTn.Catalog() == newTn.Catalog() &&
+		oldTn.Schema() == newTn.Schema() &&
+		oldTn.Table() == newTn.Table() {
 		// Noop.
-		return &zeroNode{}, nil
+		return nil
 	}
 
 	tableDesc.SetName(newTn.Table())
 	tableDesc.ParentID = targetDbDesc.ID
 
-	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
-	newTbKey := tableKey{targetDbDesc.ID, newTn.Table()}.Key()
+	newTbKey := sqlbase.MakePublicTableNameKey(ctx, params.ExecCfg().Settings,
+		targetDbDesc.ID, newTn.Table()).Key()
 
 	if err := tableDesc.Validate(ctx, p.txn); err != nil {
-		return nil, err
+		return err
 	}
 
 	descID := tableDesc.GetID()
-	descDesc := sqlbase.WrapDescriptor(tableDesc)
+	parentSchemaID := tableDesc.GetParentSchemaID()
 
-	if err := tableDesc.SetUpVersion(); err != nil {
-		return nil, err
-	}
-	renameDetails := sqlbase.TableDescriptor_RenameInfo{
-		OldParentID: dbDesc.ID,
-		OldName:     oldTn.Table()}
-	tableDesc.Renames = append(tableDesc.Renames, renameDetails)
-	if err := p.writeTableDesc(ctx, tableDesc); err != nil {
-		return nil, err
+	renameDetails := sqlbase.TableDescriptor_NameInfo{
+		ParentID:       prevDbDesc.ID,
+		ParentSchemaID: parentSchemaID,
+		Name:           oldTn.Table()}
+	tableDesc.DrainingNames = append(tableDesc.DrainingNames, renameDetails)
+	if err := p.writeSchemaChange(
+		ctx, tableDesc, sqlbase.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
+	); err != nil {
+		return err
 	}
 
 	// We update the descriptor to the new name, but also leave the mapping of the
 	// old name to the id, so that the name is not reused until the schema changer
 	// has made sure it's not in use any more.
-	b := &client.Batch{}
-	if p.session.Tracing.KVTracingEnabled() {
-		log.VEventf(ctx, 2, "Put %s -> %s", descKey, descDesc)
+	b := &kv.Batch{}
+	if p.extendedEvalCtx.Tracing.KVTracingEnabled() {
 		log.VEventf(ctx, 2, "CPut %s -> %d", newTbKey, descID)
 	}
-	b.Put(descKey, descDesc)
-	b.CPut(newTbKey, descID, nil)
-
-	if err := p.txn.Run(ctx, b); err != nil {
-		if _, ok := err.(*roachpb.ConditionFailedError); ok {
-			return nil, sqlbase.NewRelationAlreadyExistsError(newTn.Table())
-		}
-		return nil, err
+	err = writeDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(),
+		p.EvalContext().Settings, b, descID, tableDesc.TableDesc())
+	if err != nil {
+		return err
 	}
-	p.notifySchemaChange(tableDesc, sqlbase.InvalidMutationID)
 
-	p.session.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
-		if err := expectDescriptorID(systemConfig, newTbKey, descID); err != nil {
-			return err
-		}
-		return expectDescriptor(systemConfig, descKey, descDesc)
-	})
+	exists, _, err := sqlbase.LookupPublicTableID(
+		params.ctx, params.p.txn, targetDbDesc.ID, newTn.Table(),
+	)
+	if err == nil && exists {
+		return sqlbase.NewRelationAlreadyExistsError(newTn.Table())
+	} else if err != nil {
+		return err
+	}
 
-	return &zeroNode{}, nil
+	b.CPut(newTbKey, descID, nil)
+	return p.txn.Run(ctx, b)
 }
+
+func (n *renameTableNode) Next(runParams) (bool, error) { return false, nil }
+func (n *renameTableNode) Values() tree.Datums          { return tree.Datums{} }
+func (n *renameTableNode) Close(context.Context)        {}
 
 // TODO(a-robinson): Support renaming objects depended on by views once we have
 // a better encoding for view queries (#10083).

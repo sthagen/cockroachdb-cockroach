@@ -1,23 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
-import "context"
-
-// Interval of Check() calls to wait between checks for context cancellation.
-const cancelCheckInterval int64 = 1000
+import (
+	"context"
+	"sync/atomic"
+)
 
 // CancelChecker is a helper object for repeatedly checking whether the associated context
 // has been canceled or not. Encapsulates all logic for waiting for cancelCheckInterval
@@ -28,10 +24,7 @@ type CancelChecker struct {
 	ctx context.Context
 
 	// Number of times Check() has been called since last context cancellation check.
-	callsSinceLastCheck int64
-
-	// Last returned cancellation value.
-	isCanceled bool
+	callsSinceLastCheck uint32
 }
 
 // NewCancelChecker returns a new CancelChecker.
@@ -43,19 +36,31 @@ func NewCancelChecker(ctx context.Context) *CancelChecker {
 
 // Check returns an error if the associated query has been canceled.
 func (c *CancelChecker) Check() error {
-	if !c.isCanceled && c.callsSinceLastCheck%cancelCheckInterval == 0 {
+	// Interval of Check() calls to wait between checks for context
+	// cancellation. The value is a power of 2 to allow the compiler to use
+	// bitwise AND instead of division.
+	const cancelCheckInterval = 1024
+
+	if atomic.LoadUint32(&c.callsSinceLastCheck)%cancelCheckInterval == 0 {
 		select {
 		case <-c.ctx.Done():
-			c.isCanceled = true
+			// Once the context is canceled, we no longer increment
+			// callsSinceLastCheck and will fall into this path on subsequent calls
+			// to Check().
+			return QueryCanceledError
 		default:
-			c.isCanceled = false
 		}
 	}
 
-	c.callsSinceLastCheck++
-
-	if c.isCanceled {
-		return NewQueryCanceledError()
-	}
+	// Increment. This may rollover when the 32-bit capacity is reached,
+	// but that's all right.
+	atomic.AddUint32(&c.callsSinceLastCheck, 1)
 	return nil
+}
+
+// Reset resets this cancel checker with a fresh context.
+func (c *CancelChecker) Reset(ctx context.Context) {
+	*c = CancelChecker{
+		ctx: ctx,
+	}
 }

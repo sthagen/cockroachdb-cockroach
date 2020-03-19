@@ -1,16 +1,26 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 @require "~styl/base/palette.styl"
 
 .alert-box
   clearfix()
   display flex
-  width calc(100% - 48px)
+  width 100%
   float left
-  margin 0 6px 10px
+  margin 0 0 10px
   padding 20px
   border 1px solid $headings-color
   border-radius 5px
   font-family Lato-Regular
-  
+
   &__icon
     flex 0
 
@@ -22,7 +32,7 @@
     flex 0
 
   &__title
-    font-family Lato-Bold
+    font-weight bold
     padding-right 25px
 
   &__link

@@ -7,56 +7,60 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This code was derived from https://github.com/youtube/vitess.
 
 package tree
 
-import "bytes"
-
 // SetVar represents a SET or RESET statement.
 type SetVar struct {
-	Name   VarName
+	Name   string
 	Values Exprs
 }
 
 // Format implements the NodeFormatter interface.
-func (node *SetVar) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SET ")
-	if node.Name == nil {
-		buf.WriteString("ROW (")
-		FormatNode(buf, f, node.Values)
-		buf.WriteString(")")
+func (node *SetVar) Format(ctx *FmtCtx) {
+	ctx.WriteString("SET ")
+	if node.Name == "" {
+		ctx.WriteString("ROW (")
+		ctx.FormatNode(&node.Values)
+		ctx.WriteString(")")
 	} else {
-		FormatNode(buf, f, node.Name)
-		buf.WriteString(" = ")
-		FormatNode(buf, f, node.Values)
+		ctx.WithFlags(ctx.flags & ^FmtAnonymize, func() {
+			// Session var names never contain PII and should be distinguished
+			// for feature tracking purposes.
+			ctx.FormatNameP(&node.Name)
+		})
+
+		ctx.WriteString(" = ")
+		ctx.FormatNode(&node.Values)
 	}
 }
 
 // SetClusterSetting represents a SET CLUSTER SETTING statement.
 type SetClusterSetting struct {
-	Name  VarName
+	Name  string
 	Value Expr
 }
 
 // Format implements the NodeFormatter interface.
-func (node *SetClusterSetting) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SET CLUSTER SETTING ")
-	FormatNode(buf, f, node.Name)
-	buf.WriteString(" = ")
-	FormatNode(buf, f, node.Value)
+func (node *SetClusterSetting) Format(ctx *FmtCtx) {
+	ctx.WriteString("SET CLUSTER SETTING ")
+	// Cluster setting names never contain PII and should be distinguished
+	// for feature tracking purposes.
+	ctx.WithFlags(ctx.flags & ^FmtAnonymize, func() {
+		ctx.FormatNameP(&node.Name)
+	})
+
+	ctx.WriteString(" = ")
+	ctx.FormatNode(node.Value)
 }
 
 // SetTransaction represents a SET TRANSACTION statement.
@@ -65,9 +69,19 @@ type SetTransaction struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *SetTransaction) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SET TRANSACTION")
-	node.Modes.Format(buf, f)
+func (node *SetTransaction) Format(ctx *FmtCtx) {
+	ctx.WriteString("SET TRANSACTION")
+	node.Modes.Format(ctx)
+}
+
+// SetSessionAuthorizationDefault represents a SET SESSION AUTHORIZATION DEFAULT
+// statement. This can be extended (and renamed) if we ever support names in the
+// last position.
+type SetSessionAuthorizationDefault struct{}
+
+// Format implements the NodeFormatter interface.
+func (node *SetSessionAuthorizationDefault) Format(ctx *FmtCtx) {
+	ctx.WriteString("SET SESSION AUTHORIZATION DEFAULT")
 }
 
 // SetSessionCharacteristics represents a SET SESSION CHARACTERISTICS AS TRANSACTION statement.
@@ -76,7 +90,18 @@ type SetSessionCharacteristics struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *SetSessionCharacteristics) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SET SESSION CHARACTERISTICS AS TRANSACTION")
-	node.Modes.Format(buf, f)
+func (node *SetSessionCharacteristics) Format(ctx *FmtCtx) {
+	ctx.WriteString("SET SESSION CHARACTERISTICS AS TRANSACTION")
+	node.Modes.Format(ctx)
+}
+
+// SetTracing represents a SET TRACING statement.
+type SetTracing struct {
+	Values Exprs
+}
+
+// Format implements the NodeFormatter interface.
+func (node *SetTracing) Format(ctx *FmtCtx) {
+	ctx.WriteString("SET TRACING = ")
+	ctx.FormatNode(&node.Values)
 }

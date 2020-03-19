@@ -1,2 +1,0 @@
-show_backup_stmt ::=
-	'SHOW' 'BACKUP' location

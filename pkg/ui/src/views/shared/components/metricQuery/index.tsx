@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 /**
  * MetricQuery Components
  *
@@ -23,6 +33,8 @@ import React from "react";
 import * as protos from  "src/js/protos";
 
 type TSResponse = protos.cockroach.ts.tspb.TimeSeriesQueryResponse;
+import TimeSeriesQueryAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator;
+import TimeSeriesQueryDerivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative;
 
 /**
  * AxisUnits is an enumeration used to specify the type of units being displayed
@@ -41,6 +53,10 @@ export enum AxisUnits {
    * Units are durations expressed in nanoseconds.
    */
   Duration,
+  /**
+   * Units are percentages expressed as fractional values of 1 (1.0 = 100%).
+   */
+  Percentage,
 }
 
 /**
@@ -74,6 +90,16 @@ export class Axis extends React.Component<AxisProps, {}> {
 /**
  * MetricProps reperesents the properties of a Metric being selected as part of
  * a query.
+ *
+ * Note that there are redundant specifiers for several of the options
+ * (derivatives, aggregators, downsamplers). These exist because, while the
+ * exact specifiers (e.g. "aggregator") are convenient when constructing metrics
+ * programmatically, the boolean specifiers (e.g. "aggregateMax") are convenient
+ * when writing JSX directly. This is purely a syntactic helper.
+ *
+ * Only one option should be specified for each of the (derivative, aggregator,
+ * downsampler); if multiple options are specified, the exact specifier takes
+ * precedence.
  */
 export interface MetricProps {
   name: string;
@@ -86,6 +112,9 @@ export interface MetricProps {
   aggregateAvg?: boolean;
   downsampleMax?: boolean;
   downsampleMin?: boolean;
+  derivative?: TimeSeriesQueryDerivative;
+  aggregator?: TimeSeriesQueryAggregator;
+  downsampler?: TimeSeriesQueryAggregator;
 }
 
 /**
@@ -95,7 +124,7 @@ export interface MetricProps {
  * component should contain axes as children and use them only informationally
  * without rendering them.
  */
-export class Metric extends React.Component<MetricProps, {}> {
+export class Metric extends React.Component<MetricProps> {
   render(): React.ReactElement<any> {
     throw new Error("Component <Metric /> should never render.");
   }

@@ -1,22 +1,16 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package log
 
-import (
-	"os"
-)
+import "os"
 
 // OrigStderr points to the original stderr stream.
 var OrigStderr = func() *os.File {
@@ -28,21 +22,29 @@ var OrigStderr = func() *os.File {
 	return os.NewFile(fd, os.Stderr.Name())
 }()
 
-// stderrRedirected attempts to track whether stderr was redirected.
-// This is used to de-duplicate the panic log.
-var stderrRedirected bool
+// LoggingToStderr returns true if log messages of the given severity
+// sent to the main logger are also visible on stderr.
+func LoggingToStderr(s Severity) bool {
+	return s >= logging.stderrThreshold.get()
+}
+
+// stderrRedirected returns true if and only if logging to this logger
+// captures stderr output to the log file. This is used e.g. by
+// Shout() to determine whether to report to standard error in
+// addition to logs.
+func (l *loggerT) stderrRedirected() bool {
+	return logging.stderrThreshold > Severity_INFO && !l.noStderrRedirect
+}
 
 // hijackStderr replaces stderr with the given file descriptor.
 //
 // A client that wishes to use the original stderr must use
 // OrigStderr defined above.
 func hijackStderr(f *os.File) error {
-	stderrRedirected = true
 	return redirectStderr(f)
 }
 
 // restoreStderr cancels the effect of hijackStderr().
 func restoreStderr() error {
-	stderrRedirected = false
 	return redirectStderr(OrigStderr)
 }

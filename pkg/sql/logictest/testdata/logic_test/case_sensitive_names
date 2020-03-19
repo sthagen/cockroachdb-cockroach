@@ -1,5 +1,3 @@
-# LogicTest: default distsql
-
 # Case sensitivity of database names
 
 statement ok
@@ -8,13 +6,13 @@ CREATE DATABASE D
 statement ok
 SHOW TABLES FROM d
 
-statement error database "D" does not exist
+statement error target database or schema does not exist
 SHOW TABLES FROM "D"
 
 statement ok
 CREATE DATABASE "E"
 
-statement error database "e" does not exist
+statement error target database or schema does not exist
 SHOW TABLES FROM e
 
 statement ok
@@ -26,40 +24,40 @@ SHOW TABLES FROM "E"
 statement ok
 CREATE TABLE A(x INT)
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 SHOW COLUMNS FROM "A"
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 SHOW INDEXES FROM "A"
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 SHOW CREATE TABLE "A"
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 SHOW GRANTS ON TABLE "A"
 
-statement error relation "test.A" does not exist
+statement error pgcode 42P01 relation "test.A" does not exist
 SHOW GRANTS ON TABLE test."A"
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 SHOW CONSTRAINTS FROM "A"
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 SELECT * FROM "A"
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 INSERT INTO "A"(x) VALUES(1)
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 UPDATE "A" SET x = 42
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 DELETE FROM "A"
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 TRUNCATE "A"
 
-statement error relation "A" does not exist
+statement error pgcode 42P01 relation "A" does not exist
 DROP TABLE "A"
 
 statement ok
@@ -98,40 +96,40 @@ DROP TABLE a
 statement ok
 CREATE TABLE "B"(x INT)
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 SHOW COLUMNS FROM B
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 SHOW INDEXES FROM B
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 SHOW CREATE TABLE B
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 SHOW GRANTS ON TABLE B
 
-statement error relation "test.b" does not exist
+statement error pgcode 42P01 relation "test.b" does not exist
 SHOW GRANTS ON TABLE test.B
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 SHOW CONSTRAINTS FROM B
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 SELECT * FROM B
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 INSERT INTO B(x) VALUES(1)
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 UPDATE B SET x = 42
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 DELETE FROM B
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 TRUNCATE B
 
-statement error relation "b" does not exist
+statement error pgcode 42P01 relation "b" does not exist
 DROP TABLE B
 
 statement ok
@@ -180,10 +178,10 @@ SELECT x, X, "Y" FROM foo
 ----
 x x Y
 
-statement error column name "X" not found
+statement error column "X" does not exist
 SELECT "X" FROM foo
 
-statement error column name "y" not found
+statement error column "y" does not exist
 SELECT Y FROM foo
 
 # The following should not be ambiguous.
@@ -200,9 +198,9 @@ CREATE VIEW XV AS SELECT X, "Y" FROM foo
 query TT
 SHOW CREATE VIEW xv
 ----
-xv  CREATE VIEW xv (x, "Y") AS SELECT x, "Y" FROM test.foo
+xv  CREATE VIEW xv (x, "Y") AS SELECT x, "Y" FROM test.public.foo
 
-query error relation "XV" does not exist
+query error pgcode 42P01 relation "XV" does not exist
 SHOW CREATE VIEW "XV"
 
 statement ok
@@ -211,9 +209,9 @@ CREATE VIEW "YV" AS SELECT X, "Y" FROM foo
 query TT
 SHOW CREATE VIEW "YV"
 ----
-"YV"  CREATE VIEW "YV" (x, "Y") AS SELECT x, "Y" FROM test.foo
+"YV"  CREATE VIEW "YV" (x, "Y") AS SELECT x, "Y" FROM test.public.foo
 
-query error relation "yv" does not exist
+query error pgcode 42P01 relation "yv" does not exist
 SHOW CREATE VIEW YV
 
 # Case sensitivity of index names.
@@ -275,22 +273,8 @@ SELECT "Amélie", "Amélie" FROM Amelie
 Amélie Amélie
 2      1
 
-statement ok
-CREATE TABLE p (a INT PRIMARY KEY) PARTITION BY LIST (a) (
-  PARTITION P1 VALUES IN (1),
-  PARTITION "P1" VALUES IN (2),
-  PARTITION "Amélie" VALUES IN (3)
-)
-
-query TT
-SHOW CREATE TABLE p
+# Check that function names are also recognized case-insensitively.
+query I
+SELECT LENGTH('abc') -- lint: uppercase function OK
 ----
-p  CREATE TABLE p (
-   a INT NOT NULL,
-   CONSTRAINT "primary" PRIMARY KEY (a ASC),
-   FAMILY "primary" (a)
-) PARTITION BY LIST (a) (
-   PARTITION p1 VALUES IN ((1)),
-   PARTITION "P1" VALUES IN ((2)),
-   PARTITION "Amélie" VALUES IN ((3))
-)
+3

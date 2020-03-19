@@ -1,2 +1,0 @@
-set_stmt ::=
-	'SET' 'TRANSACTION' transaction_mode ( ( opt_comma transaction_mode ) )*

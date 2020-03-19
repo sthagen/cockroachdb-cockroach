@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // +build acceptance
 
@@ -22,15 +18,46 @@
 package acceptance
 
 import (
-	"fmt"
+	"context"
 	"os"
+	"os/signal"
 	"testing"
+
+	"github.com/cockroachdb/cockroach/pkg/acceptance/cluster"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
+	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
 func MainTest(m *testing.M) {
-	if *flagRemote {
-		fmt.Fprintln(os.Stderr, "use `make test [...]` instead of `make acceptance [...]` when running remote cluster")
-		os.Exit(1)
-	}
-	RunTests(m)
+	security.SetAssetLoader(securitytest.EmbeddedAssets)
+	serverutils.InitTestServerFactory(server.TestServerFactory)
+	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
+	os.Exit(RunTests(m))
+}
+
+// RunTests runs the tests in a package while gracefully handling interrupts.
+func RunTests(m *testing.M) int {
+	randutil.SeedForTests()
+
+	ctx := context.Background()
+	defer cluster.GenerateCerts(ctx)()
+
+	go func() {
+		// Shut down tests when interrupted (for example CTRL+C).
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt)
+		<-sig
+		select {
+		case <-stopper.ShouldStop():
+		default:
+			// There is a very tiny race here: the cluster might be closing
+			// the stopper simultaneously.
+			stopper.Stop(ctx)
+		}
+	}()
+	return m.Run()
 }

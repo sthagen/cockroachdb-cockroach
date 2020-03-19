@@ -1,0 +1,155 @@
+exec-ddl
+CREATE TABLE parent (x INT, p INT PRIMARY KEY, other INT UNIQUE)
+----
+
+exec-ddl
+CREATE TABLE child (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(p))
+----
+
+build
+DELETE FROM child WHERE c = 4
+----
+delete child
+ ├── columns: <none>
+ ├── fetch columns: c:3 p:4
+ └── select
+      ├── columns: c:3!null p:4!null
+      ├── scan child
+      │    └── columns: c:3!null p:4!null
+      └── filters
+           └── c:3 = 4
+
+build
+DELETE FROM parent WHERE p = 3
+----
+delete parent
+ ├── columns: <none>
+ ├── fetch columns: x:4 parent.p:5 other:6
+ ├── input binding: &1
+ ├── select
+ │    ├── columns: x:4 parent.p:5!null other:6
+ │    ├── scan parent
+ │    │    └── columns: x:4 parent.p:5!null other:6
+ │    └── filters
+ │         └── parent.p:5 = 3
+ └── f-k-checks
+      └── f-k-checks-item: child(p) -> parent(p)
+           └── semi-join (hash)
+                ├── columns: p:7!null
+                ├── with-scan &1
+                │    ├── columns: p:7!null
+                │    └── mapping:
+                │         └──  parent.p:5 => p:7
+                ├── scan child
+                │    └── columns: child.p:9!null
+                └── filters
+                     └── p:7 = child.p:9
+
+exec-ddl
+CREATE TABLE child2 (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(other))
+----
+
+build
+DELETE FROM parent WHERE p = 3
+----
+delete parent
+ ├── columns: <none>
+ ├── fetch columns: x:4 parent.p:5 parent.other:6
+ ├── input binding: &1
+ ├── select
+ │    ├── columns: x:4 parent.p:5!null parent.other:6
+ │    ├── scan parent
+ │    │    └── columns: x:4 parent.p:5!null parent.other:6
+ │    └── filters
+ │         └── parent.p:5 = 3
+ └── f-k-checks
+      ├── f-k-checks-item: child(p) -> parent(p)
+      │    └── semi-join (hash)
+      │         ├── columns: p:7!null
+      │         ├── with-scan &1
+      │         │    ├── columns: p:7!null
+      │         │    └── mapping:
+      │         │         └──  parent.p:5 => p:7
+      │         ├── scan child
+      │         │    └── columns: child.p:9!null
+      │         └── filters
+      │              └── p:7 = child.p:9
+      └── f-k-checks-item: child2(p) -> parent(other)
+           └── semi-join (hash)
+                ├── columns: other:10
+                ├── with-scan &1
+                │    ├── columns: other:10
+                │    └── mapping:
+                │         └──  parent.other:6 => other:10
+                ├── scan child2
+                │    └── columns: child2.p:12!null
+                └── filters
+                     └── other:10 = child2.p:12
+
+exec-ddl
+CREATE TABLE doubleparent (p1 INT, p2 INT, other INT, PRIMARY KEY (p1, p2))
+----
+
+exec-ddl
+CREATE TABLE doublechild (c INT PRIMARY KEY, p1 INT, p2 INT, FOREIGN KEY (p1, p2) REFERENCES doubleparent (p1, p2))
+----
+
+build
+DELETE FROM doubleparent WHERE p1 = 10
+----
+delete doubleparent
+ ├── columns: <none>
+ ├── fetch columns: doubleparent.p1:4 doubleparent.p2:5 other:6
+ ├── input binding: &1
+ ├── select
+ │    ├── columns: doubleparent.p1:4!null doubleparent.p2:5!null other:6
+ │    ├── scan doubleparent
+ │    │    └── columns: doubleparent.p1:4!null doubleparent.p2:5!null other:6
+ │    └── filters
+ │         └── doubleparent.p1:4 = 10
+ └── f-k-checks
+      └── f-k-checks-item: doublechild(p1,p2) -> doubleparent(p1,p2)
+           └── semi-join (hash)
+                ├── columns: p1:7!null p2:8!null
+                ├── with-scan &1
+                │    ├── columns: p1:7!null p2:8!null
+                │    └── mapping:
+                │         ├──  doubleparent.p1:4 => p1:7
+                │         └──  doubleparent.p2:5 => p2:8
+                ├── scan doublechild
+                │    └── columns: doublechild.p1:10 doublechild.p2:11
+                └── filters
+                     ├── p1:7 = doublechild.p1:10
+                     └── p2:8 = doublechild.p2:11
+
+build
+DELETE FROM doublechild WHERE p1 = 10
+----
+delete doublechild
+ ├── columns: <none>
+ ├── fetch columns: c:4 p1:5 p2:6
+ └── select
+      ├── columns: c:4!null p1:5!null p2:6
+      ├── scan doublechild
+      │    └── columns: c:4!null p1:5 p2:6
+      └── filters
+           └── p1:5 = 10
+
+exec-ddl
+CREATE TABLE child_cascade (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(p) ON DELETE CASCADE)
+----
+
+# Fall back to the exec-style checks in the presence of CASCADE.
+build
+DELETE FROM parent WHERE p = 1
+----
+delete parent
+ ├── columns: <none>
+ ├── fetch columns: x:4 parent.p:5 parent.other:6
+ ├── fk-fallback
+ └── select
+      ├── columns: x:4 parent.p:5!null parent.other:6
+      ├── scan parent
+      │    └── columns: x:4 parent.p:5!null parent.other:6
+      └── filters
+           └── parent.p:5 = 1

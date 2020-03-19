@@ -1,13 +1,20 @@
+// Copyright 2019 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 "use strict";
 
 const path = require("path");
 const rimraf = require("rimraf");
 const webpack = require("webpack");
-
-const ForkTsCheckerWebpackPlugin = require("fork-ts-checker-webpack-plugin");
-const HtmlWebpackPlugin = require("html-webpack-plugin");
-
-const title = "Cockroach Console";
+const CopyWebpackPlugin = require("copy-webpack-plugin");
+const VisualizerPlugin = require("webpack-visualizer-plugin");
 
 // Remove a broken dependency that Yarn insists upon installing before every
 // Webpack compile. We also do this when installing dependencies via Make, but
@@ -29,108 +36,142 @@ try {
   DashboardPlugin = class { apply() { /* no-op */ } };
 }
 
+const proxyPrefixes = ["/_admin", "/_status", "/ts", "/login", "/logout"];
+function shouldProxy(reqPath) {
+  if (reqPath === "/") {
+    return true;
+  }
+  return proxyPrefixes.some((prefix) => (
+    reqPath.startsWith(prefix)
+  ));
+}
+
 // tslint:disable:object-literal-sort-keys
-module.exports = (distDir, ...additionalRoots) => ({
-  entry: ["./src/index.tsx"],
-  output: {
-    filename: "bundle.js",
-    path: path.resolve(__dirname, distDir),
-  },
+module.exports = (env, argv) => {
+  let localRoots = [path.resolve(__dirname)];
+  if (env.dist === "ccl") {
+    // CCL modules shadow OSS modules.
+    localRoots.unshift(path.resolve(__dirname, "ccl"));
+  }
 
-  resolve: {
-    // Add resolvable extensions.
-    extensions: [".ts", ".tsx", ".js", ".json", ".styl", ".css"],
-    // Resolve modules from src directory or node_modules.
-    // The "path.resolve" is used to make these into absolute paths, meaning
-    // that only the exact directory is checked. A relative path would follow
-    // the resolution behavior used by node.js for "node_modules", which checks
-    // for a "node_modules" child directory located in either the current
-    // directory *or in any parent directory*.
-    modules: [
-      ...additionalRoots,
-      path.resolve(__dirname),
-      path.resolve(__dirname, "node_modules"),
-    ],
-    alias: {oss: path.resolve(__dirname)},
-  },
+  return {
+    entry: ["./src/index.tsx"],
+    output: {
+      filename: "bundle.js",
+      path: path.resolve(__dirname, `dist${env.dist}`),
+    },
 
-  module: {
-    rules: [
-      { test: /\.css$/, use: [ "style-loader", "css-loader" ] },
-      {
-        test: /\.styl$/,
-        use: [
-          "cache-loader",
-          "style-loader",
-          "css-loader",
-          {
-            loader: "stylus-loader",
-            options: {
-              use: [require("nib")()],
+    mode: argv.mode || "production",
+
+    resolve: {
+      // Add resolvable extensions.
+      extensions: [".ts", ".tsx", ".js", ".json", ".styl", ".css"],
+      // First check for local modules, then for third-party modules from
+      // node_modules.
+      //
+      // These module roots are transformed into absolute paths, by
+      // path.resolve, to ensure that only the exact directory is checked.
+      // Relative paths would trigger the resolution behavior used by Node.js
+      // for "node_modules", i.e., checking for a "node_modules" directory in
+      // the current directory *or any parent directory*.
+      modules: [
+        ...localRoots,
+        path.resolve(__dirname, "node_modules"),
+      ],
+      alias: {oss: path.resolve(__dirname)},
+    },
+
+    module: {
+      rules: [
+        { test: /\.css$/, use: [ "style-loader", "css-loader" ] },
+        {
+          test: /\.styl$/,
+          use: [
+            "cache-loader",
+            "style-loader",
+            "css-loader",
+            {
+              loader: "stylus-loader",
+              options: {
+                use: [require("nib")()],
+              },
             },
+          ],
+        },
+        {
+          test: /\.(png|jpg|gif|svg|eot|ttf|woff|woff2)$/,
+          loader: "url-loader",
+          options: {
+            limit: 10000,
           },
-        ],
-      },
-      {
-        test: /\.(png|jpg|gif|svg|eot|ttf|woff|woff2)$/,
-        loader: "url-loader",
-        options: {
-          limit: 10000,
+        },
+        { test: /\.html$/, loader: "file-loader" },
+        {
+          test: /\.js$/,
+          include: localRoots,
+          use: ["cache-loader", "babel-loader"],
+        },
+        {
+          test: /\.(ts|tsx)?$/,
+          include: localRoots,
+          exclude: /\/node_modules/,
+          use: [
+            "cache-loader",
+            "babel-loader",
+            { loader: "ts-loader", options: { happyPackMode: true } },
+          ],
+        },
+
+        // All output ".js" files will have any sourcemaps re-processed by "source-map-loader".
+        {
+          enforce: "pre",
+          test: /\.js$/,
+          loader: "source-map-loader",
+          include: localRoots,
+          exclude: /\/node_modules/,
+        },
+      ],
+    },
+
+    plugins: [
+      new RemoveBrokenDependenciesPlugin(),
+      // See "DLLs for speedy builds" in the README for details.
+      new webpack.DllReferencePlugin({
+        context: path.resolve(__dirname, `dist${env.dist}`),
+        manifest: require(`./protos.${env.dist}.manifest.json`),
+      }),
+      new webpack.DllReferencePlugin({
+        context: path.resolve(__dirname, `dist${env.dist}`),
+        manifest: require("./vendor.oss.manifest.json"),
+      }),
+      new CopyWebpackPlugin([{ from: "favicon.ico", to: "favicon.ico" }]),
+      new DashboardPlugin(),
+      new VisualizerPlugin({ filename: `../dist/stats.${env.dist}.html` }),
+    ],
+
+    stats: "errors-only",
+
+    devServer: {
+      contentBase: path.join(__dirname, `dist${env.dist}`),
+      index: "",
+      proxy: {
+        "/": {
+          secure: false,
+          target: process.env.TARGET,
         },
       },
-      { test: /\.html$/, loader: "file-loader" },
-      {
-        test: /\.js$/,
-        include: [...additionalRoots, path.resolve(__dirname, "src")],
-        use: ["cache-loader", "babel-loader"],
-      },
-      {
-        test: /\.tsx?$/,
-        include: [...additionalRoots, path.resolve(__dirname, "src")],
-        use: [
-          "cache-loader",
-          "babel-loader",
-          { loader: "ts-loader", options: { happyPackMode: true } },
-        ],
-      },
+    },
 
-      // All output ".js" files will have any sourcemaps re-processed by "source-map-loader".
-      { enforce: "pre", test: /\.js$/, loader: "source-map-loader" },
-    ],
-  },
+    watchOptions: {
+      poll: 1000,
+      ignored: /node_modules/,
+    },
 
-  plugins: [
-    new RemoveBrokenDependenciesPlugin(),
-    new HtmlWebpackPlugin({
-      title: title,
-      template: require("html-webpack-template"),
-      scripts: ["protos.dll.js", "vendor.dll.js"],
-      favicon: "favicon.ico",
-      inject: false,
-      appMountId: "react-layout",
-    }),
-    // See "DLLs for speedy builds" in the README for details.
-    new webpack.DllReferencePlugin({
-      manifest: require("./protos-manifest.json"),
-    }),
-    new webpack.DllReferencePlugin({
-      manifest: require("./vendor-manifest.json"),
-    }),
-    new DashboardPlugin(),
-  ],
-
-  // https://webpack.js.org/configuration/stats/
-  stats: {
-    colors: true,
-    chunks: false,
-  },
-
-  devServer: {
-    contentBase: path.join(__dirname, distDir),
-    proxy: [{
-      context: ["/_admin", "/_status", "/ts"],
-      secure: false,
-      target: process.env.TARGET,
-    }],
-  },
-});
+    // Max size of is set to 4Mb to disable warning message and control
+    // the growing size of bundle over time.
+    performance: {
+      maxEntrypointSize: 4000000,
+      maxAssetSize: 4000000,
+    },
+  };
+};

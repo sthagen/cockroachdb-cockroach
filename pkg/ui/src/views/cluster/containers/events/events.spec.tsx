@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import { assert } from "chai";
 import { shallow } from "enzyme";
@@ -5,6 +15,7 @@ import _ from "lodash";
 import Long from "long";
 import * as sinon from "sinon";
 
+import "src/enzymeInit";
 import * as protos from  "src/js/protos";
 import { EventBoxUnconnected as EventBox, EventRow, getEventInfo } from "src/views/cluster/containers/events";
 import { refreshEvents } from "src/redux/apiReducers";
@@ -13,7 +24,7 @@ import { allEvents } from "src/util/eventTypes";
 type Event = protos.cockroach.server.serverpb.EventsResponse.Event;
 
 function makeEventBox(
-  events: protos.cockroach.server.serverpb.EventsResponse.Event$Properties[],
+  events: protos.cockroach.server.serverpb.EventsResponse.IEvent[],
   refreshEventsFn: typeof refreshEvents,
 ) {
   return shallow(
@@ -81,8 +92,8 @@ describe("<EventRow>", function () {
 
       const provider = makeEvent(e);
       assert.lengthOf(provider.first().children(), 2);
-      const text = provider.first().childAt(0).text();
-      assert(_.includes(text, "created database"));
+      const tooltip = provider.first().childAt(0).childAt(0).childAt(0).childAt(0).childAt(0);
+      assert(_.includes(tooltip.text(), "created database"));
     });
 
     it("correctly renders an unknown event", function () {
@@ -93,8 +104,8 @@ describe("<EventRow>", function () {
 
       const provider = makeEvent(e);
       assert.lengthOf(provider.first().children(), 2);
-      const text = provider.first().childAt(0).text();
-      assert(_.includes(text, "Unknown Event Type"));
+      const tooltip = provider.first().childAt(0).childAt(0).childAt(0).childAt(0).childAt(0);
+      assert(_.includes(tooltip.text(), "Unknown Event Type"));
     });
   });
 });

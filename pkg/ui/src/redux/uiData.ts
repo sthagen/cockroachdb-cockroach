@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import { Action, Dispatch } from "redux";
 import * as protobuf from "protobufjs/minimal";
@@ -42,8 +52,13 @@ export class OptInAttributes {
   updates: boolean = null; // Did the user sign up for product/feature updates
 }
 
-// VERSION_DISMISSED_KEY is the uiData key on the server that tracks when the outdated banner was last dismissed.
+// VERSION_DISMISSED_KEY is the uiData key on the server that tracks when the outdated banner
+// was last dismissed.
 export const VERSION_DISMISSED_KEY = "version_dismissed";
+
+// INSTRUCTIONS_BOX_COLLAPSED_KEY is the uiData key on the server that tracks whether the
+// instructions box on the cluster viz has been collapsed or not.
+export const INSTRUCTIONS_BOX_COLLAPSED_KEY = "clusterviz_instructions_box_collapsed";
 
 export enum UIDataStatus {
   UNINITIALIZED, // Data has not been loaded yet.
@@ -246,7 +261,7 @@ export function getLoadError(state: AdminUIState, key: string): Error {
  * in the local UIDataState store.
  */
 export function saveUIData(...values: KeyValue[]) {
-  return (dispatch: Dispatch<AdminUIState>, getState: () => AdminUIState): Promise<void> => {
+  return (dispatch: Dispatch<Action, AdminUIState>, getState: () => AdminUIState): Promise<void> => {
     const state = getState();
     values = _.filter(values, (kv) => !isInFlight(state, kv.key));
     if (values.length === 0) {
@@ -278,7 +293,7 @@ export function saveUIData(...values: KeyValue[]) {
  * loadUIData loads the values of the give UIData keys from the server.
  */
 export function loadUIData(...keys: string[]) {
-  return (dispatch: Dispatch<AdminUIState>, getState: () => AdminUIState): Promise<void> => {
+  return (dispatch: Dispatch<Action, AdminUIState>, getState: () => AdminUIState): Promise<void> => {
     const state = getState();
     keys = _.filter(keys, (k) => !isInFlight(state, k));
     if (keys.length === 0) {

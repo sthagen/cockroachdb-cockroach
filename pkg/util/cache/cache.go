@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // This code is based on: https://github.com/golang/groupcache/
 
@@ -23,7 +19,6 @@ import (
 	"sync/atomic"
 
 	"github.com/biogo/store/llrb"
-
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -63,6 +58,10 @@ type Config struct {
 	// OnEvicted optionally specifies a callback function to be
 	// executed when an entry is purged from the cache.
 	OnEvicted func(key, value interface{})
+
+	// OnEvictedEntry optionally specifies a callback function to
+	// be executed when an entry is purged from the cache.
+	OnEvictedEntry func(entry *Entry)
 }
 
 // Entry holds the key and value and a pointer to the linked list
@@ -259,9 +258,14 @@ func (bc *baseCache) DelEntry(entry *Entry) {
 
 // Clear clears all entries from the cache.
 func (bc *baseCache) Clear() {
-	if bc.OnEvicted != nil {
+	if bc.OnEvicted != nil || bc.OnEvictedEntry != nil {
 		for e := bc.ll.back(); e != &bc.ll.root; e = e.prev {
-			bc.OnEvicted(e.Key, e.Value)
+			if bc.OnEvicted != nil {
+				bc.OnEvicted(e.Key, e.Value)
+			}
+			if bc.OnEvictedEntry != nil {
+				bc.OnEvictedEntry(e)
+			}
 		}
 	}
 	bc.ll.init()
@@ -284,6 +288,9 @@ func (bc *baseCache) removeElement(e *Entry) {
 	bc.store.del(e)
 	if bc.OnEvicted != nil {
 		bc.OnEvicted(e.Key, e.Value)
+	}
+	if bc.OnEvictedEntry != nil {
+		bc.OnEvictedEntry(e)
 	}
 }
 

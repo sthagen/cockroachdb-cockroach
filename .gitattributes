@@ -1,3 +1,2 @@
-*.ir.* -diff
 *.pb.* -diff
-pkg/sql/ir/irgen/parser/irgen.go -diff
+

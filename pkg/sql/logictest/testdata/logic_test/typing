@@ -1,4 +1,4 @@
-# LogicTest: default
+# LogicTest: local
 
 statement ok
 CREATE TABLE f (x FLOAT)
@@ -16,7 +16,7 @@ SELECT * FROM f
 statement ok
 CREATE TABLE i (x INT)
 
-statement error value type decimal doesn't match type INT of column "x"
+statement error value type decimal doesn't match type int of column "x"
 INSERT INTO i(x) VALUES (4.5)
 
 statement ok
@@ -46,7 +46,7 @@ SELECT * FROM d
 7
 
 statement ok
-UPDATE d SET x = x + 1 WHERE x + SQRT(x) >= 2 + .1
+UPDATE d SET x = x + 1 WHERE x + sqrt(x) >= 2 + .1
 
 query R rowsort
 SELECT * FROM d
@@ -65,14 +65,15 @@ SELECT * FROM s WHERE x > b'\x00'
 statement ok
 INSERT INTO s(x) VALUES (b'qwe'), ('start' || b'end')
 
-statement error value type bytes doesn't match type STRING of column "x"
+statement ok
 INSERT INTO s(x) VALUES (b'\xfffefd')
 
-query T rowsort
-SELECT * from s
+query IT rowsort
+SELECT length(x), encode(x::bytes, 'escape') from s
 ----
-qwe
-startend
+3 qwe
+8 startend
+5 \377fefd
 
 statement error incompatible COALESCE expressions: could not parse "foo" as type int
 INSERT INTO s VALUES (COALESCE(1, 'foo'))
@@ -87,21 +88,21 @@ query error incompatible COALESCE expressions: could not parse "foo" as type int
 SELECT COALESCE(1::INT, 'foo')
 
 query R
-SELECT GREATEST(-1, 1, 2.3, 123456789, 3 + 5, -(-4))
+SELECT greatest(-1, 1, 2.3, 123456789, 3 + 5, -(-4))
 ----
 123456789
 
 query T
-SELECT GREATEST('2010-09-29', '2010-09-28'::TIMESTAMP)
+SELECT greatest('2010-09-29', '2010-09-28'::TIMESTAMP)
 ----
 2010-09-29 00:00:00 +0000 +0000
 
 query T
-SELECT GREATEST('PT12H2M', 'PT12H2M'::INTERVAL, '1s')
+SELECT greatest('PT12H2M', 'PT12H2M'::INTERVAL, '1s')
 ----
-12h2m
+12:02:00
 
-# This is a current limitation where a nested constant that does not get folded (eg. ABS(-9))
+# This is a current limitation where a nested constant that does not get folded (eg. abs(-9))
 # will not be exposed to the same constant type resolution rules as other constants, meaning that
 # it may miss out on being upcast. The limitation could be addressed by either improving the
 # scope of constant folding or improving homogeneous type resolution.
@@ -109,10 +110,10 @@ SELECT GREATEST('PT12H2M', 'PT12H2M'::INTERVAL, '1s')
 #     of all constants for the first resolvableExpr in typeCheckSameTypedExprs when the parent
 #     expression has no desired type.
 query error greatest\(\): expected -1.123 to be of type int, found type decimal
-SELECT GREATEST(-1.123, 1.21313, 2.3, 123456789.321, 3 + 5.3213, -(-4.3213), ABS(-9))
+SELECT greatest(-1.123, 1.21313, 2.3, 123456789.321, 3 + 5.3213, -(-4.3213), abs(-9))
 
 query R
-SELECT GREATEST(-1, 1, 2.3, 123456789, 3 + 5, -(-4), ABS(-9.0))
+SELECT greatest(-1, 1, 2.3, 123456789, 3 + 5, -(-4), abs(-9.0))
 ----
 123456789
 
@@ -125,7 +126,7 @@ INSERT INTO untyped VALUES ('f', '42', '4.2', '4.20', '2010-09-28', '2010-09-28 
 query BIRRTTTT
 SELECT * FROM untyped
 ----
-false   42   4.2    4.20    2010-09-28 00:00:00 +0000 +0000   2010-09-28 12:00:00.1 +0000 +0000   2010-09-29 12:00:00.1 +0000 +0000   12h2m
+false  42  4.2  4.20  2010-09-28 00:00:00 +0000 +0000  2010-09-28 12:00:00.1 +0000 +0000  2010-09-29 12:00:00.1 +0000 UTC  12:02:00
 
 # Issue #14527: support string literal coercion during overload resolution
 query T
@@ -135,11 +136,11 @@ SELECT ts FROM untyped WHERE ts != '2015-09-18 00:00:00'
 
 # Regression tests for #15050
 
-statement error error type checking constant value: could not parse "2017-04-18 18:00" as type timestamp
-CREATE TABLE t15050a (c DECIMAL DEFAULT CASE WHEN NOW() < '2017-04-18 18:00' THEN 2 ELSE 2 END);
+statement error unsupported comparison operator: <timestamptz> < <string>
+CREATE TABLE t15050a (c DECIMAL DEFAULT CASE WHEN now() < 'Not Timestamp' THEN 2 ELSE 2 END);
 
-statement error error type checking constant value: could not parse "2017-04-18 18:00" as type timestamp
-CREATE TABLE t15050b (c DECIMAL DEFAULT IF(NOW() < '2017-04-18 18:00', 2, 2));
+statement error unsupported comparison operator: <timestamptz> < <string>
+CREATE TABLE t15050b (c DECIMAL DEFAULT IF(now() < 'Not Timestamp', 2, 2));
 
 # Regression tests for #15632
 
@@ -166,7 +167,7 @@ SELECT 1 in (SELECT 1)
 ----
 true
 
-statement error unsupported comparison operator: <int> IN <tuple{string}>
+statement error could not parse "a" as type int
 SELECT 1 IN (SELECT 'a')
 
 statement error unsupported comparison operator: <int> IN <tuple{tuple{int, int}}>
@@ -177,5 +178,46 @@ SELECT (1, 2) IN (SELECT 1, 2)
 ----
 true
 
-statement error subquery must return 2 columns, found 1
+query B
 SELECT (1, 2) IN (SELECT (1, 2))
+----
+true
+
+statement ok
+CREATE TABLE t1 (a DATE)
+
+statement ok
+CREATE TABLE t2 (b TIMESTAMPTZ)
+
+statement ok
+INSERT INTO t1 VALUES (DATE '2018-01-01'); INSERT INTO t2 VALUES (TIMESTAMPTZ '2018-01-01');
+
+# Make sure that we do not create invalid filters due to substituting columns
+# with different types.
+query TT
+SELECT * FROM t1, t2 WHERE a = b AND age(b, TIMESTAMPTZ '2017-01-01') > INTERVAL '1 day'
+----
+2018-01-01 00:00:00 +0000 +0000  2018-01-01 00:00:00 +0000 UTC
+
+# Regression test for #44181: allow left side of BETWEEN to be typed
+# differently in the two comparisons.
+query B
+SELECT '' BETWEEN ''::BYTES AND '';
+----
+true
+
+# Regression test for #44632: NULLIF should have the type of the first argument.
+query I
+SELECT NULLIF(NULL, 0) + NULLIF(NULL, 0)
+----
+NULL
+
+query I
+SELECT NULLIF(0, 0) + NULLIF(0, 0)
+----
+NULL
+
+query I
+SELECT NULLIF(0, NULL) + NULLIF(0, NULL)
+----
+0

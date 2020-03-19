@@ -1,31 +1,44 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package json
 
-// ObjectKeyIterator is an iterator to access the keys of an object.
-type ObjectKeyIterator struct {
+// ObjectIterator is an iterator to access the key value pair of an object in
+// sorted order based on key.
+type ObjectIterator struct {
 	src jsonObject
 	idx int
 }
 
-// Next returns true and the next key in the iterator if one exists,
-// and false otherwise.
-func (it *ObjectKeyIterator) Next() (bool, string) {
-	it.idx++
-	if it.idx >= len(it.src) {
-		return false, ""
+func newObjectIterator(src jsonObject) *ObjectIterator {
+	return &ObjectIterator{
+		src: src,
+		idx: -1,
 	}
-	return true, string(it.src[it.idx].k)
+}
+
+// Next updates the cursor and returns whether the next pair exists.
+func (it *ObjectIterator) Next() bool {
+	if it.idx >= len(it.src)-1 {
+		return false
+	}
+	it.idx++
+	return true
+}
+
+// Key returns key of the current pair.
+func (it *ObjectIterator) Key() string {
+	return string(it.src[it.idx].k)
+}
+
+// Value returns value of the current pair
+func (it *ObjectIterator) Value() JSON {
+	return it.src[it.idx].v
 }

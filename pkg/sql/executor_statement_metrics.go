@@ -1,20 +1,17 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
+	"context"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -41,17 +38,18 @@ const (
 	// the session age.
 	sessionInit sessionPhase = iota
 
-	// When a batch of SQL code is received in pgwire.
-	// Used to compute the batch age.
-	sessionStartBatch
-
 	// Executor phases.
-	sessionStartParse
-	sessionEndParse
-	plannerStartLogicalPlan
-	plannerEndLogicalPlan
-	plannerStartExecStmt
-	plannerEndExecStmt
+	sessionQueryReceived    // Query is received.
+	sessionStartParse       // Parse starts.
+	sessionEndParse         // Parse ends.
+	plannerStartLogicalPlan // Planning starts.
+	plannerEndLogicalPlan   // Planning ends.
+	plannerStartExecStmt    // Execution starts.
+	plannerEndExecStmt      // Execution ends.
+
+	// Transaction phases.
+	transactionStart // Transaction starts.
+	transactionEnd   // Transaction ends.
 
 	// sessionNumPhases must be listed last so that it can be used to
 	// define arrays sufficiently large to hold all the other values.
@@ -59,56 +57,74 @@ const (
 )
 
 // phaseTimes is the type of the session.phaseTimes array.
+//
+// It's important that this is an array and not a slice, as we rely on the array
+// copy behavior.
 type phaseTimes [sessionNumPhases]time.Time
 
-type sqlEngineMetrics struct {
+// EngineMetrics groups a set of SQL metrics.
+type EngineMetrics struct {
 	// The subset of SELECTs that are processed through DistSQL.
-	DistSQLSelectCount    *metric.Counter
+	DistSQLSelectCount *metric.Counter
+	// The subset of queries which we attempted and failed to plan with the
+	// cost-based optimizer.
+	SQLOptFallbackCount   *metric.Counter
+	SQLOptPlanCacheHits   *metric.Counter
+	SQLOptPlanCacheMisses *metric.Counter
+
 	DistSQLExecLatency    *metric.Histogram
 	SQLExecLatency        *metric.Histogram
 	DistSQLServiceLatency *metric.Histogram
 	SQLServiceLatency     *metric.Histogram
+	SQLTxnLatency         *metric.Histogram
+
+	// TxnAbortCount counts transactions that were aborted, either due
+	// to non-retriable errors, or retriable errors when the client-side
+	// retry protocol is not in use.
+	TxnAbortCount *metric.Counter
+
+	// FailureCount counts non-retriable errors in open transactions.
+	FailureCount *metric.Counter
 }
 
-// sqlEngineMetrics implements the metric.Struct interface
-var _ metric.Struct = sqlEngineMetrics{}
+// EngineMetrics implements the metric.Struct interface
+var _ metric.Struct = EngineMetrics{}
 
 // MetricStruct is part of the metric.Struct interface.
-func (sqlEngineMetrics) MetricStruct() {}
+func (EngineMetrics) MetricStruct() {}
 
 // recordStatementSummery gathers various details pertaining to the
 // last executed statement/query and performs the associated
-// accounting in the passed-in sqlEngineMetrics.
+// accounting in the passed-in EngineMetrics.
 // - distSQLUsed reports whether the query was distributed.
 // - automaticRetryCount is the count of implicit txn retries
 //   so far.
 // - result is the result set computed by the query/statement.
 // - err is the error encountered, if any.
-func recordStatementSummary(
+func (ex *connExecutor) recordStatementSummary(
+	ctx context.Context,
 	planner *planner,
-	stmt Statement,
-	distSQLUsed bool,
 	automaticRetryCount int,
-	resultWriter StatementResult,
+	rowsAffected int,
 	err error,
-	m *sqlEngineMetrics,
+	bytesRead int64,
+	rowsRead int64,
 ) {
-	phaseTimes := &planner.phaseTimes
+	phaseTimes := &ex.statsCollector.phaseTimes
 
 	// Compute the run latency. This is always recorded in the
 	// server metrics.
 	runLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[plannerStartExecStmt])
 
 	// Collect the statistics.
-	numRows := resultWriter.RowsAffected()
 	runLat := runLatRaw.Seconds()
 
 	parseLat := phaseTimes[sessionEndParse].
 		Sub(phaseTimes[sessionStartParse]).Seconds()
 	planLat := phaseTimes[plannerEndLogicalPlan].
 		Sub(phaseTimes[plannerStartLogicalPlan]).Seconds()
-	// service latency: start to parse to end of run
-	svcLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[sessionStartParse])
+	// service latency: time query received to end of run
+	svcLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[sessionQueryReceived])
 	svcLat := svcLatRaw.Seconds()
 
 	// processing latency: contributing towards SQL results.
@@ -117,44 +133,57 @@ func recordStatementSummary(
 	// overhead latency: txn/retry management, error checking, etc
 	execOverhead := svcLat - processingLat
 
+	stmt := planner.stmt
+	flags := planner.curPlan.flags
 	if automaticRetryCount == 0 {
-		if distSQLUsed {
+		ex.updateOptCounters(flags)
+		m := &ex.metrics.EngineMetrics
+		if flags.IsSet(planFlagDistributed) {
 			if _, ok := stmt.AST.(*tree.Select); ok {
 				m.DistSQLSelectCount.Inc(1)
 			}
 			m.DistSQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
 			m.DistSQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
-		} else {
-			m.SQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
-			m.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 		}
+		m.SQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
+		m.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 	}
 
-	planner.session.appStats.recordStatement(
-		stmt, distSQLUsed, automaticRetryCount, numRows, err,
-		parseLat, planLat, runLat, svcLat, execOverhead,
+	ex.statsCollector.recordStatement(
+		stmt, planner.curPlan.instrumentation.savedPlanForStats,
+		flags.IsSet(planFlagDistributed), flags.IsSet(planFlagImplicitTxn),
+		automaticRetryCount, rowsAffected, err,
+		parseLat, planLat, runLat, svcLat, execOverhead, bytesRead, rowsRead,
 	)
 
 	if log.V(2) {
 		// ages since significant epochs
-		batchAge := phaseTimes[plannerEndExecStmt].
-			Sub(phaseTimes[sessionStartBatch]).Seconds()
 		sessionAge := phaseTimes[plannerEndExecStmt].
 			Sub(phaseTimes[sessionInit]).Seconds()
 
-		log.Infof(planner.session.Ctx(),
+		log.Infof(ctx,
 			"query stats: %d rows, %d retries, "+
 				"parse %.2fµs (%.1f%%), "+
 				"plan %.2fµs (%.1f%%), "+
 				"run %.2fµs (%.1f%%), "+
 				"overhead %.2fµs (%.1f%%), "+
-				"batch age %.3fms, session age %.4fs",
-			numRows, automaticRetryCount,
+				"session age %.4fs",
+			rowsAffected, automaticRetryCount,
 			parseLat*1e6, 100*parseLat/svcLat,
 			planLat*1e6, 100*planLat/svcLat,
 			runLat*1e6, 100*runLat/svcLat,
 			execOverhead*1e6, 100*execOverhead/svcLat,
-			batchAge*1000, sessionAge,
+			sessionAge,
 		)
+	}
+}
+
+func (ex *connExecutor) updateOptCounters(planFlags planFlags) {
+	m := &ex.metrics.EngineMetrics
+
+	if planFlags.IsSet(planFlagOptCacheHit) {
+		m.SQLOptPlanCacheHits.Inc(1)
+	} else if planFlags.IsSet(planFlagOptCacheMiss) {
+		m.SQLOptPlanCacheMisses.Inc(1)
 	}
 }

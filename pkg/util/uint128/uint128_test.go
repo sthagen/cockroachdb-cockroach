@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package uint128
 
@@ -122,5 +118,35 @@ func TestEqual(t *testing.T) {
 		if actual := test.u1.Equal(test.u2); actual != test.expected {
 			t.Errorf("expected: %v.Equal(%v) expected %v but got %v", test.u1, test.u2, test.expected, actual)
 		}
+	}
+}
+
+func TestAnd(t *testing.T) {
+	u1 := Uint128{14799720563850130797, 11152134164166830811}
+	u2 := Uint128{10868624793753271583, 6542293553298186666}
+
+	expected := Uint128{9529907221165552909, 1927615693132931210}
+	if !(u1.And(u2)).Equal(expected) {
+		t.Errorf("incorrect AND computation: %v & %v != %v", u1, u2, expected)
+	}
+}
+
+func TestOr(t *testing.T) {
+	u1 := Uint128{14799720563850130797, 11152134164166830811}
+	u2 := Uint128{10868624793753271583, 6542293553298186666}
+
+	expected := Uint128{16138438136437849471, 15766812024332086267}
+	if !(u1.Or(u2)).Equal(expected) {
+		t.Errorf("incorrect OR computation: %v | %v != %v", u1, u2, expected)
+	}
+}
+
+func TestXor(t *testing.T) {
+	u1 := Uint128{14799720563850130797, 11152134164166830811}
+	u2 := Uint128{10868624793753271583, 6542293553298186666}
+
+	expected := Uint128{6608530915272296562, 13839196331199155057}
+	if !(u1.Xor(u2)).Equal(expected) {
+		t.Errorf("incorrect XOR computation: %v ^ %v != %v", u1, u2, expected)
 	}
 }

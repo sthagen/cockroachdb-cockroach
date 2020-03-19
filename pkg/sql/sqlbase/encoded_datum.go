@@ -1,26 +1,25 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
 import (
 	"bytes"
 	"fmt"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // EncodingDirToDatumEncoding returns an equivalent DatumEncoding for the given
@@ -50,7 +49,7 @@ type EncDatum struct {
 	Datum tree.Datum
 }
 
-func (ed *EncDatum) stringWithAlloc(typ *ColumnType, a *DatumAlloc) string {
+func (ed *EncDatum) stringWithAlloc(typ *types.T, a *DatumAlloc) string {
 	if ed.Datum == nil {
 		if ed.encoded == nil {
 			return "<unset>"
@@ -66,15 +65,41 @@ func (ed *EncDatum) stringWithAlloc(typ *ColumnType, a *DatumAlloc) string {
 	return ed.Datum.String()
 }
 
-func (ed *EncDatum) String(typ *ColumnType) string {
+func (ed *EncDatum) String(typ *types.T) string {
 	return ed.stringWithAlloc(typ, nil)
+}
+
+// BytesEqual is true if the EncDatum's encoded field is equal to the input.
+func (ed *EncDatum) BytesEqual(b []byte) bool {
+	return bytes.Equal(ed.encoded, b)
+}
+
+// EncodedString returns an immutable copy of this EncDatum's encoded field.
+func (ed *EncDatum) EncodedString() string {
+	return string(ed.encoded)
+}
+
+// EncDatumOverhead is the overhead of EncDatum in bytes.
+const EncDatumOverhead = unsafe.Sizeof(EncDatum{})
+
+// Size returns a lower bound on the total size of the receiver in bytes,
+// including memory referenced by the receiver.
+func (ed EncDatum) Size() uintptr {
+	size := EncDatumOverhead
+	if ed.encoded != nil {
+		size += uintptr(len(ed.encoded))
+	}
+	if ed.Datum != nil {
+		size += ed.Datum.Size()
+	}
+	return size
 }
 
 // EncDatumFromEncoded initializes an EncDatum with the given encoded
 // value. The encoded value is stored as a shallow copy, so the caller must
 // make sure the slice is not modified for the lifetime of the EncDatum.
-// SetEncoded wipes the underlying Datum.
-func EncDatumFromEncoded(typ *ColumnType, enc DatumEncoding, encoded []byte) EncDatum {
+// The underlying Datum is nil.
+func EncDatumFromEncoded(enc DatumEncoding, encoded []byte) EncDatum {
 	if len(encoded) == 0 {
 		panic(fmt.Sprintf("empty encoded value"))
 	}
@@ -89,38 +114,57 @@ func EncDatumFromEncoded(typ *ColumnType, enc DatumEncoding, encoded []byte) Enc
 // possibly followed by other data. Similar to EncDatumFromEncoded,
 // except that this function figures out where the encoding stops and returns a
 // slice for the rest of the buffer.
-func EncDatumFromBuffer(typ *ColumnType, enc DatumEncoding, buf []byte) (EncDatum, []byte, error) {
+func EncDatumFromBuffer(typ *types.T, enc DatumEncoding, buf []byte) (EncDatum, []byte, error) {
 	if len(buf) == 0 {
 		return EncDatum{}, nil, errors.New("empty encoded value")
 	}
 	switch enc {
 	case DatumEncoding_ASCENDING_KEY, DatumEncoding_DESCENDING_KEY:
-		encLen, err := encoding.PeekLength(buf)
+		var encLen int
+		var err error
+		encLen, err = encoding.PeekLength(buf)
 		if err != nil {
 			return EncDatum{}, nil, err
 		}
-		ed := EncDatumFromEncoded(typ, enc, buf[:encLen])
+		ed := EncDatumFromEncoded(enc, buf[:encLen])
 		return ed, buf[encLen:], nil
 	case DatumEncoding_VALUE:
 		typeOffset, encLen, err := encoding.PeekValueLength(buf)
 		if err != nil {
 			return EncDatum{}, nil, err
 		}
-		ed := EncDatumFromEncoded(typ, enc, buf[typeOffset:encLen])
+		ed := EncDatumFromEncoded(enc, buf[typeOffset:encLen])
 		return ed, buf[encLen:], nil
 	default:
 		panic(fmt.Sprintf("unknown encoding %s", enc))
 	}
 }
 
+// EncDatumValueFromBufferWithOffsetsAndType is just like calling
+// EncDatumFromBuffer with DatumEncoding_VALUE, except it expects that you pass
+// in the result of calling DecodeValueTag on the input buf. Use this if you've
+// already called DecodeValueTag on buf already, to avoid it getting called
+// more than necessary.
+func EncDatumValueFromBufferWithOffsetsAndType(
+	buf []byte, typeOffset int, dataOffset int, typ encoding.Type,
+) (EncDatum, []byte, error) {
+	encLen, err := encoding.PeekValueLengthWithOffsetsAndType(buf, dataOffset, typ)
+	if err != nil {
+		return EncDatum{}, nil, err
+	}
+	ed := EncDatumFromEncoded(DatumEncoding_VALUE, buf[typeOffset:encLen])
+	return ed, buf[encLen:], nil
+}
+
 // DatumToEncDatum initializes an EncDatum with the given Datum.
-func DatumToEncDatum(ctyp ColumnType, d tree.Datum) EncDatum {
+func DatumToEncDatum(ctyp *types.T, d tree.Datum) EncDatum {
 	if d == nil {
 		panic("Cannot convert nil datum to EncDatum")
 	}
-	if ptyp := ctyp.ToDatumType(); d != tree.DNull && !ptyp.Equivalent(d.ResolvedType()) {
-		panic(fmt.Sprintf("invalid datum type given: %s, expected %s",
-			d.ResolvedType(), ptyp))
+
+	dTyp := d.ResolvedType()
+	if d != tree.DNull && !ctyp.Equivalent(dTyp) && !dTyp.IsAmbiguous() {
+		panic(fmt.Sprintf("invalid datum type given: %s, expected %s", dTyp, ctyp))
 	}
 	return EncDatum{Datum: d}
 }
@@ -132,7 +176,7 @@ func (ed *EncDatum) UnsetDatum() {
 	ed.encoding = 0
 }
 
-// IsUnset returns true if SetEncoded or SetDatum were not called.
+// IsUnset returns true if EncDatumFromEncoded or DatumToEncDatum were not called.
 func (ed *EncDatum) IsUnset() bool {
 	return ed.encoded == nil && ed.Datum == nil
 }
@@ -164,32 +208,32 @@ func (ed *EncDatum) IsNull() bool {
 }
 
 // EnsureDecoded ensures that the Datum field is set (decoding if it is not).
-func (ed *EncDatum) EnsureDecoded(typ *ColumnType, a *DatumAlloc) error {
+func (ed *EncDatum) EnsureDecoded(typ *types.T, a *DatumAlloc) error {
 	if ed.Datum != nil {
 		return nil
 	}
 	if ed.encoded == nil {
-		panic("decoding unset EncDatum")
+		return errors.AssertionFailedf("decoding unset EncDatum")
 	}
-	datType := typ.ToDatumType()
 	var err error
 	var rem []byte
 	switch ed.encoding {
 	case DatumEncoding_ASCENDING_KEY:
-		ed.Datum, rem, err = DecodeTableKey(a, datType, ed.encoded, encoding.Ascending)
+		ed.Datum, rem, err = DecodeTableKey(a, typ, ed.encoded, encoding.Ascending)
 	case DatumEncoding_DESCENDING_KEY:
-		ed.Datum, rem, err = DecodeTableKey(a, datType, ed.encoded, encoding.Descending)
+		ed.Datum, rem, err = DecodeTableKey(a, typ, ed.encoded, encoding.Descending)
 	case DatumEncoding_VALUE:
-		ed.Datum, rem, err = DecodeTableValue(a, datType, ed.encoded)
+		ed.Datum, rem, err = DecodeTableValue(a, typ, ed.encoded)
 	default:
-		panic(fmt.Sprintf("unknown encoding %s", ed.encoding))
+		return errors.AssertionFailedf("unknown encoding %d", log.Safe(ed.encoding))
 	}
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "error decoding %d bytes", log.Safe(len(ed.encoded)))
 	}
 	if len(rem) != 0 {
 		ed.Datum = nil
-		return errors.Errorf("%d trailing bytes in encoded value", len(rem))
+		return errors.AssertionFailedf(
+			"%d trailing bytes in encoded value: %+v", log.Safe(len(rem)), rem)
 	}
 	return nil
 }
@@ -208,7 +252,7 @@ func (ed *EncDatum) Encoding() (DatumEncoding, bool) {
 // Note: DatumEncoding_VALUE encodings are not unique because they can contain
 // a column ID so they should not be used to test for equality.
 func (ed *EncDatum) Encode(
-	typ *ColumnType, a *DatumAlloc, enc DatumEncoding, appendTo []byte,
+	typ *types.T, a *DatumAlloc, enc DatumEncoding, appendTo []byte,
 ) ([]byte, error) {
 	if ed.encoded != nil && enc == ed.encoding {
 		// We already have an encoding that matches that we can use.
@@ -229,12 +273,59 @@ func (ed *EncDatum) Encode(
 	}
 }
 
+// Fingerprint appends a unique hash of ed to the given slice. If datums are intended
+// to be deduplicated or grouped with hashes, this function should be used
+// instead of encode. Additionally, Fingerprint has the property that if the
+// fingerprints of a set of datums are appended together, the resulting
+// fingerprint will uniquely identify the set.
+func (ed *EncDatum) Fingerprint(typ *types.T, a *DatumAlloc, appendTo []byte) ([]byte, error) {
+	if err := ed.EnsureDecoded(typ, a); err != nil {
+		return nil, err
+	}
+	switch typ.Family() {
+	case types.JsonFamily:
+		// We must use value encodings without a column ID even if the EncDatum already
+		// is encoded with the value encoding so that the hashes are indeed unique.
+		return EncodeTableValue(appendTo, ColumnID(encoding.NoColumnID), ed.Datum, a.scratch)
+	case types.ArrayFamily:
+		// Arrays may contain composite data, so we cannot just value
+		// encode an array (that would give same-valued composite
+		// datums a different encoding).
+		if ed.Datum == tree.DNull {
+			return ed.Encode(typ, a, DatumEncoding_ASCENDING_KEY, appendTo)
+		}
+		// Allocate one EncDatum upfront rather than using the DatumToEncDatum
+		// to avoid allocating an EncDatum on each iteration of the loop.
+		e := EncDatum{}
+		array := ed.Datum.(*tree.DArray)
+		// Append a type header to the encoding to differentiate between
+		// NULL and ARRAY[NULL].
+		appendTo = append(appendTo, byte(encoding.Array))
+		var err error
+		for _, d := range array.Array {
+			e.Datum = d
+			appendTo, err = e.Fingerprint(array.ParamTyp, a, appendTo)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return appendTo, nil
+	default:
+		// For values that are key encodable, using the ascending key.
+		// TODO (rohany): However, there should be a knob for the hasher that sees
+		//  what kind of encoding already exists on the enc datums incoming to the
+		//  DistSQL operators, and should use that encoding to avoid re-encoding
+		//  datums into different encoding types as much as possible.
+		return ed.Encode(typ, a, DatumEncoding_ASCENDING_KEY, appendTo)
+	}
+}
+
 // Compare returns:
 //    -1 if the receiver is less than rhs,
 //    0  if the receiver is equal to rhs,
 //    +1 if the receiver is greater than rhs.
 func (ed *EncDatum) Compare(
-	typ *ColumnType, a *DatumAlloc, evalCtx *tree.EvalContext, rhs *EncDatum,
+	typ *types.T, a *DatumAlloc, evalCtx *tree.EvalContext, rhs *EncDatum,
 ) (int, error) {
 	// TODO(radu): if we have both the Datum and a key encoding available, which
 	// one would be faster to use?
@@ -302,7 +393,7 @@ func (ed *EncDatum) GetInt() (int64, error) {
 // EncDatumRow is a row of EncDatums.
 type EncDatumRow []EncDatum
 
-func (r EncDatumRow) stringToBuf(types []ColumnType, a *DatumAlloc, b *bytes.Buffer) {
+func (r EncDatumRow) stringToBuf(types []types.T, a *DatumAlloc, b *bytes.Buffer) {
 	if len(types) != len(r) {
 		panic(fmt.Sprintf("mismatched types (%v) and row (%v)", types, r))
 	}
@@ -316,15 +407,39 @@ func (r EncDatumRow) stringToBuf(types []ColumnType, a *DatumAlloc, b *bytes.Buf
 	b.WriteString("]")
 }
 
-func (r EncDatumRow) String(types []ColumnType) string {
+// Copy makes a copy of this EncDatumRow. Convenient for tests. Use an
+// EncDatumRowAlloc in non-test code.
+func (r EncDatumRow) Copy() EncDatumRow {
+	if r == nil {
+		return nil
+	}
+	rCopy := make(EncDatumRow, len(r))
+	copy(rCopy, r)
+	return rCopy
+}
+
+func (r EncDatumRow) String(types []types.T) string {
 	var b bytes.Buffer
 	r.stringToBuf(types, &DatumAlloc{}, &b)
 	return b.String()
 }
 
+// EncDatumRowOverhead is the overhead of EncDatumRow in bytes.
+const EncDatumRowOverhead = unsafe.Sizeof(EncDatumRow{})
+
+// Size returns a lower bound on the total size all EncDatum's in the receiver,
+// including memory referenced by all EncDatum's.
+func (r EncDatumRow) Size() uintptr {
+	size := EncDatumRowOverhead
+	for _, ed := range r {
+		size += ed.Size()
+	}
+	return size
+}
+
 // EncDatumRowToDatums converts a given EncDatumRow to a Datums.
 func EncDatumRowToDatums(
-	types []ColumnType, datums tree.Datums, row EncDatumRow, da *DatumAlloc,
+	types []types.T, datums tree.Datums, row EncDatumRow, da *DatumAlloc,
 ) error {
 	if len(types) != len(row) {
 		panic(fmt.Sprintf("mismatched types (%v) and row (%v)", types, row))
@@ -359,7 +474,7 @@ func EncDatumRowToDatums(
 // {{0, asc}, {1, asc}} (i.e. ordered by first column and then by second
 // column).
 func (r EncDatumRow) Compare(
-	types []ColumnType,
+	types []types.T,
 	a *DatumAlloc,
 	ordering ColumnOrdering,
 	evalCtx *tree.EvalContext,
@@ -385,7 +500,7 @@ func (r EncDatumRow) Compare(
 
 // CompareToDatums is a version of Compare which compares against decoded Datums.
 func (r EncDatumRow) CompareToDatums(
-	types []ColumnType,
+	types []types.T,
 	a *DatumAlloc,
 	ordering ColumnOrdering,
 	evalCtx *tree.EvalContext,
@@ -409,7 +524,7 @@ func (r EncDatumRow) CompareToDatums(
 // EncDatumRows is a slice of EncDatumRows having the same schema.
 type EncDatumRows []EncDatumRow
 
-func (r EncDatumRows) String(types []ColumnType) string {
+func (r EncDatumRows) String(types []types.T) string {
 	var a DatumAlloc
 	var b bytes.Buffer
 	b.WriteString("[")
@@ -421,6 +536,48 @@ func (r EncDatumRows) String(types []ColumnType) string {
 	}
 	b.WriteString("]")
 	return b.String()
+}
+
+// EncDatumRowContainer holds rows and can cycle through them.
+// Must be Reset upon initialization.
+type EncDatumRowContainer struct {
+	rows  EncDatumRows
+	index int
+}
+
+// Peek returns the current element at the top of the container.
+func (c *EncDatumRowContainer) Peek() EncDatumRow {
+	return c.rows[c.index]
+}
+
+// Pop returns the next row from the container. Will cycle through the rows
+// again if we reach the end.
+func (c *EncDatumRowContainer) Pop() EncDatumRow {
+	if c.index < 0 {
+		c.index = len(c.rows) - 1
+	}
+	row := c.rows[c.index]
+	c.index--
+	return row
+}
+
+// Push adds a row to the container.
+func (c *EncDatumRowContainer) Push(row EncDatumRow) {
+	c.rows = append(c.rows, row)
+	c.index = len(c.rows) - 1
+}
+
+// Reset clears the container and resets the indexes.
+// Must be called upon creating a container.
+func (c *EncDatumRowContainer) Reset() {
+	c.rows = c.rows[:0]
+	c.index = -1
+}
+
+// IsEmpty returns whether the container is "empty", which means that it's about
+// to cycle through its rows again on the next Pop.
+func (c *EncDatumRowContainer) IsEmpty() bool {
+	return c.index == -1
 }
 
 // EncDatumRowAlloc is a helper that speeds up allocation of EncDatumRows

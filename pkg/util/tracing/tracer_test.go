@@ -1,22 +1,19 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tracing
 
 import (
 	"testing"
 
+	"github.com/cockroachdb/logtags"
 	lightstep "github.com/lightstep/lightstep-tracer-go"
 	opentracing "github.com/opentracing/opentracing-go"
 )
@@ -135,7 +132,7 @@ func TestStartChildSpan(t *testing.T) {
 	tr := NewTracer()
 	sp1 := tr.StartSpan("parent", Recordable)
 	StartRecording(sp1, SingleNodeRecording)
-	sp2 := StartChildSpan("child", sp1, false /*!separateRecording*/)
+	sp2 := StartChildSpan("child", sp1, nil /* logTags */, false /*separateRecording*/)
 	sp2.Finish()
 	sp1.Finish()
 	if err := TestingCheckRecordedSpans(GetRecording(sp1), `
@@ -147,7 +144,7 @@ func TestStartChildSpan(t *testing.T) {
 
 	sp1 = tr.StartSpan("parent", Recordable)
 	StartRecording(sp1, SingleNodeRecording)
-	sp2 = StartChildSpan("child", sp1, true /*separateRecording*/)
+	sp2 = StartChildSpan("child", sp1, nil /* logTags */, true /*separateRecording*/)
 	sp2.Finish()
 	sp1.Finish()
 	if err := TestingCheckRecordedSpans(GetRecording(sp1), `
@@ -157,6 +154,21 @@ func TestStartChildSpan(t *testing.T) {
 	}
 	if err := TestingCheckRecordedSpans(GetRecording(sp2), `
 		span child:
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	sp1 = tr.StartSpan("parent", Recordable)
+	StartRecording(sp1, SingleNodeRecording)
+	sp2 = StartChildSpan(
+		"child", sp1, logtags.SingleTagBuffer("key", "val"), false, /*separateRecording*/
+	)
+	sp2.Finish()
+	sp1.Finish()
+	if err := TestingCheckRecordedSpans(GetRecording(sp1), `
+		span parent:
+			span child:
+				tags: key=val
 	`); err != nil {
 		t.Fatal(err)
 	}

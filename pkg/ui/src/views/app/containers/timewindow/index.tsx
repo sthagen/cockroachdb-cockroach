@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import { connect } from "react-redux";
 import moment from "moment";
@@ -65,7 +75,7 @@ class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWind
       this.setWindow(props);
     } else {
       // Set a timeout to reset the window when the current window expires.
-      const newTimeout = setTimeout(() => this.setWindow(props), expires.diff(now).valueOf());
+      const newTimeout = window.setTimeout(() => this.setWindow(props), expires.diff(now).valueOf());
       this.setState({
         timeout: newTimeout,
       });
@@ -78,11 +88,13 @@ class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWind
    */
   setWindow(props: TimeWindowManagerProps) {
     if (!props.timeWindow.scale.windowEnd) {
-      const now = props.now ? props.now() : moment();
-      props.setTimeWindow({
-        start: now.clone().subtract(props.timeWindow.scale.windowSize),
-        end: now,
-      });
+      if (!props.timeWindow.useTimeRage) {
+        const now = props.now ? props.now() : moment();
+        props.setTimeWindow({
+          start: now.clone().subtract(props.timeWindow.scale.windowSize),
+          end: now,
+        });
+      }
     } else {
       const windowEnd = props.timeWindow.scale.windowEnd;
       props.setTimeWindow({

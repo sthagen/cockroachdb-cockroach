@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package binfetcher
 
@@ -20,13 +16,14 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
@@ -136,6 +133,10 @@ func (opts Options) filename() string {
 	return filepath.Base(opts.URL.Path[:len(opts.URL.Path)-len(opts.Suffix)])
 }
 
+// Downloading binaries may take some time, so give ourselves
+// some room before the timeout expires.
+var httpClient = httputil.NewClientWithTimeout(30 * time.Second)
+
 // Download downloads the binary for the given version, and skips the download
 // if the archive is already present in `destDir`.
 //
@@ -165,8 +166,7 @@ func Download(ctx context.Context, opts Options) (string, error) {
 	}
 
 	log.Infof(ctx, "downloading %s to %s", opts.URL.String(), destFileName)
-
-	resp, err := http.Get(opts.URL.String())
+	resp, err := httpClient.Get(ctx, opts.URL.String())
 	if err != nil {
 		return "", err
 	}
@@ -174,6 +174,9 @@ func Download(ctx context.Context, opts Options) (string, error) {
 	if resp.StatusCode != 200 {
 		body, _ := ioutil.ReadAll(resp.Body)
 		return "", errors.Errorf("unexpected HTTP response from %s: %d\n%s", opts.URL.String(), resp.StatusCode, body)
+	}
+	if opts.Version == "LATEST" {
+		log.Infof(ctx, "LATEST redirected to %s", resp.Request.URL.String())
 	}
 
 	destFile, err := os.Create(destFileName)

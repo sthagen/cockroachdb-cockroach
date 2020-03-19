@@ -1,23 +1,33 @@
-import React from "react";
-import { Link } from "react-router";
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
-import { connect } from "react-redux";
 import moment from "moment";
-
-import "./events.styl";
-
+import React from "react";
+import { Helmet } from "react-helmet";
+import { Link, withRouter } from "react-router-dom";
+import { connect } from "react-redux";
 import * as protos from "src/js/protos";
-
-import { AdminUIState } from "src/redux/state";
 import { refreshEvents } from "src/redux/apiReducers";
 import { eventsSelector, eventsValidSelector } from "src/redux/events";
 import { LocalSetting } from "src/redux/localsettings";
+import { AdminUIState } from "src/redux/state";
 import { TimestampToMoment } from "src/util/convert";
 import { getEventDescription } from "src/util/events";
+import { DATE_FORMAT } from "src/util/format";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import { SortedTable } from "src/views/shared/components/sortedtable";
+import { ToolTipWrapper } from "src/views/shared/components/toolTip";
+import "./events.styl";
 
-type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.Event$Properties;
+type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.IEvent;
 
 // Number of events to show in the sidebar.
 const EVENT_BOX_NUM_EVENTS = 10;
@@ -33,13 +43,7 @@ export interface SimplifiedEvent {
   content: React.ReactNode;
 }
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or JSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-const EventSortedTable = SortedTable as new () => SortedTable<SimplifiedEvent>;
+class EventSortedTable extends SortedTable<SimplifiedEvent> {}
 
 export interface EventRowProps {
   event: Event$Properties;
@@ -47,7 +51,7 @@ export interface EventRowProps {
 
 export function getEventInfo(e: Event$Properties): SimplifiedEvent {
   return {
-    fromNowString: TimestampToMoment(e.timestamp).fromNow()
+    fromNowString: TimestampToMoment(e.timestamp).format(DATE_FORMAT)
       .replace("second", "sec")
       .replace("minute", "min"),
     content: <span>{ getEventDescription(e) }</span>,
@@ -60,8 +64,14 @@ export class EventRow extends React.Component<EventRowProps, {}> {
     const { event } = this.props;
     const e = getEventInfo(event);
     return <tr>
-      <td><div className="events__message">{e.content}</div></td>
-      <td><div className="events__timestamp">{e.fromNowString}</div></td>
+      <td>
+        <ToolTipWrapper placement="left" text={ e.content }>
+          <div className="events__message">{e.content}</div>
+        </ToolTipWrapper>
+      </td>
+      <td>
+        <div className="events__timestamp">{e.fromNowString}</div>
+      </td>
     </tr>;
   }
 }
@@ -95,7 +105,7 @@ export class EventBoxUnconnected extends React.Component<EventBoxProps, {}> {
             return <EventRow event={e} key={i} />;
           })}
           <tr>
-            <td className="events__more-link" colSpan={2}><Link to="/cluster/events">View all events</Link></td>
+            <td className="events__more-link" colSpan={2}><Link to="/events">View all events</Link></td>
           </tr>
         </tbody>
       </table>
@@ -130,15 +140,9 @@ export class EventPageUnconnected extends React.Component<EventPageProps, {}> {
     const simplifiedEvents = _.map(events, getEventInfo);
 
     return <div>
-      {
-        // TODO(mrtracy): This currently always links back to the main cluster
-        // page, when it should link back to the dashboard previously visible.
-      }
-      <section className="section parent-link">
-        <Link to="/cluster">&lt; Back to Cluster</Link>
-      </section>
+      <Helmet title="Events" />
       <section className="section section--heading">
-        <h2>Events</h2>
+        <h1 className="base-heading">Events</h1>
       </section>
       <section className="section l-columns">
         <div className="l-columns__left events-table">
@@ -165,7 +169,7 @@ export class EventPageUnconnected extends React.Component<EventPageProps, {}> {
 }
 
 // Connect the EventsList class with our redux store.
-const eventBoxConnected = connect(
+const eventBoxConnected = withRouter(connect(
   (state: AdminUIState) => {
     return {
       events: eventsSelector(state),
@@ -175,10 +179,10 @@ const eventBoxConnected = connect(
   {
     refreshEvents,
   },
-)(EventBoxUnconnected);
+)(EventBoxUnconnected));
 
 // Connect the EventsList class with our redux store.
-const eventPageConnected = connect(
+const eventPageConnected = withRouter(connect(
   (state: AdminUIState) => {
     return {
       events: eventsSelector(state),
@@ -190,7 +194,7 @@ const eventPageConnected = connect(
     refreshEvents,
     setSort: eventsSortSetting.set,
   },
-)(EventPageUnconnected);
+)(EventPageUnconnected));
 
 export { eventBoxConnected as EventBox };
 export { eventPageConnected as EventPage };

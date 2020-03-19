@@ -7,7 +7,7 @@ import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
 
-import binary "encoding/binary"
+import encoding_binary "encoding/binary"
 
 import io "io"
 
@@ -15,6 +15,12 @@ import io "io"
 var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the proto package it is being compiled against.
+// A compilation error at this line likely means your copy of the
+// proto package needs to be updated.
+const _ = proto.GoGoProtoPackageIsVersion2 // please upgrade the proto package
 
 // InternalTimeSeriesData is a collection of data samples for some
 // measurable value, where each sample is taken over a uniform time
@@ -34,6 +40,24 @@ var _ = math.Inf
 // mind, this message does not identify the variable which is actually being
 // measured; that information is expected be encoded in the key where this
 // message is stored.
+//
+// The actual samples can be stored in one of two formats: a Row-based format in
+// the "samples" repeated field, or a columnar format spread across several
+// different repeated columns. The row-based format will eventually be
+// deprecated, but is maintained for backwards compatibility. There is no flag
+// that indicates whether the data is stored as rows or columns; columnar data
+// is indicated by the presence of a non-zero-length "offset" collection, while
+// row data is indicated by a non-zero-length "samples" collection. Each data
+// message must have all of its data either row format or column format.
+//
+// One feature of the columnar layout is that it is "sparse", and columns
+// without useful information are elided. Specifically, the "offset" and "last"
+// columns will always be populated, but the other columns are only populated
+// for resolutions which contain detailed "rollup" information about long sample
+// periods. In the case of non-rollup data there is only one measurement per
+// sample period, and the value of all optional columns can be directly inferred
+// from the "last" column. Eliding those columns represents a significant memory
+// and on-disk savings for our highest resolution data.
 type InternalTimeSeriesData struct {
 	// Holds a wall time, expressed as a unix epoch time in nanoseconds. This
 	// represents the earliest possible timestamp for a sample within the
@@ -41,14 +65,70 @@ type InternalTimeSeriesData struct {
 	StartTimestampNanos int64 `protobuf:"varint,1,opt,name=start_timestamp_nanos,json=startTimestampNanos" json:"start_timestamp_nanos"`
 	// The duration of each sample interval, expressed in nanoseconds.
 	SampleDurationNanos int64 `protobuf:"varint,2,opt,name=sample_duration_nanos,json=sampleDurationNanos" json:"sample_duration_nanos"`
-	// The actual data samples for this metric.
-	Samples []InternalTimeSeriesSample `protobuf:"bytes,3,rep,name=samples" json:"samples"`
+	// The data samples for this metric if this data was written in the old
+	// row format.
+	Samples []InternalTimeSeriesSample `protobuf:"bytes,3,rep,name=samples" json:"samples"` // Deprecated: Do not use.
+	// Columnar array containing the ordered offsets of the samples in this
+	// data set.
+	Offset []int32 `protobuf:"varint,4,rep,packed,name=offset" json:"offset,omitempty"`
+	// Columnar array containing the last value of the samples in this data set;
+	// the "last" value is the most recent individual measurement during a sample
+	// period.
+	Last []float64 `protobuf:"fixed64,5,rep,packed,name=last" json:"last,omitempty"`
+	// Columnar array containing the total number of measurements that were taken
+	// during this sample period.
+	Count []uint32 `protobuf:"varint,6,rep,packed,name=count" json:"count,omitempty"`
+	// Columnar array containing the sum of measurements that were taken during
+	// this sample period. If this column is elided, its value for all samples is
+	// 1.
+	Sum []float64 `protobuf:"fixed64,7,rep,packed,name=sum" json:"sum,omitempty"`
+	// Columnar array containing the maximum value of any single measurement taken
+	// during this sample period. If this column is elided, its value for all
+	// samples is equal to "last".
+	Max []float64 `protobuf:"fixed64,8,rep,packed,name=max" json:"max,omitempty"`
+	// Columnar array containing the minimum value of any single measurements
+	// taken during this sample period. If this column is elided, its value for
+	// all samples is equal to "last".
+	Min []float64 `protobuf:"fixed64,9,rep,packed,name=min" json:"min,omitempty"`
+	// Columnar array containing the first value of the samples in this data set;
+	// the "first" value is the earliest individual measurement during a sample
+	// period. If this column is elided, its value for all samples is equal to
+	// "last".
+	First []float64 `protobuf:"fixed64,10,rep,packed,name=first" json:"first,omitempty"`
+	// Columnar array containing the variance of measurements that were taken
+	// during this sample period. If this column is elided, its value for all
+	// samples is zero.
+	Variance []float64 `protobuf:"fixed64,11,rep,packed,name=variance" json:"variance,omitempty"`
 }
 
-func (m *InternalTimeSeriesData) Reset()                    { *m = InternalTimeSeriesData{} }
-func (m *InternalTimeSeriesData) String() string            { return proto.CompactTextString(m) }
-func (*InternalTimeSeriesData) ProtoMessage()               {}
-func (*InternalTimeSeriesData) Descriptor() ([]byte, []int) { return fileDescriptorInternal, []int{0} }
+func (m *InternalTimeSeriesData) Reset()         { *m = InternalTimeSeriesData{} }
+func (m *InternalTimeSeriesData) String() string { return proto.CompactTextString(m) }
+func (*InternalTimeSeriesData) ProtoMessage()    {}
+func (*InternalTimeSeriesData) Descriptor() ([]byte, []int) {
+	return fileDescriptor_internal_10ecd69bc61e348f, []int{0}
+}
+func (m *InternalTimeSeriesData) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *InternalTimeSeriesData) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *InternalTimeSeriesData) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_InternalTimeSeriesData.Merge(dst, src)
+}
+func (m *InternalTimeSeriesData) XXX_Size() int {
+	return m.Size()
+}
+func (m *InternalTimeSeriesData) XXX_DiscardUnknown() {
+	xxx_messageInfo_InternalTimeSeriesData.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_InternalTimeSeriesData proto.InternalMessageInfo
 
 // A InternalTimeSeriesSample represents data gathered from multiple
 // measurements of a variable value over a given period of time. The
@@ -85,10 +165,34 @@ type InternalTimeSeriesSample struct {
 	Min *float64 `protobuf:"fixed64,9,opt,name=min" json:"min,omitempty"`
 }
 
-func (m *InternalTimeSeriesSample) Reset()                    { *m = InternalTimeSeriesSample{} }
-func (m *InternalTimeSeriesSample) String() string            { return proto.CompactTextString(m) }
-func (*InternalTimeSeriesSample) ProtoMessage()               {}
-func (*InternalTimeSeriesSample) Descriptor() ([]byte, []int) { return fileDescriptorInternal, []int{1} }
+func (m *InternalTimeSeriesSample) Reset()         { *m = InternalTimeSeriesSample{} }
+func (m *InternalTimeSeriesSample) String() string { return proto.CompactTextString(m) }
+func (*InternalTimeSeriesSample) ProtoMessage()    {}
+func (*InternalTimeSeriesSample) Descriptor() ([]byte, []int) {
+	return fileDescriptor_internal_10ecd69bc61e348f, []int{1}
+}
+func (m *InternalTimeSeriesSample) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *InternalTimeSeriesSample) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *InternalTimeSeriesSample) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_InternalTimeSeriesSample.Merge(dst, src)
+}
+func (m *InternalTimeSeriesSample) XXX_Size() int {
+	return m.Size()
+}
+func (m *InternalTimeSeriesSample) XXX_DiscardUnknown() {
+	xxx_messageInfo_InternalTimeSeriesSample.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_InternalTimeSeriesSample proto.InternalMessageInfo
 
 func init() {
 	proto.RegisterType((*InternalTimeSeriesData)(nil), "cockroach.roachpb.InternalTimeSeriesData")
@@ -127,6 +231,101 @@ func (m *InternalTimeSeriesData) MarshalTo(dAtA []byte) (int, error) {
 			i += n
 		}
 	}
+	if len(m.Offset) > 0 {
+		dAtA2 := make([]byte, len(m.Offset)*10)
+		var j1 int
+		for _, num1 := range m.Offset {
+			num := uint64(num1)
+			for num >= 1<<7 {
+				dAtA2[j1] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j1++
+			}
+			dAtA2[j1] = uint8(num)
+			j1++
+		}
+		dAtA[i] = 0x22
+		i++
+		i = encodeVarintInternal(dAtA, i, uint64(j1))
+		i += copy(dAtA[i:], dAtA2[:j1])
+	}
+	if len(m.Last) > 0 {
+		dAtA[i] = 0x2a
+		i++
+		i = encodeVarintInternal(dAtA, i, uint64(len(m.Last)*8))
+		for _, num := range m.Last {
+			f3 := math.Float64bits(float64(num))
+			encoding_binary.LittleEndian.PutUint64(dAtA[i:], uint64(f3))
+			i += 8
+		}
+	}
+	if len(m.Count) > 0 {
+		dAtA5 := make([]byte, len(m.Count)*10)
+		var j4 int
+		for _, num := range m.Count {
+			for num >= 1<<7 {
+				dAtA5[j4] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j4++
+			}
+			dAtA5[j4] = uint8(num)
+			j4++
+		}
+		dAtA[i] = 0x32
+		i++
+		i = encodeVarintInternal(dAtA, i, uint64(j4))
+		i += copy(dAtA[i:], dAtA5[:j4])
+	}
+	if len(m.Sum) > 0 {
+		dAtA[i] = 0x3a
+		i++
+		i = encodeVarintInternal(dAtA, i, uint64(len(m.Sum)*8))
+		for _, num := range m.Sum {
+			f6 := math.Float64bits(float64(num))
+			encoding_binary.LittleEndian.PutUint64(dAtA[i:], uint64(f6))
+			i += 8
+		}
+	}
+	if len(m.Max) > 0 {
+		dAtA[i] = 0x42
+		i++
+		i = encodeVarintInternal(dAtA, i, uint64(len(m.Max)*8))
+		for _, num := range m.Max {
+			f7 := math.Float64bits(float64(num))
+			encoding_binary.LittleEndian.PutUint64(dAtA[i:], uint64(f7))
+			i += 8
+		}
+	}
+	if len(m.Min) > 0 {
+		dAtA[i] = 0x4a
+		i++
+		i = encodeVarintInternal(dAtA, i, uint64(len(m.Min)*8))
+		for _, num := range m.Min {
+			f8 := math.Float64bits(float64(num))
+			encoding_binary.LittleEndian.PutUint64(dAtA[i:], uint64(f8))
+			i += 8
+		}
+	}
+	if len(m.First) > 0 {
+		dAtA[i] = 0x52
+		i++
+		i = encodeVarintInternal(dAtA, i, uint64(len(m.First)*8))
+		for _, num := range m.First {
+			f9 := math.Float64bits(float64(num))
+			encoding_binary.LittleEndian.PutUint64(dAtA[i:], uint64(f9))
+			i += 8
+		}
+	}
+	if len(m.Variance) > 0 {
+		dAtA[i] = 0x5a
+		i++
+		i = encodeVarintInternal(dAtA, i, uint64(len(m.Variance)*8))
+		for _, num := range m.Variance {
+			f10 := math.Float64bits(float64(num))
+			encoding_binary.LittleEndian.PutUint64(dAtA[i:], uint64(f10))
+			i += 8
+		}
+	}
 	return i, nil
 }
 
@@ -153,18 +352,18 @@ func (m *InternalTimeSeriesSample) MarshalTo(dAtA []byte) (int, error) {
 	i = encodeVarintInternal(dAtA, i, uint64(m.Count))
 	dAtA[i] = 0x39
 	i++
-	binary.LittleEndian.PutUint64(dAtA[i:], uint64(math.Float64bits(float64(m.Sum))))
+	encoding_binary.LittleEndian.PutUint64(dAtA[i:], uint64(math.Float64bits(float64(m.Sum))))
 	i += 8
 	if m.Max != nil {
 		dAtA[i] = 0x41
 		i++
-		binary.LittleEndian.PutUint64(dAtA[i:], uint64(math.Float64bits(float64(*m.Max))))
+		encoding_binary.LittleEndian.PutUint64(dAtA[i:], uint64(math.Float64bits(float64(*m.Max))))
 		i += 8
 	}
 	if m.Min != nil {
 		dAtA[i] = 0x49
 		i++
-		binary.LittleEndian.PutUint64(dAtA[i:], uint64(math.Float64bits(float64(*m.Min))))
+		encoding_binary.LittleEndian.PutUint64(dAtA[i:], uint64(math.Float64bits(float64(*m.Min))))
 		i += 8
 	}
 	return i, nil
@@ -179,7 +378,212 @@ func encodeVarintInternal(dAtA []byte, offset int, v uint64) int {
 	dAtA[offset] = uint8(v)
 	return offset + 1
 }
+func NewPopulatedInternalTimeSeriesData(r randyInternal, easy bool) *InternalTimeSeriesData {
+	this := &InternalTimeSeriesData{}
+	this.StartTimestampNanos = int64(r.Int63())
+	if r.Intn(2) == 0 {
+		this.StartTimestampNanos *= -1
+	}
+	this.SampleDurationNanos = int64(r.Int63())
+	if r.Intn(2) == 0 {
+		this.SampleDurationNanos *= -1
+	}
+	if r.Intn(10) != 0 {
+		v1 := r.Intn(5)
+		this.Samples = make([]InternalTimeSeriesSample, v1)
+		for i := 0; i < v1; i++ {
+			v2 := NewPopulatedInternalTimeSeriesSample(r, easy)
+			this.Samples[i] = *v2
+		}
+	}
+	if r.Intn(10) != 0 {
+		v3 := r.Intn(10)
+		this.Offset = make([]int32, v3)
+		for i := 0; i < v3; i++ {
+			this.Offset[i] = int32(r.Int31())
+			if r.Intn(2) == 0 {
+				this.Offset[i] *= -1
+			}
+		}
+	}
+	if r.Intn(10) != 0 {
+		v4 := r.Intn(10)
+		this.Last = make([]float64, v4)
+		for i := 0; i < v4; i++ {
+			this.Last[i] = float64(r.Float64())
+			if r.Intn(2) == 0 {
+				this.Last[i] *= -1
+			}
+		}
+	}
+	if r.Intn(10) != 0 {
+		v5 := r.Intn(10)
+		this.Count = make([]uint32, v5)
+		for i := 0; i < v5; i++ {
+			this.Count[i] = uint32(r.Uint32())
+		}
+	}
+	if r.Intn(10) != 0 {
+		v6 := r.Intn(10)
+		this.Sum = make([]float64, v6)
+		for i := 0; i < v6; i++ {
+			this.Sum[i] = float64(r.Float64())
+			if r.Intn(2) == 0 {
+				this.Sum[i] *= -1
+			}
+		}
+	}
+	if r.Intn(10) != 0 {
+		v7 := r.Intn(10)
+		this.Max = make([]float64, v7)
+		for i := 0; i < v7; i++ {
+			this.Max[i] = float64(r.Float64())
+			if r.Intn(2) == 0 {
+				this.Max[i] *= -1
+			}
+		}
+	}
+	if r.Intn(10) != 0 {
+		v8 := r.Intn(10)
+		this.Min = make([]float64, v8)
+		for i := 0; i < v8; i++ {
+			this.Min[i] = float64(r.Float64())
+			if r.Intn(2) == 0 {
+				this.Min[i] *= -1
+			}
+		}
+	}
+	if r.Intn(10) != 0 {
+		v9 := r.Intn(10)
+		this.First = make([]float64, v9)
+		for i := 0; i < v9; i++ {
+			this.First[i] = float64(r.Float64())
+			if r.Intn(2) == 0 {
+				this.First[i] *= -1
+			}
+		}
+	}
+	if r.Intn(10) != 0 {
+		v10 := r.Intn(10)
+		this.Variance = make([]float64, v10)
+		for i := 0; i < v10; i++ {
+			this.Variance[i] = float64(r.Float64())
+			if r.Intn(2) == 0 {
+				this.Variance[i] *= -1
+			}
+		}
+	}
+	if !easy && r.Intn(10) != 0 {
+	}
+	return this
+}
+
+func NewPopulatedInternalTimeSeriesSample(r randyInternal, easy bool) *InternalTimeSeriesSample {
+	this := &InternalTimeSeriesSample{}
+	this.Offset = int32(r.Int31())
+	if r.Intn(2) == 0 {
+		this.Offset *= -1
+	}
+	this.Count = uint32(r.Uint32())
+	this.Sum = float64(r.Float64())
+	if r.Intn(2) == 0 {
+		this.Sum *= -1
+	}
+	if r.Intn(10) != 0 {
+		v11 := float64(r.Float64())
+		if r.Intn(2) == 0 {
+			v11 *= -1
+		}
+		this.Max = &v11
+	}
+	if r.Intn(10) != 0 {
+		v12 := float64(r.Float64())
+		if r.Intn(2) == 0 {
+			v12 *= -1
+		}
+		this.Min = &v12
+	}
+	if !easy && r.Intn(10) != 0 {
+	}
+	return this
+}
+
+type randyInternal interface {
+	Float32() float32
+	Float64() float64
+	Int63() int64
+	Int31() int32
+	Uint32() uint32
+	Intn(n int) int
+}
+
+func randUTF8RuneInternal(r randyInternal) rune {
+	ru := r.Intn(62)
+	if ru < 10 {
+		return rune(ru + 48)
+	} else if ru < 36 {
+		return rune(ru + 55)
+	}
+	return rune(ru + 61)
+}
+func randStringInternal(r randyInternal) string {
+	v13 := r.Intn(100)
+	tmps := make([]rune, v13)
+	for i := 0; i < v13; i++ {
+		tmps[i] = randUTF8RuneInternal(r)
+	}
+	return string(tmps)
+}
+func randUnrecognizedInternal(r randyInternal, maxFieldNumber int) (dAtA []byte) {
+	l := r.Intn(5)
+	for i := 0; i < l; i++ {
+		wire := r.Intn(4)
+		if wire == 3 {
+			wire = 5
+		}
+		fieldNumber := maxFieldNumber + r.Intn(100)
+		dAtA = randFieldInternal(dAtA, r, fieldNumber, wire)
+	}
+	return dAtA
+}
+func randFieldInternal(dAtA []byte, r randyInternal, fieldNumber int, wire int) []byte {
+	key := uint32(fieldNumber)<<3 | uint32(wire)
+	switch wire {
+	case 0:
+		dAtA = encodeVarintPopulateInternal(dAtA, uint64(key))
+		v14 := r.Int63()
+		if r.Intn(2) == 0 {
+			v14 *= -1
+		}
+		dAtA = encodeVarintPopulateInternal(dAtA, uint64(v14))
+	case 1:
+		dAtA = encodeVarintPopulateInternal(dAtA, uint64(key))
+		dAtA = append(dAtA, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)))
+	case 2:
+		dAtA = encodeVarintPopulateInternal(dAtA, uint64(key))
+		ll := r.Intn(100)
+		dAtA = encodeVarintPopulateInternal(dAtA, uint64(ll))
+		for j := 0; j < ll; j++ {
+			dAtA = append(dAtA, byte(r.Intn(256)))
+		}
+	default:
+		dAtA = encodeVarintPopulateInternal(dAtA, uint64(key))
+		dAtA = append(dAtA, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)))
+	}
+	return dAtA
+}
+func encodeVarintPopulateInternal(dAtA []byte, v uint64) []byte {
+	for v >= 1<<7 {
+		dAtA = append(dAtA, uint8(uint64(v)&0x7f|0x80))
+		v >>= 7
+	}
+	dAtA = append(dAtA, uint8(v))
+	return dAtA
+}
 func (m *InternalTimeSeriesData) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovInternal(uint64(m.StartTimestampNanos))
@@ -190,10 +594,45 @@ func (m *InternalTimeSeriesData) Size() (n int) {
 			n += 1 + l + sovInternal(uint64(l))
 		}
 	}
+	if len(m.Offset) > 0 {
+		l = 0
+		for _, e := range m.Offset {
+			l += sovInternal(uint64(e))
+		}
+		n += 1 + sovInternal(uint64(l)) + l
+	}
+	if len(m.Last) > 0 {
+		n += 1 + sovInternal(uint64(len(m.Last)*8)) + len(m.Last)*8
+	}
+	if len(m.Count) > 0 {
+		l = 0
+		for _, e := range m.Count {
+			l += sovInternal(uint64(e))
+		}
+		n += 1 + sovInternal(uint64(l)) + l
+	}
+	if len(m.Sum) > 0 {
+		n += 1 + sovInternal(uint64(len(m.Sum)*8)) + len(m.Sum)*8
+	}
+	if len(m.Max) > 0 {
+		n += 1 + sovInternal(uint64(len(m.Max)*8)) + len(m.Max)*8
+	}
+	if len(m.Min) > 0 {
+		n += 1 + sovInternal(uint64(len(m.Min)*8)) + len(m.Min)*8
+	}
+	if len(m.First) > 0 {
+		n += 1 + sovInternal(uint64(len(m.First)*8)) + len(m.First)*8
+	}
+	if len(m.Variance) > 0 {
+		n += 1 + sovInternal(uint64(len(m.Variance)*8)) + len(m.Variance)*8
+	}
 	return n
 }
 
 func (m *InternalTimeSeriesSample) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovInternal(uint64(m.Offset))
@@ -319,6 +758,458 @@ func (m *InternalTimeSeriesData) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 4:
+			if wireType == 0 {
+				var v int32
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowInternal
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= (int32(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.Offset = append(m.Offset, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowInternal
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthInternal
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.Offset) == 0 {
+					m.Offset = make([]int32, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v int32
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowInternal
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= (int32(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.Offset = append(m.Offset, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Offset", wireType)
+			}
+		case 5:
+			if wireType == 1 {
+				var v uint64
+				if (iNdEx + 8) > l {
+					return io.ErrUnexpectedEOF
+				}
+				v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+				iNdEx += 8
+				v2 := float64(math.Float64frombits(v))
+				m.Last = append(m.Last, v2)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowInternal
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthInternal
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				elementCount = packedLen / 8
+				if elementCount != 0 && len(m.Last) == 0 {
+					m.Last = make([]float64, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint64
+					if (iNdEx + 8) > l {
+						return io.ErrUnexpectedEOF
+					}
+					v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+					iNdEx += 8
+					v2 := float64(math.Float64frombits(v))
+					m.Last = append(m.Last, v2)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Last", wireType)
+			}
+		case 6:
+			if wireType == 0 {
+				var v uint32
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowInternal
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= (uint32(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.Count = append(m.Count, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowInternal
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthInternal
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.Count) == 0 {
+					m.Count = make([]uint32, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint32
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowInternal
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= (uint32(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.Count = append(m.Count, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Count", wireType)
+			}
+		case 7:
+			if wireType == 1 {
+				var v uint64
+				if (iNdEx + 8) > l {
+					return io.ErrUnexpectedEOF
+				}
+				v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+				iNdEx += 8
+				v2 := float64(math.Float64frombits(v))
+				m.Sum = append(m.Sum, v2)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowInternal
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthInternal
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				elementCount = packedLen / 8
+				if elementCount != 0 && len(m.Sum) == 0 {
+					m.Sum = make([]float64, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint64
+					if (iNdEx + 8) > l {
+						return io.ErrUnexpectedEOF
+					}
+					v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+					iNdEx += 8
+					v2 := float64(math.Float64frombits(v))
+					m.Sum = append(m.Sum, v2)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Sum", wireType)
+			}
+		case 8:
+			if wireType == 1 {
+				var v uint64
+				if (iNdEx + 8) > l {
+					return io.ErrUnexpectedEOF
+				}
+				v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+				iNdEx += 8
+				v2 := float64(math.Float64frombits(v))
+				m.Max = append(m.Max, v2)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowInternal
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthInternal
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				elementCount = packedLen / 8
+				if elementCount != 0 && len(m.Max) == 0 {
+					m.Max = make([]float64, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint64
+					if (iNdEx + 8) > l {
+						return io.ErrUnexpectedEOF
+					}
+					v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+					iNdEx += 8
+					v2 := float64(math.Float64frombits(v))
+					m.Max = append(m.Max, v2)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Max", wireType)
+			}
+		case 9:
+			if wireType == 1 {
+				var v uint64
+				if (iNdEx + 8) > l {
+					return io.ErrUnexpectedEOF
+				}
+				v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+				iNdEx += 8
+				v2 := float64(math.Float64frombits(v))
+				m.Min = append(m.Min, v2)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowInternal
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthInternal
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				elementCount = packedLen / 8
+				if elementCount != 0 && len(m.Min) == 0 {
+					m.Min = make([]float64, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint64
+					if (iNdEx + 8) > l {
+						return io.ErrUnexpectedEOF
+					}
+					v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+					iNdEx += 8
+					v2 := float64(math.Float64frombits(v))
+					m.Min = append(m.Min, v2)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Min", wireType)
+			}
+		case 10:
+			if wireType == 1 {
+				var v uint64
+				if (iNdEx + 8) > l {
+					return io.ErrUnexpectedEOF
+				}
+				v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+				iNdEx += 8
+				v2 := float64(math.Float64frombits(v))
+				m.First = append(m.First, v2)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowInternal
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthInternal
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				elementCount = packedLen / 8
+				if elementCount != 0 && len(m.First) == 0 {
+					m.First = make([]float64, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint64
+					if (iNdEx + 8) > l {
+						return io.ErrUnexpectedEOF
+					}
+					v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+					iNdEx += 8
+					v2 := float64(math.Float64frombits(v))
+					m.First = append(m.First, v2)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field First", wireType)
+			}
+		case 11:
+			if wireType == 1 {
+				var v uint64
+				if (iNdEx + 8) > l {
+					return io.ErrUnexpectedEOF
+				}
+				v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+				iNdEx += 8
+				v2 := float64(math.Float64frombits(v))
+				m.Variance = append(m.Variance, v2)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowInternal
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthInternal
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				elementCount = packedLen / 8
+				if elementCount != 0 && len(m.Variance) == 0 {
+					m.Variance = make([]float64, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint64
+					if (iNdEx + 8) > l {
+						return io.ErrUnexpectedEOF
+					}
+					v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+					iNdEx += 8
+					v2 := float64(math.Float64frombits(v))
+					m.Variance = append(m.Variance, v2)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Variance", wireType)
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipInternal(dAtA[iNdEx:])
@@ -415,7 +1306,7 @@ func (m *InternalTimeSeriesSample) Unmarshal(dAtA []byte) error {
 			if (iNdEx + 8) > l {
 				return io.ErrUnexpectedEOF
 			}
-			v = uint64(binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+			v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
 			iNdEx += 8
 			m.Sum = float64(math.Float64frombits(v))
 		case 8:
@@ -426,7 +1317,7 @@ func (m *InternalTimeSeriesSample) Unmarshal(dAtA []byte) error {
 			if (iNdEx + 8) > l {
 				return io.ErrUnexpectedEOF
 			}
-			v = uint64(binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+			v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
 			iNdEx += 8
 			v2 := float64(math.Float64frombits(v))
 			m.Max = &v2
@@ -438,7 +1329,7 @@ func (m *InternalTimeSeriesSample) Unmarshal(dAtA []byte) error {
 			if (iNdEx + 8) > l {
 				return io.ErrUnexpectedEOF
 			}
-			v = uint64(binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+			v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
 			iNdEx += 8
 			v2 := float64(math.Float64frombits(v))
 			m.Min = &v2
@@ -568,27 +1459,34 @@ var (
 	ErrIntOverflowInternal   = fmt.Errorf("proto: integer overflow")
 )
 
-func init() { proto.RegisterFile("roachpb/internal.proto", fileDescriptorInternal) }
+func init() { proto.RegisterFile("roachpb/internal.proto", fileDescriptor_internal_10ecd69bc61e348f) }
 
-var fileDescriptorInternal = []byte{
-	// 300 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x74, 0x8f, 0xc1, 0x4a, 0xc3, 0x30,
-	0x18, 0x80, 0x1b, 0xeb, 0x56, 0x8d, 0x08, 0x1a, 0xb5, 0x84, 0x21, 0xb1, 0xee, 0x54, 0x10, 0x3a,
-	0xf0, 0xe4, 0x79, 0xec, 0x22, 0x82, 0x87, 0x6d, 0x27, 0x2f, 0x25, 0xd6, 0x6c, 0x06, 0x97, 0xa4,
-	0x24, 0x29, 0xf8, 0x18, 0x7b, 0xac, 0x1e, 0x3d, 0xea, 0x45, 0xb4, 0xbe, 0x88, 0x34, 0xcd, 0x0e,
-	0x32, 0xbc, 0x85, 0xef, 0xff, 0xbe, 0x9f, 0xfc, 0x30, 0xd6, 0x8a, 0x16, 0xcf, 0xe5, 0xe3, 0x88,
-	0x4b, 0xcb, 0xb4, 0xa4, 0xab, 0xac, 0xd4, 0xca, 0x2a, 0x74, 0x5c, 0xa8, 0xe2, 0xc5, 0xcd, 0x32,
-	0x6f, 0x0c, 0x4e, 0x97, 0x6a, 0xa9, 0xdc, 0x74, 0xd4, 0xbe, 0x3a, 0x71, 0xf8, 0x01, 0x60, 0x7c,
-	0xeb, 0xdb, 0x39, 0x17, 0x6c, 0xc6, 0x34, 0x67, 0x66, 0x42, 0x2d, 0x45, 0x37, 0xf0, 0xcc, 0x58,
-	0xaa, 0x6d, 0x6e, 0xb9, 0x60, 0xc6, 0x52, 0x51, 0xe6, 0x92, 0x4a, 0x65, 0x30, 0x48, 0x40, 0x1a,
-	0x8e, 0x77, 0xeb, 0xcf, 0x8b, 0x60, 0x7a, 0xe2, 0x94, 0xf9, 0xc6, 0xb8, 0x6f, 0x05, 0x57, 0x52,
-	0x51, 0xae, 0x58, 0xfe, 0x54, 0x69, 0x6a, 0xb9, 0x92, 0xbe, 0xdc, 0xf9, 0x53, 0x3a, 0x65, 0xe2,
-	0x8d, 0xae, 0xbc, 0x83, 0x51, 0x87, 0x0d, 0x0e, 0x93, 0x30, 0x3d, 0xb8, 0xbe, 0xca, 0xb6, 0x2e,
-	0xc9, 0xb6, 0xff, 0x3b, 0x73, 0x8d, 0x5f, 0xbc, 0xd9, 0x30, 0x5c, 0x03, 0x88, 0xff, 0x73, 0xd1,
-	0x39, 0xec, 0xab, 0xc5, 0xc2, 0x30, 0xeb, 0xce, 0xe9, 0xf9, 0xd6, 0x33, 0x34, 0x80, 0xbd, 0x42,
-	0x55, 0xd2, 0xe2, 0x7e, 0x02, 0xd2, 0x43, 0x3f, 0xec, 0x10, 0x8a, 0x61, 0x68, 0x2a, 0x81, 0xa3,
-	0x04, 0xa4, 0xc0, 0x4f, 0x5a, 0x80, 0x8e, 0x60, 0x28, 0xe8, 0x2b, 0xde, 0x6b, 0xf9, 0xb4, 0x7d,
-	0x3a, 0xc2, 0x25, 0xde, 0xf7, 0x84, 0xcb, 0xf1, 0x65, 0xfd, 0x4d, 0x82, 0xba, 0x21, 0xe0, 0xad,
-	0x21, 0xe0, 0xbd, 0x21, 0xe0, 0xab, 0x21, 0x60, 0xfd, 0x43, 0x82, 0x87, 0xc8, 0x5f, 0xf7, 0x1b,
-	0x00, 0x00, 0xff, 0xff, 0xff, 0xd1, 0x2a, 0x47, 0xd3, 0x01, 0x00, 0x00,
+var fileDescriptor_internal_10ecd69bc61e348f = []byte{
+	// 408 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x74, 0x91, 0xb1, 0x8e, 0xd3, 0x30,
+	0x00, 0x86, 0xe3, 0x73, 0xd2, 0x1e, 0x3e, 0x9d, 0x54, 0xcc, 0x11, 0x59, 0x15, 0xf2, 0x45, 0x37,
+	0x19, 0x21, 0xe5, 0x24, 0x26, 0xc4, 0x18, 0xdd, 0xc2, 0x00, 0x43, 0xef, 0x26, 0x96, 0xca, 0x04,
+	0xf7, 0xb0, 0x68, 0xec, 0xc8, 0x76, 0x51, 0x1f, 0x83, 0x89, 0x99, 0x9d, 0x17, 0xe0, 0x11, 0x3a,
+	0x76, 0xec, 0x84, 0x20, 0x7d, 0x11, 0x14, 0xc7, 0x49, 0x41, 0xd5, 0x6d, 0xcd, 0xf7, 0xff, 0xbf,
+	0xe5, 0xaf, 0x46, 0xa9, 0xd1, 0xbc, 0xfc, 0x54, 0x7f, 0xb8, 0x96, 0xca, 0x09, 0xa3, 0xf8, 0x32,
+	0xaf, 0x8d, 0x76, 0x1a, 0x3f, 0x2e, 0x75, 0xf9, 0xd9, 0x67, 0x79, 0x68, 0x4c, 0x2f, 0xee, 0xf5,
+	0xbd, 0xf6, 0xe9, 0x75, 0xfb, 0xab, 0x2b, 0x5e, 0xfd, 0x80, 0x28, 0x7d, 0x13, 0xb6, 0x77, 0xb2,
+	0x12, 0xb7, 0xc2, 0x48, 0x61, 0x6f, 0xb8, 0xe3, 0xf8, 0x15, 0x7a, 0x6a, 0x1d, 0x37, 0x6e, 0xee,
+	0x64, 0x25, 0xac, 0xe3, 0x55, 0x3d, 0x57, 0x5c, 0x69, 0x4b, 0x40, 0x06, 0x18, 0x2c, 0xe2, 0xcd,
+	0xaf, 0xcb, 0x68, 0xf6, 0xc4, 0x57, 0xee, 0xfa, 0xc6, 0xbb, 0xb6, 0xe0, 0x97, 0xbc, 0xaa, 0x97,
+	0x62, 0xfe, 0x71, 0x65, 0xb8, 0x93, 0x5a, 0x85, 0xe5, 0xc9, 0x7f, 0x4b, 0x5f, 0xb9, 0x09, 0x8d,
+	0x6e, 0xf9, 0x16, 0x8d, 0x3b, 0x6c, 0x09, 0xcc, 0x20, 0x3b, 0x7b, 0xf9, 0x22, 0x3f, 0x32, 0xc9,
+	0x8f, 0xef, 0x7b, 0xeb, 0x37, 0xc5, 0xa8, 0x3d, 0x98, 0x80, 0x59, 0x7f, 0x06, 0x9e, 0xa2, 0x91,
+	0x5e, 0x2c, 0xac, 0x70, 0x24, 0xce, 0x20, 0x4b, 0x8a, 0x93, 0x09, 0x98, 0x05, 0x82, 0x53, 0x14,
+	0x2f, 0xb9, 0x75, 0x24, 0xc9, 0x20, 0x03, 0x3e, 0xf1, 0xdf, 0x98, 0xa0, 0xa4, 0xd4, 0x2b, 0xe5,
+	0xc8, 0x28, 0x83, 0xec, 0xdc, 0x07, 0x1d, 0xc0, 0x17, 0x08, 0xda, 0x55, 0x45, 0xc6, 0xc3, 0xa0,
+	0xfd, 0x6c, 0x69, 0xc5, 0xd7, 0xe4, 0xf4, 0x40, 0x2b, 0xbe, 0xf6, 0x54, 0x2a, 0xf2, 0xe8, 0x1f,
+	0x2a, 0x55, 0x7b, 0xf6, 0x42, 0x1a, 0xeb, 0x08, 0x1a, 0x78, 0x07, 0x30, 0x45, 0xa7, 0x5f, 0xb8,
+	0x91, 0x5c, 0x95, 0x82, 0x9c, 0x0d, 0xe1, 0xc0, 0x5e, 0xc7, 0x3f, 0xbf, 0x5f, 0x82, 0xab, 0x6f,
+	0x00, 0x91, 0x87, 0xec, 0xf1, 0xb3, 0x41, 0xb6, 0x7d, 0xa0, 0x24, 0xfc, 0xcd, 0xbd, 0xee, 0xf4,
+	0xa0, 0x05, 0xd8, 0x79, 0x08, 0x83, 0x58, 0xda, 0x8b, 0x01, 0x06, 0x42, 0xe2, 0xd5, 0x26, 0xbd,
+	0x1a, 0x60, 0x41, 0x6b, 0xd2, 0x6b, 0x75, 0x44, 0xaa, 0xee, 0x62, 0xc5, 0xf3, 0xcd, 0x1f, 0x1a,
+	0x6d, 0x1a, 0x0a, 0xb6, 0x0d, 0x05, 0xbb, 0x86, 0x82, 0xdf, 0x0d, 0x05, 0x5f, 0xf7, 0x34, 0xda,
+	0xee, 0x69, 0xb4, 0xdb, 0xd3, 0xe8, 0xfd, 0x38, 0xbc, 0xde, 0xdf, 0x00, 0x00, 0x00, 0xff, 0xff,
+	0x2b, 0x28, 0x34, 0x60, 0xb3, 0x02, 0x00, 0x00,
 }

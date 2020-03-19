@@ -1,29 +1,38 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
+import { Col, Row, Tabs } from "antd";
+import { Highlight } from "oss/src/views/shared/components/sql/highlight";
+import { SummaryCard } from "oss/src/views/shared/components/summaryCard";
+import { selectStatements } from "oss/src/views/statements/statementsPage";
+import { AggregateStatistics, makeStatementsColumns, StatementsSortedTable } from "oss/src/views/statements/statementsTable";
 import React from "react";
-import { RouterState, Link } from "react-router";
+import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
-
-import "./sqlhighlight.styl";
-
+import { RouteComponentProps, withRouter } from "react-router-dom";
 import * as protos from "src/js/protos";
-import { databaseNameAttr, tableNameAttr } from "src/util/constants";
-import { Bytes } from "src/util/format";
-import { AdminUIState } from "src/redux/state";
+import { generateTableID, refreshStatements, refreshTableDetails, refreshTableStats, refreshDatabaseDetails } from "src/redux/apiReducers";
 import { LocalSetting } from "src/redux/localsettings";
-import { refreshTableDetails, refreshTableStats, generateTableID } from "src/redux/apiReducers";
-import { SummaryBar, SummaryHeadlineStat } from "src/views/shared/components/summaryBar";
-
+import { AdminUIState } from "src/redux/state";
+import { appAttr, databaseNameAttr, tableNameAttr } from "src/util/constants";
+import { Bytes } from "src/util/format";
 import { TableInfo } from "src/views/databases/data/tableInfo";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import { SortedTable } from "src/views/shared/components/sortedtable";
-import * as hljs from "highlight.js";
+import "./styles.styl";
+const { TabPane } = Tabs;
+import { getMatchParamByName } from "src/util/query";
+import { databaseDetails } from "../databaseSummary";
+import { Button, BackIcon } from "oss/src/components/button";
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or JSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-export const GrantsSortedTable = SortedTable as new () => SortedTable<protos.cockroach.server.serverpb.TableDetailsResponse.Grant$Properties>;
+class GrantsSortedTable extends SortedTable<protos.cockroach.server.serverpb.TableDetailsResponse.IGrant> {}
 
 const databaseTableGrantsSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "tableDetails/sort_setting/grants", (s) => s.localSettings,
@@ -36,6 +45,7 @@ const databaseTableGrantsSortSetting = new LocalSetting<AdminUIState, SortSettin
 interface TableMainData {
   tableInfo: TableInfo;
   grantsSortSetting: SortSetting;
+  statements: AggregateStatistics[];
 }
 
 /**
@@ -46,90 +56,143 @@ interface TableMainActions {
   // Refresh the table data
   refreshTableDetails: typeof refreshTableDetails;
   refreshTableStats: typeof refreshTableStats;
+  refreshStatements: typeof refreshStatements;
+  refreshDatabaseDetails: typeof refreshDatabaseDetails;
   setSort: typeof databaseTableGrantsSortSetting.set;
+  dbResponse: protos.cockroach.server.serverpb.DatabaseDetailsResponse;
 }
 
 /**
  * TableMainProps is the type of the props object that must be passed to
  * TableMain component.
  */
-type TableMainProps = TableMainData & TableMainActions & RouterState;
+type TableMainProps = TableMainData & TableMainActions & RouteComponentProps;
 
 /**
  * TableMain renders the main content of the databases page, which is primarily a
  * data table of all databases.
  */
-class TableMain extends React.Component<TableMainProps, {}> {
-  createStmtNode: Node;
-
+export class TableMain extends React.Component<TableMainProps, {}> {
   componentWillMount() {
+    const database = getMatchParamByName(this.props.match, databaseNameAttr);
+    const table = getMatchParamByName(this.props.match, tableNameAttr);
+    this.props.refreshDatabaseDetails(new protos.cockroach.server.serverpb.DatabaseDetailsRequest({ database: getMatchParamByName(this.props.match, databaseNameAttr) }));
     this.props.refreshTableDetails(new protos.cockroach.server.serverpb.TableDetailsRequest({
-      database: this.props.params[databaseNameAttr],
-      table: this.props.params[tableNameAttr],
+      database,
+      table,
     }));
     this.props.refreshTableStats(new protos.cockroach.server.serverpb.TableStatsRequest({
-      database: this.props.params[databaseNameAttr],
-      table: this.props.params[tableNameAttr],
+      database,
+      table,
     }));
+    this.props.refreshStatements();
   }
 
-  componentDidMount() {
-    hljs.highlightBlock(this.createStmtNode);
+  prevPage = () => this.props.history.goBack();
+
+  getStatementsTableData = () => {
+    const { statements, match } = this.props;
+    const database = getMatchParamByName(match, databaseNameAttr);
+    const table = getMatchParamByName(match, tableNameAttr);
+    const title = `${database}.${table}`;
+
+    if (statements) {
+      return statements.filter((statement: AggregateStatistics) => statement.label.indexOf(title) !== -1);
+    }
+    return;
   }
 
   render() {
-    const { tableInfo, grantsSortSetting } = this.props;
+    const { tableInfo, grantsSortSetting, statements, match, dbResponse } = this.props;
+    const database = getMatchParamByName(match, databaseNameAttr);
+    const table = getMatchParamByName(match, tableNameAttr);
+    const selectedApp = getMatchParamByName(match, appAttr);
 
+    const title = `${database}.${table}`;
     if (tableInfo) {
-      return <div>
-        <section className="section parent-link">
-          <Link to="/databases/tables">&lt; Back to Databases</Link>
-        </section>
-        <section className="section">
-          <div className="database-summary-title">
-            <h2>{ this.props.params[tableNameAttr] }</h2>
-          </div>
-          <div className="content l-columns">
-            <div className="l-columns__left">
-              <pre className="sql-highlight" ref={(node) => this.createStmtNode = node}>
-                {/* TODO (mrtracy): format create table statement */}
-                {tableInfo.createStatement}
-              </pre>
-              <div className="sql-table">
-                <GrantsSortedTable
-                  data={tableInfo.grants}
-                  sortSetting={grantsSortSetting}
-                  onChangeSortSetting={(setting) => this.props.setSort(setting) }
-                  columns={[
-                    {
-                      title: "User",
-                      cell: (grants) => grants.user,
-                      sort: (grants) => grants.user,
-                    },
-                    {
-                      title: "Grants",
-                      cell: (grants) => grants.privileges.join(", "),
-                      sort: (grants) => grants.privileges.join(", "),
-                    },
-                  ]}/>
-              </div>
-            </div>
-            <div className="l-columns__right">
-              <SummaryBar>
-                <SummaryHeadlineStat
-                  title="Size"
-                  tooltip="Approximate total disk size of this table across all replicas."
-                  value={ tableInfo.physicalSize }
-                  format={ Bytes }/>
-                <SummaryHeadlineStat
-                  title="Ranges"
-                  tooltip="The total number of ranges in this table."
-                  value={ tableInfo.rangeCount }/>
-              </SummaryBar>
+      return (
+        <div>
+          <Helmet title={`${title} Table | Databases`} />
+          <div className="page--header">
+            <Button
+              onClick={this.prevPage}
+              type="flat"
+              size="small"
+              className="crl-button--link-to"
+              icon={BackIcon}
+              iconPosition="left"
+            >
+              Databases
+            </Button>
+            <div className="database-summary-title">
+              <h2 className="base-heading">{ title }</h2>
             </div>
           </div>
-        </section>
-      </div>;
+          <section className="section section--container table-details">
+            <Tabs defaultActiveKey="1" className="cockroach--tabs">
+              <TabPane tab="Overview" key="1">
+                <Row gutter={16}>
+                  <Col className="gutter-row" span={16}>
+                    <div className="box-highlight"><Highlight value={ tableInfo.createStatement || "" } zone={dbResponse} /></div>
+                  </Col>
+                  <Col className="gutter-row" span={8}>
+                    <SummaryCard>
+                      <Row>
+                        <Col span={12}>
+                          <div className="summary--card__counting">
+                            <h3 className="summary--card__counting--value">{Bytes(tableInfo.physicalSize)}</h3>
+                            <p className="summary--card__counting--label">Size</p>
+                          </div>
+                        </Col>
+                        <Col span={12}>
+                          <div className="summary--card__counting">
+                            <h3 className="summary--card__counting--value">{tableInfo.numIndices}</h3>
+                            <p className="summary--card__counting--label">Replicas</p>
+                          </div>
+                        </Col>
+                        <Col span={24}>
+                          <div className="summary--card__counting">
+                            <h3 className="summary--card__counting--value">{tableInfo.rangeCount}</h3>
+                            <p className="summary--card__counting--label">Ranges</p>
+                          </div>
+                        </Col>
+                      </Row>
+                    </SummaryCard>
+                  </Col>
+                </Row>
+              </TabPane>
+              <TabPane tab="Statements" key="2">
+                <SummaryCard>
+                  <StatementsSortedTable
+                    data={this.getStatementsTableData()}
+                    columns={statements && makeStatementsColumns(statements, selectedApp)}
+                  />
+                </SummaryCard>
+              </TabPane>
+              <TabPane tab="Grants" key="3">
+                <SummaryCard>
+                  <GrantsSortedTable
+                    data={tableInfo.grants}
+                    sortSetting={grantsSortSetting}
+                    onChangeSortSetting={(setting) => this.props.setSort(setting) }
+                    columns={[
+                      {
+                        title: "User",
+                        cell: (grants) => grants.user,
+                        sort: (grants) => grants.user,
+                      },
+                      {
+                        title: "Grants",
+                        cell: (grants) => grants.privileges.join(", "),
+                        sort: (grants) => grants.privileges.join(", "),
+                      },
+                    ]}/>
+                </SummaryCard>
+              </TabPane>
+            </Tabs>
+          </section>
+        </div>
+      );
     }
     return <div>No results.</div>;
   }
@@ -139,27 +202,33 @@ class TableMain extends React.Component<TableMainProps, {}> {
  *         SELECTORS
  */
 
-function tableInfo(state: AdminUIState, props: RouterState): TableInfo {
-  const db = props.params[databaseNameAttr];
-  const table = props.params[tableNameAttr];
+export function selectTableInfo(state: AdminUIState, props: RouteComponentProps): TableInfo {
+  const db = getMatchParamByName(props.match, databaseNameAttr);
+  const table = getMatchParamByName(props.match, tableNameAttr);
   const details = state.cachedData.tableDetails[generateTableID(db, table)];
   const stats = state.cachedData.tableStats[generateTableID(db, table)];
   return new TableInfo(table, details && details.data, stats && stats.data);
 }
 
+const mapStateToProps = (state: AdminUIState, ownProps: RouteComponentProps) => ({
+  tableInfo: selectTableInfo(state, ownProps),
+  grantsSortSetting: databaseTableGrantsSortSetting.selector(state),
+  statements: selectStatements(state, ownProps),
+  dbResponse: databaseDetails(state)[getMatchParamByName(ownProps.match, databaseNameAttr)] && databaseDetails(state)[getMatchParamByName(ownProps.match, databaseNameAttr)].data,
+});
+
+const mapDispatchToProps = {
+  setSort: databaseTableGrantsSortSetting.set,
+  refreshTableDetails,
+  refreshTableStats,
+  refreshStatements,
+  refreshDatabaseDetails,
+};
+
 // Connect the TableMain class with our redux store.
-const tableMainConnected = connect(
-  (state: AdminUIState, ownProps: RouterState) => {
-    return {
-      tableInfo: tableInfo(state, ownProps),
-      grantsSortSetting: databaseTableGrantsSortSetting.selector(state),
-    };
-  },
-  {
-    setSort: databaseTableGrantsSortSetting.set,
-    refreshTableDetails,
-    refreshTableStats,
-  },
-)(TableMain);
+const tableMainConnected = withRouter(connect(
+  mapStateToProps,
+  mapDispatchToProps,
+)(TableMain));
 
 export default tableMainConnected;

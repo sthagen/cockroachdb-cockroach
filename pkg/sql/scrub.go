@@ -1,33 +1,28 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
-
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 type scrubNode struct {
@@ -75,21 +70,10 @@ type checkOperation interface {
 // Scrub checks the database.
 // Privileges: superuser.
 func (p *planner) Scrub(ctx context.Context, n *tree.Scrub) (planNode, error) {
-	if err := p.RequireSuperUser("SCRUB"); err != nil {
+	if err := p.RequireAdminRole(ctx, "SCRUB"); err != nil {
 		return nil, err
 	}
 	return &scrubNode{n: n}, nil
-}
-
-var scrubColumns = sqlbase.ResultColumns{
-	{Name: "job_uuid", Typ: types.UUID},
-	{Name: "error_type", Typ: types.String},
-	{Name: "database", Typ: types.String},
-	{Name: "table", Typ: types.String},
-	{Name: "primary_key", Typ: types.String},
-	{Name: "timestamp", Typ: types.Timestamp},
-	{Name: "repaired", Typ: types.Bool},
-	{Name: "details", Typ: types.JSON},
 }
 
 // scrubRun contains the run-time state of scrubNode during local execution.
@@ -101,21 +85,16 @@ type scrubRun struct {
 func (n *scrubNode) startExec(params runParams) error {
 	switch n.n.Typ {
 	case tree.ScrubTable:
-		tableName, err := n.n.Table.NormalizeWithDatabaseName(params.p.session.Database)
-		if err != nil {
-			return err
-		}
-		if err := tableName.QualifyWithDatabase(params.p.session.Database); err != nil {
-			return err
-		}
 		// If the tableName provided refers to a view and error will be
 		// returned here.
-		tableDesc, err := MustGetTableDesc(params.ctx, params.p.txn, params.p.getVirtualTabler(),
-			tableName, false /* allowAdding */)
+		tableDesc, err := params.p.ResolveExistingObjectEx(
+			params.ctx, n.n.Table, true /*required*/, ResolveRequireTableDesc)
 		if err != nil {
 			return err
 		}
-		if err := n.startScrubTable(params.ctx, params.p, tableDesc, tableName); err != nil {
+		if err := n.startScrubTable(
+			params.ctx, params.p, tableDesc, params.p.ResolvedName(n.n.Table),
+		); err != nil {
 			return err
 		}
 	case tree.ScrubDatabase:
@@ -123,8 +102,7 @@ func (n *scrubNode) startExec(params runParams) error {
 			return err
 		}
 	default:
-		return pgerror.NewErrorf(pgerror.CodeInternalError,
-			"unexpected SCRUB type received, got: %v", n.n.Typ)
+		return errors.AssertionFailedf("unexpected SCRUB type received, got: %v", n.n.Typ)
 	}
 	return nil
 }
@@ -174,27 +152,35 @@ func (n *scrubNode) Close(ctx context.Context) {
 func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tree.Name) error {
 	// Check that the database exists.
 	database := string(*name)
-	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), database)
-	if err != nil {
-		return err
-	}
-	tbNames, err := getTableNames(ctx, p.txn, p.getVirtualTabler(), dbDesc, false)
+	dbDesc, err := p.ResolveUncachedDatabaseByName(ctx, database, true /*required*/)
 	if err != nil {
 		return err
 	}
 
-	for i := range tbNames {
-		tableName := &tbNames[i]
-		if err := tableName.QualifyWithDatabase(database); err != nil {
-			return err
-		}
-		tableDesc, err := MustGetTableOrViewDesc(ctx, p.txn, p.getVirtualTabler(), tableName,
-			false /* allowAdding */)
+	schemas, err := p.Tables().getSchemasForDatabase(ctx, p.txn, dbDesc.ID)
+	if err != nil {
+		return err
+	}
+
+	var tbNames TableNames
+	for _, schema := range schemas {
+		toAppend, err := GetObjectNames(ctx, p.txn, p, dbDesc, schema, true /*explicitPrefix*/)
 		if err != nil {
 			return err
 		}
-		// Skip views and don't throw an error if we encounter one.
-		if tableDesc.IsView() {
+		tbNames = append(tbNames, toAppend...)
+	}
+
+	for i := range tbNames {
+		tableName := &tbNames[i]
+		objDesc, err := p.LogicalSchemaAccessor().GetObjectDesc(ctx, p.txn, p.ExecCfg().Settings,
+			tableName, p.ObjectLookupFlags(true /*required*/, false /*requireMutable*/))
+		if err != nil {
+			return err
+		}
+		tableDesc := objDesc.(*sqlbase.ImmutableTableDescriptor)
+		// Skip non-tables and don't throw an error if we encounter one.
+		if !tableDesc.IsTable() {
 			continue
 		}
 		if err := n.startScrubTable(ctx, p, tableDesc, tableName); err != nil {
@@ -205,7 +191,10 @@ func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tr
 }
 
 func (n *scrubNode) startScrubTable(
-	ctx context.Context, p *planner, tableDesc *sqlbase.TableDescriptor, tableName *tree.TableName,
+	ctx context.Context,
+	p *planner,
+	tableDesc *sqlbase.ImmutableTableDescriptor,
+	tableName *tree.TableName,
 ) error {
 	ts, hasTS, err := p.getTimestamp(n.n.AsOf)
 	if err != nil {
@@ -220,7 +209,7 @@ func (n *scrubNode) startScrubTable(
 		switch v := option.(type) {
 		case *tree.ScrubOptionIndex:
 			if indexesSet {
-				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return pgerror.Newf(pgcode.Syntax,
 					"cannot specify INDEX option more than once")
 			}
 			indexesSet = true
@@ -231,11 +220,11 @@ func (n *scrubNode) startScrubTable(
 			n.run.checkQueue = append(n.run.checkQueue, checks...)
 		case *tree.ScrubOptionPhysical:
 			if physicalCheckSet {
-				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return pgerror.Newf(pgcode.Syntax,
 					"cannot specify PHYSICAL option more than once")
 			}
 			if hasTS {
-				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return pgerror.Newf(pgcode.Syntax,
 					"cannot use AS OF SYSTEM TIME with PHYSICAL option")
 			}
 			physicalCheckSet = true
@@ -243,7 +232,7 @@ func (n *scrubNode) startScrubTable(
 			n.run.checkQueue = append(n.run.checkQueue, physicalChecks...)
 		case *tree.ScrubOptionConstraint:
 			if constraintsSet {
-				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return pgerror.Newf(pgcode.Syntax,
 					"cannot specify CONSTRAINT option more than once")
 			}
 			constraintsSet = true
@@ -280,41 +269,10 @@ func (n *scrubNode) startScrubTable(
 	return nil
 }
 
-// getColumns returns the columns that are stored in an index k/v. The
-// column names and types are also returned.
-func getColumns(
-	tableDesc *sqlbase.TableDescriptor, indexDesc *sqlbase.IndexDescriptor,
-) (columns []*sqlbase.ColumnDescriptor, columnNames []string, columnTypes []sqlbase.ColumnType) {
-	colToIdx := make(map[sqlbase.ColumnID]int)
-	for i, col := range tableDesc.Columns {
-		colToIdx[col.ID] = i
-	}
-
-	// Collect all of the columns we are fetching from the index. This
-	// includes the columns involved in the index: columns, extra columns,
-	// and store columns.
-	for _, colID := range indexDesc.ColumnIDs {
-		columns = append(columns, &tableDesc.Columns[colToIdx[colID]])
-	}
-	for _, colID := range indexDesc.ExtraColumnIDs {
-		columns = append(columns, &tableDesc.Columns[colToIdx[colID]])
-	}
-	for _, colID := range indexDesc.StoreColumnIDs {
-		columns = append(columns, &tableDesc.Columns[colToIdx[colID]])
-	}
-
-	// Collect the column names and types.
-	for _, col := range columns {
-		columnNames = append(columnNames, col.Name)
-		columnTypes = append(columnTypes, col.Type)
-	}
-	return columns, columnNames, columnTypes
-}
-
 // getPrimaryColIdxs returns a list of the primary index columns and
 // their corresponding index in the columns list.
 func getPrimaryColIdxs(
-	tableDesc *sqlbase.TableDescriptor, columns []*sqlbase.ColumnDescriptor,
+	tableDesc *sqlbase.ImmutableTableDescriptor, columns []*sqlbase.ColumnDescriptor,
 ) (primaryColIdxs []int, err error) {
 	for i, colID := range tableDesc.PrimaryIndex.ColumnIDs {
 		rowIdx := -1
@@ -335,81 +293,45 @@ func getPrimaryColIdxs(
 	return primaryColIdxs, nil
 }
 
-// tableColumnsIsNullPredicate creates a predicate that checks if all of
-// the specified columns for a table are NULL (or not NULL, based on the
-// isNull flag). For example, given table is t1 and the columns id,
-// name, data, then the returned string is:
-//
-//   t1.id IS NULL AND t1.name IS NULL AND t1.data IS NULL
-//
-func tableColumnsIsNullPredicate(
-	tableName string, columns []string, conjunction string, isNull bool,
-) string {
-	var buf bytes.Buffer
-	nullCheck := "NOT NULL"
-	if isNull {
-		nullCheck = "NULL"
+// col returns the string for referencing a column, with a specific alias,
+// e.g. "table.col".
+func colRef(tableAlias string, columnName string) string {
+	u := tree.UnrestrictedName(columnName)
+	if tableAlias == "" {
+		return u.String()
 	}
-	for i, col := range columns {
-		if i > 0 {
-			buf.WriteByte(' ')
-			buf.WriteString(conjunction)
-			buf.WriteByte(' ')
-		}
-		fmt.Fprintf(&buf, "%[1]s.%[2]s IS %[3]s", tableName, col, nullCheck)
-	}
-	return buf.String()
+	return fmt.Sprintf("%s.%s", tableAlias, &u)
 }
 
-// tableColumnsEQ creates a predicate that checks if all of the
-// specified columns for two tables are equal. For example, given tables
-// t1, t2 and the columns id, name, then the returned string is:
-//
-//   t1.id = t2.id AND t1.name = t2.name
-//
-func tableColumnsEQ(
-	tableName string, otherTableName string, columns []string, otherColumns []string,
-) string {
-	if len(columns) != len(otherColumns) {
-		panic(fmt.Sprintf(
-			"expected columns to have the same size: columns len was %d, otherColumns len was %d",
-			len(columns),
-			len(otherColumns),
-		))
+// colRefs returns the strings for referencing a list of columns (as a list).
+func colRefs(tableAlias string, columnNames []string) []string {
+	res := make([]string, len(columnNames))
+	for i := range res {
+		res[i] = colRef(tableAlias, columnNames[i])
 	}
-
-	var buf bytes.Buffer
-	for i := range columns {
-		if i > 0 {
-			buf.WriteString(" AND ")
-		}
-		fmt.Fprintf(&buf, `%[1]s.%[3]s = %[2]s.%[4]s`,
-			tableName, otherTableName, columns[i], otherColumns[i])
-	}
-	return buf.String()
+	return res
 }
 
-// tableColumnsProjection creates the select projection statement (a
-// comma delimetered column list), for the specified table and
-// columns. For example, if the table is t1 and the columns are id,
-// name, data, then the returned string is:
-//
-//   t1.id, t1.name, t1.data
-func tableColumnsProjection(tableName string, columns []string) string {
-	var buf bytes.Buffer
-	for i, col := range columns {
-		if i > 0 {
-			buf.WriteString(", ")
-		}
-		fmt.Fprintf(&buf, "%[1]s.%[2]s", tableName, col)
+// pairwiseOp joins each string on the left with the string on the right, with a
+// given operator in-between. For example
+//   pairwiseOp([]string{"a","b"}, []string{"x", "y"}, "=")
+// returns
+//   []string{"a = x", "b = y"}.
+func pairwiseOp(left []string, right []string, op string) []string {
+	if len(left) != len(right) {
+		panic(errors.AssertionFailedf("slice length mismatch (%d vs %d)", len(left), len(right)))
 	}
-	return buf.String()
+	res := make([]string, len(left))
+	for i := range res {
+		res[i] = fmt.Sprintf("%s %s %s", left[i], op, right[i])
+	}
+	return res
 }
 
 // createPhysicalCheckOperations will return the physicalCheckOperation
 // for all indexes on a table.
 func createPhysicalCheckOperations(
-	tableDesc *sqlbase.TableDescriptor, tableName *tree.TableName,
+	tableDesc *sqlbase.ImmutableTableDescriptor, tableName *tree.TableName,
 ) (checks []checkOperation) {
 	checks = append(checks, newPhysicalCheckOperation(tableName, tableDesc, &tableDesc.PrimaryIndex))
 	for i := range tableDesc.Indexes {
@@ -426,7 +348,7 @@ func createPhysicalCheckOperations(
 // first invalid index.
 func createIndexCheckOperations(
 	indexNames tree.NameList,
-	tableDesc *sqlbase.TableDescriptor,
+	tableDesc *sqlbase.ImmutableTableDescriptor,
 	tableName *tree.TableName,
 	asOf hlc.Timestamp,
 ) (results []checkOperation, err error) {
@@ -468,7 +390,7 @@ func createIndexCheckOperations(
 				missingIndexNames = append(missingIndexNames, idxName.String())
 			}
 		}
-		return nil, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
+		return nil, pgerror.Newf(pgcode.UndefinedObject,
 			"specified indexes to check that do not exist on table %q: %v",
 			tableDesc.Name, strings.Join(missingIndexNames, ", "))
 	}
@@ -484,7 +406,7 @@ func createConstraintCheckOperations(
 	ctx context.Context,
 	p *planner,
 	constraintNames tree.NameList,
-	tableDesc *sqlbase.TableDescriptor,
+	tableDesc *sqlbase.ImmutableTableDescriptor,
 	tableName *tree.TableName,
 	asOf hlc.Timestamp,
 ) (results []checkOperation, err error) {
@@ -501,7 +423,7 @@ func createConstraintCheckOperations(
 			if v, ok := constraints[string(constraintName)]; ok {
 				wantedConstraints[string(constraintName)] = v
 			} else {
-				return nil, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
+				return nil, pgerror.Newf(pgcode.UndefinedObject,
 					"constraint %q of relation %q does not exist", constraintName, tableDesc.Name)
 			}
 		}
@@ -530,46 +452,36 @@ func createConstraintCheckOperations(
 	return results, nil
 }
 
-// scrubPlanDistSQL will prepare and run the plan in distSQL.
-func scrubPlanDistSQL(
-	ctx context.Context, planCtx *planningCtx, p *planner, plan planNode,
-) (*physicalPlan, error) {
-	log.VEvent(ctx, 1, "creating DistSQL plan")
-	physPlan, err := p.session.distSQLPlanner.createPlanForNode(planCtx, plan)
-	if err != nil {
-		return nil, err
-	}
-	p.session.distSQLPlanner.FinalizePlan(planCtx, &physPlan)
-	return &physPlan, nil
-}
-
 // scrubRunDistSQL run a distSQLPhysicalPlan plan in distSQL. If
 // RowContainer is returned, the caller must close it.
 func scrubRunDistSQL(
-	ctx context.Context,
-	planCtx *planningCtx,
-	p *planner,
-	plan *physicalPlan,
-	columnTypes []sqlbase.ColumnType,
-) (*sqlbase.RowContainer, error) {
+	ctx context.Context, planCtx *PlanningCtx, p *planner, plan *PhysicalPlan, columnTypes []types.T,
+) (*rowcontainer.RowContainer, error) {
 	ci := sqlbase.ColTypeInfoFromColTypes(columnTypes)
-	rows := sqlbase.NewRowContainer(*p.evalCtx.ActiveMemAcc, ci, 0)
-	rowResultWriter := NewRowResultWriter(tree.Rows, rows)
-	recv := makeDistSQLReceiver(
+	acc := p.extendedEvalCtx.Mon.MakeBoundAccount()
+	rows := rowcontainer.NewRowContainer(acc, ci, 0 /* rowCapacity */)
+	rowResultWriter := NewRowResultWriter(rows)
+	recv := MakeDistSQLReceiver(
 		ctx,
 		rowResultWriter,
+		tree.Rows,
 		p.ExecCfg().RangeDescriptorCache,
 		p.ExecCfg().LeaseHolderCache,
 		p.txn,
 		func(ts hlc.Timestamp) {
 			_ = p.ExecCfg().Clock.Update(ts)
 		},
+		p.extendedEvalCtx.Tracing,
 	)
+	defer recv.Release()
 
-	if err := p.session.distSQLPlanner.Run(planCtx, p.txn, plan, &recv, p.evalCtx); err != nil {
-		return rows, err
-	} else if recv.err != nil {
-		return rows, recv.err
+	// Copy the evalCtx, as dsp.Run() might change it.
+	evalCtxCopy := p.extendedEvalCtx
+	p.extendedEvalCtx.DistSQLPlanner.Run(
+		planCtx, p.txn, plan, recv, &evalCtxCopy, nil, /* finishedSetupFn */
+	)()
+	if rowResultWriter.Err() != nil {
+		return rows, rowResultWriter.Err()
 	} else if rows.Len() == 0 {
 		rows.Close(ctx)
 		return nil, nil

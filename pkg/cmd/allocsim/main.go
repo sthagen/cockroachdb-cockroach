@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -32,8 +28,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/acceptance/localcluster"
 	"github.com/cockroachdb/cockroach/pkg/acceptance/localcluster/tc"
 	"github.com/cockroachdb/cockroach/pkg/cli"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -406,7 +402,7 @@ func handleStart() bool {
 	// in the few minutes after allocsim starts up causes it to take a long time
 	// for leases to settle onto other nodes even when requests are skewed heavily
 	// onto them.
-	storage.MinLeaseTransferStatsDuration = 10 * time.Second
+	kvserver.MinLeaseTransferStatsDuration = 10 * time.Second
 
 	cli.Main()
 	return true
@@ -522,7 +518,7 @@ func main() {
 	a := newAllocSim(c)
 	a.localities = localities
 
-	log.SetExitFunc(func(code int) {
+	log.SetExitFunc(false /* hideStack */, func(code int) {
 		c.Close()
 		os.Exit(code)
 	})
@@ -544,7 +540,7 @@ func main() {
 	c.Start(context.Background())
 	defer c.Close()
 	c.UpdateZoneConfig(1, 1<<20)
-	_, err := c.Nodes[0].DB().Exec("SET CLUSTER SETTING kv.raft_log.synchronize = false;")
+	_, err := c.Nodes[0].DB().Exec("SET CLUSTER SETTING kv.raft_log.disable_synchronization_unsafe = true")
 	if err != nil {
 		log.Fatal(context.Background(), err)
 	}

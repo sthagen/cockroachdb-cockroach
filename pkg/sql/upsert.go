@@ -1,259 +1,187 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
-	"fmt"
+	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
-// upsertExcludedTable is the name of a synthetic table used in an upsert's set
-// expressions to refer to the values that would be inserted for a row if it
-// didn't conflict.
-// Example: `INSERT INTO kv VALUES (1, 2) ON CONFLICT (k) DO UPDATE SET v = excluded.v`
-var upsertExcludedTable = tree.TableName{TableName: "excluded"}
-
-type upsertHelper struct {
-	p                  *planner
-	evalExprs          []tree.TypedExpr
-	whereExpr          tree.TypedExpr
-	sourceInfo         *dataSourceInfo
-	excludedSourceInfo *dataSourceInfo
-	curSourceRow       tree.Datums
-	curExcludedRow     tree.Datums
-
-	ivarHelper *tree.IndexedVarHelper
-
-	// This struct must be allocated on the heap and its location stay
-	// stable after construction because it implements
-	// IndexedVarContainer and the IndexedVar objects in sub-expressions
-	// will link to it by reference after checkRenderStar / analyzeExpr.
-	// Enforce this using NoCopy.
-	//
-	//lint:ignore U1000 this marker prevents by-value copies.
-	noCopy util.NoCopy
+var upsertNodePool = sync.Pool{
+	New: func() interface{} {
+		return &upsertNode{}
+	},
 }
 
-var _ tableUpsertEvaler = (*upsertHelper)(nil)
+type upsertNode struct {
+	source planNode
 
-// IndexedVarEval implements the tree.IndexedVarContainer interface.
-func (uh *upsertHelper) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
-	numSourceColumns := len(uh.sourceInfo.sourceColumns)
-	if idx >= numSourceColumns {
-		return uh.curExcludedRow[idx-numSourceColumns].Eval(ctx)
-	}
-	return uh.curSourceRow[idx].Eval(ctx)
+	// columns is set if this UPDATE is returning any rows, to be
+	// consumed by a renderNode upstream. This occurs when there is a
+	// RETURNING clause with some scalar expressions.
+	columns sqlbase.ResultColumns
+
+	run upsertRun
 }
 
-// IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
-func (uh *upsertHelper) IndexedVarResolvedType(idx int) types.T {
-	numSourceColumns := len(uh.sourceInfo.sourceColumns)
-	if idx >= numSourceColumns {
-		return uh.excludedSourceInfo.sourceColumns[idx-numSourceColumns].Typ
-	}
-	return uh.sourceInfo.sourceColumns[idx].Typ
+// upsertRun contains the run-time state of upsertNode during local execution.
+type upsertRun struct {
+	tw        optTableUpserter
+	checkOrds checkSet
+
+	// insertCols are the columns being inserted/upserted into.
+	insertCols []sqlbase.ColumnDescriptor
+
+	// done informs a new call to BatchedNext() that the previous call to
+	// BatchedNext() has completed the work already.
+	done bool
+
+	// traceKV caches the current KV tracing flag.
+	traceKV bool
 }
 
-// IndexedVarNodeFormatter implements the tree.IndexedVarContainer interface.
-func (uh *upsertHelper) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	numSourceColumns := len(uh.sourceInfo.sourceColumns)
-	if idx >= numSourceColumns {
-		return uh.excludedSourceInfo.NodeFormatter(idx - numSourceColumns)
-	}
-	return uh.sourceInfo.NodeFormatter(idx)
+func (n *upsertNode) startExec(params runParams) error {
+	// cache traceKV during execution, to avoid re-evaluating it for every row.
+	n.run.traceKV = params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
+
+	return n.run.tw.init(params.ctx, params.p.txn, params.EvalContext())
 }
 
-func (p *planner) makeUpsertHelper(
-	ctx context.Context,
-	tn *tree.TableName,
-	tableDesc *sqlbase.TableDescriptor,
-	insertCols []sqlbase.ColumnDescriptor,
-	updateCols []sqlbase.ColumnDescriptor,
-	updateExprs tree.UpdateExprs,
-	upsertConflictIndex *sqlbase.IndexDescriptor,
-	whereClause *tree.Where,
-) (*upsertHelper, error) {
-	defaultExprs, err := sqlbase.MakeDefaultExprs(updateCols, &p.txCtx, &p.evalCtx)
-	if err != nil {
-		return nil, err
+// Next is required because batchedPlanNode inherits from planNode, but
+// batchedPlanNode doesn't really provide it. See the explanatory comments
+// in plan_batch.go.
+func (n *upsertNode) Next(params runParams) (bool, error) { panic("not valid") }
+
+// Values is required because batchedPlanNode inherits from planNode, but
+// batchedPlanNode doesn't really provide it. See the explanatory comments
+// in plan_batch.go.
+func (n *upsertNode) Values() tree.Datums { panic("not valid") }
+
+// maxUpsertBatchSize is the max number of entries in the KV batch for
+// the upsert operation (including secondary index updates, FK
+// cascading updates, etc), before the current KV batch is executed
+// and a new batch is started.
+const maxUpsertBatchSize = 10000
+
+// BatchedNext implements the batchedPlanNode interface.
+func (n *upsertNode) BatchedNext(params runParams) (bool, error) {
+	if n.run.done {
+		return false, nil
 	}
 
-	untupledExprs := make(tree.Exprs, 0, len(updateExprs))
-	i := 0
-	for _, updateExpr := range updateExprs {
-		if updateExpr.Tuple {
-			if t, ok := updateExpr.Expr.(*tree.Tuple); ok {
-				for _, e := range t.Exprs {
-					e = fillDefault(e, i, defaultExprs)
-					untupledExprs = append(untupledExprs, e)
-					i++
-				}
+	tracing.AnnotateTrace()
+
+	// Now consume/accumulate the rows for this batch.
+	lastBatch := false
+	for {
+		if err := params.p.cancelChecker.Check(); err != nil {
+			return false, err
+		}
+
+		// Advance one individual row.
+		if next, err := n.source.Next(params); !next {
+			lastBatch = true
+			if err != nil {
+				return false, err
 			}
-		} else {
-			e := fillDefault(updateExpr.Expr, i, defaultExprs)
-			untupledExprs = append(untupledExprs, e)
-			i++
+			break
+		}
+
+		// Process the insertion for the current source row, potentially
+		// accumulating the result row for later.
+		if err := n.processSourceRow(params, n.source.Values()); err != nil {
+			return false, err
+		}
+
+		// Are we done yet with the current batch?
+		if n.run.tw.curBatchSize() >= maxUpsertBatchSize {
+			break
 		}
 	}
 
-	sourceInfo := newSourceInfoForSingleTable(
-		*tn, sqlbase.ResultColumnsFromColDescs(tableDesc.Columns),
+	// In Upsert, curBatchSize indicates whether "there is still work to do in this batch".
+	batchSize := n.run.tw.curBatchSize()
+
+	if batchSize > 0 {
+		if err := n.run.tw.atBatchEnd(params.ctx, n.run.traceKV); err != nil {
+			return false, err
+		}
+
+		if !lastBatch {
+			// We only run/commit the batch if there were some rows processed
+			// in this batch.
+			if err := n.run.tw.flushAndStartNewBatch(params.ctx); err != nil {
+				return false, err
+			}
+		}
+	}
+
+	if lastBatch {
+		if _, err := n.run.tw.finalize(params.ctx, n.run.traceKV); err != nil {
+			return false, err
+		}
+		// Remember we're done for the next call to BatchedNext().
+		n.run.done = true
+	}
+
+	// Possibly initiate a run of CREATE STATISTICS.
+	params.ExecCfg().StatsRefresher.NotifyMutation(
+		n.run.tw.tableDesc().ID,
+		n.run.tw.batchedCount(),
 	)
-	excludedSourceInfo := newSourceInfoForSingleTable(
-		upsertExcludedTable, sqlbase.ResultColumnsFromColDescs(insertCols),
-	)
 
-	helper := &upsertHelper{
-		p:                  p,
-		sourceInfo:         sourceInfo,
-		excludedSourceInfo: excludedSourceInfo,
-	}
-
-	var evalExprs []tree.TypedExpr
-	ivarHelper := tree.MakeIndexedVarHelper(helper, len(sourceInfo.sourceColumns)+len(excludedSourceInfo.sourceColumns))
-	sources := multiSourceInfo{sourceInfo, excludedSourceInfo}
-	for i, expr := range untupledExprs {
-		typ := updateCols[i].Type.ToDatumType()
-		normExpr, err := p.analyzeExpr(ctx, expr, sources, ivarHelper, typ, true, "ON CONFLICT")
-		if err != nil {
-			return nil, err
-		}
-		evalExprs = append(evalExprs, normExpr)
-	}
-	helper.ivarHelper = &ivarHelper
-	helper.evalExprs = evalExprs
-
-	if whereClause != nil {
-		whereExpr, err := p.analyzeExpr(
-			ctx, whereClause.Expr, sources, ivarHelper, types.Bool, true /* requireType */, "WHERE",
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		// Make sure there are no aggregation/window functions in the filter
-		// (after subqueries have been expanded).
-		if err := p.txCtx.AssertNoAggregationOrWindowing(
-			whereExpr, "WHERE", p.session.SearchPath,
-		); err != nil {
-			return nil, err
-		}
-
-		helper.whereExpr = whereExpr
-	}
-
-	return helper, nil
+	return n.run.tw.batchedCount() > 0, nil
 }
 
-func (uh *upsertHelper) walkExprs(walk func(desc string, index int, expr tree.TypedExpr)) {
-	for i, evalExpr := range uh.evalExprs {
-		walk("eval", i, evalExpr)
+// processSourceRow processes one row from the source for upsertion.
+// The table writer is in charge of accumulating the result rows.
+func (n *upsertNode) processSourceRow(params runParams, rowVals tree.Datums) error {
+	if err := enforceLocalColumnConstraints(rowVals, n.run.insertCols); err != nil {
+		return err
 	}
+
+	// Run the CHECK constraints, if any. CheckHelper will either evaluate the
+	// constraints itself, or else inspect boolean columns from the input that
+	// contain the results of evaluation.
+	if !n.run.checkOrds.Empty() {
+		ord := len(rowVals) - n.run.checkOrds.Len()
+		checkVals := rowVals[ord:]
+		if err := checkMutationInput(n.run.tw.tableDesc(), n.run.checkOrds, checkVals); err != nil {
+			return err
+		}
+		rowVals = rowVals[:ord]
+	}
+
+	// Process the row. This is also where the tableWriter will accumulate
+	// the row for later.
+	return n.run.tw.row(params.ctx, rowVals, n.run.traceKV)
 }
 
-// eval returns the values for the update case of an upsert, given the row
-// that would have been inserted and the existing (conflicting) values.
-func (uh *upsertHelper) eval(insertRow tree.Datums, existingRow tree.Datums) (tree.Datums, error) {
-	uh.curSourceRow = existingRow
-	uh.curExcludedRow = insertRow
+// BatchedCount implements the batchedPlanNode interface.
+func (n *upsertNode) BatchedCount() int { return n.run.tw.batchedCount() }
 
-	var err error
-	ret := make([]tree.Datum, len(uh.evalExprs))
-	uh.p.evalCtx.IVarHelper = uh.ivarHelper
-	defer func() { uh.p.evalCtx.IVarHelper = nil }()
-	for i, evalExpr := range uh.evalExprs {
-		ret[i], err = evalExpr.Eval(&uh.p.evalCtx)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return ret, nil
+// BatchedCount implements the batchedPlanNode interface.
+func (n *upsertNode) BatchedValues(rowIdx int) tree.Datums { return n.run.tw.batchedValues(rowIdx) }
+
+func (n *upsertNode) Close(ctx context.Context) {
+	n.source.Close(ctx)
+	n.run.tw.close(ctx)
+	*n = upsertNode{}
+	upsertNodePool.Put(n)
 }
 
-// shouldUpdate returns the result of evaluating the WHERE clause of the
-// ON CONFLICT ... DO UPDATE clause.
-func (uh *upsertHelper) shouldUpdate(insertRow tree.Datums, existingRow tree.Datums) (bool, error) {
-	uh.curSourceRow = existingRow
-	uh.curExcludedRow = insertRow
-
-	uh.p.evalCtx.IVarHelper = uh.ivarHelper
-	defer func() { uh.p.evalCtx.IVarHelper = nil }()
-	return sqlbase.RunFilter(uh.whereExpr, &uh.p.evalCtx)
-}
-
-// upsertExprsAndIndex returns the upsert conflict index and the (possibly
-// synthetic) SET expressions used when a row conflicts.
-func upsertExprsAndIndex(
-	tableDesc *sqlbase.TableDescriptor,
-	onConflict tree.OnConflict,
-	insertCols []sqlbase.ColumnDescriptor,
-) (tree.UpdateExprs, *sqlbase.IndexDescriptor, error) {
-	if onConflict.IsUpsertAlias() {
-		// The UPSERT syntactic sugar is the same as the longhand specifying the
-		// primary index as the conflict index and SET expressions for the columns
-		// in insertCols minus any columns in the conflict index. Example:
-		// `UPSERT INTO abc VALUES (1, 2, 3)` is syntactic sugar for
-		// `INSERT INTO abc VALUES (1, 2, 3) ON CONFLICT a DO UPDATE SET b = 2, c = 3`.
-		conflictIndex := &tableDesc.PrimaryIndex
-		indexColSet := make(map[sqlbase.ColumnID]struct{}, len(conflictIndex.ColumnIDs))
-		for _, colID := range conflictIndex.ColumnIDs {
-			indexColSet[colID] = struct{}{}
-		}
-		updateExprs := make(tree.UpdateExprs, 0, len(insertCols))
-		for _, c := range insertCols {
-			if _, ok := indexColSet[c.ID]; !ok {
-				names := tree.UnresolvedNames{
-					tree.UnresolvedName{tree.Name(c.Name)},
-				}
-				expr := &tree.ColumnItem{
-					TableName:  upsertExcludedTable,
-					ColumnName: tree.Name(c.Name),
-				}
-				updateExprs = append(updateExprs, &tree.UpdateExpr{Names: names, Expr: expr})
-			}
-		}
-		return updateExprs, conflictIndex, nil
-	}
-
-	indexMatch := func(index sqlbase.IndexDescriptor) bool {
-		if !index.Unique {
-			return false
-		}
-		if len(index.ColumnNames) != len(onConflict.Columns) {
-			return false
-		}
-		for i, colName := range index.ColumnNames {
-			if colName != string(onConflict.Columns[i]) {
-				return false
-			}
-		}
-		return true
-	}
-
-	if indexMatch(tableDesc.PrimaryIndex) {
-		return onConflict.Exprs, &tableDesc.PrimaryIndex, nil
-	}
-	for _, index := range tableDesc.Indexes {
-		if indexMatch(index) {
-			return onConflict.Exprs, &index, nil
-		}
-	}
-	return nil, nil, fmt.Errorf("there is no unique or exclusion constraint matching the ON CONFLICT specification")
+func (n *upsertNode) enableAutoCommit() {
+	n.run.tw.enableAutoCommit()
 }

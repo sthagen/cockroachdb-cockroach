@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package parser
 
@@ -23,7 +19,11 @@ import (
 	"text/tabwriter"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/errors"
 )
 
 // HelpMessage describes a contextual help message.
@@ -72,8 +72,9 @@ func (h *HelpMessage) Format(w io.Writer) {
 // error", with the error set to a contextual help message about the
 // current statement.
 func helpWith(sqllex sqlLexer, helpText string) int {
-	scan := sqllex.(*Scanner)
+	scan := sqllex.(*lexer)
 	if helpText == "" {
+		scan.lastError = pgerror.WithCandidateCode(errors.New("help upon syntax error"), pgcode.Syntax)
 		scan.populateHelpMsg("help:\n" + AllHelp)
 		return 1
 	}
@@ -88,7 +89,7 @@ func helpWith(sqllex sqlLexer, helpText string) int {
 // "in error", with the error set to a contextual help message about
 // the current built-in function.
 func helpWithFunction(sqllex sqlLexer, f tree.ResolvableFunctionReference) int {
-	d, err := f.Resolve(tree.SearchPath{})
+	d, err := f.Resolve(sessiondata.SearchPath{})
 	if err != nil {
 		return 1
 	}
@@ -96,7 +97,7 @@ func helpWithFunction(sqllex sqlLexer, f tree.ResolvableFunctionReference) int {
 	msg := HelpMessage{
 		Function: f.String(),
 		HelpMessageBody: HelpMessageBody{
-			Category: "built-in functions",
+			Category: d.Category,
 			SeeAlso:  base.DocsURL("functions-and-operators.html"),
 		},
 	}
@@ -110,27 +111,29 @@ func helpWithFunction(sqllex sqlLexer, f tree.ResolvableFunctionReference) int {
 	// together.
 	lastInfo := ""
 	for i, overload := range d.Definition {
-		b := overload.(tree.Builtin)
+		b := overload.(*tree.Overload)
 		if b.Info != "" && b.Info != lastInfo {
 			if i > 0 {
 				fmt.Fprintln(w, "---")
 			}
 			fmt.Fprintf(w, "\n%s\n\n", b.Info)
-			fmt.Fprintln(w, "Signature\tCategory")
+			fmt.Fprintln(w, "Signature")
 		}
 		lastInfo = b.Info
 
-		cat := b.Category
-		if cat != "" {
-			cat = "[" + cat + "]"
-		}
-		fmt.Fprintf(w, "%s%s\t%s\n", d.Name, b.Signature(), cat)
+		simplifyRet := d.Class == tree.GeneratorClass
+		fmt.Fprintf(w, "%s%s\n", d.Name, b.Signature(simplifyRet))
 	}
 	_ = w.Flush()
 	msg.Text = buf.String()
 
-	sqllex.(*Scanner).SetHelp(msg)
+	sqllex.(*lexer).SetHelp(msg)
 	return 1
+}
+
+func helpWithFunctionByName(sqllex sqlLexer, s string) int {
+	un := &tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{s}}
+	return helpWithFunction(sqllex, tree.ResolvableFunctionReference{FunctionReference: un})
 }
 
 const (

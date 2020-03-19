@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tests_test
 
@@ -19,32 +15,33 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/kr/pretty"
-
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/gogo/protobuf/proto"
+	"github.com/kr/pretty"
+	"github.com/stretchr/testify/require"
 )
 
 func TestInitialKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
 	const keysPerDesc = 2
-	const nonDescKeys = 2
+	const nonDescKeys = 9
 
-	ms := sqlbase.MakeMetadataSchema()
-	kv := ms.GetInitialValues()
+	ms := sqlbase.MakeMetadataSchema(zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
+	kv, _ /* splits */ := ms.GetInitialValues(clusterversion.TestingClusterVersion)
 	expected := nonDescKeys + keysPerDesc*ms.SystemDescriptorCount()
 	if actual := len(kv); actual != expected {
 		t.Fatalf("Wrong number of initial sql kv pairs: %d, wanted %d", actual, expected)
 	}
 
 	// Add an additional table.
-	sqlbase.SystemAllowedPrivileges[keys.MaxReservedDescID] = privilege.Lists{{privilege.ALL}}
+	sqlbase.SystemAllowedPrivileges[keys.MaxReservedDescID] = privilege.List{privilege.ALL}
 	desc, err := sql.CreateTestTableDescriptor(
 		context.TODO(),
 		keys.SystemDatabaseID,
@@ -56,7 +53,7 @@ func TestInitialKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	ms.AddDescriptor(keys.SystemDatabaseID, &desc)
-	kv = ms.GetInitialValues()
+	kv, _ /* splits */ = ms.GetInitialValues(clusterversion.TestingClusterVersion)
 	expected = nonDescKeys + keysPerDesc*ms.SystemDescriptorCount()
 	if actual := len(kv); actual != expected {
 		t.Fatalf("Wrong number of initial sql kv pairs: %d, wanted %d", actual, expected)
@@ -81,7 +78,7 @@ func TestInitialKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := i, int64(keys.MaxReservedDescID+1); a != e {
+	if a, e := i, int64(keys.MinUserDescID); a != e {
 		t.Fatalf("Expected next descriptor ID to be %d, was %d", e, a)
 	}
 }
@@ -103,43 +100,44 @@ func TestSystemTableLiterals(t *testing.T) {
 		id     sqlbase.ID
 		schema string
 		pkg    sqlbase.TableDescriptor
-		// Starting with the RoleMembers table, all newly created tables have two sets of privileges:
-		// one for "root", another for "admin". Previous tables get them through a migration.
-		hasAdmin bool
 	}
 
 	for _, test := range []testcase{
-		{keys.NamespaceTableID, sqlbase.NamespaceTableSchema, sqlbase.NamespaceTable, false},
-		{keys.DescriptorTableID, sqlbase.DescriptorTableSchema, sqlbase.DescriptorTable, false},
-		{keys.UsersTableID, sqlbase.UsersTableSchema, sqlbase.UsersTable, false},
-		{keys.ZonesTableID, sqlbase.ZonesTableSchema, sqlbase.ZonesTable, false},
-		{keys.LeaseTableID, sqlbase.LeaseTableSchema, sqlbase.LeaseTable, false},
-		{keys.EventLogTableID, sqlbase.EventLogTableSchema, sqlbase.EventLogTable, false},
-		{keys.RangeEventTableID, sqlbase.RangeEventTableSchema, sqlbase.RangeEventTable, false},
-		{keys.UITableID, sqlbase.UITableSchema, sqlbase.UITable, false},
-		{keys.JobsTableID, sqlbase.JobsTableSchema, sqlbase.JobsTable, false},
-		{keys.SettingsTableID, sqlbase.SettingsTableSchema, sqlbase.SettingsTable, false},
-		{keys.WebSessionsTableID, sqlbase.WebSessionsTableSchema, sqlbase.WebSessionsTable, false},
-		{keys.TableStatisticsTableID, sqlbase.TableStatisticsTableSchema, sqlbase.TableStatisticsTable, false},
-		{keys.LocationsTableID, sqlbase.LocationsTableSchema, sqlbase.LocationsTable, false},
-		{keys.RoleMembersTableID, sqlbase.RoleMembersTableSchema, sqlbase.RoleMembersTable, true},
+		{keys.NamespaceTableID, sqlbase.NamespaceTableSchema, sqlbase.NamespaceTable},
+		{keys.DescriptorTableID, sqlbase.DescriptorTableSchema, sqlbase.DescriptorTable},
+		{keys.UsersTableID, sqlbase.UsersTableSchema, sqlbase.UsersTable},
+		{keys.ZonesTableID, sqlbase.ZonesTableSchema, sqlbase.ZonesTable},
+		{keys.LeaseTableID, sqlbase.LeaseTableSchema, sqlbase.LeaseTable},
+		{keys.EventLogTableID, sqlbase.EventLogTableSchema, sqlbase.EventLogTable},
+		{keys.RangeEventTableID, sqlbase.RangeEventTableSchema, sqlbase.RangeEventTable},
+		{keys.UITableID, sqlbase.UITableSchema, sqlbase.UITable},
+		{keys.JobsTableID, sqlbase.JobsTableSchema, sqlbase.JobsTable},
+		{keys.SettingsTableID, sqlbase.SettingsTableSchema, sqlbase.SettingsTable},
+		{keys.WebSessionsTableID, sqlbase.WebSessionsTableSchema, sqlbase.WebSessionsTable},
+		{keys.TableStatisticsTableID, sqlbase.TableStatisticsTableSchema, sqlbase.TableStatisticsTable},
+		{keys.LocationsTableID, sqlbase.LocationsTableSchema, sqlbase.LocationsTable},
+		{keys.RoleMembersTableID, sqlbase.RoleMembersTableSchema, sqlbase.RoleMembersTable},
+		{keys.CommentsTableID, sqlbase.CommentsTableSchema, sqlbase.CommentsTable},
+		{keys.ProtectedTimestampsMetaTableID, sqlbase.ProtectedTimestampsMetaTableSchema, sqlbase.ProtectedTimestampsMetaTable},
+		{keys.ProtectedTimestampsRecordsTableID, sqlbase.ProtectedTimestampsRecordsTableSchema, sqlbase.ProtectedTimestampsRecordsTable},
+		{keys.RoleOptionsTableID, sqlbase.RoleOptionsTableSchema, sqlbase.RoleOptionsTable},
+		{keys.StatementBundleChunksTableID, sqlbase.StatementBundleChunksTableSchema, sqlbase.StatementBundleChunksTable},
+		{keys.StatementDiagnosticsRequestsTableID, sqlbase.StatementDiagnosticsRequestsTableSchema, sqlbase.StatementDiagnosticsRequestsTable},
+		{keys.StatementDiagnosticsTableID, sqlbase.StatementDiagnosticsTableSchema, sqlbase.StatementDiagnosticsTable},
 	} {
-		var privs *sqlbase.PrivilegeDescriptor
-		if test.hasAdmin {
-			privs = sqlbase.NewCustomSuperuserPrivilegeDescriptor(sqlbase.SystemDesiredPrivileges(test.id))
-		} else {
-			privs = sqlbase.NewCustomRootPrivilegeDescriptor(sqlbase.SystemDesiredPrivileges(test.id))
-		}
+		privs := *test.pkg.Privileges
 		gen, err := sql.CreateTestTableDescriptor(
 			context.TODO(),
 			keys.SystemDatabaseID,
 			test.id,
 			test.schema,
-			privs,
+			&privs,
 		)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("test: %+v, err: %v", test, err)
 		}
+		require.NoError(t, gen.ValidateTable())
+
 		if !proto.Equal(&test.pkg, &gen) {
 			diff := strings.Join(pretty.Diff(&test.pkg, &gen), "\n")
 			t.Errorf("%s table descriptor generated from CREATE TABLE statement does not match "+

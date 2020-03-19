@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package keys
 
@@ -37,6 +33,7 @@ func TestStoreKeyEncodeDecode(t *testing.T) {
 		{key: StoreGossipKey(), expSuffix: localStoreGossipSuffix, expDetail: nil},
 		{key: StoreClusterVersionKey(), expSuffix: localStoreClusterVersionSuffix, expDetail: nil},
 		{key: StoreLastUpKey(), expSuffix: localStoreLastUpSuffix, expDetail: nil},
+		{key: StoreHLCUpperBoundKey(), expSuffix: localStoreHLCUpperBoundSuffix, expDetail: nil},
 		{
 			key:       StoreSuggestedCompactionKey(roachpb.Key("a"), roachpb.Key("z")),
 			expSuffix: localStoreSuggestedCompactionSuffix,
@@ -143,18 +140,15 @@ func TestKeyAddressError(t *testing.T) {
 		},
 		"local range ID key .* is not addressable": {
 			AbortSpanKey(0, uuid.MakeV4()),
-			RaftTombstoneKey(0),
-			RaftAppliedIndexKey(0),
-			RaftTruncatedStateKey(0),
+			RangeTombstoneKey(0),
+			RaftAppliedIndexLegacyKey(0),
+			RaftTruncatedStateLegacyKey(0),
 			RangeLeaseKey(0),
-			RangeStatsKey(0),
+			RangeStatsLegacyKey(0),
 			RaftHardStateKey(0),
-			RaftLastIndexKey(0),
 			RaftLogPrefix(0),
 			RaftLogKey(0, 0),
 			RangeLastReplicaGCTimestampKey(0),
-			RangeLastVerificationTimestampKeyDeprecated(0),
-			RangeDescriptorKey(roachpb.RKey(RangeLastVerificationTimestampKeyDeprecated(0))),
 		},
 		"local key .* malformed": {
 			makeKey(localPrefix, roachpb.Key("z")),
@@ -243,7 +237,7 @@ func TestUserKey(t *testing.T) {
 
 func TestSequenceKey(t *testing.T) {
 	actual := MakeSequenceKey(55)
-	expected := []byte("\xbfseqval")
+	expected := []byte("\xbf\x89\x88\x88")
 	if !bytes.Equal(actual, expected) {
 		t.Errorf("expected %q (len %d), got %q (len %d)", expected, len(expected), actual, len(actual))
 	}
@@ -473,9 +467,11 @@ func TestBatchRange(t *testing.T) {
 	for i, c := range testCases {
 		var ba roachpb.BatchRequest
 		for _, pair := range c.req {
-			ba.Add(&roachpb.ScanRequest{Span: roachpb.Span{Key: roachpb.Key(pair[0]), EndKey: roachpb.Key(pair[1])}})
+			ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
+				Key: roachpb.Key(pair[0]), EndKey: roachpb.Key(pair[1]),
+			}})
 		}
-		if rs, err := Range(ba); err != nil {
+		if rs, err := Range(ba.Requests); err != nil {
 			t.Errorf("%d: %v", i, err)
 		} else if actPair := [2]string{string(rs.Key), string(rs.EndKey)}; !reflect.DeepEqual(actPair, c.exp) {
 			t.Errorf("%d: expected [%q,%q), got [%q,%q)", i, c.exp[0], c.exp[1], actPair[0], actPair[1])
@@ -501,16 +497,20 @@ func TestBatchError(t *testing.T) {
 
 	for i, c := range testCases {
 		var ba roachpb.BatchRequest
-		ba.Add(&roachpb.ScanRequest{Span: roachpb.Span{Key: roachpb.Key(c.req[0]), EndKey: roachpb.Key(c.req[1])}})
-		if _, err := Range(ba); !testutils.IsError(err, c.errMsg) {
+		ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
+			Key: roachpb.Key(c.req[0]), EndKey: roachpb.Key(c.req[1]),
+		}})
+		if _, err := Range(ba.Requests); !testutils.IsError(err, c.errMsg) {
 			t.Errorf("%d: unexpected error %v", i, err)
 		}
 	}
 
 	// Test a case where a non-range request has an end key.
 	var ba roachpb.BatchRequest
-	ba.Add(&roachpb.GetRequest{Span: roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("b")}})
-	if _, err := Range(ba); !testutils.IsError(err, "end key specified for non-range operation") {
+	ba.Add(&roachpb.GetRequest{RequestHeader: roachpb.RequestHeader{
+		Key: roachpb.Key("a"), EndKey: roachpb.Key("b"),
+	}})
+	if _, err := Range(ba.Requests); !testutils.IsError(err, "end key specified for non-range operation") {
 		t.Errorf("unexpected error %v", err)
 	}
 }

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // +build linux freebsd
 
@@ -23,13 +19,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/backtrace-labs/go-bcd"
-
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"golang.org/x/sys/unix"
 )
 
 // Currently disabled as backtrace appears to be obscuring problems when test
@@ -93,7 +87,7 @@ func initBacktrace(logDir string, options ...stop.Option) *stop.Stopper {
 	bcd.Register(tracer)
 
 	// Hook log.Fatal*.
-	log.SetExitFunc(func(code int) {
+	log.SetExitFunc(false /* hideStack */, func(code int) {
 		_ = bcd.Trace(tracer, fmt.Errorf("exit %d", code), nil)
 		os.Exit(code)
 	})

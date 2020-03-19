@@ -1,361 +1,48 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "db.h"
 #include <algorithm>
-#include <google/protobuf/stubs/stringprintf.h>
-#include <mutex>
-#include <rocksdb/cache.h>
-#include <rocksdb/db.h>
-#include <rocksdb/env.h>
-#include <rocksdb/filter_policy.h>
-#include <rocksdb/ldb_tool.h>
-#include <rocksdb/merge_operator.h>
-#include <rocksdb/options.h>
-#include <rocksdb/slice_transform.h>
+#include <iostream>
+#include <rocksdb/convenience.h>
+#include <rocksdb/perf_context.h>
 #include <rocksdb/sst_file_writer.h>
-#include <rocksdb/statistics.h>
 #include <rocksdb/table.h>
-#include <rocksdb/utilities/write_batch_with_index.h>
+#include <rocksdb/utilities/checkpoint.h>
+#include <stdarg.h>
+#include "batch.h"
+#include "cache.h"
+#include "comparator.h"
+#include "defines.h"
 #include "encoding.h"
-#include "env_switching.h"
+#include "engine.h"
+#include "env_manager.h"
 #include "eventlistener.h"
 #include "fmt.h"
-#include "keys.h"
-#include "protos/roachpb/data.pb.h"
-#include "protos/roachpb/internal.pb.h"
-#include "protos/storage/engine/enginepb/mvcc.pb.h"
-#include "protos/storage/engine/enginepb/rocksdb.pb.h"
+#include "getter.h"
+#include "godefs.h"
+#include "incremental_iterator.h"
+#include "iterator.h"
+#include "merge.h"
+#include "options.h"
+#include "protos/roachpb/errors.pb.h"
+#include "row_counter.h"
+#include "snapshot.h"
+#include "stack_trace.h"
+#include "status.h"
+#include "table_props.h"
+#include "timestamp.h"
 
-const DBStatus kSuccess = {NULL, 0};
+using namespace cockroach;
 
-extern "C" {
-static void __attribute__((noreturn)) die_missing_symbol(const char* name) {
-  fprintf(stderr, "%s symbol missing; expected to be supplied by Go\n", name);
-  abort();
-}
-
-// These are Go functions exported by storage/engine. We provide these stubs,
-// which simply panic if called, to to allow intermediate build products to link
-// successfully. Otherwise, when building ccl/storageccl/engineccl, Go will
-// complain that these symbols are undefined. Because these stubs are marked
-// "weak", they will be replaced by their proper implementation in
-// storage/engine when the final cockroach binary is linked.
-void __attribute__((weak)) rocksDBLog(char*, int) { die_missing_symbol(__func__); }
-char* __attribute__((weak)) prettyPrintKey(DBKey) { die_missing_symbol(__func__); }
-}  // extern "C"
-
-#if defined(COMPILER_GCC) || defined(__clang__)
-#define WARN_UNUSED_RESULT __attribute__((warn_unused_result))
-#else
-#define WARN_UNUSED_RESULT
-#endif
-
-// DBOpenHook in OSS mode only verifies that no extra options are specified.
-__attribute__((weak)) rocksdb::Status DBOpenHook(const DBOptions opts) {
-  if (opts.extra_options.len != 0) {
-    return rocksdb::Status::InvalidArgument("DBOptions has extra_options, but OSS code cannot handle them");
-  }
-  return rocksdb::Status::OK();
-}
-
-struct DBCache {
-  std::mutex mu;
-  std::shared_ptr<rocksdb::Cache> rep;
-};
-
-struct DBEngine {
-  rocksdb::DB* const rep;
-
-  DBEngine(rocksdb::DB* r) : rep(r) {}
-  virtual ~DBEngine() {}
-
-  virtual DBStatus Put(DBKey key, DBSlice value) = 0;
-  virtual DBStatus Merge(DBKey key, DBSlice value) = 0;
-  virtual DBStatus Delete(DBKey key) = 0;
-  virtual DBStatus DeleteRange(DBKey start, DBKey end) = 0;
-  virtual DBStatus CommitBatch(bool sync) = 0;
-  virtual DBStatus ApplyBatchRepr(DBSlice repr, bool sync) = 0;
-  virtual DBSlice BatchRepr() = 0;
-  virtual DBStatus Get(DBKey key, DBString* value) = 0;
-  virtual DBIterator* NewIter(rocksdb::ReadOptions*) = 0;
-  virtual DBStatus GetStats(DBStatsResult* stats) = 0;
-  virtual DBString GetCompactionStats() = 0;
-  virtual DBStatus EnvWriteFile(DBSlice path, DBSlice contents) = 0;
-
-  DBSSTable* GetSSTables(int* n);
-  DBString GetUserProperties();
-};
-
-struct DBImpl : public DBEngine {
-  std::unique_ptr<rocksdb::Env> switching_env;
-  std::unique_ptr<rocksdb::Env> memenv;
-  std::unique_ptr<rocksdb::DB> rep_deleter;
-  std::shared_ptr<rocksdb::Cache> block_cache;
-  std::shared_ptr<DBEventListener> event_listener;
-
-  // Construct a new DBImpl from the specified DB.
-  // The DB and passed Envs will be deleted when the DBImpl is deleted.
-  // Either env can be NULL.
-  DBImpl(rocksdb::DB* r, rocksdb::Env* m, std::shared_ptr<rocksdb::Cache> bc,
-         std::shared_ptr<DBEventListener> event_listener, rocksdb::Env* s_env)
-      : DBEngine(r), switching_env(s_env), memenv(m), rep_deleter(r), block_cache(bc), event_listener(event_listener) {}
-  virtual ~DBImpl() {
-    const rocksdb::Options& opts = rep->GetOptions();
-    const std::shared_ptr<rocksdb::Statistics>& s = opts.statistics;
-    rocksdb::Info(opts.info_log, "bloom filter utility:    %0.1f%%",
-                  (100.0 * s->getTickerCount(rocksdb::BLOOM_FILTER_PREFIX_USEFUL)) /
-                      s->getTickerCount(rocksdb::BLOOM_FILTER_PREFIX_CHECKED));
-  }
-
-  virtual DBStatus Put(DBKey key, DBSlice value);
-  virtual DBStatus Merge(DBKey key, DBSlice value);
-  virtual DBStatus Delete(DBKey key);
-  virtual DBStatus DeleteRange(DBKey start, DBKey end);
-  virtual DBStatus CommitBatch(bool sync);
-  virtual DBStatus ApplyBatchRepr(DBSlice repr, bool sync);
-  virtual DBSlice BatchRepr();
-  virtual DBStatus Get(DBKey key, DBString* value);
-  virtual DBIterator* NewIter(rocksdb::ReadOptions*);
-  virtual DBStatus GetStats(DBStatsResult* stats);
-  virtual DBString GetCompactionStats();
-  virtual DBStatus EnvWriteFile(DBSlice path, DBSlice contents);
-};
-
-struct DBBatch : public DBEngine {
-  int updates;
-  bool has_delete_range;
-  rocksdb::WriteBatchWithIndex batch;
-
-  DBBatch(DBEngine* db);
-  virtual ~DBBatch() {}
-
-  virtual DBStatus Put(DBKey key, DBSlice value);
-  virtual DBStatus Merge(DBKey key, DBSlice value);
-  virtual DBStatus Delete(DBKey key);
-  virtual DBStatus DeleteRange(DBKey start, DBKey end);
-  virtual DBStatus CommitBatch(bool sync);
-  virtual DBStatus ApplyBatchRepr(DBSlice repr, bool sync);
-  virtual DBSlice BatchRepr();
-  virtual DBStatus Get(DBKey key, DBString* value);
-  virtual DBIterator* NewIter(rocksdb::ReadOptions*);
-  virtual DBStatus GetStats(DBStatsResult* stats);
-  virtual DBString GetCompactionStats();
-  virtual DBStatus EnvWriteFile(DBSlice path, DBSlice contents);
-};
-
-struct DBWriteOnlyBatch : public DBEngine {
-  int updates;
-  rocksdb::WriteBatch batch;
-
-  DBWriteOnlyBatch(DBEngine* db);
-  virtual ~DBWriteOnlyBatch() {}
-
-  virtual DBStatus Put(DBKey key, DBSlice value);
-  virtual DBStatus Merge(DBKey key, DBSlice value);
-  virtual DBStatus Delete(DBKey key);
-  virtual DBStatus DeleteRange(DBKey start, DBKey end);
-  virtual DBStatus CommitBatch(bool sync);
-  virtual DBStatus ApplyBatchRepr(DBSlice repr, bool sync);
-  virtual DBSlice BatchRepr();
-  virtual DBStatus Get(DBKey key, DBString* value);
-  virtual DBIterator* NewIter(rocksdb::ReadOptions*);
-  virtual DBStatus GetStats(DBStatsResult* stats);
-  virtual DBString GetCompactionStats();
-  virtual DBStatus EnvWriteFile(DBSlice path, DBSlice contents);
-};
-
-struct DBSnapshot : public DBEngine {
-  const rocksdb::Snapshot* snapshot;
-
-  DBSnapshot(DBEngine* db) : DBEngine(db->rep), snapshot(db->rep->GetSnapshot()) {}
-  virtual ~DBSnapshot() { rep->ReleaseSnapshot(snapshot); }
-
-  virtual DBStatus Put(DBKey key, DBSlice value);
-  virtual DBStatus Merge(DBKey key, DBSlice value);
-  virtual DBStatus Delete(DBKey key);
-  virtual DBStatus DeleteRange(DBKey start, DBKey end);
-  virtual DBStatus CommitBatch(bool sync);
-  virtual DBStatus ApplyBatchRepr(DBSlice repr, bool sync);
-  virtual DBSlice BatchRepr();
-  virtual DBStatus Get(DBKey key, DBString* value);
-  virtual DBIterator* NewIter(rocksdb::ReadOptions*);
-  virtual DBStatus GetStats(DBStatsResult* stats);
-  virtual DBString GetCompactionStats();
-  virtual DBStatus EnvWriteFile(DBSlice path, DBSlice contents);
-};
-
-struct DBIterator {
-  std::unique_ptr<rocksdb::Iterator> rep;
-};
-
-std::string ToString(DBSlice s) { return std::string(s.data, s.len); }
-
-std::string ToString(DBString s) { return std::string(s.data, s.len); }
-
-rocksdb::Slice ToSlice(DBSlice s) { return rocksdb::Slice(s.data, s.len); }
-
-rocksdb::Slice ToSlice(DBString s) { return rocksdb::Slice(s.data, s.len); }
-
-const int kMVCCVersionTimestampSize = 12;
-
-void EncodeTimestamp(std::string& s, int64_t wall_time, int32_t logical) {
-  EncodeUint64(&s, uint64_t(wall_time));
-  if (logical != 0) {
-    EncodeUint32(&s, uint32_t(logical));
-  }
-}
-
-std::string EncodeTimestamp(DBTimestamp ts) {
-  std::string s;
-  s.reserve(kMVCCVersionTimestampSize);
-  EncodeTimestamp(s, ts.wall_time, ts.logical);
-  return s;
-}
-
-// MVCC keys are encoded as <key>[<wall_time>[<logical>]]<#timestamp-bytes>. A
-// custom RocksDB comparator (DBComparator) is used to maintain the desired
-// ordering as these keys do not sort lexicographically correctly.
-std::string EncodeKey(DBKey k) {
-  std::string s;
-  const bool ts = k.wall_time != 0 || k.logical != 0;
-  s.reserve(k.key.len + 1 + (ts ? 1 + kMVCCVersionTimestampSize : 0));
-  s.append(k.key.data, k.key.len);
-  if (ts) {
-    // Add a NUL prefix to the timestamp data. See DBPrefixExtractor.Transform
-    // for more details.
-    s.push_back(0);
-    EncodeTimestamp(s, k.wall_time, k.logical);
-  }
-  s.push_back(char(s.size() - k.key.len));
-  return s;
-}
-
-// When we're performing a prefix scan, we want to limit the scan to
-// the keys that have the matching prefix. Prefix in this case refers
-// to an exact match on the non-timestamp portion of a key. We do this
-// by constructing an encoded mvcc key which has a zero timestamp
-// (hence the trailing 0) and is the "next" key (thus the additional
-// 0). See EncodeKey and SplitKey for more details on the encoded key
-// format.
-std::string EncodePrefixNextKey(DBSlice k) {
-  std::string s;
-  if (k.len > 0) {
-    s.reserve(k.len + 2);
-    s.append(k.data, k.len);
-    s.push_back(0);
-    s.push_back(0);
-  }
-  return s;
-}
-
-WARN_UNUSED_RESULT bool SplitKey(rocksdb::Slice buf, rocksdb::Slice* key, rocksdb::Slice* timestamp) {
-  if (buf.empty()) {
-    return false;
-  }
-  const char ts_size = buf[buf.size() - 1];
-  if (ts_size >= buf.size()) {
-    return false;
-  }
-  *key = rocksdb::Slice(buf.data(), buf.size() - ts_size - 1);
-  *timestamp = rocksdb::Slice(key->data() + key->size(), ts_size);
-  return true;
-}
-
-WARN_UNUSED_RESULT bool DecodeTimestamp(rocksdb::Slice* timestamp, int64_t* wall_time, int32_t* logical) {
-  uint64_t w;
-  if (!DecodeUint64(timestamp, &w)) {
-    return false;
-  }
-  *wall_time = int64_t(w);
-  *logical = 0;
-  if (timestamp->size() > 0) {
-    // TODO(peter): Use varint decoding here.
-    uint32_t l;
-    if (!DecodeUint32(timestamp, &l)) {
-      return false;
-    }
-    *logical = int32_t(l);
-  }
-  return true;
-}
-
-WARN_UNUSED_RESULT bool DecodeHLCTimestamp(rocksdb::Slice buf, cockroach::util::hlc::Timestamp* timestamp) {
-  int64_t wall_time;
-  int32_t logical;
-  if (!DecodeTimestamp(&buf, &wall_time, &logical)) {
-    return false;
-  }
-  timestamp->set_wall_time(wall_time);
-  timestamp->set_logical(logical);
-  return true;
-}
-
-WARN_UNUSED_RESULT bool DecodeKey(rocksdb::Slice buf, rocksdb::Slice* key, int64_t* wall_time, int32_t* logical) {
-  key->clear();
-
-  rocksdb::Slice timestamp;
-  if (!SplitKey(buf, key, &timestamp)) {
-    return false;
-  }
-  if (timestamp.size() > 0) {
-    timestamp.remove_prefix(1);  // The NUL prefix.
-    if (!DecodeTimestamp(&timestamp, wall_time, logical)) {
-      return false;
-    }
-  }
-  return timestamp.empty();
-}
-
-rocksdb::Slice KeyPrefix(const rocksdb::Slice& src) {
-  rocksdb::Slice key;
-  rocksdb::Slice ts;
-  if (!SplitKey(src, &key, &ts)) {
-    return src;
-  }
-  // RocksDB requires that keys generated via Transform be comparable with
-  // normal encoded MVCC keys. Encoded MVCC keys have a suffix indicating the
-  // number of bytes of timestamp data. MVCC keys without a timestamp have a
-  // suffix of 0. We're careful in EncodeKey to make sure that the user-key
-  // always has a trailing 0. If there is no timestamp this falls out
-  // naturally. If there is a timestamp we prepend a 0 to the encoded
-  // timestamp data.
-  assert(src.size() > key.size() && src[key.size()] == 0);
-  return rocksdb::Slice(key.data(), key.size() + 1);
-}
-
-DBSlice ToDBSlice(const rocksdb::Slice& s) {
-  DBSlice result;
-  result.data = const_cast<char*>(s.data());
-  result.len = s.size();
-  return result;
-}
-
-DBSlice ToDBSlice(const DBString& s) {
-  DBSlice result;
-  result.data = s.data;
-  result.len = s.len;
-  return result;
-}
-
-DBString ToDBString(const rocksdb::Slice& s) {
-  DBString result;
-  result.len = s.size();
-  result.data = static_cast<char*>(malloc(result.len));
-  memcpy(result.data, s.data(), s.size());
-  return result;
-}
+namespace cockroach {
 
 DBKey ToDBKey(const rocksdb::Slice& s) {
   DBKey key;
@@ -367,21 +54,66 @@ DBKey ToDBKey(const rocksdb::Slice& s) {
   return key;
 }
 
-DBStatus ToDBStatus(const rocksdb::Status& status) {
-  if (status.ok()) {
-    return kSuccess;
+ScopedStats::ScopedStats(DBIterator* iter)
+    : iter_(iter),
+      internal_delete_skipped_count_base_(
+          rocksdb::get_perf_context()->internal_delete_skipped_count) {
+  if (iter_->stats != nullptr) {
+    rocksdb::SetPerfLevel(rocksdb::PerfLevel::kEnableTimeExceptForMutex);
   }
-  return ToDBString(status.ToString());
+}
+ScopedStats::~ScopedStats() {
+  if (iter_->stats != nullptr) {
+    iter_->stats->internal_delete_skipped_count +=
+        (rocksdb::get_perf_context()->internal_delete_skipped_count -
+         internal_delete_skipped_count_base_);
+    rocksdb::SetPerfLevel(rocksdb::PerfLevel::kDisable);
+  }
 }
 
-DBStatus FmtStatus(const char* fmt_str, ...) {
-  va_list ap;
-  va_start(ap, fmt_str);
-  std::string str;
-  fmt::StringAppendV(&str, fmt_str, ap);
-  va_end(ap);
-  return ToDBString(str);
+void BatchSSTablesForCompaction(const std::vector<rocksdb::SstFileMetaData>& sst,
+                                rocksdb::Slice start_key, rocksdb::Slice end_key,
+                                uint64_t target_size, std::vector<rocksdb::Range>* ranges) {
+  int prev = -1;  // index of the last compacted sst
+  uint64_t size = 0;
+  for (int i = 0; i < sst.size(); ++i) {
+    size += sst[i].size;
+    if (size < target_size && (i + 1) < sst.size()) {
+      // We haven't reached the target size or the end of the sstables
+      // to compact.
+      continue;
+    }
+
+    rocksdb::Slice start;
+    if (prev == -1) {
+      // This is the first compaction.
+      start = start_key;
+    } else {
+      // This is a compaction in the middle or end of the requested
+      // key range. The start key for the compaction is the largest
+      // key from the previous compacted.
+      start = rocksdb::Slice(sst[prev].largestkey);
+    }
+
+    rocksdb::Slice end;
+    if ((i + 1) == sst.size()) {
+      // This is the last compaction.
+      end = end_key;
+    } else {
+      // This is a compaction at the start or in the middle of the
+      // requested key range. The end key is the largest key in the
+      // current sstable.
+      end = rocksdb::Slice(sst[i].largestkey);
+    }
+
+    ranges->emplace_back(rocksdb::Range(start, end));
+
+    prev = i;
+    size = 0;
+  }
 }
+
+}  // namespace cockroach
 
 namespace {
 
@@ -398,1188 +130,107 @@ DBIterState DBIterGetState(DBIterator* iter) {
       state.value = ToDBSlice(iter->rep->value());
     }
   }
+
   return state;
 }
-
-const int kChecksumSize = 4;
-const int kTagPos = kChecksumSize;
-const int kHeaderSize = kTagPos + 1;
-
-rocksdb::Slice ValueDataBytes(const std::string& val) {
-  if (val.size() < kHeaderSize) {
-    return rocksdb::Slice();
-  }
-  return rocksdb::Slice(val.data() + kHeaderSize, val.size() - kHeaderSize);
-}
-
-cockroach::roachpb::ValueType GetTag(const std::string& val) {
-  if (val.size() < kHeaderSize) {
-    return cockroach::roachpb::UNKNOWN;
-  }
-  return cockroach::roachpb::ValueType(val[kTagPos]);
-}
-
-void SetTag(std::string* val, cockroach::roachpb::ValueType tag) { (*val)[kTagPos] = tag; }
-
-WARN_UNUSED_RESULT bool ParseProtoFromValue(const std::string& val, google::protobuf::MessageLite* msg) {
-  if (val.size() < kHeaderSize) {
-    return false;
-  }
-  const rocksdb::Slice d = ValueDataBytes(val);
-  return msg->ParseFromArray(d.data(), d.size());
-}
-
-void SerializeProtoToValue(std::string* val, const google::protobuf::MessageLite& msg) {
-  val->resize(kHeaderSize);
-  std::fill(val->begin(), val->end(), 0);
-  SetTag(val, cockroach::roachpb::BYTES);
-  msg.AppendToString(val);
-}
-
-bool IsValidSplitKey(const rocksdb::Slice& key, bool allow_meta2_splits) {
-  if (key == kMeta2KeyMax) {
-    // We do not allow splits at Meta2KeyMax. The reason for this is that the
-    // last range is the keyspace will always end at KeyMax, which will be
-    // stored at Meta2KeyMax because RangeMetaKey(KeyMax) = Meta2KeyMax. If we
-    // allowed splits at this key then the last descriptor would be stored on a
-    // non-meta range since the meta ranges would span from [KeyMin,Meta2KeyMax)
-    // and the first non-meta range would span [Meta2KeyMax,...).
-    return false;
-  }
-  const auto& no_split_spans = allow_meta2_splits ? kSortedNoSplitSpans : kSortedNoSplitSpansWithoutMeta2Splits;
-  for (auto span : no_split_spans) {
-    // kSortedNoSplitSpans and kSortedNoSplitSpansWithoutMeta2Splits are
-    // both reverse sorted (largest to smallest) on the span end key which
-    // allows us to early exit if our key to check is above the end of the
-    // last no-split span.
-    if (key.compare(span.second) >= 0) {
-      return true;
-    }
-    if (key.compare(span.first) > 0) {
-      return false;
-    }
-  }
-  return true;
-}
-
-class DBComparator : public rocksdb::Comparator {
- public:
-  DBComparator() {}
-
-  virtual const char* Name() const override { return "cockroach_comparator"; }
-
-  virtual int Compare(const rocksdb::Slice& a, const rocksdb::Slice& b) const override {
-    rocksdb::Slice key_a, key_b;
-    rocksdb::Slice ts_a, ts_b;
-    if (!SplitKey(a, &key_a, &ts_a) || !SplitKey(b, &key_b, &ts_b)) {
-      // This should never happen unless there is some sort of corruption of
-      // the keys.
-      return a.compare(b);
-    }
-
-    const int c = key_a.compare(key_b);
-    if (c != 0) {
-      return c;
-    }
-    if (ts_a.empty()) {
-      if (ts_b.empty()) {
-        return 0;
-      }
-      return -1;
-    } else if (ts_b.empty()) {
-      return +1;
-    }
-    return ts_b.compare(ts_a);
-  }
-
-  virtual bool Equal(const rocksdb::Slice& a, const rocksdb::Slice& b) const override { return a == b; }
-
-  // The RocksDB docs say it is safe to leave these two methods unimplemented.
-  virtual void FindShortestSeparator(std::string* start, const rocksdb::Slice& limit) const override {}
-
-  virtual void FindShortSuccessor(std::string* key) const override {}
-};
-
-const DBComparator kComparator;
-
-class DBPrefixExtractor : public rocksdb::SliceTransform {
- public:
-  DBPrefixExtractor() {}
-
-  virtual const char* Name() const { return "cockroach_prefix_extractor"; }
-
-  // MVCC keys are encoded as <user-key>/<timestamp>. Extract the <user-key>
-  // prefix which will allow for more efficient iteration over the keys
-  // matching a particular <user-key>. Specifically, the <user-key> will be
-  // added to the per table bloom filters and will be used to skip tables
-  // which do not contain the <user-key>.
-  virtual rocksdb::Slice Transform(const rocksdb::Slice& src) const { return KeyPrefix(src); }
-
-  virtual bool InDomain(const rocksdb::Slice& src) const { return true; }
-
-  virtual bool InRange(const rocksdb::Slice& dst) const { return Transform(dst) == dst; }
-};
-
-class DBBatchInserter : public rocksdb::WriteBatch::Handler {
- public:
-  DBBatchInserter(rocksdb::WriteBatchBase* batch) : batch_(batch) {}
-
-  virtual void Put(const rocksdb::Slice& key, const rocksdb::Slice& value) { batch_->Put(key, value); }
-  virtual void Delete(const rocksdb::Slice& key) { batch_->Delete(key); }
-  virtual void Merge(const rocksdb::Slice& key, const rocksdb::Slice& value) { batch_->Merge(key, value); }
-  virtual rocksdb::Status DeleteRangeCF(uint32_t column_family_id, const rocksdb::Slice& begin_key,
-                                        const rocksdb::Slice& end_key) {
-    if (column_family_id == 0) {
-      batch_->DeleteRange(begin_key, end_key);
-      return rocksdb::Status::OK();
-    }
-    return rocksdb::Status::InvalidArgument("DeleteRangeCF not implemented");
-  }
-
- private:
-  rocksdb::WriteBatchBase* const batch_;
-};
-
-// Method used to sort InternalTimeSeriesSamples.
-bool TimeSeriesSampleOrdering(const cockroach::roachpb::InternalTimeSeriesSample* a,
-                              const cockroach::roachpb::InternalTimeSeriesSample* b) {
-  return a->offset() < b->offset();
-}
-
-// IsTimeSeriesData returns true if the given protobuffer Value contains a
-// TimeSeriesData message.
-bool IsTimeSeriesData(const std::string& val) { return GetTag(val) == cockroach::roachpb::TIMESERIES; }
-
-void SerializeTimeSeriesToValue(std::string* val, const cockroach::roachpb::InternalTimeSeriesData& ts) {
-  SerializeProtoToValue(val, ts);
-  SetTag(val, cockroach::roachpb::TIMESERIES);
-}
-
-// MergeTimeSeriesValues attempts to merge two Values which contain
-// InternalTimeSeriesData messages. The messages cannot be merged if they have
-// different start timestamps or sample durations. Returns true if the merge is
-// successful.
-WARN_UNUSED_RESULT bool MergeTimeSeriesValues(std::string* left, const std::string& right, bool full_merge,
-                                              rocksdb::Logger* logger) {
-  // Attempt to parse TimeSeriesData from both Values.
-  cockroach::roachpb::InternalTimeSeriesData left_ts;
-  cockroach::roachpb::InternalTimeSeriesData right_ts;
-  if (!ParseProtoFromValue(*left, &left_ts)) {
-    rocksdb::Warn(logger, "left InternalTimeSeriesData could not be parsed from bytes.");
-    return false;
-  }
-  if (!ParseProtoFromValue(right, &right_ts)) {
-    rocksdb::Warn(logger, "right InternalTimeSeriesData could not be parsed from bytes.");
-    return false;
-  }
-
-  // Ensure that both InternalTimeSeriesData have the same timestamp and
-  // sample_duration.
-  if (left_ts.start_timestamp_nanos() != right_ts.start_timestamp_nanos()) {
-    rocksdb::Warn(logger, "TimeSeries merge failed due to mismatched start timestamps");
-    return false;
-  }
-  if (left_ts.sample_duration_nanos() != right_ts.sample_duration_nanos()) {
-    rocksdb::Warn(logger, "TimeSeries merge failed due to mismatched sample durations.");
-    return false;
-  }
-
-  // If only a partial merge, do not sort and combine - instead, just quickly
-  // merge the two values together. Values will be processed later after a
-  // full merge.
-  if (!full_merge) {
-    left_ts.MergeFrom(right_ts);
-    SerializeTimeSeriesToValue(left, left_ts);
-    return true;
-  }
-
-  // Initialize new_ts and its primitive data fields. Values from the left and
-  // right collections will be merged into the new collection.
-  cockroach::roachpb::InternalTimeSeriesData new_ts;
-  new_ts.set_start_timestamp_nanos(left_ts.start_timestamp_nanos());
-  new_ts.set_sample_duration_nanos(left_ts.sample_duration_nanos());
-
-  // Sort values in right_ts. Assume values in left_ts have been sorted.
-  std::stable_sort(right_ts.mutable_samples()->pointer_begin(), right_ts.mutable_samples()->pointer_end(),
-                   TimeSeriesSampleOrdering);
-
-  // Merge sample values of left and right into new_ts.
-  auto left_front = left_ts.samples().begin();
-  auto left_end = left_ts.samples().end();
-  auto right_front = right_ts.samples().begin();
-  auto right_end = right_ts.samples().end();
-
-  // Loop until samples from both sides have been exhausted.
-  while (left_front != left_end || right_front != right_end) {
-    // Select the lowest offset from either side.
-    long next_offset;
-    if (left_front == left_end) {
-      next_offset = right_front->offset();
-    } else if (right_front == right_end) {
-      next_offset = left_front->offset();
-    } else if (left_front->offset() <= right_front->offset()) {
-      next_offset = left_front->offset();
-    } else {
-      next_offset = right_front->offset();
-    }
-
-    // Create an empty sample in the output collection.
-    cockroach::roachpb::InternalTimeSeriesSample* ns = new_ts.add_samples();
-
-    // Only the most recently merged value with a given sample offset is kept;
-    // samples merged earlier at the same offset are discarded. We will now
-    // parse through the left and right sample sets, finding the most recently
-    // merged sample at the current offset.
-    cockroach::roachpb::InternalTimeSeriesSample src;
-    while (left_front != left_end && left_front->offset() == next_offset) {
-      src = *left_front;
-      left_front++;
-    }
-    while (right_front != right_end && right_front->offset() == next_offset) {
-      src = *right_front;
-      right_front++;
-    }
-
-    ns->CopyFrom(src);
-  }
-
-  // Serialize the new TimeSeriesData into the left value's byte field.
-  SerializeTimeSeriesToValue(left, new_ts);
-  return true;
-}
-
-// ConsolidateTimeSeriesValue processes a single value which contains
-// InternalTimeSeriesData messages. This method will sort the sample collection
-// of the value, keeping only the last of samples with duplicate offsets.
-// This method is the single-value equivalent of MergeTimeSeriesValues, and is
-// used in the case where the first value is merged into the key. Returns true
-// if the merge is successful.
-WARN_UNUSED_RESULT bool ConsolidateTimeSeriesValue(std::string* val, rocksdb::Logger* logger) {
-  // Attempt to parse TimeSeriesData from both Values.
-  cockroach::roachpb::InternalTimeSeriesData val_ts;
-  if (!ParseProtoFromValue(*val, &val_ts)) {
-    rocksdb::Warn(logger, "InternalTimeSeriesData could not be parsed from bytes.");
-    return false;
-  }
-
-  // Initialize new_ts and its primitive data fields.
-  cockroach::roachpb::InternalTimeSeriesData new_ts;
-  new_ts.set_start_timestamp_nanos(val_ts.start_timestamp_nanos());
-  new_ts.set_sample_duration_nanos(val_ts.sample_duration_nanos());
-
-  // Sort values in the ts value.
-  std::stable_sort(val_ts.mutable_samples()->pointer_begin(), val_ts.mutable_samples()->pointer_end(),
-                   TimeSeriesSampleOrdering);
-
-  // Consolidate sample values from the ts value with duplicate offsets.
-  auto front = val_ts.samples().begin();
-  auto end = val_ts.samples().end();
-
-  // Loop until samples have been exhausted.
-  while (front != end) {
-    // Create an empty sample in the output collection.
-    cockroach::roachpb::InternalTimeSeriesSample* ns = new_ts.add_samples();
-    ns->set_offset(front->offset());
-    while (front != end && front->offset() == ns->offset()) {
-      // Only the last sample in the value's repeated samples field with a given
-      // offset is kept in the case of multiple samples with identical offsets.
-      ns->CopyFrom(*front);
-      ++front;
-    }
-  }
-
-  // Serialize the new TimeSeriesData into the value's byte field.
-  SerializeTimeSeriesToValue(val, new_ts);
-  return true;
-}
-
-WARN_UNUSED_RESULT bool MergeValues(cockroach::storage::engine::enginepb::MVCCMetadata* left,
-                                    const cockroach::storage::engine::enginepb::MVCCMetadata& right, bool full_merge,
-                                    rocksdb::Logger* logger) {
-  if (left->has_raw_bytes()) {
-    if (!right.has_raw_bytes()) {
-      rocksdb::Warn(logger, "inconsistent value types for merge (left = bytes, right = ?)");
-      return false;
-    }
-
-    // Replay Advisory: Because merge commands pass through raft, it is possible
-    // for merging values to be "replayed". Currently, the only actual use of
-    // the merge system is for time series data, which is safe against replay;
-    // however, this property is not general for all potential mergeable types.
-    // If a future need arises to merge another type of data, replay protection
-    // will likely need to be a consideration.
-
-    if (IsTimeSeriesData(left->raw_bytes()) || IsTimeSeriesData(right.raw_bytes())) {
-      // The right operand must also be a time series.
-      if (!IsTimeSeriesData(left->raw_bytes()) || !IsTimeSeriesData(right.raw_bytes())) {
-        rocksdb::Warn(logger, "inconsistent value types for merging time "
-                              "series data (type(left) != type(right))");
-        return false;
-      }
-      return MergeTimeSeriesValues(left->mutable_raw_bytes(), right.raw_bytes(), full_merge, logger);
-    } else {
-      const rocksdb::Slice rdata = ValueDataBytes(right.raw_bytes());
-      left->mutable_raw_bytes()->append(rdata.data(), rdata.size());
-    }
-    return true;
-  } else {
-    left->mutable_raw_bytes()->assign(right.raw_bytes());
-    if (right.has_merge_timestamp()) {
-      left->mutable_merge_timestamp()->CopyFrom(right.merge_timestamp());
-    }
-    if (full_merge && IsTimeSeriesData(left->raw_bytes())) {
-      if (!ConsolidateTimeSeriesValue(left->mutable_raw_bytes(), logger)) {
-        return false;
-      }
-    }
-    return true;
-  }
-}
-
-// MergeResult serializes the result MVCCMetadata value into a byte slice.
-DBStatus MergeResult(cockroach::storage::engine::enginepb::MVCCMetadata* meta, DBString* result) {
-  // TODO(pmattis): Should recompute checksum here. Need a crc32
-  // implementation and need to verify the checksumming is identical
-  // to what is being done in Go. Zlib's crc32 should be sufficient.
-  result->len = meta->ByteSize();
-  result->data = static_cast<char*>(malloc(result->len));
-  if (!meta->SerializeToArray(result->data, result->len)) {
-    return ToDBString("serialization error");
-  }
-  return kSuccess;
-}
-
-class DBMergeOperator : public rocksdb::MergeOperator {
-  virtual const char* Name() const { return "cockroach_merge_operator"; }
-
-  virtual bool FullMerge(const rocksdb::Slice& key, const rocksdb::Slice* existing_value,
-                         const std::deque<std::string>& operand_list, std::string* new_value,
-                         rocksdb::Logger* logger) const WARN_UNUSED_RESULT {
-    // TODO(pmattis): Taken from the old merger code, below are some
-    // details about how errors returned by the merge operator are
-    // handled. Need to test various error scenarios and decide on
-    // desired behavior. Clear the key and it's gone. Corrupt it
-    // properly and RocksDB might refuse to work with it at all until
-    // you clear it manually, which may also not be what we want. The
-    // problem with merges is that RocksDB won't really carry them out
-    // while we have a chance to talk back to clients.
-    //
-    // If we indicate failure (*success = false), then the call to the
-    // merger via rocksdb_merge will not return an error, but simply
-    // remove or truncate the offending key (at least when the settings
-    // specify that missing keys should be created; otherwise a
-    // corruption error will be returned, but likely only after the next
-    // read of the key). In effect, there is no propagation of error
-    // information to the client.
-    cockroach::storage::engine::enginepb::MVCCMetadata meta;
-    if (existing_value != NULL) {
-      if (!meta.ParseFromArray(existing_value->data(), existing_value->size())) {
-        // Corrupted existing value.
-        rocksdb::Warn(logger, "corrupted existing value");
-        return false;
-      }
-    }
-
-    for (int i = 0; i < operand_list.size(); i++) {
-      if (!MergeOne(&meta, operand_list[i], true, logger)) {
-        return false;
-      }
-    }
-
-    if (!meta.SerializeToString(new_value)) {
-      rocksdb::Warn(logger, "serialization error");
-      return false;
-    }
-    return true;
-  }
-
-  virtual bool PartialMergeMulti(const rocksdb::Slice& key, const std::deque<rocksdb::Slice>& operand_list,
-                                 std::string* new_value, rocksdb::Logger* logger) const WARN_UNUSED_RESULT {
-    cockroach::storage::engine::enginepb::MVCCMetadata meta;
-
-    for (int i = 0; i < operand_list.size(); i++) {
-      if (!MergeOne(&meta, operand_list[i], false, logger)) {
-        return false;
-      }
-    }
-
-    if (!meta.SerializeToString(new_value)) {
-      rocksdb::Warn(logger, "serialization error");
-      return false;
-    }
-    return true;
-  }
-
- private:
-  bool MergeOne(cockroach::storage::engine::enginepb::MVCCMetadata* meta, const rocksdb::Slice& operand,
-                bool full_merge, rocksdb::Logger* logger) const WARN_UNUSED_RESULT {
-    cockroach::storage::engine::enginepb::MVCCMetadata operand_meta;
-    if (!operand_meta.ParseFromArray(operand.data(), operand.size())) {
-      rocksdb::Warn(logger, "corrupted operand value");
-      return false;
-    }
-    return MergeValues(meta, operand_meta, full_merge, logger);
-  }
-};
-
-class DBLogger : public rocksdb::Logger {
- public:
-  DBLogger(bool enabled) : enabled_(enabled) {}
-  virtual void Logv(const char* format, va_list ap) {
-    // TODO(pmattis): Benchmark calling Go exported methods from C++
-    // to determine if this is too slow.
-    if (!enabled_) {
-      return;
-    }
-
-    // First try with a small fixed size buffer.
-    char space[1024];
-
-    // It's possible for methods that use a va_list to invalidate the data in
-    // it upon use. The fix is to make a copy of the structure before using it
-    // and use that copy instead.
-    va_list backup_ap;
-    va_copy(backup_ap, ap);
-    int result = vsnprintf(space, sizeof(space), format, backup_ap);
-    va_end(backup_ap);
-
-    if ((result >= 0) && (result < sizeof(space))) {
-      rocksDBLog(space, result);
-      return;
-    }
-
-    // Repeatedly increase buffer size until it fits.
-    int length = sizeof(space);
-    while (true) {
-      if (result < 0) {
-        // Older behavior: just try doubling the buffer size.
-        length *= 2;
-      } else {
-        // We need exactly "result+1" characters.
-        length = result + 1;
-      }
-      char* buf = new char[length];
-
-      // Restore the va_list before we use it again
-      va_copy(backup_ap, ap);
-      result = vsnprintf(buf, length, format, backup_ap);
-      va_end(backup_ap);
-
-      if ((result >= 0) && (result < length)) {
-        // It fit
-        rocksDBLog(buf, result);
-        delete[] buf;
-        return;
-      }
-      delete[] buf;
-    }
-  }
-
- private:
-  const bool enabled_;
-};
-
-// Getter defines an interface for retrieving a value from either an
-// iterator or an engine. It is used by ProcessDeltaKey to abstract
-// whether the "base" layer is an iterator or an engine.
-struct Getter {
-  virtual DBStatus Get(DBString* value) = 0;
-};
-
-// IteratorGetter is an implementation of the Getter interface which
-// retrieves the value currently pointed to by the supplied
-// iterator. It is ok for the supplied iterator to be NULL in which
-// case no value will be retrieved.
-struct IteratorGetter : public Getter {
-  rocksdb::Iterator* const base;
-
-  IteratorGetter(rocksdb::Iterator* iter) : base(iter) {}
-
-  virtual DBStatus Get(DBString* value) {
-    if (base == NULL) {
-      value->data = NULL;
-      value->len = 0;
-    } else {
-      *value = ToDBString(base->value());
-    }
-    return kSuccess;
-  }
-};
-
-// DBGetter is an implementation of the Getter interface which
-// retrieves the value for the supplied key from a rocksdb::DB.
-struct DBGetter : public Getter {
-  rocksdb::DB* const rep;
-  rocksdb::ReadOptions const options;
-  std::string const key;
-
-  DBGetter(rocksdb::DB* const r, rocksdb::ReadOptions opts, std::string&& k)
-      : rep(r), options(opts), key(std::move(k)) {}
-
-  virtual DBStatus Get(DBString* value) {
-    std::string tmp;
-    rocksdb::Status s = rep->Get(options, key, &tmp);
-    if (!s.ok()) {
-      if (s.IsNotFound()) {
-        // This mirrors the logic in rocksdb_get(). It doesn't seem like
-        // a good idea, but some code in engine_test.go depends on it.
-        value->data = NULL;
-        value->len = 0;
-        return kSuccess;
-      }
-      return ToDBStatus(s);
-    }
-    *value = ToDBString(tmp);
-    return kSuccess;
-  }
-};
-
-// ProcessDeltaKey performs the heavy lifting of processing the deltas
-// for "key" contained in a batch and determining what the resulting
-// value is. "delta" should have been seeked to "key", but may not be
-// pointing to "key" if no updates existing for that key in the batch.
-//
-// Note that RocksDB WriteBatches append updates
-// internally. WBWIIterator maintains an index for these updates on
-// <key, seq-num>. Looping over the entries in WBWIIterator will
-// return the keys in sorted order and, for each key, the updates as
-// they were added to the batch.
-//
-// Upon return, the delta iterator will point to the next entry past
-// key. The delta iterator may not be valid if the end of iteration
-// was reached.
-DBStatus ProcessDeltaKey(Getter* base, rocksdb::WBWIIterator* delta, rocksdb::Slice key, DBString* value) {
-  if (value->data != NULL) {
-    free(value->data);
-  }
-  value->data = NULL;
-  value->len = 0;
-
-  int count = 0;
-  for (; delta->Valid() && delta->Entry().key == key; ++count, delta->Next()) {
-    rocksdb::WriteEntry entry = delta->Entry();
-    switch (entry.type) {
-    case rocksdb::kPutRecord:
-      if (value->data != NULL) {
-        free(value->data);
-      }
-      *value = ToDBString(entry.value);
-      break;
-    case rocksdb::kMergeRecord: {
-      DBString existing;
-      if (count == 0) {
-        // If this is the first record for the key, then we need to
-        // merge with the record in base.
-        DBStatus status = base->Get(&existing);
-        if (status.data != NULL) {
-          if (value->data != NULL) {
-            free(value->data);
-            value->data = NULL;
-            value->len = 0;
-          }
-          return status;
-        }
-      } else {
-        // Merge with the value we've built up so far.
-        existing = *value;
-        value->data = NULL;
-        value->len = 0;
-      }
-      if (existing.data != NULL) {
-        DBStatus status = DBMergeOne(ToDBSlice(existing), ToDBSlice(entry.value), value);
-        free(existing.data);
-        if (status.data != NULL) {
-          return status;
-        }
-      } else {
-        *value = ToDBString(entry.value);
-      }
-      break;
-    }
-    case rocksdb::kDeleteRecord:
-      if (value->data != NULL) {
-        free(value->data);
-      }
-      // This mirrors the logic in DBGet(): a deleted entry is
-      // indicated by a value with NULL data.
-      value->data = NULL;
-      value->len = 0;
-      break;
-    default:
-      break;
-    }
-  }
-
-  if (count > 0) {
-    return kSuccess;
-  }
-  return base->Get(value);
-}
-
-// This was cribbed from RocksDB and modified to support merge
-// records. A BaseDeltaIterator is an iterator which provides a merged
-// view of a base iterator and a delta where the delta iterator is
-// from a WriteBatchWithIndex.
-class BaseDeltaIterator : public rocksdb::Iterator {
- public:
-  BaseDeltaIterator(rocksdb::Iterator* base_iterator, rocksdb::WBWIIterator* delta_iterator, bool prefix_same_as_start)
-      : current_at_base_(true),
-        equal_keys_(false),
-        status_(rocksdb::Status::OK()),
-        base_iterator_(base_iterator),
-        delta_iterator_(delta_iterator),
-        prefix_same_as_start_(prefix_same_as_start) {
-    merged_.data = NULL;
-  }
-
-  virtual ~BaseDeltaIterator() { ClearMerged(); }
-
-  bool Valid() const override { return status_.ok() && (current_at_base_ ? BaseValid() : DeltaValid()); }
-
-  void SeekToFirst() override {
-    base_iterator_->SeekToFirst();
-    delta_iterator_->SeekToFirst();
-    UpdateCurrent(false /* no prefix check */);
-    MaybeSavePrefixStart();
-  }
-
-  void SeekToLast() override {
-    prefix_start_key_.clear();
-    base_iterator_->SeekToLast();
-    delta_iterator_->SeekToLast();
-    UpdateCurrent(false /* no prefix check */);
-    MaybeSavePrefixStart();
-  }
-
-  void Seek(const rocksdb::Slice& k) override {
-    if (prefix_same_as_start_) {
-      prefix_start_key_ = KeyPrefix(k);
-    }
-    base_iterator_->Seek(k);
-    delta_iterator_->Seek(k);
-    UpdateCurrent(prefix_same_as_start_);
-
-    // Similar to MaybeSavePrefixStart, but we can avoid computing the
-    // prefix again.
-    if (prefix_same_as_start_) {
-      if (Valid()) {
-        prefix_start_buf_ = prefix_start_key_.ToString();
-        prefix_start_key_ = prefix_start_buf_;
-      } else {
-        prefix_start_key_.clear();
-      }
-    }
-  }
-
-  void Next() override {
-    if (!Valid()) {
-      status_ = rocksdb::Status::NotSupported("Next() on invalid iterator");
-    }
-    Advance();
-  }
-
-  void Prev() override { status_ = rocksdb::Status::NotSupported("Prev() not supported"); }
-
-  rocksdb::Slice key() const override { return current_at_base_ ? base_iterator_->key() : delta_key_; }
-
-  rocksdb::Slice value() const override {
-    if (current_at_base_) {
-      return base_iterator_->value();
-    }
-    return ToSlice(merged_);
-  }
-
-  rocksdb::Status status() const override {
-    if (!status_.ok()) {
-      return status_;
-    }
-    if (!base_iterator_->status().ok()) {
-      return base_iterator_->status();
-    }
-    return delta_iterator_->status();
-  }
-
- private:
-  // -1 -- delta less advanced than base
-  // 0 -- delta == base
-  // 1 -- delta more advanced than base
-  int Compare() const {
-    assert(delta_iterator_->Valid() && base_iterator_->Valid());
-    return kComparator.Compare(delta_iterator_->Entry().key, base_iterator_->key());
-  }
-
-  // Advance the iterator to the next key, advancing either the base
-  // or delta iterators or both.
-  void Advance() {
-    if (equal_keys_) {
-      assert(BaseValid() && DeltaValid());
-      AdvanceBase();
-      AdvanceDelta();
-    } else {
-      if (current_at_base_) {
-        assert(BaseValid());
-        AdvanceBase();
-      } else {
-        assert(DeltaValid());
-        AdvanceDelta();
-      }
-    }
-    UpdateCurrent(prefix_same_as_start_);
-  }
-
-  // Advance the delta iterator, clearing any cached (merged) value
-  // the delta iterator was pointing at.
-  void AdvanceDelta() {
-    delta_iterator_->Next();
-    ClearMerged();
-  }
-
-  // Process the current entry the delta iterator is pointing at. This
-  // is needed to handle merge operations. Note that all of the
-  // entries for a particular key are stored consecutively in the
-  // write batch with the "earlier" entries appearing first. Returns
-  // true if the current entry is deleted and false otherwise.
-  bool ProcessDelta() WARN_UNUSED_RESULT {
-    IteratorGetter base(equal_keys_ ? base_iterator_.get() : NULL);
-    // The contents of WBWIIterator.Entry() are only valid until the
-    // next mutation to the write batch. So keep a copy of the key
-    // we're pointing at.
-    delta_key_ = delta_iterator_->Entry().key.ToString();
-    DBStatus status = ProcessDeltaKey(&base, delta_iterator_.get(), delta_key_, &merged_);
-    if (status.data != NULL) {
-      status_ = rocksdb::Status::Corruption("unable to merge records");
-      free(status.data);
-      return false;
-    }
-
-    // We advanced past the last entry for key and want to back up the
-    // delta iterator, but we can only back up if the iterator is
-    // valid.
-    if (delta_iterator_->Valid()) {
-      delta_iterator_->Prev();
-    } else {
-      delta_iterator_->SeekToLast();
-    }
-
-    return merged_.data == NULL;
-  }
-
-  // Advance the base iterator.
-  void AdvanceBase() { base_iterator_->Next(); }
-
-  // Save the prefix start key if prefix iteration is enabled. The
-  // prefix start key is the prefix of the key that was seeked to. See
-  // also Seek() where similar code is inlined.
-  void MaybeSavePrefixStart() {
-    if (prefix_same_as_start_) {
-      if (Valid()) {
-        prefix_start_buf_ = KeyPrefix(key()).ToString();
-        prefix_start_key_ = prefix_start_buf_;
-      } else {
-        prefix_start_key_.clear();
-      }
-    }
-  }
-
-  // CheckPrefix checks the specified key against the prefix being
-  // iterated over (if restricted), returning true if the key exceeds
-  // the iteration boundaries.
-  bool CheckPrefix(const rocksdb::Slice key) { return KeyPrefix(key) != prefix_start_key_; }
-
-  bool BaseValid() const { return base_iterator_->Valid(); }
-
-  bool DeltaValid() const { return delta_iterator_->Valid(); }
-
-  // Update the state for the iterator. The check_prefix parameter
-  // specifies whether iteration should stop if the next non-deleted
-  // key has a prefix that differs from prefix_start_key_.
-  //
-  // UpdateCurrent is the work horse of the BaseDeltaIterator methods
-  // and contains the logic for advancing either the base or delta
-  // iterators or both, as well as overlaying the delta iterator state
-  // on the base iterator.
-  void UpdateCurrent(bool check_prefix) {
-    ClearMerged();
-
-    for (;;) {
-      equal_keys_ = false;
-      if (!BaseValid()) {
-        // Base has finished.
-        if (!DeltaValid()) {
-          // Both base and delta have finished.
-          return;
-        }
-        if (check_prefix && CheckPrefix(delta_iterator_->Entry().key)) {
-          // The delta iterator key has a different prefix than the
-          // one we're searching for. We set current_at_base_ to true
-          // which will cause the iterator overall to be considered
-          // not valid (since base currently isn't valid).
-          current_at_base_ = true;
-          return;
-        }
-        if (!ProcessDelta()) {
-          current_at_base_ = false;
-          return;
-        }
-        // Delta is a deletion tombstone.
-        AdvanceDelta();
-        continue;
-      }
-
-      if (!DeltaValid()) {
-        // Delta has finished.
-        current_at_base_ = true;
-        return;
-      }
-
-      // Delta and base are both valid. We need to compare keys to see
-      // which to use.
-
-      const int compare = Compare();
-      if (compare > 0) {
-        // Delta is greater than base (use base).
-        current_at_base_ = true;
-        return;
-      }
-      // Delta is less than or equal to base. If check_prefix is true,
-      // for base to be valid it has to contain the prefix we were
-      // searching for. It follows that delta contains the prefix
-      // we're searching for.
-      if (compare == 0) {
-        // Delta is equal to base.
-        equal_keys_ = true;
-      }
-      if (!ProcessDelta()) {
-        current_at_base_ = false;
-        return;
-      }
-
-      // Delta is less than or equal to base and is a deletion
-      // tombstone.
-      AdvanceDelta();
-      if (equal_keys_) {
-        AdvanceBase();
-      }
-    }
-  }
-
-  // Clear the merged delta iterator value.
-  void ClearMerged() const {
-    if (merged_.data != NULL) {
-      free(merged_.data);
-      merged_.data = NULL;
-      merged_.len = 0;
-    }
-  }
-
-  // Is the iterator currently pointed at the base or delta iterator?
-  // Also see equal_keys_ which indicates the base and delta iterator
-  // keys are the same and both need to be advanced.
-  bool current_at_base_;
-  bool equal_keys_;
-  mutable rocksdb::Status status_;
-  // The merged delta value returned when we're pointed at the delta
-  // iterator.
-  mutable DBString merged_;
-  // The base iterator, presumably obtained from a rocksdb::DB.
-  std::unique_ptr<rocksdb::Iterator> base_iterator_;
-  // The delta iterator obtained from a rocksdb::WriteBatchWithIndex.
-  std::unique_ptr<rocksdb::WBWIIterator> delta_iterator_;
-  // The key the delta iterator is currently pointed at. We can't use
-  // delta_iterator_->Entry().key due to the handling of merge
-  // operations.
-  std::string delta_key_;
-  // Is this a prefix iterator?
-  const bool prefix_same_as_start_;
-  // The key prefix that we're restricting iteration to. Only used if
-  // prefix_same_as_start_ is true.
-  std::string prefix_start_buf_;
-  rocksdb::Slice prefix_start_key_;
-};
-
 }  // namespace
 
-DBSSTable* DBEngine::GetSSTables(int* n) {
-  std::vector<rocksdb::LiveFileMetaData> metadata;
-  rep->GetLiveFilesMetaData(&metadata);
-  *n = metadata.size();
-  // We malloc the result so it can be deallocated by the caller using free().
-  const int size = metadata.size() * sizeof(DBSSTable);
-  DBSSTable* tables = reinterpret_cast<DBSSTable*>(malloc(size));
-  memset(tables, 0, size);
-  for (int i = 0; i < metadata.size(); i++) {
-    tables[i].level = metadata[i].level;
-    tables[i].size = metadata[i].size;
+namespace cockroach {
 
-    rocksdb::Slice tmp;
-    if (DecodeKey(metadata[i].smallestkey, &tmp, &tables[i].start_key.wall_time, &tables[i].start_key.logical)) {
-      // This is a bit ugly because we want DBKey.key to be copied and
-      // not refer to the memory in metadata[i].smallestkey.
-      DBString str = ToDBString(tmp);
-      tables[i].start_key.key = DBSlice{str.data, str.len};
-    }
-    if (DecodeKey(metadata[i].largestkey, &tmp, &tables[i].end_key.wall_time, &tables[i].end_key.logical)) {
-      DBString str = ToDBString(tmp);
-      tables[i].end_key.key = DBSlice{str.data, str.len};
-    }
+// DBOpenHookOSS mode only verifies that no extra options are specified.
+rocksdb::Status DBOpenHookOSS(std::shared_ptr<rocksdb::Logger> info_log, const std::string& db_dir,
+                              const DBOptions db_opts, EnvManager* env_mgr) {
+  if (db_opts.extra_options.len != 0) {
+    return rocksdb::Status::InvalidArgument("encryption options are not supported in OSS builds");
   }
-  return tables;
+  return rocksdb::Status::OK();
 }
 
-DBString DBEngine::GetUserProperties() {
-  rocksdb::TablePropertiesCollection props;
-  rocksdb::Status status = rep->GetPropertiesOfAllTables(&props);
+}  // namespace cockroach
 
-  cockroach::storage::engine::enginepb::SSTUserPropertiesCollection all;
-  if (!status.ok()) {
-    all.set_error(status.ToString());
-    return ToDBString(all.SerializeAsString());
-  }
+static DBOpenHook* db_open_hook = DBOpenHookOSS;
 
-  for (auto i = props.begin(); i != props.end(); i++) {
-    cockroach::storage::engine::enginepb::SSTUserProperties* sst = all.add_sst();
-    sst->set_path(i->first);
-    auto userprops = i->second->user_collected_properties;
-
-    auto ts_min = userprops.find("crdb.ts.min");
-    if (ts_min != userprops.end() && !ts_min->second.empty()) {
-      if (!DecodeHLCTimestamp(rocksdb::Slice(ts_min->second), sst->mutable_ts_min())) {
-        fmt::SStringPrintf(all.mutable_error(), "unable to decode crdb.ts.min value '%s' in table %s",
-                           rocksdb::Slice(ts_min->second).ToString(true).c_str(), sst->path().c_str());
-        break;
-      }
-    }
-
-    auto ts_max = userprops.find("crdb.ts.max");
-    if (ts_max != userprops.end() && !ts_max->second.empty()) {
-      if (!DecodeHLCTimestamp(rocksdb::Slice(ts_max->second), sst->mutable_ts_max())) {
-        fmt::SStringPrintf(all.mutable_error(), "unable to decode crdb.ts.max value '%s' in table %s",
-                           rocksdb::Slice(ts_max->second).ToString(true).c_str(), sst->path().c_str());
-        break;
-      }
-    }
-  }
-  return ToDBString(all.SerializeAsString());
-}
-
-DBBatch::DBBatch(DBEngine* db) : DBEngine(db->rep), updates(0), has_delete_range(false), batch(&kComparator) {}
-
-DBWriteOnlyBatch::DBWriteOnlyBatch(DBEngine* db) : DBEngine(db->rep), updates(0) {}
-
-DBCache* DBNewCache(uint64_t size) {
-  const int num_cache_shard_bits = 4;
-  DBCache* cache = new DBCache;
-  cache->rep = rocksdb::NewLRUCache(size, num_cache_shard_bits);
-  return cache;
-}
-
-DBCache* DBRefCache(DBCache* cache) {
-  DBCache* res = new DBCache;
-  res->rep = cache->rep;
-  return res;
-}
-
-void DBReleaseCache(DBCache* cache) { delete cache; }
-
-class TimeBoundTblPropCollector : public rocksdb::TablePropertiesCollector {
- public:
-  const char* Name() const override { return "TimeBoundTblPropCollector"; }
-
-  rocksdb::Status Finish(rocksdb::UserCollectedProperties* properties) override {
-    *properties = rocksdb::UserCollectedProperties{
-        {"crdb.ts.min", ts_min_},
-        {"crdb.ts.max", ts_max_},
-    };
-    return rocksdb::Status::OK();
-  }
-
-  rocksdb::Status AddUserKey(const rocksdb::Slice& user_key, const rocksdb::Slice& value, rocksdb::EntryType type,
-                             rocksdb::SequenceNumber seq, uint64_t file_size) override {
-    rocksdb::Slice unused;
-    rocksdb::Slice ts;
-    if (SplitKey(user_key, &unused, &ts) && !ts.empty()) {
-      ts.remove_prefix(1);  // The NUL prefix.
-      if (ts_max_.empty() || ts.compare(ts_max_) > 0) {
-        ts_max_.assign(ts.data(), ts.size());
-      }
-      if (ts_min_.empty() || ts.compare(ts_min_) < 0) {
-        ts_min_.assign(ts.data(), ts.size());
-      }
-    }
-    return rocksdb::Status::OK();
-  }
-
-  virtual rocksdb::UserCollectedProperties GetReadableProperties() const override {
-    return rocksdb::UserCollectedProperties{};
-  }
-
- private:
-  std::string ts_min_;
-  std::string ts_max_;
-};
-
-class TimeBoundTblPropCollectorFactory : public rocksdb::TablePropertiesCollectorFactory {
- public:
-  explicit TimeBoundTblPropCollectorFactory() {}
-  virtual rocksdb::TablePropertiesCollector*
-  CreateTablePropertiesCollector(rocksdb::TablePropertiesCollectorFactory::Context context) override {
-    return new TimeBoundTblPropCollector();
-  }
-  const char* Name() const override { return "TimeBoundTblPropCollectorFactory"; }
-};
-
-rocksdb::Options DBMakeOptions(DBOptions db_opts) {
-  // Use the rocksdb options builder to configure the base options
-  // using our memtable budget.
-  rocksdb::Options options;
-  // Increase parallelism for compactions and flushes based on the
-  // number of cpus. Always use at least 2 threads, otherwise
-  // compactions and flushes may fight with each other.
-  options.IncreaseParallelism(std::max(db_opts.num_cpu, 2));
-  // Enable subcompactions which will use multiple threads to speed up
-  // a single compaction. The value of num_cpu/2 has not been tuned.
-  options.max_subcompactions = std::max(db_opts.num_cpu / 2, 1);
-  options.WAL_ttl_seconds = db_opts.wal_ttl_seconds;
-  options.comparator = &kComparator;
-  options.create_if_missing = !db_opts.must_exist;
-  options.info_log.reset(new DBLogger(db_opts.logging_enabled));
-  options.merge_operator.reset(new DBMergeOperator);
-  options.prefix_extractor.reset(new DBPrefixExtractor);
-  options.statistics = rocksdb::CreateDBStatistics();
-  options.max_open_files = db_opts.max_open_files;
-  options.compaction_pri = rocksdb::kMinOverlappingRatio;
-  // Periodically sync both the WAL and SST writes to smooth out disk
-  // usage. Not performing such syncs can be faster but can cause
-  // performance blips when the OS decides it needs to flush data.
-  options.wal_bytes_per_sync = 512 << 10;  // 512 KB
-  options.bytes_per_sync = 512 << 10;      // 512 KB
-
-  // The size reads should be performed in for compaction. The
-  // internets claim this can speed up compactions, though RocksDB
-  // docs say it is only useful on spinning disks. Experimentally it
-  // has had no effect.
-  // options.compaction_readahead_size = 2 << 20;
-
-  // Do not create bloom filters for the last level (i.e. the largest
-  // level which contains data in the LSM store). Setting this option
-  // reduces the size of the bloom filters by 10x. This is significant
-  // given that bloom filters require 1.25 bytes (10 bits) per key
-  // which can translate into gigabytes of memory given typical key
-  // and value sizes. The downside is that bloom filters will only be
-  // usable on the higher levels, but that seems acceptable. We
-  // typically see read amplification of 5-6x on clusters (i.e. there
-  // are 5-6 levels of sstables) which means we'll achieve 80-90% of
-  // the benefit of having bloom filters on every level for only 10%
-  // of the memory cost.
-  options.optimize_filters_for_hits = true;
-
-  // We periodically report stats ourselves and by default the info
-  // logger swallows log messages.
-  options.stats_dump_period_sec = 0;
-
-  // Use the TablePropertiesCollector hook to store the min and max MVCC
-  // timestamps present in each sstable in the metadata for that sstable.
-  std::shared_ptr<rocksdb::TablePropertiesCollectorFactory> time_bound_prop_collector(
-      new TimeBoundTblPropCollectorFactory());
-  options.table_properties_collector_factories.push_back(time_bound_prop_collector);
-
-  // The write buffer size is the size of the in memory structure that
-  // will be flushed to create L0 files.
-  options.write_buffer_size = 64 << 20;  // 64 MB
-  // How much memory should be allotted to memtables? Note that this
-  // is a peak setting, steady state should be lower. We set this
-  // relatively high to account for bursts of writes (e.g. due to a
-  // deletion of a large range of keys). In particular, we want this
-  // to be somewhat larger than than typical range size so that
-  // deletion of a range worth of keys does not cause write stalls.
-  options.max_write_buffer_number = 4;
-  // Number of files to trigger L0 compaction. We set this low so that
-  // we quickly move files out of L0 as each L0 file increases read
-  // amplification.
-  options.level0_file_num_compaction_trigger = 2;
-  // Soft limit on number of L0 files. Writes are slowed down when
-  // this number is reached.
-  options.level0_slowdown_writes_trigger = 20;
-  // Maximum number of L0 files. Writes are stopped at this
-  // point. This is set significantly higher than
-  // level0_slowdown_writes_trigger to avoid completely blocking
-  // writes.
-  options.level0_stop_writes_trigger = 32;
-  // Flush write buffers to L0 as soon as they are full. A higher
-  // value could be beneficial if there are duplicate records in each
-  // of the individual write buffers, but perf testing hasn't shown
-  // any benefit so far.
-  options.min_write_buffer_number_to_merge = 1;
-  // Enable dynamic level sizing which reduces both size and write
-  // amplification. This causes RocksDB to pick the target size of
-  // each level dynamically.
-  options.level_compaction_dynamic_level_bytes = true;
-  // Follow the RocksDB recommendation to configure the size of L1 to
-  // be the same as the estimated size of L0.
-  options.max_bytes_for_level_base = 64 << 20;  // 64 MB
-  options.max_bytes_for_level_multiplier = 10;
-  // Target the base file size (L1) as 4 MB. Each additional level
-  // grows the file size by 2. With max_bytes_for_level_base set to 64
-  // MB, this translates into the following target level and file
-  // sizes for each level:
-  //
-  //       level-size  file-size  max-files
-  //   L1:      64 MB       4 MB         16
-  //   L2:     640 MB       8 MB         80
-  //   L3:    6.25 GB      16 MB        400
-  //   L4:    62.5 GB      32 MB       2000
-  //   L5:     625 GB      64 MB      10000
-  //   L6:     6.1 TB     128 MB      50000
-  //
-  // Due to the use of level_compaction_dynamic_level_bytes most data
-  // will be in L6. The number of files will be approximately
-  // total-data-size / 128 MB.
-  //
-  // We don't want the target file size to be too large, otherwise
-  // individual compactions become more expensive. We don't want the
-  // target file size to be too small or else we get an overabundance
-  // of sstables.
-  options.target_file_size_base = 4 << 20;  // 4 MB
-  options.target_file_size_multiplier = 2;
-
-  rocksdb::BlockBasedTableOptions table_options;
-  if (db_opts.cache != nullptr) {
-    table_options.block_cache = db_opts.cache->rep;
-
-    // Reserve 1 memtable worth of memory from the cache. Under high
-    // load situations we'll be using somewhat more than 1 memtable,
-    // but usually not significantly more unless there is an I/O
-    // throughput problem.
-    std::lock_guard<std::mutex> guard(db_opts.cache->mu);
-    const int64_t capacity = db_opts.cache->rep->GetCapacity();
-    const int64_t new_capacity = std::max<int64_t>(0, capacity - options.write_buffer_size);
-    db_opts.cache->rep->SetCapacity(new_capacity);
-  }
-
-  // Pass false for use_blocked_base_builder creates a per file
-  // (sstable) filter instead of a per-block filter. The per file
-  // filter can be consulted before going to the index which saves an
-  // index lookup. The cost is an 4-bytes per key in memory during
-  // compactions, which seems a small price to pay.
-  table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false /* !block_based */));
-  table_options.format_version = 2;
-
-  // Increasing block_size decreases memory usage at the cost of
-  // increased read amplification.
-  table_options.block_size = db_opts.block_size;
-  // Disable whole_key_filtering which adds a bloom filter entry for
-  // the "whole key", doubling the size of our bloom filters. This is
-  // used to speed up Get operations which we don't use.
-  table_options.whole_key_filtering = false;
-  options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
-  return options;
-}
+void DBSetOpenHook(void* hook) { db_open_hook = (DBOpenHook*)hook; }
 
 DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions db_opts) {
   rocksdb::Options options = DBMakeOptions(db_opts);
 
+  const std::string additional_options = ToString(db_opts.rocksdb_options);
+  if (!additional_options.empty()) {
+    // TODO(peter): Investigate using rocksdb::LoadOptionsFromFile if
+    // "additional_options" starts with "@". The challenge is that
+    // LoadOptionsFromFile gives us a DBOptions and
+    // ColumnFamilyOptions with no ability to supply "base" options
+    // and no ability to determine what options were specified in the
+    // file which could cause "defaults" to override the options
+    // returned by DBMakeOptions. We might need to fix this upstream.
+    rocksdb::Status status = rocksdb::GetOptionsFromString(options, additional_options, &options);
+    if (!status.ok()) {
+      return ToDBStatus(status);
+    }
+  }
+
+  const std::string db_dir = ToString(dir);
+
+  // Make the default options.env the default. It points to Env::Default which does not
+  // need to be deleted.
+  std::unique_ptr<cockroach::EnvManager> env_mgr(new cockroach::EnvManager(options.env));
+
+  if (dir.len == 0) {
+    // In-memory database: use a MemEnv as the base Env.
+    auto memenv = rocksdb::NewMemEnv(rocksdb::Env::Default());
+    // Register it for deletion.
+    env_mgr->TakeEnvOwnership(memenv);
+    // Create a root directory to suppress error messages that RocksDB would
+    // print if it had to create the DB directory itself.
+    memenv->CreateDir("/");
+    // Make it the env that all other Envs must wrap.
+    env_mgr->base_env = memenv;
+    // Make it the env for rocksdb.
+    env_mgr->db_env = memenv;
+  }
+
+  // Create the file registry. It uses the base_env to access the registry file.
+  auto file_registry =
+      std::unique_ptr<FileRegistry>(new FileRegistry(env_mgr->base_env, db_dir, db_opts.read_only));
+
+  if (db_opts.use_file_registry) {
+    // We're using the file registry.
+    auto status = file_registry->Load();
+    if (!status.ok()) {
+      return ToDBStatus(status);
+    }
+
+    status = file_registry->CheckNoRegistryFile();
+    if (!status.ok()) {
+      // We have a file registry, this means we've used encryption flags before
+      // and are tracking all files on disk. Running without encryption (extra_options empty)
+      // will bypass the file registry and lose changes.
+      // In this case, we have multiple possibilities:
+      // - no extra_options: this fails here
+      // - extra_options:
+      //   - OSS: this fails in the OSS hook (OSS does not understand extra_options)
+      //   - CCL: fails if the options do not parse properly
+      if (db_opts.extra_options.len == 0) {
+        return ToDBStatus(rocksdb::Status::InvalidArgument(
+            "encryption was used on this store before, but no encryption flags specified. You need "
+            "a CCL build and must fully specify the --enterprise-encryption flag"));
+      }
+    }
+
+    // EnvManager takes ownership of the file registry.
+    env_mgr->file_registry.swap(file_registry);
+  } else {
+    // File registry format not enabled: check whether we have a registry file (we shouldn't).
+    // The file_registry is not passed to anyone, it is deleted when it goes out of scope.
+    auto status = file_registry->CheckNoRegistryFile();
+    if (!status.ok()) {
+      return ToDBStatus(status);
+    }
+  }
+
   // Call hooks to handle db_opts.extra_options.
-  auto hook_status = DBOpenHook(db_opts);
+  auto hook_status = db_open_hook(options.info_log, db_dir, db_opts, env_mgr.get());
   if (!hook_status.ok()) {
     return ToDBStatus(hook_status);
   }
@@ -1588,29 +239,38 @@ DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions db_opts) {
   std::shared_ptr<DBEventListener> event_listener(new DBEventListener);
   options.listeners.emplace_back(event_listener);
 
-  // TODO(mberhault): we shouldn't need two separate env objects,
-  // options.env should be sufficient with SwitchingEnv owning any
-  // underlying Env.
-  std::unique_ptr<rocksdb::Env> memenv;
-  if (dir.len == 0) {
-    memenv.reset(rocksdb::NewMemEnv(rocksdb::Env::Default()));
-    options.env = memenv.get();
-  }
-
-  std::unique_ptr<rocksdb::Env> switching_env;
-  if (db_opts.use_switching_env) {
-    switching_env.reset(NewSwitchingEnv(options.env, options.info_log));
-    options.env = switching_env.get();
-  }
+  // Point rocksdb to the env to use.
+  options.env = env_mgr->db_env;
 
   rocksdb::DB* db_ptr;
-  rocksdb::Status status = rocksdb::DB::Open(options, ToString(dir), &db_ptr);
+  rocksdb::Status status;
+  if (db_opts.read_only) {
+    status = rocksdb::DB::OpenForReadOnly(options, db_dir, &db_ptr);
+  } else {
+    status = rocksdb::DB::Open(options, db_dir, &db_ptr);
+  }
+
   if (!status.ok()) {
     return ToDBStatus(status);
   }
-  *db = new DBImpl(db_ptr, memenv.release(), db_opts.cache != nullptr ? db_opts.cache->rep : nullptr, event_listener,
-                   switching_env.release());
+  *db = new DBImpl(db_ptr, std::move(env_mgr),
+                   db_opts.cache != nullptr ? db_opts.cache->rep : nullptr, event_listener);
   return kSuccess;
+}
+
+DBStatus DBCreateCheckpoint(DBEngine* db, DBSlice dir) {
+  const std::string cp_dir = ToString(dir);
+
+  rocksdb::Checkpoint* cp_ptr;
+  auto status = rocksdb::Checkpoint::Create(db->rep, &cp_ptr);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+  // NB: passing 0 for log_size_for_flush forces a WAL sync, i.e. makes sure
+  // that the checkpoint is up to date.
+  status = cp_ptr->CreateCheckpoint(cp_dir, 0 /* log_size_for_flush */);
+  delete (cp_ptr);
+  return ToDBStatus(status);
 }
 
 DBStatus DBDestroy(DBSlice dir) {
@@ -1618,7 +278,13 @@ DBStatus DBDestroy(DBSlice dir) {
   return ToDBStatus(rocksdb::DestroyDB(ToString(dir), options));
 }
 
-void DBClose(DBEngine* db) { delete db; }
+DBStatus DBClose(DBEngine* db) {
+  DBStatus status = db->AssertPreClose();
+  if (status.data == nullptr) {
+    delete db;
+  }
+  return status;
+}
 
 DBStatus DBFlush(DBEngine* db) {
   rocksdb::FlushOptions options;
@@ -1644,22 +310,29 @@ DBStatus DBSyncWAL(DBEngine* db) {
   options.sync = true;
   return ToDBStatus(db->rep->Write(options, &batch));
 #else
-  return ToDBStatus(db->rep->SyncWAL());
+  return ToDBStatus(db->rep->FlushWAL(true /* sync */));
 #endif
 }
 
 DBStatus DBCompact(DBEngine* db) {
-  return DBCompactRange(db, DBKey(), DBKey());
+  return DBCompactRange(db, DBSlice(), DBSlice(), true /* force_bottommost */);
 }
 
-DBStatus DBCompactRange(DBEngine* db, DBKey start, DBKey end) {
+DBStatus DBCompactRange(DBEngine* db, DBSlice start, DBSlice end, bool force_bottommost) {
   rocksdb::CompactRangeOptions options;
   // By default, RocksDB doesn't recompact the bottom level (unless
   // there is a compaction filter, which we don't use). However,
   // recompacting the bottom layer is necessary to pick up changes to
   // settings like bloom filter configurations, and to fully reclaim
   // space after dropping, truncating, or migrating tables.
-  options.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForce;
+  if (force_bottommost) {
+    options.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForce;
+  }
+  // By default, RocksDB treats manual compaction requests as
+  // operating exclusively, preventing normal automatic compactions
+  // from running. This can block writes to the database, as L0
+  // SSTables will become full without being allowed to compact to L1.
+  options.exclusive_manual_compaction = false;
 
   // Compacting the entire database in a single-shot can use a
   // significant amount of additional (temporary) disk space. Instead,
@@ -1671,14 +344,14 @@ DBStatus DBCompactRange(DBEngine* db, DBKey start, DBKey end) {
   std::vector<rocksdb::LiveFileMetaData> metadata;
   db->rep->GetLiveFilesMetaData(&all_metadata);
 
-  const std::string start_key(EncodeKey(start));
-  const std::string end_key(EncodeKey(end));
+  const std::string start_key(ToString(start));
+  const std::string end_key(ToString(end));
 
   int max_level = 0;
   for (int i = 0; i < all_metadata.size(); i++) {
     // Skip any SSTables which fall outside the specified range, if a
     // range was specified.
-    if ((!start_key.empty() > 0 && all_metadata[i].largestkey < start_key) ||
+    if ((!start_key.empty() && all_metadata[i].largestkey < start_key) ||
         (!end_key.empty() && all_metadata[i].smallestkey >= end_key)) {
       continue;
     }
@@ -1736,35 +409,35 @@ DBStatus DBCompactRange(DBEngine* db, DBKey start, DBKey end) {
     sst.push_back(metadata[i]);
   }
   // Sort the metadata by smallest key.
-  std::sort(sst.begin(), sst.end(), [](const rocksdb::SstFileMetaData& a, const rocksdb::SstFileMetaData& b) -> bool {
-      return a.smallestkey < b.smallestkey;
-    });
+  std::sort(sst.begin(), sst.end(),
+            [](const rocksdb::SstFileMetaData& a, const rocksdb::SstFileMetaData& b) -> bool {
+              return a.smallestkey < b.smallestkey;
+            });
 
-  // Walk over the bottom-most sstables in order and perform
-  // compactions every 128MB.
-  rocksdb::Slice last;
-  rocksdb::Slice* last_ptr = nullptr;
-  uint64_t size = 0;
+  // Batch the bottom-most sstables into compactions of ~128MB.
   const uint64_t target_size = 128 << 20;
-  for (int i = 0; i < sst.size(); ++i) {
-    size += sst[i].size;
-    if (size < target_size) {
-      continue;
-    }
-    rocksdb::Slice cur(sst[i].largestkey);
-    rocksdb::Status status = db->rep->CompactRange(options, last_ptr, &cur);
+  std::vector<rocksdb::Range> ranges;
+  BatchSSTablesForCompaction(sst, start_key, end_key, target_size, &ranges);
+
+  for (auto r : ranges) {
+    rocksdb::Status status = db->rep->CompactRange(options, r.start.empty() ? nullptr : &r.start,
+                                                   r.limit.empty() ? nullptr : &r.limit);
     if (!status.ok()) {
       return ToDBStatus(status);
     }
-    last = cur;
-    last_ptr = &last;
-    size = 0;
   }
 
-  if (size > 0) {
-    return ToDBStatus(db->rep->CompactRange(options, last_ptr, nullptr));
-  }
   return kSuccess;
+}
+
+DBStatus DBDisableAutoCompaction(DBEngine* db) {
+  auto status = db->rep->SetOptions({{"disable_auto_compactions", "true"}});
+  return ToDBStatus(status);
+}
+
+DBStatus DBEnableAutoCompaction(DBEngine* db) {
+  auto status = db->rep->EnableAutoCompaction({db->rep->DefaultColumnFamily()});
+  return ToDBStatus(status);
 }
 
 DBStatus DBApproximateDiskBytes(DBEngine* db, DBKey start, DBKey end, uint64_t* size) {
@@ -1777,121 +450,15 @@ DBStatus DBApproximateDiskBytes(DBEngine* db, DBKey start, DBKey end, uint64_t* 
   return kSuccess;
 }
 
-DBStatus DBImpl::Put(DBKey key, DBSlice value) {
-  rocksdb::WriteOptions options;
-  return ToDBStatus(rep->Put(options, EncodeKey(key), ToSlice(value)));
-}
-
-DBStatus DBBatch::Put(DBKey key, DBSlice value) {
-  ++updates;
-  batch.Put(EncodeKey(key), ToSlice(value));
-  return kSuccess;
-}
-
-DBStatus DBWriteOnlyBatch::Put(DBKey key, DBSlice value) {
-  ++updates;
-  batch.Put(EncodeKey(key), ToSlice(value));
-  return kSuccess;
-}
-
-DBStatus DBSnapshot::Put(DBKey key, DBSlice value) { return FmtStatus("unsupported"); }
-
 DBStatus DBPut(DBEngine* db, DBKey key, DBSlice value) { return db->Put(key, value); }
-
-DBStatus DBImpl::Merge(DBKey key, DBSlice value) {
-  rocksdb::WriteOptions options;
-  return ToDBStatus(rep->Merge(options, EncodeKey(key), ToSlice(value)));
-}
-
-DBStatus DBBatch::Merge(DBKey key, DBSlice value) {
-  ++updates;
-  batch.Merge(EncodeKey(key), ToSlice(value));
-  return kSuccess;
-}
-
-DBStatus DBWriteOnlyBatch::Merge(DBKey key, DBSlice value) {
-  ++updates;
-  batch.Merge(EncodeKey(key), ToSlice(value));
-  return kSuccess;
-}
-
-DBStatus DBSnapshot::Merge(DBKey key, DBSlice value) { return FmtStatus("unsupported"); }
 
 DBStatus DBMerge(DBEngine* db, DBKey key, DBSlice value) { return db->Merge(key, value); }
 
-DBStatus DBImpl::Get(DBKey key, DBString* value) {
-  rocksdb::ReadOptions read_opts;
-  DBGetter base(rep, read_opts, EncodeKey(key));
-  return base.Get(value);
-}
-
-DBStatus DBBatch::Get(DBKey key, DBString* value) {
-  rocksdb::ReadOptions read_opts;
-  DBGetter base(rep, read_opts, EncodeKey(key));
-  if (updates == 0) {
-    return base.Get(value);
-  }
-  if (has_delete_range) {
-    // TODO(peter): We don't support iterators when the batch contains
-    // delete range entries.
-    return FmtStatus("cannot read from a batch containing delete range entries");
-  }
-  std::unique_ptr<rocksdb::WBWIIterator> iter(batch.NewIterator());
-  iter->Seek(base.key);
-  return ProcessDeltaKey(&base, iter.get(), base.key, value);
-}
-
-DBStatus DBWriteOnlyBatch::Get(DBKey key, DBString* value) { return FmtStatus("unsupported"); }
-
-DBStatus DBSnapshot::Get(DBKey key, DBString* value) {
-  rocksdb::ReadOptions read_opts;
-  read_opts.snapshot = snapshot;
-  DBGetter base(rep, read_opts, EncodeKey(key));
-  return base.Get(value);
-}
-
 DBStatus DBGet(DBEngine* db, DBKey key, DBString* value) { return db->Get(key, value); }
 
-DBStatus DBImpl::Delete(DBKey key) {
-  rocksdb::WriteOptions options;
-  return ToDBStatus(rep->Delete(options, EncodeKey(key)));
-}
-
-DBStatus DBBatch::Delete(DBKey key) {
-  ++updates;
-  batch.Delete(EncodeKey(key));
-  return kSuccess;
-}
-
-DBStatus DBWriteOnlyBatch::Delete(DBKey key) {
-  ++updates;
-  batch.Delete(EncodeKey(key));
-  return kSuccess;
-}
-
-DBStatus DBSnapshot::Delete(DBKey key) { return FmtStatus("unsupported"); }
-
-DBStatus DBImpl::DeleteRange(DBKey start, DBKey end) {
-  rocksdb::WriteOptions options;
-  return ToDBStatus(rep->DeleteRange(options, rep->DefaultColumnFamily(), EncodeKey(start), EncodeKey(end)));
-}
-
-DBStatus DBBatch::DeleteRange(DBKey start, DBKey end) {
-  ++updates;
-  has_delete_range = true;
-  batch.DeleteRange(EncodeKey(start), EncodeKey(end));
-  return kSuccess;
-}
-
-DBStatus DBWriteOnlyBatch::DeleteRange(DBKey start, DBKey end) {
-  ++updates;
-  batch.DeleteRange(EncodeKey(start), EncodeKey(end));
-  return kSuccess;
-}
-
-DBStatus DBSnapshot::DeleteRange(DBKey start, DBKey end) { return FmtStatus("unsupported"); }
-
 DBStatus DBDelete(DBEngine* db, DBKey key) { return db->Delete(key); }
+
+DBStatus DBSingleDelete(DBEngine* db, DBKey key) { return db->SingleDelete(key); }
 
 DBStatus DBDeleteRange(DBEngine* db, DBKey start, DBKey end) { return db->DeleteRange(start, end); }
 
@@ -1908,28 +475,6 @@ DBStatus DBDeleteIterRange(DBEngine* db, DBIterator* iter, DBKey start, DBKey en
   return kSuccess;
 }
 
-DBStatus DBImpl::CommitBatch(bool sync) { return FmtStatus("unsupported"); }
-
-DBStatus DBBatch::CommitBatch(bool sync) {
-  if (updates == 0) {
-    return kSuccess;
-  }
-  rocksdb::WriteOptions options;
-  options.sync = sync;
-  return ToDBStatus(rep->Write(options, batch.GetWriteBatch()));
-}
-
-DBStatus DBWriteOnlyBatch::CommitBatch(bool sync) {
-  if (updates == 0) {
-    return kSuccess;
-  }
-  rocksdb::WriteOptions options;
-  options.sync = sync;
-  return ToDBStatus(rep->Write(options, &batch));
-}
-
-DBStatus DBSnapshot::CommitBatch(bool sync) { return FmtStatus("unsupported"); }
-
 DBStatus DBCommitAndCloseBatch(DBEngine* db, bool sync) {
   DBStatus status = db->CommitBatch(sync);
   if (status.data == NULL) {
@@ -1938,56 +483,9 @@ DBStatus DBCommitAndCloseBatch(DBEngine* db, bool sync) {
   return status;
 }
 
-DBStatus DBImpl::ApplyBatchRepr(DBSlice repr, bool sync) {
-  rocksdb::WriteBatch batch(ToString(repr));
-  rocksdb::WriteOptions options;
-  options.sync = sync;
-  return ToDBStatus(rep->Write(options, &batch));
+DBStatus DBApplyBatchRepr(DBEngine* db, DBSlice repr, bool sync) {
+  return db->ApplyBatchRepr(repr, sync);
 }
-
-DBStatus DBBatch::ApplyBatchRepr(DBSlice repr, bool sync) {
-  if (sync) {
-    return FmtStatus("unsupported");
-  }
-  // TODO(peter): It would be slightly more efficient to iterate over
-  // repr directly instead of first converting it to a string.
-  DBBatchInserter inserter(&batch);
-  rocksdb::WriteBatch batch(ToString(repr));
-  rocksdb::Status status = batch.Iterate(&inserter);
-  if (!status.ok()) {
-    return ToDBStatus(status);
-  }
-  updates += batch.Count();
-  return kSuccess;
-}
-
-DBStatus DBWriteOnlyBatch::ApplyBatchRepr(DBSlice repr, bool sync) {
-  if (sync) {
-    return FmtStatus("unsupported");
-  }
-  // TODO(peter): It would be slightly more efficient to iterate over
-  // repr directly instead of first converting it to a string.
-  DBBatchInserter inserter(&batch);
-  rocksdb::WriteBatch batch(ToString(repr));
-  rocksdb::Status status = batch.Iterate(&inserter);
-  if (!status.ok()) {
-    return ToDBStatus(status);
-  }
-  updates += batch.Count();
-  return kSuccess;
-}
-
-DBStatus DBSnapshot::ApplyBatchRepr(DBSlice repr, bool sync) { return FmtStatus("unsupported"); }
-
-DBStatus DBApplyBatchRepr(DBEngine* db, DBSlice repr, bool sync) { return db->ApplyBatchRepr(repr, sync); }
-
-DBSlice DBImpl::BatchRepr() { return ToDBSlice("unsupported"); }
-
-DBSlice DBBatch::BatchRepr() { return ToDBSlice(batch.GetWriteBatch()->Data()); }
-
-DBSlice DBWriteOnlyBatch::BatchRepr() { return ToDBSlice(batch.GetWriteBatch()->Data()); }
-
-DBSlice DBSnapshot::BatchRepr() { return ToDBSlice("unsupported"); }
 
 DBSlice DBBatchRepr(DBEngine* db) { return db->BatchRepr(); }
 
@@ -2000,157 +498,205 @@ DBEngine* DBNewBatch(DBEngine* db, bool writeOnly) {
   return new DBBatch(db);
 }
 
-DBIterator* DBImpl::NewIter(rocksdb::ReadOptions* read_opts) {
-  DBIterator* iter = new DBIterator;
-  iter->rep.reset(rep->NewIterator(*read_opts));
-  return iter;
+DBStatus DBEnvWriteFile(DBEngine* db, DBSlice path, DBSlice contents) {
+  return db->EnvWriteFile(path, contents);
 }
 
-DBIterator* DBBatch::NewIter(rocksdb::ReadOptions* read_opts) {
-  DBIterator* iter = new DBIterator;
-  if (has_delete_range) {
-    // TODO(peter): We don't support iterators when the batch contains
-    // delete range entries.
-    return NULL;
-  }
-  rocksdb::Iterator* base = rep->NewIterator(*read_opts);
-  rocksdb::WBWIIterator* delta = batch.NewIterator();
-  iter->rep.reset(new BaseDeltaIterator(base, delta, read_opts->prefix_same_as_start));
-  return iter;
+DBStatus DBEnvOpenFile(DBEngine* db, DBSlice path,  uint64_t bytes_per_sync,
+                       DBWritableFile* file) {
+  return db->EnvOpenFile(path, bytes_per_sync, (rocksdb::WritableFile**)file);
 }
 
-DBIterator* DBWriteOnlyBatch::NewIter(rocksdb::ReadOptions* read_opts) { return NULL; }
-
-DBIterator* DBSnapshot::NewIter(rocksdb::ReadOptions* read_opts) {
-  read_opts->snapshot = snapshot;
-  DBIterator* iter = new DBIterator;
-  iter->rep.reset(rep->NewIterator(*read_opts));
-  return iter;
+DBStatus DBEnvReadFile(DBEngine* db, DBSlice path, DBSlice* contents) {
+  return db->EnvReadFile(path, contents);
 }
 
-// GetStats retrieves a subset of RocksDB stats that are relevant to
-// CockroachDB.
-DBStatus DBImpl::GetStats(DBStatsResult* stats) {
-  const rocksdb::Options& opts = rep->GetOptions();
-  const std::shared_ptr<rocksdb::Statistics>& s = opts.statistics;
-
-  uint64_t memtable_total_size;
-  rep->GetIntProperty("rocksdb.cur-size-all-mem-tables", &memtable_total_size);
-
-  uint64_t table_readers_mem_estimate;
-  rep->GetIntProperty("rocksdb.estimate-table-readers-mem", &table_readers_mem_estimate);
-
-  uint64_t pending_compaction_bytes_estimate;
-  rep->GetIntProperty("rocksdb.estimate-pending-compaction-bytes", &pending_compaction_bytes_estimate);
-
-  stats->block_cache_hits = (int64_t)s->getTickerCount(rocksdb::BLOCK_CACHE_HIT);
-  stats->block_cache_misses = (int64_t)s->getTickerCount(rocksdb::BLOCK_CACHE_MISS);
-  stats->block_cache_usage = (int64_t)block_cache->GetUsage();
-  stats->block_cache_pinned_usage = (int64_t)block_cache->GetPinnedUsage();
-  stats->bloom_filter_prefix_checked = (int64_t)s->getTickerCount(rocksdb::BLOOM_FILTER_PREFIX_CHECKED);
-  stats->bloom_filter_prefix_useful = (int64_t)s->getTickerCount(rocksdb::BLOOM_FILTER_PREFIX_USEFUL);
-  stats->memtable_total_size = memtable_total_size;
-  stats->flushes = (int64_t)event_listener->GetFlushes();
-  stats->compactions = (int64_t)event_listener->GetCompactions();
-  stats->table_readers_mem_estimate = table_readers_mem_estimate;
-  stats->pending_compaction_bytes_estimate = pending_compaction_bytes_estimate;
-  return kSuccess;
+DBStatus DBEnvCloseFile(DBEngine* db, DBWritableFile file) {
+  return db->EnvCloseFile((rocksdb::WritableFile*)file);
 }
 
-DBStatus DBBatch::GetStats(DBStatsResult* stats) { return FmtStatus("unsupported"); }
-
-DBStatus DBWriteOnlyBatch::GetStats(DBStatsResult* stats) { return FmtStatus("unsupported"); }
-
-DBStatus DBSnapshot::GetStats(DBStatsResult* stats) { return FmtStatus("unsupported"); }
-
-DBString DBImpl::GetCompactionStats() {
-  std::string tmp;
-  rep->GetProperty("rocksdb.cfstats-no-file-histogram", &tmp);
-  return ToDBString(tmp);
+DBStatus DBEnvSyncFile(DBEngine* db, DBWritableFile file) {
+  return db->EnvSyncFile((rocksdb::WritableFile*)file);
 }
 
-DBString DBBatch::GetCompactionStats() { return ToDBString("unsupported"); }
-
-DBString DBWriteOnlyBatch::GetCompactionStats() { return ToDBString("unsupported"); }
-
-DBString DBSnapshot::GetCompactionStats() { return ToDBString("unsupported"); }
-
-// EnvWriteFile writes the given data as a new "file" in the given engine.
-DBStatus DBImpl::EnvWriteFile(DBSlice path, DBSlice contents) {
-  rocksdb::Status s;
-
-  const rocksdb::EnvOptions soptions;
-  rocksdb::unique_ptr<rocksdb::WritableFile> destfile;
-  s = this->rep->GetEnv()->NewWritableFile(ToString(path), &destfile, soptions);
-  if (!s.ok()) {
-    return ToDBStatus(s);
-  }
-
-  s = destfile->Append(ToSlice(contents));
-  if (!s.ok()) {
-    return ToDBStatus(s);
-  }
-
-  return kSuccess;
+DBStatus DBEnvAppendFile(DBEngine* db, DBWritableFile file, DBSlice contents) {
+  return db->EnvAppendFile((rocksdb::WritableFile*)file, contents);
 }
 
-DBStatus DBBatch::EnvWriteFile(DBSlice path, DBSlice contents) { return FmtStatus("unsupported"); }
+DBStatus DBEnvDeleteFile(DBEngine* db, DBSlice path) { return db->EnvDeleteFile(path); }
 
-DBStatus DBWriteOnlyBatch::EnvWriteFile(DBSlice path, DBSlice contents) { return FmtStatus("unsupported"); }
+DBStatus DBEnvDeleteDirAndFiles(DBEngine* db, DBSlice dir) { return db->EnvDeleteDirAndFiles(dir); }
 
-DBStatus DBSnapshot::EnvWriteFile(DBSlice path, DBSlice contents) { return FmtStatus("unsupported"); }
-
-DBStatus DBEnvWriteFile(DBEngine* db, DBSlice path, DBSlice contents) { return db->EnvWriteFile(path, contents); }
-
-DBIterator* DBNewIter(DBEngine* db, bool prefix) {
-  rocksdb::ReadOptions opts;
-  opts.prefix_same_as_start = prefix;
-  opts.total_order_seek = !prefix;
-  return db->NewIter(&opts);
+DBStatus DBEnvLinkFile(DBEngine* db, DBSlice oldname, DBSlice newname) {
+  return db->EnvLinkFile(oldname, newname);
 }
 
-DBIterator* DBNewTimeBoundIter(DBEngine* db, DBTimestamp min_ts, DBTimestamp max_ts) {
-  const std::string min = EncodeTimestamp(min_ts);
-  const std::string max = EncodeTimestamp(max_ts);
-  rocksdb::ReadOptions opts;
-  opts.total_order_seek = true;
-  opts.table_filter = [min, max](const rocksdb::TableProperties& props) {
-    auto userprops = props.user_collected_properties;
-    auto tbl_min = userprops.find("crdb.ts.min");
-    if (tbl_min == userprops.end() || tbl_min->second.empty()) {
-      return true;
+DBIterState DBCheckForKeyCollisions(DBIterator* existingIter, DBIterator* sstIter,
+                                    MVCCStatsResult* skippedKVStats, DBString* write_intent) {
+  DBIterState state = {};
+  memset(skippedKVStats, 0, sizeof(*skippedKVStats));
+
+  while (existingIter->rep->Valid() && sstIter->rep->Valid()) {
+    rocksdb::Slice sstKey;
+    rocksdb::Slice existingKey;
+    DBTimestamp existing_ts = kZeroTimestamp;
+    DBTimestamp sst_ts = kZeroTimestamp;
+    if (!DecodeKey(sstIter->rep->key(), &sstKey, &sst_ts) ||
+        !DecodeKey(existingIter->rep->key(), &existingKey, &existing_ts)) {
+      state.valid = false;
+      state.status = FmtStatus("unable to decode key");
+      return state;
     }
-    auto tbl_max = userprops.find("crdb.ts.max");
-    if (tbl_max == userprops.end() || tbl_max->second.empty()) {
-      return true;
+
+    // Encountered an inline value or a write intent.
+    if (existing_ts == kZeroTimestamp) {
+      cockroach::storage::enginepb::MVCCMetadata meta;
+      if (!meta.ParseFromArray(existingIter->rep->value().data(),
+                               existingIter->rep->value().size())) {
+        state.status = FmtStatus("failed to parse meta");
+        state.valid = false;
+        return state;
+      }
+
+      // Check for an inline value, as these are only used in non-user data.
+      // This method is currently used by AddSSTable when performing an IMPORT
+      // INTO. We do not expect to encounter any inline values, and thus we
+      // report an error.
+      if (meta.has_raw_bytes()) {
+        state.status = FmtStatus("InlineError");
+      } else if (meta.has_txn()) {
+        // Check for a write intent.
+        //
+        // TODO(adityamaru): Currently, we raise a WriteIntentError on
+        // encountering all intents. This is because, we do not expect to
+        // encounter many intents during IMPORT INTO as we lock the key space we
+        // are importing into. Older write intents could however be found in the
+        // target key space, which will require appropriate resolution logic.
+        cockroach::roachpb::WriteIntentError err;
+        cockroach::roachpb::Intent* intent = err.add_intents();
+        intent->mutable_single_key_span()->set_key(existingIter->rep->key().data(),
+                                                   existingIter->rep->key().size());
+        intent->mutable_txn()->CopyFrom(meta.txn());
+
+        *write_intent = ToDBString(err.SerializeAsString());
+        state.status = FmtStatus("WriteIntentError");
+      } else {
+        state.status = FmtStatus("intent without transaction");
+      }
+
+      state.valid = false;
+      return state;
     }
-    // If the timestamp range of the table overlaps with the timestamp range we
-    // want to iterate, the table might contain timestamps we care about. For
-    // consistency with engineccl.MVCCIncrementalIterator, the min_ts bound is
-    // exclusive, but the max_ts bound is inclusive.
-    return max.compare(tbl_min->second) >= 0 && min.compare(tbl_max->second) < 0;
-  };
-  return db->NewIter(&opts);
+
+    DBKey targetKey;
+    memset(&targetKey, 0, sizeof(targetKey));
+    int compare = kComparator.Compare(existingKey, sstKey);
+    if (compare == 0) {
+      // If the colliding key is a tombstone in the existing data, and the
+      // timestamp of the sst key is greater than or equal to the timestamp of
+      // the tombstone, then this is not considered a collision. We move the
+      // iterator over the existing data to the next potentially colliding key
+      // (skipping all versions of the deleted key), and resume iteration.
+      //
+      // If the ts of the sst key is less than that of the tombstone it is
+      // changing existing data, and we treat this as a collision.
+      if (existingIter->rep->value().empty() && sst_ts >= existing_ts) {
+        DBIterNext(existingIter, true /* skip_current_key_versions */);
+        continue;
+      }
+
+      // If the ingested KV has an identical timestamp and value as the existing
+      // data then we do not consider it to be a collision. We move the iterator
+      // over the existing data to the next potentially colliding key (skipping
+      // all versions of the current key), and resume iteration.
+      bool has_equal_timestamp = existing_ts == sst_ts;
+      bool has_equal_value =
+          kComparator.Compare(existingIter->rep->value(), sstIter->rep->value()) == 0;
+      if (has_equal_timestamp && has_equal_value) {
+        // Even though we skip over the KVs described above, their stats have
+        // already been accounted for resulting in a problem of double-counting.
+        // To solve this we send back the stats of these skipped KVs so that we
+        // can subtract them later. This enables us to construct accurate
+        // MVCCStats and prevents expensive recomputation in the future.
+        const int64_t meta_key_size = sstKey.size() + 1;
+        const int64_t meta_val_size = 0;
+        int64_t total_bytes = meta_key_size + meta_val_size;
+
+        // Update the skipped stats to account fot the skipped meta key.
+        skippedKVStats->live_bytes += total_bytes;
+        skippedKVStats->live_count++;
+        skippedKVStats->key_bytes += meta_key_size;
+        skippedKVStats->val_bytes += meta_val_size;
+        skippedKVStats->key_count++;
+
+        // Update the stats to account for the skipped versioned key/value.
+        total_bytes = sstIter->rep->value().size() + kMVCCVersionTimestampSize;
+        skippedKVStats->live_bytes += total_bytes;
+        skippedKVStats->key_bytes += kMVCCVersionTimestampSize;
+        skippedKVStats->val_bytes += sstIter->rep->value().size();
+        skippedKVStats->val_count++;
+
+        DBIterNext(existingIter, true /* skip_current_key_versions */);
+        continue;
+      }
+
+      state.valid = false;
+      state.key.key = ToDBSlice(sstKey);
+      state.status = FmtStatus("key collision");
+      return state;
+    } else if (compare < 0) {
+      targetKey.key = ToDBSlice(sstKey);
+      DBIterSeek(existingIter, targetKey);
+    } else if (compare > 0) {
+      targetKey.key = ToDBSlice(existingKey);
+      DBIterSeek(sstIter, targetKey);
+    }
+  }
+
+  state.valid = true;
+  return state;
+}
+
+DBIterator* DBNewIter(DBEngine* db, DBIterOptions iter_options) {
+  return db->NewIter(iter_options);
 }
 
 void DBIterDestroy(DBIterator* iter) { delete iter; }
 
+IteratorStats DBIterStats(DBIterator* iter) {
+  IteratorStats stats = {};
+  if (iter->stats != nullptr) {
+    stats = *iter->stats;
+  }
+  return stats;
+}
+
 DBIterState DBIterSeek(DBIterator* iter, DBKey key) {
+  ScopedStats stats(iter);
   iter->rep->Seek(EncodeKey(key));
   return DBIterGetState(iter);
 }
 
+DBIterState DBIterSeekForPrev(DBIterator* iter, DBKey key) {
+  ScopedStats stats(iter);
+  iter->rep->SeekForPrev(EncodeKey(key));
+  return DBIterGetState(iter);
+}
+
 DBIterState DBIterSeekToFirst(DBIterator* iter) {
+  ScopedStats stats(iter);
   iter->rep->SeekToFirst();
   return DBIterGetState(iter);
 }
 
 DBIterState DBIterSeekToLast(DBIterator* iter) {
+  ScopedStats stats(iter);
   iter->rep->SeekToLast();
   return DBIterGetState(iter);
 }
 
 DBIterState DBIterNext(DBIterator* iter, bool skip_current_key_versions) {
+  ScopedStats stats(iter);
   // If we're skipping the current key versions, remember the key the
   // iterator was pointing out.
   std::string old_key;
@@ -2193,6 +739,7 @@ DBIterState DBIterNext(DBIterator* iter, bool skip_current_key_versions) {
 }
 
 DBIterState DBIterPrev(DBIterator* iter, bool skip_current_key_versions) {
+  ScopedStats stats(iter);
   // If we're skipping the current key versions, remember the key the
   // iterator was pointed out.
   std::string old_key;
@@ -2229,248 +776,139 @@ DBIterState DBIterPrev(DBIterator* iter, bool skip_current_key_versions) {
   return DBIterGetState(iter);
 }
 
-DBStatus DBMergeOne(DBSlice existing, DBSlice update, DBString* new_value) {
+void DBIterSetLowerBound(DBIterator* iter, DBKey key) { iter->SetLowerBound(key); }
+void DBIterSetUpperBound(DBIterator* iter, DBKey key) { iter->SetUpperBound(key); }
+
+DBStatus DBMerge(DBSlice existing, DBSlice update, DBString* new_value, bool full_merge) {
   new_value->len = 0;
 
-  cockroach::storage::engine::enginepb::MVCCMetadata meta;
+  cockroach::storage::enginepb::MVCCMetadata meta;
   if (!meta.ParseFromArray(existing.data, existing.len)) {
     return ToDBString("corrupted existing value");
   }
 
-  cockroach::storage::engine::enginepb::MVCCMetadata update_meta;
+  cockroach::storage::enginepb::MVCCMetadata update_meta;
   if (!update_meta.ParseFromArray(update.data, update.len)) {
     return ToDBString("corrupted update value");
   }
 
-  if (!MergeValues(&meta, update_meta, true, NULL)) {
+  if (!MergeValues(&meta, update_meta, full_merge, NULL)) {
     return ToDBString("incompatible merge values");
   }
   return MergeResult(&meta, new_value);
 }
 
-const int64_t kNanosecondPerSecond = 1e9;
-
-inline int64_t age_factor(int64_t fromNS, int64_t toNS) {
-  // Careful about implicit conversions here.
-  // toNS/1e9 - fromNS/1e9 is not the same since
-  // "1e9" is a double.
-  return toNS / kNanosecondPerSecond - fromNS / kNanosecondPerSecond;
+DBStatus DBMergeOne(DBSlice existing, DBSlice update, DBString* new_value) {
+  return DBMerge(existing, update, new_value, true);
 }
 
-// TODO(tschottdorf): it's unfortunate that this method duplicates the logic
-// in (*MVCCStats).AgeTo. Passing now_nanos in is semantically tricky if there
-// is a chance that we run into values ahead of now_nanos. Instead, now_nanos
-// should be taken as a hint but determined by the max timestamp encountered.
-//
-// This implementation must match engine.ComputeStatsGo.
-MVCCStatsResult MVCCComputeStatsInternal(::rocksdb::Iterator* const iter_rep, DBKey start, DBKey end,
-                                         int64_t now_nanos) {
-  MVCCStatsResult stats;
-  memset(&stats, 0, sizeof(stats));
-
-  iter_rep->Seek(EncodeKey(start));
-  const std::string end_key = EncodeKey(end);
-
-  cockroach::storage::engine::enginepb::MVCCMetadata meta;
-  std::string prev_key;
-  bool first = false;
-
-  for (; iter_rep->Valid() && kComparator.Compare(iter_rep->key(), end_key) < 0; iter_rep->Next()) {
-    const rocksdb::Slice key = iter_rep->key();
-    const rocksdb::Slice value = iter_rep->value();
-
-    rocksdb::Slice decoded_key;
-    int64_t wall_time = 0;
-    int32_t logical = 0;
-    if (!DecodeKey(key, &decoded_key, &wall_time, &logical)) {
-      stats.status = FmtStatus("unable to decode key");
-      break;
-    }
-
-    const bool isSys = (rocksdb::Slice(decoded_key).compare(kLocalMax) < 0);
-    const bool isValue = (wall_time != 0 || logical != 0);
-    const bool implicitMeta = isValue && decoded_key != prev_key;
-    prev_key.assign(decoded_key.data(), decoded_key.size());
-
-    if (implicitMeta) {
-      // No MVCCMetadata entry for this series of keys.
-      meta.Clear();
-      meta.set_key_bytes(kMVCCVersionTimestampSize);
-      meta.set_val_bytes(value.size());
-      meta.set_deleted(value.size() == 0);
-      meta.mutable_timestamp()->set_wall_time(wall_time);
-    }
-
-    if (!isValue || implicitMeta) {
-      const int64_t meta_key_size = decoded_key.size() + 1;
-      const int64_t meta_val_size = implicitMeta ? 0 : value.size();
-      const int64_t total_bytes = meta_key_size + meta_val_size;
-      first = true;
-
-      if (!implicitMeta && !meta.ParseFromArray(value.data(), value.size())) {
-        stats.status = FmtStatus("unable to decode MVCCMetadata");
-        break;
-      }
-
-      if (isSys) {
-        stats.sys_bytes += total_bytes;
-        stats.sys_count++;
-      } else {
-        if (!meta.deleted()) {
-          stats.live_bytes += total_bytes;
-          stats.live_count++;
-        } else {
-          stats.gc_bytes_age += total_bytes * age_factor(meta.timestamp().wall_time(), now_nanos);
-        }
-        stats.key_bytes += meta_key_size;
-        stats.val_bytes += meta_val_size;
-        stats.key_count++;
-        if (meta.has_raw_bytes()) {
-          stats.val_count++;
-        }
-      }
-      if (!implicitMeta) {
-        continue;
-      }
-    }
-
-    const int64_t total_bytes = value.size() + kMVCCVersionTimestampSize;
-    if (isSys) {
-      stats.sys_bytes += total_bytes;
-    } else {
-      if (first) {
-        first = false;
-        if (!meta.deleted()) {
-          stats.live_bytes += total_bytes;
-        } else {
-          stats.gc_bytes_age += total_bytes * age_factor(meta.timestamp().wall_time(), now_nanos);
-        }
-        if (meta.has_txn()) {
-          stats.intent_bytes += total_bytes;
-          stats.intent_count++;
-          stats.intent_age += age_factor(meta.timestamp().wall_time(), now_nanos);
-        }
-        if (meta.key_bytes() != kMVCCVersionTimestampSize) {
-          stats.status = FmtStatus("expected mvcc metadata key bytes to equal %d; got %d", kMVCCVersionTimestampSize,
-                                   int(meta.key_bytes()));
-          break;
-        }
-        if (meta.val_bytes() != value.size()) {
-          stats.status = FmtStatus("expected mvcc metadata val bytes to equal %d; got %d", int(value.size()),
-                                   int(meta.val_bytes()));
-          break;
-        }
-      } else {
-        stats.gc_bytes_age += total_bytes * age_factor(wall_time, now_nanos);
-      }
-      stats.key_bytes += kMVCCVersionTimestampSize;
-      stats.val_bytes += value.size();
-      stats.val_count++;
-    }
-  }
-
-  stats.last_update_nanos = now_nanos;
-  return stats;
-}
-
-MVCCStatsResult MVCCComputeStats(DBIterator* iter, DBKey start, DBKey end, int64_t now_nanos) {
-  return MVCCComputeStatsInternal(iter->rep.get(), start, end, now_nanos);
-}
-
-bool MVCCIsValidSplitKey(DBSlice key, bool allow_meta2_splits) {
-  return IsValidSplitKey(ToSlice(key), allow_meta2_splits);
-}
-
-DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey end, DBKey min_split, int64_t target_size,
-                          bool allow_meta2_splits, DBString* split_key) {
-  auto iter_rep = iter->rep.get();
-  const std::string start_key = EncodeKey(start);
-  iter_rep->Seek(start_key);
-  const std::string end_key = EncodeKey(end);
-  const rocksdb::Slice min_split_key = ToSlice(min_split.key);
-
-  int64_t size_so_far = 0;
-  std::string best_split_key = start_key;
-  int64_t best_split_diff = std::numeric_limits<int64_t>::max();
-  std::string prev_key;
-  int n = 0;
-
-  for (; iter_rep->Valid() && kComparator.Compare(iter_rep->key(), end_key) < 0; iter_rep->Next()) {
-    const rocksdb::Slice key = iter_rep->key();
-    rocksdb::Slice decoded_key;
-    int64_t wall_time = 0;
-    int32_t logical = 0;
-    if (!DecodeKey(key, &decoded_key, &wall_time, &logical)) {
-      return FmtStatus("unable to decode key");
-    }
-
-    ++n;
-    const bool valid =
-        n > 1 && IsValidSplitKey(decoded_key, allow_meta2_splits) && decoded_key.compare(min_split_key) >= 0;
-    int64_t diff = target_size - size_so_far;
-    if (diff < 0) {
-      diff = -diff;
-    }
-    if (valid && diff < best_split_diff) {
-      best_split_key = decoded_key.ToString();
-      best_split_diff = diff;
-    }
-    // If diff is increasing, that means we've passed the ideal split point and
-    // should return the first key that we can. Note that best_split_key may
-    // still be empty if we haven't reached min_split_key yet.
-    if (diff > best_split_diff && !best_split_key.empty()) {
-      break;
-    }
-
-    const bool is_value = (wall_time != 0 || logical != 0);
-    if (is_value && decoded_key == prev_key) {
-      size_so_far += kMVCCVersionTimestampSize + iter_rep->value().size();
-    } else {
-      size_so_far += decoded_key.size() + 1 + iter_rep->value().size();
-      if (is_value) {
-        size_so_far += kMVCCVersionTimestampSize;
-      }
-    }
-    prev_key.assign(decoded_key.data(), decoded_key.size());
-  }
-  if (best_split_key == start_key) {
-    return kSuccess;
-  }
-  *split_key = ToDBString(best_split_key);
-  return kSuccess;
+DBStatus DBPartialMergeOne(DBSlice existing, DBSlice update, DBString* new_value) {
+  return DBMerge(existing, update, new_value, false);
 }
 
 // DBGetStats queries the given DBEngine for various operational stats and
 // write them to the provided DBStatsResult instance.
-DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats) { return db->GetStats(stats); }
+DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats) {
+  return db->GetStats(stats);
+}
+
+// `DBGetTickersAndHistograms` retrieves maps of all RocksDB tickers and histograms.
+// It differs from `DBGetStats` by getting _every_ ticker and histogram, and by not
+// getting anything else (DB properties, for example).
+//
+// In addition to freeing the `DBString`s in the result, the caller is also
+// responsible for freeing `DBTickersAndHistogramsResult::tickers` and
+// `DBTickersAndHistogramsResult::histograms`.
+DBStatus DBGetTickersAndHistograms(DBEngine* db, DBTickersAndHistogramsResult* stats) {
+  return db->GetTickersAndHistograms(stats);
+}
 
 DBString DBGetCompactionStats(DBEngine* db) { return db->GetCompactionStats(); }
 
+DBStatus DBGetEnvStats(DBEngine* db, DBEnvStatsResult* stats) { return db->GetEnvStats(stats); }
+
+DBStatus DBGetEncryptionRegistries(DBEngine* db, DBEncryptionRegistries* result) {
+  return db->GetEncryptionRegistries(result);
+}
+
 DBSSTable* DBGetSSTables(DBEngine* db, int* n) { return db->GetSSTables(n); }
+
+DBStatus DBGetSortedWALFiles(DBEngine* db, DBWALFile** files, int* n) {
+  return db->GetSortedWALFiles(files, n);
+}
 
 DBString DBGetUserProperties(DBEngine* db) { return db->GetUserProperties(); }
 
-DBStatus DBIngestExternalFile(DBEngine* db, DBSlice path, bool move_file) {
-  const std::vector<std::string> paths = {ToString(path)};
+DBStatus DBIngestExternalFiles(DBEngine* db, char** paths, size_t len, bool move_files) {
+  std::vector<std::string> paths_vec;
+  for (size_t i = 0; i < len; i++) {
+    paths_vec.push_back(paths[i]);
+  }
+
   rocksdb::IngestExternalFileOptions ingest_options;
   // If move_files is true and the env supports it, RocksDB will hard link.
   // Otherwise, it will copy.
-  ingest_options.move_files = move_file;
+  ingest_options.move_files = move_files;
   // If snapshot_consistency is true and there is an outstanding RocksDB
   // snapshot, a global sequence number is forced (see the allow_global_seqno
   // option).
   ingest_options.snapshot_consistency = true;
   // If a file is ingested over existing data (including the range tombstones
   // used by range snapshots) or if a RocksDB snapshot is outstanding when this
-  // ingest runs, then after moving/copying the file, RocksDB will edit it
-  // (overwrite some of the bytes) to have a global sequence number. If this is
-  // false, it will error in these cases instead.
+  // ingest runs, then after moving/copying the file, historically RocksDB would
+  // edit it (overwrite some of the bytes) to have a global sequence number.
+  // After https://github.com/facebook/rocksdb/pull/4172 this can be disabled
+  // (with the mutable manifest/metadata tracking that instead). However it is
+  // only safe to disable the seqno write if older versions of RocksDB (<5.16)
+  // will not be used to read these SSTs; luckily we no longer need to
+  // interoperate with such older versions.
+  ingest_options.write_global_seqno = false;
+  // RocksDB checks the option allow_global_seqno and, if it is false, returns
+  // an error instead of ingesting a file that would require one. However it
+  // does this check *even if it is not planning on writing seqno* at all (and
+  // we're not planning on writing any as per write_global_seqno above), so we
+  // need to set allow_global_seqno to true.
   ingest_options.allow_global_seqno = true;
   // If there are mutations in the memtable for the keyrange covered by the file
   // being ingested, this option is checked. If true, the memtable is flushed
-  // and the ingest run. If false, an error is returned.
-  ingest_options.allow_blocking_flush = true;
-  rocksdb::Status status = db->rep->IngestExternalFile(paths, ingest_options);
+  // using a blocking, write-stalling flush and the ingest run. If false, an
+  // error is returned.
+  //
+  // We want to ingest, but we do not want a write-stall, so we initially set it
+  // to false -- if our ingest fails, we'll do a manual, no-stall flush and wait
+  // for it to finish before trying the ingest again.
+  ingest_options.allow_blocking_flush = false;
+
+  rocksdb::Status status = db->rep->IngestExternalFile(paths_vec, ingest_options);
+  if (status.IsInvalidArgument()) {
+    // TODO(dt): inspect status to see if it has the message
+    //          `External file requires flush`
+    //           since the move_file and other errors also use kInvalidArgument.
+
+    // It is possible we failed because the memtable required a flush but in the
+    // options above, we set "allow_blocking_flush = false" preventing ingest
+    // from running flush with allow_write_stall = true and halting foreground
+    // traffic. Now that we know we need to flush, let's do one ourselves, with
+    // allow_write_stall = false and wait for it. After it finishes we can retry
+    // the ingest.
+    rocksdb::FlushOptions flush_options;
+    flush_options.allow_write_stall = false;
+    flush_options.wait = true;
+
+    rocksdb::Status flush_status = db->rep->Flush(flush_options);
+    if (!flush_status.ok()) {
+      return ToDBStatus(flush_status);
+    }
+
+    // Hopefully on this second attempt we will not need to flush at all, but
+    // just in case we do, we'll allow the write stall this time -- that way we
+    // can ensure we actually get the ingestion done and move on. A stalling
+    // flush is be less than ideal, but since we just flushed, a) this shouldn't
+    // happen often and b) if it does, it should be small and quick.
+    ingest_options.allow_blocking_flush = true;
+    status = db->rep->IngestExternalFile(paths_vec, ingest_options);
+  }
+
   if (!status.ok()) {
     return ToDBStatus(status);
   }
@@ -2496,16 +934,29 @@ DBSstFileWriter* DBSstFileWriterNew() {
   rocksdb::BlockBasedTableOptions table_options;
   // Larger block size (4kb default) means smaller file at the expense of more
   // scanning during lookups.
-  table_options.block_size = 64 * 1024;
+  table_options.block_size = 32 * 1024;
   // The original LevelDB compatible format. We explicitly set the checksum too
   // to guard against the silent version upconversion. See
   // https://github.com/facebook/rocksdb/blob/972f96b3fbae1a4675043bdf4279c9072ad69645/include/rocksdb/table.h#L198
   table_options.format_version = 0;
   table_options.checksum = rocksdb::kCRC32c;
+  table_options.whole_key_filtering = false;
+  // This makes the sstables produced by Pebble and RocksDB byte-by-byte identical, which is
+  // useful for testing.
+  table_options.index_shortening =
+      rocksdb::BlockBasedTableOptions::IndexShorteningMode::kShortenSeparatorsAndSuccessor;
 
   rocksdb::Options* options = new rocksdb::Options();
   options->comparator = &kComparator;
   options->table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
+
+  // Use the TablePropertiesCollector hook to store the min and max MVCC
+  // timestamps present in each sstable in the metadata for that sstable. Used
+  // by the time bounded iterator optimization.
+  options->table_properties_collector_factories.emplace_back(DBMakeTimeBoundCollector());
+  // Automatically request compactions whenever an SST contains too many range
+  // deletions.
+  options->table_properties_collector_factories.emplace_back(DBMakeDeleteRangeCollector());
 
   std::unique_ptr<rocksdb::Env> memenv;
   memenv.reset(rocksdb::NewMemEnv(rocksdb::Env::Default()));
@@ -2522,28 +973,50 @@ DBStatus DBSstFileWriterOpen(DBSstFileWriter* fw) {
   return kSuccess;
 }
 
+namespace {
+DBStatus DBSstFileWriterAddRaw(DBSstFileWriter* fw, const rocksdb::Slice key,
+                               const rocksdb::Slice val) {
+  rocksdb::Status status = fw->rep.Put(key, val);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+
+  return kSuccess;
+}
+}  // namespace
+
 DBStatus DBSstFileWriterAdd(DBSstFileWriter* fw, DBKey key, DBSlice val) {
-  rocksdb::Status status = fw->rep.Put(EncodeKey(key), ToSlice(val));
+  return DBSstFileWriterAddRaw(fw, EncodeKey(key), ToSlice(val));
+}
+
+DBStatus DBSstFileWriterDelete(DBSstFileWriter* fw, DBKey key) {
+  rocksdb::Status status = fw->rep.Delete(EncodeKey(key));
   if (!status.ok()) {
     return ToDBStatus(status);
   }
   return kSuccess;
 }
 
-DBStatus DBSstFileWriterFinish(DBSstFileWriter* fw, DBString* data) {
-  rocksdb::Status status = fw->rep.Finish();
+DBStatus DBSstFileWriterDeleteRange(DBSstFileWriter* fw, DBKey start, DBKey end) {
+  rocksdb::Status status = fw->rep.DeleteRange(EncodeKey(start), EncodeKey(end));
   if (!status.ok()) {
     return ToDBStatus(status);
   }
+  return kSuccess;
+}
 
+DBStatus DBSstFileWriterCopyData(DBSstFileWriter* fw, DBString* data) {
   uint64_t file_size;
-  status = fw->memenv->GetFileSize("sst", &file_size);
+  rocksdb::Status status = fw->memenv->GetFileSize("sst", &file_size);
   if (!status.ok()) {
     return ToDBStatus(status);
+  }
+  if (file_size == 0) {
+    return kSuccess;
   }
 
   const rocksdb::EnvOptions soptions;
-  rocksdb::unique_ptr<rocksdb::SequentialFile> sst;
+  std::unique_ptr<rocksdb::SequentialFile> sst;
   status = fw->memenv->NewSequentialFile("sst", &sst, soptions);
   if (!status.ok()) {
     return ToDBStatus(status);
@@ -2559,7 +1032,8 @@ DBStatus DBSstFileWriterFinish(DBSstFileWriter* fw, DBString* data) {
     return ToDBStatus(status);
   }
   if (sst_contents.size() != file_size) {
-    return FmtStatus("expected to read %d bytes but got %d", file_size, sst_contents.size());
+        return FmtStatus("expected to read %" PRIu64 " bytes but got %zu", file_size,
+                     sst_contents.size());
   }
 
   // The contract of the SequentialFile.Read call above is that it _might_ use
@@ -2577,31 +1051,191 @@ DBStatus DBSstFileWriterFinish(DBSstFileWriter* fw, DBString* data) {
   return kSuccess;
 }
 
-void DBSstFileWriterClose(DBSstFileWriter* fw) { delete fw; }
-
-namespace {
-
-class CockroachKeyFormatter : public rocksdb::SliceFormatter {
-  std::string Format(const rocksdb::Slice& s) const {
-    char* p = prettyPrintKey(ToDBKey(s));
-    std::string ret(p);
-    free(static_cast<void*>(p));
-    return ret;
+DBStatus DBSstFileWriterTruncate(DBSstFileWriter* fw, DBString* data) {
+  DBStatus status = DBSstFileWriterCopyData(fw, data);
+  if (status.data != NULL) {
+    return status;
   }
-};
-
-}  // unnamed namespace
-
-void DBRunLDB(int argc, char** argv) {
-  rocksdb::Options options = DBMakeOptions(DBOptions());
-  rocksdb::LDBOptions ldb_options;
-  ldb_options.key_formatter.reset(new CockroachKeyFormatter);
-  rocksdb::LDBTool tool;
-  tool.Run(argc, argv, options, ldb_options);
+  return ToDBStatus(fw->memenv->Truncate("sst", 0));
 }
 
-const rocksdb::Comparator* CockroachComparator() { return &kComparator; }
+DBStatus DBSstFileWriterFinish(DBSstFileWriter* fw, DBString* data) {
+  rocksdb::Status status = fw->rep.Finish();
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
 
-rocksdb::WriteBatch::Handler* GetDBBatchInserter(::rocksdb::WriteBatchBase* batch) {
-  return new DBBatchInserter(batch);
+  return DBSstFileWriterCopyData(fw, data);
+}
+
+void DBSstFileWriterClose(DBSstFileWriter* fw) { delete fw; }
+
+DBStatus DBLockFile(DBSlice filename, DBFileLock* lock) {
+  return ToDBStatus(
+      rocksdb::Env::Default()->LockFile(ToString(filename), (rocksdb::FileLock**)lock));
+}
+
+DBStatus DBUnlockFile(DBFileLock lock) {
+  return ToDBStatus(rocksdb::Env::Default()->UnlockFile((rocksdb::FileLock*)lock));
+}
+
+DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions,
+                       uint64_t target_size, uint64_t max_size,
+                       DBIterOptions iter_opts, DBEngine* engine, DBString* data,
+                       DBString* write_intent, DBString* summary, DBString* resume) {
+  DBSstFileWriter* writer = DBSstFileWriterNew();
+  DBStatus status = DBSstFileWriterOpen(writer);
+  if (status.data != NULL) {
+    return status;
+  }
+
+  DBIncrementalIterator iter(engine, iter_opts, start, end, write_intent);
+
+  roachpb::BulkOpSummary bulkop_summary;
+  RowCounter row_counter(&bulkop_summary);
+
+  bool skip_current_key_versions = !export_all_revisions;
+  DBIterState state;
+  const std::string end_key = EncodeKey(end);
+  // cur_key is used when paginated is true and export_all_revisions is
+  // true. If we're exporting all revisions and we're returning a paginated
+  // SST then we need to keep track of when we've finished adding all of the
+  // versions of a key to the writer.
+  const bool paginated = target_size > 0;
+  std::string cur_key;
+  std::string resume_key;
+  // Seek to the MVCC metadata key for the provided start key and let the
+  // incremental iterator find the appropriate version.
+  const DBKey seek_key = {.key = start.key};
+  for (state = iter.seek(seek_key);; state = iter.next(skip_current_key_versions)) {
+    if (state.status.data != NULL) {
+      DBSstFileWriterClose(writer);
+      return state.status;
+    } else if (!state.valid || kComparator.Compare(iter.key(), end_key) >= 0) {
+      break;
+    }
+    rocksdb::Slice decoded_key;
+    int64_t wall_time = 0;
+    int32_t logical_time = 0;
+
+    if (!DecodeKey(iter.key(), &decoded_key, &wall_time, &logical_time)) {
+      DBSstFileWriterClose(writer);
+      return ToDBString("Unable to decode key");
+    }
+
+    const bool is_new_key = !export_all_revisions || decoded_key.compare(cur_key) != 0;
+    if (paginated && export_all_revisions && is_new_key) {
+      // Reuse the underlying buffer in cur_key.
+      cur_key.clear();
+      cur_key.reserve(decoded_key.size());
+      cur_key.assign(decoded_key.data(), decoded_key.size());
+    }
+
+    // Skip tombstone (len=0) records when start time is zero (non-incremental)
+    // and we are not exporting all versions.
+    const bool is_skipping_deletes =
+        start.wall_time == 0 && start.logical == 0 && !export_all_revisions;
+    if (is_skipping_deletes && iter.value().size() == 0) {
+      continue;
+    }
+
+    // Check to see if this is the first version of key and adding it would
+    // put us over the limit (we might already be over the limit).
+    const int64_t cur_size = bulkop_summary.data_size();
+    const bool reached_target_size = cur_size > 0 && cur_size >= target_size;
+    if (paginated && is_new_key && reached_target_size) {
+      resume_key.reserve(decoded_key.size());
+      resume_key.assign(decoded_key.data(), decoded_key.size());
+      break;
+    }
+
+    // Insert key into sst and update statistics.
+    status = DBSstFileWriterAddRaw(writer, iter.key(), iter.value());
+    if (status.data != NULL) {
+      DBSstFileWriterClose(writer);
+      return status;
+    }
+
+    if (!row_counter.Count(iter.key())) {
+      return ToDBString("Error in row counter");
+    }
+    const int64_t new_size = cur_size + decoded_key.size() + iter.value().size();
+    if (max_size > 0 && new_size > max_size) {
+      return FmtStatus("export size (%" PRIi64 " bytes) exceeds max size (%" PRIi64 " bytes)",
+                       new_size, max_size);
+    }
+    bulkop_summary.set_data_size(new_size);
+  }
+  *summary = ToDBString(bulkop_summary.SerializeAsString());
+
+  if (bulkop_summary.data_size() == 0) {
+    DBSstFileWriterClose(writer);
+    return kSuccess;
+  }
+
+  auto res = DBSstFileWriterFinish(writer, data);
+  DBSstFileWriterClose(writer);
+
+  // If we're not returning an error, check to see if we need to return the resume key.
+  if (res.data == NULL && resume_key.length() > 0) {
+    *resume = ToDBString(resume_key);
+  }
+
+  return res;
+}
+
+DBStatus DBEnvOpenReadableFile(DBEngine* db, DBSlice path, DBReadableFile* file) {
+  return db->EnvOpenReadableFile(path, (rocksdb::RandomAccessFile**)file);
+}
+
+DBStatus DBEnvReadAtFile(DBEngine* db, DBReadableFile file, DBSlice buffer, int64_t offset,
+                         int* n) {
+  return db->EnvReadAtFile((rocksdb::RandomAccessFile*)file, buffer, offset, n);
+}
+
+DBStatus DBEnvCloseReadableFile(DBEngine* db, DBReadableFile file) {
+  return db->EnvCloseReadableFile((rocksdb::RandomAccessFile*)file);
+}
+
+DBStatus DBEnvOpenDirectory(DBEngine* db, DBSlice path, DBDirectory* file) {
+  return db->EnvOpenDirectory(path, (rocksdb::Directory**)file);
+}
+
+DBStatus DBEnvSyncDirectory(DBEngine* db, DBDirectory file) {
+  return db->EnvSyncDirectory((rocksdb::Directory*)file);
+}
+
+DBStatus DBEnvCloseDirectory(DBEngine* db, DBDirectory file) {
+  return db->EnvCloseDirectory((rocksdb::Directory*)file);
+}
+
+DBStatus DBEnvRenameFile(DBEngine* db, DBSlice oldname, DBSlice newname) {
+  return db->EnvRenameFile(oldname, newname);
+}
+
+DBStatus DBEnvCreateDir(DBEngine* db, DBSlice name) {
+  return db->EnvCreateDir(name);
+}
+
+DBStatus DBEnvDeleteDir(DBEngine* db, DBSlice name) {
+  return db->EnvDeleteDir(name);
+}
+
+DBListDirResults DBEnvListDir(DBEngine* db, DBSlice name) {
+  DBListDirResults result;
+  std::vector<std::string> contents;
+  result.status = db->EnvListDir(name, &contents);
+  result.n = contents.size();
+  // We malloc the names so it can be deallocated by the caller using free().
+  const int size = contents.size() * sizeof(DBString);
+  result.names = reinterpret_cast<DBString*>(malloc(size));
+  memset(result.names, 0, size);
+  for (int i = 0; i < contents.size(); i++) {
+    result.names[i] = ToDBString(rocksdb::Slice(contents[i].data(), contents[i].size()));
+  }
+  return result;
+}
+
+DBString DBDumpThreadStacks() {
+  return ToDBString(DumpThreadStacks());
 }

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package roachpb
 
@@ -18,7 +14,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -47,10 +42,11 @@ func TestNewErrorNil(t *testing.T) {
 
 // TestSetTxn vefifies that SetTxn updates the error message.
 func TestSetTxn(t *testing.T) {
-	e := NewError(NewTransactionAbortedError())
-	txn := MakeTransaction("test", Key("a"), 1, enginepb.SERIALIZABLE, hlc.Timestamp{}, 0)
+	e := NewError(NewTransactionAbortedError(ABORT_REASON_ABORTED_RECORD_FOUND))
+	txn := MakeTransaction("test", Key("a"), 1, hlc.Timestamp{}, 0)
 	e.SetTxn(&txn)
-	if !strings.HasPrefix(e.Message, "TransactionAbortedError: txn aborted \"test\"") {
+	if !strings.HasPrefix(
+		e.Message, "TransactionAbortedError(ABORT_REASON_ABORTED_RECORD_FOUND): \"test\"") {
 		t.Errorf("unexpected message: %s", e.Message)
 	}
 }
@@ -65,5 +61,34 @@ func TestErrorTxn(t *testing.T) {
 	pErr.SetTxn(&Transaction{Name: name})
 	if txn := pErr.GetTxn(); txn == nil || txn.Name != name {
 		t.Fatalf("wanted name %s, unexpected: %+v", name, txn)
+	}
+}
+
+func TestReadWithinUncertaintyIntervalError(t *testing.T) {
+	{
+		rwueNew := NewReadWithinUncertaintyIntervalError(
+			hlc.Timestamp{WallTime: 1}, hlc.Timestamp{WallTime: 2},
+			&Transaction{
+				MaxTimestamp:       hlc.Timestamp{WallTime: 3},
+				ObservedTimestamps: []ObservedTimestamp{{NodeID: 12, Timestamp: hlc.Timestamp{WallTime: 4}}},
+			})
+		expNew := "ReadWithinUncertaintyIntervalError: read at time 0.000000001,0 encountered " +
+			"previous write with future timestamp 0.000000002,0 within uncertainty interval " +
+			"`t <= 0.000000003,0`; observed timestamps: [{12 0.000000004,0}]"
+		if a := rwueNew.Error(); a != expNew {
+			t.Fatalf("expected: %s\ngot: %s", a, expNew)
+		}
+	}
+
+	{
+		rwueOld := NewReadWithinUncertaintyIntervalError(
+			hlc.Timestamp{WallTime: 1}, hlc.Timestamp{WallTime: 2}, nil)
+
+		expOld := "ReadWithinUncertaintyIntervalError: read at time 0.000000001,0 encountered " +
+			"previous write with future timestamp 0.000000002,0 within uncertainty interval " +
+			"`t <= <nil>`; observed timestamps: []"
+		if a := rwueOld.Error(); a != expOld {
+			t.Fatalf("expected: %s\ngot: %s", a, expOld)
+		}
 	}
 }

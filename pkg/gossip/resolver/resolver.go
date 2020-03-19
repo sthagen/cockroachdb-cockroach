@@ -1,27 +1,28 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package resolver
 
 import (
+	"fmt"
 	"net"
 	"os"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/pkg/errors"
+)
+
+var (
+	lookupSRV = net.LookupSRV
 )
 
 // Resolver is an interface which provides an abstract factory for
@@ -41,6 +42,37 @@ func NewResolver(address string) (Resolver, error) {
 	// Ensure addr has port and host set.
 	address = ensureHostPort(address, base.DefaultPort)
 	return &socketResolver{typ: "tcp", addr: address}, nil
+}
+
+// SRV returns a slice of addresses from SRV record lookup
+func SRV(name string) ([]string, error) {
+	// Ignore port
+	name, _, err := netutil.SplitHostPort(name, base.DefaultPort)
+	if err != nil {
+		return nil, err
+	}
+
+	if name == "" {
+		// nolint:returnerrcheck
+		return nil, nil
+	}
+
+	// "" as the addr and proto forces the direct look up of the name
+	_, recs, err := lookupSRV("", "", name)
+	if err != nil {
+		if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.Err == "no such host" {
+			return nil, nil
+		}
+
+		return nil, errors.Wrapf(err, "failed to lookup SRV record for %q", name)
+	}
+
+	var addrs = make([]string, len(recs))
+	for i, r := range recs {
+		addrs[i] = net.JoinHostPort(r.Target, fmt.Sprintf("%d", r.Port))
+	}
+
+	return addrs, nil
 }
 
 // NewResolverFromAddress takes a net.Addr and constructs a resolver.

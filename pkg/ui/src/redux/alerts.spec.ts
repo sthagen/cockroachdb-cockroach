@@ -1,23 +1,46 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import { assert } from "chai";
-import fetchMock from "src/util/fetch-mock";
 import { Store } from "redux";
 import moment from "moment";
+import sinon from "sinon";
+import { createHashHistory } from "history";
 
 import * as protos from "src/js/protos";
 import { API_PREFIX } from "src/util/api";
+import fetchMock from "src/util/fetch-mock";
+
 import { AdminUIState, createAdminUIStore } from "./state";
 import {
   AlertLevel,
   alertDataSync,
-  versionsSelector,
-  staggeredVersionWarningSelector, staggeredVersionDismissedSetting,
-  newVersionNotificationSelector, newVersionDismissedLocalSetting,
-  disconnectedAlertSelector, disconnectedDismissedLocalSetting,
+  staggeredVersionWarningSelector,
+  staggeredVersionDismissedSetting,
+  newVersionNotificationSelector,
+  newVersionDismissedLocalSetting,
+  disconnectedAlertSelector,
+  disconnectedDismissedLocalSetting,
+  emailSubscriptionAlertLocalSetting,
+  emailSubscriptionAlertSelector,
 } from "./alerts";
-import { VERSION_DISMISSED_KEY, setUIDataKey, isInFlight } from "./uiData";
+import { versionsSelector } from "src/redux/nodes";
+import {
+  VERSION_DISMISSED_KEY, INSTRUCTIONS_BOX_COLLAPSED_KEY,
+  setUIDataKey, isInFlight,
+} from "./uiData";
 import {
   livenessReducerObj, versionReducerObj, nodesReducerObj, clusterReducerObj, healthReducerObj,
 } from "./apiReducers";
+
+const sandbox = sinon.createSandbox();
 
 describe("alerts", function() {
   let store: Store<AdminUIState>;
@@ -25,12 +48,16 @@ describe("alerts", function() {
   let state: typeof store.getState;
 
   beforeEach(function () {
-    store = createAdminUIStore();
+    store = createAdminUIStore(createHashHistory());
     dispatch = store.dispatch;
     state = store.getState;
+    // localSettings persist values in sessionStorage and
+    // this stub disables caching values between tests.
+    sandbox.stub(sessionStorage, "getItem").returns(null);
   });
 
   afterEach(function() {
+    sandbox.restore();
     fetchMock.restore();
   });
 
@@ -305,7 +332,7 @@ describe("alerts", function() {
         const alert = disconnectedAlertSelector(state());
         assert.isObject(alert);
         assert.equal(alert.level, AlertLevel.CRITICAL);
-        assert.equal(alert.title, "Connection to CockroachDB node lost.");
+        assert.equal(alert.title, "We're currently having some trouble fetching updated data. If this persists, it might be a good idea to check your network connection to the CockroachDB cluster.");
       });
 
       it("does not display if dismissed locally", function () {
@@ -326,6 +353,26 @@ describe("alerts", function() {
           );
           done();
         });
+      });
+    });
+
+    describe("email signup for release notes alert", () => {
+      it("initialized with default 'false' (hidden) state", () => {
+        const settingState = emailSubscriptionAlertLocalSetting.selector(state());
+        assert.isFalse(settingState);
+      });
+
+      it("dismissed by alert#dismiss", async () => {
+        // set alert to open state
+        dispatch(emailSubscriptionAlertLocalSetting.set(true));
+        let openState = emailSubscriptionAlertLocalSetting.selector(state());
+        assert.isTrue(openState);
+
+        // dismiss alert
+        const alert = emailSubscriptionAlertSelector(state());
+        await alert.dismiss(dispatch, state);
+        openState = emailSubscriptionAlertLocalSetting.selector(state());
+        assert.isFalse(openState);
       });
     });
   });
@@ -411,6 +458,7 @@ describe("alerts", function() {
         cluster_id: "my-cluster",
       })));
       dispatch(setUIDataKey(VERSION_DISMISSED_KEY, "blank"));
+      dispatch(setUIDataKey(INSTRUCTIONS_BOX_COLLAPSED_KEY, false));
       dispatch(versionReducerObj.receiveData({
         details: [],
       }));

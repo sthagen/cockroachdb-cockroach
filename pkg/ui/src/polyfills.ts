@@ -1,10 +1,14 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 // This file imports polyfills necessary for both the unit tests and the
 // deployed bundle.
-//
-// If you're tempted to instead import babel-polyfill, which bundles the most
-// common polyfills, fair warning: babel-polyfill, jsdom, and Node 6 are
-// mutually incompatible.
-//
-// TODO(benesch): reevaluate babel-polyfill when we upgrade to Node 8.
 
-import "regenerator-runtime/runtime";
+import "babel-polyfill";

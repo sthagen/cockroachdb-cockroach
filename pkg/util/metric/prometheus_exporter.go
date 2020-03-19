@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package metric
 
@@ -18,6 +14,7 @@ import (
 	"io"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/prometheus/client_golang/prometheus"
 	prometheusgo "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 )
@@ -68,18 +65,16 @@ func (pm *PrometheusExporter) findOrCreateFamily(
 // call. It creates new families as needed.
 func (pm *PrometheusExporter) ScrapeRegistry(registry *Registry) {
 	labels := registry.getLabels()
-	for _, metric := range registry.tracked {
-		metric.Inspect(func(v interface{}) {
-			if prom, ok := v.(PrometheusExportable); ok {
-				m := prom.ToPrometheusMetric()
-				// Set registry and metric labels.
-				m.Label = append(labels, prom.GetLabels()...)
+	registry.Each(func(_ string, v interface{}) {
+		if prom, ok := v.(PrometheusExportable); ok {
+			m := prom.ToPrometheusMetric()
+			// Set registry and metric labels.
+			m.Label = append(labels, prom.GetLabels()...)
 
-				family := pm.findOrCreateFamily(prom)
-				family.Metric = append(family.Metric, m)
-			}
-		})
-	}
+			family := pm.findOrCreateFamily(prom)
+			family.Metric = append(family.Metric, m)
+		}
+	})
 }
 
 // PrintAsText writes all metrics in the families map to the io.Writer in
@@ -90,8 +85,29 @@ func (pm *PrometheusExporter) PrintAsText(w io.Writer) error {
 		if _, err := expfmt.MetricFamilyToText(w, family); err != nil {
 			return err
 		}
-		// Clear metrics for reuse.
-		family.Metric = []*prometheusgo.Metric{}
 	}
+	pm.clearMetrics()
 	return nil
+}
+
+// Verify GraphiteExporter implements Gatherer interface.
+var _ prometheus.Gatherer = (*PrometheusExporter)(nil)
+
+// Gather implements prometheus.Gatherer
+func (pm *PrometheusExporter) Gather() ([]*prometheusgo.MetricFamily, error) {
+	v := make([]*prometheusgo.MetricFamily, len(pm.families))
+	i := 0
+	for _, family := range pm.families {
+		v[i] = family
+		i++
+	}
+	return v, nil
+}
+
+// Clear metrics for reuse.
+func (pm *PrometheusExporter) clearMetrics() {
+	for _, family := range pm.families {
+		// Set to nil to avoid allocation if the family never gets any metrics.
+		family.Metric = nil
+	}
 }

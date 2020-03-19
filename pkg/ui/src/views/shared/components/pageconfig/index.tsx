@@ -1,16 +1,44 @@
-import React from "react";
-import { Sticky } from "react-sticky";
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
-export function PageConfig(props: {children?: React.ReactNode}) {
-    return <Sticky className="page-config" stickyClassName="page-config--fixed">
-      <ul className="page-config__list">
-        { props.children }
-      </ul>
-    </Sticky>;
+import classnames from "classnames";
+import React from "react";
+
+export interface PageConfigProps {
+  layout?: "list" | "spread";
+  children?: React.ReactNode;
 }
 
-export function PageConfigItem(props: {children?: React.ReactNode}) {
-    return <li className="page-config__item">
+export function PageConfig(props: PageConfigProps) {
+  const classes = classnames({
+    "page-config__list": props.layout !== "spread",
+    "page-config__spread": props.layout === "spread",
+  });
+
+  return (
+    <div className="page-config">
+      <ul className={ classes }>
         { props.children }
-    </li>;
+      </ul>
+    </div>
+  );
+}
+
+export interface PageConfigItemProps {
+  children?: React.ReactNode;
+}
+
+export function PageConfigItem(props: PageConfigItemProps) {
+  return (
+    <li className="page-config__item">
+      { props.children }
+    </li>
+  );
 }

@@ -6,21 +6,22 @@
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
-import OSSLicenseType from "oss/src/views/shared/components/licenseType";
 import React from "react";
+
+import DebugAnnotation from "src/views/shared/components/debugAnnotation";
+import swapByLicense from "src/views/shared/containers/licenseSwap";
+import OSSLicenseType from "oss/src/views/shared/components/licenseType";
+
+class CCLLicenseType extends React.Component<{}, {}> {
+  render() {
+    return <DebugAnnotation label="License type" value="CCL" />;
+  }
+}
 
 /**
  * LicenseType is an indicator showing the current build license.
  */
-export default class LicenseType extends React.Component<{}, {}> {
-  render() {
-    if (location.hash.indexOf("pretend-license-expired") !== -1) {
-      return <OSSLicenseType/>;
-    }
-    return (
-      <div>
-        <h3>License type: CCL</h3>
-      </div>
-    );
-  }
-}
+// tslint:disable-next-line:variable-name
+const LicenseType = swapByLicense(OSSLicenseType, CCLLicenseType);
+
+export default LicenseType;

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -24,12 +20,11 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/golang-commonmark/markdown"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 func init() {
@@ -49,12 +44,17 @@ func init() {
 			}
 
 			if err := ioutil.WriteFile(
-				filepath.Join(outDir, "functions.md"), generateFunctions(builtins.Builtins, true), 0644,
+				filepath.Join(outDir, "functions.md"), generateFunctions(builtins.AllBuiltinNames, true), 0644,
 			); err != nil {
 				return err
 			}
 			if err := ioutil.WriteFile(
-				filepath.Join(outDir, "aggregates.md"), generateFunctions(builtins.Aggregates, false), 0644,
+				filepath.Join(outDir, "aggregates.md"), generateFunctions(builtins.AllAggregateBuiltinNames, false), 0644,
+			); err != nil {
+				return err
+			}
+			if err := ioutil.WriteFile(
+				filepath.Join(outDir, "window_functions.md"), generateFunctions(builtins.AllWindowBuiltinNames, false), 0644,
 			); err != nil {
 				return err
 			}
@@ -104,7 +104,7 @@ func generateOperators() []byte {
 	for optyp, overloads := range tree.UnaryOps {
 		op := optyp.String()
 		for _, untyped := range overloads {
-			v := untyped.(tree.UnaryOp)
+			v := untyped.(*tree.UnaryOp)
 			ops[op] = append(ops[op], operation{
 				left: v.Typ.String(),
 				ret:  v.ReturnType.String(),
@@ -115,7 +115,7 @@ func generateOperators() []byte {
 	for optyp, overloads := range tree.BinOps {
 		op := optyp.String()
 		for _, untyped := range overloads {
-			v := untyped.(tree.BinOp)
+			v := untyped.(*tree.BinOp)
 			left := v.LeftType.String()
 			right := v.RightType.String()
 			ops[op] = append(ops[op], operation{
@@ -129,7 +129,7 @@ func generateOperators() []byte {
 	for optyp, overloads := range tree.CmpOps {
 		op := optyp.String()
 		for _, untyped := range overloads {
-			v := untyped.(tree.CmpOp)
+			v := untyped.(*tree.CmpOp)
 			left := v.LeftType.String()
 			right := v.RightType.String()
 			ops[op] = append(ops[op], operation{
@@ -147,12 +147,18 @@ func generateOperators() []byte {
 	}
 	sort.Strings(opstrs)
 	b := new(bytes.Buffer)
+	seen := map[string]bool{}
 	for _, op := range opstrs {
 		fmt.Fprintf(b, "<table><thead>\n")
 		fmt.Fprintf(b, "<tr><td><code>%s</code></td><td>Return</td></tr>\n", op)
 		fmt.Fprintf(b, "</thead><tbody>\n")
 		for _, v := range ops[op] {
-			fmt.Fprintf(b, "<tr><td>%s</td><td>%s</td></tr>\n", v.String(), linkTypeName(v.ret))
+			s := fmt.Sprintf("<tr><td>%s</td><td>%s</td></tr>\n", v.String(), linkTypeName(v.ret))
+			if seen[s] {
+				continue
+			}
+			seen[s] = true
+			b.WriteString(s)
 		}
 		fmt.Fprintf(b, "</tbody></table>")
 		fmt.Fprintln(b)
@@ -163,30 +169,39 @@ func generateOperators() []byte {
 // TODO(mjibson): use the exported value from sql/parser/pg_builtins.go.
 const notUsableInfo = "Not usable; exposed only for compatibility with PostgreSQL."
 
-func generateFunctions(from map[string][]tree.Builtin, categorize bool) []byte {
+func generateFunctions(from []string, categorize bool) []byte {
 	functions := make(map[string][]string)
 	seen := make(map[string]struct{})
 	md := markdown.New(markdown.XHTMLOutput(true), markdown.Nofollow(true))
-	for name, fns := range from {
-		// NB: funcs can appear more than once i.e. upper/lowercase varients for
+	for _, name := range from {
+		// NB: funcs can appear more than once i.e. upper/lowercase variants for
 		// faster lookups, so normalize to lowercase and de-dupe using a set.
 		name = strings.ToLower(name)
 		if _, ok := seen[name]; ok {
 			continue
 		}
 		seen[name] = struct{}{}
+		props, fns := builtins.GetBuiltinProperties(name)
+		if props.Private {
+			continue
+		}
 		for _, fn := range fns {
 			if fn.Info == notUsableInfo {
 				continue
 			}
-			if categorize && fn.WindowFunc != nil {
+			// We generate docs for both aggregates and window functions in separate
+			// files, so we want to omit them when processing all builtins.
+			if categorize && (props.Class == tree.AggregateClass || props.Class == tree.WindowClass) {
 				continue
 			}
 			args := fn.Types.String()
-			ret := fn.FixedReturnType().String()
-			cat := ret
-			if c := fn.Category; c != "" {
-				cat = c
+
+			retType := fn.FixedReturnType()
+			ret := retType.String()
+
+			cat := props.Category
+			if cat == "" {
+				cat = strings.ToUpper(ret)
 			}
 			if !categorize {
 				cat = ""
@@ -200,7 +215,7 @@ func generateFunctions(from map[string][]tree.Builtin, categorize bool) []byte {
 				info := md.RenderToString([]byte(fn.Info))
 				extra = fmt.Sprintf("<span class=\"funcdesc\">%s</span>", info)
 			}
-			s := fmt.Sprintf("<tr><td><code>%s(%s) &rarr; %s</code></td><td>%s</td></tr>", name, linkArguments(args), linkArguments(ret), extra)
+			s := fmt.Sprintf("<tr><td><a name=\"%s\"></a><code>%s(%s) &rarr; %s</code></td><td>%s</td></tr>", name, name, linkArguments(args), linkArguments(ret), extra)
 			functions[cat] = append(functions[cat], s)
 		}
 	}
@@ -222,7 +237,7 @@ func generateFunctions(from map[string][]tree.Builtin, categorize bool) []byte {
 	b := new(bytes.Buffer)
 	for _, cat := range cats {
 		if categorize {
-			fmt.Fprintf(b, "### %s Functions\n\n", cat)
+			fmt.Fprintf(b, "### %s functions\n\n", cat)
 		}
 		b.WriteString("<table>\n<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>\n")
 		b.WriteString("<tbody>\n")
@@ -248,12 +263,14 @@ func linkArguments(t string) string {
 
 func linkTypeName(s string) string {
 	s = strings.TrimSuffix(s, "{}")
+	s = strings.TrimSuffix(s, "{*}")
 	name := s
 	switch s {
 	case "timestamptz":
 		s = "timestamp"
 	}
 	s = strings.TrimSuffix(s, "[]")
+	s = strings.TrimSuffix(s, "*")
 	switch s {
 	case "int", "decimal", "float", "bool", "date", "timestamp", "interval", "string", "bytes",
 		"inet", "uuid", "collatedstring", "time":

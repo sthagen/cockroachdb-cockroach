@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -22,21 +18,39 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/pkg/errors"
 )
 
 func makeTestPlanner() *planner {
-	return makeInternalPlanner("test", nil /* txn */, security.RootUser, &MemoryMetrics{})
+	// Initialize an Executorconfig sufficiently for the purposes of creating a
+	// planner.
+	var nodeID base.NodeIDContainer
+	nodeID.Set(context.TODO(), 1)
+	execCfg := ExecutorConfig{
+		NodeInfo: NodeInfo{
+			NodeID: &nodeID,
+			ClusterID: func() uuid.UUID {
+				return uuid.MakeV4()
+			},
+		},
+	}
+
+	// TODO(andrei): pass the cleanup along to the caller.
+	p, _ /* cleanup */ := newInternalPlanner(
+		"test", nil /* txn */, security.RootUser, &MemoryMetrics{}, &execCfg,
+	)
+	return p
 }
 
 func TestValues(t *testing.T) {
@@ -52,23 +66,29 @@ func TestValues(t *testing.T) {
 	unsupp := &tree.RangeCond{}
 
 	intVal := func(v int64) *tree.NumVal {
-		return &tree.NumVal{Value: constant.MakeInt64(v)}
+		return tree.NewNumVal(
+			constant.MakeInt64(v),
+			"", /* origString */
+			false /* negative */)
 	}
 	floatVal := func(f float64) *tree.CastExpr {
 		return &tree.CastExpr{
-			Expr: &tree.NumVal{Value: constant.MakeFloat64(f)},
-			Type: &coltypes.TFloat{},
+			Expr: tree.NewNumVal(
+				constant.MakeFloat64(f),
+				"", /* origString */
+				false /* negative */),
+			Type: types.Float,
 		}
 	}
 	asRow := func(datums ...tree.Datum) []tree.Datums {
 		return []tree.Datums{datums}
 	}
 
-	makeValues := func(tuples ...*tree.Tuple) *tree.ValuesClause {
-		return &tree.ValuesClause{Tuples: tuples}
+	makeValues := func(tuples ...tree.Exprs) *tree.ValuesClause {
+		return &tree.ValuesClause{Rows: tuples}
 	}
-	makeTuple := func(exprs ...tree.Expr) *tree.Tuple {
-		return &tree.Tuple{Exprs: exprs}
+	makeTuple := func(exprs ...tree.Expr) tree.Exprs {
+		return tree.Exprs(exprs)
 	}
 
 	testCases := []struct {
@@ -133,12 +153,8 @@ func TestValues(t *testing.T) {
 			if plan == nil {
 				return
 			}
-			plan, err = p.optimizePlan(ctx, plan, allColumns(plan))
-			if err != nil {
-				t.Fatalf("%d: unexpected error in optimizePlan: %v", i, err)
-			}
-			params := runParams{ctx: ctx, p: p, evalCtx: &p.evalCtx}
-			if err := startPlan(params, plan); err != nil {
+			params := runParams{ctx: ctx, p: p, extendedEvalCtx: &p.extendedEvalCtx}
+			if err := startExec(params, plan); err != nil {
 				t.Fatalf("%d: unexpected error in Start: %v", i, err)
 			}
 			var rows []tree.Datums
@@ -162,6 +178,7 @@ type stringAlias string
 
 func TestGolangQueryArgs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
 	// Each test case pairs an arbitrary value and tree.Datum which has the same
 	// type
 	testCases := []struct {
@@ -169,7 +186,7 @@ func TestGolangQueryArgs(t *testing.T) {
 		expectedType reflect.Type
 	}{
 		// Null type.
-		{nil, reflect.TypeOf(types.Null)},
+		{nil, reflect.TypeOf(types.Unknown)},
 
 		// Bool type.
 		{true, reflect.TypeOf(types.Bool)},
@@ -213,17 +230,18 @@ func TestGolangQueryArgs(t *testing.T) {
 		// Byte slice aliases.
 		{roachpb.Key("key"), reflect.TypeOf(types.Bytes)},
 		{roachpb.RKey("key"), reflect.TypeOf(types.Bytes)},
+
+		// Bit array.
+		{bitarray.MakeBitArrayFromInt64(8, 58, 7), reflect.TypeOf(types.VarBit)},
 	}
 
-	pinfo := &tree.PlaceholderInfo{}
 	for i, tcase := range testCases {
-		golangFillQueryArguments(pinfo, []interface{}{tcase.value})
-		output, valid := pinfo.Type("1", false)
-		if !valid {
-			t.Errorf("case %d failed: argument was invalid", i)
-			continue
+		datums := golangFillQueryArguments(tcase.value)
+		if len(datums) != 1 {
+			t.Fatalf("epected 1 datum, got: %d", len(datums))
 		}
-		if a, e := reflect.TypeOf(output), tcase.expectedType; a != e {
+		d := datums[0]
+		if a, e := reflect.TypeOf(d.ResolvedType()), tcase.expectedType; a != e {
 			t.Errorf("case %d failed: expected type %s, got %s", i, e.String(), a.String())
 		}
 	}

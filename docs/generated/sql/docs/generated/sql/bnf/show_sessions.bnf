@@ -1,4 +1,0 @@
-show_sessions_stmt ::=
-	'SHOW' 'SESSIONS'
-	| 'SHOW' 'CLUSTER' 'SESSIONS'
-	| 'SHOW' 'LOCAL' 'SESSIONS'

@@ -1,3 +1,13 @@
+// Copyright 2019 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 "use strict";
 
 const path = require("path");
@@ -13,8 +23,10 @@ module.exports = {
     vendor: prodDependencies,
   },
 
+  mode: "none",
+
   output: {
-    filename: "vendor.dll.js",
+    filename: "vendor.oss.dll.js",
     path: path.resolve(__dirname, "dist"),
     library: "[name]_[hash]",
   },
@@ -40,7 +52,14 @@ module.exports = {
   plugins: [
     new webpack.DllPlugin({
       name: "[name]_[hash]",
-      path: path.resolve(__dirname, "vendor-manifest.json"),
+      path: path.resolve(__dirname, "vendor.oss.manifest.json"),
     }),
   ],
+
+  // Max size of is set to 4Mb to disable warning message and control
+  // the growing size of bundle over time.
+  performance: {
+    maxEntrypointSize: 4000000,
+    maxAssetSize: 4000000,
+  },
 };

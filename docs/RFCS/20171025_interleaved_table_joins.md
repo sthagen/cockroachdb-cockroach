@@ -207,7 +207,7 @@ As for how each phase of this feature affects the codebase:
       (scoped to the relevant key span if there is a filter on the primary
       key). It can be configured with the `TableDescriptor`s and
       `IndexDescriptor`s of the parent and child table such that it can perform
-      a single-pass scan of the two tables with `MultiRowFetcher`.  See [\[1\]
+      a single-pass scan of the two tables with `RowFetcher`.  See [\[1\]
       Scanning the interleaved
       hierarchy](#1-scanning-the-interleaved-hierarchy) for discussion on why
       this is the case.
@@ -368,7 +368,7 @@ emit multiple interleaved tables in one scan or to support [multi-table
 joins](#4-multi-table-joins)).
 
 The refactor necessary is as follows:
-- A new `MultiRowFetcher` that produces rows from any of the `N` tables
+- A new `RowFetcher` that produces rows from any of the `N` tables
   (identified as unique `TableDescriptor`-`IndexDescriptor` pairs)
 - `NextRow` will need to be able to return a `RowResponse` with the
   `EncDatumRow` as well as the row's `TableDescriptor` and `IndexDescriptor`.
@@ -383,11 +383,11 @@ The refactor necessary is as follows:
     proceed to decode each index key, we compute the equivalence signature
     and check if it corresponds to any of the tables.
 - Instead of trying to refactor `RowFetcher` and introducing additional
-  overhead, it is prudent to separately implement this `MultiRowFetcher`. We
-  can eventually merge `RowFetcher` into `MultiRowFetcher` after it is
+  overhead, it is prudent to separately implement this `RowFetcher`. We
+  can eventually merge `RowFetcher` into `RowFetcher` after it is
   determined the overhead is marginal for the 1 table case.
 
-The [outstanding PR for `MultiRowFetcher`](https://github.com/cockroachdb/cockroach/pull/19228)
+The [outstanding PR for `RowFetcher`](https://github.com/cockroachdb/cockroach/pull/19228)
 has the full implementation details.
 
 #### Joining component
@@ -476,7 +476,7 @@ for the `left` and `right` `scanNode`s and invoking `MergePlans`. Instead, the
 descriptors on the `scanNode`s  will be used to construct the
 `InterleaveReaderJoiner` processor.
 We pass down `TableDescriptor`s, `IndexDescriptor`s and any other arguments
-our `MultiRowFetcher` requires to perform a single-pass read for the two tables.
+our `RowFetcher` requires to perform a single-pass read for the two tables.
 
 The final physical plan for a three-node cluster looks something like
 
@@ -485,8 +485,8 @@ The final physical plan for a three-node cluster looks something like
 First the union of the spans from the two `scanNode`s (by invoking
 [`MergeSpans`](https://github.com/cockroachdb/cockroach/blob/master/pkg/roachpb/merge_spans.go#L42))
 are passed into
-[`partitionSpans`](https://github.com/cockroachdb/cockroach/blob/62b7495302a8e06b4be3780e349d10d31e378bd7/pkg/sql/distsql_physical_planner.go#L488).
-This will return a slice of `spanPartitions` of length `n`, which corresponds
+[`PartitionSpans`](https://github.com/cockroachdb/cockroach/blob/62b7495302a8e06b4be3780e349d10d31e378bd7/pkg/sql/distsql_physical_planner.go#L488).
+This will return a slice of `SpanPartition`s of length `n`, which corresponds
 to the number of data nodes.  We will eventually spawn `n`
 `InterleaveReaderJoiner`s, one for each node (`n = 3` in the diagram above).
 Side note: any scan over an interleaved index will always [default to
@@ -508,7 +508,7 @@ To do this, we need to figure out the cumulative. That is for a given `child` ke
 where the number of segments (`/.../`) for `<parent-interleave-prefix>` (i.e.
 number of columns in the prefix) is `shared_prefix_len` in the child table's
 `InterleaveDescriptor`.
-For example, if we wanted to fix this span (generated from `partitionSpans`)
+For example, if we wanted to fix this span (generated from `PartitionSpans`)
 (`#` is the `<interleave sentinel>`)
 ```
 StartKey: /parent/1/2/#/child/2
@@ -573,7 +573,7 @@ ancestor joins.
 
 After discussions with @jordanlewis who has been working with indexes of interleaved
 parent and child tables, a couple of key points were brought up that will dictate
-how we do the reading component of `InterleaveReaderJoiner` (and `MultiRowFetcher`):
+how we do the reading component of `InterleaveReaderJoiner` (and `RowFetcher`):
 1. Currently, one cannot selectively scan all parent rows without scanning
    interleaved (grand-)\*children. Similarly, one cannot selectively scan
    all the child rows without scanning its (grand-)\*parents and
@@ -759,7 +759,7 @@ for the parent table is ordered, two 2-pass approaches using a merge-join
 pattern e-merges here:
 
   TODO(richardwu): From my understanding, if one does not know the exact
-  `/pk1/pk2` start and end keys (i.e. one can't tell RowFetcher/kvFetcher to scan
+  `/pk1/pk2` start and end keys (i.e. one can't tell RowFetcher/kvBatchFetcher to scan
   the first, second, etc. /pk1/pk2/ range), then one would have to scan the
   entire hierarchy. The bases for the following approaches revolve around the
   fact that we can't do separate scans for each unique `(pk1, pk2)` prefix.
@@ -897,7 +897,7 @@ permits multiple input streams).
 
 #### Reading component
 
-`InterleaveReader` also requires reading from `MultiRowFetcher` and piping the
+`InterleaveReader` also requires reading from `RowFetcher` and piping the
 rows to each of its streams. Since `InterleaveReader` "owns" its `N` output
 streams (rather than letting some `Router` message-broker direct the output), a
 similar buffer logic will be [required to prevent

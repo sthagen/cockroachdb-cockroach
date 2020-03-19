@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -30,8 +26,6 @@ var noColumns = make(sqlbase.ResultColumns, 0)
 // The returned slice is *not* mutable. To modify the result column
 // set, implement a separate recursion (e.g. needed_columns.go) or use
 // planMutableColumns defined below.
-//
-// Available after newPlan().
 func planColumns(plan planNode) sqlbase.ResultColumns {
 	return getPlanColumns(plan, false)
 }
@@ -49,14 +43,10 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 	switch n := plan.(type) {
 
 	// Nodes that define their own schema.
-	case *copyNode:
-		return n.resultColumns
 	case *delayedNode:
 		return n.columns
 	case *groupNode:
 		return n.columns
-	case *hookFnNode:
-		return n.header
 	case *joinNode:
 		return n.columns
 	case *ordinalityNode:
@@ -65,60 +55,99 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return n.columns
 	case *scanNode:
 		return n.resultColumns
-	case *sortNode:
-		return n.columns
-	case *valueGenerator:
+	case *unionNode:
 		return n.columns
 	case *valuesNode:
+		return n.columns
+	case *virtualTableNode:
 		return n.columns
 	case *explainPlanNode:
 		return n.run.results.columns
 	case *windowNode:
-		return n.run.values.columns
+		return n.columns
 	case *showTraceNode:
 		return n.columns
-
-		// Nodes with a fixed schema.
-	case *scrubNode:
-		return n.getColumns(mut, scrubColumns)
-	case *explainDistSQLNode:
-		return n.getColumns(mut, explainDistSQLColumns)
-	case *testingRelocateNode:
-		return n.getColumns(mut, relocateNodeColumns)
-	case *scatterNode:
-		return n.getColumns(mut, scatterNodeColumns)
-	case *showZoneConfigNode:
-		return n.getColumns(mut, showZoneConfigNodeColumns)
-	case *showRangesNode:
-		return n.getColumns(mut, showRangesColumns)
-	case *showFingerprintsNode:
-		return n.getColumns(mut, showFingerprintsColumns)
-	case *splitNode:
-		return n.getColumns(mut, splitNodeColumns)
-
-	// Nodes using the RETURNING helper.
+	case *zeroNode:
+		return n.columns
 	case *deleteNode:
-		return n.rh.columns
-	case *insertNode:
-		return n.rh.columns
+		return n.columns
 	case *updateNode:
-		return n.rh.columns
+		return n.columns
+	case *insertNode:
+		return n.columns
+	case *insertFastPathNode:
+		return n.columns
+	case *upsertNode:
+		return n.columns
+	case *indexJoinNode:
+		return n.resultColumns
+	case *projectSetNode:
+		return n.columns
+	case *applyJoinNode:
+		return n.columns
+	case *lookupJoinNode:
+		return n.columns
+	case *zigzagJoinNode:
+		return n.columns
+
+	// Nodes with a fixed schema.
+	case *scrubNode:
+		return n.getColumns(mut, sqlbase.ScrubColumns)
+	case *explainDistSQLNode:
+		return n.getColumns(mut, sqlbase.ExplainDistSQLColumns)
+	case *explainVecNode:
+		return n.getColumns(mut, sqlbase.ExplainVecColumns)
+	case *relocateNode:
+		return n.getColumns(mut, sqlbase.AlterTableRelocateColumns)
+	case *scatterNode:
+		return n.getColumns(mut, sqlbase.AlterTableScatterColumns)
+	case *showFingerprintsNode:
+		return n.getColumns(mut, sqlbase.ShowFingerprintsColumns)
+	case *splitNode:
+		return n.getColumns(mut, sqlbase.AlterTableSplitColumns)
+	case *unsplitNode:
+		return n.getColumns(mut, sqlbase.AlterTableUnsplitColumns)
+	case *unsplitAllNode:
+		return n.getColumns(mut, sqlbase.AlterTableUnsplitColumns)
+	case *showTraceReplicaNode:
+		return n.getColumns(mut, sqlbase.ShowReplicaTraceColumns)
+	case *sequenceSelectNode:
+		return n.getColumns(mut, sqlbase.SequenceSelectColumns)
+	case *exportNode:
+		return n.getColumns(mut, sqlbase.ExportColumns)
+
+	// The columns in the hookFnNode are returned by the hook function; we don't
+	// know if they can be modified in place or not.
+	case *hookFnNode:
+		return n.getColumns(mut, n.header)
 
 	// Nodes that have the same schema as their source or their
 	// valueNode helper.
+	case *bufferNode:
+		return getPlanColumns(n.plan, mut)
 	case *distinctNode:
 		return getPlanColumns(n.plan, mut)
 	case *filterNode:
 		return getPlanColumns(n.source.plan, mut)
-	case *indexJoinNode:
-		return getPlanColumns(n.table, mut)
+	case *max1RowNode:
+		return getPlanColumns(n.plan, mut)
 	case *limitNode:
 		return getPlanColumns(n.plan, mut)
-	case *unionNode:
-		if n.inverted {
-			return getPlanColumns(n.right, mut)
-		}
-		return getPlanColumns(n.left, mut)
+	case *spoolNode:
+		return getPlanColumns(n.source, mut)
+	case *serializeNode:
+		return getPlanColumns(n.source, mut)
+	case *saveTableNode:
+		return getPlanColumns(n.source, mut)
+	case *scanBufferNode:
+		return getPlanColumns(n.buffer, mut)
+	case *sortNode:
+		return getPlanColumns(n.plan, mut)
+	case *recursiveCTENode:
+		return getPlanColumns(n.initial, mut)
+
+	case *rowSourceToPlanNode:
+		return n.planCols
 	}
 
 	// Every other node has no columns in their results.

@@ -1,0 +1,450 @@
+exec-ddl
+CREATE TABLE a (x INT PRIMARY KEY, y INT)
+----
+
+exec-ddl
+CREATE TABLE b (x STRING PRIMARY KEY, z DECIMAL NOT NULL)
+----
+
+exec-ddl
+CREATE TABLE unusual (x INT PRIMARY KEY, arr INT[])
+----
+
+# Variable
+build
+SELECT a.x FROM a
+----
+project
+ ├── columns: x:1(int!null)
+ └── scan a
+      └── columns: x:1(int!null) y:2(int)
+
+# Const
+build
+SELECT 1 AS a, TRUE AS b, FALSE AS c, NULL AS d
+----
+project
+ ├── columns: a:1(int!null) b:2(bool!null) c:3(bool!null) d:4(unknown)
+ ├── values
+ │    └── () [type=tuple]
+ └── projections
+      ├── 1 [as=a:1, type=int]
+      ├── true [as=b:2, type=bool]
+      ├── false [as=c:3, type=bool]
+      └── NULL [as=d:4, type=unknown]
+
+# Placeholder
+build
+SELECT * FROM a WHERE x = $1
+----
+select
+ ├── columns: x:1(int!null) y:2(int)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── filters
+      └── x:1 = $1 [type=bool]
+
+# Tuple, Projections
+build
+SELECT (a.x, 1.5) AS r, a.y FROM a
+----
+project
+ ├── columns: r:3(tuple{int, decimal}!null) y:2(int)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── projections
+      └── (x:1, 1.5) [as=r:3, type=tuple{int, decimal}]
+
+# And, Or, Not
+build
+SELECT * FROM a WHERE a.x = 1 AND NOT (a.y = 2 OR a.y = 3.5)
+----
+select
+ ├── columns: x:1(int!null) y:2(int)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── filters
+      └── (x:1 = 1) AND (NOT ((y:2 = 2) OR (y:2 = 3.5))) [type=bool]
+
+# Eq, Ne
+build
+SELECT * FROM a WHERE a.x = 1 AND a.x <> 2
+----
+select
+ ├── columns: x:1(int!null) y:2(int)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── filters
+      └── (x:1 = 1) AND (x:1 != 2) [type=bool]
+
+# Le, Ge, Lt, Gt
+build
+SELECT * FROM a WHERE a.x >= 1 AND a.x <= 10 AND a.y > 1 AND a.y < 10
+----
+select
+ ├── columns: x:1(int!null) y:2(int!null)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── filters
+      └── (((x:1 >= 1) AND (x:1 <= 10)) AND (y:2 > 1)) AND (y:2 < 10) [type=bool]
+
+# In, NotIn
+build
+SELECT * FROM a WHERE a.x IN (1, 2) AND a.y NOT IN (3, 4)
+----
+select
+ ├── columns: x:1(int!null) y:2(int)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── filters
+      └── (x:1 IN (1, 2)) AND (y:2 NOT IN (3, 4)) [type=bool]
+
+# Like, NotLike
+build
+SELECT * FROM b WHERE b.x LIKE '%foo%' AND b.x NOT LIKE '%bar%'
+----
+select
+ ├── columns: x:1(string!null) z:2(decimal!null)
+ ├── scan b
+ │    └── columns: x:1(string!null) z:2(decimal!null)
+ └── filters
+      └── (x:1 LIKE '%foo%') AND (x:1 NOT LIKE '%bar%') [type=bool]
+
+# ILike, INotLike
+build
+SELECT * FROM b WHERE b.x ILIKE '%foo%' AND b.x NOT ILIKE '%bar%'
+----
+select
+ ├── columns: x:1(string!null) z:2(decimal!null)
+ ├── scan b
+ │    └── columns: x:1(string!null) z:2(decimal!null)
+ └── filters
+      └── (x:1 ILIKE '%foo%') AND (x:1 NOT ILIKE '%bar%') [type=bool]
+
+# RegMatch, NotRegMatch, RegIMatch, NotRegIMatch
+build
+SELECT * FROM b WHERE b.x ~ 'foo' AND b.x !~ 'bar' AND b.x ~* 'foo' AND b.x !~* 'bar'
+----
+select
+ ├── columns: x:1(string!null) z:2(decimal!null)
+ ├── scan b
+ │    └── columns: x:1(string!null) z:2(decimal!null)
+ └── filters
+      └── (((x:1 ~ 'foo') AND (x:1 !~ 'bar')) AND (x:1 ~* 'foo')) AND (x:1 !~* 'bar') [type=bool]
+
+# Is, IsNot
+build
+SELECT * FROM a WHERE a.x IS DISTINCT FROM a.y AND a.x IS NULL
+----
+select
+ ├── columns: x:1(int!null) y:2(int)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── filters
+      └── (x:1 IS DISTINCT FROM y:2) AND (x:1 IS NULL) [type=bool]
+
+# Bitand, Bitor, Bitxor
+build
+SELECT a.x & a.y AS r, a.x | a.y AS s, a.x # a.y AS t FROM a
+----
+project
+ ├── columns: r:3(int) s:4(int) t:5(int)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── projections
+      ├── x:1 & y:2 [as=r:3, type=int]
+      ├── x:1 | y:2 [as=s:4, type=int]
+      └── x:1 # y:2 [as=t:5, type=int]
+
+# Plus, Minus, Mult, Div, FloorDiv
+build
+SELECT a.x + 1.5 AS r,
+       DATE '2000-01-01' - 15 AS s,
+       10.10 * a.x AS t,
+       1 / a.y AS u,
+       a.x // 1.5 AS v
+  FROM a
+----
+project
+ ├── columns: r:3(decimal!null) s:4(date!null) t:5(decimal!null) u:6(decimal) v:7(decimal!null)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── projections
+      ├── x:1 + 1.5 [as=r:3, type=decimal]
+      ├── '2000-01-01' - 15 [as=s:4, type=date]
+      ├── 10.10 * x:1 [as=t:5, type=decimal]
+      ├── 1 / y:2 [as=u:6, type=decimal]
+      └── x:1 // 1.5 [as=v:7, type=decimal]
+
+# Mod, Pow, LShift, RShift
+build
+SELECT 100.1 % a.x AS r,
+       a.x ^ 2.5 AS s,
+       a.x << 3 AS t,
+       a.y >> 2 AS u
+  FROM a
+----
+project
+ ├── columns: r:3(decimal!null) s:4(decimal!null) t:5(int!null) u:6(int)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── projections
+      ├── 100.1 % x:1 [as=r:3, type=decimal]
+      ├── x:1 ^ 2.5 [as=s:4, type=decimal]
+      ├── x:1 << 3 [as=t:5, type=int]
+      └── y:2 >> 2 [as=u:6, type=int]
+
+# FetchVal, FetchText, FetchValPath, FetchTextPath
+build
+SELECT '[1, 2]'->1 AS r,
+       '[1, 2]'->>1 AS s,
+       '{"a": 5}'#>ARRAY['a'] AS t,
+       '{"a": 5}'#>>ARRAY['a'] AS u
+  FROM a
+----
+project
+ ├── columns: r:3(jsonb) s:4(string) t:5(jsonb) u:6(string)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── projections
+      ├── '[1, 2]'->1 [as=r:3, type=jsonb]
+      ├── '[1, 2]'->>1 [as=s:4, type=string]
+      ├── '{"a": 5}'#>ARRAY['a'] [as=t:5, type=jsonb]
+      └── '{"a": 5}'#>>ARRAY['a'] [as=u:6, type=string]
+
+# Concat
+build
+SELECT b.x || 'more' AS r FROM b
+----
+project
+ ├── columns: r:3(string!null)
+ ├── scan b
+ │    └── columns: x:1(string!null) z:2(decimal!null)
+ └── projections
+      └── x:1 || 'more' [as=r:3, type=string]
+
+# UnaryMinus, UnaryComplement
+build
+SELECT -a.y AS r, ~a.x AS s FROM a
+----
+project
+ ├── columns: r:3(int) s:4(int)
+ ├── scan a
+ │    └── columns: x:1(int!null) y:2(int)
+ └── projections
+      ├── -y:2 [as=r:3, type=int]
+      └── ~x:1 [as=s:4, type=int]
+
+# Array Concat
+build
+SELECT arr || arr AS r, arr || NULL AS s, NULL || arr AS t FROM unusual
+----
+project
+ ├── columns: r:3(int[]) s:4(int[]) t:5(int[])
+ ├── scan unusual
+ │    └── columns: x:1(int!null) arr:2(int[])
+ └── projections
+      ├── arr:2 || arr:2 [as=r:3, type=int[]]
+      ├── arr:2 || NULL::INT8[] [as=s:4, type=int[]]
+      └── NULL::INT8[] || arr:2 [as=t:5, type=int[]]
+
+# Array Element Concat
+build
+SELECT x || arr AS r, arr || x AS s, x || NULL AS t, NULL || x AS u FROM unusual
+----
+project
+ ├── columns: r:3(int[]) s:4(int[]) t:5(int[]) u:6(int[])
+ ├── scan unusual
+ │    └── columns: x:1(int!null) arr:2(int[])
+ └── projections
+      ├── x:1 || arr:2 [as=r:3, type=int[]]
+      ├── arr:2 || x:1 [as=s:4, type=int[]]
+      ├── x:1 || NULL::INT8[] [as=t:5, type=int[]]
+      └── NULL::INT8[] || x:1 [as=u:6, type=int[]]
+
+# Function with fixed return type.
+build
+SELECT length('text')
+----
+project
+ ├── columns: length:1(int)
+ ├── values
+ │    └── () [type=tuple]
+ └── projections
+      └── length('text') [as=length:1, type=int]
+
+# Function with return type dependent on arg types.
+build
+SELECT div(1.0, 2.0)
+----
+project
+ ├── columns: div:1(decimal)
+ ├── values
+ │    └── () [type=tuple]
+ └── projections
+      └── div(1.0, 2.0) [as=div:1, type=decimal]
+
+# Function with same arguments in multiple overloads.
+build
+SELECT now()
+----
+project
+ ├── columns: now:1(timestamptz)
+ ├── values
+ │    └── () [type=tuple]
+ └── projections
+      └── now() [as=now:1, type=timestamptz]
+
+# Variadic function.
+build
+SELECT greatest(1, 2, 3, 4)
+----
+project
+ ├── columns: greatest:1(int)
+ ├── values
+ │    └── () [type=tuple]
+ └── projections
+      └── greatest(1, 2, 3, 4) [as=greatest:1, type=int]
+
+# Aggregate functions.
+build
+SELECT
+    array_agg(z), avg(z), bool_and(z=0), bool_or(z=0), concat_agg(x), count(z),
+    count(*), max(x), max(z), sum_int(x::int), sum(z), sqrdiff(z), variance(x::int),
+    stddev(z), xor_agg(x::int), json_agg(x::json), jsonb_agg(x::jsonb)
+FROM b
+----
+scalar-group-by
+ ├── columns: array_agg:3(decimal[]) avg:4(decimal) bool_and:6(bool) bool_or:7(bool) concat_agg:8(string) count:9(int!null) count:10(int!null) max:11(string) max:12(decimal) sum_int:14(int) sum:15(decimal) sqrdiff:16(decimal) variance:17(decimal) stddev:18(decimal) xor_agg:19(int) json_agg:21(jsonb) jsonb_agg:22(jsonb)
+ ├── project
+ │    ├── columns: column5:5(bool!null) column13:13(int!null) column20:20(jsonb!null) x:1(string!null) z:2(decimal!null)
+ │    ├── scan b
+ │    │    └── columns: x:1(string!null) z:2(decimal!null)
+ │    └── projections
+ │         ├── z:2 = 0 [as=column5:5, type=bool]
+ │         ├── x:1::INT8 [as=column13:13, type=int]
+ │         └── x:1::JSONB [as=column20:20, type=jsonb]
+ └── aggregations
+      ├── array-agg [as=array_agg:3, type=decimal[]]
+      │    └── z:2 [type=decimal]
+      ├── avg [as=avg:4, type=decimal]
+      │    └── z:2 [type=decimal]
+      ├── bool-and [as=bool_and:6, type=bool]
+      │    └── column5:5 [type=bool]
+      ├── bool-or [as=bool_or:7, type=bool]
+      │    └── column5:5 [type=bool]
+      ├── concat-agg [as=concat_agg:8, type=string]
+      │    └── x:1 [type=string]
+      ├── count [as=count:9, type=int]
+      │    └── z:2 [type=decimal]
+      ├── count-rows [as=count_rows:10, type=int]
+      ├── max [as=max:11, type=string]
+      │    └── x:1 [type=string]
+      ├── max [as=max:12, type=decimal]
+      │    └── z:2 [type=decimal]
+      ├── sum-int [as=sum_int:14, type=int]
+      │    └── column13:13 [type=int]
+      ├── sum [as=sum:15, type=decimal]
+      │    └── z:2 [type=decimal]
+      ├── sqr-diff [as=sqrdiff:16, type=decimal]
+      │    └── z:2 [type=decimal]
+      ├── variance [as=variance:17, type=decimal]
+      │    └── column13:13 [type=int]
+      ├── std-dev [as=stddev:18, type=decimal]
+      │    └── z:2 [type=decimal]
+      ├── xor-agg [as=xor_agg:19, type=int]
+      │    └── column13:13 [type=int]
+      ├── json-agg [as=json_agg:21, type=jsonb]
+      │    └── column20:20 [type=jsonb]
+      └── jsonb-agg [as=jsonb_agg:22, type=jsonb]
+           └── column20:20 [type=jsonb]
+
+# ConstAgg internal aggregate function.
+opt
+SELECT * FROM (SELECT x, x::string, y FROM a) WHERE (SELECT max(x) FROM b WHERE y=z::int) > 'foo'
+----
+project
+ ├── columns: x:1(int!null) x:3(string!null) y:2(int!null)
+ ├── select
+ │    ├── columns: a.x:1(int!null) y:2(int!null) max:6(string!null)
+ │    ├── group-by
+ │    │    ├── columns: a.x:1(int!null) y:2(int!null) max:6(string!null)
+ │    │    ├── grouping columns: a.x:1(int!null)
+ │    │    ├── inner-join (hash)
+ │    │    │    ├── columns: a.x:1(int!null) y:2(int!null) b.x:4(string!null) column7:7(int!null)
+ │    │    │    ├── scan a
+ │    │    │    │    └── columns: a.x:1(int!null) y:2(int)
+ │    │    │    ├── project
+ │    │    │    │    ├── columns: column7:7(int!null) b.x:4(string!null)
+ │    │    │    │    ├── scan b
+ │    │    │    │    │    └── columns: b.x:4(string!null) z:5(decimal!null)
+ │    │    │    │    └── projections
+ │    │    │    │         └── z:5::INT8 [as=column7:7, type=int]
+ │    │    │    └── filters
+ │    │    │         └── y:2 = column7:7 [type=bool]
+ │    │    └── aggregations
+ │    │         ├── max [as=max:6, type=string]
+ │    │         │    └── b.x:4 [type=string]
+ │    │         └── const-agg [as=y:2, type=int]
+ │    │              └── y:2 [type=int]
+ │    └── filters
+ │         └── max:6 > 'foo' [type=bool]
+ └── projections
+      └── a.x:1::STRING [as=x:3, type=string]
+
+# ConstNotNullAgg internal aggregate function.
+opt
+SELECT EXISTS(SELECT * FROM a WHERE expr<0) FROM (SELECT x+1 AS expr FROM a)
+----
+project
+ ├── columns: exists:6(bool!null)
+ ├── group-by
+ │    ├── columns: true_agg:8(bool) rownum:10(int!null)
+ │    ├── grouping columns: rownum:10(int!null)
+ │    ├── left-join (cross)
+ │    │    ├── columns: expr:3(int!null) true:7(bool) rownum:10(int!null)
+ │    │    ├── ordinality
+ │    │    │    ├── columns: expr:3(int!null) rownum:10(int!null)
+ │    │    │    └── project
+ │    │    │         ├── columns: expr:3(int!null)
+ │    │    │         ├── scan a
+ │    │    │         │    └── columns: x:1(int!null)
+ │    │    │         └── projections
+ │    │    │              └── x:1 + 1 [as=expr:3, type=int]
+ │    │    ├── project
+ │    │    │    ├── columns: true:7(bool!null)
+ │    │    │    ├── scan a
+ │    │    │    └── projections
+ │    │    │         └── true [as=true:7, type=bool]
+ │    │    └── filters
+ │    │         └── expr:3 < 0 [type=bool]
+ │    └── aggregations
+ │         └── const-not-null-agg [as=true_agg:8, type=bool]
+ │              └── true:7 [type=bool]
+ └── projections
+      └── true_agg:8 IS NOT NULL [as=exists:6, type=bool]
+
+# Cast
+build
+SELECT x::VARCHAR(2) FROM b
+----
+project
+ ├── columns: x:3(varchar!null)
+ ├── scan b
+ │    └── columns: b.x:1(string!null) z:2(decimal!null)
+ └── projections
+      └── b.x:1::VARCHAR(2) [as=x:3, type=varchar]
+
+# Cast same type with different precisions.
+# See #42571.
+build
+SELECT z::decimal(10, 3), z::decimal(10, 1), z::decimal(10, 4) FROM b
+----
+project
+ ├── columns: z:3(decimal!null) z:4(decimal!null) z:5(decimal!null)
+ ├── scan b
+ │    └── columns: x:1(string!null) b.z:2(decimal!null)
+ └── projections
+      ├── b.z:2::DECIMAL(10,3) [as=z:3, type=decimal]
+      ├── b.z:2::DECIMAL(10,1) [as=z:4, type=decimal]
+      └── b.z:2::DECIMAL(10,4) [as=z:5, type=decimal]

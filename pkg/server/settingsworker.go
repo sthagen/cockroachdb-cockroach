@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -21,8 +17,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
@@ -34,7 +32,7 @@ func (s *Server) refreshSettings() {
 
 	a := &sqlbase.DatumAlloc{}
 	settingsTablePrefix := keys.MakeTablePrefix(uint32(tbl.ID))
-	colIdxMap := sqlbase.ColIDtoRowIndexFromCols(tbl.Columns)
+	colIdxMap := row.ColIDtoRowIndexFromCols(tbl.Columns)
 
 	processKV := func(ctx context.Context, kv roachpb.KeyValue, u settings.Updater) error {
 		if !bytes.HasPrefix(kv.Key, settingsTablePrefix) {
@@ -44,9 +42,9 @@ func (s *Server) refreshSettings() {
 		var k, v, t string
 		// First we need to decode the setting name field from the index key.
 		{
-			types := []sqlbase.ColumnType{tbl.Columns[0].Type}
+			types := []types.T{tbl.Columns[0].Type}
 			nameRow := make([]sqlbase.EncDatum, 1)
-			_, matches, err := sqlbase.DecodeIndexKey(tbl, &tbl.PrimaryIndex, types, nameRow, nil, kv.Key)
+			_, matches, _, err := sqlbase.DecodeIndexKey(tbl, &tbl.PrimaryIndex, types, nameRow, nil, kv.Key)
 			if err != nil {
 				return errors.Wrap(err, "failed to decode key")
 			}
@@ -79,7 +77,7 @@ func (s *Server) refreshSettings() {
 				colID := lastColID + sqlbase.ColumnID(colIDDiff)
 				lastColID = colID
 				if idx, ok := colIdxMap[colID]; ok {
-					res, bytes, err = sqlbase.DecodeTableValue(a, tbl.Columns[idx].Type.ToDatumType(), bytes)
+					res, bytes, err = sqlbase.DecodeTableValue(a, &tbl.Columns[idx].Type, bytes)
 					if err != nil {
 						return err
 					}
@@ -111,7 +109,7 @@ func (s *Server) refreshSettings() {
 		for {
 			select {
 			case <-gossipUpdateC:
-				cfg, _ := s.gossip.GetSystemConfig()
+				cfg := s.gossip.GetSystemConfig()
 				u := s.st.MakeUpdater()
 				ok := true
 				for _, kv := range cfg.Values {

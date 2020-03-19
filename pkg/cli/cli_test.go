@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -31,18 +27,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	// register some workloads for TestWorkload
+	_ "github.com/cockroachdb/cockroach/pkg/workload/examples"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 )
 
 type cliTest struct {
@@ -56,13 +57,17 @@ type cliTest struct {
 	// logScope binds the lifetime of the log files to this test, when t
 	// is not nil
 	logScope *log.TestLogScope
+	// if true, doesn't print args during RunWithArgs
+	omitArgs bool
 }
 
 type cliTestParams struct {
-	t          *testing.T
-	insecure   bool
-	noServer   bool
-	storeSpecs []base.StoreSpec
+	t           *testing.T
+	insecure    bool
+	noServer    bool
+	storeSpecs  []base.StoreSpec
+	locality    roachpb.Locality
+	noNodelocal bool
 }
 
 func (c *cliTest) fail(err interface{}) {
@@ -71,6 +76,32 @@ func (c *cliTest) fail(err interface{}) {
 		c.t.Fatal(err)
 	} else {
 		panic(err)
+	}
+}
+
+func createTestCerts(certsDir string) (cleanup func() error) {
+	// Copy these assets to disk from embedded strings, so this test can
+	// run from a standalone binary.
+	// Disable embedded certs, or the security library will try to load
+	// our real files as embedded assets.
+	security.ResetAssetLoader()
+
+	assets := []string{
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCAKey),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootCert),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootKey),
+	}
+
+	for _, a := range assets {
+		securitytest.RestrictedCopy(nil, a, certsDir, filepath.Base(a))
+	}
+
+	return func() error {
+		security.SetAssetLoader(securitytest.EmbeddedAssets)
+		return os.RemoveAll(certsDir)
 	}
 }
 
@@ -91,43 +122,28 @@ func newCLITest(params cliTestParams) cliTest {
 
 	if !params.noServer {
 		if !params.insecure {
-			// Copy these assets to disk from embedded strings, so this test can
-			// run from a standalone binary.
-			// Disable embedded certs, or the security library will try to load
-			// our real files as embedded assets.
-			security.ResetAssetLoader()
-
-			assets := []string{
-				filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert),
-				filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCAKey),
-				filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert),
-				filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey),
-				filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootCert),
-				filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootKey),
-			}
-
-			for _, a := range assets {
-				securitytest.RestrictedCopy(nil, a, certsDir, filepath.Base(a))
-			}
+			c.cleanupFunc = createTestCerts(certsDir)
 			baseCfg.SSLCertsDir = certsDir
-
-			c.cleanupFunc = func() error {
-				security.SetAssetLoader(securitytest.EmbeddedAssets)
-				return os.RemoveAll(c.certsDir)
-			}
 		}
 
-		s, err := serverutils.StartServerRaw(base.TestServerArgs{
-			Insecure:    params.insecure,
-			SSLCertsDir: c.certsDir,
-			StoreSpecs:  params.storeSpecs,
-		})
+		args := base.TestServerArgs{
+			Insecure:      params.insecure,
+			SSLCertsDir:   c.certsDir,
+			StoreSpecs:    params.storeSpecs,
+			Locality:      params.locality,
+			ExternalIODir: filepath.Join(certsDir, "extern"),
+		}
+		if params.noNodelocal {
+			args.ExternalIODir = ""
+		}
+		s, err := serverutils.StartServerRaw(args)
 		if err != nil {
 			c.fail(err)
 		}
 		c.TestServer = s.(*server.TestServer)
 
-		log.Infof(context.TODO(), "server started at %s", c.ServingAddr())
+		log.Infof(context.TODO(), "server started at %s", c.ServingRPCAddr())
+		log.Infof(context.TODO(), "SQL listener at %s", c.ServingSQLAddr())
 	}
 
 	baseCfg.User = security.NodeUser
@@ -140,10 +156,23 @@ func newCLITest(params cliTestParams) cliTest {
 	return c
 }
 
+// setCLIDefaultsForTests invokes initCLIDefaults but pretends the
+// output is not a terminal, even if it happens to be. This ensures
+// e.g. that tests ran with -v have the same output as those without.
+func setCLIDefaultsForTests() {
+	initCLIDefaults()
+	cliCtx.terminalOutput = false
+	sqlCtx.showTimes = false
+	// Even though we pretend there is no terminal, most tests want
+	// pretty tables.
+	cliCtx.tableDisplayFormat = tableDisplayTable
+}
+
 // stopServer stops the test server.
 func (c *cliTest) stopServer() {
 	if c.TestServer != nil {
-		log.Infof(context.TODO(), "stopping server at %s", c.ServingAddr())
+		log.Infof(context.TODO(), "stopping server at %s / %s",
+			c.ServingRPCAddr(), c.ServingSQLAddr())
 		select {
 		case <-c.Stopper().ShouldStop():
 			// If ShouldStop() doesn't block, that means someone has already
@@ -155,7 +184,7 @@ func (c *cliTest) stopServer() {
 	}
 }
 
-// restartServer stops and restarts the test server. The ServingAddr() may
+// restartServer stops and restarts the test server. The ServingRPCAddr() may
 // have changed after this method returns.
 func (c *cliTest) restartServer(params cliTestParams) {
 	c.stopServer()
@@ -169,7 +198,8 @@ func (c *cliTest) restartServer(params cliTestParams) {
 		c.fail(err)
 	}
 	c.TestServer = s.(*server.TestServer)
-	log.Infof(context.TODO(), "restarted server at %s", c.ServingAddr())
+	log.Infof(context.TODO(), "restarted server at %s / %s",
+		c.ServingRPCAddr(), c.ServingSQLAddr())
 }
 
 // cleanup cleans up after the test, stopping the server if necessary.
@@ -218,12 +248,13 @@ func captureOutput(f func()) (out string, err error) {
 	// Heavily inspired by Go's testing/example.go:runExample().
 
 	// Funnel stdout into a pipe.
-	stdout := os.Stdout
+	stdoutSave, stderrRedirSave := os.Stdout, stderr
 	r, w, err := os.Pipe()
 	if err != nil {
 		return "", err
 	}
 	os.Stdout = w
+	stderr = w
 
 	// Send all bytes from piped stdout through the output channel.
 	type captureResult struct {
@@ -242,7 +273,8 @@ func captureOutput(f func()) (out string, err error) {
 	defer func() {
 		// Close pipe and restore normal stdout.
 		w.Close()
-		os.Stdout = stdout
+		os.Stdout = stdoutSave
+		stderr = stderrRedirSave
 		outResult := <-outC
 		out, err = outResult.out, outResult.err
 		if x := recover(); x != nil {
@@ -255,33 +287,60 @@ func captureOutput(f func()) (out string, err error) {
 	return
 }
 
+func isSQLCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "sql", "dump", "workload", "nodelocal":
+		return true
+	case "node":
+		if len(args) == 0 {
+			return false
+		}
+		switch args[1] {
+		case "status", "ls":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
 func (c cliTest) RunWithArgs(origArgs []string) {
 	TestingReset()
 
 	if err := func() error {
 		args := append([]string(nil), origArgs[:1]...)
 		if c.TestServer != nil {
-			h, p, err := net.SplitHostPort(c.ServingAddr())
+			addr := c.ServingRPCAddr()
+			if isSQLCommand(origArgs) {
+				addr = c.ServingSQLAddr()
+			}
+			h, p, err := net.SplitHostPort(addr)
 			if err != nil {
 				return err
 			}
+			args = append(args, fmt.Sprintf("--host=%s", net.JoinHostPort(h, p)))
 			if c.Cfg.Insecure {
-				args = append(args, "--insecure")
+				args = append(args, "--insecure=true")
 			} else {
 				args = append(args, "--insecure=false")
 				args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
 			}
-			args = append(args, fmt.Sprintf("--host=%s", h))
-			args = append(args, fmt.Sprintf("--port=%s", p))
 		}
 		args = append(args, origArgs[1:]...)
 
-		fmt.Fprintf(os.Stderr, "%s\n", args)
-		fmt.Println(strings.Join(origArgs, " "))
+		if !c.omitArgs {
+			fmt.Fprintf(os.Stderr, "%s\n", args)
+			fmt.Println(strings.Join(origArgs, " "))
+		}
 
 		return Run(args)
 	}(); err != nil {
-		fmt.Println(err)
+		cliOutputError(os.Stdout, err, true /*showSeverity*/, false /*verbose*/)
 	}
 }
 
@@ -318,479 +377,221 @@ func TestQuit(t *testing.T) {
 	c.Run("quit")
 	// Wait until this async command cleanups the server.
 	<-c.Stopper().IsStopped()
-
-	// NB: if this test is ever flaky due to port reuse, we could run against
-	// :0 (which however changes some of the errors we get).
-	// One way of getting that is:
-	//	c.Cfg.AdvertiseAddr = "127.0.0.1:0"
-
-	styled := func(s string) string {
-		const preamble = `unable to connect or connection lost.
-
-Please check the address and credentials such as certificates \(if attempting to
-communicate with a secure cluster\).
-
-`
-		return preamble + s
-	}
-
-	for _, test := range []struct {
-		cmd, expOutPattern string
-	}{
-		// Error returned from GRPC to internal/client (which has to pass it
-		// up the stack as a roachpb.NewError(roachpb.NewSendError(.)).
-		// Error returned directly from GRPC.
-		{`quit`, styled(
-			`Failed to connect to the node: initial connection heartbeat failed: rpc error: ` +
-				`code = Unavailable desc = grpc: the connection is unavailable`),
-		},
-		// Going through the SQL client libraries gives a *net.OpError which
-		// we also handle.
-		//
-		// On *nix, this error is:
-		//
-		// dial tcp 127.0.0.1:65054: getsockopt: connection refused
-		//
-		// On Windows, this error is:
-		//
-		// dial tcp 127.0.0.1:59951: connectex: No connection could be made because the target machine actively refused it.
-		//
-		// So we look for the common bit.
-		{`zone ls`, styled(
-			`dial tcp .*: .* refused`),
-		},
-	} {
-		t.Run(test.cmd, func(t *testing.T) {
-			out, err := c.RunWithCapture(test.cmd)
-			if err != nil {
-				t.Fatal(err)
-			}
-			exp := test.cmd + "\n" + test.expOutPattern
-			re := regexp.MustCompile(exp)
-			if !re.MatchString(out) {
-				t.Errorf("expected '%s' to match pattern:\n%s\ngot:\n%s", test.cmd, exp, out)
-			}
-		})
-	}
-}
-
-func Example_ranges() {
-	c := newCLITest(cliTestParams{})
-	defer c.cleanup()
-
-	c.Run("debug range split ranges3")
-	c.Run("debug range ls")
-
-	// Output:
-	//debug range split ranges3
-	//debug range ls
-	///Min-/System/"" [1]
-	//	0: node-id=1 store-id=1
-	///System/""-/System/NodeLiveness [2]
-	//	0: node-id=1 store-id=1
-	///System/NodeLiveness-/System/NodeLivenessMax [3]
-	//	0: node-id=1 store-id=1
-	///System/NodeLivenessMax-/System/tsd [4]
-	//	0: node-id=1 store-id=1
-	///System/tsd-/System/"tse" [5]
-	//	0: node-id=1 store-id=1
-	///System/"tse"-"ranges3" [6]
-	//	0: node-id=1 store-id=1
-	//"ranges3"-/Table/SystemConfigSpan/Start [21]
-	//	0: node-id=1 store-id=1
-	///Table/SystemConfigSpan/Start-/Table/11 [7]
-	//	0: node-id=1 store-id=1
-	///Table/11-/Table/12 [8]
-	//	0: node-id=1 store-id=1
-	///Table/12-/Table/13 [9]
-	//	0: node-id=1 store-id=1
-	///Table/13-/Table/14 [10]
-	//	0: node-id=1 store-id=1
-	///Table/14-/Table/15 [11]
-	//	0: node-id=1 store-id=1
-	///Table/15-/Table/16 [12]
-	//	0: node-id=1 store-id=1
-	///Table/16-/Table/17 [13]
-	//	0: node-id=1 store-id=1
-	///Table/17-/Table/18 [14]
-	//	0: node-id=1 store-id=1
-	///Table/18-/Table/19 [15]
-	//	0: node-id=1 store-id=1
-	///Table/19-/Table/20 [16]
-	//	0: node-id=1 store-id=1
-	///Table/20-/Table/21 [17]
-	//	0: node-id=1 store-id=1
-	///Table/21-/Table/22 [18]
-	//	0: node-id=1 store-id=1
-	///Table/22-/Table/23 [19]
-	//	0: node-id=1 store-id=1
-	///Table/23-/Max [20]
-	//	0: node-id=1 store-id=1
-	//21 result(s)
-
 }
 
 func Example_logging() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
-	c.RunWithArgs([]string{"sql", "--logtostderr=false", "-e", "select 1"})
-	c.RunWithArgs([]string{"sql", "--log-backtrace-at=foo.go:1", "-e", "select 1"})
-	c.RunWithArgs([]string{"sql", "--log-dir=", "-e", "select 1"})
-	c.RunWithArgs([]string{"sql", "--logtostderr=true", "-e", "select 1"})
-	c.RunWithArgs([]string{"sql", "--verbosity=0", "-e", "select 1"})
-	c.RunWithArgs([]string{"sql", "--vmodule=foo=1", "-e", "select 1"})
+	c.RunWithArgs([]string{`sql`, `--logtostderr=false`, `-e`, `select 1 as "1"`})
+	c.RunWithArgs([]string{`sql`, `--logtostderr=true`, `-e`, `select 1 as "1"`})
+	c.RunWithArgs([]string{`sql`, `--vmodule=foo=1`, `-e`, `select 1 as "1"`})
 
 	// Output:
-	// sql --logtostderr=false -e select 1
+	// sql --logtostderr=false -e select 1 as "1"
 	// 1
 	// 1
-	// # 1 row
-	// sql --log-backtrace-at=foo.go:1 -e select 1
+	// sql --logtostderr=true -e select 1 as "1"
 	// 1
 	// 1
-	// # 1 row
-	// sql --log-dir= -e select 1
+	// sql --vmodule=foo=1 -e select 1 as "1"
 	// 1
 	// 1
-	// # 1 row
-	// sql --logtostderr=true -e select 1
-	// 1
-	// 1
-	// # 1 row
-	// sql --verbosity=0 -e select 1
-	// 1
-	// 1
-	// # 1 row
-	// sql --vmodule=foo=1 -e select 1
-	// 1
-	// 1
-	// # 1 row
 }
 
-func Example_max_results() {
-	c := newCLITest(cliTestParams{})
+func Example_demo() {
+	c := newCLITest(cliTestParams{noServer: true})
 	defer c.cleanup()
 
-	c.Run("debug range split max_results3")
-	c.Run("debug range split max_results4")
-	c.Run("debug range ls --max-results=5")
+	testData := [][]string{
+		{`demo`, `-e`, `show database`},
+		{`demo`, `-e`, `show database`, `--empty`},
+		{`demo`, `-e`, `show application_name`},
+		{`demo`, `--format=table`, `-e`, `show database`},
+		{`demo`, `-e`, `select 1 as "1"`, `-e`, `select 3 as "3"`},
+		{`demo`, `--echo-sql`, `-e`, `select 1 as "1"`},
+		{`demo`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`},
+		{`demo`, `startrek`, `-e`, `show databases`},
+		{`demo`, `startrek`, `-e`, `show databases`, `--format=table`},
+		// Test that if we start with --insecure=false we can perform
+		// commands that require a secure cluster.
+		{`demo`, `--insecure=false`, `-e`, `CREATE USER test WITH PASSWORD 'testpass'`},
+		{`demo`, `-e`, `CREATE USER test WITH PASSWORD 'testpass'`},
+		{`demo`, `--geo-partitioned-replicas`, `--disable-demo-license`},
+	}
+	setCLIDefaultsForTests()
+	// We must reset the security asset loader here, otherwise the dummy
+	// asset loader that is set by default in tests will not be able to
+	// find the certs that demo sets up.
+	security.ResetAssetLoader()
+	for _, cmd := range testData {
+		c.RunWithArgs(cmd)
+	}
 
 	// Output:
-	//debug range split max_results3
-	//debug range split max_results4
-	//debug range ls --max-results=5
-	///Min-/System/"" [1]
-	//	0: node-id=1 store-id=1
-	///System/""-/System/NodeLiveness [2]
-	//	0: node-id=1 store-id=1
-	///System/NodeLiveness-/System/NodeLivenessMax [3]
-	//	0: node-id=1 store-id=1
-	///System/NodeLivenessMax-/System/tsd [4]
-	//	0: node-id=1 store-id=1
-	///System/tsd-/System/"tse" [5]
-	//	0: node-id=1 store-id=1
-	//5 result(s)
-}
-
-func Example_zone() {
-	c := newCLITest(cliTestParams{})
-	defer c.cleanup()
-
-	c.Run("zone ls")
-	c.Run("zone set system --file=./testdata/zone_attrs.yaml")
-	c.Run("zone ls")
-	c.Run("zone get .liveness")
-	c.Run("zone get .meta")
-	c.Run("zone get system.nonexistent")
-	c.Run("zone get system.descriptor")
-	c.Run("zone set system.descriptor --file=./testdata/zone_attrs.yaml")
-	c.Run("zone set system.namespace --file=./testdata/zone_attrs.yaml")
-	c.Run("zone set system.nonexistent --file=./testdata/zone_attrs.yaml")
-	c.Run("zone set system --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone get system")
-	c.Run("zone rm system")
-	c.Run("zone ls")
-	c.Run("zone rm .default")
-	c.Run("zone set .liveness --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone set .meta --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone set .system --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone set .timeseries --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone get .system")
-	c.Run("zone ls")
-	c.Run("zone set .default --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone get system")
-	c.Run("zone set .default --disable-replication")
-	c.Run("zone get system")
-	c.Run("zone rm .liveness")
-	c.Run("zone rm .meta")
-	c.Run("zone rm .system")
-	c.Run("zone ls")
-	c.Run("zone rm .timeseries")
-	c.Run("zone ls")
-	c.Run("zone rm .liveness")
-	c.Run("zone rm .meta")
-	c.Run("zone rm .system")
-	c.Run("zone rm .timeseries")
-	c.Run("zone set system.jobs@primary --file=./testdata/zone_attrs.yaml")
-
-	// Output:
-	// zone ls
-	// .default
-	// .liveness
-	// .meta
-	// zone set system --file=./testdata/zone_attrs.yaml
-	// range_min_bytes: 1048576
-	// range_max_bytes: 67108864
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 1
-	// constraints: [us-east-1a, ssd]
-	// zone ls
-	// .default
-	// .liveness
-	// .meta
+	// demo -e show database
+	// database
+	// movr
+	// demo -e show database --empty
+	// database
+	// defaultdb
+	// demo -e show application_name
+	// application_name
+	// $ cockroach demo
+	// demo --format=table -e show database
+	//   database
+	// ------------
+	//   movr
+	// (1 row)
+	// demo -e select 1 as "1" -e select 3 as "3"
+	// 1
+	// 1
+	// 3
+	// 3
+	// demo --echo-sql -e select 1 as "1"
+	// > select 1 as "1"
+	// 1
+	// 1
+	// demo --set=errexit=0 -e select nonexistent -e select 123 as "123"
+	// ERROR: column "nonexistent" does not exist
+	// SQLSTATE: 42703
+	// 123
+	// 123
+	// demo startrek -e show databases
+	// database_name
+	// defaultdb
+	// postgres
+	// startrek
 	// system
-	// zone get .liveness
-	// .liveness
-	// range_min_bytes: 1048576
-	// range_max_bytes: 67108864
-	// gc:
-	//   ttlseconds: 600
-	// num_replicas: 1
-	// constraints: []
-	// zone get .meta
-	// .meta
-	// range_min_bytes: 1048576
-	// range_max_bytes: 67108864
-	// gc:
-	//   ttlseconds: 3600
-	// num_replicas: 1
-	// constraints: []
-	// zone get system.nonexistent
-	// pq: relation "system.nonexistent" does not exist
-	// zone get system.descriptor
-	// system
-	// range_min_bytes: 1048576
-	// range_max_bytes: 67108864
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 1
-	// constraints: [us-east-1a, ssd]
-	// zone set system.descriptor --file=./testdata/zone_attrs.yaml
-	// pq: cannot set zone configs for system config tables; try setting your config on the entire "system" database instead
-	// zone set system.namespace --file=./testdata/zone_attrs.yaml
-	// pq: cannot set zone configs for system config tables; try setting your config on the entire "system" database instead
-	// zone set system.nonexistent --file=./testdata/zone_attrs.yaml
-	// pq: relation "system.nonexistent" does not exist
-	// zone set system --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: [us-east-1a, ssd]
-	// zone get system
-	// system
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: [us-east-1a, ssd]
-	// zone rm system
-	// CONFIGURE ZONE 1
-	// zone ls
-	// .default
-	// .liveness
-	// .meta
-	// zone rm .default
-	// pq: cannot remove default zone
-	// zone set .liveness --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 600
-	// num_replicas: 3
-	// constraints: []
-	// zone set .meta --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 3600
-	// num_replicas: 3
-	// constraints: []
-	// zone set .system --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// zone set .timeseries --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// zone get .system
-	// .system
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// zone ls
-	// .default
-	// .liveness
-	// .meta
-	// .system
-	// .timeseries
-	// zone set .default --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// zone get system
-	// .default
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// zone set .default --disable-replication
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 1
-	// constraints: []
-	// zone get system
-	// .default
-	// range_min_bytes: 1048576
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 1
-	// constraints: []
-	// zone rm .liveness
-	// CONFIGURE ZONE 1
-	// zone rm .meta
-	// CONFIGURE ZONE 1
-	// zone rm .system
-	// CONFIGURE ZONE 1
-	// zone ls
-	// .default
-	// .timeseries
-	// zone rm .timeseries
-	// CONFIGURE ZONE 1
-	// zone ls
-	// .default
-	// zone rm .liveness
-	// CONFIGURE ZONE 0
-	// zone rm .meta
-	// CONFIGURE ZONE 0
-	// zone rm .system
-	// CONFIGURE ZONE 0
-	// zone rm .timeseries
-	// CONFIGURE ZONE 0
-	// zone set system.jobs@primary --file=./testdata/zone_attrs.yaml
-	// pq: setting zone configs on indexes or partitions requires a CCL binary
+	// demo startrek -e show databases --format=table
+	//   database_name
+	// -----------------
+	//   defaultdb
+	//   postgres
+	//   startrek
+	//   system
+	// (4 rows)
+	// demo --insecure=false -e CREATE USER test WITH PASSWORD 'testpass'
+	// CREATE ROLE 1
+	// demo -e CREATE USER test WITH PASSWORD 'testpass'
+	// ERROR: setting or updating a password is not supported in insecure mode
+	// SQLSTATE: 28P01
+	// demo --geo-partitioned-replicas --disable-demo-license
+	// ERROR: enterprise features are needed for this demo (--geo-partitioned-replicas)
 }
 
 func Example_sql() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
-	c.RunWithArgs([]string{"sql", "-e", "show application_name"})
-	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int); insert into t.f values (42, 69)"})
-	c.RunWithArgs([]string{"sql", "-e", "select 3", "-e", "select * from t.f"})
-	c.RunWithArgs([]string{"sql", "-e", "begin", "-e", "select 3", "-e", "commit"})
-	c.RunWithArgs([]string{"sql", "-e", "select * from t.f"})
-	c.RunWithArgs([]string{"sql", "--execute=show databases"})
-	c.RunWithArgs([]string{"sql", "-e", "select 1; select 2"})
-	c.RunWithArgs([]string{"sql", "-e", "select 1; select 2 where false"})
+	c.RunWithArgs([]string{`sql`, `-e`, `show application_name`})
+	c.RunWithArgs([]string{`sql`, `-e`, `create database t; create table t.f (x int, y int); insert into t.f values (42, 69)`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select 3 as "3"`, `-e`, `select * from t.f`})
+	c.RunWithArgs([]string{`sql`, `-e`, `begin`, `-e`, `select 3 as "3"`, `-e`, `commit`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select * from t.f`})
+	c.RunWithArgs([]string{`sql`, `--execute=show databases`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "2"`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "@" where false`})
 	// CREATE TABLE AS returns a SELECT tag with a row count, check this.
-	c.RunWithArgs([]string{"sql", "-e", "create table t.g1 (x int)"})
-	c.RunWithArgs([]string{"sql", "-e", "create table t.g2 as select * from generate_series(1,10)"})
+	c.RunWithArgs([]string{`sql`, `-e`, `create table t.g1 (x int)`})
+	c.RunWithArgs([]string{`sql`, `-e`, `create table t.g2 as select * from generate_series(1,10)`})
 	// It must be possible to access pre-defined/virtual tables even if the current database
 	// does not exist yet.
-	c.RunWithArgs([]string{"sql", "-d", "nonexistent", "-e", "select count(*) from pg_class limit 0"})
+	c.RunWithArgs([]string{`sql`, `-d`, `nonexistent`, `-e`, `select count(*) from "".information_schema.tables limit 0`})
 	// It must be possible to create the current database after the
 	// connection was established.
-	c.RunWithArgs([]string{"sql", "-d", "nonexistent", "-e", "create database nonexistent; create table foo(x int); select * from foo"})
+	c.RunWithArgs([]string{`sql`, `-d`, `nonexistent`, `-e`, `create database nonexistent; create table foo(x int); select * from foo`})
 	// COPY should return an intelligible error message.
-	c.RunWithArgs([]string{"sql", "-e", "copy t.f from stdin"})
-	// --echo-sql should print out the SQL statements.
-	c.RunWithArgs([]string{"user", "ls", "--echo-sql"})
+	c.RunWithArgs([]string{`sql`, `-e`, `copy t.f from stdin`})
+	// --set changes client-side variables before executing commands.
+	c.RunWithArgs([]string{`sql`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`})
+	c.RunWithArgs([]string{`sql`, `--set`, `echo=true`, `-e`, `select 123 as "123"`})
+	c.RunWithArgs([]string{`sql`, `--set`, `unknownoption`, `-e`, `select 123 as "123"`})
+	// Check that partial results + error get reported together.
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(@1-3) from generate_series(1,4)`})
 
 	// Output:
 	// sql -e show application_name
 	// application_name
-	// cockroach
-	// # 1 row
+	// $ cockroach sql
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
 	// INSERT 1
-	// sql -e select 3 -e select * from t.f
+	// sql -e select 3 as "3" -e select * from t.f
 	// 3
 	// 3
-	// # 1 row
 	// x	y
 	// 42	69
-	// # 1 row
-	// sql -e begin -e select 3 -e commit
+	// sql -e begin -e select 3 as "3" -e commit
 	// BEGIN
 	// 3
 	// 3
-	// # 1 row
 	// COMMIT
 	// sql -e select * from t.f
 	// x	y
 	// 42	69
-	// # 1 row
 	// sql --execute=show databases
-	// Database
-	// crdb_internal
-	// information_schema
-	// pg_catalog
+	// database_name
+	// defaultdb
+	// postgres
 	// system
 	// t
-	// # 5 rows
-	// sql -e select 1; select 2
+	// sql -e select 1 as "1"; select 2 as "2"
 	// 1
 	// 1
-	// # 1 row
 	// 2
 	// 2
-	// # 1 row
-	// sql -e select 1; select 2 where false
+	// sql -e select 1 as "1"; select 2 as "@" where false
 	// 1
 	// 1
-	// # 1 row
-	// 2
-	// # 0 rows
+	// @
 	// sql -e create table t.g1 (x int)
 	// CREATE TABLE
 	// sql -e create table t.g2 as select * from generate_series(1,10)
-	// SELECT 10
-	// sql -d nonexistent -e select count(*) from pg_class limit 0
+	// CREATE TABLE AS
+	// sql -d nonexistent -e select count(*) from "".information_schema.tables limit 0
 	// count
-	// # 0 rows
 	// sql -d nonexistent -e create database nonexistent; create table foo(x int); select * from foo
 	// x
-	// # 0 rows
 	// sql -e copy t.f from stdin
-	// woops! COPY has confused this client! Suggestion: use 'psql' for COPY
-	// user ls --echo-sql
-	// > SHOW USERS
-	// username
-	// root
-	// # 1 row
+	// ERROR: woops! COPY has confused this client! Suggestion: use 'psql' for COPY
+	// sql --set=errexit=0 -e select nonexistent -e select 123 as "123"
+	// ERROR: column "nonexistent" does not exist
+	// SQLSTATE: 42703
+	// 123
+	// 123
+	// sql --set echo=true -e select 123 as "123"
+	// > select 123 as "123"
+	// 123
+	// 123
+	// sql --set unknownoption -e select 123 as "123"
+	// invalid syntax: \set unknownoption. Try \? for help.
+	// ERROR: invalid syntax
+	// sql -e select 1/(@1-3) from generate_series(1,4)
+	// ?column?
+	// -0.5
+	// -1
+	// (error encountered after some results were delivered)
+	// ERROR: division by zero
+	// SQLSTATE: 22012
+}
+
+func Example_sql_watch() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{`sql`, `-e`, `create table d(x int); insert into d values(3)`})
+	c.RunWithArgs([]string{`sql`, `--watch`, `.1s`, `-e`, `update d set x=x-1 returning 1/x as dec`})
+
+	// Output:
+	// sql -e create table d(x int); insert into d values(3)
+	// INSERT 1
+	// sql --watch .1s -e update d set x=x-1 returning 1/x as dec
+	// dec
+	// 0.5
+	// dec
+	// 1
+	// ERROR: division by zero
+	// SQLSTATE: 22012
 }
 
 func Example_sql_format() {
@@ -809,99 +610,162 @@ func Example_sql_format() {
 	// sql -e select * from t.times
 	// bare	withtz
 	// 2016-01-25 10:10:10+00:00	2016-01-25 15:10:10+00:00
-	// # 1 row
 }
 
 func Example_sql_column_labels() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
-	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.u (\"\"\"foo\" int, \"\\foo\" int, \"foo\nbar\" int, \"κόσμε\" int, \"a|b\" int, \"܈85\" int)"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.u values (0, 0, 0, 0, 0, 0)"})
+	testData := []string{
+		`f"oo`,
+		`f'oo`,
+		`f\oo`,
+		`short
+very very long
+not much`,
+		`very very long
+thenshort`,
+		`κόσμε`,
+		`a|b`,
+		`܈85`,
+	}
+
+	tdef := make([]string, len(testData))
+	var vals bytes.Buffer
+	for i, col := range testData {
+		tdef[i] = tree.NameString(col) + " int"
+		if i > 0 {
+			vals.WriteString(", ")
+		}
+		vals.WriteByte('0')
+	}
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.u (" + strings.Join(tdef, ", ") + ")"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.u values (" + vals.String() + ")"})
 	c.RunWithArgs([]string{"sql", "-e", "show columns from t.u"})
 	c.RunWithArgs([]string{"sql", "-e", "select * from t.u"})
-	c.RunWithArgs([]string{"sql", "--format=pretty", "-e", "show columns from t.u"})
-	c.RunWithArgs([]string{"sql", "--format=pretty", "-e", "select * from t.u"})
-	c.RunWithArgs([]string{"sql", "--format=tsv", "-e", "select * from t.u"})
-	c.RunWithArgs([]string{"sql", "--format=csv", "-e", "select * from t.u"})
-	c.RunWithArgs([]string{"sql", "--format=sql", "-e", "select * from t.u"})
-	c.RunWithArgs([]string{"sql", "--format=html", "-e", "select * from t.u"})
-	c.RunWithArgs([]string{"sql", "--format=records", "-e", "select * from t.u"})
+	c.RunWithArgs([]string{"sql", "--format=table", "-e", "show columns from t.u"})
+	for i := tableDisplayFormat(0); i < tableDisplayLastFormat; i++ {
+		c.RunWithArgs([]string{"sql", "--format=" + i.String(), "-e", "select * from t.u"})
+	}
 
-	// Output:
-	// sql -e create database t; create table t.u ("""foo" int, "\foo" int, "foo
-	// bar" int, "κόσμε" int, "a|b" int, "܈85" int)
+	// Output
+	// sql -e create database t; create table t.u ("f""oo" int, "f'oo" int, "f\oo" int, "short
+	// very very long
+	// not much" int, "very very long
+	// thenshort" int, "κόσμε" int, "a|b" int, ܈85 int)
 	// CREATE TABLE
-	// sql -e insert into t.u values (0, 0, 0, 0, 0, 0)
+	// sql -e insert into t.u values (0, 0, 0, 0, 0, 0, 0, 0)
 	// INSERT 1
 	// sql -e show columns from t.u
-	// Field	Type	Null	Default	Indices
-	// """foo"	INT	true	NULL	{}
-	// \foo	INT	true	NULL	{}
-	// "foo
-	// bar"	INT	true	NULL	{}
-	// κόσμε	INT	true	NULL	{}
-	// a|b	INT	true	NULL	{}
-	// ܈85	INT	true	NULL	{}
-	// # 6 rows
+	// column_name	data_type	is_nullable	column_default	generation_expression	indices
+	// "f""oo"	INT	true	NULL		{}
+	// f'oo	INT	true	NULL		{}
+	// f\oo	INT	true	NULL		{}
+	// "short
+	// very very long
+	// not much"	INT	true	NULL		{}
+	// "very very long
+	// thenshort"	INT	true	NULL		{}
+	// κόσμε	INT	true	NULL		{}
+	// a|b	INT	true	NULL		{}
+	// ܈85	INT	true	NULL		{}
 	// sql -e select * from t.u
-	// """foo"	\foo	"""foo\nbar"""	κόσμε	a|b	܈85
-	// 0	0	0	0	0	0
-	// # 1 row
-	// sql --format=pretty -e show columns from t.u
-	// +---------+------+------+---------+---------+
-	// |  Field  | Type | Null | Default | Indices |
-	// +---------+------+------+---------+---------+
-	// | "foo    | INT  | true | NULL    | {}      |
-	// | \foo    | INT  | true | NULL    | {}      |
-	// | foo␤    | INT  | true | NULL    | {}      |
-	// | bar     |      |      |         |         |
-	// | κόσμε   | INT  | true | NULL    | {}      |
-	// | a|b     | INT  | true | NULL    | {}      |
-	// | ܈85     | INT  | true | NULL    | {}      |
-	// +---------+------+------+---------+---------+
-	// (6 rows)
-	// sql --format=pretty -e select * from t.u
-	// +------+------+------------+-------+-----+-----+
-	// | "foo | \foo | "foo\nbar" | κόσμε | a|b | ܈85 |
-	// +------+------+------------+-------+-----+-----+
-	// |    0 |    0 |          0 |     0 |   0 |   0 |
-	// +------+------+------------+-------+-----+-----+
-	// (1 row)
+	// "f""oo"	f'oo	f\oo	"short
+	// very very long
+	// not much"	"very very long
+	// thenshort"	κόσμε	a|b	܈85
+	// 0	0	0	0	0	0	0	0
+	// sql --format=table -e show columns from t.u
+	//    column_name   | data_type | is_nullable | column_default | generation_expression | indices
+	// +----------------+-----------+-------------+----------------+-----------------------+---------+
+	//   f"oo           | INT       |    true     | NULL           |                       | {}
+	//   f'oo           | INT       |    true     | NULL           |                       | {}
+	//   f\oo           | INT       |    true     | NULL           |                       | {}
+	//   short          | INT       |    true     | NULL           |                       | {}
+	//   very very long |           |             |                |                       |
+	//   not much       |           |             |                |                       |
+	//   very very long | INT       |    true     | NULL           |                       | {}
+	//   thenshort      |           |             |                |                       |
+	//   κόσμε          | INT       |    true     | NULL           |                       | {}
+	//   a|b            | INT       |    true     | NULL           |                       | {}
+	//   ܈85            | INT       |    true     | NULL           |                       | {}
+	// (8 rows)
 	// sql --format=tsv -e select * from t.u
-	// """foo"	\foo	"""foo\nbar"""	κόσμε	a|b	܈85
-	// 0	0	0	0	0	0
-	// # 1 row
+	// "f""oo"	f'oo	f\oo	"short
+	// very very long
+	// not much"	"very very long
+	// thenshort"	κόσμε	a|b	܈85
+	// 0	0	0	0	0	0	0	0
 	// sql --format=csv -e select * from t.u
-	// """foo",\foo,"""foo\nbar""",κόσμε,a|b,܈85
-	// 0,0,0,0,0,0
-	// # 1 row
+	// "f""oo",f'oo,f\oo,"short
+	// very very long
+	// not much","very very long
+	// thenshort",κόσμε,a|b,܈85
+	// 0,0,0,0,0,0,0,0
+	// sql --format=table -e select * from t.u
+	//   f"oo | f'oo | f\oo |     short      | very very long | κόσμε | a|b | ܈85
+	//        |      |      | very very long |   thenshort    |       |     |
+	//        |      |      |    not much    |                |       |     |
+	// +------+------+------+----------------+----------------+-------+-----+-----+
+	//      0 |    0 |    0 |              0 |              0 |     0 |   0 |   0
+	// (1 row)
+	// sql --format=records -e select * from t.u
+	// -[ RECORD 1 ]
+	// f"oo           | 0
+	// f'oo           | 0
+	// f\oo           | 0
+	// short         +| 0
+	// very very long+|
+	// not much       |
+	// very very long+| 0
+	// thenshort      |
+	// κόσμε          | 0
+	// a|b            | 0
+	// ܈85            | 0
 	// sql --format=sql -e select * from t.u
 	// CREATE TABLE results (
-	//   """foo" STRING,
-	//   "\foo" STRING,
-	//   """foo\nbar""" STRING,
+	//   "f""oo" STRING,
+	//   "f'oo" STRING,
+	//   "f\oo" STRING,
+	//   "short
+	// very very long
+	// not much" STRING,
+	//   "very very long
+	// thenshort" STRING,
 	//   "κόσμε" STRING,
 	//   "a|b" STRING,
 	//   ܈85 STRING
 	// );
 	//
-	// INSERT INTO results VALUES ('0', '0', '0', '0', '0', '0');
+	// INSERT INTO results VALUES ('0', '0', '0', '0', '0', '0', '0', '0');
+	// -- 1 row
 	// sql --format=html -e select * from t.u
 	// <table>
-	// <thead><tr><th>row</th><th>&#34;foo</th><th>\foo</th><th>&#34;foo\nbar&#34;</th><th>κόσμε</th><th>a|b</th><th>܈85</th></tr></head>
+	// <thead><tr><th>row</th><th>f&#34;oo</th><th>f&#39;oo</th><th>f\oo</th><th>short<br/>very very long<br/>not much</th><th>very very long<br/>thenshort</th><th>κόσμε</th><th>a|b</th><th>܈85</th></tr></thead>
 	// <tbody>
-	// <tr><td>1</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+	// <tr><td>1</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
 	// </tbody>
-	// <tfoot><tr><td colspan=7>1 row</td></tr></tfoot></table>
-	// sql --format=records -e select * from t.u
-	// -[ RECORD 1 ]
-	// "foo       | 0
-	// \foo       | 0
-	// "foo\nbar" | 0
-	// κόσμε      | 0
-	// a|b        | 0
-	// ܈85        | 0
+	// <tfoot><tr><td colspan=9>1 row</td></tr></tfoot></table>
+	// sql --format=raw -e select * from t.u
+	// # 8 columns
+	// # row 1
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// ## 1
+	// 0
+	// # 1 row
 }
 
 func Example_sql_empty_table() {
@@ -913,55 +777,52 @@ func Example_sql_empty_table() {
 		"create table t.nocolsnorows();" +
 		"create table t.nocols(); insert into t.nocols(rowid) values (1),(2),(3);"})
 	for _, table := range []string{"norows", "nocols", "nocolsnorows"} {
-		for _, format := range []string{"pretty", "tsv", "csv", "sql", "html", "raw", "records"} {
-			c.RunWithArgs([]string{"sql", "--format=" + format, "-e", "select * from t." + table})
+		for format := tableDisplayFormat(0); format < tableDisplayLastFormat; format++ {
+			c.RunWithArgs([]string{"sql", "--format=" + format.String(), "-e", "select * from t." + table})
 		}
 	}
 
 	// Output:
 	// sql -e create database t;create table t.norows(x int);create table t.nocolsnorows();create table t.nocols(); insert into t.nocols(rowid) values (1),(2),(3);
 	// INSERT 3
-	// sql --format=pretty -e select * from t.norows
-	// +---+
-	// | x |
-	// +---+
-	// +---+
-	// (0 rows)
 	// sql --format=tsv -e select * from t.norows
 	// x
-	// # 0 rows
 	// sql --format=csv -e select * from t.norows
 	// x
-	// # 0 rows
+	// sql --format=table -e select * from t.norows
+	//   x
+	// -----
+	// (0 rows)
+	// sql --format=records -e select * from t.norows
 	// sql --format=sql -e select * from t.norows
 	// CREATE TABLE results (
 	//   x STRING
 	// );
 	//
+	// -- 0 rows
 	// sql --format=html -e select * from t.norows
 	// <table>
-	// <thead><tr><th>row</th><th>x</th></tr></head>
+	// <thead><tr><th>row</th><th>x</th></tr></thead>
 	// </tbody>
 	// <tfoot><tr><td colspan=2>0 rows</td></tr></tfoot></table>
 	// sql --format=raw -e select * from t.norows
 	// # 1 column
 	// # 0 rows
-	// sql --format=records -e select * from t.norows
-	// sql --format=pretty -e select * from t.nocols
-	// --
-	// (3 rows)
 	// sql --format=tsv -e select * from t.nocols
 	// # no columns
 	// # empty
 	// # empty
 	// # empty
-	// # 3 rows
 	// sql --format=csv -e select * from t.nocols
 	// # no columns
 	// # empty
 	// # empty
 	// # empty
-	// # 3 rows
+	// sql --format=table -e select * from t.nocols
+	// --
+	// (3 rows)
+	// sql --format=records -e select * from t.nocols
+	// (3 rows)
 	// sql --format=sql -e select * from t.nocols
 	// CREATE TABLE results (
 	// );
@@ -969,9 +830,10 @@ func Example_sql_empty_table() {
 	// INSERT INTO results(rowid) VALUES (DEFAULT);
 	// INSERT INTO results(rowid) VALUES (DEFAULT);
 	// INSERT INTO results(rowid) VALUES (DEFAULT);
+	// -- 3 rows
 	// sql --format=html -e select * from t.nocols
 	// <table>
-	// <thead><tr><th>row</th></tr></head>
+	// <thead><tr><th>row</th></tr></thead>
 	// <tbody>
 	// <tr><td>1</td></tr>
 	// <tr><td>2</td></tr>
@@ -984,58 +846,212 @@ func Example_sql_empty_table() {
 	// # row 2
 	// # row 3
 	// # 3 rows
-	// sql --format=records -e select * from t.nocols
-	// (3 rows)
-	// sql --format=pretty -e select * from t.nocolsnorows
-	// --
-	// (0 rows)
 	// sql --format=tsv -e select * from t.nocolsnorows
 	// # no columns
-	// # 0 rows
 	// sql --format=csv -e select * from t.nocolsnorows
 	// # no columns
-	// # 0 rows
+	// sql --format=table -e select * from t.nocolsnorows
+	// --
+	// (0 rows)
+	// sql --format=records -e select * from t.nocolsnorows
+	// (0 rows)
 	// sql --format=sql -e select * from t.nocolsnorows
 	// CREATE TABLE results (
 	// );
 	//
+	// -- 0 rows
 	// sql --format=html -e select * from t.nocolsnorows
 	// <table>
-	// <thead><tr><th>row</th></tr></head>
+	// <thead><tr><th>row</th></tr></thead>
 	// </tbody>
 	// <tfoot><tr><td colspan=1>0 rows</td></tr></tfoot></table>
 	// sql --format=raw -e select * from t.nocolsnorows
 	// # 0 columns
 	// # 0 rows
-	// sql --format=records -e select * from t.nocolsnorows
-	// (0 rows)
+}
+
+func Example_csv_tsv_quoting() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	testData := []string{
+		`ab`,
+		`a b`,
+		`a
+bc
+def`,
+		`a, b`,
+		`"a", "b"`,
+		`'a', 'b'`,
+		`a\,b`,
+		`a	b`,
+	}
+
+	for _, sqlStr := range testData {
+		escaped := lex.EscapeSQLString(sqlStr)
+		sql := "select " + escaped + " as s, " + escaped + " as t"
+		c.RunWithArgs([]string{"sql", "--format=csv", "-e", sql})
+		c.RunWithArgs([]string{"sql", "--format=tsv", "-e", sql})
+	}
+
+	for _, identStr := range testData {
+		escaped1 := tree.NameString(identStr + "1")
+		escaped2 := tree.NameString(identStr + "2")
+		sql := "select 1 as " + escaped1 + ", 2 as " + escaped2
+		c.RunWithArgs([]string{"sql", "--format=csv", "-e", sql})
+		c.RunWithArgs([]string{"sql", "--format=tsv", "-e", sql})
+	}
+
+	// Output:
+	// sql --format=csv -e select 'ab' as s, 'ab' as t
+	// s,t
+	// ab,ab
+	// sql --format=tsv -e select 'ab' as s, 'ab' as t
+	// s	t
+	// ab	ab
+	// sql --format=csv -e select 'a b' as s, 'a b' as t
+	// s,t
+	// a b,a b
+	// sql --format=tsv -e select 'a b' as s, 'a b' as t
+	// s	t
+	// a b	a b
+	// sql --format=csv -e select e'a\nbc\ndef' as s, e'a\nbc\ndef' as t
+	// s,t
+	// "a
+	// bc
+	// def","a
+	// bc
+	// def"
+	// sql --format=tsv -e select e'a\nbc\ndef' as s, e'a\nbc\ndef' as t
+	// s	t
+	// "a
+	// bc
+	// def"	"a
+	// bc
+	// def"
+	// sql --format=csv -e select 'a, b' as s, 'a, b' as t
+	// s,t
+	// "a, b","a, b"
+	// sql --format=tsv -e select 'a, b' as s, 'a, b' as t
+	// s	t
+	// a, b	a, b
+	// sql --format=csv -e select '"a", "b"' as s, '"a", "b"' as t
+	// s,t
+	// """a"", ""b""","""a"", ""b"""
+	// sql --format=tsv -e select '"a", "b"' as s, '"a", "b"' as t
+	// s	t
+	// """a"", ""b"""	"""a"", ""b"""
+	// sql --format=csv -e select e'\'a\', \'b\'' as s, e'\'a\', \'b\'' as t
+	// s,t
+	// "'a', 'b'","'a', 'b'"
+	// sql --format=tsv -e select e'\'a\', \'b\'' as s, e'\'a\', \'b\'' as t
+	// s	t
+	// 'a', 'b'	'a', 'b'
+	// sql --format=csv -e select e'a\\,b' as s, e'a\\,b' as t
+	// s,t
+	// "a\,b","a\,b"
+	// sql --format=tsv -e select e'a\\,b' as s, e'a\\,b' as t
+	// s	t
+	// a\,b	a\,b
+	// sql --format=csv -e select e'a\tb' as s, e'a\tb' as t
+	// s,t
+	// a	b,a	b
+	// sql --format=tsv -e select e'a\tb' as s, e'a\tb' as t
+	// s	t
+	// "a	b"	"a	b"
+	// sql --format=csv -e select 1 as ab1, 2 as ab2
+	// ab1,ab2
+	// 1,2
+	// sql --format=tsv -e select 1 as ab1, 2 as ab2
+	// ab1	ab2
+	// 1	2
+	// sql --format=csv -e select 1 as "a b1", 2 as "a b2"
+	// a b1,a b2
+	// 1,2
+	// sql --format=tsv -e select 1 as "a b1", 2 as "a b2"
+	// a b1	a b2
+	// 1	2
+	// sql --format=csv -e select 1 as "a
+	// bc
+	// def1", 2 as "a
+	// bc
+	// def2"
+	// "a
+	// bc
+	// def1","a
+	// bc
+	// def2"
+	// 1,2
+	// sql --format=tsv -e select 1 as "a
+	// bc
+	// def1", 2 as "a
+	// bc
+	// def2"
+	// "a
+	// bc
+	// def1"	"a
+	// bc
+	// def2"
+	// 1	2
+	// sql --format=csv -e select 1 as "a, b1", 2 as "a, b2"
+	// "a, b1","a, b2"
+	// 1,2
+	// sql --format=tsv -e select 1 as "a, b1", 2 as "a, b2"
+	// a, b1	a, b2
+	// 1	2
+	// sql --format=csv -e select 1 as """a"", ""b""1", 2 as """a"", ""b""2"
+	// """a"", ""b""1","""a"", ""b""2"
+	// 1,2
+	// sql --format=tsv -e select 1 as """a"", ""b""1", 2 as """a"", ""b""2"
+	// """a"", ""b""1"	"""a"", ""b""2"
+	// 1	2
+	// sql --format=csv -e select 1 as "'a', 'b'1", 2 as "'a', 'b'2"
+	// "'a', 'b'1","'a', 'b'2"
+	// 1,2
+	// sql --format=tsv -e select 1 as "'a', 'b'1", 2 as "'a', 'b'2"
+	// 'a', 'b'1	'a', 'b'2
+	// 1	2
+	// sql --format=csv -e select 1 as "a\,b1", 2 as "a\,b2"
+	// "a\,b1","a\,b2"
+	// 1,2
+	// sql --format=tsv -e select 1 as "a\,b1", 2 as "a\,b2"
+	// a\,b1	a\,b2
+	// 1	2
+	// sql --format=csv -e select 1 as "a	b1", 2 as "a	b2"
+	// a	b1,a	b2
+	// 1,2
+	// sql --format=tsv -e select 1 as "a	b1", 2 as "a	b2"
+	// "a	b1"	"a	b2"
+	// 1	2
 }
 
 func Example_sql_table() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
+	testData := []struct {
+		str, desc string
+	}{
+		{"e'foo'", "printable ASCII"},
+		{"e'\"foo'", "printable ASCII with quotes"},
+		{"e'\\\\foo'", "printable ASCII with backslash"},
+		{"e'foo\\x0abar'", "non-printable ASCII"},
+		{"'κόσμε'", "printable UTF8"},
+		{"e'\\xc3\\xb1'", "printable UTF8 using escapes"},
+		{"e'\\x01'", "non-printable UTF8 string"},
+		{"e'\\xdc\\x88\\x38\\x35'", "UTF8 string with RTL char"},
+		{"e'a\\tb\\tc\\n12\\t123123213\\t12313'", "tabs"},
+		{"e'\\xc3\\x28'", "non-UTF8 string"}, // This expects an insert error.
+	}
+
 	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.t (s string, d string);"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'foo', 'printable ASCII')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\"foo', 'printable ASCII with quotes')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\\\foo', 'printable ASCII with backslash')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'foo\\x0abar', 'non-printable ASCII')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values ('κόσμε', 'printable UTF8')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\xc3\\xb1', 'printable UTF8 using escapes')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\x01', 'non-printable UTF8 string')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\xdc\\x88\\x38\\x35', 'UTF8 string with RTL char')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\xc3\\x28', 'non-UTF8 string')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'a\\tb\\tc\\n12\\t123123213\\t12313', 'tabs')"})
+	for _, t := range testData {
+		c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (" + t.str + ", '" + t.desc + "')"})
+	}
 	c.RunWithArgs([]string{"sql", "-e", "select * from t.t"})
-	c.RunWithArgs([]string{"sql", "--format=pretty", "-e", "select * from t.t"})
-	c.RunWithArgs([]string{"sql", "--format=tsv", "-e", "select * from t.t"})
-	c.RunWithArgs([]string{"sql", "--format=csv", "-e", "select * from t.t"})
-	c.RunWithArgs([]string{"sql", "--format=sql", "-e", "select * from t.t"})
-	c.RunWithArgs([]string{"sql", "--format=html", "-e", "select * from t.t"})
-	c.RunWithArgs([]string{"sql", "--format=raw", "-e", "select * from t.t"})
-	c.RunWithArgs([]string{"sql", "--format=records", "-e", "select * from t.t"})
-	c.RunWithArgs([]string{"sql", "--format=pretty", "-e", "select '  hai' as x"})
-	c.RunWithArgs([]string{"sql", "--format=pretty", "-e", "explain select s from t.t union all select s from t.t"})
+	for format := tableDisplayFormat(0); format < tableDisplayLastFormat; format++ {
+		c.RunWithArgs([]string{"sql", "--format=" + format.String(), "-e", "select * from t.t"})
+	}
 
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
@@ -1056,14 +1072,15 @@ func Example_sql_table() {
 	// INSERT 1
 	// sql -e insert into t.t values (e'\xdc\x88\x38\x35', 'UTF8 string with RTL char')
 	// INSERT 1
+	// sql -e insert into t.t values (e'a\tb\tc\n12\t123123213\t12313', 'tabs')
+	// INSERT 1
 	// sql -e insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
-	// pq: invalid UTF-8 byte sequence
+	// ERROR: lexical error: invalid UTF-8 byte sequence
+	// SQLSTATE: 42601
 	// DETAIL: source SQL:
 	// insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
 	//                         ^
 	// HINT: try \h VALUES
-	// sql -e insert into t.t values (e'a\tb\tc\n12\t123123213\t12313', 'tabs')
-	// INSERT 1
 	// sql -e select * from t.t
 	// s	d
 	// foo	printable ASCII
@@ -1073,28 +1090,10 @@ func Example_sql_table() {
 	// bar"	non-printable ASCII
 	// κόσμε	printable UTF8
 	// ñ	printable UTF8 using escapes
-	// """\x01"""	non-printable UTF8 string
+	// \x01	non-printable UTF8 string
 	// ܈85	UTF8 string with RTL char
 	// "a	b	c
 	// 12	123123213	12313"	tabs
-	// # 9 rows
-	// sql --format=pretty -e select * from t.t
-	// +--------------------------------+--------------------------------+
-	// |               s                |               d                |
-	// +--------------------------------+--------------------------------+
-	// | foo                            | printable ASCII                |
-	// | "foo                           | printable ASCII with quotes    |
-	// | \foo                           | printable ASCII with backslash |
-	// | foo␤                           | non-printable ASCII            |
-	// | bar                            |                                |
-	// | κόσμε                          | printable UTF8                 |
-	// | ñ                              | printable UTF8 using escapes   |
-	// | "\x01"                         | non-printable UTF8 string      |
-	// | ܈85                            | UTF8 string with RTL char      |
-	// | a   b         c␤               | tabs                           |
-	// | 12  123123213 12313            |                                |
-	// +--------------------------------+--------------------------------+
-	// (9 rows)
 	// sql --format=tsv -e select * from t.t
 	// s	d
 	// foo	printable ASCII
@@ -1104,11 +1103,10 @@ func Example_sql_table() {
 	// bar"	non-printable ASCII
 	// κόσμε	printable UTF8
 	// ñ	printable UTF8 using escapes
-	// """\x01"""	non-printable UTF8 string
+	// \x01	non-printable UTF8 string
 	// ܈85	UTF8 string with RTL char
 	// "a	b	c
 	// 12	123123213	12313"	tabs
-	// # 9 rows
 	// sql --format=csv -e select * from t.t
 	// s,d
 	// foo,printable ASCII
@@ -1118,11 +1116,55 @@ func Example_sql_table() {
 	// bar",non-printable ASCII
 	// κόσμε,printable UTF8
 	// ñ,printable UTF8 using escapes
-	// """\x01""",non-printable UTF8 string
+	// \x01,non-printable UTF8 string
 	// ܈85,UTF8 string with RTL char
 	// "a	b	c
 	// 12	123123213	12313",tabs
-	// # 9 rows
+	// sql --format=table -e select * from t.t
+	//            s          |               d
+	// ----------------------+---------------------------------
+	//   foo                 | printable ASCII
+	//   "foo                | printable ASCII with quotes
+	//   \foo                | printable ASCII with backslash
+	//   foo                 | non-printable ASCII
+	//   bar                 |
+	//   κόσμε               | printable UTF8
+	//   ñ                   | printable UTF8 using escapes
+	//   \x01                | non-printable UTF8 string
+	//   ܈85                 | UTF8 string with RTL char
+	//   a   b         c     | tabs
+	//   12  123123213 12313 |
+	// (9 rows)
+	// sql --format=records -e select * from t.t
+	// -[ RECORD 1 ]
+	// s | foo
+	// d | printable ASCII
+	// -[ RECORD 2 ]
+	// s | "foo
+	// d | printable ASCII with quotes
+	// -[ RECORD 3 ]
+	// s | \foo
+	// d | printable ASCII with backslash
+	// -[ RECORD 4 ]
+	// s | foo+
+	//   | bar
+	// d | non-printable ASCII
+	// -[ RECORD 5 ]
+	// s | κόσμε
+	// d | printable UTF8
+	// -[ RECORD 6 ]
+	// s | ñ
+	// d | printable UTF8 using escapes
+	// -[ RECORD 7 ]
+	// s | \x01
+	// d | non-printable UTF8 string
+	// -[ RECORD 8 ]
+	// s | ܈85
+	// d | UTF8 string with RTL char
+	// -[ RECORD 9 ]
+	// s | a	b	c+
+	//   | 12	123123213	12313
+	// d | tabs
 	// sql --format=sql -e select * from t.t
 	// CREATE TABLE results (
 	//   s STRING,
@@ -1135,12 +1177,13 @@ func Example_sql_table() {
 	// INSERT INTO results VALUES (e'foo\nbar', 'non-printable ASCII');
 	// INSERT INTO results VALUES (e'\u03BA\U00001F79\u03C3\u03BC\u03B5', 'printable UTF8');
 	// INSERT INTO results VALUES (e'\u00F1', 'printable UTF8 using escapes');
-	// INSERT INTO results VALUES (e'"\\x01"', 'non-printable UTF8 string');
+	// INSERT INTO results VALUES (e'\\x01', 'non-printable UTF8 string');
 	// INSERT INTO results VALUES (e'\u070885', 'UTF8 string with RTL char');
 	// INSERT INTO results VALUES (e'a\tb\tc\n12\t123123213\t12313', 'tabs');
+	// -- 9 rows
 	// sql --format=html -e select * from t.t
 	// <table>
-	// <thead><tr><th>row</th><th>s</th><th>d</th></tr></head>
+	// <thead><tr><th>row</th><th>s</th><th>d</th></tr></thead>
 	// <tbody>
 	// <tr><td>1</td><td>foo</td><td>printable ASCII</td></tr>
 	// <tr><td>2</td><td>&#34;foo</td><td>printable ASCII with quotes</td></tr>
@@ -1148,7 +1191,7 @@ func Example_sql_table() {
 	// <tr><td>4</td><td>foo<br/>bar</td><td>non-printable ASCII</td></tr>
 	// <tr><td>5</td><td>κόσμε</td><td>printable UTF8</td></tr>
 	// <tr><td>6</td><td>ñ</td><td>printable UTF8 using escapes</td></tr>
-	// <tr><td>7</td><td>&#34;\x01&#34;</td><td>non-printable UTF8 string</td></tr>
+	// <tr><td>7</td><td>\x01</td><td>non-printable UTF8 string</td></tr>
 	// <tr><td>8</td><td>܈85</td><td>UTF8 string with RTL char</td></tr>
 	// <tr><td>9</td><td>a	b	c<br/>12	123123213	12313</td><td>tabs</td></tr>
 	// </tbody>
@@ -1187,8 +1230,8 @@ func Example_sql_table() {
 	// ## 28
 	// printable UTF8 using escapes
 	// # row 7
-	// ## 6
-	// "\x01"
+	// ## 4
+	// \x01
 	// ## 25
 	// non-printable UTF8 string
 	// # row 8
@@ -1203,185 +1246,113 @@ func Example_sql_table() {
 	// ## 4
 	// tabs
 	// # 9 rows
-	// sql --format=records -e select * from t.t
-	// -[ RECORD 1 ]
-	// s | foo
-	// d | printable ASCII
-	// -[ RECORD 2 ]
-	// s | "foo
-	// d | printable ASCII with quotes
-	// -[ RECORD 3 ]
-	// s | \foo
-	// d | printable ASCII with backslash
-	// -[ RECORD 4 ]
-	// s | foo
-	//   | bar
-	// d | non-printable ASCII
-	// -[ RECORD 5 ]
-	// s | κόσμε
-	// d | printable UTF8
-	// -[ RECORD 6 ]
-	// s | ñ
-	// d | printable UTF8 using escapes
-	// -[ RECORD 7 ]
-	// s | "\x01"
-	// d | non-printable UTF8 string
-	// -[ RECORD 8 ]
-	// s | ܈85
-	// d | UTF8 string with RTL char
-	// -[ RECORD 9 ]
-	// s | a	b	c
-	//   | 12	123123213	12313
-	// d | tabs
-	// sql --format=pretty -e select '  hai' as x
-	// +-------+
-	// |   x   |
-	// +-------+
-	// |   hai |
-	// +-------+
-	// (1 row)
-	// sql --format=pretty -e explain select s from t.t union all select s from t.t
-	// +----------------+-------+-------------+
-	// |      Tree      | Field | Description |
-	// +----------------+-------+-------------+
-	// | append         |       |             |
-	// |  ├── render    |       |             |
-	// |  │    └── scan |       |             |
-	// |  │             | table | t@primary   |
-	// |  │             | spans | ALL         |
-	// |  └── render    |       |             |
-	// |       └── scan |       |             |
-	// |                | table | t@primary   |
-	// |                | spans | ALL         |
-	// +----------------+-------+-------------+
-	// (9 rows)
 }
 
-func Example_user() {
+func TestRenderHTML(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	cols := []string{"colname"}
+	align := "d"
+	rows := [][]string{
+		{"<b>foo</b>"},
+		{"bar"},
+	}
+
+	type testCase struct {
+		reporter htmlReporter
+		out      string
+	}
+
+	testCases := []testCase{
+		{
+			reporter: htmlReporter{},
+			out: `<table>
+<thead><tr><th>colname</th></tr></thead>
+<tbody>
+<tr><td><b>foo</b></td></tr>
+<tr><td>bar</td></tr>
+</tbody>
+</table>
+`,
+		},
+		{
+			reporter: htmlReporter{escape: true},
+			out: `<table>
+<thead><tr><th>colname</th></tr></thead>
+<tbody>
+<tr><td>&lt;b&gt;foo&lt;/b&gt;</td></tr>
+<tr><td>bar</td></tr>
+</tbody>
+</table>
+`,
+		},
+		{
+			reporter: htmlReporter{rowStats: true},
+			out: `<table>
+<thead><tr><th>row</th><th>colname</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><b>foo</b></td></tr>
+<tr><td>2</td><td>bar</td></tr>
+</tbody>
+<tfoot><tr><td colspan=2>2 rows</td></tr></tfoot></table>
+`,
+		},
+		{
+			reporter: htmlReporter{escape: true, rowStats: true},
+			out: `<table>
+<thead><tr><th>row</th><th>colname</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>&lt;b&gt;foo&lt;/b&gt;</td></tr>
+<tr><td>2</td><td>bar</td></tr>
+</tbody>
+<tfoot><tr><td colspan=2>2 rows</td></tr></tfoot></table>
+`,
+		},
+	}
+
+	for _, tc := range testCases {
+		name := fmt.Sprintf("escape=%v/rowStats=%v", tc.reporter.escape, tc.reporter.rowStats)
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := render(&tc.reporter, &buf,
+				cols, newRowSliceIter(rows, align),
+				nil /* completedHook */, nil /* noRowsHook */)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.out != buf.String() {
+				t.Errorf("expected:\n%s\ngot:\n%s", tc.out, buf.String())
+			}
+		})
+	}
+}
+
+func Example_misc_table() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
-	c.Run("user ls")
-	c.Run("user ls --format=pretty")
-	c.Run("user ls --format=tsv")
-	c.Run("user set FOO")
-	c.RunWithArgs([]string{"sql", "-e", "create user if not exists 'FOO'"})
-	c.Run("user set Foo")
-	c.Run("user set fOo")
-	c.Run("user set foO")
-	c.Run("user set foo")
-	c.Run("user set _foo")
-	c.Run("user set f_oo")
-	c.Run("user set foo_")
-	c.Run("user set ,foo")
-	c.Run("user set f,oo")
-	c.Run("user set foo,")
-	c.Run("user set 0foo")
-	c.Run("user set foo0")
-	c.Run("user set f0oo")
-	c.Run("user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof")
-	c.Run("user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo")
-	c.Run("user set Ομηρος")
-	// Try some reserved keywords.
-	c.Run("user set and")
-	c.Run("user set table")
-	// Don't use get, since the output of hashedPassword is random.
-	// c.Run("user get foo")
-	c.Run("user ls --format=pretty")
-	c.Run("user rm foo")
-	c.Run("user ls --format=pretty")
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.t (s string, d string);"})
+	c.RunWithArgs([]string{"sql", "--format=table", "-e", "select '  hai' as x"})
+	c.RunWithArgs([]string{"sql", "--format=table", "-e", "explain select s, 'foo' from t.t"})
 
 	// Output:
-	// user ls
-	// username
-	// root
-	// # 1 row
-	// user ls --format=pretty
-	// +----------+
-	// | username |
-	// +----------+
-	// | root     |
-	// +----------+
+	// sql -e create database t; create table t.t (s string, d string);
+	// CREATE TABLE
+	// sql --format=table -e select '  hai' as x
+	//     x
+	// ---------
+	//     hai
 	// (1 row)
-	// user ls --format=tsv
-	// username
-	// root
-	// # 1 row
-	// user set FOO
-	// CREATE USER 1
-	// sql -e create user if not exists 'FOO'
-	// CREATE USER 0
-	// user set Foo
-	// CREATE USER 0
-	// user set fOo
-	// CREATE USER 0
-	// user set foO
-	// CREATE USER 0
-	// user set foo
-	// CREATE USER 0
-	// user set _foo
-	// CREATE USER 1
-	// user set f_oo
-	// CREATE USER 1
-	// user set foo_
-	// CREATE USER 1
-	// user set ,foo
-	// pq: username ",foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
-	// user set f,oo
-	// pq: username "f,oo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
-	// user set foo,
-	// pq: username "foo," invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
-	// user set 0foo
-	// pq: username "0foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
-	// user set foo0
-	// CREATE USER 1
-	// user set f0oo
-	// CREATE USER 1
-	// user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof
-	// pq: username "foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
-	// user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo
-	// CREATE USER 1
-	// user set Ομηρος
-	// CREATE USER 1
-	// user set and
-	// CREATE USER 1
-	// user set table
-	// CREATE USER 1
-	// user ls --format=pretty
-	// +-----------------------------------------------------------------+
-	// |                            username                             |
-	// +-----------------------------------------------------------------+
-	// | _foo                                                            |
-	// | and                                                             |
-	// | f0oo                                                            |
-	// | f_oo                                                            |
-	// | foo                                                             |
-	// | foo0                                                            |
-	// | foo_                                                            |
-	// | foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo |
-	// | root                                                            |
-	// | table                                                           |
-	// | ομηρος                                                          |
-	// +-----------------------------------------------------------------+
-	// (11 rows)
-	// user rm foo
-	// DROP USER 1
-	// user ls --format=pretty
-	// +-----------------------------------------------------------------+
-	// |                            username                             |
-	// +-----------------------------------------------------------------+
-	// | _foo                                                            |
-	// | and                                                             |
-	// | f0oo                                                            |
-	// | f_oo                                                            |
-	// | foo0                                                            |
-	// | foo_                                                            |
-	// | foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo |
-	// | root                                                            |
-	// | table                                                           |
-	// | ομηρος                                                          |
-	// +-----------------------------------------------------------------+
-	// (10 rows)
+	// sql --format=table -e explain select s, 'foo' from t.t
+	//     tree    |    field    | description
+	// ------------+-------------+--------------
+	//             | distributed | true
+	//             | vectorized  | false
+	//   render    |             |
+	//    └── scan |             |
+	//             | table       | t@primary
+	//             | spans       | ALL
+	// (6 rows)
 }
 
 func Example_cert() {
@@ -1391,12 +1362,16 @@ func Example_cert() {
 	c.RunWithCAArgs([]string{"cert", "create-client", "foo"})
 	c.RunWithCAArgs([]string{"cert", "create-client", "Ομηρος"})
 	c.RunWithCAArgs([]string{"cert", "create-client", "0foo"})
+	c.RunWithCAArgs([]string{"cert", "create-client", ",foo"})
 
 	// Output:
 	// cert create-client foo
 	// cert create-client Ομηρος
 	// cert create-client 0foo
-	// failed to generate client certificate and key: username "0foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
+	// cert create-client ,foo
+	// ERROR: failed to generate client certificate and key: username ",foo" invalid
+	// SQLSTATE: 42602
+	// HINT: Usernames are case insensitive, must start with a letter, digit or underscore, may contain letters, digits, dashes, periods, or underscores, and must not exceed 63 characters.
 }
 
 // TestFlagUsage is a basic test to make sure the fragile
@@ -1408,29 +1383,29 @@ func TestFlagUsage(t *testing.T) {
   cockroach [command]
 
 Available Commands:
-  start       start a node
-  init        initialize a cluster
-  cert        create ca, node, and client certs
-  quit        drain and shutdown node
+  start             start a node in a multi-node cluster
+  start-single-node start a single-node cluster
+  init              initialize a cluster
+  cert              create ca, node, and client certs
+  quit              drain and shutdown node
 
-  sql         open a sql shell
-  user        get, set, list and remove users
-  zone        get, set, list and remove zones
-  node        list, inspect or remove nodes
-  dump        dump sql tables
+  sql               open a sql shell
+  auth-session      log in and out of HTTP sessions
+  node              list, inspect or remove nodes
+  dump              dump sql tables
 
-  gen         generate auxiliary files
-  version     output version information
-  debug       debugging commands
-  help        Help about any command
+  nodelocal         upload and delete nodelocal files
+  demo              open a demo sql shell
+  gen               generate auxiliary files
+  version           output version information
+  debug             debugging commands
+  sqlfmt            format SQL statements
+  workload          [experimental] generators for data and query loads
+  systembench       Run systembench
+  help              Help about any command
 
 Flags:
   -h, --help                             help for cockroach
-      --log-backtrace-at traceLocation   when logging hits line file:N, emit a stack trace (default :0)
-      --log-dir string                   if non-empty, write log files in this directory
-      --log-dir-max-size bytes           maximum combined size of all log files (default 100 MiB)
-      --log-file-max-size bytes          maximum size of each log file (default 10 MiB)
-      --log-file-verbosity Severity      minimum verbosity of messages written to the log file (default INFO)
       --logtostderr Severity[=DEFAULT]   logs at or above this threshold go to stderr (default NONE)
       --no-color                         disable standard error log colorization
 
@@ -1466,8 +1441,11 @@ Use "cockroach [command] --help" for more information about a command.
 				done <- err
 			}()
 
-			if err := Run(test.flags); err != nil && !test.expErr {
-				t.Error(err)
+			if err := Run(test.flags); err != nil {
+				fmt.Fprintln(w, "Error:", err)
+				if !test.expErr {
+					t.Error(err)
+				}
 			}
 
 			// back to normal state
@@ -1477,7 +1455,7 @@ Use "cockroach [command] --help" for more information about a command.
 			}
 
 			// Filter out all test flags.
-			testFlagRE := regexp.MustCompile(`--(test\.|verbosity|vmodule)`)
+			testFlagRE := regexp.MustCompile(`--(test\.|vmodule|rewrite)`)
 			lines := strings.Split(buf.String(), "\n")
 			final := []string{}
 			for _, l := range lines {
@@ -1488,9 +1466,7 @@ Use "cockroach [command] --help" for more information about a command.
 			}
 			got := strings.Join(final, "\n")
 
-			if got != test.expected {
-				t.Errorf("got:\n%s\n----\nexpected:\n%s", got, test.expected)
-			}
+			assert.Equal(t, test.expected, got)
 		})
 	}
 }
@@ -1505,23 +1481,27 @@ func Example_node() {
 	}
 
 	c.Run("node ls")
-	c.Run("node ls --format=pretty")
+	c.Run("node ls --format=table")
 	c.Run("node status 10000")
+	c.RunWithArgs([]string{"sql", "-e", "drop database defaultdb"})
+	c.Run("node ls")
 
 	// Output:
 	// node ls
 	// id
 	// 1
-	// # 1 row
-	// node ls --format=pretty
-	// +----+
-	// | id |
-	// +----+
-	// |  1 |
-	// +----+
+	// node ls --format=table
+	//   id
+	// ------
+	//    1
 	// (1 row)
 	// node status 10000
-	// Error: node 10000 doesn't exist
+	// ERROR: node 10000 doesn't exist
+	// sql -e drop database defaultdb
+	// DROP DATABASE
+	// node ls
+	// id
+	// 1
 }
 
 func TestCLITimeout(t *testing.T) {
@@ -1532,17 +1512,17 @@ func TestCLITimeout(t *testing.T) {
 
 	// Wrap the meat of the test in a retry loop. Setting a timeout like this is
 	// racy as the operation may have succeeded by the time the scheduler gives
-	// the timeout a chance to have an effect.
+	// the timeout a chance to have an effect. We specify --all to include some
+	// slower to access virtual tables in the query.
 	testutils.SucceedsSoon(t, func() error {
-		out, err := c.RunWithCapture("node status 1 --timeout 1ns")
+		out, err := c.RunWithCapture("node status 1 --all --timeout 1ns")
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		const exp = `node status 1 --timeout 1ns
-operation timed out.
-
-context deadline exceeded
+		const exp = `node status 1 --all --timeout 1ns
+ERROR: query execution canceled due to statement timeout
+SQLSTATE: 57014
 `
 		if out != exp {
 			err := errors.Errorf("unexpected output:\n%q\nwanted:\n%q", out, exp)
@@ -1556,6 +1536,8 @@ context deadline exceeded
 func TestNodeStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	t.Skip("currently flaky: #38151")
+
 	start := timeutil.Now()
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
@@ -1565,49 +1547,49 @@ func TestNodeStatus(t *testing.T) {
 		t.Fatalf("couldn't write stats summaries: %s", err)
 	}
 
-	out, err := c.RunWithCapture("node status 1 --format=pretty")
+	out, err := c.RunWithCapture("node status 1 --format=table")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkNodeStatus(t, c, out, start)
 
-	out, err = c.RunWithCapture("node status --ranges --format=pretty")
+	out, err = c.RunWithCapture("node status --ranges --format=table")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkNodeStatus(t, c, out, start)
 
-	out, err = c.RunWithCapture("node status --stats --format=pretty")
+	out, err = c.RunWithCapture("node status --stats --format=table")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkNodeStatus(t, c, out, start)
 
-	out, err = c.RunWithCapture("node status --ranges --stats --format=pretty")
+	out, err = c.RunWithCapture("node status --ranges --stats --format=table")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkNodeStatus(t, c, out, start)
 
-	out, err = c.RunWithCapture("node status --decommission --format=pretty")
+	out, err = c.RunWithCapture("node status --decommission --format=table")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkNodeStatus(t, c, out, start)
 
-	out, err = c.RunWithCapture("node status --ranges --stats --decommission --format=pretty")
+	out, err = c.RunWithCapture("node status --ranges --stats --decommission --format=table")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkNodeStatus(t, c, out, start)
 
-	out, err = c.RunWithCapture("node status --all --format=pretty")
+	out, err = c.RunWithCapture("node status --all --format=table")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkNodeStatus(t, c, out, start)
 
-	out, err = c.RunWithCapture("node status --format=pretty")
+	out, err = c.RunWithCapture("node status --format=table")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1628,8 +1610,6 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 	if !s.Scan() {
 		t.Fatalf("Couldn't skip command line: %s", s.Err())
 	}
-
-	checkSeparatorLine(t, s)
 
 	// check column names.
 	if !s.Scan() {
@@ -1668,15 +1648,23 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 		t.Errorf("node address (%s) != expected (%s)", a, e)
 	}
 
+	nodeSQLAddr, err := c.Gossip().GetNodeIDSQLAddress(nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, e := fields[2], nodeSQLAddr.String(); a != e {
+		t.Errorf("node SQL address (%s) != expected (%s)", a, e)
+	}
+
 	// Verify Build Tag.
-	if a, e := fields[2], build.GetInfo().Tag; a != e {
+	if a, e := fields[3], build.GetInfo().Tag; a != e {
 		t.Errorf("build tag (%s) != expected (%s)", a, e)
 	}
 
 	// Verify that updated_at and started_at are reasonably recent.
 	// CircleCI can be very slow. This was flaky at 5s.
-	checkTimeElapsed(t, fields[3], 15*time.Second, start)
 	checkTimeElapsed(t, fields[4], 15*time.Second, start)
+	checkTimeElapsed(t, fields[5], 15*time.Second, start)
 
 	testcases := []testCase{}
 
@@ -1684,16 +1672,20 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 	// address. They don't need closer checks.
 	baseIdx := len(baseNodeColumnHeaders)
 
-	// Adding fields that need verification for --range flag.
+	// Adding fields that need verification for --ranges flag.
+	// We have to allow up to 1 unavailable/underreplicated range because
+	// sometimes we run the `node status` command before the server has fully
+	// initialized itself and it doesn't consider itself live yet. In such cases,
+	// there will only be one range covering the entire keyspace because it won't
+	// have been able to do any splits yet.
 	if nodeCtx.statusShowRanges || nodeCtx.statusShowAll {
 		testcases = append(testcases,
-			testCase{"leader_ranges", baseIdx, 3},
-			testCase{"repl_ranges", baseIdx + 1, 3},
-			testCase{"avail_ranges", baseIdx + 2, 3},
+			testCase{"leader_ranges", baseIdx, 22},
+			testCase{"leaseholder_ranges", baseIdx + 1, 22},
+			testCase{"ranges", baseIdx + 2, 22},
+			testCase{"unavailable_ranges", baseIdx + 3, 1},
+			testCase{"underreplicated_ranges", baseIdx + 4, 1},
 		)
-
-		// Ranges actually adds 5 fields, but we only need to check
-		// the 3 above.
 		baseIdx += len(statusNodesColumnHeadersForRanges)
 	}
 
@@ -1701,12 +1693,19 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 	if nodeCtx.statusShowStats || nodeCtx.statusShowAll {
 		testcases = append(testcases,
 			testCase{"live_bytes", baseIdx, 100000},
-			testCase{"key_bytes", baseIdx + 1, 30000},
+			testCase{"key_bytes", baseIdx + 1, 50000},
 			testCase{"value_bytes", baseIdx + 2, 100000},
-			testCase{"intent_bytes", baseIdx + 3, 30000},
-			testCase{"system_bytes", baseIdx + 4, 30000},
+			testCase{"intent_bytes", baseIdx + 3, 50000},
+			testCase{"system_bytes", baseIdx + 4, 50000},
 		)
 		baseIdx += len(statusNodesColumnHeadersForStats)
+	}
+
+	if nodeCtx.statusShowDecommission || nodeCtx.statusShowAll {
+		testcases = append(testcases,
+			testCase{"gossiped_replicas", baseIdx, 30},
+		)
+		baseIdx++
 	}
 
 	for _, tc := range testcases {
@@ -1724,7 +1723,15 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 		}
 	}
 
-	checkSeparatorLine(t, s)
+	if nodeCtx.statusShowDecommission || nodeCtx.statusShowAll {
+		names := []string{"is_decommissioning", "is_draining"}
+		for i := range names {
+			if fields[baseIdx] != "false" {
+				t.Errorf("value for %s (%s) should be false", names[i], fields[baseIdx])
+			}
+			baseIdx++
+		}
+	}
 }
 
 var separatorLineExp = regexp.MustCompile(`[\+-]+$`)
@@ -1762,10 +1769,9 @@ func extractFields(line string) ([]string, error) {
 	// fields has two extra entries, one for the empty token to the left of the first
 	// |, and another empty one to the right of the final |. So, we need to take those
 	// out.
-	if a, e := len(fields), len(getStatusNodeHeaders())+2; a != e {
+	if a, e := len(fields), len(getStatusNodeHeaders()); a != e {
 		return nil, errors.Errorf("can't extract fields: # of fields (%d) != expected (%d)", a, e)
 	}
-	fields = fields[1 : len(fields)-1]
 	var r []string
 	for _, f := range fields {
 		r = append(r, strings.TrimSpace(f))
@@ -1820,18 +1826,43 @@ func TestGenAutocomplete(t *testing.T) {
 		}
 	}()
 
-	const minsize = 25000
-	acpath := filepath.Join(acdir, "cockroach.bash")
+	for _, tc := range []struct {
+		shell  string
+		expErr string
+	}{
+		{shell: ""},
+		{shell: "bash"},
+		{shell: "zsh"},
+		{shell: "bad", expErr: `invalid argument "bad" for "cockroach gen autocomplete"`},
+	} {
+		t.Run("shell="+tc.shell, func(t *testing.T) {
+			const minsize = 1000
+			acpath := filepath.Join(acdir, "output-"+tc.shell)
 
-	if err := Run([]string{"gen", "autocomplete", "--out=" + acpath}); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(acpath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if size := info.Size(); size < minsize {
-		t.Fatalf("autocomplete file size (%d) < minimum (%d)", size, minsize)
+			args := []string{"gen", "autocomplete", "--out=" + acpath}
+			if len(tc.shell) > 0 {
+				args = append(args, tc.shell)
+			}
+			err := Run(args)
+			if tc.expErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if !testutils.IsError(err, tc.expErr) {
+					t.Fatalf("expected error %s, found %v", tc.expErr, err)
+				}
+				return
+			}
+
+			info, err := os.Stat(acpath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if size := info.Size(); size < minsize {
+				t.Fatalf("autocomplete file size (%d) < minimum (%d)", size, minsize)
+			}
+		})
 	}
 }
 
@@ -1842,81 +1873,37 @@ func TestJunkPositionalArguments(t *testing.T) {
 	defer c.cleanup()
 
 	for i, test := range []string{
-		"start junk",
-		"sql junk",
-		"gen man junk",
-		"gen autocomplete junk",
-		"gen example-data file junk",
+		"start",
+		"sql",
+		"gen man",
+		"gen example-data intro",
 	} {
-		out, err := c.RunWithCapture(test)
+		const junk = "junk"
+		line := test + " " + junk
+		out, err := c.RunWithCapture(line)
 		if err != nil {
 			t.Fatal(errors.Wrap(err, strconv.Itoa(i)))
 		}
-		exp := test + "\ninvalid arguments\n"
+		exp := fmt.Sprintf("%s\nERROR: unknown command %q for \"cockroach %s\"\n", line, junk, test)
 		if exp != out {
 			t.Errorf("expected:\n%s\ngot:\n%s", exp, out)
 		}
 	}
 }
 
-func TestZip(t *testing.T) {
+func TestWorkload(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	c := newCLITest(cliTestParams{})
+	c := newCLITest(cliTestParams{noServer: true})
 	defer c.cleanup()
 
-	out, err := c.RunWithCapture("debug zip " + os.DevNull)
+	out, err := c.RunWithCapture("workload init --help")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	const expected = `debug zip ` + os.DevNull + `
-writing ` + os.DevNull + `
-  debug/events
-  debug/liveness
-  debug/settings
-  debug/nodes/1/status
-  debug/nodes/1/gossip
-  debug/nodes/1/stacks
-  debug/nodes/1/ranges/1
-  debug/nodes/1/ranges/2
-  debug/nodes/1/ranges/3
-  debug/nodes/1/ranges/4
-  debug/nodes/1/ranges/5
-  debug/nodes/1/ranges/6
-  debug/nodes/1/ranges/7
-  debug/nodes/1/ranges/8
-  debug/nodes/1/ranges/9
-  debug/nodes/1/ranges/10
-  debug/nodes/1/ranges/11
-  debug/nodes/1/ranges/12
-  debug/nodes/1/ranges/13
-  debug/nodes/1/ranges/14
-  debug/nodes/1/ranges/15
-  debug/nodes/1/ranges/16
-  debug/nodes/1/ranges/17
-  debug/nodes/1/ranges/18
-  debug/nodes/1/ranges/19
-  debug/nodes/1/ranges/20
-  debug/schema/system@details
-  debug/schema/system/descriptor
-  debug/schema/system/eventlog
-  debug/schema/system/jobs
-  debug/schema/system/lease
-  debug/schema/system/locations
-  debug/schema/system/namespace
-  debug/schema/system/rangelog
-  debug/schema/system/role_members
-  debug/schema/system/settings
-  debug/schema/system/table_statistics
-  debug/schema/system/ui
-  debug/schema/system/users
-  debug/schema/system/web_sessions
-  debug/schema/system/zones
-`
-
-	if out != expected {
-		t.Errorf("expected:\n%s\ngot:\n%s", expected, out)
+	if !strings.Contains(out, `startrek`) {
+		t.Fatalf(`startrek workload failed to register got: %s`, out)
 	}
 }
 
@@ -1940,5 +1927,108 @@ func Example_in_memory() {
 	// node ls
 	// id
 	// 1
-	// # 1 row
+	//
+}
+
+func Example_pretty_print_numerical_strings() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	// All strings in pretty-print output should be aligned to left regardless of their contents
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.t (s string, d string);"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'0', 'positive numerical string')"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'-1', 'negative numerical string')"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'1.0', 'decimal numerical string')"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'aaaaa', 'non-numerical string')"})
+	c.RunWithArgs([]string{"sql", "--format=table", "-e", "select * from t.t"})
+
+	// Output:
+	// sql -e create database t; create table t.t (s string, d string);
+	// CREATE TABLE
+	// sql -e insert into t.t values (e'0', 'positive numerical string')
+	// INSERT 1
+	// sql -e insert into t.t values (e'-1', 'negative numerical string')
+	// INSERT 1
+	// sql -e insert into t.t values (e'1.0', 'decimal numerical string')
+	// INSERT 1
+	// sql -e insert into t.t values (e'aaaaa', 'non-numerical string')
+	// INSERT 1
+	// sql --format=table -e select * from t.t
+	//     s   |             d
+	// --------+----------------------------
+	//   0     | positive numerical string
+	//   -1    | negative numerical string
+	//   1.0   | decimal numerical string
+	//   aaaaa | non-numerical string
+	// (4 rows)
+}
+
+func Example_sqlfmt() {
+	c := newCLITest(cliTestParams{noServer: true})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{"sqlfmt", "-e", ";"})
+	c.RunWithArgs([]string{"sqlfmt", "-e", "delete from t"})
+	c.RunWithArgs([]string{"sqlfmt", "-e", "delete from t", "-e", "update t set a = 1"})
+	c.RunWithArgs([]string{"sqlfmt", "--print-width=10", "-e", "select 1,2,3 from a,b,c;;;select 4"})
+	c.RunWithArgs([]string{"sqlfmt", "--print-width=10", "--align", "-e", "select 1,2,3 from a,b,c;;;select 4"})
+	c.RunWithArgs([]string{"sqlfmt", "--print-width=10", "--tab-width=2", "--use-spaces", "-e", "select 1,2,3 from a,b,c;;;select 4"})
+	c.RunWithArgs([]string{"sqlfmt", "-e", "select (1+2)+3"})
+	c.RunWithArgs([]string{"sqlfmt", "--no-simplify", "-e", "select (1+2)+3"})
+
+	// Output:
+	// sqlfmt -e ;
+	// sqlfmt -e delete from t
+	// DELETE FROM t
+	// sqlfmt -e delete from t -e update t set a = 1
+	// DELETE FROM t;
+	// UPDATE t SET a = 1;
+	// sqlfmt --print-width=10 -e select 1,2,3 from a,b,c;;;select 4
+	// SELECT
+	// 	1,
+	// 	2,
+	// 	3
+	// FROM
+	// 	a,
+	// 	b,
+	// 	c;
+	// SELECT 4;
+	// sqlfmt --print-width=10 --align -e select 1,2,3 from a,b,c;;;select 4
+	// SELECT 1,
+	//        2,
+	//        3
+	//   FROM a,
+	//        b,
+	//        c;
+	// SELECT 4;
+	// sqlfmt --print-width=10 --tab-width=2 --use-spaces -e select 1,2,3 from a,b,c;;;select 4
+	// SELECT
+	//   1, 2, 3
+	// FROM
+	//   a, b, c;
+	// SELECT 4;
+	// sqlfmt -e select (1+2)+3
+	// SELECT 1 + 2 + 3
+	// sqlfmt --no-simplify -e select (1+2)+3
+	// SELECT (1 + 2) + 3
+}
+
+func Example_dump_no_visible_columns() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{"sql", "-e", "create table t(x int); set sql_safe_updates=false; alter table t drop x"})
+	c.RunWithArgs([]string{"dump", "defaultdb"})
+
+	// Output:
+	// sql -e create table t(x int); set sql_safe_updates=false; alter table t drop x
+	// ALTER TABLE
+	// dump defaultdb
+	// CREATE TABLE t (,
+	// 	FAMILY "primary" (rowid)
+	// );
+	// ERROR: table "defaultdb.public.t" has no visible columns
+	// HINT: To proceed with the dump, either omit this table from the list of tables to dump, drop the table, or add some visible columns.
+	// --
+	// See: https://github.com/cockroachdb/cockroach/issues/37768
 }

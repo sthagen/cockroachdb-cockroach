@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tests_test
 
@@ -27,7 +23,9 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -81,14 +79,16 @@ func TestMonotonicInserts(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
 
-	for _, distSQLMode := range []sql.DistSQLExecMode{sql.DistSQLOff, sql.DistSQLOn} {
+	for _, distSQLMode := range []sessiondata.DistSQLExecMode{
+		sessiondata.DistSQLOff, sessiondata.DistSQLOn,
+	} {
 		t.Run(fmt.Sprintf("distsql=%s", distSQLMode), func(t *testing.T) {
 			testMonotonicInserts(t, distSQLMode)
 		})
 	}
 }
 
-func testMonotonicInserts(t *testing.T, distSQLMode sql.DistSQLExecMode) {
+func testMonotonicInserts(t *testing.T, distSQLMode sessiondata.DistSQLExecMode) {
 	defer leaktest.AfterTest(t)()
 
 	if testing.Short() {
@@ -108,6 +108,10 @@ func testMonotonicInserts(t *testing.T, distSQLMode sql.DistSQLExecMode) {
 		st := server.ClusterSettings()
 		st.Manual.Store(true)
 		sql.DistSQLClusterExecMode.Override(&st.SV, int64(distSQLMode))
+		// Let transactions push immediately to detect deadlocks. The test creates a
+		// large amount of contention and dependency cycles, and could take a long
+		// time to complete without this.
+		concurrency.LockTableDeadlockDetectionPushDelay.Override(&st.SV, 0)
 	}
 
 	var clients []mtClient
@@ -147,7 +151,7 @@ INSERT INTO mono.mono VALUES(-1, '0', -1, -1)`); err != nil {
 			}
 
 			l("read max val")
-			if err := tx.QueryRow(`SELECT MAX(val) AS m FROM mono.mono`).Scan(
+			if err := tx.QueryRow(`SELECT max(val) AS m FROM mono.mono`).Scan(
 				&exRow.val,
 			); err != nil {
 				l(err.Error())
@@ -185,7 +189,7 @@ RETURNING val, sts, node, tb`,
 	verify := func() {
 		client := clients[0]
 		var numDistinct int
-		if err := client.QueryRow("SELECT COUNT(DISTINCT(val)) FROM mono.mono").Scan(
+		if err := client.QueryRow("SELECT count(DISTINCT(val)) FROM mono.mono").Scan(
 			&numDistinct,
 		); err != nil {
 			t.Fatal(err)

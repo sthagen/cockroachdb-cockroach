@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import { assert } from "chai";
 import { shallow } from "enzyme";
@@ -5,6 +15,7 @@ import * as sinon from "sinon";
 import moment from "moment";
 import _ from "lodash";
 
+import "src/enzymeInit";
 import { TimeWindowManagerUnconnected as TimeWindowManager } from "./";
 import * as timewindow from "src/redux/timewindow";
 

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package localcluster
 
@@ -34,19 +30,14 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/pkg/errors"
-	// Import postgres driver.
-	_ "github.com/lib/pq"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -55,6 +46,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/gogo/protobuf/proto"
+	// Import postgres driver.
+	_ "github.com/lib/pq"
+	"github.com/pkg/errors"
 )
 
 func repoRoot() string {
@@ -63,6 +58,12 @@ func repoRoot() string {
 		panic(fmt.Sprintf("must run from within the cockroach repository: %s", err))
 	}
 	return root.Dir
+}
+
+// SourceBinary returns the path of the cockroach binary that was built with the
+// local source.
+func SourceBinary() string {
+	return filepath.Join(repoRoot(), "cockroach")
 }
 
 const listeningURLFile = "cockroachdb-url"
@@ -84,6 +85,7 @@ type ClusterConfig struct {
 	PerNodeCfg  map[int]NodeConfig // optional map of nodeIndex -> configuration
 	DB          string             // database to configure DB connection for
 	NumWorkers  int                // SetMaxOpenConns to use for DB connection
+	NoWait      bool               // if set, return from Start before cluster ready
 }
 
 // NodeConfig is a configuration for a node in a Cluster. Options with the zero
@@ -135,7 +137,7 @@ func (s *seqGen) Next() int32 {
 // New creates a Cluster with the given configuration.
 func New(cfg ClusterConfig) *Cluster {
 	if cfg.Binary == "" {
-		cfg.Binary = filepath.Join(repoRoot(), "cockroach")
+		cfg.Binary = SourceBinary()
 	}
 	return &Cluster{
 		Cfg:     cfg,
@@ -194,7 +196,7 @@ func (c *Cluster) Start(ctx context.Context) {
 		}
 	}
 
-	if c.Cfg.NumNodes > 1 {
+	if !c.Cfg.NoWait {
 		for i := range chs {
 			if err := <-chs[i]; err != nil {
 				log.Fatalf(ctx, "node %d: %s", i+1, err)
@@ -204,7 +206,7 @@ func (c *Cluster) Start(ctx context.Context) {
 
 	log.Infof(context.Background(), "started %.3fs", timeutil.Since(c.started).Seconds())
 
-	if c.Cfg.NumNodes > 1 {
+	if c.Cfg.NumNodes > 1 || !c.Cfg.NoWait {
 		c.waitForFullReplication()
 	} else {
 		// NB: This is useful for TestRapidRestarts.
@@ -270,7 +272,7 @@ func (c *Cluster) makeNode(ctx context.Context, nodeIdx int, cfg NodeConfig) (*N
 		Insecure: true,
 	}
 	rpcCtx := rpc.NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, baseCtx,
-		hlc.NewClock(hlc.UnixNano, 0), c.stopper, &cluster.MakeTestingClusterSettings().Version)
+		hlc.NewClock(hlc.UnixNano, 0), c.stopper, cluster.MakeTestingClusterSettings())
 
 	n := &Node{
 		Cfg:    cfg,
@@ -282,6 +284,9 @@ func (c *Cluster) makeNode(ctx context.Context, nodeIdx int, cfg NodeConfig) (*N
 		cfg.Binary,
 		"start",
 		"--insecure",
+		// Although --host/--port are deprecated, we cannot yet replace
+		// this here by --listen-addr/--listen-port, because
+		// TestVersionUpgrade will also try old binaries.
 		fmt.Sprintf("--host=%s", n.IPAddr()),
 		fmt.Sprintf("--port=%d", cfg.RPCPort),
 		fmt.Sprintf("--http-port=%d", cfg.HTTPPort),
@@ -327,41 +332,35 @@ func (c *Cluster) waitForFullReplication() {
 	log.Infof(context.Background(), "replicated %.3fs", timeutil.Since(c.started).Seconds())
 }
 
-// Client returns a *client.DB for the node with the given index.
-func (c *Cluster) Client(idx int) *client.DB {
-	return c.Nodes[idx].Client()
-}
-
 func (c *Cluster) isReplicated() (bool, string) {
-	db := c.Client(0)
-	rows, err := db.Scan(context.Background(), keys.Meta2Prefix, keys.Meta2Prefix.PrefixEnd(), 100000)
+	db := c.Nodes[0].DB()
+	rows, err := db.Query(`SELECT range_id, start_key, end_key, array_length(replicas, 1) FROM crdb_internal.ranges`)
 	if err != nil {
-		if IsUnavailableError(err) {
-			return false, ""
+		// Versions <= 1.1 do not contain the crdb_internal table, which is what's used
+		// to determine whether a cluster has up-replicated. This is relevant for the
+		// version upgrade acceptance test. Just skip the replication check for this case.
+		if testutils.IsError(err, "(table|relation) \"crdb_internal.ranges\" does not exist") {
+			return true, ""
 		}
-		log.Fatalf(context.Background(), "scan failed: %s\n", err)
+		log.Fatal(context.Background(), err)
 	}
+	defer rows.Close()
 
 	var buf bytes.Buffer
 	tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
-
 	done := true
-	for _, row := range rows {
-		desc := &roachpb.RangeDescriptor{}
-		if err := row.ValueProto(desc); err != nil {
-			log.Fatalf(context.Background(), "%s: unable to unmarshal range descriptor\n", row.Key)
-			continue
+	for rows.Next() {
+		var rangeID int64
+		var startKey, endKey roachpb.Key
+		var numReplicas int
+		if err := rows.Scan(&rangeID, &startKey, &endKey, &numReplicas); err != nil {
+			log.Fatalf(context.Background(), "unable to scan range replicas: %s", err)
 		}
-		var storeIDs []roachpb.StoreID
-		for _, replica := range desc.Replicas {
-			storeIDs = append(storeIDs, replica.StoreID)
-		}
-		fmt.Fprintf(tw, "\t%s\t%s\t[%d]\t%d\n",
-			desc.StartKey, desc.EndKey, desc.RangeID, storeIDs)
+		fmt.Fprintf(tw, "\t%s\t%s\t[%d]\t%d\n", startKey, endKey, rangeID, numReplicas)
 		// This check is coarse since it doesn't know the real configuration.
 		// Assume all is well when there are 3+ replicas, or if there are as
 		// many replicas as there are nodes.
-		if len(desc.Replicas) < 3 && len(desc.Replicas) != len(c.Nodes) {
+		if numReplicas < 3 && numReplicas != len(c.Nodes) {
 			done = false
 		}
 	}
@@ -371,9 +370,9 @@ func (c *Cluster) isReplicated() (bool, string) {
 
 // UpdateZoneConfig updates the default zone config for the cluster.
 func (c *Cluster) UpdateZoneConfig(rangeMinBytes, rangeMaxBytes int64) {
-	zone := config.DefaultZoneConfig()
-	zone.RangeMinBytes = rangeMinBytes
-	zone.RangeMaxBytes = rangeMaxBytes
+	zone := zonepb.DefaultZoneConfig()
+	zone.RangeMinBytes = proto.Int64(rangeMinBytes)
+	zone.RangeMaxBytes = proto.Int64(rangeMaxBytes)
 
 	buf, err := protoutil.Marshal(&zone)
 	if err != nil {
@@ -387,41 +386,13 @@ func (c *Cluster) UpdateZoneConfig(rangeMinBytes, rangeMaxBytes int64) {
 
 // Split splits the range containing the split key at the specified split key.
 func (c *Cluster) Split(nodeIdx int, splitKey roachpb.Key) error {
-	return c.Client(nodeIdx).AdminSplit(context.Background(), splitKey, splitKey)
+	return errors.Errorf("Split is unimplemented and should be re-implemented using SQL")
 }
 
 // TransferLease transfers the lease for the range containing key to a random
 // alive node in the range.
 func (c *Cluster) TransferLease(nodeIdx int, r *rand.Rand, key roachpb.Key) (bool, error) {
-	desc, err := c.lookupRange(nodeIdx, key)
-	if err != nil {
-		return false, err
-	}
-	if len(desc.Replicas) <= 1 {
-		return false, nil
-	}
-
-	var target roachpb.StoreID
-	for {
-		target = desc.Replicas[r.Intn(len(desc.Replicas))].StoreID
-		if c.Nodes[target-1].Alive() {
-			break
-		}
-	}
-	if err := c.Client(nodeIdx).AdminTransferLease(context.Background(), key, target); err != nil {
-		return false, errors.Errorf("%s: transfer lease: %s", key, err)
-	}
-	return true, nil
-}
-
-func (c *Cluster) lookupRange(nodeIdx int, key roachpb.Key) (*roachpb.RangeDescriptor, error) {
-	sender := c.Client(nodeIdx).GetSender()
-	rs, _, err := client.RangeLookup(context.Background(), sender, key,
-		roachpb.CONSISTENT, 0 /* prefetchNum */, false /* prefetchReverse */)
-	if err != nil {
-		return nil, errors.Errorf("%s: lookup range: %s", key, err)
-	}
-	return &rs[0], nil
+	return false, errors.Errorf("TransferLease is unimplemented and should be re-implemented using SQL")
 }
 
 // RandNode returns the index of a random alive node.
@@ -449,7 +420,6 @@ type Node struct {
 	cmd            *exec.Cmd
 	rpcPort, pgURL string // legacy: remove once 1.0.x is no longer tested
 	db             *gosql.DB
-	client         *client.DB
 	statusClient   serverpb.StatusClient
 }
 
@@ -505,23 +475,6 @@ func (n *Node) Alive() bool {
 	return n.cmd != nil
 }
 
-// Client returns a *client.DB set up to talk to this node.
-func (n *Node) Client() *client.DB {
-	n.Lock()
-	existingClient := n.client
-	n.Unlock()
-
-	if existingClient != nil {
-		return existingClient
-	}
-
-	conn, err := n.rpcCtx.GRPCDialRaw(n.RPCAddr())
-	if err != nil {
-		log.Fatalf(context.Background(), "failed to initialize KV client: %s", err)
-	}
-	return client.NewDB(client.NewSender(conn), n.rpcCtx.LocalClock)
-}
-
 // StatusClient returns a StatusClient set up to talk to this node.
 func (n *Node) StatusClient() serverpb.StatusClient {
 	n.Lock()
@@ -532,7 +485,7 @@ func (n *Node) StatusClient() serverpb.StatusClient {
 		return existingClient
 	}
 
-	conn, err := n.rpcCtx.GRPCDialRaw(n.RPCAddr())
+	conn, _, err := n.rpcCtx.GRPCDialRaw(n.RPCAddr())
 	if err != nil {
 		log.Fatalf(context.Background(), "failed to initialize status client: %s", err)
 	}
@@ -566,7 +519,6 @@ func (n *Node) setNotRunningLocked(waitErr *exec.ExitError) {
 	}
 	n.notRunning = make(chan struct{})
 	n.db = nil
-	n.client = nil
 	n.statusClient = nil
 	n.cmd = nil
 	n.rpcPort = ""
@@ -583,6 +535,7 @@ func (n *Node) startAsyncInnerLocked(ctx context.Context, joins ...string) error
 	}
 	n.cmd = exec.Command(n.Cfg.ExtraArgs[0], args...)
 	n.cmd.Env = os.Environ()
+	n.cmd.Env = append(n.cmd.Env, "COCKROACH_SCAN_MAX_IDLE_TIME=5ms") // speed up rebalancing
 	n.cmd.Env = append(n.cmd.Env, n.Cfg.ExtraEnv...)
 
 	atomic.StoreInt32(&n.startSeq, n.seq.Next())
@@ -664,11 +617,10 @@ func (n *Node) StartAsync(ctx context.Context, joins ...string) <-chan error {
 		return ch
 	}
 
-	isServing := make(chan struct{})
 	go func() {
-		n.waitUntilLive()
-		close(isServing)
-		ch <- nil
+		// If the node does not become live within a minute, something is wrong and
+		// it's better not to hang indefinitely.
+		ch <- n.waitUntilLive(time.Minute)
 	}()
 
 	return ch
@@ -730,12 +682,15 @@ func (n *Node) AdvertiseAddr() (s string) {
 	return addr
 }
 
-func (n *Node) waitUntilLive() {
+func (n *Node) waitUntilLive(dur time.Duration) error {
 	ctx := context.Background()
+	closer := make(chan struct{})
+	defer time.AfterFunc(dur, func() { close(closer) }).Stop()
 	opts := retry.Options{
 		InitialBackoff: time.Millisecond,
 		MaxBackoff:     500 * time.Millisecond,
 		Multiplier:     2,
+		Closer:         closer,
 	}
 	for r := retry.Start(opts); r.Next(); {
 		var pid int
@@ -745,11 +700,13 @@ func (n *Node) waitUntilLive() {
 		}
 		n.Unlock()
 		if pid == 0 {
-			return // process already quit
+			log.Info(ctx, "process already quit")
+			return nil
 		}
 
 		urlBytes, err := ioutil.ReadFile(n.listeningURLFile())
 		if err != nil {
+			log.Info(ctx, err)
 			continue
 		}
 
@@ -793,7 +750,7 @@ func (n *Node) waitUntilLive() {
 				`SELECT value FROM crdb_internal.node_runtime_info WHERE component='UI' AND field = 'URL'`,
 			).Scan(&uiStr); err != nil {
 				log.Info(ctx, err)
-				break
+				return nil
 			}
 
 			_, uiURL, err = portFromURL(uiStr)
@@ -802,8 +759,9 @@ func (n *Node) waitUntilLive() {
 				// TODO(tschottdorf): see above.
 			}
 		}
-		break
+		return nil
 	}
+	return errors.Errorf("node %+v was unable to join cluster within %s", n.Cfg, dur)
 }
 
 // Kill stops a node abruptly by sending it SIGKILL.
@@ -858,3 +816,6 @@ func (n *Node) Wait() *exec.ExitError {
 	ee, _ := n.waitErr.Load().(*exec.ExitError)
 	return ee
 }
+
+// Silence unused warning.
+var _ = (*Node)(nil).Wait

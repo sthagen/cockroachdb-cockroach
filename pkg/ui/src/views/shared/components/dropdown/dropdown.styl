@@ -1,31 +1,88 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 @require nib
 @require "~styl/base/palette.styl"
+@require "~src/components/core/index.styl"
 
 $dropdown-hover-color = darken($background-color, 2.5%)
 
 .dropdown
-  text-transform uppercase
-  letter-spacing 2px
-  line-height 17px
-  padding 12px 24px
+  padding 7.5px 9px 7.5px 19px;
   vertical-align middle
-  border 1px solid $button-border-color
-  border-radius 4px
-  display inline-flex
+  border 1px solid $grey-light
+  border-radius 3px
   white-space nowrap
   padding-right 10px
   color $body-color
+  cursor pointer
+  position relative
+  background #fff
+  display flex
+  align-items center
+
+  .dropdown__title, .Select-value-label
+    color $adminui-grey-1 !important
+    font-family SourceSansPro-SemiBold
+    font-size 14px
+    line-height 1.71
+    letter-spacing 0.1px
 
   &:hover
     background-color $dropdown-hover-color
+  
+  .Select-arrow-zone
+    color $adminui-blue-1-base
+    .anticon
+      transform rotate(180deg)
+    .active
+      color $grey
+  
+  &._range
+    width 423px
+    padding 7px 9px
 
   &__title
     vertical-align middle
     display inline-block
+    -webkit-user-select none
+    -moz-user-select none
+    -ms-user-select none
+    user-select none
+    letter-spacing 2px
+    line-height 17px
+  
+  &__range-title
+    display flex
+    justify-content center
+    align-items center
+    background $colors--neutral-3
+    width 34px
+    text-align center
+    border-radius 3px
+    color $colors--neutral-7
+    font-size 12px
+    line-height 24px
+    letter-spacing 0.1px
+    font-family Lato-Bold
 
   &__select
     display inline-block
     vertical-align middle
+    -webkit-user-select none
+    -moz-user-select none
+    -ms-user-select none
+    user-select none
+    text-transform uppercase
+    letter-spacing 2px
+    line-height 17px
 
     &:hover
       background-color $dropdown-hover-color
@@ -33,8 +90,12 @@ $dropdown-hover-color = darken($background-color, 2.5%)
   &__side-arrow
     font-family Lato-Bold
     display none
-    color $link-color
+    color $adminui-grey-1
     cursor pointer
+    -webkit-user-select none
+    -moz-user-select none
+    -ms-user-select: none;
+    user-select: none;
 
     &:first-child
       border-right 1px solid $button-border-color
@@ -66,5 +127,8 @@ $dropdown-hover-color = darken($background-color, 2.5%)
 
       &:hover
         background-color $dropdown-hover-color
+.dropdown.full-size
+  .Select-menu-outer, .Select-menu
+    max-height 450px
 
 // NOTE: react-select styles can be found in styl/shame.styl

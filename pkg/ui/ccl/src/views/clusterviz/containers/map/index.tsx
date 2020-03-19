@@ -1,129 +1,98 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Cockroach Community Licence (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed as a CockroachDB Enterprise file under the Cockroach Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
-import _ from "lodash";
 import React from "react";
-import * as d3 from "d3";
+import { RouteComponentProps, withRouter } from "react-router-dom";
+import { connect } from "react-redux";
+import cn from "classnames";
 
-import "./sim.css";
+import { Breadcrumbs } from "src/views/clusterviz/containers/map/breadcrumbs";
+import NeedEnterpriseLicense from "src/views/clusterviz/containers/map/needEnterpriseLicense";
+import NodeCanvasContainer from "src/views/clusterviz/containers/map/nodeCanvasContainer";
+import TimeScaleDropdown from "src/views/cluster/containers/timescale";
+import swapByLicense from "src/views/shared/containers/licenseSwap";
+import { parseLocalityRoute } from "src/util/localities";
+import Loading from "src/views/shared/components/loading";
+import { AdminUIState } from "src/redux/state";
+import { selectEnterpriseEnabled } from "src/redux/license";
+import { Dropdown } from "src/components/dropdown";
+import { parseSplatParams } from "src/util/parseSplatParams";
 
-import CurrentNodes from "./currentNodes";
-import * as Vector from "./vector";
-import { WorldMap } from "./worldmap";
-import { Box, ZoomTransformer } from "./zoom";
+// tslint:disable-next-line:variable-name
+const NodeCanvasContent = swapByLicense(NeedEnterpriseLicense, NodeCanvasContainer);
 
-interface ClusterVisualizationState {
-  zoomTransform: ZoomTransformer;
+interface ClusterVisualizationProps {
+  licenseDataExists: boolean;
+  enterpriseEnabled: boolean;
+  clusterDataError: Error | null;
 }
 
-export default class ClusterVisualization extends React.Component<{}, ClusterVisualizationState> {
-  graphEl: SVGElement;
-  zoom: d3.behavior.Zoom<any>;
-  maxLatitude = 63;
-  debouncedOnResize: () => void;
+export class ClusterVisualization extends React.Component<ClusterVisualizationProps & RouteComponentProps> {
+  readonly items = [
+    { value: "list", name: "Node List" },
+    { value: "map", name: "Node Map" },
+  ];
 
-  constructor(props: any) {
-    super(props);
+  handleMapTableToggle = (value: string) => {
+    this.props.history.push(`/overview/${value}`);
   }
 
-  updateZoomState(zt: ZoomTransformer) {
-    const minScale = zt.minScale();
-
-    // Update both the d3 zoom behavior and the local state.
-    this.zoom
-      .scaleExtent([minScale, minScale * 10])
-      .size(zt.viewportSize())
-      .scale(zt.scale())
-      .translate(zt.translate());
-
-    this.setState({
-      zoomTransform: zt,
-    });
-  }
-
-  onZoom = () => {
-    this.updateZoomState(this.state.zoomTransform.withScaleAndTranslate(
-      this.zoom.scale(), this.zoom.translate(),
-    ));
-  }
-
-  onResize = () => {
-    this.updateZoomState(this.state.zoomTransform.withViewportSize(
-      [this.graphEl.clientWidth, this.graphEl.clientHeight],
-    ));
-  }
-
-  componentDidMount() {
-    // Create a new zoom behavior and apply it to the svg element.
-    this.zoom = d3.behavior.zoom()
-      .on("zoom", this.onZoom);
-    d3.select(this.graphEl).call(this.zoom);
-
-    // Add debounced resize listener.
-    this.debouncedOnResize = _.debounce(this.onResize, 200);
-    window.addEventListener("resize", this.debouncedOnResize);
-
-    // Compute zoomable area bounds based on the default mercator projection.
-    const projection = d3.geo.mercator();
-    const topLeft = projection([-180, this.maxLatitude]);
-    const botRight = projection([180, -this.maxLatitude]);
-    const bounds = new Box(
-      topLeft[0],
-      topLeft[1],
-      botRight[0] - topLeft[0],
-      botRight[1] - topLeft[1],
-    );
-
-    // Set initial zoom state.
-    this.updateZoomState(new ZoomTransformer(
-      bounds, [this.graphEl.clientWidth, this.graphEl.clientHeight],
-    ));
-  }
-
-  componentWillUnmount() {
-    window.removeEventListener("resize", this.debouncedOnResize);
-  }
-
-  renderContent() {
-    if (!this.state) {
-      return null;
-    }
-
-    // Apply the current zoom transform to a  mercator projection to pass to
-    // components of the ClusterVisualization.  Our zoom bounds are computed
-    // from the default projection, so we apply the scale and translation on
-    // top of the default scale and translation.
-    const scale = this.state.zoomTransform.scale();
-    const translate = this.state.zoomTransform.translate();
-    const projection = d3.geo.mercator();
-    projection.scale(projection.scale() * scale);
-    projection.translate(Vector.add(Vector.mult(projection.translate(), scale), translate));
-
-    return (
-      <g>
-        <WorldMap projection={projection} />
-        <CurrentNodes projection={projection} />
-      </g>
-    );
+  getTiers() {
+    const { match, location } = this.props;
+    const splat = parseSplatParams(match, location);
+    return parseLocalityRoute(splat);
   }
 
   render() {
-    // We must render the SVG even before initializing the state, because we
-    // need to read its dimensions from the DOM in order to initialize the
-    // state.
+    const tiers = this.getTiers();
+
+    // TODO(couchand): integrate with license swapper
+    const showingLicensePage = this.props.licenseDataExists && !this.props.enterpriseEnabled;
+
+    const classes = cn(
+      "cluster-visualization-layout",
+      { "cluster-visualization-layout--show-license": showingLicensePage });
+
+    const contentItemClasses = cn(
+      "cluster-visualization-layout__content-item",
+      { "cluster-visualization-layout__content-item--show-license": showingLicensePage });
+
+    // TODO(vilterp): dedup with NodeList
     return (
-      <svg
-        style={{ width: "100%", height: "100%" }}
-        className="cluster-viz"
-        ref={svg => this.graphEl = svg}
-      >
-        { this.renderContent() }
-      </svg>
+      <div className={classes}>
+        <div className="cluster-visualization-layout__content">
+          <div className="cluster-visualization-layout__content-item">
+            <Dropdown
+              items={this.items}
+              onChange={this.handleMapTableToggle}
+            >
+              Node Map
+            </Dropdown>
+          </div>
+          <div className={contentItemClasses}><Breadcrumbs tiers={tiers} /></div>
+          <div className={contentItemClasses}><TimeScaleDropdown /></div>
+        </div>
+        <Loading
+          loading={!this.props.licenseDataExists}
+          error={this.props.clusterDataError}
+          render={() => <NodeCanvasContent tiers={tiers} />}
+        />
+      </div>
     );
   }
 }
+
+function mapStateToProps(state: AdminUIState) {
+  return {
+    licenseDataExists: !!state.cachedData.cluster.data,
+    enterpriseEnabled: selectEnterpriseEnabled(state),
+    clusterDataError: state.cachedData.cluster.lastError,
+  };
+}
+
+export default withRouter(connect(mapStateToProps)(ClusterVisualization));

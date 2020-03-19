@@ -1,5 +1,3 @@
-# LogicTest: default distsql
-
 statement ok
 CREATE TABLE aliases (
     a OID,
@@ -11,13 +9,13 @@ CREATE TABLE aliases (
 query TT colnames
 SHOW CREATE TABLE aliases
 ----
-Table    CreateTable
-aliases  CREATE TABLE aliases (
-           a OID NULL,
-           b NAME NULL,
-           FAMILY "primary" (a, rowid),
-           FAMILY fam_1_b (b)
-         )
+table_name  create_statement
+aliases     CREATE TABLE aliases (
+            a OID NULL,
+            b NAME NULL,
+            FAMILY "primary" (a, rowid),
+            FAMILY fam_1_b (b)
+)
 
 statement ok
 INSERT INTO aliases VALUES (100, 'abc')

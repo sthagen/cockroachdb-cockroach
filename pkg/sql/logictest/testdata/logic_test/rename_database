@@ -1,19 +1,22 @@
-# LogicTest: default parallel-stmts distsql
-
 query T
 SHOW DATABASES
 ----
-crdb_internal
-information_schema
-pg_catalog
+defaultdb
+postgres
 system
 test
 
-query TTT
+query TTTT
 SHOW GRANTS ON DATABASE test
 ----
-test  admin  ALL
-test  root   ALL
+test  crdb_internal       admin  ALL
+test  crdb_internal       root   ALL
+test  information_schema  admin  ALL
+test  information_schema  root   ALL
+test  pg_catalog          admin  ALL
+test  pg_catalog          root   ALL
+test  public              admin  ALL
+test  public              root   ALL
 
 statement ok
 CREATE TABLE kv (
@@ -33,29 +36,41 @@ SELECT * FROM kv
 7 8
 
 statement ok
+SET sql_safe_updates = TRUE;
+
+statement error RENAME DATABASE on current database
 ALTER DATABASE test RENAME TO u
 
-statement error relation "kv" does not exist
+statement ok
+SET sql_safe_updates = FALSE;
+ ALTER DATABASE test RENAME TO u
+
+statement error pgcode 42P01 relation "kv" does not exist
 SELECT * FROM kv
 
-statement error database "test" does not exist
+statement error target database or schema does not exist
 SHOW GRANTS ON DATABASE test
 
 query T
 SHOW DATABASES
 ----
-crdb_internal
-information_schema
-pg_catalog
+defaultdb
+postgres
 system
 u
 
 # check the name in descriptor is also changed
-query TTT
+query TTTT
 SHOW GRANTS ON DATABASE u
 ----
-u  admin  ALL
-u  root   ALL
+u  crdb_internal       admin  ALL
+u  crdb_internal       root   ALL
+u  information_schema  admin  ALL
+u  information_schema  root   ALL
+u  pg_catalog          admin  ALL
+u  pg_catalog          root   ALL
+u  public              admin  ALL
+u  public              root   ALL
 
 statement ok
 SET DATABASE = u
@@ -88,15 +103,12 @@ GRANT ALL ON DATABASE t TO testuser
 
 user testuser
 
-statement error only root is allowed to ALTER DATABASE ... RENAME
+statement error only users with the admin role are allowed to ALTER DATABASE ... RENAME
 ALTER DATABASE t RENAME TO v
 
 query T
 SHOW DATABASES
 ----
-crdb_internal
-information_schema
-pg_catalog
 t
 
 user root
@@ -112,7 +124,7 @@ SHOW TABLES FROM u
 ----
 kv
 
-statement error cannot rename database because view "t.v" depends on table "kv"
+statement error cannot rename database because relation "t.public.v" depends on relation "u.public.kv"
 ALTER DATABASE u RENAME TO v
 
 statement ok
@@ -124,5 +136,73 @@ ALTER DATABASE u RENAME TO v
 statement ok
 CREATE VIEW v.v AS SELECT k,v FROM v.kv
 
-statement error cannot rename database because view "v" depends on table "kv"
+statement error cannot rename database because relation "v.public.v" depends on relation "v.public.kv"\s.*you can drop "v.public.v" instead
 ALTER DATABASE v RENAME TO u
+
+# Check that the default databases can be renamed like any other.
+statement ok
+ALTER DATABASE defaultdb RENAME TO w;
+  ALTER DATABASE postgres RENAME TO defaultdb;
+  ALTER DATABASE w RENAME TO postgres
+
+query T
+SHOW DATABASES
+----
+defaultdb
+postgres
+system
+t
+v
+
+query TTT
+EXPLAIN ALTER DATABASE v RENAME TO x
+----
+·                distributed  false
+·                vectorized   false
+rename database  ·            ·
+
+# Verify that the EXPLAIN above does not actually rename the database (#30543)
+query T colnames
+SHOW DATABASES
+----
+database_name
+defaultdb
+postgres
+system
+t
+v
+
+# Test dependent sequences on different databases upon renames
+# return the appropriate error message, as well as testing
+# renaming databases with sequences in the same DB is successful.
+subtest regression_45411
+
+statement ok
+CREATE DATABASE db1; CREATE SEQUENCE db1.seq
+
+statement ok
+CREATE DATABASE db2; CREATE TABLE db2.tbl (a int DEFAULT nextval('db1.seq'))
+
+statement error cannot rename database because relation "db2.public.tbl" depends on relation "db1.public.seq"\s.*you can drop the column default "a" of "db1.public.seq" referencing "db2.public.tbl"
+ALTER DATABASE db1 RENAME TO db3
+
+statement ok
+DROP DATABASE db2 CASCADE; DROP DATABASE db1 CASCADE
+
+statement ok
+CREATE DATABASE db1; CREATE SEQUENCE db1.a_seq; CREATE SEQUENCE db1.b_seq; USE db1;
+
+statement ok
+CREATE TABLE db1.a (a int default nextval('a_seq') + nextval('b_seq') + 1); ALTER DATABASE db1 RENAME TO db2; USE db2;
+
+statement error cannot rename database because relation "db2.public.a" depends on relation "db2.public.a_seq"\s.*you can drop the column default "a" of "db2.public.a_seq" referencing "db2.public.a" or modify the default to not reference the database name "db2"
+DROP TABLE db2.a; CREATE TABLE db2.a (a int default nextval('a_seq') + nextval('db2.b_seq') + 1); ALTER DATABASE db2 RENAME TO db1
+
+statement error cannot rename database because relation "db2.public.a" depends on relation "db2.public.a_seq"\s.*you can drop the column default "a" of "db2.public.a_seq" referencing "db2.public.a" or modify the default to not reference the database name "db2"
+DROP TABLE db2.a; CREATE TABLE db2.a (a int default nextval('a_seq') + nextval('db2.public.b_seq') + 1); ALTER DATABASE db2 RENAME TO db1
+
+statement ok
+DROP TABLE db2.a; CREATE TABLE db2.a (a int default nextval('a_seq') + nextval('public.b_seq') + 1); ALTER DATABASE db2 RENAME TO db1
+
+statement ok
+USE defaultdb; DROP DATABASE db1 CASCADE

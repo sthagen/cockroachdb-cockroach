@@ -1,29 +1,23 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
 import (
 	"context"
+	gosql "database/sql"
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -78,7 +72,7 @@ func TestSplitAt(t *testing.T) {
 		},
 		{
 			in:    "ALTER TABLE d.t SPLIT AT VALUES (i, s)",
-			error: `name "i" is not defined`,
+			error: `column "i" does not exist`,
 		},
 		{
 			in: "ALTER INDEX d.t@s_idx SPLIT AT VALUES ('f')",
@@ -88,7 +82,7 @@ func TestSplitAt(t *testing.T) {
 			error: `index "not_present" does not exist`,
 		},
 		{
-			in:    "ALTER TABLE d.i SPLIT AT VALUES (avg(1))",
+			in:    "ALTER TABLE d.i SPLIT AT VALUES (avg(1::float))",
 			error: "aggregate functions are not allowed in VALUES",
 		},
 		{
@@ -112,12 +106,58 @@ func TestSplitAt(t *testing.T) {
 		{
 			in: "ALTER TABLE d.i SPLIT AT VALUES ((SELECT 1))",
 		},
+		{
+			in: "ALTER TABLE d.i SPLIT AT VALUES (10) WITH EXPIRATION '1 day'",
+		},
+		{
+			in: "ALTER TABLE d.i SPLIT AT VALUES (11) WITH EXPIRATION '1 day'::interval",
+		},
+		{
+			in: "ALTER TABLE d.i SPLIT AT VALUES (12) WITH EXPIRATION '7258118400000000000.0'",
+		},
+		{
+			in: "ALTER TABLE d.i SPLIT AT VALUES (13) WITH EXPIRATION '2200-01-01 00:00:00.0'",
+		},
+		{
+			in: "ALTER TABLE d.i SPLIT AT VALUES (14) WITH EXPIRATION TIMESTAMP '2200-01-01 00:00:00.0'",
+		},
+		{
+			in: "ALTER TABLE d.i SPLIT AT VALUES (15) WITH EXPIRATION '2200-01-01 00:00:00.0':::timestamp",
+		},
+		{
+			in: "ALTER TABLE d.i SPLIT AT VALUES (16) WITH EXPIRATION TIMESTAMPTZ '2200-01-01 00:00:00.0'",
+		},
+		{
+			in:    "ALTER TABLE d.i SPLIT AT VALUES (17) WITH EXPIRATION 'a'",
+			error: "SPLIT AT: value is neither timestamp, decimal, nor interval",
+		},
+		{
+			in:    "ALTER TABLE d.i SPLIT AT VALUES (17) WITH EXPIRATION true",
+			error: "SPLIT AT: expected timestamp, decimal, or interval, got bool (*tree.DBool)",
+		},
+		{
+			in:    "ALTER TABLE d.i SPLIT AT VALUES (17) WITH EXPIRATION '1969-01-01 00:00:00.0'",
+			error: "SPLIT AT: timestamp before 1970-01-01T00:00:00Z is invalid",
+		},
+		{
+			in:    "ALTER TABLE d.i SPLIT AT VALUES (17) WITH EXPIRATION '1970-01-01 00:00:00.0'",
+			error: "SPLIT AT: zero timestamp is invalid",
+		},
+		{
+			in:    "ALTER TABLE d.i SPLIT AT VALUES (17) WITH EXPIRATION '-1 day'::interval",
+			error: "SPLIT AT: expiration time should be greater than or equal to current time",
+		},
+		{
+			in:    "ALTER TABLE d.i SPLIT AT VALUES (17) WITH EXPIRATION '0.1us'",
+			error: "SPLIT AT: interval value '0.1us' too small, absolute value must be >= 1µs",
+		},
 	}
 
 	for _, tt := range tests {
 		var key roachpb.Key
 		var pretty string
-		err := db.QueryRow(tt.in, tt.args...).Scan(&key, &pretty)
+		var expirationTimestamp gosql.NullString
+		err := db.QueryRow(tt.in, tt.args...).Scan(&key, &pretty, &expirationTimestamp)
 		if err != nil && tt.error == "" {
 			t.Fatalf("%s: unexpected error: %s", tt.in, err)
 		} else if tt.error != "" && err == nil {
@@ -137,122 +177,5 @@ func TestSplitAt(t *testing.T) {
 				t.Fatalf("%s: expected range start %s, got %s", tt.in, expect, pretty)
 			}
 		}
-	}
-}
-
-func TestScatter(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	t.Skip("#14955")
-
-	const numHosts = 4
-	tc := serverutils.StartTestCluster(t, numHosts, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(context.TODO())
-
-	sqlutils.CreateTable(
-		t, tc.ServerConn(0), "t",
-		"k INT PRIMARY KEY, v INT",
-		1000,
-		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(10)),
-	)
-
-	r := sqlutils.MakeSQLRunner(tc.ServerConn(0))
-
-	// Introduce 99 splits to get 100 ranges.
-	r.Exec(t, "ALTER TABLE test.t SPLIT AT (SELECT i*10 FROM generate_series(1, 99) AS g(i))")
-
-	// Ensure that scattering leaves each node with at least 20% of the leases.
-	r.Exec(t, "ALTER TABLE test.t SCATTER")
-	rows := r.Query(t, "SHOW TESTING_RANGES FROM TABLE test.t")
-	// See showRangesColumns for the schema.
-	if cols, err := rows.Columns(); err != nil {
-		t.Fatal(err)
-	} else if len(cols) != 5 {
-		t.Fatalf("expected 4 columns, got %#v", cols)
-	}
-	vals := []interface{}{
-		new(interface{}),
-		new(interface{}),
-		new(interface{}),
-		new(interface{}),
-		new(int),
-	}
-	leaseHolders := map[int]int{1: 0, 2: 0, 3: 0, 4: 0}
-	numRows := 0
-	for ; rows.Next(); numRows++ {
-		if err := rows.Scan(vals...); err != nil {
-			t.Fatal(err)
-		}
-		leaseHolder := *vals[4].(*int)
-		if leaseHolder < 1 || leaseHolder > numHosts {
-			t.Fatalf("invalid lease holder value: %d", leaseHolder)
-		}
-		leaseHolders[leaseHolder]++
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if numRows != 100 {
-		t.Fatalf("expected 100 ranges, got %d", numRows)
-	}
-	for i, count := range leaseHolders {
-		if count < 20 {
-			t.Errorf("less than 20 leaseholders on host %d (only %d)", i, count)
-		}
-	}
-}
-
-// TestScatterResponse ensures that ALTER TABLE... SCATTER includes one row of
-// output per range in the table. It does *not* test that scatter properly
-// distributes replicas and leases; see TestScatter for that.
-//
-// TODO(benesch): consider folding this test into TestScatter once TestScatter
-// is unskipped.
-func TestScatterResponse(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
-
-	sqlutils.CreateTable(
-		t, sqlDB, "t",
-		"k INT PRIMARY KEY, v INT",
-		1000,
-		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(10)),
-	)
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
-
-	r := sqlutils.MakeSQLRunner(sqlDB)
-	r.Exec(t, "ALTER TABLE test.t SPLIT AT (SELECT i*10 FROM generate_series(1, 99) AS g(i))")
-	rows := r.Query(t, "ALTER TABLE test.t SCATTER")
-
-	i := 0
-	for ; rows.Next(); i++ {
-		var actualKey []byte
-		var pretty string
-		if err := rows.Scan(&actualKey, &pretty); err != nil {
-			t.Fatal(err)
-		}
-		var expectedKey roachpb.Key
-		if i == 0 {
-			expectedKey = keys.MakeTablePrefix(uint32(tableDesc.ID))
-		} else {
-			var err error
-			expectedKey, err = sqlbase.MakePrimaryIndexKey(tableDesc, i*10)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-		if e, a := expectedKey, roachpb.Key(actualKey); !e.Equal(a) {
-			t.Errorf("%d: expected split key %s, but got %s", i, e, a)
-		}
-		if e, a := expectedKey.String(), pretty; e != a {
-			t.Errorf("%d: expected pretty split key %s, but got %s", i, e, a)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if e, a := 100, i; e != a {
-		t.Fatalf("expected %d rows, but got %d", e, a)
 	}
 }

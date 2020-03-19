@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlutils
 
@@ -35,15 +31,21 @@ const TestDB = "test"
 type GenRowFn func(row int) []tree.Datum
 
 // genValues writes a string of generated values "(a,b,c),(d,e,f)...".
-func genValues(w io.Writer, firstRow, lastRow int, fn GenRowFn) {
+func genValues(w io.Writer, firstRow, lastRow int, fn GenRowFn, shouldPrint bool) {
 	for rowIdx := firstRow; rowIdx <= lastRow; rowIdx++ {
 		if rowIdx > firstRow {
 			fmt.Fprint(w, ",")
 		}
 		row := fn(rowIdx)
-		fmt.Fprintf(w, "(%s", row[0])
+		if shouldPrint {
+			for _, v := range row {
+				fmt.Printf("%s\t\t", v)
+			}
+			fmt.Printf("\n")
+		}
+		fmt.Fprintf(w, "(%s", tree.Serialize(row[0]))
 		for _, v := range row[1:] {
-			fmt.Fprintf(w, ",%s", v)
+			fmt.Fprintf(w, ",%s", tree.Serialize(v))
 		}
 		fmt.Fprint(w, ")")
 	}
@@ -57,6 +59,19 @@ func CreateTable(
 	CreateTableInterleaved(tb, sqlDB, tableName, schema, "" /*interleaveSchema*/, numRows, fn)
 }
 
+// CreateTableDebug is identical to debug, but allows for the added option of
+// printing the table and its contents upon creation.
+func CreateTableDebug(
+	tb testing.TB,
+	sqlDB *gosql.DB,
+	tableName, schema string,
+	numRows int,
+	fn GenRowFn,
+	shouldPrint bool,
+) {
+	CreateTableInterleavedDebug(tb, sqlDB, tableName, schema, "" /*interleaveSchema*/, numRows, fn, shouldPrint)
+}
+
 // CreateTableInterleaved is identical to CreateTable with the added option
 // of specifying an interleave schema for interleaving the table.
 func CreateTableInterleaved(
@@ -66,6 +81,19 @@ func CreateTableInterleaved(
 	numRows int,
 	fn GenRowFn,
 ) {
+	CreateTableInterleavedDebug(tb, sqlDB, tableName, schema, interleaveSchema, numRows, fn, false /* print */)
+}
+
+// CreateTableInterleavedDebug is identical to CreateTableInterleaved with the
+// option of printing the table being created.
+func CreateTableInterleavedDebug(
+	tb testing.TB,
+	sqlDB *gosql.DB,
+	tableName, schema, interleaveSchema string,
+	numRows int,
+	fn GenRowFn,
+	shouldPrint bool,
+) {
 	if interleaveSchema != "" {
 		interleaveSchema = fmt.Sprintf(`INTERLEAVE IN PARENT %s.%s`, TestDB, interleaveSchema)
 	}
@@ -74,6 +102,9 @@ func CreateTableInterleaved(
 	stmt := fmt.Sprintf(`CREATE DATABASE IF NOT EXISTS %s;`, TestDB)
 	stmt += fmt.Sprintf(`CREATE TABLE %s.%s (%s) %s;`, TestDB, tableName, schema, interleaveSchema)
 	r.Exec(tb, stmt)
+	if shouldPrint {
+		fmt.Printf("Creating table: %s\n%s\n", tableName, schema)
+	}
 	for i := 1; i <= numRows; {
 		var buf bytes.Buffer
 		fmt.Fprintf(&buf, `INSERT INTO %s.%s VALUES `, TestDB, tableName)
@@ -81,7 +112,7 @@ func CreateTableInterleaved(
 		if batchEnd > numRows {
 			batchEnd = numRows
 		}
-		genValues(&buf, i, batchEnd, fn)
+		genValues(&buf, i, batchEnd, fn, shouldPrint)
 
 		r.Exec(tb, buf.String())
 		i = batchEnd + 1

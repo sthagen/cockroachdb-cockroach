@@ -1,80 +1,93 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
+// teamcity-trigger launches a variety of nightly build jobs on TeamCity using
+// its REST API. It is intended to be run from a meta-build on a schedule
+// trigger.
+//
+// One might think that TeamCity would support scheduling the same build to run
+// multiple times with different parameters, but alas. The feature request has
+// been open for ten years: https://youtrack.jetbrains.com/issue/TW-6439
 package main
 
 import (
-	"flag"
+	"fmt"
 	"log"
-	"net/url"
 	"os"
-	"strconv"
 
 	"github.com/abourget/teamcity"
+	"github.com/cockroachdb/cockroach/pkg/cmd/cmdutil"
 	"github.com/kisielk/gotool"
 )
 
-var buildTypeID = flag.String("build", "Cockroach_Nightlies_Stress", "the TeamCity build ID to start")
-var branchName = flag.String("branch", "", "the VCS branch to build")
-
-const teamcityServerURLEnv = "TC_SERVER_URL"
-const teamcityAPIUserEnv = "TC_API_USER"
-const teamcityAPIPasswordEnv = "TC_API_PASSWORD"
-
 func main() {
-	flag.Parse()
+	if len(os.Args) != 1 {
+		fmt.Fprintf(os.Stderr, "usage: %s\n", os.Args[0])
+		os.Exit(1)
+	}
 
-	serverURL, ok := os.LookupEnv(teamcityServerURLEnv)
-	if !ok {
-		log.Fatalf("teamcity server URL environment variable %s is not set", teamcityServerURLEnv)
-	}
-	u, err := url.Parse(serverURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-	username, ok := os.LookupEnv(teamcityAPIUserEnv)
-	if !ok {
-		log.Fatalf("teamcity API username environment variable %s is not set", teamcityAPIUserEnv)
-	}
-	password, ok := os.LookupEnv(teamcityAPIPasswordEnv)
-	if !ok {
-		log.Fatalf("teamcity API password environment variable %s is not set", teamcityAPIPasswordEnv)
-	}
-	client := teamcity.New(u.Host, username, password)
-	runTC(func(properties map[string]string) {
-		build, err := client.QueueBuild(*buildTypeID, *branchName, properties)
+	branch := cmdutil.RequireEnv("TC_BUILD_BRANCH")
+	serverURL := cmdutil.RequireEnv("TC_SERVER_URL")
+	username := cmdutil.RequireEnv("TC_API_USER")
+	password := cmdutil.RequireEnv("TC_API_PASSWORD")
+
+	tcClient := teamcity.New(serverURL, username, password)
+	runTC(func(buildID string, opts map[string]string) {
+		build, err := tcClient.QueueBuild(buildID, branch, opts)
 		if err != nil {
-			log.Fatalf("failed to create teamcity build (*buildTypeID=%s *branchName=%s, properties=%+v): %s", *buildTypeID, *branchName, properties, err)
+			log.Fatalf("failed to create teamcity build (buildID=%s, branch=%s, opts=%+v): %s",
+				build, branch, opts, err)
 		}
-		log.Printf("created teamcity build (*buildTypeID=%s *branchName=%s, properties=%+v): %s", *buildTypeID, *branchName, properties, build)
+		log.Printf("created teamcity build (buildID=%s, branch=%s, opts=%+v): %s",
+			buildID, branch, opts, build)
 	})
 }
 
-func runTC(queueBuildFn func(map[string]string)) {
-	importPaths := gotool.ImportPaths([]string{"github.com/cockroachdb/cockroach/pkg/..."})
+const baseImportPath = "github.com/cockroachdb/cockroach/pkg/"
 
-	// Queue a build per configuration per package.
-	for _, properties := range []map[string]string{
-		{}, // uninstrumented
-		{"env.GOFLAGS": "-race"},
-		{"env.TAGS": "deadlock"},
-	} {
-		properties["COCKROACH_NIGHTLY_STRESS"] = strconv.FormatBool(true)
-		for _, importPath := range importPaths {
-			properties["env.PKG"] = importPath
+var importPaths = gotool.ImportPaths([]string{baseImportPath + "..."})
 
-			queueBuildFn(properties)
+func runTC(queueBuild func(string, map[string]string)) {
+	// Queue stress builds. One per configuration per package.
+	for _, importPath := range importPaths {
+		// The stress program by default runs as many instances in parallel as there
+		// are CPUs. Each instance itself can run tests in parallel. The amount of
+		// parallelism needs to be reduced, or we can run into OOM issues,
+		// especially for race builds and/or logic tests (see
+		// https://github.com/cockroachdb/cockroach/pull/10966).
+		//
+		// We limit both the stress program parallelism and the go test parallelism
+		// to 4 for non-race builds and 2 for race builds. For logic tests, we
+		// halve these values.
+		parallelism := 4
+
+		// Stress logic tests with reduced parallelism (to avoid overloading the
+		// machine, see https://github.com/cockroachdb/cockroach/pull/10966).
+		if importPath == baseImportPath+"sql/logictest" {
+			parallelism /= 2
 		}
+
+		opts := map[string]string{
+			"env.PKG": importPath,
+		}
+
+		// Run non-race build.
+		opts["env.GOFLAGS"] = fmt.Sprintf("-parallel=%d", parallelism)
+		opts["env.STRESSFLAGS"] = fmt.Sprintf("-p %d", parallelism)
+		queueBuild("Cockroach_Nightlies_Stress", opts)
+
+		// Run race build. Reduce the parallelism to avoid overloading the machine.
+		parallelism /= 2
+		opts["env.GOFLAGS"] = fmt.Sprintf("-race -parallel=%d", parallelism)
+		opts["env.STRESSFLAGS"] = fmt.Sprintf("-p %d", parallelism)
+
+		queueBuild("Cockroach_Nightlies_Stress", opts)
 	}
 }

@@ -1,29 +1,25 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package transform
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 )
 
 // IsAggregateVisitor checks if walked expressions contain aggregate functions.
 type IsAggregateVisitor struct {
 	Aggregated bool
 	// searchPath is used to search for unqualified function names.
-	searchPath tree.SearchPath
+	searchPath sessiondata.SearchPath
 }
 
 var _ tree.Visitor = &IsAggregateVisitor{}
@@ -41,7 +37,7 @@ func (v *IsAggregateVisitor) VisitPre(expr tree.Expr) (recurse bool, newExpr tre
 		if err != nil {
 			return false, expr
 		}
-		if _, ok := builtins.Aggregates[fd.Name]; ok {
+		if fd.Class == tree.AggregateClass {
 			v.Aggregated = true
 			return false, expr
 		}
@@ -54,8 +50,3 @@ func (v *IsAggregateVisitor) VisitPre(expr tree.Expr) (recurse bool, newExpr tre
 
 // VisitPost satisfies the Visitor interface.
 func (*IsAggregateVisitor) VisitPost(expr tree.Expr) tree.Expr { return expr }
-
-// Reset clear the IsAggregateVisitor's internal state.
-func (v *IsAggregateVisitor) Reset() {
-	v.Aggregated = false
-}

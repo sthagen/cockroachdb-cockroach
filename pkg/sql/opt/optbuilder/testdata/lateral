@@ -1,0 +1,297 @@
+exec-ddl
+CREATE TABLE x (a INT PRIMARY KEY)
+----
+
+exec-ddl
+CREATE TABLE y (b INT PRIMARY KEY)
+----
+
+exec-ddl
+CREATE TABLE z (c INT PRIMARY KEY)
+----
+
+build
+SELECT * FROM x, y, z
+----
+inner-join (cross)
+ ├── columns: a:1!null b:2!null c:3!null
+ ├── scan x
+ │    └── columns: a:1!null
+ ├── inner-join (cross)
+ │    ├── columns: b:2!null c:3!null
+ │    ├── scan y
+ │    │    └── columns: b:2!null
+ │    ├── scan z
+ │    │    └── columns: c:3!null
+ │    └── filters (true)
+ └── filters (true)
+
+build
+SELECT * FROM x, LATERAL (SELECT * FROM y WHERE b = a)
+----
+inner-join-apply
+ ├── columns: a:1!null b:2!null
+ ├── scan x
+ │    └── columns: a:1!null
+ ├── select
+ │    ├── columns: b:2!null
+ │    ├── scan y
+ │    │    └── columns: b:2!null
+ │    └── filters
+ │         └── b:2 = a:1
+ └── filters (true)
+
+build
+SELECT * FROM x, (SELECT * FROM y WHERE b = a)
+----
+error (42703): column "a" does not exist
+
+# Ensure that the presence of LATERAL properly affects name resolution.
+
+build
+SELECT
+  (SELECT b FROM (SELECT c AS a FROM z), LATERAL (SELECT * FROM y WHERE b = a))
+FROM x
+----
+project
+ ├── columns: b:4
+ ├── scan x
+ │    └── columns: a:1!null
+ └── projections
+      └── subquery [as=b:4]
+           └── max1-row
+                ├── columns: y.b:3!null
+                └── project
+                     ├── columns: y.b:3!null
+                     └── inner-join-apply
+                          ├── columns: c:2!null y.b:3!null
+                          ├── scan z
+                          │    └── columns: c:2!null
+                          ├── select
+                          │    ├── columns: y.b:3!null
+                          │    ├── scan y
+                          │    │    └── columns: y.b:3!null
+                          │    └── filters
+                          │         └── y.b:3 = c:2
+                          └── filters (true)
+
+build
+SELECT
+  (SELECT b FROM (SELECT c AS a FROM z), (SELECT * FROM y WHERE b = a))
+FROM x
+----
+project
+ ├── columns: b:4
+ ├── scan x
+ │    └── columns: a:1!null
+ └── projections
+      └── subquery [as=b:4]
+           └── max1-row
+                ├── columns: y.b:3!null
+                └── project
+                     ├── columns: y.b:3!null
+                     └── inner-join (cross)
+                          ├── columns: c:2!null y.b:3!null
+                          ├── scan z
+                          │    └── columns: c:2!null
+                          ├── select
+                          │    ├── columns: y.b:3!null
+                          │    ├── scan y
+                          │    │    └── columns: y.b:3!null
+                          │    └── filters
+                          │         └── y.b:3 = a:1
+                          └── filters (true)
+
+build
+SELECT * FROM x AS o WHERE EXISTS(SELECT * FROM x, LATERAL (SELECT * FROM y WHERE b = x.a AND o.a = x.a))
+----
+select
+ ├── columns: a:1!null
+ ├── scan o
+ │    └── columns: o.a:1!null
+ └── filters
+      └── exists
+           └── inner-join-apply
+                ├── columns: x.a:2!null b:3!null
+                ├── scan x
+                │    └── columns: x.a:2!null
+                ├── select
+                │    ├── columns: b:3!null
+                │    ├── scan y
+                │    │    └── columns: b:3!null
+                │    └── filters
+                │         └── (b:3 = x.a:2) AND (o.a:1 = x.a:2)
+                └── filters (true)
+
+build
+SELECT * FROM x, LATERAL (SELECT * FROM y WHERE b = a), z
+----
+inner-join-apply
+ ├── columns: a:1!null b:2!null c:3!null
+ ├── inner-join-apply
+ │    ├── columns: a:1!null b:2!null
+ │    ├── scan x
+ │    │    └── columns: a:1!null
+ │    ├── select
+ │    │    ├── columns: b:2!null
+ │    │    ├── scan y
+ │    │    │    └── columns: b:2!null
+ │    │    └── filters
+ │    │         └── b:2 = a:1
+ │    └── filters (true)
+ ├── scan z
+ │    └── columns: c:3!null
+ └── filters (true)
+
+build
+SELECT * FROM x, LATERAL (SELECT * FROM y WHERE b = a), x
+----
+error (42712): source name "x" specified more than once (missing AS clause)
+
+exec-ddl
+CREATE TABLE j (
+  id INT PRIMARY KEY,
+  j JSONB
+)
+----
+
+build
+SELECT * FROM j, jsonb_array_elements(j.j->'foo')
+----
+inner-join-apply
+ ├── columns: id:1!null j:2 value:3
+ ├── scan j
+ │    └── columns: id:1!null j:2
+ ├── project-set
+ │    ├── columns: value:3
+ │    ├── values
+ │    │    └── ()
+ │    └── zip
+ │         └── jsonb_array_elements(j:2->'foo')
+ └── filters (true)
+
+# Explicit LATERAL makes no difference for SRFs.
+
+build
+SELECT * FROM j, LATERAL jsonb_array_elements(j.j->'foo')
+----
+inner-join-apply
+ ├── columns: id:1!null j:2 value:3
+ ├── scan j
+ │    └── columns: id:1!null j:2
+ ├── project-set
+ │    ├── columns: value:3
+ │    ├── values
+ │    │    └── ()
+ │    └── zip
+ │         └── jsonb_array_elements(j:2->'foo')
+ └── filters (true)
+
+# Referencing a lateral SRF from a lateral SRF.
+
+build
+SELECT * FROM j, jsonb_array_elements(j.j->'foo') AS e, jsonb_array_elements(e.e->'bar')
+----
+inner-join-apply
+ ├── columns: id:1!null j:2 e:3 value:4
+ ├── inner-join-apply
+ │    ├── columns: id:1!null j:2 value:3
+ │    ├── scan j
+ │    │    └── columns: id:1!null j:2
+ │    ├── project-set
+ │    │    ├── columns: value:3
+ │    │    ├── values
+ │    │    │    └── ()
+ │    │    └── zip
+ │    │         └── jsonb_array_elements(j:2->'foo')
+ │    └── filters (true)
+ ├── project-set
+ │    ├── columns: value:4
+ │    ├── values
+ │    │    └── ()
+ │    └── zip
+ │         └── jsonb_array_elements(value:3->'bar')
+ └── filters (true)
+
+build
+SELECT
+    *
+FROM
+    j,
+    jsonb_array_elements(
+        (
+            SELECT
+                j2.j->'members' AS members
+            FROM
+                j AS j2
+            WHERE
+                j2.j->>'name' = j.j->>'name'
+        )
+    )
+----
+inner-join-apply
+ ├── columns: id:1!null j:2 value:6
+ ├── scan j
+ │    └── columns: j.id:1!null j.j:2
+ ├── project-set
+ │    ├── columns: value:6
+ │    ├── values
+ │    │    └── ()
+ │    └── zip
+ │         └── function: jsonb_array_elements
+ │              └── subquery
+ │                   └── max1-row
+ │                        ├── columns: members:5
+ │                        └── project
+ │                             ├── columns: members:5
+ │                             ├── select
+ │                             │    ├── columns: j2.id:3!null j2.j:4
+ │                             │    ├── scan j2
+ │                             │    │    └── columns: j2.id:3!null j2.j:4
+ │                             │    └── filters
+ │                             │         └── (j2.j:4->>'name') = (j.j:2->>'name')
+ │                             └── projections
+ │                                  └── j2.j:4->'members' [as=members:5]
+ └── filters (true)
+
+build
+SELECT * FROM x JOIN LATERAL (SELECT * FROM y WHERE b = x.a) ON true
+----
+inner-join-apply
+ ├── columns: a:1!null b:2!null
+ ├── scan x
+ │    └── columns: a:1!null
+ ├── select
+ │    ├── columns: b:2!null
+ │    ├── scan y
+ │    │    └── columns: b:2!null
+ │    └── filters
+ │         └── b:2 = a:1
+ └── filters
+      └── true
+
+build
+SELECT * FROM x LEFT JOIN LATERAL (SELECT * FROM y WHERE b = x.a) ON true
+----
+left-join-apply
+ ├── columns: a:1!null b:2
+ ├── scan x
+ │    └── columns: a:1!null
+ ├── select
+ │    ├── columns: b:2!null
+ │    ├── scan y
+ │    │    └── columns: b:2!null
+ │    └── filters
+ │         └── b:2 = a:1
+ └── filters
+      └── true
+
+build
+SELECT * FROM x RIGHT JOIN LATERAL (SELECT * FROM y WHERE b = x.a) ON true
+----
+error (42601): The combining JOIN type must be INNER or LEFT for a LATERAL reference
+
+build
+SELECT * FROM x FULL OUTER JOIN LATERAL (SELECT * FROM y WHERE b = x.a) ON true
+----
+error (42601): The combining JOIN type must be INNER or LEFT for a LATERAL reference

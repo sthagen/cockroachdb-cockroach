@@ -1,13 +1,26 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
-import React from "react";
+import React, { Fragment } from "react";
+import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
-import { RouterState } from "react-router";
+import { RouteComponentProps, withRouter } from "react-router-dom";
 
 import * as protos from "src/js/protos";
-import { refreshCertificates } from "src/redux/apiReducers";
+import { certificatesRequestKey, refreshCertificates } from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
 import { nodeIDAttr } from "src/util/constants";
 import { LongToMoment } from "src/util/convert";
+import Loading from "src/views/shared/components/loading";
+import { getMatchParamByName } from "src/util/query";
 
 interface CertificatesOwnProps {
   certificates: protos.cockroach.server.serverpb.CertificatesResponse;
@@ -17,7 +30,7 @@ interface CertificatesOwnProps {
 
 const dateFormat = "Y-MM-DD HH:mm:ss";
 
-type CertificatesProps = CertificatesOwnProps & RouterState;
+type CertificatesProps = CertificatesOwnProps & RouteComponentProps;
 
 const emptyRow = (
   <tr className="certs-table__row">
@@ -26,14 +39,18 @@ const emptyRow = (
   </tr>
 );
 
+function certificatesRequestFromProps(props: CertificatesProps) {
+  return new protos.cockroach.server.serverpb.CertificatesRequest({
+    node_id: getMatchParamByName(props.match, nodeIDAttr),
+  });
+}
+
 /**
  * Renders the Certificate Report page.
  */
-class Certificates extends React.Component<CertificatesProps, {}> {
+export class Certificates extends React.Component<CertificatesProps, {}> {
   refresh(props = this.props) {
-    props.refreshCertificates(new protos.cockroach.server.serverpb.CertificatesRequest({
-      node_id: props.params[nodeIDAttr],
-    }));
+    props.refreshCertificates(certificatesRequestFromProps(props));
   }
 
   componentWillMount() {
@@ -88,7 +105,7 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     return this.renderSimpleRow(header, timestamp, title);
   }
 
-  renderFields(fields: protos.cockroach.server.serverpb.CertificateDetails.Fields$Properties, id: number) {
+  renderFields(fields: protos.cockroach.server.serverpb.CertificateDetails.IFields, id: number) {
     return [
       this.renderSimpleRow("Cert ID", id.toString()),
       this.renderSimpleRow("Issuer", fields.issuer),
@@ -103,14 +120,26 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     ];
   }
 
-  renderCert(cert: protos.cockroach.server.serverpb.CertificateDetails$Properties, key: number) {
+  renderCert(cert: protos.cockroach.server.serverpb.ICertificateDetails, key: number) {
     let certType: string;
     switch (cert.type) {
       case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.CA:
         certType = "Certificate Authority";
         break;
       case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.NODE:
-        certType = "Node";
+        certType = "Node Certificate";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.CLIENT_CA:
+        certType = "Client Certificate Authority";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.CLIENT:
+        certType = "Client Certificate";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.UI_CA:
+        certType = "UI Certificate Authority";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.UI:
+        certType = "UI Certificate";
         break;
       default:
         certType = "Unknown";
@@ -133,66 +162,61 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     );
   }
 
-  render() {
-    const nodeID = this.props.params[nodeIDAttr];
-    if (!_.isNil(this.props.lastError)) {
-      return (
-        <div className="section">
-          <h1>Certificates</h1>
-          <h2>Error loading certificates for node {nodeID}</h2>
-        </div>
-      );
-    }
-    const { certificates } = this.props;
-    if (_.isEmpty(certificates)) {
-      return (
-        <div className="section">
-          <h1>Certificates</h1>
-          <h2>Loading cluster status...</h2>
-        </div>
-      );
-    }
+  renderContent = () => {
+    const { certificates, match } = this.props;
+    const nodeId = getMatchParamByName(match, nodeIDAttr);
 
     if (_.isEmpty(certificates.certificates)) {
-      return (
-        <div className="section">
-          <h1>Certificates</h1>
-          <h2>No certificates were found on node {this.props.params[nodeIDAttr]}.</h2>
-        </div>
-      );
+      return <h2 className="base-heading">No certificates were found on node {nodeId}.</h2>;
     }
 
     let header: string = null;
-    if (_.isNaN(parseInt(nodeID, 10))) {
+    if (_.isNaN(parseInt(nodeId, 10))) {
       header = "Local Node";
     } else {
-      header = `Node ${nodeID}`;
+      header = `Node ${nodeId}`;
     }
 
     return (
-      <div className="section">
-        <h1>Certificates</h1>
-        <h2>{header} certificates</h2>
+      <Fragment>
+        <h2 className="base-heading">{header} certificates</h2>
         {
           _.map(certificates.certificates, (cert, key) => (
             this.renderCert(cert, key)
           ))
         }
+      </Fragment>
+    );
+  }
+
+  render() {
+    return (
+      <div className="section">
+        <Helmet title="Certificates | Debug" />
+        <h1 className="base-heading">Certificates</h1>
+
+        <section className="section">
+          <Loading
+            loading={!this.props.certificates}
+            error={this.props.lastError}
+            render={this.renderContent}
+          />
+        </section>
       </div>
     );
   }
 }
 
-function mapStateToProps(state: AdminUIState, props: CertificatesProps) {
-  const nodeID = props.params[nodeIDAttr];
+const mapStateToProps = (state: AdminUIState, props: CertificatesProps) => {
+  const nodeIDKey = certificatesRequestKey(certificatesRequestFromProps(props));
   return {
-    certificates: state.cachedData.certificates[nodeID] && state.cachedData.certificates[nodeID].data,
-    lastError: state.cachedData.certificates[nodeID] && state.cachedData.certificates[nodeID].lastError,
+    certificates: state.cachedData.certificates[nodeIDKey] && state.cachedData.certificates[nodeIDKey].data,
+    lastError: state.cachedData.certificates[nodeIDKey] && state.cachedData.certificates[nodeIDKey].lastError,
   };
-}
+};
 
-const actions = {
+const mapDispatchToProps = {
   refreshCertificates,
 };
 
-export default connect(mapStateToProps, actions)(Certificates);
+export default withRouter(connect(mapStateToProps, mapDispatchToProps)(Certificates));

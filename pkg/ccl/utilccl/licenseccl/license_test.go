@@ -9,10 +9,9 @@
 package licenseccl
 
 import (
+	"fmt"
 	"testing"
 	"time"
-
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -68,10 +67,10 @@ func TestLicense(t *testing.T) {
 		var lic *License
 		if tc.licType != -1 {
 			s, err := License{
-				tc.grantedTo,
-				tc.expiration.Unix(),
-				tc.licType,
-				fmt.Sprintf("tc-%d", i),
+				ClusterID:         tc.grantedTo,
+				ValidUntilUnixSec: tc.expiration.Unix(),
+				Type:              tc.licType,
+				OrganizationName:  fmt.Sprintf("tc-%d", i),
 			}.Encode()
 			if err != nil {
 				t.Fatal(err)
@@ -100,5 +99,19 @@ func TestBadLicenseStrings(t *testing.T) {
 		if _, err := Decode(tc.lic); !testutils.IsError(err, tc.err) {
 			t.Fatalf("%q: expected err %q, got %v", tc.lic, tc.err, err)
 		}
+	}
+}
+
+func TestExpiredLicenseLanguage(t *testing.T) {
+	lic := License{
+		Type:              License_Evaluation,
+		ValidUntilUnixSec: 1,
+	}
+	err := lic.Check(timeutil.Now(), uuid.MakeV4(), "", "RESTORE")
+	expected := "Use of RESTORE requires an enterprise license. Your evaluation license expired on " +
+		"January 1, 1970. If you're interested in getting a new license, please contact " +
+		"subscriptions@cockroachlabs.com and we can help you out."
+	if err == nil || err.Error() != expected {
+		t.Fatalf("expected err %q, got %v", expected, err)
 	}
 }

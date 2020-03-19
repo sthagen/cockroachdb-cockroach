@@ -1,0 +1,439 @@
+exec-ddl
+CREATE TABLE abcde (
+    a INT NOT NULL,
+    b INT,
+    c INT DEFAULT (10),
+    d INT AS (b + c + 1) STORED,
+    e INT AS (a) STORED
+)
+----
+
+exec-ddl
+CREATE TABLE xyz (
+    x TEXT PRIMARY KEY,
+    y INT8,
+    z FLOAT8
+)
+----
+
+exec-ddl
+CREATE TABLE uv (
+    u DECIMAL,
+    v BYTES
+)
+----
+
+exec-ddl
+CREATE TABLE mutation (
+    m INT PRIMARY KEY,
+    n INT,
+    "o:write-only" INT DEFAULT(10),
+    "p:delete-only" INT AS (o + n) STORED
+)
+----
+
+# ------------------------------------------------------------------------------
+# Basic tests.
+# ------------------------------------------------------------------------------
+
+# No extra clauses.
+build
+DELETE FROM abcde
+----
+delete abcde
+ ├── columns: <none>
+ ├── fetch columns: a:7 b:8 c:9 d:10 e:11 rowid:12
+ └── scan abcde
+      ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+      └── computed column expressions
+           ├── d:10
+           │    └── (b:8 + c:9) + 1
+           └── e:11
+                └── a:7
+
+# Use WHERE, ORDER BY, LIMIT.
+build
+DELETE FROM abcde WHERE a>0 ORDER BY a LIMIT 10
+----
+delete abcde
+ ├── columns: <none>
+ ├── fetch columns: a:7 b:8 c:9 d:10 e:11 rowid:12
+ └── limit
+      ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+      ├── internal-ordering: +7
+      ├── sort
+      │    ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+      │    ├── ordering: +7
+      │    ├── limit hint: 10.00
+      │    └── select
+      │         ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+      │         ├── scan abcde
+      │         │    ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+      │         │    └── computed column expressions
+      │         │         ├── d:10
+      │         │         │    └── (b:8 + c:9) + 1
+      │         │         └── e:11
+      │         │              └── a:7
+      │         └── filters
+      │              └── a:7 > 0
+      └── 10
+
+# Use aliased table name.
+build
+DELETE FROM abcde AS foo WHERE foo.a>0 ORDER BY foo.a LIMIT 10
+----
+delete foo
+ ├── columns: <none>
+ ├── fetch columns: a:7 b:8 c:9 d:10 e:11 rowid:12
+ └── limit
+      ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+      ├── internal-ordering: +7
+      ├── sort
+      │    ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+      │    ├── ordering: +7
+      │    ├── limit hint: 10.00
+      │    └── select
+      │         ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+      │         ├── scan foo
+      │         │    ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+      │         │    └── computed column expressions
+      │         │         ├── d:10
+      │         │         │    └── (b:8 + c:9) + 1
+      │         │         └── e:11
+      │         │              └── a:7
+      │         └── filters
+      │              └── a:7 > 0
+      └── 10
+
+# DELETE with index hints.
+exec-ddl
+CREATE TABLE xyzw (
+  x INT PRIMARY KEY,
+  y INT,
+  z INT,
+  w INT,
+  INDEX foo (z, y)
+)
+----
+
+build
+DELETE FROM xyzw@primary
+----
+delete xyzw
+ ├── columns: <none>
+ ├── fetch columns: x:5 y:6 z:7 w:8
+ └── scan xyzw
+      ├── columns: x:5!null y:6 z:7 w:8
+      └── flags: force-index=primary
+
+build
+DELETE FROM xyzw@foo
+----
+delete xyzw
+ ├── columns: <none>
+ ├── fetch columns: x:5 y:6 z:7 w:8
+ └── scan xyzw
+      ├── columns: x:5!null y:6 z:7 w:8
+      └── flags: force-index=foo
+
+build
+DELETE FROM xyzw@{FORCE_INDEX=foo,ASC}
+----
+delete xyzw
+ ├── columns: <none>
+ ├── fetch columns: x:5 y:6 z:7 w:8
+ └── scan xyzw
+      ├── columns: x:5!null y:6 z:7 w:8
+      └── flags: force-index=foo,fwd
+
+build
+DELETE FROM xyzw@{FORCE_INDEX=foo,DESC}
+----
+delete xyzw
+ ├── columns: <none>
+ ├── fetch columns: x:5 y:6 z:7 w:8
+ └── scan xyzw,rev
+      ├── columns: x:5!null y:6 z:7 w:8
+      └── flags: force-index=foo,rev
+
+build
+DELETE FROM xyzw@{NO_INDEX_JOIN}
+----
+delete xyzw
+ ├── columns: <none>
+ ├── fetch columns: x:5 y:6 z:7 w:8
+ └── scan xyzw
+      ├── columns: x:5!null y:6 z:7 w:8
+      └── flags: no-index-join
+
+build
+DELETE FROM xyzw@bad_idx
+----
+error: index "bad_idx" not found
+
+# Use placeholders.
+build
+DELETE FROM xyz WHERE x=$1 ORDER BY y+$2 DESC LIMIT 2
+----
+delete xyz
+ ├── columns: <none>
+ ├── fetch columns: x:4 y:5 z:6
+ └── limit
+      ├── columns: x:4!null y:5 z:6 column7:7
+      ├── internal-ordering: -7
+      ├── sort
+      │    ├── columns: x:4!null y:5 z:6 column7:7
+      │    ├── ordering: -7
+      │    ├── limit hint: 2.00
+      │    └── project
+      │         ├── columns: column7:7 x:4!null y:5 z:6
+      │         ├── select
+      │         │    ├── columns: x:4!null y:5 z:6
+      │         │    ├── scan xyz
+      │         │    │    └── columns: x:4!null y:5 z:6
+      │         │    └── filters
+      │         │         └── x:4 = $1
+      │         └── projections
+      │              └── y:5 + $2 [as=column7:7]
+      └── 2
+
+
+# Use CTE within WHERE clause.
+build
+WITH cte AS (SELECT x FROM xyz) DELETE FROM abcde WHERE EXISTS(SELECT * FROM cte)
+----
+with &1 (cte)
+ ├── project
+ │    ├── columns: xyz.x:1!null
+ │    └── scan xyz
+ │         └── columns: xyz.x:1!null y:2 z:3
+ └── delete abcde
+      ├── columns: <none>
+      ├── fetch columns: a:10 b:11 c:12 d:13 e:14 rowid:15
+      └── select
+           ├── columns: a:10!null b:11 c:12 d:13 e:14 rowid:15!null
+           ├── scan abcde
+           │    ├── columns: a:10!null b:11 c:12 d:13 e:14 rowid:15!null
+           │    └── computed column expressions
+           │         ├── d:13
+           │         │    └── (b:11 + c:12) + 1
+           │         └── e:14
+           │              └── a:10
+           └── filters
+                └── exists
+                     └── with-scan &1 (cte)
+                          ├── columns: x:16!null
+                          └── mapping:
+                               └──  xyz.x:1 => x:16
+
+# Unknown target table.
+build
+DELETE FROM unknown WHERE x=1
+----
+error (42P01): no data source matches prefix: "unknown"
+
+# Try to use non-returning UPDATE as expression.
+build
+SELECT * FROM [DELETE FROM abcde WHERE a=1]
+----
+error (42703): statement source "DELETE FROM abcde WHERE a = 1" does not return any columns
+
+# Non-referenced CTE with mutation.
+build
+WITH cte AS (SELECT b FROM [DELETE FROM abcde WHERE a=b RETURNING *]) DELETE FROM abcde WHERE a=b
+----
+with &1
+ ├── project
+ │    ├── columns: abcde.a:1!null abcde.b:2!null abcde.c:3 abcde.d:4 abcde.e:5
+ │    └── delete abcde
+ │         ├── columns: abcde.a:1!null abcde.b:2!null abcde.c:3 abcde.d:4 abcde.e:5 rowid:6!null
+ │         ├── fetch columns: abcde.a:7 abcde.b:8 abcde.c:9 abcde.d:10 abcde.e:11 rowid:12
+ │         └── select
+ │              ├── columns: abcde.a:7!null abcde.b:8!null abcde.c:9 abcde.d:10 abcde.e:11 rowid:12!null
+ │              ├── scan abcde
+ │              │    ├── columns: abcde.a:7!null abcde.b:8 abcde.c:9 abcde.d:10 abcde.e:11 rowid:12!null
+ │              │    └── computed column expressions
+ │              │         ├── abcde.d:10
+ │              │         │    └── (abcde.b:8 + abcde.c:9) + 1
+ │              │         └── abcde.e:11
+ │              │              └── abcde.a:7
+ │              └── filters
+ │                   └── abcde.a:7 = abcde.b:8
+ └── with &2 (cte)
+      ├── project
+      │    ├── columns: b:14!null
+      │    └── with-scan &1
+      │         ├── columns: a:13!null b:14!null c:15 d:16 e:17
+      │         └── mapping:
+      │              ├──  abcde.a:1 => a:13
+      │              ├──  abcde.b:2 => b:14
+      │              ├──  abcde.c:3 => c:15
+      │              ├──  abcde.d:4 => d:16
+      │              └──  abcde.e:5 => e:17
+      └── delete abcde
+           ├── columns: <none>
+           ├── fetch columns: abcde.a:24 abcde.b:25 abcde.c:26 abcde.d:27 abcde.e:28 rowid:29
+           └── select
+                ├── columns: abcde.a:24!null abcde.b:25!null abcde.c:26 abcde.d:27 abcde.e:28 rowid:29!null
+                ├── scan abcde
+                │    ├── columns: abcde.a:24!null abcde.b:25 abcde.c:26 abcde.d:27 abcde.e:28 rowid:29!null
+                │    └── computed column expressions
+                │         ├── abcde.d:27
+                │         │    └── (abcde.b:25 + abcde.c:26) + 1
+                │         └── abcde.e:28
+                │              └── abcde.a:24
+                └── filters
+                     └── abcde.a:24 = abcde.b:25
+
+# With alias, original table name should be inaccessible.
+build
+DELETE FROM abcde AS foo WHERE a=abcde.b
+----
+error (42P01): no data source matches prefix: abcde
+
+# ORDER BY can only be used with LIMIT.
+build
+DELETE FROM abcde WHERE b=1 ORDER BY c
+----
+error (42601): DELETE statement requires LIMIT when ORDER BY is used
+
+# ------------------------------------------------------------------------------
+# Test RETURNING.
+# ------------------------------------------------------------------------------
+
+# Return values from delete.
+build
+DELETE FROM abcde WHERE a=1 RETURNING *
+----
+project
+ ├── columns: a:1!null b:2 c:3 d:4 e:5
+ └── delete abcde
+      ├── columns: a:1!null b:2 c:3 d:4 e:5 rowid:6!null
+      ├── fetch columns: a:7 b:8 c:9 d:10 e:11 rowid:12
+      └── select
+           ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+           ├── scan abcde
+           │    ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+           │    └── computed column expressions
+           │         ├── d:10
+           │         │    └── (b:8 + c:9) + 1
+           │         └── e:11
+           │              └── a:7
+           └── filters
+                └── a:7 = 1
+
+# Return values from aliased table.
+build
+DELETE FROM abcde AS foo WHERE a=1 RETURNING foo.a+1, foo.b * foo.d
+----
+project
+ ├── columns: "?column?":13!null "?column?":14
+ ├── delete foo
+ │    ├── columns: a:1!null b:2 c:3 d:4 e:5 rowid:6!null
+ │    ├── fetch columns: a:7 b:8 c:9 d:10 e:11 rowid:12
+ │    └── select
+ │         ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+ │         ├── scan foo
+ │         │    ├── columns: a:7!null b:8 c:9 d:10 e:11 rowid:12!null
+ │         │    └── computed column expressions
+ │         │         ├── d:10
+ │         │         │    └── (b:8 + c:9) + 1
+ │         │         └── e:11
+ │         │              └── a:7
+ │         └── filters
+ │              └── a:7 = 1
+ └── projections
+      ├── a:1 + 1 [as="?column?":13]
+      └── b:2 * d:4 [as="?column?":14]
+
+# Use returning DELETE as a FROM expression.
+build
+SELECT a, d FROM [DELETE FROM abcde WHERE a>0 ORDER BY b LIMIT 10 RETURNING *]
+----
+with &1
+ ├── columns: a:13!null d:16
+ ├── project
+ │    ├── columns: abcde.a:1!null abcde.b:2 abcde.c:3 abcde.d:4 abcde.e:5
+ │    └── delete abcde
+ │         ├── columns: abcde.a:1!null abcde.b:2 abcde.c:3 abcde.d:4 abcde.e:5 rowid:6!null
+ │         ├── fetch columns: abcde.a:7 abcde.b:8 abcde.c:9 abcde.d:10 abcde.e:11 rowid:12
+ │         └── limit
+ │              ├── columns: abcde.a:7!null abcde.b:8 abcde.c:9 abcde.d:10 abcde.e:11 rowid:12!null
+ │              ├── internal-ordering: +8
+ │              ├── sort
+ │              │    ├── columns: abcde.a:7!null abcde.b:8 abcde.c:9 abcde.d:10 abcde.e:11 rowid:12!null
+ │              │    ├── ordering: +8
+ │              │    ├── limit hint: 10.00
+ │              │    └── select
+ │              │         ├── columns: abcde.a:7!null abcde.b:8 abcde.c:9 abcde.d:10 abcde.e:11 rowid:12!null
+ │              │         ├── scan abcde
+ │              │         │    ├── columns: abcde.a:7!null abcde.b:8 abcde.c:9 abcde.d:10 abcde.e:11 rowid:12!null
+ │              │         │    └── computed column expressions
+ │              │         │         ├── abcde.d:10
+ │              │         │         │    └── (abcde.b:8 + abcde.c:9) + 1
+ │              │         │         └── abcde.e:11
+ │              │         │              └── abcde.a:7
+ │              │         └── filters
+ │              │              └── abcde.a:7 > 0
+ │              └── 10
+ └── project
+      ├── columns: a:13!null d:16
+      └── with-scan &1
+           ├── columns: a:13!null b:14 c:15 d:16 e:17
+           └── mapping:
+                ├──  abcde.a:1 => a:13
+                ├──  abcde.b:2 => b:14
+                ├──  abcde.c:3 => c:15
+                ├──  abcde.d:4 => d:16
+                └──  abcde.e:5 => e:17
+
+# ------------------------------------------------------------------------------
+# Tests with mutations.
+# ------------------------------------------------------------------------------
+
+# Without RETURNING clause.
+build
+DELETE FROM mutation WHERE m=1
+----
+delete mutation
+ ├── columns: <none>
+ ├── fetch columns: m:5 n:6 o:7 p:8
+ └── select
+      ├── columns: m:5!null n:6 o:7 p:8
+      ├── scan mutation
+      │    └── columns: m:5!null n:6 o:7 p:8
+      └── filters
+           └── m:5 = 1
+
+# With RETURNING clause.
+build
+DELETE FROM mutation WHERE m=1 RETURNING *
+----
+delete mutation
+ ├── columns: m:1!null n:2
+ ├── fetch columns: m:5 n:6 o:7 p:8
+ └── select
+      ├── columns: m:5!null n:6 o:7 p:8
+      ├── scan mutation
+      │    └── columns: m:5!null n:6 o:7 p:8
+      └── filters
+           └── m:5 = 1
+
+
+# Try to return a mutation column.
+build
+DELETE FROM mutation RETURNING o
+----
+error (42703): column "o" does not exist
+
+# Try to use mutation column in WHERE clause.
+build
+DELETE FROM mutation WHERE o=10
+----
+error (42P10): column "o" is being backfilled
+
+# Try to use mutation column in ORDER BY expression.
+build
+DELETE FROM mutation ORDER BY p LIMIT 2
+----
+error (42P10): column "p" is being backfilled

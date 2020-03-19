@@ -12,14 +12,14 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/pkg/errors"
 )
 
 // TODO(tamird): why does rocksdb not link jemalloc,snappy statically?
 
-// #cgo CPPFLAGS: -I../../../../c-deps/libroach/include
+// #cgo CPPFLAGS: -I../../../../c-deps/libroach/include -I../../../../c-deps/libroach/ccl/include
 // #cgo LDFLAGS: -lroachccl
 // #cgo LDFLAGS: -lroach
 // #cgo LDFLAGS: -lprotobuf
@@ -27,16 +27,20 @@ import (
 // #cgo LDFLAGS: -lsnappy
 // #cgo LDFLAGS: -lcryptopp
 // #cgo linux LDFLAGS: -lrt -lpthread
-// #cgo windows LDFLAGS: -lrpcrt4
+// #cgo windows LDFLAGS: -lshlwapi -lrpcrt4
 //
 // #include <stdlib.h>
 // #include <libroachccl.h>
 import "C"
 
+func init() {
+	storage.SetRocksDBOpenHook(C.DBOpenHookCCL)
+}
+
 // VerifyBatchRepr asserts that all keys in a BatchRepr are between the specified
 // start and end keys and computes the enginepb.MVCCStats for it.
 func VerifyBatchRepr(
-	repr []byte, start, end engine.MVCCKey, nowNanos int64,
+	repr []byte, start, end storage.MVCCKey, nowNanos int64,
 ) (enginepb.MVCCStats, error) {
 	// We store a 4 byte checksum of each key/value entry in the value. Make
 	// sure the all ones in this BatchRepr validate.
@@ -46,13 +50,13 @@ func VerifyBatchRepr(
 	// checksums in go and constructs the MVCCStats in c++. It'd be nice to move
 	// one or the other.
 	{
-		r, err := engine.NewRocksDBBatchReader(repr)
+		r, err := storage.NewRocksDBBatchReader(repr)
 		if err != nil {
 			return enginepb.MVCCStats{}, errors.Wrapf(err, "verifying key/value checksums")
 		}
 		for r.Next() {
 			switch r.BatchType() {
-			case engine.BatchTypeValue:
+			case storage.BatchTypeValue:
 				mvccKey, err := r.MVCCKey()
 				if err != nil {
 					return enginepb.MVCCStats{}, errors.Wrapf(err, "verifying key/value checksums")
@@ -101,11 +105,11 @@ func goToCSlice(b []byte) C.DBSlice {
 	}
 	return C.DBSlice{
 		data: (*C.char)(unsafe.Pointer(&b[0])),
-		len:  C.int(len(b)),
+		len:  C.size_t(len(b)),
 	}
 }
 
-func goToCKey(key engine.MVCCKey) C.DBKey {
+func goToCKey(key storage.MVCCKey) C.DBKey {
 	return C.DBKey{
 		key:       goToCSlice(key.Key),
 		wall_time: C.int64_t(key.Timestamp.WallTime),
@@ -113,11 +117,20 @@ func goToCKey(key engine.MVCCKey) C.DBKey {
 	}
 }
 
+func cSliceToUnsafeGoBytes(s C.DBSlice) []byte {
+	if s.data == nil {
+		return nil
+	}
+	// Interpret the C pointer as a pointer to a Go array, then slice.
+	return (*[storage.MaxArrayLen]byte)(unsafe.Pointer(s.data))[:s.len:s.len]
+}
+
 func cStringToGoString(s C.DBString) string {
 	if s.data == nil {
 		return ""
 	}
-	result := C.GoStringN(s.data, s.len)
+	// Reinterpret the string as a slice, then cast to string which does a copy.
+	result := string(cSliceToUnsafeGoBytes(C.DBSlice{s.data, s.len}))
 	C.free(unsafe.Pointer(s.data))
 	return result
 }
@@ -134,7 +147,7 @@ func cStatsToGoStats(stats C.MVCCStatsResult, nowNanos int64) (enginepb.MVCCStat
 	if err := statusToError(stats.status); err != nil {
 		return ms, err
 	}
-	ms.ContainsEstimates = false
+	ms.ContainsEstimates = 0
 	ms.LiveBytes = int64(stats.live_bytes)
 	ms.KeyBytes = int64(stats.key_bytes)
 	ms.ValBytes = int64(stats.val_bytes)

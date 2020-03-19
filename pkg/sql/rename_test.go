@@ -1,21 +1,18 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -35,9 +32,8 @@ func TestRenameTable(t *testing.T) {
 	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
 
-	counter := int64(keys.MaxReservedDescID)
+	counter := int64(keys.MinNonPredefinedUserDescID)
 
-	counter++
 	oldDBID := sqlbase.ID(counter)
 	if _, err := db.Exec(`CREATE DATABASE test`); err != nil {
 		t.Fatal(err)
@@ -53,10 +49,11 @@ func TestRenameTable(t *testing.T) {
 	// Check the table descriptor.
 	desc := &sqlbase.Descriptor{}
 	tableDescKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(counter))
-	if err := kvDB.GetProto(context.TODO(), tableDescKey, desc); err != nil {
+	ts, err := kvDB.GetProtoTs(context.TODO(), tableDescKey, desc)
+	if err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := desc.GetTable()
+	tableDesc := desc.Table(ts)
 	if tableDesc.Name != oldName {
 		t.Fatalf("Wrong table name, expected %s, got: %+v", oldName, tableDesc)
 	}
@@ -78,10 +75,11 @@ func TestRenameTable(t *testing.T) {
 	}
 
 	// Check the table descriptor again.
-	if err := kvDB.GetProto(context.TODO(), tableDescKey, desc); err != nil {
+	ts, err = kvDB.GetProtoTs(context.TODO(), tableDescKey, desc)
+	if err != nil {
 		t.Fatal(err)
 	}
-	tableDesc = desc.GetTable()
+	tableDesc = desc.Table(ts)
 	if tableDesc.Name != newName {
 		t.Fatalf("Wrong table name, expected %s, got: %+v", newName, tableDesc)
 	}
@@ -96,7 +94,7 @@ func isRenamed(
 	tableID sqlbase.ID,
 	expectedName string,
 	expectedVersion sqlbase.DescriptorVersion,
-	cfg config.SystemConfig,
+	cfg *config.SystemConfig,
 ) bool {
 	descKey := sqlbase.MakeDescMetadataKey(tableID)
 	val := cfg.GetValue(descKey)
@@ -107,7 +105,7 @@ func isRenamed(
 	if err := val.GetProto(&descriptor); err != nil {
 		panic("unable to unmarshal table descriptor")
 	}
-	table := descriptor.GetTable()
+	table := descriptor.Table(val.Timestamp)
 	return table.Name == expectedName && table.Version == expectedVersion
 }
 
@@ -128,7 +126,7 @@ func TestTxnCanStillResolveOldName(t *testing.T) {
 	serverParams := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLSchemaChanger: &SchemaChangerTestingKnobs{
-				RenameOldNameNotInUseNotification: func() {
+				OldNamesDrainedNotification: func() {
 					<-renameUnblocked
 				},
 			},
@@ -145,7 +143,7 @@ func TestTxnCanStillResolveOldName(t *testing.T) {
 	// version is ignored by the leasing refresh mechanism).
 	renamed := make(chan interface{})
 	lmKnobs.TestingLeasesRefreshedEvent =
-		func(cfg config.SystemConfig) {
+		func(cfg *config.SystemConfig) {
 			mu.Lock()
 			defer mu.Unlock()
 			if waitTableID != 0 {
@@ -225,8 +223,13 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 	// Check that the old name is not usable outside of the transaction now
 	// that the node doesn't have a lease on it anymore (committing the txn
 	// should have released the lease on the version of the descriptor with the
-	// old name), even thoudh the name mapping still exists.
-	lease := s.LeaseManager().(*LeaseManager).tableNames.get(tableDesc.ID, "t", s.Clock().Now())
+	// old name), even though the name mapping still exists.
+	lease := s.LeaseManager().(*LeaseManager).tableNames.get(
+		tableDesc.ID,
+		tableDesc.GetParentSchemaID(),
+		"t",
+		s.Clock().Now(),
+	)
 	if lease != nil {
 		t.Fatalf(`still have lease on "t"`)
 	}
@@ -343,6 +346,97 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 		t.Fatal(err)
 	}
 	if _, err := db.Exec("CREATE TABLE test.t3 (a INT PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Tests that a RENAME while a name is being drained will result in the
+// table version being incremented again, implying that all old names
+// are drained correctly. The new RENAME will succeed with
+// all old names drained.
+func TestRenameDuringDrainingName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// two channels that signal the start of the second rename
+	// and the end of the second rename.
+	startRename := make(chan interface{})
+	finishRename := make(chan interface{})
+	serverParams := base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLSchemaChanger: &SchemaChangerTestingKnobs{
+				OldNamesDrainedNotification: func() {
+					if startRename != nil {
+						// Run second rename.
+						start := startRename
+						startRename = nil
+						close(start)
+						<-finishRename
+					}
+				},
+				// Don't run the schema changer for the second RENAME so that we can be
+				// sure that the first schema changer runs both schema changes. This
+				// behavior is due to the fact that the schema changer for the first job
+				// will process all the draining names on the table descriptor,
+				// including the ones queued up by the second job. It's not ideal since
+				// we would like jobs to manage their own state without interference
+				// from other jobs, but that's how schema change jobs work right now.
+				SchemaChangeJobNoOp: func() bool {
+					return startRename == nil
+				},
+			},
+		}}
+
+	s, db, kvDB := serverutils.StartServer(t, serverParams)
+	defer s.Stopper().Stop(context.TODO())
+
+	sql := `
+CREATE DATABASE test;
+CREATE TABLE test.t (a INT PRIMARY KEY);
+`
+	_, err := db.Exec(sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
+	// The expected version will be the result of two increments for the two
+	// schema changes and one increment for signaling of the completion of the
+	// drain. See the above comment for an explanation of why there's only one
+	// expected version update for draining names.
+	expectedVersion := tableDesc.Version + 3
+
+	// Concurrently, rename the table.
+	start := startRename
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		if _, err := db.Exec("ALTER TABLE test.t RENAME TO test.t2"); err != nil {
+			t.Error(err)
+		}
+		wg.Done()
+	}()
+
+	<-start
+	if _, err := db.Exec("ALTER TABLE test.t2 RENAME TO test.t3"); err != nil {
+		t.Fatal(err)
+	}
+	close(finishRename)
+
+	wg.Wait()
+
+	// Table rename to t3 was successful.
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, "test", "t3")
+	if version := tableDesc.Version; expectedVersion != version {
+		t.Fatalf("version mismatch: expected = %d, current = %d", expectedVersion, version)
+	}
+
+	// Old names are gone.
+	if _, err := db.Exec("SELECT * FROM test.t"); !testutils.IsError(
+		err, `relation "test.t" does not exist`) {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("SELECT * FROM test.t2"); !testutils.IsError(
+		err, `relation "test.t2" does not exist`) {
 		t.Fatal(err)
 	}
 }

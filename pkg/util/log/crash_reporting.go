@@ -1,41 +1,50 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package log
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
-	"syscall"
 	"time"
-
-	raven "github.com/getsentry/raven-go"
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/stacktrace"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	raven "github.com/getsentry/raven-go"
+	"github.com/pkg/errors"
 )
 
+// The call stack here is usually:
+// - ReportPanic
+// - RecoverAndReport
+// - panic()
+// so ReportPanic should pop three frames.
+const depthForRecoverAndReportPanic = 3
+
 var (
+	// crashReportEnv controls the version reported in crash reports
+	crashReportEnv = "development"
+
 	// DiagnosticsReportingEnabled wraps "diagnostics.reporting.enabled".
 	//
 	// "diagnostics.reporting.enabled" enables reporting of metrics related to a
@@ -50,7 +59,7 @@ var (
 	//
 	// Doing this, rather than just using a default of `true`, means that a node
 	// will not errantly send a report using a default before loading settings.
-	DiagnosticsReportingEnabled = settings.RegisterBoolSetting(
+	DiagnosticsReportingEnabled = settings.RegisterPublicBoolSetting(
 		"diagnostics.reporting.enabled",
 		"enable reporting diagnostic metrics to cockroach labs",
 		false,
@@ -61,6 +70,13 @@ var (
 		"diagnostics.reporting.send_crash_reports",
 		"send crash and panic reports",
 		true,
+	)
+
+	// PanicOnAssertions wraps "debug.panic_on_failed_assertions"
+	PanicOnAssertions = settings.RegisterBoolSetting(
+		"debug.panic_on_failed_assertions",
+		"panic when an assertion fails rather than reporting",
+		false,
 	)
 
 	// startTime records when the process started so that crash reports can
@@ -79,14 +95,19 @@ var (
 // real stderr a panic has occurred.
 func RecoverAndReportPanic(ctx context.Context, sv *settings.Values) {
 	if r := recover(); r != nil {
-		// The call stack here is usually:
-		// - ReportPanic
-		// - RecoverAndReport
-		// - panic.go
-		// - panic()
-		// so ReportPanic should pop four frames.
-		ReportPanic(ctx, sv, r, 4)
+		ReportPanic(ctx, sv, r, depthForRecoverAndReportPanic)
 		panic(r)
+	}
+}
+
+// RecoverAndReportNonfatalPanic is an alternative RecoverAndReportPanic that
+// does not re-panic in Release builds.
+func RecoverAndReportNonfatalPanic(ctx context.Context, sv *settings.Values) {
+	if r := recover(); r != nil {
+		ReportPanic(ctx, sv, r, depthForRecoverAndReportPanic)
+		if !build.IsRelease() || PanicOnAssertions.Get(sv) {
+			panic(r)
+		}
 	}
 }
 
@@ -116,13 +137,26 @@ func (st SafeType) SafeMessage() string {
 	return fmt.Sprintf("%v", st.V)
 }
 
+// Format implements fmt.Formatter.
+func (st SafeType) Format(s fmt.State, verb rune) {
+	switch {
+	case verb == 'v' && s.Flag('+'):
+		fmt.Fprintf(s, "%s", st.Error())
+	default:
+		// "%d" etc with log.Safe() should minimally work.
+		// TODO(knz): This may lose some flags.
+		fmt.Fprintf(s, fmt.Sprintf("%%%c", verb), st.V)
+	}
+}
+
 // Error implements error as a convenience.
 func (st SafeType) Error() string {
-	msg := st.SafeMessage()
+	var buf bytes.Buffer
+	fmt.Fprint(&buf, st.SafeMessage())
 	for _, cause := range st.causes {
-		msg += fmt.Sprintf("; caused by %v", cause)
+		fmt.Fprintf(&buf, "; caused by %v", cause)
 	}
-	return msg
+	return buf.String()
 }
 
 // SafeType implements fmt.Stringer as a convenience.
@@ -173,7 +207,7 @@ func (st SafeType) WithCause(cause interface{}) SafeType {
 func ReportPanic(ctx context.Context, sv *settings.Values, r interface{}, depth int) {
 	Shout(ctx, Severity_ERROR, "a panic has occurred!")
 
-	if stderrRedirected {
+	if mainLog.stderrRedirected() {
 		// We do not use Shout() to print the panic details here, because
 		// if stderr is not redirected (e.g. when logging to file is
 		// disabled) Shout() would copy its argument to stderr
@@ -186,10 +220,10 @@ func ReportPanic(ctx context.Context, sv *settings.Values, r interface{}, depth 
 		// If stderr is not redirected, then Go's runtime will only print
 		// out the panic details to the original stderr, and we'll miss a copy
 		// in the log file. Produce it here.
-		logging.printPanicToFile(r)
+		mainLog.printPanicToFile(r)
 	}
 
-	SendCrashReport(ctx, sv, depth+1, "", []interface{}{r})
+	SendCrashReport(ctx, sv, depth+1, "", []interface{}{r}, ReportTypePanic)
 
 	// Ensure that the logs are flushed before letting a panic
 	// terminate the server.
@@ -198,24 +232,31 @@ func ReportPanic(ctx context.Context, sv *settings.Values, r interface{}, depth 
 
 var crashReportURL = func() string {
 	var defaultURL string
-	if build.IsRelease() {
+	if build.SeemsOfficial() {
 		defaultURL = "https://ignored:ignored@errors.cockroachdb.com/sentry"
 	}
 	return envutil.EnvOrDefaultString("COCKROACH_CRASH_REPORTS", defaultURL)
 }()
 
+// crashReportingActive is set to true if raven has been initialized.
+var crashReportingActive bool
+
 // SetupCrashReporter sets the crash reporter info.
 func SetupCrashReporter(ctx context.Context, cmd string) {
+	if crashReportURL == "" {
+		return
+	}
 	if err := raven.SetDSN(crashReportURL); err != nil {
 		panic(errors.Wrap(err, "failed to setup crash reporting"))
 	}
+	crashReportingActive = true
 
 	if cmd == "start" {
 		cmd = "server"
 	}
 	info := build.GetInfo()
 	raven.SetRelease(info.Tag)
-	raven.SetEnvironment(info.Type)
+	raven.SetEnvironment(crashReportEnv)
 	raven.SetTagsContext(map[string]string{
 		"cmd":          cmd,
 		"platform":     info.Platform,
@@ -223,11 +264,6 @@ func SetupCrashReporter(ctx context.Context, cmd string) {
 		"rev":          info.Revision,
 		"goversion":    info.GoVersion,
 	})
-}
-
-var crdbPaths = []string{
-	"github.com/cockroachdb/cockroach",
-	"github.com/coreos/etcd/raft",
 }
 
 func uptimeTag(now time.Time) string {
@@ -259,19 +295,13 @@ func (e *safeError) Error() string {
 	return e.message
 }
 
-// redact returns a redacted version of the supplied item that is safe to use in
+// Redact returns a redacted version of the supplied item that is safe to use in
 // anonymized reporting.
-func redact(r interface{}) string {
+func Redact(r interface{}) string {
 	typAnd := func(i interface{}, text string) string {
-		type stackTracer interface {
-			StackTrace() errors.StackTrace
-		}
-		typ := fmt.Sprintf("%T", i)
-		if e, ok := i.(stackTracer); ok {
-			tr := e.StackTrace()
-			if len(tr) > 0 {
-				typ = fmt.Sprintf("%v", tr[0]) // prints file:line
-			}
+		typ := ErrorSource(i)
+		if typ == "" {
+			typ = fmt.Sprintf("%T", i)
 		}
 		if text == "" {
 			return typ
@@ -302,10 +332,10 @@ func redact(r interface{}) string {
 		switch t := r.(error).(type) {
 		case runtime.Error:
 			return typAnd(t, t.Error())
-		case syscall.Errno:
+		case sysutil.Errno:
 			return typAnd(t, t.Error())
 		case *os.SyscallError:
-			s := redact(t.Err)
+			s := Redact(t.Err)
 			return typAnd(t, fmt.Sprintf("%s: %s", t.Syscall, s))
 		case *os.PathError:
 			// It hardly matters, but avoid mutating the original.
@@ -319,6 +349,14 @@ func redact(r interface{}) string {
 			t = &cpy
 
 			t.Old, t.New = "<redacted>", "<redacted>"
+			return typAnd(t, t.Error())
+		case *net.OpError:
+			// It hardly matters, but avoid mutating the original.
+			cpy := *t
+			t = &cpy
+			t.Source = &util.UnresolvedAddr{NetworkField: "tcp", AddressField: "redacted"}
+			t.Addr = &util.UnresolvedAddr{NetworkField: "tcp", AddressField: "redacted"}
+			t.Err = errors.New(Redact(t.Err))
 			return typAnd(t, t.Error())
 		default:
 		}
@@ -347,12 +385,12 @@ func redact(r interface{}) string {
 	case interfaceCauser:
 		cause := c.Cause()
 		if cause != nil {
-			reportable += ": caused by " + redact(c.Cause())
+			reportable += ": caused by " + Redact(c.Cause())
 		}
 	case (interface {
 		Cause() error
 	}):
-		reportable += ": caused by " + redact(c.Cause())
+		reportable += ": caused by " + Redact(c.Cause())
 	}
 	return reportable
 }
@@ -369,12 +407,12 @@ func ReportablesToSafeError(depth int, format string, reportables []interface{})
 	file := "?"
 	var line int
 	if depth > 0 {
-		file, line, _ = caller.Lookup(depth)
+		file, line, _ = caller.Lookup(depth + 1)
 	}
 
 	redacted := make([]string, 0, len(reportables))
 	for i := range reportables {
-		redacted = append(redacted, redact(reportables[i]))
+		redacted = append(redacted, Redact(reportables[i]))
 	}
 	reportables = nil
 
@@ -392,6 +430,18 @@ func ReportablesToSafeError(depth int, format string, reportables []interface{})
 	return err
 }
 
+// ReportType is used to differentiate between an actual crash/panic and just
+// reporting an error. This data is useful for stability purposes.
+type ReportType int
+
+const (
+	// ReportTypePanic signifies that this is an actual panic.
+	ReportTypePanic ReportType = iota
+	// ReportTypeError signifies that this is just a report of an error but it
+	// still may include an exception and stack trace.
+	ReportTypeError
+)
+
 // SendCrashReport posts to sentry. The `reportables` is essentially the `args...` in
 // `log.Fatalf(format, args...)` (similarly for `log.Fatal`) or `[]interface{}{arg}` in
 // `panic(arg)`.
@@ -405,24 +455,54 @@ func ReportablesToSafeError(depth int, format string, reportables []interface{})
 // should be at least somewhat helpful in telling us where crashes are coming from. We capture the
 // full stacktrace below, so we only need the short file and line here help uniquely identify the
 // error. Some exceptions, like a runtime.Error, are assumed to be fine as-is.
+//
+// The crashReportType parameter adds a tag to the event that shows if the
+// cluster did indeed crash or not.
 func SendCrashReport(
-	ctx context.Context, sv *settings.Values, depth int, format string, reportables []interface{},
+	ctx context.Context,
+	sv *settings.Values,
+	depth int,
+	format string,
+	reportables []interface{},
+	crashReportType ReportType,
 ) {
-	if !DiagnosticsReportingEnabled.Get(sv) || !CrashReports.Get(sv) {
-		return // disabled via settings.
+	if !ShouldSendReport(sv) {
+		return
 	}
-	if raven.DefaultClient == nil {
-		return // disabled via empty URL env var.
-	}
-
 	err := ReportablesToSafeError(depth+1, format, reportables)
+	ex := raven.NewException(err, stacktrace.NewStackTrace(depth+1))
+	SendReport(ctx, err.Error(), crashReportType, nil, ex)
+}
 
-	// This is close to inlining raven.CaptureErrorAndWait(), except it lets us
-	// control the stack depth of the collected trace.
-	const contextLines = 3
+// ShouldSendReport returns true iff SendReport() should be called.
+func ShouldSendReport(sv *settings.Values) bool {
+	if sv == nil || !DiagnosticsReportingEnabled.Get(sv) || !CrashReports.Get(sv) {
+		return false // disabled via settings.
+	}
+	if !crashReportingActive {
+		return false // disabled via empty URL env var.
+	}
+	return true
+}
 
-	ex := raven.NewException(err, raven.NewStacktrace(depth+1, contextLines, crdbPaths))
-	packet := raven.NewPacket(err.Error(), ex)
+// SendReport uploads a detailed error report to sentry.
+// Note that there can be at most one reportable object of each type in the report.
+// For more messages, use extraDetails.
+// The crashReportType parameter adds a tag to the event that shows if the
+// cluster did indeed crash or not.
+func SendReport(
+	ctx context.Context,
+	errMsg string,
+	crashReportType ReportType,
+	extraDetails map[string]interface{},
+	details ...stacktrace.ReportableObject,
+) {
+	packet := raven.NewPacket(errMsg, details...)
+
+	for extraKey, extraValue := range extraDetails {
+		packet.Extra[extraKey] = extraValue
+	}
+
 	if !ReportSensitiveDetails {
 		// Avoid leaking the machine's hostname by injecting the literal "<redacted>".
 		// Otherwise, raven.Client.Capture will see an empty ServerName field and
@@ -432,6 +512,21 @@ func SendCrashReport(
 	tags := map[string]string{
 		"uptime": uptimeTag(timeutil.Now()),
 	}
+
+	switch crashReportType {
+	case ReportTypePanic:
+		tags["report_type"] = "panic"
+	case ReportTypeError:
+		tags["report_type"] = "error"
+	}
+
+	for _, f := range tagFns {
+		v := f.value(ctx)
+		if v != "" {
+			tags[f.key] = maybeTruncate(v)
+		}
+	}
+
 	eventID, ch := raven.DefaultClient.Capture(packet, tags)
 	select {
 	case <-ch:
@@ -439,4 +534,58 @@ func SendCrashReport(
 	case <-time.After(10 * time.Second):
 		Shout(ctx, Severity_ERROR, "Time out trying to submit crash report")
 	}
+}
+
+// ReportOrPanic either reports an error to sentry, if run from a release
+// binary, or panics, if triggered in tests. This is intended to be used for
+// failing assertions which are recoverable but serious enough to report and to
+// cause tests to fail.
+//
+// Like SendCrashReport, the format string should not contain any sensitive
+// data, and unsafe reportables will be redacted before reporting.
+func ReportOrPanic(
+	ctx context.Context, sv *settings.Values, format string, reportables ...interface{},
+) {
+	if !build.IsRelease() || (sv != nil && PanicOnAssertions.Get(sv)) {
+		panic(fmt.Sprintf(format, reportables...))
+	}
+	Warningf(ctx, format, reportables...)
+	SendCrashReport(ctx, sv, 1 /* depth */, format, reportables, ReportTypeError)
+}
+
+const maxTagLen = 500
+
+func maybeTruncate(tagValue string) string {
+	if len(tagValue) > maxTagLen {
+		return tagValue[:maxTagLen] + " [...]"
+	}
+	return tagValue
+}
+
+type tagFn struct {
+	key   string
+	value func(context.Context) string
+}
+
+var tagFns []tagFn
+
+// RegisterTagFn adds a function for tagging crash reports based on the context.
+// This is intended to be called by other packages at init time.
+func RegisterTagFn(key string, value func(context.Context) string) {
+	tagFns = append(tagFns, tagFn{key, value})
+}
+
+// ErrorSource attempts to return the file:line where `i` was created if `i` has
+// that information (i.e. if it is an errors.withStack). Returns "" otherwise.
+func ErrorSource(i interface{}) string {
+	type stackTracer interface {
+		StackTrace() errors.StackTrace
+	}
+	if e, ok := i.(stackTracer); ok {
+		tr := e.StackTrace()
+		if len(tr) > 0 {
+			return fmt.Sprintf("%v", tr[0]) // prints file:line
+		}
+	}
+	return ""
 }

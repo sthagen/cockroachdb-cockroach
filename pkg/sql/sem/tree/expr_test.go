@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -19,15 +15,17 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 // TestUnresolvedNameString tests the string representation of tree.UnresolvedName and thus tree.Name.
 func TestUnresolvedNameString(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		in, out string
 	}{
@@ -49,66 +47,9 @@ func TestUnresolvedNameString(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		q := tree.UnresolvedName{tree.Name(tc.in)}
+		q := tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{tc.in}}
 		if q.String() != tc.out {
 			t.Errorf("expected q.String() == %q, got %q", tc.out, q.String())
-		}
-	}
-}
-
-func TestNormalizeNameInExpr(t *testing.T) {
-	testCases := []struct {
-		in, out string
-		err     string
-	}{
-		{`foo`, `foo`, ``},
-		{`*`, `*`, ``},
-		{`foo.bar`, `foo.bar`, ``},
-		{`foo.*`, `foo.*`, ``},
-		{`test.foo.*`, `test.foo.*`, ``},
-		{`foo.bar[blah]`, `foo.bar`, ``},
-		{`foo[bar]`, `foo`, ``},
-		{`test.*[foo]`, `test.*`, ``},
-
-		{`"".foo`, ``, `empty table name`},
-		{`"".*`, ``, `empty table name`},
-		{`""`, ``, `empty column name`},
-		{`foo.*.bar`, ``, `invalid table name: "foo.*"`},
-		{`foo.*.bar[baz]`, ``, `invalid table name: "foo.*"`},
-		{`test.foo.*.bar[foo]`, ``, `invalid table name: "test.foo.*"`},
-	}
-
-	for _, tc := range testCases {
-		stmt, err := parser.ParseOne("SELECT " + tc.in)
-		if err != nil {
-			t.Fatalf("%s: %v", tc.in, err)
-		}
-		var vBase tree.VarName
-		startExpr := stmt.(*tree.Select).Select.(*tree.SelectClause).Exprs[0].Expr
-		for {
-			switch e := startExpr.(type) {
-			case tree.VarName:
-				vBase = e
-			case *tree.IndirectionExpr:
-				startExpr = e.Expr
-				continue
-			default:
-				t.Fatalf("%s does not parse to a tree.VarName or tree.IndirectionExpr", tc.in)
-			}
-			break
-		}
-		v, err := vBase.NormalizeVarName()
-		if tc.err != "" {
-			if !testutils.IsError(err, tc.err) {
-				t.Fatalf("%s: expected %s, but found %v", tc.in, tc.err, err)
-			}
-			continue
-		}
-		if err != nil {
-			t.Fatalf("%s: expected success, but found %v", tc.in, err)
-		}
-		if out := v.String(); tc.out != out {
-			t.Errorf("%s: expected %s, but found %s", tc.in, tc.out, out)
 		}
 	}
 }
@@ -116,7 +57,8 @@ func TestNormalizeNameInExpr(t *testing.T) {
 // TestExprString verifies that converting an expression to a string and back
 // doesn't change the (normalized) expression.
 func TestExprString(t *testing.T) {
-	defer tree.MockNameTypes(map[string]types.T{
+	defer leaktest.AfterTest(t)()
+	defer tree.MockNameTypes(map[string]*types.T{
 		"a": types.Bool,
 		"b": types.Bool,
 		"c": types.Bool,
@@ -181,7 +123,7 @@ func TestExprString(t *testing.T) {
 			t.Errorf("Print/parse/print cycle changes the string: `%s` vs `%s`", str, str2)
 		}
 		// Compare the normalized expressions.
-		ctx := tree.NewTestingEvalContext()
+		ctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer ctx.Mon.Stop(context.Background())
 		normalized, err := ctx.NormalizeExpr(typedExpr)
 		if err != nil {
@@ -202,6 +144,7 @@ func TestExprString(t *testing.T) {
 }
 
 func TestStripParens(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testExprs := []struct {
 		in, out string
 	}{

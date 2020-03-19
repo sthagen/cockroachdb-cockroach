@@ -1,24 +1,21 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
 import (
-	"bytes"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // Function names are used in expressions in the FuncExpr node.
@@ -38,18 +35,20 @@ type ResolvableFunctionReference struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (fn ResolvableFunctionReference) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, fn.FunctionReference)
+func (fn *ResolvableFunctionReference) Format(ctx *FmtCtx) {
+	ctx.FormatNode(fn.FunctionReference)
 }
-func (fn ResolvableFunctionReference) String() string { return AsString(fn) }
+func (fn *ResolvableFunctionReference) String() string { return AsString(fn) }
 
 // Resolve checks if the function name is already resolved and
 // resolves it as necessary.
-func (fn *ResolvableFunctionReference) Resolve(searchPath SearchPath) (*FunctionDefinition, error) {
+func (fn *ResolvableFunctionReference) Resolve(
+	searchPath sessiondata.SearchPath,
+) (*FunctionDefinition, error) {
 	switch t := fn.FunctionReference.(type) {
 	case *FunctionDefinition:
 		return t, nil
-	case UnresolvedName:
+	case *UnresolvedName:
 		fd, err := t.ResolveFunction(searchPath)
 		if err != nil {
 			return nil, err
@@ -57,9 +56,9 @@ func (fn *ResolvableFunctionReference) Resolve(searchPath SearchPath) (*Function
 		fn.FunctionReference = fd
 		return fd, nil
 	default:
-		panic(fmt.Sprintf("unsupported function name: %+v (%T)",
+		return nil, errors.AssertionFailedf("unknown function name type: %+v (%T)",
 			fn.FunctionReference, fn.FunctionReference,
-		))
+		)
 	}
 }
 
@@ -68,7 +67,7 @@ func (fn *ResolvableFunctionReference) Resolve(searchPath SearchPath) (*Function
 func WrapFunction(n string) ResolvableFunctionReference {
 	fd, ok := FunDefs[n]
 	if !ok {
-		panic(fmt.Sprintf("function %s() not defined", n))
+		panic(errors.AssertionFailedf("function %s() not defined", log.Safe(n)))
 	}
 	return ResolvableFunctionReference{fd}
 }
@@ -80,64 +79,5 @@ type FunctionReference interface {
 	functionReference()
 }
 
-func (UnresolvedName) functionReference()      {}
+func (*UnresolvedName) functionReference()     {}
 func (*FunctionDefinition) functionReference() {}
-
-// functionName implements a structured function name. It is an
-// intermediate step between an UnresolvedName and a
-// FunctionDefinition.
-type functionName struct {
-	prefixName   Name
-	functionName Name
-	selector     NameParts
-}
-
-// normalizeFunctionName transforms an UnresolvedName to a functionName.
-func (n UnresolvedName) normalizeFunctionName() (functionName, error) {
-	if len(n) == 0 {
-		return functionName{}, pgerror.NewErrorf(
-			pgerror.CodeInvalidNameError, "invalid function name: %s", n)
-	}
-
-	// Find the first array subscript, if any.
-	i := len(n)
-	for j, p := range n {
-		if _, ok := p.(*ArraySubscript); ok {
-			i = j
-			break
-		}
-	}
-
-	// There must be something before the array subscript.
-	if i == 0 {
-		return functionName{}, pgerror.NewErrorf(
-			pgerror.CodeInvalidNameError, "invalid function name: %s", n)
-	}
-
-	// The function name, together with its prefix, must /look/ like a
-	// table name. (We don't support record types yet.)  Reuse the
-	// existing normalization code.
-	tn, err := n[:i].normalizeTableNameAsValue()
-	if err != nil {
-		// Override the error, so as to not confuse the user.
-		return functionName{}, pgerror.NewErrorf(
-			pgerror.CodeInvalidNameError, "invalid function name: %s", n)
-	}
-
-	// Everything afterwards is the selector.
-	return functionName{
-		prefixName:   tn.DatabaseName,
-		functionName: tn.TableName,
-		selector:     NameParts(n[i:]),
-	}, nil
-}
-
-// Function retrieves the unqualified function name.
-func (fn *functionName) function() string {
-	return string(fn.functionName)
-}
-
-// Prefix retrieves the unqualified prefix.
-func (fn *functionName) prefix() string {
-	return string(fn.prefixName)
-}

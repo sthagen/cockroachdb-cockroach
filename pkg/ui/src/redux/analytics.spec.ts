@@ -1,16 +1,28 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import { assert } from "chai";
 import * as sinon from "sinon";
 
 import Analytics from "analytics-node";
-import { Location } from "history";
+import { Location, createLocation, createHashHistory } from "history";
 import _ from "lodash";
 import { Store } from "redux";
 
-import { AnalyticsSync } from "./analytics";
+import { AnalyticsSync, defaultRedactions } from "./analytics";
 import { clusterReducerObj, nodesReducerObj } from "./apiReducers";
 import { AdminUIState, createAdminUIStore } from "./state";
 
 import * as protos from "src/js/protos";
+
+const sandbox = sinon.createSandbox();
 
 describe("analytics listener", function() {
   const clusterID = "a49f0ced-7ada-4135-af37-8acf6b548df0";
@@ -20,14 +32,18 @@ describe("analytics listener", function() {
     let pageSpy: sinon.SinonSpy;
 
     beforeEach(function () {
-      store = createAdminUIStore();
-      pageSpy = sinon.spy();
+      store = createAdminUIStore(createHashHistory());
+      pageSpy = sandbox.spy();
 
       // Analytics is a completely fake object, we don't want to call
       // segment if an unexpected method is called.
       analytics = {
         page: pageSpy,
       } as any;
+    });
+
+    afterEach(() => {
+      sandbox.reset();
     });
 
     const setClusterData = function (enabled = true) {
@@ -74,6 +90,7 @@ describe("analytics listener", function() {
         name: "/test/path",
         properties: {
           path: "/test/path",
+          search: "",
         },
       });
     });
@@ -98,6 +115,7 @@ describe("analytics listener", function() {
         name: "/test/path",
         properties: {
           path: "/test/path",
+          search: "",
         },
       });
       assert.deepEqual(pageSpy.args[1][0], {
@@ -105,6 +123,7 @@ describe("analytics listener", function() {
         name: "/test/path/2",
         properties: {
           path: "/test/path/2",
+          search: "",
         },
       });
     });
@@ -128,7 +147,68 @@ describe("analytics listener", function() {
         name: "/test/[redacted]/path",
         properties: {
           path: "/test/[redacted]/path",
+          search: "",
         },
+      });
+    });
+
+    function testRedaction(title: string, input: string, expected: string) {
+      return { title, input, expected };
+    }
+
+    ([
+      testRedaction(
+        "old database URL",
+        "/databases/database/foobar/table/baz",
+        "/databases/database/[db]/table/[tbl]",
+      ),
+      testRedaction(
+        "new database URL",
+        "/database/foobar/table/baz",
+        "/database/[db]/table/[tbl]",
+      ),
+      testRedaction(
+        "clusterviz map root",
+        "/overview/map/",
+        "/overview/map/",
+      ),
+      testRedaction(
+        "clusterviz map single locality",
+        "/overview/map/datacenter=us-west-1",
+        "/overview/map/[locality]",
+      ),
+      testRedaction(
+        "clusterviz map multiple localities",
+        "/overview/map/datacenter=us-west-1/rack=1234",
+        "/overview/map/[locality]/[locality]",
+      ),
+      testRedaction(
+        "login redirect URL parameters",
+        "/login?redirectTo=%2Fdatabase%2Ffoobar%2Ftable%2Fbaz",
+        "/login?redirectTo=%2Fdatabase%2F%5Bdb%5D%2Ftable%2F%5Btbl%5D",
+      ),
+      testRedaction(
+        "statement details page",
+        "/statement/SELECT * FROM database.table",
+        "/statement/[statement]",
+      ),
+    ]).map(function ({ title, input, expected }) {
+      it(`applies a redaction for ${title}`, function () {
+        setClusterData();
+        const sync = new AnalyticsSync(analytics, store, defaultRedactions);
+        const expectedLocation = createLocation(expected);
+
+        sync.page(createLocation(input));
+
+        assert.isTrue(pageSpy.calledOnce);
+        assert.deepEqual(pageSpy.args[0][0], {
+          userId: clusterID,
+          name: expectedLocation.pathname,
+          properties: {
+            path: expectedLocation.pathname,
+            search: expectedLocation.search,
+          },
+        });
       });
     });
   });
@@ -139,14 +219,18 @@ describe("analytics listener", function() {
     let identifySpy: sinon.SinonSpy;
 
     beforeEach(function () {
-      store = createAdminUIStore();
-      identifySpy = sinon.spy();
+      store = createAdminUIStore(createHashHistory());
+      identifySpy = sandbox.spy();
 
       // Analytics is a completely fake object, we don't want to call
       // segment if an unexpected method is called.
       analytics = {
         identify: identifySpy,
       } as any;
+    });
+
+    afterEach(() => {
+      sandbox.reset();
     });
 
     const setClusterData = function (enabled = true, enterprise = true) {
@@ -201,7 +285,7 @@ describe("analytics listener", function() {
       setVersionData();
 
       _.each([false, true], (enterpriseSetting) => {
-        identifySpy.reset();
+        sandbox.reset();
         setClusterData(true, enterpriseSetting);
         const sync = new AnalyticsSync(analytics, store, []);
         sync.identify();

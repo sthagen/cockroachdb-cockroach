@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package simulation
 
@@ -20,9 +16,8 @@ import (
 	"net"
 	"time"
 
-	"google.golang.org/grpc"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -36,6 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"google.golang.org/grpc"
 )
 
 // Node represents a node used in a Network. It includes information
@@ -58,35 +55,42 @@ func (n *Node) Addr() net.Addr {
 type Network struct {
 	Nodes           []*Node
 	Stopper         *stop.Stopper
+	RPCContext      *rpc.Context
 	nodeIDAllocator roachpb.NodeID // provides unique node IDs
-	rpcContext      *rpc.Context
 	tlsConfig       *tls.Config
 	started         bool
 }
 
 // NewNetwork creates nodeCount gossip nodes.
-func NewNetwork(stopper *stop.Stopper, nodeCount int, createResolvers bool) *Network {
+func NewNetwork(
+	stopper *stop.Stopper, nodeCount int, createResolvers bool, defaultZoneConfig *zonepb.ZoneConfig,
+) *Network {
 	log.Infof(context.TODO(), "simulating gossip network with %d nodes", nodeCount)
 
 	n := &Network{
 		Nodes:   []*Node{},
 		Stopper: stopper,
 	}
-	n.rpcContext = rpc.NewContext(
+	n.RPCContext = rpc.NewContext(
 		log.AmbientContext{Tracer: tracing.NewTracer()},
 		&base.Config{Insecure: true},
 		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
 		n.Stopper,
-		&cluster.MakeTestingClusterSettings().Version,
+		cluster.MakeTestingClusterSettings(),
 	)
 	var err error
-	n.tlsConfig, err = n.rpcContext.GetServerTLSConfig()
+	n.tlsConfig, err = n.RPCContext.GetServerTLSConfig()
 	if err != nil {
 		log.Fatal(context.TODO(), err)
 	}
 
+	// Ensure that tests using this test context and restart/shut down
+	// their servers do not inadvertently start talking to servers from
+	// unrelated concurrent tests.
+	n.RPCContext.ClusterID.Set(context.TODO(), uuid.MakeV4())
+
 	for i := 0; i < nodeCount; i++ {
-		node, err := n.CreateNode()
+		node, err := n.CreateNode(defaultZoneConfig)
 		if err != nil {
 			log.Fatal(context.TODO(), err)
 		}
@@ -103,14 +107,14 @@ func NewNetwork(stopper *stop.Stopper, nodeCount int, createResolvers bool) *Net
 }
 
 // CreateNode creates a simulation node and starts an RPC server for it.
-func (n *Network) CreateNode() (*Node, error) {
-	server := rpc.NewServer(n.rpcContext)
+func (n *Network) CreateNode(defaultZoneConfig *zonepb.ZoneConfig) (*Node, error) {
+	server := rpc.NewServer(n.RPCContext)
 	ln, err := net.Listen(util.IsolatedTestAddr.Network(), util.IsolatedTestAddr.String())
 	if err != nil {
 		return nil, err
 	}
 	node := &Node{Server: server, Listener: ln, Registry: metric.NewRegistry()}
-	node.Gossip = gossip.NewTest(0, n.rpcContext, server, n.Stopper, node.Registry)
+	node.Gossip = gossip.NewTest(0, n.RPCContext, server, n.Stopper, node.Registry, defaultZoneConfig)
 	n.Stopper.RunWorker(context.TODO(), func(context.Context) {
 		<-n.Stopper.ShouldQuiesce()
 		netutil.FatalIfUnexpected(ln.Close())

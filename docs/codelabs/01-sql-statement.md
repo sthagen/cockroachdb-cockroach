@@ -17,7 +17,7 @@ good coverage of how to add tests, which this codelab ignores.
 Also, remember that for real feature development, you'll want to first write up
 an RFC describing the new feature as well as the proposed syntax, and make sure
 to get the approval of someone from @cockroachdb/sql-language.  There are also
-some guidelines on adding new syntax that you can read about on #17569.
+some guidelines on adding new syntax that you can read about on [#17569](https://github.com/cockroachdb/cockroach/pull/17569).
 
 ## Adding a SQL Statement
 
@@ -261,9 +261,9 @@ Great, a failing test!  Let's make it pass.
 
 ```text
 frobnicate_stmt:
-  FROBNICATE CLUSTER { $$.val = &Frobnicate{Mode: FrobnicateModeCluster} }
-| FROBNICATE SESSION { $$.val = &Frobnicate{Mode: FrobnicateModeSession} }
-| FROBNICATE ALL { $$.val = &Frobnicate{Mode: FrobnicateModeAll} }
+  FROBNICATE CLUSTER { $$.val = &tree.Frobnicate{Mode: tree.FrobnicateModeCluster} }
+| FROBNICATE SESSION { $$.val = &tree.Frobnicate{Mode: tree.FrobnicateModeSession} }
+| FROBNICATE ALL { $$.val = &tree.Frobnicate{Mode: tree.FrobnicateModeAll} }
 ```
 
 The special symbol `$$.val` represents the node value that this rule generates.
@@ -295,7 +295,7 @@ a method to the planner.  That's where the centralized statement dispatch takes
 place, so that's the place to add semantics.
 
 Look for the source of the error we're seeing.  You'll find that it's at the end
-of a long type switch statement.  Let's add a case to that:
+of a long type switch statement in `/pkg/sql/plan.go`.  Let's add a case to that:
 
 ```go
 case *tree.Frobnicate:
@@ -486,7 +486,7 @@ func (p *planner) Frobnicate(ctx context.Context, stmt *tree.Frobnicate) (planNo
         return nil, fmt.Errorf("Unhandled FROBNICATE mode %v!", stmt.Mode)
     }
 
-    return &emptyNode{}, nil
+    return &zeroNode{}, nil
 }
 ```
 
@@ -565,12 +565,12 @@ it a try, and look below if you need a hint.
   ...
 
   frobnicate_stmt:
-    FROBNICATE CLUSTER { $$.val = &Frobnicate{Mode: FrobnicateModeCluster} }
-  | FROBNICATE SESSION { $$.val = &Frobnicate{Mode: FrobnicateModeSession} }
-  | FROBNICATE ALL { $$.val = &Frobnicate{Mode: FrobnicateModeAll} }
-+ | FROB CLUSTER { $$.val = &Frobnicate{Mode: FrobnicateModeCluster} }
-+ | FROB SESSION { $$.val = &Frobnicate{Mode: FrobnicateModeSession} }
-+ | FROB ALL { $$.val = &Frobnicate{Mode: FrobnicateModeAll} }
+    FROBNICATE CLUSTER { $$.val = &tree.Frobnicate{Mode: tree.FrobnicateModeCluster} }
+  | FROBNICATE SESSION { $$.val = &tree.Frobnicate{Mode: tree.FrobnicateModeSession} }
+  | FROBNICATE ALL { $$.val = &tree.Frobnicate{Mode: tree.FrobnicateModeAll} }
++ | FROB CLUSTER { $$.val = &tree.Frobnicate{Mode: tree.FrobnicateModeCluster} }
++ | FROB SESSION { $$.val = &tree.Frobnicate{Mode: tree.FrobnicateModeSession} }
++ | FROB ALL { $$.val = &tree.Frobnicate{Mode: tree.FrobnicateModeAll} }
   ```
   </p>
 </details>

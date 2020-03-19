@@ -15,50 +15,31 @@ var (
 	EnterpriseEncryption = cliflags.FlagInfo{
 		Name: "enterprise-encryption",
 		Description: `
-*** Valid enterprise licenses only ***
+<PRE>Specify encryption options for one of the stores on a node. If multiple
+stores exist, the flag must be specified for each store.
 
-TODO(mberhault): fill this.
+A valid enterprise license is required to use this functionality.
 
+</PRE>
+Key files must be of size 32 bytes + AES key size, such as:
+<PRE>
+AES-128: 48 bytes
+AES-192: 56 bytes
+AES-256: 64 bytes
+
+</PRE>
 Valid fields:
-* path: must match the path of one of the stores
-* key: path to the current key file
-* old-key: path to the previous key file
-* rotation-period: amount of time after which data keys should be rotated
+<PRE>
+* path    (required): must match the path of one of the stores
+* key     (required): path to the current key file, or "plain"
+* old-key (required): path to the previous key file, or "plain"
+* rotation-period   : amount of time after which data keys should be rotated
+
+</PRE>
+example:
+<PRE>
+  --enterprise-encryption=path=cockroach-data,key=/keys/aes-128.key,old-key=plain
+</PRE>
 `,
-	}
-
-	CSVTable = cliflags.FlagInfo{
-		Name:        "table",
-		Description: `location of a file containing a single CREATE TABLE statement`,
-	}
-
-	CSVDataNames = cliflags.FlagInfo{
-		Name:        "data",
-		Description: `filenames of CSV data; uses <table>.dat if empty`,
-	}
-
-	CSVDest = cliflags.FlagInfo{
-		Name:        "dest",
-		Description: `destination directory for backup files`,
-	}
-
-	CSVNullIf = cliflags.FlagInfo{
-		Name:        "nullif",
-		Description: `if specified, the value of NULL; can specify the empty string`,
-	}
-
-	CSVComma = cliflags.FlagInfo{
-		Name:        "delimited",
-		Description: `if specified, the CSV delimiter instead of a comma`,
-	}
-
-	CSVComment = cliflags.FlagInfo{
-		Name:        "comment",
-		Description: `if specified, allows comment lines starting with this character`,
-	}
-
-	CSVTempDir = cliflags.FlagInfo{
-		Name:        "tempdir",
-		Description: `directory to store intermediate temp files`,
 	}
 )

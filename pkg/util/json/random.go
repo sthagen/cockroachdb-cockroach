@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package json
 
@@ -20,12 +16,28 @@ import (
 	"math/rand"
 )
 
+// Some issues will only be revealed if we have duplicate strings, so we
+// include a pool of common strings that we occasionally pull from rather than
+// generating a completely random string.
+var staticStrings = []string{
+	"a",
+	"b",
+	"c",
+	"foo",
+	"bar",
+	"baz",
+	"foobar",
+}
+
 // Random generates a random JSON value.
 func Random(complexity int, rng *rand.Rand) (JSON, error) {
 	return MakeJSON(doRandomJSON(complexity, rng))
 }
 
 func randomJSONString(rng *rand.Rand) interface{} {
+	if rng.Intn(2) == 0 {
+		return staticStrings[rng.Intn(len(staticStrings))]
+	}
 	result := make([]byte, 0)
 	l := rng.Intn(10) + 3
 	for i := 0; i < l; i++ {
@@ -35,7 +47,7 @@ func randomJSONString(rng *rand.Rand) interface{} {
 }
 
 func randomJSONNumber(rng *rand.Rand) interface{} {
-	return json.Number(fmt.Sprintf("%v", rand.ExpFloat64()))
+	return json.Number(fmt.Sprintf("%v", rng.ExpFloat64()))
 }
 
 func doRandomJSON(complexity int, rng *rand.Rand) interface{} {

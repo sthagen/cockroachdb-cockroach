@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package log
 
@@ -52,7 +48,7 @@ var showLogs bool
 
 // Scope creates a TestLogScope which corresponds to the lifetime of a logging
 // directory. The logging directory is named after the calling test. It also
-// disables logging to stderr for severity levels below ERROR.
+// disables logging to stderr.
 func Scope(t tShim) *TestLogScope {
 	if showLogs {
 		return (*TestLogScope)(nil)
@@ -73,7 +69,7 @@ func ScopeWithoutShowLogs(t tShim) *TestLogScope {
 	if err := dirTestOverride("", tempDir); err != nil {
 		t.Fatal(err)
 	}
-	undo, err := enableLogFileOutput(tempDir, Severity_ERROR)
+	undo, err := enableLogFileOutput(tempDir, Severity_NONE)
 	if err != nil {
 		undo()
 		t.Fatal(err)
@@ -85,20 +81,20 @@ func ScopeWithoutShowLogs(t tShim) *TestLogScope {
 // enableLogFileOutput turns on logging using the specified directory.
 // For unittesting only.
 func enableLogFileOutput(dir string, stderrSeverity Severity) (func(), error) {
-	logging.mu.Lock()
-	defer logging.mu.Unlock()
-	oldStderrThreshold := logging.stderrThreshold
-	oldNoStderrRedirect := logging.noStderrRedirect
+	mainLog.mu.Lock()
+	defer mainLog.mu.Unlock()
+	oldStderrThreshold := logging.stderrThreshold.get()
+	oldNoStderrRedirect := mainLog.noStderrRedirect
 
 	undo := func() {
-		logging.mu.Lock()
-		defer logging.mu.Unlock()
-		logging.stderrThreshold = oldStderrThreshold
-		logging.noStderrRedirect = oldNoStderrRedirect
+		mainLog.mu.Lock()
+		defer mainLog.mu.Unlock()
+		logging.stderrThreshold.set(oldStderrThreshold)
+		mainLog.noStderrRedirect = oldNoStderrRedirect
 	}
-	logging.stderrThreshold = stderrSeverity
-	logging.noStderrRedirect = true
-	return undo, logDir.Set(dir)
+	logging.stderrThreshold.set(stderrSeverity)
+	mainLog.noStderrRedirect = true
+	return undo, mainLog.logDir.Set(dir)
 }
 
 // Close cleans up a TestLogScope. The directory and its contents are
@@ -163,24 +159,51 @@ func calledDuringPanic() bool {
 // dirTestOverride sets the default value for the logging output directory
 // for use in tests.
 func dirTestOverride(expected, newDir string) error {
-	logging.mu.Lock()
-	defer logging.mu.Unlock()
+	if err := mainLog.dirTestOverride(expected, newDir); err != nil {
+		return err
+	}
+	// Same with secondary loggers.
+	secondaryLogRegistry.mu.Lock()
+	defer secondaryLogRegistry.mu.Unlock()
+	for _, l := range secondaryLogRegistry.mu.loggers {
+		if err := l.logger.dirTestOverride(expected, newDir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	logDir.Lock()
+func (l *loggerT) dirTestOverride(expected, newDir string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.logDir.Lock()
 	// The following check is intended to catch concurrent uses of
 	// Scope() or TestLogScope.Close(), which would be invalid.
-	if logDir.name != expected {
-		logDir.Unlock()
+	if l.logDir.name != expected {
+		l.logDir.Unlock()
 		return errors.Errorf("unexpected logDir setting: set to %q, expected %q",
-			logDir.name, expected)
+			l.logDir.name, expected)
 	}
-	logDir.name = newDir
-	logDir.Unlock()
+	l.logDir.name = newDir
+	l.logDir.Unlock()
 
 	// When we change the directory we close the current logging
 	// output, so that a rotation to the new directory is forced on
 	// the next logging event.
-	return logging.closeFileLocked()
+	return l.closeFileLocked()
+}
+
+func (l *loggerT) closeFileLocked() error {
+	if l.mu.file != nil {
+		if sb, ok := l.mu.file.(*syncBuffer); ok {
+			if err := sb.file.Close(); err != nil {
+				return err
+			}
+		}
+		l.mu.file = nil
+	}
+	return restoreStderr()
 }
 
 func isDirEmpty(dirname string) (bool, error) {

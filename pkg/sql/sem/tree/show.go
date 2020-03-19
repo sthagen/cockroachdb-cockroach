@@ -7,26 +7,19 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This code was derived from https://github.com/youtube/vitess.
 
 package tree
 
-import (
-	"bytes"
-	"fmt"
-)
+import "github.com/cockroachdb/cockroach/pkg/sql/lex"
 
 // ShowVar represents a SHOW statement.
 type ShowVar struct {
@@ -34,9 +27,13 @@ type ShowVar struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowVar) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW ")
-	buf.WriteString(node.Name)
+func (node *ShowVar) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW ")
+	// Session var names never contain PII and should be distinguished
+	// for feature tracking purposes.
+	ctx.WithFlags(ctx.flags & ^FmtAnonymize, func() {
+		ctx.FormatNameP(&node.Name)
+	})
 }
 
 // ShowClusterSetting represents a SHOW CLUSTER SETTING statement.
@@ -45,143 +42,283 @@ type ShowClusterSetting struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowClusterSetting) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW CLUSTER SETTING ")
-	buf.WriteString(node.Name)
+func (node *ShowClusterSetting) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW CLUSTER SETTING ")
+	// Cluster setting names never contain PII and should be distinguished
+	// for feature tracking purposes.
+	ctx.WithFlags(ctx.flags & ^FmtAnonymize, func() {
+		ctx.FormatNameP(&node.Name)
+	})
 }
 
-// ShowBackup represents a SHOW BACKUP statement.
-type ShowBackup struct {
-	Path Expr
+// ShowClusterSettingList represents a SHOW [ALL|PUBLIC] CLUSTER SETTINGS statement.
+type ShowClusterSettingList struct {
+	// All indicates whether to include non-public settings in the output.
+	All bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowBackup) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW BACKUP ")
-	FormatNode(buf, f, node.Path)
+func (node *ShowClusterSettingList) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW ")
+	qual := "PUBLIC"
+	if node.All {
+		qual = "ALL"
+	}
+	ctx.WriteString(qual)
+	ctx.WriteString(" CLUSTER SETTINGS")
+}
+
+// BackupDetails represents the type of details to display for a SHOW BACKUP
+// statement.
+type BackupDetails int
+
+const (
+	// BackupDefaultDetails identifies a bare SHOW BACKUP statement.
+	BackupDefaultDetails BackupDetails = iota
+	// BackupRangeDetails identifies a SHOW BACKUP RANGES statement.
+	BackupRangeDetails
+	// BackupFileDetails identifies a SHOW BACKUP FILES statement.
+	BackupFileDetails
+)
+
+// ShowBackup represents a SHOW BACKUP statement.
+type ShowBackup struct {
+	Path                 Expr
+	Details              BackupDetails
+	ShouldIncludeSchemas bool
+	Options              KVOptions
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowBackup) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW BACKUP ")
+	if node.Details == BackupRangeDetails {
+		ctx.WriteString("RANGES ")
+	} else if node.Details == BackupFileDetails {
+		ctx.WriteString("FILES ")
+	}
+	if node.ShouldIncludeSchemas {
+		ctx.WriteString("SCHEMAS ")
+	}
+	ctx.FormatNode(node.Path)
+	if len(node.Options) > 0 {
+		ctx.WriteString(" WITH ")
+		ctx.FormatNode(&node.Options)
+	}
 }
 
 // ShowColumns represents a SHOW COLUMNS statement.
 type ShowColumns struct {
-	Table NormalizableTableName
+	Table       *UnresolvedObjectName
+	WithComment bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowColumns) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW COLUMNS FROM ")
-	FormatNode(buf, f, &node.Table)
+func (node *ShowColumns) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW COLUMNS FROM ")
+	ctx.FormatNode(node.Table)
+
+	if node.WithComment {
+		ctx.WriteString(" WITH COMMENT")
+	}
 }
 
 // ShowDatabases represents a SHOW DATABASES statement.
 type ShowDatabases struct {
+	WithComment bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowDatabases) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW DATABASES")
+func (node *ShowDatabases) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW DATABASES")
+
+	if node.WithComment {
+		ctx.WriteString(" WITH COMMENT")
+	}
 }
 
-// ShowTrace represents a SHOW TRACE FOR <stmt>/SESSION statement.
-type ShowTrace struct {
-	// If statement is nil, this is asking for the session trace.
-	Statement   Statement
-	OnlyKVTrace bool
-	Compact     bool
+// ShowTraceType is an enum of SHOW TRACE variants.
+type ShowTraceType string
+
+// A list of the SHOW TRACE variants.
+const (
+	ShowTraceRaw     ShowTraceType = "TRACE"
+	ShowTraceKV      ShowTraceType = "KV TRACE"
+	ShowTraceReplica ShowTraceType = "EXPERIMENTAL_REPLICA TRACE"
+)
+
+// ShowTraceForSession represents a SHOW TRACE FOR SESSION statement.
+type ShowTraceForSession struct {
+	TraceType ShowTraceType
+	Compact   bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowTrace) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW")
+func (node *ShowTraceForSession) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW ")
 	if node.Compact {
-		buf.WriteString(" COMPACT")
+		ctx.WriteString("COMPACT ")
 	}
-	if node.OnlyKVTrace {
-		buf.WriteString(" KV")
-	}
-	fmt.Fprintf(buf, " TRACE FOR ")
-	if node.Statement == nil {
-		buf.WriteString("SESSION")
-	} else {
-		FormatNode(buf, f, node.Statement)
-	}
+	ctx.WriteString(string(node.TraceType))
+	ctx.WriteString(" FOR SESSION")
 }
 
-// ShowIndex represents a SHOW INDEX statement.
-type ShowIndex struct {
-	Table NormalizableTableName
+// ShowIndexes represents a SHOW INDEX statement.
+type ShowIndexes struct {
+	Table       *UnresolvedObjectName
+	WithComment bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowIndex) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW INDEXES FROM ")
-	FormatNode(buf, f, &node.Table)
+func (node *ShowIndexes) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW INDEXES FROM ")
+	ctx.FormatNode(node.Table)
+
+	if node.WithComment {
+		ctx.WriteString(" WITH COMMENT")
+	}
+}
+
+// ShowDatabaseIndexes represents a SHOW INDEXES FROM DATABASE statement.
+type ShowDatabaseIndexes struct {
+	Database    Name
+	WithComment bool
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowDatabaseIndexes) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW INDEXES FROM DATABASE ")
+	ctx.FormatNode(&node.Database)
+
+	if node.WithComment {
+		ctx.WriteString(" WITH COMMENT")
+	}
 }
 
 // ShowQueries represents a SHOW QUERIES statement
 type ShowQueries struct {
+	All     bool
 	Cluster bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowQueries) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW ")
+func (node *ShowQueries) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW ")
+	if node.All {
+		ctx.WriteString("ALL ")
+	}
 	if node.Cluster {
-		buf.WriteString("CLUSTER QUERIES")
+		ctx.WriteString("CLUSTER QUERIES")
 	} else {
-		buf.WriteString("LOCAL QUERIES")
+		ctx.WriteString("LOCAL QUERIES")
 	}
 }
 
 // ShowJobs represents a SHOW JOBS statement
 type ShowJobs struct {
+	// If non-nil, a select statement that provides the job ids to be shown.
+	Jobs *Select
+
+	// If Automatic is true, show only automatically-generated jobs such
+	// as automatic CREATE STATISTICS jobs. If Automatic is false, show
+	// only non-automatically-generated jobs.
+	Automatic bool
+
+	// Whether to block and wait for completion of all running jobs to be displayed.
+	Block bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowJobs) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW JOBS")
+func (node *ShowJobs) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW ")
+	if node.Automatic {
+		ctx.WriteString("AUTOMATIC ")
+	}
+	ctx.WriteString("JOBS")
+	if node.Block {
+		ctx.WriteString(" WHEN COMPLETE")
+	}
+	if node.Jobs != nil {
+		ctx.WriteString(" ")
+		ctx.FormatNode(node.Jobs)
+	}
 }
 
 // ShowSessions represents a SHOW SESSIONS statement
 type ShowSessions struct {
+	All     bool
 	Cluster bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowSessions) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW ")
+func (node *ShowSessions) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW ")
+	if node.All {
+		ctx.WriteString("ALL ")
+	}
 	if node.Cluster {
-		buf.WriteString("CLUSTER SESSIONS")
+		ctx.WriteString("CLUSTER SESSIONS")
 	} else {
-		buf.WriteString("LOCAL SESSIONS")
+		ctx.WriteString("LOCAL SESSIONS")
+	}
+}
+
+// ShowSchemas represents a SHOW SCHEMAS statement.
+type ShowSchemas struct {
+	Database Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowSchemas) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW SCHEMAS")
+	if node.Database != "" {
+		ctx.WriteString(" FROM ")
+		ctx.FormatNode(&node.Database)
+	}
+}
+
+// ShowSequences represents a SHOW SEQUENCES statement.
+type ShowSequences struct {
+	Database Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowSequences) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW SEQUENCES")
+	if node.Database != "" {
+		ctx.WriteString(" FROM ")
+		ctx.FormatNode(&node.Database)
 	}
 }
 
 // ShowTables represents a SHOW TABLES statement.
 type ShowTables struct {
-	Database Name
+	TableNamePrefix
+	WithComment bool
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowTables) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW TABLES")
+	if node.ExplicitSchema {
+		ctx.WriteString(" FROM ")
+		ctx.FormatNode(&node.TableNamePrefix)
+	}
+
+	if node.WithComment {
+		ctx.WriteString(" WITH COMMENT")
+	}
 }
 
 // ShowConstraints represents a SHOW CONSTRAINTS statement.
 type ShowConstraints struct {
-	Table NormalizableTableName
+	Table *UnresolvedObjectName
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowConstraints) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW CONSTRAINTS")
-	if node.Table.TableNameReference != nil {
-		buf.WriteString(" FROM ")
-		FormatNode(buf, f, &node.Table)
-	}
-}
-
-// Format implements the NodeFormatter interface.
-func (node *ShowTables) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW TABLES")
-	if node.Database != "" {
-		buf.WriteString(" FROM ")
-		FormatNode(buf, f, node.Database)
-	}
+func (node *ShowConstraints) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW CONSTRAINTS FROM ")
+	ctx.FormatNode(node.Table)
 }
 
 // ShowGrants represents a SHOW GRANTS statement.
@@ -192,38 +329,61 @@ type ShowGrants struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowGrants) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW GRANTS")
+func (node *ShowGrants) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW GRANTS")
 	if node.Targets != nil {
-		buf.WriteString(" ON ")
-		FormatNode(buf, f, node.Targets)
+		ctx.WriteString(" ON ")
+		ctx.FormatNode(node.Targets)
 	}
 	if node.Grantees != nil {
-		buf.WriteString(" FOR ")
-		FormatNode(buf, f, node.Grantees)
+		ctx.WriteString(" FOR ")
+		ctx.FormatNode(&node.Grantees)
 	}
 }
 
-// ShowCreateTable represents a SHOW CREATE TABLE statement.
-type ShowCreateTable struct {
-	Table NormalizableTableName
+// ShowRoleGrants represents a SHOW GRANTS ON ROLE statement.
+type ShowRoleGrants struct {
+	Roles    NameList
+	Grantees NameList
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowCreateTable) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW CREATE TABLE ")
-	FormatNode(buf, f, &node.Table)
+func (node *ShowRoleGrants) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW GRANTS ON ROLE")
+	if node.Roles != nil {
+		ctx.WriteString(" ")
+		ctx.FormatNode(&node.Roles)
+	}
+	if node.Grantees != nil {
+		ctx.WriteString(" FOR ")
+		ctx.FormatNode(&node.Grantees)
+	}
 }
 
-// ShowCreateView represents a SHOW CREATE VIEW statement.
-type ShowCreateView struct {
-	View NormalizableTableName
+// ShowCreate represents a SHOW CREATE statement.
+type ShowCreate struct {
+	Name *UnresolvedObjectName
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowCreateView) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW CREATE VIEW ")
-	FormatNode(buf, f, &node.View)
+func (node *ShowCreate) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW CREATE ")
+	ctx.FormatNode(node.Name)
+}
+
+// ShowSyntax represents a SHOW SYNTAX statement.
+// This the most lightweight thing that can be done on a statement
+// server-side: just report the statement that was entered without
+// any processing. Meant for use for syntax checking on clients,
+// when the client version might differ from the server.
+type ShowSyntax struct {
+	Statement string
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowSyntax) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW SYNTAX ")
+	ctx.WriteString(lex.EscapeSQLString(node.Statement))
 }
 
 // ShowTransactionStatus represents a SHOW TRANSACTION STATUS statement.
@@ -231,8 +391,17 @@ type ShowTransactionStatus struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowTransactionStatus) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW TRANSACTION STATUS")
+func (node *ShowTransactionStatus) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW TRANSACTION STATUS")
+}
+
+// ShowSavepointStatus represents a SHOW SAVEPOINT STATUS statement.
+type ShowSavepointStatus struct {
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowSavepointStatus) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW SAVEPOINT STATUS")
 }
 
 // ShowUsers represents a SHOW USERS statement.
@@ -240,8 +409,8 @@ type ShowUsers struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowUsers) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW USERS")
+func (node *ShowUsers) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW USERS")
 }
 
 // ShowRoles represents a SHOW ROLES statement.
@@ -249,49 +418,76 @@ type ShowRoles struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowRoles) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW ROLES")
+func (node *ShowRoles) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW ROLES")
 }
 
-// ShowRanges represents a SHOW TESTING_RANGES statement.
-// Only one of Table and Index can be set.
+// ShowRanges represents a SHOW RANGES statement.
 type ShowRanges struct {
-	Table *NormalizableTableName
-	Index *TableNameWithIndex
+	TableOrIndex TableIndexName
+	DatabaseName Name
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowRanges) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW TESTING_RANGES FROM ")
-	if node.Index != nil {
-		buf.WriteString("INDEX ")
-		FormatNode(buf, f, node.Index)
+func (node *ShowRanges) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW RANGES FROM ")
+	if node.DatabaseName != "" {
+		ctx.WriteString("DATABASE ")
+		ctx.FormatNode(&node.DatabaseName)
+	} else if node.TableOrIndex.Index != "" {
+		ctx.WriteString("INDEX ")
+		ctx.FormatNode(&node.TableOrIndex)
 	} else {
-		buf.WriteString("TABLE ")
-		FormatNode(buf, f, node.Table)
+		ctx.WriteString("TABLE ")
+		ctx.FormatNode(&node.TableOrIndex)
 	}
+}
+
+// ShowRangeForRow represents a SHOW RANGE FOR ROW statement.
+type ShowRangeForRow struct {
+	TableOrIndex TableIndexName
+	Row          Exprs
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowRangeForRow) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW RANGE FROM ")
+	if node.TableOrIndex.Index != "" {
+		ctx.WriteString("INDEX ")
+	} else {
+		ctx.WriteString("TABLE ")
+	}
+	ctx.FormatNode(&node.TableOrIndex)
+	ctx.WriteString(" FOR ROW (")
+	ctx.FormatNode(&node.Row)
+	ctx.WriteString(")")
 }
 
 // ShowFingerprints represents a SHOW EXPERIMENTAL_FINGERPRINTS statement.
 type ShowFingerprints struct {
-	Table *NormalizableTableName
+	Table *UnresolvedObjectName
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowFingerprints) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE ")
-	FormatNode(buf, f, node.Table)
+func (node *ShowFingerprints) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE ")
+	ctx.FormatNode(node.Table)
 }
 
 // ShowTableStats represents a SHOW STATISTICS FOR TABLE statement.
 type ShowTableStats struct {
-	Table NormalizableTableName
+	Table     *UnresolvedObjectName
+	UsingJSON bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowTableStats) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("SHOW STATISTICS FOR TABLE ")
-	FormatNode(buf, f, &node.Table)
+func (node *ShowTableStats) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW STATISTICS ")
+	if node.UsingJSON {
+		ctx.WriteString("USING JSON ")
+	}
+	ctx.WriteString("FOR TABLE ")
+	ctx.FormatNode(node.Table)
 }
 
 // ShowHistogram represents a SHOW HISTOGRAM statement.
@@ -300,6 +496,32 @@ type ShowHistogram struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowHistogram) Format(buf *bytes.Buffer, f FmtFlags) {
-	fmt.Fprintf(buf, "SHOW HISTOGRAM %d", node.HistogramID)
+func (node *ShowHistogram) Format(ctx *FmtCtx) {
+	ctx.Printf("SHOW HISTOGRAM %d", node.HistogramID)
+}
+
+// ShowPartitions represents a SHOW PARTITIONS statement.
+type ShowPartitions struct {
+	IsDB     bool
+	Database Name
+
+	IsIndex bool
+	Index   TableIndexName
+
+	IsTable bool
+	Table   *UnresolvedObjectName
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowPartitions) Format(ctx *FmtCtx) {
+	if node.IsDB {
+		ctx.Printf("SHOW PARTITIONS FROM DATABASE ")
+		ctx.FormatNode(&node.Database)
+	} else if node.IsIndex {
+		ctx.Printf("SHOW PARTITIONS FROM INDEX ")
+		ctx.FormatNode(&node.Index)
+	} else {
+		ctx.Printf("SHOW PARTITIONS FROM TABLE ")
+		ctx.FormatNode(node.Table)
+	}
 }

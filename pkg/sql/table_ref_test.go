@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -36,6 +32,7 @@ func TestTableRefs(t *testing.T) {
 	stmt := `
 CREATE DATABASE test;
 CREATE TABLE test.t(a INT PRIMARY KEY, xx INT, b INT, c INT);
+CREATE TABLE test.hidden(a INT, b INT);
 CREATE INDEX bc ON test.t(b, c);
 `
 	_, err := db.Exec(stmt)
@@ -47,7 +44,8 @@ CREATE INDEX bc ON test.t(b, c);
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
 	tID := tableDesc.ID
 	var aID, bID, cID sqlbase.ColumnID
-	for _, c := range tableDesc.Columns {
+	for i := range tableDesc.Columns {
+		c := &tableDesc.Columns[i]
 		switch c.Name {
 		case "a":
 			aID = c.ID
@@ -59,6 +57,18 @@ CREATE INDEX bc ON test.t(b, c);
 	}
 	pkID := tableDesc.PrimaryIndex.ID
 	secID := tableDesc.Indexes[0].ID
+
+	// Retrieve the numeric descriptors.
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, "test", "hidden")
+	tIDHidden := tableDesc.ID
+	var rowIDHidden sqlbase.ColumnID
+	for i := range tableDesc.Columns {
+		c := &tableDesc.Columns[i]
+		switch c.Name {
+		case "rowid":
+			rowIDHidden = c.ID
+		}
+	}
 
 	// Make some schema changes meant to shuffle the ID/name mapping.
 	stmt = `
@@ -87,7 +97,7 @@ ALTER TABLE test.t DROP COLUMN xx;
 		{fmt.Sprintf("[%d(%d) as t]@bc", tID, cID), `(c)`, ``},
 		{fmt.Sprintf("[%d(%d, %d, %d) as t]", tID, cID, bID, aID), `(c, d, p)`, ``},
 		{fmt.Sprintf("[%d(%d, %d, %d) as t(c, b, a)]", tID, cID, bID, aID), `(c, b, a)`, ``},
-		{fmt.Sprintf("[%d() as t]", tID), `()`, ``},
+		{fmt.Sprintf("[%d() as t]", tID), ``, `pq: an explicit list of column IDs must include at least one column`},
 		{`[666() as t]`, ``, `pq: [666() AS t]: relation "[666]" does not exist`},
 		{fmt.Sprintf("[%d(666) as t]", tID), ``, `pq: column [666] does not exist`},
 		{fmt.Sprintf("test.t@[%d]", pkID), `(p, d, c)`, ``},
@@ -100,23 +110,26 @@ ALTER TABLE test.t DROP COLUMN xx;
 		{fmt.Sprintf("[%d(%d) as t]@[%d]", tID, aID, secID), `(p)`, ``},
 		{fmt.Sprintf("[%d(%d) as t]@[%d]", tID, bID, secID), `(d)`, ``},
 		{fmt.Sprintf("[%d(%d) as t]@[%d]", tID, cID, secID), `(c)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]", tIDHidden, rowIDHidden), `()`, ``},
 	}
 
 	for i, d := range testData {
-		sql := `SELECT "Columns" FROM [EXPLAIN(METADATA) SELECT * FROM ` + d.tableExpr + "]"
-		var columns string
-		if err := db.QueryRow(sql).Scan(&columns); err != nil {
-			if d.expectedError != "" {
-				if err.Error() != d.expectedError {
-					t.Fatalf("%d: %s: expected error: %s, got: %v", i, d.tableExpr, d.expectedError, err)
+		t.Run(d.tableExpr, func(t *testing.T) {
+			sql := `SELECT columns FROM [EXPLAIN(VERBOSE) SELECT * FROM ` + d.tableExpr + "] WHERE columns != ''"
+			var columns string
+			if err := db.QueryRow(sql).Scan(&columns); err != nil {
+				if d.expectedError != "" {
+					if err.Error() != d.expectedError {
+						t.Fatalf("%d: %s: expected error: %s, got: %v", i, d.tableExpr, d.expectedError, err)
+					}
+				} else {
+					t.Fatalf("%d: %s: query failed: %v", i, d.tableExpr, err)
 				}
-			} else {
-				t.Fatalf("%d: %s: query failed: %v", i, d.tableExpr, err)
 			}
-		}
 
-		if columns != d.expectedColumns {
-			t.Fatalf("%d: %s: expected: %s, got: %s", i, d.tableExpr, d.expectedColumns, columns)
-		}
+			if columns != d.expectedColumns {
+				t.Fatalf("%d: %s: expected: %s, got: %s", i, d.tableExpr, d.expectedColumns, columns)
+			}
+		})
 	}
 }

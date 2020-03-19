@@ -1,5 +1,3 @@
-# LogicTest: default parallel-stmts distsql distsql-disk
-
 ##
 # Test a primary key with a collated string in second position (cannot get a key range).
 #
@@ -71,14 +69,6 @@ SELECT COUNT (a) FROM t WHERE a > ('a' COLLATE de) AND a < ('c' COLLATE de)
 statement ok
 CREATE INDEX ON t (a, b) STORING (c)
 
-query TTT
-EXPLAIN SELECT a, b FROM t ORDER BY a, b
-----
-render     ·      ·
- └── scan  ·      ·
-·          table  t@t_a_b_idx
-·          spans  ALL
-
 query TI
 SELECT a, b FROM t ORDER BY a, b
 ----
@@ -91,14 +81,6 @@ B  3
 ü  5
 ü  6
 x  5
-
-query TTT
-EXPLAIN SELECT b, a FROM t ORDER BY b, a
-----
-render     ·      ·
- └── scan  ·      ·
-·          table  t@primary
-·          spans  ALL
 
 query IT
 SELECT b, a FROM t ORDER BY b, a
@@ -133,14 +115,6 @@ SELECT COUNT (a) FROM t WHERE a > ('a' COLLATE de) AND a < ('c' COLLATE de)
 statement ok
 UPDATE t SET a = (a :: STRING || a :: STRING) COLLATE de
 
-query TTT
-EXPLAIN SELECT a, b FROM t ORDER BY a, b
-----
-render     ·      ·
- └── scan  ·      ·
-·          table  t@t_a_b_idx
-·          spans  ALL
-
 query TI
 SELECT a, b FROM t ORDER BY a, b
 ----
@@ -153,14 +127,6 @@ BB  3
 üü  5
 üü  6
 xx  5
-
-query TTT
-EXPLAIN SELECT b, a FROM t ORDER BY b, a
-----
-render     ·      ·
- └── scan  ·      ·
-·          table  t@primary
-·          spans  ALL
 
 query IT
 SELECT b, a FROM t ORDER BY b, a
@@ -180,28 +146,12 @@ SELECT b, a FROM t ORDER BY b, a
 statement ok
 DELETE FROM t WHERE a > ('a' COLLATE de) AND a < ('c' COLLATE de)
 
-query TTT
-EXPLAIN SELECT a, b FROM t ORDER BY a, b
-----
-render     ·      ·
- └── scan  ·      ·
-·          table  t@t_a_b_idx
-·          spans  ALL
-
 query TI
 SELECT a, b FROM t ORDER BY a, b
 ----
 üü  5
 üü  6
 xx  5
-
-query TTT
-EXPLAIN SELECT b, a FROM t ORDER BY b, a
-----
-render     ·      ·
- └── scan  ·      ·
-·          table  t@primary
-·          spans  ALL
 
 query IT
 SELECT b, a FROM t ORDER BY b, a

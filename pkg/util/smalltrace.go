@@ -1,27 +1,32 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package util
 
 import (
-	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
-// GetSmallTrace produces a ":"-separated single line containing the
-// topmost 5 callers from a given skip level.
+var prefix = func() string {
+	result := "github.com/cockroachdb/cockroach/pkg/"
+	if runtime.Compiler == "gccgo" {
+		result = strings.Replace(result, ".", "_", -1)
+		result = strings.Replace(result, "/", "_", -1)
+	}
+	return result
+}()
+
+// GetSmallTrace returns a comma-separated string containing the top
+// 5 callers from a given skip level.
 func GetSmallTrace(skip int) string {
 	var pcs [5]uintptr
 	nCallers := runtime.Callers(skip, pcs[:])
@@ -30,8 +35,12 @@ func GetSmallTrace(skip int) string {
 
 	for {
 		f, more := frames.Next()
-		function := strings.TrimPrefix(f.Function, "github.com/cockroachdb/cockroach/pkg/")
-		callers = append(callers, fmt.Sprintf("%s:%d", function, f.Line))
+		function := strings.TrimPrefix(f.Function, prefix)
+		file := f.File
+		if index := strings.LastIndexByte(file, '/'); index >= 0 {
+			file = file[index+1:]
+		}
+		callers = append(callers, file+":"+strconv.Itoa(f.Line)+":"+function)
 		if !more {
 			break
 		}

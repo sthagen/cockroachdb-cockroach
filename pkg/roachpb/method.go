@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package roachpb
 
@@ -46,6 +42,10 @@ const (
 	// for keys which fall between args.RequestHeader.Key and
 	// args.RequestHeader.EndKey, with the latter endpoint excluded.
 	ClearRange
+	// RevertRange removes all versions of values more recent than the
+	// TargetTime for keys which fall between args.RequestHeader.Key and
+	// args.RequestHeader.EndKey, with the latter endpoint excluded.
+	RevertRange
 	// Scan fetches the values for all keys which fall between
 	// args.RequestHeader.Key and args.RequestHeader.EndKey, with
 	// the latter endpoint excluded.
@@ -54,22 +54,21 @@ const (
 	// args.RequestHeader.Key and args.RequestHeader.EndKey, with
 	// the latter endpoint excluded.
 	ReverseScan
-	// BeginTransaction writes a new transaction record, marking the
-	// beginning of the write-portion of a transaction. It is sent
-	// exclusively by the coordinating node along with the first
-	// transactional write and neither sent nor received by the client
-	// itself.
-	BeginTransaction
-	// EndTransaction either commits or aborts an ongoing transaction.
-	EndTransaction
+	// EndTxn either commits or aborts an ongoing transaction.
+	EndTxn
 	// AdminSplit is called to coordinate a split of a range.
 	AdminSplit
+	// AdminUnsplit is called to remove the sticky bit of a manually split range.
+	AdminUnsplit
 	// AdminMerge is called to coordinate a merge of two adjacent ranges.
 	AdminMerge
 	// AdminTransferLease is called to initiate a range lease transfer.
 	AdminTransferLease
 	// AdminChangeReplicas is called to add or remove replicas for a range.
 	AdminChangeReplicas
+	// AdminRelocateRange is called to relocate the replicas for a range onto a
+	// specified list of stores.
+	AdminRelocateRange
 	// HeartbeatTxn sends a periodic heartbeat to extant
 	// transaction rows to indicate the client is still alive and
 	// the transaction should not be considered abandoned.
@@ -89,17 +88,20 @@ const (
 	// an error code either indicating the pusher must retry or abort and
 	// restart the transaction.
 	PushTxn
+	// RecoverTxn attempts to recover an abandoned STAGING transaction. It
+	// specifies whether all of the abandoned transaction's in-flight writes
+	// succeeded or whether any failed. This is used to determine whether the
+	// result of the recovery should be committing the abandoned transaction or
+	// aborting it.
+	RecoverTxn
 	// QueryTxn fetches the current state of the designated transaction.
 	QueryTxn
-	// RangeLookup looks up range descriptors, containing the
-	// locations of replicas for the range containing the specified key.
-	RangeLookup
+	// QueryIntent checks whether the specified intent exists.
+	QueryIntent
 	// ResolveIntent resolves existing write intents for a key.
 	ResolveIntent
 	// ResolveIntentRange resolves existing write intents for a key range.
 	ResolveIntentRange
-	// Noop is a no-op.
-	Noop
 	// Merge merges a given value into the specified key. Merge is a
 	// high-performance operation provided by underlying data storage for values
 	// which are accumulated over several writes. Because it is not
@@ -118,8 +120,6 @@ const (
 	LeaseInfo
 	// ComputeChecksum starts a checksum computation over a replica snapshot.
 	ComputeChecksum
-	// DeprecatedVerifyChecksum is no longer used.
-	DeprecatedVerifyChecksum
 	// CheckConsistency verifies the consistency of all ranges falling within a
 	// key span.
 	CheckConsistency
@@ -138,4 +138,21 @@ const (
 	AdminScatter
 	// AddSSTable links a file into the RocksDB log-structured merge-tree.
 	AddSSTable
+	// RecomputeStats applies a delta to a Range's MVCCStats to fix computational errors.
+	RecomputeStats
+	// Refresh verifies no writes to a key have occurred since the
+	// transaction orig timestamp and sets a new entry in the timestamp
+	// cache at the current transaction timestamp.
+	Refresh
+	// RefreshRange verifies no writes have occurred to a span of keys
+	// since the transaction orig timestamp and sets a new span in the
+	// timestamp cache at the current transaction timestamp.
+	RefreshRange
+	// Subsume freezes a range for merging with its left-hand neighbor.
+	Subsume
+	// RangeStats returns the MVCC statistics for a range.
+	RangeStats
+	// VerifyProtectedTimestamp determines whether the specified protection record
+	// will be respected by this Range.
+	AdminVerifyProtectedTimestamp
 )

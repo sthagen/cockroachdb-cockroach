@@ -155,7 +155,7 @@ System keys come in several subtypes:
 - **Replicated Range ID local** keys store range metadata that is
     present on all of the replicas for a range. These keys are updated
     via Raft operations. Examples include the range lease state and
-    abort cache entries.
+    abort span entries.
 - **Unreplicated Range ID local** keys store range metadata that is
     local to a replica. The primary examples of such keys are the Raft
     state and Raft log.
@@ -349,9 +349,7 @@ There are several scenarios in which transactions interact:
   to proceed; after all, it will be reading an older version of the
   value and so does not conflict. Recall that the write intent may
   be committed with a later timestamp than its candidate; it will
-  never commit with an earlier one. **Side note**: if a SI transaction
-  reader finds an intent with a newer timestamp which the reader’s own
-  transaction has written, the reader always returns that intent's value.
+  never commit with an earlier one. 
 
 - **Reader encounters write intent or value with newer timestamp in the
   near future:** In this case, we have to be careful. The newer
@@ -844,23 +842,6 @@ to obtain the lease synchronously. Requests received by a non-lease holder
 error pointing at the replica's last known lease holder. These requests
 are retried transparently with the updated lease by the gateway node and
 never reach the client.
-
-Since reads bypass Raft, a new lease holder will, among other things, ascertain
-that its timestamp cache does not report timestamps smaller than the previous
-lease holder's (so that it's compatible with reads which may have occurred on
-the former lease holder). This is accomplished by letting leases enter
-a <i>stasis period</i> (which is just the expiration minus the maximum clock
-offset) before the actual expiration of the lease, so that all the next lease
-holder has to do is set the low water mark of the timestamp cache to its
-new lease's start time.
-
-As a lease enters its stasis period, no more reads or writes are served, which
-is undesirable. However, this would only happen in practice if a node became
-unavailable. In almost all practical situations, no unavailability results
-since leases are usually long-lived (and/or eagerly extended, which can avoid
-the stasis period) or proactively transferred away from the lease holder, which
-can also avoid the stasis period by promising not to serve any further reads
-until the next lease goes into effect.
 
 ## Colocation with Raft leadership
 

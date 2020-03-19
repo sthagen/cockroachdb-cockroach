@@ -1,86 +1,60 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
 import (
-	"bytes"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
-// Variable names are used in multiples places in SQL:
+// VarName occurs inside scalar expressions.
 //
-// - if the context is the LHS of an UPDATE, then the name is for an
-//   unqualified column or part of a column.
+// Immediately after parsing, the following types can occur:
 //
-//   Syntax: <column-name> [ . <subfield-name> | '[' <index> ']' ]*
-//   (the name always *starts* with a column name)
+// - UnqualifiedStar: a naked star as argument to a function, e.g. count(*),
+//   or at the top level of a SELECT clause.
+//   See also uses of StarExpr() and StarSelectExpr() in the grammar.
 //
-//   Represented by: ColumnItem
-//   Found by: NormalizeUnqualifiedColumnItem()
+// - UnresolvedName: other names of the form `a.b....e` or `a.b...e.*`.
 //
-// - if the context is a direct select target, then the name may end
-//   with '*' for a column group, with optional database and table prefix.
+// Consumers of variable names do not like UnresolvedNames and instead
+// expect either AllColumnsSelector or ColumnItem. Use
+// NormalizeVarName() for this.
 //
-//   Syntax: [ [ <database-name> '.' ] <table-name> '.' ] '*'
-//
-//   Represented by: UnqualifiedStar, *AllColumnsSelector (VarName)
-//   Found by: NormalizeVarName()
-//
-// - elsewhere, the name is for a optionally-qualified column name
-//   with optional array subscript followed by additional optional
-//   subfield or array subscripts.
-//
-//   Syntax: [ [ <database-name> '.' ] <table-name> '.' ]
-//              <column-name>
-//           [ '[' <index> ']' [ '[' <index> ']' | '.' <subfield> ] * ]
-//   (either there is no array subscript and the qualified name *ends*
-//   with a column name; or there is an array subscript and the
-//   supporting column's name is the last unqualified name before the first
-//   array subscript).
-//
-//   Represented by: ColumnItem (VarName)
-//   Found by: NormalizeVarName()
-//
-// The common type in expression contexts is VarName. This extends
-// TypedExpr and VariableExpr so it can be used in expression trees
-// directly.  During parsing a name in expressions always begins as an
-// UnresolvedName instance.  During either IndexedVar substitution, type
-// checking or render target expansion (render node) this is
-// normalized and replaced by either *ColumnItem, UnqualifiedStar or
-// AllColumnsSelector using the NormalizeVarName() method.
-//
-// In the context of UpdateExprs, UnresolvedNames are translated to
-// ColumnItem directly by NormalizeUnqualifiedColumnItem() without
-// going through the VarName interface at all.
-
-// VarName is the common interface to UnresolvedName,
-// ColumnItem and AllColumnsSelector for use in expression contexts.
+// After a ColumnItem is available, it should be further resolved, for this
+// the Resolve() method should be used; see name_resolution.go.
 type VarName interface {
 	TypedExpr
 
+	// NormalizeVarName() guarantees to return a variable name
+	// that is not an UnresolvedName. This converts the UnresolvedName
+	// to an AllColumnsSelector or ColumnItem as necessary.
 	NormalizeVarName() (VarName, error)
 }
 
-var _ VarName = UnresolvedName{}
+var _ VarName = &UnresolvedName{}
 var _ VarName = UnqualifiedStar{}
 var _ VarName = &AllColumnsSelector{}
+var _ VarName = &TupleStar{}
 var _ VarName = &ColumnItem{}
 
-// NormalizeVarName is a no-op for UnqualifiedStar (already normalized)
+// UnqualifiedStar corresponds to a standalone '*' in a scalar
+// expression.
+type UnqualifiedStar struct{}
+
+// Format implements the NodeFormatter interface.
+func (UnqualifiedStar) Format(ctx *FmtCtx) { ctx.WriteByte('*') }
+func (u UnqualifiedStar) String() string   { return AsString(u) }
+
+// NormalizeVarName implements the VarName interface.
 func (u UnqualifiedStar) NormalizeVarName() (VarName, error) { return u, nil }
 
 var singletonStarName VarName = UnqualifiedStar{}
@@ -89,42 +63,47 @@ var singletonStarName VarName = UnqualifiedStar{}
 func StarExpr() VarName { return singletonStarName }
 
 // ResolvedType implements the TypedExpr interface.
-func (UnqualifiedStar) ResolvedType() types.T {
-	panic("unqualified stars ought to be replaced before this point")
+func (UnqualifiedStar) ResolvedType() *types.T {
+	panic(errors.AssertionFailedf("unqualified stars ought to be replaced before this point"))
 }
 
 // Variable implements the VariableExpr interface.
 func (UnqualifiedStar) Variable() {}
 
+// UnresolvedName is defined in name_part.go. It also implements the
+// VarName interface, and thus TypedExpr too.
+
 // ResolvedType implements the TypedExpr interface.
-func (UnresolvedName) ResolvedType() types.T {
-	panic("unresolved names ought to be replaced before this point")
+func (*UnresolvedName) ResolvedType() *types.T {
+	panic(errors.AssertionFailedf("unresolved names ought to be replaced before this point"))
 }
 
 // Variable implements the VariableExpr interface.  Although, the
 // UnresolvedName ought to be replaced to an IndexedVar before the points the
 // VariableExpr interface is used.
-func (UnresolvedName) Variable() {}
+func (*UnresolvedName) Variable() {}
+
+// NormalizeVarName implements the VarName interface.
+func (n *UnresolvedName) NormalizeVarName() (VarName, error) {
+	return classifyColumnItem(n)
+}
 
 // AllColumnsSelector corresponds to a selection of all
 // columns in a table when used in a SELECT clause.
-// (e.g. `table.*`)
+// (e.g. `table.*`).
 type AllColumnsSelector struct {
-	TableName
+	// TableName corresponds to the table prefix, before the star.
+	TableName *UnresolvedObjectName
 }
 
 // Format implements the NodeFormatter interface.
-func (a *AllColumnsSelector) Format(buf *bytes.Buffer, f FmtFlags) {
-	if !a.TableName.DBNameOriginallyOmitted {
-		FormatNode(buf, f, a.TableName.DatabaseName)
-		buf.WriteByte('.')
-	}
-	FormatNode(buf, f, a.TableName.TableName)
-	buf.WriteString(".*")
+func (a *AllColumnsSelector) Format(ctx *FmtCtx) {
+	ctx.FormatNode(a.TableName)
+	ctx.WriteString(".*")
 }
 func (a *AllColumnsSelector) String() string { return AsString(a) }
 
-// NormalizeVarName is a no-op for AllColumnsSelector (already normalized)
+// NormalizeVarName implements the VarName interface.
 func (a *AllColumnsSelector) NormalizeVarName() (VarName, error) { return a, nil }
 
 // Variable implements the VariableExpr interface.  Although, the
@@ -133,43 +112,35 @@ func (a *AllColumnsSelector) NormalizeVarName() (VarName, error) { return a, nil
 func (a *AllColumnsSelector) Variable() {}
 
 // ResolvedType implements the TypedExpr interface.
-func (*AllColumnsSelector) ResolvedType() types.T {
-	panic("all-columns selectors ought to be replaced before this point")
+func (*AllColumnsSelector) ResolvedType() *types.T {
+	panic(errors.AssertionFailedf("all-columns selectors ought to be replaced before this point"))
 }
 
-// ColumnItem corresponds to the name of a column or sub-item
-// of a column in an expression.
+// ColumnItem corresponds to the name of a column in an expression.
 type ColumnItem struct {
-	// TableName holds the table prefix, if the name refers to a column.
-	TableName TableName
+	// TableName holds the table prefix, if the name refers to a column. It is
+	// optional.
+	//
+	// This uses UnresolvedObjectName because we need to preserve the
+	// information about which parts were initially specified in the SQL
+	// text. ColumnItems are intermediate data structures anyway, that
+	// still need to undergo name resolution.
+	TableName *UnresolvedObjectName
 	// ColumnName names the designated column.
 	ColumnName Name
-	// Selector defines which sub-part of the variable is being
-	// accessed.
-	Selector NameParts
 }
 
 // Format implements the NodeFormatter interface.
-func (c *ColumnItem) Format(buf *bytes.Buffer, f FmtFlags) {
-	if c.TableName.TableName != "" {
-		if !c.TableName.DBNameOriginallyOmitted {
-			FormatNode(buf, f, c.TableName.DatabaseName)
-			buf.WriteByte('.')
-		}
-		FormatNode(buf, f, c.TableName.TableName)
-		buf.WriteByte('.')
+func (c *ColumnItem) Format(ctx *FmtCtx) {
+	if c.TableName != nil {
+		c.TableName.Format(ctx)
+		ctx.WriteByte('.')
 	}
-	FormatNode(buf, f, c.ColumnName)
-	if len(c.Selector) > 0 {
-		if _, ok := c.Selector[0].(*ArraySubscript); !ok {
-			buf.WriteByte('.')
-		}
-		FormatNode(buf, f, c.Selector)
-	}
+	ctx.FormatNode(&c.ColumnName)
 }
 func (c *ColumnItem) String() string { return AsString(c) }
 
-// NormalizeVarName is a no-op for ColumnItem (already normalized)
+// NormalizeVarName implements the VarName interface.
 func (c *ColumnItem) NormalizeVarName() (VarName, error) { return c, nil }
 
 // Column retrieves the unqualified column name.
@@ -177,106 +148,43 @@ func (c *ColumnItem) Column() string {
 	return string(c.ColumnName)
 }
 
-// Variable implements the VariableExpr interface.  Although, the
-// ColumnItem ought to be replaced to an IndexedVar before the points the
-// VariableExpr interface is used.
+// Variable implements the VariableExpr interface.
+//
+// Note that in common uses, ColumnItem ought to be replaced to an
+// IndexedVar prior to evaluation.
 func (c *ColumnItem) Variable() {}
 
 // ResolvedType implements the TypedExpr interface.
-func (c *ColumnItem) ResolvedType() types.T {
+func (c *ColumnItem) ResolvedType() *types.T {
 	if presetTypesForTesting == nil {
 		return nil
 	}
 	return presetTypesForTesting[c.String()]
 }
 
-func newInvColRef(fmt string, args ...interface{}) error {
-	return pgerror.NewErrorf(pgerror.CodeInvalidColumnReferenceError, fmt, args...)
+// NewColumnItem constructs a column item from an already valid
+// TableName. This can be used for e.g. pretty-printing.
+func NewColumnItem(tn *TableName, colName Name) *ColumnItem {
+	c := MakeColumnItem(tn, colName)
+	return &c
 }
 
-// NormalizeVarName normalizes a UnresolvedName for all the forms it can have
-// inside an expression context.
-func (n UnresolvedName) NormalizeVarName() (VarName, error) {
-	if len(n) == 0 {
-		return nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError, "invalid name: %q", n)
-	}
-
-	if s, isStar := n[len(n)-1].(UnqualifiedStar); isStar {
-		// Either a single '*' or a name of the form [db.]table.*
-
-		if len(n) == 1 {
-			return s, nil
+// MakeColumnItem constructs a column item from an already valid
+// TableName. This can be used for e.g. pretty-printing.
+func MakeColumnItem(tn *TableName, colName Name) ColumnItem {
+	c := ColumnItem{ColumnName: colName}
+	if tn.Table() != "" {
+		numParts := 1
+		if tn.ExplicitCatalog {
+			numParts = 3
+		} else if tn.ExplicitSchema {
+			numParts = 2
 		}
 
-		// The prefix before the star must be a valid table name.  Use the
-		// existing normalize code to enforce that, since we can reuse the
-		// resulting TableName.
-		t, err := n[:len(n)-1].normalizeTableNameAsValue()
-		if err != nil {
-			return nil, err
-		}
-
-		return &AllColumnsSelector{t}, nil
-	}
-
-	// In the remaining case, we have an optional table name prefix,
-	// followed by a column name, followed by some additional selector.
-
-	// Find the first array subscript, if any.
-	i := len(n)
-	for j, p := range n {
-		if _, ok := p.(*ArraySubscript); ok {
-			i = j
-			break
+		c.TableName = &UnresolvedObjectName{
+			NumParts: numParts,
+			Parts:    [3]string{tn.Table(), tn.Schema(), tn.Catalog()},
 		}
 	}
-	// The element at position i - 1 must be the column name.
-	// (We don't support record types yet.)
-	if i == 0 {
-		return nil, newInvColRef("invalid column name: %q", n)
-	}
-	colName, ok := n[i-1].(Name)
-	if !ok {
-		return nil, newInvColRef("invalid column name: %q", n[:i])
-	}
-	if len(colName) == 0 {
-		return nil, newInvColRef("empty column name: %q", n)
-	}
-
-	// Everything afterwards is the selector.
-	res := &ColumnItem{ColumnName: colName, Selector: NameParts(n[i:])}
-
-	if i-1 > 0 {
-		// What's before must be a valid table name.  Use the existing
-		// normalize code to enforce that, since we can reuse the
-		// resulting TableName.
-		t, err := n[:i-1].normalizeTableNameAsValue()
-		if err != nil {
-			return nil, err
-		}
-		res.TableName = t
-	}
-
-	return res, nil
-}
-
-// NormalizeUnqualifiedColumnItem normalizes a UnresolvedName for all
-// the forms it can have inside a context that requires an unqualified
-// column item (e.g. UPDATE LHS, INSERT, etc.).
-func (n UnresolvedName) NormalizeUnqualifiedColumnItem() (*ColumnItem, error) {
-	if len(n) == 0 {
-		return nil, newInvColRef("invalid column name: %q", n)
-	}
-
-	colName, ok := n[0].(Name)
-	if !ok {
-		return nil, newInvColRef("invalid column name: %q", n)
-	}
-
-	if colName == "" {
-		return nil, newInvColRef("empty column name: %q", n)
-	}
-
-	// Remainder is a selector.
-	return &ColumnItem{ColumnName: colName, Selector: NameParts(n[1:])}, nil
+	return c
 }

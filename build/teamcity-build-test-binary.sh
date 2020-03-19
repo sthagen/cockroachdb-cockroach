@@ -3,13 +3,15 @@
 # This file builds a cockroach binary that's used by integration tests external
 # to this repository.
 
-set -euxo pipefail
+set -euo pipefail
 
 source "$(dirname "${0}")/teamcity-support.sh"
-maybe_ccache
 
-# We don't want to build a proper release binary here, because we don't want
-# this binary to operate in release mode and e.g. report errors.
-build/builder.sh make build TYPE=portable
-mkdir -p artifacts
-mv cockroach artifacts/
+tc_prepare
+
+tc_start_block "Build test binary"
+# Buffer noisy output and only print it on failure.
+run build/builder.sh mkrelease linux-gnu -Otarget &> artifacts/build-binary.log || (cat artifacts/build-binary.log && false)
+rm artifacts/build-binary.log
+run mv cockroach-linux-2.6.32-gnu-amd64 artifacts/cockroach
+tc_end_block "Build test binary"

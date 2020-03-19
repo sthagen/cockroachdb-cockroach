@@ -1,75 +1,99 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
-import "bytes"
+// DescriptorCoverage specifies whether or not a subset of descriptors were
+// requested or if all the descriptors were requested, so all the descriptors
+// are covered in a given backup.
+type DescriptorCoverage int32
+
+const (
+	// RequestedDescriptors table coverage means that the backup is not
+	// guaranteed to have all of the cluster data. This can be accomplished by
+	// backing up a specific subset of tables/databases. Note that even if all
+	// of the tables and databases have been included in the backup manually, a
+	// backup is not said to have complete table coverage unless it was created
+	// by a `BACKUP TO` command.
+	RequestedDescriptors DescriptorCoverage = iota
+	// AllDescriptors table coverage means that backup is guaranteed to have all the
+	// relevant data in the cluster. These can only be created by running a
+	// full cluster backup with `BACKUP TO`.
+	AllDescriptors
+)
 
 // Backup represents a BACKUP statement.
 type Backup struct {
-	Targets         TargetList
-	To              Expr
-	IncrementalFrom Exprs
-	AsOf            AsOfClause
-	Options         KVOptions
+	Targets            TargetList
+	DescriptorCoverage DescriptorCoverage
+	To                 PartitionedBackup
+	IncrementalFrom    Exprs
+	AsOf               AsOfClause
+	Options            KVOptions
 }
 
 var _ Statement = &Backup{}
 
 // Format implements the NodeFormatter interface.
-func (node *Backup) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("BACKUP ")
-	FormatNode(buf, f, node.Targets)
-	buf.WriteString(" TO ")
-	FormatNode(buf, f, node.To)
+func (node *Backup) Format(ctx *FmtCtx) {
+	ctx.WriteString("BACKUP ")
+	if node.DescriptorCoverage == RequestedDescriptors {
+		ctx.FormatNode(&node.Targets)
+	}
+	ctx.WriteString(" TO ")
+	ctx.FormatNode(&node.To)
 	if node.AsOf.Expr != nil {
-		buf.WriteString(" ")
-		FormatNode(buf, f, node.AsOf)
+		ctx.WriteString(" ")
+		ctx.FormatNode(&node.AsOf)
 	}
 	if node.IncrementalFrom != nil {
-		buf.WriteString(" INCREMENTAL FROM ")
-		FormatNode(buf, f, node.IncrementalFrom)
+		ctx.WriteString(" INCREMENTAL FROM ")
+		ctx.FormatNode(&node.IncrementalFrom)
 	}
 	if node.Options != nil {
-		buf.WriteString(" WITH ")
-		FormatNode(buf, f, node.Options)
+		ctx.WriteString(" WITH ")
+		ctx.FormatNode(&node.Options)
 	}
 }
 
 // Restore represents a RESTORE statement.
 type Restore struct {
-	Targets TargetList
-	From    Exprs
-	AsOf    AsOfClause
-	Options KVOptions
+	Targets            TargetList
+	DescriptorCoverage DescriptorCoverage
+	From               []PartitionedBackup
+	AsOf               AsOfClause
+	Options            KVOptions
 }
 
 var _ Statement = &Restore{}
 
 // Format implements the NodeFormatter interface.
-func (node *Restore) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("RESTORE ")
-	FormatNode(buf, f, node.Targets)
-	buf.WriteString(" FROM ")
-	FormatNode(buf, f, node.From)
+func (node *Restore) Format(ctx *FmtCtx) {
+	ctx.WriteString("RESTORE ")
+	if node.DescriptorCoverage == RequestedDescriptors {
+		ctx.FormatNode(&node.Targets)
+	}
+	ctx.WriteString(" FROM ")
+	for i := range node.From {
+		if i > 0 {
+			ctx.WriteString(", ")
+		}
+		ctx.FormatNode(&node.From[i])
+	}
 	if node.AsOf.Expr != nil {
-		buf.WriteString(" EXPERIMENTAL ")
-		FormatNode(buf, f, node.AsOf)
+		ctx.WriteString(" ")
+		ctx.FormatNode(&node.AsOf)
 	}
 	if node.Options != nil {
-		buf.WriteString(" WITH ")
-		FormatNode(buf, f, node.Options)
+		ctx.WriteString(" WITH ")
+		ctx.FormatNode(&node.Options)
 	}
 }
 
@@ -83,15 +107,33 @@ type KVOption struct {
 type KVOptions []KVOption
 
 // Format implements the NodeFormatter interface.
-func (o KVOptions) Format(buf *bytes.Buffer, f FmtFlags) {
-	for i, n := range o {
+func (o *KVOptions) Format(ctx *FmtCtx) {
+	for i := range *o {
+		n := &(*o)[i]
 		if i > 0 {
-			buf.WriteString(", ")
+			ctx.WriteString(", ")
 		}
-		FormatNode(buf, f, n.Key)
+		ctx.FormatNode(&n.Key)
 		if n.Value != nil {
-			buf.WriteString(` = `)
-			FormatNode(buf, f, n.Value)
+			ctx.WriteString(` = `)
+			ctx.FormatNode(n.Value)
 		}
+	}
+}
+
+// PartitionedBackup is a list of destination URIs for a single BACKUP. A single
+// URI corresponds to the special case of a regular backup, and multiple URIs
+// correspond to a partitioned backup whose locality configuration is
+// specified by LOCALITY url params.
+type PartitionedBackup []Expr
+
+// Format implements the NodeFormatter interface.
+func (node *PartitionedBackup) Format(ctx *FmtCtx) {
+	if len(*node) > 1 {
+		ctx.WriteString("(")
+	}
+	ctx.FormatNode((*Exprs)(node))
+	if len(*node) > 1 {
+		ctx.WriteString(")")
 	}
 }

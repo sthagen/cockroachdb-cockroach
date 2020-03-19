@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -18,12 +14,11 @@ import (
 	"context"
 	"sort"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-
-	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func (s *statusServer) ProblemRanges(
@@ -42,15 +37,12 @@ func (s *statusServer) ProblemRanges(
 	if len(req.NodeID) > 0 {
 		requestedNodeID, _, err := s.parseNodeID(req.NodeID)
 		if err != nil {
-			return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+			return nil, status.Errorf(codes.InvalidArgument, err.Error())
 		}
-		isLiveMap = map[roachpb.NodeID]bool{
-			requestedNodeID: true,
+		isLiveMap = kvserver.IsLiveMap{
+			requestedNodeID: kvserver.IsLiveMapEntry{IsLive: true},
 		}
 	}
-
-	nodeCtx, cancel := context.WithTimeout(ctx, base.NetworkTimeout)
-	defer cancel()
 
 	type nodeResponse struct {
 		nodeID roachpb.NodeID
@@ -63,7 +55,7 @@ func (s *statusServer) ProblemRanges(
 	for nodeID := range isLiveMap {
 		nodeID := nodeID
 		if err := s.stopper.RunAsyncTask(
-			nodeCtx, "server.statusServer: requesting remote ranges",
+			ctx, "server.statusServer: requesting remote ranges",
 			func(ctx context.Context) {
 				status, err := s.dialNode(ctx, nodeID)
 				var rangesResponse *serverpb.RangesResponse
@@ -84,7 +76,7 @@ func (s *statusServer) ProblemRanges(
 					// Context completed, response no longer needed.
 				}
 			}); err != nil {
-			return nil, grpc.Errorf(codes.Internal, err.Error())
+			return nil, status.Errorf(codes.Internal, err.Error())
 		}
 	}
 
@@ -121,9 +113,21 @@ func (s *statusServer) ProblemRanges(
 					problems.UnderreplicatedRangeIDs =
 						append(problems.UnderreplicatedRangeIDs, info.State.Desc.RangeID)
 				}
+				if info.Problems.Overreplicated {
+					problems.OverreplicatedRangeIDs =
+						append(problems.OverreplicatedRangeIDs, info.State.Desc.RangeID)
+				}
 				if info.Problems.NoLease {
 					problems.NoLeaseRangeIDs =
 						append(problems.NoLeaseRangeIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.QuiescentEqualsTicking {
+					problems.QuiescentEqualsTickingRangeIDs =
+						append(problems.QuiescentEqualsTickingRangeIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.RaftLogTooLarge {
+					problems.RaftLogTooLargeRangeIDs =
+						append(problems.RaftLogTooLargeRangeIDs, info.State.Desc.RangeID)
 				}
 			}
 			sort.Sort(roachpb.RangeIDSlice(problems.UnavailableRangeIDs))
@@ -131,9 +135,12 @@ func (s *statusServer) ProblemRanges(
 			sort.Sort(roachpb.RangeIDSlice(problems.NoRaftLeaderRangeIDs))
 			sort.Sort(roachpb.RangeIDSlice(problems.NoLeaseRangeIDs))
 			sort.Sort(roachpb.RangeIDSlice(problems.UnderreplicatedRangeIDs))
+			sort.Sort(roachpb.RangeIDSlice(problems.OverreplicatedRangeIDs))
+			sort.Sort(roachpb.RangeIDSlice(problems.QuiescentEqualsTickingRangeIDs))
+			sort.Sort(roachpb.RangeIDSlice(problems.RaftLogTooLargeRangeIDs))
 			response.ProblemsByNodeID[resp.nodeID] = problems
 		case <-ctx.Done():
-			return nil, grpc.Errorf(codes.DeadlineExceeded, ctx.Err().Error())
+			return nil, status.Errorf(codes.DeadlineExceeded, ctx.Err().Error())
 		}
 	}
 

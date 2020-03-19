@@ -1,5 +1,3 @@
-# LogicTest: default parallel-stmts distsql
-
 statement error pq: invalid locale bad_locale: language: subtag "locale" is well-formed but unknown
 SELECT 'a' COLLATE bad_locale
 
@@ -18,6 +16,21 @@ SELECT ('a' COLLATE en_u_ks_level1, 'a' COLLATE en) < ('A' COLLATE en, 'B' COLLA
 
 query T
 SELECT 'A' COLLATE en
+----
+A
+
+query T
+SELECT ('A' COLLATE de) COLLATE en
+----
+A
+
+query T
+SELECT NAME 'A' COLLATE en
+----
+A
+
+query T
+SELECT (NAME 'A' COLLATE de) COLLATE en
 ----
 A
 
@@ -179,17 +192,17 @@ SELECT 'ü' COLLATE de < 'x' COLLATE de
 true
 
 
-statement error invalid locale e: language: tag is not well-formed at or near "\)"
+statement error syntax error: invalid locale e: language: tag is not well-formed
 CREATE TABLE e1 (
   a STRING COLLATE e
 )
 
-statement error multiple COLLATE declarations for column "a" at or near "\)"
+statement error multiple COLLATE declarations for column "a"
 CREATE TABLE e2 (
   a STRING COLLATE en COLLATE de
 )
 
-statement error COLLATE declaration for non-string-typed column "a" at or near "\)"
+statement error COLLATE declaration for non-string-typed column "a"
 CREATE TABLE e3 (
   a INT COLLATE en
 )
@@ -216,7 +229,7 @@ INSERT INTO t VALUES
   ('x' COLLATE en),
   ('ü' COLLATE en)
 
-statement error locale "de" doesn't match locale "en" of column "a"
+statement error value type collatedstring{de} doesn't match type collatedstring{en} of column "a"
 INSERT INTO t VALUES ('X' COLLATE de)
 
 query T
@@ -238,6 +251,11 @@ b
 B
 x
 ü
+
+query T
+SELECT a FROM t WHERE a = 'A' COLLATE en;
+----
+A
 
 query T
 SELECT 'a' COLLATE en::STRING || 'b'
@@ -275,14 +293,14 @@ SELECT '2017-01-10 16:05:50.734049+00:00' COLLATE en::TIMESTAMP
 2017-01-10 16:05:50.734049 +0000 +0000
 
 query T
-SELECT '2017-01-10 16:05:50.734049+00:00' COLLATE en::TIMESTAMP WITH TIME ZONE
+SELECT '2017-01-10 16:05:50.734049+00:00' COLLATE en::TIMESTAMPTZ
 ----
-2017-01-10 16:05:50.734049 +0000 +0000
+2017-01-10 16:05:50.734049 +0000 UTC
 
 query T
 SELECT '40 days' COLLATE en::INTERVAL
 ----
-40d
+40 days
 
 statement ok
 CREATE TABLE foo(a STRING COLLATE en_u_ks_level2)
@@ -299,3 +317,42 @@ query T
 SELECT a FROM foo
 ----
 NULL
+
+# Regression test for #24449
+
+statement ok
+INSERT INTO foo VALUES ('aBcD' COLLATE en_u_ks_level2)
+
+query T
+SELECT * FROM foo WHERE a = 'aBcD' COLLATE en_u_ks_level2
+----
+aBcD
+
+query T
+SELECT * FROM foo WHERE a = 'abcd' COLLATE en_u_ks_level2
+----
+aBcD
+
+# Test quoted collations.
+
+statement ok
+CREATE TABLE quoted_coll (
+  a STRING COLLATE "en",
+  b STRING COLLATE "en_US",
+  c STRING COLLATE "en-Us" DEFAULT ('c' COLLATE "en-Us"),
+  d STRING COLLATE "en-u-ks-level1" DEFAULT ('d'::STRING COLLATE "en-u-ks-level1"),
+  e STRING COLLATE "en-us" AS (a COLLATE "en-us") STORED,
+  FAMILY "primary" (a, b, c, d, e, rowid)
+)
+
+query TT
+SHOW CREATE TABLE quoted_coll
+----
+quoted_coll  CREATE TABLE quoted_coll (
+  a STRING COLLATE en NULL,
+  b STRING COLLATE en_US NULL,
+  c STRING COLLATE en_Us NULL DEFAULT 'c':::STRING COLLATE en_Us,
+  d STRING COLLATE en_u_ks_level1 NULL DEFAULT 'd':::STRING::STRING COLLATE en_u_ks_level1,
+  e STRING COLLATE en_us NULL AS (a COLLATE en_us) STORED,
+  FAMILY "primary" (a, b, c, d, e, rowid)
+)

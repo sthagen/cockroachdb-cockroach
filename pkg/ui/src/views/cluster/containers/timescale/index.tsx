@@ -1,19 +1,30 @@
-import React from "react";
-import { connect } from "react-redux";
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import moment from "moment";
-
-import "./timescale.styl";
-
-import Dropdown, { DropdownOption, ArrowDirection } from "src/views/shared/components/dropdown";
-
-import { AdminUIState } from "src/redux/state";
+import { queryByName, queryToObj, queryToString } from "oss/src/util/query";
+import React from "react";
+import { connect } from "react-redux";
+import { RouteComponentProps, withRouter } from "react-router-dom";
 import { refreshNodes } from "src/redux/apiReducers";
-import * as timewindow from "src/redux/timewindow";
 import { LocalSetting } from "src/redux/localsettings";
-
-import { NodeStatus$Properties } from "src/util/proto";
+import { AdminUIState } from "src/redux/state";
+import * as timewindow from "src/redux/timewindow";
 import { LongToMoment } from "src/util/convert";
+import { INodeStatus } from "src/util/proto";
+import Dropdown, { ArrowDirection, DropdownOption } from "src/views/shared/components/dropdown";
+import TimeFrameControls from "../../components/controls";
+import RangeSelect, { DateTypes } from "../../components/range";
+import "./timescale.styl";
+import { Divider } from "antd";
 
 // Tracks whether the default timescale been set once in the app. Tracked across
 // the entire app so that changing pages doesn't cause it to reset.
@@ -21,122 +32,129 @@ const timescaleDefaultSet = new LocalSetting(
   "timescale/default_set", (s: AdminUIState) => s.localSettings, false,
 );
 
-interface TimeRangeProps {
-  start: moment.Moment;
-  end: moment.Moment;
-}
-
-// TimeRange is a prettified string representation of the current timescale.
-class TimeRange extends React.Component<TimeRangeProps, {}> {
-  render() {
-    const s = this.props.start.clone().utc();
-    const e = this.props.end.clone().utc();
-    const startTimeSpan = <span className="time-range__time">{s.format("HH:mm:ss")}</span>;
-    const endTimeSpan = <span className="time-range__time">{e.format("HH:mm:ss")}</span>;
-    const startDateSpan = <span className="time-range__date">{s.format("MMM DD, YYYY")}</span>;
-    const endDateSpan = <span className="time-range__date">{e.format("MMM DD, YYYY")}</span>;
-
-    const rangeHours = e.diff(s, "hours");
-    const pastHours = moment().diff(s, "hours");
-    // If start and end times are on the same day, show the times.
-    if (rangeHours < 24 && s.date() === e.date()) {
-      // If start and end times are today, omit the date, otherwise include it.
-      if (pastHours < 24 && s.date() === moment().date()) {
-        return <span className="time-range">{startTimeSpan} to {endTimeSpan}</span>;
-      } else {
-        return <span className="time-range">{startTimeSpan} to {endTimeSpan} on {endDateSpan}</span>;
-      }
-    }
-    // If start and end times are within 48 hours show times and dates,
-    // otherwise omit times and only show the dates.
-    if ( rangeHours < 48) {
-      return <span className="time-range">{startTimeSpan} on {startDateSpan} to {endTimeSpan} on {endDateSpan}</span>;
-    } else {
-      return <span className="time-range">{startDateSpan} to {endDateSpan}</span>;
-    }
-  }
-}
-
-interface TimeScaleDropdownProps {
+interface TimeScaleDropdownProps extends RouteComponentProps {
   currentScale: timewindow.TimeScale;
+  currentWindow: timewindow.TimeWindow;
   availableScales: timewindow.TimeScaleCollection;
   setTimeScale: typeof timewindow.setTimeScale;
+  setTimeRange: typeof timewindow.setTimeRange;
   // Track node data to find the oldest node and set the default timescale.
   refreshNodes: typeof refreshNodes;
-  nodeStatuses: NodeStatus$Properties[];
+  nodeStatuses: INodeStatus[];
   nodeStatusesValid: boolean;
   // Track whether the default has been set.
   setDefaultSet: typeof timescaleDefaultSet.set;
   defaultTimescaleSet: boolean;
+  useTimeRange: boolean;
 }
+
+export const getTimeLabel = (currentWindow?: timewindow.TimeWindow, windowSize?: moment.Duration) => {
+  const time = windowSize ? windowSize : moment.duration(moment(currentWindow.end).diff(currentWindow.start));
+  const seconds = time.asSeconds();
+  const minutes = 60;
+  const hour = minutes * 60;
+  const day = hour * 24;
+  const week = day * 7;
+  const month = day * moment().daysInMonth();
+  switch (true) {
+    case seconds < hour:
+      return time.asMinutes().toFixed() + "m";
+    case (seconds >= hour && seconds < day):
+      return time.asHours().toFixed() + "h";
+    case seconds < week:
+      return time.asDays().toFixed() + "d";
+    case seconds < month:
+      return time.asWeeks().toFixed() + "w";
+    default:
+      return time.asMonths().toFixed() + "m";
+  }
+};
 
 // TimeScaleDropdown is the dropdown that allows users to select the time range
 // for graphs.
 class TimeScaleDropdown extends React.Component<TimeScaleDropdownProps, {}> {
   changeSettings = (newTimescaleKey: DropdownOption) => {
     const newSettings = timewindow.availableTimeScales[newTimescaleKey.value];
+    newSettings.windowEnd = null;
     if (newSettings) {
-      this.props.setTimeScale(newSettings);
+      this.setQueryParamsByDates(newSettings.windowSize, moment());
+      this.props.setTimeScale({ ...newSettings, key: newTimescaleKey.value });
     }
   }
 
   arrowClick = (direction: ArrowDirection) => {
-    let selected = _.clone(this.props.currentScale);
+    const { currentWindow, currentScale } = this.props;
+    const windowSize: any = moment.duration(moment(currentWindow.end).diff(currentWindow.start));
+    const seconds = windowSize.asSeconds();
+    let selected = {};
+    let key = currentScale.key;
+    let windowEnd = currentWindow.end || moment.utc();
 
     switch (direction) {
       case ArrowDirection.RIGHT:
-        if (selected.windowEnd) {
-          selected.windowEnd.add(selected.windowSize);
+        if (windowEnd) {
+          windowEnd = windowEnd.add(seconds, "seconds");
         }
         break;
       case ArrowDirection.LEFT:
-        selected.windowEnd = selected.windowEnd || moment();
-        selected.windowEnd.subtract(selected.windowSize);
+        windowEnd = windowEnd.subtract(seconds, "seconds");
+        break;
+      case ArrowDirection.CENTER:
+        windowEnd = moment.utc();
         break;
       default:
         console.error("Unknown direction: ", direction);
     }
-
     // If the timescale extends into the future then fallback to a default
     // timescale. Otherwise set the key to "Custom" so it appears correctly.
-    if (!selected.windowEnd || selected.windowEnd > moment().subtract(selected.windowValid)) {
-      selected = _.find(timewindow.availableTimeScales, { windowSize: selected.windowSize });
+    if (!windowEnd || windowEnd > moment().subtract(currentScale.windowValid)) {
+      const size = { windowSize: { _data: windowSize._data } } ;
+      if (_.find(timewindow.availableTimeScales, size as any)) {
+        const data = {
+          ..._.find(timewindow.availableTimeScales, size as any),
+          key: _.findKey(timewindow.availableTimeScales, size as any),
+        };
+        selected = data;
+      } else {
+        key = "Custom";
+      }
     } else {
-      selected.key = "Custom";
+      key = "Custom";
     }
 
-    this.props.setTimeScale(selected);
+    this.setQueryParamsByDates(windowSize, windowEnd);
+    this.props.setTimeScale({ ...currentScale, windowEnd, windowSize, key, ...selected });
   }
 
   getTimescaleOptions = () => {
+    const { currentWindow } = this.props;
     const timescaleOptions = _.map(timewindow.availableTimeScales, (_ts, k) => {
-      return { value: k, label: "Last " + k };
+      return { value: k, label: k, timeLabel: getTimeLabel(null, _ts.windowSize) };
     });
 
     // This just ensures that if the key is "Custom" it will show up in the
     // dropdown options. If a custom value isn't currently selected, "Custom"
     // won't show up in the list of options.
-    if (!_.has(timewindow.availableTimeScales, this.props.currentScale.key)) {
-      timescaleOptions.push({
-        value: this.props.currentScale.key,
-        label: this.props.currentScale.key,
-      });
-    }
+    timescaleOptions.push({
+      value: "Custom",
+      label: "Custom",
+      timeLabel: getTimeLabel(currentWindow),
+    });
     return timescaleOptions;
   }
 
   // Sets the default timescale based on the start time of the oldest node.
-  setDefaultTime(props = this.props) {
+  setDefaultTime(props: TimeScaleDropdownProps = this.props) {
     if (props.nodeStatusesValid && !props.defaultTimescaleSet) {
-      const oldestNode = _.minBy(props.nodeStatuses, (nodeStatus: NodeStatus$Properties) => nodeStatus.started_at);
+      const oldestNode = _.minBy(props.nodeStatuses, (nodeStatus: INodeStatus) => nodeStatus.started_at);
       const clusterStarted = LongToMoment(oldestNode.started_at);
       // TODO (maxlang): This uses the longest uptime, not the oldest
       const clusterDurationHrs = moment.utc().diff(clusterStarted, "hours");
       if (clusterDurationHrs > 1) {
         if (clusterDurationHrs < 6) {
-          props.setTimeScale(props.availableScales["1 hour"]);
+          props.setTimeScale(props.availableScales["Past 1 Hour"]);
         } else if (clusterDurationHrs < 12) {
-          props.setTimeScale(props.availableScales["6 hours"]);
+          props.setTimeScale(props.availableScales["Past 6 Hours"]);
         }
       }
       props.setDefaultSet(true);
@@ -148,55 +166,175 @@ class TimeScaleDropdown extends React.Component<TimeScaleDropdownProps, {}> {
     this.setDefaultTime();
   }
 
+  componentDidMount() {
+    this.getQueryParams();
+  }
+
+  getQueryParams = () => {
+    const { location } = this.props;
+    const queryStart = queryByName(location, "start");
+    const queryEnd = queryByName(location, "end");
+    const start = queryStart && moment.unix(Number(queryStart)).utc();
+    const end = queryEnd && moment.unix(Number(queryEnd)).utc();
+
+    this.setDatesByQueryParams({ start, end });
+  }
+
+  setQueryParams = (date: moment.Moment, type: DateTypes) => {
+    const { location, history } = this.props;
+    const dataType = type === DateTypes.DATE_FROM ? "start" : "end";
+    const timestamp = moment(date).format("X");
+    const query = queryToObj(location, dataType, timestamp);
+    history.push({
+      pathname: location.pathname,
+      search: `?${queryToString(query)}`,
+    });
+  }
+
   componentWillReceiveProps(props: TimeScaleDropdownProps) {
     if (!props.nodeStatusesValid) {
       this.props.refreshNodes();
-    } else {
+    } else if (!props.useTimeRange) {
       this.setDefaultTime(props);
     }
   }
 
-  render() {
-    const currentScale = this.props.currentScale;
-    let timeRange: React.ReactNode = "";
-    const disabledArrows = [];
+  setQueryParamsByDates = (duration: moment.Duration, dateEnd: moment.Moment) => {
+    const { location, history } = this.props;
+    const { pathname, search } = location;
+    const urlParams = new URLSearchParams(search);
+    const seconds = duration.clone().asSeconds();
+    const end = dateEnd.clone();
+    const start =  moment.utc(end.subtract(seconds, "seconds")).format("X");
 
-    // If the time scale doesn't end at the present, display the time range.
-    if (currentScale.windowEnd) {
-      const start = currentScale.windowEnd.clone().subtract(currentScale.windowSize);
-      timeRange = <TimeRange start={start} end={currentScale.windowEnd} />;
-    } else {
-      // If the time scale does end at the present hide the right arrow.
-      disabledArrows.push(ArrowDirection.RIGHT);
+    urlParams.set("start", start);
+    urlParams.set("end", moment.utc(dateEnd).format("X"));
+
+    history.push({
+      pathname,
+      search: urlParams.toString(),
+    });
+  }
+
+  setDatesByQueryParams = (dates?: timewindow.TimeWindow) => {
+    const currentWindow = _.clone(this.props.currentWindow);
+    const end = dates.end || currentWindow.end;
+    const start = dates.start || currentWindow.start;
+    const seconds = moment.duration(moment(end).diff(start)).asSeconds();
+    const timeScale = timewindow.findClosestTimeScale(seconds);
+    const now = moment();
+    if (moment.duration(now.diff(end)).asMinutes() > timeScale.sampleSize.asMinutes()) {
+      timeScale.key = "Custom";
+    }
+    timeScale.windowEnd = null;
+    this.props.setTimeRange({ end, start });
+    this.props.setTimeScale(timeScale);
+  }
+
+  setDate = (date: moment.Moment, type: DateTypes) => {
+    const currentWindow = _.clone(this.props.currentWindow);
+    const selected = _.clone(this.props.currentScale);
+    const end  = currentWindow.end || moment().utc().set({hours: 23, minutes: 59, seconds: 0});
+    const start = currentWindow.start || moment().utc().set({hours: 0, minutes: 0, seconds: 0});
+    switch (type) {
+      case DateTypes.DATE_FROM:
+        this.setQueryParams(date, DateTypes.DATE_FROM);
+        currentWindow.start = date;
+        currentWindow.end = end;
+        break;
+      case DateTypes.DATE_TO:
+        this.setQueryParams(date, DateTypes.DATE_TO);
+        currentWindow.start = start;
+        currentWindow.end = date;
+        break;
+      default:
+        console.error("Unknown type: ", type);
     }
 
-    return <div>
-      <Dropdown
-        title=""
-        options={this.getTimescaleOptions()}
-        selected={currentScale.key}
-        onChange={this.changeSettings}
-        onArrowClick={this.arrowClick}
-        disabledArrows={disabledArrows}
+    selected.key = "Custom";
+    this.props.setTimeScale(selected);
+    this.props.setTimeRange(currentWindow);
+  }
+
+  getTimeRangeTitle = () => {
+    const { currentWindow, currentScale } = this.props;
+    const dateFormat = "MMM DD,";
+    const timeFormat = "h:mmA";
+    const isSameStartDay = moment(currentWindow.start).isSame(moment(), "day");
+    const isSameEndDay = moment(currentWindow.end).isSame(moment(), "day");
+    if (currentScale.key === "Custom") {
+      return {
+        dateStart: isSameStartDay ? "" : moment.utc(currentWindow.start).format(dateFormat),
+        dateEnd: isSameEndDay ? "" : moment.utc(currentWindow.end).format(dateFormat),
+        timeStart: moment.utc(currentWindow.start).format(timeFormat),
+        timeEnd: moment.utc(currentWindow.end).format(timeFormat),
+        title: "Custom",
+      };
+    } else {
+      return {
+        title: currentScale.key,
+      };
+    }
+  }
+
+  generateDisabledArrows = () => {
+    const { currentWindow } = this.props;
+    const differenceEndToNow = moment.duration(moment().diff(currentWindow.end)).asMinutes();
+    const differenceEndToStart = moment.duration(moment(currentWindow.end).diff(currentWindow.start)).asMinutes();
+    const disabledArrows = [];
+    if (differenceEndToNow < differenceEndToStart) {
+      if (differenceEndToNow < 10) {
+        disabledArrows.push(ArrowDirection.CENTER);
+      }
+      disabledArrows.push(ArrowDirection.RIGHT);
+    }
+    return disabledArrows;
+  }
+
+  render() {
+    const { useTimeRange, currentScale, currentWindow } = this.props;
+    return (
+      <div className="timescale">
+        <Divider type="vertical" />
+        <Dropdown
+          title={getTimeLabel(currentWindow)}
+          options={[]}
+          selected={currentScale.key}
+          onChange={this.changeSettings}
+          isTimeRange
+          content={
+            <RangeSelect
+              value={currentWindow}
+              useTimeRange={useTimeRange}
+              selected={this.getTimeRangeTitle()}
+              onChange={this.changeSettings}
+              changeDate={this.setDate}
+              options={this.getTimescaleOptions()}
+            />
+          }
         />
-      <span>{timeRange}</span>
-    </div>;
+        <TimeFrameControls disabledArrows={this.generateDisabledArrows()} onArrowClick={this.arrowClick} />
+      </div>
+    );
   }
 }
 
-export default connect(
+export default withRouter(connect(
   (state: AdminUIState) => {
     return {
       nodeStatusesValid: state.cachedData.nodes.valid,
       nodeStatuses: state.cachedData.nodes.data,
       currentScale: (state.timewindow as timewindow.TimeWindowState).scale,
+      currentWindow: (state.timewindow as timewindow.TimeWindowState).currentWindow,
       availableScales: timewindow.availableTimeScales,
+      useTimeRange: state.timewindow.useTimeRage,
       defaultTimescaleSet: timescaleDefaultSet.selector(state),
     };
   },
   {
     setTimeScale: timewindow.setTimeScale,
+    setTimeRange: timewindow.setTimeRange,
     refreshNodes: refreshNodes,
     setDefaultSet: timescaleDefaultSet.set,
   },
-)(TimeScaleDropdown);
+)(TimeScaleDropdown));

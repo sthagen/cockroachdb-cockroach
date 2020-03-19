@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -19,390 +15,937 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
-	"github.com/pkg/errors"
-
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
-// This file contains utils and interfaces used by a ConnExecutor to communicate
-// with a SQL client. There's stmtBuf used for input and clientComm used for
+// This file contains utils and interfaces used by a connExecutor to communicate
+// with a SQL client. There's StmtBuf used for input and ClientComm used for
 // output.
 
-// queryStrPos represents the index of a query string relative to the start of a
-// ConnExecutor. The first query string received on a connection has
-// queryStrPos = 0.
-type queryStrPos int64
+// CmdPos represents the index of a command relative to the start of a
+// connection. The first command received on a connection has position 0.
+type CmdPos int64
 
-// stmtIdx represents the index of a statement within the query string that it's
-// part of.
-type stmtIdx int
+// TransactionStatusIndicator represents a pg identifier for the transaction state.
+type TransactionStatusIndicator byte
 
-// cursorPosition represents a position of a cursor iterating over statements in
-// a stmtBuf.
-type cursorPosition struct {
-	// queryStrPos indicates the current query string (a.k.a. batch of statements
-	// received from the client as a unit). The position is relative to the start
-	// of the connection, even though the stmtBuf may not contain query strings
-	// from the beginning of the connection (old query strings are cleared).
-	queryStrPos queryStrPos
-	// stmtIdx indicates the index of a query within a query string.
-	stmtIdx stmtIdx
-}
+const (
+	// IdleTxnBlock means the session is outside of a transaction.
+	IdleTxnBlock TransactionStatusIndicator = 'I'
+	// InTxnBlock means the session is inside a transaction.
+	InTxnBlock TransactionStatusIndicator = 'T'
+	// InFailedTxnBlock means the session is inside a transaction, but the
+	// transaction is in the Aborted state.
+	InFailedTxnBlock TransactionStatusIndicator = 'E'
+)
 
-func (c cursorPosition) String() string {
-	return fmt.Sprintf("%d:%d", c.queryStrPos, c.stmtIdx)
-}
-
-// compare return -1 if c < other, 0 if c == other, 1 if c > other.
-func (c cursorPosition) compare(other cursorPosition) int {
-	if c.queryStrPos < other.queryStrPos ||
-		(c.queryStrPos == other.queryStrPos && c.stmtIdx < other.stmtIdx) {
-		return -1
-	}
-	if c.queryStrPos == other.queryStrPos && c.stmtIdx == other.stmtIdx {
-		return 0
-	}
-	return 1
-}
-
-// stmtBuf represents a list of query strings (batches of SQL statements sent as
-// a unit by a client) that a SQL client has sent for execution. The buffer
-// is supposed to be used by one reader and one writer. The writer adds
-// statements to the buffer using push(). The reader reads one statement at a
-// time using curStmt(). The buffer internally maintains a cursor representing
-// the reader's position. The reader has to manually move the cursor using
-// advanceOne(), seekToNextQueryStr() and rewind().
+// StmtBuf maintains a list of commands that a SQL client has sent for execution
+// over a network connection. The commands are SQL queries to be executed,
+// statements to be prepared, etc. At any point in time the buffer contains
+// outstanding commands that have yet to be executed, and it can also contain
+// some history of commands that we might want to retry - in the case of a
+// retriable error, we'd like to retry all the commands pertaining to the
+// current SQL transaction.
 //
+// The buffer is supposed to be used by one reader and one writer. The writer
+// adds commands to the buffer using Push(). The reader reads one command at a
+// time using CurCmd(). The consumer is then supposed to create command results
+// (the buffer is not involved in this).
+// The buffer internally maintains a cursor representing the reader's position.
+// The reader has to manually move the cursor using AdvanceOne(),
+// seekToNextBatch() and rewind().
 // In practice, the writer is a module responsible for communicating with a SQL
-// client (i.e.  pgwire) and the reader is a ConnExecutor.
+// client (i.e. pgwire.conn) and the reader is a connExecutor.
 //
-// push() can be called concurrently with curStmt().
+// The StmtBuf supports grouping commands into "batches" delimited by sync
+// commands. A reader can then at any time chose to skip over commands from the
+// current batch. This is used to implement Postgres error semantics: when an
+// error happens during processing of a command, some future commands might need
+// to be skipped. Batches correspond either to multiple queries received in a
+// single query string (when the SQL client sends a semicolon-separated list of
+// queries as part of the "simple" protocol), or to different commands pipelined
+// by the cliend, separated from "sync" messages.
 //
-// The ConnExecutor will use the buffer to maintain a window around the
-// statement it is currently executing. It will maintain enough history for
-// executing statements again in case of an automatic retry. The ConnExecutor is
-// in charge of trimming completed statements from the buffer when it's done
-// with them.
-type stmtBuf struct {
+// push() can be called concurrently with CurCmd().
+//
+// The connExecutor will use the buffer to maintain a window around the
+// command it is currently executing. It will maintain enough history for
+// executing commands again in case of an automatic retry. The connExecutor is
+// in charge of trimming completed commands from the buffer when it's done with
+// them.
+type StmtBuf struct {
 	mu struct {
 		syncutil.Mutex
 
 		// closed, if set, means that the writer has closed the buffer. See Close().
 		closed bool
 
-		// cond is signaled when new statements are pushed.
+		// cond is signaled when new commands are pushed.
 		cond *sync.Cond
 
-		queryStrings []tree.StatementList
-		// startPos indicates the index of queryStrings[0] relative to the start of
-		// the connection.
-		startPos queryStrPos
-		// curPos is the current position of the cursor going through the statements.
-		// At any time, curPos indicates the position of the statement to be returned
-		// by curStmt().
-		curPos cursorPosition
+		// data contains the elements of the buffer.
+		data ring.Buffer // []Command
+
+		// startPos indicates the index of the first command currently in data
+		// relative to the start of the connection.
+		startPos CmdPos
+		// curPos is the current position of the cursor going through the commands.
+		// At any time, curPos indicates the position of the command to be returned
+		// by CurCmd().
+		curPos CmdPos
+		// lastPos indicates the position of the last command that was pushed into
+		// the buffer.
+		lastPos CmdPos
 	}
 }
 
-// newStmtBuf creates a stmtBuf.
-func newStmtBuf() *stmtBuf {
-	var buf stmtBuf
-	buf.mu.cond = sync.NewCond(&buf.mu.Mutex)
+// Command is an interface implemented by all commands pushed by pgwire into the
+// buffer.
+type Command interface {
+	fmt.Stringer
+	// command returns a string representation of the command type (e.g.
+	// "prepare stmt", "exec stmt").
+	command() string
+}
+
+// ExecStmt is the command for running a query sent through the "simple" pgwire
+// protocol.
+type ExecStmt struct {
+	// Information returned from parsing: AST, SQL, NumPlaceholders.
+	// Note that AST can be nil, in which case executing it should produce an
+	// "empty query response" message.
+	parser.Statement
+
+	// TimeReceived is the time at which the exec message was received
+	// from the client. Used to compute the service latency.
+	TimeReceived time.Time
+	// ParseStart/ParseEnd are the timing info for parsing of the query. Used for
+	// stats reporting.
+	ParseStart time.Time
+	ParseEnd   time.Time
+}
+
+// command implements the Command interface.
+func (ExecStmt) command() string { return "exec stmt" }
+
+func (e ExecStmt) String() string {
+	// We have the original SQL, but we still use String() because it obfuscates
+	// passwords.
+	s := "(empty)"
+	// e.AST could be nil in the case of a completely empty query.
+	if e.AST != nil {
+		s = e.AST.String()
+	}
+	return fmt.Sprintf("ExecStmt: %s", s)
+}
+
+var _ Command = ExecStmt{}
+
+// ExecPortal is the Command for executing a portal.
+type ExecPortal struct {
+	Name string
+	// limit is a feature of pgwire that we don't really support. We accept it and
+	// don't complain as long as the statement produces fewer results than this.
+	Limit int
+	// TimeReceived is the time at which the exec message was received
+	// from the client. Used to compute the service latency.
+	TimeReceived time.Time
+}
+
+// command implements the Command interface.
+func (ExecPortal) command() string { return "exec portal" }
+
+func (e ExecPortal) String() string {
+	return fmt.Sprintf("ExecPortal name: %q", e.Name)
+}
+
+var _ Command = ExecPortal{}
+
+// PrepareStmt is the command for creating a prepared statement.
+type PrepareStmt struct {
+	// Name of the prepared statement (optional).
+	Name string
+
+	// Information returned from parsing: AST, SQL, NumPlaceholders.
+	// Note that AST can be nil, in which case executing it should produce an
+	// "empty query response" message.
+	parser.Statement
+
+	TypeHints tree.PlaceholderTypes
+	// RawTypeHints is the representation of type hints exactly as specified by
+	// the client.
+	RawTypeHints []oid.Oid
+	ParseStart   time.Time
+	ParseEnd     time.Time
+}
+
+// command implements the Command interface.
+func (PrepareStmt) command() string { return "prepare stmt" }
+
+func (p PrepareStmt) String() string {
+	// We have the original SQL, but we still use String() because it obfuscates
+	// passwords.
+	s := "(empty)"
+	// p.AST could be nil in the case of a completely empty query.
+	if p.AST != nil {
+		s = p.AST.String()
+	}
+	return fmt.Sprintf("PrepareStmt: %s", s)
+}
+
+var _ Command = PrepareStmt{}
+
+// DescribeStmt is the Command for producing info about a prepared statement or
+// portal.
+type DescribeStmt struct {
+	Name string
+	Type pgwirebase.PrepareType
+}
+
+// command implements the Command interface.
+func (DescribeStmt) command() string { return "describe stmt" }
+
+func (d DescribeStmt) String() string {
+	return fmt.Sprintf("Describe: %q", d.Name)
+}
+
+var _ Command = DescribeStmt{}
+
+// BindStmt is the Command for creating a portal from a prepared statement.
+type BindStmt struct {
+	PreparedStatementName string
+	PortalName            string
+	// OutFormats contains the requested formats for the output columns.
+	// It either contains a bunch of format codes, in which case the number will
+	// need to match the number of output columns of the portal, or contains a single
+	// code, in which case that code will be applied to all columns.
+	OutFormats []pgwirebase.FormatCode
+	// Args are the arguments for the prepared statement.
+	// They are passed in without decoding because decoding requires type
+	// inference to have been performed.
+	//
+	// A nil element means a tree.DNull argument.
+	Args [][]byte
+	// ArgFormatCodes are the codes to be used to deserialize the Args.
+	// It either contains a bunch of format codes, in which case the number will
+	// need to match the number of arguments for the portal, or contains a single
+	// code, in which case that code will be applied to all arguments.
+	ArgFormatCodes []pgwirebase.FormatCode
+
+	// internalArgs, if not nil, represents the arguments for the prepared
+	// statements as produced by the internal clients. These don't need to go
+	// through encoding/decoding of the args. However, the types of the datums
+	// must correspond exactly to the inferred types (but note that the types of
+	// the datums are passes as type hints to the PrepareStmt command, so the
+	// inferred types should reflect that).
+	// If internalArgs is specified, Args and ArgFormatCodes are ignored.
+	internalArgs []tree.Datum
+}
+
+// command implements the Command interface.
+func (BindStmt) command() string { return "bind stmt" }
+
+func (b BindStmt) String() string {
+	return fmt.Sprintf("BindStmt: %q->%q", b.PreparedStatementName, b.PortalName)
+}
+
+var _ Command = BindStmt{}
+
+// DeletePreparedStmt is the Command for freeing a prepared statement.
+type DeletePreparedStmt struct {
+	Name string
+	Type pgwirebase.PrepareType
+}
+
+// command implements the Command interface.
+func (DeletePreparedStmt) command() string { return "delete stmt" }
+
+func (d DeletePreparedStmt) String() string {
+	return fmt.Sprintf("DeletePreparedStmt: %q", d.Name)
+}
+
+var _ Command = DeletePreparedStmt{}
+
+// Sync is a command that serves two purposes:
+// 1) It marks the end of one batch of commands and the beginning of the next.
+// stmtBuf.seekToNextBatch will seek to this marker.
+// 2) It generates a ReadyForQuery protocol message.
+//
+// A Sync command is generated for both the simple and the extended pgwire
+// protocol variants. So, it doesn't strictly correspond to a pgwire sync
+// message - those are not sent in the simple protocol. We synthesize Sync
+// commands though because their handling matches the simple protocol too.
+type Sync struct{}
+
+// command implements the Command interface.
+func (Sync) command() string { return "sync" }
+
+func (Sync) String() string {
+	return "Sync"
+}
+
+var _ Command = Sync{}
+
+// Flush is a Command asking for the results of all previous commands to be
+// delivered to the client.
+type Flush struct{}
+
+// command implements the Command interface.
+func (Flush) command() string { return "flush" }
+
+func (Flush) String() string {
+	return "Flush"
+}
+
+var _ Command = Flush{}
+
+// CopyIn is the command for execution of the Copy-in pgwire subprotocol.
+type CopyIn struct {
+	Stmt *tree.CopyFrom
+	// Conn is the network connection. Execution of the CopyFrom statement takes
+	// control of the connection.
+	Conn pgwirebase.Conn
+	// CopyDone is decremented once execution finishes, signaling that control of
+	// the connection is being handed back to the network routine.
+	CopyDone *sync.WaitGroup
+}
+
+// command implements the Command interface.
+func (CopyIn) command() string { return "copy" }
+
+func (CopyIn) String() string {
+	return "CopyIn"
+}
+
+var _ Command = CopyIn{}
+
+// DrainRequest represents a notice that the server is draining and command
+// processing should stop soon.
+//
+// DrainRequest commands don't produce results.
+type DrainRequest struct{}
+
+// command implements the Command interface.
+func (DrainRequest) command() string { return "drain" }
+
+func (DrainRequest) String() string {
+	return "Drain"
+}
+
+var _ Command = DrainRequest{}
+
+// SendError is a command that, upon execution, send a specific error to the
+// client. This is used by pgwire to schedule errors to be sent at an
+// appropriate time.
+type SendError struct {
+	// Err is a *pgerror.Error.
+	Err error
+}
+
+// command implements the Command interface.
+func (SendError) command() string { return "send error" }
+
+func (s SendError) String() string {
+	return fmt.Sprintf("SendError: %s", s.Err)
+}
+
+var _ Command = SendError{}
+
+// NewStmtBuf creates a StmtBuf.
+func NewStmtBuf() *StmtBuf {
+	var buf StmtBuf
+	buf.Init()
 	return &buf
 }
 
+// Init initializes a StmtBuf. It exists to avoid the allocation imposed by
+// NewStmtBuf.
+func (buf *StmtBuf) Init() {
+	buf.mu.lastPos = -1
+	buf.mu.cond = sync.NewCond(&buf.mu.Mutex)
+}
+
 // Close marks the buffer as closed. Once Close() is called, no further push()es
-// are allowed. If a reader is blocked on a curStmt() call, it is unblocked with
-// io.EOF. Any further curStmt() call also returns io.EOF (even if some
-// statements were already available in the buffer before the Close()).
-func (buf *stmtBuf) Close() {
+// are allowed. If a reader is blocked on a CurCmd() call, it is unblocked with
+// io.EOF. Any further CurCmd() call also returns io.EOF (even if some
+// commands were already available in the buffer before the Close()).
+//
+// Close() is idempotent.
+func (buf *StmtBuf) Close() {
 	buf.mu.Lock()
 	buf.mu.closed = true
 	buf.mu.cond.Signal()
 	buf.mu.Unlock()
 }
 
-// push adds a query string to the end of the buffer. If a curStmt() call was
-// blocked waiting for this query string to arrive, it will be woken up.
-func (buf *stmtBuf) push(ctx context.Context, stmts tree.StatementList) {
+// Push adds a Command to the end of the buffer. If a CurCmd() call was blocked
+// waiting for this command to arrive, it will be woken up.
+//
+// An error is returned if the buffer has been closed.
+func (buf *StmtBuf) Push(ctx context.Context, cmd Command) error {
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
 	if buf.mu.closed {
-		log.Fatal(ctx, "cannot push after Close()")
+		return errors.AssertionFailedf("buffer is closed")
 	}
-	buf.mu.queryStrings = append(buf.mu.queryStrings, stmts)
+	buf.mu.data.AddLast(cmd)
+	buf.mu.lastPos++
+
 	buf.mu.cond.Signal()
+	return nil
 }
 
-// curStmt returns the statement currently indicated by the cursor. Besides
-// the statement itself, the statement's position is also returned; the position
-// can be used to later rewind() to this statement.
-// If the cursor is positioned at the beginning of the (next) query string and
-// that query string hasn't arrived yet, this blocks until the query string is
-// pushed to the buffer.
+// CurCmd returns the Command currently indicated by the cursor. Besides the
+// Command itself, the command's position is also returned; the position can be
+// used to later rewind() to this Command.
+//
+// If the cursor is positioned over an empty slot, the call blocks until the
+// next Command is pushed into the buffer.
 //
 // If the buffer has previously been Close()d, or is closed while this is
 // blocked, io.EOF is returned.
-func (buf *stmtBuf) curStmt(ctx context.Context) (tree.Statement, cursorPosition, error) {
+func (buf *StmtBuf) CurCmd() (Command, CmdPos, error) {
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
 	for {
 		if buf.mu.closed {
-			return nil, cursorPosition{}, io.EOF
+			return nil, 0, io.EOF
 		}
 		curPos := buf.mu.curPos
-		qsIdx, err := buf.translateQueryStrPosLocked(curPos.queryStrPos)
+		cmdIdx, err := buf.translatePosLocked(curPos)
 		if err != nil {
-			return nil, cursorPosition{}, err
+			return nil, 0, err
 		}
-		if qsIdx < len(buf.mu.queryStrings) {
-			qs := buf.mu.queryStrings[qsIdx]
-			if int(curPos.stmtIdx) >= len(qs) {
-				log.Fatalf(ctx, "corrupt cursor: %s", curPos)
-			}
-			return buf.mu.queryStrings[qsIdx][curPos.stmtIdx], curPos, nil
+		len := buf.mu.data.Len()
+		if cmdIdx < len {
+			return buf.mu.data.Get(cmdIdx).(Command), curPos, nil
 		}
-		if (qsIdx != len(buf.mu.queryStrings)) || (curPos.stmtIdx != 0) {
-			return nil, cursorPosition{}, errors.Errorf(
-				"can only wait for next query string; corrupt cursor: %s", curPos)
+		if cmdIdx != len {
+			return nil, 0, errors.AssertionFailedf(
+				"can only wait for next command; corrupt cursor: %d", errors.Safe(curPos))
 		}
-		// Wait for the next statement to arrive to the buffer.
+		// Wait for the next Command to arrive to the buffer.
 		buf.mu.cond.Wait()
 	}
 }
 
-// translateQueryStrPosLocked translates an absolute position of a query string
-// (counting from the connection start) to the index of the respective query
-// string among the query strings currently buffered in buf (so, it returns an
-// index relative to the start of the buffer).
+// translatePosLocked translates an absolute position of a command (counting
+// from the connection start) to the index of the respective command in the
+// buffer (so, it returns an index relative to the start of the buffer).
 //
 // Attempting to translate a position that's below buf.startPos returns an
 // error.
-func (buf *stmtBuf) translateQueryStrPosLocked(pos queryStrPos) (int, error) {
+func (buf *StmtBuf) translatePosLocked(pos CmdPos) (int, error) {
 	if pos < buf.mu.startPos {
-		return 0, errors.Errorf(
+		return 0, errors.AssertionFailedf(
 			"position %d no longer in buffer (buffer starting at %d)",
-			pos, buf.mu.startPos)
+			errors.Safe(pos), errors.Safe(buf.mu.startPos))
 	}
 	return int(pos - buf.mu.startPos), nil
 }
 
-// ltrim iterates over the buffer forward and removes all query strings up to
-// (not including) the query string indicated by pos.
-// Nothing is done for statements in pos' query string (even if pos is higher
-// than some statements).
+// ltrim iterates over the buffer forward and removes all commands up to
+// (not including) the command at pos.
 //
 // It's illegal to ltrim to a position higher than the current cursor.
-func (buf *stmtBuf) ltrim(ctx context.Context, pos cursorPosition) {
+func (buf *StmtBuf) ltrim(ctx context.Context, pos CmdPos) {
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
-	if pos.queryStrPos < buf.mu.startPos {
-		log.Fatalf(ctx, "invalid ltrim query string position: %s. buf starting at: %d",
+	if pos < buf.mu.startPos {
+		log.Fatalf(ctx, "invalid ltrim position: %d. buf starting at: %d",
 			pos, buf.mu.startPos)
 	}
-	if buf.mu.curPos.compare(pos) < 0 {
-		log.Fatalf(ctx, "invalid ltrim position: %s when cursor is: %s",
+	if buf.mu.curPos < pos {
+		log.Fatalf(ctx, "invalid ltrim position: %d when cursor is: %d",
 			pos, buf.mu.curPos)
 	}
-	// Remove query strings one by one.
+	// Remove commands one by one.
 	for {
-		if (len(buf.mu.queryStrings) == 0) || (buf.mu.startPos == pos.queryStrPos) {
+		if buf.mu.startPos == pos {
 			break
 		}
-		buf.mu.queryStrings = buf.mu.queryStrings[1:]
+		buf.mu.data.RemoveFirst()
 		buf.mu.startPos++
 	}
 }
 
-// advanceOne advances the cursor one statement over. The statement over which
-// the cursor will be positioned when this returns may not be in the
-// buffer yet.
-func (buf *stmtBuf) advanceOne(ctx context.Context) {
+// AdvanceOne advances the cursor one Command over. The command over which
+// the cursor will be positioned when this returns may not be in the buffer
+// yet. The previous CmdPos is returned.
+func (buf *StmtBuf) AdvanceOne() CmdPos {
 	buf.mu.Lock()
-	defer buf.mu.Unlock()
-	curBatchIdx, err := buf.translateQueryStrPosLocked(buf.mu.curPos.queryStrPos)
-	if err != nil {
-		log.Fatal(ctx, err)
-	}
-	if int(buf.mu.curPos.stmtIdx) == len(buf.mu.queryStrings[curBatchIdx])-1 {
-		// We were positioned on the last statement in a query string. Time to
-		// advance to the next query string.
-		buf.mu.curPos.queryStrPos++
-		buf.mu.curPos.stmtIdx = 0
-	} else {
-		buf.mu.curPos.stmtIdx++
-	}
-}
-
-// seekToNextQueryStr moves the cursor position to the start of the next query
-// string, skipping past any statements left in the current query string (if
-// any).
-// The statement over which the cursor will be positioned when this returns may
-// not be in the buffer yet.
-func (buf *stmtBuf) seekToNextQueryStr() {
-	buf.mu.Lock()
-	buf.mu.curPos.stmtIdx = 0
-	buf.mu.curPos.queryStrPos++
+	prev := buf.mu.curPos
+	buf.mu.curPos++
 	buf.mu.Unlock()
+	return prev
 }
 
-// rewind resets the buffer's position to pos.
-func (buf *stmtBuf) rewind(ctx context.Context, pos cursorPosition) {
+// seekToNextBatch moves the cursor position to the start of the next batch of
+// commands, skipping past remaining commands from the current batch (if any).
+// Batches are delimited by Sync commands. Sync is considered to be the first
+// command in a batch, so once this returns, the cursor will be positioned over
+// a Sync command. If the cursor is positioned on a Sync when this is called,
+// that Sync will be skipped.
+//
+// This method blocks until a Sync command is pushed to the buffer.
+//
+// It is an error to start seeking when the cursor is positioned on an empty
+// slot.
+func (buf *StmtBuf) seekToNextBatch() error {
+	buf.mu.Lock()
+	curPos := buf.mu.curPos
+	cmdIdx, err := buf.translatePosLocked(curPos)
+	if err != nil {
+		buf.mu.Unlock()
+		return err
+	}
+	if cmdIdx == buf.mu.data.Len() {
+		buf.mu.Unlock()
+		return errors.AssertionFailedf("invalid seek start point")
+	}
+	buf.mu.Unlock()
+
+	var foundSync bool
+	for !foundSync {
+		buf.AdvanceOne()
+		_, pos, err := buf.CurCmd()
+		if err != nil {
+			return err
+		}
+		buf.mu.Lock()
+		cmdIdx, err := buf.translatePosLocked(pos)
+		if err != nil {
+			buf.mu.Unlock()
+			return err
+		}
+
+		if _, ok := buf.mu.data.Get(cmdIdx).(Sync); ok {
+			foundSync = true
+		}
+
+		buf.mu.Unlock()
+	}
+	return nil
+}
+
+// Rewind resets the buffer's position to pos.
+func (buf *StmtBuf) Rewind(ctx context.Context, pos CmdPos) {
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
-	if pos.queryStrPos < buf.mu.startPos {
+	if pos < buf.mu.startPos {
 		log.Fatalf(ctx, "attempting to rewind below buffer start")
 	}
 	buf.mu.curPos = pos
 }
 
-// clientComm is the interface used by the ConnExecutor for creating results to
+// RowDescOpt specifies whether a result needs a row description message.
+type RowDescOpt bool
+
+const (
+	// NeedRowDesc specifies that a row description message is needed.
+	NeedRowDesc RowDescOpt = false
+	// DontNeedRowDesc specifies that a row description message is not needed.
+	DontNeedRowDesc RowDescOpt = true
+)
+
+// ClientComm is the interface used by the connExecutor for creating results to
 // be communicated to client and for exerting some control over this
 // communication.
 //
-// clientComm is implemented by the pgwire connection.
-type clientComm interface {
-	// createStatementResult creates a StatementResult for stmt. pos is the stmt's
-	// position within the connection and is used to enforce that results are
-	// created in order and also to discard results through clientLock.rtrim(pos).
-	createStatementResult(stmt tree.Statement, pos cursorPosition) StatementResult
+// ClientComm is implemented by the pgwire connection.
+type ClientComm interface {
+	// createStatementResult creates a StatementResult for stmt.
+	//
+	// descOpt specifies if result needs to inform the client about row schema. If
+	// it doesn't, a SetColumns call becomes a no-op.
+	//
+	// pos is the stmt's position within the connection and is used to enforce
+	// that results are created in order and also to discard results through
+	// ClientLock.rtrim(pos).
+	//
+	// formatCodes describe how each column in the result rows is to be encoded.
+	// It should be nil if statement type != Rows. Otherwise, it can be nil, in
+	// which case every column will be encoded using the text encoding, otherwise
+	// it needs to contain a value for every column.
+	CreateStatementResult(
+		stmt tree.Statement,
+		descOpt RowDescOpt,
+		pos CmdPos,
+		formatCodes []pgwirebase.FormatCode,
+		conv sessiondata.DataConversionConfig,
+		limit int,
+		portalName string,
+		implicitTxn bool,
+	) CommandResult
+	// CreatePrepareResult creates a result for a PrepareStmt command.
+	CreatePrepareResult(pos CmdPos) ParseResult
+	// CreateDescribeResult creates a result for a DescribeStmt command.
+	CreateDescribeResult(pos CmdPos) DescribeResult
+	// CreateBindResult creates a result for a BindStmt command.
+	CreateBindResult(pos CmdPos) BindResult
+	// CreateDeleteResult creates a result for a DeletePreparedStmt command.
+	CreateDeleteResult(pos CmdPos) DeleteResult
+	// CreateSyncResult creates a result for a Sync command.
+	CreateSyncResult(pos CmdPos) SyncResult
+	// CreateFlushResult creates a result for a Flush command.
+	CreateFlushResult(pos CmdPos) FlushResult
+	// CreateErrorResult creates a result on which only errors can be communicated
+	// to the client.
+	CreateErrorResult(pos CmdPos) ErrorResult
+	// CreateEmptyQueryResult creates a result for an empty-string query.
+	CreateEmptyQueryResult(pos CmdPos) EmptyQueryResult
+	// CreateCopyInResult creates a result for a Copy-in command.
+	CreateCopyInResult(pos CmdPos) CopyInResult
+	// CreateDrainResult creates a result for a Drain command.
+	CreateDrainResult(pos CmdPos) DrainResult
 
 	// lockCommunication ensures that no further results are delivered to the
-	// client. The returned clientLock can be queried to see what results have
+	// client. The returned ClientLock can be queried to see what results have
 	// been already delivered to the client and to discard results that haven't
 	// been delivered.
 	//
-	// clientLock.Close() needs to be called on the returned lock once
+	// ClientLock.Close() needs to be called on the returned lock once
 	// communication can be unlocked (i.e. results can be delivered to the client
 	// again).
-	lockCommunication() clientLock
+	LockCommunication() ClientLock
 
-	// flush tells the implementation that all the results produced so far can be
-	// delivered to the SQL client. In other words, this is promising that
-	// the corresponding stmtBuf will not be rewind()ed to positions <= the
-	// last position passed to createStatementResult().
-	// flush() is generally called once a transaction ends, as the connExecutor no
-	// longer needs to be able to rewind past the txn's last statement.
-	//
-	// An error is returned if the client connection is broken. In this case, no
-	// further calls can be made on this clientComm. The caller should interrupt
-	// any statements running on the respective connection.
-	//
-	// The connExecutor's expectation is that, after flush() is called, results
-	// that are part of future StatementResult's will be buffered (in the now
-	// empty buffer*) by the implementer until one of the following happens:
-	// - the buffer overflows
-	// - flush() is called again
-	// - the last StatementResult is Close()d and there are no more statements in
-	// 	 stmtBuf at the moment.
-	// If the implementer respects this, then it will be guaranteed that, as long
-	// as a transaction prefix's results fit in said buffer, the connExecutor will
-	// be able to automatically retry the prefix in case of retriable errors so
-	// that the client doesn't need to worry about them. As an important special
-	// case, this means that implicit transactions (i.e. statements executed
-	// outside of a transaction) are always automatically retried as long as their
-	// results fit in the implementer's buffer.
-	//
-	// TODO(andrei): In the future we might want to add a time component to this
-	// policy (or make it user configurable), and restrict the guarantees about
-	// automatic retries to queries that are fast enough.
-	//
-	// (*) The implication is that, if the implementer wishes to deliver the
-	// contents of the buffer to the client concurrently with accepting new
-	// results after the flush() call, it needs to behave as if the buffer's
-	// capacity was just expanded: the size of the buffer's contents at the moment
-	// of the flush() call cannot impact the capacity available for future
-	// results.
-	flush() error
+	// Flush delivers all the previous results to the client. The results might
+	// have been buffered, in which case this flushes the buffer.
+	Flush(pos CmdPos) error
 }
 
-// WIP(andrei)
-var _ clientComm
+// CommandResult represents the result of a statement. It which needs to be
+// ultimately delivered to the client. pgwire.conn implements this.
+type CommandResult interface {
+	RestrictedCommandResult
+	CommandResultClose
+}
 
-// clientLock is an interface returned by clientComm.lockCommunication(). It
+// CommandResultErrBase is the subset of CommandResult dealing with setting a
+// query execution error.
+type CommandResultErrBase interface {
+	// SetError accumulates an execution error that needs to be reported to the
+	// client. No further calls other than SetError(), Close() and Discard() are
+	// allowed.
+	//
+	// Calling SetError() a second time overwrites the previously set error.
+	SetError(error)
+
+	// Err returns the error previously set with SetError(), if any.
+	Err() error
+}
+
+// ResultBase is the common interface implemented by all the different command
+// results.
+type ResultBase interface {
+	CommandResultErrBase
+	CommandResultClose
+}
+
+// CommandResultClose is a subset of CommandResult dealing with the closing of
+// the result.
+type CommandResultClose interface {
+	// Close marks a result as complete. No further uses of the CommandResult are
+	// allowed after this call. All results must be eventually closed through
+	// Close()/Discard(), except in case query processing has encountered an
+	// irrecoverable error and the client connection will be closed; in such
+	// cases it is not mandated that these functions are called on the result
+	// that may have been open at the time the error occurred.
+	// NOTE(andrei): We might want to tighten the contract if the results get any
+	// state that needs to be closed even when the whole connection is about to be
+	// terminated.
+	Close(context.Context, TransactionStatusIndicator)
+
+	// Discard is called to mark the fact that the result is being disposed off.
+	// No completion message will be sent to the client. The expectation is that
+	// either the no other methods on the result had previously been used (and so
+	// no data has been buffered for the client), or there is a communication lock
+	// in effect and the buffer will be rewound - in either case, the client will
+	// never see any bytes pertaining to this result.
+	Discard()
+}
+
+// RestrictedCommandResult is a subset of CommandResult meant to make it clear
+// that its clients don't close the CommandResult.
+type RestrictedCommandResult interface {
+	CommandResultErrBase
+
+	// AppendParamStatusUpdate appends a parameter status update to the result.
+	// This gets flushed only when the CommandResult is closed.
+	AppendParamStatusUpdate(string, string)
+
+	// AppendNotice appends a notice to the result.
+	// This gets flushed only when the CommandResult is closed.
+	AppendNotice(noticeErr error)
+
+	// SetColumns informs the client about the schema of the result. The columns
+	// can be nil.
+	//
+	// This needs to be called (once) before AddRow.
+	SetColumns(context.Context, sqlbase.ResultColumns)
+
+	// ResetStmtType allows a client to change the statement type of the current
+	// result, from the original one set when the result was created trough
+	// ClientComm.createStatementResult.
+	ResetStmtType(stmt tree.Statement)
+
+	// AddRow accumulates a result row.
+	//
+	// The implementation cannot hold on to the row slice; it needs to make a
+	// shallow copy if it needs to.
+	AddRow(ctx context.Context, row tree.Datums) error
+
+	// IncrementRowsAffected increments a counter by n. This is used for all
+	// result types other than tree.Rows.
+	IncrementRowsAffected(n int)
+
+	// RowsAffected returns either the number of times AddRow was called, or the
+	// sum of all n passed into IncrementRowsAffected.
+	RowsAffected() int
+
+	// DisableBuffering can be called during execution to ensure that
+	// the results accumulated so far, and all subsequent rows added
+	// to this CommandResult, will be flushed immediately to the client.
+	// This is currently used for sinkless changefeeds.
+	DisableBuffering()
+}
+
+// DescribeResult represents the result of a Describe command (for either
+// describing a prepared statement or a portal).
+type DescribeResult interface {
+	ResultBase
+
+	// SetInferredTypes tells the client about the inferred placeholder types.
+	SetInferredTypes([]oid.Oid)
+	// SetNoDataDescription is used to tell the client that the prepared statement
+	// or portal produces no rows.
+	SetNoDataRowDescription()
+	// SetPrepStmtOutput tells the client about the results schema of a prepared
+	// statement.
+	SetPrepStmtOutput(context.Context, sqlbase.ResultColumns)
+	// SetPortalOutput tells the client about the results schema and formatting of
+	// a portal.
+	SetPortalOutput(context.Context, sqlbase.ResultColumns, []pgwirebase.FormatCode)
+}
+
+// ParseResult represents the result of a Parse command.
+type ParseResult interface {
+	ResultBase
+}
+
+// BindResult represents the result of a Bind command.
+type BindResult interface {
+	ResultBase
+}
+
+// ErrorResult represents the result of a SendError command.
+type ErrorResult interface {
+	ResultBase
+}
+
+// DeleteResult represents the result of a DeletePreparedStatement command.
+type DeleteResult interface {
+	ResultBase
+}
+
+// SyncResult represents the result of a Sync command. When closed, a
+// readyForQuery message will be generated and all buffered data will be
+// flushed.
+type SyncResult interface {
+	ResultBase
+}
+
+// FlushResult represents the result of a Flush command. When this result is
+// closed, all previously accumulated results are flushed to the client.
+type FlushResult interface {
+	ResultBase
+}
+
+// DrainResult represents the result of a Drain command. Closing this result
+// produces no output for the client.
+type DrainResult interface {
+	ResultBase
+}
+
+// EmptyQueryResult represents the result of an empty query (a query
+// representing a blank string).
+type EmptyQueryResult interface {
+	ResultBase
+}
+
+// CopyInResult represents the result of a CopyIn command. Closing this result
+// produces no output for the client.
+type CopyInResult interface {
+	ResultBase
+}
+
+// ClientLock is an interface returned by ClientComm.lockCommunication(). It
 // represents a lock on the delivery of results to a SQL client. While such a
 // lock is used, no more results are delivered. The lock itself can be used to
 // query what results have already been delivered and to discard results that
 // haven't been delivered.
-type clientLock interface {
-	// Close unlocks the clientComm from whence this clientLock came from. After
+type ClientLock interface {
+	// Close unlocks the ClientComm from whence this ClientLock came from. After
 	// Close is called, buffered results may again be sent to the client,
 	// according to the result streaming policy.
 	//
-	// Once Close() is called, the clientLock cannot be used anymore.
+	// Once Close() is called, the ClientLock cannot be used anymore.
 	Close()
 
-	// clientPos returns the position of the latest statement for which results
+	// ClientPos returns the position of the latest command for which results
 	// have been sent to the client. The position is relative to the start of the
 	// connection.
-	clientPos() cursorPosition
+	ClientPos() CmdPos
 
-	// rtrim iterates backwards through the results and drops all results with
+	// RTrim iterates backwards through the results and drops all results with
 	// position >= pos.
 	// It is illegal to call rtrim with a position <= clientPos(). In other words,
 	// results can
-	rtrim(pos cursorPosition)
+	RTrim(ctx context.Context, pos CmdPos)
 }
 
 // rewindCapability is used pass rewinding instructions in between different
-// layers of the ConnExecutor state machine. It ties together a position to
-// which we want to rewind within the stream of statements with:
-// a) a clientLock that guarantees that the rewind to the respective position is
+// layers of the connExecutor state machine. It ties together a position to
+// which we want to rewind within the stream of commands with:
+// a) a ClientLock that guarantees that the rewind to the respective position is
 // (and remains) possible.
-// b) the stmtBuf that needs to be rewound at the same time as the results.
+// b) the StmtBuf that needs to be rewound at the same time as the results.
 //
 // rewindAndUnlock() needs to be called eventually in order to actually perform
-// the rewinding and unlock the respective clientComm.
+// the rewinding and unlock the respective ClientComm.
 type rewindCapability struct {
-	cl  clientLock
-	buf *stmtBuf
+	cl  ClientLock
+	buf *StmtBuf
 
-	rewindPos cursorPosition
+	rewindPos CmdPos
 }
-
-// WIP(andrei)
-var _ = func() {
-	var rc rewindCapability
-	// use the rewindAndUnlock member function
-	var _ = rc.rewindAndUnlock
-}
-var _ = rewindCapability{}.cl
-var _ = rewindCapability{}.buf
-var _ = rewindCapability{}.rewindPos
 
 // rewindAndUnlock performs the rewinding described by the rewindCapability and
-// unlocks the respective clientComm.
+// unlocks the respective ClientComm.
 func (rc *rewindCapability) rewindAndUnlock(ctx context.Context) {
-	rc.cl.rtrim(rc.rewindPos)
-	rc.buf.rewind(ctx, rc.rewindPos)
+	rc.cl.RTrim(ctx, rc.rewindPos)
+	rc.buf.Rewind(ctx, rc.rewindPos)
 	rc.cl.Close()
 }
 
-// WIP(andrei):
-//
-// // getRewindTxnCapability locks the clientComm if it's possible to rewind to the
-// // point where the transaction started. If that is possible, a rewindCapability
-// // is returned (and thus the clientComm is locked) and the returned bool is
-// // true. In this case, rewindAndUnlock() needs to be called on the returned
-// // capability.
-// //
-// // If it's not possible to rewind to the transaction's start point (because
-// // further results have been already sent to the client), then the returned bool
-// // is false and the returned rewingCapability can be ignored.
-// func (s *ConnExecutor) getRewindTxnCapability() (rewindCapability, bool) {
-//   cl := s.clientComm.lockCommunication()
-//   if s.txnStartPos.compare(cl.clientPos()) <= 0 {
-//     cl.Close()
-//     return rewindCapability{}, false
-//   }
-//   return rewindCapability{
-//     // Pass cl along. The caller will have to Close() it through
-//     // rewindCapability.rewindAndUnlock().
-//     cl:             cl,
-//     buf:            s.stmtsBuf,
-//     rewindPosition: s.TxnState.txnStartPos,
-//   }, true
-// }
+type resCloseType bool
+
+const closed resCloseType = true
+const discarded resCloseType = false
+
+// bufferedCommandResult is a CommandResult that buffers rows and can call a
+// provided callback when closed.
+type bufferedCommandResult struct {
+	err          error
+	rows         []tree.Datums
+	rowsAffected int
+	cols         sqlbase.ResultColumns
+
+	// errOnly, if set, makes AddRow() panic. This can be used when the execution
+	// of the query is not expected to produce any results.
+	errOnly bool
+
+	// closeCallback, if set, is called when Close()/Discard() is called.
+	closeCallback func(*bufferedCommandResult, resCloseType, error)
+}
+
+var _ RestrictedCommandResult = &bufferedCommandResult{}
+var _ CommandResultClose = &bufferedCommandResult{}
+
+// SetColumns is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) SetColumns(_ context.Context, cols sqlbase.ResultColumns) {
+	if r.errOnly {
+		panic("SetColumns() called when errOnly is set")
+	}
+	r.cols = cols
+}
+
+// AppendParamStatusUpdate is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) AppendParamStatusUpdate(key string, val string) {
+	panic("unimplemented")
+}
+
+// AppendNotice is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) AppendNotice(noticeErr error) {
+	panic("unimplemented")
+}
+
+// ResetStmtType is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) ResetStmtType(stmt tree.Statement) {
+	panic("unimplemented")
+}
+
+// AddRow is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) AddRow(ctx context.Context, row tree.Datums) error {
+	if r.errOnly {
+		panic("AddRow() called when errOnly is set")
+	}
+	rowCopy := make(tree.Datums, len(row))
+	copy(rowCopy, row)
+	r.rows = append(r.rows, rowCopy)
+	return nil
+}
+
+func (r *bufferedCommandResult) DisableBuffering() {
+	panic("cannot disable buffering here")
+}
+
+// SetError is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) SetError(err error) {
+	r.err = err
+}
+
+// Err is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) Err() error {
+	return r.err
+}
+
+// IncrementRowsAffected is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) IncrementRowsAffected(n int) {
+	r.rowsAffected += n
+}
+
+// RowsAffected is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) RowsAffected() int {
+	return r.rowsAffected
+}
+
+// Close is part of the CommandResultClose interface.
+func (r *bufferedCommandResult) Close(context.Context, TransactionStatusIndicator) {
+	if r.closeCallback != nil {
+		r.closeCallback(r, closed, nil /* err */)
+	}
+}
+
+// Discard is part of the CommandResult interface.
+func (r *bufferedCommandResult) Discard() {
+	if r.closeCallback != nil {
+		r.closeCallback(r, discarded, nil /* err */)
+	}
+}
+
+// SetInferredTypes is part of the DescribeResult interface.
+func (r *bufferedCommandResult) SetInferredTypes([]oid.Oid) {}
+
+// SetNoDataRowDescription is part of the DescribeResult interface.
+func (r *bufferedCommandResult) SetNoDataRowDescription() {}
+
+// SetPrepStmtOutput is part of the DescribeResult interface.
+func (r *bufferedCommandResult) SetPrepStmtOutput(context.Context, sqlbase.ResultColumns) {}
+
+// SetPortalOutput is part of the DescribeResult interface.
+func (r *bufferedCommandResult) SetPortalOutput(
+	context.Context, sqlbase.ResultColumns, []pgwirebase.FormatCode,
+) {
+}

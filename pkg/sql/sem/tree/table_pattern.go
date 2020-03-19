@@ -1,25 +1,16 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
-import (
-	"bytes"
-	"fmt"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-)
+import "fmt"
 
 // Table patterns are used by e.g. GRANT statements, to designate
 // zero, one or more table names.  For example:
@@ -39,49 +30,20 @@ type TablePattern interface {
 	fmt.Stringer
 	NodeFormatter
 
+	// NormalizeTablePattern() guarantees to return a pattern that is
+	// not an UnresolvedName. This converts the UnresolvedName to an
+	// AllTablesSelector or TableName as necessary.
 	NormalizeTablePattern() (TablePattern, error)
 }
 
-// DatabaseQualifiable identifiers can be qualifed with a database name.
-type DatabaseQualifiable interface {
-	QualifyWithDatabase(database string) error
-}
-
-var _ TablePattern = UnresolvedName{}
+var _ TablePattern = &UnresolvedName{}
 var _ TablePattern = &TableName{}
 var _ TablePattern = &AllTablesSelector{}
-var _ DatabaseQualifiable = &AllTablesSelector{}
-var _ DatabaseQualifiable = &TableName{}
 
 // NormalizeTablePattern resolves an UnresolvedName to either a
 // TableName or AllTablesSelector.
-func (n UnresolvedName) NormalizeTablePattern() (TablePattern, error) {
-	if len(n) == 0 || len(n) > 2 {
-		return nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError, "invalid table name: %q", n)
-	}
-
-	var db Name
-	dbOmitted := true
-	if len(n) > 1 {
-		dbName, ok := n[0].(Name)
-		if !ok {
-			return nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError, "invalid database name: %q", n[0])
-		}
-		db = dbName
-		dbOmitted = false
-	}
-
-	switch t := n[len(n)-1].(type) {
-	case UnqualifiedStar:
-		return &AllTablesSelector{Database: db, DBNameOriginallyOmitted: dbOmitted}, nil
-	case Name:
-		if len(t) == 0 {
-			return nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError, "empty table name: %q", n)
-		}
-		return &TableName{DatabaseName: db, TableName: t, DBNameOriginallyOmitted: dbOmitted}, nil
-	default:
-		return nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError, "invalid table pattern: %q", n)
-	}
+func (n *UnresolvedName) NormalizeTablePattern() (TablePattern, error) {
+	return classifyTablePattern(n)
 }
 
 // NormalizeTablePattern implements the TablePattern interface.
@@ -90,46 +52,32 @@ func (t *TableName) NormalizeTablePattern() (TablePattern, error) { return t, ni
 // AllTablesSelector corresponds to a selection of all
 // tables in a database, e.g. when used with GRANT.
 type AllTablesSelector struct {
-	Database                Name
-	DBNameOriginallyOmitted bool
+	TableNamePrefix
 }
 
 // Format implements the NodeFormatter interface.
-func (at *AllTablesSelector) Format(buf *bytes.Buffer, f FmtFlags) {
-	if !at.DBNameOriginallyOmitted {
-		FormatNode(buf, f, at.Database)
-		buf.WriteByte('.')
+func (at *AllTablesSelector) Format(ctx *FmtCtx) {
+	at.TableNamePrefix.Format(ctx)
+	if at.ExplicitSchema || ctx.alwaysFormatTablePrefix() {
+		ctx.WriteByte('.')
 	}
-	buf.WriteByte('*')
+	ctx.WriteByte('*')
 }
 func (at *AllTablesSelector) String() string { return AsString(at) }
 
 // NormalizeTablePattern implements the TablePattern interface.
 func (at *AllTablesSelector) NormalizeTablePattern() (TablePattern, error) { return at, nil }
 
-// QualifyWithDatabase adds an indirection for the database, if it's missing.
-// It transforms:  * -> database.*
-func (at *AllTablesSelector) QualifyWithDatabase(database string) error {
-	if !at.DBNameOriginallyOmitted {
-		return nil
-	}
-	if database == "" {
-		return pgerror.NewErrorf(pgerror.CodeInvalidDatabaseDefinitionError, "no database specified: %q", at)
-	}
-	at.Database = Name(database)
-	return nil
-}
-
 // TablePatterns implement a comma-separated list of table patterns.
 // Used by e.g. the GRANT statement.
 type TablePatterns []TablePattern
 
 // Format implements the NodeFormatter interface.
-func (tt TablePatterns) Format(buf *bytes.Buffer, f FmtFlags) {
-	for i, t := range tt {
+func (tt *TablePatterns) Format(ctx *FmtCtx) {
+	for i, t := range *tt {
 		if i > 0 {
-			buf.WriteString(", ")
+			ctx.WriteString(", ")
 		}
-		FormatNode(buf, f, t)
+		ctx.FormatNode(t)
 	}
 }

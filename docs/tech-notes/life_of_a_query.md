@@ -269,7 +269,7 @@ root@:26257> EXPLAIN(EXPRS,NOEXPAND,NOOPTIMIZE,METADATA) SELECT * FROM customers
 ```
 
 You can see data being produced by a `scanNode`, being filtered by a
-`renderNode` (presented as "render"), and then sorted by a `sortNode`
+`filterNode` (presented as "filter"), and then sorted by a `sortNode`
 (presented as "nosort", because we have turned off order analysis with
 NOEXPAND and the sort node doesn't know yet whether sorting is
 needed), wrapped in a `selectTopNode` (presented as "select").
@@ -378,7 +378,7 @@ which initiates the processing, and
 which is called repeatedly to produce the next row.
 
 To tie this to the [SQL Executor](#sql-executor) section above,
-[`executor.execClassic()`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/sql/executor.go#L1251),
+`executor.execLocal()`,
 the method responsible for executing one statement, calls
 `plan.Next()` repeatedly and accumulates the results.
 
@@ -458,7 +458,7 @@ Now let's see how these `planNode`s run:
    from SQL92/99. Another interesting fact is that, if we're sorting by a
    non-trivial expression (e.g. `SELECT a, b ... ORDER BY a + b`), we
    need the `a + b` values (for every row) to be produced by a
-   lower-level node. This is achieved through a patter that's also
+   lower-level node. This is achieved through a pattern that's also
    present in other node: the lower node capable of evaluating
    expressions and rendering their results is the `renderNode`; the
    `sortNode` constructor checks if the expressions it needs are already
@@ -559,21 +559,21 @@ SELECT * FROM Orders o inner join Customers c ON o.CustomerID = c.ID WHERE Order
       data types, browse around the [`util/encoding
       directory`](https://github.com/cockroachdb/cockroach/tree/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/util/encoding).
 
-      For actually reading a KV pair from the database, the `rowFetcher` delegates to the `kvFetcher`.
+      For actually reading a KV pair from the database, the `rowFetcher` delegates to the `kvBatchFetcher`.
 
-   2. [`kvFetcher`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/sql/sqlbase/kvfetcher.go#L84):
-      The `kvFetcher` finally reads data from the KV database. It
+   2. [`kvBatchFetcher`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/sql/sqlbase/kvfetcher.go#L84):
+      The `kvBatchFetcher` finally reads data from the KV database. It
       understands nothing of SQL concepts, such as tables, rows or
       columns. When it is created, it is configured with a number of "key
       spans" that it needs to read (these might be, for example, a single
       span for reading a whole table, or a couple of spans for reading
       parts of the PK or of an index).
 
-      To actually read data from the KV database, the `kvFetcher` uses the
+      To actually read data from the KV database, the `kvBatchFetcher` uses the
       KV layer's "client" interface, namely
       [`client.Batch`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/internal/client/batch.go#L30). This
       is where the "SQL layer" interfaces with the "KV layer" - the
-      `kvFetcher` will
+      `kvBatchFetcher` will
       [build](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/sql/sqlbase/kvfetcher.go#L197)
       such `Batch`es of requests, [send them for
       execution](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/sql/sqlbase/kvfetcher.go#L203)
@@ -586,7 +586,7 @@ SELECT * FROM Orders o inner join Customers c ON o.CustomerID = c.ID WHERE Order
       [`ScanRequest`s](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/roachpb/api.proto#L204).
 
 The rest of this document will walk through the "execution" of KV
-requests, such as the ones sent by the `kvFetcher`.
+requests, such as the ones sent by the `kvBatchFetcher`.
 
 ## KV
 
@@ -616,7 +616,7 @@ context of a transaction). Afterwards, a
 [`Txn`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/internal/client/txn.go#L36)
 object is available for [executing requests in the context of that
 transaction](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/internal/client/txn.go#L295)
-- this is what, for example, the `kvFetcher` uses. If you trace what
+- this is what, for example, the `kvBatchFetcher` uses. If you trace what
 happens inside that `Txn.Run()` method you eventually get to
 [`txn.db.sender.Send(...,
 batch)`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/internal/client/txn.go#L587):
@@ -965,10 +965,10 @@ sure they're not writing "under" a read that has already been
 performed.
 
  Now we're reading to actually evaluate the read - control moves to
- [`replica.executeBatch()`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/storage/replica.go#L4000)
+ [`replica.evaluateBatch()`](https://github.com/cockroachdb/cockroach/blob/75c26e5498ef26a4adde9425cb43682d38ec8ee4/pkg/storage/replica.go#L5225)
  which calls
- [`replica.executeCmd`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/storage/replica.go#L4050)
- for each request in the batch. `executeCmd` switches over the request
+ [`replica.evaluateCommand`](https://github.com/cockroachdb/cockroach/blob/75c26e5498ef26a4adde9425cb43682d38ec8ee4/pkg/storage/replica.go#L5286)
+ for each request in the batch. `evaluateCommand` switches over the request
  types using a [helper request to method
  map](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/storage/replica_command.go#L84)
  and [passes
@@ -1129,12 +1129,12 @@ method. This takes in the `roachpb.BatchRequest` (the KV request we've
 been dealing with all along), [allocates an
 `engine.Batch`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/storage/replica.go#L3835)
 and delegates to
-[`executeBatch()`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/storage/replica.go#L3850). This
+[`evaluateBatch()`](https://github.com/cockroachdb/cockroach/blob/75c26e5498ef26a4adde9425cb43682d38ec8ee4/pkg/storage/replica.go#L5225). This
 fellow finally
 [iterates](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/storage/replica.go#L4041)
 over the individual requests in the batch and, for each one, calls
-[`executeCmd`](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/storage/replica_command.go#L115). We've
-seen `executeCmd` before, on the read path. It switches over the
+[`evaluateCommand`](https://github.com/cockroachdb/cockroach/blob/75c26e5498ef26a4adde9425cb43682d38ec8ee4/pkg/storage/replica_command.go#L63). We've
+seen `evaluateCommand` before, on the read path. It switches over the
 different types of requests and [calls a method specific to each
 type](https://github.com/cockroachdb/cockroach/blob/33c18ad1bcdb37ed6ed428b7527148977a8c566a/pkg/storage/replica_command.go#L160). One
 such method would be

@@ -415,6 +415,15 @@ func (b *Builder) addTable(tab cat.Table, alias *tree.TableName) *opt.TableMeta 
 // list are projected by the scan. Otherwise, all columns from the table are
 // projected.
 //
+// If scanMutationCols is true, then include columns being added or dropped from
+// the table. These are currently required by the execution engine as "fetch
+// columns", when performing mutation DML statements (INSERT, UPDATE, UPSERT,
+// DELETE).
+//
+// NOTE: Callers must take care that these mutation columns are never used in
+//       any other way, since they may not have been initialized yet by the
+//       backfiller!
+//
 // See Builder.buildStmt for a description of the remaining input and return
 // values.
 func (b *Builder) buildScan(
@@ -1027,7 +1036,13 @@ func (b *Builder) buildWhere(where *tree.Where, inScope *scope) {
 		return
 	}
 
-	filter := b.resolveAndBuildScalar(where.Expr, types.Bool, "WHERE", tree.RejectSpecial, inScope)
+	filter := b.resolveAndBuildScalar(
+		where.Expr,
+		types.Bool,
+		exprKindWhere,
+		tree.RejectGenerators|tree.RejectWindowApplications,
+		inScope,
+	)
 
 	// Wrap the filter in a FiltersOp.
 	inScope.expr = b.factory.ConstructSelect(
@@ -1131,6 +1146,7 @@ func (b *Builder) buildFromWithLateral(
 		// have been built already.
 		if b.exprIsLateral(tables[i]) {
 			scope = outScope
+			scope.context = exprKindLateralJoin
 		}
 		tableScope := b.buildDataSource(tables[i], nil /* indexFlags */, locking, scope)
 

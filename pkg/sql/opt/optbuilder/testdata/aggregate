@@ -2706,12 +2706,9 @@ scalar-group-by
 build
 SELECT corr(k, NULL) FROM kv
 ----
-project
- ├── columns: corr:5
- ├── scan kv
- │    └── columns: k:1!null v:2 w:3 s:4
- └── projections
-      └── NULL [as=corr:5]
+error (42725): ambiguous call: corr(int, unknown), candidates are:
+corr(int, int) -> float
+corr(int, float) -> float
 
 build
 SELECT corr('foo', v) FROM kv
@@ -3799,3 +3796,62 @@ project
                           │    └── columns: t3.a:9!null t3.b:10!null t3.x:11 t3.y:12
                           └── filters
                                └── sum:14 = t3.x:11
+
+# Regression test for #45631.
+build
+SELECT
+  (SELECT (max(b), unnest) FROM ab WHERE a = unnest)
+FROM
+  ROWS FROM (unnest(ARRAY[1, 2]))
+----
+project
+ ├── columns: "?column?":7
+ ├── project-set
+ │    ├── columns: unnest:1
+ │    ├── values
+ │    │    └── ()
+ │    └── zip
+ │         └── unnest(ARRAY[1,2])
+ └── projections
+      └── subquery [as="?column?":7]
+           └── max1-row
+                ├── columns: "?column?":6
+                └── project
+                     ├── columns: "?column?":6
+                     ├── group-by
+                     │    ├── columns: max:4 unnest:5
+                     │    ├── grouping columns: unnest:5
+                     │    ├── project
+                     │    │    ├── columns: unnest:5 b:3
+                     │    │    ├── select
+                     │    │    │    ├── columns: a:2!null b:3
+                     │    │    │    ├── scan ab
+                     │    │    │    │    └── columns: a:2!null b:3
+                     │    │    │    └── filters
+                     │    │    │         └── a:2 = unnest:1
+                     │    │    └── projections
+                     │    │         └── unnest:1 [as=unnest:5]
+                     │    └── aggregations
+                     │         └── max [as=max:4]
+                     │              └── b:3
+                     └── projections
+                          └── (max:4, unnest:1) [as="?column?":6]
+
+# Regression test for #46196. Don't eliminate the scalar group by, and
+# default to type string.
+build format=show-types
+SELECT max(t0.c0) FROM (VALUES (NULL), (NULL)) t0(c0);
+----
+scalar-group-by
+ ├── columns: max:3(string)
+ ├── project
+ │    ├── columns: column2:2(string)
+ │    ├── values
+ │    │    ├── columns: column1:1(unknown)
+ │    │    ├── (NULL,) [type=tuple{unknown}]
+ │    │    └── (NULL,) [type=tuple{unknown}]
+ │    └── projections
+ │         └── column1:1::STRING [as=column2:2, type=string]
+ └── aggregations
+      └── max [as=max:3, type=string]
+           └── column2:2 [type=string]

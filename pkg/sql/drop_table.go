@@ -166,11 +166,20 @@ func (p *planner) prepareDrop(
 	if tableDesc == nil {
 		return nil, err
 	}
-
-	if err := p.CheckPrivilege(ctx, tableDesc, privilege.DROP); err != nil {
+	if err := p.prepareDropWithTableDesc(ctx, tableDesc); err != nil {
 		return nil, err
 	}
 	return tableDesc, nil
+}
+
+// prepareDropWithTableDesc behaves as prepareDrop, except it assumes the
+// table descriptor is already fetched. This is useful for DropDatabase,
+// as prepareDrop requires resolving a TableName when DropDatabase already
+// has it resolved.
+func (p *planner) prepareDropWithTableDesc(
+	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor,
+) error {
+	return p.CheckPrivilege(ctx, tableDesc, privilege.DROP)
 }
 
 // canRemoveFKBackReference returns an error if the input backreference isn't
@@ -398,12 +407,7 @@ func (p *planner) initiateDropTable(
 		}
 	}
 	for jobID := range jobIDs {
-		job, err := p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.txn)
-		if err != nil {
-			return err
-		}
-
-		if err := job.WithTxn(p.txn).Succeeded(ctx, nil); err != nil {
+		if err := p.ExecCfg().JobRegistry.Succeeded(ctx, p.txn, jobID); err != nil {
 			return errors.Wrapf(err,
 				"failed to mark job %d as as successful", errors.Safe(jobID))
 		}

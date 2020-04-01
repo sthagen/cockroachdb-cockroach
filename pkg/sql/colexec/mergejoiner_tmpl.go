@@ -106,7 +106,7 @@ const _MJ_OVERLOAD = 0
 // */}}
 
 type mergeJoin_JOIN_TYPE_STRINGOp struct {
-	mergeJoinBase
+	*mergeJoinBase
 }
 
 var _ InternalMemoryOperator = &mergeJoin_JOIN_TYPE_STRINGOp{}
@@ -802,6 +802,7 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildLeftBufferedGroup(
 		}
 		o.builderState.lBufferedGroupBatch = currentBatch
 		o.builderState.left.curSrcStartIdx = 0
+		o.builderState.left.numRepeatsIdx = 0
 	}
 	initialBuilderState := o.builderState.left
 	o.unlimitedAllocator.PerformOperation(
@@ -856,6 +857,9 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildLeftBufferedGroup(
 									o.builderState.left.numRepeatsIdx += toAppend
 									return
 								}
+								// We need to start building the next column
+								// with the same initial builder state as the
+								// current column.
 								o.builderState.left.setBuilderColumnState(initialBuilderState)
 								continue LeftColLoop
 							}
@@ -884,11 +888,15 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildLeftBufferedGroup(
 				}
 				o.builderState.lBufferedGroupBatch = currentBatch
 				batchLength = currentBatch.Length()
-				// Note that here we're not resetting the builder state to
-				// initialBuilderState because we have transitioned to building from a
-				// new batch.
+				// We have transitioned to building from a new batch, so we
+				// need to update the builder state to build from the beginning
+				// of the new batch.
 				o.builderState.left.curSrcStartIdx = 0
 				o.builderState.left.numRepeatsIdx = 0
+				// We also need to update 'initialBuilderState' so that the
+				// builder state gets reset correctly in-between different
+				// columns in the loop above.
+				initialBuilderState = o.builderState.left
 			}
 			o.builderState.lBufferedGroupBatch = nil
 			o.builderState.left.reset()
@@ -1429,6 +1437,8 @@ func _SOURCE_FINISHED_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 // */}}
 
 func (o *mergeJoin_JOIN_TYPE_STRINGOp) Next(ctx context.Context) coldata.Batch {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.output.ResetInternalBatch()
 	for {
 		switch o.state {
@@ -1479,11 +1489,15 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) Next(ctx context.Context) coldata.Batch {
 				return o.output
 			}
 		case mjDone:
-			if err := o.proberState.lBufferedGroup.close(ctx); err != nil {
-				execerror.VectorizedInternalPanic(err)
+			// Note that resetting of buffered groups will close disk queues
+			// (if there are any).
+			if o.proberState.lBufferedGroupNeedToReset {
+				o.proberState.lBufferedGroup.reset(ctx)
+				o.proberState.lBufferedGroupNeedToReset = false
 			}
-			if err := o.proberState.rBufferedGroup.close(ctx); err != nil {
-				execerror.VectorizedInternalPanic(err)
+			if o.proberState.rBufferedGroupNeedToReset {
+				o.proberState.rBufferedGroup.reset(ctx)
+				o.proberState.rBufferedGroupNeedToReset = false
 			}
 			return coldata.ZeroBatch
 		default:

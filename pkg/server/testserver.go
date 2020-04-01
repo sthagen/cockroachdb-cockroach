@@ -195,6 +195,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.HTTPAddr != "" {
 		cfg.HTTPAddr = params.HTTPAddr
 	}
+	cfg.DisableTLSForHTTP = params.DisableTLSForHTTP
 	if params.DisableWebSessionAuthentication {
 		cfg.EnableWebSessionAuthentication = false
 	}
@@ -220,10 +221,10 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 			// HeapProfileDirName and GoroutineDumpDirName are normally set by the
 			// cli, once, to the path of the first store.
 			if cfg.HeapProfileDirName == "" {
-				cfg.HeapProfileDirName = filepath.Join(storeSpec.Path, "logs")
+				cfg.HeapProfileDirName = filepath.Join(storeSpec.Path, "logs", base.HeapProfileDir)
 			}
 			if cfg.GoroutineDumpDirName == "" {
-				cfg.GoroutineDumpDirName = filepath.Join(storeSpec.Path, "logs")
+				cfg.GoroutineDumpDirName = filepath.Join(storeSpec.Path, "logs", base.GoroutineDumpDir)
 			}
 		}
 	}
@@ -524,7 +525,7 @@ func (ts *TestServer) getAuthenticatedHTTPClientAndCookie(
 				Secret: secret,
 			}
 			// Encode a session cookie and store it in a cookie jar.
-			cookie, err := EncodeSessionCookie(rawCookie)
+			cookie, err := EncodeSessionCookie(rawCookie, false /* forHTTPSOnly */)
 			if err != nil {
 				return err
 			}

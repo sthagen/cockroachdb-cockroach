@@ -559,7 +559,7 @@ func TestIsOnePhaseCommit(t *testing.T) {
 				// Emulate what a server actually does and bump the write timestamp when
 				// possible. This makes some batches with diverged read and write
 				// timestamps pass isOnePhaseCommit().
-				maybeBumpReadTimestampToWriteTimestamp(ctx, &ba)
+				maybeBumpReadTimestampToWriteTimestamp(ctx, &ba, &spanset.SpanSet{})
 
 				if is1PC := isOnePhaseCommit(&ba); is1PC != c.exp1PC {
 					t.Errorf("expected 1pc=%t; got %t", c.exp1PC, is1PC)
@@ -10032,6 +10032,29 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 				et.CanCommitAtHigherTimestamp = true // necessary to indicate serverside-refresh is possible
 				ba.Add(&cput, &et)
 				assignSeqNumsForReqs(ba.Txn, &cput, &et)
+				return
+			},
+		},
+		// Regression test for #43273. When locking scans run into write too old
+		// errors, the refreshed timestamp should not be below the txn's
+		// existing write timestamp.
+		{
+			name: "serverside-refresh with write too old errors during locking scan",
+			setupFn: func() (hlc.Timestamp, error) {
+				return put("lscan", "put")
+			},
+			batchFn: func(ts hlc.Timestamp) (ba roachpb.BatchRequest, expTS hlc.Timestamp) {
+				// Txn with (read_ts, write_ts) = (1, 4) finds a value with
+				// `ts = 2`. Final timestamp should be `ts = 4`.
+				ba.Txn = newTxn("lscan", ts.Prev())
+				ba.Txn.WriteTimestamp = ts.Next().Next()
+				ba.CanForwardReadTimestamp = true
+
+				expTS = ba.Txn.WriteTimestamp
+
+				scan := scanArgs(roachpb.Key("lscan"), roachpb.Key("lscan\x00"))
+				scan.KeyLocking = lock.Upgrade
+				ba.Add(scan)
 				return
 			},
 		},

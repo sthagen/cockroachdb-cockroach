@@ -8,7 +8,6 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import { Tooltip } from "antd";
 import getHighlightedText from "oss/src/util/highlightedText";
 import React from "react";
 import { Link } from "react-router-dom";
@@ -18,11 +17,12 @@ import { FixLong } from "src/util/fixLong";
 import { StatementSummary, summarize } from "src/util/sql/summarize";
 import { ColumnDescriptor, SortedTable } from "src/views/shared/components/sortedtable";
 import { countBarChart, latencyBarChart, retryBarChart, rowsBarChart } from "./barCharts";
-import { Anchor } from "src/components";
+import { Anchor, Tooltip } from "src/components";
 import "./statements.styl";
-import { DiagnosticStatusBadge } from "oss/src/views/statements/diagnostics/diagnosticStatusBadge";
+import { DiagnosticStatusBadge } from "./diagnostics/diagnosticStatusBadge";
 import { cockroach } from "src/js/protos";
 import IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
+import { ActivateDiagnosticsModalRef } from "./diagnostics/activateDiagnosticsModal";
 
 const longToInt = (d: number | Long) => FixLong(d).toInt();
 
@@ -44,8 +44,8 @@ function StatementLink(props: { statement: string, app: string, implicitTxn: boo
   return (
     <Link to={ `${base}/${encodeURIComponent(props.statement)}` }>
       <div className="cl-table-link__tooltip">
-        <Tooltip overlayClassName="preset-black" placement="bottom" title={
-          <pre style={{ whiteSpace: "pre-wrap" }}>{ getHighlightedText(props.statement, props.search) }</pre>
+        <Tooltip placement="bottom" title={
+          <pre className="cl-table-link__description">{ getHighlightedText(props.statement, props.search) }</pre>
         }>
           <div className="cl-table-link__tooltip-hover-area">
             { getHighlightedText(shortStatement(summary, props.statement), props.search, true) }
@@ -72,8 +72,9 @@ export function makeStatementsColumns(
   statements: AggregateStatistics[],
   selectedApp: string,
   search?: string,
-  activateDiagnostics?: (statement: string) => void): ColumnDescriptor<AggregateStatistics>[] {
-  const original: ColumnDescriptor<AggregateStatistics>[] = [
+  activateDiagnosticsRef?: React.RefObject<ActivateDiagnosticsModalRef>,
+): ColumnDescriptor<AggregateStatistics>[]  {
+  const columns: ColumnDescriptor<AggregateStatistics>[] = [
     {
       title: "Statement",
       className: "cl-table__col-query-text",
@@ -94,16 +95,18 @@ export function makeStatementsColumns(
       sort: (stmt) => (stmt.implicitTxn ? "Implicit" : "Explicit"),
     },
   ];
+  columns.push(...makeCommonColumns(statements));
 
-  const diagnosticsColumn: ColumnDescriptor<AggregateStatistics> = {
+  if (activateDiagnosticsRef) {
+    const diagnosticsColumn: ColumnDescriptor<AggregateStatistics> = {
       title: "Diagnostics",
       cell: (stmt) => {
         if (stmt.diagnosticsReport) {
-          return <DiagnosticStatusBadge status={stmt.diagnosticsReport.completed ? "READY" : "WAITING FOR QUERY"} />;
+          return <DiagnosticStatusBadge status={stmt.diagnosticsReport.completed ? "READY" : "WAITING FOR QUERY"}/>;
         }
         return (
           <Anchor
-            onClick={() => activateDiagnostics(stmt.label)}
+            onClick={() => activateDiagnosticsRef?.current?.showModalFor(stmt.label)}
           >
             Activate
           </Anchor>
@@ -115,11 +118,10 @@ export function makeStatementsColumns(
         }
         return null;
       },
-  };
-
-  return original
-    .concat(makeCommonColumns(statements))
-    .concat([diagnosticsColumn]);
+    };
+    columns.push(diagnosticsColumn);
+  }
+  return columns;
 }
 
 function NodeLink(props: { nodeId: string, nodeNames: { [nodeId: string]: string } }) {

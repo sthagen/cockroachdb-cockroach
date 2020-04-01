@@ -104,6 +104,8 @@ func initCLIDefaults() {
 	debugCtx.maxResults = 1000
 	debugCtx.ballastSize = base.SizeSpec{InBytes: 1000000000}
 
+	serverCfg.GoroutineDumpDirName = ""
+	serverCfg.HeapProfileDirName = ""
 	serverCfg.ReadyFn = nil
 	serverCfg.DelayedBootstrapFn = nil
 	serverCfg.SocketFile = ""
@@ -119,12 +121,12 @@ func initCLIDefaults() {
 	startCtx.serverSSLCertsDir = base.DefaultCertsDirectory
 	startCtx.serverCertPrincipalMap = nil
 	startCtx.serverListenAddr = ""
+	startCtx.unencryptedLocalhostHTTP = false
 	startCtx.tempDir = ""
 	startCtx.externalIODir = ""
 	startCtx.listeningURLFile = ""
 	startCtx.pidFile = ""
 	startCtx.inBackground = false
-	startCtx.backtraceOutputDir = ""
 
 	quitCtx.serverDecommission = false
 
@@ -163,7 +165,7 @@ func initCLIDefaults() {
 	demoCtx.disableTelemetry = false
 	demoCtx.disableLicenseAcquisition = false
 	demoCtx.transientCluster = nil
-	demoCtx.insecure = true
+	demoCtx.insecure = false
 
 	authCtx.validityPeriod = 1 * time.Hour
 
@@ -297,6 +299,10 @@ var startCtx struct {
 	serverCertPrincipalMap []string
 	serverListenAddr       string
 
+	// if specified, this forces the HTTP listen addr to localhost
+	// and disables TLS on the HTTP listener.
+	unencryptedLocalhostHTTP bool
+
 	// temporary directory to use to spill computation results to disk.
 	tempDir string
 
@@ -318,9 +324,6 @@ var startCtx struct {
 
 	// logging settings specific to file logging.
 	logDir log.DirName
-
-	// directory to use for logging backtrace outputs.
-	backtraceOutputDir string
 }
 
 // quitCtx captures the command-line parameters of the `quit` command.

@@ -1500,62 +1500,66 @@ func TestMergeJoiner(t *testing.T) {
 		monitors []*mon.BytesMonitor
 	)
 	for _, tc := range mjTestCases {
-		tc.init()
+		for _, tc := range tc.mutateTypes() {
+			tc.init()
 
-		// We use a custom verifier function so that we can get the merge join op
-		// to use a custom output batch size per test, to exercise more cases.
-		var mergeJoinVerifier verifierFn = func(output *opTestOutput) error {
-			if mj, ok := output.input.(variableOutputBatchSizeInitializer); ok {
-				mj.initWithOutputBatchSize(tc.outputBatchSize)
+			// We use a custom verifier function so that we can get the merge join op
+			// to use a custom output batch size per test, to exercise more cases.
+			var mergeJoinVerifier verifierFn = func(output *opTestOutput) error {
+				if mj, ok := output.input.(variableOutputBatchSizeInitializer); ok {
+					mj.initWithOutputBatchSize(tc.outputBatchSize)
+				} else {
+					// When we have an inner join with ON expression, a filter operator
+					// will be put on top of the merge join, so to make life easier, we'll
+					// just ignore the requested output batch size.
+					output.input.Init()
+				}
+				verify := output.Verify
+				if _, isFullOuter := output.input.(*mergeJoinFullOuterOp); isFullOuter {
+					// FULL OUTER JOIN doesn't guarantee any ordering on its output (since
+					// it is ambiguous), so we're comparing the outputs as sets.
+					verify = output.VerifyAnyOrder
+				}
+
+				return verify()
+			}
+
+			var runner testRunner
+			if tc.skipAllNullsInjection {
+				// We're omitting all nulls injection test. See comments for each such
+				// test case.
+				runner = runTestsWithoutAllNullsInjection
 			} else {
-				// When we have an inner join with ON expression, a filter operator
-				// will be put on top of the merge join, so to make life easier, we'll
-				// just ignore the requested output batch size.
-				output.input.Init()
+				runner = runTestsWithTyps
 			}
-			verify := output.Verify
-			if _, isFullOuter := output.input.(*mergeJoinFullOuterOp); isFullOuter {
-				// FULL OUTER JOIN doesn't guarantee any ordering on its output (since
-				// it is ambiguous), so we're comparing the outputs as sets.
-				verify = output.VerifyAnyOrder
+			// We test all cases with the default memory limit (regular scenario) and a
+			// limit of 1 byte (to force the buffered groups to spill to disk).
+			for _, memoryLimit := range []int64{1, defaultMemoryLimit} {
+				t.Run(fmt.Sprintf("MemoryLimit=%s/%s", humanizeutil.IBytes(memoryLimit), tc.description), func(t *testing.T) {
+					runner(t, []tuples{tc.leftTuples, tc.rightTuples},
+						[][]coltypes.T{tc.leftTypes, tc.rightTypes},
+						tc.expected, mergeJoinVerifier,
+						func(input []Operator) (Operator, error) {
+							spec := createSpecForMergeJoiner(tc)
+							args := NewColOperatorArgs{
+								Spec:                spec,
+								Inputs:              input,
+								StreamingMemAccount: testMemAcc,
+								DiskQueueCfg:        queueCfg,
+								FDSemaphore:         NewTestingSemaphore(mjFDLimit),
+							}
+							args.TestingKnobs.UseStreamingMemAccountForBuffering = true
+							flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = memoryLimit
+							result, err := NewColOperator(ctx, flowCtx, args)
+							if err != nil {
+								return nil, err
+							}
+							accounts = append(accounts, result.OpAccounts...)
+							monitors = append(monitors, result.OpMonitors...)
+							return result.Op, nil
+						})
+				})
 			}
-
-			return verify()
-		}
-
-		var runner testRunner
-		if tc.skipAllNullsInjection {
-			// We're omitting all nulls injection test. See comments for each such
-			// test case.
-			runner = runTestsWithoutAllNullsInjection
-		} else {
-			runner = runTestsWithTyps
-		}
-		// We test all cases with the default memory limit (regular scenario) and a
-		// limit of 1 byte (to force the buffered groups to spill to disk).
-		for _, memoryLimit := range []int64{1, defaultMemoryLimit} {
-			t.Run(fmt.Sprintf("MemoryLimit=%s/%s", humanizeutil.IBytes(memoryLimit), tc.description), func(t *testing.T) {
-				runner(t, []tuples{tc.leftTuples, tc.rightTuples}, nil /* typs */, tc.expected, mergeJoinVerifier,
-					func(input []Operator) (Operator, error) {
-						spec := createSpecForMergeJoiner(tc)
-						args := NewColOperatorArgs{
-							Spec:                spec,
-							Inputs:              input,
-							StreamingMemAccount: testMemAcc,
-							DiskQueueCfg:        queueCfg,
-							FDSemaphore:         NewTestingSemaphore(mjFDLimit),
-						}
-						args.TestingKnobs.UseStreamingMemAccountForBuffering = true
-						flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = memoryLimit
-						result, err := NewColOperator(ctx, flowCtx, args)
-						if err != nil {
-							return nil, err
-						}
-						accounts = append(accounts, result.OpAccounts...)
-						monitors = append(monitors, result.OpMonitors...)
-						return result.Op, nil
-					})
-			})
 		}
 	}
 	for _, acc := range accounts {
@@ -1644,6 +1648,102 @@ func TestFullOuterMergeJoinWithMaximumNumberOfGroups(t *testing.T) {
 					t.Fatalf("found count %d, expected count %d", count, 2*nTuples)
 				}
 			})
+	}
+}
+
+// TestMergeJoinCrossProduct verifies that the merge joiner produces the same
+// output as the hash joiner. The test aims at stressing randomly the building
+// of cross product (from the buffered groups) in the merge joiner and does it
+// by creating input sources such that they contain very big groups (each group
+// is about coldata.BatchSize() in size) which will force the merge joiner to
+// mostly build from the buffered groups. Join of such input sources results in
+// an output quadratic in size, so the test is skipped unless coldata.BatchSize
+// is set to relatively small number, but it is ok since we randomize this
+// value.
+func TestMergeJoinCrossProduct(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	if coldata.BatchSize() > 200 {
+		t.Skipf("this test is too slow with relatively big batch size")
+	}
+	ctx := context.Background()
+	nTuples := 2*coldata.BatchSize() + 1
+	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
+	defer cleanup()
+	rng, _ := randutil.NewPseudoRand()
+	for _, outBatchSize := range []int{1, 17, coldata.BatchSize() - 1, coldata.BatchSize(), coldata.BatchSize() + 1} {
+		t.Run(fmt.Sprintf("outBatchSize=%d", outBatchSize),
+			func(t *testing.T) {
+				typs := []coltypes.T{coltypes.Int64, coltypes.Bytes, coltypes.Decimal}
+				colsLeft := make([]coldata.Vec, len(typs))
+				colsRight := make([]coldata.Vec, len(typs))
+				for i, typ := range typs {
+					colsLeft[i] = testAllocator.NewMemColumn(typ, nTuples)
+					colsRight[i] = testAllocator.NewMemColumn(typ, nTuples)
+				}
+				groupsLeft := colsLeft[0].Int64()
+				groupsRight := colsRight[0].Int64()
+				leftGroupIdx, rightGroupIdx := 0, 0
+				for i := range groupsLeft {
+					if rng.Float64() < 1.0/float64(coldata.BatchSize()) {
+						leftGroupIdx++
+					}
+					if rng.Float64() < 1.0/float64(coldata.BatchSize()) {
+						rightGroupIdx++
+					}
+					groupsLeft[i] = int64(leftGroupIdx)
+					groupsRight[i] = int64(rightGroupIdx)
+				}
+				for i, typ := range typs[1:] {
+					coldata.RandomVec(rng, typ, 0 /* bytesFixedLength */, colsLeft[i+1], nTuples, nullProbability)
+					coldata.RandomVec(rng, typ, 0 /* bytesFixedLength */, colsRight[i+1], nTuples, nullProbability)
+				}
+				leftMJSource := newChunkingBatchSource(typs, colsLeft, nTuples)
+				rightMJSource := newChunkingBatchSource(typs, colsRight, nTuples)
+				leftHJSource := newChunkingBatchSource(typs, colsLeft, nTuples)
+				rightHJSource := newChunkingBatchSource(typs, colsRight, nTuples)
+				mj, err := newMergeJoinOp(
+					testAllocator, defaultMemoryLimit, queueCfg,
+					NewTestingSemaphore(mjFDLimit), sqlbase.InnerJoin,
+					leftMJSource, rightMJSource, typs, typs,
+					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
+					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
+					testDiskAcc,
+				)
+				if err != nil {
+					t.Fatal("error in merge join op constructor", err)
+				}
+				mj.(*mergeJoinInnerOp).initWithOutputBatchSize(outBatchSize)
+				hj := newHashJoiner(
+					testAllocator, hashJoinerSpec{
+						joinType: sqlbase.InnerJoin,
+						left: hashJoinerSourceSpec{
+							eqCols: []uint32{0}, sourceTypes: typs,
+						},
+						right: hashJoinerSourceSpec{
+							eqCols: []uint32{0}, sourceTypes: typs,
+						},
+					}, leftHJSource, rightHJSource)
+				hj.Init()
+
+				var mjOutputTuples, hjOutputTuples tuples
+				for b := mj.Next(ctx); b.Length() != 0; b = mj.Next(ctx) {
+					for i := 0; i < b.Length(); i++ {
+						mjOutputTuples = append(mjOutputTuples, getTupleFromBatch(b, i))
+					}
+				}
+				for b := hj.Next(ctx); b.Length() != 0; b = hj.Next(ctx) {
+					for i := 0; i < b.Length(); i++ {
+						hjOutputTuples = append(hjOutputTuples, getTupleFromBatch(b, i))
+					}
+				}
+				err = assertTuplesSetsEqual(hjOutputTuples, mjOutputTuples)
+				// Note that the error message can be extremely verbose (it
+				// might contain all output tuples), so we manually check that
+				// comparing err to nil returns true (if we were to use
+				// require.NoError, then the error message would be output).
+				require.True(t, err == nil)
+			})
+
 	}
 }
 

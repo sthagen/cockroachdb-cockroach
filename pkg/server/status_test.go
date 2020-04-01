@@ -425,8 +425,12 @@ func TestStatusGetFiles(t *testing.T) {
 	t.Run("goroutines", func(t *testing.T) {
 		const testFilesNo = 3
 		for i := 0; i < testFilesNo; i++ {
-			testFile := filepath.Join(storeSpec.Path, "logs", goroutinesDir, fmt.Sprintf("goroutine_dump%d.txt.gz", i))
-			if err := ioutil.WriteFile(testFile, []byte(fmt.Sprintf("Goroutine dump %d", i)), 0644); err != nil {
+			testGoroutineDir := filepath.Join(storeSpec.Path, "logs", base.GoroutineDumpDir)
+			testGoroutineFile := filepath.Join(testGoroutineDir, fmt.Sprintf("goroutine_dump%d.txt.gz", i))
+			if err := os.MkdirAll(testGoroutineDir, os.ModePerm); err != nil {
+				t.Fatal(err)
+			}
+			if err := ioutil.WriteFile(testGoroutineFile, []byte(fmt.Sprintf("Goroutine dump %d", i)), 0644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -829,7 +833,7 @@ func TestChartCatalogMetrics(t *testing.T) {
 
 	if len(undefinedMetrics) > 0 {
 		t.Fatalf(`The following metrics need are no longer present and need to be removed
-			from the chart catalog (pkg/ts/chart_catalog.go):%v`, undefinedMetrics)
+			from the chart catalog (pkg/ts/catalog/chart_catalog.go):%v`, undefinedMetrics)
 	}
 
 	// Each metric in metricsMetadata should have at least one entry in
@@ -844,8 +848,8 @@ func TestChartCatalogMetrics(t *testing.T) {
 			metricNames = append(metricNames, metricName)
 		}
 		sort.Strings(metricNames)
-		t.Fatalf(`The following metrics need to be added to the chart catalog (pkg/ts/chart_catalog.go):
-		%v`, metricNames)
+		t.Fatalf(`The following metrics need to be added to the chart catalog
+		    (pkg/ts/catalog/chart_catalog.go): %v`, metricNames)
 	}
 }
 

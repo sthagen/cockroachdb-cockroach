@@ -3,7 +3,7 @@
 set -euo pipefail
 
 image=cockroachdb/builder
-version=20200115-154509
+version=20200326-092324
 
 function init() {
   docker build --tag="${image}" "$(dirname "${0}")/builder"
@@ -126,12 +126,6 @@ if test -e "${alternates_file}"; then
   vols="${vols} --volume=${alternates_path}:${alternates_path}${cached_volume_mode}"
 fi
 
-backtrace_dir=${cockroach_toplevel}/../../cockroachlabs/backtrace
-if test -d "${backtrace_dir}"; then
-  vols="${vols} --volume=${backtrace_dir}:/opt/backtrace${cached_volume_mode}"
-  vols="${vols} --volume=${backtrace_dir}/cockroach.cf:${container_home}/.coroner.cf${cached_volume_mode}"
-fi
-
 if [ "${BUILDER_HIDE_GOPATH_SRC:-}" != "1" ]; then
   vols="${vols} --volume=${gopath0}/src:/go/src${cached_volume_mode}"
 fi
@@ -143,6 +137,8 @@ vols="${vols} --volume=${cockroach_toplevel}:/go/src/github.com/cockroachdb/cock
 # are nested, as they are here.)
 mkdir -p "${cockroach_toplevel}"/bin{.docker_amd64,}
 vols="${vols} --volume=${cockroach_toplevel}/bin.docker_amd64:/go/src/github.com/cockroachdb/cockroach/bin${delegated_volume_mode}"
+mkdir -p "${cockroach_toplevel}"/lib{.docker_amd64,}
+vols="${vols} --volume=${cockroach_toplevel}/lib.docker_amd64:/go/src/github.com/cockroachdb/cockroach/lib${delegated_volume_mode}"
 
 mkdir -p "${gocache}"/docker/bin
 vols="${vols} --volume=${gocache}/docker/bin:/go/bin${delegated_volume_mode}"

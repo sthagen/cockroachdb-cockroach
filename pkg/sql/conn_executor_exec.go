@@ -189,27 +189,28 @@ func (ex *connExecutor) execStmtInOpenState(
 	p.noticeSender = res
 
 	var shouldCollectDiagnostics bool
-	var diagHelper *stmtDiagnosticsHelper
+	var finishCollectionDiagnostics StmtDiagnosticsTraceFinishFunc
 
-	if explainBundle, ok := stmt.AST.(*tree.ExplainBundle); ok {
-		// Always collect diagnostics for EXPLAIN BUNDLE.
+	if explainBundle, ok := stmt.AST.(*tree.ExplainAnalyzeDebug); ok {
+		// Always collect diagnostics for EXPLAIN ANALYZE (DEBUG).
 		shouldCollectDiagnostics = true
-		// Strip off EXPLAIN BUNDLE to execute the inner statement.
+		// Strip off the explain node to execute the inner statement.
 		stmt.AST = explainBundle.Statement
-		// TODO(radu): should we trim the "EXPLAIN BUNDLE" part from stmt.SQL?
+		// TODO(radu): should we trim the "EXPLAIN ANALYZE (DEBUG)" part from
+		// stmt.SQL?
 
 		// Clear any ExpectedTypes we set if we prepared this statement (they
 		// reflect the column types of the EXPLAIN itself and not those of the inner
 		// statement).
 		stmt.ExpectedTypes = nil
 
-		// EXPLAIN BUNDLE does not return the rows for the given query; instead it
-		// returns some text which includes a URL.
+		// EXPLAIN ANALYZE (DEBUG) does not return the rows for the given query;
+		// instead it returns some text which includes a URL.
 		// TODO(radu): maybe capture some of the rows and include them in the
 		// bundle.
 		p.discardRows = true
 	} else {
-		shouldCollectDiagnostics, diagHelper = ex.stmtInfoRegistry.shouldCollectDiagnostics(ctx, stmt.AST)
+		shouldCollectDiagnostics, finishCollectionDiagnostics = ex.stmtDiagnosticsRecorder.ShouldCollectDiagnostics(ctx, stmt.AST)
 	}
 
 	if shouldCollectDiagnostics {
@@ -225,15 +226,18 @@ func (ex *connExecutor) execStmtInOpenState(
 			// Note that in case of implicit transactions, the trace contains the auto-commit too.
 			sp.Finish()
 			trace := tracing.GetRecording(sp)
-
-			if diagHelper != nil {
-				diagHelper.Finish(origCtx, trace, &p.curPlan)
+			ie := p.extendedEvalCtx.InternalExecutor.(*InternalExecutor)
+			if finishCollectionDiagnostics != nil {
+				traceJSON, bundle, collectionErr := getTraceAndBundle(
+					origCtx, ex.server.cfg.DB, ie, trace, &p.curPlan,
+				)
+				finishCollectionDiagnostics(origCtx, traceJSON, bundle, collectionErr)
 			} else {
-				// Handle EXPLAIN BUNDLE.
+				// Handle EXPLAIN ANALYZE (DEBUG).
 				// If there was a communication error, no point in setting any results.
 				if retErr == nil {
 					retErr = setExplainBundleResult(
-						origCtx, res, stmt.AST, trace, &p.curPlan, ex.server.cfg,
+						origCtx, res, stmt.AST, trace, &p.curPlan, ie, ex.server.cfg,
 					)
 				}
 			}
@@ -1279,20 +1283,15 @@ func payloadHasError(payload fsm.EventPayload) bool {
 // recordTransactionStart records the start of the transaction and returns a
 // closure to be called once the transaction finishes.
 func (ex *connExecutor) recordTransactionStart() func(txnEvent) {
-	// We don't need to write down the transaction start time into
-	// ex.statsCollector.phaseTimes because it will be overwritten in
-	// ex.statsCollector.reset() before executing the statements of the
-	// transaction.
-	ex.phaseTimes[transactionStart] = timeutil.Now()
+	ex.state.mu.RLock()
+	txnStart := ex.state.mu.txnStart
+	ex.state.mu.RUnlock()
 	implicit := ex.implicitTxn()
-	return func(ev txnEvent) { ex.recordTransaction(ev, implicit) }
+	return func(ev txnEvent) { ex.recordTransaction(ev, implicit, txnStart) }
 }
 
-func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool) {
-	phaseTimes := &ex.statsCollector.phaseTimes
-	phaseTimes[transactionEnd] = timeutil.Now()
-	txnStart := phaseTimes[transactionStart]
-	txnEnd := phaseTimes[transactionEnd]
+func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool, txnStart time.Time) {
+	txnEnd := timeutil.Now()
 	txnTime := txnEnd.Sub(txnStart)
 	ex.metrics.EngineMetrics.SQLTxnLatency.RecordValue(txnTime.Nanoseconds())
 	ex.statsCollector.recordTransaction(

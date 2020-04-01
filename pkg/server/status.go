@@ -92,10 +92,6 @@ const (
 	// omittedKeyStr is the string returned in place of a key when keys aren't
 	// permitted in responses.
 	omittedKeyStr = "omitted (due to the 'server.remote_debugging.mode' setting)"
-
-	// goroutineDir is the directory name where the goroutinedumper stores
-	// goroutine dumps.
-	goroutinesDir = "goroutine_dump"
 )
 
 var (
@@ -143,8 +139,19 @@ type statusServer struct {
 	stopper                  *stop.Stopper
 	sessionRegistry          *sql.SessionRegistry
 	si                       systemInfoOnce
-	stmtDiagnosticsRequester sql.StmtDiagnosticsRequester
+	stmtDiagnosticsRequester StmtDiagnosticsRequester
 	internalExecutor         *sql.InternalExecutor
+}
+
+// StmtDiagnosticsRequester is the interface into *stmtdiagnostics.Registry
+// used by AdminUI endpoints.
+type StmtDiagnosticsRequester interface {
+
+	// InsertRequest adds an entry to system.statement_diagnostics_requests for
+	// tracing a query with the given fingerprint. Once this returns, calling
+	// shouldCollectDiagnostics() on the current node will return true for the given
+	// fingerprint.
+	InsertRequest(ctx context.Context, fprint string) error
 }
 
 // newStatusServer allocates and returns a statusServer.
@@ -183,6 +190,14 @@ func newStatusServer(
 	}
 
 	return server
+}
+
+// setStmtDiagnosticsRequester is used to provide a StmtDiagnosticsRequester to
+// the status server. This cannot be done at construction time because the
+// implementation of StmtDiagnosticsRequester depends on an executor which in
+// turn depends on the statusServer.
+func (s *statusServer) setStmtDiagnosticsRequester(sr StmtDiagnosticsRequester) {
+	s.stmtDiagnosticsRequester = sr
 }
 
 // RegisterService registers the GRPC service.
@@ -699,11 +714,14 @@ func (s *statusServer) GetFiles(
 	//TODO(ridwanmsharif): Serve logfiles so debug-zip can fetch them
 	// intead of reading indididual entries.
 	case serverpb.FileType_HEAP: // Requesting for saved Heap Profiles.
-		dir = filepath.Join(s.admin.server.cfg.HeapProfileDirName, base.HeapProfileDir)
+		dir = s.admin.server.cfg.HeapProfileDirName
 	case serverpb.FileType_GOROUTINES: // Requesting for saved Goroutine dumps.
-		dir = filepath.Join(s.admin.server.cfg.GoroutineDumpDirName, goroutinesDir)
+		dir = s.admin.server.cfg.GoroutineDumpDirName
 	default:
 		return nil, grpcstatus.Errorf(codes.InvalidArgument, "unknown file type: %s", req.Type)
+	}
+	if dir == "" {
+		return nil, grpcstatus.Errorf(codes.Unimplemented, "dump directory not configured: %s", req.Type)
 	}
 	var resp serverpb.GetFilesResponse
 	for _, pattern := range req.Patterns {

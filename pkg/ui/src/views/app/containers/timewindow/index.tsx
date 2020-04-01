@@ -14,6 +14,7 @@ import moment from "moment";
 
 import { AdminUIState } from "src/redux/state";
 import * as timewindow from "src/redux/timewindow";
+import _ from "lodash";
 
 interface TimeWindowManagerProps {
   // The current timewindow redux state.
@@ -88,7 +89,7 @@ class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWind
    */
   setWindow(props: TimeWindowManagerProps) {
     if (!props.timeWindow.scale.windowEnd) {
-      if (!props.timeWindow.useTimeRage) {
+      if (!props.timeWindow.useTimeRange) {
         const now = props.now ? props.now() : moment();
         props.setTimeWindow({
           start: now.clone().subtract(props.timeWindow.scale.windowSize),
@@ -104,12 +105,14 @@ class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWind
     }
   }
 
-  componentWillMount() {
+  componentDidMount() {
     this.checkWindow(this.props);
   }
 
-  componentWillReceiveProps(props: TimeWindowManagerProps) {
-    this.checkWindow(props);
+  componentDidUpdate(prevProps: TimeWindowManagerProps) {
+    if (!_.isEqual(prevProps.timeWindow, this.props.timeWindow)) {
+      this.checkWindow(this.props);
+    }
   }
 
   render(): any {

@@ -16,6 +16,7 @@ stmt ::=
 	| release_stmt
 	| nonpreparable_set_stmt
 	| transaction_stmt
+	| close_cursor_stmt
 	| 
 
 preparable_stmt ::=
@@ -90,6 +91,9 @@ transaction_stmt ::=
 	| rollback_stmt
 	| abort_stmt
 
+close_cursor_stmt ::=
+	'CLOSE' 'ALL'
+
 alter_stmt ::=
 	alter_ddl_stmt
 	| alter_role_stmt
@@ -122,7 +126,6 @@ explain_stmt ::=
 	| 'EXPLAIN' 'ANALYSE' preparable_stmt
 	| 'EXPLAIN' 'ANALYZE' '(' explain_option_list ')' preparable_stmt
 	| 'EXPLAIN' 'ANALYSE' '(' explain_option_list ')' preparable_stmt
-	| 'EXPLAIN' 'BUNDLE' preparable_stmt
 
 import_stmt ::=
 	'IMPORT' import_format string_or_placeholder opt_with_options
@@ -632,6 +635,7 @@ unreserved_keyword ::=
 	| 'CANCEL'
 	| 'CASCADE'
 	| 'CHANGEFEED'
+	| 'CLOSE'
 	| 'CLUSTER'
 	| 'COLUMNS'
 	| 'COMMENT'
@@ -657,6 +661,7 @@ unreserved_keyword ::=
 	| 'DATE'
 	| 'DAY'
 	| 'DEALLOCATE'
+	| 'DECLARE'
 	| 'DELETE'
 	| 'DEFERRED'
 	| 'DISCARD'
@@ -694,6 +699,7 @@ unreserved_keyword ::=
 	| 'HOUR'
 	| 'IMMEDIATE'
 	| 'IMPORT'
+	| 'INCLUDE'
 	| 'INCREMENT'
 	| 'INCREMENTAL'
 	| 'INDEXES'
@@ -771,6 +777,7 @@ unreserved_keyword ::=
 	| 'PLANS'
 	| 'PRECEDING'
 	| 'PREPARE'
+	| 'PRESERVE'
 	| 'PRIORITY'
 	| 'PUBLIC'
 	| 'PUBLICATION'
@@ -1015,10 +1022,10 @@ create_database_stmt ::=
 	| 'CREATE' 'DATABASE' 'IF' 'NOT' 'EXISTS' database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause
 
 create_index_stmt ::=
-	'CREATE' opt_unique 'INDEX' opt_index_name 'ON' table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
-	| 'CREATE' opt_unique 'INDEX' 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
-	| 'CREATE' opt_unique 'INVERTED' 'INDEX' opt_index_name 'ON' table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by
-	| 'CREATE' opt_unique 'INVERTED' 'INDEX' 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by
+	'CREATE' opt_unique 'INDEX' opt_concurrently opt_index_name 'ON' table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
+	| 'CREATE' opt_unique 'INDEX' opt_concurrently 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
+	| 'CREATE' opt_unique 'INVERTED' 'INDEX' opt_concurrently opt_index_name 'ON' table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by
+	| 'CREATE' opt_unique 'INVERTED' 'INDEX' opt_concurrently 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by
 
 create_schema_stmt ::=
 	'CREATE' 'SCHEMA' schema_name
@@ -1081,8 +1088,8 @@ drop_database_stmt ::=
 	| 'DROP' 'DATABASE' 'IF' 'EXISTS' database_name opt_drop_behavior
 
 drop_index_stmt ::=
-	'DROP' 'INDEX' table_index_name_list opt_drop_behavior
-	| 'DROP' 'INDEX' 'IF' 'EXISTS' table_index_name_list opt_drop_behavior
+	'DROP' 'INDEX' opt_concurrently table_index_name_list opt_drop_behavior
+	| 'DROP' 'INDEX' opt_concurrently 'IF' 'EXISTS' table_index_name_list opt_drop_behavior
 
 drop_table_stmt ::=
 	'DROP' 'TABLE' table_name_list opt_drop_behavior
@@ -1393,6 +1400,10 @@ opt_unique ::=
 	'UNIQUE'
 	| 
 
+opt_concurrently ::=
+	'CONCURRENTLY'
+	| 
+
 opt_index_name ::=
 	opt_name
 
@@ -1679,6 +1690,7 @@ reserved_keyword ::=
 	| 'CHECK'
 	| 'COLLATE'
 	| 'COLUMN'
+	| 'CONCURRENTLY'
 	| 'CONSTRAINT'
 	| 'CREATE'
 	| 'CURRENT_CATALOG'
@@ -1789,6 +1801,7 @@ index_elem ::=
 storing ::=
 	'COVERING'
 	| 'STORING'
+	| 'INCLUDE'
 
 partition_by ::=
 	'PARTITION' 'BY' 'LIST' '(' name_list ')' '(' list_partitions ')'

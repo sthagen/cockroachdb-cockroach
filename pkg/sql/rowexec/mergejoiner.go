@@ -275,7 +275,11 @@ func (mjs *MergeJoinerStats) StatsForQueryPlan() []string {
 		mjs.LeftInputStats.StatsForQueryPlan("left "),
 		mjs.RightInputStats.StatsForQueryPlan("right ")...,
 	)
-	return append(stats, fmt.Sprintf("%s: %s", MaxMemoryQueryPlanSuffix, humanizeutil.IBytes(mjs.MaxAllocatedMem)))
+	if mjs.MaxAllocatedMem != 0 {
+		stats =
+			append(stats, fmt.Sprintf("%s: %s", MaxMemoryQueryPlanSuffix, humanizeutil.IBytes(mjs.MaxAllocatedMem)))
+	}
+	return stats
 }
 
 // outputStatsToTrace outputs the collected mergeJoiner stats to the trace. Will
@@ -303,7 +307,12 @@ func (m *mergeJoiner) outputStatsToTrace() {
 
 // ChildCount is part of the execinfra.OpNode interface.
 func (m *mergeJoiner) ChildCount(verbose bool) int {
-	return 2
+	if _, ok := m.leftSource.(execinfra.OpNode); ok {
+		if _, ok := m.rightSource.(execinfra.OpNode); ok {
+			return 2
+		}
+	}
+	return 0
 }
 
 // Child is part of the execinfra.OpNode interface.

@@ -9,7 +9,7 @@
 // licenses/APL.txt.
 
 import { Icon, Pagination } from "antd";
-import _ from "lodash";
+import { isNil, merge, forIn } from "lodash";
 import moment from "moment";
 import { DATE_FORMAT } from "src/util/format";
 import React from "react";
@@ -22,6 +22,7 @@ import * as protos from "src/js/protos";
 import { refreshStatementDiagnosticsRequests, refreshStatements } from "src/redux/apiReducers";
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { AdminUIState } from "src/redux/state";
+import { analytics } from "src/redux/analytics";
 import { StatementsResponseMessage } from "src/util/api";
 import { aggregateStatementStats, combineStatementStats, ExecutionStatistics, flattenStatementStats, StatementStatistics } from "src/util/appStats";
 import { appAttr } from "src/util/constants";
@@ -47,7 +48,7 @@ import "./statements.styl";
 
 type ICollectedStatementStatistics = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 
-interface StatementsPageProps {
+interface OwnProps {
   statements: AggregateStatistics[];
   statementsError: Error | null;
   apps: string[];
@@ -62,20 +63,22 @@ type PaginationSettings = {
   current: number;
 };
 
-interface StatementsPageState {
+export interface StatementsPageState {
   sortSetting: SortSetting;
   pagination: PaginationSettings;
   search?: string;
 }
 
-export class StatementsPage extends React.Component<StatementsPageProps & RouteComponentProps<any>, StatementsPageState> {
+export type StatementsPageProps = OwnProps & RouteComponentProps<any>;
+
+export class StatementsPage extends React.Component<StatementsPageProps, StatementsPageState> {
   activateDiagnosticsRef: React.RefObject<ActivateDiagnosticsModalRef>;
 
-  constructor(props: StatementsPageProps & RouteComponentProps<any>) {
+  constructor(props: StatementsPageProps) {
     super(props);
-    this.state = {
+    const defaultState = {
       sortSetting: {
-        sortKey: 6,  // Latency
+        sortKey: 3, // Sort by Execution Count column as default option
         ascending: false,
       },
       pagination: {
@@ -84,25 +87,71 @@ export class StatementsPage extends React.Component<StatementsPageProps & RouteC
       },
       search: "",
     };
+
+    const stateFromHistory = this.getStateFromHistory();
+    this.state = merge(defaultState, stateFromHistory);
     this.activateDiagnosticsRef = React.createRef();
+  }
+
+  getStateFromHistory = (): Partial<StatementsPageState> => {
+    const { history } = this.props;
+    const searchParams = new URLSearchParams(history.location.search);
+    const sortKey = searchParams.get("sortKey") || undefined;
+    const ascending = searchParams.get("ascending") || undefined;
+    const searchQuery = searchParams.get("q") || undefined;
+
+    return {
+      sortSetting: {
+        sortKey,
+        ascending: Boolean(ascending),
+      },
+      search: searchQuery,
+    };
+  }
+
+  syncHistory = (params: Record<string, string | undefined>) => {
+    const { history } = this.props;
+    const currentSearchParams = new URLSearchParams(history.location.search);
+    // const nextSearchParams = new URLSearchParams(params);
+
+    forIn(params, (value, key) => {
+      if (!value) {
+        currentSearchParams.delete(key);
+      } else {
+        currentSearchParams.set(key, value);
+      }
+    });
+
+    history.location.search = currentSearchParams.toString();
+    history.replace(history.location);
   }
 
   changeSortSetting = (ss: SortSetting) => {
     this.setState({
       sortSetting: ss,
     });
+
+    this.syncHistory({
+      "sortKey": ss.sortKey,
+      "ascending": Boolean(ss.ascending).toString(),
+    });
   }
 
   selectApp = (app: DropdownOption) => {
-    this.props.history.push(`/statements/${app.value}`);
+    const { history } = this.props;
+    history.location.pathname = `/statements/${app.value}`;
+    history.replace(history.location);
   }
 
-  componentWillMount() {
+  componentDidMount() {
     this.props.refreshStatements();
     this.props.refreshStatementDiagnosticsRequests();
   }
 
-  componentWillReceiveProps() {
+  componentDidUpdate = (__: StatementsPageProps, prevState: StatementsPageState) => {
+    if (this.state.search && this.state.search !== prevState.search) {
+      this.trackSearch(this.filteredStatementsData().length);
+    }
     this.props.refreshStatements();
     this.props.refreshStatementDiagnosticsRequests();
   }
@@ -113,26 +162,45 @@ export class StatementsPage extends React.Component<StatementsPageProps & RouteC
 
   onChangePage = (current: number) => {
     const { pagination } = this.state;
-    this.setState({ pagination: { ...pagination, current }});
+    this.setState({ pagination: { ...pagination, current } });
+    this.trackPaginate(current);
+  }
+  onSubmitSearchField = (search: string) => {
+    this.setState({ pagination: { ...this.state.pagination, current: 1 }, search });
+    this.syncHistory({
+      "q": search,
+    });
   }
 
-  getStatementsData = () => {
-    const { pagination: { current, pageSize } } = this.state;
-    const currentDefault = current - 1;
-    const start = (currentDefault * pageSize);
-    const end = (currentDefault * pageSize + pageSize);
-    const data = this.filteredStatementsData().slice(start, end);
-    return data;
+  onClearSearchField = () => {
+    this.setState({ search: "" });
+    this.syncHistory({
+      "q": undefined,
+    });
   }
-
-  onSubmitSearchField = (search: string) => this.setState({ pagination: { ...this.state.pagination, current: 1 }, search });
-
-  onClearSearchField = () => this.setState({ search: "" });
 
   filteredStatementsData = () => {
     const { search } = this.state;
     const { statements } = this.props;
     return statements.filter(statement => search.split(" ").every(val => statement.label.toLowerCase().includes(val.toLowerCase())));
+  }
+
+  trackSearch = (numberOfResults: number) => {
+    analytics.track({
+      event: "Search",
+      properties: {
+        numberOfResults,
+      },
+    });
+  }
+
+  trackPaginate = (page: number) => {
+    analytics.track({
+      event: "Paginate",
+      properties: {
+        selectedPage: page,
+      },
+    });
   }
 
   renderPage = (_page: number, type: "page" | "prev" | "next" | "jump-prev" | "jump-next", originalElement: React.ReactNode) => {
@@ -193,7 +261,7 @@ export class StatementsPage extends React.Component<StatementsPageProps & RouteC
     const selectedApp = appAttrValue || "";
     const appOptions = [{ value: "", label: "All" }];
     this.props.apps.forEach(app => appOptions.push({ value: app, label: app }));
-    const data = this.getStatementsData();
+    const data = this.filteredStatementsData();
     return (
       <div>
         <PageConfig>
@@ -201,6 +269,7 @@ export class StatementsPage extends React.Component<StatementsPageProps & RouteC
             <Search
               onSubmit={this.onSubmitSearchField as any}
               onClear={this.onClearSearchField}
+              defaultValue={search}
             />
           </PageConfigItem>
           <PageConfigItem>
@@ -238,12 +307,13 @@ export class StatementsPage extends React.Component<StatementsPageProps & RouteC
                     statements,
                     selectedApp,
                     search,
-                    this.activateDiagnosticsRef.current?.showModalFor,
+                    this.activateDiagnosticsRef,
                   )
                 }
                 sortSetting={this.state.sortSetting}
                 onChangeSortSetting={this.changeSortSetting}
                 renderNoResult={this.noStatementResult()}
+                pagination={pagination}
               />
             </div>
           )}
@@ -253,9 +323,9 @@ export class StatementsPage extends React.Component<StatementsPageProps & RouteC
           itemRender={this.renderPage as (page: number, type: "page" | "prev" | "next" | "jump-prev" | "jump-next") => React.ReactNode}
           pageSize={pagination.pageSize}
           current={pagination.current}
-          total={this.filteredStatementsData().length}
+          total={data.length}
           onChange={this.onChangePage}
-          hideOnSinglePage={data.length === 0}
+          hideOnSinglePage
         />
       </div>
     );
@@ -266,14 +336,14 @@ export class StatementsPage extends React.Component<StatementsPageProps & RouteC
     const app = getMatchParamByName(match, appAttr);
     return (
       <React.Fragment>
-        <Helmet title={ app ? `${app} App | Statements` : "Statements"} />
+        <Helmet title={app ? `${app} App | Statements` : "Statements"} />
 
         <section className="section">
           <h1 className="base-heading">Statements</h1>
         </section>
 
         <Loading
-          loading={_.isNil(this.props.statements)}
+          loading={isNil(this.props.statements)}
           error={this.props.statementsError}
           render={this.renderStatements}
         />
@@ -311,6 +381,7 @@ export const selectStatements = createSelector(
     }
     let statements = flattenStatementStats(state.data.statements);
     const app = getMatchParamByName(props.match, appAttr);
+    const isInternal = (statement: ExecutionStatistics) => statement.app.startsWith(state.data.internal_app_name_prefix);
 
     if (app) {
       let criteria = app;
@@ -322,8 +393,10 @@ export const selectStatements = createSelector(
       }
 
       statements = statements.filter(
-        (statement: ExecutionStatistics) => (showInternal && statement.app.startsWith(state.data.internal_app_name_prefix)) || statement.app === criteria,
+        (statement: ExecutionStatistics) => (showInternal && isInternal(statement)) || statement.app === criteria,
       );
+    } else {
+      statements = statements.filter((statement: ExecutionStatistics) => !isInternal(statement));
     }
 
     const statsByStatementAndImplicitTxn: { [statement: string]: StatementsSummaryData } = {};

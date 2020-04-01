@@ -519,10 +519,10 @@ const (
 	//     -> fetchNextKVWithUnfinishedRow
 	stateDecodeFirstKVOfRow
 
-	// stateSeekPrefix is the state of skipping all keys that sort before a
-	// prefix. s.machine.seekPrefix must be set to the prefix to seek to.
-	// state[1] must be set, and seekPrefix will transition to that state once it
-	// finds the first key with that prefix.
+	// stateSeekPrefix is the state of skipping all keys that sort before
+	// (or after, in the case of a reverse scan) a prefix. s.machine.seekPrefix
+	// must be set to the prefix to seek to. state[1] must be set, and seekPrefix
+	// will transition to that state once it finds the first key with that prefix.
 	//   1. fetch next kv into nextKV buffer
 	//   2. kv doesn't match seek prefix?
 	//     -> seekPrefix
@@ -714,19 +714,10 @@ func (rf *cFetcher) nextBatch(ctx context.Context) (coldata.Batch, error) {
 				prefixLen := len(rf.machine.lastRowPrefix)
 				remainingBytes := rf.machine.nextKV.Key[prefixLen:]
 				origRemainingBytesLen := len(remainingBytes)
-				for _, colID := range rf.table.index.ExtraColumnIDs {
-					colIdx, ok := rf.table.colIdxMap.get(colID)
-					if !ok {
-						return nil, errors.Errorf("column id %d was in index.ExtraColumnIDs but not in colIdxMap", colID)
-					}
+				for range rf.table.index.ExtraColumnIDs {
 					var err error
 					// Slice off an extra encoded column from remainingBytes.
-					remainingBytes, err = sqlbase.SkipTableKey(
-						&rf.table.cols[colIdx].Type,
-						remainingBytes,
-						// Extra columns are always stored in ascending order.
-						sqlbase.IndexDescriptor_ASC,
-					)
+					remainingBytes, err = sqlbase.SkipTableKey(remainingBytes)
 					if err != nil {
 						return nil, err
 					}
@@ -768,9 +759,18 @@ func (rf *cFetcher) nextBatch(ctx context.Context) (coldata.Batch, error) {
 					rf.machine.state[1] = stateEmitLastBatch
 					break
 				}
+				// The order we perform the comparison in depends on whether we are
+				// performing a reverse scan or not. If we are performing a reverse
+				// scan, then we want to seek until we find a key less than seekPrefix.
+				var comparison int
+				if rf.reverse {
+					comparison = bytes.Compare(rf.machine.seekPrefix, kv.Key)
+				} else {
+					comparison = bytes.Compare(kv.Key, rf.machine.seekPrefix)
+				}
 				// TODO(jordan): if nextKV returns newSpan = true, set the new span
-				// prefix and indicate that it needs decoding.
-				if bytes.Compare(kv.Key, rf.machine.seekPrefix) >= 0 {
+				//  prefix and indicate that it needs decoding.
+				if comparison >= 0 {
 					rf.machine.nextKV = kv
 					break
 				}

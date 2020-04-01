@@ -112,9 +112,10 @@ type CreateIndex struct {
 	Sharded     *ShardedIndexDef
 	// Extra columns to be stored together with the indexed ones as an optimization
 	// for improved reading performance.
-	Storing     NameList
-	Interleave  *InterleaveDef
-	PartitionBy *PartitionBy
+	Storing      NameList
+	Interleave   *InterleaveDef
+	PartitionBy  *PartitionBy
+	Concurrently bool
 }
 
 // Format implements the NodeFormatter interface.
@@ -127,6 +128,9 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 		ctx.WriteString("INVERTED ")
 	}
 	ctx.WriteString("INDEX ")
+	if node.Concurrently {
+		ctx.WriteString("CONCURRENTLY ")
+	}
 	if node.IfNotExists {
 		ctx.WriteString("IF NOT EXISTS ")
 	}
@@ -990,6 +994,17 @@ func (o *StorageParams) Format(ctx *FmtCtx) {
 	}
 }
 
+// CreateTableOnCommitSetting represents the CREATE TABLE ... ON COMMIT <action>
+// parameters.
+type CreateTableOnCommitSetting uint32
+
+const (
+	// CreateTableOnCommitUnset indicates that ON COMMIT was unset.
+	CreateTableOnCommitUnset CreateTableOnCommitSetting = iota
+	// CreateTableOnCommitPreserveRows indicates that ON COMMIT PRESERVE ROWS was set.
+	CreateTableOnCommitPreserveRows
+)
+
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
 	IfNotExists   bool
@@ -998,6 +1013,7 @@ type CreateTable struct {
 	PartitionBy   *PartitionBy
 	Temporary     bool
 	StorageParams StorageParams
+	OnCommit      CreateTableOnCommitSetting
 	// In CREATE...AS queries, Defs represents a list of ColumnTableDefs, one for
 	// each column, and a ConstraintTableDef for each constraint on a subset of
 	// these columns.

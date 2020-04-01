@@ -293,11 +293,10 @@ func testServerArgsForTransientCluster(nodeID roachpb.NodeID, joinAddr string) b
 	storeSpec.StickyInMemoryEngineID = fmt.Sprintf("demo-node%d", nodeID)
 
 	args := base.TestServerArgs{
-		PartOfCluster: true,
-		Stopper: initBacktrace(
-			fmt.Sprintf("%s/demo-node%d", startCtx.backtraceOutputDir, nodeID),
-		),
+		PartOfCluster:     true,
+		Stopper:           stop.NewStopper(),
 		JoinAddr:          joinAddr,
+		DisableTLSForHTTP: true,
 		StoreSpecs:        []base.StoreSpec{storeSpec},
 		SQLMemoryPoolSize: demoCtx.sqlPoolMemorySize,
 		CacheSize:         demoCtx.cacheSize,

@@ -62,6 +62,13 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 	md := scan.Memo().Metadata()
 	hardLimit := scan.HardLimit.RowCount()
 
+	// Side Effects
+	// ------------
+	// A Locking option is a side-effect (we don't want to elide this scan).
+	if scan.Locking != nil {
+		rel.CanHaveSideEffects = true
+	}
+
 	// Output Columns
 	// --------------
 	// Scan output columns are stored in the definition.
@@ -486,11 +493,13 @@ func (b *logicalPropsBuilder) buildGroupingExprProps(groupExpr RelExpr, rel *pro
 			continue
 		}
 
-		// All PG aggregate functions return a non-NULL result if they have at
-		// least one input row, and if all argument values are non-NULL.
-		inputCols := ExtractAggInputColumns(agg)
-		if inputCols.SubsetOf(inputProps.NotNullCols) {
-			rel.NotNullCols.Add(item.Col)
+		// Most aggregate functions return a non-NULL result if they have at least
+		// one input row with non-NULL argument value, and if all argument values are non-NULL.
+		if opt.AggregateIsNeverNullOnNonNullInput(agg.Op()) {
+			inputCols := ExtractAggInputColumns(agg)
+			if inputCols.SubsetOf(inputProps.NotNullCols) {
+				rel.NotNullCols.Add(item.Col)
+			}
 		}
 	}
 
@@ -1365,8 +1374,22 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared) {
 		return
 
 	case *DivExpr:
-		// Division by zero error is possible.
-		shared.CanHaveSideEffects = true
+		// Division by zero error is possible, unless the right-hand side is a
+		// non-zero constant.
+		var nonZero bool
+		if c, ok := t.Right.(*ConstExpr); ok {
+			switch v := c.Value.(type) {
+			case *tree.DInt:
+				nonZero = (*v != 0)
+			case *tree.DFloat:
+				nonZero = (*v != 0.0)
+			case *tree.DDecimal:
+				nonZero = !v.IsZero()
+			}
+		}
+		if !nonZero {
+			shared.CanHaveSideEffects = true
+		}
 
 	case *SubqueryExpr, *ExistsExpr, *AnyExpr, *ArrayFlattenExpr:
 		shared.HasSubquery = true

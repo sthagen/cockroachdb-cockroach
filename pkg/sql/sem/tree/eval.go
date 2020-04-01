@@ -2852,6 +2852,16 @@ type EvalContext struct {
 	TestingKnobs EvalContextTestingKnobs
 
 	Mon *mon.BytesMonitor
+
+	// SingleDatumAggMemAccount is a memory account that all aggregate builtins
+	// that store a single datum will share to account for the memory needed to
+	// perform the aggregation (i.e. memory not reported by AggregateFunc.Size
+	// method). This memory account exists so that such aggregate functions
+	// could "batch" their reservations - otherwise, we end up a situation
+	// where each aggregate function struct grows its own memory account by
+	// tiny amount, yet the account reserves a lot more resulting in
+	// significantly overestimating the memory usage.
+	SingleDatumAggMemAccount *mon.BoundAccount
 }
 
 // MakeTestingEvalContext returns an EvalContext that includes a MemoryMonitor.
@@ -3261,7 +3271,16 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 				return d, nil
 			}
 			var a DBitArray
-			a.BitArray = v.BitArray.ToWidth(uint(t.Width()))
+			switch t.Oid() {
+			case oid.T_varbit:
+				// VARBITs do not have padding attached.
+				a.BitArray = v.BitArray.Clone()
+				if uint(t.Width()) < a.BitArray.BitLen() {
+					a.BitArray = a.BitArray.ToWidth(uint(t.Width()))
+				}
+			default:
+				a.BitArray = v.BitArray.Clone().ToWidth(uint(t.Width()))
+			}
 			return &a, nil
 		case *DInt:
 			return NewDBitArrayFromInt(int64(*v), uint(t.Width()))

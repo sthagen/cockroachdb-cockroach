@@ -160,9 +160,9 @@ func newEncodeError(c rune, enc string) error {
 // For use in other packages, see AllBuiltinNames and GetBuiltinProperties().
 var builtins = map[string]builtinDefinition{
 	// TODO(XisiHuang): support encoding, i.e., length(str, encoding).
-	"length":           lengthImpls,
-	"char_length":      lengthImpls,
-	"character_length": lengthImpls,
+	"length":           lengthImpls(true /* includeBitOverload */),
+	"char_length":      lengthImpls(false /* includeBitOverload */),
+	"character_length": lengthImpls(false /* includeBitOverload */),
 
 	"bit_length": makeBuiltin(tree.FunctionProperties{Category: categoryString},
 		stringOverload1(func(_ *tree.EvalContext, s string) (tree.Datum, error) {
@@ -170,7 +170,10 @@ var builtins = map[string]builtinDefinition{
 		}, types.Int, "Calculates the number of bits used to represent `val`."),
 		bytesOverload1(func(_ *tree.EvalContext, s string) (tree.Datum, error) {
 			return tree.NewDInt(tree.DInt(len(s) * 8)), nil
-		}, types.Int, "Calculates the number of bits in `val`."),
+		}, types.Int, "Calculates the number of bits used to represent `val`."),
+		bitsOverload1(func(_ *tree.EvalContext, s *tree.DBitArray) (tree.Datum, error) {
+			return tree.NewDInt(tree.DInt(s.BitArray.BitLen())), nil
+		}, types.Int, "Calculates the number of bits used to represent `val`."),
 	),
 
 	"octet_length": makeBuiltin(tree.FunctionProperties{Category: categoryString},
@@ -179,7 +182,10 @@ var builtins = map[string]builtinDefinition{
 		}, types.Int, "Calculates the number of bytes used to represent `val`."),
 		bytesOverload1(func(_ *tree.EvalContext, s string) (tree.Datum, error) {
 			return tree.NewDInt(tree.DInt(len(s))), nil
-		}, types.Int, "Calculates the number of bytes in `val`."),
+		}, types.Int, "Calculates the number of bytes used to represent `val`."),
+		bitsOverload1(func(_ *tree.EvalContext, s *tree.DBitArray) (tree.Datum, error) {
+			return tree.NewDInt(tree.DInt((s.BitArray.BitLen() + 7) / 8)), nil
+		}, types.Int, "Calculates the number of bits used to represent `val`."),
 	),
 
 	// TODO(pmattis): What string functions should also support types.Bytes?
@@ -2551,30 +2557,17 @@ may increase either contention or retry errors, or both.`,
 			},
 			ReturnType: tree.FixedReturnType(types.Timestamp),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				// Try both ways around.
-				// TODO(otan): after 20.1, only accept (timezone, timestamptz).
-				for _, attempt := range []struct {
-					ts, tz tree.Datum
-				}{
-					{args[0], args[1]},
-					{args[1], args[0]},
-				} {
-					ts, err := tree.ParseDTimestampTZ(
-						ctx, string(tree.MustBeDString(attempt.ts)), time.Microsecond,
-					)
-					if err != nil {
-						continue
-					}
-					loc, err := timeutil.TimeZoneStringToLocation(
-						string(tree.MustBeDString(attempt.tz)),
-						timeutil.TimeZoneStringToLocationPOSIXStandard,
-					)
-					if err != nil {
-						continue
-					}
-					return ts.EvalAtTimeZone(ctx, loc), nil
+				tzArg := string(tree.MustBeDString(args[0]))
+				tsArg := string(tree.MustBeDString(args[1]))
+				ts, err := tree.ParseDTimestampTZ(ctx, tsArg, time.Microsecond)
+				if err != nil {
+					return nil, err
 				}
-				return nil, errors.Newf("cannot evaluate timezone(%s, %s)", args[0].String(), args[1].String())
+				loc, err := timeutil.TimeZoneStringToLocation(tzArg, timeutil.TimeZoneStringToLocationPOSIXStandard)
+				if err != nil {
+					return nil, err
+				}
+				return ts.EvalAtTimeZone(ctx, loc), nil
 			},
 			Info: "Convert given time stamp with time zone to the new time zone, with no time zone designation.",
 		},
@@ -2666,101 +2659,6 @@ may increase either contention or retry errors, or both.`,
 				return tree.NewDTimeTZ(timetz.MakeTimeTZFromTime(tTime.In(loc))), nil
 			},
 			Info: "Convert given time with time zone to the new time zone.",
-		},
-
-		// TODO(otan): the below should be deleted after 20.1 after sql.y is changed
-		// for the arguments to be the correct way around.
-		tree.Overload{
-			Types: tree.ArgTypes{
-				{"timestamp", types.Timestamp},
-				{"timezone", types.String},
-			},
-			ReturnType: tree.FixedReturnType(types.TimestampTZ),
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				ts := tree.MustBeDTimestamp(args[0])
-				tzStr := string(tree.MustBeDString(args[1]))
-				loc, err := timeutil.TimeZoneStringToLocation(
-					tzStr,
-					timeutil.TimeZoneStringToLocationPOSIXStandard,
-				)
-				if err != nil {
-					return nil, err
-				}
-				_, beforeOffsetSecs := ts.Time.Zone()
-				_, afterOffsetSecs := ts.Time.In(loc).Zone()
-				durationDelta := time.Duration(beforeOffsetSecs-afterOffsetSecs) * time.Second
-				return tree.MakeDTimestampTZ(ts.Time.Add(durationDelta), time.Microsecond), nil
-			},
-			Info: "Treat given time stamp without time zone as located in the specified time zone.\n" +
-				"This is deprecated in favor of timezone(str, timestamp)",
-		},
-		tree.Overload{
-			Types: tree.ArgTypes{
-				{"timestamptz", types.TimestampTZ},
-				{"timezone", types.String},
-			},
-			ReturnType: tree.FixedReturnType(types.Timestamp),
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				ts := tree.MustBeDTimestampTZ(args[0])
-				tzStr := string(tree.MustBeDString(args[1]))
-				loc, err := timeutil.TimeZoneStringToLocation(
-					tzStr,
-					timeutil.TimeZoneStringToLocationPOSIXStandard,
-				)
-				if err != nil {
-					return nil, err
-				}
-				return ts.EvalAtTimeZone(ctx, loc), nil
-			},
-			Info: "Convert given time stamp with time zone to the new time zone, with no time zone designation\n" +
-				"This is deprecated in favor of timezone(str, timestamptz)",
-		},
-		tree.Overload{
-			Types: tree.ArgTypes{
-				{"time", types.Time},
-				{"timezone", types.String},
-			},
-			ReturnType: tree.FixedReturnType(types.TimeTZ),
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				tArg := args[0].(*tree.DTime)
-				tzStr := string(tree.MustBeDString(args[1]))
-				loc, err := timeutil.TimeZoneStringToLocation(
-					tzStr,
-					timeutil.TimeZoneStringToLocationPOSIXStandard,
-				)
-				if err != nil {
-					return nil, err
-				}
-				tTime := timeofday.TimeOfDay(*tArg).ToTime()
-				_, beforeOffsetSecs := tTime.In(ctx.GetLocation()).Zone()
-				durationDelta := time.Duration(-beforeOffsetSecs) * time.Second
-				return tree.NewDTimeTZ(timetz.MakeTimeTZFromTime(tTime.In(loc).Add(durationDelta))), nil
-			},
-			Info: "Treat given time without time zone as located in the specified time zone\n" +
-				"This is deprecated in favor of timezone(str, time)",
-		},
-		tree.Overload{
-			Types: tree.ArgTypes{
-				{"timetz", types.TimeTZ},
-				{"timezone", types.String},
-			},
-			ReturnType: tree.FixedReturnType(types.TimeTZ),
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				// This one should disappear with implicit casts.
-				tArg := args[0].(*tree.DTimeTZ)
-				tzStr := string(tree.MustBeDString(args[1]))
-				loc, err := timeutil.TimeZoneStringToLocation(
-					tzStr,
-					timeutil.TimeZoneStringToLocationPOSIXStandard,
-				)
-				if err != nil {
-					return nil, err
-				}
-				tTime := tArg.TimeTZ.ToTime()
-				return tree.NewDTimeTZ(timetz.MakeTimeTZFromTime(tTime.In(loc))), nil
-			},
-			Info: "Convert given time with time zone to the new time zone\n" +
-				"This is deprecated in favor of timezone(str, timetz)",
 		},
 	),
 
@@ -3859,14 +3757,25 @@ may increase either contention or retry errors, or both.`,
 	),
 }
 
-var lengthImpls = makeBuiltin(tree.FunctionProperties{Category: categoryString},
-	stringOverload1(func(_ *tree.EvalContext, s string) (tree.Datum, error) {
-		return tree.NewDInt(tree.DInt(utf8.RuneCountInString(s))), nil
-	}, types.Int, "Calculates the number of characters in `val`."),
-	bytesOverload1(func(_ *tree.EvalContext, s string) (tree.Datum, error) {
-		return tree.NewDInt(tree.DInt(len(s))), nil
-	}, types.Int, "Calculates the number of bytes in `val`."),
-)
+var lengthImpls = func(incBitOverload bool) builtinDefinition {
+	b := makeBuiltin(tree.FunctionProperties{Category: categoryString},
+		stringOverload1(func(_ *tree.EvalContext, s string) (tree.Datum, error) {
+			return tree.NewDInt(tree.DInt(utf8.RuneCountInString(s))), nil
+		}, types.Int, "Calculates the number of characters in `val`."),
+		bytesOverload1(func(_ *tree.EvalContext, s string) (tree.Datum, error) {
+			return tree.NewDInt(tree.DInt(len(s))), nil
+		}, types.Int, "Calculates the number of bytes in `val`."),
+	)
+	if incBitOverload {
+		b.overloads = append(
+			b.overloads,
+			bitsOverload1(func(_ *tree.EvalContext, s *tree.DBitArray) (tree.Datum, error) {
+				return tree.NewDInt(tree.DInt(s.BitArray.BitLen())), nil
+			}, types.Int, "Calculates the number of bits in `val`."),
+		)
+	}
+	return b
+}
 
 var substringImpls = makeBuiltin(tree.FunctionProperties{Category: categoryString},
 	tree.Overload{
@@ -3876,17 +3785,8 @@ var substringImpls = makeBuiltin(tree.FunctionProperties{Category: categoryStrin
 		},
 		ReturnType: tree.FixedReturnType(types.String),
 		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			runes := []rune(string(tree.MustBeDString(args[0])))
-			// SQL strings are 1-indexed.
-			start := int(tree.MustBeDInt(args[1])) - 1
-
-			if start < 0 {
-				start = 0
-			} else if start > len(runes) {
-				start = len(runes)
-			}
-
-			return tree.NewDString(string(runes[start:])), nil
+			substring := getSubstringFromIndex(string(tree.MustBeDString(args[0])), int(tree.MustBeDInt(args[1])))
+			return tree.NewDString(substring), nil
 		},
 		Info: "Returns a substring of `input` starting at `start_pos` (count starts at 1).",
 	},
@@ -3899,33 +3799,15 @@ var substringImpls = makeBuiltin(tree.FunctionProperties{Category: categoryStrin
 		SpecializedVecBuiltin: tree.SubstringStringIntInt,
 		ReturnType:            tree.FixedReturnType(types.String),
 		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			runes := []rune(string(tree.MustBeDString(args[0])))
-			// SQL strings are 1-indexed.
-			start := int(tree.MustBeDInt(args[1])) - 1
+			str := string(tree.MustBeDString(args[0]))
+			start := int(tree.MustBeDInt(args[1]))
 			length := int(tree.MustBeDInt(args[2]))
 
-			if length < 0 {
-				return nil, pgerror.Newf(
-					pgcode.InvalidParameterValue, "negative substring length %d not allowed", length)
+			substring, err := getSubstringFromIndexOfLength(str, "substring", start, length)
+			if err != nil {
+				return nil, err
 			}
-
-			end := start + length
-			// Check for integer overflow.
-			if end < start {
-				end = len(runes)
-			} else if end < 0 {
-				end = 0
-			} else if end > len(runes) {
-				end = len(runes)
-			}
-
-			if start < 0 {
-				start = 0
-			} else if start > len(runes) {
-				start = len(runes)
-			}
-
-			return tree.NewDString(string(runes[start:end])), nil
+			return tree.NewDString(substring), nil
 		},
 		Info: "Returns a substring of `input` starting at `start_pos` (count starts at 1) and " +
 			"including up to `length` characters.",
@@ -3959,7 +3841,121 @@ var substringImpls = makeBuiltin(tree.FunctionProperties{Category: categoryStrin
 		Info: "Returns a substring of `input` that matches the regular expression `regex` using " +
 			"`escape_char` as your escape character instead of `\\`.",
 	},
+	tree.Overload{
+		Types: tree.ArgTypes{
+			{"input", types.VarBit},
+			{"start_pos", types.Int},
+		},
+		ReturnType: tree.FixedReturnType(types.VarBit),
+		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+			bitString := tree.MustBeDBitArray(args[0])
+			start := int(tree.MustBeDInt(args[1]))
+			substring := getSubstringFromIndex(bitString.BitArray.String(), start)
+			return tree.ParseDBitArray(substring)
+		},
+		Info: "Returns a bit subarray of `input` starting at `start_pos` (count starts at 1).",
+	},
+	tree.Overload{
+		Types: tree.ArgTypes{
+			{"input", types.VarBit},
+			{"start_pos", types.Int},
+			{"length", types.Int},
+		},
+		ReturnType: tree.FixedReturnType(types.VarBit),
+		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+			bitString := tree.MustBeDBitArray(args[0])
+			start := int(tree.MustBeDInt(args[1]))
+			length := int(tree.MustBeDInt(args[2]))
+
+			substring, err := getSubstringFromIndexOfLength(bitString.BitArray.String(), "bit subarray", start, length)
+			if err != nil {
+				return nil, err
+			}
+			return tree.ParseDBitArray(substring)
+		},
+		Info: "Returns a bit subarray of `input` starting at `start_pos` (count starts at 1) and " +
+			"including up to `length` characters.",
+	},
+	tree.Overload{
+		Types: tree.ArgTypes{
+			{"input", types.Bytes},
+			{"start_pos", types.Int},
+		},
+		ReturnType: tree.FixedReturnType(types.Bytes),
+		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+			byteString := string(*args[0].(*tree.DBytes))
+			start := int(tree.MustBeDInt(args[1]))
+			substring := getSubstringFromIndex(byteString, start)
+			return tree.ParseDByte(substring)
+		},
+		Info: "Returns a byte subarray of `input` starting at `start_pos` (count starts at 1).",
+	},
+	tree.Overload{
+		Types: tree.ArgTypes{
+			{"input", types.Bytes},
+			{"start_pos", types.Int},
+			{"length", types.Int},
+		},
+		ReturnType: tree.FixedReturnType(types.Bytes),
+		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+			byteString := string(*args[0].(*tree.DBytes))
+			start := int(tree.MustBeDInt(args[1]))
+			length := int(tree.MustBeDInt(args[2]))
+
+			substring, err := getSubstringFromIndexOfLength(byteString, "byte subarray", start, length)
+			if err != nil {
+				return nil, err
+			}
+			return tree.ParseDByte(substring)
+		},
+		Info: "Returns a byte subarray of `input` starting at `start_pos` (count starts at 1) and " +
+			"including up to `length` characters.",
+	},
 )
+
+// Returns a substring of given string starting at given position.
+func getSubstringFromIndex(str string, start int) string {
+	runes := []rune(str)
+	// SQL strings are 1-indexed.
+	start--
+
+	if start < 0 {
+		start = 0
+	} else if start > len(runes) {
+		start = len(runes)
+	}
+	return string(runes[start:])
+}
+
+// Returns a substring of given string starting at given position and
+// include upto certain length.
+func getSubstringFromIndexOfLength(str, errMsg string, start, length int) (string, error) {
+	runes := []rune(str)
+	// SQL strings are 1-indexed.
+	start--
+
+	if length < 0 {
+		return "", pgerror.Newf(
+			pgcode.InvalidParameterValue, "negative %s length %d not allowed", errMsg, length)
+	}
+
+	end := start + length
+	// Check for integer overflow.
+	if end < start {
+		end = len(runes)
+	} else if end < 0 {
+		end = 0
+	} else if end > len(runes) {
+		end = len(runes)
+	}
+
+	if start < 0 {
+		start = 0
+	} else if start > len(runes) {
+		start = len(runes)
+	}
+	return string(runes[start:end]), nil
+}
 
 var uuidV4Impl = makeBuiltin(
 	tree.FunctionProperties{
@@ -4713,6 +4709,19 @@ func bytesOverload1(
 		ReturnType: tree.FixedReturnType(returnType),
 		Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 			return f(evalCtx, string(*args[0].(*tree.DBytes)))
+		},
+		Info: info,
+	}
+}
+
+func bitsOverload1(
+	f func(*tree.EvalContext, *tree.DBitArray) (tree.Datum, error), returnType *types.T, info string,
+) tree.Overload {
+	return tree.Overload{
+		Types:      tree.ArgTypes{{"val", types.VarBit}},
+		ReturnType: tree.FixedReturnType(returnType),
+		Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+			return f(evalCtx, args[0].(*tree.DBitArray))
 		},
 		Info: info,
 	}

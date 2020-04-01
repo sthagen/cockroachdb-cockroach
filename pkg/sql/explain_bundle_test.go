@@ -30,7 +30,7 @@ import (
 	"github.com/lib/pq"
 )
 
-func TestExplainBundle(t *testing.T) {
+func TestExplainAnalyzeDebug(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
@@ -39,23 +39,29 @@ func TestExplainBundle(t *testing.T) {
 	r := sqlutils.MakeSQLRunner(godb)
 	r.Exec(t, "CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT UNIQUE)")
 
-	base := "statement.txt trace.json"
-	plans := "opt.txt opt-v.txt opt-vv.txt plan.txt"
+	base := "statement.txt trace.json env.sql"
+	plans := "schema.sql opt.txt opt-v.txt opt-vv.txt plan.txt"
 
 	t.Run("basic", func(t *testing.T) {
-		rows := r.QueryStr(t, "EXPLAIN BUNDLE SELECT * FROM abc WHERE c=1")
-		checkBundle(t, fmt.Sprint(rows), base, plans, "distsql.html")
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT * FROM abc WHERE c=1")
+		checkBundle(
+			t, fmt.Sprint(rows),
+			base, plans, "stats-defaultdb.public.abc.sql", "distsql.html",
+		)
 	})
 
 	// Check that we get separate diagrams for subqueries.
 	t.Run("subqueries", func(t *testing.T) {
-		rows := r.QueryStr(t, "EXPLAIN BUNDLE SELECT EXISTS (SELECT * FROM abc WHERE c=1)")
-		checkBundle(t, fmt.Sprint(rows), base, plans, "distsql-1.html distsql-2.html")
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT EXISTS (SELECT * FROM abc WHERE c=1)")
+		checkBundle(
+			t, fmt.Sprint(rows),
+			base, plans, "stats-defaultdb.public.abc.sql", "distsql-1.html distsql-2.html",
+		)
 	})
 
 	// Even on query errors we should still get a bundle.
 	t.Run("error", func(t *testing.T) {
-		_, err := godb.QueryContext(ctx, "EXPLAIN BUNDLE SELECT * FROM badtable")
+		_, err := godb.QueryContext(ctx, "EXPLAIN ANALYZE (DEBUG) SELECT * FROM badtable")
 		if !testutils.IsError(err, "relation.*does not exist") {
 			t.Fatalf("unexpected error %v\n", err)
 		}
@@ -66,7 +72,7 @@ func TestExplainBundle(t *testing.T) {
 	// Verify that we can issue the statement with prepare (which can happen
 	// depending on the client).
 	t.Run("prepare", func(t *testing.T) {
-		stmt, err := godb.Prepare("EXPLAIN BUNDLE SELECT * FROM abc WHERE c=1")
+		stmt, err := godb.Prepare("EXPLAIN ANALYZE (DEBUG) SELECT * FROM abc WHERE c=1")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -84,7 +90,10 @@ func TestExplainBundle(t *testing.T) {
 			rowsBuf.WriteString(row)
 			rowsBuf.WriteByte('\n')
 		}
-		checkBundle(t, rowsBuf.String(), base, plans, "distsql.html")
+		checkBundle(
+			t, rowsBuf.String(),
+			base, plans, "stats-defaultdb.public.abc.sql", "distsql.html",
+		)
 	})
 }
 

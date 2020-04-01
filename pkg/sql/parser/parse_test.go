@@ -80,6 +80,7 @@ func TestParse(t *testing.T) {
 		{`CREATE SCHEMA foo`},
 
 		{`CREATE INDEX a ON b (c)`},
+		{`CREATE INDEX CONCURRENTLY a ON b (c)`},
 		{`EXPLAIN CREATE INDEX a ON b (c)`},
 		{`CREATE INDEX a ON b.c (d)`},
 		{`CREATE INDEX ON a (b)`},
@@ -395,9 +396,9 @@ func TestParse(t *testing.T) {
 
 		{`EXPLAIN SELECT 1`},
 		{`EXPLAIN EXPLAIN SELECT 1`},
-		{`EXPLAIN (A, B, C) SELECT 1`},
-		{`EXPLAIN ANALYZE (A, B, C) SELECT 1`},
-		{`EXPLAIN BUNDLE SELECT 1`},
+		{`EXPLAIN (OPT, VERBOSE) SELECT 1`},
+		{`EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
+		{`EXPLAIN ANALYZE (DEBUG) SELECT 1`},
 		{`SELECT * FROM [EXPLAIN SELECT 1]`},
 		{`SELECT * FROM [SHOW TRANSACTION STATUS]`},
 
@@ -1453,6 +1454,7 @@ func TestParse2(t *testing.T) {
 		{`CREATE TABLE a (UNIQUE INDEX (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1)))`,
 			`CREATE TABLE a (UNIQUE (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1)))`},
 		{`CREATE INDEX ON a (b) COVERING (c)`, `CREATE INDEX ON a (b) STORING (c)`},
+		{`CREATE INDEX ON a (b) INCLUDE (c)`, `CREATE INDEX ON a (b) STORING (c)`},
 
 		{`CREATE INDEX a ON b USING GIN (c)`,
 			`CREATE INVERTED INDEX a ON b (c)`},
@@ -2244,8 +2246,9 @@ $function$`,
 
 		{`EXPLAIN ANALYZE SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
 		// Check the alternate spelling.
-		{`EXPLAIN ANALYSE (A, B, C) SELECT 1`, `EXPLAIN ANALYZE (A, B, C) SELECT 1`},
 		{`EXPLAIN ANALYSE SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
+		{`EXPLAIN ANALYSE (DISTSQL) SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
+		{`EXPLAIN (VERBOSE, OPT) SELECT 1`, `EXPLAIN (OPT, VERBOSE) SELECT 1`},
 
 		{`SET a = INDEX`, `SET a = "index"`},
 		{`SET a = NOTHING`, `SET a = "nothing"`},
@@ -3118,6 +3121,7 @@ func TestUnimplementedSyntax(t *testing.T) {
 		expected string
 	}{
 		{`ALTER TABLE a ALTER CONSTRAINT foo`, 31632, `alter constraint`},
+		{`ALTER TABLE a ADD CONSTRAINT foo EXCLUDE USING gist (bar WITH =)`, 46657, `add constraint exclude using`},
 
 		{`CREATE AGGREGATE a`, 0, `create aggregate`},
 		{`CREATE CAST a`, 0, `create cast`},
@@ -3191,6 +3195,15 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) DEFERRABLE INITIALLY IMMEDIATE)`, 31632, `initially immediate`},
 		{`CREATE TABLE a(b INT8, UNIQUE (b) DEFERRABLE)`, 31632, `deferrable`},
 		{`CREATE TABLE a(b INT8, CHECK (b > 0) DEFERRABLE)`, 31632, `deferrable`},
+
+		{`CREATE TEMP TABLE a (a int) ON COMMIT DROP`, 46556, `drop`},
+		{`CREATE TEMP TABLE a (a int) ON COMMIT DELETE ROWS`, 46556, `delete rows`},
+		{`CREATE TEMP TABLE IF NOT EXISTS a (a int) ON COMMIT DROP`, 46556, `drop`},
+		{`CREATE TEMP TABLE IF NOT EXISTS a (a int) ON COMMIT DELETE ROWS`, 46556, `delete rows`},
+		{`CREATE TEMP TABLE b AS SELECT a FROM a ON COMMIT DROP`, 46556, `drop`},
+		{`CREATE TEMP TABLE b AS SELECT a FROM a ON COMMIT DELETE ROWS`, 46556, `delete rows`},
+		{`CREATE TEMP TABLE IF NOT EXISTS b AS SELECT a FROM a ON COMMIT DROP`, 46556, `drop`},
+		{`CREATE TEMP TABLE IF NOT EXISTS b AS SELECT a FROM a ON COMMIT DELETE ROWS`, 46556, `delete rows`},
 
 		{`CREATE SEQUENCE a AS DOUBLE PRECISION`, 25110, `FLOAT8`},
 

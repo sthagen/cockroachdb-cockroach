@@ -415,6 +415,9 @@ func (u *sqlSymUnion) interleave() *tree.InterleaveDef {
 func (u *sqlSymUnion) partitionBy() *tree.PartitionBy {
     return u.val.(*tree.PartitionBy)
 }
+func (u *sqlSymUnion) createTableOnCommitSetting() tree.CreateTableOnCommitSetting {
+    return u.val.(tree.CreateTableOnCommitSetting)
+}
 func (u *sqlSymUnion) listPartition() tree.ListPartition {
     return u.val.(tree.ListPartition)
 }
@@ -524,16 +527,16 @@ func newNameFromStr(s string) *tree.Name {
 %token <str> BLOB BOOL BOOLEAN BOTH BUNDLE BY BYTEA BYTES
 
 %token <str> CACHE CANCEL CASCADE CASE CAST CHANGEFEED CHAR
-%token <str> CHARACTER CHARACTERISTICS CHECK
+%token <str> CHARACTER CHARACTERISTICS CHECK CLOSE
 %token <str> CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMIT
-%token <str> COMMITTED COMPACT COMPLETE CONCAT CONFIGURATION CONFIGURATIONS CONFIGURE
+%token <str> COMMITTED COMPACT COMPLETE CONCAT CONCURRENTLY CONFIGURATION CONFIGURATIONS CONFIGURE
 %token <str> CONFLICT CONSTRAINT CONSTRAINTS CONTAINS CONVERSION COPY COVERING CREATE CREATEROLE
 %token <str> CROSS CUBE CURRENT CURRENT_CATALOG CURRENT_DATE CURRENT_SCHEMA
 %token <str> CURRENT_ROLE CURRENT_TIME CURRENT_TIMESTAMP
 %token <str> CURRENT_USER CYCLE
 
 %token <str> DATA DATABASE DATABASES DATE DAY DEC DECIMAL DEFAULT
-%token <str> DEALLOCATE DEFERRABLE DEFERRED DELETE DESC
+%token <str> DEALLOCATE DECLARE DEFERRABLE DEFERRED DELETE DESC
 %token <str> DISCARD DISTINCT DO DOMAIN DOUBLE DROP
 
 %token <str> ELSE ENCODING END ENUM ESCAPE EXCEPT EXCLUDE
@@ -550,7 +553,7 @@ func newNameFromStr(s string) *tree.Name {
 
 %token <str> HAVING HASH HIGH HISTOGRAM HOUR
 
-%token <str> IF IFERROR IFNULL IGNORE_FOREIGN_KEYS ILIKE IMMEDIATE IMPORT IN INCREMENT INCREMENTAL
+%token <str> IF IFERROR IFNULL IGNORE_FOREIGN_KEYS ILIKE IMMEDIATE IMPORT IN INCLUDE INCREMENT INCREMENTAL
 %token <str> INET INET_CONTAINED_BY_OR_EQUALS
 %token <str> INET_CONTAINS_OR_EQUALS INDEX INDEXES INJECT INTERLEAVE INITIALLY
 %token <str> INNER INSERT INT INT2VECTOR INT2 INT4 INT8 INT64 INTEGER
@@ -573,7 +576,7 @@ func newNameFromStr(s string) *tree.Name {
 %token <str> ORDER ORDINALITY OTHERS OUT OUTER OVER OVERLAPS OVERLAY OWNED OPERATOR
 
 %token <str> PARENT PARTIAL PARTITION PARTITIONS PASSWORD PAUSE PHYSICAL PLACING
-%token <str> PLAN PLANS POSITION PRECEDING PRECISION PREPARE PRIMARY PRIORITY
+%token <str> PLAN PLANS POSITION PRECEDING PRECISION PREPARE PRESERVE PRIMARY PRIORITY
 %token <str> PROCEDURAL PUBLIC PUBLICATION
 
 %token <str> QUERIES QUERY
@@ -797,6 +800,9 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.Statement> upsert_stmt
 %type <tree.Statement> use_stmt
 
+%type <tree.Statement> close_cursor_stmt
+%type <tree.Statement> declare_cursor_stmt
+
 %type <[]string> opt_incremental
 %type <tree.KVOption> kv_option
 %type <[]tree.KVOption> kv_option_list opt_with_options var_set_list
@@ -839,7 +845,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <*tree.UnresolvedName> func_name
 %type <str> opt_collate
 
-%type <str> database_name index_name opt_index_name column_name insert_column_item statistics_name window_name
+%type <str> cursor_name database_name index_name opt_index_name column_name insert_column_item statistics_name window_name
 %type <str> family_name opt_family_name table_alias_name constraint_name target_name zone_name partition_name collation_name
 %type <str> db_object_name_component
 %type <*tree.UnresolvedObjectName> table_name standalone_index_name sequence_name type_name view_name db_object_name simple_db_object_name complex_db_object_name
@@ -857,6 +863,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.UserPriority> user_priority
 
 %type <tree.TableDefs> opt_table_elem_list table_elem_list create_as_opt_col_list create_as_table_defs
+%type <tree.CreateTableOnCommitSetting> opt_create_table_on_commit
 %type <*tree.InterleaveDef> opt_interleave
 %type <*tree.PartitionBy> opt_partition_by partition_by
 %type <str> partition opt_partition
@@ -909,7 +916,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <types.IntervalTypeMetadata> opt_interval_qualifier interval_qualifier interval_second
 %type <tree.Expr> overlay_placing
 
-%type <bool> opt_unique opt_cluster
+%type <bool> opt_unique opt_concurrently opt_cluster
 %type <bool> opt_using_gin_btree
 
 %type <*tree.Limit> limit_clause offset_clause opt_limit_clause
@@ -1132,6 +1139,8 @@ stmt:
 | release_stmt      // EXTEND WITH HELP: RELEASE
 | nonpreparable_set_stmt // help texts in sub-rule
 | transaction_stmt  // help texts in sub-rule
+| close_cursor_stmt
+| declare_cursor_stmt
 | /* EMPTY */
   {
     $$.val = tree.Statement(nil)
@@ -2562,23 +2571,25 @@ drop_table_stmt:
 
 // %Help: DROP INDEX - remove an index
 // %Category: DDL
-// %Text: DROP INDEX [IF EXISTS] <idxname> [, ...] [CASCADE | RESTRICT]
+// %Text: DROP INDEX [CONCURRENTLY] [IF EXISTS] <idxname> [, ...] [CASCADE | RESTRICT]
 // %SeeAlso: WEBDOCS/drop-index.html
 drop_index_stmt:
-  DROP INDEX table_index_name_list opt_drop_behavior
+  DROP INDEX opt_concurrently table_index_name_list opt_drop_behavior
   {
     $$.val = &tree.DropIndex{
-      IndexList: $3.newTableIndexNames(),
+      IndexList: $4.newTableIndexNames(),
       IfExists: false,
-      DropBehavior: $4.dropBehavior(),
+      DropBehavior: $5.dropBehavior(),
+      Concurrently: $3.bool(),
     }
   }
-| DROP INDEX IF EXISTS table_index_name_list opt_drop_behavior
+| DROP INDEX opt_concurrently IF EXISTS table_index_name_list opt_drop_behavior
   {
     $$.val = &tree.DropIndex{
-      IndexList: $5.newTableIndexNames(),
+      IndexList: $6.newTableIndexNames(),
       IfExists: true,
-      DropBehavior: $6.dropBehavior(),
+      DropBehavior: $7.dropBehavior(),
+      Concurrently: $3.bool(),
     }
   }
 | DROP INDEX error // SHOW HELP: DROP INDEX
@@ -2652,32 +2663,52 @@ table_name_list:
 explain_stmt:
   EXPLAIN preparable_stmt
   {
-    $$.val = &tree.Explain{Statement: $2.stmt()}
+    var err error
+    $$.val, err = tree.MakeExplain(nil /* options */, $2.stmt())
+    if err != nil {
+      return setErr(sqllex, err)
+    }
   }
 | EXPLAIN error // SHOW HELP: EXPLAIN
 | EXPLAIN '(' explain_option_list ')' preparable_stmt
   {
-    $$.val = &tree.Explain{Options: $3.strs(), Statement: $5.stmt()}
+    var err error
+    $$.val, err = tree.MakeExplain($3.strs(), $5.stmt())
+    if err != nil {
+      return setErr(sqllex, err)
+    }
   }
 | EXPLAIN ANALYZE preparable_stmt
   {
-    $$.val = &tree.Explain{Options: []string{"DISTSQL", "ANALYZE"}, Statement: $3.stmt()}
+    var err error
+    $$.val, err = tree.MakeExplain([]string{"DISTSQL", "ANALYZE"}, $3.stmt())
+    if err != nil {
+      return setErr(sqllex, err)
+    }
   }
 | EXPLAIN ANALYSE preparable_stmt
   {
-    $$.val = &tree.Explain{Options: []string{"DISTSQL", "ANALYZE"}, Statement: $3.stmt()}
+    var err error
+    $$.val, err = tree.MakeExplain([]string{"DISTSQL", "ANALYZE"}, $3.stmt())
+    if err != nil {
+      return setErr(sqllex, err)
+    }
   }
 | EXPLAIN ANALYZE '(' explain_option_list ')' preparable_stmt
   {
-    $$.val = &tree.Explain{Options: append($4.strs(), "ANALYZE"), Statement: $6.stmt()}
+    var err error
+    $$.val, err = tree.MakeExplain(append($4.strs(), "ANALYZE"), $6.stmt())
+    if err != nil {
+      return setErr(sqllex, err)
+    }
   }
 | EXPLAIN ANALYSE '(' explain_option_list ')' preparable_stmt
   {
-    $$.val = &tree.Explain{Options: append($4.strs(), "ANALYZE"), Statement: $6.stmt()}
-  }
-| EXPLAIN BUNDLE preparable_stmt
-  {
-    $$.val = &tree.ExplainBundle{Statement: $3.stmt()}
+    var err error
+    $$.val, err = tree.MakeExplain(append($4.strs(), "ANALYZE"), $6.stmt())
+    if err != nil {
+      return setErr(sqllex, err)
+    }
   }
 // This second error rule is necessary, because otherwise
 // preparable_stmt also provides "selectclause := '(' error ..." and
@@ -3368,6 +3399,15 @@ show_stmt:
 | show_users_stmt           // EXTEND WITH HELP: SHOW USERS
 | show_zone_stmt
 | SHOW error                // SHOW HELP: SHOW
+
+// Cursors are not yet supported by CockroachDB. CLOSE ALL is safe to no-op
+// since there will be no open cursors.
+close_cursor_stmt:
+	CLOSE ALL { }
+| CLOSE cursor_name { return unimplementedWithIssue(sqllex, 41412) }
+
+declare_cursor_stmt:
+	DECLARE { return unimplementedWithIssue(sqllex, 41412) }
 
 // %Help: SHOW SESSION - display session variables
 // %Category: Cfg
@@ -4238,20 +4278,20 @@ create_schema_stmt:
 // %Help: CREATE TABLE - create a new table
 // %Category: DDL
 // %Text:
-// CREATE [[GLOBAL | LOCAL] {TEMPORARY | TEMP}] TABLE [IF NOT EXISTS] <tablename> ( <elements...> ) [<interleave>]
-// CREATE [[GLOBAL | LOCAL] {TEMPORARY | TEMP}] TABLE [IF NOT EXISTS] <tablename> [( <colnames...> )] AS <source>
+// CREATE [[GLOBAL | LOCAL] {TEMPORARY | TEMP}] TABLE [IF NOT EXISTS] <tablename> ( <elements...> ) [<interleave>] [<on_commit>]
+// CREATE [[GLOBAL | LOCAL] {TEMPORARY | TEMP}] TABLE [IF NOT EXISTS] <tablename> [( <colnames...> )] AS <source> [<interleave>] [<on commit>]
 //
 // Table elements:
 //    <name> <type> [<qualifiers...>]
 //    [UNIQUE | INVERTED] INDEX [<name>] ( <colname> [ASC | DESC] [, ...] )
-//                            [USING HASH WITH BUCKET_COUNT = <shard_buckets>] [STORING ( <colnames...> )] [<interleave>]
+//                            [USING HASH WITH BUCKET_COUNT = <shard_buckets>] [{STORING | INCLUDE | COVERING} ( <colnames...> )] [<interleave>]
 //    FAMILY [<name>] ( <colnames...> )
 //    [CONSTRAINT <name>] <constraint>
 //
 // Table constraints:
 //    PRIMARY KEY ( <colnames...> ) [USING HASH WITH BUCKET_COUNT = <shard_buckets>]
 //    FOREIGN KEY ( <colnames...> ) REFERENCES <tablename> [( <colnames...> )] [ON DELETE {NO ACTION | RESTRICT}] [ON UPDATE {NO ACTION | RESTRICT}]
-//    UNIQUE ( <colnames... ) [STORING ( <colnames...> )] [<interleave>]
+//    UNIQUE ( <colnames... ) [{STORING | INCLUDE | COVERING} ( <colnames...> )] [<interleave>]
 //    CHECK ( <expr> )
 //
 // Column qualifiers:
@@ -4264,11 +4304,14 @@ create_schema_stmt:
 // Interleave clause:
 //    INTERLEAVE IN PARENT <tablename> ( <colnames...> ) [CASCADE | RESTRICT]
 //
+// On commit clause:
+//    ON COMMIT {PRESERVE ROWS | DROP | DELETE ROWS}
+//
 // %SeeAlso: SHOW TABLES, CREATE VIEW, SHOW CREATE,
 // WEBDOCS/create-table.html
 // WEBDOCS/create-table-as.html
 create_table_stmt:
-  CREATE opt_temp_create_table TABLE table_name '(' opt_table_elem_list ')' opt_interleave opt_partition_by opt_table_with
+  CREATE opt_temp_create_table TABLE table_name '(' opt_table_elem_list ')' opt_interleave opt_partition_by opt_table_with opt_create_table_on_commit
   {
     name := $4.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateTable{
@@ -4280,9 +4323,10 @@ create_table_stmt:
       PartitionBy: $9.partitionBy(),
       Temporary: $2.persistenceType(),
       StorageParams: $10.storageParams(),
+      OnCommit: $11.createTableOnCommitSetting(),
     }
   }
-| CREATE opt_temp_create_table TABLE IF NOT EXISTS table_name '(' opt_table_elem_list ')' opt_interleave opt_partition_by opt_table_with
+| CREATE opt_temp_create_table TABLE IF NOT EXISTS table_name '(' opt_table_elem_list ')' opt_interleave opt_partition_by opt_table_with opt_create_table_on_commit
   {
     name := $7.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateTable{
@@ -4294,6 +4338,7 @@ create_table_stmt:
       PartitionBy: $12.partitionBy(),
       Temporary: $2.persistenceType(),
       StorageParams: $13.storageParams(),
+      OnCommit: $14.createTableOnCommitSetting(),
     }
   }
 
@@ -4318,6 +4363,27 @@ opt_table_with:
     return unimplemented(sqllex, "create table with oids")
   }
 
+opt_create_table_on_commit:
+  /* EMPTY */
+  {
+    $$.val = tree.CreateTableOnCommitUnset
+  }
+| ON COMMIT PRESERVE ROWS
+  {
+    /* SKIP DOC */
+    $$.val = tree.CreateTableOnCommitPreserveRows
+  }
+| ON COMMIT DELETE ROWS error
+  {
+    /* SKIP DOC */
+    return unimplementedWithIssueDetail(sqllex, 46556, "delete rows")
+  }
+| ON COMMIT DROP error
+  {
+    /* SKIP DOC */
+    return unimplementedWithIssueDetail(sqllex, 46556, "drop")
+  }
+
 storage_parameter:
   name '=' d_expr
   {
@@ -4339,7 +4405,7 @@ storage_parameter_list:
   }
 
 create_table_as_stmt:
-  CREATE opt_temp_create_table TABLE table_name create_as_opt_col_list opt_table_with AS select_stmt opt_create_as_data
+  CREATE opt_temp_create_table TABLE table_name create_as_opt_col_list opt_table_with AS select_stmt opt_create_as_data opt_create_table_on_commit
   {
     name := $4.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateTable{
@@ -4349,9 +4415,10 @@ create_table_as_stmt:
       Defs: $5.tblDefs(),
       AsSource: $8.slct(),
       StorageParams: $6.storageParams(),
+      OnCommit: $10.createTableOnCommitSetting(),
     }
   }
-| CREATE opt_temp_create_table TABLE IF NOT EXISTS table_name create_as_opt_col_list opt_table_with AS select_stmt opt_create_as_data
+| CREATE opt_temp_create_table TABLE IF NOT EXISTS table_name create_as_opt_col_list opt_table_with AS select_stmt opt_create_as_data opt_create_table_on_commit
   {
     name := $7.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateTable{
@@ -4361,6 +4428,7 @@ create_table_as_stmt:
       Defs: $8.tblDefs(),
       AsSource: $11.slct(),
       StorageParams: $9.storageParams(),
+      OnCommit: $13.createTableOnCommitSetting(),
     }
   }
 
@@ -4760,6 +4828,10 @@ constraint_elem:
       Actions: $10.referenceActions(),
     }
   }
+| EXCLUDE USING error
+  {
+    return unimplementedWithIssueDetail(sqllex, 46657, "add constraint exclude using")
+  }
 
 
 create_as_opt_col_list:
@@ -4874,6 +4946,7 @@ opt_deferrable:
 storing:
   COVERING
 | STORING
+| INCLUDE
 
 // TODO(pmattis): It would be nice to support a syntax like STORING
 // ALL or STORING (*). The syntax addition is straightforward, but we
@@ -5257,7 +5330,7 @@ create_type_stmt:
 // %Help: CREATE INDEX - create a new index
 // %Category: DDL
 // %Text:
-// CREATE [UNIQUE | INVERTED] INDEX [IF NOT EXISTS] [<idxname>]
+// CREATE [UNIQUE | INVERTED] INDEX [CONCURRENTLY] [IF NOT EXISTS] [<idxname>]
 //        ON <tablename> ( <colname> [ASC | DESC] [, ...] )
 //        [USING HASH WITH BUCKET_COUNT = <shard_buckets>] [STORING ( <colnames...> )] [<interleave>]
 //
@@ -5267,64 +5340,68 @@ create_type_stmt:
 // %SeeAlso: CREATE TABLE, SHOW INDEXES, SHOW CREATE,
 // WEBDOCS/create-index.html
 create_index_stmt:
-  CREATE opt_unique INDEX opt_index_name ON table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_idx_where
-  {
-    table := $6.unresolvedObjectName().ToTableName()
-    $$.val = &tree.CreateIndex{
-      Name:    tree.Name($4),
-      Table:   table,
-      Unique:  $2.bool(),
-      Columns: $9.idxElems(),
-      Sharded: $11.shardedIndexDef(),
-      Storing: $12.nameList(),
-      Interleave: $13.interleave(),
-      PartitionBy: $14.partitionBy(),
-      Inverted: $7.bool(),
-    }
-  }
-| CREATE opt_unique INDEX IF NOT EXISTS index_name ON table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_idx_where
-  {
-    table := $9.unresolvedObjectName().ToTableName()
-    $$.val = &tree.CreateIndex{
-      Name:        tree.Name($7),
-      Table:       table,
-      Unique:      $2.bool(),
-      IfNotExists: true,
-      Columns:     $12.idxElems(),
-      Sharded:     $14.shardedIndexDef(),
-      Storing:     $15.nameList(),
-      Interleave:  $16.interleave(),
-      PartitionBy: $17.partitionBy(),
-      Inverted:    $10.bool(),
-    }
-  }
-| CREATE opt_unique INVERTED INDEX opt_index_name ON table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_idx_where
+  CREATE opt_unique INDEX opt_concurrently opt_index_name ON table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_idx_where
   {
     table := $7.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateIndex{
-      Name:       tree.Name($5),
-      Table:      table,
-      Unique:     $2.bool(),
-      Inverted:   true,
-      Columns:    $9.idxElems(),
-      Storing:     $11.nameList(),
-      Interleave:  $12.interleave(),
-      PartitionBy: $13.partitionBy(),
+      Name:    tree.Name($5),
+      Table:   table,
+      Unique:  $2.bool(),
+      Columns: $10.idxElems(),
+      Sharded: $12.shardedIndexDef(),
+      Storing: $13.nameList(),
+      Interleave: $14.interleave(),
+      PartitionBy: $15.partitionBy(),
+      Inverted: $8.bool(),
+      Concurrently: $4.bool(),
     }
   }
-| CREATE opt_unique INVERTED INDEX IF NOT EXISTS index_name ON table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_idx_where
+| CREATE opt_unique INDEX opt_concurrently IF NOT EXISTS index_name ON table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_idx_where
   {
     table := $10.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateIndex{
       Name:        tree.Name($8),
       Table:       table,
       Unique:      $2.bool(),
+      IfNotExists: true,
+      Columns:     $13.idxElems(),
+      Sharded:     $15.shardedIndexDef(),
+      Storing:     $16.nameList(),
+      Interleave:  $17.interleave(),
+      PartitionBy: $18.partitionBy(),
+      Inverted:    $11.bool(),
+      Concurrently: $4.bool(),
+    }
+  }
+| CREATE opt_unique INVERTED INDEX opt_concurrently opt_index_name ON table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_idx_where
+  {
+    table := $8.unresolvedObjectName().ToTableName()
+    $$.val = &tree.CreateIndex{
+      Name:       tree.Name($6),
+      Table:      table,
+      Unique:     $2.bool(),
+      Inverted:   true,
+      Columns:    $10.idxElems(),
+      Storing:     $12.nameList(),
+      Interleave:  $13.interleave(),
+      PartitionBy: $14.partitionBy(),
+      Concurrently: $5.bool(),
+    }
+  }
+| CREATE opt_unique INVERTED INDEX opt_concurrently IF NOT EXISTS index_name ON table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_idx_where
+  {
+    table := $11.unresolvedObjectName().ToTableName()
+    $$.val = &tree.CreateIndex{
+      Name:        tree.Name($9),
+      Table:       table,
+      Unique:      $2.bool(),
       Inverted:    true,
       IfNotExists: true,
-      Columns:     $12.idxElems(),
-      Storing:     $14.nameList(),
-      Interleave:  $15.interleave(),
-      PartitionBy: $16.partitionBy(),
+      Columns:     $13.idxElems(),
+      Storing:     $15.nameList(),
+      Interleave:  $16.interleave(),
+      PartitionBy: $17.partitionBy(),
+      Concurrently: $5.bool(),
     }
   }
 | CREATE opt_unique INDEX error // SHOW HELP: CREATE INDEX
@@ -5348,6 +5425,16 @@ opt_using_gin_btree:
         sqllex.Error("unrecognized access method: " + $2)
         return 1
     }
+  }
+| /* EMPTY */
+  {
+    $$.val = false
+  }
+
+opt_concurrently:
+  CONCURRENTLY
+  {
+    $$.val = true
   }
 | /* EMPTY */
   {
@@ -7752,9 +7839,7 @@ a_expr:
   }
 | a_expr AT TIME ZONE a_expr %prec AT
   {
-    // TODO(otan): After 20.1, switch to {$5.expr(), $1.expr()} to match postgres,
-    // and delete the reciprocal method.
-    $$.val = &tree.FuncExpr{Func: tree.WrapFunction("timezone"), Exprs: tree.Exprs{$1.expr(), $5.expr()}}
+    $$.val = &tree.FuncExpr{Func: tree.WrapFunction("timezone"), Exprs: tree.Exprs{$5.expr(), $1.expr()}}
   }
   // These operators must be called out explicitly in order to make use of
   // bison's automatic operator-precedence handling. All other operator names
@@ -9536,6 +9621,8 @@ standalone_index_name: db_object_name
 
 explain_option_name:   non_reserved_word
 
+cursor_name:           name
+
 // Names for column references.
 // Accepted patterns:
 // <colname>
@@ -9738,6 +9825,7 @@ unreserved_keyword:
 | CANCEL
 | CASCADE
 | CHANGEFEED
+| CLOSE
 | CLUSTER
 | COLUMNS
 | COMMENT
@@ -9763,6 +9851,7 @@ unreserved_keyword:
 | DATE
 | DAY
 | DEALLOCATE
+| DECLARE
 | DELETE
 | DEFERRED
 | DISCARD
@@ -9800,6 +9889,7 @@ unreserved_keyword:
 | HOUR
 | IMMEDIATE
 | IMPORT
+| INCLUDE
 | INCREMENT
 | INCREMENTAL
 | INDEXES
@@ -9877,6 +9967,7 @@ unreserved_keyword:
 | PLANS
 | PRECEDING
 | PREPARE
+| PRESERVE
 | PRIORITY
 | PUBLIC
 | PUBLICATION
@@ -10109,6 +10200,7 @@ reserved_keyword:
 | CHECK
 | COLLATE
 | COLUMN
+| CONCURRENTLY
 | CONSTRAINT
 | CREATE
 | CURRENT_CATALOG

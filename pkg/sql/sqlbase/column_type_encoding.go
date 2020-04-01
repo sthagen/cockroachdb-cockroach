@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -164,74 +163,12 @@ func EncodeTableKey(b []byte, val tree.Datum, dir encoding.Direction) ([]byte, e
 
 // SkipTableKey skips a value of type valType in key, returning the remainder
 // of the key.
-// TODO(jordan): each type could be optimized here.
-func SkipTableKey(valType *types.T, key []byte, dir IndexDescriptor_Direction) ([]byte, error) {
-	if (dir != IndexDescriptor_ASC) && (dir != IndexDescriptor_DESC) {
-		return nil, errors.AssertionFailedf("invalid direction: %d", log.Safe(dir))
-	}
-	var isNull bool
-	if key, isNull = encoding.DecodeIfNull(key); isNull {
-		return key, nil
-	}
-	var rkey []byte
-	var err error
-	switch valType.Family() {
-	case types.BoolFamily, types.IntFamily, types.DateFamily, types.OidFamily, types.TimeFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeVarintAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeVarintDescending(key)
-		}
-	case types.FloatFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeFloatAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeFloatDescending(key)
-		}
-	case types.BytesFamily, types.StringFamily, types.UuidFamily, types.INetFamily, types.CollatedStringFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeBytesAscending(key, nil)
-		} else {
-			rkey, _, err = encoding.DecodeBytesDescending(key, nil)
-		}
-	case types.DecimalFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeDecimalAscending(key, nil)
-		} else {
-			rkey, _, err = encoding.DecodeDecimalDescending(key, nil)
-		}
-	case types.TimestampFamily, types.TimestampTZFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeTimeAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeTimeDescending(key)
-		}
-	case types.TimeTZFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeTimeTZAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeTimeTZDescending(key)
-		}
-	case types.IntervalFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeDurationAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeDurationDescending(key)
-		}
-	case types.BitFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeBitArrayAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeBitArrayDescending(key)
-		}
-	default:
-		// Tuples and arrays aren't indexable types right now, so we don't have cases for them.
-		return key, errors.AssertionFailedf("unsupported type %+v", log.Safe(valType))
-	}
+func SkipTableKey(key []byte) ([]byte, error) {
+	skipLen, err := encoding.PeekLength(key)
 	if err != nil {
-		return key, err
+		return nil, err
 	}
-	return rkey, nil
+	return key[skipLen:], nil
 }
 
 // DecodeTableKey decodes a value encoded by EncodeTableKey.
@@ -305,7 +242,11 @@ func DecodeTableKey(
 		return a.NewDString(tree.DString(r)), rkey, err
 	case types.CollatedStringFamily:
 		var r string
-		rkey, r, err = encoding.DecodeUnsafeStringAscending(key, nil)
+		if dir == encoding.Ascending {
+			rkey, r, err = encoding.DecodeUnsafeStringAscending(key, nil)
+		} else {
+			rkey, r, err = encoding.DecodeUnsafeStringDescending(key, nil)
+		}
 		if err != nil {
 			return nil, nil, err
 		}
@@ -612,32 +553,6 @@ func decodeUntaggedDatum(a *DatumAlloc, t *types.T, buf []byte) (tree.Datum, []b
 	default:
 		return nil, buf, errors.Errorf("couldn't decode type %s", t)
 	}
-}
-
-// EncodeDatumKeyAscending encodes a datum using an order-preserving
-// encoding.
-// The encoding is lossy: some datums need composite encoding where
-// the key part only contains part of the datum's information.
-func EncodeDatumKeyAscending(b []byte, d tree.Datum) ([]byte, error) {
-	if values, ok := d.(*tree.DTuple); ok {
-		return EncodeDatumsKeyAscending(b, values.D)
-	}
-	return EncodeTableKey(b, d, encoding.Ascending)
-}
-
-// EncodeDatumsKeyAscending encodes a Datums (tuple) using an
-// order-preserving encoding.
-// The encoding is lossy: some datums need composite encoding where
-// the key part only contains part of the datum's information.
-func EncodeDatumsKeyAscending(b []byte, d tree.Datums) ([]byte, error) {
-	for _, val := range d {
-		var err error
-		b, err = EncodeDatumKeyAscending(b, val)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return b, nil
 }
 
 // MarshalColumnValue produces the value encoding of the given datum,

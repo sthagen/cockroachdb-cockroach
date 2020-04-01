@@ -1312,8 +1312,6 @@ func TestPropagateTxnOnError(t *testing.T) {
 			}
 			return nil
 		}
-	// Don't clobber the test's splits.
-	storeKnobs.DisableMergeQueue = true
 
 	s, _, _ := serverutils.StartServer(t,
 		base.TestServerArgs{Knobs: base.TestingKnobs{Store: &storeKnobs}})
@@ -1523,11 +1521,23 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			}
 			return nil
 		}
-	// Don't clobber the test's splits.
-	storeKnobs.DisableMergeQueue = true
 
+	var refreshSpansCondenseFilter atomic.Value
 	s, _, _ := serverutils.StartServer(t,
-		base.TestServerArgs{Knobs: base.TestingKnobs{Store: &storeKnobs}})
+		base.TestServerArgs{Knobs: base.TestingKnobs{
+			Store: &storeKnobs,
+			KVClient: &kvcoord.ClientTestingKnobs{
+				CondenseRefreshSpansFilter: func() bool {
+					fnVal := refreshSpansCondenseFilter.Load()
+					if fn, ok := fnVal.(func() bool); ok {
+						return fn()
+					}
+					return true
+				},
+			}}})
+
+	disableCondensingRefreshSpans := func() bool { return false }
+
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
@@ -1554,13 +1564,14 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name           string
-		beforeTxnStart func(context.Context, *kv.DB) error  // called before the txn starts
-		afterTxnStart  func(context.Context, *kv.DB) error  // called after the txn chooses a timestamp
-		retryable      func(context.Context, *kv.Txn) error // called during the txn; may be retried
-		filter         func(storagebase.FilterArgs) *roachpb.Error
-		priorReads     bool
-		tsLeaked       bool
+		name                       string
+		beforeTxnStart             func(context.Context, *kv.DB) error  // called before the txn starts
+		afterTxnStart              func(context.Context, *kv.DB) error  // called after the txn chooses a timestamp
+		retryable                  func(context.Context, *kv.Txn) error // called during the txn; may be retried
+		filter                     func(storagebase.FilterArgs) *roachpb.Error
+		refreshSpansCondenseFilter func() bool
+		priorReads                 bool
+		tsLeaked                   bool
 		// If both of these are false, no retries.
 		txnCoordRetry bool
 		clientRetry   bool
@@ -1675,9 +1686,46 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			// No retries, 1pc commit.
 		},
 		{
+			name: "forwarded timestamp with get in batch commit",
+			afterTxnStart: func(ctx context.Context, db *kv.DB) error {
+				_, err := db.Get(ctx, "a") // set ts cache
+				return err
+			},
+			retryable: func(ctx context.Context, txn *kv.Txn) error {
+				// Advance timestamp.
+				if err := txn.Put(ctx, "a", "put"); err != nil {
+					return err
+				}
+				b := txn.NewBatch()
+				b.Get("a2")
+				return txn.CommitInBatch(ctx, b)
+			},
+			// Read-only request (Get) prevents server-side refresh.
+			txnCoordRetry: true,
+		},
+		{
+			name: "forwarded timestamp with scan in batch commit",
+			afterTxnStart: func(ctx context.Context, db *kv.DB) error {
+				_, err := db.Get(ctx, "a") // set ts cache
+				return err
+			},
+			retryable: func(ctx context.Context, txn *kv.Txn) error {
+				// Advance timestamp.
+				if err := txn.Put(ctx, "a", "put"); err != nil {
+					return err
+				}
+				b := txn.NewBatch()
+				b.Scan("a2", "a3")
+				return txn.CommitInBatch(ctx, b)
+			},
+			// Read-only request (Scan) prevents server-side refresh.
+			txnCoordRetry: true,
+		},
+		{
 			// If we've exhausted the limit for tracking refresh spans but we
 			// already refreshed, keep running the txn.
-			name: "forwarded timestamp with too many refreshes, read only",
+			name:                       "forwarded timestamp with too many refreshes, read only",
+			refreshSpansCondenseFilter: disableCondensingRefreshSpans,
 			afterTxnStart: func(ctx context.Context, db *kv.DB) error {
 				return db.Put(ctx, "a", "value")
 			},
@@ -1706,8 +1754,11 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			// Even if accounting for the refresh spans would have exhausted the
 			// limit for tracking refresh spans and our transaction's timestamp
 			// has been pushed, if we successfully commit then we won't hit an
-			// error.
-			name: "forwarded timestamp with too many refreshes in batch commit",
+			// error. This is the case even if the final batch itself causes a
+			// no-op refresh because the txn has no refresh spans.
+			name: "forwarded timestamp with too many refreshes in batch commit " +
+				"with no-op refresh",
+			refreshSpansCondenseFilter: disableCondensingRefreshSpans,
 			afterTxnStart: func(ctx context.Context, db *kv.DB) error {
 				_, err := db.Get(ctx, "a") // set ts cache
 				return err
@@ -1732,15 +1783,17 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				}
 				return txn.CommitInBatch(ctx, b)
 			},
-			txnCoordRetry: false,
+			txnCoordRetry: true,
 		},
 		{
 			// Even if accounting for the refresh spans would have exhausted the
 			// limit for tracking refresh spans and our transaction's timestamp
 			// has been pushed, if we successfully commit then we won't hit an
 			// error. This is the case even if the final batch itself causes a
-			// refresh.
-			name: "forwarded timestamp with too many refreshes in batch commit triggering refresh",
+			// real refresh.
+			name: "forwarded timestamp with too many refreshes in batch commit " +
+				"with refresh",
+			refreshSpansCondenseFilter: disableCondensingRefreshSpans,
 			afterTxnStart: func(ctx context.Context, db *kv.DB) error {
 				_, err := db.Get(ctx, "a") // set ts cache
 				return err
@@ -2508,9 +2561,13 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				filterFn.Store(tc.filter)
 				defer filterFn.Store((func(storagebase.FilterArgs) *roachpb.Error)(nil))
 			}
+			if tc.refreshSpansCondenseFilter != nil {
+				refreshSpansCondenseFilter.Store(tc.refreshSpansCondenseFilter)
+				defer refreshSpansCondenseFilter.Store((func() bool)(nil))
+			}
 
 			var metrics kvcoord.TxnMetrics
-			var lastAutoRetries int64
+			var lastRefreshes int64
 			var hadClientRetry bool
 			epoch := 0
 			if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -2542,7 +2599,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				}
 
 				metrics = txn.Sender().(*kvcoord.TxnCoordSender).TxnCoordSenderFactory.Metrics()
-				lastAutoRetries = metrics.AutoRetries.Count()
+				lastRefreshes = metrics.RefreshSuccess.Count()
 
 				return tc.retryable(ctx, txn)
 			}); err != nil {
@@ -2558,11 +2615,11 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			// from the cluster setup are still ongoing and can experience
 			// their own retries, this might increase by more than one, so we
 			// can only check here that it's >= 1.
-			autoRetries := metrics.AutoRetries.Count() - lastAutoRetries
-			if tc.txnCoordRetry && autoRetries == 0 {
-				t.Errorf("expected [at least] one txn coord sender auto retry; got %d", autoRetries)
-			} else if !tc.txnCoordRetry && autoRetries != 0 {
-				t.Errorf("expected no txn coord sender auto retries; got %d", autoRetries)
+			refreshes := metrics.RefreshSuccess.Count() - lastRefreshes
+			if tc.txnCoordRetry && refreshes == 0 {
+				t.Errorf("expected [at least] one txn coord sender auto retry; got %d", refreshes)
+			} else if !tc.txnCoordRetry && refreshes != 0 {
+				t.Errorf("expected no txn coord sender auto retries; got %d", refreshes)
 			}
 			if tc.clientRetry && !hadClientRetry {
 				t.Errorf("expected but did not experience client retry")

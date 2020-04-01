@@ -21,11 +21,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
+	"golang.org/x/time/rate"
 )
+
+var sentryIssue46720Limiter = rate.NewLimiter(0.1, 1) // 1 every 10s
 
 // optimizePuts searches for contiguous runs of Put & CPut commands in
 // the supplied request union. Any run which exceeds a minimum length
@@ -333,7 +337,16 @@ func evaluateBatch(
 		if limit := baHeader.MaxSpanRequestKeys; limit > 0 {
 			retResults := reply.Header().NumKeys
 			if retResults > limit {
-				log.Fatalf(ctx, "received %d results, limit was %d", retResults, limit)
+				index, retResults, limit := index, retResults, limit // don't alloc unless branch taken
+				err := errorutil.UnexpectedWithIssueErrorf(46652,
+					"received %d results, limit was %d (original limit: %d, batch=%s idx=%d)",
+					errors.Safe(retResults), errors.Safe(limit),
+					errors.Safe(ba.Header.MaxSpanRequestKeys),
+					errors.Safe(ba.Summary()), errors.Safe(index))
+				if sentryIssue46720Limiter.Allow() {
+					errorutil.SendReport(ctx, &rec.ClusterSettings().SV, err)
+				}
+				return nil, mergedResult, roachpb.NewError(err)
 			} else if retResults < limit {
 				baHeader.MaxSpanRequestKeys -= retResults
 			} else {
@@ -517,7 +530,7 @@ func canDoServersideRetry(
 	pErr *roachpb.Error,
 	ba *roachpb.BatchRequest,
 	br *roachpb.BatchResponse,
-	spans *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
 	deadline *hlc.Timestamp,
 ) bool {
 	if ba.Txn != nil {
@@ -548,7 +561,16 @@ func canDoServersideRetry(
 	if pErr != nil {
 		switch tErr := pErr.GetDetail().(type) {
 		case *roachpb.WriteTooOldError:
+			// Locking scans hit WriteTooOld errors if they encounter values at
+			// timestamps higher than their read timestamps. The encountered
+			// timestamps are guaranteed to be greater than the txn's read
+			// timestamp, but not its write timestamp. So, when determining what
+			// the new timestamp should be, we make sure to not regress the
+			// txn's write timestamp.
 			newTimestamp = tErr.ActualTimestamp
+			if ba.Txn != nil {
+				newTimestamp.Forward(pErr.GetTxn().WriteTimestamp)
+			}
 		case *roachpb.TransactionRetryError:
 			if ba.Txn == nil {
 				// TODO(andrei): I don't know if TransactionRetryError is possible for
@@ -568,21 +590,8 @@ func canDoServersideRetry(
 		newTimestamp = br.Txn.WriteTimestamp
 	}
 
-	if spans.MaxProtectedTimestamp().Less(newTimestamp) {
-		// If the batch acquired any read latches with bounded (MVCC) timestamps
-		// below this new timestamp then we can not trivially bump the batch's
-		// timestamp without dropping and re-acquiring those latches. Doing so
-		// could allow the request to read at an unprotected timestamp.
-		//
-		// NOTE: we could consider adding a retry-loop above the latch
-		// acquisition to allow this to be retried, but given that we try not to
-		// mix read-only and read-write requests, doing so doesn't seem worth
-		// it.
-		return false
-	}
 	if deadline != nil && deadline.LessEq(newTimestamp) {
 		return false
 	}
-	bumpBatchTimestamp(ctx, ba, newTimestamp)
-	return true
+	return tryBumpBatchTimestamp(ctx, ba, newTimestamp, latchSpans)
 }

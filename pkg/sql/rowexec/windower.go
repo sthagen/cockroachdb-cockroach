@@ -202,6 +202,9 @@ func newWindower(
 	}
 
 	w.acc = w.MemMonitor.MakeBoundAccount()
+	// If we have aggregate builtins that aggregate a single datum, we want
+	// them to reuse the same shared memory account with the windower.
+	evalCtx.SingleDatumAggMemAccount = &w.acc
 
 	if sp := opentracing.SpanFromContext(ctx); sp != nil && tracing.IsRecording(sp) {
 		w.input = newInputStatCollector(w.input)
@@ -844,12 +847,21 @@ func (ws *WindowerStats) Stats() map[string]string {
 
 // StatsForQueryPlan implements the DistSQLSpanStats interface.
 func (ws *WindowerStats) StatsForQueryPlan() []string {
-	return append(
-		ws.InputStats.StatsForQueryPlan("" /* prefix */),
-		fmt.Sprintf("%s: %s", MaxMemoryQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedMem)),
-		fmt.Sprintf("%s: %s", MaxDiskQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedDisk)),
-	)
+	stats := ws.InputStats.StatsForQueryPlan("" /* prefix */)
+
+	if ws.MaxAllocatedMem != 0 {
+		stats = append(stats,
+			fmt.Sprintf("%s: %s", MaxMemoryQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedMem)))
+	}
+
+	if ws.MaxAllocatedDisk != 0 {
+		stats = append(stats,
+			fmt.Sprintf("%s: %s", MaxDiskQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedDisk)))
+	}
+
+	return stats
 }
+
 func (w *windower) outputStatsToTrace() {
 	is, ok := getInputStats(w.FlowCtx, w.input)
 	if !ok {
@@ -869,7 +881,10 @@ func (w *windower) outputStatsToTrace() {
 
 // ChildCount is part of the execinfra.OpNode interface.
 func (w *windower) ChildCount(verbose bool) int {
-	return 1
+	if _, ok := w.input.(execinfra.OpNode); ok {
+		return 1
+	}
+	return 0
 }
 
 // Child is part of the execinfra.OpNode interface.

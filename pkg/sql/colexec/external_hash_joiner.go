@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
 )
@@ -152,8 +153,14 @@ const (
 type externalHashJoiner struct {
 	twoInputNode
 	NonExplainable
+	closerHelper
 
-	closed             bool
+	// mu is used to protect against concurrent IdempotentClose and Next calls,
+	// which are currently allowed.
+	// TODO(asubiotto): Explore calling IdempotentClose from the same goroutine as
+	//  Next, which will simplify this model.
+	mu syncutil.Mutex
+
 	state              externalHashJoinerState
 	unlimitedAllocator *Allocator
 	spec               hashJoinerSpec
@@ -293,7 +300,6 @@ func newExternalHashJoiner(
 	rightJoinerInput := newPartitionerToOperator(
 		unlimitedAllocator, spec.right.sourceTypes, rightPartitioner, 0, /* partitionIdx */
 	)
-	diskQueuesTotalMemLimit := int(float64(memoryLimit) * externalHJDiskQueuesMemFraction)
 	// With the default limit of 256 file descriptors, this results in 16
 	// partitions. This is a hard maximum of partitions that will be used by the
 	// external hash joiner. Below we check whether we have enough RAM to support
@@ -301,6 +307,7 @@ func newExternalHashJoiner(
 	// TODO(yuzefovich): this number should be tuned.
 	maxNumberActivePartitions := fdSemaphore.GetLimit() / 16
 	if diskQueueCfg.BufferSizeBytes > 0 {
+		diskQueuesTotalMemLimit := int(float64(memoryLimit) * externalHJDiskQueuesMemFraction)
 		numDiskQueuesThatFit := diskQueuesTotalMemLimit / diskQueueCfg.BufferSizeBytes
 		if numDiskQueuesThatFit < maxNumberActivePartitions {
 			maxNumberActivePartitions = numDiskQueuesThatFit
@@ -309,6 +316,7 @@ func newExternalHashJoiner(
 	if maxNumberActivePartitions < externalHJMinPartitions {
 		maxNumberActivePartitions = externalHJMinPartitions
 	}
+	diskQueuesMemUsed := maxNumberActivePartitions * diskQueueCfg.BufferSizeBytes
 	makeOrderingCols := func(eqCols []uint32) []execinfrapb.Ordering_Column {
 		res := make([]execinfrapb.Ordering_Column, len(eqCols))
 		for i, colIdx := range eqCols {
@@ -380,7 +388,7 @@ func newExternalHashJoiner(
 	// single batch from the left partition will be read at a time as well as an
 	// output batch will be used, but that shouldn't matter in the grand scheme
 	// of things.
-	ehj.memState.maxRightPartitionSizeToJoin = memoryLimit - int64(diskQueuesTotalMemLimit)
+	ehj.memState.maxRightPartitionSizeToJoin = memoryLimit - int64(diskQueuesMemUsed)
 	ehj.scratch.leftBatch = unlimitedAllocator.NewMemBatch(spec.left.sourceTypes)
 	ehj.recursiveScratch.leftBatch = unlimitedAllocator.NewMemBatchNoCols(spec.left.sourceTypes, 0 /* size */)
 	sameSourcesSchema := len(spec.left.sourceTypes) == len(spec.right.sourceTypes)
@@ -464,18 +472,18 @@ func (hj *externalHashJoiner) partitionBatch(
 			}
 			if side == rightSide {
 				partitionInfo.rightParentMemSize = parentMemSize
-				// We cannot use allocator's methods directly because those look at the
-				// capacities of the vectors, and in our case only first len(sel)
-				// tuples belong to the "current" batch. Also, there is no selection
-				// vector on the enqueued batch, so we don't need to worry about that.
-				curBatchMemSize := getVecsMemoryFootprint(colVecs) / int64(batchLen) * int64(len(sel))
-				partitionInfo.rightMemSize += curBatchMemSize
+				// We cannot use allocator's methods directly because those
+				// look at the capacities of the vectors, and in our case only
+				// first len(sel) tuples belong to the "current" batch.
+				partitionInfo.rightMemSize += getProportionalBatchMemSize(scratchBatch, int64(len(sel)))
 			}
 		}
 	}
 }
 
 func (hj *externalHashJoiner) Next(ctx context.Context) coldata.Batch {
+	hj.mu.Lock()
+	defer hj.mu.Unlock()
 StateChanged:
 	for {
 		switch hj.state {
@@ -689,7 +697,7 @@ StateChanged:
 			return b
 
 		case externalHJFinished:
-			if err := hj.Close(ctx); err != nil {
+			if err := hj.idempotentCloseLocked(ctx); err != nil {
 				execerror.VectorizedInternalPanic(err)
 			}
 			return coldata.ZeroBatch
@@ -699,8 +707,14 @@ StateChanged:
 	}
 }
 
-func (hj *externalHashJoiner) Close(ctx context.Context) error {
-	if hj.closed {
+func (hj *externalHashJoiner) IdempotentClose(ctx context.Context) error {
+	hj.mu.Lock()
+	defer hj.mu.Unlock()
+	return hj.idempotentCloseLocked(ctx)
+}
+
+func (hj *externalHashJoiner) idempotentCloseLocked(ctx context.Context) error {
+	if !hj.close() {
 		return nil
 	}
 	var retErr error
@@ -710,8 +724,8 @@ func (hj *externalHashJoiner) Close(ctx context.Context) error {
 	if err := hj.rightPartitioner.Close(ctx); err != nil && retErr == nil {
 		retErr = err
 	}
-	if c, ok := hj.diskBackedSortMerge.(closer); ok {
-		if err := c.Close(ctx); err != nil && retErr == nil {
+	if c, ok := hj.diskBackedSortMerge.(IdempotentCloser); ok {
+		if err := c.IdempotentClose(ctx); err != nil && retErr == nil {
 			retErr = err
 		}
 	}
@@ -719,6 +733,5 @@ func (hj *externalHashJoiner) Close(ctx context.Context) error {
 		hj.fdState.fdSemaphore.Release(hj.fdState.acquiredFDs)
 		hj.fdState.acquiredFDs = 0
 	}
-	hj.closed = true
 	return retErr
 }

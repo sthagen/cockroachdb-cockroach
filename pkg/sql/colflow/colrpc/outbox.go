@@ -59,6 +59,8 @@ type Outbox struct {
 	// draining is an atomic that represents whether the Outbox is draining.
 	draining        uint32
 	metadataSources []execinfrapb.MetadataSource
+	// closers is a slice of Closers that need to be Closed on termination.
+	closers []colexec.IdempotentCloser
 
 	scratch struct {
 		buf *bytes.Buffer
@@ -76,6 +78,7 @@ func NewOutbox(
 	input colexec.Operator,
 	typs []coltypes.T,
 	metadataSources []execinfrapb.MetadataSource,
+	toClose []colexec.IdempotentCloser,
 ) (*Outbox, error) {
 	c, err := colserde.NewArrowBatchConverter(typs)
 	if err != nil {
@@ -93,10 +96,21 @@ func NewOutbox(
 		converter:       c,
 		serializer:      s,
 		metadataSources: metadataSources,
+		closers:         toClose,
 	}
 	o.scratch.buf = &bytes.Buffer{}
 	o.scratch.msg = &execinfrapb.ProducerMessage{}
 	return o, nil
+}
+
+func (o *Outbox) close(ctx context.Context) {
+	for _, closer := range o.closers {
+		if err := closer.IdempotentClose(ctx); err != nil {
+			if log.V(1) {
+				log.Infof(ctx, "error closing Closer: %v", err)
+			}
+		}
+	}
 }
 
 // Run starts an outbox by connecting to the provided node and pushing
@@ -127,39 +141,47 @@ func (o *Outbox) Run(
 ) {
 	o.runnerCtx = ctx
 	ctx = logtags.AddTag(ctx, "streamID", streamID)
-
 	log.VEventf(ctx, 2, "Outbox Dialing %s", nodeID)
-	conn, err := dialer.Dial(ctx, nodeID, rpc.DefaultClass)
-	if err != nil {
-		log.Warningf(
-			ctx,
-			"Outbox Dial connection error, distributed query will fail: %+v",
-			err,
-		)
-		return
-	}
 
-	client := execinfrapb.NewDistSQLClient(conn)
-	stream, err := client.FlowStream(ctx)
-	if err != nil {
-		log.Warningf(
-			ctx,
-			"Outbox FlowStream connection error, distributed query will fail: %+v",
-			err,
-		)
-		return
-	}
+	var stream execinfrapb.DistSQL_FlowStreamClient
+	if err := func() error {
+		conn, err := dialer.Dial(ctx, nodeID, rpc.DefaultClass)
+		if err != nil {
+			log.Warningf(
+				ctx,
+				"Outbox Dial connection error, distributed query will fail: %+v",
+				err,
+			)
+			return err
+		}
 
-	log.VEvent(ctx, 2, "Outbox sending header")
-	// Send header message to establish the remote server (consumer).
-	if err := stream.Send(
-		&execinfrapb.ProducerMessage{Header: &execinfrapb.ProducerHeader{FlowID: flowID, StreamID: streamID}},
-	); err != nil {
-		log.Warningf(
-			ctx,
-			"Outbox Send header error, distributed query will fail: %+v",
-			err,
-		)
+		client := execinfrapb.NewDistSQLClient(conn)
+		stream, err = client.FlowStream(ctx)
+		if err != nil {
+			log.Warningf(
+				ctx,
+				"Outbox FlowStream connection error, distributed query will fail: %+v",
+				err,
+			)
+			return err
+		}
+
+		log.VEvent(ctx, 2, "Outbox sending header")
+		// Send header message to establish the remote server (consumer).
+		if err := stream.Send(
+			&execinfrapb.ProducerMessage{Header: &execinfrapb.ProducerHeader{FlowID: flowID, StreamID: streamID}},
+		); err != nil {
+			log.Warningf(
+				ctx,
+				"Outbox Send header error, distributed query will fail: %+v",
+				err,
+			)
+			return err
+		}
+		return nil
+	}(); err != nil {
+		// error during stream set up.
+		o.close(ctx)
 		return
 	}
 
@@ -225,7 +247,9 @@ func (o *Outbox) sendBatches(
 		}
 
 		if err := execerror.CatchVectorizedRuntimeError(nextBatch); err != nil {
-			log.Warningf(ctx, "Outbox Next error: %+v", err)
+			if log.V(1) {
+				log.Warningf(ctx, "Outbox Next error: %+v", err)
+			}
 			return false, err
 		}
 		if o.batch.Length() == 0 {
@@ -320,5 +344,6 @@ func (o *Outbox) runWithStream(
 		}
 	}
 
+	o.close(ctx)
 	<-waitCh
 }

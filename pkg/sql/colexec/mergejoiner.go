@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/marusama/semaphore"
 )
 
@@ -102,8 +103,8 @@ type mjBufferedGroup struct {
 }
 
 func (bg *mjBufferedGroup) reset(ctx context.Context) {
-	if err := bg.close(ctx); err != nil {
-		execerror.VectorizedInternalPanic(err)
+	if bg.spillingQueue != nil {
+		bg.spillingQueue.reset(ctx)
 	}
 	bg.numTuples = 0
 }
@@ -296,7 +297,7 @@ func newMergeJoinBase(
 	leftOrdering []execinfrapb.Ordering_Column,
 	rightOrdering []execinfrapb.Ordering_Column,
 	diskAcc *mon.BoundAccount,
-) (mergeJoinBase, error) {
+) (*mergeJoinBase, error) {
 	lEqCols := make([]uint32, len(leftOrdering))
 	lDirections := make([]execinfrapb.Ordering_Column_Direction, len(leftOrdering))
 	for i, c := range leftOrdering {
@@ -313,7 +314,7 @@ func newMergeJoinBase(
 
 	diskQueueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
 	diskQueueCfg.SetDefaultBufferSizeBytesForCacheMode()
-	base := mergeJoinBase{
+	base := &mergeJoinBase{
 		twoInputNode:       newTwoInputNode(left, right),
 		unlimitedAllocator: unlimitedAllocator,
 		memoryLimit:        memoryLimit,
@@ -354,6 +355,13 @@ func newMergeJoinBase(
 // mergeJoinBase extracts the common logic between all merge join operators.
 type mergeJoinBase struct {
 	twoInputNode
+	closerHelper
+
+	// mu is used to protect against concurrent IdempotentClose and Next calls,
+	// which are currently allowed.
+	// TODO(asubiotto): Explore calling IdempotentClose from the same goroutine as
+	//  Next, which will simplify this model.
+	mu syncutil.Mutex
 
 	unlimitedAllocator *Allocator
 	memoryLimit        int64
@@ -395,7 +403,7 @@ type mergeJoinBase struct {
 }
 
 var _ resetter = &mergeJoinBase{}
-var _ closer = &mergeJoinBase{}
+var _ IdempotentCloser = &mergeJoinBase{}
 
 func (o *mergeJoinBase) reset(ctx context.Context) {
 	if r, ok := o.left.source.(resetter); ok {
@@ -410,6 +418,8 @@ func (o *mergeJoinBase) reset(ctx context.Context) {
 	o.proberState.rBatch = nil
 	o.proberState.lBufferedGroup.reset(ctx)
 	o.proberState.rBufferedGroup.reset(ctx)
+	o.proberState.lBufferedGroupNeedToReset = false
+	o.proberState.rBufferedGroupNeedToReset = false
 	o.resetBuilderCrossProductState()
 }
 
@@ -439,10 +449,18 @@ func (o *mergeJoinBase) initWithOutputBatchSize(outBatchSize int) {
 		o.outputBatchSize = 1<<16 - 1
 	}
 
+	o.proberState.lBufferedGroup.spillingQueue = newSpillingQueue(
+		o.unlimitedAllocator, o.left.sourceTypes, o.memoryLimit,
+		o.diskQueueCfg, o.fdSemaphore, coldata.BatchSize(), o.diskAcc,
+	)
 	o.proberState.lBufferedGroup.firstTuple = make([]coldata.Vec, len(o.left.sourceTypes))
 	for colIdx, colType := range o.left.sourceTypes {
 		o.proberState.lBufferedGroup.firstTuple[colIdx] = o.unlimitedAllocator.NewMemColumn(colType, 1)
 	}
+	o.proberState.rBufferedGroup.spillingQueue = newRewindableSpillingQueue(
+		o.unlimitedAllocator, o.right.sourceTypes, o.memoryLimit,
+		o.diskQueueCfg, o.fdSemaphore, coldata.BatchSize(), o.diskAcc,
+	)
 	o.proberState.rBufferedGroup.firstTuple = make([]coldata.Vec, len(o.right.sourceTypes))
 	for colIdx, colType := range o.right.sourceTypes {
 		o.proberState.rBufferedGroup.firstTuple[colIdx] = o.unlimitedAllocator.NewMemColumn(colType, 1)
@@ -483,12 +501,6 @@ func (o *mergeJoinBase) appendToBufferedGroup(
 	if input == &o.left {
 		sourceTypes = o.left.sourceTypes
 		bufferedGroup = &o.proberState.lBufferedGroup
-		if bufferedGroup.spillingQueue == nil {
-			bufferedGroup.spillingQueue = newSpillingQueue(
-				o.unlimitedAllocator, o.left.sourceTypes, o.memoryLimit,
-				o.diskQueueCfg, o.fdSemaphore, coldata.BatchSize(), o.diskAcc,
-			)
-		}
 		// TODO(yuzefovich): uncomment when spillingQueue actually copies the
 		// enqueued batches when those are kept in memory.
 		//if o.scratch.lBufferedGroupBatch == nil {
@@ -498,12 +510,6 @@ func (o *mergeJoinBase) appendToBufferedGroup(
 	} else {
 		sourceTypes = o.right.sourceTypes
 		bufferedGroup = &o.proberState.rBufferedGroup
-		if bufferedGroup.spillingQueue == nil {
-			bufferedGroup.spillingQueue = newRewindableSpillingQueue(
-				o.unlimitedAllocator, o.right.sourceTypes, o.memoryLimit,
-				o.diskQueueCfg, o.fdSemaphore, coldata.BatchSize(), o.diskAcc,
-			)
-		}
 		// TODO(yuzefovich): uncomment when spillingQueue actually copies the
 		// enqueued batches when those are kept in memory.
 		//if o.scratch.rBufferedGroupBatch == nil {
@@ -692,26 +698,25 @@ func (o *mergeJoinBase) finishProbe(ctx context.Context) {
 	)
 }
 
-func (o *mergeJoinBase) Close(ctx context.Context) error {
+func (o *mergeJoinBase) IdempotentClose(ctx context.Context) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.close() {
+		return nil
+	}
 	var lastErr error
 	for _, op := range []Operator{o.left.source, o.right.source} {
-		if c, ok := op.(closer); ok {
-			if err := c.Close(ctx); err != nil {
+		if c, ok := op.(IdempotentCloser); ok {
+			if err := c.IdempotentClose(ctx); err != nil {
 				lastErr = err
 			}
 		}
 	}
-	if o.proberState.lBufferedGroup.spillingQueue != nil {
-		if err := o.proberState.lBufferedGroup.close(ctx); err != nil {
-			lastErr = err
-		}
-		o.proberState.lBufferedGroup.spillingQueue = nil
+	if err := o.proberState.lBufferedGroup.close(ctx); err != nil {
+		lastErr = err
 	}
-	if o.proberState.rBufferedGroup.spillingQueue != nil {
-		if err := o.proberState.rBufferedGroup.close(ctx); err != nil {
-			lastErr = err
-		}
-		o.proberState.rBufferedGroup.spillingQueue = nil
+	if err := o.proberState.rBufferedGroup.close(ctx); err != nil {
+		lastErr = err
 	}
 	return lastErr
 }

@@ -48,6 +48,10 @@ func (t tuple) String() string {
 		}
 		if d, ok := t[i].(apd.Decimal); ok {
 			sb.WriteString(d.String())
+		} else if d, ok := t[i].(*apd.Decimal); ok {
+			sb.WriteString(d.String())
+		} else if d, ok := t[i].([]byte); ok {
+			sb.WriteString(string(d))
 		} else {
 			sb.WriteString(fmt.Sprintf("%v", t[i]))
 		}
@@ -121,8 +125,38 @@ func (t tuple) less(other tuple) bool {
 	return false
 }
 
+func (t tuple) clone() tuple {
+	b := make(tuple, len(t))
+	for i := range b {
+		b[i] = t[i]
+	}
+
+	return b
+}
+
 // tuples represents a table with any-type columns.
 type tuples []tuple
+
+func (t tuples) clone() tuples {
+	b := make(tuples, len(t))
+	for i := range b {
+		b[i] = t[i].clone()
+	}
+	return b
+}
+
+func (t tuples) String() string {
+	var sb strings.Builder
+	sb.WriteString("[")
+	for i := range t {
+		if i != 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(t[i].String())
+	}
+	sb.WriteString("]")
+	return sb.String()
+}
 
 // sort returns a copy of sorted tuples.
 func (t tuples) sort() tuples {
@@ -275,11 +309,11 @@ func runTestsWithTyps(
 				"non-nulls in the input tuples, we expect for all nulls injection to "+
 				"change the output")
 		}
-		if c, ok := originalOp.(closer); ok {
-			require.NoError(t, c.Close(ctx))
+		if c, ok := originalOp.(IdempotentCloser); ok {
+			require.NoError(t, c.IdempotentClose(ctx))
 		}
-		if c, ok := opWithNulls.(closer); ok {
-			require.NoError(t, c.Close(ctx))
+		if c, ok := opWithNulls.(IdempotentCloser); ok {
+			require.NoError(t, c.IdempotentClose(ctx))
 		}
 	})
 }
@@ -402,10 +436,10 @@ func runTestsWithoutAllNullsInjection(
 						assert.False(t, maybeHasNulls(b))
 					}
 				}
-				if c, ok := op.(closer); ok {
+				if c, ok := op.(IdempotentCloser); ok {
 					// Some operators need an explicit Close if not drained completely of
 					// input.
-					assert.NoError(t, c.Close(ctx))
+					assert.NoError(t, c.IdempotentClose(ctx))
 				}
 			}
 		})
@@ -520,9 +554,26 @@ func setColVal(vec coldata.Vec, idx int, val interface{}) {
 			bytesVal = []byte(val.(string))
 		}
 		vec.Bytes().Set(idx, bytesVal)
-		return
+	} else if vec.Type() == coltypes.Decimal {
+		// setColVal is used in multiple places, therefore val can be either a float
+		// or apd.Decimal.
+		if decimalVal, ok := val.(apd.Decimal); ok {
+			vec.Decimal()[idx].Set(&decimalVal)
+		} else {
+			floatVal := val.(float64)
+			decimalVal, _, err := apd.NewFromString(fmt.Sprintf("%f", floatVal))
+			if err != nil {
+				execerror.VectorizedInternalPanic(
+					fmt.Sprintf("unable to set decimal %f: %v", floatVal, err))
+			}
+			// .Set is used here instead of assignment to ensure the pointer address
+			// of the underlying storage for apd.Decimal remains the same. This can
+			// cause the code that does not properly use execgen package to fail.
+			vec.Decimal()[idx].Set(decimalVal)
+		}
+	} else {
+		reflect.ValueOf(vec.Col()).Index(idx).Set(reflect.ValueOf(val).Convert(reflect.TypeOf(vec.Col()).Elem()))
 	}
-	reflect.ValueOf(vec.Col()).Index(idx).Set(reflect.ValueOf(val).Convert(reflect.TypeOf(vec.Col()).Elem()))
 }
 
 // opTestInput is an Operator that columnarizes test input in the form of tuples
@@ -970,6 +1021,16 @@ func tupleEquals(expected tuple, actual tuple) bool {
 					}
 				}
 			}
+			if d1, ok := actual[i].(apd.Decimal); ok {
+				if f2, ok := expected[i].(float64); ok {
+					d2, _, err := apd.NewFromString(fmt.Sprintf("%f", f2))
+					if err == nil && d1.Cmp(d2) == 0 {
+						continue
+					} else {
+						return false
+					}
+				}
+			}
 			if !reflect.DeepEqual(
 				reflect.ValueOf(actual[i]).Convert(reflect.TypeOf(expected[i])).Interface(),
 				expected[i],
@@ -1286,19 +1347,19 @@ func (c *chunkingBatchSource) reset() {
 type joinTestCase struct {
 	description           string
 	joinType              sqlbase.JoinType
-	leftTuples            []tuple
+	leftTuples            tuples
 	leftTypes             []coltypes.T
 	leftOutCols           []uint32
 	leftEqCols            []uint32
 	leftDirections        []execinfrapb.Ordering_Column_Direction
-	rightTuples           []tuple
+	rightTuples           tuples
 	rightTypes            []coltypes.T
 	rightOutCols          []uint32
 	rightEqCols           []uint32
 	rightDirections       []execinfrapb.Ordering_Column_Direction
 	leftEqColsAreKey      bool
 	rightEqColsAreKey     bool
-	expected              []tuple
+	expected              tuples
 	outputBatchSize       int
 	skipAllNullsInjection bool
 	onExpr                execinfrapb.Expression
@@ -1322,6 +1383,60 @@ func (tc *joinTestCase) init() {
 			tc.rightDirections[i] = execinfrapb.Ordering_Column_ASC
 		}
 	}
+}
+
+// mutateTypes returns a slice of joinTestCases with varied types. Assumes
+// the input is made up of just int64s. Calling this
+func (tc *joinTestCase) mutateTypes() []joinTestCase {
+	ret := []joinTestCase{*tc}
+
+	for _, typ := range []coltypes.T{coltypes.Decimal, coltypes.Bytes} {
+		if typ == coltypes.Bytes {
+			// Skip test cases with ON conditions for now, since those expect
+			// numeric inputs.
+			if !tc.onExpr.Empty() {
+				continue
+			}
+		}
+		newTc := *tc
+		newTc.leftTypes = make([]coltypes.T, len(tc.leftTypes))
+		newTc.rightTypes = make([]coltypes.T, len(tc.rightTypes))
+		copy(newTc.leftTypes, tc.leftTypes)
+		copy(newTc.rightTypes, tc.rightTypes)
+		for _, typs := range [][]coltypes.T{newTc.leftTypes, newTc.rightTypes} {
+			for i := range typs {
+				if typs[i] != coltypes.Int64 {
+					// We currently can only mutate test cases that are made up of int64
+					// only.
+					return ret
+				}
+				typs[i] = typ
+			}
+		}
+		newTc.leftTuples = tc.leftTuples.clone()
+		newTc.rightTuples = tc.rightTuples.clone()
+		newTc.expected = tc.expected.clone()
+
+		for _, tups := range []tuples{newTc.leftTuples, newTc.rightTuples, newTc.expected} {
+			for i := range tups {
+				for j := range tups[i] {
+					if tups[i][j] == nil {
+						continue
+					}
+					switch typ {
+					case coltypes.Decimal:
+						var d apd.Decimal
+						_, _ = d.SetFloat64(float64(tups[i][j].(int)))
+						tups[i][j] = d
+					case coltypes.Bytes:
+						tups[i][j] = fmt.Sprintf("%.10d", tups[i][j].(int))
+					}
+				}
+			}
+		}
+		ret = append(ret, newTc)
+	}
+	return ret
 }
 
 type sortTestCase struct {

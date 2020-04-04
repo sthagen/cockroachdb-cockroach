@@ -12,43 +12,43 @@ query TTT
 EXPLAIN SELECT a, b FROM t ORDER BY b
 ----
 ·          distributed  false
-·          vectorized   true
+·          vectorized   false
 sort       ·            ·
  │         order        +b
  └── scan  ·            ·
 ·          table        t@primary
-·          spans        ALL
+·          spans        FULL SCAN
 
 query TTT
 EXPLAIN SELECT a, b FROM t ORDER BY b DESC
 ----
 ·          distributed  false
-·          vectorized   true
+·          vectorized   false
 sort       ·            ·
  │         order        -b
  └── scan  ·            ·
 ·          table        t@primary
-·          spans        ALL
+·          spans        FULL SCAN
 
 # TODO(radu): Should set "strategy top 2" on sort node
 query TTT
 EXPLAIN SELECT a, b FROM t ORDER BY b LIMIT 2
 ----
 ·               distributed  false
-·               vectorized   true
+·               vectorized   false
 limit           ·            ·
  │              count        2
  └── sort       ·            ·
       │         order        +b
       └── scan  ·            ·
 ·               table        t@primary
-·               spans        ALL
+·               spans        FULL SCAN
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT DISTINCT c, b FROM t ORDER BY b LIMIT 2
 ----
 ·                         distributed  false      ·       ·
-·                         vectorized   true       ·       ·
+·                         vectorized   false      ·       ·
 render                    ·            ·          (c, b)  ·
  │                        render 0     c          ·       ·
  │                        render 1     b          ·       ·
@@ -60,7 +60,7 @@ render                    ·            ·          (c, b)  ·
                 │         distinct on  b, c       ·       ·
                 └── scan  ·            ·          (b, c)  ·
 ·                         table        t@primary  ·       ·
-·                         spans        ALL        ·       ·
+·                         spans        FULL SCAN  ·       ·
 
 query TTT
 EXPLAIN SELECT b FROM t ORDER BY a DESC
@@ -70,7 +70,7 @@ EXPLAIN SELECT b FROM t ORDER BY a DESC
 render        ·            ·
  └── revscan  ·            ·
 ·             table        t@primary
-·             spans        ALL
+·             spans        FULL SCAN
 
 # Check that LIMIT propagates past nosort nodes.
 query TTT
@@ -81,7 +81,7 @@ EXPLAIN SELECT b FROM t ORDER BY a LIMIT 1
 render     ·            ·
  └── scan  ·            ·
 ·          table        t@primary
-·          spans        ALL
+·          spans        LIMITED SCAN
 ·          limit        1
 
 query TTT
@@ -92,7 +92,7 @@ EXPLAIN SELECT b FROM t ORDER BY a DESC, b ASC
 render        ·            ·
  └── revscan  ·            ·
 ·             table        t@primary
-·             spans        ALL
+·             spans        FULL SCAN
 
 query TTT
 EXPLAIN SELECT b FROM t ORDER BY a DESC, b DESC
@@ -102,51 +102,51 @@ EXPLAIN SELECT b FROM t ORDER BY a DESC, b DESC
 render        ·            ·
  └── revscan  ·            ·
 ·             table        t@primary
-·             spans        ALL
+·             spans        FULL SCAN
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM t ORDER BY (b, t.*)
 ----
 ·          distributed  false      ·          ·
-·          vectorized   true       ·          ·
+·          vectorized   false      ·          ·
 sort       ·            ·          (a, b, c)  +b,+a
  │         order        +b,+a      ·          ·
  └── scan  ·            ·          (a, b, c)  ·
 ·          table        t@primary  ·          ·
-·          spans        ALL        ·          ·
+·          spans        FULL SCAN  ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM t ORDER BY (b, a), c
 ----
 ·          distributed  false      ·          ·
-·          vectorized   true       ·          ·
+·          vectorized   false      ·          ·
 sort       ·            ·          (a, b, c)  +b,+a
  │         order        +b,+a      ·          ·
  └── scan  ·            ·          (a, b, c)  ·
 ·          table        t@primary  ·          ·
-·          spans        ALL        ·          ·
+·          spans        FULL SCAN  ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM t ORDER BY b, (a, c)
 ----
 ·          distributed  false      ·          ·
-·          vectorized   true       ·          ·
+·          vectorized   false      ·          ·
 sort       ·            ·          (a, b, c)  +b,+a
  │         order        +b,+a      ·          ·
  └── scan  ·            ·          (a, b, c)  ·
 ·          table        t@primary  ·          ·
-·          spans        ALL        ·          ·
+·          spans        FULL SCAN  ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM t ORDER BY (b, (a, c))
 ----
 ·          distributed  false      ·          ·
-·          vectorized   true       ·          ·
+·          vectorized   false      ·          ·
 sort       ·            ·          (a, b, c)  +b,+a
  │         order        +b,+a      ·          ·
  └── scan  ·            ·          (a, b, c)  ·
 ·          table        t@primary  ·          ·
-·          spans        ALL        ·          ·
+·          spans        FULL SCAN  ·          ·
 
 # Check that sort is skipped if the ORDER BY clause is constant.
 query TTT
@@ -156,7 +156,7 @@ EXPLAIN SELECT * FROM t ORDER BY 1+2
 ·     vectorized   true
 scan  ·            ·
 ·     table        t@primary
-·     spans        ALL
+·     spans        FULL SCAN
 
 query TTT
 EXPLAIN SELECT 1, * FROM t ORDER BY 1
@@ -166,7 +166,7 @@ EXPLAIN SELECT 1, * FROM t ORDER BY 1
 render     ·            ·
  └── scan  ·            ·
 ·          table        t@primary
-·          spans        ALL
+·          spans        FULL SCAN
 
 query TTT
 EXPLAIN SELECT * FROM t ORDER BY length('abc')
@@ -175,35 +175,35 @@ EXPLAIN SELECT * FROM t ORDER BY length('abc')
 ·     vectorized   true
 scan  ·            ·
 ·     table        t@primary
-·     spans        ALL
+·     spans        FULL SCAN
 
 # Check that the sort key reuses the existing render.
 query TTTTT
 EXPLAIN (VERBOSE) SELECT b+2 r FROM t ORDER BY b+2
 ----
 ·               distributed  false      ·    ·
-·               vectorized   true       ·    ·
+·               vectorized   false      ·    ·
 sort            ·            ·          (r)  +r
  │              order        +r         ·    ·
  └── render     ·            ·          (r)  ·
       │         render 0     b + 2      ·    ·
       └── scan  ·            ·          (b)  ·
 ·               table        t@primary  ·    ·
-·               spans        ALL        ·    ·
+·               spans        FULL SCAN  ·    ·
 
 # Check that the sort picks up a renamed render properly.
 query TTTTT
 EXPLAIN (VERBOSE) SELECT b+2 AS y FROM t ORDER BY y
 ----
 ·               distributed  false      ·    ·
-·               vectorized   true       ·    ·
+·               vectorized   false      ·    ·
 sort            ·            ·          (y)  +y
  │              order        +y         ·    ·
  └── render     ·            ·          (y)  ·
       │         render 0     b + 2      ·    ·
       └── scan  ·            ·          (b)  ·
 ·               table        t@primary  ·    ·
-·               spans        ALL        ·    ·
+·               spans        FULL SCAN  ·    ·
 
 statement ok
 CREATE TABLE abc (
@@ -258,14 +258,14 @@ EXPLAIN SELECT a, b, c FROM abc ORDER BY b, a, c
 ·     vectorized   true
 scan  ·            ·
 ·     table        abc@ba
-·     spans        ALL
+·     spans        FULL SCAN
 
 # We use the WHERE condition to force the use of the index.
 query TTT
 EXPLAIN SELECT a, b, c FROM abc WHERE b > 10 AND b < 30 ORDER BY b, a, d
 ----
 ·                     distributed      false
-·                     vectorized       true
+·                     vectorized       false
 render                ·                ·
  └── sort             ·                ·
       │               order            +b,+a,+d
@@ -282,13 +282,13 @@ query TTT
 EXPLAIN SELECT a, b, c FROM abc WHERE b > 10 ORDER BY b, a, d
 ----
 ·               distributed  false
-·               vectorized   true
+·               vectorized   false
 render          ·            ·
  └── sort       ·            ·
       │         order        +b,+a,+d
       └── scan  ·            ·
 ·               table        abc@primary
-·               spans        ALL
+·               spans        FULL SCAN
 ·               filter       b > 10
 
 query III
@@ -307,12 +307,12 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT a, b, c, d FROM abc WHERE b > 10 ORDER BY b, a, c, d
 ----
 ·          distributed  false        ·             ·
-·          vectorized   true         ·             ·
+·          vectorized   false        ·             ·
 sort       ·            ·            (a, b, c, d)  +b,+a,+c
  │         order        +b,+a,+c     ·             ·
  └── scan  ·            ·            (a, b, c, d)  ·
 ·          table        abc@primary  ·             ·
-·          spans        ALL          ·             ·
+·          spans        FULL SCAN    ·             ·
 ·          filter       b > 10       ·             ·
 
 query TTT
@@ -323,19 +323,19 @@ EXPLAIN SELECT a, b FROM abc ORDER BY b, c
 render     ·            ·
  └── scan  ·            ·
 ·          table        abc@bc
-·          spans        ALL
+·          spans        FULL SCAN
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT a, b FROM abc ORDER BY b, c
 ----
-·          distributed  false   ·          ·
-·          vectorized   true    ·          ·
-render     ·            ·       (a, b)     ·
- │         render 0     a       ·          ·
- │         render 1     b       ·          ·
- └── scan  ·            ·       (a, b, c)  +b,+c
-·          table        abc@bc  ·          ·
-·          spans        ALL     ·          ·
+·          distributed  false      ·          ·
+·          vectorized   true       ·          ·
+render     ·            ·          (a, b)     ·
+ │         render 0     a          ·          ·
+ │         render 1     b          ·          ·
+ └── scan  ·            ·          (a, b, c)  +b,+c
+·          table        abc@bc     ·          ·
+·          spans        FULL SCAN  ·          ·
 
 query TTT
 EXPLAIN SELECT a, b FROM abc ORDER BY b, c, a
@@ -345,7 +345,7 @@ EXPLAIN SELECT a, b FROM abc ORDER BY b, c, a
 render     ·            ·
  └── scan  ·            ·
 ·          table        abc@bc
-·          spans        ALL
+·          spans        FULL SCAN
 
 query TTT
 EXPLAIN SELECT a, b FROM abc ORDER BY b, c, a DESC
@@ -355,7 +355,7 @@ EXPLAIN SELECT a, b FROM abc ORDER BY b, c, a DESC
 render     ·            ·
  └── scan  ·            ·
 ·          table        abc@bc
-·          spans        ALL
+·          spans        FULL SCAN
 
 statement ok
 SET tracing = on,kv,results; SELECT b, c FROM abc ORDER BY b, c; SET tracing = off
@@ -405,7 +405,7 @@ EXPLAIN SELECT a FROM abc ORDER BY a DESC
 ·        vectorized   true
 revscan  ·            ·
 ·        table        abc@primary
-·        spans        ALL
+·        spans        FULL SCAN
 
 query TTT
 EXPLAIN SELECT c FROM abc WHERE b = 2 ORDER BY c
@@ -450,7 +450,7 @@ EXPLAIN (VERBOSE) SELECT * FROM bar ORDER BY baz, id
 ·     vectorized   true       ·          ·
 scan  ·            ·          (id, baz)  +baz,+id
 ·     table        bar@i_bar  ·          ·
-·     spans        ALL        ·          ·
+·     spans        FULL SCAN  ·          ·
 
 statement ok
 CREATE TABLE abcd (
@@ -617,7 +617,7 @@ render                    ·                 ·           (b)                 ·
                 │         render 3          true        ·                   ·
                 └── scan  ·                 ·           (a, b, c)           ·
 ·                         table             t@primary   ·                   ·
-·                         spans             ALL         ·                   ·
+·                         spans             FULL SCAN   ·                   ·
 ·                         locking strength  for update  ·                   ·
 
 statement ok
@@ -675,7 +675,7 @@ render     ·            ·               (block_id, writer_id, block_num, block
  │         render 3     block_id        ·                                           ·
  └── scan  ·            ·               (block_id, writer_id, block_num)            ·
 ·          table        blocks@primary  ·                                           ·
-·          spans        ALL             ·                                           ·
+·          spans        LIMITED SCAN    ·                                           ·
 ·          limit        1               ·                                           ·
 
 statement ok
@@ -686,7 +686,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT b, a FROM foo ORDER BY @1
 ----
 ·                    distributed  false        ·                ·
-·                    vectorized   true         ·                ·
+·                    vectorized   false        ·                ·
 render               ·            ·            (b, a)           ·
  │                   render 0     b            ·                ·
  │                   render 1     a            ·                ·
@@ -698,13 +698,13 @@ render               ·            ·            (b, a)           ·
            │         render 2     b            ·                ·
            └── scan  ·            ·            (a, b)           ·
 ·                    table        foo@primary  ·                ·
-·                    spans        ALL          ·                ·
+·                    spans        FULL SCAN    ·                ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT b, a FROM foo ORDER BY @2
 ----
 ·                    distributed  false        ·                ·
-·                    vectorized   true         ·                ·
+·                    vectorized   false        ·                ·
 render               ·            ·            (b, a)           ·
  │                   render 0     b            ·                ·
  │                   render 1     a            ·                ·
@@ -716,7 +716,7 @@ render               ·            ·            (b, a)           ·
            │         render 2     b            ·                ·
            └── scan  ·            ·            (a, b)           ·
 ·                    table        foo@primary  ·                ·
-·                    spans        ALL          ·                ·
+·                    spans        FULL SCAN    ·                ·
 
 # ------------------------------------------------------------------------------
 # Check star expansion in ORDER BY.
@@ -730,12 +730,12 @@ EXPLAIN (VERBOSE) SELECT * FROM a ORDER BY a.*
 ]
 ----
 ·          distributed  false
-·          vectorized   true
+·          vectorized   false
 sort       ·            ·
  │         order        +x,+y
  └── scan  ·            ·
 ·          table        a@primary
-·          spans        ALL
+·          spans        FULL SCAN
 
 query TTT
 SELECT tree, field, description FROM [
@@ -743,12 +743,12 @@ EXPLAIN (VERBOSE) SELECT * FROM a ORDER BY (a.*)
 ]
 ----
 ·          distributed  false
-·          vectorized   true
+·          vectorized   false
 sort       ·            ·
  │         order        +x,+y
  └── scan  ·            ·
 ·          table        a@primary
-·          spans        ALL
+·          spans        FULL SCAN
 
 # ------------------------------------------------------------------------------
 # ORDER BY INDEX test cases.
@@ -767,7 +767,7 @@ render     ·            ·           (v)     ·
  │         render 0     v           ·       ·
  └── scan  ·            ·           (k, v)  +k
 ·          table        kv@primary  ·       ·
-·          spans        ALL         ·       ·
+·          spans        FULL SCAN   ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT v FROM kv ORDER BY PRIMARY KEY kv ASC
@@ -778,7 +778,7 @@ render     ·            ·           (v)     ·
  │         render 0     v           ·       ·
  └── scan  ·            ·           (k, v)  +k
 ·          table        kv@primary  ·       ·
-·          spans        ALL         ·       ·
+·          spans        FULL SCAN   ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT v FROM kv ORDER BY PRIMARY KEY kv DESC
@@ -789,64 +789,64 @@ render        ·            ·           (v)     ·
  │            render 0     v           ·       ·
  └── revscan  ·            ·           (k, v)  -k
 ·             table        kv@primary  ·       ·
-·             spans        ALL         ·       ·
+·             spans        FULL SCAN   ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT k FROM kv ORDER BY v, PRIMARY KEY kv, v-2
 ----
 ·               distributed  false       ·       ·
-·               vectorized   true        ·       ·
+·               vectorized   false       ·       ·
 render          ·            ·           (k)     ·
  │              render 0     k           ·       ·
  └── sort       ·            ·           (k, v)  +v,+k
       │         order        +v,+k       ·       ·
       └── scan  ·            ·           (k, v)  ·
 ·               table        kv@primary  ·       ·
-·               spans        ALL         ·       ·
+·               spans        FULL SCAN   ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT k FROM kv ORDER BY INDEX kv@foo
 ----
-·          distributed  false   ·       ·
-·          vectorized   true    ·       ·
-render     ·            ·       (k)     ·
- │         render 0     k       ·       ·
- └── scan  ·            ·       (k, v)  -v,+k
-·          table        kv@foo  ·       ·
-·          spans        ALL     ·       ·
+·          distributed  false      ·       ·
+·          vectorized   true       ·       ·
+render     ·            ·          (k)     ·
+ │         render 0     k          ·       ·
+ └── scan  ·            ·          (k, v)  -v,+k
+·          table        kv@foo     ·       ·
+·          spans        FULL SCAN  ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT k FROM kv ORDER BY INDEX kv@foo ASC
 ----
-·          distributed  false   ·       ·
-·          vectorized   true    ·       ·
-render     ·            ·       (k)     ·
- │         render 0     k       ·       ·
- └── scan  ·            ·       (k, v)  -v,+k
-·          table        kv@foo  ·       ·
-·          spans        ALL     ·       ·
+·          distributed  false      ·       ·
+·          vectorized   true       ·       ·
+render     ·            ·          (k)     ·
+ │         render 0     k          ·       ·
+ └── scan  ·            ·          (k, v)  -v,+k
+·          table        kv@foo     ·       ·
+·          spans        FULL SCAN  ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT k FROM kv ORDER BY INDEX kv@foo DESC
 ----
-·             distributed  false   ·       ·
-·             vectorized   true    ·       ·
-render        ·            ·       (k)     ·
- │            render 0     k       ·       ·
- └── revscan  ·            ·       (k, v)  +v,-k
-·             table        kv@foo  ·       ·
-·             spans        ALL     ·       ·
+·             distributed  false      ·       ·
+·             vectorized   true       ·       ·
+render        ·            ·          (k)     ·
+ │            render 0     k          ·       ·
+ └── revscan  ·            ·          (k, v)  +v,-k
+·             table        kv@foo     ·       ·
+·             spans        FULL SCAN  ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT k FROM kv ORDER BY INDEX kv@foo, k
 ----
-·          distributed  false   ·       ·
-·          vectorized   true    ·       ·
-render     ·            ·       (k)     ·
- │         render 0     k       ·       ·
- └── scan  ·            ·       (k, v)  -v,+k
-·          table        kv@foo  ·       ·
-·          spans        ALL     ·       ·
+·          distributed  false      ·       ·
+·          vectorized   true       ·       ·
+render     ·            ·          (k)     ·
+ │         render 0     k          ·       ·
+ └── scan  ·            ·          (k, v)  -v,+k
+·          table        kv@foo     ·       ·
+·          spans        FULL SCAN  ·       ·
 
 # Check the syntax can be used with joins.
 #
@@ -893,10 +893,10 @@ render           ·                   ·                  (k)           ·
       │          mergeJoinOrder      -"(v=v)",+"(k=k)"  ·             ·
       ├── scan   ·                   ·                  (k, v)        -v,+k
       │          table               kv@foo             ·             ·
-      │          spans               ALL                ·             ·
+      │          spans               FULL SCAN          ·             ·
       └── scan   ·                   ·                  (k, v)        -v,+k
 ·                table               kv@foo             ·             ·
-·                spans               ALL                ·             ·
+·                spans               FULL SCAN          ·             ·
 
 statement ok
 CREATE TABLE xyz (x INT, y INT, z INT, INDEX(z,y))
@@ -906,7 +906,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM xyz WHERE z=1 AND x=y ORDER BY x;
 ----
 ·                     distributed  false            ·                      ·
-·                     vectorized   true             ·                      ·
+·                     vectorized   false            ·                      ·
 sort                  ·            ·                (x, y, z)              +x
  │                    order        +x               ·                      ·
  └── filter           ·            ·                (x, y, z)              ·

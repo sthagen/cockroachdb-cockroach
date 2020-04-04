@@ -418,9 +418,6 @@ func (n *Node) start(
 		if err := s.Start(ctx, n.stopper); err != nil {
 			return errors.Errorf("failed to start store: %s", err)
 		}
-		if s.Ident.ClusterID == (uuid.UUID{}) || s.Ident.NodeID == 0 {
-			return errors.Errorf("unidentified store: %s", s)
-		}
 		capacity, err := s.Capacity(false /* useCached */)
 		if err != nil {
 			return errors.Errorf("could not query store capacity: %s", err)
@@ -917,7 +914,7 @@ func (n *Node) batchInternal(
 		// NB: wrapped to delay br evaluation to its value when returning.
 		defer func() { finishSpan(br) }()
 		if log.HasSpanOrEvent(ctx) {
-			log.Event(ctx, args.Summary())
+			log.Eventf(ctx, "node received request: %s", args.Summary())
 		}
 
 		tStart := timeutil.Now()

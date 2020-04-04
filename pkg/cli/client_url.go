@@ -77,6 +77,10 @@ func (u urlParser) Type() string {
 }
 
 func (u urlParser) Set(v string) error {
+	return u.setInternal(v, true /* warn */)
+}
+
+func (u urlParser) setInternal(v string, warn bool) error {
 	parsedURL, err := url.Parse(v)
 	if err != nil {
 		return err
@@ -110,9 +114,11 @@ func (u urlParser) Set(v string) error {
 			// information. We do not produce an error however, so that a
 			// user can readily copy-paste the URL produced by `cockroach
 			// start` even if the client command does not accept a username.
-			fmt.Fprintf(stderr,
-				"warning: --url specifies user/password, but command %q does not accept user/password details - details ignored\n",
-				u.cmd.Name())
+			if warn {
+				fmt.Fprintf(stderr,
+					"warning: --url specifies user/password, but command %q does not accept user/password details - details ignored\n",
+					u.cmd.Name())
+			}
 		} else {
 			if err := f.Value.Set(parsedURL.User.Username()); err != nil {
 				return errors.Wrapf(err, "extracting user")
@@ -149,9 +155,11 @@ func (u urlParser) Set(v string) error {
 			// not produce an error however, so that a user can readily
 			// copy-paste an URL they picked up from another tool (a GUI
 			// tool for example).
-			fmt.Fprintf(stderr,
-				"warning: --url specifies database %q, but command %q does not accept a database name - database name ignored\n",
-				dbPath, u.cmd.Name())
+			if warn {
+				fmt.Fprintf(stderr,
+					"warning: --url specifies database %q, but command %q does not accept a database name - database name ignored\n",
+					dbPath, u.cmd.Name())
+			}
 		} else {
 			if err := f.Value.Set(dbPath); err != nil {
 				return errors.Wrapf(err, "extracting database name")
@@ -166,6 +174,14 @@ func (u urlParser) Set(v string) error {
 		options, err := url.ParseQuery(parsedURL.RawQuery)
 		if err != nil {
 			return err
+		}
+
+		// If the URL specifies host/port as query args, we're having to do
+		// with a unix socket. In that case, we don't want to populate
+		// the host field in the URL.
+		if options.Get("host") != "" {
+			cliCtx.clientConnHost = ""
+			cliCtx.clientConnPort = ""
 		}
 
 		cliCtx.extraConnURLOptions = options
@@ -305,9 +321,13 @@ func (u urlParser) Set(v string) error {
 // Do not call this function before command-line argument parsing has completed:
 // this initializes the certificate manager with the configured --certs-dir.
 func (cliCtx *cliContext) makeClientConnURL() (url.URL, error) {
+	netHost := ""
+	if cliCtx.clientConnHost != "" || cliCtx.clientConnPort != "" {
+		netHost = net.JoinHostPort(cliCtx.clientConnHost, cliCtx.clientConnPort)
+	}
 	pgurl := url.URL{
 		Scheme: "postgresql",
-		Host:   net.JoinHostPort(cliCtx.clientConnHost, cliCtx.clientConnPort),
+		Host:   netHost,
 		Path:   cliCtx.sqlConnDBName,
 	}
 
@@ -324,12 +344,17 @@ func (cliCtx *cliContext) makeClientConnURL() (url.URL, error) {
 		opts[k] = v
 	}
 
-	userName := cliCtx.sqlConnUser
-	if userName == "" {
-		userName = security.RootUser
+	if netHost != "" {
+		// Only add TLS parameters when using a network connection.
+		userName := cliCtx.sqlConnUser
+		if userName == "" {
+			userName = security.RootUser
+		}
+		if err := cliCtx.LoadSecurityOptions(opts, userName); err != nil {
+			return url.URL{}, err
+		}
 	}
 
-	err := cliCtx.LoadSecurityOptions(opts, userName)
 	pgurl.RawQuery = opts.Encode()
-	return pgurl, err
+	return pgurl, nil
 }

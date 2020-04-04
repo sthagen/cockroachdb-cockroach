@@ -443,7 +443,7 @@ func backupPlanHook(
 
 				prev, err := findPriorBackups(ctx, defaultStore)
 				if err != nil {
-					return err
+					return errors.Wrapf(err, "determining base for incremental backup")
 				}
 				prevBackups = make([]BackupManifest, 0, len(prev)+1)
 
@@ -452,6 +452,11 @@ func backupPlanHook(
 					return errors.Wrap(err, "loading base backup manifest")
 				}
 				prevBackups = append(prevBackups, m)
+
+				if m.DescriptorCoverage == tree.AllDescriptors &&
+					backupStmt.DescriptorCoverage != tree.AllDescriptors {
+					return errors.Errorf("cannot append a backup of specific tables or databases to a full-cluster backup")
+				}
 
 				for _, inc := range prev {
 					m, err := readBackupManifest(ctx, defaultStore, inc, encryption)

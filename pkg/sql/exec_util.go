@@ -197,10 +197,9 @@ var VectorizeClusterMode = settings.RegisterEnumSetting(
 	"default vectorize mode",
 	"auto",
 	map[int64]string{
-		int64(sessiondata.VectorizeOff):     "off",
-		int64(sessiondata.Vectorize192Auto): "192auto",
-		int64(sessiondata.VectorizeAuto):    "auto",
-		int64(sessiondata.VectorizeOn):      "on",
+		int64(sessiondata.VectorizeOff):  "off",
+		int64(sessiondata.VectorizeAuto): "auto",
+		int64(sessiondata.VectorizeOn):   "on",
 	},
 )
 
@@ -625,14 +624,14 @@ type StmtDiagnosticsRecorder interface {
 		stmtFingerprint string,
 		stmt string,
 		traceJSON tree.Datum,
-		bundle *bytes.Buffer,
+		bundleZip []byte,
 	) (id int64, err error)
 }
 
 // StmtDiagnosticsTraceFinishFunc is the type of function returned from
 // ShouldCollectDiagnostics to report the outcome of a trace.
 type StmtDiagnosticsTraceFinishFunc = func(
-	ctx context.Context, traceJSON tree.Datum, bundle *bytes.Buffer, collectionErr error,
+	ctx context.Context, traceJSON tree.Datum, bundle []byte, collectionErr error,
 )
 
 var _ base.ModuleTestingKnobs = &ExecutorTestingKnobs{}
@@ -651,6 +650,10 @@ type ExecutorTestingKnobs struct {
 	// optionally change their results. The filter function is invoked after each
 	// statement has been executed.
 	StatementFilter StatementFilter
+
+	// BeforePrepare can be used to trap execution of SQL statement preparation.
+	// If a nil error is returned, planning continues as usual.
+	BeforePrepare func(ctx context.Context, stmt string, txn *kv.Txn) error
 
 	// BeforeExecute is called by the Executor before plan execution. It is useful
 	// for synchronizing statement execution.
@@ -1499,21 +1502,6 @@ func (st *SessionTracing) TraceExecEnd(ctx context.Context, err error, count int
 	}
 }
 
-// extractMsgFromRecord extracts the message of the event, which is either in an
-// "event" or "error" field.
-func extractMsgFromRecord(rec tracing.LogRecord) string {
-	for _, f := range rec.Fields {
-		key := f.Key
-		if key == "event" {
-			return f.Value
-		}
-		if key == "error" {
-			return fmt.Sprint("error:", f.Value)
-		}
-	}
-	return "<event missing in trace message>"
-}
-
 const (
 	// span_idx    INT NOT NULL,        -- The span's index.
 	traceSpanIdxCol = iota
@@ -1765,7 +1753,7 @@ func getMessagesForSubtrace(
 			allLogs = append(allLogs,
 				logRecordRow{
 					timestamp: logTime,
-					msg:       extractMsgFromRecord(span.Logs[i]),
+					msg:       span.Logs[i].Msg(),
 					span:      span,
 					// Add 1 to the index to account for the first dummy message in a
 					// span.

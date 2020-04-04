@@ -39,7 +39,7 @@ func TestExplainAnalyzeDebug(t *testing.T) {
 	r := sqlutils.MakeSQLRunner(godb)
 	r.Exec(t, "CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT UNIQUE)")
 
-	base := "statement.txt trace.json env.sql"
+	base := "statement.txt trace.json trace.txt env.sql"
 	plans := "schema.sql opt.txt opt-v.txt opt-vv.txt plan.txt"
 
 	t.Run("basic", func(t *testing.T) {
@@ -103,7 +103,7 @@ func TestExplainAnalyzeDebug(t *testing.T) {
 // separated by a space.
 func checkBundle(t *testing.T, text string, expectedFiles ...string) {
 	t.Helper()
-	reg := regexp.MustCompile("http://.*/_admin/v1/stmtbundle/[0-9]*")
+	reg := regexp.MustCompile("http://[a-zA-Z0-9.:]*/_admin/v1/stmtbundle/[0-9]*")
 	url := reg.FindString(text)
 	if url == "" {
 		t.Fatalf("couldn't find URL in response '%s'", text)

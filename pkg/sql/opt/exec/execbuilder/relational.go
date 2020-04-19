@@ -189,9 +189,6 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	case *memo.ScanExpr:
 		ep, err = b.buildScan(t)
 
-	case *memo.VirtualScanExpr:
-		ep, err = b.buildVirtualScan(t)
-
 	case *memo.SelectExpr:
 		ep, err = b.buildSelect(t)
 
@@ -482,16 +479,6 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 	softLimit := int64(math.Ceil(scan.RequiredPhysical().LimitHint))
 	hardLimit := scan.HardLimit.RowCount()
 
-	// At most one of hardLimit and softLimit may be defined at the same time.
-	//
-	// TODO(celine): Determine the more optimal course of action if there are
-	// competing hard and soft limits. It is currently unclear what course to
-	// take in the case of, for example, a small soft limit and a large hard
-	// limit, but always taking the soft limit is almost certainly suboptimal.
-	if softLimit != 0 {
-		hardLimit = 0
-	}
-
 	locking := scan.Locking
 	if b.forceForUpdateLocking {
 		locking = forUpdateLocking
@@ -511,21 +498,6 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		rowCount,
 		locking,
 	)
-	if err != nil {
-		return execPlan{}, err
-	}
-	res.root = root
-	return res, nil
-}
-
-func (b *Builder) buildVirtualScan(scan *memo.VirtualScanExpr) (execPlan, error) {
-	md := b.mem.Metadata()
-	tab := md.Table(scan.Table)
-
-	_, output := b.getColumns(scan.Cols, scan.Table)
-	res := execPlan{outputCols: output}
-
-	root, err := b.factory.ConstructVirtualScan(tab)
 	if err != nil {
 		return execPlan{}, err
 	}

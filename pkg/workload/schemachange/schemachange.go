@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx"
 	"github.com/spf13/pflag"
 )
@@ -217,7 +218,7 @@ func (s *schemaChange) initSeqNum(pool *workload.MultiConnPool) (*int64, error) 
 
 	const q = `
 SELECT max(regexp_extract(name, '[0-9]+$')::int)
-  FROM ((SELECT * FROM [SHOW TABLES]) UNION (SELECT * FROM [SHOW SEQUENCES])) AS obj(name)
+  FROM ((SELECT table_name FROM [SHOW TABLES]) UNION (SELECT sequence_name FROM [SHOW SEQUENCES])) AS obj(name)
  WHERE name ~ '^(table|view|seq)[0-9]+$';
 `
 	var max gosql.NullInt64
@@ -423,6 +424,10 @@ func (w *schemaChangeWorker) createIndex(tx *pgx.Tx) (string, error) {
 		return "", err
 	}
 
+	if len(columnNames) <= 0 {
+		return "", errors.Errorf("table %s has no columns", tableName)
+	}
+
 	indexName, err := w.randIndex(tx, tableName, w.existingPct)
 	if err != nil {
 		return "", err
@@ -458,7 +463,7 @@ func (w *schemaChangeWorker) createSequence(tx *pgx.Tx) (string, error) {
 }
 
 func (w *schemaChangeWorker) createTable(tx *pgx.Tx) (string, error) {
-	tableName, err := w.randTable(tx, 100)
+	tableName, err := w.randTable(tx, 10)
 	if err != nil {
 		return "", err
 	}

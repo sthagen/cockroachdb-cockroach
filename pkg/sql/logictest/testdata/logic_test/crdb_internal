@@ -7,46 +7,46 @@ CREATE TABLE crdb_internal.t (x INT)
 query error database "crdb_internal" does not exist
 DROP DATABASE crdb_internal
 
-query T
+query TTT
 SHOW TABLES FROM crdb_internal
 ----
-backward_dependencies
-builtin_functions
-cluster_queries
-cluster_sessions
-cluster_settings
-cluster_transactions
-create_statements
-feature_usage
-forward_dependencies
-gossip_alerts
-gossip_liveness
-gossip_network
-gossip_nodes
-index_columns
-jobs
-kv_node_status
-kv_store_status
-leases
-node_build_info
-node_metrics
-node_queries
-node_runtime_info
-node_sessions
-node_statement_statistics
-node_transactions
-node_txn_stats
-partitions
-predefined_comments
-ranges
-ranges_no_leases
-schema_changes
-session_trace
-session_variables
-table_columns
-table_indexes
-tables
-zones
+crdb_internal  backward_dependencies      table
+crdb_internal  builtin_functions          table
+crdb_internal  cluster_queries            table
+crdb_internal  cluster_sessions           table
+crdb_internal  cluster_settings           table
+crdb_internal  cluster_transactions       table
+crdb_internal  create_statements          table
+crdb_internal  feature_usage              table
+crdb_internal  forward_dependencies       table
+crdb_internal  gossip_alerts              table
+crdb_internal  gossip_liveness            table
+crdb_internal  gossip_network             table
+crdb_internal  gossip_nodes               table
+crdb_internal  index_columns              table
+crdb_internal  jobs                       table
+crdb_internal  kv_node_status             table
+crdb_internal  kv_store_status            table
+crdb_internal  leases                     table
+crdb_internal  node_build_info            table
+crdb_internal  node_metrics               table
+crdb_internal  node_queries               table
+crdb_internal  node_runtime_info          table
+crdb_internal  node_sessions              table
+crdb_internal  node_statement_statistics  table
+crdb_internal  node_transactions          table
+crdb_internal  node_txn_stats             table
+crdb_internal  partitions                 table
+crdb_internal  predefined_comments        table
+crdb_internal  ranges                     view
+crdb_internal  ranges_no_leases           table
+crdb_internal  schema_changes             table
+crdb_internal  session_trace              table
+crdb_internal  session_variables          table
+crdb_internal  table_columns              table
+crdb_internal  table_indexes              table
+crdb_internal  tables                     table
+crdb_internal  zones                      table
 
 statement ok
 CREATE DATABASE testdb; CREATE TABLE testdb.foo(x INT)
@@ -75,10 +75,10 @@ table_id parent_id name type target_id target_name state direction
 
 # We don't select the modification time as it does not remain contant.
 query IITTITTTTTTT colnames
-SELECT table_id, parent_id, name, database_name, version, format_version, state, sc_lease_node_id, sc_lease_expiration_time, drop_time, audit_mode, schema_name FROM crdb_internal.tables WHERE NAME = 'namespace'
+SELECT table_id, parent_id, name, database_name, version, format_version, state, sc_lease_node_id, sc_lease_expiration_time, drop_time, audit_mode, schema_name FROM crdb_internal.tables WHERE NAME = 'descriptor'
 ----
 table_id  parent_id  name       database_name  version  format_version            state   sc_lease_node_id  sc_lease_expiration_time  drop_time  audit_mode  schema_name
-30        1          namespace  system         1        InterleavedFormatVersion  PUBLIC  NULL              NULL                      NULL       DISABLED    public
+3        1          descriptor  system         1        InterleavedFormatVersion  PUBLIC  NULL              NULL                      NULL       DISABLED    public
 
 # Verify that table names are not double escaped.
 
@@ -293,7 +293,7 @@ select crdb_internal.set_vmodule('')
 query T
 select regexp_replace(crdb_internal.node_executable_version()::string, '(-\d+)?$', '');
 ----
-19.2
+20.1
 
 query ITTT colnames
 select node_id, component, field, regexp_replace(regexp_replace(value, '^\d+$', '<port>'), e':\\d+', ':<port>') as value from crdb_internal.node_runtime_info
@@ -446,7 +446,7 @@ select * from crdb_internal.gossip_alerts
 query T
 select regexp_replace(crdb_internal.node_executable_version()::string, '(-\d+)?$', '');
 ----
-19.2
+20.1
 
 user root
 

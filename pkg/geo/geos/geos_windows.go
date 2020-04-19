@@ -17,6 +17,52 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 )
 
-func WKTToWKB(wkt geopb.WKT) (geopb.WKB, error) {
+func EnsureInit(errDisplay EnsureInitErrorDisplay) error {
+	return nil
+}
+
+func WKTToEWKB(wkt geopb.WKT, srid geopb.SRID) (geopb.EWKB, error) {
 	return nil, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
+}
+
+func ClipEWKBByRect(
+	wkb geopb.WKB, xmin float64, ymin float64, xmax float64, ymax float64,
+) (geopb.EWKB, error) {
+	return nil, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
+}
+
+func Covers(a geopb.EWKB, b geopb.EWKB) (bool, error) {
+	return false, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
+}
+
+func CoveredBy(a geopb.EWKB, b geopb.EWKB) (bool, error) {
+	return false, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
+}
+
+func Contains(a geopb.EWKB, b geopb.EWKB) (bool, error) {
+	return false, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
+}
+
+func Crosses(a geopb.EWKB, b geopb.EWKB) (bool, error) {
+	return false, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
+}
+
+func Equals(a geopb.EWKB, b geopb.EWKB) (bool, error) {
+	return false, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
+}
+
+func Intersects(a geopb.EWKB, b geopb.EWKB) (bool, error) {
+	return false, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
+}
+
+func Overlaps(a geopb.EWKB, b geopb.EWKB) (bool, error) {
+	return false, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
+}
+
+func Touches(a geopb.EWKB, b geopb.EWKB) (bool, error) {
+	return false, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
+}
+
+func Within(a geopb.EWKB, b geopb.EWKB) (bool, error) {
+	return false, unimplemented.NewWithIssue(46876, "operation not supported on Windows")
 }

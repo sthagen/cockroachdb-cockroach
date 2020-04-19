@@ -4,6 +4,19 @@ CREATE TEMP TABLE a_temp(a INT PRIMARY KEY)
 statement ok
 SET experimental_enable_temp_tables=true
 
+subtest show_tables
+
+statement ok
+CREATE TEMP TABLE tbl (a int)
+
+query TT rowsort
+SELECT table_name, type FROM [SHOW TABLES]
+----
+tbl  table
+
+statement ok
+DROP TABLE tbl
+
 subtest test_meta_tables
 
 statement ok
@@ -35,11 +48,11 @@ SELECT count(1) FROM pg_namespace WHERE nspname LIKE 'pg_temp_%'
 ----
 1
 
-query T
-SELECT * FROM [SHOW TABLES FROM pg_temp] ORDER BY 1
+query T rowsort
+SELECT table_name FROM [SHOW TABLES FROM pg_temp]
 ----
-temp_table_ref
 temp_table_test
+temp_table_ref
 
 statement ok
 DROP TABLE temp_table_ref CASCADE; DROP TABLE temp_table_test CASCADE
@@ -209,3 +222,21 @@ subtest table_with_on_commit
 
 statement error ON COMMIT can only be used on temporary tables
 CREATE TABLE a (a int) ON COMMIT PRESERVE ROWS
+
+subtest regression_47030
+
+statement ok
+CREATE TEMP TABLE regression_47030(c0 INT); INSERT INTO regression_47030 VALUES (1);
+
+query I
+SELECT * FROM regression_47030
+----
+1
+
+statement ok
+TRUNCATE regression_47030; INSERT INTO regression_47030 VALUES (2)
+
+query I
+SELECT * FROM regression_47030
+----
+2

@@ -101,6 +101,9 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 		if scan.Constraint != nil {
 			rel.FuncDeps.AddConstants(scan.Constraint.ExtractConstCols(b.evalCtx))
 		}
+		if tabMeta := md.TableMeta(scan.Table); tabMeta.Constraints != nil {
+			b.addFiltersToFuncDep(*tabMeta.Constraints.(*FiltersExpr), &rel.FuncDeps)
+		}
 		rel.FuncDeps.MakeNotNull(rel.NotNullCols)
 		rel.FuncDeps.ProjectCols(rel.OutputCols)
 	}
@@ -127,34 +130,6 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 	if !b.disableStats {
 		b.sb.buildScan(scan, rel)
 	}
-}
-
-func (b *logicalPropsBuilder) buildVirtualScanProps(scan *VirtualScanExpr, rel *props.Relational) {
-	// Output Columns
-	// --------------
-	// VirtualScan output columns are stored in the definition.
-	rel.OutputCols = scan.Cols
-
-	// Not Null Columns
-	// ----------------
-	// All columns are assumed to be nullable.
-
-	// Outer Columns
-	// -------------
-	// VirtualScan operator never has outer columns.
-
-	// Functional Dependencies
-	// -----------------------
-	// VirtualScan operator has an empty FD set.
-
-	// Cardinality
-	// -----------
-	// Don't make any assumptions about cardinality of output.
-	rel.Cardinality = props.AnyCardinality
-
-	// Statistics
-	// ----------
-	b.sb.buildVirtualScan(scan, rel)
 }
 
 func (b *logicalPropsBuilder) buildSequenceSelectProps(

@@ -64,30 +64,6 @@ func pgTypeForParserType(t *types.T) pgType {
 	}
 }
 
-var resultOidMap = map[oid.Oid]oid.Oid{
-	oid.T_bit:      oid.T_varbit,
-	oid.T__bit:     oid.T__varbit,
-	oid.T_bpchar:   oid.T_text,
-	oid.T__bpchar:  oid.T__text,
-	oid.T_char:     oid.T_text,
-	oid.T__char:    oid.T__text,
-	oid.T_varchar:  oid.T_text,
-	oid.T__varchar: oid.T__text,
-}
-
-// mapResultOid maps an Oid value returned by the server to an Oid value that is
-// backwards-compatible with previous versions of CRDB. See this issue for more
-// details: https://github.com/cockroachdb/cockroach/issues/36811
-//
-// TODO(andyk): Remove this once issue #36811 is resolved.
-func mapResultOid(o oid.Oid) oid.Oid {
-	mapped := resultOidMap[o]
-	if mapped != 0 {
-		return mapped
-	}
-	return o
-}
-
 func (b *writeBuffer) writeTextDatum(
 	ctx context.Context, d tree.Datum, conv sessiondata.DataConversionConfig,
 ) {
@@ -160,6 +136,16 @@ func (b *writeBuffer) writeTextDatum(
 		s := formatTimeTZ(v.TimeTZ, b.putbuf[4:4])
 		b.putInt32(int32(len(s)))
 		b.write(s)
+
+	case *tree.DGeography:
+		s := v.Geography.EWKBHex()
+		b.putInt32(int32(len(s)))
+		b.write([]byte(s))
+
+	case *tree.DGeometry:
+		s := v.Geometry.EWKBHex()
+		b.putInt32(int32(len(s)))
+		b.write([]byte(s))
 
 	case *tree.DTimestamp:
 		// Start at offset 4 because `putInt32` clobbers the first 4 bytes.
@@ -448,6 +434,14 @@ func (b *writeBuffer) writeBinaryDatum(
 			subWriter.writeBinaryDatum(ctx, elem, sessionLoc, oid)
 		}
 		b.writeLengthPrefixedBuffer(&subWriter.wrapped)
+
+	case *tree.DGeography:
+		b.putInt32(int32(len(v.EWKB())))
+		b.write(v.EWKB())
+
+	case *tree.DGeometry:
+		b.putInt32(int32(len(v.EWKB())))
+		b.write(v.EWKB())
 
 	case *tree.DArray:
 		if v.ParamTyp.Family() == types.ArrayFamily {

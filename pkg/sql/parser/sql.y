@@ -29,6 +29,7 @@ import (
 
     "go/constant"
 
+    "github.com/cockroachdb/cockroach/pkg/geo/geopb"
     "github.com/cockroachdb/cockroach/pkg/sql/lex"
     "github.com/cockroachdb/cockroach/pkg/sql/privilege"
     "github.com/cockroachdb/cockroach/pkg/sql/roleoption"
@@ -159,6 +160,9 @@ func (u *sqlSymUnion) unresolvedName() *tree.UnresolvedName {
 func (u *sqlSymUnion) unresolvedObjectName() *tree.UnresolvedObjectName {
     return u.val.(*tree.UnresolvedObjectName)
 }
+func (u *sqlSymUnion) unresolvedObjectNames() []*tree.UnresolvedObjectName {
+    return u.val.([]*tree.UnresolvedObjectName)
+}
 func (u *sqlSymUnion) functionReference() tree.FunctionReference {
     return u.val.(tree.FunctionReference)
 }
@@ -218,6 +222,12 @@ func (u *sqlSymUnion) tblDef() tree.TableDef {
 }
 func (u *sqlSymUnion) tblDefs() tree.TableDefs {
     return u.val.(tree.TableDefs)
+}
+func (u *sqlSymUnion) likeTableOption() tree.LikeTableOption {
+    return u.val.(tree.LikeTableOption)
+}
+func (u *sqlSymUnion) likeTableOptionList() []tree.LikeTableOption {
+    return u.val.([]tree.LikeTableOption)
 }
 func (u *sqlSymUnion) colQual() tree.NamedColumnQualification {
     return u.val.(tree.NamedColumnQualification)
@@ -501,6 +511,9 @@ func (u *sqlSymUnion) partitionedBackup() tree.PartitionedBackup {
 func (u *sqlSymUnion) partitionedBackups() []tree.PartitionedBackup {
     return u.val.([]tree.PartitionedBackup)
 }
+func (u *sqlSymUnion) geoFigure() geopb.Shape {
+  return u.val.(geopb.Shape)
+}
 func newNameFromStr(s string) *tree.Name {
     return (*tree.Name)(&s)
 }
@@ -524,27 +537,27 @@ func newNameFromStr(s string) *tree.Name {
 
 // Ordinary key words in alphabetical order.
 %token <str> ABORT ACTION ADD ADMIN AGGREGATE
-%token <str> ALL ALTER ANALYSE ANALYZE AND AND_AND ANY ANNOTATE_TYPE ARRAY AS ASC
+%token <str> ALL ALTER ALWAYS ANALYSE ANALYZE AND AND_AND ANY ANNOTATE_TYPE ARRAY AS ASC
 %token <str> ASYMMETRIC AT AUTHORIZATION AUTOMATIC
 
 %token <str> BACKUP BEGIN BETWEEN BIGINT BIGSERIAL BIT
 %token <str> BUCKET_COUNT
-%token <str> BLOB BOOL BOOLEAN BOTH BUNDLE BY BYTEA BYTES
+%token <str> BOOLEAN BOTH BUNDLE BY
 
 %token <str> CACHE CANCEL CASCADE CASE CAST CHANGEFEED CHAR
 %token <str> CHARACTER CHARACTERISTICS CHECK CLOSE
-%token <str> CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMIT
+%token <str> CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
 %token <str> COMMITTED COMPACT COMPLETE CONCAT CONCURRENTLY CONFIGURATION CONFIGURATIONS CONFIGURE
 %token <str> CONFLICT CONSTRAINT CONSTRAINTS CONTAINS CONVERSION COPY COVERING CREATE CREATEROLE
 %token <str> CROSS CUBE CURRENT CURRENT_CATALOG CURRENT_DATE CURRENT_SCHEMA
 %token <str> CURRENT_ROLE CURRENT_TIME CURRENT_TIMESTAMP
 %token <str> CURRENT_USER CYCLE
 
-%token <str> DATA DATABASE DATABASES DATE DAY DEC DECIMAL DEFAULT
+%token <str> DATA DATABASE DATABASES DATE DAY DEC DECIMAL DEFAULT DEFAULTS
 %token <str> DEALLOCATE DECLARE DEFERRABLE DEFERRED DELETE DESC
 %token <str> DISCARD DISTINCT DO DOMAIN DOUBLE DROP
 
-%token <str> ELSE ENCODING END ENUM ESCAPE EXCEPT EXCLUDE
+%token <str> ELSE ENCODING END ENUM ESCAPE EXCEPT EXCLUDE EXCLUDING
 %token <str> EXISTS EXECUTE EXPERIMENTAL
 %token <str> EXPERIMENTAL_FINGERPRINTS EXPERIMENTAL_REPLICA
 %token <str> EXPERIMENTAL_AUDIT
@@ -554,14 +567,16 @@ func newNameFromStr(s string) *tree.Name {
 %token <str> FILES FILTER
 %token <str> FIRST FLOAT FLOAT4 FLOAT8 FLOORDIV FOLLOWING FOR FORCE_INDEX FOREIGN FROM FULL FUNCTION
 
+%token <str> GENERATED GEOGRAPHY GEOMETRY GEOMETRYCOLLECTION
 %token <str> GLOBAL GRANT GRANTS GREATEST GROUP GROUPING GROUPS
 
 %token <str> HAVING HASH HIGH HISTOGRAM HOUR
 
-%token <str> IF IFERROR IFNULL IGNORE_FOREIGN_KEYS ILIKE IMMEDIATE IMPORT IN INCLUDE INCREMENT INCREMENTAL
+%token <str> IDENTITY
+%token <str> IF IFERROR IFNULL IGNORE_FOREIGN_KEYS ILIKE IMMEDIATE IMPORT IN INCLUDE INCLUDING INCREMENT INCREMENTAL
 %token <str> INET INET_CONTAINED_BY_OR_EQUALS
 %token <str> INET_CONTAINS_OR_EQUALS INDEX INDEXES INJECT INTERLEAVE INITIALLY
-%token <str> INNER INSERT INT INT2VECTOR INT2 INT4 INT8 INT64 INTEGER
+%token <str> INNER INSERT INT INTEGER
 %token <str> INTERSECT INTERVAL INTO INVERTED IS ISERROR ISNULL ISOLATION
 
 %token <str> JOB JOBS JOIN JSON JSONB JSON_SOME_EXISTS JSON_ALL_EXISTS
@@ -569,10 +584,11 @@ func newNameFromStr(s string) *tree.Name {
 %token <str> KEY KEYS KV
 
 %token <str> LANGUAGE LAST LATERAL LC_CTYPE LC_COLLATE
-%token <str> LEADING LEASE LEAST LEFT LESS LEVEL LIKE LIMIT LIST LOCAL
+%token <str> LEADING LEASE LEAST LEFT LESS LEVEL LIKE LIMIT LINESTRING LIST LOCAL
 %token <str> LOCALTIME LOCALTIMESTAMP LOCKED LOGIN LOOKUP LOW LSHIFT
 
 %token <str> MATCH MATERIALIZED MERGE MINVALUE MAXVALUE MINUTE MONTH
+%token <str> MULTILINESTRING MULTIPOINT MULTIPOLYGON
 
 %token <str> NAN NAME NAMES NATURAL NEXT NO NOCREATEROLE NOLOGIN NO_INDEX_JOIN
 %token <str> NONE NORMAL NOT NOTHING NOTNULL NOWAIT NULL NULLIF NULLS NUMERIC
@@ -581,7 +597,7 @@ func newNameFromStr(s string) *tree.Name {
 %token <str> ORDER ORDINALITY OTHERS OUT OUTER OVER OVERLAPS OVERLAY OWNED OPERATOR
 
 %token <str> PARENT PARTIAL PARTITION PARTITIONS PASSWORD PAUSE PHYSICAL PLACING
-%token <str> PLAN PLANS POSITION PRECEDING PRECISION PREPARE PRESERVE PRIMARY PRIORITY
+%token <str> PLAN PLANS POINT POLYGON POSITION PRECEDING PRECISION PREPARE PRESERVE PRIMARY PRIORITY
 %token <str> PROCEDURAL PUBLIC PUBLICATION
 
 %token <str> QUERIES QUERY
@@ -593,11 +609,10 @@ func newNameFromStr(s string) *tree.Name {
 %token <str> ROLE ROLES ROLLBACK ROLLUP ROW ROWS RSHIFT RULE
 
 %token <str> SAVEPOINT SCATTER SCHEMA SCHEMAS SCRUB SEARCH SECOND SELECT SEQUENCE SEQUENCES
-%token <str> SERIAL SERIAL2 SERIAL4 SERIAL8
 %token <str> SERIALIZABLE SERVER SESSION SESSIONS SESSION_USER SET SETTING SETTINGS
 %token <str> SHARE SHOW SIMILAR SIMPLE SKIP SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
 
-%token <str> START STATISTICS STATUS STDIN STRICT STRING STORE STORED STORING SUBSTRING
+%token <str> START STATISTICS STATUS STDIN STRICT STRING STORAGE STORE STORED STORING SUBSTRING
 %token <str> SYMMETRIC SYNTAX SYSTEM SUBSCRIPTION
 
 %token <str> TABLE TABLES TEMP TEMPLATE TEMPORARY TESTING_RELOCATE EXPERIMENTAL_RELOCATE TEXT THEN
@@ -731,6 +746,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.Statement> drop_index_stmt
 %type <tree.Statement> drop_role_stmt
 %type <tree.Statement> drop_table_stmt
+%type <tree.Statement> drop_type_stmt
 %type <tree.Statement> drop_view_stmt
 %type <tree.Statement> drop_sequence_stmt
 
@@ -848,13 +864,14 @@ func newNameFromStr(s string) *tree.Name {
 %type <str> privilege savepoint_name
 %type <tree.KVOption> role_option password_clause valid_until_clause
 %type <tree.Operator> subquery_op
-%type <*tree.UnresolvedName> func_name
+%type <*tree.UnresolvedName> func_name func_name_no_crdb_extra
 %type <str> opt_collate
 
 %type <str> cursor_name database_name index_name opt_index_name column_name insert_column_item statistics_name window_name
 %type <str> family_name opt_family_name table_alias_name constraint_name target_name zone_name partition_name collation_name
 %type <str> db_object_name_component
 %type <*tree.UnresolvedObjectName> table_name standalone_index_name sequence_name type_name view_name db_object_name simple_db_object_name complex_db_object_name
+%type <[]*tree.UnresolvedObjectName> type_name_list
 %type <str> schema_name
 %type <*tree.UnresolvedName> table_pattern complex_table_pattern
 %type <*tree.UnresolvedName> column_path prefixed_column_path column_path_with_star
@@ -869,6 +886,8 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.UserPriority> user_priority
 
 %type <tree.TableDefs> opt_table_elem_list table_elem_list create_as_opt_col_list create_as_table_defs
+%type <[]tree.LikeTableOption> like_table_option_list
+%type <tree.LikeTableOption> like_table_option
 %type <tree.CreateTableOnCommitSetting> opt_create_table_on_commit
 %type <*tree.InterleaveDef> opt_interleave
 %type <*tree.PartitionBy> opt_partition_by partition_by
@@ -947,7 +966,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <*tree.IndexFlags> opt_index_flags
 %type <*tree.IndexFlags> index_flags_param
 %type <*tree.IndexFlags> index_flags_param_list
-%type <tree.Expr> a_expr b_expr c_expr d_expr
+%type <tree.Expr> a_expr b_expr c_expr d_expr typed_literal
 %type <tree.Expr> substr_from substr_for
 %type <tree.Expr> in_expr
 %type <tree.Expr> having_clause
@@ -977,7 +996,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.Expr> opt_changefeed_sink
 
 %type <str> explain_option_name
-%type <[]string> explain_option_list
+%type <[]string> explain_option_list opt_enum_val_list enum_val_list
 
 %type <*types.T> typename simple_typename const_typename
 %type <bool> opt_timezone
@@ -987,8 +1006,9 @@ func newNameFromStr(s string) *tree.Name {
 %type <*types.T> const_datetime interval_type
 %type <*types.T> bit_with_length bit_without_length
 %type <*types.T> character_base
-%type <*types.T> postgres_oid
+%type <*types.T> geo_shape
 %type <*types.T> cast_target
+%type <*types.T> const_geo
 %type <str> extract_arg
 %type <bool> opt_varying
 
@@ -1000,15 +1020,17 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.Expr> var_value
 %type <tree.Exprs> var_list
 %type <tree.NameList> var_name
-%type <str> unrestricted_name type_function_name
+%type <str> unrestricted_name type_function_name type_function_name_no_crdb_extra
 %type <str> non_reserved_word
 %type <str> non_reserved_word_or_sconst
 %type <tree.Expr> zone_value
 %type <tree.Expr> string_or_placeholder
 %type <tree.Expr> string_or_placeholder_list
 
-%type <str> unreserved_keyword type_func_name_keyword cockroachdb_extra_type_func_name_keyword
+%type <str> unreserved_keyword type_func_name_keyword type_func_name_no_crdb_extra_keyword type_func_name_crdb_extra_keyword
 %type <str> col_name_keyword reserved_keyword cockroachdb_extra_reserved_keyword extra_var_value
+
+%type <str> complex_type_name general_type_name
 
 %type <tree.ConstraintTableDef> table_constraint constraint_elem create_as_constraint_def create_as_constraint_elem
 %type <tree.TableDef> index_def
@@ -2251,7 +2273,7 @@ comment_text:
 // %Text:
 // CREATE DATABASE, CREATE TABLE, CREATE INDEX, CREATE TABLE AS,
 // CREATE USER, CREATE VIEW, CREATE SEQUENCE, CREATE STATISTICS,
-// CREATE ROLE
+// CREATE ROLE, CREATE TYPE
 create_stmt:
   create_role_stmt     // EXTEND WITH HELP: CREATE ROLE
 | create_ddl_stmt      // help texts in sub-rule
@@ -2312,7 +2334,6 @@ drop_unsupported:
 | DROP SERVER error { return unimplemented(sqllex, "drop server") }
 | DROP SUBSCRIPTION error { return unimplemented(sqllex, "drop subscription") }
 | DROP TEXT error { return unimplementedWithIssueDetail(sqllex, 7821, "drop text") }
-| DROP TYPE error { return unimplementedWithIssueDetail(sqllex, 27793, "drop type") }
 | DROP TRIGGER error { return unimplementedWithIssueDetail(sqllex, 28296, "drop") }
 
 create_ddl_stmt:
@@ -2324,7 +2345,7 @@ create_ddl_stmt:
 | create_table_as_stmt // EXTEND WITH HELP: CREATE TABLE
 // Error case for both CREATE TABLE and CREATE TABLE ... AS in one
 | CREATE opt_temp_create_table TABLE error   // SHOW HELP: CREATE TABLE
-| create_type_stmt     { /* SKIP DOC */ }
+| create_type_stmt     // EXTEND WITH HELP: CREATE TYPE
 | create_view_stmt     // EXTEND WITH HELP: CREATE VIEW
 | create_sequence_stmt // EXTEND WITH HELP: CREATE SEQUENCE
 
@@ -2517,7 +2538,7 @@ discard_stmt:
 // %Category: Group
 // %Text:
 // DROP DATABASE, DROP INDEX, DROP TABLE, DROP VIEW, DROP SEQUENCE,
-// DROP USER, DROP ROLE
+// DROP USER, DROP ROLE, DROP TYPE
 drop_stmt:
   drop_ddl_stmt      // help texts in sub-rule
 | drop_role_stmt     // EXTEND WITH HELP: DROP ROLE
@@ -2530,6 +2551,7 @@ drop_ddl_stmt:
 | drop_table_stmt    // EXTEND WITH HELP: DROP TABLE
 | drop_view_stmt     // EXTEND WITH HELP: DROP VIEW
 | drop_sequence_stmt // EXTEND WITH HELP: DROP SEQUENCE
+| drop_type_stmt     // EXTEND WITH HELP: DROP TYPE
 
 // %Help: DROP VIEW - remove a view
 // %Category: DDL
@@ -2623,6 +2645,41 @@ drop_database_stmt:
     }
   }
 | DROP DATABASE error // SHOW HELP: DROP DATABASE
+
+// %Help: DROP TYPE - remove a type
+// %Category: DDL
+// %Text: DROP TYPE [IF EXISTS] <type_name> [, ...] [CASCASE | RESTRICT]
+// %SeeAlso: WEBDOCS/drop-type.html
+drop_type_stmt:
+  DROP TYPE type_name_list opt_drop_behavior
+  {
+    $$.val = &tree.DropType{
+      Names: $3.unresolvedObjectNames(),
+      IfExists: false,
+      DropBehavior: $4.dropBehavior(),
+    }
+  }
+| DROP TYPE IF EXISTS type_name_list opt_drop_behavior
+  {
+    $$.val = &tree.DropType{
+      Names: $5.unresolvedObjectNames(),
+      IfExists: true,
+      DropBehavior: $6.dropBehavior(),
+    }
+  }
+| DROP TYPE error // SHOW HELP: DROP TYPE
+
+
+type_name_list:
+  type_name
+  {
+    $$.val = []*tree.UnresolvedObjectName{$1.unresolvedObjectName()}
+  }
+| type_name_list ',' type_name
+  {
+    $$.val = append($1.unresolvedObjectNames(), $3.unresolvedObjectName())
+  }
+
 
 // %Help: DROP ROLE - remove a user
 // %Category: Priv
@@ -4522,7 +4579,41 @@ table_elem:
   {
     $$.val = $1.constraintDef()
   }
-| LIKE table_name error { return unimplementedWithIssue(sqllex, 30840) }
+| LIKE table_name like_table_option_list
+  {
+    $$.val = &tree.LikeTableDef{
+      Name: $2.unresolvedObjectName().ToTableName(),
+      Options: $3.likeTableOptionList(),
+    }
+  }
+
+like_table_option_list:
+  like_table_option_list INCLUDING like_table_option
+  {
+    $$.val = append($1.likeTableOptionList(), $3.likeTableOption())
+  }
+| like_table_option_list EXCLUDING like_table_option
+  {
+    opt := $3.likeTableOption()
+    opt.Excluded = true
+    $$.val = append($1.likeTableOptionList(), opt)
+  }
+| /* EMPTY */
+  {
+    $$.val = []tree.LikeTableOption(nil)
+  }
+
+like_table_option:
+  COMMENTS			{ return unimplementedWithIssueDetail(sqllex, 47071, "like table in/excluding comments") }
+| CONSTRAINTS		{ $$.val = tree.LikeTableOption{Opt: tree.LikeTableOptConstraints} }
+| DEFAULTS			{ $$.val = tree.LikeTableOption{Opt: tree.LikeTableOptDefaults} }
+| IDENTITY	  	{ return unimplementedWithIssueDetail(sqllex, 47071, "like table in/excluding identity") }
+| GENERATED			{ $$.val = tree.LikeTableOption{Opt: tree.LikeTableOptGenerated} }
+| INDEXES			{ $$.val = tree.LikeTableOption{Opt: tree.LikeTableOptIndexes} }
+| STATISTICS		{ return unimplementedWithIssueDetail(sqllex, 47071, "like table in/excluding statistics") }
+| STORAGE			{ return unimplementedWithIssueDetail(sqllex, 47071, "like table in/excluding storage") }
+| ALL				{ $$.val = tree.LikeTableOption{Opt: tree.LikeTableOptAll} }
+
 
 opt_interleave:
   INTERLEAVE IN PARENT table_name '(' name_list ')' opt_interleave_drop_behavior
@@ -4644,7 +4735,7 @@ column_def:
   column_name typename col_qual_list
   {
     typ := $2.colType()
-    tableDef, err := tree.NewColumnTableDef(tree.Name($1), typ, isSerialType(typ), $3.colQuals())
+    tableDef, err := tree.NewColumnTableDef(tree.Name($1), typ, types.IsSerialType(typ), $3.colQuals())
     if err != nil {
       return setErr(sqllex, err)
     }
@@ -4745,19 +4836,25 @@ col_qualification_elem:
       Match: $4.compositeKeyMatchMethod(),
     }
  }
-| AS '(' a_expr ')' STORED
+| generated_as '(' a_expr ')' STORED
  {
     $$.val = &tree.ColumnComputedDef{Expr: $3.expr()}
  }
-| AS '(' a_expr ')' VIRTUAL
+| generated_as '(' a_expr ')' VIRTUAL
  {
     return unimplemented(sqllex, "virtual computed columns")
  }
-| AS error
+| generated_as error
  {
     sqllex.Error("use AS ( <expr> ) STORED")
     return 1
  }
+
+// GENERATED ALWAYS is a noise word for compatibility with Postgres.
+generated_as:
+  AS {}
+//  GENERATED ALWAYS AS {}
+
 
 index_def:
   INDEX opt_index_name '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
@@ -5270,6 +5367,21 @@ create_view_stmt:
       AsSource: $8.slct(),
       Temporary: $2.persistenceType(),
       IfNotExists: false,
+      Replace: false,
+    }
+  }
+// We cannot use a rule like opt_or_replace here as that would cause a conflict
+// with the opt_temp rule.
+| CREATE OR REPLACE opt_temp opt_view_recursive VIEW view_name opt_column_list AS select_stmt
+  {
+    name := $7.unresolvedObjectName().ToTableName()
+    $$.val = &tree.CreateView{
+      Name: name,
+      ColumnNames: $8.nameList(),
+      AsSource: $10.slct(),
+      Temporary: $4.persistenceType(),
+      IfNotExists: false,
+      Replace: true,
     }
   }
 | CREATE opt_temp opt_view_recursive VIEW IF NOT EXISTS view_name opt_column_list AS select_stmt
@@ -5281,9 +5393,9 @@ create_view_stmt:
       AsSource: $11.slct(),
       Temporary: $2.persistenceType(),
       IfNotExists: true,
+      Replace: false,
     }
   }
-| CREATE OR REPLACE opt_temp opt_view_recursive VIEW error { return unimplementedWithIssue(sqllex, 24897) }
 | CREATE opt_temp opt_view_recursive VIEW error // SHOW HELP: CREATE VIEW
 
 role_option:
@@ -5340,13 +5452,24 @@ opt_view_recursive:
   /* EMPTY */ { /* no error */ }
 | RECURSIVE { return unimplemented(sqllex, "create recursive view") }
 
-// CREATE TYPE/DOMAIN is not yet supported by CockroachDB but we
-// want to report it with the right issue number.
+
+// %Help: CREATE TYPE -- create a type
+// %Category: DDL
+// %Text: CREATE TYPE <type_name> AS ENUM (...)
+// %SeeAlso: WEBDOCS/create-type.html
 create_type_stmt:
-  // Record/Composite types.
-  CREATE TYPE type_name AS '(' error      { return unimplementedWithIssue(sqllex, 27792) }
   // Enum types.
-| CREATE TYPE type_name AS ENUM '(' error { return unimplementedWithIssue(sqllex, 24873) }
+  CREATE TYPE type_name AS ENUM '(' opt_enum_val_list ')'
+  {
+    $$.val = &tree.CreateType{
+      TypeName: $3.unresolvedObjectName(),
+      Variety: tree.Enum,
+      EnumLabels: $7.strs(),
+    }
+  }
+| CREATE TYPE error // SHOW HELP: CREATE TYPE
+  // Record/Composite types.
+| CREATE TYPE type_name AS '(' error      { return unimplementedWithIssue(sqllex, 27792) }
   // Range types.
 | CREATE TYPE type_name AS RANGE error    { return unimplementedWithIssue(sqllex, 27791) }
   // Base (primitive) types.
@@ -5355,6 +5478,26 @@ create_type_stmt:
 | CREATE TYPE type_name                   { return unimplementedWithIssueDetail(sqllex, 27793, "shell") }
   // Domain types.
 | CREATE DOMAIN type_name error           { return unimplementedWithIssueDetail(sqllex, 27796, "create") }
+
+opt_enum_val_list:
+  enum_val_list
+  {
+    $$.val = $1.strs()
+  }
+| /* EMPTY */
+  {
+    $$.val = []string(nil)
+  }
+
+enum_val_list:
+  SCONST
+  {
+    $$.val = []string{$1}
+  }
+| enum_val_list ',' SCONST
+  {
+    $$.val = append($1.strs(), $3)
+  }
 
 // %Help: CREATE INDEX - create a new index
 // %Category: DDL
@@ -7251,16 +7394,101 @@ opt_array_bounds:
 | '[' ICONST ']' '[' error { return unimplementedWithIssue(sqllex, 32552) }
 | /* EMPTY */ { $$.val = []int32(nil) }
 
-const_json:
-  JSON
-| JSONB
+// general_type_name is a variant of type_or_function_name but does not
+// include some extra keywords (like FAMILY) which cause ambiguity with
+// parsing of typenames in certain contexts.
+general_type_name:
+  type_function_name_no_crdb_extra
+
+// complex_type_name mirrors the rule for complex_db_object_name, but uses
+// general_type_name rather than db_object_name_component to avoid conflicts.
+complex_type_name:
+  general_type_name '.' unrestricted_name
+  {
+    return unimplemented(sqllex, "qualified types")
+  }
+| general_type_name '.' unrestricted_name '.' unrestricted_name
+  {
+    return unimplemented(sqllex, "qualified types")
+  }
 
 simple_typename:
-  const_typename
+  general_type_name
+  {
+    /* FORCE DOC */
+    // See https://www.postgresql.org/docs/9.1/static/datatype-character.html
+    // Postgres supports a special character type named "char" (with the quotes)
+    // that is a single-character column type. It's used by system tables.
+    // Eventually this clause will be used to parse user-defined types as well,
+    // since their names can be quoted.
+    if $1 == "char" {
+      $$.val = types.MakeQChar(0)
+    } else if $1 == "serial" {
+        switch sqllex.(*lexer).nakedIntType.Width() {
+        case 32:
+          $$.val = &types.Serial4Type
+        default:
+          $$.val = &types.Serial8Type
+        }
+    } else {
+      var ok bool
+      var unimp int
+      $$.val, ok, unimp = types.TypeForNonKeywordTypeName($1)
+      if !ok {
+        switch unimp {
+          case 0:
+            // Note: we can only report an unimplemented error for specific
+            // known type names. Anything else may return sensitive info.
+            sqllex.Error(fmt.Sprintf("type %q does not exist", $1))
+            return 1
+          case -1:
+            return unimplemented(sqllex, "type name " + $1)
+          default:
+            return unimplementedWithIssueDetail(sqllex, unimp, $1)
+        }
+      }
+    }
+  }
+| complex_type_name
+  {
+    return unimplemented(sqllex, "qualified types")
+  }
+| const_typename
 | bit_with_length
 | character_with_length
 | interval_type
-| postgres_oid
+| POINT error { return unimplementedWithIssueDetail(sqllex, 21286, "point") } // needed or else it generates a syntax error.
+| POLYGON error { return unimplementedWithIssueDetail(sqllex, 21286, "polygon") } // needed or else it generates a syntax error.
+
+geo_shape:
+  POINT { $$.val = geopb.Shape_Point }
+| LINESTRING { $$.val = geopb.Shape_LineString }
+| POLYGON { $$.val = geopb.Shape_Polygon }
+| GEOMETRYCOLLECTION { $$.val = geopb.Shape_GeometryCollection }
+| MULTIPOLYGON { $$.val = geopb.Shape_MultiPolygon }
+| MULTILINESTRING { $$.val = geopb.Shape_MultiLineString }
+| MULTIPOINT { $$.val = geopb.Shape_MultiPoint }
+| GEOMETRY { $$.val = geopb.Shape_Geometry }
+
+const_geo:
+  GEOGRAPHY { $$.val = types.Geography }
+| GEOMETRY  { $$.val = types.Geometry }
+| GEOMETRY '(' geo_shape ')'
+  {
+    $$.val = types.MakeGeometry($3.geoFigure(), geopb.DefaultGeometrySRID)
+  }
+| GEOGRAPHY '(' geo_shape ')'
+  {
+    $$.val = types.MakeGeography($3.geoFigure(), geopb.DefaultGeographySRID)
+  }
+| GEOMETRY '(' geo_shape ',' iconst32 ')'
+  {
+    $$.val = types.MakeGeometry($3.geoFigure(), geopb.SRID($5.int32()))
+  }
+| GEOGRAPHY '(' geo_shape ',' iconst32 ')'
+  {
+    $$.val = types.MakeGeography($3.geoFigure(), geopb.SRID($5.int32()))
+  }
 
 // We have a separate const_typename to allow defaulting fixed-length types
 // such as CHAR() and BIT() to an unspecified length. SQL9x requires that these
@@ -7276,108 +7504,7 @@ const_typename:
 | bit_without_length
 | character_without_length
 | const_datetime
-| const_json
-  {
-    $$.val = types.Jsonb
-  }
-| BLOB
-  {
-    $$.val = types.Bytes
-  }
-| BYTES
-  {
-    $$.val = types.Bytes
-  }
-| BYTEA
-  {
-    $$.val = types.Bytes
-  }
-| TEXT
-  {
-    $$.val = types.String
-  }
-| NAME
-  {
-    $$.val = types.Name
-  }
-| SERIAL
-  {
-    switch sqllex.(*lexer).nakedIntType.Width() {
-    case 32:
-      $$.val = &serial4Type
-    default:
-      $$.val = &serial8Type
-    }
-  }
-| SERIAL2
-  {
-    $$.val = &serial2Type
-  }
-| SMALLSERIAL
-  {
-    $$.val = &serial2Type
-  }
-| SERIAL4
-  {
-    $$.val = &serial4Type
-  }
-| SERIAL8
-  {
-    $$.val = &serial8Type
-  }
-| BIGSERIAL
-  {
-    $$.val = &serial8Type
-  }
-| UUID
-  {
-    $$.val = types.Uuid
-  }
-| INET
-  {
-    $$.val = types.INet
-  }
-| OID
-  {
-    $$.val = types.Oid
-  }
-| OIDVECTOR
-  {
-    $$.val = types.OidVector
-  }
-| INT2VECTOR
-  {
-    $$.val = types.Int2Vector
-  }
-| IDENT
-  {
-    /* FORCE DOC */
-    // See https://www.postgresql.org/docs/9.1/static/datatype-character.html
-    // Postgres supports a special character type named "char" (with the quotes)
-    // that is a single-character column type. It's used by system tables.
-    // Eventually this clause will be used to parse user-defined types as well,
-    // since their names can be quoted.
-    if $1 == "char" {
-      $$.val = types.MakeQChar(0)
-    } else {
-      var ok bool
-      var unimp int
-      $$.val, ok, unimp = types.TypeForNonKeywordTypeName($1)
-      if !ok {
-          switch unimp {
-              case 0:
-                // Note: we can only report an unimplemented error for specific
-                // known type names. Anything else may return PII.
-                sqllex.Error("type does not exist")
-                return 1
-              case -1:
-                return unimplemented(sqllex, "type name " + $1)
-              default:
-                return unimplementedWithIssueDetail(sqllex, unimp, $1)
-          }
-      }
-    }
-  }
+| const_geo
 
 opt_numeric_modifiers:
   '(' iconst32 ')'
@@ -7411,25 +7538,9 @@ numeric:
   {
     $$.val = sqllex.(*lexer).nakedIntType
   }
-| INT2
-  {
-    $$.val = types.Int2
-  }
 | SMALLINT
   {
     $$.val = types.Int2
-  }
-| INT4
-  {
-    $$.val = types.Int4
-  }
-| INT8
-  {
-    $$.val = types.Int
-  }
-| INT64
-  {
-    $$.val = types.Int
   }
 | BIGINT
   {
@@ -7439,14 +7550,6 @@ numeric:
   {
     $$.val = types.Float4
   }
-| FLOAT4
-    {
-      $$.val = types.Float4
-    }
-| FLOAT8
-    {
-      $$.val = types.Float
-    }
 | FLOAT opt_float
   {
     $$.val = $2.colType()
@@ -7482,33 +7585,6 @@ numeric:
 | BOOLEAN
   {
     $$.val = types.Bool
-  }
-| BOOL
-  {
-    $$.val = types.Bool
-  }
-
-// Postgres OID pseudo-types. See https://www.postgresql.org/docs/9.4/static/datatype-oid.html.
-postgres_oid:
-  REGPROC
-  {
-    $$.val = types.RegProc
-  }
-| REGPROCEDURE
-  {
-    $$.val = types.RegProcedure
-  }
-| REGCLASS
-  {
-    $$.val = types.RegClass
-  }
-| REGTYPE
-  {
-    $$.val = types.RegType
-  }
-| REGNAMESPACE
-  {
-    $$.val = types.RegNamespace
   }
 
 opt_float:
@@ -8410,9 +8486,9 @@ d_expr:
     $$.val = d
   }
 | func_name '(' expr_list opt_sort_clause ')' SCONST { return unimplemented(sqllex, $1.unresolvedName().String() + "(...) SCONST") }
-| const_typename SCONST
+| typed_literal
   {
-    $$.val = &tree.CastExpr{Expr: tree.NewStrVal($2), Type: $1.colType(), SyntaxMode: tree.CastPrepend}
+    $$.val = $1.expr()
   }
 | interval_value
   {
@@ -8517,6 +8593,58 @@ func_application:
     $$.val = &tree.FuncExpr{Func: $1.resolvableFuncRefFromName(), Exprs: tree.Exprs{tree.StarExpr()}}
   }
 | func_name '(' error { return helpWithFunction(sqllex, $1.resolvableFuncRefFromName()) }
+
+// typed_literal represents expressions like INT '4', or generally <TYPE> SCONST.
+// This rule handles both the case of qualified and non-qualified typenames.
+typed_literal:
+  // The key here is that none of the keywords in the func_name_no_crdb_extra
+  // production can overlap with the type rules in const_typename, otherwise
+  // we will have conflicts between this rule and the one below.
+  func_name_no_crdb_extra SCONST
+  {
+    name := $1.unresolvedName()
+    if name.NumParts == 1 {
+      typName := name.Parts[0]
+      /* FORCE DOC */
+      // See https://www.postgresql.org/docs/9.1/static/datatype-character.html
+      // Postgres supports a special character type named "char" (with the quotes)
+      // that is a single-character column type. It's used by system tables.
+      // Eventually this clause will be used to parse user-defined types as well,
+      // since their names can be quoted.
+      if typName == "char" {
+        $$.val = &tree.CastExpr{Expr: tree.NewStrVal($2), Type: types.MakeQChar(0), SyntaxMode: tree.CastPrepend}
+      } else if typName == "serial" {
+        switch sqllex.(*lexer).nakedIntType.Width() {
+        case 32:
+          $$.val = &tree.CastExpr{Expr: tree.NewStrVal($2), Type: &types.Serial4Type, SyntaxMode: tree.CastPrepend}
+        default:
+          $$.val = &tree.CastExpr{Expr: tree.NewStrVal($2), Type: &types.Serial8Type, SyntaxMode: tree.CastPrepend}
+        }
+      } else {
+        typ, ok, unimp := types.TypeForNonKeywordTypeName(typName)
+        if !ok {
+          switch unimp {
+            case 0:
+              // Note: we can only report an unimplemented error for specific
+              // known type names. Anything else may return PII.
+              sqllex.Error(fmt.Sprintf("type %q does not exist", typName))
+              return 1
+            case -1:
+              return unimplemented(sqllex, "type name " + typName)
+            default:
+              return unimplementedWithIssueDetail(sqllex, unimp, typName)
+          }
+        }
+      $$.val = &tree.CastExpr{Expr: tree.NewStrVal($2), Type: typ, SyntaxMode: tree.CastPrepend}
+      }
+    } else {
+      return unimplemented(sqllex, "generic-type-name prepended casts")
+    }
+  }
+| const_typename SCONST
+  {
+    $$.val = &tree.CastExpr{Expr: tree.NewStrVal($2), Type: $1.colType(), SyntaxMode: tree.CastPrepend}
+  }
 
 // func_expr and its cousin func_expr_windowless are split out from c_expr just
 // so that we have classifications for "everything that is a function call or
@@ -9720,6 +9848,15 @@ func_name:
   }
 | prefixed_column_path
 
+// func_name_no_crdb_extra is the same rule as func_name, but does not
+// contain some CRDB specific keywords like FAMILY.
+func_name_no_crdb_extra:
+  type_function_name_no_crdb_extra
+  {
+    $$.val = &tree.UnresolvedName{NumParts:1, Parts: tree.NameParts{$1}}
+  }
+| prefixed_column_path
+
 // Names for database objects (tables, sequences, views, stored functions).
 // Accepted patterns:
 // <table>
@@ -9766,7 +9903,7 @@ complex_db_object_name:
 // trying to gain them back here.
 db_object_name_component:
   name
-| cockroachdb_extra_type_func_name_keyword
+| type_func_name_crdb_extra_keyword
 | cockroachdb_extra_reserved_keyword
 
 // General name --- names that can be column, table, etc names.
@@ -9805,6 +9942,12 @@ type_function_name:
 | unreserved_keyword
 | type_func_name_keyword
 
+// Type/function identifier without CRDB extra reserved keywords.
+type_function_name_no_crdb_extra:
+  IDENT
+| unreserved_keyword
+| type_func_name_no_crdb_extra_keyword
+
 // Any not-fully-reserved word --- these names can be, eg, variable names.
 non_reserved_word:
   IDENT
@@ -9837,19 +9980,15 @@ unreserved_keyword:
 | ADMIN
 | AGGREGATE
 | ALTER
+| ALWAYS
 | AT
 | AUTOMATIC
 | AUTHORIZATION
 | BACKUP
 | BEGIN
-| BIGSERIAL
-| BLOB
-| BOOL
 | BUCKET_COUNT
 | BUNDLE
 | BY
-| BYTEA
-| BYTES
 | CACHE
 | CANCEL
 | CASCADE
@@ -9858,6 +9997,7 @@ unreserved_keyword:
 | CLUSTER
 | COLUMNS
 | COMMENT
+| COMMENTS
 | COMMIT
 | COMMITTED
 | COMPACT
@@ -9877,11 +10017,11 @@ unreserved_keyword:
 | DATA
 | DATABASE
 | DATABASES
-| DATE
 | DAY
 | DEALLOCATE
 | DECLARE
 | DELETE
+| DEFAULTS
 | DEFERRED
 | DISCARD
 | DOMAIN
@@ -9891,6 +10031,7 @@ unreserved_keyword:
 | ENUM
 | ESCAPE
 | EXCLUDE
+| EXCLUDING
 | EXECUTE
 | EXPERIMENTAL
 | EXPERIMENTAL_AUDIT
@@ -9904,11 +10045,11 @@ unreserved_keyword:
 | FILES
 | FILTER
 | FIRST
-| FLOAT4
-| FLOAT8
 | FOLLOWING
 | FORCE_INDEX
 | FUNCTION
+| GENERATED
+| GEOMETRYCOLLECTION
 | GLOBAL
 | GRANTS
 | GROUPS
@@ -9916,27 +10057,22 @@ unreserved_keyword:
 | HIGH
 | HISTOGRAM
 | HOUR
+| IDENTITY
 | IMMEDIATE
 | IMPORT
 | INCLUDE
+| INCLUDING
 | INCREMENT
 | INCREMENTAL
 | INDEXES
-| INET
 | INJECT
 | INSERT
-| INT2
-| INT2VECTOR
-| INT4
-| INT8
-| INT64
 | INTERLEAVE
 | INVERTED
 | ISOLATION
 | JOB
 | JOBS
 | JSON
-| JSONB
 | KEY
 | KEYS
 | KV
@@ -9947,6 +10083,7 @@ unreserved_keyword:
 | LEASE
 | LESS
 | LEVEL
+| LINESTRING
 | LIST
 | LOCAL
 | LOCKED
@@ -9959,10 +10096,12 @@ unreserved_keyword:
 | MERGE
 | MINUTE
 | MINVALUE
+| MULTILINESTRING
+| MULTIPOINT
+| MULTIPOLYGON
 | MONTH
 | NAMES
 | NAN
-| NAME
 | NEXT
 | NO
 | NORMAL
@@ -9974,9 +10113,7 @@ unreserved_keyword:
 | IGNORE_FOREIGN_KEYS
 | OF
 | OFF
-| OID
 | OIDS
-| OIDVECTOR
 | OPERATOR
 | OPT
 | OPTION
@@ -10007,11 +10144,6 @@ unreserved_keyword:
 | READ
 | RECURSIVE
 | REF
-| REGCLASS
-| REGPROC
-| REGPROCEDURE
-| REGNAMESPACE
-| REGTYPE
 | REINDEX
 | RELEASE
 | RENAME
@@ -10038,11 +10170,7 @@ unreserved_keyword:
 | SCRUB
 | SEARCH
 | SECOND
-| SERIAL
 | SERIALIZABLE
-| SERIAL2
-| SERIAL4
-| SERIAL8
 | SEQUENCE
 | SEQUENCES
 | SERVER
@@ -10053,18 +10181,17 @@ unreserved_keyword:
 | SHOW
 | SIMPLE
 | SKIP
-| SMALLSERIAL
 | SNAPSHOT
 | SPLIT
 | SQL
 | START
 | STATISTICS
 | STDIN
+| STORAGE
 | STORE
 | STORED
 | STORING
 | STRICT
-| STRING
 | SUBSCRIPTION
 | SYNTAX
 | SYSTEM
@@ -10090,7 +10217,6 @@ unreserved_keyword:
 | UNTIL
 | UPDATE
 | UPSERT
-| UUID
 | USE
 | USERS
 | VALID
@@ -10129,6 +10255,8 @@ col_name_keyword:
 | EXTRACT
 | EXTRACT_DURATION
 | FLOAT
+| GEOGRAPHY
+| GEOMETRY
 | GREATEST
 | GROUPING
 | IF
@@ -10143,11 +10271,14 @@ col_name_keyword:
 | NUMERIC
 | OUT
 | OVERLAY
+| POINT
+| POLYGON
 | POSITION
 | PRECISION
 | REAL
 | ROW
 | SMALLINT
+| STRING
 | SUBSTRING
 | TIME
 | TIMETZ
@@ -10161,6 +10292,12 @@ col_name_keyword:
 | VIRTUAL
 | WORK
 
+// type_func_name_keyword contains both the standard set of
+// type_func_name_keyword's along with the set of CRDB extensions.
+type_func_name_keyword:
+  type_func_name_no_crdb_extra_keyword
+| type_func_name_crdb_extra_keyword
+
 // Type/function identifier --- keywords that can be type or function names.
 //
 // Most of these are keywords that are used as operators in expressions; in
@@ -10173,8 +10310,8 @@ col_name_keyword:
 //
 // *** DO NOT ADD COCKROACHDB-SPECIFIC KEYWORDS HERE ***
 //
-// See cockroachdb_extra_type_func_name_keyword below.
-type_func_name_keyword:
+// See type_func_name_crdb_extra_keyword below.
+type_func_name_no_crdb_extra_keyword:
   COLLATION
 | CROSS
 | FULL
@@ -10192,7 +10329,6 @@ type_func_name_keyword:
 | OVERLAPS
 | RIGHT
 | SIMILAR
-| cockroachdb_extra_type_func_name_keyword
 
 // CockroachDB-specific keywords that can be used in type/function
 // identifiers.
@@ -10202,7 +10338,7 @@ type_func_name_keyword:
 // Adding keywords here creates non-resolvable incompatibilities with
 // postgres clients.
 //
-cockroachdb_extra_type_func_name_keyword:
+type_func_name_crdb_extra_keyword:
   FAMILY
 
 // Reserved keyword --- these keywords are usable only as a unrestricted_name.

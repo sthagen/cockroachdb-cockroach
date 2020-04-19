@@ -1044,3 +1044,29 @@ eval
 cast(B'11011' || B'00' as bit(6))
 ----
 B'110110'
+
+eval
+'0101000000000000000000F03F000000000000F03F'::geography::geometry
+----
+'0101000020E6100000000000000000F03F000000000000F03F'
+
+eval
+'0101000000000000000000F03F000000000000F03F'::geometry::geography
+----
+'0101000020E6100000000000000000F03F000000000000F03F'
+
+# Test that decimals are correctly cast when the original value is negative.
+eval
+'-2020-10-10'::timestamp::decimal
+----
+-125887824000.000000
+
+eval
+'-2020-10-10-2020 10:10:00.11111111111111111'::timestamptz::decimal
+----
+-125887714199.888889
+
+eval
+'-10'::interval::decimal
+----
+-10.000000000

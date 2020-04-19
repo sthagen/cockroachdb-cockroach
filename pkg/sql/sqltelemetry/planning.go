@@ -94,6 +94,10 @@ var ExplainDistSQLUseCounter = telemetry.GetCounterOnce("sql.plan.explain-distsq
 // ExplainAnalyzeUseCounter is to be incremented whenever EXPLAIN ANALYZE is run.
 var ExplainAnalyzeUseCounter = telemetry.GetCounterOnce("sql.plan.explain-analyze")
 
+// ExplainAnalyzeDebugUseCounter is to be incremented whenever
+// EXPLAIN ANALYZE (DEBUG) is run.
+var ExplainAnalyzeDebugUseCounter = telemetry.GetCounterOnce("sql.plan.explain-analyze-debug")
+
 // ExplainOptUseCounter is to be incremented whenever EXPLAIN (OPT) is run.
 var ExplainOptUseCounter = telemetry.GetCounterOnce("sql.plan.explain-opt")
 
@@ -151,6 +155,14 @@ var JoinTypeSemiUseCounter = telemetry.GetCounterOnce("sql.plan.opt.node.join.ty
 // JoinTypeAntiUseCounter is to be incremented whenever an anti-join node is
 // planned.
 var JoinTypeAntiUseCounter = telemetry.GetCounterOnce("sql.plan.opt.node.join.type.anti")
+
+// CancelQueriesUseCounter is to be incremented whenever CANCEL QUERY or
+// CANCEL QUERIES is run.
+var CancelQueriesUseCounter = telemetry.GetCounterOnce("sql.session.cancel-queries")
+
+// CancelSessionsUseCounter is to be incremented whenever CANCEL SESSION or
+// CANCEL SESSIONS is run.
+var CancelSessionsUseCounter = telemetry.GetCounterOnce("sql.session.cancel-sessions")
 
 // We can't parameterize these telemetry counters, so just make a bunch of
 // buckets for setting the join reorder limit since the range of reasonable

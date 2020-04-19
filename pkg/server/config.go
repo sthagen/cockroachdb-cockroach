@@ -258,10 +258,13 @@ type Config struct {
 
 	// ReadyFn is called when the server has started listening on its
 	// sockets.
-	// The argument waitForInit indicates (iff true) that the
-	// server is not bootstrapped yet, will not bootstrap itself and
-	// will be waiting for an `init` command or accept bootstrapping
-	// from a joined node.
+	//
+	// The bool parameter is true if the server is not bootstrapped yet, will not
+	// bootstrap itself and will be waiting for an `init` command or accept
+	// bootstrapping from a joined node.
+	//
+	// This method is invoked from the main start goroutine, so it should not
+	// do nontrivial work.
 	ReadyFn func(waitForInit bool)
 
 	// DelayedBootstrapFn is called if the boostrap process does not complete

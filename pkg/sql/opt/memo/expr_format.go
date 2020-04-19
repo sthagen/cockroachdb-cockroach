@@ -197,7 +197,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		FormatPrivate(f, e.Private(), required)
 		f.Buffer.WriteByte(')')
 
-	case *ScanExpr, *VirtualScanExpr, *IndexJoinExpr, *ShowTraceForSessionExpr,
+	case *ScanExpr, *IndexJoinExpr, *ShowTraceForSessionExpr,
 		*InsertExpr, *UpdateExpr, *UpsertExpr, *DeleteExpr, *SequenceSelectExpr,
 		*WindowExpr, *OpaqueRelExpr, *OpaqueMutationExpr, *OpaqueDDLExpr,
 		*AlterTableSplitExpr, *AlterTableUnsplitExpr, *AlterTableUnsplitAllExpr,
@@ -326,10 +326,10 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		if t.IsCanonical() {
 			// For the canonical scan, show the expressions attached to the TableMeta.
 			tab := md.TableMeta(t.Table)
-			if len(tab.Constraints) > 0 {
+			if tab.Constraints != nil {
 				c := tp.Childf("check constraint expressions")
-				for i := 0; i < len(tab.Constraints); i++ {
-					f.formatExpr(tab.Constraints[i], c)
+				for i := 0; i < tab.Constraints.ChildCount(); i++ {
+					f.formatExpr(tab.Constraints.Child(i), c)
 				}
 			}
 			if len(tab.ComputedCols) > 0 {
@@ -1146,9 +1146,6 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 		if ScanIsReverseFn(f.Memo.Metadata(), t, &physProps.Ordering) {
 			f.Buffer.WriteString(",rev")
 		}
-
-	case *VirtualScanPrivate:
-		fmt.Fprintf(f.Buffer, " %s", tableAlias(f, t.Table))
 
 	case *SequenceSelectPrivate:
 		seq := f.Memo.metadata.Sequence(t.Sequence)

@@ -323,7 +323,24 @@ func (r *clusterRegistry) destroyAllClusters(ctx context.Context, l *logger) {
 	}
 }
 
+// execCmd is like execCmdEx, but doesn't return the command's output.
 func execCmd(ctx context.Context, l *logger, args ...string) error {
+	return execCmdEx(ctx, l, args...).err
+}
+
+type cmdRes struct {
+	err error
+	// stdout and stderr are the commands output. Note that this is truncated and
+	// only a tail is returned.
+	stdout, stderr string
+}
+
+// execCmdEx runs a command and returns its error and output.
+//
+// Note that the output is truncated; only a tail is returned.
+// Also note that if the command exits with an error code, its output is also
+// included in cmdRes.err.
+func execCmdEx(ctx context.Context, l *logger, args ...string) cmdRes {
 	// NB: It is important that this waitgroup Waits after cancel() below.
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -348,14 +365,14 @@ func execCmd(ctx context.Context, l *logger, args ...string) error {
 	{
 		rOut, wOut, err := os.Pipe()
 		if err != nil {
-			return err
+			return cmdRes{err: err}
 		}
 		defer rOut.Close()
 		defer wOut.Close()
 
 		rErr, wErr, err := os.Pipe()
 		if err != nil {
-			return err
+			return cmdRes{err: err}
 		}
 		defer rErr.Close()
 		defer wErr.Close()
@@ -392,26 +409,70 @@ func execCmd(ctx context.Context, l *logger, args ...string) error {
 		}()
 	}
 
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	if err != nil {
 		// Context errors opaquely appear as "signal killed" when manifested.
 		// We surface this error explicitly.
 		if ctx.Err() != nil {
-			err = ctx.Err()
+			err = errors.CombineErrors(ctx.Err(), err)
 		}
 
 		// Synchronize access to ring buffers before using them to create an
 		// error to return.
 		cancel()
 		wg.Wait()
-		return errors.Wrapf(
-			err,
-			"%s returned:\nstderr:\n%s\nstdout:\n%s",
-			strings.Join(args, " "),
-			debugStderrBuffer.String(),
-			debugStdoutBuffer.String(),
-		)
+		if err != nil {
+			err = &withCommandDetails{
+				cause:  err,
+				cmd:    strings.Join(args, " "),
+				stderr: debugStderrBuffer.String(),
+				stdout: debugStdoutBuffer.String(),
+			}
+		}
 	}
-	return nil
+	return cmdRes{
+		err:    err,
+		stdout: debugStdoutBuffer.String(),
+		stderr: debugStderrBuffer.String(),
+	}
+}
+
+type withCommandDetails struct {
+	cause  error
+	cmd    string
+	stderr string
+	stdout string
+}
+
+var _ error = (*withCommandDetails)(nil)
+var _ errors.Formatter = (*withCommandDetails)(nil)
+
+// Error implements error.
+func (e *withCommandDetails) Error() string { return e.cause.Error() }
+
+// Cause implements causer.
+func (e *withCommandDetails) Cause() error { return e.cause }
+
+// Format implements fmt.Formatter.
+func (e *withCommandDetails) Format(s fmt.State, verb rune) { errors.FormatError(e, s, verb) }
+
+// FormatError implements errors.Formatter.
+func (e *withCommandDetails) FormatError(p errors.Printer) error {
+	p.Printf("%s returned", e.cmd)
+	if p.Detail() {
+		p.Printf("stderr:\n%s\nstdout:\n%s", e.stderr, e.stdout)
+	}
+	return e.cause
+}
+
+// GetStderr retrieves the stderr output of a command that
+// returned with an error, or the empty string if there was no stderr.
+func GetStderr(err error) string {
+	var c *withCommandDetails
+	if errors.As(err, &c) {
+		return c.stderr
+	}
+	return ""
 }
 
 // execCmdWithBuffer executes the given command and returns its stdout/stderr
@@ -1117,7 +1178,7 @@ func (f *clusterFactory) newCluster(
 			break
 		}
 		l.PrintfCtx(ctx, "Failed to create cluster.")
-		if !strings.Contains(err.Error(), "already exists") {
+		if !strings.Contains(GetStderr(err), "already exists") {
 			l.PrintfCtx(ctx, "Cleaning up in case it was partially created.")
 			c.Destroy(ctx, closeLogger, l)
 		} else {
@@ -1376,14 +1437,24 @@ func (c *cluster) FetchDebugZip(ctx context.Context) error {
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 			return err
 		}
-		// `./cockroach debug zip` is noisy. Suppress the output unless it fails.
-		output, err := execCmdWithBuffer(ctx, c.l, roachprod, "ssh", c.name+":1", "--",
-			"./cockroach", "debug", "zip", "--url", "{pgurl:1}", zipName)
-		if err != nil {
-			c.l.Printf("./cockroach debug zip failed: %s", output)
-			return err
+		// Some nodes might be down, so try to find one that works. We make the
+		// assumption that a down node will refuse the connection, so it won't
+		// waste our time.
+		for i := 1; i <= c.spec.NodeCount; i++ {
+			// `./cockroach debug zip` is noisy. Suppress the output unless it fails.
+			si := strconv.Itoa(i)
+			output, err := execCmdWithBuffer(ctx, c.l, roachprod, "ssh", c.name+":"+si, "--",
+				"./cockroach", "debug", "zip", "--url", "{pgurl:"+si+"}", zipName)
+			if err != nil {
+				c.l.Printf("./cockroach debug zip failed: %s", output)
+				if i < c.spec.NodeCount {
+					continue
+				}
+				return err
+			}
+			return execCmd(ctx, c.l, roachprod, "get", c.name+":"+si, zipName /* src */, path /* dest */)
 		}
-		return execCmd(ctx, c.l, roachprod, "get", c.name+":1", zipName /* src */, path /* dest */)
+		return nil
 	})
 }
 
@@ -2038,18 +2109,17 @@ func (c *cluster) RunWithBuffer(
 // and communication from a test driver to nodes in a cluster should use
 // external IPs.
 func (c *cluster) pgURL(ctx context.Context, node nodeListOption, external bool) []string {
-	args := []string{`pgurl`}
+	args := []string{roachprod, "pgurl"}
 	if external {
 		args = append(args, `--external`)
 	}
-	args = append(args, c.makeNodes(node))
-	cmd := exec.CommandContext(ctx, roachprod, args...)
-	output, err := cmd.Output()
-	if err != nil {
-		fmt.Println(strings.Join(cmd.Args, ` `))
-		c.t.Fatal(err)
+	nodes := c.makeNodes(node)
+	args = append(args, nodes)
+	cmd := execCmdEx(ctx, c.l, args...)
+	if cmd.err != nil {
+		c.t.Fatal(errors.Wrapf(cmd.err, "failed to get pgurl for nodes: %s", nodes))
 	}
-	urls := strings.Split(strings.TrimSpace(string(output)), " ")
+	urls := strings.Split(strings.TrimSpace(cmd.stdout), " ")
 	for i := range urls {
 		urls[i] = strings.Trim(urls[i], "'")
 	}
@@ -2479,6 +2549,7 @@ func (m *monitor) wait(args ...string) error {
 }
 
 func waitForFullReplication(t *test, db *gosql.DB) {
+	t.l.Printf("waiting for up-replication...\n")
 	tStart := timeutil.Now()
 	for ok := false; !ok; time.Sleep(time.Second) {
 		if err := db.QueryRow(

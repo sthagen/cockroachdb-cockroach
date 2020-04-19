@@ -262,8 +262,18 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 		newDescriptorIDs:    staticIDs(keys.ProtectedTimestampsRecordsTableID),
 	},
 	{
-		// Introduced in v20.1.
-		name:                "create new system.namespace table",
+		// Introduced in v20.1. Note that this migration
+		// has v2 appended to it because in 20.1 betas, the migration edited the old
+		// system.namespace descriptor to change its Name. This wrought havoc,
+		// causing #47167, which caused 19.2 nodes to fail to be able to read
+		// system.namespace from SQL queries. However, without changing the old
+		// descriptor's Name, backup would fail, since backup requires that no two
+		// descriptors have the same Name. So, in v2 of this migration, we edit
+		// the name of the new table's Descriptor, calling it
+		// namespace2, and re-edit the old descriptor's Name to
+		// be just "namespace" again, to try to help clusters that might have
+		// upgraded to the 20.1 betas with the problem.
+		name:                "create new system.namespace table v2",
 		workFn:              createNewSystemNamespaceDescriptor,
 		includedInBootstrap: clusterversion.VersionByKey(clusterversion.VersionNamespaceTableWithSchemas),
 		newDescriptorIDs:    staticIDs(keys.NamespaceTableID),
@@ -803,23 +813,28 @@ func migrateSchemaChangeJobs(ctx context.Context, r runner, registry *jobs.Regis
 
 	// Finally, we iterate through all table descriptors and jobs, and create jobs
 	// for any tables in the ADD state or that have draining names that don't
-	// already have jobs. We start by getting all descriptors and all running jobs
-	// in a single transaction. Each eligible table then gets a job created for
-	// it, each in a separate transaction; in each of those transactions, we write
-	// a table-specific KV with a key prefixed by schemaChangeJobMigrationKey to
-	// try to prevent more than one such job from being created for the table.
+	// already have jobs. We also create a GC job for all tables in the DROP state
+	// with no associated schema change or GC job, which can result from failed
+	// IMPORT and RESTORE jobs whose table data wasn't fully GC'ed.
+	//
+	// We start by getting all descriptors and all running jobs in a single
+	// transaction. Each eligible table then gets a job created for it, each in a
+	// separate transaction; in each of those transactions, we write a table-
+	// specific KV with a key prefixed by schemaChangeJobMigrationKey to try to
+	// prevent more than one such job from being created for the table.
 	//
 	// This process ensures that every table that entered into one of these
-	// intermediate states (being added, or having draining names) in 19.2 will
-	// have a schema change job created for it in 20.1, so that the table can
-	// finish being processed. It's not essential for only one job to be created
-	// for each table, since a redundant schema change job is a no-op, but we make
-	// an effort to do that anyway.
+	// intermediate states (being added/dropped, or having draining names) in 19.2
+	// will have a job created for it in 20.1, so that the table can finish being
+	// processed. It's not essential for only one job to be created for each
+	// table, since a redundant schema change job is a no-op, but we make an
+	// effort to do that anyway.
 	//
 	// There are probably more efficient ways to do this part of the migration,
 	// but the current approach seemed like the most straightforward.
 	var allDescs []sqlbase.DescriptorProto
-	jobsForDesc := make(map[sqlbase.ID][]int64)
+	schemaChangeJobsForDesc := make(map[sqlbase.ID][]int64)
+	gcJobsForDesc := make(map[sqlbase.ID][]int64)
 	if err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		descs, err := sql.GetAllDescriptors(ctx, txn)
 		if err != nil {
@@ -842,15 +857,20 @@ func migrateSchemaChangeJobs(ctx context.Context, r runner, registry *jobs.Regis
 			if err != nil {
 				return err
 			}
-			details := payload.GetSchemaChange()
-			if details == nil || details.FormatVersion < jobspb.JobResumerFormatVersion {
-				continue
-			}
-			if details.TableID != sqlbase.InvalidID {
-				jobsForDesc[details.TableID] = append(jobsForDesc[details.TableID], jobID)
-			} else {
-				for _, t := range details.DroppedTables {
-					jobsForDesc[t.ID] = append(jobsForDesc[t.ID], jobID)
+			if details := payload.GetSchemaChange(); details != nil {
+				if details.FormatVersion < jobspb.JobResumerFormatVersion {
+					continue
+				}
+				if details.TableID != sqlbase.InvalidID {
+					schemaChangeJobsForDesc[details.TableID] = append(schemaChangeJobsForDesc[details.TableID], jobID)
+				} else {
+					for _, t := range details.DroppedTables {
+						schemaChangeJobsForDesc[t.ID] = append(schemaChangeJobsForDesc[t.ID], jobID)
+					}
+				}
+			} else if details := payload.GetSchemaChangeGC(); details != nil {
+				for _, t := range details.Tables {
+					gcJobsForDesc[t.ID] = append(gcJobsForDesc[t.ID], jobID)
 				}
 			}
 		}
@@ -870,7 +890,7 @@ func migrateSchemaChangeJobs(ctx context.Context, r runner, registry *jobs.Regis
 			// appropriate to do nothing without returning an error.
 			log.Warningf(
 				ctx,
-				"tried to add job for table %d which is neither being added nor has draining names",
+				"tried to add schema change job for table %d which is neither being added nor has draining names",
 				desc.ID,
 			)
 			return nil
@@ -890,7 +910,22 @@ func migrateSchemaChangeJobs(ctx context.Context, r runner, registry *jobs.Regis
 		if err != nil {
 			return err
 		}
-		log.Infof(ctx, "migration created new job %d: %s", *job.ID(), description)
+		log.Infof(ctx, "migration created new schema change job %d: %s", *job.ID(), description)
+		return nil
+	}
+
+	createGCJobForTable := func(txn *kv.Txn, desc *sqlbase.TableDescriptor) error {
+		record := sql.CreateGCJobRecord(
+			fmt.Sprintf("table %d", desc.ID),
+			security.NodeUser,
+			jobspb.SchemaChangeGCDetails{
+				Tables: []jobspb.SchemaChangeGCDetails_DroppedID{{ID: desc.ID, DropTime: desc.DropTime}},
+			})
+		job, err := registry.CreateJobWithTxn(ctx, record, txn)
+		if err != nil {
+			return err
+		}
+		log.Infof(ctx, "migration created new GC job %d for table %d", *job.ID(), desc.ID)
 		return nil
 	}
 
@@ -898,13 +933,16 @@ func migrateSchemaChangeJobs(ctx context.Context, r runner, registry *jobs.Regis
 	for _, desc := range allDescs {
 		switch desc := desc.(type) {
 		case *sqlbase.TableDescriptor:
-			if len(jobsForDesc[desc.ID]) > 0 {
-				log.VEventf(ctx, 3, "table %d has running jobs, skipping", desc.ID)
+			if scJobs := schemaChangeJobsForDesc[desc.ID]; len(scJobs) > 0 {
+				log.VEventf(ctx, 3, "table %d has running schema change jobs %v, skipping", desc.ID, scJobs)
+				continue
+			} else if gcJobs := gcJobsForDesc[desc.ID]; len(gcJobs) > 0 {
+				log.VEventf(ctx, 3, "table %d has running GC jobs %v, skipping", desc.ID, gcJobs)
 				continue
 			}
-			if !desc.Adding() && !desc.HasDrainingNames() {
+			if !desc.Adding() && !desc.Dropped() && !desc.HasDrainingNames() {
 				log.VEventf(ctx, 3,
-					"table %d is not being added and does not have draining names, skipping",
+					"table %d is not being added or dropped and does not have draining names, skipping",
 					desc.ID,
 				)
 				continue
@@ -919,8 +957,18 @@ func migrateSchemaChangeJobs(ctx context.Context, r runner, registry *jobs.Regis
 					log.VEventf(ctx, 3, "table %d already processed in migration", desc.ID)
 					return nil
 				}
-				if err := createSchemaChangeJobForTable(txn, desc); err != nil {
-					return err
+				if desc.Adding() || desc.HasDrainingNames() {
+					if err := createSchemaChangeJobForTable(txn, desc); err != nil {
+						return err
+					}
+				} else if desc.Dropped() {
+					// Note that a table can be both in the DROP state and have draining
+					// names. In that case it was enough to just create a schema change
+					// job, as in the case above, because that job will itself create a
+					// GC job.
+					if err := createGCJobForTable(txn, desc); err != nil {
+						return err
+					}
 				}
 				if err := txn.Put(ctx, key, startTime); err != nil {
 					return err
@@ -1030,7 +1078,6 @@ func migrateMutationJobForTable(
 		indexGCJobRecord := sql.CreateGCJobRecord(
 			job.Payload().Description,
 			job.Payload().Username,
-			sqlbase.IDs{tableDesc.ID},
 			jobspb.SchemaChangeGCDetails{
 				Indexes: []jobspb.SchemaChangeGCDetails_DroppedIndex{
 					{
@@ -1132,7 +1179,6 @@ func migrateDropTablesOrDatabaseJob(
 	gcJobRecord := sql.CreateGCJobRecord(
 		job.Payload().Description,
 		job.Payload().Username,
-		job.Payload().DescriptorIDs,
 		jobspb.SchemaChangeGCDetails{
 			Tables:   tablesToDrop,
 			ParentID: details.DroppedDatabaseID,
@@ -1239,8 +1285,9 @@ func createNewSystemNamespaceDescriptor(ctx context.Context, r runner) error {
 		b := txn.NewBatch()
 
 		// Retrieve the existing namespace table's descriptor and change its name to
-		// "namespace_deprecated". This prevents name collisions with the new
-		// namespace table, for instance during backup.
+		// "namespace". This corrects the behavior of this migration as it existed
+		// in 20.1 betas. The old namespace table cannot be edited without breaking
+		// explicit selects from system.namespace in 19.2.
 		deprecatedKey := sqlbase.MakeDescMetadataKey(keys.DeprecatedNamespaceTableID)
 		deprecatedDesc := &sqlbase.Descriptor{}
 		ts, err := txn.GetProtoTs(ctx, deprecatedKey, deprecatedDesc)
@@ -1262,7 +1309,7 @@ func createNewSystemNamespaceDescriptor(ctx context.Context, r runner) error {
 		//    the correct ID in the new system.namespace table after all tables are
 		//    copied over.
 		nameKey := sqlbase.NewPublicTableKey(
-			sqlbase.NamespaceTable.GetParentID(), sqlbase.NamespaceTable.GetName())
+			sqlbase.NamespaceTable.GetParentID(), sqlbase.NamespaceTableName)
 		b.Put(nameKey.Key(), sqlbase.NamespaceTable.GetID())
 		b.Put(sqlbase.MakeDescMetadataKey(
 			sqlbase.NamespaceTable.GetID()), sqlbase.WrapDescriptor(&sqlbase.NamespaceTable))

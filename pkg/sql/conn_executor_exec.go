@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -192,6 +193,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	var finishCollectionDiagnostics StmtDiagnosticsTraceFinishFunc
 
 	if explainBundle, ok := stmt.AST.(*tree.ExplainAnalyzeDebug); ok {
+		telemetry.Inc(sqltelemetry.ExplainAnalyzeDebugUseCounter)
 		// Always collect diagnostics for EXPLAIN ANALYZE (DEBUG).
 		shouldCollectDiagnostics = true
 		// Strip off the explain node to execute the inner statement.
@@ -211,6 +213,9 @@ func (ex *connExecutor) execStmtInOpenState(
 		p.discardRows = true
 	} else {
 		shouldCollectDiagnostics, finishCollectionDiagnostics = ex.stmtDiagnosticsRecorder.ShouldCollectDiagnostics(ctx, stmt.AST)
+		if shouldCollectDiagnostics {
+			telemetry.Inc(sqltelemetry.StatementDiagnosticsCollectedCounter)
+		}
 	}
 
 	if shouldCollectDiagnostics {
@@ -824,7 +829,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 		ex.server.cfg.RangeDescriptorCache, ex.server.cfg.LeaseHolderCache,
 		planner.txn,
 		func(ts hlc.Timestamp) {
-			_ = ex.server.cfg.Clock.Update(ts)
+			ex.server.cfg.Clock.Update(ts)
 		},
 		&ex.sessionTracing,
 	)
@@ -954,34 +959,28 @@ func (ex *connExecutor) execStmtInNoTxnState(
 				ex.incrementExecutedStmtCounter(stmt)
 			}
 		}()
-		pri, err := priorityToProto(s.Modes.UserPriority)
-		if err != nil {
-			return ex.makeErrEvent(err, s)
-		}
 		mode, sqlTs, historicalTs, err := ex.beginTransactionTimestampsAndReadMode(ctx, s)
 		if err != nil {
 			return ex.makeErrEvent(err, s)
 		}
 		return eventTxnStart{ImplicitTxn: fsm.False},
 			makeEventTxnStartPayload(
-				pri, mode, sqlTs,
+				ex.txnPriorityWithSessionDefault(s.Modes.UserPriority),
+				mode,
+				sqlTs,
 				historicalTs,
 				ex.transitionCtx)
 	case *tree.CommitTransaction, *tree.ReleaseSavepoint,
 		*tree.RollbackTransaction, *tree.SetTransaction, *tree.Savepoint:
 		return ex.makeErrEvent(errNoTransactionInProgress, stmt.AST)
 	default:
-		mode := tree.ReadWrite
-		if ex.sessionData.DefaultReadOnly {
-			mode = tree.ReadOnly
-		}
 		// NB: Implicit transactions are created without a historical timestamp even
 		// though the statement might contain an AOST clause. In these cases the
 		// clause is evaluated and applied execStmtInOpenState.
 		return eventTxnStart{ImplicitTxn: fsm.True},
 			makeEventTxnStartPayload(
-				roachpb.NormalUserPriority,
-				mode,
+				ex.txnPriorityWithSessionDefault(tree.UnspecifiedUserPriority),
+				ex.readWriteModeWithSessionDefault(tree.UnspecifiedReadWriteMode),
 				ex.server.cfg.Clock.PhysicalTime(),
 				nil, /* historicalTimestamp */
 				ex.transitionCtx)

@@ -1463,11 +1463,6 @@ func NewLeaseManager(
 	return lm
 }
 
-// SetInternalExecutor has to be called if a nil execCfg was passed to NewLeaseManager.
-func (m *LeaseManager) SetInternalExecutor(executor sqlutil.InternalExecutor) {
-	m.internalExecutor = executor
-}
-
 func nameMatchesTable(
 	table *sqlbase.TableDescriptor, dbID sqlbase.ID, schemaID sqlbase.ID, tableName string,
 ) bool {
@@ -1734,7 +1729,12 @@ func (m *LeaseManager) isDraining() bool {
 
 // SetDraining (when called with 'true') removes all inactive leases. Any leases
 // that are active will be removed once the lease's reference count drops to 0.
-func (m *LeaseManager) SetDraining(drain bool) {
+//
+// The reporter callback, if non-nil, is called on a best effort basis
+// to report work that needed to be done and which may or may not have
+// been done by the time this call returns. See the explanation in
+// pkg/server/drain.go for details.
+func (m *LeaseManager) SetDraining(drain bool, reporter func(int, string)) {
 	m.draining.Store(drain)
 	if !drain {
 		return
@@ -1748,6 +1748,10 @@ func (m *LeaseManager) SetDraining(drain bool) {
 		t.mu.Unlock()
 		for _, l := range leases {
 			releaseLease(l, m)
+		}
+		if reporter != nil {
+			// Report progress through the Drain RPC.
+			reporter(len(leases), "table leases")
 		}
 	}
 }

@@ -35,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -423,18 +422,9 @@ func migrateGCJobToOldFormat(
 		return nil
 
 	case DropIndex:
-		// Since we write the GC job in a separate transaction from finalizing the
-		// mutations on the table descriptor, there's a chance that we might see the
-		// table descriptor before it's even been updated with the new GCMutations.
-		// This seems like a potential problem. For now, we'll just hackily retry
-		// until the new descriptor appears.
-		// TODO (lucy): Update this after we fix GC job creation.
-		var tableDesc *sql.TableDescriptor
-		for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
-			tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
-			if l := len(tableDesc.GCMutations); l == 1 {
-				break
-			}
+		tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+		if l := len(tableDesc.GCMutations); l != 1 {
+			return errors.AssertionFailedf("expected exactly 1 GCMutation, found %d", l)
 		}
 
 		// Update the table descriptor.
@@ -554,7 +544,27 @@ func setupTestingKnobs(
 		}
 	case AfterBackfill:
 		if shouldCancel {
-			knobs.RunAfterOnFailOrCancel = blockFn
+			// This is a special case where (1) RunAfterBackfill within Resume() needs
+			// to call cancelFn() to cancel the job, (2) RunBeforeOnFailOrCancel needs
+			// to set hasCanceled, and (3) RunAfterBackfill, running for the 2nd time
+			// within OnFailOrCancel(), needs to read the value of hasCanceled (which
+			// is true) and run BlockFn().
+			knobs.RunBeforeOnFailOrCancel = func(jobID int64) error {
+				mu.Lock()
+				defer mu.Unlock()
+				hasCanceled = true
+				return nil
+			}
+			knobs.RunAfterBackfill = func(jobID int64) error {
+				mu.Lock()
+				hasCanceled := hasCanceled
+				mu.Unlock()
+				if hasCanceled {
+					return blockFn(jobID)
+				} else {
+					return cancelFn(jobID)
+				}
+			}
 		} else {
 			knobs.RunAfterBackfill = blockFn
 		}
@@ -698,7 +708,7 @@ func verifySchemaChangeJobRan(
 		} else {
 			expected = [][]string{{"new_table"}, {"test"}}
 		}
-		rows := runner.QueryStr(t, "SHOW TABLES FROM t")
+		rows := runner.QueryStr(t, "SELECT table_name FROM [SHOW TABLES FROM t] ORDER BY table_name")
 		require.Equal(t, expected, rows)
 	case TruncateTable:
 		if didCancel {
@@ -711,7 +721,7 @@ func verifySchemaChangeJobRan(
 	case DropTable:
 		// Canceling after the backfill has no effect.
 		expected = [][]string{}
-		rows := runner.QueryStr(t, "SHOW TABLES FROM t")
+		rows := runner.QueryStr(t, "SELECT table_name FROM [SHOW TABLES FROM t] ORDER BY table_name")
 		require.Equal(t, expected, rows)
 	}
 }
@@ -813,6 +823,10 @@ func TestMigrateSchemaChanges(t *testing.T) {
 				blockState := blockState
 				shouldCancel := shouldCancel
 
+				// Rollbacks of DROP CONSTRAINT are broken. See #47323.
+				if schemaChange.kind == DropConstraint && shouldCancel {
+					continue
+				}
 				if !canBlockIfCanceled(blockState, shouldCancel) {
 					continue
 				}
@@ -834,4 +848,51 @@ func TestMigrateSchemaChanges(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestGCJobCreated tests that a table descriptor in the DROP state with no
+// running job has a GC job created for it.
+func TestGCJobCreated(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer setTestJobsAdoptInterval()()
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs.SQLMigrationManager = &sqlmigrations.MigrationManagerTestingKnobs{
+		AlwaysRunJobMigration: true,
+	}
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+	ctx := context.Background()
+	sqlRunner := sqlutils.MakeSQLRunner(sqlDB)
+
+	// Create a table and then force it to be in the DROP state.
+	if _, err := sqlDB.Exec(`CREATE DATABASE t; CREATE TABLE t.test();`); err != nil {
+		t.Fatal(err)
+	}
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc.State = sqlbase.TableDescriptor_DROP
+	tableDesc.Version++
+	tableDesc.DropTime = 1
+	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
+		if err := sqlbase.RemoveObjectNamespaceEntry(ctx, txn, tableDesc.ID, tableDesc.ParentID, tableDesc.Name, false /* kvTrace */); err != nil {
+			return err
+		}
+		return kvDB.Put(ctx, sqlbase.MakeDescMetadataKey(tableDesc.GetID()), sqlbase.WrapDescriptor(tableDesc))
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run the migration.
+	migMgr := s.MigrationManager().(*sqlmigrations.Manager)
+	if err := migMgr.StartSchemaChangeJobMigration(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Check that a GC job was created and completed successfully.
+	sqlRunner.CheckQueryResultsRetry(t,
+		"SELECT count(*) FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE GC' AND status = 'succeeded'",
+		[][]string{{"1"}},
+	)
 }

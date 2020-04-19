@@ -1130,6 +1130,12 @@ func (b *putBuffer) marshalMeta(meta *enginepb.MVCCMetadata) (_ []byte, err erro
 func (b *putBuffer) putMeta(
 	writer Writer, key MVCCKey, meta *enginepb.MVCCMetadata,
 ) (keyBytes, valBytes int64, err error) {
+	if meta.Txn != nil && !meta.Timestamp.Equal(hlc.LegacyTimestamp(meta.Txn.WriteTimestamp)) {
+		// The timestamps are supposed to be in sync. If they weren't, it wouldn't
+		// be clear for readers which one to use for what.
+		return 0, 0, errors.AssertionFailedf(
+			"meta.Timestamp != meta.Txn.WriteTimestamp: %s != %s", meta.Timestamp, meta.Txn.WriteTimestamp)
+	}
 	bytes, err := b.marshalMeta(meta)
 	if err != nil {
 		return 0, 0, err
@@ -1729,6 +1735,13 @@ func mvccPutInternal(
 		var txnMeta *enginepb.TxnMeta
 		if txn != nil {
 			txnMeta = &txn.TxnMeta
+			// If we bumped the WriteTimestamp, we update both the TxnMeta and the
+			// MVCCMetadata.Timestamp.
+			if txnMeta.WriteTimestamp.Less(writeTimestamp) {
+				txnMetaCpy := *txnMeta
+				txnMetaCpy.WriteTimestamp.Forward(writeTimestamp)
+				txnMeta = &txnMetaCpy
+			}
 		}
 		buf.newMeta.Txn = txnMeta
 		buf.newMeta.Timestamp = hlc.LegacyTimestamp(writeTimestamp)
@@ -2539,6 +2552,28 @@ func MVCCScanToBytes(
 	return mvccScanToBytes(ctx, iter, key, endKey, timestamp, opts)
 }
 
+// MVCCScanAsTxn constructs a temporary transaction from the given transaction
+// metadata and calls MVCCScan as that transaction. This method is required only
+// for reading intents of a transaction when only its metadata is known and
+// should rarely be used.
+//
+// The read is carried out without the chance of uncertainty restarts.
+func MVCCScanAsTxn(
+	ctx context.Context,
+	reader Reader,
+	key, endKey roachpb.Key,
+	timestamp hlc.Timestamp,
+	txnMeta enginepb.TxnMeta,
+) (MVCCScanResult, error) {
+	return MVCCScan(ctx, reader, key, endKey, timestamp, MVCCScanOptions{
+		Txn: &roachpb.Transaction{
+			TxnMeta:       txnMeta,
+			Status:        roachpb.PENDING,
+			ReadTimestamp: txnMeta.WriteTimestamp,
+			MaxTimestamp:  txnMeta.WriteTimestamp,
+		}})
+}
+
 // MVCCIterate iterates over the key range [start,end). At each step of the
 // iteration, f() is invoked with the current key/value pair. If f returns
 // true (done) or an error, the iteration stops and the error is propagated.
@@ -2786,18 +2821,23 @@ func mvccResolveWriteIntent(
 	// is because removeIntent implies rolledBackVal == nil, pushed == false, and
 	// commit == false.
 	if commit || pushed || rolledBackVal != nil {
+		// The intent might be committing at a higher timestamp, or it might be
+		// getting pushed.
+		newTimestamp := intent.Txn.WriteTimestamp
+
 		buf.newMeta = *meta
 		// Set the timestamp for upcoming write (or at least the stats update).
-		buf.newMeta.Timestamp = hlc.LegacyTimestamp(intent.Txn.WriteTimestamp)
+		buf.newMeta.Timestamp = hlc.LegacyTimestamp(newTimestamp)
+		buf.newMeta.Txn.WriteTimestamp = newTimestamp
 
 		// Update or remove the metadata key.
 		var metaKeySize, metaValSize int64
 		if !commit {
-			// Keep existing intent if we're updating it. We keep the
-			// existing metadata instead of using the supplied intent meta
-			// to avoid overwriting a newer epoch (see comments above). The
-			// pusher's job isn't to do anything to update the intent but
-			// to move the timestamp forward, even if it can.
+			// Keep existing intent if we're updating it. We update the existing
+			// metadata's timestamp instead of using the supplied intent meta to avoid
+			// overwriting a newer epoch (see comments above). The pusher's job isn't
+			// to do anything to update the intent but to move the timestamp forward,
+			// even if it can.
 			metaKeySize, metaValSize, err = buf.putMeta(rw, metaKey, &buf.newMeta)
 		} else {
 			metaKeySize = int64(metaKey.EncodedSize())
@@ -2812,7 +2852,7 @@ func mvccResolveWriteIntent(
 		var prevValSize int64
 		if buf.newMeta.Timestamp != meta.Timestamp {
 			oldKey := MVCCKey{Key: intent.Key, Timestamp: hlc.Timestamp(meta.Timestamp)}
-			newKey := MVCCKey{Key: intent.Key, Timestamp: intent.Txn.WriteTimestamp}
+			newKey := MVCCKey{Key: intent.Key, Timestamp: newTimestamp}
 
 			// Rewrite the versioned value at the new timestamp.
 			iter.SeekGE(oldKey)
@@ -3028,8 +3068,12 @@ func MVCCResolveWriteIntentRange(
 // MVCCResolveWriteIntentRangeUsingIter commits or aborts (rolls back)
 // the range of write intents specified by start and end keys for a
 // given txn. ResolveWriteIntentRange will skip write intents of other
-// txns. Returns the number of intents resolved and a resume span if
-// the max keys limit was exceeded. A max of zero means unbounded.
+// txns.
+//
+// Returns the number of intents resolved and a resume span if the max
+// keys limit was exceeded. A max of zero means unbounded. A max of -1
+// means resolve nothing and return the entire intent span as the resume
+// span.
 func MVCCResolveWriteIntentRangeUsingIter(
 	ctx context.Context,
 	rw ReadWriter,
@@ -3038,6 +3082,11 @@ func MVCCResolveWriteIntentRangeUsingIter(
 	intent roachpb.LockUpdate,
 	max int64,
 ) (int64, *roachpb.Span, error) {
+	if max < 0 {
+		resumeSpan := intent.Span // don't inline or `intent` would escape to heap
+		return 0, &resumeSpan, nil
+	}
+
 	encKey := MakeMVCCMetadataKey(intent.Key)
 	encEndKey := MakeMVCCMetadataKey(intent.EndKey)
 	nextKey := encKey

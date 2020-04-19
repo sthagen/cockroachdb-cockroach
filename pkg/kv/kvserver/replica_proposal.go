@@ -456,6 +456,11 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 		// for one and if we went on to quiesce, they wouldn't necessarily get
 		// one otherwise (unless they ask for it, which adds latency).
 		r.EmitMLAI()
+
+		if leaseChangingHands && log.V(1) {
+			// This logging is useful to troubleshoot incomplete drains.
+			log.Info(ctx, "is now leaseholder")
+		}
 	}
 
 	// Mark the new lease in the replica's lease history.
@@ -662,6 +667,13 @@ func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult re
 		lResult.MaybeGossipSystemConfig = false
 	}
 
+	if lResult.MaybeGossipSystemConfigIfHaveFailure {
+		if err := r.MaybeGossipSystemConfigIfHaveFailure(ctx); err != nil {
+			log.Error(ctx, err)
+		}
+		lResult.MaybeGossipSystemConfigIfHaveFailure = false
+	}
+
 	if lResult.MaybeGossipNodeLiveness != nil {
 		if err := r.MaybeGossipNodeLiveness(ctx, *lResult.MaybeGossipNodeLiveness); err != nil {
 			log.Error(ctx, err)
@@ -735,11 +747,9 @@ func (r *Replica) evaluateProposal(
 
 		// Failed proposals can't have any Result except for what's
 		// whitelisted here.
-		intents := res.Local.DetachEncounteredIntents()
-		endTxns := res.Local.DetachEndTxns(true /* alwaysOnly */)
 		res.Local = result.LocalResult{
-			EncounteredIntents: intents,
-			EndTxns:            endTxns,
+			EncounteredIntents: res.Local.DetachEncounteredIntents(),
+			EndTxns:            res.Local.DetachEndTxns(true /* alwaysOnly */),
 			Metrics:            res.Local.Metrics,
 		}
 		res.Replicated.Reset()

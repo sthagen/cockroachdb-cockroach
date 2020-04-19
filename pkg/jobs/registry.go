@@ -96,6 +96,7 @@ type NodeLiveness interface {
 type Registry struct {
 	ac         log.AmbientContext
 	stopper    *stop.Stopper
+	nl         NodeLiveness
 	db         *kv.DB
 	ex         sqlutil.InternalExecutor
 	clock      *hlc.Clock
@@ -174,6 +175,7 @@ func MakeRegistry(
 	ac log.AmbientContext,
 	stopper *stop.Stopper,
 	clock *hlc.Clock,
+	nl NodeLiveness,
 	db *kv.DB,
 	ex sqlutil.InternalExecutor,
 	nodeID *base.NodeIDContainer,
@@ -186,6 +188,7 @@ func MakeRegistry(
 		ac:                  ac,
 		stopper:             stopper,
 		clock:               clock,
+		nl:                  nl,
 		db:                  db,
 		ex:                  ex,
 		nodeID:              nodeID,
@@ -457,14 +460,11 @@ const gcInterval = 1 * time.Hour
 // jobs if it observes a failure. Otherwise it starts all the main daemons of
 // registry that poll the jobs table and start/cancel/gc jobs.
 func (r *Registry) Start(
-	ctx context.Context,
-	stopper *stop.Stopper,
-	nl NodeLiveness,
-	cancelInterval, adoptInterval time.Duration,
+	ctx context.Context, stopper *stop.Stopper, cancelInterval, adoptInterval time.Duration,
 ) error {
 	// Calling maybeCancelJobs once at the start ensures we have an up-to-date
 	// liveness epoch before we wait out the first cancelInterval.
-	r.maybeCancelJobs(ctx, nl)
+	r.maybeCancelJobs(ctx, r.nl)
 
 	stopper.RunWorker(context.Background(), func(ctx context.Context) {
 		for {
@@ -472,7 +472,7 @@ func (r *Registry) Start(
 			case <-stopper.ShouldStop():
 				return
 			case <-time.After(cancelInterval):
-				r.maybeCancelJobs(ctx, nl)
+				r.maybeCancelJobs(ctx, r.nl)
 			}
 		}
 	})
@@ -496,7 +496,7 @@ func (r *Registry) Start(
 			r.cancelAll(ctx)
 			return
 		}
-		if err := r.maybeAdoptJob(ctx, nl, randomizeJobOrder); err != nil {
+		if err := r.maybeAdoptJob(ctx, r.nl, randomizeJobOrder); err != nil {
 			log.Errorf(ctx, "error while adopting jobs: %s", err)
 		}
 	}
@@ -769,11 +769,17 @@ func (r *Registry) createResumer(job *Job, settings *cluster.Settings) (Resumer,
 
 type retryJobError string
 
+// retryJobErrorSentinel exists so the errors returned from NewRetryJobError can
+// be marked with it, allowing more robust detection of retry errors even if
+// they are wrapped, etc. This was originally introduced to deal with injected
+// retry errors from testing knobs.
+var retryJobErrorSentinel = retryJobError("")
+
 // NewRetryJobError creates a new error that, if returned by a Resumer,
 // indicates to the jobs registry that the job should be restarted in the
 // background.
 func NewRetryJobError(s string) error {
-	return retryJobError(s)
+	return errors.Mark(retryJobError(s), retryJobErrorSentinel)
 }
 
 func (r retryJobError) Error() string {
@@ -817,8 +823,8 @@ func (r *Registry) stepThroughStateMachine(
 		// TODO(spaskob): enforce a limit on retries.
 		// TODO(spaskob,lucy): Add metrics on job retries. Consider having a backoff
 		// mechanism (possibly combined with a retry limit).
-		if e, ok := err.(retryJobError); ok {
-			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), e)
+		if errors.Is(err, retryJobErrorSentinel) {
+			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), err)
 		}
 		if err, ok := errors.Cause(err).(*InvalidStatusError); ok {
 			if err.status != StatusCancelRequested && err.status != StatusPauseRequested {
@@ -868,7 +874,7 @@ func (r *Registry) stepThroughStateMachine(
 			// If the job has failed with any error different than canceled we
 			// mark it as Failed.
 			nextStatus := StatusFailed
-			if errors.Is(errJobCanceled, jobErr) {
+			if errors.Is(jobErr, errJobCanceled) {
 				nextStatus = StatusCanceled
 			}
 			return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, nextStatus, jobErr)
@@ -878,8 +884,8 @@ func (r *Registry) stepThroughStateMachine(
 			// mark the job as failed because it can be resumed by another node.
 			return errors.Errorf("job %d: node liveness error: restarting in background", *job.ID())
 		}
-		if e, ok := err.(retryJobError); ok {
-			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), e)
+		if errors.Is(err, retryJobErrorSentinel) {
+			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), err)
 		}
 		if err, ok := errors.Cause(err).(*InvalidStatusError); ok {
 			if err.status != StatusPauseRequested {

@@ -14,7 +14,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -37,7 +36,7 @@ CREATE TABLE t.test (x INT PRIMARY KEY);
 		t.Fatal(err)
 	}
 
-	sqlServer := s.(*TestServer).Server.pgServer.SQLServer
+	sqlServer := s.(*TestServer).Server.sqlServer.pgServer.SQLServer
 
 	// Flush stats at the beginning of the test.
 	sqlServer.ResetSQLStats(ctx)
@@ -45,15 +44,14 @@ CREATE TABLE t.test (x INT PRIMARY KEY);
 
 	// Run some queries mixed with diagnostics, and ensure that the statistics
 	// are unnaffected by the calls to report diagnostics.
-	before := timeutil.Now()
 	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES ($1)`, 1); err != nil {
 		t.Fatal(err)
 	}
-	s.(*TestServer).maybeReportDiagnostics(ctx, timeutil.Now(), before, time.Second)
+	s.ReportDiagnostics(ctx)
 	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES ($1)`, 2); err != nil {
 		t.Fatal(err)
 	}
-	s.(*TestServer).maybeReportDiagnostics(ctx, timeutil.Now(), before, time.Second)
+	s.ReportDiagnostics(ctx)
 
 	// Ensure that our SQL statement data was not affected by the telemetry report.
 	stats := sqlServer.GetUnscrubbedStmtStats()
@@ -78,7 +76,7 @@ func TestSQLStatCollection(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	sqlServer := s.(*TestServer).Server.pgServer.SQLServer
+	sqlServer := s.(*TestServer).Server.sqlServer.pgServer.SQLServer
 
 	// Flush stats at the beginning of the test.
 	sqlServer.ResetSQLStats(ctx)

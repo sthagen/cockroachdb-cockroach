@@ -12,8 +12,8 @@
 # and examples.
 [GenerateConstrainedScans, Explore]
 (Select
-  (Scan $scanPrivate:* & (IsCanonicalScan $scanPrivate))
-  $filters:*
+    (Scan $scanPrivate:* & (IsCanonicalScan $scanPrivate))
+    $filters:*
 )
 =>
 (GenerateConstrainedScans $scanPrivate $filters)
@@ -22,8 +22,120 @@
 # be serviced by an inverted index.
 [GenerateInvertedIndexScans, Explore]
 (Select
-  (Scan $scanPrivate:* & (IsCanonicalScan $scanPrivate) & (HasInvertedIndexes $scanPrivate))
-  $filters:*
+    (Scan $scanPrivate:* & (IsCanonicalScan $scanPrivate) & (HasInvertedIndexes $scanPrivate))
+    $filters:*
 )
 =>
 (GenerateInvertedIndexScans $scanPrivate $filters)
+
+# SplitDisjunction splits disjunctions (Or expressions) into a Union of two
+# Select expressions, the first containing the left sub-expression of the Or
+# expression and the second containing the right sub-expression. All other
+# filter items in the original expression are preserved in the new Select
+# expressions.
+#
+# This can produce better query plans in cases where indexes cover both sides of
+# the Or expression. The execution plan can use both indexes to satisfy both
+# sides of the disjunction and union the results together.
+#
+# Note that this rule only matches Selects with canonical scans. Therefore scan
+# constraints do not need to be duplicated in the left and right scans of the
+# union.
+#
+# Also note that this rule only matches Selects that have strict keys. See
+# SplitDisjunctionAddKey which handles Selects that do not have strict keys.
+[SplitDisjunction, Explore]
+(Select
+    $input:(Scan
+        $scanPrivate:* & (IsCanonicalScan $scanPrivate)
+    ) & (HasStrictKey $input)
+    $filters:[
+        ...
+        $item:(FiltersItem $or:(Or)) &
+            (ExprPairSucceeded $pair:(ExprPairForSplitDisjunction $or)) &
+            (CanMaybeConstrainIndexWithCols $scanPrivate (OuterCols (ExprPairLeft $pair))) &
+            (CanMaybeConstrainIndexWithCols $scanPrivate (OuterCols (ExprPairRight $pair)))
+        ...
+    ]
+)
+=>
+(Union
+    (Select
+        $input
+        (ReplaceFiltersItem $filters $item (ExprPairLeft $pair))
+    )
+    (Select
+        (Scan $rightScanPrivate:(DuplicateScanPrivate $scanPrivate))
+        (MapScanFilterCols
+            (ReplaceFiltersItem $filters $item (ExprPairRight $pair))
+            $scanPrivate
+            $rightScanPrivate
+        )
+    )
+    (MakeSetPrivateForSplitDisjunction $scanPrivate $rightScanPrivate)
+)
+
+# SplitDisjunctionAddKey performs a transformation similar to
+# SplitDisjunction, but it handles the special case when the original Scan
+# does not have a strict key in its ColSet.
+#
+# For this special case, the replace pattern adds primary key columns to the
+# original Scan ColSet. It also adds a Project to remove those columns after the
+# Union operation. Inclusion of the primary keys is required to prevent the
+# generated Union from de-duplicating rows that have the same selected values.
+#
+# To understand why the addition of the primary key columns to the Scans is
+# necessary, consider the following:
+#
+#     CREATE TABLE t (k INT PRIMARY KEY, a INT, b INT)
+#     INSERT INTO t VALUES (1, 1, 3)
+#     INSERT INTO t VALUES (2, 1, 3)
+#     SELECT a, b FROM t WHERE a = 1 OR b = 3
+#
+# The expected result of the Select query is 2 rows, with values (1, 3). Now
+# consider the following query:
+#
+#     SELECT a, b FROM t WHERE a = 1
+#     UNION
+#     SELECT a, b FROM t WHERE b = 3
+#
+# Union de-duplicates all tuples with the same set of values. So, this
+# query returns only a single row.
+#
+# By adding a primary key in the output columns, each input row to the Union is
+# guaranteed to be unique. This prevents incorrect de-duplication and guarantees
+# that the newly generated plan is equivalent to the original plan.
+[SplitDisjunctionAddKey, Explore]
+(Select
+    $input:(Scan
+        $scanPrivate:* & (IsCanonicalScan $scanPrivate)
+    ) & ^(HasStrictKey $input)
+    $filters:[
+        ...
+        $item:(FiltersItem $or:(Or)) &
+            (ExprPairSucceeded $pair:(ExprPairForSplitDisjunction $or)) &
+            (CanMaybeConstrainIndexWithCols $scanPrivate (OuterCols (ExprPairLeft $pair))) &
+            (CanMaybeConstrainIndexWithCols $scanPrivate (OuterCols (ExprPairRight $pair)))
+        ...
+    ]
+)
+=>
+(Project
+    (Union
+        (Select
+            (Scan $leftScanPrivate:(AddPrimaryKeyColsToScanPrivate $scanPrivate))
+            (ReplaceFiltersItem $filters $item (ExprPairLeft $pair))
+        )
+        (Select
+            (Scan $rightScanPrivate:(DuplicateScanPrivate $leftScanPrivate))
+            (MapScanFilterCols
+                (ReplaceFiltersItem $filters $item (ExprPairRight $pair))
+                $leftScanPrivate
+                $rightScanPrivate
+            )
+        )
+        (MakeSetPrivateForSplitDisjunction $leftScanPrivate $rightScanPrivate)
+    )
+    []
+    (OutputCols $input)
+)

@@ -343,6 +343,7 @@ create_ddl_stmt ::=
 	| create_schema_stmt
 	| create_table_stmt
 	| create_table_as_stmt
+	| create_type_stmt
 	| create_view_stmt
 	| create_sequence_stmt
 
@@ -381,6 +382,7 @@ drop_ddl_stmt ::=
 	| drop_table_stmt
 	| drop_view_stmt
 	| drop_sequence_stmt
+	| drop_type_stmt
 
 drop_role_stmt ::=
 	'DROP' role_or_group_or_user string_or_placeholder_list
@@ -618,19 +620,15 @@ unreserved_keyword ::=
 	| 'ADMIN'
 	| 'AGGREGATE'
 	| 'ALTER'
+	| 'ALWAYS'
 	| 'AT'
 	| 'AUTOMATIC'
 	| 'AUTHORIZATION'
 	| 'BACKUP'
 	| 'BEGIN'
-	| 'BIGSERIAL'
-	| 'BLOB'
-	| 'BOOL'
 	| 'BUCKET_COUNT'
 	| 'BUNDLE'
 	| 'BY'
-	| 'BYTEA'
-	| 'BYTES'
 	| 'CACHE'
 	| 'CANCEL'
 	| 'CASCADE'
@@ -639,6 +637,7 @@ unreserved_keyword ::=
 	| 'CLUSTER'
 	| 'COLUMNS'
 	| 'COMMENT'
+	| 'COMMENTS'
 	| 'COMMIT'
 	| 'COMMITTED'
 	| 'COMPACT'
@@ -658,11 +657,11 @@ unreserved_keyword ::=
 	| 'DATA'
 	| 'DATABASE'
 	| 'DATABASES'
-	| 'DATE'
 	| 'DAY'
 	| 'DEALLOCATE'
 	| 'DECLARE'
 	| 'DELETE'
+	| 'DEFAULTS'
 	| 'DEFERRED'
 	| 'DISCARD'
 	| 'DOMAIN'
@@ -672,6 +671,7 @@ unreserved_keyword ::=
 	| 'ENUM'
 	| 'ESCAPE'
 	| 'EXCLUDE'
+	| 'EXCLUDING'
 	| 'EXECUTE'
 	| 'EXPERIMENTAL'
 	| 'EXPERIMENTAL_AUDIT'
@@ -685,11 +685,11 @@ unreserved_keyword ::=
 	| 'FILES'
 	| 'FILTER'
 	| 'FIRST'
-	| 'FLOAT4'
-	| 'FLOAT8'
 	| 'FOLLOWING'
 	| 'FORCE_INDEX'
 	| 'FUNCTION'
+	| 'GENERATED'
+	| 'GEOMETRYCOLLECTION'
 	| 'GLOBAL'
 	| 'GRANTS'
 	| 'GROUPS'
@@ -697,27 +697,22 @@ unreserved_keyword ::=
 	| 'HIGH'
 	| 'HISTOGRAM'
 	| 'HOUR'
+	| 'IDENTITY'
 	| 'IMMEDIATE'
 	| 'IMPORT'
 	| 'INCLUDE'
+	| 'INCLUDING'
 	| 'INCREMENT'
 	| 'INCREMENTAL'
 	| 'INDEXES'
-	| 'INET'
 	| 'INJECT'
 	| 'INSERT'
-	| 'INT2'
-	| 'INT2VECTOR'
-	| 'INT4'
-	| 'INT8'
-	| 'INT64'
 	| 'INTERLEAVE'
 	| 'INVERTED'
 	| 'ISOLATION'
 	| 'JOB'
 	| 'JOBS'
 	| 'JSON'
-	| 'JSONB'
 	| 'KEY'
 	| 'KEYS'
 	| 'KV'
@@ -728,6 +723,7 @@ unreserved_keyword ::=
 	| 'LEASE'
 	| 'LESS'
 	| 'LEVEL'
+	| 'LINESTRING'
 	| 'LIST'
 	| 'LOCAL'
 	| 'LOCKED'
@@ -740,10 +736,12 @@ unreserved_keyword ::=
 	| 'MERGE'
 	| 'MINUTE'
 	| 'MINVALUE'
+	| 'MULTILINESTRING'
+	| 'MULTIPOINT'
+	| 'MULTIPOLYGON'
 	| 'MONTH'
 	| 'NAMES'
 	| 'NAN'
-	| 'NAME'
 	| 'NEXT'
 	| 'NO'
 	| 'NORMAL'
@@ -755,9 +753,7 @@ unreserved_keyword ::=
 	| 'IGNORE_FOREIGN_KEYS'
 	| 'OF'
 	| 'OFF'
-	| 'OID'
 	| 'OIDS'
-	| 'OIDVECTOR'
 	| 'OPERATOR'
 	| 'OPT'
 	| 'OPTION'
@@ -788,11 +784,6 @@ unreserved_keyword ::=
 	| 'READ'
 	| 'RECURSIVE'
 	| 'REF'
-	| 'REGCLASS'
-	| 'REGPROC'
-	| 'REGPROCEDURE'
-	| 'REGNAMESPACE'
-	| 'REGTYPE'
 	| 'REINDEX'
 	| 'RELEASE'
 	| 'RENAME'
@@ -819,11 +810,7 @@ unreserved_keyword ::=
 	| 'SCRUB'
 	| 'SEARCH'
 	| 'SECOND'
-	| 'SERIAL'
 	| 'SERIALIZABLE'
-	| 'SERIAL2'
-	| 'SERIAL4'
-	| 'SERIAL8'
 	| 'SEQUENCE'
 	| 'SEQUENCES'
 	| 'SERVER'
@@ -834,18 +821,17 @@ unreserved_keyword ::=
 	| 'SHOW'
 	| 'SIMPLE'
 	| 'SKIP'
-	| 'SMALLSERIAL'
 	| 'SNAPSHOT'
 	| 'SPLIT'
 	| 'SQL'
 	| 'START'
 	| 'STATISTICS'
 	| 'STDIN'
+	| 'STORAGE'
 	| 'STORE'
 	| 'STORED'
 	| 'STORING'
 	| 'STRICT'
-	| 'STRING'
 	| 'SUBSCRIPTION'
 	| 'SYNTAX'
 	| 'SYSTEM'
@@ -871,7 +857,6 @@ unreserved_keyword ::=
 	| 'UNTIL'
 	| 'UPDATE'
 	| 'UPSERT'
-	| 'UUID'
 	| 'USE'
 	| 'USERS'
 	| 'VALID'
@@ -901,6 +886,8 @@ col_name_keyword ::=
 	| 'EXTRACT'
 	| 'EXTRACT_DURATION'
 	| 'FLOAT'
+	| 'GEOGRAPHY'
+	| 'GEOMETRY'
 	| 'GREATEST'
 	| 'GROUPING'
 	| 'IF'
@@ -915,11 +902,14 @@ col_name_keyword ::=
 	| 'NUMERIC'
 	| 'OUT'
 	| 'OVERLAY'
+	| 'POINT'
+	| 'POLYGON'
 	| 'POSITION'
 	| 'PRECISION'
 	| 'REAL'
 	| 'ROW'
 	| 'SMALLINT'
+	| 'STRING'
 	| 'SUBSTRING'
 	| 'TIME'
 	| 'TIMETZ'
@@ -1040,8 +1030,12 @@ create_table_as_stmt ::=
 	'CREATE' opt_temp_create_table 'TABLE' table_name create_as_opt_col_list 'AS' select_stmt
 	| 'CREATE' opt_temp_create_table 'TABLE' 'IF' 'NOT' 'EXISTS' table_name create_as_opt_col_list 'AS' select_stmt
 
+create_type_stmt ::=
+	'CREATE' 'TYPE' type_name 'AS' 'ENUM' '(' opt_enum_val_list ')'
+
 create_view_stmt ::=
 	'CREATE' opt_temp 'VIEW' view_name opt_column_list 'AS' select_stmt
+	| 'CREATE' 'OR' 'REPLACE' opt_temp 'VIEW' view_name opt_column_list 'AS' select_stmt
 	| 'CREATE' opt_temp 'VIEW' 'IF' 'NOT' 'EXISTS' view_name opt_column_list 'AS' select_stmt
 
 create_sequence_stmt ::=
@@ -1104,6 +1098,10 @@ drop_sequence_stmt ::=
 	'DROP' 'SEQUENCE' table_name_list opt_drop_behavior
 	| 'DROP' 'SEQUENCE' 'IF' 'EXISTS' table_name_list opt_drop_behavior
 
+drop_type_stmt ::=
+	'DROP' 'TYPE' type_name_list opt_drop_behavior
+	| 'DROP' 'TYPE' 'IF' 'EXISTS' type_name_list opt_drop_behavior
+
 explain_option_name ::=
 	non_reserved_word
 
@@ -1116,6 +1114,7 @@ table_elem ::=
 	| index_def
 	| family_def
 	| table_constraint
+	| 'LIKE' table_name like_table_option_list
 
 insert_column_item ::=
 	column_name
@@ -1276,7 +1275,7 @@ kv_option ::=
 
 db_object_name_component ::=
 	name
-	| cockroachdb_extra_type_func_name_keyword
+	| type_func_name_crdb_extra_keyword
 	| cockroachdb_extra_reserved_keyword
 
 unrestricted_name ::=
@@ -1449,6 +1448,13 @@ create_as_opt_col_list ::=
 	'(' create_as_table_defs ')'
 	| 
 
+type_name ::=
+	db_object_name
+
+opt_enum_val_list ::=
+	enum_val_list
+	| 
+
 opt_temp ::=
 	'TEMPORARY'
 	| 'TEMP'
@@ -1501,6 +1507,9 @@ table_index_name_list ::=
 table_name_list ::=
 	( table_name ) ( ( ',' table_name ) )*
 
+type_name_list ::=
+	( type_name ) ( ( ',' type_name ) )*
+
 non_reserved_word ::=
 	'identifier'
 	| unreserved_keyword
@@ -1522,6 +1531,9 @@ table_constraint ::=
 	'CONSTRAINT' constraint_name constraint_elem
 	| constraint_elem
 
+like_table_option_list ::=
+	(  ) ( ( 'INCLUDING' like_table_option | 'EXCLUDING' like_table_option ) )*
+
 column_name ::=
 	name
 
@@ -1531,7 +1543,7 @@ d_expr ::=
 	| 'SCONST'
 	| 'BCONST'
 	| 'BITCONST'
-	| const_typename 'SCONST'
+	| typed_literal
 	| interval_value
 	| 'TRUE'
 	| 'FALSE'
@@ -1557,11 +1569,11 @@ case_expr ::=
 	'CASE' case_arg when_clause_list case_default 'END'
 
 simple_typename ::=
-	const_typename
+	general_type_name
+	| const_typename
 	| bit_with_length
 	| character_with_length
 	| interval_type
-	| postgres_oid
 
 opt_array_bounds ::=
 	'[' ']'
@@ -1648,7 +1660,7 @@ table_ref ::=
 	| 'LATERAL' func_table opt_ordinality opt_alias_clause
 	| '[' row_source_extension_stmt ']' opt_ordinality opt_alias_clause
 
-cockroachdb_extra_type_func_name_keyword ::=
+type_func_name_crdb_extra_keyword ::=
 	'FAMILY'
 
 cockroachdb_extra_reserved_keyword ::=
@@ -1656,24 +1668,8 @@ cockroachdb_extra_reserved_keyword ::=
 	| 'NOTHING'
 
 type_func_name_keyword ::=
-	'COLLATION'
-	| 'CROSS'
-	| 'FULL'
-	| 'INNER'
-	| 'ILIKE'
-	| 'IS'
-	| 'ISNULL'
-	| 'JOIN'
-	| 'LEFT'
-	| 'LIKE'
-	| 'NATURAL'
-	| 'NONE'
-	| 'NOTNULL'
-	| 'OUTER'
-	| 'OVERLAPS'
-	| 'RIGHT'
-	| 'SIMILAR'
-	| cockroachdb_extra_type_func_name_keyword
+	type_func_name_no_crdb_extra_keyword
+	| type_func_name_crdb_extra_keyword
 
 reserved_keyword ::=
 	'ALL'
@@ -1812,6 +1808,9 @@ partition_by ::=
 create_as_table_defs ::=
 	( column_name create_as_col_qual_list ) ( ( ',' column_name create_as_col_qual_list | ',' family_def | ',' create_as_constraint_def ) )*
 
+enum_val_list ::=
+	( 'SCONST' ) ( ( ',' 'SCONST' ) )*
+
 common_table_expr ::=
 	table_alias_name opt_column_list 'AS' '(' preparable_stmt ')'
 
@@ -1852,29 +1851,16 @@ constraint_elem ::=
 	| 'PRIMARY' 'KEY' '(' index_params ')' opt_hash_sharded opt_interleave
 	| 'FOREIGN' 'KEY' '(' name_list ')' 'REFERENCES' table_name opt_column_list key_match reference_actions
 
-const_typename ::=
-	numeric
-	| bit_without_length
-	| character_without_length
-	| const_datetime
-	| const_json
-	| 'BLOB'
-	| 'BYTES'
-	| 'BYTEA'
-	| 'TEXT'
-	| 'NAME'
-	| 'SERIAL'
-	| 'SERIAL2'
-	| 'SMALLSERIAL'
-	| 'SERIAL4'
-	| 'SERIAL8'
-	| 'BIGSERIAL'
-	| 'UUID'
-	| 'INET'
-	| 'OID'
-	| 'OIDVECTOR'
-	| 'INT2VECTOR'
-	| 'identifier'
+like_table_option ::=
+	'CONSTRAINTS'
+	| 'DEFAULTS'
+	| 'GENERATED'
+	| 'INDEXES'
+	| 'ALL'
+
+typed_literal ::=
+	func_name_no_crdb_extra 'SCONST'
+	| const_typename 'SCONST'
 
 interval_value ::=
 	'INTERVAL' 'SCONST' opt_interval_qualifier
@@ -1917,6 +1903,16 @@ case_default ::=
 	'ELSE' a_expr
 	| 
 
+general_type_name ::=
+	type_function_name_no_crdb_extra
+
+const_typename ::=
+	numeric
+	| bit_without_length
+	| character_without_length
+	| const_datetime
+	| const_geo
+
 bit_with_length ::=
 	'BIT' opt_varying '(' iconst32 ')'
 	| 'VARBIT' '(' iconst32 ')'
@@ -1928,13 +1924,6 @@ interval_type ::=
 	'INTERVAL'
 	| 'INTERVAL' interval_qualifier
 	| 'INTERVAL' '(' iconst32 ')'
-
-postgres_oid ::=
-	'REGPROC'
-	| 'REGPROCEDURE'
-	| 'REGCLASS'
-	| 'REGTYPE'
-	| 'REGNAMESPACE'
 
 tuple1_ambiguous_values ::=
 	a_expr
@@ -2017,6 +2006,25 @@ row_source_extension_stmt ::=
 	| show_stmt
 	| update_stmt
 	| upsert_stmt
+
+type_func_name_no_crdb_extra_keyword ::=
+	'COLLATION'
+	| 'CROSS'
+	| 'FULL'
+	| 'INNER'
+	| 'ILIKE'
+	| 'IS'
+	| 'ISNULL'
+	| 'JOIN'
+	| 'LEFT'
+	| 'LIKE'
+	| 'NATURAL'
+	| 'NONE'
+	| 'NOTNULL'
+	| 'OUTER'
+	| 'OVERLAPS'
+	| 'RIGHT'
+	| 'SIMILAR'
 
 user_priority ::=
 	'LOW'
@@ -2120,48 +2128,9 @@ reference_actions ::=
 	| reference_on_delete reference_on_update
 	| 
 
-numeric ::=
-	'INT'
-	| 'INTEGER'
-	| 'INT2'
-	| 'SMALLINT'
-	| 'INT4'
-	| 'INT8'
-	| 'INT64'
-	| 'BIGINT'
-	| 'REAL'
-	| 'FLOAT4'
-	| 'FLOAT8'
-	| 'FLOAT' opt_float
-	| 'DOUBLE' 'PRECISION'
-	| 'DECIMAL' opt_numeric_modifiers
-	| 'DEC' opt_numeric_modifiers
-	| 'NUMERIC' opt_numeric_modifiers
-	| 'BOOLEAN'
-	| 'BOOL'
-
-bit_without_length ::=
-	'BIT'
-	| 'BIT' 'VARYING'
-	| 'VARBIT'
-
-character_without_length ::=
-	character_base
-
-const_datetime ::=
-	'DATE'
-	| 'TIME' opt_timezone
-	| 'TIME' '(' iconst32 ')' opt_timezone
-	| 'TIMETZ'
-	| 'TIMETZ' '(' iconst32 ')'
-	| 'TIMESTAMP' opt_timezone
-	| 'TIMESTAMP' '(' iconst32 ')' opt_timezone
-	| 'TIMESTAMPTZ'
-	| 'TIMESTAMPTZ' '(' iconst32 ')'
-
-const_json ::=
-	'JSON'
-	| 'JSONB'
+func_name_no_crdb_extra ::=
+	type_function_name_no_crdb_extra
+	| prefixed_column_path
 
 opt_interval_qualifier ::=
 	interval_qualifier
@@ -2228,6 +2197,51 @@ opt_slice_bound ::=
 
 when_clause ::=
 	'WHEN' a_expr 'THEN' a_expr
+
+type_function_name_no_crdb_extra ::=
+	'identifier'
+	| unreserved_keyword
+	| type_func_name_no_crdb_extra_keyword
+
+numeric ::=
+	'INT'
+	| 'INTEGER'
+	| 'SMALLINT'
+	| 'BIGINT'
+	| 'REAL'
+	| 'FLOAT' opt_float
+	| 'DOUBLE' 'PRECISION'
+	| 'DECIMAL' opt_numeric_modifiers
+	| 'DEC' opt_numeric_modifiers
+	| 'NUMERIC' opt_numeric_modifiers
+	| 'BOOLEAN'
+
+bit_without_length ::=
+	'BIT'
+	| 'BIT' 'VARYING'
+	| 'VARBIT'
+
+character_without_length ::=
+	character_base
+
+const_datetime ::=
+	'DATE'
+	| 'TIME' opt_timezone
+	| 'TIME' '(' iconst32 ')' opt_timezone
+	| 'TIMETZ'
+	| 'TIMETZ' '(' iconst32 ')'
+	| 'TIMESTAMP' opt_timezone
+	| 'TIMESTAMP' '(' iconst32 ')' opt_timezone
+	| 'TIMESTAMPTZ'
+	| 'TIMESTAMPTZ' '(' iconst32 ')'
+
+const_geo ::=
+	'GEOGRAPHY'
+	| 'GEOMETRY'
+	| 'GEOMETRY' '(' geo_shape ')'
+	| 'GEOGRAPHY' '(' geo_shape ')'
+	| 'GEOMETRY' '(' geo_shape ',' iconst32 ')'
+	| 'GEOGRAPHY' '(' geo_shape ',' iconst32 ')'
 
 opt_varying ::=
 	'VARYING'
@@ -2346,7 +2360,7 @@ col_qualification_elem ::=
 	| 'CHECK' '(' a_expr ')'
 	| 'DEFAULT' b_expr
 	| 'REFERENCES' table_name opt_name_parens key_match reference_actions
-	| 'AS' '(' a_expr ')' 'STORED'
+	| generated_as '(' a_expr ')' 'STORED'
 
 family_name ::=
 	name
@@ -2356,20 +2370,6 @@ reference_on_update ::=
 
 reference_on_delete ::=
 	'ON' 'DELETE' reference_action
-
-opt_float ::=
-	'(' 'ICONST' ')'
-	| 
-
-opt_numeric_modifiers ::=
-	'(' iconst32 ')'
-	| '(' iconst32 ',' iconst32 ')'
-	| 
-
-opt_timezone ::=
-	'WITH' 'TIME' 'ZONE'
-	| 'WITHOUT' 'TIME' 'ZONE'
-	| 
 
 func_name ::=
 	type_function_name
@@ -2409,6 +2409,30 @@ tuple1_unambiguous_values ::=
 	a_expr ','
 	| a_expr ',' expr_list
 
+opt_float ::=
+	'(' 'ICONST' ')'
+	| 
+
+opt_numeric_modifiers ::=
+	'(' iconst32 ')'
+	| '(' iconst32 ',' iconst32 ')'
+	| 
+
+opt_timezone ::=
+	'WITH' 'TIME' 'ZONE'
+	| 'WITHOUT' 'TIME' 'ZONE'
+	| 
+
+geo_shape ::=
+	'POINT'
+	| 'LINESTRING'
+	| 'POLYGON'
+	| 'GEOMETRYCOLLECTION'
+	| 'MULTIPOLYGON'
+	| 'MULTILINESTRING'
+	| 'MULTIPOINT'
+	| 'GEOMETRY'
+
 char_aliases ::=
 	'CHAR'
 	| 'CHARACTER'
@@ -2440,6 +2464,9 @@ create_as_params ::=
 opt_name_parens ::=
 	'(' name ')'
 	| 
+
+generated_as ::=
+	'AS'
 
 reference_action ::=
 	'NO' 'ACTION'

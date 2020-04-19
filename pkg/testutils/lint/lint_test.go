@@ -221,6 +221,8 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`_string\.go`),
 			stream.GrepNot(`_generated\.go`),
 			stream.GrepNot(`/embedded.go`),
+			stream.GrepNot(`geo/geographiclib/geodesic\.c$`),
+			stream.GrepNot(`geo/geographiclib/geodesic\.h$`),
 		), func(filename string) {
 			isCCL := strings.Contains(filename, "ccl/")
 			var expHeader *regexp.Regexp
@@ -852,7 +854,7 @@ func TestLint(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`(json|yaml|protoutil|xml|\.Field)\.Marshal\(`),
+			stream.GrepNot(`(json|yaml|protoutil|xml|\.Field|ewkb|wkb)\.Marshal\(`),
 		), func(s string) {
 			t.Errorf("\n%s <- forbidden; use 'protoutil.Marshal' instead", s)
 		}); err != nil {
@@ -890,7 +892,7 @@ func TestLint(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`(json|jsonpb|yaml|xml|protoutil|toml|Codec)\.Unmarshal\(`),
+			stream.GrepNot(`(json|jsonpb|yaml|xml|protoutil|toml|Codec|ewkb)\.Unmarshal\(`),
 		), func(s string) {
 			t.Errorf("\n%s <- forbidden; use 'protoutil.Unmarshal' instead", s)
 		}); err != nil {
@@ -1341,6 +1343,7 @@ func TestLint(t *testing.T) {
 				filter,
 				stream.GrepNot("sql/.*exported func .* returns unexported type sql.planNode"),
 				stream.GrepNot("pkg/sql/types/types.go.* var Uuid should be UUID"),
+				stream.GrepNot("pkg/sql/oidext/oidext.go.*don't use underscores in Go names; const T_"),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -1390,6 +1393,8 @@ func TestLint(t *testing.T) {
 				stream.GrepNot(`pkg/sql/opt/optgen/exprgen/custom_funcs.go:.* func .* is unused`),
 				// Using deprecated method to COPY.
 				stream.GrepNot(`pkg/cli/nodelocal.go:.* stmt.Exec is deprecated: .*`),
+				// Geospatial code is in-progress.
+				stream.GrepNot("pkg/geo/geopb/types.go:.* type WKB is unused .*"),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -1412,6 +1417,10 @@ func TestLint(t *testing.T) {
 			"-nE",
 			fmt.Sprintf(`panic\(.*\)`),
 			"--",
+			// NOTE: if you're adding a new package to the list here because it
+			// uses "panic-catch" error propagation mechanism of the vectorized
+			// engine, don't forget to "register" the newly added package in
+			// sql/colexec/execerror/error.go file.
 			"sql/colexec",
 			"sql/colflow",
 			"sql/colcontainer",

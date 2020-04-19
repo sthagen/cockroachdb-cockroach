@@ -71,6 +71,12 @@ var ClusterOrganization = settings.RegisterPublicStringSetting(
 	"",
 )
 
+// ClusterIsInternal returns true if the cluster organization contains
+// "Cockroach Labs", indicating an internal cluster.
+func ClusterIsInternal(sv *settings.Values) bool {
+	return strings.Contains(ClusterOrganization.Get(sv), "Cockroach Labs")
+}
+
 // ClusterSecret is a cluster specific secret. This setting is
 // non-reportable.
 var ClusterSecret = func() *settings.StringSetting {
@@ -886,6 +892,8 @@ func checkResultType(typ *types.T) error {
 	case types.FloatFamily:
 	case types.DecimalFamily:
 	case types.BytesFamily:
+	case types.GeographyFamily:
+	case types.GeometryFamily:
 	case types.StringFamily:
 	case types.CollatedStringFamily:
 	case types.DateFamily:
@@ -1860,6 +1868,10 @@ func (m *sessionDataMutator) SetTemporarySchemaName(scName string) {
 
 func (m *sessionDataMutator) SetDefaultIntSize(size int) {
 	m.data.DefaultIntSize = size
+}
+
+func (m *sessionDataMutator) SetDefaultTransactionPriority(val tree.UserPriority) {
+	m.data.DefaultTxnPriority = int(val)
 }
 
 func (m *sessionDataMutator) SetDefaultReadOnly(val bool) {

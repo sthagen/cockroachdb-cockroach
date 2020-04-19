@@ -151,7 +151,6 @@ type NodeLiveness struct {
 	ambientCtx        log.AmbientContext
 	clock             *hlc.Clock
 	db                *kv.DB
-	engines           []storage.Engine
 	gossip            *gossip.Gossip
 	livenessThreshold time.Duration
 	heartbeatInterval time.Duration
@@ -170,6 +169,9 @@ type NodeLiveness struct {
 		callbacks         []IsLiveCallback
 		nodes             map[roachpb.NodeID]storagepb.Liveness
 		heartbeatCallback HeartbeatCallback
+		// Before heartbeating, we write to each of these engines to avoid
+		// maintaining liveness when a local disks is stalled.
+		engines []storage.Engine
 	}
 }
 
@@ -179,7 +181,6 @@ func NewNodeLiveness(
 	ambient log.AmbientContext,
 	clock *hlc.Clock,
 	db *kv.DB,
-	engines []storage.Engine,
 	g *gossip.Gossip,
 	livenessThreshold time.Duration,
 	renewalDuration time.Duration,
@@ -190,7 +191,6 @@ func NewNodeLiveness(
 		ambientCtx:        ambient,
 		clock:             clock,
 		db:                db,
-		engines:           engines,
 		gossip:            g,
 		livenessThreshold: livenessThreshold,
 		heartbeatInterval: livenessThreshold - renewalDuration,
@@ -226,16 +226,26 @@ func (nl *NodeLiveness) sem(nodeID roachpb.NodeID) chan struct{} {
 
 // SetDraining attempts to update this node's liveness record to put itself
 // into the draining state.
-func (nl *NodeLiveness) SetDraining(ctx context.Context, drain bool) {
+//
+// The reporter callback, if non-nil, is called on a best effort basis
+// to report work that needed to be done and which may or may not have
+// been done by the time this call returns. See the explanation in
+// pkg/server/drain.go for details.
+func (nl *NodeLiveness) SetDraining(ctx context.Context, drain bool, reporter func(int, string)) {
 	ctx = nl.ambientCtx.AnnotateCtx(ctx)
 	for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
 		liveness, err := nl.Self()
 		if err != nil && err != ErrNoLivenessRecord {
 			log.Errorf(ctx, "unexpected error getting liveness: %+v", err)
 		}
-		if err := nl.setDrainingInternal(ctx, liveness, drain); err == nil {
-			return
+		err = nl.setDrainingInternal(ctx, liveness, drain, reporter)
+		if err != nil {
+			if log.V(1) {
+				log.Infof(ctx, "attempting to set liveness draining status to %v: %v", drain, err)
+			}
+			continue
 		}
+		return
 	}
 }
 
@@ -316,7 +326,7 @@ func (nl *NodeLiveness) SetDecommissioning(
 }
 
 func (nl *NodeLiveness) setDrainingInternal(
-	ctx context.Context, liveness storagepb.Liveness, drain bool,
+	ctx context.Context, liveness storagepb.Liveness, drain bool, reporter func(int, string),
 ) error {
 	nodeID := nl.gossip.NodeID.Get()
 	sem := nl.sem(nodeID)
@@ -339,6 +349,10 @@ func (nl *NodeLiveness) setDrainingInternal(
 	if liveness != (storagepb.Liveness{}) {
 		update.Liveness = liveness
 	}
+	if reporter != nil && drain && !update.Draining {
+		// Report progress to the Drain RPC.
+		reporter(1, "liveness record")
+	}
 	update.Draining = drain
 	update.ignoreCache = true
 
@@ -349,6 +363,9 @@ func (nl *NodeLiveness) setDrainingInternal(
 		}
 		return errors.New("failed to update liveness record")
 	}); err != nil {
+		if log.V(1) {
+			log.Infof(ctx, "updating liveness record: %v", err)
+		}
 		if err == errNodeDrainingSet {
 			return nil
 		}
@@ -415,19 +432,27 @@ func (nl *NodeLiveness) IsLive(nodeID roachpb.NodeID) (bool, error) {
 	return liveness.IsLive(nl.clock.Now().GoTime()), nil
 }
 
-// StartHeartbeat starts a periodic heartbeat to refresh this node's
-// last heartbeat in the node liveness table. The optionally provided
-// HeartbeatCallback will be invoked whenever this node updates its own liveness.
+// StartHeartbeat starts a periodic heartbeat to refresh this node's last
+// heartbeat in the node liveness table. The optionally provided
+// HeartbeatCallback will be invoked whenever this node updates its own
+// liveness. The slice of engines will be written to before each heartbeat to
+// avoid maintaining liveness in the presence of disk stalls.
 func (nl *NodeLiveness) StartHeartbeat(
-	ctx context.Context, stopper *stop.Stopper, alive HeartbeatCallback,
+	ctx context.Context, stopper *stop.Stopper, alive HeartbeatCallback, engines []storage.Engine,
 ) {
 	log.VEventf(ctx, 1, "starting liveness heartbeat")
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.Closer = stopper.ShouldQuiesce()
 
-	nl.mu.RLock()
+	if len(engines) == 0 {
+		// Avoid silently forgetting to pass the engines. It happened before.
+		log.Fatalf(ctx, "must supply at least one engine")
+	}
+
+	nl.mu.Lock()
 	nl.mu.heartbeatCallback = alive
-	nl.mu.RUnlock()
+	nl.mu.engines = engines
+	nl.mu.Unlock()
 
 	stopper.RunWorker(ctx, func(context.Context) {
 		ambient := nl.ambientCtx
@@ -789,7 +814,10 @@ func (nl *NodeLiveness) updateLiveness(
 			return err
 		}
 
-		for _, eng := range nl.engines {
+		nl.mu.RLock()
+		engines := nl.mu.engines
+		nl.mu.RUnlock()
+		for _, eng := range engines {
 			// We synchronously write to all disks before updating liveness because we
 			// don't want any excessively slow disks to prevent leases from being
 			// shifted to other nodes. A slow/stalled disk would block here and cause
@@ -819,7 +847,11 @@ func (nl *NodeLiveness) updateLivenessAttempt(
 	// First check the existing liveness map to avoid known conditional
 	// put failures.
 	if !update.ignoreCache {
-		if l, err := nl.GetLiveness(update.NodeID); err == nil && l != oldLiveness {
+		l, err := nl.GetLiveness(update.NodeID)
+		if err != nil && err != ErrNoLivenessRecord {
+			return err
+		}
+		if err == nil && l != oldLiveness {
 			return handleCondFailed(l)
 		}
 	}

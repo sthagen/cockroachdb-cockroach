@@ -1387,11 +1387,11 @@ Available Commands:
   start-single-node start a single-node cluster
   init              initialize a cluster
   cert              create ca, node, and client certs
-  quit              drain and shutdown node
+  quit              drain and shut down a node
 
   sql               open a sql shell
   auth-session      log in and out of HTTP sessions
-  node              list, inspect or remove nodes
+  node              list, inspect, drain or remove nodes
   dump              dump sql tables
 
   nodelocal         upload and delete nodelocal files
@@ -2024,11 +2024,6 @@ func Example_dump_no_visible_columns() {
 	// sql -e create table t(x int); set sql_safe_updates=false; alter table t drop x
 	// ALTER TABLE
 	// dump defaultdb
-	// CREATE TABLE t (,
-	// 	FAMILY "primary" (rowid)
+	// CREATE TABLE t (FAMILY "primary" (rowid)
 	// );
-	// ERROR: table "defaultdb.public.t" has no visible columns
-	// HINT: To proceed with the dump, either omit this table from the list of tables to dump, drop the table, or add some visible columns.
-	// --
-	// See: https://github.com/cockroachdb/cockroach/issues/37768
 }

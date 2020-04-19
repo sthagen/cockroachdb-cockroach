@@ -79,7 +79,7 @@ INSERT INTO skip_unneeded_cols VALUES ('63616665-6630-3064-6465-616462656562', 1
 statement ok
 SET vectorize=experimental_always
 
-statement error pq: unable to vectorize execution plan: unhandled type int\[\]
+statement error .*(unhandled|unsupported) type int\[\]
 SELECT _unsupported1 FROM skip_unneeded_cols
 
 query IBB
@@ -150,3 +150,12 @@ query I
 SELECT * FROM t46714_0 ORDER BY c0 + c0
 ----
 0
+
+# Regression test for #47131 (mismatched expected logical and actual physical
+# integer types on mixed-width integer binary expressions).
+statement ok
+CREATE TABLE t47131_0(c0 INT2 UNIQUE); INSERT INTO t47131_0 VALUES(1)
+
+query I
+SELECT * FROM t47131_0 WHERE (t47131_0.c0 + t47131_0.c0::INT4) = 0
+----

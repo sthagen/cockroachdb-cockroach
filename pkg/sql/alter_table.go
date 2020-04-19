@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -144,6 +145,16 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return unimplemented.NewWithIssue(32917,
 					"adding a REFERENCES constraint while also adding a column via ALTER not supported")
 			}
+			version := params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx)
+			if supported, err := isTypeSupportedInVersion(version, d.Type); err != nil {
+				return err
+			} else if !supported {
+				return pgerror.Newf(
+					pgcode.FeatureNotSupported,
+					"type %s is not supported until version upgrade is finalized",
+					d.Type.SQLString(),
+				)
+			}
 
 			newDef, seqDbDesc, seqName, seqOpts, err := params.p.processSerialInColumnDef(params.ctx, d, tn)
 			if err != nil {
@@ -166,7 +177,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			d = newDef
 			incTelemetryForNewColumn(d)
 
-			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, &params.p.semaCtx)
+			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, &params.p.semaCtx, params.EvalContext())
 			if err != nil {
 				return err
 			}
@@ -443,6 +454,11 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 			}
 
+			// We cannot remove this column if there are computed columns that use it.
+			if err := checkColumnHasNoComputedColDependencies(n.tableDesc, col); err != nil {
+				return err
+			}
+
 			if n.tableDesc.PrimaryIndex.ContainsColumnID(col.ID) {
 				return pgerror.Newf(pgcode.InvalidColumnReference,
 					"column %q is referenced by the primary key", col.Name)
@@ -715,7 +731,9 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 		case *tree.AlterTableRenameColumn:
-			descChanged, err := params.p.renameColumn(params.ctx, n.tableDesc, &t.Column, &t.NewName)
+			const allowRenameOfShardColumn = false
+			descChanged, err := params.p.renameColumn(params.ctx, n.tableDesc,
+				&t.Column, &t.NewName, allowRenameOfShardColumn)
 			if err != nil {
 				return err
 			}
@@ -870,6 +888,17 @@ func applyColumnMutation(
 	case *tree.AlterTableAlterColumnType:
 		typ := t.ToType
 
+		version := params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx)
+		if supported, err := isTypeSupportedInVersion(version, typ); err != nil {
+			return err
+		} else if !supported {
+			return pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"type %s is not supported until version upgrade is finalized",
+				typ.SQLString(),
+			)
+		}
+
 		// Special handling for STRING COLLATE xy to verify that we recognize the language.
 		if t.Collation != "" {
 			if types.IsStringType(typ) {
@@ -906,6 +935,14 @@ func applyColumnMutation(
 				col.Type.SQLString(), typ.SQLString())
 		case schemachange.ColumnConversionTrivial:
 			col.Type = *typ
+		case schemachange.ColumnConversionGeneral:
+			return unimplemented.NewWithIssueDetailf(
+				9851,
+				fmt.Sprintf("%s->%s", col.Type.SQLString(), typ.SQLString()),
+				"type conversion from %s to %s requires overwriting existing values which is not yet implemented",
+				col.Type.SQLString(),
+				typ.SQLString(),
+			)
 		default:
 			return unimplemented.NewWithIssueDetail(9851,
 				fmt.Sprintf("%s->%s", col.Type.SQLString(), typ.SQLString()),
@@ -1023,6 +1060,47 @@ func applyColumnMutation(
 				"column %q is not a computed column", col.Name)
 		}
 		col.ComputeExpr = nil
+	}
+	return nil
+}
+
+func checkColumnHasNoComputedColDependencies(
+	desc *sqlbase.MutableTableDescriptor, col *sqlbase.ColumnDescriptor,
+) error {
+	checkComputed := func(c *sqlbase.ColumnDescriptor) error {
+		if !c.IsComputed() {
+			return nil
+		}
+		expr, err := parser.ParseExpr(*c.ComputeExpr)
+		if err != nil {
+			// At this point, we should be able to parse the computed expression.
+			return errors.WithAssertionFailure(err)
+		}
+		return iterColDescriptorsInExpr(desc, expr, func(colVar *sqlbase.ColumnDescriptor) error {
+			if colVar.ID == col.ID {
+				return pgerror.Newf(
+					pgcode.InvalidColumnReference,
+					"column %q is referenced by computed column %q",
+					col.Name,
+					c.Name,
+				)
+			}
+			return nil
+		})
+	}
+	for i := range desc.Columns {
+		if err := checkComputed(&desc.Columns[i]); err != nil {
+			return err
+		}
+	}
+	for i := range desc.Mutations {
+		mut := &desc.Mutations[i]
+		mutCol := mut.GetColumn()
+		if mut.Direction == sqlbase.DescriptorMutation_ADD && mutCol != nil {
+			if err := checkComputed(mutCol); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

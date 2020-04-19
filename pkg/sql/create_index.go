@@ -12,10 +12,10 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -114,6 +114,11 @@ func (p *planner) setupFamilyAndConstraintForShard(
 func MakeIndexDescriptor(
 	params runParams, n *tree.CreateIndex, tableDesc *sqlbase.MutableTableDescriptor,
 ) (*sqlbase.IndexDescriptor, error) {
+	// Ensure that the columns we want to index exist before trying to create the
+	// index.
+	if err := validateIndexColumnsExist(tableDesc, n.Columns); err != nil {
+		return nil, err
+	}
 	indexDesc := sqlbase.IndexDescriptor{
 		Name:              string(n.Name),
 		Unique:            n.Unique,
@@ -154,7 +159,8 @@ func MakeIndexDescriptor(
 		}
 		shardCol, newColumn, err := setupShardedIndex(
 			params.ctx,
-			params.EvalContext().Settings,
+			params.EvalContext(),
+			&params.p.semaCtx,
 			params.SessionData().HashShardedIndexesEnabled,
 			&n.Columns,
 			n.Sharded.ShardBuckets,
@@ -179,6 +185,23 @@ func MakeIndexDescriptor(
 	return &indexDesc, nil
 }
 
+// validateIndexColumnsExists validates that the columns for an index exist
+// in the table and are not being dropped prior to attempting to add the index.
+func validateIndexColumnsExist(
+	desc *sqlbase.MutableTableDescriptor, columns tree.IndexElemList,
+) error {
+	for _, column := range columns {
+		_, dropping, err := desc.FindColumnByName(column.Column)
+		if err != nil {
+			return err
+		}
+		if dropping {
+			return sqlbase.NewUndefinedColumnError(string(column.Column))
+		}
+	}
+	return nil
+}
+
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
 // This is because CREATE INDEX performs multiple KV operations on descriptors
 // and expects to see its own writes.
@@ -192,7 +215,8 @@ var hashShardedIndexesDisabledError = pgerror.Newf(pgcode.FeatureNotSupported,
 
 func setupShardedIndex(
 	ctx context.Context,
-	st *cluster.Settings,
+	evalCtx *tree.EvalContext,
+	semaCtx *tree.SemaContext,
 	shardedIndexEnabled bool,
 	columns *tree.IndexElemList,
 	bucketsExpr tree.Expr,
@@ -200,6 +224,7 @@ func setupShardedIndex(
 	indexDesc *sqlbase.IndexDescriptor,
 	isNewTable bool,
 ) (shard *sqlbase.ColumnDescriptor, newColumn bool, err error) {
+	st := evalCtx.Settings
 	if !st.Version.IsActive(ctx, clusterversion.VersionHashShardedIndexes) {
 		return nil, false, invalidClusterForShardedIndexError
 	}
@@ -211,7 +236,7 @@ func setupShardedIndex(
 	for _, c := range *columns {
 		colNames = append(colNames, string(c.Column))
 	}
-	buckets, err := tree.EvalShardBucketCount(bucketsExpr)
+	buckets, err := sqlbase.EvalShardBucketCount(semaCtx, evalCtx, bucketsExpr)
 	if err != nil {
 		return nil, false, err
 	}
@@ -249,6 +274,12 @@ func maybeCreateAndAddShardCol(
 		// TODO(ajwerner): In what ways is existingShardCol allowed to differ from
 		// the newly made shardCol? Should there be some validation of
 		// existingShardCol?
+		if !existingShardCol.Hidden {
+			// The user managed to reverse-engineer our crazy shard column name, so
+			// we'll return an error here rather than try to be tricky.
+			return nil, false, pgerror.New(pgcode.DuplicateColumn,
+				fmt.Sprintf("column %s already specified; can't be used for sharding", shardCol.Name))
+		}
 		return existingShardCol, false, nil
 	}
 	columnIsUndefined := sqlbase.IsUndefinedColumnError(err)

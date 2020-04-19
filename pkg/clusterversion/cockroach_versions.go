@@ -57,6 +57,10 @@ const (
 	VersionStatementDiagnosticsSystemTables
 	VersionSchemaChangeJob
 	VersionSavepoints
+	VersionTimeTZType
+	VersionTimePrecision
+	Version20_1
+	VersionStart20_2
 
 	// Add new versions here (step one of two).
 )
@@ -444,6 +448,27 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Key:     VersionSavepoints,
 		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 16},
 	},
+	{
+		// VersionTimeTZType enables the use of the TimeTZ data type.
+		Key:     VersionTimeTZType,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 17},
+	},
+	{
+		// VersionTimePrecision enables the use of precision with time/intervals.
+		Key:     VersionTimePrecision,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 18},
+	},
+	{
+		// Version20_1 is CockroachDB v20.1. It's used for all v20.1.x patch releases.
+		Key:     Version20_1,
+		Version: roachpb.Version{Major: 20, Minor: 1},
+	},
+	{
+		// VersionStart20_2 demarcates work towards CockroachDB v20.2.
+		Key:     VersionStart20_2,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 1},
+	},
+
 	// Add new versions here (step two of two).
 
 })

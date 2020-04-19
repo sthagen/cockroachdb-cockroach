@@ -333,6 +333,14 @@ func (n *CreateTable) StatementTag() string {
 func (*CreateTable) modifiesSchema() bool { return true }
 
 // StatementType implements the Statement interface.
+func (*CreateType) StatementType() StatementType { return DDL }
+
+// StatementTag implements the Statement interface.
+func (*CreateType) StatementTag() string { return "CREATE TYPE" }
+
+func (*CreateType) modifiesSchema() bool { return true }
+
+// StatementType implements the Statement interface.
 func (*CreateRole) StatementType() StatementType { return Ack }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -423,6 +431,12 @@ func (*DropRole) StatementTag() string { return "DROP ROLE" }
 func (*DropRole) cclOnlyStatement() {}
 
 func (*DropRole) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*DropType) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*DropType) StatementTag() string { return "DROP TYPE" }
 
 // StatementType implements the Statement interface.
 func (*Execute) StatementType() StatementType { return Unknown }
@@ -922,6 +936,7 @@ func (n *Delete) String() string                         { return AsString(n) }
 func (n *DropDatabase) String() string                   { return AsString(n) }
 func (n *DropIndex) String() string                      { return AsString(n) }
 func (n *DropTable) String() string                      { return AsString(n) }
+func (n *DropType) String() string                       { return AsString(n) }
 func (n *DropView) String() string                       { return AsString(n) }
 func (n *DropSequence) String() string                   { return AsString(n) }
 func (n *DropRole) String() string                       { return AsString(n) }

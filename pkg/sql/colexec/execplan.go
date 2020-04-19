@@ -244,6 +244,9 @@ func isSupported(
 		if !core.HashJoiner.OnExpr.Empty() && core.HashJoiner.Type != sqlbase.InnerJoin {
 			return false, errors.Newf("can't plan vectorized non-inner hash joins with ON expressions")
 		}
+		if core.HashJoiner.Type.IsSetOpJoin() {
+			return false, errors.Newf("vectorized hash join of type %s is not supported", core.HashJoiner.Type)
+		}
 		leftInput, rightInput := spec.Input[0], spec.Input[1]
 		if len(leftInput.ColumnTypes) == 0 || len(rightInput.ColumnTypes) == 0 {
 			// We have a cross join of two inputs, and at least one of them has
@@ -259,6 +262,9 @@ func isSupported(
 		if !core.MergeJoiner.OnExpr.Empty() &&
 			core.MergeJoiner.Type != sqlbase.JoinType_INNER {
 			return false, errors.Errorf("can't plan non-inner merge join with ON expressions")
+		}
+		if core.MergeJoiner.Type.IsSetOpJoin() {
+			return false, errors.Newf("vectorized merge join of type %s is not supported", core.MergeJoiner.Type)
 		}
 		return true, nil
 
@@ -854,9 +860,6 @@ func NewColOperator(
 		case core.MergeJoiner != nil:
 			if err := checkNumIn(inputs, 2); err != nil {
 				return result, err
-			}
-			if core.MergeJoiner.Type.IsSetOpJoin() {
-				return result, errors.AssertionFailedf("unexpectedly %s merge join was planned", core.MergeJoiner.Type.String())
 			}
 			// Merge joiner is a streaming operator when equality columns form a key
 			// for both of the inputs.
@@ -1809,14 +1812,18 @@ func planProjectionExpr(
 	// actualOutputType tracks the logical type of the output column of the
 	// projection operator. See the comment below for more details.
 	actualOutputType := outputType
-	if outputType.Equivalent(types.Int) {
+	if outputType.Identical(types.Int) {
 		// Currently, SQL type system does not respect the width of integers
 		// when figuring out the type of the output of a projection expression
 		// (for example, INT2 + INT2 will be typed as INT8); however,
-		// vectorized operators do respect the width. In order to go around
-		// this limitation, we explicitly check whether output type is INT8,
-		// and if so, we override the output physical types to be what the
-		// vectorized projection operators will actually output.
+		// vectorized operators do respect the width when both operands have
+		// the same width. In order to go around this limitation, we explicitly
+		// check whether output type is INT8, and if so, we override the output
+		// physical types to be what the vectorized projection operators will
+		// actually output.
+		//
+		// Note that in mixed-width scenarios (i.e. INT2 + INT4) the vectorized
+		// engine will output INT8, so no overriding is needed.
 		//
 		// We do, however, need to plan a cast to the expected logical type and
 		// we will do that below.
@@ -1825,9 +1832,7 @@ func planProjectionExpr(
 		if leftPhysType == coltypes.Int16 && rightPhysType == coltypes.Int16 {
 			actualOutputType = types.Int2
 			outputPhysType = coltypes.Int16
-		} else if (leftPhysType == coltypes.Int16 && rightPhysType == coltypes.Int32) ||
-			(leftPhysType == coltypes.Int32 && rightPhysType == coltypes.Int16) ||
-			(leftPhysType == coltypes.Int32 && rightPhysType == coltypes.Int32) {
+		} else if leftPhysType == coltypes.Int32 && rightPhysType == coltypes.Int32 {
 			actualOutputType = types.Int4
 			outputPhysType = coltypes.Int32
 		}
@@ -1929,7 +1934,7 @@ func planProjectionExpr(
 		internalMemUsed += sMem.InternalMemoryUsage()
 	}
 	ct = append(ct, *actualOutputType)
-	if !outputType.Equivalent(actualOutputType) {
+	if !outputType.Identical(actualOutputType) {
 		// The projection operator outputs a column of a different type than
 		// the expected logical type. In order to "synchronize" the reality and
 		// the expectations, we plan a cast.

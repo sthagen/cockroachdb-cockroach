@@ -13,12 +13,14 @@ package execbuilder
 import (
 	"bytes"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 )
 
@@ -63,6 +65,7 @@ func (b *Builder) buildCreateView(cv *memo.CreateViewExpr) (execPlan, error) {
 		schema,
 		cv.ViewName,
 		cv.IfNotExists,
+		cv.Replace,
 		cv.Temporary,
 		cv.ViewQuery,
 		cols,
@@ -270,6 +273,9 @@ func (b *Builder) buildCancelQueries(cancel *memo.CancelQueriesExpr) (execPlan, 
 	if err != nil {
 		return execPlan{}, err
 	}
+	if !b.disableTelemetry {
+		telemetry.Inc(sqltelemetry.CancelQueriesUseCounter)
+	}
 	// CancelQueries returns no columns.
 	return execPlan{root: node}, nil
 }
@@ -282,6 +288,9 @@ func (b *Builder) buildCancelSessions(cancel *memo.CancelSessionsExpr) (execPlan
 	node, err := b.factory.ConstructCancelSessions(input.root, cancel.IfExists)
 	if err != nil {
 		return execPlan{}, err
+	}
+	if !b.disableTelemetry {
+		telemetry.Inc(sqltelemetry.CancelSessionsUseCounter)
 	}
 	// CancelSessions returns no columns.
 	return execPlan{root: node}, nil

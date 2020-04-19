@@ -112,13 +112,44 @@ var storageParamExpectedTypes = map[string]storageParamType{
 	`user_catalog_table`:                          storageParamUnimplemented,
 }
 
+// minimumTypeUsageVersions defines the minimum version needed for a new
+// data type.
+var minimumTypeUsageVersions = map[types.Family]clusterversion.VersionKey{
+	types.TimeTZFamily: clusterversion.VersionTimeTZType,
+}
+
+// isTypeSupportedInVersion returns whether a given type is supported in the given version.
+func isTypeSupportedInVersion(v clusterversion.ClusterVersion, t *types.T) (bool, error) {
+	switch t.Family() {
+	case types.TimeFamily, types.TimestampFamily, types.TimestampTZFamily, types.TimeTZFamily:
+		if t.Precision() != 6 && !v.IsActive(clusterversion.VersionTimePrecision) {
+			return false, nil
+		}
+	case types.IntervalFamily:
+		itm, err := t.IntervalTypeMetadata()
+		if err != nil {
+			return false, err
+		}
+		if (t.Precision() != 6 || itm.DurationField != types.IntervalDurationField{}) &&
+			!v.IsActive(clusterversion.VersionTimePrecision) {
+			return false, nil
+		}
+	}
+	minVersion, ok := minimumTypeUsageVersions[t.Family()]
+	if !ok {
+		return true, nil
+	}
+	return v.IsActive(minVersion), nil
+}
+
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
 // This is because CREATE TABLE performs multiple KV operations on descriptors
 // and expects to see its own writes.
 func (n *createTableNode) ReadingOwnWrites() {}
 
 // getTableCreateParams returns the table key needed for the new table,
-// as well as the schema id.
+// as well as the schema id. It returns valid data in the case that
+// the desired object exists.
 func getTableCreateParams(
 	params runParams, dbID sqlbase.ID, isTemporary bool, tableName string,
 ) (sqlbase.DescriptorKey, sqlbase.ID, error) {
@@ -161,7 +192,8 @@ func getTableCreateParams(
 
 	exists, _, err := sqlbase.LookupObjectID(params.ctx, params.p.txn, dbID, schemaID, tableName)
 	if err == nil && exists {
-		return nil, 0, sqlbase.NewRelationAlreadyExistsError(tableName)
+		// Still return data in this case.
+		return tKey, schemaID, sqlbase.NewRelationAlreadyExistsError(tableName)
 	} else if err != nil {
 		return nil, 0, err
 	}
@@ -1238,6 +1270,15 @@ func MakeTableDesc(
 					)
 				}
 			}
+			if supported, err := isTypeSupportedInVersion(version, d.Type); err != nil {
+				return desc, err
+			} else if !supported {
+				return desc, pgerror.Newf(
+					pgcode.FeatureNotSupported,
+					"type %s is not supported until version upgrade is finalized",
+					d.Type.SQLString(),
+				)
+			}
 			if d.PrimaryKey.Sharded {
 				// This function can sometimes be called when `st` is nil,
 				// and also before the version has been initialized. We only
@@ -1260,7 +1301,7 @@ func MakeTableDesc(
 				if n.Interleave != nil {
 					return desc, pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
 				}
-				buckets, err := tree.EvalShardBucketCount(d.PrimaryKey.ShardBuckets)
+				buckets, err := sqlbase.EvalShardBucketCount(semaCtx, evalCtx, d.PrimaryKey.ShardBuckets)
 				if err != nil {
 					return desc, err
 				}
@@ -1280,7 +1321,7 @@ func MakeTableDesc(
 				n.Defs = append(n.Defs, checkConstraint)
 				columnDefaultExprs = append(columnDefaultExprs, nil)
 			}
-			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, semaCtx)
+			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, semaCtx, evalCtx)
 			if err != nil {
 				return desc, err
 			}
@@ -1342,7 +1383,8 @@ func MakeTableDesc(
 		}
 		shardCol, newColumn, err := setupShardedIndex(
 			ctx,
-			st,
+			evalCtx,
+			semaCtx,
 			sessionData.HashShardedIndexesEnabled,
 			&d.Columns,
 			d.Sharded.ShardBuckets,
@@ -1353,7 +1395,7 @@ func MakeTableDesc(
 			return err
 		}
 		if newColumn {
-			buckets, err := tree.EvalShardBucketCount(d.Sharded.ShardBuckets)
+			buckets, err := sqlbase.EvalShardBucketCount(semaCtx, evalCtx, d.Sharded.ShardBuckets)
 			if err != nil {
 				return err
 			}
@@ -1368,7 +1410,7 @@ func MakeTableDesc(
 	}
 	for _, def := range n.Defs {
 		switch d := def.(type) {
-		case *tree.ColumnTableDef:
+		case *tree.ColumnTableDef, *tree.LikeTableDef:
 			// pass, handled above.
 
 		case *tree.IndexTableDef:
@@ -1591,7 +1633,7 @@ func MakeTableDesc(
 		case *tree.ColumnTableDef:
 			// Check after all ResolveFK calls.
 
-		case *tree.IndexTableDef, *tree.UniqueConstraintTableDef, *tree.FamilyTableDef:
+		case *tree.IndexTableDef, *tree.UniqueConstraintTableDef, *tree.FamilyTableDef, *tree.LikeTableDef:
 			// Pass, handled above.
 
 		case *tree.CheckConstraintTableDef:
@@ -1697,6 +1739,18 @@ func makeTableDesc(
 			createStmt = &newCreateStmt
 		}
 	}
+	newDefs, err := replaceLikeTableOpts(n, params)
+	if err != nil {
+		return ret, err
+	}
+
+	if newDefs != nil {
+		// If we found any LIKE table defs, we actually modified the list of
+		// defs during iteration, so we re-assign the resultant list back to
+		// n.Defs.
+		n.Defs = newDefs
+	}
+
 	for i, def := range n.Defs {
 		d, ok := def.(*tree.ColumnTableDef)
 		if !ok {
@@ -1757,6 +1811,139 @@ func makeTableDesc(
 	return ret, err
 }
 
+// replaceLikeTableOps processes the TableDefs in the input CreateTableNode,
+// searching for LikeTableDefs. If any are found, each LikeTableDef will be
+// replaced in the output tree.TableDefs (which will be a copy of the input
+// node's TableDefs) by an equivalent set of TableDefs pulled from the
+// LikeTableDef's target table.
+// If no LikeTableDefs are found, the output tree.TableDefs will be nil.
+func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs, error) {
+	var newDefs tree.TableDefs
+	for i, def := range n.Defs {
+		d, ok := def.(*tree.LikeTableDef)
+		if !ok {
+			if newDefs != nil {
+				newDefs = append(newDefs, def)
+			}
+			continue
+		}
+		// We're definitely going to be editing n.Defs now, so make a copy of it.
+		if newDefs == nil {
+			newDefs = make(tree.TableDefs, 0, len(n.Defs))
+			newDefs = append(newDefs, n.Defs[:i]...)
+		}
+		td, err := params.p.ResolveMutableTableDescriptor(params.ctx, &d.Name, true, ResolveRequireTableDesc)
+		if err != nil {
+			return nil, err
+		}
+		opts := tree.LikeTableOpt(0)
+		// Process ons / offs.
+		for _, opt := range d.Options {
+			if opt.Excluded {
+				opts &^= opt.Opt
+			} else {
+				opts |= opt.Opt
+			}
+		}
+
+		defs := make(tree.TableDefs, 0)
+		// Add all columns. Columns are always added.
+		for i := range td.Columns {
+			c := &td.Columns[i]
+			if c.Hidden {
+				// Hidden columns automatically get added by the system; we don't need
+				// to add them ourselves here.
+				continue
+			}
+			def := tree.ColumnTableDef{
+				Name: tree.Name(c.Name),
+				Type: c.DatumType(),
+			}
+			if c.Nullable {
+				def.Nullable.Nullability = tree.Null
+			} else {
+				def.Nullable.Nullability = tree.NotNull
+			}
+			if c.DefaultExpr != nil {
+				if opts.Has(tree.LikeTableOptDefaults) {
+					def.DefaultExpr.Expr, err = parser.ParseExpr(*c.DefaultExpr)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+			if c.ComputeExpr != nil {
+				if opts.Has(tree.LikeTableOptGenerated) {
+					def.Computed.Computed = true
+					def.Computed.Expr, err = parser.ParseExpr(*c.ComputeExpr)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+			defs = append(defs, &def)
+		}
+		if opts.Has(tree.LikeTableOptConstraints) {
+			for _, c := range td.Checks {
+				def := tree.CheckConstraintTableDef{
+					Name:   tree.Name(c.Name),
+					Hidden: c.Hidden,
+				}
+				def.Expr, err = parser.ParseExpr(c.Expr)
+				if err != nil {
+					return nil, err
+				}
+				defs = append(defs, &def)
+			}
+		}
+		if opts.Has(tree.LikeTableOptIndexes) {
+			for _, idx := range td.AllNonDropIndexes() {
+				indexDef := tree.IndexTableDef{
+					Name:     tree.Name(idx.Name),
+					Inverted: idx.Type == sqlbase.IndexDescriptor_INVERTED,
+					Storing:  make(tree.NameList, 0, len(idx.StoreColumnNames)),
+					Columns:  make(tree.IndexElemList, 0, len(idx.ColumnNames)),
+				}
+				columnNames := idx.ColumnNames
+				if idx.IsSharded() {
+					indexDef.Sharded = &tree.ShardedIndexDef{
+						ShardBuckets: tree.NewDInt(tree.DInt(idx.Sharded.ShardBuckets)),
+					}
+					columnNames = idx.Sharded.ColumnNames
+				}
+				for i, name := range columnNames {
+					elem := tree.IndexElem{
+						Column:    tree.Name(name),
+						Direction: tree.Ascending,
+					}
+					if idx.ColumnDirections[i] == sqlbase.IndexDescriptor_DESC {
+						elem.Direction = tree.Descending
+					}
+					indexDef.Columns = append(indexDef.Columns, elem)
+				}
+				for _, name := range idx.StoreColumnNames {
+					indexDef.Storing = append(indexDef.Storing, tree.Name(name))
+				}
+				var def tree.TableDef = &indexDef
+				if idx.Unique {
+					isPK := idx.ID == td.PrimaryIndex.ID
+					if isPK && td.IsPrimaryIndexDefaultRowID() {
+						continue
+					}
+
+					def = &tree.UniqueConstraintTableDef{
+						IndexTableDef: indexDef,
+						PrimaryKey:    isPK,
+					}
+				}
+				defs = append(defs, def)
+			}
+		}
+		newDefs = append(newDefs, defs...)
+	}
+	return newDefs, nil
+}
+
 // dummyColumnItem is used in MakeCheckConstraint to construct an expression
 // that can be both type-checked and examined for variable expressions.
 type dummyColumnItem struct {
@@ -1815,22 +2002,35 @@ func makeShardColumnDesc(colNames []string, buckets int) (*sqlbase.ColumnDescrip
 //    mod(fnv32(colNames[0]::STRING)+fnv32(colNames[1])+...,buckets)
 //
 func makeHashShardComputeExpr(colNames []string, buckets int) *string {
-	unresolvedName := func(name string) *tree.UnresolvedName {
-		return &tree.UnresolvedName{
-			NumParts: 1,
-			Parts:    tree.NameParts{name},
-		}
-	}
 	unresolvedFunc := func(funcName string) tree.ResolvableFunctionReference {
 		return tree.ResolvableFunctionReference{
-			FunctionReference: unresolvedName(funcName),
+			FunctionReference: &tree.UnresolvedName{
+				NumParts: 1,
+				Parts:    tree.NameParts{funcName},
+			},
 		}
 	}
 	hashedColumnExpr := func(colName string) tree.Expr {
 		return &tree.FuncExpr{
 			Func: unresolvedFunc("fnv32"),
 			Exprs: tree.Exprs{
-				&tree.CastExpr{Expr: unresolvedName(colName), Type: types.String},
+				// NB: We have created the hash shard column as NOT NULL so we need
+				// to coalesce NULLs into something else. There's a variety of different
+				// reasonable choices here. We could pick some outlandish value, we
+				// could pick a zero value for each type, or we can do the simple thing
+				// we do here, however the empty string seems pretty reasonable. At worst
+				// we'll have a collision for every combination of NULLable string
+				// columns. That seems just fine.
+				&tree.CoalesceExpr{
+					Name: "COALESCE",
+					Exprs: tree.Exprs{
+						&tree.CastExpr{
+							Type: types.String,
+							Expr: &tree.ColumnItem{ColumnName: tree.Name(colName)},
+						},
+						tree.NewDString(""),
+					},
+				},
 			},
 		}
 	}
@@ -1844,7 +2044,9 @@ func makeHashShardComputeExpr(colNames []string, buckets int) *string {
 			expr = hashedColumnExpr(c)
 		} else {
 			expr = &tree.BinaryExpr{
-				Operator: tree.Plus, Left: hashedColumnExpr(c), Right: expr,
+				Left:     hashedColumnExpr(c),
+				Operator: tree.Plus,
+				Right:    expr,
 			}
 		}
 	}
@@ -1852,10 +2054,7 @@ func makeHashShardComputeExpr(colNames []string, buckets int) *string {
 		Func: unresolvedFunc("mod"),
 		Exprs: tree.Exprs{
 			expr,
-			tree.NewNumVal(
-				constant.MakeInt64(int64(buckets)),
-				strconv.Itoa(buckets),
-				false /* negative */),
+			tree.NewDInt(tree.DInt(buckets)),
 		},
 	})
 	return &str
@@ -1923,8 +2122,10 @@ func makeShardCheckConstraintDef(
 	return &tree.CheckConstraintTableDef{
 		Expr: &tree.ComparisonExpr{
 			Operator: tree.In,
-			Left:     &tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{shardCol.Name}},
-			Right:    values,
+			Left: &tree.ColumnItem{
+				ColumnName: tree.Name(shardCol.Name),
+			},
+			Right: values,
 		},
 		Hidden: true,
 	}, nil

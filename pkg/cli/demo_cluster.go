@@ -157,7 +157,7 @@ func setupTransientCluster(
 
 		// We force a wait for all servers until they are ready.
 		servReadyFnCh := make(chan struct{})
-		serv.Cfg.ReadyFn = func(_ bool) {
+		serv.Cfg.ReadyFn = func(bool) {
 			close(servReadyFnCh)
 		}
 
@@ -353,12 +353,7 @@ func (c *transientCluster) DrainNode(nodeID roachpb.NodeID) error {
 	}
 	defer finish()
 
-	onModes := make([]int32, len(server.GracefulDrainModes))
-	for i, m := range server.GracefulDrainModes {
-		onModes[i] = int32(m)
-	}
-
-	if err := doShutdown(ctx, adminClient, onModes); err != nil {
+	if err := drainAndShutdown(ctx, adminClient); err != nil {
 		return err
 	}
 	c.servers[nodeIndex] = nil
@@ -413,7 +408,7 @@ func (c *transientCluster) RestartNode(nodeID roachpb.NodeID) error {
 
 	// We want to only return after the server is ready.
 	readyCh := make(chan struct{})
-	serv.Cfg.ReadyFn = func(_ bool) {
+	serv.Cfg.ReadyFn = func(bool) {
 		close(readyCh)
 	}
 

@@ -231,8 +231,10 @@ func createTestStoreWithoutStart(
 	cfg.DB = kv.NewDB(cfg.AmbientCtx, factory, cfg.Clock)
 	store := NewStore(context.TODO(), *cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 	factory.setStore(store)
+
+	require.NoError(t, WriteClusterVersion(context.Background(), eng, clusterversion.TestingClusterVersion))
 	if err := InitEngine(
-		context.TODO(), eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1}, clusterversion.TestingClusterVersion,
+		context.TODO(), eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -436,8 +438,9 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 			t.Error("expected failure starting un-bootstrapped store")
 		}
 
+		require.NoError(t, WriteClusterVersion(context.Background(), eng, clusterversion.TestingClusterVersion))
 		// Bootstrap with a fake ident.
-		if err := InitEngine(ctx, eng, testIdent, clusterversion.TestingClusterVersion); err != nil {
+		if err := InitEngine(ctx, eng, testIdent); err != nil {
 			t.Fatalf("error bootstrapping store: %+v", err)
 		}
 
@@ -490,9 +493,9 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 	}
 }
 
-// TestBootstrapOfNonEmptyStore verifies bootstrap failure if engine
+// TestInitializeEngineErrors verifies bootstrap failure if engine
 // is not empty.
-func TestBootstrapOfNonEmptyStore(t *testing.T) {
+func TestInitializeEngineErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	ctx := context.TODO()
@@ -500,10 +503,16 @@ func TestBootstrapOfNonEmptyStore(t *testing.T) {
 	eng := storage.NewDefaultInMem()
 	stopper.AddCloser(eng)
 
-	// Put some random garbage into the engine.
-	if err := eng.Put(storage.MakeMVCCMetadataKey(roachpb.Key("foo")), []byte("bar")); err != nil {
-		t.Errorf("failure putting key foo into engine: %+v", err)
+	// Bootstrap should fail if engine has no cluster version yet.
+	if err := InitEngine(ctx, eng, testIdent); !testutils.IsError(err, `no cluster version`) {
+		t.Fatalf("unexpected error: %v", err)
 	}
+
+	require.NoError(t, WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
+
+	// Put some random garbage into the engine.
+	require.NoError(t, eng.Put(storage.MakeMVCCMetadataKey(roachpb.Key("foo")), []byte("bar")))
+
 	cfg := TestStoreConfig(nil)
 	cfg.Transport = NewDummyRaftTransport(cfg.Settings)
 	store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
@@ -516,12 +525,8 @@ func TestBootstrapOfNonEmptyStore(t *testing.T) {
 	}
 
 	// Bootstrap should fail on non-empty engine.
-	switch err := errors.Cause(InitEngine(
-		ctx, eng, testIdent, clusterversion.TestingClusterVersion,
-	)); err.(type) {
-	case *NotBootstrappedError:
-	default:
-		t.Errorf("unexpected error bootstrapping non-empty store: %+v", err)
+	if err := InitEngine(ctx, eng, testIdent); !testutils.IsError(err, `cannot be bootstrapped`) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -1620,7 +1625,8 @@ func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 	storeCfg.TestingKnobs.DontRetryPushTxnFailures = true
 	storeCfg.TestingKnobs.DontRecoverIndeterminateCommits = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
 	store := createTestStoreWithConfig(t, stopper, testStoreOpts{createSystemRanges: true}, &storeCfg)
 
 	testCases := []struct {
@@ -1695,12 +1701,21 @@ func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 			expPusheeRetry:      false,
 		},
 	}
-	for _, tc := range testCases {
-		name := fmt.Sprintf("pusherWillWin=%t,pusheePushed=%t,pusheeStaging=%t",
-			tc.pusherWillWin, tc.pusheeAlreadyPushed, tc.pusheeStagingRecord)
+	for i, tc := range testCases {
+		name := fmt.Sprintf("%d-pusherWillWin=%t,pusheePushed=%t,pusheeStaging=%t",
+			i, tc.pusherWillWin, tc.pusheeAlreadyPushed, tc.pusheeStagingRecord)
 		t.Run(name, func(t *testing.T) {
-			ctx := context.Background()
 			key := roachpb.Key(fmt.Sprintf("key-%s", name))
+
+			// First, write original value. We use this value as a sentinel; we'll
+			// check that we can read it later.
+			{
+				args := putArgs(key, []byte("value1"))
+				if _, pErr := kv.SendWrapped(ctx, store.TestSender(), &args); pErr != nil {
+					t.Fatal(pErr)
+				}
+			}
+
 			pusher := newTransaction("pusher", key, 1, store.cfg.Clock)
 			pushee := newTransaction("pushee", key, 1, store.cfg.Clock)
 
@@ -1711,14 +1726,6 @@ func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 			} else {
 				pushee.Priority = enginepb.MaxTxnPriority
 				pusher.Priority = enginepb.MinTxnPriority // Pusher will lose.
-			}
-
-			// First, write original value.
-			{
-				args := putArgs(key, []byte("value1"))
-				if _, pErr := kv.SendWrapped(ctx, store.TestSender(), &args); pErr != nil {
-					t.Fatal(pErr)
-				}
 			}
 
 			// Second, lay down intent using the pushee's txn.

@@ -43,10 +43,17 @@ func registerAcceptance(r *testRegistry) {
 		{name: "gossip/restart-node-one", fn: runGossipRestartNodeOne},
 		{name: "gossip/locality-address", fn: runCheckLocalityIPAddress},
 		{name: "rapid-restart", fn: runRapidRestart},
+		{name: "many-splits", fn: runManySplits},
 		{name: "status-server", fn: runStatusServer},
 		{
 			name: "version-upgrade",
-			fn:   runVersionUpgrade,
+			fn: func(ctx context.Context, t *test, c *cluster) {
+				predV, err := PredecessorVersion(r.buildVersion)
+				if err != nil {
+					t.Fatal(err)
+				}
+				runVersionUpgrade(ctx, t, c, predV)
+			},
 			// This test doesn't like running on old versions because it upgrades to
 			// the latest released version and then it tries to "head", where head is
 			// the cockroach binary built from the branch on which the test is

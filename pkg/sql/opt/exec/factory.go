@@ -50,12 +50,10 @@ type Factory interface {
 	//   - Only the given set of needed columns are part of the result.
 	//   - If indexConstraint is not nil, the scan is restricted to the spans in
 	//     in the constraint.
-	//   - If hardLimit > 0, then only up to hardLimit rows can be returned from
-	//     the scan. If hardLimit > 0, softLimit must be 0.
+	//   - If hardLimit > 0, then the scan returns only up to hardLimit rows.
 	//   - If softLimit > 0, then the scan may be required to return up to all
-	//     of its rows, but can be optimized under the assumption that only
-	//     softLimit rows will be needed. If softLimit > 0, then hardLimit must
-	//     be 0.
+	//     of its rows (or up to the hardLimit if it is set), but can be optimized
+	//     under the assumption that only softLimit rows will be needed.
 	//   - If maxResults > 0, the scan is guaranteed to return at most maxResults
 	//     rows.
 	//   - If locking is provided, the scan should use the specified row-level
@@ -73,11 +71,6 @@ type Factory interface {
 		rowCount float64,
 		locking *tree.LockingItem,
 	) (Node, error)
-
-	// ConstructVirtualScan returns a node that represents the scan of a virtual
-	// table. Virtual tables are system tables that are populated "on the fly"
-	// with rows synthesized from system metadata and other state.
-	ConstructVirtualScan(table cat.Table) (Node, error)
 
 	// ConstructFilter returns a node that applies a filter on the results of
 	// the given input node.
@@ -486,6 +479,7 @@ type Factory interface {
 		schema cat.Schema,
 		viewName string,
 		ifNotExists bool,
+		replace bool,
 		temporary bool,
 		viewQuery string,
 		columns sqlbase.ResultColumns,

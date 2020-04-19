@@ -80,7 +80,7 @@ func (c *CustomFuncs) IsLocking(scan *memo.ScanPrivate) bool {
 func (c *CustomFuncs) GenerateIndexScans(grp memo.RelExpr, scanPrivate *memo.ScanPrivate) {
 	// Iterate over all secondary indexes.
 	var iter scanIndexIter
-	iter.init(c.e.mem, scanPrivate)
+	iter.init(c.e.mem, scanPrivate, onlyStandardIndexes)
 	for iter.next() {
 		// Skip primary index.
 		if iter.indexOrdinal == cat.PrimaryIndex {
@@ -209,7 +209,7 @@ func (c *CustomFuncs) GenerateConstrainedScans(
 	var iter scanIndexIter
 	md := c.e.mem.Metadata()
 	tabMeta := md.TableMeta(scanPrivate.Table)
-	iter.init(c.e.mem, scanPrivate)
+	iter.init(c.e.mem, scanPrivate, onlyStandardIndexes)
 	for iter.next() {
 		// We only consider the partition values when a particular index can otherwise
 		// not be constrained. For indexes that are constrained, the partitioned values
@@ -406,27 +406,13 @@ func (c *CustomFuncs) GenerateConstrainedScans(
 // will be added to the memo group.
 func (c *CustomFuncs) checkConstraintFilters(tabID opt.TableID) memo.FiltersExpr {
 	md := c.e.mem.Metadata()
-	tab := md.Table(tabID)
 	tabMeta := md.TableMeta(tabID)
-
-	// Maintain a ColSet of non-nullable columns.
-	var notNullCols opt.ColSet
-	for i := 0; i < tab.ColumnCount(); i++ {
-		if !tab.Column(i).IsNullable() {
-			notNullCols.Add(tabID.ColumnID(i))
-		}
+	if tabMeta.Constraints == nil {
+		return memo.FiltersExpr{}
 	}
-
-	checkFilters := make(memo.FiltersExpr, 0, len(tabMeta.Constraints))
-	for _, checkConstraint := range tabMeta.Constraints {
-		// Check constraints that are guaranteed to not evaluate to NULL
-		// are the only ones converted into filters.
-		if memo.ExprIsNeverNull(checkConstraint, notNullCols) {
-			checkFilters = append(checkFilters, c.e.f.ConstructFiltersItem(checkConstraint))
-		}
-	}
-
-	return checkFilters
+	filters := *tabMeta.Constraints.(*memo.FiltersExpr)
+	// Limit slice capacity to allow the caller to append if necessary.
+	return filters[:len(filters):len(filters)]
 }
 
 // computedColFilters generates all filters that can be derived from the list of
@@ -843,8 +829,8 @@ func (c *CustomFuncs) partitionValuesFilters(
 func (c *CustomFuncs) HasInvertedIndexes(scanPrivate *memo.ScanPrivate) bool {
 	// Don't bother matching unless there's an inverted index.
 	var iter scanIndexIter
-	iter.init(c.e.mem, scanPrivate)
-	return iter.nextInverted()
+	iter.init(c.e.mem, scanPrivate, onlyInvertedIndexes)
+	return iter.next()
 }
 
 // GenerateInvertedIndexScans enumerates all inverted indexes on the Scan
@@ -863,11 +849,11 @@ func (c *CustomFuncs) GenerateInvertedIndexScans(
 
 	// Iterate over all inverted indexes.
 	var iter scanIndexIter
-	iter.init(c.e.mem, scanPrivate)
-	for iter.nextInverted() {
+	iter.init(c.e.mem, scanPrivate, onlyInvertedIndexes)
+	for iter.next() {
 		// Check whether the filter can constrain the index.
 		constraint, remaining, ok := c.tryConstrainIndex(
-			filters, nil /* optioanlFilters */, scanPrivate.Table, iter.indexOrdinal, true /* isInverted */)
+			filters, nil /* optionalFilters */, scanPrivate.Table, iter.indexOrdinal, true /* isInverted */)
 		if !ok {
 			continue
 		}
@@ -983,13 +969,16 @@ func (c *CustomFuncs) allInvIndexConstraints(
 	return constraints, true
 }
 
-// canMaybeConstrainIndex performs two checks that can quickly rule out the
-// possibility that the given index can be constrained by the specified filter:
+// canMaybeConstrainIndex returns true if we should try to constrain a given
+// index by the given filter. It returns false if it is impossible for the
+// filter can constrain the scan.
 //
-//   1. If the filter does not reference the first index column, then no
-//      constraint can be generated.
-//   2. If none of the filter's constraints start with the first index column,
-//      then no constraint can be generated.
+// If any of the three following statements are true, then it is
+// possible that the index can be constrained:
+//
+//   1. The filter references the first index column.
+//   2. The constraints are not tight (see props.Scalar.TightConstraints).
+//   3. Any of the filter's constraints start with the first index column.
 //
 func (c *CustomFuncs) canMaybeConstrainIndex(
 	filters memo.FiltersExpr, tabID opt.TableID, indexOrd int,
@@ -1099,7 +1088,7 @@ func (c *CustomFuncs) GenerateLimitedScans(
 
 	// Iterate over all indexes, looking for those that can be limited.
 	var iter scanIndexIter
-	iter.init(c.e.mem, scanPrivate)
+	iter.init(c.e.mem, scanPrivate, onlyStandardIndexes)
 	for iter.next() {
 		newScanPrivate := *scanPrivate
 		newScanPrivate.Index = iter.indexOrdinal
@@ -1339,22 +1328,14 @@ func (c *CustomFuncs) GenerateLookupJoins(
 	var pkCols opt.ColList
 
 	var iter scanIndexIter
-	iter.init(c.e.mem, scanPrivate)
+	iter.init(c.e.mem, scanPrivate, onlyStandardIndexes)
 	for iter.next() {
-		idxCols := iter.indexCols()
-
 		// Find the longest prefix of index key columns that are constrained by
 		// an equality with another column or a constant.
 		numIndexKeyCols := iter.index.LaxKeyColumnCount()
-		constValMap := memo.ExtractValuesFromFilter(on, idxCols)
-		constFilterMap := memo.ExtractConstantFilter(on, idxCols)
 
 		var projections memo.ProjectionsExpr
 		var constFilters memo.FiltersExpr
-		if len(constValMap) > 0 {
-			projections = make(memo.ProjectionsExpr, 0, numIndexKeyCols)
-			constFilters = make(memo.FiltersExpr, 0, numIndexKeyCols)
-		}
 
 		// Check if the first column in the index has an equality constraint, or if
 		// it is constrained to a constant value. This check doesn't guarantee that
@@ -1362,7 +1343,7 @@ func (c *CustomFuncs) GenerateLookupJoins(
 		// in most cases.
 		firstIdxCol := scanPrivate.Table.ColumnID(iter.index.Column(0).Ordinal)
 		if _, ok := rightEq.Find(firstIdxCol); !ok {
-			if _, ok := constValMap[firstIdxCol]; !ok {
+			if _, _, ok := c.findConstantFilter(on, firstIdxCol); !ok {
 				continue
 			}
 		}
@@ -1387,28 +1368,34 @@ func (c *CustomFuncs) GenerateLookupJoins(
 				continue
 			}
 
-			// Project a new column with a constant value if that allows the
-			// index column to be constrained and used by the lookup joiner.
-			filter, ok := constFilterMap[idxCol]
-			if !ok {
+			// Try to find a filter that constrains this column to a non-NULL constant
+			// value. We cannot use a NULL value because the lookup join implements
+			// logic equivalent to simple equality between columns (where NULL never
+			// equals anything).
+			foundVal, onIdx, ok := c.findConstantFilter(on, idxCol)
+			if !ok || foundVal == tree.DNull {
 				break
 			}
-			condition, ok := filter.Condition.(*memo.EqExpr)
-			if !ok {
-				break
+
+			// We will project this constant value in the input to make it an equality
+			// column.
+			if projections == nil {
+				projections = make(memo.ProjectionsExpr, 0, numIndexKeyCols-j)
+				constFilters = make(memo.FiltersExpr, 0, numIndexKeyCols-j)
 			}
+
 			constColID := c.e.f.Metadata().AddColumn(
 				fmt.Sprintf("project_const_col_@%d", idxCol),
-				condition.Right.DataType())
+				foundVal.ResolvedType())
 			projections = append(projections, c.e.f.ConstructProjectionsItem(
-				c.e.f.ConstructConst(constValMap[idxCol]),
+				c.e.f.ConstructConst(foundVal),
 				constColID,
 			))
 
 			needProjection = true
 			lookupJoin.KeyCols = append(lookupJoin.KeyCols, constColID)
 			rightSideCols = append(rightSideCols, idxCol)
-			constFilters = append(constFilters, filter)
+			constFilters = append(constFilters, on[onIdx])
 		}
 
 		if len(lookupJoin.KeyCols) == 0 {
@@ -1512,6 +1499,24 @@ func (c *CustomFuncs) GenerateLookupJoins(
 	}
 }
 
+// findConstantFilter tries to find a filter that is exactly equivalent to
+// constraining the given column to a constant value. Note that the constant
+// value can be NULL (for an `x IS NULL` filter).
+func (c *CustomFuncs) findConstantFilter(
+	filters memo.FiltersExpr, col opt.ColumnID,
+) (value tree.Datum, filterIdx int, ok bool) {
+	for filterIdx := range filters {
+		props := filters[filterIdx].ScalarProps()
+		if props.TightConstraints {
+			constCol, constVal, ok := props.Constraints.IsSingleColumnConstValue(c.e.evalCtx)
+			if ok && constCol == col {
+				return constVal, filterIdx, true
+			}
+		}
+	}
+	return nil, -1, false
+}
+
 // eqColsForZigzag is a helper function to generate eqCol lists for the zigzag
 // joiner. The zigzag joiner requires that the equality columns immediately
 // follow the fixed columns in the index. Fixed here refers to columns that
@@ -1595,24 +1600,25 @@ func eqColsForZigzag(
 }
 
 // fixedColsForZigzag is a helper function to generate FixedCols lists for the
-// zigzag join expression. It takes in a fixedValMap mapping column IDs to
-// constant values they are constrained to. This function iterates through
-// the columns of the specified index in order until it comes across the first
-// column ID not in fixedValMap.
+// zigzag join expression. This function iterates through the columns of the
+// specified index in order until it comes across the first column ID that is
+// not constrained to a constant.
 func (c *CustomFuncs) fixedColsForZigzag(
-	index cat.Index, tabID opt.TableID, fixedValMap map[opt.ColumnID]tree.Datum,
-) (opt.ColList, memo.ScalarListExpr, []types.T) {
-	vals := make(memo.ScalarListExpr, 0, len(fixedValMap))
-	typs := make([]types.T, 0, len(fixedValMap))
-	fixedCols := make(opt.ColList, 0, len(fixedValMap))
-
+	index cat.Index, tabID opt.TableID, filters memo.FiltersExpr,
+) (fixedCols opt.ColList, vals memo.ScalarListExpr, typs []types.T) {
 	for i, cnt := 0, index.ColumnCount(); i < cnt; i++ {
 		colID := tabID.ColumnID(index.Column(i).Ordinal)
-		val, ok := fixedValMap[colID]
+		val, _, ok := c.findConstantFilter(filters, colID)
 		if !ok {
 			break
 		}
-		dt := index.Column(i).DatumType()
+		if vals == nil {
+			vals = make(memo.ScalarListExpr, 0, cnt-i)
+			typs = make([]types.T, 0, cnt-i)
+			fixedCols = make(opt.ColList, 0, cnt-i)
+		}
+
+		dt := val.ResolvedType()
 		vals = append(vals, c.e.f.ConstructConstVal(val, dt))
 		typs = append(typs, *dt)
 		fixedCols = append(fixedCols, colID)
@@ -1671,7 +1677,7 @@ func (c *CustomFuncs) GenerateZigzagJoins(
 	// algorithm laid out here:
 	// https://en.wikipedia.org/wiki/Maximum_coverage_problem
 	var iter, iter2 scanIndexIter
-	iter.init(c.e.mem, scanPrivate)
+	iter.init(c.e.mem, scanPrivate, onlyStandardIndexes)
 	for iter.next() {
 		if iter.indexOrdinal == cat.PrimaryIndex {
 			continue
@@ -1683,7 +1689,7 @@ func (c *CustomFuncs) GenerateZigzagJoins(
 		if leftFixed.Len() == 0 {
 			continue
 		}
-		iter2.init(c.e.mem, scanPrivate)
+		iter2.init(c.e.mem, scanPrivate, onlyStandardIndexes)
 		// Only look at indexes after this one.
 		iter2.indexOrdinal = iter.indexOrdinal
 
@@ -1763,27 +1769,11 @@ func (c *CustomFuncs) GenerateZigzagJoins(
 				},
 			}
 
-			// Fixed values are represented as tuples consisting of the
-			// fixed segment of that side's index.
-			fixedValMap := memo.ExtractValuesFromFilter(filters, fixedCols)
-
-			if len(fixedValMap) != fixedCols.Len() {
-				if util.RaceEnabled {
-					panic(errors.AssertionFailedf(
-						"we inferred constant columns whose value we couldn't extract",
-					))
-				}
-
-				// This is a bug, but we don't want to block queries from running because of it.
-				// TODO(justin): remove this when we fix extractConstEquality.
-				continue
-			}
-
 			leftFixedCols, leftVals, leftTypes := c.fixedColsForZigzag(
-				iter.index, scanPrivate.Table, fixedValMap,
+				iter.index, scanPrivate.Table, filters,
 			)
 			rightFixedCols, rightVals, rightTypes := c.fixedColsForZigzag(
-				iter2.index, scanPrivate.Table, fixedValMap,
+				iter2.index, scanPrivate.Table, filters,
 			)
 
 			zigzagJoin.LeftFixedCols = leftFixedCols
@@ -1889,8 +1879,8 @@ func (c *CustomFuncs) GenerateInvertedIndexZigzagJoins(
 
 	// Iterate over all inverted indexes.
 	var iter scanIndexIter
-	iter.init(c.e.mem, scanPrivate)
-	for iter.nextInverted() {
+	iter.init(c.e.mem, scanPrivate, onlyInvertedIndexes)
+	for iter.next() {
 		// See if there are two or more constraints that can be satisfied
 		// by this inverted index. This is possible with inverted indexes as
 		// opposed to secondary indexes, because one row in the primary index
@@ -2268,11 +2258,253 @@ func (c *CustomFuncs) MakeOrderingChoiceFromColumn(
 	return oc
 }
 
+// ExprPair stores a left and right ScalarExpr. ExprPairForSplitDisjunction
+// returns ExprPair, which can be deconstructed later, to avoid extra
+// computation in determining the left and right expression groups.
+type ExprPair struct {
+	left  opt.ScalarExpr
+	right opt.ScalarExpr
+}
+
+// ExprPairLeft returns the left ScalarExpr in an ExprPair.
+func (c *CustomFuncs) ExprPairLeft(ep ExprPair) opt.ScalarExpr {
+	return ep.left
+}
+
+// ExprPairRight returns the right ScalarExpr in an ExprPair.
+func (c *CustomFuncs) ExprPairRight(ep ExprPair) opt.ScalarExpr {
+	return ep.right
+}
+
+// ExprPairSucceeded returns true if the ExprPair is not nil.
+func (c *CustomFuncs) ExprPairSucceeded(ep ExprPair) bool {
+	return ep != ExprPair{}
+}
+
+// ExprPairForSplitDisjunction returns an ExprPair that groups all
+// sub-expressions adjacent to the input OrExpr into left and right expression
+// groups. These two groups form the new filter expressions on the left and
+// right side of the generated Union.
+//
+// All sub-expressions with the same columns as the left-most sub-expression
+// are grouped in the left group. All other sub-expressions are grouped in the
+// right group.
+//
+// ExprPairForSplitDisjunction returns nil if all sub-expressions have the same
+// columns.
+func (c *CustomFuncs) ExprPairForSplitDisjunction(or opt.ScalarExpr) ExprPair {
+	var leftExprs memo.ScalarListExpr
+	var rightExprs memo.ScalarListExpr
+	var leftColSet opt.ColSet
+
+	// Traverse all adjacent OrExpr.
+	var collect func(opt.ScalarExpr)
+	collect = func(expr opt.ScalarExpr) {
+		switch t := expr.(type) {
+		case *memo.OrExpr:
+			collect(t.Left)
+			collect(t.Right)
+			return
+		}
+
+		cols := c.OuterCols(expr)
+
+		// Set the left-most non-Or expression as the left ColSet to match (or
+		// not match) on.
+		if leftColSet.Empty() {
+			leftColSet = cols
+		}
+
+		// If the current expression ColSet matches leftColSet, add the expr to
+		// the left group. Otherwise, add it to the right group.
+		if c.ColsAreEqual(leftColSet, cols) {
+			leftExprs = append(leftExprs, expr)
+		} else {
+			rightExprs = append(rightExprs, expr)
+		}
+	}
+	collect(or)
+
+	// Return an empty pair if one of the groups has no expressions.
+	if len(leftExprs) == 0 || len(rightExprs) == 0 {
+		return ExprPair{}
+	}
+
+	return ExprPair{
+		left:  c.constructOr(leftExprs),
+		right: c.constructOr(rightExprs),
+	}
+}
+
+// CanMaybeConstrainIndexWithCols returns true if any indexes on the
+// ScanPrivate's table could be constrained by cols. It is a fast check for
+// SplitDisjunction to avoid matching a large number of queries that won't
+// obviously be improved by the rule.
+//
+// CanMaybeConstrainIndexWithCols checks for an intersection between the input
+// columns and an index's columns. An intersection between column sets implies
+// that cols could constrain a scan on that index. For example, the columns "a"
+// would constrain a scan on an index over columns "a, b", because the "a" is a
+// subset of the index columns. Likewise, the columns "a" and "b" would
+// constrain a scan on an index over column "a", because "a" and "b" are a
+// superset of the index columns.
+//
+// Notice that this function can return both false positives and false
+// negatives. As an example of a false negative, consider the following table
+// and query.
+//
+//   CREATE TABLE t (
+//     k PRIMARY KEY,
+//     a INT,
+//     hash INT AS (a % 4) STORED,
+//     INDEX hash (hash)
+//   )
+//
+//   SELECT * FROM t WHERE a = 5
+//
+// The expression "a = 5" can constrain a scan over the hash index: The columns
+// "hash" must be a constant value of 1 because it is dependent on column "a"
+// with a constant value of 5. However, CanMaybeConstrainIndexWithCols will
+// return false in this case because "a" does not intersect with the index
+// column, "hash".
+func (c *CustomFuncs) CanMaybeConstrainIndexWithCols(sp *memo.ScanPrivate, cols opt.ColSet) bool {
+	md := c.e.mem.Metadata()
+	tabMeta := md.TableMeta(sp.Table)
+
+	var iter scanIndexIter
+	iter.init(c.e.mem, sp, allIndexes)
+	for iter.next() {
+		// Iterate through all indexes of the table and return true if cols
+		// intersect with the index's columns.
+		indexColumns := tabMeta.IndexKeyColumns(iter.indexOrdinal)
+		if cols.Intersects(indexColumns) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// DuplicateScanPrivate constructs a new ScanPrivate that is identical to the
+// input, but has new table and column IDs.
+//
+// DuplicateScanPrivate can only be called on canonical ScanPrivates because not
+// all scan properties are copied to the new ScanPrivate, e.g. constraints.
+func (c *CustomFuncs) DuplicateScanPrivate(sp *memo.ScanPrivate) *memo.ScanPrivate {
+	if !c.IsCanonicalScan(sp) {
+		panic(errors.AssertionFailedf("input ScanPrivate must be canonical: %v", sp))
+	}
+
+	md := c.e.mem.Metadata()
+	tabMeta := md.TableMeta(sp.Table)
+	dupTabID := md.AddTable(tabMeta.Table, &tabMeta.Alias)
+
+	var dupTabColIDs opt.ColSet
+	cols := sp.Cols
+	for i, ok := cols.Next(0); ok; i, ok = cols.Next(i + 1) {
+		ord := tabMeta.MetaID.ColumnOrdinal(i)
+		dupColID := dupTabID.ColumnID(ord)
+		dupTabColIDs.Add(dupColID)
+	}
+
+	return &memo.ScanPrivate{
+		Table:   dupTabID,
+		Cols:    dupTabColIDs,
+		Flags:   sp.Flags,
+		Locking: sp.Locking,
+	}
+}
+
+// MapScanFilterCols returns a new FiltersExpr with all the src column IDs in
+// the input expression replaced with column IDs in dst.
+//
+// NOTE: Every ColumnID in src must map to the a ColumnID in dst with the same
+// relative position in the ColSets. For example, if src and dst are (1, 5, 6)
+// and (7, 12, 15), then the following mapping would be applied:
+//
+//   1 => 7
+//   5 => 12
+//   6 => 15
+func (c *CustomFuncs) MapScanFilterCols(
+	filters memo.FiltersExpr, src *memo.ScanPrivate, dst *memo.ScanPrivate,
+) memo.FiltersExpr {
+	if src.Cols.Len() != dst.Cols.Len() {
+		panic(errors.AssertionFailedf(
+			"src and dst must have the same number of columns, src.Cols: %v, dst.Cols: %v",
+			src.Cols,
+			dst.Cols,
+		))
+	}
+
+	// Map each column in src to a column in dst based on the relative position
+	// of both the src and dst ColumnIDs in the ColSet.
+	var colMap util.FastIntMap
+	dstCol, _ := dst.Cols.Next(0)
+	for srcCol, ok := src.Cols.Next(0); ok; srcCol, ok = src.Cols.Next(srcCol + 1) {
+		colMap.Set(int(srcCol), int(dstCol))
+		dstCol, _ = dst.Cols.Next(dstCol + 1)
+	}
+
+	// Map the columns of each filter in the FiltersExpr.
+	newFilters := make([]memo.FiltersItem, 0, len(filters))
+	for i := range filters {
+		expr := c.MapFiltersItemCols(&filters[i], colMap)
+		newFilters = append(newFilters, c.e.f.ConstructFiltersItem(expr))
+	}
+
+	return newFilters
+}
+
+// MakeSetPrivateForSplitDisjunction constructs a new SetPrivate with column sets
+// from the left and right ScanPrivate. We use the same ColList for the
+// LeftCols and OutCols of the SetPrivate because we've used the original
+// ScanPrivate column IDs for the left ScanPrivate and those are safe to use as
+// output column IDs of the Union expression.
+func (c *CustomFuncs) MakeSetPrivateForSplitDisjunction(
+	left, right *memo.ScanPrivate,
+) *memo.SetPrivate {
+	leftAndOutCols := opt.ColSetToList(left.Cols)
+	return &memo.SetPrivate{
+		LeftCols:  leftAndOutCols,
+		RightCols: opt.ColSetToList(right.Cols),
+		OutCols:   leftAndOutCols,
+	}
+}
+
+// AddPrimaryKeyColsToScanPrivate creates a new ScanPrivate that is the same as
+// the input ScanPrivate, but has primary keys added to the ColSet.
+func (c *CustomFuncs) AddPrimaryKeyColsToScanPrivate(sp *memo.ScanPrivate) *memo.ScanPrivate {
+	keyCols := c.PrimaryKeyCols(sp.Table)
+	return &memo.ScanPrivate{
+		Table:   sp.Table,
+		Cols:    sp.Cols.Union(keyCols),
+		Flags:   sp.Flags,
+		Locking: sp.Locking,
+	}
+}
+
+// indexIterType is an option passed to scanIndexIter.init() to specify index types
+// to include during iteration.
+type indexIterType int
+
+const (
+	// allIndexes sepcifies that no indexes will be skipped during iteration.
+	allIndexes indexIterType = iota
+
+	// onlyStandardIndexes specifies iteration over all standard indexes,
+	// skipping inverted indexes.
+	onlyStandardIndexes
+
+	// onlyInvertedIndexes specifies iteration over all inverted indexes,
+	// skipping standard indexes.
+	onlyInvertedIndexes
+)
+
 // scanIndexIter is a helper struct that supports iteration over the indexes
 // of a Scan operator table. For example:
 //
 //   var iter scanIndexIter
-//   iter.init(mem, scanOpDef)
+//   iter.init(mem, scanOpDef, onlyStandardIndexes)
 //   for iter.next() {
 //     doSomething(iter.indexOrdinal)
 //   }
@@ -2283,63 +2515,54 @@ type scanIndexIter struct {
 	tab          cat.Table
 	indexOrdinal cat.IndexOrdinal
 	index        cat.Index
+	indexType    indexIterType
 	cols         opt.ColSet
 }
 
-func (it *scanIndexIter) init(mem *memo.Memo, scanPrivate *memo.ScanPrivate) {
+func (it *scanIndexIter) init(mem *memo.Memo, scanPrivate *memo.ScanPrivate, t indexIterType) {
 	it.mem = mem
 	it.scanPrivate = scanPrivate
 	it.tab = mem.Metadata().Table(scanPrivate.Table)
 	it.indexOrdinal = -1
 	it.index = nil
+	it.indexType = t
 }
 
 // next advances iteration to the next index of the Scan operator's table. This
 // is the primary index if it's the first time next is called, or a secondary
-// index thereafter. Inverted index are skipped. If the ForceIndex flag is set,
-// then all indexes except the forced index are skipped. When there are no more
-// indexes to enumerate, next returns false. The current index is accessible via
-// the iterator's "index" field.
+// index thereafter. When there are no more indexes to enumerate, next returns
+// false. The current index is accessible via the iterator's "index" field.
+//
+// The indexType determines which indexes to skip when iterating, if any.
+//
+// If the ForceIndex flag is set, then all indexes except the forced index are
+// skipped.
 func (it *scanIndexIter) next() bool {
 	for {
 		it.indexOrdinal++
-		if it.indexOrdinal >= it.tab.IndexCount() {
-			it.index = nil
-			return false
-		}
-		it.index = it.tab.Index(it.indexOrdinal)
-		if it.index.IsInverted() {
-			continue
-		}
-		if it.scanPrivate.Flags.ForceIndex && it.scanPrivate.Flags.Index != it.indexOrdinal {
-			// If we are forcing a specific index, ignore the others.
-			continue
-		}
-		it.cols = opt.ColSet{}
-		return true
-	}
-}
 
-// nextInverted advances iteration to the next inverted index of the Scan
-// operator's table. It returns false when there are no more inverted indexes to
-// enumerate (or if there were none to begin with). The current index is
-// accessible via the iterator's "index" field.
-func (it *scanIndexIter) nextInverted() bool {
-	for {
-		it.indexOrdinal++
 		if it.indexOrdinal >= it.tab.IndexCount() {
 			it.index = nil
 			return false
 		}
 
 		it.index = it.tab.Index(it.indexOrdinal)
-		if !it.index.IsInverted() {
+
+		// Skip over inverted indexes if indexType is onlyStandardIndexes.
+		if it.indexType == onlyStandardIndexes && it.index.IsInverted() {
 			continue
 		}
+
+		// Skip over standard indexes if indexType is onlyInvertedIndexes.
+		if it.indexType == onlyInvertedIndexes && !it.index.IsInverted() {
+			continue
+		}
+
 		if it.scanPrivate.Flags.ForceIndex && it.scanPrivate.Flags.Index != it.indexOrdinal {
 			// If we are forcing a specific index, ignore the others.
 			continue
 		}
+
 		it.cols = opt.ColSet{}
 		return true
 	}

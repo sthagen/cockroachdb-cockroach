@@ -544,7 +544,7 @@ func newNameFromStr(s string) *tree.Name {
 %token <str> BUCKET_COUNT
 %token <str> BOOLEAN BOTH BUNDLE BY
 
-%token <str> CACHE CANCEL CASCADE CASE CAST CHANGEFEED CHAR
+%token <str> CACHE CANCEL CASCADE CASE CAST CBRT CHANGEFEED CHAR
 %token <str> CHARACTER CHARACTERISTICS CHECK CLOSE
 %token <str> CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
 %token <str> COMMITTED COMPACT COMPLETE CONCAT CONCURRENTLY CONFIGURATION CONFIGURATIONS CONFIGURE
@@ -613,7 +613,7 @@ func newNameFromStr(s string) *tree.Name {
 %token <str> SHARE SHOW SIMILAR SIMPLE SKIP SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
 
 %token <str> START STATISTICS STATUS STDIN STRICT STRING STORAGE STORE STORED STORING SUBSTRING
-%token <str> SYMMETRIC SYNTAX SYSTEM SUBSCRIPTION
+%token <str> SYMMETRIC SYNTAX SYSTEM SQRT SUBSCRIPTION
 
 %token <str> TABLE TABLES TEMP TEMPLATE TEMPORARY TESTING_RELOCATE EXPERIMENTAL_RELOCATE TEXT THEN
 %token <str> TIES TIME TIMETZ TIMESTAMP TIMESTAMPTZ TO THROTTLING TRAILING TRACE TRANSACTION TREAT TRIGGER TRIM TRUE
@@ -1048,6 +1048,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <*tree.With> with_clause opt_with_clause
 %type <[]*tree.CTE> cte_list
 %type <*tree.CTE> common_table_expr
+%type <bool> materialize_clause
 
 %type <empty> within_group_clause
 %type <tree.Expr> filter_clause
@@ -1123,7 +1124,7 @@ func newNameFromStr(s string) *tree.Name {
 %left      '|'
 %left      '#'
 %left      '&'
-%left      LSHIFT RSHIFT INET_CONTAINS_OR_EQUALS INET_CONTAINED_BY_OR_EQUALS AND_AND
+%left      LSHIFT RSHIFT INET_CONTAINS_OR_EQUALS INET_CONTAINED_BY_OR_EQUALS AND_AND SQRT CBRT
 %left      '+' '-'
 %left      '*' '/' FLOORDIV '%'
 %left      '^'
@@ -3867,7 +3868,7 @@ show_sessions_stmt:
 show_tables_stmt:
   SHOW TABLES FROM name '.' name with_comment
   {
-    $$.val = &tree.ShowTables{TableNamePrefix:tree.TableNamePrefix{
+    $$.val = &tree.ShowTables{ObjectNamePrefix:tree.ObjectNamePrefix{
         CatalogName: tree.Name($4),
         ExplicitCatalog: true,
         SchemaName: tree.Name($6),
@@ -3877,7 +3878,7 @@ show_tables_stmt:
   }
 | SHOW TABLES FROM name with_comment
   {
-    $$.val = &tree.ShowTables{TableNamePrefix:tree.TableNamePrefix{
+    $$.val = &tree.ShowTables{ObjectNamePrefix:tree.ObjectNamePrefix{
         // Note: the schema name may be interpreted as database name,
         // see name_resolution.go.
         SchemaName: tree.Name($4),
@@ -6520,7 +6521,7 @@ table_clause:
 // SQL standard WITH clause looks like:
 //
 // WITH [ RECURSIVE ] <query name> [ (<column> [, ...]) ]
-//        AS (query) [ SEARCH or CYCLE clause ]
+//        AS [ [ NOT ] MATERIALIZED ] (query) [ SEARCH or CYCLE clause ]
 //
 // We don't currently support the SEARCH or CYCLE clause.
 //
@@ -6550,14 +6551,38 @@ cte_list:
     $$.val = append($1.ctes(), $3.cte())
   }
 
+materialize_clause:
+  MATERIALIZED
+  {
+    $$.val = true
+  }
+| NOT MATERIALIZED
+  {
+    $$.val = false
+  }
+
 common_table_expr:
   table_alias_name opt_column_list AS '(' preparable_stmt ')'
-  {
-    $$.val = &tree.CTE{
-      Name: tree.AliasClause{Alias: tree.Name($1), Cols: $2.nameList() },
-      Stmt: $5.stmt(),
+    {
+      $$.val = &tree.CTE{
+        Name: tree.AliasClause{Alias: tree.Name($1), Cols: $2.nameList() },
+        Mtr: tree.MaterializeClause{
+          Set: false,
+        },
+        Stmt: $5.stmt(),
+      }
     }
-  }
+| table_alias_name opt_column_list AS materialize_clause '(' preparable_stmt ')'
+    {
+      $$.val = &tree.CTE{
+        Name: tree.AliasClause{Alias: tree.Name($1), Cols: $2.nameList() },
+        Mtr: tree.MaterializeClause{
+          Materialize: $4.bool(),
+          Set: true,
+        },
+        Stmt: $6.stmt(),
+      }
+    }
 
 opt_with:
   WITH {}
@@ -7965,6 +7990,14 @@ a_expr:
 | '~' a_expr %prec UMINUS
   {
     $$.val = &tree.UnaryExpr{Operator: tree.UnaryComplement, Expr: $2.expr()}
+  }
+| SQRT a_expr
+  {
+    $$.val = &tree.UnaryExpr{Operator: tree.UnarySqrt, Expr: $2.expr()}
+  }
+| CBRT a_expr
+  {
+    $$.val = &tree.UnaryExpr{Operator: tree.UnaryCbrt, Expr: $2.expr()}
   }
 | a_expr '+' a_expr
   {
@@ -9555,10 +9588,10 @@ table_index_name:
   }
 | standalone_index_name
   {
-    // Treat it as a table name, then pluck out the TableName.
+    // Treat it as a table name, then pluck out the ObjectName.
     name := $1.unresolvedObjectName().ToTableName()
-    indexName := tree.UnrestrictedName(name.TableName)
-    name.TableName = ""
+    indexName := tree.UnrestrictedName(name.ObjectName)
+    name.ObjectName = ""
     $$.val = tree.TableIndexName{
         Table: name,
         Index: indexName,

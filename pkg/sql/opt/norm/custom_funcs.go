@@ -1380,12 +1380,38 @@ func (c *CustomFuncs) ProjectColMapRight(set *memo.SetPrivate) memo.ProjectionsE
 // projectColMapSide implements the side-agnostic logic from ProjectColMapLeft
 // and ProjectColMapRight.
 func (c *CustomFuncs) projectColMapSide(toList, fromList opt.ColList) memo.ProjectionsExpr {
-	items := make(memo.ProjectionsExpr, len(toList))
+	items := make(memo.ProjectionsExpr, 0, len(toList))
 	for idx, fromCol := range fromList {
 		toCol := toList[idx]
-		items[idx] = c.f.ConstructProjectionsItem(c.f.ConstructVariable(fromCol), toCol)
+		// If the to and from col ids are the same, do not project them. They
+		// are passed-through instead. See opt.Metadata for more details about
+		// why some col ids could exist on one side and the output of a set
+		// operation.
+		if fromCol != toCol {
+			items = append(items, c.f.ConstructProjectionsItem(c.f.ConstructVariable(fromCol), toCol))
+		}
 	}
 	return items
+}
+
+// ProjectPassthroughLeft returns a ColSet that contains the columns that can
+// be passed-through from the left side in a SetPrivate when eliminating a set
+// operation, like in EliminateUnionAllLeft. Columns in both the output
+// ColList and the left ColList should be passed-through.
+func (c *CustomFuncs) ProjectPassthroughLeft(set *memo.SetPrivate) opt.ColSet {
+	out := set.OutCols.ToSet()
+	out.IntersectionWith(set.LeftCols.ToSet())
+	return out
+}
+
+// ProjectPassthroughRight returns a ColSet that contains the columns that can
+// be passed-through from the right side in a SetPrivate when eliminating a set
+// operation, like in EliminateUnionAllRight. Columns in both the output
+// ColList and the right ColList should be passed-through.
+func (c *CustomFuncs) ProjectPassthroughRight(set *memo.SetPrivate) opt.ColSet {
+	out := set.OutCols.ToSet()
+	out.IntersectionWith(set.RightCols.ToSet())
+	return out
 }
 
 // PruneSetPrivate returns a SetPrivate based on the given SetPrivate, but with
@@ -2050,11 +2076,15 @@ func (c *CustomFuncs) CanAddConstInts(first tree.Datum, second tree.Datum) bool 
 // ----------------------------------------------------------------------
 
 // CanInlineWith returns whether or not it's valid to inline binding in expr.
-// This is the case when:
+// This is the case when materialize is explicitly set to false, or when:
 // 1. binding has no side-effects (because once it's inlined, there's no
 //    guarantee it will be executed fully), and
 // 2. binding is referenced at most once in expr.
 func (c *CustomFuncs) CanInlineWith(binding, expr memo.RelExpr, private *memo.WithPrivate) bool {
+	// If materialization is set, ignore the checks below.
+	if private.Mtr.Set {
+		return !private.Mtr.Materialize
+	}
 	if binding.Relational().CanHaveSideEffects {
 		return false
 	}

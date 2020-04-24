@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -73,7 +74,7 @@ func (n *dropIndexNode) startExec(params runParams) error {
 	if n.n.Concurrently {
 		params.p.SendClientNotice(
 			params.ctx,
-			pgerror.Noticef("CONCURRENTLY is not required as all indexes are dropped concurrently"),
+			pgnotice.Newf("CONCURRENTLY is not required as all indexes are dropped concurrently"),
 		)
 	}
 
@@ -245,6 +246,14 @@ func (p *planner) dropIndexByName(
 		return nil
 	}
 
+	if idx.Unique && behavior != tree.DropCascade && constraintBehavior != ignoreIdxConstraint && !idx.CreatedExplicitly {
+		return errors.WithHint(
+			pgerror.Newf(pgcode.DependentObjectsStillExist,
+				"index %q is in use as unique constraint", idx.Name),
+			"use CASCADE if you really want to drop it.",
+		)
+	}
+
 	// Check if requires CCL binary for eventual zone config removal.
 	_, zone, _, err := GetZoneConfigInTxn(ctx, p.txn, uint32(tableDesc.ID), nil, "", false)
 	if err != nil {
@@ -390,10 +399,6 @@ func (p *planner) dropIndexByName(
 		}
 	}
 
-	if idx.Unique && behavior != tree.DropCascade && constraintBehavior != ignoreIdxConstraint && !idx.CreatedExplicitly {
-		return errors.Errorf("index %q is in use as unique constraint (use CASCADE if you really want to drop it)", idx.Name)
-	}
-
 	var droppedViews []string
 	for _, tableRef := range tableDesc.DependedOnBy {
 		if tableRef.IndexID == idx.ID {
@@ -477,10 +482,13 @@ func (p *planner) dropIndexByName(
 	if err := p.writeSchemaChange(ctx, tableDesc, mutationID, jobDesc); err != nil {
 		return err
 	}
-	p.SendClientNotice(ctx,
+	p.SendClientNotice(
+		ctx,
 		errors.WithHint(
-			pgerror.Noticef("the data for dropped indexes is reclaimed asynchronously"),
-			"The reclamation delay can be customized in the zone configuration for the table."))
+			pgnotice.Newf("the data for dropped indexes is reclaimed asynchronously"),
+			"The reclamation delay can be customized in the zone configuration for the table.",
+		),
+	)
 	// Record index drop in the event log. This is an auditable log event
 	// and is recorded in the same transaction as the table descriptor
 	// update.

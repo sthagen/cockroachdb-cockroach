@@ -77,396 +77,10 @@ var (
 	}
 )
 
-var (
-	tpchTables = []string{
-		"nation", "region", "part", "supplier",
-		"partsupp", "customer", "orders", "lineitem",
-	}
-	tpchTableStatsInjection = []string{
-		`ALTER TABLE region INJECT STATISTICS '[
-				{
-					"columns": ["r_regionkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 5,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["r_name"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 5,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["r_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 5,
-					"distinct_count": 5
-				}
-			]';`,
-		`ALTER TABLE nation INJECT STATISTICS '[
-				{
-					"columns": ["n_nationkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 25,
-					"distinct_count": 25
-				},
-				{
-					"columns": ["n_name"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 25,
-					"distinct_count": 25
-				},
-				{
-					"columns": ["n_regionkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 25,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["n_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 25,
-					"distinct_count": 25
-				}
-			]';`,
-		`ALTER TABLE supplier INJECT STATISTICS '[
-				{
-					"columns": ["s_suppkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["s_name"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["s_address"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["s_nationkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 25
-				},
-				{
-					"columns": ["s_phone"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["s_acctbal"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["s_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				}
-			]';`,
-		`ALTER TABLE public.part INJECT STATISTICS '[
-				{
-					"columns": ["p_partkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 200000
-				},
-				{
-					"columns": ["p_name"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 200000
-				},
-				{
-					"columns": ["p_mfgr"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["p_brand"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 25
-				},
-				{
-					"columns": ["p_type"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 150
-				},
-				{
-					"columns": ["p_size"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 50
-				},
-				{
-					"columns": ["p_container"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 40
-				},
-				{
-					"columns": ["p_retailprice"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 20000
-				},
-				{
-					"columns": ["p_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 130000
-				}
-			]';`,
-		`ALTER TABLE partsupp INJECT STATISTICS '[
-				{
-					"columns": ["ps_partkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 800000,
-					"distinct_count": 200000
-				},
-				{
-					"columns": ["ps_suppkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 800000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["ps_availqty"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 800000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["ps_supplycost"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 800000,
-					"distinct_count": 100000
-				},
-				{
-					"columns": ["ps_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 800000,
-					"distinct_count": 800000
-				}
-			]';`,
-		`ALTER TABLE customer INJECT STATISTICS '[
-				{
-					"columns": ["c_custkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				},
-				{
-					"columns": ["c_name"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				},
-				{
-					"columns": ["c_address"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				},
-				{
-					"columns": ["c_nationkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 25
-				},
-				{
-					"columns": ["c_phone"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				},
-				{
-					"columns": ["c_acctbal"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				},
-				{
-					"columns": ["c_mktsegment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["c_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				}
-			]';`,
-		`ALTER TABLE orders INJECT STATISTICS '[
-				{
-					"columns": ["o_orderkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 1500000
-				},
-				{
-					"columns": ["o_custkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 100000
-				},
-				{
-					"columns": ["o_orderstatus"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 3
-				},
-				{
-					"columns": ["o_totalprice"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 1500000
-				},
-				{
-					"columns": ["o_orderdate"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 2500
-				},
-				{
-					"columns": ["o_orderpriority"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["o_clerk"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 1000
-				},
-				{
-					"columns": ["o_shippriority"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 1
-				},
-				{
-					"columns": ["o_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 1500000
-				}
-			]';`,
-		`ALTER TABLE lineitem INJECT STATISTICS '[
-				{
-					"columns": ["l_orderkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 1500000
-				},
-				{
-					"columns": ["l_partkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 200000
-				},
-				{
-					"columns": ["l_suppkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["l_linenumber"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 7
-				},
-				{
-					"columns": ["l_quantity"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 50
-				},
-				{
-					"columns": ["l_extendedprice"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 1000000
-				},
-				{
-					"columns": ["l_discount"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 11
-				},
-				{
-					"columns": ["l_tax"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 9
-				},
-				{
-					"columns": ["l_returnflag"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 3
-				},
-				{
-					"columns": ["l_linestatus"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 2
-				},
-				{
-					"columns": ["l_shipdate"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 2500
-				},
-				{
-					"columns": ["l_commitdate"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 2500
-				},
-				{
-					"columns": ["l_receiptdate"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 2500
-				},
-				{
-					"columns": ["l_shipinstruct"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 4
-				},
-				{
-					"columns": ["l_shipmode"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 7
-				},
-				{
-					"columns": ["l_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 4500000
-				}
-			]';`,
-	}
-)
+var tpchTables = []string{
+	"nation", "region", "part", "supplier",
+	"partsupp", "customer", "orders", "lineitem",
+}
 
 type tpchVecTestCase interface {
 	// TODO(asubiotto): Getting the queries we want to run given a version should
@@ -479,7 +93,7 @@ type tpchVecTestCase interface {
 	numRunsPerQuery() int
 	// preTestRunHook is called before any tpch query is run. Can be used to
 	// perform setup.
-	preTestRunHook(t *test, conn *gosql.DB)
+	preTestRunHook(t *test, conn *gosql.DB, version crdbVersion)
 	// postQueryRunHook is called after each tpch query is run with the output and
 	// the vectorize mode it was run in.
 	postQueryRunHook(t *test, output []byte, vectorized bool)
@@ -500,10 +114,12 @@ func (r tpchVecTestCaseBase) numRunsPerQuery() int {
 	return 1
 }
 
-func (r tpchVecTestCaseBase) preTestRunHook(t *test, conn *gosql.DB) {
-	t.Status("resetting sql.testing.vectorize.batch_size")
-	if _, err := conn.Exec("RESET CLUSTER SETTING sql.testing.vectorize.batch_size"); err != nil {
-		t.Fatal(err)
+func (r tpchVecTestCaseBase) preTestRunHook(t *test, conn *gosql.DB, version crdbVersion) {
+	if version != tpchVecVersion19_2 {
+		t.Status("resetting sql.testing.vectorize.batch_size")
+		if _, err := conn.Exec("RESET CLUSTER SETTING sql.testing.vectorize.batch_size"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Status("resetting workmem to default")
 	if _, err := conn.Exec("RESET CLUSTER SETTING sql.distsql.temp_storage.workmem"); err != nil {
@@ -619,8 +235,8 @@ type tpchVecDiskTest struct {
 	tpchVecTestCaseBase
 }
 
-func (d tpchVecDiskTest) preTestRunHook(t *test, conn *gosql.DB) {
-	d.tpchVecTestCaseBase.preTestRunHook(t, conn)
+func (d tpchVecDiskTest) preTestRunHook(t *test, conn *gosql.DB, version crdbVersion) {
+	d.tpchVecTestCaseBase.preTestRunHook(t, conn, version)
 	// In order to stress the disk spilling of the vectorized
 	// engine, we will set workmem limit to a random value in range
 	// [16KiB, 256KiB).
@@ -637,8 +253,8 @@ type tpchVecSmallBatchSizeTest struct {
 	tpchVecTestCaseBase
 }
 
-func (b tpchVecSmallBatchSizeTest) preTestRunHook(t *test, conn *gosql.DB) {
-	b.tpchVecTestCaseBase.preTestRunHook(t, conn)
+func (b tpchVecSmallBatchSizeTest) preTestRunHook(t *test, conn *gosql.DB, version crdbVersion) {
+	b.tpchVecTestCaseBase.preTestRunHook(t, conn, version)
 	rng, _ := randutil.NewPseudoRand()
 	batchSize := 1 + rng.Intn(4)
 	t.Status(fmt.Sprintf("setting sql.testing.vectorize.batch_size to %d", batchSize))
@@ -653,30 +269,20 @@ func runTPCHVec(ctx context.Context, t *test, c *cluster, testCase tpchVecTestCa
 	c.Put(ctx, workload, "./workload", firstNode)
 	c.Start(ctx, t)
 
+	conn := c.Conn(ctx, 1)
+	disableAutoStats(t, conn)
 	t.Status("restoring TPCH dataset for Scale Factor 1")
 	if err := loadTPCHDataset(ctx, t, c, 1 /* sf */, newMonitor(ctx, c), c.All()); err != nil {
 		t.Fatal(err)
 	}
 
-	t.Status("scattering the data")
-	conn := c.Conn(ctx, 1)
 	if _, err := conn.Exec("USE tpch;"); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range tpchTables {
-		scatter := fmt.Sprintf("ALTER TABLE %s SCATTER;", table)
-		if _, err := conn.Exec(scatter); err != nil {
-			t.Fatal(err)
-		}
-	}
+	scatterTables(t, conn, tpchTables)
 	t.Status("waiting for full replication")
 	waitForFullReplication(t, conn)
-	t.Status("injecting stats")
-	for _, injectStats := range tpchTableStatsInjection {
-		if _, err := conn.Exec(injectStats); err != nil {
-			t.Fatal(err)
-		}
-	}
+	createStatsFromTables(t, conn, tpchTables)
 	versionString, err := fetchCockroachVersion(ctx, c, c.Node(1)[0])
 	if err != nil {
 		t.Fatal(err)
@@ -687,7 +293,7 @@ func runTPCHVec(ctx context.Context, t *test, c *cluster, testCase tpchVecTestCa
 	}
 	queriesToSkip := queriesToSkipByVersion[version]
 
-	testCase.preTestRunHook(t, conn)
+	testCase.preTestRunHook(t, conn, version)
 
 	for queryNum := 1; queryNum <= tpchVecNumQueries; queryNum++ {
 		for _, vectorize := range testCase.vectorizeOptions() {

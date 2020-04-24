@@ -67,26 +67,6 @@ const Version execinfrapb.DistSQLVersion = 28
 // compatible with; see above.
 const MinAcceptedVersion execinfrapb.DistSQLVersion = 27
 
-// SettingUseTempStorageJoins is a cluster setting that configures whether
-// joins are allowed to spill to disk.
-// TODO(yuzefovich): remove this setting.
-var SettingUseTempStorageJoins = settings.RegisterPublicBoolSetting(
-	"sql.distsql.temp_storage.joins",
-	"set to true to enable use of disk for distributed sql joins. "+
-		"Note that disabling this can have negative impact on memory usage and performance.",
-	true,
-)
-
-// SettingUseTempStorageSorts is a cluster setting that configures whether
-// sorts are allowed to spill to disk.
-// TODO(yuzefovich): remove this setting.
-var SettingUseTempStorageSorts = settings.RegisterPublicBoolSetting(
-	"sql.distsql.temp_storage.sorts",
-	"set to true to enable use of disk for distributed sql sorts. "+
-		"Note that disabling this can have negative impact on memory usage and performance.",
-	true,
-)
-
 // SettingWorkMemBytes is a cluster setting that determines the maximum amount
 // of RAM that a processor can use.
 var SettingWorkMemBytes = settings.RegisterByteSizeSetting(
@@ -110,11 +90,6 @@ type ServerConfig struct {
 	// whereas this one isn't.
 	Executor sqlutil.InternalExecutor
 
-	// FlowDB is the DB that flows should use for interacting with the database.
-	// This DB has to be set such that it bypasses the local TxnCoordSender. We
-	// want only the TxnCoordSender on the gateway to be involved with requests
-	// performed by DistSQL.
-	FlowDB       *kv.DB
 	RPCContext   *rpc.Context
 	Stopper      *stop.Stopper
 	TestingKnobs TestingKnobs

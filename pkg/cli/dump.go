@@ -720,9 +720,15 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 					case types.TimeTZFamily:
 						d = tree.NewDTimeTZFromTime(t)
 					case types.TimestampFamily:
-						d = tree.MakeDTimestamp(t, time.Nanosecond)
+						d, err = tree.MakeDTimestamp(t, time.Nanosecond)
+						if err != nil {
+							return err
+						}
 					case types.TimestampTZFamily:
-						d = tree.MakeDTimestampTZ(t, time.Nanosecond)
+						d, err = tree.MakeDTimestampTZ(t, time.Nanosecond)
+						if err != nil {
+							return err
+						}
 					default:
 						return errors.Errorf("unknown timestamp type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]])
 					}
@@ -758,7 +764,7 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 }
 
 func writeInserts(w io.Writer, tmd tableMetadata, inserts []string) {
-	fmt.Fprintf(w, "\nINSERT INTO %s (%s) VALUES", &tmd.name.TableName, tmd.columnNames)
+	fmt.Fprintf(w, "\nINSERT INTO %s (%s) VALUES", &tmd.name.ObjectName, tmd.columnNames)
 	for idx, values := range inserts {
 		if idx > 0 {
 			fmt.Fprint(w, ",")

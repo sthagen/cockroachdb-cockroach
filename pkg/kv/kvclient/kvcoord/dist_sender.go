@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/pkg/errors"
@@ -98,6 +100,12 @@ var (
 		Measurement: "Range Lookups",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaDistSenderSlowRPCs = metric.Metadata{
+		Name:        "requests.slow.distsender",
+		Help:        "Number of RPCs stuck or retrying for a long time",
+		Measurement: "Requests",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // CanSendToFollower is used by the DistSender to determine if it needs to look
@@ -148,6 +156,7 @@ type DistSenderMetrics struct {
 	NotLeaseHolderErrCount  *metric.Counter
 	InLeaseTransferBackoffs *metric.Counter
 	RangeLookups            *metric.Counter
+	SlowRPCs                *metric.Gauge
 }
 
 func makeDistSenderMetrics() DistSenderMetrics {
@@ -162,6 +171,7 @@ func makeDistSenderMetrics() DistSenderMetrics {
 		NotLeaseHolderErrCount:  metric.NewCounter(metaDistSenderNotLeaseHolderErrCount),
 		InLeaseTransferBackoffs: metric.NewCounter(metaDistSenderInLeaseTransferBackoffsCount),
 		RangeLookups:            metric.NewCounter(metaDistSenderRangeLookups),
+		SlowRPCs:                metric.NewGauge(metaDistSenderSlowRPCs),
 	}
 }
 
@@ -1333,6 +1343,16 @@ func (ds *DistSender) sendPartialBatchAsync(
 	return true
 }
 
+func slowRangeRPCWarningStr(
+	dur time.Duration, attempts int64, desc *roachpb.RangeDescriptor, pErr *roachpb.Error,
+) string {
+	return fmt.Sprintf("have been waiting %.2fs (%d attempts) for RPC to %s: %s", dur.Seconds(), attempts, desc, pErr)
+}
+
+func slowRangeRPCReturnWarningStr(dur time.Duration, attempts int64) string {
+	return fmt.Sprintf("slow RPC finished after %.2fs (%d attempts)", dur.Seconds(), attempts)
+}
+
 // sendPartialBatch sends the supplied batch to the range specified by
 // desc. The batch request is first truncated so that it contains only
 // requests which intersect the range descriptor and keys for each
@@ -1385,7 +1405,9 @@ func (ds *DistSender) sendPartialBatch(
 	}
 
 	// Start a retry loop for sending the batch to the range.
+	tBegin, attempts := timeutil.Now(), int64(0) // for slow log message
 	for r := retry.StartWithCtx(ctx, ds.rpcRetryOptions); r.Next(); {
+		attempts++
 		// If we've cleared the descriptor on a send failure, re-lookup.
 		if desc == nil {
 			var descKey roachpb.RKey
@@ -1417,6 +1439,17 @@ func (ds *DistSender) sendPartialBatch(
 			pErr.Index.Index = int32(positions[pErr.Index.Index])
 		}
 
+		const slowDistSenderThreshold = time.Minute
+		if dur := timeutil.Since(tBegin); dur > slowDistSenderThreshold && !tBegin.IsZero() {
+			ds.metrics.SlowRPCs.Inc(1)
+			dur := dur // leak dur to heap only when branch taken
+			log.Warning(ctx, slowRangeRPCWarningStr(dur, attempts, desc, pErr))
+			defer func(tBegin time.Time, attempts int64) {
+				ds.metrics.SlowRPCs.Dec(1)
+				log.Warning(ctx, slowRangeRPCReturnWarningStr(timeutil.Since(tBegin), attempts))
+			}(tBegin, attempts)
+			tBegin = time.Time{} // prevent reentering branch for this RPC
+		}
 		log.VErrEventf(ctx, 2, "reply error %s: %s", ba, pErr)
 
 		// Error handling: If the error indicates that our range
@@ -1429,10 +1462,11 @@ func (ds *DistSender) sendPartialBatch(
 		// to our caller.
 		switch tErr := pErr.GetDetail().(type) {
 		case *roachpb.SendError:
-			// We've tried all the replicas without success. Either
-			// they're all down, or we're using an out-of-date range
-			// descriptor. Invalidate the cache and try again with the new
-			// metadata.
+			// We've tried all the replicas without success. Either they're all down,
+			// or we're using an out-of-date range descriptor. Invalidate the cache
+			// and try again with the new metadata. Re-sending the request is ok even
+			// though it might have succeeded the first time around because of
+			// idempotency.
 			log.VEventf(ctx, 1, "evicting range descriptor on %T and backoff for re-lookup: %+v", tErr, desc)
 			if err := evictToken.Evict(ctx); err != nil {
 				return response{pErr: roachpb.NewError(err)}
@@ -1650,17 +1684,53 @@ func (ds *DistSender) sendToReplicas(
 	var ambiguousError error
 	for {
 		if err != nil {
-			// For most connection errors, we cannot tell whether or not
-			// the request may have succeeded on the remote server, so we
-			// set the ambiguous commit flag (exceptions are captured in
-			// the grpcutil.RequestDidNotStart function).
+			// For most connection errors, we cannot tell whether or not the request
+			// may have succeeded on the remote server (exceptions are captured in the
+			// grpcutil.RequestDidNotStart function). We'll retry the request in order
+			// to attempt to eliminate the ambiguity; see below. If there's a commit
+			// in the batch, we track the ambiguity more explicitly by setting
+			// ambiguousError. This serves two purposes:
+			// 1) the higher-level retries in the DistSender will not forget the
+			// ambiguity, like they forget it for non-commit batches. This in turn
+			// will ensure that TxnCoordSender-level retries don't happen across
+			// commits; that'd be bad since requests are not idempotent across
+			// commits.
+			// TODO(andrei): This higher-level does things too bluntly, retrying only
+			// in case of SendError. It should also retry in case of
+			// AmbiguousRetryError as long as it makes sure to not forget about the
+			// ambiguity.
+			// 2) SQL recognizes AmbiguousResultErrors and gives them a special code
+			// (StatementCompletionUnknown).
+			// TODO(andrei): The use of this code is inconsistent because a) the
+			// DistSender tries to only return the code for commits, but it'll happily
+			// forward along AmbiguousResultErrors coming from the replica and b) we
+			// probably should be returning that code for non-commit statements too.
 			//
-			// We retry ambiguous commit batches to avoid returning the
-			// unrecoverable AmbiguousResultError. This is safe because
-			// repeating an already-successfully applied batch is
-			// guaranteed to return an error. If the original attempt merely timed out
-			// or was lost, then the batch will succeed and we can be assured the
-			// commit was applied just once.
+			// We retry requests in order to avoid returning errors (in particular,
+			// AmbiguousResultError). Retrying the batch will either:
+			// a) succeed if the request had not been evaluated the first time.
+			// b) succeed if the request also succeeded the first time, but is
+			//    idempotent (i.e. it is internal to a txn, without a commit in the
+			//    batch).
+			// c) fail if it succeeded the first time and the request is not
+			//    idempotent. In the case of EndTxn requests, this is ensured by the
+			//    tombstone keys in the timestamp cache. The retry failing does not
+			//    prove that the request did not succeed the first time around, so we
+			//    can't claim success (and even if we could claim success, we still
+			//    wouldn't have the complete result of the successful evaluation).
+			//
+			// Case a) is great - the retry made the request succeed. Case b) is also
+			// good; due to idempotency we managed to swallow a communication error.
+			// Case c) is not great - we'll end up returning an error even though the
+			// request might have succeeded (an AmbiguousResultError if withCommit is
+			// set).
+			//
+			// TODO(andrei): Case c) is broken for non-transactional requests: nothing
+			// prevents them from double evaluation. This can result in, for example,
+			// an increment applying twice, or more subtle problems like a blind write
+			// evaluating twice, overwriting another unrelated write that fell
+			// in-between.
+			//
 			if withCommit && !grpcutil.RequestDidNotStart(err) {
 				ambiguousError = err
 			}

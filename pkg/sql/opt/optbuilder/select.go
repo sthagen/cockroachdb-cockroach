@@ -106,7 +106,7 @@ func (b *Builder) buildDataSource(
 		}
 
 		priv := privilege.SELECT
-		locking = locking.filter(tn.TableName)
+		locking = locking.filter(tn.ObjectName)
 		if locking.isSet() {
 			// SELECT ... FOR [KEY] UPDATE/SHARE requires UPDATE privileges.
 			priv = privilege.UPDATE
@@ -728,6 +728,7 @@ func (b *Builder) buildCTEs(with *tree.With, inScope *scope) (outScope *scope) {
 			expr:         cteExpr,
 			bindingProps: cteExpr.Relational(),
 			id:           id,
+			mtr:          cte.Mtr,
 		}
 		cte := &addedCTEs[i]
 		outScope.ctes[cte.name.Alias.String()] = cte
@@ -782,6 +783,7 @@ func (b *Builder) flushCTEs(expr memo.RelExpr) memo.RelExpr {
 			&memo.WithPrivate{
 				ID:           ctes[i].id,
 				Name:         string(ctes[i].name.Alias),
+				Mtr:          ctes[i].mtr,
 				OriginalExpr: ctes[i].originalExpr,
 			},
 		)
@@ -1291,7 +1293,7 @@ func (b *Builder) validateLockingInFrom(
 			// columns to be small enough that doing so is likely not worth it.
 			found := false
 			for _, col := range fromScope.cols {
-				if target.TableName == col.table.TableName {
+				if target.ObjectName == col.table.ObjectName {
 					found = true
 					break
 				}
@@ -1300,7 +1302,7 @@ func (b *Builder) validateLockingInFrom(
 				panic(pgerror.Newf(
 					pgcode.UndefinedTable,
 					"relation %q in %s clause not found in FROM clause",
-					target.TableName, li.Strength,
+					target.ObjectName, li.Strength,
 				))
 			}
 		}

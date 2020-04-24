@@ -53,10 +53,10 @@ func (pg *Error) SafeDetails() []string {
 func FullError(err error) string {
 	var errString string
 	if pqErr, ok := err.(*pq.Error); ok {
-		errString = formatMsgHintDetail("pq: ", pqErr.Message, pqErr.Hint, pqErr.Detail)
+		errString = formatMsgHintDetail("pq", pqErr.Message, pqErr.Hint, pqErr.Detail)
 	} else {
 		pg := Flatten(err)
-		errString = formatMsgHintDetail("", err.Error(), pg.Hint, pg.Detail)
+		errString = formatMsgHintDetail(pg.Severity, err.Error(), pg.Hint, pg.Detail)
 	}
 	return errString
 }
@@ -64,6 +64,7 @@ func FullError(err error) string {
 func formatMsgHintDetail(prefix, msg, hint, detail string) string {
 	var b strings.Builder
 	b.WriteString(prefix)
+	b.WriteString(": ")
 	b.WriteString(msg)
 	if hint != "" {
 		b.WriteString("\nHINT: ")
@@ -98,13 +99,6 @@ func Newf(code string, format string, args ...interface{}) error {
 	return err
 }
 
-// Noticef generates a Notice with a format string.
-func Noticef(format string, args ...interface{}) error {
-	err := errors.NewWithDepthf(1, format, args...)
-	err = WithCandidateCode(err, pgcode.SuccessfulCompletion)
-	return err
-}
-
 // DangerousStatementf creates a new error for "rejected dangerous
 // statements".
 func DangerousStatementf(format string, args ...interface{}) error {
@@ -124,6 +118,14 @@ func WrongNumberOfPreparedStatements(n int) error {
 	err := errors.NewWithDepthf(1, "prepared statement had %d statements, expected 1", errors.Safe(n))
 	err = WithCandidateCode(err, pgcode.InvalidPreparedStatementDefinition)
 	return err
+}
+
+// UnsupportedWithMultiTenancy returns an error suitable for returning when an
+// operation could not be carried out due to the SQL server running in
+// multi-tenancy mode. In that mode, Gossip and other components of the KV layer
+// are not available.
+func UnsupportedWithMultiTenancy() error {
+	return New(pgcode.Internal, "operation is unsupported in multi-tenancy mode")
 }
 
 var _ fmt.Formatter = &Error{}

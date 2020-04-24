@@ -496,6 +496,15 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			f.formatMutationCommon(tp, &t.MutationPrivate)
 		}
 
+	case *WithExpr:
+		if t.Mtr.Set {
+			if t.Mtr.Materialize {
+				tp.Child("materialized")
+			} else {
+				tp.Child("not-materialized")
+			}
+		}
+
 	case *WithScanExpr:
 		if !f.HasFlags(ExprFmtHideColumns) {
 			child := tp.Child("mapping:")
@@ -926,7 +935,7 @@ func (f *ExprFmtCtx) formatScalarPrivate(scalar opt.ScalarExpr) {
 		//
 		// TODO(radu): maybe flip these if we are deleting from the parent (i.e.
 		// FKOutbound=false)?
-		fmt.Fprintf(f.Buffer, ": %s(", origin.Alias.TableName)
+		fmt.Fprintf(f.Buffer, ": %s(", origin.Alias.ObjectName)
 		for i := 0; i < fk.ColumnCount(); i++ {
 			if i > 0 {
 				f.Buffer.WriteByte(',')
@@ -934,7 +943,7 @@ func (f *ExprFmtCtx) formatScalarPrivate(scalar opt.ScalarExpr) {
 			col := origin.Table.Column(fk.OriginColumnOrdinal(origin.Table, i))
 			f.Buffer.WriteString(string(col.ColName()))
 		}
-		fmt.Fprintf(f.Buffer, ") -> %s(", referenced.Alias.TableName)
+		fmt.Fprintf(f.Buffer, ") -> %s(", referenced.Alias.ObjectName)
 		for i := 0; i < fk.ColumnCount(); i++ {
 			if i > 0 {
 				f.Buffer.WriteByte(',')

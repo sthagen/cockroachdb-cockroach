@@ -14,6 +14,7 @@ import { Moment } from "moment";
 import React from "react";
 import { createSelector } from "reselect";
 import { ExpandableConfig, SortableColumn, SortableTable, SortSetting } from "src/views/shared/components/sortabletable";
+import { IEmptyProps } from "oss/src/components/empty";
 
 export interface ISortedTablePagination {
   current: number;
@@ -80,6 +81,11 @@ interface SortedTableProps<T> {
   firstCellBordered?: boolean;
   renderNoResult?: React.ReactNode;
   pagination?: ISortedTablePagination;
+  loading?: boolean;
+  loadingLabel?: string;
+  // empty state for table
+  empty?: boolean;
+  emptyProps?: IEmptyProps;
 }
 
 interface SortedTableState {
@@ -210,7 +216,7 @@ export class SortedTable<T> extends React.Component<SortedTableProps<T>, SortedT
   }
 
   render() {
-    const { data, sortSetting, onChangeSortSetting, firstCellBordered, renderNoResult } = this.props;
+    const { data, loading, sortSetting, onChangeSortSetting, firstCellBordered, renderNoResult, loadingLabel, empty, emptyProps } = this.props;
     let expandableConfig: ExpandableConfig = null;
     if (this.props.expandableConfig) {
       expandableConfig = {
@@ -219,22 +225,23 @@ export class SortedTable<T> extends React.Component<SortedTableProps<T>, SortedT
         onChangeExpansion: this.onChangeExpansion,
       };
     }
-    if (data) {
-      return (
-        <SortableTable
-          count={this.paginatedData().length}
-          sortSetting={sortSetting}
-          onChangeSortSetting={onChangeSortSetting}
-          columns={this.columns(this.props)}
-          rowClass={this.rowClass(this.props)}
-          className={this.props.className}
-          expandableConfig={expandableConfig}
-          drawer={this.props.drawer}
-          firstCellBordered={firstCellBordered}
-          renderNoResult={renderNoResult}
-        />
-      );
-    }
-    return <div>No results.</div>;
+    return (
+      <SortableTable
+        count={data ? this.paginatedData().length : 0}
+        sortSetting={sortSetting}
+        onChangeSortSetting={onChangeSortSetting}
+        columns={this.columns(this.props)}
+        rowClass={this.rowClass(this.props)}
+        className={this.props.className}
+        expandableConfig={expandableConfig}
+        drawer={this.props.drawer}
+        firstCellBordered={firstCellBordered}
+        renderNoResult={renderNoResult}
+        loading={loading}
+        loadingLabel={loadingLabel}
+        empty={empty}
+        emptyProps={emptyProps}
+      />
+    );
   }
 }

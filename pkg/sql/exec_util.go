@@ -42,10 +42,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -563,20 +565,24 @@ type ExecutorConfig struct {
 	LeaseManager      *LeaseManager
 	Clock             *hlc.Clock
 	DistSQLSrv        *distsql.ServerImpl
-	StatusServer      serverpb.StatusServer
-	MetricsRecorder   nodeStatusGenerator
-	SessionRegistry   *SessionRegistry
-	JobRegistry       *jobs.Registry
-	VirtualSchemas    *VirtualSchemaHolder
-	DistSQLPlanner    *DistSQLPlanner
-	TableStatsCache   *stats.TableStatisticsCache
-	StatsRefresher    *stats.Refresher
-	ExecLogger        *log.SecondaryLogger
-	AuditLogger       *log.SecondaryLogger
-	SlowQueryLogger   *log.SecondaryLogger
-	AuthLogger        *log.SecondaryLogger
-	InternalExecutor  *InternalExecutor
-	QueryCache        *querycache.C
+	// StatusServer gives access to the Status service.
+	//
+	// In a SQL tenant server, this is not available (returning false) and
+	// pgerror.UnsupportedWithMultiTenancy should be returned.
+	StatusServer     func() (serverpb.StatusServer, bool)
+	MetricsRecorder  nodeStatusGenerator
+	SessionRegistry  *SessionRegistry
+	JobRegistry      *jobs.Registry
+	VirtualSchemas   *VirtualSchemaHolder
+	DistSQLPlanner   *DistSQLPlanner
+	TableStatsCache  *stats.TableStatisticsCache
+	StatsRefresher   *stats.Refresher
+	ExecLogger       *log.SecondaryLogger
+	AuditLogger      *log.SecondaryLogger
+	SlowQueryLogger  *log.SecondaryLogger
+	AuthLogger       *log.SecondaryLogger
+	InternalExecutor *InternalExecutor
+	QueryCache       *querycache.C
 
 	TestingKnobs              ExecutorTestingKnobs
 	PGWireTestingKnobs        *PGWireTestingKnobs
@@ -821,7 +827,7 @@ func shouldDistributePlan(
 // TODO: This does not support arguments of the SQL 'Date' type, as there is not
 // an equivalent type in Go's standard library. It's not currently needed by any
 // of our internal tables.
-func golangFillQueryArguments(args ...interface{}) tree.Datums {
+func golangFillQueryArguments(args ...interface{}) (tree.Datums, error) {
 	res := make(tree.Datums, len(args))
 	for i, arg := range args {
 		if arg == nil {
@@ -837,7 +843,11 @@ func golangFillQueryArguments(args ...interface{}) tree.Datums {
 		case tree.Datum:
 			d = t
 		case time.Time:
-			d = tree.MakeDTimestamp(t, time.Microsecond)
+			var err error
+			d, err = tree.MakeDTimestamp(t, time.Microsecond)
+			if err != nil {
+				return nil, err
+			}
 		case time.Duration:
 			d = &tree.DInterval{Duration: duration.MakeDuration(t.Nanoseconds(), 0, 0)}
 		case bitarray.BitArray:
@@ -877,7 +887,7 @@ func golangFillQueryArguments(args ...interface{}) tree.Datums {
 		}
 		res[i] = d
 	}
-	return res
+	return res, nil
 }
 
 // checkResultType verifies that a table result can be returned to the
@@ -1640,10 +1650,15 @@ func generateSessionTraceVTable(spans []tracing.RecordedSpan) ([]traceRow, error
 			return nil, fmt.Errorf("unable to split trace message: %q", lrr.msg)
 		}
 
+		tsDatum, err := tree.MakeDTimestampTZ(lrr.timestamp, time.Nanosecond)
+		if err != nil {
+			return nil, err
+		}
+
 		row := traceRow{
-			tree.NewDInt(tree.DInt(lrr.span.index)),               // span_idx
-			tree.NewDInt(tree.DInt(lrr.index)),                    // message_idx
-			tree.MakeDTimestampTZ(lrr.timestamp, time.Nanosecond), // timestamp
+			tree.NewDInt(tree.DInt(lrr.span.index)), // span_idx
+			tree.NewDInt(tree.DInt(lrr.index)),      // message_idx
+			tsDatum,                                 // timestamp
 			tree.DNull,                              // duration, will be populated below
 			tree.DNull,                              // operation, will be populated below
 			tree.NewDString(lrr.msg[loc[2]:loc[3]]), // location
@@ -1849,7 +1864,7 @@ func (m *sessionDataMutator) SetApplicationName(appName string) {
 	m.paramStatusUpdater.AppendParamStatusUpdate("application_name", appName)
 }
 
-func (m *sessionDataMutator) SetBytesEncodeFormat(val sessiondata.BytesEncodeFormat) {
+func (m *sessionDataMutator) SetBytesEncodeFormat(val lex.BytesEncodeFormat) {
 	m.data.DataConversion.BytesEncodeFormat = val
 }
 
@@ -1963,6 +1978,11 @@ func (m *sessionDataMutator) SetHashShardedIndexesEnabled(val bool) {
 // a sequence.
 func (m *sessionDataMutator) RecordLatestSequenceVal(seqID uint32, val int64) {
 	m.data.SequenceState.RecordValue(seqID, val)
+}
+
+// SetNoticeDisplaySeverity sets the NoticeDisplaySeverity for the given session.
+func (m *sessionDataMutator) SetNoticeDisplaySeverity(severity pgnotice.DisplaySeverity) {
+	m.data.NoticeDisplaySeverity = severity
 }
 
 type sqlStatsCollector struct {

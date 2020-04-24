@@ -16,11 +16,14 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -38,6 +41,8 @@ type routerOutput interface {
 	addBatch(context.Context, coldata.Batch, []int) bool
 	// cancel tells the output to stop producing batches.
 	cancel(ctx context.Context)
+	// drain drains the output of any metadata.
+	drain() []execinfrapb.ProducerMetadata
 }
 
 // getDefaultRouterOutputBlockedThreshold returns the number of unread values
@@ -49,11 +54,24 @@ func getDefaultRouterOutputBlockedThreshold() int {
 	return coldata.BatchSize() * 2
 }
 
+type routerOutputOpState int
+
+const (
+	// routerOutputOpRunning is the state in which routerOutputOp operates
+	// normally. The router output transitions into the draining state when
+	// either it is finished (when a zero-length batch was added or when it was
+	// canceled) or it encounters an error.
+	routerOutputOpRunning routerOutputOpState = iota
+	// routerOutputOpDraining is the state in which routerOutputOp always
+	// returns zero-length batches on calls to Next.
+	routerOutputOpDraining
+)
+
 type routerOutputOp struct {
 	// input is a reference to our router.
 	input execinfra.OpNode
 
-	types []coltypes.T
+	types []types.T
 
 	// unblockedEventsChan is signaled when a routerOutput changes state from
 	// blocked to unblocked.
@@ -61,6 +79,7 @@ type routerOutputOp struct {
 
 	mu struct {
 		syncutil.Mutex
+		state routerOutputOpState
 		// unlimitedAllocator tracks the memory usage of this router output,
 		// providing a signal for when it should spill to disk.
 		// The memory lifecycle is as follows:
@@ -90,9 +109,8 @@ type routerOutputOp struct {
 		// In short, batches whose references are retained are also retained in the
 		// allocator, but if any references are overwritten or lost, those batches
 		// are released.
-		unlimitedAllocator *Allocator
+		unlimitedAllocator *colmem.Allocator
 		cond               *sync.Cond
-		done               bool
 		// pendingBatch is a partially-filled batch with data added through
 		// addBatch. Once this batch reaches capacity, it is flushed to data. The
 		// main use of pendingBatch is coalescing various fragmented batches into
@@ -102,6 +120,17 @@ type routerOutputOp struct {
 		data      *spillingQueue
 		numUnread int
 		blocked   bool
+
+		drainState struct {
+			// err stores any error (if such occurs) when dequeueing from data
+			// (one possible error could be hitting disk usage limit). Once
+			// such error occurs, the output transitions into draining state.
+			// The error, however, will not be propagated right away - in order to
+			// prevent double reporting of the error by the hash router, it will be
+			// returned either on the next call to addBatch (if such occurs) or
+			// during draining of the router output.
+			err error
+		}
 	}
 
 	testingKnobs struct {
@@ -126,12 +155,12 @@ func (o *routerOutputOp) Child(nth int, verbose bool) execinfra.OpNode {
 	if nth == 0 {
 		return o.input
 	}
-	execerror.VectorizedInternalPanic(fmt.Sprintf("invalid index %d", nth))
+	colexecerror.InternalError(fmt.Sprintf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }
 
-var _ Operator = &routerOutputOp{}
+var _ colexecbase.Operator = &routerOutputOp{}
 
 // newRouterOutputOp creates a new router output. The caller must ensure that
 // unblockedEventsChan is a buffered channel, as the router output will write to
@@ -139,8 +168,8 @@ var _ Operator = &routerOutputOp{}
 // memoryLimit will act as a soft limit to allow the router output to use disk
 // when it is exceeded.
 func newRouterOutputOp(
-	unlimitedAllocator *Allocator,
-	types []coltypes.T,
+	unlimitedAllocator *colmem.Allocator,
+	types []types.T,
 	unblockedEventsChan chan<- struct{},
 	memoryLimit int64,
 	cfg colcontainer.DiskQueueCfg,
@@ -151,8 +180,8 @@ func newRouterOutputOp(
 }
 
 func newRouterOutputOpWithBlockedThresholdAndBatchSize(
-	unlimitedAllocator *Allocator,
-	types []coltypes.T,
+	unlimitedAllocator *colmem.Allocator,
+	types []types.T,
 	unblockedEventsChan chan<- struct{},
 	memoryLimit int64,
 	cfg colcontainer.DiskQueueCfg,
@@ -182,14 +211,11 @@ func (o *routerOutputOp) Init() {}
 func (o *routerOutputOp) Next(ctx context.Context) coldata.Batch {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.mu.done {
-		return coldata.ZeroBatch
-	}
-	for o.mu.pendingBatch == nil && o.mu.data.empty() && !o.mu.done {
+	for o.mu.state == routerOutputOpRunning && o.mu.pendingBatch == nil && o.mu.data.empty() {
 		// Wait until there is data to read or the output is canceled.
 		o.mu.cond.Wait()
 	}
-	if o.mu.done {
+	if o.mu.state == routerOutputOpDraining {
 		return coldata.ZeroBatch
 	}
 	var b coldata.Batch
@@ -201,10 +227,10 @@ func (o *routerOutputOp) Next(ctx context.Context) coldata.Batch {
 		o.mu.unlimitedAllocator.ReleaseBatch(b)
 		o.mu.pendingBatch = nil
 	} else {
-		var err error
-		b, err = o.mu.data.dequeue(ctx)
-		if err != nil {
-			execerror.VectorizedInternalPanic(err)
+		b, o.mu.drainState.err = o.mu.data.dequeue(ctx)
+		if o.mu.drainState.err != nil {
+			o.mu.state = routerOutputOpDraining
+			return coldata.ZeroBatch
 		}
 	}
 	o.mu.numUnread -= b.Length()
@@ -221,7 +247,7 @@ func (o *routerOutputOp) Next(ctx context.Context) coldata.Batch {
 }
 
 func (o *routerOutputOp) closeLocked(ctx context.Context) {
-	o.mu.done = true
+	o.mu.state = routerOutputOpDraining
 	if err := o.mu.data.close(ctx); err != nil {
 		// This log message is Info instead of Warning because the flow will also
 		// attempt to clean up the parent directory, so this failure might not have
@@ -262,10 +288,20 @@ func (o *routerOutputOp) addBatch(ctx context.Context, batch coldata.Batch, sele
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.mu.state == routerOutputOpDraining {
+		// We have encountered an error in Next() but have not yet propagated
+		// it, so we do so now - the error will get to the hash router which
+		// will cancel all of its outputs.
+		err := o.mu.drainState.err
+		// We set the error to nil so that it is not propagated again, during
+		// drain() call.
+		o.mu.drainState.err = nil
+		colexecerror.InternalError(err)
+	}
 	if batch.Length() == 0 {
 		if o.mu.pendingBatch != nil {
 			if err := o.mu.data.enqueue(ctx, o.mu.pendingBatch); err != nil {
-				execerror.VectorizedInternalPanic(err)
+				colexecerror.InternalError(err)
 			}
 		}
 		o.mu.pendingBatch = coldata.ZeroBatch
@@ -296,7 +332,7 @@ func (o *routerOutputOp) addBatch(ctx context.Context, batch coldata.Batch, sele
 				o.mu.pendingBatch.ColVec(i).Copy(
 					coldata.CopySliceArgs{
 						SliceArgs: coldata.SliceArgs{
-							ColType:   t,
+							ColType:   typeconv.FromColumnType(&t),
 							Src:       batch.ColVec(i),
 							Sel:       selection[:numAppended],
 							DestIdx:   o.mu.pendingBatch.Length(),
@@ -311,7 +347,7 @@ func (o *routerOutputOp) addBatch(ctx context.Context, batch coldata.Batch, sele
 		if o.testingKnobs.alwaysFlush || newLength >= o.outputBatchSize {
 			// The capacity in o.mu.pendingBatch has been filled.
 			if err := o.mu.data.enqueue(ctx, o.mu.pendingBatch); err != nil {
-				execerror.VectorizedInternalPanic(err)
+				colexecerror.InternalError(err)
 			}
 			o.mu.pendingBatch = nil
 		}
@@ -339,11 +375,23 @@ func (o *routerOutputOp) maybeUnblockLocked() {
 	}
 }
 
+func (o *routerOutputOp) drain() []execinfrapb.ProducerMetadata {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.mu.drainState.err != nil {
+		err := o.mu.drainState.err
+		o.mu.drainState.err = nil
+		return []execinfrapb.ProducerMetadata{{Err: err}}
+	}
+	return nil
+}
+
 // reset resets the routerOutputOp for a benchmark run.
 func (o *routerOutputOp) reset(ctx context.Context) {
 	o.mu.Lock()
-	o.mu.done = false
+	o.mu.state = routerOutputOpRunning
 	o.mu.data.reset(ctx)
+	o.mu.drainState.err = nil
 	o.mu.numUnread = 0
 	o.mu.blocked = false
 	o.mu.Unlock()
@@ -355,7 +403,7 @@ func (o *routerOutputOp) reset(ctx context.Context) {
 type HashRouter struct {
 	OneInputNode
 	// types are the input coltypes.
-	types []coltypes.T
+	types []types.T
 	// hashCols is a slice of indices of the columns used for hashing.
 	hashCols []uint32
 
@@ -389,20 +437,20 @@ type HashRouter struct {
 // be called concurrently between different outputs. Similarly, each output
 // needs to have a separate disk account.
 func NewHashRouter(
-	unlimitedAllocators []*Allocator,
-	input Operator,
-	types []coltypes.T,
+	unlimitedAllocators []*colmem.Allocator,
+	input colexecbase.Operator,
+	types []types.T,
 	hashCols []uint32,
 	memoryLimit int64,
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
 	diskAccounts []*mon.BoundAccount,
-) (*HashRouter, []Operator) {
+) (*HashRouter, []colexecbase.Operator) {
 	if diskQueueCfg.CacheMode != colcontainer.DiskQueueCacheModeDefault {
-		execerror.VectorizedInternalPanic(errors.Errorf("hash router instantiated with incompatible disk queue cache mode: %d", diskQueueCfg.CacheMode))
+		colexecerror.InternalError(errors.Errorf("hash router instantiated with incompatible disk queue cache mode: %d", diskQueueCfg.CacheMode))
 	}
 	outputs := make([]routerOutput, len(unlimitedAllocators))
-	outputsAsOps := make([]Operator, len(unlimitedAllocators))
+	outputsAsOps := make([]colexecbase.Operator, len(unlimitedAllocators))
 	// unblockEventsChan is buffered to 2*numOutputs as we don't want the outputs
 	// writing to it to block.
 	// Unblock events only happen after a corresponding block event. Since these
@@ -425,8 +473,8 @@ func NewHashRouter(
 }
 
 func newHashRouterWithOutputs(
-	input Operator,
-	types []coltypes.T,
+	input colexecbase.Operator,
+	types []types.T,
 	hashCols []uint32,
 	unblockEventsChan <-chan struct{},
 	outputs []routerOutput,
@@ -446,62 +494,82 @@ func newHashRouterWithOutputs(
 // output calculated by hashing columns. Cancel the given context to terminate
 // early.
 func (r *HashRouter) Run(ctx context.Context) {
-	r.input.Init()
-	cancelOutputs := func(err error) {
-		if err != nil {
-			r.mu.Lock()
-			r.mu.bufferedMeta = append(r.mu.bufferedMeta, execinfrapb.ProducerMetadata{Err: err})
-			r.mu.Unlock()
-		}
-		for _, o := range r.outputs {
-			o.cancel(ctx)
-		}
+	bufferErr := func(err error) {
+		r.mu.Lock()
+		r.mu.bufferedMeta = append(r.mu.bufferedMeta, execinfrapb.ProducerMetadata{Err: err})
+		r.mu.Unlock()
 	}
-	var done bool
-	processNextBatch := func() {
-		done = r.processNextBatch(ctx)
-	}
-	for {
-		// Check for cancellation.
-		select {
-		case <-ctx.Done():
-			cancelOutputs(ctx.Err())
-			return
-		default:
-		}
-
-		// Read all the routerOutput state changes that have happened since the
-		// last iteration.
-		for moreToRead := true; moreToRead; {
-			select {
-			case <-r.unblockedEventsChan:
-				r.numBlockedOutputs--
-			default:
-				// No more routerOutput state changes to read without blocking.
-				moreToRead = false
+	// Since HashRouter runs in a separate goroutine, we want to be safe and
+	// make sure that we catch errors in all code paths, so we wrap the whole
+	// method with a catcher. Note that we also have "internal" catchers as
+	// well for more fine-grained control of error propagation.
+	if err := colexecerror.CatchVectorizedRuntimeError(func() {
+		r.input.Init()
+		// cancelOutputs buffers non-nil error as metadata, cancels all of the
+		// outputs additionally buffering any error if such occurs during the
+		// outputs' cancellation as metadata as well. Note that it attempts to
+		// cancel every output regardless of whether "previous" output's
+		// cancellation succeeds.
+		cancelOutputs := func(err error) {
+			if err != nil {
+				bufferErr(err)
+			}
+			for _, o := range r.outputs {
+				if err := colexecerror.CatchVectorizedRuntimeError(func() {
+					o.cancel(ctx)
+				}); err != nil {
+					bufferErr(err)
+				}
 			}
 		}
-
-		if r.numBlockedOutputs == len(r.outputs) {
-			// All outputs are blocked, wait until at least one output is unblocked.
+		var done bool
+		processNextBatch := func() {
+			done = r.processNextBatch(ctx)
+		}
+		for {
+			// Check for cancellation.
 			select {
-			case <-r.unblockedEventsChan:
-				r.numBlockedOutputs--
 			case <-ctx.Done():
 				cancelOutputs(ctx.Err())
 				return
+			default:
+			}
+
+			// Read all the routerOutput state changes that have happened since the
+			// last iteration.
+			for moreToRead := true; moreToRead; {
+				select {
+				case <-r.unblockedEventsChan:
+					r.numBlockedOutputs--
+				default:
+					// No more routerOutput state changes to read without blocking.
+					moreToRead = false
+				}
+			}
+
+			if r.numBlockedOutputs == len(r.outputs) {
+				// All outputs are blocked, wait until at least one output is unblocked.
+				select {
+				case <-r.unblockedEventsChan:
+					r.numBlockedOutputs--
+				case <-ctx.Done():
+					cancelOutputs(ctx.Err())
+					return
+				}
+			}
+
+			if err := colexecerror.CatchVectorizedRuntimeError(processNextBatch); err != nil {
+				cancelOutputs(err)
+				return
+			}
+			if done {
+				// The input was done and we have notified the routerOutputs that there
+				// is no more data.
+				return
 			}
 		}
-
-		if err := execerror.CatchVectorizedRuntimeError(processNextBatch); err != nil {
-			cancelOutputs(err)
-			return
-		}
-		if done {
-			// The input was done and we have notified the routerOutputs that there
-			// is no more data.
-			return
-		}
+	}); err != nil {
+		bufferErr(err)
 	}
 }
 
@@ -552,6 +620,9 @@ func (r *HashRouter) reset(ctx context.Context) {
 func (r *HashRouter) DrainMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	for _, o := range r.outputs {
+		r.mu.bufferedMeta = append(r.mu.bufferedMeta, o.drain()...)
+	}
 	meta := r.mu.bufferedMeta
 	r.mu.bufferedMeta = r.mu.bufferedMeta[:0]
 	return meta

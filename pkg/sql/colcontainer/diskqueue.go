@@ -19,8 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -158,7 +157,7 @@ type diskQueue struct {
 	// dirName is the directory in cfg.Path that holds this queue's files.
 	dirName string
 
-	typs  []coltypes.T
+	typs  []types.T
 	cfg   DiskQueueCfg
 	files []file
 	seqNo int
@@ -328,14 +327,14 @@ func (cfg *DiskQueueCfg) SetDefaultBufferSizeBytesForCacheMode() {
 
 // NewDiskQueue creates a Queue that spills to disk.
 func NewDiskQueue(
-	ctx context.Context, typs []coltypes.T, cfg DiskQueueCfg, diskAcc *mon.BoundAccount,
+	ctx context.Context, typs []types.T, cfg DiskQueueCfg, diskAcc *mon.BoundAccount,
 ) (Queue, error) {
 	return newDiskQueue(ctx, typs, cfg, diskAcc)
 }
 
 // NewRewindableDiskQueue creates a RewindableQueue that spills to disk.
 func NewRewindableDiskQueue(
-	ctx context.Context, typs []coltypes.T, cfg DiskQueueCfg, diskAcc *mon.BoundAccount,
+	ctx context.Context, typs []types.T, cfg DiskQueueCfg, diskAcc *mon.BoundAccount,
 ) (RewindableQueue, error) {
 	d, err := newDiskQueue(ctx, typs, cfg, diskAcc)
 	if err != nil {
@@ -346,7 +345,7 @@ func NewRewindableDiskQueue(
 }
 
 func newDiskQueue(
-	ctx context.Context, typs []coltypes.T, cfg DiskQueueCfg, diskAcc *mon.BoundAccount,
+	ctx context.Context, typs []types.T, cfg DiskQueueCfg, diskAcc *mon.BoundAccount,
 ) (*diskQueue, error) {
 	if err := cfg.EnsureDefaults(); err != nil {
 		return nil, err
@@ -425,6 +424,9 @@ func (d *diskQueue) Close(ctx context.Context) error {
 	for _, file := range d.files[leftOverFileIdx : d.writeFileIdx+1] {
 		totalSize += int64(file.totalSize)
 	}
+	if totalSize > d.diskAcc.Used() {
+		totalSize = d.diskAcc.Used()
+	}
 	d.diskAcc.Shrink(ctx, totalSize)
 	return nil
 }
@@ -489,7 +491,7 @@ func (d *diskQueue) writeFooterAndFlush(ctx context.Context) error {
 	d.numBufferedBatches = 0
 	d.files[d.writeFileIdx].totalSize += written
 	if err := d.diskAcc.Grow(ctx, int64(written)); err != nil {
-		execerror.VectorizedInternalPanic(err)
+		return err
 	}
 	// Append offset for the readers.
 	d.files[d.writeFileIdx].offsets = append(d.files[d.writeFileIdx].offsets, d.files[d.writeFileIdx].totalSize)
@@ -578,7 +580,11 @@ func (d *diskQueue) maybeInitDeserializer(ctx context.Context) (bool, error) {
 				if err := d.cfg.FS.DeleteFile(d.files[d.readFileIdx].name); err != nil {
 					return false, err
 				}
-				d.diskAcc.Shrink(ctx, int64(d.files[d.readFileIdx].totalSize))
+				fileSize := int64(d.files[d.readFileIdx].totalSize)
+				if fileSize > d.diskAcc.Used() {
+					fileSize = d.diskAcc.Used()
+				}
+				d.diskAcc.Shrink(ctx, fileSize)
 			}
 			d.readFile = nil
 			// Read next file.
@@ -639,7 +645,7 @@ func (d *diskQueue) maybeInitDeserializer(ctx context.Context) (bool, error) {
 		decompressedBytes = d.scratchDecompressedReadBytes
 	}
 
-	deserializer, err := colserde.NewFileDeserializerFromBytes(decompressedBytes)
+	deserializer, err := colserde.NewFileDeserializerFromBytes(d.typs, decompressedBytes)
 	if err != nil {
 		return false, err
 	}
@@ -705,19 +711,15 @@ func (d *diskQueue) Dequeue(ctx context.Context, b coldata.Batch) (bool, error) 
 			// told about.
 			vecs := b.ColVecs()[:len(d.typs)]
 			for i := range vecs {
-				// When we deserialize a new memory region, we create new memory that
-				// the batch to deserialize into will point to. This is due to
-				// https://github.com/cockroachdb/cockroach/issues/43964, which could
-				// result in corrupting memory if we naively allow the arrow batch
-				// converter to call Reset() on a batch that points to memory that has
-				// still not been read. Doing this avoids reallocating a new
-				// scratchDecompressedReadBytes every time we perform a read from the
-				// file and constrains the downside to allocating a new batch every
-				// couple of batches.
-				// TODO(asubiotto): This is a stop-gap solution. The issue is that
-				//  ownership semantics are a bit murky. Can we do better? Refer to the
-				//  issue.
-				vecs[i] = coldata.NewMemColumn(d.typs[i], coldata.BatchSize())
+				// When we deserialize a new memory region, we allocate a new null
+				// bitmap for the batch which deserializer will write to. If we naively
+				// allow the arrow batch converter to directly overwrite null bitmap of
+				// each column, it could lead to memory corruption. Doing this avoids
+				// reallocating a new scratchDecompressedReadBytes every time we perform
+				// a read from the file and constrains the downside to allocating a new
+				// null bitmap every couple of batches.
+				nulls := coldata.NewNulls(coldata.BatchSize())
+				vecs[i].SetNulls(&nulls)
 			}
 		}
 		if err := d.deserializerState.GetBatch(d.deserializerState.curBatch, b); err != nil {

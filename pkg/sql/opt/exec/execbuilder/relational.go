@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
@@ -40,7 +41,7 @@ import (
 type execPlan struct {
 	root exec.Node
 
-	// outputCols is a map from opt.ColumnID to exec.ColumnOrdinal. It maps
+	// outputCols is a map from opt.ColumnID to exec.NodeColumnOrdinal. It maps
 	// columns in the output set of a relational expression to indices in the
 	// result columns of the exec.Node.
 	//
@@ -93,21 +94,21 @@ func (ep *execPlan) makeBuildScalarCtx() buildScalarCtx {
 	}
 }
 
-// getColumnOrdinal takes a column that is known to be produced by the execPlan
+// getNodeColumnOrdinal takes a column that is known to be produced by the execPlan
 // and returns the ordinal index of that column in the result columns of the
 // node.
-func (ep *execPlan) getColumnOrdinal(col opt.ColumnID) exec.ColumnOrdinal {
+func (ep *execPlan) getNodeColumnOrdinal(col opt.ColumnID) exec.NodeColumnOrdinal {
 	ord, ok := ep.outputCols.Get(int(col))
 	if !ok {
 		panic(errors.AssertionFailedf("column %d not in input", log.Safe(col)))
 	}
-	return exec.ColumnOrdinal(ord)
+	return exec.NodeColumnOrdinal(ord)
 }
 
-func (ep *execPlan) getColumnOrdinalSet(cols opt.ColSet) exec.ColumnOrdinalSet {
-	var res exec.ColumnOrdinalSet
+func (ep *execPlan) getNodeColumnOrdinalSet(cols opt.ColSet) exec.NodeColumnOrdinalSet {
+	var res exec.NodeColumnOrdinalSet
 	cols.ForEach(func(colID opt.ColumnID) {
-		res.Add(int(ep.getColumnOrdinal(colID)))
+		res.Add(int(ep.getNodeColumnOrdinal(colID)))
 	})
 	return res
 }
@@ -126,7 +127,7 @@ func (ep *execPlan) sqlOrdering(ordering opt.Ordering) sqlbase.ColumnOrdering {
 	}
 	colOrder := make(sqlbase.ColumnOrdering, len(ordering))
 	for i := range ordering {
-		colOrder[i].ColIdx = int(ep.getColumnOrdinal(ordering[i].ID()))
+		colOrder[i].ColIdx = int(ep.getNodeColumnOrdinal(ordering[i].ID()))
 		if ordering[i].Descending() {
 			colOrder[i].Direction = encoding.Descending
 		} else {
@@ -399,9 +400,9 @@ func (b *Builder) constructValues(rows [][]tree.TypedExpr, cols opt.ColList) (ex
 // (starting with outputOrdinalStart).
 func (b *Builder) getColumns(
 	cols opt.ColSet, tableID opt.TableID,
-) (exec.ColumnOrdinalSet, opt.ColMap) {
-	needed := exec.ColumnOrdinalSet{}
-	output := opt.ColMap{}
+) (exec.TableColumnOrdinalSet, opt.ColMap) {
+	var needed exec.TableColumnOrdinalSet
+	var output opt.ColMap
 
 	columnCount := b.mem.Metadata().Table(tableID).DeletableColumnCount()
 	n := 0
@@ -530,11 +531,11 @@ func (b *Builder) applySimpleProject(
 	input execPlan, cols opt.ColSet, providedOrd opt.Ordering,
 ) (execPlan, error) {
 	// We have only pass-through columns.
-	colList := make([]exec.ColumnOrdinal, 0, cols.Len())
+	colList := make([]exec.NodeColumnOrdinal, 0, cols.Len())
 	var res execPlan
 	cols.ForEach(func(i opt.ColumnID) {
 		res.outputCols.Set(int(i), len(colList))
-		colList = append(colList, input.getColumnOrdinal(i))
+		colList = append(colList, input.getNodeColumnOrdinal(i))
 	})
 	var err error
 	res.root, err = b.factory.ConstructSimpleProject(
@@ -586,31 +587,6 @@ func (b *Builder) buildProject(prj *memo.ProjectExpr) (execPlan, error) {
 	return res, nil
 }
 
-// ReplaceVars replaces the VariableExprs within a RelExpr with constant Datums
-// provided by the vars map, which maps opt column id for each VariableExpr to
-// replace to the Datum that should replace it. The memo within the input
-// norm.Factory will be replaced with the result.
-// requiredPhysical is the set of physical properties that are required of the
-// root of the new expression.
-func ReplaceVars(
-	f *norm.Factory,
-	applyInput memo.RelExpr,
-	requiredPhysical *physical.Required,
-	vars map[opt.ColumnID]tree.Datum,
-) {
-	var replaceFn norm.ReplaceFunc
-	replaceFn = func(e opt.Expr) opt.Expr {
-		switch t := e.(type) {
-		case *memo.VariableExpr:
-			if d, ok := vars[t.Col]; ok {
-				return f.ConstructConstVal(d, t.Typ)
-			}
-		}
-		return f.CopyAndReplaceDefault(e, replaceFn)
-	}
-	f.CopyAndReplace(applyInput, requiredPhysical, replaceFn)
-}
-
 func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 	switch join.Op() {
 	case opt.InnerJoinApplyOp, opt.LeftJoinApplyOp, opt.SemiJoinApplyOp, opt.AntiJoinApplyOp:
@@ -619,68 +595,95 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 	}
 	joinType := joinOpToJoinType(join.Op())
 	leftExpr := join.Child(0).(memo.RelExpr)
+	leftProps := leftExpr.Relational()
 	rightExpr := join.Child(1).(memo.RelExpr)
+	rightProps := rightExpr.Relational()
 	filters := join.Child(2).(*memo.FiltersExpr)
 
-	// Create a fake version of the right-side plan that contains NULL for all
-	// outer columns, so that we can figure out the output columns and various
-	// other attributes.
-	var f norm.Factory
-	f.Init(b.evalCtx, b.catalog)
-	fakeBindings := make(map[opt.ColumnID]tree.Datum)
-	rightExpr.Relational().OuterCols.ForEach(func(k opt.ColumnID) {
-		fakeBindings[k] = tree.DNull
-	})
-	ReplaceVars(&f, rightExpr, rightExpr.RequiredPhysical(), fakeBindings)
-
-	// We increment nullifyMissingVarExprs here to instruct the scalar builder to
-	// replace the outer column VariableExprs with null for the current scope.
-	b.nullifyMissingVarExprs++
-	fakeRight, err := b.buildRelational(rightExpr)
-	b.nullifyMissingVarExprs--
+	leftPlan, err := b.buildRelational(leftExpr)
 	if err != nil {
 		return execPlan{}, err
 	}
 
-	// Make a copy of the required props.
-	requiredProps := *rightExpr.RequiredPhysical()
-	requiredProps.Presentation = make(physical.Presentation, fakeRight.outputCols.Len())
-	fakeRight.outputCols.ForEach(func(k, v int) {
-		requiredProps.Presentation[opt.ColumnID(v)] = opt.AliasedColumn{
-			ID:    opt.ColumnID(k),
-			Alias: join.Memo().Metadata().ColumnMeta(opt.ColumnID(k)).Alias,
-		}
-	})
-
-	left, err := b.buildRelational(leftExpr)
-	if err != nil {
-		return execPlan{}, err
-	}
+	// Make a copy of the required props for the right side.
+	rightRequiredProps := *rightExpr.RequiredPhysical()
+	// The right-hand side will produce the output columns in order.
+	rightRequiredProps.Presentation = b.makePresentation(rightProps.OutputCols)
 
 	// leftBoundCols is the set of columns that this apply join binds.
-	leftBoundCols := leftExpr.Relational().OutputCols.Intersection(rightExpr.Relational().OuterCols)
+	leftBoundCols := leftProps.OutputCols.Intersection(rightProps.OuterCols)
 	// leftBoundColMap is a map from opt.ColumnID to opt.ColumnOrdinal that maps
 	// a column bound by the left side of this apply join to the column ordinal
 	// in the left side that contains the binding.
 	var leftBoundColMap opt.ColMap
-	for k, ok := leftBoundCols.Next(0); ok; k, ok = leftBoundCols.Next(k + 1) {
-		v, ok := left.outputCols.Get(int(k))
+	for col, ok := leftBoundCols.Next(0); ok; col, ok = leftBoundCols.Next(col + 1) {
+		v, ok := leftPlan.outputCols.Get(int(col))
 		if !ok {
-			return execPlan{}, fmt.Errorf("couldn't find binding column %d in output columns", k)
+			return execPlan{}, fmt.Errorf("couldn't find binding column %d in left output columns", col)
 		}
-		leftBoundColMap.Set(int(k), v)
+		leftBoundColMap.Set(int(col), v)
 	}
 
-	allCols := joinOutputMap(left.outputCols, fakeRight.outputCols)
+	// Now, the cool part! We set up an ApplyJoinPlanRightSideFn which plans the
+	// right side given a particular left side row. We do this planning in a
+	// separate memo, but we use the same exec.Factory.
+	//
+	// Note: we put o outside of the function so we allocate it only once.
+	var o xform.Optimizer
+	planRightSideFn := func(leftRow tree.Datums) (exec.Plan, error) {
+		o.Init(b.evalCtx, b.catalog)
+		f := o.Factory()
 
-	ctx := buildScalarCtx{
-		ivh:     tree.MakeIndexedVarHelper(nil /* container */, numOutputColsInMap(allCols)),
-		ivarMap: allCols,
+		// Copy the right expression into a new memo, replacing each bound column
+		// with the corresponding value from the left row.
+		var replaceFn norm.ReplaceFunc
+		replaceFn = func(e opt.Expr) opt.Expr {
+			switch t := e.(type) {
+			case *memo.VariableExpr:
+				if leftOrd, ok := leftBoundColMap.Get(int(t.Col)); ok {
+					return f.ConstructConstVal(leftRow[leftOrd], t.Typ)
+				}
+			}
+			return f.CopyAndReplaceDefault(e, replaceFn)
+		}
+		f.CopyAndReplace(rightExpr, &rightRequiredProps, replaceFn)
+
+		newRightSide, err := o.Optimize()
+		if err != nil {
+			return nil, err
+		}
+
+		eb := New(b.factory, f.Memo(), b.catalog, newRightSide, b.evalCtx)
+		eb.disableTelemetry = true
+		plan, err := eb.Build()
+		if err != nil {
+			if errors.IsAssertionFailure(err) {
+				// Enhance the error with the EXPLAIN (OPT, VERBOSE) of the inner
+				// expression.
+				fmtFlags := memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes
+				explainOpt := o.FormatExpr(newRightSide, fmtFlags)
+				err = errors.WithDetailf(err, "newRightSide:\n%s", explainOpt)
+			}
+			return nil, err
+		}
+		return plan, nil
 	}
+
+	// The right plan will always produce the columns in the presentation, in
+	// the same order.
+	var rightOutputCols opt.ColMap
+	for i := range rightRequiredProps.Presentation {
+		rightOutputCols.Set(int(rightRequiredProps.Presentation[i].ID), i)
+	}
+	allCols := joinOutputMap(leftPlan.outputCols, rightOutputCols)
 
 	var onExpr tree.TypedExpr
 	if len(*filters) != 0 {
-		onExpr, err = b.buildScalar(&ctx, filters)
+		scalarCtx := buildScalarCtx{
+			ivh:     tree.MakeIndexedVarHelper(nil /* container */, numOutputColsInMap(allCols)),
+			ivarMap: allCols,
+		}
+		onExpr, err = b.buildScalar(&scalarCtx, filters)
 		if err != nil {
 			return execPlan{}, err
 		}
@@ -689,7 +692,7 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 	var outputCols opt.ColMap
 	if joinType == sqlbase.LeftSemiJoin || joinType == sqlbase.LeftAntiJoin {
 		// For semi and anti join, only the left columns are output.
-		outputCols = left.outputCols
+		outputCols = leftPlan.outputCols
 	} else {
 		outputCols = allCols
 	}
@@ -698,18 +701,43 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 
 	ep.root, err = b.factory.ConstructApplyJoin(
 		joinType,
-		left.root,
-		leftBoundColMap,
-		b.mem,
-		&requiredProps,
-		fakeRight.root,
-		rightExpr,
+		leftPlan.root,
+		b.presentationToResultColumns(rightRequiredProps.Presentation),
 		onExpr,
+		planRightSideFn,
 	)
 	if err != nil {
 		return execPlan{}, err
 	}
 	return ep, nil
+}
+
+// makePresentation creates a Presentation that contains the given columns, in
+// order of their IDs.
+func (b *Builder) makePresentation(cols opt.ColSet) physical.Presentation {
+	md := b.mem.Metadata()
+	result := make(physical.Presentation, 0, cols.Len())
+	cols.ForEach(func(col opt.ColumnID) {
+		result = append(result, opt.AliasedColumn{
+			Alias: md.ColumnMeta(col).Alias,
+			ID:    col,
+		})
+	})
+	return result
+}
+
+// presentationToResultColumns returns ResultColumns corresponding to the
+// columns in a presentation.
+func (b *Builder) presentationToResultColumns(pres physical.Presentation) sqlbase.ResultColumns {
+	md := b.mem.Metadata()
+	result := make(sqlbase.ResultColumns, len(pres))
+	for i := range pres {
+		result[i] = sqlbase.ResultColumn{
+			Name: pres[i].Alias,
+			Typ:  md.ColumnMeta(pres[i].ID).Type,
+		}
+	}
+	return result
 }
 
 func (b *Builder) buildHashJoin(join memo.RelExpr) (execPlan, error) {
@@ -757,12 +785,12 @@ func (b *Builder) buildHashJoin(join memo.RelExpr) (execPlan, error) {
 	ep := execPlan{outputCols: outputCols}
 
 	// Convert leftEq/rightEq to ordinals.
-	eqColsBuf := make([]exec.ColumnOrdinal, 2*len(leftEq))
+	eqColsBuf := make([]exec.NodeColumnOrdinal, 2*len(leftEq))
 	leftEqOrdinals := eqColsBuf[:len(leftEq):len(leftEq)]
 	rightEqOrdinals := eqColsBuf[len(leftEq):]
 	for i := range leftEq {
-		leftEqOrdinals[i] = left.getColumnOrdinal(leftEq[i])
-		rightEqOrdinals[i] = right.getColumnOrdinal(rightEq[i])
+		leftEqOrdinals[i] = left.getNodeColumnOrdinal(leftEq[i])
+		rightEqOrdinals[i] = right.getNodeColumnOrdinal(rightEq[i])
 	}
 
 	leftEqColsAreKey := leftExpr.Relational().FuncDeps.ColsAreStrictKey(leftEq.ToSet())
@@ -896,10 +924,10 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 
 	var ep execPlan
 	groupingCols := groupBy.Private().(*memo.GroupingPrivate).GroupingCols
-	groupingColIdx := make([]exec.ColumnOrdinal, 0, groupingCols.Len())
+	groupingColIdx := make([]exec.NodeColumnOrdinal, 0, groupingCols.Len())
 	for i, ok := groupingCols.Next(0); ok; i, ok = groupingCols.Next(i + 1) {
 		ep.outputCols.Set(int(i), len(groupingColIdx))
-		groupingColIdx = append(groupingColIdx, input.getColumnOrdinal(i))
+		groupingColIdx = append(groupingColIdx, input.getNodeColumnOrdinal(i))
 	}
 
 	aggregations := *groupBy.Child(1).(*memo.AggregationsExpr)
@@ -908,13 +936,13 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 		item := &aggregations[i]
 		agg := item.Agg
 
-		var filterOrd exec.ColumnOrdinal = -1
+		var filterOrd exec.NodeColumnOrdinal = -1
 		if aggFilter, ok := agg.(*memo.AggFilterExpr); ok {
 			filter, ok := aggFilter.Filter.(*memo.VariableExpr)
 			if !ok {
 				return execPlan{}, errors.AssertionFailedf("only VariableOp args supported")
 			}
-			filterOrd = input.getColumnOrdinal(filter.Col)
+			filterOrd = input.getNodeColumnOrdinal(filter.Col)
 			agg = aggFilter.Input
 		}
 
@@ -928,7 +956,7 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 
 		// Accumulate variable arguments in argCols and constant arguments in
 		// constArgs. Constant arguments must follow variable arguments.
-		var argCols []exec.ColumnOrdinal
+		var argCols []exec.NodeColumnOrdinal
 		var constArgs tree.Datums
 		for j, n := 0, agg.ChildCount(); j < n; j++ {
 			child := agg.Child(j)
@@ -936,7 +964,7 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 				if len(constArgs) != 0 {
 					return execPlan{}, errors.Errorf("constant args must come after variable args")
 				}
-				argCols = append(argCols, input.getColumnOrdinal(variable.Col))
+				argCols = append(argCols, input.getNodeColumnOrdinal(variable.Col))
 			} else {
 				if len(argCols) == 0 {
 					return execPlan{}, errors.Errorf("a constant arg requires at least one variable arg")
@@ -988,13 +1016,13 @@ func (b *Builder) buildDistinct(distinct memo.RelExpr) (execPlan, error) {
 		return execPlan{}, err
 	}
 
-	distinctCols := input.getColumnOrdinalSet(private.GroupingCols)
-	var orderedCols exec.ColumnOrdinalSet
+	distinctCols := input.getNodeColumnOrdinalSet(private.GroupingCols)
+	var orderedCols exec.NodeColumnOrdinalSet
 	ordering := ordering.StreamingGroupingColOrdering(
 		private, &distinct.RequiredPhysical().Ordering,
 	)
 	for i := range ordering {
-		orderedCols.Add(int(input.getColumnOrdinal(ordering[i].ID())))
+		orderedCols.Add(int(input.getNodeColumnOrdinal(ordering[i].ID())))
 	}
 	ep := execPlan{outputCols: input.outputCols}
 
@@ -1065,7 +1093,7 @@ func (b *Builder) buildGroupByInput(groupBy memo.RelExpr) (execPlan, error) {
 	}
 
 	// The input is producing columns that are not useful; set up a projection.
-	cols := make([]exec.ColumnOrdinal, 0, neededCols.Len())
+	cols := make([]exec.NodeColumnOrdinal, 0, neededCols.Len())
 	var newOutputCols opt.ColMap
 	for colID, ok := neededCols.Next(0); ok; colID, ok = neededCols.Next(colID + 1) {
 		ordinal, ordOk := input.outputCols.Get(int(colID))
@@ -1073,7 +1101,7 @@ func (b *Builder) buildGroupByInput(groupBy memo.RelExpr) (execPlan, error) {
 			panic(errors.AssertionFailedf("needed column not produced by group-by input"))
 		}
 		newOutputCols.Set(int(colID), len(cols))
-		cols = append(cols, exec.ColumnOrdinal(ordinal))
+		cols = append(cols, exec.NodeColumnOrdinal(ordinal))
 	}
 
 	input.outputCols = newOutputCols
@@ -1246,9 +1274,9 @@ func (b *Builder) buildIndexJoin(join *memo.IndexJoinExpr) (execPlan, error) {
 	// TODO(radu): the distsql implementation of index join assumes that the input
 	// starts with the PK columns in order (#40749).
 	pri := tab.Index(cat.PrimaryIndex)
-	keyCols := make([]exec.ColumnOrdinal, pri.KeyColumnCount())
+	keyCols := make([]exec.NodeColumnOrdinal, pri.KeyColumnCount())
 	for i := range keyCols {
-		keyCols[i] = input.getColumnOrdinal(join.Table.ColumnID(pri.Column(i).Ordinal))
+		keyCols[i] = input.getNodeColumnOrdinal(join.Table.ColumnID(pri.Column(i).Ordinal))
 	}
 
 	cols := join.Cols
@@ -1277,9 +1305,9 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 
 	md := b.mem.Metadata()
 
-	keyCols := make([]exec.ColumnOrdinal, len(join.KeyCols))
+	keyCols := make([]exec.NodeColumnOrdinal, len(join.KeyCols))
 	for i, c := range join.KeyCols {
-		keyCols[i] = input.getColumnOrdinal(c)
+		keyCols[i] = input.getNodeColumnOrdinal(c)
 	}
 
 	inputCols := join.Input.Relational().OutputCols
@@ -1340,11 +1368,11 @@ func (b *Builder) buildZigzagJoin(join *memo.ZigzagJoinExpr) (execPlan, error) {
 	leftIndex := leftTable.Index(join.LeftIndex)
 	rightIndex := rightTable.Index(join.RightIndex)
 
-	leftEqCols := make([]exec.ColumnOrdinal, len(join.LeftEqCols))
-	rightEqCols := make([]exec.ColumnOrdinal, len(join.RightEqCols))
+	leftEqCols := make([]exec.NodeColumnOrdinal, len(join.LeftEqCols))
+	rightEqCols := make([]exec.NodeColumnOrdinal, len(join.RightEqCols))
 	for i := range join.LeftEqCols {
-		leftEqCols[i] = exec.ColumnOrdinal(join.LeftTable.ColumnOrdinal(join.LeftEqCols[i]))
-		rightEqCols[i] = exec.ColumnOrdinal(join.RightTable.ColumnOrdinal(join.RightEqCols[i]))
+		leftEqCols[i] = exec.NodeColumnOrdinal(join.LeftTable.ColumnOrdinal(join.LeftEqCols[i]))
+		rightEqCols[i] = exec.NodeColumnOrdinal(join.RightTable.ColumnOrdinal(join.RightEqCols[i]))
 	}
 	leftCols := md.TableMeta(join.LeftTable).IndexColumns(join.LeftIndex).Intersection(join.Cols)
 	rightCols := md.TableMeta(join.RightTable).IndexColumns(join.RightIndex).Intersection(join.Cols)
@@ -1493,7 +1521,7 @@ func (b *Builder) buildRecursiveCTE(rec *memo.RecursiveCTEExpr) (execPlan, error
 		withExprs: b.withExprs[:len(b.withExprs):len(b.withExprs)],
 	}
 
-	fn := func(bufferRef exec.Node) (exec.Plan, error) {
+	fn := func(bufferRef exec.BufferNode) (exec.Plan, error) {
 		// Use a separate builder each time.
 		innerBld := *innerBldTemplate
 		innerBld.addBuiltWithExpr(rec.WithID, initial.outputCols, bufferRef)
@@ -1561,13 +1589,13 @@ func (b *Builder) buildWithScan(withScan *memo.WithScanExpr) (execPlan, error) {
 		}
 	} else {
 		// We need a projection.
-		cols := make([]exec.ColumnOrdinal, len(withScan.InCols))
+		cols := make([]exec.NodeColumnOrdinal, len(withScan.InCols))
 		for i := range withScan.InCols {
 			col, ok := e.outputCols.Get(int(withScan.InCols[i]))
 			if !ok {
 				panic(errors.AssertionFailedf("column %d not in input", log.Safe(withScan.InCols[i])))
 			}
-			cols[i] = exec.ColumnOrdinal(col)
+			cols[i] = exec.NodeColumnOrdinal(col)
 			res.outputCols.Set(int(withScan.OutCols[i]), i)
 		}
 		res.root, err = b.factory.ConstructSimpleProject(
@@ -1767,18 +1795,18 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 		}
 	}
 
-	partitionIdxs := make([]exec.ColumnOrdinal, w.Partition.Len())
+	partitionIdxs := make([]exec.NodeColumnOrdinal, w.Partition.Len())
 	partitionExprs := make(tree.Exprs, w.Partition.Len())
 
 	i := 0
 	w.Partition.ForEach(func(col opt.ColumnID) {
 		ordinal, _ := input.outputCols.Get(int(col))
-		partitionIdxs[i] = exec.ColumnOrdinal(ordinal)
+		partitionIdxs[i] = exec.NodeColumnOrdinal(ordinal)
 		partitionExprs[i] = b.indexedVar(&ctx, b.mem.Metadata(), col)
 		i++
 	})
 
-	argIdxs := make([][]exec.ColumnOrdinal, len(w.Windows))
+	argIdxs := make([][]exec.NodeColumnOrdinal, len(w.Windows))
 	filterIdxs := make([]int, len(w.Windows))
 	exprs := make([]*tree.FuncExpr, len(w.Windows))
 
@@ -1792,12 +1820,12 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 		props, _ := builtins.GetBuiltinProperties(name)
 
 		args := make([]tree.TypedExpr, fn.ChildCount())
-		argIdxs[i] = make([]exec.ColumnOrdinal, fn.ChildCount())
+		argIdxs[i] = make([]exec.NodeColumnOrdinal, fn.ChildCount())
 		for j, n := 0, fn.ChildCount(); j < n; j++ {
 			col := fn.Child(j).(*memo.VariableExpr).Col
 			args[j] = b.indexedVar(&ctx, b.mem.Metadata(), col)
 			idx, _ := input.outputCols.Get(int(col))
-			argIdxs[i][j] = exec.ColumnOrdinal(idx)
+			argIdxs[i][j] = exec.NodeColumnOrdinal(idx)
 		}
 
 		frame, err := b.buildFrame(input, item)
@@ -1865,10 +1893,10 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 		outputIdxs[i] = windowStart + i
 	}
 
-	var rangeOffsetColumn exec.ColumnOrdinal
+	var rangeOffsetColumn exec.NodeColumnOrdinal
 	if ord.Empty() {
 		idx, _ := input.outputCols.Get(int(w.RangeOffsetColumn))
-		rangeOffsetColumn = exec.ColumnOrdinal(idx)
+		rangeOffsetColumn = exec.NodeColumnOrdinal(idx)
 	}
 	node, err := b.factory.ConstructWindow(input.root, exec.WindowInfo{
 		Cols:              resultCols,
@@ -1947,7 +1975,7 @@ func (b *Builder) buildOpaque(opaque *memo.OpaqueRelPrivate) (execPlan, error) {
 // the columns (in the same order), returns needProj=false.
 func (b *Builder) needProjection(
 	input execPlan, colList opt.ColList,
-) (_ []exec.ColumnOrdinal, needProj bool) {
+) (_ []exec.NodeColumnOrdinal, needProj bool) {
 	if input.numOutputCols() == len(colList) {
 		identity := true
 		for i, col := range colList {
@@ -1960,10 +1988,10 @@ func (b *Builder) needProjection(
 			return nil, false
 		}
 	}
-	cols := make([]exec.ColumnOrdinal, 0, len(colList))
+	cols := make([]exec.NodeColumnOrdinal, 0, len(colList))
 	for _, col := range colList {
 		if col != 0 {
-			cols = append(cols, input.getColumnOrdinal(col))
+			cols = append(cols, input.getNodeColumnOrdinal(col))
 		}
 	}
 	return cols, true

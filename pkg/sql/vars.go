@@ -23,8 +23,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -136,7 +138,7 @@ var varGen = map[string]sessionVar{
 		Set: func(
 			_ context.Context, m *sessionDataMutator, s string,
 		) error {
-			mode, ok := sessiondata.BytesEncodeFormatFromString(s)
+			mode, ok := lex.BytesEncodeFormatFromString(s)
 			if !ok {
 				return newVarValueError(`bytea_output`, s, "hex", "escape", "base64")
 			}
@@ -146,13 +148,33 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) string {
 			return evalCtx.SessionData.DataConversion.BytesEncodeFormat.String()
 		},
-		GlobalDefault: func(sv *settings.Values) string { return sessiondata.BytesEncodeHex.String() },
+		GlobalDefault: func(sv *settings.Values) string { return lex.BytesEncodeHex.String() },
 	},
 
-	// Supported for PG compatibility only.
-	// Controls returned message verbosity. We don't support this.
-	// See https://www.postgresql.org/docs/9.6/static/runtime-config-compatible.html
-	`client_min_messages`: makeCompatStringVar(`client_min_messages`, `notice`, `debug5`, `debug4`, `debug3`, `debug2`, `debug1`, `debug`, `log`, `warning`, `error`, `fatal`, `panic`),
+	`client_min_messages`: {
+		Set: func(
+			_ context.Context, m *sessionDataMutator, s string,
+		) error {
+			severity, ok := pgnotice.ParseDisplaySeverity(s)
+			if !ok {
+				return errors.WithHintf(
+					pgerror.Newf(
+						pgcode.InvalidParameterValue,
+						"%s is not supported",
+						severity,
+					),
+					"Valid severities are: %s.",
+					strings.Join(pgnotice.ValidDisplaySeverities(), ", "),
+				)
+			}
+			m.SetNoticeDisplaySeverity(severity)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return evalCtx.SessionData.NoticeDisplaySeverity.String()
+		},
+		GlobalDefault: func(_ *settings.Values) string { return "notice" },
+	},
 
 	// See https://www.postgresql.org/docs/9.6/static/multibyte.html
 	// Also aliased to SET NAMES.

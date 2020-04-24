@@ -618,7 +618,7 @@ func importPlanHook(
 
 				var match string
 				if table != nil {
-					match = table.TableName.String()
+					match = table.ObjectName.String()
 				}
 
 				fks := fkHandler{skip: skipFKs, allowed: true, resolver: make(fkResolver)}
@@ -636,7 +636,7 @@ func importPlanHook(
 					return err
 				}
 				if tableDescs == nil && table != nil {
-					return errors.Errorf("table definition not found for %q", table.TableName.String())
+					return errors.Errorf("table definition not found for %q", table.ObjectName.String())
 				}
 			} else {
 				if table == nil {
@@ -658,10 +658,10 @@ func importPlanHook(
 						return err
 					}
 
-					if table.TableName != create.Table.TableName {
+					if table.ObjectName != create.Table.ObjectName {
 						return errors.Errorf(
 							"importing table %s, but file specifies a schema for table %s",
-							table.TableName, create.Table.TableName,
+							table.ObjectName, create.Table.ObjectName,
 						)
 					}
 				}
@@ -902,7 +902,7 @@ func prepareNewTableDescsForIngestion(
 	// Write the new TableDescriptors and flip the namespace entries over to
 	// them. After this call, any queries on a table will be served by the newly
 	// imported data.
-	if err := backupccl.WriteTableDescs(ctx, txn, nil /* databases */, tableDescs, tree.RequestedDescriptors, p.User(), p.ExecCfg().Settings, seqValKVs); err != nil {
+	if err := backupccl.WriteTableDescs(ctx, txn, nil /* databases */, tableDescs, tree.RequestedDescriptors, p.ExecCfg().Settings, seqValKVs); err != nil {
 		return nil, errors.Wrapf(err, "creating tables")
 	}
 

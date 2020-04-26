@@ -188,7 +188,8 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp:
 		cost = c.computeSetCost(candidate)
 
-	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.UpsertDistinctOnOp:
+	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.EnsureDistinctOnOp,
+		opt.UpsertDistinctOnOp:
 		cost = c.computeGroupingCost(candidate, required)
 
 	case opt.LimitOp:
@@ -611,7 +612,7 @@ func (c *coster) rowScanCost(tabID opt.TableID, idxOrd int, numScannedCols int) 
 	// Adjust cost based on how well the current locality matches the index's
 	// zone constraints.
 	var costFactor memo.Cost = cpuCostFactor
-	if len(c.locality.Tiers) != 0 {
+	if !tab.IsVirtualTable() && len(c.locality.Tiers) != 0 {
 		// If 0% of locality tiers have matching constraints, then add additional
 		// cost. If 100% of locality tiers have matching constraints, then add no
 		// additional cost. Anything in between is proportional to the number of

@@ -391,10 +391,15 @@ func (v *Value) SetFloat(f float64) {
 
 // SetGeo encodes the specified geo value into the bytes field of the
 // receiver, sets the tag and clears the checksum.
-func (v *Value) SetGeo(ewkb geopb.EWKB) {
-	v.ensureRawBytes(headerSize + len(ewkb))
-	copy(v.dataBytes(), ewkb)
+func (v *Value) SetGeo(so geopb.SpatialObject) error {
+	bytes, err := protoutil.Marshal(&so)
+	if err != nil {
+		return err
+	}
+	v.ensureRawBytes(headerSize + len(bytes))
+	copy(v.dataBytes(), bytes)
 	v.setTag(ValueType_GEO)
+	return nil
 }
 
 // SetBool encodes the specified bool value into the bytes field of the
@@ -423,12 +428,11 @@ func (v *Value) SetInt(i int64) {
 // receiver and clears the checksum. If the proto message is an
 // InternalTimeSeriesData, the tag will be set to TIMESERIES rather than BYTES.
 func (v *Value) SetProto(msg protoutil.Message) error {
-	msg = protoutil.MaybeFuzz(msg)
 	// All of the Cockroach protos implement MarshalTo and Size. So we marshal
 	// directly into the Value.RawBytes field instead of allocating a separate
 	// []byte and copying.
 	v.ensureRawBytes(headerSize + msg.Size())
-	if _, err := protoutil.MarshalToWithoutFuzzing(msg, v.RawBytes[headerSize:]); err != nil {
+	if _, err := protoutil.MarshalTo(msg, v.RawBytes[headerSize:]); err != nil {
 		return err
 	}
 	// Special handling for timeseries data.
@@ -526,11 +530,13 @@ func (v Value) GetFloat() (float64, error) {
 
 // GetGeo decodes a geo value from the bytes field of the receiver. If the
 // tag is not GEO an error will be returned.
-func (v Value) GetGeo() (geopb.EWKB, error) {
+func (v Value) GetGeo() (geopb.SpatialObject, error) {
 	if tag := v.GetTag(); tag != ValueType_GEO {
-		return nil, fmt.Errorf("value type is not %s: %s", ValueType_GEO, tag)
+		return geopb.SpatialObject{}, fmt.Errorf("value type is not %s: %s", ValueType_GEO, tag)
 	}
-	return geopb.EWKB(v.dataBytes()), nil
+	var ret geopb.SpatialObject
+	err := protoutil.Unmarshal(v.dataBytes(), &ret)
+	return ret, err
 }
 
 // GetBool decodes a bool value from the bytes field of the receiver. If the

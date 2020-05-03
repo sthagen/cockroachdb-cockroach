@@ -14,7 +14,6 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"math"
 	"net"
 	"sync"
 	"testing"
@@ -684,7 +683,7 @@ func (tc *TestCluster) FindRangeLeaseHolder(
 // kv scratch space (it doesn't overlap system spans or SQL tables). The range
 // is lazily split off on the first call to ScratchRange.
 func (tc *TestCluster) ScratchRange(t testing.TB) roachpb.Key {
-	scratchKey := keys.MakeTablePrefix(math.MaxUint32)
+	scratchKey := keys.TableDataMax
 	if tc.scratchRangeID > 0 {
 		return scratchKey
 	}
@@ -789,7 +788,7 @@ func (tc *TestCluster) WaitForFullReplication() error {
 				if err := s.ComputeMetrics(context.TODO(), 0); err != nil {
 					// This can sometimes fail since ComputeMetrics calls
 					// updateReplicationGauges which needs the system config gossiped.
-					log.Info(context.TODO(), err)
+					log.Infof(context.TODO(), "%v", err)
 					notReplicated = true
 					return nil
 				}

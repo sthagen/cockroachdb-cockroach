@@ -113,7 +113,7 @@ func maybeSideloadEntriesImpl(
 			{
 				data := make([]byte, raftCommandPrefixLen+strippedCmd.Size())
 				encodeRaftCommandPrefix(data[:raftCommandPrefixLen], raftVersionSideloaded, cmdID)
-				_, err := protoutil.MarshalToWithoutFuzzing(&strippedCmd, data[raftCommandPrefixLen:])
+				_, err := protoutil.MarshalTo(&strippedCmd, data[raftCommandPrefixLen:])
 				if err != nil {
 					return nil, 0, errors.Wrap(err, "while marshaling stripped sideloaded command")
 				}
@@ -193,7 +193,7 @@ func maybeInlineSideloadedRaftCommand(
 	{
 		data := make([]byte, raftCommandPrefixLen+command.Size())
 		encodeRaftCommandPrefix(data[:raftCommandPrefixLen], raftVersionSideloaded, cmdID)
-		_, err := protoutil.MarshalToWithoutFuzzing(&command, data[raftCommandPrefixLen:])
+		_, err := protoutil.MarshalTo(&command, data[raftCommandPrefixLen:])
 		if err != nil {
 			return nil, err
 		}
@@ -214,7 +214,7 @@ func assertSideloadedRaftCommandInlined(ctx context.Context, ent *raftpb.Entry) 
 	var command storagepb.RaftCommand
 	_, data := DecodeRaftCommand(ent.Data)
 	if err := protoutil.Unmarshal(data, &command); err != nil {
-		log.Fatal(ctx, err)
+		log.Fatalf(ctx, "%v", err)
 	}
 
 	if len(command.ReplicatedEvalResult.AddSSTable.Data) == 0 {

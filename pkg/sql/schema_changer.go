@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -72,7 +73,7 @@ type SchemaChanger struct {
 	tableID           sqlbase.ID
 	mutationID        sqlbase.MutationID
 	droppedDatabaseID sqlbase.ID
-	nodeID            roachpb.NodeID
+	sqlInstanceID     base.SQLInstanceID
 	db                *kv.DB
 	leaseMgr          *LeaseManager
 
@@ -96,7 +97,7 @@ type SchemaChanger struct {
 func NewSchemaChangerForTesting(
 	tableID sqlbase.ID,
 	mutationID sqlbase.MutationID,
-	nodeID roachpb.NodeID,
+	sqlInstanceID base.SQLInstanceID,
 	db kv.DB,
 	leaseMgr *LeaseManager,
 	jobRegistry *jobs.Registry,
@@ -104,14 +105,14 @@ func NewSchemaChangerForTesting(
 	settings *cluster.Settings,
 ) SchemaChanger {
 	return SchemaChanger{
-		tableID:     tableID,
-		mutationID:  mutationID,
-		nodeID:      nodeID,
-		db:          &db,
-		leaseMgr:    leaseMgr,
-		jobRegistry: jobRegistry,
-		settings:    settings,
-		execCfg:     execCfg,
+		tableID:       tableID,
+		mutationID:    mutationID,
+		sqlInstanceID: sqlInstanceID,
+		db:            &db,
+		leaseMgr:      leaseMgr,
+		jobRegistry:   jobRegistry,
+		settings:      settings,
+		execCfg:       execCfg,
 	}
 }
 
@@ -262,7 +263,7 @@ func (sc *SchemaChanger) maybeBackfillCreateTableAs(
 		)
 		defer recv.Release()
 
-		rec, err := sc.distSQLPlanner.checkSupportForNode(localPlanner.curPlan.plan)
+		rec, err := sc.distSQLPlanner.checkSupportForNode(localPlanner.curPlan.main)
 		var planAndRunErr error
 		localPlanner.runWithOptions(resolveFlags{skipCache: true}, func() {
 			// Resolve subqueries before running the queries' physical plan.
@@ -286,7 +287,7 @@ func (sc *SchemaChanger) maybeBackfillCreateTableAs(
 			}}
 
 			PlanAndRunCTAS(ctx, sc.distSQLPlanner, localPlanner,
-				txn, isLocal, localPlanner.curPlan.plan, out, recv)
+				txn, isLocal, localPlanner.curPlan.main, out, recv)
 			if planAndRunErr = rw.Err(); planAndRunErr != nil {
 				return
 			}
@@ -887,7 +888,7 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 				// If we performed MakeMutationComplete on a PrimaryKeySwap mutation, then we need to start
 				// a job for the index deletion mutations that the primary key swap mutation added, if any.
 				mutationID := scDesc.ClusterVersion.NextMutationID
-				span := scDesc.PrimaryIndexSpan()
+				span := scDesc.PrimaryIndexSpan(sc.execCfg.Codec)
 				var spanList []jobspb.ResumeSpanList
 				for j := len(scDesc.ClusterVersion.Mutations); j < len(scDesc.Mutations); j++ {
 					spanList = append(spanList,
@@ -959,7 +960,7 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 			txn,
 			schemaChangeEventType,
 			int32(sc.tableID),
-			int32(sc.nodeID),
+			int32(sc.sqlInstanceID),
 			struct {
 				MutationID uint32
 			}{uint32(sc.mutationID)},
@@ -1193,7 +1194,7 @@ func (sc *SchemaChanger) maybeReverseMutations(ctx context.Context, causingError
 			txn,
 			EventLogReverseSchemaChange,
 			int32(sc.tableID),
-			int32(sc.nodeID),
+			int32(sc.sqlInstanceID),
 			struct {
 				Error      string
 				MutationID uint32
@@ -1221,7 +1222,7 @@ func (sc *SchemaChanger) updateJobForRollback(
 	ctx context.Context, txn *kv.Txn, tableDesc *sqlbase.TableDescriptor,
 ) error {
 	// Initialize refresh spans to scan the entire table.
-	span := tableDesc.PrimaryIndexSpan()
+	span := tableDesc.PrimaryIndexSpan(sc.execCfg.Codec)
 	var spanList []jobspb.ResumeSpanList
 	for _, m := range tableDesc.Mutations {
 		if m.MutationID == sc.mutationID {
@@ -1495,7 +1496,10 @@ func (*SchemaChangerTestingKnobs) ModuleTestingKnobs() {}
 // used in the surrounding SQL session, so session tracing is unable
 // to capture schema change activity.
 func createSchemaChangeEvalCtx(
-	ctx context.Context, ts hlc.Timestamp, ieFactory sqlutil.SessionBoundInternalExecutorFactory,
+	ctx context.Context,
+	execCfg *ExecutorConfig,
+	ts hlc.Timestamp,
+	ieFactory sqlutil.SessionBoundInternalExecutorFactory,
 ) extendedEvalContext {
 	dummyLocation := time.UTC
 
@@ -1522,6 +1526,7 @@ func createSchemaChangeEvalCtx(
 		// because it sets "enabled: false" and thus none of the
 		// other fields are used.
 		Tracing: &SessionTracing{},
+		ExecCfg: execCfg,
 		EvalContext: tree.EvalContext{
 			SessionData:      sd,
 			InternalExecutor: ieFactory(ctx, sd),
@@ -1532,6 +1537,13 @@ func createSchemaChangeEvalCtx(
 			Planner:            &sqlbase.DummyEvalPlanner{},
 			SessionAccessor:    &sqlbase.DummySessionAccessor{},
 			PrivilegedAccessor: &sqlbase.DummyPrivilegedAccessor{},
+			Settings:           execCfg.Settings,
+			TestingKnobs:       execCfg.EvalContextTestingKnobs,
+			ClusterID:          execCfg.ClusterID(),
+			ClusterName:        execCfg.RPCContext.ClusterName(),
+			NodeID:             execCfg.NodeID,
+			Codec:              execCfg.Codec,
+			Locality:           execCfg.Locality,
 		},
 	}
 	// The backfill is going to use the current timestamp for the various
@@ -1572,7 +1584,7 @@ func (r schemaChangeResumer) Resume(
 			tableID:              tableID,
 			mutationID:           mutationID,
 			droppedDatabaseID:    droppedDatabaseID,
-			nodeID:               p.ExecCfg().NodeID.Get(),
+			sqlInstanceID:        p.ExecCfg().NodeID.SQLInstanceID(),
 			db:                   p.ExecCfg().DB,
 			leaseMgr:             p.ExecCfg().LeaseManager,
 			testingKnobs:         p.ExecCfg().SchemaChangerTestingKnobs,
@@ -1679,7 +1691,7 @@ func (r schemaChangeResumer) OnFailOrCancel(ctx context.Context, phs interface{}
 	sc := SchemaChanger{
 		tableID:              details.TableID,
 		mutationID:           details.MutationID,
-		nodeID:               p.ExecCfg().NodeID.Get(),
+		sqlInstanceID:        p.ExecCfg().NodeID.SQLInstanceID(),
 		db:                   p.ExecCfg().DB,
 		leaseMgr:             p.ExecCfg().LeaseManager,
 		testingKnobs:         p.ExecCfg().SchemaChangerTestingKnobs,

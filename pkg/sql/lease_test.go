@@ -197,8 +197,9 @@ func (t *leaseTest) mustPublish(ctx context.Context, nodeID uint32, descID sqlba
 func (t *leaseTest) node(nodeID uint32) *sql.LeaseManager {
 	mgr := t.nodes[nodeID]
 	if mgr == nil {
-		nc := &base.NodeIDContainer{}
-		nc.Set(context.TODO(), roachpb.NodeID(nodeID))
+		var c base.NodeIDContainer
+		c.Set(context.Background(), roachpb.NodeID(nodeID))
+		nc := base.NewSQLIDContainer(0, &c, true /* exposed*/)
 		// Hack the ExecutorConfig that we pass to the LeaseManager to have a
 		// different node id.
 		cfgCpy := t.server.ExecutorConfig().(sql.ExecutorConfig)
@@ -1086,7 +1087,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 		t.Fatal(err)
 	}
 
-	tableSpan := tableDesc.TableSpan()
+	tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
 	tests.CheckKeyCount(t, kvDB, tableSpan, 4)
 
 	// Allow async schema change waiting for GC to complete (when dropping an

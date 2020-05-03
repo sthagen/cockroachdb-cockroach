@@ -113,6 +113,7 @@ func Load(
 	evalCtx := &tree.EvalContext{}
 	evalCtx.SetTxnTimestamp(curTime)
 	evalCtx.SetStmtTimestamp(curTime)
+	evalCtx.Codec = keys.TODOSQLCodec
 
 	blobClientFactory := blobs.TestBlobServiceClient(writeToDir)
 	conf, err := cloud.ExternalStorageConfFromURI(uri)
@@ -223,7 +224,7 @@ func Load(
 			}
 
 			ri, err = row.MakeInserter(
-				ctx, nil, tableDesc, tableDesc.Columns, row.SkipFKs, nil /* fkTables */, &sqlbase.DatumAlloc{},
+				ctx, nil, evalCtx.Codec, tableDesc, tableDesc.Columns, row.SkipFKs, nil /* fkTables */, &sqlbase.DatumAlloc{},
 			)
 			if err != nil {
 				return backupccl.BackupManifest{}, errors.Wrap(err, "make row inserter")
@@ -384,7 +385,7 @@ func writeSST(
 	}
 
 	filename := fmt.Sprintf("load-%d.sst", rand.Int63())
-	log.Info(ctx, "writesst ", filename)
+	log.Infof(ctx, "writesst %s", filename)
 
 	sstFile := &storage.MemFile{}
 	sst := storage.MakeBackupSSTWriter(sstFile)

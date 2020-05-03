@@ -90,7 +90,7 @@ type anyNotNull_TYPEAgg struct {
 func (a *anyNotNull_TYPEAgg) Init(groups []bool, vec coldata.Vec) {
 	a.groups = groups
 	a.vec = vec
-	a.col = vec._TemplateType()
+	a.col = vec.TemplateType()
 	a.nulls = vec.Nulls()
 	a.Reset()
 }
@@ -131,7 +131,7 @@ func (a *anyNotNull_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 		return
 	}
 	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
-	col, nulls := vec._TemplateType(), vec.Nulls()
+	col, nulls := vec.TemplateType(), vec.Nulls()
 
 	a.allocator.PerformOperation(
 		[]coldata.Vec{a.vec},
@@ -195,11 +195,11 @@ func _FIND_ANY_NOT_NULL(a *anyNotNull_TYPEAgg, nulls *coldata.Nulls, i int, _HAS
 		a.foundNonNullForCurrentGroup = false
 	}
 	var isNull bool
-	// {{ if .HasNulls }}
+	// {{if .HasNulls}}
 	isNull = nulls.NullAt(i)
-	// {{ else }}
+	// {{else}}
 	isNull = false
-	// {{ end }}
+	// {{end}}
 	if !a.foundNonNullForCurrentGroup && !isNull {
 		// If we haven't seen any non-nulls for the current group yet, and the
 		// current value is non-null, then we can pick the current value to be the

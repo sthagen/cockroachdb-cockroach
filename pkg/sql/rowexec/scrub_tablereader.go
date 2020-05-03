@@ -68,7 +68,8 @@ func newScrubTableReader(
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (*scrubTableReader, error) {
-	if flowCtx.NodeID == 0 {
+	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
+	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
 		return nil, errors.Errorf("attempting to create a tableReader with uninitialized NodeID")
 	}
 	tr := &scrubTableReader{
@@ -121,8 +122,8 @@ func newScrubTableReader(
 
 	var fetcher row.Fetcher
 	if _, _, err := initRowFetcher(
-		&fetcher, &tr.tableDesc, int(spec.IndexIdx), tr.tableDesc.ColumnIdxMap(), spec.Reverse,
-		neededColumns, true /* isCheck */, &tr.alloc,
+		flowCtx, &fetcher, &tr.tableDesc, int(spec.IndexIdx), tr.tableDesc.ColumnIdxMap(),
+		spec.Reverse, neededColumns, true /* isCheck */, &tr.alloc,
 		execinfrapb.ScanVisibility_PUBLIC, spec.LockingStrength,
 	); err != nil {
 		return nil, err

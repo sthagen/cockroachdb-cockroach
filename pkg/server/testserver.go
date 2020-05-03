@@ -473,27 +473,31 @@ func testSQLServerArgs(ts *TestServer) sqlServerArgs {
 
 	dummyRecorder := &status.MetricsRecorder{}
 
-	var nodeIDContainer base.NodeIDContainer
+	const fakeNodeID = roachpb.NodeID(9999)
+	var c base.NodeIDContainer
+	c.Set(context.Background(), fakeNodeID)
+	const sqlInstanceID = base.SQLInstanceID(10001)
+	idContainer := base.NewSQLIDContainer(sqlInstanceID, &c, false /* exposed */)
 
 	// We don't need this for anything except some services that want a gRPC
 	// server to register against (but they'll never get RPCs at the time of
 	// writing): the blob service and DistSQL.
 	dummyRPCServer := rpc.NewServer(rpcContext)
-	noStatusServer := func() (*statusServer, bool) { return nil, false }
+	noStatusServer := serverpb.MakeOptionalStatusServer(nil)
 	return sqlServerArgs{
 		sqlServerOptionalArgs: sqlServerOptionalArgs{
 			rpcContext:   rpcContext,
 			distSender:   ds,
 			statusServer: noStatusServer,
 			nodeLiveness: nl,
-			gossip:       g,
+			gossip:       gossip.MakeDeprecatedGossip(g, false /* exposed */),
 			nodeDialer:   nd,
 			grpcServer:   dummyRPCServer,
 			recorder:     dummyRecorder,
 			isMeta1Leaseholder: func(timestamp hlc.Timestamp) (bool, error) {
 				return false, errors.New("fake isMeta1Leaseholder")
 			},
-			nodeIDContainer: &nodeIDContainer,
+			nodeIDContainer: idContainer,
 			externalStorage: func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
 				return nil, errors.New("fake external storage")
 			},
@@ -504,12 +508,14 @@ func testSQLServerArgs(ts *TestServer) sqlServerArgs {
 		Config:                   &cfg,
 		stopper:                  stopper,
 		clock:                    clock,
-		protectedtsProvider:      protectedTSProvider,
 		runtime:                  status.NewRuntimeStatSampler(context.Background(), clock),
+		tenantID:                 roachpb.SystemTenantID,
 		db:                       ts.DB(),
 		registry:                 registry,
+		sessionRegistry:          sql.NewSessionRegistry(),
 		circularInternalExecutor: circularInternalExecutor,
 		jobRegistry:              &jobs.Registry{},
+		protectedtsProvider:      protectedTSProvider,
 	}
 }
 
@@ -517,16 +523,14 @@ func testSQLServerArgs(ts *TestServer) sqlServerArgs {
 func (ts *TestServer) StartTenant() (addr string, _ error) {
 	ctx := context.Background()
 	args := testSQLServerArgs(ts)
-	const nodeID = 9999
-	args.nodeIDContainer.Set(context.Background(), nodeID)
 	s, err := newSQLServer(ctx, args)
 	if err != nil {
 		return "", err
 	}
 
-	s.execCfg.DistSQLPlanner.SetNodeDesc(roachpb.NodeDescriptor{
-		NodeID: args.nodeIDContainer.Get(),
-	})
+	// NB: this should no longer be necessary after #47902. Right now it keeps
+	// the tenant from crashing.
+	s.execCfg.DistSQLPlanner.SetNodeDesc(roachpb.NodeDescriptor{NodeID: -1})
 
 	connManager := netutil.MakeServer(
 		args.stopper,
@@ -1062,7 +1066,7 @@ func (ts *TestServer) ForceTableGC(
 		return errors.AssertionFailedf("expected 1 column from internal query")
 	}
 	tableID := uint32(*row[0].(*tree.DInt))
-	tblKey := roachpb.Key(keys.MakeTablePrefix(tableID))
+	tblKey := keys.SystemSQLCodec.TablePrefix(tableID)
 	gcr := roachpb.GCRequest{
 		RequestHeader: roachpb.RequestHeader{
 			Key:    tblKey,

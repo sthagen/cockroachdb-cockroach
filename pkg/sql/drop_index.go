@@ -263,7 +263,13 @@ func (p *planner) dropIndexByName(
 	for _, s := range zone.Subzones {
 		if s.IndexID != uint32(idx.ID) {
 			_, err = GenerateSubzoneSpans(
-				p.ExecCfg().Settings, p.ExecCfg().ClusterID(), tableDesc.TableDesc(), zone.Subzones, false /* newSubzones */)
+				p.ExecCfg().Settings,
+				p.ExecCfg().ClusterID(),
+				p.ExecCfg().Codec,
+				tableDesc.TableDesc(),
+				zone.Subzones,
+				false, /* newSubzones */
+			)
 			if sqlbase.IsCCLRequiredError(err) {
 				return sqlbase.NewCCLRequiredError(fmt.Errorf("schema change requires a CCL binary "+
 					"because table %q has at least one remaining index or partition with a zone config",
@@ -414,7 +420,9 @@ func (p *planner) dropIndexByName(
 			if err != nil {
 				return err
 			}
-			cascadedViews, err := p.removeDependentView(ctx, tableDesc, viewDesc)
+			viewJobDesc := fmt.Sprintf("removing view %q dependent on index %q which is being dropped",
+				viewDesc.Name, idx.Name)
+			cascadedViews, err := p.removeDependentView(ctx, tableDesc, viewDesc, viewJobDesc)
 			if err != nil {
 				return err
 			}
@@ -432,7 +440,7 @@ func (p *planner) dropIndexByName(
 		if idxEntry.ID == idx.ID {
 			// Unsplit all manually split ranges in the index so they can be
 			// automatically merged by the merge queue.
-			span := tableDesc.IndexSpan(idxEntry.ID)
+			span := tableDesc.IndexSpan(p.ExecCfg().Codec, idxEntry.ID)
 			ranges, err := ScanMetaKVs(ctx, p.txn, span)
 			if err != nil {
 				return err
@@ -497,7 +505,7 @@ func (p *planner) dropIndexByName(
 		p.txn,
 		EventLogDropIndex,
 		int32(tableDesc.ID),
-		int32(p.extendedEvalCtx.NodeID),
+		int32(p.extendedEvalCtx.NodeID.SQLInstanceID()),
 		struct {
 			TableName           string
 			IndexName           string

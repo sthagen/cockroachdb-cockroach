@@ -1208,7 +1208,7 @@ func TestReplicaGossipConfigsOnLease(t *testing.T) {
 	}
 
 	// Write some arbitrary data in the system config span.
-	key := keys.MakeTablePrefix(keys.MaxSystemConfigDescID)
+	key := keys.SystemSQLCodec.TablePrefix(keys.MaxSystemConfigDescID)
 	var val roachpb.Value
 	val.SetInt(42)
 	if err := storage.MVCCPut(context.Background(), tc.engine, nil, key, hlc.Timestamp{}, val, nil); err != nil {
@@ -1480,7 +1480,7 @@ func TestReplicaNoGossipConfig(t *testing.T) {
 	tc.Start(t, stopper)
 
 	// Write some arbitrary data in the system span (up to, but not including MaxReservedID+1)
-	key := keys.MakeTablePrefix(keys.MaxReservedDescID)
+	key := keys.SystemSQLCodec.TablePrefix(keys.MaxReservedDescID)
 
 	txn := newTransaction("test", key, 1 /* userPriority */, tc.Clock())
 	h := roachpb.Header{Txn: txn}
@@ -1525,7 +1525,7 @@ func TestReplicaNoGossipFromNonLeader(t *testing.T) {
 	tc.Start(t, stopper)
 
 	// Write some arbitrary data in the system span (up to, but not including MaxReservedID+1)
-	key := keys.MakeTablePrefix(keys.MaxReservedDescID)
+	key := keys.SystemSQLCodec.TablePrefix(keys.MaxReservedDescID)
 
 	txn := newTransaction("test", key, 1 /* userPriority */, tc.Clock())
 	req1 := putArgs(key, nil)
@@ -8705,7 +8705,7 @@ func TestReplicaMetrics(t *testing.T) {
 				context.Background(), hlc.Timestamp{}, &cfg.RaftConfig, zoneConfig,
 				c.liveness, 0, &c.desc, c.raftStatus, storagepb.LeaseStatus{},
 				c.storeID, c.expected.Quiescent, c.expected.Ticking,
-				storagepb.LatchManagerInfo{}, storagepb.LatchManagerInfo{}, c.raftLogSize)
+				storagepb.LatchManagerInfo{}, storagepb.LatchManagerInfo{}, c.raftLogSize, true)
 			if c.expected != metrics {
 				t.Fatalf("unexpected metrics:\n%s", pretty.Diff(c.expected, metrics))
 			}
@@ -9335,6 +9335,7 @@ type testQuiescer struct {
 	mergeInProgress bool
 	isDestroyed     bool
 	livenessMap     IsLiveMap
+	pendingQuota    bool
 }
 
 func (q *testQuiescer) descRLocked() *roachpb.RangeDescriptor {
@@ -9355,6 +9356,10 @@ func (q *testQuiescer) hasRaftReadyRLocked() bool {
 
 func (q *testQuiescer) hasPendingProposalsRLocked() bool {
 	return q.numProposals > 0
+}
+
+func (q *testQuiescer) hasPendingProposalQuotaRLocked() bool {
+	return q.pendingQuota
 }
 
 func (q *testQuiescer) ownsValidLeaseRLocked(ts hlc.Timestamp) bool {
@@ -9430,6 +9435,10 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 	})
 	test(false, func(q *testQuiescer) *testQuiescer {
 		q.numProposals = 1
+		return q
+	})
+	test(false, func(q *testQuiescer) *testQuiescer {
+		q.pendingQuota = true
 		return q
 	})
 	test(false, func(q *testQuiescer) *testQuiescer {
@@ -12245,7 +12254,7 @@ func TestLaterReproposalsDoNotReuseContext(t *testing.T) {
 func TestReplicaTelemetryCounterForPushesDueToClosedTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
-	keyA := append(keys.MakeTablePrefix(math.MaxUint32), 'a')
+	keyA := append(keys.SystemSQLCodec.TablePrefix(math.MaxUint32), 'a')
 	keyAA := append(keyA[:len(keyA):len(keyA)], 'a')
 	rKeyA, err := keys.Addr(keyA)
 	putReq := func(key roachpb.Key) *roachpb.PutRequest {

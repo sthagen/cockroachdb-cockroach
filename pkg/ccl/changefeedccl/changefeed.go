@@ -54,12 +54,13 @@ type emitEntry struct {
 // returns a closure that may be repeatedly called to advance the changefeed.
 // The returned closure is not threadsafe.
 func kvsToRows(
+	codec keys.SQLCodec,
 	leaseMgr *sql.LeaseManager,
 	details jobspb.ChangefeedDetails,
 	inputFn func(context.Context) (kvfeed.Event, error),
 ) func(context.Context) ([]emitEntry, error) {
 	_, withDiff := details.Opts[changefeedbase.OptDiff]
-	rfCache := newRowFetcherCache(leaseMgr)
+	rfCache := newRowFetcherCache(codec, leaseMgr)
 
 	var kvs row.SpanKVFetcher
 	appendEmitEntryForKV := func(
@@ -402,7 +403,7 @@ func makeSpansToProtect(targets jobspb.ChangefeedTargets) []roachpb.Span {
 	// of table descriptors to version data.
 	spansToProtect := make([]roachpb.Span, 0, len(targets)+1)
 	addTablePrefix := func(id uint32) {
-		tablePrefix := roachpb.Key(keys.MakeTablePrefix(id))
+		tablePrefix := keys.TODOSQLCodec.TablePrefix(id)
 		spansToProtect = append(spansToProtect, roachpb.Span{
 			Key:    tablePrefix,
 			EndKey: tablePrefix.PrefixEnd(),

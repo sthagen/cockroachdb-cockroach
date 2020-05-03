@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -52,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -186,6 +188,30 @@ var optDrivenFKCascadesClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.experimental_optimizer_foreign_key_cascades.enabled",
 	"default value for experimental_optimizer_foreign_key_cascades session setting; enables optimizer-driven foreign key cascades by default",
 	false,
+)
+
+// optUseHistogramsClusterMode controls the cluster default for whether
+// histograms are used by the optimizer for cardinality estimation.
+// Note that it does not control histogram collection; regardless of the
+// value of this setting, the optimizer cannot use histograms if they
+// haven't been collected. Collection of histograms is controlled by the
+// cluster setting sql.stats.histogram_collection.enabled.
+var optUseHistogramsClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.optimizer_use_histograms.enabled",
+	"default value for optimizer_use_histograms session setting; enables usage of histograms in the optimizer by default",
+	true,
+)
+
+// optUseMultiColStatsClusterMode controls the cluster default for whether
+// multi-column stats are used by the optimizer for cardinality estimation.
+// Note that it does not control collection of multi-column stats; regardless
+// of the value of this setting, the optimizer cannot use multi-column stats
+// if they haven't been collected. Collection of multi-column stats is
+// controlled by the cluster setting sql.stats.multi_column_collection.enabled.
+var optUseMultiColStatsClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.optimizer_use_multicol_stats.enabled",
+	"default value for optimizer_use_multicol_stats session setting; enables usage of multi-column stats in the optimizer by default",
+	true,
 )
 
 var implicitSelectForUpdateClusterMode = settings.RegisterBoolSetting(
@@ -543,7 +569,7 @@ func getMetricMeta(meta metric.Metadata, internal bool) metric.Metadata {
 // NodeInfo contains metadata about the executing node and cluster.
 type NodeInfo struct {
 	ClusterID func() uuid.UUID
-	NodeID    *base.NodeIDContainer
+	NodeID    *base.SQLIDContainer
 	AdminURL  func() *url.URL
 	PGURL     func(*url.Userinfo) (*url.URL, error)
 }
@@ -561,21 +587,19 @@ type nodeStatusGenerator interface {
 type ExecutorConfig struct {
 	Settings *cluster.Settings
 	NodeInfo
+	Codec             keys.SQLCodec
 	DefaultZoneConfig *zonepb.ZoneConfig
 	Locality          roachpb.Locality
 	AmbientCtx        log.AmbientContext
 	DB                *kv.DB
-	Gossip            *gossip.Gossip
+	Gossip            gossip.DeprecatedGossip
 	DistSender        *kvcoord.DistSender
 	RPCContext        *rpc.Context
 	LeaseManager      *LeaseManager
 	Clock             *hlc.Clock
 	DistSQLSrv        *distsql.ServerImpl
 	// StatusServer gives access to the Status service.
-	//
-	// In a SQL tenant server, this is not available (returning false) and
-	// pgerror.UnsupportedWithMultiTenancy should be returned.
-	StatusServer     func() (serverpb.StatusServer, bool)
+	StatusServer     serverpb.OptionalStatusServer
 	MetricsRecorder  nodeStatusGenerator
 	SessionRegistry  *SessionRegistry
 	JobRegistry      *jobs.Registry
@@ -610,7 +634,7 @@ type ExecutorConfig struct {
 	ProtectedTimestampProvider protectedts.Provider
 
 	// StmtDiagnosticsRecorder deals with recording statement diagnostics.
-	StmtDiagnosticsRecorder StmtDiagnosticsRecorder
+	StmtDiagnosticsRecorder *stmtdiagnostics.Registry
 }
 
 // Organization returns the value of cluster.organization.
@@ -1933,6 +1957,14 @@ func (m *sessionDataMutator) SetOptimizerFKChecks(val bool) {
 
 func (m *sessionDataMutator) SetOptimizerFKCascades(val bool) {
 	m.data.OptimizerFKCascades = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseHistograms(val bool) {
+	m.data.OptimizerUseHistograms = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseMultiColStats(val bool) {
+	m.data.OptimizerUseMultiColStats = val
 }
 
 func (m *sessionDataMutator) SetImplicitSelectForUpdate(val bool) {

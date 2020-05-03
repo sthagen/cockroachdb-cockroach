@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
@@ -82,7 +81,7 @@ func updateStatusForGCElements(
 	progress *jobspb.SchemaChangeGCProgress,
 ) (expired bool, timeToNextTrigger time.Time) {
 	defTTL := execCfg.DefaultZoneConfig.GC.TTLSeconds
-	cfg := execCfg.Gossip.GetSystemConfig()
+	cfg := execCfg.Gossip.Deprecated(47150).GetSystemConfig()
 	protectedtsCache := execCfg.ProtectedTimestampProvider
 
 	earliestDeadline := timeutil.Unix(0, int64(math.MaxInt64))
@@ -105,7 +104,7 @@ func updateStatusForGCElements(
 
 		// Update the status of the table if the table was dropped.
 		if table.Dropped() {
-			deadline := updateTableStatus(ctx, int64(tableTTL), protectedtsCache, table, tableDropTimes, progress)
+			deadline := updateTableStatus(ctx, execCfg, int64(tableTTL), protectedtsCache, table, tableDropTimes, progress)
 			if timeutil.Until(deadline) < 0 {
 				expired = true
 			} else if deadline.Before(earliestDeadline) {
@@ -114,7 +113,7 @@ func updateStatusForGCElements(
 		}
 
 		// Update the status of any indexes waiting for GC.
-		indexesExpired, deadline := updateIndexesStatus(ctx, tableTTL, table, protectedtsCache, placeholder, indexDropTimes, progress)
+		indexesExpired, deadline := updateIndexesStatus(ctx, execCfg, tableTTL, table, protectedtsCache, placeholder, indexDropTimes, progress)
 		if indexesExpired {
 			expired = true
 		}
@@ -135,6 +134,7 @@ func updateStatusForGCElements(
 // expired.
 func updateTableStatus(
 	ctx context.Context,
+	execCfg *sql.ExecutorConfig,
 	ttlSeconds int64,
 	protectedtsCache protectedts.Cache,
 	table *sqlbase.TableDescriptor,
@@ -142,7 +142,7 @@ func updateTableStatus(
 	progress *jobspb.SchemaChangeGCProgress,
 ) time.Time {
 	deadline := timeutil.Unix(0, int64(math.MaxInt64))
-	sp := table.TableSpan()
+	sp := table.TableSpan(execCfg.Codec)
 
 	for i, t := range progress.Tables {
 		droppedTable := &progress.Tables[i]
@@ -180,6 +180,7 @@ func updateTableStatus(
 // index should be GC'd, if any, otherwise MaxInt.
 func updateIndexesStatus(
 	ctx context.Context,
+	execCfg *sql.ExecutorConfig,
 	tableTTL int32,
 	table *sqlbase.TableDescriptor,
 	protectedtsCache protectedts.Cache,
@@ -195,7 +196,7 @@ func updateIndexesStatus(
 			continue
 		}
 
-		sp := table.IndexSpan(idxProgress.IndexID)
+		sp := table.IndexSpan(execCfg.Codec, idxProgress.IndexID)
 
 		ttlSeconds := getIndexTTL(tableTTL, placeholder, idxProgress.IndexID)
 
@@ -272,9 +273,8 @@ func isProtected(
 func setupConfigWatcher(
 	execCfg *sql.ExecutorConfig,
 ) (gossip.SystemConfigDeltaFilter, <-chan struct{}) {
-	k := keys.MakeTablePrefix(uint32(keys.ZonesTableID))
-	k = encoding.EncodeUvarintAscending(k, uint64(keys.ZonesTablePrimaryIndexID))
+	k := keys.TODOSQLCodec.IndexPrefix(uint32(keys.ZonesTableID), uint32(keys.ZonesTablePrimaryIndexID))
 	zoneCfgFilter := gossip.MakeSystemConfigDeltaFilter(k)
-	gossipUpdateC := execCfg.Gossip.RegisterSystemConfigChannel()
+	gossipUpdateC := execCfg.Gossip.Deprecated(47150).RegisterSystemConfigChannel()
 	return zoneCfgFilter, gossipUpdateC
 }

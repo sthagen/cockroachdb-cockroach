@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -68,7 +69,7 @@ func TestTableReader(t *testing.T) {
 
 	makeIndexSpan := func(start, end int) execinfrapb.TableReaderSpan {
 		var span roachpb.Span
-		prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(td, td.Indexes[0].ID))
+		prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(keys.SystemSQLCodec, td, td.Indexes[0].ID))
 		span.Key = append(prefix, encoding.EncodeVarintAscending(nil, int64(start))...)
 		span.EndKey = append(span.EndKey, prefix...)
 		span.EndKey = append(span.EndKey, encoding.EncodeVarintAscending(nil, int64(end))...)
@@ -82,7 +83,7 @@ func TestTableReader(t *testing.T) {
 	}{
 		{
 			spec: execinfrapb.TableReaderSpec{
-				Spans: []execinfrapb.TableReaderSpan{{Span: td.PrimaryIndexSpan()}},
+				Spans: []execinfrapb.TableReaderSpan{{Span: td.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 			},
 			post: execinfrapb.PostProcessSpec{
 				Filter:        execinfrapb.Expression{Expr: "@3 < 5 AND @2 != 3"}, // sum < 5 && b != 3
@@ -93,7 +94,7 @@ func TestTableReader(t *testing.T) {
 		},
 		{
 			spec: execinfrapb.TableReaderSpec{
-				Spans: []execinfrapb.TableReaderSpan{{Span: td.PrimaryIndexSpan()}},
+				Spans: []execinfrapb.TableReaderSpan{{Span: td.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 			},
 			post: execinfrapb.PostProcessSpec{
 				Filter:        execinfrapb.Expression{Expr: "@3 < 5 AND @2 != 3"},
@@ -131,7 +132,7 @@ func TestTableReader(t *testing.T) {
 					EvalCtx: &evalCtx,
 					Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
 					Txn:     kv.NewTxn(ctx, s.DB(), s.NodeID()),
-					NodeID:  s.NodeID(),
+					NodeID:  evalCtx.NodeID,
 				}
 
 				var out execinfra.RowReceiver
@@ -211,15 +212,15 @@ ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[
 	st := tc.Server(0).ClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
-	nodeID := tc.Server(0).NodeID()
+
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Cfg:     &execinfra.ServerConfig{Settings: st},
-		Txn:     kv.NewTxn(ctx, tc.Server(0).DB(), nodeID),
-		NodeID:  nodeID,
+		Txn:     kv.NewTxn(ctx, tc.Server(0).DB(), tc.Server(0).NodeID()),
+		NodeID:  evalCtx.NodeID,
 	}
 	spec := execinfrapb.TableReaderSpec{
-		Spans: []execinfrapb.TableReaderSpan{{Span: td.PrimaryIndexSpan()}},
+		Spans: []execinfrapb.TableReaderSpan{{Span: td.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 		Table: *td,
 	}
 	post := execinfrapb.PostProcessSpec{
@@ -321,11 +322,11 @@ func TestLimitScans(t *testing.T) {
 		EvalCtx: &evalCtx,
 		Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
 		Txn:     kv.NewTxn(ctx, kvDB, s.NodeID()),
-		NodeID:  s.NodeID(),
+		NodeID:  evalCtx.NodeID,
 	}
 	spec := execinfrapb.TableReaderSpec{
 		Table: *tableDesc,
-		Spans: []execinfrapb.TableReaderSpan{{Span: tableDesc.PrimaryIndexSpan()}},
+		Spans: []execinfrapb.TableReaderSpan{{Span: tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 	}
 	// We're going to ask for 3 rows, all contained in the first range.
 	const limit = 3
@@ -425,13 +426,13 @@ func BenchmarkTableReader(b *testing.B) {
 			EvalCtx: &evalCtx,
 			Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
 			Txn:     kv.NewTxn(ctx, s.DB(), s.NodeID()),
-			NodeID:  s.NodeID(),
+			NodeID:  evalCtx.NodeID,
 		}
 
 		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
 			spec := execinfrapb.TableReaderSpec{
 				Table: *tableDesc,
-				Spans: []execinfrapb.TableReaderSpan{{Span: tableDesc.PrimaryIndexSpan()}},
+				Spans: []execinfrapb.TableReaderSpan{{Span: tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 			}
 			post := execinfrapb.PostProcessSpec{}
 

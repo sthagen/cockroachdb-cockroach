@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -216,7 +217,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 func mustParseOne(s string) parser.Statement {
 	stmts, err := parser.Parse(s)
 	if err != nil {
-		log.Fatal(context.TODO(), err)
+		log.Fatalf(context.TODO(), "%v", err)
 	}
 	return stmts[0]
 }
@@ -253,8 +254,7 @@ func startConnExecutor(
 		})
 	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock)
 	st := cluster.MakeTestingClusterSettings()
-	nodeID := &base.NodeIDContainer{}
-	nodeID.Set(ctx, 1)
+	nodeID := base.TestingIDContainer
 	distSQLMetrics := execinfra.MakeDistSQLMetrics(time.Hour /* histogramWindow */)
 	cfg := &ExecutorConfig{
 		AmbientCtx:      testutils.MakeAmbientCtx(),
@@ -266,6 +266,7 @@ func startConnExecutor(
 			NodeID:    nodeID,
 			ClusterID: func() uuid.UUID { return uuid.UUID{} },
 		},
+		Codec: keys.SystemSQLCodec,
 		DistSQLPlanner: NewDistSQLPlanner(
 			ctx, execinfra.Version, st, roachpb.NodeDescriptor{NodeID: 1},
 			nil, /* rpcCtx */

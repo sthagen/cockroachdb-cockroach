@@ -76,23 +76,24 @@ func _REHASH_BODY(
 	// {{define "rehashBody" -}}
 	// Early bounds checks.
 	_ = buckets[nKeys-1]
-	// {{ if .HasSel }}
+	// {{if .HasSel}}
 	_ = sel[nKeys-1]
-	// {{ else }}
+	// {{else}}
 	_ = execgen.UNSAFEGET(keys, nKeys-1)
-	// {{ end }}
+	// {{end}}
+	var selIdx int
 	for i := 0; i < nKeys; i++ {
 		cancelChecker.check(ctx)
-		// {{ if .HasSel }}
-		selIdx := sel[i]
-		// {{ else }}
-		selIdx := i
-		// {{ end }}
-		// {{ if .HasNulls }}
+		// {{if .HasSel}}
+		selIdx = sel[i]
+		// {{else}}
+		selIdx = i
+		// {{end}}
+		// {{if .HasNulls}}
 		if nulls.NullAt(selIdx) {
 			continue
 		}
-		// {{ end }}
+		// {{end}}
 		v := execgen.UNSAFEGET(keys, selIdx)
 		p := uintptr(buckets[i])
 		_ASSIGN_HASH(p, v)
@@ -121,7 +122,7 @@ func rehash(
 	switch typeconv.FromColumnType(t) {
 	// {{range $hashType := .}}
 	case _TYPES_T:
-		keys, nulls := col._TemplateType(), col.Nulls()
+		keys, nulls := col.TemplateType(), col.Nulls()
 		if col.MaybeHasNulls() {
 			if sel != nil {
 				_REHASH_BODY(ctx, buckets, keys, nulls, nKeys, sel, true, true)

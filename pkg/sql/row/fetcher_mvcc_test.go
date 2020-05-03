@@ -95,7 +95,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 			valNeededForCol.Add(colIdx)
 		}
 		args = append(args, row.FetcherTableArgs{
-			Spans:            desc.AllIndexSpans(),
+			Spans:            desc.AllIndexSpans(keys.SystemSQLCodec),
 			Desc:             desc,
 			Index:            &desc.PrimaryIndex,
 			ColIdxMap:        colIdxMap,
@@ -106,6 +106,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 	}
 	var rf row.Fetcher
 	if err := rf.Init(
+		keys.SystemSQLCodec,
 		false, /* reverse */
 		sqlbase.ScanLockingStrength_FOR_NONE,
 		false, /* returnRangeInfo */
@@ -123,7 +124,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 	kvsToRows := func(kvs []roachpb.KeyValue) []rowWithMVCCMetadata {
 		t.Helper()
 		for _, kv := range kvs {
-			log.Info(ctx, kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
+			log.Infof(ctx, "%v %v %v", kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
 		}
 
 		if err := rf.StartScanFrom(ctx, &row.SpanKVFetcher{KVs: kvs}); err != nil {

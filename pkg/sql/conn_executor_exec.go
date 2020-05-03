@@ -329,7 +329,11 @@ func (ex *connExecutor) execStmtInOpenState(
 			}
 			typeHints = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
 			for i, t := range s.Types {
-				typeHints[i] = t
+				resolved, err := tree.ResolveType(t, ex.planner.semaCtx.GetTypeResolver())
+				if err != nil {
+					return makeErrEvent(err)
+				}
+				typeHints[i] = resolved
 			}
 		}
 		if _, err := ex.addPreparedStmt(
@@ -617,7 +621,7 @@ func (ex *connExecutor) checkTableTwoVersionInvariant(ctx context.Context) error
 
 	// Create a new transaction to retry with a higher timestamp than the
 	// timestamps used in the retry loop above.
-	ex.state.mu.txn = kv.NewTxnWithSteppingEnabled(ctx, ex.transitionCtx.db, ex.transitionCtx.nodeID)
+	ex.state.mu.txn = kv.NewTxnWithSteppingEnabled(ctx, ex.transitionCtx.db, ex.transitionCtx.nodeIDOrZero)
 	if err := ex.state.mu.txn.SetUserPriority(userPriority); err != nil {
 		return err
 	}
@@ -725,7 +729,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	var cols sqlbase.ResultColumns
 	if stmt.AST.StatementType() == tree.Rows {
-		cols = planColumns(planner.curPlan.plan)
+		cols = planColumns(planner.curPlan.main)
 	}
 	if err := ex.initStatementResult(ctx, res, stmt, cols); err != nil {
 		res.SetError(err)
@@ -734,8 +738,10 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	ex.sessionTracing.TracePlanCheckStart(ctx)
 	distributePlan := false
-	distributePlan = shouldDistributePlan(
-		ctx, ex.sessionData.DistSQLMode, ex.server.cfg.DistSQLPlanner, planner.curPlan.plan)
+	if _, noMultiTenancy := planner.execCfg.NodeID.OptionalNodeID(); noMultiTenancy {
+		distributePlan = shouldDistributePlan(
+			ctx, ex.sessionData.DistSQLMode, ex.server.cfg.DistSQLPlanner, planner.curPlan.main)
+	}
 	ex.sessionTracing.TracePlanCheckEnd(ctx, nil, distributePlan)
 
 	if ex.server.cfg.TestingKnobs.BeforeExecute != nil {
@@ -853,7 +859,9 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	}
 
 	var evalCtxFactory func() *extendedEvalContext
-	if len(planner.curPlan.subqueryPlans) != 0 || len(planner.curPlan.postqueryPlans) != 0 {
+	if len(planner.curPlan.subqueryPlans) != 0 ||
+		len(planner.curPlan.cascades) != 0 ||
+		len(planner.curPlan.checkPlans) != 0 {
 		// The factory reuses the same object because the contexts are not used
 		// concurrently.
 		var factoryEvalCtx extendedEvalContext
@@ -881,7 +889,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	// We pass in whether or not we wanted to distribute this plan, which tells
 	// the planner whether or not to plan remote table readers.
 	cleanup := ex.server.cfg.DistSQLPlanner.PlanAndRun(
-		ctx, evalCtx, planCtx, planner.txn, planner.curPlan.plan, recv,
+		ctx, evalCtx, planCtx, planner.txn, planner.curPlan.main, recv,
 	)
 	// Note that we're not cleaning up right away because postqueries might
 	// need to have access to the main query tree.
@@ -890,11 +898,9 @@ func (ex *connExecutor) execWithDistSQLEngine(
 		return recv.bytesRead, recv.rowsRead, recv.commErr
 	}
 
-	if len(planner.curPlan.postqueryPlans) != 0 {
-		ex.server.cfg.DistSQLPlanner.PlanAndRunPostqueries(
-			ctx, planner, evalCtxFactory, planner.curPlan.postqueryPlans, recv, distribute,
-		)
-	}
+	ex.server.cfg.DistSQLPlanner.PlanAndRunCascadesAndChecks(
+		ctx, planner, evalCtxFactory, &planner.curPlan.planComponents, recv, distribute,
+	)
 
 	return recv.bytesRead, recv.rowsRead, recv.commErr
 }

@@ -237,6 +237,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// bootstrapped; otherwise a new one is allocated in Node.
 	nodeIDContainer := &base.NodeIDContainer{}
 	cfg.AmbientCtx.AddLogTag("n", nodeIDContainer)
+	const sqlInstanceID = base.SQLInstanceID(0)
+	idContainer := base.NewSQLIDContainer(sqlInstanceID, nodeIDContainer, true /* exposed */)
 
 	ctx := cfg.AmbientCtx.AnnotateCtx(context.Background())
 
@@ -260,7 +262,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	rpcContext.HeartbeatCB = func() {
 		if err := rpcContext.RemoteClocks.VerifyClockOffset(ctx); err != nil {
-			log.Fatal(ctx, err)
+			log.Fatalf(ctx, "%v", err)
 		}
 	}
 	registry.AddMetricStruct(rpcContext.Metrics())
@@ -329,7 +331,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	tcsFactory := kvcoord.NewTxnCoordSenderFactory(txnCoordSenderFactoryCfg, distSender)
 
 	dbCtx := kv.DefaultDBContext()
-	dbCtx.NodeID = nodeIDContainer
+	dbCtx.NodeID = idContainer
 	dbCtx.Stopper = stopper
 	db := kv.NewDBWithContext(cfg.AmbientCtx, tcsFactory, clock, dbCtx)
 
@@ -521,17 +523,15 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	sqlServer, err := newSQLServer(ctx, sqlServerArgs{
 		sqlServerOptionalArgs: sqlServerOptionalArgs{
-			rpcContext: rpcContext,
-			distSender: distSender,
-			statusServer: func() (*statusServer, bool) {
-				return sStatus, true
-			},
+			rpcContext:             rpcContext,
+			distSender:             distSender,
+			statusServer:           serverpb.MakeOptionalStatusServer(sStatus),
 			nodeLiveness:           nodeLiveness,
-			gossip:                 g,
+			gossip:                 gossip.MakeDeprecatedGossip(g, true /* exposed */),
 			nodeDialer:             nodeDialer,
 			grpcServer:             grpcServer.Server,
 			recorder:               recorder,
-			nodeIDContainer:        nodeIDContainer,
+			nodeIDContainer:        idContainer,
 			externalStorage:        externalStorage,
 			externalStorageFromURI: externalStorageFromURI,
 			isMeta1Leaseholder:     node.stores.IsMeta1Leaseholder,
@@ -539,16 +539,19 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		Config:                   &cfg, // NB: s.cfg has a populated AmbientContext.
 		stopper:                  stopper,
 		clock:                    clock,
-		protectedtsProvider:      protectedtsProvider,
 		runtime:                  runtimeSampler,
+		tenantID:                 roachpb.SystemTenantID,
 		db:                       db,
 		registry:                 registry,
+		sessionRegistry:          sessionRegistry,
 		circularInternalExecutor: internalExecutor,
 		jobRegistry:              jobRegistry,
+		protectedtsProvider:      protectedtsProvider,
 	})
 	if err != nil {
 		return nil, err
 	}
+	sStatus.setStmtDiagnosticsRequester(sqlServer.execCfg.StmtDiagnosticsRecorder)
 	debugServer := debug.NewServer(st, sqlServer.pgServer.HBADebugFn())
 	node.InitLogger(sqlServer.execCfg)
 
@@ -1048,7 +1051,7 @@ func (s *Server) Start(ctx context.Context) error {
 				ctx, s.engines, v.BinaryVersion(), v.BinaryMinSupportedVersion(),
 			)
 			if err != nil {
-				log.Fatal(ctx, err)
+				log.Fatalf(ctx, "%v", err)
 			}
 			if !prevCV.Version.Less(newCV.Version) {
 				// If nothing needs to be updated, don't do anything. The
@@ -1058,7 +1061,7 @@ func (s *Server) Start(ctx context.Context) error {
 				return
 			}
 			if err := kvserver.WriteClusterVersionToEngines(ctx, s.engines, newCV); err != nil {
-				log.Fatal(ctx, err)
+				log.Fatalf(ctx, "%v", err)
 			}
 			log.Infof(ctx, "active cluster version is now %s (up from %s)", newCV, prevCV)
 		}
@@ -1154,7 +1157,7 @@ func (s *Server) Start(ctx context.Context) error {
 		<-s.stopper.ShouldQuiesce()
 		for _, c := range []net.Conn{c1, c2} {
 			if err := c.Close(); err != nil {
-				log.Fatal(workersCtx, err)
+				log.Fatalf(workersCtx, "%v", err)
 			}
 		}
 	})
@@ -1183,7 +1186,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
 		<-s.stopper.ShouldQuiesce()
 		if err := conn.Close(); err != nil {
-			log.Fatal(workersCtx, err)
+			log.Fatalf(workersCtx, "%v", err)
 		}
 	})
 
@@ -1468,7 +1471,7 @@ func (s *Server) Start(ctx context.Context) error {
 		if err := s.node.stores.VisitStores(func(s *kvserver.Store) error {
 			return s.WriteLastUpTimestamp(ctx, now)
 		}); err != nil {
-			log.Warning(ctx, errors.Wrap(err, "writing last up timestamp"))
+			log.Warningf(ctx, "writing last up timestamp: %v", err)
 		}
 	})
 
@@ -1614,7 +1617,7 @@ func (s *Server) startListenRPCAndSQL(
 		s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
 			<-s.stopper.ShouldQuiesce()
 			if err := pgL.Close(); err != nil {
-				log.Fatal(workersCtx, err)
+				log.Fatalf(workersCtx, "%v", err)
 			}
 		})
 		log.Eventf(ctx, "listening on sql port %s", s.cfg.SQLAddr)
@@ -1695,7 +1698,7 @@ func (s *Server) startServeUI(
 	s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
 		<-s.stopper.ShouldQuiesce()
 		if err := httpLn.Close(); err != nil {
-			log.Fatal(workersCtx, err)
+			log.Fatalf(workersCtx, "%v", err)
 		}
 	})
 
@@ -1779,7 +1782,7 @@ func (s *sqlServer) startServeSQL(
 		stopper.RunWorker(ctx, func(workersCtx context.Context) {
 			<-stopper.ShouldQuiesce()
 			if err := unixLn.Close(); err != nil {
-				log.Fatal(workersCtx, err)
+				log.Fatalf(workersCtx, "%v", err)
 			}
 		})
 
@@ -1787,7 +1790,7 @@ func (s *sqlServer) startServeSQL(
 			netutil.FatalIfUnexpected(connManager.ServeWith(pgCtx, stopper, unixLn, func(conn net.Conn) {
 				connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
 				if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketUnix); err != nil {
-					log.Error(connCtx, err)
+					log.Errorf(connCtx, "%v", err)
 				}
 			}))
 		})

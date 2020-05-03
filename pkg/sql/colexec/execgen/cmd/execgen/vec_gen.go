@@ -32,7 +32,7 @@ func genVec(wr io.Writer) error {
 	// Replace the template variables.
 	s = strings.Replace(s, "_GOTYPE", "{{.LTyp.GoTypeName}}", -1)
 	s = strings.Replace(s, "_TYPES_T", "coltypes.{{.LTyp}}", -1)
-	s = strings.Replace(s, "_TemplateType", "{{.LTyp}}", -1)
+	s = strings.Replace(s, "TemplateType", "{{.LTyp}}", -1)
 	s = replaceManipulationFuncs(".LTyp", s)
 
 	copyWithSel := makeFunctionRegex("_COPY_WITH_SEL", 6)
@@ -44,7 +44,10 @@ func genVec(wr io.Writer) error {
 		return err
 	}
 
-	return tmpl.Execute(wr, sameTypeComparisonOpToOverloads[tree.NE])
+	// It doesn't matter that we're passing in all overloads of Equality
+	// comparison operator - we simply need to iterate over all supported
+	// types.
+	return tmpl.Execute(wr, sameTypeComparisonOpToOverloads[tree.EQ])
 }
 func init() {
 	registerGenerator(genVec, "vec.eg.go", vecTmpl)

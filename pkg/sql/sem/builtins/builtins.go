@@ -31,6 +31,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -66,7 +67,7 @@ var (
 	errChrValueTooLarge = pgerror.Newf(pgcode.InvalidParameterValue,
 		"input value must be <= %d (maximum Unicode code point)", utf8.MaxRune)
 	errStringTooLarge = pgerror.Newf(pgcode.ProgramLimitExceeded,
-		fmt.Sprintf("requested length too large, exceeds %s", humanizeutil.IBytes(maxAllocatedStringSize)))
+		"requested length too large, exceeds %s", humanizeutil.IBytes(maxAllocatedStringSize))
 )
 
 const maxAllocatedStringSize = 128 * 1024 * 1024
@@ -1531,7 +1532,7 @@ CockroachDB supports the following flags:
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return tree.NewDInt(GenerateUniqueInt(ctx.NodeID)), nil
+				return tree.NewDInt(GenerateUniqueInt(ctx.NodeID.SQLInstanceID())), nil
 			},
 			Info: "Returns a unique ID used by CockroachDB to generate unique row IDs if a " +
 				"Primary Key isn't defined for the table. The value is a combination of the " +
@@ -2864,7 +2865,7 @@ may increase either contention or retry errors, or both.`,
 				}
 
 				if indexDesc.ID == tableDesc.PrimaryIndex.ID {
-					keyPrefix := tableDesc.IndexSpan(indexDesc.ID).Key
+					keyPrefix := sqlbase.MakeIndexKeyPrefix(ctx.Codec, tableDesc, indexDesc.ID)
 					res, _, err := sqlbase.EncodeIndexKey(tableDesc, indexDesc, colMap, datums, keyPrefix)
 					if err != nil {
 						return nil, err
@@ -2872,7 +2873,7 @@ may increase either contention or retry errors, or both.`,
 					return tree.NewDBytes(tree.DBytes(res)), err
 				}
 				// We have a secondary index.
-				res, err := sqlbase.EncodeSecondaryIndex(tableDesc, indexDesc, colMap, datums, true /* includeEmpty */)
+				res, err := sqlbase.EncodeSecondaryIndex(ctx.Codec, tableDesc, indexDesc, colMap, datums, true /* includeEmpty */)
 				if err != nil {
 					return nil, err
 				}
@@ -2898,10 +2899,12 @@ may increase either contention or retry errors, or both.`,
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				errCode := string(*args[0].(*tree.DString))
 				msg := string(*args[1].(*tree.DString))
+				// We construct the errors below via %s as the
+				// message may contain PII.
 				if errCode == "" {
-					return nil, errors.New(msg)
+					return nil, errors.Newf("%s", msg)
 				}
-				return nil, pgerror.New(errCode, msg)
+				return nil, pgerror.Newf(errCode, "%s", msg)
 			},
 			Info: "This function is used only by CockroachDB's developers for testing purposes.",
 		},
@@ -3193,7 +3196,79 @@ may increase either contention or retry errors, or both.`,
 				"Raising the verbosity can severely affect performance.",
 		},
 	),
-
+	// Returns the number of distinct inverted index entries that would be
+	// generated for a value.
+	"crdb_internal.num_geo_inverted_index_entries": makeBuiltin(
+		tree.FunctionProperties{
+			Category:     categorySystemInfo,
+			NullableArgs: true,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"table_id", types.Int},
+				{"index_id", types.Int},
+				{"val", types.Geography},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull || args[1] == tree.DNull || args[2] == tree.DNull {
+					return tree.DZero, nil
+				}
+				tableID := int(tree.MustBeDInt(args[0]))
+				indexID := int(tree.MustBeDInt(args[1]))
+				g := tree.MustBeDGeography(args[2])
+				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, sqlbase.ID(tableID))
+				if err != nil {
+					return nil, err
+				}
+				indexDesc, err := tableDesc.FindIndexByID(sqlbase.IndexID(indexID))
+				if err != nil {
+					return nil, err
+				}
+				if indexDesc.GeoConfig.S2Geography == nil {
+					return nil, errors.Errorf("index_id %d is not a geography inverted index", indexID)
+				}
+				keys, err := sqlbase.EncodeGeoInvertedIndexTableKeys(g, nil, indexDesc)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDInt(tree.DInt(len(keys))), nil
+			},
+			Info: "This function is used only by CockroachDB's developers for testing purposes.",
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"table_id", types.Int},
+				{"index_id", types.Int},
+				{"val", types.Geometry},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull || args[1] == tree.DNull || args[2] == tree.DNull {
+					return tree.DZero, nil
+				}
+				tableID := int(tree.MustBeDInt(args[0]))
+				indexID := int(tree.MustBeDInt(args[1]))
+				g := tree.MustBeDGeometry(args[2])
+				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, sqlbase.ID(tableID))
+				if err != nil {
+					return nil, err
+				}
+				indexDesc, err := tableDesc.FindIndexByID(sqlbase.IndexID(indexID))
+				if err != nil {
+					return nil, err
+				}
+				if indexDesc.GeoConfig.S2Geometry == nil {
+					return nil, errors.Errorf("index_id %d is not a geometry inverted index", indexID)
+				}
+				keys, err := sqlbase.EncodeGeoInvertedIndexTableKeys(g, nil, indexDesc)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDInt(tree.DInt(len(keys))), nil
+			},
+			Info: "This function is used only by CockroachDB's developers for testing purposes.",
+		}),
 	// Returns the number of distinct inverted index entries that would be
 	// generated for a value.
 	"crdb_internal.num_inverted_index_entries": makeBuiltin(
@@ -3238,8 +3313,7 @@ may increase either contention or retry errors, or both.`,
 				return tree.NewDInt(tree.DInt(len(keys))), nil
 			},
 			Info: "This function is used only by CockroachDB's developers for testing purposes.",
-		},
-	),
+		}),
 
 	// Returns true iff the current user has admin role.
 	// Note: it would be a privacy leak to extend this to check arbitrary usernames.
@@ -4113,6 +4187,19 @@ func setProps(props tree.FunctionProperties, d builtinDefinition) builtinDefinit
 	return d
 }
 
+func jsonOverload1(
+	f func(*tree.EvalContext, json.JSON) (tree.Datum, error), returnType *types.T, info string,
+) tree.Overload {
+	return tree.Overload{
+		Types:      tree.ArgTypes{{"val", types.Jsonb}},
+		ReturnType: tree.FixedReturnType(returnType),
+		Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+			return f(evalCtx, tree.MustBeDJSON(args[0]).JSON)
+		},
+		Info: info,
+	}
+}
+
 func stringOverload1(
 	f func(*tree.EvalContext, string) (tree.Datum, error), returnType *types.T, info string,
 ) tree.Overload {
@@ -4534,19 +4621,19 @@ func overlay(s, to string, pos, size int) (tree.Datum, error) {
 const NodeIDBits = 15
 
 // GenerateUniqueInt creates a unique int composed of the current time at a
-// 10-microsecond granularity and the node-id. The node-id is stored in the
+// 10-microsecond granularity and the instance-id. The instance-id is stored in the
 // lower 15 bits of the returned value and the timestamp is stored in the upper
 // 48 bits. The top-bit is left empty so that negative values are not returned.
 // The 48-bit timestamp field provides for 89 years of timestamps. We use a
 // custom epoch (Jan 1, 2015) in order to utilize the entire timestamp range.
 //
-// Note that GenerateUniqueInt() imposes a limit on node IDs while
+// Note that GenerateUniqueInt() imposes a limit on instance IDs while
 // generateUniqueBytes() does not.
 //
 // TODO(pmattis): Do we have to worry about persisting the milliseconds value
 // periodically to avoid the clock ever going backwards (e.g. due to NTP
 // adjustment)?
-func GenerateUniqueInt(nodeID roachpb.NodeID) tree.DInt {
+func GenerateUniqueInt(instanceID base.SQLInstanceID) tree.DInt {
 	const precision = uint64(10 * time.Microsecond)
 
 	nowNanos := timeutil.Now().UnixNano()
@@ -4563,15 +4650,15 @@ func GenerateUniqueInt(nodeID roachpb.NodeID) tree.DInt {
 	uniqueIntState.timestamp = timestamp
 	uniqueIntState.Unlock()
 
-	return GenerateUniqueID(int32(nodeID), timestamp)
+	return GenerateUniqueID(int32(instanceID), timestamp)
 }
 
 // GenerateUniqueID encapsulates the logic to generate a unique number from
 // a nodeID and timestamp.
-func GenerateUniqueID(nodeID int32, timestamp uint64) tree.DInt {
-	// We xor in the nodeID so that nodeIDs larger than 32K will flip bits in the
-	// timestamp portion of the final value instead of always setting them.
-	id := (timestamp << NodeIDBits) ^ uint64(nodeID)
+func GenerateUniqueID(instanceID int32, timestamp uint64) tree.DInt {
+	// We xor in the instanceID so that instanceIDs larger than 32K will flip bits
+	// in the timestamp portion of the final value instead of always setting them.
+	id := (timestamp << NodeIDBits) ^ uint64(instanceID)
 	return tree.DInt(id)
 }
 

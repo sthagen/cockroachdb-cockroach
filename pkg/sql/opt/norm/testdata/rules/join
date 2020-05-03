@@ -2060,8 +2060,8 @@ full-join (hash)
  │    └── fd: (6)-->(7-10)
  └── filters
       ├── a.k:1 = a2.k:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
-      ├── a.f:3 = a.f:3 [outer=(3), constraints=(/3: (/NULL - ])]
-      └── a2.f:8 = a2.f:8 [outer=(8), constraints=(/8: (/NULL - ])]
+      ├── a.f:3 IS DISTINCT FROM CAST(NULL AS FLOAT8) [outer=(3), constraints=(/3: (/NULL - ]; tight)]
+      └── a2.f:8 IS DISTINCT FROM CAST(NULL AS FLOAT8) [outer=(8), constraints=(/8: (/NULL - ]; tight)]
 
 # Can't simplify: equality conditions have columns from different tables.
 norm expect-not=(SimplifyRightJoinWithFilters,SimplifyLeftJoinWithFilters)
@@ -2165,7 +2165,7 @@ scan a
 # SimplifyZeroCardinalitySemiJoin
 # --------------------------------------------------
 # TODO(justin): figure out if there's a good way to make this still apply.
-norm disable=SimplifyZeroCardinalityGroup expect=SimplifyZeroCardinalitySemiJoin
+norm disable=(SimplifyZeroCardinalityGroup,EliminateExistsZeroRows) expect=SimplifyZeroCardinalitySemiJoin
 SELECT * FROM a WHERE EXISTS(SELECT * FROM (VALUES (k)) OFFSET 1)
 ----
 values
@@ -2178,7 +2178,7 @@ values
 # EliminateAntiJoin
 # --------------------------------------------------
 # TODO(justin): figure out if there's a good way to make this still apply.
-norm disable=SimplifyZeroCardinalityGroup expect=EliminateAntiJoin
+norm disable=(SimplifyZeroCardinalityGroup,EliminateExistsZeroRows) expect=EliminateAntiJoin
 SELECT * FROM a WHERE NOT EXISTS(SELECT * FROM (VALUES (k)) OFFSET 1)
 ----
 scan a

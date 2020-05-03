@@ -88,8 +88,12 @@ func (p *planner) processSerialInColumnDef(
 	// Clear the IsSerial bit now that it's been remapped.
 	newSpec.IsSerial = false
 
+	defType, err := tree.ResolveType(d.Type, p.semaCtx.GetTypeResolver())
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 	telemetry.Inc(sqltelemetry.SerialColumnNormalizationCounter(
-		d.Type.Name(), serialNormalizationMode.String()))
+		defType.Name(), serialNormalizationMode.String()))
 
 	if serialNormalizationMode == sessiondata.SerialUsesRowID {
 		// We're not constructing a sequence for this SERIAL column.
@@ -111,10 +115,13 @@ func (p *planner) processSerialInColumnDef(
 	// Here and below we skip the cache because name resolution using
 	// the cache does not work (well) if the txn retries and the
 	// descriptor was written already in an early txn attempt.
-	dbDesc, err := p.ResolveUncachedDatabase(ctx, seqName)
+	un := seqName.ToUnresolvedObjectName()
+	dbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, un)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	seqName.ObjectNamePrefix = prefix
+
 	// Now skip over all names that are already taken.
 	nameBase := seqName.ObjectName
 	for i := 0; ; i++ {

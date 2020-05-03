@@ -406,7 +406,7 @@
 
 [[projects]]
   branch = "v1.2.4-cockroach20.1"
-  digest = "1:f4441cc580b6f69ff82a4130589b43cf4b14883e9f090db66f9c4ad337b41ee4"
+  digest = "1:f3e110587a7cde6152fe8861a5873ffb552232b8a91ce444075397f4ebabd4cd"
   name = "github.com/cockroachdb/errors"
   packages = [
     ".",
@@ -429,7 +429,7 @@
     "withstack",
   ]
   pruneopts = "UT"
-  revision = "5f3a6d1e1cf5d5d6212d56dc3833d6d57c7545e4"
+  revision = "fcfc812fae48db497f9fb1dbc7b4d4041caa06fa"
 
 [[projects]]
   digest = "1:a44e537b3e080ff297315d166956dba9607f070644a89be78b59af6c54876b64"
@@ -979,6 +979,14 @@
   pruneopts = "UT"
   revision = "c8a15bac9b9fe955bd9f900272f9a306465d28cf"
   version = "v2.0.3"
+
+[[projects]]
+  digest = "1:e3f17aa0eb8c151426d23cb767ae50f5b42c46533db3424761ee639b56ab9041"
+  name = "github.com/gorhill/cronexpr"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "a557574d6c024ed6e36acc8b610f5f211c91568a"
+  version = "1.0.0"
 
 [[projects]]
   digest = "1:7b5c6e2eeaa9ae5907c391a91c132abfd5c9e8a784a341b5625e750c67e6825d"
@@ -2117,6 +2125,7 @@
     "github.com/golang-commonmark/markdown",
     "github.com/golang/dep/cmd/dep",
     "github.com/golang/geo/r3",
+    "github.com/golang/geo/s1",
     "github.com/golang/geo/s2",
     "github.com/golang/protobuf/proto",
     "github.com/golang/snappy",
@@ -2127,6 +2136,7 @@
     "github.com/google/go-github/github",
     "github.com/google/pprof/driver",
     "github.com/google/pprof/profile",
+    "github.com/gorhill/cronexpr",
     "github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway",
     "github.com/grpc-ecosystem/grpc-gateway/runtime",
     "github.com/grpc-ecosystem/grpc-gateway/utilities",
@@ -2255,6 +2265,7 @@
     "golang.org/x/tools/go/ast/inspector",
     "golang.org/x/tools/go/buildutil",
     "golang.org/x/tools/go/packages",
+    "golang.org/x/tools/go/types/typeutil",
     "google.golang.org/api/iterator",
     "google.golang.org/api/option",
     "google.golang.org/grpc",

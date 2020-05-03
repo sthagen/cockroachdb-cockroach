@@ -26,7 +26,7 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -157,12 +157,12 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 	case types.GeographyFamily:
 		// TODO(otan): generate fake data properly.
 		return tree.NewDGeography(
-			geo.NewGeography(geopb.EWKB([]byte("\x01\x01\x00\x00\x20\xe6\x10\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f"))),
+			geo.MustParseGeographyFromEWKBRaw([]byte("\x01\x01\x00\x00\x20\xe6\x10\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f")),
 		)
 	case types.GeometryFamily:
 		// TODO(otan): generate fake data properly.
 		return tree.NewDGeometry(
-			geo.NewGeometry(geopb.EWKB([]byte("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f"))),
+			geo.MustParseGeometryFromEWKBRaw([]byte("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f")),
 		)
 	case types.DecimalFamily:
 		d := &tree.DDecimal{}
@@ -532,11 +532,11 @@ var (
 		},
 		types.GeographyFamily: {
 			// TODO(otan): more interesting datums
-			&tree.DGeography{Geography: geo.NewGeography(geopb.EWKB([]byte("\x01\x01\x00\x00\x20\xe6\x10\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f")))},
+			&tree.DGeography{Geography: geo.MustParseGeographyFromEWKBRaw([]byte("\x01\x01\x00\x00\x20\xe6\x10\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f"))},
 		},
 		types.GeometryFamily: {
 			// TODO(otan): more interesting datums
-			&tree.DGeometry{Geometry: geo.NewGeometry([]byte("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f"))},
+			&tree.DGeometry{Geometry: geo.MustParseGeometryFromEWKBRaw([]byte("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f"))},
 		},
 		types.StringFamily: {
 			tree.NewDString(""),
@@ -964,7 +964,7 @@ func TestingMakePrimaryIndexKey(desc *TableDescriptor, vals ...interface{}) (roa
 		colIDToRowIndex[index.ColumnIDs[i]] = i
 	}
 
-	keyPrefix := MakeIndexKeyPrefix(desc, index.ID)
+	keyPrefix := MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, index.ID)
 	key, _, err := EncodeIndexKey(desc, index, colIDToRowIndex, datums, keyPrefix)
 	if err != nil {
 		return nil, err
@@ -1325,7 +1325,7 @@ func randIndexTableDefFromCols(
 
 	indexElemList := make(tree.IndexElemList, 0, len(cols))
 	for i := range cols {
-		semType := cols[i].Type.Family()
+		semType := tree.MustBeStaticallyKnownType(cols[i].Type).Family()
 		if MustBeValueEncoded(semType) {
 			continue
 		}

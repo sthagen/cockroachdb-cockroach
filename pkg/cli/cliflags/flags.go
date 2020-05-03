@@ -240,6 +240,12 @@ Dumps the data as of the specified timestamp. Formats supported are the same
 as the timestamp type.`,
 	}
 
+	DumpAll = FlagInfo{
+		Name: "dump-all",
+		Description: `
+Dumps all databases, for each non-system database provides dump of all available tables.`,
+	}
+
 	Execute = FlagInfo{
 		Name:      "execute",
 		Shorthand: "e",
@@ -1137,5 +1143,21 @@ Addresses for network benchmark.`,
 		Name: "latency",
 		Description: `
 Latency or throughput mode.`,
+	}
+
+	ZipNodes = FlagInfo{
+		Name: "nodes",
+		Description: `
+List of nodes to include. Can be specified as a comma-delimited
+list of node IDs or ranges of node IDs, for example: 5,10-20,23.
+The default is to include all nodes.`,
+	}
+
+	ZipExcludeNodes = FlagInfo{
+		Name: "exclude-nodes",
+		Description: `
+List of nodes to exclude. Can be specified as a comma-delimited
+list of node IDs or ranges of node IDs, for example: 5,10-20,23.
+The default is to not exclude any node.`,
 	}
 )

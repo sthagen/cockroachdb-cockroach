@@ -203,7 +203,11 @@ func newTruncateDecision(ctx context.Context, r *Replica) (truncateDecision, err
 	log.Eventf(ctx, "raft status before lastUpdateTimes check: %+v", raftStatus.Progress)
 	log.Eventf(ctx, "lastUpdateTimes: %+v", r.mu.lastUpdateTimes)
 	updateRaftProgressFromActivity(
-		ctx, raftStatus.Progress, r.descRLocked().Replicas().All(), r.mu.lastUpdateTimes, now,
+		ctx, raftStatus.Progress, r.descRLocked().Replicas().All(),
+		func(replicaID roachpb.ReplicaID) bool {
+			return r.mu.lastUpdateTimes.isFollowerActiveSince(
+				ctx, replicaID, now, r.store.cfg.RangeLeaseActiveDuration())
+		},
 	)
 	log.Eventf(ctx, "raft status after lastUpdateTimes check: %+v", raftStatus.Progress)
 	r.mu.RUnlock()
@@ -233,8 +237,7 @@ func updateRaftProgressFromActivity(
 	ctx context.Context,
 	prs map[uint64]tracker.Progress,
 	replicas []roachpb.ReplicaDescriptor,
-	lastUpdate lastUpdateTimesMap,
-	now time.Time,
+	replicaActive func(roachpb.ReplicaID) bool,
 ) {
 	for _, replDesc := range replicas {
 		replicaID := replDesc.ReplicaID
@@ -242,7 +245,7 @@ func updateRaftProgressFromActivity(
 		if !ok {
 			continue
 		}
-		pr.RecentActive = lastUpdate.isFollowerActive(ctx, replicaID, now)
+		pr.RecentActive = replicaActive(replicaID)
 		// Override this field for safety since we don't use it. Instead, we use
 		// pendingSnapshotIndex from above which is also populated for preemptive
 		// snapshots.
@@ -277,6 +280,10 @@ func (input truncateDecisionInput) LogTooLarge() bool {
 	return input.LogSize > input.MaxLogSize
 }
 
+// truncateDecision describes a truncation decision.
+// Beware: when extending this struct, be sure to adjust .String()
+// so that it is guaranteed to not contain any PII or confidential
+// cluster data.
 type truncateDecision struct {
 	Input       truncateDecisionInput
 	CommitIndex uint64
@@ -318,6 +325,9 @@ func (td *truncateDecision) NumNewRaftSnapshots() int {
 	return td.raftSnapshotsForIndex(td.NewFirstIndex) - td.raftSnapshotsForIndex(td.Input.FirstIndex)
 }
 
+// String returns a representation for the decision.
+// It is guaranteed to not return PII or confidential
+// information from the cluster.
 func (td *truncateDecision) String() string {
 	var buf strings.Builder
 	_, _ = fmt.Fprintf(&buf, "should truncate: %t [", td.ShouldTruncate())
@@ -521,7 +531,7 @@ func (rlq *raftLogQueue) shouldQueue(
 ) (shouldQ bool, priority float64) {
 	decision, err := newTruncateDecision(ctx, r)
 	if err != nil {
-		log.Warning(ctx, err)
+		log.Warningf(ctx, "%v", err)
 		return false, 0
 	}
 
@@ -597,9 +607,9 @@ func (rlq *raftLogQueue) process(ctx context.Context, r *Replica, _ *config.Syst
 	// Can and should the raft logs be truncated?
 	if decision.ShouldTruncate() {
 		if n := decision.NumNewRaftSnapshots(); log.V(1) || n > 0 && rlq.logSnapshots.ShouldProcess(timeutil.Now()) {
-			log.Info(ctx, decision.String())
+			log.Infof(ctx, "%v", log.Safe(decision.String()))
 		} else {
-			log.VEvent(ctx, 1, decision.String())
+			log.VEventf(ctx, 1, "%v", log.Safe(decision.String()))
 		}
 		b := &kv.Batch{}
 		b.AddRawRequest(&roachpb.TruncateLogRequest{
@@ -612,7 +622,7 @@ func (rlq *raftLogQueue) process(ctx context.Context, r *Replica, _ *config.Syst
 		}
 		r.store.metrics.RaftLogTruncated.Inc(int64(decision.NumTruncatableIndexes()))
 	} else {
-		log.VEventf(ctx, 3, decision.String())
+		log.VEventf(ctx, 3, "%s", log.Safe(decision.String()))
 	}
 	return nil
 }

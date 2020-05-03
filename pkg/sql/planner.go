@@ -52,10 +52,7 @@ type extendedEvalContext struct {
 	Tracing *SessionTracing
 
 	// StatusServer gives access to the Status service.
-	//
-	// In a SQL tenant server, this is not available (returning false) and
-	// pgerror.UnsupportedWithMultiTenancy should be returned.
-	StatusServer func() (serverpb.StatusServer, bool)
+	StatusServer serverpb.OptionalStatusServer
 
 	// MemMetrics represent the group of metrics to which execution should
 	// contribute.
@@ -298,7 +295,7 @@ func newInternalPlanner(
 	p.extendedEvalCtx.Sequence = p
 	p.extendedEvalCtx.ClusterID = execCfg.ClusterID()
 	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
-	p.extendedEvalCtx.NodeID = execCfg.NodeID.Get()
+	p.extendedEvalCtx.NodeID = execCfg.NodeID
 	p.extendedEvalCtx.Locality = execCfg.Locality
 
 	p.sessionDataMutator = dataMutator
@@ -344,6 +341,7 @@ func internalExtendedEvalCtx(
 			TxnReadOnly:      false,
 			TxnImplicit:      true,
 			Settings:         execCfg.Settings,
+			Codec:            execCfg.Codec,
 			Context:          ctx,
 			Mon:              plannerMon,
 			TestingKnobs:     evalContextTestingKnobs,
@@ -425,7 +423,11 @@ func (p *planner) DistSQLPlanner() *DistSQLPlanner {
 // ParseType implements the tree.EvalPlanner interface.
 // We define this here to break the dependency from eval.go to the parser.
 func (p *planner) ParseType(sql string) (*types.T, error) {
-	return parser.ParseType(sql)
+	ref, err := parser.ParseType(sql)
+	if err != nil {
+		return nil, err
+	}
+	return tree.ResolveType(ref, p.semaCtx.GetTypeResolver())
 }
 
 // ParseQualifiedTableName implements the tree.EvalDatabase interface.

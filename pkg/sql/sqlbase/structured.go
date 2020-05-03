@@ -1716,6 +1716,16 @@ func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *k
 	return nil
 }
 
+// ValidateIndexNameIsUnique validates that the index name does not exist.
+func (desc *TableDescriptor) ValidateIndexNameIsUnique(indexName string) error {
+	for _, index := range desc.AllNonDropIndexes() {
+		if indexName == index.Name {
+			return NewRelationAlreadyExistsError(indexName)
+		}
+	}
+	return nil
+}
+
 // ValidateTable validates that the table descriptor is well formed. Checks
 // include validating the table, column and index names, verifying that column
 // names and index names are unique and verifying that column IDs and index IDs
@@ -1982,13 +1992,16 @@ func (desc *TableDescriptor) validateTableIndexes(columnNames map[string]ColumnI
 			return fmt.Errorf("invalid index ID %d", index.ID)
 		}
 
-		if _, ok := indexNames[index.Name]; ok {
+		if _, indexNameExists := indexNames[index.Name]; indexNameExists {
 			for i := range desc.Indexes {
 				if desc.Indexes[i].Name == index.Name {
-					return fmt.Errorf("duplicate index name: %q", index.Name)
+					// This error should be caught in MakeIndexDescriptor.
+					return errors.HandleAsAssertionFailure(fmt.Errorf("duplicate index name: %q", index.Name))
 				}
 			}
-			return fmt.Errorf("duplicate: index %q in the middle of being added, not yet public", index.Name)
+			// This error should be caught in MakeIndexDescriptor.
+			return errors.HandleAsAssertionFailure(fmt.Errorf(
+				"duplicate: index %q in the middle of being added, not yet public", index.Name))
 		}
 		indexNames[index.Name] = struct{}{}
 
@@ -2134,6 +2147,11 @@ func (desc *TableDescriptor) validatePartitioningDescriptor(
 		return nil
 	}
 
+	// Use the system-tenant SQL codec when validating the keys in the partition
+	// descriptor. We just want to know how the partitions relate to one another,
+	// so it's fine to ignore the tenant ID prefix.
+	codec := keys.SystemSQLCodec
+
 	if len(partDesc.List) > 0 {
 		listValues := make(map[string]struct{}, len(partDesc.List))
 		for _, p := range partDesc.List {
@@ -2148,7 +2166,7 @@ func (desc *TableDescriptor) validatePartitioningDescriptor(
 			// to match the behavior of the value when indexed.
 			for _, valueEncBuf := range p.Values {
 				tuple, keyPrefix, err := DecodePartitionTuple(
-					a, desc, idxDesc, partDesc, valueEncBuf, fakePrefixDatums)
+					a, codec, desc, idxDesc, partDesc, valueEncBuf, fakePrefixDatums)
 				if err != nil {
 					return fmt.Errorf("PARTITION %s: %v", p.Name, err)
 				}
@@ -2177,12 +2195,12 @@ func (desc *TableDescriptor) validatePartitioningDescriptor(
 			// NB: key encoding is used to check uniqueness because it has to match
 			// the behavior of the value when indexed.
 			fromDatums, fromKey, err := DecodePartitionTuple(
-				a, desc, idxDesc, partDesc, p.FromInclusive, fakePrefixDatums)
+				a, codec, desc, idxDesc, partDesc, p.FromInclusive, fakePrefixDatums)
 			if err != nil {
 				return fmt.Errorf("PARTITION %s: %v", p.Name, err)
 			}
 			toDatums, toKey, err := DecodePartitionTuple(
-				a, desc, idxDesc, partDesc, p.ToExclusive, fakePrefixDatums)
+				a, codec, desc, idxDesc, partDesc, p.ToExclusive, fakePrefixDatums)
 			if err != nil {
 				return fmt.Errorf("PARTITION %s: %v", p.Name, err)
 			}
@@ -2280,7 +2298,8 @@ func ColumnTypeIsIndexable(t *types.T) bool {
 // using an inverted index.
 func ColumnTypeIsInvertedIndexable(t *types.T) bool {
 	family := t.Family()
-	return family == types.JsonFamily || family == types.ArrayFamily
+	return family == types.JsonFamily || family == types.ArrayFamily ||
+		family == types.GeographyFamily || family == types.GeometryFamily
 }
 
 func notIndexableError(cols []ColumnDescriptor, inverted bool) error {
@@ -2309,7 +2328,7 @@ func notIndexableError(cols []ColumnDescriptor, inverted bool) error {
 			}
 		}
 	}
-	return unimplemented.NewWithIssueDetailf(35730, typInfo, msg)
+	return unimplemented.NewWithIssueDetailf(35730, typInfo, "%s", msg)
 }
 
 func checkColumnsValidForIndex(tableDesc *MutableTableDescriptor, indexColNames []string) error {
@@ -2333,7 +2352,8 @@ func checkColumnsValidForInvertedIndex(
 	tableDesc *MutableTableDescriptor, indexColNames []string,
 ) error {
 	if len((indexColNames)) > 1 {
-		return errors.New("indexing more than one column with an inverted index is not supported")
+		return unimplemented.NewWithIssue(48100,
+			"indexing more than one column with an inverted index is not supported")
 	}
 	invalidColumns := make([]ColumnDescriptor, 0, len(indexColNames))
 	for _, indexCol := range indexColNames {
@@ -2743,6 +2763,7 @@ func (desc *MutableTableDescriptor) DropConstraint(
 	case ConstraintTypeFK:
 		if detail.FK.Validity == ConstraintValidity_Validating {
 			return unimplemented.NewWithIssueDetailf(42844,
+				"drop-constraint-fk-validating",
 				"constraint %q in the middle of being added, try again later", name)
 		}
 		if detail.FK.Validity == ConstraintValidity_Dropping {
@@ -3564,10 +3585,10 @@ func (desc *TableDescriptor) InvalidateFKConstraints() {
 
 // AllIndexSpans returns the Spans for each index in the table, including those
 // being added in the mutations.
-func (desc *TableDescriptor) AllIndexSpans() roachpb.Spans {
+func (desc *TableDescriptor) AllIndexSpans(codec keys.SQLCodec) roachpb.Spans {
 	var spans roachpb.Spans
 	err := desc.ForeachNonDropIndex(func(index *IndexDescriptor) error {
-		spans = append(spans, desc.IndexSpan(index.ID))
+		spans = append(spans, desc.IndexSpan(codec, index.ID))
 		return nil
 	})
 	if err != nil {
@@ -3578,20 +3599,22 @@ func (desc *TableDescriptor) AllIndexSpans() roachpb.Spans {
 
 // PrimaryIndexSpan returns the Span that corresponds to the entire primary
 // index; can be used for a full table scan.
-func (desc *TableDescriptor) PrimaryIndexSpan() roachpb.Span {
-	return desc.IndexSpan(desc.PrimaryIndex.ID)
+func (desc *TableDescriptor) PrimaryIndexSpan(codec keys.SQLCodec) roachpb.Span {
+	return desc.IndexSpan(codec, desc.PrimaryIndex.ID)
 }
 
 // IndexSpan returns the Span that corresponds to an entire index; can be used
 // for a full index scan.
-func (desc *TableDescriptor) IndexSpan(indexID IndexID) roachpb.Span {
-	prefix := roachpb.Key(MakeIndexKeyPrefix(desc, indexID))
+func (desc *TableDescriptor) IndexSpan(codec keys.SQLCodec, indexID IndexID) roachpb.Span {
+	prefix := roachpb.Key(MakeIndexKeyPrefix(codec, desc, indexID))
 	return roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
 }
 
 // TableSpan returns the Span that corresponds to the entire table.
-func (desc *TableDescriptor) TableSpan() roachpb.Span {
-	prefix := roachpb.Key(keys.MakeTablePrefix(uint32(desc.ID)))
+func (desc *TableDescriptor) TableSpan(codec keys.SQLCodec) roachpb.Span {
+	// TODO(jordan): Why does IndexSpan consider interleaves but TableSpan does
+	// not? Should it?
+	prefix := codec.TablePrefix(uint32(desc.ID))
 	return roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
 }
 
@@ -3990,6 +4013,34 @@ func (desc *ImmutableTableDescriptor) TableDesc() *TableDescriptor {
 	return &desc.TableDescriptor
 }
 
+// GetAuditMode implements the DescriptorProto interface.
+func (desc *TypeDescriptor) GetAuditMode() TableDescriptor_AuditMode {
+	return TableDescriptor_DISABLED
+}
+
+// GetPrivileges implements the DescriptorProto interface.
+func (desc *TypeDescriptor) GetPrivileges() *PrivilegeDescriptor {
+	return nil
+}
+
+// SetID implements the DescriptorProto interface.
+func (desc *TypeDescriptor) SetID(id ID) {
+	desc.ID = id
+}
+
+// TypeName implements the DescriptorProto interface.
+func (desc *TypeDescriptor) TypeName() string {
+	return "type"
+}
+
+// SetName implements the DescriptorProto interface.
+func (desc *TypeDescriptor) SetName(name string) {
+	desc.Name = name
+}
+
+// NameResolutionResult implements the NameResolutionResult interface.
+func (desc *TypeDescriptor) NameResolutionResult() {}
+
 // DatabaseKey implements DescriptorKey.
 type DatabaseKey struct {
 	name string
@@ -4114,4 +4165,15 @@ func GenerateUniqueConstraintName(prefix string, nameExistsFunc func(name string
 		name = fmt.Sprintf("%s_%d", prefix, i)
 	}
 	return name
+}
+
+// GetLogicalColumnID returns the LogicalColumnID of the ColumnDescriptor
+// if the LogicalColumnID is set (non-zero). Returns the ID of the
+// ColumnDescriptor if the LogicalColumnID is not set.
+func (desc ColumnDescriptor) GetLogicalColumnID() ColumnID {
+	if desc.LogicalColumnID != 0 {
+		return desc.LogicalColumnID
+	}
+
+	return desc.ID
 }

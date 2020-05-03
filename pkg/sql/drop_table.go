@@ -125,7 +125,7 @@ func (n *dropTableNode) startExec(params runParams) error {
 			params.p.txn,
 			EventLogDropTable,
 			int32(droppedDesc.ID),
-			int32(params.extendedEvalCtx.NodeID),
+			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 			struct {
 				TableName           string
 				Statement           string
@@ -362,7 +362,7 @@ func (p *planner) initiateDropTable(
 
 	// Unsplit all manually split ranges in the table so they can be
 	// automatically merged by the merge queue.
-	ranges, err := ScanMetaKVs(ctx, p.txn, tableDesc.TableSpan())
+	ranges, err := ScanMetaKVs(ctx, p.txn, tableDesc.TableSpan(p.ExecCfg().Codec))
 	if err != nil {
 		return err
 	}

@@ -44,9 +44,9 @@ func (n *cancelQueriesNode) Next(params runParams) (bool, error) {
 		return true, nil
 	}
 
-	statusServer, ok := params.extendedEvalCtx.StatusServer()
-	if !ok {
-		return false, pgerror.UnsupportedWithMultiTenancy()
+	statusServer, err := params.extendedEvalCtx.StatusServer.OptionalErr(47895)
+	if err != nil {
+		return false, err
 	}
 
 	queryIDString, ok := tree.AsDString(datum)

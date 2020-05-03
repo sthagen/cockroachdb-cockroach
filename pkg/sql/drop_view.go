@@ -12,7 +12,6 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -100,7 +99,7 @@ func (n *dropViewNode) startExec(params runParams) error {
 			params.p.txn,
 			EventLogDropView,
 			int32(droppedDesc.ID),
-			int32(params.extendedEvalCtx.NodeID),
+			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 			struct {
 				ViewName            string
 				Statement           string
@@ -164,14 +163,13 @@ func (p *planner) canRemoveDependentViewGeneric(
 // Returns the names of any additional views that were also dropped
 // due to `cascade` behavior.
 func (p *planner) removeDependentView(
-	ctx context.Context, tableDesc, viewDesc *sqlbase.MutableTableDescriptor,
+	ctx context.Context, tableDesc, viewDesc *sqlbase.MutableTableDescriptor, jobDesc string,
 ) ([]string, error) {
 	// In the table whose index is being removed, filter out all back-references
 	// that refer to the view that's being removed.
 	tableDesc.DependedOnBy = removeMatchingReferences(tableDesc.DependedOnBy, viewDesc.ID)
 	// Then proceed to actually drop the view and log an event for it.
-	// TODO (lucy): Have more consistent/informative names for dependent jobs.
-	return p.dropViewImpl(ctx, viewDesc, true /* queueJob */, "dropping dependent view", tree.DropCascade)
+	return p.dropViewImpl(ctx, viewDesc, true /* queueJob */, jobDesc, tree.DropCascade)
 }
 
 // dropViewImpl does the work of dropping a view (and views that depend on it
@@ -252,14 +250,14 @@ func (p *planner) getViewDescForCascade(
 			viewName, err = p.getQualifiedTableName(ctx, viewDesc.TableDesc())
 			if err != nil {
 				log.Warningf(ctx, "unable to retrieve qualified name of view %d: %v", viewID, err)
-				msg := fmt.Sprintf("cannot drop %s %q because a view depends on it", typeName, objName)
-				return nil, sqlbase.NewDependentObjectError(msg)
+				return nil, sqlbase.NewDependentObjectErrorf(
+					"cannot drop %s %q because a view depends on it", typeName, objName)
 			}
 		}
-		msg := fmt.Sprintf("cannot drop %s %q because view %q depends on it",
-			typeName, objName, viewName)
-		hint := fmt.Sprintf("you can drop %s instead.", viewName)
-		return nil, sqlbase.NewDependentObjectErrorWithHint(msg, hint)
+		return nil, errors.WithHintf(
+			sqlbase.NewDependentObjectErrorf("cannot drop %s %q because view %q depends on it",
+				typeName, objName, viewName),
+			"you can drop %s instead.", viewName)
 	}
 	return viewDesc, nil
 }

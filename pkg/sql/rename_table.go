@@ -12,13 +12,13 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 type renameTableNode struct {
@@ -83,17 +83,21 @@ func (n *renameTableNode) startExec(params runParams) error {
 	newTn := n.newTn
 	tableDesc := n.tableDesc
 
-	prevDbDesc, err := p.ResolveUncachedDatabase(ctx, oldTn)
+	oldUn := oldTn.ToUnresolvedObjectName()
+	prevDbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, oldUn)
 	if err != nil {
 		return err
 	}
+	oldTn.ObjectNamePrefix = prefix
 
 	// Check if target database exists.
 	// We also look at uncached descriptors here.
-	targetDbDesc, err := p.ResolveUncachedDatabase(ctx, newTn)
+	newUn := newTn.ToUnresolvedObjectName()
+	targetDbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, newUn)
 	if err != nil {
 		return err
 	}
+	newTn.ObjectNamePrefix = prefix
 
 	if err := p.CheckPrivilege(ctx, targetDbDesc, privilege.CREATE); err != nil {
 		return err
@@ -176,13 +180,13 @@ func (p *planner) dependentViewRenameError(
 		viewName, err = p.getQualifiedTableName(ctx, viewDesc)
 		if err != nil {
 			log.Warningf(ctx, "unable to retrieve name of view %d: %v", viewID, err)
-			msg := fmt.Sprintf("cannot rename %s %q because a view depends on it",
+			return sqlbase.NewDependentObjectErrorf(
+				"cannot rename %s %q because a view depends on it",
 				typeName, objName)
-			return sqlbase.NewDependentObjectError(msg)
 		}
 	}
-	msg := fmt.Sprintf("cannot rename %s %q because view %q depends on it",
-		typeName, objName, viewName)
-	hint := fmt.Sprintf("you can drop %s instead.", viewName)
-	return sqlbase.NewDependentObjectErrorWithHint(msg, hint)
+	return errors.WithHintf(
+		sqlbase.NewDependentObjectErrorf("cannot rename %s %q because view %q depends on it",
+			typeName, objName, viewName),
+		"you can drop %s instead.", viewName)
 }

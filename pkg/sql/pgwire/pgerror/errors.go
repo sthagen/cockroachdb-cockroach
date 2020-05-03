@@ -12,7 +12,6 @@ package pgerror
 
 import (
 	"bytes"
-	goErr "errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -106,7 +105,7 @@ func DangerousStatementf(format string, args ...interface{}) error {
 	buf.WriteString("rejected: ")
 	fmt.Fprintf(&buf, format, args...)
 	buf.WriteString(" (sql_safe_updates = true)")
-	err := goErr.New(buf.String())
+	err := errors.Newf("%s", buf.String())
 	err = errors.WithSafeDetails(err, format, args...)
 	err = WithCandidateCode(err, pgcode.Warning)
 	return err
@@ -118,14 +117,6 @@ func WrongNumberOfPreparedStatements(n int) error {
 	err := errors.NewWithDepthf(1, "prepared statement had %d statements, expected 1", errors.Safe(n))
 	err = WithCandidateCode(err, pgcode.InvalidPreparedStatementDefinition)
 	return err
-}
-
-// UnsupportedWithMultiTenancy returns an error suitable for returning when an
-// operation could not be carried out due to the SQL server running in
-// multi-tenancy mode. In that mode, Gossip and other components of the KV layer
-// are not available.
-func UnsupportedWithMultiTenancy() error {
-	return New(pgcode.Internal, "operation is unsupported in multi-tenancy mode")
 }
 
 var _ fmt.Formatter = &Error{}

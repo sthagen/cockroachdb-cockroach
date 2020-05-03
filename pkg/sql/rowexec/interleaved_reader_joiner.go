@@ -282,7 +282,8 @@ func newInterleavedReaderJoiner(
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (*interleavedReaderJoiner, error) {
-	if flowCtx.NodeID == 0 {
+	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
+	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
 		return nil, errors.AssertionFailedf("attempting to create an interleavedReaderJoiner with uninitialized NodeID")
 	}
 
@@ -367,7 +368,7 @@ func newInterleavedReaderJoiner(
 	}
 
 	if err := irj.initRowFetcher(
-		spec.Tables, tables, spec.Reverse, spec.LockingStrength, &irj.alloc,
+		flowCtx, spec.Tables, tables, spec.Reverse, spec.LockingStrength, &irj.alloc,
 	); err != nil {
 		return nil, err
 	}
@@ -400,6 +401,7 @@ func newInterleavedReaderJoiner(
 }
 
 func (irj *interleavedReaderJoiner) initRowFetcher(
+	flowCtx *execinfra.FlowCtx,
 	tables []execinfrapb.InterleavedReaderJoinerSpec_Table,
 	tableInfos []tableInfo,
 	reverseScan bool,
@@ -427,6 +429,7 @@ func (irj *interleavedReaderJoiner) initRowFetcher(
 	}
 
 	return irj.fetcher.Init(
+		flowCtx.Codec(),
 		reverseScan,
 		lockStr,
 		true, /* returnRangeInfo */
@@ -448,9 +451,12 @@ func (irj *interleavedReaderJoiner) generateMeta(
 	ctx context.Context,
 ) []execinfrapb.ProducerMetadata {
 	var trailingMeta []execinfrapb.ProducerMetadata
-	ranges := execinfra.MisplannedRanges(ctx, irj.fetcher.GetRangesInfo(), irj.FlowCtx.NodeID)
-	if ranges != nil {
-		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
+	nodeID, ok := irj.FlowCtx.NodeID.OptionalNodeID()
+	if ok {
+		ranges := execinfra.MisplannedRanges(ctx, irj.fetcher.GetRangesInfo(), nodeID)
+		if ranges != nil {
+			trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
+		}
 	}
 	if tfs := execinfra.GetLeafTxnFinalState(ctx, irj.FlowCtx.Txn); tfs != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})

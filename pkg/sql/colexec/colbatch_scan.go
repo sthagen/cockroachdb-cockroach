@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
@@ -87,9 +88,12 @@ func (s *colBatchScan) DrainMeta(ctx context.Context) []execinfrapb.ProducerMeta
 	}
 	var trailingMeta []execinfrapb.ProducerMetadata
 	if !s.flowCtx.Local {
-		ranges := execinfra.MisplannedRanges(ctx, s.rf.GetRangesInfo(), s.flowCtx.NodeID)
-		if ranges != nil {
-			trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
+		nodeID, ok := s.flowCtx.NodeID.OptionalNodeID()
+		if ok {
+			ranges := execinfra.MisplannedRanges(ctx, s.rf.GetRangesInfo(), nodeID)
+			if ranges != nil {
+				trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
+			}
 		}
 	}
 	if tfs := execinfra.GetLeafTxnFinalState(ctx, s.flowCtx.Txn); tfs != nil {
@@ -105,7 +109,8 @@ func newColBatchScan(
 	spec *execinfrapb.TableReaderSpec,
 	post *execinfrapb.PostProcessSpec,
 ) (*colBatchScan, error) {
-	if flowCtx.NodeID == 0 {
+	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
+	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
 		return nil, errors.Errorf("attempting to create a colBatchScan with uninitialized NodeID")
 	}
 
@@ -128,8 +133,8 @@ func newColBatchScan(
 	columnIdxMap := spec.Table.ColumnIdxMapWithMutations(returnMutations)
 	fetcher := cFetcher{}
 	if _, _, err := initCRowFetcher(
-		allocator, &fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap, spec.Reverse,
-		neededColumns, spec.IsCheck, spec.Visibility, spec.LockingStrength,
+		flowCtx.Codec(), allocator, &fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap,
+		spec.Reverse, neededColumns, spec.IsCheck, spec.Visibility, spec.LockingStrength,
 	); err != nil {
 		return nil, err
 	}
@@ -150,6 +155,7 @@ func newColBatchScan(
 
 // initCRowFetcher initializes a row.cFetcher. See initRowFetcher.
 func initCRowFetcher(
+	codec keys.SQLCodec,
 	allocator *colmem.Allocator,
 	fetcher *cFetcher,
 	desc *sqlbase.TableDescriptor,
@@ -180,7 +186,7 @@ func initCRowFetcher(
 		ValNeededForCol:  valNeededForCol,
 	}
 	if err := fetcher.Init(
-		allocator, reverseScan, lockStr, true /* returnRangeInfo */, isCheck, tableArgs,
+		codec, allocator, reverseScan, lockStr, true /* returnRangeInfo */, isCheck, tableArgs,
 	); err != nil {
 		return nil, false, err
 	}

@@ -189,7 +189,7 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 		result.flags.Set(planFlagIsDDL)
 	}
 
-	cols := planColumns(result.plan)
+	cols := planColumns(result.main)
 	if stmt.ExpectedTypes != nil {
 		if !stmt.ExpectedTypes.TypesEqual(cols) {
 			return pgerror.New(pgcode.FeatureNotSupported, "cached plan must not change result type")
@@ -266,7 +266,7 @@ func (opc *optPlanningCtx) reset() {
 
 func (opc *optPlanningCtx) log(ctx context.Context, msg string) {
 	if log.VDepth(1, 1) {
-		log.InfofDepth(ctx, 1, "%s: %s", msg, opc.p.stmt)
+		log.InfofDepth(ctx, 1, "%s: %s", log.Safe(msg), opc.p.stmt)
 	} else {
 		log.Event(ctx, msg)
 	}

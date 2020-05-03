@@ -1,4 +1,4 @@
-// Copyright 2017 The Cockroach Authors.
+// Copyright 2020 The Cockroach Authors.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt.
@@ -8,8 +8,14 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-//+build race
+package geopb
 
-package protoutil
+import (
+	"encoding/hex"
+	"strings"
+)
 
-const fuzzEnabled = true
+// EWKBHex returns the EWKB-hex version of this data type
+func (b *SpatialObject) EWKBHex() string {
+	return strings.ToUpper(hex.EncodeToString(b.EWKB))
+}

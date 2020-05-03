@@ -37,6 +37,7 @@ import (
 // only include what the optimizer needs, and certain common lookups are cached
 // for faster performance.
 type optCatalog struct {
+	tree.TypeReferenceResolver
 	// planner needs to be set via a call to init before calling other methods.
 	planner *planner
 
@@ -73,9 +74,10 @@ func (oc *optCatalog) reset() {
 		oc.dataSources = make(map[*sqlbase.ImmutableTableDescriptor]cat.DataSource)
 	}
 
+	g := oc.planner.execCfg.Gossip.Deprecated(47150)
 	// Gossip can be nil in testing scenarios.
-	if oc.planner.execCfg.Gossip != nil {
-		oc.cfg = oc.planner.execCfg.Gossip.GetSystemConfig()
+	if g != nil {
+		oc.cfg = g.GetSystemConfig()
 	}
 }
 
@@ -368,7 +370,7 @@ func (oc *optCatalog) dataSourceForTable(
 		return ds, nil
 	}
 
-	ds, err := newOptTable(desc, tableStats, zoneConfig)
+	ds, err := newOptTable(desc, oc.planner.ExecCfg().Codec, tableStats, zoneConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -507,6 +509,9 @@ type optTable struct {
 	// indexes.
 	indexes []optIndex
 
+	// codec is capable of encoding sql table keys.
+	codec keys.SQLCodec
+
 	// rawStats stores the original table statistics slice. Used for a fast-path
 	// check that the statistics haven't changed.
 	rawStats []*stats.TableStatistic
@@ -538,10 +543,14 @@ type optTable struct {
 var _ cat.Table = &optTable{}
 
 func newOptTable(
-	desc *sqlbase.ImmutableTableDescriptor, stats []*stats.TableStatistic, tblZone *zonepb.ZoneConfig,
+	desc *sqlbase.ImmutableTableDescriptor,
+	codec keys.SQLCodec,
+	stats []*stats.TableStatistic,
+	tblZone *zonepb.ZoneConfig,
 ) (*optTable, error) {
 	ot := &optTable{
 		desc:     desc,
+		codec:    codec,
 		rawStats: stats,
 		zone:     tblZone,
 	}
@@ -982,7 +991,7 @@ func (oi *optIndex) Span() roachpb.Span {
 	if desc.ID <= keys.MaxSystemConfigDescID {
 		return keys.SystemConfigSpan
 	}
-	return desc.IndexSpan(oi.desc.ID)
+	return desc.IndexSpan(oi.tab.codec, oi.desc.ID)
 }
 
 // Table is part of the cat.Index interface.
@@ -1006,7 +1015,7 @@ func (oi *optIndex) PartitionByListPrefixes() []tree.Datums {
 	for i := range list {
 		for _, valueEncBuf := range list[i].Values {
 			t, _, err := sqlbase.DecodePartitionTuple(
-				&a, &oi.tab.desc.TableDescriptor, oi.desc, &oi.desc.Partitioning,
+				&a, oi.tab.codec, &oi.tab.desc.TableDescriptor, oi.desc, &oi.desc.Partitioning,
 				valueEncBuf, nil, /* prefixDatums */
 			)
 			if err != nil {

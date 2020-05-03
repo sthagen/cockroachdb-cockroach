@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -26,10 +27,8 @@ import (
 type explainDistSQLNode struct {
 	optColumnsSlot
 
-	options        *tree.ExplainOptions
-	plan           planNode
-	subqueryPlans  []subquery
-	postqueryPlans []postquery
+	options *tree.ExplainOptions
+	plan    planComponents
 
 	stmtType tree.StatementType
 
@@ -66,24 +65,29 @@ type distSQLExplainable interface {
 
 func (n *explainDistSQLNode) startExec(params runParams) error {
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
-	shouldPlanDistribute, recommendation := willDistributePlan(distSQLPlanner, n.plan, params)
+	shouldPlanDistribute, recommendation := willDistributePlan(distSQLPlanner, n.plan.main, params)
 	planCtx := distSQLPlanner.NewPlanningCtx(params.ctx, params.extendedEvalCtx, params.p.txn)
 	planCtx.isLocal = !shouldPlanDistribute
 	planCtx.ignoreClose = true
 	planCtx.planner = params.p
 	planCtx.stmtType = n.stmtType
 
+	if n.analyze && len(n.plan.cascades) > 0 {
+		return errors.New("running EXPLAIN ANALYZE (DISTSQL) on this query is " +
+			"unsupported because of the presence of cascades")
+	}
+
 	// In EXPLAIN ANALYZE mode, we need subqueries to be evaluated as normal.
 	// In EXPLAIN mode, we don't evaluate subqueries, and instead display their
 	// original text in the plan.
 	planCtx.noEvalSubqueries = !n.analyze
 
-	if n.analyze && len(n.subqueryPlans) > 0 {
+	if n.analyze && len(n.plan.subqueryPlans) > 0 {
 		outerSubqueries := planCtx.planner.curPlan.subqueryPlans
 		defer func() {
 			planCtx.planner.curPlan.subqueryPlans = outerSubqueries
 		}()
-		planCtx.planner.curPlan.subqueryPlans = n.subqueryPlans
+		planCtx.planner.curPlan.subqueryPlans = n.plan.subqueryPlans
 
 		// Discard rows that are returned.
 		rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
@@ -106,7 +110,7 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 			planCtx.ctx,
 			params.p,
 			params.extendedEvalCtx.copy,
-			n.subqueryPlans,
+			n.plan.subqueryPlans,
 			recv,
 			true,
 		) {
@@ -117,9 +121,9 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 		}
 	}
 
-	plan, err := makePhysicalPlan(planCtx, distSQLPlanner, n.plan)
+	plan, err := makePhysicalPlan(planCtx, distSQLPlanner, n.plan.main)
 	if err != nil {
-		if len(n.subqueryPlans) > 0 {
+		if len(n.plan.subqueryPlans) > 0 {
 			return errors.New("running EXPLAIN (DISTSQL) on this query is " +
 				"unsupported because of the presence of subqueries")
 		}
@@ -197,7 +201,11 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 		}
 		diagram.AddSpans(spans)
 	} else {
-		flows := plan.GenerateFlowSpecs(params.extendedEvalCtx.NodeID)
+		nodeID, err := params.extendedEvalCtx.NodeID.OptionalNodeIDErr(distsql.MultiTenancyIssueNo)
+		if err != nil {
+			return err
+		}
+		flows := plan.GenerateFlowSpecs(nodeID)
 		showInputTypes := n.options.Flags[tree.ExplainFlagTypes]
 		diagram, err = execinfrapb.GeneratePlanDiagram(params.p.stmt.String(), flows, showInputTypes)
 		if err != nil {
@@ -205,12 +213,12 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 		}
 	}
 
-	if n.analyze && len(n.postqueryPlans) > 0 {
-		outerPostqueries := planCtx.planner.curPlan.postqueryPlans
+	if n.analyze && len(n.plan.checkPlans) > 0 {
+		outerChecks := planCtx.planner.curPlan.checkPlans
 		defer func() {
-			planCtx.planner.curPlan.postqueryPlans = outerPostqueries
+			planCtx.planner.curPlan.checkPlans = outerChecks
 		}()
-		planCtx.planner.curPlan.postqueryPlans = n.postqueryPlans
+		planCtx.planner.curPlan.checkPlans = n.plan.checkPlans
 
 		// Discard rows that are returned.
 		rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
@@ -229,11 +237,11 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 			},
 			params.extendedEvalCtx.Tracing,
 		)
-		if !distSQLPlanner.PlanAndRunPostqueries(
+		if !distSQLPlanner.PlanAndRunCascadesAndChecks(
 			planCtx.ctx,
 			params.p,
 			params.extendedEvalCtx.copy,
-			n.postqueryPlans,
+			&n.plan,
 			recv,
 			true,
 		) {
@@ -267,21 +275,7 @@ func (n *explainDistSQLNode) Next(runParams) (bool, error) {
 
 func (n *explainDistSQLNode) Values() tree.Datums { return n.run.values }
 func (n *explainDistSQLNode) Close(ctx context.Context) {
-	n.plan.Close(ctx)
-	for i := range n.subqueryPlans {
-		// Once a subquery plan has been evaluated, it already closes its plan.
-		if n.subqueryPlans[i].plan != nil {
-			n.subqueryPlans[i].plan.Close(ctx)
-			n.subqueryPlans[i].plan = nil
-		}
-	}
-	for i := range n.postqueryPlans {
-		// Once a postquery plan has been evaluated, it already closes its plan.
-		if n.postqueryPlans[i].plan != nil {
-			n.postqueryPlans[i].plan.Close(ctx)
-			n.postqueryPlans[i].plan = nil
-		}
-	}
+	n.plan.close(ctx)
 }
 
 // willDistributePlan checks if the given plan will run with distributed

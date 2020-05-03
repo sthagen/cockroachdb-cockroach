@@ -25,6 +25,7 @@ import (
 
 // Builder is a single struct for generating key spans from Constraints, Datums and encDatums.
 type Builder struct {
+	codec         keys.SQLCodec
 	table         *sqlbase.TableDescriptor
 	index         *sqlbase.IndexDescriptor
 	indexColTypes []types.T
@@ -48,11 +49,14 @@ var _ = (*Builder).SetNeededFamilies
 var _ = (*Builder).UnsetNeededFamilies
 
 // MakeBuilder creates a Builder for a table and index.
-func MakeBuilder(table *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor) *Builder {
+func MakeBuilder(
+	codec keys.SQLCodec, table *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor,
+) *Builder {
 	s := &Builder{
+		codec:          codec,
 		table:          table,
 		index:          index,
-		KeyPrefix:      sqlbase.MakeIndexKeyPrefix(table, index.ID),
+		KeyPrefix:      sqlbase.MakeIndexKeyPrefix(codec, table, index.ID),
 		interstices:    make([][]byte, len(index.ColumnDirections)+len(index.ExtraColumnIDs)+1),
 		neededFamilies: nil,
 	}
@@ -71,25 +75,22 @@ func MakeBuilder(table *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor)
 	}
 
 	// Set up the interstices for encoding interleaved tables later.
-	s.interstices[0] = sqlbase.MakeIndexKeyPrefix(table, index.ID)
+	s.interstices[0] = s.KeyPrefix
 	if len(index.Interleave.Ancestors) > 0 {
 		// TODO(rohany): too much of this code is copied from EncodePartialIndexKey.
 		sharedPrefixLen := 0
 		for i, ancestor := range index.Interleave.Ancestors {
 			// The first ancestor is already encoded in interstices[0].
 			if i != 0 {
-				s.interstices[sharedPrefixLen] =
-					encoding.EncodeUvarintAscending(s.interstices[sharedPrefixLen], uint64(ancestor.TableID))
-				s.interstices[sharedPrefixLen] =
-					encoding.EncodeUvarintAscending(s.interstices[sharedPrefixLen], uint64(ancestor.IndexID))
+				s.interstices[sharedPrefixLen] = sqlbase.EncodePartialTableIDIndexID(
+					s.interstices[sharedPrefixLen], ancestor.TableID, ancestor.IndexID)
 			}
 			sharedPrefixLen += int(ancestor.SharedPrefixLen)
-			s.interstices[sharedPrefixLen] = encoding.EncodeInterleavedSentinel(s.interstices[sharedPrefixLen])
+			s.interstices[sharedPrefixLen] = encoding.EncodeInterleavedSentinel(
+				s.interstices[sharedPrefixLen])
 		}
-		s.interstices[sharedPrefixLen] =
-			encoding.EncodeUvarintAscending(s.interstices[sharedPrefixLen], uint64(table.ID))
-		s.interstices[sharedPrefixLen] =
-			encoding.EncodeUvarintAscending(s.interstices[sharedPrefixLen], uint64(index.ID))
+		s.interstices[sharedPrefixLen] = sqlbase.EncodePartialTableIDIndexID(
+			s.interstices[sharedPrefixLen], table.ID, index.ID)
 	}
 
 	return s
@@ -129,7 +130,7 @@ func (s *Builder) SpanFromEncDatums(
 	values sqlbase.EncDatumRow, prefixLen int,
 ) (_ roachpb.Span, containsNull bool, _ error) {
 	return sqlbase.MakeSpanFromEncDatums(
-		s.KeyPrefix, values[:prefixLen], s.indexColTypes[:prefixLen], s.indexColDirs[:prefixLen], s.table, s.index, &s.alloc)
+		values[:prefixLen], s.indexColTypes[:prefixLen], s.indexColDirs[:prefixLen], s.table, s.index, &s.alloc, s.KeyPrefix)
 }
 
 // SpanFromDatumRow generates an index span with prefixLen constraint columns from the index.
@@ -222,8 +223,8 @@ func (s *Builder) SpansFromConstraint(
 
 // UnconstrainedSpans returns the full span corresponding to the Builder's
 // table and index.
-func (s *Builder) UnconstrainedSpans(forDelete bool) (roachpb.Spans, error) {
-	return s.SpansFromConstraint(nil, exec.TableColumnOrdinalSet{}, forDelete)
+func (s *Builder) UnconstrainedSpans() (roachpb.Spans, error) {
+	return s.SpansFromConstraint(nil, exec.TableColumnOrdinalSet{}, false /* forDelete */)
 }
 
 // appendSpansFromConstraintSpan converts a constraint.Span to one or more
@@ -269,7 +270,7 @@ func (s *Builder) appendSpansFromConstraintSpan(
 	// last parent key. If cs.End.Inclusive is true, we also advance the key as
 	// necessary.
 	endInclusive := cs.EndBoundary() == constraint.IncludeBoundary
-	span.EndKey, err = sqlbase.AdjustEndKeyForInterleave(s.table, s.index, span.EndKey, endInclusive)
+	span.EndKey, err = sqlbase.AdjustEndKeyForInterleave(s.codec, s.table, s.index, span.EndKey, endInclusive)
 	if err != nil {
 		return nil, err
 	}

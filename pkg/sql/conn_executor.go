@@ -318,12 +318,13 @@ func makeMetrics(internal bool) Metrics {
 
 // Start starts the Server's background processing.
 func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
-	gossipUpdateC := s.cfg.Gossip.RegisterSystemConfigChannel()
+	g := s.cfg.Gossip.Deprecated(47150)
+	gossipUpdateC := g.RegisterSystemConfigChannel()
 	stopper.RunWorker(ctx, func(ctx context.Context) {
 		for {
 			select {
 			case <-gossipUpdateC:
-				sysCfg := s.cfg.Gossip.GetSystemConfig()
+				sysCfg := g.GetSystemConfig()
 				s.dbCache.updateSystemConfig(sysCfg)
 			case <-stopper.ShouldStop():
 				return
@@ -563,6 +564,7 @@ func (s *Server) newConnExecutor(
 		-1 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
 	)
 
+	nodeIDOrZero, _ := s.cfg.NodeID.OptionalNodeID()
 	ex := &connExecutor{
 		server:      s,
 		metrics:     srvMetrics,
@@ -577,9 +579,9 @@ func (s *Server) newConnExecutor(
 			connCtx: ctx,
 		},
 		transitionCtx: transitionCtx{
-			db:     s.cfg.DB,
-			nodeID: s.cfg.NodeID.Get(),
-			clock:  s.cfg.Clock,
+			db:           s.cfg.DB,
+			nodeIDOrZero: nodeIDOrZero,
+			clock:        s.cfg.Clock,
 			// Future transaction's monitors will inherits from sessionRootMon.
 			connMon:  &sessionRootMon,
 			tracer:   s.cfg.AmbientCtx.Tracer,
@@ -793,8 +795,8 @@ func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{})
 			cutStmt = cutStmt[:panicLogOutputCutoffChars] + " [...]"
 		}
 
-		log.Shout(ctx, log.Severity_ERROR,
-			fmt.Sprintf("a SQL panic has occurred while executing %q: %s", cutStmt, recovered))
+		log.Shoutf(ctx, log.Severity_ERROR,
+			"a SQL panic has occurred while executing %q: %s", cutStmt, recovered)
 
 		ex.close(ctx, panicClose)
 
@@ -1797,11 +1799,11 @@ func stmtHasNoData(stmt tree.Statement) bool {
 	return stmt == nil || stmt.StatementType() != tree.Rows
 }
 
-// generateID generates a unique ID based on the node's ID and its current HLC
-// timestamp. These IDs are either scoped at the query level or at the session
-// level.
+// generateID generates a unique ID based on the SQL instance ID and its current
+// HLC timestamp. These IDs are either scoped at the query level or at the
+// session level.
 func (ex *connExecutor) generateID() ClusterWideID {
-	return GenerateClusterWideID(ex.server.cfg.Clock.Now(), ex.server.cfg.NodeID.Get())
+	return GenerateClusterWideID(ex.server.cfg.Clock.Now(), ex.server.cfg.NodeID.SQLInstanceID())
 }
 
 // commitPrepStmtNamespace deallocates everything in
@@ -1970,7 +1972,8 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			TestingKnobs:       ex.server.cfg.EvalContextTestingKnobs,
 			ClusterID:          ex.server.cfg.ClusterID(),
 			ClusterName:        ex.server.cfg.RPCContext.ClusterName(),
-			NodeID:             ex.server.cfg.NodeID.Get(),
+			NodeID:             ex.server.cfg.NodeID,
+			Codec:              ex.server.cfg.Codec,
 			Locality:           ex.server.cfg.Locality,
 			ReCache:            ex.server.reCache,
 			InternalExecutor:   &ie,
@@ -2111,7 +2114,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 					advInfo.txnEvent.String()+ //the event is included like this so that it doesn't get sanitized
 					" generated even though res.Err() has been set to: %s",
 				res.Err())
-			log.Error(ex.Ctx(), err)
+			log.Errorf(ex.Ctx(), "%v", err)
 			errorutil.SendReport(ex.Ctx(), &ex.server.cfg.Settings.SV, err)
 			return advanceInfo{}, err
 		}

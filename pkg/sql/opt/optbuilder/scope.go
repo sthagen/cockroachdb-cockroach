@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -455,11 +456,7 @@ func (s *scope) resolveAndRequireType(expr tree.Expr, desired *types.T) tree.Typ
 // and can be cast to any other type.
 func (s *scope) ensureNullType(texpr tree.TypedExpr, desired *types.T) tree.TypedExpr {
 	if desired.Family() != types.AnyFamily && texpr.ResolvedType().Family() == types.UnknownFamily {
-		var err error
-		texpr, err = tree.NewTypedCastExpr(texpr, desired)
-		if err != nil {
-			panic(err)
-		}
+		texpr = tree.NewTypedCastExpr(texpr, desired)
 	}
 	return texpr
 }
@@ -1229,11 +1226,14 @@ func analyzeWindowFrame(s *scope, windowDef *tree.WindowDef) error {
 			// At least one of the bounds is of type 'value' PRECEDING or 'value' FOLLOWING.
 			// We require ordering on a single column that supports addition/subtraction.
 			if len(windowDef.OrderBy) != 1 {
-				return pgerror.Newf(pgcode.Windowing, "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
+				return pgerror.Newf(pgcode.Windowing,
+					"RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
 			}
 			requiredType = windowDef.OrderBy[0].Expr.(tree.TypedExpr).ResolvedType()
 			if !types.IsAdditiveType(requiredType) {
-				return pgerror.Newf(pgcode.Windowing, fmt.Sprintf("RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s", requiredType))
+				return pgerror.Newf(pgcode.Windowing,
+					"RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s",
+					log.Safe(requiredType))
 			}
 			if types.IsDateTimeType(requiredType) {
 				// Spec: for datetime ordering columns, the required type is an 'interval'.

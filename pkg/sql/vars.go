@@ -526,7 +526,7 @@ var varGen = map[string]sessionVar{
 	`experimental_optimizer_foreign_key_cascades`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`experimental_optimizer_foreign_key_cascades`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("optimizer_foreign_key_cascades", s)
+			b, err := parseBoolVar("experimental_optimizer_foreign_key_cascades", s)
 			if err != nil {
 				return err
 			}
@@ -538,6 +538,44 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(optDrivenFKCascadesClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`optimizer_use_histograms`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_histograms`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parseBoolVar("optimizer_use_histograms", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseHistograms(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.OptimizerUseHistograms)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(optUseHistogramsClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`optimizer_use_multicol_stats`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_multicol_stats`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parseBoolVar("optimizer_use_multicol_stats", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseMultiColStats(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.OptimizerUseMultiColStats)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(optUseMultiColStatsClusterMode.Get(sv))
 		},
 	},
 
@@ -678,7 +716,8 @@ var varGen = map[string]sessionVar{
 	// CockroachDB extension.
 	`node_id`: {
 		Get: func(evalCtx *extendedEvalContext) string {
-			return fmt.Sprintf("%d", evalCtx.NodeID)
+			nodeID, _ := evalCtx.NodeID.OptionalNodeID() // zero if unavailable
+			return fmt.Sprintf("%d", nodeID)
 		},
 	},
 

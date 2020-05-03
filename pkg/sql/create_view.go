@@ -207,7 +207,7 @@ func (n *createViewNode) startExec(params runParams) error {
 		params.p.txn,
 		EventLogCreateView,
 		int32(newDesc.ID),
-		int32(params.extendedEvalCtx.NodeID),
+		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 		struct {
 			ViewName  string
 			ViewQuery string
@@ -374,7 +374,7 @@ func verifyReplacingViewColumns(oldColumns, newColumns []sqlbase.ColumnDescripto
 				newCol.Name,
 			)
 		}
-		if !newCol.Type.Equal(oldCol.Type) {
+		if !newCol.Type.Identical(&oldCol.Type) {
 			return pgerror.Newf(
 				pgcode.InvalidTableDefinition,
 				`cannot change type of view column %q from %s to %s`,

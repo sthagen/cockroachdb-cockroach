@@ -16,11 +16,14 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"math/rand"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 )
@@ -84,8 +87,7 @@ var tpchTables = []string{
 
 type tpchVecTestCase interface {
 	// TODO(asubiotto): Getting the queries we want to run given a version should
-	//  also be part of this. This can also be where we return tpch queries with
-	//  random placeholders.
+	//  also be part of this.
 	// vectorizeOptions are the vectorize options that each query will be run
 	// with.
 	vectorizeOptions() []bool
@@ -93,7 +95,7 @@ type tpchVecTestCase interface {
 	numRunsPerQuery() int
 	// preTestRunHook is called before any tpch query is run. Can be used to
 	// perform setup.
-	preTestRunHook(t *test, conn *gosql.DB, version crdbVersion)
+	preTestRunHook(ctx context.Context, t *test, c *cluster, conn *gosql.DB, version crdbVersion)
 	// postQueryRunHook is called after each tpch query is run with the output and
 	// the vectorize mode it was run in.
 	postQueryRunHook(t *test, output []byte, vectorized bool)
@@ -106,15 +108,17 @@ type tpchVecTestCase interface {
 // embedded and extended.
 type tpchVecTestCaseBase struct{}
 
-func (r tpchVecTestCaseBase) vectorizeOptions() []bool {
+func (b tpchVecTestCaseBase) vectorizeOptions() []bool {
 	return []bool{true}
 }
 
-func (r tpchVecTestCaseBase) numRunsPerQuery() int {
+func (b tpchVecTestCaseBase) numRunsPerQuery() int {
 	return 1
 }
 
-func (r tpchVecTestCaseBase) preTestRunHook(t *test, conn *gosql.DB, version crdbVersion) {
+func (b tpchVecTestCaseBase) preTestRunHook(
+	_ context.Context, t *test, _ *cluster, conn *gosql.DB, version crdbVersion,
+) {
 	if version != tpchVecVersion19_2 {
 		t.Status("resetting sql.testing.vectorize.batch_size")
 		if _, err := conn.Exec("RESET CLUSTER SETTING sql.testing.vectorize.batch_size"); err != nil {
@@ -127,9 +131,9 @@ func (r tpchVecTestCaseBase) preTestRunHook(t *test, conn *gosql.DB, version crd
 	}
 }
 
-func (r tpchVecTestCaseBase) postQueryRunHook(_ *test, _ []byte, _ bool) {}
+func (b tpchVecTestCaseBase) postQueryRunHook(_ *test, _ []byte, _ bool) {}
 
-func (r tpchVecTestCaseBase) postTestRunHook(_ *test, _ *gosql.DB, _ crdbVersion) {}
+func (b tpchVecTestCaseBase) postTestRunHook(_ *test, _ *gosql.DB, _ crdbVersion) {}
 
 const (
 	tpchPerfTestNumRunsPerQuery = 3
@@ -235,8 +239,10 @@ type tpchVecDiskTest struct {
 	tpchVecTestCaseBase
 }
 
-func (d tpchVecDiskTest) preTestRunHook(t *test, conn *gosql.DB, version crdbVersion) {
-	d.tpchVecTestCaseBase.preTestRunHook(t, conn, version)
+func (d tpchVecDiskTest) preTestRunHook(
+	ctx context.Context, t *test, c *cluster, conn *gosql.DB, version crdbVersion,
+) {
+	d.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version)
 	// In order to stress the disk spilling of the vectorized
 	// engine, we will set workmem limit to a random value in range
 	// [16KiB, 256KiB).
@@ -249,13 +255,9 @@ func (d tpchVecDiskTest) preTestRunHook(t *test, conn *gosql.DB, version crdbVer
 	}
 }
 
-type tpchVecSmallBatchSizeTest struct {
-	tpchVecTestCaseBase
-}
-
-func (b tpchVecSmallBatchSizeTest) preTestRunHook(t *test, conn *gosql.DB, version crdbVersion) {
-	b.tpchVecTestCaseBase.preTestRunHook(t, conn, version)
-	rng, _ := randutil.NewPseudoRand()
+// setSmallBatchSize sets a cluster setting to override the batch size to be in
+// [1, 5) range.
+func setSmallBatchSize(t *test, conn *gosql.DB, rng *rand.Rand) {
 	batchSize := 1 + rng.Intn(4)
 	t.Status(fmt.Sprintf("setting sql.testing.vectorize.batch_size to %d", batchSize))
 	if _, err := conn.Exec(fmt.Sprintf("SET CLUSTER SETTING sql.testing.vectorize.batch_size=%d", batchSize)); err != nil {
@@ -263,7 +265,108 @@ func (b tpchVecSmallBatchSizeTest) preTestRunHook(t *test, conn *gosql.DB, versi
 	}
 }
 
-func runTPCHVec(ctx context.Context, t *test, c *cluster, testCase tpchVecTestCase) {
+type tpchVecSmallBatchSizeTest struct {
+	tpchVecTestCaseBase
+}
+
+func (b tpchVecSmallBatchSizeTest) preTestRunHook(
+	ctx context.Context, t *test, c *cluster, conn *gosql.DB, version crdbVersion,
+) {
+	b.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version)
+	rng, _ := randutil.NewPseudoRand()
+	setSmallBatchSize(t, conn, rng)
+}
+
+func baseTestRun(
+	ctx context.Context, t *test, c *cluster, version crdbVersion, tc tpchVecTestCase,
+) {
+	firstNode := c.Node(1)
+	queriesToSkip := queriesToSkipByVersion[version]
+	for queryNum := 1; queryNum <= tpchVecNumQueries; queryNum++ {
+		for _, vectorize := range tc.vectorizeOptions() {
+			if reason, skip := queriesToSkip[queryNum]; skip {
+				t.Status(fmt.Sprintf("skipping q%d because of %q", queryNum, reason))
+				continue
+			}
+			vectorizeSetting := "off"
+			if vectorize {
+				vectorizeSetting = vectorizeOnOptionByVersion[version]
+			}
+			cmd := fmt.Sprintf("./workload run tpch --concurrency=1 --db=tpch "+
+				"--max-ops=%d --queries=%d --vectorize=%s {pgurl:1-%d}",
+				tc.numRunsPerQuery(), queryNum, vectorizeSetting, tpchVecNodeCount)
+			workloadOutput, err := c.RunWithBuffer(ctx, t.l, firstNode, cmd)
+			t.l.Printf("\n" + string(workloadOutput))
+			if err != nil {
+				// Note: if you see an error like "exit status 1", it is likely caused
+				// by the erroneous output of the query.
+				t.Fatal(err)
+			}
+			tc.postQueryRunHook(t, workloadOutput, vectorize)
+		}
+	}
+}
+
+type tpchVecSmithcmpTest struct {
+	tpchVecTestCaseBase
+}
+
+const tpchVecSmithcmp = "smithcmp"
+
+func (s tpchVecSmithcmpTest) preTestRunHook(
+	ctx context.Context, t *test, c *cluster, conn *gosql.DB, version crdbVersion,
+) {
+	s.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version)
+	const smithcmpSHA = "a3f41f5ba9273249c5ecfa6348ea8ee3ac4b77e3"
+	node := c.Node(1)
+	if local && runtime.GOOS != "linux" {
+		t.Fatalf("must run on linux os, found %s", runtime.GOOS)
+	}
+	// This binary has been manually compiled using
+	// './build/builder.sh go build ./pkg/cmd/smithcmp' and uploaded to S3
+	// bucket at cockroach/smithcmp. The binary shouldn't change much, so it is
+	// acceptable.
+	smithcmp, err := binfetcher.Download(ctx, binfetcher.Options{
+		Component: tpchVecSmithcmp,
+		Binary:    tpchVecSmithcmp,
+		Version:   smithcmpSHA,
+		GOOS:      "linux",
+		GOARCH:    "amd64",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Put(ctx, smithcmp, "./"+tpchVecSmithcmp, node)
+	// To increase test coverage, we will be randomizing the batch size in 50%
+	// of the runs.
+	rng, _ := randutil.NewPseudoRand()
+	if rng.Float64() < 0.5 {
+		setSmallBatchSize(t, conn, rng)
+	}
+}
+
+func smithcmpTestRun(ctx context.Context, t *test, c *cluster, _ crdbVersion, _ tpchVecTestCase) {
+	const (
+		configFile = `tpchvec_smithcmp.toml`
+		configURL  = `https://raw.githubusercontent.com/cockroachdb/cockroach/master/pkg/cmd/roachtest/` + configFile
+	)
+	firstNode := c.Node(1)
+	if err := c.RunE(ctx, firstNode, fmt.Sprintf("curl %s > %s", configURL, configFile)); err != nil {
+		t.Fatal(err)
+	}
+	cmd := fmt.Sprintf("./%s %s", tpchVecSmithcmp, configFile)
+	if err := c.RunE(ctx, firstNode, cmd); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runTPCHVec(
+	ctx context.Context,
+	t *test,
+	c *cluster,
+	testCase tpchVecTestCase,
+	testRun func(ctx context.Context, t *test, c *cluster, version crdbVersion, tc tpchVecTestCase),
+) {
 	firstNode := c.Node(1)
 	c.Put(ctx, cockroach, "./cockroach", c.All())
 	c.Put(ctx, workload, "./workload", firstNode)
@@ -291,33 +394,9 @@ func runTPCHVec(ctx context.Context, t *test, c *cluster, testCase tpchVecTestCa
 	if err != nil {
 		t.Fatal(err)
 	}
-	queriesToSkip := queriesToSkipByVersion[version]
 
-	testCase.preTestRunHook(t, conn, version)
-
-	for queryNum := 1; queryNum <= tpchVecNumQueries; queryNum++ {
-		for _, vectorize := range testCase.vectorizeOptions() {
-			if reason, skip := queriesToSkip[queryNum]; skip {
-				t.Status(fmt.Sprintf("skipping q%d because of %q", queryNum, reason))
-				continue
-			}
-			vectorizeSetting := "off"
-			if vectorize {
-				vectorizeSetting = vectorizeOnOptionByVersion[version]
-			}
-			cmd := fmt.Sprintf("./workload run tpch --concurrency=1 --db=tpch "+
-				"--max-ops=%d --queries=%d --vectorize=%s {pgurl:1-%d}",
-				testCase.numRunsPerQuery(), queryNum, vectorizeSetting, tpchVecNodeCount)
-			workloadOutput, err := c.RunWithBuffer(ctx, t.l, firstNode, cmd)
-			t.l.Printf("\n" + string(workloadOutput))
-			if err != nil {
-				// Note: if you see an error like "exit status 1", it is likely caused
-				// by the erroneous output of the query.
-				t.Fatal(err)
-			}
-			testCase.postQueryRunHook(t, workloadOutput, vectorize)
-		}
-	}
+	testCase.preTestRunHook(ctx, t, c, conn, version)
+	testRun(ctx, t, c, version, testCase)
 	testCase.postTestRunHook(t, conn, version)
 }
 
@@ -328,7 +407,7 @@ func registerTPCHVec(r *testRegistry) {
 		Cluster:    makeClusterSpec(tpchVecNodeCount),
 		MinVersion: "v19.2.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			runTPCHVec(ctx, t, c, newTpchVecPerfTest())
+			runTPCHVec(ctx, t, c, newTpchVecPerfTest(), baseTestRun)
 		},
 	})
 
@@ -340,7 +419,7 @@ func registerTPCHVec(r *testRegistry) {
 		// there is no point in running this config on that version.
 		MinVersion: "v20.1.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			runTPCHVec(ctx, t, c, tpchVecDiskTest{})
+			runTPCHVec(ctx, t, c, tpchVecDiskTest{}, baseTestRun)
 		},
 	})
 
@@ -352,7 +431,17 @@ func registerTPCHVec(r *testRegistry) {
 		// size, so only run on versions >= 20.1.0.
 		MinVersion: "v20.1.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			runTPCHVec(ctx, t, c, tpchVecSmallBatchSizeTest{})
+			runTPCHVec(ctx, t, c, tpchVecSmallBatchSizeTest{}, baseTestRun)
+		},
+	})
+
+	r.Add(testSpec{
+		Name:       "tpchvec/smithcmp",
+		Owner:      OwnerSQLExec,
+		Cluster:    makeClusterSpec(tpchVecNodeCount),
+		MinVersion: "v20.1.0",
+		Run: func(ctx context.Context, t *test, c *cluster) {
+			runTPCHVec(ctx, t, c, tpchVecSmithcmpTest{}, smithcmpTestRun)
 		},
 	})
 }

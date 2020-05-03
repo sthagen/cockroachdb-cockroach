@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -505,7 +506,7 @@ func (tc *TableCollection) releaseTableLeases(ctx context.Context, tables []IDVe
 		if !shouldRelease(l.ID) {
 			filteredLeases = append(filteredLeases, l)
 		} else if err := tc.leaseMgr.Release(l); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 	}
 	tc.leasedTables = filteredLeases
@@ -516,7 +517,7 @@ func (tc *TableCollection) releaseLeases(ctx context.Context) {
 		log.VEventf(ctx, 2, "releasing %d tables", len(tc.leasedTables))
 		for _, table := range tc.leasedTables {
 			if err := tc.leaseMgr.Release(table); err != nil {
-				log.Warning(ctx, err)
+				log.Warningf(ctx, "%v", err)
 			}
 		}
 		tc.leasedTables = tc.leasedTables[:0]
@@ -856,7 +857,7 @@ func (tc *TableCollection) validatePrimaryKeys() error {
 	for i := range modifiedTables {
 		table := tc.getUncommittedTableByID(modifiedTables[i].id).MutableTableDescriptor
 		if !table.HasPrimaryKey() {
-			return errors.Errorf(
+			return unimplemented.NewWithIssuef(48026,
 				"primary key of table %s dropped without subsequent addition of new primary key",
 				table.Name,
 			)
@@ -955,7 +956,7 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 	if jobExists {
 		spanList = job.Details().(jobspb.SchemaChangeDetails).ResumeSpanList
 	}
-	span := tableDesc.PrimaryIndexSpan()
+	span := tableDesc.PrimaryIndexSpan(p.ExecCfg().Codec)
 	for i := len(tableDesc.ClusterVersion.Mutations) + len(spanList); i < len(tableDesc.Mutations); i++ {
 		spanList = append(spanList,
 			jobspb.ResumeSpanList{

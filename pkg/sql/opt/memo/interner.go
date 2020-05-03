@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
@@ -483,6 +484,12 @@ func (h *hasher) HashJoinFlags(val JoinFlags) {
 	h.HashUint64(uint64(val))
 }
 
+func (h *hasher) HashFKCascades(val FKCascades) {
+	for i := range val {
+		h.HashUint64(uint64(reflect.ValueOf(val[i].Builder).Pointer()))
+	}
+}
+
 func (h *hasher) HashExplainOptions(val tree.ExplainOptions) {
 	h.HashUint64(uint64(val.Mode))
 	hash := h.hash
@@ -549,6 +556,10 @@ func (h *hasher) HashLockingItem(val *tree.LockingItem) {
 		h.HashByte(byte(val.Strength))
 		h.HashByte(byte(val.WaitPolicy))
 	}
+}
+
+func (h *hasher) HashGeoRelationshipType(val geoindex.RelationshipType) {
+	h.HashUint64(uint64(val))
 }
 
 func (h *hasher) HashRelExpr(val RelExpr) {
@@ -836,6 +847,19 @@ func (h *hasher) IsJoinFlagsEqual(l, r JoinFlags) bool {
 	return l == r
 }
 
+func (h *hasher) IsFKCascadesEqual(l, r FKCascades) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	for i := range l {
+		// It's sufficient to compare the CascadeBuilder instances.
+		if l[i].Builder != r[i].Builder {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *hasher) IsExplainOptionsEqual(l, r tree.ExplainOptions) bool {
 	return l == r
 }
@@ -883,6 +907,10 @@ func (h *hasher) IsLockingItemEqual(l, r *tree.LockingItem) bool {
 		return l == r
 	}
 	return l.Strength == r.Strength && l.WaitPolicy == r.WaitPolicy
+}
+
+func (h *hasher) IsGeoRelationshipTypeEqual(l, r geoindex.RelationshipType) bool {
+	return l == r
 }
 
 func (h *hasher) IsPointerEqual(l, r unsafe.Pointer) bool {

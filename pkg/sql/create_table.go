@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -354,7 +355,7 @@ func (n *createTableNode) startExec(params runParams) error {
 		params.p.txn,
 		EventLogCreateTable,
 		int32(desc.ID),
-		int32(params.extendedEvalCtx.NodeID),
+		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 		struct {
 			TableName string
 			Statement string
@@ -382,6 +383,7 @@ func (n *createTableNode) startExec(params runParams) error {
 			ri, err := row.MakeInserter(
 				params.ctx,
 				params.p.txn,
+				params.ExecCfg().Codec,
 				sqlbase.NewImmutableTableDescriptor(*desc.TableDesc()),
 				desc.Columns,
 				row.SkipFKs,
@@ -496,7 +498,7 @@ func (p *planner) resolveFK(
 	ts FKTableState,
 	validationBehavior tree.ValidationBehavior,
 ) error {
-	return ResolveFK(ctx, p.txn, p, tbl, d, backrefs, ts, validationBehavior, p.ExecCfg().Settings)
+	return ResolveFK(ctx, p.txn, p, tbl, d, backrefs, ts, validationBehavior, p.EvalContext())
 }
 
 func qualifyFKColErrorWithDB(
@@ -606,7 +608,7 @@ func ResolveFK(
 	backrefs map[sqlbase.ID]*sqlbase.MutableTableDescriptor,
 	ts FKTableState,
 	validationBehavior tree.ValidationBehavior,
-	settings *cluster.Settings,
+	evalCtx *tree.EvalContext,
 ) error {
 	originColumnIDs := make(sqlbase.ColumnIDs, len(d.FromCols))
 	for i, col := range d.FromCols {
@@ -829,9 +831,15 @@ func addIndexForFK(
 	constraintName string,
 	ts FKTableState,
 ) (sqlbase.IndexID, error) {
+	autoIndexName := sqlbase.GenerateUniqueConstraintName(
+		fmt.Sprintf("%s_auto_index_%s", tbl.Name, constraintName),
+		func(name string) bool {
+			return tbl.ValidateIndexNameIsUnique(name) != nil
+		},
+	)
 	// No existing index for the referencing columns found, so we add one.
 	idx := sqlbase.IndexDescriptor{
-		Name:             fmt.Sprintf("%s_auto_index_%s", tbl.Name, constraintName),
+		Name:             autoIndexName,
 		ColumnNames:      make([]string, len(srcCols)),
 		ColumnDirections: make([]sqlbase.IndexDescriptor_Direction, len(srcCols)),
 	}
@@ -1253,8 +1261,15 @@ func MakeTableDesc(
 
 	for i, def := range n.Defs {
 		if d, ok := def.(*tree.ColumnTableDef); ok {
+			// MakeTableDesc is called sometimes with a nil SemaCtx (for example
+			// during bootstrapping). In order to not panic, pass a nil TypeResolver
+			// when attempting to resolve the columns type.
+			defType, err := tree.ResolveType(d.Type, semaCtx.GetTypeResolver())
+			if err != nil {
+				return sqlbase.MutableTableDescriptor{}, err
+			}
 			if !desc.IsVirtualTable() {
-				switch d.Type.Oid() {
+				switch defType.Oid() {
 				case oid.T_int2vector, oid.T_oidvector:
 					return desc, pgerror.Newf(
 						pgcode.FeatureNotSupported,
@@ -1262,13 +1277,13 @@ func MakeTableDesc(
 					)
 				}
 			}
-			if supported, err := isTypeSupportedInVersion(version, d.Type); err != nil {
+			if supported, err := isTypeSupportedInVersion(version, defType); err != nil {
 				return desc, err
 			} else if !supported {
 				return desc, pgerror.Newf(
 					pgcode.FeatureNotSupported,
 					"type %s is not supported until version upgrade is finalized",
-					d.Type.SQLString(),
+					defType.SQLString(),
 				)
 			}
 			if d.PrimaryKey.Sharded {
@@ -1424,6 +1439,18 @@ func MakeTableDesc(
 			}
 			if err := idx.FillColumns(d.Columns); err != nil {
 				return desc, err
+			}
+			if d.Inverted {
+				columnDesc, _, err := desc.FindColumnByName(tree.Name(idx.ColumnNames[0]))
+				if err != nil {
+					return desc, err
+				}
+				if columnDesc.Type.InternalType.Family == types.GeometryFamily {
+					idx.GeoConfig = *geoindex.DefaultGeometryIndexConfig()
+				}
+				if columnDesc.Type.InternalType.Family == types.GeographyFamily {
+					idx.GeoConfig = *geoindex.DefaultGeographyIndexConfig()
+				}
 			}
 			if d.PartitionBy != nil {
 				partitioning, err := CreatePartitioning(ctx, st, evalCtx, &desc, &idx, d.PartitionBy)
@@ -1636,7 +1663,9 @@ func MakeTableDesc(
 			desc.Checks = append(desc.Checks, ck)
 
 		case *tree.ForeignKeyConstraintTableDef:
-			if err := ResolveFK(ctx, txn, fkResolver, &desc, d, affected, NewTable, tree.ValidationDefault, st); err != nil {
+			if err := ResolveFK(
+				ctx, txn, fkResolver, &desc, d, affected, NewTable, tree.ValidationDefault, evalCtx,
+			); err != nil {
 				return desc, err
 			}
 
@@ -1671,6 +1700,13 @@ func MakeTableDesc(
 		}
 		if idx.Type == sqlbase.IndexDescriptor_INVERTED {
 			telemetry.Inc(sqltelemetry.InvertedIndexCounter)
+			if !geoindex.IsEmptyConfig(&idx.GeoConfig) {
+				if geoindex.IsGeographyConfig(&idx.GeoConfig) {
+					telemetry.Inc(sqltelemetry.GeographyInvertedIndexCounter)
+				} else if geoindex.IsGeometryConfig(&idx.GeoConfig) {
+					telemetry.Inc(sqltelemetry.GeometryInvertedIndexCounter)
+				}
+			}
 		}
 		return nil
 	}); err != nil {
@@ -2216,8 +2252,12 @@ func validateComputedColumn(
 		return err
 	}
 
+	defType, err := tree.ResolveType(d.Type, semaCtx.GetTypeResolver())
+	if err != nil {
+		return err
+	}
 	if _, err := sqlbase.SanitizeVarFreeExpr(
-		replacedExpr, d.Type, "computed column", semaCtx, false, /* allowImpure */
+		replacedExpr, defType, "computed column", semaCtx, false, /* allowImpure */
 	); err != nil {
 		return err
 	}
@@ -2318,7 +2358,9 @@ func MakeCheckConstraint(
 // incTelemetryForNewColumn increments relevant telemetry every time a new column
 // is added to a table.
 func incTelemetryForNewColumn(d *tree.ColumnTableDef) {
-	telemetry.Inc(sqltelemetry.SchemaNewTypeCounter(d.Type.TelemetryName()))
+	if typ, ok := tree.GetStaticallyKnownType(d.Type); ok {
+		telemetry.Inc(sqltelemetry.SchemaNewTypeCounter(typ.TelemetryName()))
+	}
 	if d.IsComputed() {
 		telemetry.Inc(sqltelemetry.SchemaNewColumnTypeQualificationCounter("computed"))
 	}

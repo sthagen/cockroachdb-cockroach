@@ -146,7 +146,7 @@ func NewDistSQLPlanner(
 	rpcCtx *rpc.Context,
 	distSQLSrv *distsql.ServerImpl,
 	distSender *kvcoord.DistSender,
-	gossip *gossip.Gossip,
+	g *gossip.Gossip,
 	stopper *stop.Stopper,
 	liveness livenessProvider,
 	nodeDialer *nodedialer.Dialer,
@@ -160,10 +160,10 @@ func NewDistSQLPlanner(
 		nodeDesc:    nodeDesc,
 		stopper:     stopper,
 		distSQLSrv:  distSQLSrv,
-		gossip:      gossip,
+		gossip:      g,
 		nodeDialer:  nodeDialer,
 		nodeHealth: distSQLNodeHealth{
-			gossip:     gossip,
+			gossip:     g,
 			connHealth: nodeDialer.ConnHealth,
 		},
 		distSender:            distSender,
@@ -219,7 +219,9 @@ func (v *distSQLExprCheckVisitor) VisitPre(expr tree.Expr) (recurse bool, newExp
 		v.err = newQueryNotSupportedError("OID expressions are not supported by distsql")
 		return false, expr
 	case *tree.CastExpr:
-		if t.Type.Family() == types.OidFamily {
+		// TODO (rohany): I'm not sure why this CastExpr doesn't have a type
+		//  annotation at this stage of processing...
+		if typ, ok := tree.GetStaticallyKnownType(t.Type); ok && typ.Family() == types.OidFamily {
 			v.err = newQueryNotSupportedErrorf("cast to %s is not supported by distsql", t.Type)
 			return false, expr
 		}
@@ -446,7 +448,7 @@ func (dsp *DistSQLPlanner) checkSupportForNode(node planNode) (distRecommendatio
 			rec = rec.compose(shouldDistribute)
 		}
 		// Check if we are doing a full scan.
-		if len(n.spans) == 1 && n.spans[0].EqualValue(n.desc.IndexSpan(n.index.ID)) {
+		if n.isFull {
 			rec = rec.compose(shouldDistribute)
 		}
 		return rec, nil
@@ -703,9 +705,9 @@ func (h *distSQLNodeHealth) check(ctx context.Context, nodeID roachpb.NodeID) er
 	}
 
 	if drainingInfo.Draining {
-		errMsg := fmt.Sprintf("not using n%d because it is draining", nodeID)
-		log.VEvent(ctx, 1, errMsg)
-		return errors.New(errMsg)
+		err := errors.Newf("not using n%d because it is draining", log.Safe(nodeID))
+		log.VEventf(ctx, 1, "%v", err)
+		return err
 	}
 
 	return nil
@@ -2421,7 +2423,7 @@ func (dsp *DistSQLPlanner) createPlanForNode(
 
 	if dsp.shouldPlanTestMetadata() {
 		if err := plan.CheckLastStagePost(); err != nil {
-			log.Fatal(planCtx.ctx, err)
+			log.Fatalf(planCtx.ctx, "%v", err)
 		}
 		plan.AddNoGroupingStageWithCoreFunc(
 			func(_ int, _ *physicalplan.Processor) execinfrapb.ProcessorCoreUnion {

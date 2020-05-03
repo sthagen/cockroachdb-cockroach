@@ -90,7 +90,11 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 				// Lookup the store in gossip.
 				var storeDesc roachpb.StoreDescriptor
 				gossipStoreKey := gossip.MakeStoreKey(storeID)
-				if err := params.extendedEvalCtx.ExecCfg.Gossip.GetInfoProto(
+				g, err := params.extendedEvalCtx.ExecCfg.Gossip.OptionalErr()
+				if err != nil {
+					return false, err
+				}
+				if err := g.GetInfoProto(
 					gossipStoreKey, &storeDesc,
 				); err != nil {
 					return false, errors.Wrapf(err, "error looking up store %d", storeID)
@@ -108,7 +112,7 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 	// TODO(a-robinson): Get the lastRangeStartKey via the ReturnRangeInfo option
 	// on the BatchRequest Header. We can't do this until v2.2 because admin
 	// requests don't respect the option on versions earlier than v2.1.
-	rowKey, err := getRowKey(n.tableDesc, n.index, data[1:])
+	rowKey, err := getRowKey(params.ExecCfg().Codec, n.tableDesc, n.index, data[1:])
 	if err != nil {
 		return false, err
 	}

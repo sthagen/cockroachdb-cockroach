@@ -11,6 +11,7 @@
 package bench
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
@@ -161,6 +162,20 @@ func (f *stubFactory) ConstructLookupJoin(
 	return struct{}{}, nil
 }
 
+func (f *stubFactory) ConstructGeoLookupJoin(
+	joinType sqlbase.JoinType,
+	geoRelationshipType geoindex.RelationshipType,
+	input exec.Node,
+	table cat.Table,
+	index cat.Index,
+	geoCol exec.NodeColumnOrdinal,
+	lookupCols exec.TableColumnOrdinalSet,
+	onCond tree.TypedExpr,
+	reqOrdering exec.OutputOrdering,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
 func (f *stubFactory) ConstructZigzagJoin(
 	leftTable cat.Table,
 	leftIndex cat.Index,
@@ -202,7 +217,7 @@ func (f *stubFactory) RenameColumns(input exec.Node, colNames []string) (exec.No
 }
 
 func (f *stubFactory) ConstructPlan(
-	root exec.Node, subqueries []exec.Subquery, postqueries []exec.Node,
+	root exec.Node, subqueries []exec.Subquery, cascades []exec.Cascade, checks []exec.Node,
 ) (exec.Plan, error) {
 	return struct{}{}, nil
 }

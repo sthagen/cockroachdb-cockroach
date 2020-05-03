@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
@@ -89,7 +90,7 @@ func (ef *execFactory) ConstructScan(
 	scan := ef.planner.Scan()
 	colCfg := makeScanColumnsConfig(table, needed)
 
-	sb := span.MakeBuilder(tabDesc.TableDesc(), indexDesc)
+	sb := span.MakeBuilder(ef.planner.ExecCfg().Codec, tabDesc.TableDesc(), indexDesc)
 
 	// initTable checks that the current user has the correct privilege to access
 	// the table. However, the privilege has already been checked in optbuilder,
@@ -119,6 +120,9 @@ func (ef *execFactory) ConstructScan(
 	if err != nil {
 		return nil, err
 	}
+	scan.isFull = len(scan.spans) == 1 && scan.spans[0].EqualValue(
+		scan.desc.IndexSpan(ef.planner.ExecCfg().Codec, scan.index.ID),
+	)
 	for i := range reqOrdering {
 		if reqOrdering[i].ColIdx >= len(colCfg.wantedColumns) {
 			return nil, errors.Errorf("invalid reqOrdering: %v", reqOrdering)
@@ -682,6 +686,21 @@ func (ef *execFactory) ConstructLookupJoin(
 	return n, nil
 }
 
+func (ef *execFactory) ConstructGeoLookupJoin(
+	joinType sqlbase.JoinType,
+	geoRelationshipType geoindex.RelationshipType,
+	input exec.Node,
+	table cat.Table,
+	index cat.Index,
+	geoCol exec.NodeColumnOrdinal,
+	lookupCols exec.TableColumnOrdinalSet,
+	onCond tree.TypedExpr,
+	reqOrdering exec.OutputOrdering,
+) (exec.Node, error) {
+	// TODO(rytaft, sumeerbhola): Fill this in.
+	return nil, errors.Errorf("Geospatial joins are not yet supported")
+}
+
 // Helper function to create a scanNode from just a table / index descriptor
 // and requested cols.
 func (ef *execFactory) constructScanForZigzag(
@@ -931,20 +950,20 @@ func (ef *execFactory) ConstructWindow(root exec.Node, wi exec.WindowInfo) (exec
 
 // ConstructPlan is part of the exec.Factory interface.
 func (ef *execFactory) ConstructPlan(
-	root exec.Node, subqueries []exec.Subquery, postqueries []exec.Node,
+	root exec.Node, subqueries []exec.Subquery, cascades []exec.Cascade, checks []exec.Node,
 ) (exec.Plan, error) {
 	// No need to spool at the root.
 	if spool, ok := root.(*spoolNode); ok {
 		root = spool.source
 	}
 	res := &planTop{
-		plan: root.(planNode),
 		// TODO(radu): these fields can be modified by planning various opaque
 		// statements. We should have a cleaner way of plumbing these.
 		avoidBuffering:  ef.planner.curPlan.avoidBuffering,
 		auditEvents:     ef.planner.curPlan.auditEvents,
 		instrumentation: ef.planner.curPlan.instrumentation,
 	}
+	res.main = root.(planNode)
 	if len(subqueries) > 0 {
 		res.subqueryPlans = make([]subquery, len(subqueries))
 		for i := range subqueries {
@@ -967,10 +986,16 @@ func (ef *execFactory) ConstructPlan(
 			out.plan = in.Root.(planNode)
 		}
 	}
-	if len(postqueries) > 0 {
-		res.postqueryPlans = make([]postquery, len(postqueries))
-		for i := range res.postqueryPlans {
-			res.postqueryPlans[i].plan = postqueries[i].(planNode)
+	if len(cascades) > 0 {
+		res.cascades = make([]cascadeMetadata, len(cascades))
+		for i := range cascades {
+			res.cascades[i].Cascade = cascades[i]
+		}
+	}
+	if len(checks) > 0 {
+		res.checkPlans = make([]checkPlan, len(checks))
+		for i := range checks {
+			res.checkPlans[i].plan = checks[i].(planNode)
 		}
 	}
 
@@ -1123,18 +1148,16 @@ func (ef *execFactory) ConstructExplain(
 	switch options.Mode {
 	case tree.ExplainDistSQL:
 		return &explainDistSQLNode{
-			options:        options,
-			plan:           p.plan,
-			subqueryPlans:  p.subqueryPlans,
-			postqueryPlans: p.postqueryPlans,
-			analyze:        analyzeSet,
-			stmtType:       stmtType,
+			options:  options,
+			plan:     p.planComponents,
+			analyze:  analyzeSet,
+			stmtType: stmtType,
 		}, nil
 
 	case tree.ExplainVec:
 		return &explainVecNode{
 			options:       options,
-			plan:          p.plan,
+			plan:          p.main,
 			subqueryPlans: p.subqueryPlans,
 			stmtType:      stmtType,
 		}, nil
@@ -1146,9 +1169,7 @@ func (ef *execFactory) ConstructExplain(
 		return ef.planner.makeExplainPlanNodeWithPlan(
 			context.TODO(),
 			options,
-			p.plan,
-			p.subqueryPlans,
-			p.postqueryPlans,
+			&p.planComponents,
 			stmtType,
 		)
 
@@ -1210,7 +1231,7 @@ func (ef *execFactory) ConstructInsert(
 	}
 	// Create the table inserter, which does the bulk of the work.
 	ri, err := row.MakeInserter(
-		ctx, ef.planner.txn, tabDesc, colDescs, checkFKs, fkTables, &ef.planner.alloc,
+		ctx, ef.planner.txn, ef.planner.ExecCfg().Codec, tabDesc, colDescs, checkFKs, fkTables, &ef.planner.alloc,
 	)
 	if err != nil {
 		return nil, err
@@ -1275,7 +1296,7 @@ func (ef *execFactory) ConstructInsertFastPath(
 
 	// Create the table inserter, which does the bulk of the work.
 	ri, err := row.MakeInserter(
-		ctx, ef.planner.txn, tabDesc, colDescs, row.SkipFKs, nil /* fkTables */, &ef.planner.alloc,
+		ctx, ef.planner.txn, ef.planner.ExecCfg().Codec, tabDesc, colDescs, row.SkipFKs, nil /* fkTables */, &ef.planner.alloc,
 	)
 	if err != nil {
 		return nil, err
@@ -1379,6 +1400,7 @@ func (ef *execFactory) ConstructUpdate(
 	ru, err := row.MakeUpdater(
 		ctx,
 		ef.planner.txn,
+		ef.planner.ExecCfg().Codec,
 		tabDesc,
 		fkTables,
 		updateColDescs,
@@ -1525,7 +1547,14 @@ func (ef *execFactory) ConstructUpsert(
 
 	// Create the table inserter, which does the bulk of the insert-related work.
 	ri, err := row.MakeInserter(
-		ctx, ef.planner.txn, tabDesc, insertColDescs, checkFKs, fkTables, &ef.planner.alloc,
+		ctx,
+		ef.planner.txn,
+		ef.planner.ExecCfg().Codec,
+		tabDesc,
+		insertColDescs,
+		checkFKs,
+		fkTables,
+		&ef.planner.alloc,
 	)
 	if err != nil {
 		return nil, err
@@ -1535,6 +1564,7 @@ func (ef *execFactory) ConstructUpsert(
 	ru, err := row.MakeUpdater(
 		ctx,
 		ef.planner.txn,
+		ef.planner.ExecCfg().Codec,
 		tabDesc,
 		fkTables,
 		updateColDescs,
@@ -1652,6 +1682,7 @@ func (ef *execFactory) ConstructDelete(
 	rd, err := row.MakeDeleter(
 		ctx,
 		ef.planner.txn,
+		ef.planner.ExecCfg().Codec,
 		tabDesc,
 		fkTables,
 		fetchColDescs,
@@ -1712,7 +1743,7 @@ func (ef *execFactory) ConstructDeleteRange(
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
 	indexDesc := &tabDesc.PrimaryIndex
-	sb := span.MakeBuilder(tabDesc.TableDesc(), indexDesc)
+	sb := span.MakeBuilder(ef.planner.ExecCfg().Codec, tabDesc.TableDesc(), indexDesc)
 
 	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
 		return nil, err

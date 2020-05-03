@@ -99,10 +99,7 @@ type sqlServerOptionalArgs struct {
 	// for debugging and DistSQL planning purposes.
 	distSender *kvcoord.DistSender
 	// statusServer gives access to the Status service.
-	//
-	// In a SQL tenant server, this is not available (returning false) and
-	// pgerror.UnsupportedWithMultiTenancy should be returned.
-	statusServer func() (*statusServer, bool)
+	statusServer serverpb.OptionalStatusServer
 	// Narrowed down version of *NodeLiveness.
 	nodeLiveness interface {
 		jobs.NodeLiveness                    // jobs uses this
@@ -111,7 +108,7 @@ type sqlServerOptionalArgs struct {
 	// Gossip is relied upon by distSQLCfg (execinfra.ServerConfig), the executor
 	// config, the DistSQL planner, the table statistics cache, the statements
 	// diagnostics registry, and the lease manager.
-	gossip *gossip.Gossip
+	gossip gossip.DeprecatedGossip
 	// Used by DistSQLConfig and DistSQLPlanner.
 	nodeDialer *nodedialer.Dialer
 	// To register blob and DistSQL servers.
@@ -121,7 +118,7 @@ type sqlServerOptionalArgs struct {
 	// For the temporaryObjectCleaner.
 	isMeta1Leaseholder func(hlc.Timestamp) (bool, error)
 	// DistSQL, lease management, and others want to know the node they're on.
-	nodeIDContainer *base.NodeIDContainer
+	nodeIDContainer *base.SQLIDContainer
 
 	// Used by backup/restore.
 	externalStorage        cloud.ExternalStorageFactory
@@ -138,17 +135,21 @@ type sqlServerArgs struct {
 	// other things.
 	clock *hlc.Clock
 
-	// The executorConfig uses the provider.
-	protectedtsProvider protectedts.Provider
 	// DistSQLCfg holds on to this to check for node CPU utilization in
 	// samplerProcessor.
 	runtime execinfra.RuntimeStats
+
+	// The tenant that the SQL server runs on the behalf of.
+	tenantID roachpb.TenantID
 
 	// SQL uses KV, both for non-DistSQL and DistSQL execution.
 	db *kv.DB
 
 	// Various components want to register themselves with metrics.
 	registry *metric.Registry
+
+	// Used for SHOW/CANCEL QUERIE(S)/SESSION(S).
+	sessionRegistry *sql.SessionRegistry
 
 	// KV depends on the internal executor, so we pass a pointer to an empty
 	// struct in this configuration, which newSQLServer fills.
@@ -160,17 +161,15 @@ type sqlServerArgs struct {
 	// pointer to an empty struct in this configuration, which newSQLServer
 	// fills.
 	jobRegistry *jobs.Registry
+
+	// The executorConfig uses the provider.
+	protectedtsProvider protectedts.Provider
 }
 
 func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
-	var sessionRegistry *sql.SessionRegistry
-	if statusServer, ok := cfg.statusServer(); ok {
-		sessionRegistry = statusServer.sessionRegistry
-	} else {
-		sessionRegistry = sql.NewSessionRegistry()
-	}
-
 	execCfg := &sql.ExecutorConfig{}
+	codec := keys.MakeSQLCodec(cfg.tenantID)
+
 	var jobAdoptionStopFile string
 	for _, spec := range cfg.Stores.Specs {
 		if !spec.InMemory && spec.Path != "" {
@@ -297,13 +296,14 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		AmbientContext: cfg.AmbientCtx,
 		Settings:       cfg.Settings,
 		RuntimeStats:   cfg.runtime,
+		ClusterID:      &cfg.rpcContext.ClusterID,
+		ClusterName:    cfg.ClusterName,
+		NodeID:         cfg.nodeIDContainer,
+		Codec:          codec,
 		DB:             cfg.db,
 		Executor:       cfg.circularInternalExecutor,
 		RPCContext:     cfg.rpcContext,
 		Stopper:        cfg.stopper,
-		NodeID:         cfg.nodeIDContainer,
-		ClusterID:      &cfg.rpcContext.ClusterID,
-		ClusterName:    cfg.ClusterName,
 
 		TempStorage:     tempEngine,
 		TempStoragePath: cfg.TempStorageConfig.Path,
@@ -369,6 +369,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	*execCfg = sql.ExecutorConfig{
 		Settings:                cfg.Settings,
 		NodeInfo:                nodeInfo,
+		Codec:                   codec,
 		DefaultZoneConfig:       &cfg.DefaultZoneConfig,
 		Locality:                cfg.Locality,
 		AmbientCtx:              cfg.AmbientCtx,
@@ -380,8 +381,8 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		LeaseManager:            leaseMgr,
 		Clock:                   cfg.clock,
 		DistSQLSrv:              distSQLServer,
-		StatusServer:            func() (serverpb.StatusServer, bool) { return cfg.statusServer() },
-		SessionRegistry:         sessionRegistry,
+		StatusServer:            cfg.statusServer,
+		SessionRegistry:         cfg.sessionRegistry,
 		JobRegistry:             jobRegistry,
 		VirtualSchemas:          virtualSchemas,
 		HistogramWindowInterval: cfg.HistogramWindowInterval(),
@@ -399,7 +400,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 			cfg.rpcContext,
 			distSQLServer,
 			cfg.distSender,
-			cfg.gossip,
+			cfg.gossip.Deprecated(distsql.MultiTenancyIssueNo),
 			cfg.stopper,
 			cfg.nodeLiveness,
 			cfg.nodeDialer,
@@ -407,7 +408,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 
 		TableStatsCache: stats.NewTableStatisticsCache(
 			cfg.SQLTableStatCacheSize,
-			cfg.gossip,
+			cfg.gossip.Deprecated(47925),
 			cfg.db,
 			cfg.circularInternalExecutor,
 		),
@@ -526,13 +527,14 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	)
 	execCfg.InternalExecutor = cfg.circularInternalExecutor
 	stmtDiagnosticsRegistry := stmtdiagnostics.NewRegistry(
-		cfg.circularInternalExecutor, cfg.db, cfg.gossip, cfg.Settings)
-	if statusServer, ok := cfg.statusServer(); ok {
-		statusServer.setStmtDiagnosticsRequester(stmtDiagnosticsRegistry)
-	}
+		cfg.circularInternalExecutor,
+		cfg.db,
+		cfg.gossip.Deprecated(47893),
+		cfg.Settings,
+	)
 	execCfg.StmtDiagnosticsRecorder = stmtDiagnosticsRegistry
 
-	leaseMgr.RefreshLeases(cfg.stopper, cfg.db, cfg.gossip)
+	leaseMgr.RefreshLeases(cfg.stopper, cfg.db, cfg.gossip.Deprecated(47150))
 	leaseMgr.PeriodicallyRefreshSomeLeases()
 
 	temporaryObjectCleaner := sql.NewTemporaryObjectCleaner(
@@ -540,9 +542,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		cfg.db,
 		cfg.registry,
 		distSQLServer.ServerConfig.SessionBoundInternalExecutorFactory,
-		func() (serverpb.StatusServer, bool) {
-			return cfg.statusServer()
-		},
+		cfg.statusServer,
 		cfg.isMeta1Leaseholder,
 		sqlExecutorTestingKnobs,
 	)
@@ -554,7 +554,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		internalExecutor:        cfg.circularInternalExecutor,
 		leaseMgr:                leaseMgr,
 		blobService:             blobService,
-		sessionRegistry:         sessionRegistry,
+		sessionRegistry:         cfg.sessionRegistry,
 		jobRegistry:             jobRegistry,
 		statsRefresher:          statsRefresher,
 		temporaryObjectCleaner:  temporaryObjectCleaner,
@@ -609,7 +609,7 @@ func (s *sqlServer) start(
 		&migrationsExecutor,
 		s.execCfg.Clock,
 		mmKnobs,
-		s.execCfg.NodeID.String(), // TODO(tbg): set yet?
+		s.execCfg.NodeID.SQLInstanceID().String(),
 		s.execCfg.Settings,
 		s.jobRegistry,
 	)

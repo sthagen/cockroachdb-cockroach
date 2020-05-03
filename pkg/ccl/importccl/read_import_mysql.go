@@ -19,7 +19,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
@@ -332,7 +331,7 @@ func readMysqlCreateTable(
 	if match != "" && !found {
 		return nil, errors.Errorf("table %q not found in file (found tables: %s)", match, strings.Join(names, ", "))
 	}
-	if err := addDelayedFKs(ctx, fkDefs, fks.resolver, evalCtx.Settings); err != nil {
+	if err := addDelayedFKs(ctx, fkDefs, fks.resolver, evalCtx); err != nil {
 		return nil, err
 	}
 	return ret, nil
@@ -540,11 +539,11 @@ type delayedFK struct {
 }
 
 func addDelayedFKs(
-	ctx context.Context, defs []delayedFK, resolver fkResolver, settings *cluster.Settings,
+	ctx context.Context, defs []delayedFK, resolver fkResolver, evalCtx *tree.EvalContext,
 ) error {
 	for _, def := range defs {
 		if err := sql.ResolveFK(
-			ctx, nil, resolver, def.tbl, def.def, map[sqlbase.ID]*sqlbase.MutableTableDescriptor{}, sql.NewTable, tree.ValidationDefault, settings,
+			ctx, nil, resolver, def.tbl, def.def, map[sqlbase.ID]*sqlbase.MutableTableDescriptor{}, sql.NewTable, tree.ValidationDefault, evalCtx,
 		); err != nil {
 			return err
 		}
@@ -676,18 +675,18 @@ func mysqlColToCockroach(
 		def.Type = types.Jsonb
 
 	case mysqltypes.Set:
-		return nil, unimplemented.NewWithIssueHint(32560,
-			"cannot import SET columns at this time",
+		return nil, errors.WithHint(
+			unimplemented.NewWithIssue(32560, "cannot import SET columns at this time"),
 			"try converting the column to a 64-bit integer before import")
 	case mysqltypes.Geometry:
-		return nil, unimplemented.NewWithIssuef(32559,
-			"cannot import GEOMETRY columns at this time")
+		return nil, unimplemented.NewWithIssue(32559, "cannot import GEOMETRY columns at this time")
 	case mysqltypes.Bit:
-		return nil, unimplemented.NewWithIssueHint(32561,
-			"cannot improt BIT columns at this time",
+		return nil, errors.WithHint(
+			unimplemented.NewWithIssue(32561, "cannot import BIT columns at this time"),
 			"try converting the column to a 64-bit integer before import")
 	default:
-		return nil, unimplemented.Newf(fmt.Sprintf("import.mysqlcoltype.%s", typ), "unsupported mysql type %q", col.Type)
+		return nil, unimplemented.Newf(fmt.Sprintf("import.mysqlcoltype.%s", typ),
+			"unsupported mysql type %q", col.Type)
 	}
 
 	if col.NotNull {

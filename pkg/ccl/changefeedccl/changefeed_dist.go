@@ -12,9 +12,11 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
@@ -99,14 +101,14 @@ func distChangefeedFlow(
 	}
 
 	execCfg := phs.ExecCfg()
-	trackedSpans, err := fetchSpansForTargets(ctx, execCfg.DB, details.Targets, spansTS)
+	trackedSpans, err := fetchSpansForTargets(ctx, execCfg.DB, execCfg.Codec, details.Targets, spansTS)
 	if err != nil {
 		return err
 	}
 
 	// Changefeed flows handle transactional consistency themselves.
 	var noTxn *kv.Txn
-	gatewayNodeID := execCfg.NodeID.Get()
+	gatewayNodeID := execCfg.NodeID.DeprecatedNodeID(distsql.MultiTenancyIssueNo)
 	dsp := phs.DistSQLPlanner()
 	evalCtx := phs.ExtendedEvalContext()
 	planCtx := dsp.NewPlanningCtx(ctx, evalCtx, noTxn)
@@ -211,7 +213,11 @@ func distChangefeedFlow(
 }
 
 func fetchSpansForTargets(
-	ctx context.Context, db *kv.DB, targets jobspb.ChangefeedTargets, ts hlc.Timestamp,
+	ctx context.Context,
+	db *kv.DB,
+	codec keys.SQLCodec,
+	targets jobspb.ChangefeedTargets,
+	ts hlc.Timestamp,
 ) ([]roachpb.Span, error) {
 	var spans []roachpb.Span
 	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -223,7 +229,7 @@ func fetchSpansForTargets(
 			if err != nil {
 				return err
 			}
-			spans = append(spans, tableDesc.PrimaryIndexSpan())
+			spans = append(spans, tableDesc.PrimaryIndexSpan(codec))
 		}
 		return nil
 	})

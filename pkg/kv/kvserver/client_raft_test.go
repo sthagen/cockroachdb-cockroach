@@ -2252,9 +2252,10 @@ func TestWedgedReplicaDetection(t *testing.T) {
 	wg.Wait()
 	defer followerRepl.RaftUnlock()
 
-	// Increment leader's clock close to MaxQuotaReplicaLivenessDuration, but
-	// not past it.
-	mtc.manualClock.Increment(kvserver.MaxQuotaReplicaLivenessDuration.Nanoseconds() - 1)
+	inactivityThreshold := time.Second
+
+	// Increment leader's clock close to inactivityThreshold, but not past it.
+	mtc.manualClock.Increment(inactivityThreshold.Nanoseconds() - 1)
 
 	// Send a request to the leader replica. followerRepl is locked so it will
 	// not respond.
@@ -2272,7 +2273,7 @@ func TestWedgedReplicaDetection(t *testing.T) {
 
 	// The follower should still be active.
 	followerID := followerRepl.ReplicaID()
-	if !leaderRepl.IsFollowerActive(ctx, followerID) {
+	if !leaderRepl.IsFollowerActiveSince(ctx, followerID, inactivityThreshold) {
 		t.Fatalf("expected follower to still be considered active")
 	}
 
@@ -2281,8 +2282,8 @@ func TestWedgedReplicaDetection(t *testing.T) {
 	// would bump the last active timestamp on the leader. Because of this,
 	// we check whether the follower is eventually considered inactive.
 	testutils.SucceedsSoon(t, func() error {
-		// Increment leader's clock past MaxQuotaReplicaLivenessDuration
-		mtc.manualClock.Increment(kvserver.MaxQuotaReplicaLivenessDuration.Nanoseconds() + 1)
+		// Increment leader's clock past inactivityThreshold
+		mtc.manualClock.Increment(inactivityThreshold.Nanoseconds() + 1)
 
 		// Send another request to the leader replica. followerRepl is locked
 		// so it will not respond.
@@ -2291,7 +2292,7 @@ func TestWedgedReplicaDetection(t *testing.T) {
 		}
 
 		// The follower should no longer be considered active.
-		if leaderRepl.IsFollowerActive(ctx, followerID) {
+		if leaderRepl.IsFollowerActiveSince(ctx, followerID, inactivityThreshold) {
 			return errors.New("expected follower to be considered inactive")
 		}
 		return nil
@@ -4492,7 +4493,7 @@ func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing
 	}
 	mtc.replicateRange(1, 1, 2)
 	// Make a key that's in the user data space.
-	keyA := append(keys.MakeTablePrefix(100), 'a')
+	keyA := append(keys.SystemSQLCodec.TablePrefix(100), 'a')
 	replica1 := mtc.stores[0].LookupReplica(roachpb.RKey(keyA))
 	mtc.replicateRange(replica1.RangeID, 1, 2)
 	// Create a test function so that we can run the test both immediately after
@@ -4847,7 +4848,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 
 		// Split off a non-system range so we don't have to account for node liveness
 		// traffic.
-		scratchTableKey := keys.MakeTablePrefix(math.MaxUint32)
+		scratchTableKey := keys.SystemSQLCodec.TablePrefix(math.MaxUint32)
 		// Put some data in the range so we'll have something to test for.
 		keyA = append(append(roachpb.Key{}, scratchTableKey...), 'a')
 		keyB = append(append(roachpb.Key{}, scratchTableKey...), 'b')

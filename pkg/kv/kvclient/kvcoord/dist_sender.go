@@ -547,7 +547,7 @@ func (ds *DistSender) sendSingleRange(
 	class := rpc.ConnectionClassForKey(desc.RSpan().Key)
 	br, err := ds.sendRPC(ctx, ba, class, desc.RangeID, replicas, cachedLeaseHolder, withCommit)
 	if err != nil {
-		log.VErrEvent(ctx, 2, err.Error())
+		log.VErrEventf(ctx, 2, "%v", err)
 		return nil, roachpb.NewError(err)
 	}
 
@@ -1443,10 +1443,12 @@ func (ds *DistSender) sendPartialBatch(
 		if dur := timeutil.Since(tBegin); dur > slowDistSenderThreshold && !tBegin.IsZero() {
 			ds.metrics.SlowRPCs.Inc(1)
 			dur := dur // leak dur to heap only when branch taken
-			log.Warning(ctx, slowRangeRPCWarningStr(dur, attempts, desc, pErr))
+			log.Warningf(ctx, "slow range RPC: %v",
+				slowRangeRPCWarningStr(dur, attempts, desc, pErr))
 			defer func(tBegin time.Time, attempts int64) {
 				ds.metrics.SlowRPCs.Dec(1)
-				log.Warning(ctx, slowRangeRPCReturnWarningStr(timeutil.Since(tBegin), attempts))
+				log.Warningf(ctx, "slow RPC response: %v",
+					slowRangeRPCReturnWarningStr(timeutil.Since(tBegin), attempts))
 			}(tBegin, attempts)
 			tBegin = time.Time{} // prevent reentering branch for this RPC
 		}
@@ -1834,10 +1836,10 @@ func (ds *DistSender) sendToReplicas(
 
 		// Has the caller given up?
 		if ctx.Err() != nil {
-			errMsg := fmt.Sprintf("context done during DistSender.Send: %s", ctx.Err())
-			log.Eventf(ctx, errMsg)
+			reportedErr := errors.Wrap(ctx.Err(), "context done during DistSender.Send")
+			log.Eventf(ctx, "%v", reportedErr)
 			if ambiguousError != nil {
-				return nil, roachpb.NewAmbiguousResultError(errMsg)
+				return nil, roachpb.NewAmbiguousResultError(reportedErr.Error())
 			}
 			// Don't consider this a SendError, because SendErrors indicate that we
 			// were unable to reach a replica that could serve the request, and they

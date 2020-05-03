@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -54,8 +53,7 @@ func makeMutationTest(
 // in the table equals e.
 func (mt mutationTest) checkTableSize(e int) {
 	// Check that there are no hidden values
-	tablePrefix := keys.MakeTablePrefix(uint32(mt.tableDesc.ID))
-	tableStartKey := roachpb.Key(tablePrefix)
+	tableStartKey := keys.SystemSQLCodec.TablePrefix(uint32(mt.tableDesc.ID))
 	tableEndKey := tableStartKey.PrefixEnd()
 	if kvs, err := mt.kvDB.Scan(context.TODO(), tableStartKey, tableEndKey, 0); err != nil {
 		mt.Error(err)
@@ -870,7 +868,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	// "foo" is being added.
 	mt.writeIndexMutation("foo", sqlbase.DescriptorMutation{Direction: sqlbase.DescriptorMutation_ADD})
 	if _, err := sqlDB.Exec(`CREATE INDEX foo ON t.test (c)`); !testutils.IsError(err,
-		`duplicate: index "foo" in the middle of being added, not yet public`) {
+		`relation "foo" already exists`) {
 		t.Fatal(err)
 	}
 	// Make "foo" live.

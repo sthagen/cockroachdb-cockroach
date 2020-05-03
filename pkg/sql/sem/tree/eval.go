@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -2829,8 +2830,9 @@ type EvalContext struct {
 
 	Settings    *cluster.Settings
 	ClusterID   uuid.UUID
-	NodeID      roachpb.NodeID
 	ClusterName string
+	NodeID      *base.SQLIDContainer
+	Codec       keys.SQLCodec
 
 	// Locality contains the location of the current node as a set of user-defined
 	// key/value pairs, ordered from most inclusive to least inclusive. If there
@@ -2940,9 +2942,11 @@ func MakeTestingEvalContext(st *cluster.Settings) EvalContext {
 // EvalContext so do not start or close the memory monitor.
 func MakeTestingEvalContextWithMon(st *cluster.Settings, monitor *mon.BytesMonitor) EvalContext {
 	ctx := EvalContext{
+		Codec:       keys.SystemSQLCodec,
 		Txn:         &kv.Txn{},
 		SessionData: &sessiondata.SessionData{},
 		Settings:    st,
+		NodeID:      base.TestingIDContainer,
 	}
 	monitor.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	ctx.Mon = monitor
@@ -3319,7 +3323,7 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 		return d, nil
 	}
 	d = UnwrapDatum(ctx, d)
-	return PerformCast(ctx, d, expr.Type)
+	return PerformCast(ctx, d, expr.ResolvedType())
 }
 
 // PerformCast performs a cast from the provided Datum to the specified
@@ -4250,7 +4254,7 @@ func (expr *IsOfTypeExpr) Eval(ctx *EvalContext) (Datum, error) {
 	}
 	datumTyp := d.ResolvedType()
 
-	for _, t := range expr.Types {
+	for _, t := range expr.ResolvedTypes() {
 		if datumTyp.Equivalent(t) {
 			return MakeDBool(DBool(!expr.Not)), nil
 		}
@@ -4599,7 +4603,7 @@ func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 		// type for the placeholder. In this case, we cast the expression to
 		// the desired type.
 		// TODO(jordan): introduce a restriction on what casts are allowed here.
-		cast := &CastExpr{Expr: e, Type: typ}
+		cast := NewTypedCastExpr(e, typ)
 		return cast.Eval(ctx)
 	}
 	return e.Eval(ctx)

@@ -565,9 +565,9 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 				return err
 			}
 
-			ss, ok := params.extendedEvalCtx.StatusServer()
-			if !ok {
-				return pgerror.UnsupportedWithMultiTenancy()
+			ss, err := params.extendedEvalCtx.StatusServer.OptionalErr()
+			if err != nil {
+				return err
 			}
 
 			// Validate that the result makes sense.
@@ -682,7 +682,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 			params.p.txn,
 			eventLogType,
 			int32(targetID),
-			int32(params.extendedEvalCtx.NodeID),
+			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 			info,
 		)
 	}
@@ -840,7 +840,7 @@ func writeZoneConfig(
 	if len(zone.Subzones) > 0 {
 		st := execCfg.Settings
 		zone.SubzoneSpans, err = GenerateSubzoneSpans(
-			st, execCfg.ClusterID(), table, zone.Subzones, hasNewSubzones)
+			st, execCfg.ClusterID(), execCfg.Codec, table, zone.Subzones, hasNewSubzones)
 		if err != nil {
 			return 0, err
 		}

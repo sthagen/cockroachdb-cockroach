@@ -30,10 +30,12 @@ type createSequenceNode struct {
 }
 
 func (p *planner) CreateSequence(ctx context.Context, n *tree.CreateSequence) (planNode, error) {
-	dbDesc, err := p.ResolveUncachedDatabase(ctx, &n.Name)
+	un := n.Name.ToUnresolvedObjectName()
+	dbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, un)
 	if err != nil {
 		return nil, err
 	}
+	n.Name.ObjectNamePrefix = prefix
 
 	if err := p.CheckPrivilege(ctx, dbDesc, privilege.CREATE); err != nil {
 		return nil, err
@@ -124,7 +126,7 @@ func doCreateSequence(
 	}
 
 	// Initialize the sequence value.
-	seqValueKey := keys.MakeSequenceKey(uint32(id))
+	seqValueKey := params.ExecCfg().Codec.SequenceKey(uint32(id))
 	b := &kv.Batch{}
 	b.Inc(seqValueKey, desc.SequenceOpts.Start-desc.SequenceOpts.Increment)
 	if err := params.p.txn.Run(params.ctx, b); err != nil {
@@ -142,7 +144,7 @@ func doCreateSequence(
 		params.p.txn,
 		EventLogCreateSequence,
 		int32(desc.ID),
-		int32(params.extendedEvalCtx.NodeID),
+		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 		struct {
 			SequenceName string
 			Statement    string

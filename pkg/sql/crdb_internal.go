@@ -116,7 +116,7 @@ CREATE TABLE crdb_internal.node_build_info (
 )`,
 	populate: func(_ context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		execCfg := p.ExecCfg()
-		nodeID := tree.NewDInt(tree.DInt(int64(execCfg.NodeID.Get())))
+		nodeID, _ := execCfg.NodeID.OptionalNodeID() // zero if not available
 
 		info := build.GetInfo()
 		for k, v := range map[string]string{
@@ -128,7 +128,7 @@ CREATE TABLE crdb_internal.node_build_info (
 			"Channel":      info.Channel,
 		} {
 			if err := addRow(
-				nodeID,
+				tree.NewDInt(tree.DInt(nodeID)),
 				tree.NewDString(k),
 				tree.NewDString(v),
 			); err != nil {
@@ -677,7 +677,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				"cannot access sql statistics from this context")
 		}
 
-		nodeID := tree.NewDInt(tree.DInt(int64(p.execCfg.NodeID.Get())))
+		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
 
 		// Retrieve the application names and sort them to ensure the
 		// output is deterministic.
@@ -719,7 +719,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 					errString = tree.NewDString(s.data.SensitiveInfo.LastErr)
 				}
 				err := addRow(
-					nodeID,
+					tree.NewDInt(tree.DInt(nodeID)),
 					tree.NewDString(appName),
 					tree.NewDString(stmtKey.flags()),
 					tree.NewDString(stmtKey.stmt),
@@ -778,7 +778,7 @@ CREATE TABLE crdb_internal.node_txn_stats (
 				"cannot access sql statistics from this context")
 		}
 
-		nodeID := tree.NewDInt(tree.DInt(int64(p.execCfg.NodeID.Get())))
+		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
 
 		// Retrieve the application names and sort them to ensure the
 		// output is deterministic.
@@ -794,7 +794,7 @@ CREATE TABLE crdb_internal.node_txn_stats (
 			appStats := sqlStats.getStatsForApplication(appName)
 			txnCount, txnTimeAvg, txnTimeVar, committedCount, implicitCount := appStats.txns.getStats()
 			err := addRow(
-				nodeID,
+				tree.NewDInt(tree.DInt(nodeID)),
 				tree.NewDString(appName),
 				tree.NewDInt(tree.DInt(txnCount)),
 				tree.NewDFloat(tree.DFloat(txnTimeAvg)),
@@ -925,9 +925,9 @@ var crdbInternalLocalTxnsTable = virtualSchemaTable{
 			return err
 		}
 		req := p.makeSessionsRequest(ctx)
-		ss, ok := p.extendedEvalCtx.StatusServer()
-		if !ok {
-			return pgerror.UnsupportedWithMultiTenancy()
+		ss, err := p.extendedEvalCtx.StatusServer.OptionalErr()
+		if err != nil {
+			return err
 		}
 		response, err := ss.ListLocalSessions(ctx, &req)
 		if err != nil {
@@ -945,9 +945,9 @@ var crdbInternalClusterTxnsTable = virtualSchemaTable{
 			return err
 		}
 		req := p.makeSessionsRequest(ctx)
-		ss, ok := p.extendedEvalCtx.StatusServer()
-		if !ok {
-			return pgerror.UnsupportedWithMultiTenancy()
+		ss, err := p.extendedEvalCtx.StatusServer.OptionalErr()
+		if err != nil {
+			return err
 		}
 		response, err := ss.ListSessions(ctx, &req)
 		if err != nil {
@@ -980,7 +980,7 @@ func populateTransactionsTable(
 		}
 	}
 	for _, rpcErr := range response.Errors {
-		log.Warning(ctx, rpcErr.Message)
+		log.Warningf(ctx, "%v", rpcErr.Message)
 		if rpcErr.NodeID != 0 {
 			// Add a row with this node ID, the error for the txn string,
 			// and nulls for all other columns.
@@ -1055,9 +1055,9 @@ var crdbInternalLocalQueriesTable = virtualSchemaTable{
 	schema:  fmt.Sprintf(queriesSchemaPattern, "node_queries"),
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		req := p.makeSessionsRequest(ctx)
-		ss, ok := p.extendedEvalCtx.StatusServer()
-		if !ok {
-			return pgerror.UnsupportedWithMultiTenancy()
+		ss, err := p.extendedEvalCtx.StatusServer.OptionalErr()
+		if err != nil {
+			return err
 		}
 		response, err := ss.ListLocalSessions(ctx, &req)
 		if err != nil {
@@ -1074,9 +1074,9 @@ var crdbInternalClusterQueriesTable = virtualSchemaTable{
 	schema:  fmt.Sprintf(queriesSchemaPattern, "cluster_queries"),
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		req := p.makeSessionsRequest(ctx)
-		ss, ok := p.extendedEvalCtx.StatusServer()
-		if !ok {
-			return pgerror.UnsupportedWithMultiTenancy()
+		ss, err := p.extendedEvalCtx.StatusServer.OptionalErr()
+		if err != nil {
+			return err
 		}
 		response, err := ss.ListSessions(ctx, &req)
 		if err != nil {
@@ -1138,7 +1138,7 @@ func populateQueriesTable(
 	}
 
 	for _, rpcErr := range response.Errors {
-		log.Warning(ctx, rpcErr.Message)
+		log.Warningf(ctx, "%v", rpcErr.Message)
 		if rpcErr.NodeID != 0 {
 			// Add a row with this node ID, the error for query, and
 			// nulls for all other columns.
@@ -1186,9 +1186,9 @@ var crdbInternalLocalSessionsTable = virtualSchemaTable{
 	schema:  fmt.Sprintf(sessionsSchemaPattern, "node_sessions"),
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		req := p.makeSessionsRequest(ctx)
-		ss, ok := p.extendedEvalCtx.StatusServer()
-		if !ok {
-			return pgerror.UnsupportedWithMultiTenancy()
+		ss, err := p.extendedEvalCtx.StatusServer.OptionalErr()
+		if err != nil {
+			return err
 		}
 		response, err := ss.ListLocalSessions(ctx, &req)
 		if err != nil {
@@ -1205,9 +1205,9 @@ var crdbInternalClusterSessionsTable = virtualSchemaTable{
 	schema:  fmt.Sprintf(sessionsSchemaPattern, "cluster_sessions"),
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		req := p.makeSessionsRequest(ctx)
-		ss, ok := p.extendedEvalCtx.StatusServer()
-		if !ok {
-			return pgerror.UnsupportedWithMultiTenancy()
+		ss, err := p.extendedEvalCtx.StatusServer.OptionalErr()
+		if err != nil {
+			return err
 		}
 		response, err := ss.ListSessions(ctx, &req)
 		if err != nil {
@@ -1276,7 +1276,7 @@ func populateSessionsTable(
 	}
 
 	for _, rpcErr := range response.Errors {
-		log.Warning(ctx, rpcErr.Message)
+		log.Warningf(ctx, "%v", rpcErr.Message)
 		if rpcErr.NodeID != 0 {
 			// Add a row with this node ID, error in active queries, and nulls
 			// for all other columns.
@@ -2130,19 +2130,19 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 			return nil, nil, err
 		}
 		// TODO(knz): maybe this could use internalLookupCtx.
-		dbNames := make(map[uint64]string)
-		tableNames := make(map[uint64]string)
-		indexNames := make(map[uint64]map[sqlbase.IndexID]string)
-		parents := make(map[uint64]uint64)
+		dbNames := make(map[uint32]string)
+		tableNames := make(map[uint32]string)
+		indexNames := make(map[uint32]map[uint32]string)
+		parents := make(map[uint32]uint32)
 		for _, desc := range descs {
-			id := uint64(desc.GetID())
+			id := uint32(desc.GetID())
 			switch desc := desc.(type) {
 			case *sqlbase.TableDescriptor:
-				parents[id] = uint64(desc.ParentID)
+				parents[id] = uint32(desc.ParentID)
 				tableNames[id] = desc.GetName()
-				indexNames[id] = make(map[sqlbase.IndexID]string)
+				indexNames[id] = make(map[uint32]string)
 				for _, idx := range desc.Indexes {
-					indexNames[id][idx.ID] = idx.Name
+					indexNames[id][uint32(idx.ID)] = idx.Name
 				}
 			case *sqlbase.DatabaseDescriptor:
 				dbNames[id] = desc.GetName()
@@ -2213,16 +2213,16 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 			}
 
 			var dbName, tableName, indexName string
-			if _, id, err := keys.DecodeTablePrefix(desc.StartKey.AsRawKey()); err == nil {
-				parent := parents[id]
+			if _, tableID, err := keys.TODOSQLCodec.DecodeTablePrefix(desc.StartKey.AsRawKey()); err == nil {
+				parent := parents[tableID]
 				if parent != 0 {
-					tableName = tableNames[id]
+					tableName = tableNames[tableID]
 					dbName = dbNames[parent]
-					if _, _, idxID, err := sqlbase.DecodeTableIDIndexID(desc.StartKey.AsRawKey()); err == nil {
-						indexName = indexNames[id][idxID]
+					if _, _, idxID, err := keys.TODOSQLCodec.DecodeIndexPrefix(desc.StartKey.AsRawKey()); err == nil {
+						indexName = indexNames[tableID][idxID]
 					}
 				} else {
-					dbName = dbNames[id]
+					dbName = dbNames[tableID]
 				}
 			}
 
@@ -2506,7 +2506,10 @@ CREATE TABLE crdb_internal.zones (
 }
 
 func getAllNodeDescriptors(p *planner) ([]roachpb.NodeDescriptor, error) {
-	g := p.ExecCfg().Gossip
+	g, err := p.ExecCfg().Gossip.OptionalErr(47899)
+	if err != nil {
+		return nil, err
+	}
 	var descriptors []roachpb.NodeDescriptor
 	if err := g.IterateInfos(gossip.KeyNodeIDPrefix, func(key string, i gossip.Info) error {
 		bytes, err := i.Value.GetBytes()
@@ -2561,7 +2564,11 @@ CREATE TABLE crdb_internal.gossip_nodes (
 			return err
 		}
 
-		g := p.ExecCfg().Gossip
+		g, err := p.ExecCfg().Gossip.OptionalErr(47899)
+		if err != nil {
+			return err
+		}
+
 		descriptors, err := getAllNodeDescriptors(p)
 		if err != nil {
 			return err
@@ -2681,7 +2688,10 @@ CREATE TABLE crdb_internal.gossip_liveness (
 			return err
 		}
 
-		g := p.ExecCfg().Gossip
+		g, err := p.ExecCfg().Gossip.OptionalErr(47899)
+		if err != nil {
+			return err
+		}
 
 		type nodeInfo struct {
 			liveness  storagepb.Liveness
@@ -2753,7 +2763,10 @@ CREATE TABLE crdb_internal.gossip_alerts (
 			return err
 		}
 
-		g := p.ExecCfg().Gossip
+		g, err := p.ExecCfg().Gossip.OptionalErr(47899)
+		if err != nil {
+			return err
+		}
 
 		type resultWithNodeID struct {
 			roachpb.NodeID
@@ -2819,7 +2832,12 @@ CREATE TABLE crdb_internal.gossip_network (
 			return err
 		}
 
-		c := p.ExecCfg().Gossip.Connectivity()
+		g, err := p.ExecCfg().Gossip.OptionalErr(47899)
+		if err != nil {
+			return err
+		}
+
+		c := g.Connectivity()
 		for _, conn := range c.ClientConns {
 			if err := addRow(
 				tree.NewDInt(tree.DInt(conn.SourceID)),
@@ -2877,7 +2895,7 @@ func addPartitioningRows(
 				buf.WriteString(`, `)
 			}
 			tuple, _, err := sqlbase.DecodePartitionTuple(
-				&datumAlloc, table, index, partitioning, values, fakePrefixDatums,
+				&datumAlloc, p.ExecCfg().Codec, table, index, partitioning, values, fakePrefixDatums,
 			)
 			if err != nil {
 				return err
@@ -2928,7 +2946,7 @@ func addPartitioningRows(
 	for _, r := range partitioning.Range {
 		var buf bytes.Buffer
 		fromTuple, _, err := sqlbase.DecodePartitionTuple(
-			&datumAlloc, table, index, partitioning, r.FromInclusive, fakePrefixDatums,
+			&datumAlloc, p.ExecCfg().Codec, table, index, partitioning, r.FromInclusive, fakePrefixDatums,
 		)
 		if err != nil {
 			return err
@@ -2936,7 +2954,7 @@ func addPartitioningRows(
 		buf.WriteString(fromTuple.String())
 		buf.WriteString(" TO ")
 		toTuple, _, err := sqlbase.DecodePartitionTuple(
-			&datumAlloc, table, index, partitioning, r.ToExclusive, fakePrefixDatums,
+			&datumAlloc, p.ExecCfg().Codec, table, index, partitioning, r.ToExclusive, fakePrefixDatums,
 		)
 		if err != nil {
 			return err
@@ -3051,9 +3069,9 @@ CREATE TABLE crdb_internal.kv_node_status (
 		if err := p.RequireAdminRole(ctx, "read crdb_internal.kv_node_status"); err != nil {
 			return err
 		}
-		ss, ok := p.extendedEvalCtx.StatusServer()
-		if !ok {
-			return pgerror.UnsupportedWithMultiTenancy()
+		ss, err := p.extendedEvalCtx.StatusServer.OptionalErr()
+		if err != nil {
+			return err
 		}
 		response, err := ss.Nodes(ctx, &serverpb.NodesRequest{})
 		if err != nil {
@@ -3165,9 +3183,9 @@ CREATE TABLE crdb_internal.kv_store_status (
 		if err := p.RequireAdminRole(ctx, "read crdb_internal.kv_store_status"); err != nil {
 			return err
 		}
-		ss, ok := p.ExecCfg().StatusServer()
-		if !ok {
-			return pgerror.UnsupportedWithMultiTenancy()
+		ss, err := p.ExecCfg().StatusServer.OptionalErr()
+		if err != nil {
+			return err
 		}
 		response, err := ss.Nodes(ctx, &serverpb.NodesRequest{})
 		if err != nil {

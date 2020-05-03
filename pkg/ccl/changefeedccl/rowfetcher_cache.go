@@ -11,6 +11,7 @@ package changefeedccl
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -26,14 +27,16 @@ import (
 // StartScanFrom can be used to turn that key (or all the keys making up the
 // column families of one row) into a row.
 type rowFetcherCache struct {
+	codec    keys.SQLCodec
 	leaseMgr *sql.LeaseManager
 	fetchers map[*sqlbase.ImmutableTableDescriptor]*row.Fetcher
 
 	a sqlbase.DatumAlloc
 }
 
-func newRowFetcherCache(leaseMgr *sql.LeaseManager) *rowFetcherCache {
+func newRowFetcherCache(codec keys.SQLCodec, leaseMgr *sql.LeaseManager) *rowFetcherCache {
 	return &rowFetcherCache{
+		codec:    codec,
 		leaseMgr: leaseMgr,
 		fetchers: make(map[*sqlbase.ImmutableTableDescriptor]*row.Fetcher),
 	}
@@ -43,8 +46,12 @@ func (c *rowFetcherCache) TableDescForKey(
 	ctx context.Context, key roachpb.Key, ts hlc.Timestamp,
 ) (*sqlbase.ImmutableTableDescriptor, error) {
 	var tableDesc *sqlbase.ImmutableTableDescriptor
+	key, err := c.codec.StripTenantPrefix(key)
+	if err != nil {
+		return nil, err
+	}
 	for skippedCols := 0; ; {
-		remaining, tableID, _, err := sqlbase.DecodeTableIDIndexID(key)
+		remaining, tableID, _, err := sqlbase.DecodePartialTableIDIndexID(key)
 		if err != nil {
 			return nil, err
 		}
@@ -98,13 +105,14 @@ func (c *rowFetcherCache) RowFetcherForTableDesc(
 
 	var rf row.Fetcher
 	if err := rf.Init(
+		c.codec,
 		false, /* reverse */
 		sqlbase.ScanLockingStrength_FOR_NONE,
 		false, /* returnRangeInfo */
 		false, /* isCheck */
 		&c.a,
 		row.FetcherTableArgs{
-			Spans:            tableDesc.AllIndexSpans(),
+			Spans:            tableDesc.AllIndexSpans(c.codec),
 			Desc:             tableDesc,
 			Index:            &tableDesc.PrimaryIndex,
 			ColIdxMap:        colIdxMap,

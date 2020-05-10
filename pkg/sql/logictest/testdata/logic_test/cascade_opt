@@ -3,11 +3,11 @@
 statement ok
 SET optimizer_foreign_keys = true
 
-# Tests for the experimental opt-driven cascades.
-subtest OptDriven
-
 statement ok
 SET experimental_optimizer_foreign_key_cascades = true
+
+# Tests for the experimental opt-driven cascades.
+subtest OptDriven
 
 # Single delete cascade.
 statement ok
@@ -70,6 +70,44 @@ DELETE FROM grandchild WHERE c = 11
 
 statement ok
 DELETE FROM parent WHERE p = 1
+
+statement ok
+DROP TABLE grandchild
+
+# Delete cascade which itself has a cascade.
+statement ok
+CREATE TABLE grandchild (
+  g INT PRIMARY KEY,
+  c INT REFERENCES child(c) ON DELETE CASCADE
+);
+INSERT INTO parent VALUES (1), (2);
+INSERT INTO child VALUES (10, 1), (11, 1), (20, 2), (21, 2);
+INSERT INTO grandchild VALUES (100, 10), (101, 10), (110, 11), (200, 20)
+
+statement ok
+DELETE FROM parent WHERE p = 1
+
+query II rowsort
+SELECT * FROM child
+----
+20  2
+21  2
+
+query II rowsort
+SELECT * FROM grandchild
+----
+200  20
+
+statement ok
+DELETE FROM parent WHERE p = 2
+
+query II
+SELECT * FROM child
+----
+
+query II
+SELECT * FROM grandchild
+----
 
 statement ok
 DROP TABLE grandchild;
@@ -181,9 +219,52 @@ SELECT a,b,c FROM child_multi_2
 ----
 3  30  300
 
-# TODO(radu): enable when we support Cascades.
 statement ok
-SET experimental_optimizer_foreign_key_cascades = false
+DROP TABLE child_multi_1;
+DROP TABLE child_multi_2;
+DROP TABLE parent_multi
+
+# Self-referencing cascade.
+statement ok
+CREATE TABLE self (a INT PRIMARY KEY, b INT REFERENCES self(a) ON DELETE CASCADE)
+
+statement ok
+INSERT INTO self VALUES (1, NULL);
+INSERT INTO self SELECT x, x-1 FROM generate_series(2, 10) AS g(x)
+
+statement ok
+DELETE FROM self WHERE a = 4
+
+query II rowsort
+SELECT * FROM self
+----
+1   NULL
+2   1
+3   2
+
+statement ok
+DELETE FROM self WHERE a = 1
+
+query II
+SELECT * FROM self
+----
+
+# Test cascade limit setting.
+statement ok
+INSERT INTO self VALUES (1, NULL);
+INSERT INTO self SELECT x, x-1 FROM generate_series(2, 20) AS g(x)
+
+statement ok
+SET foreign_key_cascades_limit = 10
+
+statement error cascades limit \(10\) reached
+DELETE FROM self WHERE a = 1
+
+statement ok
+RESET foreign_key_cascades_limit
+
+statement ok
+DROP TABLE self
 
 subtest AllCascadingActions
 ### A test of all cascading actions in their most basic form.
@@ -682,7 +763,7 @@ INSERT INTO c2 VALUES
 INSERT INTO d VALUES ('d-pk1-c2-pk4-b1-pk2', 'c2-pk4-b1-pk2');
 
 # ON DELETE CASCADE
-statement error pq: foreign key violation: values \['c2-pk4-b1-pk2'\] in columns \[id\] referenced in table "d"
+statement error delete on table "c2" violates foreign key constraint "fk_delete_restrict_ref_c2" on table "d"\nDETAIL: Key \(id\)=\('c2-pk4-b1-pk2'\) is still referenced from table "d"\.
 DELETE FROM a WHERE id = 'a-pk1';
 
 # Clean up after the test.
@@ -853,7 +934,7 @@ SELECT
 2 1 2 1 1 2
 
 # ON DELETE CASCADE
-statement error pq: foreign key violation: values \['pk1'\] in columns \[id\] referenced in table "c3"
+statement error delete on table "b2" violates foreign key constraint "fk_id_ref_b2" on table "c3"\nDETAIL: Key \(id\)=\('pk1'\) is still referenced from table "c3"\.
 DELETE FROM a WHERE id = 'pk1';
 
 # Clean up after the test.

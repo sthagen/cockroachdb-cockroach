@@ -28,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -95,10 +95,12 @@ INSERT INTO perm_table VALUES (DEFAULT, 1);
 	require.NoError(
 		t,
 		kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			execCfg := s.ExecutorConfig().(ExecutorConfig)
 			err = cleanupSchemaObjects(
 				ctx,
-				s.ExecutorConfig().(ExecutorConfig).Settings,
+				execCfg.Settings,
 				txn,
+				execCfg.Codec,
 				s.InternalExecutor().(*InternalExecutor),
 				namesToID["defaultdb"],
 				schemaName,

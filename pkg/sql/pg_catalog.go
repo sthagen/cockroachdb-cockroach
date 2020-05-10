@@ -228,6 +228,7 @@ var pgCatalog = virtualSchema{
 		sqlbase.PgCatalogPreparedStatementsTableID:  pgCatalogPreparedStatementsTable,
 		sqlbase.PgCatalogPreparedXactsTableID:       pgCatalogPreparedXactsTable,
 		sqlbase.PgCatalogProcTableID:                pgCatalogProcTable,
+		sqlbase.PgCatalogAggregateTableID:           pgCatalogAggregateTable,
 		sqlbase.PgCatalogRangeTableID:               pgCatalogRangeTable,
 		sqlbase.PgCatalogRewriteTableID:             pgCatalogRewriteTable,
 		sqlbase.PgCatalogRolesTableID:               pgCatalogRolesTable,
@@ -456,7 +457,7 @@ CREATE TABLE pg_catalog.pg_attribute (
 		addRow func(...tree.Datum) error) error {
 		// addColumn adds adds either a table or a index column to the pg_attribute table.
 		addColumn := func(column *sqlbase.ColumnDescriptor, attRelID tree.Datum, colID sqlbase.ColumnID) error {
-			colTyp := &column.Type
+			colTyp := column.Type
 			attTypMod := int32(-1)
 			if width := colTyp.Width(); width != 0 {
 				switch colTyp.Family() {
@@ -1052,7 +1053,7 @@ func makeAllRelationsVirtualTableWithDescriptorIDIndex(
 					}
 					h := makeOidHasher()
 					resolver := oneAtATimeSchemaResolver{p: p, ctx: ctx}
-					scName, err := schema.ResolveNameByID(ctx, p.txn, db.ID, table.Desc.GetParentSchemaID())
+					scName, err := schema.ResolveNameByID(ctx, p.txn, p.ExecCfg().Codec, db.ID, table.Desc.GetParentSchemaID())
 					if err != nil {
 						return false, err
 					}
@@ -1605,7 +1606,7 @@ CREATE TABLE pg_catalog.pg_index (
 						if err != nil {
 							return err
 						}
-						if err := collationOids.Append(typColl(&col.Type, h)); err != nil {
+						if err := collationOids.Append(typColl(col.Type, h)); err != nil {
 							return err
 						}
 						// Currently, nulls always appear first if the order is ascending,
@@ -2192,10 +2193,10 @@ CREATE TABLE pg_catalog.pg_proc (
 							tree.MakeDBool(tree.DBool(isWindow)),    // proiswindow
 							tree.DBoolFalse,                         // prosecdef
 							tree.MakeDBool(tree.DBool(!props.Impure)), // proleakproof
-							tree.DBoolFalse,                      // proisstrict
-							tree.MakeDBool(tree.DBool(isRetSet)), // proretset
-							tree.DNull,                           // provolatile
-							tree.DNull,                           // proparallel
+							tree.DBoolFalse,                             // proisstrict
+							tree.MakeDBool(tree.DBool(isRetSet)),        // proretset
+							tree.NewDString(string(builtin.Volatility)), // provolatile
+							tree.DNull, // proparallel
 							tree.NewDInt(tree.DInt(builtin.Types.Length())), // pronargs
 							tree.NewDInt(tree.DInt(0)),                      // pronargdefaults
 							retType,                                         // prorettype
@@ -2674,7 +2675,7 @@ CREATE TABLE pg_catalog.pg_type (
 						nspOid,                     // typnamespace
 						tree.DNull,                 // typowner
 						typLen(typ),                // typlen
-						typByVal(typ),              // typbyval
+						typByVal(typ),              // typbyval (is it fixedlen or not)
 						typType,                    // typtype
 						cat,                        // typcategory
 						tree.DBoolFalse,            // typispreferred
@@ -2936,6 +2937,104 @@ CREATE TABLE pg_catalog.pg_views (
 					tree.DNull,                      // viewowner
 					tree.NewDString(desc.ViewQuery), // definition
 				)
+			})
+	},
+}
+
+var pgCatalogAggregateTable = virtualSchemaTable{
+	comment: `aggregated built-in functions (incomplete)
+https://www.postgresql.org/docs/9.6/catalog-pg-aggregate.html`,
+	schema: `
+CREATE TABLE pg_catalog.pg_aggregate (
+	aggfnoid REGPROC,
+	aggkind  CHAR,
+	aggnumdirectargs INT2,
+	aggtransfn REGPROC,
+	aggfinalfn REGPROC,
+	aggcombinefn REGPROC,
+	aggserialfn REGPROC,
+	aggdeserialfn REGPROC,
+	aggmtransfn REGPROC,
+	aggminvtransfn REGPROC,
+	aggmfinalfn REGPROC,
+	aggfinalextra BOOL,
+	aggmfinalextra BOOL,
+	aggsortop OID,
+	aggtranstype OID,
+	aggtransspace INT4,
+	aggmtranstype OID,
+	aggmtransspace INT4,
+	agginitval TEXT,
+	aggminitval TEXT
+)
+`,
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		h := makeOidHasher()
+		return forEachDatabaseDesc(ctx, p, dbContext, false, /* requiresPrivileges */
+			func(db *DatabaseDescriptor) error {
+				for _, name := range builtins.AllAggregateBuiltinNames {
+					if name == builtins.AnyNotNull {
+						// any_not_null is treated as a special case.
+						continue
+					}
+					_, overloads := builtins.GetBuiltinProperties(name)
+					for _, overload := range overloads {
+						params, _ := tree.GetParamsAndReturnType(overload)
+						sortOperatorOid := oidZero
+						aggregateKind := tree.NewDString("n")
+						aggNumDirectArgs := zeroVal
+						if params.Length() != 0 {
+							argType := tree.NewDOid(tree.DInt(params.Types()[0].Oid()))
+							returnType := tree.NewDOid(tree.DInt(oid.T_bool))
+							switch name {
+							// Cases to determine sort operator.
+							case "max", "bool_or":
+								sortOperatorOid = h.OperatorOid(">", argType, argType, returnType)
+							case "min", "bool_and", "every":
+								sortOperatorOid = h.OperatorOid("<", argType, argType, returnType)
+
+							// Cases to determine aggregate kind.
+							case "rank", "percent_rank", "cume_dist", "dense_rank":
+								aggregateKind = tree.NewDString("h")
+								aggNumDirectArgs = tree.NewDInt(1)
+							case "mode":
+								aggregateKind = tree.NewDString("o")
+							default:
+								if strings.HasPrefix(name, "percentile_") {
+									aggregateKind = tree.NewDString("o")
+									aggNumDirectArgs = tree.NewDInt(1)
+								}
+							}
+						}
+						regprocForZeroOid := oidZero.AsRegProc("-")
+						err := addRow(
+							h.BuiltinOid(name, &overload).AsRegProc(name), // aggfnoid
+							aggregateKind,     // aggkind
+							aggNumDirectArgs,  // aggnumdirectargs
+							regprocForZeroOid, // aggtransfn
+							regprocForZeroOid, // aggfinalfn
+							regprocForZeroOid, // aggcombinefn
+							regprocForZeroOid, // aggserialfn
+							regprocForZeroOid, // aggdeserialfn
+							regprocForZeroOid, // aggmtransfn
+							regprocForZeroOid, // aggminvtransfn
+							regprocForZeroOid, // aggmfinalfn
+							tree.DBoolFalse,   // aggfinalextra
+							tree.DBoolFalse,   // aggmfinalextra
+							sortOperatorOid,   // aggsortop
+							tree.DNull,        // aggtranstype
+							tree.DNull,        // aggtransspace
+							tree.DNull,        // aggmtranstype
+							tree.DNull,        // aggmtransspace
+							tree.DNull,        // agginitval
+							tree.DNull,        // aggminitval
+						)
+						if err != nil {
+							return err
+						}
+					}
+				}
+				return nil
 			})
 	},
 }

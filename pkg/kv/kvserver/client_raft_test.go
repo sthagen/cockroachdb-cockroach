@@ -52,7 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft"
@@ -1066,7 +1066,7 @@ func TestFailedSnapshotFillsReservation(t *testing.T) {
 	// "snapshot accepted" message.
 	expectedErr := errors.Errorf("")
 	stream := fakeSnapshotStream{nil, expectedErr}
-	if err := mtc.stores[1].HandleSnapshot(&header, stream); err != expectedErr {
+	if err := mtc.stores[1].HandleSnapshot(&header, stream); !errors.Is(err, expectedErr) {
 		t.Fatalf("expected error %s, but found %v", expectedErr, err)
 	}
 	if n := mtc.stores[1].ReservationCount(); n != 0 {
@@ -1877,7 +1877,7 @@ func runReplicateRestartAfterTruncation(t *testing.T, removeBeforeTruncateAndReA
 		testutils.SucceedsSoon(t, func() error {
 			mtc.stores[1].MustForceReplicaGCScanAndProcess()
 			_, err := mtc.stores[1].GetReplica(rangeID)
-			if _, ok := err.(*roachpb.RangeNotFoundError); !ok {
+			if !errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
 				return errors.Errorf("expected replica to be garbage collected, got %v %T", err, err)
 			}
 			return nil
@@ -2198,16 +2198,11 @@ func TestQuotaPool(t *testing.T) {
 // as active for the purpose of proposal throttling.
 func TestWedgedReplicaDetection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	if testing.Short() {
-		// Takes 10s to run - #33654.
-		t.Skip("short flag")
-	}
 
 	const numReplicas = 3
 	const rangeID = 1
 
 	sc := kvserver.TestStoreConfig(nil)
-	sc.Clock = nil // manual clock
 	// Suppress timeout-based elections to avoid leadership changes in ways
 	// this test doesn't expect.
 	sc.RaftElectionTimeoutTicks = 100000
@@ -2252,10 +2247,11 @@ func TestWedgedReplicaDetection(t *testing.T) {
 	wg.Wait()
 	defer followerRepl.RaftUnlock()
 
+	// TODO(andrei): The test becomes flaky with a lower threshold because the
+	// follower is considered inactive just below. Figure out how to switch the
+	// test to a manual clock. The activity tracking for followers uses the
+	// physical clock.
 	inactivityThreshold := time.Second
-
-	// Increment leader's clock close to inactivityThreshold, but not past it.
-	mtc.manualClock.Increment(inactivityThreshold.Nanoseconds() - 1)
 
 	// Send a request to the leader replica. followerRepl is locked so it will
 	// not respond.
@@ -2282,9 +2278,6 @@ func TestWedgedReplicaDetection(t *testing.T) {
 	// would bump the last active timestamp on the leader. Because of this,
 	// we check whether the follower is eventually considered inactive.
 	testutils.SucceedsSoon(t, func() error {
-		// Increment leader's clock past inactivityThreshold
-		mtc.manualClock.Increment(inactivityThreshold.Nanoseconds() + 1)
-
 		// Send another request to the leader replica. followerRepl is locked
 		// so it will not respond.
 		if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
@@ -2639,7 +2632,7 @@ func TestRaftAfterRemoveRange(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		for _, s := range mtc.stores[1:] {
 			_, err := s.GetReplica(rangeID)
-			if _, ok := err.(*roachpb.RangeNotFoundError); !ok {
+			if !errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
 				return errors.Wrapf(err, "range %d not yet removed from %s", rangeID, s)
 			}
 		}
@@ -3477,7 +3470,7 @@ func TestReplicaTooOldGC(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		replica, err := mtc.stores[3].GetReplica(rangeID)
 		if err != nil {
-			if _, ok := err.(*roachpb.RangeNotFoundError); ok {
+			if errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
 				return nil
 			}
 			return err

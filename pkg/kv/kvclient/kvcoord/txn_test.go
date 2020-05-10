@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -168,7 +168,7 @@ func TestLostUpdate(t *testing.T) {
 		b.Put(key, newVal)
 		err = txn.Run(ctx, b)
 		if firstAttempt {
-			require.Error(t, err, "RETRY_WRITE_TOO_OLD")
+			require.Regexp(t, "RETRY_WRITE_TOO_OLD", err)
 			firstAttempt = false
 			return err
 		}
@@ -671,7 +671,7 @@ func TestTxnLeavesIntentBehindAfterWriteTooOldError(t *testing.T) {
 	intentVal := []byte("test")
 	err = txn.Put(ctx, key, intentVal)
 	require.IsType(t, &roachpb.TransactionRetryWithProtoRefreshError{}, err)
-	require.Error(t, err, "WriteTooOld")
+	require.Regexp(t, "WriteTooOld", err)
 
 	// Check that the intent was left behind.
 	b := kv.Batch{}

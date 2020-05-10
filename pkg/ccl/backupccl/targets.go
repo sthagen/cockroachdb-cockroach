@@ -62,7 +62,7 @@ type descriptorResolver struct {
 	objsByName map[sqlbase.ID]map[string]sqlbase.ID
 }
 
-// LookupSchema implements the tree.TableNameTargetResolver interface.
+// LookupSchema implements the tree.ObjectNameTargetResolver interface.
 func (r *descriptorResolver) LookupSchema(
 	_ context.Context, dbName, scName string,
 ) (bool, tree.SchemaMeta, error) {
@@ -75,7 +75,7 @@ func (r *descriptorResolver) LookupSchema(
 	return false, nil, nil
 }
 
-// LookupObject implements the tree.TableNameExistingResolver interface.
+// LookupObject implements the tree.ObjectNameExistingResolver interface.
 func (r *descriptorResolver) LookupObject(
 	_ context.Context, flags tree.ObjectLookupFlags, dbName, scName, obName string,
 ) (bool, tree.NameResolutionResult, error) {
@@ -598,8 +598,10 @@ func fullClusterTargets(
 	return fullClusterDescs, fullClusterDBs, nil
 }
 
-func lookupDatabaseID(ctx context.Context, txn *kv.Txn, name string) (sqlbase.ID, error) {
-	found, id, err := sqlbase.LookupDatabaseID(ctx, txn, name)
+func lookupDatabaseID(
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, name string,
+) (sqlbase.ID, error) {
+	found, id, err := sqlbase.LookupDatabaseID(ctx, txn, codec, name)
 	if err != nil {
 		return sqlbase.InvalidID, err
 	}
@@ -611,8 +613,10 @@ func lookupDatabaseID(ctx context.Context, txn *kv.Txn, name string) (sqlbase.ID
 
 // CheckTableExists returns an error if a table already exists with given
 // parent and name.
-func CheckTableExists(ctx context.Context, txn *kv.Txn, parentID sqlbase.ID, name string) error {
-	found, _, err := sqlbase.LookupPublicTableID(ctx, txn, parentID, name)
+func CheckTableExists(
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, parentID sqlbase.ID, name string,
+) error {
+	found, _, err := sqlbase.LookupPublicTableID(ctx, txn, codec, parentID, name)
 	if err != nil {
 		return err
 	}

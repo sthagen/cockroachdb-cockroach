@@ -16,7 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // PreferredEncoding is the encoding used for EncDatums that don't already have
@@ -71,7 +71,7 @@ func (se *StreamEncoder) SetHeaderFields(flowID execinfrapb.FlowID, streamID exe
 }
 
 // Init initializes the encoder.
-func (se *StreamEncoder) Init(types []types.T) {
+func (se *StreamEncoder) Init(types []*types.T) {
 	se.infos = make([]execinfrapb.DatumInfo, len(types))
 	for i := range types {
 		se.infos[i].Type = types[i]
@@ -105,7 +105,7 @@ func (se *StreamEncoder) AddRow(row sqlbase.EncDatumRow) error {
 			if !ok {
 				enc = PreferredEncoding
 			}
-			sType := se.infos[i].Type.Family()
+			sType := se.infos[i].Type
 			if enc != sqlbase.DatumEncoding_VALUE &&
 				(sqlbase.HasCompositeKeyEncoding(sType) || sqlbase.MustBeValueEncoded(sType)) {
 				// Force VALUE encoding for composite types (key encodings may lose data).
@@ -121,7 +121,7 @@ func (se *StreamEncoder) AddRow(row sqlbase.EncDatumRow) error {
 	}
 	for i := range row {
 		var err error
-		se.rowBuf, err = row[i].Encode(&se.infos[i].Type, &se.alloc, se.infos[i].Encoding, se.rowBuf)
+		se.rowBuf, err = row[i].Encode(se.infos[i].Type, &se.alloc, se.infos[i].Encoding, se.rowBuf)
 		if err != nil {
 			return err
 		}

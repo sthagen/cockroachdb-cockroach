@@ -290,32 +290,6 @@ func (ed *EncDatum) Fingerprint(typ *types.T, a *DatumAlloc, appendTo []byte) ([
 		// We must use value encodings without a column ID even if the EncDatum already
 		// is encoded with the value encoding so that the hashes are indeed unique.
 		return EncodeTableValue(appendTo, ColumnID(encoding.NoColumnID), ed.Datum, a.scratch)
-	case types.ArrayFamily:
-		if err := ed.EnsureDecoded(typ, a); err != nil {
-			return nil, err
-		}
-		// Arrays may contain composite data, so we cannot just value
-		// encode an array (that would give same-valued composite
-		// datums a different encoding).
-		if ed.Datum == tree.DNull {
-			return ed.Encode(typ, a, DatumEncoding_ASCENDING_KEY, appendTo)
-		}
-		// Allocate one EncDatum upfront rather than using the DatumToEncDatum
-		// to avoid allocating an EncDatum on each iteration of the loop.
-		e := EncDatum{}
-		array := ed.Datum.(*tree.DArray)
-		// Append a type header to the encoding to differentiate between
-		// NULL and ARRAY[NULL].
-		appendTo = append(appendTo, byte(encoding.Array))
-		var err error
-		for _, d := range array.Array {
-			e.Datum = d
-			appendTo, err = e.Fingerprint(array.ParamTyp, a, appendTo)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return appendTo, nil
 	default:
 		// For values that are key encodable, using the ascending key.
 		// TODO (rohany): However, there should be a knob for the hasher that sees
@@ -399,7 +373,7 @@ func (ed *EncDatum) GetInt() (int64, error) {
 // EncDatumRow is a row of EncDatums.
 type EncDatumRow []EncDatum
 
-func (r EncDatumRow) stringToBuf(types []types.T, a *DatumAlloc, b *bytes.Buffer) {
+func (r EncDatumRow) stringToBuf(types []*types.T, a *DatumAlloc, b *bytes.Buffer) {
 	if len(types) != len(r) {
 		panic(fmt.Sprintf("mismatched types (%v) and row (%v)", types, r))
 	}
@@ -408,7 +382,7 @@ func (r EncDatumRow) stringToBuf(types []types.T, a *DatumAlloc, b *bytes.Buffer
 		if i > 0 {
 			b.WriteString(" ")
 		}
-		b.WriteString(r[i].stringWithAlloc(&types[i], a))
+		b.WriteString(r[i].stringWithAlloc(types[i], a))
 	}
 	b.WriteString("]")
 }
@@ -424,7 +398,7 @@ func (r EncDatumRow) Copy() EncDatumRow {
 	return rCopy
 }
 
-func (r EncDatumRow) String(types []types.T) string {
+func (r EncDatumRow) String(types []*types.T) string {
 	var b bytes.Buffer
 	r.stringToBuf(types, &DatumAlloc{}, &b)
 	return b.String()
@@ -445,7 +419,7 @@ func (r EncDatumRow) Size() uintptr {
 
 // EncDatumRowToDatums converts a given EncDatumRow to a Datums.
 func EncDatumRowToDatums(
-	types []types.T, datums tree.Datums, row EncDatumRow, da *DatumAlloc,
+	types []*types.T, datums tree.Datums, row EncDatumRow, da *DatumAlloc,
 ) error {
 	if len(types) != len(row) {
 		panic(fmt.Sprintf("mismatched types (%v) and row (%v)", types, row))
@@ -459,7 +433,7 @@ func EncDatumRowToDatums(
 			datums[i] = tree.DNull
 			continue
 		}
-		err := encDatum.EnsureDecoded(&types[i], da)
+		err := encDatum.EnsureDecoded(types[i], da)
 		if err != nil {
 			return err
 		}
@@ -480,7 +454,7 @@ func EncDatumRowToDatums(
 // {{0, asc}, {1, asc}} (i.e. ordered by first column and then by second
 // column).
 func (r EncDatumRow) Compare(
-	types []types.T,
+	types []*types.T,
 	a *DatumAlloc,
 	ordering ColumnOrdering,
 	evalCtx *tree.EvalContext,
@@ -490,7 +464,7 @@ func (r EncDatumRow) Compare(
 		panic(fmt.Sprintf("length mismatch: %d types, %d lhs, %d rhs\n%+v\n%+v\n%+v", len(types), len(r), len(rhs), types, r, rhs))
 	}
 	for _, c := range ordering {
-		cmp, err := r[c.ColIdx].Compare(&types[c.ColIdx], a, evalCtx, &rhs[c.ColIdx])
+		cmp, err := r[c.ColIdx].Compare(types[c.ColIdx], a, evalCtx, &rhs[c.ColIdx])
 		if err != nil {
 			return 0, err
 		}
@@ -506,14 +480,14 @@ func (r EncDatumRow) Compare(
 
 // CompareToDatums is a version of Compare which compares against decoded Datums.
 func (r EncDatumRow) CompareToDatums(
-	types []types.T,
+	types []*types.T,
 	a *DatumAlloc,
 	ordering ColumnOrdering,
 	evalCtx *tree.EvalContext,
 	rhs tree.Datums,
 ) (int, error) {
 	for _, c := range ordering {
-		if err := r[c.ColIdx].EnsureDecoded(&types[c.ColIdx], a); err != nil {
+		if err := r[c.ColIdx].EnsureDecoded(types[c.ColIdx], a); err != nil {
 			return 0, err
 		}
 		cmp := r[c.ColIdx].Datum.Compare(evalCtx, rhs[c.ColIdx])
@@ -530,7 +504,7 @@ func (r EncDatumRow) CompareToDatums(
 // EncDatumRows is a slice of EncDatumRows having the same schema.
 type EncDatumRows []EncDatumRow
 
-func (r EncDatumRows) String(types []types.T) string {
+func (r EncDatumRows) String(types []*types.T) string {
 	var a DatumAlloc
 	var b bytes.Buffer
 	b.WriteString("[")

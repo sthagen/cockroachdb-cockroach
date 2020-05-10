@@ -248,7 +248,7 @@ func TestEncDatumCompare(t *testing.T) {
 
 		// These cases require decoding. Data with a composite key encoding cannot
 		// be decoded from their key part alone.
-		if !HasCompositeKeyEncoding(typ.Family()) {
+		if !HasCompositeKeyEncoding(typ) {
 			checkEncDatumCmp(t, a, typ, &v1, &v2, noncmp, noncmp, -1, true)
 			checkEncDatumCmp(t, a, typ, &v2, &v1, desc, noncmp, +1, true)
 			checkEncDatumCmp(t, a, typ, &v1, &v1, asc, desc, 0, true)
@@ -268,26 +268,26 @@ func TestEncDatumFromBuffer(t *testing.T) {
 		var err error
 		// Generate a set of random datums.
 		ed := make([]EncDatum, 1+rng.Intn(10))
-		typs := make([]types.T, len(ed))
+		typs := make([]*types.T, len(ed))
 		for i := range ed {
 			d, t := RandEncDatum(rng)
-			ed[i], typs[i] = d, *t
+			ed[i], typs[i] = d, t
 		}
 		// Encode them in a single buffer.
 		var buf []byte
 		enc := make([]DatumEncoding, len(ed))
 		for i := range ed {
-			if HasCompositeKeyEncoding(typs[i].Family()) {
+			if HasCompositeKeyEncoding(typs[i]) {
 				// There's no way to reconstruct data from the key part of a composite
 				// encoding.
 				enc[i] = DatumEncoding_VALUE
 			} else {
 				enc[i] = RandDatumEncoding(rng)
-				for !columnTypeCompatibleWithEncoding(&typs[i], enc[i]) {
+				for !columnTypeCompatibleWithEncoding(typs[i], enc[i]) {
 					enc[i] = RandDatumEncoding(rng)
 				}
 			}
-			buf, err = ed[i].Encode(&typs[i], &alloc, enc[i], buf)
+			buf, err = ed[i].Encode(typs[i], &alloc, enc[i], buf)
 			if err != nil {
 				t.Fatalf("Failed to encode type %v: %s", typs[i], err)
 			}
@@ -299,13 +299,13 @@ func TestEncDatumFromBuffer(t *testing.T) {
 				t.Fatal("buffer ended early")
 			}
 			var decoded EncDatum
-			decoded, b, err = EncDatumFromBuffer(&typs[i], enc[i], b)
+			decoded, b, err = EncDatumFromBuffer(typs[i], enc[i], b)
 			if err != nil {
-				t.Fatalf("%+v: encdatum from %+v: %+v (%+v)", ed[i].Datum, enc[i], err, &typs[i])
+				t.Fatalf("%+v: encdatum from %+v: %+v (%+v)", ed[i].Datum, enc[i], err, typs[i])
 			}
-			err = decoded.EnsureDecoded(&typs[i], &alloc)
+			err = decoded.EnsureDecoded(typs[i], &alloc)
 			if err != nil {
-				t.Fatalf("%+v: ensuredecoded: %v (%+v)", ed[i], err, &typs[i])
+				t.Fatalf("%+v: ensuredecoded: %v (%+v)", ed[i], err, typs[i])
 			}
 			if decoded.Datum.Compare(evalCtx, ed[i].Datum) != 0 {
 				t.Errorf("decoded datum %+v doesn't equal original %+v", decoded.Datum, ed[i].Datum)
@@ -417,9 +417,9 @@ func TestEncDatumRowCompare(t *testing.T) {
 	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 	for _, c := range testCases {
-		typs := make([]types.T, len(c.row1))
+		typs := make([]*types.T, len(c.row1))
 		for i := range typs {
-			typs[i] = *types.Int
+			typs[i] = types.Int
 		}
 		cmp, err := c.row1.Compare(typs, a, c.ord, evalCtx, c.row2)
 		if err != nil {
@@ -446,8 +446,8 @@ func TestEncDatumRowAlloc(t *testing.T) {
 			for i := 0; i < rows; i++ {
 				in[i] = make(EncDatumRow, cols)
 				for j := 0; j < cols; j++ {
-					datum := RandDatum(rng, &colTypes[j], true /* nullOk */)
-					in[i][j] = DatumToEncDatum(&colTypes[j], datum)
+					datum := RandDatum(rng, colTypes[j], true /* nullOk */)
+					in[i][j] = DatumToEncDatum(colTypes[j], datum)
 				}
 			}
 			var alloc EncDatumRowAlloc
@@ -479,17 +479,17 @@ func TestEncDatumRowAlloc(t *testing.T) {
 func TestValueEncodeDecodeTuple(t *testing.T) {
 	rng, seed := randutil.NewPseudoRand()
 	tests := make([]tree.Datum, 1000)
-	colTypes := make([]types.T, 1000)
+	colTypes := make([]*types.T, 1000)
 	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	for i := range tests {
 		len := rng.Intn(5)
-		contents := make([]types.T, len)
+		contents := make([]*types.T, len)
 		for j := range contents {
-			contents[j] = *RandEncodableType(rng)
+			contents[j] = RandEncodableType(rng)
 		}
-		colTypes[i] = *types.MakeTuple(contents)
-		tests[i] = RandDatum(rng, &colTypes[i], true)
+		colTypes[i] = types.MakeTuple(contents)
+		tests[i] = RandDatum(rng, colTypes[i], true)
 	}
 
 	for i, test := range tests {

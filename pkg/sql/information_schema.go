@@ -395,12 +395,12 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 					dStringPtrOrNull(column.DefaultExpr),                 // column_default
 					yesOrNoDatum(column.Nullable),                        // is_nullable
 					tree.NewDString(column.Type.InformationSchemaName()), // data_type
-					characterMaximumLength(&column.Type),                 // character_maximum_length
-					characterOctetLength(&column.Type),                   // character_octet_length
-					numericPrecision(&column.Type),                       // numeric_precision
-					numericPrecisionRadix(&column.Type),                  // numeric_precision_radix
-					numericScale(&column.Type),                           // numeric_scale
-					datetimePrecision(&column.Type),                      // datetime_precision
+					characterMaximumLength(column.Type),                  // character_maximum_length
+					characterOctetLength(column.Type),                    // character_octet_length
+					numericPrecision(column.Type),                        // numeric_precision
+					numericPrecisionRadix(column.Type),                   // numeric_precision_radix
+					numericScale(column.Type),                            // numeric_scale
+					datetimePrecision(column.Type),                       // datetime_precision
 					tree.DNull,                                           // interval_type
 					tree.DNull,                                           // interval_precision
 					tree.DNull,                                           // character_set_catalog
@@ -1367,12 +1367,12 @@ https://www.postgresql.org/docs/9.5/infoschema-tables.html`,
 				addRow func(...tree.Datum) error) (bool, error) {
 				// This index is on the TABLE_NAME column.
 				name := tree.MustBeDString(constraint)
-				desc, err := ResolveExistingObject(ctx, p, tree.NewUnqualifiedTableName(tree.Name(name)),
+				desc, err := ResolveExistingTableObject(ctx, p, tree.NewUnqualifiedTableName(tree.Name(name)),
 					tree.ObjectLookupFlags{}, ResolveAnyDescType)
 				if err != nil || desc == nil {
 					return false, err
 				}
-				schemaName, err := schema.ResolveNameByID(ctx, p.txn, db.ID, desc.GetParentSchemaID())
+				schemaName, err := schema.ResolveNameByID(ctx, p.txn, p.ExecCfg().Codec, db.ID, desc.GetParentSchemaID())
 				if err != nil {
 					return false, err
 				}
@@ -1510,7 +1510,7 @@ func forEachDatabaseDesc(
 	} else {
 		// We can't just use dbContext here because we need to fetch the descriptor
 		// with privileges from kv.
-		fetchedDbDesc, err := getDatabaseDescriptorsFromIDs(ctx, p.txn, []sqlbase.ID{dbContext.ID})
+		fetchedDbDesc, err := getDatabaseDescriptorsFromIDs(ctx, p.txn, p.ExecCfg().Codec, []sqlbase.ID{dbContext.ID})
 		if err != nil {
 			return err
 		}

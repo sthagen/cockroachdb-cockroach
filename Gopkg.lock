@@ -378,11 +378,11 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:5a75ff130630f57609ffca00d6a76dc31bb50ad6a03809848e0f9e13add31987"
+  digest = "1:18044aa13c09481d9e028ee7dda27902822ea65a8afbfac263959bb30c8e9671"
   name = "github.com/cockroachdb/cockroach-go"
   packages = ["crdb"]
   pruneopts = "UT"
-  revision = "e0a95dfd547cc9c3ebaaba1a12c2afe4bf621ac5"
+  revision = "73ffeee90b625e57147b7d6542fa2ee5c4f5b5f9"
 
 [[projects]]
   branch = "master"
@@ -406,7 +406,7 @@
 
 [[projects]]
   branch = "v1.2.4-cockroach20.1"
-  digest = "1:f3e110587a7cde6152fe8861a5873ffb552232b8a91ce444075397f4ebabd4cd"
+  digest = "1:db7275e4d3f5ee835bdbbef9ff32e6aefcd9cb24f5be9ca5cde9f4a1406400d9"
   name = "github.com/cockroachdb/errors"
   packages = [
     ".",
@@ -429,7 +429,7 @@
     "withstack",
   ]
   pruneopts = "UT"
-  revision = "fcfc812fae48db497f9fb1dbc7b4d4041caa06fa"
+  revision = "46cc0d5ac18b28dce12849e42fd1af3ecf9bcdfe"
 
 [[projects]]
   digest = "1:a44e537b3e080ff297315d166956dba9607f070644a89be78b59af6c54876b64"
@@ -1605,7 +1605,7 @@
   version = "v1.4.0"
 
 [[projects]]
-  digest = "1:661aa35409435cec194eb640ec712cf1e9b483d988d587a8b91847293e715f59"
+  digest = "1:48c4d87d7cb5dac26d1654c6584019713c9e68da7b0f695dddf21a80a08e39eb"
   name = "github.com/twpayne/go-geom"
   packages = [
     ".",
@@ -1619,8 +1619,7 @@
     "encoding/wkt",
   ]
   pruneopts = "UT"
-  revision = "6e58c69044b13f84504654b4741390b92a70a402"
-  version = "v1.0.6"
+  revision = "3402552da1eb9d7a1c8a9ecb05395b076d8e7bf6"
 
 [[projects]]
   digest = "1:43e0db2b113d1aee4bb68745598c135511976a44fb380ebd701cd0c14a77c303"

@@ -12,7 +12,6 @@ package colrpc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -23,7 +22,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
@@ -38,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -189,7 +188,7 @@ func TestOutboxInbox(t *testing.T) {
 	// Do the actual testing.
 	t.Run(fmt.Sprintf("cancellationScenario=%s", cancellationScenarioName), func(t *testing.T) {
 		var (
-			typs        = []types.T{*types.Int}
+			typs        = []*types.T{types.Int}
 			inputBuffer = colexecbase.NewBatchBuffer()
 			// Generate some random behavior before passing the random number
 			// generator to be used in the Outbox goroutine (to avoid races). These
@@ -293,7 +292,6 @@ func TestOutboxInbox(t *testing.T) {
 						for i := range typs {
 							batchCopy.ColVec(i).Append(
 								coldata.SliceArgs{
-									ColType:   typeconv.FromColumnType(&typs[i]),
 									Src:       outputBatch.ColVec(i),
 									SrcEndIdx: outputBatch.Length(),
 								},
@@ -336,8 +334,8 @@ func TestOutboxInbox(t *testing.T) {
 				for i := range typs {
 					require.Equal(
 						t,
-						inputBatch.ColVec(i).Window(typeconv.FromColumnType(&typs[i]), 0, inputBatch.Length()),
-						outputBatch.ColVec(i).Window(typeconv.FromColumnType(&typs[i]), 0, outputBatch.Length()),
+						inputBatch.ColVec(i).Window(0, inputBatch.Length()),
+						outputBatch.ColVec(i).Window(0, outputBatch.Length()),
 						"batchNum: %d", batchNum,
 					)
 				}
@@ -346,7 +344,7 @@ func TestOutboxInbox(t *testing.T) {
 			// If the stream context gets canceled, GRPC should take care of closing
 			// and cleaning up the stream. The Inbox stream handler should have
 			// received the context cancellation and returned.
-			require.Error(t, streamHandlerErr, "context canceled")
+			require.Regexp(t, "context canceled", streamHandlerErr)
 			// The Inbox propagates this cancellation on its host.
 			require.True(t, testutils.IsError(readerErr, "context canceled"), readerErr)
 
@@ -357,7 +355,7 @@ func TestOutboxInbox(t *testing.T) {
 		case readerCtxCancel:
 			// If the reader context gets canceled, the Inbox should have returned
 			// from the stream handler.
-			require.Error(t, streamHandlerErr, "context canceled")
+			require.Regexp(t, "context canceled", streamHandlerErr)
 			// The Inbox should propagate this error upwards.
 			require.True(t, testutils.IsError(readerErr, "context canceled"), readerErr)
 
@@ -446,7 +444,7 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 			var (
 				serverStreamNotification = <-mockServer.InboundStreams
 				serverStream             = serverStreamNotification.Stream
-				typs                     = []types.T{*types.Int}
+				typs                     = []*types.T{types.Int}
 				input                    = coldatatestutils.NewRandomDataOp(
 					testAllocator,
 					rng,
@@ -527,7 +525,7 @@ func BenchmarkOutboxInbox(b *testing.B) {
 	serverStreamNotification := <-mockServer.InboundStreams
 	serverStream := serverStreamNotification.Stream
 
-	typs := []types.T{*types.Int}
+	typs := []*types.T{types.Int}
 
 	batch := testAllocator.NewMemBatch(typs)
 	batch.SetLength(coldata.BatchSize())
@@ -585,7 +583,7 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 	dialer := &execinfrapb.MockDialer{Addr: addr}
 	defer dialer.Close()
 
-	typs := []types.T{*types.Int}
+	typs := []*types.T{types.Int}
 
 	var inTags *logtags.Buffer
 
@@ -662,7 +660,7 @@ func TestInboxCtxStreamIDTagging(t *testing.T) {
 
 			rpcLayer := makeMockFlowStreamRPCLayer()
 
-			typs := []types.T{*types.Int}
+			typs := []*types.T{types.Int}
 
 			inbox, err := NewInbox(testAllocator, typs, streamID)
 			require.NoError(t, err)

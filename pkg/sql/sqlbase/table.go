@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -163,7 +164,7 @@ func MakeColumnDefDescs(
 	if err := ValidateColumnDefType(resType); err != nil {
 		return nil, nil, nil, err
 	}
-	col.Type = *resType
+	col.Type = resType
 
 	var typedExpr tree.TypedExpr
 	if d.HasDefaultExpr() {
@@ -289,8 +290,8 @@ func EncodeColumns(
 }
 
 // GetColumnTypes returns the types of the columns with the given IDs.
-func GetColumnTypes(desc *TableDescriptor, columnIDs []ColumnID) ([]types.T, error) {
-	types := make([]types.T, len(columnIDs))
+func GetColumnTypes(desc *TableDescriptor, columnIDs []ColumnID) ([]*types.T, error) {
+	types := make([]*types.T, len(columnIDs))
 	for i, id := range columnIDs {
 		col, err := desc.FindActiveColumnByID(id)
 		if err != nil {
@@ -337,12 +338,12 @@ type tableLookupFn func(ID) (*TableDescriptor, error)
 
 // GetConstraintInfo returns a summary of all constraints on the table.
 func (desc *TableDescriptor) GetConstraintInfo(
-	ctx context.Context, txn *kv.Txn,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec,
 ) (map[string]ConstraintDetail, error) {
 	var tableLookup tableLookupFn
 	if txn != nil {
 		tableLookup = func(id ID) (*TableDescriptor, error) {
-			return GetTableDescFromID(ctx, txn, id)
+			return GetTableDescFromID(ctx, txn, codec, id)
 		}
 	}
 	return desc.collectConstraintInfo(tableLookup)
@@ -535,15 +536,52 @@ func FindFKOriginIndex(
 	)
 }
 
+// FindFKOriginIndexInTxn finds the first index in the supplied originTable
+// that can satisfy an outgoing foreign key of the supplied column ids.
+// It returns either an index that is active, or an index that was created
+// in the same transaction that is currently running.
+func FindFKOriginIndexInTxn(
+	originTable *MutableTableDescriptor, originColIDs ColumnIDs,
+) (*IndexDescriptor, error) {
+	// Search for an index on the origin table that matches our foreign
+	// key columns.
+	if originTable.PrimaryIndex.IsValidOriginIndex(originColIDs) {
+		return &originTable.PrimaryIndex, nil
+	}
+	// If the PK doesn't match, find the index corresponding to the origin column.
+	for i := range originTable.Indexes {
+		idx := &originTable.Indexes[i]
+		if idx.IsValidOriginIndex(originColIDs) {
+			return idx, nil
+		}
+	}
+	currentMutationID := originTable.ClusterVersion.NextMutationID
+	for i := range originTable.Mutations {
+		mut := &originTable.Mutations[i]
+		if idx := mut.GetIndex(); idx != nil &&
+			mut.MutationID == currentMutationID &&
+			mut.Direction == DescriptorMutation_ADD {
+			if idx.IsValidOriginIndex(originColIDs) {
+				return idx, nil
+			}
+		}
+	}
+	return nil, pgerror.Newf(
+		pgcode.ForeignKeyViolation,
+		"there is no index matching given keys for referenced table %s",
+		originTable.Name,
+	)
+}
+
 // ConditionalGetTableDescFromTxn validates that the supplied TableDescriptor
 // matches the one currently stored in kv. This simulates a CPut and returns a
 // ConditionFailedError on mismatch. We don't directly use CPut with protos
 // because the marshaling is not guaranteed to be stable and also because it's
 // sensitive to things like missing vs default values of fields.
 func ConditionalGetTableDescFromTxn(
-	ctx context.Context, txn *kv.Txn, expectation *TableDescriptor,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, expectation *TableDescriptor,
 ) (*roachpb.Value, error) {
-	key := MakeDescMetadataKey(expectation.ID)
+	key := MakeDescMetadataKey(codec, expectation.ID)
 	existingKV, err := txn.Get(ctx, key)
 	if err != nil {
 		return nil, err

@@ -30,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func TestHashJoiner(t *testing.T) {
@@ -240,7 +240,7 @@ func TestHashJoinerError(t *testing.T) {
 }
 
 func checkExpectedRows(
-	types []types.T, expectedRows sqlbase.EncDatumRows, results *distsqlutils.RowBuffer,
+	types []*types.T, expectedRows sqlbase.EncDatumRows, results *distsqlutils.RowBuffer,
 ) error {
 	var expected []string
 	for _, row := range expectedRows {
@@ -558,7 +558,7 @@ func BenchmarkHashJoiner(b *testing.B) {
 						// hashJoiner Run()s to omit instantiation time from benchmarks.
 						h, err := newHashJoiner(
 							flowCtx, 0 /* processorID */, spec, leftInput, rightInput,
-							post, &execinfra.RowDisposer{}, false, /* disableTempStorage */
+							post, &rowDisposer{}, false, /* disableTempStorage */
 						)
 						if err != nil {
 							b.Fatal(err)

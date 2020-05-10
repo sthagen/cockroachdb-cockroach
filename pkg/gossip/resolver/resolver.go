@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 var (
@@ -55,14 +55,13 @@ func SRV(ctx context.Context, name string) ([]string, error) {
 	}
 
 	if name == "" {
-		// nolint:returnerrcheck
 		return nil, nil
 	}
 
 	// "" as the addr and proto forces the direct look up of the name
 	_, recs, err := lookupSRV("", "", name)
 	if err != nil {
-		if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.Err == "no such host" {
+		if dnsErr := (*net.DNSError)(nil); errors.As(err, &dnsErr) && dnsErr.Err == "no such host" {
 			return nil, nil
 		}
 
@@ -73,9 +72,11 @@ func SRV(ctx context.Context, name string) ([]string, error) {
 		return nil, nil
 	}
 
-	var addrs = make([]string, len(recs))
-	for i, r := range recs {
-		addrs[i] = net.JoinHostPort(r.Target, fmt.Sprintf("%d", r.Port))
+	addrs := []string{}
+	for _, r := range recs {
+		if r.Port != 0 {
+			addrs = append(addrs, net.JoinHostPort(r.Target, fmt.Sprintf("%d", r.Port)))
+		}
 	}
 
 	return addrs, nil

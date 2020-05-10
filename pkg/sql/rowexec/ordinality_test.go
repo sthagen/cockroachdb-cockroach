@@ -133,7 +133,7 @@ func TestOrdinality(t *testing.T) {
 				res = append(res, row)
 			}
 
-			var typs []types.T
+			var typs []*types.T
 			switch len(res[0]) {
 			case 1:
 				typs = sqlbase.OneIntCol
@@ -169,7 +169,7 @@ func BenchmarkOrdinality(b *testing.B) {
 		b.SetBytes(int64(8 * numRows * numCols))
 		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				o, err := newOrdinalityProcessor(flowCtx, 0 /* processorID */, spec, input, post, &execinfra.RowDisposer{})
+				o, err := newOrdinalityProcessor(flowCtx, 0 /* processorID */, spec, input, post, &rowDisposer{})
 				if err != nil {
 					b.Fatal(err)
 				}

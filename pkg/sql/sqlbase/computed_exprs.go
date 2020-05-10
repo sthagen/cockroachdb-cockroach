@@ -64,7 +64,7 @@ func (j *descContainer) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Dat
 }
 
 func (j *descContainer) IndexedVarResolvedType(idx int) *types.T {
-	return &j.cols[idx].Type
+	return j.cols[idx].Type
 }
 
 func (*descContainer) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
@@ -129,14 +129,14 @@ func MakeComputedExprs(
 	iv := &descContainer{tableDesc.Columns}
 	ivarHelper := tree.MakeIndexedVarHelper(iv, len(tableDesc.Columns))
 
-	source := NewSourceInfoForSingleTable(*tn, ResultColumnsFromColDescs(tableDesc.Columns))
+	source := NewSourceInfoForSingleTable(*tn, ResultColumnsFromColDescs(tableDesc.GetID(), tableDesc.Columns))
 	semaCtx := tree.MakeSemaContext()
 	semaCtx.IVarContainer = iv
 
 	addColumnInfo := func(col *ColumnDescriptor) {
 		ivarHelper.AppendSlot()
 		iv.cols = append(iv.cols, *col)
-		newCols := ResultColumnsFromColDescs([]ColumnDescriptor{*col})
+		newCols := ResultColumnsFromColDescs(tableDesc.GetID(), []ColumnDescriptor{*col})
 		source.SourceColumns = append(source.SourceColumns, newCols...)
 	}
 
@@ -156,7 +156,7 @@ func MakeComputedExprs(
 			return nil, err
 		}
 
-		typedExpr, err := tree.TypeCheck(expr, &semaCtx, &col.Type)
+		typedExpr, err := tree.TypeCheck(expr, &semaCtx, col.Type)
 		if err != nil {
 			return nil, err
 		}

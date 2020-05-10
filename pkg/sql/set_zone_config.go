@@ -415,7 +415,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		_, completeZone, completeSubzone, err := GetZoneConfigInTxn(params.ctx, params.p.txn,
 			uint32(targetID), index, partition, n.setDefault)
 
-		if err == errNoZoneConfigApplies {
+		if errors.Is(err, errNoZoneConfigApplies) {
 			// No zone config yet.
 			//
 			// GetZoneConfigInTxn will fail with errNoZoneConfigApplies when
@@ -894,7 +894,7 @@ func RemoveIndexZoneConfigs(
 	tableID sqlbase.ID,
 	indexDescs []sqlbase.IndexDescriptor,
 ) error {
-	tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+	tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, execCfg.Codec, tableID)
 	if err != nil {
 		return err
 	}

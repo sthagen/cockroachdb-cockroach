@@ -116,7 +116,7 @@ func newCopyMachine(
 	}()
 	c.parsingEvalCtx = c.p.EvalContext()
 
-	tableDesc, err := ResolveExistingObject(ctx, &c.p, &n.Table, tree.ObjectLookupFlagsWithRequired(), ResolveRequireTableDesc)
+	tableDesc, err := ResolveExistingTableObject(ctx, &c.p, &n.Table, tree.ObjectLookupFlagsWithRequired(), ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +130,12 @@ func newCopyMachine(
 	}
 	c.resultColumns = make(sqlbase.ResultColumns, len(cols))
 	for i := range cols {
-		c.resultColumns[i] = sqlbase.ResultColumn{Typ: &cols[i].Type}
+		c.resultColumns[i] = sqlbase.ResultColumn{
+			Name:           cols[i].Name,
+			Typ:            cols[i].Type,
+			TableID:        tableDesc.GetID(),
+			PGAttributeNum: cols[i].GetLogicalColumnID(),
+		}
 	}
 	c.rowsMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
 	c.bufMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()

@@ -34,14 +34,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 )
 
 type router interface {
 	execinfra.RowReceiver
 	flowinfra.Startable
-	init(ctx context.Context, flowCtx *execinfra.FlowCtx, types []types.T)
+	init(ctx context.Context, flowCtx *execinfra.FlowCtx, types []*types.T)
 }
 
 // makeRouter creates a router. The router's init must be called before the
@@ -181,7 +181,7 @@ func (ro *routerOutput) popRowsLocked(
 const semaphorePeriod = 8
 
 type routerBase struct {
-	types []types.T
+	types []*types.T
 
 	outputs []routerOutput
 
@@ -236,7 +236,7 @@ func (rb *routerBase) setupStreams(
 }
 
 // init must be called after setupStreams but before Start.
-func (rb *routerBase) init(ctx context.Context, flowCtx *execinfra.FlowCtx, types []types.T) {
+func (rb *routerBase) init(ctx context.Context, flowCtx *execinfra.FlowCtx, types []*types.T) {
 	// Check if we're recording stats.
 	if s := opentracing.SpanFromContext(ctx); s != nil && tracing.IsRecording(s) {
 		rb.statsCollectionEnabled = true
@@ -379,7 +379,7 @@ func (rb *routerBase) ProducerDone() {
 	}
 }
 
-func (rb *routerBase) Types() []types.T {
+func (rb *routerBase) Types() []*types.T {
 	return rb.types
 }
 
@@ -586,7 +586,7 @@ func (hr *hashRouter) computeDestination(row sqlbase.EncDatumRow) (int, error) {
 			return -1, err
 		}
 		var err error
-		hr.buffer, err = row[col].Fingerprint(&hr.types[col], &hr.alloc, hr.buffer)
+		hr.buffer, err = row[col].Fingerprint(hr.types[col], &hr.alloc, hr.buffer)
 		if err != nil {
 			return -1, err
 		}
@@ -664,7 +664,7 @@ func (rr *rangeRouter) computeDestination(row sqlbase.EncDatumRow) (int, error) 
 	rr.b = rr.b[:0]
 	for _, enc := range rr.encodings {
 		col := enc.Column
-		rr.b, err = row[col].Encode(&rr.types[col], &rr.alloc, enc.Encoding, rr.b)
+		rr.b, err = row[col].Encode(rr.types[col], &rr.alloc, enc.Encoding, rr.b)
 		if err != nil {
 			return 0, err
 		}

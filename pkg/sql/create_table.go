@@ -180,7 +180,7 @@ func getTableCreateParams(
 		tempSchemaName := params.p.TemporarySchemaName()
 		sKey := sqlbase.NewSchemaKey(dbID, tempSchemaName)
 		var err error
-		schemaID, err = getDescriptorID(params.ctx, params.p.txn, sKey)
+		schemaID, err = getDescriptorID(params.ctx, params.p.txn, params.ExecCfg().Codec, sKey)
 		if err != nil {
 			return nil, 0, err
 		} else if schemaID == sqlbase.InvalidID {
@@ -193,10 +193,16 @@ func getTableCreateParams(
 		tKey = sqlbase.NewTableKey(dbID, schemaID, tableName)
 	}
 
-	exists, _, err := sqlbase.LookupObjectID(params.ctx, params.p.txn, dbID, schemaID, tableName)
+	exists, id, err := sqlbase.LookupObjectID(
+		params.ctx, params.p.txn, params.ExecCfg().Codec, dbID, schemaID, tableName)
 	if err == nil && exists {
+		// Try and see what kind of object we collided with.
+		desc, err := getDescriptorByID(params.ctx, params.p.txn, params.ExecCfg().Codec, id)
+		if err != nil {
+			return nil, 0, err
+		}
 		// Still return data in this case.
-		return tKey, schemaID, sqlbase.NewRelationAlreadyExistsError(tableName)
+		return tKey, schemaID, makeObjectAlreadyExistsError(desc, tableName)
 	} else if err != nil {
 		return nil, 0, err
 	}
@@ -321,7 +327,7 @@ func (n *createTableNode) startExec(params runParams) error {
 
 	// Descriptor written to store here.
 	if err := params.p.createDescriptorWithID(
-		params.ctx, tKey.Key(), id, &desc, params.EvalContext().Settings,
+		params.ctx, tKey.Key(params.ExecCfg().Codec), id, &desc, params.EvalContext().Settings,
 		tree.AsStringWithFQNames(n.n, params.Ann()),
 	); err != nil {
 		return err
@@ -344,7 +350,7 @@ func (n *createTableNode) startExec(params runParams) error {
 		}
 	}
 
-	if err := desc.Validate(params.ctx, params.p.txn); err != nil {
+	if err := desc.Validate(params.ctx, params.p.txn, params.ExecCfg().Codec); err != nil {
 		return err
 	}
 
@@ -502,18 +508,18 @@ func (p *planner) resolveFK(
 }
 
 func qualifyFKColErrorWithDB(
-	ctx context.Context, txn *kv.Txn, tbl *sqlbase.TableDescriptor, col string,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, tbl *sqlbase.TableDescriptor, col string,
 ) string {
 	if txn == nil {
 		return tree.ErrString(tree.NewUnresolvedName(tbl.Name, col))
 	}
 
 	// TODO(solon): this ought to use a database cache.
-	db, err := sqlbase.GetDatabaseDescFromID(ctx, txn, tbl.ParentID)
+	db, err := sqlbase.GetDatabaseDescFromID(ctx, txn, codec, tbl.ParentID)
 	if err != nil {
 		return tree.ErrString(tree.NewUnresolvedName(tbl.Name, col))
 	}
-	schema, err := schema.ResolveNameByID(ctx, txn, db.ID, tbl.GetParentSchemaID())
+	schema, err := schema.ResolveNameByID(ctx, txn, codec, db.ID, tbl.GetParentSchemaID())
 	if err != nil {
 		return tree.ErrString(tree.NewUnresolvedName(tbl.Name, col))
 	}
@@ -545,7 +551,7 @@ func (p *planner) MaybeUpgradeDependentOldForeignKeyVersionTables(
 	maybeUpgradeFKRepresentation := func(id sqlbase.ID) error {
 		// Read the referenced table and see if the foreign key representation has changed. If it has, write
 		// the upgraded descriptor back to disk.
-		tbl, didUpgrade, err := sqlbase.GetTableDescFromIDWithFKsChanged(ctx, p.txn, id)
+		tbl, didUpgrade, err := sqlbase.GetTableDescFromIDWithFKsChanged(ctx, p.txn, p.ExecCfg().Codec, id)
 		if err != nil {
 			return err
 		}
@@ -610,19 +616,19 @@ func ResolveFK(
 	validationBehavior tree.ValidationBehavior,
 	evalCtx *tree.EvalContext,
 ) error {
-	originColumnIDs := make(sqlbase.ColumnIDs, len(d.FromCols))
+	originCols := make([]*sqlbase.ColumnDescriptor, len(d.FromCols))
 	for i, col := range d.FromCols {
-		col, _, err := tbl.FindColumnByName(col)
+		col, err := tbl.FindActiveOrNewColumnByName(col)
 		if err != nil {
 			return err
 		}
 		if err := col.CheckCanBeFKRef(); err != nil {
 			return err
 		}
-		originColumnIDs[i] = col.ID
+		originCols[i] = col
 	}
 
-	target, err := ResolveMutableExistingObject(ctx, sc, &d.Table, true /*required*/, ResolveRequireTableDesc)
+	target, err := ResolveMutableExistingTableObject(ctx, sc, &d.Table, true /*required*/, ResolveRequireTableDesc)
 	if err != nil {
 		return err
 	}
@@ -660,33 +666,28 @@ func ResolveFK(
 		}
 	}
 
-	srcCols, err := tbl.FindActiveColumnsByNames(d.FromCols)
-	if err != nil {
-		return err
-	}
-
-	targetColNames := d.ToCols
+	referencedColNames := d.ToCols
 	// If no columns are specified, attempt to default to PK.
-	if len(targetColNames) == 0 {
-		targetColNames = make(tree.NameList, len(target.PrimaryIndex.ColumnNames))
+	if len(referencedColNames) == 0 {
+		referencedColNames = make(tree.NameList, len(target.PrimaryIndex.ColumnNames))
 		for i, n := range target.PrimaryIndex.ColumnNames {
-			targetColNames[i] = tree.Name(n)
+			referencedColNames[i] = tree.Name(n)
 		}
 	}
 
-	targetCols, err := target.FindActiveColumnsByNames(targetColNames)
+	referencedCols, err := target.FindActiveColumnsByNames(referencedColNames)
 	if err != nil {
 		return err
 	}
 
-	if len(targetCols) != len(srcCols) {
+	if len(referencedCols) != len(originCols) {
 		return pgerror.Newf(pgcode.Syntax,
 			"%d columns must reference exactly %d columns in referenced table (found %d)",
-			len(srcCols), len(srcCols), len(targetCols))
+			len(originCols), len(originCols), len(referencedCols))
 	}
 
-	for i := range srcCols {
-		if s, t := srcCols[i], targetCols[i]; !s.Type.Equivalent(&t.Type) {
+	for i := range originCols {
+		if s, t := originCols[i], referencedCols[i]; !s.Type.Equivalent(t.Type) {
 			return pgerror.Newf(pgcode.DatatypeMismatch,
 				"type of %q (%s) does not match foreign key %q.%q (%s)",
 				s.Name, s.Type.String(), target.Name, t.Name, t.Type.String())
@@ -698,7 +699,7 @@ func ResolveFK(
 	// or else we can hit other checks that break things with
 	// undesired error codes, e.g. #42858.
 	// It may be removable after #37255 is complete.
-	constraintInfo, err := tbl.GetConstraintInfo(ctx, nil)
+	constraintInfo, err := tbl.GetConstraintInfo(ctx, nil, evalCtx.Codec)
 	if err != nil {
 		return err
 	}
@@ -717,17 +718,17 @@ func ResolveFK(
 		}
 	}
 
-	targetColIDs := make(sqlbase.ColumnIDs, len(targetCols))
-	for i := range targetCols {
-		targetColIDs[i] = targetCols[i].ID
+	targetColIDs := make(sqlbase.ColumnIDs, len(referencedCols))
+	for i := range referencedCols {
+		targetColIDs[i] = referencedCols[i].ID
 	}
 
 	// Don't add a SET NULL action on an index that has any column that is NOT
 	// NULL.
 	if d.Actions.Delete == tree.SetNull || d.Actions.Update == tree.SetNull {
-		for _, sourceColumn := range srcCols {
-			if !sourceColumn.Nullable {
-				col := qualifyFKColErrorWithDB(ctx, txn, tbl.TableDesc(), sourceColumn.Name)
+		for _, originColumn := range originCols {
+			if !originColumn.Nullable {
+				col := qualifyFKColErrorWithDB(ctx, txn, evalCtx.Codec, tbl.TableDesc(), originColumn.Name)
 				return pgerror.Newf(pgcode.InvalidForeignKey,
 					"cannot add a SET NULL cascading action on column %q which has a NOT NULL constraint", col,
 				)
@@ -738,11 +739,11 @@ func ResolveFK(
 	// Don't add a SET DEFAULT action on an index that has any column that has
 	// a DEFAULT expression of NULL and a NOT NULL constraint.
 	if d.Actions.Delete == tree.SetDefault || d.Actions.Update == tree.SetDefault {
-		for _, sourceColumn := range srcCols {
+		for _, originColumn := range originCols {
 			// Having a default expression of NULL, and a constraint of NOT NULL is a
 			// contradiction and should never be allowed.
-			if sourceColumn.DefaultExpr == nil && !sourceColumn.Nullable {
-				col := qualifyFKColErrorWithDB(ctx, txn, tbl.TableDesc(), sourceColumn.Name)
+			if originColumn.DefaultExpr == nil && !originColumn.Nullable {
+				col := qualifyFKColErrorWithDB(ctx, txn, evalCtx.Codec, tbl.TableDesc(), originColumn.Name)
 				return pgerror.Newf(pgcode.InvalidForeignKey,
 					"cannot add a SET DEFAULT cascading action on column %q which has a "+
 						"NOT NULL constraint and a NULL default expression", col,
@@ -751,10 +752,15 @@ func ResolveFK(
 		}
 	}
 
+	originColumnIDs := make(sqlbase.ColumnIDs, len(originCols))
+	for i, col := range originCols {
+		originColumnIDs[i] = col.ID
+	}
 	var legacyOriginIndexID sqlbase.IndexID
 	// Search for an index on the origin table that matches. If one doesn't exist,
-	// we create one automatically if the table to alter is new or empty.
-	originIdx, err := sqlbase.FindFKOriginIndex(tbl.TableDesc(), originColumnIDs)
+	// we create one automatically if the table to alter is new or empty. We also
+	// search if an index for the set of columns was created in this transaction.
+	originIdx, err := sqlbase.FindFKOriginIndexInTxn(tbl, originColumnIDs)
 	if err == nil {
 		// If there was no error, we found a suitable index.
 		legacyOriginIndexID = originIdx.ID
@@ -777,7 +783,7 @@ func ResolveFK(
 			return pgerror.Newf(pgcode.ForeignKeyViolation,
 				"foreign key requires an existing index on columns %s", colNames.String())
 		}
-		id, err := addIndexForFK(tbl, srcCols, constraintName, ts)
+		id, err := addIndexForFK(tbl, originCols, constraintName, ts)
 		if err != nil {
 			return err
 		}
@@ -827,7 +833,7 @@ func ResolveFK(
 // that will support using `srcCols` as the referencing (src) side of an FK.
 func addIndexForFK(
 	tbl *sqlbase.MutableTableDescriptor,
-	srcCols []sqlbase.ColumnDescriptor,
+	srcCols []*sqlbase.ColumnDescriptor,
 	constraintName string,
 	ts FKTableState,
 ) (sqlbase.IndexID, error) {
@@ -897,7 +903,7 @@ func addInterleave(
 			7854, "unsupported shorthand %s", interleave.DropBehavior)
 	}
 
-	parentTable, err := ResolveExistingObject(
+	parentTable, err := ResolveExistingTableObject(
 		ctx, vt, &interleave.Parent, tree.ObjectLookupFlagsWithRequired(), ResolveRequireTableDesc,
 	)
 	if err != nil {
@@ -949,7 +955,7 @@ func addInterleave(
 				strings.Join(index.ColumnNames, ", "),
 			)
 		}
-		if !col.Type.Identical(&targetCol.Type) || index.ColumnDirections[i] != parentIndex.ColumnDirections[i] {
+		if !col.Type.Identical(targetCol.Type) || index.ColumnDirections[i] != parentIndex.ColumnDirections[i] {
 			return pgerror.Newf(
 				pgcode.InvalidSchemaDefinition,
 				"declared interleaved columns (%s) must match type and sort direction of the parent's primary index (%s)",
@@ -1363,7 +1369,7 @@ func MakeTableDesc(
 	// Now that we've constructed our columns, we pop into any of our computed
 	// columns so that we can dequalify any column references.
 	sourceInfo := sqlbase.NewSourceInfoForSingleTable(
-		n.Table, sqlbase.ResultColumnsFromColDescs(desc.Columns),
+		n.Table, sqlbase.ResultColumnsFromColDescs(desc.GetID(), desc.Columns),
 	)
 
 	for i := range desc.Columns {
@@ -1972,6 +1978,18 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 	return newDefs, nil
 }
 
+func makeObjectAlreadyExistsError(collidingObject sqlbase.DescriptorProto, name string) error {
+	switch collidingObject.(type) {
+	case *TableDescriptor:
+		return sqlbase.NewRelationAlreadyExistsError(name)
+	case *TypeDescriptor:
+		return sqlbase.NewTypeAlreadyExistsError(name)
+	case *DatabaseDescriptor:
+		return sqlbase.NewDatabaseAlreadyExistsError(name)
+	}
+	return nil
+}
+
 // dummyColumnItem is used in MakeCheckConstraint to construct an expression
 // that can be both type-checked and examined for variable expressions.
 type dummyColumnItem struct {
@@ -2016,7 +2034,7 @@ func makeShardColumnDesc(colNames []string, buckets int) (*sqlbase.ColumnDescrip
 	col := &sqlbase.ColumnDescriptor{
 		Hidden:   true,
 		Nullable: false,
-		Type:     *types.Int4,
+		Type:     types.Int4,
 	}
 	col.Name = sqlbase.GetShardColumnName(colNames, int32(buckets))
 	col.ComputeExpr = makeHashShardComputeExpr(colNames, buckets)
@@ -2297,7 +2315,7 @@ func replaceVars(
 		}
 		colIDs[col.ID] = struct{}{}
 		// Convert to a dummy node of the correct type.
-		return false, &dummyColumnItem{typ: &col.Type, name: c.ColumnName}, nil
+		return false, &dummyColumnItem{typ: col.Type, name: c.ColumnName}, nil
 	})
 	return newExpr, colIDs, err
 }
@@ -2339,7 +2357,10 @@ func MakeCheckConstraint(
 	sort.Sort(sqlbase.ColumnIDs(colIDs))
 
 	sourceInfo := sqlbase.NewSourceInfoForSingleTable(
-		tableName, sqlbase.ResultColumnsFromColDescs(desc.TableDesc().AllNonDropColumns()),
+		tableName, sqlbase.ResultColumnsFromColDescs(
+			desc.GetID(),
+			desc.TableDesc().AllNonDropColumns(),
+		),
 	)
 
 	expr, err = dequalifyColumnRefs(ctx, sourceInfo, d.Expr)

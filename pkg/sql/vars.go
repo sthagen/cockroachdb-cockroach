@@ -216,8 +216,9 @@ var varGen = map[string]sessionVar{
 
 			if len(dbName) != 0 {
 				// Verify database descriptor exists.
-				if _, err := evalCtx.schemaAccessors.logical.GetDatabaseDesc(ctx, evalCtx.Txn,
-					dbName, tree.DatabaseLookupFlags{Required: true}); err != nil {
+				if _, err := evalCtx.schemaAccessors.logical.GetDatabaseDesc(
+					ctx, evalCtx.Txn, evalCtx.Codec, dbName, tree.DatabaseLookupFlags{Required: true},
+				); err != nil {
 					return "", err
 				}
 			}
@@ -449,7 +450,7 @@ var varGen = map[string]sessionVar{
 			mode, ok := sessiondata.VectorizeExecModeFromString(s)
 			if !ok {
 				return newVarValueError(`vectorize`, s,
-					"off", "auto", "on", "experimental_always")
+					"off", "201auto", "on", "experimental_always")
 			}
 			m.SetVectorize(mode)
 			return nil
@@ -538,6 +539,29 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(optDrivenFKCascadesClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`foreign_key_cascades_limit`: {
+		GetStringVal: makeIntGetStringValFn(`foreign_key_cascades_limit`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return err
+			}
+			if b < 0 {
+				return pgerror.Newf(pgcode.InvalidParameterValue,
+					"cannot set foreign_key_cascades_limit to a negative value: %d", b)
+			}
+			m.SetOptimizerFKCascadesLimit(int(b))
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return strconv.FormatInt(int64(evalCtx.SessionData.OptimizerFKCascadesLimit), 10)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return strconv.FormatInt(optDrivenFKCascadesClusterLimit.Get(sv), 10)
 		},
 	},
 

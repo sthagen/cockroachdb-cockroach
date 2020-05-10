@@ -37,7 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // TestingGetDescriptorFromDB is a wrapper for getDescriptorFromDB.
@@ -74,7 +74,7 @@ func getDescriptorFromDB(
 			keys.RootNamespaceID,
 			dbName,
 		).Scan(&dbDescBytes); err != nil {
-			if err == gosql.ErrNoRows {
+			if errors.Is(err, gosql.ErrNoRows) {
 				continue
 			}
 			return nil, errors.Wrap(err, "fetch database descriptor")
@@ -347,7 +347,7 @@ func insertStmtToKVs(
 				return errors.Errorf("unsupported expr: %q", expr)
 			}
 			var err error
-			insertRow[i], err = c.ResolveAsType(nil, &tableDesc.Columns[i].Type)
+			insertRow[i], err = c.ResolveAsType(nil, tableDesc.Columns[i].Type)
 			if err != nil {
 				return err
 			}

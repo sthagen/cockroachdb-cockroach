@@ -17,7 +17,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -49,7 +48,7 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 		expr         string
 		inputCols    []int
 		inputTuples  tuples
-		inputTypes   []types.T
+		inputTypes   []*types.T
 		outputTuples tuples
 	}{
 		{
@@ -57,7 +56,7 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 			expr:         "abs(@1)",
 			inputCols:    []int{0},
 			inputTuples:  tuples{{1}, {-2}},
-			inputTypes:   []types.T{*types.Int},
+			inputTypes:   []*types.T{types.Int},
 			outputTuples: tuples{{1, 1}, {-2, 2}},
 		},
 		{
@@ -65,7 +64,7 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 			expr:         "length(@1)",
 			inputCols:    []int{0},
 			inputTuples:  tuples{{"Hello"}, {"The"}},
-			inputTypes:   []types.T{*types.String},
+			inputTypes:   []*types.T{types.String},
 			outputTuples: tuples{{"Hello", 5}, {"The", 3}},
 		},
 	}
@@ -95,7 +94,7 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 		},
 	}
 
-	batch := testAllocator.NewMemBatch([]types.T{*types.Int})
+	batch := testAllocator.NewMemBatch([]*types.T{types.Int})
 	col := batch.ColVec(0).Int64()
 
 	for i := 0; i < coldata.BatchSize(); i++ {
@@ -124,7 +123,7 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 		}
 	}
 
-	typs := []types.T{*types.Int}
+	typs := []*types.T{types.Int}
 	source := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
 	op, err := createTestProjectingOperator(
 		ctx, flowCtx, source, typs,
@@ -157,7 +156,7 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 	ctx := context.Background()
 	tctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 
-	typs := []types.T{*types.String, *types.Int, *types.Int}
+	typs := []*types.T{types.String, types.Int, types.Int}
 	batch := testAllocator.NewMemBatch(typs)
 	outputIdx := 3
 	bCol := batch.ColVec(0).Bytes()
@@ -185,17 +184,16 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 		b.Fatal(err)
 	}
 	defaultOp := &defaultBuiltinFuncOperator{
-		OneInputNode:   NewOneInputNode(source),
-		allocator:      testAllocator,
-		evalCtx:        tctx,
-		funcExpr:       typedExpr.(*tree.FuncExpr),
-		outputIdx:      outputIdx,
-		columnTypes:    typs,
-		outputType:     types.String,
-		outputPhysType: coltypes.Bytes,
-		converter:      getDatumToPhysicalFn(types.String),
-		row:            make(tree.Datums, outputIdx),
-		argumentCols:   inputCols,
+		OneInputNode: NewOneInputNode(source),
+		allocator:    testAllocator,
+		evalCtx:      tctx,
+		funcExpr:     typedExpr.(*tree.FuncExpr),
+		outputIdx:    outputIdx,
+		columnTypes:  typs,
+		outputType:   types.String,
+		converter:    getDatumToPhysicalFn(types.String),
+		row:          make(tree.Datums, outputIdx),
+		argumentCols: inputCols,
 	}
 	defaultOp.Init()
 

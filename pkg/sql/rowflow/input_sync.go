@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type srcInfo struct {
@@ -68,7 +68,7 @@ type orderedSynchronizer struct {
 
 	sources []srcInfo
 
-	types []types.T
+	types []*types.T
 
 	// state dictates the operation mode.
 	state orderedSynchronizerState
@@ -99,7 +99,7 @@ type orderedSynchronizer struct {
 var _ execinfra.RowSource = &orderedSynchronizer{}
 
 // OutputTypes is part of the RowSource interface.
-func (s *orderedSynchronizer) OutputTypes() []types.T {
+func (s *orderedSynchronizer) OutputTypes() []*types.T {
 	return s.types
 }
 

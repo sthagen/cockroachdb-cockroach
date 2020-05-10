@@ -143,6 +143,7 @@ type LeaseStore struct {
 	clock            *hlc.Clock
 	internalExecutor sqlutil.InternalExecutor
 	settings         *cluster.Settings
+	codec            keys.SQLCodec
 
 	// group is used for all calls made to acquireNodeLease to prevent
 	// concurrent lease acquisitions from the store.
@@ -198,14 +199,14 @@ func (s LeaseStore) acquire(
 			expiration = minExpiration.Add(int64(time.Millisecond), 0)
 		}
 
-		tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+		tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, s.codec, tableID)
 		if err != nil {
 			return err
 		}
 		if err := FilterTableState(tableDesc); err != nil {
 			return err
 		}
-		if err := tableDesc.MaybeFillInDescriptor(ctx, txn); err != nil {
+		if err := tableDesc.MaybeFillInDescriptor(ctx, txn, s.codec); err != nil {
 			return err
 		}
 		// Once the descriptor is set it is immutable and care must be taken
@@ -317,7 +318,7 @@ func (s LeaseStore) WaitForOneVersion(
 		// Get the current version of the table descriptor non-transactionally.
 		//
 		// TODO(pmattis): Do an inconsistent read here?
-		tableDesc, err = sqlbase.GetTableDescFromID(ctx, s.db, tableID)
+		tableDesc, err = sqlbase.GetTableDescFromID(ctx, s.db, s.codec, tableID)
 		if err != nil {
 			return 0, err
 		}
@@ -391,7 +392,7 @@ func (s LeaseStore) PublishMultiple(
 				// Re-read the current versions of the table descriptor, this time
 				// transactionally.
 				var err error
-				descsToUpdate[id], err = sqlbase.GetMutableTableDescFromID(ctx, txn, id)
+				descsToUpdate[id], err = sqlbase.GetMutableTableDescFromID(ctx, txn, s.codec, id)
 				if err != nil {
 					return err
 				}
@@ -435,7 +436,7 @@ func (s LeaseStore) PublishMultiple(
 
 			b := txn.NewBatch()
 			for tableID, tableDesc := range tableDescs {
-				if err := writeDescToBatch(ctx, false /* kvTrace */, s.settings, b, tableID, tableDesc.TableDesc()); err != nil {
+				if err := writeDescToBatch(ctx, false /* kvTrace */, s.settings, b, s.codec, tableID, tableDesc.TableDesc()); err != nil {
 					return err
 				}
 			}
@@ -458,14 +459,14 @@ func (s LeaseStore) PublishMultiple(
 			return txn.CommitInBatch(ctx, b)
 		})
 
-		switch err {
-		case nil, errDidntUpdateDescriptor:
+		switch {
+		case err == nil || errors.Is(err, errDidntUpdateDescriptor):
 			immutTableDescs := make(map[sqlbase.ID]*ImmutableTableDescriptor)
 			for id, tableDesc := range tableDescs {
 				immutTableDescs[id] = sqlbase.NewImmutableTableDescriptor(tableDesc.TableDescriptor)
 			}
 			return immutTableDescs, nil
-		case errLeaseVersionChanged:
+		case errors.Is(err, errLeaseVersionChanged):
 			// will loop around to retry
 		default:
 			return nil, err
@@ -568,7 +569,7 @@ func (s LeaseStore) getForExpiration(
 ) (*tableVersionState, error) {
 	var table *tableVersionState
 	err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		descKey := sqlbase.MakeDescMetadataKey(id)
+		descKey := sqlbase.MakeDescMetadataKey(s.codec, id)
 		prevTimestamp := expiration.Prev()
 		txn.SetFixedTimestamp(ctx, prevTimestamp)
 		var desc sqlbase.Descriptor
@@ -583,7 +584,7 @@ func (s LeaseStore) getForExpiration(
 		if prevTimestamp.LessEq(tableDesc.ModificationTime) {
 			return errors.AssertionFailedf("unable to read table= (%d, %s)", id, expiration)
 		}
-		if err := tableDesc.MaybeFillInDescriptor(ctx, txn); err != nil {
+		if err := tableDesc.MaybeFillInDescriptor(ctx, txn, s.codec); err != nil {
 			return err
 		}
 		// Create a tableVersionState with the table and without a lease.
@@ -1166,8 +1167,7 @@ func purgeOldVersions(
 	// active lease, so that it doesn't get released when removeInactives()
 	// is called below. Release this lease after calling removeInactives().
 	table, _, err := t.findForTimestamp(ctx, m.clock.Now())
-	if _, ok := err.(*inactiveTableError); ok || err == nil {
-		isInactive := ok
+	if isInactive := errors.HasType(err, (*inactiveTableError)(nil)); err == nil || isInactive {
 		removeInactives(isInactive)
 		if table != nil {
 			s, err := t.release(&table.ImmutableTableDescriptor, m.removeOnceDereferenced())
@@ -1431,6 +1431,7 @@ func NewLeaseManager(
 	clock *hlc.Clock,
 	internalExecutor sqlutil.InternalExecutor,
 	settings *cluster.Settings,
+	codec keys.SQLCodec,
 	testingKnobs LeaseManagerTestingKnobs,
 	stopper *stop.Stopper,
 	cfg *base.LeaseManagerConfig,
@@ -1442,6 +1443,7 @@ func NewLeaseManager(
 			clock:               clock,
 			internalExecutor:    internalExecutor,
 			settings:            settings,
+			codec:               codec,
 			group:               &singleflight.Group{},
 			leaseDuration:       cfg.TableDescriptorLeaseDuration,
 			leaseJitterFraction: cfg.TableDescriptorLeaseJitterFraction,
@@ -1622,7 +1624,7 @@ func (m *LeaseManager) resolveName(
 		txn.SetFixedTimestamp(ctx, timestamp)
 		var found bool
 		var err error
-		found, id, err = sqlbase.LookupObjectID(ctx, txn, dbID, schemaID, tableName)
+		found, id, err = sqlbase.LookupObjectID(ctx, txn, m.codec, dbID, schemaID, tableName)
 		if err != nil {
 			return err
 		}
@@ -1668,8 +1670,8 @@ func (m *LeaseManager) Acquire(
 			}
 			return &table.ImmutableTableDescriptor, table.expiration, nil
 		}
-		switch err {
-		case errRenewLease:
+		switch {
+		case errors.Is(err, errRenewLease):
 			// Renew lease and retry. This will block until the lease is acquired.
 			if _, errLease := acquireNodeLease(ctx, m, tableID); errLease != nil {
 				return nil, hlc.Timestamp{}, errLease
@@ -1678,7 +1680,7 @@ func (m *LeaseManager) Acquire(
 				m.testingKnobs.LeaseStoreTestingKnobs.LeaseAcquireResultBlockEvent(LeaseAcquireBlock)
 			}
 
-		case errReadOlderTableVersion:
+		case errors.Is(err, errReadOlderTableVersion):
 			// Read old table versions from the store. This can block while reading
 			// old table versions from the store.
 			versions, errRead := m.readOlderVersionForTimestamp(ctx, tableID, timestamp)
@@ -1770,16 +1772,16 @@ func (m *LeaseManager) findTableState(tableID sqlbase.ID, create bool) *tableSta
 
 // RefreshLeases starts a goroutine that refreshes the lease manager
 // leases for tables received in the latest system configuration via gossip.
-func (m *LeaseManager) RefreshLeases(s *stop.Stopper, db *kv.DB, g *gossip.Gossip) {
+func (m *LeaseManager) RefreshLeases(s *stop.Stopper, db *kv.DB, gw gossip.DeprecatedGossip) {
 	ctx := context.TODO()
 	s.RunWorker(ctx, func(ctx context.Context) {
-		descKeyPrefix := keys.TODOSQLCodec.TablePrefix(uint32(sqlbase.DescriptorTable.ID))
+		descKeyPrefix := m.codec.TablePrefix(uint32(sqlbase.DescriptorTable.ID))
 		cfgFilter := gossip.MakeSystemConfigDeltaFilter(descKeyPrefix)
-		gossipUpdateC := g.RegisterSystemConfigChannel()
+		gossipUpdateC := gw.DeprecatedRegisterSystemConfigChannel(47150)
 		for {
 			select {
 			case <-gossipUpdateC:
-				cfg := g.GetSystemConfig()
+				cfg := gw.DeprecatedSystemConfig(47150)
 				if m.testingKnobs.GossipUpdateEvent != nil {
 					if err := m.testingKnobs.GossipUpdateEvent(cfg); err != nil {
 						break
@@ -1803,7 +1805,7 @@ func (m *LeaseManager) RefreshLeases(s *stop.Stopper, db *kv.DB, g *gossip.Gossi
 						// Note that we don't need to "fill in" the descriptor here. Nobody
 						// actually reads the table, but it's necessary for the call to
 						// ValidateTable().
-						if err := table.MaybeFillInDescriptor(ctx, nil); err != nil {
+						if err := table.MaybeFillInDescriptor(ctx, nil, m.codec); err != nil {
 							log.Warningf(ctx, "%s: unable to fill in table descriptor %v", kv.Key, table)
 							return
 						}

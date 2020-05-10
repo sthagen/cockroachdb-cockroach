@@ -17,7 +17,6 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
@@ -26,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 var (
@@ -55,7 +54,7 @@ type decimalOverloadScratch struct {
 // vectors on inputBatch as well (in which case windowedBatch will also have a
 // "windowed" selection vector).
 func makeWindowIntoBatch(
-	windowedBatch, inputBatch coldata.Batch, startIdx int, inputTypes []types.T,
+	windowedBatch, inputBatch coldata.Batch, startIdx int, inputTypes []*types.T,
 ) {
 	inputBatchLen := inputBatch.Length()
 	windowStart := startIdx
@@ -78,8 +77,8 @@ func makeWindowIntoBatch(
 	} else {
 		windowedBatch.SetSelection(false)
 	}
-	for i, typ := range inputTypes {
-		window := inputBatch.ColVec(i).Window(typeconv.FromColumnType(&typ), windowStart, windowEnd)
+	for i := range inputTypes {
+		window := inputBatch.ColVec(i).Window(windowStart, windowEnd)
 		windowedBatch.ReplaceCol(window, i)
 	}
 	windowedBatch.SetLength(inputBatchLen - startIdx)
@@ -87,7 +86,7 @@ func makeWindowIntoBatch(
 
 func newPartitionerToOperator(
 	allocator *colmem.Allocator,
-	types []types.T,
+	types []*types.T,
 	partitioner colcontainer.PartitionedQueue,
 	partitionIdx int,
 ) *partitionerToOperator {
@@ -122,7 +121,7 @@ func (p *partitionerToOperator) Next(ctx context.Context) coldata.Batch {
 }
 
 func newAppendOnlyBufferedBatch(
-	allocator *colmem.Allocator, typs []types.T, initialSize int,
+	allocator *colmem.Allocator, typs []*types.T, initialSize int,
 ) *appendOnlyBufferedBatch {
 	batch := allocator.NewMemBatchWithSize(typs, initialSize)
 	return &appendOnlyBufferedBatch{
@@ -136,7 +135,7 @@ func newAppendOnlyBufferedBatch(
 // used by operators that buffer many tuples into a single batch by appending
 // to it. It stores the length of the batch separately and intercepts calls to
 // Length() and SetLength() in order to avoid updating offsets on vectors of
-// *types.Bytes type - which would result in a quadratic behavior - because
+// types.Bytes type - which would result in a quadratic behavior - because
 // it is not necessary since coldata.Vec.Append maintains the correct offsets.
 //
 // Note: "appendOnly" in the name indicates that the tuples should *only* be
@@ -148,7 +147,7 @@ type appendOnlyBufferedBatch struct {
 
 	length  int
 	colVecs []coldata.Vec
-	typs    []types.T
+	typs    []*types.T
 }
 
 var _ coldata.Batch = &appendOnlyBufferedBatch{}
@@ -185,7 +184,6 @@ func (b *appendOnlyBufferedBatch) append(batch coldata.Batch, startIdx, endIdx i
 	for i, colVec := range b.colVecs {
 		colVec.Append(
 			coldata.SliceArgs{
-				ColType:     typeconv.FromColumnType(&b.typs[i]),
 				Src:         batch.ColVec(i),
 				Sel:         batch.Selection(),
 				DestIdx:     b.length,

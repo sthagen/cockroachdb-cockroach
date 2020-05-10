@@ -44,6 +44,7 @@ const (
 type Overload struct {
 	Types      TypeList
 	ReturnType ReturnTyper
+	Volatility Volatility
 
 	// PreferredOverload determines overload resolution as follows.
 	// When multiple overloads are eligible based on types even after all of of
@@ -101,7 +102,7 @@ func (b Overload) Signature(simplify bool) string {
 	retType := b.FixedReturnType()
 	if simplify {
 		if retType.Family() == types.TupleFamily && len(retType.TupleContents()) == 1 {
-			retType = &retType.TupleContents()[0]
+			retType = retType.TupleContents()[0]
 		}
 	}
 	return fmt.Sprintf("(%s) -> %s", b.Types.String(), retType)

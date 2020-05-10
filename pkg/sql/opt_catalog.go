@@ -74,11 +74,7 @@ func (oc *optCatalog) reset() {
 		oc.dataSources = make(map[*sqlbase.ImmutableTableDescriptor]cat.DataSource)
 	}
 
-	g := oc.planner.execCfg.Gossip.Deprecated(47150)
-	// Gossip can be nil in testing scenarios.
-	if g != nil {
-		oc.cfg = g.GetSystemConfig()
-	}
+	oc.cfg = oc.planner.execCfg.Gossip.DeprecatedSystemConfig(47150)
 }
 
 // optSchema is a wrapper around sqlbase.DatabaseDescriptor that implements the
@@ -114,8 +110,10 @@ func (os *optSchema) Name() *cat.SchemaName {
 // GetDataSourceNames is part of the cat.Schema interface.
 func (os *optSchema) GetDataSourceNames(ctx context.Context) ([]cat.DataSourceName, error) {
 	return GetObjectNames(
-		ctx, os.planner.Txn(),
+		ctx,
+		os.planner.Txn(),
 		os.planner,
+		os.planner.ExecCfg().Codec,
 		os.desc,
 		os.name.Schema(),
 		true, /* explicitPrefix */
@@ -172,7 +170,7 @@ func (oc *optCatalog) ResolveDataSource(
 	}
 
 	oc.tn = *name
-	desc, err := ResolveExistingObject(ctx, oc.planner, &oc.tn, tree.ObjectLookupFlagsWithRequired(), ResolveAnyDescType)
+	desc, err := ResolveExistingTableObject(ctx, oc.planner, &oc.tn, tree.ObjectLookupFlagsWithRequired(), ResolveAnyDescType)
 	if err != nil {
 		return nil, cat.DataSourceName{}, err
 	}
@@ -197,7 +195,7 @@ func (oc *optCatalog) ResolveDataSourceByID(
 	tableLookup, err := oc.planner.LookupTableByID(ctx, sqlbase.ID(dataSourceID))
 
 	if err != nil || tableLookup.IsAdding {
-		if err == sqlbase.ErrDescriptorNotFound || tableLookup.IsAdding {
+		if errors.Is(err, sqlbase.ErrDescriptorNotFound) || tableLookup.IsAdding {
 			return nil, tableLookup.IsAdding, sqlbase.NewUndefinedRelationError(&tree.TableRef{TableID: int64(dataSourceID)})
 		}
 		return nil, false, err
@@ -290,7 +288,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 	}
 
 	dbID := desc.ParentID
-	dbDesc, err := sqlbase.GetDatabaseDescFromID(ctx, txn, dbID)
+	dbDesc, err := sqlbase.GetDatabaseDescFromID(ctx, txn, oc.codec(), dbID)
 	if err != nil {
 		return cat.DataSourceName{}, err
 	}
@@ -370,7 +368,7 @@ func (oc *optCatalog) dataSourceForTable(
 		return ds, nil
 	}
 
-	ds, err := newOptTable(desc, oc.planner.ExecCfg().Codec, tableStats, zoneConfig)
+	ds, err := newOptTable(desc, oc.codec(), tableStats, zoneConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -402,6 +400,10 @@ func (oc *optCatalog) getZoneConfig(
 		zone = emptyZoneConfig
 	}
 	return zone, err
+}
+
+func (oc *optCatalog) codec() keys.SQLCodec {
+	return oc.planner.ExecCfg().Codec
 }
 
 // optView is a wrapper around sqlbase.ImmutableTableDescriptor that implements

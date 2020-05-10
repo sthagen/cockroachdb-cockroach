@@ -129,7 +129,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 	descriptorChanged := false
 	origNumMutations := len(n.tableDesc.Mutations)
 	var droppedViews []string
-	tn := params.p.ResolvedName(n.n.Table)
+	resolved := params.p.ResolvedName(n.n.Table)
+	tn, ok := resolved.(*tree.TableName)
+	if !ok {
+		return errors.AssertionFailedf(
+			"%q was not resolved as a table but is %T", resolved, resolved)
+	}
 
 	for i, cmd := range n.n.Cmds {
 		telemetry.Inc(cmd.TelemetryCounter())
@@ -141,10 +146,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 		switch t := cmd.(type) {
 		case *tree.AlterTableAddColumn:
 			d := t.ColumnDef
-			if d.HasFKConstraint() {
-				return unimplemented.NewWithIssue(32917,
-					"adding a REFERENCES constraint while also adding a column via ALTER not supported")
-			}
 			version := params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx)
 			toType, err := tree.ResolveType(d.Type, params.p.semaCtx.GetTypeResolver())
 			if err != nil {
@@ -215,15 +216,29 @@ func (n *alterTableNode) startExec(params runParams) error {
 					return sqlbase.NewNonNullViolationError(col.Name)
 				}
 			}
-			_, dropped, err := n.tableDesc.FindColumnByName(d.Name)
-			if err == nil {
-				if dropped {
+			_, err = n.tableDesc.FindActiveColumnByName(string(d.Name))
+			if m := n.tableDesc.FindColumnMutationByName(d.Name); m != nil {
+				switch m.Direction {
+				case sqlbase.DescriptorMutation_ADD:
+					return pgerror.Newf(pgcode.DuplicateColumn,
+						"duplicate: column %q in the middle of being added, not yet public",
+						col.Name)
+				case sqlbase.DescriptorMutation_DROP:
 					return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 						"column %q being dropped, try again later", col.Name)
+				default:
+					if err != nil {
+						return errors.AssertionFailedf(
+							"mutation in state %s, direction %s, and no column descriptor",
+							errors.Safe(m.State), errors.Safe(m.Direction))
+					}
 				}
+			}
+			if err == nil {
 				if t.IfNotExists {
 					continue
 				}
+				return sqlbase.NewColumnAlreadyExistsError(string(d.Name), n.tableDesc.Name)
 			}
 
 			n.tableDesc.AddColumnMutation(col, sqlbase.DescriptorMutation_ADD)
@@ -248,7 +263,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 		case *tree.AlterTableAddConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 			if err != nil {
 				return err
 			}
@@ -322,12 +337,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 			case *tree.ForeignKeyConstraintTableDef:
 				for _, colName := range d.FromCols {
-					col, err := n.tableDesc.FindActiveColumnByName(string(colName))
+					col, err := n.tableDesc.FindActiveOrNewColumnByName(colName)
 					if err != nil {
-						if _, dropped, inactiveErr := n.tableDesc.FindColumnByName(colName); inactiveErr == nil && !dropped {
-							return unimplemented.NewWithIssue(32917,
-								"adding a REFERENCES constraint while the column is being added not supported")
-						}
 						return err
 					}
 
@@ -587,12 +598,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 					"column %q in the middle of being added, try again later", t.Column)
 			}
-			if err := n.tableDesc.Validate(params.ctx, params.p.txn); err != nil {
+			if err := n.tableDesc.Validate(params.ctx, params.p.txn, params.ExecCfg().Codec); err != nil {
 				return err
 			}
 
 		case *tree.AlterTableDropConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 			if err != nil {
 				return err
 			}
@@ -614,12 +625,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 			descriptorChanged = true
-			if err := n.tableDesc.Validate(params.ctx, params.p.txn); err != nil {
+			if err := n.tableDesc.Validate(params.ctx, params.p.txn, params.ExecCfg().Codec); err != nil {
 				return err
 			}
 
 		case *tree.AlterTableValidateConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 			if err != nil {
 				return err
 			}
@@ -750,7 +761,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			descriptorChanged = descChanged
 
 		case *tree.AlterTableRenameConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 			if err != nil {
 				return err
 			}
@@ -933,7 +944,7 @@ func applyColumnMutation(
 			return nil
 		}
 
-		kind, err := schemachange.ClassifyConversion(&col.Type, typ)
+		kind, err := schemachange.ClassifyConversion(col.Type, typ)
 		if err != nil {
 			return err
 		}
@@ -947,7 +958,7 @@ func applyColumnMutation(
 				"the requested type conversion (%s -> %s) requires an explicit USING expression",
 				col.Type.SQLString(), typ.SQLString())
 		case schemachange.ColumnConversionTrivial:
-			col.Type = *typ
+			col.Type = typ
 		case schemachange.ColumnConversionGeneral:
 			return unimplemented.NewWithIssueDetailf(
 				9851,
@@ -971,7 +982,7 @@ func applyColumnMutation(
 		if t.Default == nil {
 			col.DefaultExpr = nil
 		} else {
-			colDatumType := &col.Type
+			colDatumType := col.Type
 			expr, err := sqlbase.SanitizeVarFreeExpr(
 				t.Default, colDatumType, "DEFAULT", &params.p.semaCtx, true, /* allowImpure */
 			)
@@ -1016,7 +1027,7 @@ func applyColumnMutation(
 			}
 		}
 
-		info, err := tableDesc.GetConstraintInfo(params.ctx, nil)
+		info, err := tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 		if err != nil {
 			return err
 		}
@@ -1051,7 +1062,7 @@ func applyColumnMutation(
 					"constraint in the middle of being dropped")
 			}
 		}
-		info, err := tableDesc.GetConstraintInfo(params.ctx, nil)
+		info, err := tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 		if err != nil {
 			return err
 		}
@@ -1226,8 +1237,10 @@ func injectTableStats(
 	// update is handled asynchronously).
 	params.extendedEvalCtx.ExecCfg.TableStatsCache.InvalidateTableStats(params.ctx, desc.ID)
 
-	return stats.GossipTableStatAdded(
-		params.extendedEvalCtx.ExecCfg.Gossip.Deprecated(47925), desc.ID)
+	if g, ok := params.extendedEvalCtx.ExecCfg.Gossip.Optional(47925); ok {
+		return stats.GossipTableStatAdded(g, desc.ID)
+	}
+	return nil
 }
 
 func (p *planner) removeColumnComment(

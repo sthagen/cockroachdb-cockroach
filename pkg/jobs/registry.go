@@ -21,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -564,7 +565,7 @@ func (r *Registry) isOrphaned(ctx context.Context, payload *jobspb.Payload) (boo
 	for _, id := range payload.DescriptorIDs {
 		pendingMutations := false
 		if err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			td, err := sqlbase.GetTableDescFromID(ctx, txn, id)
+			td, err := sqlbase.GetTableDescFromID(ctx, txn, keys.TODOSQLCodec, id)
 			if err != nil {
 				return err
 			}
@@ -832,12 +833,12 @@ func (r *Registry) stepThroughStateMachine(
 		if errors.Is(err, retryJobErrorSentinel) {
 			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), err)
 		}
-		if err, ok := errors.Cause(err).(*InvalidStatusError); ok {
-			if err.status != StatusCancelRequested && err.status != StatusPauseRequested {
-				errorMsg := fmt.Sprintf("job %d: unexpected status %s provided for a running job", *job.ID(), err.status)
+		if sErr := (*InvalidStatusError)(nil); errors.As(err, &sErr) {
+			if sErr.status != StatusCancelRequested && sErr.status != StatusPauseRequested {
+				errorMsg := fmt.Sprintf("job %d: unexpected status %s provided for a running job", *job.ID(), sErr.status)
 				return errors.NewAssertionErrorWithWrappedErrf(jobErr, errorMsg)
 			}
-			return err
+			return sErr
 		}
 		return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, StatusReverting, err)
 	case StatusPauseRequested:
@@ -893,12 +894,12 @@ func (r *Registry) stepThroughStateMachine(
 		if errors.Is(err, retryJobErrorSentinel) {
 			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), err)
 		}
-		if err, ok := errors.Cause(err).(*InvalidStatusError); ok {
-			if err.status != StatusPauseRequested {
-				errorMsg := fmt.Sprintf("job %d: unexpected status %s provided for a reverting job", *job.ID(), err.status)
+		if sErr := (*InvalidStatusError)(nil); errors.As(err, &sErr) {
+			if sErr.status != StatusPauseRequested {
+				errorMsg := fmt.Sprintf("job %d: unexpected status %s provided for a reverting job", *job.ID(), sErr.status)
 				return errors.NewAssertionErrorWithWrappedErrf(jobErr, errorMsg)
 			}
-			return err
+			return sErr
 		}
 		return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, StatusFailed, errors.Wrapf(err, "job %d: cannot be reverted, manual cleanup may be required", *job.ID()))
 	case StatusFailed:

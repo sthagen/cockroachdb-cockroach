@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -664,12 +664,12 @@ func (w *interleavedPartitioned) fetchSessionID(
 	start := timeutil.Now()
 	baseSessionID := randomSessionID(rng, locality, localPercent)
 	var sessionID string
-	if err := w.findSessionIDStatement1.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && err != gosql.ErrNoRows {
+	if err := w.findSessionIDStatement1.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && !errors.Is(err, gosql.ErrNoRows) {
 		return "", err
 	}
 	// Didn't find a next session ID, let's try the other way.
 	if len(sessionID) == 0 {
-		if err := w.findSessionIDStatement2.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && err != gosql.ErrNoRows {
+		if err := w.findSessionIDStatement2.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && !errors.Is(err, gosql.ErrNoRows) {
 			return "", err
 		}
 	}
@@ -814,12 +814,12 @@ func (w *interleavedPartitioned) sessionsInitialRow(rowIdx int) []interface{} {
 	}
 }
 
-var childTypes = []types.T{
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
+var childTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
 }
 
 func (w *interleavedPartitioned) childInitialRowBatchFunc(
@@ -847,17 +847,17 @@ func (w *interleavedPartitioned) childInitialRowBatchFunc(
 	}
 }
 
-var deviceTypes = []types.T{
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
+var deviceTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
 }
 
 func (w *interleavedPartitioned) deviceInitialRowBatch(
@@ -893,11 +893,11 @@ func (w *interleavedPartitioned) deviceInitialRowBatch(
 	}
 }
 
-var queryTypes = []types.T{
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
-	*types.Bytes,
+var queryTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
 }
 
 func (w *interleavedPartitioned) queryInitialRowBatch(

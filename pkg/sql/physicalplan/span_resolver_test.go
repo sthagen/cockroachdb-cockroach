@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -84,7 +85,9 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 
 	lr := physicalplan.NewSpanResolver(
 		s3.Cfg.Settings,
-		s3.DistSenderI().(*kvcoord.DistSender), s3.Gossip(), s3.GetNode().Descriptor, nil,
+		s3.DistSenderI().(*kvcoord.DistSender),
+		gossip.MakeExposedGossip(s3.Gossip()),
+		s3.GetNode().Descriptor, nil,
 		replicaoracle.BinPackingChoice)
 
 	var spans []spanWithDir
@@ -190,7 +193,8 @@ func TestSpanResolver(t *testing.T) {
 	rowRanges, tableDesc := setupRanges(db, s.(*server.TestServer), cdb, t)
 	lr := physicalplan.NewSpanResolver(
 		s.(*server.TestServer).Cfg.Settings,
-		s.DistSenderI().(*kvcoord.DistSender), s.GossipI().(*gossip.Gossip),
+		s.DistSenderI().(*kvcoord.DistSender),
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
 		s.(*server.TestServer).GetNode().Descriptor, nil,
 		replicaoracle.BinPackingChoice)
 
@@ -284,7 +288,8 @@ func TestMixedDirections(t *testing.T) {
 	rowRanges, tableDesc := setupRanges(db, s.(*server.TestServer), cdb, t)
 	lr := physicalplan.NewSpanResolver(
 		s.(*server.TestServer).Cfg.Settings,
-		s.DistSenderI().(*kvcoord.DistSender), s.GossipI().(*gossip.Gossip),
+		s.DistSenderI().(*kvcoord.DistSender),
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
 		s.(*server.TestServer).GetNode().Descriptor,
 		nil,
 		replicaoracle.BinPackingChoice)
@@ -327,7 +332,7 @@ func setupRanges(
 		}
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(cdb, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(cdb, keys.SystemSQLCodec, "t", "test")
 	// Split every SQL row to its own range.
 	rowRanges := make([]roachpb.RangeDescriptor, len(values))
 	for i, val := range values {

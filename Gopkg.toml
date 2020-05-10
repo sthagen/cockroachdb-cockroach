@@ -32,6 +32,12 @@ ignored = [
   "github.com/google/protobuf/examples/tutorial",
 ]
 
+[[constraint]]
+  # Stick to the master branch, otherwise dep picks up the Go-module-aware
+  # v2.0.0 which is incompatible with the non-Go-module master.
+  name = "github.com/cockroachdb/cockroach-go"
+  branch = "master"
+
 # The collation tables must never change.
 [[constraint]]
   name = "golang.org/x/text"
@@ -132,6 +138,12 @@ ignored = [
 [[constraint]]
   name = "github.com/cockroachdb/pebble"
   branch = "master"
+
+# github.com/twpayne/go-geom has a few patches which are not released yet, including
+# empty GEOMETRYCOLLECTION handling.
+[[override]]
+  name = "github.com/twpayne/go-geom"
+  revision = "3402552da1eb9d7a1c8a9ecb05395b076d8e7bf6"
 
 # github.com/lib/pq has a newer revision that has notices, which we want
 [[override]]

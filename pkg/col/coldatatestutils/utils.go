@@ -12,7 +12,6 @@ package coldatatestutils
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -20,13 +19,12 @@ import (
 // the underlying capacity might be different (a new batch is created only with
 // capacity original.Length()).
 // NOTE: memory accounting is not performed.
-func CopyBatch(original coldata.Batch, typs []types.T) coldata.Batch {
+func CopyBatch(original coldata.Batch, typs []*types.T) coldata.Batch {
 	b := coldata.NewMemBatchWithSize(typs, original.Length())
 	b.SetLength(original.Length())
 	for colIdx, col := range original.ColVecs() {
 		b.ColVec(colIdx).Copy(coldata.CopySliceArgs{
 			SliceArgs: coldata.SliceArgs{
-				ColType:   typeconv.FromColumnType(&typs[colIdx]),
 				Src:       col,
 				SrcEndIdx: original.Length(),
 			},

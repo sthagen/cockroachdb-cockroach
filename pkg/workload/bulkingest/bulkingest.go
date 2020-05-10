@@ -59,7 +59,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -129,11 +129,11 @@ func (w *bulkingest) Tables() []workload.Table {
 	}
 	schema += ")"
 
-	var bulkingestTypes = []types.T{
-		*types.Int,
-		*types.Int,
-		*types.Int,
-		*types.Bytes,
+	var bulkingestTypes = []*types.T{
+		types.Int,
+		types.Int,
+		types.Int,
+		types.Bytes,
 	}
 
 	table := workload.Table{

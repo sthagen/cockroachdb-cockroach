@@ -417,12 +417,12 @@ func initTempStorageConfig(
 // a store wasn't found).
 func resolveStorageEngineType(engineType enginepb.EngineType, dir string) enginepb.EngineType {
 	if engineType == enginepb.EngineTypeDefault {
-		engineType = enginepb.EngineTypeRocksDB
+		engineType = enginepb.EngineTypePebble
 		// Check if this storage directory was last written to by pebble. In that
 		// case, default to opening a Pebble engine.
 		if version, err := pebble.GetVersion(dir, vfs.Default); err == nil {
-			if version != "" && !strings.HasPrefix(version, "rocksdb") {
-				engineType = enginepb.EngineTypePebble
+			if strings.HasPrefix(version, "rocksdb") {
+				engineType = enginepb.EngineTypeRocksDB
 			}
 		}
 	}
@@ -736,7 +736,7 @@ If problems persist, please see %s.`
 
 			// Attempt to start the server.
 			if err := s.Start(ctx); err != nil {
-				if le, ok := err.(server.ListenError); ok {
+				if le := (*server.ListenError)(nil); errors.As(err, &le) {
 					const errorPrefix = "consider changing the port via --"
 					if le.Addr == serverCfg.Addr {
 						err = errors.Wrap(err, errorPrefix+cliflags.ListenAddr.Name)

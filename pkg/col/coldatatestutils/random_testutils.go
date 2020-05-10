@@ -17,8 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
@@ -51,103 +50,155 @@ func init() {
 	}
 }
 
-// RandomVec populates vec with n random values of typ, setting each value to
-// null with a probability of nullProbability. It is assumed that n is in bounds
-// of the given vec.
-// bytesFixedLength (when greater than zero) specifies the fixed length of the
-// bytes slice to be generated. It is used only if typ == coltypes.Bytes.
-func RandomVec(
-	rng *rand.Rand,
-	typ *types.T,
-	bytesFixedLength int,
-	vec coldata.Vec,
-	n int,
-	nullProbability float64,
-) {
-	switch typeconv.FromColumnType(typ) {
-	case coltypes.Bool:
-		bools := vec.Bool()
-		for i := 0; i < n; i++ {
-			if rng.Float64() < 0.5 {
+// RandomVecArgs is a utility struct that contains arguments to RandomVec call.
+type RandomVecArgs struct {
+	// Rand is the provided RNG.
+	Rand *rand.Rand
+	// Vec is the vector to be filled with random values.
+	Vec coldata.Vec
+	// N is the number of values to be generated.
+	N int
+	// NullProbability determines the probability of a single value being NULL.
+	NullProbability float64
+
+	// BytesFixedLength (when greater than zero) specifies the fixed length of
+	// the bytes slice to be generated. It is used only if vec's physical
+	// representation is flat bytes.
+	BytesFixedLength int
+	// IntRange (when greater than zero) determines the range of possible
+	// values for integer vectors; namely, all values will be in
+	// (-IntRange, +IntRange) interval.
+	IntRange int
+	// ZeroProhibited determines whether numeric zero values are disallowed to
+	// be generated.
+	ZeroProhibited bool
+}
+
+// RandomVec populates vector with random values, setting each value to null
+// with the given probability. It is assumed that N is in bounds of the given
+// vector.
+func RandomVec(args RandomVecArgs) {
+	switch args.Vec.CanonicalTypeFamily() {
+	case types.BoolFamily:
+		bools := args.Vec.Bool()
+		for i := 0; i < args.N; i++ {
+			if args.Rand.Float64() < 0.5 {
 				bools[i] = true
 			} else {
 				bools[i] = false
 			}
 		}
-	case coltypes.Bytes:
-		bytes := vec.Bytes()
-		for i := 0; i < n; i++ {
-			bytesLen := bytesFixedLength
+	case types.BytesFamily:
+		bytes := args.Vec.Bytes()
+		for i := 0; i < args.N; i++ {
+			bytesLen := args.BytesFixedLength
 			if bytesLen <= 0 {
-				bytesLen = rng.Intn(maxVarLen)
+				bytesLen = args.Rand.Intn(maxVarLen)
 			}
 			randBytes := make([]byte, bytesLen)
 			// Read always returns len(bytes[i]) and nil.
 			_, _ = rand.Read(randBytes)
 			bytes.Set(i, randBytes)
 		}
-	case coltypes.Decimal:
-		decs := vec.Decimal()
-		for i := 0; i < n; i++ {
-			// int64(rng.Uint64()) to get negative numbers, too
-			decs[i].SetFinite(int64(rng.Uint64()), int32(rng.Intn(40)-20))
+	case types.DecimalFamily:
+		decs := args.Vec.Decimal()
+		for i := 0; i < args.N; i++ {
+			// int64(args.Rand.Uint64()) to get negative numbers, too
+			decs[i].SetFinite(int64(args.Rand.Uint64()), int32(args.Rand.Intn(40)-20))
+			if args.ZeroProhibited {
+				if decs[i].IsZero() {
+					i--
+				}
+			}
 		}
-	case coltypes.Int16:
-		ints := vec.Int16()
-		for i := 0; i < n; i++ {
-			ints[i] = int16(rng.Uint64())
+	case types.IntFamily:
+		switch args.Vec.Type().Width() {
+		case 16:
+			ints := args.Vec.Int16()
+			for i := 0; i < args.N; i++ {
+				ints[i] = int16(args.Rand.Uint64())
+				if args.IntRange != 0 {
+					ints[i] = ints[i] % int16(args.IntRange)
+				}
+				if args.ZeroProhibited {
+					if ints[i] == 0 {
+						i--
+					}
+				}
+			}
+		case 32:
+			ints := args.Vec.Int32()
+			for i := 0; i < args.N; i++ {
+				ints[i] = int32(args.Rand.Uint64())
+				if args.IntRange != 0 {
+					ints[i] = ints[i] % int32(args.IntRange)
+				}
+				if args.ZeroProhibited {
+					if ints[i] == 0 {
+						i--
+					}
+				}
+			}
+		case 0, 64:
+			ints := args.Vec.Int64()
+			for i := 0; i < args.N; i++ {
+				ints[i] = int64(args.Rand.Uint64())
+				if args.IntRange != 0 {
+					ints[i] = ints[i] % int64(args.IntRange)
+				}
+				if args.ZeroProhibited {
+					if ints[i] == 0 {
+						i--
+					}
+				}
+			}
 		}
-	case coltypes.Int32:
-		ints := vec.Int32()
-		for i := 0; i < n; i++ {
-			ints[i] = int32(rng.Uint64())
+	case types.FloatFamily:
+		floats := args.Vec.Float64()
+		for i := 0; i < args.N; i++ {
+			floats[i] = args.Rand.Float64()
+			if args.ZeroProhibited {
+				if floats[i] == 0 {
+					i--
+				}
+			}
 		}
-	case coltypes.Int64:
-		ints := vec.Int64()
-		for i := 0; i < n; i++ {
-			ints[i] = int64(rng.Uint64())
-		}
-	case coltypes.Float64:
-		floats := vec.Float64()
-		for i := 0; i < n; i++ {
-			floats[i] = rng.Float64()
-		}
-	case coltypes.Timestamp:
-		timestamps := vec.Timestamp()
-		for i := 0; i < n; i++ {
-			timestamps[i] = timeutil.Unix(rng.Int63n(1000000), rng.Int63n(1000000))
-			loc := locations[rng.Intn(len(locations))]
+	case types.TimestampTZFamily:
+		timestamps := args.Vec.Timestamp()
+		for i := 0; i < args.N; i++ {
+			timestamps[i] = timeutil.Unix(args.Rand.Int63n(1000000), args.Rand.Int63n(1000000))
+			loc := locations[args.Rand.Intn(len(locations))]
 			timestamps[i] = timestamps[i].In(loc)
 		}
-	case coltypes.Interval:
-		intervals := vec.Interval()
-		for i := 0; i < n; i++ {
-			intervals[i] = duration.FromFloat64(rng.Float64())
+	case types.IntervalFamily:
+		intervals := args.Vec.Interval()
+		for i := 0; i < args.N; i++ {
+			intervals[i] = duration.FromFloat64(args.Rand.Float64())
 		}
 	default:
-		panic(fmt.Sprintf("unhandled type %s", typ))
+		panic(fmt.Sprintf("unhandled type %s", args.Vec.Type()))
 	}
-	vec.Nulls().UnsetNulls()
-	if nullProbability == 0 {
+	args.Vec.Nulls().UnsetNulls()
+	if args.NullProbability == 0 {
 		return
 	}
 
-	for i := 0; i < n; i++ {
-		if rng.Float64() < nullProbability {
-			vec.Nulls().SetNull(i)
+	for i := 0; i < args.N; i++ {
+		if args.Rand.Float64() < args.NullProbability {
+			args.Vec.Nulls().SetNull(i)
 		}
 	}
 }
 
 func randomType(rng *rand.Rand) *types.T {
-	return &typeconv.AllSupportedSQLTypes[rng.Intn(len(typeconv.AllSupportedSQLTypes))]
+	return typeconv.AllSupportedSQLTypes[rng.Intn(len(typeconv.AllSupportedSQLTypes))]
 }
 
 // randomTypes returns an n-length slice of random types.T.
-func randomTypes(rng *rand.Rand, n int) []types.T {
-	typs := make([]types.T, n)
+func randomTypes(rng *rand.Rand, n int) []*types.T {
+	typs := make([]*types.T, n)
 	for i := range typs {
-		typs[i] = *randomType(rng)
+		typs[i] = randomType(rng)
 	}
 	return typs
 }
@@ -158,7 +209,7 @@ func randomTypes(rng *rand.Rand, n int) []types.T {
 func RandomBatch(
 	allocator *colmem.Allocator,
 	rng *rand.Rand,
-	typs []types.T,
+	typs []*types.T,
 	capacity int,
 	length int,
 	nullProbability float64,
@@ -167,8 +218,13 @@ func RandomBatch(
 	if length == 0 {
 		length = capacity
 	}
-	for i, typ := range typs {
-		RandomVec(rng, &typ, 0 /* bytesFixedLength */, batch.ColVec(i), length, nullProbability)
+	for _, colVec := range batch.ColVecs() {
+		RandomVec(RandomVecArgs{
+			Rand:            rng,
+			Vec:             colVec,
+			N:               length,
+			NullProbability: nullProbability,
+		})
 	}
 	batch.SetLength(length)
 	return batch
@@ -206,7 +262,7 @@ var _ = randomTypes
 func RandomBatchWithSel(
 	allocator *colmem.Allocator,
 	rng *rand.Rand,
-	typs []types.T,
+	typs []*types.T,
 	n int,
 	nullProbability float64,
 	selProbability float64,
@@ -233,10 +289,10 @@ const (
 type RandomDataOpArgs struct {
 	// DeterministicTyps, if set, overrides AvailableTyps and MaxSchemaLength,
 	// forcing the RandomDataOp to use this schema.
-	DeterministicTyps []types.T
+	DeterministicTyps []*types.T
 	// AvailableTyps is the pool of types from which the operator's schema will
 	// be generated.
-	AvailableTyps []types.T
+	AvailableTyps []*types.T
 	// MaxSchemaLength is the maximum length of the operator's schema, which will
 	// be at least one type.
 	MaxSchemaLength int
@@ -251,15 +307,15 @@ type RandomDataOpArgs struct {
 	Nulls bool
 	// BatchAccumulator, if set, will be called before returning a coldata.Batch
 	// from Next.
-	BatchAccumulator func(b coldata.Batch, typs []types.T)
+	BatchAccumulator func(b coldata.Batch, typs []*types.T)
 }
 
 // RandomDataOp is an operator that generates random data according to
 // RandomDataOpArgs. Call GetBuffer to get all data that was returned.
 type RandomDataOp struct {
 	allocator        *colmem.Allocator
-	batchAccumulator func(b coldata.Batch, typs []types.T)
-	typs             []types.T
+	batchAccumulator func(b coldata.Batch, typs []*types.T)
+	typs             []*types.T
 	rng              *rand.Rand
 	batchSize        int
 	numBatches       int
@@ -296,7 +352,7 @@ func NewRandomDataOp(
 	typs := args.DeterministicTyps
 	if typs == nil {
 		// Generate at least one type.
-		typs = make([]types.T, 1+rng.Intn(maxSchemaLength))
+		typs = make([]*types.T, 1+rng.Intn(maxSchemaLength))
 		for i := range typs {
 			typs[i] = availableTyps[rng.Intn(len(availableTyps))]
 		}
@@ -368,6 +424,6 @@ func (o *RandomDataOp) Child(nth int, verbose bool) execinfra.OpNode {
 }
 
 // Typs returns the output types of the RandomDataOp.
-func (o *RandomDataOp) Typs() []types.T {
+func (o *RandomDataOp) Typs() []*types.T {
 	return o.typs
 }

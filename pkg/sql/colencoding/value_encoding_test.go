@@ -15,8 +15,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -30,15 +29,15 @@ func TestDecodeTableValueToCol(t *testing.T) {
 	var scratch []byte
 	nCols := 1000
 	datums := make([]tree.Datum, nCols)
-	typs := make([]types.T, nCols)
+	typs := make([]*types.T, nCols)
 	for i := 0; i < nCols; i++ {
 		ct := sqlbase.RandType(rng)
-		if typeconv.FromColumnType(ct) == coltypes.Unhandled {
+		if !typeconv.IsTypeSupported(ct) {
 			i--
 			continue
 		}
 		datum := sqlbase.RandDatum(rng, ct, false /* nullOk */)
-		typs[i] = *ct
+		typs[i] = ct
 		datums[i] = datum
 		var err error
 		fmt.Println(datum)
@@ -55,7 +54,7 @@ func TestDecodeTableValueToCol(t *testing.T) {
 			t.Fatal(err)
 		}
 		buf, err = DecodeTableValueToCol(batch.ColVec(i), 0 /* rowIdx */, typ,
-			dataOffset, &typs[i], buf[typeOffset:])
+			dataOffset, typs[i], buf[typeOffset:])
 		if err != nil {
 			t.Fatal(err)
 		}

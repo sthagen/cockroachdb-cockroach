@@ -73,7 +73,7 @@ func genPropsWithLabels(returnLabels []string) tree.FunctionProperties {
 }
 
 var aclexplodeGeneratorType = types.MakeLabeledTuple(
-	[]types.T{*types.Oid, *types.Oid, *types.String, *types.Bool},
+	[]*types.T{types.Oid, types.Oid, types.String, types.Bool},
 	[]string{"grantor", "grantee", "privilege_type", "is_grantable"},
 )
 
@@ -102,6 +102,7 @@ var generators = map[string]builtinDefinition{
 			},
 			"Produces a virtual table containing aclitem stuff ("+
 				"returns no rows as this feature is unsupported in CockroachDB)",
+			tree.VolatilityStable,
 		),
 	),
 	"generate_series": makeBuiltin(genProps(),
@@ -111,18 +112,21 @@ var generators = map[string]builtinDefinition{
 			seriesValueGeneratorType,
 			makeSeriesGenerator,
 			"Produces a virtual table containing the integer values from `start` to `end`, inclusive.",
+			tree.VolatilityImmutable,
 		),
 		makeGeneratorOverload(
 			tree.ArgTypes{{"start", types.Int}, {"end", types.Int}, {"step", types.Int}},
 			seriesValueGeneratorType,
 			makeSeriesGenerator,
 			"Produces a virtual table containing the integer values from `start` to `end`, inclusive, by increment of `step`.",
+			tree.VolatilityImmutable,
 		),
 		makeGeneratorOverload(
 			tree.ArgTypes{{"start", types.Timestamp}, {"end", types.Timestamp}, {"step", types.Interval}},
 			seriesTSValueGeneratorType,
 			makeTSSeriesGenerator,
 			"Produces a virtual table containing the timestamp values from `start` to `end`, inclusive, by increment of `step`.",
+			tree.VolatilityImmutable,
 		),
 	),
 	// crdb_internal.testing_callback is a generator function intended for internal unit tests.
@@ -143,6 +147,7 @@ var generators = map[string]builtinDefinition{
 			"For internal CRDB testing only. "+
 				"The function calls a callback identified by `name` registered with the server by "+
 				"the test.",
+			tree.VolatilityVolatile,
 		),
 	),
 
@@ -153,6 +158,7 @@ var generators = map[string]builtinDefinition{
 			keywordsValueGeneratorType,
 			makeKeywordsGenerator,
 			"Produces a virtual table containing the keywords known to the SQL parser.",
+			tree.VolatilityImmutable,
 		),
 	),
 
@@ -168,6 +174,7 @@ var generators = map[string]builtinDefinition{
 			},
 			makeArrayGenerator,
 			"Returns the input array as a set of rows",
+			tree.VolatilityImmutable,
 		),
 		makeGeneratorOverloadWithReturnType(
 			tree.VariadicType{
@@ -175,19 +182,20 @@ var generators = map[string]builtinDefinition{
 				VarType:    types.AnyArray,
 			},
 			func(args []tree.TypedExpr) *types.T {
-				returnTypes := make([]types.T, len(args))
+				returnTypes := make([]*types.T, len(args))
 				labels := make([]string, len(args))
 				for i, arg := range args {
 					if arg.ResolvedType().Family() == types.UnknownFamily {
 						return tree.UnknownReturnType
 					}
-					returnTypes[i] = *arg.ResolvedType().ArrayContents()
+					returnTypes[i] = arg.ResolvedType().ArrayContents()
 					labels[i] = "unnest"
 				}
 				return types.MakeLabeledTuple(returnTypes, labels)
 			},
 			makeVariadicUnnestGenerator,
 			"Returns the input arrays as a set of rows",
+			tree.VolatilityImmutable,
 		),
 	),
 
@@ -199,10 +207,11 @@ var generators = map[string]builtinDefinition{
 					return tree.UnknownReturnType
 				}
 				t := args[0].ResolvedType().ArrayContents()
-				return types.MakeLabeledTuple([]types.T{*t, *types.Int}, expandArrayValueGeneratorLabels)
+				return types.MakeLabeledTuple([]*types.T{t, types.Int}, expandArrayValueGeneratorLabels)
 			},
 			makeExpandArrayGenerator,
 			"Returns the input array as a set of rows with an index",
+			tree.VolatilityImmutable,
 		),
 	),
 
@@ -213,6 +222,7 @@ var generators = map[string]builtinDefinition{
 			makeUnaryGenerator,
 			"Produces a virtual table containing a single row with no values.\n\n"+
 				"This function is used only by CockroachDB's developers for testing purposes.",
+			tree.VolatilityVolatile,
 		),
 	),
 
@@ -223,12 +233,14 @@ var generators = map[string]builtinDefinition{
 			subscriptsValueGeneratorType,
 			makeGenerateSubscriptsGenerator,
 			"Returns a series comprising the given array's subscripts.",
+			tree.VolatilityImmutable,
 		),
 		makeGeneratorOverload(
 			tree.ArgTypes{{"array", types.AnyArray}, {"dim", types.Int}},
 			subscriptsValueGeneratorType,
 			makeGenerateSubscriptsGenerator,
 			"Returns a series comprising the given array's subscripts.",
+			tree.VolatilityImmutable,
 		),
 		makeGeneratorOverload(
 			tree.ArgTypes{{"array", types.AnyArray}, {"dim", types.Int}, {"reverse", types.Bool}},
@@ -236,6 +248,7 @@ var generators = map[string]builtinDefinition{
 			makeGenerateSubscriptsGenerator,
 			"Returns a series comprising the given array's subscripts.\n\n"+
 				"When reverse is true, the series is returned in reverse order.",
+			tree.VolatilityImmutable,
 		),
 	),
 
@@ -272,14 +285,15 @@ var generators = map[string]builtinDefinition{
 				"and verbose detail.\n\n"+
 				"Example usage:\n"+
 				"SELECT * FROM crdb_internal.check_consistency(true, '\\x02', '\\x04')",
+			tree.VolatilityVolatile,
 		),
 	),
 }
 
 func makeGeneratorOverload(
-	in tree.TypeList, ret *types.T, g tree.GeneratorFactory, info string,
+	in tree.TypeList, ret *types.T, g tree.GeneratorFactory, info string, volatility tree.Volatility,
 ) tree.Overload {
-	return makeGeneratorOverloadWithReturnType(in, tree.FixedReturnType(ret), g, info)
+	return makeGeneratorOverloadWithReturnType(in, tree.FixedReturnType(ret), g, info, volatility)
 }
 
 func newUnsuitableUseOfGeneratorError() error {
@@ -287,7 +301,11 @@ func newUnsuitableUseOfGeneratorError() error {
 }
 
 func makeGeneratorOverloadWithReturnType(
-	in tree.TypeList, retType tree.ReturnTyper, g tree.GeneratorFactory, info string,
+	in tree.TypeList,
+	retType tree.ReturnTyper,
+	g tree.GeneratorFactory,
+	info string,
+	volatility tree.Volatility,
 ) tree.Overload {
 	return tree.Overload{
 		Types:      in,
@@ -296,7 +314,8 @@ func makeGeneratorOverloadWithReturnType(
 		Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 			return nil, newUnsuitableUseOfGeneratorError()
 		},
-		Info: info,
+		Info:       info,
+		Volatility: volatility,
 	}
 }
 
@@ -306,7 +325,7 @@ type keywordsValueGenerator struct {
 }
 
 var keywordsValueGeneratorType = types.MakeLabeledTuple(
-	[]types.T{*types.String, *types.String, *types.String},
+	[]*types.T{types.String, types.String, types.String},
 	[]string{"word", "catcode", "catdesc"},
 )
 
@@ -502,10 +521,10 @@ type multipleArrayValueGenerator struct {
 // ResolvedType implements the tree.ValueGenerator interface.
 func (s *multipleArrayValueGenerator) ResolvedType() *types.T {
 	arraysN := len(s.arrays)
-	returnTypes := make([]types.T, arraysN)
+	returnTypes := make([]*types.T, arraysN)
 	labels := make([]string, arraysN)
 	for i, arr := range s.arrays {
-		returnTypes[i] = *arr.ParamTyp
+		returnTypes[i] = arr.ParamTyp
 		labels[i] = "unnest"
 	}
 	return types.MakeLabeledTuple(returnTypes, labels)
@@ -605,7 +624,7 @@ var expandArrayValueGeneratorLabels = []string{"x", "n"}
 // ResolvedType implements the tree.ValueGenerator interface.
 func (s *expandArrayValueGenerator) ResolvedType() *types.T {
 	return types.MakeLabeledTuple(
-		[]types.T{*s.avg.array.ParamTyp, *types.Int},
+		[]*types.T{s.avg.array.ParamTyp, types.Int},
 		expandArrayValueGeneratorLabels,
 	)
 }
@@ -774,6 +793,7 @@ var jsonArrayElementsImpl = makeGeneratorOverload(
 	jsonArrayGeneratorType,
 	makeJSONArrayAsJSONGenerator,
 	"Expands a JSON array to a set of JSON values.",
+	tree.VolatilityImmutable,
 )
 
 var jsonArrayElementsTextImpl = makeGeneratorOverload(
@@ -781,6 +801,7 @@ var jsonArrayElementsTextImpl = makeGeneratorOverload(
 	jsonArrayTextGeneratorType,
 	makeJSONArrayAsTextGenerator,
 	"Expands a JSON array to a set of text values.",
+	tree.VolatilityImmutable,
 )
 
 var jsonArrayGeneratorLabels = []string{"value"}
@@ -868,6 +889,7 @@ var jsonObjectKeysImpl = makeGeneratorOverload(
 	jsonObjectKeysGeneratorType,
 	makeJSONObjectKeysGenerator,
 	"Returns sorted set of keys in the outermost JSON object.",
+	tree.VolatilityImmutable,
 )
 
 var jsonObjectKeysGeneratorType = types.String
@@ -923,6 +945,7 @@ var jsonEachImpl = makeGeneratorOverload(
 	jsonEachGeneratorType,
 	makeJSONEachImplGenerator,
 	"Expands the outermost JSON or JSONB object into a set of key/value pairs.",
+	tree.VolatilityImmutable,
 )
 
 var jsonEachTextImpl = makeGeneratorOverload(
@@ -931,17 +954,18 @@ var jsonEachTextImpl = makeGeneratorOverload(
 	makeJSONEachTextImplGenerator,
 	"Expands the outermost JSON or JSONB object into a set of key/value pairs. "+
 		"The returned values will be of type text.",
+	tree.VolatilityImmutable,
 )
 
 var jsonEachGeneratorLabels = []string{"key", "value"}
 
 var jsonEachGeneratorType = types.MakeLabeledTuple(
-	[]types.T{*types.String, *types.Jsonb},
+	[]*types.T{types.String, types.Jsonb},
 	jsonEachGeneratorLabels,
 )
 
 var jsonEachTextGeneratorType = types.MakeLabeledTuple(
-	[]types.T{*types.String, *types.String},
+	[]*types.T{types.String, types.String},
 	jsonEachGeneratorLabels,
 )
 
@@ -1075,7 +1099,7 @@ func makeCheckConsistencyGenerator(
 }
 
 var checkConsistencyGeneratorType = types.MakeLabeledTuple(
-	[]types.T{*types.Int, *types.Bytes, *types.String, *types.String, *types.String},
+	[]*types.T{types.Int, types.Bytes, types.String, types.String, types.String},
 	[]string{"range_id", "start_key", "start_key_pretty", "status", "detail"},
 )
 

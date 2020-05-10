@@ -34,7 +34,8 @@ var HistogramClusterMode = settings.RegisterPublicBoolSetting(
 // the same number of samples (though it can vary when a boundary value has
 // high frequency).
 //
-// numRows is the total number of rows from which values were sampled.
+// numRows is the total number of rows from which values were sampled
+// (excluding rows that have NULL values on the histogram column).
 //
 // In addition to building the histogram buckets, EquiDepthHistogram also
 // estimates the number of distinct values in each bucket. It distributes the
@@ -69,7 +70,7 @@ func EquiDepthHistogram(
 		Buckets: make([]HistogramData_Bucket, 0, numBuckets),
 	}
 	lowerBound := samples[0]
-	h.ColumnType = *lowerBound.ResolvedType()
+	h.ColumnType = lowerBound.ResolvedType()
 	var distinctCountRange, distinctCountEq float64
 
 	// i keeps track of the current sample and advances as we form buckets.

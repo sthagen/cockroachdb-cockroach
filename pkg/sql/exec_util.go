@@ -141,17 +141,10 @@ const ReorderJoinsLimitClusterSettingName = "sql.defaults.reorder_joins_limit"
 
 // ReorderJoinsLimitClusterValue controls the cluster default for the maximum
 // number of joins reordered.
-var ReorderJoinsLimitClusterValue = settings.RegisterValidatedIntSetting(
+var ReorderJoinsLimitClusterValue = settings.RegisterNonNegativeIntSetting(
 	ReorderJoinsLimitClusterSettingName,
 	"default number of joins to reorder",
 	opt.DefaultJoinOrderLimit,
-	func(v int64) error {
-		if v < 0 {
-			return pgerror.Newf(pgcode.InvalidParameterValue,
-				"cannot set sql.defaults.reorder_joins_limit to a negative value: %d", v)
-		}
-		return nil
-	},
 )
 
 var requireExplicitPrimaryKeysClusterMode = settings.RegisterBoolSetting(
@@ -188,6 +181,12 @@ var optDrivenFKCascadesClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.experimental_optimizer_foreign_key_cascades.enabled",
 	"default value for experimental_optimizer_foreign_key_cascades session setting; enables optimizer-driven foreign key cascades by default",
 	false,
+)
+
+var optDrivenFKCascadesClusterLimit = settings.RegisterNonNegativeIntSetting(
+	"sql.defaults.foreign_key_cascades_limit",
+	"default value for foreign_key_cascades_limit session setting; limits the number of cascading operations that run as part of a single query",
+	10000,
 )
 
 // optUseHistogramsClusterMode controls the cluster default for whether
@@ -235,11 +234,11 @@ const VectorizeClusterSettingName = "sql.defaults.vectorize"
 var VectorizeClusterMode = settings.RegisterEnumSetting(
 	VectorizeClusterSettingName,
 	"default vectorize mode",
-	"auto",
+	"on",
 	map[int64]string{
-		int64(sessiondata.VectorizeOff):  "off",
-		int64(sessiondata.VectorizeAuto): "auto",
-		int64(sessiondata.VectorizeOn):   "on",
+		int64(sessiondata.VectorizeOff):     "off",
+		int64(sessiondata.Vectorize201Auto): "201auto",
+		int64(sessiondata.VectorizeOn):      "on",
 	},
 )
 
@@ -808,7 +807,7 @@ var _ dbCacheSubscriber = &databaseCacheHolder{}
 // received.
 func (dc *databaseCacheHolder) updateSystemConfig(cfg *config.SystemConfig) {
 	dc.mu.Lock()
-	dc.mu.c = newDatabaseCache(cfg)
+	dc.mu.c = newDatabaseCache(dc.mu.c.codec, cfg)
 	dc.mu.cv.Broadcast()
 	dc.mu.Unlock()
 }
@@ -947,6 +946,7 @@ func checkResultType(typ *types.T) error {
 	case types.INetFamily:
 	case types.OidFamily:
 	case types.TupleFamily:
+	case types.EnumFamily:
 	case types.ArrayFamily:
 		if typ.ArrayContents().Family() == types.ArrayFamily {
 			// Technically we could probably return arrays of arrays to a
@@ -1959,6 +1959,10 @@ func (m *sessionDataMutator) SetOptimizerFKCascades(val bool) {
 	m.data.OptimizerFKCascades = val
 }
 
+func (m *sessionDataMutator) SetOptimizerFKCascadesLimit(val int) {
+	m.data.OptimizerFKCascadesLimit = val
+}
+
 func (m *sessionDataMutator) SetOptimizerUseHistograms(val bool) {
 	m.data.OptimizerUseHistograms = val
 }
@@ -1993,7 +1997,15 @@ func (m *sessionDataMutator) SetLocation(loc *time.Location) {
 }
 
 func (m *sessionDataMutator) SetReadOnly(val bool) {
-	m.setCurTxnReadOnly(val)
+	// The read-only state is special; it's set as a session variable (SET
+	// transaction_read_only=<>), but it represents per-txn state, not
+	// per-session. There's no field for it in the SessionData struct. Instead, we
+	// call into the connEx, which modifies its TxnState.
+	// NOTE(andrei): I couldn't find good documentation on transaction_read_only,
+	// but I've tested its behavior in Postgres 11.
+	if m.setCurTxnReadOnly != nil {
+		m.setCurTxnReadOnly(val)
+	}
 }
 
 func (m *sessionDataMutator) SetStmtTimeout(timeout time.Duration) {

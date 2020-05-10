@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -27,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // lookupFlow returns the registered flow with the given ID. If no such flow is
@@ -71,7 +70,7 @@ func lookupStreamInfo(
 
 func TestFlowRegistry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	reg := NewFlowRegistry(roachpb.NodeID(0))
+	reg := NewFlowRegistry(0)
 
 	id1 := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 	f1 := &FlowBase{}
@@ -210,7 +209,7 @@ func TestFlowRegistry(t *testing.T) {
 // are propagated to their consumers and future attempts to connect them fail.
 func TestStreamConnectionTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	reg := NewFlowRegistry(roachpb.NodeID(0))
+	reg := NewFlowRegistry(0)
 
 	jiffy := time.Nanosecond
 
@@ -278,7 +277,7 @@ func TestStreamConnectionTimeout(t *testing.T) {
 func TestHandshake(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	reg := NewFlowRegistry(roachpb.NodeID(0))
+	reg := NewFlowRegistry(0)
 
 	tests := []struct {
 		name                   string
@@ -377,7 +376,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.TODO()
-	reg := NewFlowRegistry(roachpb.NodeID(0))
+	reg := NewFlowRegistry(0)
 
 	flow := &FlowBase{}
 	id := execinfrapb.FlowID{UUID: uuid.MakeV4()}
@@ -651,7 +650,7 @@ func TestFlowCancelPartiallyBlocked(t *testing.T) {
 	// flow canceled error.
 
 	_, meta := right.Next()
-	if meta.Err != sqlbase.QueryCanceledError {
+	if !errors.Is(meta.Err, sqlbase.QueryCanceledError) {
 		t.Fatal("expected query canceled, found", meta.Err)
 	}
 
@@ -660,7 +659,7 @@ func TestFlowCancelPartiallyBlocked(t *testing.T) {
 
 	_, _ = left.Next()
 	_, meta = left.Next()
-	if meta.Err != sqlbase.QueryCanceledError {
+	if !errors.Is(meta.Err, sqlbase.QueryCanceledError) {
 		t.Fatal("expected query canceled, found", meta.Err)
 	}
 }

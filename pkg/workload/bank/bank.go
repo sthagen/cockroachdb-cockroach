@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/exp/rand"
 )
@@ -123,10 +123,10 @@ func (b *bank) Hooks() workload.Hooks {
 	}
 }
 
-var bankTypes = []types.T{
-	*types.Int,
-	*types.Int,
-	*types.Bytes,
+var bankTypes = []*types.T{
+	types.Int,
+	types.Int,
+	types.Bytes,
 }
 
 // Tables implements the Generator interface.

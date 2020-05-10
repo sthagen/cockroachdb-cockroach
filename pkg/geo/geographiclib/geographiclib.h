@@ -8,20 +8,21 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+#include "geodesic.h"
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
 
-void CR_GEOGRAPHICLIB_Inverse(
-  double radius,
-  double flattening,
-  double aLat,
-  double aLng,
-  double bLat,
-  double bLng,
-  double *s12,
-  double *az1,
-  double *az2
+// CR_GEOGRAPHICLIB_InverseBatch computes the sum of the length of the lines
+// represented by an array of lat/lngs using Inverse from GeographicLib.
+// It is batched in C++ to reduce the cgo overheads.
+void CR_GEOGRAPHICLIB_InverseBatch(
+  struct geod_geodesic* spheroid,
+  double lats[],
+  double lngs[],
+  int len,
+  double *result
 );
 
 #if defined(__cplusplus)

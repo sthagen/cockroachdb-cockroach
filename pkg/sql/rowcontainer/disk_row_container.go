@@ -51,7 +51,7 @@ type DiskRowContainer struct {
 	rowID uint64
 
 	// types is the schema of rows in the container.
-	types []types.T
+	types []*types.T
 	// ordering is the order in which rows should be sorted.
 	ordering sqlbase.ColumnOrdering
 	// encodings keeps around the DatumEncoding equivalents of the encoding
@@ -79,7 +79,7 @@ var _ SortableRowContainer = &DiskRowContainer{}
 // 	- e is the underlying store that rows are stored on.
 func MakeDiskRowContainer(
 	diskMonitor *mon.BytesMonitor,
-	types []types.T,
+	types []*types.T,
 	ordering sqlbase.ColumnOrdering,
 	e diskmap.Factory,
 ) DiskRowContainer {
@@ -114,7 +114,7 @@ func MakeDiskRowContainer(
 		// returns true may not necessarily need to be encoded in the value, so
 		// make this more fine-grained. See IsComposite() methods in
 		// pkg/sql/parser/datum.go.
-		if _, ok := orderingIdxs[i]; !ok || sqlbase.HasCompositeKeyEncoding(d.types[i].Family()) {
+		if _, ok := orderingIdxs[i]; !ok || sqlbase.HasCompositeKeyEncoding(d.types[i]) {
 			d.valueIdxs = append(d.valueIdxs, i)
 		}
 	}
@@ -144,14 +144,14 @@ func (d *DiskRowContainer) AddRow(ctx context.Context, row sqlbase.EncDatumRow) 
 	for i, orderInfo := range d.ordering {
 		col := orderInfo.ColIdx
 		var err error
-		d.scratchKey, err = row[col].Encode(&d.types[col], &d.datumAlloc, d.encodings[i], d.scratchKey)
+		d.scratchKey, err = row[col].Encode(d.types[col], &d.datumAlloc, d.encodings[i], d.scratchKey)
 		if err != nil {
 			return err
 		}
 	}
 	for _, i := range d.valueIdxs {
 		var err error
-		d.scratchVal, err = row[i].Encode(&d.types[i], &d.datumAlloc, sqlbase.DatumEncoding_VALUE, d.scratchVal)
+		d.scratchVal, err = row[i].Encode(d.types[i], &d.datumAlloc, sqlbase.DatumEncoding_VALUE, d.scratchVal)
 		if err != nil {
 			return err
 		}
@@ -244,7 +244,7 @@ func (d *DiskRowContainer) Close(ctx context.Context) {
 func (d *DiskRowContainer) keyValToRow(k []byte, v []byte) (sqlbase.EncDatumRow, error) {
 	for i, orderInfo := range d.ordering {
 		// Types with composite key encodings are decoded from the value.
-		if sqlbase.HasCompositeKeyEncoding(d.types[orderInfo.ColIdx].Family()) {
+		if sqlbase.HasCompositeKeyEncoding(d.types[orderInfo.ColIdx]) {
 			// Skip over the encoded key.
 			encLen, err := encoding.PeekLength(k)
 			if err != nil {
@@ -255,7 +255,7 @@ func (d *DiskRowContainer) keyValToRow(k []byte, v []byte) (sqlbase.EncDatumRow,
 		}
 		var err error
 		col := orderInfo.ColIdx
-		d.scratchEncRow[col], k, err = sqlbase.EncDatumFromBuffer(&d.types[col], d.encodings[i], k)
+		d.scratchEncRow[col], k, err = sqlbase.EncDatumFromBuffer(d.types[col], d.encodings[i], k)
 		if err != nil {
 			return nil, errors.NewAssertionErrorWithWrappedErrf(err,
 				"unable to decode row, column idx %d", errors.Safe(col))
@@ -263,7 +263,7 @@ func (d *DiskRowContainer) keyValToRow(k []byte, v []byte) (sqlbase.EncDatumRow,
 	}
 	for _, i := range d.valueIdxs {
 		var err error
-		d.scratchEncRow[i], v, err = sqlbase.EncDatumFromBuffer(&d.types[i], sqlbase.DatumEncoding_VALUE, v)
+		d.scratchEncRow[i], v, err = sqlbase.EncDatumFromBuffer(d.types[i], sqlbase.DatumEncoding_VALUE, v)
 		if err != nil {
 			return nil, errors.NewAssertionErrorWithWrappedErrf(err,
 				"unable to decode row, value idx %d", errors.Safe(i))

@@ -3146,9 +3146,9 @@ func AsDTuple(e Expr) (*DTuple, bool) {
 // populated.
 func (d *DTuple) maybePopulateType() {
 	if d.typ == nil {
-		contents := make([]types.T, len(d.D))
+		contents := make([]*types.T, len(d.D))
 		for i, v := range d.D {
-			contents[i] = *v.ResolvedType()
+			contents[i] = v.ResolvedType()
 		}
 		d.typ = types.MakeTuple(contents)
 	}
@@ -3565,6 +3565,16 @@ func (d *DArray) ResolvedType() *types.T {
 	return types.MakeArray(d.ParamTyp)
 }
 
+// IsComposite implements the CompositeDatum interface.
+func (d *DArray) IsComposite() bool {
+	for _, elem := range d.Array {
+		if cdatum, ok := elem.(CompositeDatum); ok && cdatum.IsComposite() {
+			return true
+		}
+	}
+	return false
+}
+
 // FirstIndex returns the first index of the array. 1 for normal SQL arrays,
 // which are 1-indexed, and 0 for the special Postgers vector types which are
 // 0-indexed.
@@ -3738,6 +3748,141 @@ func (d *DArray) Append(v Datum) error {
 	}
 	d.Array = append(d.Array, v)
 	return d.Validate()
+}
+
+// DEnum represents an ENUM value.
+type DEnum struct {
+	// EnumType is the hydrated type of this enum.
+	EnumTyp *types.T
+	// PhysicalRep is a slice containing the encodable and ordered physical
+	// representation of this datum. It is used for comparisons and encoding.
+	PhysicalRep []byte
+	// LogicalRep is a string containing the user visible value of the enum.
+	LogicalRep string
+}
+
+// Size implements the Datum interface.
+func (d *DEnum) Size() uintptr {
+	// When creating DEnums, we store pointers back into the type enum
+	// metadata, so enums themselves don't pay for the memory of their
+	// physical and logical representations.
+	return unsafe.Sizeof(d.EnumTyp) +
+		unsafe.Sizeof(d.PhysicalRep) +
+		unsafe.Sizeof(d.LogicalRep)
+}
+
+// MakeDEnumFromPhysicalRepresentation creates a DEnum of the input type
+// and the input physical representation.
+func MakeDEnumFromPhysicalRepresentation(typ *types.T, rep []byte) *DEnum {
+	// Take a pointer into the enum metadata rather than holding on
+	// to a pointer to the input bytes.
+	idx := typ.EnumGetIdxOfPhysical(rep)
+	return &DEnum{
+		EnumTyp:     typ,
+		PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[idx],
+		LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[idx],
+	}
+}
+
+// MakeDEnumFromLogicalRepresentation creates a DEnum of the input type
+// and input logical representation. It returns an error if the input
+// logical representation is invalid.
+func MakeDEnumFromLogicalRepresentation(typ *types.T, rep string) (*DEnum, error) {
+	// Take a pointer into the enum metadata rather than holding on
+	// to a pointer to the input string.
+	idx, err := typ.EnumGetIdxOfLogical(rep)
+	if err != nil {
+		return nil, err
+	}
+	return &DEnum{
+		EnumTyp:     typ,
+		PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[idx],
+		LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[idx],
+	}, nil
+}
+
+// Format implements the NodeFormatter interface.
+func (d *DEnum) Format(ctx *FmtCtx) {
+	s := DString(d.LogicalRep)
+	s.Format(ctx)
+}
+
+func (d *DEnum) String() string {
+	return AsString(d)
+}
+
+// ResolvedType implements the Datum interface.
+func (d *DEnum) ResolvedType() *types.T {
+	return d.EnumTyp
+}
+
+// Compare implements the Datum interface.
+func (d *DEnum) Compare(ctx *EvalContext, other Datum) int {
+	if other == DNull {
+		return 1
+	}
+	v, ok := UnwrapDatum(ctx, other).(*DEnum)
+	if !ok {
+		panic(makeUnsupportedComparisonMessage(d, other))
+	}
+	return bytes.Compare(d.PhysicalRep, v.PhysicalRep)
+}
+
+// Prev implements the Datum interface.
+func (d *DEnum) Prev(ctx *EvalContext) (Datum, bool) {
+	idx := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	if idx == 0 {
+		return nil, false
+	}
+	return MakeDEnumFromPhysicalRepresentation(
+		d.EnumTyp,
+		d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations[idx-1],
+	), true
+}
+
+// Next implements the Datum interface.
+func (d *DEnum) Next(ctx *EvalContext) (Datum, bool) {
+	idx := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
+	if idx == len(physReps)-1 {
+		return nil, false
+	}
+	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[idx+1]), true
+}
+
+// Max implements the Datum interface.
+func (d *DEnum) Max(ctx *EvalContext) (Datum, bool) {
+	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
+	if len(physReps) == 0 {
+		return nil, false
+	}
+	idx := len(physReps) - 1
+	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[idx]), true
+}
+
+// Min implements the Datum interface.
+func (d *DEnum) Min(ctx *EvalContext) (Datum, bool) {
+	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
+	if len(physReps) == 0 {
+		return nil, false
+	}
+	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[0]), true
+}
+
+// IsMax implements the Datum interface.
+func (d *DEnum) IsMax(_ *EvalContext) bool {
+	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
+	return d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep) == len(physReps)-1
+}
+
+// IsMin implements the Datum interface.
+func (d *DEnum) IsMin(_ *EvalContext) bool {
+	return d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep) == 0
+}
+
+// AmbiguousFormat implements the Datum interface.
+func (d *DEnum) AmbiguousFormat() bool {
+	return true
 }
 
 // DOid is the Postgres OID datum. It can represent either an OID type or any
@@ -4163,7 +4308,7 @@ func NewDefaultDatum(evalCtx *EvalContext, t *types.T) (d Datum, err error) {
 		contents := t.TupleContents()
 		datums := make([]Datum, len(contents))
 		for i, subT := range contents {
-			datums[i], err = NewDefaultDatum(evalCtx, &subT)
+			datums[i], err = NewDefaultDatum(evalCtx, subT)
 			if err != nil {
 				return nil, err
 			}
@@ -4185,7 +4330,7 @@ func NewDefaultDatum(evalCtx *EvalContext, t *types.T) (d Datum, err error) {
 // sizes.
 //
 // It holds for every Datum d that d.Size() >= DatumSize(d.ResolvedType())
-func DatumTypeSize(t *types.T) (uintptr, bool) {
+func DatumTypeSize(t *types.T) (size uintptr, isVarlen bool) {
 	// The following are composite types or types that support multiple widths.
 	switch t.Family() {
 	case types.TupleFamily:
@@ -4195,13 +4340,20 @@ func DatumTypeSize(t *types.T) (uintptr, bool) {
 		sz := uintptr(0)
 		variable := false
 		for i := range t.TupleContents() {
-			typsz, typvariable := DatumTypeSize(&t.TupleContents()[i])
+			typsz, typvariable := DatumTypeSize(t.TupleContents()[i])
 			sz += typsz
 			variable = variable || typvariable
 		}
 		return sz, variable
 	case types.IntFamily, types.FloatFamily:
 		return uintptr(t.Width() / 8), false
+
+	case types.StringFamily:
+		// T_char is a special string type that has a fixed size of 1. We have to
+		// report its size accurately, and that it's not a variable-length datatype.
+		if t.Oid() == oid.T_char {
+			return 1, false
+		}
 	}
 
 	// All the primary types have fixed size information.
@@ -4242,6 +4394,7 @@ var baseDatumTypeSizes = map[types.Family]struct {
 	types.UuidFamily:           {unsafe.Sizeof(DUuid{}), fixedSize},
 	types.INetFamily:           {unsafe.Sizeof(DIPAddr{}), fixedSize},
 	types.OidFamily:            {unsafe.Sizeof(DInt(0)), fixedSize},
+	types.EnumFamily:           {unsafe.Sizeof(DEnum{}), variableSize},
 
 	// TODO(jordan,justin): This seems suspicious.
 	types.ArrayFamily: {unsafe.Sizeof(DString("")), variableSize},

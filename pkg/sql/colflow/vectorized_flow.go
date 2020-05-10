@@ -21,7 +21,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
@@ -426,11 +426,11 @@ type remoteComponentCreator interface {
 	newOutbox(
 		allocator *colmem.Allocator,
 		input colexecbase.Operator,
-		typs []types.T,
+		typs []*types.T,
 		metadataSources []execinfrapb.MetadataSource,
 		toClose []colexec.IdempotentCloser,
 	) (*colrpc.Outbox, error)
-	newInbox(allocator *colmem.Allocator, typs []types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error)
+	newInbox(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error)
 }
 
 type vectorizedRemoteComponentCreator struct{}
@@ -438,7 +438,7 @@ type vectorizedRemoteComponentCreator struct{}
 func (vectorizedRemoteComponentCreator) newOutbox(
 	allocator *colmem.Allocator,
 	input colexecbase.Operator,
-	typs []types.T,
+	typs []*types.T,
 	metadataSources []execinfrapb.MetadataSource,
 	toClose []colexec.IdempotentCloser,
 ) (*colrpc.Outbox, error) {
@@ -446,7 +446,7 @@ func (vectorizedRemoteComponentCreator) newOutbox(
 }
 
 func (vectorizedRemoteComponentCreator) newInbox(
-	allocator *colmem.Allocator, typs []types.T, streamID execinfrapb.StreamID,
+	allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID,
 ) (*colrpc.Inbox, error) {
 	return colrpc.NewInbox(allocator, typs, streamID)
 }
@@ -569,7 +569,7 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	op colexecbase.Operator,
-	outputTyps []types.T,
+	outputTyps []*types.T,
 	stream *execinfrapb.StreamEndpointSpec,
 	metadataSourcesQueue []execinfrapb.MetadataSource,
 	toClose []colexec.IdempotentCloser,
@@ -615,7 +615,7 @@ func (s *vectorizedFlowCreator) setupRouter(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	input colexecbase.Operator,
-	outputTyps []types.T,
+	outputTyps []*types.T,
 	output *execinfrapb.OutputRouterSpec,
 	metadataSourcesQueue []execinfrapb.MetadataSource,
 	toClose []colexec.IdempotentCloser,
@@ -726,7 +726,7 @@ func (s *vectorizedFlowCreator) setupInput(
 			if err := s.checkInboundStreamID(inputStream.StreamID); err != nil {
 				return nil, nil, err
 			}
-			if _, err := typeconv.FromColumnTypes(input.ColumnTypes); err != nil {
+			if err := typeconv.AreTypesSupported(input.ColumnTypes); err != nil {
 				return nil, nil, err
 			}
 			inbox, err := s.remoteComponentCreator.newInbox(
@@ -757,7 +757,7 @@ func (s *vectorizedFlowCreator) setupInput(
 	if len(inputStreamOps) > 1 {
 		var err error
 		statsInputs := inputStreamOps
-		if _, err = typeconv.FromColumnTypes(input.ColumnTypes); err != nil {
+		if err = typeconv.AreTypesSupported(input.ColumnTypes); err != nil {
 			return nil, nil, err
 		}
 		if input.Type == execinfrapb.InputSyncSpec_ORDERED {
@@ -805,7 +805,7 @@ func (s *vectorizedFlowCreator) setupOutput(
 	flowCtx *execinfra.FlowCtx,
 	pspec *execinfrapb.ProcessorSpec,
 	op colexecbase.Operator,
-	opOutputTypes []types.T,
+	opOutputTypes []*types.T,
 	metadataSourcesQueue []execinfrapb.MetadataSource,
 	toClose []colexec.IdempotentCloser,
 ) error {
@@ -988,9 +988,9 @@ func (s *vectorizedFlowCreator) setupFlow(
 		if flowCtx.Cfg != nil && flowCtx.Cfg.TestingKnobs.EnableVectorizedInvariantsChecker {
 			result.Op = colexec.NewInvariantsChecker(result.Op)
 		}
-		if flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.VectorizeAuto &&
+		if flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.Vectorize201Auto &&
 			!result.IsStreaming {
-			return nil, errors.Errorf("non-streaming operator encountered when vectorize=auto")
+			return nil, errors.Errorf("non-streaming operator encountered when vectorize=201auto")
 		}
 		// We created a streaming memory account when calling NewColOperator above,
 		// so there is definitely at least one memory account, and it doesn't
@@ -1011,14 +1011,14 @@ func (s *vectorizedFlowCreator) setupFlow(
 			}
 		}
 
-		if (flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.VectorizeAuto) &&
+		if (flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.Vectorize201Auto) &&
 			pspec.Output[0].Type == execinfrapb.OutputRouterSpec_BY_HASH {
 			// colexec.HashRouter is not supported when vectorize=auto since it can
 			// buffer an unlimited number of tuples, even though it falls back to
 			// disk. vectorize=on does support this.
-			return nil, errors.Errorf("hash router encountered when vectorize=auto")
+			return nil, errors.Errorf("hash router encountered when vectorize=201auto")
 		}
-		if _, err := typeconv.FromColumnTypes(result.ColumnTypes); err != nil {
+		if err := typeconv.AreTypesSupported(result.ColumnTypes); err != nil {
 			return nil, err
 		}
 		if err = s.setupOutput(
@@ -1076,9 +1076,9 @@ func (s *vectorizedFlowCreator) setupFlow(
 
 // assertTypesMatch checks whether expected types match with actual types and
 // returns an error if not.
-func assertTypesMatch(expected []types.T, actual []types.T) error {
+func assertTypesMatch(expected []*types.T, actual []*types.T) error {
 	for i := range expected {
-		if !expected[i].Identical(&actual[i]) {
+		if !expected[i].Identical(actual[i]) {
 			return errors.Errorf("mismatched types at index %d: expected %v\tactual %v ",
 				i, expected, actual,
 			)

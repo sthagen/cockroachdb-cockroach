@@ -12,7 +12,6 @@ package kvserver_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -33,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -438,5 +438,5 @@ func TestTimestampCacheErrorAfterLeaseTransfer(t *testing.T) {
 	require.NoError(t, tc.TransferRangeLease(rangeDesc, tc.Target(1)))
 
 	err = txn.Commit(ctx)
-	require.Error(t, err, "TransactionAbortedError(ABORT_REASON_NEW_LEASE_PREVENTS_TXN)")
+	require.Regexp(t, `TransactionAbortedError\(ABORT_REASON_NEW_LEASE_PREVENTS_TXN\)`, err)
 }

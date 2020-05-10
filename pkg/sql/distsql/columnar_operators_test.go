@@ -19,8 +19,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -73,11 +72,11 @@ func TestAggregatorAgainstProcessor(t *testing.T) {
 				aggregations[i].Func = aggFn
 				aggregations[i].ColIdx = []uint32{uint32(i + numGroupingCols)}
 			}
-			inputTypes := make([]types.T, len(aggregations)+numGroupingCols)
+			inputTypes := make([]*types.T, len(aggregations)+numGroupingCols)
 			for i := 0; i < numGroupingCols; i++ {
-				inputTypes[i] = *types.Int
+				inputTypes[i] = types.Int
 			}
-			outputTypes := make([]types.T, len(aggregations))
+			outputTypes := make([]*types.T, len(aggregations))
 
 			for run := 0; run < nRuns; run++ {
 				var rows sqlbase.EncDatumRows
@@ -89,20 +88,20 @@ func TestAggregatorAgainstProcessor(t *testing.T) {
 					var aggTyp *types.T
 					for {
 						aggTyp = sqlbase.RandType(rng)
-						aggInputTypes := []types.T{*aggTyp}
+						aggInputTypes := []*types.T{aggTyp}
 						if aggFn == execinfrapb.AggregatorSpec_COUNT_ROWS {
 							// Count rows takes no arguments.
 							aggregations[i].ColIdx = []uint32{}
 							aggInputTypes = aggInputTypes[:0]
 						}
-						if isSupportedType(aggTyp) {
+						if typeconv.IsTypeSupported(aggTyp) {
 							if _, outputType, err := execinfrapb.GetAggregateInfo(aggFn, aggInputTypes...); err == nil {
-								outputTypes[i] = *outputType
+								outputTypes[i] = outputType
 								break
 							}
 						}
 					}
-					inputTypes[i+numGroupingCols] = *aggTyp
+					inputTypes[i+numGroupingCols] = aggTyp
 				}
 				rows = sqlbase.RandEncDatumRowsOfTypes(rng, nRows, inputTypes)
 				groupIdx := 0
@@ -146,7 +145,7 @@ func TestAggregatorAgainstProcessor(t *testing.T) {
 				}
 				args := verifyColOperatorArgs{
 					anyOrder:    hashAgg,
-					inputTypes:  [][]types.T{inputTypes},
+					inputTypes:  [][]*types.T{inputTypes},
 					inputs:      []sqlbase.EncDatumRows{rows},
 					outputTypes: outputTypes,
 					pspec:       pspec,
@@ -181,9 +180,9 @@ func TestDistinctAgainstProcessor(t *testing.T) {
 	nRows := 10
 	maxCols := 3
 	maxNum := 3
-	intTyps := make([]types.T, maxCols)
+	intTyps := make([]*types.T, maxCols)
 	for i := range intTyps {
-		intTyps[i] = *types.Int
+		intTyps[i] = types.Int
 	}
 
 	for run := 0; run < nRuns; run++ {
@@ -192,7 +191,7 @@ func TestDistinctAgainstProcessor(t *testing.T) {
 				for nOrderedCols := 0; nOrderedCols <= nDistinctCols; nOrderedCols++ {
 					var (
 						rows       sqlbase.EncDatumRows
-						inputTypes []types.T
+						inputTypes []*types.T
 						ordCols    []execinfrapb.Ordering_Column
 					)
 					if rng.Float64() < randTypesProbability {
@@ -240,7 +239,7 @@ func TestDistinctAgainstProcessor(t *testing.T) {
 					}
 					args := verifyColOperatorArgs{
 						anyOrder:    false,
-						inputTypes:  [][]types.T{inputTypes},
+						inputTypes:  [][]*types.T{inputTypes},
 						inputs:      []sqlbase.EncDatumRows{rows},
 						outputTypes: inputTypes,
 						pspec:       pspec,
@@ -270,9 +269,9 @@ func TestSorterAgainstProcessor(t *testing.T) {
 	nRows := 8 * coldata.BatchSize()
 	maxCols := 5
 	maxNum := 10
-	intTyps := make([]types.T, maxCols)
+	intTyps := make([]*types.T, maxCols)
 	for i := range intTyps {
-		intTyps[i] = *types.Int
+		intTyps[i] = types.Int
 	}
 
 	for _, spillForced := range []bool{false, true} {
@@ -282,7 +281,7 @@ func TestSorterAgainstProcessor(t *testing.T) {
 				for _, topK := range []uint64{0, uint64(1 + rng.Intn(64))} {
 					var (
 						rows       sqlbase.EncDatumRows
-						inputTypes []types.T
+						inputTypes []*types.T
 					)
 					if rng.Float64() < randTypesProbability {
 						inputTypes = generateRandomSupportedTypes(rng, nCols)
@@ -310,7 +309,7 @@ func TestSorterAgainstProcessor(t *testing.T) {
 						Post:  execinfrapb.PostProcessSpec{Limit: limit, Offset: offset},
 					}
 					args := verifyColOperatorArgs{
-						inputTypes:     [][]types.T{inputTypes},
+						inputTypes:     [][]*types.T{inputTypes},
 						inputs:         []sqlbase.EncDatumRows{rows},
 						outputTypes:    inputTypes,
 						pspec:          pspec,
@@ -345,9 +344,9 @@ func TestSortChunksAgainstProcessor(t *testing.T) {
 	nRows := 5 * coldata.BatchSize() / 4
 	maxCols := 3
 	maxNum := 10
-	intTyps := make([]types.T, maxCols)
+	intTyps := make([]*types.T, maxCols)
 	for i := range intTyps {
-		intTyps[i] = *types.Int
+		intTyps[i] = types.Int
 	}
 
 	for _, spillForced := range []bool{false, true} {
@@ -356,7 +355,7 @@ func TestSortChunksAgainstProcessor(t *testing.T) {
 				for matchLen := 1; matchLen < nCols; matchLen++ {
 					var (
 						rows       sqlbase.EncDatumRows
-						inputTypes []types.T
+						inputTypes []*types.T
 					)
 					if rng.Float64() < randTypesProbability {
 						inputTypes = generateRandomSupportedTypes(rng, nCols)
@@ -389,7 +388,7 @@ func TestSortChunksAgainstProcessor(t *testing.T) {
 						Core:  execinfrapb.ProcessorCoreUnion{Sorter: sorterSpec},
 					}
 					args := verifyColOperatorArgs{
-						inputTypes:     [][]types.T{inputTypes},
+						inputTypes:     [][]*types.T{inputTypes},
 						inputs:         []sqlbase.EncDatumRows{rows},
 						outputTypes:    inputTypes,
 						pspec:          pspec,
@@ -445,9 +444,9 @@ func TestHashJoinerAgainstProcessor(t *testing.T) {
 	nRows := 10
 	maxCols := 3
 	maxNum := 5
-	intTyps := make([]types.T, maxCols)
+	intTyps := make([]*types.T, maxCols)
 	for i := range intTyps {
-		intTyps[i] = *types.Int
+		intTyps[i] = types.Int
 	}
 
 	for _, spillForced := range []bool{false, true} {
@@ -464,7 +463,7 @@ func TestHashJoinerAgainstProcessor(t *testing.T) {
 								var (
 									lRows, rRows             sqlbase.EncDatumRows
 									lEqCols, rEqCols         []uint32
-									lInputTypes, rInputTypes []types.T
+									lInputTypes, rInputTypes []*types.T
 									usingRandomTypes         bool
 								)
 								if rng.Float64() < randTypesProbability {
@@ -535,7 +534,7 @@ func TestHashJoinerAgainstProcessor(t *testing.T) {
 								}
 								args := verifyColOperatorArgs{
 									anyOrder:       true,
-									inputTypes:     [][]types.T{lInputTypes, rInputTypes},
+									inputTypes:     [][]*types.T{lInputTypes, rInputTypes},
 									inputs:         []sqlbase.EncDatumRows{lRows, rRows},
 									outputTypes:    outputTypes,
 									pspec:          pspec,
@@ -627,9 +626,9 @@ func TestMergeJoinerAgainstProcessor(t *testing.T) {
 	nRows := 10
 	maxCols := 3
 	maxNum := 5
-	intTyps := make([]types.T, maxCols)
+	intTyps := make([]*types.T, maxCols)
 	for i := range intTyps {
-		intTyps[i] = *types.Int
+		intTyps[i] = types.Int
 	}
 
 	for run := 0; run < nRuns; run++ {
@@ -644,7 +643,7 @@ func TestMergeJoinerAgainstProcessor(t *testing.T) {
 						for !triedWithoutOnExpr || !triedWithOnExpr {
 							var (
 								lRows, rRows                 sqlbase.EncDatumRows
-								lInputTypes, rInputTypes     []types.T
+								lInputTypes, rInputTypes     []*types.T
 								lOrderingCols, rOrderingCols []execinfrapb.Ordering_Column
 								usingRandomTypes             bool
 							)
@@ -729,7 +728,7 @@ func TestMergeJoinerAgainstProcessor(t *testing.T) {
 							}
 							args := verifyColOperatorArgs{
 								anyOrder:    testSpec.anyOrder,
-								inputTypes:  [][]types.T{lInputTypes, rInputTypes},
+								inputTypes:  [][]*types.T{lInputTypes, rInputTypes},
 								inputs:      []sqlbase.EncDatumRows{lRows, rRows},
 								outputTypes: outputTypes,
 								pspec:       pspec,
@@ -789,7 +788,7 @@ func generateFilterExpr(
 	rng *rand.Rand,
 	nCols int,
 	nEqCols int,
-	colTypes []types.T,
+	colTypes []*types.T,
 	forceConstComparison bool,
 	forceLeftSide bool,
 ) execinfrapb.Expression {
@@ -814,7 +813,7 @@ func generateFilterExpr(
 			// Use right side.
 			colIdx += nCols
 		}
-		constDatum := sqlbase.RandDatum(rng, &colTypes[colIdx], true /* nullOk */)
+		constDatum := sqlbase.RandDatum(rng, colTypes[colIdx], true /* nullOk */)
 		constDatumString := constDatum.String()
 		switch colTypes[colIdx].Family() {
 		case types.FloatFamily, types.DecimalFamily:
@@ -839,11 +838,11 @@ func TestWindowFunctionsAgainstProcessor(t *testing.T) {
 	nRows := 2 * coldata.BatchSize()
 	maxCols := 4
 	maxNum := 10
-	typs := make([]types.T, maxCols)
+	typs := make([]*types.T, maxCols)
 	for i := range typs {
 		// TODO(yuzefovich): randomize the types of the columns once we support
 		// window functions that take in arguments.
-		typs[i] = *types.Int
+		typs[i] = types.Int
 	}
 	for windowFn := range colexec.SupportedWindowFns {
 		for _, partitionBy := range [][]uint32{
@@ -891,9 +890,9 @@ func TestWindowFunctionsAgainstProcessor(t *testing.T) {
 					require.NoError(t, err)
 					args := verifyColOperatorArgs{
 						anyOrder:    true,
-						inputTypes:  [][]types.T{inputTypes},
+						inputTypes:  [][]*types.T{inputTypes},
 						inputs:      []sqlbase.EncDatumRows{rows},
-						outputTypes: append(inputTypes, *outputType),
+						outputTypes: append(inputTypes, outputType),
 						pspec:       pspec,
 					}
 					if err := verifyColOperator(args); err != nil {
@@ -907,19 +906,14 @@ func TestWindowFunctionsAgainstProcessor(t *testing.T) {
 	}
 }
 
-func isSupportedType(typ *types.T) bool {
-	converted := typeconv.FromColumnType(typ)
-	return converted != coltypes.Unhandled
-}
-
 // generateRandomSupportedTypes generates nCols random types that are supported
 // by the vectorized engine.
-func generateRandomSupportedTypes(rng *rand.Rand, nCols int) []types.T {
-	typs := make([]types.T, 0, nCols)
+func generateRandomSupportedTypes(rng *rand.Rand, nCols int) []*types.T {
+	typs := make([]*types.T, 0, nCols)
 	for len(typs) < nCols {
 		typ := sqlbase.RandType(rng)
-		if isSupportedType(typ) {
-			typs = append(typs, *typ)
+		if typeconv.IsTypeSupported(typ) {
+			typs = append(typs, typ)
 		}
 	}
 	return typs
@@ -928,12 +922,12 @@ func generateRandomSupportedTypes(rng *rand.Rand, nCols int) []types.T {
 // generateRandomComparableTypes generates random types that are supported by
 // the vectorized engine and are such that they are comparable to the
 // corresponding types in inputTypes.
-func generateRandomComparableTypes(rng *rand.Rand, inputTypes []types.T) []types.T {
-	typs := make([]types.T, len(inputTypes))
+func generateRandomComparableTypes(rng *rand.Rand, inputTypes []*types.T) []*types.T {
+	typs := make([]*types.T, len(inputTypes))
 	for i, inputType := range inputTypes {
 		for {
 			typ := sqlbase.RandType(rng)
-			if isSupportedType(typ) {
+			if typeconv.IsTypeSupported(typ) {
 				comparable := false
 				for _, cmpOverloads := range tree.CmpOps[tree.LT] {
 					o := cmpOverloads.(*tree.CmpOp)
@@ -950,7 +944,7 @@ func generateRandomComparableTypes(rng *rand.Rand, inputTypes []types.T) []types
 					}
 				}
 				if comparable {
-					typs[i] = *typ
+					typs[i] = typ
 					break
 				}
 			}
@@ -991,7 +985,7 @@ func generateOrderingGivenPartitionBy(
 }
 
 // prettyPrintTypes prints out typs as a CREATE TABLE statement.
-func prettyPrintTypes(typs []types.T, tableName string) {
+func prettyPrintTypes(typs []*types.T, tableName string) {
 	fmt.Printf("CREATE TABLE %s(", tableName)
 	colName := byte('a')
 	for typIdx, typ := range typs {
@@ -1005,12 +999,12 @@ func prettyPrintTypes(typs []types.T, tableName string) {
 }
 
 // prettyPrintInput prints out rows as INSERT INTO tableName VALUES statement.
-func prettyPrintInput(rows sqlbase.EncDatumRows, inputTypes []types.T, tableName string) {
+func prettyPrintInput(rows sqlbase.EncDatumRows, inputTypes []*types.T, tableName string) {
 	fmt.Printf("INSERT INTO %s VALUES\n", tableName)
 	for rowIdx, row := range rows {
-		fmt.Printf("(%s", row[0].String(&inputTypes[0]))
+		fmt.Printf("(%s", row[0].String(inputTypes[0]))
 		for i := range row[1:] {
-			fmt.Printf(", %s", row[i+1].String(&inputTypes[i+1]))
+			fmt.Printf(", %s", row[i+1].String(inputTypes[i+1]))
 		}
 		if rowIdx < len(rows)-1 {
 			fmt.Printf("),\n")

@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -148,7 +150,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 	}
 
 	if evalCtx.SessionData.VectorizeMode != sessiondata.VectorizeOff {
-		if !vectorizeThresholdMet && (evalCtx.SessionData.VectorizeMode == sessiondata.VectorizeAuto) {
+		if !vectorizeThresholdMet && (evalCtx.SessionData.VectorizeMode == sessiondata.Vectorize201Auto || evalCtx.SessionData.VectorizeMode == sessiondata.VectorizeOn) {
 			// Vectorization is not justified for this flow because the expected
 			// amount of data is too small and the overhead of pre-allocating data
 			// structures needed for the vectorized engine is expected to dominate
@@ -445,7 +447,7 @@ type DistSQLReceiver struct {
 	stmtType tree.StatementType
 
 	// outputTypes are the types of the result columns produced by the plan.
-	outputTypes []types.T
+	outputTypes []*types.T
 
 	// resultToStreamColMap maps result columns to columns in the rowexec results
 	// stream.
@@ -642,11 +644,7 @@ func (r *DistSQLReceiver) Push(
 			// previous error (if any).
 			if roachpb.ErrPriority(meta.Err) > roachpb.ErrPriority(r.resultWriter.Err()) {
 				if r.txn != nil {
-					if err, ok := errors.If(meta.Err, func(err error) (v interface{}, ok bool) {
-						v, ok = err.(*roachpb.UnhandledRetryableError)
-						return v, ok
-					}); ok {
-						retryErr := err.(*roachpb.UnhandledRetryableError)
+					if retryErr := (*roachpb.UnhandledRetryableError)(nil); errors.As(meta.Err, &retryErr) {
 						// Update the txn in response to remote errors. In the non-DistSQL
 						// world, the TxnCoordSender handles "unhandled" retryable errors,
 						// but this one is coming from a distributed SQL node, which has
@@ -727,7 +725,7 @@ func (r *DistSQLReceiver) Push(
 			r.row = make(tree.Datums, len(r.resultToStreamColMap))
 		}
 		for i, resIdx := range r.resultToStreamColMap {
-			err := row[resIdx].EnsureDecoded(&r.outputTypes[resIdx], &r.alloc)
+			err := row[resIdx].EnsureDecoded(r.outputTypes[resIdx], &r.alloc)
 			if err != nil {
 				r.resultWriter.SetError(err)
 				r.status = execinfra.ConsumerClosed
@@ -788,7 +786,7 @@ func (r *DistSQLReceiver) ProducerDone() {
 }
 
 // Types is part of the RowReceiver interface.
-func (r *DistSQLReceiver) Types() []types.T {
+func (r *DistSQLReceiver) Types() []*types.T {
 	return r.outputTypes
 }
 
@@ -907,7 +905,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	var rows *rowcontainer.RowContainer
 	if subqueryPlan.execMode == rowexec.SubqueryExecModeExists {
 		subqueryRecv.noColsRequired = true
-		typ = sqlbase.ColTypeInfoFromColTypes([]types.T{})
+		typ = sqlbase.ColTypeInfoFromColTypes([]*types.T{})
 	} else {
 		// Apply the PlanToStreamColMap projection to the ResultTypes to get the
 		// final set of output types for the subquery. The reason this is necessary
@@ -915,7 +913,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 		// to merge the streams, but that aren't required by the final output of the
 		// query. These get projected out, so we need to similarly adjust the
 		// expected result types of the subquery here.
-		colTypes := make([]types.T, len(subqueryPhysPlan.PlanToStreamColMap))
+		colTypes := make([]*types.T, len(subqueryPhysPlan.PlanToStreamColMap))
 		for i, resIdx := range subqueryPhysPlan.PlanToStreamColMap {
 			colTypes[i] = subqueryPhysPlan.ResultTypes[resIdx]
 		}
@@ -1058,6 +1056,10 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 		// We place a sequence point before every cascade, so
 		// that each subsequent cascade can observe the writes
 		// by the previous step.
+		// TODO(radu): the cascades themselves can have more cascades; if any of
+		// those fall back to legacy cascades code, it will disable stepping. So we
+		// have to reenable stepping each time.
+		_ = planner.Txn().ConfigureStepping(ctx, kv.SteppingEnabled)
 		if err := planner.Txn().Step(ctx); err != nil {
 			recv.SetError(err)
 			return false
@@ -1081,14 +1083,22 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 
 		// Queue any new cascades.
 		if len(cp.cascades) > 0 {
-			// TODO(radu): append cascade, effectively making this a queue.
-			recv.SetError(errors.Newf("cascading not implemented yet"))
-			return false
+			plan.cascades = append(plan.cascades, cp.cascades...)
 		}
 
 		// Collect any new checks.
 		if len(cp.checkPlans) > 0 {
 			plan.checkPlans = append(plan.checkPlans, cp.checkPlans...)
+		}
+
+		// In cyclical reference situations, the number of cascading operations can
+		// be arbitrarily large. To avoid OOM, we enforce a limit. This is also a
+		// safeguard in case we have a bug that results in an infinite cascade loop.
+		if limit := evalCtx.SessionData.OptimizerFKCascadesLimit; len(plan.cascades) > limit {
+			telemetry.Inc(sqltelemetry.CascadesLimitReached)
+			err := pgerror.Newf(pgcode.TriggeredActionException, "cascades limit (%d) reached", limit)
+			recv.SetError(err)
+			return false
 		}
 
 		if err := dsp.planAndRunPostquery(
@@ -1110,6 +1120,10 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 
 	// We place a sequence point before the checks, so that they observe the
 	// writes of the main query and/or any cascades.
+	// TODO(radu): the cascades themselves can have more cascades; if any of
+	// those fall back to legacy cascades code, it will disable stepping. So we
+	// have to reenable stepping each time.
+	_ = planner.Txn().ConfigureStepping(ctx, kv.SteppingEnabled)
 	if err := planner.Txn().Step(ctx); err != nil {
 		recv.SetError(err)
 		return false

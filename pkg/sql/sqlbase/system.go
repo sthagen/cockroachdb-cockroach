@@ -378,9 +378,9 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "parentID", ID: 1, Type: *types.Int},
-			{Name: "name", ID: 2, Type: *types.String},
-			{Name: "id", ID: 3, Type: *types.Int, Nullable: true},
+			{Name: "parentID", ID: 1, Type: types.Int},
+			{Name: "name", ID: 2, Type: types.String},
+			{Name: "id", ID: 3, Type: types.Int, Nullable: true},
 		},
 		NextColumnID: 4,
 		Families: []ColumnFamilyDescriptor{
@@ -422,10 +422,10 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "parentID", ID: 1, Type: *types.Int},
-			{Name: "parentSchemaID", ID: 2, Type: *types.Int},
-			{Name: "name", ID: 3, Type: *types.String},
-			{Name: "id", ID: 4, Type: *types.Int, Nullable: true},
+			{Name: "parentID", ID: 1, Type: types.Int},
+			{Name: "parentSchemaID", ID: 2, Type: types.Int},
+			{Name: "name", ID: 3, Type: types.String},
+			{Name: "id", ID: 4, Type: types.Int, Nullable: true},
 		},
 		NextColumnID: 5,
 		Families: []ColumnFamilyDescriptor{
@@ -457,8 +457,8 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "id", ID: 1, Type: *types.Int},
-			{Name: "descriptor", ID: keys.DescriptorTableDescriptorColID, Type: *types.Bytes, Nullable: true},
+			{Name: "id", ID: 1, Type: types.Int},
+			{Name: "descriptor", ID: keys.DescriptorTableDescriptorColID, Type: types.Bytes, Nullable: true},
 		},
 		NextColumnID: 3,
 		Families: []ColumnFamilyDescriptor{
@@ -486,9 +486,9 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "username", ID: 1, Type: *types.String},
-			{Name: "hashedPassword", ID: 2, Type: *types.Bytes, Nullable: true},
-			{Name: "isRole", ID: 3, Type: *types.Bool, DefaultExpr: &falseBoolString},
+			{Name: "username", ID: 1, Type: types.String},
+			{Name: "hashedPassword", ID: 2, Type: types.Bytes, Nullable: true},
+			{Name: "isRole", ID: 3, Type: types.Bool, DefaultExpr: &falseBoolString},
 		},
 		NextColumnID: 4,
 		Families: []ColumnFamilyDescriptor{
@@ -512,8 +512,8 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "id", ID: 1, Type: *types.Int},
-			{Name: "config", ID: keys.ZonesTableConfigColumnID, Type: *types.Bytes, Nullable: true},
+			{Name: "id", ID: 1, Type: types.Int},
+			{Name: "config", ID: keys.ZonesTableConfigColumnID, Type: types.Bytes, Nullable: true},
 		},
 		NextColumnID: 3,
 		Families: []ColumnFamilyDescriptor{
@@ -546,10 +546,10 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "name", ID: 1, Type: *types.String},
-			{Name: "value", ID: 2, Type: *types.String},
-			{Name: "lastUpdated", ID: 3, Type: *types.Timestamp, DefaultExpr: &nowString},
-			{Name: "valueType", ID: 4, Type: *types.String, Nullable: true},
+			{Name: "name", ID: 1, Type: types.String},
+			{Name: "value", ID: 2, Type: types.String},
+			{Name: "lastUpdated", ID: 3, Type: types.Timestamp, DefaultExpr: &nowString},
+			{Name: "valueType", ID: 4, Type: types.String, Nullable: true},
 		},
 		NextColumnID: 5,
 		Families: []ColumnFamilyDescriptor{
@@ -583,10 +583,10 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "descID", ID: 1, Type: *types.Int},
-			{Name: "version", ID: 2, Type: *types.Int},
-			{Name: "nodeID", ID: 3, Type: *types.Int},
-			{Name: "expiration", ID: 4, Type: *types.Timestamp},
+			{Name: "descID", ID: 1, Type: types.Int},
+			{Name: "version", ID: 2, Type: types.Int},
+			{Name: "nodeID", ID: 3, Type: types.Int},
+			{Name: "expiration", ID: 4, Type: types.Timestamp},
 		},
 		NextColumnID: 5,
 		Families: []ColumnFamilyDescriptor{
@@ -618,12 +618,12 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "timestamp", ID: 1, Type: *types.Timestamp},
-			{Name: "eventType", ID: 2, Type: *types.String},
-			{Name: "targetID", ID: 3, Type: *types.Int},
-			{Name: "reportingID", ID: 4, Type: *types.Int},
-			{Name: "info", ID: 5, Type: *types.String, Nullable: true},
-			{Name: "uniqueID", ID: 6, Type: *types.Bytes, DefaultExpr: &uuidV4String},
+			{Name: "timestamp", ID: 1, Type: types.Timestamp},
+			{Name: "eventType", ID: 2, Type: types.String},
+			{Name: "targetID", ID: 3, Type: types.Int},
+			{Name: "reportingID", ID: 4, Type: types.Int},
+			{Name: "info", ID: 5, Type: types.String, Nullable: true},
+			{Name: "uniqueID", ID: 6, Type: types.Bytes, DefaultExpr: &uuidV4String},
 		},
 		NextColumnID: 7,
 		Families: []ColumnFamilyDescriptor{
@@ -659,13 +659,13 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "timestamp", ID: 1, Type: *types.Timestamp},
-			{Name: "rangeID", ID: 2, Type: *types.Int},
-			{Name: "storeID", ID: 3, Type: *types.Int},
-			{Name: "eventType", ID: 4, Type: *types.String},
-			{Name: "otherRangeID", ID: 5, Type: *types.Int, Nullable: true},
-			{Name: "info", ID: 6, Type: *types.String, Nullable: true},
-			{Name: "uniqueID", ID: 7, Type: *types.Int, DefaultExpr: &uniqueRowIDString},
+			{Name: "timestamp", ID: 1, Type: types.Timestamp},
+			{Name: "rangeID", ID: 2, Type: types.Int},
+			{Name: "storeID", ID: 3, Type: types.Int},
+			{Name: "eventType", ID: 4, Type: types.String},
+			{Name: "otherRangeID", ID: 5, Type: types.Int, Nullable: true},
+			{Name: "info", ID: 6, Type: types.String, Nullable: true},
+			{Name: "uniqueID", ID: 7, Type: types.Int, DefaultExpr: &uniqueRowIDString},
 		},
 		NextColumnID: 8,
 		Families: []ColumnFamilyDescriptor{
@@ -700,9 +700,9 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "key", ID: 1, Type: *types.String},
-			{Name: "value", ID: 2, Type: *types.Bytes, Nullable: true},
-			{Name: "lastUpdated", ID: 3, Type: *types.Timestamp},
+			{Name: "key", ID: 1, Type: types.String},
+			{Name: "value", ID: 2, Type: types.Bytes, Nullable: true},
+			{Name: "lastUpdated", ID: 3, Type: types.Timestamp},
 		},
 		NextColumnID: 4,
 		Families: []ColumnFamilyDescriptor{
@@ -728,11 +728,11 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "id", ID: 1, Type: *types.Int, DefaultExpr: &uniqueRowIDString},
-			{Name: "status", ID: 2, Type: *types.String},
-			{Name: "created", ID: 3, Type: *types.Timestamp, DefaultExpr: &nowString},
-			{Name: "payload", ID: 4, Type: *types.Bytes},
-			{Name: "progress", ID: 5, Type: *types.Bytes, Nullable: true},
+			{Name: "id", ID: 1, Type: types.Int, DefaultExpr: &uniqueRowIDString},
+			{Name: "status", ID: 2, Type: types.String},
+			{Name: "created", ID: 3, Type: types.Timestamp, DefaultExpr: &nowString},
+			{Name: "payload", ID: 4, Type: types.Bytes},
+			{Name: "progress", ID: 5, Type: types.Bytes, Nullable: true},
 		},
 		NextColumnID: 6,
 		Families: []ColumnFamilyDescriptor{
@@ -778,14 +778,14 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "id", ID: 1, Type: *types.Int, DefaultExpr: &uniqueRowIDString},
-			{Name: "hashedSecret", ID: 2, Type: *types.Bytes},
-			{Name: "username", ID: 3, Type: *types.String},
-			{Name: "createdAt", ID: 4, Type: *types.Timestamp, DefaultExpr: &nowString},
-			{Name: "expiresAt", ID: 5, Type: *types.Timestamp},
-			{Name: "revokedAt", ID: 6, Type: *types.Timestamp, Nullable: true},
-			{Name: "lastUsedAt", ID: 7, Type: *types.Timestamp, DefaultExpr: &nowString},
-			{Name: "auditInfo", ID: 8, Type: *types.String, Nullable: true},
+			{Name: "id", ID: 1, Type: types.Int, DefaultExpr: &uniqueRowIDString},
+			{Name: "hashedSecret", ID: 2, Type: types.Bytes},
+			{Name: "username", ID: 3, Type: types.String},
+			{Name: "createdAt", ID: 4, Type: types.Timestamp, DefaultExpr: &nowString},
+			{Name: "expiresAt", ID: 5, Type: types.Timestamp},
+			{Name: "revokedAt", ID: 6, Type: types.Timestamp, Nullable: true},
+			{Name: "lastUsedAt", ID: 7, Type: types.Timestamp, DefaultExpr: &nowString},
+			{Name: "auditInfo", ID: 8, Type: types.String, Nullable: true},
 		},
 		NextColumnID: 9,
 		Families: []ColumnFamilyDescriptor{
@@ -843,15 +843,15 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "tableID", ID: 1, Type: *types.Int},
-			{Name: "statisticID", ID: 2, Type: *types.Int, DefaultExpr: &uniqueRowIDString},
-			{Name: "name", ID: 3, Type: *types.String, Nullable: true},
-			{Name: "columnIDs", ID: 4, Type: *types.IntArray},
-			{Name: "createdAt", ID: 5, Type: *types.Timestamp, DefaultExpr: &nowString},
-			{Name: "rowCount", ID: 6, Type: *types.Int},
-			{Name: "distinctCount", ID: 7, Type: *types.Int},
-			{Name: "nullCount", ID: 8, Type: *types.Int},
-			{Name: "histogram", ID: 9, Type: *types.Bytes, Nullable: true},
+			{Name: "tableID", ID: 1, Type: types.Int},
+			{Name: "statisticID", ID: 2, Type: types.Int, DefaultExpr: &uniqueRowIDString},
+			{Name: "name", ID: 3, Type: types.String, Nullable: true},
+			{Name: "columnIDs", ID: 4, Type: types.IntArray},
+			{Name: "createdAt", ID: 5, Type: types.Timestamp, DefaultExpr: &nowString},
+			{Name: "rowCount", ID: 6, Type: types.Int},
+			{Name: "distinctCount", ID: 7, Type: types.Int},
+			{Name: "nullCount", ID: 8, Type: types.Int},
+			{Name: "histogram", ID: 9, Type: types.Bytes, Nullable: true},
 		},
 		NextColumnID: 10,
 		Families: []ColumnFamilyDescriptor{
@@ -898,10 +898,10 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "localityKey", ID: 1, Type: *types.String},
-			{Name: "localityValue", ID: 2, Type: *types.String},
-			{Name: "latitude", ID: 3, Type: *latLonDecimal},
-			{Name: "longitude", ID: 4, Type: *latLonDecimal},
+			{Name: "localityKey", ID: 1, Type: types.String},
+			{Name: "localityValue", ID: 2, Type: types.String},
+			{Name: "latitude", ID: 3, Type: latLonDecimal},
+			{Name: "longitude", ID: 4, Type: latLonDecimal},
 		},
 		NextColumnID: 5,
 		Families: []ColumnFamilyDescriptor{
@@ -936,9 +936,9 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "role", ID: 1, Type: *types.String},
-			{Name: "member", ID: 2, Type: *types.String},
-			{Name: "isAdmin", ID: 3, Type: *types.Bool},
+			{Name: "role", ID: 1, Type: types.String},
+			{Name: "member", ID: 2, Type: types.String},
+			{Name: "isAdmin", ID: 3, Type: types.Bool},
 		},
 		NextColumnID: 4,
 		Families: []ColumnFamilyDescriptor{
@@ -1002,10 +1002,10 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "type", ID: 1, Type: *types.Int},
-			{Name: "object_id", ID: 2, Type: *types.Int},
-			{Name: "sub_id", ID: 3, Type: *types.Int},
-			{Name: "comment", ID: 4, Type: *types.String},
+			{Name: "type", ID: 1, Type: types.Int},
+			{Name: "object_id", ID: 2, Type: types.Int},
+			{Name: "sub_id", ID: 3, Type: types.Int},
+			{Name: "comment", ID: 4, Type: types.String},
 		},
 		NextColumnID: 5,
 		Families: []ColumnFamilyDescriptor{
@@ -1035,8 +1035,8 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "id", ID: 1, Type: *types.Int},
-			{Name: "generated", ID: 2, Type: *types.TimestampTZ},
+			{Name: "id", ID: 1, Type: types.Int},
+			{Name: "generated", ID: 2, Type: types.TimestampTZ},
 		},
 		NextColumnID: 3,
 		Families: []ColumnFamilyDescriptor{
@@ -1076,13 +1076,13 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "zone_id", ID: 1, Type: *types.Int},
-			{Name: "subzone_id", ID: 2, Type: *types.Int},
-			{Name: "type", ID: 3, Type: *types.String},
-			{Name: "config", ID: 4, Type: *types.String},
-			{Name: "report_id", ID: 5, Type: *types.Int},
-			{Name: "violation_start", ID: 6, Type: *types.TimestampTZ, Nullable: true},
-			{Name: "violating_ranges", ID: 7, Type: *types.Int},
+			{Name: "zone_id", ID: 1, Type: types.Int},
+			{Name: "subzone_id", ID: 2, Type: types.Int},
+			{Name: "type", ID: 3, Type: types.String},
+			{Name: "config", ID: 4, Type: types.String},
+			{Name: "report_id", ID: 5, Type: types.Int},
+			{Name: "violation_start", ID: 6, Type: types.TimestampTZ, Nullable: true},
+			{Name: "violating_ranges", ID: 7, Type: types.Int},
 		},
 		NextColumnID: 8,
 		Families: []ColumnFamilyDescriptor{
@@ -1129,11 +1129,11 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "zone_id", ID: 1, Type: *types.Int},
-			{Name: "subzone_id", ID: 2, Type: *types.Int},
-			{Name: "locality", ID: 3, Type: *types.String},
-			{Name: "report_id", ID: 4, Type: *types.Int},
-			{Name: "at_risk_ranges", ID: 5, Type: *types.Int},
+			{Name: "zone_id", ID: 1, Type: types.Int},
+			{Name: "subzone_id", ID: 2, Type: types.Int},
+			{Name: "locality", ID: 3, Type: types.String},
+			{Name: "report_id", ID: 4, Type: types.Int},
+			{Name: "at_risk_ranges", ID: 5, Type: types.Int},
 		},
 		NextColumnID: 6,
 		Families: []ColumnFamilyDescriptor{
@@ -1179,13 +1179,13 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "zone_id", ID: 1, Type: *types.Int},
-			{Name: "subzone_id", ID: 2, Type: *types.Int},
-			{Name: "report_id", ID: 3, Type: *types.Int},
-			{Name: "total_ranges", ID: 4, Type: *types.Int},
-			{Name: "unavailable_ranges", ID: 5, Type: *types.Int},
-			{Name: "under_replicated_ranges", ID: 6, Type: *types.Int},
-			{Name: "over_replicated_ranges", ID: 7, Type: *types.Int},
+			{Name: "zone_id", ID: 1, Type: types.Int},
+			{Name: "subzone_id", ID: 2, Type: types.Int},
+			{Name: "report_id", ID: 3, Type: types.Int},
+			{Name: "total_ranges", ID: 4, Type: types.Int},
+			{Name: "unavailable_ranges", ID: 5, Type: types.Int},
+			{Name: "under_replicated_ranges", ID: 6, Type: types.Int},
+			{Name: "over_replicated_ranges", ID: 7, Type: types.Int},
 		},
 		NextColumnID: 8,
 		Families: []ColumnFamilyDescriptor{
@@ -1230,13 +1230,13 @@ var (
 			{
 				Name:        "singleton",
 				ID:          1,
-				Type:        *types.Bool,
+				Type:        types.Bool,
 				DefaultExpr: &trueBoolString,
 			},
-			{Name: "version", ID: 2, Type: *types.Int},
-			{Name: "num_records", ID: 3, Type: *types.Int},
-			{Name: "num_spans", ID: 4, Type: *types.Int},
-			{Name: "total_bytes", ID: 5, Type: *types.Int},
+			{Name: "version", ID: 2, Type: types.Int},
+			{Name: "num_records", ID: 3, Type: types.Int},
+			{Name: "num_spans", ID: 4, Type: types.Int},
+			{Name: "total_bytes", ID: 5, Type: types.Int},
 		},
 		Checks: []*TableDescriptor_CheckConstraint{
 			{
@@ -1278,13 +1278,13 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "id", ID: 1, Type: *types.Uuid},
-			{Name: "ts", ID: 2, Type: *types.Decimal},
-			{Name: "meta_type", ID: 3, Type: *types.String},
-			{Name: "meta", ID: 4, Type: *types.Bytes, Nullable: true},
-			{Name: "num_spans", ID: 5, Type: *types.Int},
-			{Name: "spans", ID: 6, Type: *types.Bytes},
-			{Name: "verified", ID: 7, Type: *types.Bool, DefaultExpr: &falseBoolString},
+			{Name: "id", ID: 1, Type: types.Uuid},
+			{Name: "ts", ID: 2, Type: types.Decimal},
+			{Name: "meta_type", ID: 3, Type: types.String},
+			{Name: "meta", ID: 4, Type: types.Bytes, Nullable: true},
+			{Name: "num_spans", ID: 5, Type: types.Int},
+			{Name: "spans", ID: 6, Type: types.Bytes},
+			{Name: "verified", ID: 7, Type: types.Bool, DefaultExpr: &falseBoolString},
 		},
 		NextColumnID: 8,
 		Families: []ColumnFamilyDescriptor{
@@ -1320,9 +1320,9 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "username", ID: 1, Type: *types.String},
-			{Name: "option", ID: 2, Type: *types.String},
-			{Name: "value", ID: 3, Type: *types.String, Nullable: true},
+			{Name: "username", ID: 1, Type: types.String},
+			{Name: "option", ID: 2, Type: types.String},
+			{Name: "value", ID: 3, Type: types.String, Nullable: true},
 		},
 		NextColumnID: 4,
 		Families: []ColumnFamilyDescriptor{
@@ -1356,9 +1356,9 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "id", ID: 1, Type: *types.Int, DefaultExpr: &uniqueRowIDString},
-			{Name: "description", ID: 2, Type: *types.String, Nullable: true},
-			{Name: "data", ID: 3, Type: *types.Bytes},
+			{Name: "id", ID: 1, Type: types.Int, DefaultExpr: &uniqueRowIDString},
+			{Name: "description", ID: 2, Type: types.String, Nullable: true},
+			{Name: "data", ID: 3, Type: types.Bytes},
 		},
 		NextColumnID: 4,
 		Families: []ColumnFamilyDescriptor{
@@ -1385,11 +1385,11 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "id", ID: 1, Type: *types.Int, DefaultExpr: &uniqueRowIDString, Nullable: false},
-			{Name: "completed", ID: 2, Type: *types.Bool, Nullable: false, DefaultExpr: &falseBoolString},
-			{Name: "statement_fingerprint", ID: 3, Type: *types.String, Nullable: false},
-			{Name: "statement_diagnostics_id", ID: 4, Type: *types.Int, Nullable: true},
-			{Name: "requested_at", ID: 5, Type: *types.TimestampTZ, Nullable: false},
+			{Name: "id", ID: 1, Type: types.Int, DefaultExpr: &uniqueRowIDString, Nullable: false},
+			{Name: "completed", ID: 2, Type: types.Bool, Nullable: false, DefaultExpr: &falseBoolString},
+			{Name: "statement_fingerprint", ID: 3, Type: types.String, Nullable: false},
+			{Name: "statement_diagnostics_id", ID: 4, Type: types.Int, Nullable: true},
+			{Name: "requested_at", ID: 5, Type: types.TimestampTZ, Nullable: false},
 		},
 		NextColumnID: 6,
 		Families: []ColumnFamilyDescriptor{
@@ -1429,13 +1429,13 @@ var (
 		UnexposedParentSchemaID: keys.PublicSchemaID,
 		Version:                 1,
 		Columns: []ColumnDescriptor{
-			{Name: "id", ID: 1, Type: *types.Int, DefaultExpr: &uniqueRowIDString, Nullable: false},
-			{Name: "statement_fingerprint", ID: 2, Type: *types.String, Nullable: false},
-			{Name: "statement", ID: 3, Type: *types.String, Nullable: false},
-			{Name: "collected_at", ID: 4, Type: *types.TimestampTZ, Nullable: false},
-			{Name: "trace", ID: 5, Type: *types.Jsonb, Nullable: true},
-			{Name: "bundle_chunks", ID: 6, Type: *types.IntArray, Nullable: true},
-			{Name: "error", ID: 7, Type: *types.String, Nullable: true},
+			{Name: "id", ID: 1, Type: types.Int, DefaultExpr: &uniqueRowIDString, Nullable: false},
+			{Name: "statement_fingerprint", ID: 2, Type: types.String, Nullable: false},
+			{Name: "statement", ID: 3, Type: types.String, Nullable: false},
+			{Name: "collected_at", ID: 4, Type: types.TimestampTZ, Nullable: false},
+			{Name: "trace", ID: 5, Type: types.Jsonb, Nullable: true},
+			{Name: "bundle_chunks", ID: 6, Type: types.IntArray, Nullable: true},
+			{Name: "error", ID: 7, Type: types.String, Nullable: true},
 		},
 		NextColumnID: 8,
 		Families: []ColumnFamilyDescriptor{
@@ -1457,13 +1457,15 @@ var (
 )
 
 // Create a kv pair for the zone config for the given key and config value.
-func createZoneConfigKV(keyID int, zoneConfig *zonepb.ZoneConfig) roachpb.KeyValue {
+func createZoneConfigKV(
+	keyID int, codec keys.SQLCodec, zoneConfig *zonepb.ZoneConfig,
+) roachpb.KeyValue {
 	value := roachpb.Value{}
 	if err := value.SetProto(zoneConfig); err != nil {
 		panic(fmt.Sprintf("could not marshal ZoneConfig for ID: %d: %s", keyID, err))
 	}
 	return roachpb.KeyValue{
-		Key:   keys.TODOSQLCodec.ZoneKey(uint32(keyID)),
+		Key:   codec.ZoneKey(uint32(keyID)),
 		Value: value,
 	}
 }
@@ -1529,7 +1531,8 @@ func addSystemDatabaseToSchema(
 	// and also created as a migration for older cluster. The includedInBootstrap
 	// field should be set on the migration.
 
-	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.RootNamespaceID, defaultZoneConfig))
+	target.otherKV = append(target.otherKV,
+		createZoneConfigKV(keys.RootNamespaceID, target.codec, defaultZoneConfig))
 
 	systemZoneConf := defaultSystemZoneConfig
 	metaRangeZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*zonepb.ZoneConfig)
@@ -1537,7 +1540,8 @@ func addSystemDatabaseToSchema(
 
 	// .meta zone config entry with a shorter GC time.
 	metaRangeZoneConf.GC.TTLSeconds = 60 * 60 // 1h
-	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.MetaRangesID, metaRangeZoneConf))
+	target.otherKV = append(target.otherKV,
+		createZoneConfigKV(keys.MetaRangesID, target.codec, metaRangeZoneConf))
 
 	// Some reporting tables have shorter GC times.
 	replicationConstraintStatsZoneConf := &zonepb.ZoneConfig{
@@ -1549,13 +1553,16 @@ func addSystemDatabaseToSchema(
 
 	// Liveness zone config entry with a shorter GC time.
 	livenessZoneConf.GC.TTLSeconds = 10 * 60 // 10m
-	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.LivenessRangesID, livenessZoneConf))
-	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.SystemRangesID, systemZoneConf))
-	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.SystemDatabaseID, systemZoneConf))
 	target.otherKV = append(target.otherKV,
-		createZoneConfigKV(keys.ReplicationConstraintStatsTableID, replicationConstraintStatsZoneConf))
+		createZoneConfigKV(keys.LivenessRangesID, target.codec, livenessZoneConf))
 	target.otherKV = append(target.otherKV,
-		createZoneConfigKV(keys.ReplicationStatsTableID, replicationStatsZoneConf))
+		createZoneConfigKV(keys.SystemRangesID, target.codec, systemZoneConf))
+	target.otherKV = append(target.otherKV,
+		createZoneConfigKV(keys.SystemDatabaseID, target.codec, systemZoneConf))
+	target.otherKV = append(target.otherKV,
+		createZoneConfigKV(keys.ReplicationConstraintStatsTableID, target.codec, replicationConstraintStatsZoneConf))
+	target.otherKV = append(target.otherKV,
+		createZoneConfigKV(keys.ReplicationStatsTableID, target.codec, replicationStatsZoneConf))
 }
 
 // IsSystemConfigID returns whether this ID is for a system config object.

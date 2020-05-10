@@ -492,7 +492,7 @@ func testSQLServerArgs(ts *TestServer) sqlServerArgs {
 			distSender:   ds,
 			statusServer: noStatusServer,
 			nodeLiveness: nl,
-			gossip:       gossip.MakeDeprecatedGossip(g, false /* exposed */),
+			gossip:       gossip.MakeUnexposedGossip(g),
 			nodeDialer:   nd,
 			grpcServer:   dummyRPCServer,
 			recorder:     dummyRecorder,
@@ -586,7 +586,9 @@ func (ts *TestServer) ExpectedInitialRangeCount() (int, error) {
 func ExpectedInitialRangeCount(
 	db *kv.DB, defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) (int, error) {
-	descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(context.Background(), db, defaultZoneConfig, defaultSystemZoneConfig)
+	descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(
+		context.Background(), db, keys.SystemSQLCodec, defaultZoneConfig, defaultSystemZoneConfig,
+	)
 	if err != nil {
 		return 0, err
 	}

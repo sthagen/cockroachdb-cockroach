@@ -33,9 +33,9 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-var csvOutputTypes = []types.T{
-	*types.Bytes,
-	*types.Bytes,
+var csvOutputTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
 }
 
 type readImportDataProcessor struct {
@@ -46,7 +46,7 @@ type readImportDataProcessor struct {
 
 var _ execinfra.Processor = &readImportDataProcessor{}
 
-func (cp *readImportDataProcessor) OutputTypes() []types.T {
+func (cp *readImportDataProcessor) OutputTypes() []*types.T {
 	return csvOutputTypes
 }
 
@@ -332,14 +332,14 @@ func ingestKvs(
 				// more efficient than parsing every kv.
 				if indexID == 1 {
 					if err := pkIndexAdder.Add(ctx, kv.Key, kv.Value.RawBytes); err != nil {
-						if _, ok := err.(storagebase.DuplicateKeyError); ok {
+						if errors.HasType(err, (*storagebase.DuplicateKeyError)(nil)) {
 							return errors.Wrap(err, "duplicate key in primary index")
 						}
 						return err
 					}
 				} else {
 					if err := indexAdder.Add(ctx, kv.Key, kv.Value.RawBytes); err != nil {
-						if _, ok := err.(storagebase.DuplicateKeyError); ok {
+						if errors.HasType(err, (*storagebase.DuplicateKeyError)(nil)) {
 							return errors.Wrap(err, "duplicate key in index")
 						}
 						return err
@@ -363,14 +363,14 @@ func ingestKvs(
 	}
 
 	if err := pkIndexAdder.Flush(ctx); err != nil {
-		if err, ok := err.(storagebase.DuplicateKeyError); ok {
+		if errors.HasType(err, (*storagebase.DuplicateKeyError)(nil)) {
 			return nil, errors.Wrap(err, "duplicate key in primary index")
 		}
 		return nil, err
 	}
 
 	if err := indexAdder.Flush(ctx); err != nil {
-		if err, ok := err.(storagebase.DuplicateKeyError); ok {
+		if errors.HasType(err, (*storagebase.DuplicateKeyError)(nil)) {
 			return nil, errors.Wrap(err, "duplicate key in index")
 		}
 		return nil, err

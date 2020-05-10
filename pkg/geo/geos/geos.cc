@@ -8,16 +8,28 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-// +build !windows
-
 #include <cstdarg>
 #include <cstring>
+#if _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif // #if _WIN32
 #include <memory>
 #include <stdlib.h>
 #include <string>
 
-#include "geos_unix.h"
+#include "geos.h"
+
+#if _WIN32
+#define dlopen(x,y) LoadLibrary(x)
+#define dlsym GetProcAddress
+#define dlclose FreeLibrary
+#define dlerror() ((char*) "failed to execute dlsym")
+typedef HMODULE dlhandle;
+#else
+typedef void* dlhandle;
+#endif // #if _WIN32
 
 #define CR_GEOS_NO_ERROR_DEFINED_MESSAGE "geos: returned invalid result but error not populated"
 
@@ -82,7 +94,7 @@ const char* dlopenFailError = "failed to execute dlopen";
 }  // namespace
 
 struct CR_GEOS {
-  void* dlHandle;
+  dlhandle dlHandle;
 
   CR_GEOS_init_r GEOS_init_r;
   CR_GEOS_finish_r GEOS_finish_r;
@@ -123,7 +135,7 @@ struct CR_GEOS {
 
   CR_GEOS_ClipByRect_r GEOSClipByRect_r;
 
-  CR_GEOS(void* h) : dlHandle(h) {}
+  CR_GEOS(dlhandle h) : dlHandle(h) {}
 
   ~CR_GEOS() {
     if (dlHandle != NULL) {
@@ -203,7 +215,7 @@ CR_GEOS_String toGEOSString(const char* data, size_t len) {
 
 CR_GEOS_Slice CR_GEOS_Init(CR_GEOS_Slice loc, CR_GEOS** lib) {
   auto locStr = ToString(loc);
-  void* dlHandle = dlopen(locStr.c_str(), RTLD_LAZY);
+  dlhandle dlHandle = dlopen(locStr.c_str(), RTLD_LAZY);
   if (!dlHandle) {
     return cStringToSlice((char*)dlopenFailError);
   }
@@ -304,6 +316,7 @@ CR_GEOS_Status CR_GEOS_UnaryOperator(CR_GEOS* lib, T fn, CR_GEOS_Slice a, R *ret
         error.assign(CR_GEOS_NO_ERROR_DEFINED_MESSAGE);
       }
     }
+    lib->GEOSGeom_destroy_r(handle, geom);
   }
   lib->GEOS_finish_r(handle);
   return toGEOSString(error.data(), error.length());
@@ -325,6 +338,12 @@ CR_GEOS_Status CR_GEOS_BinaryOperator(CR_GEOS* lib, T fn, CR_GEOS_Slice a, CR_GE
         error.assign(CR_GEOS_NO_ERROR_DEFINED_MESSAGE);
       }
     }
+  }
+  if (geomA != nullptr) {
+    lib->GEOSGeom_destroy_r(handle, geomA);
+  }
+  if (geomB != nullptr) {
+    lib->GEOSGeom_destroy_r(handle, geomB);
   }
   lib->GEOS_finish_r(handle);
   return toGEOSString(error.data(), error.length());
@@ -366,6 +385,12 @@ CR_GEOS_Status CR_GEOS_BinaryPredicate(CR_GEOS* lib, T fn, CR_GEOS_Slice a, CR_G
     } else {
       *ret = r;
     }
+  }
+  if (geomA != nullptr) {
+    lib->GEOSGeom_destroy_r(handle, geomA);
+  }
+  if (geomB != nullptr) {
+    lib->GEOSGeom_destroy_r(handle, geomB);
   }
   lib->GEOS_finish_r(handle);
   return toGEOSString(error.data(), error.length());

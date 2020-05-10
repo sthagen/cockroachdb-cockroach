@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // A TableStatistic object holds a statistic for a particular column or group
@@ -55,7 +55,6 @@ type TableStatisticsCache struct {
 		// from the system table.
 		numInternalQueries int64
 	}
-	Gossip      *gossip.Gossip
 	ClientDB    *kv.DB
 	SQLExecutor sqlutil.InternalExecutor
 }
@@ -77,10 +76,9 @@ type cacheEntry struct {
 // NewTableStatisticsCache creates a new TableStatisticsCache that can hold
 // statistics for <cacheSize> tables.
 func NewTableStatisticsCache(
-	cacheSize int, g *gossip.Gossip, db *kv.DB, sqlExecutor sqlutil.InternalExecutor,
+	cacheSize int, gw gossip.DeprecatedGossip, db *kv.DB, sqlExecutor sqlutil.InternalExecutor,
 ) *TableStatisticsCache {
 	tableStatsCache := &TableStatisticsCache{
-		Gossip:      g,
 		ClientDB:    db,
 		SQLExecutor: sqlExecutor,
 	}
@@ -90,11 +88,13 @@ func NewTableStatisticsCache(
 	})
 	// The stat cache requires redundant callbacks as it is using gossip to
 	// signal the presence of new stats, not to actually propagate them.
-	g.RegisterCallback(
-		gossip.MakePrefixPattern(gossip.KeyTableStatAddedPrefix),
-		tableStatsCache.tableStatAddedGossipUpdate,
-		gossip.Redundant,
-	)
+	if g, ok := gw.Optional(47925); ok {
+		g.RegisterCallback(
+			gossip.MakePrefixPattern(gossip.KeyTableStatAddedPrefix),
+			tableStatsCache.tableStatAddedGossipUpdate,
+			gossip.Redundant,
+		)
+	}
 	return tableStatsCache
 }
 
@@ -302,7 +302,7 @@ func parseStats(datums tree.Datums) (*TableStatistic, error) {
 
 		// Decode the histogram data so that it's usable by the opt catalog.
 		res.Histogram = make([]cat.HistogramBucket, len(res.HistogramData.Buckets))
-		typ := &res.HistogramData.ColumnType
+		typ := res.HistogramData.ColumnType
 		var a sqlbase.DatumAlloc
 		for i := range res.Histogram {
 			bucket := &res.HistogramData.Buckets[i]

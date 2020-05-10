@@ -60,21 +60,25 @@ func (p *planner) getVirtualTabler() VirtualTabler {
 var errTableAdding = errors.New("table is being added")
 
 type inactiveTableError struct {
-	error
+	cause error
 }
+
+func (i *inactiveTableError) Error() string { return i.cause.Error() }
+
+func (i *inactiveTableError) Unwrap() error { return i.cause }
 
 // FilterTableState inspects the state of a given table and returns an error if
 // the state is anything but PUBLIC. The error describes the state of the table.
 func FilterTableState(tableDesc *sqlbase.TableDescriptor) error {
 	switch tableDesc.State {
 	case sqlbase.TableDescriptor_DROP:
-		return inactiveTableError{errors.New("table is being dropped")}
+		return &inactiveTableError{errors.New("table is being dropped")}
 	case sqlbase.TableDescriptor_OFFLINE:
 		err := errors.Errorf("table %q is offline", tableDesc.Name)
 		if tableDesc.OfflineReason != "" {
 			err = errors.Errorf("table %q is offline: %s", tableDesc.Name, tableDesc.OfflineReason)
 		}
-		return inactiveTableError{err}
+		return &inactiveTableError{err}
 	case sqlbase.TableDescriptor_ADD:
 		return errTableAdding
 	case sqlbase.TableDescriptor_PUBLIC:
@@ -234,11 +238,24 @@ func (tc *TableCollection) getMutableTableDescriptor(
 	}
 
 	phyAccessor := UncachedPhysicalAccessor{}
-	obj, err := phyAccessor.GetObjectDesc(ctx, txn, tc.settings, tn, flags)
+	obj, err := phyAccessor.GetObjectDesc(
+		ctx,
+		txn,
+		tc.settings,
+		tc.codec(),
+		tn.Catalog(),
+		tn.Schema(),
+		tn.Table(),
+		flags,
+	)
 	if obj == nil {
 		return nil, err
 	}
-	return obj.(*sqlbase.MutableTableDescriptor), err
+	mutDesc, ok := obj.(*sqlbase.MutableTableDescriptor)
+	if !ok {
+		return nil, err
+	}
+	return mutDesc, nil
 }
 
 // resolveSchemaID attempts to lookup the schema from the schemaCache if it exists,
@@ -263,7 +280,7 @@ func (tc *TableCollection) resolveSchemaID(
 	}
 
 	// Next, try lookup the result from KV, storing and returning the value.
-	exists, schemaID, err := resolveSchemaID(ctx, txn, dbID, schemaName)
+	exists, schemaID, err := resolveSchemaID(ctx, txn, tc.codec(), dbID, schemaName)
 	if err != nil || !exists {
 		return exists, schemaID, err
 	}
@@ -295,11 +312,24 @@ func (tc *TableCollection) getTableVersion(
 
 	readTableFromStore := func() (*sqlbase.ImmutableTableDescriptor, error) {
 		phyAccessor := UncachedPhysicalAccessor{}
-		obj, err := phyAccessor.GetObjectDesc(ctx, txn, tc.settings, tn, flags)
+		obj, err := phyAccessor.GetObjectDesc(
+			ctx,
+			txn,
+			tc.settings,
+			tc.codec(),
+			tn.Catalog(),
+			tn.Schema(),
+			tn.Table(),
+			flags,
+		)
 		if obj == nil {
 			return nil, err
 		}
-		return obj.(*sqlbase.ImmutableTableDescriptor), err
+		tbl, ok := obj.(*sqlbase.ImmutableTableDescriptor)
+		if !ok {
+			return nil, err
+		}
+		return tbl, err
 	}
 
 	refuseFurtherLookup, dbID, err := tc.getUncommittedDatabaseID(tn.Catalog(), flags.Required)
@@ -380,7 +410,8 @@ func (tc *TableCollection) getTableVersion(
 		// Read the descriptor from the store in the face of some specific errors
 		// because of a known limitation of AcquireByName. See the known
 		// limitations of AcquireByName for details.
-		if _, ok := err.(inactiveTableError); ok || err == sqlbase.ErrDescriptorNotFound {
+		if errors.HasType(err, (*inactiveTableError)(nil)) ||
+			errors.Is(err, sqlbase.ErrDescriptorNotFound) {
 			return readTableFromStore()
 		}
 		// Lease acquisition failed with some other error. This we don't
@@ -410,7 +441,7 @@ func (tc *TableCollection) getTableVersionByID(
 	log.VEventf(ctx, 2, "planner getting table on table ID %d", tableID)
 
 	if flags.AvoidCached || testDisableTableLeases {
-		table, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+		table, err := sqlbase.GetTableDescFromID(ctx, txn, tc.codec(), tableID)
 		if err != nil {
 			return nil, err
 		}
@@ -444,7 +475,7 @@ func (tc *TableCollection) getTableVersionByID(
 	readTimestamp := txn.ReadTimestamp()
 	table, expiration, err := tc.leaseMgr.Acquire(ctx, readTimestamp, tableID)
 	if err != nil {
-		if err == sqlbase.ErrDescriptorNotFound {
+		if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
 			// Transform the descriptor error into an error that references the
 			// table's ID.
 			return nil, sqlbase.NewUndefinedRelationError(
@@ -479,7 +510,7 @@ func (tc *TableCollection) getMutableTableVersionByID(
 		log.VEventf(ctx, 2, "found uncommitted table %d", tableID)
 		return table, nil
 	}
-	return sqlbase.GetMutableTableDescFromID(ctx, txn, tableID)
+	return sqlbase.GetMutableTableDescFromID(ctx, txn, tc.codec(), tableID)
 }
 
 // releaseTableLeases releases the leases for the tables with ids in
@@ -695,7 +726,7 @@ func (tc *TableCollection) getUncommittedTable(
 			tn.Table(),
 		) {
 			// Right state?
-			if err = FilterTableState(mutTbl.TableDesc()); err != nil && err != errTableAdding {
+			if err = FilterTableState(mutTbl.TableDesc()); err != nil && !errors.Is(err, errTableAdding) {
 				if !required {
 					// If it's not required here, we simply say we don't have it.
 					err = nil
@@ -731,7 +762,7 @@ func (tc *TableCollection) getAllDescriptors(
 	ctx context.Context, txn *kv.Txn,
 ) ([]sqlbase.DescriptorProto, error) {
 	if tc.allDescriptors == nil {
-		descs, err := GetAllDescriptors(ctx, txn)
+		descs, err := GetAllDescriptors(ctx, txn, tc.codec())
 		if err != nil {
 			return nil, err
 		}
@@ -748,11 +779,11 @@ func (tc *TableCollection) getAllDatabaseDescriptors(
 	ctx context.Context, txn *kv.Txn,
 ) ([]*sqlbase.DatabaseDescriptor, error) {
 	if tc.allDatabaseDescriptors == nil {
-		dbDescIDs, err := GetAllDatabaseDescriptorIDs(ctx, txn)
+		dbDescIDs, err := GetAllDatabaseDescriptorIDs(ctx, txn, tc.codec())
 		if err != nil {
 			return nil, err
 		}
-		dbDescs, err := getDatabaseDescriptorsFromIDs(ctx, txn, dbDescIDs)
+		dbDescs, err := getDatabaseDescriptorsFromIDs(ctx, txn, tc.codec(), dbDescIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -766,11 +797,11 @@ func (tc *TableCollection) getAllDatabaseDescriptors(
 // database. It attempts to perform this operation in a single request,
 // rather than making a round trip for each ID.
 func getDatabaseDescriptorsFromIDs(
-	ctx context.Context, txn *kv.Txn, ids []sqlbase.ID,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, ids []sqlbase.ID,
 ) ([]*sqlbase.DatabaseDescriptor, error) {
 	b := txn.NewBatch()
 	for _, id := range ids {
-		key := sqlbase.MakeDescMetadataKey(id)
+		key := sqlbase.MakeDescMetadataKey(codec, id)
 		b.Get(key)
 	}
 	if err := txn.Run(ctx, b); err != nil {
@@ -816,7 +847,7 @@ func (tc *TableCollection) getSchemasForDatabase(
 	}
 	if _, ok := tc.allSchemasForDatabase[dbID]; !ok {
 		var err error
-		tc.allSchemasForDatabase[dbID], err = schema.GetForDatabase(ctx, txn, dbID)
+		tc.allSchemasForDatabase[dbID], err = schema.GetForDatabase(ctx, txn, tc.codec(), dbID)
 		if err != nil {
 			return nil, err
 		}
@@ -864,6 +895,10 @@ func (tc *TableCollection) validatePrimaryKeys() error {
 		}
 	}
 	return nil
+}
+
+func (tc *TableCollection) codec() keys.SQLCodec {
+	return tc.leaseMgr.codec
 }
 
 // MigrationSchemaChangeRequiredContext flags a schema change as necessary to
@@ -1129,5 +1164,13 @@ func (p *planner) writeTableDescToBatch(
 		return err
 	}
 
-	return writeDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(), p.execCfg.Settings, b, tableDesc.GetID(), tableDesc.TableDesc())
+	return writeDescToBatch(
+		ctx,
+		p.extendedEvalCtx.Tracing.KVTracingEnabled(),
+		p.ExecCfg().Settings,
+		b,
+		p.ExecCfg().Codec,
+		tableDesc.GetID(),
+		tableDesc.TableDesc(),
+	)
 }

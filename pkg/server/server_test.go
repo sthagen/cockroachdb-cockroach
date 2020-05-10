@@ -47,9 +47,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -545,7 +545,7 @@ func TestSystemConfigGossip(t *testing.T) {
 	ts := s.(*TestServer)
 	ctx := context.TODO()
 
-	key := sqlbase.MakeDescMetadataKey(keys.MaxReservedDescID)
+	key := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, keys.MaxReservedDescID)
 	valAt := func(i int) *sqlbase.DatabaseDescriptor {
 		return &sqlbase.DatabaseDescriptor{Name: "foo", ID: sqlbase.ID(i)}
 	}

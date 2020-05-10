@@ -313,8 +313,10 @@ func (e virtualDefEntry) getPlanInfo(
 	for i := range e.desc.Columns {
 		col := &e.desc.Columns[i]
 		columns = append(columns, sqlbase.ResultColumn{
-			Name: col.Name,
-			Typ:  &col.Type,
+			Name:           col.Name,
+			Typ:            col.Type,
+			TableID:        table.GetID(),
+			PGAttributeNum: col.GetLogicalColumnID(),
 		})
 	}
 
@@ -322,7 +324,7 @@ func (e virtualDefEntry) getPlanInfo(
 		var dbDesc *DatabaseDescriptor
 		if dbName != "" {
 			var err error
-			dbDesc, err = p.LogicalSchemaAccessor().GetDatabaseDesc(ctx, p.txn,
+			dbDesc, err = p.LogicalSchemaAccessor().GetDatabaseDesc(ctx, p.txn, p.ExecCfg().Codec,
 				dbName, tree.DatabaseLookupFlags{Required: true, AvoidCached: p.avoidCachedDescriptors})
 			if err != nil {
 				return nil, err

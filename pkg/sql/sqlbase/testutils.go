@@ -42,19 +42,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
 )
 
 // This file contains utility functions for tests (in other packages).
 
 // GetTableDescriptor retrieves a table descriptor directly from the KV layer.
-func GetTableDescriptor(kvDB *kv.DB, database string, table string) *TableDescriptor {
+func GetTableDescriptor(
+	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
+) *TableDescriptor {
 	// log.VEventf(context.TODO(), 2, "GetTableDescriptor %q %q", database, table)
 	// testutil, so we pass settings as nil for both database and table name keys.
 	dKey := NewDatabaseKey(database)
 	ctx := context.TODO()
-	gr, err := kvDB.Get(ctx, dKey.Key())
+	gr, err := kvDB.Get(ctx, dKey.Key(codec))
 	if err != nil {
 		panic(err)
 	}
@@ -64,7 +66,7 @@ func GetTableDescriptor(kvDB *kv.DB, database string, table string) *TableDescri
 	dbDescID := ID(gr.ValueInt())
 
 	tKey := NewPublicTableKey(dbDescID, table)
-	gr, err = kvDB.Get(ctx, tKey.Key())
+	gr, err = kvDB.Get(ctx, tKey.Key(codec))
 	if err != nil {
 		panic(err)
 	}
@@ -72,7 +74,7 @@ func GetTableDescriptor(kvDB *kv.DB, database string, table string) *TableDescri
 		panic("table missing")
 	}
 
-	descKey := MakeDescMetadataKey(ID(gr.ValueInt()))
+	descKey := MakeDescMetadataKey(codec, ID(gr.ValueInt()))
 	desc := &Descriptor{}
 	ts, err := kvDB.GetProtoTs(ctx, descKey, desc)
 	if err != nil || (*desc == Descriptor{}) {
@@ -82,7 +84,7 @@ func GetTableDescriptor(kvDB *kv.DB, database string, table string) *TableDescri
 	if tableDesc == nil {
 		return nil
 	}
-	err = tableDesc.MaybeFillInDescriptor(ctx, kvDB)
+	err = tableDesc.MaybeFillInDescriptor(ctx, kvDB, codec)
 	if err != nil {
 		log.Fatalf(ctx, "failure to fill in descriptor. err: %v", err)
 	}
@@ -91,9 +93,9 @@ func GetTableDescriptor(kvDB *kv.DB, database string, table string) *TableDescri
 
 // GetImmutableTableDescriptor retrieves an immutable table descriptor directly from the KV layer.
 func GetImmutableTableDescriptor(
-	kvDB *kv.DB, database string, table string,
+	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
 ) *ImmutableTableDescriptor {
-	return NewImmutableTableDescriptor(*GetTableDescriptor(kvDB, database, table))
+	return NewImmutableTableDescriptor(*GetTableDescriptor(kvDB, codec, database, table))
 }
 
 // RandDatum generates a random Datum of the given type.
@@ -212,7 +214,7 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 	case types.TupleFamily:
 		tuple := tree.DTuple{D: make(tree.Datums, len(typ.TupleContents()))}
 		for i := range typ.TupleContents() {
-			tuple.D[i] = RandDatum(rng, &typ.TupleContents()[i], true)
+			tuple.D[i] = RandDatum(rng, typ.TupleContents()[i], true)
 		}
 		return &tuple
 	case types.BitFamily:
@@ -265,22 +267,28 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 	case types.UnknownFamily:
 		return tree.DNull
 	case types.ArrayFamily:
-		contents := typ.ArrayContents()
-		if contents.Family() == types.AnyFamily {
-			contents = RandArrayContentsType(rng)
-		}
-		arr := tree.NewDArray(contents)
-		for i := 0; i < rng.Intn(10); i++ {
-			if err := arr.Append(RandDatumWithNullChance(rng, contents, 0)); err != nil {
-				panic(err)
-			}
-		}
-		return arr
+		return RandArray(rng, typ, 0)
 	case types.AnyFamily:
 		return RandDatumWithNullChance(rng, RandType(rng), nullChance)
 	default:
 		panic(fmt.Sprintf("invalid type %v", typ.DebugString()))
 	}
+}
+
+// RandArray generates a random DArray where the contents have nullChance
+// of being null.
+func RandArray(rng *rand.Rand, typ *types.T, nullChance int) tree.Datum {
+	contents := typ.ArrayContents()
+	if contents.Family() == types.AnyFamily {
+		contents = RandArrayContentsType(rng)
+	}
+	arr := tree.NewDArray(contents)
+	for i := 0; i < rng.Intn(10); i++ {
+		if err := arr.Append(RandDatumWithNullChance(rng, contents, nullChance)); err != nil {
+			panic(err)
+		}
+	}
+	return arr
 }
 
 const simpleRange = 10
@@ -531,12 +539,72 @@ var (
 			&tree.DInterval{Duration: duration.MakeDuration(0, 0, 290*12)},
 		},
 		types.GeographyFamily: {
-			// TODO(otan): more interesting datums
-			&tree.DGeography{Geography: geo.MustParseGeographyFromEWKBRaw([]byte("\x01\x01\x00\x00\x20\xe6\x10\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f"))},
+			// NOTE(otan): we cannot use WKT here because roachtests do not have geos uploaded.
+			// If we parse WKT ourselves or upload GEOS on every roachtest, we may be able to avoid this.
+			// POINT(1.0 1.0)
+			&tree.DGeography{Geography: geo.MustParseGeography("0101000000000000000000F03F000000000000F03F")},
+			// LINESTRING(1.0 1.0, 2.0 2.0)
+			&tree.DGeography{Geography: geo.MustParseGeography("010200000002000000000000000000F03F000000000000F03F00000000000000400000000000000040")},
+			// POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0))
+			&tree.DGeography{Geography: geo.MustParseGeography("0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000")},
+			// POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0), (0.2 0.2, 0.2 0.4, 0.4 0.4, 0.4 0.2, 0.2 0.2))
+			&tree.DGeography{Geography: geo.MustParseGeography("0103000000020000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000050000009A9999999999C93F9A9999999999C93F9A9999999999C93F9A9999999999D93F9A9999999999D93F9A9999999999D93F9A9999999999D93F9A9999999999C93F9A9999999999C93F9A9999999999C93F")},
+			// MULTIPOINT ((10 40), (40 30), (20 20), (30 10))
+			&tree.DGeography{Geography: geo.MustParseGeography("010400000004000000010100000000000000000024400000000000004440010100000000000000000044400000000000003E4001010000000000000000003440000000000000344001010000000000000000003E400000000000002440")},
+			// MULTILINESTRING ((10 10, 20 20, 10 40), (40 40, 30 30, 40 20, 30 10))
+			&tree.DGeography{Geography: geo.MustParseGeography("010500000002000000010200000003000000000000000000244000000000000024400000000000003440000000000000344000000000000024400000000000004440010200000004000000000000000000444000000000000044400000000000003E400000000000003E40000000000000444000000000000034400000000000003E400000000000002440")},
+			// MULTIPOLYGON (((40 40, 20 45, 45 30, 40 40)),((20 35, 10 30, 10 10, 30 5, 45 20, 20 35),(30 20, 20 15, 20 25, 30 20)))
+			&tree.DGeography{Geography: geo.MustParseGeography("01060000000200000001030000000100000004000000000000000000444000000000000044400000000000003440000000000080464000000000008046400000000000003E4000000000000044400000000000004440010300000002000000060000000000000000003440000000000080414000000000000024400000000000003E40000000000000244000000000000024400000000000003E4000000000000014400000000000804640000000000000344000000000000034400000000000804140040000000000000000003E40000000000000344000000000000034400000000000002E40000000000000344000000000000039400000000000003E400000000000003440")},
+			// GEOMETRYCOLLECTION (POINT (40 10),LINESTRING (10 10, 20 20, 10 40),POLYGON ((40 40, 20 45, 45 30, 40 40)))
+			&tree.DGeography{Geography: geo.MustParseGeography("01070000000300000001010000000000000000004440000000000000244001020000000300000000000000000024400000000000002440000000000000344000000000000034400000000000002440000000000000444001030000000100000004000000000000000000444000000000000044400000000000003440000000000080464000000000008046400000000000003E4000000000000044400000000000004440")},
+			// POINT EMPTY
+			&tree.DGeography{Geography: geo.MustParseGeography("0101000000000000000000F87F000000000000F87F")},
+			// LINESTRING EMPTY
+			&tree.DGeography{Geography: geo.MustParseGeography("010200000000000000")},
+			// POLYGON EMPTY
+			&tree.DGeography{Geography: geo.MustParseGeography("010300000000000000")},
+			// MULTIPOINT EMPTY
+			&tree.DGeography{Geography: geo.MustParseGeography("010400000000000000")},
+			// MULTILINESTRING EMPTY
+			&tree.DGeography{Geography: geo.MustParseGeography("010500000000000000")},
+			// MULTIPOLYGON EMPTY
+			&tree.DGeography{Geography: geo.MustParseGeography("010600000000000000")},
+			// GEOMETRYCOLLECTION EMPTY
+			&tree.DGeography{Geography: geo.MustParseGeography("010700000000000000")},
 		},
 		types.GeometryFamily: {
-			// TODO(otan): more interesting datums
-			&tree.DGeometry{Geometry: geo.MustParseGeometryFromEWKBRaw([]byte("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f"))},
+			// NOTE(otan): we cannot use WKT here because roachtests do not have geos uploaded.
+			// If we parse WKT ourselves or upload GEOS on every roachtest, we may be able to avoid this.
+			// POINT(1.0 1.0)
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("0101000000000000000000F03F000000000000F03F")},
+			// LINESTRING(1.0 1.0, 2.0 2.0)
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("010200000002000000000000000000F03F000000000000F03F00000000000000400000000000000040")},
+			// POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0))
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000")},
+			// POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0), (0.2 0.2, 0.2 0.4, 0.4 0.4, 0.4 0.2, 0.2 0.2))
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("0103000000020000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000050000009A9999999999C93F9A9999999999C93F9A9999999999C93F9A9999999999D93F9A9999999999D93F9A9999999999D93F9A9999999999D93F9A9999999999C93F9A9999999999C93F9A9999999999C93F")},
+			// MULTIPOINT ((10 40), (40 30), (20 20), (30 10))
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("010400000004000000010100000000000000000024400000000000004440010100000000000000000044400000000000003E4001010000000000000000003440000000000000344001010000000000000000003E400000000000002440")},
+			// MULTILINESTRING ((10 10, 20 20, 10 40), (40 40, 30 30, 40 20, 30 10))
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("010500000002000000010200000003000000000000000000244000000000000024400000000000003440000000000000344000000000000024400000000000004440010200000004000000000000000000444000000000000044400000000000003E400000000000003E40000000000000444000000000000034400000000000003E400000000000002440")},
+			// MULTIPOLYGON (((40 40, 20 45, 45 30, 40 40)),((20 35, 10 30, 10 10, 30 5, 45 20, 20 35),(30 20, 20 15, 20 25, 30 20)))
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("01060000000200000001030000000100000004000000000000000000444000000000000044400000000000003440000000000080464000000000008046400000000000003E4000000000000044400000000000004440010300000002000000060000000000000000003440000000000080414000000000000024400000000000003E40000000000000244000000000000024400000000000003E4000000000000014400000000000804640000000000000344000000000000034400000000000804140040000000000000000003E40000000000000344000000000000034400000000000002E40000000000000344000000000000039400000000000003E400000000000003440")},
+			// GEOMETRYCOLLECTION (POINT (40 10),LINESTRING (10 10, 20 20, 10 40),POLYGON ((40 40, 20 45, 45 30, 40 40)))
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("01070000000300000001010000000000000000004440000000000000244001020000000300000000000000000024400000000000002440000000000000344000000000000034400000000000002440000000000000444001030000000100000004000000000000000000444000000000000044400000000000003440000000000080464000000000008046400000000000003E4000000000000044400000000000004440")},
+			// POINT EMPTY
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("0101000000000000000000F87F000000000000F87F")},
+			// LINESTRING EMPTY
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("010200000000000000")},
+			// POLYGON EMPTY
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("010300000000000000")},
+			// MULTIPOINT EMPTY
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("010400000000000000")},
+			// MULTILINESTRING EMPTY
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("010500000000000000")},
+			// MULTIPOLYGON EMPTY
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("010600000000000000")},
+			// GEOMETRYCOLLECTION EMPTY
+			&tree.DGeometry{Geometry: geo.MustParseGeometry("010700000000000000")},
 		},
 		types.StringFamily: {
 			tree.NewDString(""),
@@ -747,9 +815,9 @@ func randType(rng *rand.Rand, typs []*types.T) *types.T {
 	case types.TupleFamily:
 		// Generate tuples between 0 and 4 datums in length
 		len := rng.Intn(5)
-		contents := make([]types.T, len)
+		contents := make([]*types.T, len)
 		for i := range contents {
-			contents[i] = *RandType(rng)
+			contents[i] = RandType(rng)
 		}
 		return types.MakeTuple(contents)
 	}
@@ -767,12 +835,23 @@ func RandColumnType(rng *rand.Rand) *types.T {
 	}
 }
 
+// RandArrayType generates a random array type.
+func RandArrayType(rng *rand.Rand) *types.T {
+	for {
+		typ := RandColumnType(rng)
+		resTyp := types.MakeArray(typ)
+		if err := ValidateColumnDefType(resTyp); err == nil {
+			return resTyp
+		}
+	}
+}
+
 // RandColumnTypes returns a slice of numCols random types. These types must be
 // legal table column types.
-func RandColumnTypes(rng *rand.Rand, numCols int) []types.T {
-	types := make([]types.T, numCols)
+func RandColumnTypes(rng *rand.Rand, numCols int) []*types.T {
+	types := make([]*types.T, numCols)
 	for i := range types {
-		types[i] = *RandColumnType(rng)
+		types[i] = RandColumnType(rng)
 	}
 	return types
 }
@@ -780,7 +859,7 @@ func RandColumnTypes(rng *rand.Rand, numCols int) []types.T {
 // RandSortingType returns a column type which can be key-encoded.
 func RandSortingType(rng *rand.Rand) *types.T {
 	typ := RandType(rng)
-	for MustBeValueEncoded(typ.Family()) {
+	for MustBeValueEncoded(typ) {
 		typ = RandType(rng)
 	}
 	return typ
@@ -788,10 +867,10 @@ func RandSortingType(rng *rand.Rand) *types.T {
 
 // RandSortingTypes returns a slice of numCols random ColumnType values
 // which are key-encodable.
-func RandSortingTypes(rng *rand.Rand, numCols int) []types.T {
-	types := make([]types.T, numCols)
+func RandSortingTypes(rng *rand.Rand, numCols int) []*types.T {
+	types := make([]*types.T, numCols)
 	for i := range types {
-		types[i] = *RandSortingType(rng)
+		types[i] = RandSortingType(rng)
 	}
 	return types
 }
@@ -822,7 +901,7 @@ func RandEncodableType(rng *rand.Rand) *types.T {
 
 		case types.TupleFamily:
 			for i := range t.TupleContents() {
-				if !isEncodableType(&t.TupleContents()[i]) {
+				if !isEncodableType(t.TupleContents()[i]) {
 					return false
 				}
 			}
@@ -843,12 +922,12 @@ func RandEncodableType(rng *rand.Rand) *types.T {
 //
 // TODO(andyk): Remove this workaround once #36736 is resolved. Replace calls to
 // it with calls to RandColumnTypes.
-func RandEncodableColumnTypes(rng *rand.Rand, numCols int) []types.T {
-	types := make([]types.T, numCols)
+func RandEncodableColumnTypes(rng *rand.Rand, numCols int) []*types.T {
+	types := make([]*types.T, numCols)
 	for i := range types {
 		for {
-			types[i] = *RandEncodableType(rng)
-			if err := ValidateColumnDefType(&types[i]); err == nil {
+			types[i] = RandEncodableType(rng)
+			if err := ValidateColumnDefType(types[i]); err == nil {
 				break
 			}
 		}
@@ -878,36 +957,36 @@ func RandSortingEncDatumSlice(rng *rand.Rand, numVals int) ([]EncDatum, *types.T
 // random type which is key-encodable.
 func RandSortingEncDatumSlices(
 	rng *rand.Rand, numSets, numValsPerSet int,
-) ([][]EncDatum, []types.T) {
+) ([][]EncDatum, []*types.T) {
 	vals := make([][]EncDatum, numSets)
-	types := make([]types.T, numSets)
+	types := make([]*types.T, numSets)
 	for i := range vals {
 		val, typ := RandSortingEncDatumSlice(rng, numValsPerSet)
-		vals[i], types[i] = val, *typ
+		vals[i], types[i] = val, typ
 	}
 	return vals, types
 }
 
 // RandEncDatumRowOfTypes generates a slice of random EncDatum values for the
 // corresponding type in types.
-func RandEncDatumRowOfTypes(rng *rand.Rand, types []types.T) EncDatumRow {
+func RandEncDatumRowOfTypes(rng *rand.Rand, types []*types.T) EncDatumRow {
 	vals := make([]EncDatum, len(types))
 	for i := range types {
-		vals[i] = DatumToEncDatum(&types[i], RandDatum(rng, &types[i], true))
+		vals[i] = DatumToEncDatum(types[i], RandDatum(rng, types[i], true))
 	}
 	return vals
 }
 
 // RandEncDatumRows generates EncDatumRows where all rows follow the same random
 // []ColumnType structure.
-func RandEncDatumRows(rng *rand.Rand, numRows, numCols int) (EncDatumRows, []types.T) {
+func RandEncDatumRows(rng *rand.Rand, numRows, numCols int) (EncDatumRows, []*types.T) {
 	types := RandEncodableColumnTypes(rng, numCols)
 	return RandEncDatumRowsOfTypes(rng, numRows, types), types
 }
 
 // RandEncDatumRowsOfTypes generates EncDatumRows, each row with values of the
 // corresponding type in types.
-func RandEncDatumRowsOfTypes(rng *rand.Rand, numRows int, types []types.T) EncDatumRows {
+func RandEncDatumRowsOfTypes(rng *rand.Rand, numRows int, types []*types.T) EncDatumRows {
 	vals := make(EncDatumRows, numRows)
 	for i := range vals {
 		vals[i] = RandEncDatumRowOfTypes(rng, types)
@@ -1325,7 +1404,7 @@ func randIndexTableDefFromCols(
 
 	indexElemList := make(tree.IndexElemList, 0, len(cols))
 	for i := range cols {
-		semType := tree.MustBeStaticallyKnownType(cols[i].Type).Family()
+		semType := tree.MustBeStaticallyKnownType(cols[i].Type)
 		if MustBeValueEncoded(semType) {
 			continue
 		}
@@ -1340,20 +1419,20 @@ func randIndexTableDefFromCols(
 // The following variables are useful for testing.
 var (
 	// OneIntCol is a slice of one IntType.
-	OneIntCol = []types.T{*types.Int}
+	OneIntCol = []*types.T{types.Int}
 	// TwoIntCols is a slice of two IntTypes.
-	TwoIntCols = []types.T{*types.Int, *types.Int}
+	TwoIntCols = []*types.T{types.Int, types.Int}
 	// ThreeIntCols is a slice of three IntTypes.
-	ThreeIntCols = []types.T{*types.Int, *types.Int, *types.Int}
+	ThreeIntCols = []*types.T{types.Int, types.Int, types.Int}
 	// FourIntCols is a slice of four IntTypes.
-	FourIntCols = []types.T{*types.Int, *types.Int, *types.Int, *types.Int}
+	FourIntCols = []*types.T{types.Int, types.Int, types.Int, types.Int}
 )
 
 // MakeIntCols makes a slice of numCols IntTypes.
-func MakeIntCols(numCols int) []types.T {
-	ret := make([]types.T, numCols)
+func MakeIntCols(numCols int) []*types.T {
+	ret := make([]*types.T, numCols)
 	for i := 0; i < numCols; i++ {
-		ret[i] = *types.Int
+		ret[i] = types.Int
 	}
 	return ret
 }

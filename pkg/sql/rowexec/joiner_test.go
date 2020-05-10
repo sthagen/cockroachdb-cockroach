@@ -15,7 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type joinerTestCase struct {
@@ -24,9 +24,9 @@ type joinerTestCase struct {
 	joinType    sqlbase.JoinType
 	onExpr      execinfrapb.Expression
 	outCols     []uint32
-	leftTypes   []types.T
+	leftTypes   []*types.T
 	leftInput   sqlbase.EncDatumRows
-	rightTypes  []types.T
+	rightTypes  []*types.T
 	rightInput  sqlbase.EncDatumRows
 	expected    sqlbase.EncDatumRows
 }
@@ -823,9 +823,9 @@ type joinerErrorTestCase struct {
 	joinType    sqlbase.JoinType
 	onExpr      execinfrapb.Expression
 	outCols     []uint32
-	leftTypes   []types.T
+	leftTypes   []*types.T
 	leftInput   sqlbase.EncDatumRows
-	rightTypes  []types.T
+	rightTypes  []*types.T
 	rightInput  sqlbase.EncDatumRows
 	expectedErr error
 }

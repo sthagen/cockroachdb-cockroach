@@ -16,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
@@ -36,11 +35,11 @@ const (
 	changeFrontierProcName   = `changefntr`
 )
 
-var changefeedResultTypes = []types.T{
-	*types.Bytes,  // resolved span
-	*types.String, // topic
-	*types.Bytes,  // key
-	*types.Bytes,  // value
+var changefeedResultTypes = []*types.T{
+	types.Bytes,  // resolved span
+	types.String, // topic
+	types.Bytes,  // key
+	types.Bytes,  // value
 }
 
 // distChangefeedFlow plans and runs a distributed changefeed.
@@ -108,7 +107,10 @@ func distChangefeedFlow(
 
 	// Changefeed flows handle transactional consistency themselves.
 	var noTxn *kv.Txn
-	gatewayNodeID := execCfg.NodeID.DeprecatedNodeID(distsql.MultiTenancyIssueNo)
+	gatewayNodeID, err := execCfg.NodeID.OptionalNodeIDErr(48274)
+	if err != nil {
+		return err
+	}
 	dsp := phs.DistSQLPlanner()
 	evalCtx := phs.ExtendedEvalContext()
 	planCtx := dsp.NewPlanningCtx(ctx, evalCtx, noTxn)
@@ -225,7 +227,7 @@ func fetchSpansForTargets(
 		txn.SetFixedTimestamp(ctx, ts)
 		// Note that all targets are currently guaranteed to be tables.
 		for tableID := range targets {
-			tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+			tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, codec, tableID)
 			if err != nil {
 				return err
 			}

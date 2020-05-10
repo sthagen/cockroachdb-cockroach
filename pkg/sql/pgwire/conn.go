@@ -1283,8 +1283,8 @@ func (c *conn) writeRowDescription(
 		}
 		c.msgBuilder.writeTerminatedString(column.Name)
 		typ := pgTypeForParserType(column.Typ)
-		c.msgBuilder.putInt32(0) // Table OID (optional).
-		c.msgBuilder.putInt16(0) // Column attribute ID (optional).
+		c.msgBuilder.putInt32(int32(column.TableID))        // Table OID (optional).
+		c.msgBuilder.putInt16(int16(column.PGAttributeNum)) // Column attribute ID (optional).
 		c.msgBuilder.putInt32(int32(typ.oid))
 		c.msgBuilder.putInt16(int16(typ.size))
 		// The type modifier (atttypmod) is used to include various extra information
@@ -1562,7 +1562,7 @@ func (c *readTimeoutConn) Read(b []byte) (int, error) {
 		}
 		n, err := c.Conn.Read(b)
 		// Continue if the error is due to timing out.
-		if err, ok := err.(net.Error); ok && err.Timeout() {
+		if ne := (net.Error)(nil); errors.As(err, &ne) && ne.Timeout() {
 			continue
 		}
 		return n, err

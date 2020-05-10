@@ -26,8 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
-	"github.com/pkg/errors"
 )
 
 // DefaultStorageEngine represents the default storage engine to use.
@@ -564,7 +564,7 @@ func NewEngine(
 		}
 
 		return NewTee(ctx, rocksDB, pebbleDB), nil
-	case enginepb.EngineTypePebble:
+	case enginepb.EngineTypeDefault, enginepb.EngineTypePebble:
 		pebbleConfig := PebbleConfig{
 			StorageConfig: storageConfig,
 			Opts:          DefaultPebbleOptions(),
@@ -573,7 +573,7 @@ func NewEngine(
 		defer pebbleConfig.Opts.Cache.Unref()
 
 		return NewPebble(context.Background(), pebbleConfig)
-	case enginepb.EngineTypeDefault, enginepb.EngineTypeRocksDB:
+	case enginepb.EngineTypeRocksDB:
 		cache := NewRocksDBCache(cacheSize)
 		defer cache.Release()
 

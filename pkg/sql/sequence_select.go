@@ -15,7 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type sequenceSelectNode struct {
@@ -46,7 +46,7 @@ func (ss *sequenceSelectNode) Next(params runParams) (bool, error) {
 	if ss.done {
 		return false, nil
 	}
-	val, err := params.p.GetSequenceValue(params.ctx, ss.desc)
+	val, err := params.p.GetSequenceValue(params.ctx, params.ExecCfg().Codec, ss.desc)
 	if err != nil {
 		return false, err
 	}

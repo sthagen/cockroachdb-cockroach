@@ -125,7 +125,7 @@ func (s *Server) ServeWith(
 	for {
 		rw, e := l.Accept()
 		if e != nil {
-			if ne, ok := e.(net.Error); ok && ne.Temporary() {
+			if ne := (net.Error)(nil); errors.As(e, &ne) && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
 				} else {
@@ -153,9 +153,7 @@ func (s *Server) ServeWith(
 // IsClosedConnection returns true if err is cmux.ErrListenerClosed,
 // grpc.ErrServerStopped, io.EOF, or the net package's errClosed.
 func IsClosedConnection(err error) bool {
-	return err == cmux.ErrListenerClosed ||
-		err == grpc.ErrServerStopped ||
-		err == io.EOF ||
+	return errors.IsAny(err, cmux.ErrListenerClosed, grpc.ErrServerStopped, io.EOF) ||
 		strings.Contains(err.Error(), "use of closed network connection")
 }
 
@@ -163,7 +161,7 @@ func IsClosedConnection(err error) bool {
 // cmux.ErrListenerClosed, or the net package's errClosed.
 func FatalIfUnexpected(err error) {
 	if err != nil && !IsClosedConnection(err) {
-		log.Fatalf(context.TODO(), "%v", err)
+		log.Fatalf(context.TODO(), "%+v", err)
 	}
 }
 

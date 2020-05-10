@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // Grant adds privileges to users.
@@ -145,7 +145,15 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			if err := d.Validate(); err != nil {
 				return err
 			}
-			if err := writeDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(), p.execCfg.Settings, b, descriptor.GetID(), descriptor); err != nil {
+			if err := writeDescToBatch(
+				ctx,
+				p.extendedEvalCtx.Tracing.KVTracingEnabled(),
+				p.ExecCfg().Settings,
+				b,
+				p.ExecCfg().Codec,
+				descriptor.GetID(),
+				descriptor,
+			); err != nil {
 				return err
 			}
 

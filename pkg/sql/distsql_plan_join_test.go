@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func setTestEqColForSide(colName string, side *scanNode, equalityIndices *[]int) error {
@@ -110,7 +110,7 @@ func encodeTestKey(kvDB *kv.DB, keyStr string) (roachpb.Key, error) {
 	for _, tok := range tokens {
 		// Encode the table ID if the token is a table name.
 		if tableNames[tok] {
-			desc := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, tok)
+			desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, tok)
 			key = encoding.EncodeUvarintAscending(key, uint64(desc.ID))
 			continue
 		}
@@ -153,7 +153,7 @@ func decodeTestKey(kvDB *kv.DB, key roachpb.Key) (string, error) {
 			}
 
 			if err := kvDB.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
-				desc, err := sqlbase.GetTableDescFromID(context.TODO(), txn, sqlbase.ID(descID))
+				desc, err := sqlbase.GetTableDescFromID(context.TODO(), txn, keys.SystemSQLCodec, sqlbase.ID(descID))
 				if err != nil {
 					return err
 				}

@@ -28,8 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
-	"github.com/lib/pq"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -267,9 +266,9 @@ func preferColumnFamilies(workload string) bool {
 	}
 }
 
-var usertableTypes = []types.T{
-	*types.Bytes, *types.Bytes, *types.Bytes, *types.Bytes, *types.Bytes, *types.Bytes,
-	*types.Bytes, *types.Bytes, *types.Bytes, *types.Bytes, *types.Bytes,
+var usertableTypes = []*types.T{
+	types.Bytes, types.Bytes, types.Bytes, types.Bytes, types.Bytes, types.Bytes,
+	types.Bytes, types.Bytes, types.Bytes, types.Bytes, types.Bytes,
 }
 
 // Tables implements the Generator interface.
@@ -652,45 +651,21 @@ func (yw *ycsbWorker) readRow(ctx context.Context) error {
 func (yw *ycsbWorker) scanRows(ctx context.Context) error {
 	key := yw.nextReadKey()
 	scanLength := yw.scanLengthGen.Uint64()
-	// We run the SELECT statement in a retry loop to handle retryable errors.
-	// The scan is large enough that it occasionally begins streaming results
-	// back to the client. If it then hits a ReadWithinUncertaintyIntervalError
+	// We run the SELECT statement in a retry loop to handle retryable errors. The
+	// scan is large enough that it occasionally begins streaming results back to
+	// the client, and so if it then hits a ReadWithinUncertaintyIntervalError
 	// then it will return this error even if it is being run as an implicit
 	// transaction.
-	// TODO(nvanbenschoten): replace this with crdb.Execute when we update our
-	// vendored cockroachdb/cockroach-go library. Updating is currently running
-	// into issues because it requires us to update jackc/pgx to v4, which
-	// requires module support.
-	for {
-		err := func() error {
-			res, err := yw.scanStmt.QueryContext(ctx, key, scanLength)
-			if err != nil {
-				return err
-			}
-			defer res.Close()
-			for res.Next() {
-			}
-			return res.Err()
-		}()
-		if err == nil || !errIsRetryable(err) {
+	return crdb.Execute(func() error {
+		res, err := yw.scanStmt.QueryContext(ctx, key, scanLength)
+		if err != nil {
 			return err
 		}
-	}
-}
-
-func errIsRetryable(err error) bool {
-	switch t := err.(type) {
-	case *pq.Error:
-		// We look for either:
-		//  - the standard PG errcode SerializationFailureError:40001 or
-		//  - the Cockroach extension errcode RetriableError:CR000. This extension
-		//    has been removed server-side, but support for it has been left here for
-		//    now to maintain backwards compatibility.
-		return t.Code == "CR000" || t.Code == "40001"
-
-	default:
-		return false
-	}
+		defer res.Close()
+		for res.Next() {
+		}
+		return res.Err()
+	})
 }
 
 func (yw *ycsbWorker) readModifyWriteRow(ctx context.Context) error {
@@ -716,7 +691,7 @@ func (yw *ycsbWorker) readModifyWriteRow(ctx context.Context) error {
 		_, err := tx.StmtContext(ctx, updateStmt).ExecContext(ctx, args[:]...)
 		return err
 	})
-	if err == gosql.ErrNoRows && ctx.Err() != nil {
+	if errors.Is(err, gosql.ErrNoRows) && ctx.Err() != nil {
 		// Sometimes a context cancellation during a transaction can result in
 		// sql.ErrNoRows instead of the appropriate context.DeadlineExceeded. In
 		// this case, we just return ctx.Err(). See

@@ -17,11 +17,10 @@ import (
 	"github.com/apache/arrow/go/arrow/array"
 	"github.com/apache/arrow/go/arrow/memory"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde/arrowserde"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 	flatbuffers "github.com/google/flatbuffers/go"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -33,12 +32,12 @@ const (
 
 // numBuffersForType returns how many buffers are used to represent an array of
 // the given type.
-func numBuffersForType(t coltypes.T) int {
+func numBuffersForType(t *types.T) int {
 	// Nearly all types are represented by 2 memory.Buffers. One buffer for the
 	// null bitmap and one for the values.
 	numBuffers := 2
-	switch t {
-	case coltypes.Bytes, coltypes.Decimal, coltypes.Timestamp, coltypes.Interval:
+	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+	case types.BytesFamily, types.DecimalFamily, types.TimestampTZFamily, types.IntervalFamily:
 		// This type has an extra offsets buffer.
 		numBuffers = 3
 	}
@@ -70,7 +69,7 @@ type RecordBatchSerializer struct {
 // NewRecordBatchSerializer creates a new RecordBatchSerializer according to
 // typs. Note that Serializing or Deserializing data that does not follow the
 // passed in schema results in undefined behavior.
-func NewRecordBatchSerializer(typs []types.T) (*RecordBatchSerializer, error) {
+func NewRecordBatchSerializer(typs []*types.T) (*RecordBatchSerializer, error) {
 	if len(typs) == 0 {
 		return nil, errors.Errorf("zero length schema unsupported")
 	}
@@ -78,8 +77,8 @@ func NewRecordBatchSerializer(typs []types.T) (*RecordBatchSerializer, error) {
 		numBuffers: make([]int, len(typs)),
 		builder:    flatbuffers.NewBuilder(flatbufferBuilderInitialCapacity),
 	}
-	for i := range typs {
-		s.numBuffers[i] = numBuffersForType(typeconv.FromColumnType(&typs[i]))
+	for i, t := range typs {
+		s.numBuffers[i] = numBuffersForType(t)
 	}
 	// s.scratch.padding is used to align metadata to an 8 byte boundary, so
 	// doesn't need to be larger than 7 bytes.

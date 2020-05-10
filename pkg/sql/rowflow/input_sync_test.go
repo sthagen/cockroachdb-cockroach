@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func TestOrderedSync(t *testing.T) {
@@ -185,7 +185,7 @@ func TestUnorderedSync(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	mrc := &execinfra.RowChannel{}
-	mrc.InitWithNumSenders([]types.T{*types.Int}, 5)
+	mrc.InitWithNumSenders([]*types.T{types.Int}, 5)
 	producerErr := make(chan error, 100)
 	for i := 1; i <= 5; i++ {
 		go func(i int) {
@@ -234,7 +234,7 @@ func TestUnorderedSync(t *testing.T) {
 
 	// Test case when one source closes with an error.
 	mrc = &execinfra.RowChannel{}
-	mrc.InitWithNumSenders([]types.T{*types.Int}, 5)
+	mrc.InitWithNumSenders([]*types.T{types.Int}, 5)
 	for i := 1; i <= 5; i++ {
 		go func(i int) {
 			for j := 1; j <= 100; j++ {

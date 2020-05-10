@@ -87,7 +87,7 @@ type DistSQLPlanner struct {
 
 	// gossip handle used to check node version compatibility and to construct
 	// the spanResolver.
-	gossip *gossip.Gossip
+	gossip gossip.DeprecatedGossip
 
 	nodeDialer *nodedialer.Dialer
 
@@ -146,7 +146,7 @@ func NewDistSQLPlanner(
 	rpcCtx *rpc.Context,
 	distSQLSrv *distsql.ServerImpl,
 	distSender *kvcoord.DistSender,
-	g *gossip.Gossip,
+	gw gossip.DeprecatedGossip,
 	stopper *stop.Stopper,
 	liveness livenessProvider,
 	nodeDialer *nodedialer.Dialer,
@@ -160,10 +160,10 @@ func NewDistSQLPlanner(
 		nodeDesc:    nodeDesc,
 		stopper:     stopper,
 		distSQLSrv:  distSQLSrv,
-		gossip:      g,
+		gossip:      gw,
 		nodeDialer:  nodeDialer,
 		nodeHealth: distSQLNodeHealth{
-			gossip:     g,
+			gossip:     gw,
 			connHealth: nodeDialer.ConnHealth,
 		},
 		distSender:            distSender,
@@ -656,7 +656,7 @@ type SpanPartition struct {
 }
 
 type distSQLNodeHealth struct {
-	gossip     *gossip.Gossip
+	gossip     gossip.DeprecatedGossip
 	isLive     func(roachpb.NodeID) (bool, error)
 	connHealth func(roachpb.NodeID, rpc.ConnectionClass) error
 }
@@ -671,7 +671,7 @@ func (h *distSQLNodeHealth) check(ctx context.Context, nodeID roachpb.NodeID) er
 		// writing). This is better than having it used in 100% of cases
 		// (until the liveness check below kicks in).
 		err := h.connHealth(nodeID, rpc.DefaultClass)
-		if err != nil && err != rpc.ErrNotHeartbeated {
+		if err != nil && !errors.Is(err, rpc.ErrNotHeartbeated) {
 			// This host is known to be unhealthy. Don't use it (use the gateway
 			// instead). Note: this can never happen for our nodeID (which
 			// always has its address in the nodeMap).
@@ -692,22 +692,24 @@ func (h *distSQLNodeHealth) check(ctx context.Context, nodeID roachpb.NodeID) er
 	}
 
 	// Check that the node is not draining.
-	drainingInfo := &execinfrapb.DistSQLDrainingInfo{}
-	if err := h.gossip.GetInfoProto(gossip.MakeDistSQLDrainingKey(nodeID), drainingInfo); err != nil {
-		// Because draining info has no expiration, an error
-		// implies that we have not yet received a node's
-		// draining information. Since this information is
-		// written on startup, the most likely scenario is
-		// that the node is ready. We therefore return no
-		// error.
-		// TODO(ajwerner): Determine the expected error types and only filter those.
-		return nil //nolint:returnerrcheck
-	}
+	if g, ok := h.gossip.Optional(distsql.MultiTenancyIssueNo); ok {
+		drainingInfo := &execinfrapb.DistSQLDrainingInfo{}
+		if err := g.GetInfoProto(gossip.MakeDistSQLDrainingKey(nodeID), drainingInfo); err != nil {
+			// Because draining info has no expiration, an error
+			// implies that we have not yet received a node's
+			// draining information. Since this information is
+			// written on startup, the most likely scenario is
+			// that the node is ready. We therefore return no
+			// error.
+			// TODO(ajwerner): Determine the expected error types and only filter those.
+			return nil //nolint:returnerrcheck
+		}
 
-	if drainingInfo.Draining {
-		err := errors.Newf("not using n%d because it is draining", log.Safe(nodeID))
-		log.VEventf(ctx, 1, "%v", err)
-		return err
+		if drainingInfo.Draining {
+			err := errors.Newf("not using n%d because it is draining", log.Safe(nodeID))
+			log.VEventf(ctx, 1, "%v", err)
+			return err
+		}
 	}
 
 	return nil
@@ -861,8 +863,12 @@ func (dsp *DistSQLPlanner) PartitionSpans(
 func (dsp *DistSQLPlanner) nodeVersionIsCompatible(
 	nodeID roachpb.NodeID, planVer execinfrapb.DistSQLVersion,
 ) bool {
+	g, ok := dsp.gossip.Optional(distsql.MultiTenancyIssueNo)
+	if !ok {
+		return true // no gossip - always compatible; only a single gateway running in Phase 2
+	}
 	var v execinfrapb.DistSQLVersionGossipInfo
-	if err := dsp.gossip.GetInfoProto(gossip.MakeDistSQLNodeVersionKey(nodeID), &v); err != nil {
+	if err := g.GetInfoProto(gossip.MakeDistSQLNodeVersionKey(nodeID), &v); err != nil {
 		return false
 	}
 	return distsql.FlowVerIsCompatible(dsp.planVersion, v.MinAcceptedVersion, v.Version)
@@ -1160,11 +1166,11 @@ func (dsp *DistSQLPlanner) createTableReaders(
 		p.SetMergeOrdering(dsp.convertOrdering(n.reqOrdering, scanNodeToTableOrdinalMap))
 	}
 
-	var typs []types.T
+	var typs []*types.T
 	if returnMutations {
-		typs = make([]types.T, 0, len(n.desc.Columns)+len(n.desc.MutationColumns()))
+		typs = make([]*types.T, 0, len(n.desc.Columns)+len(n.desc.MutationColumns()))
 	} else {
-		typs = make([]types.T, 0, len(n.desc.Columns))
+		typs = make([]*types.T, 0, len(n.desc.Columns))
 	}
 	for i := range n.desc.Columns {
 		typs = append(typs, n.desc.Columns[i].Type)
@@ -1268,7 +1274,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 	planCtx *PlanningCtx, p *PhysicalPlan, n *groupNode,
 ) error {
 	aggregations := make([]execinfrapb.AggregatorSpec_Aggregation, len(n.funcs))
-	aggregationsColumnTypes := make([][]types.T, len(n.funcs))
+	aggregationsColumnTypes := make([][]*types.T, len(n.funcs))
 	for i, fholder := range n.funcs {
 		// Convert the aggregate function to the enum value with the same string
 		// representation.
@@ -1287,14 +1293,14 @@ func (dsp *DistSQLPlanner) addAggregators(
 			aggregations[i].FilterColIdx = &col
 		}
 		aggregations[i].Arguments = make([]execinfrapb.Expression, len(fholder.arguments))
-		aggregationsColumnTypes[i] = make([]types.T, len(fholder.arguments))
+		aggregationsColumnTypes[i] = make([]*types.T, len(fholder.arguments))
 		for j, argument := range fholder.arguments {
 			var err error
 			aggregations[i].Arguments[j], err = physicalplan.MakeExpression(argument, planCtx, nil)
 			if err != nil {
 				return err
 			}
-			aggregationsColumnTypes[i][j] = *argument.ResolvedType()
+			aggregationsColumnTypes[i][j] = argument.ResolvedType()
 			if err != nil {
 				return err
 			}
@@ -1444,7 +1450,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 		// aggregations but do not initialize any aggregations
 		// since we can de-duplicate equivalent local and final aggregations.
 		localAggs := make([]execinfrapb.AggregatorSpec_Aggregation, 0, nLocalAgg+len(groupCols))
-		intermediateTypes := make([]types.T, 0, nLocalAgg+len(groupCols))
+		intermediateTypes := make([]*types.T, 0, nLocalAgg+len(groupCols))
 		finalAggs := make([]execinfrapb.AggregatorSpec_Aggregation, 0, nFinalAgg)
 		// finalIdxMap maps the index i of the final aggregation (with
 		// respect to the i-th final aggregation out of all final
@@ -1512,7 +1518,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 
 					// Keep track of the new local
 					// aggregation's output type.
-					argTypes := make([]types.T, len(e.ColIdx))
+					argTypes := make([]*types.T, len(e.ColIdx))
 					for j, c := range e.ColIdx {
 						argTypes[j] = inputTypes[c]
 					}
@@ -1520,7 +1526,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 					if err != nil {
 						return err
 					}
-					intermediateTypes = append(intermediateTypes, *outputType)
+					intermediateTypes = append(intermediateTypes, outputType)
 				}
 			}
 
@@ -1561,7 +1567,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 					finalAggs = append(finalAggs, finalAgg)
 
 					if needRender {
-						argTypes := make([]types.T, len(finalInfo.LocalIdxs))
+						argTypes := make([]*types.T, len(finalInfo.LocalIdxs))
 						for i := range finalInfo.LocalIdxs {
 							// Map the corresponding local
 							// aggregation output types for
@@ -1722,9 +1728,9 @@ func (dsp *DistSQLPlanner) addAggregators(
 
 	// Set up the final stage.
 
-	finalOutTypes := make([]types.T, len(aggregations))
+	finalOutTypes := make([]*types.T, len(aggregations))
 	for i, agg := range aggregations {
-		argTypes := make([]types.T, len(agg.ColIdx)+len(agg.Arguments))
+		argTypes := make([]*types.T, len(agg.ColIdx)+len(agg.Arguments))
 		for j, c := range agg.ColIdx {
 			argTypes[j] = inputTypes[c]
 		}
@@ -1736,7 +1742,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 		if err != nil {
 			return err
 		}
-		finalOutTypes[i] = *returnTyp
+		finalOutTypes[i] = returnTyp
 	}
 
 	// Update p.PlanToStreamColMap; we will have a simple 1-to-1 mapping of
@@ -1931,7 +1937,7 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 	post := execinfrapb.PostProcessSpec{Projection: true}
 
 	post.OutputColumns = make([]uint32, numOutCols)
-	types := make([]types.T, numOutCols)
+	types := make([]*types.T, numOutCols)
 
 	for i := 0; i < numLeftCols; i++ {
 		types[i] = plan.ResultTypes[i]
@@ -2045,7 +2051,7 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 	numOutCols := len(n.columns)
 
 	post.OutputColumns = make([]uint32, numOutCols)
-	types := make([]types.T, numOutCols)
+	types := make([]*types.T, numOutCols)
 	planToStreamColMap := makePlanToStreamColMap(numOutCols)
 	colOffset := 0
 	i := 0
@@ -2119,13 +2125,13 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 // getTypesForPlanResult returns the types of the elements in the result streams
 // of a plan that corresponds to a given planNode. If planToStreamColMap is nil,
 // a 1-1 mapping is assumed.
-func getTypesForPlanResult(node planNode, planToStreamColMap []int) ([]types.T, error) {
+func getTypesForPlanResult(node planNode, planToStreamColMap []int) ([]*types.T, error) {
 	nodeColumns := planColumns(node)
 	if planToStreamColMap == nil {
 		// No remapping.
-		types := make([]types.T, len(nodeColumns))
+		types := make([]*types.T, len(nodeColumns))
 		for i := range nodeColumns {
-			types[i] = *nodeColumns[i].Typ
+			types[i] = nodeColumns[i].Typ
 		}
 		return types, nil
 	}
@@ -2135,10 +2141,10 @@ func getTypesForPlanResult(node planNode, planToStreamColMap []int) ([]types.T, 
 			numCols = streamCol + 1
 		}
 	}
-	types := make([]types.T, numCols)
+	types := make([]*types.T, numCols)
 	for nodeCol, streamCol := range planToStreamColMap {
 		if streamCol != -1 {
-			types[streamCol] = *nodeColumns[nodeCol].Typ
+			types[streamCol] = nodeColumns[nodeCol].Typ
 		}
 	}
 	return types, nil
@@ -2567,7 +2573,7 @@ func (dsp *DistSQLPlanner) wrapPlan(planCtx *PlanningCtx, n planNode) (PhysicalP
 // located on the gateway node and initialized with given numRows
 // and rawBytes that need to be precomputed beforehand.
 func (dsp *DistSQLPlanner) createValuesPlan(
-	resultTypes []types.T, numRows int, rawBytes [][]byte,
+	resultTypes []*types.T, numRows int, rawBytes [][]byte,
 ) (PhysicalPlan, error) {
 	numColumns := len(resultTypes)
 	s := execinfrapb.ValuesCoreSpec{
@@ -2632,8 +2638,8 @@ func (dsp *DistSQLPlanner) createPlanForValues(
 		datums := n.Values()
 		for j := range n.columns {
 			var err error
-			datum := sqlbase.DatumToEncDatum(&types[j], datums[j])
-			buf, err = datum.Encode(&types[j], &a, sqlbase.DatumEncoding_VALUE, buf)
+			datum := sqlbase.DatumToEncDatum(types[j], datums[j])
+			buf, err = datum.Encode(types[j], &a, sqlbase.DatumEncoding_VALUE, buf)
 			if err != nil {
 				return PhysicalPlan{}, err
 			}
@@ -2741,7 +2747,7 @@ func (dsp *DistSQLPlanner) createPlanForOrdinality(
 	}
 
 	plan.PlanToStreamColMap = append(plan.PlanToStreamColMap, len(plan.ResultTypes))
-	outputTypes := append(plan.ResultTypes, *types.Int)
+	outputTypes := append(plan.ResultTypes, types.Int)
 
 	// WITH ORDINALITY never gets distributed so that the gateway node can
 	// always number each row in order.
@@ -2755,7 +2761,7 @@ func createProjectSetSpec(
 ) (*execinfrapb.ProjectSetSpec, error) {
 	spec := execinfrapb.ProjectSetSpec{
 		Exprs:            make([]execinfrapb.Expression, len(n.exprs)),
-		GeneratedColumns: make([]types.T, len(n.columns)-n.numColsInSource),
+		GeneratedColumns: make([]*types.T, len(n.columns)-n.numColsInSource),
 		NumColsPerGen:    make([]uint32, len(n.exprs)),
 	}
 	for i, expr := range n.exprs {
@@ -2766,7 +2772,7 @@ func createProjectSetSpec(
 		}
 	}
 	for i, col := range n.columns[n.numColsInSource:] {
-		spec.GeneratedColumns[i] = *col.Typ
+		spec.GeneratedColumns[i] = col.Typ
 	}
 	for i, n := range n.numColsPerGen {
 		spec.NumColsPerGen[i] = uint32(n)
@@ -3105,14 +3111,14 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 			WindowFns:   make([]execinfrapb.WindowerSpec_WindowFn, len(samePartitionFuncs)),
 		}
 
-		newResultTypes := make([]types.T, len(plan.ResultTypes)+len(samePartitionFuncs))
+		newResultTypes := make([]*types.T, len(plan.ResultTypes)+len(samePartitionFuncs))
 		copy(newResultTypes, plan.ResultTypes)
 		for windowFnSpecIdx, windowFn := range samePartitionFuncs {
 			windowFnSpec, outputType, err := windowPlanState.createWindowFnSpec(windowFn)
 			if err != nil {
 				return PhysicalPlan{}, err
 			}
-			newResultTypes[windowFn.outputColIdx] = *outputType
+			newResultTypes[windowFn.outputColIdx] = outputType
 			windowerSpec.WindowFns[windowFnSpecIdx] = windowFnSpec
 		}
 
@@ -3237,9 +3243,9 @@ func (dsp *DistSQLPlanner) createPlanForExport(
 		CompressionCodec: n.fileCompression,
 	}}
 
-	resTypes := make([]types.T, len(sqlbase.ExportColumns))
+	resTypes := make([]*types.T, len(sqlbase.ExportColumns))
 	for i := range sqlbase.ExportColumns {
-		resTypes[i] = *sqlbase.ExportColumns[i].Typ
+		resTypes[i] = sqlbase.ExportColumns[i].Typ
 	}
 	plan.AddNoGroupingStage(
 		core, execinfrapb.PostProcessSpec{}, resTypes, execinfrapb.Ordering{},

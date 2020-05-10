@@ -36,7 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type indexKeyTest struct {
@@ -55,7 +55,7 @@ func makeTableDescForTest(test indexKeyTest) (TableDescriptor, map[ColumnID]int)
 	for i := range columns {
 		columns[i] = ColumnDescriptor{
 			ID:   ColumnID(i + 1),
-			Type: *types.Int,
+			Type: types.Int,
 		}
 		colMap[columns[i].ID] = i
 		if i < len(test.primaryValues) {
@@ -121,7 +121,7 @@ func decodeIndex(
 	decodedValues := make([]tree.Datum, len(values))
 	var da DatumAlloc
 	for i, value := range values {
-		err := value.EnsureDecoded(&types[i], &da)
+		err := value.EnsureDecoded(types[i], &da)
 		if err != nil {
 			return nil, err
 		}
@@ -543,7 +543,7 @@ func TestMarshalColumnValue(t *testing.T) {
 
 	for i, testCase := range tests {
 		typ := testCase.typ
-		col := ColumnDescriptor{ID: ColumnID(typ.Family() + 1), Type: *typ}
+		col := ColumnDescriptor{ID: ColumnID(typ.Family() + 1), Type: typ}
 
 		if actual, err := MarshalColumnValue(&col, testCase.datum); err != nil {
 			t.Errorf("%d: unexpected error with column type %v: %v", i, typ, err)
@@ -881,9 +881,9 @@ func TestAdjustStartKeyForInterleave(t *testing.T) {
 	//    parent		(pid1)
 	//	child		(pid1, cid1, cid2)
 	//	  grandchild	(pid1, cid1, cid2, gcid1)
-	parent := GetTableDescriptor(kvDB, sqlutils.TestDB, "parent1")
-	child := GetTableDescriptor(kvDB, sqlutils.TestDB, "child1")
-	grandchild := GetTableDescriptor(kvDB, sqlutils.TestDB, "grandchild1")
+	parent := GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "parent1")
+	child := GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "child1")
+	grandchild := GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "grandchild1")
 
 	parentDescIdx := parent.Indexes[0]
 	childDescIdx := child.Indexes[0]
@@ -1093,9 +1093,9 @@ func TestAdjustEndKeyForInterleave(t *testing.T) {
 	//    parent		(pid1)
 	//	child		(pid1, cid1, cid2)
 	//	  grandchild	(pid1, cid1, cid2, gcid1)
-	parent := GetTableDescriptor(kvDB, sqlutils.TestDB, "parent1")
-	child := GetTableDescriptor(kvDB, sqlutils.TestDB, "child1")
-	grandchild := GetTableDescriptor(kvDB, sqlutils.TestDB, "grandchild1")
+	parent := GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "parent1")
+	child := GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "child1")
+	grandchild := GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "grandchild1")
 
 	parentDescIdx := parent.Indexes[0]
 	childDescIdx := child.Indexes[0]

@@ -78,7 +78,7 @@ func TestAggregator(t *testing.T) {
 				Rows: [][]interface{}{
 					{nil, nil, 0, nil, nil, nil, nil},
 				},
-				Types: []types.T{*types.Int, *types.Int, *types.Int, *types.Decimal, *types.Decimal, *types.Decimal, *types.Decimal},
+				Types: []*types.T{types.Int, types.Int, types.Int, types.Decimal, types.Decimal, types.Decimal, types.Decimal},
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -205,7 +205,7 @@ func TestAggregator(t *testing.T) {
 					{2, 14},
 					{4, 11},
 				},
-				Types: []types.T{*types.Int, *types.Decimal},
+				Types: []*types.T{types.Int, types.Decimal},
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -235,7 +235,7 @@ func TestAggregator(t *testing.T) {
 					{2, 14},
 					{4, 11},
 				},
-				Types: []types.T{*types.Int, *types.Decimal},
+				Types: []*types.T{types.Int, types.Decimal},
 			},
 			DisableSort: true,
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
@@ -266,7 +266,7 @@ func TestAggregator(t *testing.T) {
 				Rows: [][]interface{}{
 					{5, 14},
 				},
-				Types: []types.T{*types.Int, *types.Decimal},
+				Types: []*types.T{types.Int, types.Decimal},
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -368,7 +368,7 @@ func TestAggregator(t *testing.T) {
 					{3, nil, 1, true},
 					{2, true, 1, true},
 				},
-				Types: []types.T{*types.Int, *types.Bool, *types.Int, *types.Bool},
+				Types: []*types.T{types.Int, types.Bool, types.Int, types.Bool},
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
@@ -432,7 +432,7 @@ func BenchmarkAggregation(b *testing.B) {
 				},
 			}
 			post := &execinfrapb.PostProcessSpec{}
-			disposer := &execinfra.RowDisposer{}
+			disposer := &rowDisposer{}
 			input := execinfra.NewRepeatableRowSource(sqlbase.OneIntCol, sqlbase.MakeIntRows(numRows, numCols))
 
 			b.SetBytes(int64(8 * numRows * numCols))
@@ -459,7 +459,7 @@ func BenchmarkCountRows(b *testing.B) {
 		},
 	}
 	post := &execinfrapb.PostProcessSpec{}
-	disposer := &execinfra.RowDisposer{}
+	disposer := &rowDisposer{}
 	const numCols = 1
 	const numRows = 100000
 	input := execinfra.NewRepeatableRowSource(sqlbase.OneIntCol, sqlbase.MakeIntRows(numRows, numCols))
@@ -503,7 +503,7 @@ func BenchmarkGrouping(b *testing.B) {
 		GroupCols: []uint32{0},
 	}
 	post := &execinfrapb.PostProcessSpec{}
-	disposer := &execinfra.RowDisposer{}
+	disposer := &rowDisposer{}
 	input := execinfra.NewRepeatableRowSource(sqlbase.OneIntCol, sqlbase.MakeIntRows(numRows, numCols))
 
 	b.SetBytes(int64(8 * numRows * numCols))
@@ -561,7 +561,7 @@ func benchmarkAggregationWithGrouping(b *testing.B, numOrderedCols int) {
 			}
 			spec.OrderedGroupCols = allOrderedGroupCols[:numOrderedCols]
 			post := &execinfrapb.PostProcessSpec{}
-			disposer := &execinfra.RowDisposer{}
+			disposer := &rowDisposer{}
 			input := execinfra.NewRepeatableRowSource(sqlbase.ThreeIntCols, makeGroupedIntRows(groupSize, numCols, groupedCols[:]))
 
 			b.SetBytes(int64(8 * intPow(groupSize, len(groupedCols)+1) * numCols))

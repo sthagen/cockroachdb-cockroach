@@ -12,7 +12,6 @@ package cli
 
 import (
 	"context"
-	gosql "database/sql"
 	"database/sql/driver"
 	"fmt"
 	"io"
@@ -173,7 +172,7 @@ func (c *sqlConn) getServerMetadata() (
 ) {
 	// Retrieve the node ID and server build info.
 	rows, err := c.Query("SELECT * FROM crdb_internal.node_build_info", nil)
-	if err == driver.ErrBadConn {
+	if errors.Is(err, driver.ErrBadConn) {
 		return 0, "", "", err
 	}
 	if err != nil {
@@ -241,7 +240,7 @@ func (c *sqlConn) checkServerMetadata() error {
 	}
 
 	_, newServerVersion, newClusterID, err := c.getServerMetadata()
-	if err == driver.ErrBadConn {
+	if errors.Is(err, driver.ErrBadConn) {
 		return err
 	}
 	if err != nil {
@@ -353,21 +352,21 @@ type sqlTxnShim struct {
 	conn *sqlConn
 }
 
-func (t sqlTxnShim) Commit() error {
+var _ crdb.Tx = sqlTxnShim{}
+
+func (t sqlTxnShim) Commit(context.Context) error {
 	return t.conn.Exec(`COMMIT`, nil)
 }
 
-func (t sqlTxnShim) Rollback() error {
+func (t sqlTxnShim) Rollback(context.Context) error {
 	return t.conn.Exec(`ROLLBACK`, nil)
 }
 
-func (t sqlTxnShim) ExecContext(
-	_ context.Context, query string, values ...interface{},
-) (gosql.Result, error) {
+func (t sqlTxnShim) Exec(_ context.Context, query string, values ...interface{}) error {
 	if len(values) != 0 {
 		panic(fmt.Sprintf("sqlTxnShim.ExecContext must not be called with values"))
 	}
-	return nil, t.conn.Exec(query, nil)
+	return t.conn.Exec(query, nil)
 }
 
 // ExecTxn runs fn inside a transaction and retries it as needed.
@@ -394,7 +393,7 @@ func (c *sqlConn) Exec(query string, args []driver.Value) error {
 	}
 	_, err := c.conn.Exec(query, args)
 	c.flushNotices()
-	if err == driver.ErrBadConn {
+	if errors.Is(err, driver.ErrBadConn) {
 		c.reconnecting = true
 		c.Close()
 	}
@@ -409,7 +408,7 @@ func (c *sqlConn) Query(query string, args []driver.Value) (*sqlRows, error) {
 		fmt.Fprintln(stderr, ">", query)
 	}
 	rows, err := c.conn.Query(query, args)
-	if err == driver.ErrBadConn {
+	if errors.Is(err, driver.ErrBadConn) {
 		c.reconnecting = true
 		c.Close()
 	}
@@ -447,7 +446,7 @@ func (c *sqlConn) Close() {
 	c.flushNotices()
 	if c.conn != nil {
 		err := c.conn.Close()
-		if err != nil && err != driver.ErrBadConn {
+		if err != nil && !errors.Is(err, driver.ErrBadConn) {
 			log.Infof(context.TODO(), "%v", err)
 		}
 		c.conn = nil
@@ -485,7 +484,7 @@ func (r *sqlRows) Tag() string {
 func (r *sqlRows) Close() error {
 	r.conn.flushNotices()
 	err := r.rows.Close()
-	if err == driver.ErrBadConn {
+	if errors.Is(err, driver.ErrBadConn) {
 		r.conn.reconnecting = true
 		r.conn.Close()
 	}
@@ -498,7 +497,7 @@ func (r *sqlRows) Close() error {
 // (since this is unobvious and unexpected behavior) outweigh.
 func (r *sqlRows) Next(values []driver.Value) error {
 	err := r.rows.Next(values)
-	if err == driver.ErrBadConn {
+	if errors.Is(err, driver.ErrBadConn) {
 		r.conn.reconnecting = true
 		r.conn.Close()
 	}

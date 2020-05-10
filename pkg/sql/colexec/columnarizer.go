@@ -15,7 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
@@ -48,7 +48,7 @@ type Columnarizer struct {
 	batch           coldata.Batch
 	accumulatedMeta []execinfrapb.ProducerMetadata
 	ctx             context.Context
-	typs            []types.T
+	typs            []*types.T
 }
 
 var _ colexecbase.Operator = &Columnarizer{}
@@ -80,8 +80,7 @@ func NewColumnarizer(
 		return nil, err
 	}
 	c.typs = c.OutputTypes()
-	_, err = typeconv.FromColumnTypes(c.typs)
-	return c, err
+	return c, typeconv.AreTypesSupported(c.typs)
 }
 
 // Init is part of the Operator interface.
@@ -126,7 +125,7 @@ func (c *Columnarizer) Next(context.Context) coldata.Batch {
 
 	// Write each column into the output batch.
 	for idx, ct := range columnTypes {
-		err := EncDatumRowsToColVec(c.allocator, c.buffered[:nRows], c.batch.ColVec(idx), idx, &ct, &c.da)
+		err := EncDatumRowsToColVec(c.allocator, c.buffered[:nRows], c.batch.ColVec(idx), idx, ct, &c.da)
 		if err != nil {
 			colexecerror.InternalError(err)
 		}

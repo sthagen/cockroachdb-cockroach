@@ -14,6 +14,7 @@ package geographiclib
 // #cgo CXXFLAGS: -std=c++14
 // #cgo LDFLAGS: -lm
 //
+// #include "geodesic.h"
 // #include "geographiclib.h"
 import "C"
 
@@ -27,22 +28,31 @@ var (
 // Spheroid is an object that can perform geodesic operations
 // on a given spheroid.
 type Spheroid struct {
-	Radius     float64
-	Flattening float64
+	cRepr        C.struct_geod_geodesic
+	Radius       float64
+	Flattening   float64
+	SphereRadius float64
 }
 
 // MakeSpheroid creates a spheroid from a radius and flattening.
 func MakeSpheroid(radius float64, flattening float64) Spheroid {
-	return Spheroid{Radius: radius, Flattening: flattening}
+	minorAxis := radius - radius*flattening
+	s := Spheroid{
+		Radius:       radius,
+		Flattening:   flattening,
+		SphereRadius: (radius*2 + minorAxis) / 3,
+	}
+	C.geod_init(&s.cRepr, C.double(radius), C.double(flattening))
+	return s
 }
 
-// Inverse solves the inverse geodesic problem on the given spheroid.
+// Inverse solves the geodetic inverse problem on the given spheroid
+// (https://en.wikipedia.org/wiki/Geodesy#Geodetic_problems).
 // Returns s12 (distance in meters), az1 (azimuth to point 1) and az2 (azimuth to point 2).
-func (s Spheroid) Inverse(a, b s2.LatLng) (s12, az1, az2 float64) {
+func (s *Spheroid) Inverse(a, b s2.LatLng) (s12, az1, az2 float64) {
 	var retS12, retAZ1, retAZ2 C.double
-	C.CR_GEOGRAPHICLIB_Inverse(
-		C.double(s.Radius),
-		C.double(s.Flattening),
+	C.geod_inverse(
+		&s.cRepr,
 		C.double(a.Lat.Degrees()),
 		C.double(a.Lng.Degrees()),
 		C.double(b.Lat.Degrees()),
@@ -52,4 +62,50 @@ func (s Spheroid) Inverse(a, b s2.LatLng) (s12, az1, az2 float64) {
 		&retAZ2,
 	)
 	return float64(retS12), float64(retAZ1), float64(retAZ2)
+}
+
+// InverseBatch computes the sum of the length of the lines represented
+// by the line of points.
+// This is intended for use for LineStrings. LinearRings/Polygons should use "AreaAndPerimeter".
+// Returns the sum of the s12 (distance in meters) units.
+func (s *Spheroid) InverseBatch(points []s2.Point) float64 {
+	lats := make([]C.double, len(points))
+	lngs := make([]C.double, len(points))
+	for i, p := range points {
+		latlng := s2.LatLngFromPoint(p)
+		lats[i] = C.double(latlng.Lat.Degrees())
+		lngs[i] = C.double(latlng.Lng.Degrees())
+	}
+	var result C.double
+	C.CR_GEOGRAPHICLIB_InverseBatch(
+		&s.cRepr,
+		&lats[0],
+		&lngs[0],
+		C.int(len(points)),
+		&result,
+	)
+	return float64(result)
+}
+
+// AreaAndPerimeter computes the area and perimeter of a polygon on a given spheroid.
+// The points must never be duplicated (i.e. do not include the "final" point of a Polygon LinearRing).
+// Area is in meter^2, Perimeter is in meters.
+func (s *Spheroid) AreaAndPerimeter(points []s2.Point) (area float64, perimeter float64) {
+	lats := make([]C.double, len(points))
+	lngs := make([]C.double, len(points))
+	for i, p := range points {
+		latlng := s2.LatLngFromPoint(p)
+		lats[i] = C.double(latlng.Lat.Degrees())
+		lngs[i] = C.double(latlng.Lng.Degrees())
+	}
+	var areaDouble, perimeterDouble C.double
+	C.geod_polygonarea(
+		&s.cRepr,
+		&lats[0],
+		&lngs[0],
+		C.int(len(points)),
+		&areaDouble,
+		&perimeterDouble,
+	)
+	return float64(areaDouble), float64(perimeterDouble)
 }

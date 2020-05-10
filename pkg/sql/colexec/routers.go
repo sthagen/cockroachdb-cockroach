@@ -16,7 +16,6 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
@@ -71,7 +70,7 @@ type routerOutputOp struct {
 	// input is a reference to our router.
 	input execinfra.OpNode
 
-	types []types.T
+	types []*types.T
 
 	// unblockedEventsChan is signaled when a routerOutput changes state from
 	// blocked to unblocked.
@@ -169,7 +168,7 @@ var _ colexecbase.Operator = &routerOutputOp{}
 // when it is exceeded.
 func newRouterOutputOp(
 	unlimitedAllocator *colmem.Allocator,
-	types []types.T,
+	types []*types.T,
 	unblockedEventsChan chan<- struct{},
 	memoryLimit int64,
 	cfg colcontainer.DiskQueueCfg,
@@ -181,7 +180,7 @@ func newRouterOutputOp(
 
 func newRouterOutputOpWithBlockedThresholdAndBatchSize(
 	unlimitedAllocator *colmem.Allocator,
-	types []types.T,
+	types []*types.T,
 	unblockedEventsChan chan<- struct{},
 	memoryLimit int64,
 	cfg colcontainer.DiskQueueCfg,
@@ -328,11 +327,10 @@ func (o *routerOutputOp) addBatch(ctx context.Context, batch coldata.Batch, sele
 			numAppended = available
 		}
 		o.mu.unlimitedAllocator.PerformOperation(o.mu.pendingBatch.ColVecs(), func() {
-			for i, t := range o.types {
+			for i := range o.types {
 				o.mu.pendingBatch.ColVec(i).Copy(
 					coldata.CopySliceArgs{
 						SliceArgs: coldata.SliceArgs{
-							ColType:   typeconv.FromColumnType(&t),
 							Src:       batch.ColVec(i),
 							Sel:       selection[:numAppended],
 							DestIdx:   o.mu.pendingBatch.Length(),
@@ -402,8 +400,8 @@ func (o *routerOutputOp) reset(ctx context.Context) {
 // returned by the constructor.
 type HashRouter struct {
 	OneInputNode
-	// types are the input coltypes.
-	types []types.T
+	// types are the input types.
+	types []*types.T
 	// hashCols is a slice of indices of the columns used for hashing.
 	hashCols []uint32
 
@@ -439,7 +437,7 @@ type HashRouter struct {
 func NewHashRouter(
 	unlimitedAllocators []*colmem.Allocator,
 	input colexecbase.Operator,
-	types []types.T,
+	types []*types.T,
 	hashCols []uint32,
 	memoryLimit int64,
 	diskQueueCfg colcontainer.DiskQueueCfg,
@@ -474,7 +472,7 @@ func NewHashRouter(
 
 func newHashRouterWithOutputs(
 	input colexecbase.Operator,
-	types []types.T,
+	types []*types.T,
 	hashCols []uint32,
 	unblockEventsChan <-chan struct{},
 	outputs []routerOutput,

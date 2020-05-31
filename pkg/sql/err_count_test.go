@@ -31,7 +31,7 @@ func TestErrorCounts(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	count1 := telemetry.GetRawFeatureCounts()["errorcodes."+pgcode.Syntax]
 
@@ -70,17 +70,20 @@ func TestUnimplementedCounts(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
-	if _, err := db.Exec("CREATE TABLE t(x INT8)"); err != nil {
+	if _, err := db.Exec(`
+CREATE TABLE t(x INT8); 
+SET enable_experimental_alter_column_type_general = true;
+BEGIN;
+`); err != nil {
 		t.Fatal(err)
 	}
-
-	if _, err := db.Exec("ALTER TABLE t ALTER COLUMN x SET DATA TYPE STRING USING x::STRING"); err == nil {
+	if _, err := db.Exec("ALTER TABLE t ALTER COLUMN x SET DATA TYPE STRING"); err == nil {
 		t.Fatal("expected error, got no error")
 	}
 
-	if telemetry.GetRawFeatureCounts()["unimplemented.#9851.INT8->STRING"] == 0 {
+	if telemetry.GetRawFeatureCounts()["unimplemented.#49351"] == 0 {
 		t.Fatal("expected unimplemented telemetry, got nothing")
 	}
 }
@@ -96,7 +99,7 @@ func TestTransactionRetryErrorCounts(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec("CREATE TABLE accounts (id INT8 PRIMARY KEY, balance INT8)"); err != nil {
 		t.Fatal(err)

@@ -19,6 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -67,29 +69,22 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 		return nil, err
 	}
 
-	schemas, err := p.Tables().getSchemasForDatabase(ctx, p.txn, dbDesc.ID)
+	schemas, err := p.Tables().GetSchemasForDatabase(ctx, p.txn, dbDesc.ID)
 	if err != nil {
 		return nil, err
 	}
 
 	var tbNames TableNames
-	tempSchemasToDelete := make(map[ClusterWideID]struct{})
+	schemasToDelete := make([]string, 0, len(schemas))
 	for _, schema := range schemas {
-		toAppend, err := GetObjectNames(
+		schemasToDelete = append(schemasToDelete, schema)
+		toAppend, err := resolver.GetObjectNames(
 			ctx, p.txn, p, p.ExecCfg().Codec, dbDesc, schema, true, /*explicitPrefix*/
 		)
 		if err != nil {
 			return nil, err
 		}
 		tbNames = append(tbNames, toAppend...)
-
-		isTempSchema, clusterWideID, err := temporarySchemaSessionID(schema)
-		if err != nil {
-			return nil, err
-		}
-		if isTempSchema {
-			tempSchemasToDelete[clusterWideID] = struct{}{}
-		}
 	}
 
 	if len(tbNames) > 0 {
@@ -156,11 +151,6 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 	td, err = p.filterCascadedTables(ctx, td)
 	if err != nil {
 		return nil, err
-	}
-
-	schemasToDelete := make([]string, 0, len(tempSchemasToDelete))
-	for clusterWideID := range tempSchemasToDelete {
-		schemasToDelete = append(schemasToDelete, temporarySchemaName(clusterWideID))
 	}
 
 	return &dropDatabaseNode{n: n, dbDesc: dbDesc, td: td, schemasToDelete: schemasToDelete}, nil
@@ -248,7 +238,7 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		b.DelRange(zoneKeyPrefix, zoneKeyPrefix.PrefixEnd(), false /* returnKeys */)
 	}
 
-	p.Tables().addUncommittedDatabase(n.dbDesc.Name, n.dbDesc.ID, dbDropped)
+	p.Tables().AddUncommittedDatabase(n.dbDesc.Name, n.dbDesc.ID, descs.DBDropped)
 
 	if err := p.txn.Run(ctx, b); err != nil {
 		return err
@@ -307,7 +297,7 @@ func (p *planner) accumulateDependentTables(
 ) error {
 	for _, ref := range desc.DependedOnBy {
 		dependentTables[ref.ID] = true
-		dependentDesc, err := p.Tables().getMutableTableVersionByID(ctx, ref.ID, p.txn)
+		dependentDesc, err := p.Tables().GetMutableTableVersionByID(ctx, ref.ID, p.txn)
 		if err != nil {
 			return err
 		}

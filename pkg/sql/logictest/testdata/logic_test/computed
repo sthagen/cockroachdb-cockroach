@@ -1,3 +1,4 @@
+# LogicTest: !3node-tenant
 statement ok
 CREATE TABLE with_no_column_refs (
   a INT,
@@ -688,7 +689,7 @@ SELECT * FROM x ORDER BY a
 6 12 10
 
 # Verify a bad statement fails.
-statement error unsupported binary operator: <int> \+ <string> \(desired <int>\)
+statement error pq: could not parse "a" as type int
 ALTER TABLE x ADD COLUMN d INT AS (a + 'a') STORED
 
 statement error could not parse "a" as type int
@@ -776,3 +777,17 @@ query TT
 SELECT * FROM t34901
 ----
 a  ab
+
+# Regression test for #42418.
+statement ok
+CREATE TABLE t42418 (x INT GENERATED ALWAYS AS (1) STORED);
+ALTER TABLE t42418 ADD COLUMN y INT GENERATED ALWAYS AS (1) STORED
+
+query TT
+SHOW CREATE t42418
+----
+t42418  CREATE TABLE t42418 (
+        x INT8 NULL AS (1) STORED,
+        y INT8 NULL AS (1) STORED,
+        FAMILY "primary" (x, rowid, y)
+)

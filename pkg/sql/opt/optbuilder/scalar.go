@@ -133,11 +133,6 @@ func (b *Builder) buildScalar(
 		out = b.factory.ConstructCollate(in, t.Locale)
 
 	case *tree.ArrayFlatten:
-		if b.AllowUnsupportedExpr {
-			out = b.factory.ConstructUnsupportedExpr(t)
-			break
-		}
-
 		s := t.Subquery.(*subquery)
 
 		inCol := s.cols[0].id
@@ -308,6 +303,22 @@ func (b *Builder) buildScalar(
 		input := b.buildScalar(t.TypedInnerExpr(), inScope, nil, nil, colRefs)
 		out = b.factory.ConstructNot(input)
 
+	case *tree.IsNullExpr:
+		input := b.buildScalar(t.TypedInnerExpr(), inScope, nil, nil, colRefs)
+		if t.TypedInnerExpr().ResolvedType().Family() == types.TupleFamily {
+			out = b.factory.ConstructIsTupleNull(input)
+		} else {
+			out = b.factory.ConstructIs(input, memo.NullSingleton)
+		}
+
+	case *tree.IsNotNullExpr:
+		input := b.buildScalar(t.TypedInnerExpr(), inScope, nil, nil, colRefs)
+		if t.TypedInnerExpr().ResolvedType().Family() == types.TupleFamily {
+			out = b.factory.ConstructIsTupleNotNull(input)
+		} else {
+			out = b.factory.ConstructIsNot(input, memo.NullSingleton)
+		}
+
 	case *tree.NullIfExpr:
 		// Ensure that the type of the first expression matches the resolved type
 		// of the NULLIF expression so that type inference will be correct in the
@@ -347,6 +358,9 @@ func (b *Builder) buildScalar(
 		inputTo := b.buildScalar(t.TypedLeftTo(), inScope, nil, nil, colRefs)
 		to := b.buildScalar(t.TypedTo(), inScope, nil, nil, colRefs)
 		out = b.buildRangeCond(t.Not, t.Symmetric, inputFrom, from, inputTo, to)
+
+	case *sqlFnInfo:
+		out = b.buildSQLFn(t, inScope, outScope, outCol, colRefs)
 
 	case *srf:
 		if len(t.cols) == 1 {
@@ -407,11 +421,7 @@ func (b *Builder) buildScalar(
 		out = b.factory.ConstructConstVal(t, t.ResolvedType())
 
 	default:
-		if b.AllowUnsupportedExpr {
-			out = b.factory.ConstructUnsupportedExpr(scalar)
-		} else {
-			panic(unimplemented.Newf(fmt.Sprintf("optbuilder.%T", scalar), "not yet implemented: scalar expression: %T", scalar))
-		}
+		panic(unimplemented.Newf(fmt.Sprintf("optbuilder.%T", scalar), "not yet implemented: scalar expression: %T", scalar))
 	}
 
 	return b.finishBuildScalar(scalar, out, inScope, outScope, outCol)

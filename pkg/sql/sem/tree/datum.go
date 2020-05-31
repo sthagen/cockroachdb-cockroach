@@ -197,7 +197,7 @@ func (d Datums) Compare(evalCtx *EvalContext, other Datums) int {
 
 // IsDistinctFrom checks to see if two datums are distinct from each other. Any
 // change in value is considered distinct, however, a NULL value is NOT
-// considered disctinct from another NULL value.
+// considered distinct from another NULL value.
 func (d Datums) IsDistinctFrom(evalCtx *EvalContext, other Datums) bool {
 	if len(d) != len(other) {
 		return true
@@ -2506,6 +2506,16 @@ type DInterval struct {
 	duration.Duration
 }
 
+// MustBeDInterval attempts to retrieve a DInterval from an Expr, panicking if the
+// assertion fails.
+func MustBeDInterval(e Expr) *DInterval {
+	switch t := e.(type) {
+	case *DInterval:
+		return t
+	}
+	panic(errors.AssertionFailedf("expected *DInterval, found %T", e))
+}
+
 // NewDInterval creates a new DInterval.
 func NewDInterval(d duration.Duration, itm types.IntervalTypeMetadata) *DInterval {
 	ret := &DInterval{Duration: d}
@@ -3771,23 +3781,46 @@ func (d *DEnum) Size() uintptr {
 		unsafe.Sizeof(d.LogicalRep)
 }
 
-// MakeDEnumFromPhysicalRepresentation creates a DEnum of the input type
-// and the input physical representation.
-func MakeDEnumFromPhysicalRepresentation(typ *types.T, rep []byte) *DEnum {
+// GetEnumComponentsFromPhysicalRep returns the physical and logical components
+// for an enum of the requested type. It returns an error if it cannot find a
+// matching physical representation.
+func GetEnumComponentsFromPhysicalRep(typ *types.T, rep []byte) ([]byte, string, error) {
+	idx, err := typ.EnumGetIdxOfPhysical(rep)
+	if err != nil {
+		return nil, "", err
+	}
+	meta := typ.TypeMeta.EnumData
 	// Take a pointer into the enum metadata rather than holding on
 	// to a pointer to the input bytes.
-	idx := typ.EnumGetIdxOfPhysical(rep)
+	return meta.PhysicalRepresentations[idx], meta.LogicalRepresentations[idx], nil
+}
+
+// MakeDEnumFromPhysicalRepresentation creates a DEnum of the input type
+// and the input physical representation.
+func MakeDEnumFromPhysicalRepresentation(typ *types.T, rep []byte) (*DEnum, error) {
+	// Return a nice error if the input requested type is types.AnyEnum.
+	if typ.Oid() == oid.T_anyenum {
+		return nil, errors.New("cannot create enum of unspecified type")
+	}
+	phys, log, err := GetEnumComponentsFromPhysicalRep(typ, rep)
+	if err != nil {
+		return nil, err
+	}
 	return &DEnum{
 		EnumTyp:     typ,
-		PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[idx],
-		LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[idx],
-	}
+		PhysicalRep: phys,
+		LogicalRep:  log,
+	}, nil
 }
 
 // MakeDEnumFromLogicalRepresentation creates a DEnum of the input type
 // and input logical representation. It returns an error if the input
 // logical representation is invalid.
 func MakeDEnumFromLogicalRepresentation(typ *types.T, rep string) (*DEnum, error) {
+	// Return a nice error if the input requested type is types.AnyEnum.
+	if typ.Oid() == oid.T_anyenum {
+		return nil, errors.New("cannot create enum of unspecified type")
+	}
 	// Take a pointer into the enum metadata rather than holding on
 	// to a pointer to the input string.
 	idx, err := typ.EnumGetIdxOfLogical(rep)
@@ -3830,54 +3863,82 @@ func (d *DEnum) Compare(ctx *EvalContext, other Datum) int {
 
 // Prev implements the Datum interface.
 func (d *DEnum) Prev(ctx *EvalContext) (Datum, bool) {
-	idx := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	idx, err := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	if err != nil {
+		panic(err)
+	}
 	if idx == 0 {
 		return nil, false
 	}
-	return MakeDEnumFromPhysicalRepresentation(
-		d.EnumTyp,
-		d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations[idx-1],
-	), true
+	enumData := d.EnumTyp.TypeMeta.EnumData
+	return &DEnum{
+		EnumTyp:     d.EnumTyp,
+		PhysicalRep: enumData.PhysicalRepresentations[idx-1],
+		LogicalRep:  enumData.LogicalRepresentations[idx-1],
+	}, true
 }
 
 // Next implements the Datum interface.
 func (d *DEnum) Next(ctx *EvalContext) (Datum, bool) {
-	idx := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
-	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
-	if idx == len(physReps)-1 {
+	idx, err := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	if err != nil {
+		panic(err)
+	}
+	enumData := d.EnumTyp.TypeMeta.EnumData
+	if idx == len(enumData.PhysicalRepresentations)-1 {
 		return nil, false
 	}
-	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[idx+1]), true
+	return &DEnum{
+		EnumTyp:     d.EnumTyp,
+		PhysicalRep: enumData.PhysicalRepresentations[idx+1],
+		LogicalRep:  enumData.LogicalRepresentations[idx+1],
+	}, true
 }
 
 // Max implements the Datum interface.
 func (d *DEnum) Max(ctx *EvalContext) (Datum, bool) {
-	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
-	if len(physReps) == 0 {
+	enumData := d.EnumTyp.TypeMeta.EnumData
+	if len(enumData.PhysicalRepresentations) == 0 {
 		return nil, false
 	}
-	idx := len(physReps) - 1
-	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[idx]), true
+	idx := len(enumData.PhysicalRepresentations) - 1
+	return &DEnum{
+		EnumTyp:     d.EnumTyp,
+		PhysicalRep: enumData.PhysicalRepresentations[idx],
+		LogicalRep:  enumData.LogicalRepresentations[idx],
+	}, true
 }
 
 // Min implements the Datum interface.
 func (d *DEnum) Min(ctx *EvalContext) (Datum, bool) {
-	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
-	if len(physReps) == 0 {
+	enumData := d.EnumTyp.TypeMeta.EnumData
+	if len(enumData.PhysicalRepresentations) == 0 {
 		return nil, false
 	}
-	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[0]), true
+	return &DEnum{
+		EnumTyp:     d.EnumTyp,
+		PhysicalRep: enumData.PhysicalRepresentations[0],
+		LogicalRep:  enumData.LogicalRepresentations[0],
+	}, true
 }
 
 // IsMax implements the Datum interface.
 func (d *DEnum) IsMax(_ *EvalContext) bool {
 	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
-	return d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep) == len(physReps)-1
+	idx, err := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	if err != nil {
+		panic(err)
+	}
+	return idx == len(physReps)-1
 }
 
 // IsMin implements the Datum interface.
 func (d *DEnum) IsMin(_ *EvalContext) bool {
-	return d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep) == 0
+	idx, err := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	if err != nil {
+		panic(err)
+	}
+	return idx == 0
 }
 
 // AmbiguousFormat implements the Datum interface.

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/biogo/store/llrb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -24,12 +25,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/opentracing/opentracing-go"
 )
 
 // rangeCacheKey is the key type used to store and sort values in the
@@ -67,7 +71,8 @@ type RangeDescriptorDB interface {
 // arbitrary keys. Descriptors are initially queried from storage
 // using a RangeDescriptorDB, but are cached for subsequent lookups.
 type RangeDescriptorCache struct {
-	st *cluster.Settings
+	st      *cluster.Settings
+	stopper *stop.Stopper
 	// RangeDescriptorDB is used to retrieve range descriptors from the
 	// database, which will be cached by this structure.
 	db RangeDescriptorDB
@@ -84,6 +89,11 @@ type RangeDescriptorCache struct {
 	// multiplexed onto the same database lookup. See makeLookupRequestKey
 	// for details on this inference.
 	lookupRequests singleflight.Group
+
+	// coalesced, if not nil, is sent on every time a request is coalesced onto
+	// another in-flight one. Used by tests to block until a lookup request is
+	// blocked on the single-flight querying the db.
+	coalesced chan struct{}
 }
 
 // RangeDescriptorCache implements the kvbase interface.
@@ -159,9 +169,9 @@ func makeLookupRequestKey(
 	// split again into [a, b) and [b, c), we don't want to the requests on [a,
 	// b) to be coalesced with the retried requests on [c, e). To distinguish the
 	// two cases, we can use the generation of the previous descriptor.
-	if prevDesc != nil && prevDesc.GetGenerationComparable() {
+	if prevDesc != nil {
 		ret.WriteString(":")
-		ret.WriteString(strconv.FormatInt(prevDesc.GetGeneration(), 10))
+		ret.WriteString(strconv.FormatInt(prevDesc.Generation, 10))
 	}
 	return ret.String()
 }
@@ -170,9 +180,9 @@ func makeLookupRequestKey(
 // uses the given RangeDescriptorDB as the underlying source of range
 // descriptors.
 func NewRangeDescriptorCache(
-	st *cluster.Settings, db RangeDescriptorDB, size func() int64,
+	st *cluster.Settings, db RangeDescriptorDB, size func() int64, stopper *stop.Stopper,
 ) *RangeDescriptorCache {
-	rdc := &RangeDescriptorCache{st: st, db: db}
+	rdc := &RangeDescriptorCache{st: st, db: db, stopper: stopper}
 	rdc.rangeCache.cache = cache.NewOrderedCache(cache.Config{
 		Policy: cache.CacheLRU,
 		ShouldEvict: func(n int, _, _ interface{}) bool {
@@ -268,7 +278,7 @@ func (et *EvictionToken) EvictAndReplace(
 func (rdc *RangeDescriptorCache) LookupRangeDescriptorWithEvictionToken(
 	ctx context.Context, key roachpb.RKey, evictToken *EvictionToken, useReverseScan bool,
 ) (*roachpb.RangeDescriptor, *EvictionToken, error) {
-	return rdc.lookupRangeDescriptorInternal(ctx, key, evictToken, useReverseScan, nil)
+	return rdc.lookupRangeDescriptorInternal(ctx, key, evictToken, useReverseScan)
 }
 
 // LookupRangeDescriptor presents a simpler interface for looking up a
@@ -278,7 +288,7 @@ func (rdc *RangeDescriptorCache) LookupRangeDescriptorWithEvictionToken(
 func (rdc *RangeDescriptorCache) LookupRangeDescriptor(
 	ctx context.Context, key roachpb.RKey,
 ) (*roachpb.RangeDescriptor, error) {
-	rd, _, err := rdc.lookupRangeDescriptorInternal(ctx, key, nil, false, nil)
+	rd, _, err := rdc.lookupRangeDescriptorInternal(ctx, key, nil, false)
 	return rd, err
 }
 
@@ -288,20 +298,49 @@ func (rdc *RangeDescriptorCache) LookupRangeDescriptor(
 // added to the inflight request map (with or without merging) or the
 // function finishes. Used for testing.
 func (rdc *RangeDescriptorCache) lookupRangeDescriptorInternal(
-	ctx context.Context,
-	key roachpb.RKey,
-	evictToken *EvictionToken,
-	useReverseScan bool,
-	wg *sync.WaitGroup,
+	ctx context.Context, key roachpb.RKey, evictToken *EvictionToken, useReverseScan bool,
 ) (*roachpb.RangeDescriptor, *EvictionToken, error) {
-	doneWg := func() {
-		if wg != nil {
-			wg.Done()
+	// Retry while we're hitting lookupCoalescingErrors.
+	for {
+		desc, newToken, err := rdc.tryLookupRangeDescriptor(ctx, key, evictToken, useReverseScan)
+		if errors.HasType(err, (lookupCoalescingError{})) {
+			log.VEventf(ctx, 2, "bad lookup coalescing; retrying: %s", err)
+			continue
 		}
-		wg = nil
+		if err != nil {
+			return nil, nil, err
+		}
+		return desc, newToken, nil
 	}
-	defer doneWg()
+}
 
+// lookupCoalescingError is returned by tryLookupRangeDescriptor() when the
+// descriptor database lookup failed because this request was grouped with
+// another request for another key, and the grouping proved bad since that other
+// request returned a descriptor that doesn't cover our request. The lookup
+// should be retried.
+type lookupCoalescingError struct {
+	// key is the key whose range was being looked-up.
+	key       roachpb.RKey
+	wrongDesc *roachpb.RangeDescriptor
+}
+
+func (e lookupCoalescingError) Error() string {
+	return fmt.Sprintf("key %q not contained in range lookup's "+
+		"resulting descriptor %v", e.key, e.wrongDesc)
+}
+
+func newLookupCoalescingError(key roachpb.RKey, wrongDesc *roachpb.RangeDescriptor) error {
+	return lookupCoalescingError{
+		key:       key,
+		wrongDesc: wrongDesc,
+	}
+}
+
+// tryLookupRangeDescriptor can return a lookupCoalescingError.
+func (rdc *RangeDescriptorCache) tryLookupRangeDescriptor(
+	ctx context.Context, key roachpb.RKey, evictToken *EvictionToken, useReverseScan bool,
+) (*roachpb.RangeDescriptor, *EvictionToken, error) {
 	rdc.rangeCache.RLock()
 	if desc, _, err := rdc.getCachedRangeDescriptorLocked(key, useReverseScan); err != nil {
 		rdc.rangeCache.RUnlock()
@@ -315,7 +354,7 @@ func (rdc *RangeDescriptorCache) lookupRangeDescriptorInternal(
 	}
 
 	if log.V(2) {
-		log.Infof(ctx, "lookup range descriptor: key=%s", key)
+		log.Infof(ctx, "lookup range descriptor: key=%s (reverse: %t)", key, useReverseScan)
 	}
 
 	var prevDesc *roachpb.RangeDescriptor
@@ -324,57 +363,70 @@ func (rdc *RangeDescriptorCache) lookupRangeDescriptorInternal(
 	}
 	requestKey := makeLookupRequestKey(key, prevDesc, useReverseScan)
 	resC, leader := rdc.lookupRequests.DoChan(requestKey, func() (interface{}, error) {
-		ctx := ctx // disable shadows linter
-		ctx, reqSpan := tracing.ForkCtxSpan(ctx, "range lookup")
-		defer tracing.FinishSpan(reqSpan)
-
-		rs, preRs, err := rdc.performRangeLookup(ctx, key, useReverseScan)
-		if err != nil {
-			return nil, err
-		}
-
 		var lookupRes lookupResult
-		switch len(rs) {
-		case 0:
-			return nil, fmt.Errorf("no range descriptors returned for %s", key)
-		case 1:
-			desc := &rs[0]
-			lookupRes = lookupResult{
-				desc: desc,
-				evictToken: rdc.makeEvictionToken(desc, func(ctx context.Context) error {
-					return rdc.evictCachedRangeDescriptorLocked(ctx, key, desc, useReverseScan)
-				}),
-			}
-		case 2:
-			desc := &rs[0]
-			nextDesc := rs[1]
-			lookupRes = lookupResult{
-				desc: desc,
-				evictToken: rdc.makeEvictionToken(desc, func(ctx context.Context) error {
-					return rdc.insertRangeDescriptorsLocked(ctx, nextDesc)
-				}),
-			}
-		default:
-			panic(fmt.Sprintf("more than 2 matching range descriptors returned for %s: %v", key, rs))
-		}
+		if err := rdc.stopper.RunTaskWithErr(ctx, "rangecache: range lookup", func(ctx context.Context) error {
+			ctx, reqSpan := tracing.ForkCtxSpan(ctx, "range lookup")
+			defer tracing.FinishSpan(reqSpan)
+			// Clear the context's cancelation. This request services potentially many
+			// callers waiting for its result, and using the flight's leader's
+			// cancelation doesn't make sense.
+			ctx = logtags.WithTags(context.Background(), logtags.FromContext(ctx))
+			ctx = opentracing.ContextWithSpan(ctx, reqSpan)
 
-		// We want to be assured that all goroutines which experienced a cache miss
-		// have joined our in-flight request, and all others will experience a
-		// cache hit. This requires atomicity across cache population and
-		// notification, hence this exclusive lock.
-		rdc.rangeCache.Lock()
-		defer rdc.rangeCache.Unlock()
+			// Since we don't inherit any other cancelation, let's put in a generous
+			// timeout as some protection against unavailable meta ranges.
+			var rs, preRs []roachpb.RangeDescriptor
+			if err := contextutil.RunWithTimeout(ctx, "range lookup", 10*time.Second,
+				func(ctx context.Context) error {
+					var err error
+					rs, preRs, err = rdc.performRangeLookup(ctx, key, useReverseScan)
+					return err
+				}); err != nil {
+				return err
+			}
 
-		// These need to be separate because we need to preserve the pointer to rs[0]
-		// so that the compare-and-evict logic works correctly in EvictCachedRangeDescriptor.
-		// An append could cause a copy, which would change the address of rs[0]. We insert
-		// the prefetched descriptors first to avoid any unintended overwriting. We then
-		// only insert the first desired descriptor, since any other descriptor in rs would
-		// overwrite rs[0]. Instead, these are handled with the evictToken.
-		if err := rdc.insertRangeDescriptorsLocked(ctx, preRs...); err != nil {
-			log.Warningf(ctx, "range cache inserting prefetched descriptors failed: %v", err)
-		}
-		if err := rdc.insertRangeDescriptorsLocked(ctx, rs[:1]...); err != nil {
+			switch len(rs) {
+			case 0:
+				return fmt.Errorf("no range descriptors returned for %s", key)
+			case 1:
+				desc := &rs[0]
+				lookupRes = lookupResult{
+					desc: desc,
+					evictToken: rdc.makeEvictionToken(desc, func(ctx context.Context) error {
+						return rdc.evictCachedRangeDescriptorLocked(ctx, key, desc, useReverseScan)
+					}),
+				}
+			case 2:
+				desc := &rs[0]
+				nextDesc := rs[1]
+				lookupRes = lookupResult{
+					desc: desc,
+					evictToken: rdc.makeEvictionToken(desc, func(ctx context.Context) error {
+						return rdc.insertRangeDescriptorsLocked(ctx, nextDesc)
+					}),
+				}
+			default:
+				panic(fmt.Sprintf("more than 2 matching range descriptors returned for %s: %v", key, rs))
+			}
+
+			// We want to be assured that all goroutines which experienced a cache miss
+			// have joined our in-flight request, and all others will experience a
+			// cache hit. This requires atomicity across cache population and
+			// notification, hence this exclusive lock.
+			rdc.rangeCache.Lock()
+			defer rdc.rangeCache.Unlock()
+
+			// These need to be separate because we need to preserve the pointer to rs[0]
+			// so that the compare-and-evict logic works correctly in EvictCachedRangeDescriptor.
+			// An append could cause a copy, which would change the address of rs[0]. We insert
+			// the prefetched descriptors first to avoid any unintended overwriting. We then
+			// only insert the first desired descriptor, since any other descriptor in rs would
+			// overwrite rs[0]. Instead, these are handled with the evictToken.
+			if err := rdc.insertRangeDescriptorsLocked(ctx, preRs...); err != nil {
+				log.Warningf(ctx, "range cache inserting prefetched descriptors failed: %v", err)
+			}
+			return rdc.insertRangeDescriptorsLocked(ctx, rs[:1]...)
+		}); err != nil {
 			return nil, err
 		}
 		return lookupRes, nil
@@ -384,23 +436,19 @@ func (rdc *RangeDescriptorCache) lookupRangeDescriptorInternal(
 	// be done *after* the request has been added to the lookupRequests group, or
 	// we risk it racing with an inflight request.
 	rdc.rangeCache.RUnlock()
-	doneWg()
 
-	// We only want to wait on context cancellation here if we are not the
-	// leader of the lookupRequest. If we are the leader then we'll wait for
-	// lower levels to propagate the context cancellation error over resC. This
-	// assures that as the leader we always wait for the function passed to
-	// DoChan to return before returning from this method.
-	ctxDone := ctx.Done()
-	if leader {
-		ctxDone = nil
+	if !leader {
+		log.VEvent(ctx, 2, "coalesced range lookup request onto in-flight one")
+		if rdc.coalesced != nil {
+			rdc.coalesced <- struct{}{}
+		}
 	}
 
 	// Wait for the inflight request.
 	var res singleflight.Result
 	select {
 	case res = <-resC:
-	case <-ctxDone:
+	case <-ctx.Done():
 		return nil, nil, errors.Wrap(ctx.Err(), "aborted during range descriptor lookup")
 	}
 
@@ -419,9 +467,15 @@ func (rdc *RangeDescriptorCache) lookupRangeDescriptorInternal(
 		return nil, nil, res.Err
 	}
 
-	// It rarely may be possible that we got grouped in with the wrong
-	// RangeLookup (eg. from a double split), so if we did, return an error with
-	// an unmodified eviction token.
+	// We might get a descriptor that doesn't contain the key we're looking for
+	// because of bad grouping of requests. For example, say we had a stale
+	// [a-z) in the cache who's info is passed into this function as evictToken.
+	// In the meantime the range has been split to [a-m),[m-z). A request for "a"
+	// will be coalesced with a request for "m" in the singleflight, above, but
+	// one of them will get a wrong results. We return an error that will trigger
+	// a retry at a higher level inside the cache. Note that the retry might find
+	// the descriptor it's looking for in the cache if it was pre-fetched by the
+	// original lookup.
 	lookupRes := res.Val.(lookupResult)
 	if desc := lookupRes.desc; desc != nil {
 		containsFn := (*roachpb.RangeDescriptor).ContainsKey
@@ -429,8 +483,7 @@ func (rdc *RangeDescriptorCache) lookupRangeDescriptorInternal(
 			containsFn = (*roachpb.RangeDescriptor).ContainsKeyInverted
 		}
 		if !containsFn(desc, key) {
-			return nil, evictToken, errors.Errorf("key %q not contained in range lookup's "+
-				"resulting descriptor %v", key, desc)
+			return nil, nil, newLookupCoalescingError(key, desc)
 		}
 	}
 	return lookupRes.desc, lookupRes.evictToken, nil
@@ -497,23 +550,12 @@ func (rdc *RangeDescriptorCache) evictCachedRangeDescriptorLocked(
 
 	// Note that we're doing a "compare-and-erase": If seenDesc is not nil, we
 	// want to clean the cache only if it equals the cached range descriptor. We
-	// try to use Generation and GenerationComparable to determine if the range
-	// descriptors are equal, but if we cannot, we fallback to
-	// pointer-comparison. If the range descriptors are not equal, then likely
-	// some other caller already evicted previously, and we can save work by not
-	// doing it again (which would prompt another expensive lookup).
+	// use Generation to determine if the range descriptors are equal. If the
+	// range descriptors are not equal, then likely some other caller already
+	// evicted previously, and we can save work by not doing it again (which would
+	// prompt another expensive lookup).
 	if seenDesc != nil {
-		if seenDesc.GetGenerationComparable() && cachedDesc.GetGenerationComparable() {
-			if seenDesc.GetGeneration() != cachedDesc.GetGeneration() {
-				return nil
-			}
-		} else if !seenDesc.GetGenerationComparable() && !cachedDesc.GetGenerationComparable() {
-			if seenDesc != cachedDesc {
-				return nil
-			}
-		} else {
-			// One descriptor's generation is comparable, while the other is
-			// incomparable, so the descriptors are guaranteed to be different.
+		if seenDesc.Generation != cachedDesc.Generation {
 			return nil
 		}
 	}
@@ -640,15 +682,8 @@ func (rdc *RangeDescriptorCache) clearOverlappingCachedRangeDescriptors(
 		// check ["c", "d"). We do, however, want to check ["b", "c"), which is why
 		// the end key is inclusive.
 		if cached.StartKey.Less(desc.EndKey) && !cached.EndKey.Less(desc.EndKey) {
-			if desc.GetGenerationComparable() && cached.GetGenerationComparable() {
-				if desc.GetGeneration() <= cached.GetGeneration() {
-					// Generations are comparable and a newer descriptor already exists in
-					// cache.
-					continueWithInsert = false
-				}
-			} else if desc.Equal(*cached) {
-				// Generations are incomparable so we don't continue with insertion
-				// only if the descriptor already exists.
+			if desc.Generation <= cached.Generation {
+				// A newer descriptor already exists in cache.
 				continueWithInsert = false
 			}
 			if continueWithInsert {
@@ -672,16 +707,10 @@ func (rdc *RangeDescriptorCache) clearOverlappingCachedRangeDescriptors(
 	// cache unconditionally.
 	rdc.rangeCache.cache.DoRangeEntry(func(e *cache.Entry) bool {
 		descriptor := e.Value.(*roachpb.RangeDescriptor)
-		if desc.GetGenerationComparable() && descriptor.GetGenerationComparable() {
-			// If generations are comparable, then check generations to see if we
-			// evict.
-			if desc.GetGeneration() <= descriptor.GetGeneration() {
-				continueWithInsert = false
-			} else {
-				entriesToEvict = append(entriesToEvict, e)
-			}
+		// Check generations to see if we evict.
+		if desc.Generation <= descriptor.Generation {
+			continueWithInsert = false
 		} else {
-			// If generations are not comparable, evict.
 			entriesToEvict = append(entriesToEvict, e)
 		}
 		return false

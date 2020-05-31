@@ -481,7 +481,7 @@ func TestRouterOutputRandom(t *testing.T) {
 				go func() {
 					for {
 						b := o.Next(ctx)
-						actual.Add(coldatatestutils.CopyBatch(b, typs), typs)
+						actual.Add(coldatatestutils.CopyBatch(b, typs, testColumnFactory), typs)
 						if b.Length() == 0 {
 							wg.Done()
 							return
@@ -592,7 +592,7 @@ func TestHashRouterComputesDestination(t *testing.T) {
 		}
 	}
 
-	r := newHashRouterWithOutputs(in, typs, []uint32{0}, nil /* ch */, outputs)
+	r := newHashRouterWithOutputs(in, typs, []uint32{0}, nil /* ch */, outputs, nil /* toClose */)
 	for r.processNextBatch(ctx) {
 	}
 
@@ -631,7 +631,7 @@ func TestHashRouterCancellation(t *testing.T) {
 	in := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
 
 	unbufferedCh := make(chan struct{})
-	r := newHashRouterWithOutputs(in, typs, []uint32{0}, unbufferedCh, outputs)
+	r := newHashRouterWithOutputs(in, typs, []uint32{0}, unbufferedCh, outputs, nil /* toClose */)
 
 	t.Run("BeforeRun", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -735,9 +735,9 @@ func TestHashRouterOneOutput(t *testing.T) {
 			diskAcc := testDiskMonitor.MakeBoundAccount()
 			defer diskAcc.Close(ctx)
 			r, routerOutputs := NewHashRouter(
-				[]*colmem.Allocator{testAllocator}, newOpFixedSelTestInput(sel, len(sel), data),
+				[]*colmem.Allocator{testAllocator}, newOpFixedSelTestInput(sel, len(sel), data, typs),
 				typs, []uint32{0}, mtc.bytes, queueCfg, colexecbase.NewTestingSemaphore(2),
-				[]*mon.BoundAccount{&diskAcc},
+				[]*mon.BoundAccount{&diskAcc}, nil, /* toClose */
 			)
 
 			if len(routerOutputs) != 1 {
@@ -846,14 +846,14 @@ func TestHashRouterRandom(t *testing.T) {
 					defer acc.Close(ctx)
 					diskAcc := testDiskMonitor.MakeBoundAccount()
 					defer diskAcc.Close(ctx)
-					allocator := colmem.NewAllocator(ctx, &acc)
+					allocator := colmem.NewAllocator(ctx, &acc, testColumnFactory)
 					op := newRouterOutputOpWithBlockedThresholdAndBatchSize(allocator, typs, unblockEventsChan, memoryLimitPerOutput, queueCfg, colexecbase.NewTestingSemaphore(len(outputs)*2), blockedThreshold, outputSize, &diskAcc)
 					outputs[i] = op
 					outputsAsOps[i] = op
 				}
 
 				r := newHashRouterWithOutputs(
-					inputs[0], typs, hashCols, unblockEventsChan, outputs,
+					inputs[0], typs, hashCols, unblockEventsChan, outputs, nil, /* toClose */
 				)
 
 				var (
@@ -947,13 +947,16 @@ func BenchmarkHashRouter(b *testing.B) {
 				diskAccounts := make([]*mon.BoundAccount, numOutputs)
 				for i := range allocators {
 					acc := testMemMonitor.MakeBoundAccount()
-					allocators[i] = colmem.NewAllocator(ctx, &acc)
+					allocators[i] = colmem.NewAllocator(ctx, &acc, testColumnFactory)
 					defer acc.Close(ctx)
 					diskAcc := testDiskMonitor.MakeBoundAccount()
 					diskAccounts[i] = &diskAcc
 					defer diskAcc.Close(ctx)
 				}
-				r, outputs := NewHashRouter(allocators, input, typs, []uint32{0}, 64<<20, queueCfg, &colexecbase.TestingSemaphore{}, diskAccounts)
+				r, outputs := NewHashRouter(
+					allocators, input, typs, []uint32{0}, 64<<20,
+					queueCfg, &colexecbase.TestingSemaphore{}, diskAccounts, nil, /* toClose */
+				)
 				b.SetBytes(8 * int64(coldata.BatchSize()) * int64(numInputBatches))
 				// We expect distribution to not change. This is a sanity check that
 				// we're resetting properly.
@@ -965,7 +968,7 @@ func BenchmarkHashRouter(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					input.ResetBatchesToReturn(numInputBatches)
-					r.reset(ctx)
+					r.resetForBenchmarks(ctx)
 					wg.Add(len(outputs))
 					for j := range outputs {
 						go func(j int) {

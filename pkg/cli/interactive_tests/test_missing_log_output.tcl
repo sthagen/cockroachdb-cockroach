@@ -1,5 +1,7 @@
 #! /usr/bin/env expect -f
 
+# disabled until #48413 is resolved.
+
 source [file join [file dirname $argv0] common.tcl]
 
 spawn /bin/bash
@@ -19,14 +21,21 @@ eexpect ":/# "
 end_test
 
 start_test "Check that a broken stderr prints a message to the log files."
-send "$argv start-single-node -s=path=logs/db --insecure --logtostderr --vmodule=*=1 2>&1 | cat\r"
+# We use --log-file-max-size to avoid rotations during the test.
+send "$argv start-single-node -s=path=logs/db --log-file-max-size=100M --insecure --logtostderr --vmodule=*=1 2>&1 | cat\r"
 eexpect "CockroachDB node starting"
 system "killall cat"
 eexpect ":/# "
 # NB: we can't just grep for the broken pipe output, because it may take
 # a while for the server to initiate the next log line where it will detect
 # the broken pipe error.
-send "tail -f logs/db/logs/cockroach.log\r"
+#
+# We use -F and not -f because the log file may be rotated during the test.
+#
+# We also watch all the log files in the directory, because the error
+# is only reported on the logger which is writing first after stderr
+# is has been broken, and that may be the secondary logger.
+send "tail -F `find logs/db/logs -type l`\r"
 eexpect "log: exiting because of error: write /dev/stderr: broken pipe"
 interrupt
 eexpect ":/# "
@@ -81,8 +90,8 @@ eexpect "CockroachDB node starting"
 
 system "($argv sql --insecure -e \"select crdb_internal.force_panic('helloworld')\" || true)&"
 # Check the panic is reported on the server's stderr
+eexpect "a SQL panic has occurred"
 eexpect "panic: helloworld"
-eexpect "panic while executing"
 eexpect "goroutine"
 eexpect ":/# "
 # Check the panic is reported on the server log file
@@ -90,7 +99,6 @@ send "cat logs/db/logs/cockroach.log\r"
 eexpect "a SQL panic has occurred"
 eexpect "helloworld"
 eexpect "a panic has occurred"
-eexpect "panic while executing"
 eexpect "goroutine"
 eexpect ":/# "
 

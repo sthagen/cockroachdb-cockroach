@@ -188,11 +188,9 @@ func allocateStoreIDs(
 // GetBootstrapSchema returns the schema which will be used to bootstrap a new
 // server.
 func GetBootstrapSchema(
-	codec keys.SQLCodec,
-	defaultZoneConfig *zonepb.ZoneConfig,
-	defaultSystemZoneConfig *zonepb.ZoneConfig,
+	defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) sqlbase.MetadataSchema {
-	return sqlbase.MakeMetadataSchema(codec, defaultZoneConfig, defaultSystemZoneConfig)
+	return sqlbase.MakeMetadataSchema(keys.SystemSQLCodec, defaultZoneConfig, defaultSystemZoneConfig)
 }
 
 // bootstrapCluster initializes the passed-in engines for a new cluster.
@@ -217,18 +215,14 @@ func bootstrapCluster(
 		cv, err := kvserver.ReadClusterVersion(ctx, eng)
 		if err != nil {
 			return nil, errors.Wrapf(err, "reading cluster version of %s", eng)
-		}
-
-		// bootstrapCluster requires matching cluster versions on all engines.
-		if cv.Major == 0 {
+		} else if cv.Major == 0 {
 			return nil, errors.Errorf("missing bootstrap version")
 		}
 
+		// bootstrapCluster requires matching cluster versions on all engines.
 		if i == 0 {
 			bootstrapVersion = cv
-		}
-
-		if bootstrapVersion != cv {
+		} else if bootstrapVersion != cv {
 			return nil, errors.Wrapf(err, "found cluster versions %s and %s", bootstrapVersion, cv)
 		}
 
@@ -248,8 +242,8 @@ func bootstrapCluster(
 		// not create the range, just its data. Only do this if this is the
 		// first store.
 		if i == 0 {
-			schema := GetBootstrapSchema(keys.SystemSQLCodec, defaultZoneConfig, defaultSystemZoneConfig)
-			initialValues, tableSplits := schema.GetInitialValues(bootstrapVersion)
+			schema := GetBootstrapSchema(defaultZoneConfig, defaultSystemZoneConfig)
+			initialValues, tableSplits := schema.GetInitialValues()
 			splits := append(config.StaticSplits(), tableSplits...)
 			sort.Slice(splits, func(i, j int) bool {
 				return splits[i].Less(splits[j])
@@ -460,7 +454,7 @@ func (n *Node) start(
 		}
 	}
 
-	n.startComputePeriodicMetrics(n.stopper, DefaultMetricsSampleInterval)
+	n.startComputePeriodicMetrics(n.stopper, base.DefaultMetricsSampleInterval)
 
 	// Be careful about moving this line above `startStores`; store migrations rely
 	// on the fact that the cluster version has not been updated via Gossip (we

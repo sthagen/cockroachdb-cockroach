@@ -86,19 +86,24 @@ func TestParse(t *testing.T) {
 		{`CREATE INDEX a ON b.c (d)`},
 		{`CREATE INDEX ON a (b)`},
 		{`CREATE INDEX ON a (b) STORING (c)`},
+		{`CREATE INDEX ON a (b) WHERE c > 3`},
 		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c (d)`},
 		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c.d (e)`},
 		{`CREATE INDEX ON a (b ASC, c DESC)`},
 		{`CREATE INDEX ON a (b NULLS FIRST, c ASC NULLS FIRST, d DESC NULLS LAST)`},
+		{`CREATE INDEX IF NOT EXISTS i ON a (b) WHERE c > 3`},
 		{`CREATE UNIQUE INDEX a ON b (c)`},
 		{`CREATE UNIQUE INDEX a ON b (c) STORING (d)`},
+		{`CREATE UNIQUE INDEX a ON b (c) WHERE d > 3`},
 		{`CREATE UNIQUE INDEX a ON b (c) INTERLEAVE IN PARENT d (e, f)`},
 		{`CREATE UNIQUE INDEX a ON b (c) INTERLEAVE IN PARENT d.e (f, g)`},
 		{`CREATE UNIQUE INDEX a ON b.c (d)`},
 		{`CREATE INVERTED INDEX a ON b (c)`},
 		{`CREATE INVERTED INDEX a ON b.c (d)`},
 		{`CREATE INVERTED INDEX a ON b (c) STORING (d)`},
+		{`CREATE INVERTED INDEX a ON b (c) WHERE d > 3`},
 		{`CREATE INVERTED INDEX a ON b (c) INTERLEAVE IN PARENT d (e)`},
+		{`CREATE INVERTED INDEX IF NOT EXISTS a ON b (c) WHERE d > 3`},
 
 		{`CREATE TABLE a ()`},
 		{`CREATE TEMPORARY TABLE a (b INT8)`},
@@ -118,6 +123,8 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b TIMETZ)`},
 		{`CREATE TABLE a (b TIME(3))`},
 		{`CREATE TABLE a (b TIMETZ(3))`},
+		{`CREATE TABLE a (b GEOGRAPHY)`},
+		{`CREATE TABLE a (b GEOGRAPHY(POINT))`},
 		{`CREATE TABLE a (b GEOGRAPHY(POINT,4326))`},
 		{`CREATE TABLE a (b GEOGRAPHY(LINESTRING,4326))`},
 		{`CREATE TABLE a (b GEOGRAPHY(POLYGON,4326))`},
@@ -217,6 +224,8 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b INT8, c INT8 REFERENCES foo MATCH FULL ON DELETE RESTRICT ON UPDATE RESTRICT)`},
 		{`CREATE TABLE a (b INT8, c INT8 REFERENCES foo (bar) MATCH FULL)`},
 		{`CREATE TABLE a (b INT8, INDEX (b) STORING (c))`},
+		{`CREATE TABLE a (b INT8, INDEX (b) WHERE b > 3)`},
+		{`CREATE TABLE a (b INT8, INVERTED INDEX (b) WHERE b > 3)`},
 		{`CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c))`},
 		{`CREATE TABLE a (b INT8, INDEX (b) INTERLEAVE IN PARENT c (d, e))`},
 		{`CREATE TABLE a (b INT8, FAMILY (b))`},
@@ -781,7 +790,9 @@ func TestParse(t *testing.T) {
 		{`SELECT 'foo'::TIME(6)`},
 		{`SELECT '0'::INTERVAL`},
 
+		{`SELECT 'foo'::GEOGRAPHY`},
 		{`SELECT 'foo'::GEOGRAPHY(POINT,4326)`},
+		{`SELECT 'foo'::GEOGRAPHY(POINT)`},
 		{`SELECT 'foo'::GEOMETRY`},
 		{`SELECT 'foo'::GEOMETRY(POINT)`},
 		{`SELECT 'foo'::GEOMETRY(POINT,4326)`},
@@ -891,6 +902,8 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t WHERE a NOT BETWEEN SYMMETRIC b AND c`},
 		{`SELECT a FROM t WHERE a IS NULL`},
 		{`SELECT a FROM t WHERE a IS NOT NULL`},
+		{`SELECT a FROM t WHERE (a, b) IS NULL`},
+		{`SELECT a FROM t WHERE (a, b) IS NOT NULL`},
 		{`SELECT a FROM t WHERE a IS true`},
 		{`SELECT a FROM t WHERE a IS NOT true`},
 		{`SELECT a FROM t WHERE a IS false`},
@@ -899,6 +912,8 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t WHERE a IS NOT OF (FLOAT8, STRING)`},
 		{`SELECT a FROM t WHERE a IS DISTINCT FROM b`},
 		{`SELECT a FROM t WHERE a IS NOT DISTINCT FROM b`},
+		{`SELECT a FROM t WHERE (a, b) IS NOT DISTINCT FROM NULL`},
+		{`SELECT a FROM t WHERE (a, b) IS DISTINCT FROM NULL`},
 		{`SELECT a FROM t WHERE a < b`},
 		{`SELECT a FROM t WHERE a <= b`},
 		{`SELECT a FROM t WHERE a >= b`},
@@ -1030,6 +1045,12 @@ func TestParse(t *testing.T) {
 		{`SELECT avg(1) OVER (ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT ROW) FROM t`},
 		{`SELECT avg(1) OVER (ROWS UNBOUNDED PRECEDING EXCLUDE GROUP) FROM t`},
 		{`SELECT avg(1) OVER (ROWS UNBOUNDED PRECEDING EXCLUDE TIES) FROM t`},
+
+		{`SELECT percentile_disc(0.50) WITHIN GROUP (ORDER BY c) FROM t`},
+		{`SELECT percentile_disc(0.50) WITHIN GROUP (ORDER BY c DESC) FROM t`},
+		{`SELECT percentile_cont(0.50) WITHIN GROUP (ORDER BY c) FROM t`},
+		{`SELECT percentile_disc(ARRAY[0.95, 0.90]) WITHIN GROUP (ORDER BY c) FROM t`},
+		{`SELECT percentile_cont(ARRAY[0.95, 0.90]) WITHIN GROUP (ORDER BY c) FROM t`},
 
 		{`SELECT avg(1) FILTER (WHERE a > b)`},
 		{`SELECT avg(1) FILTER (WHERE a > b) OVER (ORDER BY c)`},
@@ -1359,6 +1380,14 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN ALTER TABLE t EXPERIMENTAL_AUDIT SET READ WRITE`},
 		{`ALTER TABLE t EXPERIMENTAL_AUDIT SET OFF`},
 
+		{`ALTER TYPE db.s.t ADD VALUE 'hi'`},
+		{`ALTER TYPE s.t ADD VALUE 'hi' BEFORE 'hello'`},
+		{`ALTER TYPE t ADD VALUE 'hi' AFTER 'howdy'`},
+		{`ALTER TYPE s.t ADD VALUE IF NOT EXISTS 'hi' BEFORE 'hello'`},
+		{`ALTER TYPE t RENAME VALUE 'value1' TO 'value2'`},
+		{`ALTER TYPE t RENAME TO t2`},
+		{`ALTER TYPE t SET SCHEMA newschema`},
+
 		{`COMMENT ON COLUMN a.b IS 'a'`},
 		{`COMMENT ON COLUMN a.b IS NULL`},
 		{`COMMENT ON COLUMN a.b.c IS 'a'`},
@@ -1511,6 +1540,8 @@ func TestParse2(t *testing.T) {
 			`CREATE TABLE a (b INT8)`},
 		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b))`,
 			`CREATE TABLE a (b INT8, CONSTRAINT foo UNIQUE (b))`},
+		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b) WHERE c > 3)`,
+			`CREATE TABLE a (b INT8, CONSTRAINT foo UNIQUE (b) WHERE c > 3)`},
 		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b) INTERLEAVE IN PARENT c (d))`,
 			`CREATE TABLE a (b INT8, CONSTRAINT foo UNIQUE (b) INTERLEAVE IN PARENT c (d))`},
 		{`CREATE TABLE a (UNIQUE INDEX (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1)))`,
@@ -1547,8 +1578,6 @@ func TestParse2(t *testing.T) {
 			`CREATE TABLE a (b VARCHAR, c VARCHAR(3))`},
 		{`CREATE TABLE a (b BIT VARYING(2), c BIT(1))`,
 			`CREATE TABLE a (b VARBIT(2), c BIT)`},
-		{`CREATE TABLE a (b GEOGRAPHY(POINT))`, `CREATE TABLE a (b GEOGRAPHY(POINT,4326))`},
-		{`CREATE TABLE a (b GEOGRAPHY)`, `CREATE TABLE a (b GEOGRAPHY(GEOMETRY,4326))`},
 
 		{`CREATE STATISTICS a ON col1 FROM t AS OF SYSTEM TIME '2016-01-01'`,
 			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
@@ -1559,9 +1588,6 @@ func TestParse2(t *testing.T) {
 		{`SELECT CAST(1 AS _int8)`, `SELECT CAST(1 AS INT8[])`},
 		{`SELECT CAST(1 AS "_int8")`, `SELECT CAST(1 AS INT8[])`},
 		{`SELECT SERIAL8 'foo', 'foo'::SERIAL8`, `SELECT INT8 'foo', 'foo'::INT8`},
-
-		{`SELECT 'foo'::GEOGRAPHY`, `SELECT 'foo'::GEOGRAPHY(GEOMETRY,4326)`},
-		{`SELECT 'foo'::GEOGRAPHY(POINT)`, `SELECT 'foo'::GEOGRAPHY(POINT,4326)`},
 
 		{`SELECT 'a'::TIMESTAMP(3)`, `SELECT 'a'::TIMESTAMP(3)`},
 		{`SELECT 'a'::TIMESTAMP(3) WITHOUT TIME ZONE`, `SELECT 'a'::TIMESTAMP(3)`},
@@ -1585,8 +1611,8 @@ func TestParse2(t *testing.T) {
 
 		{`SELECT a FROM t WHERE a ISNULL`, `SELECT a FROM t WHERE a IS NULL`},
 		{`SELECT a FROM t WHERE a NOTNULL`, `SELECT a FROM t WHERE a IS NOT NULL`},
-		{`SELECT a FROM t WHERE a IS UNKNOWN`, `SELECT a FROM t WHERE a IS NULL`},
-		{`SELECT a FROM t WHERE a IS NOT UNKNOWN`, `SELECT a FROM t WHERE a IS NOT NULL`},
+		{`SELECT a FROM t WHERE a IS UNKNOWN`, `SELECT a FROM t WHERE a IS NOT DISTINCT FROM NULL`},
+		{`SELECT a FROM t WHERE a IS NOT UNKNOWN`, `SELECT a FROM t WHERE a IS DISTINCT FROM NULL`},
 
 		{`SELECT +1`, `SELECT 1`},
 		{`SELECT - - 5`, `SELECT 5`},
@@ -2302,6 +2328,7 @@ $function$`,
 			`CREATE TABLE a (b INT8, c STRING, FOREIGN KEY (b, c) REFERENCES other (x, y) MATCH SIMPLE ON DELETE CASCADE ON UPDATE SET NULL)`,
 			`CREATE TABLE a (b INT8, c STRING, FOREIGN KEY (b, c) REFERENCES other (x, y) ON DELETE CASCADE ON UPDATE SET NULL)`,
 		},
+		{`CREATE TABLE a (b INT8 GENERATED ALWAYS AS (a + b) STORED)`, `CREATE TABLE a (b INT8 AS (a + b) STORED)`},
 
 		{`ALTER TABLE a ALTER b DROP STORED`, `ALTER TABLE a ALTER COLUMN b DROP STORED`},
 		{`ALTER TABLE a ADD b INT8`, `ALTER TABLE a ADD COLUMN b INT8`},
@@ -2920,6 +2947,13 @@ ALTER PARTITION p OF TABLE tbl@* CONFIGURE ZONE USING num_replicas = 1
                                  ^
 HINT: try ALTER PARTITION <partition> OF INDEX <tablename>@*`,
 		},
+		{
+			`SELECT percentile_disc(0.50) WITHIN GROUP (ORDER BY f, s) FROM x;`,
+			`at or near ")": syntax error: multiple ORDER BY clauses are not supported in this function
+DETAIL: source SQL:
+SELECT percentile_disc(0.50) WITHIN GROUP (ORDER BY f, s) FROM x
+                                                        ^`,
+		},
 	}
 	for _, d := range testData {
 		t.Run(d.sql, func(t *testing.T) {
@@ -3264,7 +3298,23 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TYPE a`, 27793, `shell`, ``},
 		{`CREATE DOMAIN a`, 27796, `create`, ``},
 
-		{`CREATE INDEX a ON b(c) WHERE d > 0`, 9683, ``, ``},
+		{`ALTER TYPE t OWNER TO hello`, 48700, `ALTER TYPE OWNER TO`, ``},
+		{`ALTER TYPE t OWNER TO CURRENT_USER`, 48700, `ALTER TYPE OWNER TO`, ``},
+		{`ALTER TYPE t OWNER TO SESSION_USER`, 48700, `ALTER TYPE OWNER TO`, ``},
+		{`ALTER TYPE db.t RENAME ATTRIBUTE foo TO bar`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar COLLATE hello`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar RESTRICT`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar CASCADE`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t DROP ATTRIBUTE foo`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t DROP ATTRIBUTE foo RESTRICT`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t DROP ATTRIBUTE foo CASCADE`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ALTER ATTRIBUTE foo TYPE typ`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ALTER ATTRIBUTE foo TYPE typ COLLATE en`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ALTER ATTRIBUTE foo TYPE typ COLLATE en CASCADE`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ALTER ATTRIBUTE foo SET DATA TYPE typ COLLATE en RESTRICT`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar RESTRICT, DROP ATTRIBUTE foo`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+
 		{`CREATE INDEX a ON b USING HASH (c)`, 0, `index using hash`, ``},
 		{`CREATE INDEX a ON b USING GIST (c)`, 0, `index using gist`, ``},
 		{`CREATE INDEX a ON b USING SPGIST (c)`, 0, `index using spgist`, ``},
@@ -3289,7 +3339,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`SELECT a(VARIADIC b)`, 0, `variadic`, ``},
 		{`SELECT a(b, c, VARIADIC b)`, 0, `variadic`, ``},
 		{`SELECT TREAT (a AS INT8)`, 0, `treat`, ``},
-		{`SELECT a(b) WITHIN GROUP (ORDER BY c)`, 0, `within group`, ``},
 
 		{`SELECT a FROM t ORDER BY a NULLS LAST`, 6224, ``, ``},
 		{`SELECT a FROM t ORDER BY a ASC NULLS LAST`, 6224, ``, ``},

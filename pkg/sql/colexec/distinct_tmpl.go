@@ -20,20 +20,14 @@
 package colexec
 
 import (
-	"bytes"
 	"context"
-	"math"
-	"time"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
@@ -97,24 +91,6 @@ var _ = execgen.UNSAFEGET
 
 // Declarations to make the template compile properly.
 
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
-
 // _GOTYPE is the template variable.
 type _GOTYPE interface{}
 
@@ -123,7 +99,7 @@ type _GOTYPESLICE interface{}
 
 // _ASSIGN_NE is the template equality function for assigning the first input
 // to the result of the second input != the third input.
-func _ASSIGN_NE(_ bool, _, _ _GOTYPE) bool {
+func _ASSIGN_NE(_ bool, _, _, _, _, _ _GOTYPE) bool {
 	colexecerror.InternalError("")
 }
 
@@ -138,7 +114,7 @@ const _TYPE_WIDTH = 0
 func newSingleDistinct(
 	input colexecbase.Operator, distinctColIdx int, outputCol []bool, t *types.T,
 ) (colexecbase.Operator, error) {
-	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
 	case _CANONICAL_TYPE_FAMILY:
 		switch t.Width() {
@@ -175,7 +151,7 @@ type partitioner interface {
 
 // newPartitioner returns a new partitioner on type t.
 func newPartitioner(t *types.T) (partitioner, error) {
-	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
 	case _CANONICAL_TYPE_FAMILY:
 		switch t.Width() {
@@ -373,7 +349,7 @@ func _CHECK_DISTINCT(
 	// {{with .Global}}
 	v := execgen.UNSAFEGET(col, checkIdx)
 	var unique bool
-	_ASSIGN_NE(unique, v, lastVal)
+	_ASSIGN_NE(unique, v, lastVal, _, col, _)
 	outputCol[outputIdx] = outputCol[outputIdx] || unique
 	execgen.COPYVAL(lastVal, v)
 	// {{end}}
@@ -412,7 +388,7 @@ func _CHECK_DISTINCT_WITH_NULLS(
 		} else {
 			// Neither value is null, so we must compare.
 			var unique bool
-			_ASSIGN_NE(unique, v, lastVal)
+			_ASSIGN_NE(unique, v, lastVal, _, col, _)
 			outputCol[outputIdx] = outputCol[outputIdx] || unique
 		}
 		execgen.COPYVAL(lastVal, v)

@@ -78,7 +78,7 @@ type TestServerArgs struct {
 
 	// Fields copied to the server.Config.
 	Insecure                    bool
-	RetryOptions                retry.Options
+	RetryOptions                retry.Options // TODO(tbg): make testing knob.
 	SocketFile                  string
 	ScanInterval                time.Duration
 	ScanMinIdleTime             time.Duration
@@ -150,7 +150,14 @@ var (
 // DefaultTestStoreSpec that is in-memory.
 // It has a maximum size of 100MiB.
 func DefaultTestTempStorageConfig(st *cluster.Settings) TempStorageConfig {
-	var maxSizeBytes int64 = DefaultInMemTempStorageMaxSizeBytes
+	return DefaultTestTempStorageConfigWithSize(st, DefaultInMemTempStorageMaxSizeBytes)
+}
+
+// DefaultTestTempStorageConfigWithSize is the associated temp storage for
+// DefaultTestStoreSpec that is in-memory with the customized maximum size.
+func DefaultTestTempStorageConfigWithSize(
+	st *cluster.Settings, maxSizeBytes int64,
+) TempStorageConfig {
 	monitor := mon.MakeMonitor(
 		"in-mem temp storage",
 		mon.DiskResource,
@@ -186,3 +193,12 @@ const (
 	// all with a single replica on node 1.
 	ReplicationManual
 )
+
+// TestTenantArgs are the arguments used when creating a tenant from a
+// TestServer.
+type TestTenantArgs struct {
+	TenantID roachpb.TenantID
+	// AllowSettingClusterSettings, if true, allows the tenant to set in-memory
+	// cluster settings.
+	AllowSettingClusterSettings bool
+}

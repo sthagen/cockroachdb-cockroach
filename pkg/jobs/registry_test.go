@@ -56,8 +56,18 @@ func TestRegistryCancelation(t *testing.T) {
 	mClock := hlc.NewManualClock(hlc.UnixNano())
 	clock := hlc.NewClock(mClock.UnixNano, time.Nanosecond)
 	registry := MakeRegistry(
-		log.AmbientContext{}, stopper, clock, nodeLiveness, db, nil /* ex */, base.TestingIDContainer, cluster.NoSettings,
-		histogramWindowInterval, FakePHS, "")
+		log.AmbientContext{},
+		stopper,
+		clock,
+		sqlbase.MakeOptionalNodeLiveness(nodeLiveness),
+		db,
+		nil, /* ex */
+		base.TestingIDContainer,
+		cluster.NoSettings,
+		histogramWindowInterval,
+		FakePHS,
+		"",
+	)
 
 	const cancelInterval = time.Nanosecond
 	const adoptInterval = time.Duration(math.MaxInt64)
@@ -211,7 +221,7 @@ func TestRegistryGC(t *testing.T) {
 		desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
 		desc.Mutations = mutations
 		if err := kvDB.Put(
-			context.TODO(),
+			context.Background(),
 			sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.GetID()),
 			sqlbase.WrapDescriptor(desc),
 		); err != nil {
@@ -224,7 +234,7 @@ func TestRegistryGC(t *testing.T) {
 		desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
 		desc.GCMutations = gcMutations
 		if err := kvDB.Put(
-			context.TODO(),
+			context.Background(),
 			sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.GetID()),
 			sqlbase.WrapDescriptor(desc),
 		); err != nil {
@@ -242,7 +252,7 @@ func TestRegistryGC(t *testing.T) {
 			desc.DropJobID = 0
 		}
 		if err := kvDB.Put(
-			context.TODO(),
+			context.Background(),
 			sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.GetID()),
 			sqlbase.WrapDescriptor(desc),
 		); err != nil {

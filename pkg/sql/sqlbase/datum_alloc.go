@@ -10,11 +10,17 @@
 
 package sqlbase
 
-import "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+import (
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
+)
 
 // DatumAlloc provides batch allocation of datum pointers, amortizing the cost
 // of the allocations.
+// NOTE: it *must* be passed in by a pointer.
 type DatumAlloc struct {
+	_ util.NoCopy
+
 	datumAlloc        []tree.Datum
 	dintAlloc         []tree.DInt
 	dfloatAlloc       []tree.DFloat
@@ -23,6 +29,7 @@ type DatumAlloc struct {
 	dbitArrayAlloc    []tree.DBitArray
 	ddecimalAlloc     []tree.DDecimal
 	ddateAlloc        []tree.DDate
+	denumAlloc        []tree.DEnum
 	dgeometryAlloc    []tree.DGeometry
 	dgeographyAlloc   []tree.DGeography
 	dtimeAlloc        []tree.DTime
@@ -139,6 +146,18 @@ func (a *DatumAlloc) NewDDate(v tree.DDate) *tree.DDate {
 	buf := &a.ddateAlloc
 	if len(*buf) == 0 {
 		*buf = make([]tree.DDate, datumAllocSize)
+	}
+	r := &(*buf)[0]
+	*r = v
+	*buf = (*buf)[1:]
+	return r
+}
+
+// NewDEnum allocates a DEnum.
+func (a *DatumAlloc) NewDEnum(v tree.DEnum) *tree.DEnum {
+	buf := &a.denumAlloc
+	if len(*buf) == 0 {
+		*buf = make([]tree.DEnum, datumAllocSize)
 	}
 	r := &(*buf)[0]
 	*r = v

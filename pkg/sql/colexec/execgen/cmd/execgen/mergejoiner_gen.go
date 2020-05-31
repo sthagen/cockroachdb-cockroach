@@ -36,6 +36,7 @@ type joinTypeInfo struct {
 	IsRightOuter bool
 	IsLeftSemi   bool
 	IsLeftAnti   bool
+	IsSetOp      bool
 
 	String string
 }
@@ -48,26 +49,26 @@ func genMergeJoinOps(wr io.Writer, jti joinTypeInfo) error {
 		return err
 	}
 
-	s := string(d)
-
-	s = strings.ReplaceAll(s, "_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}")
-	s = strings.ReplaceAll(s, "_TYPE_WIDTH", typeWidthReplacement)
-	s = strings.ReplaceAll(s, "_GOTYPESLICE", "{{.GoTypeSliceName}}")
-	s = strings.ReplaceAll(s, "_GOTYPE", "{{.GoType}}")
-	s = strings.ReplaceAll(s, "TemplateType", "{{.VecMethod}}")
-
-	s = strings.ReplaceAll(s, "_L_SEL_IND", "{{$sel.LSelString}}")
-	s = strings.ReplaceAll(s, "_R_SEL_IND", "{{$sel.RSelString}}")
-	s = strings.ReplaceAll(s, "_IS_L_SEL", "{{$sel.IsLSel}}")
-	s = strings.ReplaceAll(s, "_IS_R_SEL", "{{$sel.IsRSel}}")
-	s = strings.ReplaceAll(s, "_SEL_ARG", "$sel")
-	s = strings.ReplaceAll(s, "_JOIN_TYPE_STRING", "{{$.JoinType.String}}")
-	s = strings.ReplaceAll(s, "_JOIN_TYPE", "$.JoinType")
-	s = strings.ReplaceAll(s, "_L_HAS_NULLS", "$.lHasNulls")
-	s = strings.ReplaceAll(s, "_R_HAS_NULLS", "$.rHasNulls")
-	s = strings.ReplaceAll(s, "_HAS_NULLS", "$.HasNulls")
-	s = strings.ReplaceAll(s, "_HAS_SELECTION", "$.HasSelection")
-	s = strings.ReplaceAll(s, "_SEL_PERMUTATION", "$.SelPermutation")
+	r := strings.NewReplacer(
+		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"_GOTYPESLICE", "{{.GoTypeSliceName}}",
+		"_GOTYPE", "{{.GoType}}",
+		"TemplateType", "{{.VecMethod}}",
+		"_L_SEL_IND", "{{$sel.LSelString}}",
+		"_R_SEL_IND", "{{$sel.RSelString}}",
+		"_IS_L_SEL", "{{$sel.IsLSel}}",
+		"_IS_R_SEL", "{{$sel.IsRSel}}",
+		"_SEL_ARG", "$sel",
+		"_JOIN_TYPE_STRING", "{{$.JoinType.String}}",
+		"_JOIN_TYPE", "$.JoinType",
+		"_L_HAS_NULLS", "$.lHasNulls",
+		"_R_HAS_NULLS", "$.rHasNulls",
+		"_HAS_NULLS", "$.HasNulls",
+		"_HAS_SELECTION", "$.HasSelection",
+		"_SEL_PERMUTATION", "$.SelPermutation",
+	)
+	s := r.Replace(string(d))
 
 	leftUnmatchedGroupSwitch := makeFunctionRegex("_LEFT_UNMATCHED_GROUP_SWITCH", 1)
 	s = leftUnmatchedGroupSwitch.ReplaceAllString(s, `{{template "leftUnmatchedGroupSwitch" buildDict "Global" $ "JoinType" $1}}`)
@@ -102,11 +103,11 @@ func genMergeJoinOps(wr io.Writer, jti joinTypeInfo) error {
 	rightSwitch := makeFunctionRegex("_RIGHT_SWITCH", 3)
 	s = rightSwitch.ReplaceAllString(s, `{{template "rightSwitch" buildDict "Global" $ "JoinType" $1 "HasSelection" $2  "HasNulls" $3}}`)
 
-	assignEqRe := makeFunctionRegex("_ASSIGN_EQ", 3)
-	s = assignEqRe.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 3))
+	assignEqRe := makeFunctionRegex("_ASSIGN_EQ", 6)
+	s = assignEqRe.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 6))
 
-	assignLtRe := makeFunctionRegex("_ASSIGN_CMP", 3)
-	s = assignLtRe.ReplaceAllString(s, makeTemplateFunctionCall("Compare", 3))
+	assignLtRe := makeFunctionRegex("_ASSIGN_CMP", 5)
+	s = assignLtRe.ReplaceAllString(s, makeTemplateFunctionCall("Compare", 5))
 
 	s = replaceManipulationFuncs(s)
 
@@ -181,6 +182,16 @@ func init() {
 		{
 			IsLeftAnti: true,
 			String:     "LeftAnti",
+		},
+		{
+			IsLeftSemi: true,
+			IsSetOp:    true,
+			String:     "IntersectAll",
+		},
+		{
+			IsLeftAnti: true,
+			IsSetOp:    true,
+			String:     "ExceptAll",
 		},
 	}
 

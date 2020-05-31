@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -256,22 +257,22 @@ func backupJobDescription(
 
 // backupPlanHook implements PlanHookFn.
 func backupPlanHook(
-	_ context.Context, stmt tree.Statement, p sql.PlanHookState,
+	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
 ) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
 	backupStmt, ok := stmt.(*tree.Backup)
 	if !ok {
 		return nil, nil, nil, false, nil
 	}
 
-	toFn, err := p.TypeAsStringArray(tree.Exprs(backupStmt.To), "BACKUP")
+	toFn, err := p.TypeAsStringArray(ctx, tree.Exprs(backupStmt.To), "BACKUP")
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-	incrementalFromFn, err := p.TypeAsStringArray(backupStmt.IncrementalFrom, "BACKUP")
+	incrementalFromFn, err := p.TypeAsStringArray(ctx, backupStmt.IncrementalFrom, "BACKUP")
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-	optsFn, err := p.TypeAsStringOpts(backupStmt.Options, backupOptionExpectValues)
+	optsFn, err := p.TypeAsStringOpts(ctx, backupStmt.Options, backupOptionExpectValues)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -321,7 +322,7 @@ func backupPlanHook(
 		endTime := p.ExecCfg().Clock.Now()
 		if backupStmt.AsOf.Expr != nil {
 			var err error
-			if endTime, err = p.EvalAsOfTimestamp(backupStmt.AsOf); err != nil {
+			if endTime, err = p.EvalAsOfTimestamp(ctx, backupStmt.AsOf); err != nil {
 				return err
 			}
 		}
@@ -355,6 +356,13 @@ func backupPlanHook(
 					return err
 				}
 				tables = append(tables, tableDesc)
+
+				// If the table has any user defined types, error out.
+				for _, col := range tableDesc.Columns {
+					if col.Type.UserDefined() {
+						return unimplemented.NewWithIssue(48689, "user defined types in backup")
+					}
+				}
 
 				// Collect all the table stats for this table.
 				tableStatisticsAcc, err := statsCache.GetTableStats(ctx, tableDesc.GetID())

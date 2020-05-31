@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/lib/pq"
 )
 
@@ -38,7 +39,7 @@ func TestCopyNullInfNaN(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -137,7 +138,7 @@ func TestCopyRandom(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -256,9 +257,9 @@ func TestCopyRandom(t *testing.T) {
 			case time.Time:
 				var dt tree.NodeFormatter
 				if typs[i].Family() == types.TimeFamily {
-					dt = tree.MakeDTime(timeofday.FromTime(d))
+					dt = tree.MakeDTime(timeofday.FromTimeAllow2400(d))
 				} else if typs[i].Family() == types.TimeTZFamily {
-					dt = tree.NewDTimeTZFromTime(d)
+					dt = tree.NewDTimeTZ(timetz.MakeTimeTZFromTimeAllow2400(d))
 				} else {
 					dt = tree.MustMakeDTimestamp(d, time.Microsecond)
 				}
@@ -276,7 +277,7 @@ func TestCopyError(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -331,7 +332,7 @@ func TestCopyOne(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -365,7 +366,7 @@ func TestCopyInProgress(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -398,7 +399,7 @@ func TestCopyTransaction(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -451,7 +452,7 @@ func TestCopyFKCheck(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	db.SetMaxOpenConns(1)
 	r := sqlutils.MakeSQLRunner(db)

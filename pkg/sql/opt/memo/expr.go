@@ -588,7 +588,7 @@ func (prj *ProjectExpr) initUnexportedFields(mem *Memo) {
 			composite := false
 			for i, ok := from.Next(0); ok; i, ok = from.Next(i + 1) {
 				typ := mem.Metadata().ColumnMeta(i).Type
-				if sqlbase.DatumTypeHasCompositeKeyEncoding(typ) {
+				if sqlbase.HasCompositeKeyEncoding(typ) {
 					composite = true
 					break
 				}
@@ -623,7 +623,7 @@ func ExprIsNeverNull(e opt.ScalarExpr, notNullCols opt.ColSet) bool {
 	case *VariableExpr:
 		return notNullCols.Contains(t.Col)
 
-	case *TrueExpr, *FalseExpr, *ConstExpr, *IsExpr, *IsNotExpr:
+	case *TrueExpr, *FalseExpr, *ConstExpr, *IsExpr, *IsNotExpr, *IsTupleNullExpr, *IsTupleNotNullExpr:
 		return true
 
 	case *NullExpr:
@@ -679,6 +679,54 @@ func ExprIsNeverNull(e opt.ScalarExpr, notNullCols opt.ColSet) bool {
 	default:
 		return false
 	}
+}
+
+// OutputColumnIsAlwaysNull returns true if the expression produces only NULL
+// values for the given column. Used to elide foreign key checks.
+//
+// This could be a logical property but we only care about simple cases (NULLs
+// in Projections and Values).
+func OutputColumnIsAlwaysNull(e RelExpr, col opt.ColumnID) bool {
+	isNullScalar := func(scalar opt.ScalarExpr) bool {
+		switch scalar.Op() {
+		case opt.NullOp:
+			return true
+		case opt.CastOp:
+			// Normally this cast should have been folded, but we want this to work
+			// in "build" opttester mode (disabled normalization rules).
+			return scalar.Child(0).Op() == opt.NullOp
+		default:
+			return false
+		}
+	}
+
+	switch e.Op() {
+	case opt.ProjectOp:
+		p := e.(*ProjectExpr)
+		if p.Passthrough.Contains(col) {
+			return OutputColumnIsAlwaysNull(p.Input, col)
+		}
+		for i := range p.Projections {
+			if p.Projections[i].Col == col {
+				return isNullScalar(p.Projections[i].Element)
+			}
+		}
+
+	case opt.ValuesOp:
+		v := e.(*ValuesExpr)
+		colOrdinal, ok := v.Cols.Find(col)
+		if !ok {
+			return false
+		}
+		for i := range v.Rows {
+			if !isNullScalar(v.Rows[i].(*TupleExpr).Elems[colOrdinal]) {
+				return false
+			}
+		}
+		return true
+	}
+
+	return false
 }
 
 // FKCascades stores metadata necessary for building cascading queries.

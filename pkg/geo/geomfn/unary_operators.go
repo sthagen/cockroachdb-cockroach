@@ -19,6 +19,25 @@ import (
 	"github.com/twpayne/go-geom/encoding/ewkb"
 )
 
+// Centroid returns the Centroid of a given Geometry.
+func Centroid(g *geo.Geometry) (*geo.Geometry, error) {
+	// Empty geometries do not react well in GEOS, so we have to
+	// convert and check beforehand.
+	// Remove after #49209 is resolved.
+	t, err := g.AsGeomT()
+	if err != nil {
+		return nil, err
+	}
+	if t.Empty() {
+		return geo.NewGeometryFromGeom(geom.NewPointEmpty(geom.XY))
+	}
+	centroidEWKB, err := geos.Centroid(g.EWKB())
+	if err != nil {
+		return nil, err
+	}
+	return geo.ParseGeometryFromEWKB(centroidEWKB)
+}
+
 // Length returns the length of a given Geometry.
 // Note only (MULTI)LINESTRING objects have a length.
 // (MULTI)POLYGON objects should use Perimeter.
@@ -41,7 +60,7 @@ func Length(g *geo.Geometry) (float64, error) {
 			case *geom.Point, *geom.MultiPoint, *geom.Polygon, *geom.MultiPolygon:
 				continue
 			case *geom.LineString, *geom.MultiLineString:
-				subGEWKB, err := ewkb.Marshal(subG, geo.EWKBEncodingFormat)
+				subGEWKB, err := ewkb.Marshal(subG, geo.DefaultEWKBEncodingFormat)
 				if err != nil {
 					return 0, err
 				}
@@ -80,7 +99,7 @@ func Perimeter(g *geo.Geometry) (float64, error) {
 			case *geom.Point, *geom.MultiPoint, *geom.LineString, *geom.MultiLineString:
 				continue
 			case *geom.Polygon, *geom.MultiPolygon:
-				subGEWKB, err := ewkb.Marshal(subG, geo.EWKBEncodingFormat)
+				subGEWKB, err := ewkb.Marshal(subG, geo.DefaultEWKBEncodingFormat)
 				if err != nil {
 					return 0, err
 				}

@@ -21,7 +21,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
@@ -206,7 +206,7 @@ func (f *vectorizedFlow) Setup(
 				return
 			}
 			log.VEventf(ctx, 1, "flow %s spilled to disk, stack trace: %s", f.ID, util.GetSmallTrace(2))
-			if err := f.Cfg.TempFS.CreateDir(f.tempStorage.path); err != nil {
+			if err := f.Cfg.TempFS.MkdirAll(f.tempStorage.path); err != nil {
 				colexecerror.InternalError(errors.Errorf("unable to create temporary storage directory: %v", err))
 			}
 			f.tempStorage.createdStateMu.created = true
@@ -279,11 +279,11 @@ func (f *vectorizedFlow) Release() {
 func (f *vectorizedFlow) tryRemoveAll(root string) error {
 	// Unfortunately there is no way to Stat using TempFS, so simply try all
 	// alternatives.
-	if f.Cfg.TempFS.DeleteFile(root) != nil {
+	if f.Cfg.TempFS.Remove(root) != nil {
 		// If there was an error, it might be a directory.
-		if f.Cfg.TempFS.DeleteDir(root) != nil {
+		if f.Cfg.TempFS.RemoveDir(root) != nil {
 			// DeleteDir failed, this is probably due to children.
-			children, err := f.Cfg.TempFS.ListDir(root)
+			children, err := f.Cfg.TempFS.List(root)
 			if err != nil {
 				// This would be a weird error, so return it.
 				return err
@@ -292,13 +292,13 @@ func (f *vectorizedFlow) tryRemoveAll(root string) error {
 				if child == "." || child == ".." {
 					continue
 				}
-				// ListDir returns relative paths, so join with parent dir.
+				// List returns relative paths, so join with parent dir.
 				if err := f.tryRemoveAll(filepath.Join(root, child)); err != nil {
 					return err
 				}
 			}
 			// Now that children are cleaned up, delete the directory.
-			if err := f.Cfg.TempFS.DeleteDir(root); err != nil {
+			if err := f.Cfg.TempFS.RemoveDir(root); err != nil {
 				return err
 			}
 		}
@@ -573,11 +573,12 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 	stream *execinfrapb.StreamEndpointSpec,
 	metadataSourcesQueue []execinfrapb.MetadataSource,
 	toClose []colexec.IdempotentCloser,
+	factory coldata.ColumnFactory,
 ) (execinfra.OpNode, error) {
 	// TODO(yuzefovich): we should collect some statistics on the outbox (e.g.
 	// number of bytes sent).
 	outbox, err := s.remoteComponentCreator.newOutbox(
-		colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx)),
+		colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx), factory),
 		op, outputTyps, metadataSourcesQueue, toClose,
 	)
 	if err != nil {
@@ -619,6 +620,7 @@ func (s *vectorizedFlowCreator) setupRouter(
 	output *execinfrapb.OutputRouterSpec,
 	metadataSourcesQueue []execinfrapb.MetadataSource,
 	toClose []colexec.IdempotentCloser,
+	factory coldata.ColumnFactory,
 ) error {
 	if output.Type != execinfrapb.OutputRouterSpec_BY_HASH {
 		return errors.Errorf("vectorized output router type %s unsupported", output.Type)
@@ -635,7 +637,7 @@ func (s *vectorizedFlowCreator) setupRouter(
 	allocators := make([]*colmem.Allocator, len(output.Streams))
 	for i := range allocators {
 		acc := hashRouterMemMonitor.MakeBoundAccount()
-		allocators[i] = colmem.NewAllocator(ctx, &acc)
+		allocators[i] = colmem.NewAllocator(ctx, &acc, factory)
 		s.accounts = append(s.accounts, &acc)
 	}
 	limit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
@@ -644,7 +646,8 @@ func (s *vectorizedFlowCreator) setupRouter(
 	}
 	diskMon, diskAccounts := s.createDiskAccounts(ctx, flowCtx, mmName, len(output.Streams))
 	router, outputs := colexec.NewHashRouter(
-		allocators, input, outputTyps, output.HashColumns, limit, s.diskQueueCfg, s.fdSemaphore, diskAccounts,
+		allocators, input, outputTyps, output.HashColumns, limit,
+		s.diskQueueCfg, s.fdSemaphore, diskAccounts, toClose,
 	)
 	runRouter := func(ctx context.Context, _ context.CancelFunc) {
 		logtags.AddTag(ctx, "hashRouterID", mmName)
@@ -662,8 +665,10 @@ func (s *vectorizedFlowCreator) setupRouter(
 		case execinfrapb.StreamEndpointSpec_SYNC_RESPONSE:
 			return errors.Errorf("unexpected sync response output when setting up router")
 		case execinfrapb.StreamEndpointSpec_REMOTE:
+			// Note that here we pass in nil 'toClose' slice because hash
+			// router is responsible for closing all of the idempotent closers.
 			if _, err := s.setupRemoteOutputStream(
-				ctx, flowCtx, op, outputTyps, stream, metadataSourcesQueue, toClose,
+				ctx, flowCtx, op, outputTyps, stream, metadataSourcesQueue, nil /* toClose */, factory,
 			); err != nil {
 				return err
 			}
@@ -711,9 +716,19 @@ func (s *vectorizedFlowCreator) setupInput(
 	flowCtx *execinfra.FlowCtx,
 	input execinfrapb.InputSyncSpec,
 	opt flowinfra.FuseOpt,
+	factory coldata.ColumnFactory,
 ) (op colexecbase.Operator, _ []execinfrapb.MetadataSource, _ error) {
 	inputStreamOps := make([]colexecbase.Operator, 0, len(input.Streams))
 	metaSources := make([]execinfrapb.MetadataSource, 0, len(input.Streams))
+	// Before we can safely use types we received over the wire in the
+	// operators, we need to make sure they are hydrated. In row execution
+	// engine it is done during the processor initialization, but operators
+	// don't do that. However, all operators (apart from the colBatchScan) get
+	// their types from InputSyncSpec, so this is a convenient place to do the
+	// hydration so that all operators get the valid types.
+	if err := execinfrapb.HydrateTypeSlice(flowCtx.EvalCtx, input.ColumnTypes); err != nil {
+		return nil, nil, err
+	}
 	for _, inputStream := range input.Streams {
 		switch inputStream.Type {
 		case execinfrapb.StreamEndpointSpec_LOCAL:
@@ -726,11 +741,8 @@ func (s *vectorizedFlowCreator) setupInput(
 			if err := s.checkInboundStreamID(inputStream.StreamID); err != nil {
 				return nil, nil, err
 			}
-			if err := typeconv.AreTypesSupported(input.ColumnTypes); err != nil {
-				return nil, nil, err
-			}
 			inbox, err := s.remoteComponentCreator.newInbox(
-				colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx)),
+				colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx), factory),
 				input.ColumnTypes, inputStream.StreamID,
 			)
 			if err != nil {
@@ -757,12 +769,9 @@ func (s *vectorizedFlowCreator) setupInput(
 	if len(inputStreamOps) > 1 {
 		var err error
 		statsInputs := inputStreamOps
-		if err = typeconv.AreTypesSupported(input.ColumnTypes); err != nil {
-			return nil, nil, err
-		}
 		if input.Type == execinfrapb.InputSyncSpec_ORDERED {
 			op, err = colexec.NewOrderedSynchronizer(
-				colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx)),
+				colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx), factory),
 				inputStreamOps, input.ColumnTypes, execinfrapb.ConvertToColumnOrdering(input.Ordering),
 			)
 			if err != nil {
@@ -808,6 +817,7 @@ func (s *vectorizedFlowCreator) setupOutput(
 	opOutputTypes []*types.T,
 	metadataSourcesQueue []execinfrapb.MetadataSource,
 	toClose []colexec.IdempotentCloser,
+	factory coldata.ColumnFactory,
 ) error {
 	output := &pspec.Output[0]
 	if output.Type != execinfrapb.OutputRouterSpec_PASS_THROUGH {
@@ -821,6 +831,7 @@ func (s *vectorizedFlowCreator) setupOutput(
 			// further appends without overwriting.
 			metadataSourcesQueue,
 			toClose,
+			factory,
 		)
 	}
 
@@ -858,7 +869,8 @@ func (s *vectorizedFlowCreator) setupOutput(
 				},
 			)
 		}
-		outbox, err := s.setupRemoteOutputStream(ctx, flowCtx, op, opOutputTypes, outputStream, metadataSourcesQueue, toClose)
+		outbox, err :=
+			s.setupRemoteOutputStream(ctx, flowCtx, op, opOutputTypes, outputStream, metadataSourcesQueue, toClose, factory)
 		if err != nil {
 			return err
 		}
@@ -890,7 +902,6 @@ func (s *vectorizedFlowCreator) setupOutput(
 			pspec.ProcessorID,
 			op,
 			columnTypes,
-			&execinfrapb.PostProcessSpec{},
 			s.syncFlowConsumer,
 			metadataSourcesQueue,
 			toClose,
@@ -918,6 +929,7 @@ func (s *vectorizedFlowCreator) setupFlow(
 	opt flowinfra.FuseOpt,
 ) (leaves []execinfra.OpNode, err error) {
 	streamIDToSpecIdx := make(map[execinfrapb.StreamID]int)
+	factory := coldataext.NewExtendedColumnFactory(flowCtx.NewEvalCtx())
 	// queue is a queue of indices into processorSpecs, for topologically
 	// ordered processing.
 	queue := make([]int, 0, len(processorSpecs))
@@ -960,7 +972,7 @@ func (s *vectorizedFlowCreator) setupFlow(
 		toClose := make([]colexec.IdempotentCloser, 0, 1)
 		inputs = inputs[:0]
 		for i := range pspec.Input {
-			input, metadataSources, err := s.setupInput(ctx, flowCtx, pspec.Input[i], opt)
+			input, metadataSources, err := s.setupInput(ctx, flowCtx, pspec.Input[i], opt, factory)
 			if err != nil {
 				return nil, err
 			}
@@ -1018,11 +1030,8 @@ func (s *vectorizedFlowCreator) setupFlow(
 			// disk. vectorize=on does support this.
 			return nil, errors.Errorf("hash router encountered when vectorize=201auto")
 		}
-		if err := typeconv.AreTypesSupported(result.ColumnTypes); err != nil {
-			return nil, err
-		}
 		if err = s.setupOutput(
-			ctx, flowCtx, pspec, op, result.ColumnTypes, metadataSourcesQueue, toClose,
+			ctx, flowCtx, pspec, op, result.ColumnTypes, metadataSourcesQueue, toClose, factory,
 		); err != nil {
 			return nil, err
 		}

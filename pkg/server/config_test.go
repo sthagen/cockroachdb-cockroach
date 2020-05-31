@@ -12,6 +12,7 @@ package server
 
 import (
 	"context"
+	"net"
 	"os"
 	"reflect"
 	"testing"
@@ -23,21 +24,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
 )
 
 func TestParseInitNodeAttributes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	cfg := MakeConfig(context.TODO(), cluster.MakeTestingClusterSettings())
+	cfg := MakeConfig(context.Background(), cluster.MakeTestingClusterSettings())
 	cfg.Attrs = "attr1=val1::attr2=val2"
 	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, Size: base.SizeSpec{InBytes: base.MinimumStoreSize * 100}}}}
-	engines, err := cfg.CreateEngines(context.TODO())
+	engines, err := cfg.CreateEngines(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to initialize stores: %s", err)
 	}
 	defer engines.Close()
-	if err := cfg.InitNode(context.TODO()); err != nil {
+	if err := cfg.InitNode(context.Background()); err != nil {
 		t.Fatalf("Failed to initialize node: %s", err)
 	}
 
@@ -50,15 +52,15 @@ func TestParseInitNodeAttributes(t *testing.T) {
 // correctly.
 func TestParseJoinUsingAddrs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	cfg := MakeConfig(context.TODO(), cluster.MakeTestingClusterSettings())
+	cfg := MakeConfig(context.Background(), cluster.MakeTestingClusterSettings())
 	cfg.JoinList = []string{"localhost:12345", "localhost:23456", "localhost:34567", "localhost"}
 	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, Size: base.SizeSpec{InBytes: base.MinimumStoreSize * 100}}}}
-	engines, err := cfg.CreateEngines(context.TODO())
+	engines, err := cfg.CreateEngines(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to initialize stores: %s", err)
 	}
 	defer engines.Close()
-	if err := cfg.InitNode(context.TODO()); err != nil {
+	if err := cfg.InitNode(context.Background()); err != nil {
 		t.Fatalf("Failed to initialize node: %s", err)
 	}
 	r1, err := resolver.NewResolver("localhost:12345")
@@ -111,8 +113,8 @@ func TestReadEnvironmentVariables(t *testing.T) {
 
 	st := cluster.MakeTestingClusterSettings()
 	// Makes sure no values are set when no environment variables are set.
-	cfg := MakeConfig(context.TODO(), st)
-	cfgExpected := MakeConfig(context.TODO(), st)
+	cfg := MakeConfig(context.Background(), st)
+	cfgExpected := MakeConfig(context.Background(), st)
 
 	resetEnvVar()
 	cfg.readEnvironmentVariables()
@@ -182,7 +184,7 @@ func TestFilterGossipBootstrapResolvers(t *testing.T) {
 			resolvers = append(resolvers, resolver)
 		}
 	}
-	cfg := MakeConfig(context.TODO(), cluster.MakeTestingClusterSettings())
+	cfg := MakeConfig(context.Background(), cluster.MakeTestingClusterSettings())
 	cfg.GossipBootstrapResolvers = resolvers
 
 	listenAddr := util.MakeUnresolvedAddr("tcp", resolverSpecs[0])
@@ -193,4 +195,66 @@ func TestFilterGossipBootstrapResolvers(t *testing.T) {
 	} else if filtered[0].Addr() != resolverSpecs[1] {
 		t.Fatalf("expected resolver to be %q; got %q", resolverSpecs[1], filtered[0].Addr())
 	}
+}
+
+func TestParseBootstrapResolvers(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	cfg := MakeConfig(context.Background(), cluster.MakeTestingClusterSettings())
+	const expectedName = "hello"
+
+	t.Run("nosrv", func(t *testing.T) {
+		// Ensure that a name in the join list becomes a resolver for that name,
+		// when SRV lookups are disabled.
+		cfg.JoinPreferSRVRecords = false
+		cfg.JoinList = append(base.JoinListType(nil), expectedName)
+
+		resolvers, err := cfg.parseGossipBootstrapResolvers(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resolvers) != 1 {
+			t.Fatalf("expected 1 resolver, got %# v", pretty.Formatter(resolvers))
+		}
+		host, port, err := netutil.SplitHostPort(resolvers[0].Addr(), "UNKNOWN")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if port == "UNKNOWN" {
+			t.Fatalf("expected port defined in resover: %# v", pretty.Formatter(resolvers))
+		}
+		if host != expectedName {
+			t.Errorf("expected name %q, got %q", expectedName, host)
+		}
+	})
+
+	t.Run("srv", func(t *testing.T) {
+		cfg.JoinPreferSRVRecords = true
+		cfg.JoinList = append(base.JoinListType(nil), "othername")
+
+		defer resolver.TestingOverrideSRVLookupFn(func(service, proto, name string) (string, []*net.SRV, error) {
+			return "cluster", []*net.SRV{{Target: expectedName, Port: 111}}, nil
+		})()
+
+		resolvers, err := cfg.parseGossipBootstrapResolvers(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resolvers) != 1 {
+			t.Fatalf("expected 1 resolver, got %# v", pretty.Formatter(resolvers))
+		}
+		host, port, err := netutil.SplitHostPort(resolvers[0].Addr(), "UNKNOWN")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if port == "UNKNOWN" {
+			t.Fatalf("expected port defined in resover: %# v", pretty.Formatter(resolvers))
+		}
+		if port != "111" {
+			t.Fatalf("expected port 111 from SRV, got %q", port)
+		}
+		if host != expectedName {
+			t.Errorf("expected name %q, got %q", expectedName, host)
+		}
+	})
 }

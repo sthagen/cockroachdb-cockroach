@@ -95,9 +95,10 @@ type Factory interface {
 	) (Node, error)
 
 	// ConstructRender returns a node that applies a projection on the results of
-	// the given input node. The projection can contain new expressions.
+	// the given input node. The projection can contain new expressions. The input
+	// expression slice will be modified.
 	ConstructRender(
-		n Node, exprs tree.TypedExprs, colNames []string, reqOrdering OutputOrdering,
+		n Node, columns sqlbase.ResultColumns, exprs tree.TypedExprs, reqOrdering OutputOrdering,
 	) (Node, error)
 
 	// ConstructApplyJoin returns a node that runs an apply join between an input
@@ -482,13 +483,26 @@ type Factory interface {
 
 	// ConstructDeleteRange creates a node that efficiently deletes contiguous
 	// rows stored in the given table's primary index. This fast path is only
-	// possible when certain conditions hold true (see canUseDeleteRange for more
-	// details). See the comment for ConstructScan for descriptions of the
-	// parameters, since DeleteRange combines Delete + Scan into a single operator.
+	// possible when certain conditions hold true:
+	//  - there are no secondary indexes;
+	//  - the input to the delete is a scan (without limits);
+	//  - the table is not involved in interleaving, or it is at the root of an
+	//    interleaving hierarchy with cascading FKs such that a delete of a row
+	//    cascades and deletes all interleaved rows corresponding to that row;
+	//  - there are no inbound FKs to the table (other than within the
+	//    interleaving as described above).
+	//
+	// See the comment for ConstructScan for descriptions of the needed and
+	// indexConstraint parameters, since DeleteRange combines Delete + Scan into a
+	// single operator.
+	//
+	// If any interleavedTables are passed, they are all the descendant tables in
+	// an interleaving hierarchy we are deleting from.
 	ConstructDeleteRange(
 		table cat.Table,
 		needed TableColumnOrdinalSet,
 		indexConstraint *constraint.Constraint,
+		interleavedTables []cat.Table,
 		maxReturnedKeys int,
 		allowAutoCommit bool,
 	) (Node, error)

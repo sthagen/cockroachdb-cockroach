@@ -32,9 +32,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -123,7 +123,7 @@ func TestStoreRangeMergeTwoEmptyRanges(t *testing.T) {
 
 	// The LHS has been split once and merged once, so it should have received
 	// two generation bumps.
-	if e, a := int64(2), lhsRepl.Desc().GetGeneration(); e != a {
+	if e, a := int64(2), lhsRepl.Desc().Generation; e != a {
 		t.Fatalf("expected LHS to have generation %d, but got %d", e, a)
 	}
 }
@@ -796,7 +796,7 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 				},
 			},
 		})
-		defer s.Stopper().Stop(context.TODO())
+		defer s.Stopper().Stop(context.Background())
 
 		leftKey := roachpb.Key("z")
 		rightKey := leftKey.Next().Next()
@@ -810,14 +810,14 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 		assert.NoError(t, err)
 		leftRepl := store.LookupReplica(keys.MustAddr(leftKey))
 		assert.NotNil(t, leftRepl)
-		preSplitGen := leftRepl.Desc().GetGeneration()
+		preSplitGen := leftRepl.Desc().Generation
 		leftDesc, rightDesc, err := s.SplitRange(rightKey)
 		assert.NoError(t, err)
 
 		// Split should increment the LHS' generation and also propagate the result
 		// to the RHS.
-		assert.Equal(t, preSplitGen+1, leftDesc.GetGeneration())
-		assert.Equal(t, preSplitGen+1, rightDesc.GetGeneration())
+		assert.Equal(t, preSplitGen+1, leftDesc.Generation)
+		assert.Equal(t, preSplitGen+1, rightDesc.Generation)
 
 		if rhsHasHigherGen {
 			// Split the RHS again to increment its generation once more, so that
@@ -827,7 +827,7 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 			//
 			rightDesc, _, err = s.SplitRange(rightKey.Next())
 			assert.NoError(t, err)
-			assert.Equal(t, preSplitGen+2, rightDesc.GetGeneration())
+			assert.Equal(t, preSplitGen+2, rightDesc.Generation)
 		} else {
 			// Split and merge the LHS to increment the generation (it ends up
 			// being incremented by two). Note that leftKey.Next() is still in
@@ -837,12 +837,12 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 			// |--left@4---||---right@2---|
 			var tmpRightDesc roachpb.RangeDescriptor
 			leftDesc, tmpRightDesc, err = s.SplitRange(leftKey.Next())
-			assert.Equal(t, preSplitGen+2, leftDesc.GetGeneration())
-			assert.Equal(t, preSplitGen+2, tmpRightDesc.GetGeneration())
+			assert.Equal(t, preSplitGen+2, leftDesc.Generation)
+			assert.Equal(t, preSplitGen+2, tmpRightDesc.Generation)
 			assert.NoError(t, err)
 			leftDesc, err = s.MergeRanges(leftKey)
 			assert.NoError(t, err)
-			assert.Equal(t, preSplitGen+3, leftDesc.GetGeneration())
+			assert.Equal(t, preSplitGen+3, leftDesc.Generation)
 		}
 
 		// Make sure the split/merge shenanigans above didn't get the range
@@ -855,12 +855,12 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 		mergedDesc, err := s.MergeRanges(leftKey)
 		assert.NoError(t, err)
 
-		maxPreMergeGen := leftDesc.GetGeneration()
-		if rhsGen := rightDesc.GetGeneration(); rhsGen > maxPreMergeGen {
+		maxPreMergeGen := leftDesc.Generation
+		if rhsGen := rightDesc.Generation; rhsGen > maxPreMergeGen {
 			maxPreMergeGen = rhsGen
 		}
 
-		assert.Equal(t, maxPreMergeGen+1, mergedDesc.GetGeneration())
+		assert.Equal(t, maxPreMergeGen+1, mergedDesc.Generation)
 		assert.Equal(t, leftDesc.RangeID, mergedDesc.RangeID)
 	})
 }
@@ -2971,7 +2971,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			}
 			tombstoneKey := keys.RangeTombstoneKey(rangeID)
 			tombstoneValue := &roachpb.RangeTombstone{NextReplicaID: math.MaxInt32}
-			if err := storage.MVCCBlindPutProto(context.TODO(), &sst, nil, tombstoneKey, hlc.Timestamp{}, tombstoneValue, nil); err != nil {
+			if err := storage.MVCCBlindPutProto(context.Background(), &sst, nil, tombstoneKey, hlc.Timestamp{}, tombstoneValue, nil); err != nil {
 				return err
 			}
 			err := sst.Finish()
@@ -3181,7 +3181,7 @@ func TestStoreRangeMergeDuringShutdown(t *testing.T) {
 		rhsDesc        *roachpb.RangeDescriptor
 		stop, stopping bool
 	}
-	storeCfg.TestingKnobs.TestingPostApplyFilter = func(args storagebase.ApplyFilterArgs) (int, *roachpb.Error) {
+	storeCfg.TestingKnobs.TestingPostApplyFilter = func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
 		state.Lock()
 		if state.stop && !state.stopping && args.RangeID == state.rhsDesc.RangeID && args.IsLeaseRequest {
 			// Shut down the store. The lease acquisition will notice that a merge is
@@ -3264,7 +3264,7 @@ func TestMergeQueue(t *testing.T) {
 	rangeMinBytes := int64(1 << 10) // 1KB
 	storeCfg.DefaultZoneConfig.RangeMinBytes = &rangeMinBytes
 	sv := &storeCfg.Settings.SV
-	storagebase.MergeQueueEnabled.Override(sv, true)
+	kvserverbase.MergeQueueEnabled.Override(sv, true)
 	kvserver.MergeQueueInterval.Override(sv, 0) // process greedily
 	var mtc multiTestContext
 	// This test was written before the multiTestContext started creating many

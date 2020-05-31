@@ -218,17 +218,9 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 func mustParseOne(s string) parser.Statement {
 	stmts, err := parser.Parse(s)
 	if err != nil {
-		log.Fatalf(context.TODO(), "%v", err)
+		log.Fatalf(context.Background(), "%v", err)
 	}
 	return stmts[0]
-}
-
-type dummyLivenessProvider struct {
-}
-
-// IsLive implements the livenessProvider interface.
-func (l dummyLivenessProvider) IsLive(roachpb.NodeID) (bool, error) {
-	return true, nil
 }
 
 // startConnExecutor start a goroutine running a connExecutor. This connExecutor
@@ -282,8 +274,8 @@ func startConnExecutor(
 			nil, /* distSender */
 			gw,
 			stopper,
-			dummyLivenessProvider{}, /* liveness */
-			nil,                     /* nodeDialer */
+			func(roachpb.NodeID) (bool, error) { return true, nil }, // everybody is live
+			nil, /* nodeDialer */
 		),
 		QueryCache:              querycache.New(0),
 		TestingKnobs:            ExecutorTestingKnobs{},

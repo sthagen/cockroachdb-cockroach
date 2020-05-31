@@ -1,3 +1,4 @@
+# LogicTest: !3node-tenant
 query T
 SHOW DATABASES
 ----
@@ -31,6 +32,7 @@ public  statement_bundle_chunks          table
 public  statement_diagnostics            table
 public  statement_diagnostics_requests   table
 public  table_statistics                 table
+public  tenants                          table
 public  ui                               table
 public  users                            table
 public  web_sessions                     table
@@ -45,6 +47,7 @@ SELECT id FROM system.descriptor
 4
 5
 6
+8
 11
 12
 13
@@ -135,11 +138,13 @@ lastUpdated  TIMESTAMP  false  NULL  ·  {}         false
 query TTBTTTB
 SHOW COLUMNS FROM system.jobs
 ----
-id        INT8       false  unique_rowid()     ·  {primary,jobs_status_created_idx}  false
-status    STRING     false  NULL               ·  {jobs_status_created_idx}          false
-created   TIMESTAMP  false  now():::TIMESTAMP  ·  {jobs_status_created_idx}          false
-payload   BYTES      false  NULL               ·  {}                                 false
-progress  BYTES      true   NULL               ·  {}                                 false
+id               INT8       false  unique_rowid()     ·  {primary,jobs_status_created_idx,jobs_created_by_type_created_by_id_idx}  false
+status           STRING     false  NULL               ·  {jobs_status_created_idx,jobs_created_by_type_created_by_id_idx}          false
+created          TIMESTAMP  false  now():::TIMESTAMP  ·  {jobs_status_created_idx}                                                 false
+payload          BYTES      false  NULL               ·  {}                                                                        false
+progress         BYTES      true   NULL               ·  {}                                                                        false
+created_by_type  STRING     true   NULL               ·  {jobs_created_by_type_created_by_id_idx}                                  false
+created_by_id    INT8       true   NULL               ·  {jobs_created_by_type_created_by_id_idx}                                  false
 
 query TTBTTTB
 SHOW COLUMNS FROM system.settings
@@ -173,6 +178,10 @@ system  pg_catalog          admin  GRANT
 system  pg_catalog          admin  SELECT
 system  pg_catalog          root   GRANT
 system  pg_catalog          root   SELECT
+system  pg_extension        admin  GRANT
+system  pg_extension        admin  SELECT
+system  pg_extension        root   GRANT
+system  pg_extension        root   SELECT
 system  public              admin  GRANT
 system  public              admin  SELECT
 system  public              root   GRANT
@@ -372,6 +381,10 @@ system  public  table_statistics                 root    GRANT
 system  public  table_statistics                 root    INSERT
 system  public  table_statistics                 root    SELECT
 system  public  table_statistics                 root    UPDATE
+system  public  tenants                          admin   GRANT
+system  public  tenants                          admin   SELECT
+system  public  tenants                          root    GRANT
+system  public  tenants                          root    SELECT
 system  public  ui                               admin   DELETE
 system  public  ui                               admin   GRANT
 system  public  ui                               admin   INSERT

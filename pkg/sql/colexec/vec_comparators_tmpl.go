@@ -20,19 +20,13 @@
 package colexec
 
 import (
-	"bytes"
 	"fmt"
-	"math"
-	"time"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // Remove unused warning.
@@ -41,24 +35,6 @@ var _ = execgen.UNSAFEGET
 // {{/*
 
 // Declarations to make the template compile properly.
-
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
 
 // _GOTYPESLICE is the template variable.
 type _GOTYPESLICE interface{}
@@ -71,7 +47,7 @@ const _TYPE_WIDTH = 0
 
 // _COMPARE is the template equality function for assigning the first input
 // to the result of comparing second and third inputs.
-func _COMPARE(_, _, _ string) bool {
+func _COMPARE(_, _, _, _, _ string) bool {
 	colexecerror.InternalError("")
 }
 
@@ -116,7 +92,7 @@ func (c *_TYPEVecComparator) compare(vecIdx1, vecIdx2 int, valIdx1, valIdx2 int)
 	left := execgen.UNSAFEGET(c.vecs[vecIdx1], valIdx1)
 	right := execgen.UNSAFEGET(c.vecs[vecIdx2], valIdx2)
 	var cmp int
-	_COMPARE(cmp, left, right)
+	_COMPARE(cmp, left, right, c.vecs[vecIdx1], c.vecs[vecIdx2])
 	return cmp
 }
 
@@ -149,7 +125,7 @@ func (c *_TYPEVecComparator) set(srcVecIdx, dstVecIdx int, srcIdx, dstIdx int) {
 // {{end}}
 
 func GetVecComparator(t *types.T, numVecs int) vecComparator {
-	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
 	case _CANONICAL_TYPE_FAMILY:
 		switch t.Width() {

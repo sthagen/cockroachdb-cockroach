@@ -37,13 +37,21 @@ import (
 )
 
 type execFactory struct {
-	planner *planner
+	planner         *planner
+	allowAutoCommit bool
 }
 
 var _ exec.Factory = &execFactory{}
 
 func makeExecFactory(p *planner) execFactory {
-	return execFactory{planner: p}
+	return execFactory{
+		planner:         p,
+		allowAutoCommit: p.autoCommit,
+	}
+}
+
+func (ef *execFactory) disableAutoCommit() {
+	ef.allowAutoCommit = false
 }
 
 // ConstructValues is part of the exec.Factory interface.
@@ -281,15 +289,26 @@ func (ef *execFactory) ConstructSimpleProject(
 	}
 
 	var rb renderBuilder
-	rb.init(n, reqOrdering, len(cols))
+	rb.init(n, reqOrdering)
+
+	exprs := make(tree.TypedExprs, len(cols))
+	resultCols := make(sqlbase.ResultColumns, len(cols))
 	for i, col := range cols {
 		v := rb.r.ivarHelper.IndexedVar(int(col))
 		if colNames == nil {
-			rb.addExpr(v, inputCols[col].Name, inputCols[col].TableID, inputCols[col].PGAttributeNum)
+			resultCols[i] = inputCols[col]
+			// If we have a SimpleProject, we should clear the hidden bit on any
+			// column since it indicates it's been explicitly selected.
+			resultCols[i].Hidden = false
 		} else {
-			rb.addExpr(v, colNames[i], 0 /* tableID */, 0 /* pgAttributeNum */)
+			resultCols[i] = sqlbase.ResultColumn{
+				Name: colNames[i],
+				Typ:  v.ResolvedType(),
+			}
 		}
+		exprs[i] = v
 	}
+	rb.setOutput(exprs, resultCols)
 	return rb.res, nil
 }
 
@@ -305,15 +324,20 @@ func hasDuplicates(cols []exec.NodeColumnOrdinal) bool {
 }
 
 // ConstructRender is part of the exec.Factory interface.
+// N.B.: The input exprs will be modified.
 func (ef *execFactory) ConstructRender(
-	n exec.Node, exprs tree.TypedExprs, colNames []string, reqOrdering exec.OutputOrdering,
+	n exec.Node,
+	columns sqlbase.ResultColumns,
+	exprs tree.TypedExprs,
+	reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
 	var rb renderBuilder
-	rb.init(n, reqOrdering, len(exprs))
+	rb.init(n, reqOrdering)
 	for i, expr := range exprs {
 		expr = rb.r.ivarHelper.Rebind(expr, false /* alsoReset */, true /* normalizeToNonNil */)
-		rb.addExpr(expr, colNames[i], 0 /* tableID */, 0 /* pgAttributeNum */)
+		exprs[i] = expr
 	}
+	rb.setOutput(exprs, columns)
 	return rb.res, nil
 }
 
@@ -648,6 +672,9 @@ func (ef *execFactory) ConstructLookupJoin(
 	onCond tree.TypedExpr,
 	reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
+	if table.IsVirtualTable() {
+		return ef.constructVirtualTableLookupJoin(joinType, input, table, index, eqCols, lookupCols, onCond)
+	}
 	tabDesc := table.(*optTable).desc
 	indexDesc := index.(*optIndex).desc
 	colCfg := makeScanColumnsConfig(table, lookupCols)
@@ -683,6 +710,75 @@ func (ef *execFactory) ConstructLookupJoin(
 	n.columns = make(sqlbase.ResultColumns, 0, len(inputCols)+len(scanCols))
 	n.columns = append(n.columns, inputCols...)
 	n.columns = append(n.columns, scanCols...)
+	return n, nil
+}
+
+func (ef *execFactory) constructVirtualTableLookupJoin(
+	joinType sqlbase.JoinType,
+	input exec.Node,
+	table cat.Table,
+	index cat.Index,
+	eqCols []exec.NodeColumnOrdinal,
+	lookupCols exec.TableColumnOrdinalSet,
+	onCond tree.TypedExpr,
+) (exec.Node, error) {
+	tn := &table.(*optVirtualTable).name
+	virtual, err := ef.planner.getVirtualTabler().getVirtualTableEntry(tn)
+	if err != nil {
+		return nil, err
+	}
+	if len(eqCols) > 1 {
+		return nil, errors.AssertionFailedf("vtable indexes with more than one column aren't supported yet")
+	}
+	// Check for explicit use of the dummy column.
+	if lookupCols.Contains(0) {
+		return nil, errors.Errorf("use of %s column not allowed.", table.Column(0).ColName())
+	}
+	indexDesc := index.(*optVirtualIndex).desc
+	tableDesc := table.(*optVirtualTable).desc
+	// Build the result columns.
+	inputCols := planColumns(input.(planNode))
+
+	if onCond == tree.DBoolTrue {
+		onCond = nil
+	}
+
+	var tableScan scanNode
+	// Set up a scanNode that we won't actually use, just to get the needed
+	// column analysis.
+	colCfg := makeScanColumnsConfig(table, lookupCols)
+	if err := tableScan.initTable(context.TODO(), ef.planner, tableDesc, nil, colCfg); err != nil {
+		return nil, err
+	}
+	tableScan.index = indexDesc
+	tableScan.isSecondaryIndex = true
+	vtableCols := sqlbase.ResultColumnsFromColDescs(tableDesc.ID, tableDesc.Columns)
+	projectedVtableCols := planColumns(&tableScan)
+	outputCols := make(sqlbase.ResultColumns, 0, len(inputCols)+len(projectedVtableCols))
+	outputCols = append(outputCols, inputCols...)
+	outputCols = append(outputCols, projectedVtableCols...)
+	// joinType is either INNER or LEFT_OUTER.
+	pred, err := makePredicate(joinType, inputCols, projectedVtableCols)
+	if err != nil {
+		return nil, err
+	}
+	pred.onCond = pred.iVarHelper.Rebind(
+		onCond, false /* alsoReset */, false, /* normalizeToNonNil */
+	)
+	n := &vTableLookupJoinNode{
+		input:             input.(planNode),
+		joinType:          joinType,
+		virtualTableEntry: virtual,
+		dbName:            tn.Catalog(),
+		table:             tableDesc.TableDesc(),
+		index:             indexDesc,
+		eqCol:             int(eqCols[0]),
+		inputCols:         inputCols,
+		vtableCols:        vtableCols,
+		lookupCols:        lookupCols,
+		columns:           outputCols,
+		pred:              pred,
+	}
 	return n, nil
 }
 
@@ -1231,7 +1327,7 @@ func (ef *execFactory) ConstructInsert(
 	}
 	// Create the table inserter, which does the bulk of the work.
 	ri, err := row.MakeInserter(
-		ctx, ef.planner.txn, ef.planner.ExecCfg().Codec, tabDesc, colDescs, checkFKs, fkTables, &ef.planner.alloc,
+		ctx, ef.planner.txn, ef.planner.ExecCfg().Codec, tabDesc, colDescs, checkFKs, fkTables, ef.planner.alloc,
 	)
 	if err != nil {
 		return nil, err
@@ -1259,7 +1355,7 @@ func (ef *execFactory) ConstructInsert(
 		ins.run.rowsNeeded = true
 	}
 
-	if allowAutoCommit && ef.planner.autoCommit {
+	if allowAutoCommit && ef.allowAutoCommit {
 		ins.enableAutoCommit()
 	}
 
@@ -1296,7 +1392,7 @@ func (ef *execFactory) ConstructInsertFastPath(
 
 	// Create the table inserter, which does the bulk of the work.
 	ri, err := row.MakeInserter(
-		ctx, ef.planner.txn, ef.planner.ExecCfg().Codec, tabDesc, colDescs, row.SkipFKs, nil /* fkTables */, &ef.planner.alloc,
+		ctx, ef.planner.txn, ef.planner.ExecCfg().Codec, tabDesc, colDescs, row.SkipFKs, nil /* fkTables */, ef.planner.alloc,
 	)
 	if err != nil {
 		return nil, err
@@ -1337,7 +1433,7 @@ func (ef *execFactory) ConstructInsertFastPath(
 		return &zeroNode{columns: ins.columns}, nil
 	}
 
-	if ef.planner.autoCommit {
+	if ef.allowAutoCommit {
 		ins.enableAutoCommit()
 	}
 
@@ -1408,7 +1504,7 @@ func (ef *execFactory) ConstructUpdate(
 		row.UpdaterDefault,
 		checkFKs,
 		ef.planner.EvalContext(),
-		&ef.planner.alloc,
+		ef.planner.alloc,
 	)
 	if err != nil {
 		return nil, err
@@ -1463,7 +1559,7 @@ func (ef *execFactory) ConstructUpdate(
 		upd.run.rowsNeeded = true
 	}
 
-	if allowAutoCommit && ef.planner.autoCommit {
+	if allowAutoCommit && ef.allowAutoCommit {
 		upd.enableAutoCommit()
 	}
 
@@ -1554,7 +1650,7 @@ func (ef *execFactory) ConstructUpsert(
 		insertColDescs,
 		checkFKs,
 		fkTables,
-		&ef.planner.alloc,
+		ef.planner.alloc,
 	)
 	if err != nil {
 		return nil, err
@@ -1572,7 +1668,7 @@ func (ef *execFactory) ConstructUpsert(
 		row.UpdaterDefault,
 		checkFKs,
 		ef.planner.EvalContext(),
-		&ef.planner.alloc,
+		ef.planner.alloc,
 	)
 	if err != nil {
 		return nil, err
@@ -1599,7 +1695,7 @@ func (ef *execFactory) ConstructUpsert(
 			insertCols: ri.InsertCols,
 			tw: optTableUpserter{
 				ri:            ri,
-				alloc:         &ef.planner.alloc,
+				alloc:         ef.planner.alloc,
 				canaryOrdinal: int(canaryCol),
 				fkTables:      fkTables,
 				fetchCols:     fetchColDescs,
@@ -1622,7 +1718,7 @@ func (ef *execFactory) ConstructUpsert(
 		ups.run.tw.collectRows = true
 	}
 
-	if allowAutoCommit && ef.planner.autoCommit {
+	if allowAutoCommit && ef.allowAutoCommit {
 		ups.enableAutoCommit()
 	}
 
@@ -1657,23 +1753,16 @@ func (ef *execFactory) ConstructDelete(
 		return nil, err
 	}
 
-	// Determine the foreign key tables involved in the delete.
-	// This will include all the interleaved child tables as we need them
-	// to see if we can execute the fast path delete.
-	fkTables, err := ef.makeFkMetadata(tabDesc, row.CheckDeletes)
-	if err != nil {
-		return nil, err
-	}
-
-	fastPathInterleaved := canDeleteFastInterleaved(tabDesc, fkTables)
-	if fastPathNode, ok := maybeCreateDeleteFastNode(
-		ctx, input.(planNode), tabDesc, fkTables, fastPathInterleaved, rowsNeeded); ok {
-		return fastPathNode, nil
-	}
-
-	checkFKs := row.CheckFKs
-	if skipFKChecks {
-		checkFKs = row.SkipFKs
+	var fkTables row.FkTableMetadata
+	checkFKs := row.SkipFKs
+	if !skipFKChecks {
+		checkFKs = row.CheckFKs
+		// Determine the foreign key tables involved in the update.
+		var err error
+		fkTables, err = ef.makeFkMetadata(tabDesc, row.CheckDeletes)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// Create the table deleter, which does the bulk of the work. In the HP,
 	// the deleter derives the columns that need to be fetched. By contrast, the
@@ -1688,7 +1777,7 @@ func (ef *execFactory) ConstructDelete(
 		fetchColDescs,
 		checkFKs,
 		ef.planner.EvalContext(),
-		&ef.planner.alloc,
+		ef.planner.alloc,
 	)
 	if err != nil {
 		return nil, err
@@ -1703,7 +1792,7 @@ func (ef *execFactory) ConstructDelete(
 	*del = deleteNode{
 		source: input.(planNode),
 		run: deleteRun{
-			td: tableDeleter{rd: rd, alloc: &ef.planner.alloc},
+			td: tableDeleter{rd: rd, alloc: ef.planner.alloc},
 		},
 	}
 
@@ -1718,7 +1807,7 @@ func (ef *execFactory) ConstructDelete(
 		del.run.rowsNeeded = true
 	}
 
-	if allowAutoCommit && ef.planner.autoCommit {
+	if allowAutoCommit && ef.allowAutoCommit {
 		del.enableAutoCommit()
 	}
 
@@ -1738,6 +1827,7 @@ func (ef *execFactory) ConstructDeleteRange(
 	table cat.Table,
 	needed exec.TableColumnOrdinalSet,
 	indexConstraint *constraint.Constraint,
+	interleavedTables []cat.Table,
 	maxReturnedKeys int,
 	allowAutoCommit bool,
 ) (exec.Node, error) {
@@ -1766,7 +1856,7 @@ func (ef *execFactory) ConstructDeleteRange(
 	// request doesn't work properly if the limit is hit. So, we permit autocommit
 	// here if we can guarantee that the number of returned keys is finite and
 	// relatively small.
-	autoCommitEnabled := allowAutoCommit && ef.planner.autoCommit
+	autoCommitEnabled := allowAutoCommit && ef.allowAutoCommit
 	// If maxReturnedKeys is 0, it indicates that we weren't able to determine
 	// the maximum number of returned keys, so we'll give up and not permit
 	// autocommit.
@@ -1774,12 +1864,21 @@ func (ef *execFactory) ConstructDeleteRange(
 		autoCommitEnabled = false
 	}
 
-	return &deleteRangeNode{
+	dr := &deleteRangeNode{
 		interleavedFastPath: false,
 		spans:               spans,
 		desc:                tabDesc,
 		autoCommitEnabled:   autoCommitEnabled,
-	}, nil
+	}
+
+	if len(interleavedTables) > 0 {
+		dr.interleavedFastPath = true
+		dr.interleavedDesc = make([]*sqlbase.ImmutableTableDescriptor, len(interleavedTables))
+		for i := range dr.interleavedDesc {
+			dr.interleavedDesc[i] = interleavedTables[i].(*optTable).desc
+		}
+	}
+	return dr, nil
 }
 
 // ConstructCreateTable is part of the exec.Factory interface.
@@ -1952,12 +2051,10 @@ type renderBuilder struct {
 }
 
 // init initializes the renderNode with render expressions.
-func (rb *renderBuilder) init(n exec.Node, reqOrdering exec.OutputOrdering, cap int) {
+func (rb *renderBuilder) init(n exec.Node, reqOrdering exec.OutputOrdering) {
 	src := asDataSource(n)
 	rb.r = &renderNode{
-		source:  src,
-		render:  make([]tree.TypedExpr, 0, cap),
-		columns: make([]sqlbase.ResultColumn, 0, cap),
+		source: src,
 	}
 	rb.r.ivarHelper = tree.MakeIndexedVarHelper(rb.r, len(src.columns))
 	rb.r.reqOrdering = ReqOrdering(reqOrdering)
@@ -1972,20 +2069,12 @@ func (rb *renderBuilder) init(n exec.Node, reqOrdering exec.OutputOrdering, cap 
 	}
 }
 
-// addExpr adds a new render expression with the given name.
-func (rb *renderBuilder) addExpr(
-	expr tree.TypedExpr, colName string, tableID sqlbase.ID, pgAttributeNum sqlbase.ColumnID,
-) {
-	rb.r.render = append(rb.r.render, expr)
-	rb.r.columns = append(
-		rb.r.columns,
-		sqlbase.ResultColumn{
-			Name:           colName,
-			Typ:            expr.ResolvedType(),
-			TableID:        tableID,
-			PGAttributeNum: pgAttributeNum,
-		},
-	)
+// setOutput sets the output of the renderNode. exprs is the list of render
+// expressions, and columns is the list of information about the expressions,
+// including their names, types, and so on. They must be the same length.
+func (rb *renderBuilder) setOutput(exprs tree.TypedExprs, columns sqlbase.ResultColumns) {
+	rb.r.render = exprs
+	rb.r.columns = columns
 }
 
 // makeColDescList returns a list of table column descriptors. Columns are

@@ -20,21 +20,15 @@
 package colexec
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"math"
-	"time"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // Remove unused warning.
@@ -43,24 +37,6 @@ var _ = execgen.UNSAFEGET
 // {{/*
 
 // Declarations to make the template compile properly.
-
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
 
 // _GOTYPESLICE is the template variable.
 type _GOTYPESLICE interface{}
@@ -80,7 +56,7 @@ const _ISNULL = false
 
 // _ASSIGN_LT is the template equality function for assigning the first input
 // to the result of the second input < the third input.
-func _ASSIGN_LT(_, _, _ string) bool {
+func _ASSIGN_LT(_, _, _, _, _, _ string) bool {
 	colexecerror.InternalError("")
 }
 
@@ -92,7 +68,7 @@ func isSorterSupported(t *types.T, dir execinfrapb.Ordering_Column_Direction) bo
 	switch dir {
 	// {{range .DirOverloads}}
 	case _DIR_ENUM:
-		switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+		switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 		// {{range .FamilyOverloads}}
 		case _CANONICAL_TYPE_FAMILY:
 			switch t.Width() {
@@ -121,7 +97,7 @@ func newSingleSorter(
 		// {{range .DirOverloads}}
 		// {{$dir := .DirString}}
 		case _DIR_ENUM:
-			switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+			switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 			// {{range .FamilyOverloads}}
 			case _CANONICAL_TYPE_FAMILY:
 				switch t.Width() {
@@ -212,7 +188,7 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) Less(i, j int) bool {
 	// We always indirect via the order vector.
 	arg1 := execgen.UNSAFEGET(s.sortCol, s.order[i])
 	arg2 := execgen.UNSAFEGET(s.sortCol, s.order[j])
-	_ASSIGN_LT(lt, arg1, arg2)
+	_ASSIGN_LT(lt, arg1, arg2, _, s.sortCol, s.sortCol)
 	return lt
 }
 

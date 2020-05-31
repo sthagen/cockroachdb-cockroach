@@ -16,6 +16,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -25,10 +26,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
@@ -38,54 +40,67 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx"
 	"github.com/lib/pq"
+	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
 )
 
 func TestAnonymizeStatementsForReporting(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	const stmt = `
-INSERT INTO sensitive(super, sensible) VALUES('that', 'nobody', 'must', 'see');
-
-select * from crdb_internal.node_runtime_info;
+	const stmt1s = `
+INSERT INTO sensitive(super, sensible) VALUES('that', 'nobody', 'must', 'see')
 `
+	stmt1, err := parser.ParseOne(stmt1s)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	rUnsafe := "i'm not safe"
-	rSafe := log.Safe("something safe")
+	rUnsafe := errors.New("panic: i'm not safe")
+	safeErr := sql.WithAnonymizedStatement(rUnsafe, stmt1.AST)
 
-	safeErr := sql.AnonymizeStatementsForReporting("testing", stmt, rUnsafe)
-
-	const (
-		expMessage = "panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
-			"(_, _, __more2__); SELECT * FROM _._; caused by i'm not safe"
-		expSafeRedactedMessage = "?:0: panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
-			"(_, _, __more2__); SELECT * FROM _._: caused by <redacted>"
-		expSafeSafeMessage = "?:0: panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
-			"(_, _, __more2__); SELECT * FROM _._: caused by something safe"
-	)
-
+	const expMessage = "panic: i'm not safe"
 	actMessage := safeErr.Error()
 	if actMessage != expMessage {
-		t.Fatalf("wanted: %s\ngot: %s", expMessage, actMessage)
+		t.Errorf("wanted: %s\ngot: %s", expMessage, actMessage)
 	}
 
-	actSafeRedactedMessage := log.ReportablesToSafeError(0, "", []interface{}{safeErr}).Error()
+	const expSafeRedactedMessage = `...conn_executor_test.go:NN: <*errors.errorString>
+wrapper: <*withstack.withStack>
+(more details:)
+github.com/cockroachdb/cockroach/pkg/sql_test.TestAnonymizeStatementsForReporting
+	...conn_executor_test.go:NN
+testing.tRunner
+	...testing.go:NN
+runtime.goexit
+	...asm_amd64.s:NN
+wrapper: <*safedetails.withSafeDetails>
+(more details:)
+while executing: %s
+-- arg 1: INSERT INTO _(_, _) VALUES (_, _, __more2__)`
+
+	// Edit non-determinstic stack trace filenames from the message.
+	actSafeRedactedMessage := fileref.ReplaceAllString(
+		errors.Redact(safeErr), "...$2:NN")
+
 	if actSafeRedactedMessage != expSafeRedactedMessage {
-		t.Fatalf("wanted: %s\ngot: %s", expSafeRedactedMessage, actSafeRedactedMessage)
-	}
-
-	safeErr = sql.AnonymizeStatementsForReporting("testing", stmt, rSafe)
-
-	actSafeSafeMessage := log.ReportablesToSafeError(0, "", []interface{}{safeErr}).Error()
-	if actSafeSafeMessage != expSafeSafeMessage {
-		t.Fatalf("wanted: %s\ngot: %s", expSafeSafeMessage, actSafeSafeMessage)
+		diff, _ := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+			A:        difflib.SplitLines(expSafeRedactedMessage),
+			B:        difflib.SplitLines(actSafeRedactedMessage),
+			FromFile: "Expected",
+			FromDate: "",
+			ToFile:   "Actual",
+			ToDate:   "",
+			Context:  1,
+		})
+		t.Errorf("Diff:\n%s", diff)
 	}
 }
+
+var fileref = regexp.MustCompile(`((?:[a-zA-Z0-9\._@-]*/)*)([a-zA-Z0-9._@-]*\.(?:go|s)):\d+`)
 
 // Test that a connection closed abruptly while a SQL txn is in progress results
 // in that txn being rolled back.
@@ -144,7 +159,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 				}
 			}()
 
-			ctx := context.TODO()
+			ctx := context.Background()
 			conn := c.(driver.ConnBeginTx)
 			txn, err := conn.BeginTx(ctx, driver.TxOptions{})
 			if err != nil {
@@ -265,7 +280,7 @@ func TestNonRetriableErrorOnAutoCommit(t *testing.T) {
 		},
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sqlDB.SetMaxOpenConns(1)
 
@@ -294,7 +309,7 @@ func TestErrorOnRollback(t *testing.T) {
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingProposalFilter: func(fArgs storagebase.ProposalFilterArgs) *roachpb.Error {
+				TestingProposalFilter: func(fArgs kvserverbase.ProposalFilterArgs) *roachpb.Error {
 					if !fArgs.Req.IsSingleRequest() {
 						return nil
 					}
@@ -319,7 +334,7 @@ func TestErrorOnRollback(t *testing.T) {
 		},
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	ctx := context.TODO()
+	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
 	if _, err := sqlDB.Exec(`
@@ -383,7 +398,7 @@ func TestHalloweenProblemAvoidance(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Insecure = true
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 CREATE DATABASE t;
@@ -432,7 +447,7 @@ func TestAppNameStatisticsInitialization(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Insecure = true
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Prepare a session with a custom application name.
 	pgURL := url.URL{
@@ -513,7 +528,7 @@ func TestQueryProgress(t *testing.T) {
 		},
 	}
 	s, rawDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	db := sqlutils.MakeSQLRunner(rawDB)
 
@@ -750,34 +765,80 @@ func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
 	require.NoError(t, tx.Commit())
 }
 
+// TestTrimFlushedStatements verifies that the conn executor trims the
+// statements buffer once the corresponding results are returned to the user.
+func TestTrimFlushedStatements(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const (
+		countStmt = "SELECT count(*) FROM test"
+		// stmtBufMaxLen is the maximum length the statement buffer should be during
+		// execution of COUNT(*). This includes a SELECT COUNT(*) command as well
+		// as a Sync command.
+		stmtBufMaxLen = 2
+	)
+	// stmtBufLen is set to the length of the statement buffer after each SELECT
+	// COUNT(*) execution.
+	stmtBufLen := 0
+	ctx := context.Background()
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				AfterExecCmd: func(_ context.Context, cmd sql.Command, buf *sql.StmtBuf) {
+					if strings.Contains(cmd.String(), countStmt) {
+						// Only compare statement buffer length on SELECT COUNT(*) queries.
+						stmtBufLen = buf.Len()
+					}
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+
+	_, err := sqlDB.Exec("CREATE TABLE test (i int)")
+	require.NoError(t, err)
+
+	tx, err := sqlDB.Begin()
+	require.NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		_, err := tx.Exec(countStmt)
+		require.NoError(t, err)
+		if stmtBufLen > stmtBufMaxLen {
+			t.Fatalf("statement buffer grew to %d (> %d) after %dth execution", stmtBufLen, stmtBufMaxLen, i)
+		}
+	}
+	require.NoError(t, tx.Commit())
+}
+
 // dynamicRequestFilter exposes a filter method which is a
-// storagebase.ReplicaRequestFilter but can be set dynamically.
+// kvserverbase.ReplicaRequestFilter but can be set dynamically.
 type dynamicRequestFilter struct {
 	v atomic.Value
 }
 
 func newDynamicRequestFilter() *dynamicRequestFilter {
 	f := &dynamicRequestFilter{}
-	f.v.Store(storagebase.ReplicaRequestFilter(noopRequestFilter))
+	f.v.Store(kvserverbase.ReplicaRequestFilter(noopRequestFilter))
 	return f
 }
 
-func (f *dynamicRequestFilter) setFilter(filter storagebase.ReplicaRequestFilter) {
+func (f *dynamicRequestFilter) setFilter(filter kvserverbase.ReplicaRequestFilter) {
 	if filter == nil {
-		f.v.Store(storagebase.ReplicaRequestFilter(noopRequestFilter))
+		f.v.Store(kvserverbase.ReplicaRequestFilter(noopRequestFilter))
 	} else {
 		f.v.Store(filter)
 	}
 }
 
-// noopRequestFilter is a storagebase.ReplicaRequestFilter.
+// noopRequestFilter is a kvserverbase.ReplicaRequestFilter.
 func (f *dynamicRequestFilter) filter(
 	ctx context.Context, request roachpb.BatchRequest,
 ) *roachpb.Error {
-	return f.v.Load().(storagebase.ReplicaRequestFilter)(ctx, request)
+	return f.v.Load().(kvserverbase.ReplicaRequestFilter)(ctx, request)
 }
 
-// noopRequestFilter is a storagebase.ReplicaRequestFilter that does nothing.
+// noopRequestFilter is a kvserverbase.ReplicaRequestFilter that does nothing.
 func noopRequestFilter(ctx context.Context, request roachpb.BatchRequest) *roachpb.Error {
 	return nil
 }

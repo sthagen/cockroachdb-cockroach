@@ -20,12 +20,8 @@
 package colexec
 
 import (
-	"bytes"
 	"context"
-	"math"
-	"time"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
@@ -34,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
@@ -43,24 +38,6 @@ var _ = execgen.UNSAFEGET
 
 // {{/*
 // Declarations to make the template compile properly.
-
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
 
 // _LEFT_CANONICAL_TYPE_FAMILY is the template variable.
 const _LEFT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
@@ -79,7 +56,7 @@ type _NON_CONST_GOTYPESLICE interface{}
 
 // _ASSIGN is the template function for assigning the first input to the result
 // of computation an operation on the second and the third inputs.
-func _ASSIGN(_, _, _ interface{}) {
+func _ASSIGN(_, _, _, _, _, _ interface{}) {
 	colexecerror.InternalError("")
 }
 
@@ -104,11 +81,11 @@ type _OP_CONST_NAME struct {
 
 func (p _OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
 	// In order to inline the templated code of overloads, we need to have a
-	// `decimalScratch` local variable of type `decimalOverloadScratch`.
-	decimalScratch := p.decimalScratch
+	// `_overloadHelper` local variable of type `overloadHelper`.
+	_overloadHelper := p.overloadHelper
 	// However, the scratch is not used in all of the projection operators, so
 	// we add this to go around "unused" error.
-	_ = decimalScratch
+	_ = _overloadHelper
 	batch := p.input.Next(ctx)
 	n := batch.Length()
 	if n == 0 {
@@ -188,9 +165,9 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 		// {{end}}
 		arg := execgen.UNSAFEGET(col, i)
 		// {{if _IS_CONST_LEFT}}
-		_ASSIGN(projCol[i], p.constArg, arg)
+		_ASSIGN(projCol[i], p.constArg, arg, projCol, _, col)
 		// {{else}}
-		_ASSIGN(projCol[i], arg, p.constArg)
+		_ASSIGN(projCol[i], arg, p.constArg, projCol, col, _)
 		// {{end}}
 		// {{if _HAS_NULLS}}
 	}
@@ -242,13 +219,15 @@ func GetProjection_CONST_SIDEConstOperator(
 	colIdx int,
 	constArg tree.Datum,
 	outputIdx int,
+	overloadHelper overloadHelper,
 ) (colexecbase.Operator, error) {
 	input = newVectorTypeEnforcer(allocator, input, outputType, outputIdx)
 	projConstOpBase := projConstOpBase{
-		OneInputNode: NewOneInputNode(input),
-		allocator:    allocator,
-		colIdx:       colIdx,
-		outputIdx:    outputIdx,
+		OneInputNode:   NewOneInputNode(input),
+		allocator:      allocator,
+		colIdx:         colIdx,
+		outputIdx:      outputIdx,
+		overloadHelper: overloadHelper,
 	}
 	var (
 		c   interface{}
@@ -267,13 +246,13 @@ func GetProjection_CONST_SIDEConstOperator(
 		switch op {
 		// {{range .BinOps}}
 		case tree._NAME:
-			switch typeconv.TypeFamilyToCanonicalTypeFamily[leftType.Family()] {
+			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			// {{range .LeftFamilies}}
 			case _LEFT_CANONICAL_TYPE_FAMILY:
 				switch leftType.Width() {
 				// {{range .LeftWidths}}
 				case _LEFT_TYPE_WIDTH:
-					switch typeconv.TypeFamilyToCanonicalTypeFamily[rightType.Family()] {
+					switch typeconv.TypeFamilyToCanonicalTypeFamily(rightType.Family()) {
 					// {{range .RightFamilies}}
 					case _RIGHT_CANONICAL_TYPE_FAMILY:
 						switch rightType.Width() {
@@ -301,13 +280,13 @@ func GetProjection_CONST_SIDEConstOperator(
 		switch op {
 		// {{range .CmpOps}}
 		case tree._NAME:
-			switch typeconv.TypeFamilyToCanonicalTypeFamily[leftType.Family()] {
+			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			// {{range .LeftFamilies}}
 			case _LEFT_CANONICAL_TYPE_FAMILY:
 				switch leftType.Width() {
 				// {{range .LeftWidths}}
 				case _LEFT_TYPE_WIDTH:
-					switch typeconv.TypeFamilyToCanonicalTypeFamily[rightType.Family()] {
+					switch typeconv.TypeFamilyToCanonicalTypeFamily(rightType.Family()) {
 					// {{range .RightFamilies}}
 					case _RIGHT_CANONICAL_TYPE_FAMILY:
 						switch rightType.Width() {

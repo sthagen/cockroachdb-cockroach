@@ -118,7 +118,7 @@ func (expr *BinaryExpr) normalize(v *NormalizeVisitor) TypedExpr {
 	right := expr.TypedRight()
 	expectedType := expr.ResolvedType()
 
-	if !expr.fn.NullableArgs && (left == DNull || right == DNull) {
+	if !expr.Fn.NullableArgs && (left == DNull || right == DNull) {
 		return DNull
 	}
 
@@ -451,7 +451,7 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 					break
 				}
 
-				typedJ, err := dj.TypeCheck(nil, types.Jsonb)
+				typedJ, err := dj.TypeCheck(v.ctx.Context, nil, types.Jsonb)
 				if err != nil {
 					break
 				}

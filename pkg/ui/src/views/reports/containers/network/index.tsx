@@ -41,7 +41,7 @@ interface NetworkOwnProps {
 export interface Identity {
   nodeID: number;
   address: string;
-  locality: string;
+  locality?: string;
   updatedAt: moment.Moment;
 }
 
@@ -76,6 +76,9 @@ function contentAvailable(nodesSummary: NodesSummary) {
 }
 
 export function getValueFromString(key: string, params: string, fullString?: boolean) {
+  if (!params) {
+    return;
+  }
   const result = params.match(new RegExp(key + "=([^,#]*)"));
   if (!result) {
     return;
@@ -234,22 +237,30 @@ export class Network extends React.Component<NetworkProps, INetworkState> {
     data.forEach(values => {
       const localities = searchQuery(values.locality).split(",");
       localities.forEach((locality: string) => {
-        const value = locality.match(/^\w+/gi) ? locality.match(/^\w+/gi)[0] : null;
-        if (!sort.some(x => x.id === value)) {
-          const sortValue: NetworkSort = { id: value, filters: [] };
-          data.forEach(item => {
-            const valueLocality = searchQuery(values.locality).split(",");
-            const itemLocality = searchQuery(item.locality);
-            valueLocality.forEach(val => {
-              const itemLocalitySplited = val.match(/^\w+/gi) ? val.match(/^\w+/gi)[0] : null;
-              if (val === "cluster" && value === "cluster") {
-                sortValue.filters = [...sortValue.filters, { name: item.nodeID.toString(), address: item.address }];
-              } else if (itemLocalitySplited === value && !sortValue.filters.reduce((accumulator, vendor) => (accumulator || vendor.name === getValueFromString(value, itemLocality)), false)) {
-                sortValue.filters = [...sortValue.filters, { name: getValueFromString(value, itemLocality), address: item.address }];
-              }
+        if (locality !== "") {
+          const value = locality.match(/^\w+/gi) ? locality.match(/^\w+/gi)[0] : null;
+          if (!sort.some(x => x.id === value)) {
+            const sortValue: NetworkSort = {id: value, filters: []};
+            data.forEach(item => {
+              const valueLocality = searchQuery(values.locality).split(",");
+              const itemLocality = searchQuery(item.locality);
+              valueLocality.forEach(val => {
+                const itemLocalitySplited = val.match(/^\w+/gi) ? val.match(/^\w+/gi)[0] : null;
+                if (val === "cluster" && value === "cluster") {
+                  sortValue.filters = [...sortValue.filters, {
+                    name: item.nodeID.toString(),
+                    address: item.address,
+                  }];
+                } else if (itemLocalitySplited === value && !sortValue.filters.reduce((accumulator, vendor) => (accumulator || vendor.name === getValueFromString(value, itemLocality)), false)) {
+                  sortValue.filters = [...sortValue.filters, {
+                    name: getValueFromString(value, itemLocality),
+                    address: item.address,
+                  }];
+                }
+              });
             });
-          });
-          sort.push(sortValue);
+            sort.push(sortValue);
+          }
         }
       });
     });

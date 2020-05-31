@@ -20,14 +20,11 @@
 package colexec
 
 import (
-	"bytes"
 	"fmt"
-	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -38,15 +35,6 @@ var _ = execgen.UNSAFEGET
 
 // Declarations to make the template compile properly.
 
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "tree" package.
-var _ tree.Operator
-
-// Dummy import to pull in "math" package.
-var _ int = math.MaxInt16
-
 // _CANONICAL_TYPE_FAMILY is the template variable.
 const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
 
@@ -55,7 +43,7 @@ const _TYPE_WIDTH = 0
 
 // _ASSIGN_NE is the template function for assigning the result of comparing
 // the second input to the third input into the first input.
-func _ASSIGN_NE(_, _, _ interface{}) int {
+func _ASSIGN_NE(_, _, _, _, _, _ interface{}) int {
 	colexecerror.InternalError("")
 }
 
@@ -142,7 +130,7 @@ func _MATCH_LOOP(
 		rhsVal := execgen.UNSAFEGET(rhsCol, rowIdx)
 
 		var cmp bool
-		_ASSIGN_NE(cmp, lhsVal, rhsVal)
+		_ASSIGN_NE(cmp, lhsVal, rhsVal, _, lhsCol, rhsCol)
 		diff[selIdx] = diff[selIdx] || cmp
 	}
 

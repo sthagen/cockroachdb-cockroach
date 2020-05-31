@@ -15,9 +15,13 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -71,11 +75,65 @@ func ConvertToMappedSpecOrdering(
 	return specOrdering
 }
 
+// DistSQLTypeResolver implements tree.ResolvableTypeReference for accessing
+// type information during DistSQL query evaluation.
+type DistSQLTypeResolver struct {
+	EvalContext *tree.EvalContext
+	// TODO (rohany): This struct should locally cache id -> types.T here
+	//  so that repeated lookups do not incur additional KV operations.
+}
+
+// ResolveType implements tree.ResolvableTypeReference.
+func (tr *DistSQLTypeResolver) ResolveType(
+	context.Context, *tree.UnresolvedObjectName,
+) (*types.T, error) {
+	return nil, errors.AssertionFailedf("cannot resolve types in DistSQL by name")
+}
+
+func makeTypeLookupFunc(
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec,
+) sqlbase.TypeLookupFunc {
+	return func(id sqlbase.ID) (*tree.TypeName, *sqlbase.TypeDescriptor, error) {
+		return resolver.ResolveTypeDescByID(ctx, txn, codec, id)
+	}
+}
+
+// ResolveTypeByID implements tree.ResolvableTypeReference.
+func (tr *DistSQLTypeResolver) ResolveTypeByID(ctx context.Context, id uint32) (*types.T, error) {
+	// TODO (rohany): This should eventually look into the set of cached type
+	//  descriptors before attempting to access it here.
+	lookup := makeTypeLookupFunc(ctx, tr.EvalContext.Txn, tr.EvalContext.Codec)
+	name, typDesc, err := lookup(sqlbase.ID(id))
+	if err != nil {
+		return nil, err
+	}
+	return typDesc.MakeTypesT(name, lookup)
+}
+
+// HydrateTypeSlice hydrates all user defined types in an input slice of types.
+func HydrateTypeSlice(evalCtx *tree.EvalContext, typs []*types.T) error {
+	// TODO (rohany): This should eventually look into the set of cached type
+	//  descriptors before attempting to access it here.
+	lookup := makeTypeLookupFunc(evalCtx.Context, evalCtx.Txn, evalCtx.Codec)
+	for _, t := range typs {
+		if t.UserDefined() {
+			name, typDesc, err := lookup(sqlbase.ID(t.StableTypeID()))
+			if err != nil {
+				return err
+			}
+			if err := typDesc.HydrateTypeInfoWithName(t, name, lookup); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // ExprFmtCtxBase produces a FmtCtx used for serializing expressions; a proper
 // IndexedVar formatting function needs to be added on. It replaces placeholders
 // with their values.
 func ExprFmtCtxBase(evalCtx *tree.EvalContext) *tree.FmtCtx {
-	fmtCtx := tree.NewFmtCtx(tree.FmtCheckEquivalence)
+	fmtCtx := tree.NewFmtCtx(tree.FmtDistSQLSerialization)
 	fmtCtx.SetPlaceholderFormat(
 		func(fmtCtx *tree.FmtCtx, p *tree.Placeholder) {
 			d, err := p.Eval(evalCtx)
@@ -115,7 +173,7 @@ func (e *Expression) Empty() bool {
 // String implements the Stringer interface.
 func (e Expression) String() string {
 	if e.LocalExpr != nil {
-		ctx := tree.NewFmtCtx(tree.FmtCheckEquivalence)
+		ctx := tree.NewFmtCtx(tree.FmtDistSQLSerialization)
 		ctx.FormatNode(e.LocalExpr)
 		return ctx.CloseAndGetString()
 	}

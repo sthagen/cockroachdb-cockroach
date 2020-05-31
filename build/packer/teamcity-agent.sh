@@ -15,17 +15,13 @@ EOF
 # Avoid saving any Bash history.
 HISTSIZE=0
 
-# At the time of writing we really want 1.11, but that doesn't
-# exist in the PPA yet.
-GOVERS=1.10
-
 # Add third-party APT repositories.
 apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 0EBFCD88
 cat > /etc/apt/sources.list.d/docker.list <<EOF
-deb https://download.docker.com/linux/ubuntu xenial stable
+deb https://download.docker.com/linux/ubuntu bionic stable
 EOF
-apt-add-repository ppa:webupd8team/java
-add-apt-repository ppa:gophers/archive
+# Per https://github.com/golang/go/wiki/Ubuntu
+add-apt-repository ppa:longsleep/golang-backports
 # Git 2.7, which ships with Xenial, has a bug where submodule metadata sometimes
 # uses absolute paths instead of relative paths, which means the affected
 # submodules cannot be mounted in Docker containers. Use the latest version of
@@ -33,27 +29,20 @@ add-apt-repository ppa:gophers/archive
 add-apt-repository ppa:git-core/ppa
 apt-get update --yes
 
-# Auto-accept the Oracle Java license agreement.
-debconf-set-selections <<< "oracle-java8-installer shared/accepted-oracle-license-v1-1 select true"
-
 # Install the necessary dependencies. Keep this list small!
 apt-get install --yes \
   docker-ce \
   docker-compose \
   gnome-keyring \
   git \
-  golang-${GOVERS} \
-  oracle-java8-installer \
+  golang-go \
+  openjdk-11-jre-headless \
   unzip
 # Installing gnome-keyring prevents the error described in
 # https://github.com/moby/moby/issues/34048
 
-# Link Go into the PATH; the PPA installs it into /usr/lib/go-1.x/bin.
-ln -s /usr/lib/go-${GOVERS}/bin/go /usr/bin/go
-
-# Add a user for the TeamCity agent with Docker rights.
-adduser agent --disabled-password
-adduser agent docker
+# Give the user for the TeamCity agent Docker rights.
+usermod -a -G docker agent
 
 # Download the TeamCity agent code and install its configuration.
 # N.B.: This must be done as the agent user.
@@ -125,6 +114,33 @@ SuccessExitStatus=0 143
 WantedBy=multi-user.target
 EOF
 systemctl enable teamcity-agent.service
+
+# Enable LRU pruning of Docker images.
+# https://github.com/stepchowfun/docuum#running-docuum-in-a-docker-container
+DOCUUM_VERSION=0.9.4
+cat > /etc/systemd/system/docuum.service <<EOF
+[Unit]
+Description=Remove Stale Docker Images
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStart=/usr/bin/docker run \
+          --init \
+          --rm \
+          --tty \
+          --name docuum \
+          --volume /var/run/docker.sock:/var/run/docker.sock \
+          --volume docuum:/root stephanmisc/docuum:$DOCUUM_VERSION \
+          --threshold '128 GB'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable docuum.service
+# Prefetch the image
+docker pull stephanmisc/docuum:$DOCUUM_VERSION
 
 # Boot the TeamCity agent so it can be upgraded by the server (i.e., download
 # and install whatever plugins the server has installed) before we bake the

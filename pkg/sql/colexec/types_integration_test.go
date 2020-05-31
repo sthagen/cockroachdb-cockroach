@@ -18,12 +18,10 @@ import (
 	"github.com/apache/arrow/go/arrow/array"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
-	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -33,13 +31,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSupportedSQLTypesIntegration tests that all SQL types supported by the
-// vectorized engine are "actually supported." For each type, it creates a bunch
-// of rows consisting of a single datum (possibly null), converts them into
-// column batches, serializes and then deserializes these batches, and finally
-// converts the deserialized batches back to rows which are compared with the
-// original rows.
-func TestSupportedSQLTypesIntegration(t *testing.T) {
+// TestSQLTypesIntegration tests that all SQL types are supported by the
+// vectorized engine. For each type, it creates a bunch of rows consisting of a
+// single datum (possibly null), converts them into column batches, serializes
+// and then deserializes these batches, and finally converts the deserialized
+// batches back to rows which are compared with the original rows.
+func TestSQLTypesIntegration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
@@ -58,8 +55,10 @@ func TestSupportedSQLTypesIntegration(t *testing.T) {
 
 	var da sqlbase.DatumAlloc
 	rng, _ := randutil.NewPseudoRand()
+	typesToTest := 20
 
-	for _, typ := range typeconv.AllSupportedSQLTypes {
+	for i := 0; i < typesToTest; i++ {
+		typ := sqlbase.RandType(rng)
 		for _, numRows := range []int{
 			// A few interesting sizes.
 			1,
@@ -90,7 +89,6 @@ func TestSupportedSQLTypesIntegration(t *testing.T) {
 				1, /* processorID */
 				arrowOp,
 				typs,
-				&execinfrapb.PostProcessSpec{},
 				output,
 				nil, /* metadataSourcesQueue */
 				nil, /* toClose */

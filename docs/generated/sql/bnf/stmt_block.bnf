@@ -299,6 +299,7 @@ alter_ddl_stmt ::=
 	| alter_database_stmt
 	| alter_range_stmt
 	| alter_partition_stmt
+	| alter_type_stmt
 
 alter_role_stmt ::=
 	'ALTER' role_or_group_or_user string_or_placeholder opt_role_options
@@ -618,13 +619,16 @@ unreserved_keyword ::=
 	| 'ACTION'
 	| 'ADD'
 	| 'ADMIN'
+	| 'AFTER'
 	| 'AGGREGATE'
 	| 'ALTER'
 	| 'ALWAYS'
 	| 'AT'
+	| 'ATTRIBUTE'
 	| 'AUTOMATIC'
 	| 'AUTHORIZATION'
 	| 'BACKUP'
+	| 'BEFORE'
 	| 'BEGIN'
 	| 'BUCKET_COUNT'
 	| 'BUNDLE'
@@ -762,6 +766,7 @@ unreserved_keyword ::=
 	| 'OTHERS'
 	| 'OVER'
 	| 'OWNED'
+	| 'OWNER'
 	| 'PARENT'
 	| 'PARTIAL'
 	| 'PARTITION'
@@ -994,6 +999,13 @@ alter_range_stmt ::=
 alter_partition_stmt ::=
 	alter_zone_partition_stmt
 
+alter_type_stmt ::=
+	'ALTER' 'TYPE' type_name 'ADD' 'VALUE' 'SCONST' opt_add_val_placement
+	| 'ALTER' 'TYPE' type_name 'ADD' 'VALUE' 'IF' 'NOT' 'EXISTS' 'SCONST' opt_add_val_placement
+	| 'ALTER' 'TYPE' type_name 'RENAME' 'VALUE' 'SCONST' 'TO' 'SCONST'
+	| 'ALTER' 'TYPE' type_name 'RENAME' 'TO' type_name
+	| 'ALTER' 'TYPE' type_name 'SET' 'SCHEMA' schema_name
+
 role_or_group_or_user ::=
 	'ROLE'
 	| 'USER'
@@ -1013,10 +1025,10 @@ create_database_stmt ::=
 	| 'CREATE' 'DATABASE' 'IF' 'NOT' 'EXISTS' database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause
 
 create_index_stmt ::=
-	'CREATE' opt_unique 'INDEX' opt_concurrently opt_index_name 'ON' table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
-	| 'CREATE' opt_unique 'INDEX' opt_concurrently 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
-	| 'CREATE' opt_unique 'INVERTED' 'INDEX' opt_concurrently opt_index_name 'ON' table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by
-	| 'CREATE' opt_unique 'INVERTED' 'INDEX' opt_concurrently 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by
+	'CREATE' opt_unique 'INDEX' opt_concurrently opt_index_name 'ON' table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_where_clause
+	| 'CREATE' opt_unique 'INDEX' opt_concurrently 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_where_clause
+	| 'CREATE' opt_unique 'INVERTED' 'INDEX' opt_concurrently opt_index_name 'ON' table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_where_clause
+	| 'CREATE' opt_unique 'INVERTED' 'INDEX' opt_concurrently 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_where_clause
 
 create_schema_stmt ::=
 	'CREATE' 'SCHEMA' schema_name
@@ -1366,6 +1378,17 @@ alter_zone_partition_stmt ::=
 	| 'ALTER' 'PARTITION' partition_name 'OF' 'INDEX' table_index_name set_zone_config
 	| 'ALTER' 'PARTITION' partition_name 'OF' 'INDEX' table_name '@' '*' set_zone_config
 
+type_name ::=
+	db_object_name
+
+opt_add_val_placement ::=
+	'BEFORE' 'SCONST'
+	| 'AFTER' 'SCONST'
+	| 
+
+schema_name ::=
+	name
+
 opt_with ::=
 	'WITH'
 	| 
@@ -1430,9 +1453,6 @@ opt_partition_by ::=
 	partition_by
 	| 
 
-schema_name ::=
-	name
-
 opt_temp_create_table ::=
 	opt_temp
 	| 'LOCAL' 'TEMPORARY'
@@ -1447,9 +1467,6 @@ opt_table_elem_list ::=
 create_as_opt_col_list ::=
 	'(' create_as_table_defs ')'
 	| 
-
-type_name ::=
-	db_object_name
 
 opt_enum_val_list ::=
 	enum_val_list
@@ -1520,9 +1537,9 @@ column_def ::=
 	column_name typename col_qual_list
 
 index_def ::=
-	'INDEX' opt_index_name '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
-	| 'UNIQUE' 'INDEX' opt_index_name '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
-	| 'INVERTED' 'INDEX' opt_name '(' index_params ')'
+	'INDEX' opt_index_name '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_where_clause
+	| 'UNIQUE' 'INDEX' opt_index_name '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_where_clause
+	| 'INVERTED' 'INDEX' opt_name '(' index_params ')' opt_where_clause
 
 family_def ::=
 	'FAMILY' opt_family_name '(' name_list ')'
@@ -1570,6 +1587,7 @@ case_expr ::=
 
 simple_typename ::=
 	general_type_name
+	| '@' iconst32
 	| complex_type_name
 	| const_typename
 	| bit_with_length
@@ -1849,7 +1867,7 @@ constraint_name ::=
 
 constraint_elem ::=
 	'CHECK' '(' a_expr ')'
-	| 'UNIQUE' '(' index_params ')' opt_storing opt_interleave opt_partition_by
+	| 'UNIQUE' '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_where_clause
 	| 'PRIMARY' 'KEY' '(' index_params ')' opt_hash_sharded opt_interleave
 	| 'FOREIGN' 'KEY' '(' name_list ')' 'REFERENCES' table_name opt_column_list key_match reference_actions
 
@@ -1875,7 +1893,7 @@ column_path_with_star ::=
 	| db_object_name_component '.' '*'
 
 func_expr ::=
-	func_application filter_clause over_clause
+	func_application within_group_clause filter_clause over_clause
 	| func_expr_common_subexpr
 
 labeled_row ::=
@@ -1907,6 +1925,9 @@ case_default ::=
 
 general_type_name ::=
 	type_function_name_no_crdb_extra
+
+iconst32 ::=
+	'ICONST'
 
 complex_type_name ::=
 	general_type_name '.' unrestricted_name
@@ -2146,15 +2167,16 @@ opt_interval_qualifier ::=
 	interval_qualifier
 	| 
 
-iconst32 ::=
-	'ICONST'
-
 func_application ::=
 	func_name '(' ')'
 	| func_name '(' expr_list opt_sort_clause ')'
 	| func_name '(' 'ALL' expr_list opt_sort_clause ')'
 	| func_name '(' 'DISTINCT' expr_list ')'
 	| func_name '(' '*' ')'
+
+within_group_clause ::=
+	'WITHIN' 'GROUP' '(' single_sort_clause ')'
+	| 
 
 filter_clause ::=
 	'FILTER' '(' 'WHERE' a_expr ')'
@@ -2385,6 +2407,10 @@ func_name ::=
 	type_function_name
 	| prefixed_column_path
 
+single_sort_clause ::=
+	'ORDER' 'BY' sortby
+	| 'ORDER' 'BY' sortby ',' sortby_list
+
 window_specification ::=
 	'(' opt_existing_window_name opt_partition_clause opt_sort_clause opt_frame_clause ')'
 
@@ -2477,6 +2503,7 @@ opt_name_parens ::=
 
 generated_as ::=
 	'AS'
+	| 'GENERATED_ALWAYS' 'ALWAYS' 'AS'
 
 reference_action ::=
 	'NO' 'ACTION'

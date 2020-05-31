@@ -64,7 +64,7 @@ func TestSpillingQueue(t *testing.T) {
 					BatchSize:  1 + rng.Intn(coldata.BatchSize()),
 					Nulls:      true,
 					BatchAccumulator: func(b coldata.Batch, typs []*types.T) {
-						batches = append(batches, coldatatestutils.CopyBatch(b, typs))
+						batches = append(batches, coldatatestutils.CopyBatch(b, typs, testColumnFactory))
 					},
 				})
 				typs := op.Typs()
@@ -144,7 +144,7 @@ func TestSpillingQueue(t *testing.T) {
 				require.NoError(t, q.close(ctx))
 
 				// Verify no directories are left over.
-				directories, err := queueCfg.FS.ListDir(queueCfg.Path)
+				directories, err := queueCfg.FS.List(queueCfg.Path)
 				require.NoError(t, err)
 				require.Equal(t, 0, len(directories))
 			})

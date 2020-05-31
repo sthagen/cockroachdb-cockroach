@@ -22,22 +22,26 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-func (o lastArgWidthOverload) AssignAdd(target, l, r string) string {
-	return o.WidthOverloads[0].Assign(target, l, r)
+func (o lastArgWidthOverload) AssignAdd(
+	targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string,
+) string {
+	return o.WidthOverloads[0].Assign(targetElem, leftElem, rightElem, targetCol, leftCol, rightCol)
 }
 
-func (o lastArgWidthOverload) AssignDivInt64(target, l, r string) string {
+func (o lastArgWidthOverload) AssignDivInt64(
+	targetElem, leftElem, rightElem, _, _, _ string,
+) string {
 	switch o.lastArgTypeOverload.CanonicalTypeFamily {
 	case types.DecimalFamily:
-		return fmt.Sprintf(
-			`%s.SetInt64(%s)
-if _, err := tree.DecimalCtx.Quo(&%s, &%s, &%s); err != nil {
+		return fmt.Sprintf(`
+			%s.SetInt64(%s)
+			if _, err := tree.DecimalCtx.Quo(&%s, &%s, &%s); err != nil {
 			colexecerror.InternalError(err)
 		}`,
-			target, r, target, l, target,
+			targetElem, rightElem, targetElem, leftElem, targetElem,
 		)
 	case types.FloatFamily:
-		return fmt.Sprintf("%s = %s / float64(%s)", target, l, r)
+		return fmt.Sprintf("%s = %s / float64(%s)", targetElem, leftElem, rightElem)
 	}
 	colexecerror.InternalError("unsupported avg agg type")
 	// This code is unreachable, but the compiler cannot infer that.
@@ -57,19 +61,20 @@ func genAvgAgg(wr io.Writer) error {
 		return err
 	}
 
-	s := string(t)
+	r := strings.NewReplacer(
+		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"_GOTYPESLICE", "{{.GoTypeSliceName}}",
+		"_GOTYPE", "{{.GoType}}",
+		"_TYPE", "{{.VecMethod}}",
+		"TemplateType", "{{.VecMethod}}",
+	)
+	s := r.Replace(string(t))
 
-	s = strings.ReplaceAll(s, "_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}")
-	s = strings.ReplaceAll(s, "_TYPE_WIDTH", typeWidthReplacement)
-	s = strings.ReplaceAll(s, "_GOTYPESLICE", "{{.GoTypeSliceName}}")
-	s = strings.ReplaceAll(s, "_GOTYPE", "{{.GoType}}")
-	s = strings.ReplaceAll(s, "_TYPE", "{{.VecMethod}}")
-	s = strings.ReplaceAll(s, "TemplateType", "{{.VecMethod}}")
-
-	assignDivRe := makeFunctionRegex("_ASSIGN_DIV_INT64", 3)
-	s = assignDivRe.ReplaceAllString(s, makeTemplateFunctionCall("AssignDivInt64", 3))
-	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 3)
-	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.AssignAdd", 3))
+	assignDivRe := makeFunctionRegex("_ASSIGN_DIV_INT64", 6)
+	s = assignDivRe.ReplaceAllString(s, makeTemplateFunctionCall("AssignDivInt64", 6))
+	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 6)
+	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.AssignAdd", 6))
 
 	accumulateAvg := makeFunctionRegex("_ACCUMULATE_AVG", 4)
 	s = accumulateAvg.ReplaceAllString(s, `{{template "accumulateAvg" buildDict "Global" . "HasNulls" $4}}`)

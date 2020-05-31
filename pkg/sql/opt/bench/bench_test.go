@@ -350,7 +350,7 @@ func newHarness() *harness {
 
 func (h *harness) close() {
 	if h.s != nil {
-		h.s.Stopper().Stop(context.TODO())
+		h.s.Stopper().Stop(context.Background())
 	}
 }
 
@@ -507,6 +507,7 @@ func (h *harness) prepareUsingAPI(tb testing.TB) {
 		id := tree.PlaceholderIdx(i)
 		typ, _ := h.semaCtx.Placeholders.ValueType(id)
 		texpr, err := sqlbase.SanitizeVarFreeExpr(
+			context.Background(),
 			parg,
 			typ,
 			"", /* context */

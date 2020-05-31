@@ -57,7 +57,7 @@ func newFileUploadMachine(
 	c := &copyMachine{
 		conn: conn,
 		// The planner will be prepared before use.
-		p: planner{execCfg: execCfg},
+		p: planner{execCfg: execCfg, alloc: &sqlbase.DatumAlloc{}},
 	}
 	f = &fileUploadMachine{
 		c:  c,
@@ -76,7 +76,7 @@ func newFileUploadMachine(
 		return nil, err
 	}
 
-	optsFn, err := f.c.p.TypeAsStringOpts(n.Options, copyFileOptionExpectValues)
+	optsFn, err := f.c.p.TypeAsStringOpts(ctx, n.Options, copyFileOptionExpectValues)
 	if err != nil {
 		return nil, err
 	}

@@ -46,7 +46,7 @@ func TestCleanupSchemaObjects(t *testing.T) {
 
 	_, err = conn.ExecContext(ctx, `
 SET experimental_enable_temp_tables=true;
-SET experimental_serial_normalization='sql_sequence';
+SET serial_normalization='sql_sequence';
 CREATE TEMP TABLE a (a SERIAL, c INT);
 ALTER TABLE a ADD COLUMN b SERIAL;
 CREATE TEMP SEQUENCE a_sequence;
@@ -163,7 +163,7 @@ func TestTemporaryObjectCleaner(t *testing.T) {
 			},
 		},
 	)
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	// Start and close two temporary schemas.
 	for _, dbID := range []int{0, 1} {
@@ -232,7 +232,7 @@ func TestTemporarySchemaDropDatabase(t *testing.T) {
 			},
 		},
 	)
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	// Create a database to drop that has a temporary table inside.
 	{

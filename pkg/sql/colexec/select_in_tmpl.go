@@ -20,12 +20,8 @@
 package colexec
 
 import (
-	"bytes"
 	"context"
-	"math"
-	"time"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
@@ -34,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
@@ -46,23 +41,9 @@ var (
 
 // {{/*
 
+type _GOTYPESLICE interface{}
 type _GOTYPE interface{}
 type _TYPE interface{}
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
-
-// Dummy import to pull in "bytes" package
-var _ bytes.Buffer
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
 
 // _CANONICAL_TYPE_FAMILY is the template variable.
 const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
@@ -70,7 +51,7 @@ const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
 // _TYPE_WIDTH is the template variable.
 const _TYPE_WIDTH = 0
 
-func _ASSIGN_EQ(_, _, _ interface{}) int {
+func _ASSIGN_EQ(_, _, _, _, _, _ interface{}) int {
 	colexecerror.InternalError("")
 }
 
@@ -96,7 +77,7 @@ func GetInProjectionOperator(
 ) (colexecbase.Operator, error) {
 	input = newVectorTypeEnforcer(allocator, input, types.Bool, resultIdx)
 	var err error
-	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
 	case _CANONICAL_TYPE_FAMILY:
 		switch t.Width() {
@@ -125,7 +106,7 @@ func GetInOperator(
 	t *types.T, input colexecbase.Operator, colIdx int, datumTuple *tree.DTuple, negate bool,
 ) (colexecbase.Operator, error) {
 	var err error
-	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
 	case _CANONICAL_TYPE_FAMILY:
 		switch t.Width() {
@@ -192,10 +173,12 @@ func fillDatumRow_TYPE(t *types.T, datumTuple *tree.DTuple) ([]_GOTYPE, bool, er
 	return result, hasNulls, nil
 }
 
-func cmpIn_TYPE(target _GOTYPE, filterRow []_GOTYPE, hasNulls bool) comparisonResult {
+func cmpIn_TYPE(
+	targetElem _GOTYPE, targetCol _GOTYPESLICE, filterRow []_GOTYPE, hasNulls bool,
+) comparisonResult {
 	for i := range filterRow {
 		var cmp bool
-		_ASSIGN_EQ(cmp, target, filterRow[i])
+		_ASSIGN_EQ(cmp, targetElem, filterRow[i], _, targetCol, _)
 		if cmp {
 			return siTrue
 		}
@@ -238,7 +221,7 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 				sel = sel[:n]
 				for _, i := range sel {
 					v := execgen.UNSAFEGET(col, i)
-					if !nulls.NullAt(i) && cmpIn_TYPE(v, si.filterRow, si.hasNulls) == compVal {
+					if !nulls.NullAt(i) && cmpIn_TYPE(v, col, si.filterRow, si.hasNulls) == compVal {
 						sel[idx] = i
 						idx++
 					}
@@ -249,7 +232,7 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 				col = execgen.SLICE(col, 0, n)
 				for execgen.RANGE(i, col, 0, n) {
 					v := execgen.UNSAFEGET(col, i)
-					if !nulls.NullAt(i) && cmpIn_TYPE(v, si.filterRow, si.hasNulls) == compVal {
+					if !nulls.NullAt(i) && cmpIn_TYPE(v, col, si.filterRow, si.hasNulls) == compVal {
 						sel[idx] = i
 						idx++
 					}
@@ -260,7 +243,7 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 				sel = sel[:n]
 				for _, i := range sel {
 					v := execgen.UNSAFEGET(col, i)
-					if cmpIn_TYPE(v, si.filterRow, si.hasNulls) == compVal {
+					if cmpIn_TYPE(v, col, si.filterRow, si.hasNulls) == compVal {
 						sel[idx] = i
 						idx++
 					}
@@ -271,7 +254,7 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 				col = execgen.SLICE(col, 0, n)
 				for execgen.RANGE(i, col, 0, n) {
 					v := execgen.UNSAFEGET(col, i)
-					if cmpIn_TYPE(v, si.filterRow, si.hasNulls) == compVal {
+					if cmpIn_TYPE(v, col, si.filterRow, si.hasNulls) == compVal {
 						sel[idx] = i
 						idx++
 					}
@@ -320,7 +303,7 @@ func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 					projNulls.SetNull(i)
 				} else {
 					v := execgen.UNSAFEGET(col, i)
-					cmpRes := cmpIn_TYPE(v, pi.filterRow, pi.hasNulls)
+					cmpRes := cmpIn_TYPE(v, col, pi.filterRow, pi.hasNulls)
 					if cmpRes == siNull {
 						projNulls.SetNull(i)
 					} else {
@@ -335,7 +318,7 @@ func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 					projNulls.SetNull(i)
 				} else {
 					v := execgen.UNSAFEGET(col, i)
-					cmpRes := cmpIn_TYPE(v, pi.filterRow, pi.hasNulls)
+					cmpRes := cmpIn_TYPE(v, col, pi.filterRow, pi.hasNulls)
 					if cmpRes == siNull {
 						projNulls.SetNull(i)
 					} else {
@@ -349,7 +332,7 @@ func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 			sel = sel[:n]
 			for _, i := range sel {
 				v := execgen.UNSAFEGET(col, i)
-				cmpRes := cmpIn_TYPE(v, pi.filterRow, pi.hasNulls)
+				cmpRes := cmpIn_TYPE(v, col, pi.filterRow, pi.hasNulls)
 				if cmpRes == siNull {
 					projNulls.SetNull(i)
 				} else {
@@ -360,7 +343,7 @@ func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 			col = execgen.SLICE(col, 0, n)
 			for execgen.RANGE(i, col, 0, n) {
 				v := execgen.UNSAFEGET(col, i)
-				cmpRes := cmpIn_TYPE(v, pi.filterRow, pi.hasNulls)
+				cmpRes := cmpIn_TYPE(v, col, pi.filterRow, pi.hasNulls)
 				if cmpRes == siNull {
 					projNulls.SetNull(i)
 				} else {

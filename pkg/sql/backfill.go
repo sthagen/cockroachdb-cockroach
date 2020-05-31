@@ -25,6 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -203,7 +205,7 @@ func (sc *SchemaChanger) runBackfill(ctx context.Context) error {
 					constraintsToAddBeforeValidation = append(constraintsToAddBeforeValidation, *t.Constraint)
 					constraintsToValidate = append(constraintsToValidate, *t.Constraint)
 				}
-			case *sqlbase.DescriptorMutation_PrimaryKeySwap:
+			case *sqlbase.DescriptorMutation_PrimaryKeySwap, *sqlbase.DescriptorMutation_ComputedColumnSwap:
 				// The backfiller doesn't need to do anything here.
 			default:
 				return errors.AssertionFailedf(
@@ -220,7 +222,7 @@ func (sc *SchemaChanger) runBackfill(ctx context.Context) error {
 				}
 			case *sqlbase.DescriptorMutation_Constraint:
 				constraintsToDrop = append(constraintsToDrop, *t.Constraint)
-			case *sqlbase.DescriptorMutation_PrimaryKeySwap:
+			case *sqlbase.DescriptorMutation_PrimaryKeySwap, *sqlbase.DescriptorMutation_ComputedColumnSwap:
 				// The backfiller doesn't need to do anything here.
 			default:
 				return errors.AssertionFailedf(
@@ -492,7 +494,7 @@ func (sc *SchemaChanger) addConstraints(
 func (sc *SchemaChanger) validateConstraints(
 	ctx context.Context, constraints []sqlbase.ConstraintToUpdate,
 ) error {
-	if testDisableTableLeases {
+	if lease.TestingTableLeasesAreDisabled() {
 		return nil
 	}
 
@@ -525,7 +527,7 @@ func (sc *SchemaChanger) validateConstraints(
 		c := constraints[i]
 		grp.GoCtx(func(ctx context.Context) error {
 			// Make the mutations public in a private copy of the descriptor
-			// and add it to the TableCollection, so that we can use SQL below to perform
+			// and add it to the Collection, so that we can use SQL below to perform
 			// the validation. We wouldn't have needed to do this if we could have
 			// updated the descriptor and run validation in the same transaction. However,
 			// our current system is incapable of running long running schema changes
@@ -572,9 +574,9 @@ func (sc *SchemaChanger) validateConstraints(
 // It operates entirely on the current goroutine and is thus able to
 // reuse an existing kv.Txn safely.
 func (sc *SchemaChanger) getTableVersion(
-	ctx context.Context, txn *kv.Txn, tc *TableCollection, version sqlbase.DescriptorVersion,
+	ctx context.Context, txn *kv.Txn, tc *descs.Collection, version sqlbase.DescriptorVersion,
 ) (*sqlbase.ImmutableTableDescriptor, error) {
-	tableDesc, err := tc.getTableVersionByID(ctx, txn, sc.tableID, tree.ObjectLookupFlags{})
+	tableDesc, err := tc.GetTableVersionByID(ctx, txn, sc.tableID, tree.ObjectLookupFlags{})
 	if err != nil {
 		return nil, err
 	}
@@ -617,11 +619,8 @@ func (sc *SchemaChanger) truncateIndexes(
 				}
 
 				// Retrieve a lease for this table inside the current txn.
-				tc := &TableCollection{
-					leaseMgr: sc.leaseMgr,
-					settings: sc.settings,
-				}
-				defer tc.releaseTables(ctx)
+				tc := descs.NewCollection(sc.leaseMgr, sc.settings)
+				defer tc.ReleaseAll(ctx)
 				tableDesc, err := sc.getTableVersion(ctx, txn, tc, version)
 				if err != nil {
 					return err
@@ -817,12 +816,9 @@ func (sc *SchemaChanger) distBackfill(
 				}
 			}
 
-			tc := &TableCollection{
-				leaseMgr: sc.leaseMgr,
-				settings: sc.settings,
-			}
+			tc := descs.NewCollection(sc.leaseMgr, sc.settings)
 			// Use a leased table descriptor for the backfill.
-			defer tc.releaseTables(ctx)
+			defer tc.ReleaseAll(ctx)
 			tableDesc, err := sc.getTableVersion(ctx, txn, tc, version)
 			if err != nil {
 				return err
@@ -845,7 +841,7 @@ func (sc *SchemaChanger) distBackfill(
 				}
 
 				for k := range fkTables {
-					table, err := tc.getTableVersionByID(ctx, txn, k, tree.ObjectLookupFlags{})
+					table, err := tc.GetTableVersionByID(ctx, txn, k, tree.ObjectLookupFlags{})
 					if err != nil {
 						return err
 					}
@@ -977,7 +973,7 @@ func (sc *SchemaChanger) updateJobRunningStatus(
 // This operates over multiple goroutines concurrently and is thus not
 // able to reuse the original kv.Txn safely, so it makes its own.
 func (sc *SchemaChanger) validateIndexes(ctx context.Context) error {
-	if testDisableTableLeases {
+	if lease.TestingTableLeasesAreDisabled() {
 		return nil
 	}
 
@@ -1171,7 +1167,7 @@ func (sc *SchemaChanger) validateForwardIndexes(
 		grp.GoCtx(func(ctx context.Context) error {
 			start := timeutil.Now()
 			// Make the mutations public in a private copy of the descriptor
-			// and add it to the TableCollection, so that we can use SQL below to perform
+			// and add it to the Collection, so that we can use SQL below to perform
 			// the validation. We wouldn't have needed to do this if we could have
 			// updated the descriptor and run validation in the same transaction. However,
 			// our current system is incapable of running long running schema changes
@@ -1182,12 +1178,9 @@ func (sc *SchemaChanger) validateForwardIndexes(
 			if err != nil {
 				return err
 			}
-			tc := &TableCollection{
-				leaseMgr: sc.leaseMgr,
-				settings: sc.settings,
-			}
+			tc := descs.NewCollection(sc.leaseMgr, sc.settings)
 			// pretend that the schema has been modified.
-			if err := tc.addUncommittedTable(*desc); err != nil {
+			if err := tc.AddUncommittedTable(*desc); err != nil {
 				return err
 			}
 
@@ -1353,6 +1346,8 @@ func runSchemaChangesInTxn(
 			case *sqlbase.DescriptorMutation_PrimaryKeySwap:
 				// Don't need to do anything here, as the call to MakeMutationComplete
 				// will perform the steps for this operation.
+			case *sqlbase.DescriptorMutation_ComputedColumnSwap:
+				return AlterColTypeInTxnNotSupportedErr
 			case *sqlbase.DescriptorMutation_Column:
 				if doneColumnBackfill || !sqlbase.ColumnNeedsBackfill(m.GetColumn()) {
 					break
@@ -1379,7 +1374,7 @@ func runSchemaChangesInTxn(
 					if selfReference {
 						referencedTableDesc = tableDesc
 					} else {
-						lookup, err := planner.Tables().getMutableTableVersionByID(ctx, fk.ReferencedTableID, planner.Txn())
+						lookup, err := planner.Tables().GetMutableTableVersionByID(ctx, fk.ReferencedTableID, planner.Txn())
 						if err != nil {
 							return errors.Errorf("error resolving referenced table ID %d: %v", fk.ReferencedTableID, err)
 						}
@@ -1486,7 +1481,7 @@ func runSchemaChangesInTxn(
 				}
 				if len(oldIndex.Interleave.Ancestors) != 0 {
 					ancestorInfo := oldIndex.Interleave.Ancestors[len(oldIndex.Interleave.Ancestors)-1]
-					ancestor, err := planner.Tables().getMutableTableVersionByID(ctx, ancestorInfo.TableID, planner.txn)
+					ancestor, err := planner.Tables().GetMutableTableVersionByID(ctx, ancestorInfo.TableID, planner.txn)
 					if err != nil {
 						return err
 					}
@@ -1522,7 +1517,7 @@ func runSchemaChangesInTxn(
 		switch c.ConstraintType {
 		case sqlbase.ConstraintToUpdate_CHECK, sqlbase.ConstraintToUpdate_NOT_NULL:
 			if err := validateCheckInTxn(
-				ctx, planner.Tables().leaseMgr, planner.EvalContext(), tableDesc, planner.txn, c.Check.Name,
+				ctx, planner.Tables().LeaseManager(), planner.EvalContext(), tableDesc, planner.txn, c.Check.Name,
 			); err != nil {
 				return err
 			}
@@ -1568,7 +1563,7 @@ func runSchemaChangesInTxn(
 // reuse an existing kv.Txn safely.
 func validateCheckInTxn(
 	ctx context.Context,
-	leaseMgr *LeaseManager,
+	leaseMgr *lease.Manager,
 	evalCtx *tree.EvalContext,
 	tableDesc *MutableTableDescriptor,
 	txn *kv.Txn,
@@ -1576,12 +1571,9 @@ func validateCheckInTxn(
 ) error {
 	ie := evalCtx.InternalExecutor.(*InternalExecutor)
 	if tableDesc.Version > tableDesc.ClusterVersion.Version {
-		newTc := &TableCollection{
-			leaseMgr: leaseMgr,
-			settings: evalCtx.Settings,
-		}
+		newTc := descs.NewCollection(leaseMgr, evalCtx.Settings)
 		// pretend that the schema has been modified.
-		if err := newTc.addUncommittedTable(*tableDesc); err != nil {
+		if err := newTc.AddUncommittedTable(*tableDesc); err != nil {
 			return err
 		}
 
@@ -1612,7 +1604,7 @@ func validateCheckInTxn(
 // reuse an existing kv.Txn safely.
 func validateFkInTxn(
 	ctx context.Context,
-	leaseMgr *LeaseManager,
+	leaseMgr *lease.Manager,
 	evalCtx *tree.EvalContext,
 	tableDesc *MutableTableDescriptor,
 	txn *kv.Txn,
@@ -1620,12 +1612,9 @@ func validateFkInTxn(
 ) error {
 	ie := evalCtx.InternalExecutor.(*InternalExecutor)
 	if tableDesc.Version > tableDesc.ClusterVersion.Version {
-		newTc := &TableCollection{
-			leaseMgr: leaseMgr,
-			settings: evalCtx.Settings,
-		}
+		newTc := descs.NewCollection(leaseMgr, evalCtx.Settings)
 		// pretend that the schema has been modified.
-		if err := newTc.addUncommittedTable(*tableDesc); err != nil {
+		if err := newTc.AddUncommittedTable(*tableDesc); err != nil {
 			return err
 		}
 
@@ -1658,7 +1647,7 @@ func validateFkInTxn(
 func columnBackfillInTxn(
 	ctx context.Context,
 	txn *kv.Txn,
-	tc *TableCollection,
+	tc *descs.Collection,
 	evalCtx *tree.EvalContext,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	traceKV bool,
@@ -1668,7 +1657,7 @@ func columnBackfillInTxn(
 		return nil
 	}
 	var backfiller backfill.ColumnBackfiller
-	if err := backfiller.Init(evalCtx, tableDesc); err != nil {
+	if err := backfiller.Init(ctx, evalCtx, tableDesc); err != nil {
 		return err
 	}
 	// otherTableDescs contains any other table descriptors required by the
@@ -1689,8 +1678,8 @@ func columnBackfillInTxn(
 	// All the FKs here are guaranteed to be created in the same transaction
 	// or else this table would be created in the ADD state.
 	for k := range fkTables {
-		t := tc.getUncommittedTableByID(k)
-		if (uncommittedTable{}) == t || !t.IsNewTable() {
+		t := tc.GetUncommittedTableByID(k)
+		if (descs.UncommittedTable{}) == t || !t.IsNewTable() {
 			return errors.AssertionFailedf(
 				"table %s not created in the same transaction as id = %d", tableDesc.Name, k)
 		}

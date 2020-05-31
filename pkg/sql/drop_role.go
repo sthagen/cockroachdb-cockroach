@@ -47,7 +47,7 @@ func (p *planner) DropRoleNode(
 		return nil, err
 	}
 
-	names, err := p.TypeAsStringArray(namesE, opName)
+	names, err := p.TypeAsStringArray(ctx, namesE, opName)
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +111,7 @@ func (n *DropRoleNode) startExec(params runParams) error {
 	// the predefined forEachTableAll() function because we need to look
 	// at all _visible_ descriptors, not just those on which the current
 	// user has permission.
-	descs, err := params.p.Tables().getAllDescriptors(params.ctx, params.p.txn)
+	descs, err := params.p.Tables().GetAllDescriptors(params.ctx, params.p.txn)
 	if err != nil {
 		return err
 	}

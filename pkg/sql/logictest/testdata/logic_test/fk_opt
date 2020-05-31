@@ -5,6 +5,9 @@
 statement ok
 SET optimizer_foreign_keys = true
 
+statement ok
+SET experimental_optimizer_foreign_key_cascades = true
+
 # Randomize the use of insert fast path.
 # The let statement will also log the value.
 let $enable_insert_fast_path
@@ -231,17 +234,6 @@ SELECT * FROM parent
 # row via an update, and is disallowed.
 statement error pq: insert on table "parent" violates foreign key constraint "fk_b_ref_parent" on table "child"\nDETAIL: Key \(b\)=\(2\) is still referenced from table "child"\.
 INSERT INTO parent VALUES (2, 2) ON CONFLICT (a) DO UPDATE SET b = parent.b - 1
-
-# This mutation *also* removes that row, but also via an update, introduces a
-# new one, making it acceptable.
-statement ok
-INSERT INTO parent VALUES (2, 2), (1, 3) ON CONFLICT (a) DO UPDATE SET b = parent.b - 1
-
-query II rowsort
-SELECT * FROM parent
-----
-1  2
-2  1
 
 statement ok
 DROP TABLE child
@@ -3137,7 +3129,7 @@ statement ok
 ALTER TABLE good_users ADD FOREIGN KEY (id2) REFERENCES users(id)
 
 # Updating should no longer work, since we have a restrict.
-statement error value \[2000\] not found in good_users@good_users_id2_key \[id2\]
+statement error update on table "users" violates foreign key constraint "fk_id2_ref_users" on table "good_users"\nDETAIL: Key \(id\)=\(20\) is still referenced from table "good_users"\.
 UPDATE users SET id = id * 100 WHERE id = 20
 
 # Insert some more stuff -- make sure it still behaves as expected.
@@ -3303,12 +3295,14 @@ ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE
 
 # 'ON DELETE SET DEFAULT', followed by 'ON DELETE CASCADE'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT;
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE
 
 statement ok
-insert into t1 values (123); insert into t2 values (123)
+INSERT INTO t1 VALUES (123);
+INSERT INTO t2 VALUES (123)
 
-statement error value \[1\] not found in t1@primary \[a\]
+statement error pq: update on table "t2" violates foreign key constraint "fk1"\nDETAIL: Key \(a\)=\(1\) is not present in table "t1"\.
 DELETE FROM t1 WHERE a = 123
 
 query I
@@ -3321,12 +3315,14 @@ ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE
 
 # 'ON DELETE SET DEFAULT', followed by 'ON DELETE SET NULL'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET NULL
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT;
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET NULL
 
 statement ok
-insert into t1 values (123); insert into t2 values (123)
+INSERT INTO t1 VALUES (123);
+INSERT INTO t2 VALUES (123)
 
-statement error value \[1\] not found in t1@primary \[a\]
+statement error pq: update on table "t2" violates foreign key constraint "fk1"\nDETAIL: Key \(a\)=\(1\) is not present in table "t1"\.
 DELETE FROM t1 WHERE a = 123
 
 query I
@@ -3480,7 +3476,7 @@ ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET DE
 statement ok
 insert into t1 values (123); insert into t2 values (123)
 
-statement error value \[1\] not found in t1@primary \[a\]
+statement error pq: update on table "t2" violates foreign key constraint "fk1"\nDETAIL: Key \(a\)=\(1\) is not present in table "t1"\.
 UPDATE t1 SET a = 2 WHERE a = 123
 
 query I
@@ -3498,7 +3494,7 @@ ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET DE
 statement ok
 insert into t1 values (123); insert into t2 values (123)
 
-statement error value \[1\] not found in t1@primary \[a\]
+statement error update on table "t2" violates foreign key constraint "fk1"\nDETAIL: Key \(a\)=\(1\) is not present in table "t1"\.
 UPDATE t1 SET a = 2 WHERE a = 123
 
 query I

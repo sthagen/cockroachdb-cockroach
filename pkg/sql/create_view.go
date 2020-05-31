@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -60,7 +61,7 @@ func (n *createViewNode) startExec(params runParams) error {
 	// If so, promote this view to temporary.
 	backRefMutables := make(map[sqlbase.ID]*sqlbase.MutableTableDescriptor, len(n.planDeps))
 	for id, updated := range n.planDeps {
-		backRefMutable := params.p.Tables().getUncommittedTableByID(id).MutableTableDescriptor
+		backRefMutable := params.p.Tables().GetUncommittedTableByID(id).MutableTableDescriptor
 		if backRefMutable == nil {
 			backRefMutable = sqlbase.NewMutableExistingTableDescriptor(*updated.desc.TableDesc())
 		}
@@ -87,11 +88,11 @@ func (n *createViewNode) startExec(params runParams) error {
 		case n.replace:
 			// If we are replacing an existing view see if what we are
 			// replacing is actually a view.
-			id, err := getDescriptorID(params.ctx, params.p.txn, params.ExecCfg().Codec, tKey)
+			id, err := catalogkv.GetDescriptorID(params.ctx, params.p.txn, params.ExecCfg().Codec, tKey)
 			if err != nil {
 				return err
 			}
-			desc, err := params.p.Tables().getMutableTableVersionByID(params.ctx, id, params.p.txn)
+			desc, err := params.p.Tables().GetMutableTableVersionByID(params.ctx, id, params.p.txn)
 			if err != nil {
 				return err
 			}
@@ -128,11 +129,12 @@ func (n *createViewNode) startExec(params runParams) error {
 		}
 	} else {
 		// If we aren't replacing anything, make a new table descriptor.
-		id, err := GenerateUniqueDescID(params.ctx, params.extendedEvalCtx.ExecCfg.DB)
+		id, err := catalogkv.GenerateUniqueDescID(params.ctx, params.p.ExecCfg().DB, params.p.ExecCfg().Codec)
 		if err != nil {
 			return err
 		}
 		desc, err := makeViewTableDesc(
+			params.ctx,
 			viewName,
 			n.viewQuery,
 			n.dbDesc.ID,
@@ -232,6 +234,7 @@ func (n *createViewNode) Close(ctx context.Context)  {}
 // doesn't matter if reads/writes use a cached descriptor that doesn't
 // include the back-references.
 func makeViewTableDesc(
+	ctx context.Context,
 	viewName string,
 	viewQuery string,
 	parentID sqlbase.ID,
@@ -254,7 +257,7 @@ func makeViewTableDesc(
 		temporary,
 	)
 	desc.ViewQuery = viewQuery
-	if err := addResultColumns(semaCtx, evalCtx, &desc, resultColumns); err != nil {
+	if err := addResultColumns(ctx, semaCtx, evalCtx, &desc, resultColumns); err != nil {
 		return sqlbase.MutableTableDescriptor{}, err
 	}
 	return desc, nil
@@ -276,7 +279,7 @@ func (p *planner) replaceViewDesc(
 	// Reset the columns to add the new result columns onto.
 	toReplace.Columns = make([]sqlbase.ColumnDescriptor, 0, len(n.columns))
 	toReplace.NextColumnID = 0
-	if err := addResultColumns(&p.semaCtx, p.EvalContext(), toReplace, n.columns); err != nil {
+	if err := addResultColumns(ctx, &p.semaCtx, p.EvalContext(), toReplace, n.columns); err != nil {
 		return nil, err
 	}
 
@@ -294,7 +297,7 @@ func (p *planner) replaceViewDesc(
 		desc, ok := backRefMutables[id]
 		if !ok {
 			var err error
-			desc, err = p.Tables().getMutableTableVersionByID(ctx, id, p.txn)
+			desc, err = p.Tables().GetMutableTableVersionByID(ctx, id, p.txn)
 			if err != nil {
 				return nil, err
 			}
@@ -336,6 +339,7 @@ func (p *planner) replaceViewDesc(
 // addResultColumns adds the resultColumns as actual column
 // descriptors onto desc.
 func addResultColumns(
+	ctx context.Context,
 	semaCtx *tree.SemaContext,
 	evalCtx *tree.EvalContext,
 	desc *sqlbase.MutableTableDescriptor,
@@ -345,7 +349,7 @@ func addResultColumns(
 		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colRes.Typ}
 		// The new types in the CREATE VIEW column specs never use
 		// SERIAL so we need not process SERIAL types here.
-		col, _, _, err := sqlbase.MakeColumnDefDescs(&columnTableDef, semaCtx, evalCtx)
+		col, _, _, err := sqlbase.MakeColumnDefDescs(ctx, &columnTableDef, semaCtx, evalCtx)
 		if err != nil {
 			return err
 		}

@@ -270,6 +270,9 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 		return RandArray(rng, typ, 0)
 	case types.AnyFamily:
 		return RandDatumWithNullChance(rng, RandType(rng), nullChance)
+	case types.EnumFamily:
+		// We don't yet have the ability to generate random user defined types.
+		return tree.DNull
 	default:
 		panic(fmt.Sprintf("invalid type %v", typ.DebugString()))
 	}
@@ -508,13 +511,12 @@ var (
 		},
 		types.TimeFamily: {
 			tree.MakeDTime(timeofday.Min),
-			// Uncomment this once #44548 has been resolved.
-			// tree.MakeDTime(timeofday.Max),
+			tree.MakeDTime(timeofday.Max),
+			tree.MakeDTime(timeofday.Time2400),
 		},
 		types.TimeTZFamily: {
 			tree.DMinTimeTZ,
-			// Uncomment this once #44548 has been resolved.
-			// tree.DMaxTimeTZ,
+			tree.DMaxTimeTZ,
 		},
 		types.TimestampFamily: func() []tree.Datum {
 			res := make([]tree.Datum, len(randTimestampSpecials))

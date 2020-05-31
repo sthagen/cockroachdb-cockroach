@@ -19,7 +19,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -188,11 +187,14 @@ func populateExplain(
 ) error {
 	// Determine the "distributed" and "vectorized" values, which we will emit as
 	// special rows.
-	var isDistSQL, isVec bool
+	var willDistribute, willVectorize bool
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
-	isDistSQL, _ = willDistributePlan(distSQLPlanner, plan.main, params)
+	willDistribute = willDistributePlanForExplainPurposes(
+		params.ctx, params.extendedEvalCtx.ExecCfg.NodeID,
+		params.extendedEvalCtx.SessionData.DistSQLMode, plan.main,
+	)
 	outerSubqueries := params.p.curPlan.subqueryPlans
-	planCtx := makeExplainVecPlanningCtx(distSQLPlanner, params, stmtType, plan.subqueryPlans, isDistSQL)
+	planCtx := makeExplainPlanningCtx(distSQLPlanner, params, stmtType, plan.subqueryPlans, willDistribute)
 	defer func() {
 		planCtx.planner.curPlan.subqueryPlans = outerSubqueries
 	}()
@@ -201,31 +203,29 @@ func populateExplain(
 		// There might be an issue making the physical plan, but that should not
 		// cause an error or panic, so swallow the error. See #40677 for example.
 		distSQLPlanner.FinalizePlan(planCtx, &physicalPlan)
-		nodeID, err := params.extendedEvalCtx.NodeID.OptionalNodeIDErr(distsql.MultiTenancyIssueNo)
-		if err != nil {
-			return err
-		}
-		flows := physicalPlan.GenerateFlowSpecs(nodeID)
+		// TODO(asubiotto): This cast from SQLInstanceID to NodeID is temporary:
+		//  https://github.com/cockroachdb/cockroach/issues/49596
+		flows := physicalPlan.GenerateFlowSpecs(roachpb.NodeID(params.extendedEvalCtx.NodeID.SQLInstanceID()))
 		flowCtx := makeFlowCtx(planCtx, physicalPlan, params)
 		flowCtx.Cfg.ClusterID = &distSQLPlanner.rpcCtx.ClusterID
 
 		ctxSessionData := flowCtx.EvalCtx.SessionData
 		vectorizedThresholdMet := physicalPlan.MaxEstimatedRowCount >= ctxSessionData.VectorizeRowCountThreshold
-		isVec = true
+		willVectorize = true
 		if ctxSessionData.VectorizeMode == sessiondata.VectorizeOff {
-			isVec = false
+			willVectorize = false
 		} else if !vectorizedThresholdMet && (ctxSessionData.VectorizeMode == sessiondata.Vectorize201Auto || ctxSessionData.VectorizeMode == sessiondata.VectorizeOn) {
-			isVec = false
+			willVectorize = false
 		} else {
 			thisNodeID := distSQLPlanner.nodeDesc.NodeID
 			for nodeID, flow := range flows {
 				fuseOpt := flowinfra.FuseNormally
-				if nodeID == thisNodeID && !isDistSQL {
+				if nodeID == thisNodeID && !willDistribute {
 					fuseOpt = flowinfra.FuseAggressively
 				}
 				_, err := colflow.SupportsVectorized(params.ctx, flowCtx, flow.Processors, fuseOpt, nil /* output */)
-				isVec = isVec && (err == nil)
-				if !isVec {
+				willVectorize = willVectorize && (err == nil)
+				if !willVectorize {
 					break
 				}
 			}
@@ -258,10 +258,10 @@ func populateExplain(
 	}
 
 	// First, emit the "distributed" and "vectorized" information rows.
-	if err := emitRow("", 0, "", "distributed", fmt.Sprintf("%t", isDistSQL), "", ""); err != nil {
+	if err := emitRow("", 0, "", "distributed", fmt.Sprintf("%t", willDistribute), "", ""); err != nil {
 		return err
 	}
-	if err := emitRow("", 0, "", "vectorized", fmt.Sprintf("%t", isVec), "", ""); err != nil {
+	if err := emitRow("", 0, "", "vectorized", fmt.Sprintf("%t", willVectorize), "", ""); err != nil {
 		return err
 	}
 

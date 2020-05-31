@@ -60,7 +60,10 @@ func (f *stubFactory) ConstructSimpleProject(
 }
 
 func (f *stubFactory) ConstructRender(
-	n exec.Node, exprs tree.TypedExprs, colNames []string, reqOrdering exec.OutputOrdering,
+	n exec.Node,
+	columns sqlbase.ResultColumns,
+	exprs tree.TypedExprs,
+	reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -305,6 +308,7 @@ func (f *stubFactory) ConstructDeleteRange(
 	table cat.Table,
 	needed exec.TableColumnOrdinalSet,
 	indexConstraint *constraint.Constraint,
+	interleavedTables []cat.Table,
 	maxReturnedKeys int,
 	allowAutoCommit bool,
 ) (exec.Node, error) {

@@ -13,7 +13,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -28,17 +28,22 @@ import (
 // column families of one row) into a row.
 type rowFetcherCache struct {
 	codec    keys.SQLCodec
-	leaseMgr *sql.LeaseManager
-	fetchers map[*sqlbase.ImmutableTableDescriptor]*row.Fetcher
+	leaseMgr *lease.Manager
+	fetchers map[idVersion]*row.Fetcher
 
 	a sqlbase.DatumAlloc
 }
 
-func newRowFetcherCache(codec keys.SQLCodec, leaseMgr *sql.LeaseManager) *rowFetcherCache {
+type idVersion struct {
+	id      sqlbase.ID
+	version sqlbase.DescriptorVersion
+}
+
+func newRowFetcherCache(codec keys.SQLCodec, leaseMgr *lease.Manager) *rowFetcherCache {
 	return &rowFetcherCache{
 		codec:    codec,
 		leaseMgr: leaseMgr,
-		fetchers: make(map[*sqlbase.ImmutableTableDescriptor]*row.Fetcher),
+		fetchers: make(map[idVersion]*row.Fetcher),
 	}
 }
 
@@ -59,7 +64,7 @@ func (c *rowFetcherCache) TableDescForKey(
 		// own caching.
 		tableDesc, _, err = c.leaseMgr.Acquire(ctx, ts, tableID)
 		if err != nil {
-			// LeaseManager can return all kinds of errors during chaos, but based on
+			// Manager can return all kinds of errors during chaos, but based on
 			// its usage, none of them should ever be terminal.
 			return nil, MarkRetryableError(err)
 		}
@@ -91,10 +96,10 @@ func (c *rowFetcherCache) TableDescForKey(
 func (c *rowFetcherCache) RowFetcherForTableDesc(
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 ) (*row.Fetcher, error) {
-	if rf, ok := c.fetchers[tableDesc]; ok {
+	idVer := idVersion{id: tableDesc.ID, version: tableDesc.Version}
+	if rf, ok := c.fetchers[idVer]; ok {
 		return rf, nil
 	}
-
 	// TODO(dan): Allow for decoding a subset of the columns.
 	colIdxMap := make(map[sqlbase.ColumnID]int)
 	var valNeededForCol util.FastIntSet
@@ -126,6 +131,6 @@ func (c *rowFetcherCache) RowFetcherForTableDesc(
 	// TODO(dan): Bound the size of the cache. Resolved notifications will let
 	// us evict anything for timestamps entirely before the notification. Then
 	// probably an LRU just in case?
-	c.fetchers[tableDesc] = &rf
+	c.fetchers[idVer] = &rf
 	return &rf, nil
 }

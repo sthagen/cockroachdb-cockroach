@@ -527,7 +527,7 @@ func (c *CustomFuncs) findConstantFilterCols(
 			// different forms of the same value.
 			colID := cons.Columns.Get(0).ID()
 			colTyp := tab.Column(tabID.ColumnOrdinal(colID)).DatumType()
-			if sqlbase.DatumTypeHasCompositeKeyEncoding(colTyp) {
+			if sqlbase.HasCompositeKeyEncoding(colTyp) {
 				continue
 			}
 
@@ -1318,9 +1318,6 @@ func (c *CustomFuncs) GenerateLookupJoins(
 		return
 	}
 	md := c.e.mem.Metadata()
-	if md.Table(scanPrivate.Table).IsVirtualTable() {
-		return
-	}
 	inputProps := input.Relational()
 
 	leftEq, rightEq := memo.ExtractJoinEqualityColumns(inputProps.OutputCols, scanPrivate.Cols, on)
@@ -1388,11 +1385,13 @@ func (c *CustomFuncs) GenerateLookupJoins(
 				constFilters = make(memo.FiltersExpr, 0, numIndexKeyCols-j)
 			}
 
+			idxColType := c.e.f.Metadata().ColumnMeta(idxCol).Type
 			constColID := c.e.f.Metadata().AddColumn(
 				fmt.Sprintf("project_const_col_@%d", idxCol),
-				foundVal.ResolvedType())
+				idxColType,
+			)
 			projections = append(projections, c.e.f.ConstructProjectionsItem(
-				c.e.f.ConstructConst(foundVal),
+				c.e.f.ConstructConst(foundVal, idxColType),
 				constColID,
 			))
 
@@ -1637,20 +1636,27 @@ func (c *CustomFuncs) GenerateGeoLookupJoins(
 // TODO(rytaft): add ST_DFullyWithin (geoindex.Covers) and ST_DWithin
 //  (geoindex.Intersects) once we add support for extending a geometry.
 var geoRelationshipMap = map[string]geoindex.RelationshipType{
-	"st_covers":     geoindex.Covers,
-	"st_coveredby":  geoindex.CoveredBy,
-	"st_contains":   geoindex.Covers,
-	"st_crosses":    geoindex.Intersects,
-	"st_equals":     geoindex.Intersects,
-	"st_intersects": geoindex.Intersects,
-	"st_overlaps":   geoindex.Intersects,
-	"st_touches":    geoindex.Intersects,
-	"st_within":     geoindex.CoveredBy,
+	"st_covers":           geoindex.Covers,
+	"st_coveredby":        geoindex.CoveredBy,
+	"st_contains":         geoindex.Covers,
+	"st_containsproperly": geoindex.Covers,
+	"st_crosses":          geoindex.Intersects,
+	"st_equals":           geoindex.Intersects,
+	"st_intersects":       geoindex.Intersects,
+	"st_overlaps":         geoindex.Intersects,
+	"st_touches":          geoindex.Intersects,
+	"st_within":           geoindex.CoveredBy,
 }
 
 // IsGeoIndexFunction returns true if the given function is a geospatial
 // function that can be index-accelerated.
 func (c *CustomFuncs) IsGeoIndexFunction(fn opt.ScalarExpr) bool {
+	return IsGeoIndexFunction(fn)
+}
+
+// IsGeoIndexFunction returns true if the given function is a geospatial
+// function that can be index-accelerated.
+func IsGeoIndexFunction(fn opt.ScalarExpr) bool {
 	function := fn.(*memo.FunctionExpr)
 	_, ok := geoRelationshipMap[function.Name]
 	return ok
@@ -2388,6 +2394,14 @@ func (c *CustomFuncs) GenerateStreamingGroupBy(
 				GroupingPrivate: newPrivate,
 			}
 			c.e.mem.AddUpsertDistinctOnToGroup(&newExpr, grp)
+
+		case opt.EnsureUpsertDistinctOnOp:
+			newExpr := memo.EnsureUpsertDistinctOnExpr{
+				Input:           input,
+				Aggregations:    aggs,
+				GroupingPrivate: newPrivate,
+			}
+			c.e.mem.AddEnsureUpsertDistinctOnToGroup(&newExpr, grp)
 		}
 	}
 }
@@ -2693,10 +2707,10 @@ func (c *CustomFuncs) MapScanFilterCols(
 	}
 
 	// Map the columns of each filter in the FiltersExpr.
-	newFilters := make([]memo.FiltersItem, 0, len(filters))
+	newFilters := make([]memo.FiltersItem, len(filters))
 	for i := range filters {
 		expr := c.MapFiltersItemCols(&filters[i], colMap)
-		newFilters = append(newFilters, c.e.f.ConstructFiltersItem(expr))
+		newFilters[i] = c.e.f.ConstructFiltersItem(expr)
 	}
 
 	return newFilters

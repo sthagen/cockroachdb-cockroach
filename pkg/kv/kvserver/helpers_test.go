@@ -29,8 +29,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -105,7 +105,7 @@ func (s *Store) LogReplicaChangeTest(
 	changeType roachpb.ReplicaChangeType,
 	replica roachpb.ReplicaDescriptor,
 	desc roachpb.RangeDescriptor,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 ) error {
 	return s.logChange(ctx, txn, changeType, replica, desc, reason, details)
@@ -165,7 +165,7 @@ func manualQueue(s *Store, q queueImpl, repl *Replica) error {
 	if cfg == nil {
 		return fmt.Errorf("%s: system config not yet available", s)
 	}
-	ctx := repl.AnnotateCtx(context.TODO())
+	ctx := repl.AnnotateCtx(context.Background())
 	return q.process(ctx, repl, cfg)
 }
 
@@ -182,7 +182,7 @@ func (s *Store) ManualReplicaGC(repl *Replica) error {
 
 // ManualRaftSnapshot will manually send a raft snapshot to the target replica.
 func (s *Store) ManualRaftSnapshot(repl *Replica, target roachpb.ReplicaID) error {
-	return s.raftSnapshotQueue.processRaftSnapshot(context.TODO(), repl, target)
+	return s.raftSnapshotQueue.processRaftSnapshot(context.Background(), repl, target)
 }
 
 func (s *Store) ReservationCount() int {
@@ -193,6 +193,12 @@ func (s *Store) ReservationCount() int {
 // knowledge about closed timestamps.
 func (s *Store) ClearClosedTimestampStorage() {
 	s.cfg.ClosedTimestamp.Storage.Clear()
+}
+
+// RequestClosedTimestamp instructs the closed timestamp client to request the
+// relevant node to publish its MLAI for the provided range.
+func (s *Store) RequestClosedTimestamp(nodeID roachpb.NodeID, rangeID roachpb.RangeID) {
+	s.cfg.ClosedTimestamp.Clients.Request(nodeID, rangeID)
 }
 
 // AssertInvariants verifies that the store's bookkeping is self-consistent. It
@@ -232,8 +238,8 @@ func NewTestStorePool(cfg StoreConfig) *StorePool {
 		func() int {
 			return 1
 		},
-		func(roachpb.NodeID, time.Time, time.Duration) storagepb.NodeLivenessStatus {
-			return storagepb.NodeLivenessStatus_LIVE
+		func(roachpb.NodeID, time.Time, time.Duration) kvserverpb.NodeLivenessStatus {
+			return kvserverpb.NodeLivenessStatus_LIVE
 		},
 		/* deterministic */ false,
 	)
@@ -267,6 +273,11 @@ func (r *Replica) LastAssignedLeaseIndex() uint64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.mu.proposalBuf.LastAssignedLeaseIndexRLocked()
+}
+
+// MaxClosed returns the maximum closed timestamp known to the Replica.
+func (r *Replica) MaxClosed(ctx context.Context) (_ hlc.Timestamp, ok bool) {
+	return r.maxClosed(ctx)
 }
 
 // SetQuotaPool allows the caller to set a replica's quota pool initialized to
@@ -364,8 +375,8 @@ func (r *Replica) IsRaftGroupInitialized() bool {
 
 // GetStoreList exposes getStoreList for testing only, but with a hardcoded
 // storeFilter of storeFilterNone.
-func (sp *StorePool) GetStoreList(rangeID roachpb.RangeID) (StoreList, int, int) {
-	list, available, throttled := sp.getStoreList(rangeID, storeFilterNone)
+func (sp *StorePool) GetStoreList() (StoreList, int, int) {
+	list, available, throttled := sp.getStoreList(storeFilterNone)
 	return list, available, len(throttled)
 }
 
@@ -444,8 +455,8 @@ func SetMockAddSSTable() (undo func()) {
 		args := cArgs.Args.(*roachpb.AddSSTableRequest)
 
 		return result.Result{
-			Replicated: storagepb.ReplicatedEvalResult{
-				AddSSTable: &storagepb.ReplicatedEvalResult_AddSSTable{
+			Replicated: kvserverpb.ReplicatedEvalResult{
+				AddSSTable: &kvserverpb.ReplicatedEvalResult_AddSSTable{
 					Data:  args.Data,
 					CRC32: util.CRC32(args.Data),
 				},
@@ -489,13 +500,13 @@ func (r *Replica) ReadProtectedTimestamps(ctx context.Context) {
 }
 
 func (nl *NodeLiveness) SetDrainingInternal(
-	ctx context.Context, liveness storagepb.Liveness, drain bool,
+	ctx context.Context, liveness kvserverpb.Liveness, drain bool,
 ) error {
 	return nl.setDrainingInternal(ctx, liveness, drain, nil /* reporter */)
 }
 
 func (nl *NodeLiveness) SetDecommissioningInternal(
-	ctx context.Context, nodeID roachpb.NodeID, liveness storagepb.Liveness, decommission bool,
+	ctx context.Context, nodeID roachpb.NodeID, liveness kvserverpb.Liveness, decommission bool,
 ) (changeCommitted bool, err error) {
 	return nl.setDecommissioningInternal(ctx, nodeID, liveness, decommission)
 }

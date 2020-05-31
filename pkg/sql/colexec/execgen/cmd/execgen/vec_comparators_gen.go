@@ -26,15 +26,16 @@ func genVecComparators(wr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	s := string(d)
+	r := strings.NewReplacer(
+		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"_GOTYPESLICE", "{{.GoTypeSliceName}}",
+		"_TYPE", "{{.VecMethod}}",
+	)
+	s := r.Replace(string(d))
 
-	s = strings.ReplaceAll(s, "_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}")
-	s = strings.ReplaceAll(s, "_TYPE_WIDTH", "{{.Width}}{{if eq .Width -1}}: default{{end}}")
-	s = strings.ReplaceAll(s, "_GOTYPESLICE", "{{.GoTypeSliceName}}")
-	s = strings.ReplaceAll(s, "_TYPE", "{{.VecMethod}}")
-
-	compareRe := makeFunctionRegex("_COMPARE", 3)
-	s = compareRe.ReplaceAllString(s, makeTemplateFunctionCall("Compare", 3))
+	compareRe := makeFunctionRegex("_COMPARE", 5)
+	s = compareRe.ReplaceAllString(s, makeTemplateFunctionCall("Compare", 5))
 
 	s = replaceManipulationFuncs(s)
 

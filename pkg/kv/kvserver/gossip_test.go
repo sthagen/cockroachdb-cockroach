@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -36,7 +37,7 @@ func TestGossipFirstRange(t *testing.T) {
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	errors := make(chan error, 1)
 	descs := make(chan *roachpb.RangeDescriptor)
@@ -77,7 +78,7 @@ func TestGossipFirstRange(t *testing.T) {
 				if reflect.DeepEqual(&desc, gossiped) {
 					return
 				}
-				log.Infof(context.TODO(), "expected\n%+v\nbut found\n%+v", desc, gossiped)
+				log.Infof(context.Background(), "expected\n%+v\nbut found\n%+v", desc, gossiped)
 			}
 		}
 	}
@@ -164,7 +165,7 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 		base.TestClusterArgs{
 			ServerArgs: serverArgs,
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	// Take down the first node and replace it with a new one.
 	oldNodeIdx := 0
@@ -211,10 +212,12 @@ func TestGossipAfterAbortOfSystemConfigTransactionAfterFailureDueToIntents(t *te
 	txB := db.NewTxn(ctx, "b")
 
 	require.NoError(t, txA.SetSystemConfigTrigger())
-	require.NoError(t, txA.Put(ctx, keys.SystemSQLCodec.DescMetadataKey(1000), "foo"))
+	require.NoError(t, txA.Put(
+		ctx, keys.SystemSQLCodec.DescMetadataKey(1000), sqlbase.WrapDescriptor(&sqlbase.DatabaseDescriptor{})))
 
 	require.NoError(t, txB.SetSystemConfigTrigger())
-	require.NoError(t, txB.Put(ctx, keys.SystemSQLCodec.DescMetadataKey(2000), "bar"))
+	require.NoError(t, txB.Put(
+		ctx, keys.SystemSQLCodec.DescMetadataKey(2000), sqlbase.WrapDescriptor(&sqlbase.DatabaseDescriptor{})))
 
 	const someTime = 10 * time.Millisecond
 	clearNotifictions := func(ch <-chan struct{}) {

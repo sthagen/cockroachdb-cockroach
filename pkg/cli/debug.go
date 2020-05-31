@@ -34,9 +34,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -139,7 +139,7 @@ func OpenEngine(dir string, stopper *stop.Stopper, opts OpenEngineOptions) (stor
 	}
 
 	var db storage.Engine
-	storageEngine := resolveStorageEngineType(storage.DefaultStorageEngine, storageConfig.Dir)
+	storageEngine := resolveStorageEngineType(context.Background(), storage.DefaultStorageEngine, storageConfig)
 
 	switch storageEngine {
 	case enginepb.EngineTypePebble:
@@ -806,7 +806,7 @@ func parseGossipValues(gossipInfo *gossip.InfoStatus) (string, error) {
 			}
 			output = append(output, fmt.Sprintf("%q: %+v", key, desc))
 		} else if strings.HasPrefix(key, gossip.KeyNodeLivenessPrefix) {
-			var liveness storagepb.Liveness
+			var liveness kvserverpb.Liveness
 			if err := protoutil.Unmarshal(bytes, &liveness); err != nil {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
@@ -1267,12 +1267,11 @@ func init() {
 		return mvccValueFormatter{kv: storage.MVCCKeyValue{Key: decoded, Value: value}}
 	}
 
-	pebbleTool := tool.New()
 	// To be able to read Cockroach-written RocksDB manifests/SSTables, comparator
 	// and merger functions must be specified to pebble that match the ones used
 	// to write those files.
-	pebbleTool.RegisterMerger(storage.MVCCMerger)
-	pebbleTool.RegisterComparer(storage.MVCCComparer)
+	pebbleTool := tool.New(tool.Mergers(storage.MVCCMerger),
+		tool.DefaultComparer(storage.MVCCComparer))
 	debugPebbleCmd.AddCommand(pebbleTool.Commands...)
 	DebugCmd.AddCommand(debugPebbleCmd)
 

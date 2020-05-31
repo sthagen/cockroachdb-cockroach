@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -35,7 +35,7 @@ func TestAsOfTime(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { select {} }}
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	const val1 = 1
 	const val2 = 2
@@ -251,7 +251,7 @@ func TestAsOfRetry(t *testing.T) {
 
 	params, cmdFilters := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	const val1 = 1
 	const val2 = 2
@@ -292,7 +292,7 @@ func TestAsOfRetry(t *testing.T) {
 		name: 5,
 	}
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			magicVals.Lock()
 			defer magicVals.Unlock()
 
@@ -348,7 +348,7 @@ func TestShowTraceAsOfTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	const val1 = 456
 	const val2 = 789

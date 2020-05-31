@@ -12,6 +12,7 @@ package colexec
 
 import (
 	"context"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
@@ -19,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -161,12 +163,20 @@ type hashAggregator struct {
 	// hashBuffer stores hash values for each tuple in the buffered batch.
 	hashBuffer []uint64
 
-	alloc          hashAggFuncsAlloc
+	aggFnsAlloc    *aggregateFuncsAlloc
+	hashAlloc      hashAggFuncsAlloc
 	cancelChecker  CancelChecker
-	decimalScratch decimalOverloadScratch
+	overloadHelper overloadHelper
+	datumAlloc     sqlbase.DatumAlloc
 }
 
 var _ colexecbase.Operator = &hashAggregator{}
+
+// hashAggregatorAllocSize determines the allocation size used by the hash
+// aggregator's allocators. This number was chosen after running benchmarks of
+// 'sum' aggregation on ints and decimals with varying group sizes (powers of 2
+// from 1 to 4096).
+const hashAggregatorAllocSize = 64
 
 // NewHashAggregator creates a hash aggregator on the given grouping columns.
 // The input specifications to this function are the same as that of the
@@ -192,6 +202,8 @@ func NewHashAggregator(
 		groupTypes[i] = typs[colIdx]
 	}
 
+	aggFnsAlloc, err := newAggregateFuncsAlloc(allocator, aggTyps, aggFns, hashAggregatorAllocSize)
+
 	return &hashAggregator{
 		OneInputNode: NewOneInputNode(input),
 		allocator:    allocator,
@@ -208,6 +220,9 @@ func NewHashAggregator(
 		groupCols:                  groupCols,
 		groupTypes:                 groupTypes,
 		groupCanonicalTypeFamilies: typeconv.ToCanonicalTypeFamilies(groupTypes),
+
+		aggFnsAlloc: aggFnsAlloc,
+		hashAlloc:   hashAggFuncsAlloc{allocator: allocator},
 	}, err
 }
 
@@ -249,11 +264,9 @@ func (op *hashAggregator) Next(ctx context.Context) coldata.Batch {
 				remainingAggFuncs := op.aggFuncMap[op.output.resumeHashCode][op.output.resumeIdx:]
 				for groupIdx, aggFunc := range remainingAggFuncs {
 					if curOutputIdx < coldata.BatchSize() {
-						for fnIdx, fn := range aggFunc.fns {
+						for _, fn := range aggFunc.fns {
 							fn.SetOutputIndex(curOutputIdx)
-							// Passing a zero batch into an aggregation function causing it to
-							// flush the agg result to the output batch at curOutputIdx.
-							fn.Compute(coldata.ZeroBatch, op.aggCols[fnIdx])
+							fn.Flush()
 						}
 					} else {
 						op.output.resumeIdx = op.output.resumeIdx + groupIdx
@@ -271,9 +284,9 @@ func (op *hashAggregator) Next(ctx context.Context) coldata.Batch {
 			for aggHashCode, aggFuncs := range op.aggFuncMap {
 				for groupIdx, aggFunc := range aggFuncs {
 					if curOutputIdx < coldata.BatchSize() {
-						for fnIdx, fn := range aggFunc.fns {
+						for _, fn := range aggFunc.fns {
 							fn.SetOutputIndex(curOutputIdx)
-							fn.Compute(coldata.ZeroBatch, op.aggCols[fnIdx])
+							fn.Flush()
 						}
 					} else {
 						// If current batch is filled, we record where we left off
@@ -316,7 +329,8 @@ func (op *hashAggregator) buildSelectionForEachHashCode(ctx context.Context, b c
 			nKeys,
 			b.Selection(),
 			op.cancelChecker,
-			op.decimalScratch,
+			op.overloadHelper,
+			&op.datumAlloc,
 		)
 	}
 
@@ -355,10 +369,8 @@ func (op *hashAggregator) onlineAgg(b coldata.Batch) {
 				}
 			}
 		} else {
-			// No aggregate functions exist for this hashCode, create one. Since we
-			// don't expect a lot of hash collisions we only allocate small amount of
-			// memory here.
-			op.aggFuncMap[hashCode] = make([]*hashAggFuncs, 0, 1)
+			// No aggregate functions exist for this hashCode, create one.
+			op.aggFuncMap[hashCode] = op.hashAlloc.newHashAggFuncsSlice()
 		}
 
 		// Stage 2: Build aggregate function that doesn't exist, then perform
@@ -369,7 +381,7 @@ func (op *hashAggregator) onlineAgg(b coldata.Batch) {
 
 			// Build new agg functions.
 			keyIdx := op.keyMapping.Length()
-			aggFunc := op.alloc.newHashAggFuncs()
+			aggFunc := op.hashAlloc.newHashAggFuncs()
 			aggFunc.keyIdx = keyIdx
 
 			// Store the key of the current aggregating group into keyMapping.
@@ -388,7 +400,7 @@ func (op *hashAggregator) onlineAgg(b coldata.Batch) {
 				op.keyMapping.SetLength(keyIdx + 1)
 			})
 
-			aggFunc.fns, _ = makeAggregateFuncs(op.allocator, op.aggTypes, op.aggFuncs)
+			aggFunc.fns = op.aggFnsAlloc.makeAggregateFuncs()
 			op.aggFuncMap[hashCode] = append(op.aggFuncMap[hashCode], aggFunc)
 
 			// Select rest of the tuples that matches the current key. We don't need
@@ -442,6 +454,14 @@ type hashAggFuncs struct {
 	fns []aggregateFunc
 }
 
+const (
+	sizeOfHashAggFuncs    = unsafe.Sizeof(hashAggFuncs{})
+	sizeOfHashAggFuncsPtr = unsafe.Sizeof(&hashAggFuncs{})
+)
+
+// TODO(yuzefovich): we need to account for memory used by this map. It is
+// likely that we will replace Golang's map with our vectorized hash table, so
+// we might hold off with fixing the accounting until then.
 type hashAggFuncMap map[uint64][]*hashAggFuncs
 
 func (v *hashAggFuncs) init(group []bool, b coldata.Batch) {
@@ -456,23 +476,32 @@ func (v *hashAggFuncs) compute(b coldata.Batch, aggCols [][]uint32) {
 	}
 }
 
-// hashAggFuncsAllocSize determines the allocation size used by
-// hashAggFuncsAlloc. This number was chosen after running benchmarks of 'sum'
-// aggregation on ints and decimals with varying group sizes (powers of 2 from
-// 1 to 4096).
-const hashAggFuncsAllocSize = 64
-
 // hashAggFuncsAlloc is a utility struct that batches allocations of
-// hashAggFuncs.
+// hashAggFuncs and slices of pointers to hashAggFuncs.
 type hashAggFuncsAlloc struct {
-	buf []hashAggFuncs
+	allocator *colmem.Allocator
+	buf       []hashAggFuncs
+	ptrBuf    []*hashAggFuncs
 }
 
 func (a *hashAggFuncsAlloc) newHashAggFuncs() *hashAggFuncs {
 	if len(a.buf) == 0 {
-		a.buf = make([]hashAggFuncs, hashAggFuncsAllocSize)
+		a.allocator.AdjustMemoryUsage(int64(hashAggregatorAllocSize * sizeOfHashAggFuncs))
+		a.buf = make([]hashAggFuncs, hashAggregatorAllocSize)
 	}
 	ret := &a.buf[0]
 	a.buf = a.buf[1:]
+	return ret
+}
+
+func (a *hashAggFuncsAlloc) newHashAggFuncsSlice() []*hashAggFuncs {
+	if len(a.ptrBuf) == 0 {
+		a.allocator.AdjustMemoryUsage(int64(hashAggregatorAllocSize * sizeOfHashAggFuncsPtr))
+		a.ptrBuf = make([]*hashAggFuncs, hashAggregatorAllocSize)
+	}
+	// Since we don't expect a lot of hash collisions we only give out small
+	// amount of memory here.
+	ret := a.ptrBuf[0:0:1]
+	a.ptrBuf = a.ptrBuf[1:]
 	return ret
 }

@@ -17,8 +17,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -283,7 +283,7 @@ type RangeStateListener interface {
 // the concurrency manager. It is one of the roles of Manager.
 type MetricExporter interface {
 	// LatchMetrics returns information about the state of the latchManager.
-	LatchMetrics() (global, local storagepb.LatchManagerInfo)
+	LatchMetrics() (global, local kvserverpb.LatchManagerInfo)
 
 	// LockTableDebug returns a debug string representing the state of the
 	// lockTable.
@@ -377,7 +377,7 @@ type latchManager interface {
 	Release(latchGuard)
 
 	// Info returns information about the state of the latchManager.
-	Info() (global, local storagepb.LatchManagerInfo)
+	Info() (global, local kvserverpb.LatchManagerInfo)
 }
 
 // latchGuard is a handle to a set of acquired key latches.
@@ -632,6 +632,11 @@ type lockTableWaiter interface {
 	// and, in turn, remove this method. This will likely fall out of pulling
 	// all replicated locks into the lockTable.
 	WaitOnLock(context.Context, Request, *roachpb.Intent) *Error
+
+	// ClearCaches wipes all caches maintained by the lockTableWaiter. This is
+	// primarily used to recover memory when a replica loses a lease. However,
+	// it is also used in tests to reset the state of the lockTableWaiter.
+	ClearCaches()
 }
 
 // txnWaitQueue holds a collection of wait-queues for transaction records.

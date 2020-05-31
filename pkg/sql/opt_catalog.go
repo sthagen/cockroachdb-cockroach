@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -37,7 +38,6 @@ import (
 // only include what the optimizer needs, and certain common lookups are cached
 // for faster performance.
 type optCatalog struct {
-	tree.TypeReferenceResolver
 	// planner needs to be set via a call to init before calling other methods.
 	planner *planner
 
@@ -109,7 +109,7 @@ func (os *optSchema) Name() *cat.SchemaName {
 
 // GetDataSourceNames is part of the cat.Schema interface.
 func (os *optSchema) GetDataSourceNames(ctx context.Context) ([]cat.DataSourceName, error) {
-	return GetObjectNames(
+	return resolver.GetObjectNames(
 		ctx,
 		os.planner.Txn(),
 		os.planner,
@@ -170,7 +170,7 @@ func (oc *optCatalog) ResolveDataSource(
 	}
 
 	oc.tn = *name
-	desc, err := ResolveExistingTableObject(ctx, oc.planner, &oc.tn, tree.ObjectLookupFlagsWithRequired(), ResolveAnyDescType)
+	desc, err := resolver.ResolveExistingTableObject(ctx, oc.planner, &oc.tn, tree.ObjectLookupFlagsWithRequired(), resolver.ResolveAnyDescType)
 	if err != nil {
 		return nil, cat.DataSourceName{}, err
 	}
@@ -725,11 +725,6 @@ func (ot *optTable) IsVirtualTable() bool {
 	return false
 }
 
-// IsInterleaved is part of the cat.Table interface.
-func (ot *optTable) IsInterleaved() bool {
-	return ot.desc.IsInterleaved()
-}
-
 // ColumnCount is part of the cat.Table interface.
 func (ot *optTable) ColumnCount() int {
 	return len(ot.desc.Columns)
@@ -1033,6 +1028,28 @@ func (oi *optIndex) PartitionByListPrefixes() []tree.Datums {
 		}
 	}
 	return res
+}
+
+// InterleaveAncestorCount is part of the cat.Index interface.
+func (oi *optIndex) InterleaveAncestorCount() int {
+	return len(oi.desc.Interleave.Ancestors)
+}
+
+// InterleaveAncestor is part of the cat.Index interface.
+func (oi *optIndex) InterleaveAncestor(i int) (table, index cat.StableID, numKeyCols int) {
+	a := &oi.desc.Interleave.Ancestors[i]
+	return cat.StableID(a.TableID), cat.StableID(a.IndexID), int(a.SharedPrefixLen)
+}
+
+// InterleavedByCount is part of the cat.Index interface.
+func (oi *optIndex) InterleavedByCount() int {
+	return len(oi.desc.InterleavedBy)
+}
+
+// InterleavedBy is part of the cat.Index interface.
+func (oi *optIndex) InterleavedBy(i int) (table, index cat.StableID) {
+	ref := &oi.desc.InterleavedBy[i]
+	return cat.StableID(ref.Table), cat.StableID(ref.Index)
 }
 
 type optTableStat struct {
@@ -1392,11 +1409,6 @@ func (ot *optVirtualTable) IsVirtualTable() bool {
 	return true
 }
 
-// IsInterleaved is part of the cat.Table interface.
-func (ot *optVirtualTable) IsInterleaved() bool {
-	return ot.desc.IsInterleaved()
-}
-
 // ColumnCount is part of the cat.Table interface.
 func (ot *optVirtualTable) ColumnCount() int {
 	// Virtual tables expose an extra (bogus) PK column.
@@ -1671,6 +1683,26 @@ func (oi *optVirtualIndex) Ordinal() int {
 // PartitionByListPrefixes is part of the cat.Index interface.
 func (oi *optVirtualIndex) PartitionByListPrefixes() []tree.Datums {
 	panic("no partition")
+}
+
+// InterleaveAncestorCount is part of the cat.Index interface.
+func (oi *optVirtualIndex) InterleaveAncestorCount() int {
+	return 0
+}
+
+// InterleaveAncestor is part of the cat.Index interface.
+func (oi *optVirtualIndex) InterleaveAncestor(i int) (table, index cat.StableID, numKeyCols int) {
+	panic("no interleavings")
+}
+
+// InterleavedByCount is part of the cat.Index interface.
+func (oi *optVirtualIndex) InterleavedByCount() int {
+	return 0
+}
+
+// InterleavedBy is part of the cat.Index interface.
+func (oi *optVirtualIndex) InterleavedBy(i int) (table, index cat.StableID) {
+	panic("no interleavings")
 }
 
 // optVirtualFamily is a dummy implementation of cat.Family for the only family

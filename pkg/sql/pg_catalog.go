@@ -23,8 +23,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/schema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -251,6 +251,7 @@ var pgCatalog = virtualSchema{
 	// database set. Simply reject any attempts to use them in that
 	// case.
 	validWithNoDatabaseContext: false,
+	containsTypes:              true,
 }
 
 // The catalog pg_am stores information about relation access methods.
@@ -458,36 +459,19 @@ CREATE TABLE pg_catalog.pg_attribute (
 		// addColumn adds adds either a table or a index column to the pg_attribute table.
 		addColumn := func(column *sqlbase.ColumnDescriptor, attRelID tree.Datum, colID sqlbase.ColumnID) error {
 			colTyp := column.Type
-			attTypMod := int32(-1)
-			if width := colTyp.Width(); width != 0 {
-				switch colTyp.Family() {
-				case types.StringFamily:
-					// Postgres adds 4 to the attypmod for bounded string types, the
-					// var header size.
-					attTypMod = width + 4
-				case types.BitFamily:
-					attTypMod = width
-				case types.DecimalFamily:
-					// attTypMod is calculated by putting the precision in the upper
-					// bits and the scale in the lower bits of a 32-bit int, and adding
-					// 4 (the var header size). We mock this for clients' sake. See
-					// numeric.c.
-					attTypMod = ((colTyp.Precision() << 16) | width) + 4
-				}
-			}
 			return addRow(
-				attRelID,                           // attrelid
-				tree.NewDName(column.Name),         // attname
-				typOid(colTyp),                     // atttypid
-				zeroVal,                            // attstattarget
-				typLen(colTyp),                     // attlen
-				tree.NewDInt(tree.DInt(colID)),     // attnum
-				zeroVal,                            // attndims
-				negOneVal,                          // attcacheoff
-				tree.NewDInt(tree.DInt(attTypMod)), // atttypmod
-				tree.DNull,                         // attbyval (see pg_type.typbyval)
-				tree.DNull,                         // attstorage
-				tree.DNull,                         // attalign
+				attRelID,                       // attrelid
+				tree.NewDName(column.Name),     // attname
+				typOid(colTyp),                 // atttypid
+				zeroVal,                        // attstattarget
+				typLen(colTyp),                 // attlen
+				tree.NewDInt(tree.DInt(colID)), // attnum
+				zeroVal,                        // attndims
+				negOneVal,                      // attcacheoff
+				tree.NewDInt(tree.DInt(colTyp.TypeModifier())), // atttypmod
+				tree.DNull, // attbyval (see pg_type.typbyval)
+				tree.DNull, // attstorage
+				tree.DNull, // attalign
 				tree.MakeDBool(tree.DBool(!column.Nullable)),          // attnotnull
 				tree.MakeDBool(tree.DBool(column.DefaultExpr != nil)), // atthasdef
 				tree.DBoolFalse,    // attisdropped
@@ -561,9 +545,10 @@ CREATE TABLE pg_catalog.pg_authid (
 )`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachRole(ctx, p, func(username string, isRole bool) error {
+		return forEachRole(ctx, p, func(username string, isRole bool, noLogin bool) error {
 			isRoot := tree.DBool(username == security.RootUser || username == sqlbase.AdminRole)
 			isRoleDBool := tree.DBool(isRole)
+			roleCanLogin := tree.DBool(!noLogin)
 			return addRow(
 				h.UserOid(username),          // oid
 				tree.NewDName(username),      // rolname
@@ -571,7 +556,7 @@ CREATE TABLE pg_catalog.pg_authid (
 				tree.MakeDBool(isRoleDBool),  // rolinherit. Roles inherit by default.
 				tree.MakeDBool(isRoot),       // rolcreaterole
 				tree.MakeDBool(isRoot),       // rolcreatedb
-				tree.MakeDBool(!isRoleDBool), // rolcanlogin. Only users can login.
+				tree.MakeDBool(roleCanLogin), // rolcanlogin.
 				tree.DBoolFalse,              // rolreplication
 				tree.DBoolFalse,              // rolbypassrls
 				negOneVal,                    // rolconnlimit
@@ -980,7 +965,7 @@ type oneAtATimeSchemaResolver struct {
 }
 
 func (r oneAtATimeSchemaResolver) getDatabaseByID(id sqlbase.ID) (*DatabaseDescriptor, error) {
-	return r.p.Tables().databaseCache.getDatabaseDescByID(r.ctx, r.p.txn, id)
+	return r.p.Tables().DatabaseCache().GetDatabaseDescByID(r.ctx, r.p.txn, id)
 }
 
 func (r oneAtATimeSchemaResolver) getTableByID(id sqlbase.ID) (*TableDescriptor, error) {
@@ -1024,14 +1009,18 @@ func makeAllRelationsVirtualTableWithDescriptorIDIndex(
 				populate: func(ctx context.Context, constraint tree.Datum, p *planner, db *DatabaseDescriptor,
 					addRow func(...tree.Datum) error) (bool, error) {
 					var id sqlbase.ID
-					switch t := constraint.(type) {
+					d := tree.UnwrapDatum(p.EvalContext(), constraint)
+					if d == tree.DNull {
+						return false, nil
+					}
+					switch t := d.(type) {
 					case *tree.DOid:
 						id = sqlbase.ID(t.DInt)
 					case *tree.DInt:
 						id = sqlbase.ID(*t)
 					default:
 						return false, errors.AssertionFailedf("unexpected type %T for table id column in virtual table %s",
-							constraint, schemaDef)
+							d, schemaDef)
 					}
 					table, err := p.LookupTableByID(ctx, id)
 					if err != nil {
@@ -1052,12 +1041,12 @@ func makeAllRelationsVirtualTableWithDescriptorIDIndex(
 						return false, nil
 					}
 					h := makeOidHasher()
-					resolver := oneAtATimeSchemaResolver{p: p, ctx: ctx}
-					scName, err := schema.ResolveNameByID(ctx, p.txn, p.ExecCfg().Codec, db.ID, table.Desc.GetParentSchemaID())
+					scResolver := oneAtATimeSchemaResolver{p: p, ctx: ctx}
+					scName, err := resolver.ResolveSchemaNameByID(ctx, p.txn, p.ExecCfg().Codec, db.ID, table.Desc.GetParentSchemaID())
 					if err != nil {
 						return false, err
 					}
-					if err := populateFromTable(ctx, p, h, db, scName, table.Desc.TableDesc(), resolver,
+					if err := populateFromTable(ctx, p, h, db, scName, table.Desc.TableDesc(), scResolver,
 						addRow); err != nil {
 						return false, err
 					}
@@ -1176,7 +1165,7 @@ CREATE TABLE pg_catalog.pg_database (
 	datacl STRING[]
 )`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachDatabaseDesc(ctx, p, nil /*all databases*/, true, /* requiresPrivileges */
+		return forEachDatabaseDesc(ctx, p, nil /*all databases*/, false, /* requiresPrivileges */
 			func(db *sqlbase.DatabaseDescriptor) error {
 				return addRow(
 					dbOid(db.ID),           // oid
@@ -1449,8 +1438,47 @@ CREATE TABLE pg_catalog.pg_enum (
   enumsortorder FLOAT4,
   enumlabel STRING
 )`,
-	populate: func(_ context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		// Enum types are not currently supported.
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		h := makeOidHasher()
+		descs, err := p.Tables().GetAllDescriptors(ctx, p.txn)
+		if err != nil {
+			return err
+		}
+		for _, desc := range descs {
+			typDesc, ok := desc.(*sqlbase.TypeDescriptor)
+			if !ok {
+				continue
+			}
+			if dbContext != nil && typDesc.ParentID != dbContext.ID {
+				continue
+			}
+			if typDesc.Kind != sqlbase.TypeDescriptor_ENUM {
+				continue
+			}
+			// Generate a row for each member of the enum. We don't represent enums
+			// internally using floats for ordering like Postgres, so just pick a
+			// float entry for the rows.
+			typ := types.MakeEnum(uint32(typDesc.ID), uint32(typDesc.ArrayTypeID))
+			if err := typDesc.HydrateTypeInfoWithName(
+				typ,
+				tree.NewUnqualifiedTypeName(tree.Name(typDesc.Name)),
+				p.makeTypeLookupFn(ctx),
+			); err != nil {
+				return err
+			}
+			enumData := typ.TypeMeta.EnumData
+			typOID := tree.NewDOid(tree.DInt(typ.Oid()))
+			for i := range enumData.LogicalRepresentations {
+				if err := addRow(
+					h.EnumEntryOid(typOID, enumData.PhysicalRepresentations[i]),
+					typOID,
+					tree.NewDFloat(tree.DFloat(float64(i))),
+					tree.NewDString(enumData.LogicalRepresentations[i]),
+				); err != nil {
+					return err
+				}
+			}
+		}
 		return nil
 	},
 }
@@ -2179,24 +2207,26 @@ CREATE TABLE pg_catalog.pg_proc (
 							argmodes = tree.DNull
 							variadicType = oidZero
 						}
+						provolatile, proleakproof := builtin.Volatility.ToPostgres()
+
 						err := addRow(
-							h.BuiltinOid(name, &builtin),            // oid
-							dName,                                   // proname
-							nspOid,                                  // pronamespace
-							tree.DNull,                              // proowner
-							oidZero,                                 // prolang
-							tree.DNull,                              // procost
-							tree.DNull,                              // prorows
-							variadicType,                            // provariadic
-							tree.DNull,                              // protransform
-							tree.MakeDBool(tree.DBool(isAggregate)), // proisagg
-							tree.MakeDBool(tree.DBool(isWindow)),    // proiswindow
-							tree.DBoolFalse,                         // prosecdef
-							tree.MakeDBool(tree.DBool(!props.Impure)), // proleakproof
-							tree.DBoolFalse,                             // proisstrict
-							tree.MakeDBool(tree.DBool(isRetSet)),        // proretset
-							tree.NewDString(string(builtin.Volatility)), // provolatile
-							tree.DNull, // proparallel
+							h.BuiltinOid(name, &builtin),             // oid
+							dName,                                    // proname
+							nspOid,                                   // pronamespace
+							tree.DNull,                               // proowner
+							oidZero,                                  // prolang
+							tree.DNull,                               // procost
+							tree.DNull,                               // prorows
+							variadicType,                             // provariadic
+							tree.DNull,                               // protransform
+							tree.MakeDBool(tree.DBool(isAggregate)),  // proisagg
+							tree.MakeDBool(tree.DBool(isWindow)),     // proiswindow
+							tree.DBoolFalse,                          // prosecdef
+							tree.MakeDBool(tree.DBool(proleakproof)), // proleakproof
+							tree.DBoolFalse,                          // proisstrict
+							tree.MakeDBool(tree.DBool(isRetSet)),     // proretset
+							tree.NewDString(provolatile),             // provolatile
+							tree.DNull,                               // proparallel
 							tree.NewDInt(tree.DInt(builtin.Types.Length())), // pronargs
 							tree.NewDInt(tree.DInt(0)),                      // pronargdefaults
 							retType,                                         // prorettype
@@ -2288,9 +2318,10 @@ CREATE TABLE pg_catalog.pg_roles (
 		// include sensitive information such as password hashes.
 		h := makeOidHasher()
 		return forEachRole(ctx, p,
-			func(username string, isRole bool) error {
+			func(username string, isRole bool, noLogin bool) error {
 				isRoot := tree.DBool(username == security.RootUser || username == sqlbase.AdminRole)
 				isRoleDBool := tree.DBool(isRole)
+				roleCanLogin := tree.DBool(!noLogin)
 				return addRow(
 					h.UserOid(username),          // oid
 					tree.NewDName(username),      // rolname
@@ -2299,7 +2330,7 @@ CREATE TABLE pg_catalog.pg_roles (
 					tree.MakeDBool(isRoot),       // rolcreaterole
 					tree.MakeDBool(isRoot),       // rolcreatedb
 					tree.DBoolFalse,              // rolcatupdate
-					tree.MakeDBool(!isRoleDBool), // rolcanlogin. Only users can login.
+					tree.MakeDBool(roleCanLogin), // rolcanlogin.
 					tree.DBoolFalse,              // rolreplication
 					negOneVal,                    // rolconnlimit
 					passwdStarString,             // rolpassword
@@ -2563,7 +2594,6 @@ var (
 	// Avoid unused warning for constants.
 	_ = typTypeComposite
 	_ = typTypeDomain
-	_ = typTypeEnum
 	_ = typTypePseudo
 	_ = typTypeRange
 
@@ -2594,6 +2624,84 @@ var (
 	typDelim = tree.NewDString(",")
 )
 
+func addPGTypeRow(
+	h oidHasher, nspOid tree.Datum, typ *types.T, addRow func(...tree.Datum) error,
+) error {
+	cat := typCategory(typ)
+	typType := typTypeBase
+	typElem := oidZero
+	typArray := oidZero
+	builtinPrefix := builtins.PGIOBuiltinPrefix(typ)
+	switch typ.Family() {
+	case types.ArrayFamily:
+		switch typ.Oid() {
+		case oid.T_int2vector:
+			// IntVector needs a special case because it's a special snowflake
+			// type that behaves in some ways like a scalar type and in others
+			// like an array type.
+			typElem = tree.NewDOid(tree.DInt(oid.T_int2))
+			typArray = tree.NewDOid(tree.DInt(oid.T__int2vector))
+		case oid.T_oidvector:
+			// Same story as above for OidVector.
+			typElem = tree.NewDOid(tree.DInt(oid.T_oid))
+			typArray = tree.NewDOid(tree.DInt(oid.T__oidvector))
+		case oid.T_anyarray:
+			// AnyArray does not use a prefix or element type.
+		default:
+			builtinPrefix = "array_"
+			typElem = tree.NewDOid(tree.DInt(typ.ArrayContents().Oid()))
+		}
+	default:
+		typArray = tree.NewDOid(tree.DInt(types.MakeArray(typ).Oid()))
+	}
+	if typ.Family() == types.EnumFamily {
+		builtinPrefix = "enum_"
+		typType = typTypeEnum
+	}
+	if cat == typCategoryPseudo {
+		typType = typTypePseudo
+	}
+	typname := typ.PGName()
+
+	return addRow(
+		tree.NewDOid(tree.DInt(typ.Oid())), // oid
+		tree.NewDName(typname),             // typname
+		nspOid,                             // typnamespace
+		tree.DNull,                         // typowner
+		typLen(typ),                        // typlen
+		typByVal(typ),                      // typbyval (is it fixedlen or not)
+		typType,                            // typtype
+		cat,                                // typcategory
+		tree.DBoolFalse,                    // typispreferred
+		tree.DBoolTrue,                     // typisdefined
+		typDelim,                           // typdelim
+		oidZero,                            // typrelid
+		typElem,                            // typelem
+		typArray,                           // typarray
+
+		// regproc references
+		h.RegProc(builtinPrefix+"in"),   // typinput
+		h.RegProc(builtinPrefix+"out"),  // typoutput
+		h.RegProc(builtinPrefix+"recv"), // typreceive
+		h.RegProc(builtinPrefix+"send"), // typsend
+		oidZero,                         // typmodin
+		oidZero,                         // typmodout
+		oidZero,                         // typanalyze
+
+		tree.DNull,      // typalign
+		tree.DNull,      // typstorage
+		tree.DBoolFalse, // typnotnull
+		oidZero,         // typbasetype
+		negOneVal,       // typtypmod
+		zeroVal,         // typndims
+		typColl(typ, h), // typcollation
+		tree.DNull,      // typdefaultbin
+		tree.DNull,      // typdefault
+		tree.DNull,      // typacl
+	)
+}
+
+// TODO (rohany): We should add a virtual index on OID here. See #49208.
 var pgCatalogTypeTable = virtualSchemaTable{
 	comment: `scalar types (incomplete)
 https://www.postgresql.org/docs/9.5/catalog-pg-type.html`,
@@ -2637,74 +2745,37 @@ CREATE TABLE pg_catalog.pg_type (
 			func(db *DatabaseDescriptor) error {
 				nspOid := h.NamespaceOid(db, pgCatalogName)
 
-				for o, typ := range types.OidToType {
-					cat := typCategory(typ)
-					typType := typTypeBase
-					typElem := oidZero
-					typArray := oidZero
-					builtinPrefix := builtins.PGIOBuiltinPrefix(typ)
-					if typ.Family() == types.ArrayFamily {
-						switch typ.Oid() {
-						case oid.T_int2vector:
-							// IntVector needs a special case because it's a special snowflake
-							// type that behaves in some ways like a scalar type and in others
-							// like an array type.
-							typElem = tree.NewDOid(tree.DInt(oid.T_int2))
-							typArray = tree.NewDOid(tree.DInt(oid.T__int2vector))
-						case oid.T_oidvector:
-							// Same story as above for OidVector.
-							typElem = tree.NewDOid(tree.DInt(oid.T_oid))
-							typArray = tree.NewDOid(tree.DInt(oid.T__oidvector))
-						case oid.T_anyarray:
-							// AnyArray does not use a prefix or element type.
-						default:
-							builtinPrefix = "array_"
-							typElem = tree.NewDOid(tree.DInt(typ.ArrayContents().Oid()))
-						}
-					} else {
-						typArray = tree.NewDOid(tree.DInt(types.MakeArray(typ).Oid()))
+				// Generate rows for all predefined types.
+				for _, typ := range types.OidToType {
+					if err := addPGTypeRow(h, nspOid, typ, addRow); err != nil {
+						return err
 					}
-					if cat == typCategoryPseudo {
-						typType = typTypePseudo
+				}
+
+				// Now generate rows for user defined types in this database.
+				descs, err := p.Tables().GetAllDescriptors(ctx, p.txn)
+				if err != nil {
+					return err
+				}
+				for _, desc := range descs {
+					typDesc, ok := desc.(*sqlbase.TypeDescriptor)
+					if !ok {
+						continue
 					}
-					typname := typ.PGName()
-
-					if err := addRow(
-						tree.NewDOid(tree.DInt(o)), // oid
-						tree.NewDName(typname),     // typname
-						nspOid,                     // typnamespace
-						tree.DNull,                 // typowner
-						typLen(typ),                // typlen
-						typByVal(typ),              // typbyval (is it fixedlen or not)
-						typType,                    // typtype
-						cat,                        // typcategory
-						tree.DBoolFalse,            // typispreferred
-						tree.DBoolTrue,             // typisdefined
-						typDelim,                   // typdelim
-						oidZero,                    // typrelid
-						typElem,                    // typelem
-						typArray,                   // typarray
-
-						// regproc references
-						h.RegProc(builtinPrefix+"in"),   // typinput
-						h.RegProc(builtinPrefix+"out"),  // typoutput
-						h.RegProc(builtinPrefix+"recv"), // typreceive
-						h.RegProc(builtinPrefix+"send"), // typsend
-						oidZero,                         // typmodin
-						oidZero,                         // typmodout
-						oidZero,                         // typanalyze
-
-						tree.DNull,      // typalign
-						tree.DNull,      // typstorage
-						tree.DBoolFalse, // typnotnull
-						oidZero,         // typbasetype
-						negOneVal,       // typtypmod
-						zeroVal,         // typndims
-						typColl(typ, h), // typcollation
-						tree.DNull,      // typdefaultbin
-						tree.DNull,      // typdefault
-						tree.DNull,      // typacl
-					); err != nil {
+					// Ignore this type if it is not part of this database.
+					// TODO (rohany): This logic will need to be updated once we support
+					//  user defined schemas.
+					if typDesc.ParentID != db.ID {
+						continue
+					}
+					typ, err := typDesc.MakeTypesT(
+						tree.NewUnqualifiedTypeName(tree.Name(typDesc.Name)),
+						p.makeTypeLookupFn(ctx),
+					)
+					if err != nil {
+						return err
+					}
+					if err := addPGTypeRow(h, nspOid, typ, addRow); err != nil {
 						return err
 					}
 				}
@@ -2731,7 +2802,7 @@ CREATE TABLE pg_catalog.pg_user (
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
 		return forEachRole(ctx, p,
-			func(username string, isRole bool) error {
+			func(username string, isRole bool, noLogin bool) error {
 				if isRole {
 					return nil
 				}
@@ -2877,6 +2948,7 @@ var datumToTypeCategory = map[types.Family]*tree.DString{
 	types.BoolFamily:        typCategoryBoolean,
 	types.BytesFamily:       typCategoryUserDefined,
 	types.DateFamily:        typCategoryDateTime,
+	types.EnumFamily:        typCategoryEnum,
 	types.TimeFamily:        typCategoryDateTime,
 	types.TimeTZFamily:      typCategoryDateTime,
 	types.FloatFamily:       typCategoryNumeric,
@@ -3006,7 +3078,7 @@ CREATE TABLE pg_catalog.pg_aggregate (
 								}
 							}
 						}
-						regprocForZeroOid := oidZero.AsRegProc("-")
+						regprocForZeroOid := tree.NewDOidWithName(tree.DInt(0), types.RegProc, "-")
 						err := addRow(
 							h.BuiltinOid(name, &overload).AsRegProc(name), // aggfnoid
 							aggregateKind,     // aggkind
@@ -3074,6 +3146,12 @@ func (h oidHasher) writeStr(s string) {
 	}
 }
 
+func (h oidHasher) writeBytes(b []byte) {
+	if _, err := h.h.Write(b); err != nil {
+		panic(err)
+	}
+}
+
 func (h oidHasher) writeUInt8(i uint8) {
 	if err := binary.Write(h.h, binary.BigEndian, i); err != nil {
 		panic(err)
@@ -3111,6 +3189,7 @@ const (
 	userTypeTag
 	collationTypeTag
 	operatorTypeTag
+	enumEntryTypeTag
 )
 
 func (h oidHasher) writeTypeTag(tag oidTypeTag) {
@@ -3260,6 +3339,13 @@ func (h oidHasher) OperatorOid(name string, leftType, rightType, returnType *tre
 	h.writeOID(leftType)
 	h.writeOID(rightType)
 	h.writeOID(returnType)
+	return h.getOid()
+}
+
+func (h oidHasher) EnumEntryOid(typOID *tree.DOid, physicalRep []byte) *tree.DOid {
+	h.writeTypeTag(enumEntryTypeTag)
+	h.writeOID(typOID)
+	h.writeBytes(physicalRep)
 	return h.getOid()
 }
 

@@ -113,7 +113,7 @@ func classifyColumnItem(n *UnresolvedName) (VarName, error) {
 const (
 	// PublicSchema is the name of the physical schema in every
 	// database/catalog.
-	PublicSchema string = "public"
+	PublicSchema string = sessiondata.PublicSchemaName
 	// PublicSchemaName is the same, typed as Name.
 	PublicSchemaName Name = Name(PublicSchema)
 )
@@ -580,6 +580,21 @@ const (
 	// TypeObject is used when a type-like object is desired from resolution.
 	TypeObject
 )
+
+// NewQualifiedObjectName returns an ObjectName of the corresponding kind.
+// It is used mainly for constructing appropriate error messages depending
+// on what kind of object was requested.
+func NewQualifiedObjectName(catalog, schema, object string, kind DesiredObjectKind) ObjectName {
+	switch kind {
+	case TableObject:
+		name := MakeTableNameWithSchema(Name(catalog), Name(schema), Name(object))
+		return &name
+	case TypeObject:
+		name := MakeNewQualifiedTypeName(catalog, schema, object)
+		return &name
+	}
+	return nil
+}
 
 // ObjectLookupFlags is the flag struct suitable for GetObjectDesc().
 type ObjectLookupFlags struct {

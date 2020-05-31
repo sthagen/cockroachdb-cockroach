@@ -16,6 +16,8 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -27,17 +29,18 @@ func genSumAgg(wr io.Writer) error {
 		return err
 	}
 
-	s := string(t)
+	r := strings.NewReplacer(
+		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"_GOTYPESLICE", "{{.GoTypeSliceName}}",
+		"_GOTYPE", "{{.GoType}}",
+		"_TYPE", "{{.VecMethod}}",
+		"TemplateType", "{{.VecMethod}}",
+	)
+	s := r.Replace(string(t))
 
-	s = strings.ReplaceAll(s, "_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}")
-	s = strings.ReplaceAll(s, "_TYPE_WIDTH", typeWidthReplacement)
-	s = strings.ReplaceAll(s, "_GOTYPESLICE", "{{.GoTypeSliceName}}")
-	s = strings.ReplaceAll(s, "_GOTYPE", "{{.GoType}}")
-	s = strings.ReplaceAll(s, "_TYPE", "{{.VecMethod}}")
-	s = strings.ReplaceAll(s, "TemplateType", "{{.VecMethod}}")
-
-	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 3)
-	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.Assign", 3))
+	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 6)
+	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.Assign", 6))
 
 	accumulateSum := makeFunctionRegex("_ACCUMULATE_SUM", 4)
 	s = accumulateSum.ReplaceAllString(s, `{{template "accumulateSum" buildDict "Global" . "HasNulls" $4}}`)
@@ -47,7 +50,13 @@ func genSumAgg(wr io.Writer) error {
 		return err
 	}
 
-	return tmpl.Execute(wr, sameTypeBinaryOpToOverloads[tree.Plus])
+	overloads := sameTypeBinaryOpToOverloads[tree.Plus]
+	// We want to omit the overload that operates on datum-backed vectors.
+	if overloads[len(overloads)-1].CanonicalTypeFamily != typeconv.DatumVecCanonicalTypeFamily {
+		colexecerror.InternalError("unexpectedly plus overload on datum-backed types is not the last one")
+	}
+	overloads = overloads[:len(overloads)-1]
+	return tmpl.Execute(wr, overloads)
 }
 
 func init() {

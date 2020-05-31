@@ -32,6 +32,14 @@ enum ConstraintValidity {
   Dropping = 3;
 }
 
+// ForeignKeyReference is deprecated, replaced by ForeignKeyConstraint in v19.2
+// (though it is still possible for table descriptors on disk to have
+// ForeignKeyReferences).
+//
+// It is still used to describe interleavings (see
+// IndexDescriptor.InterleavedBy), for which it is a poor choice: only the Table
+// and Index fields are used, and the interleaving has nothing to do with
+// traditional foreign key references.
 message ForeignKeyReference {
   option (gogoproto.equal) = true;
   enum Action {
@@ -139,8 +147,10 @@ message ColumnDescriptor {
   // This does not exist in TableDescriptors pre 20.2.
   optional uint32 logical_id = 13 [(gogoproto.nullable) = false,
    (gogoproto.customname) = "LogicalColumnID", (gogoproto.casttype) = "ColumnID"];
+  // Used to indicate column is used and dropped for ALTER COLUMN TYPE mutation.
+  optional bool alter_column_type_in_progress = 14 [(gogoproto.nullable) = false];
 }
-
+  
 // ColumnFamilyDescriptor is set of columns stored together in one kv entry.
 // For more information, look at `docs/tech-notes/encoding.md#value-encoding`.
 message ColumnFamilyDescriptor {
@@ -418,7 +428,16 @@ message IndexDescriptor {
 
   // InterleavedBy contains a reference to every table/index that is interleaved
   // into this one.
-  repeated ForeignKeyReference interleaved_by = 12  [(gogoproto.nullable) = false];
+  //
+  // Note that any of these indexes can themselves be interleaved by other
+  // tables but this list contains only those for which this index is a direct
+  // interleave parent.
+  //
+  // Only the Table and Index fields of the ForeignKeyReference are used. And
+  // despite the message used here, interleavings don't have to have
+  // corresponding foreign key references (and whether they do or not is
+  // irrelevant for this field).
+  repeated ForeignKeyReference interleaved_by = 12 [(gogoproto.nullable) = false];
 
   // Partitioning, if it's not the zero value, describes how this index's data
   // is partitioned into spans of keys each addressable by zone configs.
@@ -497,6 +516,15 @@ message PrimaryKeySwap {
   repeated uint32 new_indexes = 3 [(gogoproto.casttype) = "IndexID"];
 }
 
+// ComputedColumnSwap is a mutation corresponding to the atomic swap phase
+// where Column a' that is computed using Column a is swapped to replace
+// Column a while Column a becomes computed using a'.
+message ComputedColumnSwap {
+  option (gogoproto.equal) = true;
+  optional uint32 new_column_id = 1 [(gogoproto.nullable) = false, (gogoproto.casttype) = "ColumnID"];
+  optional uint32 old_column_id = 2 [(gogoproto.nullable) = false, (gogoproto.casttype) = "ColumnID"];
+}
+
 // A DescriptorMutation represents a column or an index that
 // has either been added or dropped and hasn't yet transitioned
 // into a stable state: completely backfilled and visible, or
@@ -512,6 +540,7 @@ message DescriptorMutation {
     IndexDescriptor index = 2;
     ConstraintToUpdate constraint = 8;
     PrimaryKeySwap primaryKeySwap = 9;
+    ComputedColumnSwap  computedColumnSwap = 10;
   }
   // A descriptor within a mutation is unavailable for reads, writes
   // and deletes. It is only available for implicit (internal to
@@ -964,8 +993,8 @@ message TableDescriptor {
 }
 
 // DatabaseDescriptor represents a namespace (aka database) and is stored
-// in a structured metadata key. The DatabaseDescriptor has a globally-unique
-// ID shared with the TableDescriptor ID.
+// in a structured metadata key. The DatabaseDescriptor has a globally-unique ID
+// shared with other Descriptors.
 // Permissions are applied to all tables in the namespace.
 message DatabaseDescriptor {
   option (gogoproto.equal) = true;
@@ -979,8 +1008,8 @@ message DatabaseDescriptor {
 }
 
 // TypeDescriptor represents a user defined type and is stored in a structured
-// metadata key. The TypeDescriptor has a globally-unique ID shared with the
-// TableDescriptor and DatabaseDescriptor ID's.
+// metadata key. The TypeDescriptor has a globally-unique ID shared with other
+// Descriptors.
 message TypeDescriptor {
   option (gogoproto.equal) = true;
   // Needed for the descriptorProto interface.
@@ -1002,17 +1031,22 @@ message TypeDescriptor {
   // id is the globally unique ID for this type.
   optional uint32 id = 4 [(gogoproto.nullable) = false, (gogoproto.customname) = "ID", (gogoproto.casttype) = "ID"];
 
-  // oid is the Postgres compatible OID for this type. It is intended to be
-  // used only within catalog tables.
-  optional uint32 oid = 5 [(gogoproto.nullable) = false, (gogoproto.customname) = "OID"];
+  // array_type_id is the globally unique ID for the implicitly created array
+  // type for this type. It is only set when the type descriptor points to a
+  // non-array type.
+  optional uint32 array_type_id = 8
+    [(gogoproto.nullable) = false, (gogoproto.customname) = "ArrayTypeID", (gogoproto.casttype) = "ID"];
 
   // Represents the kind of type that this type descriptor represents.
   enum Kind {
     // Represents a user defined enum type.
     ENUM = 0;
+    // Represents a user defined type that is just an alias for another type.
+    // As of now, it is used only internally.
+    ALIAS = 1;
     // Add more entries as we support more user defined types.
   }
-  optional Kind kind = 6 [(gogoproto.nullable) = false];
+  optional Kind kind = 5 [(gogoproto.nullable) = false];
 
   // The fields below are used only when this type is an ENUM type.
 
@@ -1024,17 +1058,46 @@ message TypeDescriptor {
     // TODO (rohany): Add the state here.
   }
   // enum_members is the set of values in an enum.
-  repeated EnumMember enum_members = 7 [(gogoproto.nullable) = false];
+  repeated EnumMember enum_members = 6 [(gogoproto.nullable) = false];
+
+  // The fields below are used only when this type is an ALIAS type.
+
+  // alias is the types.T that this descriptor is an alias for.
+  optional sql.sem.types.T alias = 7;
 
   // TODO (rohany): Do we need a draining names like the table descriptor?
 }
 
-// Descriptor is a union type holding either a table or database descriptor.
+// SchemaDescriptor represents a physical schema and is stored in a structured
+// metadata key.
+message SchemaDescriptor {
+  option (gogoproto.equal) = true;
+  // Needed for the descriptorProto interface.
+  option (gogoproto.goproto_getters) = true;
+
+  // parent_id refers to the database the schema is in.
+  optional uint32 parent_id = 1
+  [(gogoproto.nullable) = false, (gogoproto.customname) = "ParentID", (gogoproto.casttype) = "ID"];
+
+  // name is the name of the schema.
+  optional string name = 2 [(gogoproto.nullable) = false];
+
+  // id is the schema ID, globally unique across all descriptors.
+  optional uint32 id = 3
+  [(gogoproto.nullable) = false, (gogoproto.customname) = "ID", (gogoproto.casttype) = "ID"];
+
+  // privileges contains the privileges for the schema.
+  optional PrivilegeDescriptor privileges = 4;
+}
+
+// Descriptor is a union type for descriptors for tables, schemas, databases,
+// and types.
 message Descriptor {
   option (gogoproto.equal) = true;
   oneof union {
     TableDescriptor table = 1;
     DatabaseDescriptor database = 2;
     TypeDescriptor type = 3;
+    SchemaDescriptor schema = 4;
   }
 }

@@ -25,15 +25,16 @@ func genHashUtils(wr io.Writer) error {
 		return err
 	}
 
-	s := string(t)
+	r := strings.NewReplacer(
+		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"_TYPE", "{{.VecMethod}}",
+		"TemplateType", "{{.VecMethod}}",
+	)
+	s := r.Replace(string(t))
 
-	s = strings.ReplaceAll(s, "_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}")
-	s = strings.ReplaceAll(s, "_TYPE_WIDTH", typeWidthReplacement)
-	s = strings.ReplaceAll(s, "_TYPE", "{{.VecMethod}}")
-	s = strings.ReplaceAll(s, "TemplateType", "{{.VecMethod}}")
-
-	assignHash := makeFunctionRegex("_ASSIGN_HASH", 2)
-	s = assignHash.ReplaceAllString(s, makeTemplateFunctionCall("Global.UnaryAssign", 2))
+	assignHash := makeFunctionRegex("_ASSIGN_HASH", 4)
+	s = assignHash.ReplaceAllString(s, makeTemplateFunctionCall("Global.UnaryAssign", 4))
 
 	rehash := makeFunctionRegex("_REHASH_BODY", 8)
 	s = rehash.ReplaceAllString(s, `{{template "rehashBody" buildDict "Global" . "HasSel" $7 "HasNulls" $8}}`)

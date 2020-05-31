@@ -20,8 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -71,7 +71,7 @@ type rangefeedTxnPusher struct {
 // transactions.
 func (tp *rangefeedTxnPusher) PushTxns(
 	ctx context.Context, txns []enginepb.TxnMeta, ts hlc.Timestamp,
-) ([]roachpb.Transaction, error) {
+) ([]*roachpb.Transaction, error) {
 	pushTxnMap := make(map[uuid.UUID]*enginepb.TxnMeta, len(txns))
 	for i := range txns {
 		txn := &txns[i]
@@ -94,7 +94,7 @@ func (tp *rangefeedTxnPusher) PushTxns(
 		return nil, pErr.GoError()
 	}
 
-	pushedTxns := make([]roachpb.Transaction, 0, len(pushedTxnMap))
+	pushedTxns := make([]*roachpb.Transaction, 0, len(pushedTxnMap))
 	for _, txn := range pushedTxnMap {
 		pushedTxns = append(pushedTxns, txn)
 	}
@@ -103,11 +103,11 @@ func (tp *rangefeedTxnPusher) PushTxns(
 
 // CleanupTxnIntentsAsync is part of the rangefeed.TxnPusher interface.
 func (tp *rangefeedTxnPusher) CleanupTxnIntentsAsync(
-	ctx context.Context, txns []roachpb.Transaction,
+	ctx context.Context, txns []*roachpb.Transaction,
 ) error {
 	endTxns := make([]result.EndTxnIntents, len(txns))
-	for i := range txns {
-		endTxns[i].Txn = &txns[i]
+	for i, txn := range txns {
+		endTxns[i].Txn = txn
 		endTxns[i].Poison = true
 	}
 	return tp.ir.CleanupTxnIntentsAsync(ctx, tp.r.RangeID, endTxns, true /* allowSyncProcessing */)
@@ -130,7 +130,7 @@ func (i iteratorWithCloser) Close() {
 func (r *Replica) RangeFeed(
 	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
 ) *roachpb.Error {
-	if !RangefeedEnabled.Get(&r.store.cfg.Settings.SV) {
+	if !r.isSystemRange() && !RangefeedEnabled.Get(&r.store.cfg.Settings.SV) {
 		return roachpb.NewErrorf("rangefeeds require the kv.rangefeed.enabled setting. See %s",
 			base.DocsURL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
 	}
@@ -440,7 +440,7 @@ func (r *Replica) numRangefeedRegistrations() int {
 // the state of the Replica before the operations in the logical op log are
 // applied. No-op if a rangefeed is not active. Requires raftMu to be locked.
 func (r *Replica) populatePrevValsInLogicalOpLogRaftMuLocked(
-	ctx context.Context, ops *storagepb.LogicalOpLog, prevReader storage.Reader,
+	ctx context.Context, ops *kvserverpb.LogicalOpLog, prevReader storage.Reader,
 ) {
 	p, filter := r.getRangefeedProcessorAndFilter()
 	if p == nil {
@@ -498,7 +498,7 @@ func (r *Replica) populatePrevValsInLogicalOpLogRaftMuLocked(
 // them to the rangefeed processor. No-op if a rangefeed is not active. Requires
 // raftMu to be locked.
 func (r *Replica) handleLogicalOpLogRaftMuLocked(
-	ctx context.Context, ops *storagepb.LogicalOpLog, reader storage.Reader,
+	ctx context.Context, ops *kvserverpb.LogicalOpLog, reader storage.Reader,
 ) {
 	p, filter := r.getRangefeedProcessorAndFilter()
 	if p == nil {
@@ -595,7 +595,7 @@ func (r *Replica) handleClosedTimestampUpdateRaftMuLocked(ctx context.Context) {
 	}
 
 	// Determine what the maximum closed timestamp is for this replica.
-	closedTS := r.maxClosed(ctx)
+	closedTS, _ := r.maxClosed(ctx)
 
 	// If the closed timestamp is sufficiently stale, signal that we want an
 	// update to the leaseholder so that it will eventually begin to progress

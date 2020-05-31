@@ -13,6 +13,8 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -67,17 +69,17 @@ func (p *planner) RunParams(ctx context.Context) runParams {
 // CCL statements to get access to a "planner" is through this PlanHookState
 // that gets passed back due to this inversion of roles.
 type PlanHookState interface {
-	SchemaResolver
+	resolver.SchemaResolver
 	RunParams(ctx context.Context) runParams
 	ExtendedEvalContext() *extendedEvalContext
 	SessionData() *sessiondata.SessionData
 	ExecCfg() *ExecutorConfig
 	DistSQLPlanner() *DistSQLPlanner
-	LeaseMgr() *LeaseManager
-	TypeAsString(e tree.Expr, op string) (func() (string, error), error)
-	TypeAsStringArray(e tree.Exprs, op string) (func() ([]string, error), error)
+	LeaseMgr() *lease.Manager
+	TypeAsString(ctx context.Context, e tree.Expr, op string) (func() (string, error), error)
+	TypeAsStringArray(ctx context.Context, e tree.Exprs, op string) (func() ([]string, error), error)
 	TypeAsStringOpts(
-		opts tree.KVOptions, optsValidate map[string]KVStringOptValidate,
+		ctx context.Context, opts tree.KVOptions, optsValidate map[string]KVStringOptValidate,
 	) (func() (map[string]string, error), error)
 	User() string
 	AuthorizationAccessor
@@ -85,14 +87,14 @@ type PlanHookState interface {
 	// TODO(mberhault): it would be easier to just pass a planner to plan hooks.
 	GetAllRoles(ctx context.Context) (map[string]bool, error)
 	BumpRoleMembershipTableVersion(ctx context.Context) error
-	EvalAsOfTimestamp(asOf tree.AsOfClause) (hlc.Timestamp, error)
+	EvalAsOfTimestamp(ctx context.Context, asOf tree.AsOfClause) (hlc.Timestamp, error)
 	ResolveUncachedDatabaseByName(
 		ctx context.Context, dbName string, required bool) (*UncachedDatabaseDescriptor, error)
 	ResolveMutableTableDescriptor(
-		ctx context.Context, tn *TableName, required bool, requiredType ResolveRequiredType,
+		ctx context.Context, tn *TableName, required bool, requiredType resolver.ResolveRequiredType,
 	) (table *MutableTableDescriptor, err error)
 	ShowCreate(
-		ctx context.Context, dbPrefix string, allDescs []sqlbase.Descriptor, desc *sqlbase.TableDescriptor, ignoreFKs shouldOmitFKClausesFromCreate,
+		ctx context.Context, dbPrefix string, allDescs []sqlbase.Descriptor, desc *sqlbase.TableDescriptor, displayOptions ShowCreateDisplayOptions,
 	) (string, error)
 }
 

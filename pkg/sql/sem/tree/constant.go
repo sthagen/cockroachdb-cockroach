@@ -57,12 +57,14 @@ func isConstant(expr Expr) bool {
 	return ok
 }
 
-func typeCheckConstant(c Constant, ctx *SemaContext, desired *types.T) (ret TypedExpr, err error) {
+func typeCheckConstant(
+	c Constant, semaCtx *SemaContext, desired *types.T,
+) (ret TypedExpr, err error) {
 	avail := c.AvailableTypes()
 	if desired.Family() != types.AnyFamily {
 		for _, typ := range avail {
 			if desired.Equivalent(typ) {
-				return c.ResolveAsType(ctx, desired)
+				return c.ResolveAsType(semaCtx, desired)
 			}
 		}
 	}
@@ -84,7 +86,7 @@ func typeCheckConstant(c Constant, ctx *SemaContext, desired *types.T) (ret Type
 	}
 
 	natural := avail[0]
-	return c.ResolveAsType(ctx, natural)
+	return c.ResolveAsType(semaCtx, natural)
 }
 
 func naturalConstantType(c Constant) *types.T {
@@ -469,7 +471,7 @@ var (
 		types.AnyEnum,
 	}
 	// StrValAvailBytes is the set of types convertible to byte array.
-	StrValAvailBytes = []*types.T{types.Bytes, types.Uuid, types.String}
+	StrValAvailBytes = []*types.T{types.Bytes, types.Uuid, types.String, types.AnyEnum}
 )
 
 // AvailableTypes implements the Constant interface.
@@ -521,6 +523,8 @@ func (expr *StrVal) ResolveAsType(ctx *SemaContext, typ *types.T) (Datum, error)
 		case types.BytesFamily:
 			expr.resBytes = DBytes(expr.s)
 			return &expr.resBytes, nil
+		case types.EnumFamily:
+			return MakeDEnumFromPhysicalRepresentation(typ, []byte(expr.s))
 		case types.UuidFamily:
 			return ParseDUuidFromBytes([]byte(expr.s))
 		case types.StringFamily:

@@ -99,6 +99,10 @@ define Variable {
 [Scalar, ConstValue]
 define Const {
     Value Datum
+
+    # Typ is the type of the constant. It is necessary because
+    # Value.ResolvedType() loses information in some cases.
+    Typ Type
 }
 
 # Null is the constant SQL null value that has "unknown value" semantics. If
@@ -298,6 +302,20 @@ define Not {
     Input ScalarExpr
 }
 
+# IsTupleNull is the boolean expression with a tuple input that evaluates to
+# true if the tuple is null or all elements in the tuple are null.
+[Scalar, Bool]
+define IsTupleNull {
+    Input ScalarExpr
+}
+
+# IsTupleNotNull is the boolean expression with a tuple input that evaluates to
+# true if the tuple is not null and all elements in the tuple are not null.
+[Scalar, Bool]
+define IsTupleNotNull {
+    Input ScalarExpr
+}
+
 [Scalar, Bool, Comparison]
 define Eq {
     Left ScalarExpr
@@ -406,12 +424,17 @@ define NotRegIMatch {
     Right ScalarExpr
 }
 
+# Is maps to the IS NOT DISTINCT FROM operator which is equivalent to IS for
+# non-tuples. See IsTupleNull for the tuple-specific IS NULL operator.
 [Scalar, Bool, Comparison]
 define Is {
     Left ScalarExpr
     Right ScalarExpr
 }
 
+# IsNot is the inverse of Is. It maps to the IS DISTINCT FROM operator which is
+# equivalent to IS NOT for non-tuples. See IsTupleNotNull for the
+# tuple-specific IS NOT NULL operator.
 [Scalar, Bool, Comparison]
 define IsNot {
     Left ScalarExpr
@@ -878,6 +901,23 @@ define AnyNotNullAgg {
 # FirstAggs in a DistinctOn.
 [Scalar, Aggregate]
 define FirstAgg {
+    Input ScalarExpr
+}
+
+# PercentileDisc returns a value such that N% of values are below it
+# in a given window. Ignores nulls in the input.
+[Scalar, Aggregate]
+define PercentileDisc {
+    Fraction ScalarExpr
+    Input ScalarExpr
+}
+
+# PercentileCont returns a value such that N% of values are below it
+# in a given window, interpolating values if needed. Ignores nulls in the
+# input.
+[Scalar, Aggregate]
+define PercentileCont {
+    Fraction ScalarExpr
     Input ScalarExpr
 }
 

@@ -62,7 +62,7 @@ func storeFromURI(
 		t.Fatal(err)
 	}
 	// Setup a sink for the given args.
-	s, err := MakeExternalStorage(ctx, conf, base.ExternalIOConfig{}, testSettings, clientFactory)
+	s, err := MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, testSettings, clientFactory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,13 +70,13 @@ func storeFromURI(
 }
 
 func testExportStore(t *testing.T, storeURI string, skipSingleFile bool) {
-	testExportStoreWithExternalIOConfig(t, base.ExternalIOConfig{}, storeURI, skipSingleFile)
+	testExportStoreWithExternalIOConfig(t, base.ExternalIODirConfig{}, storeURI, skipSingleFile)
 }
 
 func testExportStoreWithExternalIOConfig(
-	t *testing.T, ioConf base.ExternalIOConfig, storeURI string, skipSingleFile bool,
+	t *testing.T, ioConf base.ExternalIODirConfig, storeURI string, skipSingleFile bool,
 ) {
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	conf, err := ExternalStorageConfFromURI(storeURI)
 	if err != nil {
@@ -221,7 +221,7 @@ func testExportStoreWithExternalIOConfig(
 }
 
 func testListFiles(t *testing.T, storeURI string) {
-	ctx := context.TODO()
+	ctx := context.Background()
 	dataLetterFiles := []string{"file/letters/dataA.csv", "file/letters/dataB.csv", "file/letters/dataC.csv"}
 	dataNumberFiles := []string{"file/numbers/data1.csv", "file/numbers/data2.csv", "file/numbers/data3.csv"}
 	letterFiles := []string{"file/abc/A.csv", "file/abc/B.csv", "file/abc/C.csv"}
@@ -433,7 +433,7 @@ func TestPutGoogleCloud(t *testing.T) {
 	})
 	t.Run("implicit", func(t *testing.T) {
 		// Only test these if they exist.
-		if _, err := google.FindDefaultCredentials(context.TODO()); err != nil {
+		if _, err := google.FindDefaultCredentials(context.Background()); err != nil {
 			t.Skip(err)
 		}
 		testExportStore(t,
@@ -476,7 +476,7 @@ func TestWorkloadStorage(t *testing.T) {
 
 	{
 		s, err := ExternalStorageFromURI(
-			ctx, bankURL().String(), base.ExternalIOConfig{},
+			ctx, bankURL().String(), base.ExternalIODirConfig{},
 			settings, blobs.TestEmptyBlobClientFactory,
 		)
 		require.NoError(t, err)
@@ -496,7 +496,7 @@ func TestWorkloadStorage(t *testing.T) {
 		params := map[string]string{
 			`row-start`: `1`, `row-end`: `3`, `payload-bytes`: `14`, `batch-size`: `1`}
 		s, err := ExternalStorageFromURI(
-			ctx, bankURL(params).String(), base.ExternalIOConfig{},
+			ctx, bankURL(params).String(), base.ExternalIODirConfig{},
 			settings, blobs.TestEmptyBlobClientFactory,
 		)
 		require.NoError(t, err)
@@ -511,32 +511,32 @@ func TestWorkloadStorage(t *testing.T) {
 	}
 
 	_, err := ExternalStorageFromURI(
-		ctx, `workload:///nope`, base.ExternalIOConfig{},
+		ctx, `workload:///nope`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `path must be of the form /<format>/<generator>/<table>: /nope`)
 	_, err = ExternalStorageFromURI(
-		ctx, `workload:///fmt/bank/bank?version=`, base.ExternalIOConfig{},
+		ctx, `workload:///fmt/bank/bank?version=`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `unsupported format: fmt`)
 	_, err = ExternalStorageFromURI(
-		ctx, `workload:///csv/nope/nope?version=`, base.ExternalIOConfig{},
+		ctx, `workload:///csv/nope/nope?version=`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `unknown generator: nope`)
 	_, err = ExternalStorageFromURI(
-		ctx, `workload:///csv/bank/bank`, base.ExternalIOConfig{},
+		ctx, `workload:///csv/bank/bank`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `parameter version is required`)
 	_, err = ExternalStorageFromURI(
-		ctx, `workload:///csv/bank/bank?version=`, base.ExternalIOConfig{},
+		ctx, `workload:///csv/bank/bank?version=`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `expected bank version "" but got "1.0.0"`)
 	_, err = ExternalStorageFromURI(
-		ctx, `workload:///csv/bank/bank?version=nope`, base.ExternalIOConfig{},
+		ctx, `workload:///csv/bank/bank?version=nope`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `expected bank version "nope" but got "1.0.0"`)

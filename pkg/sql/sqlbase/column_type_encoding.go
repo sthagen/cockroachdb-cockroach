@@ -160,6 +160,11 @@ func EncodeTableKey(b []byte, val tree.Datum, dir encoding.Direction) ([]byte, e
 			return encoding.EncodeVarintAscending(b, int64(t.DInt)), nil
 		}
 		return encoding.EncodeVarintDescending(b, int64(t.DInt)), nil
+	case *tree.DEnum:
+		if dir == encoding.Ascending {
+			return encoding.EncodeBytesAscending(b, t.PhysicalRep), nil
+		}
+		return encoding.EncodeBytesDescending(b, t.PhysicalRep), nil
 	}
 	return nil, errors.Errorf("unable to encode table key: %T", val)
 }
@@ -348,6 +353,21 @@ func DecodeTableKey(
 			rkey, i, err = encoding.DecodeVarintDescending(key)
 		}
 		return a.NewDOid(tree.MakeDOid(tree.DInt(i))), rkey, err
+	case types.EnumFamily:
+		var r []byte
+		if dir == encoding.Ascending {
+			rkey, r, err = encoding.DecodeBytesAscending(key, nil)
+		} else {
+			rkey, r, err = encoding.DecodeBytesDescending(key, nil)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		phys, log, err := tree.GetEnumComponentsFromPhysicalRep(valType, r)
+		if err != nil {
+			return nil, nil, err
+		}
+		return a.NewDEnum(tree.DEnum{EnumTyp: valType, PhysicalRep: phys, LogicalRep: log}), rkey, nil
 	default:
 		return nil, nil, errors.Errorf("unable to decode table key: %s", valType)
 	}
@@ -444,10 +464,10 @@ func DecodeTableValue(a *DatumAlloc, valType *types.T, b []byte) (tree.Datum, []
 	if valType.Family() != types.BoolFamily {
 		b = b[dataOffset:]
 	}
-	return decodeUntaggedDatum(a, valType, b)
+	return DecodeUntaggedDatum(a, valType, b)
 }
 
-// decodeUntaggedDatum is used to decode a Datum whose type is known,
+// DecodeUntaggedDatum is used to decode a Datum whose type is known,
 // and which doesn't have a value tag (either due to it having been
 // consumed already or not having one in the first place).
 //
@@ -455,7 +475,7 @@ func DecodeTableValue(a *DatumAlloc, valType *types.T, b []byte) (tree.Datum, []
 //
 // If t is types.Bool, the value tag must be present, as its value is encoded in
 // the tag directly.
-func decodeUntaggedDatum(a *DatumAlloc, t *types.T, buf []byte) (tree.Datum, []byte, error) {
+func DecodeUntaggedDatum(a *DatumAlloc, t *types.T, buf []byte) (tree.Datum, []byte, error) {
 	switch t.Family() {
 	case types.IntFamily:
 		b, i, err := encoding.DecodeUntaggedIntValue(buf)
@@ -578,7 +598,11 @@ func decodeUntaggedDatum(a *DatumAlloc, t *types.T, buf []byte) (tree.Datum, []b
 		if err != nil {
 			return nil, b, err
 		}
-		return tree.MakeDEnumFromPhysicalRepresentation(t, data), b, nil
+		phys, log, err := tree.GetEnumComponentsFromPhysicalRep(t, data)
+		if err != nil {
+			return nil, nil, err
+		}
+		return a.NewDEnum(tree.DEnum{EnumTyp: t, PhysicalRep: phys, LogicalRep: log}), b, nil
 	default:
 		return nil, buf, errors.Errorf("couldn't decode type %s", t)
 	}
@@ -723,6 +747,11 @@ func MarshalColumnValue(col *ColumnDescriptor, val tree.Datum) (roachpb.Value, e
 	case types.OidFamily:
 		if v, ok := val.(*tree.DOid); ok {
 			r.SetInt(int64(v.DInt))
+			return r, nil
+		}
+	case types.EnumFamily:
+		if v, ok := val.(*tree.DEnum); ok {
+			r.SetBytes(v.PhysicalRep)
 			return r, nil
 		}
 	default:
@@ -876,6 +905,7 @@ func UnmarshalColumnValue(a *DatumAlloc, typ *types.T, value roachpb.Value) (tre
 			return nil, err
 		}
 		datum, _, err := decodeArrayNoMarshalColumnValue(a, typ.ArrayContents(), v)
+		// TODO(yuzefovich): do we want to create a new object via DatumAlloc?
 		return datum, err
 	case types.JsonFamily:
 		v, err := value.GetBytes()
@@ -887,6 +917,16 @@ func UnmarshalColumnValue(a *DatumAlloc, typ *types.T, value roachpb.Value) (tre
 			return nil, err
 		}
 		return tree.NewDJSON(jsonDatum), nil
+	case types.EnumFamily:
+		v, err := value.GetBytes()
+		if err != nil {
+			return nil, err
+		}
+		phys, log, err := tree.GetEnumComponentsFromPhysicalRep(typ, v)
+		if err != nil {
+			return nil, err
+		}
+		return a.NewDEnum(tree.DEnum{EnumTyp: typ, PhysicalRep: phys, LogicalRep: log}), nil
 	default:
 		return nil, errors.Errorf("unsupported column type: %s", typ.Family())
 	}
@@ -1065,7 +1105,7 @@ func decodeArrayNoMarshalColumnValue(
 			result.HasNulls = true
 		} else {
 			result.HasNonNulls = true
-			val, b, err = decodeUntaggedDatum(a, elementType, b)
+			val, b, err = DecodeUntaggedDatum(a, elementType, b)
 			if err != nil {
 				return nil, b, err
 			}
@@ -1188,7 +1228,7 @@ func datumTypeToArrayElementEncodingType(t *types.T) (encoding.Type, error) {
 		return encoding.Geo, nil
 	case types.DecimalFamily:
 		return encoding.Decimal, nil
-	case types.BytesFamily, types.StringFamily, types.CollatedStringFamily:
+	case types.BytesFamily, types.StringFamily, types.CollatedStringFamily, types.EnumFamily:
 		return encoding.Bytes, nil
 	case types.TimestampFamily, types.TimestampTZFamily:
 		return encoding.Time, nil
@@ -1276,6 +1316,8 @@ func encodeArrayElement(b []byte, d tree.Datum) ([]byte, error) {
 		return encoding.EncodeUntaggedBytesValue(b, []byte(t.Contents)), nil
 	case *tree.DOidWrapper:
 		return encodeArrayElement(b, t.Wrapped)
+	case *tree.DEnum:
+		return encoding.EncodeUntaggedBytesValue(b, t.PhysicalRep), nil
 	default:
 		return nil, errors.Errorf("don't know how to encode %s (%T)", d, d)
 	}

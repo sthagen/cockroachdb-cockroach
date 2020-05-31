@@ -199,6 +199,9 @@ func calcArrayOid(elemTyp *T) oid.Oid {
 		// so return 0 for that case (since there's no T__unknown). This is what
 		// previous versions of CRDB returned for this case.
 		return unknownArrayOid
+
+	case EnumFamily:
+		return StableTypeIDToOID(elemTyp.StableArrayTypeID())
 	}
 
 	// Map the OID of the array element type to the corresponding array OID.

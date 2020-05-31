@@ -99,6 +99,32 @@ var unaryOperatorTestCases = []struct {
 			expectedPerimeter: 9632838.874863794,
 		},
 	},
+	{
+		wkt: "GEOMETRYCOLLECTION (MULTIPOINT EMPTY, POINT (40 10),LINESTRING (10 10, 20 20, 10 40),POLYGON ((40 40, 20 45, 45 30, 40 40)))",
+		sphere: unaryOperatorExpectedResult{
+			expectedArea:      691570576619.521,
+			expectedLength:    9637039.459995955,
+			expectedPerimeter: 9637039.459995955,
+		},
+		spheroid: unaryOperatorExpectedResult{
+			expectedArea:      691638769184.1753,
+			expectedLength:    9632838.874863794,
+			expectedPerimeter: 9632838.874863794,
+		},
+	},
+	{
+		wkt: "GEOMETRYCOLLECTION EMPTY",
+		sphere: unaryOperatorExpectedResult{
+			expectedArea:      0,
+			expectedLength:    0,
+			expectedPerimeter: 0,
+		},
+		spheroid: unaryOperatorExpectedResult{
+			expectedArea:      0,
+			expectedLength:    0,
+			expectedPerimeter: 0,
+		},
+	},
 }
 
 func TestArea(t *testing.T) {
@@ -109,7 +135,7 @@ func TestArea(t *testing.T) {
 
 			for _, subTC := range []struct {
 				desc                string
-				useSphereOrSpheroid useSphereOrSpheroid
+				useSphereOrSpheroid UseSphereOrSpheroid
 				expected            float64
 			}{
 				{"sphere", UseSphere, tc.sphere.expectedArea},
@@ -140,7 +166,7 @@ func TestPerimeter(t *testing.T) {
 
 			for _, subTC := range []struct {
 				desc                string
-				useSphereOrSpheroid useSphereOrSpheroid
+				useSphereOrSpheroid UseSphereOrSpheroid
 				expected            float64
 			}{
 				{"sphere", UseSphere, tc.sphere.expectedPerimeter},
@@ -171,7 +197,7 @@ func TestLength(t *testing.T) {
 
 			for _, subTC := range []struct {
 				desc                string
-				useSphereOrSpheroid useSphereOrSpheroid
+				useSphereOrSpheroid UseSphereOrSpheroid
 				expected            float64
 			}{
 				{"sphere", UseSphere, tc.sphere.expectedLength},

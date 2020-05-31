@@ -9,14 +9,62 @@
 package backupccl_test
 
 import (
+	"context"
 	"fmt"
 	"reflect"
+	"strconv"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
+
+func backupRestoreTestSetupEmptyWithParams(
+	t testing.TB,
+	clusterSize int,
+	dir string,
+	init func(tc *testcluster.TestCluster),
+	params base.TestClusterArgs,
+) (ctx context.Context, tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, cleanup func()) {
+	ctx = context.Background()
+
+	params.ServerArgs.ExternalIODir = dir
+	tc = testcluster.StartTestCluster(t, clusterSize, params)
+	init(tc)
+
+	sqlDB = sqlutils.MakeSQLRunner(tc.Conns[0])
+
+	cleanupFn := func() {
+		tc.Stopper().Stop(ctx) // cleans up in memory storage's auxiliary dirs
+	}
+
+	return ctx, tc, sqlDB, cleanupFn
+}
+
+func createEmptyCluster(
+	t testing.TB, clusterSize int,
+) (sqlDB *sqlutils.SQLRunner, tempDir string, cleanup func()) {
+	ctx := context.Background()
+
+	dir, dirCleanupFn := testutils.TempDir(t)
+	params := base.TestClusterArgs{}
+	params.ServerArgs.ExternalIODir = dir
+	tc := testcluster.StartTestCluster(t, clusterSize, params)
+
+	sqlDB = sqlutils.MakeSQLRunner(tc.Conns[0])
+
+	cleanupFn := func() {
+		tc.Stopper().Stop(ctx) // cleans up in memory storage's auxiliary dirs
+		dirCleanupFn()         // cleans up dir, which is the nodelocal:// storage
+	}
+
+	return sqlDB, dir, cleanupFn
+}
 
 // Large test to ensure that all of the system table data is being restored in
 // the new cluster. Ensures that all the moving pieces are working together.
@@ -70,6 +118,21 @@ func TestFullClusterBackup(t *testing.T) {
 
 	sqlDB.Exec(t, `CREATE STATISTICS my_stats FROM data.bank`)
 	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
+
+	// Create a bunch of user tables on the restoring cluster that we're going
+	// to delete.
+	for i := 0; i < 50; i++ {
+		sqlDBRestore.Exec(t, `CREATE DATABASE db_to_drop`)
+		sqlDBRestore.Exec(t, `CREATE TABLE db_to_drop.table_to_drop (a int)`)
+		sqlDBRestore.Exec(t, `ALTER TABLE db_to_drop.table_to_drop CONFIGURE ZONE USING gc.ttlseconds=1`)
+		sqlDBRestore.Exec(t, `DROP DATABASE db_to_drop`)
+	}
+	// Wait for the GC job to finish to ensure the descriptors no longer exist.
+	sqlDBRestore.CheckQueryResultsRetry(
+		t, "SELECT count(*) FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE GC' AND status = 'running'",
+		[][]string{{"0"}},
+	)
+
 	sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
 
 	t.Run("ensure all databases restored", func(t *testing.T) {
@@ -163,6 +226,29 @@ func TestFullClusterBackup(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("ensure that tables can be created at the execpted ID", func(t *testing.T) {
+		maxID, err := strconv.Atoi(sqlDBRestore.QueryStr(t, "SELECT max(id) FROM system.namespace")[0][0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		dbName, tableName := "new_db", "new_table"
+		// N.B. We skip the database ID that was allocated too the temporary
+		// system table and all of the temporary system tables (1 + 8).
+		numIDsToSkip := 9
+		expectedDBID := maxID + numIDsToSkip + 1
+		expectedTableID := maxID + numIDsToSkip + 2
+		sqlDBRestore.Exec(t, fmt.Sprintf("CREATE DATABASE %s", dbName))
+		sqlDBRestore.Exec(t, fmt.Sprintf("CREATE TABLE %s.%s (a int)", dbName, tableName))
+		sqlDBRestore.CheckQueryResults(
+			t, fmt.Sprintf("SELECT id FROM system.namespace WHERE name = '%s'", dbName),
+			[][]string{{strconv.Itoa(expectedDBID)}},
+		)
+		sqlDBRestore.CheckQueryResults(
+			t, fmt.Sprintf("SELECT id FROM system.namespace WHERE name = '%s'", tableName),
+			[][]string{{strconv.Itoa(expectedTableID)}},
+		)
+	})
 }
 
 func TestFullClusterBackupDroppedTables(t *testing.T) {
@@ -200,6 +286,25 @@ func TestIncrementalFullClusterBackup(t *testing.T) {
 
 	sqlDB.Exec(t, `BACKUP TO $1 INCREMENTAL FROM $2`, incrementalBackupLocation, localFoo)
 	sqlDBRestore.Exec(t, `RESTORE FROM $1, $2`, localFoo, incrementalBackupLocation)
+
+	checkQuery := "SELECT * FROM system.users"
+	sqlDBRestore.CheckQueryResults(t, checkQuery, sqlDB.QueryStr(t, checkQuery))
+}
+
+// TestEmptyFullClusterResotre ensures that we can backup and restore a full
+// cluster backup with only metadata (no user data). Regression test for #49573.
+func TestEmptyFullClusterRestore(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	sqlDB, tempDir, cleanupFn := createEmptyCluster(t, singleNode)
+	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, initNone)
+	defer cleanupFn()
+	defer cleanupEmptyCluster()
+
+	sqlDB.Exec(t, `CREATE USER alice`)
+	sqlDB.Exec(t, `CREATE USER bob`)
+	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
+	sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
 
 	checkQuery := "SELECT * FROM system.users"
 	sqlDBRestore.CheckQueryResults(t, checkQuery, sqlDB.QueryStr(t, checkQuery))

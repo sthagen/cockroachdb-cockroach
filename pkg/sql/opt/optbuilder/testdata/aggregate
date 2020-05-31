@@ -2715,7 +2715,7 @@ corr(int, float) -> float
 build
 SELECT corr('foo', v) FROM kv
 ----
-error (42883): unknown signature: corr(string, int)
+error (22P02): corr(): could not parse "foo" as type int: strconv.ParseInt: parsing "foo": invalid syntax
 
 # Tests for string_agg.
 
@@ -3857,3 +3857,87 @@ scalar-group-by
  └── aggregations
       └── max [as=max:3, type=string]
            └── column2:2 [type=string]
+
+build
+SELECT percentile_disc(0.95) WITHIN GROUP (ORDER BY b) FROM abc;
+----
+scalar-group-by
+ ├── columns: percentile_disc:6
+ ├── window partition=() ordering=+2
+ │    ├── columns: a:1!null b:2 c:3 d:4 column5:5!null percentile_disc:6
+ │    ├── project
+ │    │    ├── columns: column5:5!null a:1!null b:2 c:3 d:4
+ │    │    ├── scan abc
+ │    │    │    └── columns: a:1!null b:2 c:3 d:4
+ │    │    └── projections
+ │    │         └── 0.95 [as=column5:5]
+ │    └── windows
+ │         └── percentile-disc [as=percentile_disc:6, frame="range from unbounded to unbounded"]
+ │              ├── column5:5
+ │              └── b:2
+ └── aggregations
+      └── const-agg [as=percentile_disc:6]
+           └── percentile_disc:6
+
+build
+SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY b) FROM abc;
+----
+scalar-group-by
+ ├── columns: percentile_cont:6
+ ├── window partition=() ordering=+2
+ │    ├── columns: a:1!null b:2 c:3 d:4 column5:5!null percentile_cont:6
+ │    ├── project
+ │    │    ├── columns: column5:5!null a:1!null b:2 c:3 d:4
+ │    │    ├── scan abc
+ │    │    │    └── columns: a:1!null b:2 c:3 d:4
+ │    │    └── projections
+ │    │         └── 0.95 [as=column5:5]
+ │    └── windows
+ │         └── percentile-cont [as=percentile_cont:6, frame="range from unbounded to unbounded"]
+ │              ├── column5:5
+ │              └── b:2
+ └── aggregations
+      └── const-agg [as=percentile_cont:6]
+           └── percentile_cont:6
+
+build
+SELECT percentile_disc(ARRAY[0.90, 0.95]::float[]) WITHIN GROUP (ORDER BY b) FROM abc;
+----
+scalar-group-by
+ ├── columns: percentile_disc:6
+ ├── window partition=() ordering=+2
+ │    ├── columns: a:1!null b:2 c:3 d:4 column5:5!null percentile_disc:6
+ │    ├── project
+ │    │    ├── columns: column5:5!null a:1!null b:2 c:3 d:4
+ │    │    ├── scan abc
+ │    │    │    └── columns: a:1!null b:2 c:3 d:4
+ │    │    └── projections
+ │    │         └── ARRAY[0.90,0.95]::FLOAT8[] [as=column5:5]
+ │    └── windows
+ │         └── percentile-disc [as=percentile_disc:6, frame="range from unbounded to unbounded"]
+ │              ├── column5:5
+ │              └── b:2
+ └── aggregations
+      └── const-agg [as=percentile_disc:6]
+           └── percentile_disc:6
+
+build
+SELECT percentile_cont(ARRAY[0.90, 0.95]::float[]) WITHIN GROUP (ORDER BY b) FROM abc;
+----
+scalar-group-by
+ ├── columns: percentile_cont:6
+ ├── window partition=() ordering=+2
+ │    ├── columns: a:1!null b:2 c:3 d:4 column5:5!null percentile_cont:6
+ │    ├── project
+ │    │    ├── columns: column5:5!null a:1!null b:2 c:3 d:4
+ │    │    ├── scan abc
+ │    │    │    └── columns: a:1!null b:2 c:3 d:4
+ │    │    └── projections
+ │    │         └── ARRAY[0.90,0.95]::FLOAT8[] [as=column5:5]
+ │    └── windows
+ │         └── percentile-cont [as=percentile_cont:6, frame="range from unbounded to unbounded"]
+ │              ├── column5:5
+ │              └── b:2
+ └── aggregations
+      └── const-agg [as=percentile_cont:6]
+           └── percentile_cont:6

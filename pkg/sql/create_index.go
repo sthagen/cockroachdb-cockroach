@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -24,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -38,7 +40,7 @@ type createIndexNode struct {
 //          mysql requires INDEX on the table.
 func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNode, error) {
 	tableDesc, err := p.ResolveMutableTableDescriptor(
-		ctx, &n.Table, true /*required*/, ResolveRequireTableDesc,
+		ctx, &n.Table, true /*required*/, resolver.ResolveRequireTableDesc,
 	)
 	if err != nil {
 		return nil, err
@@ -98,7 +100,7 @@ func (p *planner) setupFamilyAndConstraintForShard(
 	}
 	// Avoid creating duplicate check constraints.
 	if _, ok := inuseNames[ckName]; !ok {
-		ck, err := MakeCheckConstraint(ctx, tableDesc, ckDef, inuseNames,
+		ck, err := makeCheckConstraint(ctx, tableDesc, ckDef, inuseNames,
 			&p.semaCtx, p.tableName)
 		if err != nil {
 			return err
@@ -198,6 +200,18 @@ func MakeIndexDescriptor(
 		telemetry.Inc(sqltelemetry.HashShardedIndexCounter)
 	}
 
+	if n.Predicate != nil {
+		// TODO(mgartner): remove this once partial indexes are fully supported.
+		if !params.SessionData().PartialIndexes {
+			return nil, unimplemented.NewWithIssue(9683, "partial indexes are not supported")
+		}
+
+		_, err := validateIndexPredicate(params.ctx, tableDesc, n.Predicate, &params.p.semaCtx, n.Table)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if err := indexDesc.FillColumns(n.Columns); err != nil {
 		return nil, err
 	}
@@ -255,7 +269,7 @@ func setupShardedIndex(
 	for _, c := range *columns {
 		colNames = append(colNames, string(c.Column))
 	}
-	buckets, err := sqlbase.EvalShardBucketCount(semaCtx, evalCtx, bucketsExpr)
+	buckets, err := sqlbase.EvalShardBucketCount(ctx, semaCtx, evalCtx, bucketsExpr)
 	if err != nil {
 		return nil, false, err
 	}

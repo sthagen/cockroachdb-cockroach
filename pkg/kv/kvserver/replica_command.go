@@ -23,8 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -40,7 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	"github.com/gogo/protobuf/proto"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 	"go.etcd.io/etcd/raft/tracker"
@@ -132,14 +131,12 @@ func prepareSplitDescs(
 	}
 
 	leftDesc.IncrementGeneration()
-	leftDesc.GenerationComparable = proto.Bool(true)
 	leftDesc.EndKey = splitKey
 
 	// Set the generation of the right hand side descriptor to match that of the
 	// (updated) left hand side. See the comment on the field for an explanation
 	// of why generations are useful.
 	rightDesc.Generation = leftDesc.Generation
-	rightDesc.GenerationComparable = proto.Bool(true)
 
 	setStickyBit(rightDesc, expiration)
 	return leftDesc, rightDesc
@@ -329,13 +326,13 @@ func (r *Replica) adminSplitWithDescriptor(
 			// If the key that routed this request to this range is now out of this
 			// range's bounds, return an error for the client to try again on the
 			// correct range.
-			if !storagebase.ContainsKey(desc, args.Key) {
+			if !kvserverbase.ContainsKey(desc, args.Key) {
 				return reply, roachpb.NewRangeKeyMismatchError(args.Key, args.Key, desc)
 			}
 			foundSplitKey = args.SplitKey
 		}
 
-		if !storagebase.ContainsKey(desc, foundSplitKey) {
+		if !kvserverbase.ContainsKey(desc, foundSplitKey) {
 			return reply, errors.Errorf("requested split key %s out of bounds of %s", args.SplitKey, r)
 		}
 
@@ -644,11 +641,10 @@ func (r *Replica) AdminMerge(
 		updatedLeftDesc := *origLeftDesc
 		// lhs.Generation = max(rhs.Generation, lhs.Generation)+1.
 		// See the comment on the Generation field for why generation are useful.
-		if updatedLeftDesc.GetGeneration() < rightDesc.GetGeneration() {
+		if updatedLeftDesc.Generation < rightDesc.Generation {
 			updatedLeftDesc.Generation = rightDesc.Generation
 		}
 		updatedLeftDesc.IncrementGeneration()
-		updatedLeftDesc.GenerationComparable = proto.Bool(true)
 		updatedLeftDesc.EndKey = rightDesc.EndKey
 		log.Infof(ctx, "initiating a merge of %s into this range (%s)", &rightDesc, reason)
 
@@ -930,7 +926,7 @@ func (r *Replica) ChangeReplicas(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	priority SnapshotRequest_Priority,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs roachpb.ReplicationChanges,
 ) (updatedDesc *roachpb.RangeDescriptor, _ error) {
@@ -964,7 +960,7 @@ func (r *Replica) changeReplicasImpl(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	priority SnapshotRequest_Priority,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs roachpb.ReplicationChanges,
 ) (updatedDesc *roachpb.RangeDescriptor, _ error) {
@@ -1054,7 +1050,7 @@ func maybeLeaveAtomicChangeReplicas(
 	//
 	// TODO(tbg): reconsider this.
 	return execChangeReplicasTxn(
-		ctx, store, desc, storagepb.ReasonUnknown /* unused */, "", nil, /* iChgs */
+		ctx, store, desc, kvserverpb.ReasonUnknown /* unused */, "", nil, /* iChgs */
 	)
 }
 
@@ -1089,7 +1085,7 @@ func maybeLeaveAtomicChangeReplicasAndRemoveLearners(
 	for _, target := range targets {
 		var err error
 		desc, err = execChangeReplicasTxn(
-			ctx, store, desc, storagepb.ReasonAbandonedLearner, "",
+			ctx, store, desc, kvserverpb.ReasonAbandonedLearner, "",
 			[]internalReplicationChange{{target: target, typ: internalChangeTypeRemove}},
 		)
 		if err != nil {
@@ -1157,7 +1153,7 @@ func addLearnerReplicas(
 	ctx context.Context,
 	store *Store,
 	desc *roachpb.RangeDescriptor,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 	targets []roachpb.ReplicationTarget,
 ) (*roachpb.RangeDescriptor, error) {
@@ -1234,7 +1230,7 @@ func (r *Replica) atomicReplicationChange(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	priority SnapshotRequest_Priority,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs roachpb.ReplicationChanges,
 ) (*roachpb.RangeDescriptor, error) {
@@ -1319,7 +1315,7 @@ func (r *Replica) tryRollBackLearnerReplica(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	target roachpb.ReplicationTarget,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 ) {
 	repDesc, ok := desc.GetReplicaDescriptor(target.StoreID)
@@ -1405,7 +1401,6 @@ func prepareChangeReplicasTrigger(
 	updatedDesc := *desc
 	updatedDesc.SetReplicas(desc.Replicas().DeepCopy())
 	updatedDesc.IncrementGeneration()
-	updatedDesc.GenerationComparable = proto.Bool(true)
 
 	var added, removed []roachpb.ReplicaDescriptor
 	if !chgs.leaveJoint() {
@@ -1540,7 +1535,7 @@ func execChangeReplicasTxn(
 	ctx context.Context,
 	store *Store,
 	referenceDesc *roachpb.RangeDescriptor,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs internalReplicationChanges,
 ) (*roachpb.RangeDescriptor, error) {
@@ -2139,7 +2134,7 @@ func (s *Store) relocateOne(
 		return nil, nil, err
 	}
 
-	storeList, _, _ := s.allocator.storePool.getStoreList(desc.RangeID, storeFilterNone)
+	storeList, _, _ := s.allocator.storePool.getStoreList(storeFilterNone)
 	storeMap := storeListToMap(storeList)
 
 	// Compute which replica to add and/or remove, respectively. We ask the allocator

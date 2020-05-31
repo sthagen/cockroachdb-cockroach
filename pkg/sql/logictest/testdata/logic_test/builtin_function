@@ -1,3 +1,9 @@
+# 3node-tenant fails due to:
+# https://github.com/cockroachdb/cockroach/issues/48375
+# Specifically, a status server is unavailable when attempting to set a zone
+# config.
+# LogicTest: !3node-tenant
+
 statement ok
 CREATE TABLE foo (a int)
 
@@ -1559,7 +1565,7 @@ SELECT foo.* IS NOT TRUE FROM (VALUES (1)) AS foo(x)
 query T
 SELECT current_schemas(true)
 ----
-{pg_catalog,public}
+{pg_catalog,pg_extension,public}
 
 query T
 SELECT current_schemas(false)
@@ -1571,7 +1577,7 @@ SELECT current_schemas(false)
 query T
 SELECT current_schemas(x) FROM (VALUES (true), (false)) AS t(x);
 ----
-{pg_catalog,public}
+{pg_catalog,pg_extension,public}
 {public}
 
 statement ok
@@ -1878,7 +1884,7 @@ SELECT from_uuid(b'f00d')
 query T
 SELECT pg_catalog.pg_typeof(sign(1:::decimal))
 ----
-decimal
+numeric
 
 query T
 VALUES (pg_typeof(1:::int)),
@@ -1891,15 +1897,15 @@ VALUES (pg_typeof(1:::int)),
        (pg_typeof(b'a':::bytes)),
        (pg_typeof(array[1,2,3]))
 ----
-int
-string
-bool
+bigint
+text
+boolean
 unknown
 interval
 date
-timestamptz
-bytes
-int[]
+timestamp with time zone
+bytea
+bigint[]
 
 query T
 VALUES (format_type('anyelement'::regtype, -1)),

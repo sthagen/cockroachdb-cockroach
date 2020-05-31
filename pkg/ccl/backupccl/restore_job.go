@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/covering"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -448,7 +449,7 @@ func WriteTableDescs(
 				desc.Privileges = sqlbase.NewDefaultPrivilegeDescriptor()
 			}
 			wroteDBs[desc.ID] = desc
-			if err := sql.WriteNewDescToBatch(ctx, false /* kvTrace */, settings, b, keys.SystemSQLCodec, desc.ID, desc); err != nil {
+			if err := catalogkv.WriteNewDescToBatch(ctx, false /* kvTrace */, settings, b, keys.SystemSQLCodec, desc.ID, desc); err != nil {
 				return err
 			}
 			// Depending on which cluster version we are restoring to, we decide which
@@ -480,7 +481,7 @@ func WriteTableDescs(
 					tables[i].Privileges = parentDB.GetPrivileges()
 				}
 			}
-			if err := sql.WriteNewDescToBatch(ctx, false /* kvTrace */, settings, b, keys.SystemSQLCodec, tables[i].ID, tables[i]); err != nil {
+			if err := catalogkv.WriteNewDescToBatch(ctx, false /* kvTrace */, settings, b, keys.SystemSQLCodec, tables[i].ID, tables[i]); err != nil {
 				return err
 			}
 			// Depending on which cluster version we are restoring to, we decide which
@@ -888,15 +889,15 @@ func createImportingTables(
 			}
 		}
 	}
-	var tempSystemDBID sqlbase.ID
+	tempSystemDBID := keys.MinNonPredefinedUserDescID
 	for id := range details.TableRewrites {
-		if uint32(id) > uint32(tempSystemDBID) {
-			tempSystemDBID = id
+		if int(id) > tempSystemDBID {
+			tempSystemDBID = int(id)
 		}
 	}
 	if details.DescriptorCoverage == tree.AllDescriptors {
 		databases = append(databases, &sqlbase.DatabaseDescriptor{
-			ID:         tempSystemDBID,
+			ID:         sqlbase.ID(tempSystemDBID),
 			Name:       restoreTempSystemDB,
 			Privileges: sqlbase.NewDefaultPrivilegeDescriptor(),
 		})
@@ -1075,6 +1076,7 @@ func (r *restoreResumer) publishTables(ctx context.Context) error {
 	}
 	log.Event(ctx, "making tables live")
 
+	newSchemaChangeJobs := make([]*jobs.StartableJob, 0)
 	err := r.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		// Write the new TableDescriptors and flip state over to public so they can be
 		// accessed.
@@ -1083,6 +1085,13 @@ func (r *restoreResumer) publishTables(ctx context.Context) error {
 			tableDesc := *tbl
 			tableDesc.Version++
 			tableDesc.State = sqlbase.TableDescriptor_PUBLIC
+			// Convert any mutations that were in progress on the table descriptor
+			// when the backup was taken, and convert them to schema change jobs.
+			newJobs, err := createSchemaChangeJobsFromMutations(ctx, r.execCfg.JobRegistry, r.execCfg.Codec, txn, r.job.Payload().Username, &tableDesc)
+			if err != nil {
+				return err
+			}
+			newSchemaChangeJobs = append(newSchemaChangeJobs, newJobs...)
 			existingDescVal, err := sqlbase.ConditionalGetTableDescFromTxn(ctx, txn, r.execCfg.Codec, tbl)
 			if err != nil {
 				return errors.Wrap(err, "validating table descriptor has not changed")
@@ -1101,6 +1110,11 @@ func (r *restoreResumer) publishTables(ctx context.Context) error {
 		// Update and persist the state of the job.
 		details.TablesPublished = true
 		if err := r.job.WithTxn(txn).SetDetails(ctx, details); err != nil {
+			for _, newJob := range newSchemaChangeJobs {
+				if cleanupErr := newJob.CleanupOnRollback(ctx); cleanupErr != nil {
+					log.Warningf(ctx, "failed to clean up job %d: %v", newJob.ID(), cleanupErr)
+				}
+			}
 			return errors.Wrap(err, "updating job details after publishing tables")
 		}
 
@@ -1108,6 +1122,13 @@ func (r *restoreResumer) publishTables(ctx context.Context) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Start the schema change jobs we created.
+	for _, newJob := range newSchemaChangeJobs {
+		if _, err := newJob.Start(ctx); err != nil {
+			return err
+		}
 	}
 
 	// Initiate a run of CREATE STATISTICS. We don't know the actual number of

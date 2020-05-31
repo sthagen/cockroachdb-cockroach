@@ -123,7 +123,12 @@ func (b *overloadBase) String() string {
 }
 
 func toString(family types.Family) string {
-	return "types." + family.String()
+	switch family {
+	case typeconv.DatumVecCanonicalTypeFamily:
+		return "typeconv.DatumVecCanonicalTypeFamily"
+	default:
+		return "types." + family.String()
+	}
 }
 
 type argTypeOverloadBase struct {
@@ -267,12 +272,13 @@ type lastArgWidthOverload struct {
 func newLastArgWidthOverload(
 	typeOverload *lastArgTypeOverload, width int32, retType *types.T,
 ) *lastArgWidthOverload {
+	retCanonicalTypeFamily := typeconv.TypeFamilyToCanonicalTypeFamily(retType.Family())
 	lawo := &lastArgWidthOverload{
 		lastArgTypeOverload:  typeOverload,
 		argWidthOverloadBase: newArgWidthOverloadBase(typeOverload.argTypeOverloadBase, width),
 		RetType:              retType,
-		RetVecMethod:         toVecMethod(retType.Family(), retType.Width()),
-		RetGoType:            toPhysicalRepresentation(retType.Family(), retType.Width()),
+		RetVecMethod:         toVecMethod(retCanonicalTypeFamily, retType.Width()),
+		RetGoType:            toPhysicalRepresentation(retCanonicalTypeFamily, retType.Width()),
 	}
 	typeOverload.WidthOverloads = append(typeOverload.WidthOverloads, lawo)
 	return lawo
@@ -336,39 +342,54 @@ type twoArgsResolvedOverloadRightWidthInfo struct {
 	*twoArgsResolvedOverload
 }
 
-type assignFunc func(op *lastArgWidthOverload, target, l, r string) string
-type compareFunc func(target, l, r string) string
+type assignFunc func(op *lastArgWidthOverload, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string) string
+type compareFunc func(targetElem, leftElem, rightElem, leftCol, rightCol string) string
 type castFunc func(to, from string) string
 
-// Assign produces a Go source string that assigns the "target" variable to the
-// result of applying the overload to the two inputs, l and r.
+// Assign produces a Go source string that assigns the "targetElem" variable to
+// the result of applying the overload to the two inputs, "leftElem" and
+// "rightElem". Some overload implementations might need access to the column
+// variable names, and those are provided via the corresponding parameters.
+// Note that these are not generic vectors (i.e. not coldata.Vec) but rather
+// concrete columns (e.g. []int64).
 //
-// For example, an overload that implemented the float64 plus operation, when fed
-// the inputs "x", "a", "b", would produce the string "x = a + b".
-func (o *lastArgWidthOverload) Assign(target, l, r string) string {
+// For example, an overload that implemented the float64 plus operation, when
+// fed the inputs "x", "a", "b", "xCol", "aCol", "bCol", would produce the
+// string "x = a + b".
+func (o *lastArgWidthOverload) Assign(
+	targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string,
+) string {
 	if o.AssignFunc != nil {
-		if ret := o.AssignFunc(o, target, l, r); ret != "" {
+		if ret := o.AssignFunc(
+			o, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol,
+		); ret != "" {
 			return ret
 		}
 	}
 	// Default assign form assumes an infix operator.
-	return fmt.Sprintf("%s = %s %s %s", target, l, o.overloadBase.OpStr, r)
+	return fmt.Sprintf("%s = %s %s %s", targetElem, leftElem, o.overloadBase.OpStr, rightElem)
 }
 
-// Compare produces a Go source string that assigns the "target" variable to the
-// result of comparing the two inputs, l and r. The target will be negative,
-// zero, or positive depending on whether l is less-than, equal-to, or
-// greater-than r.
-func (o *lastArgWidthOverload) Compare(target, l, r string) string {
+// Compare produces a Go source string that assigns the "targetElem" variable to
+// the result of comparing the two inputs, "leftElem" and "rightElem". Some
+// overload implementations might need access to the vector variable names, and
+// those are provided via the corresponding parameters. Note that there is no
+// "targetCol" variable because we know that the target column is []bool.
+//
+// The targetElem will be negative, zero, or positive depending on whether
+// leftElem is less-than, equal-to, or greater-than rightElem.
+func (o *lastArgWidthOverload) Compare(
+	targetElem, leftElem, rightElem, leftCol, rightCol string,
+) string {
 	if o.CompareFunc != nil {
-		if ret := o.CompareFunc(target, l, r); ret != "" {
+		if ret := o.CompareFunc(targetElem, leftElem, rightElem, leftCol, rightCol); ret != "" {
 			return ret
 		}
 	}
 	// Default compare form assumes an infix operator.
 	return fmt.Sprintf(
 		"if %s < %s { %s = -1 } else if %s > %s { %s = 1 } else { %s = 0 }",
-		l, r, target, l, r, target, target)
+		leftElem, rightElem, targetElem, leftElem, rightElem, targetElem, targetElem)
 }
 
 func (o *lastArgWidthOverload) Cast(to, from string) string {
@@ -381,14 +402,14 @@ func (o *lastArgWidthOverload) Cast(to, from string) string {
 	return fmt.Sprintf("%s = %s", to, from)
 }
 
-func (o *lastArgWidthOverload) UnaryAssign(target, v string) string {
+func (o *lastArgWidthOverload) UnaryAssign(targetElem, vElem, targetCol, vVec string) string {
 	if o.AssignFunc != nil {
-		if ret := o.AssignFunc(o, target, v, ""); ret != "" {
+		if ret := o.AssignFunc(o, targetElem, vElem, "", targetCol, vVec, ""); ret != "" {
 			return ret
 		}
 	}
 	// Default assign form assumes a function operator.
-	return fmt.Sprintf("%s = %s(%s)", target, o.overloadBase.OpStr, v)
+	return fmt.Sprintf("%s = %s(%s)", targetElem, o.overloadBase.OpStr, vElem)
 }
 
 func (b *argWidthOverloadBase) GoTypeSliceName() string {
@@ -408,6 +429,8 @@ func (b *argWidthOverloadBase) GoTypeSliceName() string {
 			// This code is unreachable, but the compiler cannot infer that.
 			return ""
 		}
+	case typeconv.DatumVecCanonicalTypeFamily:
+		return "coldata.DatumVec"
 	default:
 		return "[]" + toPhysicalRepresentation(b.CanonicalTypeFamily, b.Width)
 	}
@@ -415,7 +438,7 @@ func (b *argWidthOverloadBase) GoTypeSliceName() string {
 
 func get(family types.Family, target, i string) string {
 	switch family {
-	case types.BytesFamily:
+	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
 		return fmt.Sprintf("%s.Get(%s)", target, i)
 	}
 	return fmt.Sprintf("%s[%s]", target, i)
@@ -428,7 +451,7 @@ func (b *argWidthOverloadBase) Get(target, i string) string {
 
 // ReturnGet is a function that should only be used in templates.
 func (o *lastArgWidthOverload) ReturnGet(target, i string) string {
-	return get(typeconv.TypeFamilyToCanonicalTypeFamily[o.RetType.Family()], target, i)
+	return get(typeconv.TypeFamilyToCanonicalTypeFamily(o.RetType.Family()), target, i)
 }
 
 // CopyVal is a function that should only be used in templates.
@@ -442,15 +465,19 @@ func (b *argWidthOverloadBase) CopyVal(dest, src string) string {
 	return fmt.Sprintf("%s = %s", dest, src)
 }
 
-// Set is a function that should only be used in templates.
-func (b *argWidthOverloadBase) Set(target, i, new string) string {
-	switch b.CanonicalTypeFamily {
-	case types.BytesFamily:
+func set(family types.Family, target, i, new string) string {
+	switch family {
+	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
 		return fmt.Sprintf("%s.Set(%s, %s)", target, i, new)
 	case types.DecimalFamily:
 		return fmt.Sprintf("%s[%s].Set(&%s)", target, i, new)
 	}
 	return fmt.Sprintf("%s[%s] = %s", target, i, new)
+}
+
+// Set is a function that should only be used in templates.
+func (b *argWidthOverloadBase) Set(target, i, new string) string {
+	return set(b.CanonicalTypeFamily, target, i, new)
 }
 
 // Slice is a function that should only be used in templates.
@@ -462,6 +489,8 @@ func (b *argWidthOverloadBase) Slice(target, start, end string) string {
 		return fmt.Sprintf(`%s
 _ = %s
 _ = %s`, target, start, end)
+	case typeconv.DatumVecCanonicalTypeFamily:
+		return fmt.Sprintf(`%s.Slice(%s, %s)`, target, start, end)
 	}
 	return fmt.Sprintf("%s[%s:%s]", target, start, end)
 }
@@ -472,7 +501,7 @@ func (b *argWidthOverloadBase) CopySlice(
 ) string {
 	var tmpl string
 	switch b.CanonicalTypeFamily {
-	case types.BytesFamily:
+	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
 		tmpl = `{{.Tgt}}.CopySlice({{.Src}}, {{.TgtIdx}}, {{.SrcStart}}, {{.SrcEnd}})`
 	case types.DecimalFamily:
 		tmpl = `{
@@ -505,7 +534,7 @@ func (b *argWidthOverloadBase) AppendSlice(
 ) string {
 	var tmpl string
 	switch b.CanonicalTypeFamily {
-	case types.BytesFamily:
+	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
 		tmpl = `{{.Tgt}}.AppendSlice({{.Src}}, {{.TgtIdx}}, {{.SrcStart}}, {{.SrcEnd}})`
 	case types.DecimalFamily:
 		tmpl = `{
@@ -548,7 +577,7 @@ func (b *argWidthOverloadBase) AppendSlice(
 // AppendVal is a function that should only be used in templates.
 func (b *argWidthOverloadBase) AppendVal(target, v string) string {
 	switch b.CanonicalTypeFamily {
-	case types.BytesFamily:
+	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
 		return fmt.Sprintf("%s.AppendVal(%s)", target, v)
 	case types.DecimalFamily:
 		return fmt.Sprintf(`%[1]s = append(%[1]s, apd.Decimal{})
@@ -562,7 +591,7 @@ func (b *argWidthOverloadBase) AppendVal(target, v string) string {
 // type.
 func (b *argWidthOverloadBase) Len(target string) string {
 	switch b.CanonicalTypeFamily {
-	case types.BytesFamily:
+	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
 		return fmt.Sprintf("%s.Len()", target)
 	}
 	return fmt.Sprintf("len(%s)", target)
@@ -571,7 +600,7 @@ func (b *argWidthOverloadBase) Len(target string) string {
 // Range is a function that should only be used in templates.
 func (b *argWidthOverloadBase) Range(loopVariableIdent, target, start, end string) string {
 	switch b.CanonicalTypeFamily {
-	case types.BytesFamily:
+	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
 		return fmt.Sprintf("%[1]s := %[2]s; %[1]s < %[3]s; %[1]s++", loopVariableIdent, start, end)
 	}
 	return fmt.Sprintf("%[1]s := range %[2]s", loopVariableIdent, target)
@@ -583,7 +612,7 @@ func (b *argWidthOverloadBase) Window(target, start, end string) string {
 	case types.BytesFamily:
 		return fmt.Sprintf(`%s.Window(%s, %s)`, target, start, end)
 	}
-	return fmt.Sprintf("%s[%s:%s]", target, start, end)
+	return b.Slice(target, start, end)
 }
 
 // Remove unused warnings.
@@ -724,6 +753,21 @@ type intervalDecimalCustomizer struct{}
 // left-hand side and an interval right-hand side.
 type decimalIntervalCustomizer struct{}
 
+// datumCustomizer supports overloads on tree.Datums.
+type datumCustomizer struct{}
+
+// datumNonDatumCustomizer supports overloads of mixed type binary expressions
+// with a datum left-hand side and non-datum right-hand side.
+type datumNonDatumCustomizer struct{}
+
+// nonDatumDatumCustomizer supports overloads of mixed type binary expressions
+// with a non-datum left-hand side and datum right-hand side.
+type nonDatumDatumCustomizer struct {
+	leftCanonicalTypeFamily types.Family
+}
+
+// TODO(yuzefovich): add support for datums on both sides and non-datum result.
+
 func registerTypeCustomizers() {
 	typeCustomizers = make(map[typePair]typeCustomizer)
 	registerTypeCustomizer(typePair{types.BoolFamily, anyWidth, types.BoolFamily, anyWidth}, boolCustomizer{})
@@ -732,6 +776,7 @@ func registerTypeCustomizers() {
 	registerTypeCustomizer(typePair{types.FloatFamily, anyWidth, types.FloatFamily, anyWidth}, floatCustomizer{})
 	registerTypeCustomizer(typePair{types.TimestampTZFamily, anyWidth, types.TimestampTZFamily, anyWidth}, timestampCustomizer{})
 	registerTypeCustomizer(typePair{types.IntervalFamily, anyWidth, types.IntervalFamily, anyWidth}, intervalCustomizer{})
+	registerTypeCustomizer(typePair{typeconv.DatumVecCanonicalTypeFamily, anyWidth, typeconv.DatumVecCanonicalTypeFamily, anyWidth}, datumCustomizer{})
 	for _, leftIntWidth := range supportedWidthsByCanonicalTypeFamily[types.IntFamily] {
 		for _, rightIntWidth := range supportedWidthsByCanonicalTypeFamily[types.IntFamily] {
 			registerTypeCustomizer(typePair{types.IntFamily, leftIntWidth, types.IntFamily, rightIntWidth}, intCustomizer{width: anyWidth})
@@ -760,6 +805,15 @@ func registerTypeCustomizers() {
 	registerTypeCustomizer(typePair{types.IntervalFamily, anyWidth, types.TimestampTZFamily, anyWidth}, intervalTimestampCustomizer{})
 	registerTypeCustomizer(typePair{types.IntervalFamily, anyWidth, types.DecimalFamily, anyWidth}, intervalDecimalCustomizer{})
 	registerTypeCustomizer(typePair{types.DecimalFamily, anyWidth, types.IntervalFamily, anyWidth}, decimalIntervalCustomizer{})
+
+	for _, compatibleFamily := range compatibleCanonicalTypeFamilies[typeconv.DatumVecCanonicalTypeFamily] {
+		if compatibleFamily != typeconv.DatumVecCanonicalTypeFamily {
+			for _, width := range supportedWidthsByCanonicalTypeFamily[compatibleFamily] {
+				registerTypeCustomizer(typePair{typeconv.DatumVecCanonicalTypeFamily, anyWidth, compatibleFamily, width}, datumNonDatumCustomizer{})
+				registerTypeCustomizer(typePair{compatibleFamily, width, typeconv.DatumVecCanonicalTypeFamily, anyWidth}, nonDatumDatumCustomizer{compatibleFamily})
+			}
+		}
+	}
 }
 
 var supportedCanonicalTypeFamilies = []types.Family{
@@ -770,6 +824,7 @@ var supportedCanonicalTypeFamilies = []types.Family{
 	types.FloatFamily,
 	types.TimestampTZFamily,
 	types.IntervalFamily,
+	typeconv.DatumVecCanonicalTypeFamily,
 }
 
 // anyWidth is special "value" of width of a type that will be used to generate
@@ -783,18 +838,17 @@ var typeWidthReplacement = fmt.Sprintf("{{.Width}}{{if eq .Width %d}}: default{{
 // family to all widths that are supported by that family. Make sure that
 // anyWidth value is the last one in every slice.
 var supportedWidthsByCanonicalTypeFamily = map[types.Family][]int32{
-	types.BoolFamily:        {anyWidth},
-	types.BytesFamily:       {anyWidth},
-	types.DecimalFamily:     {anyWidth},
-	types.IntFamily:         {16, 32, anyWidth},
-	types.FloatFamily:       {anyWidth},
-	types.TimestampTZFamily: {anyWidth},
-	types.IntervalFamily:    {anyWidth},
+	types.BoolFamily:                     {anyWidth},
+	types.BytesFamily:                    {anyWidth},
+	types.DecimalFamily:                  {anyWidth},
+	types.IntFamily:                      {16, 32, anyWidth},
+	types.FloatFamily:                    {anyWidth},
+	types.TimestampTZFamily:              {anyWidth},
+	types.IntervalFamily:                 {anyWidth},
+	typeconv.DatumVecCanonicalTypeFamily: {anyWidth},
 }
 
 var numericCanonicalTypeFamilies = []types.Family{types.IntFamily, types.FloatFamily, types.DecimalFamily}
-
-var timeCanonicalTypeFamilies = []types.Family{types.TimestampTZFamily, types.IntervalFamily}
 
 // toVecMethod returns the method name from coldata.Vec interface that can be
 // used to get the well-typed underlying memory from a vector.
@@ -823,6 +877,8 @@ func toVecMethod(canonicalTypeFamily types.Family, width int32) string {
 		return "Timestamp"
 	case types.IntervalFamily:
 		return "Interval"
+	case typeconv.DatumVecCanonicalTypeFamily:
+		return "Datum"
 	default:
 		colexecerror.InternalError(fmt.Sprintf("unsupported canonical type family %s", canonicalTypeFamily))
 	}
@@ -858,9 +914,31 @@ func toPhysicalRepresentation(canonicalTypeFamily types.Family, width int32) str
 		return "time.Time"
 	case types.IntervalFamily:
 		return "duration.Duration"
+	case typeconv.DatumVecCanonicalTypeFamily:
+		// This is somewhat unfortunate, but we can neither use coldata.Datum
+		// nor tree.Datum because we have generated files living in two
+		// different packages (sql/colexec and col/coldata).
+		return "interface{}"
 	default:
 		colexecerror.InternalError(fmt.Sprintf("unsupported canonical type family %s", canonicalTypeFamily))
 	}
 	// This code is unreachable, but the compiler cannot infer that.
 	return ""
+}
+
+// getDatumVecVariableName returns the variable name for a datumVec given
+// leftCol and rightCol (either of which could be "_" - meaning there is no
+// vector in scope for the corresponding side).
+// - preferRightSide determines whether we prefer the right side.
+func getDatumVecVariableName(leftCol, rightCol string, preferRightSide bool) string {
+	preferredSide, otherSide := leftCol, rightCol
+	if preferRightSide {
+		preferredSide, otherSide = rightCol, leftCol
+	}
+	switch preferredSide {
+	case "_":
+		return otherSide
+	default:
+		return preferredSide
+	}
 }

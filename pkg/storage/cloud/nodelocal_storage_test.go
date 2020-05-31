@@ -37,14 +37,14 @@ func TestPutLocal(t *testing.T) {
 func TestLocalIOLimits(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	const allowed = "/allowed"
 	testSettings.ExternalIODir = allowed
 
 	clientFactory := blobs.TestBlobServiceClient(testSettings.ExternalIODir)
 
 	baseDir, err := ExternalStorageFromURI(
-		ctx, "nodelocal://0/", base.ExternalIOConfig{}, testSettings, clientFactory)
+		ctx, "nodelocal://0/", base.ExternalIODirConfig{}, testSettings, clientFactory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestLocalIOLimits(t *testing.T) {
 	for dest, expected := range map[string]string{allowed: "", "/../../blah": "not allowed"} {
 		u := fmt.Sprintf("nodelocal://0%s", dest)
 		e, err := ExternalStorageFromURI(
-			ctx, u, base.ExternalIOConfig{}, testSettings, clientFactory)
+			ctx, u, base.ExternalIODirConfig{}, testSettings, clientFactory)
 		if err != nil {
 			t.Fatal(err)
 		}

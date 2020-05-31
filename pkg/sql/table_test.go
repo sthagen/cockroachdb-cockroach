@@ -15,32 +15,16 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/stretchr/testify/assert"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
-
-func TestIsSupportedSchemaName(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	testCases := []struct {
-		name  string
-		valid bool
-	}{
-		{"db_name", false},
-		{"public", true},
-		{"pg_temp", true},
-		{"pg_temp_1234_1", true},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.valid, isSupportedSchemaName(tree.Name(tc.name)))
-		})
-	}
-}
 
 func TestMakeTableDescColumns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -188,7 +172,7 @@ func TestMakeTableDescColumns(t *testing.T) {
 	}
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (a " + d.sqlType + " PRIMARY KEY, b " + d.sqlType + ")"
-		schema, err := CreateTestTableDescriptor(context.TODO(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
+		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
 		if err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}
@@ -302,7 +286,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 	}
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (" + d.sql + ")"
-		schema, err := CreateTestTableDescriptor(context.TODO(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
+		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
 		if err != nil {
 			t.Fatalf("%d (%s): %v", i, d.sql, err)
 		}
@@ -319,7 +303,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 func TestPrimaryKeyUnspecified(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := "CREATE TABLE foo.test (a INT, b INT, CONSTRAINT c UNIQUE (b))"
-	desc, err := CreateTestTableDescriptor(context.TODO(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
+	desc, err := CreateTestTableDescriptor(context.Background(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,4 +313,34 @@ func TestPrimaryKeyUnspecified(t *testing.T) {
 	if !testutils.IsError(err, sqlbase.ErrMissingPrimaryKey.Error()) {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestCanCloneTableWithUDT(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+	if _, err := sqlDB.Exec(`
+SET experimental_enable_enums=true;
+CREATE DATABASE test;
+CREATE TYPE test.t AS ENUM ('hello');
+CREATE TABLE test.tt (x test.t);
+`); err != nil {
+		t.Fatal(err)
+	}
+	desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "tt")
+	typLookup := func(id sqlbase.ID) (*tree.TypeName, *sqlbase.TypeDescriptor, error) {
+		typDesc, err := sqlbase.GetTypeDescFromID(ctx, kvDB, keys.SystemSQLCodec, id)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &tree.TypeName{}, typDesc, nil
+	}
+	if err := sqlbase.HydrateTypesInTableDescriptor(desc, typLookup); err != nil {
+		t.Fatal(err)
+	}
+	// Ensure that we can clone this table.
+	_ = protoutil.Clone(desc).(*TableDescriptor)
 }

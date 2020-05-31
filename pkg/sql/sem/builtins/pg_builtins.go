@@ -121,6 +121,10 @@ func initPGBuiltins() {
 	for name, builtin := range makeTypeIOBuiltins("anyarray_", types.AnyArray) {
 		builtins[name] = builtin
 	}
+	// Make enum type i/o builtins.
+	for name, builtin := range makeTypeIOBuiltins("enum_", types.AnyEnum) {
+		builtins[name] = builtin
+	}
 
 	// Make crdb_internal.create_regfoo builtins.
 	for _, typ := range []*types.T{types.RegType, types.RegProc, types.RegProcedure, types.RegClass, types.RegNamespace} {
@@ -755,7 +759,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			Types:      tree.ArgTypes{{"val", types.Any}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return tree.NewDString(args[0].ResolvedType().String()), nil
+				return tree.NewDString(args[0].ResolvedType().SQLStandardName()), nil
 			},
 			Info:       notUsableInfo,
 			Volatility: tree.VolatilityStable,

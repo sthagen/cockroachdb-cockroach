@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -89,8 +88,8 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 		idContainer := base.NewSQLIDContainer(0, &c, true /* exposed */)
 		ac := log.AmbientContext{Tracer: tracing.NewTracer()}
 		r := jobs.MakeRegistry(
-			ac, s.Stopper(), clock, nodeLiveness, db, s.InternalExecutor().(sqlutil.InternalExecutor),
-			idContainer, s.ClusterSettings(), server.DefaultHistogramWindowInterval, jobs.FakePHS, "",
+			ac, s.Stopper(), clock, sqlbase.MakeOptionalNodeLiveness(nodeLiveness), db, s.InternalExecutor().(sqlutil.InternalExecutor),
+			idContainer, s.ClusterSettings(), base.DefaultHistogramWindowInterval(), jobs.FakePHS, "",
 		)
 		if err := r.Start(ctx, s.Stopper(), cancelInterval, adoptInterval); err != nil {
 			t.Fatal(err)

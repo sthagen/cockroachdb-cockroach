@@ -372,10 +372,10 @@ func init() {
 		BoolFlag(f, &startCtx.serverInsecure, cliflags.ServerInsecure, startCtx.serverInsecure)
 
 		// Enable/disable various external storage endpoints.
-		serverCfg.ExternalIOConfig = base.ExternalIOConfig{}
-		BoolFlag(f, &serverCfg.ExternalIOConfig.DisableHTTP,
+		serverCfg.ExternalIODirConfig = base.ExternalIODirConfig{}
+		BoolFlag(f, &serverCfg.ExternalIODirConfig.DisableHTTP,
 			cliflags.ExternalIODisableHTTP, false)
-		BoolFlag(f, &serverCfg.ExternalIOConfig.DisableImplicitCredentials,
+		BoolFlag(f, &serverCfg.ExternalIODirConfig.DisableImplicitCredentials,
 			cliflags.ExtenralIODisableImplicitCredentials, false)
 
 		// Certificates directory. Use a server-specific flag and value to ignore environment
@@ -391,6 +391,7 @@ func init() {
 		// --join, because it delegates its logic to that of 'start', and
 		// 'start' will check that the flag is properly defined.
 		VarFlag(f, &serverCfg.JoinList, cliflags.Join)
+		BoolFlag(f, &serverCfg.JoinPreferSRVRecords, cliflags.JoinPreferSRVRecords, serverCfg.JoinPreferSRVRecords)
 		VarFlag(f, clusterNameSetter{&baseCfg.ClusterName}, cliflags.ClusterName)
 		BoolFlag(f, &baseCfg.DisableClusterNameVerification,
 			cliflags.DisableClusterNameVerification, baseCfg.DisableClusterNameVerification)
@@ -419,7 +420,7 @@ func init() {
 		StringFlag(f, &startCtx.tempDir, cliflags.TempDir, startCtx.tempDir)
 		StringFlag(f, &startCtx.externalIODir, cliflags.ExternalIODir, startCtx.externalIODir)
 
-		VarFlag(f, serverCfg.SQLAuditLogDirName, cliflags.SQLAuditLogDirName)
+		VarFlag(f, serverCfg.AuditLogDirName, cliflags.SQLAuditLogDirName)
 	}
 
 	// Log flags.
@@ -566,18 +567,7 @@ func init() {
 	// Decommission command.
 	VarFlag(decommissionNodeCmd.Flags(), &nodeCtx.nodeDecommissionWait, cliflags.Wait)
 
-	// Quit command.
-	{
-		f := quitCmd.Flags()
-		// The --decommission flag for quit is now deprecated.
-		// Users should use `node decommission` and then `quit` after
-		// decommission completes.
-		// TODO(knz): Remove in 20.2.
-		BoolFlag(f, &quitCtx.serverDecommission, cliflags.Decommission, quitCtx.serverDecommission)
-		_ = f.MarkDeprecated(cliflags.Decommission.Name, `use 'cockroach node decommission' then 'cockroach quit' instead`)
-	}
-
-	// Quit and node drain.
+	// Quit and node drain commands.
 	for _, cmd := range []*cobra.Command{quitCmd, drainNodeCmd} {
 		f := cmd.Flags()
 		DurationFlag(f, &quitCtx.drainWait, cliflags.DrainWait, quitCtx.drainWait)

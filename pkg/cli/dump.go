@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
@@ -519,12 +520,12 @@ func constructTableMetadata(rows *sqlRows, md basicMetadata) (tableMetadata, err
 		}
 
 		// Transform the type name to an internal coltype.
-		sql := fmt.Sprintf("ALTER TABLE woo ALTER COLUMN woo SET DATA TYPE %s", typ)
+		sql := fmt.Sprintf("CREATE TABLE woo (x %s)", typ)
 		stmt, err := parser.ParseOne(sql)
 		if err != nil {
 			return tableMetadata{}, fmt.Errorf("type %s is not a valid CockroachDB type", typ)
 		}
-		ref := stmt.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAlterColumnType).ToType
+		ref := stmt.AST.(*tree.CreateTable).Defs[0].(*tree.ColumnTableDef).Type
 
 		coltyp, ok := tree.GetStaticallyKnownType(ref)
 		if !ok {
@@ -643,7 +644,7 @@ func dumpTableData(w io.Writer, conn *sqlConn, bmd basicMetadata) error {
 	if err != nil {
 		return err
 	}
-
+	var collationEnv tree.CollationEnvironment
 	bs := fmt.Sprintf("SELECT %s FROM %s AS OF SYSTEM TIME %s ORDER BY PRIMARY KEY %[2]s",
 		md.columnNames,
 		md.name,
@@ -714,7 +715,17 @@ func dumpTableData(w io.Writer, conn *sqlConn, bmd basicMetadata) error {
 				case float64:
 					d = tree.NewDFloat(tree.DFloat(t))
 				case string:
-					d = tree.NewDString(t)
+					switch ct := md.columnTypes[cols[si]]; ct.Family() {
+					case types.StringFamily:
+						d = tree.NewDString(t)
+					case types.CollatedStringFamily:
+						d, err = tree.NewDCollatedString(t, ct.Locale(), &collationEnv)
+						if err != nil {
+							return err
+						}
+					default:
+						return errors.AssertionFailedf("unknown string type %s", ct)
+					}
 				case []byte:
 					// TODO(knz): this approach is brittle+flawed, see #28948.
 					switch ct := md.columnTypes[cols[si]]; ct.Family() {
@@ -787,9 +798,9 @@ func dumpTableData(w io.Writer, conn *sqlConn, bmd basicMetadata) error {
 						}
 					case types.TimeFamily:
 						// pq awkwardly represents TIME as a time.Time with date 0000-01-01.
-						d = tree.MakeDTime(timeofday.FromTime(t))
+						d = tree.MakeDTime(timeofday.FromTimeAllow2400(t))
 					case types.TimeTZFamily:
-						d = tree.NewDTimeTZFromTime(t)
+						d = tree.NewDTimeTZ(timetz.MakeTimeTZFromTimeAllow2400(t))
 					case types.TimestampFamily:
 						d, err = tree.MakeDTimestamp(t, time.Nanosecond)
 						if err != nil {

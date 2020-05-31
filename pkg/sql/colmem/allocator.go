@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -31,8 +32,9 @@ import (
 //
 // In the future this can also be used to pool coldata.Vec allocations.
 type Allocator struct {
-	ctx context.Context
-	acc *mon.BoundAccount
+	ctx     context.Context
+	acc     *mon.BoundAccount
+	factory coldata.ColumnFactory
 }
 
 func selVectorSize(capacity int) int64 {
@@ -77,8 +79,14 @@ func GetProportionalBatchMemSize(b coldata.Batch, length int64) int64 {
 }
 
 // NewAllocator constructs a new Allocator instance.
-func NewAllocator(ctx context.Context, acc *mon.BoundAccount) *Allocator {
-	return &Allocator{ctx: ctx, acc: acc}
+func NewAllocator(
+	ctx context.Context, acc *mon.BoundAccount, factory coldata.ColumnFactory,
+) *Allocator {
+	return &Allocator{
+		ctx:     ctx,
+		acc:     acc,
+		factory: factory,
+	}
 }
 
 // NewMemBatch allocates a new in-memory coldata.Batch.
@@ -93,7 +101,7 @@ func (a *Allocator) NewMemBatchWithSize(typs []*types.T, size int) coldata.Batch
 	if err := a.acc.Grow(a.ctx, estimatedMemoryUsage); err != nil {
 		colexecerror.InternalError(err)
 	}
-	return coldata.NewMemBatchWithSize(typs, size)
+	return coldata.NewMemBatchWithSize(typs, size, a.factory)
 }
 
 // NewMemBatchNoCols creates a "skeleton" of new in-memory coldata.Batch. It
@@ -158,7 +166,7 @@ func (a *Allocator) NewMemColumn(t *types.T, n int) coldata.Vec {
 	if err := a.acc.Grow(a.ctx, estimatedMemoryUsage); err != nil {
 		colexecerror.InternalError(err)
 	}
-	return coldata.NewMemColumn(t, n)
+	return coldata.NewMemColumn(t, n, a.factory)
 }
 
 // MaybeAppendColumn might append a newly allocated coldata.Vec of the given
@@ -178,9 +186,21 @@ func (a *Allocator) MaybeAppendColumn(b coldata.Batch, t *types.T, colIdx int) {
 	}
 	width := b.Width()
 	if colIdx < width {
-		presentType := b.ColVec(colIdx).Type()
+		presentVec := b.ColVec(colIdx)
+		presentType := presentVec.Type()
 		if presentType.Identical(t) {
 			// We already have the vector of the desired type in place.
+			if presentVec.CanonicalTypeFamily() == types.BytesFamily {
+				// Flat bytes vector needs to be reset before the vector can be
+				// reused.
+				presentVec.Bytes().Reset()
+			}
+			return
+		}
+		if presentType.Family() == types.UnknownFamily {
+			// We already have an unknown vector in place. If this is expected,
+			// then it will not be accessed and we're good; if this is not
+			// expected, then an error will occur later.
 			return
 		}
 		// We have a vector with an unexpected type, so we panic.
@@ -215,8 +235,18 @@ func (a *Allocator) PerformOperation(destVecs []coldata.Vec, operation func()) {
 	operation()
 	after := getVecsMemoryFootprint(destVecs)
 
-	delta := after - before
-	if delta >= 0 {
+	a.AdjustMemoryUsage(after - before)
+}
+
+// Used returns the number of bytes currently allocated through this allocator.
+func (a *Allocator) Used() int64 {
+	return a.acc.Used()
+}
+
+// AdjustMemoryUsage adjusts the number of bytes currently allocated through
+// this allocator by delta bytes (which can be both positive or negative).
+func (a *Allocator) AdjustMemoryUsage(delta int64) {
+	if delta > 0 {
 		if err := a.acc.Grow(a.ctx, delta); err != nil {
 			colexecerror.InternalError(err)
 		}
@@ -225,14 +255,12 @@ func (a *Allocator) PerformOperation(destVecs []coldata.Vec, operation func()) {
 	}
 }
 
-// Used returns the number of bytes currently allocated through this allocator.
-func (a *Allocator) Used() int64 {
-	return a.acc.Used()
-}
-
 // ReleaseMemory reduces the number of bytes currently allocated through this
-// allocator by (at most) size bytes.
+// allocator by (at most) size bytes. size must be non-negative.
 func (a *Allocator) ReleaseMemory(size int64) {
+	if size < 0 {
+		colexecerror.InternalError(fmt.Sprintf("unexpectedly negative size in ReleaseMemory: %d", size))
+	}
 	if size > a.acc.Used() {
 		size = a.acc.Used()
 	}
@@ -255,6 +283,7 @@ const (
 	SizeOfTime = int(unsafe.Sizeof(time.Time{}))
 	// SizeOfDuration is the size of a single duration.Duration value.
 	SizeOfDuration = int(unsafe.Sizeof(duration.Duration{}))
+	sizeOfDatum    = int(unsafe.Sizeof(tree.Datum(nil)))
 )
 
 // SizeOfBatchSizeSelVector is the size (in bytes) of a selection vector of
@@ -270,7 +299,7 @@ func EstimateBatchSizeBytes(vecTypes []*types.T, batchLength int) int {
 	// acc represents the number of bytes to represent a row in the batch.
 	acc := 0
 	for _, t := range vecTypes {
-		switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+		switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 		case types.BoolFamily:
 			acc += SizeOfBool
 		case types.BytesFamily:
@@ -307,10 +336,15 @@ func EstimateBatchSizeBytes(vecTypes []*types.T, batchLength int) int {
 			acc += SizeOfTime
 		case types.IntervalFamily:
 			acc += SizeOfDuration
-		case types.UnknownFamily:
-			// Placeholder coldata.Vecs of unknown types are allowed.
+		case typeconv.DatumVecCanonicalTypeFamily:
+			// In datum vec we need to account for memory underlying the struct
+			// that is the implementation of tree.Datum interface (for example,
+			// tree.DBoolFalse) as well as for the overhead of storing that
+			// implementation in the slice of tree.Datums.
+			implementationSize, _ := tree.DatumTypeSize(t)
+			acc += int(implementationSize) + sizeOfDatum
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled type %s", t.String()))
+			colexecerror.InternalError(fmt.Sprintf("unhandled type %s", t))
 		}
 	}
 	return acc * batchLength

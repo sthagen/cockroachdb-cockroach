@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/diagutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -108,7 +109,7 @@ func TestUsageQuantization(t *testing.T) {
 	defer r.Close()
 
 	st := cluster.MakeTestingClusterSettings()
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	url := r.URL()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
@@ -208,7 +209,7 @@ func TestReportUsage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	const elemName = "somestring"
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	r := diagutils.NewServer()
 	defer r.Close()
@@ -233,7 +234,7 @@ func TestReportUsage(t *testing.T) {
 			},
 		},
 		Knobs: base.TestingKnobs{
-			SQLLeaseManager: &sql.LeaseManagerTestingKnobs{
+			SQLLeaseManager: &lease.ManagerTestingKnobs{
 				// Disable SELECT called for delete orphaned leases to keep
 				// query stats stable.
 				DisableDeleteOrphanedLeases: true,
@@ -247,7 +248,7 @@ func TestReportUsage(t *testing.T) {
 	}
 
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO()) // stopper will wait for the update/report loop to finish too.
+	defer s.Stopper().Stop(context.Background()) // stopper will wait for the update/report loop to finish too.
 	ts := s.(*TestServer)
 
 	// make sure the test's generated activity is the only activity we measure.

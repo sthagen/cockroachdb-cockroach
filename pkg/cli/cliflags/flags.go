@@ -375,6 +375,17 @@ or both forms can be used together, for example:
 </PRE>`,
 	}
 
+	JoinPreferSRVRecords = FlagInfo{
+		Name: "experimental-dns-srv",
+		Description: `
+When enabled, the node will first attempt to fetch SRV records
+from DNS for every name specified with --join. If a valid
+SRV record is found, that information is used instead
+of regular DNS A/AAAA lookups.
+This feature is experimental and may be removed or modified
+in a later version.`,
+	}
+
 	ListenAddr = FlagInfo{
 		Name: "listen-addr",
 		Description: `
@@ -902,11 +913,6 @@ If specified, takes priority over host/port flags.`,
 		Description: `
 If specified, print the system config contents. Beware that the output will be
 long and not particularly human-readable.`,
-	}
-
-	Decommission = FlagInfo{
-		Name:        "decommission",
-		Description: `Deprecated: use 'node decommission' instead.`,
 	}
 
 	DrainWait = FlagInfo{

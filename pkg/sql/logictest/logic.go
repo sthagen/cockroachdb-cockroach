@@ -109,6 +109,17 @@ import (
 // logicTestConfigs. If the directive is missing, the test is run in the
 // default configuration.
 //
+// The directive also supports blacklists, i.e. running all specified
+// configurations apart from a blacklisted configuration:
+//
+//   # LogicTest: default-configs !3node-tenant
+//
+// If a blacklist is specified without an accompanying configuration, the
+// default config is assumed. i.e., the following directive is equivalent to the
+// one above:
+//
+//   # LogicTest: !3node-tenant
+//
 // The Test-Script language is extended here for use with CockroachDB. The
 // supported directives are:
 //
@@ -554,10 +565,21 @@ var logicTestConfigs = []testClusterConfig{
 		skipShort:           true,
 	},
 	{
-		name:      "3node-tenant",
-		numNodes:  3,
-		useTenant: true,
+		name:     "3node-tenant",
+		numNodes: 3,
+		// overrideAutoStats will disable automatic stats on the cluster this tenant
+		// is connected to.
+		overrideAutoStats: "false",
+		useTenant:         true,
 	},
+}
+
+var logicTestConfigIdxToName = make(map[logicTestConfigIdx]string)
+
+func init() {
+	for i, cfg := range logicTestConfigs {
+		logicTestConfigIdxToName[logicTestConfigIdx(i)] = cfg.name
+	}
 }
 
 func parseTestConfig(names []string) []logicTestConfigIdx {
@@ -585,6 +607,7 @@ var (
 		"fakedist-vec-auto-disk",
 		"fakedist-metadata",
 		"fakedist-disk",
+		"3node-tenant",
 	}
 	// fiveNodeDefaultConfigName is a special alias for all 5 node configs.
 	fiveNodeDefaultConfigName  = "5node-default-configs"
@@ -1139,7 +1162,7 @@ func (t *logicTest) setUser(user string) func() {
 	return cleanupFunc
 }
 
-func (t *logicTest) setup(cfg testClusterConfig) {
+func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 	t.cfg = cfg
 	// TODO(pmattis): Add a flag to make it easy to run the tests against a local
 	// MySQL or Postgres instance.
@@ -1147,11 +1170,18 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 	// it installs detects a transaction that doesn't have
 	// modifiedSystemConfigSpan set even though it should, for
 	// "testdata/rename_table". Figure out what's up with that.
+	var tempStorageConfig base.TempStorageConfig
+	if serverArgs.tempStorageDiskLimit == 0 {
+		tempStorageConfig = base.DefaultTestTempStorageConfig(cluster.MakeTestingClusterSettings())
+	} else {
+		tempStorageConfig = base.DefaultTestTempStorageConfigWithSize(cluster.MakeTestingClusterSettings(), serverArgs.tempStorageDiskLimit)
+	}
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			// Specify a fixed memory limit (some test cases verify OOM conditions; we
 			// don't want those to take long on large machines).
 			SQLMemoryPoolSize: 192 * 1024 * 1024,
+			TempStorageConfig: tempStorageConfig,
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
 					// The consistency queue makes a lot of noisy logs during logic tests.
@@ -1229,26 +1259,98 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 		t.cluster.Server(t.nodeIdx).SetDistSQLSpanResolver(fakeResolver)
 	}
 
+	connsForClusterSettingChanges := []*gosql.DB{t.cluster.ServerConn(0)}
 	if cfg.useTenant {
 		var err error
-		t.tenantAddr, err = t.cluster.Server(t.nodeIdx).StartTenant()
+		t.tenantAddr, err = t.cluster.Server(t.nodeIdx).StartTenant(base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10), AllowSettingClusterSettings: true})
+		if err != nil {
+			t.rootT.Fatalf("%+v", err)
+		}
+
+		// Open a connection to this tenant to set any cluster settings specified
+		// by the test config.
+		pgURL, cleanup := sqlutils.PGUrl(t.rootT, t.tenantAddr, "Tenant", url.User(security.RootUser))
+		defer cleanup()
+		if params.ServerArgs.Insecure {
+			pgURL.RawQuery = "sslmode=disable"
+		}
+		db, err := gosql.Open("postgres", pgURL.String())
 		if err != nil {
 			t.rootT.Fatal(err)
 		}
+		defer db.Close()
+		connsForClusterSettingChanges = append(connsForClusterSettingChanges, db)
 	}
 
-	if _, err := t.cluster.ServerConn(0).Exec(
-		"SET CLUSTER SETTING sql.stats.automatic_collection.min_stale_rows = $1::int", 5,
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	if cfg.overrideDistSQLMode != "" {
-		if _, err := t.cluster.ServerConn(0).Exec(
-			"SET CLUSTER SETTING sql.defaults.distsql = $1::string", cfg.overrideDistSQLMode,
+	// Set cluster settings.
+	for _, conn := range connsForClusterSettingChanges {
+		if _, err := conn.Exec(
+			"SET CLUSTER SETTING sql.stats.automatic_collection.min_stale_rows = $1::int", 5,
 		); err != nil {
 			t.Fatal(err)
 		}
+
+		if cfg.overrideDistSQLMode != "" {
+			if _, err := conn.Exec(
+				"SET CLUSTER SETTING sql.defaults.distsql = $1::string", cfg.overrideDistSQLMode,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if cfg.overrideVectorize != "" {
+			if _, err := conn.Exec(
+				"SET CLUSTER SETTING sql.defaults.vectorize = $1::string", cfg.overrideVectorize,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Always override the vectorize row count threshold. This runs all supported
+		// queries (relative to the mode) through the vectorized execution engine.
+		if _, err := conn.Exec(
+			"SET CLUSTER SETTING sql.defaults.vectorize_row_count_threshold = 0",
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := conn.Exec(
+			fmt.Sprintf("SET CLUSTER SETTING sql.testing.vectorize.batch_size to %d",
+				t.randomizedVectorizedBatchSize),
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if cfg.overrideAutoStats != "" {
+			if _, err := conn.Exec(
+				"SET CLUSTER SETTING sql.stats.automatic_collection.enabled = $1::bool", cfg.overrideAutoStats,
+			); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			// Background stats collection is enabled by default, but we've seen tests
+			// flake with it on. When the issue manifests, it seems to be around a
+			// schema change transaction getting pushed, which causes it to increment a
+			// table ID twice instead of once, causing non-determinism.
+			//
+			// In the short term, we disable auto stats by default to avoid the flakes.
+			//
+			// In the long run, these tests should be running with default settings as
+			// much as possible, so we likely want to address this. Two options are
+			// either making schema changes more resilient to being pushed or possibly
+			// making auto stats avoid pushing schema change transactions. There might
+			// be other better alternatives than these.
+			//
+			// See #37751 for details.
+			if _, err := conn.Exec(
+				"SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false",
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if cfg.overrideDistSQLMode != "" {
 		_, ok := sessiondata.DistSQLExecModeFromString(cfg.overrideDistSQLMode)
 		if !ok {
 			t.Fatalf("invalid distsql mode override: %s", cfg.overrideDistSQLMode)
@@ -1272,56 +1374,6 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 			return nil
 		})
 	}
-	if cfg.overrideVectorize != "" {
-		if _, err := t.cluster.ServerConn(0).Exec(
-			"SET CLUSTER SETTING sql.defaults.vectorize = $1::string", cfg.overrideVectorize,
-		); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Always override the vectorize row count threshold. This runs all supported
-	// queries (relative to the mode) through the vectorized execution engine.
-	if _, err := t.cluster.ServerConn(0).Exec(
-		"SET CLUSTER SETTING sql.defaults.vectorize_row_count_threshold = 0",
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := t.cluster.ServerConn(0).Exec(
-		fmt.Sprintf("SET CLUSTER SETTING sql.testing.vectorize.batch_size to %d",
-			t.randomizedVectorizedBatchSize),
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	if cfg.overrideAutoStats != "" {
-		if _, err := t.cluster.ServerConn(0).Exec(
-			"SET CLUSTER SETTING sql.stats.automatic_collection.enabled = $1::bool", cfg.overrideAutoStats,
-		); err != nil {
-			t.Fatal(err)
-		}
-	} else {
-		// Background stats collection is enabled by default, but we've seen tests
-		// flake with it on. When the issue manifests, it seems to be around a
-		// schema change transaction getting pushed, which causes it to increment a
-		// table ID twice instead of once, causing non-determinism.
-		//
-		// In the short term, we disable auto stats by default to avoid the flakes.
-		//
-		// In the long run, these tests should be running with default settings as
-		// much as possible, so we likely want to address this. Two options are
-		// either making schema changes more resilient to being pushed or possibly
-		// making auto stats avoid pushing schema change transactions. There might
-		// be other better alternatives than these.
-		//
-		// See #37751 for details.
-		if _, err := t.cluster.ServerConn(0).Exec(
-			"SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false",
-		); err != nil {
-			t.Fatal(err)
-		}
-	}
 
 	// db may change over the lifetime of this function, with intermediate
 	// values cached in t.clients and finally closed in t.close().
@@ -1343,6 +1395,70 @@ CREATE DATABASE test;
 	t.progress = 0
 	t.failures = 0
 	t.unsupported = 0
+}
+
+// applyBlacklistToConfigIdxs applies the given blacklist to config idxs,
+// returning the result.
+func applyBlacklistToConfigIdxs(
+	configIdxs []logicTestConfigIdx, blacklist map[string]struct{},
+) []logicTestConfigIdx {
+	if len(blacklist) == 0 {
+		return configIdxs
+	}
+	var newConfigIdxs []logicTestConfigIdx
+	for _, idx := range configIdxs {
+		if _, ok := blacklist[logicTestConfigIdxToName[idx]]; ok {
+			continue
+		}
+		newConfigIdxs = append(newConfigIdxs, idx)
+	}
+	return newConfigIdxs
+}
+
+// processConfigs, given a list of configNames, returns the list of
+// corresponding logicTestConfigIdxs.
+func processConfigs(t *testing.T, path string, configNames []string) []logicTestConfigIdx {
+	const blacklistChar = '!'
+	blacklist := make(map[string]struct{})
+	allConfigNamesAreBlacklistDirectives := true
+	for _, configName := range configNames {
+		if configName[0] != blacklistChar {
+			allConfigNamesAreBlacklistDirectives = false
+			continue
+		}
+		blacklist[configName[1:]] = struct{}{}
+	}
+
+	var configs []logicTestConfigIdx
+	if len(blacklist) != 0 && allConfigNamesAreBlacklistDirectives {
+		// No configs specified, this blacklist applies to the default config.
+		return applyBlacklistToConfigIdxs(defaultConfig, blacklist)
+	}
+
+	for _, configName := range configNames {
+		if configName[0] == blacklistChar {
+			continue
+		}
+		if _, ok := blacklist[configName]; ok {
+			continue
+		}
+
+		idx, ok := findLogicTestConfig(configName)
+		if !ok {
+			switch configName {
+			case defaultConfigName:
+				configs = append(configs, applyBlacklistToConfigIdxs(defaultConfig, blacklist)...)
+			case fiveNodeDefaultConfigName:
+				configs = append(configs, applyBlacklistToConfigIdxs(fiveNodeDefaultConfig, blacklist)...)
+			default:
+				t.Fatalf("%s: unknown config name %s", path, configName)
+			}
+		} else {
+			configs = append(configs, idx)
+		}
+	}
+
+	return configs
 }
 
 // readTestFileConfigs reads any LogicTest directive at the beginning of a
@@ -1378,23 +1494,7 @@ func readTestFileConfigs(t *testing.T, path string) []logicTestConfigIdx {
 			if len(fields) == 2 {
 				t.Fatalf("%s: empty LogicTest directive", path)
 			}
-			var configs []logicTestConfigIdx
-			for _, configName := range fields[2:] {
-				idx, ok := findLogicTestConfig(configName)
-				if !ok {
-					switch configName {
-					case defaultConfigName:
-						configs = append(configs, defaultConfig...)
-					case fiveNodeDefaultConfigName:
-						configs = append(configs, fiveNodeDefaultConfig...)
-					default:
-						t.Fatalf("%s: unknown config name %s", path, configName)
-					}
-				} else {
-					configs = append(configs, idx)
-				}
-			}
-			return configs
+			return processConfigs(t, path, fields[2:])
 		}
 	}
 	// No directive found, return the default config.
@@ -2464,9 +2564,18 @@ var skipLogicTests = envutil.EnvOrDefaultBool("COCKROACH_LOGIC_TESTS_SKIP", fals
 var logicTestsConfigExclude = envutil.EnvOrDefaultString("COCKROACH_LOGIC_TESTS_SKIP_CONFIG", "")
 var logicTestsConfigFilter = envutil.EnvOrDefaultString("COCKROACH_LOGIC_TESTS_CONFIG", "")
 
+// TestServerArgs contains the parameters that callers of RunLogicTest might
+// want to specify for the test clusters to be created with.
+type TestServerArgs struct {
+	// tempStorageDiskLimit determines the limit for the temp storage (that is
+	// actually in-memory). If it is unset, then the default limit of 100MB
+	// will be used.
+	tempStorageDiskLimit int64
+}
+
 // RunLogicTest is the main entry point for the logic test. The globs parameter
 // specifies the default sets of files to run.
-func RunLogicTest(t *testing.T, globs ...string) {
+func RunLogicTest(t *testing.T, serverArgs TestServerArgs, globs ...string) {
 	// Note: there is special code in teamcity-trigger/main.go to run this package
 	// with less concurrency in the nightly stress runs. If you see problems
 	// please make adjustments there.
@@ -2594,7 +2703,7 @@ func RunLogicTest(t *testing.T, globs ...string) {
 					if *printErrorSummary {
 						defer lt.printErrorSummary()
 					}
-					lt.setup(cfg)
+					lt.setup(cfg, serverArgs)
 					lt.runFile(path, cfg)
 
 					progress.Lock()

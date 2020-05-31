@@ -260,12 +260,12 @@ func (o *routerOutputOp) closeLocked(ctx context.Context) {
 // all accumulated data that hasn't been read will not be returned.
 func (o *routerOutputOp) cancel(ctx context.Context) {
 	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.closeLocked(ctx)
 	// Some goroutine might be waiting on the condition variable, so wake it up.
 	// Note that read goroutines check o.mu.done, so won't wait on the condition
 	// variable after we unlock the mutex.
 	o.mu.cond.Signal()
-	o.mu.Unlock()
 }
 
 // addBatch copies the columns in batch according to selection into an internal
@@ -384,15 +384,15 @@ func (o *routerOutputOp) drain() []execinfrapb.ProducerMetadata {
 	return nil
 }
 
-// reset resets the routerOutputOp for a benchmark run.
-func (o *routerOutputOp) reset(ctx context.Context) {
+// resetForBenchmarks resets the routerOutputOp for a benchmark run.
+func (o *routerOutputOp) resetForBenchmarks(ctx context.Context) {
 	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.mu.state = routerOutputOpRunning
 	o.mu.data.reset(ctx)
 	o.mu.drainState.err = nil
 	o.mu.numUnread = 0
 	o.mu.blocked = false
-	o.mu.Unlock()
 }
 
 // HashRouter hashes values according to provided hash columns and computes a
@@ -407,6 +407,9 @@ type HashRouter struct {
 
 	// One output for each stream.
 	outputs []routerOutput
+	// closers is a slice of IdempotentClosers that need to be closed when the
+	// hash router terminates.
+	closers []IdempotentCloser
 
 	// unblockedEventsChan is a channel shared between the HashRouter and its
 	// outputs. outputs send events on this channel when they are unblocked by a
@@ -443,6 +446,7 @@ func NewHashRouter(
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
 	diskAccounts []*mon.BoundAccount,
+	toClose []IdempotentCloser,
 ) (*HashRouter, []colexecbase.Operator) {
 	if diskQueueCfg.CacheMode != colcontainer.DiskQueueCacheModeDefault {
 		colexecerror.InternalError(errors.Errorf("hash router instantiated with incompatible disk queue cache mode: %d", diskQueueCfg.CacheMode))
@@ -463,7 +467,7 @@ func NewHashRouter(
 		outputs[i] = op
 		outputsAsOps[i] = op
 	}
-	router := newHashRouterWithOutputs(input, types, hashCols, unblockEventsChan, outputs)
+	router := newHashRouterWithOutputs(input, types, hashCols, unblockEventsChan, outputs, toClose)
 	for i := range outputs {
 		outputs[i].(*routerOutputOp).input = router
 	}
@@ -476,12 +480,14 @@ func newHashRouterWithOutputs(
 	hashCols []uint32,
 	unblockEventsChan <-chan struct{},
 	outputs []routerOutput,
+	toClose []IdempotentCloser,
 ) *HashRouter {
 	r := &HashRouter{
 		OneInputNode:        NewOneInputNode(input),
 		types:               types,
 		hashCols:            hashCols,
 		outputs:             outputs,
+		closers:             toClose,
 		unblockedEventsChan: unblockEventsChan,
 		tupleDistributor:    newTupleHashDistributor(defaultInitHashValue, len(outputs)),
 	}
@@ -497,6 +503,15 @@ func (r *HashRouter) Run(ctx context.Context) {
 		r.mu.bufferedMeta = append(r.mu.bufferedMeta, execinfrapb.ProducerMetadata{Err: err})
 		r.mu.Unlock()
 	}
+	defer func() {
+		for _, closer := range r.closers {
+			if err := closer.IdempotentClose(ctx); err != nil {
+				if log.V(1) {
+					log.Infof(ctx, "error closing IdempotentCloser: %v", err)
+				}
+			}
+		}
+	}()
 	// Since HashRouter runs in a separate goroutine, we want to be safe and
 	// make sure that we catch errors in all code paths, so we wrap the whole
 	// method with a catcher. Note that we also have "internal" catchers as
@@ -596,8 +611,8 @@ func (r *HashRouter) processNextBatch(ctx context.Context) bool {
 	return false
 }
 
-// reset resets the HashRouter for a benchmark run.
-func (r *HashRouter) reset(ctx context.Context) {
+// resetForBenchmarks resets the HashRouter for a benchmark run.
+func (r *HashRouter) resetForBenchmarks(ctx context.Context) {
 	if i, ok := r.input.(resetter); ok {
 		i.reset(ctx)
 	}
@@ -610,7 +625,7 @@ func (r *HashRouter) reset(ctx context.Context) {
 		}
 	}
 	for _, o := range r.outputs {
-		o.(resetter).reset(ctx)
+		o.(*routerOutputOp).resetForBenchmarks(ctx)
 	}
 }
 

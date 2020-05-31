@@ -63,6 +63,9 @@ const (
 	VersionStart20_2
 	VersionGeospatialType
 	VersionEnums
+	VersionRangefeedLeases
+	VersionAlterColumnTypeGeneral
+	VersionAlterSystemJobsAddCreatedByColumns
 
 	// Add new versions here (step one of two).
 )
@@ -471,6 +474,7 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 1},
 	},
 	{
+
 		// VersionGeospatialType enables the use of Geospatial features.
 		Key:     VersionGeospatialType,
 		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 2},
@@ -479,6 +483,28 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		// VersionEnums enables the use of ENUM types.
 		Key:     VersionEnums,
 		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 3},
+	},
+	{
+
+		// VersionRangefeedLeases is the enablement of leases uses rangefeeds.
+		// All nodes with this versions will have rangefeeds enabled on all system
+		// ranges. Once this version is finalized, gossip is not needed in the
+		// schema lease subsystem. Nodes which start with this version finalized
+		// will not pass gossip to the SQL layer.
+		Key:     VersionRangefeedLeases,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 4},
+	},
+	{
+		// VersionAlterColumnTypeGeneral enables the use of alter column type for
+		// conversions that require the column data to be rewritten.
+		Key:     VersionAlterColumnTypeGeneral,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 5},
+	},
+	{
+		// VersionAlterSystemJobsTable is a version which modified system.jobs table
+		//
+		Key:     VersionAlterSystemJobsAddCreatedByColumns,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 6},
 	},
 
 	// Add new versions here (step two of two).
@@ -499,7 +525,7 @@ var (
 	// to HEAD; if we were to set binaryMinSupportedVersion to Version19_2,
 	// that wouldn't work since you'd have to go through the final 19.2 binary
 	// before going to HEAD.
-	binaryMinSupportedVersion = VersionByKey(VersionStart19_2)
+	binaryMinSupportedVersion = VersionByKey(Version20_1)
 
 	// binaryVersion is the version of this binary.
 	//

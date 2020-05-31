@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -75,7 +76,7 @@ type SchemaChanger struct {
 	droppedDatabaseID sqlbase.ID
 	sqlInstanceID     base.SQLInstanceID
 	db                *kv.DB
-	leaseMgr          *LeaseManager
+	leaseMgr          *lease.Manager
 
 	testingKnobs   *SchemaChangerTestingKnobs
 	distSQLPlanner *DistSQLPlanner
@@ -99,7 +100,7 @@ func NewSchemaChangerForTesting(
 	mutationID sqlbase.MutationID,
 	sqlInstanceID base.SQLInstanceID,
 	db kv.DB,
-	leaseMgr *LeaseManager,
+	leaseMgr *lease.Manager,
 	jobRegistry *jobs.Registry,
 	execCfg *ExecutorConfig,
 	settings *cluster.Settings,
@@ -263,14 +264,18 @@ func (sc *SchemaChanger) maybeBackfillCreateTableAs(
 		)
 		defer recv.Release()
 
-		rec, err := sc.distSQLPlanner.checkSupportForNode(localPlanner.curPlan.main)
+		willDistribute := willDistributePlan(
+			ctx, localPlanner.execCfg.NodeID,
+			localPlanner.extendedEvalCtx.SessionData.DistSQLMode,
+			localPlanner.curPlan.main,
+		)
 		var planAndRunErr error
 		localPlanner.runWithOptions(resolveFlags{skipCache: true}, func() {
 			// Resolve subqueries before running the queries' physical plan.
 			if len(localPlanner.curPlan.subqueryPlans) != 0 {
 				if !sc.distSQLPlanner.PlanAndRunSubqueries(
 					ctx, localPlanner, localPlanner.ExtendedEvalContextCopy,
-					localPlanner.curPlan.subqueryPlans, recv, rec == canDistribute,
+					localPlanner.curPlan.subqueryPlans, recv, willDistribute,
 				) {
 					if planAndRunErr = rw.Err(); planAndRunErr != nil {
 						return
@@ -281,7 +286,7 @@ func (sc *SchemaChanger) maybeBackfillCreateTableAs(
 				}
 			}
 
-			isLocal := err != nil || rec == cannotDistribute
+			isLocal := !willDistribute
 			out := execinfrapb.ProcessorCoreUnion{BulkRowWriter: &execinfrapb.BulkRowWriterSpec{
 				Table: *table,
 			}}
@@ -317,7 +322,7 @@ func (sc *SchemaChanger) maybeMakeAddTablePublic(
 			table.ID,
 			func(tbl *sqlbase.MutableTableDescriptor) error {
 				if !tbl.Adding() {
-					return errDidntUpdateDescriptor
+					return lease.ErrDidntUpdateDescriptor
 				}
 				tbl.State = sqlbase.TableDescriptor_PUBLIC
 				return nil
@@ -675,7 +680,7 @@ func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) erro
 		}
 		if doNothing := runStatus == "" || desc.Dropped(); doNothing {
 			// Return error so that Publish() doesn't increment the version.
-			return errDidntUpdateDescriptor
+			return lease.ErrDidntUpdateDescriptor
 		}
 		return nil
 	}, func(txn *kv.Txn) error {
@@ -792,6 +797,7 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 		if !ok {
 			return errors.AssertionFailedf("required table with ID %d not provided to update closure", sc.tableID)
 		}
+
 		for _, mutation := range scDesc.Mutations {
 			if mutation.MutationID != sc.mutationID {
 				// Mutations are applied in a FIFO order. Only apply the first set of
@@ -846,9 +852,25 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 				}
 				backrefTable.InboundFKs = append(backrefTable.InboundFKs, constraint.ForeignKey)
 			}
+
+			// Some primary key change specific operations need to happen before
+			// and after the index swap occurs.
+			if pkSwap := mutation.GetPrimaryKeySwap(); pkSwap != nil {
+				// We might have to update some zone configs for indexes that are
+				// being rewritten. It is important that this is done _before_ the
+				// index swap occurs. The logic that generates spans for subzone
+				// configurations removes spans for indexes in the dropping state,
+				// which we don't want. So, set up the zone configs before we swap.
+				if err := sc.maybeUpdateZoneConfigsForPKChange(
+					ctx, txn, sc.execCfg, scDesc.TableDesc(), pkSwap); err != nil {
+					return err
+				}
+			}
+
 			if err := scDesc.MakeMutationComplete(mutation); err != nil {
 				return err
 			}
+
 			if pkSwap := mutation.GetPrimaryKeySwap(); pkSwap != nil {
 				if fn := sc.testingKnobs.RunBeforePrimaryKeySwap; fn != nil {
 					fn()
@@ -885,45 +907,23 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 						}
 					}
 				}
-
 				// If we performed MakeMutationComplete on a PrimaryKeySwap mutation, then we need to start
 				// a job for the index deletion mutations that the primary key swap mutation added, if any.
-				mutationID := scDesc.ClusterVersion.NextMutationID
-				span := scDesc.PrimaryIndexSpan(sc.execCfg.Codec)
-				var spanList []jobspb.ResumeSpanList
-				for j := len(scDesc.ClusterVersion.Mutations); j < len(scDesc.Mutations); j++ {
-					spanList = append(spanList,
-						jobspb.ResumeSpanList{
-							ResumeSpans: roachpb.Spans{span},
-						},
-					)
+				if childJobs, err = sc.queueCleanupJobs(ctx, scDesc, txn, childJobs); err != nil {
+					return err
 				}
-				// Only start a job if spanList has any spans. If len(spanList) == 0, then
-				// no mutations were enqueued by the primary key change.
-				if len(spanList) > 0 {
-					jobRecord := jobs.Record{
-						Description:   fmt.Sprintf("CLEANUP JOB for '%s'", sc.job.Payload().Description),
-						Username:      sc.job.Payload().Username,
-						DescriptorIDs: sqlbase.IDs{scDesc.GetID()},
-						Details: jobspb.SchemaChangeDetails{
-							TableID:        sc.tableID,
-							MutationID:     mutationID,
-							ResumeSpanList: spanList,
-							FormatVersion:  jobspb.JobResumerFormatVersion,
-						},
-						Progress:      jobspb.SchemaChangeProgress{},
-						NonCancelable: true,
-					}
-					job, err := sc.jobRegistry.CreateStartableJobWithTxn(ctx, jobRecord, txn, nil /* resultsCh */)
-					if err != nil {
-						return err
-					}
-					log.VEventf(ctx, 2, "created job %d to drop previous indexes", *job.ID())
-					childJobs = append(childJobs, job)
-					scDesc.MutationJobs = append(scDesc.MutationJobs, sqlbase.TableDescriptor_MutationJob{
-						MutationID: mutationID,
-						JobID:      *job.ID(),
-					})
+			}
+
+			if computedColumnSwap := mutation.GetComputedColumnSwap(); computedColumnSwap != nil {
+				if fn := sc.testingKnobs.RunBeforeComputedColumnSwap; fn != nil {
+					fn()
+				}
+
+				// If we performed MakeMutationComplete on a computed column swap, then
+				// we need to start a job for the column deletion that the swap mutation
+				// added if any.
+				if childJobs, err = sc.queueCleanupJobs(ctx, scDesc, txn, childJobs); err != nil {
+					return err
 				}
 			}
 			i++
@@ -931,7 +931,7 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 		if i == 0 {
 			// The table descriptor is unchanged. Don't let Publish() increment
 			// the version.
-			return errDidntUpdateDescriptor
+			return lease.ErrDidntUpdateDescriptor
 		}
 		// Trim the executed mutations from the descriptor.
 		scDesc.Mutations = scDesc.Mutations[i:]
@@ -967,6 +967,11 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 			}{uint32(sc.mutationID)},
 		)
 	})
+	if fn := sc.testingKnobs.RunBeforeChildJobs; fn != nil {
+		if len(childJobs) != 0 {
+			fn()
+		}
+	}
 	if err != nil {
 		for _, job := range childJobs {
 			if rollbackErr := job.CleanupOnRollback(ctx); rollbackErr != nil {
@@ -982,6 +987,50 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 		log.VEventf(ctx, 2, "started job %d", *job.ID())
 	}
 	return descs[sc.tableID], nil
+}
+
+// maybeUpdateZoneConfigsForPKChange moves zone configs for any rewritten
+// indexes from the old index over to the new index.
+func (sc *SchemaChanger) maybeUpdateZoneConfigsForPKChange(
+	ctx context.Context,
+	txn *kv.Txn,
+	execCfg *ExecutorConfig,
+	table *sqlbase.TableDescriptor,
+	swapInfo *sqlbase.PrimaryKeySwap,
+) error {
+	zone, err := getZoneConfigRaw(ctx, txn, table.ID)
+	if err != nil {
+		return err
+	}
+
+	// If this table doesn't have a zone attached to it, don't do anything.
+	if zone == nil {
+		return nil
+	}
+
+	// For each rewritten index, point its subzones for the old index at the
+	// new index.
+	for i, oldID := range swapInfo.OldIndexes {
+		for j := range zone.Subzones {
+			subzone := &zone.Subzones[j]
+			if subzone.IndexID == uint32(oldID) {
+				// If we find a subzone matching an old index, copy its subzone
+				// into a new subzone with the new index's ID.
+				subzoneCopy := *subzone
+				subzoneCopy.IndexID = uint32(swapInfo.NewIndexes[i])
+				zone.SetSubzone(subzoneCopy)
+			}
+		}
+	}
+
+	// Write the zone back. This call regenerates the index spans that apply
+	// to each partition in the index.
+	_, err = writeZoneConfig(ctx, txn, table.ID, table, zone, execCfg, false)
+	if err != nil && !sqlbase.IsCCLRequiredError(err) {
+		return err
+	}
+
+	return nil
 }
 
 // notFirstInLine returns true whenever the schema change has been queued
@@ -1110,7 +1159,7 @@ func (sc *SchemaChanger) maybeReverseMutations(ctx context.Context, causingError
 				// Only reverse the first set of mutations if they have the
 				// mutation ID we're looking for.
 				if i == 0 {
-					return errDidntUpdateDescriptor
+					return lease.ErrDidntUpdateDescriptor
 				}
 				break
 			}
@@ -1368,10 +1417,12 @@ func (sc *SchemaChanger) reverseMutation(
 		if col := mutation.GetColumn(); col != nil {
 			columns[col.Name] = struct{}{}
 		}
-		// PrimaryKeySwap doesn't have a concept of the state machine.
-		if pkSwap := mutation.GetPrimaryKeySwap(); pkSwap != nil {
+		// PrimaryKeySwap and ComputedColumnSwap don't have a concept of the state machine.
+		if pkSwap, computedColumnsSwap :=
+			mutation.GetPrimaryKeySwap(), mutation.GetComputedColumnSwap(); pkSwap != nil || computedColumnsSwap != nil {
 			return mutation, columns
 		}
+
 		if notStarted && mutation.State != sqlbase.DescriptorMutation_DELETE_ONLY {
 			panic(fmt.Sprintf("mutation in bad state: %+v", mutation))
 		}
@@ -1442,6 +1493,13 @@ type SchemaChangerTestingKnobs struct {
 
 	// RunBeforePrimaryKeySwap is called just before the primary key swap is committed.
 	RunBeforePrimaryKeySwap func()
+
+	// RunBeforeComputedColumnSwap is called just before the computed column swap is committed.
+	RunBeforeComputedColumnSwap func()
+
+	// RunBeforeChildJobs is called just before child jobs are run to clean up
+	// dropped schema elements after a mutation.
+	RunBeforeChildJobs func()
 
 	// RunBeforeIndexValidation is called just before starting the index validation,
 	// after setting the job status to validating.
@@ -1534,10 +1592,12 @@ func createSchemaChangeEvalCtx(
 			// TODO(andrei): This is wrong (just like on the main code path on
 			// setupFlow). Each processor should override Ctx with its own context.
 			Context:            ctx,
-			Sequence:           &sqlbase.DummySequenceOperators{},
 			Planner:            &sqlbase.DummyEvalPlanner{},
-			SessionAccessor:    &sqlbase.DummySessionAccessor{},
 			PrivilegedAccessor: &sqlbase.DummyPrivilegedAccessor{},
+			SessionAccessor:    &sqlbase.DummySessionAccessor{},
+			ClientNoticeSender: &sqlbase.DummyClientNoticeSender{},
+			Sequence:           &sqlbase.DummySequenceOperators{},
+			Tenant:             &sqlbase.DummyTenantOperator{},
 			Settings:           execCfg.Settings,
 			TestingKnobs:       execCfg.EvalContextTestingKnobs,
 			ClusterID:          execCfg.ClusterID(),
@@ -1793,4 +1853,51 @@ func init() {
 		return &schemaChangeResumer{job: job}
 	}
 	jobs.RegisterConstructor(jobspb.TypeSchemaChange, createResumerFn)
+}
+
+// queueCleanupJobs checks if the completed schema change needs to start a
+// child job to clean up dropped schema elements.
+func (sc *SchemaChanger) queueCleanupJobs(
+	ctx context.Context, scDesc *MutableTableDescriptor, txn *kv.Txn, childJobs []*jobs.StartableJob,
+) ([]*jobs.StartableJob, error) {
+	// Create jobs for dropped columns / indexes to be deleted.
+	mutationID := scDesc.ClusterVersion.NextMutationID
+	span := scDesc.PrimaryIndexSpan(sc.execCfg.Codec)
+	var spanList []jobspb.ResumeSpanList
+	for j := len(scDesc.ClusterVersion.Mutations); j < len(scDesc.Mutations); j++ {
+		spanList = append(spanList,
+			jobspb.ResumeSpanList{
+				ResumeSpans: roachpb.Spans{span},
+			},
+		)
+	}
+	// Only start a job if spanList has any spans. If len(spanList) == 0, then
+	// no mutations were enqueued by the primary key change.
+	if len(spanList) > 0 {
+		jobRecord := jobs.Record{
+			Description:   fmt.Sprintf("CLEANUP JOB for '%s'", sc.job.Payload().Description),
+			Username:      sc.job.Payload().Username,
+			DescriptorIDs: sqlbase.IDs{scDesc.GetID()},
+			Details: jobspb.SchemaChangeDetails{
+				TableID:        sc.tableID,
+				MutationID:     mutationID,
+				ResumeSpanList: spanList,
+				FormatVersion:  jobspb.JobResumerFormatVersion,
+			},
+			Progress:      jobspb.SchemaChangeProgress{},
+			NonCancelable: true,
+		}
+		job, err := sc.jobRegistry.CreateStartableJobWithTxn(ctx, jobRecord, txn, nil /* resultsCh */)
+		if err != nil {
+			return nil, err
+		}
+		log.VEventf(ctx, 2, "created job %d to drop previous columns "+
+			"and indexes.", *job.ID())
+		childJobs = append(childJobs, job)
+		scDesc.MutationJobs = append(scDesc.MutationJobs, sqlbase.TableDescriptor_MutationJob{
+			MutationID: mutationID,
+			JobID:      *job.ID(),
+		})
+	}
+	return childJobs, nil
 }

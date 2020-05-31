@@ -14,10 +14,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
@@ -25,8 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // quitCmd command shuts down the node server.
@@ -67,24 +63,11 @@ func runQuit(cmd *cobra.Command, args []string) (err error) {
 	}
 	defer finish()
 
-	// If --decommission was passed, perform the decommission as first
-	// step. (Note that this flag is deprecated. It will be removed.)
-	if quitCtx.serverDecommission {
-		var myself []roachpb.NodeID // will remain empty, which means target yourself
-		if err := runDecommissionNodeImpl(ctx, c, nodeDecommissionWaitAll, myself); err != nil {
-			log.Warningf(ctx, "%v", err)
-			if server.IsWaitingForInit(err) {
-				err = errors.New("node cannot be decommissioned before it has been initialized")
-			}
-			return err
-		}
-	}
-
 	return drainAndShutdown(ctx, c)
 }
 
 // drainAndShutdown attempts to drain the server and then shut it
-// down. When given an empty onModes slice, it's a hard shutdown.
+// down.
 func drainAndShutdown(ctx context.Context, c serverpb.AdminClient) (err error) {
 	hardError, remainingWork, err := doDrain(ctx, c)
 	if hardError {
@@ -98,10 +81,8 @@ func drainAndShutdown(ctx context.Context, c serverpb.AdminClient) (err error) {
 	if err != nil {
 		log.Warningf(ctx, "drain did not complete successfully; hard shutdown may cause disruption")
 	}
-	// We have already performed the drain above. We use a nil array
-	// of drain modes to indicate no further drain needs to be attempted
-	// and go straight to shutdown. We try two times just in case there
-	// is a transient error.
+	// We have already performed the drain above, so now go straight to
+	// shutdown. We try twice just in case there is a transient error.
 	hardErr, err := doShutdown(ctx, c)
 	if err != nil && !hardErr {
 		log.Warningf(ctx, "hard shutdown attempt failed, retrying: %v", err)
@@ -128,7 +109,7 @@ func doDrain(
 		hardError, remainingWork, err = doDrainNoTimeout(ctx, c)
 		return err
 	})
-	if errors.HasType(err, (*contextutil.TimeoutError)(nil)) {
+	if errors.HasType(err, (*contextutil.TimeoutError)(nil)) || grpcutil.IsTimeout(err) {
 		log.Infof(ctx, "drain timed out: %v", err)
 		err = errors.New("drain timeout")
 	}
@@ -160,7 +141,7 @@ func doDrainNoTimeout(
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "\n") // finish the line started above.
-			return true, remainingWork, errors.Wrap(err, "error sending drain request")
+			return !grpcutil.IsTimeout(err), remainingWork, errors.Wrap(err, "error sending drain request")
 		}
 		for {
 			resp, err := stream.Recv()
@@ -227,7 +208,7 @@ func doShutdown(ctx context.Context, c serverpb.AdminClient) (hardError bool, er
 			err = errors.WithHint(err, "You can still stop the process using a service manager or a signal.")
 			hardError = true
 		}
-		if grpcutil.IsClosedConnection(err) || grpcConfusedErrConnClosedByPeer(err) {
+		if grpcutil.IsClosedConnection(err) {
 			// This most likely means that we shut down successfully. Note
 			// that sometimes the connection can be shut down even before a
 			// DrainResponse gets sent back to us, so we don't require a
@@ -269,25 +250,4 @@ func getAdminClient(ctx context.Context, cfg server.Config) (serverpb.AdminClien
 		return nil, nil, errors.Wrap(err, "Failed to connect to the node")
 	}
 	return serverpb.NewAdminClient(conn), finish, nil
-}
-
-// grpcConfusedErrConnClosedByPeer returns true if the given error
-// has been likely produced by a gRPC handshake that was confused
-// by the remote end closing the connection.
-// This situation occurs semi-frequently (10-15% of cases) in
-// go 1.13, and may have been eliminated in 1.14.
-func grpcConfusedErrConnClosedByPeer(err error) bool {
-	err = errors.Cause(err)
-	s, ok := status.FromError(err)
-	if !ok {
-		return false
-	}
-	switch {
-	case s.Code() == codes.Internal && strings.Contains(err.Error(), "compressed flag set with identity or empty encoding"):
-		return true
-	case s.Code() == codes.Unimplemented && strings.Contains(err.Error(), "Decompressor is not installed"):
-		return true
-	default:
-		return false
-	}
 }

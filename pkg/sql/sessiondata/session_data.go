@@ -41,6 +41,8 @@ type SessionData struct {
 	// DistSQLMode indicates whether to run queries using the distributed
 	// execution engine.
 	DistSQLMode DistSQLExecMode
+	// EnumsEnabled indicates whether use of ENUM types are allowed.
+	EnumsEnabled bool
 	// OptimizerFKChecks indicates whether we should use the new paths to plan foreign
 	// key checks in the optimizer.
 	OptimizerFKChecks bool
@@ -56,6 +58,9 @@ type SessionData struct {
 	// OptimizerUseMultiColStats indicates whether we should use multi-column
 	// statistics for cardinality estimation in the optimizer.
 	OptimizerUseMultiColStats bool
+	// PartialIndexes indicates whether creation of partial indexes are allowed.
+	// TODO(mgartner): remove this once partial indexes are fully supported.
+	PartialIndexes bool
 	// SerialNormalizationMode indicates how to handle the SERIAL pseudo-type.
 	SerialNormalizationMode SerialNormalizationMode
 	// SearchPath is a list of namespaces to search builtins in.
@@ -122,6 +127,9 @@ type SessionData struct {
 	// NoticeDisplaySeverity indicates the level of Severity to send notices for the given
 	// session.
 	NoticeDisplaySeverity pgnotice.DisplaySeverity
+	// AlterColumnTypeGeneralEnabled is true if ALTER TABLE ... ALTER COLUMN ...
+	// TYPE x may be used for general conversions requiring online schema change/
+	AlterColumnTypeGeneralEnabled bool
 }
 
 // DataConversionConfig contains the parameters that influence

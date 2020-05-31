@@ -25,7 +25,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
@@ -731,7 +731,7 @@ func (hv *historyVerifier) runCmds(
 ) (string, map[string]int64, error) {
 	var strs []string
 	env := map[string]int64{}
-	err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		txn.SetDebugName(txnName)
 		for _, c := range cmds {
 			c.historyIdx = hv.idx
@@ -763,7 +763,7 @@ func (hv *historyVerifier) runTxn(
 		prev.ch <- err
 	}
 
-	err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		// If this is 2nd attempt, and a retry wasn't expected, return a
 		// retry error which results in further histories being enumerated.
 		if retry++; retry > 1 {
@@ -826,7 +826,7 @@ func checkConcurrency(name string, txns []string, verify *verifier, t *testing.T
 			// after the pushee's commit has already returned successfully. This
 			// is a result of the asynchronous nature of making transaction commits
 			// explicit after a parallel commit.
-			EvalKnobs: storagebase.BatchEvalTestingKnobs{
+			EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 				RecoverIndeterminateCommitsOnFailedPushes: true,
 			},
 		},

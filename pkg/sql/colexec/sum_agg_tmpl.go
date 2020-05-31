@@ -20,27 +20,18 @@
 package colexec
 
 import (
-	"github.com/cockroachdb/apd"
+	"unsafe"
+
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
 // {{/*
 // Declarations to make the template compile properly
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
 
 // _CANONICAL_TYPE_FAMILY is the template variable.
 const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
@@ -50,20 +41,22 @@ const _TYPE_WIDTH = 0
 
 // _ASSIGN_ADD is the template addition function for assigning the first input
 // to the result of the second input + the third input.
-func _ASSIGN_ADD(_, _, _ string) {
+func _ASSIGN_ADD(_, _, _, _, _, _ string) {
 	colexecerror.InternalError("")
 }
 
 // */}}
 
-func newSumAgg(t *types.T) (aggregateFunc, error) {
-	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+func newSumAggAlloc(
+	allocator *colmem.Allocator, t *types.T, allocSize int64,
+) (aggregateFuncAlloc, error) {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
 	case _CANONICAL_TYPE_FAMILY:
 		switch t.Width() {
 		// {{range .WidthOverloads}}
 		case _TYPE_WIDTH:
-			return &sum_TYPEAgg{}, nil
+			return &sum_TYPEAggAlloc{allocator: allocator, allocSize: allocSize}, nil
 			// {{end}}
 		}
 		// {{end}}
@@ -75,8 +68,6 @@ func newSumAgg(t *types.T) (aggregateFunc, error) {
 // {{range .WidthOverloads}}
 
 type sum_TYPEAgg struct {
-	done bool
-
 	groups  []bool
 	scratch struct {
 		curIdx int
@@ -95,6 +86,8 @@ type sum_TYPEAgg struct {
 
 var _ aggregateFunc = &sum_TYPEAgg{}
 
+const sizeOfSum_TYPEAgg = int64(unsafe.Sizeof(sum_TYPEAgg{}))
+
 func (a *sum_TYPEAgg) Init(groups []bool, v coldata.Vec) {
 	a.groups = groups
 	a.scratch.vec = v.TemplateType()
@@ -106,7 +99,6 @@ func (a *sum_TYPEAgg) Reset() {
 	a.scratch.curIdx = -1
 	a.scratch.foundNonNullForCurrentGroup = false
 	a.scratch.nulls.UnsetNulls()
-	a.done = false
 }
 
 func (a *sum_TYPEAgg) CurrentOutputIndex() int {
@@ -121,23 +113,7 @@ func (a *sum_TYPEAgg) SetOutputIndex(idx int) {
 }
 
 func (a *sum_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	if a.done {
-		return
-	}
 	inputLen := b.Length()
-	if inputLen == 0 {
-		// The aggregation is finished. Flush the last value. If we haven't found
-		// any non-nulls for this group so far, the output for this group should be
-		// null.
-		if !a.scratch.foundNonNullForCurrentGroup {
-			a.scratch.nulls.SetNull(a.scratch.curIdx)
-		} else {
-			a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
-		}
-		a.scratch.curIdx++
-		a.done = true
-		return
-	}
 	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
 	col, nulls := vec.TemplateType(), vec.Nulls()
 	if nulls.MaybeHasNulls() {
@@ -167,8 +143,38 @@ func (a *sum_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
+func (a *sum_TYPEAgg) Flush() {
+	// The aggregation is finished. Flush the last value. If we haven't found
+	// any non-nulls for this group so far, the output for this group should be
+	// null.
+	if !a.scratch.foundNonNullForCurrentGroup {
+		a.scratch.nulls.SetNull(a.scratch.curIdx)
+	} else {
+		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+	}
+	a.scratch.curIdx++
+}
+
 func (a *sum_TYPEAgg) HandleEmptyInputScalar() {
 	a.scratch.nulls.SetNull(0)
+}
+
+type sum_TYPEAggAlloc struct {
+	allocator *colmem.Allocator
+	allocSize int64
+	aggFuncs  []sum_TYPEAgg
+}
+
+var _ aggregateFuncAlloc = &sum_TYPEAggAlloc{}
+
+func (a *sum_TYPEAggAlloc) newAggFunc() aggregateFunc {
+	if len(a.aggFuncs) == 0 {
+		a.allocator.AdjustMemoryUsage(sizeOfSum_TYPEAgg * a.allocSize)
+		a.aggFuncs = make([]sum_TYPEAgg, a.allocSize)
+	}
+	f := &a.aggFuncs[0]
+	a.aggFuncs = a.aggFuncs[1:]
+	return f
 }
 
 // {{end}}
@@ -213,7 +219,7 @@ func _ACCUMULATE_SUM(a *sum_TYPEAgg, nulls *coldata.Nulls, i int, _HAS_NULLS boo
 	isNull = false
 	// {{end}}
 	if !isNull {
-		_ASSIGN_ADD(a.scratch.curAgg, a.scratch.curAgg, col[i])
+		_ASSIGN_ADD(a.scratch.curAgg, a.scratch.curAgg, col[i], _, _, col)
 		a.scratch.foundNonNullForCurrentGroup = true
 	}
 	// {{end}}

@@ -30,6 +30,7 @@ noverify = [
 ignored = [
   # Non-existent package used by a toy program in c-deps/protobuf.
   "github.com/google/protobuf/examples/tutorial",
+  "github.com/cockroachdb/cockroach/c-deps/protobuf/benchmarks/go",
 ]
 
 [[constraint]]
@@ -61,10 +62,19 @@ ignored = [
   name = "github.com/maruel/panicparse"
   revision = "f20d4c4d746f810c9110e21928d4135e1f2a3efa"
 
-# https://github.com/getsentry/raven-go/pull/139
+# We use a forked copy of sentry-go because we want this patch:
+# https://github.com/cockroachdb/sentry-go/pull/1/commits/2061d6c803c44899e4d3e2d3c6ac70d329587513
+#
+# (It should really go upstream - we had a PR - see
+# https://github.com/getsentry/raven-go/pull/139 - but that somehow
+# hasn't gone anywhere yet.)
+[[override]]
+  name = "github.com/getsentry/sentry-go"
+  source = "https://github.com/cockroachdb/sentry-go"
+
 [[constraint]]
-  name = "github.com/getsentry/raven-go"
-  source = "https://github.com/cockroachdb/raven-go"
+  name = "github.com/cockroachdb/sentry-go"
+  version = "=v0.6.1-cockroachdb"
 
 # Used for benchmarks, should be recent.
 [[constraint]]
@@ -83,7 +93,7 @@ ignored = [
 
 [[constraint]]
   name = "github.com/cockroachdb/errors"
-  branch = "v1.2.4-cockroach20.1"
+  branch = "master"
 
 [[constraint]]
   name = "vitess.io/vitess"
@@ -116,6 +126,16 @@ ignored = [
   branch = "master"
 
 [[constraint]]
+  # This package should be replaced for google.golang.org/protobuf,
+  # but we (and various deps including etcd) continue to use this
+  # one. We require v1.4+.
+  # The package is a wrapper around the suggested replacement
+  # (google.golang.org/protobuf) so there's no pressing reason
+  # to do anything.
+  name = "github.com/golang/protobuf"
+  version = "=v1.4.1"
+
+[[constraint]]
   name = "github.com/gogo/protobuf"
   source = "https://github.com/cockroachdb/gogoproto"
   branch = "v1.2.0-with-clone-fix"
@@ -139,17 +159,6 @@ ignored = [
   name = "github.com/cockroachdb/pebble"
   branch = "master"
 
-# github.com/twpayne/go-geom has a few patches which are not released yet, including
-# empty GEOMETRYCOLLECTION handling.
-[[override]]
-  name = "github.com/twpayne/go-geom"
-  revision = "3402552da1eb9d7a1c8a9ecb05395b076d8e7bf6"
-
-# github.com/lib/pq has a newer revision that has notices, which we want
-[[override]]
-  name = "github.com/lib/pq"
-  revision = "9eb3fc897d6fd97dd4aad3d0404b54e2f7cc56be"
-
 # github.com/openzipkin-contrib/zipkin-go-opentracing requires a newer
 # version of thrift than is currently present in a release.
 [[override]]
@@ -163,7 +172,19 @@ ignored = [
 
 [[constraint]]
   name = "google.golang.org/grpc"
-  version = "=v1.21.2"
+  version = "=v1.27.1"
+
+[[constraint]]
+  # The grpc-gateway protoc plugin prints warnings whenever
+  # you have a gRPC service without a HttpRule. We have a number
+  # of those (and it's totally reasonable to).
+  # For the time being, we use a fork that has the warning removed.
+  # See:
+  # https://github.com/grpc-ecosystem/grpc-gateway/commit/ee513453fd80ce577c1a680b14300458072dad5e
+  # https://github.com/uber/prototool/issues/128
+  name = "github.com/grpc-ecosystem/grpc-gateway"
+  branch = "v1.14.5-nowarning"
+  source = "https://github.com/cockroachdb/grpc-gateway"
 
 [prune]
   go-tests = true

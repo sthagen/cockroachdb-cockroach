@@ -506,6 +506,21 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr></tbody>
 </table>
 
+### Enum functions
+
+<table>
+<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a name="enum_first"></a><code>enum_first(val: anyenum) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Returns the first value of the input enum type.</p>
+</span></td></tr>
+<tr><td><a name="enum_last"></a><code>enum_last(val: anyenum) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Returns the last value of the input enum type.</p>
+</span></td></tr>
+<tr><td><a name="enum_range"></a><code>enum_range(lower: anyenum, upper: anyenum) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Returns all values of the input enum in an ordered array between the two arguments.</p>
+</span></td></tr>
+<tr><td><a name="enum_range"></a><code>enum_range(val: anyenum) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Returns all values of the input enum in an ordered array.</p>
+</span></td></tr></tbody>
+</table>
+
 ### FLOAT functions
 
 <table>
@@ -664,12 +679,38 @@ has no relationship with the commit order of concurrent transactions.</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
+<tr><td><a name="addgeometrycolumn"></a><code>addgeometrycolumn(catalog_name: <a href="string.html">string</a>, schema_name: <a href="string.html">string</a>, table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>, srid: <a href="int.html">int</a>, type: <a href="string.html">string</a>, dimension: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Adds a new geometry column to an existing table and returns metadata about the column created.</p>
+</span></td></tr>
+<tr><td><a name="addgeometrycolumn"></a><code>addgeometrycolumn(catalog_name: <a href="string.html">string</a>, schema_name: <a href="string.html">string</a>, table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>, srid: <a href="int.html">int</a>, type: <a href="string.html">string</a>, dimension: <a href="int.html">int</a>, use_typmod: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Adds a new geometry column to an existing table and returns metadata about the column created.</p>
+</span></td></tr>
+<tr><td><a name="addgeometrycolumn"></a><code>addgeometrycolumn(schema_name: <a href="string.html">string</a>, table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>, srid: <a href="int.html">int</a>, type: <a href="string.html">string</a>, dimension: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Adds a new geometry column to an existing table and returns metadata about the column created.</p>
+</span></td></tr>
+<tr><td><a name="addgeometrycolumn"></a><code>addgeometrycolumn(schema_name: <a href="string.html">string</a>, table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>, srid: <a href="int.html">int</a>, type: <a href="string.html">string</a>, dimension: <a href="int.html">int</a>, use_typmod: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Adds a new geometry column to an existing table and returns metadata about the column created.</p>
+</span></td></tr>
+<tr><td><a name="addgeometrycolumn"></a><code>addgeometrycolumn(table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>, srid: <a href="int.html">int</a>, type: <a href="string.html">string</a>, dimension: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Adds a new geometry column to an existing table and returns metadata about the column created.</p>
+</span></td></tr>
+<tr><td><a name="addgeometrycolumn"></a><code>addgeometrycolumn(table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>, srid: <a href="int.html">int</a>, type: <a href="string.html">string</a>, dimension: <a href="int.html">int</a>, use_typmod: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Adds a new geometry column to an existing table and returns metadata about the column created.</p>
+</span></td></tr>
+<tr><td><a name="st_area"></a><code>st_area(geography: geography) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the area of the given geography in meters^2. Uses a spheroid to perform the operation.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+</span></td></tr>
+<tr><td><a name="st_area"></a><code>st_area(geography: geography, use_spheroid: <a href="bool.html">bool</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the area of the given geography in meters^2.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+</span></td></tr>
 <tr><td><a name="st_area"></a><code>st_area(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the area of the given geometry.</p>
-<p>This function uses the GEOS module.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_area2d"></a><code>st_area2d(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the area of the given geometry.</p>
+<p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_asbinary"></a><code>st_asbinary(geography: geography) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Returns the WKB representation of a given Geography.</p>
 </span></td></tr>
+<tr><td><a name="st_asbinary"></a><code>st_asbinary(geography: geography, xdr_or_ndr: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Returns the WKB representation of a given Geography. This variant has a second argument denoting the encoding - <code>xdr</code> for big endian and <code>ndr</code> for little endian.</p>
+</span></td></tr>
 <tr><td><a name="st_asbinary"></a><code>st_asbinary(geometry: geometry) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Returns the WKB representation of a given Geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_asbinary"></a><code>st_asbinary(geometry: geometry, xdr_or_ndr: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Returns the WKB representation of a given Geometry. This variant has a second argument denoting the encoding - <code>xdr</code> for big endian and <code>ndr</code> for little endian.</p>
 </span></td></tr>
 <tr><td><a name="st_asewkb"></a><code>st_asewkb(geography: geography) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Returns the EWKB representation of a given Geography.</p>
 </span></td></tr>
@@ -685,7 +726,11 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="st_ashexewkb"></a><code>st_ashexewkb(geography: geography) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the EWKB representation in hex of a given Geography.</p>
 </span></td></tr>
+<tr><td><a name="st_ashexewkb"></a><code>st_ashexewkb(geography: geography, xdr_or_ndr: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the EWKB representation in hex of a given Geography. This variant has a second argument denoting the encoding - <code>xdr</code> for big endian and <code>ndr</code> for little endian.</p>
+</span></td></tr>
 <tr><td><a name="st_ashexewkb"></a><code>st_ashexewkb(geometry: geometry) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the EWKB representation in hex of a given Geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_ashexewkb"></a><code>st_ashexewkb(geometry: geometry, xdr_or_ndr: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the EWKB representation in hex of a given Geometry. This variant has a second argument denoting the encoding - <code>xdr</code> for big endian and <code>ndr</code> for little endian.</p>
 </span></td></tr>
 <tr><td><a name="st_ashexwkb"></a><code>st_ashexwkb(geography: geography) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the WKB representation in hex of a given Geography.</p>
 </span></td></tr>
@@ -699,28 +744,74 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="st_astext"></a><code>st_astext(geometry: geometry) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the WKT representation of a given Geometry.</p>
 </span></td></tr>
+<tr><td><a name="st_centroid"></a><code>st_centroid(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the centroid of the given geometry.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_centroid"></a><code>st_centroid(val: <a href="string.html">string</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the centroid of the given string, which will be parsed as a geometry object.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
 <tr><td><a name="st_contains"></a><code>st_contains(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no points of geometry_b lie in the exterior of geometry_a, and there is at least one point in the interior of geometry_b that lies in the interior of geometry_a.</p>
-<p>This function uses the GEOS module.</p>
+<p>This function utilizes the GEOS module.</p>
 <p>This function will automatically use any available index.</p>
 </span></td></tr>
-<tr><td><a name="st_coveredby"></a><code>st_coveredby(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geometry_a is outside geometry_b.</p>
-<p>This function uses the GEOS module.</p>
+<tr><td><a name="st_containsproperly"></a><code>st_containsproperly(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_b intersects the interior of geometry_a but not the boundary or exterior of geometry_a.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_coveredby"></a><code>st_coveredby(geography_a: geography, geography_b: geography) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geography_a is outside geography_b.</p>
+<p>The calculations performed are have a precision of 1cm.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_coveredby"></a><code>st_coveredby(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geometry_a is outside geometry_b</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_covers"></a><code>st_covers(geography_a: geography, geography_b: geography) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geography_b is outside geography_a.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
 <p>This function will automatically use any available index.</p>
 </span></td></tr>
 <tr><td><a name="st_covers"></a><code>st_covers(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geometry_b is outside geometry_a.</p>
-<p>This function uses the GEOS module.</p>
+<p>This function utilizes the GEOS module.</p>
 <p>This function will automatically use any available index.</p>
 </span></td></tr>
 <tr><td><a name="st_crosses"></a><code>st_crosses(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a has some - but not all - interior points in common with geometry_b.</p>
-<p>This function uses the GEOS module.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_dfullywithin"></a><code>st_dfullywithin(geometry_a: geometry, geometry_b: geometry, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if every pair of points comprising geometry_a and geometry_b are within distance units. In other words, the ST_MaxDistance between geometry_a and geometry_b is less than or equal to distance units.</p>
+</span></td></tr>
+<tr><td><a name="st_distance"></a><code>st_distance(geography_a: geography, geography_b: geography) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the distance in meters between geography_a and geography_b.  Uses a spheroid to perform the operation.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+<p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_distance"></a><code>st_distance(geography_a: geography, geography_b: geography, use_spheroid: <a href="bool.html">bool</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the distance in meters between geography_a and geography_b.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
 <p>This function will automatically use any available index.</p>
 </span></td></tr>
 <tr><td><a name="st_distance"></a><code>st_distance(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the distance between the given geometries.</p>
-<p>This function uses the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_dwithin"></a><code>st_dwithin(geography_a: geography, geography_b: geography, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geography_a is within distance meters of geography_b. Uses a spheroid to perform the operation.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
+<p>The calculations performed are have a precision of 1cm.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+<p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_dwithin"></a><code>st_dwithin(geography_a: geography, geography_b: geography, distance: <a href="float.html">float</a>, use_spheroid: <a href="bool.html">bool</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geography_a is within distance meters of geography_b.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
+<p>The calculations performed are have a precision of 1cm.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+<p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_dwithin"></a><code>st_dwithin(geometry_a: geometry, geometry_b: geometry, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geometry_a is within distance units of geometry_b.</p>
+</span></td></tr>
+<tr><td><a name="st_endpoint"></a><code>st_endpoint(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the last point of a geometry which has shape LineString. Returns NULL if the geometry is not a LineString.</p>
 </span></td></tr>
 <tr><td><a name="st_equals"></a><code>st_equals(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a is spatially equal to geometry_b, i.e. ST_Within(geometry_a, geometry_b) = ST_Within(geometry_b, geometry_a) = true.</p>
-<p>This function uses the GEOS module.</p>
+<p>This function utilizes the GEOS module.</p>
 <p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_exteriorring"></a><code>st_exteriorring(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the exterior ring of a Polygon as a LineString. Returns NULL if the shape is not a Polygon.</p>
 </span></td></tr>
 <tr><td><a name="st_geogfromewkb"></a><code>st_geogfromewkb(val: <a href="bytes.html">bytes</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns the Geography from an EWKB representation.</p>
 </span></td></tr>
@@ -754,6 +845,11 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="st_geometryfromtext"></a><code>st_geometryfromtext(val: <a href="string.html">string</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKT or EWKT representation.</p>
 </span></td></tr>
+<tr><td><a name="st_geometryn"></a><code>st_geometryn(geometry: geometry, n: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the n-th Geometry (1-indexed). Returns NULL if out of bounds.</p>
+</span></td></tr>
+<tr><td><a name="st_geometrytype"></a><code>st_geometrytype(geometry: geometry) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the type of geometry as a string.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
 <tr><td><a name="st_geomfromewkb"></a><code>st_geomfromewkb(val: <a href="bytes.html">bytes</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from an EWKB representation.</p>
 </span></td></tr>
 <tr><td><a name="st_geomfromewkt"></a><code>st_geomfromewkt(val: <a href="string.html">string</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from an EWKT representation.</p>
@@ -770,13 +866,28 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="st_geomfromwkb"></a><code>st_geomfromwkb(val: <a href="bytes.html">bytes</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB representation.</p>
 </span></td></tr>
-<tr><td><a name="st_intersects"></a><code>st_intersects(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a shares any portion of space with geometry_b.</p>
-<p>This function uses the GEOS module.</p>
+<tr><td><a name="st_interiorringn"></a><code>st_interiorringn(geometry: geometry, n: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the n-th (1-indexed) interior ring of a Polygon as a LineString. Returns NULL if the shape is not a Polygon, or the ring does not exist.</p>
+</span></td></tr>
+<tr><td><a name="st_intersects"></a><code>st_intersects(geography_a: geography, geography_b: geography) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geography_a shares any portion of space with geography_b.</p>
+<p>The calculations performed are have a precision of 1cm.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
 <p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_intersects"></a><code>st_intersects(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a shares any portion of space with geometry_b.</p>
+<p>The calculations performed are have a precision of 1cm.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_length"></a><code>st_length(geography: geography) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the length of the given geography in meters. Uses a spheroid to perform the operation.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+</span></td></tr>
+<tr><td><a name="st_length"></a><code>st_length(geography: geography, use_spheroid: <a href="bool.html">bool</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the length of the given geography in meters.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
 </span></td></tr>
 <tr><td><a name="st_length"></a><code>st_length(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the length of the given geometry.</p>
 <p>Note ST_Length is only valid for LineString - use ST_Perimeter for Polygon.</p>
-<p>This function uses the GEOS module.</p>
+<p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_linefromtext"></a><code>st_linefromtext(str: <a href="string.html">string</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKT or EWKT representation with an SRID. If the shape underneath is not LineString, NULL is returned. If the SRID is present in both the EWKT and the argument, the argument value is used.</p>
 </span></td></tr>
@@ -793,6 +904,10 @@ has no relationship with the commit order of concurrent transactions.</p>
 <tr><td><a name="st_linestringfromwkb"></a><code>st_linestringfromwkb(val: <a href="bytes.html">bytes</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB representation. If the shape underneath is not LineString, NULL is returned.</p>
 </span></td></tr>
 <tr><td><a name="st_linestringfromwkb"></a><code>st_linestringfromwkb(wkb: <a href="bytes.html">bytes</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB representation with an SRID. If the shape underneath is not LineString, NULL is returned.</p>
+</span></td></tr>
+<tr><td><a name="st_makepoint"></a><code>st_makepoint(x: <a href="float.html">float</a>, y: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a new Point with the given X and Y coordinates.</p>
+</span></td></tr>
+<tr><td><a name="st_maxdistance"></a><code>st_maxdistance(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the maximum distance across every pair of points comprising the given geometries. Note if the geometries are the same, it will return the maximum distance between the geometry’s vertexes.</p>
 </span></td></tr>
 <tr><td><a name="st_mlinefromtext"></a><code>st_mlinefromtext(str: <a href="string.html">string</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKT or EWKT representation with an SRID. If the shape underneath is not MultiLineString, NULL is returned. If the SRID is present in both the EWKT and the argument, the argument value is used.</p>
 </span></td></tr>
@@ -858,13 +973,36 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="st_multipolygonfromwkb"></a><code>st_multipolygonfromwkb(wkb: <a href="bytes.html">bytes</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB representation with an SRID. If the shape underneath is not MultiPolygon, NULL is returned.</p>
 </span></td></tr>
+<tr><td><a name="st_ndims"></a><code>st_ndims(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of dimensions of a given Geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_npoints"></a><code>st_npoints(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of points in a given Geometry. Works for any shape type.</p>
+</span></td></tr>
+<tr><td><a name="st_nrings"></a><code>st_nrings(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of rings in a Polygon Geometry. Returns 0 if the shape is not a Polygon.</p>
+</span></td></tr>
+<tr><td><a name="st_numgeometries"></a><code>st_numgeometries(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of shapes inside a given Geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_numinteriorring"></a><code>st_numinteriorring(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of interior rings in a Polygon Geometry. Returns NULL if the shape is not a Polygon.</p>
+</span></td></tr>
+<tr><td><a name="st_numinteriorrings"></a><code>st_numinteriorrings(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of interior rings in a Polygon Geometry. Returns NULL if the shape is not a Polygon.</p>
+</span></td></tr>
+<tr><td><a name="st_numpoints"></a><code>st_numpoints(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of points in a LineString. Returns NULL if the Geometry is not a LineString.</p>
+</span></td></tr>
 <tr><td><a name="st_overlaps"></a><code>st_overlaps(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a intersects but does not completely contain geometry_b, or vice versa. “Does not completely” implies ST_Within(geometry_a, geometry_b) = ST_Within(geometry_b, geometry_a) = false.</p>
-<p>This function uses the GEOS module.</p>
+<p>This function utilizes the GEOS module.</p>
 <p>This function will automatically use any available index.</p>
 </span></td></tr>
-<tr><td><a name="st_perimeter"></a><code>st_perimeter(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the perimeter of the given geometry.</p>
+<tr><td><a name="st_perimeter"></a><code>st_perimeter(geography: geography) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the perimeter of the given geography in meters. Uses a spheroid to perform the operation.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+</span></td></tr>
+<tr><td><a name="st_perimeter"></a><code>st_perimeter(geography: geography, use_spheroid: <a href="bool.html">bool</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the perimeter of the given geography in meters.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+</span></td></tr>
+<tr><td><a name="st_perimeter"></a><code>st_perimeter(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the perimeter of the given geometry in meters.</p>
 <p>Note ST_Perimeter is only valid for Polygon - use ST_Length for LineString.</p>
-<p>This function uses the GEOS module.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_point"></a><code>st_point(x: <a href="float.html">float</a>, y: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a new Point with the given X and Y coordinates.</p>
 </span></td></tr>
 <tr><td><a name="st_pointfromtext"></a><code>st_pointfromtext(str: <a href="string.html">string</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKT or EWKT representation with an SRID. If the shape underneath is not Point, NULL is returned. If the SRID is present in both the EWKT and the argument, the argument value is used.</p>
 </span></td></tr>
@@ -873,6 +1011,8 @@ has no relationship with the commit order of concurrent transactions.</p>
 <tr><td><a name="st_pointfromwkb"></a><code>st_pointfromwkb(val: <a href="bytes.html">bytes</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB representation. If the shape underneath is not Point, NULL is returned.</p>
 </span></td></tr>
 <tr><td><a name="st_pointfromwkb"></a><code>st_pointfromwkb(wkb: <a href="bytes.html">bytes</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB representation with an SRID. If the shape underneath is not Point, NULL is returned.</p>
+</span></td></tr>
+<tr><td><a name="st_pointn"></a><code>st_pointn(geometry: geometry, n: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the n-th Point of a LineString (1-indexed). Returns NULL if out of bounds or not a LineString.</p>
 </span></td></tr>
 <tr><td><a name="st_polyfromtext"></a><code>st_polyfromtext(str: <a href="string.html">string</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKT or EWKT representation with an SRID. If the shape underneath is not Polygon, NULL is returned. If the SRID is present in both the EWKT and the argument, the argument value is used.</p>
 </span></td></tr>
@@ -890,13 +1030,42 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="st_polygonfromwkb"></a><code>st_polygonfromwkb(wkb: <a href="bytes.html">bytes</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB representation with an SRID. If the shape underneath is not Polygon, NULL is returned.</p>
 </span></td></tr>
+<tr><td><a name="st_relate"></a><code>st_relate(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the DE-9IM spatial relation between geometry_a and geometry_b.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_relate"></a><code>st_relate(geometry_a: geometry, geometry_b: geometry, pattern: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the DE-9IM spatial relation between geometry_a and geometry_b matches the DE-9IM pattern.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_segmentize"></a><code>st_segmentize(geography: geography, max_segment_length_meters: <a href="float.html">float</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns a modified Geography having no segment longer than the given max_segment_length meters.</p>
+<p>The calculations are done on a sphere.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_setsrid"></a><code>st_setsrid(geography: geography, srid: <a href="int.html">int</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Sets a Geography to a new SRID without transforming the coordinates.</p>
+</span></td></tr>
+<tr><td><a name="st_setsrid"></a><code>st_setsrid(geometry: geometry, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Sets a Geometry to a new SRID without transforming the coordinates.</p>
+</span></td></tr>
+<tr><td><a name="st_srid"></a><code>st_srid(geography: geography) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the Spatial Reference Identifier (SRID) for the ST_Geography as defined in spatial_ref_sys table.</p>
+</span></td></tr>
+<tr><td><a name="st_srid"></a><code>st_srid(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the Spatial Reference Identifier (SRID) for the ST_Geometry as defined in spatial_ref_sys table.</p>
+</span></td></tr>
+<tr><td><a name="st_startpoint"></a><code>st_startpoint(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the first point of a geometry which has shape LineString. Returns NULL if the geometry is not a LineString.</p>
+</span></td></tr>
 <tr><td><a name="st_touches"></a><code>st_touches(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if the only points in common between geometry_a and geometry_b are on the boundary. Note points do not touch other points.</p>
-<p>This function uses the GEOS module.</p>
+<p>This function utilizes the GEOS module.</p>
 <p>This function will automatically use any available index.</p>
 </span></td></tr>
 <tr><td><a name="st_within"></a><code>st_within(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a is completely inside geometry_b.</p>
-<p>This function uses the GEOS module.</p>
+<p>This function utilizes the GEOS module.</p>
 <p>This function will automatically use any available index.</p>
+</span></td></tr>
+<tr><td><a name="st_wkbtosql"></a><code>st_wkbtosql(val: <a href="bytes.html">bytes</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB representation.</p>
+</span></td></tr>
+<tr><td><a name="st_wkttosql"></a><code>st_wkttosql(val: <a href="string.html">string</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKT or EWKT representation.</p>
+</span></td></tr>
+<tr><td><a name="st_x"></a><code>st_x(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the X coordinate of a geometry if it is a Point.</p>
+</span></td></tr>
+<tr><td><a name="st_y"></a><code>st_y(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the Y coordinate of a geometry if it is a Point.</p>
 </span></td></tr></tbody>
 </table>
 
@@ -1410,6 +1579,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="crdb_internal.cluster_id"></a><code>crdb_internal.cluster_id() &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Returns the cluster ID.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.cluster_name"></a><code>crdb_internal.cluster_name() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the cluster name.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.completed_migrations"></a><code>crdb_internal.completed_migrations() &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.encode_key"></a><code>crdb_internal.encode_key(table_id: <a href="int.html">int</a>, index_id: <a href="int.html">int</a>, row_tuple: anyelement) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Generate the key for a row on a particular table and index.</p>
 </span></td></tr>

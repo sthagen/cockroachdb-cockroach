@@ -33,6 +33,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -75,17 +76,19 @@ const maxAllocatedStringSize = 128 * 1024 * 1024
 const errInsufficientArgsFmtString = "unknown signature: %s()"
 
 const (
+	categoryArray         = "Array"
 	categoryComparison    = "Comparison"
 	categoryCompatibility = "Compatibility"
 	categoryDateAndTime   = "Date and time"
-	categoryIDGeneration  = "ID generation"
+	categoryEnum          = "Enum"
+	categoryGenerator     = "Set-returning"
 	categoryGeospatial    = "Geospatial"
+	categoryIDGeneration  = "ID generation"
+	categoryJSON          = "JSONB"
+	categoryMultiTenancy  = "Multi-tenancy"
 	categorySequences     = "Sequence"
 	categoryString        = "String and byte"
-	categoryArray         = "Array"
 	categorySystemInfo    = "System info"
-	categoryGenerator     = "Set-returning"
-	categoryJSON          = "JSONB"
 )
 
 func categorizeType(t *types.T) string {
@@ -99,7 +102,7 @@ func categorizeType(t *types.T) string {
 	}
 }
 
-var digitNames = []string{"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
+var digitNames = [...]string{"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
 
 // builtinDefinition represents a built-in function before it becomes
 // a tree.FunctionDefinition.
@@ -1694,8 +1697,7 @@ CockroachDB supports the following flags:
 
 	"random": makeBuiltin(
 		tree.FunctionProperties{
-			Impure:                  true,
-			NeedsRepeatedEvaluation: true,
+			Impure: true,
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{},
@@ -2416,7 +2418,7 @@ may increase either contention or retry errors, or both.`,
 				return ts.EvalAtTimeZone(ctx, loc)
 			},
 			Info:       "Convert given time stamp with time zone to the new time zone, with no time zone designation.",
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityStable,
 		},
 		tree.Overload{
 			Types: tree.ArgTypes{
@@ -2484,7 +2486,9 @@ may increase either contention or retry errors, or both.`,
 				durationDelta := time.Duration(-beforeOffsetSecs) * time.Second
 				return tree.NewDTimeTZ(timetz.MakeTimeTZFromTime(tTime.In(loc).Add(durationDelta))), nil
 			},
-			Info:       "Treat given time without time zone as located in the specified time zone.",
+			Info: "Treat given time without time zone as located in the specified time zone.",
+			// TODO(mgartner): This overload might be stable, not volatile.
+			// See: https://github.com/cockroachdb/cockroach/pull/48756#issuecomment-627672686
 			Volatility: tree.VolatilityVolatile,
 		},
 		tree.Overload{
@@ -2507,7 +2511,9 @@ may increase either contention or retry errors, or both.`,
 				tTime := tArg.TimeTZ.ToTime()
 				return tree.NewDTimeTZ(timetz.MakeTimeTZFromTime(tTime.In(loc))), nil
 			},
-			Info:       "Convert given time with time zone to the new time zone.",
+			Info: "Convert given time with time zone to the new time zone.",
+			// TODO(mgartner): This overload might be stable, not volatile.
+			// See: https://github.com/cockroachdb/cockroach/pull/48756#issuecomment-627672686
 			Volatility: tree.VolatilityVolatile,
 		},
 	),
@@ -2839,6 +2845,141 @@ may increase either contention or retry errors, or both.`,
 
 	"jsonb_array_length": makeBuiltin(jsonProps(), jsonArrayLengthImpl),
 
+	// Enum functions.
+	"enum_first": makeBuiltin(
+		tree.FunctionProperties{NullableArgs: true, Category: categoryEnum},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"val", types.AnyEnum}},
+			ReturnType: tree.IdentityReturnType(0),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return nil, pgerror.Newf(pgcode.NullValueNotAllowed, "argument cannot be NULL")
+				}
+				arg := args[0].(*tree.DEnum)
+				min, ok := arg.Min(evalCtx)
+				if !ok {
+					return nil, errors.Newf("enum %s contains no values", arg.ResolvedType().Name())
+				}
+				return min, nil
+			},
+			Info:       "Returns the first value of the input enum type.",
+			Volatility: tree.VolatilityStable,
+		},
+	),
+
+	"enum_last": makeBuiltin(
+		tree.FunctionProperties{NullableArgs: true, Category: categoryEnum},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"val", types.AnyEnum}},
+			ReturnType: tree.IdentityReturnType(0),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return nil, pgerror.Newf(pgcode.NullValueNotAllowed, "argument cannot be NULL")
+				}
+				arg := args[0].(*tree.DEnum)
+				max, ok := arg.Max(evalCtx)
+				if !ok {
+					return nil, errors.Newf("enum %s contains no values", arg.ResolvedType().Name())
+				}
+				return max, nil
+			},
+			Info:       "Returns the last value of the input enum type.",
+			Volatility: tree.VolatilityStable,
+		},
+	),
+
+	"enum_range": makeBuiltin(
+		tree.FunctionProperties{NullableArgs: true, Category: categoryEnum},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"val", types.AnyEnum}},
+			ReturnType: tree.ArrayOfFirstNonNullReturnType(),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return nil, pgerror.Newf(pgcode.NullValueNotAllowed, "argument cannot be NULL")
+				}
+				arg := args[0].(*tree.DEnum)
+				typ := arg.EnumTyp
+				arr := tree.NewDArray(typ)
+				for i := range typ.TypeMeta.EnumData.LogicalRepresentations {
+					enum := &tree.DEnum{
+						EnumTyp:     typ,
+						PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[i],
+						LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[i],
+					}
+					if err := arr.Append(enum); err != nil {
+						return nil, err
+					}
+				}
+				return arr, nil
+			},
+			Info:       "Returns all values of the input enum in an ordered array.",
+			Volatility: tree.VolatilityStable,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"lower", types.AnyEnum}, {"upper", types.AnyEnum}},
+			ReturnType: tree.ArrayOfFirstNonNullReturnType(),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull && args[1] == tree.DNull {
+					return nil, pgerror.Newf(pgcode.NullValueNotAllowed, "both arguments cannot be NULL")
+				}
+				var bottom, top int
+				var typ *types.T
+				switch {
+				case args[0] == tree.DNull:
+					right := args[1].(*tree.DEnum)
+					typ = right.ResolvedType()
+					idx, err := typ.EnumGetIdxOfPhysical(right.PhysicalRep)
+					if err != nil {
+						return nil, err
+					}
+					bottom, top = 0, idx
+				case args[1] == tree.DNull:
+					left := args[0].(*tree.DEnum)
+					typ = left.ResolvedType()
+					idx, err := typ.EnumGetIdxOfPhysical(left.PhysicalRep)
+					if err != nil {
+						return nil, err
+					}
+					bottom, top = idx, len(typ.TypeMeta.EnumData.PhysicalRepresentations)-1
+				default:
+					left, right := args[0].(*tree.DEnum), args[1].(*tree.DEnum)
+					if !left.ResolvedType().Equivalent(right.ResolvedType()) {
+						return nil, pgerror.Newf(
+							pgcode.DatatypeMismatch,
+							"mismatched types %s and %s",
+							left.ResolvedType(),
+							right.ResolvedType(),
+						)
+					}
+					typ = left.ResolvedType()
+					var err error
+					bottom, err = typ.EnumGetIdxOfPhysical(left.PhysicalRep)
+					if err != nil {
+						return nil, err
+					}
+					top, err = typ.EnumGetIdxOfPhysical(right.PhysicalRep)
+					if err != nil {
+						return nil, err
+					}
+				}
+				arr := tree.NewDArray(typ)
+				for i := bottom; i <= top; i++ {
+					enum := &tree.DEnum{
+						EnumTyp:     typ,
+						PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[i],
+						LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[i],
+					}
+					if err := arr.Append(enum); err != nil {
+						return nil, err
+					}
+				}
+				return arr, nil
+			},
+			Info:       "Returns all values of the input enum in an ordered array between the two arguments.",
+			Volatility: tree.VolatilityStable,
+		},
+	),
+
 	// Metadata functions.
 
 	// https://www.postgresql.org/docs/10/static/functions-info.html
@@ -3054,6 +3195,78 @@ may increase either contention or retry errors, or both.`,
 		},
 	),
 
+	"crdb_internal.create_tenant": makeBuiltin(
+		tree.FunctionProperties{
+			Category:     categoryMultiTenancy,
+			Undocumented: true,
+			Impure:       true,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"id", types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				sTenID := int64(tree.MustBeDInt(args[0]))
+				if sTenID <= 0 {
+					return nil, pgerror.New(pgcode.InvalidParameterValue, "tenant ID must be positive")
+				}
+				if err := ctx.Tenant.CreateTenant(ctx.Context, uint64(sTenID), nil); err != nil {
+					return nil, err
+				}
+				return args[0], nil
+			},
+			Info:       "Creates a new tenant with the provided ID. Must be run by the System tenant.",
+			Volatility: tree.VolatilityVolatile,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"id", types.Int},
+				{"info", types.Bytes},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				sTenID := int64(tree.MustBeDInt(args[0]))
+				if sTenID <= 0 {
+					return nil, pgerror.New(pgcode.InvalidParameterValue, "tenant ID must be positive")
+				}
+				tenInfo := []byte(tree.MustBeDBytes(args[1]))
+				if err := ctx.Tenant.CreateTenant(ctx.Context, uint64(sTenID), tenInfo); err != nil {
+					return nil, err
+				}
+				return args[0], nil
+			},
+			Info:       "Creates a new tenant with the provided ID. Must be run by the System tenant.",
+			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
+	"crdb_internal.destroy_tenant": makeBuiltin(
+		tree.FunctionProperties{
+			Category:     categoryMultiTenancy,
+			Undocumented: true,
+			Impure:       true,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"id", types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				sTenID := int64(tree.MustBeDInt(args[0]))
+				if sTenID <= 0 {
+					return nil, pgerror.New(pgcode.InvalidParameterValue, "tenant ID must be positive")
+				}
+				if err := ctx.Tenant.DestroyTenant(ctx.Context, uint64(sTenID)); err != nil {
+					return nil, err
+				}
+				return args[0], nil
+			},
+			Info:       "Destroys a tenant with the provided ID. Must be run by the System tenant.",
+			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
 	"crdb_internal.encode_key": makeBuiltin(
 		tree.FunctionProperties{Category: categorySystemInfo},
 		tree.Overload{
@@ -3242,7 +3455,7 @@ may increase either contention or retry errors, or both.`,
 					return nil, err
 				}
 				msg := string(*args[0].(*tree.DString))
-				log.Fatal(ctx.Ctx(), msg)
+				log.Fatalf(ctx.Ctx(), "force_log_fatal(): %s", msg)
 				return nil, nil
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
@@ -3668,6 +3881,33 @@ may increase either contention or retry errors, or both.`,
 			},
 			Info:       "This function is used internally to round decimal array values during mutations.",
 			Volatility: tree.VolatilityStable,
+		},
+	),
+	"crdb_internal.completed_migrations": makeBuiltin(
+		tree.FunctionProperties{
+			Category: categorySystemInfo,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.StringArray),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				prefix := ctx.Codec.MigrationKeyPrefix()
+				keyvals, err := ctx.Txn.Scan(ctx.Context, prefix, prefix.PrefixEnd(), 0 /* maxRows */)
+				if err != nil {
+					return nil, errors.Wrapf(err, "failed to get list of completed migrations")
+				}
+				ret := &tree.DArray{ParamTyp: types.String, Array: make(tree.Datums, 0, len(keyvals))}
+				for _, keyval := range keyvals {
+					key := keyval.Key
+					if len(key) > len(keys.MigrationPrefix) {
+						key = key[len(keys.MigrationPrefix):]
+					}
+					ret.Array = append(ret.Array, tree.NewDString(string(key)))
+				}
+				return ret, nil
+			},
+			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
+			Volatility: tree.VolatilityVolatile,
 		},
 	),
 }
@@ -4682,7 +4922,7 @@ func hashBuiltin(newHash func() hash.Hash, info string) builtinDefinition {
 				return tree.NewDString(fmt.Sprintf("%x", h.Sum(nil))), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 		tree.Overload{
 			Types:      tree.VariadicType{VarType: types.Bytes},
@@ -4695,7 +4935,7 @@ func hashBuiltin(newHash func() hash.Hash, info string) builtinDefinition {
 				return tree.NewDString(fmt.Sprintf("%x", h.Sum(nil))), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 	)
 }
@@ -4713,7 +4953,7 @@ func hash32Builtin(newHash func() hash.Hash32, info string) builtinDefinition {
 				return tree.NewDInt(tree.DInt(h.Sum32())), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 		tree.Overload{
 			Types:      tree.VariadicType{VarType: types.Bytes},
@@ -4726,7 +4966,7 @@ func hash32Builtin(newHash func() hash.Hash32, info string) builtinDefinition {
 				return tree.NewDInt(tree.DInt(h.Sum32())), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 	)
 }
@@ -4744,7 +4984,7 @@ func hash64Builtin(newHash func() hash.Hash64, info string) builtinDefinition {
 				return tree.NewDInt(tree.DInt(h.Sum64())), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 		tree.Overload{
 			Types:      tree.VariadicType{VarType: types.Bytes},
@@ -4757,7 +4997,7 @@ func hash64Builtin(newHash func() hash.Hash64, info string) builtinDefinition {
 				return tree.NewDInt(tree.DInt(h.Sum64())), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 	)
 }

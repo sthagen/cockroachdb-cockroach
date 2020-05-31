@@ -15,14 +15,30 @@ import (
 	"encoding/binary"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	_ "github.com/cockroachdb/cockroach/pkg/geo/geoproj" // blank import to make sure PROJ compiles
 	"github.com/cockroachdb/errors"
 	"github.com/golang/geo/s2"
 	"github.com/twpayne/go-geom"
 	"github.com/twpayne/go-geom/encoding/ewkb"
 )
 
-// EWKBEncodingFormat is the encoding format for EWKB.
-var EWKBEncodingFormat = binary.LittleEndian
+// DefaultEWKBEncodingFormat is the default encoding format for EWKB.
+var DefaultEWKBEncodingFormat = binary.LittleEndian
+
+// EmptyBehavior is the behavior to adopt when an empty Geometry is encountered.
+type EmptyBehavior uint8
+
+const (
+	// EmptyBehaviorError will error with EmptyGeometryError when an empty geometry
+	// is encountered.
+	EmptyBehaviorError EmptyBehavior = 0
+	// EmptyBehaviorOmit will omit an entry when an empty geometry is encountered.
+	EmptyBehaviorOmit EmptyBehavior = 1
+)
+
+//
+// Geospatial Type
+//
 
 // GeospatialType are functions that are common between all Geospatial types.
 type GeospatialType interface {
@@ -34,6 +50,22 @@ type GeospatialType interface {
 
 var _ GeospatialType = (*Geometry)(nil)
 var _ GeospatialType = (*Geography)(nil)
+
+// GeospatialTypeFitsColumnMetadata determines whether a GeospatialType is compatible with the
+// given SRID and Shape.
+// Returns an error if the types does not fit.
+func GeospatialTypeFitsColumnMetadata(t GeospatialType, srid geopb.SRID, shape geopb.Shape) error {
+	// SRID 0 can take in any SRID. Otherwise SRIDs must match.
+	if srid != 0 && t.SRID() != srid {
+		return errors.Newf("object SRID %d does not match column SRID %d", t.SRID(), srid)
+	}
+	// Shape_Geometry/Shape_Unset can take in any kind of shape.
+	// Otherwise, shapes must match.
+	if shape != geopb.Shape_Unset && shape != geopb.Shape_Geometry && shape != t.Shape() {
+		return errors.Newf("object type %s does not match column type %s", t.Shape(), shape)
+	}
+	return nil
+}
 
 //
 // Geometry
@@ -47,6 +79,24 @@ type Geometry struct {
 // NewGeometry returns a new Geometry. Assumes the input EWKB is validated and in little endian.
 func NewGeometry(spatialObject geopb.SpatialObject) *Geometry {
 	return &Geometry{SpatialObject: spatialObject}
+}
+
+// NewGeometryFromPointCoords makes a point from x, y coordinates.
+func NewGeometryFromPointCoords(x, y float64) (*Geometry, error) {
+	s, err := spatialObjectFromGeom(geom.NewPointFlat(geom.XY, []float64{x, y}))
+	if err != nil {
+		return nil, err
+	}
+	return &Geometry{SpatialObject: s}, nil
+}
+
+// NewGeometryFromGeom creates a new Geometry object from a geom.T object.
+func NewGeometryFromGeom(g geom.T) (*Geometry, error) {
+	spatialObject, err := spatialObjectFromGeom(g)
+	if err != nil {
+		return nil, err
+	}
+	return NewGeometry(spatialObject), nil
 }
 
 // ParseGeometry parses a Geometry from a given text.
@@ -125,24 +175,40 @@ func MustParseGeometryFromEWKBRaw(ewkb geopb.EWKB) *Geometry {
 	return ret
 }
 
-// AsGeography converts a given Geometry to it's Geography form.
+// AsGeography converts a given Geometry to its Geography form.
 func (g *Geometry) AsGeography() (*Geography, error) {
 	if g.SRID() != 0 {
 		// TODO(otan): check SRID is latlng
 		return NewGeography(g.SpatialObject), nil
 	}
 
-	// Set a default SRID if one is not already set.
-	t, err := ewkb.Unmarshal(g.EWKB())
-	if err != nil {
-		return nil, err
-	}
-	adjustGeomSRID(t, geopb.DefaultGeographySRID)
-	spatialObject, err := spatialObjectFromGeom(t)
+	spatialObject, err := adjustEWKBSRID(g.EWKB(), geopb.DefaultGeographySRID)
 	if err != nil {
 		return nil, err
 	}
 	return NewGeography(spatialObject), nil
+}
+
+// CloneWithSRID sets a given Geometry's SRID to another, without any transformations.
+// Returns a new Geometry object.
+func (g *Geometry) CloneWithSRID(srid geopb.SRID) (*Geometry, error) {
+	spatialObject, err := adjustEWKBSRID(g.EWKB(), srid)
+	if err != nil {
+		return nil, err
+	}
+	return NewGeometry(spatialObject), nil
+}
+
+// adjustEWKBSRID returns the SpatialObject of an EWKB that has been overwritten
+// with the new given SRID.
+func adjustEWKBSRID(b geopb.EWKB, srid geopb.SRID) (geopb.SpatialObject, error) {
+	// Set a default SRID if one is not already set.
+	t, err := ewkb.Unmarshal(b)
+	if err != nil {
+		return geopb.SpatialObject{}, err
+	}
+	adjustGeomSRID(t, srid)
+	return spatialObjectFromGeom(t)
 }
 
 // AsGeomT returns the geometry as a geom.T object.
@@ -177,6 +243,15 @@ type Geography struct {
 // NewGeography returns a new Geography. Assumes the input EWKB is validated and in little endian.
 func NewGeography(spatialObject geopb.SpatialObject) *Geography {
 	return &Geography{SpatialObject: spatialObject}
+}
+
+// NewGeographyFromGeom creates a new Geography from a geom.T object.
+func NewGeographyFromGeom(g geom.T) (*Geography, error) {
+	spatialObject, err := spatialObjectFromGeom(g)
+	if err != nil {
+		return nil, err
+	}
+	return NewGeography(spatialObject), nil
 }
 
 // ParseGeography parses a Geography from a given text.
@@ -255,7 +330,17 @@ func MustParseGeographyFromEWKBRaw(ewkb geopb.EWKB) *Geography {
 	return ret
 }
 
-// AsGeometry converts a given Geography to it's Geometry form.
+// CloneWithSRID sets a given Geography's SRID to another, without any transformations.
+// Returns a new Geography object.
+func (g *Geography) CloneWithSRID(srid geopb.SRID) (*Geography, error) {
+	spatialObject, err := adjustEWKBSRID(g.EWKB(), srid)
+	if err != nil {
+		return nil, err
+	}
+	return NewGeography(spatialObject), nil
+}
+
+// AsGeometry converts a given Geography to its Geometry form.
 func (g *Geography) AsGeometry() *Geometry {
 	return NewGeometry(g.SpatialObject)
 }
@@ -281,13 +366,13 @@ func (g *Geography) Shape() geopb.Shape {
 }
 
 // AsS2 converts a given Geography into it's S2 form.
-func (g *Geography) AsS2() ([]s2.Region, error) {
+func (g *Geography) AsS2(emptyBehavior EmptyBehavior) ([]s2.Region, error) {
 	geomRepr, err := g.AsGeomT()
 	if err != nil {
 		return nil, err
 	}
 	// TODO(otan): convert by reading from EWKB to S2 directly.
-	return S2RegionsFromGeom(geomRepr), nil
+	return S2RegionsFromGeom(geomRepr, emptyBehavior)
 }
 
 // isLinearRingCCW returns whether a given linear ring is counter clock wise.
@@ -334,8 +419,20 @@ func isLinearRingCCW(linearRing *geom.LinearRing) bool {
 
 // S2RegionsFromGeom converts an geom representation of an object
 // to s2 regions.
-func S2RegionsFromGeom(geomRepr geom.T) []s2.Region {
+// As S2 does not really handle empty geometries well, we need to ingest emptyBehavior and
+// react appropriately.
+func S2RegionsFromGeom(geomRepr geom.T, emptyBehavior EmptyBehavior) ([]s2.Region, error) {
 	var regions []s2.Region
+	if geomRepr.Empty() {
+		switch emptyBehavior {
+		case EmptyBehaviorOmit:
+			return nil, nil
+		case EmptyBehaviorError:
+			return nil, NewEmptyGeometryError()
+		default:
+			return nil, errors.Newf("programmer error: unknown behavior")
+		}
+	}
 	switch repr := geomRepr.(type) {
 	case *geom.Point:
 		regions = []s2.Region{
@@ -373,31 +470,47 @@ func S2RegionsFromGeom(geomRepr geom.T) []s2.Region {
 		}
 	case *geom.GeometryCollection:
 		for _, geom := range repr.Geoms() {
-			regions = append(regions, S2RegionsFromGeom(geom)...)
+			subRegions, err := S2RegionsFromGeom(geom, emptyBehavior)
+			if err != nil {
+				return nil, err
+			}
+			regions = append(regions, subRegions...)
 		}
 	case *geom.MultiPoint:
 		for i := 0; i < repr.NumPoints(); i++ {
-			regions = append(regions, S2RegionsFromGeom(repr.Point(i))...)
+			subRegions, err := S2RegionsFromGeom(repr.Point(i), emptyBehavior)
+			if err != nil {
+				return nil, err
+			}
+			regions = append(regions, subRegions...)
 		}
 	case *geom.MultiLineString:
 		for i := 0; i < repr.NumLineStrings(); i++ {
-			regions = append(regions, S2RegionsFromGeom(repr.LineString(i))...)
+			subRegions, err := S2RegionsFromGeom(repr.LineString(i), emptyBehavior)
+			if err != nil {
+				return nil, err
+			}
+			regions = append(regions, subRegions...)
 		}
 	case *geom.MultiPolygon:
 		for i := 0; i < repr.NumPolygons(); i++ {
-			regions = append(regions, S2RegionsFromGeom(repr.Polygon(i))...)
+			subRegions, err := S2RegionsFromGeom(repr.Polygon(i), emptyBehavior)
+			if err != nil {
+				return nil, err
+			}
+			regions = append(regions, subRegions...)
 		}
 	}
-	return regions
+	return regions, nil
 }
 
 //
-// common
+// Common
 //
 
 // spatialObjectFromGeom creates a geopb.SpatialObject from a geom.T.
 func spatialObjectFromGeom(t geom.T) (geopb.SpatialObject, error) {
-	ret, err := ewkb.Marshal(t, EWKBEncodingFormat)
+	ret, err := ewkb.Marshal(t, DefaultEWKBEncodingFormat)
 	if err != nil {
 		return geopb.SpatialObject{}, err
 	}
@@ -429,9 +542,14 @@ func spatialObjectFromGeom(t geom.T) (geopb.SpatialObject, error) {
 	default:
 		return geopb.SpatialObject{}, errors.Newf("only 2D objects are currently supported")
 	}
+	bbox, err := BoundingBoxFromGeom(t)
+	if err != nil {
+		return geopb.SpatialObject{}, err
+	}
 	return geopb.SpatialObject{
-		EWKB:  geopb.EWKB(ret),
-		SRID:  geopb.SRID(t.SRID()),
-		Shape: shape,
+		EWKB:        geopb.EWKB(ret),
+		SRID:        geopb.SRID(t.SRID()),
+		Shape:       shape,
+		BoundingBox: bbox,
 	}, nil
 }

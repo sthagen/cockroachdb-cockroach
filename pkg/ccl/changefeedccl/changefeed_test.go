@@ -33,9 +33,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -984,7 +984,7 @@ func TestChangefeedStopOnSchemaChange(t *testing.T) {
 		t.Helper()
 		for {
 			if ev, err := f.Next(); err != nil {
-				log.Infof(context.TODO(), "got event %v %v", ev, err)
+				log.Infof(context.Background(), "got event %v %v", ev, err)
 				tsStr = timestampStrFromError(t, err)
 				_ = f.Close()
 				return tsStr
@@ -2166,7 +2166,7 @@ func TestChangefeedProtectedTimestamps(t *testing.T) {
 				}
 			}
 		}
-		requestFilter = storagebase.ReplicaRequestFilter(func(
+		requestFilter = kvserverbase.ReplicaRequestFilter(func(
 			ctx context.Context, ba roachpb.BatchRequest,
 		) *roachpb.Error {
 			if ba.Txn == nil || ba.Txn.Name != "changefeed backfill" {
@@ -2395,7 +2395,7 @@ func TestChangefeedProtectedTimestampsVerificationFails(t *testing.T) {
 	jobs.DefaultAdoptInterval = 10 * time.Millisecond
 
 	verifyRequestCh := make(chan *roachpb.AdminVerifyProtectedTimestampRequest, 1)
-	requestFilter := storagebase.ReplicaRequestFilter(func(
+	requestFilter := kvserverbase.ReplicaRequestFilter(func(
 		ctx context.Context, ba roachpb.BatchRequest,
 	) *roachpb.Error {
 		if r, ok := ba.GetArg(roachpb.AdminVerifyProtectedTimestamp); ok {
@@ -2412,7 +2412,7 @@ func TestChangefeedProtectedTimestampsVerificationFails(t *testing.T) {
 			args.Knobs.Store = storeKnobs
 		},
 		func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-			ctx := context.TODO()
+			ctx := context.Background()
 			sqlDB := sqlutils.MakeSQLRunner(db)
 			sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
 			_, err := f.Feed(`CREATE CHANGEFEED FOR foo WITH resolved`)

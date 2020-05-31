@@ -16,8 +16,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -30,7 +31,7 @@ import (
 func TestRenameTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	counter := int64(keys.MinNonPredefinedUserDescID)
 
@@ -49,7 +50,7 @@ func TestRenameTable(t *testing.T) {
 	// Check the table descriptor.
 	desc := &sqlbase.Descriptor{}
 	tableDescKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(counter))
-	ts, err := kvDB.GetProtoTs(context.TODO(), tableDescKey, desc)
+	ts, err := kvDB.GetProtoTs(context.Background(), tableDescKey, desc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +76,7 @@ func TestRenameTable(t *testing.T) {
 	}
 
 	// Check the table descriptor again.
-	ts, err = kvDB.GetProtoTs(context.TODO(), tableDescKey, desc)
+	ts, err = kvDB.GetProtoTs(context.Background(), tableDescKey, desc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,27 +89,6 @@ func TestRenameTable(t *testing.T) {
 	}
 }
 
-// isRenamed tests if a descriptor is updated by gossip to the specified name
-// and version.
-func isRenamed(
-	tableID sqlbase.ID,
-	expectedName string,
-	expectedVersion sqlbase.DescriptorVersion,
-	cfg *config.SystemConfig,
-) bool {
-	descKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableID)
-	val := cfg.GetValue(descKey)
-	if val == nil {
-		return false
-	}
-	var descriptor sqlbase.Descriptor
-	if err := val.GetProto(&descriptor); err != nil {
-		panic("unable to unmarshal table descriptor")
-	}
-	table := descriptor.Table(val.Timestamp)
-	return table.Name == expectedName && table.Version == expectedVersion
-}
-
 // Test that a SQL txn that resolved a name can keep resolving that name during
 // its lifetime even after the table has been renamed.
 // Also tests that the name of a renamed table cannot be reused until everybody
@@ -119,7 +99,7 @@ func isRenamed(
 func TestTxnCanStillResolveOldName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	var lmKnobs LeaseManagerTestingKnobs
+	var lmKnobs lease.ManagerTestingKnobs
 	// renameUnblocked is used to block the rename schema change until the test
 	// doesn't need the old name->id mapping to exist anymore.
 	renameUnblocked := make(chan interface{})
@@ -142,19 +122,20 @@ func TestTxnCanStillResolveOldName(t *testing.T) {
 	// leases using the old name (an update with the new name but the original
 	// version is ignored by the leasing refresh mechanism).
 	renamed := make(chan interface{})
-	lmKnobs.TestingLeasesRefreshedEvent =
-		func(cfg *config.SystemConfig) {
+	lmKnobs.TestingTableRefreshedEvent =
+		func(table *sqlbase.TableDescriptor) {
 			mu.Lock()
 			defer mu.Unlock()
-			if waitTableID != 0 {
-				if isRenamed(waitTableID, "t2", 2, cfg) {
-					close(renamed)
-					waitTableID = 0
-				}
+			if waitTableID != table.ID {
+				return
+			}
+			if table.Name == "t2" && table.Version == 2 {
+				close(renamed)
+				waitTableID = 0
 			}
 		}
 	s, db, kvDB := serverutils.StartServer(t, serverParams)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sql := `
 CREATE DATABASE test;
@@ -198,7 +179,7 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 		}
 	}()
 
-	// Block until the LeaseManager has processed the gossip update.
+	// Block until the Manager has processed the gossip update.
 	<-renamed
 
 	// Run another command in the transaction and make sure that we can still
@@ -224,13 +205,17 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 	// that the node doesn't have a lease on it anymore (committing the txn
 	// should have released the lease on the version of the descriptor with the
 	// old name), even though the name mapping still exists.
-	lease := s.LeaseManager().(*LeaseManager).tableNames.get(
-		tableDesc.ID,
-		tableDesc.GetParentSchemaID(),
-		"t",
-		s.Clock().Now(),
-	)
-	if lease != nil {
+
+	var foundLease bool
+	s.LeaseManager().(*lease.Manager).VisitLeases(func(
+		desc sqlbase.TableDescriptor, dropped bool, refCount int, expiration tree.DTimestamp,
+	) (wantMore bool) {
+		if desc.ID == tableDesc.ID && desc.Name == "t" {
+			foundLease = true
+		}
+		return true
+	})
+	if foundLease {
 		t.Fatalf(`still have lease on "t"`)
 	}
 	if _, err := db.Exec("SELECT * FROM test.t"); !testutils.IsError(
@@ -245,7 +230,7 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 func TestTxnCanUseNewNameAfterRename(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sql := `
 CREATE DATABASE test;
@@ -309,7 +294,7 @@ SELECT * FROM test.t2
 func TestSeriesOfRenames(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sql := `
 CREATE DATABASE test;
@@ -387,7 +372,7 @@ func TestRenameDuringDrainingName(t *testing.T) {
 		}}
 
 	s, db, kvDB := serverutils.StartServer(t, serverParams)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sql := `
 CREATE DATABASE test;

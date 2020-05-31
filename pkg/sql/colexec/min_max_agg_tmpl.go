@@ -20,19 +20,14 @@
 package colexec
 
 import (
-	"bytes"
-	"math"
-	"time"
+	"unsafe"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
@@ -44,24 +39,6 @@ var _ = colexecerror.InternalError
 
 // {{/*
 // Declarations to make the template compile properly.
-
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
 
 // _GOTYPESLICE is the template variable.
 type _GOTYPESLICE interface{}
@@ -75,7 +52,7 @@ const _TYPE_WIDTH = 0
 // _ASSIGN_CMP is the template function for assigning true to the first input
 // if the second input compares successfully to the third input. The comparison
 // operator is tree.LT for MIN and is tree.GT for MAX.
-func _ASSIGN_CMP(_, _, _ string) bool {
+func _ASSIGN_CMP(_, _, _, _, _, _ string) bool {
 	colexecerror.InternalError("")
 }
 
@@ -86,14 +63,16 @@ func _ASSIGN_CMP(_, _, _ string) bool {
 // {{/* Capture the aggregation name so we can use it in the inner loop. */}}
 // {{$agg := .AggNameLower}}
 
-func new_AGG_TITLEAgg(allocator *colmem.Allocator, t *types.T) (aggregateFunc, error) {
-	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+func new_AGG_TITLEAggAlloc(
+	allocator *colmem.Allocator, t *types.T, allocSize int64,
+) (aggregateFuncAlloc, error) {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .Overloads}}
 	case _CANONICAL_TYPE_FAMILY:
 		switch t.Width() {
 		// {{range .WidthOverloads}}
 		case _TYPE_WIDTH:
-			return &_AGG_TYPEAgg{allocator: allocator}, nil
+			return &_AGG_TYPEAggAlloc{allocator: allocator, allocSize: allocSize}, nil
 			// {{end}}
 		}
 		// {{end}}
@@ -106,7 +85,6 @@ func new_AGG_TITLEAgg(allocator *colmem.Allocator, t *types.T) (aggregateFunc, e
 
 type _AGG_TYPEAgg struct {
 	allocator *colmem.Allocator
-	done      bool
 	groups    []bool
 	curIdx    int
 	// curAgg holds the running min/max, so we can index into the slice once per
@@ -126,6 +104,8 @@ type _AGG_TYPEAgg struct {
 
 var _ aggregateFunc = &_AGG_TYPEAgg{}
 
+const sizeOf_AGG_TYPEAgg = int64(unsafe.Sizeof(_AGG_TYPEAgg{}))
+
 func (a *_AGG_TYPEAgg) Init(groups []bool, v coldata.Vec) {
 	a.groups = groups
 	a.vec = v
@@ -138,7 +118,6 @@ func (a *_AGG_TYPEAgg) Reset() {
 	a.curIdx = -1
 	a.foundNonNullForCurrentGroup = false
 	a.nulls.UnsetNulls()
-	a.done = false
 }
 
 func (a *_AGG_TYPEAgg) CurrentOutputIndex() int {
@@ -153,28 +132,7 @@ func (a *_AGG_TYPEAgg) SetOutputIndex(idx int) {
 }
 
 func (a *_AGG_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	if a.done {
-		return
-	}
 	inputLen := b.Length()
-	if inputLen == 0 {
-		// The aggregation is finished. Flush the last value. If we haven't found
-		// any non-nulls for this group so far, the output for this group should
-		// be null.
-		if !a.foundNonNullForCurrentGroup {
-			a.nulls.SetNull(a.curIdx)
-		} else {
-			a.allocator.PerformOperation(
-				[]coldata.Vec{a.vec},
-				func() {
-					execgen.SET(a.col, a.curIdx, a.curAgg)
-				},
-			)
-		}
-		a.curIdx++
-		a.done = true
-		return
-	}
 	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
 	col, nulls := vec._TYPE(), vec.Nulls()
 	a.allocator.PerformOperation(
@@ -209,8 +167,39 @@ func (a *_AGG_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	)
 }
 
+func (a *_AGG_TYPEAgg) Flush() {
+	// The aggregation is finished. Flush the last value. If we haven't found
+	// any non-nulls for this group so far, the output for this group should
+	// be null.
+	if !a.foundNonNullForCurrentGroup {
+		a.nulls.SetNull(a.curIdx)
+	} else {
+		execgen.SET(a.col, a.curIdx, a.curAgg)
+	}
+	a.curIdx++
+}
+
 func (a *_AGG_TYPEAgg) HandleEmptyInputScalar() {
 	a.nulls.SetNull(0)
+}
+
+type _AGG_TYPEAggAlloc struct {
+	allocator *colmem.Allocator
+	allocSize int64
+	aggFuncs  []_AGG_TYPEAgg
+}
+
+var _ aggregateFuncAlloc = &_AGG_TYPEAggAlloc{}
+
+func (a *_AGG_TYPEAggAlloc) newAggFunc() aggregateFunc {
+	if len(a.aggFuncs) == 0 {
+		a.allocator.AdjustMemoryUsage(sizeOf_AGG_TYPEAgg * a.allocSize)
+		a.aggFuncs = make([]_AGG_TYPEAgg, a.allocSize)
+	}
+	f := &a.aggFuncs[0]
+	f.allocator = a.allocator
+	a.aggFuncs = a.aggFuncs[1:]
+	return f
 }
 
 // {{end}}
@@ -256,7 +245,7 @@ func _ACCUMULATE_MINMAX(a *_AGG_TYPEAgg, nulls *coldata.Nulls, i int, _HAS_NULLS
 		} else {
 			var cmp bool
 			candidate := execgen.UNSAFEGET(col, i)
-			_ASSIGN_CMP(cmp, candidate, a.curAgg)
+			_ASSIGN_CMP(cmp, candidate, a.curAgg, _, col, _)
 			if cmp {
 				execgen.COPYVAL(a.curAgg, candidate)
 			}

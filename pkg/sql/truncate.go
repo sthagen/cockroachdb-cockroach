@@ -18,6 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -58,7 +60,7 @@ func (t *truncateNode) startExec(params runParams) error {
 	for i := range n.Tables {
 		tn := &n.Tables[i]
 		tableDesc, err := p.ResolveMutableTableDescriptor(
-			ctx, tn, true /*required*/, ResolveRequireTableDesc)
+			ctx, tn, true /*required*/, resolver.ResolveRequireTableDesc)
 		if err != nil {
 			return err
 		}
@@ -84,7 +86,7 @@ func (t *truncateNode) startExec(params runParams) error {
 			if _, ok := toTruncate[tableID]; ok {
 				return nil
 			}
-			other, err := p.Tables().getMutableTableVersionByID(ctx, tableID, p.txn)
+			other, err := p.Tables().GetMutableTableVersionByID(ctx, tableID, p.txn)
 			if err != nil {
 				return err
 			}
@@ -162,7 +164,7 @@ func (p *planner) truncateTable(
 ) error {
 	// Read the table descriptor because it might have changed
 	// while another table in the truncation list was truncated.
-	tableDesc, err := p.Tables().getMutableTableVersionByID(ctx, id, p.txn)
+	tableDesc, err := p.Tables().GetMutableTableVersionByID(ctx, id, p.txn)
 	if err != nil {
 		return err
 	}
@@ -190,13 +192,6 @@ func (p *planner) truncateTable(
 	//
 	// TODO(vivek): Fix properly along with #12123.
 	zoneKey := config.MakeZoneKey(uint32(tableDesc.ID))
-	nameKey := sqlbase.MakeObjectNameKey(
-		ctx,
-		p.ExecCfg().Settings,
-		tableDesc.ParentID,
-		tableDesc.GetParentSchemaID(),
-		tableDesc.GetName(),
-	).Key(p.ExecCfg().Codec)
 	key := sqlbase.MakeObjectNameKey(
 		ctx, p.ExecCfg().Settings,
 		newTableDesc.ParentID,
@@ -204,15 +199,11 @@ func (p *planner) truncateTable(
 		newTableDesc.Name,
 	).Key(p.ExecCfg().Codec)
 
-	b := &kv.Batch{}
-	// Use CPut because we want to remove a specific name -> id map.
-	if traceKV {
-		log.VEventf(ctx, 2, "CPut %s -> nil", nameKey)
-	}
-	var existingIDVal roachpb.Value
-	existingIDVal.SetInt(int64(tableDesc.ID))
-	b.CPut(nameKey, nil, &existingIDVal)
-	if err := p.txn.Run(ctx, b); err != nil {
+	// Remove the old namespace entry.
+	if err := sqlbase.RemoveObjectNamespaceEntry(
+		ctx, p.txn, p.execCfg.Codec,
+		tableDesc.ParentID, tableDesc.GetParentSchemaID(), tableDesc.GetName(),
+		traceKV); err != nil {
 		return err
 	}
 
@@ -221,7 +212,7 @@ func (p *planner) truncateTable(
 		return err
 	}
 
-	newID, err := GenerateUniqueDescID(ctx, p.ExecCfg().DB)
+	newID, err := catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
 	if err != nil {
 		return err
 	}
@@ -282,7 +273,7 @@ func (p *planner) truncateTable(
 	}
 
 	// Copy the zone config.
-	b = &kv.Batch{}
+	b := &kv.Batch{}
 	b.Get(zoneKey)
 	if err := p.txn.Run(ctx, b); err != nil {
 		return err
@@ -314,7 +305,7 @@ func (p *planner) findAllReferences(
 		if id == table.ID {
 			continue
 		}
-		t, err := p.Tables().getMutableTableVersionByID(ctx, id, p.txn)
+		t, err := p.Tables().GetMutableTableVersionByID(ctx, id, p.txn)
 		if err != nil {
 			return nil, err
 		}

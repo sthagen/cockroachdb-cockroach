@@ -19,17 +19,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachange"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
@@ -50,12 +49,12 @@ type alterTableNode struct {
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode, error) {
 	tableDesc, err := p.ResolveMutableTableDescriptorEx(
-		ctx, n.Table, !n.IfExists, ResolveRequireTableDesc,
+		ctx, n.Table, !n.IfExists, resolver.ResolveRequireTableDesc,
 	)
-	if errors.Is(err, errNoPrimaryKey) {
+	if errors.Is(err, resolver.ErrNoPrimaryKey) {
 		if len(n.Cmds) > 0 && isAlterCmdValidWithoutPrimaryKey(n.Cmds[0]) {
 			tableDesc, err = p.ResolveMutableTableDescriptorExAllowNoPrimaryKey(
-				ctx, n.Table, !n.IfExists, ResolveRequireTableDesc,
+				ctx, n.Table, !n.IfExists, resolver.ResolveRequireTableDesc,
 			)
 		}
 	}
@@ -147,7 +146,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 		case *tree.AlterTableAddColumn:
 			d := t.ColumnDef
 			version := params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx)
-			toType, err := tree.ResolveType(d.Type, params.p.semaCtx.GetTypeResolver())
+			toType, err := tree.ResolveType(params.ctx, d.Type, params.p.semaCtx.GetTypeResolver())
 			if err != nil {
 				return err
 			}
@@ -182,7 +181,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			d = newDef
 			incTelemetryForNewColumn(d)
 
-			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, &params.p.semaCtx, params.EvalContext())
+			col, idx, expr, err := sqlbase.MakeColumnDefDescs(params.ctx, d, &params.p.semaCtx, params.EvalContext())
 			if err != nil {
 				return err
 			}
@@ -257,7 +256,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 			if d.IsComputed() {
-				if err := validateComputedColumn(n.tableDesc, d, &params.p.semaCtx); err != nil {
+				if err := validateComputedColumn(params.ctx, n.tableDesc, d, &params.p.semaCtx); err != nil {
 					return err
 				}
 			}
@@ -323,7 +322,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 
 			case *tree.CheckConstraintTableDef:
-				ck, err := MakeCheckConstraint(params.ctx,
+				ck, err := makeCheckConstraint(params.ctx,
 					n.tableDesc, d, inuseNames, &params.p.semaCtx, *tn)
 				if err != nil {
 					return err
@@ -705,7 +704,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 					"column %q in the middle of being dropped", t.GetColumn())
 			}
 			// Apply mutations to copy of column descriptor.
-			if err := applyColumnMutation(n.tableDesc, col, t, params); err != nil {
+			if err := applyColumnMutation(params.ctx, n.tableDesc, col, t, params, n.n.Cmds); err != nil {
 				return err
 			}
 			descriptorChanged = true
@@ -900,78 +899,16 @@ func addIndexMutationWithSpecificPrimaryKey(
 // columnDescriptor, and saves the containing table descriptor. If the column's
 // dependencies on sequences change, it updates them as well.
 func applyColumnMutation(
+	ctx context.Context,
 	tableDesc *sqlbase.MutableTableDescriptor,
 	col *sqlbase.ColumnDescriptor,
 	mut tree.ColumnMutationCmd,
 	params runParams,
+	cmds tree.AlterTableCmds,
 ) error {
 	switch t := mut.(type) {
 	case *tree.AlterTableAlterColumnType:
-		typ, err := tree.ResolveType(t.ToType, params.p.semaCtx.GetTypeResolver())
-		if err != nil {
-			return err
-		}
-
-		version := params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx)
-		if supported, err := isTypeSupportedInVersion(version, typ); err != nil {
-			return err
-		} else if !supported {
-			return pgerror.Newf(
-				pgcode.FeatureNotSupported,
-				"type %s is not supported until version upgrade is finalized",
-				typ.SQLString(),
-			)
-		}
-
-		// Special handling for STRING COLLATE xy to verify that we recognize the language.
-		if t.Collation != "" {
-			if types.IsStringType(typ) {
-				typ = types.MakeCollatedString(typ, t.Collation)
-			} else {
-				return pgerror.New(pgcode.Syntax, "COLLATE can only be used with string types")
-			}
-		}
-
-		err = sqlbase.ValidateColumnDefType(typ)
-		if err != nil {
-			return err
-		}
-
-		// No-op if the types are Identical.  We don't use Equivalent here because
-		// the user may be trying to change the type of the column without changing
-		// the type family.
-		if col.Type.Identical(typ) {
-			return nil
-		}
-
-		kind, err := schemachange.ClassifyConversion(col.Type, typ)
-		if err != nil {
-			return err
-		}
-
-		switch kind {
-		case schemachange.ColumnConversionDangerous, schemachange.ColumnConversionImpossible:
-			// We're not going to make it impossible for the user to perform
-			// this conversion, but we do want them to explicit about
-			// what they're going for.
-			return pgerror.Newf(pgcode.CannotCoerce,
-				"the requested type conversion (%s -> %s) requires an explicit USING expression",
-				col.Type.SQLString(), typ.SQLString())
-		case schemachange.ColumnConversionTrivial:
-			col.Type = typ
-		case schemachange.ColumnConversionGeneral:
-			return unimplemented.NewWithIssueDetailf(
-				9851,
-				fmt.Sprintf("%s->%s", col.Type.SQLString(), typ.SQLString()),
-				"type conversion from %s to %s requires overwriting existing values which is not yet implemented",
-				col.Type.SQLString(),
-				typ.SQLString(),
-			)
-		default:
-			return unimplemented.NewWithIssueDetail(9851,
-				fmt.Sprintf("%s->%s", col.Type.SQLString(), typ.SQLString()),
-				"type conversion not yet implemented")
-		}
+		return AlterColumnType(ctx, tableDesc, col, t, params, cmds)
 
 	case *tree.AlterTableSetDefault:
 		if len(col.UsesSequenceIds) > 0 {
@@ -984,7 +921,7 @@ func applyColumnMutation(
 		} else {
 			colDatumType := col.Type
 			expr, err := sqlbase.SanitizeVarFreeExpr(
-				t.Default, colDatumType, "DEFAULT", &params.p.semaCtx, true, /* allowImpure */
+				params.ctx, t.Default, colDatumType, "DEFAULT", &params.p.semaCtx, true, /* allowImpure */
 			)
 			if err != nil {
 				return err
@@ -1276,7 +1213,7 @@ func (p *planner) updateFKBackReferenceName(
 	if tableDesc.ID == ref.ReferencedTableID {
 		referencedTableDesc = tableDesc
 	} else {
-		lookup, err := p.Tables().getMutableTableVersionByID(ctx, ref.ReferencedTableID, p.txn)
+		lookup, err := p.Tables().GetMutableTableVersionByID(ctx, ref.ReferencedTableID, p.txn)
 		if err != nil {
 			return errors.Errorf("error resolving referenced table ID %d: %v", ref.ReferencedTableID, err)
 		}

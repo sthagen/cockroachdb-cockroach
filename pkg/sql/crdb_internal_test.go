@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -126,8 +127,8 @@ func TestGossipAlertsTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-	ctx := context.TODO()
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
 
 	if err := s.GossipI().(*gossip.Gossip).AddInfoProto(gossip.MakeNodeHealthAlertKey(456), &statuspb.HealthCheckResult{
 		Alerts: []statuspb.HealthAlert{{
@@ -165,11 +166,12 @@ func TestOldBitColumnMetadata(t *testing.T) {
 
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
-	defer sql.TestDisableTableLeases()()
+	defer lease.TestingDisableTableLeases()()
 
+	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(ctx)
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -202,7 +204,7 @@ CREATE TABLE t.test (k INT);
 		t.Fatal(err)
 	}
 	colDef := alterCmd.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
-	col, _, _, err := sqlbase.MakeColumnDefDescs(colDef, nil, nil)
+	col, _, _, err := sqlbase.MakeColumnDefDescs(ctx, colDef, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +215,7 @@ CREATE TABLE t.test (k INT);
 	tableDesc.Columns = append(tableDesc.Columns, *col)
 
 	// Write the modified descriptor.
-	if err := kvDB.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := kvDB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		if err := txn.SetSystemConfigTrigger(); err != nil {
 			return err
 		}

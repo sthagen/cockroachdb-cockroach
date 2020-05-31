@@ -291,7 +291,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 	// Special-case handling for GroupBy private; print grouping columns
 	// and internal ordering in addition to full set of columns.
 	case *GroupByExpr, *ScalarGroupByExpr, *DistinctOnExpr, *EnsureDistinctOnExpr,
-		*UpsertDistinctOnExpr:
+		*UpsertDistinctOnExpr, *EnsureUpsertDistinctOnExpr:
 		private := e.Private().(*GroupingPrivate)
 		if !f.HasFlags(ExprFmtHideColumns) && !private.GroupingCols.Empty() {
 			f.formatColList(e, tp, "grouping columns:", opt.ColSetToList(private.GroupingCols))
@@ -685,6 +685,12 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 		if r.JoinSize > 1 {
 			tp.Childf("join-size: %d", r.JoinSize)
+		}
+		switch e.Op() {
+		case opt.InnerJoinOp, opt.LeftJoinOp, opt.FullJoinOp:
+			if s := r.MultiplicityProps.String(); (r.Available&props.MultiplicityProps) != 0 && s != "" {
+				tp.Childf("multiplicity: %s", s)
+			}
 		}
 		if withUses := relational.Shared.Rule.WithUses; len(withUses) > 0 {
 			n := tp.Childf("cte-uses")

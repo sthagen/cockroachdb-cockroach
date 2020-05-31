@@ -18,7 +18,6 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -162,7 +161,7 @@ func (m colIdxMap) get(c sqlbase.ColumnID) (int, bool) {
 //   }
 type cFetcher struct {
 	// table is the table that's configured for fetching.
-	table cTableInfo
+	table *cTableInfo
 
 	// reverse denotes whether or not the spans should be read in reverse
 	// or not when StartScan is invoked.
@@ -266,7 +265,6 @@ func (rf *cFetcher) Init(
 	}
 
 	tableArgs := tables[0]
-	oldTable := rf.table
 
 	m := colIdxMap{
 		vals: make(sqlbase.ColumnIDs, 0, len(tableArgs.ColIdxMap)),
@@ -278,30 +276,18 @@ func (rf *cFetcher) Init(
 	}
 	sort.Sort(m)
 	colDescriptors := tableArgs.Cols
-	table := cTableInfo{
+	table := &cTableInfo{
 		spans:            tableArgs.Spans,
 		desc:             tableArgs.Desc,
 		colIdxMap:        m,
 		index:            tableArgs.Index,
 		isSecondaryIndex: tableArgs.IsSecondaryIndex,
 		cols:             colDescriptors,
-
-		// These slice fields might get re-allocated below, so reslice them from
-		// the old table here in case they've got enough capacity already.
-		indexColOrdinals:       oldTable.indexColOrdinals[:0],
-		extraValColOrdinals:    oldTable.extraValColOrdinals[:0],
-		allIndexColOrdinals:    oldTable.allIndexColOrdinals[:0],
-		allExtraValColOrdinals: oldTable.allExtraValColOrdinals[:0],
 	}
 
 	typs := make([]*types.T, len(colDescriptors))
 	for i := range typs {
 		typs[i] = colDescriptors[i].Type
-		if !typeconv.IsTypeSupported(typs[i]) && tableArgs.ValNeededForCol.Contains(i) {
-			// Only return an error if the type is unhandled and needed. If not needed,
-			// a placeholder Vec will be created.
-			return errors.Errorf("unhandled type %+v", colDescriptors[i].Type)
-		}
 	}
 
 	rf.machine.batch = allocator.NewMemBatch(typs)
@@ -403,7 +389,7 @@ func (rf *cFetcher) Init(
 	if err != nil {
 		return err
 	}
-	if cHasExtraCols(&table) {
+	if cHasExtraCols(table) {
 		// Unique secondary indexes have a value that is the
 		// primary index key.
 		// Primary indexes only contain ascendingly-encoded
@@ -669,6 +655,7 @@ func (rf *cFetcher) nextBatch(ctx context.Context) (coldata.Batch, error) {
 					indexOrds = rf.table.allIndexColOrdinals
 				}
 				key, matches, foundNull, err = colencoding.DecodeIndexKeyToCols(
+					&rf.table.da,
 					rf.machine.colvecs,
 					rf.machine.rowIdx,
 					rf.table.desc,
@@ -897,7 +884,7 @@ func (rf *cFetcher) pushState(state fetcherState) {
 // getDatumAt returns the converted datum object at the given (colIdx, rowIdx).
 // This function is meant for tracing and should not be used in hot paths.
 func (rf *cFetcher) getDatumAt(colIdx int, rowIdx int, typ *types.T) tree.Datum {
-	return PhysicalTypeColElemToDatum(rf.machine.colvecs[colIdx], rowIdx, rf.table.da, typ)
+	return PhysicalTypeColElemToDatum(rf.machine.colvecs[colIdx], rowIdx, &rf.table.da, typ)
 }
 
 // processValue processes the state machine's current value component, setting
@@ -908,7 +895,7 @@ func (rf *cFetcher) getDatumAt(colIdx int, rowIdx int, typ *types.T) tree.Datum 
 func (rf *cFetcher) processValue(
 	ctx context.Context, familyID sqlbase.FamilyID,
 ) (prettyKey string, prettyValue string, err error) {
-	table := &rf.table
+	table := rf.table
 
 	if rf.traceKV {
 		var buf strings.Builder
@@ -997,6 +984,7 @@ func (rf *cFetcher) processValue(
 					extraColOrds = table.allExtraValColOrdinals
 				}
 				valueBytes, _, err = colencoding.DecodeKeyValsToCols(
+					&table.da,
 					rf.machine.colvecs,
 					rf.machine.rowIdx,
 					extraColOrds,
@@ -1085,7 +1073,9 @@ func (rf *cFetcher) processValueSingle(
 				return prettyKey, "", nil
 			}
 			typ := table.cols[idx].Type
-			err := colencoding.UnmarshalColumnValueToCol(rf.machine.colvecs[idx], rf.machine.rowIdx, typ, val)
+			err := colencoding.UnmarshalColumnValueToCol(
+				&table.da, rf.machine.colvecs[idx], rf.machine.rowIdx, typ, val,
+			)
 			if err != nil {
 				return "", "", err
 			}
@@ -1183,8 +1173,9 @@ func (rf *cFetcher) processValueBytes(
 		vec := rf.machine.colvecs[idx]
 
 		valTyp := table.cols[idx].Type
-		valueBytes, err = colencoding.DecodeTableValueToCol(vec, rf.machine.rowIdx, typ, dataOffset, valTyp,
-			valueBytes)
+		valueBytes, err = colencoding.DecodeTableValueToCol(
+			&table.da, vec, rf.machine.rowIdx, typ, dataOffset, valTyp, valueBytes,
+		)
 		if err != nil {
 			return "", "", err
 		}
@@ -1211,7 +1202,7 @@ func (rf *cFetcher) processValueTuple(
 }
 
 func (rf *cFetcher) fillNulls() error {
-	table := &rf.table
+	table := rf.table
 	if rf.machine.remainingValueColsByIdx.Empty() {
 		return nil
 	}

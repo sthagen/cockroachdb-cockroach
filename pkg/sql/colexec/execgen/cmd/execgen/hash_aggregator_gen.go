@@ -27,16 +27,17 @@ func genHashAggregator(wr io.Writer) error {
 		return err
 	}
 
-	s := string(t)
-
-	s = strings.ReplaceAll(s, "_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}")
-	s = strings.ReplaceAll(s, "_TYPE_WIDTH", typeWidthReplacement)
-	s = strings.ReplaceAll(s, "TemplateType", "{{.VecMethod}}")
+	r := strings.NewReplacer(
+		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"TemplateType", "{{.VecMethod}}",
+	)
+	s := r.Replace(string(t))
 
 	s = replaceManipulationFuncsAmbiguous(".Global", s)
 
-	assignCmpRe := makeFunctionRegex("_ASSIGN_NE", 3)
-	s = assignCmpRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.Assign", 3))
+	assignCmpRe := makeFunctionRegex("_ASSIGN_NE", 6)
+	s = assignCmpRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.Assign", 6))
 
 	populateSels := makeFunctionRegex("_POPULATE_SELS", 3)
 	s = populateSels.ReplaceAllString(s, `{{template "populateSels" buildDict "Global" . "BatchHasSelection" $3}}`)

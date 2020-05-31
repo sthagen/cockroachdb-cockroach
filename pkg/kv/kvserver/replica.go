@@ -27,11 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -251,7 +251,7 @@ type Replica struct {
 		// the closing of the channel.
 		mergeComplete chan struct{}
 		// The state of the Raft state machine.
-		state storagepb.ReplicaState
+		state kvserverpb.ReplicaState
 		// Last index/term persisted to the raft log (not necessarily
 		// committed). Note that lastTerm may be 0 (and thus invalid) even when
 		// lastIndex is known, in which case the term will have to be retrieved
@@ -340,7 +340,7 @@ type Replica struct {
 		//
 		// TODO(ajwerner): move the proposal map and ProposalData entirely under
 		// the raftMu.
-		proposals         map[storagebase.CmdIDKey]*ProposalData
+		proposals         map[kvserverbase.CmdIDKey]*ProposalData
 		internalRaftGroup *raft.RawNode
 		// The ID of the replica within the Raft group. This value may never be 0.
 		replicaID roachpb.ReplicaID
@@ -709,7 +709,7 @@ func (r *Replica) StoreID() roachpb.StoreID {
 }
 
 // EvalKnobs returns the EvalContext's Knobs.
-func (r *Replica) EvalKnobs() storagebase.BatchEvalTestingKnobs {
+func (r *Replica) EvalKnobs() kvserverbase.BatchEvalTestingKnobs {
 	return r.store.cfg.TestingKnobs.EvalKnobs
 }
 
@@ -772,13 +772,13 @@ func (r *Replica) GetGCThreshold() hlc.Timestamp {
 // is enabled and the TTL has passed. If this is an admin command or this range
 // contains data outside of the user keyspace, we return the true GC threshold.
 func (r *Replica) getImpliedGCThresholdRLocked(
-	st *storagepb.LeaseStatus, isAdmin bool,
+	st *kvserverpb.LeaseStatus, isAdmin bool,
 ) hlc.Timestamp {
 	threshold := *r.mu.state.GCThreshold
 
 	// The GC threshold is the oldest value we can return here.
 	if isAdmin || !StrictGCEnforcement.Get(&r.store.ClusterSettings().SV) ||
-		r.mu.state.Desc.StartKey.Less(roachpb.RKey(keys.UserTableDataMin)) {
+		r.isSystemRangeRLocked() {
 		return threshold
 	}
 
@@ -791,7 +791,7 @@ func (r *Replica) getImpliedGCThresholdRLocked(
 	// user experience win; it's always safe to allow reads to continue so long
 	// as they are after the GC threshold.
 	c := r.mu.cachedProtectedTS
-	if st.State != storagepb.LeaseState_VALID || c.readAt.Less(st.Lease.Start) {
+	if st.State != kvserverpb.LeaseState_VALID || c.readAt.Less(st.Lease.Start) {
 		return threshold
 	}
 
@@ -804,6 +804,17 @@ func (r *Replica) getImpliedGCThresholdRLocked(
 		threshold = c.earliestRecord.Timestamp.Prev()
 	}
 	return threshold
+}
+
+// isSystemRange returns true if r's key range precedes keys.UserTableDataMin.
+func (r *Replica) isSystemRange() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isSystemRangeRLocked()
+}
+
+func (r *Replica) isSystemRangeRLocked() bool {
+	return r.mu.state.Desc.StartKey.Less(roachpb.RKey(keys.UserTableDataMin))
 }
 
 // maxReplicaIDOfAny returns the maximum ReplicaID of any replica, including
@@ -891,13 +902,13 @@ func (r *Replica) GetSplitQPS() float64 {
 //
 // TODO(bdarnell): This is not the same as RangeDescriptor.ContainsKey.
 func (r *Replica) ContainsKey(key roachpb.Key) bool {
-	return storagebase.ContainsKey(r.Desc(), key)
+	return kvserverbase.ContainsKey(r.Desc(), key)
 }
 
 // ContainsKeyRange returns whether this range contains the specified
 // key range from start to end.
 func (r *Replica) ContainsKeyRange(start, end roachpb.Key) bool {
-	return storagebase.ContainsKeyRange(r.Desc(), start, end)
+	return kvserverbase.ContainsKeyRange(r.Desc(), start, end)
 }
 
 // GetLastReplicaGCTimestamp reads the timestamp at which the replica was
@@ -969,13 +980,13 @@ func (r *Replica) raftBasicStatusRLocked() raft.BasicStatus {
 
 // State returns a copy of the internal state of the Replica, along with some
 // auxiliary information.
-func (r *Replica) State() storagepb.RangeInfo {
-	var ri storagepb.RangeInfo
+func (r *Replica) State() kvserverpb.RangeInfo {
+	var ri kvserverpb.RangeInfo
 
 	// NB: this acquires an RLock(). Reentrant RLocks are deadlock prone, so do
 	// this first before RLocking below. Performance of this extra lock
 	// acquisition is not a concern.
-	ri.ActiveClosedTimestamp = r.maxClosed(context.Background())
+	ri.ActiveClosedTimestamp, _ = r.maxClosed(context.Background())
 
 	// NB: numRangefeedRegistrations doesn't require Replica.mu to be locked.
 	// However, it does require coordination between multiple goroutines, so
@@ -984,7 +995,7 @@ func (r *Replica) State() storagepb.RangeInfo {
 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	ri.ReplicaState = *(protoutil.Clone(&r.mu.state)).(*storagepb.ReplicaState)
+	ri.ReplicaState = *(protoutil.Clone(&r.mu.state)).(*kvserverpb.ReplicaState)
 	ri.LastIndex = r.mu.lastIndex
 	ri.NumPending = uint64(r.numPendingProposalsRLocked())
 	ri.RaftLogSize = r.mu.raftLogSize
@@ -1014,8 +1025,9 @@ func (r *Replica) State() storagepb.RangeInfo {
 				}
 				if ri.NewestClosedTimestamp.ClosedTimestamp.Less(e.ClosedTimestamp) {
 					ri.NewestClosedTimestamp.NodeID = replDesc.NodeID
-					ri.NewestClosedTimestamp.MLAI = int64(mlai)
 					ri.NewestClosedTimestamp.ClosedTimestamp = e.ClosedTimestamp
+					ri.NewestClosedTimestamp.MLAI = int64(mlai)
+					ri.NewestClosedTimestamp.Epoch = int64(e.Epoch)
 				}
 				return true // done
 			})
@@ -1059,7 +1071,7 @@ func (r *Replica) assertStateLocked(ctx context.Context, reader storage.Reader) 
 // they know that they will end up checking for a pending merge at some later
 // time.
 func (r *Replica) checkExecutionCanProceed(
-	ba *roachpb.BatchRequest, g *concurrency.Guard, st *storagepb.LeaseStatus,
+	ba *roachpb.BatchRequest, g *concurrency.Guard, st *kvserverpb.LeaseStatus,
 ) error {
 	rSpan, err := keys.Range(ba.Requests)
 	if err != nil {
@@ -1121,7 +1133,7 @@ func (r *Replica) checkSpanInRangeRLocked(rspan roachpb.RSpan) error {
 // checkTSAboveGCThresholdRLocked returns an error if a request (identified
 // by its MVCC timestamp) can be run on the replica.
 func (r *Replica) checkTSAboveGCThresholdRLocked(
-	ts hlc.Timestamp, st *storagepb.LeaseStatus, isAdmin bool,
+	ts hlc.Timestamp, st *kvserverpb.LeaseStatus, isAdmin bool,
 ) error {
 	threshold := r.getImpliedGCThresholdRLocked(st, isAdmin)
 	if threshold.Less(ts) {

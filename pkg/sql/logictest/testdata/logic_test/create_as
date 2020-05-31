@@ -1,3 +1,4 @@
+# LogicTest: !3node-tenant
 statement ok
 CREATE TABLE stock (item, quantity) AS VALUES ('cups', 10), ('plates', 15), ('forks', 30)
 
@@ -132,7 +133,7 @@ query III colnames
 SELECT * FROM bar
 ----
 a  b  c
-1  2  4
+1  2  5
 
 statement ok
 CREATE TABLE baz (a, b, c) AS SELECT 1, 2, count(*) FROM foo
@@ -141,7 +142,7 @@ query III colnames
 SELECT * FROM baz
 ----
 a  b  c
-1  2  4
+1  2  5
 
 # Check that CREATE TABLE AS allows users to specify primary key (#20940)
 statement ok

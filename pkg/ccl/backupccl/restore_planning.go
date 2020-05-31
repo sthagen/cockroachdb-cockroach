@@ -21,13 +21,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/covering"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
@@ -155,10 +155,10 @@ func allocateTableRewrites(
 
 	// Fail fast if the tables to restore are incompatible with the specified
 	// options.
-	maxDescIDInBackup := uint32(0)
+	maxDescIDInBackup := int64(keys.MinNonPredefinedUserDescID)
 	for _, table := range tablesByID {
-		if uint32(table.ID) > maxDescIDInBackup {
-			maxDescIDInBackup = uint32(table.ID)
+		if int64(table.ID) > maxDescIDInBackup {
+			maxDescIDInBackup = int64(table.ID)
 		}
 		// Check that foreign key targets exist.
 		for i := range table.OutboundFKs {
@@ -191,27 +191,27 @@ func allocateTableRewrites(
 
 	needsNewParentIDs := make(map[string][]sqlbase.ID)
 
-	// Increment the DescIDGenerator so that it is higher than the max desc ID in
-	// the backup. This generator keeps produced the next descriptor ID.
+	// Increment the DescIDSequenceKey so that it is higher than the max desc ID
+	// in the backup. This generator keeps produced the next descriptor ID.
 	var tempSysDBID sqlbase.ID
 	if descriptorCoverage == tree.AllDescriptors {
 		var err error
-		numberOfIncrements := maxDescIDInBackup - uint32(sql.MaxDefaultDescriptorID)
-		// We need to increment this key this many times rather than settings
-		// it since the interface does not expect it to be set. See client.Inc()
-		// for more information.
-		// TODO(pbardea): Follow up too see if there is a way to just set this
-		//   since for clusters with many descrirptors we'd want to avoid
-		//   incrementing it 10,000+ times.
-		for i := uint32(0); i <= numberOfIncrements; i++ {
-			_, err = sql.GenerateUniqueDescID(ctx, p.ExecCfg().DB)
-			if err != nil {
-				return nil, err
-			}
+		// Restore the key which generates descriptor IDs.
+		if err = p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			b := txn.NewBatch()
+			// N.B. This key is usually mutated using the Inc command. That
+			// command warns that if the key was every Put directly, Inc will
+			// return an error. This is only to ensure that the type of the key
+			// doesn't change. Here we just need to be very careful that we only
+			// write int64 values.
+			// The generator's value should be set to the value of the next ID
+			// to generate.
+			b.Put(p.ExecCfg().Codec.DescIDSequenceKey(), maxDescIDInBackup+1)
+			return txn.Run(ctx, b)
+		}); err != nil {
+			return nil, err
 		}
-
-		// Generate one more desc ID for the ID of the temporary system db.
-		tempSysDBID, err = sql.GenerateUniqueDescID(ctx, p.ExecCfg().DB)
+		tempSysDBID, err = catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
 		if err != nil {
 			return nil, err
 		}
@@ -221,17 +221,14 @@ func allocateTableRewrites(
 	// Fail fast if the necessary databases don't exist or are otherwise
 	// incompatible with this restore.
 	if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		maxExpectedDB := keys.MinUserDescID + sql.MaxDefaultDescriptorID
 		// Check that any DBs being restored do _not_ exist.
 		for name := range restoreDBNames {
-			found, foundID, err := sqlbase.LookupDatabaseID(ctx, txn, p.ExecCfg().Codec, name)
+			found, _, err := sqlbase.LookupDatabaseID(ctx, txn, p.ExecCfg().Codec, name)
 			if err != nil {
 				return err
 			}
-			if found && descriptorCoverage == tree.AllDescriptors {
-				if foundID > maxExpectedDB {
-					return errors.Errorf("database %q already exists", name)
-				}
+			if found {
+				return errors.Errorf("database %q already exists", name)
 			}
 		}
 
@@ -239,14 +236,14 @@ func allocateTableRewrites(
 			var targetDB string
 			if renaming {
 				targetDB = overrideDB
-			} else if descriptorCoverage == tree.AllDescriptors && table.ParentID < sql.MaxDefaultDescriptorID {
+			} else if descriptorCoverage == tree.AllDescriptors && table.ParentID < sqlbase.MaxDefaultDescriptorID {
 				// This is a table that is in a database that already existed at
 				// cluster creation time.
-				defaultDBID, err := lookupDatabaseID(ctx, txn, p.ExecCfg().Codec, sessiondata.DefaultDatabaseName)
+				defaultDBID, err := lookupDatabaseID(ctx, txn, p.ExecCfg().Codec, sqlbase.DefaultDatabaseName)
 				if err != nil {
 					return err
 				}
-				postgresDBID, err := lookupDatabaseID(ctx, txn, p.ExecCfg().Codec, sessiondata.PgDatabaseName)
+				postgresDBID, err := lookupDatabaseID(ctx, txn, p.ExecCfg().Codec, sqlbase.PgDatabaseName)
 				if err != nil {
 					return err
 				}
@@ -257,9 +254,9 @@ func allocateTableRewrites(
 					targetDB = restoreTempSystemDB
 					tableRewrites[table.ID] = &jobspb.RestoreDetails_TableRewrite{ParentID: tempSysDBID}
 				} else if table.ParentID == defaultDBID {
-					targetDB = sessiondata.DefaultDatabaseName
+					targetDB = sqlbase.DefaultDatabaseName
 				} else if table.ParentID == postgresDBID {
-					targetDB = sessiondata.PgDatabaseName
+					targetDB = sqlbase.PgDatabaseName
 				}
 			} else {
 				database, ok := databasesByID[table.ParentID]
@@ -338,7 +335,7 @@ func allocateTableRewrites(
 		if descriptorCoverage == tree.AllDescriptors {
 			newID = db.ID
 		} else {
-			newID, err = sql.GenerateUniqueDescID(ctx, p.ExecCfg().DB)
+			newID, err = catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
 			if err != nil {
 				return nil, err
 			}
@@ -372,7 +369,7 @@ func allocateTableRewrites(
 
 	// Generate new IDs for the tables that need to be remapped.
 	for _, table := range tablesToRemap {
-		newTableID, err := sql.GenerateUniqueDescID(ctx, p.ExecCfg().DB)
+		newTableID, err := catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
 		if err != nil {
 			return nil, err
 		}
@@ -603,7 +600,7 @@ var RestoreHeader = sqlbase.ResultColumns{
 
 // restorePlanHook implements sql.PlanHookFn.
 func restorePlanHook(
-	_ context.Context, stmt tree.Statement, p sql.PlanHookState,
+	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
 ) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
 	restoreStmt, ok := stmt.(*tree.Restore)
 	if !ok {
@@ -612,14 +609,14 @@ func restorePlanHook(
 
 	fromFns := make([]func() ([]string, error), len(restoreStmt.From))
 	for i := range restoreStmt.From {
-		fromFn, err := p.TypeAsStringArray(tree.Exprs(restoreStmt.From[i]), "RESTORE")
+		fromFn, err := p.TypeAsStringArray(ctx, tree.Exprs(restoreStmt.From[i]), "RESTORE")
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
 		fromFns[i] = fromFn
 	}
 
-	optsFn, err := p.TypeAsStringOpts(restoreStmt.Options, restoreOptionExpectValues)
+	optsFn, err := p.TypeAsStringOpts(ctx, restoreStmt.Options, restoreOptionExpectValues)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -653,7 +650,7 @@ func restorePlanHook(
 		var endTime hlc.Timestamp
 		if restoreStmt.AsOf.Expr != nil {
 			var err error
-			endTime, err = p.EvalAsOfTimestamp(restoreStmt.AsOf)
+			endTime, err = p.EvalAsOfTimestamp(ctx, restoreStmt.AsOf)
 			if err != nil {
 				return err
 			}
@@ -716,7 +713,7 @@ func doRestorePlan(
 
 	// Ensure that no user table descriptors exist for a full cluster restore.
 	txn := p.ExecCfg().DB.NewTxn(ctx, "count-user-descs")
-	descCount, err := sql.CountUserDescriptors(ctx, txn, p.ExecCfg().Codec)
+	descCount, err := catalogkv.CountUserDescriptors(ctx, txn, p.ExecCfg().Codec)
 	if err != nil {
 		return errors.Wrap(err, "looking up user descriptors during restore")
 	}

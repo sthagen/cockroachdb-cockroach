@@ -229,6 +229,28 @@ render     ·            ·          (r)  ·
 ·          spans        FULL SCAN  ·    ·
 
 query TTTTT
+EXPLAIN (VERBOSE) SELECT (a, b) IS NULL AS r FROM t
+----
+·          distributed  false           ·       ·
+·          vectorized   true            ·       ·
+render     ·            ·               (r)     ·
+ │         render 0     (a, b) IS NULL  ·       ·
+ └── scan  ·            ·               (a, b)  ·
+·          table        t@primary       ·       ·
+·          spans        FULL SCAN       ·       ·
+
+query TTTTT
+EXPLAIN (VERBOSE) SELECT (a, b) IS NOT DISTINCT FROM NULL AS r FROM t
+----
+·          distributed  false                             ·       ·
+·          vectorized   true                              ·       ·
+render     ·            ·                                 (r)     ·
+ │         render 0     (a, b) IS NOT DISTINCT FROM NULL  ·       ·
+ └── scan  ·            ·                                 (a, b)  ·
+·          table        t@primary                         ·       ·
+·          spans        FULL SCAN                         ·       ·
+
+query TTTTT
 EXPLAIN (VERBOSE) SELECT a IS NOT DISTINCT FROM b AS r FROM t
 ----
 ·          distributed  false                     ·       ·
@@ -260,6 +282,28 @@ render     ·            ·              (r)  ·
  └── scan  ·            ·              (a)  ·
 ·          table        t@primary      ·    ·
 ·          spans        FULL SCAN      ·    ·
+
+query TTTTT
+EXPLAIN (VERBOSE) SELECT (a, b) IS NOT NULL AS r FROM t
+----
+·          distributed  false               ·       ·
+·          vectorized   true                ·       ·
+render     ·            ·                   (r)     ·
+ │         render 0     (a, b) IS NOT NULL  ·       ·
+ └── scan  ·            ·                   (a, b)  ·
+·          table        t@primary           ·       ·
+·          spans        FULL SCAN           ·       ·
+
+query TTTTT
+EXPLAIN (VERBOSE) SELECT (a, b) IS DISTINCT FROM NULL AS r FROM t
+----
+·          distributed  false                         ·       ·
+·          vectorized   true                          ·       ·
+render     ·            ·                             (r)     ·
+ │         render 0     (a, b) IS DISTINCT FROM NULL  ·       ·
+ └── scan  ·            ·                             (a, b)  ·
+·          table        t@primary                     ·       ·
+·          spans        FULL SCAN                     ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT a IS DISTINCT FROM b AS r FROM t
@@ -364,7 +408,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT j @> '{"a": 1}' AS r FROM t
 ----
 ·          distributed  false            ·    ·
-·          vectorized   false            ·    ·
+·          vectorized   true             ·    ·
 render     ·            ·                (r)  ·
  │         render 0     j @> '{"a": 1}'  ·    ·
  └── scan  ·            ·                (j)  ·
@@ -375,7 +419,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT '{"a": 1}' <@ j AS r FROM t
 ----
 ·          distributed  false            ·    ·
-·          vectorized   false            ·    ·
+·          vectorized   true             ·    ·
 render     ·            ·                (r)  ·
  │         render 0     j @> '{"a": 1}'  ·    ·
  └── scan  ·            ·                (j)  ·
@@ -386,7 +430,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT j->>'a' AS r FROM t
 ----
 ·          distributed  false      ·    ·
-·          vectorized   false      ·    ·
+·          vectorized   true       ·    ·
 render     ·            ·          (r)  ·
  │         render 0     j->>'a'    ·    ·
  └── scan  ·            ·          (j)  ·
@@ -397,7 +441,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT j->'a' AS r FROM t
 ----
 ·          distributed  false      ·    ·
-·          vectorized   false      ·    ·
+·          vectorized   true       ·    ·
 render     ·            ·          (r)  ·
  │         render 0     j->'a'     ·    ·
  └── scan  ·            ·          (j)  ·
@@ -408,7 +452,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT j ? 'a' AS r FROM t
 ----
 ·          distributed  false      ·    ·
-·          vectorized   false      ·    ·
+·          vectorized   true       ·    ·
 render     ·            ·          (r)  ·
  │         render 0     j ? 'a'    ·    ·
  └── scan  ·            ·          (j)  ·
@@ -419,7 +463,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT j ?| ARRAY['a', 'b', 'c'] AS r FROM t
 ----
 ·          distributed  false                    ·    ·
-·          vectorized   false                    ·    ·
+·          vectorized   true                     ·    ·
 render     ·            ·                        (r)  ·
  │         render 0     j ?| ARRAY['a','b','c']  ·    ·
  └── scan  ·            ·                        (j)  ·
@@ -430,7 +474,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT j ?& ARRAY['a', 'b', 'c'] AS r FROM t
 ----
 ·          distributed  false                    ·    ·
-·          vectorized   false                    ·    ·
+·          vectorized   true                     ·    ·
 render     ·            ·                        (r)  ·
  │         render 0     j ?& ARRAY['a','b','c']  ·    ·
  └── scan  ·            ·                        (j)  ·
@@ -441,7 +485,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT j#>ARRAY['a'] AS r FROM t
 ----
 ·          distributed  false          ·    ·
-·          vectorized   false          ·    ·
+·          vectorized   true           ·    ·
 render     ·            ·              (r)  ·
  │         render 0     j#>ARRAY['a']  ·    ·
  └── scan  ·            ·              (j)  ·
@@ -452,7 +496,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT j#>>ARRAY['a'] AS r FROM t
 ----
 ·          distributed  false           ·    ·
-·          vectorized   false           ·    ·
+·          vectorized   true            ·    ·
 render     ·            ·               (r)  ·
  │         render 0     j#>>ARRAY['a']  ·    ·
  └── scan  ·            ·               (j)  ·
@@ -584,7 +628,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT ARRAY[]:::int[] FROM t
 ----
 ·          distributed  false      ·          ·
-·          vectorized   false      ·          ·
+·          vectorized   true       ·          ·
 render     ·            ·          ("array")  ·
  │         render 0     ARRAY[]    ·          ·
  └── scan  ·            ·          ()         ·
@@ -595,7 +639,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT ARRAY[1, 2, 3] FROM t
 ----
 ·          distributed  false         ·          ·
-·          vectorized   false         ·          ·
+·          vectorized   true          ·          ·
 render     ·            ·             ("array")  ·
  │         render 0     ARRAY[1,2,3]  ·          ·
  └── scan  ·            ·             ()         ·
@@ -606,7 +650,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT ARRAY[a + 1, 2, 3] FROM t
 ----
 ·          distributed  false               ·          ·
-·          vectorized   false               ·          ·
+·          vectorized   true                ·          ·
 render     ·            ·                   ("array")  ·
  │         render 0     ARRAY[a + 1, 2, 3]  ·          ·
  └── scan  ·            ·                   (a)        ·

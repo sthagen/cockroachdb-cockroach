@@ -199,7 +199,8 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	case *memo.GroupByExpr, *memo.ScalarGroupByExpr:
 		ep, err = b.buildGroupBy(e)
 
-	case *memo.DistinctOnExpr, *memo.EnsureDistinctOnExpr, *memo.UpsertDistinctOnExpr:
+	case *memo.DistinctOnExpr, *memo.EnsureDistinctOnExpr, *memo.UpsertDistinctOnExpr,
+		*memo.EnsureUpsertDistinctOnExpr:
 		ep, err = b.buildDistinct(t)
 
 	case *memo.LimitExpr, *memo.OffsetExpr:
@@ -565,7 +566,7 @@ func (b *Builder) buildProject(prj *memo.ProjectExpr) (execPlan, error) {
 
 	var res execPlan
 	exprs := make(tree.TypedExprs, 0, len(projections)+prj.Passthrough.Len())
-	colNames := make([]string, 0, len(exprs))
+	cols := make(sqlbase.ResultColumns, 0, len(exprs))
 	ctx := input.makeBuildScalarCtx()
 	for i := range projections {
 		item := &projections[i]
@@ -575,15 +576,23 @@ func (b *Builder) buildProject(prj *memo.ProjectExpr) (execPlan, error) {
 		}
 		res.outputCols.Set(int(item.Col), i)
 		exprs = append(exprs, expr)
-		colNames = append(colNames, md.ColumnMeta(item.Col).Alias)
+		cols = append(cols, sqlbase.ResultColumn{
+			Name: md.ColumnMeta(item.Col).Alias,
+			Typ:  item.Typ,
+		})
 	}
 	prj.Passthrough.ForEach(func(colID opt.ColumnID) {
 		res.outputCols.Set(int(colID), len(exprs))
-		exprs = append(exprs, b.indexedVar(&ctx, md, colID))
-		colNames = append(colNames, md.ColumnMeta(colID).Alias)
+		indexedVar := b.indexedVar(&ctx, md, colID)
+		exprs = append(exprs, indexedVar)
+		meta := md.ColumnMeta(colID)
+		cols = append(cols, sqlbase.ResultColumn{
+			Name: meta.Alias,
+			Typ:  meta.Type,
+		})
 	})
 	reqOrdering := res.reqOrdering(prj)
-	res.root, err = b.factory.ConstructRender(input.root, exprs, colNames, reqOrdering)
+	res.root, err = b.factory.ConstructRender(input.root, cols, exprs, reqOrdering)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1029,15 +1038,10 @@ func (b *Builder) buildDistinct(distinct memo.RelExpr) (execPlan, error) {
 	}
 	ep := execPlan{outputCols: input.outputCols}
 
-	// If this is UpsertDistinctOn, then treat NULL values as distinct.
-	var nullsAreDistinct bool
-	if distinct.Op() == opt.UpsertDistinctOnOp {
-		nullsAreDistinct = true
-	}
-
 	reqOrdering := ep.reqOrdering(distinct)
 	ep.root, err = b.factory.ConstructDistinct(
-		input.root, distinctCols, orderedCols, reqOrdering, nullsAreDistinct, private.ErrorOnDup)
+		input.root, distinctCols, orderedCols, reqOrdering,
+		private.NullsAreDistinct, private.ErrorOnDup)
 	if err != nil {
 		return execPlan{}, err
 	}

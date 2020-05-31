@@ -182,7 +182,6 @@ func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 		CoalescedHeartbeatsInterval: 50 * time.Millisecond,
 		RaftHeartbeatIntervalTicks:  1,
 		ScanInterval:                10 * time.Minute,
-		TimestampCachePageSize:      tscache.TestSklPageSize,
 		HistogramWindowInterval:     metric.TestSampleInterval,
 		EnableEpochRangeLeases:      true,
 		ClosedTimestamp:             container.NoopContainer(),
@@ -701,9 +700,6 @@ type StoreConfig struct {
 	// to be applied concurrently.
 	concurrentSnapshotApplyLimit int
 
-	// TimestampCachePageSize is (server.Config).TimestampCachePageSize
-	TimestampCachePageSize uint32
-
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval
 	HistogramWindowInterval time.Duration
 
@@ -835,7 +831,7 @@ func NewStore(
 	s.rangefeedReplicas.m = map[roachpb.RangeID]struct{}{}
 	s.rangefeedReplicas.Unlock()
 
-	s.tsCache = tscache.New(cfg.Clock, cfg.TimestampCachePageSize)
+	s.tsCache = tscache.New(cfg.Clock)
 	s.metrics.registry.AddMetricStruct(s.tsCache.Metrics())
 
 	s.txnWaitMetrics = txnwait.NewMetrics(cfg.HistogramWindowInterval)
@@ -1007,9 +1003,30 @@ func (s *Store) SetDraining(drain bool, reporter func(int, string)) {
 		return
 	}
 
+	baseCtx := logtags.AddTag(context.Background(), "drain", nil)
+
+	// In a running server, the code below (transferAllAway and the loop
+	// that calls it) does not need to be conditional on messaging by
+	// the Stopper. This is because the top level Server calls SetDrain
+	// upon a graceful shutdown, and waits until the SetDrain calls
+	// completes, at which point the work has terminated on its own. If
+	// the top-level server is forcefully shut down, it does not matter
+	// if some of the code below is still running.
+	//
+	// However, the situation is different in unit tests where we also
+	// assert there are no leaking goroutines when a test terminates.
+	// If a test terminates with a timed out lease transfer, it's
+	// possible for the transferAllAway() closure to be still running
+	// when the closer shuts down the test server.
+	//
+	// To prevent this, we add this code here which adds the missing
+	// cancel + wait in the particular case where the stopper is
+	// completing a shutdown while a graceful SetDrain is still ongoing.
+	ctx, cancelFn := s.stopper.WithCancelOnStop(baseCtx)
+	defer cancelFn()
+
 	var wg sync.WaitGroup
 
-	ctx := logtags.AddTag(context.Background(), "drain", nil)
 	transferAllAway := func(transferCtx context.Context) int {
 		// Limit the number of concurrent lease transfers.
 		const leaseTransferConcurrency = 100
@@ -1378,9 +1395,13 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	}
 
 	// Create ID allocators.
-	idAlloc, err := idalloc.NewAllocator(
-		s.cfg.AmbientCtx, keys.RangeIDGenerator, s.db, rangeIDAllocCount, s.stopper,
-	)
+	idAlloc, err := idalloc.NewAllocator(idalloc.Options{
+		AmbientCtx:  s.cfg.AmbientCtx,
+		Key:         keys.RangeIDGenerator,
+		Incrementer: idalloc.DBIncrementer(s.db),
+		BlockSize:   rangeIDAllocCount,
+		Stopper:     s.stopper,
+	})
 	if err != nil {
 		return err
 	}
@@ -1429,12 +1450,16 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 				// range which has processed a raft command to remove itself (which is
 				// possible prior to 19.2 or if the DisableEagerReplicaRemoval is
 				// enabled) and has not yet been removed by the replica gc queue.
-				// We treat both cases the same way.
-				//
-				// TODO(ajwerner): Remove this migration in 20.2. It exists in 20.1 to
-				// find and remove any pre-emptive snapshots which may have been sent by
-				// a 19.1 or older node to this node while it was running 19.2.
-				return false /* done */, removePreemptiveSnapshot(ctx, s, &desc)
+				// We treat both cases the same way. These should no longer exist in
+				// 20.2 or after as there was a migration in 20.1 to remove them and
+				// no pre-emptive snapshot should have been sent since 19.2 was
+				// finalized.
+				return false /* done */, errors.AssertionFailedf(
+					"found RangeDescriptor for range %d at generation %d which does not"+
+						" contain this store %d",
+					log.Safe(desc.RangeID),
+					log.Safe(desc.Generation),
+					log.Safe(s.StoreID()))
 			}
 
 			rep, err := newReplica(ctx, &desc, s, replicaDesc.ReplicaID)
@@ -1922,7 +1947,7 @@ func (s *Store) recordNewPerSecondStats(newQPS, newWPS float64) {
 
 // VisitReplicas invokes the visitor on the Store's Replicas until the visitor returns false.
 // Replicas which are added to the Store after iteration begins may or may not be observed.
-func (s *Store) VisitReplicas(visitor func(*Replica) bool) {
+func (s *Store) VisitReplicas(visitor func(*Replica) (wantMore bool)) {
 	v := newStoreReplicaVisitor(s)
 	v.Visit(visitor)
 }
@@ -2295,6 +2320,13 @@ func (s *Store) Descriptor(useCached bool) (*roachpb.StoreDescriptor, error) {
 func (s *Store) RangeFeed(
 	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
 ) *roachpb.Error {
+
+	if filter := s.TestingKnobs().TestingRangefeedFilter; filter != nil {
+		if pErr := filter(args, stream); pErr != nil {
+			return pErr
+		}
+	}
+
 	if err := verifyKeys(args.Span.Key, args.Span.EndKey, true); err != nil {
 		return roachpb.NewError(err)
 	}
@@ -2392,7 +2424,8 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		if wps, dur := rep.writeStats.avgQPS(); dur >= MinStatsDuration {
 			averageWritesPerSecond += wps
 		}
-		if mc := rep.maxClosed(ctx); minMaxClosedTS.IsEmpty() || mc.Less(minMaxClosedTS) {
+		mc, ok := rep.maxClosed(ctx)
+		if ok && (minMaxClosedTS.IsEmpty() || mc.Less(minMaxClosedTS)) {
 			minMaxClosedTS = mc
 		}
 		return true // more

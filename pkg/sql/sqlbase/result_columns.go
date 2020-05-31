@@ -62,6 +62,12 @@ func ResultColumnsFromColDescs(tableID ID, colDescs []ColumnDescriptor) ResultCo
 	return cols
 }
 
+// GetTypeModifier returns the type modifier for this column. If it is not set,
+// it defaults to returning -1.
+func (r ResultColumn) GetTypeModifier() int32 {
+	return r.Typ.TypeModifier()
+}
+
 // TypesEqual returns whether the length and types of r matches other. If
 // a type in other is NULL, it is considered equal.
 func (r ResultColumns) TypesEqual(other ResultColumns) bool {

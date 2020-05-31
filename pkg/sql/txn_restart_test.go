@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -210,7 +210,7 @@ func checkRestarts(t *testing.T, magicVals *filterVals) {
 //		params, cmdFilters := tests.CreateTestServerParams()
 //		params.Knobs.SQLExecutor = aborter.executorKnobs()
 //		s, sqlDB, _ := serverutils.StartServer(t, params)
-//		defer s.Stopper().Stop(context.TODO())
+//		defer s.Stopper().Stop(context.Background())
 //		{
 //			pgURL, cleanup := sqlutils.PGUrl(t, s.ServingRPCAddr(), "TestTxnAutoRetry", url.User(security.RootUser)
 //			defer cleanup()
@@ -448,7 +448,7 @@ func TestTxnAutoRetry(t *testing.T) {
 	params, cmdFilters := tests.CreateTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestTxnAutoRetry", url.User(security.RootUser))
 		defer cleanup()
@@ -488,7 +488,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT, t DECIMAL);
 		"boulanger": 2,
 	}
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			if err := injectErrors(args.Req, args.Hdr, magicVals, true /* verifyTxn */); err != nil {
 				return roachpb.NewErrorWithTxn(err, args.Hdr.Txn)
 			}
@@ -588,7 +588,7 @@ INSERT INTO t.public.test(k, v, t) VALUES (6, 'laureal', cluster_logical_timesta
 		"hooly": 2,
 	}
 	cleanupFilter = cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			if err := injectErrors(args.Req, args.Hdr, magicVals, true /* verifyTxn */); err != nil {
 				return roachpb.NewErrorWithTxn(err, args.Hdr.Txn)
 			}
@@ -625,7 +625,7 @@ func TestAbortedTxnOnlyRetriedOnce(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestAbortedTxnOnlyRetriedOnce", url.User(security.RootUser))
 		defer cleanup()
@@ -780,7 +780,7 @@ func TestTxnUserRestart(t *testing.T) {
 				params, cmdFilters := tests.CreateTestServerParams()
 				params.Knobs.SQLExecutor = aborter.executorKnobs()
 				s, sqlDB, _ := serverutils.StartServer(t, params)
-				defer s.Stopper().Stop(context.TODO())
+				defer s.Stopper().Stop(context.Background())
 				{
 					pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestTxnUserRestart", url.User(security.RootUser))
 					defer cleanup()
@@ -796,7 +796,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 					t.Fatal(err)
 				}
 				cleanupFilter := cmdFilters.AppendFilter(
-					func(args storagebase.FilterArgs) *roachpb.Error {
+					func(args kvserverbase.FilterArgs) *roachpb.Error {
 						if err := injectErrors(args.Req, args.Hdr, tc.magicVals, true /* verifyTxn */); err != nil {
 							return roachpb.NewErrorWithTxn(err, args.Hdr.Txn)
 						}
@@ -858,7 +858,7 @@ func TestCommitWaitState(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t; CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 `); err != nil {
@@ -894,7 +894,7 @@ func TestErrorOnCommitFinalizesTxn(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestErrorOnCommitFinalizesTxn", url.User(security.RootUser))
 		defer cleanup()
@@ -980,7 +980,7 @@ func TestRollbackInRestartWait(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestRollbackInRestartWait", url.User(security.RootUser))
 		defer cleanup()
@@ -1039,7 +1039,7 @@ func TestUnexpectedStatementInRestartWait(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	tx, err := sqlDB.Begin()
 	if err != nil {
@@ -1089,12 +1089,12 @@ func TestNonRetryableError(t *testing.T) {
 
 	params, cmdFilters := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	testKey := []byte("test_key")
 	hitError := false
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			if req, ok := args.Req.(*roachpb.ScanRequest); ok {
 				if bytes.Contains(req.Key, testKey) && !kv.TestingIsRangeLookupRequest(req) {
 					hitError = true
@@ -1138,7 +1138,7 @@ func TestReacquireLeaseOnRestart(t *testing.T) {
 	var clockUpdate int32
 	testKey := []byte("test_key")
 	storeTestingKnobs := &kvserver.StoreTestingKnobs{
-		EvalKnobs: storagebase.BatchEvalTestingKnobs{
+		EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 			TestingEvalFilter: cmdFilters.RunFilters,
 		},
 		DisableMaxOffsetCheck: true,
@@ -1171,11 +1171,11 @@ func TestReacquireLeaseOnRestart(t *testing.T) {
 	params.Knobs.Store = storeTestingKnobs
 	params.Knobs.KVClient = clientTestingKnobs
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	var restartDone int32
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			// Allow a set number of restarts so that the auto retry on the
 			// first few uncertainty interval errors also fails.
 			if atomic.LoadInt32(&restartDone) > refreshAttempts {
@@ -1235,7 +1235,7 @@ func TestFlushUncommitedDescriptorCacheOnRestart(t *testing.T) {
 	cmdFilters.AppendFilter(tests.CheckEndTxnTrigger, true)
 	testKey := []byte("test_key")
 	testingKnobs := &kvserver.StoreTestingKnobs{
-		EvalKnobs: storagebase.BatchEvalTestingKnobs{
+		EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 			TestingEvalFilter: cmdFilters.RunFilters,
 		},
 	}
@@ -1243,11 +1243,11 @@ func TestFlushUncommitedDescriptorCacheOnRestart(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.Store = testingKnobs
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	var restartDone int32
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			if atomic.LoadInt32(&restartDone) > 0 {
 				return nil
 			}
@@ -1309,8 +1309,8 @@ func TestDistSQLRetryableError(t *testing.T) {
 				UseDatabase: "test",
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
-						EvalKnobs: storagebase.BatchEvalTestingKnobs{
-							TestingEvalFilter: func(fArgs storagebase.FilterArgs) *roachpb.Error {
+						EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
+							TestingEvalFilter: func(fArgs kvserverbase.FilterArgs) *roachpb.Error {
 								_, ok := fArgs.Req.(*roachpb.ScanRequest)
 								if ok && fArgs.Req.Header().Key.Equal(targetKey) && fArgs.Hdr.Txn.Epoch == 0 {
 									restarted = true
@@ -1332,7 +1332,7 @@ func TestDistSQLRetryableError(t *testing.T) {
 				},
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	db := tc.ServerConn(0)
 	sqlutils.CreateTable(t, db, "t",
@@ -1432,7 +1432,7 @@ func TestRollbackToSavepointFromUnusualStates(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	checkState := func(tx *gosql.Tx, ts time.Time) {
 		t.Helper()
@@ -1494,7 +1494,7 @@ func TestTxnAutoRetriesDisabledAfterResultsHaveBeenSentToClient(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	tests := []struct {
 		name                              string

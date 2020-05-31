@@ -25,6 +25,7 @@ import "sql/sqlbase/locking.proto";
 import "sql/types/types.proto";
 import "sql/execinfrapb/data.proto";
 import "sql/execinfrapb/processors_base.proto";
+import "sql/opt/invertedexpr/span_expression.proto";
 import "gogoproto/gogo.proto";
 
 // ValuesCoreSpec is the core of a processor that has no inputs and generates
@@ -245,6 +246,11 @@ message JoinReaderSpec {
   // makes it out of the SQL optimizer without throwing an error. If/when other
   // wait policies are supported, this field will be plumbed further.
   optional sqlbase.ScanLockingWaitPolicy locking_wait_policy = 10 [(gogoproto.nullable) = false];
+
+  // Indicates that the join reader should maintain the ordering of the input
+  // stream. This is only applicable to lookup joins, where doing so is
+  // expensive. Index joins do this by default regardless of the parameter.
+  optional bool maintain_ordering = 11 [(gogoproto.nullable) = false];
 }
 
 // SorterSpec is the specification for a "sorting aggregator". A sorting
@@ -524,6 +530,29 @@ message InvertedJoinerSpec {
   optional sqlbase.JoinType type = 6 [(gogoproto.nullable) = false];
 }
 
+// InvertedFiltererSpec is the specification of a processor that does filtering
+// on a table by evaluating an invertedexpr.SpanExpressionProto on an inverted
+// index of the table. The input consists of the inverted index rows from
+// SpanExpressionProto.SpansToRead.
+//
+// Example:
+// Table columns: | a | b | c | d |
+// where a, b are the primary key and d is the column with the inverted index.
+// Inverted index columns: | d' | a | b |
+// where d' is derived from d. For instance, if d is an array, d' will be
+// elements of the array.
+//
+// Internal columns are | a | b |.
+message InvertedFiltererSpec {
+  // The expression to evaluate.
+  optional opt.invertedexpr.SpanExpressionProto inverted_expr = 1 [(gogoproto.nullable) = false];
+
+  // Optional expression involving the primary key columns, where
+  // @1 refers to the first PK column, and so on. The inverted index
+  // column is not part of this numbering.
+  optional Expression on_expr = 2 [(gogoproto.nullable) = false];
+}
+
 // AggregatorSpec is the specification for an "aggregator" (processor core
 // type, not the logical plan computation stage). An aggregator performs
 // 'aggregation' in the SQL sense in that it groups rows and computes an aggregate
@@ -560,6 +589,8 @@ message AggregatorSpec {
     BIT_AND = 22;
     BIT_OR = 23;
     CORR = 24;
+    PERCENTILE_DISC_IMPL = 25;
+    PERCENTILE_CONT_IMPL = 26;
   }
 
   enum Type {

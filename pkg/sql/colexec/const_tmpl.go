@@ -21,16 +21,13 @@ package colexec
 
 import (
 	"context"
-	"time"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
@@ -40,15 +37,6 @@ var _ = execgen.UNSAFEGET
 // {{/*
 
 // Declarations to make the template compile properly.
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
 
 // _GOTYPE is the template variable.
 type _GOTYPE interface{}
@@ -71,7 +59,7 @@ func NewConstOp(
 	outputIdx int,
 ) (colexecbase.Operator, error) {
 	input = newVectorTypeEnforcer(allocator, input, t, outputIdx)
-	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
 	case _CANONICAL_TYPE_FAMILY:
 		switch t.Width() {
@@ -142,19 +130,17 @@ func (c const_TYPEOp) Next(ctx context.Context) coldata.Batch {
 // NewConstNullOp creates a new operator that produces a constant (untyped) NULL
 // value at index outputIdx.
 func NewConstNullOp(
-	allocator *colmem.Allocator, input colexecbase.Operator, outputIdx int, typ *types.T,
+	allocator *colmem.Allocator, input colexecbase.Operator, outputIdx int,
 ) colexecbase.Operator {
-	input = newVectorTypeEnforcer(allocator, input, typ, outputIdx)
+	input = newVectorTypeEnforcer(allocator, input, types.Unknown, outputIdx)
 	return &constNullOp{
 		OneInputNode: NewOneInputNode(input),
-		allocator:    allocator,
 		outputIdx:    outputIdx,
 	}
 }
 
 type constNullOp struct {
 	OneInputNode
-	allocator *colmem.Allocator
 	outputIdx int
 }
 
@@ -171,19 +157,6 @@ func (c constNullOp) Next(ctx context.Context) coldata.Batch {
 		return coldata.ZeroBatch
 	}
 
-	col := batch.ColVec(c.outputIdx)
-	nulls := col.Nulls()
-	if col.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		nulls.UnsetNulls()
-	}
-	if sel := batch.Selection(); sel != nil {
-		for _, i := range sel[:n] {
-			nulls.SetNull(i)
-		}
-	} else {
-		nulls.SetNulls()
-	}
+	batch.ColVec(c.outputIdx).Nulls().SetNulls()
 	return batch
 }

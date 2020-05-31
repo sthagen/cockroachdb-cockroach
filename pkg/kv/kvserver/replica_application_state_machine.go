@@ -17,8 +17,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -128,14 +128,14 @@ func (r *Replica) getStateMachine() *replicaStateMachine {
 // then sets the provided command's leaseIndex, proposalRetry, and forcedErr
 // fields and returns whether command should be applied or rejected.
 func (r *Replica) shouldApplyCommand(
-	ctx context.Context, cmd *replicatedCmd, replicaState *storagepb.ReplicaState,
+	ctx context.Context, cmd *replicatedCmd, replicaState *kvserverpb.ReplicaState,
 ) bool {
 	cmd.leaseIndex, cmd.proposalRetry, cmd.forcedErr = checkForcedErr(
 		ctx, cmd.idKey, &cmd.raftCmd, cmd.IsLocal(), replicaState,
 	)
 	if filter := r.store.cfg.TestingKnobs.TestingApplyFilter; cmd.forcedErr == nil && filter != nil {
 		var newPropRetry int
-		newPropRetry, cmd.forcedErr = filter(storagebase.ApplyFilterArgs{
+		newPropRetry, cmd.forcedErr = filter(kvserverbase.ApplyFilterArgs{
 			CmdID:                cmd.idKey,
 			ReplicatedEvalResult: *cmd.replicatedResult(),
 			StoreID:              r.store.StoreID(),
@@ -168,10 +168,10 @@ func (r *Replica) shouldApplyCommand(
 // TODO(nvanbenschoten): Unit test this function now that it is stateless.
 func checkForcedErr(
 	ctx context.Context,
-	idKey storagebase.CmdIDKey,
-	raftCmd *storagepb.RaftCommand,
+	idKey kvserverbase.CmdIDKey,
+	raftCmd *kvserverpb.RaftCommand,
 	isLocal bool,
-	replicaState *storagepb.ReplicaState,
+	replicaState *kvserverpb.ReplicaState,
 ) (uint64, proposalReevaluationReason, *roachpb.Error) {
 	leaseIndex := replicaState.LeaseAppliedIndex
 	isLeaseRequest := raftCmd.ReplicatedEvalResult.IsLeaseRequest
@@ -365,7 +365,7 @@ type replicaAppBatch struct {
 	// state is this batch's view of the replica's state. It is copied from
 	// under the Replica.mu when the batch is initialized and is updated in
 	// stageTrivialReplicatedEvalResult.
-	state storagepb.ReplicaState
+	state kvserverpb.ReplicaState
 	// stats is stored on the application batch to avoid an allocation in
 	// tracking the batch's view of replicaState. All pointer fields in
 	// replicaState other than Stats are overwritten completely rather than
@@ -434,7 +434,7 @@ func (b *replicaAppBatch) Stage(cmdI apply.Command) (apply.CheckedCommand, error
 		log.VEventf(ctx, 1, "applying command with forced error: %s", cmd.forcedErr)
 
 		// Apply an empty command.
-		cmd.raftCmd.ReplicatedEvalResult = storagepb.ReplicatedEvalResult{}
+		cmd.raftCmd.ReplicatedEvalResult = kvserverpb.ReplicatedEvalResult{}
 		cmd.raftCmd.WriteBatch = nil
 		cmd.raftCmd.LogicalOpLog = nil
 	} else {
@@ -529,7 +529,7 @@ func (b *replicaAppBatch) stageWriteBatch(ctx context.Context, cmd *replicatedCm
 
 // changeRemovesStore returns true if any of the removals in this change have storeID.
 func changeRemovesStore(
-	desc *roachpb.RangeDescriptor, change *storagepb.ChangeReplicas, storeID roachpb.StoreID,
+	desc *roachpb.RangeDescriptor, change *kvserverpb.ChangeReplicas, storeID roachpb.StoreID,
 ) (removesStore bool) {
 	curReplica, existsInDesc := desc.GetReplicaDescriptor(storeID)
 	// NB: if we're catching up from a preemptive snapshot then we won't
@@ -615,6 +615,16 @@ func (b *replicaAppBatch) runPreApplyTriggersAfterStagingWriteBatch(
 		// Alternatively if we discover that the RHS has already been removed
 		// from this store, clean up its data.
 		splitPreApply(ctx, b.batch, res.Split.SplitTrigger, b.r)
+
+		// The rangefeed processor will no longer be provided logical ops for
+		// its entire range, so it needs to be shut down and all registrations
+		// need to retry.
+		// TODO(nvanbenschoten): It should be possible to only reject registrations
+		// that overlap with the new range of the split and keep registrations that
+		// are only interested in keys that are still on the original range running.
+		b.r.disconnectRangefeedWithReason(
+			roachpb.RangeFeedRetryError_REASON_RANGE_SPLIT,
+		)
 	}
 
 	if merge := res.Merge; merge != nil {
@@ -632,6 +642,9 @@ func (b *replicaAppBatch) runPreApplyTriggersAfterStagingWriteBatch(
 		if err != nil {
 			return wrapWithNonDeterministicFailure(err, "unable to get replica for merge")
 		}
+		// We should already have acquired the raftMu for the rhsRepl and now hold
+		// its unlock method in cmd.splitMergeUnlock.
+		rhsRepl.raftMu.AssertHeld()
 
 		// Use math.MaxInt32 (mergedTombstoneReplicaID) as the nextReplicaID as an
 		// extra safeguard against creating new replicas of the RHS. This isn't
@@ -645,6 +658,29 @@ func (b *replicaAppBatch) runPreApplyTriggersAfterStagingWriteBatch(
 		); err != nil {
 			return wrapWithNonDeterministicFailure(err, "unable to destroy replica before merge")
 		}
+
+		// Shut down rangefeed processors on either side of the merge.
+		//
+		// NB: It is critical to shut-down a rangefeed processor on the surviving
+		// replica primarily do deal with the possibility that there are logical ops
+		// for the RHS to resolve intents written by the merge transaction. In
+		// practice, the only such intents that exist are on the RangeEventTable,
+		// but it's good to be consistent here and allow the merge transaction to
+		// write to the RHS of a merge. See batcheval.resolveLocalLocks for details
+		// on why we resolve RHS intents when committing a merge transaction.
+		//
+		// TODO(nvanbenschoten): Alternatively we could just adjust the bounds of
+		// b.r.Processor to include the rhsRepl span.
+		//
+		// NB: removeInitializedReplicaRaftMuLocked also disconnects any initialized
+		// rangefeeds with REASON_REPLICA_REMOVED. That's ok because we will have
+		// already disconnected the rangefeed here.
+		b.r.disconnectRangefeedWithReason(
+			roachpb.RangeFeedRetryError_REASON_RANGE_MERGED,
+		)
+		rhsRepl.disconnectRangefeedWithReason(
+			roachpb.RangeFeedRetryError_REASON_RANGE_MERGED,
+		)
 	}
 
 	if res.State != nil && res.State.TruncatedState != nil {
@@ -947,7 +983,7 @@ func (b *replicaAppBatch) Close() {
 // determine whether a replicated command should be rejected or applied.
 type ephemeralReplicaAppBatch struct {
 	r     *Replica
-	state storagepb.ReplicaState
+	state kvserverpb.ReplicaState
 }
 
 // Stage implements the apply.Batch interface.
@@ -1021,7 +1057,7 @@ func (sm *replicaStateMachine) ApplySideEffects(
 			sm.r.mu.Unlock()
 			sm.stats.stateAssertions++
 		}
-	} else if res := cmd.replicatedResult(); !res.Equal(storagepb.ReplicatedEvalResult{}) {
+	} else if res := cmd.replicatedResult(); !res.Equal(kvserverpb.ReplicatedEvalResult{}) {
 		log.Fatalf(ctx, "failed to handle all side-effects of ReplicatedEvalResult: %v", res)
 	}
 
@@ -1074,10 +1110,10 @@ func (sm *replicaStateMachine) ApplySideEffects(
 // non-trivial commands. It is run with the raftMu locked. It is illegal
 // to pass a replicatedResult that does not imply any side-effects.
 func (sm *replicaStateMachine) handleNonTrivialReplicatedEvalResult(
-	ctx context.Context, rResult storagepb.ReplicatedEvalResult,
+	ctx context.Context, rResult kvserverpb.ReplicatedEvalResult,
 ) (shouldAssert, isRemoved bool) {
 	// Assert that this replicatedResult implies at least one side-effect.
-	if rResult.Equal(storagepb.ReplicatedEvalResult{}) {
+	if rResult.Equal(kvserverpb.ReplicatedEvalResult{}) {
 		log.Fatalf(ctx, "zero-value ReplicatedEvalResult passed to handleNonTrivialReplicatedEvalResult")
 	}
 
@@ -1087,7 +1123,7 @@ func (sm *replicaStateMachine) handleNonTrivialReplicatedEvalResult(
 			rResult.State.TruncatedState = nil
 		}
 
-		if (*rResult.State == storagepb.ReplicaState{}) {
+		if (*rResult.State == kvserverpb.ReplicaState{}) {
 			rResult.State = nil
 		}
 	}
@@ -1105,7 +1141,7 @@ func (sm *replicaStateMachine) handleNonTrivialReplicatedEvalResult(
 	// The rest of the actions are "nontrivial" and may have large effects on the
 	// in-memory and on-disk ReplicaStates. If any of these actions are present,
 	// we want to assert that these two states do not diverge.
-	shouldAssert = !rResult.Equal(storagepb.ReplicatedEvalResult{})
+	shouldAssert = !rResult.Equal(kvserverpb.ReplicatedEvalResult{})
 	if !shouldAssert {
 		return false, false
 	}
@@ -1141,7 +1177,7 @@ func (sm *replicaStateMachine) handleNonTrivialReplicatedEvalResult(
 			rResult.State.UsingAppliedStateKey = false
 		}
 
-		if (*rResult.State == storagepb.ReplicaState{}) {
+		if (*rResult.State == kvserverpb.ReplicaState{}) {
 			rResult.State = nil
 		}
 	}
@@ -1156,8 +1192,8 @@ func (sm *replicaStateMachine) handleNonTrivialReplicatedEvalResult(
 		rResult.ComputeChecksum = nil
 	}
 
-	if !rResult.Equal(storagepb.ReplicatedEvalResult{}) {
-		log.Fatalf(ctx, "unhandled field in ReplicatedEvalResult: %s", pretty.Diff(rResult, storagepb.ReplicatedEvalResult{}))
+	if !rResult.Equal(kvserverpb.ReplicatedEvalResult{}) {
+		log.Fatalf(ctx, "unhandled field in ReplicatedEvalResult: %s", pretty.Diff(rResult, kvserverpb.ReplicatedEvalResult{}))
 	}
 	return true, isRemoved
 }

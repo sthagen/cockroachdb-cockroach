@@ -41,11 +41,11 @@ func TestPutS3(t *testing.T) {
 		t.Skip("AWS_S3_BUCKET env var must be set")
 	}
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	t.Run("auth-empty-no-cred", func(t *testing.T) {
 		_, err := ExternalStorageFromURI(
 			ctx, fmt.Sprintf("s3://%s/%s", bucket, "backup-test-default"),
-			base.ExternalIOConfig{}, testSettings, blobs.TestEmptyBlobClientFactory,
+			base.ExternalIODirConfig{}, testSettings, blobs.TestEmptyBlobClientFactory,
 		)
 		require.EqualError(t, err, fmt.Sprintf(
 			`%s is set to '%s', but %s is not set`,
@@ -131,8 +131,8 @@ func TestPutS3Endpoint(t *testing.T) {
 }
 
 func TestS3DisallowCustomEndpoints(t *testing.T) {
-	s3, err := makeS3Storage(context.TODO(),
-		base.ExternalIOConfig{DisableHTTP: true},
+	s3, err := makeS3Storage(context.Background(),
+		base.ExternalIODirConfig{DisableHTTP: true},
 		&roachpb.ExternalStorage_S3{Endpoint: "http://do.not.go.there/"}, nil,
 	)
 	require.Nil(t, s3)
@@ -141,8 +141,8 @@ func TestS3DisallowCustomEndpoints(t *testing.T) {
 
 func TestS3DisallowImplicitCredentials(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s3, err := makeS3Storage(context.TODO(),
-		base.ExternalIOConfig{DisableImplicitCredentials: true},
+	s3, err := makeS3Storage(context.Background(),
+		base.ExternalIODirConfig{DisableImplicitCredentials: true},
 		&roachpb.ExternalStorage_S3{
 			Endpoint: "http://do-not-go-there",
 			Auth:     authParamImplicit,

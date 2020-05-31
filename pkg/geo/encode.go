@@ -12,6 +12,7 @@ package geo
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"strings"
 
@@ -26,6 +27,11 @@ import (
 
 // EWKBToWKT transforms a given EWKB to WKT.
 func EWKBToWKT(b geopb.EWKB) (geopb.WKT, error) {
+	// twpayne/go-geom doesn't seem to handle POINT EMPTY just yet. Add this hack in.
+	// Remove after #49209 is resolved.
+	if bytes.Equal(b, []byte{0x01, 0x01, 0x00, 0x00, 0x00}) {
+		return geopb.WKT("POINT EMPTY"), nil
+	}
 	t, err := ewkb.Unmarshal([]byte(b))
 	if err != nil {
 		return "", err
@@ -36,6 +42,11 @@ func EWKBToWKT(b geopb.EWKB) (geopb.WKT, error) {
 
 // EWKBToEWKT transforms a given EWKB to EWKT.
 func EWKBToEWKT(b geopb.EWKB) (geopb.EWKT, error) {
+	// twpayne/go-geom doesn't seem to handle POINT EMPTY just yet. Add this hack in.
+	// Remove after #49209 is resolved.
+	if bytes.Equal(b, []byte{0x01, 0x01, 0x00, 0x00, 0x00}) {
+		return geopb.EWKT("POINT EMPTY"), nil
+	}
 	t, err := ewkb.Unmarshal([]byte(b))
 	if err != nil {
 		return "", err
@@ -51,12 +62,12 @@ func EWKBToEWKT(b geopb.EWKB) (geopb.EWKT, error) {
 }
 
 // EWKBToWKB transforms a given EWKB to WKB.
-func EWKBToWKB(b geopb.EWKB) (geopb.WKB, error) {
+func EWKBToWKB(b geopb.EWKB, byteOrder binary.ByteOrder) (geopb.WKB, error) {
 	t, err := ewkb.Unmarshal([]byte(b))
 	if err != nil {
 		return nil, err
 	}
-	ret, err := wkb.Marshal(t, EWKBEncodingFormat)
+	ret, err := wkb.Marshal(t, byteOrder)
 	return geopb.WKB(ret), err
 }
 
@@ -79,7 +90,7 @@ func EWKBToWKBHex(b geopb.EWKB) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ret, err := wkbhex.Encode(t, EWKBEncodingFormat)
+	ret, err := wkbhex.Encode(t, DefaultEWKBEncodingFormat)
 	return strings.ToUpper(ret), err
 }
 
@@ -98,4 +109,16 @@ func EWKBToKML(b geopb.EWKB) (string, error) {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// StringToByteOrder returns the byte order of string.
+func StringToByteOrder(s string) binary.ByteOrder {
+	switch strings.ToLower(s) {
+	case "ndr":
+		return binary.LittleEndian
+	case "xdr":
+		return binary.BigEndian
+	default:
+		return DefaultEWKBEncodingFormat
+	}
 }

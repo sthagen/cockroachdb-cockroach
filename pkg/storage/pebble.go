@@ -360,12 +360,12 @@ type pebbleLogger struct {
 func (l pebbleLogger) Infof(format string, args ...interface{}) {
 	if pebbleLog != nil {
 		pebbleLog.LogfDepth(l.ctx, l.depth, format, args...)
-		// Only log INFO logs to the normal CockroachDB log at --v=3 and above.
-		if !log.V(3) {
-			return
-		}
+		return
 	}
-	log.InfofDepth(l.ctx, l.depth, format, args...)
+	// Only log INFO logs to the normal CockroachDB log at --v=3 and above.
+	if log.V(3) {
+		log.InfofDepth(l.ctx, l.depth, format, args...)
+	}
 }
 
 func (l pebbleLogger) Fatalf(format string, args ...interface{}) {
@@ -421,6 +421,44 @@ var _ Engine = &Pebble{}
 // code does not depend on CCL code.
 var NewEncryptedEnvFunc func(fs vfs.FS, fr *PebbleFileRegistry, dbDir string, readOnly bool, optionBytes []byte) (vfs.FS, EncryptionStatsHandler, error)
 
+// ResolveEncryptedEnvOptions fills in cfg.Opts.FS with an encrypted vfs if this
+// store has encryption-at-rest enabled. Also returns the associated file
+// registry and EncryptionStatsHandler.
+func ResolveEncryptedEnvOptions(
+	cfg *PebbleConfig,
+) (*PebbleFileRegistry, EncryptionStatsHandler, error) {
+	fileRegistry := &PebbleFileRegistry{FS: cfg.Opts.FS, DBDir: cfg.Dir, ReadOnly: cfg.Opts.ReadOnly}
+	if cfg.UseFileRegistry {
+		if err := fileRegistry.Load(); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		if err := fileRegistry.checkNoRegistryFile(); err != nil {
+			return nil, nil, fmt.Errorf("encryption was used on this store before, but no encryption flags " +
+				"specified. You need a CCL build and must fully specify the --enterprise-encryption flag")
+		}
+		fileRegistry = nil
+	}
+
+	var statsHandler EncryptionStatsHandler
+	if len(cfg.ExtraOptions) > 0 {
+		// Encryption is enabled.
+		if !cfg.UseFileRegistry {
+			return nil, nil, fmt.Errorf("file registry is needed to support encryption")
+		}
+		if NewEncryptedEnvFunc == nil {
+			return nil, nil, fmt.Errorf("encryption is enabled but no function to create the encrypted env")
+		}
+		var err error
+		cfg.Opts.FS, statsHandler, err =
+			NewEncryptedEnvFunc(cfg.Opts.FS, fileRegistry, cfg.Dir, cfg.Opts.ReadOnly, cfg.ExtraOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return fileRegistry, statsHandler, nil
+}
+
 // NewPebble creates a new Pebble instance, at the specified path.
 func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 	// pebble.Open also calls EnsureDefaults, but only after doing a clone. Call
@@ -454,34 +492,9 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 		}
 	}
 
-	fileRegistry := &PebbleFileRegistry{FS: cfg.Opts.FS, DBDir: cfg.Dir, ReadOnly: cfg.Opts.ReadOnly}
-	if cfg.UseFileRegistry {
-		if err := fileRegistry.Load(); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := fileRegistry.checkNoRegistryFile(); err != nil {
-			return nil, fmt.Errorf("encryption was used on this store before, but no encryption flags " +
-				"specified. You need a CCL build and must fully specify the --enterprise-encryption flag")
-		}
-		fileRegistry = nil
-	}
-
-	var statsHandler EncryptionStatsHandler
-	if len(cfg.ExtraOptions) > 0 {
-		// Encryption is enabled.
-		if !cfg.UseFileRegistry {
-			return nil, fmt.Errorf("file registry is needed to support encryption")
-		}
-		if NewEncryptedEnvFunc == nil {
-			return nil, fmt.Errorf("encryption is enabled but no function to create the encrypted env")
-		}
-		var err error
-		cfg.Opts.FS, statsHandler, err =
-			NewEncryptedEnvFunc(cfg.Opts.FS, fileRegistry, cfg.Dir, cfg.Opts.ReadOnly, cfg.ExtraOptions)
-		if err != nil {
-			return nil, err
-		}
+	fileRegistry, statsHandler, err := ResolveEncryptedEnvOptions(&cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	// The context dance here is done so that we have a clean context without
@@ -966,32 +979,25 @@ func (p *Pebble) WriteFile(filename string, data []byte) error {
 	return err
 }
 
-// DeleteFile implements the FS interface.
-func (p *Pebble) DeleteFile(filename string) error {
+// Remove implements the FS interface.
+func (p *Pebble) Remove(filename string) error {
 	return p.fs.Remove(filename)
 }
 
-// DeleteDirAndFiles implements the Engine interface.
-func (p *Pebble) DeleteDirAndFiles(dir string) error {
-	// NB RemoveAll does not return an error if dir does not exist, but we want
-	// DeleteDirAndFiles to return an error in that case to match the RocksDB
-	// behavior.
-	_, err := p.fs.Stat(dir)
-	if err != nil {
-		return err
-	}
+// RemoveAll implements the Engine interface.
+func (p *Pebble) RemoveAll(dir string) error {
 	return p.fs.RemoveAll(dir)
 }
 
-// LinkFile implements the FS interface.
-func (p *Pebble) LinkFile(oldname, newname string) error {
+// Link implements the FS interface.
+func (p *Pebble) Link(oldname, newname string) error {
 	return p.fs.Link(oldname, newname)
 }
 
 var _ fs.FS = &Pebble{}
 
-// CreateFile implements the FS interface.
-func (p *Pebble) CreateFile(name string) (fs.File, error) {
+// Create implements the FS interface.
+func (p *Pebble) Create(name string) (fs.File, error) {
 	// TODO(peter): On RocksDB, the MemEnv allows creating a file when the parent
 	// directory does not exist. Various tests in the storage package depend on
 	// this because they are accidentally creating the required directory on the
@@ -1003,8 +1009,8 @@ func (p *Pebble) CreateFile(name string) (fs.File, error) {
 	return p.fs.Create(name)
 }
 
-// CreateFileWithSync implements the FS interface.
-func (p *Pebble) CreateFileWithSync(name string, bytesPerSync int) (fs.File, error) {
+// CreateWithSync implements the FS interface.
+func (p *Pebble) CreateWithSync(name string, bytesPerSync int) (fs.File, error) {
 	// TODO(peter): On RocksDB, the MemEnv allows creating a file when the parent
 	// directory does not exist. Various tests in the storage package depend on
 	// this because they are accidentally creating the required directory on the
@@ -1020,8 +1026,8 @@ func (p *Pebble) CreateFileWithSync(name string, bytesPerSync int) (fs.File, err
 	return vfs.NewSyncingFile(f, vfs.SyncingFileOptions{BytesPerSync: bytesPerSync}), nil
 }
 
-// OpenFile implements the FS interface.
-func (p *Pebble) OpenFile(name string) (fs.File, error) {
+// Open implements the FS interface.
+func (p *Pebble) Open(name string) (fs.File, error) {
 	return p.fs.Open(name)
 }
 
@@ -1030,24 +1036,26 @@ func (p *Pebble) OpenDir(name string) (fs.File, error) {
 	return p.fs.OpenDir(name)
 }
 
-// RenameFile implements the FS interface.
-func (p *Pebble) RenameFile(oldname, newname string) error {
+// Rename implements the FS interface.
+func (p *Pebble) Rename(oldname, newname string) error {
 	return p.fs.Rename(oldname, newname)
 }
 
-// CreateDir implements the FS interface.
-func (p *Pebble) CreateDir(name string) error {
+// MkdirAll implements the FS interface.
+func (p *Pebble) MkdirAll(name string) error {
 	return p.fs.MkdirAll(name, 0755)
 }
 
-// DeleteDir implements the FS interface.
-func (p *Pebble) DeleteDir(name string) error {
+// RemoveDir implements the FS interface.
+func (p *Pebble) RemoveDir(name string) error {
 	return p.fs.Remove(name)
 }
 
-// ListDir implements the FS interface.
-func (p *Pebble) ListDir(name string) ([]string, error) {
-	return p.fs.List(name)
+// List implements the FS interface.
+func (p *Pebble) List(name string) ([]string, error) {
+	dirents, err := p.fs.List(name)
+	sort.Strings(dirents)
+	return dirents, err
 }
 
 // CreateCheckpoint implements the Engine interface.

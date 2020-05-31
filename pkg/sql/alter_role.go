@@ -54,7 +54,10 @@ func (p *planner) AlterRoleNode(
 		return nil, err
 	}
 
-	roleOptions, err := kvOptions.ToRoleOptions(p.TypeAsStringOrNull, opName)
+	asStringOrNull := func(e tree.Expr, op string) (func() (bool, string, error), error) {
+		return p.TypeAsStringOrNull(ctx, e, op)
+	}
+	roleOptions, err := kvOptions.ToRoleOptions(asStringOrNull, opName)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +65,7 @@ func (p *planner) AlterRoleNode(
 		return nil, err
 	}
 
-	ua, err := p.getUserAuthInfo(nameE, opName)
+	ua, err := p.getUserAuthInfo(ctx, nameE, opName)
 	if err != nil {
 		return nil, err
 	}
@@ -144,6 +147,15 @@ func (n *alterRoleNode) startExec(params runParams) error {
 			// and certs can't be MITM'ed over the insecure SQL connection.
 			return pgerror.New(pgcode.InvalidPassword,
 				"setting or updating a password is not supported in insecure mode")
+		}
+
+		if hashedPassword == nil {
+			// v20.1 and below crash during authentication if they find a NULL value
+			// in system.users.hashedPassword. v20.2 and above handle this correctly,
+			// but we need to maintain mixed version compatibility for at least one
+			// release.
+			// TODO(nvanbenschoten): remove this for v21.1.
+			hashedPassword = []byte{}
 		}
 
 		// Updating PASSWORD is a special case since PASSWORD lives in system.users

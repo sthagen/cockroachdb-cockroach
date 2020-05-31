@@ -523,6 +523,9 @@ func (u *sqlSymUnion) typeReference() tree.ResolvableTypeReference {
 func (u *sqlSymUnion) typeReferences() []tree.ResolvableTypeReference {
     return u.val.([]tree.ResolvableTypeReference)
 }
+func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacement {
+    return u.val.(*tree.AlterTypeAddValuePlacement)
+}
 %}
 
 // NB: the %token definitions must come before the %type definitions in this
@@ -542,11 +545,11 @@ func (u *sqlSymUnion) typeReferences() []tree.ResolvableTypeReference {
 // below; search this file for "Keyword category lists".
 
 // Ordinary key words in alphabetical order.
-%token <str> ABORT ACTION ADD ADMIN AGGREGATE
+%token <str> ABORT ACTION ADD ADMIN AFTER AGGREGATE
 %token <str> ALL ALTER ALWAYS ANALYSE ANALYZE AND AND_AND ANY ANNOTATE_TYPE ARRAY AS ASC
-%token <str> ASYMMETRIC AT AUTHORIZATION AUTOMATIC
+%token <str> ASYMMETRIC AT ATTRIBUTE AUTHORIZATION AUTOMATIC
 
-%token <str> BACKUP BEGIN BETWEEN BIGINT BIGSERIAL BIT
+%token <str> BACKUP BEFORE BEGIN BETWEEN BIGINT BIGSERIAL BIT
 %token <str> BUCKET_COUNT
 %token <str> BOOLEAN BOTH BUNDLE BY
 
@@ -600,7 +603,7 @@ func (u *sqlSymUnion) typeReferences() []tree.ResolvableTypeReference {
 %token <str> NONE NORMAL NOT NOTHING NOTNULL NOWAIT NULL NULLIF NULLS NUMERIC
 
 %token <str> OF OFF OFFSET OID OIDS OIDVECTOR ON ONLY OPT OPTION OPTIONS OR
-%token <str> ORDER ORDINALITY OTHERS OUT OUTER OVER OVERLAPS OVERLAY OWNED OPERATOR
+%token <str> ORDER ORDINALITY OTHERS OUT OUTER OVER OVERLAPS OVERLAY OWNED OWNER OPERATOR
 
 %token <str> PARENT PARTIAL PARTITION PARTITIONS PASSWORD PAUSE PHYSICAL PLACING
 %token <str> PLAN PLANS POINT POLYGON POSITION PRECEDING PRECISION PREPARE PRESERVE PRIMARY PRIORITY
@@ -644,8 +647,10 @@ func (u *sqlSymUnion) typeReferences() []tree.ResolvableTypeReference {
 // NOT_LA exists so that productions such as NOT LIKE can be given the same
 // precedence as LIKE; otherwise they'd effectively have the same precedence as
 // NOT, at least with respect to their left-hand subexpression. WITH_LA is
-// needed to make the grammar LALR(1).
-%token NOT_LA WITH_LA AS_LA
+// needed to make the grammar LALR(1). GENERATED_ALWAYS is needed to support
+// the Postgres syntax for computed columns along with our family related
+// extensions (CREATE FAMILY/CREATE FAMILY family_name).
+%token NOT_LA WITH_LA AS_LA GENERATED_ALWAYS
 
 %union {
   id    int32
@@ -667,6 +672,7 @@ func (u *sqlSymUnion) typeReferences() []tree.ResolvableTypeReference {
 %type <tree.Statement> alter_range_stmt
 %type <tree.Statement> alter_partition_stmt
 %type <tree.Statement> alter_role_stmt
+%type <tree.Statement> alter_type_stmt
 
 // ALTER RANGE
 %type <tree.Statement> alter_zone_range_stmt
@@ -906,7 +912,7 @@ func (u *sqlSymUnion) typeReferences() []tree.ResolvableTypeReference {
 %type <bool> distinct_clause
 %type <tree.DistinctOn> distinct_on_clause
 %type <tree.NameList> opt_column_list insert_column_list opt_stats_columns
-%type <tree.OrderBy> sort_clause opt_sort_clause
+%type <tree.OrderBy> sort_clause single_sort_clause opt_sort_clause
 %type <[]*tree.Order> sortby_list
 %type <tree.IndexElemList> index_params create_as_params
 %type <tree.NameList> name_list privilege_list
@@ -1006,6 +1012,7 @@ func (u *sqlSymUnion) typeReferences() []tree.ResolvableTypeReference {
 
 %type <tree.ResolvableTypeReference> typename simple_typename cast_target
 %type <*types.T> const_typename
+%type <*tree.AlterTypeAddValuePlacement> opt_add_val_placement
 %type <bool> opt_timezone
 %type <*types.T> numeric opt_numeric_modifiers
 %type <*types.T> opt_float
@@ -1057,7 +1064,7 @@ func (u *sqlSymUnion) typeReferences() []tree.ResolvableTypeReference {
 %type <*tree.CTE> common_table_expr
 %type <bool> materialize_clause
 
-%type <empty> within_group_clause
+%type <tree.Expr> within_group_clause
 %type <tree.Expr> filter_clause
 %type <tree.Exprs> opt_partition_clause
 %type <tree.Window> window_clause window_definition_list
@@ -1199,6 +1206,7 @@ alter_ddl_stmt:
 | alter_database_stmt  // EXTEND WITH HELP: ALTER DATABASE
 | alter_range_stmt     // EXTEND WITH HELP: ALTER RANGE
 | alter_partition_stmt // EXTEND WITH HELP: ALTER PARTITION
+| alter_type_stmt      // EXTEND WITH HELP: ALTER TYPE
 
 // %Help: ALTER TABLE - change the definition of a table
 // %Category: DDL
@@ -1866,6 +1874,126 @@ opt_validate_behavior:
   {
     $$.val = tree.ValidationDefault
   }
+
+// %Help: ALTER TYPE - change the definition of a type.
+// %Category: DDL
+// %Text: ALTER TYPE <typename> <command>
+//
+// Commands:
+//   ALTER TYPE ... ADD VALUE [IF NOT EXISTS] <value> [ { BEFORE | AFTER } <value> ]
+//   ALTER TYPE ... RENAME VALUE <oldname> TO <newname>
+//   ALTER TYPE ... RENAME TO <newname>
+//   ALTER TYPE ... SET SCHEMA <newschemaname>
+//   ALTER TYPE ... OWNER TO {<newowner> | CURRENT_USER | SESSION_USER }
+//   ALTER TYPE ... RENAME ATTRIBUTE <oldname> TO <newname> [ CASCADE | RESTRICT ]
+//   ALTER TYPE ... <attributeaction> [, ... ]
+//
+// Attribute action:
+//   ADD ATTRIBUTE <name> <type> [ COLLATE <collation> ] [ CASCADE | RESTRICT ]
+//   DROP ATTRIBUTE [IF EXISTS] <name> [ CASCADE | RESTRICT ]
+//   ALTER ATTRIBUTE <name> [ SET DATA ] TYPE <type> [ COLLATE <collation> ] [ CASCADE | RESTRICT ]
+//
+// %SeeAlso: WEBDOCS/alter-type.html
+alter_type_stmt:
+  ALTER TYPE type_name ADD VALUE SCONST opt_add_val_placement
+  {
+    $$.val = &tree.AlterType{
+      Type: $3.unresolvedObjectName(),
+      Cmd: &tree.AlterTypeAddValue{
+        NewVal: $6,
+        IfNotExists: false,
+        Placement: $7.alterTypeAddValuePlacement(),
+      },
+    }
+  }
+| ALTER TYPE type_name ADD VALUE IF NOT EXISTS SCONST opt_add_val_placement
+  {
+    $$.val = &tree.AlterType{
+      Type: $3.unresolvedObjectName(),
+      Cmd: &tree.AlterTypeAddValue{
+        NewVal: $9,
+        IfNotExists: true,
+        Placement: $10.alterTypeAddValuePlacement(),
+      },
+    }
+  }
+| ALTER TYPE type_name RENAME VALUE SCONST TO SCONST
+  {
+    $$.val = &tree.AlterType{
+      Type: $3.unresolvedObjectName(),
+      Cmd: &tree.AlterTypeRenameValue{
+        OldVal: $6,
+        NewVal: $8,
+      },
+    }
+  }
+| ALTER TYPE type_name RENAME TO type_name
+  {
+    $$.val = &tree.AlterType{
+      Type: $3.unresolvedObjectName(),
+      Cmd: &tree.AlterTypeRename{
+        NewName: $6.unresolvedObjectName(),
+      },
+    }
+  }
+| ALTER TYPE type_name SET SCHEMA schema_name
+  {
+    $$.val = &tree.AlterType{
+      Type: $3.unresolvedObjectName(),
+      Cmd: &tree.AlterTypeSetSchema{
+        Schema: $6,
+      },
+    }
+  }
+| ALTER TYPE type_name OWNER TO role_spec
+  {
+    return unimplementedWithIssueDetail(sqllex, 48700, "ALTER TYPE OWNER TO")
+  }
+| ALTER TYPE type_name RENAME ATTRIBUTE column_name TO column_name opt_drop_behavior
+  {
+    return unimplementedWithIssueDetail(sqllex, 48701, "ALTER TYPE ATTRIBUTE")
+  }
+| ALTER TYPE type_name alter_attribute_action_list
+  {
+    return unimplementedWithIssueDetail(sqllex, 48701, "ALTER TYPE ATTRIBUTE")
+  }
+| ALTER TYPE error // SHOW HELP: ALTER TYPE
+
+opt_add_val_placement:
+  BEFORE SCONST
+  {
+    $$.val = &tree.AlterTypeAddValuePlacement{
+       Before: true,
+       ExistingVal: $2,
+    }
+  }
+| AFTER SCONST
+  {
+    $$.val = &tree.AlterTypeAddValuePlacement{
+       Before: false,
+       ExistingVal: $2,
+    }
+  }
+| /* EMPTY */
+  {
+    $$.val = (*tree.AlterTypeAddValuePlacement)(nil)
+  }
+
+role_spec:
+  non_reserved_word_or_sconst
+| CURRENT_USER
+| SESSION_USER
+
+alter_attribute_action_list:
+  alter_attribute_action
+| alter_attribute_action_list ',' alter_attribute_action
+
+alter_attribute_action:
+  ADD ATTRIBUTE column_name type_name opt_collate opt_drop_behavior
+| DROP ATTRIBUTE column_name opt_drop_behavior
+| DROP ATTRIBUTE IF EXISTS column_name opt_drop_behavior
+| ALTER ATTRIBUTE column_name TYPE type_name opt_collate opt_drop_behavior
+| ALTER ATTRIBUTE column_name SET DATA TYPE type_name opt_collate opt_drop_behavior
 
 // %Help: BACKUP - back up data to external storage
 // %Category: CCL
@@ -4861,11 +4989,11 @@ col_qualification_elem:
 // GENERATED ALWAYS is a noise word for compatibility with Postgres.
 generated_as:
   AS {}
-//  GENERATED ALWAYS AS {}
+| GENERATED_ALWAYS ALWAYS AS {}
 
 
 index_def:
-  INDEX opt_index_name '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
+  INDEX opt_index_name '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_where_clause
   {
     $$.val = &tree.IndexTableDef{
       Name:    tree.Name($2),
@@ -4874,9 +5002,10 @@ index_def:
       Storing: $7.nameList(),
       Interleave: $8.interleave(),
       PartitionBy: $9.partitionBy(),
+      Predicate: $10.expr(),
     }
   }
-| UNIQUE INDEX opt_index_name '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by
+| UNIQUE INDEX opt_index_name '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_where_clause
   {
     $$.val = &tree.UniqueConstraintTableDef{
       IndexTableDef: tree.IndexTableDef {
@@ -4886,15 +5015,17 @@ index_def:
         Storing: $8.nameList(),
         Interleave: $9.interleave(),
         PartitionBy: $10.partitionBy(),
+        Predicate: $11.expr(),
       },
     }
   }
-| INVERTED INDEX opt_name '(' index_params ')'
+| INVERTED INDEX opt_name '(' index_params ')' opt_where_clause
   {
     $$.val = &tree.IndexTableDef{
       Name:    tree.Name($3),
       Columns: $5.idxElems(),
       Inverted: true,
+      Predicate: $7.expr(),
     }
   }
 
@@ -4928,7 +5059,7 @@ constraint_elem:
       Expr: $3.expr(),
     }
   }
-| UNIQUE '(' index_params ')' opt_storing opt_interleave opt_partition_by  opt_deferrable
+| UNIQUE '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_deferrable opt_where_clause
   {
     $$.val = &tree.UniqueConstraintTableDef{
       IndexTableDef: tree.IndexTableDef{
@@ -4936,6 +5067,7 @@ constraint_elem:
         Storing: $5.nameList(),
         Interleave: $6.interleave(),
         PartitionBy: $7.partitionBy(),
+        Predicate: $9.expr(),
       },
     }
   }
@@ -5520,7 +5652,7 @@ enum_val_list:
 // %SeeAlso: CREATE TABLE, SHOW INDEXES, SHOW CREATE,
 // WEBDOCS/create-index.html
 create_index_stmt:
-  CREATE opt_unique INDEX opt_concurrently opt_index_name ON table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_idx_where
+  CREATE opt_unique INDEX opt_concurrently opt_index_name ON table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_where_clause
   {
     table := $7.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateIndex{
@@ -5532,11 +5664,12 @@ create_index_stmt:
       Storing: $13.nameList(),
       Interleave: $14.interleave(),
       PartitionBy: $15.partitionBy(),
+      Predicate: $16.expr(),
       Inverted: $8.bool(),
       Concurrently: $4.bool(),
     }
   }
-| CREATE opt_unique INDEX opt_concurrently IF NOT EXISTS index_name ON table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_idx_where
+| CREATE opt_unique INDEX opt_concurrently IF NOT EXISTS index_name ON table_name opt_using_gin_btree '(' index_params ')' opt_hash_sharded opt_storing opt_interleave opt_partition_by opt_where_clause
   {
     table := $10.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateIndex{
@@ -5550,10 +5683,11 @@ create_index_stmt:
       Interleave:  $17.interleave(),
       PartitionBy: $18.partitionBy(),
       Inverted:    $11.bool(),
+      Predicate:   $19.expr(),
       Concurrently: $4.bool(),
     }
   }
-| CREATE opt_unique INVERTED INDEX opt_concurrently opt_index_name ON table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_idx_where
+| CREATE opt_unique INVERTED INDEX opt_concurrently opt_index_name ON table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_where_clause
   {
     table := $8.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateIndex{
@@ -5565,10 +5699,11 @@ create_index_stmt:
       Storing:     $12.nameList(),
       Interleave:  $13.interleave(),
       PartitionBy: $14.partitionBy(),
+      Predicate:   $15.expr(),
       Concurrently: $5.bool(),
     }
   }
-| CREATE opt_unique INVERTED INDEX opt_concurrently IF NOT EXISTS index_name ON table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_idx_where
+| CREATE opt_unique INVERTED INDEX opt_concurrently IF NOT EXISTS index_name ON table_name '(' index_params ')' opt_storing opt_interleave opt_partition_by opt_where_clause
   {
     table := $11.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateIndex{
@@ -5581,14 +5716,11 @@ create_index_stmt:
       Storing:     $15.nameList(),
       Interleave:  $16.interleave(),
       PartitionBy: $17.partitionBy(),
+      Predicate:   $18.expr(),
       Concurrently: $5.bool(),
     }
   }
 | CREATE opt_unique INDEX error // SHOW HELP: CREATE INDEX
-
-opt_idx_where:
-  /* EMPTY */ { /* no error */ }
-| WHERE error { return unimplementedWithIssue(sqllex, 9683) }
 
 opt_using_gin_btree:
   USING name
@@ -6655,6 +6787,17 @@ sort_clause:
     $$.val = tree.OrderBy($3.orders())
   }
 
+single_sort_clause:
+  ORDER BY sortby
+  {
+    $$.val = tree.OrderBy([]*tree.Order{$3.order()})
+  }
+| ORDER BY sortby ',' sortby_list
+  {
+    sqllex.Error("multiple ORDER BY clauses are not supported in this function")
+    return 1
+  }
+
 sortby_list:
   sortby
   {
@@ -7491,6 +7634,11 @@ simple_typename:
       }
     }
   }
+| '@' iconst32
+  {
+    id := $2.int32()
+    $$.val = &tree.IDTypeReference{ID: uint32(id)}
+  }
 | complex_type_name
   {
     $$.val = $1.typeReference()
@@ -7517,11 +7665,11 @@ const_geo:
 | GEOMETRY  { $$.val = types.Geometry }
 | GEOMETRY '(' geo_shape ')'
   {
-    $$.val = types.MakeGeometry($3.geoFigure(), geopb.DefaultGeometrySRID)
+    $$.val = types.MakeGeometry($3.geoFigure(), 0)
   }
 | GEOGRAPHY '(' geo_shape ')'
   {
-    $$.val = types.MakeGeography($3.geoFigure(), geopb.DefaultGeographySRID)
+    $$.val = types.MakeGeography($3.geoFigure(), 0)
   }
 | GEOMETRY '(' geo_shape ',' iconst32 ')'
   {
@@ -8234,19 +8382,19 @@ a_expr:
   }
 | a_expr IS NULL %prec IS
   {
-    $$.val = &tree.ComparisonExpr{Operator: tree.IsNotDistinctFrom, Left: $1.expr(), Right: tree.DNull}
+    $$.val = &tree.IsNullExpr{Expr: $1.expr()}
   }
 | a_expr ISNULL %prec IS
   {
-    $$.val = &tree.ComparisonExpr{Operator: tree.IsNotDistinctFrom, Left: $1.expr(), Right: tree.DNull}
+    $$.val = &tree.IsNullExpr{Expr: $1.expr()}
   }
 | a_expr IS NOT NULL %prec IS
   {
-    $$.val = &tree.ComparisonExpr{Operator: tree.IsDistinctFrom, Left: $1.expr(), Right: tree.DNull}
+    $$.val = &tree.IsNotNullExpr{Expr: $1.expr()}
   }
 | a_expr NOTNULL %prec IS
   {
-    $$.val = &tree.ComparisonExpr{Operator: tree.IsDistinctFrom, Left: $1.expr(), Right: tree.DNull}
+    $$.val = &tree.IsNotNullExpr{Expr: $1.expr()}
   }
 | row OVERLAPS row { return unimplemented(sqllex, "overlaps") }
 | a_expr IS TRUE %prec IS
@@ -8624,13 +8772,13 @@ func_application:
   }
 | func_name '(' expr_list opt_sort_clause ')'
   {
-    $$.val = &tree.FuncExpr{Func: $1.resolvableFuncRefFromName(), Exprs: $3.exprs(), OrderBy: $4.orderBy()}
+    $$.val = &tree.FuncExpr{Func: $1.resolvableFuncRefFromName(), Exprs: $3.exprs(), OrderBy: $4.orderBy(), AggType: tree.GeneralAgg}
   }
 | func_name '(' VARIADIC a_expr opt_sort_clause ')' { return unimplemented(sqllex, "variadic") }
 | func_name '(' expr_list ',' VARIADIC a_expr opt_sort_clause ')' { return unimplemented(sqllex, "variadic") }
 | func_name '(' ALL expr_list opt_sort_clause ')'
   {
-    $$.val = &tree.FuncExpr{Func: $1.resolvableFuncRefFromName(), Type: tree.AllFuncType, Exprs: $4.exprs(), OrderBy: $5.orderBy()}
+    $$.val = &tree.FuncExpr{Func: $1.resolvableFuncRefFromName(), Type: tree.AllFuncType, Exprs: $4.exprs(), OrderBy: $5.orderBy(), AggType: tree.GeneralAgg}
   }
 // TODO(ridwanmsharif): Once DISTINCT is supported by window aggregates,
 // allow ordering to be specified below.
@@ -8719,6 +8867,11 @@ func_expr:
   func_application within_group_clause filter_clause over_clause
   {
     f := $1.expr().(*tree.FuncExpr)
+    w := $2.expr().(*tree.FuncExpr)
+    if w.AggType != 0 {
+      f.AggType = w.AggType
+      f.OrderBy = w.OrderBy
+    }
     f.Filter = $3.expr()
     f.WindowDef = $4.windowDef()
     $$.val = f
@@ -8939,8 +9092,14 @@ special_function:
 
 // Aggregate decoration clauses
 within_group_clause:
-WITHIN GROUP '(' sort_clause ')' { return unimplemented(sqllex, "within group") }
-| /* EMPTY */ {}
+  WITHIN GROUP '(' single_sort_clause ')'
+  {
+    $$.val = &tree.FuncExpr{OrderBy: $4.orderBy(), AggType: tree.OrderedSetAgg}
+  }
+| /* EMPTY */
+  {
+    $$.val = &tree.FuncExpr{}
+  }
 
 filter_clause:
   FILTER '(' WHERE a_expr ')'
@@ -10040,13 +10199,16 @@ unreserved_keyword:
 | ACTION
 | ADD
 | ADMIN
+| AFTER
 | AGGREGATE
 | ALTER
 | ALWAYS
 | AT
+| ATTRIBUTE
 | AUTOMATIC
 | AUTHORIZATION
 | BACKUP
+| BEFORE
 | BEGIN
 | BUCKET_COUNT
 | BUNDLE
@@ -10184,6 +10346,7 @@ unreserved_keyword:
 | OTHERS
 | OVER
 | OWNED
+| OWNER
 | PARENT
 | PARTIAL
 | PARTITION

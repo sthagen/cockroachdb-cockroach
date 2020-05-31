@@ -15,6 +15,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -31,13 +32,14 @@ var comparisonOpInfix = map[tree.ComparisonOperator]string{
 }
 
 var comparableCanonicalTypeFamilies = map[types.Family][]types.Family{
-	types.BoolFamily:        {types.BoolFamily},
-	types.BytesFamily:       {types.BytesFamily},
-	types.DecimalFamily:     numericCanonicalTypeFamilies,
-	types.IntFamily:         numericCanonicalTypeFamilies,
-	types.FloatFamily:       numericCanonicalTypeFamilies,
-	types.TimestampTZFamily: {types.TimestampTZFamily},
-	types.IntervalFamily:    {types.IntervalFamily},
+	types.BoolFamily:                     {types.BoolFamily},
+	types.BytesFamily:                    {types.BytesFamily},
+	types.DecimalFamily:                  numericCanonicalTypeFamilies,
+	types.IntFamily:                      numericCanonicalTypeFamilies,
+	types.FloatFamily:                    numericCanonicalTypeFamilies,
+	types.TimestampTZFamily:              {types.TimestampTZFamily},
+	types.IntervalFamily:                 {types.IntervalFamily},
+	typeconv.DatumVecCanonicalTypeFamily: {typeconv.DatumVecCanonicalTypeFamily},
 }
 
 // sameTypeComparisonOpToOverloads maps a comparison operator to all of the
@@ -75,12 +77,12 @@ func populateCmpOpOverloads() {
 			cmpOpOutputTypes,
 			func(lawo *lastArgWidthOverload, customizer typeCustomizer) {
 				if b, ok := customizer.(cmpOpTypeCustomizer); ok {
-					lawo.AssignFunc = func(op *lastArgWidthOverload, target, l, r string) string {
-						cmp := b.getCmpOpCompareFunc()("cmpResult", l, r)
+					lawo.AssignFunc = func(op *lastArgWidthOverload, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string) string {
+						cmp := b.getCmpOpCompareFunc()("cmpResult", leftElem, rightElem, leftCol, rightCol)
 						if cmp == "" {
 							return ""
 						}
-						args := map[string]string{"Target": target, "Cmp": cmp, "Op": op.overloadBase.OpStr}
+						args := map[string]string{"Target": targetElem, "Cmp": cmp, "Op": op.overloadBase.OpStr}
 						buf := strings.Builder{}
 						t := template.Must(template.New("").Parse(`
 										{
@@ -109,8 +111,8 @@ type cmpOpTypeCustomizer interface {
 }
 
 func (boolCustomizer) getCmpOpCompareFunc() compareFunc {
-	return func(target, l, r string) string {
-		args := map[string]string{"Target": target, "Left": l, "Right": r}
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		args := map[string]string{"Target": targetElem, "Left": leftElem, "Right": rightElem}
 		buf := strings.Builder{}
 		// Inline the code from tree.CompareBools
 		t := template.Must(template.New("").Parse(`
@@ -131,14 +133,14 @@ func (boolCustomizer) getCmpOpCompareFunc() compareFunc {
 }
 
 func (bytesCustomizer) getCmpOpCompareFunc() compareFunc {
-	return func(target, l, r string) string {
-		return fmt.Sprintf("%s = bytes.Compare(%s, %s)", target, l, r)
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		return fmt.Sprintf("%s = bytes.Compare(%s, %s)", targetElem, leftElem, rightElem)
 	}
 }
 
 func (decimalCustomizer) getCmpOpCompareFunc() compareFunc {
-	return func(target, l, r string) string {
-		return fmt.Sprintf("%s = tree.CompareDecimals(&%s, &%s)", target, l, r)
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		return fmt.Sprintf("%s = tree.CompareDecimals(&%s, &%s)", targetElem, leftElem, rightElem)
 	}
 }
 
@@ -147,11 +149,11 @@ func (c floatCustomizer) getCmpOpCompareFunc() compareFunc {
 }
 
 func getFloatCmpOpCompareFunc(checkLeftNan, checkRightNan bool) compareFunc {
-	return func(target, l, r string) string {
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
 		args := map[string]interface{}{
-			"Target":        target,
-			"Left":          l,
-			"Right":         r,
+			"Target":        targetElem,
+			"Left":          leftElem,
+			"Right":         rightElem,
 			"CheckLeftNan":  checkLeftNan,
 			"CheckRightNan": checkRightNan}
 		buf := strings.Builder{}
@@ -189,8 +191,8 @@ func getFloatCmpOpCompareFunc(checkLeftNan, checkRightNan bool) compareFunc {
 }
 
 func (c intCustomizer) getCmpOpCompareFunc() compareFunc {
-	return func(target, l, r string) string {
-		args := map[string]string{"Target": target, "Left": l, "Right": r}
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		args := map[string]string{"Target": targetElem, "Left": leftElem, "Right": rightElem}
 		buf := strings.Builder{}
 		// To allow ints of different sizes to be compared, always upcast to int64.
 		t := template.Must(template.New("").Parse(`
@@ -214,12 +216,12 @@ func (c intCustomizer) getCmpOpCompareFunc() compareFunc {
 }
 
 func (c decimalFloatCustomizer) getCmpOpCompareFunc() compareFunc {
-	return func(target, l, r string) string {
-		args := map[string]string{"Target": target, "Left": l, "Right": r}
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		args := map[string]string{"Target": targetElem, "Left": leftElem, "Right": rightElem}
 		buf := strings.Builder{}
 		t := template.Must(template.New("").Parse(`
 			{
-				tmpDec := &decimalScratch.tmpDec1
+				tmpDec := &_overloadHelper.tmpDec1
 				if _, err := tmpDec.SetFloat64(float64({{.Right}})); err != nil {
 					colexecerror.ExpectedError(err)
 				}
@@ -234,12 +236,12 @@ func (c decimalFloatCustomizer) getCmpOpCompareFunc() compareFunc {
 }
 
 func (c decimalIntCustomizer) getCmpOpCompareFunc() compareFunc {
-	return func(target, l, r string) string {
-		args := map[string]string{"Target": target, "Left": l, "Right": r}
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		args := map[string]string{"Target": targetElem, "Left": leftElem, "Right": rightElem}
 		buf := strings.Builder{}
 		t := template.Must(template.New("").Parse(`
 			{
-				tmpDec := &decimalScratch.tmpDec1
+				tmpDec := &_overloadHelper.tmpDec1
 				tmpDec.SetFinite(int64({{.Right}}), 0)
 				{{.Target}} = tree.CompareDecimals(&{{.Left}}, tmpDec)
 			}
@@ -252,12 +254,12 @@ func (c decimalIntCustomizer) getCmpOpCompareFunc() compareFunc {
 }
 
 func (c floatDecimalCustomizer) getCmpOpCompareFunc() compareFunc {
-	return func(target, l, r string) string {
-		args := map[string]string{"Target": target, "Left": l, "Right": r}
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		args := map[string]string{"Target": targetElem, "Left": leftElem, "Right": rightElem}
 		buf := strings.Builder{}
 		t := template.Must(template.New("").Parse(`
 			{
-				tmpDec := &decimalScratch.tmpDec1
+				tmpDec := &_overloadHelper.tmpDec1
 				if _, err := tmpDec.SetFloat64(float64({{.Left}})); err != nil {
 					colexecerror.ExpectedError(err)
 				}
@@ -272,12 +274,12 @@ func (c floatDecimalCustomizer) getCmpOpCompareFunc() compareFunc {
 }
 
 func (c intDecimalCustomizer) getCmpOpCompareFunc() compareFunc {
-	return func(target, l, r string) string {
-		args := map[string]string{"Target": target, "Left": l, "Right": r}
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		args := map[string]string{"Target": targetElem, "Left": leftElem, "Right": rightElem}
 		buf := strings.Builder{}
 		t := template.Must(template.New("").Parse(`
 			{
-				tmpDec := &decimalScratch.tmpDec1
+				tmpDec := &_overloadHelper.tmpDec1
 				tmpDec.SetFinite(int64({{.Left}}), 0)
 				{{.Target}} = tree.CompareDecimals(tmpDec, &{{.Right}})
 			}
@@ -303,18 +305,18 @@ func (c intFloatCustomizer) getCmpOpCompareFunc() compareFunc {
 }
 
 func (c timestampCustomizer) getCmpOpCompareFunc() compareFunc {
-	return func(target, l, r string) string {
-		args := map[string]string{"Target": target, "Left": l, "Right": r}
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		args := map[string]string{"Target": targetElem, "Left": leftElem, "Right": rightElem}
 		buf := strings.Builder{}
 		// Inline the code from tree.compareTimestamps.
 		t := template.Must(template.New("").Parse(`
-      if {{.Left}}.Before({{.Right}}) {
-				{{.Target}} = -1
-			} else if {{.Right}}.Before({{.Left}}) {
-				{{.Target}} = 1
-			} else { 
-        {{.Target}} = 0
-      }`))
+		if {{.Left}}.Before({{.Right}}) {
+			{{.Target}} = -1
+		} else if {{.Right}}.Before({{.Left}}) {
+			{{.Target}} = 1
+		} else {
+			{{.Target}} = 0
+		}`))
 
 		if err := t.Execute(&buf, args); err != nil {
 			colexecerror.InternalError(err)
@@ -324,7 +326,16 @@ func (c timestampCustomizer) getCmpOpCompareFunc() compareFunc {
 }
 
 func (c intervalCustomizer) getCmpOpCompareFunc() compareFunc {
-	return func(target, l, r string) string {
-		return fmt.Sprintf("%s = %s.Compare(%s)", target, l, r)
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		return fmt.Sprintf("%s = %s.Compare(%s)", targetElem, leftElem, rightElem)
+	}
+}
+
+func (c datumCustomizer) getCmpOpCompareFunc() compareFunc {
+	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
+		datumVecVariableName := getDatumVecVariableName(leftCol, rightCol, false /* preferRightSide */)
+		return fmt.Sprintf(`
+			%s = %s.(*coldataext.Datum).CompareDatum(%s, %s)
+		`, targetElem, leftElem, datumVecVariableName, rightElem)
 	}
 }

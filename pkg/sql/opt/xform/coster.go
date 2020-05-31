@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/tools/container/intsets"
@@ -132,6 +133,11 @@ const (
 	// If the final expression has this cost or larger, it means that there was no
 	// plan that could satisfy the hints.
 	hugeCost memo.Cost = 1e100
+
+	// Some benchmarks showed that some geo functions were atleast 10 times
+	// slower than some float functions, so this is a somewhat data-backed
+	// guess.
+	geoFnCost = cpuCostFactor * 10
 )
 
 // Init initializes a new coster structure with the given memo.
@@ -182,7 +188,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		cost = c.computeLookupJoinCost(candidate.(*memo.LookupJoinExpr), required)
 
 	case opt.GeoLookupJoinOp:
-		cost = c.computeGeoLookupJoinCost(candidate.(*memo.GeoLookupJoinExpr))
+		cost = c.computeGeoLookupJoinCost(candidate.(*memo.GeoLookupJoinExpr), required)
 
 	case opt.ZigzagJoinOp:
 		cost = c.computeZigzagJoinCost(candidate.(*memo.ZigzagJoinExpr))
@@ -192,7 +198,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		cost = c.computeSetCost(candidate)
 
 	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.EnsureDistinctOnOp,
-		opt.UpsertDistinctOnOp:
+		opt.UpsertDistinctOnOp, opt.EnsureUpsertDistinctOnOp:
 		cost = c.computeGroupingCost(candidate, required)
 
 	case opt.LimitOp:
@@ -361,8 +367,26 @@ func (c *coster) computeHashJoinCost(join memo.RelExpr) memo.Cost {
 	}
 	cost += memo.Cost(rowsProcessed) * cpuCostFactor
 
-	// TODO(rytaft): Add a constant "setup" cost per extra ON condition similar
-	// to merge join and lookup join.
+	// Compute filter cost. Fetch the equality columns so they can be
+	// ignored later.
+	on := join.Child(2).(*memo.FiltersExpr)
+	leftEq, rightEq := memo.ExtractJoinEqualityColumns(
+		join.Child(0).(memo.RelExpr).Relational().OutputCols,
+		join.Child(1).(memo.RelExpr).Relational().OutputCols,
+		*on,
+	)
+	// Generate a quick way to lookup if two columns are join equality
+	// columns. We add in both directions because we don't know which way
+	// the equality filters will be defined.
+	eqMap := util.FastIntMap{}
+	for i := range leftEq {
+		left := int(leftEq[i])
+		right := int(rightEq[i])
+		eqMap.Set(left, right)
+		eqMap.Set(right, left)
+	}
+	cost += c.computeFiltersCost(*on, eqMap)
+
 	return cost
 }
 
@@ -382,10 +406,7 @@ func (c *coster) computeMergeJoinCost(join *memo.MergeJoinExpr) memo.Cost {
 	}
 	cost += memo.Cost(rowsProcessed) * cpuCostFactor
 
-	// Add a constant "setup" cost per ON condition to account for the fact that
-	// the rowsProcessed estimate alone cannot effectively discriminate between
-	// plans when RowCount is too small.
-	cost += cpuCostFactor * memo.Cost(len(join.On))
+	cost += c.computeFiltersCost(join.On, util.FastIntMap{})
 	return cost
 }
 
@@ -405,12 +426,34 @@ func (c *coster) computeLookupJoinCost(
 ) memo.Cost {
 	lookupCount := join.Input.Relational().Stats.RowCount
 
+	// Take into account that the "internal" row count is higher, according to
+	// the selectivities of the conditions. In particular, we need to ignore
+	// left-over conditions that are not selective.
+	// For example:
+	//   ab JOIN xy ON a=x AND x=10
+	// becomes (during normalization):
+	//   ab JOIN xy ON a=x AND a=10 AND x=10
+	// which can become a lookup join with left-over condition x=10 which doesn't
+	// actually filter anything.
+	rowsProcessed, ok := c.mem.RowsProcessed(join)
+	if !ok {
+		// We shouldn't ever get here. Since we don't allow the memo
+		// to be optimized twice, the coster should never be used after
+		// logPropsBuilder.clear() is called.
+		panic(errors.AssertionFailedf("could not get rows processed for lookup join"))
+	}
+
 	// Lookup joins can return early if enough rows have been found. An otherwise
 	// expensive lookup join might have a lower cost if its limit hint estimates
 	// that most rows will not be needed.
-	if required.LimitHint != 0 {
+	if required.LimitHint != 0 && lookupCount > 0 {
 		outputRows := join.Relational().Stats.RowCount
-		lookupCount = lookupJoinInputLimitHint(lookupCount, outputRows, required.LimitHint)
+		unlimitedLookupCount := lookupCount
+		lookupCount = lookupJoinInputLimitHint(unlimitedLookupCount, outputRows, required.LimitHint)
+		// We scale the number of rows processed by the same factor (we are
+		// calculating the average number of rows processed per lookup and
+		// multiplying by the new lookup count).
+		rowsProcessed = (rowsProcessed / unlimitedLookupCount) * lookupCount
 	}
 
 	// The rows in the (left) input are used to probe into the (right) table.
@@ -434,34 +477,115 @@ func (c *coster) computeLookupJoinCost(
 	perRowCost := lookupJoinRetrieveRowCost +
 		c.rowScanCost(join.Table, join.Index, numLookupCols)
 
+	cost += memo.Cost(rowsProcessed) * perRowCost
+
+	cost += c.computeFiltersCost(join.On, util.FastIntMap{})
+	return cost
+}
+
+func (c *coster) computeGeoLookupJoinCost(
+	join *memo.GeoLookupJoinExpr, required *physical.Required,
+) memo.Cost {
+	lookupCount := join.Input.Relational().Stats.RowCount
+
 	// Take into account that the "internal" row count is higher, according to
 	// the selectivities of the conditions. In particular, we need to ignore
-	// left-over conditions that are not selective.
-	// For example:
-	//   ab JOIN xy ON a=x AND x=10
-	// becomes (during normalization):
-	//   ab JOIN xy ON a=x AND a=10 AND x=10
-	// which can become a lookup join with left-over condition x=10 which doesn't
-	// actually filter anything.
+	// the conditions that don't affect the number of rows processed.
+	// A contrived example, where gid is a SERIAL PK:
+	//   nyc_census_blocks c JOIN nyc_neighborhoods n ON
+	//   ST_Intersects(c.geom, n.geom) AND c.gid < n.gid
+	// which can become a lookup join with left-over condition c.gid <
+	// n.gid.
 	rowsProcessed, ok := c.mem.RowsProcessed(join)
 	if !ok {
 		// We shouldn't ever get here. Since we don't allow the memo
 		// to be optimized twice, the coster should never be used after
 		// logPropsBuilder.clear() is called.
-		panic(errors.AssertionFailedf("could not get rows processed for lookup join"))
+		panic(errors.AssertionFailedf("could not get rows processed for geolookup join"))
 	}
+
+	// Lookup joins can return early if enough rows have been found. An otherwise
+	// expensive lookup join might have a lower cost if its limit hint estimates
+	// that most rows will not be needed.
+	if required.LimitHint != 0 && lookupCount > 0 {
+		outputRows := join.Relational().Stats.RowCount
+		unlimitedLookupCount := lookupCount
+		lookupCount = lookupJoinInputLimitHint(unlimitedLookupCount, outputRows, required.LimitHint)
+		// We scale the number of rows processed by the same factor (we are
+		// calculating the average number of rows processed per lookup and
+		// multiplying by the new lookup count).
+		rowsProcessed = (rowsProcessed / unlimitedLookupCount) * lookupCount
+	}
+
+	// The rows in the (left) input are used to probe into the (right) table.
+	// Since the matching rows in the table may not all be in the same range, this
+	// counts as random I/O.
+	perLookupCost := memo.Cost(randIOCostFactor)
+	// Since inverted indexes can't form a key, execution will have to
+	// limit KV batches which prevents running requests to multiple nodes
+	// in parallel.  An experiment on a 4 node cluster with a table with
+	// 100k rows split into 100 ranges showed that a "non-parallel" lookup
+	// join is about 5 times slower.
+	perLookupCost *= 5
+	cost := memo.Cost(lookupCount) * perLookupCost
+
+	// Each lookup might retrieve many rows; add the IO cost of retrieving the
+	// rows (relevant when we expect many resulting rows per lookup) and the CPU
+	// cost of emitting the rows.
+	numLookupCols := join.Cols.Difference(join.Input.Relational().OutputCols).Len()
+	perRowCost := lookupJoinRetrieveRowCost +
+		c.rowScanCost(join.Table, join.Index, numLookupCols)
 	cost += memo.Cost(rowsProcessed) * perRowCost
 
-	// Add a constant "setup" cost per ON condition to account for the fact that
-	// the rowsProcessed estimate alone cannot effectively discriminate between
-	// plans when RowCount is too small.
-	cost += cpuCostFactor * memo.Cost(len(join.On))
+	// We don't add the result of computeFiltersCost to perRowCost because
+	// otherwise the 1 that is added to rowsProcessed would either have
+	// to be removed or be multiplied by all of the other various costs in
+	// perRowCost. To be consistent with other joins, keep it separate.
+	cost += c.computeFiltersCost(join.On, util.FastIntMap{}) * memo.Cost(1+rowsProcessed)
 	return cost
 }
 
-func (c *coster) computeGeoLookupJoinCost(join *memo.GeoLookupJoinExpr) memo.Cost {
-	// TODO(rytaft): add a real cost here.
-	return 0
+// computeFiltersCost returns the per-row cost of executing a filter. Callers
+// of this function should multiply its output by the number of rows expected
+// to be filtered + 1. The + 1 accounts for a setup cost and is useful for
+// comparing costs of filters with very low row counts.
+// TODO: account for per-row costs in all callers.
+func (c *coster) computeFiltersCost(filters memo.FiltersExpr, eqMap util.FastIntMap) memo.Cost {
+	var cost memo.Cost
+	for i := range filters {
+		f := &filters[i]
+		switch f.Condition.Op() {
+		case opt.EqOp:
+			eq := f.Condition.(*memo.EqExpr)
+			leftVar, ok := eq.Left.(*memo.VariableExpr)
+			if !ok {
+				break
+			}
+			rightVar, ok := eq.Right.(*memo.VariableExpr)
+			if !ok {
+				break
+			}
+			if val, ok := eqMap.Get(int(leftVar.Col)); ok && val == int(rightVar.Col) {
+				// Equality filters on some joins are still in
+				// filters, while others have already removed
+				// them. They do not cost anything.
+				continue
+			}
+		case opt.FunctionOp:
+			if IsGeoIndexFunction(f.Condition) {
+				cost += geoFnCost
+			}
+			// TODO(mjibson): do we need to cost other functions?
+		}
+
+		// Add a constant "setup" cost per ON condition to account for the fact that
+		// the rowsProcessed estimate alone cannot effectively discriminate between
+		// plans when RowCount is too small.
+		// TODO: perhaps separate the one-time and per-row costs and
+		// return them separately.
+		cost += cpuCostFactor
+	}
+	return cost
 }
 
 func (c *coster) computeZigzagJoinCost(join *memo.ZigzagJoinExpr) memo.Cost {
@@ -484,6 +608,8 @@ func (c *coster) computeZigzagJoinCost(join *memo.ZigzagJoinExpr) memo.Cost {
 	// Double the cost of emitting rows as well as the cost of seeking rows,
 	// given two indexes will be accessed.
 	cost := memo.Cost(rowCount) * (2*(cpuCostFactor+seqIOCostFactor) + scanCost)
+
+	cost += c.computeFiltersCost(join.On, util.FastIntMap{})
 	return cost
 }
 

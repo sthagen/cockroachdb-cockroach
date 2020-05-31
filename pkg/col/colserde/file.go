@@ -328,7 +328,7 @@ func schema(fb *flatbuffers.Builder, typs []*types.T) flatbuffers.UOffsetT {
 	for idx, typ := range typs {
 		var fbTyp byte
 		var fbTypOffset flatbuffers.UOffsetT
-		switch typeconv.TypeFamilyToCanonicalTypeFamily[typ.Family()] {
+		switch typeconv.TypeFamilyToCanonicalTypeFamily(typ.Family()) {
 		case types.BoolFamily:
 			arrowserde.BoolStart(fb)
 			fbTypOffset = arrowserde.BoolEnd(fb)
@@ -380,6 +380,11 @@ func schema(fb *flatbuffers.Builder, typs []*types.T) flatbuffers.UOffsetT {
 			arrowserde.BinaryStart(fb)
 			fbTypOffset = arrowserde.BinaryEnd(fb)
 			fbTyp = arrowserde.TypeInterval
+		case typeconv.DatumVecCanonicalTypeFamily:
+			// Datums are marshaled into bytes, so we use binary headers.
+			arrowserde.BinaryStart(fb)
+			fbTypOffset = arrowserde.BinaryEnd(fb)
+			fbTyp = arrowserde.TypeUtf8
 		default:
 			panic(errors.Errorf(`don't know how to map %s`, typ))
 		}

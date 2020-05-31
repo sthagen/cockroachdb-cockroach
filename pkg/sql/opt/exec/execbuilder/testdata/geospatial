@@ -1,8 +1,13 @@
+# This logic test fails in the 3node-tenant configuration because the keys are
+# prefixed with the tenant ID if run by a tenant:
+# https://github.com/cockroachdb/cockroach/issues/49582
+# LogicTest: !3node-tenant
+
 statement ok
 CREATE TABLE b(
   a int primary key,
   geog geography(geometry, 4326),
-  geom geometry(point, 4326),
+  geom geometry(point),
   FAMILY (a, geog, geom)
 )
 
@@ -10,7 +15,7 @@ statement ok
 CREATE TABLE c(
   a int primary key,
   geog geography(geometry, 4326),
-  geom geometry(point, 4326),
+  geom geometry(point),
   FAMILY (a, geog, geom),
   INVERTED INDEX (geog),
   INVERTED INDEX (geom)

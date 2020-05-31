@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -96,7 +96,7 @@ type Config struct {
 	DB                   *kv.DB
 	Stopper              *stop.Stopper
 	AmbientCtx           log.AmbientContext
-	TestingKnobs         storagebase.IntentResolverTestingKnobs
+	TestingKnobs         kvserverbase.IntentResolverTestingKnobs
 	RangeDescriptorCache kvbase.RangeDescriptorCache
 
 	TaskLimit                    int
@@ -114,7 +114,7 @@ type IntentResolver struct {
 	clock        *hlc.Clock
 	db           *kv.DB
 	stopper      *stop.Stopper
-	testingKnobs storagebase.IntentResolverTestingKnobs
+	testingKnobs kvserverbase.IntentResolverTestingKnobs
 	ambientCtx   log.AmbientContext
 	sem          *quotapool.IntPool // semaphore to limit async goroutines
 
@@ -247,7 +247,7 @@ func getPusherTxn(h roachpb.Header) roachpb.Transaction {
 // the returned intent slice.
 func updateIntentTxnStatus(
 	ctx context.Context,
-	pushedTxns map[uuid.UUID]roachpb.Transaction,
+	pushedTxns map[uuid.UUID]*roachpb.Transaction,
 	intents []roachpb.Intent,
 	skipIfInFlight bool,
 	results []roachpb.LockUpdate,
@@ -262,7 +262,7 @@ func updateIntentTxnStatus(
 			// It must have been skipped.
 			continue
 		}
-		up := roachpb.MakeLockUpdate(&pushee, roachpb.Span{Key: intent.Key})
+		up := roachpb.MakeLockUpdate(pushee, roachpb.Span{Key: intent.Key})
 		results = append(results, up)
 	}
 	return results
@@ -273,12 +273,12 @@ func updateIntentTxnStatus(
 // to the pushed transaction.
 func (ir *IntentResolver) PushTransaction(
 	ctx context.Context, pushTxn *enginepb.TxnMeta, h roachpb.Header, pushType roachpb.PushTxnType,
-) (roachpb.Transaction, *roachpb.Error) {
+) (*roachpb.Transaction, *roachpb.Error) {
 	pushTxns := make(map[uuid.UUID]*enginepb.TxnMeta, 1)
 	pushTxns[pushTxn.ID] = pushTxn
 	pushedTxns, pErr := ir.MaybePushTransactions(ctx, pushTxns, h, pushType, false /* skipIfInFlight */)
 	if pErr != nil {
-		return roachpb.Transaction{}, pErr
+		return nil, pErr
 	}
 	pushedTxn, ok := pushedTxns[pushTxn.ID]
 	if !ok {
@@ -315,7 +315,7 @@ func (ir *IntentResolver) MaybePushTransactions(
 	h roachpb.Header,
 	pushType roachpb.PushTxnType,
 	skipIfInFlight bool,
-) (map[uuid.UUID]roachpb.Transaction, *roachpb.Error) {
+) (map[uuid.UUID]*roachpb.Transaction, *roachpb.Error) {
 	// Decide which transactions to push and which to ignore because
 	// of other in-flight requests. For those transactions that we
 	// will be pushing, increment their ref count in the in-flight
@@ -373,9 +373,9 @@ func (ir *IntentResolver) MaybePushTransactions(
 	}
 
 	br := b.RawResponse()
-	pushedTxns := map[uuid.UUID]roachpb.Transaction{}
+	pushedTxns := make(map[uuid.UUID]*roachpb.Transaction, len(br.Responses))
 	for _, resp := range br.Responses {
-		txn := resp.GetInner().(*roachpb.PushTxnResponse).PusheeTxn
+		txn := &resp.GetInner().(*roachpb.PushTxnResponse).PusheeTxn
 		if _, ok := pushedTxns[txn.ID]; ok {
 			log.Fatalf(ctx, "have two PushTxn responses for %s", txn.ID)
 		}

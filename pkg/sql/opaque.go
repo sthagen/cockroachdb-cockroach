@@ -51,6 +51,8 @@ func buildOpaque(
 		plan, err = p.AlterIndex(ctx, n)
 	case *tree.AlterTable:
 		plan, err = p.AlterTable(ctx, n)
+	case *tree.AlterType:
+		plan, err = p.AlterType(ctx, n)
 	case *tree.AlterRole:
 		plan, err = p.AlterRole(ctx, n)
 	case *tree.AlterSequence:
@@ -122,7 +124,7 @@ func buildOpaque(
 	case *tree.SetVar:
 		plan, err = p.SetVar(ctx, n)
 	case *tree.SetTransaction:
-		plan, err = p.SetTransaction(n)
+		plan, err = p.SetTransaction(ctx, n)
 	case *tree.SetSessionAuthorizationDefault:
 		plan, err = p.SetSessionAuthorizationDefault()
 	case *tree.SetSessionCharacteristics:
@@ -164,6 +166,7 @@ func init() {
 	for _, stmt := range []tree.Statement{
 		&tree.AlterIndex{},
 		&tree.AlterTable{},
+		&tree.AlterType{},
 		&tree.AlterSequence{},
 		&tree.AlterRole{},
 		&tree.CommentOnColumn{},

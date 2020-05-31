@@ -698,12 +698,16 @@ func (node *FuncExpr) doc(p *PrettyCfg) pretty.Doc {
 			)
 		}
 
-		if len(node.OrderBy) > 0 {
+		if node.AggType == GeneralAgg && len(node.OrderBy) > 0 {
 			args = pretty.ConcatSpace(args, node.OrderBy.doc(p))
 		}
 		d = pretty.Concat(d, p.bracket("(", args, ")"))
 	} else {
 		d = pretty.Concat(d, pretty.Text("()"))
+	}
+	if node.AggType == OrderedSetAgg && len(node.OrderBy) > 0 {
+		args := node.OrderBy.doc(p)
+		d = pretty.Concat(d, p.bracket("WITHIN GROUP (", args, ")"))
 	}
 	if node.Filter != nil {
 		d = pretty.Fold(pretty.ConcatSpace,
@@ -854,9 +858,12 @@ func (p *PrettyCfg) peelCompOperand(e Expr) Expr {
 
 func (node *ComparisonExpr) doc(p *PrettyCfg) pretty.Doc {
 	opStr := node.Operator.String()
-	if node.Operator == IsDistinctFrom && (node.Right == DNull || node.Right == DBoolTrue || node.Right == DBoolFalse) {
+	// IS and IS NOT are equivalent to IS NOT DISTINCT FROM and IS DISTINCT
+	// FROM, respectively, when the RHS is true or false. We prefer the less
+	// verbose IS and IS NOT in those cases.
+	if node.Operator == IsDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
 		opStr = "IS NOT"
-	} else if node.Operator == IsNotDistinctFrom && (node.Right == DNull || node.Right == DBoolTrue || node.Right == DBoolFalse) {
+	} else if node.Operator == IsNotDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
 		opStr = "IS"
 	}
 	opDoc := pretty.Keyword(opStr)
@@ -1498,6 +1505,7 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 	//    [STORING ( ... )]
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
+	//    [WHERE ...]
 	//
 	title := make([]pretty.Doc, 0, 6)
 	title = append(title, pretty.Keyword("CREATE"))
@@ -1539,6 +1547,9 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 	}
 	if node.PartitionBy != nil {
 		clauses = append(clauses, p.Doc(node.PartitionBy))
+	}
+	if node.Predicate != nil {
+		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
 	}
 	return p.nestUnder(
 		pretty.Fold(pretty.ConcatSpace, title...),
@@ -1598,6 +1609,7 @@ func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	//    [STORING ( ... )]
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
+	//    [WHERE ...]
 	//
 	title := pretty.Keyword("INDEX")
 	if node.Name != "" {
@@ -1624,6 +1636,9 @@ func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	if node.PartitionBy != nil {
 		clauses = append(clauses, p.Doc(node.PartitionBy))
 	}
+	if node.Predicate != nil {
+		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
+	}
 
 	if len(clauses) == 0 {
 		return title
@@ -1638,6 +1653,7 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	//    [STORING ( ... )]
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
+	//    [WHERE ...]
 	//
 	// or (no constraint name):
 	//
@@ -1645,6 +1661,7 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	//    [STORING ( ... )]
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
+	//    [WHERE ...]
 	//
 	clauses := make([]pretty.Doc, 0, 5)
 	var title pretty.Doc
@@ -1672,6 +1689,9 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	}
 	if node.PartitionBy != nil {
 		clauses = append(clauses, p.Doc(node.PartitionBy))
+	}
+	if node.Predicate != nil {
+		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
 	}
 
 	if len(clauses) == 0 {
@@ -2077,6 +2097,20 @@ func (node *NotExpr) doc(p *PrettyCfg) pretty.Doc {
 	return p.nestUnder(
 		pretty.Keyword("NOT"),
 		p.exprDocWithParen(node.Expr),
+	)
+}
+
+func (node *IsNullExpr) doc(p *PrettyCfg) pretty.Doc {
+	return pretty.ConcatSpace(
+		p.exprDocWithParen(node.Expr),
+		pretty.Keyword("IS NULL"),
+	)
+}
+
+func (node *IsNotNullExpr) doc(p *PrettyCfg) pretty.Doc {
+	return pretty.ConcatSpace(
+		p.exprDocWithParen(node.Expr),
+		pretty.Keyword("IS NOT NULL"),
 	)
 }
 

@@ -65,7 +65,7 @@ func (g *gcsStorage) Conf() roachpb.ExternalStorage {
 
 func makeGCSStorage(
 	ctx context.Context,
-	ioConf base.ExternalIOConfig,
+	ioConf base.ExternalIODirConfig,
 	conf *roachpb.ExternalStorage_GCS,
 	settings *cluster.Settings,
 ) (ExternalStorage, error) {
@@ -224,11 +224,15 @@ func (r *resumingGoogleStorageReader) Close() error {
 
 func (g *gcsStorage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
 	// https://github.com/cockroachdb/cockroach/issues/23859
-	return &resumingGoogleStorageReader{
+	reader := &resumingGoogleStorageReader{
 		ctx:    ctx,
 		bucket: g.bucket,
 		object: path.Join(g.prefix, basename),
-	}, nil
+	}
+	if err := reader.openStream(); err != nil {
+		return nil, err
+	}
+	return reader, nil
 }
 
 func (g *gcsStorage) ListFiles(ctx context.Context, patternSuffix string) ([]string, error) {

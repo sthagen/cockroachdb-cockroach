@@ -20,15 +20,13 @@
 package colexec
 
 import (
-	"time"
+	"unsafe"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
@@ -38,15 +36,6 @@ var _ = execgen.UNSAFEGET
 // {{/*
 
 // Declarations to make the template compile properly.
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
 
 // _GOTYPESLICE is the template variable.
 type _GOTYPESLICE interface{}
@@ -59,14 +48,16 @@ const _TYPE_WIDTH = 0
 
 // */}}
 
-func newAnyNotNullAgg(allocator *colmem.Allocator, t *types.T) (aggregateFunc, error) {
-	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
+func newAnyNotNullAggAlloc(
+	allocator *colmem.Allocator, t *types.T, allocSize int64,
+) (aggregateFuncAlloc, error) {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
 	case _CANONICAL_TYPE_FAMILY:
 		switch t.Width() {
 		// {{range .WidthOverloads}}
 		case _TYPE_WIDTH:
-			return &anyNotNull_TYPEAgg{allocator: allocator}, nil
+			return &anyNotNull_TYPEAggAlloc{allocator: allocator, allocSize: allocSize}, nil
 			// {{end}}
 		}
 		// {{end}}
@@ -81,7 +72,6 @@ func newAnyNotNullAgg(allocator *colmem.Allocator, t *types.T) (aggregateFunc, e
 // first non-null value in the input column.
 type anyNotNull_TYPEAgg struct {
 	allocator                   *colmem.Allocator
-	done                        bool
 	groups                      []bool
 	vec                         coldata.Vec
 	col                         _GOTYPESLICE
@@ -90,6 +80,10 @@ type anyNotNull_TYPEAgg struct {
 	curAgg                      _GOTYPE
 	foundNonNullForCurrentGroup bool
 }
+
+var _ aggregateFunc = &anyNotNull_TYPEAgg{}
+
+const sizeOfAnyNotNull_TYPEAgg = int64(unsafe.Sizeof(anyNotNull_TYPEAgg{}))
 
 func (a *anyNotNull_TYPEAgg) Init(groups []bool, vec coldata.Vec) {
 	a.groups = groups
@@ -101,7 +95,6 @@ func (a *anyNotNull_TYPEAgg) Init(groups []bool, vec coldata.Vec) {
 
 func (a *anyNotNull_TYPEAgg) Reset() {
 	a.curIdx = -1
-	a.done = false
 	a.foundNonNullForCurrentGroup = false
 	a.nulls.UnsetNulls()
 }
@@ -118,22 +111,7 @@ func (a *anyNotNull_TYPEAgg) SetOutputIndex(idx int) {
 }
 
 func (a *anyNotNull_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	if a.done {
-		return
-	}
 	inputLen := b.Length()
-	if inputLen == 0 {
-		// If we haven't found any non-nulls for this group so far, the output for
-		// this group should be null.
-		if !a.foundNonNullForCurrentGroup {
-			a.nulls.SetNull(a.curIdx)
-		} else {
-			execgen.SET(a.col, a.curIdx, a.curAgg)
-		}
-		a.curIdx++
-		a.done = true
-		return
-	}
 	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
 	col, nulls := vec.TemplateType(), vec.Nulls()
 
@@ -169,8 +147,38 @@ func (a *anyNotNull_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	)
 }
 
+func (a *anyNotNull_TYPEAgg) Flush() {
+	// If we haven't found any non-nulls for this group so far, the output for
+	// this group should be null.
+	if !a.foundNonNullForCurrentGroup {
+		a.nulls.SetNull(a.curIdx)
+	} else {
+		execgen.SET(a.col, a.curIdx, a.curAgg)
+	}
+	a.curIdx++
+}
+
 func (a *anyNotNull_TYPEAgg) HandleEmptyInputScalar() {
 	a.nulls.SetNull(0)
+}
+
+type anyNotNull_TYPEAggAlloc struct {
+	allocator *colmem.Allocator
+	allocSize int64
+	aggFuncs  []anyNotNull_TYPEAgg
+}
+
+var _ aggregateFuncAlloc = &anyNotNull_TYPEAggAlloc{}
+
+func (a *anyNotNull_TYPEAggAlloc) newAggFunc() aggregateFunc {
+	if len(a.aggFuncs) == 0 {
+		a.allocator.AdjustMemoryUsage(sizeOfAnyNotNull_TYPEAgg * a.allocSize)
+		a.aggFuncs = make([]anyNotNull_TYPEAgg, a.allocSize)
+	}
+	f := &a.aggFuncs[0]
+	f.allocator = a.allocator
+	a.aggFuncs = a.aggFuncs[1:]
+	return f
 }
 
 // {{end}}

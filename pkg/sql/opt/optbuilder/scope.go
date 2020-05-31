@@ -424,7 +424,7 @@ func (s *scope) resolveCTE(name *tree.TableName) *cteSource {
 // order to produce the desired type.
 func (s *scope) resolveType(expr tree.Expr, desired *types.T) tree.TypedExpr {
 	expr = s.walkExprTree(expr)
-	texpr, err := tree.TypeCheck(expr, s.builder.semaCtx, desired)
+	texpr, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, desired)
 	if err != nil {
 		panic(err)
 	}
@@ -443,7 +443,7 @@ func (s *scope) resolveType(expr tree.Expr, desired *types.T) tree.TypedExpr {
 // desired type.
 func (s *scope) resolveAndRequireType(expr tree.Expr, desired *types.T) tree.TypedExpr {
 	expr = s.walkExprTree(expr)
-	texpr, err := tree.TypeCheckAndRequire(expr, s.builder.semaCtx, desired, s.context.String())
+	texpr, err := tree.TypeCheckAndRequire(s.builder.ctx, expr, s.builder.semaCtx, desired, s.context.String())
 	if err != nil {
 		panic(err)
 	}
@@ -915,12 +915,12 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 			break
 		}
 
-	case *tree.ArrayFlatten:
-		if s.builder.AllowUnsupportedExpr {
-			// TODO(rytaft): Temporary fix for #24171 and #24170.
+		if isSQLFn(def) {
+			expr = s.replaceSQLFn(t, def)
 			break
 		}
 
+	case *tree.ArrayFlatten:
 		if sub, ok := t.Subquery.(*tree.Subquery); ok {
 			// Copy the ArrayFlatten expression so that the tree isn't mutated.
 			copy := *t
@@ -931,11 +931,6 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 		}
 
 	case *tree.ComparisonExpr:
-		if s.builder.AllowUnsupportedExpr {
-			// TODO(rytaft): Temporary fix for #24171 and #24170.
-			break
-		}
-
 		switch t.Operator {
 		case tree.In, tree.NotIn, tree.Any, tree.Some, tree.All:
 			if sub, ok := t.Right.(*tree.Subquery); ok {
@@ -949,11 +944,6 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 		}
 
 	case *tree.Subquery:
-		if s.builder.AllowUnsupportedExpr {
-			// TODO(rytaft): Temporary fix for #24171, #24170 and #24225.
-			return false, expr
-		}
-
 		if t.Exists {
 			expr = s.replaceSubquery(
 				t, true /* wrapInTuple */, -1 /* desiredNumColumns */, noExtraColsAllowed,
@@ -992,7 +982,7 @@ func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf 
 		tree.RejectAggregates|tree.RejectWindowApplications|tree.RejectNestedGenerators)
 
 	expr := f.Walk(s)
-	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
 	if err != nil {
 		panic(err)
 	}
@@ -1018,6 +1008,24 @@ func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf 
 	return srf
 }
 
+// isOrderedSetAggregate returns if the input function definition is an
+// ordered-set aggregate, and the overridden function definition if so.
+func isOrderedSetAggregate(def *tree.FunctionDefinition) (*tree.FunctionDefinition, bool) {
+	// The impl functions are private because they should never be run directly.
+	// Thus, they need to be marked as non-private before using them.
+	switch def {
+	case tree.FunDefs["percentile_disc"]:
+		newDef := *tree.FunDefs["percentile_disc_impl"]
+		newDef.Private = false
+		return &newDef, true
+	case tree.FunDefs["percentile_cont"]:
+		newDef := *tree.FunDefs["percentile_cont_impl"]
+		newDef.Private = false
+		return &newDef, true
+	}
+	return def, false
+}
+
 // replaceAggregate returns an aggregateInfo that can be used to replace a raw
 // aggregate function. When an aggregateInfo is encountered during the build
 // process, it is replaced with a reference to the column returned by the
@@ -1040,7 +1048,31 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 	s.builder.semaCtx.Properties.Require("aggregate",
 		tree.RejectNestedAggregates|tree.RejectWindowApplications|tree.RejectGenerators)
 
-	expr := f.Walk(s)
+	// Make a copy of f so we can modify it if needed.
+	fCopy := *f
+	// Override ordered-set aggregates to use their impl counterparts.
+	if orderedSetDef, found := isOrderedSetAggregate(def); found {
+		// Ensure that the aggregation is well formed.
+		if f.AggType != tree.OrderedSetAgg || len(f.OrderBy) != 1 {
+			panic(pgerror.Newf(
+				pgcode.InvalidFunctionDefinition,
+				"ordered-set aggregations must have a WITHIN GROUP clause containing one ORDER BY column"))
+		}
+
+		// Override function definition.
+		def = orderedSetDef
+		fCopy.Func.FunctionReference = orderedSetDef
+
+		// Copy Exprs slice.
+		oldExprs := f.Exprs
+		fCopy.Exprs = make(tree.Exprs, len(oldExprs))
+		copy(fCopy.Exprs, oldExprs)
+
+		// Add implicit column to the input expressions.
+		fCopy.Exprs = append(fCopy.Exprs, fCopy.OrderBy[0].Expr.(tree.TypedExpr))
+	}
+
+	expr := fCopy.Walk(s)
 
 	// We need to do this check here to ensure that we check the usage of special
 	// functions with the right error message.
@@ -1050,14 +1082,14 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 			defer func() { s.builder.semaCtx.Properties.Restore(oldProps) }()
 
 			s.builder.semaCtx.Properties.Require("FILTER", tree.RejectSpecial)
-			_, err := tree.TypeCheck(expr.(*tree.FuncExpr).Filter, s.builder.semaCtx, types.Any)
+			_, err := tree.TypeCheck(s.builder.ctx, expr.(*tree.FuncExpr).Filter, s.builder.semaCtx, types.Any)
 			if err != nil {
 				panic(err)
 			}
 		}()
 	}
 
-	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
 	if err != nil {
 		panic(err)
 	}
@@ -1129,7 +1161,7 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 
 	expr := fCopy.Walk(s)
 
-	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
 	if err != nil {
 		panic(err)
 	}
@@ -1199,6 +1231,40 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 
 	s.windows = append(s.windows, *info.col)
 
+	return &info
+}
+
+// replaceSQLFn replaces a tree.SQLClass function with a sqlFnInfo struct. See
+// comments above tree.SQLClass and sqlFnInfo for details.
+func (s *scope) replaceSQLFn(f *tree.FuncExpr, def *tree.FunctionDefinition) tree.Expr {
+	// We need to save and restore the previous value of the field in
+	// semaCtx in case we are recursively called within a subquery
+	// context.
+	defer s.builder.semaCtx.Properties.Restore(s.builder.semaCtx.Properties)
+
+	s.builder.semaCtx.Properties.Require("SQL function", tree.RejectSpecial)
+
+	expr := f.Walk(s)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
+	if err != nil {
+		panic(err)
+	}
+
+	f = typedFunc.(*tree.FuncExpr)
+	args := make(memo.ScalarListExpr, len(f.Exprs))
+	for i, arg := range f.Exprs {
+		args[i] = s.builder.buildScalar(arg.(tree.TypedExpr), s, nil, nil, nil)
+	}
+
+	info := sqlFnInfo{
+		FuncExpr: f,
+		def: memo.FunctionPrivate{
+			Name:       def.Name,
+			Properties: &def.FunctionProperties,
+			Overload:   f.ResolvedOverload(),
+		},
+		args: args,
+	}
 	return &info
 }
 
@@ -1318,7 +1384,8 @@ func (s *scope) replaceCount(
 			}
 			// We call TypeCheck to fill in FuncExpr internals. This is a fixed
 			// expression; we should not hit an error here.
-			if _, err := e.TypeCheck(&tree.SemaContext{}, types.Any); err != nil {
+			semaCtx := tree.MakeSemaContext()
+			if _, err := e.TypeCheck(s.builder.ctx, &semaCtx, types.Any); err != nil {
 				panic(err)
 			}
 			newDef, err := e.Func.Resolve(s.builder.semaCtx.SearchPath)

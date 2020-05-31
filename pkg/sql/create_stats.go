@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -147,7 +148,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 	var err error
 	switch t := n.Table.(type) {
 	case *tree.UnresolvedObjectName:
-		tableDesc, err = n.p.ResolveExistingObjectEx(ctx, t, true /*required*/, ResolveRequireTableDesc)
+		tableDesc, err = n.p.ResolveExistingObjectEx(ctx, t, true /*required*/, resolver.ResolveRequireTableDesc)
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +158,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
 			AvoidCached: n.p.avoidCachedDescriptors,
 		}}
-		tableDesc, err = n.p.Tables().getTableVersionByID(ctx, n.p.txn, sqlbase.ID(t.TableID), flags)
+		tableDesc, err = n.p.Tables().GetTableVersionByID(ctx, n.p.txn, sqlbase.ID(t.TableID), flags)
 		if err != nil {
 			return nil, err
 		}
@@ -216,7 +217,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 	// Evaluate the AS OF time, if any.
 	var asOf *hlc.Timestamp
 	if n.Options.AsOf.Expr != nil {
-		asOfTs, err := n.p.EvalAsOfTimestamp(n.Options.AsOf)
+		asOfTs, err := n.p.EvalAsOfTimestamp(ctx, n.Options.AsOf)
 		if err != nil {
 			return nil, err
 		}
@@ -328,7 +329,7 @@ func createStatsDefaultColumns(
 		if _, ok := requestedStats[key]; !ok && col.Type.Family() != types.JsonFamily {
 			colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
 				ColumnIDs:    colList,
-				HasHistogram: col.Type.Family() == types.BoolFamily,
+				HasHistogram: col.Type.Family() == types.BoolFamily || col.Type.Family() == types.EnumFamily,
 			})
 			nonIdxCols++
 		}
@@ -397,6 +398,10 @@ func (r *createStatsResumer) Resume(
 
 	dsp := p.DistSQLPlanner()
 	if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		// Set the transaction on the EvalContext to this txn. This allows for
+		// use of the txn during processor setup during the execution of the flow.
+		evalCtx.Txn = txn
+
 		if details.AsOf != nil {
 			p.semaCtx.AsOfTimestamp = details.AsOf
 			p.extendedEvalCtx.SetTxnTimestamp(details.AsOf.GoTime())

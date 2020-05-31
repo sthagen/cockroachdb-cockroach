@@ -72,7 +72,7 @@ func processExpression(
 
 	semaCtx.IVarContainer = h.Container()
 	// Convert to a fully typed expression.
-	typedExpr, err := tree.TypeCheck(expr, semaCtx, types.Any)
+	typedExpr, err := tree.TypeCheck(evalCtx.Context, expr, semaCtx, types.Any)
 	if err != nil {
 		// Type checking must succeed by now.
 		return nil, errors.NewAssertionErrorWithWrappedErrf(err, "%s", expr)
@@ -158,6 +158,7 @@ func (eh *ExprHelper) Init(
 	}
 	var err error
 	semaContext := tree.MakeSemaContext()
+	semaContext.TypeResolver = evalCtx.DistSQLTypeResolver
 	eh.Expr, err = processExpression(expr, evalCtx, &semaContext, &eh.Vars)
 	if err != nil {
 		return err

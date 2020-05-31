@@ -40,22 +40,23 @@ func genSortOps(wr io.Writer) error {
 		return err
 	}
 
-	s := string(d)
+	r := strings.NewReplacer(
+		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"_GOTYPESLICE", "{{.GoTypeSliceName}}",
+		"_GOTYPE", "{{.GoType}}",
+		"_TYPE", "{{.VecMethod}}",
+		"TemplateType", "{{.VecMethod}}",
 
-	s = strings.ReplaceAll(s, "_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}")
-	s = strings.ReplaceAll(s, "_TYPE_WIDTH", typeWidthReplacement)
-	s = strings.ReplaceAll(s, "_GOTYPESLICE", "{{.GoTypeSliceName}}")
-	s = strings.ReplaceAll(s, "_GOTYPE", "{{.GoType}}")
-	s = strings.ReplaceAll(s, "_TYPE", "{{.VecMethod}}")
-	s = strings.ReplaceAll(s, "TemplateType", "{{.VecMethod}}")
+		"_DIR_ENUM", "{{.Dir}}",
+		"_DIR", "{{$dir}}",
+		"_ISNULL", "{{$nulls}}",
+		"_HANDLES_NULLS", "{{if $nulls}}WithNulls{{else}}{{end}}",
+	)
+	s := r.Replace(string(d))
 
-	s = strings.ReplaceAll(s, "_DIR_ENUM", "{{.Dir}}")
-	s = strings.ReplaceAll(s, "_DIR", "{{$dir}}")
-	s = strings.ReplaceAll(s, "_ISNULL", "{{$nulls}}")
-	s = strings.ReplaceAll(s, "_HANDLES_NULLS", "{{if $nulls}}WithNulls{{else}}{{end}}")
-
-	assignLtRe := makeFunctionRegex("_ASSIGN_LT", 3)
-	s = assignLtRe.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 3))
+	assignLtRe := makeFunctionRegex("_ASSIGN_LT", 6)
+	s = assignLtRe.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 6))
 
 	s = replaceManipulationFuncs(s)
 

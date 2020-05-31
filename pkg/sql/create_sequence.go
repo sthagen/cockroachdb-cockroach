@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -82,7 +83,7 @@ func doCreateSequence(
 	opts tree.SequenceOptions,
 	jobDesc string,
 ) error {
-	id, err := GenerateUniqueDescID(params.ctx, params.p.ExecCfg().DB)
+	id, err := catalogkv.GenerateUniqueDescID(params.ctx, params.p.ExecCfg().DB, params.p.ExecCfg().Codec)
 	if err != nil {
 		return err
 	}
@@ -157,11 +158,6 @@ func (*createSequenceNode) Next(runParams) (bool, error) { return false, nil }
 func (*createSequenceNode) Values() tree.Datums          { return tree.Datums{} }
 func (*createSequenceNode) Close(context.Context)        {}
 
-const (
-	sequenceColumnID   = 1
-	sequenceColumnName = "value"
-)
-
 // MakeSequenceTableDesc creates a sequence descriptor.
 func MakeSequenceTableDesc(
 	sequenceName string,
@@ -187,25 +183,25 @@ func MakeSequenceTableDesc(
 	// Mimic a table with one column, "value".
 	desc.Columns = []sqlbase.ColumnDescriptor{
 		{
-			ID:   1,
-			Name: sequenceColumnName,
+			ID:   sqlbase.SequenceColumnID,
+			Name: sqlbase.SequenceColumnName,
 			Type: types.Int,
 		},
 	}
 	desc.PrimaryIndex = sqlbase.IndexDescriptor{
 		ID:               keys.SequenceIndexID,
 		Name:             sqlbase.PrimaryKeyIndexName,
-		ColumnIDs:        []sqlbase.ColumnID{sqlbase.ColumnID(1)},
-		ColumnNames:      []string{sequenceColumnName},
+		ColumnIDs:        []sqlbase.ColumnID{sqlbase.SequenceColumnID},
+		ColumnNames:      []string{sqlbase.SequenceColumnName},
 		ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC},
 	}
 	desc.Families = []sqlbase.ColumnFamilyDescriptor{
 		{
 			ID:              keys.SequenceColumnFamilyID,
-			ColumnIDs:       []sqlbase.ColumnID{1},
-			ColumnNames:     []string{sequenceColumnName},
+			ColumnIDs:       []sqlbase.ColumnID{sqlbase.SequenceColumnID},
+			ColumnNames:     []string{sqlbase.SequenceColumnName},
 			Name:            "primary",
-			DefaultColumnID: sequenceColumnID,
+			DefaultColumnID: sqlbase.SequenceColumnID,
 		},
 	}
 

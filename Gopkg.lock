@@ -188,11 +188,11 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:caed868e37c6cda382a217d8ad4f55da579e1a1d046836de57f11a569e383443"
+  digest = "1:82298f2aa48be0c275272f8cada5e78e2100cefd032bf13ef84a9d26c1a80d92"
   name = "github.com/andy-kimball/arenaskl"
   packages = ["."]
   pruneopts = "UT"
-  revision = "6bf06cf57626e536063e9398a57dfe1417ed0799"
+  revision = "4b42aa066e46a6900c75bf45abd9f0dbfb704c46"
 
 [[projects]]
   digest = "1:66b3310cf22cdc96c35ef84ede4f7b9b370971c4025f394c89a2638729653b11"
@@ -204,18 +204,20 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:1a148d5a83dc8e077ad6e201f723a97bc652c72ffb40294947036be0080b005c"
+  digest = "1:194f2a8fb361c7b17260b2d2df53cbad06e4f64bb1ad4d5b4fc8b3168a5bf3c7"
   name = "github.com/apache/arrow"
   packages = [
     "go/arrow",
     "go/arrow/array",
-    "go/arrow/internal/bitutil",
+    "go/arrow/bitutil",
+    "go/arrow/decimal128",
+    "go/arrow/float16",
     "go/arrow/internal/cpu",
     "go/arrow/internal/debug",
     "go/arrow/memory",
   ]
   pruneopts = "UT"
-  revision = "338c62a2a20574072fde5c478fcd42bf27a2d4b6"
+  revision = "bfb07ad1ed6447d74cfcd00682fed70ec01fbdaf"
 
 [[projects]]
   digest = "1:b39cf81d5f440b9c0757a25058432d33af867e5201109bf53621356d9dab4b73"
@@ -334,14 +336,6 @@
   version = "v2.1.1"
 
 [[projects]]
-  digest = "1:fed1f537c2f1269fe475a8556c393fe466641682d73ef8fd0491cd3aa1e47bad"
-  name = "github.com/certifi/gocertifi"
-  packages = ["."]
-  pruneopts = "UT"
-  revision = "deb3ae2ef2610fde3330947281941c562861188b"
-  version = "2018.01.18"
-
-[[projects]]
   digest = "1:848ef40f818e59905140552cc49ff3dc1a15f955e4b56d1c5c2cc4b54dbadf0c"
   name = "github.com/client9/misspell"
   packages = [
@@ -405,8 +399,8 @@
   revision = "aca09668cb243672cb82f3cbeec73b3871e13cc9"
 
 [[projects]]
-  branch = "v1.2.4-cockroach20.1"
-  digest = "1:db7275e4d3f5ee835bdbbef9ff32e6aefcd9cb24f5be9ca5cde9f4a1406400d9"
+  branch = "master"
+  digest = "1:9fc3ba4d5c7c301cd27944239be4cc8449be51546787e71442d7be9303d8d9dd"
   name = "github.com/cockroachdb/errors"
   packages = [
     ".",
@@ -429,7 +423,7 @@
     "withstack",
   ]
   pruneopts = "UT"
-  revision = "46cc0d5ac18b28dce12849e42fd1af3ecf9bcdfe"
+  revision = "489491acc69206e6ed276646bc0d6215400c0d48"
 
 [[projects]]
   digest = "1:a44e537b3e080ff297315d166956dba9607f070644a89be78b59af6c54876b64"
@@ -464,7 +458,7 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:e4f9305757fe44f0484aba1d16ea46d126c2a65d6cf238418b8920f09538fa1e"
+  digest = "1:d9384f595f479e31f06cf58a9bd8798c7f24bce19160359d494efbb5bf0b0ce7"
   name = "github.com/cockroachdb/pebble"
   packages = [
     ".",
@@ -490,7 +484,7 @@
     "vfs",
   ]
   pruneopts = "UT"
-  revision = "43f8d507aa62091533b3370120dbbe1fe300d9a3"
+  revision = "a41e4ac929214c1aaf7d152e2042f04f960f63ac"
 
 [[projects]]
   branch = "master"
@@ -499,6 +493,14 @@
   packages = ["."]
   pruneopts = "UT"
   revision = "e91bb28baf9de4a530d3ae7f041953b23dcce9be"
+
+[[projects]]
+  digest = "1:6db0e7e7c412aa14043b3e19417e58b0564588a687dd9c7557b2ca334a0325f8"
+  name = "github.com/cockroachdb/sentry-go"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "3a03c57765edff71fbf662474edb271744ca966c"
+  version = "v0.6.1-cockroachdb"
 
 [[projects]]
   branch = "master"
@@ -695,15 +697,6 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:da009be490724f12d2625817b738405854412728031d8997672643e8593791be"
-  name = "github.com/getsentry/raven-go"
-  packages = ["."]
-  pruneopts = "UT"
-  revision = "221b2b44fb33f84ed3ea13f3aed62ff48c85636b"
-  source = "https://github.com/cockroachdb/raven-go"
-
-[[projects]]
-  branch = "master"
   digest = "1:29be51c30865aef8e9246267922b1dbb10764210756472a444761b6db5e7394d"
   name = "github.com/ghemawat/stream"
   packages = ["."]
@@ -871,24 +864,23 @@
   revision = "23def4e6c14b4da8ac2ed8007337bc5eb5007998"
 
 [[projects]]
-  digest = "1:6ce94e52c5f56dfbea4e3cb99ccf4b44d701d91b16167486e9842b2fe45e717a"
+  digest = "1:59a826b72bb40d1f541f1438cfdfcea63948327478b82c72fc1349b33ddff7ca"
   name = "github.com/golang/protobuf"
   packages = [
+    "descriptor",
     "jsonpb",
     "proto",
     "protoc-gen-go/descriptor",
-    "protoc-gen-go/generator",
-    "protoc-gen-go/generator/internal/remap",
     "protoc-gen-go/plugin",
     "ptypes",
     "ptypes/any",
     "ptypes/duration",
-    "ptypes/struct",
     "ptypes/timestamp",
+    "ptypes/wrappers",
   ]
   pruneopts = "UT"
-  revision = "aa810b61a9c79d51363740d207bb46cf8e620ed5"
-  version = "v1.2.0"
+  revision = "6c66de79d66478d166c7ea05f5d2ccaf016fbd6b"
+  version = "v1.4.1"
 
 [[projects]]
   branch = "master"
@@ -997,22 +989,24 @@
   version = "v1.4.0"
 
 [[projects]]
-  digest = "1:c4a0b2286ccdfcb4575e19c2bab20d4972ba7fce2ed7cba0941c168708b96f54"
+  branch = "v1.14.5-nowarning"
+  digest = "1:a6de7f0d13a06f7e6804284b1160a2cc628bd55c948090ae6645ef51f0cfffa0"
   name = "github.com/grpc-ecosystem/grpc-gateway"
   packages = [
     "codegenerator",
+    "internal",
+    "internal/casing",
     "protoc-gen-grpc-gateway",
     "protoc-gen-grpc-gateway/descriptor",
     "protoc-gen-grpc-gateway/generator",
-    "protoc-gen-grpc-gateway/gengateway",
     "protoc-gen-grpc-gateway/httprule",
+    "protoc-gen-grpc-gateway/internal/gengateway",
     "runtime",
-    "runtime/internal",
     "utilities",
   ]
   pruneopts = "T"
-  revision = "aeab1d96e0f1368d243e2e5f526aa29d495517bb"
-  version = "v1.5.1"
+  revision = "52697fc4a24978380c5ad7b80adc795336d4dfd4"
+  source = "https://github.com/cockroachdb/grpc-gateway"
 
 [[projects]]
   branch = "master"
@@ -1182,7 +1176,7 @@
   revision = "634a59d12406abc51545000deab7cf43ebc32378"
 
 [[projects]]
-  digest = "1:e8501d7fa801be523f103178ced935b37778925c7338f0f94e50c14a4d450f4a"
+  digest = "1:2284023e6fc3d18e206abf1792f50a062155d25df6a0d104202bf060a3d3d4a1"
   name = "github.com/lib/pq"
   packages = [
     ".",
@@ -1190,7 +1184,8 @@
     "scram",
   ]
   pruneopts = "UT"
-  revision = "9eb3fc897d6fd97dd4aad3d0404b54e2f7cc56be"
+  revision = "f3b22b2cad9e4567803b7ffd9853b8acda021438"
+  version = "v1.5.2"
 
 [[projects]]
   digest = "1:078d0b47a888546a9f8810d64f76792f70b2fa564ad2bbe6dddd002c032ce7cf"
@@ -1605,10 +1600,11 @@
   version = "v1.4.0"
 
 [[projects]]
-  digest = "1:48c4d87d7cb5dac26d1654c6584019713c9e68da7b0f695dddf21a80a08e39eb"
+  digest = "1:c8fafded0eb90c84e4ef05b9e1ff2a5c8fb2aaf5009ba11b91f6bed2ef680aae"
   name = "github.com/twpayne/go-geom"
   packages = [
     ".",
+    "bigxy",
     "encoding/ewkb",
     "encoding/ewkbhex",
     "encoding/geojson",
@@ -1617,9 +1613,16 @@
     "encoding/wkbcommon",
     "encoding/wkbhex",
     "encoding/wkt",
+    "xy/internal",
+    "xy/internal/centralendpoint",
+    "xy/internal/hcoords",
+    "xy/lineintersection",
+    "xy/lineintersector",
+    "xy/orientation",
   ]
   pruneopts = "UT"
-  revision = "3402552da1eb9d7a1c8a9ecb05395b076d8e7bf6"
+  revision = "078e8ab21d838b07c627dc1d704f1f80688b1b90"
+  version = "v1.1.0"
 
 [[projects]]
   digest = "1:43e0db2b113d1aee4bb68745598c135511976a44fb380ebd701cd0c14a77c303"
@@ -1884,6 +1887,17 @@
   revision = "63859f3815cb436d25749575cb14aef1153e5634"
 
 [[projects]]
+  branch = "master"
+  digest = "1:918a46e4a2fb83df33f668f5a6bd51b2996775d073fce1800d3ec01b0a5ddd2b"
+  name = "golang.org/x/xerrors"
+  packages = [
+    ".",
+    "internal",
+  ]
+  pruneopts = "UT"
+  revision = "9bdfabe68543c54f90421aeb9a60ef8061b5b544"
+
+[[projects]]
   digest = "1:768c35ec83dd17029060ea581d6ca9fdcaef473ec87e93e4bb750949035f6070"
   name = "google.golang.org/api"
   packages = [
@@ -1924,22 +1938,26 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:a7d48ca460ca1b4f6ccd8c95502443afa05df88aee84de7dbeb667a8754e8fa6"
+  digest = "1:85ec6b7b2696fa3a7ba2c8dc5bbefd04babaed9dd4d88485acf14842d09bf08c"
   name = "google.golang.org/genproto"
   packages = [
     "googleapis/api/annotations",
+    "googleapis/api/httpbody",
     "googleapis/iam/v1",
     "googleapis/rpc/code",
     "googleapis/rpc/status",
+    "protobuf/field_mask",
   ]
   pruneopts = "UT"
   revision = "db91494dd46c1fdcbbde05e5ff5eb56df8f7d79a"
 
 [[projects]]
-  digest = "1:1bdff737fd41a4c48d06265e782e38f7fddb2610ed6877095c42763b8767d195"
+  digest = "1:da30b4e3c9b7e254e4fc081943b8c89a9d02384b5b12ed0dcd665c5873bd03bf"
   name = "google.golang.org/grpc"
   packages = [
     ".",
+    "attributes",
+    "backoff",
     "balancer",
     "balancer/base",
     "balancer/roundrobin",
@@ -1956,10 +1974,13 @@
     "internal/backoff",
     "internal/balancerload",
     "internal/binarylog",
+    "internal/buffer",
     "internal/channelz",
     "internal/envconfig",
     "internal/grpcrand",
     "internal/grpcsync",
+    "internal/resolver/dns",
+    "internal/resolver/passthrough",
     "internal/syscall",
     "internal/transport",
     "keepalive",
@@ -1967,15 +1988,60 @@
     "naming",
     "peer",
     "resolver",
-    "resolver/dns",
-    "resolver/passthrough",
+    "serviceconfig",
     "stats",
     "status",
     "tap",
   ]
   pruneopts = "UT"
-  revision = "86af7e80a3703e2400cce4ea455a9abab36bbcf8"
-  version = "v1.21.2"
+  revision = "f495f5b15ae7ccda3b38c53a1bfcde4c1a58a2bc"
+  version = "v1.27.1"
+
+[[projects]]
+  digest = "1:e5d63d9b4158ac40db2eb80386de374b285ba279ff1e5dcfb868ee7dfbe2a4e3"
+  name = "google.golang.org/protobuf"
+  packages = [
+    "encoding/protojson",
+    "encoding/prototext",
+    "encoding/protowire",
+    "internal/descfmt",
+    "internal/descopts",
+    "internal/detectknown",
+    "internal/detrand",
+    "internal/encoding/defval",
+    "internal/encoding/json",
+    "internal/encoding/messageset",
+    "internal/encoding/tag",
+    "internal/encoding/text",
+    "internal/errors",
+    "internal/fieldnum",
+    "internal/fieldsort",
+    "internal/filedesc",
+    "internal/filetype",
+    "internal/flags",
+    "internal/genname",
+    "internal/impl",
+    "internal/mapsort",
+    "internal/pragma",
+    "internal/set",
+    "internal/strs",
+    "internal/version",
+    "proto",
+    "reflect/protodesc",
+    "reflect/protoreflect",
+    "reflect/protoregistry",
+    "runtime/protoiface",
+    "runtime/protoimpl",
+    "types/descriptorpb",
+    "types/known/anypb",
+    "types/known/durationpb",
+    "types/known/timestamppb",
+    "types/known/wrapperspb",
+    "types/pluginpb",
+  ]
+  pruneopts = "UT"
+  revision = "d165be301fb1e13390ad453281ded24385fd8ebc"
+  version = "v1.23.0"
 
 [[projects]]
   branch = "v2-encoding-style"
@@ -2093,6 +2159,7 @@
     "github.com/cockroachdb/pebble/tool",
     "github.com/cockroachdb/pebble/vfs",
     "github.com/cockroachdb/returncheck",
+    "github.com/cockroachdb/sentry-go",
     "github.com/cockroachdb/stress",
     "github.com/cockroachdb/ttycolor",
     "github.com/codahale/hdrhistogram",
@@ -2111,7 +2178,6 @@
     "github.com/elastic/gosigar",
     "github.com/elazarl/go-bindata-assetfs",
     "github.com/facebookgo/clock",
-    "github.com/getsentry/raven-go",
     "github.com/ghemawat/stream",
     "github.com/go-sql-driver/mysql",
     "github.com/gogo/protobuf/jsonpb",
@@ -2126,6 +2192,7 @@
     "github.com/golang/geo/r3",
     "github.com/golang/geo/s1",
     "github.com/golang/geo/s2",
+    "github.com/golang/protobuf/descriptor",
     "github.com/golang/protobuf/proto",
     "github.com/golang/snappy",
     "github.com/google/btree",
@@ -2173,7 +2240,6 @@
     "github.com/openzipkin-contrib/zipkin-go-opentracing",
     "github.com/petermattis/goid",
     "github.com/pkg/browser",
-    "github.com/pkg/errors",
     "github.com/pmezard/go-difflib/difflib",
     "github.com/prometheus/client_golang/prometheus",
     "github.com/prometheus/client_golang/prometheus/graphite",
@@ -2201,6 +2267,7 @@
     "github.com/twpayne/go-geom/encoding/wkb",
     "github.com/twpayne/go-geom/encoding/wkbhex",
     "github.com/twpayne/go-geom/encoding/wkt",
+    "github.com/twpayne/go-geom/xy/lineintersector",
     "github.com/wadey/gocovmerge",
     "go.etcd.io/etcd/raft",
     "go.etcd.io/etcd/raft/confchange",
@@ -2268,6 +2335,7 @@
     "google.golang.org/api/iterator",
     "google.golang.org/api/option",
     "google.golang.org/grpc",
+    "google.golang.org/grpc/backoff",
     "google.golang.org/grpc/codes",
     "google.golang.org/grpc/connectivity",
     "google.golang.org/grpc/credentials",

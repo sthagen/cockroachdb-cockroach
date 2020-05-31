@@ -12,10 +12,10 @@ package tree
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strconv"
 
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -37,13 +37,13 @@ type Expr interface {
 	// sub-expressions will be guaranteed to be well-typed, meaning that the method effectively
 	// maps the Expr tree into a TypedExpr tree.
 	//
-	// The ctx parameter defines the context in which to perform type checking.
+	// The semaCtx parameter defines the context in which to perform type checking.
 	// The desired parameter hints the desired type that the method's caller wants from
 	// the resulting TypedExpr. It is not valid to call TypeCheck with a nil desired
 	// type. Instead, call it with wildcard type types.Any if no specific type is
 	// desired. This restriction is also true of most methods and functions related
 	// to type checking.
-	TypeCheck(ctx *SemaContext, desired *types.T) (TypedExpr, error)
+	TypeCheck(ctx context.Context, semaCtx *SemaContext, desired *types.T) (TypedExpr, error)
 }
 
 // TypedExpr represents a well-typed expression.
@@ -90,6 +90,8 @@ type operatorExpr interface {
 var _ operatorExpr = &AndExpr{}
 var _ operatorExpr = &OrExpr{}
 var _ operatorExpr = &NotExpr{}
+var _ operatorExpr = &IsNullExpr{}
+var _ operatorExpr = &IsNotNullExpr{}
 var _ operatorExpr = &BinaryExpr{}
 var _ operatorExpr = &UnaryExpr{}
 var _ operatorExpr = &ComparisonExpr{}
@@ -261,6 +263,64 @@ func (node *NotExpr) TypedInnerExpr() TypedExpr {
 	return node.Expr.(TypedExpr)
 }
 
+// IsNullExpr represents an IS NULL expression. This is equivalent to IS NOT
+// DISTINCT FROM NULL, except when the input is a tuple.
+type IsNullExpr struct {
+	Expr Expr
+
+	typeAnnotation
+}
+
+func (*IsNullExpr) operatorExpr() {}
+
+// Format implements the NodeFormatter interface.
+func (node *IsNullExpr) Format(ctx *FmtCtx) {
+	exprFmtWithParen(ctx, node.Expr)
+	ctx.WriteString(" IS NULL")
+}
+
+// NewTypedIsNullExpr returns a new IsNullExpr that is verified to be
+// well-typed.
+func NewTypedIsNullExpr(expr TypedExpr) *IsNullExpr {
+	node := &IsNullExpr{Expr: expr}
+	node.typ = types.Bool
+	return node
+}
+
+// TypedInnerExpr returns the IsNullExpr's inner expression as a TypedExpr.
+func (node *IsNullExpr) TypedInnerExpr() TypedExpr {
+	return node.Expr.(TypedExpr)
+}
+
+// IsNotNullExpr represents an IS NOT NULL expression. This is equivalent to IS
+// DISTINCT FROM NULL, except when the input is a tuple.
+type IsNotNullExpr struct {
+	Expr Expr
+
+	typeAnnotation
+}
+
+func (*IsNotNullExpr) operatorExpr() {}
+
+// Format implements the NodeFormatter interface.
+func (node *IsNotNullExpr) Format(ctx *FmtCtx) {
+	exprFmtWithParen(ctx, node.Expr)
+	ctx.WriteString(" IS NOT NULL")
+}
+
+// NewTypedIsNotNullExpr returns a new IsNotNullExpr that is verified to be
+// well-typed.
+func NewTypedIsNotNullExpr(expr TypedExpr) *IsNotNullExpr {
+	node := &IsNotNullExpr{Expr: expr}
+	node.typ = types.Bool
+	return node
+}
+
+// TypedInnerExpr returns the IsNotNullExpr's inner expression as a TypedExpr.
+func (node *IsNotNullExpr) TypedInnerExpr() TypedExpr {
+	return node.Expr.(TypedExpr)
+}
+
 // ParenExpr represents a parenthesized expression.
 type ParenExpr struct {
 	Expr Expr
@@ -421,9 +481,12 @@ func (*ComparisonExpr) operatorExpr() {}
 // Format implements the NodeFormatter interface.
 func (node *ComparisonExpr) Format(ctx *FmtCtx) {
 	opStr := node.Operator.String()
-	if node.Operator == IsDistinctFrom && (node.Right == DNull || node.Right == DBoolTrue || node.Right == DBoolFalse) {
+	// IS and IS NOT are equivalent to IS NOT DISTINCT FROM and IS DISTINCT
+	// FROM, respectively, when the RHS is true or false. We prefer the less
+	// verbose IS and IS NOT in those cases.
+	if node.Operator == IsDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
 		opStr = "IS NOT"
-	} else if node.Operator == IsNotDistinctFrom && (node.Right == DNull || node.Right == DBoolTrue || node.Right == DBoolFalse) {
+	} else if node.Operator == IsNotDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
 		opStr = "IS"
 	}
 	if node.Operator.hasSubOperator() {
@@ -629,7 +692,7 @@ func (node *IsOfTypeExpr) Format(ctx *FmtCtx) {
 		if i > 0 {
 			ctx.WriteString(", ")
 		}
-		ctx.Buffer.WriteString(t.SQLString())
+		ctx.FormatTypeReference(t)
 	}
 	ctx.WriteByte(')')
 }
@@ -999,6 +1062,42 @@ func (node *Subquery) Format(ctx *FmtCtx) {
 	}
 }
 
+// TypedDummy is a dummy expression that represents a dummy value with
+// a specified type. It can be used in situations where TypedExprs of a
+// particular type are required for semantic analysis.
+type TypedDummy struct {
+	Typ *types.T
+}
+
+func (node *TypedDummy) String() string {
+	return AsString(node)
+}
+
+// Format implements the NodeFormatter interface.
+func (node *TypedDummy) Format(ctx *FmtCtx) {
+	ctx.WriteString("dummyvalof(")
+	ctx.FormatTypeReference(node.Typ)
+	ctx.WriteString(")")
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (node *TypedDummy) ResolvedType() *types.T {
+	return node.Typ
+}
+
+// TypeCheck implements the Expr interface.
+func (node *TypedDummy) TypeCheck(context.Context, *SemaContext, *types.T) (TypedExpr, error) {
+	return node, nil
+}
+
+// Walk implements the Expr interface.
+func (node *TypedDummy) Walk(Visitor) Expr { return node }
+
+// Eval implements the TypedExpr interface.
+func (node *TypedDummy) Eval(*EvalContext) (Datum, error) {
+	return nil, errors.AssertionFailedf("should not eval typed dummy")
+}
+
 // BinaryOperator represents a binary operator.
 type BinaryOperator int
 
@@ -1091,7 +1190,7 @@ type BinaryExpr struct {
 	Left, Right Expr
 
 	typeAnnotation
-	fn *BinOp
+	Fn *BinOp
 }
 
 // TypedLeft returns the BinaryExpr's left expression as a TypedExpr.
@@ -1107,7 +1206,7 @@ func (node *BinaryExpr) TypedRight() TypedExpr {
 // ResolvedBinOp returns the resolved binary op overload; can only be called
 // after Resolve (which happens during TypeCheck).
 func (node *BinaryExpr) ResolvedBinOp() *BinOp {
-	return node.fn
+	return node.Fn
 }
 
 // NewTypedBinaryExpr returns a new BinaryExpr that is well-typed.
@@ -1127,7 +1226,7 @@ func (node *BinaryExpr) memoizeFn() {
 		panic(errors.AssertionFailedf("lookup for BinaryExpr %s's BinOp failed",
 			AsStringWithFlags(node, FmtShowTypes)))
 	}
-	node.fn = fn
+	node.Fn = fn
 }
 
 // newBinExprIfValidOverload constructs a new BinaryExpr if and only
@@ -1141,7 +1240,7 @@ func newBinExprIfValidOverload(op BinaryOperator, left TypedExpr, right TypedExp
 			Operator: op,
 			Left:     left,
 			Right:    right,
-			fn:       fn,
+			Fn:       fn,
 		}
 		expr.typ = returnTypeToFixedType(fn.returnType())
 		return expr
@@ -1241,9 +1340,12 @@ type FuncExpr struct {
 	Filter    Expr
 	WindowDef *WindowDef
 
-	// OrderBy is used for aggregations that specify an order:
-	// array_agg(col1 ORDER BY col2)
+	// AggType is used to specify the type of aggregation.
+	AggType AggType
+	// OrderBy is used for aggregations which specify an order. This same field
+	// is used for any type of aggregation.
 	OrderBy OrderBy
+
 	typeAnnotation
 	fnProps *FunctionProperties
 	fn      *Overload
@@ -1324,6 +1426,20 @@ var funcTypeName = [...]string{
 	AllFuncType:      "ALL",
 }
 
+// AggType specifies the type of aggregation.
+type AggType int
+
+// FuncExpr.AggType
+const (
+	_ AggType = iota
+	// GeneralAgg is used for general-purpose aggregate functions.
+	// array_agg(col1 ORDER BY col2)
+	GeneralAgg
+	// OrderedSetAgg is used for ordered-set aggregate functions.
+	// percentile_disc(fraction) WITHIN GROUP (ORDER BY col1)
+	OrderedSetAgg
+)
+
 // Format implements the NodeFormatter interface.
 func (node *FuncExpr) Format(ctx *FmtCtx) {
 	var typ string
@@ -1340,7 +1456,7 @@ func (node *FuncExpr) Format(ctx *FmtCtx) {
 	ctx.WriteByte('(')
 	ctx.WriteString(typ)
 	ctx.FormatNode(&node.Exprs)
-	if len(node.OrderBy) > 0 {
+	if node.AggType == GeneralAgg && len(node.OrderBy) > 0 {
 		ctx.WriteByte(' ')
 		ctx.FormatNode(&node.OrderBy)
 	}
@@ -1355,6 +1471,11 @@ func (node *FuncExpr) Format(ctx *FmtCtx) {
 				ctx.Buffer.WriteString(node.typ.SQLString())
 			}
 		}
+	}
+	if node.AggType == OrderedSetAgg && len(node.OrderBy) > 0 {
+		ctx.WriteString(" WITHIN GROUP (")
+		ctx.FormatNode(&node.OrderBy)
+		ctx.WriteString(")")
 	}
 	if node.Filter != nil {
 		ctx.WriteString(" FILTER (WHERE ")
@@ -1448,7 +1569,7 @@ func (node *CastExpr) Format(ctx *FmtCtx) {
 		// with string constants; if the underlying expression was changed, we fall
 		// back to the short syntax.
 		if _, ok := node.Expr.(*StrVal); ok {
-			ctx.WriteString(node.Type.SQLString())
+			ctx.FormatTypeReference(node.Type)
 			ctx.WriteByte(' ')
 			ctx.FormatNode(node.Expr)
 			break
@@ -1457,7 +1578,7 @@ func (node *CastExpr) Format(ctx *FmtCtx) {
 	case CastShort:
 		exprFmtWithParen(ctx, node.Expr)
 		ctx.WriteString("::")
-		ctx.WriteString(node.Type.SQLString())
+		ctx.FormatTypeReference(node.Type)
 	default:
 		ctx.WriteString("CAST(")
 		ctx.FormatNode(node.Expr)
@@ -1476,7 +1597,7 @@ func (node *CastExpr) Format(ctx *FmtCtx) {
 			ctx.WriteString(") COLLATE ")
 			lex.EncodeLocaleName(&ctx.Buffer, typ.Locale())
 		} else {
-			ctx.WriteString(node.Type.SQLString())
+			ctx.FormatTypeReference(node.Type)
 			ctx.WriteByte(')')
 		}
 	}
@@ -1487,90 +1608,6 @@ func NewTypedCastExpr(expr TypedExpr, typ *types.T) *CastExpr {
 	node := &CastExpr{Expr: expr, Type: typ, SyntaxMode: CastShort}
 	node.typ = typ
 	return node
-}
-
-type castInfo struct {
-	fromT   *types.T
-	counter telemetry.Counter
-}
-
-var (
-	bitArrayCastTypes = annotateCast(types.VarBit, []*types.T{types.Unknown, types.VarBit, types.Int, types.String, types.AnyCollatedString})
-	boolCastTypes     = annotateCast(types.Bool, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString})
-	intCastTypes      = annotateCast(types.Int, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
-		types.Timestamp, types.TimestampTZ, types.Date, types.Interval, types.Oid, types.VarBit})
-	floatCastTypes = annotateCast(types.Float, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
-		types.Timestamp, types.TimestampTZ, types.Date, types.Interval})
-	geographyCastTypes = annotateCast(types.Geography, []*types.T{types.Unknown, types.String, types.Geography, types.Geometry})
-	geometryCastTypes  = annotateCast(types.Geometry, []*types.T{types.Unknown, types.String, types.Geography, types.Geometry})
-	decimalCastTypes   = annotateCast(types.Decimal, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
-		types.Timestamp, types.TimestampTZ, types.Date, types.Interval})
-	stringCastTypes = annotateCast(types.String, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
-		types.VarBit,
-		types.AnyArray, types.AnyTuple,
-		types.Geometry, types.Geography,
-		types.Bytes, types.Timestamp, types.TimestampTZ, types.Interval, types.Uuid, types.Date, types.Time, types.TimeTZ, types.Oid, types.INet, types.Jsonb, types.AnyEnum})
-	bytesCastTypes = annotateCast(types.Bytes, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Bytes, types.Uuid})
-	dateCastTypes  = annotateCast(types.Date, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Date, types.Timestamp, types.TimestampTZ, types.Int})
-	timeCastTypes  = annotateCast(types.Time, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Time, types.TimeTZ,
-		types.Timestamp, types.TimestampTZ, types.Interval})
-	timeTZCastTypes    = annotateCast(types.TimeTZ, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Time, types.TimeTZ, types.TimestampTZ})
-	timestampCastTypes = annotateCast(types.Timestamp, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Date, types.Timestamp, types.TimestampTZ, types.Int})
-	intervalCastTypes  = annotateCast(types.Interval, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Int, types.Time, types.Interval, types.Float, types.Decimal})
-	oidCastTypes       = annotateCast(types.Oid, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Int, types.Oid})
-	uuidCastTypes      = annotateCast(types.Uuid, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Bytes, types.Uuid})
-	inetCastTypes      = annotateCast(types.INet, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.INet})
-	arrayCastTypes     = annotateCast(types.AnyArray, []*types.T{types.Unknown, types.String})
-	jsonCastTypes      = annotateCast(types.Jsonb, []*types.T{types.Unknown, types.String, types.Jsonb})
-	enumCastTypes      = annotateCast(types.AnyEnum, []*types.T{types.Unknown, types.String, types.AnyEnum})
-)
-
-// validCastTypes returns a set of types that can be cast into the provided type.
-func validCastTypes(t *types.T) []castInfo {
-	switch t.Family() {
-	case types.BitFamily:
-		return bitArrayCastTypes
-	case types.BoolFamily:
-		return boolCastTypes
-	case types.IntFamily:
-		return intCastTypes
-	case types.FloatFamily:
-		return floatCastTypes
-	case types.DecimalFamily:
-		return decimalCastTypes
-	case types.StringFamily, types.CollatedStringFamily:
-		return stringCastTypes
-	case types.BytesFamily:
-		return bytesCastTypes
-	case types.DateFamily:
-		return dateCastTypes
-	case types.GeographyFamily:
-		return geographyCastTypes
-	case types.GeometryFamily:
-		return geometryCastTypes
-	case types.TimeFamily:
-		return timeCastTypes
-	case types.TimeTZFamily:
-		return timeTZCastTypes
-	case types.TimestampFamily, types.TimestampTZFamily:
-		return timestampCastTypes
-	case types.IntervalFamily:
-		return intervalCastTypes
-	case types.JsonFamily:
-		return jsonCastTypes
-	case types.UuidFamily:
-		return uuidCastTypes
-	case types.INetFamily:
-		return inetCastTypes
-	case types.OidFamily:
-		return oidCastTypes
-	case types.ArrayFamily:
-		return arrayCastTypes
-	case types.EnumFamily:
-		return enumCastTypes
-	default:
-		return nil
-	}
 }
 
 // ArraySubscripts represents a sequence of one or more array subscripts.
@@ -1622,7 +1659,7 @@ func (node *AnnotateTypeExpr) Format(ctx *FmtCtx) {
 			case types.StringFamily, types.CollatedStringFamily:
 				// Postgres formats strings using a cast afterward. Let's do the same.
 				ctx.WriteString("::")
-				ctx.WriteString(node.Type.SQLString())
+				ctx.WriteString(typ.SQLString())
 			}
 		}
 		return
@@ -1631,13 +1668,13 @@ func (node *AnnotateTypeExpr) Format(ctx *FmtCtx) {
 	case AnnotateShort:
 		exprFmtWithParen(ctx, node.Expr)
 		ctx.WriteString(":::")
-		ctx.WriteString(node.Type.SQLString())
+		ctx.FormatTypeReference(node.Type)
 
 	default:
 		ctx.WriteString("ANNOTATE_TYPE(")
 		ctx.FormatNode(node.Expr)
 		ctx.WriteString(", ")
-		ctx.WriteString(node.Type.SQLString())
+		ctx.FormatTypeReference(node.Type)
 		ctx.WriteByte(')')
 	}
 }
@@ -1774,6 +1811,8 @@ func (node *IsOfTypeExpr) String() string     { return AsString(node) }
 func (node *Name) String() string             { return AsString(node) }
 func (node *UnrestrictedName) String() string { return AsString(node) }
 func (node *NotExpr) String() string          { return AsString(node) }
+func (node *IsNullExpr) String() string       { return AsString(node) }
+func (node *IsNotNullExpr) String() string    { return AsString(node) }
 func (node *NullIfExpr) String() string       { return AsString(node) }
 func (node *NumVal) String() string           { return AsString(node) }
 func (node *OrExpr) String() string           { return AsString(node) }

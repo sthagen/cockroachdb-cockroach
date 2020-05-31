@@ -66,22 +66,18 @@ $input
 (Limit
     (Offset
         $input:*
-        (Const $offset:* & (IsPositiveLimit $offset))
+        $offsetExpr:(Const $offset:* & (IsPositiveInt $offset))
         $offsetOrdering:*
     )
-    (Const $limit:* & (IsPositiveLimit $limit))
+    (Const $limit:* & (IsPositiveInt $limit))
     $limitOrdering:* &
         (IsSameOrdering $offsetOrdering $limitOrdering) &
         (CanAddConstInts $limit $offset)
 )
 =>
 (Offset
-    (Limit
-        $input
-        (Const (AddConstInts $offset $limit))
-        $limitOrdering
-    )
-    (Const $offset)
+    (Limit $input (AddConstInts $offset $limit) $limitOrdering)
+    $offsetExpr
     $offsetOrdering
 )
 
@@ -132,8 +128,8 @@ $input
 [PushLimitIntoLeftJoin, Normalize]
 (Limit
     $input:(LeftJoin $left:* $right:* $on:* $private:*)
-    (Const $limit:*) &
-        (IsPositiveLimit $limit) &
+    $limitExpr:(Const $limit:*) &
+        (IsPositiveInt $limit) &
         ^(LimitGeMaxRows $limit $left)
     $ordering:* & (HasColsInOrdering $left $ordering)
 )
@@ -142,13 +138,13 @@ $input
     (LeftJoin
         (Limit
             $left
-            (Const $limit)
+            $limitExpr
             (PruneOrdering $ordering (OutputCols $left))
         )
         $right
         $on
         $private
     )
-    (Const $limit)
+    $limitExpr
     $ordering
 )

@@ -595,11 +595,6 @@ func (tt *Table) IsVirtualTable() bool {
 	return tt.IsVirtual
 }
 
-// IsInterleaved is part of the cat.Table interface.
-func (tt *Table) IsInterleaved() bool {
-	return false
-}
-
 // ColumnCount is part of the cat.Table interface.
 func (tt *Table) ColumnCount() int {
 	return len(tt.Columns) - tt.writeOnlyColCount - tt.deleteOnlyColCount
@@ -802,6 +797,7 @@ func (ti *Index) Span() roachpb.Span {
 
 // PartitionByListPrefixes is part of the cat.Index interface.
 func (ti *Index) PartitionByListPrefixes() []tree.Datums {
+	ctx := context.Background()
 	p := ti.partitionBy
 	if p == nil {
 		return nil
@@ -840,7 +836,7 @@ func (ti *Index) PartitionByListPrefixes() []tree.Datums {
 			d := make(tree.Datums, len(vals))
 			for i := range vals {
 				c := tree.CastExpr{Expr: vals[i], Type: ti.Columns[i].DatumType()}
-				cTyped, err := c.TypeCheck(&semaCtx, nil)
+				cTyped, err := c.TypeCheck(ctx, &semaCtx, nil)
 				if err != nil {
 					panic(err)
 				}
@@ -858,6 +854,26 @@ func (ti *Index) PartitionByListPrefixes() []tree.Datums {
 		}
 	}
 	return res
+}
+
+// InterleaveAncestorCount is part of the cat.Index interface.
+func (ti *Index) InterleaveAncestorCount() int {
+	return 0
+}
+
+// InterleaveAncestor is part of the cat.Index interface.
+func (ti *Index) InterleaveAncestor(i int) (table, index cat.StableID, numKeyCols int) {
+	panic("no interleavings")
+}
+
+// InterleavedByCount is part of the cat.Index interface.
+func (ti *Index) InterleavedByCount() int {
+	return 0
+}
+
+// InterleavedBy is part of the cat.Index interface.
+func (ti *Index) InterleavedBy(i int) (table, index cat.StableID) {
+	panic("no interleavings")
 }
 
 // Column implements the cat.Column interface for testing purposes.

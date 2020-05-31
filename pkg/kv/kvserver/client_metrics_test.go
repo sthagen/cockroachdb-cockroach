@@ -15,16 +15,21 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -124,7 +129,7 @@ func verifyStats(t *testing.T, mtc *multiTestContext, storeIdxSlice ...int) {
 }
 
 func verifyRocksDBStats(t *testing.T, s *kvserver.Store) {
-	if err := s.ComputeMetrics(context.TODO(), 0); err != nil {
+	if err := s.ComputeMetrics(context.Background(), 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -284,7 +289,7 @@ func TestStoreMetrics(t *testing.T) {
 
 	// Add some data to the "right" range.
 	dataKey := []byte("z")
-	if _, err := mtc.dbs[0].Inc(context.TODO(), dataKey, 5); err != nil {
+	if _, err := mtc.dbs[0].Inc(context.Background(), dataKey, 5); err != nil {
 		t.Fatal(err)
 	}
 	mtc.waitForValues(roachpb.Key("z"), []int64{5, 5, 5})
@@ -293,7 +298,7 @@ func TestStoreMetrics(t *testing.T) {
 	verifyStats(t, mtc, 0, 1, 2)
 
 	// Create a transaction statement that fails. Regression test for #4969.
-	if err := mtc.dbs[0].Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := mtc.dbs[0].Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		b := txn.NewBatch()
 		var expVal roachpb.Value
 		expVal.SetInt(6)
@@ -310,7 +315,7 @@ func TestStoreMetrics(t *testing.T) {
 	// Unreplicate range from the first store.
 	testutils.SucceedsSoon(t, func() error {
 		// This statement can fail if store 0 is not the leaseholder.
-		if err := mtc.transferLeaseNonFatal(context.TODO(), replica.RangeID, 0, 1); err != nil {
+		if err := mtc.transferLeaseNonFatal(context.Background(), replica.RangeID, 0, 1); err != nil {
 			t.Log(err)
 		}
 		// This statement will fail if store 0 IS the leaseholder. This can happen
@@ -332,4 +337,62 @@ func TestStoreMetrics(t *testing.T) {
 
 	verifyRocksDBStats(t, mtc.stores[0])
 	verifyRocksDBStats(t, mtc.stores[1])
+}
+
+// TestStoreMaxBehindNanosOnlyTracksEpochBasedLeases ensures that the metric
+// ClosedTimestampMaxBehindNanos does not follow the start time of expiration
+// based leases. Expiration based leases don't publish closed timestamps.
+func TestStoreMaxBehindNanosOnlyTracksEpochBasedLeases(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			// Set a long timeout so that no lease or liveness ever times out.
+			RaftConfig: base.RaftConfig{RaftElectionTimeoutTicks: 100},
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	// We want to choose setting values such that this test doesn't take too long
+	// with the caveat that under extreme stress, we need to make sure that the
+	// subsystem remains live.
+	const closedTimestampDuration = 15 * time.Millisecond
+	const closedTimestampFraction = 1
+	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = $1",
+		closedTimestampDuration.String())
+	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.close_fraction = $1",
+		closedTimestampFraction)
+
+	// Let's get to a point where we know that we have an expiration based lease
+	// with a start time more than some time ago and then we have a max closed
+	// value more recent.
+	_, meta2Repl1 := getFirstStoreReplica(t, tc.Server(0), keys.Meta2Prefix)
+
+	// Transfer the lease for the meta range to ensure that it has a non-zero
+	// start time.
+	require.NoError(t, tc.TransferRangeLease(*meta2Repl1.Desc(), tc.Target(1)))
+
+	testutils.SucceedsSoon(t, func() error {
+		_, metaRepl := getFirstStoreReplica(t, tc.Server(1), keys.Meta2Prefix)
+		l, _ := metaRepl.GetLease()
+		if l.Start == (hlc.Timestamp{}) {
+			return errors.Errorf("don't have a lease for meta1 yet: %v %v", l, meta2Repl1)
+		}
+		sinceExpBasedLeaseStart := timeutil.Since(timeutil.Unix(0, l.Start.WallTime))
+		for i := 0; i < tc.NumServers(); i++ {
+			s, _ := getFirstStoreReplica(t, tc.Server(i), keys.Meta1Prefix)
+			require.NoError(t, s.ComputeMetrics(ctx, 0))
+			maxBehind := time.Duration(s.Metrics().ClosedTimestampMaxBehindNanos.Value())
+			// We want to make sure that maxBehind ends up being much smaller than the
+			// start of an expiration based lease.
+			const behindMultiple = 5
+			if maxBehind*behindMultiple > sinceExpBasedLeaseStart {
+				return errors.Errorf("store %v has a ClosedTimestampMaxBehindNanos"+
+					" of %v which is not way less than the an expiration-based lease start, %v",
+					s.StoreID(), maxBehind, sinceExpBasedLeaseStart)
+			}
+		}
+		return nil
+	})
 }

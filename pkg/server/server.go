@@ -57,6 +57,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/gcjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -78,7 +79,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	raven "github.com/getsentry/raven-go"
+	"github.com/cockroachdb/sentry-go"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/opentracing/opentracing-go"
 	"google.golang.org/grpc"
@@ -381,7 +382,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// This function defines how ExternalStorage objects are created.
 	externalStorage := func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
 		return cloud.MakeExternalStorage(
-			ctx, dest, cfg.ExternalIOConfig, st,
+			ctx, dest, cfg.ExternalIODirConfig, st,
 			blobs.NewBlobClientFactory(
 				nodeIDContainer.Get(),
 				nodeDialer,
@@ -391,7 +392,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	externalStorageFromURI := func(ctx context.Context, uri string) (cloud.ExternalStorage, error) {
 		return cloud.ExternalStorageFromURI(
-			ctx, uri, cfg.ExternalIOConfig, st,
+			ctx, uri, cfg.ExternalIODirConfig, st,
 			blobs.NewBlobClientFactory(
 				nodeIDContainer.Get(),
 				nodeDialer,
@@ -428,7 +429,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		ScanInterval:            cfg.ScanInterval,
 		ScanMinIdleTime:         cfg.ScanMinIdleTime,
 		ScanMaxIdleTime:         cfg.ScanMaxIdleTime,
-		TimestampCachePageSize:  cfg.TimestampCachePageSize,
 		HistogramWindowInterval: cfg.HistogramWindowInterval(),
 		StorePool:               storePool,
 		SQLExecutor:             internalExecutor,
@@ -521,12 +521,20 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		gw.RegisterService(grpcServer.Server)
 	}
 
+	var jobAdoptionStopFile string
+	for _, spec := range cfg.Stores.Specs {
+		if !spec.InMemory && spec.Path != "" {
+			jobAdoptionStopFile = filepath.Join(spec.Path, jobs.PreventAdoptionFile)
+			break
+		}
+	}
+
 	sqlServer, err := newSQLServer(ctx, sqlServerArgs{
 		sqlServerOptionalArgs: sqlServerOptionalArgs{
 			rpcContext:             rpcContext,
 			distSender:             distSender,
 			statusServer:           serverpb.MakeOptionalStatusServer(sStatus),
-			nodeLiveness:           nodeLiveness,
+			nodeLiveness:           sqlbase.MakeOptionalNodeLiveness(nodeLiveness),
 			gossip:                 gossip.MakeExposedGossip(g),
 			nodeDialer:             nodeDialer,
 			grpcServer:             grpcServer.Server,
@@ -536,7 +544,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			externalStorageFromURI: externalStorageFromURI,
 			isMeta1Leaseholder:     node.stores.IsMeta1Leaseholder,
 		},
-		Config:                   &cfg, // NB: s.cfg has a populated AmbientContext.
+		SQLConfig:                &cfg.SQLConfig,
+		BaseConfig:               &cfg.BaseConfig,
 		stopper:                  stopper,
 		clock:                    clock,
 		runtime:                  runtimeSampler,
@@ -546,6 +555,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		sessionRegistry:          sessionRegistry,
 		circularInternalExecutor: internalExecutor,
 		jobRegistry:              jobRegistry,
+		jobAdoptionStopFile:      jobAdoptionStopFile,
 		protectedtsProvider:      protectedtsProvider,
 	})
 	if err != nil {
@@ -1195,6 +1205,7 @@ func (s *Server) Start(ctx context.Context) error {
 		if storeSpec.InMemory {
 			continue
 		}
+
 		for name, val := range listenerFiles {
 			file := filepath.Join(storeSpec.Path, name)
 			if err := ioutil.WriteFile(file, []byte(val), 0644); err != nil {
@@ -1217,36 +1228,18 @@ func (s *Server) Start(ctx context.Context) error {
 		defer time.AfterFunc(30*time.Second, s.cfg.DelayedBootstrapFn).Stop()
 	}
 
-	// The start cli command wants to print helpful information if it looks as
-	// though this node didn't immediately manage to connect to the cluster.
-	// This isn't the prettiest way to achieve this, but it gets the job done.
-	//
-	//
-	// TODO(tbg): we should avoid this when the node is bootstrapped.
-	// Unfortunately this knowledge is nicely encapsulated away in ServeAndWait.
-	// Perhaps that method should be split up.
-	haveStateCh := make(chan struct{})
-	if s.cfg.ReadyFn != nil {
-		_ = s.stopper.RunAsyncTask(ctx, "signal-readiness", func(ctx context.Context) {
-			waitForInit := true
-			tm := time.After(2 * time.Second)
-			select {
-			case <-haveStateCh:
-				waitForInit = false
-			case <-tm:
-			case <-ctx.Done():
-				return
-			case <-s.stopper.ShouldQuiesce():
-				return
-			}
-			s.cfg.ReadyFn(waitForInit)
-		})
-	}
-
-	if len(s.cfg.GossipBootstrapResolvers) == 0 {
-		// If the node is started without join flags, attempt self-bootstrap.
-		// Note that we're not checking whether the node is already bootstrapped;
-		// if this is the case, Bootstrap will simply fail.
+	// Set up calling s.cfg.ReadyFn at the right time. Essentially, this call
+	// determines when `./cockroach [...] --background` returns. For any initialized
+	// nodes (i.e. already part of a cluster) this is when this method returns
+	// (assuming there's no error). For nodes that need to join a cluster, we
+	// return once the initServer is ready to accept requests.
+	var onSuccessfulReturnFn, onInitServerReady func()
+	selfBootstrap := initServer.NeedsInit() && len(s.cfg.GossipBootstrapResolvers) == 0
+	if selfBootstrap {
+		// If a new node is started without join flags, self-bootstrap.
+		//
+		// Note: this is behavior slated for removal, see:
+		// https://github.com/cockroachdb/cockroach/pull/44112
 		_, err := initServer.Bootstrap(ctx, &serverpb.BootstrapRequest{})
 		switch {
 		case err == nil:
@@ -1256,15 +1249,30 @@ func (s *Server) Start(ctx context.Context) error {
 			// Process is shutting down.
 		}
 	}
+	{
+		readyFn := func(bool) {}
+		if s.cfg.ReadyFn != nil {
+			readyFn = s.cfg.ReadyFn
+		}
+		if !initServer.NeedsInit() || selfBootstrap {
+			onSuccessfulReturnFn = func() { readyFn(false /* waitForInit */) }
+			onInitServerReady = func() {}
+		} else {
+			onSuccessfulReturnFn = func() {}
+			onInitServerReady = func() { readyFn(true /* waitForInit */) }
+		}
+	}
 
-	// This opens the main listener.
+	// This opens the main listener. When the listener is open, we can call
+	// initServerReadyFn since any request initated to the initServer at that
+	// point will reach it once ServeAndWait starts handling the queue of incoming
+	// connections.
 	startRPCServer(workersCtx)
-
+	onInitServerReady()
 	state, err := initServer.ServeAndWait(ctx, s.stopper, &s.cfg.Settings.SV, s.gossip)
 	if err != nil {
 		return errors.Wrap(err, "during init")
 	}
-	close(haveStateCh)
 
 	s.rpcContext.ClusterID.Set(ctx, state.clusterID)
 	// If there's no NodeID here, then we didn't just bootstrap. The Node will
@@ -1350,6 +1358,8 @@ func (s *Server) Start(ctx context.Context) error {
 	// TODO(tbg): clarify the contract here and move closer to usage if possible.
 	orphanedLeasesTimeThresholdNanos := s.clock.Now().WallTime
 
+	onSuccessfulReturnFn()
+
 	// Now that we have a monotonic HLC wrt previous incarnations of the process,
 	// init all the replicas. At this point *some* store has been bootstrapped or
 	// we're joining an existing cluster for the first time.
@@ -1381,24 +1391,26 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.refreshSettings()
 
-	raven.SetTagsContext(map[string]string{
-		"cluster":     s.ClusterID().String(),
-		"node":        s.NodeID().String(),
-		"server_id":   fmt.Sprintf("%s-%s", s.ClusterID().Short(), s.NodeID()),
-		"engine_type": s.cfg.StorageEngine.String(),
+	sentry.ConfigureScope(func(scope *sentry.Scope) {
+		scope.SetTags(map[string]string{
+			"cluster":     s.ClusterID().String(),
+			"node":        s.NodeID().String(),
+			"server_id":   fmt.Sprintf("%s-%s", s.ClusterID().Short(), s.NodeID()),
+			"engine_type": s.cfg.StorageEngine.String(),
+		})
 	})
 
 	// We can now add the node registry.
 	s.recorder.AddNode(s.registry, s.node.Descriptor, s.node.startedAt, s.cfg.AdvertiseAddr, s.cfg.HTTPAdvertiseAddr, s.cfg.SQLAdvertiseAddr)
 
 	// Begin recording runtime statistics.
-	if err := s.startSampleEnvironment(ctx, DefaultMetricsSampleInterval); err != nil {
+	if err := s.startSampleEnvironment(ctx, base.DefaultMetricsSampleInterval); err != nil {
 		return err
 	}
 
 	// Begin recording time series data collected by the status monitor.
 	s.tsDB.PollSource(
-		s.cfg.AmbientCtx, s.recorder, DefaultMetricsSampleInterval, ts.Resolution10s, s.stopper,
+		s.cfg.AmbientCtx, s.recorder, base.DefaultMetricsSampleInterval, ts.Resolution10s, s.stopper,
 	)
 
 	var graphiteOnce sync.Once
@@ -1456,7 +1468,7 @@ func (s *Server) Start(ctx context.Context) error {
 	})
 
 	// Begin recording status summaries.
-	s.node.startWriteNodeStatus(DefaultMetricsSampleInterval)
+	s.node.startWriteNodeStatus(base.DefaultMetricsSampleInterval)
 
 	// Start the protected timestamp subsystem.
 	if err := s.protectedtsProvider.Start(ctx, s.stopper); err != nil {
@@ -1554,8 +1566,11 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 
-	log.Event(ctx, "server ready")
+	if err := s.debug.RegisterEngines(s.cfg.Stores.Specs, s.engines); err != nil {
+		return errors.Wrapf(err, "failed to register engines with debug server")
+	}
 
+	log.Event(ctx, "server ready")
 	return nil
 }
 

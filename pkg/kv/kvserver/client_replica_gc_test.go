@@ -21,7 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -67,7 +67,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	cfg := kvserver.TestStoreConfig(nil)
 	mtc.storeConfig = &cfg
 	mtc.storeConfig.TestingKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs storagebase.FilterArgs) *roachpb.Error {
+		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
 			et, ok := filterArgs.Req.(*roachpb.EndTxnRequest)
 			if !ok || filterArgs.Sid != 2 {
 				return nil
@@ -177,7 +177,7 @@ func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
 	mtc.stores[1].SetReplicaGCQueueActive(true)
 
 	// Increment the clock's timestamp to make the replica GC queue process the range.
-	mtc.advanceClock(context.TODO())
+	mtc.advanceClock(context.Background())
 	mtc.manualClock.Increment(int64(kvserver.ReplicaGCQueueInactivityThreshold + 1))
 
 	// Make sure the range is removed from the store.

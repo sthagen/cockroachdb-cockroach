@@ -30,6 +30,7 @@ type Materializer struct {
 	NonExplainable
 
 	input colexecbase.Operator
+	typs  []*types.T
 
 	da sqlbase.DatumAlloc
 
@@ -40,6 +41,10 @@ type Materializer struct {
 	curIdx int
 	// batch is the current Batch the Materializer is processing.
 	batch coldata.Batch
+	// colvecs is the unwrapped batch.
+	colvecs []coldata.Vec
+	// sel is the selection vector on the batch.
+	sel []int
 
 	// row is the memory used for the output row.
 	row sqlbase.EncDatumRow
@@ -74,12 +79,13 @@ const materializerProcName = "materializer"
 // the context of the flow (i.e. it is Flow.ctxCancel). It should only be
 // non-nil in case of a root Materializer (i.e. not when we're wrapping a row
 // source).
+// NOTE: the constructor does *not* take in an execinfrapb.PostProcessSpec
+// because we expect input to handle that for us.
 func NewMaterializer(
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	input colexecbase.Operator,
 	typs []*types.T,
-	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 	metadataSourcesQueue []execinfrapb.MetadataSource,
 	toClose []IdempotentCloser,
@@ -88,13 +94,16 @@ func NewMaterializer(
 ) (*Materializer, error) {
 	m := &Materializer{
 		input:   input,
+		typs:    typs,
 		row:     make(sqlbase.EncDatumRow, len(typs)),
 		closers: toClose,
 	}
 
 	if err := m.ProcessorBase.Init(
 		m,
-		post,
+		// input must have handled any post-processing itself, so we pass in
+		// an empty post-processing spec.
+		&execinfrapb.PostProcessSpec{},
 		typs,
 		flowCtx,
 		processorID,
@@ -161,21 +170,22 @@ func (m *Materializer) next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadat
 				return nil, m.DrainHelper()
 			}
 			m.curIdx = 0
+			m.colvecs = m.batch.ColVecs()
+			m.sel = m.batch.Selection()
 		}
-		sel := m.batch.Selection()
-
 		rowIdx := m.curIdx
-		if sel != nil {
-			rowIdx = sel[m.curIdx]
+		if m.sel != nil {
+			rowIdx = m.sel[m.curIdx]
 		}
 		m.curIdx++
 
-		typs := m.OutputTypes()
-		for colIdx := 0; colIdx < len(typs); colIdx++ {
-			col := m.batch.ColVec(colIdx)
-			m.row[colIdx].Datum = PhysicalTypeColElemToDatum(col, rowIdx, m.da, typs[colIdx])
+		for colIdx, typ := range m.typs {
+			m.row[colIdx].Datum = PhysicalTypeColElemToDatum(m.colvecs[colIdx], rowIdx, &m.da, typ)
 		}
-		return m.ProcessRowHelper(m.row), nil
+		// Note that there is no post-processing to be done in the
+		// materializer, so we do not use ProcessRowHelper and emit the row
+		// directly.
+		return m.row, nil
 	}
 	return nil, m.DrainHelper()
 }

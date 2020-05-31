@@ -20,14 +20,11 @@
 package colexec
 
 import (
-	"bytes"
 	"fmt"
-	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -37,15 +34,6 @@ var _ = execgen.UNSAFEGET
 // {{/*
 
 // Declarations to make the template compile properly.
-
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
 
 // _GOTYPE is the template variable.
 type _GOTYPE interface{}
@@ -58,7 +46,7 @@ const _TYPE_WIDTH = 0
 
 // _ASSIGN_NE is the template equality function for assigning the first input
 // to the result of the second input != the third input.
-func _ASSIGN_NE(_, _, _ string) bool {
+func _ASSIGN_NE(_, _, _, _, _, _ string) bool {
 	colexecerror.InternalError("")
 }
 
@@ -88,7 +76,7 @@ func valuesDiffer(aColVec coldata.Vec, aValueIdx int, bColVec coldata.Vec, bValu
 			arg1 := execgen.UNSAFEGET(aCol, aValueIdx)
 			arg2 := execgen.UNSAFEGET(bCol, bValueIdx)
 			var unique bool
-			_ASSIGN_NE(unique, arg1, arg2)
+			_ASSIGN_NE(unique, arg1, arg2, _, aCol, bCol)
 			return unique
 			// {{end}}
 		}

@@ -17,15 +17,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
-// PgDatabaseName is the name of the default postgres system database.
-const PgDatabaseName = "postgres"
-
-// DefaultDatabaseName is the name ofthe default CockroachDB database used
-// for connections without a current db set.
-const DefaultDatabaseName = "defaultdb"
-
 // PgCatalogName is the name of the pg_catalog system schema.
 const PgCatalogName = "pg_catalog"
+
+// PublicSchemaName is the name of the pg_catalog system schema.
+const PublicSchemaName = "public"
 
 // InformationSchemaName is the name of the information_schema system schema.
 const InformationSchemaName = "information_schema"
@@ -36,11 +32,16 @@ const CRDBInternalSchemaName = "crdb_internal"
 // PgTempSchemaName is the alias for temporary schemas across sessions.
 const PgTempSchemaName = "pg_temp"
 
+// PgExtensionSchemaName is the alias for schemas which are usually "public" in postgres
+// when installing an extension, but must be stored as a separate schema in CRDB.
+const PgExtensionSchemaName = "pg_extension"
+
 // SearchPath represents a list of namespaces to search builtins in.
 // The names must be normalized (as per Name.Normalize) already.
 type SearchPath struct {
 	paths                []string
 	containsPgCatalog    bool
+	containsPgExtension  bool
 	containsPgTempSchema bool
 	tempSchemaName       string
 }
@@ -49,17 +50,22 @@ type SearchPath struct {
 // must not be modified after hand-off to MakeSearchPath.
 func MakeSearchPath(paths []string) SearchPath {
 	containsPgCatalog := false
+	containsPgExtension := false
 	containsPgTempSchema := false
 	for _, e := range paths {
-		if e == PgCatalogName {
+		switch e {
+		case PgCatalogName:
 			containsPgCatalog = true
-		} else if e == PgTempSchemaName {
+		case PgTempSchemaName:
 			containsPgTempSchema = true
+		case PgExtensionSchemaName:
+			containsPgExtension = true
 		}
 	}
 	return SearchPath{
 		paths:                paths,
 		containsPgCatalog:    containsPgCatalog,
+		containsPgExtension:  containsPgExtension,
 		containsPgTempSchema: containsPgTempSchema,
 	}
 }
@@ -73,6 +79,7 @@ func (s SearchPath) WithTemporarySchemaName(tempSchemaName string) SearchPath {
 		paths:                s.paths,
 		containsPgCatalog:    s.containsPgCatalog,
 		containsPgTempSchema: s.containsPgTempSchema,
+		containsPgExtension:  s.containsPgExtension,
 		tempSchemaName:       tempSchemaName,
 	}
 }
@@ -102,6 +109,8 @@ func (s SearchPath) MaybeResolveTemporarySchema(schemaName string) (string, erro
 // Iter returns an iterator through the search path. We must include the
 // implicit pg_catalog and temporary schema at the beginning of the search path,
 // unless they have been explicitly set later by the user.
+// We also include pg_extension in the path, as this normally be used in place
+// of the public schema. This should be read before "public" is read.
 // "The system catalog schema, pg_catalog, is always searched, whether it is
 // mentioned in the path or not. If it is mentioned in the path then it will be
 // searched in the specified order. If pg_catalog is not in the path then it
@@ -116,6 +125,7 @@ func (s SearchPath) Iter() SearchPathIter {
 	sp := SearchPathIter{
 		paths:                s.paths,
 		implicitPgCatalog:    !s.containsPgCatalog,
+		implicitPgExtension:  !s.containsPgExtension,
 		implicitPgTempSchema: implicitPgTempSchema,
 		tempSchemaName:       s.tempSchemaName,
 	}
@@ -151,6 +161,9 @@ func (s SearchPath) Equals(other *SearchPath) bool {
 	if s.containsPgCatalog != other.containsPgCatalog {
 		return false
 	}
+	if s.containsPgExtension != other.containsPgExtension {
+		return false
+	}
 	if s.containsPgTempSchema != other.containsPgTempSchema {
 		return false
 	}
@@ -183,6 +196,7 @@ func (s SearchPath) String() string {
 type SearchPathIter struct {
 	paths                []string
 	implicitPgCatalog    bool
+	implicitPgExtension  bool
 	implicitPgTempSchema bool
 	tempSchemaName       string
 	i                    int
@@ -213,6 +227,13 @@ func (iter *SearchPathIter) Next() (path string, ok bool) {
 				return iter.Next()
 			}
 			return iter.tempSchemaName, true
+		}
+		// pg_extension should be read before delving into the schema.
+		if iter.paths[iter.i-1] == PublicSchemaName && iter.implicitPgExtension {
+			iter.implicitPgExtension = false
+			// Go back one so `public` can be found again next.
+			iter.i--
+			return PgExtensionSchemaName, true
 		}
 		return iter.paths[iter.i-1], true
 	}

@@ -11,6 +11,7 @@
 package geogfn
 
 import (
+	"fmt"
 	"math"
 	"testing"
 
@@ -110,6 +111,20 @@ var distanceTestCases = []struct {
 		627129.50261075,
 	},
 	{
+		"LINESTRING to intersecting LINESTRING, duplicate points",
+		"LINESTRING(0.0 0.0, 0.0 0.0, 1.0 1.0)",
+		"LINESTRING(0.0 1.0, 1.0 0.0, 1.0 0.0)",
+		0,
+		0,
+	},
+	{
+		"LINESTRING to faraway LINESTRING, duplicate points",
+		"LINESTRING(0.0 0.0, 1.0 1.0)",
+		"LINESTRING(5.0 5.0, 6.0 6.0, 6.0 6.0, 6.0 6.0)",
+		628519.03378753,
+		627129.50261075,
+	},
+	{
 		"LINESTRING to intersecting POLYGON where LINESTRING is inside the polygon",
 		"POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0))",
 		"LINESTRING(0.1 0.1, 0.15 0.15)",
@@ -169,6 +184,20 @@ var distanceTestCases = []struct {
 		"POLYGON to POLYGON intersecting through its hole",
 		"POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0), (0.2 0.2, 0.2 0.4, 0.4 0.4, 0.4 0.2, 0.2 0.2))",
 		"POLYGON((0.15 0.25, 0.35 0.25, 0.35 0.35, 0.25 0.35, 0.15 0.25))",
+		0,
+		0,
+	},
+	{
+		"POLYGON to POLYGON completely inside its hole, duplicate points",
+		"POLYGON((0.0 0.0, 0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0), (0.2 0.2, 0.2 0.4, 0.2 0.4, 0.4 0.4, 0.4 0.2, 0.2 0.2))",
+		"POLYGON((0.25 0.25, 0.25 0.25, 0.35 0.35, 0.25 0.35, 0.25 0.35, 0.25 0.25))",
+		5559.65025416,
+		5565.87138621,
+	},
+	{
+		"POLYGON to POLYGON intersecting through its hole, duplicate points",
+		"POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 1.0, 0.0 0.0), (0.2 0.2, 0.2 0.4, 0.2 0.4, 0.4 0.4, 0.4 0.2, 0.2 0.2))",
+		"POLYGON((0.15 0.25, 0.15 0.25, 0.35 0.25, 0.35 0.35, 0.25 0.35, 0.25 0.35, 0.15 0.25))",
 		0,
 		0,
 	},
@@ -235,7 +264,7 @@ func TestDistance(t *testing.T) {
 			for _, subTC := range []struct {
 				desc                string
 				expected            float64
-				useSphereOrSpheroid useSphereOrSpheroid
+				useSphereOrSpheroid UseSphereOrSpheroid
 			}{
 				{"sphere", tc.expectedSphereDistance, UseSphere},
 				{"spheroid", tc.expectedSpheroidDistance, UseSpheroid},
@@ -269,5 +298,31 @@ func TestDistance(t *testing.T) {
 	t.Run("errors if SRIDs mismatch", func(t *testing.T) {
 		_, err := Distance(mismatchingSRIDGeographyA, mismatchingSRIDGeographyB, UseSpheroid)
 		requireMismatchingSRIDError(t, err)
+	})
+
+	t.Run("empty geographies always error", func(t *testing.T) {
+		for _, tc := range []struct {
+			a string
+			b string
+		}{
+			{"GEOMETRYCOLLECTION EMPTY", "GEOMETRYCOLLECTION EMPTY"},
+			{"GEOMETRYCOLLECTION EMPTY", "GEOMETRYCOLLECTION (POINT(1.0 1.0), LINESTRING EMPTY)"},
+			{"POINT(1.0 1.0)", "GEOMETRYCOLLECTION (POINT(1.0 1.0), LINESTRING EMPTY)"},
+		} {
+			for _, useSphereOrSpheroid := range []UseSphereOrSpheroid{
+				UseSphere,
+				UseSpheroid,
+			} {
+				t.Run(fmt.Sprintf("Distance(%s,%s),spheroid=%t", tc.a, tc.b, useSphereOrSpheroid), func(t *testing.T) {
+					a, err := geo.ParseGeography(tc.a)
+					require.NoError(t, err)
+					b, err := geo.ParseGeography(tc.b)
+					require.NoError(t, err)
+					_, err = Distance(a, b, useSphereOrSpheroid)
+					require.Error(t, err)
+					require.True(t, geo.IsEmptyGeometryError(err))
+				})
+			}
+		}
 	})
 }

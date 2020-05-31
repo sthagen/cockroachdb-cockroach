@@ -384,6 +384,25 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`experimental_enable_enums`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_enums`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parseBoolVar(`experimental_enable_enums`, s)
+			if err != nil {
+				return err
+			}
+			m.SetEnumsEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.EnumsEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(enumsEnabledClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
 	`enable_zigzag_join`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enable_zigzag_join`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
@@ -604,6 +623,26 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	// TODO(mgartner): remove this once partial indexes are fully supported.
+	`experimental_partial_indexes`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`experimental_partial_indexes`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parseBoolVar("experimental_partial_indexes", s)
+			if err != nil {
+				return err
+			}
+			m.SetPartialIndexes(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.PartialIndexes)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(partialIndexClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
 	`enable_implicit_select_for_update`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enable_implicit_select_for_update`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
@@ -642,11 +681,11 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
-	`experimental_serial_normalization`: {
+	`serial_normalization`: {
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
 			mode, ok := sessiondata.SerialNormalizationModeFromString(s)
 			if !ok {
-				return newVarValueError(`experimental_serial_normalization`, s,
+				return newVarValueError(`serial_normalization`, s,
 					"rowid", "virtual_sequence", "sql_sequence")
 			}
 			m.SetSerialNormalizationMode(mode)
@@ -1027,6 +1066,25 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(hashShardedIndexesEnabledClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`enable_experimental_alter_column_type_general`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_experimental_alter_column_type_general`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parseBoolVar("enable_experimental_alter_column_type_general", s)
+			if err != nil {
+				return err
+			}
+			m.SetAlterColumnTypeGeneral(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.AlterColumnTypeGeneralEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(experimentalAlterColumnTypeGeneralMode.Get(sv))
 		},
 	},
 }

@@ -193,7 +193,7 @@ render                                       ·            ·
                 │                            type         inner
                 │                            equality     (oid) = (relnamespace)
                 ├── filter                   ·            ·
-                │    │                       filter       nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog')
+                │    │                       filter       nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
                 │    └── render              ·            ·
                 │         └── virtual table  ·            ·
                 │                            source       pg_namespace@primary
@@ -219,7 +219,7 @@ render                                            ·            ·
                 │    │                            type         inner
                 │    │                            equality     (oid) = (relnamespace)
                 │    ├── filter                   ·            ·
-                │    │    │                       filter       nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog')
+                │    │    │                       filter       nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
                 │    │    └── render              ·            ·
                 │    │         └── virtual table  ·            ·
                 │    │                            source       pg_namespace@primary
@@ -369,44 +369,35 @@ render                        ·            ·
 query TTT
 EXPLAIN SHOW CONSTRAINTS FROM foo
 ----
-·                                                      distributed         false
-·                                                      vectorized          false
-render                                                 ·                   ·
- └── sort                                              ·                   ·
-      │                                                order               +conname
-      └── render                                       ·                   ·
-           └── hash-join                               ·                   ·
-                │                                      type                inner
-                │                                      equality            (oid) = (relnamespace)
-                ├── filter                             ·                   ·
-                │    │                                 filter              nspname = 'public'
-                │    └── render                        ·                   ·
-                │         └── virtual table            ·                   ·
-                │                                      source              pg_namespace@primary
-                └── merge-join                         ·                   ·
-                     │                                 type                inner
-                     │                                 equality            (conrelid) = (oid)
-                     │                                 left cols are key   ·
-                     │                                 right cols are key  ·
-                     │                                 mergeJoinOrder      +"(conrelid=oid)"
-                     ├── sort                          ·                   ·
-                     │    │                            order               +conrelid
-                     │    └── render                   ·                   ·
-                     │         └── virtual table       ·                   ·
-                     │                                 source              pg_constraint@pg_constraint_conrelid_idx
-                     └── filter                        ·                   ·
-                          │                            filter              relname = 'foo'
-                          └── sort                     ·                   ·
-                               │                       order               +oid
-                               └── render              ·                   ·
-                                    └── virtual table  ·                   ·
-·                                                      source              pg_class@pg_class_oid_idx
+·                                                 distributed  false
+·                                                 vectorized   false
+render                                            ·            ·
+ └── sort                                         ·            ·
+      │                                           order        +conname
+      └── render                                  ·            ·
+           └── hash-join                          ·            ·
+                │                                 type         inner
+                │                                 equality     (oid) = (relnamespace)
+                ├── filter                        ·            ·
+                │    │                            filter       nspname = 'public'
+                │    └── render                   ·            ·
+                │         └── virtual table       ·            ·
+                │                                 source       pg_namespace@primary
+                └── virtual-table-lookup-join     ·            ·
+                     │                            table        pg_constraint@pg_constraint_conrelid_idx
+                     │                            type         inner
+                     │                            equality     (oid) = (conrelid)
+                     └── filter                   ·            ·
+                          │                       filter       relname = 'foo'
+                          └── render              ·            ·
+                               └── virtual table  ·            ·
+·                                                 source       pg_class@primary
 
 query TTT
 EXPLAIN SHOW USERS
 ----
 ·                                                                  distributed        false
-·                                                                  vectorized         false
+·                                                                  vectorized         true
 render                                                             ·                  ·
  └── sort                                                          ·                  ·
       │                                                            order              +username
@@ -728,22 +719,22 @@ count                ·            ·                            ()             
 query TTTTT
 EXPLAIN (TYPES) UPDATE t SET v = k + 1 WHERE v > 123
 ----
-·                    distributed  false                          ·                            ·
-·                    vectorized   false                          ·                            ·
-count                ·            ·                              ()                           ·
- └── update          ·            ·                              ()                           ·
-      │              table        t                              ·                            ·
-      │              set          v                              ·                            ·
-      │              strategy     updater                        ·                            ·
-      │              auto commit  ·                              ·                            ·
-      └── render     ·            ·                              (k int, v int, column5 int)  ·
-           │         render 0     (k)[int]                       ·                            ·
-           │         render 1     (v)[int]                       ·                            ·
-           │         render 2     ((k)[int] + (1)[int])[int]     ·                            ·
-           └── scan  ·            ·                              (k int, v int)               ·
-·                    table        t@primary                      ·                            ·
-·                    spans        FULL SCAN                      ·                            ·
-·                    filter       ((v)[int] > (123)[int])[bool]  ·                            ·
+·                    distributed  false                          ·                          ·
+·                    vectorized   false                          ·                          ·
+count                ·            ·                              ()                         ·
+ └── update          ·            ·                              ()                         ·
+      │              table        t                              ·                          ·
+      │              set          v                              ·                          ·
+      │              strategy     updater                        ·                          ·
+      │              auto commit  ·                              ·                          ·
+      └── render     ·            ·                              (k int, v int, v_new int)  ·
+           │         render 0     (k)[int]                       ·                          ·
+           │         render 1     (v)[int]                       ·                          ·
+           │         render 2     ((k)[int] + (1)[int])[int]     ·                          ·
+           └── scan  ·            ·                              (k int, v int)             ·
+·                    table        t@primary                      ·                          ·
+·                    spans        FULL SCAN                      ·                          ·
+·                    filter       ((v)[int] > (123)[int])[bool]  ·                          ·
 
 query TTTTT
 EXPLAIN (TYPES) VALUES (1) UNION VALUES (2)

@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -215,6 +216,12 @@ func (dsp *DistSQLPlanner) setupFlows(
 		if nodeID == thisNodeID {
 			// Skip this node.
 			continue
+		}
+		if !evalCtx.Codec.ForSystemTenant() {
+			// A tenant server should never find itself distributing flows.
+			// NB: we wouldn't hit this in practice but if we did the actual
+			// error would be opaque.
+			return nil, nil, errorutil.UnsupportedWithMultiTenancy(47900)
 		}
 		req := setupReq
 		req.Flow = *flowSpec
@@ -871,8 +878,9 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	var subqueryPlanCtx *PlanningCtx
 	var distributeSubquery bool
 	if maybeDistribute {
-		distributeSubquery = shouldDistributePlan(
-			ctx, planner.SessionData().DistSQLMode, dsp, subqueryPlan.plan)
+		distributeSubquery = willDistributePlan(
+			ctx, planner.execCfg.NodeID, planner.SessionData().DistSQLMode, subqueryPlan.plan,
+		)
 	}
 	if distributeSubquery {
 		subqueryPlanCtx = dsp.NewPlanningCtx(ctx, evalCtx, planner.txn)
@@ -1053,6 +1061,8 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 			continue
 		}
 
+		log.VEventf(ctx, 1, "executing cascade for constraint %s", plan.cascades[i].FKName)
+
 		// We place a sequence point before every cascade, so
 		// that each subsequent cascade can observe the writes
 		// by the previous step.
@@ -1067,6 +1077,11 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 
 		evalCtx := evalCtxFactory()
 		execFactory := makeExecFactory(planner)
+		// The cascading query is allowed to autocommit only if it is the last
+		// cascade and there are no check queries to run.
+		if len(plan.checkPlans) > 0 || i < len(plan.cascades)-1 {
+			execFactory.disableAutoCommit()
+		}
 		cascadePlan, err := plan.cascades[i].PlanFn(
 			ctx, &planner.semaCtx, &evalCtx.EvalContext, &execFactory, buf, buf.bufferedRows.Len(),
 		)
@@ -1130,6 +1145,7 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 	}
 
 	for i := range plan.checkPlans {
+		log.VEventf(ctx, 1, "executing check query %d out of %d", i+1, len(plan.checkPlans))
 		if err := dsp.planAndRunPostquery(
 			ctx,
 			plan.checkPlans[i].plan,
@@ -1173,8 +1189,9 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 	var postqueryPlanCtx *PlanningCtx
 	var distributePostquery bool
 	if maybeDistribute {
-		distributePostquery = shouldDistributePlan(
-			ctx, planner.SessionData().DistSQLMode, dsp, postqueryPlan)
+		distributePostquery = willDistributePlan(
+			ctx, planner.execCfg.NodeID, planner.SessionData().DistSQLMode, postqueryPlan,
+		)
 	}
 	if distributePostquery {
 		postqueryPlanCtx = dsp.NewPlanningCtx(ctx, evalCtx, planner.txn)

@@ -35,6 +35,10 @@ func TestTypes(t *testing.T) {
 		{MakeArray(Any), &T{InternalType: InternalType{
 			Family: ArrayFamily, ArrayContents: Any, Oid: oid.T_anyarray, Locale: &emptyLocale}}},
 
+		{MakeArray(Float), FloatArray},
+		{MakeArray(Float), &T{InternalType: InternalType{
+			Family: ArrayFamily, ArrayContents: Float, Oid: oid.T__float8, Locale: &emptyLocale}}},
+
 		{MakeArray(Decimal), DecimalArray},
 		{MakeArray(Decimal), &T{InternalType: InternalType{
 			Family: ArrayFamily, ArrayContents: Decimal, Oid: oid.T__numeric, Locale: &emptyLocale}}},
@@ -153,7 +157,7 @@ func TestTypes(t *testing.T) {
 					Oid:    oidext.T_geography,
 					Locale: &emptyLocale,
 					GeoMetadata: &GeoMetadata{
-						SRID:  4326,
+						SRID:  0,
 						Shape: geopb.Shape_Unset,
 					},
 				},
@@ -494,12 +498,14 @@ func TestTypes(t *testing.T) {
 		{Uuid, MakeScalar(UuidFamily, oid.T_uuid, 0, 0, emptyLocale)},
 
 		// ENUMs
-		{MakeEnum(15210), &T{InternalType: InternalType{
+		{MakeEnum(15210, 15213), &T{InternalType: InternalType{
 			Family: EnumFamily,
 			Locale: &emptyLocale,
-			// TODO (rohany): Oid will be populated in the future.
-			Oid:          0,
-			StableTypeID: 15210,
+			Oid:    StableTypeIDToOID(15210),
+			UDTMetadata: &PersistentUserDefinedTypeMetadata{
+				StableTypeID:      15210,
+				StableArrayTypeID: 15213,
+			},
 		}}},
 	}
 
@@ -604,8 +610,8 @@ func TestEquivalent(t *testing.T) {
 		{MakeTuple([]*T{String, Int}), MakeTuple([]*T{Int, String}), false},
 
 		// ENUM
-		{MakeEnum(15210), MakeEnum(15210), true},
-		{MakeEnum(15210), MakeEnum(15150), false},
+		{MakeEnum(15210, 15213), MakeEnum(15210, 15213), true},
+		{MakeEnum(15210, 15213), MakeEnum(15150, 15213), false},
 
 		// UNKNOWN
 		{Unknown, &T{InternalType: InternalType{

@@ -523,7 +523,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("defaultdb"),
 		}},
 		{"SELECT descriptor FROM system.descriptor WHERE descriptor != $1 LIMIT 1", []preparedQueryTest{
-			baseTest.SetArgs([]byte("abc")).Results([]byte("\x12!\n\x06system\x10\x01\x1a\x15\n\t\n\x05admin\x100\n\b\n\x04root\x100")),
+			baseTest.SetArgs([]byte("abc")).Results([]byte("\x12%\n\x06system\x10\x01\x1a\x15\n\t\n\x05admin\x100\n\b\n\x04root\x100\"\x00(\x01")),
 		}},
 		{"SHOW COLUMNS FROM system.users", []preparedQueryTest{
 			baseTest.
@@ -550,7 +550,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("users", "primary", false, 1, "username", "ASC", false, false),
 		}},
 		{"SHOW TABLES FROM system", []preparedQueryTest{
-			baseTest.Results("public", "comments", "table").Others(26),
+			baseTest.Results("public", "comments", "table").Others(27),
 		}},
 		{"SHOW SCHEMAS FROM system", []preparedQueryTest{
 			baseTest.Results("crdb_internal").Others(4),
@@ -727,7 +727,7 @@ func TestPGPreparedQuery(t *testing.T) {
 		// #14238
 		{"EXPLAIN SELECT 1", []preparedQueryTest{
 			baseTest.SetArgs().
-				Results("", "distributed", "false").
+				Results("", "distribution", "local").
 				Results("", "vectorized", "false").
 				Results("values", "", "").
 				Results("", "size", "1 column, 1 row"),

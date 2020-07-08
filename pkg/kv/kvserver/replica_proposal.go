@@ -13,8 +13,6 @@ package kvserver
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -33,8 +31,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
@@ -228,6 +228,8 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc kvserverpb.Co
 		}
 	}
 
+	limiter := limit.NewLimiter(rate.Limit(consistencyCheckRate.Get(&r.store.ClusterSettings().SV)))
+
 	// Compute SHA asynchronously and store it in a map by UUID.
 	if err := stopper.RunAsyncTask(ctx, "storage.Replica: computing checksum", func(ctx context.Context) {
 		func() {
@@ -236,7 +238,8 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc kvserverpb.Co
 			if cc.SaveSnapshot {
 				snapshot = &roachpb.RaftSnapshotData{}
 			}
-			result, err := r.sha512(ctx, desc, snap, snapshot, cc.Mode)
+
+			result, err := r.sha512(ctx, desc, snap, snapshot, cc.Mode, limiter)
 			if err != nil {
 				log.Errorf(ctx, "%v", err)
 				result = nil
@@ -259,7 +262,7 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc kvserverpb.Co
 			// in a goroutine that's about to end, simply sleep for a few seconds
 			// and then terminate.
 			auxDir := r.store.engine.GetAuxiliaryDir()
-			_ = os.MkdirAll(auxDir, 0755)
+			_ = r.store.engine.MkdirAll(auxDir)
 			path := base.PreventedStartupFile(auxDir)
 
 			preventStartupMsg := fmt.Sprintf(`ATTENTION:
@@ -276,7 +279,7 @@ A file preventing this node from restarting was placed at:
 %s
 `, r, auxDir, path)
 
-			if err := ioutil.WriteFile(path, []byte(preventStartupMsg), 0644); err != nil {
+			if err := fs.WriteFile(r.store.engine, path, []byte(preventStartupMsg)); err != nil {
 				log.Warningf(ctx, "%v", err)
 			}
 
@@ -566,15 +569,15 @@ func addSSTablePreApply(
 
 		// TODO(tschottdorf): remove this once sideloaded storage guarantees its
 		// existence.
-		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		if err := eng.MkdirAll(filepath.Dir(path)); err != nil {
 			panic(err)
 		}
-		if _, err := os.Stat(path); err == nil {
+		if _, err := eng.Stat(path); err == nil {
 			// The file we want to ingest exists. This can happen since the
 			// ingestion may apply twice (we ingest before we mark the Raft
 			// command as committed). Just unlink the file (RocksDB created a
 			// hard link); after that we're free to write it again.
-			if err := os.Remove(path); err != nil {
+			if err := eng.Remove(path); err != nil {
 				log.Fatalf(ctx, "while removing existing file during ingestion of %s: %+v", path, err)
 			}
 		}
@@ -747,7 +750,7 @@ func (r *Replica) evaluateProposal(
 		}
 
 		// Failed proposals can't have any Result except for what's
-		// whitelisted here.
+		// allowlisted here.
 		res.Local = result.LocalResult{
 			EncounteredIntents: res.Local.DetachEncounteredIntents(),
 			EndTxns:            res.Local.DetachEndTxns(true /* alwaysOnly */),

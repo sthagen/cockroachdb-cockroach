@@ -74,7 +74,7 @@ type partitioningTest struct {
 
 	// scans are each a shorthand for an assertion of where data should live.
 	// The map key is the used for the `WHERE` clause of a `SELECT *` and the
-	// value is a comma separated whitelist of nodes that are allowed to serve
+	// value is a comma separated allowlist of nodes that are allowed to serve
 	// this query. Example: `map[string]string{`b = 1`: `n2`}` means that
 	// `SELECT * FROM t WHERE b = 1` is required to be served entirely by node2.
 	//
@@ -93,7 +93,7 @@ type partitioningTest struct {
 		createStmt string
 
 		// tableDesc is the TableDescriptor created by `createStmt`.
-		tableDesc *sqlbase.TableDescriptor
+		tableDesc *sqlbase.MutableTableDescriptor
 
 		// zoneConfigStmt contains SQL that effects the zone configs described
 		// by `configs`.
@@ -120,6 +120,7 @@ func (pt *partitioningTest) parse() error {
 
 	{
 		ctx := context.Background()
+		semaCtx := tree.MakeSemaContext()
 		stmt, err := parser.ParseOne(pt.parsed.createStmt)
 		if err != nil {
 			return errors.Wrapf(err, `parsing %s`, pt.parsed.createStmt)
@@ -131,11 +132,11 @@ func (pt *partitioningTest) parse() error {
 		st := cluster.MakeTestingClusterSettings()
 		const parentID, tableID = keys.MinUserDescID, keys.MinUserDescID + 1
 		mutDesc, err := importccl.MakeSimpleTableDescriptor(
-			ctx, st, createTable, parentID, tableID, importccl.NoFKs, hlc.UnixNano())
+			ctx, &semaCtx, st, createTable, parentID, tableID, importccl.NoFKs, hlc.UnixNano())
 		if err != nil {
 			return err
 		}
-		pt.parsed.tableDesc = mutDesc.TableDesc()
+		pt.parsed.tableDesc = mutDesc
 		if err := pt.parsed.tableDesc.ValidateTable(); err != nil {
 			return err
 		}
@@ -1113,14 +1114,15 @@ func verifyScansOnNode(
 		}
 	}
 	if len(scansWrongNode) > 0 {
-		var err bytes.Buffer
-		fmt.Fprintf(&err, "expected to scan on %s: %s\n%s\nfull trace:",
-			node, query, strings.Join(scansWrongNode, "\n"))
+		err := errors.Newf("expected to scan on %s: %s", node, query)
+		err = errors.WithDetailf(err, "scans:\n%s", strings.Join(scansWrongNode, "\n"))
+		var trace strings.Builder
 		for _, traceLine := range traceLines {
-			err.WriteString("\n  ")
-			err.WriteString(traceLine)
+			trace.WriteString("\n  ")
+			trace.WriteString(traceLine)
 		}
-		return errors.New(err.String())
+		err = errors.WithDetailf(err, "trace:%s", trace.String())
+		return err
 	}
 	return nil
 }
@@ -1171,6 +1173,9 @@ func setupPartitioningTestCluster(
 
 func TestInitialPartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	// Skipping as part of test-infra-team flaky test cleanup.
+	t.Skip("https://github.com/cockroachdb/cockroach/issues/49909")
 
 	// This test configures many sub-tests and is too slow to run under nightly
 	// race stress.
@@ -1261,7 +1266,7 @@ func TestSelectPartitionExprs(t *testing.T) {
 			for _, p := range strings.Split(test.partitions, `,`) {
 				partNames = append(partNames, tree.Name(p))
 			}
-			expr, err := selectPartitionExprs(evalCtx, testData.parsed.tableDesc, partNames)
+			expr, err := selectPartitionExprs(evalCtx, testData.parsed.tableDesc.TableDesc(), partNames)
 			if err != nil {
 				t.Fatalf("%+v", err)
 			}
@@ -1272,7 +1277,7 @@ func TestSelectPartitionExprs(t *testing.T) {
 	}
 	t.Run("error", func(t *testing.T) {
 		partNames := tree.NameList{`p33p44`, `nope`}
-		_, err := selectPartitionExprs(evalCtx, testData.parsed.tableDesc, partNames)
+		_, err := selectPartitionExprs(evalCtx, testData.parsed.tableDesc.TableDesc(), partNames)
 		if !testutils.IsError(err, `unknown partition`) {
 			t.Errorf(`expected "unknown partition" error got: %+v`, err)
 		}
@@ -1281,6 +1286,9 @@ func TestSelectPartitionExprs(t *testing.T) {
 
 func TestRepartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	// Skipping as part of test-infra-team flaky test cleanup.
+	t.Skip("https://github.com/cockroachdb/cockroach/issues/49112")
 
 	// This test configures many sub-tests and is too slow to run under nightly
 	// race stress.
@@ -1404,8 +1412,8 @@ ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y)
 	}
 
 	// Get the zone config corresponding to the table.
-	table := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t")
-	kv, err := kvDB.Get(ctx, config.MakeZoneKey(uint32(table.ID)))
+	table := sqlbase.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t")
+	kv, err := kvDB.Get(ctx, config.MakeZoneKey(config.SystemTenantObjectID(table.ID)))
 	if err != nil {
 		t.Fatal(err)
 	}

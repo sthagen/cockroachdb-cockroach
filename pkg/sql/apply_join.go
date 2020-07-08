@@ -234,7 +234,6 @@ func runPlanInsidePlan(
 	recv := MakeDistSQLReceiver(
 		params.ctx, rowResultWriter, tree.Rows,
 		params.extendedEvalCtx.ExecCfg.RangeDescriptorCache,
-		params.extendedEvalCtx.ExecCfg.LeaseHolderCache,
 		params.p.Txn(),
 		func(ts hlc.Timestamp) {
 			params.extendedEvalCtx.ExecCfg.Clock.Update(ts)
@@ -259,9 +258,7 @@ func runPlanInsidePlan(
 
 	// Make a copy of the EvalContext so it can be safely modified.
 	evalCtx := params.p.ExtendedEvalContextCopy()
-	planCtx := params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.newLocalPlanningCtx(params.ctx, evalCtx)
-	// Always plan local.
-	planCtx.isLocal = true
+	planCtx := params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.NewPlanningCtx(params.ctx, evalCtx, params.p.txn, false /* distribute */)
 	plannerCopy := *params.p
 	planCtx.planner = &plannerCopy
 	planCtx.planner.curPlan = *plan

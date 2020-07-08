@@ -161,6 +161,7 @@ func (jr *JoinReaderSpec) summary() (string, []string) {
 	if jr.Type != sqlbase.InnerJoin {
 		details = append(details, joinTypeDetail(jr.Type))
 	}
+	// TODO(yuzefovich): swap to make it table@index.
 	details = append(details, fmt.Sprintf("%s@%s", index, jr.Table.Name))
 	if jr.LookupColumns != nil {
 		details = append(details, fmt.Sprintf("Lookup join on: %s", colListStr(jr.LookupColumns)))
@@ -204,6 +205,23 @@ func (hj *HashJoinerSpec) summary() (string, []string) {
 		details = append(details, fmt.Sprintf("Merged columns: %d", len(hj.LeftEqColumns)))
 	}
 
+	return name, details
+}
+
+// summary implements the diagramCellType interface.
+func (ifs *InvertedFiltererSpec) summary() (string, []string) {
+	name := "InvertedFilterer"
+	var b strings.Builder
+	for i := range ifs.InvertedExpr.SpansToRead {
+		if i > 0 {
+			fmt.Fprintf(&b, " and %d others", len(ifs.InvertedExpr.SpansToRead)-1)
+			break
+		} else {
+			fmt.Fprintf(&b, "%s", ifs.InvertedExpr.SpansToRead[i].String())
+		}
+	}
+	details := append([]string(nil), fmt.Sprintf(
+		"InvertedExpr on @%d: spans %s", ifs.InvertedColIdx, b.String()))
 	return name, details
 }
 
@@ -276,6 +294,23 @@ func (zj *ZigzagJoinerSpec) summary() (string, []string) {
 		details = append(details, fmt.Sprintf("ON %s", zj.OnExpr))
 	}
 	return name, details
+}
+
+// summary implements the diagramCellType interface.
+func (ij *InvertedJoinerSpec) summary() (string, []string) {
+	index := ij.Table.Indexes[ij.IndexIdx-1].Name
+	details := make([]string, 0, 4)
+	if ij.Type != sqlbase.InnerJoin {
+		details = append(details, joinTypeDetail(ij.Type))
+	}
+	// TODO(yuzefovich): swap to make it table@index.
+	details = append(details, fmt.Sprintf("%s@%s", index, ij.Table.Name))
+	details = append(details, fmt.Sprintf("Inverted join on: @%d", ij.LookupColumn+1))
+	details = append(details, fmt.Sprintf("InvertedExpr %s", ij.InvertedExpr))
+	if !ij.OnExpr.Empty() {
+		details = append(details, fmt.Sprintf("ON %s", ij.OnExpr))
+	}
+	return "InvertedJoiner", details
 }
 
 // summary implements the diagramCellType interface.

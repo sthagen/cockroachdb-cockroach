@@ -107,9 +107,9 @@ func benchmarkSelectInInt64(b *testing.B, useSelectionVector bool, hasNulls bool
 
 	for i := 0; i < coldata.BatchSize(); i++ {
 		if float64(i) < float64(coldata.BatchSize())*selectivity {
-			col1[i] = -1
+			col1[i] = int64(i % 10)
 		} else {
-			col1[i] = 1
+			col1[i] = -1
 		}
 	}
 
@@ -136,7 +136,7 @@ func benchmarkSelectInInt64(b *testing.B, useSelectionVector bool, hasNulls bool
 	inOp := &selectInOpInt64{
 		OneInputNode: NewOneInputNode(source),
 		colIdx:       0,
-		filterRow:    []int64{1, 2, 3},
+		filterRow:    []int64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
 	}
 	inOp.Init()
 
@@ -240,7 +240,7 @@ func TestProjectInInt64(t *testing.T) {
 							},
 						},
 					}
-					args := NewColOperatorArgs{
+					args := &NewColOperatorArgs{
 						Spec:                spec,
 						Inputs:              input,
 						StreamingMemAccount: testMemAcc,
@@ -252,7 +252,7 @@ func TestProjectInInt64(t *testing.T) {
 						ProcessorConstructor: rowexec.NewProcessor,
 					}
 					args.TestingKnobs.UseStreamingMemAccountForBuffering = true
-					result, err := NewColOperator(ctx, flowCtx, args)
+					result, err := TestNewColOperator(ctx, flowCtx, args)
 					if err != nil {
 						return nil, err
 					}

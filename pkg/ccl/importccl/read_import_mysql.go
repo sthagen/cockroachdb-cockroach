@@ -39,7 +39,7 @@ import (
 
 // mysqldumpReader reads the default output of `mysqldump`, which consists of
 // SQL statements, in MySQL-dialect, namely CREATE TABLE and INSERT statements,
-// with some additional statements that contorl the loading process like LOCK or
+// with some additional statements that control the loading process like LOCK or
 // UNLOCK (which are simply ignored for the purposed of this reader). Data for
 // tables with names that appear in the `tables` map is converted to Cockroach
 // KVs using the mapped converter and sent to kvCh.
@@ -85,8 +85,9 @@ func (m *mysqldumpReader) readFiles(
 	resumePos map[int32]int64,
 	format roachpb.IOFileFormat,
 	makeExternalStorage cloud.ExternalStorageFactory,
+	user string,
 ) error {
-	return readInputFiles(ctx, dataFiles, resumePos, format, m.readFile, makeExternalStorage)
+	return readInputFiles(ctx, dataFiles, resumePos, format, m.readFile, makeExternalStorage, user)
 }
 
 func (m *mysqldumpReader) readFile(
@@ -474,7 +475,13 @@ func mysqlTableToCockroach(
 		stmt.Defs = append(stmt.Defs, c)
 	}
 
-	desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), evalCtx.Settings, stmt, parentID, id, fks, time.WallTime)
+	semaCtx := tree.MakeSemaContext()
+	semaCtxPtr := &semaCtx
+	// p is nil in some tests.
+	if p != nil {
+		semaCtxPtr = p.SemaCtx()
+	}
+	desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), semaCtxPtr, evalCtx.Settings, stmt, parentID, id, fks, time.WallTime)
 	if err != nil {
 		return nil, nil, err
 	}

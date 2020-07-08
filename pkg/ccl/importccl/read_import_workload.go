@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
@@ -116,6 +117,7 @@ func (w *workloadReader) readFiles(
 	_ map[int32]int64,
 	_ roachpb.IOFileFormat,
 	_ cloud.ExternalStorageFactory,
+	_ string,
 ) error {
 
 	wcs := make([]*WorkloadKVConverter, 0, len(dataFiles))
@@ -124,7 +126,7 @@ func (w *workloadReader) readFiles(
 		if err != nil {
 			return err
 		}
-		conf, err := cloud.ParseWorkloadConfig(file)
+		conf, err := cloudimpl.ParseWorkloadConfig(file)
 		if err != nil {
 			return err
 		}

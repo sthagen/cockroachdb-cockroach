@@ -41,12 +41,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 // SplitTable splits a range in the table, creates a replica for the right
@@ -157,7 +159,7 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 				return
 			default:
 				// Split the table at a random row.
-				desc := sqlbase.GetTableDescriptor(cdb, keys.SystemSQLCodec, "test", "t")
+				desc := sqlbase.TestingGetTableDescriptor(cdb, keys.SystemSQLCodec, "test", "t")
 
 				val := rng.Intn(n)
 				t.Logf("splitting at %d", val)
@@ -248,22 +250,23 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 }
 
 // Test that DistSQLReceiver uses inbound metadata to update the
-// RangeDescriptorCache and the LeaseHolderCache.
+// RangeDescriptorCache.
 func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	size := func() int64 { return 2 << 10 }
 	st := cluster.MakeTestingClusterSettings()
 	rangeCache := kvcoord.NewRangeDescriptorCache(st, nil /* db */, size, stop.NewStopper())
-	leaseCache := kvcoord.NewLeaseHolderCache(size)
 	r := MakeDistSQLReceiver(
 		context.Background(), nil /* resultWriter */, tree.Rows,
-		rangeCache, leaseCache, nil /* txn */, nil /* updateClock */, &SessionTracing{})
+		rangeCache, nil /* txn */, nil /* updateClock */, &SessionTracing{})
+
+	replicas := []roachpb.ReplicaDescriptor{{ReplicaID: 1}, {ReplicaID: 2}, {ReplicaID: 3}}
 
 	descs := []roachpb.RangeDescriptor{
-		{RangeID: 1, StartKey: roachpb.RKey("a"), EndKey: roachpb.RKey("c")},
-		{RangeID: 2, StartKey: roachpb.RKey("c"), EndKey: roachpb.RKey("e")},
-		{RangeID: 3, StartKey: roachpb.RKey("g"), EndKey: roachpb.RKey("z")},
+		{RangeID: 1, StartKey: roachpb.RKey("a"), EndKey: roachpb.RKey("c"), InternalReplicas: replicas},
+		{RangeID: 2, StartKey: roachpb.RKey("c"), EndKey: roachpb.RKey("e"), InternalReplicas: replicas},
+		{RangeID: 3, StartKey: roachpb.RKey("g"), EndKey: roachpb.RKey("z"), InternalReplicas: replicas},
 	}
 
 	// Push some metadata and check that the caches are updated with it.
@@ -271,13 +274,17 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 		Ranges: []roachpb.RangeInfo{
 			{
 				Desc: descs[0],
-				Lease: roachpb.Lease{Replica: roachpb.ReplicaDescriptor{
-					NodeID: 1, StoreID: 1, ReplicaID: 1}},
+				Lease: roachpb.Lease{
+					Replica: roachpb.ReplicaDescriptor{NodeID: 1, StoreID: 1, ReplicaID: 1},
+					Start:   hlc.MinTimestamp,
+				},
 			},
 			{
 				Desc: descs[1],
-				Lease: roachpb.Lease{Replica: roachpb.ReplicaDescriptor{
-					NodeID: 2, StoreID: 2, ReplicaID: 2}},
+				Lease: roachpb.Lease{
+					Replica: roachpb.ReplicaDescriptor{NodeID: 2, StoreID: 2, ReplicaID: 2},
+					Start:   hlc.MinTimestamp,
+				},
 			},
 		}})
 	if status != execinfra.NeedMoreRows {
@@ -287,8 +294,10 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 		Ranges: []roachpb.RangeInfo{
 			{
 				Desc: descs[2],
-				Lease: roachpb.Lease{Replica: roachpb.ReplicaDescriptor{
-					NodeID: 3, StoreID: 3, ReplicaID: 3}},
+				Lease: roachpb.Lease{
+					Replica: roachpb.ReplicaDescriptor{NodeID: 3, StoreID: 3, ReplicaID: 3},
+					Start:   hlc.MinTimestamp,
+				},
 			},
 		}})
 	if status != execinfra.NeedMoreRows {
@@ -296,21 +305,10 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 	}
 
 	for i := range descs {
-		desc, err := rangeCache.GetCachedRangeDescriptor(descs[i].StartKey, false /* inclusive */)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if desc == nil {
-			t.Fatalf("failed to find range for key: %s", descs[i].StartKey)
-		}
-		if !desc.Equal(descs[i]) {
-			t.Fatalf("expected: %+v, got: %+v", descs[i], desc)
-		}
-
-		_, ok := leaseCache.Lookup(context.Background(), descs[i].RangeID)
-		if !ok {
-			t.Fatalf("didn't find lease for RangeID: %d", descs[i].RangeID)
-		}
+		ri := rangeCache.GetCached(descs[i].StartKey, false /* inclusive */)
+		require.NotNilf(t, ri, "failed to find range for key: %s", descs[i].StartKey)
+		require.Equal(t, descs[i], ri.Desc)
+		require.False(t, ri.Lease.Empty())
 	}
 }
 
@@ -432,7 +430,7 @@ func TestDistSQLRangeCachesIntegrationTest(t *testing.T) {
 func TestDistSQLDeadHosts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	t.Skip("test is too slow; we need to tweak timeouts so connections die faster (see #14376)")
+	t.Skip("#49843. test is too slow; we need to tweak timeouts so connections die faster (see #14376)")
 
 	const n = 100
 	const numNodes = 5
@@ -673,12 +671,11 @@ func (it *testSpanResolverIterator) Desc() roachpb.RangeDescriptor {
 }
 
 // ReplicaInfo is part of the SpanResolverIterator interface.
-func (it *testSpanResolverIterator) ReplicaInfo(_ context.Context) (kvcoord.ReplicaInfo, error) {
+func (it *testSpanResolverIterator) ReplicaInfo(
+	_ context.Context,
+) (roachpb.ReplicaDescriptor, error) {
 	n := it.tsr.nodes[it.tsr.ranges[it.curRangeIdx].node-1]
-	return kvcoord.ReplicaInfo{
-		ReplicaDescriptor: roachpb.ReplicaDescriptor{NodeID: n.NodeID},
-		NodeDesc:          n,
-	}, nil
+	return roachpb.ReplicaDescriptor{NodeID: n.NodeID}, nil
 }
 
 func TestPartitionSpans(t *testing.T) {
@@ -818,12 +815,12 @@ func TestPartitionSpans(t *testing.T) {
 
 			gw := gossip.MakeExposedGossip(mockGossip)
 			dsp := DistSQLPlanner{
-				planVersion:  execinfra.Version,
-				st:           cluster.MakeTestingClusterSettings(),
-				nodeDesc:     *tsp.nodes[tc.gatewayNode-1],
-				stopper:      stopper,
-				spanResolver: tsp,
-				gossip:       gw,
+				planVersion:   execinfra.Version,
+				st:            cluster.MakeTestingClusterSettings(),
+				gatewayNodeID: tsp.nodes[tc.gatewayNode-1].NodeID,
+				stopper:       stopper,
+				spanResolver:  tsp,
+				gossip:        gw,
 				nodeHealth: distSQLNodeHealth{
 					gossip: gw,
 					connHealth: func(node roachpb.NodeID, _ rpc.ConnectionClass) error {
@@ -840,7 +837,9 @@ func TestPartitionSpans(t *testing.T) {
 				},
 			}
 
-			planCtx := dsp.NewPlanningCtx(context.Background(), nil /* evalCtx */, nil /* txn */)
+			planCtx := dsp.NewPlanningCtx(context.Background(), &extendedEvalContext{
+				EvalContext: tree.EvalContext{Codec: keys.SystemSQLCodec},
+			}, nil /* txn */, true /* distribute */)
 			var spans []roachpb.Span
 			for _, s := range tc.spans {
 				spans = append(spans, roachpb.Span{Key: roachpb.Key(s[0]), EndKey: roachpb.Key(s[1])})
@@ -1003,12 +1002,12 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 
 			gw := gossip.MakeExposedGossip(mockGossip)
 			dsp := DistSQLPlanner{
-				planVersion:  tc.planVersion,
-				st:           cluster.MakeTestingClusterSettings(),
-				nodeDesc:     *tsp.nodes[gatewayNode-1],
-				stopper:      stopper,
-				spanResolver: tsp,
-				gossip:       gw,
+				planVersion:   tc.planVersion,
+				st:            cluster.MakeTestingClusterSettings(),
+				gatewayNodeID: tsp.nodes[gatewayNode-1].NodeID,
+				stopper:       stopper,
+				spanResolver:  tsp,
+				gossip:        gw,
 				nodeHealth: distSQLNodeHealth{
 					gossip: gw,
 					connHealth: func(roachpb.NodeID, rpc.ConnectionClass) error {
@@ -1021,7 +1020,9 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 				},
 			}
 
-			planCtx := dsp.NewPlanningCtx(context.Background(), nil /* evalCtx */, nil /* txn */)
+			planCtx := dsp.NewPlanningCtx(context.Background(), &extendedEvalContext{
+				EvalContext: tree.EvalContext{Codec: keys.SystemSQLCodec},
+			}, nil /* txn */, true /* distribute */)
 			partitions, err := dsp.PartitionSpans(planCtx, roachpb.Spans{span})
 			if err != nil {
 				t.Fatal(err)
@@ -1099,12 +1100,12 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 
 	gw := gossip.MakeExposedGossip(mockGossip)
 	dsp := DistSQLPlanner{
-		planVersion:  execinfra.Version,
-		st:           cluster.MakeTestingClusterSettings(),
-		nodeDesc:     *tsp.nodes[gatewayNode-1],
-		stopper:      stopper,
-		spanResolver: tsp,
-		gossip:       gw,
+		planVersion:   execinfra.Version,
+		st:            cluster.MakeTestingClusterSettings(),
+		gatewayNodeID: tsp.nodes[gatewayNode-1].NodeID,
+		stopper:       stopper,
+		spanResolver:  tsp,
+		gossip:        gw,
 		nodeHealth: distSQLNodeHealth{
 			gossip: gw,
 			connHealth: func(node roachpb.NodeID, _ rpc.ConnectionClass) error {
@@ -1117,7 +1118,9 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 		},
 	}
 
-	planCtx := dsp.NewPlanningCtx(context.Background(), nil /* evalCtx */, nil /* txn */)
+	planCtx := dsp.NewPlanningCtx(context.Background(), &extendedEvalContext{
+		EvalContext: tree.EvalContext{Codec: keys.SystemSQLCodec},
+	}, nil /* txn */, true /* distribute */)
 	partitions, err := dsp.PartitionSpans(planCtx, roachpb.Spans{span})
 	if err != nil {
 		t.Fatal(err)

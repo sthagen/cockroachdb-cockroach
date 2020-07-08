@@ -19,6 +19,7 @@ SELECT * FROM a FULL JOIN xy ON true WHERE a.k IS NOT NULL
 ----
 left-join (cross)
  ├── columns: k:1!null i:2 f:3 s:4 x:5 y:6
+ ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  ├── key: (1,5)
  ├── fd: (1)-->(2-4), (5)-->(6)
  ├── scan a
@@ -36,6 +37,7 @@ SELECT * FROM a FULL JOIN xy ON true WHERE xy.x > 5
 ----
 left-join (cross)
  ├── columns: k:1 i:2 f:3 s:4 x:5!null y:6
+ ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  ├── key: (1,5)
  ├── fd: (5)-->(6), (1)-->(2-4)
  ├── select
@@ -67,6 +69,7 @@ inner-join (cross)
  ├── fd: ()-->(5,6), (1)-->(2-4), (7)-->(8-10), (11)-->(12)
  ├── inner-join (cross)
  │    ├── columns: k:1!null i:2 f:3 s:4 u:5!null v:6
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
  │    ├── key: (1)
  │    ├── fd: ()-->(5,6), (1)-->(2-4)
  │    ├── scan a
@@ -112,6 +115,7 @@ SELECT * FROM a LEFT JOIN xy ON true WHERE xy.x = a.k
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3 s:4 x:5!null y:6
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (5)
  ├── fd: (1)-->(2-4), (5)-->(6), (1)==(5), (5)==(1)
  ├── scan a
@@ -181,6 +185,7 @@ SELECT * FROM a FULL JOIN xy ON true WHERE i IS NOT NULL
 ----
 left-join (cross)
  ├── columns: k:1!null i:2!null f:3 s:4 x:5 y:6
+ ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  ├── key: (1,5)
  ├── fd: (1)-->(2-4), (5)-->(6)
  ├── select
@@ -242,7 +247,7 @@ project
 
 # Aggregate function with DISTINCT.
 norm expect=RejectNullsGroupBy
-SELECT sum(DISTINCT y)
+SELECT sum(DISTINCT y), max(y)
 FROM (SELECT k FROM a)
 LEFT JOIN (SELECT y FROM xy)
 ON True
@@ -250,17 +255,19 @@ GROUP BY k
 HAVING sum(DISTINCT y)=1
 ----
 project
- ├── columns: sum:7!null
+ ├── columns: sum:7!null max:8!null
+ ├── immutable
  ├── fd: ()-->(7)
  └── select
-      ├── columns: k:1!null sum:7!null
+      ├── columns: k:1!null sum:7!null max:8!null
+      ├── immutable
       ├── key: (1)
-      ├── fd: ()-->(7)
+      ├── fd: ()-->(7), (1)-->(8)
       ├── group-by
-      │    ├── columns: k:1!null sum:7!null
+      │    ├── columns: k:1!null sum:7!null max:8!null
       │    ├── grouping columns: k:1!null
       │    ├── key: (1)
-      │    ├── fd: (1)-->(7)
+      │    ├── fd: (1)-->(7,8)
       │    ├── inner-join (cross)
       │    │    ├── columns: k:1!null y:6!null
       │    │    ├── scan a
@@ -274,11 +281,13 @@ project
       │    │    │         └── y:6 IS NOT NULL [outer=(6), constraints=(/6: (/NULL - ]; tight)]
       │    │    └── filters (true)
       │    └── aggregations
-      │         └── agg-distinct [as=sum:7, outer=(6)]
-      │              └── sum
-      │                   └── y:6
+      │         ├── agg-distinct [as=sum:7, outer=(6)]
+      │         │    └── sum
+      │         │         └── y:6
+      │         └── max [as=max:8, outer=(6)]
+      │              └── y:6
       └── filters
-           └── sum:7 = 1 [outer=(7), constraints=(/7: [/1 - /1]; tight), fd=()-->(7)]
+           └── sum:7 = 1 [outer=(7), immutable, constraints=(/7: [/1 - /1]; tight), fd=()-->(7)]
 
 # Single max aggregate function without grouping columns.
 norm expect=RejectNullsGroupBy
@@ -472,6 +481,7 @@ project
       │    ├── fd: (1)-->(7,8)
       │    ├── left-join (cross)
       │    │    ├── columns: k:1!null x:5 y:6
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    ├── key: (1,5)
       │    │    ├── fd: (5)-->(6)
       │    │    ├── scan a
@@ -514,6 +524,7 @@ project
       │    ├── fd: (1)-->(7)
       │    ├── left-join (cross)
       │    │    ├── columns: k:1!null x:5
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    ├── key: (1,5)
       │    │    ├── scan a
       │    │    │    ├── columns: k:1!null
@@ -555,6 +566,7 @@ project
  │    │    │    ├── left-join (cross)
  │    │    │    │    ├── columns: ref_1.k:5!null true:14
  │    │    │    │    ├── outer: (4)
+ │    │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    │    │    ├── scan ref_1
  │    │    │    │    │    ├── columns: ref_1.k:5!null
  │    │    │    │    │    └── key: (5)
@@ -643,21 +655,26 @@ HAVING string_agg(s || 'bar', ',')='foo'
 ----
 project
  ├── columns: string_agg:9!null
+ ├── immutable
  ├── fd: ()-->(9)
  └── select
       ├── columns: k:3 string_agg:9!null
+      ├── immutable
       ├── key: (3)
       ├── fd: ()-->(9)
       ├── group-by
       │    ├── columns: k:3 string_agg:9
       │    ├── grouping columns: k:3
+      │    ├── immutable
       │    ├── key: (3)
       │    ├── fd: (3)-->(9)
       │    ├── project
       │    │    ├── columns: column7:7 column8:8!null k:3
+      │    │    ├── immutable
       │    │    ├── fd: ()-->(8), (3)-->(7)
       │    │    ├── left-join (cross)
       │    │    │    ├── columns: k:3 s:6
+      │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    │    ├── fd: (3)-->(6)
       │    │    │    ├── scan xy
       │    │    │    ├── scan a
@@ -666,7 +683,7 @@ project
       │    │    │    │    └── fd: (3)-->(6)
       │    │    │    └── filters (true)
       │    │    └── projections
-      │    │         ├── s:6 || 'bar' [as=column7:7, outer=(6)]
+      │    │         ├── s:6 || 'bar' [as=column7:7, outer=(6), immutable]
       │    │         └── ',' [as=column8:8]
       │    └── aggregations
       │         └── string-agg [as=string_agg:9, outer=(7,8)]
@@ -707,15 +724,18 @@ exprnorm
 select
  ├── columns: sum:6!null
  ├── cardinality: [0 - 1]
+ ├── immutable
  ├── key: ()
  ├── fd: ()-->(6)
  ├── scalar-group-by
  │    ├── columns: sum:6
  │    ├── cardinality: [1 - 1]
+ │    ├── immutable
  │    ├── key: ()
  │    ├── fd: ()-->(6)
  │    ├── inner-join-apply
  │    │    ├── columns: x:1!null u:3!null z:5
+ │    │    ├── immutable
  │    │    ├── key: (1,3)
  │    │    ├── fd: (1,3)-->(5)
  │    │    ├── scan xy
@@ -724,6 +744,7 @@ select
  │    │    ├── left-join-apply
  │    │    │    ├── columns: u:3!null z:5
  │    │    │    ├── outer: (1)
+ │    │    │    ├── immutable
  │    │    │    ├── key: (3)
  │    │    │    ├── fd: (3)-->(5)
  │    │    │    ├── scan uv
@@ -733,6 +754,7 @@ select
  │    │    │    │    ├── columns: z:5
  │    │    │    │    ├── outer: (1,3)
  │    │    │    │    ├── cardinality: [1 - 1]
+ │    │    │    │    ├── immutable
  │    │    │    │    ├── key: ()
  │    │    │    │    ├── fd: ()-->(5)
  │    │    │    │    └── (x:1 + u:3,)

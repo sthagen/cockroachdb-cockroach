@@ -81,6 +81,7 @@ WHERE
 ----
 project
  ├── columns: PID:3 User:5 Database:2 "Backend start":10 Client:37 Application:6 Query:19 "Query start":12 "Xact start":11
+ ├── immutable
  ├── select
  │    ├── columns: datname:2 pid:3 username:5 application_name:6 client_addr:7 client_hostname:8 client_port:9 backend_start:10 xact_start:11 query_start:12 query:19 sa.rowid:20!null "?column?":36!null
  │    ├── key: (20)
@@ -103,10 +104,11 @@ project
  │    │    │    │    ├── outer: (4)
  │    │    │    │    ├── select
  │    │    │    │    │    ├── columns: oid:21 rolname:22!null rolsuper:23
+ │    │    │    │    │    ├── fd: ()-->(22)
  │    │    │    │    │    ├── scan r
  │    │    │    │    │    │    └── columns: oid:21 rolname:22 rolsuper:23
  │    │    │    │    │    └── filters
- │    │    │    │    │         └── rolname:22 = current_user() [outer=(22), constraints=(/22: (/NULL - ])]
+ │    │    │    │    │         └── rolname:22 = 'opttester' [outer=(22), constraints=(/22: [/'opttester' - /'opttester']; tight), fd=()-->(22)]
  │    │    │    │    └── projections
  │    │    │    │         └── rolsuper:23 OR (oid:21 = usesysid:4) [as="?column?":36, outer=(4,21,23)]
  │    │    │    └── filters (true)
@@ -138,4 +140,4 @@ project
  │    └── filters
  │         └── "?column?":36 [outer=(36), constraints=(/36: [/true - /true]; tight), fd=()-->(36)]
  └── projections
-      └── CASE WHEN (client_hostname:8 IS NOT NULL) AND (client_hostname:8 != '') THEN (client_hostname:8 || ':') || client_port:9::STRING WHEN (client_addr:7 IS NOT NULL) AND (client_addr:7::STRING != '') THEN (client_addr:7::STRING || ':') || client_port:9::STRING WHEN client_port:9 = -1 THEN 'local pipe' ELSE 'localhost:' || client_port:9::STRING END [as=Client:37, outer=(7-9)]
+      └── CASE WHEN (client_hostname:8 IS NOT NULL) AND (client_hostname:8 != '') THEN (client_hostname:8 || ':') || client_port:9::STRING WHEN (client_addr:7 IS NOT NULL) AND (client_addr:7::STRING != '') THEN (client_addr:7::STRING || ':') || client_port:9::STRING WHEN client_port:9 = -1 THEN 'local pipe' ELSE 'localhost:' || client_port:9::STRING END [as=Client:37, outer=(7-9), immutable]

@@ -60,8 +60,10 @@ var geosOnce struct {
 
 // EnsureInit attempts to start GEOS if it has not been opened already
 // and returns the location if found, and an error if the CR_GEOS is not valid.
-func EnsureInit(errDisplay EnsureInitErrorDisplay, flagGEOSLocationValue string) (string, error) {
-	_, err := ensureInit(errDisplay, flagGEOSLocationValue)
+func EnsureInit(
+	errDisplay EnsureInitErrorDisplay, flagLibraryDirectoryValue string,
+) (string, error) {
+	_, err := ensureInit(errDisplay, flagLibraryDirectoryValue)
 	return geosOnce.loc, err
 }
 
@@ -75,10 +77,10 @@ func ensureInitInternal() (*C.CR_GEOS, error) {
 // ensureInits behaves as described in EnsureInit, but also returns the GEOS
 // C object which should be hidden from the public eye.
 func ensureInit(
-	errDisplay EnsureInitErrorDisplay, flagGEOSLocationValue string,
+	errDisplay EnsureInitErrorDisplay, flagLibraryDirectoryValue string,
 ) (*C.CR_GEOS, error) {
 	geosOnce.once.Do(func() {
-		geosOnce.geos, geosOnce.loc, geosOnce.err = initGEOS(findGEOSLocations(flagGEOSLocationValue))
+		geosOnce.geos, geosOnce.loc, geosOnce.err = initGEOS(findLibraryDirectories(flagLibraryDirectoryValue))
 	})
 	if geosOnce.err != nil && errDisplay == EnsureInitErrorDisplayPublic {
 		return nil, errors.Newf("geos: this operation is not available")
@@ -86,31 +88,37 @@ func ensureInit(
 	return geosOnce.geos, geosOnce.err
 }
 
-// findGEOSLocations returns the default locations where GEOS is installed.
-func findGEOSLocations(flagGEOSLocationValue string) []string {
-	var ext string
+// appendLibraryExt appends the extension expected for the running OS.
+func getLibraryExt(base string) string {
 	switch runtime.GOOS {
 	case "darwin":
-		ext = "dylib"
+		return base + ".dylib"
 	case "windows":
-		ext = "dll"
+		return base + ".dll"
 	default:
-		ext = "so"
+		return base + ".so"
 	}
-	locs := []string{
-		filepath.Join(flagGEOSLocationValue, "libgeos_c."+ext),
-	}
+}
+
+const (
+	libgeosFileName  = "libgeos"
+	libgeoscFileName = "libgeos_c"
+)
+
+// findLibraryDirectories returns the default locations where GEOS is installed.
+func findLibraryDirectories(flagLibraryDirectoryValue string) []string {
 	// For CI, they are always in a parenting directory where libgeos_c is set.
 	// For now, this will need to look at every given location
 	// TODO(otan): fix CI to always use a fixed location OR initialize GEOS
 	// correctly for each test suite that may need GEOS.
-	locs = append(locs, findGEOSLocationsInParentingDirectories(ext)...)
+	locs := append(findLibraryDirectoriesInParentingDirectories(), flagLibraryDirectoryValue)
 	return locs
 }
 
-// findGEOSLocationsInParentingDirectories attempts to find GEOS by looking at
-// parenting folders and looking inside `lib/lib_geos_c.*`.
-func findGEOSLocationsInParentingDirectories(ext string) []string {
+// findLibraryDirectoriesInParentingDirectories attempts to find GEOS by looking at
+// parenting folders and looking inside `lib/libgeos_c.*`.
+// This is basically only useful for CI runs.
+func findLibraryDirectoriesInParentingDirectories() []string {
 	locs := []string{}
 
 	// Add the CI path by trying to find all parenting paths and appending
@@ -121,9 +129,19 @@ func findGEOSLocationsInParentingDirectories(ext string) []string {
 	}
 
 	for {
-		nextPath := filepath.Join(cwd, "lib", "libgeos_c."+ext)
-		if _, err := os.Stat(nextPath); err == nil {
-			locs = append(locs, nextPath)
+		dir := filepath.Join(cwd, "lib")
+		found := true
+		for _, file := range []string{
+			filepath.Join(dir, getLibraryExt(libgeoscFileName)),
+			filepath.Join(dir, getLibraryExt(libgeosFileName)),
+		} {
+			if _, err := os.Stat(file); err != nil {
+				found = false
+				break
+			}
+		}
+		if found {
+			locs = append(locs, dir)
 		}
 		nextCWD := filepath.Dir(cwd)
 		if nextCWD == cwd {
@@ -136,19 +154,23 @@ func findGEOSLocationsInParentingDirectories(ext string) []string {
 
 // initGEOS initializes the CR_GEOS by attempting to dlopen all
 // the paths as parsed in by locs.
-func initGEOS(locs []string) (*C.CR_GEOS, string, error) {
+func initGEOS(dirs []string) (*C.CR_GEOS, string, error) {
 	var err error
-	for _, loc := range locs {
+	for _, dir := range dirs {
 		var ret *C.CR_GEOS
-		errStr := C.CR_GEOS_Init(goToCSlice([]byte(loc)), &ret)
+		errStr := C.CR_GEOS_Init(
+			goToCSlice([]byte(filepath.Join(dir, getLibraryExt(libgeoscFileName)))),
+			goToCSlice([]byte(filepath.Join(dir, getLibraryExt(libgeosFileName)))),
+			&ret,
+		)
 		if errStr.data == nil {
-			return ret, loc, nil
+			return ret, dir, nil
 		}
 		err = errors.CombineErrors(
 			err,
 			errors.Newf(
-				"geos: cannot load GEOS from %s: %s",
-				loc,
+				"geos: cannot load GEOS from dir %q: %s",
+				dir,
 				string(cSliceToUnsafeGoBytes(errStr)),
 			),
 		)
@@ -228,6 +250,59 @@ func WKTToEWKB(wkt geopb.WKT, srid geopb.SRID) (geopb.EWKB, error) {
 	return cStringToSafeGoBytes(cEWKB), nil
 }
 
+// BufferParamsJoinStyle maps to the GEOSBufJoinStyles enum in geos_c.h.in.
+type BufferParamsJoinStyle int
+
+// These should be kept in sync with the geos_c.h.in corresponding enum definition.
+const (
+	BufferParamsJoinStyleRound = 1
+	BufferParamsJoinStyleMitre = 2
+	BufferParamsJoinStyleBevel = 3
+)
+
+// BufferParamsEndCapStyle maps to the GEOSBufCapStyles enum in geos_c.h.in.
+type BufferParamsEndCapStyle int
+
+// These should be kept in sync with the geos_c.h.in corresponding enum definition.
+const (
+	BufferParamsEndCapStyleRound  = 1
+	BufferParamsEndCapStyleFlat   = 2
+	BufferParamsEndCapStyleSquare = 3
+)
+
+// BufferParams are parameters to provide into the GEOS buffer function.
+type BufferParams struct {
+	JoinStyle        BufferParamsJoinStyle
+	EndCapStyle      BufferParamsEndCapStyle
+	SingleSided      bool
+	QuadrantSegments int
+	MitreLimit       float64
+}
+
+// Buffer buffers the given geometry by the given distance and params.
+func Buffer(ewkb geopb.EWKB, params BufferParams, distance float64) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	singleSided := 0
+	if params.SingleSided {
+		singleSided = 1
+	}
+	cParams := C.CR_GEOS_BufferParamsInput{
+		endCapStyle:      C.int(params.EndCapStyle),
+		joinStyle:        C.int(params.JoinStyle),
+		singleSided:      C.int(singleSided),
+		quadrantSegments: C.int(params.QuadrantSegments),
+		mitreLimit:       C.double(params.MitreLimit),
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_Buffer(g, goToCSlice(ewkb), cParams, C.double(distance), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
 // Area returns the area of an EWKB.
 func Area(ewkb geopb.EWKB) (float64, error) {
 	g, err := ensureInitInternal()
@@ -262,6 +337,64 @@ func Centroid(ewkb geopb.EWKB) (geopb.EWKB, error) {
 	}
 	var cEWKB C.CR_GEOS_String
 	if err := statusToError(C.CR_GEOS_Centroid(g, goToCSlice(ewkb), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// PointOnSurface returns an EWKB with a point that is on the surface of the given EWKB.
+func PointOnSurface(ewkb geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_PointOnSurface(g, goToCSlice(ewkb), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// Intersection returns an EWKB which contains the geometries of intersection between A and B.
+func Intersection(a geopb.EWKB, b geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_Intersection(g, goToCSlice(a), goToCSlice(b), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// Union returns an EWKB which is a union of shapes A and B.
+func Union(a geopb.EWKB, b geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_Union(g, goToCSlice(a), goToCSlice(b), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// InterpolateLine returns the point along the given LineString which is at
+// a given distance from starting point.
+// Note: For distance less than 0 it returns start point similarly for distance
+// greater LineString's length.
+// InterpolateLine also works with (Multi)LineString. However, the result is
+// not appropriate as it combines all the LineString present in (MULTI)LineString,
+// considering all the corner points of LineString overlaps each other.
+func InterpolateLine(ewkb geopb.EWKB, distance float64) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_Interpolate(g, goToCSlice(ewkb), C.double(distance), &cEWKB)); err != nil {
 		return nil, err
 	}
 	return cStringToSafeGoBytes(cEWKB), nil
@@ -431,4 +564,19 @@ func Relate(a geopb.EWKB, b geopb.EWKB) (string, error) {
 		return "", errors.Newf("expected DE-9IM string but found nothing")
 	}
 	return string(cStringToSafeGoBytes(ret)), nil
+}
+
+// RelatePattern whether A and B have a DE-9IM relation matching the given pattern.
+func RelatePattern(a geopb.EWKB, b geopb.EWKB, pattern string) (bool, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return false, err
+	}
+	var ret C.char
+	if err := statusToError(
+		C.CR_GEOS_RelatePattern(g, goToCSlice(a), goToCSlice(b), goToCSlice([]byte(pattern)), &ret),
+	); err != nil {
+		return false, err
+	}
+	return ret == 1, nil
 }

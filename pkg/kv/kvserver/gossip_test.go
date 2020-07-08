@@ -140,6 +140,10 @@ func TestGossipFirstRange(t *testing.T) {
 // restarted after losing its data) without the cluster breaking.
 func TestGossipHandlesReplacedNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	// Skipping as part of test-infra-team flaky test cleanup.
+	t.Skip("https://github.com/cockroachdb/cockroach/issues/50024")
+
 	if testing.Short() {
 		// As of Nov 2018 it takes 3.6s.
 		t.Skip("short")
@@ -212,12 +216,16 @@ func TestGossipAfterAbortOfSystemConfigTransactionAfterFailureDueToIntents(t *te
 	txB := db.NewTxn(ctx, "b")
 
 	require.NoError(t, txA.SetSystemConfigTrigger())
-	require.NoError(t, txA.Put(
-		ctx, keys.SystemSQLCodec.DescMetadataKey(1000), sqlbase.WrapDescriptor(&sqlbase.DatabaseDescriptor{})))
+	db1000 := sqlbase.NewInitialDatabaseDescriptor(1000, "1000")
+	require.NoError(t, txA.Put(ctx,
+		keys.SystemSQLCodec.DescMetadataKey(1000),
+		db1000.DescriptorProto()))
 
 	require.NoError(t, txB.SetSystemConfigTrigger())
-	require.NoError(t, txB.Put(
-		ctx, keys.SystemSQLCodec.DescMetadataKey(2000), sqlbase.WrapDescriptor(&sqlbase.DatabaseDescriptor{})))
+	db2000 := sqlbase.NewInitialDatabaseDescriptor(2000, "2000")
+	require.NoError(t, txB.Put(ctx,
+		keys.SystemSQLCodec.DescMetadataKey(2000),
+		db2000.DescriptorProto()))
 
 	const someTime = 10 * time.Millisecond
 	clearNotifictions := func(ch <-chan struct{}) {

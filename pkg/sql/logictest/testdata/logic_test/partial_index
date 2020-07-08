@@ -21,13 +21,16 @@ statement error expected index predicate expression to have type bool, but '1' h
 CREATE TABLE error (a INT, INDEX (a) WHERE 1)
 
 # Don't allow columns not in table.
-statement error pgcode 42703 column "b" does not exist, referenced in "b = 3"
+statement error pgcode 42703 column "b" does not exist
 CREATE TABLE error (a INT, INDEX (a) WHERE b = 3)
 
 # Don't allow mutable functions.
 # TODO(mgartner): The error code for this should be 42P17, not 0A000.
-statement error pgcode 0A000 impure functions are not allowed in index predicate
+statement error pgcode 0A000 context-dependent functions are not allowed in index predicate
 CREATE TABLE error (t TIMESTAMPTZ, INDEX (t) WHERE t < now())
+
+statement error pgcode 0A000 volatile functions are not allowed in index predicate
+CREATE TABLE error (t FLOAT, INDEX (t) WHERE t < random())
 
 # Don't allow variable subexpressions.
 statement error pgcode 42601 variable sub-expressions are not allowed in index predicate
@@ -53,6 +56,18 @@ CREATE TABLE error (a INT, INDEX (a) WHERE generate_series(1, 1))
 statement error pq: unsupported binary operator: <bool> - <bool>
 CREATE TABLE error (a INT, INDEX (a) WHERE false - true)
 
+# Don't allow references to other tables.
+statement error no data source matches prefix: t1
+CREATE TABLE error (a INT, INDEX (a) WHERE t1.a > 0)
+
+# Don't allow references to unknown tables.
+statement error no data source matches prefix: unknown
+CREATE TABLE error (a INT, INDEX (a) WHERE unknown.a > 0)
+
+# Don't allow reference to unknown databases.
+statement error no data source matches prefix: unknown.error
+CREATE TABLE error (a INT, INDEX (a) WHERE unknown.error.a > 9)
+
 #### Validate CREATE TABLE ... UNIQUE INDEX predicate.
 
 statement ok
@@ -65,11 +80,94 @@ CREATE TABLE error (a INT, UNIQUE INDEX (a) WHERE 1)
 #### Validate CREATE INDEX predicate.
 
 statement ok
-CREATE TABLE t (a INT)
+CREATE TABLE t5 (a INT)
 
 statement ok
-CREATE INDEX i1 ON t (a) WHERE a = 0
+CREATE INDEX t5i ON t5 (a) WHERE a = 0
 
 # Don't allow invalid predicates.
 statement error expected index predicate expression to have type bool, but '1' has type int
-CREATE INDEX error ON t (a) WHERE 1
+CREATE INDEX error ON t5 (a) WHERE 1
+
+# Don't allow references to other tables in predicates.
+statement error no data source matches prefix: t4
+CREATE INDEX error ON t5 (a) WHERE t4.a = 1
+
+#### Dequalify table references.
+
+statement ok
+CREATE TABLE t6 (
+    a INT,
+    INDEX (a) WHERE a > 0,
+    INDEX (a) WHERE t6.a > 1,
+    INDEX (a DESC) WHERE test.t6.a > 2,
+    UNIQUE INDEX (a) WHERE a > 3,
+    UNIQUE INDEX (a) WHERE t6.a > 4,
+    UNIQUE INDEX (a DESC) WHERE test.t6.a > 5
+)
+
+statement ok
+CREATE INDEX t6i1 ON t6 (a) WHERE a > 6;
+CREATE INDEX t6i2 ON t6 (a) WHERE t6.a > 7;
+CREATE INDEX t6i3 ON t6 (a DESC) WHERE test.t6.a > 8;
+
+query TT
+SHOW CREATE TABLE t6
+----
+t6  CREATE TABLE t6 (
+    a INT8 NULL,
+    INDEX t6_a_idx (a ASC) WHERE a > 0:::INT8,
+    INDEX t6_a_idx1 (a ASC) WHERE a > 1:::INT8,
+    INDEX t6_a_idx2 (a DESC) WHERE a > 2:::INT8,
+    UNIQUE INDEX t6_a_key (a ASC) WHERE a > 3:::INT8,
+    UNIQUE INDEX t6_a_key1 (a ASC) WHERE a > 4:::INT8,
+    UNIQUE INDEX t6_a_key2 (a DESC) WHERE a > 5:::INT8,
+    INDEX t6i1 (a ASC) WHERE a > 6:::INT8,
+    INDEX t6i2 (a ASC) WHERE a > 7:::INT8,
+    INDEX t6i3 (a DESC) WHERE a > 8:::INT8,
+    FAMILY "primary" (a, rowid)
+)
+
+#### Renaming a column updates the index predicates.
+
+statement ok
+ALTER TABLE t6 RENAME COLUMN a TO b
+
+query TT
+SHOW CREATE TABLE t6
+----
+t6  CREATE TABLE t6 (
+    b INT8 NULL,
+    INDEX t6_a_idx (b ASC) WHERE b > 0:::INT8,
+    INDEX t6_a_idx1 (b ASC) WHERE b > 1:::INT8,
+    INDEX t6_a_idx2 (b DESC) WHERE b > 2:::INT8,
+    UNIQUE INDEX t6_a_key (b ASC) WHERE b > 3:::INT8,
+    UNIQUE INDEX t6_a_key1 (b ASC) WHERE b > 4:::INT8,
+    UNIQUE INDEX t6_a_key2 (b DESC) WHERE b > 5:::INT8,
+    INDEX t6i1 (b ASC) WHERE b > 6:::INT8,
+    INDEX t6i2 (b ASC) WHERE b > 7:::INT8,
+    INDEX t6i3 (b DESC) WHERE b > 8:::INT8,
+    FAMILY "primary" (b, rowid)
+)
+
+#### Renaming a table keeps the index predicates intact.
+
+statement ok
+ALTER TABLE t6 RENAME TO t7
+
+query TT
+SHOW CREATE TABLE t7
+----
+t7  CREATE TABLE t7 (
+    b INT8 NULL,
+    INDEX t6_a_idx (b ASC) WHERE b > 0:::INT8,
+    INDEX t6_a_idx1 (b ASC) WHERE b > 1:::INT8,
+    INDEX t6_a_idx2 (b DESC) WHERE b > 2:::INT8,
+    UNIQUE INDEX t6_a_key (b ASC) WHERE b > 3:::INT8,
+    UNIQUE INDEX t6_a_key1 (b ASC) WHERE b > 4:::INT8,
+    UNIQUE INDEX t6_a_key2 (b DESC) WHERE b > 5:::INT8,
+    INDEX t6i1 (b ASC) WHERE b > 6:::INT8,
+    INDEX t6i2 (b ASC) WHERE b > 7:::INT8,
+    INDEX t6i3 (b DESC) WHERE b > 8:::INT8,
+    FAMILY "primary" (b, rowid)
+)

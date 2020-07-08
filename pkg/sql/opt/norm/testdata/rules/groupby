@@ -20,6 +20,16 @@ CREATE TABLE xy
 ----
 
 exec-ddl
+CREATE TABLE fks
+(
+    k INT PRIMARY KEY,
+    v INT,
+    r1 INT NOT NULL REFERENCES xy(x),
+    r2 INT REFERENCES xy(x)
+)
+----
+
+exec-ddl
 CREATE TABLE abc
 (
     a INT,
@@ -99,6 +109,364 @@ group-by
       └── sum [as=sum:6, outer=(3)]
            └── f:3
 
+# --------------------------------------------------
+# EliminateJoinUnderGroupByLeft
+# --------------------------------------------------
+
+# Simple DistinctOn case with a LeftJoin.
+norm expect=EliminateJoinUnderGroupByLeft
+SELECT DISTINCT ON (x) x, y FROM xy LEFT JOIN fks ON x=v
+----
+scan xy
+ ├── columns: x:1!null y:2
+ ├── key: (1)
+ └── fd: (1)-->(2)
+
+# RightJoin case. The RightJoin is turned into a LeftJoin, so
+# EliminateJoinUnderGroupByLeft matches it.
+norm expect=EliminateJoinUnderGroupByLeft
+SELECT DISTINCT ON (x) x, y FROM fks RIGHT JOIN xy ON x=v
+----
+scan xy
+ ├── columns: x:5!null y:6
+ ├── key: (5)
+ └── fd: (5)-->(6)
+
+# InnerJoin case. The Values operator in the join guarantees cardinality of at
+# least one, so rows from the left input are guaranteed to be included in the
+# join at least once.
+norm expect=EliminateJoinUnderGroupByLeft
+SELECT k, max(r1) FROM fks INNER JOIN (SELECT * FROM (VALUES (1), (2)) f(t)) ON True GROUP BY k
+----
+group-by
+ ├── columns: k:1!null max:6!null
+ ├── grouping columns: k:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(6)
+ ├── scan fks
+ │    ├── columns: k:1!null r1:3!null
+ │    ├── key: (1)
+ │    └── fd: (1)-->(3)
+ └── aggregations
+      └── max [as=max:6, outer=(3)]
+           └── r1:3
+
+# Case with ScalarGroupBy with a sum aggregate that doesn't ignore duplicates.
+# The join can be eliminated because r1 is a foreign key referencing x, which
+# implies that the rows of fks are not being duplicated by the join.
+norm expect=EliminateJoinUnderGroupByLeft disable=EliminateJoinUnderProjectLeft
+SELECT sum(k) FROM fks LEFT JOIN xy ON x=r1
+----
+scalar-group-by
+ ├── columns: sum:7
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(7)
+ ├── scan fks
+ │    ├── columns: k:1!null
+ │    └── key: (1)
+ └── aggregations
+      └── sum [as=sum:7, outer=(1)]
+           └── k:1
+
+# LeftJoin case with possible duplicate rows. The rule can fire because the
+# output of the max aggregate is not affected by duplicate rows.
+norm expect=EliminateJoinUnderGroupByLeft
+SELECT x, max(y) FROM xy LEFT JOIN fks ON True GROUP BY x
+----
+group-by
+ ├── columns: x:1!null max:7
+ ├── grouping columns: x:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── scan xy
+ │    ├── columns: x:1!null y:2
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2)
+ └── aggregations
+      └── max [as=max:7, outer=(2)]
+           └── y:2
+
+# LeftJoin case with a not-null foreign key equality filter and a sum aggregate.
+norm expect=EliminateJoinUnderGroupByLeft disable=EliminateJoinUnderProjectLeft
+SELECT k, sum(r1) FROM fks LEFT JOIN xy ON x=r1 GROUP BY k
+----
+group-by
+ ├── columns: k:1!null sum:7!null
+ ├── grouping columns: k:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── scan fks
+ │    ├── columns: k:1!null r1:3!null
+ │    ├── key: (1)
+ │    └── fd: (1)-->(3)
+ └── aggregations
+      └── sum [as=sum:7, outer=(3)]
+           └── r1:3
+
+# The LeftJoin guarantees that all left rows will be included in the output, and
+# since k is a key column, no rows from xy will be duplicated. Therefore the sum
+# aggregate will not be affected by join removal.
+norm expect=EliminateJoinUnderGroupByLeft disable=EliminateJoinUnderProjectLeft
+SELECT x, sum(y) FROM xy LEFT JOIN fks ON x=k GROUP BY x
+----
+group-by
+ ├── columns: x:1!null sum:7
+ ├── grouping columns: x:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── scan xy
+ │    ├── columns: x:1!null y:2
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2)
+ └── aggregations
+      └── sum [as=sum:7, outer=(2)]
+           └── y:2
+
+# The LeftJoin guarantees that all left rows will be included in the output, and
+# since r2 is a foreign key referencing x, it is guaranteed that no left rows
+# will be matched more than once. Therefore, the sum aggregate will be
+# unaffected by join removal.
+norm expect=EliminateJoinUnderGroupByLeft disable=EliminateJoinUnderProjectLeft
+SELECT k, sum(r1) FROM fks LEFT JOIN xy ON x=r2 GROUP BY k
+----
+group-by
+ ├── columns: k:1!null sum:7!null
+ ├── grouping columns: k:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── scan fks
+ │    ├── columns: k:1!null r1:3!null
+ │    ├── key: (1)
+ │    └── fd: (1)-->(3)
+ └── aggregations
+      └── sum [as=sum:7, outer=(3)]
+           └── r1:3
+
+# InnerJoin case. Because r1 is a non-null foreign key that references x, the
+# join output is guaranteed to include every left row exactly once.
+norm expect=EliminateJoinUnderGroupByLeft disable=EliminateJoinUnderProjectLeft
+SELECT k, sum(r1) FROM fks INNER JOIN xy ON x=r1 GROUP BY k
+----
+group-by
+ ├── columns: k:1!null sum:7!null
+ ├── grouping columns: k:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── scan fks
+ │    ├── columns: k:1!null r1:3!null
+ │    ├── key: (1)
+ │    └── fd: (1)-->(3)
+ └── aggregations
+      └── sum [as=sum:7, outer=(3)]
+           └── r1:3
+
+# Case with an ordering on left columns.
+norm expect=EliminateJoinUnderGroupByLeft
+SELECT max(y) FROM xy LEFT JOIN fks ON True GROUP BY x ORDER BY x
+----
+group-by
+ ├── columns: max:7  [hidden: x:1!null]
+ ├── grouping columns: x:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── ordering: +1
+ ├── scan xy
+ │    ├── columns: x:1!null y:2
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2)
+ │    └── ordering: +1
+ └── aggregations
+      └── max [as=max:7, outer=(2)]
+           └── y:2
+
+# Cross join case where neither the foreign key column nor its referenced column
+# are output columns.
+norm expect=EliminateJoinUnderGroupByLeft
+SELECT DISTINCT ON (k) k, v FROM fks INNER JOIN xy ON True
+----
+scan fks
+ ├── columns: k:1!null v:2
+ ├── key: (1)
+ └── fd: (1)-->(2)
+
+# No-op case because the InnerJoin will return no rows if fks is empty.
+norm expect-not=EliminateJoinUnderGroupByLeft
+SELECT DISTINCT ON (x) x, y FROM xy INNER JOIN fks ON True
+----
+distinct-on
+ ├── columns: x:1!null y:2
+ ├── grouping columns: x:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── inner-join (cross)
+ │    ├── columns: x:1!null y:2
+ │    ├── fd: (1)-->(2)
+ │    ├── scan xy
+ │    │    ├── columns: x:1!null y:2
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2)
+ │    ├── scan fks
+ │    └── filters (true)
+ └── aggregations
+      └── first-agg [as=y:2, outer=(2)]
+           └── y:2
+
+# No-op case because the DistinctOn is using columns from the right input.
+norm expect-not=EliminateJoinUnderGroupByLeft
+SELECT DISTINCT ON (x) y, k FROM xy LEFT JOIN fks ON True
+----
+distinct-on
+ ├── columns: y:2 k:3  [hidden: x:1!null]
+ ├── grouping columns: x:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(2,3)
+ ├── left-join (cross)
+ │    ├── columns: x:1!null y:2 k:3
+ │    ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
+ │    ├── key: (1,3)
+ │    ├── fd: (1)-->(2)
+ │    ├── scan xy
+ │    │    ├── columns: x:1!null y:2
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2)
+ │    ├── scan fks
+ │    │    ├── columns: k:3!null
+ │    │    └── key: (3)
+ │    └── filters (true)
+ └── aggregations
+      ├── first-agg [as=y:2, outer=(2)]
+      │    └── y:2
+      └── first-agg [as=k:3, outer=(3)]
+           └── k:3
+
+# No-op case because an InnerJoin on true may create duplicate rows that will
+# affect the output of the sum on r1.
+norm expect-not=EliminateJoinUnderGroupByLeft
+SELECT k, sum(r1) FROM fks INNER JOIN xy ON True GROUP BY k
+----
+group-by
+ ├── columns: k:1!null sum:7!null
+ ├── grouping columns: k:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── inner-join (cross)
+ │    ├── columns: k:1!null r1:3!null
+ │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
+ │    ├── fd: (1)-->(3)
+ │    ├── scan fks
+ │    │    ├── columns: k:1!null r1:3!null
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(3)
+ │    ├── scan xy
+ │    └── filters (true)
+ └── aggregations
+      └── sum [as=sum:7, outer=(3)]
+           └── r1:3
+
+# No-op case with a foreign key equality filter and a sum aggregate. No-op
+# because r2 is nullable and therefore the InnerJoin may filter out rows.
+norm expect-not=EliminateJoinUnderGroupByLeft
+SELECT k, sum(r1) FROM fks INNER JOIN xy ON x=r2 GROUP BY k
+----
+group-by
+ ├── columns: k:1!null sum:7!null
+ ├── grouping columns: k:1!null
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── inner-join (hash)
+ │    ├── columns: k:1!null r1:3!null r2:4!null x:5!null
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(3,4), (4)==(5), (5)==(4)
+ │    ├── scan fks
+ │    │    ├── columns: k:1!null r1:3!null r2:4
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(3,4)
+ │    ├── scan xy
+ │    │    ├── columns: x:5!null
+ │    │    └── key: (5)
+ │    └── filters
+ │         └── x:5 = r2:4 [outer=(4,5), constraints=(/4: (/NULL - ]; /5: (/NULL - ]), fd=(4)==(5), (5)==(4)]
+ └── aggregations
+      └── sum [as=sum:7, outer=(3)]
+           └── r1:3
+
+# No-op case because the ordering includes a column from the right input.
+norm expect-not=EliminateJoinUnderGroupByLeft
+SELECT x, max(y) FROM xy LEFT JOIN fks ON True GROUP BY x, k ORDER BY x, k
+----
+group-by
+ ├── columns: x:1!null max:7  [hidden: k:3]
+ ├── grouping columns: x:1!null k:3
+ ├── key: (1,3)
+ ├── fd: (1,3)-->(7)
+ ├── ordering: +1,+3
+ ├── sort
+ │    ├── columns: x:1!null y:2 k:3
+ │    ├── key: (1,3)
+ │    ├── fd: (1)-->(2)
+ │    ├── ordering: +1,+3
+ │    └── left-join (cross)
+ │         ├── columns: x:1!null y:2 k:3
+ │         ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
+ │         ├── key: (1,3)
+ │         ├── fd: (1)-->(2)
+ │         ├── scan xy
+ │         │    ├── columns: x:1!null y:2
+ │         │    ├── key: (1)
+ │         │    └── fd: (1)-->(2)
+ │         ├── scan fks
+ │         │    ├── columns: k:3!null
+ │         │    └── key: (3)
+ │         └── filters (true)
+ └── aggregations
+      └── max [as=max:7, outer=(2)]
+           └── y:2
+
+# --------------------------------------------------
+# EliminateJoinUnderGroupByRight
+# --------------------------------------------------
+
+# InnerJoin case.
+norm expect=EliminateJoinUnderGroupByRight disable=EliminateJoinUnderProjectRight
+SELECT k, sum(r1) FROM xy INNER JOIN fks ON x = r1 GROUP BY k
+----
+group-by
+ ├── columns: k:3!null sum:7!null
+ ├── grouping columns: k:3!null
+ ├── key: (3)
+ ├── fd: (3)-->(7)
+ ├── scan fks
+ │    ├── columns: k:3!null r1:5!null
+ │    ├── key: (3)
+ │    └── fd: (3)-->(5)
+ └── aggregations
+      └── sum [as=sum:7, outer=(5)]
+           └── r1:5
+
+# No-op case because columns from the right side of a left join are being used.
+norm expect-not=EliminateJoinUnderGroupByRight
+SELECT max(r1) FROM xy LEFT JOIN fks ON x = r1
+----
+scalar-group-by
+ ├── columns: max:7
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(7)
+ ├── left-join (hash)
+ │    ├── columns: x:1!null r1:5
+ │    ├── multiplicity: left-rows(one-or-more), right-rows(exactly-one)
+ │    ├── scan xy
+ │    │    ├── columns: x:1!null
+ │    │    └── key: (1)
+ │    ├── scan fks
+ │    │    └── columns: r1:5!null
+ │    └── filters
+ │         └── x:1 = r1:5 [outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
+ └── aggregations
+      └── max [as=max:7, outer=(5)]
+           └── r1:5
 
 # --------------------------------------------------
 # EliminateDistinct
@@ -206,6 +574,7 @@ project
  ├── columns: y:8
  ├── left-join (cross)
  │    ├── columns: k:1!null x:6 xy.y:7
+ │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
  │    ├── key: (1)
  │    ├── fd: (1)-->(6,7)
  │    ├── scan a
@@ -317,25 +686,30 @@ SELECT (SELECT y FROM xy WHERE x+y=k) FROM a
 ----
 project
  ├── columns: y:8
+ ├── immutable
  ├── ensure-distinct-on
  │    ├── columns: k:1!null xy.y:7
  │    ├── grouping columns: k:1!null
  │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(7)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null xy.y:7 column9:9
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
+ │    │    ├── immutable
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null
  │    │    │    └── key: (1)
  │    │    ├── project
  │    │    │    ├── columns: column9:9 xy.y:7
+ │    │    │    ├── immutable
  │    │    │    ├── scan xy
  │    │    │    │    ├── columns: x:6!null xy.y:7
  │    │    │    │    ├── key: (6)
  │    │    │    │    └── fd: (6)-->(7)
  │    │    │    └── projections
- │    │    │         └── x:6 + xy.y:7 [as=column9:9, outer=(6,7)]
+ │    │    │         └── x:6 + xy.y:7 [as=column9:9, outer=(6,7), immutable]
  │    │    └── filters
  │    │         └── k:1 = column9:9 [outer=(1,9), constraints=(/1: (/NULL - ]; /9: (/NULL - ]), fd=(1)==(9), (9)==(1)]
  │    └── aggregations
@@ -358,7 +732,7 @@ insert nullablecols
  │    ├── i:6 => c3:3
  │    └── i:6 => rowid:4
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── upsert-distinct-on
       ├── columns: i:6!null
       ├── grouping columns: i:6!null
@@ -369,6 +743,7 @@ insert nullablecols
            ├── fd: ()-->(15,18), (5)-->(6)
            ├── left-join (hash)
            │    ├── columns: k:5!null i:6!null c1:15 rowid:18
+           │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
            │    ├── key: (5,18)
            │    ├── fd: (5)-->(6), (18)-->(15), (15)~~>(18)
            │    ├── select
@@ -420,13 +795,14 @@ upsert nullablecols
  ├── update-mapping:
  │    └── upsert_c3:22 => c3:3
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: upsert_c3:22!null i:6!null c1:15 c2:16 c3:17 rowid:18
       ├── key: (6,18)
       ├── fd: (18)-->(15-17), (15)~~>(16-18), (16,17)~~>(15,18), (6,18)-->(22)
       ├── left-join (hash)
       │    ├── columns: i:6!null c1:15 c2:16 c3:17 rowid:18
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    ├── key: (6,18)
       │    ├── fd: (18)-->(15-17), (15)~~>(16-18), (16,17)~~>(15,18)
       │    ├── ensure-upsert-distinct-on
@@ -471,18 +847,21 @@ SELECT min(s) FROM (SELECT i+1 AS i2, s FROM a) GROUP BY i2
 ----
 project
  ├── columns: min:7!null
+ ├── immutable
  └── group-by
       ├── columns: i2:6!null min:7!null
       ├── grouping columns: i2:6!null
+      ├── immutable
       ├── key: (6)
       ├── fd: (6)-->(7)
       ├── project
       │    ├── columns: i2:6!null s:4!null
+      │    ├── immutable
       │    ├── scan a
       │    │    ├── columns: i:2!null s:4!null
       │    │    └── key: (2,4)
       │    └── projections
-      │         └── i:2 + 1 [as=i2:6, outer=(2)]
+      │         └── i:2 + 1 [as=i2:6, outer=(2), immutable]
       └── aggregations
            └── min [as=min:7, outer=(4)]
                 └── s:4
@@ -627,7 +1006,7 @@ insert xy
  │    ├── y:4 => x:1
  │    └── column5:5 => y:2
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: y:4!null column5:5
       ├── cardinality: [0 - 1]
@@ -644,6 +1023,7 @@ insert xy
            │    ├── limit hint: 1.00
            │    ├── left-join (hash)
            │    │    ├── columns: y:4!null column5:5 x:6
+           │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
            │    │    ├── fd: ()-->(4,5)
            │    │    ├── limit hint: 1.00
            │    │    ├── project
@@ -683,7 +1063,7 @@ upsert xy
  ├── update-mapping:
  │    └── upsert_y:10 => y:2
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: upsert_y:10 y:4!null column5:5 x:6 y:7
       ├── cardinality: [0 - 1]
@@ -692,6 +1072,7 @@ upsert xy
       ├── left-join (hash)
       │    ├── columns: y:4!null column5:5 x:6 y:7
       │    ├── cardinality: [0 - 1]
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    ├── key: ()
       │    ├── fd: ()-->(4-7)
       │    ├── max1-row
@@ -733,7 +1114,7 @@ insert xy
  │    ├── y:4 => x:1
  │    └── column5:5 => y:2
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── upsert-distinct-on
       ├── columns: y:4 column5:5
       ├── grouping columns: y:4
@@ -744,6 +1125,7 @@ insert xy
       │    ├── fd: ()-->(4-6)
       │    ├── left-join (hash)
       │    │    ├── columns: y:4 column5:5 x:6
+      │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    │    ├── fd: ()-->(4,5)
       │    │    ├── project
       │    │    │    ├── columns: column5:5 y:4
@@ -784,13 +1166,14 @@ upsert xy
  ├── update-mapping:
  │    └── upsert_y:10 => y:2
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: upsert_y:10 y:4 column5:5 x:6 y:7
       ├── lax-key: (4,6)
-      ├── fd: ()-->(4,5), (6)-->(7), (6)-->(10)
+      ├── fd: ()-->(4,5), (6)-->(7,10)
       ├── left-join (hash)
       │    ├── columns: y:4 column5:5 x:6 y:7
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    ├── lax-key: (4,6)
       │    ├── fd: ()-->(4,5), (6)-->(7)
       │    ├── ensure-upsert-distinct-on
@@ -840,9 +1223,10 @@ upsert abc
  ├── update-mapping:
  │    └── "?column?":7 => a:1
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── left-join (hash)
       ├── columns: b:5!null "?column?":7!null "?column?":8!null a:9 b:10 c:11
+      ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       ├── key: (5)
       ├── fd: ()-->(7,8), (5)-->(9-11)
       ├── ensure-upsert-distinct-on
@@ -889,13 +1273,14 @@ upsert abc
  ├── update-mapping:
  │    └── upsert_c:14 => c:3
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: upsert_c:14!null b:5!null c:6!null "?column?":7 a:8 b:9 c:10
       ├── lax-key: (6-10)
       ├── fd: ()-->(5,7), (6,8)-->(14)
       ├── left-join (hash)
       │    ├── columns: b:5!null c:6!null "?column?":7 a:8 b:9 c:10
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    ├── lax-key: (6-10)
       │    ├── fd: ()-->(5,7)
       │    ├── ensure-upsert-distinct-on
@@ -995,7 +1380,8 @@ project
            └── sum [as=sum:6, outer=(1)]
                 └── k:1
 
-# GroupBy with no key.
+# GroupBy with no key. The AggDistinct is instead pushed into the GroupBy by
+# PushAggDistinctIntoGroupBy.
 norm expect-not=EliminateAggDistinctForKeys
 SELECT sum(DISTINCT a) FROM abc GROUP BY b
 ----
@@ -1006,12 +1392,15 @@ project
       ├── grouping columns: b:2!null
       ├── key: (2)
       ├── fd: (2)-->(4)
-      ├── scan abc
-      │    └── columns: a:1!null b:2!null
+      ├── distinct-on
+      │    ├── columns: a:1!null b:2!null
+      │    ├── grouping columns: a:1!null b:2!null
+      │    ├── key: (1,2)
+      │    └── scan abc
+      │         └── columns: a:1!null b:2!null
       └── aggregations
-           └── agg-distinct [as=sum:4, outer=(1)]
-                └── sum
-                     └── a:1
+           └── sum [as=sum:4, outer=(1)]
+                └── a:1
 
 # GroupBy with composite key formed by argument plus grouping columns.
 norm expect=EliminateAggDistinctForKeys
@@ -1353,7 +1742,7 @@ insert a
  │    ├── "?column?":12 => s:4
  │    └── column14:14 => j:5
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: i:7!null "?column?":11!null "?column?":12!null column13:13 column14:14
       ├── cardinality: [0 - 1]
@@ -1370,6 +1759,7 @@ insert a
            │    ├── limit hint: 1.00
            │    ├── left-join (hash)
            │    │    ├── columns: i:7!null "?column?":11!null "?column?":12!null column13:13 column14:14 i:16 s:18
+           │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
            │    │    ├── fd: ()-->(7,11-14)
            │    │    ├── limit hint: 1.00
            │    │    ├── project
@@ -1423,6 +1813,7 @@ project
  │    ├── fd: ()-->(1,2,6,7)
  │    └── left-join (hash)
  │         ├── columns: k:1!null i:2!null xy.x:6 y:7
+ │         ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
  │         ├── key: (6)
  │         ├── fd: ()-->(1,2), (6)-->(7)
  │         ├── select
@@ -1463,7 +1854,7 @@ upsert a
  ├── update-mapping:
  │    └── upsert_f:23 => f:3
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: upsert_f:23 i:7!null "?column?":11!null "?column?":12!null column13:13 column14:14 k:15 i:16 f:17 s:18 j:19
       ├── cardinality: [0 - 1]
@@ -1472,6 +1863,7 @@ upsert a
       ├── left-join (hash)
       │    ├── columns: i:7!null "?column?":11!null "?column?":12!null column13:13 column14:14 k:15 i:16 f:17 s:18 j:19
       │    ├── cardinality: [0 - 1]
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    ├── key: ()
       │    ├── fd: ()-->(7,11-19)
       │    ├── max1-row
@@ -1530,12 +1922,16 @@ WHERE x > 100 OR b > 100
 ----
 project
  ├── columns: x:1!null y:2!null z:3!null a:4 b:5 c:6 "?column?":7!null
+ ├── cardinality: [0 - 2]
+ ├── immutable
  ├── fd: (1)-->(7)
  ├── select
  │    ├── columns: column1:1!null column2:2!null column3:3!null a:4 b:5 c:6
+ │    ├── cardinality: [0 - 2]
  │    ├── left-join (hash)
  │    │    ├── columns: column1:1!null column2:2!null column3:3!null a:4 b:5 c:6
- │    │    ├── cardinality: [2 - ]
+ │    │    ├── cardinality: [2 - 2]
+ │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
  │    │    ├── values
  │    │    │    ├── columns: column1:1!null column2:2!null column3:3!null
  │    │    │    ├── cardinality: [2 - 2]
@@ -1551,7 +1947,7 @@ project
  │    └── filters
  │         └── (column1:1 > 100) OR (b:5 > 100) [outer=(1,5)]
  └── projections
-      └── column1:1 + 1 [as="?column?":7, outer=(1)]
+      └── column1:1 + 1 [as="?column?":7, outer=(1), immutable]
 
 # Right input of left join does not have a key, so left side may have dups.
 norm expect-not=EliminateDistinctOnValues
@@ -1569,6 +1965,7 @@ distinct-on
  ├── left-join (hash)
  │    ├── columns: column1:1!null a:2
  │    ├── cardinality: [2 - ]
+ │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    ├── values
  │    │    ├── columns: column1:1!null
  │    │    ├── cardinality: [2 - 2]
@@ -1599,6 +1996,7 @@ distinct-on
  ├── left-join (hash)
  │    ├── columns: column1:1!null column2:2!null a:3 b:4 c:5
  │    ├── cardinality: [2 - ]
+ │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    ├── values
  │    │    ├── columns: column1:1!null column2:2!null
  │    │    ├── cardinality: [2 - 2]
@@ -1627,11 +2025,13 @@ distinct-on
  ├── columns: x:1!null y:2!null
  ├── grouping columns: y:2!null
  ├── cardinality: [1 - 2]
+ ├── immutable
  ├── key: (2)
  ├── fd: (1)-->(2), (2)-->(1)
  ├── project
  │    ├── columns: y:2!null column1:1!null
  │    ├── cardinality: [2 - 2]
+ │    ├── immutable
  │    ├── fd: (1)-->(2)
  │    ├── values
  │    │    ├── columns: column1:1!null
@@ -1639,7 +2039,7 @@ distinct-on
  │    │    ├── (1,)
  │    │    └── (2,)
  │    └── projections
- │         └── column1:1 + 1 [as=y:2, outer=(1)]
+ │         └── column1:1 + 1 [as=y:2, outer=(1), immutable]
  └── aggregations
       └── first-agg [as=column1:1, outer=(1)]
            └── column1:1
@@ -1658,6 +2058,7 @@ distinct-on
  ├── fd: (6)-->(1)
  ├── left-join (hash)
  │    ├── columns: k:1!null column1:6
+ │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
  │    ├── scan a
  │    │    ├── columns: k:1!null
  │    │    └── key: (1)
@@ -1721,12 +2122,12 @@ distinct-on
  ├── columns: x:1
  ├── grouping columns: column1:1
  ├── cardinality: [1 - 2]
- ├── side-effects
+ ├── volatile
  ├── key: (1)
  └── values
       ├── columns: column1:1
       ├── cardinality: [2 - 2]
-      ├── side-effects
+      ├── volatile
       ├── (1,)
       └── (unique_rowid(),)
 
@@ -1794,16 +2195,19 @@ insert a
  │    ├── column2:7 => s:4
  │    └── column10:10 => j:5
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: column1:6!null column2:7 column3:8 column9:9 column10:10
+      ├── cardinality: [0 - 2]
       ├── fd: ()-->(9,10)
       └── select
            ├── columns: column1:6!null column2:7 column3:8 column9:9 column10:10 i:12 s:14
+           ├── cardinality: [0 - 2]
            ├── fd: ()-->(9,10,14)
            ├── left-join (hash)
            │    ├── columns: column1:6!null column2:7 column3:8 column9:9 column10:10 i:12 s:14
-           │    ├── cardinality: [2 - ]
+           │    ├── cardinality: [2 - 2]
+           │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
            │    ├── fd: ()-->(9,10)
            │    ├── project
            │    │    ├── columns: column9:9 column10:10 column1:6!null column2:7 column3:8
@@ -1844,14 +2248,15 @@ upsert a
  ├── update-mapping:
  │    └── upsert_f:19 => f:3
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: upsert_f:19 column1:6!null column2:7 column3:8 column9:9 column10:10 k:11 i:12 f:13 s:14 j:15
-      ├── cardinality: [2 - ]
+      ├── cardinality: [2 - 2]
       ├── fd: ()-->(9,10), (11)-->(12-15), (12,14)-->(11,13,15), (12,13)~~>(11,14,15)
       ├── left-join (hash)
       │    ├── columns: column1:6!null column2:7 column3:8 column9:9 column10:10 k:11 i:12 f:13 s:14 j:15
-      │    ├── cardinality: [2 - ]
+      │    ├── cardinality: [2 - 2]
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    ├── fd: ()-->(9,10), (11)-->(12-15), (12,14)-->(11,13,15), (12,13)~~>(11,14,15)
       │    ├── project
       │    │    ├── columns: column9:9 column10:10 column1:6!null column2:7 column3:8
@@ -1893,15 +2298,16 @@ upsert a
  ├── update-mapping:
  │    └── upsert_f:19 => f:3
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: upsert_f:19 column1:6!null column2:7!null column3:8!null column9:9 column10:10 k:11 i:12 f:13 s:14 j:15
-      ├── cardinality: [1 - ]
+      ├── cardinality: [1 - 3]
       ├── key: (7,8)
       ├── fd: ()-->(9,10), (7,8)-->(6,11-15,19), (11)-->(12-15), (12,14)-->(11,13,15), (12,13)~~>(11,14,15)
       ├── left-join (hash)
       │    ├── columns: column1:6!null column2:7!null column3:8!null column9:9 column10:10 k:11 i:12 f:13 s:14 j:15
-      │    ├── cardinality: [1 - ]
+      │    ├── cardinality: [1 - 3]
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    ├── key: (7,8)
       │    ├── fd: ()-->(9,10), (7,8)-->(6,11-15), (11)-->(12-15), (12,14)-->(11,13,15), (12,13)~~>(11,14,15)
       │    ├── ensure-upsert-distinct-on
@@ -1955,28 +2361,37 @@ insert a
  │    ├── column2:7 => s:4
  │    └── column10:10 => j:5
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: column1:6!null column2:7!null column3:8!null column4:9!null column10:10
+      ├── cardinality: [0 - 3]
       ├── fd: ()-->(10)
       └── select
            ├── columns: column1:6!null column2:7!null column3:8!null column4:9!null column10:10 k:11 i:17 s:19 i:22 f:23
+           ├── cardinality: [0 - 3]
            ├── fd: ()-->(10,11,19,22)
            ├── left-join (hash)
            │    ├── columns: column1:6!null column2:7!null column3:8!null column4:9!null column10:10 k:11 i:17 s:19 i:22 f:23
+           │    ├── cardinality: [0 - 3]
+           │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
            │    ├── fd: ()-->(10,11,19)
            │    ├── select
            │    │    ├── columns: column1:6!null column2:7!null column3:8!null column4:9!null column10:10 k:11 i:17 s:19
+           │    │    ├── cardinality: [0 - 3]
            │    │    ├── fd: ()-->(10,11,19)
            │    │    ├── left-join (hash)
            │    │    │    ├── columns: column1:6!null column2:7!null column3:8!null column4:9!null column10:10 k:11 i:17 s:19
+           │    │    │    ├── cardinality: [0 - 3]
+           │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
            │    │    │    ├── fd: ()-->(10,11)
            │    │    │    ├── select
            │    │    │    │    ├── columns: column1:6!null column2:7!null column3:8!null column4:9!null column10:10 k:11
+           │    │    │    │    ├── cardinality: [0 - 3]
            │    │    │    │    ├── fd: ()-->(10,11)
            │    │    │    │    ├── left-join (hash)
            │    │    │    │    │    ├── columns: column1:6!null column2:7!null column3:8!null column4:9!null column10:10 k:11
-           │    │    │    │    │    ├── cardinality: [3 - ]
+           │    │    │    │    │    ├── cardinality: [3 - 3]
+           │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
            │    │    │    │    │    ├── fd: ()-->(10)
            │    │    │    │    │    ├── project
            │    │    │    │    │    │    ├── columns: column10:10 column1:6!null column2:7!null column3:8!null column4:9!null
@@ -2029,37 +2444,47 @@ insert a
  │    ├── column2:7 => s:4
  │    └── column10:10 => j:5
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── upsert-distinct-on
       ├── columns: column1:6!null column2:7!null column3:8!null column9:9 column10:10
       ├── grouping columns: column3:8!null column9:9
+      ├── cardinality: [0 - 3]
       ├── lax-key: (8,9)
       ├── fd: ()-->(9,10), (7,9)~~>(6,8), (8,9)~~>(6,7,10)
       ├── select
       │    ├── columns: column1:6!null column2:7!null column3:8!null column9:9 column10:10 i:22 f:23
+      │    ├── cardinality: [0 - 3]
       │    ├── lax-key: (7,9,22,23)
       │    ├── fd: ()-->(9,10,22), (7,9)~~>(6,8)
       │    ├── left-join (hash)
       │    │    ├── columns: column1:6!null column2:7!null column3:8!null column9:9 column10:10 i:22 f:23
+      │    │    ├── cardinality: [0 - 3]
+      │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    │    ├── lax-key: (7,9,22,23)
       │    │    ├── fd: ()-->(9,10), (7,9)~~>(6,8)
       │    │    ├── upsert-distinct-on
       │    │    │    ├── columns: column1:6!null column2:7!null column3:8!null column9:9 column10:10
       │    │    │    ├── grouping columns: column2:7!null column9:9
+      │    │    │    ├── cardinality: [0 - 3]
       │    │    │    ├── lax-key: (7,9)
       │    │    │    ├── fd: ()-->(9,10), (7,9)~~>(6,8,10)
       │    │    │    ├── select
       │    │    │    │    ├── columns: column1:6!null column2:7!null column3:8!null column9:9 column10:10 k:11 i:17 s:19
+      │    │    │    │    ├── cardinality: [0 - 3]
       │    │    │    │    ├── fd: ()-->(9-11,19)
       │    │    │    │    ├── left-join (hash)
       │    │    │    │    │    ├── columns: column1:6!null column2:7!null column3:8!null column9:9 column10:10 k:11 i:17 s:19
+      │    │    │    │    │    ├── cardinality: [0 - 3]
+      │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    │    │    │    │    ├── fd: ()-->(9-11)
       │    │    │    │    │    ├── select
       │    │    │    │    │    │    ├── columns: column1:6!null column2:7!null column3:8!null column9:9 column10:10 k:11
+      │    │    │    │    │    │    ├── cardinality: [0 - 3]
       │    │    │    │    │    │    ├── fd: ()-->(9-11)
       │    │    │    │    │    │    ├── left-join (hash)
       │    │    │    │    │    │    │    ├── columns: column1:6!null column2:7!null column3:8!null column9:9 column10:10 k:11
-      │    │    │    │    │    │    │    ├── cardinality: [3 - ]
+      │    │    │    │    │    │    │    ├── cardinality: [3 - 3]
+      │    │    │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    │    │    │    │    │    │    ├── fd: ()-->(9,10)
       │    │    │    │    │    │    │    ├── project
       │    │    │    │    │    │    │    │    ├── columns: column9:9 column10:10 column1:6!null column2:7!null column3:8!null
@@ -2128,55 +2553,65 @@ insert a
  │    ├── column2:7 => s:4
  │    └── column10:10 => j:5
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── project
       ├── columns: column1:6 column2:7!null column3:8!null column4:9!null column10:10
-      ├── side-effects
+      ├── cardinality: [0 - 2]
+      ├── volatile
       ├── fd: ()-->(10), (6)~~>(7-9)
       └── select
            ├── columns: column1:6 column2:7!null column3:8!null column4:9!null column10:10 i:17 s:19 i:22 f:23
-           ├── side-effects
+           ├── cardinality: [0 - 2]
+           ├── volatile
            ├── lax-key: (6,17,19,22,23)
            ├── fd: ()-->(10,19,22), (6)~~>(7-9)
            ├── left-join (hash)
            │    ├── columns: column1:6 column2:7!null column3:8!null column4:9!null column10:10 i:17 s:19 i:22 f:23
-           │    ├── side-effects
+           │    ├── cardinality: [0 - 2]
+           │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
+           │    ├── volatile
            │    ├── lax-key: (6,17,19,22,23)
            │    ├── fd: ()-->(10,19), (6)~~>(7-9)
            │    ├── select
            │    │    ├── columns: column1:6 column2:7!null column3:8!null column4:9!null column10:10 i:17 s:19
-           │    │    ├── side-effects
+           │    │    ├── cardinality: [0 - 2]
+           │    │    ├── volatile
            │    │    ├── lax-key: (6,17,19)
            │    │    ├── fd: ()-->(10,19), (6)~~>(7-9)
            │    │    ├── left-join (hash)
            │    │    │    ├── columns: column1:6 column2:7!null column3:8!null column4:9!null column10:10 i:17 s:19
-           │    │    │    ├── side-effects
+           │    │    │    ├── cardinality: [0 - 2]
+           │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
+           │    │    │    ├── volatile
            │    │    │    ├── lax-key: (6,17,19)
            │    │    │    ├── fd: ()-->(10), (6)~~>(7-9)
            │    │    │    ├── upsert-distinct-on
            │    │    │    │    ├── columns: column1:6 column2:7!null column3:8!null column4:9!null column10:10
            │    │    │    │    ├── grouping columns: column1:6
-           │    │    │    │    ├── side-effects
+           │    │    │    │    ├── cardinality: [0 - 2]
+           │    │    │    │    ├── volatile
            │    │    │    │    ├── lax-key: (6)
            │    │    │    │    ├── fd: ()-->(10), (6)~~>(7-10)
            │    │    │    │    ├── select
            │    │    │    │    │    ├── columns: column1:6 column2:7!null column3:8!null column4:9!null column10:10 k:11
-           │    │    │    │    │    ├── side-effects
+           │    │    │    │    │    ├── cardinality: [0 - 2]
+           │    │    │    │    │    ├── volatile
            │    │    │    │    │    ├── fd: ()-->(10,11)
            │    │    │    │    │    ├── left-join (hash)
            │    │    │    │    │    │    ├── columns: column1:6 column2:7!null column3:8!null column4:9!null column10:10 k:11
-           │    │    │    │    │    │    ├── cardinality: [2 - ]
-           │    │    │    │    │    │    ├── side-effects
+           │    │    │    │    │    │    ├── cardinality: [2 - 2]
+           │    │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
+           │    │    │    │    │    │    ├── volatile
            │    │    │    │    │    │    ├── fd: ()-->(10)
            │    │    │    │    │    │    ├── project
            │    │    │    │    │    │    │    ├── columns: column10:10 column1:6 column2:7!null column3:8!null column4:9!null
            │    │    │    │    │    │    │    ├── cardinality: [2 - 2]
-           │    │    │    │    │    │    │    ├── side-effects
+           │    │    │    │    │    │    │    ├── volatile
            │    │    │    │    │    │    │    ├── fd: ()-->(10)
            │    │    │    │    │    │    │    ├── values
            │    │    │    │    │    │    │    │    ├── columns: column1:6 column2:7!null column3:8!null column4:9!null
            │    │    │    │    │    │    │    │    ├── cardinality: [2 - 2]
-           │    │    │    │    │    │    │    │    ├── side-effects
+           │    │    │    │    │    │    │    │    ├── volatile
            │    │    │    │    │    │    │    │    ├── (unique_rowid(), 'foo', 1, 1.0)
            │    │    │    │    │    │    │    │    └── (unique_rowid(), 'bar', 2, 2.0)
            │    │    │    │    │    │    │    └── projections
@@ -2229,7 +2664,7 @@ insert a
  │    ├── "?column?":11 => s:4
  │    └── column13:13 => j:5
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── upsert-distinct-on
       ├── columns: i:7!null "?column?":11!null column12:12 column13:13
       ├── grouping columns: i:7!null
@@ -2240,6 +2675,7 @@ insert a
       │    ├── fd: ()-->(11-13,17)
       │    ├── left-join (hash)
       │    │    ├── columns: i:7!null "?column?":11!null column12:12 column13:13 i:15 s:17
+      │    │    ├── multiplicity: left-rows(exactly-one), right-rows(one-or-more)
       │    │    ├── fd: ()-->(11-13)
       │    │    ├── project
       │    │    │    ├── columns: column12:12 column13:13 "?column?":11!null i:7!null
@@ -2272,11 +2708,11 @@ insert a
                 └── "?column?":11
 
 # --------------------------------------------------
-# PushAggDistinctIntoScalarGroupBy
+# PushAggDistinctIntoGroupBy
 # --------------------------------------------------
 
 # SUM case.
-norm expect=PushAggDistinctIntoScalarGroupBy
+norm expect=PushAggDistinctIntoGroupBy
 SELECT sum(DISTINCT y) FROM xyzbs
 ----
 scalar-group-by
@@ -2295,7 +2731,7 @@ scalar-group-by
            └── y:2
 
 # COUNT case. Expecting an index scan because opt command is used.
-opt expect=PushAggDistinctIntoScalarGroupBy
+opt expect=PushAggDistinctIntoGroupBy
 SELECT count(DISTINCT y) FROM xyzbs
 ----
 scalar-group-by
@@ -2316,7 +2752,7 @@ scalar-group-by
            └── y:2
 
 # AVG case.
-norm expect=PushAggDistinctIntoScalarGroupBy
+norm expect=PushAggDistinctIntoGroupBy
 SELECT avg(DISTINCT y) FROM xyzbs
 ----
 scalar-group-by
@@ -2335,7 +2771,7 @@ scalar-group-by
            └── y:2
 
 # JSON_AGG case.
-norm expect=PushAggDistinctIntoScalarGroupBy
+norm expect=PushAggDistinctIntoGroupBy
 SELECT json_agg(DISTINCT y) FROM xyzbs
 ----
 scalar-group-by
@@ -2355,7 +2791,7 @@ scalar-group-by
 
 # CORR case.
 # Multiple input arguments for aggregate function.
-norm expect=PushAggDistinctIntoScalarGroupBy
+norm expect=PushAggDistinctIntoGroupBy
 SELECT corr(DISTINCT y, z) FROM xyzbs
 ----
 scalar-group-by
@@ -2376,7 +2812,7 @@ scalar-group-by
 
 # STRING_AGG case.
 # Multiple input arguments for aggregate function.
-norm expect=PushAggDistinctIntoScalarGroupBy
+norm expect=PushAggDistinctIntoGroupBy
 SELECT string_agg(DISTINCT s, '-') FROM xyzbs
 ----
 scalar-group-by
@@ -2406,7 +2842,7 @@ scalar-group-by
 
 # STRING_AGG case with an ORDER BY.
 # Multiple input arguments for aggregate function.
-norm expect=PushAggDistinctIntoScalarGroupBy
+norm expect=PushAggDistinctIntoGroupBy
 SELECT string_agg(DISTINCT s, '-') FROM (SELECT s FROM xyzbs ORDER BY s)
 ----
 scalar-group-by
@@ -2433,6 +2869,8 @@ scalar-group-by
  │         │    └── projections
  │         │         └── '-' [as=column6:6]
  │         └── aggregations
+ │              ├── first-agg [as=s:5, outer=(5)]
+ │              │    └── s:5
  │              └── const-agg [as=column6:6, outer=(6)]
  │                   └── column6:6
  └── aggregations
@@ -2440,9 +2878,102 @@ scalar-group-by
            ├── s:5
            └── column6:6
 
+# Case with a GroupBy operator.
+norm expect=PushAggDistinctIntoGroupBy
+SELECT b, count(DISTINCT y) FROM xyzbs GROUP BY b
+----
+group-by
+ ├── columns: b:4!null count:6!null
+ ├── grouping columns: b:4!null
+ ├── key: (4)
+ ├── fd: (4)-->(6)
+ ├── distinct-on
+ │    ├── columns: y:2 b:4!null
+ │    ├── grouping columns: y:2 b:4!null
+ │    ├── key: (2,4)
+ │    └── scan xyzbs
+ │         └── columns: y:2 b:4!null
+ └── aggregations
+      └── count [as=count:6, outer=(2)]
+           └── y:2
+
+# Case with a GroupBy operator grouping on multiple columns.
+norm expect=PushAggDistinctIntoGroupBy
+SELECT b, s, count(DISTINCT y) FROM xyzbs GROUP BY b, s
+----
+group-by
+ ├── columns: b:4!null s:5 count:6!null
+ ├── grouping columns: b:4!null s:5
+ ├── key: (4,5)
+ ├── fd: (4,5)-->(6)
+ ├── distinct-on
+ │    ├── columns: y:2 b:4!null s:5
+ │    ├── grouping columns: y:2 b:4!null s:5
+ │    ├── key: (2,4,5)
+ │    └── scan xyzbs
+ │         └── columns: y:2 b:4!null s:5
+ └── aggregations
+      └── count [as=count:6, outer=(2)]
+           └── y:2
+
+# Case with a GroupBy operator and an aggregate with multiple input columns.
+norm expect=PushAggDistinctIntoGroupBy
+SELECT s, corr(DISTINCT y, z) FROM xyzbs GROUP BY s
+----
+group-by
+ ├── columns: s:5 corr:6
+ ├── grouping columns: s:5
+ ├── key: (5)
+ ├── fd: (5)-->(6)
+ ├── distinct-on
+ │    ├── columns: y:2 z:3!null s:5
+ │    ├── grouping columns: y:2 z:3!null s:5
+ │    ├── key: (2,3,5)
+ │    └── scan xyzbs
+ │         └── columns: y:2 z:3!null s:5
+ └── aggregations
+      └── corr [as=corr:6, outer=(2,3)]
+           ├── y:2
+           └── z:3
+
+# The ordering columns of the GroupBy operator should become FirstAggs in the
+# DistinctOn. This ensures that the ordering columns are available for the
+# GroupBy operator.
+norm expect=PushAggDistinctIntoGroupBy
+SELECT array_agg(DISTINCT s) FROM (SELECT * FROM a ORDER BY i) GROUP BY f
+----
+project
+ ├── columns: array_agg:6!null
+ └── group-by
+      ├── columns: f:3 array_agg:6!null
+      ├── grouping columns: f:3
+      ├── internal-ordering: +2 opt(3)
+      ├── key: (3)
+      ├── fd: (3)-->(6)
+      ├── sort
+      │    ├── columns: i:2!null f:3 s:4!null
+      │    ├── key: (2,4)
+      │    ├── fd: (2,4)-->(3), (2,3)~~>(4), (3,4)-->(2)
+      │    ├── ordering: +2 opt(3) [actual: +2]
+      │    └── distinct-on
+      │         ├── columns: i:2!null f:3 s:4!null
+      │         ├── grouping columns: f:3 s:4!null
+      │         ├── key: (2,4)
+      │         ├── fd: (2,4)-->(3), (2,3)~~>(4), (3,4)-->(2)
+      │         ├── scan a
+      │         │    ├── columns: i:2!null f:3 s:4!null
+      │         │    ├── key: (2,4)
+      │         │    └── fd: (2,4)-->(3), (2,3)~~>(4)
+      │         └── aggregations
+      │              └── first-agg [as=i:2, outer=(2)]
+      │                   └── i:2
+      └── aggregations
+           └── array-agg [as=array_agg:6, outer=(4)]
+                └── s:4
+
 # No-op case where the same aggregate function is called on different
 # columns.
-norm expect-not=PushAggDistinctIntoScalarGroupBy
+norm expect-not=PushAggDistinctIntoGroupBy
 SELECT count(DISTINCT y), count(DISTINCT z) FROM xyzbs
 ----
 scalar-group-by
@@ -2462,7 +2993,7 @@ scalar-group-by
 
 # No-op case where different aggregate functions are called on the same
 # column.
-norm expect-not=PushAggDistinctIntoScalarGroupBy
+norm expect-not=PushAggDistinctIntoGroupBy
 SELECT count(DISTINCT y), sum(DISTINCT y) FROM xyzbs
 ----
 scalar-group-by
@@ -2481,9 +3012,9 @@ scalar-group-by
                 └── y:2
 
 # No-op cases where EliminateAggDistinct removes the AggDistinct before
-# PushAggDistinctIntoScalarGroupBy is applied. Applies to MAX, MIN, BOOL_AND,
+# PushAggDistinctIntoGroupBy is applied. Applies to MAX, MIN, BOOL_AND,
 # and BOOL_OR.
-norm expect-not=PushAggDistinctIntoScalarGroupBy
+norm expect-not=PushAggDistinctIntoGroupBy
 SELECT max(DISTINCT y) FROM xyzbs
 ----
 scalar-group-by
@@ -2497,7 +3028,7 @@ scalar-group-by
       └── max [as=max:6, outer=(2)]
            └── y:2
 
-norm expect-not=PushAggDistinctIntoScalarGroupBy
+norm expect-not=PushAggDistinctIntoGroupBy
 SELECT bool_and(DISTINCT b) FROM xyzbs
 ----
 scalar-group-by
@@ -2901,7 +3432,7 @@ scalar-group-by
 
 # No-op case because the DISTINCT requires the count input column, so the count
 # can't be eliminated.
-norm
+norm expect-not=ConvertCountToCountRows
 SELECT count(DISTINCT y) FROM xyzbs GROUP BY z
 ----
 project
@@ -2911,9 +3442,264 @@ project
       ├── grouping columns: z:3!null
       ├── key: (3)
       ├── fd: (3)-->(6)
-      ├── scan xyzbs
-      │    └── columns: y:2 z:3!null
+      ├── distinct-on
+      │    ├── columns: y:2 z:3!null
+      │    ├── grouping columns: y:2 z:3!null
+      │    ├── key: (2,3)
+      │    └── scan xyzbs
+      │         └── columns: y:2 z:3!null
       └── aggregations
-           └── agg-distinct [as=count:6, outer=(2)]
-                └── count
-                     └── y:2
+           └── count [as=count:6, outer=(2)]
+                └── y:2
+
+# --------------------------------------------------
+# FoldGroupingOperators
+# --------------------------------------------------
+
+# Case with sum aggregate.
+norm expect=FoldGroupingOperators
+SELECT sum(s) FROM (SELECT sum(x) FROM xy GROUP BY y) AS f(s)
+----
+scalar-group-by
+ ├── columns: sum:4
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(4)
+ ├── scan xy
+ │    ├── columns: x:1!null
+ │    └── key: (1)
+ └── aggregations
+      └── sum [as=sum:4, outer=(1)]
+           └── x:1
+
+# Case with count-rows aggregate.
+norm expect=FoldGroupingOperators
+SELECT sum_int(c) FROM (SELECT count(x) FROM xy GROUP BY y) AS f(c)
+----
+scalar-group-by
+ ├── columns: sum_int:4!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(4)
+ ├── scan xy
+ └── aggregations
+      └── count-rows [as=sum_int:4]
+
+# Case with a count aggregate.
+norm expect=FoldGroupingOperators
+SELECT sum_int(cnt) FROM (SELECT count(c2) FROM nullablecols GROUP BY c1) AS f(cnt)
+----
+scalar-group-by
+ ├── columns: sum_int:6!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(6)
+ ├── scan nullablecols
+ │    └── columns: c2:2
+ └── aggregations
+      └── count [as=sum_int:6, outer=(2)]
+           └── c2:2
+
+# Case with max aggregate.
+norm expect=FoldGroupingOperators
+SELECT max(m) FROM (SELECT max(x) FROM xy GROUP BY y) AS f(m)
+----
+scalar-group-by
+ ├── columns: max:4
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(4)
+ ├── scan xy
+ │    ├── columns: x:1!null
+ │    └── key: (1)
+ └── aggregations
+      └── max [as=max:4, outer=(1)]
+           └── x:1
+
+# Case with bit_and aggregate.
+norm expect=FoldGroupingOperators
+SELECT bit_and(b) FROM (SELECT bit_and(x) FROM xy GROUP BY y) AS f(b)
+----
+scalar-group-by
+ ├── columns: bit_and:4
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(4)
+ ├── scan xy
+ │    ├── columns: x:1!null
+ │    └── key: (1)
+ └── aggregations
+      └── bit-and-agg [as=bit_and:4, outer=(1)]
+           └── x:1
+
+# Case with multiple aggregates.
+norm expect=FoldGroupingOperators
+SELECT max(m), sum(s), sum_int(c)
+FROM (SELECT sum(b), count(c), max(b) FROM abc GROUP BY a)
+AS f(s, c, m)
+----
+scalar-group-by
+ ├── columns: max:7 sum:8 sum_int:9!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(7-9)
+ ├── scan abc
+ │    └── columns: b:2!null
+ └── aggregations
+      ├── max [as=max:7, outer=(2)]
+      │    └── b:2
+      ├── sum [as=sum:8, outer=(2)]
+      │    └── b:2
+      └── count-rows [as=sum_int:9]
+
+# GroupBy on GroupBy case where the inner grouping columns determine the outer
+# grouping columns, but they do not intersect.
+norm expect=FoldGroupingOperators
+SELECT sum(s) FROM (SELECT y, sum(x) AS s FROM xy GROUP BY x) GROUP BY y
+----
+project
+ ├── columns: sum:4!null
+ └── group-by
+      ├── columns: y:2 sum:4!null
+      ├── grouping columns: y:2
+      ├── key: (2)
+      ├── fd: (2)-->(4)
+      ├── scan xy
+      │    ├── columns: x:1!null y:2
+      │    ├── key: (1)
+      │    └── fd: (1)-->(2)
+      └── aggregations
+           └── sum [as=sum:4, outer=(1)]
+                └── x:1
+
+# GroupBy on GroupBy case with multiple-column grouping.
+norm expect=FoldGroupingOperators
+SELECT sum(s) FROM (SELECT a, sum(c) AS s FROM abc GROUP BY a, b) GROUP BY a
+----
+project
+ ├── columns: sum:5!null
+ └── group-by
+      ├── columns: a:1!null sum:5!null
+      ├── grouping columns: a:1!null
+      ├── key: (1)
+      ├── fd: (1)-->(5)
+      ├── scan abc
+      │    └── columns: a:1!null c:3!null
+      └── aggregations
+           └── sum [as=sum:5, outer=(3)]
+                └── c:3
+
+# No-op case with an AvgOp. Note: this query actually could be folded if the
+# groups were known to be of the same size.
+norm expect-not=FoldGroupingOperators
+SELECT sum(a) FROM (SELECT avg(x) FROM xy GROUP BY y) AS f(a)
+----
+scalar-group-by
+ ├── columns: sum:4
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(4)
+ ├── group-by
+ │    ├── columns: y:2 avg:3!null
+ │    ├── grouping columns: y:2
+ │    ├── key: (2)
+ │    ├── fd: (2)-->(3)
+ │    ├── scan xy
+ │    │    ├── columns: x:1!null y:2
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2)
+ │    └── aggregations
+ │         └── avg [as=avg:3, outer=(1)]
+ │              └── x:1
+ └── aggregations
+      └── sum [as=sum:4, outer=(3)]
+           └── avg:3
+
+# No-op case with several valid aggregate pairs and one invalid pair.
+norm expect-not=FoldGroupingOperators
+SELECT sum(c), sum(s), max(s) FROM (SELECT sum(x), count(x) FROM xy GROUP BY y) AS f(s, c)
+----
+scalar-group-by
+ ├── columns: sum:5 sum:6 max:7
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(5-7)
+ ├── group-by
+ │    ├── columns: y:2 sum:3!null count:4!null
+ │    ├── grouping columns: y:2
+ │    ├── key: (2)
+ │    ├── fd: (2)-->(3,4)
+ │    ├── scan xy
+ │    │    ├── columns: x:1!null y:2
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2)
+ │    └── aggregations
+ │         ├── sum [as=sum:3, outer=(1)]
+ │         │    └── x:1
+ │         └── count-rows [as=count:4]
+ └── aggregations
+      ├── sum [as=sum:5, outer=(4)]
+      │    └── count:4
+      ├── sum [as=sum:6, outer=(3)]
+      │    └── sum:3
+      └── max [as=max:7, outer=(3)]
+           └── sum:3
+
+# No-op case because the outer grouping columns are not functionally determined
+# by the inner grouping columns in the functional dependencies of the input of
+# the inner grouping operator.
+norm expect-not=FoldGroupingOperators
+SELECT max(m) FROM (SELECT max(x) AS m, sum(x) AS s FROM xy GROUP BY y) GROUP BY s
+----
+project
+ ├── columns: max:5!null
+ └── group-by
+      ├── columns: sum:4!null max:5!null
+      ├── grouping columns: sum:4!null
+      ├── key: (4)
+      ├── fd: (4)-->(5)
+      ├── group-by
+      │    ├── columns: y:2 max:3!null sum:4!null
+      │    ├── grouping columns: y:2
+      │    ├── key: (2)
+      │    ├── fd: (2)-->(3,4)
+      │    ├── scan xy
+      │    │    ├── columns: x:1!null y:2
+      │    │    ├── key: (1)
+      │    │    └── fd: (1)-->(2)
+      │    └── aggregations
+      │         ├── max [as=max:3, outer=(1)]
+      │         │    └── x:1
+      │         └── sum [as=sum:4, outer=(1)]
+      │              └── x:1
+      └── aggregations
+           └── max [as=max:5, outer=(3)]
+                └── max:3
+
+# No-op case because one of the grouping operators has an internal ordering. The
+# array_agg ensures that the GroupBy has an internal ordering.
+norm expect-not=FoldGroupingOperators
+SELECT sum(s) FROM (SELECT sum(z) AS s, array_agg(z) FROM (SELECT * FROM uvwz ORDER BY w DESC) GROUP BY u)
+----
+scalar-group-by
+ ├── columns: sum:8
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(8)
+ ├── group-by
+ │    ├── columns: u:1!null sum:6!null
+ │    ├── grouping columns: u:1!null
+ │    ├── internal-ordering: -3 opt(1)
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(6)
+ │    ├── sort
+ │    │    ├── columns: u:1!null w:3!null z:4!null
+ │    │    ├── ordering: -3 opt(1) [actual: -3]
+ │    │    └── scan uvwz
+ │    │         └── columns: u:1!null w:3!null z:4!null
+ │    └── aggregations
+ │         └── sum [as=sum:6, outer=(4)]
+ │              └── z:4
+ └── aggregations
+      └── sum [as=sum:8, outer=(6)]
+           └── sum:6

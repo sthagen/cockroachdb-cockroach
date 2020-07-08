@@ -15,7 +15,6 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -103,8 +102,8 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 			})
 	}
 
-	// Resolve the spans. Since the LeaseHolderCache is empty, all the ranges
-	// should be grouped and "assigned" to replica 0.
+	// Resolve the spans. Since the range descriptor cache doesn't have any
+	// leases, all the ranges should be grouped and "assigned" to replica 0.
 	replicas, err := resolveSpans(context.Background(), lr.NewSpanResolverIterator(nil), spans...)
 	if err != nil {
 		t.Fatal(err)
@@ -332,7 +331,7 @@ func setupRanges(
 		}
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(cdb, keys.SystemSQLCodec, "t", "test")
+	tableDesc := sqlbase.TestingGetTableDescriptor(cdb, keys.SystemSQLCodec, "t", "test")
 	// Split every SQL row to its own range.
 	rowRanges := make([]roachpb.RangeDescriptor, len(values))
 	for i, val := range values {
@@ -347,11 +346,6 @@ func setupRanges(
 		}
 	}
 
-	// TODO(andrei): The sleep below serves to remove the noise that the
-	// RangeCache might encounter, clobbering descriptors with old versions.
-	// Remove once all the causes of such clobbering, listed in #10751, have been
-	// fixed.
-	time.Sleep(300 * time.Millisecond)
 	// Run a select across the whole table to populate the caches with all the
 	// ranges.
 	if _, err := db.Exec(`SELECT count(1) from test`); err != nil {
@@ -399,7 +393,7 @@ func resolveSpans(
 				return nil, err
 			}
 			repls = append(repls, rngInfo{
-				ReplicaDescriptor: repl.ReplicaDescriptor,
+				ReplicaDescriptor: repl,
 				rngDesc:           it.Desc(),
 			})
 			if !it.NeedAnother() {

@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -525,13 +526,17 @@ func (b *Builder) buildScan(
 
 		b.addCheckConstraintsForTable(tabMeta)
 		b.addComputedColsForTable(tabMeta)
+		b.addPartialIndexPredicatesForTable(tabMeta)
 
 		outScope.expr = b.factory.ConstructScan(&private)
 
 		if b.trackViewDeps {
 			dep := opt.ViewDep{DataSource: tab}
-			for i := 0; i < colCount; i++ {
-				dep.ColumnOrdinals.Add(getOrdinal(i))
+			dep.ColumnIDToOrd = make(map[opt.ColumnID]int)
+			// We will track the ColumnID to Ord mapping so Ords can be added
+			// when a column is referenced.
+			for i, col := range outScope.cols {
+				dep.ColumnIDToOrd[col.id] = getOrdinal(i)
 			}
 			if private.Flags.ForceIndex {
 				dep.SpecificIndex = true
@@ -547,6 +552,9 @@ func (b *Builder) buildScan(
 // apply to the table and adds them to the table metadata (see
 // TableMeta.Constraints). To do this, the scalar expressions of the check
 // constraints are built here.
+//
+// These expressions are used as "known truths" about table data; as such they
+// can only contain immutable operators.
 func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
 	tab := tabMeta.Table
 
@@ -590,12 +598,20 @@ func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
 		}
 
 		texpr := tableScope.resolveAndRequireType(expr, types.Bool)
-		condition := b.buildScalar(texpr, tableScope, nil, nil, nil)
+		var condition opt.ScalarExpr
+		b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
+			condition = b.buildScalar(texpr, tableScope, nil, nil, nil)
+		})
 		// Check constraints that are guaranteed to not evaluate to NULL
 		// are the only ones converted into filters. This is because a NULL
 		// constraint is interpreted as passing, whereas a NULL filter is not.
 		if memo.ExprIsNeverNull(condition, notNullCols) {
-			filters = append(filters, b.factory.ConstructFiltersItem(condition))
+			// Check if the expression contains non-immutable operators.
+			var sharedProps props.Shared
+			memo.BuildSharedProps(condition, &sharedProps)
+			if !sharedProps.VolatilitySet.HasStable() && !sharedProps.VolatilitySet.HasVolatile() {
+				filters = append(filters, b.factory.ConstructFiltersItem(condition))
+			}
 		}
 	}
 	if len(filters) > 0 {
@@ -604,7 +620,9 @@ func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
 }
 
 // addComputedColsForTable finds all computed columns in the given table and
-// caches them in the table metadata as scalar expressions.
+// caches them in the table metadata as scalar expressions. These expressions
+// are used as "known truths" about table data. Any columns for which the
+// expression contains non-immutable operators are omitted.
 func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 	var tableScope *scope
 	tab := tabMeta.Table
@@ -615,7 +633,7 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 		}
 		expr, err := parser.ParseExpr(tabCol.ComputedExprStr())
 		if err != nil {
-			continue
+			panic(err)
 		}
 
 		if tableScope == nil {
@@ -625,8 +643,74 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 
 		if texpr := tableScope.resolveAndRequireType(expr, types.Any); texpr != nil {
 			colID := tabMeta.MetaID.ColumnID(i)
-			scalar := b.buildScalar(texpr, tableScope, nil, nil, nil)
-			tabMeta.AddComputedCol(colID, scalar)
+			var scalar opt.ScalarExpr
+			b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
+				scalar = b.buildScalar(texpr, tableScope, nil, nil, nil)
+			})
+			// Check if the expression contains non-immutable operators.
+			var sharedProps props.Shared
+			memo.BuildSharedProps(scalar, &sharedProps)
+			if !sharedProps.VolatilitySet.HasStable() && !sharedProps.VolatilitySet.HasVolatile() {
+				tabMeta.AddComputedCol(colID, scalar)
+			}
+		}
+	}
+}
+
+// addPartialIndexPredicatesForTable finds all partial indexes in the table and
+// adds their predicates to the table metadata (see
+// TableMeta.PartialIndexPredicates). The predicates are converted from strings
+// to ScalarExprs here.
+//
+// The predicates are used as "known truths" about table data. Any predicates
+// containing non-immutable operators are omitted.
+func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta) {
+	tab := tabMeta.Table
+
+	// Find the first partial index.
+	numIndexes := tab.IndexCount()
+	indexOrd := 0
+	for ; indexOrd < numIndexes; indexOrd++ {
+		if _, ok := tab.Index(indexOrd).Predicate(); ok {
+			break
+		}
+	}
+
+	// Return early if there are no partial indexes. Only partial indexes have
+	// predicates.
+	if indexOrd == numIndexes {
+		return
+	}
+
+	// Create a scope that can be used for building the scalar expressions.
+	tableScope := b.allocScope()
+	tableScope.appendColumnsFromTable(tabMeta, &tabMeta.Alias)
+
+	// Skip to the first partial index we found above.
+	for ; indexOrd < numIndexes; indexOrd++ {
+		index := tab.Index(indexOrd)
+		pred, ok := index.Predicate()
+
+		// If the index is not a partial index, do nothing.
+		if !ok {
+			continue
+		}
+
+		expr, err := parser.ParseExpr(pred)
+		if err != nil {
+			panic(err)
+		}
+
+		texpr := tableScope.resolveAndRequireType(expr, types.Bool)
+		var scalar opt.ScalarExpr
+		b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
+			scalar = b.buildScalar(texpr, tableScope, nil, nil, nil)
+		})
+		// Check if the expression contains non-immutable operators.
+		var sharedProps props.Shared
+		memo.BuildSharedProps(scalar, &sharedProps)
+		if !sharedProps.VolatilitySet.HasStable() && !sharedProps.VolatilitySet.HasVolatile() {
+			tabMeta.AddPartialIndexPredicate(indexOrd, scalar)
 		}
 	}
 }
@@ -948,6 +1032,7 @@ func (b *Builder) buildSelectClause(
 	inScope *scope,
 ) (outScope *scope) {
 	fromScope := b.buildFrom(sel.From, locking, inScope)
+
 	b.processWindowDefs(sel, fromScope)
 	b.buildWhere(sel.Where, fromScope)
 

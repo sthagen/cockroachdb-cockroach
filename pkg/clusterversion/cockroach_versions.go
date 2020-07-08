@@ -66,6 +66,9 @@ const (
 	VersionRangefeedLeases
 	VersionAlterColumnTypeGeneral
 	VersionAlterSystemJobsAddCreatedByColumns
+	VersionAddScheduledJobsTable
+	VersionUserDefinedSchemas
+	VersionNoOriginFKIndexes
 
 	// Add new versions here (step one of two).
 )
@@ -501,10 +504,25 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 5},
 	},
 	{
-		// VersionAlterSystemJobsTable is a version which modified system.jobs table
-		//
+		// VersionAlterSystemJobsTable is a version which modified system.jobs table.
 		Key:     VersionAlterSystemJobsAddCreatedByColumns,
 		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 6},
+	},
+	{
+		// VersionAddScheduledJobsTable is a version which adds system.scheduled_jobs table.
+		Key:     VersionAddScheduledJobsTable,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 7},
+	},
+	{
+		// VersionUserDefinedSchemas enables the creation of user defined schemas.
+		Key:     VersionUserDefinedSchemas,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 8},
+	},
+	{
+		// VersionNoOriginFKIndexes allows for foreign keys to no longer need
+		// indexes on the origin side of the relationship.
+		Key:     VersionNoOriginFKIndexes,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 9},
 	},
 
 	// Add new versions here (step two of two).

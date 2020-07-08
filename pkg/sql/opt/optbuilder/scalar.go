@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -27,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/sequence"
 	"github.com/cockroachdb/errors"
 )
 
@@ -217,6 +219,7 @@ func (b *Builder) buildScalar(
 		)
 
 	case *tree.CaseExpr:
+		valType := t.ResolvedType()
 		var input opt.ScalarExpr
 		if t.Expr != nil {
 			texpr := t.Expr.(tree.TypedExpr)
@@ -227,19 +230,19 @@ func (b *Builder) buildScalar(
 
 		whens := make(memo.ScalarListExpr, 0, len(t.Whens)+1)
 		for i := range t.Whens {
-			texpr := t.Whens[i].Cond.(tree.TypedExpr)
-			cond := b.buildScalar(texpr, inScope, nil, nil, colRefs)
-			texpr = t.Whens[i].Val.(tree.TypedExpr)
-			val := b.buildScalar(texpr, inScope, nil, nil, colRefs)
+			condExpr := t.Whens[i].Cond.(tree.TypedExpr)
+			cond := b.buildScalar(condExpr, inScope, nil, nil, colRefs)
+			valExpr := tree.ReType(t.Whens[i].Val.(tree.TypedExpr), valType)
+			val := b.buildScalar(valExpr, inScope, nil, nil, colRefs)
 			whens = append(whens, b.factory.ConstructWhen(cond, val))
 		}
 		// Add the ELSE expression to the end of whens as a raw scalar expression.
 		var orElse opt.ScalarExpr
 		if t.Else != nil {
-			texpr := t.Else.(tree.TypedExpr)
-			orElse = b.buildScalar(texpr, inScope, nil, nil, colRefs)
+			elseExpr := tree.ReType(t.Else.(tree.TypedExpr), valType)
+			orElse = b.buildScalar(elseExpr, inScope, nil, nil, colRefs)
 		} else {
-			orElse = memo.NullSingleton
+			orElse = b.factory.ConstructNull(valType)
 		}
 		out = b.factory.ConstructCase(input, whens, orElse)
 
@@ -250,8 +253,13 @@ func (b *Builder) buildScalar(
 
 	case *tree.CoalesceExpr:
 		args := make(memo.ScalarListExpr, len(t.Exprs))
+		typ := t.ResolvedType()
 		for i := range args {
-			args[i] = b.buildScalar(t.TypedExprAt(i), inScope, nil, nil, colRefs)
+			// The type of the CoalesceExpr might be different than the inputs (e.g.
+			// when they are NULL). Force all inputs to be the same type, so that we
+			// build coalesce operator with the correct type.
+			expr := tree.ReType(t.TypedExprAt(i), typ)
+			args[i] = b.buildScalar(expr, inScope, nil, nil, colRefs)
 		}
 		out = b.factory.ConstructCoalesce(args)
 
@@ -286,10 +294,13 @@ func (b *Builder) buildScalar(
 		return b.buildFunction(t, inScope, outScope, outCol, colRefs)
 
 	case *tree.IfExpr:
+		valType := t.ResolvedType()
 		input := b.buildScalar(t.Cond.(tree.TypedExpr), inScope, nil, nil, colRefs)
-		ifTrue := b.buildScalar(t.True.(tree.TypedExpr), inScope, nil, nil, colRefs)
+		ifTrueExpr := tree.ReType(t.True.(tree.TypedExpr), valType)
+		ifTrue := b.buildScalar(ifTrueExpr, inScope, nil, nil, colRefs)
 		whens := memo.ScalarListExpr{b.factory.ConstructWhen(memo.TrueSingleton, ifTrue)}
-		orElse := b.buildScalar(t.Else.(tree.TypedExpr), inScope, nil, nil, colRefs)
+		orElseExpr := tree.ReType(t.Else.(tree.TypedExpr), valType)
+		orElse := b.buildScalar(orElseExpr, inScope, nil, nil, colRefs)
 		out = b.factory.ConstructCase(input, whens, orElse)
 
 	case *tree.IndexedVar:
@@ -320,14 +331,17 @@ func (b *Builder) buildScalar(
 		}
 
 	case *tree.NullIfExpr:
+		valType := t.ResolvedType()
 		// Ensure that the type of the first expression matches the resolved type
 		// of the NULLIF expression so that type inference will be correct in the
 		// CASE expression constructed below. For example, the type of
 		// NULLIF(NULL, 0) should be int.
-		expr1 := tree.ReType(t.Expr1.(tree.TypedExpr), t.ResolvedType())
+		expr1 := tree.ReType(t.Expr1.(tree.TypedExpr), valType)
 		input := b.buildScalar(expr1, inScope, nil, nil, colRefs)
 		cond := b.buildScalar(t.Expr2.(tree.TypedExpr), inScope, nil, nil, colRefs)
-		whens := memo.ScalarListExpr{b.factory.ConstructWhen(cond, memo.NullSingleton)}
+		whens := memo.ScalarListExpr{
+			b.factory.ConstructWhen(cond, b.factory.ConstructNull(valType)),
+		}
 		out = b.factory.ConstructCase(input, whens, input)
 
 	case *tree.OrExpr:
@@ -498,6 +512,22 @@ func (b *Builder) buildFunction(
 
 	if isGenerator(def) {
 		return b.finishBuildGeneratorFunction(f, out, inScope, outScope, outCol)
+	}
+
+	// Add a dependency on sequences that are used as a string argument.
+	if b.trackViewDeps {
+		name, err := sequence.GetSequenceFromFunc(f)
+		if err != nil {
+			panic(err)
+		}
+		if name != nil {
+			tn := tree.MakeUnqualifiedTableName(tree.Name(*name))
+			ds, _ := b.resolveDataSource(&tn, privilege.SELECT)
+
+			b.viewDeps = append(b.viewDeps, opt.ViewDep{
+				DataSource: ds,
+			})
+		}
 	}
 
 	return b.finishBuildScalar(f, out, inScope, outScope, outCol)

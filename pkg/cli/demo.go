@@ -237,7 +237,8 @@ func checkDemoConfiguration(
 		}
 
 		// If geo-partition-replicas is requested, make sure the workload has a Partitioning step.
-		configErr := errors.New(fmt.Sprintf("workload %s is not configured to have a partitioning step", gen.Meta().Name))
+		configErr := errors.Newf(
+			"workload %s is not configured to have a partitioning step", gen.Meta().Name)
 		hookser, ok := gen.(workload.Hookser)
 		if !ok {
 			return nil, configErr
@@ -263,11 +264,11 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (err error) {
 		return err
 	}
 
-	loc, err := geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, demoCtx.geoLibsDir)
+	loc, err := geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, startCtx.geoLibsDir)
 	if err != nil {
 		log.Infof(ctx, "could not initialize GEOS - geospatial functions may not be available: %v", err)
 	} else {
-		log.Infof(ctx, "GEOS initialized at %s", loc)
+		log.Infof(ctx, "GEOS loaded from directory %s", loc)
 	}
 
 	c, err := setupTransientCluster(ctx, cmd, gen)

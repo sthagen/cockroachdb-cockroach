@@ -19,7 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
@@ -30,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func testBasicEncodeDecode32(
@@ -1059,6 +1062,7 @@ func TestEncodeDecodeTime(t *testing.T) {
 		}
 	}
 }
+
 func TestEncodeDecodeTimeTZ(t *testing.T) {
 	// Test cases are in ascending order for TimeTZ, which means:
 	// * UTC timestamp first preference
@@ -1114,7 +1118,7 @@ func TestEncodeDecodeTimeTZ(t *testing.T) {
 		t.Run(fmt.Sprintf("dir:%d", dir), func(t *testing.T) {
 			for i := range testCases {
 				t.Run(fmt.Sprintf("tc:%d", i), func(t *testing.T) {
-					current, err := timetz.ParseTimeTZ(timeutil.Now(), testCases[i], time.Microsecond)
+					current, _, err := timetz.ParseTimeTZ(timeutil.Now(), testCases[i], time.Microsecond)
 					assert.NoError(t, err)
 
 					var b []byte
@@ -1137,6 +1141,40 @@ func TestEncodeDecodeTimeTZ(t *testing.T) {
 						}
 					}
 					lastEncoded = b
+				})
+			}
+		})
+	}
+}
+
+func TestEncodeDecodeGeo(t *testing.T) {
+	testCases := []string{
+		"SRID=4326;POINT(1.0 1.0)",
+		"POINT(2.0 2.0)",
+	}
+	for _, tc := range testCases {
+		t.Run(tc, func(t *testing.T) {
+			for _, dir := range []Direction{Ascending, Descending} {
+				t.Run(fmt.Sprintf("dir:%d", dir), func(t *testing.T) {
+					parsed, err := geo.ParseGeometry(tc)
+					require.NoError(t, err)
+					spatialObject := parsed.SpatialObject()
+
+					var b []byte
+					var decoded geopb.SpatialObject
+					if dir == Ascending {
+						b, err = EncodeGeoAscending(b, &spatialObject)
+						require.NoError(t, err)
+						_, decoded, err = DecodeGeoAscending(b)
+						require.NoError(t, err)
+					} else {
+						b, err = EncodeGeoDescending(b, &spatialObject)
+						require.NoError(t, err)
+						_, decoded, err = DecodeGeoDescending(b)
+						require.NoError(t, err)
+					}
+					require.Equal(t, spatialObject, decoded)
+					testPeekLength(t, b)
 				})
 			}
 		})
@@ -1217,8 +1255,14 @@ func TestEncodeDecodeDescending(t *testing.T) {
 }
 
 func TestPeekType(t *testing.T) {
-	encodedDurationAscending, _ := EncodeDurationAscending(nil, duration.Duration{})
-	encodedDurationDescending, _ := EncodeDurationDescending(nil, duration.Duration{})
+	encodedDurationAscending, err := EncodeDurationAscending(nil, duration.Duration{})
+	require.NoError(t, err)
+	encodedDurationDescending, err := EncodeDurationDescending(nil, duration.Duration{})
+	require.NoError(t, err)
+	encodedGeoAscending, err := EncodeGeoAscending(nil, &geopb.SpatialObject{})
+	require.NoError(t, err)
+	encodedGeoDescending, err := EncodeGeoDescending(nil, &geopb.SpatialObject{})
+	require.NoError(t, err)
 	testCases := []struct {
 		enc []byte
 		typ Type
@@ -1242,6 +1286,8 @@ func TestPeekType(t *testing.T) {
 		{EncodeTimeDescending(nil, timeutil.Now()), Time},
 		{EncodeTimeTZAscending(nil, timetz.Now()), TimeTZ},
 		{EncodeTimeTZDescending(nil, timetz.Now()), TimeTZ},
+		{encodedGeoAscending, Geo},
+		{encodedGeoDescending, GeoDesc},
 		{encodedDurationAscending, Duration},
 		{encodedDurationDescending, Duration},
 		{EncodeBitArrayAscending(nil, bitarray.BitArray{}), BitArray},

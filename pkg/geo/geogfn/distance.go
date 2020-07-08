@@ -21,6 +21,12 @@ import (
 	"github.com/golang/geo/s2"
 )
 
+// SpheroidErrorFraction is an error fraction to compensate for using a sphere
+// to calculate the distance for what is actually a spheroid. The distance
+// calculation has an error that is bounded by (2 * spheroid.Flattening)%.
+// This 5% margin is pretty safe.
+const SpheroidErrorFraction = 0.05
+
 // Distance returns the distance between geographies a and b on a sphere or spheroid.
 // Returns a geo.EmptyGeometryError if any of the Geographies are EMPTY.
 func Distance(
@@ -38,26 +44,16 @@ func Distance(
 	if err != nil {
 		return 0, err
 	}
-	spheroid := geographiclib.WGS84Spheroid
+	spheroid, err := a.Spheroid()
+	if err != nil {
+		return 0, err
+	}
 	return distanceGeographyRegions(spheroid, useSphereOrSpheroid, aRegions, bRegions, 0)
 }
 
 //
 // Spheroids
 //
-
-// s2GeodistPoint implements geodist.Point.
-type s2GeodistPoint struct {
-	s2.Point
-}
-
-var _ geodist.Point = (*s2GeodistPoint)(nil)
-
-// IsShape implements the geodist.Point interface.
-func (*s2GeodistPoint) IsShape() {}
-
-// Point implements the geodist.Point interface.
-func (*s2GeodistPoint) IsPoint() {}
 
 // s2GeodistLineString implements geodist.LineString.
 type s2GeodistLineString struct {
@@ -74,7 +70,10 @@ func (*s2GeodistLineString) IsLineString() {}
 
 // Edge implements the geodist.LineString interface.
 func (g *s2GeodistLineString) Edge(i int) geodist.Edge {
-	return geodist.Edge{V0: &s2GeodistPoint{Point: (*g.Polyline)[i]}, V1: &s2GeodistPoint{Point: (*g.Polyline)[i+1]}}
+	return geodist.Edge{
+		V0: geodist.Point{GeogPoint: (*g.Polyline)[i]},
+		V1: geodist.Point{GeogPoint: (*g.Polyline)[i+1]},
+	}
 }
 
 // NumEdges implements the geodist.LineString interface.
@@ -84,7 +83,9 @@ func (g *s2GeodistLineString) NumEdges() int {
 
 // Vertex implements the geodist.LineString interface.
 func (g *s2GeodistLineString) Vertex(i int) geodist.Point {
-	return &s2GeodistPoint{Point: (*g.Polyline)[i]}
+	return geodist.Point{
+		GeogPoint: (*g.Polyline)[i],
+	}
 }
 
 // NumVertexes implements the geodist.LineString interface.
@@ -107,7 +108,10 @@ func (*s2GeodistLinearRing) IsLinearRing() {}
 
 // Edge implements the geodist.LinearRing interface.
 func (g *s2GeodistLinearRing) Edge(i int) geodist.Edge {
-	return geodist.Edge{V0: &s2GeodistPoint{Point: g.Loop.Vertex(i)}, V1: &s2GeodistPoint{Point: g.Loop.Vertex(i + 1)}}
+	return geodist.Edge{
+		V0: geodist.Point{GeogPoint: g.Loop.Vertex(i)},
+		V1: geodist.Point{GeogPoint: g.Loop.Vertex(i + 1)},
+	}
 }
 
 // NumEdges implements the geodist.LinearRing interface.
@@ -117,7 +121,9 @@ func (g *s2GeodistLinearRing) NumEdges() int {
 
 // Vertex implements the geodist.LinearRing interface.
 func (g *s2GeodistLinearRing) Vertex(i int) geodist.Point {
-	return &s2GeodistPoint{Point: g.Loop.Vertex(i)}
+	return geodist.Point{
+		GeogPoint: g.Loop.Vertex(i),
+	}
 }
 
 // NumVertexes implements the geodist.LinearRing interface.
@@ -156,8 +162,10 @@ type s2GeodistEdgeCrosser struct {
 var _ geodist.EdgeCrosser = (*s2GeodistEdgeCrosser)(nil)
 
 // ChainCrossing implements geodist.EdgeCrosser.
-func (c *s2GeodistEdgeCrosser) ChainCrossing(p geodist.Point) bool {
-	return c.EdgeCrosser.ChainCrossingSign(p.(*s2GeodistPoint).Point) != s2.DoNotCross
+func (c *s2GeodistEdgeCrosser) ChainCrossing(p geodist.Point) (bool, geodist.Point) {
+	// Returns nil for the intersection point as we don't require the intersection
+	// point as we do not have to implement ShortestLine in geography.
+	return c.EdgeCrosser.ChainCrossingSign(p.GeogPoint) != s2.DoNotCross, geodist.Point{}
 }
 
 // distanceGeographyRegions calculates the distance between two sets of regions.
@@ -176,10 +184,8 @@ func (c *s2GeodistEdgeCrosser) ChainCrossing(p geodist.Point) bool {
 // the spheroid are different than the two closest points on the sphere.
 // See distance_test.go for examples of the "truer" distance values.
 // Since we aim to be compatible with PostGIS, we adopt the same approach.
-//
-// TODO(otan): accelerate checks with bounding boxes.
 func distanceGeographyRegions(
-	spheroid geographiclib.Spheroid,
+	spheroid *geographiclib.Spheroid,
 	useSphereOrSpheroid UseSphereOrSpheroid,
 	aRegions []s2.Region,
 	bRegions []s2.Region,
@@ -217,7 +223,7 @@ func distanceGeographyRegions(
 // geographyMinDistanceUpdater finds the minimum distance using a sphere.
 // Methods will return early if it finds a minimum distance <= stopAfterLE.
 type geographyMinDistanceUpdater struct {
-	spheroid            geographiclib.Spheroid
+	spheroid            *geographiclib.Spheroid
 	useSphereOrSpheroid UseSphereOrSpheroid
 	minEdge             s2.Edge
 	minD                s1.ChordAngle
@@ -229,16 +235,14 @@ var _ geodist.DistanceUpdater = (*geographyMinDistanceUpdater)(nil)
 // newGeographyMinDistanceUpdater returns a new geographyMinDistanceUpdater with the
 // correct arguments set up.
 func newGeographyMinDistanceUpdater(
-	spheroid geographiclib.Spheroid, useSphereOrSpheroid UseSphereOrSpheroid, stopAfterLE float64,
+	spheroid *geographiclib.Spheroid, useSphereOrSpheroid UseSphereOrSpheroid, stopAfterLE float64,
 ) *geographyMinDistanceUpdater {
 	multiplier := 1.0
 	if useSphereOrSpheroid == UseSpheroid {
-		// Modify the stopAfterLE distance to be 95% of the proposed stopAfterLE, since
-		// we use the sphere to calculate the distance and we want to leave a buffer
-		// for spheroid distances being slightly off.
-		// Distances should differ by a maximum of (2 * spheroid.Flattening)%,
-		// so the 5% margin is pretty safe.
-		multiplier = 0.95
+		// Modify the stopAfterLE distance to be less by the error fraction, since
+		// we use the sphere to calculate the distance and we want to leave a
+		// buffer for spheroid distances being slightly off.
+		multiplier -= SpheroidErrorFraction
 	}
 	stopAfterLEChordAngle := s1.ChordAngleFromAngle(s1.Angle(stopAfterLE * multiplier / spheroid.SphereRadius))
 	return &geographyMinDistanceUpdater{
@@ -262,11 +266,9 @@ func (u *geographyMinDistanceUpdater) Distance() float64 {
 }
 
 // Update implements the geodist.DistanceUpdater interface.
-func (u *geographyMinDistanceUpdater) Update(
-	aInterface geodist.Point, bInterface geodist.Point,
-) bool {
-	a := aInterface.(*s2GeodistPoint).Point
-	b := bInterface.(*s2GeodistPoint).Point
+func (u *geographyMinDistanceUpdater) Update(aPoint geodist.Point, bPoint geodist.Point) bool {
+	a := aPoint.GeogPoint
+	b := bPoint.GeogPoint
 
 	sphereDistance := s2.ChordAngleBetweenPoints(a, b)
 	if sphereDistance < u.minD {
@@ -283,7 +285,7 @@ func (u *geographyMinDistanceUpdater) Update(
 }
 
 // OnIntersects implements the geodist.DistanceUpdater interface.
-func (u *geographyMinDistanceUpdater) OnIntersects() bool {
+func (u *geographyMinDistanceUpdater) OnIntersects(p geodist.Point) bool {
 	u.minD = 0
 	return true
 }
@@ -291,6 +293,12 @@ func (u *geographyMinDistanceUpdater) OnIntersects() bool {
 // IsMaxDistance implements the geodist.DistanceUpdater interface.
 func (u *geographyMinDistanceUpdater) IsMaxDistance() bool {
 	return false
+}
+
+// FlipGeometries implements the geodist.DistanceUpdater interface.
+func (u *geographyMinDistanceUpdater) FlipGeometries() {
+	// FlipGeometries is unimplemented for geographyMinDistanceUpdater as we don't
+	// require the order of geometries for calculation of minimum distance.
 }
 
 // geographyDistanceCalculator implements geodist.DistanceCalculator
@@ -305,15 +313,22 @@ func (c *geographyDistanceCalculator) DistanceUpdater() geodist.DistanceUpdater 
 	return c.updater
 }
 
+// BoundingBoxIntersects implements geodist.DistanceCalculator.
+func (c *geographyDistanceCalculator) BoundingBoxIntersects() bool {
+	// Return true, as it does the safer thing beneath.
+	// TODO(otan): update bounding box intersects.
+	return true
+}
+
 // NewEdgeCrosser implements geodist.DistanceCalculator.
 func (c *geographyDistanceCalculator) NewEdgeCrosser(
 	edge geodist.Edge, startPoint geodist.Point,
 ) geodist.EdgeCrosser {
 	return &s2GeodistEdgeCrosser{
 		EdgeCrosser: s2.NewChainEdgeCrosser(
-			edge.V0.(*s2GeodistPoint).Point,
-			edge.V1.(*s2GeodistPoint).Point,
-			startPoint.(*s2GeodistPoint).Point,
+			edge.V0.GeogPoint,
+			edge.V1.GeogPoint,
+			startPoint.GeogPoint,
 		),
 	}
 }
@@ -322,7 +337,7 @@ func (c *geographyDistanceCalculator) NewEdgeCrosser(
 func (c *geographyDistanceCalculator) PointInLinearRing(
 	point geodist.Point, polygon geodist.LinearRing,
 ) bool {
-	return polygon.(*s2GeodistLinearRing).ContainsPoint(point.(*s2GeodistPoint).Point)
+	return polygon.(*s2GeodistLinearRing).ContainsPoint(point.GeogPoint)
 }
 
 // ClosestPointToEdge implements geodist.DistanceCalculator.
@@ -335,11 +350,10 @@ func (c *geographyDistanceCalculator) PointInLinearRing(
 // For visualization and more, see: Section 6 / Figure 4 of
 // "Projective configuration theorems: old wine into new wineskins", Tabachnikov, Serge, 2016/07/16
 func (c *geographyDistanceCalculator) ClosestPointToEdge(
-	edge geodist.Edge, pointInterface geodist.Point,
+	edge geodist.Edge, point geodist.Point,
 ) (geodist.Point, bool) {
-	eV0 := edge.V0.(*s2GeodistPoint).Point
-	eV1 := edge.V1.(*s2GeodistPoint).Point
-	point := pointInterface.(*s2GeodistPoint).Point
+	eV0 := edge.V0.GeogPoint
+	eV1 := edge.V1.GeogPoint
 
 	// Project the point onto the normal of the edge. A great circle passing through
 	// the normal and the point will intersect with the great circle represented
@@ -348,21 +362,21 @@ func (c *geographyDistanceCalculator) ClosestPointToEdge(
 	// To find the point where the great circle represented by the edge and the
 	// great circle represented by (normal, point), we project the point
 	// onto the normal.
-	normalScaledToPoint := normal.Mul(normal.Dot(point.Vector))
+	normalScaledToPoint := normal.Mul(normal.Dot(point.GeogPoint.Vector))
 	// The difference between the point and the projection of the normal when normalized
 	// should give us a point on the great circle which contains the vertexes of the edge.
-	closestPoint := s2.Point{Vector: point.Vector.Sub(normalScaledToPoint).Normalize()}
+	closestPoint := s2.Point{Vector: point.GeogPoint.Vector.Sub(normalScaledToPoint).Normalize()}
 	// We then check whether the given point lies on the geodesic of the edge,
 	// as the above algorithm only generates a point on the great circle
 	// represented by the edge.
-	return &s2GeodistPoint{Point: closestPoint}, (&s2.Polyline{eV0, eV1}).IntersectsCell(s2.CellFromPoint(closestPoint))
+	return geodist.Point{GeogPoint: closestPoint}, (&s2.Polyline{eV0, eV1}).IntersectsCell(s2.CellFromPoint(closestPoint))
 }
 
 // regionToGeodistShape converts the s2 Region to a geodist object.
 func regionToGeodistShape(r s2.Region) (geodist.Shape, error) {
 	switch r := r.(type) {
 	case s2.Point:
-		return &s2GeodistPoint{Point: r}, nil
+		return &geodist.Point{GeogPoint: r}, nil
 	case *s2.Polyline:
 		return &s2GeodistLineString{Polyline: r}, nil
 	case *s2.Polygon:

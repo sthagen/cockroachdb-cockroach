@@ -373,16 +373,20 @@ func (db *DB) PutInline(ctx context.Context, key, value interface{}) error {
 	return getOneErr(db.Run(ctx, b), b)
 }
 
-// CPut conditionally sets the value for a key if the existing value is equal
-// to expValue. To conditionally set a value only if there is no existing entry
-// pass nil for expValue. Note that this must be an interface{}(nil), not a
-// typed nil value (e.g. []byte(nil)).
+// CPut conditionally sets the value for a key if the existing value is equal to
+// expValue. To conditionally set a value only if the key doesn't currently
+// exist, pass an empty expValue.
 //
 // Returns an error if the existing value is not equal to expValue.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// protoutil.Message or any Go primitive type (bool, int, etc).
-func (db *DB) CPut(ctx context.Context, key, value interface{}, expValue *roachpb.Value) error {
+// protoutil.Message or any Go primitive type (bool, int, etc). A nil value
+// means delete the key.
+//
+// An empty expValue means that the key is expected to not exist. If not empty,
+// expValue needs to correspond to a Value.TagAndDataBytes() - i.e. a key's
+// value without the checksum (as the checksum includes the key too).
+func (db *DB) CPut(ctx context.Context, key, value interface{}, expValue []byte) error {
 	b := &Batch{}
 	b.CPut(key, value, expValue)
 	return getOneErr(db.Run(ctx, b), b)
@@ -514,13 +518,8 @@ func (db *DB) AdminMerge(ctx context.Context, key interface{}) error {
 
 // AdminSplit splits the range at splitkey.
 //
-// spanKey is a key within the range that should be split, and splitKey is the
-// key at which that range should be split. splitKey is not used exactly as
-// provided--it is first mutated by keys.EnsureSafeSplitKey. Accounting for
-// this mutation sometimes requires constructing a key that falls in a
-// different range, hence the separation between spanKey and splitKey. See
-// #16008 for details, and #16344 for the tracking issue to clean this mess up
-// properly.
+// splitKey is the key at which a split point should be added. It will become
+// the start key of the right-hand side of the new range.
 //
 // expirationTime is the timestamp when the split expires and is eligible for
 // automatic merging by the merge queue. To specify that a split should
@@ -530,10 +529,10 @@ func (db *DB) AdminMerge(ctx context.Context, key interface{}) error {
 //
 // The keys can be either byte slices or a strings.
 func (db *DB) AdminSplit(
-	ctx context.Context, spanKey, splitKey interface{}, expirationTime hlc.Timestamp,
+	ctx context.Context, splitKey interface{}, expirationTime hlc.Timestamp,
 ) error {
 	b := &Batch{}
-	b.adminSplit(spanKey, splitKey, expirationTime)
+	b.adminSplit(splitKey, expirationTime)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -541,7 +540,7 @@ func (db *DB) AdminSplit(
 func (db *DB) SplitAndScatter(
 	ctx context.Context, key roachpb.Key, expirationTime hlc.Timestamp,
 ) error {
-	if err := db.AdminSplit(ctx, key, key, expirationTime); err != nil {
+	if err := db.AdminSplit(ctx, key, expirationTime); err != nil {
 		return err
 	}
 	scatterReq := &roachpb.AdminScatterRequest{

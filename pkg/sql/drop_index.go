@@ -16,9 +16,9 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -86,7 +86,7 @@ func (n *dropIndexNode) startExec(params runParams) error {
 		// the mutation list and new version number created by the first
 		// drop need to be visible to the second drop.
 		tableDesc, err := params.p.ResolveMutableTableDescriptor(
-			ctx, index.tn, true /*required*/, resolver.ResolveRequireTableDesc)
+			ctx, index.tn, true /*required*/, tree.ResolveRequireTableDesc)
 		if sqlbase.IsUndefinedRelationError(err) {
 			// Somehow the descriptor we had during planning is not there
 			// any more.
@@ -258,28 +258,32 @@ func (p *planner) dropIndexByName(
 		)
 	}
 
-	// Check if requires CCL binary for eventual zone config removal.
-	_, zone, _, err := GetZoneConfigInTxn(ctx, p.txn, uint32(tableDesc.ID), nil, "", false)
-	if err != nil {
-		return err
-	}
+	// Check if requires CCL binary for eventual zone config removal. Only
+	// necessary for the system tenant, because secondary tenants do not have
+	// zone configs for individual objects.
+	if p.ExecCfg().Codec.ForSystemTenant() {
+		_, zone, _, err := GetZoneConfigInTxn(ctx, p.txn, config.SystemTenantObjectID(tableDesc.ID), nil, "", false)
+		if err != nil {
+			return err
+		}
 
-	for _, s := range zone.Subzones {
-		if s.IndexID != uint32(idx.ID) {
-			_, err = GenerateSubzoneSpans(
-				p.ExecCfg().Settings,
-				p.ExecCfg().ClusterID(),
-				p.ExecCfg().Codec,
-				tableDesc.TableDesc(),
-				zone.Subzones,
-				false, /* newSubzones */
-			)
-			if sqlbase.IsCCLRequiredError(err) {
-				return sqlbase.NewCCLRequiredError(fmt.Errorf("schema change requires a CCL binary "+
-					"because table %q has at least one remaining index or partition with a zone config",
-					tableDesc.Name))
+		for _, s := range zone.Subzones {
+			if s.IndexID != uint32(idx.ID) {
+				_, err = GenerateSubzoneSpans(
+					p.ExecCfg().Settings,
+					p.ExecCfg().ClusterID(),
+					p.ExecCfg().Codec,
+					tableDesc.TableDesc(),
+					zone.Subzones,
+					false, /* newSubzones */
+				)
+				if sqlbase.IsCCLRequiredError(err) {
+					return sqlbase.NewCCLRequiredError(fmt.Errorf("schema change requires a CCL binary "+
+						"because table %q has at least one remaining index or partition with a zone config",
+						tableDesc.Name))
+				}
+				break
 			}
-			break
 		}
 	}
 
@@ -351,29 +355,34 @@ func (p *planner) dropIndexByName(
 		return err
 	}
 
+	// If the we aren't at a high enough version to drop indexes on the origin
+	// side then we have to attempt to delete them.
+	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.VersionNoOriginFKIndexes) {
+		// Index for updating the FK slices in place when removing FKs.
+		sliceIdx := 0
+		for i := range tableDesc.OutboundFKs {
+			tableDesc.OutboundFKs[sliceIdx] = tableDesc.OutboundFKs[i]
+			sliceIdx++
+			fk := &tableDesc.OutboundFKs[i]
+			canReplace := func(idx *sqlbase.IndexDescriptor) bool {
+				return idx.IsValidOriginIndex(fk.OriginColumnIDs)
+			}
+			// The index being deleted could be used as the origin index for this foreign key.
+			if idx.IsValidOriginIndex(fk.OriginColumnIDs) && !indexHasReplacementCandidate(canReplace) {
+				if behavior != tree.DropCascade && constraintBehavior != ignoreIdxConstraint {
+					return errors.Errorf("index %q is in use as a foreign key constraint", idx.Name)
+				}
+				sliceIdx--
+				if err := p.removeFKBackReference(ctx, tableDesc, fk); err != nil {
+					return err
+				}
+			}
+		}
+		tableDesc.OutboundFKs = tableDesc.OutboundFKs[:sliceIdx]
+	}
+
 	// Index for updating the FK slices in place when removing FKs.
 	sliceIdx := 0
-	for i := range tableDesc.OutboundFKs {
-		tableDesc.OutboundFKs[sliceIdx] = tableDesc.OutboundFKs[i]
-		sliceIdx++
-		fk := &tableDesc.OutboundFKs[i]
-		canReplace := func(idx *sqlbase.IndexDescriptor) bool {
-			return idx.IsValidOriginIndex(fk.OriginColumnIDs)
-		}
-		// The index being deleted could be used as the origin index for this foreign key.
-		if idx.IsValidOriginIndex(fk.OriginColumnIDs) && !indexHasReplacementCandidate(canReplace) {
-			if behavior != tree.DropCascade && constraintBehavior != ignoreIdxConstraint {
-				return errors.Errorf("index %q is in use as a foreign key constraint", idx.Name)
-			}
-			sliceIdx--
-			if err := p.removeFKBackReference(ctx, tableDesc, fk); err != nil {
-				return err
-			}
-		}
-	}
-	tableDesc.OutboundFKs = tableDesc.OutboundFKs[:sliceIdx]
-
-	sliceIdx = 0
 	for i := range tableDesc.InboundFKs {
 		tableDesc.InboundFKs[sliceIdx] = tableDesc.InboundFKs[i]
 		sliceIdx++

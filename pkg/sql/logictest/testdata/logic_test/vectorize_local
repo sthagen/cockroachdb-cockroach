@@ -46,7 +46,7 @@ https://cockroachdb.github.io/distsqlplan/decode.html#eJyMkLFOwzAQhneewvonkAw4jJ
 query T
 SELECT url FROM [EXPLAIN ANALYZE SELECT c.a FROM c JOIN d ON d.b = c.b]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html#eJykkk-P0zAQxe98itGcQDIl6dESUisoUlYhWdoegFUOrj1aDK4dPA50VeW7o_wRtEigRRznzXvj-Y18Rv7qUOJuU25e7aGLDt5s67dwt3l_W66LCtbVuvzwcQNPXxe7_e5d-Qxmq16oyarhpi4qMFBXYBYHeAl6cWhQoA-GKnUkRnmHOTYC2xg0MYc4SOfRUJgTykyg9W2XBrkRqEMklGdMNjlCiXt1cLQlZSi-yFCgoaSsG8cy6ZVGgbtWeZbwHAXWXZKwysVqiQIPKulPxBC61A76EE9d6y6kwcbkSCf7zaYHCdkiG2yclHOQ7JEkZIxNL3CKzFtyUveEMu_F40lugvUzSH4N0kZ7VPFhZVBgGcKXroXPwXoIXsJIMmP9HxOdSHfJBv-LS2AM3xkiKTPnrrkHIEMnuHDlP8VH3mj5LzfaErfBM13d50-Ts74RSOaeph_FoYuabmPQ4zNTWY-5UTDEaermU1H4qTUseBnO_xpe_hZu-ic_AgAA__-5Pwzl
+https://cockroachdb.github.io/distsqlplan/decode.html#eJykUk2v0zAQvPMrVnsCyZSkR0tIraBIeQrJo-0BeMrBtVcPg2sHrwN9qvLfUT6EWhBf4rizM-uZkc_Inx1K3G3KzYs9dNHBq239Gu42b2_LdVHBulqX795v4PHLYrffvSmfwEzVCzVRNdzURQUG6grM4gDPQS8ODQr0wVCljsQo7zDHRmAbgybmEAfoPBIKc0KZCbS-7dIANwJ1iITyjMkmRyhxrw6OtqQMxWcZCjSUlHXjWSa90ihw1yrPEp6iwLpLEla5WC1R4EEl_YEYQpfaAR_kqWvdBTTQmBzpZL_Y9CAhW2QDjZNyDpI9koSMsekFTpLZJSd1TyjzXvx9kptg_Rwkvw7SRntU8WFlUGAZwqeuhY_BeghewphkjoUCY_jKEEmZ2fu1z8GAoRNcsPLv4E_c_-iHTqS7ZIP_c0fLf-loS9wGz3TVz68uZ30jkMw9TT-KQxc13cagx2emsR51I2CI07TNp6Hw02oweCnOfyte_iBu-kffAgAA__9z_wzl
 
 query T
 SELECT url FROM [EXPLAIN ANALYZE SELECT c.a FROM c INNER MERGE JOIN d ON c.a = d.b]
@@ -116,8 +116,8 @@ EXPLAIN (VEC) SELECT t46122_0.c0 FROM t46122_0, t46122_1
 │
 └ Node 1
 └ *rowexec.hashJoiner
-  ├ *colexec.colBatchScan
-  └ *colexec.colBatchScan
+  ├ *colfetcher.colBatchScan
+  └ *colfetcher.colBatchScan
 
 # Regression test for #46404 (rowexec.noopProcessor not implementing
 # execinfra.OpNode interface).
@@ -132,8 +132,8 @@ EXPLAIN (VEC) SELECT stddev((t46404_1.c0 > ANY (0, 0))::INT) FROM t46404_0, t464
 └ *rowexec.hashAggregator
   └ *rowexec.noopProcessor
     └ *colexec.hashJoiner
-      ├ *colexec.colBatchScan
-      └ *colexec.colBatchScan
+      ├ *colfetcher.colBatchScan
+      └ *colfetcher.colBatchScan
 
 statement ok
 CREATE TABLE xyz (
@@ -150,5 +150,63 @@ EXPLAIN (VEC) SELECT * FROM xyz AS t1 FULL OUTER JOIN xyz AS t2 ON t1.x = t2.x A
 │
 └ Node 1
   └ *rowexec.hashJoiner
-    ├ *colexec.colBatchScan
-    └ *colexec.colBatchScan
+    ├ *colfetcher.colBatchScan
+    └ *colfetcher.colBatchScan
+
+# Verify that the vectorized engine is used (there is a mismatch between
+# argument type width and the result).
+query T
+EXPLAIN (VEC) SELECT max(c) FROM a
+----
+│
+└ Node 1
+  └ *colexec.orderedAggregator
+    └ *colexec.distinctChainOps
+      └ *colfetcher.colBatchScan
+
+# Verify that binary operations on integers of any width return INT8.
+statement ok
+CREATE TABLE ints (_int2 INT2, _int4 INT4, _int8 INT8);
+INSERT INTO ints VALUES (1, 1, 1), (2, 2, 2)
+
+query T
+SELECT pg_typeof(_int2 - _int2) FROM ints LIMIT 1
+----
+bigint
+
+query T
+EXPLAIN (VEC) SELECT _int2 * _int2 FROM ints WHERE _int4 + _int4 = _int8 + 2
+----
+│
+└ Node 1
+  └ *colexec.projMultInt16Int16Op
+    └ *colexec.selEQInt64Int64Op
+      └ *colexec.projPlusInt64Int64ConstOp
+        └ *colexec.projPlusInt32Int32Op
+          └ *colfetcher.colBatchScan
+
+query I
+SELECT _int2 * _int2 FROM ints WHERE _int4 + _int4 = _int8 + 2
+----
+4
+
+# Check that joinReader core is wrapped into the plan when vectorize is set to
+# `experimental_always` - that core is the only exception to disabling of
+# wrapping.
+
+query T
+EXPLAIN (VEC) SELECT c.a FROM c JOIN d ON d.b = c.b
+----
+│
+└ Node 1
+  └ *rowexec.joinReader
+    └ *colfetcher.colBatchScan
+
+statement ok
+SET vectorize = experimental_always
+
+statement ok
+SELECT c.a FROM c JOIN d ON d.b = c.b
+
+statement ok
+RESET vectorize

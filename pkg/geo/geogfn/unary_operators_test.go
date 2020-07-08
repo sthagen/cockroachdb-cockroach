@@ -15,7 +15,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/golang/geo/s1"
 	"github.com/stretchr/testify/require"
+	"github.com/twpayne/go-geom"
 )
 
 type unaryOperatorExpectedResult struct {
@@ -50,6 +52,26 @@ var unaryOperatorTestCases = []struct {
 		spheroid: unaryOperatorExpectedResult{
 			expectedArea:      6154854786.721433,
 			expectedPerimeter: 378793.4476424126,
+		},
+	},
+	{
+		wkt: "SRID=4004;LINESTRING(1.0 1.0, 2.0 2.0, 3.0 3.0)",
+		sphere: unaryOperatorExpectedResult{
+			expectedLength: 314367.99984330626,
+		},
+		spheroid: unaryOperatorExpectedResult{
+			expectedLength: 313672.2213232639,
+		},
+	},
+	{
+		wkt: "SRID=4004;POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 0.0))",
+		sphere: unaryOperatorExpectedResult{
+			expectedArea:      6181093937.160788,
+			expectedPerimeter: 379596.9916332415,
+		},
+		spheroid: unaryOperatorExpectedResult{
+			expectedArea:      6153550906.915973,
+			expectedPerimeter: 378753.30454341066,
 		},
 	},
 	{
@@ -216,6 +238,46 @@ func TestLength(t *testing.T) {
 					)
 				})
 			}
+		})
+	}
+}
+
+func TestProject(t *testing.T) {
+	var testCases = []struct {
+		desc      string
+		point     *geo.Geography
+		distance  float64
+		azimuth   float64
+		projected *geo.Geography
+	}{
+		{
+			"POINT(0 0), 100000, radians(45)",
+			geo.MustNewGeographyFromGeomT(geom.NewPointFlat(geom.XY, []float64{0, 0}).SetSRID(4326)),
+			100000,
+			45 * math.Pi / 180.0,
+			geo.MustNewGeographyFromGeomT(geom.NewPointFlat(geom.XY, []float64{0.6352310291255374, 0.6394723347291977}).SetSRID(4326)),
+		},
+		{
+			"SRID=4004;POINT(0 0), 100000, radians(45)",
+			geo.MustNewGeographyFromGeomT(geom.NewPointFlat(geom.XY, []float64{0, 0}).SetSRID(4004)),
+			100000,
+			45 * math.Pi / 180.0,
+			geo.MustNewGeographyFromGeomT(geom.NewPointFlat(geom.XY, []float64{0.6353047281438549, 0.6395336363116583}).SetSRID(4004)),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			projected, err := Project(tc.point, tc.distance, s1.Angle(tc.azimuth))
+			require.NoError(t, err)
+			require.Equalf(
+				t,
+				tc.projected,
+				projected,
+				"expected %f, found %f",
+				&tc.projected,
+				projected,
+			)
 		})
 	}
 }

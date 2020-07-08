@@ -11,9 +11,10 @@
 package sqlbase
 
 import (
+	"strings"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -51,10 +52,22 @@ func AdjustValueToColumnType(
 			sv = v.Contents
 		}
 
+		if typ.Oid() == oid.T_bpchar {
+			sv = strings.TrimRight(sv, " ")
+		}
+
 		if typ.Width() > 0 && utf8.RuneCountInString(sv) > int(typ.Width()) {
 			return nil, pgerror.Newf(pgcode.StringDataRightTruncation,
 				"value too long for type %s (column %q)",
 				typ.SQLString(), tree.ErrNameStringP(name))
+		}
+
+		if typ.Oid() == oid.T_bpchar {
+			if _, ok := tree.AsDString(inVal); ok {
+				return tree.NewDString(strings.TrimRight(sv, " ")), nil
+			} else if _, ok := inVal.(*tree.DCollatedString); ok {
+				return tree.NewDCollatedString(strings.TrimRight(sv, " "), typ.Locale(), &tree.CollationEnvironment{})
+			}
 		}
 	case types.IntFamily:
 		if v, ok := tree.AsDInt(inVal); ok {
@@ -163,7 +176,7 @@ func AdjustValueToColumnType(
 			if err := geo.GeospatialTypeFitsColumnMetadata(
 				in.Geometry,
 				typ.InternalType.GeoMetadata.SRID,
-				typ.InternalType.GeoMetadata.Shape,
+				typ.InternalType.GeoMetadata.ShapeType,
 			); err != nil {
 				return nil, err
 			}
@@ -173,7 +186,7 @@ func AdjustValueToColumnType(
 			if err := geo.GeospatialTypeFitsColumnMetadata(
 				in.Geography,
 				typ.InternalType.GeoMetadata.SRID,
-				typ.InternalType.GeoMetadata.Shape,
+				typ.InternalType.GeoMetadata.ShapeType,
 			); err != nil {
 				return nil, err
 			}

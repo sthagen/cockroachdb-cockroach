@@ -113,7 +113,7 @@ func newJoinReader(
 	if err != nil {
 		return nil, err
 	}
-	returnMutations := spec.Visibility == execinfrapb.ScanVisibility_PUBLIC_AND_NOT_PUBLIC
+	returnMutations := spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic
 	jr.colIdxMap = jr.desc.ColumnIdxMapWithMutations(returnMutations)
 
 	columnIDs, _ := jr.index.FullColumnIDs()
@@ -215,9 +215,8 @@ func (jr *joinReader) initJoinReaderStrategy(
 	// Initialize memory monitors and row container for looked up rows.
 	jr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx.Cfg, "joiner-limited")
 	jr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, "joinreader-disk")
-	drc := rowcontainer.NewDiskBackedIndexedRowContainer(
-		// TODO(asubiotto): Does a nil ordering make sense in all cases?
-		nil, /* ordering */
+	drc := rowcontainer.NewDiskBackedNumberedRowContainer(
+		false, /* deDup */
 		typs,
 		jr.EvalCtx,
 		jr.FlowCtx.Cfg.TempStorage,
@@ -411,6 +410,7 @@ func (jr *joinReader) performLookup() (joinReaderState, *execinfrapb.ProducerMet
 		}
 	}
 	log.VEvent(jr.Ctx, 1, "done joining rows")
+	jr.strategy.prepareToEmit(jr.Ctx)
 
 	return jrEmittingRows, nil
 }

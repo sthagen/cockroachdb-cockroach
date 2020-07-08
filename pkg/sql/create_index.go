@@ -16,11 +16,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -40,7 +40,7 @@ type createIndexNode struct {
 //          mysql requires INDEX on the table.
 func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNode, error) {
 	tableDesc, err := p.ResolveMutableTableDescriptor(
-		ctx, &n.Table, true /*required*/, resolver.ResolveRequireTableDesc,
+		ctx, &n.Table, true /*required*/, tree.ResolveRequireTableDesc,
 	)
 	if err != nil {
 		return nil, err
@@ -94,14 +94,15 @@ func (p *planner) setupFamilyAndConstraintForShard(
 		inuseNames[k] = struct{}{}
 	}
 
-	ckName, err := generateMaybeDuplicateNameForCheckConstraint(tableDesc, ckDef.Expr)
+	ckBuilder := schemaexpr.NewCheckConstraintBuilder(ctx, p.tableName, tableDesc, &p.semaCtx)
+	ckName, err := ckBuilder.DefaultName(ckDef.Expr)
 	if err != nil {
 		return err
 	}
+
 	// Avoid creating duplicate check constraints.
 	if _, ok := inuseNames[ckName]; !ok {
-		ck, err := makeCheckConstraint(ctx, tableDesc, ckDef, inuseNames,
-			&p.semaCtx, p.tableName)
+		ck, err := ckBuilder.Build(ckDef)
 		if err != nil {
 			return err
 		}
@@ -206,10 +207,14 @@ func MakeIndexDescriptor(
 			return nil, unimplemented.NewWithIssue(9683, "partial indexes are not supported")
 		}
 
-		_, err := validateIndexPredicate(params.ctx, tableDesc, n.Predicate, &params.p.semaCtx, n.Table)
+		idxValidator := schemaexpr.NewIndexPredicateValidator(params.ctx, n.Table, tableDesc, &params.p.semaCtx)
+		expr, err := idxValidator.Validate(n.Predicate)
 		if err != nil {
 			return nil, err
 		}
+
+		// Store the serialized predicate expression in the IndexDescriptor.
+		indexDesc.Predicate = tree.Serialize(expr)
 	}
 
 	if err := indexDesc.FillColumns(n.Columns); err != nil {

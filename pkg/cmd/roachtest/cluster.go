@@ -853,21 +853,32 @@ func (s *clusterSpec) args() []string {
 		machineTypeArg := machineTypeFlag(machineType) + "=" + machineType
 		args = append(args, machineTypeArg)
 	}
-	if s.Zones != "" {
-		switch cloud {
-		case gce:
-			if s.Geo {
-				args = append(args, "--gce-zones="+s.Zones)
-			} else {
-				args = append(args, "--gce-zones="+firstZone(s.Zones))
+
+	if !local {
+		zones := s.Zones
+		if zones == "" {
+			zones = zonesF
+		}
+		if zones != "" {
+			if !s.Geo {
+				zones = firstZone(zones)
 			}
-		case azure:
-			args = append(args, "--azure-locations="+s.Zones)
-		default:
-			fmt.Fprintf(os.Stderr, "specifying zones is not yet supported on %s", cloud)
-			os.Exit(1)
+			var arg string
+			switch cloud {
+			case aws:
+				arg = "--aws-zones=" + zones
+			case gce:
+				arg = "--gce-zones=" + zones
+			case azure:
+				arg = "--azure-locations=" + zones
+			default:
+				fmt.Fprintf(os.Stderr, "specifying zones is not yet supported on %s", cloud)
+				os.Exit(1)
+			}
+			args = append(args, arg)
 		}
 	}
+
 	if s.Geo {
 		args = append(args, "--geo")
 	}
@@ -1175,13 +1186,6 @@ func (f *clusterFactory) newCluster(
 
 	sargs := []string{roachprod, "create", c.name, "-n", fmt.Sprint(c.spec.NodeCount)}
 	sargs = append(sargs, cfg.spec.args()...)
-	if !local && zonesF != "" && cfg.spec.Zones == "" {
-		if cfg.spec.Geo {
-			sargs = append(sargs, "--gce-zones="+zonesF)
-		} else {
-			sargs = append(sargs, "--gce-zones="+firstZone(zonesF))
-		}
-	}
 	if !cfg.useIOBarrier {
 		sargs = append(sargs, "--local-ssd-no-ext4-barrier")
 	}
@@ -1539,24 +1543,21 @@ WHERE t.status NOT IN ('RANGE_CONSISTENT', 'RANGE_INDETERMINATE')`)
 		c.l.Printf("consistency check failed with %v; ignoring", err)
 		return nil
 	}
-	var buf bytes.Buffer
+	var finalErr error
 	for rows.Next() {
 		var rangeID int32
 		var prettyKey, status, detail string
-		if err := rows.Scan(&rangeID, &prettyKey, &status, &detail); err != nil {
-			return err
+		if scanErr := rows.Scan(&rangeID, &prettyKey, &status, &detail); err != nil {
+			return scanErr
 		}
-		fmt.Fprintf(&buf, "r%d (%s) is inconsistent: %s %s\n", rangeID, prettyKey, status, detail)
+		finalErr = errors.CombineErrors(finalErr,
+			errors.Newf("r%d (%s) is inconsistent: %s %s\n", rangeID, prettyKey, status, detail))
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		finalErr = errors.CombineErrors(finalErr, err)
 	}
 
-	msg := buf.String()
-	if msg != "" {
-		return errors.New(msg)
-	}
-	return nil
+	return finalErr
 }
 
 // FailOnReplicaDivergence fails the test if
@@ -2425,44 +2426,27 @@ func (m *monitor) ResetDeaths() {
 	atomic.StoreInt32(&m.expDeaths, 0)
 }
 
-var errGoexit = errors.New("Goexit() was called")
+var errTestFatal = errors.New("t.Fatal() was called")
 
 func (m *monitor) Go(fn func(context.Context) error) {
 	m.g.Go(func() (err error) {
-		var returned bool
 		defer func() {
-			if returned {
-				return
-			}
-			if r := recover(); r != errGoexit && r != nil {
-				// Pass any regular panics through.
-				panic(r)
-			} else {
-				// If the invoked method called runtime.Goexit (such as it
-				// happens when it calls t.Fatal), exit with a sentinel error
-				// here so that the wrapped errgroup cancels itself.
-				//
-				// Note that the trick here is that we panicked explicitly below,
-				// which somehow "overrides" the Goexit which is supposed to be
-				// un-recoverable, but we do need to recover to return an error.
-				err = errGoexit
+			if r := recover(); r != nil {
+				if r != errTestFatal {
+					// Pass any regular panics through.
+					panic(r)
+				}
+				// t.{Skip,Fatal} perform a panic(errTestFatal). If we've caught the
+				// errTestFatal sentinel we transform the panic into an error return so
+				// that the wrapped errgroup cancels itself.
+				err = errTestFatal
 			}
 		}()
 		if impl, ok := m.t.(*test); ok {
 			// Automatically clear the worker status message when the goroutine exits.
 			defer impl.WorkerStatus()
 		}
-		defer func() {
-			if !returned {
-				if r := recover(); r != nil {
-					panic(r)
-				}
-				panic(errGoexit)
-			}
-		}()
-		err = fn(m.ctx)
-		returned = true
-		return err
+		return fn(m.ctx)
 	})
 }
 

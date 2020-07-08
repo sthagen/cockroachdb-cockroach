@@ -337,12 +337,17 @@ func TestParse(t *testing.T) {
 
 		{`CREATE STATISTICS a ON col1 FROM t`},
 		{`EXPLAIN CREATE STATISTICS a ON col1 FROM t`},
+		{`CREATE STATISTICS a FROM t`},
+		{`CREATE STATISTICS a FROM [53]`},
 		{`CREATE STATISTICS a ON col1, col2 FROM t`},
 		{`CREATE STATISTICS a ON col1 FROM d.t`},
 		{`CREATE STATISTICS a ON col1 FROM t`},
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.9`},
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.1 AS OF SYSTEM TIME '2016-01-01'`},
+
+		{`ANALYZE t`},
+		{`ANALYZE db.sc.t`},
 
 		{`CREATE TYPE a AS ENUM ()`},
 		{`CREATE TYPE a AS ENUM ('a')`},
@@ -516,6 +521,7 @@ func TestParse(t *testing.T) {
 		{`SHOW EXPERIMENTAL_REPLICA TRACE FOR SESSION`},
 		{`EXPLAIN SHOW EXPERIMENTAL_REPLICA TRACE FOR SESSION`},
 		{`SHOW STATISTICS FOR TABLE t`},
+		{`SHOW STATISTICS USING JSON FOR TABLE t`},
 		{`EXPLAIN SHOW STATISTICS FOR TABLE t`},
 		{`SHOW STATISTICS FOR TABLE d.t`},
 		{`SHOW HISTOGRAM 123`},
@@ -566,6 +572,7 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN SHOW TRANSACTION STATUS`},
 		{`SHOW SAVEPOINT STATUS`},
 		{`EXPLAIN SHOW SAVEPOINT STATUS`},
+		{`SHOW LAST QUERY STATISTICS`},
 
 		{`SHOW SYNTAX 'select 1'`},
 		{`EXPLAIN SHOW SYNTAX 'select 1'`},
@@ -1425,6 +1432,13 @@ func TestParse(t *testing.T) {
 		{`EXPERIMENTAL SCRUB TABLE x WITH OPTIONS PHYSICAL, INDEX ALL, CONSTRAINT ALL`},
 
 		{`BACKUP TABLE foo TO 'bar'`},
+		{`CREATE SCHEDULE FOR BACKUP TABLE foo TO 'bar' RECURRING NEVER`},
+		{`CREATE SCHEDULE 'my schedule' FOR BACKUP TABLE foo TO 'bar' RECURRING NEVER`},
+		{`CREATE SCHEDULE FOR BACKUP TABLE foo TO 'bar' RECURRING '@daily'`},
+		{`CREATE SCHEDULE FOR BACKUP TABLE foo, bar, buz TO 'bar' RECURRING '@daily' FULL BACKUP ALWAYS`},
+		{`CREATE SCHEDULE FOR BACKUP TABLE foo, bar, buz TO 'bar' RECURRING '@daily' FULL BACKUP '@weekly'`},
+		{`CREATE SCHEDULE FOR BACKUP TABLE foo, bar, buz TO 'bar' WITH revision_history RECURRING '@daily' FULL BACKUP '@weekly'`},
+		{`CREATE SCHEDULE FOR BACKUP TO 'bar' WITH revision_history RECURRING '@daily' FULL BACKUP '@weekly' WITH EXPERIMENTAL SCHEDULE OPTIONS foo = 'bar'`},
 		{`EXPLAIN BACKUP TABLE foo TO 'bar'`},
 		{`BACKUP TABLE foo.foo, baz.baz TO 'bar'`},
 
@@ -1464,7 +1478,7 @@ func TestParse(t *testing.T) {
 		{`RESTORE DATABASE foo FROM ($1, $2), ($3, $4)`},
 		{`RESTORE DATABASE foo FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1'`},
 
-		{`BACKUP TABLE foo TO 'bar' WITH key1, key2 = 'value'`},
+		{`BACKUP TABLE foo TO 'bar' WITH revision_history, detached`},
 		{`RESTORE TABLE foo FROM 'bar' WITH key1, key2 = 'value'`},
 
 		{`IMPORT TABLE foo CREATE USING 'nodelocal://0/some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
@@ -1581,6 +1595,8 @@ func TestParse2(t *testing.T) {
 
 		{`CREATE STATISTICS a ON col1 FROM t AS OF SYSTEM TIME '2016-01-01'`,
 			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
+
+		{`ANALYSE t`, `ANALYZE t`},
 
 		{`SELECT TIMESTAMP WITHOUT TIME ZONE 'foo'`, `SELECT TIMESTAMP 'foo'`},
 		{`SELECT CAST('foo' AS TIMESTAMP WITHOUT TIME ZONE)`, `SELECT CAST('foo' AS TIMESTAMP)`},
@@ -2114,6 +2130,8 @@ $function$`,
 			`BACKUP TABLE foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'`},
 		{`BACKUP foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'`,
 			`BACKUP TABLE foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'`},
+		{`BACKUP TO 'bar'`,
+			`BACKUP TO 'bar'`},
 		// Tables named "role" are handled specially to support SHOW GRANTS ON ROLE,
 		// but that special handling should not impact BACKUP.
 		{`BACKUP role TO 'bar'`,
@@ -2124,15 +2142,18 @@ $function$`,
 			`RESTORE TABLE foo FROM $1`},
 		{`RESTORE foo FROM $1, $2, 'bar'`,
 			`RESTORE TABLE foo FROM $1, $2, 'bar'`},
+		{`RESTORE FROM $1, $2, 'bar'`,
+			`RESTORE FROM $1, $2, 'bar'`},
 		{`RESTORE foo, baz FROM 'bar'`,
 			`RESTORE TABLE foo, baz FROM 'bar'`},
 		{`RESTORE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`,
 			`RESTORE TABLE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
-		{`BACKUP foo TO 'bar' WITH key1, key2 = 'value'`,
-			`BACKUP TABLE foo TO 'bar' WITH key1, key2 = 'value'`},
+		{`BACKUP foo TO 'bar' WITH ENCRYPTION_PASSPHRASE = 'secret', revision_history`,
+			`BACKUP TABLE foo TO 'bar' WITH revision_history, encryption_passphrase='secret'`},
+		{`BACKUP foo TO 'bar' WITH OPTIONS (detached, ENCRYPTION_PASSPHRASE = 'secret', revision_history)`,
+			`BACKUP TABLE foo TO 'bar' WITH revision_history, encryption_passphrase='secret', detached`},
 		{`RESTORE foo FROM 'bar' WITH key1, key2 = 'value'`,
 			`RESTORE TABLE foo FROM 'bar' WITH key1, key2 = 'value'`},
-
 		{`CREATE CHANGEFEED FOR foo INTO 'sink'`, `CREATE CHANGEFEED FOR TABLE foo INTO 'sink'`},
 
 		{`GRANT SELECT ON foo TO root`,
@@ -2932,6 +2953,22 @@ CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '-1s' THROTTLI
                                                                                                               ^`,
 		},
 		{
+			`ANALYZE`,
+			`at or near "EOF": syntax error
+DETAIL: source SQL:
+ANALYZE
+       ^
+HINT: try \h ANALYZE`,
+		},
+		{
+			`ANALYSE`,
+			`at or near "EOF": syntax error
+DETAIL: source SQL:
+ANALYSE
+       ^
+HINT: try \h ANALYZE`,
+		},
+		{
 			`ALTER PARTITION p OF TABLE tbl@idx CONFIGURE ZONE USING num_replicas = 1`,
 			`at or near "idx": syntax error: index name should not be specified in ALTER PARTITION ... OF TABLE
 DETAIL: source SQL:
@@ -2953,6 +2990,25 @@ HINT: try ALTER PARTITION <partition> OF INDEX <tablename>@*`,
 DETAIL: source SQL:
 SELECT percentile_disc(0.50) WITHIN GROUP (ORDER BY f, s) FROM x
                                                         ^`,
+		},
+		{`BACKUP foo TO 'bar' WITH key1, key2 = 'value'`,
+			`at or near "key1": syntax error
+DETAIL: source SQL:
+BACKUP foo TO 'bar' WITH key1, key2 = 'value'
+                         ^
+HINT: try \h BACKUP`,
+		},
+		{`BACKUP foo TO 'bar' WITH revision_history, revision_history`,
+			`at or near "revision_history": syntax error: revision_history option specified multiple times
+DETAIL: source SQL:
+BACKUP foo TO 'bar' WITH revision_history, revision_history
+                                           ^`,
+		},
+		{`BACKUP foo TO 'bar' WITH detached, revision_history, detached`,
+			`at or near "detached": syntax error: detached option specified multiple times
+DETAIL: source SQL:
+BACKUP foo TO 'bar' WITH detached, revision_history, detached
+                                                     ^`,
 		},
 	}
 	for _, d := range testData {
@@ -3416,7 +3472,7 @@ func TestUnimplementedSyntax(t *testing.T) {
 					t.Errorf("%s: expected %q in telemetry keys, got %+v", d.sql, exp, tkeys)
 				}
 
-				exp2 := fmt.Sprintf("issues/%d", d.issue)
+				exp2 := fmt.Sprintf("issue/%d", d.issue)
 				found = false
 				hints := errors.GetAllHints(err)
 				for _, h := range hints {

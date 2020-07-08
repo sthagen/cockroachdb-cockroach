@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -26,7 +27,7 @@ import (
 type KVInserter func(roachpb.KeyValue)
 
 // CPut is not implmented.
-func (i KVInserter) CPut(key, value interface{}, expValue *roachpb.Value) {
+func (i KVInserter) CPut(key, value interface{}, expValue []byte) {
 	panic("unimplemented")
 }
 
@@ -265,11 +266,8 @@ func NewDatumRowConverter(
 	}
 
 	var txCtx transform.ExprTransformContext
-	// We do not currently support DEFAULT expressions on target or non-target
-	// columns. All non-target columns must be nullable and will be set to NULL
-	// during import. We do however support DEFAULT on hidden columns (which is
-	// only the default _rowid one). This allows those expressions to run.
-	cols, defaultExprs, err := sqlbase.ProcessDefaultColumns(ctx, targetColDescriptors, immutDesc, &txCtx, c.EvalCtx)
+	semaCtx := tree.MakeSemaContext()
+	cols, defaultExprs, err := sqlbase.ProcessDefaultColumns(ctx, targetColDescriptors, immutDesc, &txCtx, c.EvalCtx, &semaCtx)
 	if err != nil {
 		return nil, errors.Wrap(err, "process default columns")
 	}
@@ -280,8 +278,6 @@ func NewDatumRowConverter(
 		evalCtx.Codec,
 		immutDesc,
 		cols,
-		SkipFKs,
-		nil, /* fkTables */
 		&sqlbase.DatumAlloc{},
 	)
 	if err != nil {
@@ -301,6 +297,11 @@ func NewDatumRowConverter(
 	c.Datums = make([]tree.Datum, len(targetColDescriptors), len(cols))
 
 	// Check for a hidden column. This should be the unique_rowid PK if present.
+	// In addition, check for non-targeted columns with non-null DEFAULT expressions.
+	isTargetCol := func(col *sqlbase.ColumnDescriptor) bool {
+		_, ok := isTargetColID[col.ID]
+		return ok
+	}
 	c.hidden = -1
 	for i := range cols {
 		col := &cols[i]
@@ -310,6 +311,23 @@ func NewDatumRowConverter(
 			}
 			c.hidden = i
 			c.Datums = append(c.Datums, nil)
+		} else {
+			if !isTargetCol(col) && col.DefaultExpr != nil {
+				// Check if the default expression is a constant expression as we do not
+				// support non-constant default expressions for non-target columns in IMPORT INTO.
+				//
+				// TODO (anzoteh96): add support to non-constant default expressions. Perhaps
+				// we can start with those with Stable volatility, like now().
+				if !tree.IsConst(evalCtx, defaultExprs[i]) {
+					return nil, errors.Newf(
+						"non-constant default expression %s for non-targeted column %q is not supported by IMPORT INTO",
+						defaultExprs[i].String(),
+						col.Name)
+				}
+				// Placeholder for columns with default values that will be evaluated when
+				// each import row is being created.
+				c.Datums = append(c.Datums, nil)
+			}
 		}
 	}
 	if len(c.Datums) != len(cols) {
@@ -364,6 +382,17 @@ func (c *DatumRowConverter) Row(ctx context.Context, sourceID int32, rowIndex in
 		c.Datums[c.hidden] = tree.NewDInt(tree.DInt(avoidCollisionsWithSQLsIDs | rowID))
 	}
 
+	for i := range c.cols {
+		col := &c.cols[i]
+		if _, ok := c.IsTargetCol[i]; !ok && !col.Hidden && col.DefaultExpr != nil {
+			datum, err := c.defaultExprs[i].Eval(c.EvalCtx)
+			if err != nil {
+				return errors.Wrapf(err, "error evaluating default expression for IMPORT INTO")
+			}
+			c.Datums[i] = datum
+		}
+	}
+
 	// TODO(justin): we currently disallow computed columns in import statements.
 	var computeExprs []tree.TypedExpr
 	var computedCols []sqlbase.ColumnDescriptor
@@ -373,6 +402,9 @@ func (c *DatumRowConverter) Row(ctx context.Context, sourceID int32, rowIndex in
 	if err != nil {
 		return errors.Wrap(err, "generate insert row")
 	}
+	// TODO(mgartner): Add partial index IDs to ignoreIndexes that we should
+	// not delete entries from.
+	var ignoreIndexes util.FastIntSet
 	if err := c.ri.InsertRow(
 		ctx,
 		KVInserter(func(kv roachpb.KeyValue) {
@@ -380,8 +412,8 @@ func (c *DatumRowConverter) Row(ctx context.Context, sourceID int32, rowIndex in
 			c.KvBatch.KVs = append(c.KvBatch.KVs, kv)
 		}),
 		insertRow,
-		true, /* ignoreConflicts */
-		SkipFKs,
+		ignoreIndexes,
+		true,  /* ignoreConflicts */
 		false, /* traceKV */
 	); err != nil {
 		return errors.Wrap(err, "insert row")

@@ -33,9 +33,6 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// Remove unused warning.
-var _ = execgen.UNSAFEGET
-
 // {{/*
 // Declarations to make the template compile properly.
 
@@ -54,24 +51,6 @@ const _RIGHT_TYPE_WIDTH = 0
 // _ASSIGN is the template function for assigning the first input to the result
 // of computation an operation on the second and the third inputs.
 func _ASSIGN(_, _, _, _, _, _ interface{}) {
-	colexecerror.InternalError("")
-}
-
-// _L_UNSAFEGET is the template function that will be replaced by
-// "execgen.UNSAFEGET" which uses _L_TYP.
-func _L_UNSAFEGET(_, _ interface{}) interface{} {
-	colexecerror.InternalError("")
-}
-
-// _R_UNSAFEGET is the template function that will be replaced by
-// "execgen.UNSAFEGET" which uses _R_TYP.
-func _R_UNSAFEGET(_, _ interface{}) interface{} {
-	colexecerror.InternalError("")
-}
-
-// _RETURN_UNSAFEGET is the template function that will be replaced by
-// "execgen.UNSAFEGET" which uses _RET_TYP.
-func _RETURN_UNSAFEGET(_, _ interface{}) interface{} {
 	colexecerror.InternalError("")
 }
 
@@ -168,11 +147,11 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 		// incorrect value. In order to keep bounds check elimination for all other
 		// types, we simply omit this code snippet for Bytes. */}}
 		col1 = execgen.SLICE(col1, 0, n)
-		colLen := execgen.LEN(col1)
-		_ = _RETURN_UNSAFEGET(projCol, colLen-1)
-		_ = _R_UNSAFEGET(col2, colLen-1)
+		colLen := col1.Len()
+		_ = projCol.Get(colLen - 1)
+		_ = col2.Get(colLen - 1)
 		// {{end}}
-		for execgen.RANGE(i, col1, 0, n) {
+		for i := 0; i < n; i++ {
 			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
 		}
 	}
@@ -196,8 +175,8 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 		// We only want to perform the projection operation if both values are not
 		// null.
 		// {{end}}
-		arg1 := _L_UNSAFEGET(col1, i)
-		arg2 := _R_UNSAFEGET(col2, i)
+		arg1 := col1.Get(i)
+		arg2 := col2.Get(i)
 		_ASSIGN(projCol[i], arg1, arg2, projCol, col1, col2)
 		// {{if _HAS_NULLS}}
 	}
@@ -249,7 +228,8 @@ func GetProjectionOperator(
 	col1Idx int,
 	col2Idx int,
 	outputIdx int,
-	overloadHelper overloadHelper,
+	binFn *tree.BinOp,
+	evalCtx *tree.EvalContext,
 ) (colexecbase.Operator, error) {
 	input = newVectorTypeEnforcer(allocator, input, outputType, outputIdx)
 	projOpBase := projOpBase{
@@ -258,7 +238,7 @@ func GetProjectionOperator(
 		col1Idx:        col1Idx,
 		col2Idx:        col2Idx,
 		outputIdx:      outputIdx,
-		overloadHelper: overloadHelper,
+		overloadHelper: overloadHelper{binFn: binFn, evalCtx: evalCtx},
 	}
 
 	switch op.(type) {

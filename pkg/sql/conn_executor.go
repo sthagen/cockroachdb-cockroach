@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -637,6 +638,7 @@ func (s *Server) newConnExecutor(
 	ex.extraTxnState.descCollection = descs.MakeCollection(s.cfg.LeaseManager,
 		s.cfg.Settings, s.dbCache.getDatabaseCache(), s.dbCache)
 	ex.extraTxnState.txnRewindPos = -1
+	ex.extraTxnState.schemaChangeJobsCache = make(map[sqlbase.ID]*jobs.Job)
 	ex.mu.ActiveQueries = make(map[ClusterWideID]*queryMeta)
 	ex.machine = fsm.MakeMachine(TxnStateTransitions, stateNoTxn{}, &ex.state)
 
@@ -937,6 +939,11 @@ type connExecutor struct {
 		// that staged them commits.
 		jobs jobsCollection
 
+		// schemaChangeJobsCache is a map of descriptor IDs to Jobs.
+		// Used in createOrUpdateSchemaChangeJob so we can check if a job has been
+		// queued up for the given ID.
+		schemaChangeJobsCache map[sqlbase.ID]*jobs.Job
+
 		// autoRetryCounter keeps track of the which iteration of a transaction
 		// auto-retry we're currently in. It's 0 whenever the transaction state is not
 		// stateOpen.
@@ -1019,6 +1026,7 @@ type connExecutor struct {
 	// safe to use when a statement is not being parallelized. It must be reset
 	// before using.
 	planner planner
+
 	// phaseTimes tracks session- and transaction-level phase times. It is
 	// copied-by-value when resetting statsCollector before executing each
 	// statement.
@@ -1149,6 +1157,10 @@ func (ex *connExecutor) resetExtraTxnState(
 	ctx context.Context, dbCacheHolder *databaseCacheHolder, ev txnEvent,
 ) error {
 	ex.extraTxnState.jobs = nil
+
+	for k := range ex.extraTxnState.schemaChangeJobsCache {
+		delete(ex.extraTxnState.schemaChangeJobsCache, k)
+	}
 
 	ex.extraTxnState.descCollection.ReleaseAll(ctx)
 
@@ -1978,19 +1990,21 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			ReCache:            ex.server.reCache,
 			InternalExecutor:   &ie,
 			DB:                 ex.server.cfg.DB,
+			TypeResolver:       p,
 		},
-		SessionMutator:    ex.dataMutator,
-		VirtualSchemas:    ex.server.cfg.VirtualSchemas,
-		Tracing:           &ex.sessionTracing,
-		StatusServer:      ex.server.cfg.StatusServer,
-		MemMetrics:        &ex.memMetrics,
-		Descs:             &ex.extraTxnState.descCollection,
-		ExecCfg:           ex.server.cfg,
-		DistSQLPlanner:    ex.server.cfg.DistSQLPlanner,
-		TxnModesSetter:    ex,
-		Jobs:              &ex.extraTxnState.jobs,
-		schemaAccessors:   scInterface,
-		sqlStatsCollector: ex.statsCollector,
+		SessionMutator:       ex.dataMutator,
+		VirtualSchemas:       ex.server.cfg.VirtualSchemas,
+		Tracing:              &ex.sessionTracing,
+		StatusServer:         ex.server.cfg.StatusServer,
+		MemMetrics:           &ex.memMetrics,
+		Descs:                &ex.extraTxnState.descCollection,
+		ExecCfg:              ex.server.cfg,
+		DistSQLPlanner:       ex.server.cfg.DistSQLPlanner,
+		TxnModesSetter:       ex,
+		Jobs:                 &ex.extraTxnState.jobs,
+		SchemaChangeJobCache: ex.extraTxnState.schemaChangeJobsCache,
+		schemaAccessors:      scInterface,
+		sqlStatsCollector:    ex.statsCollector,
 	}
 }
 
@@ -2058,7 +2072,6 @@ func (ex *connExecutor) resetPlanner(
 	p.cancelChecker.Reset(ctx)
 
 	p.semaCtx = tree.MakeSemaContext()
-	p.semaCtx.Location = &ex.sessionData.DataConversion.Location
 	p.semaCtx.SearchPath = ex.sessionData.SearchPath
 	p.semaCtx.AsOfTimestamp = nil
 	p.semaCtx.Annotations = nil
@@ -2111,9 +2124,8 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		if res.Err() != nil {
 			err := errorutil.UnexpectedWithIssueErrorf(
 				26687,
-				"programming error: non-error event "+
-					advInfo.txnEvent.String()+ //the event is included like this so that it doesn't get sanitized
-					" generated even though res.Err() has been set to: %s",
+				"programming error: non-error event %s generated even though res.Err() has been set to: %s",
+				errors.Safe(advInfo.txnEvent.String()),
 				res.Err())
 			log.Errorf(ex.Ctx(), "%v", err)
 			errorutil.SendReport(ex.Ctx(), &ex.server.cfg.Settings.SV, err)

@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
@@ -63,7 +64,7 @@ func ShowCreateTable(
 	p PlanHookState,
 	tn *tree.Name,
 	dbPrefix string,
-	desc *sqlbase.TableDescriptor,
+	desc *sqlbase.ImmutableTableDescriptor,
 	lCtx simpleSchemaResolver,
 	displayOptions ShowCreateDisplayOptions,
 ) (string, error) {
@@ -85,7 +86,11 @@ func ShowCreateTable(
 			f.WriteString(",")
 		}
 		f.WriteString("\n\t")
-		f.WriteString(col.SQLString())
+		colstr, err := schemaexpr.FormatColumnForDisplay(ctx, &p.RunParams(ctx).p.semaCtx, desc, col)
+		if err != nil {
+			return "", err
+		}
+		f.WriteString(colstr)
 		if desc.IsPhysicalTable() && desc.PrimaryIndex.ColumnIDs[0] == col.ID {
 			// Only set primaryKeyIsOnVisibleColumn to true if the primary key
 			// is on a visible column (not rowid).
@@ -158,7 +163,9 @@ func ShowCreateTable(
 
 	// Create the FAMILY and CONSTRAINTs of the CREATE statement
 	showFamilyClause(desc, f)
-	showConstraintClause(desc, f)
+	if err := showConstraintClause(ctx, desc, &p.RunParams(ctx).p.semaCtx, f); err != nil {
+		return "", err
+	}
 
 	if err := showCreateInterleave(&desc.PrimaryIndex, &f.Buffer, dbPrefix, lCtx); err != nil {
 		return "", err
@@ -202,7 +209,7 @@ func (p *planner) ShowCreate(
 	ctx context.Context,
 	dbPrefix string,
 	allDescs []sqlbase.Descriptor,
-	desc *sqlbase.TableDescriptor,
+	desc *sqlbase.ImmutableTableDescriptor,
 	displayOptions ShowCreateDisplayOptions,
 ) (string, error) {
 	var stmt string

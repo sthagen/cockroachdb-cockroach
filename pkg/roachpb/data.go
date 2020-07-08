@@ -26,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"go.etcd.io/etcd/raft/raftpb"
 )
 
@@ -84,7 +85,7 @@ func (rk RKey) AsRawKey() Key {
 	return Key(rk)
 }
 
-// Less compares two RKeys.
+// Less returns true if receiver < otherRK.
 func (rk RKey) Less(otherRK RKey) bool {
 	return bytes.Compare(rk, otherRK) < 0
 }
@@ -280,14 +281,22 @@ func (v *Value) ClearChecksum() {
 // checksum of the value's contents. If the value's Checksum is not
 // set the verification is a noop.
 func (v Value) Verify(key []byte) error {
-	if n := len(v.RawBytes); n > 0 && n < headerSize {
-		return fmt.Errorf("%s: invalid header size: %d", Key(key), n)
+	if err := v.VerifyHeader(); err != nil {
+		return err
 	}
 	if sum := v.checksum(); sum != 0 {
 		if computedSum := v.computeChecksum(key); computedSum != sum {
 			return fmt.Errorf("%s: invalid checksum (%x) value [% x]",
 				Key(key), computedSum, v.RawBytes)
 		}
+	}
+	return nil
+}
+
+// VerifyHeader checks that, if the Value is not empty, it includes a header.
+func (v Value) VerifyHeader() error {
+	if n := len(v.RawBytes); n > 0 && n < headerSize {
+		return errors.Errorf("invalid header size: %d", n)
 	}
 	return nil
 }
@@ -344,6 +353,12 @@ func (v Value) dataBytes() []byte {
 	return v.RawBytes[headerSize:]
 }
 
+// TagAndDataBytes returns the value's tag and data (no checksum, no timestamp).
+// This is suitable to be used as the expected value in a CPut.
+func (v Value) TagAndDataBytes() []byte {
+	return v.RawBytes[tagPos:]
+}
+
 func (v *Value) ensureRawBytes(size int) {
 	if cap(v.RawBytes) < size {
 		v.RawBytes = make([]byte, size)
@@ -353,7 +368,7 @@ func (v *Value) ensureRawBytes(size int) {
 	v.setChecksum(checksumUninitialized)
 }
 
-// EqualData returns a boolean reporting whether the receiver and the parameter
+// EqualTagAndData returns a boolean reporting whether the receiver and the parameter
 // have equivalent byte values. This check ignores the optional checksum field
 // in the Values' byte slices, returning only whether the Values have the same
 // tag and encoded data.
@@ -361,15 +376,24 @@ func (v *Value) ensureRawBytes(size int) {
 // This method should be used whenever the raw bytes of two Values are being
 // compared instead of comparing the RawBytes slices directly because it ignores
 // the checksum header, which is optional.
-func (v Value) EqualData(o Value) bool {
-	return bytes.Equal(v.RawBytes[checksumSize:], o.RawBytes[checksumSize:])
+func (v Value) EqualTagAndData(o Value) bool {
+	return bytes.Equal(v.TagAndDataBytes(), o.TagAndDataBytes())
 }
 
-// SetBytes sets the bytes and tag field of the receiver and clears the checksum.
+// SetBytes copies the bytes and tag field to the receiver and clears the
+// checksum.
 func (v *Value) SetBytes(b []byte) {
 	v.ensureRawBytes(headerSize + len(b))
 	copy(v.dataBytes(), b)
 	v.setTag(ValueType_BYTES)
+}
+
+// SetTagAndData copies the bytes and tag field to the receiver and clears the
+// checksum. As opposed to SetBytes, b is assumed to contain the tag too, not
+// just the data.
+func (v *Value) SetTagAndData(b []byte) {
+	v.ensureRawBytes(checksumSize + len(b))
+	copy(v.TagAndDataBytes(), b)
 }
 
 // SetString sets the bytes and tag field of the receiver and clears the
@@ -1603,6 +1627,11 @@ func confChangeImpl(
 var _ fmt.Stringer = &ChangeReplicasTrigger{}
 
 func (crt ChangeReplicasTrigger) String() string {
+	return redact.StringWithoutMarkers(crt)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (crt ChangeReplicasTrigger) SafeFormat(w redact.SafePrinter, _ rune) {
 	var nextReplicaID ReplicaID
 	var afterReplicas []ReplicaDescriptor
 	added, removed := crt.Added(), crt.Removed()
@@ -1617,10 +1646,9 @@ func (crt ChangeReplicasTrigger) String() string {
 		nextReplicaID = crt.DeprecatedNextReplicaID
 		afterReplicas = crt.DeprecatedUpdatedReplicas
 	}
-	var chgS strings.Builder
 	cc, err := crt.ConfChange(nil)
 	if err != nil {
-		fmt.Fprintf(&chgS, "<malformed ChangeReplicasTrigger: %s>", err)
+		w.Printf("<malformed ChangeReplicasTrigger: %s>", err)
 	} else {
 		ccv2 := cc.AsV2()
 		if ccv2.LeaveJoint() {
@@ -1628,24 +1656,48 @@ func (crt ChangeReplicasTrigger) String() string {
 			//
 			// TODO(tbg): could list the replicas that will actually leave the
 			// voter set.
-			fmt.Fprintf(&chgS, "LEAVE_JOINT")
+			w.SafeString("LEAVE_JOINT")
 		} else if _, ok := ccv2.EnterJoint(); ok {
-			fmt.Fprintf(&chgS, "ENTER_JOINT(%s) ", raftpb.ConfChangesToString(ccv2.Changes))
+			w.Printf("ENTER_JOINT(%s) ", confChangesToRedactableString(ccv2.Changes))
 		} else {
-			fmt.Fprintf(&chgS, "SIMPLE(%s) ", raftpb.ConfChangesToString(ccv2.Changes))
+			w.Printf("SIMPLE(%s) ", confChangesToRedactableString(ccv2.Changes))
 		}
 	}
 	if len(added) > 0 {
-		fmt.Fprintf(&chgS, "%s%s", ADD_REPLICA, added)
+		w.Printf("%s%s", ADD_REPLICA, added)
 	}
 	if len(removed) > 0 {
 		if len(added) > 0 {
-			chgS.WriteString(", ")
+			w.SafeString(", ")
 		}
-		fmt.Fprintf(&chgS, "%s%s", REMOVE_REPLICA, removed)
+		w.Printf("%s%s", REMOVE_REPLICA, removed)
 	}
-	fmt.Fprintf(&chgS, ": after=%s next=%d", afterReplicas, nextReplicaID)
-	return chgS.String()
+	w.Printf(": after=%s next=%d", afterReplicas, nextReplicaID)
+}
+
+// confChangesToRedactableString produces a safe representation for
+// the configuration changes.
+func confChangesToRedactableString(ccs []raftpb.ConfChangeSingle) redact.RedactableString {
+	return redact.Sprintfn(func(w redact.SafePrinter) {
+		for i, cc := range ccs {
+			if i > 0 {
+				w.SafeRune(' ')
+			}
+			switch cc.Type {
+			case raftpb.ConfChangeAddNode:
+				w.SafeRune('v')
+			case raftpb.ConfChangeAddLearnerNode:
+				w.SafeRune('l')
+			case raftpb.ConfChangeRemoveNode:
+				w.SafeRune('r')
+			case raftpb.ConfChangeUpdateNode:
+				w.SafeRune('u')
+			default:
+				w.SafeString("unknown")
+			}
+			w.Print(cc.NodeID)
+		}
+	})
 }
 
 func (crt ChangeReplicasTrigger) legacy() (ReplicaDescriptor, bool) {
@@ -1685,6 +1737,9 @@ func (s LeaseSequence) String() string {
 var _ fmt.Stringer = &Lease{}
 
 func (l Lease) String() string {
+	if l.Empty() {
+		return "<empty>"
+	}
 	var proposedSuffix string
 	if l.ProposedTS != nil {
 		proposedSuffix = fmt.Sprintf(" pro=%s", l.ProposedTS)
@@ -1695,15 +1750,9 @@ func (l Lease) String() string {
 	return fmt.Sprintf("repl=%s seq=%s start=%s epo=%d%s", l.Replica, l.Sequence, l.Start, l.Epoch, proposedSuffix)
 }
 
-// BootstrapLease returns the lease to persist for the range of a freshly bootstrapped store. The
-// returned lease is morally "empty" but has a few fields set to non-nil zero values because some
-// used to be non-nullable and we now fuzz their nullability in tests. As a consequence, it's better
-// to always use zero fields here so that the initial stats are constant.
-func BootstrapLease() Lease {
-	return Lease{
-		Expiration:            &hlc.Timestamp{},
-		DeprecatedStartStasis: &hlc.Timestamp{},
-	}
+// Empty returns true for the Lease zero-value.
+func (l *Lease) Empty() bool {
+	return *l == (Lease{})
 }
 
 // OwnedBy returns whether the given store is the lease owner.
@@ -2246,4 +2295,11 @@ func init() {
 	// Inject the format dependency into the enginepb package.
 	enginepb.FormatBytesAsKey = func(k []byte) string { return Key(k).String() }
 	enginepb.FormatBytesAsValue = func(v []byte) string { return Value{RawBytes: v}.PrettyPrint() }
+}
+
+// SafeValue implements the redact.SafeValue interface.
+func (ReplicaChangeType) SafeValue() {}
+
+func (ri RangeInfo) String() string {
+	return fmt.Sprintf("desc: %s lease: %s", ri.Desc, ri.Lease)
 }

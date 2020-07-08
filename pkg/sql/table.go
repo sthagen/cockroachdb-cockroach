@@ -12,7 +12,6 @@ package sql
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -81,24 +80,12 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 		}
 	}
 	var job *jobs.Job
-	// Iterate through the queued jobs to find an existing schema change job for
-	// this table, if it exists.
-	// TODO (lucy): Looking up each job to determine this is not ideal. Maybe
-	// we need some additional state in extraTxnState to help with lookups.
-	for _, jobID := range *p.extendedEvalCtx.Jobs {
-		var err error
-		j, err := p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.txn)
-		if err != nil {
-			return err
-		}
-		schemaDetails, ok := j.Details().(jobspb.SchemaChangeDetails)
-		if !ok {
-			continue
-		}
-		if schemaDetails.TableID == tableDesc.ID {
-			job = j
-			break
-		}
+	if cachedJob, ok := p.extendedEvalCtx.SchemaChangeJobCache[tableDesc.ID]; ok {
+		job = cachedJob
+	}
+
+	if p.extendedEvalCtx.ExecCfg.TestingKnobs.RunAfterSCJobsCacheLookup != nil {
+		p.extendedEvalCtx.ExecCfg.TestingKnobs.RunAfterSCJobsCacheLookup(job)
 	}
 
 	var spanList []jobspb.ResumeSpanList
@@ -133,6 +120,7 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 		if err != nil {
 			return err
 		}
+		p.extendedEvalCtx.SchemaChangeJobCache[tableDesc.ID] = newJob
 		// Only add a MutationJob if there's an associated mutation.
 		// TODO (lucy): get rid of this when we get rid of MutationJobs.
 		if mutationID != sqlbase.InvalidMutationID {
@@ -209,7 +197,8 @@ func (p *planner) writeSchemaChange(
 	}
 	if tableDesc.Dropped() {
 		// We don't allow schema changes on a dropped table.
-		return fmt.Errorf("table %q is being dropped", tableDesc.Name)
+		return errors.Errorf("no schema changes allowed on table %q as it is being dropped",
+			tableDesc.Name)
 	}
 	if err := p.createOrUpdateSchemaChangeJob(ctx, tableDesc, jobDesc, mutationID); err != nil {
 		return err
@@ -225,7 +214,8 @@ func (p *planner) writeSchemaChangeToBatch(
 	}
 	if tableDesc.Dropped() {
 		// We don't allow schema changes on a dropped table.
-		return fmt.Errorf("table %q is being dropped", tableDesc.Name)
+		return errors.Errorf("no schema changes allowed on table %q as it is being dropped",
+			tableDesc.Name)
 	}
 	return p.writeTableDescToBatch(ctx, tableDesc, b)
 }
@@ -266,9 +256,7 @@ func (p *planner) writeTableDescToBatch(
 		}
 	} else {
 		// Only increment the table descriptor version once in this transaction.
-		if err := tableDesc.MaybeIncrementVersion(ctx, p.txn, p.execCfg.Settings); err != nil {
-			return err
-		}
+		tableDesc.MaybeIncrementVersion()
 	}
 
 	if err := tableDesc.ValidateTable(); err != nil {
@@ -286,6 +274,6 @@ func (p *planner) writeTableDescToBatch(
 		b,
 		p.ExecCfg().Codec,
 		tableDesc.GetID(),
-		tableDesc.TableDesc(),
+		tableDesc,
 	)
 }

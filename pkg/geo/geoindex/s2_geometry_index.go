@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geomfn"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
 	"github.com/cockroachdb/errors"
 	"github.com/golang/geo/r3"
@@ -26,6 +27,7 @@ import (
 type s2GeometryIndex struct {
 	rc                     *s2.RegionCoverer
 	minX, maxX, minY, maxY float64
+	deltaX, deltaY         float64
 }
 
 var _ GeometryIndex = (*s2GeometryIndex)(nil)
@@ -35,6 +37,10 @@ var _ GeometryIndex = (*s2GeometryIndex)(nil)
 // config to correctly process deletions. Reads must use the same config since
 // the bounds affect when a read needs to look at the exceedsBoundsCellID.
 func NewS2GeometryIndex(cfg S2GeometryConfig) GeometryIndex {
+	// We adjust the clipping bounds to be smaller by this fraction, since using
+	// the endpoints of face 0 in S2 causes coverings to spill out of that face.
+	const boundsDelta = 0.01
+
 	// TODO(sumeer): Sanity check cfg.
 	return &s2GeometryIndex{
 		rc: &s2.RegionCoverer{
@@ -43,10 +49,12 @@ func NewS2GeometryIndex(cfg S2GeometryConfig) GeometryIndex {
 			LevelMod: int(cfg.S2Config.LevelMod),
 			MaxCells: int(cfg.S2Config.MaxCells),
 		},
-		minX: cfg.MinX,
-		maxX: cfg.MaxX,
-		minY: cfg.MinY,
-		maxY: cfg.MaxY,
+		minX:   cfg.MinX,
+		maxX:   cfg.MaxX,
+		minY:   cfg.MinY,
+		maxY:   cfg.MaxY,
+		deltaX: boundsDelta * (cfg.MaxX - cfg.MinX),
+		deltaY: boundsDelta * (cfg.MaxY - cfg.MinY),
 	}
 }
 
@@ -83,7 +91,7 @@ func (s *s2GeometryIndex) InvertedIndexKeys(c context.Context, g *geo.Geometry) 
 	}
 	var keys []Key
 	if gt != nil {
-		r := s.s2RegionsFromPlanarGeom(gt)
+		r := s.s2RegionsFromPlanarGeomT(gt)
 		keys = invertedIndexKeys(c, s.rc, r)
 	}
 	if clipped {
@@ -107,7 +115,7 @@ func (s *s2GeometryIndex) CoveredBy(c context.Context, g *geo.Geometry) (RPKeyEx
 	}
 	var expr RPKeyExpr
 	if gt != nil {
-		r := s.s2RegionsFromPlanarGeom(gt)
+		r := s.s2RegionsFromPlanarGeomT(gt)
 		expr = coveredBy(c, s.rc, r)
 	}
 	if clipped {
@@ -130,7 +138,7 @@ func (s *s2GeometryIndex) Intersects(c context.Context, g *geo.Geometry) (UnionK
 	}
 	var spans UnionKeySpans
 	if gt != nil {
-		r := s.s2RegionsFromPlanarGeom(gt)
+		r := s.s2RegionsFromPlanarGeomT(gt)
 		spans = intersects(c, s.rc, r)
 	}
 	if clipped {
@@ -138,6 +146,28 @@ func (s *s2GeometryIndex) Intersects(c context.Context, g *geo.Geometry) (UnionK
 		spans = append(spans, KeySpan{Start: Key(exceedsBoundsCellID), End: Key(exceedsBoundsCellID)})
 	}
 	return spans, nil
+}
+
+func (s *s2GeometryIndex) DWithin(
+	c context.Context, g *geo.Geometry, distance float64,
+) (UnionKeySpans, error) {
+	// TODO(sumeer): are the default params the correct thing to use here?
+	g, err := geomfn.Buffer(g, geomfn.MakeDefaultBufferParams(), distance)
+	if err != nil {
+		return nil, err
+	}
+	return s.Intersects(c, g)
+}
+
+func (s *s2GeometryIndex) DFullyWithin(
+	c context.Context, g *geo.Geometry, distance float64,
+) (UnionKeySpans, error) {
+	// TODO(sumeer): are the default params the correct thing to use here?
+	g, err := geomfn.Buffer(g, geomfn.MakeDefaultBufferParams(), distance)
+	if err != nil {
+		return nil, err
+	}
+	return s.Covers(c, g)
 }
 
 // Converts to geom.T and clips to the rectangle bounds of the index.
@@ -150,13 +180,13 @@ func (s *s2GeometryIndex) convertToGeomTAndTryClip(g *geo.Geometry) (geom.T, boo
 	if s.geomExceedsBounds(gt) {
 		clipped = true
 		clippedEWKB, err :=
-			geos.ClipEWKBByRect(g.EWKB(), s.minX, s.minY, s.maxX, s.maxY)
+			geos.ClipEWKBByRect(g.EWKB(), s.minX+s.deltaX, s.minY+s.deltaY, s.maxX-s.deltaX, s.maxY-s.deltaY)
 		if err != nil {
 			return nil, false, err
 		}
 		gt = nil
 		if clippedEWKB != nil {
-			g, err = geo.ParseGeometryFromEWKBRaw(clippedEWKB)
+			g, err = geo.ParseGeometryFromEWKBUnsafe(clippedEWKB)
 			if err != nil {
 				return nil, false, err
 			}
@@ -175,10 +205,10 @@ func (s *s2GeometryIndex) convertToGeomTAndTryClip(g *geo.Geometry) (geom.T, boo
 // Returns true if the point represented by (x, y) exceeds the rectangle
 // bounds of the index.
 func (s *s2GeometryIndex) xyExceedsBounds(x float64, y float64) bool {
-	if x < s.minX || x > s.maxX {
+	if x < (s.minX+s.deltaX) || x > (s.maxX-s.deltaX) {
 		return true
 	}
-	if y < s.minY || y > s.maxY {
+	if y < (s.minY+s.deltaY) || y > (s.maxY-s.deltaY) {
 		return true
 	}
 	return false
@@ -260,10 +290,10 @@ func (s *s2GeometryIndex) planarPointToS2Point(x float64, y float64) s2.Point {
 	return face0UVToXYZPoint(u, v)
 }
 
-// TODO(sumeer): this is similar to s2RegionsFromGeom() but needs to do
+// TODO(sumeer): this is similar to s2RegionsFromGeomT() but needs to do
 // a different point conversion. If these functions do not diverge further,
 // and turn out not to be performance critical, merge the two implementations.
-func (s *s2GeometryIndex) s2RegionsFromPlanarGeom(geomRepr geom.T) []s2.Region {
+func (s *s2GeometryIndex) s2RegionsFromPlanarGeomT(geomRepr geom.T) []s2.Region {
 	var regions []s2.Region
 	switch repr := geomRepr.(type) {
 	case *geom.Point:
@@ -280,15 +310,16 @@ func (s *s2GeometryIndex) s2RegionsFromPlanarGeom(geomRepr geom.T) []s2.Region {
 		regions = []s2.Region{&pl}
 	case *geom.Polygon:
 		loops := make([]*s2.Loop, repr.NumLinearRings())
-		// The first ring is a "shell", which is represented as CCW.
-		// Following rings are "holes", which are CW. For S2, they are CCW and automatically figured out.
+		// The first ring is a "shell". Following rings are "holes".
+		// All loops must be oriented CCW for S2.
 		for ringIdx := 0; ringIdx < repr.NumLinearRings(); ringIdx++ {
 			linearRing := repr.LinearRing(ringIdx)
 			points := make([]s2.Point, linearRing.NumCoords())
+			isCCW := geo.IsLinearRingCCW(linearRing)
 			for pointIdx := 0; pointIdx < linearRing.NumCoords(); pointIdx++ {
 				p := linearRing.Coord(pointIdx)
 				pt := s.planarPointToS2Point(p.X(), p.Y())
-				if ringIdx == 0 {
+				if isCCW {
 					points[pointIdx] = pt
 				} else {
 					points[len(points)-pointIdx-1] = pt
@@ -301,29 +332,29 @@ func (s *s2GeometryIndex) s2RegionsFromPlanarGeom(geomRepr geom.T) []s2.Region {
 		}
 	case *geom.GeometryCollection:
 		for _, geom := range repr.Geoms() {
-			regions = append(regions, s.s2RegionsFromPlanarGeom(geom)...)
+			regions = append(regions, s.s2RegionsFromPlanarGeomT(geom)...)
 		}
 	case *geom.MultiPoint:
 		for i := 0; i < repr.NumPoints(); i++ {
-			regions = append(regions, s.s2RegionsFromPlanarGeom(repr.Point(i))...)
+			regions = append(regions, s.s2RegionsFromPlanarGeomT(repr.Point(i))...)
 		}
 	case *geom.MultiLineString:
 		for i := 0; i < repr.NumLineStrings(); i++ {
-			regions = append(regions, s.s2RegionsFromPlanarGeom(repr.LineString(i))...)
+			regions = append(regions, s.s2RegionsFromPlanarGeomT(repr.LineString(i))...)
 		}
 	case *geom.MultiPolygon:
 		for i := 0; i < repr.NumPolygons(); i++ {
-			regions = append(regions, s.s2RegionsFromPlanarGeom(repr.Polygon(i))...)
+			regions = append(regions, s.s2RegionsFromPlanarGeomT(repr.Polygon(i))...)
 		}
 	}
 	return regions
 }
 
-func (s *s2GeometryIndex) testingInnerCovering(g *geo.Geometry) s2.CellUnion {
+func (s *s2GeometryIndex) TestingInnerCovering(g *geo.Geometry) s2.CellUnion {
 	gt, _, err := s.convertToGeomTAndTryClip(g)
 	if err != nil || gt == nil {
 		return nil
 	}
-	r := s.s2RegionsFromPlanarGeom(gt)
+	r := s.s2RegionsFromPlanarGeomT(gt)
 	return innerCovering(s.rc, r)
 }

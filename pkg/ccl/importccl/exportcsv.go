@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding/csv"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -235,10 +235,10 @@ func (sp *csvWriter) Run(ctx context.Context) {
 				break
 			}
 			if err := writer.Flush(); err != nil {
-				return errors.New(fmt.Sprintf("failed to flush csv writer, error %s", err))
+				return errors.Wrap(err, "failed to flush csv writer")
 			}
 
-			conf, err := cloud.ExternalStorageConfFromURI(sp.spec.Destination)
+			conf, err := cloudimpl.ExternalStorageConfFromURI(sp.spec.Destination, sp.spec.User)
 			if err != nil {
 				return err
 			}
@@ -259,7 +259,7 @@ func (sp *csvWriter) Run(ctx context.Context) {
 			// Close writer to ensure buffer and any compression footer is flushed.
 			err = writer.Close()
 			if err != nil {
-				return errors.New(fmt.Sprintf("failed to close exporting writer, error %s", err))
+				return errors.Wrapf(err, "failed to close exporting writer")
 			}
 
 			size := writer.Len()

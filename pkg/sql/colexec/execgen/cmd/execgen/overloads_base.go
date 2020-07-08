@@ -344,7 +344,7 @@ type twoArgsResolvedOverloadRightWidthInfo struct {
 
 type assignFunc func(op *lastArgWidthOverload, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string) string
 type compareFunc func(targetElem, leftElem, rightElem, leftCol, rightCol string) string
-type castFunc func(to, from string) string
+type castFunc func(to, from, fromCol string) string
 
 // Assign produces a Go source string that assigns the "targetElem" variable to
 // the result of applying the overload to the two inputs, "leftElem" and
@@ -392,9 +392,9 @@ func (o *lastArgWidthOverload) Compare(
 		leftElem, rightElem, targetElem, leftElem, rightElem, targetElem, targetElem)
 }
 
-func (o *lastArgWidthOverload) Cast(to, from string) string {
+func (o *lastArgWidthOverload) Cast(to, from, fromCol string) string {
 	if o.CastFunc != nil {
-		if ret := o.CastFunc(to, from); ret != "" {
+		if ret := o.CastFunc(to, from, fromCol); ret != "" {
 			return ret
 		}
 	}
@@ -412,51 +412,46 @@ func (o *lastArgWidthOverload) UnaryAssign(targetElem, vElem, targetCol, vVec st
 	return fmt.Sprintf("%s = %s(%s)", targetElem, o.overloadBase.OpStr, vElem)
 }
 
-func (b *argWidthOverloadBase) GoTypeSliceName() string {
-	switch b.CanonicalTypeFamily {
+func goTypeSliceName(canonicalTypeFamily types.Family, width int32) string {
+	switch canonicalTypeFamily {
+	case types.BoolFamily:
+		return "coldata.Bools"
 	case types.BytesFamily:
 		return "*coldata.Bytes"
+	case types.DecimalFamily:
+		return "coldata.Decimals"
 	case types.IntFamily:
-		switch b.Width {
+		switch width {
 		case 16:
-			return "[]int16"
+			return "coldata.Int16s"
 		case 32:
-			return "[]int32"
+			return "coldata.Int32s"
 		case 64, anyWidth:
-			return "[]int64"
+			return "coldata.Int64s"
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unexpected int width %d", b.Width))
+			colexecerror.InternalError(fmt.Sprintf("unexpected int width %d", width))
 			// This code is unreachable, but the compiler cannot infer that.
 			return ""
 		}
+	case types.IntervalFamily:
+		return "coldata.Durations"
+	case types.FloatFamily:
+		return "coldata.Float64s"
+	case types.TimestampTZFamily:
+		return "coldata.Times"
 	case typeconv.DatumVecCanonicalTypeFamily:
 		return "coldata.DatumVec"
-	default:
-		return "[]" + toPhysicalRepresentation(b.CanonicalTypeFamily, b.Width)
 	}
+	colexecerror.InternalError(fmt.Sprintf("unsupported canonical type family %s", canonicalTypeFamily))
+	return ""
 }
 
-func get(family types.Family, target, i string) string {
-	switch family {
-	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
-		return fmt.Sprintf("%s.Get(%s)", target, i)
-	}
-	return fmt.Sprintf("%s[%s]", target, i)
+func (b *argWidthOverloadBase) GoTypeSliceName() string {
+	return goTypeSliceName(b.CanonicalTypeFamily, b.Width)
 }
 
-// Get is a function that should only be used in templates.
-func (b *argWidthOverloadBase) Get(target, i string) string {
-	return get(b.CanonicalTypeFamily, target, i)
-}
-
-// ReturnGet is a function that should only be used in templates.
-func (o *lastArgWidthOverload) ReturnGet(target, i string) string {
-	return get(typeconv.TypeFamilyToCanonicalTypeFamily(o.RetType.Family()), target, i)
-}
-
-// CopyVal is a function that should only be used in templates.
-func (b *argWidthOverloadBase) CopyVal(dest, src string) string {
-	switch b.CanonicalTypeFamily {
+func copyVal(canonicalTypeFamily types.Family, dest, src string) string {
+	switch canonicalTypeFamily {
 	case types.BytesFamily:
 		return fmt.Sprintf("%[1]s = append(%[1]s[:0], %[2]s...)", dest, src)
 	case types.DecimalFamily:
@@ -465,8 +460,13 @@ func (b *argWidthOverloadBase) CopyVal(dest, src string) string {
 	return fmt.Sprintf("%s = %s", dest, src)
 }
 
-func set(family types.Family, target, i, new string) string {
-	switch family {
+// CopyVal is a function that should only be used in templates.
+func (b *argWidthOverloadBase) CopyVal(dest, src string) string {
+	return copyVal(b.CanonicalTypeFamily, dest, src)
+}
+
+func set(canonicalTypeFamily types.Family, target, i, new string) string {
+	switch canonicalTypeFamily {
 	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
 		return fmt.Sprintf("%s.Set(%s, %s)", target, i, new)
 	case types.DecimalFamily:
@@ -586,26 +586,6 @@ func (b *argWidthOverloadBase) AppendVal(target, v string) string {
 	return fmt.Sprintf("%[1]s = append(%[1]s, %[2]s)", target, v)
 }
 
-// Len is a function that should only be used in templates.
-// WARNING: combination of Slice and Len might not work correctly for Bytes
-// type.
-func (b *argWidthOverloadBase) Len(target string) string {
-	switch b.CanonicalTypeFamily {
-	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
-		return fmt.Sprintf("%s.Len()", target)
-	}
-	return fmt.Sprintf("len(%s)", target)
-}
-
-// Range is a function that should only be used in templates.
-func (b *argWidthOverloadBase) Range(loopVariableIdent, target, start, end string) string {
-	switch b.CanonicalTypeFamily {
-	case types.BytesFamily, typeconv.DatumVecCanonicalTypeFamily:
-		return fmt.Sprintf("%[1]s := %[2]s; %[1]s < %[3]s; %[1]s++", loopVariableIdent, start, end)
-	}
-	return fmt.Sprintf("%[1]s := range %[2]s", loopVariableIdent, target)
-}
-
 // Window is a function that should only be used in templates.
 func (b *argWidthOverloadBase) Window(target, start, end string) string {
 	switch b.CanonicalTypeFamily {
@@ -622,19 +602,15 @@ var (
 	_    = lawo.Compare
 	_    = lawo.Cast
 	_    = lawo.UnaryAssign
-	_    = lawo.ReturnGet
 
 	awob = &argWidthOverloadBase{}
 	_    = awob.GoTypeSliceName
-	_    = awob.Get
 	_    = awob.CopyVal
 	_    = awob.Set
 	_    = awob.Slice
 	_    = awob.CopySlice
 	_    = awob.AppendSlice
 	_    = awob.AppendVal
-	_    = awob.Len
-	_    = awob.Range
 	_    = awob.Window
 )
 
@@ -924,21 +900,4 @@ func toPhysicalRepresentation(canonicalTypeFamily types.Family, width int32) str
 	}
 	// This code is unreachable, but the compiler cannot infer that.
 	return ""
-}
-
-// getDatumVecVariableName returns the variable name for a datumVec given
-// leftCol and rightCol (either of which could be "_" - meaning there is no
-// vector in scope for the corresponding side).
-// - preferRightSide determines whether we prefer the right side.
-func getDatumVecVariableName(leftCol, rightCol string, preferRightSide bool) string {
-	preferredSide, otherSide := leftCol, rightCol
-	if preferRightSide {
-		preferredSide, otherSide = rightCol, leftCol
-	}
-	switch preferredSide {
-	case "_":
-		return otherSide
-	default:
-		return preferredSide
-	}
 }

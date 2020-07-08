@@ -37,7 +37,7 @@ func (r *Replica) executeReadOnlyBatch(
 	defer r.readOnlyCmdMu.RUnlock()
 
 	// Verify that the batch can be executed.
-	if err := r.checkExecutionCanProceed(ba, g, &st); err != nil {
+	if err := r.checkExecutionCanProceed(ctx, ba, g, &st); err != nil {
 		return nil, g, roachpb.NewError(err)
 	}
 
@@ -137,7 +137,7 @@ func (r *Replica) executeReadOnlyBatchWithServersideRefreshes(
 
 	if pErr != nil {
 		// Failed read-only batches can't have any Result except for what's
-		// whitelisted here.
+		// allowlisted here.
 		res.Local = result.LocalResult{
 			EncounteredIntents: res.Local.DetachEncounteredIntents(),
 			Metrics:            res.Local.Metrics,
@@ -159,6 +159,7 @@ func (r *Replica) handleReadOnlyLocalEvalResult(
 
 	if lResult.AcquiredLocks != nil {
 		// These will all be unreplicated locks.
+		log.Eventf(ctx, "acquiring %d unreplicated locks", len(lResult.AcquiredLocks))
 		for i := range lResult.AcquiredLocks {
 			r.concMgr.OnLockAcquired(ctx, &lResult.AcquiredLocks[i])
 		}

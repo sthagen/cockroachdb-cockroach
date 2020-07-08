@@ -21,7 +21,7 @@ import (
 	"testing"
 	"testing/quick"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -602,20 +603,25 @@ func setColVal(vec coldata.Vec, idx int, val interface{}) {
 			vec.Decimal()[idx].Set(decimalVal)
 		}
 	} else if canonicalTypeFamily == typeconv.DatumVecCanonicalTypeFamily {
-		switch vec.Type().Family() {
-		case types.JsonFamily:
-			if jsonStr, ok := val.(string); ok {
-				jobj, err := json.ParseJSON(jsonStr)
-				if err != nil {
-					colexecerror.InternalError(
-						fmt.Sprintf("unable to parse json object: %v: %v", jobj, err))
-				}
-				vec.Datum().Set(idx, &tree.DJSON{JSON: jobj})
-			} else if jobj, ok := val.(json.JSON); ok {
-				vec.Datum().Set(idx, &tree.DJSON{JSON: jobj})
-			}
+		switch v := val.(type) {
+		case *coldataext.Datum:
+			vec.Datum().Set(idx, v)
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unexpected datum-backed type: %s", vec.Type()))
+			switch vec.Type().Family() {
+			case types.JsonFamily:
+				if jsonStr, ok := val.(string); ok {
+					jobj, err := json.ParseJSON(jsonStr)
+					if err != nil {
+						colexecerror.InternalError(
+							fmt.Sprintf("unable to parse json object: %v: %v", jobj, err))
+					}
+					vec.Datum().Set(idx, &tree.DJSON{JSON: jobj})
+				} else if jobj, ok := val.(json.JSON); ok {
+					vec.Datum().Set(idx, &tree.DJSON{JSON: jobj})
+				}
+			default:
+				colexecerror.InternalError(fmt.Sprintf("unexpected datum-backed type: %s", vec.Type()))
+			}
 		}
 	} else {
 		reflect.ValueOf(vec.Col()).Index(idx).Set(reflect.ValueOf(val).Convert(reflect.TypeOf(vec.Col()).Elem()))
@@ -797,18 +803,21 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 					// exercises other scenarios (like division by zero when the value is
 					// actually NULL).
 					canonicalTypeFamily := vec.CanonicalTypeFamily()
-					if canonicalTypeFamily == types.DecimalFamily {
+					switch canonicalTypeFamily {
+					case types.DecimalFamily:
 						d := apd.Decimal{}
 						_, err := d.SetFloat64(rng.Float64())
 						if err != nil {
 							colexecerror.InternalError(fmt.Sprintf("%v", err))
 						}
 						col.Index(outputIdx).Set(reflect.ValueOf(d))
-					} else if canonicalTypeFamily == types.BytesFamily {
+					case types.BytesFamily:
 						newBytes := make([]byte, rng.Intn(16)+1)
 						rng.Read(newBytes)
 						setColVal(vec, outputIdx, newBytes)
-					} else if canonicalTypeFamily == typeconv.DatumVecCanonicalTypeFamily {
+					case types.IntervalFamily:
+						setColVal(vec, outputIdx, duration.MakeDuration(rng.Int63(), rng.Int63(), rng.Int63()))
+					case typeconv.DatumVecCanonicalTypeFamily:
 						switch vec.Type().Family() {
 						case types.JsonFamily:
 							newBytes := make([]byte, rng.Intn(16)+1)
@@ -818,10 +827,12 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 						default:
 							colexecerror.InternalError(fmt.Sprintf("unexpected datum-backed type: %s", vec.Type()))
 						}
-					} else if val, ok := quick.Value(reflect.TypeOf(vec.Col()).Elem(), rng); ok {
-						setColVal(vec, outputIdx, val.Interface())
-					} else {
-						colexecerror.InternalError(fmt.Sprintf("could not generate a random value of type %s", vec.Type()))
+					default:
+						if val, ok := quick.Value(reflect.TypeOf(vec.Col()).Elem(), rng); ok {
+							setColVal(vec, outputIdx, val.Interface())
+						} else {
+							colexecerror.InternalError(fmt.Sprintf("could not generate a random value of type %s", vec.Type()))
+						}
 					}
 				}
 			} else {
@@ -991,16 +1002,18 @@ func getTupleFromBatch(batch coldata.Batch, tupleIdx int) tuple {
 				newDec.Set(&colDec[tupleIdx])
 				val = reflect.ValueOf(newDec)
 			} else if vec.CanonicalTypeFamily() == typeconv.DatumVecCanonicalTypeFamily {
-				switch vec.Type().Family() {
-				case types.JsonFamily:
-					d := vec.Datum().Get(tupleIdx).(*coldataext.Datum).Datum
-					if d == tree.DNull {
-						val = reflect.ValueOf(tree.DNull)
-					} else {
-						val = reflect.ValueOf(d.(*tree.DJSON).JSON)
+				d := vec.Datum().Get(tupleIdx).(*coldataext.Datum)
+				if d.Datum == tree.DNull {
+					val = reflect.ValueOf(tree.DNull)
+				} else {
+					switch vec.Type().Family() {
+					case types.CollatedStringFamily:
+						val = reflect.ValueOf(d)
+					case types.JsonFamily:
+						val = reflect.ValueOf(d.Datum.(*tree.DJSON).JSON)
+					default:
+						colexecerror.InternalError(fmt.Sprintf("unexpected datum-backed type: %s", vec.Type()))
 					}
-				default:
-					colexecerror.InternalError(fmt.Sprintf("unexpected datum-backed type: %s", vec.Type()))
 				}
 			} else {
 				val = reflect.ValueOf(vec.Col()).Index(tupleIdx)
@@ -1594,30 +1607,16 @@ func createTestProjectingOperator(
 			RenderExprs: renderExprs,
 		},
 	}
-	args := NewColOperatorArgs{
+	args := &NewColOperatorArgs{
 		Spec:                spec,
 		Inputs:              []colexecbase.Operator{input},
 		StreamingMemAccount: testMemAcc,
 	}
 	if canFallbackToRowexec {
 		args.ProcessorConstructor = rowexec.NewProcessor
-	} else {
-		// It is possible that there is a valid projecting operator with the
-		// given input types, but the vectorized engine doesn't support it. In
-		// such case in the production code we fall back to row-by-row engine,
-		// but the caller of this method doesn't want such behavior. In order
-		// to avoid a nil-pointer exception we mock out the processor
-		// constructor.
-		args.ProcessorConstructor = func(
-			context.Context, *execinfra.FlowCtx, int32,
-			*execinfrapb.ProcessorCoreUnion, *execinfrapb.PostProcessSpec,
-			[]execinfra.RowSource, []execinfra.RowReceiver,
-			[]execinfra.LocalProcessor) (execinfra.Processor, error) {
-			return nil, errors.Errorf("fallback to rowexec is disabled")
-		}
 	}
 	args.TestingKnobs.UseStreamingMemAccountForBuffering = true
-	result, err := NewColOperator(ctx, flowCtx, args)
+	result, err := TestNewColOperator(ctx, flowCtx, args)
 	if err != nil {
 		return nil, err
 	}

@@ -17,8 +17,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/sampledataccl"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
@@ -45,7 +47,7 @@ func BenchmarkClusterBackup(b *testing.B) {
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
 
-	_, _, sqlDB, dir, cleanupFn := backupRestoreTestSetup(b, multiNode, 0, initNone)
+	_, _, sqlDB, dir, cleanupFn := backupccl.BackupRestoreTestSetup(b, backupccl.MultiNode, 0, backupccl.InitNone)
 	defer cleanupFn()
 	sqlDB.Exec(b, `DROP TABLE data.bank`)
 
@@ -78,7 +80,7 @@ func BenchmarkClusterRestore(b *testing.B) {
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
 
-	_, _, sqlDB, dir, cleanup := backupRestoreTestSetup(b, multiNode, 0, initNone)
+	_, _, sqlDB, dir, cleanup := backupccl.BackupRestoreTestSetup(b, backupccl.MultiNode, 0, backupccl.InitNone)
 	defer cleanup()
 	sqlDB.Exec(b, `DROP TABLE data.bank`)
 
@@ -102,7 +104,7 @@ func BenchmarkLoadRestore(b *testing.B) {
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
 
-	ctx, _, sqlDB, dir, cleanup := backupRestoreTestSetup(b, multiNode, 0, initNone)
+	ctx, _, sqlDB, dir, cleanup := backupccl.BackupRestoreTestSetup(b, backupccl.MultiNode, 0, backupccl.InitNone)
 	defer cleanup()
 	sqlDB.Exec(b, `DROP TABLE data.bank`)
 
@@ -110,7 +112,8 @@ func BenchmarkLoadRestore(b *testing.B) {
 	b.SetBytes(int64(buf.Len() / b.N))
 	ts := hlc.Timestamp{WallTime: hlc.UnixNano()}
 	b.ResetTimer()
-	if _, err := importccl.Load(ctx, sqlDB.DB.(*gosql.DB), buf, "data", dir, ts, 0, dir, dir); err != nil {
+	if _, err := importccl.Load(ctx, sqlDB.DB.(*gosql.DB), buf, "data", dir, ts,
+		0, dir, dir, security.RootUser); err != nil {
 		b.Fatalf("%+v", err)
 	}
 	sqlDB.Exec(b, fmt.Sprintf(`RESTORE data.* FROM '%s'`, dir))
@@ -121,7 +124,7 @@ func BenchmarkLoadSQL(b *testing.B) {
 	// NB: This benchmark takes liberties in how b.N is used compared to the go
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
-	_, _, sqlDB, _, cleanup := backupRestoreTestSetup(b, multiNode, 0, initNone)
+	_, _, sqlDB, _, cleanup := backupccl.BackupRestoreTestSetup(b, backupccl.MultiNode, 0, backupccl.InitNone)
 	defer cleanup()
 	sqlDB.Exec(b, `DROP TABLE data.bank`)
 
@@ -151,11 +154,11 @@ func BenchmarkClusterEmptyIncrementalBackup(b *testing.B) {
 	}
 	const numStatements = 100000
 
-	_, _, sqlDB, _, cleanupFn := backupRestoreTestSetup(b, multiNode, 0, initNone)
+	_, _, sqlDB, _, cleanupFn := backupccl.BackupRestoreTestSetup(b, backupccl.MultiNode, 0, backupccl.InitNone)
 	defer cleanupFn()
 
-	restoreDir := filepath.Join(localFoo, "restore")
-	fullDir := filepath.Join(localFoo, "full")
+	restoreDir := filepath.Join(backupccl.LocalFoo, "restore")
+	fullDir := filepath.Join(backupccl.LocalFoo, "full")
 
 	bankData := bank.FromRows(numStatements).Tables()[0]
 	_, err := sampledataccl.ToBackup(b, bankData, restoreDir)
@@ -176,7 +179,7 @@ func BenchmarkClusterEmptyIncrementalBackup(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		incrementalDir := filepath.Join(localFoo, fmt.Sprintf("incremental%d", i))
+		incrementalDir := filepath.Join(backupccl.LocalFoo, fmt.Sprintf("incremental%d", i))
 		sqlDB.Exec(b, `BACKUP DATABASE data TO $1 INCREMENTAL FROM $2`, incrementalDir, fullDir)
 	}
 	b.StopTimer()

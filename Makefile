@@ -31,7 +31,7 @@ override xgo := GOFLAGS= $(GO)
 # This needs to be the first rule because we're including build/defs.mk
 # first thing below, and Make needs to know how to build it.
 .SECONDARY: build/defs.mk
-build/defs.mk: Makefile build/defs.mk.sig remove_obsolete_execgen
+build/defs.mk: Makefile build/defs.mk.sig
 ifndef IGNORE_GOVERS
 	@build/go-version-check.sh $(GO) || { echo "Disable this check with IGNORE_GOVERS=1." >&2; exit 1; }
 endif
@@ -166,6 +166,10 @@ INSTALL      := install
 prefix       := /usr/local
 bindir       := $(prefix)/bin
 
+# We always want to build from the vendor directory.
+# Avoid reusing GOFLAGS as that is overwritten by various release processes.
+GOMODVENDORFLAGS := -mod=vendor
+
 ifeq "$(findstring -j,$(shell ps -o args= $$PPID))" ""
 ifdef NCPUS
 MAKEFLAGS += -j$(NCPUS)
@@ -221,6 +225,7 @@ export CFLAGS CXXFLAGS LDFLAGS CGO_CFLAGS CGO_CXXFLAGS CGO_LDFLAGS
 # toolchain.
 override LINKFLAGS = -X github.com/cockroachdb/cockroach/pkg/build.typ=$(BUILDTYPE) -extldflags "$(LDFLAGS)"
 
+GOMODVENDORFLAGS ?= -mod=vendor
 GOFLAGS ?=
 TAR     ?= tar
 
@@ -306,6 +311,14 @@ $(call make-lazy,yellow)
 $(call make-lazy,cyan)
 $(call make-lazy,term-reset)
 
+# Force vendor directory to rebuild.
+.PHONY: vendor_rebuild
+vendor_rebuild: bin/.submodules-initialized
+	# Use -mod=mod, as -mod=vendor will try install from the vendor directory
+	# which may be mismatching upon rebuild.
+	$(GO_INSTALL) -v -mod=mod github.com/goware/modvendor
+	./build/vendor_rebuild.sh
+
 # Tell Make to delete the target if its recipe fails. Otherwise, if a recipe
 # modifies its target before failing, the target's timestamp will make it appear
 # up-to-date on the next invocation of Make, even though it is likely corrupt.
@@ -350,27 +363,28 @@ pkg/ui/yarn.installed: pkg/ui/package.json pkg/ui/yarn.lock pkg/ui/yarn.protobuf
 
 # Update the git hooks and install commands from dependencies whenever they
 # change.
-bin/.bootstrap: $(GITHOOKS) Gopkg.lock | bin/.submodules-initialized
+# These should be synced with `./pkg/cmd/import-tools/main.go`.
+bin/.bootstrap: $(GITHOOKS) | bin/.submodules-initialized
 	@$(GO_INSTALL) -v \
-		./vendor/github.com/client9/misspell/cmd/misspell \
-		./vendor/github.com/cockroachdb/crlfmt \
-		./vendor/github.com/cockroachdb/gostdlib/cmd/gofmt \
-		./vendor/github.com/cockroachdb/gostdlib/x/tools/cmd/goimports \
-		./vendor/github.com/cockroachdb/stress \
-		./vendor/github.com/golang/dep/cmd/dep \
-		./vendor/github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway \
-		./vendor/github.com/kevinburke/go-bindata/go-bindata \
-		./vendor/github.com/kisielk/errcheck \
-		./vendor/github.com/mattn/goveralls \
-		./vendor/github.com/mibk/dupl \
-		./vendor/github.com/mmatczuk/go_generics/cmd/go_generics \
-		./vendor/github.com/wadey/gocovmerge \
-		./vendor/golang.org/x/lint/golint \
-		./vendor/golang.org/x/perf/cmd/benchstat \
-		./vendor/golang.org/x/tools/cmd/goyacc \
-		./vendor/golang.org/x/tools/cmd/stringer \
-		./vendor/golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow \
-		./vendor/honnef.co/go/tools/cmd/staticcheck
+		github.com/client9/misspell/cmd/misspell \
+		github.com/cockroachdb/crlfmt \
+		github.com/cockroachdb/gostdlib/cmd/gofmt \
+		github.com/cockroachdb/gostdlib/x/tools/cmd/goimports \
+		github.com/cockroachdb/stress \
+		github.com/goware/modvendor \
+		github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway \
+		github.com/kevinburke/go-bindata/go-bindata \
+		github.com/kisielk/errcheck \
+		github.com/mattn/goveralls \
+		github.com/mibk/dupl \
+		github.com/mmatczuk/go_generics/cmd/go_generics \
+		github.com/wadey/gocovmerge \
+		golang.org/x/lint/golint \
+		golang.org/x/perf/cmd/benchstat \
+		golang.org/x/tools/cmd/goyacc \
+		golang.org/x/tools/cmd/stringer \
+		golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow \
+		honnef.co/go/tools/cmd/staticcheck
 	touch $@
 
 IGNORE_GOVERS :=
@@ -408,6 +422,7 @@ is-cross-compile := 1
 endif
 
 target-is-windows := $(findstring w64,$(TARGET_TRIPLE))
+target-is-macos := $(findstring darwin,$(TARGET_TRIPLE))
 
 # CMAKE_TARGET_MESSAGES=OFF prevents CMake from printing progress messages
 # whenever a target is fully built to prevent spammy output from make when
@@ -482,22 +497,25 @@ LIBSNAPPY   := $(SNAPPY_DIR)/libsnappy.a
 LIBEDIT     := $(LIBEDIT_DIR)/src/.libs/libedit.a
 LIBROACH    := $(LIBROACH_DIR)/libroach.a
 LIBROACHCCL := $(LIBROACH_DIR)/libroachccl.a
-LIBPROJ     := $(PROJ_DIR)/lib/libproj.a
+LIBPROJ     := $(PROJ_DIR)/lib/libproj$(if $(target-is-windows),_4_9).a
 LIBKRB5     := $(KRB5_DIR)/lib/libgssapi_krb5.a
 PROTOC      := $(PROTOC_DIR)/protoc
 
 DYN_LIB_DIR := lib
 DYN_EXT     := so
-ifdef host-is-macos
+ifdef target-is-macos
 DYN_EXT     := dylib
+endif
+ifdef target-is-windows
+DYN_EXT     := dll
 endif
 
 LIBGEOS     := $(DYN_LIB_DIR)/libgeos.$(DYN_EXT)
 
 C_LIBS_COMMON = \
 	$(if $(use-stdmalloc),,$(LIBJEMALLOC)) \
-	$(if $(target-is-windows),,$(LIBEDIT) $(LIBGEOS)) \
-	$(LIBPROTOBUF) $(LIBSNAPPY) $(LIBROCKSDB) $(LIBPROJ)
+	$(if $(target-is-windows),,$(LIBEDIT)) \
+	$(LIBPROTOBUF) $(LIBSNAPPY) $(LIBROCKSDB) $(LIBPROJ) $(LIBGEOS)
 C_LIBS_OSS = $(C_LIBS_COMMON) $(LIBROACH)
 C_LIBS_CCL = $(C_LIBS_COMMON) $(LIBCRYPTOPP) $(LIBROACHCCL)
 
@@ -553,7 +571,7 @@ $(BASE_CGO_FLAGS_FILES): Makefile build/defs.mk.sig | bin/.submodules-initialize
 	@echo >> $@
 	@echo 'package $(if $($(@D)-package),$($(@D)-package),$(notdir $(@D)))' >> $@
 	@echo >> $@
-	@echo '// #cgo CPPFLAGS: $(addprefix -I,$(JEMALLOC_DIR)/include $(KRB_CPPFLAGS) $(GEOS_DIR)/capi $(PROJ_DIR)/lib)' >> $@
+	@echo '// #cgo CPPFLAGS: $(addprefix -I,$(JEMALLOC_DIR)/include $(KRB_CPPFLAGS))' >> $@
 	@echo '// #cgo LDFLAGS: $(addprefix -L,$(CRYPTOPP_DIR) $(PROTOBUF_DIR) $(JEMALLOC_DIR)/lib $(SNAPPY_DIR) $(LIBEDIT_DIR)/src/.libs $(ROCKSDB_DIR) $(LIBROACH_DIR) $(KRB_DIR) $(PROJ_DIR)/lib)' >> $@
 	@echo 'import "C"' >> $@
 
@@ -750,10 +768,12 @@ $(LIBPROTOBUF): $(PROTOBUF_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 $(LIBSNAPPY): $(SNAPPY_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 	@uptodate $@ $(SNAPPY_SRC_DIR) || $(MAKE) --no-print-directory -C $(SNAPPY_DIR) snappy
 
+GEOS_NATIVE_LIB_DIR = $(GEOS_DIR)/$(if $(target-is-windows),bin,lib)
 $(LIBGEOS): $(GEOS_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
-	@uptodate $@ $(GEOS_SRC_DIR) || $(MAKE) --no-print-directory -C $(GEOS_DIR) geos_c
+	@uptodate $(GEOS_NATIVE_LIB_DIR)/libgeos.$(DYN_EXT) $(GEOS_SRC_DIR) || $(MAKE) --no-print-directory -C $(GEOS_DIR) geos_c
 	mkdir -p $(DYN_LIB_DIR)
-	ln -sf $(GEOS_DIR)/lib/lib{geos,geos_c}.$(DYN_EXT) $(DYN_LIB_DIR)
+	rm -f $(DYN_LIB_DIR)/lib{geos,geos_c}.$(DYN_EXT)
+	cp -L $(GEOS_NATIVE_LIB_DIR)/lib{geos,geos_c}.$(DYN_EXT) $(DYN_LIB_DIR)
 
 $(LIBPROJ): $(PROJ_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 	@uptodate $@ $(PROJ_SRC_DIR) || $(MAKE) --no-print-directory -C $(PROJ_DIR) proj
@@ -825,23 +845,26 @@ SQLPARSER_TARGETS = \
 
 PROTOBUF_TARGETS := bin/.go_protobuf_sources bin/.gw_protobuf_sources bin/.cpp_protobuf_sources bin/.cpp_ccl_protobuf_sources
 
-DOCGEN_TARGETS := bin/.docgen_bnfs bin/.docgen_functions
+DOCGEN_TARGETS := bin/.docgen_bnfs bin/.docgen_functions docs/generated/redact_safe.md
 
 EXECGEN_TARGETS = \
   pkg/col/coldata/vec.eg.go \
   pkg/sql/colexec/and_or_projection.eg.go \
-  pkg/sql/colexec/any_not_null_agg.eg.go \
-  pkg/sql/colexec/avg_agg.eg.go \
-  pkg/sql/colexec/bool_and_or_agg.eg.go \
   pkg/sql/colexec/cast.eg.go \
   pkg/sql/colexec/const.eg.go \
-  pkg/sql/colexec/count_agg.eg.go \
   pkg/sql/colexec/distinct.eg.go \
   pkg/sql/colexec/hashjoiner.eg.go \
   pkg/sql/colexec/hashtable_distinct.eg.go \
   pkg/sql/colexec/hashtable_full_default.eg.go \
   pkg/sql/colexec/hashtable_full_deleting.eg.go \
   pkg/sql/colexec/hash_aggregator.eg.go \
+  pkg/sql/colexec/hash_any_not_null_agg.eg.go \
+  pkg/sql/colexec/hash_avg_agg.eg.go \
+  pkg/sql/colexec/hash_bool_and_or_agg.eg.go \
+  pkg/sql/colexec/hash_count_agg.eg.go \
+  pkg/sql/colexec/hash_min_max_agg.eg.go \
+  pkg/sql/colexec/hash_sum_agg.eg.go \
+  pkg/sql/colexec/hash_sum_int_agg.eg.go \
   pkg/sql/colexec/hash_utils.eg.go \
   pkg/sql/colexec/like_ops.eg.go \
   pkg/sql/colexec/mergejoinbase.eg.go \
@@ -853,7 +876,13 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/mergejoiner_leftouter.eg.go \
   pkg/sql/colexec/mergejoiner_leftsemi.eg.go \
   pkg/sql/colexec/mergejoiner_rightouter.eg.go \
-  pkg/sql/colexec/min_max_agg.eg.go \
+  pkg/sql/colexec/ordered_any_not_null_agg.eg.go \
+  pkg/sql/colexec/ordered_avg_agg.eg.go \
+  pkg/sql/colexec/ordered_bool_and_or_agg.eg.go \
+  pkg/sql/colexec/ordered_count_agg.eg.go \
+  pkg/sql/colexec/ordered_min_max_agg.eg.go \
+  pkg/sql/colexec/ordered_sum_agg.eg.go \
+  pkg/sql/colexec/ordered_sum_int_agg.eg.go \
   pkg/sql/colexec/ordered_synchronizer.eg.go \
   pkg/sql/colexec/overloads_test_utils.eg.go \
   pkg/sql/colexec/proj_const_left_ops.eg.go \
@@ -868,18 +897,11 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/select_in.eg.go \
   pkg/sql/colexec/sort.eg.go \
   pkg/sql/colexec/substring.eg.go \
-  pkg/sql/colexec/sum_agg.eg.go \
+  pkg/sql/colexec/utils.eg.go \
   pkg/sql/colexec/values_differ.eg.go \
   pkg/sql/colexec/vec_comparators.eg.go \
+  pkg/sql/colexec/vec_to_datum.eg.go \
   pkg/sql/colexec/window_peer_grouper.eg.go
-
-.PHONY: remove_obsolete_execgen
-remove_obsolete_execgen:
-	@obsolete="$(filter-out $(EXECGEN_TARGETS), $(shell find pkg/col/coldata pkg/sql/colexec pkg/sql/exec -name '*.eg.go' 2>/dev/null))"; \
-	for file in $${obsolete}; do \
-	  echo "Removing obsolete file $${file}..."; \
-	  rm -f $${file}; \
-	done
 
 OPTGEN_TARGETS = \
 	pkg/sql/opt/memo/expr.og.go \
@@ -927,8 +949,8 @@ BUILD_TAGGED_RELEASE =
 ## Override for .buildinfo/tag
 BUILDINFO_TAG :=
 
-$(go-targets): bin/.bootstrap $(BUILDINFO) $(CGO_FLAGS_FILES) $(PROTOBUF_TARGETS)
-$(go-targets): $(SQLPARSER_TARGETS) $(EXECGEN_TARGETS) $(OPTGEN_TARGETS)
+$(go-targets): bin/.bootstrap $(BUILDINFO) $(CGO_FLAGS_FILES) $(PROTOBUF_TARGETS) $(LIBPROJ)
+$(go-targets): $(SQLPARSER_TARGETS) $(OPTGEN_TARGETS)
 $(go-targets): override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.tag=$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))" \
 	-X "github.com/cockroachdb/cockroach/pkg/build.rev=$(shell cat .buildinfo/rev)" \
@@ -950,7 +972,7 @@ SETTINGS_DOC_PAGE := docs/generated/settings/settings.html
 # normal and race test builds.
 .PHONY: go-install
 $(COCKROACH) $(COCKROACHOSS) $(COCKROACHSHORT) go-install:
-	 $(xgo) $(build-mode) -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(BUILDTARGET)
+	 $(xgo) $(build-mode) -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(BUILDTARGET)
 
 # The build targets, in addition to producing a Cockroach binary, silently
 # regenerate SQL diagram BNFs and some other doc pages. Generating these docs
@@ -972,7 +994,7 @@ buildshort: ## Build the CockroachDB binary without the admin UI.
 build: $(COCKROACH)
 buildoss: $(COCKROACHOSS)
 buildshort: $(COCKROACHSHORT)
-build buildoss buildshort: $(DOCGEN_TARGETS)
+build buildoss buildshort: $(if $(is-cross-compile),,$(DOCGEN_TARGETS))
 build buildshort: $(if $(is-cross-compile),,$(SETTINGS_DOC_PAGE))
 
 # For historical reasons, symlink cockroach to cockroachshort.
@@ -996,7 +1018,7 @@ start:
 .PHONY: testbuild
 testbuild:
 	$(xgo) list -tags '$(TAGS)' -f \
-	'$(xgo) test -v $(GOFLAGS) -tags '\''$(TAGS)'\'' -ldflags '\''$(LINKFLAGS)'\'' -c {{.ImportPath}} -o {{.Dir}}/{{.Name}}.test' $(PKG) | \
+	'$(xgo) test -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '\''$(TAGS)'\'' -ldflags '\''$(LINKFLAGS)'\'' -c {{.ImportPath}} -o {{.Dir}}/{{.Name}}.test' $(PKG) | \
 	$(SHELL)
 
 testshort: override TESTFLAGS += -short
@@ -1023,13 +1045,13 @@ benchshort: override TESTFLAGS += -benchtime=1ns -short
 .PHONY: check test testshort testrace testlogic testbaselogic testccllogic testoptlogic bench benchshort
 test: ## Run tests.
 check test testshort testrace bench benchshort:
-	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
 
 .PHONY: stress stressrace
 stress: ## Run tests under stress.
 stressrace: ## Run tests under stress with the race detector enabled.
 stress stressrace:
-	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -exec 'stress $(STRESSFLAGS)' -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" -timeout 0 $(PKG) $(filter-out -v,$(TESTFLAGS)) -v -args -test.timeout $(TESTTIMEOUT)
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) $(GOMODVENDORFLAGS) -exec 'stress $(STRESSFLAGS)' -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" -timeout 0 $(PKG) $(filter-out -v,$(TESTFLAGS)) -v -args -test.timeout $(TESTTIMEOUT)
 
 .PHONY: roachprod-stress roachprod-stressrace
 roachprod-stress roachprod-stressrace: bin/roachprod-stress
@@ -1076,12 +1098,12 @@ testraceslow: TESTTIMEOUT := $(RACETIMEOUT)
 .PHONY: testslow testraceslow
 testslow testraceslow: override TESTFLAGS += -v
 testslow testraceslow:
-	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS) | grep -F ': Test' | sed -E 's/(--- PASS: |\(|\))//g' | awk '{ print $$2, $$1 }' | sort -rn | head -n 10
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS) | grep -F ': Test' | sed -E 's/(--- PASS: |\(|\))//g' | awk '{ print $$2, $$1 }' | sort -rn | head -n 10
 
 .PHONY: upload-coverage
 upload-coverage: bin/.bootstrap
-	$(GO) install ./vendor/github.com/wadey/gocovmerge
-	$(GO) install ./vendor/github.com/mattn/goveralls
+	$(GO) install github.com/wadey/gocovmerge
+	$(GO) install github.com/mattn/goveralls
 	@build/upload-coverage.sh
 
 .PHONY: acceptance
@@ -1110,8 +1132,9 @@ dupl: bin/.bootstrap
 
 .PHONY: generate
 generate: ## Regenerate generated code.
-generate: protobuf $(DOCGEN_TARGETS) $(EXECGEN_TARGETS) $(OPTGEN_TARGETS) $(SQLPARSER_TARGETS) $(SETTINGS_DOC_PAGE) bin/langgen bin/terraformgen
-	$(GO) generate $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
+generate: protobuf $(DOCGEN_TARGETS) $(OPTGEN_TARGETS) $(SQLPARSER_TARGETS) $(SETTINGS_DOC_PAGE) bin/langgen bin/terraformgen
+	$(GO) generate $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
+	$(MAKE) execgen
 
 lint lintshort: TESTTIMEOUT := $(LINTTIMEOUT)
 
@@ -1123,14 +1146,14 @@ lint: bin/returncheck bin/roachvet bin/optfmt
 	@# Run 'go build -i' to ensure we have compiled object files available for all
 	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
 	@# https://groups.google.com/forum/#!msg/golang-dev/qfa3mHN4ZPA/X2UzjNV1BAAJ.
-	$(xgo) build -i -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
-	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -timeout $(TESTTIMEOUT) -run 'Lint/$(TESTS)'
+	$(xgo) build -i -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
+	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -timeout $(TESTTIMEOUT) -run 'Lint/$(TESTS)'
 
 .PHONY: lintshort
 lintshort: override TAGS += lint
 lintshort: ## Run a fast subset of the style checkers and linters.
 lintshort: bin/roachvet bin/optfmt
-	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
+	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
 protobuf: $(PROTOBUF_TARGETS)
@@ -1161,7 +1184,6 @@ $(ARCHIVE): $(ARCHIVE).tmp
 ARCHIVE_EXTRAS = \
 	$(BUILDINFO) \
 	$(SQLPARSER_TARGETS) \
-	$(EXECGEN_TARGETS) \
 	$(OPTGEN_TARGETS) \
 	pkg/ui/distccl/bindata.go pkg/ui/distoss/bindata.go
 
@@ -1528,59 +1550,28 @@ bin/.docgen_functions: bin/docgen
 	docgen functions docs/generated/sql --quiet
 	touch $@
 
+.PHONY: docs/generated/redact_safe.md
+
+docs/generated/redact_safe.md:
+	@(echo "The following types are considered always safe for reporting:"; echo; \
+	  echo "File | Type"; echo "--|--") >$@.tmp || { rm -f $@.tmp; exit 1; }
+	@git grep -n '^func \(.*\) SafeValue\(\)' | \
+	  grep -v '^pkg/util/redact' | \
+	  sed -E -e 's/^([^:]*):[0-9]+:func \(([^ ]* )?(.*)\) SafeValue.*$$/\1 | \`\3\`/g' >>$@.tmp || { rm -f $@.tmp; exit 1; }
+	@git grep -n 'redact\.RegisterSafeType' | \
+	  grep -v '^pkg/util/redact' | \
+	  sed -E -e 's/^([^:]*):[0-9]+:.*redact\.RegisterSafeType\((.*)\).*/\1 | \`\2\`/g' >>$@.tmp || { rm -f $@.tmp; exit 1; }
+	@mv -f $@.tmp $@
+
 settings-doc-gen := $(if $(filter buildshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),$(COCKROACH))
 
 $(SETTINGS_DOC_PAGE): $(settings-doc-gen)
 	@$(settings-doc-gen) gen settings-list --format=html > $@
 
-# Produce the dependency list for all the .eg.go files, to make them
-# depend on the right template. We use the -M flag to execgen which
-# produces the dependencies, then include them below.
-.SECONDARY: bin/execgen_out.d
-bin/execgen_out.d: bin/execgen
-	@echo EXECGEN $@; execgen -M $(EXECGEN_TARGETS) >$@.tmp || { rm -f $@.tmp; exit 1; }
-	@mv -f $@.tmp $@
-
-bin/execgen: $(LIBPROJ) $(CGO_FLAGS_FILES)
-
-# No need to pull all the world in when a user just wants
-# to know how to invoke `make` or clean up.
-ifneq ($(build-with-dep-files),)
--include bin/execgen_out.d
-endif
-
-# Generate the colexec files.
-#
-# Note how the dependency work is complete after the cmp/rm/mv
-# dance to write to the output.
-# However, because it does not always change the timestamp of the
-# target file, it is possible to get a situation where the target is
-# older than both bin/execgen and the _tmpl.go file, but does not get
-# changed by this rule. This happens e.g. after a 'git checkout' to a
-# different branch, when the execgen binary and templates do not
-# change across branches.
-#
-# In order to prevent the rule from kicking again in every
-# make invocation, we tweak the timestamp of the output file
-# to be the latest of either bin/execgen or the input template.
-# This makes it just new enough that 'make' will be satisfied
-# that it does not need an update any more.
-#
-# Note that we don't want to ratchet the timestamp all the way
-# to the present, because then it will becomes newer
-# than all the other produced artifacts downstream and force
-# them to rebuild too.
-$(EXECGEN_TARGETS): bin/execgen
-	@echo EXECGEN $@
-	@execgen $@ > $@.tmp || { rm -f $@.tmp; exit 1; }
-	@cmp $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@
-	@set -e; \
-	  depfile=$$(execgen -M $@ | cut -d: -f2); \
-	  target_timestamp_file=$${depfile:-bin/execgen}; \
-	  if test bin/execgen -nt $$target_timestamp_file; then \
-	    target_timestamp_file=bin/execgen; \
-	  fi; \
-	  touch -r $$target_timestamp_file $@
+.PHONY: execgen
+execgen: $(EXECGEN_TARGETS) bin/execgen
+	for i in $(EXECGEN_TARGETS); do echo EXECGEN $$i && ./bin/execgen -fmt=false $$i > $$i; done
+	goimports -w $(EXECGEN_TARGETS)
 
 # Add a catch-all rule for any non-existent execgen generated
 # files. This prevents build errors when switching between branches
@@ -1639,16 +1630,11 @@ unsafe-clean-c-deps:
 	git -C $(LIBROACH_SRC_DIR) clean -dxf
 	git -C $(KRB5_SRC_DIR)     clean -dxf
 
-.PHONY: clean-execgen-files
-clean-execgen-files:
-	find ./pkg/sql/colexec -type f -name '*.eg.go' -exec rm {} +
-	test -d ./pkg/sql/exec && find ./pkg/sql/exec -type f -name '*.eg.go' -exec rm {} + || true
-
 .PHONY: clean
 clean: ## Remove build artifacts.
-clean: clean-c-deps clean-execgen-files
+clean: clean-c-deps
 	rm -rf bin/.go_protobuf_sources bin/.gw_protobuf_sources bin/.cpp_protobuf_sources build/defs.mk*
-	$(GO) clean $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -i -cache github.com/cockroachdb/cockroach...
+	-$(GO) clean $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -i -cache github.com/cockroachdb/cockroach...
 	$(FIND_RELEVANT) -type f \( -name 'zcgo_flags*.go' -o -name '*.test' \) -exec rm {} +
 	for f in cockroach*; do if [ -f "$$f" ]; then rm "$$f"; fi; done
 	rm -rf artifacts bin $(ARCHIVE) pkg/sql/parser/gen
@@ -1656,7 +1642,7 @@ clean: clean-c-deps clean-execgen-files
 .PHONY: maintainer-clean
 maintainer-clean: ## Like clean, but also remove some auto-generated source code.
 maintainer-clean: clean ui-maintainer-clean
-	rm -f $(SQLPARSER_TARGETS) $(EXECGEN_TARGETS) $(OPTGEN_TARGETS) $(UI_PROTOS_OSS) $(UI_PROTOS_CCL)
+	rm -f $(SQLPARSER_TARGETS) $(OPTGEN_TARGETS) $(UI_PROTOS_OSS) $(UI_PROTOS_CCL)
 
 .PHONY: unsafe-clean
 unsafe-clean: ## Like maintainer-clean, but also remove ALL untracked/ignored files.
@@ -1673,6 +1659,7 @@ bins = \
   bin/benchmark \
   bin/cockroach-oss \
   bin/cockroach-short \
+  bin/compile-builds \
   bin/docgen \
   bin/execgen \
   bin/fuzz \
@@ -1718,7 +1705,7 @@ logictest-bins := bin/logictest bin/logictestopt bin/logictestccl
 #
 # TODO(benesch): Derive this automatically. This is getting out of hand.
 bin/workload bin/docgen bin/execgen bin/roachtest $(logictest-bins): $(SQLPARSER_TARGETS) $(PROTOBUF_TARGETS)
-bin/workload bin/roachtest $(logictest-bins): $(EXECGEN_TARGETS)
+bin/workload bin/docgen bin/roachtest $(logictest-bins): $(LIBPROJ) $(CGO_FLAGS_FILES)
 bin/roachtest $(logictest-bins): $(C_LIBS_CCL) $(CGO_FLAGS_FILES) $(OPTGEN_TARGETS)
 
 $(bins): bin/%: bin/%.d | bin/prereqs bin/.submodules-initialized
@@ -1731,7 +1718,7 @@ $(testbins): bin/%: bin/%.d | bin/prereqs $(SUBMODULES_TARGET)
 	@echo go test -c $($*-package)
 	bin/prereqs -bin-name=$* -test $($*-package) > $@.d.tmp
 	mv -f $@.d.tmp $@.d
-	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -c -o $@ $($*-package)
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -c -o $@ $($*-package)
 
 bin/prereqs: ./pkg/cmd/prereqs/*.go | bin/.submodules-initialized
 	@echo go install -v ./pkg/cmd/prereqs

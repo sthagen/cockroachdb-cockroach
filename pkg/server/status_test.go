@@ -57,6 +57,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -346,9 +347,13 @@ func startServer(t *testing.T) *TestServer {
 }
 
 func newRPCTestContext(ts *TestServer, cfg *base.Config) *rpc.Context {
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, cfg, ts.Clock(), ts.Stopper(),
-		ts.ClusterSettings())
+	rpcContext := rpc.NewContext(rpc.ContextOptions{
+		AmbientCtx: log.AmbientContext{Tracer: ts.ClusterSettings().Tracer},
+		Config:     cfg,
+		Clock:      ts.Clock(),
+		Stopper:    ts.Stopper(),
+		Settings:   ts.ClusterSettings(),
+	})
 	// Ensure that the RPC client context validates the server cluster ID.
 	// This ensures that a test where the server is restarted will not let
 	// its test RPC client talk to a server started by an unrelated concurrent test.
@@ -522,7 +527,7 @@ func TestStatusLocalLogs(t *testing.T) {
 	if err := getStatusJSONProto(ts, "logfiles/local", &wrapper); err != nil {
 		t.Fatal(err)
 	}
-	if a, e := len(wrapper.Files), 1; a != e {
+	if a, e := len(wrapper.Files), 2; a != e {
 		t.Fatalf("expected %d log files; got %d", e, a)
 	}
 
@@ -628,6 +633,145 @@ func TestStatusLocalLogs(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestStatusLogRedaction checks that the log file retrieval RPCs
+// honor the redaction flags.
+func TestStatusLogRedaction(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testData := []struct {
+		redactableLogs     bool // logging flag
+		redact             bool // RPC request flag
+		keepRedactable     bool // RPC request flag
+		expectedMessage    string
+		expectedRedactable bool // redactable bit in result entries
+	}{
+		// Note: all 2^3 combinations of (redactableLogs, redact,
+		// keepRedactable) must be tested below.
+
+		// redact=false, keepredactable=false results in an unsafe "flat"
+		// format regardless of whether there were markers in the log
+		// file.
+		{false, false, false, `THISISSAFE THISISUNSAFE`, false},
+		// keepredactable=true, if there were no markers to start with
+		// (redactableLogs=false), introduces markers around the entire
+		// message to indicate it's not known to be safe.
+		{false, false, true, `‹THISISSAFE THISISUNSAFE›`, true},
+		// redact=true must be conservative and redact everything out if
+		// there were no markers to start with (redactableLogs=false).
+		{false, true, false, `‹×›`, false},
+		{false, true, true, `‹×›`, false},
+		// redact=false, keepredactable=false results in an unsafe "flat"
+		// format regardless of whether there were markers in the log
+		// file.
+		{true, false, false, `THISISSAFE THISISUNSAFE`, false},
+		// keepredactable=true, redact=false, keeps whatever was in the
+		// log file.
+		{true, false, true, `THISISSAFE ‹THISISUNSAFE›`, true},
+		// if there were markers in the log to start with, redact=true
+		// removes only the unsafe information.
+		{true, true, false, `THISISSAFE ‹×›`, false},
+		// Whether or not to keep the redactable markers has no influence
+		// on the output of redaction, just on the presence of the
+		// "redactable" marker. In any case no information is leaked.
+		{true, true, true, `THISISSAFE ‹×›`, true},
+	}
+
+	testutils.RunTrueAndFalse(t, "redactableLogs",
+		func(t *testing.T, redactableLogs bool) {
+			s := log.ScopeWithoutShowLogs(t)
+			defer s.Close(t)
+
+			// Apply the redactable log boolean for this test.
+			defer log.TestingSetRedactable(redactableLogs)()
+
+			ts := startServer(t)
+			defer ts.Stopper().Stop(context.Background())
+
+			// Log something.
+			log.Infof(context.Background(), "THISISSAFE %s", "THISISUNSAFE")
+
+			// Determine the log file name.
+			var wrapper serverpb.LogFilesListResponse
+			if err := getStatusJSONProto(ts, "logfiles/local", &wrapper); err != nil {
+				t.Fatal(err)
+			}
+			// We expect a main log and a stderr log.
+			if a, e := len(wrapper.Files), 2; a != e {
+				t.Fatalf("expected %d log files; got %d: %+v", e, a, wrapper.Files)
+			}
+			var file log.FileInfo
+			// Find the main log.
+			for _, f := range wrapper.Files {
+				if !strings.Contains("stderr", f.Name) {
+					file = f
+					break
+				}
+			}
+
+			for _, tc := range testData {
+				if tc.redactableLogs != redactableLogs {
+					continue
+				}
+				t.Run(fmt.Sprintf("redact=%v,keepredactable=%v", tc.redact, tc.keepRedactable),
+					func(t *testing.T) {
+						// checkEntries asserts that the redaction results are
+						// those expected in tc.
+						checkEntries := func(entries []log.Entry) {
+							foundMessage := false
+							for _, entry := range entries {
+								if !strings.HasSuffix(entry.File, "status_test.go") {
+									continue
+								}
+								foundMessage = true
+
+								assert.Equal(t, tc.expectedMessage, entry.Message)
+							}
+							if !foundMessage {
+								t.Fatalf("did not find expected message from test in log")
+							}
+						}
+
+						// Retrieve the log entries with the configured flags using
+						// the LogFiles() RPC.
+						logFilesURL := fmt.Sprintf("logfiles/local/%s?redact=%v&keep_redactable=%v",
+							file.Name, tc.redact, tc.keepRedactable)
+						var wrapper serverpb.LogEntriesResponse
+						if err := getStatusJSONProto(ts, logFilesURL, &wrapper); err != nil {
+							t.Fatal(err)
+						}
+						checkEntries(wrapper.Entries)
+
+						// If the test specifies redact=false, check that a non-admin
+						// user gets a privilege error.
+						if !tc.redact {
+							err := getStatusJSONProtoWithAdminOption(ts, logFilesURL, &wrapper, false /* isAdmin */)
+							if !testutils.IsError(err, "status: 403") {
+								t.Fatalf("expected privilege error, got %v", err)
+							}
+						}
+
+						// Retrieve the log entries using the Logs() RPC.
+						logsURL := fmt.Sprintf("logs/local?redact=%v&keep_redactable=%v",
+							tc.redact, tc.keepRedactable)
+						var wrapper2 serverpb.LogEntriesResponse
+						if err := getStatusJSONProto(ts, logsURL, &wrapper2); err != nil {
+							t.Fatal(err)
+						}
+						checkEntries(wrapper2.Entries)
+
+						// If the test specifies redact=false, check that a non-admin
+						// user gets a privilege error.
+						if !tc.redact {
+							err := getStatusJSONProtoWithAdminOption(ts, logsURL, &wrapper2, false /* isAdmin */)
+							if !testutils.IsError(err, "status: 403") {
+								t.Fatalf("expected privilege error, got %v", err)
+							}
+						}
+					})
+			}
+		})
 }
 
 // TestNodeStatusResponse verifies that node status returns the expected
@@ -928,7 +1072,7 @@ func TestRangesResponse(t *testing.T) {
 		if len(ri.State.Desc.InternalReplicas) != 1 || ri.State.Desc.InternalReplicas[0] != expReplica {
 			t.Errorf("unexpected replica list %+v", ri.State.Desc.InternalReplicas)
 		}
-		if ri.State.Lease == nil || *ri.State.Lease == (roachpb.Lease{}) {
+		if ri.State.Lease == nil || ri.State.Lease.Empty() {
 			t.Error("expected a nontrivial Lease")
 		}
 		if ri.State.LastIndex == 0 {
@@ -1208,7 +1352,7 @@ func TestRangeResponse(t *testing.T) {
 		t.Errorf("unexpected replica list %+v", info.State.Desc.InternalReplicas)
 	}
 
-	if info.State.Lease == nil || *info.State.Lease == (roachpb.Lease{}) {
+	if info.State.Lease == nil || info.State.Lease.Empty() {
 		t.Error("expected a nontrivial Lease")
 	}
 

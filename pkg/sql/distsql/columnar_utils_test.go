@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -134,20 +135,24 @@ func verifyColOperator(args verifyColOperatorArgs) error {
 		columnarizers[i] = c
 	}
 
-	constructorArgs := colexec.NewColOperatorArgs{
-		Spec:                 args.pspec,
-		Inputs:               columnarizers,
-		StreamingMemAccount:  &acc,
+	constructorArgs := &colexec.NewColOperatorArgs{
+		Spec:                args.pspec,
+		Inputs:              columnarizers,
+		StreamingMemAccount: &acc,
+		DiskQueueCfg:        colcontainer.DiskQueueCfg{FS: tempFS},
+		FDSemaphore:         colexecbase.NewTestingSemaphore(256),
+
+		// TODO(yuzefovich): adjust expression generator to not produce
+		// mixed-type timestamp-related expressions and then disallow the
+		// fallback again.
 		ProcessorConstructor: rowexec.NewProcessor,
-		DiskQueueCfg:         colcontainer.DiskQueueCfg{FS: tempFS},
-		FDSemaphore:          colexecbase.NewTestingSemaphore(256),
 	}
 	var spilled bool
 	if args.forceDiskSpill {
 		constructorArgs.TestingKnobs.SpillingCallbackFn = func() { spilled = true }
 	}
 	constructorArgs.TestingKnobs.NumForcedRepartitions = args.numForcedRepartitions
-	result, err := colexec.NewColOperator(ctx, flowCtx, constructorArgs)
+	result, err := colbuilder.NewColOperator(ctx, flowCtx, constructorArgs)
 	if err != nil {
 		return err
 	}

@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -49,7 +48,7 @@ func (p *planner) DropTable(ctx context.Context, n *tree.DropTable) (planNode, e
 	td := make(map[sqlbase.ID]toDelete, len(n.Names))
 	for i := range n.Names {
 		tn := &n.Names[i]
-		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, resolver.ResolveRequireTableDesc)
+		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, tree.ResolveRequireTableDesc)
 		if err != nil {
 			return nil, err
 		}
@@ -157,10 +156,7 @@ func (*dropTableNode) Close(context.Context)        {}
 // new leases for it and existing leases are released).
 // If the table does not exist, this function returns a nil descriptor.
 func (p *planner) prepareDrop(
-	ctx context.Context,
-	name *tree.TableName,
-	required bool,
-	requiredType resolver.ResolveRequiredType,
+	ctx context.Context, name *tree.TableName, required bool, requiredType tree.RequiredTableKind,
 ) (*sqlbase.MutableTableDescriptor, error) {
 	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, name, required, requiredType)
 	if err != nil {
@@ -291,7 +287,7 @@ func (p *planner) dropTableImpl(
 
 	// Drop sequences that the columns of the table own
 	for _, col := range tableDesc.Columns {
-		if err := p.dropSequencesOwnedByCol(ctx, &col); err != nil {
+		if err := p.dropSequencesOwnedByCol(ctx, &col, queueJob); err != nil {
 			return droppedViews, err
 		}
 	}
@@ -309,7 +305,6 @@ func (p *planner) dropTableImpl(
 		if viewDesc.Dropped() {
 			continue
 		}
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
 		cascadedViews, err := p.dropViewImpl(ctx, viewDesc, queueJob, "dropping dependent view", tree.DropCascade)
 		if err != nil {
 			return droppedViews, err
@@ -339,7 +334,7 @@ func (p *planner) initiateDropTable(
 	drainName bool,
 ) error {
 	if tableDesc.Dropped() {
-		return fmt.Errorf("table %q is being dropped", tableDesc.Name)
+		return errors.Errorf("table %q is already being dropped", tableDesc.Name)
 	}
 
 	// If the table is not interleaved , use the delayed GC mechanism to
@@ -351,15 +346,6 @@ func (p *planner) initiateDropTable(
 	// TODO(bram): If interleaved and ON DELETE CASCADE, we will be able to use
 	// this faster mechanism.
 	if tableDesc.IsTable() && !tableDesc.IsInterleaved() {
-		// Get the zone config applying to this table in order to
-		// ensure there is a GC TTL.
-		_, _, _, err := GetZoneConfigInTxn(
-			ctx, p.txn, uint32(tableDesc.ID), &sqlbase.IndexDescriptor{}, "", false, /* getInheritedDefault */
-		)
-		if err != nil {
-			return err
-		}
-
 		tableDesc.DropTime = timeutil.Now().UnixNano()
 	}
 
@@ -389,7 +375,7 @@ func (p *planner) initiateDropTable(
 		parentSchemaID := tableDesc.GetParentSchemaID()
 
 		// Queue up name for draining.
-		nameDetails := sqlbase.TableDescriptor_NameInfo{
+		nameDetails := sqlbase.NameInfo{
 			ParentID:       tableDesc.ParentID,
 			ParentSchemaID: parentSchemaID,
 			Name:           tableDesc.Name}
@@ -573,9 +559,11 @@ func (p *planner) removeInterleaveBackReference(
 		}
 	}
 	if t != tableDesc {
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
 		return p.writeSchemaChange(
-			ctx, t, sqlbase.InvalidMutationID, "removing reference for interleaved table",
+			ctx, t, sqlbase.InvalidMutationID,
+			fmt.Sprintf("removing reference for interleaved table %s(%d)",
+				t.Name, t.ID,
+			),
 		)
 	}
 	return nil

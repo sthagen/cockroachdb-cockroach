@@ -16,14 +16,15 @@ import (
 	gojson "encoding/json"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -49,12 +50,12 @@ type alterTableNode struct {
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode, error) {
 	tableDesc, err := p.ResolveMutableTableDescriptorEx(
-		ctx, n.Table, !n.IfExists, resolver.ResolveRequireTableDesc,
+		ctx, n.Table, !n.IfExists, tree.ResolveRequireTableDesc,
 	)
 	if errors.Is(err, resolver.ErrNoPrimaryKey) {
 		if len(n.Cmds) > 0 && isAlterCmdValidWithoutPrimaryKey(n.Cmds[0]) {
 			tableDesc, err = p.ResolveMutableTableDescriptorExAllowNoPrimaryKey(
-				ctx, n.Table, !n.IfExists, resolver.ResolveRequireTableDesc,
+				ctx, n.Table, !n.IfExists, tree.ResolveRequireTableDesc,
 			)
 		}
 	}
@@ -144,132 +145,14 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 		switch t := cmd.(type) {
 		case *tree.AlterTableAddColumn:
-			d := t.ColumnDef
-			version := params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx)
-			toType, err := tree.ResolveType(params.ctx, d.Type, params.p.semaCtx.GetTypeResolver())
+			var err error
+			params.p.runWithOptions(resolveFlags{contextDatabaseID: n.tableDesc.ParentID}, func() {
+				err = params.p.addColumnImpl(params, n, tn, n.tableDesc, t)
+			})
 			if err != nil {
 				return err
 			}
-			if supported, err := isTypeSupportedInVersion(version, toType); err != nil {
-				return err
-			} else if !supported {
-				return pgerror.Newf(
-					pgcode.FeatureNotSupported,
-					"type %s is not supported until version upgrade is finalized",
-					toType.SQLString(),
-				)
-			}
-
-			newDef, seqDbDesc, seqName, seqOpts, err := params.p.processSerialInColumnDef(params.ctx, d, tn)
-			if err != nil {
-				return err
-			}
-			if seqName != nil {
-				if err := doCreateSequence(
-					params,
-					n.n.String(),
-					seqDbDesc,
-					n.tableDesc.GetParentSchemaID(),
-					seqName,
-					n.tableDesc.Temporary,
-					seqOpts,
-					tree.AsStringWithFQNames(n.n, params.Ann()),
-				); err != nil {
-					return err
-				}
-			}
-			d = newDef
-			incTelemetryForNewColumn(d)
-
-			col, idx, expr, err := sqlbase.MakeColumnDefDescs(params.ctx, d, &params.p.semaCtx, params.EvalContext())
-			if err != nil {
-				return err
-			}
-			// If the new column has a DEFAULT expression that uses a sequence, add references between
-			// its descriptor and this column descriptor.
-			if d.HasDefaultExpr() {
-				changedSeqDescs, err := maybeAddSequenceDependencies(
-					params.ctx, params.p, n.tableDesc, col, expr, nil,
-				)
-				if err != nil {
-					return err
-				}
-				for _, changedSeqDesc := range changedSeqDescs {
-					if err := params.p.writeSchemaChange(
-						params.ctx, changedSeqDesc, sqlbase.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
-					); err != nil {
-						return err
-					}
-				}
-			}
-
-			// We're checking to see if a user is trying add a non-nullable column without a default to a
-			// non empty table by scanning the primary index span with a limit of 1 to see if any key exists.
-			if !col.Nullable && (col.DefaultExpr == nil && !col.IsComputed()) {
-				span := n.tableDesc.PrimaryIndexSpan(params.ExecCfg().Codec)
-				kvs, err := params.p.txn.Scan(params.ctx, span.Key, span.EndKey, 1)
-				if err != nil {
-					return err
-				}
-				if len(kvs) > 0 {
-					return sqlbase.NewNonNullViolationError(col.Name)
-				}
-			}
-			_, err = n.tableDesc.FindActiveColumnByName(string(d.Name))
-			if m := n.tableDesc.FindColumnMutationByName(d.Name); m != nil {
-				switch m.Direction {
-				case sqlbase.DescriptorMutation_ADD:
-					return pgerror.Newf(pgcode.DuplicateColumn,
-						"duplicate: column %q in the middle of being added, not yet public",
-						col.Name)
-				case sqlbase.DescriptorMutation_DROP:
-					return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-						"column %q being dropped, try again later", col.Name)
-				default:
-					if err != nil {
-						return errors.AssertionFailedf(
-							"mutation in state %s, direction %s, and no column descriptor",
-							errors.Safe(m.State), errors.Safe(m.Direction))
-					}
-				}
-			}
-			if err == nil {
-				if t.IfNotExists {
-					continue
-				}
-				return sqlbase.NewColumnAlreadyExistsError(string(d.Name), n.tableDesc.Name)
-			}
-
-			n.tableDesc.AddColumnMutation(col, sqlbase.DescriptorMutation_ADD)
-			if idx != nil {
-				if err := n.tableDesc.AddIndexMutation(idx, sqlbase.DescriptorMutation_ADD); err != nil {
-					return err
-				}
-			}
-			if d.HasColumnFamily() {
-				err := n.tableDesc.AddColumnToFamilyMaybeCreate(
-					col.Name, string(d.Family.Name), d.Family.Create,
-					d.Family.IfNotExists)
-				if err != nil {
-					return err
-				}
-			}
-
-			if d.IsComputed() {
-				if err := validateComputedColumn(params.ctx, n.tableDesc, d, &params.p.semaCtx); err != nil {
-					return err
-				}
-			}
-
 		case *tree.AlterTableAddConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
-			if err != nil {
-				return err
-			}
-			inuseNames := make(map[string]struct{}, len(info))
-			for k := range info {
-				inuseNames[k] = struct{}{}
-			}
 			switch d := t.ConstraintDef.(type) {
 			case *tree.UniqueConstraintTableDef:
 				if d.PrimaryKey {
@@ -322,17 +205,32 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 
 			case *tree.CheckConstraintTableDef:
-				ck, err := makeCheckConstraint(params.ctx,
-					n.tableDesc, d, inuseNames, &params.p.semaCtx, *tn)
+				var err error
+				params.p.runWithOptions(resolveFlags{contextDatabaseID: n.tableDesc.ParentID}, func() {
+					info, infoErr := n.tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
+					if err != nil {
+						err = infoErr
+						return
+					}
+					ckBuilder := schemaexpr.NewCheckConstraintBuilder(params.ctx, *tn, n.tableDesc, &params.p.semaCtx)
+					for k := range info {
+						ckBuilder.MarkNameInUse(k)
+					}
+					ck, buildErr := ckBuilder.Build(d)
+					if buildErr != nil {
+						err = buildErr
+						return
+					}
+					if t.ValidationBehavior == tree.ValidationDefault {
+						ck.Validity = sqlbase.ConstraintValidity_Validating
+					} else {
+						ck.Validity = sqlbase.ConstraintValidity_Unvalidated
+					}
+					n.tableDesc.AddCheckMutation(ck, sqlbase.DescriptorMutation_ADD)
+				})
 				if err != nil {
 					return err
 				}
-				if t.ValidationBehavior == tree.ValidationDefault {
-					ck.Validity = sqlbase.ConstraintValidity_Validating
-				} else {
-					ck.Validity = sqlbase.ConstraintValidity_Unvalidated
-				}
-				n.tableDesc.AddCheckMutation(ck, sqlbase.DescriptorMutation_ADD)
 
 			case *tree.ForeignKeyConstraintTableDef:
 				for _, colName := range d.FromCols {
@@ -353,6 +251,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				// on tables that were just added. See the comment at the start of
 				// the global-scope resolveFK().
 				// TODO(vivek): check if the cache can be used.
+				var err error
 				params.p.runWithOptions(resolveFlags{skipCache: true}, func() {
 					// Check whether the table is empty, and pass the result to resolveFK(). If
 					// the table is empty, then resolveFK will automatically add the necessary
@@ -435,7 +334,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 
-			if err := params.p.dropSequencesOwnedByCol(params.ctx, colToDrop); err != nil {
+			if err := params.p.dropSequencesOwnedByCol(params.ctx, colToDrop, true /* queueJob */); err != nil {
 				return err
 			}
 
@@ -473,7 +372,13 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 			// We cannot remove this column if there are computed columns that use it.
-			if err := checkColumnHasNoComputedColDependencies(n.tableDesc, colToDrop); err != nil {
+			computedColValidator := schemaexpr.NewComputedColumnValidator(
+				params.ctx,
+				n.tableDesc,
+				&params.p.semaCtx,
+				tn,
+			)
+			if err := computedColValidator.ValidateNoDependents(colToDrop); err != nil {
 				return err
 			}
 
@@ -553,9 +458,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 			// Drop check constraints which reference the column.
-			// Note that foreign key constraints are dropped as part of dropping
-			// indexes on the column. In the future, when FKs no longer depend on
-			// indexes in the same way, FKs will have to be dropped separately here.
 			validChecks := n.tableDesc.Checks[:0]
 			for _, check := range n.tableDesc.AllActiveAndInactiveChecks() {
 				if used, err := check.UsesColumn(n.tableDesc.TableDesc(), colToDrop.ID); err != nil {
@@ -580,6 +482,26 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 			if err := params.p.removeColumnComment(params.ctx, n.tableDesc.ID, colToDrop.ID); err != nil {
 				return err
+			}
+
+			// Since we are able to drop indexes used by foreign keys on the origin side,
+			// the drop index codepaths aren't going to remove dependent FKs, so we
+			// need to do that here.
+			if params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.VersionNoOriginFKIndexes) {
+				// We update the FK's slice in place here.
+				sliceIdx := 0
+				for i := range n.tableDesc.OutboundFKs {
+					n.tableDesc.OutboundFKs[sliceIdx] = n.tableDesc.OutboundFKs[i]
+					sliceIdx++
+					fk := &n.tableDesc.OutboundFKs[i]
+					if sqlbase.ColumnIDs(fk.OriginColumnIDs).Contains(colToDrop.ID) {
+						sliceIdx--
+						if err := params.p.removeFKBackReference(params.ctx, n.tableDesc, fk); err != nil {
+							return err
+						}
+					}
+				}
+				n.tableDesc.OutboundFKs = n.tableDesc.OutboundFKs[:sliceIdx]
 			}
 
 			found := false
@@ -659,7 +581,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 						"constraint %q in the middle of being added, try again later", t.Constraint)
 				}
 				if err := validateCheckInTxn(
-					params.ctx, params.p.LeaseMgr(), params.EvalContext(), n.tableDesc, params.EvalContext().Txn, name,
+					params.ctx, params.p.LeaseMgr(), &params.p.semaCtx, params.EvalContext(), n.tableDesc, params.EvalContext().Txn, name,
 				); err != nil {
 					return err
 				}
@@ -704,7 +626,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 					"column %q in the middle of being dropped", t.GetColumn())
 			}
 			// Apply mutations to copy of column descriptor.
-			if err := applyColumnMutation(params.ctx, n.tableDesc, col, t, params, n.n.Cmds); err != nil {
+			if err := applyColumnMutation(params.ctx, n.tableDesc, col, t, params, n.n.Cmds, tn); err != nil {
 				return err
 			}
 			descriptorChanged = true
@@ -733,7 +655,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 		case *tree.AlterTableSetAudit:
 			var err error
-			descriptorChanged, err = params.p.setAuditMode(params.ctx, n.tableDesc.TableDesc(), t.Mode)
+			descriptorChanged, err = params.p.setAuditMode(params.ctx, n.tableDesc, t.Mode)
 			if err != nil {
 				return err
 			}
@@ -848,7 +770,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 }
 
 func (p *planner) setAuditMode(
-	ctx context.Context, desc *sqlbase.TableDescriptor, auditMode tree.AuditMode,
+	ctx context.Context, desc *sqlbase.MutableTableDescriptor, auditMode tree.AuditMode,
 ) (bool, error) {
 	// An auditing config change is itself auditable!
 	// We record the event even if the permission check below fails:
@@ -905,10 +827,11 @@ func applyColumnMutation(
 	mut tree.ColumnMutationCmd,
 	params runParams,
 	cmds tree.AlterTableCmds,
+	tn *tree.TableName,
 ) error {
 	switch t := mut.(type) {
 	case *tree.AlterTableAlterColumnType:
-		return AlterColumnType(ctx, tableDesc, col, t, params, cmds)
+		return AlterColumnType(ctx, tableDesc, col, t, params, cmds, tn)
 
 	case *tree.AlterTableSetDefault:
 		if len(col.UsesSequenceIds) > 0 {
@@ -921,12 +844,12 @@ func applyColumnMutation(
 		} else {
 			colDatumType := col.Type
 			expr, err := sqlbase.SanitizeVarFreeExpr(
-				params.ctx, t.Default, colDatumType, "DEFAULT", &params.p.semaCtx, true, /* allowImpure */
+				params.ctx, t.Default, colDatumType, "DEFAULT", &params.p.semaCtx, tree.VolatilityVolatile,
 			)
 			if err != nil {
 				return err
 			}
-			s := tree.Serialize(t.Default)
+			s := tree.Serialize(expr)
 			col.DefaultExpr = &s
 
 			// Add references to the sequence descriptors this column is now using.
@@ -937,10 +860,11 @@ func applyColumnMutation(
 				return err
 			}
 			for _, changedSeqDesc := range changedSeqDescs {
-				// TODO (lucy): Have more consistent/informative names for dependent jobs.
 				if err := params.p.writeSchemaChange(
-					params.ctx, changedSeqDesc, sqlbase.InvalidMutationID, "updating dependent sequence",
-				); err != nil {
+					params.ctx, changedSeqDesc, sqlbase.InvalidMutationID,
+					fmt.Sprintf("updating dependent sequence %s(%d) for table %s(%d)",
+						changedSeqDesc.Name, changedSeqDesc.ID, tableDesc.Name, tableDesc.ID,
+					)); err != nil {
 					return err
 				}
 			}
@@ -1021,47 +945,6 @@ func applyColumnMutation(
 				"column %q is not a computed column", col.Name)
 		}
 		col.ComputeExpr = nil
-	}
-	return nil
-}
-
-func checkColumnHasNoComputedColDependencies(
-	desc *sqlbase.MutableTableDescriptor, col *sqlbase.ColumnDescriptor,
-) error {
-	checkComputed := func(c *sqlbase.ColumnDescriptor) error {
-		if !c.IsComputed() {
-			return nil
-		}
-		expr, err := parser.ParseExpr(*c.ComputeExpr)
-		if err != nil {
-			// At this point, we should be able to parse the computed expression.
-			return errors.WithAssertionFailure(err)
-		}
-		return iterColDescriptorsInExpr(desc, expr, func(colVar *sqlbase.ColumnDescriptor) error {
-			if colVar.ID == col.ID {
-				return pgerror.Newf(
-					pgcode.InvalidColumnReference,
-					"column %q is referenced by computed column %q",
-					col.Name,
-					c.Name,
-				)
-			}
-			return nil
-		})
-	}
-	for i := range desc.Columns {
-		if err := checkComputed(&desc.Columns[i]); err != nil {
-			return err
-		}
-	}
-	for i := range desc.Mutations {
-		mut := &desc.Mutations[i]
-		mutCol := mut.GetColumn()
-		if mut.Direction == sqlbase.DescriptorMutation_ADD && mutCol != nil {
-			if err := checkComputed(mutCol); err != nil {
-				return err
-			}
-		}
 	}
 	return nil
 }
@@ -1227,9 +1110,10 @@ func (p *planner) updateFKBackReferenceName(
 		backref := &referencedTableDesc.InboundFKs[i]
 		if backref.Name == ref.Name && backref.OriginTableID == tableDesc.ID {
 			backref.Name = newName
-			// TODO (lucy): Have more consistent/informative names for dependent jobs.
 			return p.writeSchemaChange(
-				ctx, referencedTableDesc, sqlbase.InvalidMutationID, "updating referenced table",
+				ctx, referencedTableDesc, sqlbase.InvalidMutationID,
+				fmt.Sprintf("updating referenced FK table %s(%d) for table %s(%d)",
+					referencedTableDesc.Name, referencedTableDesc.ID, tableDesc.Name, tableDesc.ID),
 			)
 		}
 	}

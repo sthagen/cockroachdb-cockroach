@@ -34,12 +34,12 @@ import (
 // and must not rely on having a NodeID/NodeDescriptor/NodeLiveness/...
 //
 // In short, it should not rely on the test server through anything other than a
-// `*kv.DB` and a small number of whitelisted RPCs.
+// `*kv.DB` and a small number of allowlisted RPCs.
 func TestSQLServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	tc := serverutils.StartTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 
 	db := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
@@ -49,6 +49,8 @@ func TestSQLServer(t *testing.T) {
 	r.Exec(t, `CREATE DATABASE foo`)
 	r.Exec(t, `CREATE TABLE foo.kv (k STRING PRIMARY KEY, v STRING)`)
 	r.Exec(t, `INSERT INTO foo.kv VALUES('foo', 'bar')`)
+	// Cause an index backfill operation.
+	r.Exec(t, `CREATE INDEX ON foo.kv (v)`)
 	t.Log(sqlutils.MatrixToStr(r.QueryStr(t, `SET distsql=off; SELECT * FROM foo.kv`)))
 	t.Log(sqlutils.MatrixToStr(r.QueryStr(t, `SET distsql=auto; SELECT * FROM foo.kv`)))
 }
@@ -67,5 +69,5 @@ func TestTenantCannotSetClusterSetting(t *testing.T) {
 	var pqErr *pq.Error
 	ok := errors.As(err, &pqErr)
 	require.True(t, ok, "expected err to be a *pq.Error but is of type %T. error is: %v", err)
-	require.Equal(t, pq.ErrorCode(pgcode.InsufficientPrivilege), pqErr.Code, "err %v has unexpected code", err)
+	require.Equal(t, pq.ErrorCode(pgcode.InsufficientPrivilege.String()), pqErr.Code, "err %v has unexpected code", err)
 }

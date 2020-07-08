@@ -12,12 +12,12 @@ SELECT generate_series(0,1) FROM (SELECT * FROM xy LIMIT 0)
 project-set
  ├── columns: generate_series:3(int)
  ├── cardinality: [0 - 0]
- ├── side-effects
+ ├── immutable
  ├── values
  │    ├── cardinality: [0 - 0]
  │    └── key: ()
  └── zip
-      └── function: generate_series [type=int, side-effects]
+      └── function: generate_series [type=int, immutable]
            ├── const: 0 [type=int]
            └── const: 1 [type=int]
 
@@ -45,7 +45,8 @@ project
  │    │    │    ├── key: (3)
  │    │    │    ├── fd: (3)-->(1,2)
  │    │    │    ├── prune: (1-3)
- │    │    │    └── interesting orderings: (+3)
+ │    │    │    ├── interesting orderings: (+3)
+ │    │    │    └── unfiltered-cols: (1-3)
  │    │    ├── inner-join-apply
  │    │    │    ├── columns: x:4(int!null) y:5(int) unnest:6(int)
  │    │    │    ├── outer: (1,2)

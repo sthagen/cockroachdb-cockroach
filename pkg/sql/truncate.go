@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -19,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -60,7 +60,7 @@ func (t *truncateNode) startExec(params runParams) error {
 	for i := range n.Tables {
 		tn := &n.Tables[i]
 		tableDesc, err := p.ResolveMutableTableDescriptor(
-			ctx, tn, true /*required*/, resolver.ResolveRequireTableDesc)
+			ctx, tn, true /*required*/, tree.ResolveRequireTableDesc)
 		if err != nil {
 			return err
 		}
@@ -168,16 +168,14 @@ func (p *planner) truncateTable(
 	if err != nil {
 		return err
 	}
-	// tableDesc.DropJobID = dropJobID
-	newTableDesc := sqlbase.NewMutableCreatedTableDescriptor(tableDesc.TableDescriptor)
-	newTableDesc.ReplacementOf = sqlbase.TableDescriptor_Replacement{
-		ID: id,
-		// NB: Time is just used for debugging purposes. See the comment on the
-		// field for more details.
-		Time: p.txn.ReadTimestamp(),
+
+	newID, err := catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+	if err != nil {
+		return err
 	}
-	newTableDesc.SetID(0)
-	newTableDesc.Version = 1
+	// tableDesc.DropJobID = dropJobID
+	newTableDesc := sqlbase.NewMutableTableDescriptorAsReplacement(
+		newID, tableDesc, p.txn.ReadTimestamp())
 
 	// Remove old name -> id map.
 	// This is a violation of consistency because once the TRUNCATE commits
@@ -191,7 +189,6 @@ func (p *planner) truncateTable(
 	// structured.proto
 	//
 	// TODO(vivek): Fix properly along with #12123.
-	zoneKey := config.MakeZoneKey(uint32(tableDesc.ID))
 	key := sqlbase.MakeObjectNameKey(
 		ctx, p.ExecCfg().Settings,
 		newTableDesc.ParentID,
@@ -212,11 +209,6 @@ func (p *planner) truncateTable(
 		return err
 	}
 
-	newID, err := catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
-	if err != nil {
-		return err
-	}
-
 	// update all the references to this table.
 	tables, err := p.findAllReferences(ctx, *tableDesc)
 	if err != nil {
@@ -229,7 +221,6 @@ func (p *planner) truncateTable(
 	}
 
 	for _, table := range tables {
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
 		if err := p.writeSchemaChange(
 			ctx, table, sqlbase.InvalidMutationID, "updating reference for truncated table",
 		); err != nil {
@@ -259,10 +250,10 @@ func (p *planner) truncateTable(
 	// as the commit timestamp for the new descriptor. See the comment on
 	// sqlbase.Descriptor.Table().
 	newTableDesc.ModificationTime = hlc.Timestamp{}
-	// TODO (lucy): Have more consistent/informative names for dependent jobs.
 	if err := p.createDescriptorWithID(
 		ctx, key, newID, newTableDesc, p.ExtendedEvalContext().Settings,
-		"creating new descriptor for truncated table",
+		fmt.Sprintf("creating new descriptor %d for truncated table %s with id %d",
+			newID, newTableDesc.Name, id),
 	); err != nil {
 		return err
 	}
@@ -272,24 +263,31 @@ func (p *planner) truncateTable(
 		return err
 	}
 
-	// Copy the zone config.
-	b := &kv.Batch{}
-	b.Get(zoneKey)
-	if err := p.txn.Run(ctx, b); err != nil {
-		return err
+	// Copy the zone config, if this is for the system tenant. Secondary tenants
+	// do not have zone configs for individual objects.
+	if p.ExecCfg().Codec.ForSystemTenant() {
+		zoneKey := config.MakeZoneKey(config.SystemTenantObjectID(tableDesc.ID))
+		b := &kv.Batch{}
+		b.Get(zoneKey)
+		if err := p.txn.Run(ctx, b); err != nil {
+			return err
+		}
+		val := b.Results[0].Rows[0].Value
+		if val == nil {
+			return nil
+		}
+		zoneCfg, err := val.GetBytes()
+		if err != nil {
+			return err
+		}
+		const insertZoneCfg = `INSERT INTO system.zones (id, config) VALUES ($1, $2)`
+		if _, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+			ctx, "insert-zone", p.txn, insertZoneCfg, newID, zoneCfg,
+		); err != nil {
+			return err
+		}
 	}
-	val := b.Results[0].Rows[0].Value
-	if val == nil {
-		return nil
-	}
-	zoneCfg, err := val.GetBytes()
-	if err != nil {
-		return err
-	}
-	const insertZoneCfg = `INSERT INTO system.zones (id, config) VALUES ($1, $2)`
-	_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
-		ctx, "insert-zone", p.txn, insertZoneCfg, newID, zoneCfg)
-	return err
+	return nil
 }
 
 // For all the references from a table
@@ -419,9 +417,6 @@ func ClearTableDataInChunks(
 				codec,
 				sqlbase.NewImmutableTableDescriptor(*tableDesc),
 				nil,
-				nil,
-				row.SkipFKs,
-				nil, /* *tree.EvalContext */
 				alloc,
 			)
 			if err != nil {

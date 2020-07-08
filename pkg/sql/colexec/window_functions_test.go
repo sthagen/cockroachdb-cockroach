@@ -37,7 +37,7 @@ type windowFnTestCase struct {
 
 func (tc *windowFnTestCase) init() {
 	for i := range tc.windowerSpec.WindowFns {
-		tc.windowerSpec.WindowFns[i].FilterColIdx = noFilterIdx
+		tc.windowerSpec.WindowFns[i].FilterColIdx = tree.NoColumnIdx
 	}
 }
 
@@ -295,7 +295,7 @@ func TestWindowFunctions(t *testing.T) {
 						},
 					}
 					sem := colexecbase.NewTestingSemaphore(maxNumberFDs)
-					args := NewColOperatorArgs{
+					args := &NewColOperatorArgs{
 						Spec:                spec,
 						Inputs:              inputs,
 						StreamingMemAccount: testMemAcc,
@@ -305,7 +305,7 @@ func TestWindowFunctions(t *testing.T) {
 					semsToCheck = append(semsToCheck, sem)
 					args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 					args.TestingKnobs.NumForcedRepartitions = maxNumberFDs
-					result, err := NewColOperator(ctx, flowCtx, args)
+					result, err := TestNewColOperator(ctx, flowCtx, args)
 					accounts = append(accounts, result.OpAccounts...)
 					monitors = append(monitors, result.OpMonitors...)
 					return result.Op, err

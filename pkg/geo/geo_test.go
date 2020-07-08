@@ -16,9 +16,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
-	"github.com/cockroachdb/cockroach/pkg/geo/geos"
-	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/datadriven"
 	"github.com/golang/geo/s2"
 	"github.com/stretchr/testify/require"
 	"github.com/twpayne/go-geom"
@@ -99,15 +96,15 @@ func TestGeospatialTypeFitsColumnMetadata(t *testing.T) {
 	testCases := []struct {
 		t             GeospatialType
 		srid          geopb.SRID
-		shape         geopb.Shape
+		shape         geopb.ShapeType
 		errorContains string
 	}{
-		{MustParseGeometry("POINT(1.0 1.0)"), 0, geopb.Shape_Geometry, ""},
-		{MustParseGeometry("POINT(1.0 1.0)"), 0, geopb.Shape_Unset, ""},
-		{MustParseGeometry("SRID=4326;POINT(1.0 1.0)"), 0, geopb.Shape_Geometry, ""},
-		{MustParseGeometry("SRID=4326;POINT(1.0 1.0)"), 0, geopb.Shape_Unset, ""},
-		{MustParseGeometry("SRID=4326;POINT(1.0 1.0)"), 0, geopb.Shape_LineString, "type Point does not match column type LineString"},
-		{MustParseGeometry("POINT(1.0 1.0)"), 4326, geopb.Shape_Geometry, "SRID 0 does not match column SRID 4326"},
+		{MustParseGeometry("POINT(1.0 1.0)"), 0, geopb.ShapeType_Geometry, ""},
+		{MustParseGeometry("POINT(1.0 1.0)"), 0, geopb.ShapeType_Unset, ""},
+		{MustParseGeometry("SRID=4326;POINT(1.0 1.0)"), 0, geopb.ShapeType_Geometry, ""},
+		{MustParseGeometry("SRID=4326;POINT(1.0 1.0)"), 0, geopb.ShapeType_Unset, ""},
+		{MustParseGeometry("SRID=4326;POINT(1.0 1.0)"), 0, geopb.ShapeType_LineString, "type Point does not match column type LineString"},
+		{MustParseGeometry("POINT(1.0 1.0)"), 4326, geopb.ShapeType_Geometry, "SRID 0 does not match column SRID 4326"},
 	}
 
 	for _, tc := range testCases {
@@ -123,86 +120,173 @@ func TestGeospatialTypeFitsColumnMetadata(t *testing.T) {
 	}
 }
 
-func TestSpatialObjectFromGeom(t *testing.T) {
+func TestMakeValidGeographyGeom(t *testing.T) {
+	var (
+		invalidGeomPoint              = geom.NewPointFlat(geom.XY, []float64{200.0, 199.0})
+		invalidGeomLineString         = geom.NewLineStringFlat(geom.XY, []float64{90.0, 90.0, 180.0, 180.0})
+		invalidGeomPolygon            = geom.NewPolygonFlat(geom.XY, []float64{360.0, 360.0, 450.0, 450.0, 540.0, 540.0, 630.0, 630.0}, []int{8})
+		invalidGeomMultiPoint         = geom.NewMultiPointFlat(geom.XY, []float64{-90.0, -90.0, -180.0, -180.0})
+		invalidGeomMultiLineString    = geom.NewMultiLineStringFlat(geom.XY, []float64{-270.0, -270.0, -360.0, -360.0, -450.0, -450.0, -540.0, -540.0}, []int{4, 8})
+		invalidGeomMultiPolygon       = geom.NewMultiPolygon(geom.XY)
+		invalidGeomGeometryCollection = geom.NewGeometryCollection()
+	)
+	invalidGeomGeometryCollection.MustPush(geom.NewPointFlat(geom.XY, []float64{200.0, 199.0}))
+	invalidGeomGeometryCollection.MustPush(geom.NewLineStringFlat(geom.XY, []float64{90.0, 90.0, 180.0, 180.0}))
+	var (
+		validGeomPoint              = geom.NewPointFlat(geom.XY, []float64{-160.0, -19.0})
+		validGeomLineString         = geom.NewLineStringFlat(geom.XY, []float64{90.0, 90.0, 180.0, 0.0})
+		validGeomPolygon            = geom.NewPolygonFlat(geom.XY, []float64{0.0, 0.0, 90.0, 90.0, -180.0, 0.0, -90.0, -90.0}, []int{8})
+		validGeomMultiPoint         = geom.NewMultiPointFlat(geom.XY, []float64{-90.0, -90.0, -180.0, 0.0})
+		validGeomMultiLineString    = geom.NewMultiLineStringFlat(geom.XY, []float64{90.0, 90.0, 0.0, 0.0, -90.0, -90.0, 180.0, 0.0}, []int{4, 8})
+		validGeomMultiPolygon       = geom.NewMultiPolygon(geom.XY)
+		validGeomGeometryCollection = geom.NewGeometryCollection()
+	)
+	validGeomGeometryCollection.MustPush(validGeomPoint)
+	validGeomGeometryCollection.MustPush(validGeomLineString)
 	testCases := []struct {
 		desc string
 		g    geom.T
-		ret  geopb.SpatialObject
+		ret  geom.T
+	}{
+		{
+			"Point",
+			invalidGeomPoint,
+			validGeomPoint,
+		},
+		{
+			"linestring",
+			invalidGeomLineString,
+			validGeomLineString,
+		},
+		{
+			"polygon",
+			invalidGeomPolygon,
+			validGeomPolygon,
+		},
+		{
+			"multipoint",
+			invalidGeomMultiPoint,
+			validGeomMultiPoint,
+		},
+		{
+			"multilinestring",
+			invalidGeomMultiLineString,
+			validGeomMultiLineString,
+		},
+		{
+			"multipolygon",
+			invalidGeomMultiPolygon,
+			validGeomMultiPolygon,
+		},
+		{
+			"geometrycollection",
+			invalidGeomGeometryCollection,
+			validGeomGeometryCollection,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			normalizeGeographyGeomT(tc.g)
+			require.Equal(t, tc.ret, tc.g)
+		})
+	}
+}
+
+func TestSpatialObjectFromGeomT(t *testing.T) {
+	testCases := []struct {
+		desc   string
+		soType geopb.SpatialObjectType
+		g      geom.T
+		ret    geopb.SpatialObject
 	}{
 		{
 			"point",
+			geopb.SpatialObjectType_GeometryType,
 			testGeomPoint,
 			geopb.SpatialObject{
+				Type:        geopb.SpatialObjectType_GeometryType,
 				EWKB:        mustDecodeEWKBFromString(t, "0101000000000000000000F03F0000000000000040"),
 				SRID:        0,
-				Shape:       geopb.Shape_Point,
-				BoundingBox: &geopb.BoundingBox{MinX: 1, MaxX: 1, MinY: 2, MaxY: 2},
+				ShapeType:   geopb.ShapeType_Point,
+				BoundingBox: &geopb.BoundingBox{LoX: 1, HiX: 1, LoY: 2, HiY: 2},
 			},
 		},
 		{
 			"linestring",
+			geopb.SpatialObjectType_GeometryType,
 			testGeomLineString,
 			geopb.SpatialObject{
+				Type:        geopb.SpatialObjectType_GeometryType,
 				EWKB:        mustDecodeEWKBFromString(t, "0102000020E610000002000000000000000000F03F000000000000F03F00000000000000400000000000000040"),
 				SRID:        4326,
-				Shape:       geopb.Shape_LineString,
-				BoundingBox: &geopb.BoundingBox{MinX: 1, MaxX: 2, MinY: 1, MaxY: 2},
+				ShapeType:   geopb.ShapeType_LineString,
+				BoundingBox: &geopb.BoundingBox{LoX: 1, HiX: 2, LoY: 1, HiY: 2},
 			},
 		},
 		{
 			"polygon",
+			geopb.SpatialObjectType_GeometryType,
 			testGeomPolygon,
 			geopb.SpatialObject{
+				Type:        geopb.SpatialObjectType_GeometryType,
 				EWKB:        mustDecodeEWKBFromString(t, "01030000000100000004000000000000000000F03F000000000000F03F00000000000000400000000000000040000000000000F03F0000000000000040000000000000F03F000000000000F03F"),
 				SRID:        0,
-				Shape:       geopb.Shape_Polygon,
-				BoundingBox: &geopb.BoundingBox{MinX: 1, MaxX: 2, MinY: 1, MaxY: 2},
+				ShapeType:   geopb.ShapeType_Polygon,
+				BoundingBox: &geopb.BoundingBox{LoX: 1, HiX: 2, LoY: 1, HiY: 2},
 			},
 		},
 		{
 			"multipoint",
+			geopb.SpatialObjectType_GeometryType,
 			testGeomMultiPoint,
 			geopb.SpatialObject{
+				Type:        geopb.SpatialObjectType_GeometryType,
 				EWKB:        mustDecodeEWKBFromString(t, "0104000000020000000101000000000000000000F03F000000000000F03F010100000000000000000000400000000000000040"),
 				SRID:        0,
-				Shape:       geopb.Shape_MultiPoint,
-				BoundingBox: &geopb.BoundingBox{MinX: 1, MaxX: 2, MinY: 1, MaxY: 2},
+				ShapeType:   geopb.ShapeType_MultiPoint,
+				BoundingBox: &geopb.BoundingBox{LoX: 1, HiX: 2, LoY: 1, HiY: 2},
 			},
 		},
 		{
 			"multilinestring",
+			geopb.SpatialObjectType_GeometryType,
 			testGeomMultiLineString,
 			geopb.SpatialObject{
+				Type:        geopb.SpatialObjectType_GeometryType,
 				EWKB:        mustDecodeEWKBFromString(t, "010500000002000000010200000002000000000000000000F03F000000000000F03F000000000000004000000000000000400102000000020000000000000000000840000000000000084000000000000010400000000000001040"),
 				SRID:        0,
-				Shape:       geopb.Shape_MultiLineString,
-				BoundingBox: &geopb.BoundingBox{MinX: 1, MaxX: 4, MinY: 1, MaxY: 4},
+				ShapeType:   geopb.ShapeType_MultiLineString,
+				BoundingBox: &geopb.BoundingBox{LoX: 1, HiX: 4, LoY: 1, HiY: 4},
 			},
 		},
 		{
 			"multipolygon",
+			geopb.SpatialObjectType_GeometryType,
 			testGeomMultiPolygon,
 			geopb.SpatialObject{
+				Type:        geopb.SpatialObjectType_GeometryType,
 				EWKB:        mustDecodeEWKBFromString(t, "01060000000200000001030000000100000004000000000000000000F03F000000000000F03F00000000000000400000000000000040000000000000F03F0000000000000040000000000000F03F000000000000F03F0103000000010000000400000000000000000008400000000000000840000000000000104000000000000010400000000000000840000000000000104000000000000008400000000000000840"),
 				SRID:        0,
-				Shape:       geopb.Shape_MultiPolygon,
-				BoundingBox: &geopb.BoundingBox{MinX: 1, MaxX: 4, MinY: 1, MaxY: 4},
+				ShapeType:   geopb.ShapeType_MultiPolygon,
+				BoundingBox: &geopb.BoundingBox{LoX: 1, HiX: 4, LoY: 1, HiY: 4},
 			},
 		},
 		{
 			"geometrycollection",
+			geopb.SpatialObjectType_GeometryType,
 			testGeomGeometryCollection,
 			geopb.SpatialObject{
+				Type:        geopb.SpatialObjectType_GeometryType,
 				EWKB:        mustDecodeEWKBFromString(t, "0107000000020000000101000000000000000000F03F00000000000000400104000000020000000101000000000000000000F03F000000000000F03F010100000000000000000000400000000000000040"),
 				SRID:        0,
-				Shape:       geopb.Shape_GeometryCollection,
-				BoundingBox: &geopb.BoundingBox{MinX: 1, MaxX: 2, MinY: 1, MaxY: 2},
+				ShapeType:   geopb.ShapeType_GeometryCollection,
+				BoundingBox: &geopb.BoundingBox{LoX: 1, HiX: 2, LoY: 1, HiY: 2},
 			},
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			so, err := spatialObjectFromGeom(tc.g)
+			so, err := spatialObjectFromGeomT(tc.g, tc.soType)
 			require.NoError(t, err)
 			require.Equal(t, tc.ret, so)
 		})
@@ -475,41 +559,44 @@ func TestGeographyAsS2(t *testing.T) {
 	}
 }
 
-func TestClipEWKBByRect(t *testing.T) {
-	defer leaktest.AfterTest(t)()
+func TestGeometryAsGeography(t *testing.T) {
+	for _, tc := range []struct {
+		geom string
+		geog string
+	}{
+		{"POINT(1 0)", "SRID=4326;POINT(1 0)"},
+		{"SRID=4004;POINT(1 0)", "SRID=4004;POINT(1 0)"},
+	} {
+		t.Run(tc.geom, func(t *testing.T) {
+			geom, err := ParseGeometry(tc.geom)
+			require.NoError(t, err)
+			geog, err := ParseGeography(tc.geog)
+			require.NoError(t, err)
 
-	var g *Geometry
-	var err error
-	datadriven.RunTest(t, "testdata/clip", func(t *testing.T, d *datadriven.TestData) string {
-		switch d.Cmd {
-		case "geometry":
-			g, err = ParseGeometry(d.Input)
-			if err != nil {
-				return err.Error()
-			}
-			return ""
-		case "clip":
-			var xMin, yMin, xMax, yMax int
-			d.ScanArgs(t, "xmin", &xMin)
-			d.ScanArgs(t, "ymin", &yMin)
-			d.ScanArgs(t, "xmax", &xMax)
-			d.ScanArgs(t, "ymax", &yMax)
-			ewkb, err := geos.ClipEWKBByRect(
-				g.EWKB(), float64(xMin), float64(yMin), float64(xMax), float64(yMax))
-			if err != nil {
-				return err.Error()
-			}
-			// TODO(sumeer):
-			// - add WKB to WKT and print exact output
-			// - expand test with more inputs
-			return fmt.Sprintf(
-				"%d => %d (srid: %d)",
-				len(g.EWKB()),
-				len(ewkb),
-				g.SRID(),
-			)
-		default:
-			return fmt.Sprintf("unknown command: %s", d.Cmd)
-		}
-	})
+			to, err := geom.AsGeography()
+			require.NoError(t, err)
+			require.Equal(t, geog, to)
+		})
+	}
+}
+
+func TestGeographyAsGeometry(t *testing.T) {
+	for _, tc := range []struct {
+		geom string
+		geog string
+	}{
+		{"SRID=4326;POINT(1 0)", "SRID=4326;POINT(1 0)"},
+		{"SRID=4004;POINT(1 0)", "SRID=4004;POINT(1 0)"},
+	} {
+		t.Run(tc.geom, func(t *testing.T) {
+			geom, err := ParseGeometry(tc.geom)
+			require.NoError(t, err)
+			geog, err := ParseGeography(tc.geog)
+			require.NoError(t, err)
+
+			to, err := geog.AsGeometry()
+			require.NoError(t, err)
+			require.Equal(t, geom, to)
+		})
+	}
 }

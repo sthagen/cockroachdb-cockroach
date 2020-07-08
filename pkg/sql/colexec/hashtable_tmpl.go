@@ -21,13 +21,9 @@ package colexec
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
-
-// Remove unused warning.
-var _ = execgen.UNSAFEGET
 
 // {{/*
 
@@ -46,18 +42,6 @@ const _RIGHT_TYPE_WIDTH = 0
 // _ASSIGN_NE is the template equality function for assigning the first input
 // to the result of the the second input != the third input.
 func _ASSIGN_NE(_, _, _, _, _, _ interface{}) int {
-	colexecerror.InternalError("")
-}
-
-// _L_UNSAFEGET is the template function that will be replaced by
-// "execgen.UNSAFEGET" which uses _L_TYP.
-func _L_UNSAFEGET(_, _ interface{}) interface{} {
-	colexecerror.InternalError("")
-}
-
-// _R_UNSAFEGET is the template function that will be replaced by
-// "execgen.UNSAFEGET" which uses _R_TYP.
-func _R_UNSAFEGET(_, _ interface{}) interface{} {
 	colexecerror.InternalError("")
 }
 
@@ -164,8 +148,8 @@ func _CHECK_COL_BODY(
 			} else if buildIsNull {
 				ht.probeScratch.differs[toCheck] = true
 			} else {
-				probeVal := _L_UNSAFEGET(probeKeys, probeIdx)
-				buildVal := _R_UNSAFEGET(buildKeys, buildIdx)
+				probeVal := probeKeys.Get(probeIdx)
+				buildVal := buildKeys.Get(buildIdx)
 				var unique bool
 				_ASSIGN_NE(unique, probeVal, buildVal, _, probeKeys, buildKeys)
 				ht.probeScratch.differs[toCheck] = ht.probeScratch.differs[toCheck] || unique

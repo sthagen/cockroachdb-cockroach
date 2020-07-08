@@ -420,7 +420,7 @@ func foreignKeyMutator(
 				for refI, refCol := range availCols {
 					fkColType := tree.MustBeStaticallyKnownType(fkCol.Type)
 					refColType := tree.MustBeStaticallyKnownType(refCol.Type)
-					if fkColType.Equivalent(refColType) {
+					if fkColType.Equivalent(refColType) && sqlbase.ColumnTypeIsIndexable(refColType) {
 						usingCols = append(usingCols, refCol)
 						availCols = append(availCols[:refI], availCols[refI+1:]...)
 						found = true
@@ -536,7 +536,7 @@ func postgresMutator(rng *rand.Rand, q string) string {
 var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts []tree.Statement) (mutated []tree.Statement, changed bool) {
 	for _, stmt := range stmts {
 		switch stmt := stmt.(type) {
-		case *tree.SetClusterSetting:
+		case *tree.SetClusterSetting, *tree.SetVar:
 			continue
 		case *tree.CreateTable:
 			if stmt.Interleave != nil {

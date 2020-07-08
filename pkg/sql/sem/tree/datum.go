@@ -24,7 +24,7 @@ import (
 	"unicode"
 	"unsafe"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
@@ -971,7 +971,7 @@ func (d *DDecimal) Compare(ctx *EvalContext, other Datum) int {
 	case *DDecimal:
 		v = &t.Decimal
 	case *DInt:
-		v.SetFinite(int64(*t), 0)
+		v.SetInt64(int64(*t))
 	case *DFloat:
 		if _, err := v.SetFloat64(float64(*t)); err != nil {
 			panic(errors.NewAssertionErrorWithWrappedErrf(err, "decimal compare, unexpected error"))
@@ -1427,6 +1427,9 @@ func (d *DBytes) Format(ctx *FmtCtx) {
 	} else {
 		withQuotes := !f.HasFlags(FmtFlags(lex.EncBareStrings))
 		if withQuotes {
+			if f.HasFlags(fmtFormatByteLiterals) {
+				ctx.WriteByte('b')
+			}
 			ctx.WriteByte('\'')
 		}
 		ctx.WriteString("\\x")
@@ -1734,7 +1737,6 @@ type ParseTimeContext interface {
 }
 
 var _ ParseTimeContext = &EvalContext{}
-var _ ParseTimeContext = &SemaContext{}
 var _ ParseTimeContext = &simpleParseTimeContext{}
 
 // NewParseTimeContext constructs a ParseTimeContext that returns
@@ -1765,10 +1767,13 @@ func relativeParseTime(ctx ParseTimeContext) time.Time {
 
 // ParseDDate parses and returns the *DDate Datum value represented by the provided
 // string in the provided location, or an error if parsing is unsuccessful.
-func ParseDDate(ctx ParseTimeContext, s string) (*DDate, error) {
+//
+// The dependsOnContext return value indicates if we had to consult the
+// ParseTimeContext (either for the time or the local timezone).
+func ParseDDate(ctx ParseTimeContext, s string) (_ *DDate, dependsOnContext bool, _ error) {
 	now := relativeParseTime(ctx)
-	t, err := pgdate.ParseDate(now, 0 /* mode */, s)
-	return NewDDate(t), err
+	t, dependsOnContext, err := pgdate.ParseDate(now, 0 /* mode */, s)
+	return NewDDate(t), dependsOnContext, err
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -1889,23 +1894,28 @@ func MakeDTime(t timeofday.TimeOfDay) *DTime {
 
 // ParseDTime parses and returns the *DTime Datum value represented by the
 // provided string, or an error if parsing is unsuccessful.
-func ParseDTime(ctx ParseTimeContext, s string, precision time.Duration) (*DTime, error) {
+//
+// The dependsOnContext return value indicates if we had to consult the
+// ParseTimeContext (either for the time or the local timezone).
+func ParseDTime(
+	ctx ParseTimeContext, s string, precision time.Duration,
+) (_ *DTime, dependsOnContext bool, _ error) {
 	now := relativeParseTime(ctx)
 
 	// Special case on 24:00 and 24:00:00 as the parser
 	// does not handle these correctly.
 	if DTimeMaxTimeRegex.MatchString(s) {
-		return MakeDTime(timeofday.Time2400), nil
+		return MakeDTime(timeofday.Time2400), false, nil
 	}
 
 	s = timeutil.ReplaceLibPQTimePrefix(s)
 
-	t, err := pgdate.ParseTime(now, pgdate.ParseModeYMD, s)
+	t, dependsOnContext, err := pgdate.ParseTimeWithoutTimezone(now, pgdate.ParseModeYMD, s)
 	if err != nil {
 		// Build our own error message to avoid exposing the dummy date.
-		return nil, makeParseError(s, types.Time, nil)
+		return nil, false, makeParseError(s, types.Time, nil)
 	}
-	return MakeDTime(timeofday.FromTime(t).Round(precision)), nil
+	return MakeDTime(timeofday.FromTime(t).Round(precision)), dependsOnContext, nil
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -2024,13 +2034,18 @@ func NewDTimeTZFromLocation(t timeofday.TimeOfDay, loc *time.Location) *DTimeTZ 
 
 // ParseDTimeTZ parses and returns the *DTime Datum value represented by the
 // provided string, or an error if parsing is unsuccessful.
-func ParseDTimeTZ(ctx ParseTimeContext, s string, precision time.Duration) (*DTimeTZ, error) {
+//
+// The dependsOnContext return value indicates if we had to consult the
+// ParseTimeContext (either for the time or the local timezone).
+func ParseDTimeTZ(
+	ctx ParseTimeContext, s string, precision time.Duration,
+) (_ *DTimeTZ, dependsOnContext bool, _ error) {
 	now := relativeParseTime(ctx)
-	d, err := timetz.ParseTimeTZ(now, s, precision)
+	d, dependsOnContext, err := timetz.ParseTimeTZ(now, s, precision)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return NewDTimeTZ(d), nil
+	return NewDTimeTZ(d), dependsOnContext, nil
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -2111,6 +2126,7 @@ func (d *DTimeTZ) Size() uintptr {
 
 // DTimestamp is the timestamp Datum.
 type DTimestamp struct {
+	// Time always has UTC location.
 	time.Time
 }
 
@@ -2143,16 +2159,19 @@ const (
 
 // ParseDTimestamp parses and returns the *DTimestamp Datum value represented by
 // the provided string in UTC, or an error if parsing is unsuccessful.
-func ParseDTimestamp(ctx ParseTimeContext, s string, precision time.Duration) (*DTimestamp, error) {
+//
+// The dependsOnContext return value indicates if we had to consult the
+// ParseTimeContext (either for the time or the local timezone).
+func ParseDTimestamp(
+	ctx ParseTimeContext, s string, precision time.Duration,
+) (_ *DTimestamp, dependsOnContext bool, _ error) {
 	now := relativeParseTime(ctx)
-	t, err := pgdate.ParseTimestamp(now, pgdate.ParseModeYMD, s)
+	t, dependsOnContext, err := pgdate.ParseTimestampWithoutTimezone(now, pgdate.ParseModeYMD, s)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	// Truncate the timezone. DTimestamp doesn't carry its timezone around.
-	_, offset := t.Zone()
-	t = t.Add(time.Duration(offset) * time.Second).UTC()
-	return MakeDTimestamp(t, precision)
+	d, err := MakeDTimestamp(t, precision)
+	return d, dependsOnContext, err
 }
 
 // AsDTimestamp attempts to retrieve a DTimestamp from an Expr, returning a DTimestamp and
@@ -2372,16 +2391,20 @@ func MakeDTimestampTZFromDate(loc *time.Location, d *DDate) (*DTimestampTZ, erro
 
 // ParseDTimestampTZ parses and returns the *DTimestampTZ Datum value represented by
 // the provided string in the provided location, or an error if parsing is unsuccessful.
+//
+// The dependsOnContext return value indicates if we had to consult the
+// ParseTimeContext (either for the time or the local timezone).
 func ParseDTimestampTZ(
 	ctx ParseTimeContext, s string, precision time.Duration,
-) (*DTimestampTZ, error) {
+) (_ *DTimestampTZ, dependsOnContext bool, _ error) {
 	now := relativeParseTime(ctx)
-	t, err := pgdate.ParseTimestamp(now, pgdate.ParseModeYMD, s)
+	t, dependsOnContext, err := pgdate.ParseTimestamp(now, pgdate.ParseModeYMD, s)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// Always normalize time to the current location.
-	return MakeDTimestampTZ(t, precision)
+	d, err := MakeDTimestampTZ(t, precision)
+	return d, dependsOnContext, err
 }
 
 var dZeroTimestampTZ = &DTimestampTZ{}
@@ -2741,7 +2764,7 @@ func (d *DGeography) Compare(ctx *EvalContext, other Datum) int {
 		// NULL is less than any non-NULL value.
 		return 1
 	}
-	return bytes.Compare(d.EWKB(), other.(*DGeography).EWKB())
+	return geo.CompareSpatialObject(d.Geography.SpatialObject(), other.(*DGeography).SpatialObject())
 }
 
 // Prev implements the Datum interface.
@@ -2849,7 +2872,7 @@ func (d *DGeometry) Compare(ctx *EvalContext, other Datum) int {
 		// NULL is less than any non-NULL value.
 		return 1
 	}
-	return bytes.Compare(d.EWKB(), other.(*DGeometry).EWKB())
+	return geo.CompareSpatialObject(d.Geometry.SpatialObject(), other.(*DGeometry).SpatialObject())
 }
 
 // Prev implements the Datum interface.
@@ -2977,6 +3000,8 @@ func AsJSON(d Datum, loc *time.Location) (json.JSON, error) {
 		return json.FromString(string(*t)), nil
 	case *DCollatedString:
 		return json.FromString(t.Contents), nil
+	case *DEnum:
+		return json.FromString(t.LogicalRep), nil
 	case *DJSON:
 		return t.JSON, nil
 	case *DArray:
@@ -3834,10 +3859,39 @@ func MakeDEnumFromLogicalRepresentation(typ *types.T, rep string) (*DEnum, error
 	}, nil
 }
 
+// MakeAllDEnumsInType generates a slice of all values in an enum.
+// TODO (rohany): In the future, take an option of whether to include
+//  non-writeable enum values or not.
+func MakeAllDEnumsInType(typ *types.T) []Datum {
+	result := make([]Datum, len(typ.TypeMeta.EnumData.LogicalRepresentations))
+	for i := 0; i < len(result); i++ {
+		result[i] = &DEnum{
+			EnumTyp:     typ,
+			PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[i],
+			LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[i],
+		}
+	}
+	return result
+}
+
 // Format implements the NodeFormatter interface.
 func (d *DEnum) Format(ctx *FmtCtx) {
-	s := DString(d.LogicalRep)
-	s.Format(ctx)
+	if ctx.HasFlags(fmtStaticallyFormatUserDefinedTypes) {
+		s := DBytes(d.PhysicalRep)
+		// We use the fmtFormatByteLiterals flag here so that the bytes
+		// get formatted as byte literals. Consider an enum of type t with physical
+		// representation \x80. If we don't format this as a bytes literal then
+		// it gets emitted as '\x80':::t. '\x80' is scanned as a string, and we try
+		// to find a logical representation matching '\x80', which won't exist.
+		// Instead, we want to emit b'\x80'::: so that '\x80' is scanned as bytes,
+		// triggering the logic to cast the bytes \x80 to t.
+		ctx.WithFlags(ctx.flags|fmtFormatByteLiterals, func() {
+			s.Format(ctx)
+		})
+	} else {
+		s := DString(d.LogicalRep)
+		s.Format(ctx)
+	}
 }
 
 func (d *DEnum) String() string {

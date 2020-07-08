@@ -118,11 +118,14 @@ type Collection struct {
 	// cache is purged whenever events would cause a scan of all descriptors to
 	// return different values, such as when the txn timestamp changes or when
 	// new descriptors are written in the txn.
-	allDescriptors []sqlbase.DescriptorProto
+	//
+	// TODO(ajwerner): This cache may be problematic in clusters with very large
+	// numbers of descriptors.
+	allDescriptors []sqlbase.DescriptorInterface
 
 	// allDatabaseDescriptors is a slice of all available database descriptors.
 	// These are purged at the same time as allDescriptors.
-	allDatabaseDescriptors []*sqlbase.DatabaseDescriptor
+	allDatabaseDescriptors []*sqlbase.ImmutableDatabaseDescriptor
 
 	// allSchemasForDatabase maps databaseID -> schemaID -> schemaName.
 	// For each databaseID, all schemas visible under the database can be
@@ -326,7 +329,7 @@ func (tc *Collection) GetTableVersion(
 	// system.users. For now we're sticking to disabling caching of
 	// all system descriptors except the role-members-table.
 	avoidCache := flags.AvoidCached || lease.TestingTableLeasesAreDisabled() ||
-		(tn.Catalog() == sqlbase.SystemDB.Name && tn.ObjectName.String() != sqlbase.RoleMembersTable.Name)
+		(tn.Catalog() == sqlbase.SystemDatabaseName && tn.ObjectName.String() != sqlbase.RoleMembersTable.Name)
 
 	if refuseFurtherLookup, table, err := tc.getUncommittedTable(
 		dbID,
@@ -357,14 +360,14 @@ func (tc *Collection) GetTableVersion(
 	// continue to use N to refer to X even if N is renamed during the
 	// transaction.
 	for _, table := range tc.leasedTables {
-		if lease.NameMatchesTable(&table.TableDescriptor, dbID, schemaID, tn.Table()) {
+		if lease.NameMatchesDescriptor(table, dbID, schemaID, tn.Table()) {
 			log.VEventf(ctx, 2, "found table in table collection for table '%s'", tn)
 			return table, nil
 		}
 	}
 
 	readTimestamp := txn.ReadTimestamp()
-	table, expiration, err := tc.leaseMgr.AcquireByName(ctx, readTimestamp, dbID, schemaID, tn.Table())
+	desc, expiration, err := tc.leaseMgr.AcquireByName(ctx, readTimestamp, dbID, schemaID, tn.Table())
 	if err != nil {
 		// Read the descriptor from the store in the face of some specific errors
 		// because of a known limitation of AcquireByName. See the known
@@ -376,6 +379,13 @@ func (tc *Collection) GetTableVersion(
 		// Lease acquisition failed with some other error. This we don't
 		// know how to deal with, so propagate the error.
 		return nil, err
+	}
+	table, ok := desc.(*sqlbase.ImmutableTableDescriptor)
+	if !ok {
+		if flags.Required {
+			return nil, sqlbase.NewUndefinedRelationError(tn)
+		}
+		return nil, nil
 	}
 
 	if expiration.LessEq(readTimestamp) {
@@ -432,7 +442,7 @@ func (tc *Collection) GetTableVersionByID(
 	}
 
 	readTimestamp := txn.ReadTimestamp()
-	table, expiration, err := tc.leaseMgr.Acquire(ctx, readTimestamp, tableID)
+	desc, expiration, err := tc.leaseMgr.Acquire(ctx, readTimestamp, tableID)
 	if err != nil {
 		if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
 			// Transform the descriptor error into an error that references the
@@ -441,6 +451,12 @@ func (tc *Collection) GetTableVersionByID(
 				&tree.TableRef{TableID: int64(tableID)})
 		}
 		return nil, err
+	}
+	// Also return an error if the descriptor isn't a table.
+	table, ok := desc.(*sqlbase.ImmutableTableDescriptor)
+	if !ok {
+		return nil, sqlbase.NewUndefinedRelationError(
+			&tree.TableRef{TableID: int64(tableID)})
 	}
 
 	if expiration.LessEq(readTimestamp) {
@@ -595,7 +611,8 @@ func (tc *Collection) GetTablesWithNewVersion() []lease.IDVersion {
 	var tables []lease.IDVersion
 	for _, table := range tc.uncommittedTables {
 		if mut := table.MutableTableDescriptor; !mut.IsNewTable() {
-			tables = append(tables, lease.NewIDVersionPrev(&mut.ClusterVersion))
+			clusterVer := &mut.ClusterVersion
+			tables = append(tables, lease.NewIDVersionPrev(clusterVer.Name, clusterVer.ID, clusterVer.Version))
 		}
 	}
 	return tables
@@ -691,8 +708,8 @@ func (tc *Collection) getUncommittedTable(
 		}
 
 		// Do we know about a table with this name?
-		if lease.NameMatchesTable(
-			&mutTbl.TableDescriptor,
+		if lease.NameMatchesDescriptor(
+			mutTbl,
 			dbID,
 			schemaID,
 			tn.Table(),
@@ -731,26 +748,26 @@ func (tc *Collection) GetUncommittedTableByID(id sqlbase.ID) UncommittedTable {
 // GetAllDescriptors returns all descriptors visible by the transaction,
 // first checking the Collection's cached descriptors for validity
 // before defaulting to a key-value scan, if necessary.
+//
+// TODO(ajwerner): Have this return []sqlbase.DescriptorInterface.
 func (tc *Collection) GetAllDescriptors(
 	ctx context.Context, txn *kv.Txn,
-) ([]sqlbase.DescriptorProto, error) {
+) ([]sqlbase.DescriptorInterface, error) {
 	if tc.allDescriptors == nil {
 		descs, err := catalogkv.GetAllDescriptors(ctx, txn, tc.codec())
 		if err != nil {
 			return nil, err
 		}
-
 		// There could be tables with user defined types that need hydrating,
 		// so collect the needed information to set up metadata in those types.
-		dbDescs := make(map[sqlbase.ID]*sqlbase.DatabaseDescriptor)
-		typDescs := make(map[sqlbase.ID]*sqlbase.TypeDescriptor)
-		for i := range descs {
-			desc := descs[i]
-			switch t := desc.(type) {
-			case *sqlbase.DatabaseDescriptor:
-				dbDescs[t.ID] = t
-			case *sqlbase.TypeDescriptor:
-				typDescs[t.ID] = t
+		dbDescs := make(map[sqlbase.ID]*sqlbase.ImmutableDatabaseDescriptor)
+		typDescs := make(map[sqlbase.ID]*sqlbase.ImmutableTypeDescriptor)
+		for _, desc := range descs {
+			switch desc := desc.(type) {
+			case *sqlbase.ImmutableDatabaseDescriptor:
+				dbDescs[desc.GetID()] = desc
+			case *sqlbase.ImmutableTypeDescriptor:
+				typDescs[desc.GetID()] = desc
 			}
 		}
 		// If we found any type descriptors, that means that some of the tables we
@@ -759,21 +776,29 @@ func (tc *Collection) GetAllDescriptors(
 			// Since we just scanned all the descriptors, we already have everything
 			// we need to hydrate our types. Set up an accessor for the type hydration
 			// method to look into the scanned set of descriptors.
-			typeLookup := func(id sqlbase.ID) (*tree.TypeName, *sqlbase.TypeDescriptor, error) {
+			typeLookup := func(id sqlbase.ID) (*tree.TypeName, sqlbase.TypeDescriptorInterface, error) {
 				typDesc := typDescs[id]
 				dbDesc := dbDescs[typDesc.ParentID]
-				schemaName, err := resolver.ResolveSchemaNameByID(ctx, txn, tc.codec(), dbDesc.ID, typDesc.ParentSchemaID)
+				if dbDesc == nil {
+					// TODO (rohany): Since DROP TYPE has not been implemented yet
+					//  (see #48363), dropped databases do not yet clean up their
+					//  orphaned child type descriptors. That could lead to dbDesc being
+					//  nil here. Once we support drop type, this check does not need to
+					//  be performed.
+					return nil, nil, errors.Newf("database id %d not found", typDesc.ParentID)
+				}
+				schemaName, err := resolver.ResolveSchemaNameByID(ctx, txn, tc.codec(), dbDesc.GetID(), typDesc.ParentSchemaID)
 				if err != nil {
 					return nil, nil, err
 				}
-				name := tree.MakeNewQualifiedTypeName(dbDesc.Name, schemaName, typDesc.Name)
+				name := tree.MakeNewQualifiedTypeName(dbDesc.GetName(), schemaName, typDesc.GetName())
 				return &name, typDesc, nil
 			}
 			// Now hydrate all table descriptors.
 			for i := range descs {
 				desc := descs[i]
-				if tbl, ok := desc.(*sqlbase.TableDescriptor); ok {
-					if err := sqlbase.HydrateTypesInTableDescriptor(tbl, typeLookup); err != nil {
+				if tblDesc, ok := desc.(*sqlbase.ImmutableTableDescriptor); ok {
+					if err := sqlbase.HydrateTypesInTableDescriptor(tblDesc.TableDesc(), typeLookup); err != nil {
 						// If we ran into an error hydrating the types, that means that we
 						// have some sort of corrupted descriptor state. Rather than disable
 						// uses of GetAllDescriptors, just log the error.
@@ -794,7 +819,7 @@ func (tc *Collection) GetAllDescriptors(
 // in the database cache, if necessary.
 func (tc *Collection) GetAllDatabaseDescriptors(
 	ctx context.Context, txn *kv.Txn,
-) ([]*sqlbase.DatabaseDescriptor, error) {
+) ([]*sqlbase.ImmutableDatabaseDescriptor, error) {
 	if tc.allDatabaseDescriptors == nil {
 		dbDescIDs, err := catalogkv.GetAllDatabaseDescriptorIDs(ctx, txn, tc.codec())
 		if err != nil {

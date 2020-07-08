@@ -81,20 +81,59 @@ func ScopeWithoutShowLogs(t tShim) *TestLogScope {
 // enableLogFileOutput turns on logging using the specified directory.
 // For unittesting only.
 func enableLogFileOutput(dir string, stderrSeverity Severity) (func(), error) {
-	mainLog.mu.Lock()
-	defer mainLog.mu.Unlock()
-	oldStderrThreshold := logging.stderrThreshold.get()
-	oldNoStderrRedirect := mainLog.noStderrRedirect
-
-	undo := func() {
+	oldStderrThreshold, err := func() (Severity, error) {
 		mainLog.mu.Lock()
 		defer mainLog.mu.Unlock()
-		logging.stderrThreshold.set(oldStderrThreshold)
-		mainLog.noStderrRedirect = oldNoStderrRedirect
+
+		return mainLog.stderrThreshold.get(), mainLog.logDir.Set(dir)
+	}()
+	if err != nil {
+		return nil, err
 	}
-	logging.stderrThreshold.set(stderrSeverity)
-	mainLog.noStderrRedirect = true
-	return undo, mainLog.logDir.Set(dir)
+
+	var cancelStderr func()
+	undo := func() {
+		if cancelStderr != nil {
+			cancelStderr()
+			_ = hijackStderr(OrigStderr)
+		}
+
+		mainLog.mu.Lock()
+		defer mainLog.mu.Unlock()
+		mainLog.stderrThreshold.set(oldStderrThreshold)
+	}
+
+	mainLog.stderrThreshold.set(stderrSeverity)
+	cancelStderr, err = SetupRedactionAndStderrRedirects()
+	return undo, err
+}
+
+// Rotate closes the current log files so that the next log call will
+// reopen them with current settings. This is useful when e.g. a test
+// changes the logging configuration after opening a test log scope.
+func (l *TestLogScope) Rotate(t tShim) {
+	// Ensure remaining logs are written.
+	Flush()
+
+	func() {
+		mainLog.mu.Lock()
+		defer mainLog.mu.Unlock()
+		if err := mainLog.closeFileLocked(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	secondaryLogRegistry.mu.Lock()
+	defer secondaryLogRegistry.mu.Unlock()
+	for _, l := range secondaryLogRegistry.mu.loggers {
+		func() {
+			l.logger.mu.Lock()
+			defer l.logger.mu.Unlock()
+			if err := l.logger.closeFileLocked(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+	}
 }
 
 // Close cleans up a TestLogScope. The directory and its contents are

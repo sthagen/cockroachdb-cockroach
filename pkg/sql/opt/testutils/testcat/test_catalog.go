@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -733,6 +734,13 @@ type Index struct {
 	// partitionBy is the partitioning clause that corresponds to this index. Used
 	// to implement PartitionByListPrefixes.
 	partitionBy *tree.PartitionBy
+
+	// predicate is the partial index predicate expression, if it exists.
+	predicate string
+
+	// geoConfig is the geospatial index configuration, if this is a geospatial
+	// inverted index. Otherwise geoConfig is nil.
+	geoConfig *geoindex.Config
 }
 
 // ID is part of the cat.Index interface.
@@ -793,6 +801,13 @@ func (ti *Index) Zone() cat.Zone {
 // Span is part of the cat.Index interface.
 func (ti *Index) Span() roachpb.Span {
 	panic("not implemented")
+}
+
+// Predicate is part of the cat.Index interface. It returns the predicate
+// expression and true if the index is a partial index. If the index is not
+// partial, the empty string and false is returned.
+func (ti *Index) Predicate() (string, bool) {
+	return ti.predicate, ti.predicate != ""
 }
 
 // PartitionByListPrefixes is part of the cat.Index interface.
@@ -874,6 +889,11 @@ func (ti *Index) InterleavedByCount() int {
 // InterleavedBy is part of the cat.Index interface.
 func (ti *Index) InterleavedBy(i int) (table, index cat.StableID) {
 	panic("no interleavings")
+}
+
+// GeoConfig is part of the cat.Index interface.
+func (ti *Index) GeoConfig() *geoindex.Config {
+	return ti.geoConfig
 }
 
 // Column implements the cat.Column interface for testing purposes.
@@ -971,7 +991,7 @@ var _ cat.TableStatistic = &TableStat{}
 
 // CreatedAt is part of the cat.TableStatistic interface.
 func (ts *TableStat) CreatedAt() time.Time {
-	d, err := tree.ParseDTimestamp(nil, ts.js.CreatedAt, time.Microsecond)
+	d, _, err := tree.ParseDTimestamp(nil, ts.js.CreatedAt, time.Microsecond)
 	if err != nil {
 		panic(err)
 	}

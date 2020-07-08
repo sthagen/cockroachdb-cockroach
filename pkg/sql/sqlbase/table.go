@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/text/language"
@@ -37,7 +38,7 @@ func SanitizeVarFreeExpr(
 	expectedType *types.T,
 	context string,
 	semaCtx *tree.SemaContext,
-	allowImpure bool,
+	maxVolatility tree.Volatility,
 ) (tree.TypedExpr, error) {
 	if tree.ContainsVars(expr) {
 		return nil, pgerror.Newf(pgcode.Syntax,
@@ -51,8 +52,22 @@ func SanitizeVarFreeExpr(
 
 	// Ensure that the expression doesn't contain special functions.
 	flags := tree.RejectSpecial
-	if !allowImpure {
-		flags |= tree.RejectImpureFunctions
+
+	switch maxVolatility {
+	case tree.VolatilityImmutable:
+		// TODO(radu): we only check the volatility of functions; we need to check
+		// the volatility of operators and casts as well!
+		flags |= tree.RejectStableFunctions
+		fallthrough
+
+	case tree.VolatilityStable:
+		flags |= tree.RejectVolatileFunctions
+
+	case tree.VolatilityVolatile:
+		// Allow anything (no flags needed).
+
+	default:
+		panic(errors.AssertionFailedf("maxVolatility %s not supported", maxVolatility))
 	}
 	semaCtx.Properties.Require(context, flags)
 
@@ -173,7 +188,7 @@ func MakeColumnDefDescs(
 		// and does not contain invalid functions.
 		var err error
 		if typedExpr, err = SanitizeVarFreeExpr(
-			ctx, d.DefaultExpr.Expr, resType, "DEFAULT", semaCtx, true, /* allowImpure */
+			ctx, d.DefaultExpr.Expr, resType, "DEFAULT", semaCtx, tree.VolatilityVolatile,
 		); err != nil {
 			return nil, nil, nil, err
 		}
@@ -234,7 +249,7 @@ func EvalShardBucketCount(
 ) (int32, error) {
 	const invalidBucketCountMsg = `BUCKET_COUNT must be an integer greater than 1`
 	typedExpr, err := SanitizeVarFreeExpr(
-		ctx, shardBuckets, types.Int, "BUCKET_COUNT", semaCtx, true, /* allowImpure */
+		ctx, shardBuckets, types.Int, "BUCKET_COUNT", semaCtx, tree.VolatilityVolatile,
 	)
 	if err != nil {
 		return 0, err
@@ -372,7 +387,7 @@ func (desc *TableDescriptor) collectConstraintInfo(
 ) (map[string]ConstraintDetail, error) {
 	info := make(map[string]ConstraintDetail)
 
-	// Indexes provide PK, Unique and FK constraints.
+	// Indexes provide PK and Unique constraints.
 	indexes := desc.AllNonDropIndexes()
 	for _, index := range indexes {
 		if index.ID == desc.PrimaryIndex.ID {
@@ -579,9 +594,12 @@ func FindFKOriginIndexInTxn(
 // ConditionFailedError on mismatch. We don't directly use CPut with protos
 // because the marshaling is not guaranteed to be stable and also because it's
 // sensitive to things like missing vs default values of fields.
+//
+// TODO(ajwerner): Make this take a TableDescriptorInterface and probably add
+// an equality method on that interface or something like that.
 func ConditionalGetTableDescFromTxn(
 	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, expectation *TableDescriptor,
-) (*roachpb.Value, error) {
+) ([]byte, error) {
 	key := MakeDescMetadataKey(codec, expectation.ID)
 	existingKV, err := txn.Get(ctx, key)
 	if err != nil {
@@ -596,11 +614,11 @@ func ConditionalGetTableDescFromTxn(
 		}
 		existing.Table(existingKV.Value.Timestamp)
 	}
-	wrapped := WrapDescriptor(expectation)
+	wrapped := wrapDescriptor(expectation)
 	if !existing.Equal(wrapped) {
 		return nil, &roachpb.ConditionFailedError{ActualValue: existingKV.Value}
 	}
-	return existingKV.Value, nil
+	return existingKV.Value.TagAndDataBytes(), nil
 }
 
 // FilterTableState inspects the state of a given table and returns an error if
@@ -643,4 +661,45 @@ func HasAddingTableError(err error) bool {
 // inactiveTableError.
 func HasInactiveTableError(err error) bool {
 	return errors.HasType(err, (*inactiveTableError)(nil))
+}
+
+// InitTableDescriptor returns a blank TableDescriptor.
+func InitTableDescriptor(
+	id, parentID, parentSchemaID ID,
+	name string,
+	creationTime hlc.Timestamp,
+	privileges *PrivilegeDescriptor,
+	temporary bool,
+) MutableTableDescriptor {
+	return MutableTableDescriptor{TableDescriptor: TableDescriptor{
+		ID:                      id,
+		Name:                    name,
+		ParentID:                parentID,
+		UnexposedParentSchemaID: parentSchemaID,
+		FormatVersion:           InterleavedFormatVersion,
+		Version:                 1,
+		ModificationTime:        creationTime,
+		Privileges:              privileges,
+		CreateAsOfTime:          creationTime,
+		Temporary:               temporary,
+	}}
+}
+
+// NewMutableTableDescriptorAsReplacement creates a new MutableTableDescriptor
+// as a replacement of an existing table. This is utilized with truncate.
+//
+// The passed readTimestamp is serialized into the descriptor's ReplacementOf
+// field for debugging purposes. The passed id will be the ID of the newly
+// returned replacement.
+func NewMutableTableDescriptorAsReplacement(
+	id ID, replacementOf *MutableTableDescriptor, readTimestamp hlc.Timestamp,
+) *MutableTableDescriptor {
+	replacement := &MutableTableDescriptor{TableDescriptor: replacementOf.TableDescriptor}
+	replacement.ID = id
+	replacement.Version = 1
+	replacement.ReplacementOf = TableDescriptor_Replacement{
+		ID:   replacementOf.ID,
+		Time: readTimestamp,
+	}
+	return replacement
 }

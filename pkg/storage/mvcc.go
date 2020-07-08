@@ -1869,9 +1869,10 @@ const (
 	CPutFailIfMissing CPutMissingBehavior = false
 )
 
-// MVCCConditionalPut sets the value for a specified key only if the
-// expected value matches. If not, the return a ConditionFailedError
-// containing the actual value.
+// MVCCConditionalPut sets the value for a specified key only if the expected
+// value matches. If not, the return a ConditionFailedError containing the
+// actual value. An empty expVal signifies that the key is expected to not
+// exist.
 //
 // The condition check reads a value from the key using the same operational
 // timestamp as we use to write a value.
@@ -1879,6 +1880,10 @@ const (
 // Note that, when writing transactionally, the txn's timestamps
 // dictate the timestamp of the operation, and the timestamp paramater is
 // confusing and redundant. See the comment on mvccPutInternal for details.
+//
+// An empty expVal means that the key is expected to not exist. If not empty,
+// expValue needs to correspond to a Value.TagAndDataBytes() - i.e. a key's
+// value without the checksum (as the checksum includes the key too).
 func MVCCConditionalPut(
 	ctx context.Context,
 	rw ReadWriter,
@@ -1886,7 +1891,7 @@ func MVCCConditionalPut(
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	value roachpb.Value,
-	expVal *roachpb.Value,
+	expVal []byte,
 	allowIfDoesNotExist CPutMissingBehavior,
 	txn *roachpb.Transaction,
 ) error {
@@ -1912,7 +1917,7 @@ func MVCCBlindConditionalPut(
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	value roachpb.Value,
-	expVal *roachpb.Value,
+	expVal []byte,
 	allowIfDoesNotExist CPutMissingBehavior,
 	txn *roachpb.Transaction,
 ) error {
@@ -1927,16 +1932,15 @@ func mvccConditionalPutUsingIter(
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	value roachpb.Value,
-	expVal *roachpb.Value,
+	expBytes []byte,
 	allowNoExisting CPutMissingBehavior,
 	txn *roachpb.Transaction,
 ) error {
 	return mvccPutUsingIter(
 		ctx, writer, iter, ms, key, timestamp, noValue, txn,
 		func(existVal *roachpb.Value) ([]byte, error) {
-			if expValPresent, existValPresent := expVal != nil, existVal.IsPresent(); expValPresent && existValPresent {
-				// Every type flows through here, so we can't use the typed getters.
-				if !expVal.EqualData(*existVal) {
+			if expValPresent, existValPresent := len(expBytes) != 0, existVal.IsPresent(); expValPresent && existValPresent {
+				if !bytes.Equal(expBytes, existVal.TagAndDataBytes()) {
 					return nil, &roachpb.ConditionFailedError{
 						ActualValue: existVal.ShallowClone(),
 					}
@@ -2013,7 +2017,7 @@ func mvccInitPutUsingIter(
 				// We found a tombstone and failOnTombstones is true: fail.
 				return nil, &roachpb.ConditionFailedError{ActualValue: existVal.ShallowClone()}
 			}
-			if existVal.IsPresent() && !existVal.EqualData(value) {
+			if existVal.IsPresent() && !existVal.EqualTagAndData(value) {
 				// The existing value does not match the supplied value.
 				return nil, &roachpb.ConditionFailedError{
 					ActualValue: existVal.ShallowClone(),
@@ -2526,9 +2530,11 @@ type MVCCScanResult struct {
 //
 // When scanning in "fail on more recent" mode, a WriteTooOldError will be
 // returned if the scan observes a version with a timestamp above the read
-// timestamp. Similarly, a WriteIntentError will be returned if the scan
-// observes another transaction's intent, even if it has a timestamp above
-// the read timestamp.
+// timestamp. If the scan observes multiple versions with timestamp above
+// the read timestamp, the maximum will be returned in the WriteTooOldError.
+// Similarly, a WriteIntentError will be returned if the scan observes
+// another transaction's intent, even if it has a timestamp above the read
+// timestamp.
 func MVCCScan(
 	ctx context.Context,
 	reader Reader,
@@ -3334,17 +3340,20 @@ func MVCCFindSplitKey(
 		return nil, nil
 	}
 	var minSplitKey roachpb.Key
-	if _, _, err := keys.TODOSQLCodec.DecodeTablePrefix(it.UnsafeKey().Key); err == nil {
-		// The first key in this range represents a row in a SQL table. Advance the
-		// minSplitKey past this row to avoid the problems described above.
-		firstRowKey, err := keys.EnsureSafeSplitKey(it.Key().Key)
-		if err != nil {
-			return nil, err
+	if _, tenID, err := keys.DecodeTenantPrefix(it.UnsafeKey().Key); err == nil {
+		if _, _, err := keys.MakeSQLCodec(tenID).DecodeTablePrefix(it.UnsafeKey().Key); err == nil {
+			// The first key in this range represents a row in a SQL table. Advance the
+			// minSplitKey past this row to avoid the problems described above.
+			firstRowKey, err := keys.EnsureSafeSplitKey(it.Key().Key)
+			if err != nil {
+				return nil, err
+			}
+			// Allow a split key before other rows in the same table or before any
+			// rows in interleaved tables.
+			minSplitKey = encoding.EncodeInterleavedSentinel(firstRowKey)
 		}
-		// Allow a split key before other rows in the same table or before any
-		// rows in interleaved tables.
-		minSplitKey = encoding.EncodeInterleavedSentinel(firstRowKey)
-	} else {
+	}
+	if minSplitKey == nil {
 		// The first key in the range does not represent a row in a SQL table.
 		// Allow a split at any key that sorts after it.
 		minSplitKey = it.Key().Key.Next()

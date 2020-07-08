@@ -24,7 +24,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -48,11 +48,24 @@ import (
 
 // This file contains utility functions for tests (in other packages).
 
-// GetTableDescriptor retrieves a table descriptor directly from the KV layer.
-func GetTableDescriptor(
+// TestingGetMutableExistingTableDescriptor retrieves a MutableTableDescriptor
+// directly from the KV layer.
+func TestingGetMutableExistingTableDescriptor(
+	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
+) *MutableTableDescriptor {
+	return NewMutableExistingTableDescriptor(*TestingGetTableDescriptor(kvDB, codec, database, table))
+}
+
+// TestingGetTableDescriptor retrieves a table descriptor directly from the KV
+// layer.
+//
+// TODO(ajwerner): Move this to catalogkv and/or question the very existence of
+// this function. Consider renaming to TestingGetTableDescriptorByName or
+// removing it altogether.
+func TestingGetTableDescriptor(
 	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
 ) *TableDescriptor {
-	// log.VEventf(context.TODO(), 2, "GetTableDescriptor %q %q", database, table)
+	// log.VEventf(context.TODO(), 2, "TestingGetTableDescriptor %q %q", database, table)
 	// testutil, so we pass settings as nil for both database and table name keys.
 	dKey := NewDatabaseKey(database)
 	ctx := context.TODO()
@@ -77,7 +90,7 @@ func GetTableDescriptor(
 	descKey := MakeDescMetadataKey(codec, ID(gr.ValueInt()))
 	desc := &Descriptor{}
 	ts, err := kvDB.GetProtoTs(ctx, descKey, desc)
-	if err != nil || (*desc == Descriptor{}) {
+	if err != nil || desc.Equal(Descriptor{}) {
 		log.Fatalf(ctx, "proto with id %d missing. err: %v", gr.ValueInt(), err)
 	}
 	tableDesc := desc.Table(ts)
@@ -91,11 +104,12 @@ func GetTableDescriptor(
 	return tableDesc
 }
 
-// GetImmutableTableDescriptor retrieves an immutable table descriptor directly from the KV layer.
-func GetImmutableTableDescriptor(
+// TestingGetImmutableTableDescriptor retrieves an immutable table descriptor
+// directly from the KV layer.
+func TestingGetImmutableTableDescriptor(
 	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
 ) *ImmutableTableDescriptor {
-	return NewImmutableTableDescriptor(*GetTableDescriptor(kvDB, codec, database, table))
+	return NewImmutableTableDescriptor(*TestingGetTableDescriptor(kvDB, codec, database, table))
 }
 
 // RandDatum generates a random Datum of the given type.
@@ -159,12 +173,12 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 	case types.GeographyFamily:
 		// TODO(otan): generate fake data properly.
 		return tree.NewDGeography(
-			geo.MustParseGeographyFromEWKBRaw([]byte("\x01\x01\x00\x00\x20\xe6\x10\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f")),
+			geo.MustParseGeographyFromEWKB([]byte("\x01\x01\x00\x00\x20\xe6\x10\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f")),
 		)
 	case types.GeometryFamily:
 		// TODO(otan): generate fake data properly.
 		return tree.NewDGeometry(
-			geo.MustParseGeometryFromEWKBRaw([]byte("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f")),
+			geo.MustParseGeometryFromEWKB([]byte("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f")),
 		)
 	case types.DecimalFamily:
 		d := &tree.DDecimal{}
@@ -271,8 +285,21 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 	case types.AnyFamily:
 		return RandDatumWithNullChance(rng, RandType(rng), nullChance)
 	case types.EnumFamily:
-		// We don't yet have the ability to generate random user defined types.
-		return tree.DNull
+		// If the input type is not hydrated with metadata, or doesn't contain
+		// any enum values, then return NULL.
+		if typ.TypeMeta.EnumData == nil {
+			return tree.DNull
+		}
+		reps := typ.TypeMeta.EnumData.LogicalRepresentations
+		if len(reps) == 0 {
+			return tree.DNull
+		}
+		// Otherwise, pick a random enum value.
+		d, err := tree.MakeDEnumFromLogicalRepresentation(typ, reps[rng.Intn(len(reps))])
+		if err != nil {
+			panic(err)
+		}
+		return d
 	default:
 		panic(fmt.Sprintf("invalid type %v", typ.DebugString()))
 	}
@@ -677,13 +704,13 @@ var (
 )
 
 var (
-	// seedTypes includes the following types that form the basis of randomly
+	// SeedTypes includes the following types that form the basis of randomly
 	// generated types:
 	//   - All scalar types, except UNKNOWN and ANY
 	//   - ARRAY of ANY, where the ANY will be replaced with one of the legal
 	//     array element types in RandType
 	//   - OIDVECTOR and INT2VECTOR types
-	seedTypes []*types.T
+	SeedTypes []*types.T
 
 	// arrayContentsTypes contains all of the types that are valid to store within
 	// an array.
@@ -698,11 +725,11 @@ func init() {
 			// Don't include these.
 		case oid.T_anyarray, oid.T_oidvector, oid.T_int2vector:
 			// Include these.
-			seedTypes = append(seedTypes, typ)
+			SeedTypes = append(SeedTypes, typ)
 		default:
 			// Only include scalar types.
 			if typ.Family() != types.ArrayFamily {
-				seedTypes = append(seedTypes, typ)
+				SeedTypes = append(SeedTypes, typ)
 			}
 		}
 	}
@@ -724,8 +751,8 @@ func init() {
 	}
 
 	// Sort these so randomly chosen indexes always point to the same element.
-	sort.Slice(seedTypes, func(i, j int) bool {
-		return seedTypes[i].String() < seedTypes[j].String()
+	sort.Slice(SeedTypes, func(i, j int) bool {
+		return SeedTypes[i].String() < SeedTypes[j].String()
 	})
 	sort.Slice(arrayContentsTypes, func(i, j int) bool {
 		return arrayContentsTypes[i].String() < arrayContentsTypes[j].String()
@@ -784,21 +811,17 @@ func RandCollationLocale(rng *rand.Rand) *string {
 
 // RandType returns a random type value.
 func RandType(rng *rand.Rand) *types.T {
-	return randType(rng, seedTypes)
-}
-
-// RandScalarType returns a random type value that is not an array or tuple.
-func RandScalarType(rng *rand.Rand) *types.T {
-	return randType(rng, types.Scalar)
+	return RandTypeFromSlice(rng, SeedTypes)
 }
 
 // RandArrayContentsType returns a random type that's guaranteed to be valid to
 // use as the contents of an array.
 func RandArrayContentsType(rng *rand.Rand) *types.T {
-	return randType(rng, arrayContentsTypes)
+	return RandTypeFromSlice(rng, arrayContentsTypes)
 }
 
-func randType(rng *rand.Rand, typs []*types.T) *types.T {
+// RandTypeFromSlice returns a random type from the input slice of types.
+func RandTypeFromSlice(rng *rand.Rand, typs []*types.T) *types.T {
 	typ := typs[rng.Intn(len(typs))]
 	switch typ.Family() {
 	case types.BitFamily:
@@ -1136,7 +1159,15 @@ func RandCreateTableWithInterleave(
 		extraCols := make([]*tree.ColumnTableDef, nColumns)
 		// Add more columns to the table.
 		for i := range extraCols {
-			extraCol := randColumnTableDef(rng, tableIdx, i+prefixLength)
+			// Loop until we generate an indexable column type.
+			var extraCol *tree.ColumnTableDef
+			for {
+				extraCol = randColumnTableDef(rng, tableIdx, i+prefixLength)
+				extraColType := tree.MustBeStaticallyKnownType(extraCol.Type)
+				if ColumnTypeIsIndexable(extraColType) {
+					break
+				}
+			}
 			extraCols[i] = extraCol
 			columnDefs = append(columnDefs, extraCol)
 			defs = append(defs, extraCol)
@@ -1407,7 +1438,7 @@ func randIndexTableDefFromCols(
 	indexElemList := make(tree.IndexElemList, 0, len(cols))
 	for i := range cols {
 		semType := tree.MustBeStaticallyKnownType(cols[i].Type)
-		if MustBeValueEncoded(semType) {
+		if !ColumnTypeIsIndexable(semType) {
 			continue
 		}
 		indexElemList = append(indexElemList, tree.IndexElem{
@@ -1523,4 +1554,41 @@ func MakeRepeatedIntRows(n int, numRows int, numCols int) EncDatumRows {
 		}
 	}
 	return rows
+}
+
+// RandString generates a random string of the desired length from the
+// input alphaget.
+func RandString(rng *rand.Rand, length int, alphabet string) string {
+	buf := make([]byte, length)
+	for i := range buf {
+		buf[i] = alphabet[rng.Intn(len(alphabet))]
+	}
+	return string(buf)
+}
+
+// RandCreateType creates a random CREATE TYPE statement. The resulting
+// type's name will be name, and if the type is an enum, the members will
+// be random strings generated from alphabet.
+func RandCreateType(rng *rand.Rand, name, alphabet string) tree.Statement {
+	numLabels := rng.Intn(6) + 1
+	labels := make([]string, numLabels)
+	labelsMap := make(map[string]struct{})
+	i := 0
+	for i < numLabels {
+		s := RandString(rng, rng.Intn(6)+1, alphabet)
+		if _, ok := labelsMap[s]; !ok {
+			labels[i] = s
+			labelsMap[s] = struct{}{}
+			i++
+		}
+	}
+	un, err := tree.NewUnresolvedObjectName(1, [3]string{name}, 0)
+	if err != nil {
+		panic(err)
+	}
+	return &tree.CreateType{
+		TypeName:   un,
+		Variety:    tree.Enum,
+		EnumLabels: labels,
+	}
 }

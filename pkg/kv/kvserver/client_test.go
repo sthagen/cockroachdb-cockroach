@@ -25,6 +25,7 @@ import (
 	"net"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -126,8 +127,13 @@ func createTestStoreWithOpts(
 	ac := log.AmbientContext{Tracer: tracer}
 	storeCfg.AmbientCtx = ac
 
-	rpcContext := rpc.NewContext(
-		ac, &base.Config{Insecure: true}, storeCfg.Clock, stopper, storeCfg.Settings)
+	rpcContext := rpc.NewContext(rpc.ContextOptions{
+		AmbientCtx: ac,
+		Config:     &base.Config{Insecure: true},
+		Clock:      storeCfg.Clock,
+		Stopper:    stopper,
+		Settings:   storeCfg.Settings,
+	})
 	// Ensure that tests using this test context and restart/shut down
 	// their servers do not inadvertently start talking to servers from
 	// unrelated concurrent tests.
@@ -150,15 +156,17 @@ func createTestStoreWithOpts(
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.Closer = stopper.ShouldQuiesce()
 	distSender := kvcoord.NewDistSender(kvcoord.DistSenderConfig{
-		AmbientCtx: ac,
-		Clock:      storeCfg.Clock,
-		Settings:   storeCfg.Settings,
-		RPCContext: rpcContext,
+		AmbientCtx:         ac,
+		Settings:           storeCfg.Settings,
+		Clock:              storeCfg.Clock,
+		NodeDescs:          storeCfg.Gossip,
+		RPCContext:         rpcContext,
+		RPCRetryOptions:    &retryOpts,
+		FirstRangeProvider: storeCfg.Gossip,
 		TestingKnobs: kvcoord.ClientTestingKnobs{
 			TransportFactory: kvcoord.SenderTransportFactory(tracer, stores),
 		},
-		RPCRetryOptions: &retryOpts,
-	}, storeCfg.Gossip)
+	})
 
 	tcsFactory := kvcoord.NewTxnCoordSenderFactory(
 		kvcoord.TxnCoordSenderFactoryConfig{
@@ -273,7 +281,7 @@ type multiTestContext struct {
 	transport  *kvserver.RaftTransport
 
 	// The per-store clocks slice normally contains aliases of
-	// multiTestContext.clock, but it may be populated before Start() to
+	// multiTestContext.clock, but it may be populleaseholderInfoated before Start() to
 	// use distinct clocks per store.
 	clocks      []*hlc.Clock
 	engines     []storage.Engine
@@ -363,8 +371,14 @@ func (m *multiTestContext) Start(t testing.TB, numStores int) {
 	}
 	st := cluster.MakeTestingClusterSettings()
 	if m.rpcContext == nil {
-		m.rpcContext = rpc.NewContextWithTestingKnobs(log.AmbientContext{Tracer: st.Tracer}, &base.Config{Insecure: true}, m.clock(),
-			m.transportStopper, st, m.rpcTestingKnobs)
+		m.rpcContext = rpc.NewContext(rpc.ContextOptions{
+			AmbientCtx: log.AmbientContext{Tracer: st.Tracer},
+			Config:     &base.Config{Insecure: true},
+			Clock:      m.clock(),
+			Stopper:    m.transportStopper,
+			Settings:   st,
+			Knobs:      m.rpcTestingKnobs,
+		})
 		// Ensure that tests using this test context and restart/shut down
 		// their servers do not inadvertently start talking to servers from
 		// unrelated concurrent tests.
@@ -554,6 +568,13 @@ func (t *multiTestContextKVTransport) IsExhausted() bool {
 	return t.idx == len(t.replicas)
 }
 
+// magicMultiTestContextKVTransportError can be returned by kvserver from an RPC
+// to ask the multiTestContextKVTransport to inject an RPC error. This will
+// cause the DistSender to consider the result ambiguous and to try the next
+// replica. This is useful for triggering DistSender retries *after* the request
+// has already evaluated.
+const magicMultiTestContextKVTransportError = "inject RPC error (magicMultiTestContextKVTransportError)"
+
 func (t *multiTestContextKVTransport) SendNext(
 	ctx context.Context, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, error) {
@@ -583,7 +604,7 @@ func (t *multiTestContextKVTransport) SendNext(
 
 	if s == nil {
 		t.setPending(rep.ReplicaID, false)
-		return nil, roachpb.NewSendError("store is stopped")
+		return nil, errors.New("store is stopped")
 	}
 
 	// Clone txn of ba args for sending.
@@ -597,6 +618,11 @@ func (t *multiTestContextKVTransport) SendNext(
 		br, pErr = sender.Send(ctx, ba)
 	}); err != nil {
 		pErr = roachpb.NewError(err)
+	}
+	if pErr != nil && strings.Contains(pErr.GoError().Error(), magicMultiTestContextKVTransportError) {
+		// We've been asked to inject an RPC error. This will cause the DistSender
+		// to consider the result ambiguous and to try the next replica.
+		return nil, errors.New("error injected by multiTestContextKVTransport after request has been evaluated")
 	}
 	if br == nil {
 		br = &roachpb.BatchResponse{}
@@ -645,6 +671,13 @@ func (t *multiTestContextKVTransport) NextReplica() roachpb.ReplicaDescriptor {
 		return roachpb.ReplicaDescriptor{}
 	}
 	return t.replicas[t.idx].ReplicaDescriptor
+}
+
+func (t *multiTestContextKVTransport) SkipReplica() {
+	if t.IsExhausted() {
+		return
+	}
+	t.idx++
 }
 
 func (t *multiTestContextKVTransport) MoveToFront(replica roachpb.ReplicaDescriptor) {
@@ -769,6 +802,7 @@ func (m *multiTestContext) populateDB(idx int, st *cluster.Settings, stopper *st
 	m.distSenders[idx] = kvcoord.NewDistSender(kvcoord.DistSenderConfig{
 		AmbientCtx: ambient,
 		Clock:      m.clocks[idx],
+		NodeDescs:  m.gossips[idx],
 		RPCContext: m.rpcContext,
 		RangeDescriptorDB: mtcRangeDescriptorDB{
 			multiTestContext: m,
@@ -779,7 +813,7 @@ func (m *multiTestContext) populateDB(idx int, st *cluster.Settings, stopper *st
 			TransportFactory: m.kvTransportFactory,
 		},
 		RPCRetryOptions: &retryOpts,
-	}, m.gossips[idx])
+	})
 	tcsFactory := kvcoord.NewTxnCoordSenderFactory(
 		kvcoord.TxnCoordSenderFactoryConfig{
 			AmbientCtx: ambient,

@@ -1,4 +1,3 @@
-# LogicTest: !3node-tenant
 statement ok
 CREATE TABLE with_no_column_refs (
   a INT,
@@ -13,7 +12,7 @@ SHOW CREATE TABLE with_no_column_refs
 with_no_column_refs  CREATE TABLE with_no_column_refs (
                      a INT8 NULL,
                      b INT8 NULL,
-                     c INT8 NULL AS (3) STORED,
+                     c INT8 NULL AS (3:::INT8) STORED,
                      FAMILY "primary" (a, b, c, rowid)
 )
 
@@ -31,7 +30,7 @@ SHOW CREATE TABLE extra_parens
 extra_parens  CREATE TABLE extra_parens (
               a INT8 NULL,
               b INT8 NULL,
-              c INT8 NULL AS ((3)) STORED,
+              c INT8 NULL AS (3:::INT8) STORED,
               FAMILY "primary" (a, b, c, rowid)
 )
 
@@ -290,14 +289,14 @@ CREATE TABLE y (
   b INT AS (a) STORED
 )
 
-statement error impure functions are not allowed in computed column
+statement error context-dependent functions are not allowed in computed column
 CREATE TABLE y (
   a TIMESTAMP AS (now()) STORED
 )
 
-statement error impure functions are not allowed in computed column
+statement error volatile functions are not allowed in computed column
 CREATE TABLE y (
-  a STRING AS (concat(now()::STRING, uuid_v4()::STRING)) STORED
+  a STRING AS (concat('foo', uuid_v4()::STRING)) STORED
 )
 
 statement error computed columns cannot reference other computed columns
@@ -674,8 +673,8 @@ SHOW CREATE TABLE x
 ----
 x  CREATE TABLE x (
    a INT8 NULL,
-   b INT8 NULL AS (a * 2) STORED,
-   c INT8 NOT NULL AS (a + 4) STORED,
+   b INT8 NULL AS (a * 2:::INT8) STORED,
+   c INT8 NOT NULL AS (a + 4:::INT8) STORED,
    FAMILY "primary" (a, b, rowid, c)
 )
 
@@ -787,7 +786,7 @@ query TT
 SHOW CREATE t42418
 ----
 t42418  CREATE TABLE t42418 (
-        x INT8 NULL AS (1) STORED,
-        y INT8 NULL AS (1) STORED,
+        x INT8 NULL AS (1:::INT8) STORED,
+        y INT8 NULL AS (1:::INT8) STORED,
         FAMILY "primary" (x, rowid, y)
 )

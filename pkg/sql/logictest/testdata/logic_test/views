@@ -1,4 +1,3 @@
-# LogicTest: !3node-tenant
 # NOTE: Keep this table at the beginning of the file to ensure that its numeric
 #       reference is 53 (the numeric reference of the first table). If the
 #       numbering scheme in cockroach changes, this test will break.
@@ -688,3 +687,78 @@ statement ok
 CREATE OR REPLACE VIEW tview AS SELECT x AS x, x+1 AS x1, x+2 AS x2, x+3 AS x3 FROM t2
 
 user root
+
+# Ensure a view that contains a table that is referenced multiple times with
+# different column sets depends on the correct columns.
+# Depended on columns should not be droppable.
+
+# Only column a should be depended on in this case.
+statement ok
+DROP TABLE ab CASCADE;
+CREATE TABLE ab (a INT, b INT);
+CREATE VIEW vab (x) AS SELECT ab.a FROM ab, ab AS ab2
+
+statement ok
+ALTER TABLE ab DROP COLUMN b
+
+statement error pq: cannot drop column "a" because view "vab" depends on it
+ALTER TABLE ab DROP COLUMN a
+
+statement ok
+CREATE TABLE abc (a INT, b INT, c INT);
+CREATE VIEW vabc AS SELECT abc.a, abc2.b, abc3.c FROM abc, abc AS abc2, abc AS abc3
+
+# All three columns a,b,c should not be droppable.
+statement error pq: cannot drop column "a" because view "vabc" depends on it
+ALTER TABLE abc DROP COLUMN a
+
+statement error pq: cannot drop column "b" because view "vabc" depends on it
+ALTER TABLE abc DROP COLUMN b
+
+statement error pq: cannot drop column "c" because view "vabc" depends on it
+ALTER TABLE abc DROP COLUMN c
+
+# RegClass objects used in expressions should be added to view dependencies.
+statement ok
+CREATE TABLE toreg();
+CREATE VIEW vregclass AS SELECT 'toreg'::regclass
+
+statement error pq: cannot drop relation "toreg" because view "vregclass" depends on it
+DROP TABLE toreg;
+
+statement ok
+DROP VIEW vregclass;
+CREATE VIEW vregclass AS SELECT x FROM (SELECT CAST('toreg' AS regclass) AS x)
+
+statement error pq: cannot drop relation "toreg" because view "vregclass" depends on it
+DROP TABLE toreg;
+
+statement ok
+DROP VIEW vregclass;
+CREATE SEQUENCE s_reg;
+CREATE VIEW vregclass AS SELECT x FROM [SELECT 's_reg'::REGCLASS AS x]
+
+statement error pq: cannot drop sequence s_reg because other objects depend on it
+DROP SEQUENCE s_reg
+
+# RegClass dependencies should not be added if the RegClass expression contains
+# a variable.
+statement ok
+DROP VIEW vregclass;
+CREATE VIEW vregclass AS SELECT x::regclass FROM (SELECT 's_reg' AS x);
+DROP SEQUENCE s_reg;
+
+statement ok
+DROP VIEW vregclass;
+CREATE VIEW vregclass AS SELECT x::regclass FROM (SELECT 'does_not_exist' AS x);
+
+statement error pq: relation "does_not_exist" does not exist
+SELECT * FROM vregclass
+
+statement ok
+DROP VIEW vregclass;
+CREATE table tregclass();
+CREATE VIEW vregclass AS SELECT 1 FROM (SELECT 1) AS foo WHERE 'tregclass'::regclass = 'tregclass'::regclass;
+
+statement error pq: cannot drop relation "tregclass" because view "vregclass" depends on it
+DROP TABLE tregclass

@@ -19,7 +19,6 @@ import (
 	"os/signal"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/sdnotify"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
@@ -32,6 +31,10 @@ import (
 // without a signal handler. The default action of any signal listed here thus
 // must terminate the process.
 var drainSignals = []os.Signal{unix.SIGINT, unix.SIGTERM, unix.SIGQUIT}
+
+// termSignal is the signal that causes an idempotent graceful
+// shutdown (i.e. second occurrence does not incur hard shutdown).
+var termSignal os.Signal = unix.SIGTERM
 
 // quitSignal is the signal to recognize to dump Go stacks.
 var quitSignal os.Signal = unix.SIGQUIT
@@ -58,13 +61,7 @@ func handleSignalDuringShutdown(sig os.Signal) {
 	select {}
 }
 
-var startBackground bool
-
-func init() {
-	for _, cmd := range StartCmds {
-		BoolFlag(cmd.Flags(), &startBackground, cliflags.Background, false)
-	}
-}
+const backgroundFlagDefined = true
 
 func maybeRerunBackground() (bool, error) {
 	if startBackground {

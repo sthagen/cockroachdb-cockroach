@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -69,6 +70,7 @@ func (ex *connExecutor) execStmt(
 	// Run observer statements in a separate code path; their execution does not
 	// depend on the current transaction state.
 	if _, ok := stmt.AST.(tree.ObserverStatement); ok {
+		ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
 		err := ex.runObserverStatement(ctx, stmt, res)
 		// Note that regardless of res.Err(), these observer statements don't
 		// generate error events; transactions are always allowed to continue.
@@ -249,6 +251,18 @@ func (ex *connExecutor) execStmtInOpenState(
 					)
 				}
 			}
+		}()
+	}
+
+	if ex.server.cfg.TestingKnobs.WithStatementTrace != nil {
+		tr := ex.server.cfg.AmbientCtx.Tracer
+		var sp opentracing.Span
+		ctx, sp = tracing.StartSnowballTrace(ctx, tr, stmt.SQL)
+		// TODO(radu): consider removing this if/when #46164 is addressed.
+		p.extendedEvalCtx.Context = ctx
+
+		defer func() {
+			ex.server.cfg.TestingKnobs.WithStatementTrace(sp, stmt.SQL)
 		}()
 	}
 
@@ -481,7 +495,6 @@ func (ex *connExecutor) execStmtInOpenState(
 	}
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
 	p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
-	ex.phaseTimes[plannerStartExecStmt] = timeutil.Now()
 	p.stmt = &stmt
 	p.cancelChecker = sqlbase.NewCancelChecker(ctx)
 	p.autoCommit = os.ImplicitTxn.Get() && !ex.server.cfg.TestingKnobs.DisableAutoCommit
@@ -749,7 +762,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	var cols sqlbase.ResultColumns
 	if stmt.AST.StatementType() == tree.Rows {
-		cols = planColumns(planner.curPlan.main)
+		cols = planner.curPlan.main.planColumns()
 	}
 	if err := ex.initStatementResult(ctx, res, stmt, cols); err != nil {
 		res.SetError(err)
@@ -757,9 +770,9 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	}
 
 	ex.sessionTracing.TracePlanCheckStart(ctx)
-	distributePlan := willDistributePlan(
+	distributePlan := getPlanDistribution(
 		ctx, planner.execCfg.NodeID, ex.sessionData.DistSQLMode, planner.curPlan.main,
-	)
+	).WillDistribute()
 	ex.sessionTracing.TracePlanCheckEnd(ctx, nil, distributePlan)
 
 	if ex.server.cfg.TestingKnobs.BeforeExecute != nil {
@@ -775,6 +788,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		panic(fmt.Sprintf("query %d not in registry", stmt.queryID))
 	}
 	queryMeta.phase = executing
+	// TODO(yuzefovich): introduce ternary PlanDistribution into queryMeta.
 	queryMeta.isDistributed = distributePlan
 	progAtomic := &queryMeta.progressAtomic
 	ex.mu.Unlock()
@@ -850,7 +864,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 ) (bytesRead, rowsRead int64, _ error) {
 	recv := MakeDistSQLReceiver(
 		ctx, res, stmtType,
-		ex.server.cfg.RangeDescriptorCache, ex.server.cfg.LeaseHolderCache,
+		ex.server.cfg.RangeDescriptorCache,
 		planner.txn,
 		func(ts hlc.Timestamp) {
 			ex.server.cfg.Clock.Update(ts)
@@ -861,13 +875,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	defer recv.Release()
 
 	evalCtx := planner.ExtendedEvalContext()
-	var planCtx *PlanningCtx
-	if distribute {
-		planCtx = ex.server.cfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, planner.txn)
-	} else {
-		planCtx = ex.server.cfg.DistSQLPlanner.newLocalPlanningCtx(ctx, evalCtx)
-	}
-	planCtx.isLocal = !distribute
+	planCtx := ex.server.cfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, planner.txn, distribute)
 	planCtx.planner = planner
 	planCtx.stmtType = recv.stmtType
 	if planner.collectBundle {
@@ -1110,6 +1118,8 @@ func (ex *connExecutor) runObserverStatement(
 	case *tree.SetTracing:
 		ex.runSetTracing(ctx, sqlStmt, res)
 		return nil
+	case *tree.ShowLastQueryStatistics:
+		return ex.runShowLastQueryStatistics(ctx, res)
 	default:
 		res.SetError(errors.AssertionFailedf("unrecognized observer statement type %T", stmt.AST))
 		return nil
@@ -1145,6 +1155,26 @@ func (ex *connExecutor) runShowTransactionState(
 
 	state := fmt.Sprintf("%s", ex.machine.CurState())
 	return res.AddRow(ctx, tree.Datums{tree.NewDString(state)})
+}
+
+func (ex *connExecutor) runShowLastQueryStatistics(
+	ctx context.Context, res RestrictedCommandResult,
+) error {
+	res.SetColumns(ctx, sqlbase.ShowLastQueryStatisticsColumns)
+
+	phaseTimes := &ex.statsCollector.previousPhaseTimes
+	runLat := phaseTimes.getRunLatency().Seconds()
+	parseLat := phaseTimes.getParsingLatency().Seconds()
+	planLat := phaseTimes.getPlanningLatency().Seconds()
+	svcLat := phaseTimes.getServiceLatency().Seconds()
+
+	return res.AddRow(ctx,
+		tree.Datums{
+			tree.NewDInterval(duration.FromFloat64(parseLat), types.DefaultIntervalTypeMetadata),
+			tree.NewDInterval(duration.FromFloat64(planLat), types.DefaultIntervalTypeMetadata),
+			tree.NewDInterval(duration.FromFloat64(runLat), types.DefaultIntervalTypeMetadata),
+			tree.NewDInterval(duration.FromFloat64(svcLat), types.DefaultIntervalTypeMetadata),
+		})
 }
 
 func (ex *connExecutor) runSetTracing(

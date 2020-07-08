@@ -10,7 +10,11 @@
 
 package log
 
-import "os"
+import (
+	"os"
+
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+)
 
 // OrigStderr points to the original stderr stream.
 var OrigStderr = func() *os.File {
@@ -23,23 +27,19 @@ var OrigStderr = func() *os.File {
 }()
 
 // LoggingToStderr returns true if log messages of the given severity
-// sent to the main logger are also visible on stderr.
+// sent to the main logger are also visible on stderr. This is used
+// e.g. by the startup code to announce server details both on the
+// external stderr and to the log file.
+//
+// This is also the logic used by Shout calls.
 func LoggingToStderr(s Severity) bool {
-	return s >= logging.stderrThreshold.get()
-}
-
-// stderrRedirected returns true if and only if logging to this logger
-// captures stderr output to the log file. This is used e.g. by
-// Shout() to determine whether to report to standard error in
-// addition to logs.
-func (l *loggerT) stderrRedirected() bool {
-	return logging.stderrThreshold > Severity_INFO && !l.noStderrRedirect
+	return s >= mainLog.stderrThreshold.get()
 }
 
 // hijackStderr replaces stderr with the given file descriptor.
 //
-// A client that wishes to use the original stderr must use
-// OrigStderr defined above.
+// A client that wishes to use the original stderr (the process'
+// external stderr stream) must use OrigStderr defined above.
 func hijackStderr(f *os.File) error {
 	return redirectStderr(f)
 }
@@ -48,3 +48,7 @@ func hijackStderr(f *os.File) error {
 func restoreStderr() error {
 	return redirectStderr(OrigStderr)
 }
+
+// osStderrMu ensures that concurrent redirects of stderr don't
+// overwrite each other.
+var osStderrMu syncutil.Mutex

@@ -210,7 +210,7 @@ func EndTxn(
 		// to perform this verification for commits. Rollbacks can always write
 		// an aborted txn record.
 		if args.Commit {
-			if err := CanCreateTxnRecord(cArgs.EvalCtx, reply.Txn); err != nil {
+			if err := CanCreateTxnRecord(ctx, cArgs.EvalCtx, reply.Txn); err != nil {
 				return result.Result{}, err
 			}
 		}
@@ -940,7 +940,7 @@ func splitTriggerHelper(
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load lease")
 		}
-		if (leftLease == roachpb.Lease{}) {
+		if leftLease.Empty() {
 			log.Fatalf(ctx, "LHS of split has no lease")
 		}
 

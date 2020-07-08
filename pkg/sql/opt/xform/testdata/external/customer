@@ -86,35 +86,35 @@ project
  ├── key: (1)
  ├── fd: (1)-->(2,3,5-8,10)
  ├── ordering: +1
- └── limit
+ └── index-join article
       ├── columns: id:1!null feed:2!null folder:3!null title:5 summary:6 content:7 link:8 read:9!null date:10
-      ├── internal-ordering: +1 opt(9)
       ├── cardinality: [0 - 50]
       ├── key: (1)
       ├── fd: ()-->(9), (1)-->(2,3,5-8,10)
       ├── ordering: +1 opt(9) [actual: +1]
-      ├── index-join article
-      │    ├── columns: id:1!null feed:2!null folder:3!null title:5 summary:6 content:7 link:8 read:9!null date:10
-      │    ├── key: (1)
-      │    ├── fd: ()-->(9), (1)-->(2,3,5-8,10)
-      │    ├── ordering: +1 opt(9) [actual: +1]
-      │    ├── limit hint: 50.00
-      │    └── select
-      │         ├── columns: id:1!null feed:2!null folder:3!null read:9!null
-      │         ├── key: (1)
-      │         ├── fd: ()-->(9), (1)-->(2,3)
-      │         ├── ordering: +1 opt(9) [actual: +1]
-      │         ├── limit hint: 50.00
-      │         ├── scan article@article_idx_read_key
-      │         │    ├── columns: id:1!null feed:2!null folder:3!null read:9
-      │         │    ├── constraint: /1: [/1 - ]
-      │         │    ├── key: (1)
-      │         │    ├── fd: (1)-->(2,3,9)
-      │         │    ├── ordering: +1 opt(9) [actual: +1]
-      │         │    └── limit hint: 101.01
-      │         └── filters
-      │              └── NOT read:9 [outer=(9), constraints=(/9: [/false - /false]; tight), fd=()-->(9)]
-      └── 50
+      └── limit
+           ├── columns: id:1!null feed:2!null folder:3!null read:9!null
+           ├── internal-ordering: +1 opt(9)
+           ├── cardinality: [0 - 50]
+           ├── key: (1)
+           ├── fd: ()-->(9), (1)-->(2,3)
+           ├── ordering: +1 opt(9) [actual: +1]
+           ├── select
+           │    ├── columns: id:1!null feed:2!null folder:3!null read:9!null
+           │    ├── key: (1)
+           │    ├── fd: ()-->(9), (1)-->(2,3)
+           │    ├── ordering: +1 opt(9) [actual: +1]
+           │    ├── limit hint: 50.00
+           │    ├── scan article@article_idx_read_key
+           │    │    ├── columns: id:1!null feed:2!null folder:3!null read:9
+           │    │    ├── constraint: /1: [/1 - ]
+           │    │    ├── key: (1)
+           │    │    ├── fd: (1)-->(2,3,9)
+           │    │    ├── ordering: +1 opt(9) [actual: +1]
+           │    │    └── limit hint: 101.01
+           │    └── filters
+           │         └── NOT read:9 [outer=(9), constraints=(/9: [/false - /false]; tight), fd=()-->(9)]
+           └── 50
 
 # Check that forcing the index works as well.
 opt
@@ -128,36 +128,36 @@ project
  ├── key: (1)
  ├── fd: (1)-->(2,3,5-8,10)
  ├── ordering: +1
- └── limit
+ └── index-join article
       ├── columns: id:1!null feed:2!null folder:3!null title:5 summary:6 content:7 link:8 read:9!null date:10
-      ├── internal-ordering: +1 opt(9)
       ├── cardinality: [0 - 50]
       ├── key: (1)
       ├── fd: ()-->(9), (1)-->(2,3,5-8,10)
       ├── ordering: +1 opt(9) [actual: +1]
-      ├── index-join article
-      │    ├── columns: id:1!null feed:2!null folder:3!null title:5 summary:6 content:7 link:8 read:9!null date:10
-      │    ├── key: (1)
-      │    ├── fd: ()-->(9), (1)-->(2,3,5-8,10)
-      │    ├── ordering: +1 opt(9) [actual: +1]
-      │    ├── limit hint: 50.00
-      │    └── select
-      │         ├── columns: id:1!null feed:2!null folder:3!null read:9!null
-      │         ├── key: (1)
-      │         ├── fd: ()-->(9), (1)-->(2,3)
-      │         ├── ordering: +1 opt(9) [actual: +1]
-      │         ├── limit hint: 50.00
-      │         ├── scan article@article_idx_read_key
-      │         │    ├── columns: id:1!null feed:2!null folder:3!null read:9
-      │         │    ├── constraint: /1: [/1 - ]
-      │         │    ├── flags: force-index=article_idx_read_key
-      │         │    ├── key: (1)
-      │         │    ├── fd: (1)-->(2,3,9)
-      │         │    ├── ordering: +1 opt(9) [actual: +1]
-      │         │    └── limit hint: 101.01
-      │         └── filters
-      │              └── NOT read:9 [outer=(9), constraints=(/9: [/false - /false]; tight), fd=()-->(9)]
-      └── 50
+      └── limit
+           ├── columns: id:1!null feed:2!null folder:3!null read:9!null
+           ├── internal-ordering: +1 opt(9)
+           ├── cardinality: [0 - 50]
+           ├── key: (1)
+           ├── fd: ()-->(9), (1)-->(2,3)
+           ├── ordering: +1 opt(9) [actual: +1]
+           ├── select
+           │    ├── columns: id:1!null feed:2!null folder:3!null read:9!null
+           │    ├── key: (1)
+           │    ├── fd: ()-->(9), (1)-->(2,3)
+           │    ├── ordering: +1 opt(9) [actual: +1]
+           │    ├── limit hint: 50.00
+           │    ├── scan article@article_idx_read_key
+           │    │    ├── columns: id:1!null feed:2!null folder:3!null read:9
+           │    │    ├── constraint: /1: [/1 - ]
+           │    │    ├── flags: force-index=article_idx_read_key
+           │    │    ├── key: (1)
+           │    │    ├── fd: (1)-->(2,3,9)
+           │    │    ├── ordering: +1 opt(9) [actual: +1]
+           │    │    └── limit hint: 101.01
+           │    └── filters
+           │         └── NOT read:9 [outer=(9), constraints=(/9: [/false - /false]; tight), fd=()-->(9)]
+           └── 50
 
 # Use only columns covered by the index.
 opt
@@ -232,12 +232,14 @@ LIMIT 50
 project
  ├── columns: score:9!null expires_at:15!null  [hidden: updated_at_inverse:14!null]
  ├── cardinality: [0 - 50]
+ ├── immutable
  ├── fd: ()-->(15)
  ├── ordering: -9,-14 opt(15) [actual: -9,-14]
  └── scan leaderboard_record@test_idx,rev
       ├── columns: id:1!null leaderboard_id:2!null score:9!null updated_at_inverse:14!null expires_at:15!null
       ├── constraint: /2/15/9/14/1/3: [/'\x74657374'/0 - /'\x74657374'/0/100/500/'\x736f6d655f6964')
       ├── limit: 50(rev)
+      ├── immutable
       ├── key: (1)
       ├── fd: ()-->(2,15), (1)-->(9,14)
       └── ordering: -9,-14 opt(2,15) [actual: -9,-14]
@@ -542,18 +544,22 @@ WHERE
 ----
 project
  ├── columns: secondary_id:6 "?column?":7
+ ├── stable
  ├── inner-join (lookup idtable)
  │    ├── columns: primary_id:1!null idtable.secondary_id:2!null data:3!null value:4!null column5:5!null
  │    ├── key columns: [1] = [1]
  │    ├── lookup columns are key
+ │    ├── immutable
  │    ├── fd: (1)-->(2,3), (4)-->(5), (2)==(5), (5)==(2)
  │    ├── inner-join (lookup idtable@secondary_id)
  │    │    ├── columns: primary_id:1!null idtable.secondary_id:2!null value:4!null column5:5!null
  │    │    ├── key columns: [5] = [2]
+ │    │    ├── immutable
  │    │    ├── fd: (4)-->(5), (1)-->(2), (2)==(5), (5)==(2)
  │    │    ├── project
  │    │    │    ├── columns: column5:5 value:4!null
  │    │    │    ├── cardinality: [2 - 2]
+ │    │    │    ├── immutable
  │    │    │    ├── fd: (4)-->(5)
  │    │    │    ├── values
  │    │    │    │    ├── columns: value:4!null
@@ -561,9 +567,9 @@ project
  │    │    │    │    ├── ('{"person_id": "8e5dc104-9f38-4255-9283-fd080be16c57", "product_id": "a739c2d3-edec-413b-88d8-9c31d0414b1e"}',)
  │    │    │    │    └── ('{"person_id": "308686c4-7415-4c2d-92d5-25b39a1c84e2", "product_id": "3f12802d-5b0f-43d7-a0d0-12ac8e88cb18"}',)
  │    │    │    └── projections
- │    │    │         └── (value:4->>'secondary_id')::UUID [as=column5:5, outer=(4)]
+ │    │    │         └── (value:4->>'secondary_id')::UUID [as=column5:5, outer=(4), immutable]
  │    │    └── filters (true)
  │    └── filters (true)
  └── projections
-      ├── value:4->>'secondary_id' [as=secondary_id:6, outer=(4)]
-      └── data:3 || jsonb_build_object('primary_id', primary_id:1) [as="?column?":7, outer=(1,3)]
+      ├── value:4->>'secondary_id' [as=secondary_id:6, outer=(4), immutable]
+      └── data:3 || jsonb_build_object('primary_id', primary_id:1) [as="?column?":7, outer=(1,3), stable]

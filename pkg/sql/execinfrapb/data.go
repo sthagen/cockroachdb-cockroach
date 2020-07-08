@@ -93,8 +93,8 @@ func (tr *DistSQLTypeResolver) ResolveType(
 func makeTypeLookupFunc(
 	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec,
 ) sqlbase.TypeLookupFunc {
-	return func(id sqlbase.ID) (*tree.TypeName, *sqlbase.TypeDescriptor, error) {
-		return resolver.ResolveTypeDescByID(ctx, txn, codec, id)
+	return func(id sqlbase.ID) (*tree.TypeName, sqlbase.TypeDescriptorInterface, error) {
+		return resolver.ResolveTypeDescByID(ctx, txn, codec, id, tree.ObjectLookupFlags{})
 	}
 }
 
@@ -133,7 +133,7 @@ func HydrateTypeSlice(evalCtx *tree.EvalContext, typs []*types.T) error {
 // IndexedVar formatting function needs to be added on. It replaces placeholders
 // with their values.
 func ExprFmtCtxBase(evalCtx *tree.EvalContext) *tree.FmtCtx {
-	fmtCtx := tree.NewFmtCtx(tree.FmtDistSQLSerialization)
+	fmtCtx := tree.NewFmtCtx(tree.FmtCheckEquivalence)
 	fmtCtx.SetPlaceholderFormat(
 		func(fmtCtx *tree.FmtCtx, p *tree.Placeholder) {
 			d, err := p.Eval(evalCtx)
@@ -160,8 +160,9 @@ type Expression struct {
 	// (@1, @2, @3 ..) used for "input" variables.
 	Expr string
 
-	// LocalExpr is an unserialized field that's used to pass expressions to local
-	// flows without serializing/deserializing them.
+	// LocalExpr is an unserialized field that's used to pass expressions to
+	// the gateway node without serializing/deserializing them. It is always
+	// set in non-test setup.
 	LocalExpr tree.TypedExpr
 }
 
@@ -172,13 +173,13 @@ func (e *Expression) Empty() bool {
 
 // String implements the Stringer interface.
 func (e Expression) String() string {
-	if e.LocalExpr != nil {
-		ctx := tree.NewFmtCtx(tree.FmtDistSQLSerialization)
-		ctx.FormatNode(e.LocalExpr)
-		return ctx.CloseAndGetString()
-	}
 	if e.Expr != "" {
 		return e.Expr
+	}
+	if e.LocalExpr != nil {
+		ctx := tree.NewFmtCtx(tree.FmtCheckEquivalence)
+		ctx.FormatNode(e.LocalExpr)
+		return ctx.CloseAndGetString()
 	}
 	return "none"
 }
@@ -379,9 +380,23 @@ func LocalMetaToRemoteProducerMeta(
 type MetadataSource interface {
 	// DrainMeta returns all the metadata produced by the processor or operator.
 	// It will be called exactly once, usually, when the processor or operator
-	// has finished doing its computations.
+	// has finished doing its computations. This is a signal that the output
+	// requires no more rows to be returned.
 	// Implementers can choose what to do on subsequent calls (if such occur).
 	// TODO(yuzefovich): modify the contract to require returning nil on all
 	// calls after the first one.
 	DrainMeta(context.Context) []ProducerMetadata
+}
+
+// MetadataSources is a slice of MetadataSource.
+type MetadataSources []MetadataSource
+
+// DrainMeta calls DrainMeta on all MetadataSources and returns a single slice
+// with all the accumulated metadata.
+func (s MetadataSources) DrainMeta(ctx context.Context) []ProducerMetadata {
+	var result []ProducerMetadata
+	for _, src := range s {
+		result = append(result, src.DrainMeta(ctx)...)
+	}
+	return result
 }

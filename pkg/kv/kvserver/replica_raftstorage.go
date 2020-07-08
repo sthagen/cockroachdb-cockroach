@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 )
@@ -462,7 +463,12 @@ type OutgoingSnapshot struct {
 }
 
 func (s *OutgoingSnapshot) String() string {
-	return fmt.Sprintf("%s snapshot %s at applied index %d", s.snapType, s.SnapUUID.Short(), s.State.RaftAppliedIndex)
+	return redact.StringWithoutMarkers(s)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (s *OutgoingSnapshot) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("%s snapshot %s at applied index %d", s.snapType, s.SnapUUID.Short(), s.State.RaftAppliedIndex)
 }
 
 // Close releases the resources associated with the snapshot.
@@ -496,7 +502,12 @@ type IncomingSnapshot struct {
 }
 
 func (s *IncomingSnapshot) String() string {
-	return fmt.Sprintf("%s snapshot %s at applied index %d", s.snapType, s.SnapUUID.Short(), s.State.RaftAppliedIndex)
+	return redact.StringWithoutMarkers(s)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (s *IncomingSnapshot) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("%s snapshot %s at applied index %d", s.snapType, s.SnapUUID.Short(), s.State.RaftAppliedIndex)
 }
 
 // snapshot creates an OutgoingSnapshot containing a rocksdb snapshot for the

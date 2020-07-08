@@ -4,6 +4,7 @@ stmt_block ::=
 stmt ::=
 	'HELPTOKEN'
 	| preparable_stmt
+	| analyze_stmt
 	| copy_from_stmt
 	| comment_stmt
 	| execute_stmt
@@ -41,6 +42,10 @@ preparable_stmt ::=
 	| truncate_stmt
 	| update_stmt
 	| upsert_stmt
+
+analyze_stmt ::=
+	'ANALYZE' analyze_target
+	| 'ANALYSE' analyze_target
 
 copy_from_stmt ::=
 	'COPY' table_name opt_column_list 'FROM' 'STDIN' opt_with_options
@@ -99,8 +104,7 @@ alter_stmt ::=
 	| alter_role_stmt
 
 backup_stmt ::=
-	'BACKUP' 'TO' partitioned_backup opt_as_of_clause opt_incremental opt_with_options
-	| 'BACKUP' targets 'TO' partitioned_backup opt_as_of_clause opt_incremental opt_with_options
+	'BACKUP' opt_backup_targets 'TO' partitioned_backup opt_as_of_clause opt_incremental opt_with_backup_options
 
 cancel_stmt ::=
 	cancel_jobs_stmt
@@ -111,6 +115,7 @@ create_stmt ::=
 	create_role_stmt
 	| create_ddl_stmt
 	| create_stats_stmt
+	| create_schedule_for_backup_stmt
 
 delete_stmt ::=
 	opt_with_clause 'DELETE' 'FROM' table_expr_opt_alias_idx opt_where_clause opt_sort_clause opt_limit_clause returning_clause
@@ -205,6 +210,9 @@ update_stmt ::=
 
 upsert_stmt ::=
 	opt_with_clause 'UPSERT' 'INTO' insert_target insert_rest returning_clause
+
+analyze_target ::=
+	table_name
 
 table_name ::=
 	db_object_name
@@ -305,6 +313,9 @@ alter_role_stmt ::=
 	'ALTER' role_or_group_or_user string_or_placeholder opt_role_options
 	| 'ALTER' role_or_group_or_user 'IF' 'EXISTS' string_or_placeholder opt_role_options
 
+opt_backup_targets ::=
+	targets
+
 partitioned_backup ::=
 	string_or_placeholder
 	| '(' string_or_placeholder_list ')'
@@ -315,6 +326,11 @@ opt_as_of_clause ::=
 
 opt_incremental ::=
 	'INCREMENTAL' 'FROM' string_or_placeholder_list
+	| 
+
+opt_with_backup_options ::=
+	'WITH' backup_options_list
+	| 'WITH' 'OPTIONS' '(' backup_options_list ')'
 	| 
 
 cancel_jobs_stmt ::=
@@ -350,6 +366,9 @@ create_ddl_stmt ::=
 
 create_stats_stmt ::=
 	'CREATE' 'STATISTICS' statistics_name opt_stats_columns 'FROM' create_stats_target opt_create_stats_options
+
+create_schedule_for_backup_stmt ::=
+	'CREATE' 'SCHEDULE' opt_description 'FOR' 'BACKUP' opt_backup_targets 'TO' partitioned_backup opt_with_backup_options cron_expr opt_full_backup_clause opt_with_schedule_options
 
 opt_with_clause ::=
 	with_clause
@@ -667,16 +686,19 @@ unreserved_keyword ::=
 	| 'DELETE'
 	| 'DEFAULTS'
 	| 'DEFERRED'
+	| 'DETACHED'
 	| 'DISCARD'
 	| 'DOMAIN'
 	| 'DOUBLE'
 	| 'DROP'
 	| 'ENCODING'
+	| 'ENCRYPTION_PASSPHRASE'
 	| 'ENUM'
 	| 'ESCAPE'
 	| 'EXCLUDE'
 	| 'EXCLUDING'
 	| 'EXECUTE'
+	| 'EXECUTION'
 	| 'EXPERIMENTAL'
 	| 'EXPERIMENTAL_AUDIT'
 	| 'EXPERIMENTAL_FINGERPRINTS'
@@ -746,6 +768,7 @@ unreserved_keyword ::=
 	| 'MONTH'
 	| 'NAMES'
 	| 'NAN'
+	| 'NEVER'
 	| 'NEXT'
 	| 'NO'
 	| 'NORMAL'
@@ -787,6 +810,7 @@ unreserved_keyword ::=
 	| 'RANGE'
 	| 'RANGES'
 	| 'READ'
+	| 'RECURRING'
 	| 'RECURSIVE'
 	| 'REF'
 	| 'REINDEX'
@@ -798,6 +822,8 @@ unreserved_keyword ::=
 	| 'RESTORE'
 	| 'RESTRICT'
 	| 'RESUME'
+	| 'RETRY'
+	| 'REVISION_HISTORY'
 	| 'REVOKE'
 	| 'ROLE'
 	| 'ROLES'
@@ -805,6 +831,7 @@ unreserved_keyword ::=
 	| 'ROLLUP'
 	| 'ROWS'
 	| 'RULE'
+	| 'SCHEDULE'
 	| 'SETTING'
 	| 'SETTINGS'
 	| 'STATUS'
@@ -1017,6 +1044,9 @@ opt_role_options ::=
 as_of_clause ::=
 	'AS' 'OF' 'SYSTEM' 'TIME' a_expr
 
+backup_options_list ::=
+	( backup_options ) ( ( ',' backup_options ) )*
+
 create_changefeed_stmt ::=
 	'CREATE' 'CHANGEFEED' 'FOR' changefeed_targets opt_changefeed_sink opt_with_options
 
@@ -1066,6 +1096,24 @@ create_stats_target ::=
 
 opt_create_stats_options ::=
 	as_of_clause
+	| 
+
+opt_description ::=
+	string_or_placeholder
+	| 
+
+cron_expr ::=
+	'RECURRING' 'NEVER'
+	| 'RECURRING' sconst_or_placeholder
+
+opt_full_backup_clause ::=
+	'FULL' 'BACKUP' sconst_or_placeholder
+	| 'FULL' 'BACKUP' 'ALWAYS'
+	| 
+
+opt_with_schedule_options ::=
+	'WITH' 'EXPERIMENTAL' 'SCHEDULE' 'OPTIONS' kv_option_list
+	| 'WITH' 'EXPERIMENTAL' 'SCHEDULE' 'OPTIONS' '(' kv_option_list ')'
 	| 
 
 with_clause ::=
@@ -1396,6 +1444,11 @@ opt_with ::=
 role_options ::=
 	( role_option ) ( ( role_option ) )*
 
+backup_options ::=
+	'ENCRYPTION_PASSPHRASE' '=' string_or_placeholder
+	| 'REVISION_HISTORY'
+	| 'DETACHED'
+
 changefeed_targets ::=
 	single_table_pattern_list
 	| 'TABLE' single_table_pattern_list
@@ -1486,6 +1539,10 @@ sequence_name ::=
 opt_sequence_option_list ::=
 	sequence_option_list
 	| 
+
+sconst_or_placeholder ::=
+	'SCONST'
+	| 'PLACEHOLDER'
 
 cte_list ::=
 	( common_table_expr ) ( ( ',' common_table_expr ) )*
@@ -2270,10 +2327,10 @@ const_datetime ::=
 const_geo ::=
 	'GEOGRAPHY'
 	| 'GEOMETRY'
-	| 'GEOMETRY' '(' geo_shape ')'
-	| 'GEOGRAPHY' '(' geo_shape ')'
-	| 'GEOMETRY' '(' geo_shape ',' iconst32 ')'
-	| 'GEOGRAPHY' '(' geo_shape ',' iconst32 ')'
+	| 'GEOMETRY' '(' geo_shape_type ')'
+	| 'GEOGRAPHY' '(' geo_shape_type ')'
+	| 'GEOMETRY' '(' geo_shape_type ',' signed_iconst ')'
+	| 'GEOGRAPHY' '(' geo_shape_type ',' signed_iconst ')'
 
 opt_varying ::=
 	'VARYING'
@@ -2459,7 +2516,7 @@ opt_timezone ::=
 	| 'WITHOUT' 'TIME' 'ZONE'
 	| 
 
-geo_shape ::=
+geo_shape_type ::=
 	'POINT'
 	| 'LINESTRING'
 	| 'POLYGON'
@@ -2468,6 +2525,10 @@ geo_shape ::=
 	| 'MULTILINESTRING'
 	| 'MULTIPOINT'
 	| 'GEOMETRY'
+
+signed_iconst ::=
+	'ICONST'
+	| only_signed_iconst
 
 char_aliases ::=
 	'CHAR'
@@ -2486,10 +2547,6 @@ join_outer ::=
 
 rowsfrom_item ::=
 	func_expr_windowless
-
-signed_iconst ::=
-	'ICONST'
-	| only_signed_iconst
 
 create_as_col_qualification_elem ::=
 	'PRIMARY' 'KEY'

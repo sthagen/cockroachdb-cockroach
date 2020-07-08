@@ -20,9 +20,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -152,7 +153,8 @@ func BenchmarkImport(b *testing.B) {
 			if err != nil {
 				b.Fatalf("%+v", err)
 			}
-			storage, err := cloud.ExternalStorageConfFromURI(`nodelocal://0/` + subdir)
+			storage, err := cloudimpl.ExternalStorageConfFromURI(`nodelocal://0/`+subdir,
+				security.RootUser)
 			if err != nil {
 				b.Fatalf("%+v", err)
 			}
@@ -179,9 +181,9 @@ func BenchmarkImport(b *testing.B) {
 						b.Fatalf("bad table descriptor: %+v", tableDesc)
 					}
 					oldStartKey = sqlbase.MakeIndexKeyPrefix(keys.SystemSQLCodec, tableDesc, tableDesc.PrimaryIndex.ID)
-					newDesc := *tableDesc
+					newDesc := sqlbase.NewMutableCreatedTableDescriptor(*tableDesc)
 					newDesc.ID = id
-					newDescBytes, err := protoutil.Marshal(sqlbase.WrapDescriptor(&newDesc))
+					newDescBytes, err := protoutil.Marshal(newDesc.DescriptorProto())
 					if err != nil {
 						panic(err)
 					}

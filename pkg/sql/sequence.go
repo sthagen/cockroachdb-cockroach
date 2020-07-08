@@ -25,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/sequence"
 	"github.com/cockroachdb/errors"
 )
 
@@ -37,7 +37,8 @@ func (p *planner) IncrementSequence(ctx context.Context, seqName *tree.TableName
 		return 0, readOnlyError("nextval()")
 	}
 
-	descriptor, err := resolver.ResolveExistingTableObject(ctx, p, seqName, tree.ObjectLookupFlagsWithRequired(), resolver.ResolveRequireSequenceDesc)
+	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc)
+	descriptor, err := resolver.ResolveExistingTableObject(ctx, p, seqName, flags)
 	if err != nil {
 		return 0, err
 	}
@@ -93,7 +94,8 @@ func boundsExceededError(descriptor *sqlbase.ImmutableTableDescriptor) error {
 func (p *planner) GetLatestValueInSessionForSequence(
 	ctx context.Context, seqName *tree.TableName,
 ) (int64, error) {
-	descriptor, err := resolver.ResolveExistingTableObject(ctx, p, seqName, tree.ObjectLookupFlagsWithRequired(), resolver.ResolveRequireSequenceDesc)
+	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc)
+	descriptor, err := resolver.ResolveExistingTableObject(ctx, p, seqName, flags)
 	if err != nil {
 		return 0, err
 	}
@@ -116,7 +118,8 @@ func (p *planner) SetSequenceValue(
 		return readOnlyError("setval()")
 	}
 
-	descriptor, err := resolver.ResolveExistingTableObject(ctx, p, seqName, tree.ObjectLookupFlagsWithRequired(), resolver.ResolveRequireSequenceDesc)
+	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc)
+	descriptor, err := resolver.ResolveExistingTableObject(ctx, p, seqName, flags)
 	if err != nil {
 		return err
 	}
@@ -289,7 +292,7 @@ func assignSequenceOptions(
 					if err := removeSequenceOwnerIfExists(params.ctx, params.p, sequenceID, opts); err != nil {
 						return err
 					}
-					err := addSequenceOwner(params.ctx, params.p, tableDesc, col, sequenceID, opts)
+					err := addSequenceOwner(params.ctx, params.p, option.ColumnItemVal, sequenceID, opts)
 					if err != nil {
 						return err
 					}
@@ -328,12 +331,17 @@ func removeSequenceOwnerIfExists(
 	sequenceID sqlbase.ID,
 	opts *sqlbase.TableDescriptor_SequenceOpts,
 ) error {
-	if opts.SequenceOwner.Equal(sqlbase.TableDescriptor_SequenceOpts_SequenceOwner{}) {
+	if !opts.HasOwner() {
 		return nil
 	}
 	tableDesc, err := p.Tables().GetMutableTableVersionByID(ctx, opts.SequenceOwner.OwnerTableID, p.txn)
 	if err != nil {
 		return err
+	}
+	// If the table descriptor has already been dropped, there is no need to
+	// remove the reference.
+	if tableDesc.Dropped() {
+		return nil
 	}
 	col, err := tableDesc.FindColumnByID(opts.SequenceOwner.OwnerColumnID)
 	if err != nil {
@@ -350,9 +358,11 @@ func removeSequenceOwnerIfExists(
 		return errors.AssertionFailedf("couldn't find reference from column to this sequence")
 	}
 	col.OwnsSequenceIds = append(col.OwnsSequenceIds[:refIdx], col.OwnsSequenceIds[refIdx+1:]...)
-	// TODO (lucy): Have more consistent/informative names for dependent jobs.
 	if err := p.writeSchemaChange(
-		ctx, tableDesc, sqlbase.InvalidMutationID, "removing sequence owner",
+		ctx, tableDesc, sqlbase.InvalidMutationID,
+		fmt.Sprintf("removing sequence owner %s(%d) for sequence %d",
+			tableDesc.Name, tableDesc.ID, sequenceID,
+		),
 	); err != nil {
 		return err
 	}
@@ -369,7 +379,7 @@ func resolveColumnItemToDescriptors(
 		tableName = columnItem.TableName.ToTableName()
 	}
 
-	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &tableName, true /* required */, resolver.ResolveRequireTableDesc)
+	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &tableName, true /* required */, tree.ResolveRequireTableDesc)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -383,18 +393,23 @@ func resolveColumnItemToDescriptors(
 func addSequenceOwner(
 	ctx context.Context,
 	p *planner,
-	tableDesc *MutableTableDescriptor,
-	col *sqlbase.ColumnDescriptor,
+	columnItemVal *tree.ColumnItem,
 	sequenceID sqlbase.ID,
 	opts *sqlbase.TableDescriptor_SequenceOpts,
 ) error {
+	tableDesc, col, err := resolveColumnItemToDescriptors(ctx, p, columnItemVal)
+	if err != nil {
+		return err
+	}
+
 	col.OwnsSequenceIds = append(col.OwnsSequenceIds, sequenceID)
 
 	opts.SequenceOwner.OwnerColumnID = col.ID
 	opts.SequenceOwner.OwnerTableID = tableDesc.GetID()
-	// TODO (lucy): Have more consistent/informative names for dependent jobs.
 	return p.writeSchemaChange(
-		ctx, tableDesc, sqlbase.InvalidMutationID, "adding sequence owner",
+		ctx, tableDesc, sqlbase.InvalidMutationID, fmt.Sprintf(
+			"adding sequence owner %s(%d) for sequence %d",
+			tableDesc.Name, tableDesc.ID, sequenceID),
 	)
 }
 
@@ -410,7 +425,7 @@ func maybeAddSequenceDependencies(
 	expr tree.TypedExpr,
 	backrefs map[sqlbase.ID]*sqlbase.MutableTableDescriptor,
 ) ([]*MutableTableDescriptor, error) {
-	seqNames, err := getUsedSequenceNames(expr)
+	seqNames, err := sequence.GetUsedSequenceNames(expr)
 	if err != nil {
 		return nil, err
 	}
@@ -425,13 +440,13 @@ func maybeAddSequenceDependencies(
 		var seqDesc *MutableTableDescriptor
 		p, ok := sc.(*planner)
 		if ok {
-			seqDesc, err = p.ResolveMutableTableDescriptor(ctx, &tn, true /*required*/, resolver.ResolveRequireSequenceDesc)
+			seqDesc, err = p.ResolveMutableTableDescriptor(ctx, &tn, true /*required*/, tree.ResolveRequireSequenceDesc)
 			if err != nil {
 				return nil, err
 			}
 		} else {
 			// This is only executed via IMPORT which uses its own resolver.
-			seqDesc, err = resolver.ResolveMutableExistingTableObject(ctx, sc, &tn, true /*required*/, resolver.ResolveRequireSequenceDesc)
+			seqDesc, err = resolver.ResolveMutableExistingTableObject(ctx, sc, &tn, true /*required*/, tree.ResolveRequireSequenceDesc)
 			if err != nil {
 				return nil, err
 			}
@@ -466,17 +481,21 @@ func maybeAddSequenceDependencies(
 // dropSequencesOwnedByCol drops all the sequences from col.OwnsSequenceIDs.
 // Called when the respective column (or the whole table) is being dropped.
 func (p *planner) dropSequencesOwnedByCol(
-	ctx context.Context, col *sqlbase.ColumnDescriptor,
+	ctx context.Context, col *sqlbase.ColumnDescriptor, queueJob bool,
 ) error {
 	for _, sequenceID := range col.OwnsSequenceIds {
 		seqDesc, err := p.Tables().GetMutableTableVersionByID(ctx, sequenceID, p.txn)
 		if err != nil {
 			return err
 		}
+		// This sequence is already getting dropped. Don't do it twice.
+		if seqDesc.Dropped() {
+			continue
+		}
 		jobDesc := fmt.Sprintf("removing sequence %q dependent on column %q which is being dropped",
 			seqDesc.Name, col.ColName())
 		if err := p.dropSequenceImpl(
-			ctx, seqDesc, true /* queueJob */, jobDesc, tree.DropRestrict,
+			ctx, seqDesc, queueJob, jobDesc, tree.DropRestrict,
 		); err != nil {
 			return err
 		}
@@ -547,37 +566,4 @@ func (p *planner) removeSequenceDependencies(
 	// Remove the reference from the column descriptor to the sequence descriptor.
 	col.UsesSequenceIds = []sqlbase.ID{}
 	return nil
-}
-
-// getUsedSequenceNames returns the name of the sequence passed to
-// a call to nextval in the given expression, or nil if there is
-// no call to nextval.
-// e.g. nextval('foo') => "foo"; <some other expression> => nil
-func getUsedSequenceNames(defaultExpr tree.TypedExpr) ([]string, error) {
-	searchPath := sessiondata.SearchPath{}
-	var names []string
-	_, err := tree.SimpleVisit(
-		defaultExpr,
-		func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
-			switch t := expr.(type) {
-			case *tree.FuncExpr:
-				def, err := t.Func.Resolve(searchPath)
-				if err != nil {
-					return false, expr, err
-				}
-				if def.Name == "nextval" {
-					arg := t.Exprs[0]
-					switch a := arg.(type) {
-					case *tree.DString:
-						names = append(names, string(*a))
-					}
-				}
-			}
-			return true, expr, nil
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	return names, nil
 }

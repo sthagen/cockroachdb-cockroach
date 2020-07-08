@@ -1,4 +1,3 @@
-# LogicTest: !3node-tenant
 statement ok
 CREATE TABLE t (
   x INT, y INT,
@@ -17,7 +16,7 @@ CREATE TABLE t (
    CONSTRAINT cf FOREIGN KEY (x) REFERENCES t(x),
    UNIQUE INDEX cu (x ASC),
    FAMILY "primary" (x, y, rowid),
-   CONSTRAINT cc CHECK (x > 10)
+   CONSTRAINT cc CHECK (x > 10:::INT8)
 )
 
 query TT
@@ -43,7 +42,7 @@ CREATE TABLE t (
    CONSTRAINT cf2 FOREIGN KEY (x) REFERENCES t(x),
    UNIQUE INDEX cu2 (x ASC),
    FAMILY "primary" (x, y, rowid),
-   CONSTRAINT cc2 CHECK (x > 10)
+   CONSTRAINT cc2 CHECK (x > 10:::INT8)
 )
 
 query TT
@@ -93,7 +92,7 @@ CREATE TABLE t (
    CONSTRAINT cf4 FOREIGN KEY (x) REFERENCES t(x),
    UNIQUE INDEX cu4 (x ASC),
    FAMILY "primary" (x, y, rowid),
-   CONSTRAINT cc4 CHECK (x > 10)
+   CONSTRAINT cc4 CHECK (x > 10:::INT8)
 )
 
 query TT

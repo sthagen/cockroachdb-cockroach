@@ -202,6 +202,7 @@ SELECT * FROM a WHERE ((s >= 'bar' AND s <= 'foo') OR (s >= 'foobar')) AND d > 5
 ----
 select
  ├── columns: x:1(int!null) y:2(int) s:3(string!null) d:4(decimal!null) b:5(bool)
+ ├── immutable
  ├── stats: [rows=650, distinct(3)=1, null(3)=0, distinct(4)=650, null(4)=0, distinct(3,4)=650, null(3,4)=0]
  ├── key: (1)
  ├── fd: (1)-->(2-5), (3,4)-->(1,2,5)
@@ -212,13 +213,14 @@ select
  │    └── fd: (1)-->(2-5), (3,4)~~>(1,2,5)
  └── filters
       ├── ((s:3 >= 'bar') AND (s:3 <= 'foo')) OR (s:3 >= 'foobar') [type=bool, outer=(3), constraints=(/3: [/'bar' - /'foo'] [/'foobar' - ]; tight)]
-      └── d:4 > 5.0 [type=bool, outer=(4), constraints=(/4: (/5.0 - ]; tight)]
+      └── d:4 > 5.0 [type=bool, outer=(4), immutable, constraints=(/4: (/5.0 - ]; tight)]
 
 opt
 SELECT * FROM a WHERE ((s >= 'bar' AND s <= 'foo') OR (s >= 'foobar')) AND d <= 5.0 AND s IS NOT NULL
 ----
 select
  ├── columns: x:1(int!null) y:2(int) s:3(string!null) d:4(decimal!null) b:5(bool)
+ ├── immutable
  ├── stats: [rows=650, distinct(3)=1, null(3)=0, distinct(4)=650, null(4)=0, distinct(3,4)=650, null(3,4)=0]
  ├── key: (1)
  ├── fd: (1)-->(2-5), (3,4)-->(1,2,5)
@@ -229,7 +231,7 @@ select
  │    └── fd: (1)-->(2-5), (3,4)~~>(1,2,5)
  └── filters
       ├── (((s:3 >= 'bar') AND (s:3 <= 'foo')) OR (s:3 >= 'foobar')) AND (s:3 IS NOT NULL) [type=bool, outer=(3), constraints=(/3: [/'bar' - /'foo'] [/'foobar' - ]; tight)]
-      └── d:4 <= 5.0 [type=bool, outer=(4), constraints=(/4: (/NULL - /5.0]; tight)]
+      └── d:4 <= 5.0 [type=bool, outer=(4), immutable, constraints=(/4: (/NULL - /5.0]; tight)]
 
 # Bump up null counts.
 
@@ -359,11 +361,13 @@ SELECT * FROM a WHERE ((s >= 'bar' AND s <= 'foo') OR (s >= 'foobar')) AND d <= 
 ----
 index-join a
  ├── columns: x:1(int!null) y:2(int) s:3(string!null) d:4(decimal!null) b:5(bool)
+ ├── immutable
  ├── stats: [rows=333.333333, distinct(3)=1, null(3)=0, distinct(4)=100, null(4)=0, distinct(3,4)=100, null(3,4)=0]
  ├── key: (1)
  ├── fd: (1)-->(2-5), (3,4)-->(1,2,5)
  └── select
       ├── columns: x:1(int!null) s:3(string!null) d:4(decimal!null)
+      ├── immutable
       ├── stats: [rows=333.333333, distinct(4)=98.265847, null(4)=0]
       ├── key: (1)
       ├── fd: (1)-->(3,4), (3,4)-->(1)
@@ -376,7 +380,7 @@ index-join a
       │    ├── key: (1)
       │    └── fd: (1)-->(3,4), (3,4)-->(1)
       └── filters
-           └── d:4 <= 5.0 [type=bool, outer=(4), constraints=(/4: (/NULL - /5.0]; tight)]
+           └── d:4 <= 5.0 [type=bool, outer=(4), immutable, constraints=(/4: (/NULL - /5.0]; tight)]
 
 exec-ddl
 CREATE TABLE abcde (
@@ -507,14 +511,17 @@ WHERE
 ----
 project
  ├── columns: "?column?":26(int!null)
+ ├── immutable
  ├── stats: [rows=1]
  ├── fd: ()-->(26)
  ├── select
  │    ├── columns: col1:25(bool!null)
+ │    ├── immutable
  │    ├── stats: [rows=1, distinct(25)=1, null(25)=0]
  │    ├── fd: ()-->(25)
  │    ├── project
  │    │    ├── columns: col1:25(bool)
+ │    │    ├── immutable
  │    │    ├── stats: [rows=333333.333, distinct(25)=333333.333, null(25)=0]
  │    │    ├── inner-join (cross)
  │    │    │    ├── columns: tab0.e:5(varchar) tab0.f:6("char") tab0.h:8(varchar) tab0.j:10(float!null) tab1.e:16(varchar) tab1.f:17("char") tab1.j:21(float!null)
@@ -528,7 +535,7 @@ project
  │    │    │    └── filters
  │    │    │         └── tab0.j:10 IN (tab1.j:21,) [type=bool, outer=(10,21)]
  │    │    └── projections
- │    │         └── CASE WHEN ilike_escape(regexp_replace(tab0.h:8, tab1.e:16, tab0.f:6, tab0.e:5::STRING), tab1.f:17, '') THEN true ELSE false END [as=col1:25, type=bool, outer=(5,6,8,16,17)]
+ │    │         └── CASE WHEN ilike_escape(regexp_replace(tab0.h:8, tab1.e:16, tab0.f:6, tab0.e:5::STRING), tab1.f:17, '') THEN true ELSE false END [as=col1:25, type=bool, outer=(5,6,8,16,17), immutable]
  │    └── filters
  │         └── col1:25 [type=bool, outer=(25), constraints=(/25: [/true - /true]; tight), fd=()-->(25)]
  └── projections
@@ -717,6 +724,7 @@ SELECT * FROM hist WHERE c = 20 OR (c < 10)
 ----
 index-join hist
  ├── columns: a:1(int) b:2(date) c:3(decimal!null) d:4(float) e:5(timestamp) f:6(timestamptz) g:7(string)
+ ├── immutable
  ├── stats: [rows=110, distinct(3)=10, null(3)=0]
  │   histogram(3)=  0  0  90  0   0  20
  │                <--- 0 ---- 10 --- 20
@@ -736,6 +744,7 @@ SELECT * FROM hist WHERE c = 20 OR (c <= 10)
 ----
 index-join hist
  ├── columns: a:1(int) b:2(date) c:3(decimal!null) d:4(float) e:5(timestamp) f:6(timestamptz) g:7(string)
+ ├── immutable
  ├── stats: [rows=120, distinct(3)=11, null(3)=0]
  │   histogram(3)=  0  0  90  10  0  20
  │                <--- 0 ---- 10 --- 20
@@ -961,7 +970,7 @@ select
  │    ├── columns: x:1(int!null) y:2(int!null) z:3(int) other:4(int)
  │    ├── stats: [rows=0.58]
  │    ├── key: (2)
- │    ├── fd: ()-->(1), (2)-->(4), (2)-->(3,4), (1,3)~~>(2,4)
+ │    ├── fd: ()-->(1), (2)-->(3,4), (1,3)~~>(2,4)
  │    └── scan xyz@xyz_x_other_z
  │         ├── columns: x:1(int!null) y:2(int!null) other:4(int!null)
  │         ├── constraint: /1/-4/2
@@ -1012,6 +1021,7 @@ SELECT a, b::string FROM t47742 WHERE b = true
 ----
 project
  ├── columns: a:1(int) b:4(string!null)
+ ├── immutable
  ├── stats: [rows=2640.64496]
  ├── fd: ()-->(4)
  ├── index-join t47742
@@ -1029,7 +1039,7 @@ project
  │         ├── key: (3)
  │         └── fd: ()-->(2)
  └── projections
-      └── t47742.b:2::STRING [as=b:4, type=string, outer=(2)]
+      └── t47742.b:2::STRING [as=b:4, type=string, outer=(2), immutable]
 
 # Multi-column stats tests.
 exec-ddl
@@ -1215,7 +1225,7 @@ select
  ├── fd: ()-->(2,3)
  ├── index-join multi_col
  │    ├── columns: a:1(uuid) b:2(bool) c:3(int) d:4(string) e:5(int) f:6(float)
- │    ├── stats: [rows=45.825]
+ │    ├── stats: [rows=16.596296]
  │    ├── fd: ()-->(2)
  │    └── scan multi_col@bef_idx
  │         ├── columns: b:2(bool!null) e:5(int!null) f:6(float!null) rowid:7(int!null)
@@ -1226,7 +1236,7 @@ select
  │         │    ├── [/true/7/5e-324 - /true/7]
  │         │    └── [/true/9/5e-324 - /true/9]
  │         ├── flags: force-index=bef_idx
- │         ├── stats: [rows=45.825, distinct(2)=1, null(2)=0, distinct(5)=5, null(5)=0, distinct(6)=33.3333333, null(6)=0, distinct(2,5,6)=45.825, null(2,5,6)=0]
+ │         ├── stats: [rows=16.596296, distinct(2)=1, null(2)=0, distinct(5)=5, null(5)=0, distinct(6)=16.596296, null(6)=0, distinct(2,5,6)=16.596296, null(2,5,6)=0]
  │         ├── key: (7)
  │         └── fd: ()-->(2), (7)-->(5,6)
  └── filters
@@ -1504,7 +1514,7 @@ select
  ├── fd: ()-->(2,3)
  ├── index-join multi_col
  │    ├── columns: a:1(uuid) b:2(bool) c:3(int) d:4(string) e:5(int) f:6(float)
- │    ├── stats: [rows=412.841659]
+ │    ├── stats: [rows=197.143852]
  │    ├── fd: ()-->(2)
  │    └── scan multi_col@bef_idx
  │         ├── columns: b:2(bool!null) e:5(int!null) f:6(float!null) rowid:7(int!null)
@@ -1515,7 +1525,7 @@ select
  │         │    ├── [/true/7/5e-324 - /true/7]
  │         │    └── [/true/9/5e-324 - /true/9]
  │         ├── flags: force-index=bef_idx
- │         ├── stats: [rows=412.841659, distinct(2)=1, null(2)=0, distinct(5)=5, null(5)=0, distinct(6)=412.841659, null(6)=0, distinct(2,5,6)=412.841659, null(2,5,6)=0]
+ │         ├── stats: [rows=197.143852, distinct(2)=1, null(2)=0, distinct(5)=5, null(5)=0, distinct(6)=197.143852, null(6)=0, distinct(2,5,6)=197.143852, null(2,5,6)=0]
  │         ├── key: (7)
  │         └── fd: ()-->(2), (7)-->(5,6)
  └── filters
@@ -2000,3 +2010,71 @@ select
  └── filters
       ├── a:1 = '37685f26-4b07-40ba-9bbf-42916ed9bc61' [type=bool, outer=(1), constraints=(/1: [/'37685f26-4b07-40ba-9bbf-42916ed9bc61' - /'37685f26-4b07-40ba-9bbf-42916ed9bc61']; tight), fd=()-->(1)]
       └── d:4 = 'foo' [type=bool, outer=(4), constraints=(/4: [/'foo' - /'foo']; tight), fd=()-->(4)]
+
+# Regression test for #50409.
+exec-ddl
+CREATE TABLE t (
+  x int primary key,
+  y int,
+  z int,
+  s string,
+  index (y),
+  index (s)
+)
+----
+
+exec-ddl
+ALTER TABLE t INJECT STATISTICS'[
+  {
+    "columns": ["x"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000,
+    "distinct_count": 1000
+  },
+  {
+    "columns": ["y"],
+    "created_at": "2018-01-01 1:30:00.00000+00:00",
+    "row_count": 1000,
+    "null_count": 500,
+    "distinct_count": 500
+  }
+]'
+----
+
+# The row count estimate of the scan should be approximately 2, to account for
+# the selectivity of the predicate on x. If the selectivity of x is ignored,
+# the row count estimate rises to 501 (and the index join is no longer chosen).
+opt disable=SplitDisjunction
+SELECT * FROM t WHERE (y IS NULL AND x = 5) OR y = 5
+----
+index-join t
+ ├── columns: x:1(int!null) y:2(int) z:3(int) s:4(string)
+ ├── stats: [rows=167.000668, distinct(2)=2, null(2)=167.000668]
+ ├── key: (1)
+ ├── fd: (1)-->(2-4)
+ └── scan t@secondary
+      ├── columns: x:1(int!null) y:2(int)
+      ├── constraint: /2/1
+      │    ├── [/NULL/5 - /NULL/5]
+      │    └── [/5 - /5]
+      ├── stats: [rows=1.95200401, distinct(1)=1.95200401, null(1)=0, distinct(2)=1.95200401, null(2)=1.95200401]
+      ├── key: (1)
+      └── fd: (1)-->(2)
+
+opt
+SELECT * FROM t WHERE (s >= 'a' AND s <= 'b') OR  (s >= 'c' AND s <= 'd') OR (s >= 'e' AND s <= 'f')
+----
+index-join t
+ ├── columns: x:1(int!null) y:2(int) z:3(int) s:4(string!null)
+ ├── stats: [rows=111.111111, distinct(4)=11.1111111, null(4)=0]
+ ├── key: (1)
+ ├── fd: (1)-->(2-4)
+ └── scan t@secondary
+      ├── columns: x:1(int!null) s:4(string!null)
+      ├── constraint: /4/1
+      │    ├── [/'a' - /'b']
+      │    ├── [/'c' - /'d']
+      │    └── [/'e' - /'f']
+      ├── stats: [rows=111.111111, distinct(4)=11.1111111, null(4)=0]
+      ├── key: (1)
+      └── fd: (1)-->(4)

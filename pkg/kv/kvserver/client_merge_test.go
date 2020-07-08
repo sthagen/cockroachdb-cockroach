@@ -1518,6 +1518,9 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 func TestStoreRangeMergeConcurrentRequests(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	// Skipping as part of test-infra-team flaky test cleanup.
+	t.Skip("https://github.com/cockroachdb/cockroach/issues/50795")
+
 	ctx := context.Background()
 	storeCfg := kvserver.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
@@ -3247,7 +3250,7 @@ func TestStoreRangeMergeDuringShutdown(t *testing.T) {
 		return err
 	})
 	if exp := "not lease holder"; !testutils.IsError(err, exp) {
-		t.Fatalf("expected %q error, but got %v", err, exp)
+		t.Fatalf("expected %q error, but got %v", exp, err)
 	}
 }
 

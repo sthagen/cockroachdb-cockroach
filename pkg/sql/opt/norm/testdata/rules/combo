@@ -25,8 +25,10 @@ Initial expression
 ================================================================================
   project
    ├── columns: s:4
+   ├── immutable
    └── inner-join (cross)
         ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6!null y:7
+        ├── immutable
         ├── key: (1,6)
         ├── fd: (1)-->(2-5), (3,4)~~>(1,2,5), (6)-->(7)
         ├── scan a
@@ -38,16 +40,18 @@ Initial expression
         │    ├── key: (6)
         │    └── fd: (6)-->(7)
         └── filters
-             └── (k:1 = x:6) AND ((i:2 + 1) = 10) [outer=(1,2,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ])]
+             └── (k:1 = x:6) AND ((i:2 + 1) = 10) [outer=(1,2,6), immutable, constraints=(/1: (/NULL - ]; /6: (/NULL - ])]
 ================================================================================
 NormalizeCmpPlusConst
   Cost: 15470.07
 ================================================================================
    project
     ├── columns: s:4
+    ├── immutable
     └── inner-join (cross)
   -      ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6!null y:7
   +      ├── columns: k:1!null i:2!null f:3 s:4 j:5 x:6!null y:7
+         ├── immutable
          ├── key: (1,6)
          ├── fd: (1)-->(2-5), (3,4)~~>(1,2,5), (6)-->(7)
          ├── scan a
@@ -59,16 +63,18 @@ NormalizeCmpPlusConst
          │    ├── key: (6)
          │    └── fd: (6)-->(7)
          └── filters
-  -           └── (k:1 = x:6) AND ((i:2 + 1) = 10) [outer=(1,2,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ])]
-  +           └── (k:1 = x:6) AND (i:2 = (10 - 1)) [outer=(1,2,6), constraints=(/1: (/NULL - ]; /2: (/NULL - ]; /6: (/NULL - ])]
+  -           └── (k:1 = x:6) AND ((i:2 + 1) = 10) [outer=(1,2,6), immutable, constraints=(/1: (/NULL - ]; /6: (/NULL - ])]
+  +           └── (k:1 = x:6) AND (i:2 = (10 - 1)) [outer=(1,2,6), immutable, constraints=(/1: (/NULL - ]; /2: (/NULL - ]; /6: (/NULL - ])]
 ================================================================================
 FoldBinary
   Cost: 12203.40
 ================================================================================
    project
     ├── columns: s:4
+  - ├── immutable
     └── inner-join (cross)
          ├── columns: k:1!null i:2!null f:3 s:4 j:5 x:6!null y:7
+  -      ├── immutable
          ├── key: (1,6)
   -      ├── fd: (1)-->(2-5), (3,4)~~>(1,2,5), (6)-->(7)
   +      ├── fd: ()-->(2), (1)-->(3-5), (3,4)~~>(1,5), (6)-->(7)
@@ -81,7 +87,7 @@ FoldBinary
          │    ├── key: (6)
          │    └── fd: (6)-->(7)
          └── filters
-  -           └── (k:1 = x:6) AND (i:2 = (10 - 1)) [outer=(1,2,6), constraints=(/1: (/NULL - ]; /2: (/NULL - ]; /6: (/NULL - ])]
+  -           └── (k:1 = x:6) AND (i:2 = (10 - 1)) [outer=(1,2,6), immutable, constraints=(/1: (/NULL - ]; /2: (/NULL - ]; /6: (/NULL - ])]
   +           └── (k:1 = x:6) AND (i:2 = 9) [outer=(1,2,6), constraints=(/1: (/NULL - ]; /2: [/9 - /9]; /6: (/NULL - ]), fd=()-->(2)]
 ================================================================================
 SimplifyJoinFilters
@@ -94,6 +100,7 @@ SimplifyJoinFilters
          ├── columns: k:1!null i:2!null f:3 s:4 j:5 x:6!null y:7
   -      ├── key: (1,6)
   -      ├── fd: ()-->(2), (1)-->(3-5), (3,4)~~>(1,5), (6)-->(7)
+  +      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
   +      ├── key: (6)
   +      ├── fd: ()-->(2), (1)-->(3-5), (3,4)~~>(1,5), (6)-->(7), (1)==(6), (6)==(1)
          ├── scan a
@@ -116,6 +123,7 @@ PushFilterIntoJoinLeft
     ├── columns: s:4
     └── inner-join (hash)
          ├── columns: k:1!null i:2!null f:3 s:4 j:5 x:6!null y:7
+         ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
          ├── key: (6)
          ├── fd: ()-->(2), (1)-->(3-5), (3,4)~~>(1,5), (6)-->(7), (1)==(6), (6)==(1)
   -      ├── scan a
@@ -148,6 +156,7 @@ PruneJoinLeftCols
     └── inner-join (hash)
   -      ├── columns: k:1!null i:2!null f:3 s:4 j:5 x:6!null y:7
   +      ├── columns: k:1!null i:2!null s:4 x:6!null y:7
+         ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
          ├── key: (6)
   -      ├── fd: ()-->(2), (1)-->(3-5), (3,4)~~>(1,5), (6)-->(7), (1)==(6), (6)==(1)
   -      ├── select
@@ -188,6 +197,7 @@ PruneSelectCols
     ├── columns: s:4
     └── inner-join (hash)
          ├── columns: k:1!null i:2!null s:4 x:6!null y:7
+         ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
          ├── key: (6)
          ├── fd: ()-->(2), (1)-->(4), (6)-->(7), (1)==(6), (6)==(1)
          ├── project
@@ -222,6 +232,7 @@ EliminateProject
     ├── columns: s:4
     └── inner-join (hash)
          ├── columns: k:1!null i:2!null s:4 x:6!null y:7
+         ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
          ├── key: (6)
          ├── fd: ()-->(2), (1)-->(4), (6)-->(7), (1)==(6), (6)==(1)
   -      ├── project
@@ -260,6 +271,7 @@ PruneJoinRightCols
     └── inner-join (hash)
   -      ├── columns: k:1!null i:2!null s:4 x:6!null y:7
   +      ├── columns: k:1!null i:2!null s:4 x:6!null
+         ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
          ├── key: (6)
   -      ├── fd: ()-->(2), (1)-->(4), (6)-->(7), (1)==(6), (6)==(1)
   +      ├── fd: ()-->(2), (1)-->(4), (1)==(6), (6)==(1)
@@ -288,6 +300,9 @@ GenerateIndexScans (no changes)
 GenerateZigzagJoins (no changes)
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
+GeneratePartialIndexScans (no changes)
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
 GenerateConstrainedScans (no changes)
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -301,6 +316,7 @@ CommuteJoin
     ├── columns: s:4
     └── inner-join (hash)
          ├── columns: k:1!null i:2!null s:4 x:6!null
+         ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
          ├── key: (6)
          ├── fd: ()-->(2), (1)-->(4), (1)==(6), (6)==(1)
   +      ├── scan xy
@@ -330,6 +346,7 @@ GenerateMergeJoins
   - └── inner-join (hash)
   + └── inner-join (merge)
          ├── columns: k:1!null i:2!null s:4 x:6!null
+  -      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
   +      ├── left ordering: +1
   +      ├── right ordering: +6
          ├── key: (6)
@@ -570,6 +587,9 @@ GenerateIndexScans
               └── f:3 > 100.0 [outer=(3), constraints=(/3: [/100.00000000000001 - ]; tight)]
 --------------------------------------------------------------------------------
 GenerateZigzagJoins (no changes)
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+GeneratePartialIndexScans (no changes)
 --------------------------------------------------------------------------------
 ================================================================================
 GenerateConstrainedScans
@@ -819,6 +839,7 @@ CommuteSemiJoin
   -      └── y:7 = i:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
   + └── inner-join (hash)
   +      ├── columns: k:1!null i:2!null f:3 s:4 j:5 y:7!null
+  +      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
   +      ├── key: (1)
   +      ├── fd: (1)-->(2-5), (3,4)~~>(1,2,5), (2)==(7), (7)==(2)
   +      ├── scan a
@@ -867,6 +888,7 @@ Final best expression
    ├── fd: (1)-->(2-5), (3,4)~~>(1,2,5)
    └── inner-join (hash)
         ├── columns: k:1!null i:2!null f:3 s:4 j:5 y:7!null
+        ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
         ├── key: (1)
         ├── fd: (1)-->(2-5), (3,4)~~>(1,2,5), (2)==(7), (7)==(2)
         ├── scan a
@@ -1051,7 +1073,7 @@ HoistProjectSubquery
   + │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
   + │    │    │              └── notnull:9
   + │    │    └── projections
-  + │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+  + │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
   + │    └── filters (true)
     └── projections
   -      └── any: eq [as=r:8, outer=(1), correlated-subquery]
@@ -1139,7 +1161,7 @@ CommuteVar
     │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
     │    │    │              └── notnull:9
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1219,7 +1241,7 @@ PushSelectIntoProject
     │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
     │    │    │              └── notnull:9
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1297,7 +1319,7 @@ MergeSelects
     │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
     │    │    │              └── notnull:9
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1378,7 +1400,7 @@ EliminateSelect
     │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
     │    │    │              └── notnull:9
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1448,7 +1470,7 @@ MergeProjects
     │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
     │    │    │              └── notnull:9
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1502,8 +1524,8 @@ FoldNonNullIsNotNull
     │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
     │    │    │              └── notnull:9
     │    │    └── projections
-  - │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
-  + │    │         └── CASE WHEN bool_or:10 AND true THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+  - │    │         └── CASE WHEN bool_or:10 AND (5 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
+  + │    │         └── CASE WHEN bool_or:10 AND true THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1557,8 +1579,8 @@ SimplifyAndTrue
     │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
     │    │    │              └── notnull:9
     │    │    └── projections
-  - │    │         └── CASE WHEN bool_or:10 AND true THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
-  + │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+  - │    │         └── CASE WHEN bool_or:10 AND true THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
+  + │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1648,7 +1670,7 @@ TryDecorrelateProject
   + │    │    │    │              └── notnull:9
   + │    │    │    └── filters (true)
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1747,7 +1769,7 @@ TryDecorrelateScalarGroupBy
   + │    │    │    │                   └── notnull:9
     │    │    │    └── filters (true)
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1833,7 +1855,7 @@ TryDecorrelateProjectSelect
     │    │    │    │                   └── notnull:9
     │    │    │    └── filters (true)
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1871,6 +1893,7 @@ DecorrelateJoin
   - │    │    │    │         │    └── left-join-apply
   + │    │    │    │         │    └── left-join (hash)
     │    │    │    │         │         ├── columns: x:1!null k:3 i:4 notnull:9
+  + │    │    │    │         │         ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    │    │         │         ├── key: (1)
   - │    │    │    │         │         ├── fd: (1)-->(3,4,9)
   + │    │    │    │         │         ├── fd: (3)-->(4), (4)~~>(9), (1)-->(3,4,9)
@@ -1895,7 +1918,7 @@ DecorrelateJoin
     │    │    │    │                   └── notnull:9
     │    │    │    └── filters (true)
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -1932,6 +1955,7 @@ PushFilterIntoJoinRight
     │    │    │    │         │    ├── fd: (1)-->(9)
     │    │    │    │         │    └── left-join (hash)
     │    │    │    │         │         ├── columns: x:1!null k:3 i:4 notnull:9
+    │    │    │    │         │         ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    │    │         │         ├── key: (1)
     │    │    │    │         │         ├── fd: (3)-->(4), (4)~~>(9), (1)-->(3,4,9)
     │    │    │    │         │         ├── scan xy
@@ -1969,7 +1993,7 @@ PushFilterIntoJoinRight
     │    │    │    │                   └── notnull:9
     │    │    │    └── filters (true)
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -2006,6 +2030,7 @@ PushSelectIntoProject
     │    │    │    │         │    ├── fd: (1)-->(9)
     │    │    │    │         │    └── left-join (hash)
     │    │    │    │         │         ├── columns: x:1!null k:3 i:4 notnull:9
+    │    │    │    │         │         ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    │    │         │         ├── key: (1)
     │    │    │    │         │         ├── fd: (3)-->(4), (4)~~>(9), (1)-->(3,4,9)
     │    │    │    │         │         ├── scan xy
@@ -2043,7 +2068,7 @@ PushSelectIntoProject
     │    │    │    │                   └── notnull:9
     │    │    │    └── filters (true)
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -2080,6 +2105,7 @@ EliminateSelect
     │    │    │    │         │    ├── fd: (1)-->(9)
     │    │    │    │         │    └── left-join (hash)
     │    │    │    │         │         ├── columns: x:1!null k:3 i:4 notnull:9
+    │    │    │    │         │         ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    │    │         │         ├── key: (1)
     │    │    │    │         │         ├── fd: (3)-->(4), (4)~~>(9), (1)-->(3,4,9)
     │    │    │    │         │         ├── scan xy
@@ -2124,7 +2150,7 @@ EliminateSelect
     │    │    │    │                   └── notnull:9
     │    │    │    └── filters (true)
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -2162,6 +2188,7 @@ PruneJoinRightCols
     │    │    │    │         │    └── left-join (hash)
   - │    │    │    │         │         ├── columns: x:1!null k:3 i:4 notnull:9
   + │    │    │    │         │         ├── columns: x:1!null k:3 notnull:9
+    │    │    │    │         │         ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    │    │         │         ├── key: (1)
   - │    │    │    │         │         ├── fd: (3)-->(4), (4)~~>(9), (1)-->(3,4,9)
   + │    │    │    │         │         ├── fd: (3)-->(9), (1)-->(3,9)
@@ -2193,7 +2220,7 @@ PruneJoinRightCols
     │    │    │    │                   └── notnull:9
     │    │    │    └── filters (true)
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -2228,10 +2255,12 @@ EliminateGroupByProject
   - │    │    │    │         │    ├── columns: x:1!null notnull:9
   + │    │    │    │         ├── left-join (hash)
   + │    │    │    │         │    ├── columns: x:1!null k:3 notnull:9
+  + │    │    │    │         │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    │    │         │    ├── key: (1)
   - │    │    │    │         │    ├── fd: (1)-->(9)
   - │    │    │    │         │    └── left-join (hash)
   - │    │    │    │         │         ├── columns: x:1!null k:3 notnull:9
+  - │    │    │    │         │         ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
   - │    │    │    │         │         ├── key: (1)
   - │    │    │    │         │         ├── fd: (3)-->(9), (1)-->(3,9)
   - │    │    │    │         │         ├── scan xy
@@ -2282,7 +2311,7 @@ EliminateGroupByProject
     │    │    │    │                   └── notnull:9
     │    │    │    └── filters (true)
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -2317,6 +2346,7 @@ EliminateProject
   - │    │    │    │         ├── fd: (1)-->(10)
   - │    │    │    │         ├── left-join (hash)
   - │    │    │    │         │    ├── columns: x:1!null k:3 notnull:9
+  - │    │    │    │         │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
   - │    │    │    │         │    ├── key: (1)
   - │    │    │    │         │    ├── fd: (3)-->(9), (1)-->(3,9)
   - │    │    │    │         │    ├── scan xy
@@ -2345,6 +2375,7 @@ EliminateProject
   - │    │    │    │                   └── notnull:9
   + │    │    │    │    ├── left-join (hash)
   + │    │    │    │    │    ├── columns: x:1!null k:3 notnull:9
+  + │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
   + │    │    │    │    │    ├── key: (1)
   + │    │    │    │    │    ├── fd: (3)-->(9), (1)-->(3,9)
   + │    │    │    │    │    ├── scan xy
@@ -2373,7 +2404,7 @@ EliminateProject
   + │    │    │    │              └── notnull:9
     │    │    │    └── filters (true)
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -2402,10 +2433,12 @@ EliminateSelect
   - │    │    │    │    ├── grouping columns: x:1!null
   + │    │    │    ├── left-join (hash)
   + │    │    │    │    ├── columns: x:1!null k:3 notnull:9
+  + │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    │    │    ├── key: (1)
   - │    │    │    │    ├── fd: (1)-->(10)
   - │    │    │    │    ├── left-join (hash)
   - │    │    │    │    │    ├── columns: x:1!null k:3 notnull:9
+  - │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
   - │    │    │    │    │    ├── key: (1)
   - │    │    │    │    │    ├── fd: (3)-->(9), (1)-->(3,9)
   - │    │    │    │    │    ├── scan xy
@@ -2456,7 +2489,7 @@ EliminateSelect
   + │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
   + │    │    │              └── notnull:9
     │    │    └── projections
-    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     │    └── filters (true)
     └── projections
          └── case:11 [as=r:8, outer=(11)]
@@ -2485,10 +2518,12 @@ EliminateSelect
   + │    │    ├── fd: (1)-->(10)
   + │    │    ├── left-join (hash)
   + │    │    │    ├── columns: x:1!null k:3 notnull:9
+  + │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    │    ├── key: (1)
   - │    │    │    ├── fd: (1)-->(10)
   - │    │    │    ├── left-join (hash)
   - │    │    │    │    ├── columns: x:1!null k:3 notnull:9
+  - │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
   - │    │    │    │    ├── key: (1)
   - │    │    │    │    ├── fd: (3)-->(9), (1)-->(3,9)
   - │    │    │    │    ├── scan xy
@@ -2528,7 +2563,7 @@ EliminateSelect
   - │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
   - │    │    │              └── notnull:9
   - │    │    └── projections
-  - │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+  - │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
   - │    └── filters (true)
   + │    │    │    │    │    │    └── fd: (3)-->(4)
   + │    │    │    │    │    └── filters
@@ -2541,7 +2576,7 @@ EliminateSelect
   + │    │         └── bool-or [as=bool_or:10, outer=(9)]
   + │    │              └── notnull:9
   + │    └── projections
-  + │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+  + │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     └── projections
          └── case:11 [as=r:8, outer=(11)]
 ================================================================================
@@ -2562,6 +2597,7 @@ PruneProjectCols
     │    │    ├── fd: (1)-->(10)
     │    │    ├── left-join (hash)
     │    │    │    ├── columns: x:1!null k:3 notnull:9
+    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    │    ├── key: (1)
     │    │    │    ├── fd: (3)-->(9), (1)-->(3,9)
     │    │    │    ├── scan xy
@@ -2589,7 +2625,7 @@ PruneProjectCols
     │    │         └── bool-or [as=bool_or:10, outer=(9)]
     │    │              └── notnull:9
     │    └── projections
-    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
     └── projections
          └── case:11 [as=r:8, outer=(11)]
 ================================================================================
@@ -2610,10 +2646,12 @@ InlineProjectInProject
   + │    ├── fd: (1)-->(10)
   + │    ├── left-join (hash)
   + │    │    ├── columns: x:1!null k:3 notnull:9
+  + │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    ├── key: (1)
   - │    │    ├── fd: (1)-->(10)
   - │    │    ├── left-join (hash)
   - │    │    │    ├── columns: x:1!null k:3 notnull:9
+  - │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
   - │    │    │    ├── key: (1)
   - │    │    │    ├── fd: (3)-->(9), (1)-->(3,9)
   - │    │    │    ├── scan xy
@@ -2653,7 +2691,7 @@ InlineProjectInProject
   - │    │         └── bool-or [as=bool_or:10, outer=(9)]
   - │    │              └── notnull:9
   - │    └── projections
-  - │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+  - │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
   + │    │    │    │    │    └── fd: (3)-->(4)
   + │    │    │    │    └── filters
   + │    │    │    │         └── (i:4 = 5) IS NOT false [outer=(4)]
@@ -2666,7 +2704,7 @@ InlineProjectInProject
   + │              └── notnull:9
     └── projections
   -      └── case:11 [as=r:8, outer=(11)]
-  +      └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=r:8, outer=(10)]
+  +      └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(10)]
 --------------------------------------------------------------------------------
 GenerateIndexScans (no changes)
 --------------------------------------------------------------------------------
@@ -2675,6 +2713,9 @@ GenerateIndexScans (no changes)
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
 GenerateZigzagJoins (no changes)
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+GeneratePartialIndexScans (no changes)
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
 GenerateConstrainedScans (no changes)
@@ -2692,6 +2733,7 @@ CommuteLeftJoin (higher cost)
   - │    ├── left-join (hash)
   + │    ├── right-join (hash)
     │    │    ├── columns: x:1!null k:3 notnull:9
+  - │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
     │    │    ├── key: (1)
     │    │    ├── fd: (3)-->(9), (1)-->(3,9)
   - │    │    ├── scan xy
@@ -2722,7 +2764,7 @@ CommuteLeftJoin (higher cost)
     │         └── bool-or [as=bool_or:10, outer=(9)]
     │              └── notnull:9
     └── projections
-         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=r:8, outer=(10)]
+         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(10)]
 ================================================================================
 GenerateMergeJoins
   Cost: 2200.10
@@ -2737,6 +2779,7 @@ GenerateMergeJoins
   - │    ├── left-join (hash)
   + │    ├── left-join (merge)
     │    │    ├── columns: x:1!null k:3 notnull:9
+  - │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
   + │    │    ├── left ordering: +1
   + │    │    ├── right ordering: +3
     │    │    ├── key: (1)
@@ -2773,7 +2816,7 @@ GenerateMergeJoins
     │         └── bool-or [as=bool_or:10, outer=(9)]
     │              └── notnull:9
     └── projections
-         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=r:8, outer=(10)]
+         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(10)]
 --------------------------------------------------------------------------------
 GenerateMergeJoins (higher cost)
 --------------------------------------------------------------------------------
@@ -2825,7 +2868,7 @@ GenerateMergeJoins (higher cost)
     │         └── bool-or [as=bool_or:10, outer=(9)]
     │              └── notnull:9
     └── projections
-         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=r:8, outer=(10)]
+         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(10)]
 ================================================================================
 GenerateStreamingGroupBy
   Cost: 2190.10
@@ -2873,7 +2916,7 @@ GenerateStreamingGroupBy
     │         └── bool-or [as=bool_or:10, outer=(9)]
     │              └── notnull:9
     └── projections
-         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=r:8, outer=(10)]
+         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(10)]
 ================================================================================
 Final best expression
   Cost: 2190.10
@@ -2921,4 +2964,4 @@ Final best expression
    │         └── bool-or [as=bool_or:10, outer=(9)]
    │              └── notnull:9
    └── projections
-        └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=r:8, outer=(10)]
+        └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(10)]

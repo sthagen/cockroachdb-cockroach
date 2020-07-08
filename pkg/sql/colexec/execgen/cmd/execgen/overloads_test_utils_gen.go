@@ -23,7 +23,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -59,7 +59,7 @@ func {{template "opName" .}}(a {{.Left.GoType}}, b {{.Right.GoType}}) {{.Right.R
 // genOverloadsTestUtils creates a file that has a function for each binary and
 // comparison overload supported by the vectorized engine. This is so that we
 // can more easily test each overload.
-func genOverloadsTestUtils(wr io.Writer) error {
+func genOverloadsTestUtils(_ string, wr io.Writer) error {
 	tmpl, err := template.New("overloads_test_utils").Parse(overloadsTestUtilsTemplate)
 	if err != nil {
 		return err

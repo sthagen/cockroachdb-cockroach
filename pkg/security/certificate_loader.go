@@ -55,6 +55,11 @@ var defaultAssetLoader = AssetLoader{
 // assetLoaderImpl is used to list/read/stat security assets.
 var assetLoaderImpl = defaultAssetLoader
 
+// GetAssetLoader returns the active asset loader.
+func GetAssetLoader() AssetLoader {
+	return assetLoaderImpl
+}
+
 // SetAssetLoader overrides the asset loader with the passed-in one.
 func SetAssetLoader(al AssetLoader) {
 	assetLoaderImpl = al
@@ -72,6 +77,12 @@ const (
 	_ PemUsage = iota
 	// CAPem describes the main CA certificate.
 	CAPem
+	// TenantServerCAPem describes the CA certificate used to host endpoints that
+	// tenants will access.
+	TenantServerCAPem
+	// TenantClientCAPem describes the CA certificate used to broker authN/Z for SQL
+	// tenants wishing to access the KV layer.
+	TenantClientCAPem
 	// ClientCAPem describes the CA certificate used to verify client certificates.
 	ClientCAPem
 	// UICAPem describes the CA certificate used to verify the Admin UI server certificate.
@@ -79,10 +90,15 @@ const (
 	// NodePem describes the server certificate for the node, possibly a combined server/client
 	// certificate for user Node if a separate 'client.node.crt' is not present.
 	NodePem
+	// TenantServerPem describes the server certificate for hosting endpoints accessible
+	// to SQL tenants.
+	TenantServerPem
 	// UIPem describes the server certificate for the admin UI.
 	UIPem
 	// ClientPem describes a client certificate.
 	ClientPem
+	// TenantClientPem describes a SQL tenant client certificate.
+	TenantClientPem
 
 	// Maximum allowable permissions.
 	maxKeyPermissions os.FileMode = 0700
@@ -94,7 +110,7 @@ const (
 )
 
 func isCA(usage PemUsage) bool {
-	return usage == CAPem || usage == ClientCAPem || usage == UICAPem
+	return usage == CAPem || usage == TenantServerCAPem || usage == ClientCAPem || usage == TenantClientCAPem || usage == UICAPem
 }
 
 func (p PemUsage) String() string {
@@ -103,6 +119,10 @@ func (p PemUsage) String() string {
 		return "CA"
 	case ClientCAPem:
 		return "Client CA"
+	case TenantServerCAPem:
+		return "Tenant Server CA"
+	case TenantClientCAPem:
+		return "Tenant Client CA"
 	case UICAPem:
 		return "UI CA"
 	case NodePem:
@@ -185,6 +205,16 @@ func CertInfoFromFilename(filename string) (*CertInfo, error) {
 		if numParts != 2 {
 			return nil, errors.Errorf("client CA certificate filename should match ca-client%s", certExtension)
 		}
+	case `ca-server-tenant`:
+		fileUsage = TenantServerCAPem
+		if numParts != 2 {
+			return nil, errors.Errorf("tenant CA certificate filename should match ca%s", certExtension)
+		}
+	case `ca-client-tenant`:
+		fileUsage = TenantClientCAPem
+		if numParts != 2 {
+			return nil, errors.Errorf("tenant CA certificate filename should match ca%s", certExtension)
+		}
 	case `ca-ui`:
 		fileUsage = UICAPem
 		if numParts != 2 {
@@ -195,6 +225,11 @@ func CertInfoFromFilename(filename string) (*CertInfo, error) {
 		if numParts != 2 {
 			return nil, errors.Errorf("node certificate filename should match node%s", certExtension)
 		}
+	case `server-tenant`:
+		fileUsage = TenantServerPem
+		if numParts != 2 {
+			return nil, errors.Errorf("tenant server certificate filename should match server-tenant%s", certExtension)
+		}
 	case `ui`:
 		fileUsage = UIPem
 		if numParts != 2 {
@@ -202,10 +237,17 @@ func CertInfoFromFilename(filename string) (*CertInfo, error) {
 		}
 	case `client`:
 		fileUsage = ClientPem
-		// strip prefix and suffix and re-join middle parts.
+		// Strip prefix and suffix and re-join middle parts.
 		name = strings.Join(parts[1:numParts-1], `.`)
 		if len(name) == 0 {
 			return nil, errors.Errorf("client certificate filename should match client.<user>%s", certExtension)
+		}
+	case `client-tenant`:
+		fileUsage = TenantClientPem
+		// Strip prefix and suffix and re-join middle parts.
+		name = strings.Join(parts[1:numParts-1], `.`)
+		if len(name) == 0 {
+			return nil, errors.Errorf("tenant certificate filename should match client-tenant.<tenantid>%s", certExtension)
 		}
 	default:
 		return nil, errors.Errorf("unknown prefix %q", prefix)

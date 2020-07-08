@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -57,11 +58,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft/raftpb"
 )
-
-func strToValue(s string) *roachpb.Value {
-	v := roachpb.MakeValueFromBytes([]byte(s))
-	return &v
-}
 
 // TestRangeCommandClockUpdate verifies that followers update their
 // clocks when executing a command, even if the lease holder's clock is far
@@ -281,7 +277,7 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 			}
 
 			updatedVal := []byte("updatedVal")
-			if err := txn.CPut(ctx, key, updatedVal, strToValue("initVal")); err != nil {
+			if err := txn.CPut(ctx, key, updatedVal, kvclientutils.StrToCPutExistingValue("initVal")); err != nil {
 				log.Errorf(context.Background(), "failed put value: %+v", err)
 				return err
 			}
@@ -1883,11 +1879,6 @@ func TestClearRange(t *testing.T) {
 	// Verify that a ClearRange request from [lg1, lg3) removes lg1 and lg2.
 	clearRange(lg1, lg3)
 	verifyKeysWithPrefix(lg, []roachpb.Key{lg3})
-
-	// Verify that only the large ClearRange request used a range deletion
-	// tombstone by checking for the presence of a suggested compaction.
-	verifyKeysWithPrefix(keys.LocalStoreSuggestedCompactionsMin,
-		[]roachpb.Key{keys.StoreSuggestedCompactionKey(lg1, lg3)})
 }
 
 // TestLeaseTransferInSnapshotUpdatesTimestampCache prevents a regression of
@@ -2840,7 +2831,7 @@ func TestChangeReplicasLeaveAtomicRacesWithMerge(t *testing.T) {
 		err = db.AdminMerge(ctx, lhs)
 		require.NoError(t, err)
 		if resplit {
-			require.NoError(t, db.AdminSplit(ctx, lhs, rhs, hlc.Timestamp{WallTime: math.MaxInt64}))
+			require.NoError(t, db.AdminSplit(ctx, rhs, hlc.Timestamp{WallTime: math.MaxInt64}))
 			err = tc.WaitForSplitAndInitialization(rhs)
 			require.NoError(t, err)
 		}

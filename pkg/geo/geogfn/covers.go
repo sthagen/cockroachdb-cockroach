@@ -48,6 +48,11 @@ func Covers(a *geo.Geography, b *geo.Geography) (bool, error) {
 
 // covers is the internal calculation for Covers.
 func covers(a *geo.Geography, b *geo.Geography) (bool, error) {
+	// Rect "contains" is a version of covers.
+	if !a.BoundingRect().Contains(b.BoundingRect()) {
+		return false, nil
+	}
+
 	// Ignore EMPTY regions in a.
 	aRegions, err := a.AsS2(geo.EmptyBehaviorOmit)
 	if err != nil {

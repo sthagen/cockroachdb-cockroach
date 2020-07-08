@@ -70,7 +70,13 @@ type extendedEvalContext struct {
 
 	TxnModesSetter txnModesSetter
 
+	// Jobs refers to jobs in extraTxnState. Jobs is a pointer to a jobsCollection
+	// which is a slice because we need calls to resetExtraTxnState to reset the
+	// jobsCollection.
 	Jobs *jobsCollection
+
+	// SchemaChangeJobCache refers to schemaChangeJobsCache in extraTxnState.
+	SchemaChangeJobCache map[sqlbase.ID]*jobs.Job
 
 	schemaAccessors *schemaInterface
 
@@ -197,6 +203,12 @@ type planner struct {
 	noticeSender noticeSender
 
 	queryCacheSession querycache.Session
+
+	// contextDatabaseID is the ID of a database. It is set during some name
+	// resolution processes to disallow cross database references. In particular,
+	// the type resolution steps will disallow resolution of types that have a
+	// parentID != contextDatabaseID when it is set.
+	contextDatabaseID sqlbase.ID
 }
 
 func (ctx *extendedEvalContext) setSessionID(sessionID ClusterWideID) {
@@ -276,7 +288,6 @@ func newInternalPlanner(
 	p.cancelChecker = sqlbase.NewCancelChecker(ctx)
 
 	p.semaCtx = tree.MakeSemaContext()
-	p.semaCtx.Location = &sd.DataConversion.Location
 	p.semaCtx.SearchPath = sd.SearchPath
 	p.semaCtx.TypeResolver = p
 
@@ -299,6 +310,7 @@ func newInternalPlanner(
 	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	p.extendedEvalCtx.NodeID = execCfg.NodeID
 	p.extendedEvalCtx.Locality = execCfg.Locality
+	p.extendedEvalCtx.TypeResolver = p
 
 	p.sessionDataMutator = dataMutator
 	p.autoCommit = false
@@ -369,6 +381,11 @@ func (p *planner) PhysicalSchemaAccessor() catalog.Accessor {
 // LogicalSchemaAccessor is part of the resolver.SchemaResolver interface.
 func (p *planner) LogicalSchemaAccessor() catalog.Accessor {
 	return p.extendedEvalCtx.schemaAccessors.logical
+}
+
+// SemaCtx provides access to the planner's SemaCtx.
+func (p *planner) SemaCtx() *tree.SemaContext {
+	return &p.semaCtx
 }
 
 // Note: if the context will be modified, use ExtendedEvalContextCopy instead.
@@ -446,7 +463,8 @@ func (p *planner) ParseQualifiedTableName(sql string) (*tree.TableName, error) {
 
 // ResolveTableName implements the tree.EvalDatabase interface.
 func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tree.ID, error) {
-	desc, err := resolver.ResolveExistingTableObject(ctx, p, tn, tree.ObjectLookupFlagsWithRequired(), resolver.ResolveAnyDescType)
+	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveAnyTableKind)
+	desc, err := resolver.ResolveExistingTableObject(ctx, p, tn, flags)
 	if err != nil {
 		return 0, err
 	}

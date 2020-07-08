@@ -12,9 +12,11 @@ package sql
 
 import (
 	"context"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
@@ -23,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -48,6 +51,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 
 	switch stmt.AST.(type) {
 	case *tree.AlterIndex, *tree.AlterTable, *tree.AlterSequence,
+		*tree.Analyze,
 		*tree.BeginTransaction,
 		*tree.CommentOnColumn, *tree.CommentOnDatabase, *tree.CommentOnIndex, *tree.CommentOnTable,
 		*tree.CommitTransaction,
@@ -173,11 +177,59 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 
 	// Build the plan tree.
 	root := execMemo.RootExpr()
-	execFactory := makeExecFactory(p)
-	bld := execbuilder.New(&execFactory, execMemo, &opc.catalog, root, p.EvalContext())
-	plan, err := bld.Build()
-	if err != nil {
-		return err
+	var (
+		plan exec.Plan
+		bld  *execbuilder.Builder
+	)
+	// TODO(yuzefovich): we're creating a new exec.Factory for every query, but
+	// we probably could pool those allocations using sync.Pool. Investigate
+	// this.
+	if mode := p.SessionData().ExperimentalDistSQLPlanningMode; mode != sessiondata.ExperimentalDistSQLPlanningOff {
+		bld = execbuilder.New(newDistSQLSpecExecFactory(p, distSQLDefaultPlanning), execMemo, &opc.catalog, root, p.EvalContext())
+		plan, err = bld.Build()
+		if err != nil {
+			if mode == sessiondata.ExperimentalDistSQLPlanningAlways &&
+				!strings.Contains(p.stmt.AST.StatementTag(), "SET") {
+				// We do not fallback to the old path because experimental
+				// planning is set to 'always' and we don't have a SET
+				// statement, so we return an error. SET statements are
+				// exceptions because we want to be able to execute them
+				// regardless of whether they are supported by the new factory.
+				// TODO(yuzefovich): update this once SET statements are
+				// supported (see #47473).
+				return err
+			}
+			// We will fallback to the old path.
+		}
+		if err == nil {
+			m := plan.(*planTop).main
+			if m.isPartiallyDistributed() && p.SessionData().PartiallyDistributedPlansDisabled {
+				// The planning has succeeded, but we've created a partially
+				// distributed plan yet the session variable prohibits such
+				// plan distribution - we need to replan with a new factory
+				// that forces local planning.
+				// TODO(yuzefovich): remove this logic when deleting old
+				// execFactory.
+				bld = execbuilder.New(newDistSQLSpecExecFactory(p, distSQLLocalOnlyPlanning), execMemo, &opc.catalog, root, p.EvalContext())
+				plan, err = bld.Build()
+			}
+		}
+		if err != nil {
+			bld = nil
+			// TODO(yuzefovich): make the logging conditional on the verbosity
+			// level once new DistSQL planning is no longer experimental.
+			log.Infof(ctx, "distSQLSpecExecFactory failed planning with %v, "+
+				"falling back to the old path", err)
+		}
+	}
+	if bld == nil {
+		// If bld is non-nil, then experimental planning has succeeded and has
+		// already created a plan.
+		bld = execbuilder.New(newExecFactory(p), execMemo, &opc.catalog, root, p.EvalContext())
+		plan, err = bld.Build()
+		if err != nil {
+			return err
+		}
 	}
 
 	result := plan.(*planTop)
@@ -189,7 +241,7 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 		result.flags.Set(planFlagIsDDL)
 	}
 
-	cols := planColumns(result.main)
+	cols := result.main.planColumns()
 	if stmt.ExpectedTypes != nil {
 		if !stmt.ExpectedTypes.TypesEqual(cols) {
 			return pgerror.New(pgcode.FeatureNotSupported, "cached plan must not change result type")
@@ -314,6 +366,7 @@ func (opc *optPlanningCtx) buildReusableMemo(ctx context.Context) (_ *memo.Memo,
 	}
 
 	if bld.DisableMemoReuse {
+		// The builder encountered a statement that prevents safe reuse of the memo.
 		opc.allowMemoReuse = false
 		opc.useCache = false
 	}
@@ -321,16 +374,17 @@ func (opc *optPlanningCtx) buildReusableMemo(ctx context.Context) (_ *memo.Memo,
 	if isCanned {
 		if f.Memo().HasPlaceholders() {
 			// We don't support placeholders inside the canned plan. The main reason
-			// is that they would be invisible to the parser (which is reports the
-			// number of placeholders, used to initialize the relevant structures).
+			// is that they would be invisible to the parser (which reports the number
+			// of placeholders, used to initialize the relevant structures).
 			return nil, pgerror.Newf(pgcode.Syntax,
 				"placeholders are not supported with PREPARE AS OPT PLAN")
 		}
 		// With a canned plan, the memo is already optimized.
 	} else {
-		// If the memo doesn't have placeholders, then fully optimize it, since
-		// it can be reused without further changes to build the execution tree.
-		if !f.Memo().HasPlaceholders() {
+		// If the memo doesn't have placeholders and did not encounter any stable
+		// operators that can be constant folded, then fully optimize it now - it
+		// can be reused without further changes to build the execution tree.
+		if !f.Memo().HasPlaceholders() && !f.FoldingControl().PreventedStableFold() {
 			if _, err := opc.optimizer.Optimize(); err != nil {
 				return nil, err
 			}
@@ -351,16 +405,17 @@ func (opc *optPlanningCtx) buildReusableMemo(ctx context.Context) (_ *memo.Memo,
 // The returned memo is only safe to use in one thread, during execution of the
 // current statement.
 func (opc *optPlanningCtx) reuseMemo(cachedMemo *memo.Memo) (*memo.Memo, error) {
-	if !cachedMemo.HasPlaceholders() {
-		// If there are no placeholders, the query was already fully optimized
-		// (see buildReusableMemo).
+	if cachedMemo.IsOptimized() {
+		// The query could have been already fully optimized if there were no
+		// placeholders (see buildReusableMemo).
 		return cachedMemo, nil
 	}
 	f := opc.optimizer.Factory()
 	// Finish optimization by assigning any remaining placeholders and
 	// applying exploration rules. Reinitialize the optimizer and construct a
 	// new memo that is copied from the prepared memo, but with placeholders
-	// assigned.
+	// assigned. Stable operators can be constant-folded at this time.
+	f.FoldingControl().AllowStableFolds()
 	if err := f.AssignPlaceholders(cachedMemo); err != nil {
 		return nil, err
 	}
@@ -429,6 +484,7 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 	// We are executing a statement for which there is no reusable memo
 	// available.
 	f := opc.optimizer.Factory()
+	f.FoldingControl().AllowStableFolds()
 	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), &opc.catalog, f, opc.p.stmt.AST)
 	if err := bld.Build(); err != nil {
 		return nil, err
@@ -439,10 +495,12 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 		}
 	}
 
-	// If this statement doesn't have placeholders, add it to the cache. Note
-	// that non-prepared statements from pgwire clients cannot have
+	// If this statement doesn't have placeholders and we have not constant-folded
+	// any VolatilityStable operators, add it to the cache.
+	// Note that non-prepared statements from pgwire clients cannot have
 	// placeholders.
-	if opc.useCache && !bld.HadPlaceholders && !bld.DisableMemoReuse {
+	if opc.useCache && !bld.HadPlaceholders && !bld.DisableMemoReuse &&
+		!f.FoldingControl().PermittedStableFold() {
 		memo := opc.optimizer.DetachMemo()
 		cachedData := querycache.CachedData{
 			SQL:  opc.p.stmt.SQL,

@@ -109,6 +109,12 @@ func TestRandStep(t *testing.T) {
 				} else {
 					client.PutMissing++
 				}
+			case *ScanOperation:
+				if o.ForUpdate {
+					client.ScanForUpdate++
+				} else {
+					client.Scan++
+				}
 			case *BatchOperation:
 				batch.Batch++
 				countClientOps(&batch.Ops, nil, o.Ops...)
@@ -120,7 +126,7 @@ func TestRandStep(t *testing.T) {
 	for {
 		step := g.RandStep(rng)
 		switch o := step.Op.GetValue().(type) {
-		case *GetOperation, *PutOperation, *BatchOperation:
+		case *GetOperation, *PutOperation, *ScanOperation, *BatchOperation:
 			countClientOps(&counts.DB, &counts.Batch, step.Op)
 		case *ClosureTxnOperation:
 			countClientOps(&counts.ClosureTxn.TxnClientOps, &counts.ClosureTxn.TxnBatchOps, o.Ops...)

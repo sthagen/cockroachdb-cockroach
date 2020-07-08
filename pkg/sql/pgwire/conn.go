@@ -1111,7 +1111,7 @@ func (c *conn) bufferRow(
 	row tree.Datums,
 	formatCodes []pgwirebase.FormatCode,
 	conv sessiondata.DataConversionConfig,
-	oids []oid.Oid,
+	types []*types.T,
 ) {
 	c.msgBuilder.initMsg(pgwirebase.ServerMsgDataRow)
 	c.msgBuilder.putInt16(int16(len(row)))
@@ -1122,9 +1122,9 @@ func (c *conn) bufferRow(
 		}
 		switch fmtCode {
 		case pgwirebase.FormatText:
-			c.msgBuilder.writeTextDatum(ctx, col, conv)
+			c.msgBuilder.writeTextDatum(ctx, col, conv, types[i])
 		case pgwirebase.FormatBinary:
-			c.msgBuilder.writeBinaryDatum(ctx, col, conv.Location, oids[i])
+			c.msgBuilder.writeBinaryDatum(ctx, col, conv.Location, types[i])
 		default:
 			c.msgBuilder.setError(errors.Errorf("unsupported format code %s", fmtCode))
 		}
@@ -1344,15 +1344,13 @@ func (c *conn) maybeFlush(pos sql.CmdPos) (bool, error) {
 // nothing to "lock" - communication is naturally blocked as the command
 // processor won't write any more results.
 func (c *conn) LockCommunication() sql.ClientLock {
-	return &clientConnLock{flushInfo: &c.writerState.fi}
+	return (*clientConnLock)(&c.writerState.fi)
 }
 
 // clientConnLock is the connection's implementation of sql.ClientLock. It lets
 // the sql module lock the flushing of results and find out what has already
 // been flushed.
-type clientConnLock struct {
-	*flushInfo
-}
+type clientConnLock flushInfo
 
 var _ sql.ClientLock = &clientConnLock{}
 

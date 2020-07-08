@@ -11,9 +11,12 @@
 package geogfn
 
 import (
+	"math"
+
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geographiclib"
 	"github.com/cockroachdb/errors"
+	"github.com/golang/geo/s1"
 	"github.com/golang/geo/s2"
 	"github.com/twpayne/go-geom"
 )
@@ -24,7 +27,10 @@ func Area(g *geo.Geography, useSphereOrSpheroid UseSphereOrSpheroid) (float64, e
 	if err != nil {
 		return 0, err
 	}
-	spheroid := geographiclib.WGS84Spheroid
+	spheroid, err := g.Spheroid()
+	if err != nil {
+		return 0, err
+	}
 
 	var totalArea float64
 	for _, region := range regions {
@@ -63,11 +69,15 @@ func Perimeter(g *geo.Geography, useSphereOrSpheroid UseSphereOrSpheroid) (float
 	default:
 		return 0, nil
 	}
-	regions, err := geo.S2RegionsFromGeom(gt, geo.EmptyBehaviorOmit)
+	regions, err := geo.S2RegionsFromGeomT(gt, geo.EmptyBehaviorOmit)
 	if err != nil {
 		return 0, err
 	}
-	return length(regions, useSphereOrSpheroid)
+	spheroid, err := g.Spheroid()
+	if err != nil {
+		return 0, err
+	}
+	return length(regions, spheroid, useSphereOrSpheroid)
 }
 
 // Length returns length of a given Geography.
@@ -83,18 +93,73 @@ func Length(g *geo.Geography, useSphereOrSpheroid UseSphereOrSpheroid) (float64,
 	default:
 		return 0, nil
 	}
-	regions, err := geo.S2RegionsFromGeom(gt, geo.EmptyBehaviorOmit)
+	regions, err := geo.S2RegionsFromGeomT(gt, geo.EmptyBehaviorOmit)
 	if err != nil {
 		return 0, err
 	}
-	return length(regions, useSphereOrSpheroid)
+	spheroid, err := g.Spheroid()
+	if err != nil {
+		return 0, err
+	}
+	return length(regions, spheroid, useSphereOrSpheroid)
+}
+
+// Project returns calculate a projected point given a source point, a distance and a azimuth.
+func Project(g *geo.Geography, distance float64, azimuth s1.Angle) (*geo.Geography, error) {
+	geomT, err := g.AsGeomT()
+	if err != nil {
+		return nil, err
+	}
+
+	point, ok := geomT.(*geom.Point)
+	if !ok {
+		return nil, errors.Newf("ST_Project(geography) is only valid for point inputs")
+	}
+
+	spheroid, err := g.Spheroid()
+	if err != nil {
+		return nil, err
+	}
+
+	// Normalize distance to be positive.
+	if distance < 0.0 {
+		distance = -distance
+		azimuth += math.Pi
+	}
+
+	// Normalize azimuth
+	azimuth = azimuth.Normalized()
+
+	// Check the distance validity.
+	if distance > (math.Pi * spheroid.Radius) {
+		return nil, errors.Newf("distance must not be greater than %f", math.Pi*spheroid.Radius)
+	}
+
+	// Convert to ta geodetic point.
+	x := point.X()
+	y := point.Y()
+
+	projected := spheroid.Project(
+		s2.LatLngFromDegrees(x, y),
+		distance,
+		azimuth,
+	)
+
+	ret := geom.NewPointFlat(
+		geom.XY,
+		[]float64{
+			geo.NormalizeLongitudeDegrees(projected.Lng.Degrees()),
+			geo.NormalizeLatitudeDegrees(projected.Lat.Degrees()),
+		},
+	).SetSRID(point.SRID())
+	return geo.NewGeographyFromGeomT(ret)
 }
 
 // length returns the sum of the lengtsh and perimeters in the shapes of the Geography.
 // In OGC parlance, length returns both LineString lengths _and_ Polygon perimeters.
-func length(regions []s2.Region, useSphereOrSpheroid UseSphereOrSpheroid) (float64, error) {
-	spheroid := geographiclib.WGS84Spheroid
-
+func length(
+	regions []s2.Region, spheroid *geographiclib.Spheroid, useSphereOrSpheroid UseSphereOrSpheroid,
+) (float64, error) {
 	var totalLength float64
 	for _, region := range regions {
 		switch region := region.(type) {

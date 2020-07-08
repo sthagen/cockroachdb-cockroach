@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -54,19 +55,19 @@ func TestGetDescriptorFromDB(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	aliceDesc := &sqlbase.DatabaseDescriptor{Name: "alice"}
-	bobDesc := &sqlbase.DatabaseDescriptor{Name: "bob"}
+	aliceDesc := sqlbase.NewInitialDatabaseDescriptor(10000, "alice")
+	bobDesc := sqlbase.NewInitialDatabaseDescriptor(9999, "bob")
 
 	err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		if err := txn.SetSystemConfigTrigger(); err != nil {
 			return err
 		}
 		batch := txn.NewBatch()
-		batch.Put(sqlbase.NewDatabaseKey("bob").Key(keys.SystemSQLCodec), 9999)
-		batch.Put(sqlbase.NewDeprecatedDatabaseKey("alice").Key(keys.SystemSQLCodec), 10000)
+		batch.Put(sqlbase.NewDatabaseKey("bob").Key(keys.SystemSQLCodec), bobDesc.GetID())
+		batch.Put(sqlbase.NewDeprecatedDatabaseKey("alice").Key(keys.SystemSQLCodec), aliceDesc.GetID())
 
-		batch.Put(sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, 9999), sqlbase.WrapDescriptor(bobDesc))
-		batch.Put(sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, 10000), sqlbase.WrapDescriptor(aliceDesc))
+		batch.Put(sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, bobDesc.GetID()), bobDesc.DescriptorProto())
+		batch.Put(sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, aliceDesc.GetID()), aliceDesc.DescriptorProto())
 		return txn.CommitInBatch(ctx, batch)
 	})
 	require.NoError(t, err)
@@ -77,8 +78,8 @@ func TestGetDescriptorFromDB(t *testing.T) {
 		expected    *sqlbase.DatabaseDescriptor
 		expectedErr error
 	}{
-		{"bob", bobDesc, nil},
-		{"alice", aliceDesc, nil},
+		{"bob", bobDesc.DatabaseDesc(), nil},
+		{"alice", aliceDesc.DatabaseDesc(), nil},
 		{"not_found", nil, gosql.ErrNoRows},
 	} {
 		t.Run(tc.dbName, func(t *testing.T) {
@@ -88,7 +89,7 @@ func TestGetDescriptorFromDB(t *testing.T) {
 				assert.Equal(t, tc.expectedErr, err)
 			} else {
 				assert.NoError(t, err)
-				assert.Equal(t, tc.expected, ret)
+				assert.Equal(t, tc.expected, ret.DatabaseDesc())
 			}
 		})
 	}
@@ -113,7 +114,8 @@ func TestImportChunking(t *testing.T) {
 	}
 
 	ts := hlc.Timestamp{WallTime: hlc.UnixNano()}
-	desc, err := importccl.Load(ctx, tc.Conns[0], bankBuf(numAccounts), "data", "nodelocal://0"+dir, ts, chunkSize, dir, dir)
+	desc, err := importccl.Load(ctx, tc.Conns[0], bankBuf(numAccounts), "data",
+		"nodelocal://0"+dir, ts, chunkSize, dir, dir, security.RootUser)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -146,7 +148,8 @@ func TestImportOutOfOrder(t *testing.T) {
 	fmt.Fprintf(&buf, "INSERT INTO %s VALUES (%s);\n", bankData.Name, strings.Join(row1, `,`))
 
 	ts := hlc.Timestamp{WallTime: hlc.UnixNano()}
-	_, err := importccl.Load(ctx, tc.Conns[0], &buf, "data", "nodelocal://0/foo", ts, 0, dir, dir)
+	_, err := importccl.Load(ctx, tc.Conns[0], &buf, "data", "nodelocal://0/foo", ts,
+		0, dir, dir, security.RootUser)
 	if !testutils.IsError(err, "out of order row") {
 		t.Fatalf("expected out of order row, got: %+v", err)
 	}
@@ -173,7 +176,8 @@ func BenchmarkLoad(b *testing.B) {
 	buf := bankBuf(b.N)
 	b.SetBytes(int64(buf.Len() / b.N))
 	b.ResetTimer()
-	if _, err := importccl.Load(ctx, tc.Conns[0], buf, "data", dir, ts, 0, dir, dir); err != nil {
+	if _, err := importccl.Load(ctx, tc.Conns[0], buf, "data", dir, ts,
+		0, dir, dir, security.RootUser); err != nil {
 		b.Fatalf("%+v", err)
 	}
 }

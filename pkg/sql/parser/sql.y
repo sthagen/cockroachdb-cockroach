@@ -478,6 +478,9 @@ func (u *sqlSymUnion) kvOptions() []tree.KVOption {
     }
     return nil
 }
+func (u *sqlSymUnion) backupOptions() *tree.BackupOptions {
+  return u.val.(*tree.BackupOptions)
+}
 func (u *sqlSymUnion) transactionModes() tree.TransactionModes {
     return u.val.(tree.TransactionModes)
 }
@@ -511,8 +514,11 @@ func (u *sqlSymUnion) partitionedBackup() tree.PartitionedBackup {
 func (u *sqlSymUnion) partitionedBackups() []tree.PartitionedBackup {
     return u.val.([]tree.PartitionedBackup)
 }
-func (u *sqlSymUnion) geoFigure() geopb.Shape {
-  return u.val.(geopb.Shape)
+func (u *sqlSymUnion) fullBackupClause() *tree.FullBackupClause {
+    return u.val.(*tree.FullBackupClause)
+}
+func (u *sqlSymUnion) geoShapeType() geopb.ShapeType {
+  return u.val.(geopb.ShapeType)
 }
 func newNameFromStr(s string) *tree.Name {
     return (*tree.Name)(&s)
@@ -563,11 +569,11 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %token <str> CURRENT_USER CYCLE
 
 %token <str> DATA DATABASE DATABASES DATE DAY DEC DECIMAL DEFAULT DEFAULTS
-%token <str> DEALLOCATE DECLARE DEFERRABLE DEFERRED DELETE DESC
+%token <str> DEALLOCATE DECLARE DEFERRABLE DEFERRED DELETE DESC DETACHED
 %token <str> DISCARD DISTINCT DO DOMAIN DOUBLE DROP
 
-%token <str> ELSE ENCODING END ENUM ESCAPE EXCEPT EXCLUDE EXCLUDING
-%token <str> EXISTS EXECUTE EXPERIMENTAL
+%token <str> ELSE ENCODING ENCRYPTION_PASSPHRASE END ENUM ESCAPE EXCEPT EXCLUDE EXCLUDING
+%token <str> EXISTS EXECUTE EXECUTION EXPERIMENTAL
 %token <str> EXPERIMENTAL_FINGERPRINTS EXPERIMENTAL_REPLICA
 %token <str> EXPERIMENTAL_AUDIT
 %token <str> EXPIRATION EXPLAIN EXPORT EXTENSION EXTRACT EXTRACT_DURATION
@@ -599,7 +605,7 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %token <str> MATCH MATERIALIZED MERGE MINVALUE MAXVALUE MINUTE MONTH
 %token <str> MULTILINESTRING MULTIPOINT MULTIPOLYGON
 
-%token <str> NAN NAME NAMES NATURAL NEXT NO NOCREATEROLE NOLOGIN NO_INDEX_JOIN
+%token <str> NAN NAME NAMES NATURAL NEVER NEXT NO NOCREATEROLE NOLOGIN NO_INDEX_JOIN
 %token <str> NONE NORMAL NOT NOTHING NOTNULL NOWAIT NULL NULLIF NULLS NUMERIC
 
 %token <str> OF OFF OFFSET OID OIDS OIDVECTOR ON ONLY OPT OPTION OPTIONS OR
@@ -611,13 +617,13 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 
 %token <str> QUERIES QUERY
 
-%token <str> RANGE RANGES READ REAL RECURSIVE REF REFERENCES
+%token <str> RANGE RANGES READ REAL RECURSIVE RECURRING REF REFERENCES
 %token <str> REGCLASS REGPROC REGPROCEDURE REGNAMESPACE REGTYPE REINDEX
 %token <str> REMOVE_PATH RENAME REPEATABLE REPLACE
-%token <str> RELEASE RESET RESTORE RESTRICT RESUME RETURNING REVOKE RIGHT
+%token <str> RELEASE RESET RESTORE RESTRICT RESUME RETURNING RETRY REVISION_HISTORY REVOKE RIGHT
 %token <str> ROLE ROLES ROLLBACK ROLLUP ROW ROWS RSHIFT RULE
 
-%token <str> SAVEPOINT SCATTER SCHEMA SCHEMAS SCRUB SEARCH SECOND SELECT SEQUENCE SEQUENCES
+%token <str> SAVEPOINT SCATTER SCHEDULE SCHEMA SCHEMAS SCRUB SEARCH SECOND SELECT SEQUENCE SEQUENCES
 %token <str> SERIALIZABLE SERVER SESSION SESSIONS SESSION_USER SET SETTING SETTINGS
 %token <str> SHARE SHOW SIMILAR SIMPLE SKIP SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
 
@@ -737,6 +743,7 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %type <tree.Statement> create_database_stmt
 %type <tree.Statement> create_index_stmt
 %type <tree.Statement> create_role_stmt
+%type <tree.Statement> create_schedule_for_backup_stmt
 %type <tree.Statement> create_schema_stmt
 %type <tree.Statement> create_table_stmt
 %type <tree.Statement> create_table_as_stmt
@@ -762,6 +769,7 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %type <tree.Statement> drop_view_stmt
 %type <tree.Statement> drop_sequence_stmt
 
+%type <tree.Statement> analyze_stmt
 %type <tree.Statement> explain_stmt
 %type <tree.Statement> prepare_stmt
 %type <tree.Statement> preparable_stmt
@@ -818,6 +826,7 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %type <tree.Statement> show_savepoint_stmt
 %type <tree.Statement> show_stats_stmt
 %type <tree.Statement> show_syntax_stmt
+%type <tree.Statement> show_last_query_stats_stmt
 %type <tree.Statement> show_tables_stmt
 %type <tree.Statement> show_trace_stmt
 %type <tree.Statement> show_transaction_stmt
@@ -839,7 +848,8 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 
 %type <[]string> opt_incremental
 %type <tree.KVOption> kv_option
-%type <[]tree.KVOption> kv_option_list opt_with_options var_set_list
+%type <[]tree.KVOption> kv_option_list opt_with_options var_set_list opt_with_schedule_options
+%type <*tree.BackupOptions> opt_with_backup_options backup_options backup_options_list
 %type <str> import_format
 %type <tree.StorageParam> storage_parameter
 %type <[]tree.StorageParam> storage_parameter_list opt_table_with
@@ -887,7 +897,7 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %type <str> schema_name
 %type <*tree.UnresolvedName> table_pattern complex_table_pattern
 %type <*tree.UnresolvedName> column_path prefixed_column_path column_path_with_star
-%type <tree.TableExpr> insert_target create_stats_target
+%type <tree.TableExpr> insert_target create_stats_target analyze_target
 
 %type <*tree.TableIndexName> table_index_name
 %type <tree.TableIndexNames> table_index_name_list
@@ -1020,7 +1030,7 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %type <*types.T> const_datetime interval_type
 %type <*types.T> bit_with_length bit_without_length
 %type <*types.T> character_base
-%type <*types.T> geo_shape
+%type <*types.T> geo_shape_type
 %type <*types.T> const_geo
 %type <str> extract_arg
 %type <bool> opt_varying
@@ -1078,7 +1088,7 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %type <[]tree.ColumnID> opt_tableref_col_list tableref_col_list
 
 %type <tree.TargetList> targets targets_roles changefeed_targets
-%type <*tree.TargetList> opt_on_targets_roles
+%type <*tree.TargetList> opt_on_targets_roles opt_backup_targets
 %type <tree.NameList> for_grantee_clause
 %type <privilege.List> privileges
 %type <[]tree.KVOption> opt_role_options role_options
@@ -1093,6 +1103,9 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %type <bool> opt_temp
 %type <bool> opt_temp_create_table
 %type <bool> role_or_group_or_user
+
+%type <tree.Expr>  cron_expr opt_description sconst_or_placeholder
+%type <*tree.FullBackupClause> opt_full_backup_clause
 
 // Precedence: lowest to highest
 %nonassoc  VALUES              // see value_clause
@@ -1169,7 +1182,8 @@ stmt_block:
 
 stmt:
   HELPTOKEN { return helpWith(sqllex, "") }
-| preparable_stmt  // help texts in sub-rule
+| preparable_stmt   // help texts in sub-rule
+| analyze_stmt      // EXTEND WITH HELP: ANALYZE
 | copy_from_stmt
 | comment_stmt
 | execute_stmt      // EXTEND WITH HELP: EXECUTE
@@ -2004,6 +2018,7 @@ alter_attribute_action:
 //        [ WITH <option> [= <value>] [, ...] ]
 //
 // Targets:
+//    Empty targets list: backup full cluster.
 //    TABLE <pattern> [, ...]
 //    DATABASE <databasename> [, ...]
 //
@@ -2011,20 +2026,241 @@ alter_attribute_action:
 //    "[scheme]://[host]/[path to backup]?[parameters]"
 //
 // Options:
-//    INTO_DB
-//    SKIP_MISSING_FOREIGN_KEYS
+//    revision_history: enable revision history
+//    encryption_passphrase="secret": encrypt backups
+//    detached: execute backup job asynchronously, without waiting for its completion.
 //
 // %SeeAlso: RESTORE, WEBDOCS/backup.html
 backup_stmt:
-  BACKUP TO partitioned_backup opt_as_of_clause opt_incremental opt_with_options
+  BACKUP opt_backup_targets TO partitioned_backup opt_as_of_clause opt_incremental opt_with_backup_options
   {
-    $$.val = &tree.Backup{DescriptorCoverage: tree.AllDescriptors, To: $3.partitionedBackup(), IncrementalFrom: $5.exprs(), AsOf: $4.asOfClause(), Options: $6.kvOptions()}
-  }
-| BACKUP targets TO partitioned_backup opt_as_of_clause opt_incremental opt_with_options
-  {
-    $$.val = &tree.Backup{Targets: $2.targetList(), To: $4.partitionedBackup(), IncrementalFrom: $6.exprs(), AsOf: $5.asOfClause(), Options: $7.kvOptions()}
+    backup := &tree.Backup{
+      To:              $4.partitionedBackup(),
+      IncrementalFrom: $6.exprs(),
+      AsOf:            $5.asOfClause(),
+      Options:         *$7.backupOptions(),
+    }
+
+    tl := $2.targetListPtr()
+    if tl == nil {
+      backup.DescriptorCoverage = tree.AllDescriptors
+    } else {
+      backup.DescriptorCoverage = tree.RequestedDescriptors
+      backup.Targets = *tl
+    }
+
+    $$.val = backup
   }
 | BACKUP error // SHOW HELP: BACKUP
+
+opt_backup_targets:
+  /* EMPTY -- full cluster */
+  {
+    $$.val = (*tree.TargetList)(nil)
+  }
+| targets
+  {
+    t := $1.targetList()
+    $$.val = &t
+  }
+
+// Optional backup options.
+opt_with_backup_options:
+  WITH backup_options_list
+  {
+    $$.val = $2.backupOptions()
+  }
+| WITH OPTIONS '(' backup_options_list ')'
+  {
+    $$.val = $4.backupOptions()
+  }
+| /* EMPTY */
+  {
+    $$.val = &tree.BackupOptions{}
+  }
+
+backup_options_list:
+  // Require at least one option
+  backup_options
+  {
+    $$.val = $1.backupOptions()
+  }
+| backup_options_list ',' backup_options
+  {
+    if err := $1.backupOptions().CombineWith($3.backupOptions()); err != nil {
+      return setErr(sqllex, err)
+    }
+  }
+
+// List of valid backup options.
+backup_options:
+  ENCRYPTION_PASSPHRASE '=' string_or_placeholder
+  {
+    $$.val = &tree.BackupOptions{EncryptionPassphrase: $3.expr()}
+  }
+| REVISION_HISTORY
+  {
+    $$.val = &tree.BackupOptions{CaptureRevisionHistory: true}
+  }
+| DETACHED
+  {
+    $$.val = &tree.BackupOptions{Detached: true}
+  }
+
+// %Help: CREATE SCHEDULE FOR BACKUP - backup data periodically
+// %Category: CCL
+// %Text:
+// CREATE SCHEDULE [<description>]
+// FOR BACKUP [<targets>] TO <location...>
+// [WITH <backup_option>[=<value>] [, ...]]
+// RECURRING [crontab|NEVER] [FULL BACKUP <crontab|ALWAYS>]
+// [WITH EXPERIMENTAL SCHEDULE OPTIONS <schedule_option>[= <value>] [, ...] ]
+//
+// All backups run in UTC timezone.
+//
+// Description:
+//   Optional description (or name) for this schedule
+//
+// Targets:
+//   empty targets: Backup entire cluster
+//   DATABASE <pattern> [, ...]: comma separated list of databases to backup.
+//   TABLE <pattern> [, ...]: comma separated list of tables to backup.
+//
+// Location:
+//   "[scheme]://[host]/[path prefix to backup]?[parameters]"
+//   Backup schedule will create subdirectories under this location to store
+//   full and periodic backups.
+//
+// WITH <options>:
+//   Options specific to BACKUP: See BACKUP options
+//
+// RECURRING <crontab>:
+//   The RECURRING expression specifies when we backup.  By default these are incremental
+//   backups that capture changes since the last backup, writing to the "current" backup.
+//
+//   Schedule specified as a string in crontab format.
+//   All times in UTC.
+//     "5 0 * * *": run schedule 5 minutes past midnight.
+//     "@daily": run daily, at midnight
+//   See https://en.wikipedia.org/wiki/Cron
+//
+//   RECURRING NEVER indicates that the schedule is non recurring.
+//   If, in addition to 'NEVER', the 'first_run' schedule option is specified,
+//   then the schedule will execute once at that time (that is: it's a one-off execution).
+//   If the 'first_run' is not specified, then the created scheduled will be in 'PAUSED' state,
+//   and will need to be unpaused before it can execute.
+//
+// FULL BACKUP <crontab|ALWAYS>:
+//   The optional FULL BACKUP '<cron expr>' clause specifies when we'll start a new full backup,
+//   which becomes the "current" backup when complete.
+//   If FULL BACKUP ALWAYS is specified, then the backups triggered by the RECURRING clause will
+//   always be full backups. For free users, this is the only accepted value of FULL BACKUP.
+//
+//   If the FULL BACKUP clause is omitted, we will select a reasonable default:
+//      * RECURRING <= 1 hour: we default to FULL BACKUP '@daily';
+//      * RECURRING <= 1 day:  we default to FULL BACKUP '@weekly';
+//      * Otherwise: we default to FULL BACKUP ALWAYS.
+//
+// EXPERIMENTAL SCHEDULE OPTIONS:
+//   The schedule can be modified by specifying the following options (which are considered
+//   to be experimental at this time):
+//   * first_run=TIMESTAMPTZ:
+//     execute the schedule at the specified time. If not specified, the default is to execute
+//     the scheduled based on it's next RECURRING time.
+//   * on_execution_failure='[retry|reschedule|pause]':
+//     If an error occurs during the execution, handle the error based as:
+//     * retry: retry execution right away
+//     * reschedule: retry execution by rescheduling it based on its RECURRING expression.
+//       This is the default.
+//     * pause: pause this schedule.  Requires manual intervention to unpause.
+//   * on_previous_running='[start|skip|wait]':
+//     If the previous backup started by this schedule still running, handle this as:
+//     * start: start this execution anyway, even if the previous one still running.
+//     * skip: skip this execution, reschedule it based on RECURRING (or change_capture_period)
+//       expression.
+//     * wait: wait for the previous execution to complete.  This is the default.
+//
+// %SeeAlso: BACKUP
+create_schedule_for_backup_stmt:
+  CREATE SCHEDULE /*$3=*/opt_description FOR BACKUP /*$6=*/opt_backup_targets TO
+  /*$8=*/partitioned_backup /*$9=*/opt_with_backup_options
+  /*$10=*/cron_expr /*$11=*/opt_full_backup_clause /*$12=*/opt_with_schedule_options
+  {
+    $$.val = &tree.ScheduledBackup{
+      ScheduleName:     $3.expr(),
+      Recurrence:       $10.expr(),
+      FullBackup:       $11.fullBackupClause(),
+      To:               $8.partitionedBackup(),
+      Targets:          $6.targetListPtr(),
+      BackupOptions:    *($9.backupOptions()),
+      ScheduleOptions:  $12.kvOptions(),
+    }
+  }
+| CREATE SCHEDULE error  // SHOW HELP: CREATE SCHEDULE FOR BACKUP
+
+opt_description:
+  string_or_placeholder
+| /* EMPTY */
+  {
+     $$.val = nil
+  }
+
+
+// sconst_or_placeholder matches a simple string, or a placeholder.
+sconst_or_placeholder:
+  SCONST
+  {
+    $$.val =  tree.NewStrVal($1)
+  }
+| PLACEHOLDER
+  {
+    p := $1.placeholder()
+    sqllex.(*lexer).UpdateNumPlaceholders(p)
+    $$.val = p
+  }
+
+cron_expr:
+  RECURRING NEVER
+  {
+    $$.val = nil
+  }
+| RECURRING sconst_or_placeholder
+  // Can't use string_or_placeholder here due to conflict on NEVER branch above
+  // (is NEVER a keyword or a variable?).
+  {
+    $$.val = $2.expr()
+  }
+
+opt_full_backup_clause:
+  FULL BACKUP sconst_or_placeholder
+  // Can't use string_or_placeholder here due to conflict on ALWAYS branch below
+  // (is ALWAYS a keyword or a variable?).
+  {
+    $$.val = &tree.FullBackupClause{Recurrence: $3.expr()}
+  }
+| FULL BACKUP ALWAYS
+  {
+    $$.val = &tree.FullBackupClause{AlwaysFull: true}
+  }
+| /* EMPTY */
+  {
+    $$.val = (*tree.FullBackupClause)(nil)
+  }
+
+opt_with_schedule_options:
+  WITH EXPERIMENTAL SCHEDULE OPTIONS kv_option_list
+  {
+    $$.val = $5.kvOptions()
+  }
+| WITH EXPERIMENTAL SCHEDULE OPTIONS '(' kv_option_list ')'
+  {
+    $$.val = $6.kvOptions()
+  }
+| /* EMPTY */
+  {
+    $$.val = nil
+  }
+
 
 // %Help: RESTORE - restore data from external storage
 // %Category: CCL
@@ -2414,6 +2650,7 @@ create_stmt:
   create_role_stmt     // EXTEND WITH HELP: CREATE ROLE
 | create_ddl_stmt      // help texts in sub-rule
 | create_stats_stmt    // EXTEND WITH HELP: CREATE STATISTICS
+| create_schedule_for_backup_stmt   // EXTEND WITH HELP: CREATE SCHEDULE FOR BACKUP
 | create_unsupported   {}
 | CREATE error         // SHOW HELP: CREATE
 
@@ -2785,7 +3022,6 @@ drop_database_stmt:
 // %Help: DROP TYPE - remove a type
 // %Category: DDL
 // %Text: DROP TYPE [IF EXISTS] <type_name> [, ...] [CASCASE | RESTRICT]
-// %SeeAlso: WEBDOCS/drop-type.html
 drop_type_stmt:
   DROP TYPE type_name_list opt_drop_behavior
   {
@@ -2842,6 +3078,34 @@ table_name_list:
   {
     name := $3.unresolvedObjectName().ToTableName()
     $$.val = append($1.tableNames(), name)
+  }
+
+// %Help: ANALYZE - collect table statistics
+// %Category: Misc
+// %Text:
+// ANALYZE <tablename>
+//
+// %SeeAlso: CREATE STATISTICS
+analyze_stmt:
+  ANALYZE analyze_target
+  {
+    $$.val = &tree.Analyze{
+      Table: $2.tblExpr(),
+    }
+  }
+| ANALYZE error // SHOW HELP: ANALYZE
+| ANALYSE analyze_target
+  {
+    $$.val = &tree.Analyze{
+      Table: $2.tblExpr(),
+    }
+  }
+| ANALYSE error // SHOW HELP: ANALYZE
+
+analyze_target:
+  table_name
+  {
+    $$.val = $1.unresolvedObjectName()
   }
 
 // %Help: EXPLAIN - show the logical plan of a query
@@ -3568,7 +3832,8 @@ zone_value:
 // SHOW CREATE, SHOW DATABASES, SHOW HISTOGRAM, SHOW INDEXES, SHOW
 // PARTITIONS, SHOW JOBS, SHOW QUERIES, SHOW RANGE, SHOW RANGES,
 // SHOW ROLES, SHOW SCHEMAS, SHOW SEQUENCES, SHOW SESSION, SHOW SESSIONS,
-// SHOW STATISTICS, SHOW SYNTAX, SHOW TABLES, SHOW TRACE SHOW TRANSACTION, SHOW USERS
+// SHOW STATISTICS, SHOW SYNTAX, SHOW TABLES, SHOW TRACE SHOW TRANSACTION, SHOW USERS,
+// SHOW LAST QUERY STATISTICS
 show_stmt:
   show_backup_stmt          // EXTEND WITH HELP: SHOW BACKUP
 | show_columns_stmt         // EXTEND WITH HELP: SHOW COLUMNS
@@ -3599,6 +3864,7 @@ show_stmt:
 | show_users_stmt           // EXTEND WITH HELP: SHOW USERS
 | show_zone_stmt
 | SHOW error                // SHOW HELP: SHOW
+| show_last_query_stats_stmt // EXTEND WITH HELP: SHOW LAST QUERY STATISTICS
 
 // Cursors are not yet supported by CockroachDB. CLOSE ALL is safe to no-op
 // since there will be no open cursors.
@@ -4070,6 +4336,16 @@ show_syntax_stmt:
   }
 | SHOW SYNTAX error // SHOW HELP: SHOW SYNTAX
 
+// %Help: SHOW LAST QUERY STATISTICS - display statistics for the last query issued
+// %Category: Misc
+// %Text: SHOW LAST QUERY STATISTICS
+show_last_query_stats_stmt:
+  SHOW LAST QUERY STATISTICS
+  {
+   /* SKIP DOC */
+   $$.val = &tree.ShowLastQueryStatistics{}
+  }
+
 // %Help: SHOW SAVEPOINT - display current savepoint properties
 // %Category: Cfg
 // %Text: SHOW SAVEPOINT STATUS
@@ -4477,7 +4753,7 @@ pause_stmt:
   }
 | PAUSE error // SHOW HELP: PAUSE JOBS
 
-// %Help: CREATE SCHEMA - create a new schema (not yet supported)
+// %Help: CREATE SCHEMA - create a new schema
 // %Category: DDL
 // %Text:
 // CREATE SCHEMA [IF NOT EXISTS] <schemaname>
@@ -5596,7 +5872,6 @@ opt_view_recursive:
 // %Help: CREATE TYPE -- create a type
 // %Category: DDL
 // %Text: CREATE TYPE <type_name> AS ENUM (...)
-// %SeeAlso: WEBDOCS/create-type.html
 create_type_stmt:
   // Enum types.
   CREATE TYPE type_name AS ENUM '(' opt_enum_val_list ')'
@@ -7650,34 +7925,42 @@ simple_typename:
 | POINT error { return unimplementedWithIssueDetail(sqllex, 21286, "point") } // needed or else it generates a syntax error.
 | POLYGON error { return unimplementedWithIssueDetail(sqllex, 21286, "polygon") } // needed or else it generates a syntax error.
 
-geo_shape:
-  POINT { $$.val = geopb.Shape_Point }
-| LINESTRING { $$.val = geopb.Shape_LineString }
-| POLYGON { $$.val = geopb.Shape_Polygon }
-| GEOMETRYCOLLECTION { $$.val = geopb.Shape_GeometryCollection }
-| MULTIPOLYGON { $$.val = geopb.Shape_MultiPolygon }
-| MULTILINESTRING { $$.val = geopb.Shape_MultiLineString }
-| MULTIPOINT { $$.val = geopb.Shape_MultiPoint }
-| GEOMETRY { $$.val = geopb.Shape_Geometry }
+geo_shape_type:
+  POINT { $$.val = geopb.ShapeType_Point }
+| LINESTRING { $$.val = geopb.ShapeType_LineString }
+| POLYGON { $$.val = geopb.ShapeType_Polygon }
+| GEOMETRYCOLLECTION { $$.val = geopb.ShapeType_GeometryCollection }
+| MULTIPOLYGON { $$.val = geopb.ShapeType_MultiPolygon }
+| MULTILINESTRING { $$.val = geopb.ShapeType_MultiLineString }
+| MULTIPOINT { $$.val = geopb.ShapeType_MultiPoint }
+| GEOMETRY { $$.val = geopb.ShapeType_Geometry }
 
 const_geo:
   GEOGRAPHY { $$.val = types.Geography }
 | GEOMETRY  { $$.val = types.Geometry }
-| GEOMETRY '(' geo_shape ')'
+| GEOMETRY '(' geo_shape_type ')'
   {
-    $$.val = types.MakeGeometry($3.geoFigure(), 0)
+    $$.val = types.MakeGeometry($3.geoShapeType(), 0)
   }
-| GEOGRAPHY '(' geo_shape ')'
+| GEOGRAPHY '(' geo_shape_type ')'
   {
-    $$.val = types.MakeGeography($3.geoFigure(), 0)
+    $$.val = types.MakeGeography($3.geoShapeType(), 0)
   }
-| GEOMETRY '(' geo_shape ',' iconst32 ')'
+| GEOMETRY '(' geo_shape_type ',' signed_iconst ')'
   {
-    $$.val = types.MakeGeometry($3.geoFigure(), geopb.SRID($5.int32()))
+    val, err := $5.numVal().AsInt32()
+    if err != nil {
+      return setErr(sqllex, err)
+    }
+    $$.val = types.MakeGeometry($3.geoShapeType(), geopb.SRID(val))
   }
-| GEOGRAPHY '(' geo_shape ',' iconst32 ')'
+| GEOGRAPHY '(' geo_shape_type ',' signed_iconst ')'
   {
-    $$.val = types.MakeGeography($3.geoFigure(), geopb.SRID($5.int32()))
+    val, err := $5.numVal().AsInt32()
+    if err != nil {
+      return setErr(sqllex, err)
+    }
+    $$.val = types.MakeGeography($3.geoShapeType(), geopb.SRID(val))
   }
 
 // We have a separate const_typename to allow defaulting fixed-length types
@@ -10247,16 +10530,19 @@ unreserved_keyword:
 | DELETE
 | DEFAULTS
 | DEFERRED
+| DETACHED
 | DISCARD
 | DOMAIN
 | DOUBLE
 | DROP
 | ENCODING
+| ENCRYPTION_PASSPHRASE
 | ENUM
 | ESCAPE
 | EXCLUDE
 | EXCLUDING
 | EXECUTE
+| EXECUTION
 | EXPERIMENTAL
 | EXPERIMENTAL_AUDIT
 | EXPERIMENTAL_FINGERPRINTS
@@ -10326,6 +10612,7 @@ unreserved_keyword:
 | MONTH
 | NAMES
 | NAN
+| NEVER
 | NEXT
 | NO
 | NORMAL
@@ -10367,6 +10654,7 @@ unreserved_keyword:
 | RANGE
 | RANGES
 | READ
+| RECURRING
 | RECURSIVE
 | REF
 | REINDEX
@@ -10378,6 +10666,8 @@ unreserved_keyword:
 | RESTORE
 | RESTRICT
 | RESUME
+| RETRY
+| REVISION_HISTORY
 | REVOKE
 | ROLE
 | ROLES
@@ -10385,6 +10675,7 @@ unreserved_keyword:
 | ROLLUP
 | ROWS
 | RULE
+| SCHEDULE
 | SETTING
 | SETTINGS
 | STATUS

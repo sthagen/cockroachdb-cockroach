@@ -62,11 +62,11 @@ import (
 //
 // ATTENTION: When updating these fields, add to version_history.txt explaining
 // what changed.
-const Version execinfrapb.DistSQLVersion = 29
+const Version execinfrapb.DistSQLVersion = 30
 
 // MinAcceptedVersion is the oldest version that the server is
 // compatible with; see above.
-const MinAcceptedVersion execinfrapb.DistSQLVersion = 29
+const MinAcceptedVersion execinfrapb.DistSQLVersion = 30
 
 // SettingWorkMemBytes is a cluster setting that determines the maximum amount
 // of RAM that a processor can use.
@@ -213,6 +213,9 @@ type TestingKnobs struct {
 
 	// Changefeed contains testing knobs specific to the changefeed system.
 	Changefeed base.ModuleTestingKnobs
+
+	// Flowinfra contains testing knobs specific to the flowinfra system
+	Flowinfra base.ModuleTestingKnobs
 
 	// EnableVectorizedInvariantsChecker, if enabled, will allow for planning
 	// the invariant checkers between all columnar operators.

@@ -70,6 +70,11 @@ type cliTestParams struct {
 	noNodelocal bool
 }
 
+// testTempFilePrefix is a sentinel marker to be used as the prefix of a
+// test file name. It is used to extract the file name from a uniquely
+// generated (temp directory) file path.
+const testTempFilePrefix = "test-temp-prefix-"
+
 func (c *cliTest) fail(err interface{}) {
 	if c.t != nil {
 		defer c.logScope.Close(c.t)
@@ -332,6 +337,16 @@ func (c cliTest) RunWithArgs(origArgs []string) {
 			}
 		}
 		args = append(args, origArgs[1:]...)
+
+		// `nodelocal upload` CLI tests create test files in unique temp
+		// directories. Given that the expected output for such tests is defined as
+		// a static comment, it is not possible to match against the full file path.
+		// So, we trim the file path upto the sentinel prefix marker, and use only
+		// the file name for comparing against the expected output.
+		if len(origArgs) >= 3 && strings.Contains(origArgs[2], testTempFilePrefix) {
+			splitFilePath := strings.Split(origArgs[2], testTempFilePrefix)
+			origArgs[2] = splitFilePath[1]
+		}
 
 		if !c.omitArgs {
 			fmt.Fprintf(os.Stderr, "%s\n", args)
@@ -1344,14 +1359,14 @@ func Example_misc_table() {
 	//     hai
 	// (1 row)
 	// sql --format=table -e explain select s, 'foo' from t.t
-	//     tree    |    field    | description
-	// ------------+-------------+--------------
-	//             | distributed | true
-	//             | vectorized  | false
-	//   render    |             |
-	//    └── scan |             |
-	//             | table       | t@primary
-	//             | spans       | FULL SCAN
+	//     tree    |    field     | description
+	// ------------+--------------+--------------
+	//             | distribution | full
+	//             | vectorized   | false
+	//   render    |              |
+	//    └── scan |              |
+	//             | table        | t@primary
+	//             | spans        | FULL SCAN
 	// (6 rows)
 }
 
@@ -1387,8 +1402,6 @@ Available Commands:
   start-single-node start a single-node cluster
   init              initialize a cluster
   cert              create ca, node, and client certs
-  quit              drain and shut down a node
-
   sql               open a sql shell
   auth-session      log in and out of HTTP sessions
   node              list, inspect, drain or remove nodes
@@ -1882,11 +1895,11 @@ func TestJunkPositionalArguments(t *testing.T) {
 		line := test + " " + junk
 		out, err := c.RunWithCapture(line)
 		if err != nil {
-			t.Fatal(errors.Wrap(err, strconv.Itoa(i)))
+			t.Fatalf("%d: %v", i, err)
 		}
 		exp := fmt.Sprintf("%s\nERROR: unknown command %q for \"cockroach %s\"\n", line, junk, test)
 		if exp != out {
-			t.Errorf("expected:\n%s\ngot:\n%s", exp, out)
+			t.Errorf("%d: expected:\n%s\ngot:\n%s", i, exp, out)
 		}
 	}
 }

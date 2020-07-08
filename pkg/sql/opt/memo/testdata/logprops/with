@@ -35,14 +35,14 @@ WITH foo AS (SELECT 1/0) SELECT * FROM foo
 with &1 (foo)
  ├── columns: "?column?":2(decimal!null)
  ├── cardinality: [1 - 1]
- ├── side-effects
+ ├── immutable
  ├── key: ()
  ├── fd: ()-->(2)
  ├── prune: (2)
  ├── project
  │    ├── columns: "?column?":1(decimal!null)
  │    ├── cardinality: [1 - 1]
- │    ├── side-effects
+ │    ├── immutable
  │    ├── key: ()
  │    ├── fd: ()-->(1)
  │    ├── prune: (1)
@@ -51,7 +51,7 @@ with &1 (foo)
  │    │    ├── key: ()
  │    │    └── tuple [type=tuple]
  │    └── projections
- │         └── div [as="?column?":1, type=decimal, side-effects]
+ │         └── div [as="?column?":1, type=decimal, immutable]
  │              ├── const: 1 [type=int]
  │              └── const: 0 [type=int]
  └── with-scan &1 (foo)
@@ -61,7 +61,9 @@ with &1 (foo)
       ├── cardinality: [1 - 1]
       ├── key: ()
       ├── fd: ()-->(2)
-      └── prune: (2)
+      ├── prune: (2)
+      └── cte-uses
+           └── &1: count=1 used-columns=(1)
 
 # Side effects should be propagated up to the top-level from the Input side of
 # a With.
@@ -71,7 +73,7 @@ WITH foo AS (SELECT 1) SELECT 1/0 FROM foo
 with &1 (foo)
  ├── columns: "?column?":3(decimal!null)
  ├── cardinality: [1 - 1]
- ├── side-effects
+ ├── immutable
  ├── key: ()
  ├── fd: ()-->(3)
  ├── prune: (3)
@@ -90,7 +92,7 @@ with &1 (foo)
  └── project
       ├── columns: "?column?":3(decimal!null)
       ├── cardinality: [1 - 1]
-      ├── side-effects
+      ├── immutable
       ├── key: ()
       ├── fd: ()-->(3)
       ├── prune: (3)
@@ -107,7 +109,7 @@ with &1 (foo)
       │    └── cte-uses
       │         └── &1: count=1 used-columns=(1)
       └── projections
-           └── div [as="?column?":3, type=decimal, side-effects]
+           └── div [as="?column?":3, type=decimal, immutable]
                 ├── const: 1 [type=int]
                 └── const: 0 [type=int]
 
@@ -117,14 +119,14 @@ WITH foo AS (SELECT $1::INT) SELECT 1 FROM foo
 with &1 (foo)
  ├── columns: "?column?":3(int!null)
  ├── cardinality: [1 - 1]
- ├── has-placeholder
+ ├── immutable, has-placeholder
  ├── key: ()
  ├── fd: ()-->(3)
  ├── prune: (3)
  ├── project
  │    ├── columns: int8:1(int)
  │    ├── cardinality: [1 - 1]
- │    ├── has-placeholder
+ │    ├── immutable, has-placeholder
  │    ├── key: ()
  │    ├── fd: ()-->(1)
  │    ├── prune: (1)
@@ -133,7 +135,7 @@ with &1 (foo)
  │    │    ├── key: ()
  │    │    └── tuple [type=tuple]
  │    └── projections
- │         └── cast: INT8 [as=int8:1, type=int]
+ │         └── cast: INT8 [as=int8:1, type=int, immutable]
  │              └── placeholder: $1 [type=string]
  └── project
       ├── columns: "?column?":3(int!null)
@@ -194,7 +196,9 @@ project
  ├── prune: (7)
  ├── inner-join (cross)
  │    ├── scan t40930
+ │    │    └── unfiltered-cols: (4,5)
  │    ├── scan tab_10102
+ │    │    └── unfiltered-cols: (1,2)
  │    └── filters (true)
  └── projections
       └── null [as="?column?":7, type=unknown]

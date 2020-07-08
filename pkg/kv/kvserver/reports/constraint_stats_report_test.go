@@ -450,7 +450,7 @@ func (c constraintEntry) toReportEntry(
 	zk, ok := objects[c.object]
 	if !ok {
 		return ConstraintStatusKey{}, ConstraintStatus{},
-			errors.AssertionFailedf("missing object: " + c.object)
+			errors.AssertionFailedf("missing object: %s", c.object)
 	}
 	k := ConstraintStatusKey{
 		ZoneKey:       zk,
@@ -754,10 +754,8 @@ func compileTestCase(tc baseReportTestCase) (compiledTestCase, error) {
 				return compiledTestCase{}, err
 			}
 		}
-		sysCfgBuilder.addDBDesc(dbID, sqlbase.DatabaseDescriptor{
-			Name: db.name,
-			ID:   sqlbase.ID(dbID),
-		})
+		sysCfgBuilder.addDBDesc(dbID,
+			sqlbase.NewInitialDatabaseDescriptor(sqlbase.ID(dbID), db.name))
 
 		for _, table := range db.tables {
 			tableID := objectCounter
@@ -1011,13 +1009,13 @@ func (b *systemConfigBuilder) setDefaultZoneConfig(cfg zonepb.ZoneConfig) error 
 }
 
 func (b *systemConfigBuilder) addZoneInner(objectName string, id int, cfg zonepb.ZoneConfig) error {
-	k := config.MakeZoneKey(uint32(id))
+	k := config.MakeZoneKey(config.SystemTenantObjectID(id))
 	var v roachpb.Value
 	if err := v.SetProto(&cfg); err != nil {
 		panic(err)
 	}
 	b.kv = append(b.kv, roachpb.KeyValue{Key: k, Value: v})
-	return b.addZoneToObjectMapping(MakeZoneKey(uint32(id), NoSubzone), objectName)
+	return b.addZoneToObjectMapping(MakeZoneKey(config.SystemTenantObjectID(id), NoSubzone), objectName)
 }
 
 func (b *systemConfigBuilder) addDatabaseZone(name string, id int, cfg zonepb.ZoneConfig) error {
@@ -1044,7 +1042,7 @@ func (b *systemConfigBuilder) addTableZone(t sqlbase.TableDescriptor, cfg zonepb
 			object = fmt.Sprintf("%s.%s", idx, subzone.PartitionName)
 		}
 		if err := b.addZoneToObjectMapping(
-			MakeZoneKey(uint32(t.ID), base.SubzoneIDFromIndex(i)), object,
+			MakeZoneKey(config.SystemTenantObjectID(t.ID), base.SubzoneIDFromIndex(i)), object,
 		); err != nil {
 			return err
 		}
@@ -1090,16 +1088,11 @@ func (b *systemConfigBuilder) addTableDesc(id int, tableDesc sqlbase.TableDescri
 }
 
 // addTableDesc adds a database descriptor to the SystemConfig.
-func (b *systemConfigBuilder) addDBDesc(id int, dbDesc sqlbase.DatabaseDescriptor) {
+func (b *systemConfigBuilder) addDBDesc(id int, dbDesc *sqlbase.ImmutableDatabaseDescriptor) {
 	// Write the table to the SystemConfig, in the descriptors table.
 	k := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(id))
-	desc := &sqlbase.Descriptor{
-		Union: &sqlbase.Descriptor_Database{
-			Database: &dbDesc,
-		},
-	}
 	var v roachpb.Value
-	if err := v.SetProto(desc); err != nil {
+	if err := v.SetProto(dbDesc.DescriptorProto()); err != nil {
 		panic(err)
 	}
 	b.kv = append(b.kv, roachpb.KeyValue{Key: k, Value: v})

@@ -13,7 +13,6 @@ package kvserver
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -53,6 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/google/btree"
 	"github.com/kr/pretty"
 	"go.etcd.io/etcd/raft"
@@ -133,30 +133,41 @@ type atomicDescString struct {
 
 // store atomically updates d.strPtr with the string representation of desc.
 func (d *atomicDescString) store(replicaID roachpb.ReplicaID, desc *roachpb.RangeDescriptor) {
-	var buf strings.Builder
-	fmt.Fprintf(&buf, "%d/", desc.RangeID)
-	if replicaID == 0 {
-		fmt.Fprintf(&buf, "?:")
-	} else {
-		fmt.Fprintf(&buf, "%d:", replicaID)
-	}
+	str := redact.Sprintfn(func(w redact.SafePrinter) {
+		w.Printf("%d/", desc.RangeID)
+		if replicaID == 0 {
+			w.SafeString("?:")
+		} else {
+			w.Printf("%d:", replicaID)
+		}
 
-	if !desc.IsInitialized() {
-		buf.WriteString("{-}")
-	} else {
-		const maxRangeChars = 30
-		rngStr := keys.PrettyPrintRange(roachpb.Key(desc.StartKey), roachpb.Key(desc.EndKey), maxRangeChars)
-		buf.WriteString(rngStr)
-	}
+		if !desc.IsInitialized() {
+			w.SafeString("{-}")
+		} else {
+			const maxRangeChars = 30
+			rngStr := keys.PrettyPrintRange(roachpb.Key(desc.StartKey), roachpb.Key(desc.EndKey), maxRangeChars)
+			w.UnsafeString(rngStr)
+		}
+	})
 
-	str := buf.String()
 	atomic.StorePointer(&d.strPtr, unsafe.Pointer(&str))
 }
 
 // String returns the string representation of the range; since we are not
 // using a lock, the copy might be inconsistent.
 func (d *atomicDescString) String() string {
-	return *(*string)(atomic.LoadPointer(&d.strPtr))
+	return d.get().StripMarkers()
+}
+
+// SafeFormat renders the string safely.
+func (d *atomicDescString) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Print(d.get())
+}
+
+// Get returns the string representation of the range; since we are not
+// using a lock, the copy might be inconsistent.
+func (d *atomicDescString) get() redact.RedactableString {
+	return *(*redact.RedactableString)(atomic.LoadPointer(&d.strPtr))
 }
 
 // atomicConnectionClass stores an rpc.ConnectionClass atomically.
@@ -581,7 +592,13 @@ var _ kv.Sender = &Replica{}
 // require a lock and its output may not be atomic with other ongoing work in
 // the replica. This is done to prevent deadlocks in logging sites.
 func (r *Replica) String() string {
-	return fmt.Sprintf("[n%d,s%d,r%s]", r.store.Ident.NodeID, r.store.Ident.StoreID, &r.rangeStr)
+	return redact.StringWithoutMarkers(r)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (r *Replica) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("[n%d,s%d,r%s]",
+		r.store.Ident.NodeID, r.store.Ident.StoreID, r.rangeStr.get())
 }
 
 // ReplicaID returns the ID for the Replica. It may be zero if the replica does
@@ -806,7 +823,8 @@ func (r *Replica) getImpliedGCThresholdRLocked(
 	return threshold
 }
 
-// isSystemRange returns true if r's key range precedes keys.UserTableDataMin.
+// isSystemRange returns true if r's key range precedes the start of user
+// structured data (SQL keys) for the range's tenant keyspace.
 func (r *Replica) isSystemRange() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -814,7 +832,8 @@ func (r *Replica) isSystemRange() bool {
 }
 
 func (r *Replica) isSystemRangeRLocked() bool {
-	return r.mu.state.Desc.StartKey.Less(roachpb.RKey(keys.UserTableDataMin))
+	rem, _, err := keys.DecodeTenantPrefix(r.mu.state.Desc.StartKey.AsRawKey())
+	return err == nil && roachpb.Key(rem).Compare(keys.UserTableDataMin) < 0
 }
 
 // maxReplicaIDOfAny returns the maximum ReplicaID of any replica, including
@@ -1071,7 +1090,7 @@ func (r *Replica) assertStateLocked(ctx context.Context, reader storage.Reader) 
 // they know that they will end up checking for a pending merge at some later
 // time.
 func (r *Replica) checkExecutionCanProceed(
-	ba *roachpb.BatchRequest, g *concurrency.Guard, st *kvserverpb.LeaseStatus,
+	ctx context.Context, ba *roachpb.BatchRequest, g *concurrency.Guard, st *kvserverpb.LeaseStatus,
 ) error {
 	rSpan, err := keys.Range(ba.Requests)
 	if err != nil {
@@ -1081,7 +1100,7 @@ func (r *Replica) checkExecutionCanProceed(
 	defer r.mu.RUnlock()
 	if _, err := r.isDestroyedRLocked(); err != nil {
 		return err
-	} else if err := r.checkSpanInRangeRLocked(rSpan); err != nil {
+	} else if err := r.checkSpanInRangeRLocked(ctx, rSpan); err != nil {
 		return err
 	} else if err := r.checkTSAboveGCThresholdRLocked(ba.Timestamp, st, ba.IsAdmin()); err != nil {
 		return err
@@ -1089,6 +1108,11 @@ func (r *Replica) checkExecutionCanProceed(
 		// Only check for a pending merge if latches are held and the Range
 		// lease is held by this Replica. Without both of these conditions,
 		// checkForPendingMergeRLocked could return false negatives.
+		//
+		// In practice, this means that follower reads or any request where
+		// concurrency.shouldAcquireLatches() == false (e.g. lease requests)
+		// will not check for a pending merge before executing and, as such,
+		// can execute while a range is in a merge's critical phase.
 		return r.checkForPendingMergeRLocked(ba)
 	}
 	return nil
@@ -1097,7 +1121,7 @@ func (r *Replica) checkExecutionCanProceed(
 // checkExecutionCanProceedForRangeFeed returns an error if a rangefeed request
 // cannot be executed by the Replica.
 func (r *Replica) checkExecutionCanProceedForRangeFeed(
-	rSpan roachpb.RSpan, ts hlc.Timestamp,
+	ctx context.Context, rSpan roachpb.RSpan, ts hlc.Timestamp,
 ) error {
 	now := r.Clock().Now()
 	r.mu.RLock()
@@ -1105,7 +1129,7 @@ func (r *Replica) checkExecutionCanProceedForRangeFeed(
 	status := r.leaseStatus(*r.mu.state.Lease, now, r.mu.minLeaseProposedTS)
 	if _, err := r.isDestroyedRLocked(); err != nil {
 		return err
-	} else if err := r.checkSpanInRangeRLocked(rSpan); err != nil {
+	} else if err := r.checkSpanInRangeRLocked(ctx, rSpan); err != nil {
 		return err
 	} else if err := r.checkTSAboveGCThresholdRLocked(ts, &status, false /* isAdmin */); err != nil {
 		return err
@@ -1119,14 +1143,14 @@ func (r *Replica) checkExecutionCanProceedForRangeFeed(
 }
 
 // checkSpanInRangeRLocked returns an error if a request (identified by its
-// key span) can be run on the replica.
-func (r *Replica) checkSpanInRangeRLocked(rspan roachpb.RSpan) error {
+// key span) can not be run on the replica.
+func (r *Replica) checkSpanInRangeRLocked(ctx context.Context, rspan roachpb.RSpan) error {
 	desc := r.mu.state.Desc
 	if desc.ContainsKeyRange(rspan.Key, rspan.EndKey) {
 		return nil
 	}
 	return roachpb.NewRangeKeyMismatchError(
-		rspan.Key.AsRawKey(), rspan.EndKey.AsRawKey(), desc,
+		ctx, rspan.Key.AsRawKey(), rspan.EndKey.AsRawKey(), desc, r.mu.state.Lease,
 	)
 }
 
@@ -1586,9 +1610,9 @@ func (r *Replica) GetExternalStorage(
 
 // GetExternalStorageFromURI returns an ExternalStorage object, based on the given URI.
 func (r *Replica) GetExternalStorageFromURI(
-	ctx context.Context, uri string,
+	ctx context.Context, uri string, user string,
 ) (cloud.ExternalStorage, error) {
-	return r.store.cfg.ExternalStorageFromURI(ctx, uri)
+	return r.store.cfg.ExternalStorageFromURI(ctx, uri, user)
 }
 
 func (r *Replica) markSystemConfigGossipSuccess() {

@@ -93,8 +93,8 @@ create-view t.public.v1
  ├── WITH t AS (SELECT a FROM t.public.y WHERE a < 3) SELECT 1 FROM t.public.x NATURAL JOIN t
  ├── columns: "?column?":7
  └── dependencies
-      ├── y [columns: (0,1)]
-      └── x [columns: (0-2)]
+      ├── y [columns: a]
+      └── x [columns: a]
 
 build
 CREATE TABLE t1 AS
@@ -566,7 +566,7 @@ error (42P10): source "t" has 1 columns available but 2 columns specified
 build
 WITH t AS (SELECT a FROM x) SELECT a, x.t FROM t
 ----
-error (42P01): no data source matches prefix: x
+error (42P01): no data source matches prefix: x in this context
 
 # Nested WITH, name shadowing
 build

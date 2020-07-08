@@ -184,6 +184,9 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			if n.canParallelize() && (len(n.spans) > 1 || n.maxResults > 1) {
 				v.observer.attr(name, "parallel", "")
 			}
+			if n.index.IsPartial() {
+				v.observer.attr(name, "partial index", "")
+			}
 			if n.hardLimit > 0 && isFilterTrue(n.filter) {
 				v.observer.attr(name, "limit", fmt.Sprintf("%d", n.hardLimit))
 			}
@@ -375,6 +378,29 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		n.left.plan = v.visit(n.left.plan)
 		n.right.plan = v.visit(n.right.plan)
 
+	case *invertedFilterNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "inverted column", fmt.Sprintf("%d", n.invColumn+1))
+			v.observer.attr(name, "num spans", fmt.Sprintf("%d", len(n.expression.SpansToRead)))
+		}
+		n.input = v.visit(n.input)
+
+	case *invertedJoinNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "table", fmt.Sprintf("%s@%s", n.table.desc.Name, n.table.index.Name))
+			v.observer.attr(name, "type", joinTypeStr(n.joinType))
+		}
+		if v.observer.expr != nil {
+			v.expr(name, "", -1, n.invertedExpr)
+			if n.onExpr != nil && n.onExpr != tree.DBoolTrue {
+				v.expr(name, "onExpr", -1, n.onExpr)
+			}
+		}
+		if n.CanParallelize() {
+			v.observer.attr(name, "parallel", "")
+		}
+		n.input = v.visit(n.input)
+
 	case *limitNode:
 		if v.observer.expr != nil {
 			v.expr(name, "count", -1, n.countExpr)
@@ -455,7 +481,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 						}
 					}
 					buf.WriteByte(')')
-					if agg.filterRenderIdx != noRenderIdx {
+					if agg.filterRenderIdx != tree.NoColumnIdx {
 						fmt.Fprintf(&buf, " FILTER (WHERE %s)", inputCols[agg.filterRenderIdx].Name)
 					}
 				}
@@ -660,10 +686,24 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		}
 
 	case *explainDistSQLNode:
-		n.plan.main = v.visit(n.plan.main)
+		// We check whether planNode is nil because the plan might be
+		// represented physically. We don't yet have a walker over such
+		// representation, so we simply short-circuit.
+		// TODO(yuzefovich): implement that walker and use it here.
+		if n.plan.main.planNode == nil {
+			return
+		}
+		n.plan.main.planNode = v.visit(n.plan.main.planNode)
 
 	case *explainVecNode:
-		n.plan = v.visit(n.plan)
+		// We check whether planNode is nil because the plan might be
+		// represented physically. We don't yet have a walker over such
+		// representation, so we simply short-circuit.
+		// TODO(yuzefovich): implement that walker and use it here.
+		if n.plan.planNode == nil {
+			return
+		}
+		n.plan.planNode = v.visit(n.plan.planNode)
 
 	case *ordinalityNode:
 		n.source = v.visit(n.source)
@@ -684,7 +724,14 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		n.plan = v.visit(n.plan)
 
 	case *explainPlanNode:
-		n.plan.main = v.visit(n.plan.main)
+		// We check whether planNode is nil because the plan might be
+		// represented physically. We don't yet have a walker over such
+		// representation, so we simply short-circuit.
+		// TODO(yuzefovich): implement that walker and use it here.
+		if n.plan.main.planNode == nil {
+			return
+		}
+		n.plan.main.planNode = v.visit(n.plan.main.planNode)
 
 	case *cancelQueriesNode:
 		n.rows = v.visit(n.rows)
@@ -904,6 +951,8 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&indexJoinNode{}):         "index-join",
 	reflect.TypeOf(&insertNode{}):            "insert",
 	reflect.TypeOf(&insertFastPathNode{}):    "insert-fast-path",
+	reflect.TypeOf(&invertedFilterNode{}):    "inverted-filter",
+	reflect.TypeOf(&invertedJoinNode{}):      "inverted-join",
 	reflect.TypeOf(&joinNode{}):              "join",
 	reflect.TypeOf(&limitNode{}):             "limit",
 	reflect.TypeOf(&lookupJoinNode{}):        "lookup-join",

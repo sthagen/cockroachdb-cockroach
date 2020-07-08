@@ -36,7 +36,7 @@ type createViewNode struct {
 	ifNotExists bool
 	replace     bool
 	temporary   bool
-	dbDesc      *sqlbase.DatabaseDescriptor
+	dbDesc      *sqlbase.ImmutableDatabaseDescriptor
 	columns     sqlbase.ResultColumns
 
 	// planDeps tracks which tables and views the view being created
@@ -78,7 +78,7 @@ func (n *createViewNode) startExec(params runParams) error {
 
 	var replacingDesc *sqlbase.MutableTableDescriptor
 
-	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.ID, isTemporary, viewName)
+	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), isTemporary, viewName)
 	if err != nil {
 		switch {
 		case !sqlbase.IsRelationAlreadyExistsError(err):
@@ -133,15 +133,21 @@ func (n *createViewNode) startExec(params runParams) error {
 		if err != nil {
 			return err
 		}
+		// creationTime is initialized to a zero value and populated at read time.
+		// See the comment in desc.MaybeIncrementVersion.
+		//
+		// TODO(ajwerner): remove the timestamp from MakeViewTableDesc, it's
+		// currently relied on in import and restore code and tests.
+		var creationTime hlc.Timestamp
 		desc, err := makeViewTableDesc(
 			params.ctx,
 			viewName,
 			n.viewQuery,
-			n.dbDesc.ID,
+			n.dbDesc.GetID(),
 			schemaID,
 			id,
 			n.columns,
-			params.creationTimeForNewTableDescriptor(),
+			creationTime,
 			privs,
 			&params.p.semaCtx,
 			params.p.EvalContext(),
@@ -186,12 +192,13 @@ func (n *createViewNode) startExec(params runParams) error {
 			dep.ID = newDesc.ID
 			backRefMutable.DependedOnBy = append(backRefMutable.DependedOnBy, dep)
 		}
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
 		if err := params.p.writeSchemaChange(
 			params.ctx,
 			backRefMutable,
 			sqlbase.InvalidMutationID,
-			fmt.Sprintf("updating view reference %q", n.viewName),
+			fmt.Sprintf("updating view reference %q in table %s(%d)", n.viewName,
+				updated.desc.Name, updated.desc.ID,
+			),
 		); err != nil {
 			return err
 		}
@@ -203,7 +210,7 @@ func (n *createViewNode) startExec(params runParams) error {
 
 	// Log Create View event. This is an auditable log event and is
 	// recorded in the same transaction as the table descriptor update.
-	tn := tree.MakeTableNameWithSchema(tree.Name(n.dbDesc.Name), schemaName, n.viewName)
+	tn := tree.MakeTableNameWithSchema(tree.Name(n.dbDesc.GetName()), schemaName, n.viewName)
 	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
 		params.ctx,
 		params.p.txn,
@@ -247,7 +254,7 @@ func makeViewTableDesc(
 	evalCtx *tree.EvalContext,
 	temporary bool,
 ) (sqlbase.MutableTableDescriptor, error) {
-	desc := InitTableDescriptor(
+	desc := sqlbase.InitTableDescriptor(
 		id,
 		parentID,
 		schemaID,
@@ -312,7 +319,9 @@ func (p *planner) replaceViewDesc(
 				ctx,
 				desc,
 				sqlbase.InvalidMutationID,
-				fmt.Sprintf("updating view reference %q", n.viewName),
+				fmt.Sprintf("removing view reference for %q from %s(%d)", n.viewName,
+					desc.Name, desc.ID,
+				),
 			); err != nil {
 				return nil, err
 			}

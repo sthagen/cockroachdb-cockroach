@@ -66,9 +66,10 @@ update xy
  │    ├── u:5 => x:1
  │    └── v:6 => y:2
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── left-join (hash)
       ├── columns: x:3!null y:4 u:5 v:6
+      ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       ├── key: (3)
       ├── fd: (3)-->(4-6), (5)-->(6)
       ├── scan xy
@@ -101,19 +102,21 @@ upsert xy
  ├── return-mapping:
  │    ├── upsert_x:9 => x:1
  │    └── upsert_y:10 => y:2
- ├── cardinality: [2 - ]
- ├── side-effects, mutations
+ ├── cardinality: [2 - 2]
+ ├── volatile, mutations
  └── project
       ├── columns: upsert_x:9 upsert_y:10 column1:3!null column2:4!null x:5 y:6
-      ├── cardinality: [2 - ]
+      ├── cardinality: [2 - 2]
       ├── fd: (5)-->(6)
       ├── left-join (hash)
       │    ├── columns: column1:3!null column2:4!null x:5 y:6 u:7 v:8
-      │    ├── cardinality: [2 - ]
+      │    ├── cardinality: [2 - 2]
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    ├── fd: (5)-->(6), (7)-->(8)
       │    ├── left-join (hash)
       │    │    ├── columns: column1:3!null column2:4!null x:5 y:6
-      │    │    ├── cardinality: [2 - ]
+      │    │    ├── cardinality: [2 - 2]
+      │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    │    ├── fd: (5)-->(6)
       │    │    ├── values
       │    │    │    ├── columns: column1:3!null column2:4!null
@@ -144,7 +147,7 @@ delete xy
  ├── columns: <none>
  ├── fetch columns: x:3
  ├── cardinality: [0 - 0]
- ├── side-effects, mutations
+ ├── volatile, mutations
  └── semi-join (hash)
       ├── columns: x:3!null
       ├── key: (3)
@@ -166,17 +169,17 @@ SELECT generate_series(0, 5) FROM xy
 ----
 inner-join (cross)
  ├── columns: generate_series:3
- ├── side-effects
+ ├── immutable
  ├── scan xy
  ├── project-set
  │    ├── columns: generate_series:3
- │    ├── side-effects
+ │    ├── immutable
  │    ├── values
  │    │    ├── cardinality: [1 - 1]
  │    │    ├── key: ()
  │    │    └── ()
  │    └── zip
- │         └── generate_series(0, 5) [side-effects]
+ │         └── generate_series(0, 5) [immutable]
  └── filters (true)
 
 norm expect=DecorrelateProjectSet
@@ -184,7 +187,7 @@ SELECT * FROM a WHERE i IN (SELECT generate_series(k, i) FROM xy)
 ----
 semi-join-apply
  ├── columns: k:1!null i:2!null f:3 s:4 j:5
- ├── side-effects
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-5)
  ├── scan a
@@ -194,18 +197,18 @@ semi-join-apply
  ├── inner-join (cross)
  │    ├── columns: generate_series:8
  │    ├── outer: (1,2)
- │    ├── side-effects
+ │    ├── immutable
  │    ├── scan xy
  │    ├── project-set
  │    │    ├── columns: generate_series:8
  │    │    ├── outer: (1,2)
- │    │    ├── side-effects
+ │    │    ├── immutable
  │    │    ├── values
  │    │    │    ├── cardinality: [1 - 1]
  │    │    │    ├── key: ()
  │    │    │    └── ()
  │    │    └── zip
- │    │         └── generate_series(k:1, i:2) [outer=(1,2), side-effects]
+ │    │         └── generate_series(k:1, i:2) [outer=(1,2), immutable]
  │    └── filters (true)
  └── filters
       └── i:2 = generate_series:8 [outer=(2,8), constraints=(/2: (/NULL - ]; /8: (/NULL - ]), fd=(2)==(8), (8)==(2)]
@@ -215,39 +218,39 @@ SELECT generate_series(0, (SELECT generate_series(1,0) FROM xy)) FROM uv
 ----
 inner-join (cross)
  ├── columns: generate_series:6
- ├── side-effects
+ ├── immutable
  ├── scan uv
  ├── project-set
  │    ├── columns: generate_series:6
- │    ├── side-effects
+ │    ├── immutable
  │    ├── values
  │    │    ├── cardinality: [1 - 1]
  │    │    ├── key: ()
  │    │    └── ()
  │    └── zip
- │         └── function: generate_series [side-effects, subquery]
+ │         └── function: generate_series [immutable, subquery]
  │              ├── 0
  │              └── subquery
  │                   └── max1-row
  │                        ├── columns: generate_series:5
  │                        ├── error: "more than one row returned by a subquery used as an expression"
  │                        ├── cardinality: [0 - 1]
- │                        ├── side-effects
+ │                        ├── immutable
  │                        ├── key: ()
  │                        ├── fd: ()-->(5)
  │                        └── inner-join (cross)
  │                             ├── columns: generate_series:5
- │                             ├── side-effects
+ │                             ├── immutable
  │                             ├── scan xy
  │                             ├── project-set
  │                             │    ├── columns: generate_series:5
- │                             │    ├── side-effects
+ │                             │    ├── immutable
  │                             │    ├── values
  │                             │    │    ├── cardinality: [1 - 1]
  │                             │    │    ├── key: ()
  │                             │    │    └── ()
  │                             │    └── zip
- │                             │         └── generate_series(1, 0) [side-effects]
+ │                             │         └── generate_series(1, 0) [immutable]
  │                             └── filters (true)
  └── filters (true)
 
@@ -273,6 +276,7 @@ project
       ├── fd: ()-->(4), (1)-->(2), (1)==(3), (3)==(1)
       ├── inner-join (hash)
       │    ├── columns: u:1!null v:2 k:3!null i:4!null
+      │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
       │    ├── key: (3)
       │    ├── fd: ()-->(4), (1)-->(2), (1)==(3), (3)==(1)
       │    ├── scan uv
@@ -358,13 +362,17 @@ FROM
 ----
 project
  ├── columns: x:1!null row_number:7 i:3
+ ├── cardinality: [0 - 3]
  ├── fd: (1)-->(3)
  └── window partition=(8)
       ├── columns: column1:1!null k:2!null i:3 row_number:7 rownum:8!null
+      ├── cardinality: [0 - 3]
       ├── key: (8)
       ├── fd: (8)-->(1), (2)-->(3), (1)==(2), (2)==(1)
       ├── inner-join (hash)
       │    ├── columns: column1:1!null k:2!null i:3 rownum:8!null
+      │    ├── cardinality: [0 - 3]
+      │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
       │    ├── key: (8)
       │    ├── fd: (8)-->(1), (2)-->(3), (1)==(2), (2)==(1)
       │    ├── ordinality
@@ -439,17 +447,22 @@ FROM
 ----
 project
  ├── columns: x:1!null row_number:7 i:3
+ ├── cardinality: [0 - 3]
  ├── fd: (1)-->(3)
  └── window partition=(9)
       ├── columns: column1:1!null i:3 row_number:7 rownum:9!null
+      ├── cardinality: [0 - 3]
       ├── key: (9)
       ├── fd: (9)-->(1), (1)-->(3)
       ├── project
       │    ├── columns: column1:1!null i:3 rownum:9!null
+      │    ├── cardinality: [0 - 3]
       │    ├── key: (9)
       │    ├── fd: (9)-->(1), (1)-->(3)
       │    └── inner-join (hash)
       │         ├── columns: column1:1!null k:2!null i:3 rownum:9!null
+      │         ├── cardinality: [0 - 3]
+      │         ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
       │         ├── key: (9)
       │         ├── fd: (9)-->(1), (2)-->(3), (1)==(2), (2)==(1)
       │         ├── ordinality
@@ -481,17 +494,22 @@ FROM
 ----
 project
  ├── columns: x:1!null y:2!null row_number:8 i:4
+ ├── cardinality: [0 - 3]
  ├── fd: (1)-->(4)
  └── window partition=(11)
       ├── columns: column1:1!null column2:2!null i:4 row_number:8 rownum:11!null
+      ├── cardinality: [0 - 3]
       ├── key: (11)
       ├── fd: (11)-->(1,2), (1)-->(4)
       ├── project
       │    ├── columns: column1:1!null column2:2!null i:4 rownum:11!null
+      │    ├── cardinality: [0 - 3]
       │    ├── key: (11)
       │    ├── fd: (11)-->(1,2), (1)-->(4)
       │    └── inner-join (hash)
       │         ├── columns: column1:1!null column2:2!null k:3!null i:4 rownum:11!null
+      │         ├── cardinality: [0 - 3]
+      │         ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
       │         ├── key: (11)
       │         ├── fd: (11)-->(1,2), (3)-->(4), (1)==(3), (3)==(1)
       │         ├── ordinality
@@ -531,6 +549,7 @@ window partition=(1)
  │    ├── fd: (1)-->(2,4)
  │    └── inner-join (hash)
  │         ├── columns: u:1!null v:2 k:3!null i:4
+ │         ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │         ├── key: (3)
  │         ├── fd: (1)-->(2), (3)-->(4), (1)==(3), (3)==(1)
  │         ├── scan uv
@@ -563,6 +582,7 @@ project
       ├── fd: (1)-->(2), (3)-->(4), (1)==(3), (3)==(1)
       ├── inner-join (hash)
       │    ├── columns: u:1!null v:2 k:3!null i:4
+      │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
       │    ├── key: (3)
       │    ├── fd: (1)-->(2), (3)-->(4), (1)==(3), (3)==(1)
       │    ├── scan uv
@@ -593,6 +613,7 @@ project
       ├── fd: (1)-->(2), (1)==(4), (4)==(1)
       ├── inner-join (hash)
       │    ├── columns: u:1!null v:2 i:4!null s:6
+      │    ├── multiplicity: left-rows(zero-or-more), right-rows(zero-or-one)
       │    ├── fd: (1)-->(2), (1)==(4), (4)==(1)
       │    ├── scan uv
       │    │    ├── columns: u:1!null v:2
@@ -754,6 +775,7 @@ project
  ├── fd: (1)-->(2-5)
  └── inner-join (hash)
       ├── columns: k:1!null i:2!null f:3 s:4 j:5 x:6!null
+      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
       ├── key: (1)
       ├── fd: (1)-->(2-5), (2)==(6), (6)==(2)
       ├── select
@@ -789,6 +811,7 @@ project
  └── inner-join (hash)
       ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6!null
       ├── cardinality: [0 - 1]
+      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
       ├── key: ()
       ├── fd: ()-->(1-6)
       ├── select
@@ -879,6 +902,7 @@ project
  │    ├── fd: (1)-->(10)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null x:6 notnull:9
+ │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    │    ├── key: (1)
  │    │    ├── fd: (6)-->(9), (1)-->(6,9)
  │    │    ├── scan a
@@ -906,7 +930,7 @@ project
  │         └── bool-or [as=bool_or:10, outer=(9)]
  │              └── notnull:9
  └── projections
-      └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=r:8, outer=(10)]
+      └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(10)]
 
 # Left join caused by zero or one cardinality subquery.
 norm expect=TryDecorrelateProjectSelect
@@ -920,6 +944,7 @@ project
  └── inner-join (hash)
       ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6!null y:7!null
       ├── cardinality: [0 - 1]
+      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
       ├── key: ()
       ├── fd: ()-->(1-7)
       ├── scan a
@@ -960,6 +985,7 @@ project
  │    ├── fd: (1)-->(10)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null x:6 notnull:9
+ │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    │    ├── key: (1)
  │    │    ├── fd: (6)-->(9), (1)-->(6,9)
  │    │    ├── scan a
@@ -987,7 +1013,7 @@ project
  │         └── bool-or [as=bool_or:10, outer=(9)]
  │              └── notnull:9
  └── projections
-      └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=r:8, outer=(10)]
+      └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(10)]
 
 # Any clause with variable.
 norm expect=(TryDecorrelateProject,TryDecorrelateProjectSelect,TryDecorrelateScalarGroupBy)
@@ -1002,6 +1028,7 @@ project
  │    ├── fd: (1)-->(2,10)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null i:2 x:6 y:7 notnull:9
+ │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    │    ├── key: (1)
  │    │    ├── fd: (1)-->(2,6,7,9), (6)-->(7), (7)~~>(9)
  │    │    ├── scan a
@@ -1027,7 +1054,7 @@ project
  │         └── const-agg [as=i:2, outer=(2)]
  │              └── i:2
  └── projections
-      └── CASE WHEN bool_or:10 AND (i:2 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false END [as=r:8, outer=(2,10)]
+      └── CASE WHEN bool_or:10 AND (i:2 IS NOT NULL) THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(2,10)]
 
 # Any clause with more complex expression that must be cached.
 norm expect=(TryDecorrelateProject,TryDecorrelateProjectSelect,TryDecorrelateScalarGroupBy)
@@ -1035,17 +1062,22 @@ SELECT i*i/5=ANY(SELECT y FROM xy WHERE x=k) AS r FROM a
 ----
 project
  ├── columns: r:8
+ ├── immutable
  ├── group-by
  │    ├── columns: k:1!null scalar:9 bool_or:11
  │    ├── grouping columns: k:1!null
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(9,11)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null x:6 y:7 scalar:9 notnull:10
+ │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
+ │    │    ├── immutable
  │    │    ├── key: (1)
  │    │    ├── fd: (1)-->(6,7,9,10), (6)-->(7), (7)~~>(10)
  │    │    ├── project
  │    │    │    ├── columns: scalar:9 k:1!null
+ │    │    │    ├── immutable
  │    │    │    ├── key: (1)
  │    │    │    ├── fd: (1)-->(9)
  │    │    │    ├── scan a
@@ -1053,7 +1085,7 @@ project
  │    │    │    │    ├── key: (1)
  │    │    │    │    └── fd: (1)-->(2)
  │    │    │    └── projections
- │    │    │         └── (i:2 * i:2) / 5 [as=scalar:9, outer=(2)]
+ │    │    │         └── (i:2 * i:2) / 5 [as=scalar:9, outer=(2), immutable]
  │    │    ├── project
  │    │    │    ├── columns: notnull:10!null x:6!null y:7
  │    │    │    ├── key: (6)
@@ -1073,7 +1105,7 @@ project
  │         └── const-agg [as=scalar:9, outer=(9)]
  │              └── scalar:9
  └── projections
-      └── CASE WHEN bool_or:11 AND (scalar:9 IS NOT NULL) THEN true WHEN bool_or:11 IS NULL THEN false END [as=r:8, outer=(9,11)]
+      └── CASE WHEN bool_or:11 AND (scalar:9 IS NOT NULL) THEN true WHEN bool_or:11 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(9,11), immutable]
 
 # --------------------------------------------------
 # TryDecorrelateProject
@@ -1146,6 +1178,7 @@ project
       ├── left-join (cross)
       │    ├── columns: x:6 div:10!null
       │    ├── outer: (2)
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    ├── project
       │    │    ├── columns: div:10!null
       │    │    ├── outer: (2)
@@ -1179,9 +1212,11 @@ WHERE EXISTS
 ----
 project
  ├── columns: k:1!null
+ ├── immutable
  ├── key: (1)
  └── semi-join-apply
       ├── columns: k:1!null i:2
+      ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(2)
       ├── scan a
@@ -1191,12 +1226,15 @@ project
       ├── left-join (hash)
       │    ├── columns: x:6!null plus:10
       │    ├── outer: (2)
+      │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
+      │    ├── immutable
       │    ├── scan xy
       │    │    ├── columns: x:6!null
       │    │    └── key: (6)
       │    ├── project
       │    │    ├── columns: plus:10!null
       │    │    ├── outer: (2)
+      │    │    ├── immutable
       │    │    ├── select
       │    │    │    ├── columns: u:8!null
       │    │    │    ├── outer: (2)
@@ -1207,7 +1245,7 @@ project
       │    │    │    └── filters
       │    │    │         └── i:2 = 5 [outer=(2), constraints=(/2: [/5 - /5]; tight), fd=()-->(2)]
       │    │    └── projections
-      │    │         └── u:8 + 1 [as=plus:10, outer=(8)]
+      │    │         └── u:8 + 1 [as=plus:10, outer=(8), immutable]
       │    └── filters
       │         └── x:6 = plus:10 [outer=(6,10), constraints=(/6: (/NULL - ]; /10: (/NULL - ]), fd=(6)==(10), (10)==(6)]
       └── filters (true)
@@ -1222,9 +1260,11 @@ WHERE EXISTS
 ----
 project
  ├── columns: k:1!null
+ ├── immutable
  ├── key: (1)
  └── semi-join-apply
       ├── columns: k:1!null i:2
+      ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(2)
       ├── scan a
@@ -1234,12 +1274,15 @@ project
       ├── full-join (hash)
       │    ├── columns: x:6 plus:10
       │    ├── outer: (2)
+      │    ├── multiplicity: left-rows(one-or-more), right-rows(exactly-one)
+      │    ├── immutable
       │    ├── scan xy
       │    │    ├── columns: x:6!null
       │    │    └── key: (6)
       │    ├── project
       │    │    ├── columns: plus:10!null
       │    │    ├── outer: (2)
+      │    │    ├── immutable
       │    │    ├── select
       │    │    │    ├── columns: u:8!null
       │    │    │    ├── outer: (2)
@@ -1250,7 +1293,7 @@ project
       │    │    │    └── filters
       │    │    │         └── i:2 = 5 [outer=(2), constraints=(/2: [/5 - /5]; tight), fd=()-->(2)]
       │    │    └── projections
-      │    │         └── u:8 + 1 [as=plus:10, outer=(8)]
+      │    │         └── u:8 + 1 [as=plus:10, outer=(8), immutable]
       │    └── filters
       │         └── x:6 = plus:10 [outer=(6,10), constraints=(/6: (/NULL - ]; /10: (/NULL - ]), fd=(6)==(10), (10)==(6)]
       └── filters (true)
@@ -1263,13 +1306,17 @@ SELECT (SELECT sum(y + v) FROM xy, uv WHERE x=u AND x=k) FROM a
 ----
 project
  ├── columns: sum:12
+ ├── immutable
  ├── group-by
  │    ├── columns: k:1!null sum:11
  │    ├── grouping columns: k:1!null
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(11)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null x:6 column10:10
+ │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
+ │    │    ├── immutable
  │    │    ├── key: (1)
  │    │    ├── fd: (6)-->(10), (1)-->(6,10)
  │    │    ├── scan a
@@ -1277,10 +1324,12 @@ project
  │    │    │    └── key: (1)
  │    │    ├── project
  │    │    │    ├── columns: column10:10 x:6!null
+ │    │    │    ├── immutable
  │    │    │    ├── key: (6)
  │    │    │    ├── fd: (6)-->(10)
  │    │    │    ├── inner-join (hash)
  │    │    │    │    ├── columns: x:6!null y:7 u:8!null v:9
+ │    │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    │    │    │    ├── key: (8)
  │    │    │    │    ├── fd: (6)-->(7), (8)-->(9), (6)==(8), (8)==(6)
  │    │    │    │    ├── scan xy
@@ -1294,7 +1343,7 @@ project
  │    │    │    │    └── filters
  │    │    │    │         └── x:6 = u:8 [outer=(6,8), constraints=(/6: (/NULL - ]; /8: (/NULL - ]), fd=(6)==(8), (8)==(6)]
  │    │    │    └── projections
- │    │    │         └── y:7 + v:9 [as=column10:10, outer=(7,9)]
+ │    │    │         └── y:7 + v:9 [as=column10:10, outer=(7,9), immutable]
  │    │    └── filters
  │    │         └── x:6 = k:1 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
  │    └── aggregations
@@ -1322,6 +1371,7 @@ semi-join (hash)
  │    └── key: (1)
  ├── inner-join (hash)
  │    ├── columns: x:6!null u:8!null
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    ├── key: (8)
  │    ├── fd: (6)==(8), (8)==(6)
  │    ├── scan xy
@@ -1351,6 +1401,7 @@ anti-join (hash)
  │    └── key: (1)
  ├── inner-join (hash)
  │    ├── columns: x:6!null u:8!null
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    ├── key: (8)
  │    ├── fd: (6)==(8), (8)==(6)
  │    ├── scan xy
@@ -1389,6 +1440,7 @@ project
       │    ├── fd: (1)-->(10)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null x:6 u:8
+      │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    │    ├── key: (1)
       │    │    ├── fd: (6)==(8), (8)==(6), (1)-->(6,8)
       │    │    ├── scan a
@@ -1396,6 +1448,7 @@ project
       │    │    │    └── key: (1)
       │    │    ├── inner-join (hash)
       │    │    │    ├── columns: x:6!null u:8!null
+      │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
       │    │    │    ├── key: (8)
       │    │    │    ├── fd: (6)==(8), (8)==(6)
       │    │    │    ├── scan xy
@@ -1431,6 +1484,7 @@ semi-join-apply
  ├── left-join (hash)
  │    ├── columns: x:6!null u:8
  │    ├── outer: (1)
+ │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    ├── key: (6)
  │    ├── fd: (6)-->(8)
  │    ├── scan xy
@@ -1493,7 +1547,7 @@ WHERE EXISTS(
     )=i
 )
 ----
-semi-join-apply
+select
  ├── columns: v1:1!null
  ├── cardinality: [0 - 2]
  ├── values
@@ -1501,43 +1555,31 @@ semi-join-apply
  │    ├── cardinality: [2 - 2]
  │    ├── (1,)
  │    └── (2,)
- ├── left-join (hash)
- │    ├── columns: k:2!null i:3!null x:7!null y:8!null v1:11
- │    ├── outer: (1)
- │    ├── key: (7)
- │    ├── fd: (2)-->(3), (7)-->(8,11), (2)==(7), (7)==(2), (3)==(8), (8)==(3)
- │    ├── inner-join (hash)
- │    │    ├── columns: k:2!null i:3!null x:7!null y:8!null
- │    │    ├── key: (7)
- │    │    ├── fd: (2)-->(3), (7)-->(8), (2)==(7), (7)==(2), (3)==(8), (8)==(3)
- │    │    ├── scan a
- │    │    │    ├── columns: k:2!null i:3
- │    │    │    ├── key: (2)
- │    │    │    └── fd: (2)-->(3)
- │    │    ├── scan xy
- │    │    │    ├── columns: x:7!null y:8
- │    │    │    ├── key: (7)
- │    │    │    └── fd: (7)-->(8)
- │    │    └── filters
- │    │         ├── x:7 = k:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
- │    │         └── i:3 = y:8 [outer=(3,8), constraints=(/3: (/NULL - ]; /8: (/NULL - ]), fd=(3)==(8), (8)==(3)]
- │    ├── project
- │    │    ├── columns: v1:11
- │    │    ├── outer: (1)
- │    │    ├── cardinality: [0 - 1]
- │    │    ├── key: ()
- │    │    ├── fd: ()-->(11)
- │    │    ├── limit
- │    │    │    ├── cardinality: [0 - 1]
- │    │    │    ├── key: ()
- │    │    │    ├── scan uv
- │    │    │    │    └── limit hint: 1.00
- │    │    │    └── 1
- │    │    └── projections
- │    │         └── column1:1 [as=v1:11, outer=(1)]
- │    └── filters
- │         └── x:7 = v1:11 [outer=(7,11), constraints=(/7: (/NULL - ]; /11: (/NULL - ]), fd=(7)==(11), (11)==(7)]
- └── filters (true)
+ └── filters
+      └── exists [subquery]
+           └── limit
+                ├── columns: k:2!null i:3!null x:7!null y:8!null
+                ├── cardinality: [0 - 1]
+                ├── key: ()
+                ├── fd: ()-->(2,3,7,8)
+                ├── inner-join (hash)
+                │    ├── columns: k:2!null i:3!null x:7!null y:8!null
+                │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
+                │    ├── key: (7)
+                │    ├── fd: (2)-->(3), (7)-->(8), (2)==(7), (7)==(2), (3)==(8), (8)==(3)
+                │    ├── limit hint: 1.00
+                │    ├── scan a
+                │    │    ├── columns: k:2!null i:3
+                │    │    ├── key: (2)
+                │    │    └── fd: (2)-->(3)
+                │    ├── scan xy
+                │    │    ├── columns: x:7!null y:8
+                │    │    ├── key: (7)
+                │    │    └── fd: (7)-->(8)
+                │    └── filters
+                │         ├── x:7 = k:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
+                │         └── i:3 = y:8 [outer=(3,8), constraints=(/3: (/NULL - ]; /8: (/NULL - ]), fd=(3)==(8), (8)==(3)]
+                └── 1
 
 norm expect=TryDecorrelateInnerLeftJoin
 SELECT *
@@ -1554,6 +1596,7 @@ project
       ├── fd: (1)-->(2), (3)-->(4), (5)-->(6), (1,3)-->(5,6)
       ├── left-join (hash)
       │    ├── columns: x:1!null y:2 u:3!null v:4 k:5 i:6
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    ├── key: (1,3)
       │    ├── fd: (1)-->(2), (3)-->(4), (5)-->(6), (1,3)-->(5,6)
       │    ├── inner-join (cross)
@@ -1736,10 +1779,12 @@ project
       │    ├── fd: (1)-->(2), (3)-->(1,2,4,10), (1)==(4), (4)==(1)
       │    ├── inner-join (hash)
       │    │    ├── columns: x:1!null y:2 u:3!null v:4!null k:5!null i:6!null
+      │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
       │    │    ├── key: (3)
       │    │    ├── fd: (1)-->(2), (3)-->(4), (1)==(4,5), (4)==(1,5), (5)-->(6), (5)==(1,4)
       │    │    ├── inner-join (hash)
       │    │    │    ├── columns: x:1!null y:2 u:3!null v:4!null
+      │    │    │    ├── multiplicity: left-rows(zero-or-more), right-rows(zero-or-one)
       │    │    │    ├── key: (3)
       │    │    │    ├── fd: (1)-->(2), (3)-->(4), (1)==(4), (4)==(1)
       │    │    │    ├── scan xy
@@ -1798,10 +1843,12 @@ project
       │    ├── fd: (1)-->(2), (3)-->(1,2,4,10), (1)==(4), (4)==(1)
       │    ├── left-join (hash)
       │    │    ├── columns: x:1!null y:2 u:3!null v:4!null k:5 i:6
+      │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    │    ├── key: (3)
       │    │    ├── fd: (1)-->(2), (3)-->(4-6), (1)==(4), (4)==(1), (5)-->(6)
       │    │    ├── inner-join (hash)
       │    │    │    ├── columns: x:1!null y:2 u:3!null v:4!null
+      │    │    │    ├── multiplicity: left-rows(zero-or-more), right-rows(zero-or-one)
       │    │    │    ├── key: (3)
       │    │    │    ├── fd: (1)-->(2), (3)-->(4), (1)==(4), (4)==(1)
       │    │    │    ├── scan xy
@@ -1855,6 +1902,7 @@ project
  │    │    ├── fd: ()-->(2), (1)-->(2,9)
  │    │    ├── inner-join (hash)
  │    │    │    ├── columns: x:1!null y:2!null k:4!null s:7
+ │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
  │    │    │    ├── key: (1)
  │    │    │    ├── fd: ()-->(2,4,7), (2)==(4), (4)==(2)
  │    │    │    ├── scan xy
@@ -2120,6 +2168,7 @@ group-by
  │    │    ├── fd: (1)-->(2-5), (1,6)-->(2-5,11)
  │    │    ├── left-join (cross)
  │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6!null canary:12
+ │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    │    ├── fd: (1)-->(2-5)
  │    │    │    ├── inner-join (cross)
  │    │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6!null
@@ -2182,6 +2231,7 @@ project
  │    │    ├── fd: (1)-->(2,9)
  │    │    ├── inner-join (hash)
  │    │    │    ├── columns: k:1!null i:2!null x:7!null y:8!null
+ │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
  │    │    │    ├── key: (1)
  │    │    │    ├── fd: (1)-->(2), (7)-->(8), (2)==(7), (7)==(2)
  │    │    │    ├── scan a
@@ -2226,6 +2276,7 @@ project
  │    ├── fd: (1)-->(7,10)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null y:7
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null
  │    │    │    └── key: (1)
@@ -2239,7 +2290,7 @@ project
  │         └── any-not-null-agg [as=y:7, outer=(7)]
  │              └── y:7
  └── projections
-      └── CASE WHEN y:7 IS NOT NULL THEN array_agg:10 END [as=array_agg:9, outer=(7,10)]
+      └── CASE WHEN y:7 IS NOT NULL THEN array_agg:10 ELSE CAST(NULL AS INT8[]) END [as=array_agg:9, outer=(7,10)]
 
 # With multiple columns. Without LATERAL these tests are a bit verbose.
 norm expect=TryDecorrelateScalarGroupBy
@@ -2256,6 +2307,7 @@ project
  │    ├── fd: (1)-->(7,9,12)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null y:7
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null
  │    │    │    └── key: (1)
@@ -2271,7 +2323,7 @@ project
  │         └── any-not-null-agg [as=y:7, outer=(7)]
  │              └── y:7
  └── projections
-      └── (CASE WHEN y:7 IS NOT NULL THEN array_agg:12 END, max:9) [as="?column?":11, outer=(7,9,12)]
+      └── (CASE WHEN y:7 IS NOT NULL THEN array_agg:12 ELSE CAST(NULL AS INT8[]) END, max:9) [as="?column?":11, outer=(7,9,12)]
 
 
 # With an aggregate that can't ignore nulls and when a non-nullable column must be synthesized.
@@ -2289,6 +2341,7 @@ project
  │    ├── fd: (1)-->(10,11)
  │    ├── left-join (cross)
  │    │    ├── columns: k:1!null i:2 y:7 canary:10
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    ├── fd: (1)-->(2)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null i:2
@@ -2309,7 +2362,7 @@ project
  │         └── any-not-null-agg [as=canary:10, outer=(10)]
  │              └── canary:10
  └── projections
-      └── COALESCE(CASE WHEN canary:10 IS NOT NULL THEN array_agg:11 END, ARRAY[]) [as=array:9, outer=(10,11)]
+      └── COALESCE(CASE WHEN canary:10 IS NOT NULL THEN array_agg:11 ELSE CAST(NULL AS INT8[]) END, ARRAY[]) [as=array:9, outer=(10,11)]
 
 # With an ordering.
 norm expect=TryDecorrelateScalarGroupBy
@@ -2329,6 +2382,7 @@ project
  │    │    ├── ordering: +7
  │    │    └── left-join (cross)
  │    │         ├── columns: k:1!null i:2 y:7 canary:10
+ │    │         ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │         ├── fd: (1)-->(2)
  │    │         ├── scan a
  │    │         │    ├── columns: k:1!null i:2
@@ -2351,7 +2405,7 @@ project
  │         └── any-not-null-agg [as=canary:10, outer=(10)]
  │              └── canary:10
  └── projections
-      └── COALESCE(CASE WHEN canary:10 IS NOT NULL THEN array_agg:11 END, ARRAY[]) [as=array:9, outer=(10,11)]
+      └── COALESCE(CASE WHEN canary:10 IS NOT NULL THEN array_agg:11 ELSE CAST(NULL AS INT8[]) END, ARRAY[]) [as=array:9, outer=(10,11)]
 
 # Nest scalar decorrelation within scalar decorrelation, using IS NULL to force
 # use of left joins.
@@ -2398,6 +2452,7 @@ project
       │    │    │    ├── left-join (cross)
       │    │    │    │    ├── columns: x:6!null y:7 u:8 v:9
       │    │    │    │    ├── outer: (1)
+      │    │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    │    │    ├── key: (6,8)
       │    │    │    │    ├── fd: (6)-->(7), (8)-->(9)
       │    │    │    │    ├── scan xy
@@ -2461,6 +2516,7 @@ project
       │    │    ├── fd: (1)-->(2,3,6)
       │    │    ├── left-join (hash)
       │    │    │    ├── columns: c:1!null d:2!null x:3 y:4
+      │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    │    │    ├── key: (1)
       │    │    │    ├── fd: (1)-->(2-4), (3)-->(4)
       │    │    │    ├── scan cd
@@ -2481,7 +2537,7 @@ project
       │    │         └── any-not-null-agg [as=x:3, outer=(3)]
       │    │              └── x:3
       │    └── projections
-      │         └── CASE WHEN x:3 IS NOT NULL THEN array_agg:6 END [as=array_agg:5, outer=(3,6)]
+      │         └── CASE WHEN x:3 IS NOT NULL THEN array_agg:6 ELSE CAST(NULL AS INT8[]) END [as=array_agg:5, outer=(3,6)]
       └── filters
            └── array_agg:5 = ARRAY[] [outer=(5), constraints=(/5: [/ARRAY[] - /ARRAY[]]; tight), fd=()-->(5)]
 
@@ -2490,23 +2546,29 @@ SELECT * FROM a WHERE 'foo'=(SELECT concat_agg(y::string) FROM xy WHERE x=k)
 ----
 project
  ├── columns: k:1!null i:2 f:3 s:4 j:5
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-5)
  └── select
       ├── columns: k:1!null i:2 f:3 s:4 j:5 concat_agg:9!null
+      ├── immutable
       ├── key: (1)
       ├── fd: ()-->(9), (1)-->(2-5)
       ├── project
       │    ├── columns: concat_agg:9 k:1!null i:2 f:3 s:4 j:5
+      │    ├── immutable
       │    ├── key: (1)
       │    ├── fd: (1)-->(2-5,9)
       │    ├── group-by
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 canary:10 concat_agg:11
       │    │    ├── grouping columns: k:1!null
+      │    │    ├── immutable
       │    │    ├── key: (1)
       │    │    ├── fd: (1)-->(2-5,10,11)
       │    │    ├── left-join (hash)
       │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6 column8:8 canary:10
+      │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
+      │    │    │    ├── immutable
       │    │    │    ├── key: (1)
       │    │    │    ├── fd: (1)-->(2-6,8,10), (6)-->(8)
       │    │    │    ├── scan a
@@ -2515,6 +2577,7 @@ project
       │    │    │    │    └── fd: (1)-->(2-5)
       │    │    │    ├── project
       │    │    │    │    ├── columns: canary:10!null column8:8 x:6!null
+      │    │    │    │    ├── immutable
       │    │    │    │    ├── key: (6)
       │    │    │    │    ├── fd: ()-->(10), (6)-->(8)
       │    │    │    │    ├── scan xy
@@ -2523,7 +2586,7 @@ project
       │    │    │    │    │    └── fd: (6)-->(7)
       │    │    │    │    └── projections
       │    │    │    │         ├── true [as=canary:10]
-      │    │    │    │         └── y:7::STRING [as=column8:8, outer=(7)]
+      │    │    │    │         └── y:7::STRING [as=column8:8, outer=(7), immutable]
       │    │    │    └── filters
       │    │    │         └── x:6 = k:1 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
       │    │    └── aggregations
@@ -2540,7 +2603,7 @@ project
       │    │         └── any-not-null-agg [as=canary:10, outer=(10)]
       │    │              └── canary:10
       │    └── projections
-      │         └── CASE WHEN canary:10 IS NOT NULL THEN concat_agg:11 END [as=concat_agg:9, outer=(10,11)]
+      │         └── CASE WHEN canary:10 IS NOT NULL THEN concat_agg:11 ELSE CAST(NULL AS STRING) END [as=concat_agg:9, outer=(10,11)]
       └── filters
            └── concat_agg:9 = 'foo' [outer=(9), constraints=(/9: [/'foo' - /'foo']; tight), fd=()-->(9)]
 
@@ -2559,6 +2622,7 @@ project
  │    ├── fd: (1)-->(12)
  │    ├── left-join (hash)
  │    │    ├── columns: a2.k:1!null a2.i:2 a.k:6 a.s:9 column11:11
+ │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
  │    │    ├── key: (1)
  │    │    ├── fd: (1)-->(2,6,9,11), (6)-->(9)
  │    │    ├── scan a2
@@ -2600,46 +2664,52 @@ WHERE EXISTS
 group-by
  ├── columns: x:1!null y:2
  ├── grouping columns: x:1!null
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── select
  │    ├── columns: x:1!null y:2 k:3!null i:4!null max:13!null
+ │    ├── immutable
  │    ├── key: (1,3)
  │    ├── fd: (1)-->(2), (3)-->(4), (1,3)-->(2,4,13), (4)==(13), (13)==(4)
  │    ├── group-by
  │    │    ├── columns: x:1!null y:2 k:3!null i:4 max:13!null
  │    │    ├── grouping columns: x:1!null k:3!null
+ │    │    ├── immutable
  │    │    ├── key: (1,3)
  │    │    ├── fd: (1)-->(2), (3)-->(4), (1,3)-->(2,4,13)
- │    │    ├── inner-join (hash)
+ │    │    ├── inner-join (cross)
  │    │    │    ├── columns: x:1!null y:2 k:3!null i:4 i:9!null f:10!null column14:14!null
- │    │    │    ├── fd: (1)-->(2), (2)-->(14), (3)-->(4), (10)==(14), (14)==(10)
- │    │    │    ├── project
- │    │    │    │    ├── columns: column14:14 x:1!null y:2
- │    │    │    │    ├── key: (1)
- │    │    │    │    ├── fd: (1)-->(2), (2)-->(14)
- │    │    │    │    ├── scan xy
- │    │    │    │    │    ├── columns: x:1!null y:2
+ │    │    │    ├── immutable
+ │    │    │    ├── fd: (1)-->(2), (2)-->(14), (10)==(14), (14)==(10), (3)-->(4)
+ │    │    │    ├── inner-join (hash)
+ │    │    │    │    ├── columns: x:1!null y:2 i:9!null f:10!null column14:14!null
+ │    │    │    │    ├── immutable
+ │    │    │    │    ├── fd: (1)-->(2), (2)-->(14), (10)==(14), (14)==(10)
+ │    │    │    │    ├── project
+ │    │    │    │    │    ├── columns: column14:14 x:1!null y:2
+ │    │    │    │    │    ├── immutable
  │    │    │    │    │    ├── key: (1)
- │    │    │    │    │    └── fd: (1)-->(2)
- │    │    │    │    └── projections
- │    │    │    │         └── y:2::FLOAT8 [as=column14:14, outer=(2)]
- │    │    │    ├── inner-join (cross)
- │    │    │    │    ├── columns: k:3!null i:4 i:9!null f:10
- │    │    │    │    ├── fd: (3)-->(4)
- │    │    │    │    ├── scan a
- │    │    │    │    │    ├── columns: k:3!null i:4
- │    │    │    │    │    ├── key: (3)
- │    │    │    │    │    └── fd: (3)-->(4)
+ │    │    │    │    │    ├── fd: (1)-->(2), (2)-->(14)
+ │    │    │    │    │    ├── scan xy
+ │    │    │    │    │    │    ├── columns: x:1!null y:2
+ │    │    │    │    │    │    ├── key: (1)
+ │    │    │    │    │    │    └── fd: (1)-->(2)
+ │    │    │    │    │    └── projections
+ │    │    │    │    │         └── y:2::FLOAT8 [as=column14:14, outer=(2), immutable]
  │    │    │    │    ├── select
  │    │    │    │    │    ├── columns: i:9!null f:10
  │    │    │    │    │    ├── scan a
  │    │    │    │    │    │    └── columns: i:9 f:10
  │    │    │    │    │    └── filters
  │    │    │    │    │         └── i:9 IS NOT NULL [outer=(9), constraints=(/9: (/NULL - ]; tight)]
- │    │    │    │    └── filters (true)
- │    │    │    └── filters
- │    │    │         └── column14:14 = f:10 [outer=(10,14), constraints=(/10: (/NULL - ]; /14: (/NULL - ]), fd=(10)==(14), (14)==(10)]
+ │    │    │    │    └── filters
+ │    │    │    │         └── column14:14 = f:10 [outer=(10,14), constraints=(/10: (/NULL - ]; /14: (/NULL - ]), fd=(10)==(14), (14)==(10)]
+ │    │    │    ├── scan a
+ │    │    │    │    ├── columns: k:3!null i:4
+ │    │    │    │    ├── key: (3)
+ │    │    │    │    └── fd: (3)-->(4)
+ │    │    │    └── filters (true)
  │    │    └── aggregations
  │    │         ├── max [as=max:13, outer=(9)]
  │    │         │    └── i:9
@@ -2717,26 +2787,28 @@ project
       │    ├── columns: computed:10 k:1!null x:6!null
       │    ├── key: (1,6)
       │    ├── fd: (1)-->(10)
-      │    ├── inner-join (hash)
+      │    ├── inner-join (cross)
       │    │    ├── columns: k:1!null i:2!null x:6!null u:8!null
       │    │    ├── key: (1,6)
       │    │    ├── fd: (1)-->(2), (2)==(8), (8)==(2)
-      │    │    ├── scan a
-      │    │    │    ├── columns: k:1!null i:2
+      │    │    ├── inner-join (hash)
+      │    │    │    ├── columns: k:1!null i:2!null u:8!null
+      │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
       │    │    │    ├── key: (1)
-      │    │    │    └── fd: (1)-->(2)
-      │    │    ├── inner-join (cross)
-      │    │    │    ├── columns: x:6!null u:8!null
-      │    │    │    ├── key: (6,8)
-      │    │    │    ├── scan xy
-      │    │    │    │    ├── columns: x:6!null
-      │    │    │    │    └── key: (6)
+      │    │    │    ├── fd: (1)-->(2), (2)==(8), (8)==(2)
+      │    │    │    ├── scan a
+      │    │    │    │    ├── columns: k:1!null i:2
+      │    │    │    │    ├── key: (1)
+      │    │    │    │    └── fd: (1)-->(2)
       │    │    │    ├── scan uv
       │    │    │    │    ├── columns: u:8!null
       │    │    │    │    └── key: (8)
-      │    │    │    └── filters (true)
-      │    │    └── filters
-      │    │         └── u:8 = i:2 [outer=(2,8), constraints=(/2: (/NULL - ]; /8: (/NULL - ]), fd=(2)==(8), (8)==(2)]
+      │    │    │    └── filters
+      │    │    │         └── u:8 = i:2 [outer=(2,8), constraints=(/2: (/NULL - ]; /8: (/NULL - ]), fd=(2)==(8), (8)==(2)]
+      │    │    ├── scan xy
+      │    │    │    ├── columns: x:6!null
+      │    │    │    └── key: (6)
+      │    │    └── filters (true)
       │    └── projections
       │         └── COALESCE(u:8, 10) [as=computed:10, outer=(8)]
       └── filters
@@ -2749,20 +2821,20 @@ SELECT * FROM xy WHERE EXISTS(SELECT generate_series(x, 10), generate_series(y, 
 group-by
  ├── columns: x:1!null y:2
  ├── grouping columns: x:1!null
- ├── side-effects
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── project-set
  │    ├── columns: x:1!null y:2 generate_series:3 generate_series:4
- │    ├── side-effects
+ │    ├── immutable
  │    ├── fd: (1)-->(2)
  │    ├── scan xy
  │    │    ├── columns: x:1!null y:2
  │    │    ├── key: (1)
  │    │    └── fd: (1)-->(2)
  │    └── zip
- │         ├── generate_series(x:1, 10) [outer=(1), side-effects]
- │         └── generate_series(y:2, 10) [outer=(2), side-effects]
+ │         ├── generate_series(x:1, 10) [outer=(1), immutable]
+ │         └── generate_series(y:2, 10) [outer=(2), immutable]
  └── aggregations
       └── const-agg [as=y:2, outer=(2)]
            └── y:2
@@ -2793,6 +2865,7 @@ semi-join (hash)
  │    └── fd: (1)-->(2-5)
  ├── inner-join (hash)
  │    ├── columns: x:6!null u:8!null v:9
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    ├── key: (8)
  │    ├── fd: (8)-->(9), (6)==(8), (8)==(6)
  │    ├── scan xy
@@ -2820,6 +2893,7 @@ project
  │    ├── fd: (1)-->(6)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null i:2 xy.x:6 y:7
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    ├── key: (1,6)
  │    │    ├── fd: (1)-->(2), (6)-->(7)
  │    │    ├── scan a
@@ -2857,6 +2931,7 @@ project
       │    ├── fd: (1)-->(2-5,8)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6!null u:8 v:9
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    ├── key: (1,8)
       │    │    ├── fd: (1)-->(2-5), (1)==(6), (6)==(1), (8)-->(9)
       │    │    ├── select
@@ -2870,6 +2945,7 @@ project
       │    │    │    │    ├── fd: (1)-->(2-6)
       │    │    │    │    ├── left-join (hash)
       │    │    │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6 y:7
+      │    │    │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    │    │    │    ├── key: (1,6)
       │    │    │    │    │    ├── fd: (1)-->(2-5), (6)-->(7)
       │    │    │    │    │    ├── scan a
@@ -2945,6 +3021,7 @@ project
       │    ├── fd: (1)-->(2-6)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6 y:7 u:8
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    ├── key: (1,6)
       │    │    ├── fd: (1)-->(2-5), (6)-->(7), (6)==(8), (8)==(6)
       │    │    ├── scan a
@@ -2962,6 +3039,7 @@ project
       │    │    │    │    ├── fd: (6)-->(7,8)
       │    │    │    │    ├── left-join (hash)
       │    │    │    │    │    ├── columns: x:6!null y:7 u:8 v:9
+      │    │    │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    │    │    │    ├── key: (6,8)
       │    │    │    │    │    ├── fd: (6)-->(7), (8)-->(9)
       │    │    │    │    │    ├── scan xy
@@ -3018,6 +3096,7 @@ project
  │    ├── fd: (1)-->(4)
  │    ├── left-join (hash)
  │    │    ├── columns: x:1!null u:3 uv.v:4 k:5 i:6
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
  │    │    ├── key: (1,5)
  │    │    ├── fd: (3)-->(4), (5)-->(6), (3)==(5), (5)==(3)
  │    │    ├── scan xy
@@ -3025,6 +3104,7 @@ project
  │    │    │    └── key: (1)
  │    │    ├── inner-join (hash)
  │    │    │    ├── columns: u:3!null uv.v:4 k:5!null i:6
+ │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    │    │    ├── key: (5)
  │    │    │    ├── fd: (3)-->(4), (5)-->(6), (3)==(5), (5)==(3)
  │    │    │    ├── scan uv
@@ -3070,6 +3150,7 @@ project
       │    │    ├── ordering: +5,+6 opt(4) [actual: +5,+6]
       │    │    └── left-join (hash)
       │    │         ├── columns: x:1!null y:2 k:3 i:4 f:5 s:6
+      │    │         ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │         ├── key: (1,3)
       │    │         ├── fd: (1)-->(2), (3)-->(4-6)
       │    │         ├── scan xy
@@ -3108,6 +3189,7 @@ project
  │    ├── fd: (1)-->(4)
  │    ├── left-join (hash)
  │    │    ├── columns: x:1!null cd.d:4
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
  │    │    ├── scan xy
  │    │    │    ├── columns: x:1!null
  │    │    │    └── key: (1)
@@ -3140,6 +3222,7 @@ project
       │    ├── fd: (1)-->(2,4)
       │    ├── left-join (hash)
       │    │    ├── columns: x:1!null y:2 d:4
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    ├── fd: (1)-->(2)
       │    │    ├── scan xy
       │    │    │    ├── columns: x:1!null y:2
@@ -3173,6 +3256,7 @@ project
  │    ├── fd: (1)-->(2-5,7)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 cd.d:7
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
  │    │    ├── fd: (1)-->(2-5)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5
@@ -3225,6 +3309,7 @@ project
       │    ├── left-join (cross)
       │    │    ├── columns: u:6!null v:7 bool:10
       │    │    ├── outer: (2)
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    ├── fd: (6)-->(7)
       │    │    ├── scan uv
       │    │    │    ├── columns: u:6!null v:7
@@ -3271,6 +3356,7 @@ project
  │    │    ├── columns: "?column?":4!null x:1!null
  │    │    ├── inner-join (cross)
  │    │    │    ├── columns: x:1!null column1:3!null
+ │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    │    ├── scan xy
  │    │    │    │    ├── columns: x:1!null
  │    │    │    │    └── key: (1)
@@ -3319,6 +3405,7 @@ project
       │    │    ├── fd: (6)-->(7)
       │    │    ├── inner-join (cross)
       │    │    │    ├── columns: u:6!null v:7 column1:8!null
+      │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    │    ├── fd: (6)-->(7)
       │    │    │    ├── scan uv
       │    │    │    │    ├── columns: u:6!null v:7
@@ -3361,6 +3448,7 @@ project
       │    ├── left-join (cross)
       │    │    ├── columns: column1:1!null x:2 y:3 rownum:4!null
       │    │    ├── cardinality: [2 - ]
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    ├── key: (2,4)
       │    │    ├── fd: (4)-->(1), (2)-->(3)
       │    │    ├── ordinality
@@ -3662,6 +3750,7 @@ project
       │    ├── fd: (1)-->(2-5,7)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 y:7
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
       │    │    ├── fd: (1)-->(2-5)
       │    │    ├── scan a
       │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5
@@ -3708,6 +3797,7 @@ project
       │    ├── fd: ()-->(1-5,7)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 y:7
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
       │    │    ├── fd: ()-->(1-5)
       │    │    ├── limit hint: 1.00
       │    │    ├── select
@@ -3780,6 +3870,7 @@ project
       │    ├── fd: (1)-->(2-5,10)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 count_rows:8!null y:10
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
       │    │    ├── fd: (1)-->(2-5,8)
       │    │    ├── select
       │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 count_rows:8!null
@@ -3792,6 +3883,7 @@ project
       │    │    │    │    ├── fd: (1)-->(2-5,8)
       │    │    │    │    ├── left-join (hash)
       │    │    │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 y:7
+      │    │    │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
       │    │    │    │    │    ├── fd: (1)-->(2-5)
       │    │    │    │    │    ├── scan a
       │    │    │    │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5
@@ -3839,10 +3931,12 @@ SELECT * FROM a WHERE (0, length((SELECT count(*) FROM uv WHERE k=u)::string)) >
 ----
 project
  ├── columns: k:1!null i:2 f:3 s:4 j:5
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-5)
  └── select
       ├── columns: k:1!null i:2 f:3 s:4 j:5 count_rows:8!null
+      ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(2-5,8)
       ├── group-by
@@ -3852,6 +3946,7 @@ project
       │    ├── fd: (1)-->(2-5,8)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 u:6
+      │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    │    ├── key: (1)
       │    │    ├── fd: (1)-->(2-6)
       │    │    ├── scan a
@@ -3875,7 +3970,7 @@ project
       │         └── const-agg [as=j:5, outer=(5)]
       │              └── j:5
       └── filters
-           └── ((0, length(count_rows:8::STRING)) > (0, 1)) OR (i:2 = 1) [outer=(2,8)]
+           └── ((0, length(count_rows:8::STRING)) > (0, 1)) OR (i:2 = 1) [outer=(2,8), immutable]
 
 # Exists within a disjunction.
 norm expect=HoistSelectSubquery
@@ -3896,6 +3991,7 @@ project
       │    ├── fd: (1)-->(2-5,9)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 y:7 true:8
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    ├── fd: (1)-->(2-5)
       │    │    ├── scan a
       │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5
@@ -3947,6 +4043,7 @@ project
       │    │    ├── fd: (1)-->(2-5,9)
       │    │    ├── left-join (hash)
       │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6 y:7 notnull:8
+      │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    │    │    ├── key: (1)
       │    │    │    ├── fd: (1)-->(2-8), (6)-->(7), (7)~~>(8)
       │    │    │    ├── scan a
@@ -3978,7 +4075,7 @@ project
       │    │         └── const-agg [as=j:5, outer=(5)]
       │    │              └── j:5
       │    └── projections
-      │         └── CASE WHEN bool_or:9 AND (i:2 IS NOT NULL) THEN true WHEN bool_or:9 IS NULL THEN false END [as=case:10, outer=(2,9)]
+      │         └── CASE WHEN bool_or:9 AND (i:2 IS NOT NULL) THEN true WHEN bool_or:9 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:10, outer=(2,9)]
       └── filters
            └── case:10 IS NULL [outer=(10), constraints=(/10: [/NULL - /NULL]; tight), fd=()-->(10)]
 
@@ -4008,17 +4105,22 @@ SELECT i*i/100 < ALL(SELECT y FROM xy WHERE x=k) AS r, s FROM a
 ----
 project
  ├── columns: r:8 s:4
+ ├── immutable
  ├── group-by
  │    ├── columns: k:1!null s:4 scalar:9 bool_or:11
  │    ├── grouping columns: k:1!null
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(4,9,11)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null s:4 x:6 y:7 scalar:9 notnull:10
+ │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
+ │    │    ├── immutable
  │    │    ├── key: (1)
  │    │    ├── fd: (1)-->(4,6,7,9,10), (6)-->(7), (7)~~>(10)
  │    │    ├── project
  │    │    │    ├── columns: scalar:9 k:1!null s:4
+ │    │    │    ├── immutable
  │    │    │    ├── key: (1)
  │    │    │    ├── fd: (1)-->(4,9)
  │    │    │    ├── scan a
@@ -4026,7 +4128,7 @@ project
  │    │    │    │    ├── key: (1)
  │    │    │    │    └── fd: (1)-->(2,4)
  │    │    │    └── projections
- │    │    │         └── (i:2 * i:2) / 100 [as=scalar:9, outer=(2)]
+ │    │    │         └── (i:2 * i:2) / 100 [as=scalar:9, outer=(2), immutable]
  │    │    ├── project
  │    │    │    ├── columns: notnull:10!null x:6!null y:7
  │    │    │    ├── key: (6)
@@ -4048,7 +4150,7 @@ project
  │         └── const-agg [as=scalar:9, outer=(9)]
  │              └── scalar:9
  └── projections
-      └── NOT CASE WHEN bool_or:11 AND (scalar:9 IS NOT NULL) THEN true WHEN bool_or:11 IS NULL THEN false END [as=r:8, outer=(9,11)]
+      └── NOT CASE WHEN bool_or:11 AND (scalar:9 IS NOT NULL) THEN true WHEN bool_or:11 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(9,11), immutable]
 
 # Regress issue #32270: Panic when expression contains both correlated and
 # uncorrelated subquery.
@@ -4070,6 +4172,7 @@ project
       │    ├── fd: (1)-->(2-5,11)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:8 true:10
+      │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │    │    ├── key: (1)
       │    │    ├── fd: (1)-->(2-5,8,10)
       │    │    ├── scan a
@@ -4124,6 +4227,7 @@ project
  ├── columns: x:8
  ├── left-join (hash)
  │    ├── columns: k:1!null xy.x:6
+ │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    ├── key: (1)
  │    ├── fd: (1)-->(6)
  │    ├── scan a
@@ -4158,9 +4262,11 @@ project
  │    ├── fd: (1)-->(6,16)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null xy.x:6 xy.y:15
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
  │    │    ├── fd: (1)-->(6)
  │    │    ├── left-join (hash)
  │    │    │    ├── columns: k:1!null xy.x:6
+ │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    │    │    ├── key: (1)
  │    │    │    ├── fd: (1)-->(6)
  │    │    │    ├── scan a
@@ -4230,6 +4336,7 @@ scalar-group-by
  │    │    ├── fd: (1)-->(7)
  │    │    ├── left-join (hash)
  │    │    │    ├── columns: k:1!null i:2 y:7
+ │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    │    ├── fd: (1)-->(2)
  │    │    │    ├── scan a
  │    │    │    │    ├── columns: k:1!null i:2
@@ -4261,6 +4368,7 @@ project
  │    ├── fd: (1)-->(10)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null i:2 y:7 true:9
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    ├── fd: (1)-->(2)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null i:2
@@ -4294,6 +4402,7 @@ project
  │    ├── fd: (1)-->(10)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null i:2 y:7 notnull:9
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    ├── fd: (1)-->(2), (7)~~>(9)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null i:2
@@ -4316,7 +4425,7 @@ project
  │         └── bool-or [as=bool_or:10, outer=(9)]
  │              └── notnull:9
  └── projections
-      └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=r:8, outer=(10)]
+      └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=r:8, outer=(10)]
 
 # Correlated subquery nested in uncorrelated subquery.
 norm expect=HoistProjectSubquery
@@ -4336,6 +4445,7 @@ values
                 ├── fd: ()-->(1,2,7,9)
                 ├── left-join (hash)
                 │    ├── columns: k:1!null i:2 y:7 true:9
+                │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
                 │    ├── fd: ()-->(1,2)
                 │    ├── limit hint: 1.00
                 │    ├── limit
@@ -4382,8 +4492,10 @@ SELECT i, y FROM a INNER JOIN xy ON (SELECT k+1) = x
 ----
 project
  ├── columns: i:2 y:7
+ ├── immutable
  └── inner-join-apply
       ├── columns: k:1!null i:2 x:6!null y:7 "?column?":8
+      ├── immutable
       ├── key: (1,6)
       ├── fd: (1)-->(2), (1,6)-->(7,8), (6)==(8), (8)==(6)
       ├── scan a
@@ -4393,6 +4505,8 @@ project
       ├── inner-join (cross)
       │    ├── columns: x:6!null y:7 "?column?":8
       │    ├── outer: (1)
+      │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
+      │    ├── immutable
       │    ├── key: (6)
       │    ├── fd: ()-->(8), (6)-->(7)
       │    ├── scan xy
@@ -4403,6 +4517,7 @@ project
       │    │    ├── columns: "?column?":8
       │    │    ├── outer: (1)
       │    │    ├── cardinality: [1 - 1]
+      │    │    ├── immutable
       │    │    ├── key: ()
       │    │    ├── fd: ()-->(8)
       │    │    └── (k:1 + 1,)
@@ -4435,6 +4550,7 @@ project
       │    │    ├── fd: (6)-->(11)
       │    │    ├── left-join (hash)
       │    │    │    ├── columns: x:6!null y:7 u:8 true:10
+      │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    │    │    ├── key: (6)
       │    │    │    ├── fd: (6)-->(7,8,10)
       │    │    │    ├── scan xy
@@ -4479,6 +4595,7 @@ project
       │    │    ├── fd: (1)-->(5), (6)-->(7), (1,6)-->(5,7,11)
       │    │    ├── left-join (hash)
       │    │    │    ├── columns: k:1!null i:2 j:5 x:6!null y:7 u:8 v:9 notnull:10
+      │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
       │    │    │    ├── key: (1,6)
       │    │    │    ├── fd: (1)-->(2,5), (6)-->(7), (8)-->(9), (9)~~>(10), (1,6)-->(8-10)
       │    │    │    ├── inner-join (cross)
@@ -4516,7 +4633,7 @@ project
       │    │         └── const-agg [as=j:5, outer=(5)]
       │    │              └── j:5
       │    └── projections
-      │         └── CASE WHEN bool_or:11 AND (x:6 IS NOT NULL) THEN true WHEN bool_or:11 IS NULL THEN false END [as=case:12, outer=(6,11)]
+      │         └── CASE WHEN bool_or:11 AND (x:6 IS NOT NULL) THEN true WHEN bool_or:11 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:12, outer=(6,11)]
       └── filters
            └── case:12 OR (x:6 IS NULL) [outer=(6,12)]
 
@@ -4529,14 +4646,17 @@ SELECT (VALUES ((SELECT i+1 AS r)), (10), ((SELECT k+1 AS s))) FROM a
 ----
 project
  ├── columns: column1:9
+ ├── immutable
  ├── ensure-distinct-on
  │    ├── columns: k:1!null column1:8
  │    ├── grouping columns: k:1!null
  │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(8)
  │    ├── inner-join-apply
  │    │    ├── columns: k:1!null i:2 r:6 s:7 column1:8
+ │    │    ├── immutable
  │    │    ├── fd: (1)-->(2)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null i:2
@@ -4546,17 +4666,21 @@ project
  │    │    │    ├── columns: r:6 s:7 column1:8
  │    │    │    ├── outer: (1,2)
  │    │    │    ├── cardinality: [3 - 3]
+ │    │    │    ├── immutable
  │    │    │    ├── fd: ()-->(6,7)
  │    │    │    ├── inner-join (cross)
  │    │    │    │    ├── columns: r:6 s:7
  │    │    │    │    ├── outer: (1,2)
  │    │    │    │    ├── cardinality: [1 - 1]
+ │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
+ │    │    │    │    ├── immutable
  │    │    │    │    ├── key: ()
  │    │    │    │    ├── fd: ()-->(6,7)
  │    │    │    │    ├── values
  │    │    │    │    │    ├── columns: r:6
  │    │    │    │    │    ├── outer: (2)
  │    │    │    │    │    ├── cardinality: [1 - 1]
+ │    │    │    │    │    ├── immutable
  │    │    │    │    │    ├── key: ()
  │    │    │    │    │    ├── fd: ()-->(6)
  │    │    │    │    │    └── (i:2 + 1,)
@@ -4564,6 +4688,7 @@ project
  │    │    │    │    │    ├── columns: s:7
  │    │    │    │    │    ├── outer: (1)
  │    │    │    │    │    ├── cardinality: [1 - 1]
+ │    │    │    │    │    ├── immutable
  │    │    │    │    │    ├── key: ()
  │    │    │    │    │    ├── fd: ()-->(7)
  │    │    │    │    │    └── (k:1 + 1,)
@@ -4618,6 +4743,7 @@ project
  │    │    │    │    │    ├── columns: true:9
  │    │    │    │    │    ├── outer: (1)
  │    │    │    │    │    ├── cardinality: [1 - 1]
+ │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  │    │    │    │    │    ├── key: ()
  │    │    │    │    │    ├── fd: ()-->(9)
  │    │    │    │    │    ├── values
@@ -4696,6 +4822,7 @@ project
  │    │    │    │    │    ├── columns: notnull:9
  │    │    │    │    │    ├── outer: (1)
  │    │    │    │    │    ├── cardinality: [1 - 1]
+ │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  │    │    │    │    │    ├── key: ()
  │    │    │    │    │    ├── fd: ()-->(9)
  │    │    │    │    │    ├── values
@@ -4728,7 +4855,7 @@ project
  │    │    │    │         └── bool-or [as=bool_or:10, outer=(9)]
  │    │    │    │              └── notnull:9
  │    │    │    └── projections
- │    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false END [as=case:11, outer=(10)]
+ │    │    │         └── CASE WHEN bool_or:10 THEN true WHEN bool_or:10 IS NULL THEN false ELSE CAST(NULL AS BOOL) END [as=case:11, outer=(10)]
  │    │    ├── values
  │    │    │    ├── columns: column1:8
  │    │    │    ├── outer: (11)
@@ -4749,14 +4876,15 @@ SELECT generate_series(1, (SELECT v FROM uv WHERE u=x)) FROM xy
 ----
 project
  ├── columns: generate_series:5
- ├── side-effects
+ ├── immutable
  └── project-set
       ├── columns: v:4 generate_series:5
-      ├── side-effects
+      ├── immutable
       ├── project
       │    ├── columns: v:4
       │    └── left-join (hash)
       │         ├── columns: x:1!null u:3 v:4
+      │         ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │         ├── key: (1)
       │         ├── fd: (3)-->(4), (1)-->(3,4)
       │         ├── scan xy
@@ -4769,7 +4897,7 @@ project
       │         └── filters
       │              └── u:3 = x:1 [outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
       └── zip
-           └── generate_series(1, v:4) [outer=(4), side-effects]
+           └── generate_series(1, v:4) [outer=(4), immutable]
 
 # Zip correlation within EXISTS.
 norm expect=(HoistProjectSetSubquery,TryDecorrelateSemiJoin,TryDecorrelateProjectSet)
@@ -4778,12 +4906,12 @@ SELECT * FROM xy WHERE EXISTS(SELECT * FROM generate_series(1, (SELECT v FROM uv
 group-by
  ├── columns: x:1!null y:2
  ├── grouping columns: x:1!null
- ├── side-effects
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── project-set
  │    ├── columns: x:1!null y:2 v:4 generate_series:5
- │    ├── side-effects
+ │    ├── immutable
  │    ├── fd: (1)-->(2,4)
  │    ├── project
  │    │    ├── columns: x:1!null y:2 v:4
@@ -4791,6 +4919,7 @@ group-by
  │    │    ├── fd: (1)-->(2,4)
  │    │    └── left-join (hash)
  │    │         ├── columns: x:1!null y:2 u:3 v:4
+ │    │         ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    │         ├── key: (1)
  │    │         ├── fd: (1)-->(2-4), (3)-->(4)
  │    │         ├── scan xy
@@ -4804,7 +4933,7 @@ group-by
  │    │         └── filters
  │    │              └── u:3 = x:1 [outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
  │    └── zip
- │         └── generate_series(1, v:4) [outer=(4), side-effects]
+ │         └── generate_series(1, v:4) [outer=(4), immutable]
  └── aggregations
       └── const-agg [as=y:2, outer=(2)]
            └── y:2
@@ -4815,18 +4944,20 @@ SELECT generate_series((select y FROM xy WHERE x=k), (SELECT v FROM uv WHERE u=k
 ----
 project
  ├── columns: generate_series:10
- ├── side-effects
+ ├── immutable
  └── project-set
       ├── columns: y:7 v:9 generate_series:10
-      ├── side-effects
+      ├── immutable
       ├── project
       │    ├── columns: y:7 v:9
       │    └── left-join (hash)
       │         ├── columns: k:1!null x:6 y:7 u:8 v:9
+      │         ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │         ├── key: (1)
       │         ├── fd: (6)-->(7), (1)-->(6-9), (8)-->(9)
       │         ├── left-join (hash)
       │         │    ├── columns: k:1!null x:6 y:7
+      │         │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       │         │    ├── key: (1)
       │         │    ├── fd: (6)-->(7), (1)-->(6,7)
       │         │    ├── scan a
@@ -4845,7 +4976,7 @@ project
       │         └── filters
       │              └── u:8 = k:1 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
       └── zip
-           └── generate_series(y:7, v:9) [outer=(7,9), side-effects]
+           └── generate_series(y:7, v:9) [outer=(7,9), immutable]
 
 # Multiple functions.
 norm expect=HoistProjectSetSubquery
@@ -4856,18 +4987,20 @@ FROM a
 ----
 project
  ├── columns: generate_series:8 information_schema._pg_expandarray:13
- ├── side-effects
+ ├── immutable
  ├── project-set
  │    ├── columns: v:7 generate_series:8 xy.x:9 x:11 n:12
- │    ├── side-effects
+ │    ├── immutable
  │    ├── project
  │    │    ├── columns: v:7 xy.x:9
  │    │    └── left-join (hash)
  │    │         ├── columns: k:1!null u:6 v:7 xy.x:9
+ │    │         ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    │         ├── key: (1)
  │    │         ├── fd: (6)-->(7), (1)-->(6,7,9)
  │    │         ├── left-join (hash)
  │    │         │    ├── columns: k:1!null u:6 v:7
+ │    │         │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    │         │    ├── key: (1)
  │    │         │    ├── fd: (6)-->(7), (1)-->(6,7)
  │    │         │    ├── scan a
@@ -4885,8 +5018,8 @@ project
  │    │         └── filters
  │    │              └── xy.x:9 = k:1 [outer=(1,9), constraints=(/1: (/NULL - ]; /9: (/NULL - ]), fd=(1)==(9), (9)==(1)]
  │    └── zip
- │         ├── generate_series(1, v:7) [outer=(7), side-effects]
- │         └── information_schema._pg_expandarray(ARRAY[xy.x:9]) [outer=(9), side-effects]
+ │         ├── generate_series(1, v:7) [outer=(7), immutable]
+ │         └── information_schema._pg_expandarray(ARRAY[xy.x:9]) [outer=(9), immutable]
  └── projections
       └── ((x:11, n:12) AS x, n) [as=information_schema._pg_expandarray:13, outer=(11,12)]
 
@@ -4895,11 +5028,11 @@ SELECT a, generate_series(1, (SELECT a)) FROM (VALUES (1)) AS v (a)
 ----
 project
  ├── columns: a:1!null generate_series:3
- ├── side-effects
+ ├── immutable
  ├── fd: ()-->(1)
  └── project-set
       ├── columns: column1:1!null a:2 generate_series:3
-      ├── side-effects
+      ├── immutable
       ├── fd: ()-->(1,2)
       ├── inner-join-apply
       │    ├── columns: column1:1!null a:2
@@ -4921,18 +5054,18 @@ project
       │    │    └── (column1:1,)
       │    └── filters (true)
       └── zip
-           └── generate_series(1, a:2) [outer=(2), side-effects]
+           └── generate_series(1, a:2) [outer=(2), immutable]
 
 norm expect=HoistProjectSetSubquery
 SELECT a, generate_series(1, (SELECT a)), generate_series(1, (SELECT a)) FROM (VALUES (1)) AS v (a)
 ----
 project
  ├── columns: a:1!null generate_series:3 generate_series:5
- ├── side-effects
+ ├── immutable
  ├── fd: ()-->(1)
  └── project-set
       ├── columns: column1:1!null a:2 generate_series:3 a:4 generate_series:5
-      ├── side-effects
+      ├── immutable
       ├── fd: ()-->(1,2,4)
       ├── inner-join-apply
       │    ├── columns: column1:1!null a:2 a:4
@@ -4967,8 +5100,8 @@ project
       │    │    └── (column1:1,)
       │    └── filters (true)
       └── zip
-           ├── generate_series(1, a:2) [outer=(2), side-effects]
-           └── generate_series(1, a:4) [outer=(4), side-effects]
+           ├── generate_series(1, a:2) [outer=(2), immutable]
+           └── generate_series(1, a:4) [outer=(4), immutable]
 
 exec-ddl
 CREATE TABLE articles (
@@ -4997,13 +5130,13 @@ limit
  ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9
  ├── internal-ordering: +8
  ├── cardinality: [0 - 10]
- ├── side-effects
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-9)
  ├── ordering: +8
  ├── sort
  │    ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9
- │    ├── side-effects
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-9)
  │    ├── ordering: +8
@@ -5011,23 +5144,23 @@ limit
  │    └── group-by
  │         ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9
  │         ├── grouping columns: id:1!null
- │         ├── side-effects
+ │         ├── immutable
  │         ├── key: (1)
  │         ├── fd: (1)-->(2-9)
  │         ├── select
  │         │    ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9 unnest:10!null
- │         │    ├── side-effects
+ │         │    ├── immutable
  │         │    ├── fd: ()-->(10), (1)-->(2-9)
  │         │    ├── project-set
  │         │    │    ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9 unnest:10
- │         │    │    ├── side-effects
+ │         │    │    ├── immutable
  │         │    │    ├── fd: (1)-->(2-9)
  │         │    │    ├── scan a0
  │         │    │    │    ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9
  │         │    │    │    ├── key: (1)
  │         │    │    │    └── fd: (1)-->(2-9)
  │         │    │    └── zip
- │         │    │         └── unnest(tag_list:6) [outer=(6), side-effects]
+ │         │    │         └── unnest(tag_list:6) [outer=(6), immutable]
  │         │    └── filters
  │         │         └── unnest:10 = 'dragons' [outer=(10), constraints=(/10: [/'dragons' - /'dragons']; tight), fd=()-->(10)]
  │         └── aggregations
@@ -5057,23 +5190,23 @@ SELECT * FROM articles, xy WHERE EXISTS(
 ----
 project
  ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9 x:10!null y:11
- ├── side-effects
+ ├── immutable
  ├── key: (1,10)
  ├── fd: (1)-->(2-9), (1,10)-->(2-9,11)
  └── select
       ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9 x:10!null y:11 true_agg:17!null
-      ├── side-effects
+      ├── immutable
       ├── key: (1,10)
       ├── fd: (1)-->(2-9), (1,10)-->(2-9,11,17)
       ├── group-by
       │    ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9 x:10!null y:11 true_agg:17
       │    ├── grouping columns: id:1!null x:10!null
-      │    ├── side-effects
+      │    ├── immutable
       │    ├── key: (1,10)
       │    ├── fd: (1)-->(2-9), (1,10)-->(2-9,11,17)
       │    ├── inner-join-apply
       │    │    ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9 x:10!null y:11 true:16
-      │    │    ├── side-effects
+      │    │    ├── immutable
       │    │    ├── fd: (1)-->(2-9), (1,10)-->(11)
       │    │    ├── scan articles
       │    │    │    ├── columns: id:1!null body:2 description:3 title:4 slug:5 tag_list:6 user_id:7 created_at:8 updated_at:9
@@ -5082,7 +5215,7 @@ project
       │    │    ├── left-join-apply
       │    │    │    ├── columns: x:10!null y:11 true:16
       │    │    │    ├── outer: (1,4,6)
-      │    │    │    ├── side-effects
+      │    │    │    ├── immutable
       │    │    │    ├── fd: (10)-->(11)
       │    │    │    ├── scan xy
       │    │    │    │    ├── columns: x:10!null y:11
@@ -5091,21 +5224,21 @@ project
       │    │    │    ├── project
       │    │    │    │    ├── columns: true:16!null
       │    │    │    │    ├── outer: (1,4,6,10)
-      │    │    │    │    ├── side-effects
+      │    │    │    │    ├── immutable
       │    │    │    │    ├── fd: ()-->(16)
       │    │    │    │    ├── project-set
       │    │    │    │    │    ├── columns: generate_series:12 length:13 upper:14 unnest:15
       │    │    │    │    │    ├── outer: (1,4,6,10)
-      │    │    │    │    │    ├── side-effects
+      │    │    │    │    │    ├── immutable
       │    │    │    │    │    ├── values
       │    │    │    │    │    │    ├── cardinality: [1 - 1]
       │    │    │    │    │    │    ├── key: ()
       │    │    │    │    │    │    └── ()
       │    │    │    │    │    └── zip
-      │    │    │    │    │         ├── generate_series(x:10, id:1) [outer=(1,10), side-effects]
-      │    │    │    │    │         ├── length(title:4) [outer=(4)]
-      │    │    │    │    │         ├── upper(title:4) [outer=(4)]
-      │    │    │    │    │         └── unnest(tag_list:6) [outer=(6), side-effects]
+      │    │    │    │    │         ├── generate_series(x:10, id:1) [outer=(1,10), immutable]
+      │    │    │    │    │         ├── length(title:4) [outer=(4), immutable]
+      │    │    │    │    │         ├── upper(title:4) [outer=(4), immutable]
+      │    │    │    │    │         └── unnest(tag_list:6) [outer=(6), immutable]
       │    │    │    │    └── projections
       │    │    │    │         └── true [as=true:16]
       │    │    │    └── filters (true)
@@ -5142,24 +5275,24 @@ SELECT id FROM articles WHERE title = ANY(
 distinct-on
  ├── columns: id:1!null
  ├── grouping columns: id:1!null
- ├── side-effects
+ ├── immutable
  ├── key: (1)
  └── select
       ├── columns: id:1!null title:4!null tag_list:6 upper:10 unnest:11!null generate_series:12 lower:13
-      ├── side-effects
+      ├── immutable
       ├── fd: (1)-->(4,6), (4)==(11), (11)==(4)
       ├── project-set
       │    ├── columns: id:1!null title:4 tag_list:6 upper:10 unnest:11 generate_series:12 lower:13
-      │    ├── side-effects
+      │    ├── immutable
       │    ├── fd: (1)-->(4,6)
       │    ├── scan articles
       │    │    ├── columns: id:1!null title:4 tag_list:6
       │    │    ├── key: (1)
       │    │    └── fd: (1)-->(4,6)
       │    └── zip
-      │         ├── upper(title:4) [outer=(4)]
-      │         ├── unnest(tag_list:6) [outer=(6), side-effects]
-      │         ├── generate_series(0, 1) [side-effects]
+      │         ├── upper(title:4) [outer=(4), immutable]
+      │         ├── unnest(tag_list:6) [outer=(6), immutable]
+      │         ├── generate_series(0, 1) [immutable]
       │         └── 'abc'
       └── filters
            └── title:4 = unnest:11 [outer=(4,11), constraints=(/4: (/NULL - ]; /11: (/NULL - ]), fd=(4)==(11), (11)==(4)]
@@ -5215,10 +5348,12 @@ SELECT * FROM a WHERE i < ANY(SELECT y FROM xy) AND s = ANY(SELECT y::string FRO
 ----
 semi-join (cross)
  ├── columns: k:1!null i:2 f:3 s:4 j:5
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-5)
  ├── semi-join (hash)
  │    ├── columns: k:1!null i:2 f:3 s:4 j:5
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-5)
  │    ├── scan a
@@ -5227,10 +5362,11 @@ semi-join (cross)
  │    │    └── fd: (1)-->(2-5)
  │    ├── project
  │    │    ├── columns: y:10
+ │    │    ├── immutable
  │    │    ├── scan xy
  │    │    │    └── columns: xy.y:9
  │    │    └── projections
- │    │         └── xy.y:9::STRING [as=y:10, outer=(9)]
+ │    │         └── xy.y:9::STRING [as=y:10, outer=(9), immutable]
  │    └── filters
  │         └── s:4 = y:10 [outer=(4,10), constraints=(/4: (/NULL - ]; /10: (/NULL - ]), fd=(4)==(10), (10)==(4)]
  ├── scan xy
@@ -5274,6 +5410,7 @@ SELECT * FROM a INNER JOIN xy ON i IN (SELECT v FROM uv) AND k=x
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6!null y:7
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (6)
  ├── fd: (1)-->(2-5), (6)-->(7), (1)==(6), (6)==(1)
  ├── semi-join (hash)
@@ -5346,10 +5483,12 @@ SELECT * FROM a WHERE i < ALL(SELECT y FROM xy) AND s <> ALL(SELECT y::string FR
 ----
 anti-join (cross)
  ├── columns: k:1!null i:2 f:3 s:4 j:5
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-5)
  ├── anti-join (cross)
  │    ├── columns: k:1!null i:2 f:3 s:4 j:5
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-5)
  │    ├── scan a
@@ -5358,10 +5497,11 @@ anti-join (cross)
  │    │    └── fd: (1)-->(2-5)
  │    ├── project
  │    │    ├── columns: y:10
+ │    │    ├── immutable
  │    │    ├── scan xy
  │    │    │    └── columns: xy.y:9
  │    │    └── projections
- │    │         └── xy.y:9::STRING [as=y:10, outer=(9)]
+ │    │         └── xy.y:9::STRING [as=y:10, outer=(9), immutable]
  │    └── filters
  │         └── (s:4 = y:10) IS NOT false [outer=(4,10)]
  ├── scan xy
@@ -5405,6 +5545,7 @@ SELECT * FROM a INNER JOIN xy ON i NOT IN (SELECT v FROM uv) AND k=x
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6!null y:7
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (6)
  ├── fd: (1)-->(2-5), (6)-->(7), (1)==(6), (6)==(1)
  ├── anti-join (cross)
@@ -5434,10 +5575,12 @@ SELECT * FROM a WHERE i = ANY(SELECT y FROM xy) AND s <> ALL(SELECT y::string FR
 ----
 semi-join (hash)
  ├── columns: k:1!null i:2 f:3 s:4 j:5
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-5)
  ├── anti-join (cross)
  │    ├── columns: k:1!null i:2 f:3 s:4 j:5
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-5)
  │    ├── scan a
@@ -5446,10 +5589,11 @@ semi-join (hash)
  │    │    └── fd: (1)-->(2-5)
  │    ├── project
  │    │    ├── columns: y:10
+ │    │    ├── immutable
  │    │    ├── scan xy
  │    │    │    └── columns: xy.y:9
  │    │    └── projections
- │    │         └── xy.y:9::STRING [as=y:10, outer=(9)]
+ │    │         └── xy.y:9::STRING [as=y:10, outer=(9), immutable]
  │    └── filters
  │         └── (s:4 = y:10) IS NOT false [outer=(4,10)]
  ├── scan xy
@@ -5479,6 +5623,7 @@ project
  │    ├── fd: (1)-->(6)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null i:2 xy.x:6 y:7
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    ├── key: (1,6)
  │    │    ├── fd: (1)-->(2), (6)-->(7)
  │    │    ├── scan a
@@ -5510,6 +5655,7 @@ project
  │    ├── fd: (3)-->(4)
  │    ├── left-join (hash)
  │    │    ├── columns: b:2 rowid:3!null xy.x:4 y:5
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    ├── key: (3,4)
  │    │    ├── fd: (3)-->(2), (4)-->(5)
  │    │    ├── scan ab
@@ -5542,6 +5688,7 @@ project
  │    ├── fd: (11)-->(8)
  │    ├── left-join (hash)
  │    │    ├── columns: version:7 xy.x:8 y:9 rownum:11!null
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    ├── key: (8,11)
  │    │    ├── fd: (11)-->(7), (8)-->(9)
  │    │    ├── ordinality

@@ -80,6 +80,11 @@ func TestContextualHelp(t *testing.T) {
 		{`ALTER PARTITION ??`, `ALTER PARTITION`},
 		{`ALTER PARTITION p OF INDEX tbl@idx ??`, `ALTER PARTITION`},
 
+		{`ANALYZE ??`, `ANALYZE`},
+		{`ANALYZE blah ??`, `ANALYZE`},
+		{`ANALYSE ??`, `ANALYZE`},
+		{`ANALYSE blah ??`, `ANALYZE`},
+
 		{`CANCEL ??`, `CANCEL`},
 		{`CANCEL JOB ??`, `CANCEL JOBS`},
 		{`CANCEL JOBS ??`, `CANCEL JOBS`},
@@ -315,6 +320,7 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW SYNTAX ??`, `SHOW SYNTAX`},
 		{`SHOW SYNTAX 'foo' ??`, `SHOW SYNTAX`},
 		{`SHOW SAVEPOINT STATUS ??`, `SHOW SAVEPOINT`},
+		{`SHOW LAST QUERY STATISTICS ??`, `SHOW LAST QUERY STATISTICS`},
 
 		{`SHOW RANGE ??`, `SHOW RANGE`},
 
@@ -397,6 +403,7 @@ func TestContextualHelp(t *testing.T) {
 		{`EXPORT ??`, `EXPORT`},
 		{`EXPORT INTO CSV 'a' ??`, `EXPORT`},
 		{`EXPORT INTO CSV 'a' FROM SELECT a ??`, `SELECT`},
+		{`CREATE SCHEDULE FOR BACKUP ??`, `CREATE SCHEDULE FOR BACKUP`},
 	}
 
 	// The following checks that the test definition above exercises all

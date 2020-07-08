@@ -235,13 +235,13 @@ func TestIsNullSelOp(t *testing.T) {
 						Filter: execinfrapb.Expression{Expr: fmt.Sprintf("@1 %s", c.selExpr)},
 					},
 				}
-				args := NewColOperatorArgs{
+				args := &NewColOperatorArgs{
 					Spec:                spec,
 					Inputs:              input,
 					StreamingMemAccount: testMemAcc,
 				}
 				args.TestingKnobs.UseStreamingMemAccountForBuffering = true
-				result, err := NewColOperator(ctx, flowCtx, args)
+				result, err := TestNewColOperator(ctx, flowCtx, args)
 				if err != nil {
 					return nil, err
 				}

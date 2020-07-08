@@ -195,6 +195,8 @@ var AggregateOpReverseMap = map[Operator]string{
 	XorAggOp:          "xor_agg",
 	JsonAggOp:         "json_agg",
 	JsonbAggOp:        "jsonb_agg",
+	JsonObjectAggOp:   "json_object_agg",
+	JsonbObjectAggOp:  "jsonb_object_agg",
 	StringAggOp:       "string_agg",
 	ConstAggOp:        "any_not_null",
 	ConstNotNullAggOp: "any_not_null",
@@ -283,7 +285,7 @@ func AggregateIgnoresNulls(op Operator) bool {
 		return true
 
 	case ArrayAggOp, ConcatAggOp, ConstAggOp, CountRowsOp, FirstAggOp, JsonAggOp,
-		JsonbAggOp:
+		JsonbAggOp, JsonObjectAggOp, JsonbObjectAggOp:
 		return false
 
 	default:
@@ -301,7 +303,8 @@ func AggregateIsNullOnEmpty(op Operator) bool {
 		BitOrAggOp, BoolAndOp, BoolOrOp, ConcatAggOp, ConstAggOp,
 		ConstNotNullAggOp, CorrOp, FirstAggOp, JsonAggOp, JsonbAggOp,
 		MaxOp, MinOp, SqrDiffOp, StdDevOp, StringAggOp, SumOp, SumIntOp,
-		VarianceOp, XorAggOp, PercentileDiscOp, PercentileContOp:
+		VarianceOp, XorAggOp, PercentileDiscOp, PercentileContOp,
+		JsonObjectAggOp, JsonbObjectAggOp:
 		return true
 
 	case CountOp, CountRowsOp:
@@ -326,7 +329,8 @@ func AggregateIsNeverNullOnNonNullInput(op Operator) bool {
 		BitOrAggOp, BoolAndOp, BoolOrOp, ConcatAggOp, ConstAggOp,
 		ConstNotNullAggOp, CountOp, CountRowsOp, FirstAggOp,
 		JsonAggOp, JsonbAggOp, MaxOp, MinOp, SqrDiffOp,
-		StringAggOp, SumOp, SumIntOp, XorAggOp, PercentileDiscOp, PercentileContOp:
+		StringAggOp, SumOp, SumIntOp, XorAggOp, PercentileDiscOp, PercentileContOp,
+		JsonObjectAggOp, JsonbObjectAggOp:
 		return true
 
 	case VarianceOp, StdDevOp, CorrOp:
@@ -346,6 +350,61 @@ func AggregateIsNeverNull(op Operator) bool {
 		return true
 	}
 	return false
+}
+
+// AggregatesCanMerge returns true if the given inner and outer operators can be
+// replaced with a single equivalent operator, assuming the outer operator is
+// aggregating on the inner. In other words, the inner-outer aggregate pair
+// forms a valid "decomposition" of a single aggregate. For example, the
+// following pairs of queries are equivalent:
+//
+//   SELECT sum(s) FROM (SELECT sum(y) FROM xy GROUP BY x) AS f(s);
+//   SELECT sum(y) FROM xy;
+//
+//   SELECT sum_int(c) FROM (SELECT count(y) FROM xy GROUP BY x) AS f(c);
+//   SELECT count(y) FROM xy;
+//
+// Note: some aggregates like StringAggOp are decomposable in theory, but in
+// practice can not be easily merged as in the examples above.
+func AggregatesCanMerge(inner, outer Operator) bool {
+	switch inner {
+
+	case AnyNotNullAggOp, BitAndAggOp, BitOrAggOp, BoolAndOp,
+		BoolOrOp, ConstAggOp, ConstNotNullAggOp, FirstAggOp,
+		MaxOp, MinOp, SumOp, SumIntOp, XorAggOp:
+		return inner == outer
+
+	case CountOp, CountRowsOp:
+		// Only SumIntOp can be used here because SumOp outputs a decimal value,
+		// while CountOp and CountRowsOp both output int values.
+		return outer == SumIntOp
+
+	case ArrayAggOp, AvgOp, ConcatAggOp, CorrOp, JsonAggOp,
+		JsonbAggOp, PercentileContOp, PercentileDiscOp, SqrDiffOp,
+		StdDevOp, StringAggOp, VarianceOp:
+		return false
+
+	default:
+		panic(errors.AssertionFailedf("unhandled ops: %s, %s", log.Safe(inner), log.Safe(outer)))
+	}
+}
+
+// AggregateIgnoresDuplicates returns true if the output of the given aggregate
+// operator does not change when duplicate rows are added to the input.
+func AggregateIgnoresDuplicates(op Operator) bool {
+	switch op {
+	case AnyNotNullAggOp, BitAndAggOp, BitOrAggOp, BoolAndOp, BoolOrOp,
+		ConstAggOp, ConstNotNullAggOp, FirstAggOp, MaxOp, MinOp:
+		return true
+
+	case ArrayAggOp, AvgOp, ConcatAggOp, CountOp, CorrOp, CountRowsOp, SumIntOp,
+		SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, JsonAggOp, JsonbAggOp,
+		StringAggOp, PercentileDiscOp, PercentileContOp:
+		return false
+
+	default:
+		panic(errors.AssertionFailedf("unhandled op %s", log.Safe(op)))
+	}
 }
 
 // OpaqueMetadata is an object stored in OpaqueRelExpr and passed

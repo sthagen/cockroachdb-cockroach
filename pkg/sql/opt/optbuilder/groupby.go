@@ -252,7 +252,7 @@ func (a aggregateInfo) isOrderingSensitive() bool {
 		return true
 	}
 	switch a.def.Name {
-	case "array_agg", "concat_agg", "string_agg", "json_agg", "jsonb_agg":
+	case "array_agg", "concat_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg":
 		return true
 	default:
 		return false
@@ -268,6 +268,11 @@ func (a aggregateInfo) isCommutative() bool {
 // Eval is part of the tree.TypedExpr interface.
 func (a *aggregateInfo) Eval(_ *tree.EvalContext) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("aggregateInfo must be replaced before evaluation"))
+}
+
+// ResolvedType is part of the tree.TypedExpr interface.
+func (a *aggregateInfo) ResolvedType() *types.T {
+	return a.col.typ
 }
 
 var _ tree.Expr = &aggregateInfo{}
@@ -824,7 +829,12 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 		return b.factory.ConstructPercentileDisc(args[0], args[1])
 	case "percentile_cont_impl":
 		return b.factory.ConstructPercentileCont(args[0], args[1])
+	case "json_object_agg":
+		return b.factory.ConstructJsonObjectAgg(args[0], args[1])
+	case "jsonb_object_agg":
+		return b.factory.ConstructJsonbObjectAgg(args[0], args[1])
 	}
+
 	panic(errors.AssertionFailedf("unhandled aggregate: %s", name))
 }
 

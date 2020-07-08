@@ -122,6 +122,12 @@ func (c *Columnarizer) Next(context.Context) coldata.Batch {
 		copy(c.buffered[nRows], row)
 	}
 
+	// Check if we have buffered more rows than the current allocation size
+	// and increase it if so.
+	if nRows > c.da.AllocSize {
+		c.da.AllocSize = nRows
+	}
+
 	// Write each column into the output batch.
 	for idx, ct := range columnTypes {
 		err := EncDatumRowsToColVec(c.allocator, c.buffered[:nRows], c.batch.ColVec(idx), idx, ct, &c.da)
@@ -178,4 +184,9 @@ func (c *Columnarizer) Child(nth int, verbose bool) execinfra.OpNode {
 	colexecerror.InternalError(fmt.Sprintf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
+}
+
+// Input returns the input of this columnarizer.
+func (c *Columnarizer) Input() execinfra.RowSource {
+	return c.input
 }

@@ -300,7 +300,7 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 	// contain the results of evaluation.
 	if !u.run.checkOrds.Empty() {
 		checkVals := sourceVals[len(u.run.tu.ru.FetchCols)+len(u.run.tu.ru.UpdateCols)+u.run.numPassthrough:]
-		if err := checkMutationInput(u.run.tu.tableDesc(), u.run.checkOrds, checkVals); err != nil {
+		if err := checkMutationInput(params.ctx, &params.p.semaCtx, u.run.tu.tableDesc(), u.run.checkOrds, checkVals); err != nil {
 			return err
 		}
 	}
@@ -314,9 +314,9 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 	// If result rows need to be accumulated, do it.
 	if u.run.rows != nil {
 		// The new values can include all columns, the construction of the
-		// values has used publicAndNonPublicColumns so the values may
-		// contain additional columns for every newly added column not yet
-		// visible. We do not want them to be available for RETURNING.
+		// values has used execinfra.ScanVisibilityPublicAndNotPublic so the
+		// values may contain additional columns for every newly added column
+		// not yet visible. We do not want them to be available for RETURNING.
 		//
 		// MakeUpdater guarantees that the first columns of the new values
 		// are those specified u.columns.

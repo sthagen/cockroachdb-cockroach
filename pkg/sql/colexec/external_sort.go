@@ -124,7 +124,7 @@ type externalSorter struct {
 	state              externalSorterState
 	inputTypes         []*types.T
 	ordering           execinfrapb.Ordering
-	inMemSorter        resettableOperator
+	inMemSorter        ResettableOperator
 	inMemSorterInput   *inputPartitioningOperator
 	partitioner        colcontainer.PartitionedQueue
 	partitionerCreator func() colcontainer.PartitionedQueue
@@ -151,10 +151,10 @@ type externalSorter struct {
 	}
 }
 
-var _ resettableOperator = &externalSorter{}
+var _ ResettableOperator = &externalSorter{}
 var _ closableOperator = &externalSorter{}
 
-// newExternalSorter returns a disk-backed general sort operator.
+// NewExternalSorter returns a disk-backed general sort operator.
 // - ctx is the same context that standaloneMemAccount was created with.
 // - unlimitedAllocator must have been created with a memory account derived
 // from an unlimited memory monitor. It will be used by several internal
@@ -171,7 +171,7 @@ var _ closableOperator = &externalSorter{}
 // - delegateFDAcquisitions specifies whether the external sorter should let
 // the partitioned disk queue acquire file descriptors instead of acquiring
 // them up front in Next. This should only be true in tests.
-func newExternalSorter(
+func NewExternalSorter(
 	ctx context.Context,
 	unlimitedAllocator *colmem.Allocator,
 	standaloneMemAccount *mon.BoundAccount,
@@ -416,9 +416,9 @@ func (s *externalSorter) IdempotentClose(ctx context.Context) error {
 func (s *externalSorter) createMergerForPartitions(
 	firstIdx, numPartitions int,
 ) (colexecbase.Operator, error) {
-	syncInputs := make([]colexecbase.Operator, numPartitions)
+	syncInputs := make([]SynchronizerInput, numPartitions)
 	for i := range syncInputs {
-		syncInputs[i] = newPartitionerToOperator(
+		syncInputs[i].Op = newPartitionerToOperator(
 			s.unlimitedAllocator, s.inputTypes, s.partitioner, firstIdx+i,
 		)
 	}
@@ -432,7 +432,7 @@ func (s *externalSorter) createMergerForPartitions(
 
 func newInputPartitioningOperator(
 	input colexecbase.Operator, standaloneMemAccount *mon.BoundAccount, memoryLimit int64,
-) resettableOperator {
+) ResettableOperator {
 	return &inputPartitioningOperator{
 		OneInputNode:         NewOneInputNode(input),
 		standaloneMemAccount: standaloneMemAccount,
@@ -469,7 +469,7 @@ type inputPartitioningOperator struct {
 	interceptReset bool
 }
 
-var _ resettableOperator = &inputPartitioningOperator{}
+var _ ResettableOperator = &inputPartitioningOperator{}
 
 func (o *inputPartitioningOperator) Init() {
 	o.input.Init()

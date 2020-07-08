@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -54,6 +55,11 @@ type deleteRun struct {
 
 	// traceKV caches the current KV tracing flag.
 	traceKV bool
+
+	// partialIndexDelValsOffset is the offset of partial index delete
+	// indicators in the source values. It is equal to the number of fetched
+	// columns.
+	partialIndexDelValsOffset int
 
 	// rowIdxToRetIdx is the mapping from the columns returned by the deleter
 	// to the columns in the resultRowBuffer. A value of -1 is used to indicate
@@ -168,17 +174,47 @@ func (d *deleteNode) BatchedNext(params runParams) (bool, error) {
 // processSourceRow processes one row from the source for deletion and, if
 // result rows are needed, saves it in the result row container
 func (d *deleteNode) processSourceRow(params runParams, sourceVals tree.Datums) error {
+	// Create a set of index IDs to not delete from. Indexes should not be
+	// deleted from when they are partial indexes and the row does not satisfy
+	// the predicate and therefore do not exist in the partial index. This
+	// set is passed as a argument to tableDeleter.row below.
+	var ignoreIndexes util.FastIntSet
+	partialIndexDelVals := sourceVals[d.run.partialIndexDelValsOffset:]
+	colIdx := 0
+	indexes := d.run.td.tableDesc().Indexes
+	for i := range indexes {
+		index := indexes[i]
+		if index.IsPartial() {
+			val, err := tree.GetBool(partialIndexDelVals[colIdx])
+			if err != nil {
+				return err
+			}
+
+			if !val {
+				// If the value of the column for the index predicate expression
+				// is false, the row should not be removed from the partial
+				// index.
+				ignoreIndexes.Add(int(index.ID))
+			}
+
+			colIdx++
+			if colIdx >= len(partialIndexDelVals) {
+				break
+			}
+		}
+	}
+
 	// Queue the deletion in the KV batch.
-	if err := d.run.td.row(params.ctx, sourceVals, d.run.traceKV); err != nil {
+	if err := d.run.td.row(params.ctx, sourceVals, ignoreIndexes, d.run.traceKV); err != nil {
 		return err
 	}
 
 	// If result rows need to be accumulated, do it.
 	if d.run.rows != nil {
 		// The new values can include all columns, the construction of the
-		// values has used publicAndNonPublicColumns so the values may
-		// contain additional columns for every newly dropped column not
-		// visible. We do not want them to be available for RETURNING.
+		// values has used execinfra.ScanVisibilityPublicAndNotPublic so the
+		// values may contain additional columns for every newly dropped column
+		// not visible. We do not want them to be available for RETURNING.
 		//
 		// d.run.rows.NumCols() is guaranteed to only contain the requested
 		// public columns.

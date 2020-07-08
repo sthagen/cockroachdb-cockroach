@@ -117,8 +117,8 @@ type resetter interface {
 	reset(ctx context.Context)
 }
 
-// resettableOperator is an Operator that can be reset.
-type resettableOperator interface {
+// ResettableOperator is an Operator that can be reset.
+type ResettableOperator interface {
 	colexecbase.Operator
 	resetter
 }
@@ -198,6 +198,25 @@ func (s *zeroOperator) Next(ctx context.Context) coldata.Batch {
 	return coldata.ZeroBatch
 }
 
+type zeroOperatorNoInput struct {
+	colexecbase.ZeroInputNode
+	NonExplainable
+}
+
+var _ colexecbase.Operator = &zeroOperatorNoInput{}
+
+// NewZeroOpNoInput creates a new operator which just returns an empty batch
+// and doesn't an input.
+func NewZeroOpNoInput() colexecbase.Operator {
+	return &zeroOperatorNoInput{}
+}
+
+func (s *zeroOperatorNoInput) Init() {}
+
+func (s *zeroOperatorNoInput) Next(ctx context.Context) coldata.Batch {
+	return coldata.ZeroBatch
+}
+
 type singleTupleNoInputOperator struct {
 	colexecbase.ZeroInputNode
 	NonExplainable
@@ -229,21 +248,28 @@ func (s *singleTupleNoInputOperator) Next(ctx context.Context) coldata.Batch {
 	return s.batch
 }
 
-// feedOperator is used to feed an Operator chain with input by manually
+// FeedOperator is used to feed an Operator chain with input by manually
 // setting the next batch.
-type feedOperator struct {
+type FeedOperator struct {
 	colexecbase.ZeroInputNode
 	NonExplainable
 	batch coldata.Batch
 }
 
-func (feedOperator) Init() {}
+// NewFeedOperator returns a new feed operator.
+func NewFeedOperator() *FeedOperator {
+	return &FeedOperator{}
+}
 
-func (o *feedOperator) Next(context.Context) coldata.Batch {
+// Init implements the colexecbase.Operator interface.
+func (FeedOperator) Init() {}
+
+// Next implements the colexecbase.Operator interface.
+func (o *FeedOperator) Next(context.Context) coldata.Batch {
 	return o.batch
 }
 
-var _ colexecbase.Operator = &feedOperator{}
+var _ colexecbase.Operator = &FeedOperator{}
 
 // vectorTypeEnforcer is a utility Operator that on every call to Next
 // enforces that non-zero length batch from the input has a vector of the
@@ -304,7 +330,7 @@ func (e *vectorTypeEnforcer) Next(ctx context.Context) coldata.Batch {
 	return b
 }
 
-// batchSchemaSubsetEnforcer is similar to vectorTypeEnforcer in its purpose,
+// BatchSchemaSubsetEnforcer is similar to vectorTypeEnforcer in its purpose,
 // but it enforces that the subset of the columns of the non-zero length batch
 // satisfies the desired schema. It needs to wrap the input to a "projecting"
 // operator that internally uses other "projecting" operators (for example,
@@ -315,9 +341,9 @@ func (e *vectorTypeEnforcer) Next(ctx context.Context) coldata.Batch {
 // The word "subset" is actually more like a "range", but we chose the former
 // since the latter is overloaded.
 //
-// NOTE: the type schema passed into batchSchemaSubsetEnforcer *must* include
+// NOTE: the type schema passed into BatchSchemaSubsetEnforcer *must* include
 // the output type of the Operator that the enforcer will be the input to.
-type batchSchemaSubsetEnforcer struct {
+type BatchSchemaSubsetEnforcer struct {
 	OneInputNode
 	NonExplainable
 
@@ -326,19 +352,19 @@ type batchSchemaSubsetEnforcer struct {
 	subsetStartIdx, subsetEndIdx int
 }
 
-var _ colexecbase.Operator = &batchSchemaSubsetEnforcer{}
+var _ colexecbase.Operator = &BatchSchemaSubsetEnforcer{}
 
-// newBatchSchemaSubsetEnforcer creates a new batchSchemaSubsetEnforcer.
+// NewBatchSchemaSubsetEnforcer creates a new BatchSchemaSubsetEnforcer.
 // - subsetStartIdx and subsetEndIdx define the boundaries of the range of
 // columns that the projecting operator and its internal projecting operators
 // own.
-func newBatchSchemaSubsetEnforcer(
+func NewBatchSchemaSubsetEnforcer(
 	allocator *colmem.Allocator,
 	input colexecbase.Operator,
 	typs []*types.T,
 	subsetStartIdx, subsetEndIdx int,
-) *batchSchemaSubsetEnforcer {
-	return &batchSchemaSubsetEnforcer{
+) *BatchSchemaSubsetEnforcer {
+	return &BatchSchemaSubsetEnforcer{
 		OneInputNode:   NewOneInputNode(input),
 		allocator:      allocator,
 		typs:           typs,
@@ -347,14 +373,16 @@ func newBatchSchemaSubsetEnforcer(
 	}
 }
 
-func (e *batchSchemaSubsetEnforcer) Init() {
+// Init implements the colexecbase.Operator interface.
+func (e *BatchSchemaSubsetEnforcer) Init() {
 	e.input.Init()
 	if e.subsetStartIdx >= e.subsetEndIdx {
 		colexecerror.InternalError("unexpectedly subsetStartIdx is not less than subsetEndIdx")
 	}
 }
 
-func (e *batchSchemaSubsetEnforcer) Next(ctx context.Context) coldata.Batch {
+// Next implements the colexecbase.Operator interface.
+func (e *BatchSchemaSubsetEnforcer) Next(ctx context.Context) coldata.Batch {
 	b := e.input.Next(ctx)
 	if b.Length() == 0 {
 		return b
@@ -363,4 +391,11 @@ func (e *batchSchemaSubsetEnforcer) Next(ctx context.Context) coldata.Batch {
 		e.allocator.MaybeAppendColumn(b, e.typs[i], i)
 	}
 	return b
+}
+
+// SetTypes sets the types of this schema subset enforcer, and sets the end
+// of the range of enforced columns to the length of the input types.
+func (e *BatchSchemaSubsetEnforcer) SetTypes(typs []*types.T) {
+	e.typs = typs
+	e.subsetEndIdx = len(typs)
 }

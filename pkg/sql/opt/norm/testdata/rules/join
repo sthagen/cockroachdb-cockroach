@@ -52,6 +52,7 @@ SELECT * FROM a RIGHT JOIN b ON k=x
 ----
 left-join (hash)
  ├── columns: k:1 i:2 f:3 s:4 j:5 x:6!null y:7
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  ├── key: (6)
  ├── fd: (6)-->(1-5,7), (1)-->(2-5)
  ├── scan b
@@ -83,6 +84,7 @@ SELECT * FROM a LEFT JOIN b ON (k<1 AND k>2) OR (k<4 AND k>5)
 ----
 left-join (cross)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6 y:7
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
  ├── key: (1)
  ├── fd: (1)-->(2-7)
  ├── scan a
@@ -101,6 +103,7 @@ SELECT * FROM a FULL JOIN b ON i=5 AND ((k<1 AND k>2) OR (k<4 AND k>5)) AND s='f
 ----
 full-join (cross)
  ├── columns: k:1 i:2 f:3 s:4 j:5 x:6 y:7
+ ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
  ├── key: (1,6)
  ├── fd: (1)-->(2-5), (6)-->(7)
  ├── scan a
@@ -122,6 +125,7 @@ SELECT * FROM a INNER JOIN b ON a.k=b.x AND a.s='foo'
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4!null j:5 x:6!null y:7
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (6)
  ├── fd: ()-->(4), (1)-->(2,3,5), (6)-->(7), (1)==(6), (6)==(1)
  ├── select
@@ -147,6 +151,7 @@ SELECT * FROM a LEFT JOIN b ON a.k=b.x AND a.i=1
 ----
 left-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6 y:7
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  ├── key: (1)
  ├── fd: (1)-->(2-7), (6)-->(7)
  ├── scan a
@@ -212,6 +217,7 @@ SELECT * FROM b INNER JOIN a ON b.x=a.k AND a.s='foo'
 ----
 inner-join (hash)
  ├── columns: x:1!null y:2 k:3!null i:4 f:5!null s:6!null j:7
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (3)
  ├── fd: ()-->(6), (1)-->(2), (3)-->(4,5,7), (1)==(3), (3)==(1)
  ├── scan b
@@ -236,6 +242,7 @@ SELECT * FROM b LEFT JOIN a ON (a.i<0 OR a.i>10) AND b.y=1 AND a.s='foo' AND b.x
 ----
 left-join (hash)
  ├── columns: x:1!null y:2 k:3 i:4 f:5 s:6 j:7
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  ├── key: (1)
  ├── fd: (1)-->(2-7), (3)-->(4,5,7)
  ├── scan b
@@ -263,6 +270,7 @@ SELECT * FROM b RIGHT JOIN a ON b.x=a.k AND a.i=1
 ----
 left-join (hash)
  ├── columns: x:1 y:2 k:3!null i:4 f:5!null s:6 j:7
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  ├── key: (3)
  ├── fd: (3)-->(1,2,4-7), (1)-->(2)
  ├── scan a
@@ -337,10 +345,13 @@ SELECT * FROM a INNER JOIN b ON a.k=b.x AND a.k + b.y > 5 AND b.x * a.i = 3
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6!null y:7
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
+ ├── immutable
  ├── key: (6)
  ├── fd: (1)-->(2-5), (6)-->(7), (1)==(6), (6)==(1)
  ├── select
  │    ├── columns: k:1!null i:2 f:3!null s:4 j:5
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-5)
  │    ├── scan a
@@ -348,9 +359,10 @@ inner-join (hash)
  │    │    ├── key: (1)
  │    │    └── fd: (1)-->(2-5)
  │    └── filters
- │         └── (k:1 * i:2) = 3 [outer=(1,2)]
+ │         └── (k:1 * i:2) = 3 [outer=(1,2), immutable]
  ├── select
  │    ├── columns: x:6!null y:7
+ │    ├── immutable
  │    ├── key: (6)
  │    ├── fd: (6)-->(7)
  │    ├── scan b
@@ -358,7 +370,7 @@ inner-join (hash)
  │    │    ├── key: (6)
  │    │    └── fd: (6)-->(7)
  │    └── filters
- │         └── (x:6 + y:7) > 5 [outer=(6,7)]
+ │         └── (x:6 + y:7) > 5 [outer=(6,7), immutable]
  └── filters
       └── k:1 = x:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
 
@@ -368,10 +380,13 @@ SELECT * FROM a INNER JOIN b ON a.k=b.x AND a.i=b.x AND a.i=b.y AND a.f + b.y::F
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2!null f:3!null s:4 j:5 x:6!null y:7!null
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
+ ├── immutable
  ├── key: (6)
  ├── fd: (1)-->(3-5), (1)==(2,6,7), (2)==(1,6,7), (6)==(1,2,7), (7)==(1,2,6)
  ├── select
  │    ├── columns: k:1!null i:2!null f:3!null s:4 j:5
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(3-5), (1)==(2), (2)==(1)
  │    ├── scan a
@@ -379,8 +394,8 @@ inner-join (hash)
  │    │    ├── key: (1)
  │    │    └── fd: (1)-->(2-5)
  │    └── filters
- │         ├── (f:3 + k:1::FLOAT8) > 5.0 [outer=(1,3)]
- │         ├── (s:4 || k:1::STRING) = 'foo1' [outer=(1,4)]
+ │         ├── (f:3 + k:1::FLOAT8) > 5.0 [outer=(1,3), immutable]
+ │         ├── (s:4 || k:1::STRING) = 'foo1' [outer=(1,4), immutable]
  │         └── k:1 = i:2 [outer=(1,2), constraints=(/1: (/NULL - ]; /2: (/NULL - ]), fd=(1)==(2), (2)==(1)]
  ├── select
  │    ├── columns: x:6!null y:7!null
@@ -403,10 +418,12 @@ SELECT * FROM a WHERE EXISTS(
 ----
 semi-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-5)
  ├── select
  │    ├── columns: k:1!null i:2 f:3!null s:4 j:5
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-5)
  │    ├── scan a
@@ -414,9 +431,10 @@ semi-join (hash)
  │    │    ├── key: (1)
  │    │    └── fd: (1)-->(2-5)
  │    └── filters
- │         └── (k:1 * i:2) = 3 [outer=(1,2)]
+ │         └── (k:1 * i:2) = 3 [outer=(1,2), immutable]
  ├── select
  │    ├── columns: x:6!null y:7
+ │    ├── immutable
  │    ├── key: (6)
  │    ├── fd: (6)-->(7)
  │    ├── scan b
@@ -424,7 +442,7 @@ semi-join (hash)
  │    │    ├── key: (6)
  │    │    └── fd: (6)-->(7)
  │    └── filters
- │         └── (x:6 + y:7) > 5 [outer=(6,7)]
+ │         └── (x:6 + y:7) > 5 [outer=(6,7), immutable]
  └── filters
       └── k:1 = x:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
 
@@ -467,6 +485,8 @@ SELECT * FROM a LEFT JOIN b ON a.k=b.x AND a.k + b.y > 5 AND b.x * a.i = 3
 ----
 left-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6 y:7
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-7), (6)-->(7)
  ├── scan a
@@ -475,6 +495,7 @@ left-join (hash)
  │    └── fd: (1)-->(2-5)
  ├── select
  │    ├── columns: x:6!null y:7
+ │    ├── immutable
  │    ├── key: (6)
  │    ├── fd: (6)-->(7)
  │    ├── scan b
@@ -482,16 +503,17 @@ left-join (hash)
  │    │    ├── key: (6)
  │    │    └── fd: (6)-->(7)
  │    └── filters
- │         └── (x:6 + y:7) > 5 [outer=(6,7)]
+ │         └── (x:6 + y:7) > 5 [outer=(6,7), immutable]
  └── filters
       ├── k:1 = x:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
-      └── (x:6 * i:2) = 3 [outer=(2,6)]
+      └── (x:6 * i:2) = 3 [outer=(2,6), immutable]
 
 norm expect=MapFilterIntoJoinRight expect-not=PushFilterIntoJoinLeftAndRight
 SELECT * FROM a LEFT JOIN b ON a.k=b.x AND a.k > 5 AND b.x IN (3, 7, 10)
 ----
 left-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6 y:7
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  ├── key: (1)
  ├── fd: (1)-->(2-7), (6)-->(7)
  ├── scan a
@@ -518,6 +540,8 @@ SELECT * FROM a FULL JOIN b ON a.k=b.x AND a.k + b.y > 5 AND b.x * a.i = 3
 ----
 full-join (hash)
  ├── columns: k:1 i:2 f:3 s:4 j:5 x:6 y:7
+ ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
+ ├── immutable
  ├── key: (1,6)
  ├── fd: (1)-->(2-5), (6)-->(7)
  ├── scan a
@@ -530,14 +554,15 @@ full-join (hash)
  │    └── fd: (6)-->(7)
  └── filters
       ├── k:1 = x:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
-      ├── (k:1 + y:7) > 5 [outer=(1,7)]
-      └── (x:6 * i:2) = 3 [outer=(2,6)]
+      ├── (k:1 + y:7) > 5 [outer=(1,7), immutable]
+      └── (x:6 * i:2) = 3 [outer=(2,6), immutable]
 
 norm expect-not=(PushFilterIntoJoinLeftAndRight,MapFilterIntoJoinLeft,MapFilterIntoJoinRight)
 SELECT * FROM a FULL JOIN b ON a.k=b.x AND a.k > 5 AND b.x IN (3, 7, 10)
 ----
 full-join (hash)
  ├── columns: k:1 i:2 f:3 s:4 j:5 x:6 y:7
+ ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  ├── key: (1,6)
  ├── fd: (1)-->(2-5), (6)-->(7)
  ├── scan a
@@ -561,6 +586,7 @@ SELECT * FROM a WHERE NOT EXISTS(
 ----
 anti-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-5)
  ├── scan a
@@ -569,6 +595,7 @@ anti-join (hash)
  │    └── fd: (1)-->(2-5)
  ├── select
  │    ├── columns: x:6!null y:7
+ │    ├── immutable
  │    ├── key: (6)
  │    ├── fd: (6)-->(7)
  │    ├── scan b
@@ -576,10 +603,10 @@ anti-join (hash)
  │    │    ├── key: (6)
  │    │    └── fd: (6)-->(7)
  │    └── filters
- │         └── (x:6 + y:7) > 5 [outer=(6,7)]
+ │         └── (x:6 + y:7) > 5 [outer=(6,7), immutable]
  └── filters
       ├── k:1 = x:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
-      └── (x:6 * i:2) = 3 [outer=(2,6)]
+      └── (x:6 * i:2) = 3 [outer=(2,6), immutable]
 
 norm expect=MapFilterIntoJoinRight expect-not=PushFilterIntoJoinLeftAndRight
 SELECT * FROM a WHERE NOT EXISTS(
@@ -612,10 +639,13 @@ SELECT * FROM a JOIN b ON a.k = b.x AND b.x * a.i = (SELECT min(b.x) FROM b)
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6!null y:7
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
+ ├── immutable
  ├── key: (6)
  ├── fd: (1)-->(2-5), (6)-->(7), (1)==(6), (6)==(1)
  ├── select
  │    ├── columns: k:1!null i:2 f:3!null s:4 j:5
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-5)
  │    ├── scan a
@@ -623,7 +653,7 @@ inner-join (hash)
  │    │    ├── key: (1)
  │    │    └── fd: (1)-->(2-5)
  │    └── filters
- │         └── eq [outer=(1,2), subquery]
+ │         └── eq [outer=(1,2), immutable, subquery]
  │              ├── k:1 * i:2
  │              └── subquery
  │                   └── scalar-group-by
@@ -650,10 +680,12 @@ SELECT * FROM a JOIN b ON a.k = b.x AND b.x * a.i = (SELECT a.k * b.y FROM b)
 ----
 project
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6!null y:7
+ ├── immutable
  ├── key: (6)
  ├── fd: (1)-->(2-5), (1,6)-->(7), (1)==(6), (6)==(1)
  └── inner-join-apply
       ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6!null y:7 "?column?":10
+      ├── immutable
       ├── key: (6)
       ├── fd: (1)-->(2-5), (1,6)-->(7,10), (1)==(6), (6)==(1)
       ├── scan a
@@ -665,11 +697,14 @@ project
       │    ├── grouping columns: x:6!null
       │    ├── error: "more than one row returned by a subquery used as an expression"
       │    ├── outer: (1)
+      │    ├── immutable
       │    ├── key: (6)
       │    ├── fd: (6)-->(7,10)
       │    ├── left-join (cross)
       │    │    ├── columns: x:6!null y:7 "?column?":10
       │    │    ├── outer: (1)
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
+      │    │    ├── immutable
       │    │    ├── fd: (6)-->(7)
       │    │    ├── scan b
       │    │    │    ├── columns: x:6!null y:7
@@ -678,10 +713,11 @@ project
       │    │    ├── project
       │    │    │    ├── columns: "?column?":10
       │    │    │    ├── outer: (1)
+      │    │    │    ├── immutable
       │    │    │    ├── scan b
       │    │    │    │    └── columns: y:9
       │    │    │    └── projections
-      │    │    │         └── k:1 * y:9 [as="?column?":10, outer=(1,9)]
+      │    │    │         └── k:1 * y:9 [as="?column?":10, outer=(1,9), immutable]
       │    │    └── filters (true)
       │    └── aggregations
       │         ├── const-agg [as=y:7, outer=(7)]
@@ -690,7 +726,7 @@ project
       │              └── "?column?":10
       └── filters
            ├── k:1 = x:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
-           └── "?column?":10 = (x:6 * i:2) [outer=(2,6,10), constraints=(/10: (/NULL - ])]
+           └── "?column?":10 = (x:6 * i:2) [outer=(2,6,10), immutable, constraints=(/10: (/NULL - ])]
 
 # Ensure that we do not map filters for types with composite key encoding.
 norm expect-not=(PushFilterIntoJoinLeftAndRight,MapFilterIntoJoinLeft,MapFilterIntoJoinRight)
@@ -700,24 +736,26 @@ FROM (VALUES (1.0), (2.0)) AS t1(x), (VALUES (1.00), (2.00)) AS t2(y)WHERE x=y A
 inner-join (hash)
  ├── columns: x:1!null y:2!null
  ├── cardinality: [0 - 4]
+ ├── immutable
  ├── fd: (1)==(2), (2)==(1)
  ├── select
  │    ├── columns: column1:1!null
  │    ├── cardinality: [0 - 2]
+ │    ├── immutable
  │    ├── values
  │    │    ├── columns: column1:1!null
  │    │    ├── cardinality: [2 - 2]
  │    │    ├── (1.0,)
  │    │    └── (2.0,)
  │    └── filters
- │         └── column1:1::STRING = '1.0' [outer=(1)]
+ │         └── column1:1::STRING = '1.0' [outer=(1), immutable]
  ├── values
  │    ├── columns: column1:2!null
  │    ├── cardinality: [2 - 2]
  │    ├── (1.00,)
  │    └── (2.00,)
  └── filters
-      └── column1:1 = column1:2 [outer=(1,2), constraints=(/1: (/NULL - ]; /2: (/NULL - ]), fd=(1)==(2), (2)==(1)]
+      └── column1:1 = column1:2 [outer=(1,2), immutable, constraints=(/1: (/NULL - ]; /2: (/NULL - ]), fd=(1)==(2), (2)==(1)]
 
 # Optimization does not apply if equality is only on one side.
 norm expect-not=(PushFilterIntoJoinLeftAndRight,MapFilterIntoJoinLeft,MapFilterIntoJoinRight)
@@ -725,6 +763,7 @@ SELECT * FROM a INNER JOIN b ON b.y=b.x AND a.k=a.i AND a.k + b.y > 5 AND b.x * 
 ----
 inner-join (cross)
  ├── columns: k:1!null i:2!null f:3!null s:4 j:5 x:6!null y:7!null
+ ├── immutable
  ├── key: (1,6)
  ├── fd: (1)-->(3-5), (1)==(2), (2)==(1), (6)==(7), (7)==(6)
  ├── select
@@ -748,8 +787,8 @@ inner-join (cross)
  │    └── filters
  │         └── y:7 = x:6 [outer=(6,7), constraints=(/6: (/NULL - ]; /7: (/NULL - ]), fd=(6)==(7), (7)==(6)]
  └── filters
-      ├── (k:1 + y:7) > 5 [outer=(1,7)]
-      └── (x:6 * i:2) = 3 [outer=(2,6)]
+      ├── (k:1 + y:7) > 5 [outer=(1,7), immutable]
+      └── (x:6 * i:2) = 3 [outer=(2,6), immutable]
 
 # Ensure that MapFilterIntoJoinRight doesn't cause cycle with decorrelation.
 norm expect=MapFilterIntoJoinRight
@@ -763,14 +802,17 @@ FROM c
 ----
 project
  ├── columns: x:13
+ ├── immutable
  ├── ensure-distinct-on
  │    ├── columns: c.x:1!null b.x:4
  │    ├── grouping columns: c.x:1!null
  │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(4)
  │    ├── left-join-apply
  │    │    ├── columns: c.x:1!null b.x:4 k:8
+ │    │    ├── immutable
  │    │    ├── fd: (4)==(8), (8)==(4)
  │    │    ├── scan c
  │    │    │    ├── columns: c.x:1!null
@@ -778,10 +820,13 @@ project
  │    │    ├── inner-join (hash)
  │    │    │    ├── columns: b.x:4!null k:8!null
  │    │    │    ├── outer: (1)
+ │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
+ │    │    │    ├── immutable
  │    │    │    ├── fd: (4)==(8), (8)==(4)
  │    │    │    ├── full-join (cross)
  │    │    │    │    ├── columns: b.x:4
  │    │    │    │    ├── outer: (1)
+ │    │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
  │    │    │    │    ├── scan b
  │    │    │    │    │    ├── columns: b.x:4!null
  │    │    │    │    │    └── key: (4)
@@ -790,12 +835,13 @@ project
  │    │    │    │         └── c.x:1 = 5 [outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
  │    │    │    ├── select
  │    │    │    │    ├── columns: k:8!null
+ │    │    │    │    ├── immutable
  │    │    │    │    ├── key: (8)
  │    │    │    │    ├── scan a
  │    │    │    │    │    ├── columns: k:8!null
  │    │    │    │    │    └── key: (8)
  │    │    │    │    └── filters
- │    │    │    │         └── (k:8 + k:8) < 5 [outer=(8)]
+ │    │    │    │         └── (k:8 + k:8) < 5 [outer=(8), immutable]
  │    │    │    └── filters
  │    │    │         └── k:8 = b.x:4 [outer=(4,8), constraints=(/4: (/NULL - ]; /8: (/NULL - ]), fd=(4)==(8), (8)==(4)]
  │    │    └── filters (true)
@@ -816,14 +862,17 @@ FROM c
 ----
 project
  ├── columns: x:13
+ ├── immutable
  ├── ensure-distinct-on
  │    ├── columns: c.x:1!null b.x:9
  │    ├── grouping columns: c.x:1!null
  │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── immutable
  │    ├── key: (1)
  │    ├── fd: (1)-->(9)
  │    ├── left-join-apply
  │    │    ├── columns: c.x:1!null k:4 b.x:9
+ │    │    ├── immutable
  │    │    ├── fd: (4)==(9), (9)==(4)
  │    │    ├── scan c
  │    │    │    ├── columns: c.x:1!null
@@ -831,18 +880,22 @@ project
  │    │    ├── inner-join (hash)
  │    │    │    ├── columns: k:4!null b.x:9!null
  │    │    │    ├── outer: (1)
+ │    │    │    ├── multiplicity: left-rows(zero-or-more), right-rows(zero-or-one)
+ │    │    │    ├── immutable
  │    │    │    ├── fd: (4)==(9), (9)==(4)
  │    │    │    ├── select
  │    │    │    │    ├── columns: k:4!null
+ │    │    │    │    ├── immutable
  │    │    │    │    ├── key: (4)
  │    │    │    │    ├── scan a
  │    │    │    │    │    ├── columns: k:4!null
  │    │    │    │    │    └── key: (4)
  │    │    │    │    └── filters
- │    │    │    │         └── (k:4 + k:4) < 5 [outer=(4)]
+ │    │    │    │         └── (k:4 + k:4) < 5 [outer=(4), immutable]
  │    │    │    ├── full-join (cross)
  │    │    │    │    ├── columns: b.x:9
  │    │    │    │    ├── outer: (1)
+ │    │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
  │    │    │    │    ├── scan b
  │    │    │    │    │    ├── columns: b.x:9!null
  │    │    │    │    │    └── key: (9)
@@ -873,19 +926,19 @@ SELECT * FROM t1, t2 WHERE a = b AND age(b, TIMESTAMPTZ '2017-01-01') > INTERVAL
 ----
 inner-join (cross)
  ├── columns: a:1!null b:3!null
- ├── side-effects
+ ├── stable
  ├── fd: (1)==(3), (3)==(1)
  ├── scan t1
  │    └── columns: a:1
  ├── select
  │    ├── columns: b:3
- │    ├── side-effects
+ │    ├── immutable
  │    ├── scan t2
  │    │    └── columns: b:3
  │    └── filters
- │         └── age(b:3, '2017-01-01 00:00:00+00:00') > '1 day' [outer=(3), side-effects]
+ │         └── age(b:3, '2017-01-01 00:00:00+00:00') > '1 day' [outer=(3), immutable]
  └── filters
-      └── a:1 = b:3 [outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
+      └── a:1 = b:3 [outer=(1,3), stable, constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
 
 # Regression for issue 28818. Try to trigger undetectable cycle between the
 # PushFilterIntoJoinLeftAndRight and TryDecorrelateSelect rules.
@@ -975,6 +1028,7 @@ WHERE (a.k = b.x) OR (a.k IN (SELECT 5 FROM b WHERE x = y));
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6!null y:7
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (6)
  ├── fd: (1)-->(2-5), (6)-->(7), (1)==(6), (6)==(1)
  ├── scan a
@@ -1023,21 +1077,25 @@ WHERE
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6!null y:7 x:8!null y:9!null z:10!null x:11!null y:12!null z:13!null x:14!null y:15
  ├── cardinality: [0 - 1]
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: ()
  ├── fd: ()-->(1-15)
  ├── inner-join (hash)
  │    ├── columns: k:1!null i:2 f:3!null s:4 j:5 b.x:6!null b.y:7 c.x:8!null c.y:9!null c.z:10!null d.x:11!null d.y:12!null d.z:13!null
  │    ├── cardinality: [0 - 1]
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    ├── key: ()
  │    ├── fd: ()-->(1-13)
  │    ├── inner-join (hash)
  │    │    ├── columns: k:1!null i:2 f:3!null s:4 j:5 b.x:6!null b.y:7 c.x:8!null c.y:9!null c.z:10!null
  │    │    ├── cardinality: [0 - 1]
+ │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    │    ├── key: ()
  │    │    ├── fd: ()-->(1-10)
  │    │    ├── inner-join (hash)
  │    │    │    ├── columns: k:1!null i:2 f:3!null s:4 j:5 b.x:6!null b.y:7
  │    │    │    ├── cardinality: [0 - 1]
+ │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    │    │    ├── key: ()
  │    │    │    ├── fd: ()-->(1-7)
  │    │    │    ├── select
@@ -1137,6 +1195,7 @@ project
  │    │    │    ├── fd: (10-13)-->(19,40)
  │    │    │    ├── left-join (cross)
  │    │    │    │    ├── columns: ol_o_id:10!null ol_d_id:11!null ol_w_id:12!null ol_number:13!null ol_dist_info:19 true:39
+ │    │    │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  │    │    │    │    ├── fd: (10-13)-->(19)
  │    │    │    │    ├── scan order_line
  │    │    │    │    │    ├── columns: ol_o_id:10!null ol_d_id:11!null ol_w_id:12!null ol_number:13!null ol_dist_info:19
@@ -1199,10 +1258,12 @@ ON a_k = c_x AND c_x = b_x AND b_x = d_x
 ----
 inner-join (hash)
  ├── columns: a_k:1!null b_x:6!null c_x:8!null d_x:11!null
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (11)
  ├── fd: (1)==(6,8,11), (6)==(1,8,11), (8)==(1,6,11), (11)==(1,6,8)
  ├── inner-join (hash)
  │    ├── columns: k:1!null b.x:6!null
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    ├── key: (6)
  │    ├── fd: (1)==(6), (6)==(1)
  │    ├── scan a
@@ -1215,6 +1276,7 @@ inner-join (hash)
  │         └── k:1 = b.x:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
  ├── inner-join (hash)
  │    ├── columns: c.x:8!null d.x:11!null
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    ├── key: (11)
  │    ├── fd: (8)==(11), (11)==(8)
  │    ├── scan c
@@ -1233,10 +1295,12 @@ SELECT * FROM (SELECT b.x AS b_x, c.x AS c_x FROM b, c), d WHERE b_x=d.x AND c_x
 ----
 inner-join (hash)
  ├── columns: b_x:1!null c_x:3!null x:6!null y:7!null z:8!null
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (6)
  ├── fd: (1)==(3,6), (3)==(1,6), (6)-->(7,8), (6)==(1,3)
  ├── inner-join (hash)
  │    ├── columns: b.x:1!null c.x:3!null
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    ├── key: (3)
  │    ├── fd: (1)==(3), (3)==(1)
  │    ├── scan b
@@ -1259,6 +1323,7 @@ SELECT * FROM b, c, d WHERE b.x=c.x AND b.x=d.x
 ----
 inner-join (hash)
  ├── columns: x:1!null y:2 x:3!null y:4!null z:5!null x:6!null y:7!null z:8!null
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (6)
  ├── fd: (1)-->(2), (3)-->(4,5), (6)-->(7,8), (3)==(1,6), (6)==(1,3), (1)==(3,6)
  ├── scan b
@@ -1267,6 +1332,7 @@ inner-join (hash)
  │    └── fd: (1)-->(2)
  ├── inner-join (hash)
  │    ├── columns: c.x:3!null c.y:4!null c.z:5!null d.x:6!null d.y:7!null d.z:8!null
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  │    ├── key: (6)
  │    ├── fd: (3)-->(4,5), (6)-->(7,8), (3)==(6), (6)==(3)
  │    ├── scan c
@@ -1287,6 +1353,7 @@ SELECT * FROM c INNER JOIN d ON c.x = d.x AND d.x = c.y AND c.y = d.y AND d.y = 
 ----
 inner-join (hash)
  ├── columns: x:1!null y:2!null z:3!null x:4!null y:5!null z:6!null
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (4)
  ├── fd: (1)==(2-6), (2)==(1,3-6), (3)==(1,2,4-6), (4)==(1-3,5,6), (5)==(1-4,6), (6)==(1-5)
  ├── select
@@ -1319,6 +1386,7 @@ SELECT * from c, d WHERE c.x = c.y AND c.x = d.x AND c.y = d.y;
 ----
 inner-join (hash)
  ├── columns: x:1!null y:2!null z:3!null x:4!null y:5!null z:6!null
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (4)
  ├── fd: (1)-->(3), (1)==(2,4,5), (2)==(1,4,5), (4)-->(6), (4)==(1,2,5), (5)==(1,2,4)
  ├── select
@@ -1349,6 +1417,7 @@ SELECT * FROM c, d WHERE c.x = d.x AND d.x = c.y AND c.y = d.y
 ----
 inner-join (hash)
  ├── columns: x:1!null y:2!null z:3!null x:4!null y:5!null z:6!null
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (4)
  ├── fd: (1)-->(3), (1)==(2,4,5), (2)==(1,4,5), (4)-->(6), (4)==(1,2,5), (5)==(1,2,4)
  ├── select
@@ -1419,6 +1488,7 @@ SELECT * FROM a INNER JOIN b ON a.k=b.x AND a.i=1 AND b.y=1
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2!null f:3!null s:4 j:5 x:6!null y:7!null
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (6)
  ├── fd: ()-->(2,7), (1)-->(3-5), (1)==(6), (6)==(1)
  ├── select
@@ -1450,6 +1520,7 @@ SELECT * FROM a FULL JOIN b ON a.k=b.x AND a.i=1 AND b.y=1
 ----
 full-join (hash)
  ├── columns: k:1 i:2 f:3 s:4 j:5 x:6 y:7
+ ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  ├── key: (1,6)
  ├── fd: (1)-->(2-5), (6)-->(7)
  ├── scan a
@@ -1516,6 +1587,7 @@ SELECT * FROM a FULL JOIN a AS a2 ON a.k=a2.k
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 k:6!null i:7 f:8!null s:9 j:10
+ ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  ├── key: (6)
  ├── fd: (6)-->(7-10), (1)-->(2-5), (1)==(6), (6)==(1)
  ├── scan a2
@@ -1535,6 +1607,7 @@ SELECT * FROM a FULL JOIN (SELECT * FROM a WHERE k>0) AS a2 ON a.k=a2.k
 ----
 left-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 k:6 i:7 f:8 s:9 j:10
+ ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  ├── key: (1)
  ├── fd: (1)-->(2-10), (6)-->(7-10)
  ├── scan a
@@ -1560,6 +1633,7 @@ SELECT * FROM a FULL JOIN a AS a2 ON a.k=a2.k AND a.k=a2.k AND a2.f=a.f
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 k:6!null i:7 f:8!null s:9 j:10
+ ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  ├── key: (6)
  ├── fd: (6)-->(7-10), (1)-->(2-5), (3)==(8), (8)==(3), (1)==(6), (6)==(1)
  ├── scan a2
@@ -1580,6 +1654,8 @@ SELECT * FROM (SELECT length(s), f FROM a) AS a FULL JOIN a AS a2 ON a.f=a2.f
 ----
 inner-join (hash)
  ├── columns: length:6 f:3!null k:7!null i:8 f:9!null s:10 j:11
+ ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
+ ├── immutable
  ├── fd: (7)-->(8-11), (3)==(9), (9)==(3)
  ├── scan a2
  │    ├── columns: a2.k:7!null a2.i:8 a2.f:9!null a2.s:10 a2.j:11
@@ -1587,10 +1663,11 @@ inner-join (hash)
  │    └── fd: (7)-->(8-11)
  ├── project
  │    ├── columns: length:6 a.f:3!null
+ │    ├── immutable
  │    ├── scan a
  │    │    └── columns: a.f:3!null a.s:4
  │    └── projections
- │         └── length(a.s:4) [as=length:6, outer=(4)]
+ │         └── length(a.s:4) [as=length:6, outer=(4), immutable]
  └── filters
       └── a.f:3 = a2.f:9 [outer=(3,9), constraints=(/3: (/NULL - ]; /9: (/NULL - ]), fd=(3)==(9), (9)==(3)]
 
@@ -1600,10 +1677,12 @@ SELECT * FROM a FULL JOIN (SELECT * FROM a INNER JOIN a AS a2 ON a.k=a2.k) AS a2
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 k:6!null i:7 f:8!null s:9 j:10 k:11!null i:12 f:13!null s:14 j:15
+ ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
  ├── key: (1,11)
  ├── fd: (6)-->(7-10), (11)-->(12-15), (6)==(11), (11)==(6), (1)-->(2-5), (3)==(8), (8)==(3)
  ├── inner-join (hash)
  │    ├── columns: a.k:6!null a.i:7 a.f:8!null a.s:9 a.j:10 a2.k:11!null a2.i:12 a2.f:13!null a2.s:14 a2.j:15
+ │    ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  │    ├── key: (11)
  │    ├── fd: (6)-->(7-10), (11)-->(12-15), (6)==(11), (11)==(6)
  │    ├── scan a
@@ -1632,6 +1711,7 @@ ON c.y = a.k
 ----
 inner-join (hash)
  ├── columns: x:1!null y:2!null z:3!null k:4!null i:5 f:6!null s:7 j:8
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
  ├── key: (1)
  ├── fd: (1)-->(2,3), (4)-->(5-8), (2)==(4), (4)==(2)
  ├── scan c
@@ -1655,6 +1735,7 @@ AND d.y = c.x
 ----
 inner-join (hash)
  ├── columns: x:1!null y:2!null z:3!null x:4!null y:5!null z:6!null
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
  ├── key: (1)
  ├── fd: (1)-->(2,3), (4)-->(5,6), (3)==(6), (6)==(3), (2)==(4), (4)==(2)
  ├── scan d
@@ -1678,6 +1759,7 @@ ON d.z = c.z
 ----
 inner-join (hash)
  ├── columns: x:1!null y:2!null z:3!null x:4!null y:5!null z:6!null
+ ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  ├── key: (1,4)
  ├── fd: (1)-->(2,3), (4)-->(5,6), (3)==(6), (6)==(3)
  ├── scan d
@@ -1702,6 +1784,7 @@ ON True
 ----
 inner-join (cross)
  ├── columns: x:1!null y:2!null z:3!null x:4!null y:5!null z:6!null
+ ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
  ├── key: (1,4)
  ├── fd: (1)-->(2,3), (4)-->(5,6)
  ├── scan d
@@ -1720,6 +1803,7 @@ SELECT * FROM (SELECT count(*) FROM b) FULL JOIN a ON True
 left-join (cross)
  ├── columns: count:3!null k:4 i:5 f:6 s:7 j:8
  ├── cardinality: [1 - ]
+ ├── multiplicity: left-rows(one-or-more), right-rows(exactly-one)
  ├── key: (4)
  ├── fd: ()-->(3), (4)-->(5-8)
  ├── scalar-group-by
@@ -1743,6 +1827,7 @@ SELECT * FROM (SELECT count(*) FROM b) FULL JOIN a ON True
 left-join (cross)
  ├── columns: count:3!null k:4 i:5 f:6 s:7 j:8
  ├── cardinality: [1 - ]
+ ├── multiplicity: left-rows(one-or-more), right-rows(exactly-one)
  ├── key: (4)
  ├── fd: ()-->(3), (4)-->(5-8)
  ├── scalar-group-by
@@ -1766,6 +1851,7 @@ SELECT * FROM (SELECT count(*) FROM b) FULL JOIN a ON True
 left-join (cross)
  ├── columns: count:3!null k:4 i:5 f:6 s:7 j:8
  ├── cardinality: [1 - ]
+ ├── multiplicity: left-rows(one-or-more), right-rows(exactly-one)
  ├── key: (4)
  ├── fd: ()-->(3), (4)-->(5-8)
  ├── scalar-group-by
@@ -1787,6 +1873,7 @@ SELECT * FROM a LEFT JOIN (SELECT count(*) FROM b) ON True
 ----
 inner-join (cross)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 count:8!null
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
  ├── key: (1)
  ├── fd: ()-->(8), (1)-->(2-5)
  ├── scan a
@@ -1810,6 +1897,7 @@ SELECT * FROM a FULL JOIN (SELECT count(*) FROM b) ON True
 left-join (cross)
  ├── columns: k:1 i:2 f:3 s:4 j:5 count:8!null
  ├── cardinality: [1 - ]
+ ├── multiplicity: left-rows(one-or-more), right-rows(exactly-one)
  ├── key: (1)
  ├── fd: ()-->(8), (1)-->(2-5)
  ├── scalar-group-by
@@ -1832,10 +1920,12 @@ SELECT * FROM a WHERE (SELECT sum(column1) FROM (VALUES (k), (1))) = 1
 ----
 project
  ├── columns: k:1!null i:2 f:3!null s:4 j:5
+ ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-5)
  └── select
       ├── columns: k:1!null i:2 f:3!null s:4 j:5 sum:7!null
+      ├── immutable
       ├── key: (1)
       ├── fd: ()-->(7), (1)-->(2-5)
       ├── group-by
@@ -1869,7 +1959,7 @@ project
       │         └── const-agg [as=j:5, outer=(5)]
       │              └── j:5
       └── filters
-           └── sum:7 = 1 [outer=(7), constraints=(/7: [/1 - /1]; tight), fd=()-->(7)]
+           └── sum:7 = 1 [outer=(7), immutable, constraints=(/7: [/1 - /1]; tight), fd=()-->(7)]
 
 # Don't simplify left join
 norm expect-not=SimplifyRightJoin
@@ -1878,6 +1968,7 @@ SELECT * FROM (SELECT count(*) FROM b) LEFT JOIN a ON True
 left-join (cross)
  ├── columns: count:3!null k:4 i:5 f:6 s:7 j:8
  ├── cardinality: [1 - ]
+ ├── multiplicity: left-rows(one-or-more), right-rows(exactly-one)
  ├── key: (4)
  ├── fd: ()-->(3), (4)-->(5-8)
  ├── scalar-group-by
@@ -1901,6 +1992,7 @@ SELECT * FROM a RIGHT JOIN (SELECT count(*) FROM b) ON True
 left-join (cross)
  ├── columns: k:1 i:2 f:3 s:4 j:5 count:8!null
  ├── cardinality: [1 - ]
+ ├── multiplicity: left-rows(one-or-more), right-rows(exactly-one)
  ├── key: (1)
  ├── fd: ()-->(8), (1)-->(2-5)
  ├── scalar-group-by
@@ -1926,6 +2018,7 @@ ON c.z = a.k
 ----
 left-join (hash)
  ├── columns: x:1!null y:2!null z:3!null k:4 i:5 f:6 s:7 j:8
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
  ├── key: (1)
  ├── fd: (1)-->(2-8), (4)-->(5-8)
  ├── scan c
@@ -1948,6 +2041,7 @@ ON c.x = a.k
 ----
 left-join (hash)
  ├── columns: x:1!null y:2!null z:3!null k:4 i:5 f:6 s:7 j:8
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  ├── key: (1)
  ├── fd: (1)-->(2-8), (4)-->(5-8)
  ├── scan c
@@ -1967,6 +2061,7 @@ SELECT * FROM a FULL JOIN a AS a2 ON a.k<a2.k
 ----
 full-join (cross)
  ├── columns: k:1 i:2 f:3 s:4 j:5 k:6 i:7 f:8 s:9 j:10
+ ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
  ├── key: (1,6)
  ├── fd: (1)-->(2-5), (6)-->(7-10)
  ├── scan a
@@ -1986,6 +2081,7 @@ SELECT * FROM a FULL JOIN a AS a2 ON a.f=1 AND a.f=a2.f
 ----
 full-join (hash)
  ├── columns: k:1 i:2 f:3 s:4 j:5 k:6 i:7 f:8 s:9 j:10
+ ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
  ├── key: (1,6)
  ├── fd: (1)-->(2-5), (6)-->(7-10)
  ├── scan a
@@ -2006,6 +2102,7 @@ SELECT * FROM a FULL JOIN a AS a2 ON a.s=a2.s
 ----
 full-join (hash)
  ├── columns: k:1 i:2 f:3 s:4 j:5 k:6 i:7 f:8 s:9 j:10
+ ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
  ├── key: (1,6)
  ├── fd: (1)-->(2-5), (6)-->(7-10)
  ├── scan a
@@ -2025,6 +2122,8 @@ SELECT * FROM a FULL JOIN (SELECT k+1 AS k FROM a) AS a2 ON a.k=a2.k
 ----
 full-join (hash)
  ├── columns: k:1 i:2 f:3 s:4 j:5 k:11
+ ├── multiplicity: left-rows(one-or-more), right-rows(exactly-one)
+ ├── immutable
  ├── fd: (1)-->(2-5)
  ├── scan a
  │    ├── columns: a.k:1!null i:2 f:3!null s:4 j:5
@@ -2032,11 +2131,12 @@ full-join (hash)
  │    └── fd: (1)-->(2-5)
  ├── project
  │    ├── columns: k:11!null
+ │    ├── immutable
  │    ├── scan a
  │    │    ├── columns: a.k:6!null
  │    │    └── key: (6)
  │    └── projections
- │         └── a.k:6 + 1 [as=k:11, outer=(6)]
+ │         └── a.k:6 + 1 [as=k:11, outer=(6), immutable]
  └── filters
       └── a.k:1 = k:11 [outer=(1,11), constraints=(/1: (/NULL - ]; /11: (/NULL - ]), fd=(1)==(11), (11)==(1)]
 
@@ -2046,6 +2146,7 @@ SELECT * FROM a FULL JOIN a AS a2 ON a.k=a2.f
 ----
 full-join (cross)
  ├── columns: k:1 i:2 f:3 s:4 j:5 k:6 i:7 f:8 s:9 j:10
+ ├── multiplicity: left-rows(one-or-more), right-rows(exactly-one)
  ├── key: (1,6)
  ├── fd: (1)-->(2-5), (6)-->(7-10)
  ├── scan a
@@ -2065,6 +2166,7 @@ SELECT * FROM a FULL JOIN a AS a2 ON a.k=a2.k AND a.f=a.f AND a2.f=a2.f
 ----
 full-join (hash)
  ├── columns: k:1 i:2 f:3 s:4 j:5 k:6 i:7 f:8 s:9 j:10
+ ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  ├── key: (1,6)
  ├── fd: (1)-->(2-5), (6)-->(7-10)
  ├── scan a
@@ -2086,6 +2188,7 @@ SELECT * FROM (SELECT * FROM a, b) AS a FULL JOIN a AS a2 ON a.k=a2.k AND a.x=a2
 ----
 full-join (hash)
  ├── columns: k:1 i:2 f:3 s:4 j:5 x:6 y:7 k:8 i:9 f:10 s:11 j:12
+ ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  ├── key: (1,6,8)
  ├── fd: (1)-->(2-5), (6)-->(7), (8)-->(9-12)
  ├── inner-join (cross)
@@ -2115,6 +2218,7 @@ SELECT * FROM a LEFT JOIN (SELECT * FROM a, b) AS a2 ON a.k=a2.x
 ----
 left-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 k:6 i:7 f:8 s:9 j:10 x:11 y:12
+ ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
  ├── key: (1,6,11)
  ├── fd: (1)-->(2-5), (6)-->(7-10), (11)-->(12)
  ├── scan a
@@ -2146,6 +2250,7 @@ ON c.y = a.k
 ----
 left-join (hash)
  ├── columns: x:1!null y:2!null z:3!null k:4 i:5 f:6 s:7 j:8
+ ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
  ├── key: (1)
  ├── fd: (1)-->(2-8), (4)-->(5-8)
  ├── scan c
@@ -2228,29 +2333,39 @@ values
 # EliminateJoinNoColsLeft
 # --------------------------------------------------
 norm expect=EliminateJoinNoColsLeft
-SELECT s FROM (VALUES (1, 2)) INNER JOIN a ON s='foo'
+SELECT unnest(ARRAY[[1,2,3],[4,5]])
 ----
-select
- ├── columns: s:6!null
- ├── fd: ()-->(6)
- ├── scan a
- │    └── columns: s:6
- └── filters
-      └── s:6 = 'foo' [outer=(6), constraints=(/6: [/'foo' - /'foo']; tight), fd=()-->(6)]
+values
+ ├── columns: unnest:1!null
+ ├── cardinality: [2 - 2]
+ ├── (ARRAY[1,2,3],)
+ └── (ARRAY[4,5],)
 
 # --------------------------------------------------
 # EliminateJoinNoColsRight
 # --------------------------------------------------
 norm expect=EliminateJoinNoColsRight
-SELECT s FROM a INNER JOIN (SELECT count(*) FROM b) ON s='foo'
+SELECT * FROM xy WHERE EXISTS(SELECT generate_series(x, 10))
 ----
-select
- ├── columns: s:4!null
- ├── fd: ()-->(4)
- ├── scan a
- │    └── columns: s:4
- └── filters
-      └── s:4 = 'foo' [outer=(4), constraints=(/4: [/'foo' - /'foo']; tight), fd=()-->(4)]
+group-by
+ ├── columns: x:1!null y:2
+ ├── grouping columns: x:1!null
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── project-set
+ │    ├── columns: x:1!null y:2 generate_series:3
+ │    ├── immutable
+ │    ├── fd: (1)-->(2)
+ │    ├── scan xy
+ │    │    ├── columns: x:1!null y:2
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2)
+ │    └── zip
+ │         └── generate_series(x:1, 10) [outer=(1), immutable]
+ └── aggregations
+      └── const-agg [as=y:2, outer=(2)]
+           └── y:2
 
 # --------------------------------------------------
 # HoistJoinProjectRight
@@ -2267,6 +2382,7 @@ project
  ├── fd: (1)-->(2-5), (1)==(6), (6)==(1)
  └── inner-join (hash)
       ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6!null y:7!null
+      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
       ├── key: (6)
       ├── fd: ()-->(7), (1)-->(2-5), (1)==(6), (6)==(1)
       ├── scan a
@@ -2296,6 +2412,7 @@ project
  ├── fd: (1)-->(2-6)
  └── left-join (hash)
       ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6 y:7
+      ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       ├── key: (1)
       ├── fd: (1)-->(2-7)
       ├── scan a
@@ -2329,6 +2446,7 @@ project
  ├── fd: (3)-->(4-7), (1)==(3), (3)==(1)
  └── inner-join (hash)
       ├── columns: x:1!null y:2!null k:3!null i:4 f:5!null s:6 j:7
+      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
       ├── key: (3)
       ├── fd: ()-->(2), (3)-->(4-7), (1)==(3), (3)==(1)
       ├── select
@@ -2358,6 +2476,7 @@ project
  ├── fd: (3)-->(4-7), (1)-->(3-7)
  └── left-join (hash)
       ├── columns: x:1!null y:2!null k:3 i:4 f:5 s:6 j:7
+      ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
       ├── key: (1)
       ├── fd: ()-->(2), (3)-->(4-7), (1)-->(3-7)
       ├── select
@@ -2385,6 +2504,7 @@ SELECT * FROM a INNER JOIN b ON (a.k=b.x) IS True
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6!null y:7
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (6)
  ├── fd: (1)-->(2-5), (6)-->(7), (1)==(6), (6)==(1)
  ├── scan a
@@ -2448,6 +2568,7 @@ SELECT * FROM a INNER JOIN b ON (a.k=b.x) IS NOT False
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2 f:3!null s:4 j:5 x:6!null y:7
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
  ├── key: (6)
  ├── fd: (1)-->(2-5), (6)-->(7), (1)==(6), (6)==(1)
  ├── scan a
@@ -2487,6 +2608,8 @@ ON a.f>=b.z::float AND (a.k=b.x) IS True AND a.f>=b.z::float AND (a.i=b.y) IS NO
 ----
 inner-join (hash)
  ├── columns: k:1!null i:2!null f:3!null s:4 j:5 x:6!null y:7!null z:8!null
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
+ ├── immutable
  ├── key: (6)
  ├── fd: (1)-->(2-5), (6)-->(7), (7)-->(8), (1)==(6), (6)==(1), (2)==(7), (7)==(2)
  ├── select
@@ -2501,6 +2624,7 @@ inner-join (hash)
  │         └── i:2 > 0 [outer=(2), constraints=(/2: [/1 - ]; tight)]
  ├── project
  │    ├── columns: z:8!null x:6!null y:7!null
+ │    ├── immutable
  │    ├── key: (6)
  │    ├── fd: (6)-->(7), (7)-->(8)
  │    ├── select
@@ -2514,10 +2638,10 @@ inner-join (hash)
  │    │    └── filters
  │    │         └── y:7 > 10 [outer=(7), constraints=(/7: [/11 - ]; tight)]
  │    └── projections
- │         └── y:7 + 1 [as=z:8, outer=(7)]
+ │         └── y:7 + 1 [as=z:8, outer=(7), immutable]
  └── filters
-      ├── f:3 >= z:8::FLOAT8 [outer=(3,8), constraints=(/3: (/NULL - ])]
-      ├── f:3 >= z:8::FLOAT8 [outer=(3,8), constraints=(/3: (/NULL - ])]
+      ├── f:3 >= z:8::FLOAT8 [outer=(3,8), immutable, constraints=(/3: (/NULL - ])]
+      ├── f:3 >= z:8::FLOAT8 [outer=(3,8), immutable, constraints=(/3: (/NULL - ])]
       ├── k:1 = x:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
       └── i:2 = y:7 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
 
@@ -2550,22 +2674,26 @@ SELECT * FROM xy JOIN uv ON x+y=u
 ----
 project
  ├── columns: x:1!null y:2 u:3!null v:4
+ ├── immutable
  ├── key: (1)
- ├── fd: (1)-->(2), (1,2)-->(3,4), (3)-->(4)
+ ├── fd: (1)-->(2-4), (3)-->(4)
  └── inner-join (hash)
       ├── columns: x:1!null y:2 u:3!null v:4 column5:5!null
+      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
+      ├── immutable
       ├── key: (1)
-      ├── fd: (1)-->(2), (1,2)-->(5), (3)-->(4), (3)==(5), (5)==(3)
+      ├── fd: (1)-->(2,5), (3)-->(4), (3)==(5), (5)==(3)
       ├── project
       │    ├── columns: column5:5 x:1!null y:2
+      │    ├── immutable
       │    ├── key: (1)
-      │    ├── fd: (1)-->(2), (1,2)-->(5)
+      │    ├── fd: (1)-->(2,5)
       │    ├── scan xy
       │    │    ├── columns: x:1!null y:2
       │    │    ├── key: (1)
       │    │    └── fd: (1)-->(2)
       │    └── projections
-      │         └── x:1 + y:2 [as=column5:5, outer=(1,2)]
+      │         └── x:1 + y:2 [as=column5:5, outer=(1,2), immutable]
       ├── scan uv
       │    ├── columns: u:3!null v:4
       │    ├── key: (3)
@@ -2578,22 +2706,26 @@ SELECT * FROM xy JOIN uv ON u=x+y
 ----
 project
  ├── columns: x:1!null y:2 u:3!null v:4
+ ├── immutable
  ├── key: (1)
- ├── fd: (1)-->(2), (1,2)-->(3,4), (3)-->(4)
+ ├── fd: (1)-->(2-4), (3)-->(4)
  └── inner-join (hash)
       ├── columns: x:1!null y:2 u:3!null v:4 column5:5!null
+      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
+      ├── immutable
       ├── key: (1)
-      ├── fd: (1)-->(2), (1,2)-->(5), (3)-->(4), (3)==(5), (5)==(3)
+      ├── fd: (1)-->(2,5), (3)-->(4), (3)==(5), (5)==(3)
       ├── project
       │    ├── columns: column5:5 x:1!null y:2
+      │    ├── immutable
       │    ├── key: (1)
-      │    ├── fd: (1)-->(2), (1,2)-->(5)
+      │    ├── fd: (1)-->(2,5)
       │    ├── scan xy
       │    │    ├── columns: x:1!null y:2
       │    │    ├── key: (1)
       │    │    └── fd: (1)-->(2)
       │    └── projections
-      │         └── x:1 + y:2 [as=column5:5, outer=(1,2)]
+      │         └── x:1 + y:2 [as=column5:5, outer=(1,2), immutable]
       ├── scan uv
       │    ├── columns: u:3!null v:4
       │    ├── key: (3)
@@ -2606,26 +2738,30 @@ SELECT * FROM xy JOIN uv ON x=u+v
 ----
 project
  ├── columns: x:1!null y:2 u:3!null v:4
+ ├── immutable
  ├── key: (3)
- ├── fd: (1)-->(2), (3)-->(4), (3,4)-->(1,2)
+ ├── fd: (1)-->(2), (3)-->(1,2,4)
  └── inner-join (hash)
       ├── columns: x:1!null y:2 u:3!null v:4 column5:5!null
+      ├── multiplicity: left-rows(zero-or-more), right-rows(zero-or-one)
+      ├── immutable
       ├── key: (3)
-      ├── fd: (1)-->(2), (3)-->(4), (3,4)-->(5), (1)==(5), (5)==(1)
+      ├── fd: (1)-->(2), (3)-->(4,5), (1)==(5), (5)==(1)
       ├── scan xy
       │    ├── columns: x:1!null y:2
       │    ├── key: (1)
       │    └── fd: (1)-->(2)
       ├── project
       │    ├── columns: column5:5 u:3!null v:4
+      │    ├── immutable
       │    ├── key: (3)
-      │    ├── fd: (3)-->(4), (3,4)-->(5)
+      │    ├── fd: (3)-->(4,5)
       │    ├── scan uv
       │    │    ├── columns: u:3!null v:4
       │    │    ├── key: (3)
       │    │    └── fd: (3)-->(4)
       │    └── projections
-      │         └── u:3 + v:4 [as=column5:5, outer=(3,4)]
+      │         └── u:3 + v:4 [as=column5:5, outer=(3,4), immutable]
       └── filters
            └── x:1 = column5:5 [outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
 
@@ -2634,26 +2770,30 @@ SELECT * FROM xy JOIN uv ON u+v=x
 ----
 project
  ├── columns: x:1!null y:2 u:3!null v:4
+ ├── immutable
  ├── key: (3)
- ├── fd: (1)-->(2), (3)-->(4), (3,4)-->(1,2)
+ ├── fd: (1)-->(2), (3)-->(1,2,4)
  └── inner-join (hash)
       ├── columns: x:1!null y:2 u:3!null v:4 column5:5!null
+      ├── multiplicity: left-rows(zero-or-more), right-rows(zero-or-one)
+      ├── immutable
       ├── key: (3)
-      ├── fd: (1)-->(2), (3)-->(4), (3,4)-->(5), (1)==(5), (5)==(1)
+      ├── fd: (1)-->(2), (3)-->(4,5), (1)==(5), (5)==(1)
       ├── scan xy
       │    ├── columns: x:1!null y:2
       │    ├── key: (1)
       │    └── fd: (1)-->(2)
       ├── project
       │    ├── columns: column5:5 u:3!null v:4
+      │    ├── immutable
       │    ├── key: (3)
-      │    ├── fd: (3)-->(4), (3,4)-->(5)
+      │    ├── fd: (3)-->(4,5)
       │    ├── scan uv
       │    │    ├── columns: u:3!null v:4
       │    │    ├── key: (3)
       │    │    └── fd: (3)-->(4)
       │    └── projections
-      │         └── u:3 + v:4 [as=column5:5, outer=(3,4)]
+      │         └── u:3 + v:4 [as=column5:5, outer=(3,4), immutable]
       └── filters
            └── x:1 = column5:5 [outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
 
@@ -2662,32 +2802,36 @@ SELECT * FROM xy JOIN uv ON x+y=u+v
 ----
 project
  ├── columns: x:1!null y:2 u:3!null v:4
+ ├── immutable
  ├── key: (1,3)
  ├── fd: (1)-->(2), (3)-->(4)
  └── inner-join (hash)
       ├── columns: x:1!null y:2 u:3!null v:4 column5:5!null column6:6!null
+      ├── immutable
       ├── key: (1,3)
-      ├── fd: (1)-->(2), (1,2)-->(5), (3)-->(4), (3,4)-->(6), (5)==(6), (6)==(5)
+      ├── fd: (1)-->(2,5), (3)-->(4,6), (5)==(6), (6)==(5)
       ├── project
       │    ├── columns: column5:5 x:1!null y:2
+      │    ├── immutable
       │    ├── key: (1)
-      │    ├── fd: (1)-->(2), (1,2)-->(5)
+      │    ├── fd: (1)-->(2,5)
       │    ├── scan xy
       │    │    ├── columns: x:1!null y:2
       │    │    ├── key: (1)
       │    │    └── fd: (1)-->(2)
       │    └── projections
-      │         └── x:1 + y:2 [as=column5:5, outer=(1,2)]
+      │         └── x:1 + y:2 [as=column5:5, outer=(1,2), immutable]
       ├── project
       │    ├── columns: column6:6 u:3!null v:4
+      │    ├── immutable
       │    ├── key: (3)
-      │    ├── fd: (3)-->(4), (3,4)-->(6)
+      │    ├── fd: (3)-->(4,6)
       │    ├── scan uv
       │    │    ├── columns: u:3!null v:4
       │    │    ├── key: (3)
       │    │    └── fd: (3)-->(4)
       │    └── projections
-      │         └── u:3 + v:4 [as=column6:6, outer=(3,4)]
+      │         └── u:3 + v:4 [as=column6:6, outer=(3,4), immutable]
       └── filters
            └── column5:5 = column6:6 [outer=(5,6), constraints=(/5: (/NULL - ]; /6: (/NULL - ]), fd=(5)==(6), (6)==(5)]
 
@@ -2697,34 +2841,39 @@ SELECT * FROM xy JOIN uv ON x+y=u AND x=u+v AND x*y+1=u*v+2
 ----
 project
  ├── columns: x:1!null y:2 u:3!null v:4
+ ├── immutable
  ├── key: (1)
- ├── fd: (1)-->(2), (1,2)-->(3,4), (3)-->(4), (3,4)-->(1,2)
+ ├── fd: (1)-->(2-4), (3)-->(1,2,4)
  └── inner-join (hash)
       ├── columns: x:1!null y:2 u:3!null v:4 column5:5!null column6:6!null column7:7!null column8:8!null
+      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
+      ├── immutable
       ├── key: (1)
-      ├── fd: (1)-->(2), (1,2)-->(5,7), (3)-->(4), (3,4)-->(6,8), (3)==(5), (5)==(3), (1)==(6), (6)==(1), (7)==(8), (8)==(7)
+      ├── fd: (1)-->(2,5,7), (3)-->(4,6,8), (3)==(5), (5)==(3), (1)==(6), (6)==(1), (7)==(8), (8)==(7)
       ├── project
       │    ├── columns: column7:7 column5:5 x:1!null y:2
+      │    ├── immutable
       │    ├── key: (1)
-      │    ├── fd: (1)-->(2), (1,2)-->(5,7)
+      │    ├── fd: (1)-->(2,5,7)
       │    ├── scan xy
       │    │    ├── columns: x:1!null y:2
       │    │    ├── key: (1)
       │    │    └── fd: (1)-->(2)
       │    └── projections
-      │         ├── (x:1 * y:2) + 1 [as=column7:7, outer=(1,2)]
-      │         └── x:1 + y:2 [as=column5:5, outer=(1,2)]
+      │         ├── (x:1 * y:2) + 1 [as=column7:7, outer=(1,2), immutable]
+      │         └── x:1 + y:2 [as=column5:5, outer=(1,2), immutable]
       ├── project
       │    ├── columns: column8:8 column6:6 u:3!null v:4
+      │    ├── immutable
       │    ├── key: (3)
-      │    ├── fd: (3)-->(4), (3,4)-->(6,8)
+      │    ├── fd: (3)-->(4,6,8)
       │    ├── scan uv
       │    │    ├── columns: u:3!null v:4
       │    │    ├── key: (3)
       │    │    └── fd: (3)-->(4)
       │    └── projections
-      │         ├── (u:3 * v:4) + 2 [as=column8:8, outer=(3,4)]
-      │         └── u:3 + v:4 [as=column6:6, outer=(3,4)]
+      │         ├── (u:3 * v:4) + 2 [as=column8:8, outer=(3,4), immutable]
+      │         └── u:3 + v:4 [as=column6:6, outer=(3,4), immutable]
       └── filters
            ├── column5:5 = u:3 [outer=(3,5), constraints=(/3: (/NULL - ]; /5: (/NULL - ]), fd=(3)==(5), (5)==(3)]
            ├── x:1 = column6:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
@@ -2736,28 +2885,32 @@ SELECT * FROM xy JOIN uv ON x+y=u AND x+u=v
 ----
 project
  ├── columns: x:1!null y:2 u:3!null v:4!null
+ ├── immutable
  ├── key: (1)
- ├── fd: (1)-->(2), (1,2)-->(3,4), (3)-->(4)
+ ├── fd: (1)-->(2-4), (3)-->(4)
  └── inner-join (hash)
       ├── columns: x:1!null y:2 u:3!null v:4!null column5:5!null
+      ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
+      ├── immutable
       ├── key: (1)
-      ├── fd: (1)-->(2), (1,2)-->(5), (3)-->(4), (3)==(5), (5)==(3)
+      ├── fd: (1)-->(2,5), (3)-->(4), (3)==(5), (5)==(3)
       ├── project
       │    ├── columns: column5:5 x:1!null y:2
+      │    ├── immutable
       │    ├── key: (1)
-      │    ├── fd: (1)-->(2), (1,2)-->(5)
+      │    ├── fd: (1)-->(2,5)
       │    ├── scan xy
       │    │    ├── columns: x:1!null y:2
       │    │    ├── key: (1)
       │    │    └── fd: (1)-->(2)
       │    └── projections
-      │         └── x:1 + y:2 [as=column5:5, outer=(1,2)]
+      │         └── x:1 + y:2 [as=column5:5, outer=(1,2), immutable]
       ├── scan uv
       │    ├── columns: u:3!null v:4
       │    ├── key: (3)
       │    └── fd: (3)-->(4)
       └── filters
-           ├── v:4 = (x:1 + u:3) [outer=(1,3,4), constraints=(/4: (/NULL - ])]
+           ├── v:4 = (x:1 + u:3) [outer=(1,3,4), immutable, constraints=(/4: (/NULL - ])]
            └── column5:5 = u:3 [outer=(3,5), constraints=(/3: (/NULL - ]; /5: (/NULL - ]), fd=(3)==(5), (5)==(3)]
 
 # Cases with non-extractable equality.
@@ -2766,6 +2919,7 @@ SELECT * FROM xy FULL OUTER JOIN uv ON x=u
 ----
 full-join (hash)
  ├── columns: x:1 y:2 u:3 v:4
+ ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
  ├── key: (1,3)
  ├── fd: (1)-->(2), (3)-->(4)
  ├── scan xy
@@ -2784,6 +2938,8 @@ SELECT * FROM xy FULL OUTER JOIN uv ON x+y=1
 ----
 full-join (cross)
  ├── columns: x:1 y:2 u:3 v:4
+ ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
+ ├── immutable
  ├── key: (1,3)
  ├── fd: (1)-->(2), (3)-->(4)
  ├── scan xy
@@ -2795,13 +2951,15 @@ full-join (cross)
  │    ├── key: (3)
  │    └── fd: (3)-->(4)
  └── filters
-      └── (x:1 + y:2) = 1 [outer=(1,2)]
+      └── (x:1 + y:2) = 1 [outer=(1,2), immutable]
 
 norm expect-not=ExtractJoinEqualities
 SELECT * FROM xy FULL OUTER JOIN uv ON 1=u+v
 ----
 full-join (cross)
  ├── columns: x:1 y:2 u:3 v:4
+ ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
+ ├── immutable
  ├── key: (1,3)
  ├── fd: (1)-->(2), (3)-->(4)
  ├── scan xy
@@ -2813,7 +2971,7 @@ full-join (cross)
  │    ├── key: (3)
  │    └── fd: (3)-->(4)
  └── filters
-      └── (u:3 + v:4) = 1 [outer=(3,4)]
+      └── (u:3 + v:4) = 1 [outer=(3,4), immutable]
 
 norm expect-not=ExtractJoinEqualities
 SELECT * FROM xy INNER JOIN uv ON (SELECT k FROM a WHERE i=x)=u
@@ -2840,6 +2998,7 @@ project
       │    ├── left-join (cross)
       │    │    ├── columns: u:3!null v:4 k:5 i:6
       │    │    ├── outer: (1)
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
       │    │    ├── key: (3,5)
       │    │    ├── fd: (3)-->(4), (5)-->(6)
       │    │    ├── scan uv
@@ -2869,6 +3028,7 @@ project
  ├── fd: (1)-->(2), (3)-->(1,2,4)
  └── inner-join (hash)
       ├── columns: x:1!null y:2 u:3!null v:4 k:5!null
+      ├── multiplicity: left-rows(zero-or-more), right-rows(zero-or-one)
       ├── key: (3)
       ├── fd: (1)-->(2), (3)-->(4,5), (1)==(5), (5)==(1)
       ├── scan xy
@@ -2883,6 +3043,7 @@ project
       │    ├── fd: (3)-->(4,5)
       │    ├── left-join (hash)
       │    │    ├── columns: u:3!null v:4 k:5 i:6
+      │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
       │    │    ├── key: (3,5)
       │    │    ├── fd: (3)-->(4), (5)-->(6)
       │    │    ├── scan uv
@@ -2911,6 +3072,8 @@ SELECT * FROM xy FULL JOIN uv ON (substring('', ')') = '') = (u > 0)
 ----
 full-join (cross)
  ├── columns: x:1 y:2 u:3 v:4
+ ├── multiplicity: left-rows(one-or-more), right-rows(one-or-more)
+ ├── immutable
  ├── key: (1,3)
  ├── fd: (1)-->(2), (3)-->(4)
  ├── scan xy
@@ -2922,4 +3085,261 @@ full-join (cross)
  │    ├── key: (3)
  │    └── fd: (3)-->(4)
  └── filters
-      └── (substring('', ')') = '') = (u:3 > 0) [outer=(3)]
+      └── (substring('', ')') = '') = (u:3 > 0) [outer=(3), immutable]
+
+# --------------------------------------------------
+# LeftAssociateJoinsLeft,  LeftAssociateJoinsRight,
+# RightAssociateJoinsLeft,  RightAssociateJoinsRight
+# --------------------------------------------------
+
+# Common use case.
+norm expect=RightAssociateJoinsLeft
+SELECT * FROM xy, a, uv WHERE x=u AND y=k
+----
+inner-join (hash)
+ ├── columns: x:1!null y:2!null k:3!null i:4 f:5!null s:6 j:7 u:8!null v:9
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
+ ├── key: (8)
+ ├── fd: (1)-->(2), (3)-->(4-7), (2)==(3), (3)==(2), (8)-->(9), (1)==(8), (8)==(1)
+ ├── inner-join (hash)
+ │    ├── columns: x:1!null y:2!null k:3!null i:4 f:5!null s:6 j:7
+ │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2), (3)-->(4-7), (2)==(3), (3)==(2)
+ │    ├── scan xy
+ │    │    ├── columns: x:1!null y:2
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2)
+ │    ├── scan a
+ │    │    ├── columns: k:3!null i:4 f:5!null s:6 j:7
+ │    │    ├── key: (3)
+ │    │    └── fd: (3)-->(4-7)
+ │    └── filters
+ │         └── y:2 = k:3 [outer=(2,3), constraints=(/2: (/NULL - ]; /3: (/NULL - ]), fd=(2)==(3), (3)==(2)]
+ ├── scan uv
+ │    ├── columns: u:8!null v:9
+ │    ├── key: (8)
+ │    └── fd: (8)-->(9)
+ └── filters
+      └── x:1 = u:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
+
+# LeftAssociateJoinsLeft case with one association operation.
+norm expect=LeftAssociateJoinsLeft format=hide-all
+SELECT * FROM (SELECT * FROM xy INNER JOIN uv ON True)
+INNER JOIN a
+ON k=x
+----
+inner-join (cross)
+ ├── scan uv
+ ├── inner-join (hash)
+ │    ├── scan xy
+ │    ├── scan a
+ │    └── filters
+ │         └── k = x
+ └── filters (true)
+
+# LeftAssociateJoinsRight case with one association operation.
+norm expect=LeftAssociateJoinsRight format=hide-all
+SELECT * FROM (SELECT * FROM xy INNER JOIN uv ON True)
+INNER JOIN a
+ON i=u
+----
+inner-join (cross)
+ ├── scan xy
+ ├── inner-join (hash)
+ │    ├── scan uv
+ │    ├── scan a
+ │    └── filters
+ │         └── i = u
+ └── filters (true)
+
+# RightAssociateJoinsLeft case with one association operation.
+norm expect=RightAssociateJoinsLeft format=hide-all
+SELECT * FROM a
+INNER JOIN (SELECT * FROM xy INNER JOIN uv ON True)
+ON k=x
+----
+inner-join (cross)
+ ├── inner-join (hash)
+ │    ├── scan a
+ │    ├── scan xy
+ │    └── filters
+ │         └── k = x
+ ├── scan uv
+ └── filters (true)
+
+# RightAssociateJoinsRight case with one association operation.
+norm expect=RightAssociateJoinsRight format=hide-all
+SELECT * FROM a
+INNER JOIN (SELECT * FROM xy INNER JOIN uv ON True)
+ON i=u
+----
+inner-join (cross)
+ ├── inner-join (hash)
+ │    ├── scan a
+ │    ├── scan uv
+ │    └── filters
+ │         └── i = u
+ ├── scan xy
+ └── filters (true)
+
+# LeftAssociateJoinsLeft case with multiple filters referencing the left input.
+norm expect=LeftAssociateJoinsLeft format=hide-all
+SELECT * FROM (SELECT * FROM xy INNER JOIN uv ON True)
+INNER JOIN a
+ON k=x AND i=y
+----
+inner-join (cross)
+ ├── scan uv
+ ├── inner-join (hash)
+ │    ├── scan xy
+ │    ├── scan a
+ │    └── filters
+ │         ├── k = x
+ │         └── i = y
+ └── filters (true)
+
+# LeftAssociateJoinsLeft case with multiple filters referencing both inputs.
+norm expect=LeftAssociateJoinsLeft format=hide-all
+SELECT * FROM (SELECT * FROM xy INNER JOIN uv ON True)
+INNER JOIN a
+ON k=x AND i=u
+----
+inner-join (hash)
+ ├── scan uv
+ ├── inner-join (hash)
+ │    ├── scan xy
+ │    ├── scan a
+ │    └── filters
+ │         └── k = x
+ └── filters
+      └── i = u
+
+# Case with multiple associations. Also worst-case scenario, since 9 operations
+# have to be performed with 6 joins in the tree.
+norm expect=(LeftAssociateJoinsLeft,LeftAssociateJoinsRight) format=hide-all
+SELECT *
+FROM xy
+INNER JOIN xy AS xy1 ON True
+INNER JOIN xy AS xy2 ON True
+INNER JOIN xy AS xy3 ON True
+INNER JOIN uv AS uv1 ON xy.x=uv1.u
+INNER JOIN uv AS uv2 ON xy.x=uv2.u
+INNER JOIN uv AS uv3 ON xy.x=uv3.u
+----
+inner-join (cross)
+ ├── scan xy3
+ ├── inner-join (cross)
+ │    ├── scan xy2
+ │    ├── inner-join (cross)
+ │    │    ├── scan xy1
+ │    │    ├── inner-join (hash)
+ │    │    │    ├── inner-join (hash)
+ │    │    │    │    ├── inner-join (hash)
+ │    │    │    │    │    ├── scan xy
+ │    │    │    │    │    ├── scan uv1
+ │    │    │    │    │    └── filters
+ │    │    │    │    │         └── xy.x = uv1.u
+ │    │    │    │    ├── scan uv2
+ │    │    │    │    └── filters
+ │    │    │    │         └── xy.x = uv2.u
+ │    │    │    ├── scan uv3
+ │    │    │    └── filters
+ │    │    │         └── xy.x = uv3.u
+ │    │    └── filters (true)
+ │    └── filters (true)
+ └── filters (true)
+
+# No-op case because the lower join isn't a cross join.
+norm expect-not=LeftAssociateJoinsLeft format=hide-all
+SELECT * FROM (SELECT * FROM xy INNER JOIN uv ON u=x)
+INNER JOIN a
+ON k=x
+----
+inner-join (hash)
+ ├── inner-join (hash)
+ │    ├── scan xy
+ │    ├── scan uv
+ │    └── filters
+ │         └── u = x
+ ├── scan a
+ └── filters
+      └── k = x
+
+# No-op case because the upper join is a cross join.
+norm expect-not=LeftAssociateJoinsLeft format=hide-all
+SELECT * FROM (SELECT * FROM xy INNER JOIN uv ON True)
+INNER JOIN a
+ON True
+----
+inner-join (cross)
+ ├── inner-join (cross)
+ │    ├── scan xy
+ │    ├── scan uv
+ │    └── filters (true)
+ ├── scan a
+ └── filters (true)
+
+# No-op case because the lower join has join hints.
+norm expect-not=LeftAssociateJoinsLeft format=hide-all
+SELECT * FROM (SELECT * FROM xy INNER MERGE JOIN uv ON True)
+INNER JOIN a
+ON k=x
+----
+inner-join (hash)
+ ├── inner-join (cross)
+ │    ├── flags: force merge join
+ │    ├── scan xy
+ │    ├── scan uv
+ │    └── filters (true)
+ ├── scan a
+ └── filters
+      └── k = x
+
+# No-op case because the upper join has join hints.
+norm expect-not=LeftAssociateJoinsLeft format=hide-all
+SELECT * FROM (SELECT * FROM xy INNER JOIN uv ON True)
+INNER MERGE JOIN a
+ON k=x
+----
+inner-join (hash)
+ ├── flags: force merge join
+ ├── inner-join (cross)
+ │    ├── scan xy
+ │    ├── scan uv
+ │    └── filters (true)
+ ├── scan a
+ └── filters
+      └── k = x
+
+# No-op case for LeftAssociateJoinsLeft because the upper filter is bound by the
+# lower join's right input (instead of left).
+norm expect-not=LeftAssociateJoinsLeft format=hide-all
+SELECT * FROM (SELECT * FROM xy INNER JOIN uv ON True)
+INNER JOIN a
+ON i=u
+----
+inner-join (cross)
+ ├── scan xy
+ ├── inner-join (hash)
+ │    ├── scan uv
+ │    ├── scan a
+ │    └── filters
+ │         └── i = u
+ └── filters (true)
+
+# No-op case for LeftAssociateJoinsLeft because the lower join is the right
+# input of the upper join.
+norm expect-not=LeftAssociateJoinsLeft format=hide-all
+SELECT * FROM a
+INNER JOIN (SELECT * FROM xy INNER JOIN uv ON True)
+ON k=x
+----
+inner-join (cross)
+ ├── inner-join (hash)
+ │    ├── scan a
+ │    ├── scan xy
+ │    └── filters
+ │         └── k = x
+ ├── scan uv
+ └── filters (true)

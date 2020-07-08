@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geos"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 )
@@ -53,13 +54,60 @@ func TestS2GeometryIndexBasic(t *testing.T) {
 		case "index-keys":
 			return keysToString(index.InvertedIndexKeys(ctx, shapes[nameArg(t, d)]))
 		case "inner-covering":
-			return cellUnionToString(index.testingInnerCovering(shapes[nameArg(t, d)]))
+			return cellUnionToString(index.TestingInnerCovering(shapes[nameArg(t, d)]))
 		case "covers":
 			return spansToString(index.Covers(ctx, shapes[nameArg(t, d)]))
 		case "intersects":
 			return spansToString(index.Intersects(ctx, shapes[nameArg(t, d)]))
 		case "covered-by":
 			return checkExprAndToString(index.CoveredBy(ctx, shapes[nameArg(t, d)]))
+		case "d-within":
+			var distance int
+			d.ScanArgs(t, "distance", &distance)
+			return spansToString(index.DWithin(ctx, shapes[nameArg(t, d)], float64(distance)))
+		case "d-fully-within":
+			var distance int
+			d.ScanArgs(t, "distance", &distance)
+			return spansToString(index.DFullyWithin(ctx, shapes[nameArg(t, d)], float64(distance)))
+		default:
+			return fmt.Sprintf("unknown command: %s", d.Cmd)
+		}
+	})
+}
+
+func TestClipEWKBByRect(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var g *geo.Geometry
+	var err error
+	datadriven.RunTest(t, "testdata/clip", func(t *testing.T, d *datadriven.TestData) string {
+		switch d.Cmd {
+		case "geometry":
+			g, err = geo.ParseGeometry(d.Input)
+			if err != nil {
+				return err.Error()
+			}
+			return ""
+		case "clip":
+			var xMin, yMin, xMax, yMax int
+			d.ScanArgs(t, "xmin", &xMin)
+			d.ScanArgs(t, "ymin", &yMin)
+			d.ScanArgs(t, "xmax", &xMax)
+			d.ScanArgs(t, "ymax", &yMax)
+			ewkb, err := geos.ClipEWKBByRect(
+				g.EWKB(), float64(xMin), float64(yMin), float64(xMax), float64(yMax))
+			if err != nil {
+				return err.Error()
+			}
+			// TODO(sumeer):
+			// - add WKB to WKT and print exact output
+			// - expand test with more inputs
+			return fmt.Sprintf(
+				"%d => %d (srid: %d)",
+				len(g.EWKB()),
+				len(ewkb),
+				g.SRID(),
+			)
 		default:
 			return fmt.Sprintf("unknown command: %s", d.Cmd)
 		}

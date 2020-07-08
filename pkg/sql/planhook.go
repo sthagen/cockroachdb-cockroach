@@ -71,6 +71,7 @@ func (p *planner) RunParams(ctx context.Context) runParams {
 type PlanHookState interface {
 	resolver.SchemaResolver
 	RunParams(ctx context.Context) runParams
+	SemaCtx() *tree.SemaContext
 	ExtendedEvalContext() *extendedEvalContext
 	SessionData() *sessiondata.SessionData
 	ExecCfg() *ExecutorConfig
@@ -91,10 +92,10 @@ type PlanHookState interface {
 	ResolveUncachedDatabaseByName(
 		ctx context.Context, dbName string, required bool) (*UncachedDatabaseDescriptor, error)
 	ResolveMutableTableDescriptor(
-		ctx context.Context, tn *TableName, required bool, requiredType resolver.ResolveRequiredType,
+		ctx context.Context, tn *TableName, required bool, requiredType tree.RequiredTableKind,
 	) (table *MutableTableDescriptor, err error)
 	ShowCreate(
-		ctx context.Context, dbPrefix string, allDescs []sqlbase.Descriptor, desc *sqlbase.TableDescriptor, displayOptions ShowCreateDisplayOptions,
+		ctx context.Context, dbPrefix string, allDescs []sqlbase.Descriptor, desc *sqlbase.ImmutableTableDescriptor, displayOptions ShowCreateDisplayOptions,
 	) (string, error)
 }
 

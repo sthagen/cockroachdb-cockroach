@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -75,7 +76,7 @@ func selectComment(ctx context.Context, p PlanHookState, tableID sqlbase.ID) (tc
 // statement used to create the given view. It is used in the implementation of
 // the crdb_internal.create_statements virtual table.
 func ShowCreateView(
-	ctx context.Context, tn *tree.Name, desc *sqlbase.TableDescriptor,
+	ctx context.Context, tn *tree.Name, desc *sqlbase.ImmutableTableDescriptor,
 ) (string, error) {
 	f := tree.NewFmtCtx(tree.FmtSimple)
 	f.WriteString("CREATE ")
@@ -98,7 +99,9 @@ func ShowCreateView(
 
 // showComments prints out the COMMENT statements sufficient to populate a
 // table's comments, including its index and column comments.
-func showComments(table *sqlbase.TableDescriptor, tc *tableComments, buf *bytes.Buffer) error {
+func showComments(
+	table *sqlbase.ImmutableTableDescriptor, tc *tableComments, buf *bytes.Buffer,
+) error {
 	if tc == nil {
 		return nil
 	}
@@ -136,7 +139,7 @@ func showComments(table *sqlbase.TableDescriptor, tc *tableComments, buf *bytes.
 func showForeignKeyConstraint(
 	buf *bytes.Buffer,
 	dbPrefix string,
-	originTable *sqlbase.TableDescriptor,
+	originTable *sqlbase.ImmutableTableDescriptor,
 	fk *sqlbase.ForeignKeyConstraint,
 	lCtx simpleSchemaResolver,
 ) error {
@@ -156,8 +159,8 @@ func showForeignKeyConstraint(
 		if err != nil {
 			return err
 		}
-		fkTableName = tree.MakeTableName(tree.Name(fkDb.Name), tree.Name(fkTable.Name))
-		fkTableName.ExplicitSchema = fkDb.Name != dbPrefix
+		fkTableName = tree.MakeTableName(tree.Name(fkDb.GetName()), tree.Name(fkTable.Name))
+		fkTableName.ExplicitSchema = fkDb.GetName() != dbPrefix
 		originNames, err = originTable.NamesForColumnIDs(fk.OriginColumnIDs)
 		if err != nil {
 			return err
@@ -196,7 +199,7 @@ func showForeignKeyConstraint(
 // ShowCreateSequence returns a valid SQL representation of the
 // CREATE SEQUENCE statement used to create the given sequence.
 func ShowCreateSequence(
-	ctx context.Context, tn *tree.Name, desc *sqlbase.TableDescriptor,
+	ctx context.Context, tn *tree.Name, desc *sqlbase.ImmutableTableDescriptor,
 ) (string, error) {
 	f := tree.NewFmtCtx(tree.FmtSimple)
 	f.WriteString("CREATE ")
@@ -218,7 +221,7 @@ func ShowCreateSequence(
 
 // showFamilyClause creates the FAMILY clauses for a CREATE statement, writing them
 // to tree.FmtCtx f
-func showFamilyClause(desc *sqlbase.TableDescriptor, f *tree.FmtCtx) {
+func showFamilyClause(desc *sqlbase.ImmutableTableDescriptor, f *tree.FmtCtx) {
 	for _, fam := range desc.Families {
 		activeColumnNames := make([]string, 0, len(fam.ColumnNames))
 		for i, colID := range fam.ColumnIDs {
@@ -283,7 +286,7 @@ func showCreateInterleave(
 func ShowCreatePartitioning(
 	a *sqlbase.DatumAlloc,
 	codec keys.SQLCodec,
-	tableDesc *sqlbase.TableDescriptor,
+	tableDesc sqlbase.TableDescriptorInterface,
 	idxDesc *sqlbase.IndexDescriptor,
 	partDesc *sqlbase.PartitioningDescriptor,
 	buf *bytes.Buffer,
@@ -335,7 +338,7 @@ func ShowCreatePartitioning(
 				buf.WriteString(`, `)
 			}
 			tuple, _, err := sqlbase.DecodePartitionTuple(
-				a, codec, tableDesc, idxDesc, partDesc, values, fakePrefixDatums)
+				a, codec, tableDesc.TableDesc(), idxDesc, partDesc, values, fakePrefixDatums)
 			if err != nil {
 				return err
 			}
@@ -359,14 +362,14 @@ func ShowCreatePartitioning(
 		buf.WriteString(part.Name)
 		buf.WriteString(" VALUES FROM ")
 		fromTuple, _, err := sqlbase.DecodePartitionTuple(
-			a, codec, tableDesc, idxDesc, partDesc, part.FromInclusive, fakePrefixDatums)
+			a, codec, tableDesc.TableDesc(), idxDesc, partDesc, part.FromInclusive, fakePrefixDatums)
 		if err != nil {
 			return err
 		}
 		buf.WriteString(fromTuple.String())
 		buf.WriteString(" TO ")
 		toTuple, _, err := sqlbase.DecodePartitionTuple(
-			a, codec, tableDesc, idxDesc, partDesc, part.ToExclusive, fakePrefixDatums)
+			a, codec, tableDesc.TableDesc(), idxDesc, partDesc, part.ToExclusive, fakePrefixDatums)
 		if err != nil {
 			return err
 		}
@@ -380,7 +383,12 @@ func ShowCreatePartitioning(
 
 // showConstraintClause creates the CONSTRAINT clauses for a CREATE statement,
 // writing them to tree.FmtCtx f
-func showConstraintClause(desc *sqlbase.TableDescriptor, f *tree.FmtCtx) {
+func showConstraintClause(
+	ctx context.Context,
+	desc *sqlbase.ImmutableTableDescriptor,
+	semaCtx *tree.SemaContext,
+	f *tree.FmtCtx,
+) error {
 	for _, e := range desc.AllActiveAndInactiveChecks() {
 		if e.Hidden {
 			continue
@@ -392,8 +400,13 @@ func showConstraintClause(desc *sqlbase.TableDescriptor, f *tree.FmtCtx) {
 			f.WriteString(" ")
 		}
 		f.WriteString("CHECK (")
-		f.WriteString(e.Expr)
+		typed, err := schemaexpr.DeserializeTableDescExpr(ctx, semaCtx, desc, e.Expr)
+		if err != nil {
+			return err
+		}
+		f.WriteString(tree.SerializeForDisplay(typed))
 		f.WriteString(")")
 	}
 	f.WriteString("\n)")
+	return nil
 }

@@ -18,7 +18,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -38,9 +38,6 @@ func initAggregateBuiltins() {
 			panic("duplicate builtin: " + k)
 		}
 
-		if !v.props.Impure {
-			panic(fmt.Sprintf("%s: aggregate functions should all be impure, found %v", k, v))
-		}
 		if v.props.Class != tree.AggregateClass {
 			panic(fmt.Sprintf("%s: aggregate functions should be marked with the tree.AggregateClass "+
 				"function class, found %v", k, v))
@@ -61,7 +58,7 @@ func initAggregateBuiltins() {
 }
 
 func aggProps() tree.FunctionProperties {
-	return tree.FunctionProperties{Class: tree.AggregateClass, Impure: true}
+	return tree.FunctionProperties{Class: tree.AggregateClass}
 }
 
 func aggPropsNullableArgs() tree.FunctionProperties {
@@ -335,8 +332,14 @@ var aggregates = map[string]builtinDefinition{
 			"Aggregates values as a JSON or JSONB array.", tree.VolatilityStable),
 	),
 
-	"json_object_agg":  makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 33285, Class: tree.AggregateClass, Impure: true}),
-	"jsonb_object_agg": makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 33285, Class: tree.AggregateClass, Impure: true}),
+	"json_object_agg": makeBuiltin(aggPropsNullableArgs(),
+		makeAggOverload([]*types.T{types.String, types.Any}, types.Jsonb, newJSONObjectAggregate,
+			"Aggregates values as a JSON or JSONB object.", tree.VolatilityStable),
+	),
+	"jsonb_object_agg": makeBuiltin(aggPropsNullableArgs(),
+		makeAggOverload([]*types.T{types.String, types.Any}, types.Jsonb, newJSONObjectAggregate,
+			"Aggregates values as a JSON or JSONB object.", tree.VolatilityStable),
+	),
 
 	AnyNotNull: makePrivate(makeBuiltin(aggProps(),
 		makeAggOverloadWithReturnType(
@@ -607,6 +610,7 @@ const sizeOfBoolOrAggregate = int64(unsafe.Sizeof(boolOrAggregate{}))
 const sizeOfBytesXorAggregate = int64(unsafe.Sizeof(bytesXorAggregate{}))
 const sizeOfIntXorAggregate = int64(unsafe.Sizeof(intXorAggregate{}))
 const sizeOfJSONAggregate = int64(unsafe.Sizeof(jsonAggregate{}))
+const sizeOfJSONObjectAggregate = int64(unsafe.Sizeof(jsonObjectAggregate{}))
 const sizeOfIntBitAndAggregate = int64(unsafe.Sizeof(intBitAndAggregate{}))
 const sizeOfBitBitAndAggregate = int64(unsafe.Sizeof(bitBitAndAggregate{}))
 const sizeOfIntBitOrAggregate = int64(unsafe.Sizeof(intBitOrAggregate{}))
@@ -1717,12 +1721,12 @@ func (a *intSumAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.D
 				// And overflow was detected; go to large integers, but keep the
 				// sum computed so far.
 				a.large = true
-				a.decSum.SetFinite(a.intSum, 0)
+				a.decSum.SetInt64(a.intSum)
 			}
 		}
 
 		if a.large {
-			a.tmpDec.SetFinite(t, 0)
+			a.tmpDec.SetInt64(t)
 			_, err := tree.ExactCtx.Add(&a.decSum, &a.decSum, &a.tmpDec)
 			if err != nil {
 				return err
@@ -1745,7 +1749,7 @@ func (a *intSumAggregate) Result() (tree.Datum, error) {
 	if a.large {
 		dd.Set(&a.decSum)
 	} else {
-		dd.SetFinite(a.intSum, 0)
+		dd.SetInt64(a.intSum)
 	}
 	return dd, nil
 }
@@ -1815,7 +1819,7 @@ func (a *decimalSumAggregate) Result() (tree.Datum, error) {
 
 // Reset implements tree.AggregateFunc interface.
 func (a *decimalSumAggregate) Reset(ctx context.Context) {
-	a.sum.SetFinite(0, 0)
+	a.sum.SetInt64(0)
 	a.sawNonNull = false
 	a.reset(ctx)
 }
@@ -1951,7 +1955,7 @@ func (a *intSqrDiffAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tr
 		return nil
 	}
 
-	a.tmpDec.SetFinite(int64(tree.MustBeDInt(datum)), 0)
+	a.tmpDec.SetInt64(int64(tree.MustBeDInt(datum)))
 	return a.agg.Add(ctx, &a.tmpDec)
 }
 
@@ -2121,9 +2125,9 @@ func (a *decimalSqrDiffAggregate) Result() (tree.Datum, error) {
 
 // Reset implements tree.AggregateFunc interface.
 func (a *decimalSqrDiffAggregate) Reset(ctx context.Context) {
-	a.count.SetFinite(0, 0)
-	a.mean.SetFinite(0, 0)
-	a.sqrDiff.SetFinite(0, 0)
+	a.count.SetInt64(0)
+	a.mean.SetInt64(0)
+	a.sqrDiff.SetInt64(0)
 	a.reset(ctx)
 }
 
@@ -2317,9 +2321,9 @@ func (a *decimalSumSqrDiffsAggregate) Result() (tree.Datum, error) {
 
 // Reset implements tree.AggregateFunc interface.
 func (a *decimalSumSqrDiffsAggregate) Reset(ctx context.Context) {
-	a.count.SetFinite(0, 0)
-	a.mean.SetFinite(0, 0)
-	a.sqrDiff.SetFinite(0, 0)
+	a.count.SetInt64(0)
+	a.mean.SetInt64(0)
+	a.sqrDiff.SetInt64(0)
 	a.reset(ctx)
 }
 
@@ -3020,4 +3024,79 @@ func (a *percentileContAggregate) Close(ctx context.Context) {
 // Size is part of the tree.AggregateFunc interface.
 func (a *percentileContAggregate) Size() int64 {
 	return sizeOfPercentileContAggregate
+}
+
+type jsonObjectAggregate struct {
+	singleDatumAggregateBase
+
+	loc        *time.Location
+	builder    *json.ObjectBuilderWithCounter
+	sawNonNull bool
+}
+
+func newJSONObjectAggregate(
+	_ []*types.T, evalCtx *tree.EvalContext, _ tree.Datums,
+) tree.AggregateFunc {
+	return &jsonObjectAggregate{
+		singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx),
+		loc:                      evalCtx.GetLocation(),
+		builder:                  json.NewObjectBuilderWithCounter(),
+		sawNonNull:               false,
+	}
+}
+
+// Add accumulates the transformed json into the JSON object.
+func (a *jsonObjectAggregate) Add(
+	ctx context.Context, datum tree.Datum, others ...tree.Datum,
+) error {
+	if len(others) != 1 {
+		return errors.Errorf("wrong number of arguments, expected key/value pair")
+	}
+
+	// If the key datum is NULL, return an error.
+	if datum == tree.DNull {
+		return pgerror.New(pgcode.InvalidParameterValue,
+			"field name must not be null")
+	}
+
+	key, err := asJSONBuildObjectKey(datum, a.loc)
+	if err != nil {
+		return err
+	}
+	val, err := tree.AsJSON(others[0], a.loc)
+	if err != nil {
+		return err
+	}
+	a.builder.Add(key, val)
+	if err = a.updateMemoryUsage(ctx, int64(a.builder.Size())); err != nil {
+		return err
+	}
+	a.sawNonNull = true
+	return nil
+}
+
+// Result returns a DJSON from the array of JSON.
+func (a *jsonObjectAggregate) Result() (tree.Datum, error) {
+	if a.sawNonNull {
+		return tree.NewDJSON(a.builder.Build()), nil
+	}
+	return tree.DNull, nil
+}
+
+// Reset implements tree.AggregateFunc interface.
+func (a *jsonObjectAggregate) Reset(ctx context.Context) {
+	a.builder = json.NewObjectBuilderWithCounter()
+	a.sawNonNull = false
+	a.reset(ctx)
+}
+
+// Close allows the aggregate to release the memory it requested during
+// operation.
+func (a *jsonObjectAggregate) Close(ctx context.Context) {
+	a.close(ctx)
+}
+
+// Size is part of the tree.AggregateFunc interface.
+func (a *jsonObjectAggregate) Size() int64 {
+	return sizeOfJSONObjectAggregate
 }

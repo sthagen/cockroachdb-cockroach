@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -120,7 +121,12 @@ func TestAggregatorAgainstProcessor(t *testing.T) {
 					GroupCols:    groupingCols[:numGroupingCols],
 					Aggregations: aggregations,
 				}
-				if !hashAgg {
+				if hashAgg {
+					// Let's shuffle the rows for the hash aggregator.
+					rand.Shuffle(nRows, func(i, j int) {
+						rows[i], rows[j] = rows[j], rows[i]
+					})
+				} else {
 					aggregatorSpec.OrderedGroupCols = groupingCols[:numGroupingCols]
 					orderedCols := execinfrapb.ConvertToColumnOrdering(
 						execinfrapb.Ordering{Columns: orderingCols[:numGroupingCols]},
@@ -884,7 +890,7 @@ func TestWindowFunctionsAgainstProcessor(t *testing.T) {
 		// window functions that take in arguments.
 		typs[i] = types.Int
 	}
-	for windowFn := range colexec.SupportedWindowFns {
+	for windowFn := range colbuilder.SupportedWindowFns {
 		for _, partitionBy := range [][]uint32{
 			{},     // No PARTITION BY clause.
 			{0},    // Partitioning on the first input column.
@@ -909,6 +915,7 @@ func TestWindowFunctionsAgainstProcessor(t *testing.T) {
 								Func:         execinfrapb.WindowerSpec_Func{WindowFunc: &windowFn},
 								Ordering:     generateOrderingGivenPartitionBy(rng, nCols, nOrderingCols, partitionBy),
 								OutputColIdx: uint32(nCols),
+								FilterColIdx: tree.NoColumnIdx,
 							},
 						},
 					}

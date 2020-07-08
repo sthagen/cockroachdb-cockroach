@@ -11,6 +11,7 @@ package changefeedccl
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"math/rand"
 	"net/url"
 	"sort"
@@ -29,10 +30,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -259,7 +261,7 @@ func changefeedPlanHook(
 			var nilOracle timestampLowerBoundOracle
 			canarySink, err := getSink(
 				ctx, details.SinkURI, nodeID, details.Opts, details.Targets,
-				settings, nilOracle, p.ExecCfg().DistSQLSrv.ExternalStorageFromURI,
+				settings, nilOracle, p.ExecCfg().DistSQLSrv.ExternalStorageFromURI, p.User(),
 			)
 			if err != nil {
 				return MaybeStripRetryableErrorMarker(err)
@@ -363,7 +365,7 @@ func changefeedPlanHook(
 func changefeedJobDescription(
 	p sql.PlanHookState, changefeed *tree.CreateChangefeed, sinkURI string, opts map[string]string,
 ) (string, error) {
-	cleanedSinkURI, err := cloud.SanitizeExternalStorageURI(sinkURI, []string{changefeedbase.SinkParamSASLPassword})
+	cleanedSinkURI, err := cloudimpl.SanitizeExternalStorageURI(sinkURI, []string{changefeedbase.SinkParamSASLPassword})
 	if err != nil {
 		return "", err
 	}
@@ -571,6 +573,16 @@ func (b *changefeedResumer) Resume(
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+
+			if flowinfra.IsFlowRetryableError(err) {
+				// We don't want to retry flowinfra retryable error in the retry loop above.
+				// This error currently indicates that this node is being drained.  As such,
+				// retries will not help.
+				// Instead, we want to make sure that the changefeed job is not marked failed
+				// due to a transient, retryable error.
+				err = jobs.NewRetryJobError(fmt.Sprintf("retryable flow error: %+v", err))
+			}
+
 			log.Warningf(ctx, `CHANGEFEED job %d returning with error: %+v`, jobID, err)
 			return err
 		}

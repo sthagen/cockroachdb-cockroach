@@ -24,18 +24,9 @@ import (
 // This file contains common functions for the three writers, Inserter, Deleter
 // and Updater.
 
-type checkFKConstraints bool
-
-const (
-	// CheckFKs can be passed to row writers to check fk validity.
-	CheckFKs checkFKConstraints = true
-	// SkipFKs can be passed to row writer to skip fk validity checks.
-	SkipFKs checkFKConstraints = false
-)
-
 // ColIDtoRowIndexFromCols groups a slice of ColumnDescriptors by their ID
-// field, returning a map from ID to ColumnDescriptor. It assumes there are no
-// duplicate descriptors in the input.
+// field, returning a map from ID to the index of the column in the input slice.
+// It assumes there are no duplicate descriptors in the input.
 func ColIDtoRowIndexFromCols(cols []sqlbase.ColumnDescriptor) map[sqlbase.ColumnID]int {
 	colIDtoRowIndex := make(map[sqlbase.ColumnID]int, len(cols))
 	for i := range cols {

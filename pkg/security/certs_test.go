@@ -22,14 +22,29 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 const testKeySize = 1024
+
+// tempDir is like testutils.TempDir but avoids a circular import.
+func tempDir(t *testing.T) (string, func()) {
+	certsDir, err := ioutil.TempDir("", "certs_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certsDir, func() {
+		if err := os.RemoveAll(certsDir); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func TestGenerateCACert(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -37,15 +52,8 @@ func TestGenerateCACert(t *testing.T) {
 	security.ResetAssetLoader()
 	defer ResetTest()
 
-	certsDir, err := ioutil.TempDir("", "certs_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := os.RemoveAll(certsDir); err != nil {
-			t.Fatal(err)
-		}
-	}()
+	certsDir, cleanup := tempDir(t)
+	defer cleanup()
 
 	cm, err := security.NewCertificateManager(certsDir)
 	if err != nil {
@@ -106,6 +114,92 @@ func TestGenerateCACert(t *testing.T) {
 			t.Errorf("#%d: expected %d certificates, found %d", i, tc.numCerts, actual)
 		}
 	}
+}
+
+func TestGenerateTenantCerts(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// Do not mock cert access for this test.
+	security.ResetAssetLoader()
+	defer ResetTest()
+
+	certsDir, cleanup := tempDir(t)
+	defer cleanup()
+
+	{
+		caKeyFile := filepath.Join(certsDir, "irrelevant.key")
+		require.NoError(t, security.CreateTenantServerCAPair(
+			certsDir,
+			caKeyFile,
+			testKeySize,
+			48*time.Hour,
+			false, // allowKeyReuse
+			false, // overwrite
+		))
+
+		require.NoError(t, security.CreateTenantServerPair(
+			certsDir,
+			caKeyFile,
+			testKeySize,
+			time.Hour,
+			false, // overwrite
+			[]string{"127.0.0.1"},
+		))
+	}
+
+	caKeyFile := filepath.Join(certsDir, "name-must-not-matter.key")
+	require.NoError(t, security.CreateTenantClientCAPair(
+		certsDir,
+		caKeyFile,
+		testKeySize,
+		48*time.Hour,
+		false, // allowKeyReuse
+		false, // overwrite
+	))
+
+	cp, err := security.CreateTenantClientPair(
+		certsDir,
+		caKeyFile,
+		testKeySize,
+		time.Hour,
+		"999",
+	)
+	require.NoError(t, err)
+	require.NoError(t, security.WriteTenantClientPair(certsDir, cp, false))
+
+	cl := security.NewCertificateLoader(certsDir)
+	require.NoError(t, cl.Load())
+	infos := cl.Certificates()
+	for _, info := range infos {
+		require.NoError(t, info.Error)
+	}
+
+	for i := range infos {
+		// Scrub the struct to retain only tested fields.
+		*infos[i] = security.CertInfo{
+			FileUsage: infos[i].FileUsage,
+			Filename:  infos[i].Filename,
+			Name:      infos[i].Name,
+		}
+	}
+	require.Equal(t, []*security.CertInfo{
+		{
+			FileUsage: security.TenantClientCAPem,
+			Filename:  "ca-client-tenant.crt",
+		},
+		{
+			FileUsage: security.TenantServerCAPem,
+			Filename:  "ca-server-tenant.crt",
+		},
+		{
+			FileUsage: security.TenantClientPem,
+			Filename:  "client-tenant.999.crt",
+			Name:      "999",
+		},
+		{
+			FileUsage: security.TenantServerPem,
+			Filename:  "server-tenant.crt",
+		},
+	}, infos)
 }
 
 func TestGenerateNodeCerts(t *testing.T) {
@@ -288,7 +382,8 @@ func TestUseCerts(t *testing.T) {
 	// Insecure mode.
 	clientContext := testutils.NewNodeTestBaseContext()
 	clientContext.Insecure = true
-	httpClient, err := clientContext.GetHTTPClient()
+	sCtx := rpc.MakeSecurityContext(clientContext)
+	httpClient, err := sCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +401,10 @@ func TestUseCerts(t *testing.T) {
 	// New client. With certs this time.
 	clientContext = testutils.NewNodeTestBaseContext()
 	clientContext.SSLCertsDir = certsDir
-	httpClient, err = clientContext.GetHTTPClient()
+	{
+		secondSCtx := rpc.MakeSecurityContext(clientContext)
+		httpClient, err = secondSCtx.GetHTTPClient()
+	}
 	if err != nil {
 		t.Fatalf("Expected success, got %v", err)
 	}
@@ -374,7 +472,8 @@ func TestUseSplitCACerts(t *testing.T) {
 	// Insecure mode.
 	clientContext := testutils.NewNodeTestBaseContext()
 	clientContext.Insecure = true
-	httpClient, err := clientContext.GetHTTPClient()
+	sCtx := rpc.MakeSecurityContext(clientContext)
+	httpClient, err := sCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +491,10 @@ func TestUseSplitCACerts(t *testing.T) {
 	// New client. With certs this time.
 	clientContext = testutils.NewNodeTestBaseContext()
 	clientContext.SSLCertsDir = certsDir
-	httpClient, err = clientContext.GetHTTPClient()
+	{
+		secondSCtx := rpc.MakeSecurityContext(clientContext)
+		httpClient, err = secondSCtx.GetHTTPClient()
+	}
 	if err != nil {
 		t.Fatalf("Expected success, got %v", err)
 	}
@@ -494,7 +596,8 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 	// Insecure mode.
 	clientContext := testutils.NewNodeTestBaseContext()
 	clientContext.Insecure = true
-	httpClient, err := clientContext.GetHTTPClient()
+	sCtx := rpc.MakeSecurityContext(clientContext)
+	httpClient, err := sCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +615,10 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 	// New client with certs, but the UI CA is gone, we have no way to verify the Admin UI cert.
 	clientContext = testutils.NewNodeTestBaseContext()
 	clientContext.SSLCertsDir = certsDir
-	httpClient, err = clientContext.GetHTTPClient()
+	{
+		secondCtx := rpc.MakeSecurityContext(clientContext)
+		httpClient, err = secondCtx.GetHTTPClient()
+	}
 	if err != nil {
 		t.Fatalf("Expected success, got %v", err)
 	}

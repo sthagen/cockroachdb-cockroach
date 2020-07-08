@@ -13,10 +13,10 @@ package exec
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -56,8 +56,9 @@ type Factory interface {
 	// ConstructScan returns a node that represents a scan of the given index on
 	// the given table.
 	//   - Only the given set of needed columns are part of the result.
-	//   - If indexConstraint is not nil, the scan is restricted to the spans in
-	//     in the constraint.
+	//   - If indexConstraint or invertedConstraint are not nil, the scan is
+	//     restricted to the spans in in the constraint. Only one of the two may
+	//     be non-nil.
 	//   - If hardLimit > 0, then the scan returns only up to hardLimit rows.
 	//   - If softLimit > 0, then the scan may be required to return up to all
 	//     of its rows (or up to the hardLimit if it is set), but can be optimized
@@ -71,6 +72,7 @@ type Factory interface {
 		index cat.Index,
 		needed TableColumnOrdinalSet,
 		indexConstraint *constraint.Constraint,
+		invertedConstraint invertedexpr.InvertedSpans,
 		hardLimit int64,
 		softLimit int64,
 		reverse bool,
@@ -83,6 +85,14 @@ type Factory interface {
 	// ConstructFilter returns a node that applies a filter on the results of
 	// the given input node.
 	ConstructFilter(n Node, filter tree.TypedExpr, reqOrdering OutputOrdering) (Node, error)
+
+	// ConstructInvertedFilter returns a node that applies a span expression on
+	// the results of the given input node.
+	ConstructInvertedFilter(
+		n Node,
+		invFilter *invertedexpr.SpanExpression,
+		invColumn NodeColumnOrdinal,
+	) (Node, error)
 
 	// ConstructSimpleProject returns a node that applies a "simple" projection on the
 	// results of the given input node. A simple projection is one that does not
@@ -232,22 +242,22 @@ type Factory interface {
 		reqOrdering OutputOrdering,
 	) (Node, error)
 
-	// ConstructGeoLookupJoin returns a node that performs a geospatial lookup
-	// join. geoRelationshipType describes the type of geospatial relationship
-	// represented by the join. geoCol is the geospatial column from the input
-	// that will be used to look up into the index; lookupCols are ordinals for
-	// the table columns we are retrieving.
+	// ConstructInvertedJoin returns a node that performs an inverted join.
+	// invertedExpr is used along with inputCol (a column from the input) to
+	// find the keys to look up in the index; lookupCols are ordinals for the
+	// table columns we are retrieving.
 	//
 	// The node produces the columns in the input and (unless join type is
 	// LeftSemiJoin or LeftAntiJoin) the lookupCols, ordered by ordinal. The ON
-	// condition can refer to these using IndexedVars.
-	ConstructGeoLookupJoin(
+	// condition can refer to these using IndexedVars. Note that lookupCols
+	// includes the inverted column.
+	ConstructInvertedJoin(
 		joinType sqlbase.JoinType,
-		geoRelationshipType geoindex.RelationshipType,
+		invertedExpr tree.TypedExpr,
 		input Node,
 		table cat.Table,
 		index cat.Index,
-		geoCol NodeColumnOrdinal,
+		inputCol NodeColumnOrdinal,
 		lookupCols TableColumnOrdinalSet,
 		onCond tree.TypedExpr,
 		reqOrdering OutputOrdering,
@@ -337,10 +347,6 @@ type Factory interface {
 	// transaction (if appropriate, i.e. if it is in an implicit transaction).
 	// This is false if there are multiple mutations in a statement, or the output
 	// of the mutation is processed through side-effecting expressions.
-	//
-	// If skipFKChecks is set, foreign keys are not checked as part of the
-	// execution of the insertion. This is used when the FK checks are planned by
-	// the optimizer and are run separately as plan checks.
 	ConstructInsert(
 		input Node,
 		table cat.Table,
@@ -348,7 +354,6 @@ type Factory interface {
 		returnCols TableColumnOrdinalSet,
 		checkCols CheckOrdinalSet,
 		allowAutoCommit bool,
-		skipFKChecks bool,
 	) (Node, error)
 
 	// ConstructInsertFastPath creates a node that implements a special (but very
@@ -394,10 +399,6 @@ type Factory interface {
 	// transaction (if appropriate, i.e. if it is in an implicit transaction).
 	// This is false if there are multiple mutations in a statement, or the output
 	// of the mutation is processed through side-effecting expressions.
-	//
-	// If skipFKChecks is set, foreign keys are not checked as part of the
-	// execution of the insertion. This is used when the FK checks are planned by
-	// the optimizer and are run separately as plan checks.
 	ConstructUpdate(
 		input Node,
 		table cat.Table,
@@ -407,7 +408,6 @@ type Factory interface {
 		checks CheckOrdinalSet,
 		passthrough sqlbase.ResultColumns,
 		allowAutoCommit bool,
-		skipFKChecks bool,
 	) (Node, error)
 
 	// ConstructUpsert creates a node that implements an INSERT..ON CONFLICT or
@@ -438,11 +438,6 @@ type Factory interface {
 	// transaction (if appropriate, i.e. if it is in an implicit transaction).
 	// This is false if there are multiple mutations in a statement, or the output
 	// of the mutation is processed through side-effecting expressions.
-	//
-	// If skipFKChecks is set, foreign keys are not checked as part of the
-	// execution of the upsert for the insert half. This is used when the FK
-	// checks are planned by the optimizer and are run separately as plan
-	// checks.
 	ConstructUpsert(
 		input Node,
 		table cat.Table,
@@ -453,7 +448,6 @@ type Factory interface {
 		returnCols TableColumnOrdinalSet,
 		checks CheckOrdinalSet,
 		allowAutoCommit bool,
-		skipFKChecks bool,
 	) (Node, error)
 
 	// ConstructDelete creates a node that implements a DELETE statement. The
@@ -468,17 +462,12 @@ type Factory interface {
 	// transaction (if appropriate, i.e. if it is in an implicit transaction).
 	// This is false if there are multiple mutations in a statement, or the output
 	// of the mutation is processed through side-effecting expressions.
-	//
-	// If skipFKChecks is set, foreign keys are not checked as part of the
-	// execution of the delete. This is used when the FK checks are planned
-	// by the optimizer and are run separately as plan checks.
 	ConstructDelete(
 		input Node,
 		table cat.Table,
 		fetchCols TableColumnOrdinalSet,
 		returnCols TableColumnOrdinalSet,
 		allowAutoCommit bool,
-		skipFKChecks bool,
 	) (Node, error)
 
 	// ConstructDeleteRange creates a node that efficiently deletes contiguous
@@ -661,7 +650,6 @@ type CheckOrdinalSet = util.FastIntSet
 // AggInfo represents an aggregation (see ConstructGroupBy).
 type AggInfo struct {
 	FuncName   string
-	Builtin    *tree.Overload
 	Distinct   bool
 	ResultType *types.T
 	ArgCols    []NodeColumnOrdinal

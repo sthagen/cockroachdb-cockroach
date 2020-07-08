@@ -571,8 +571,10 @@ func (b *BoundAccount) Grow(ctx context.Context, x int64) error {
 // Shrink releases part of the cumulated allocations by the specified size.
 func (b *BoundAccount) Shrink(ctx context.Context, delta int64) {
 	if b.used < delta {
-		panic(fmt.Sprintf("%s: no bytes in account to release, current %d, free %d",
-			b.mon.name, b.used, delta))
+		log.ReportOrPanic(ctx, &b.mon.settings.SV,
+			"%s: no bytes in account to release, current %d, free %d",
+			b.mon.name, b.used, delta)
+		delta = b.used
 	}
 	b.used -= delta
 	b.reserved += delta
@@ -591,9 +593,12 @@ func (mm *BytesMonitor) reserveBytes(ctx context.Context, x int64) error {
 	// Check the local limit first. NB: The condition is written in this manner
 	// so that it handles overflow correctly. Consider what happens if
 	// x==math.MaxInt64. mm.limit-x will be a large negative number.
+	//
+	// TODO(knz): make the monitor name reportable in telemetry, after checking
+	// that the name is never constructed from user data.
 	if mm.mu.curAllocated > mm.limit-x {
-		return errors.Wrap(
-			mm.resource.NewBudgetExceededError(x, mm.mu.curAllocated, mm.limit), mm.name,
+		return errors.Wrapf(
+			mm.resource.NewBudgetExceededError(x, mm.mu.curAllocated, mm.limit), "%s", mm.name,
 		)
 	}
 	// Check whether we need to request an increase of our budget.
@@ -663,8 +668,10 @@ func (mm *BytesMonitor) releaseBytes(ctx context.Context, sz int64) {
 func (mm *BytesMonitor) increaseBudget(ctx context.Context, minExtra int64) error {
 	// NB: mm.mu Already locked by reserveBytes().
 	if mm.mu.curBudget.mon == nil {
-		return errors.Wrap(mm.resource.NewBudgetExceededError(
-			minExtra, mm.mu.curAllocated, mm.reserved.used), mm.name,
+		// TODO(knz): make the monitor name reportable in telemetry, after checking
+		// that the name is never constructed from user data.
+		return errors.Wrapf(mm.resource.NewBudgetExceededError(
+			minExtra, mm.mu.curAllocated, mm.reserved.used), "%s", mm.name,
 		)
 	}
 	if log.V(2) {

@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -31,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -50,6 +48,14 @@ var createStatsPostEvents = settings.RegisterPublicBoolSetting(
 func (p *planner) CreateStatistics(ctx context.Context, n *tree.CreateStats) (planNode, error) {
 	return &createStatsNode{
 		CreateStats: *n,
+		p:           p,
+	}, nil
+}
+
+// Analyze is syntactic sugar for CreateStatistics.
+func (p *planner) Analyze(ctx context.Context, n *tree.Analyze) (planNode, error) {
+	return &createStatsNode{
+		CreateStats: tree.CreateStats{Table: n.Table},
 		p:           p,
 	}, nil
 }
@@ -148,7 +154,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 	var err error
 	switch t := n.Table.(type) {
 	case *tree.UnresolvedObjectName:
-		tableDesc, err = n.p.ResolveExistingObjectEx(ctx, t, true /*required*/, resolver.ResolveRequireTableDesc)
+		tableDesc, err = n.p.ResolveExistingObjectEx(ctx, t, true /*required*/, tree.ResolveRequireTableDesc)
 		if err != nil {
 			return nil, err
 		}
@@ -199,18 +205,26 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 
 		columnIDs := make([]sqlbase.ColumnID, len(columns))
 		for i := range columns {
-			if columns[i].Type.Family() == types.JsonFamily {
-				return nil, unimplemented.NewWithIssuef(35844,
-					"CREATE STATISTICS is not supported for JSON columns")
-			}
 			columnIDs[i] = columns[i].ID
 		}
-		colStats = []jobspb.CreateStatsDetails_ColStat{{ColumnIDs: columnIDs, HasHistogram: false}}
-		if len(columnIDs) == 1 && columns[0].Type.Family() != types.ArrayFamily {
+		col, err := tableDesc.FindColumnByID(columnIDs[0])
+		if err != nil {
+			return nil, err
+		}
+		isInvIndex := sqlbase.ColumnTypeIsInvertedIndexable(col.Type)
+		colStats = []jobspb.CreateStatsDetails_ColStat{{
+			ColumnIDs: columnIDs,
 			// By default, create histograms on all explicitly requested column stats
-			// with a single column. (We cannot create histograms on array columns
-			// because we do not support key encoding arrays.)
-			colStats[0].HasHistogram = true
+			// with a single column that doesn't use an inverted index.
+			HasHistogram: len(columnIDs) == 1 && !isInvIndex,
+		}}
+		// Make histograms for inverted index column types.
+		if len(columnIDs) == 1 && isInvIndex {
+			colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
+				ColumnIDs:    columnIDs,
+				HasHistogram: true,
+				Inverted:     true,
+			})
 		}
 	}
 
@@ -285,48 +299,60 @@ func createStatsDefaultColumns(
 			break
 		}
 
+		colIDs := desc.PrimaryIndex.ColumnIDs[: i+1 : i+1]
+
 		// Remember the requested stats so we don't request duplicates.
-		key := makeColStatKey(desc.PrimaryIndex.ColumnIDs[: i+1 : i+1])
+		key := makeColStatKey(colIDs)
 		requestedStats[key] = struct{}{}
 
 		colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
-			ColumnIDs:    desc.PrimaryIndex.ColumnIDs[: i+1 : i+1],
+			ColumnIDs:    colIDs,
 			HasHistogram: i == 0,
 		})
 	}
 
 	// Add column stats for each secondary index.
 	for i := range desc.Indexes {
-		if desc.Indexes[i].Type == sqlbase.IndexDescriptor_INVERTED {
-			// We don't yet support stats on inverted indexes.
-			continue
-		}
 		for j := range desc.Indexes[i].ColumnIDs {
 			if j != 0 && !multiColEnabled {
 				break
 			}
 
+			colIDs := desc.Indexes[i].ColumnIDs[: j+1 : j+1]
+
 			// Check for existing stats and remember the requested stats.
-			key := makeColStatKey(desc.Indexes[i].ColumnIDs[: j+1 : j+1])
+			key := makeColStatKey(colIDs)
 			if _, ok := requestedStats[key]; ok {
 				continue
 			}
 			requestedStats[key] = struct{}{}
 
-			colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
-				ColumnIDs:    desc.Indexes[i].ColumnIDs[: j+1 : j+1],
-				HasHistogram: j == 0,
-			})
+			// Only generate a histogram for forward indexes.
+			colStat := jobspb.CreateStatsDetails_ColStat{
+				ColumnIDs:    colIDs,
+				HasHistogram: j == 0 && desc.Indexes[i].Type == sqlbase.IndexDescriptor_FORWARD,
+			}
+			colStats = append(colStats, colStat)
+			// Generate histograms for inverted indexes. The above
+			// colStat append is still needed for a basic sketch of
+			// the column. The following colStat is needed for the
+			// sampling and sketch of the inverted index keys of
+			// the column.
+			if desc.Indexes[i].Type == sqlbase.IndexDescriptor_INVERTED {
+				colStat.Inverted = true
+				colStat.HasHistogram = true
+				colStats = append(colStats, colStat)
+			}
 		}
 	}
 
-	// Add all remaining non-json columns in the table, up to maxNonIndexCols.
+	// Add all remaining columns in the table, up to maxNonIndexCols.
 	nonIdxCols := 0
 	for i := 0; i < len(desc.Columns) && nonIdxCols < maxNonIndexCols; i++ {
 		col := &desc.Columns[i]
 		colList := []sqlbase.ColumnID{col.ID}
 		key := makeColStatKey(colList)
-		if _, ok := requestedStats[key]; !ok && col.Type.Family() != types.JsonFamily {
+		if _, ok := requestedStats[key]; !ok {
 			colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
 				ColumnIDs:    colList,
 				HasHistogram: col.Type.Family() == types.BoolFamily || col.Type.Family() == types.EnumFamily,
@@ -348,14 +374,14 @@ func makeColStatKey(cols []sqlbase.ColumnID) string {
 	return colSet.String()
 }
 
-// makePlanForExplainDistSQL is part of the distSQLExplainable interface.
-func (n *createStatsNode) makePlanForExplainDistSQL(
+// newPlanForExplainDistSQL is part of the distSQLExplainable interface.
+func (n *createStatsNode) newPlanForExplainDistSQL(
 	planCtx *PlanningCtx, distSQLPlanner *DistSQLPlanner,
-) (PhysicalPlan, error) {
+) (*PhysicalPlan, error) {
 	// Create a job record but don't actually start the job.
 	record, err := n.makeJobRecord(planCtx.ctx)
 	if err != nil {
-		return PhysicalPlan{}, err
+		return nil, err
 	}
 	job := n.p.ExecCfg().JobRegistry.NewJob(*record)
 
@@ -408,7 +434,7 @@ func (r *createStatsResumer) Resume(
 			txn.SetFixedTimestamp(ctx, *details.AsOf)
 		}
 
-		planCtx := dsp.NewPlanningCtx(ctx, evalCtx, txn)
+		planCtx := dsp.NewPlanningCtx(ctx, evalCtx, txn, true /* distribute */)
 		planCtx.planner = p
 		if err := dsp.planAndRunCreateStats(
 			ctx, evalCtx, planCtx, txn, r.job, NewRowResultWriter(rows),

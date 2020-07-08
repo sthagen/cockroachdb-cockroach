@@ -314,6 +314,7 @@ func TestProjectionAndRendering(t *testing.T) {
 				{Spec: execinfrapb.ProcessorSpec{Post: tc.post}},
 			},
 			ResultRouters: []ProcessorIdx{0, 1},
+			Distribution:  LocalPlan,
 		}
 
 		if tc.ordering != "" {
@@ -337,7 +338,16 @@ func TestProjectionAndRendering(t *testing.T) {
 
 		tc.action(&p)
 
-		if post := p.GetLastStagePost(); !reflect.DeepEqual(post, tc.expPost) {
+		post := p.GetLastStagePost()
+		// The actual planning always sets unserialized LocalExpr field on the
+		// expressions, however, we don't do that for the expected results. In
+		// order to be able to use the deep comparison below we manually unset
+		// that unserialized field.
+		post.Filter.LocalExpr = nil
+		for i := range post.RenderExprs {
+			post.RenderExprs[i].LocalExpr = nil
+		}
+		if !reflect.DeepEqual(post, tc.expPost) {
 			t.Errorf("%d: incorrect post:\n%s\nexpected:\n%s", testIdx, &post, &tc.expPost)
 		}
 		var resTypes []string

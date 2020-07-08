@@ -22,8 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
+// HashTableNumBuckets is the default number of buckets in the colexec hashtable.
 // TODO(yuzefovich): support rehashing instead of large fixed bucket size.
-const hashTableNumBuckets = 1 << 16
+const HashTableNumBuckets = 1 << 16
 
 // hashTableBuildMode represents different modes in which the hashTable can be
 // built.
@@ -379,6 +380,12 @@ func (ht *hashTable) computeBuckets(
 		return
 	}
 
+	// Check if we received a batch with more tuples than the current
+	// allocation size and increase it if so.
+	if nKeys > ht.datumAlloc.AllocSize {
+		ht.datumAlloc.AllocSize = nKeys
+	}
+
 	for i := range ht.keyCols {
 		rehash(ctx, buckets, keys[i], nKeys, sel, ht.cancelChecker, ht.overloadHelper, &ht.datumAlloc)
 	}
@@ -480,14 +487,22 @@ func (ht *hashTable) reset(_ context.Context) {
 	}
 	ht.vals.ResetInternalBatch()
 	ht.vals.SetLength(0)
-	// ht.next, ht.same and ht.visited are reset separately before
+	// ht.probeScratch.next, ht.same and ht.visited are reset separately before
 	// they are used (these slices are not used in all of the code paths).
-	// ht.buckets doesn't need to be reset because buckets are always initialized
-	// when computing the hash.
+	// ht.probeScratch.buckets doesn't need to be reset because buckets are
+	// always initialized when computing the hash.
 	copy(ht.probeScratch.groupID[:coldata.BatchSize()], zeroUint64Column)
-	// ht.toCheck doesn't need to be reset because it is populated manually every
-	// time before checking the columns.
+	// ht.probeScratch.toCheck doesn't need to be reset because it is populated
+	// manually every time before checking the columns.
 	copy(ht.probeScratch.headID[:coldata.BatchSize()], zeroUint64Column)
 	copy(ht.probeScratch.differs[:coldata.BatchSize()], zeroBoolColumn)
 	copy(ht.probeScratch.distinct, zeroBoolColumn)
+	if ht.buildMode == hashTableDistinctBuildMode && cap(ht.buildScratch.next) > 0 {
+		// In "distinct" build mode, ht.buildScratch.next is populated
+		// iteratively, whenever we find tuples that we haven't seen before. In
+		// order to reuse the same underlying memory we need to slice up that
+		// slice (note that keyID=0 is reserved for the end of all hash chains,
+		// so we make the length 1).
+		ht.buildScratch.next = ht.buildScratch.next[:1]
+	}
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -119,7 +121,8 @@ func TestConverterFlushesBatches(t *testing.T) {
 				group := ctxgroup.WithContext(ctx)
 				group.Go(func() error {
 					defer close(kvCh)
-					return conv.readFiles(ctx, testCase.inputs, nil, converterSpec.Format, externalStorageFactory)
+					return conv.readFiles(ctx, testCase.inputs, nil, converterSpec.Format,
+						externalStorageFactory, security.RootUser)
 				})
 
 				lastBatch := 0
@@ -429,6 +432,66 @@ func TestImportHonorsResumePosition(t *testing.T) {
 	}
 }
 
+type duplicateKeyErrorAdder struct {
+	doNothingKeyAdder
+}
+
+var _ kvserverbase.BulkAdder = &duplicateKeyErrorAdder{}
+
+func (a *duplicateKeyErrorAdder) Add(_ context.Context, k roachpb.Key, v []byte) error {
+	return &kvserverbase.DuplicateKeyError{Key: k, Value: v}
+}
+
+func TestImportHandlesDuplicateKVs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	batchSize := 13
+	defer row.TestingSetDatumRowConverterBatchSize(batchSize)()
+	evalCtx := tree.MakeTestingEvalContext(nil)
+	flowCtx := &execinfra.FlowCtx{
+		EvalCtx: &evalCtx,
+		Cfg: &execinfra.ServerConfig{
+			Settings:        &cluster.Settings{},
+			ExternalStorage: externalStorageFactory,
+			BulkAdder: func(
+				_ context.Context, _ *kv.DB, _ hlc.Timestamp,
+				opts kvserverbase.BulkAdderOptions) (kvserverbase.BulkAdder, error) {
+				return &duplicateKeyErrorAdder{}, nil
+			},
+			TestingKnobs: execinfra.TestingKnobs{
+				BulkAdderFlushesEveryBatch: true,
+			},
+		},
+	}
+
+	// In this test, we'll attempt to import different input formats.
+	// All imports produce a DuplicateKeyError, which we expect to be propagated.
+	testSpecs := []testSpec{
+		newTestSpec(t, csvFormat(), "testdata/csv/data-0"),
+		newTestSpec(t, mysqlDumpFormat(), "testdata/mysqldump/simple.sql"),
+		newTestSpec(t, mysqlOutFormat(), "testdata/mysqlout/csv-ish/simple.txt"),
+		newTestSpec(t, pgCopyFormat(), "testdata/pgcopy/default/test.txt"),
+		newTestSpec(t, pgDumpFormat(), "testdata/pgdump/simple.sql"),
+		newTestSpec(t, avroFormat(t, roachpb.AvroOptions_JSON_RECORDS), "testdata/avro/simple-sorted.json"),
+	}
+
+	for _, testCase := range testSpecs {
+		spec := testCase.getConverterSpec()
+
+		t.Run(fmt.Sprintf("duplicate-key-%v", spec.Format.Format), func(t *testing.T) {
+			progCh := make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress)
+			defer close(progCh)
+			go func() {
+				for range progCh {
+				}
+			}()
+
+			_, err := runImport(context.Background(), flowCtx, spec, progCh)
+			require.True(t, errors.HasType(err, &kvserverbase.DuplicateKeyError{}))
+		})
+	}
+}
+
 // syncBarrier allows 2 threads (a controller and a worker) to
 // synchronize between themselves. A controller portion of the
 // barrier waits until worker starts running, and then notifies
@@ -659,8 +722,8 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 	resumePos := js.prog.ResumePos[0]
 	t.Logf("Resume pos: %v\n", js.prog.ResumePos[0])
 
-	// Resume the job and wait for it to complete.
-	if err := registry.Resume(ctx, nil, jobID); err != nil {
+	// Unpause the job and wait for it to complete.
+	if err := registry.Unpause(ctx, nil, jobID); err != nil {
 		t.Fatal(err)
 	}
 	js = queryJobUntil(t, sqlDB.DB, jobID, func(js jobState) bool { return jobs.StatusSucceeded == js.status })
@@ -763,8 +826,8 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 	// Send cancellation and unblock import.
 	proceedImport()
 
-	// Resume the job and wait for it to complete.
-	if err := registry.Resume(ctx, nil, jobID); err != nil {
+	// Unpause the job and wait for it to complete.
+	if err := registry.Unpause(ctx, nil, jobID); err != nil {
 		t.Fatal(err)
 	}
 	js = queryJobUntil(t, sqlDB.DB, jobID, func(js jobState) bool { return jobs.StatusSucceeded == js.status })
@@ -797,8 +860,8 @@ func externalStorageFactory(
 	if err != nil {
 		return nil, err
 	}
-	return cloud.MakeExternalStorage(ctx, dest, base.ExternalIODirConfig{},
-		nil, blobs.TestBlobServiceClient(workdir))
+	return cloudimpl.MakeExternalStorage(ctx, dest, base.ExternalIODirConfig{},
+		nil, blobs.TestBlobServiceClient(workdir), nil, nil)
 }
 
 // Helper to create and initialize testSpec.
@@ -842,7 +905,7 @@ func newTestSpec(t *testing.T, format roachpb.IOFileFormat, inputs ...string) te
 	}
 
 	for id, path := range inputs {
-		spec.inputs[int32(id)] = cloud.MakeLocalStorageURI(path)
+		spec.inputs[int32(id)] = cloudimpl.MakeLocalStorageURI(path)
 	}
 
 	return spec

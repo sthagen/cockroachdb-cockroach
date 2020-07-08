@@ -87,10 +87,12 @@ SELECT * FROM (SELECT concat(s, y::string) FROM a) AS q(v) WHERE v = 'foo'
 ----
 select
  ├── columns: v:5(string!null)
+ ├── immutable
  ├── stats: [rows=20, distinct(5)=1, null(5)=0]
  ├── fd: ()-->(5)
  ├── project
  │    ├── columns: concat:5(string)
+ │    ├── immutable
  │    ├── stats: [rows=2000, distinct(5)=100, null(5)=0]
  │    ├── scan a
  │    │    ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
@@ -98,7 +100,7 @@ select
  │    │    ├── key: (1)
  │    │    └── fd: (1)-->(2-4), (3,4)~~>(1,2)
  │    └── projections
- │         └── concat(s:3, y:2::STRING) [as=concat:5, type=string, outer=(2,3)]
+ │         └── concat(s:3, y:2::STRING) [as=concat:5, type=string, outer=(2,3), immutable]
  └── filters
       └── concat:5 = 'foo' [type=bool, outer=(5), constraints=(/5: [/'foo' - /'foo']; tight), fd=()-->(5)]
 
@@ -109,11 +111,13 @@ SELECT * FROM (SELECT concat(s, y::string), x FROM a) AS q(v, x) GROUP BY v, x
 group-by
  ├── columns: v:5(string) x:1(int!null)
  ├── grouping columns: x:1(int!null) concat:5(string)
+ ├── immutable
  ├── stats: [rows=2000, distinct(1,5)=2000, null(1,5)=0]
  ├── key: (1)
  ├── fd: (1)-->(5)
  └── project
       ├── columns: concat:5(string) x:1(int!null)
+      ├── immutable
       ├── stats: [rows=2000, distinct(1,5)=2000, null(1,5)=0]
       ├── key: (1)
       ├── fd: (1)-->(5)
@@ -123,7 +127,7 @@ group-by
       │    ├── key: (1)
       │    └── fd: (1)-->(2-4), (3,4)~~>(1,2)
       └── projections
-           └── concat(s:3, y:2::STRING) [as=concat:5, type=string, outer=(2,3)]
+           └── concat(s:3, y:2::STRING) [as=concat:5, type=string, outer=(2,3), immutable]
 
 # No available stats for column y.
 build
@@ -131,9 +135,11 @@ SELECT * FROM (SELECT y + 3 AS v FROM a) WHERE v >= 1 AND v <= 100
 ----
 select
  ├── columns: v:5(int!null)
+ ├── immutable
  ├── stats: [rows=1000, distinct(5)=100, null(5)=0]
  ├── project
  │    ├── columns: v:5(int)
+ │    ├── immutable
  │    ├── stats: [rows=2000, distinct(5)=200, null(5)=0]
  │    ├── scan a
  │    │    ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
@@ -141,7 +147,7 @@ select
  │    │    ├── key: (1)
  │    │    └── fd: (1)-->(2-4), (3,4)~~>(1,2)
  │    └── projections
- │         └── y:2 + 3 [as=v:5, type=int, outer=(2)]
+ │         └── y:2 + 3 [as=v:5, type=int, outer=(2), immutable]
  └── filters
       └── (v:5 >= 1) AND (v:5 <= 100) [type=bool, outer=(5), constraints=(/5: [/1 - /100]; tight)]
 
@@ -244,10 +250,12 @@ SELECT * FROM (SELECT concat(s, y::string) FROM a) AS q(v) WHERE v = 'foo'
 ----
 select
  ├── columns: v:5(string!null)
+ ├── immutable
  ├── stats: [rows=1, distinct(5)=1, null(5)=0]
  ├── fd: ()-->(5)
  ├── project
  │    ├── columns: concat:5(string)
+ │    ├── immutable
  │    ├── stats: [rows=2000, distinct(5)=2000, null(5)=0]
  │    ├── scan a
  │    │    ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
@@ -255,7 +263,7 @@ select
  │    │    ├── key: (1)
  │    │    └── fd: (1)-->(2-4), (3,4)~~>(1,2)
  │    └── projections
- │         └── concat(s:3, y:2::STRING) [as=concat:5, type=string, outer=(2,3)]
+ │         └── concat(s:3, y:2::STRING) [as=concat:5, type=string, outer=(2,3), immutable]
  └── filters
       └── concat:5 = 'foo' [type=bool, outer=(5), constraints=(/5: [/'foo' - /'foo']; tight), fd=()-->(5)]
 
@@ -273,4 +281,4 @@ project
  │    └── fd: (1)-->(2-4), (3,4)~~>(1,2)
  └── projections
       ├── NULL [as="?column?":5, type=unknown]
-      └── CASE x:1 WHEN y:2 THEN NULL ELSE x:1 END [as=nullif:6, type=int, outer=(1,2)]
+      └── CASE x:1 WHEN y:2 THEN CAST(NULL AS INT8) ELSE x:1 END [as=nullif:6, type=int, outer=(1,2)]

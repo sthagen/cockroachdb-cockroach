@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geogfn"
 	"github.com/golang/geo/s2"
 )
 
@@ -83,8 +84,17 @@ type GeographyIndex interface {
 	// ST_Intersects(g, x), where x are the indexed geometries.
 	Intersects(c context.Context, g *geo.Geography) (UnionKeySpans, error)
 
-	// testingInnerCovering returns an inner covering of g.
-	testingInnerCovering(g *geo.Geography) s2.CellUnion
+	// DWithin returns the index spans to read and union for the relationship
+	// ST_DWithin(g, x, distanceMeters). That is, there exists a part of
+	// geometry g that is within distanceMeters of x, where x is an indexed
+	// geometry. This function assumes a sphere.
+	DWithin(
+		c context.Context, g *geo.Geography, distanceMeters float64,
+		useSphereOrSpheroid geogfn.UseSphereOrSpheroid,
+	) (UnionKeySpans, error)
+
+	// TestingInnerCovering returns an inner covering of g.
+	TestingInnerCovering(g *geo.Geography) s2.CellUnion
 }
 
 // GeometryIndex is an index over 2D cartesian coordinates.
@@ -113,8 +123,19 @@ type GeometryIndex interface {
 	// ST_Intersects(g, x), where x are the indexed geometries.
 	Intersects(c context.Context, g *geo.Geometry) (UnionKeySpans, error)
 
-	// testingInnerCovering returns an inner covering of g.
-	testingInnerCovering(g *geo.Geometry) s2.CellUnion
+	// DWithin returns the index spans to read and union for the relationship
+	// ST_DWithin(g, x, distance). That is, there exists a part of geometry g
+	// that is within distance units of x, where x is an indexed geometry.
+	DWithin(c context.Context, g *geo.Geometry, distance float64) (UnionKeySpans, error)
+
+	// DFullyWithin returns the index spans to read and union for the
+	// relationship ST_DFullyWithin(g, x, distance). That is, the maximum distance
+	// across every pair of points comprising geometries g and x is within distance
+	// units, where x is an indexed geometry.
+	DFullyWithin(c context.Context, g *geo.Geometry, distance float64) (UnionKeySpans, error)
+
+	// TestingInnerCovering returns an inner covering of g.
+	TestingInnerCovering(g *geo.Geometry) s2.CellUnion
 }
 
 // RelationshipType stores a type of geospatial relationship query that can
@@ -133,6 +154,14 @@ const (
 	// Intersects corresponds to the relationship in which one geospatial object
 	// intersects another geospatial object.
 	Intersects
+
+	// DWithin corresponds to a relationship where there exists a part of one
+	// geometry within d distance units of the other geometry.
+	DWithin
+
+	// DFullyWithin corresponds to a relationship where every pair of points in
+	// two geometries are within d distance units.
+	DFullyWithin
 )
 
 var geoRelationshipTypeStr = map[RelationshipType]string{
@@ -330,16 +359,13 @@ func innerCovering(rc *s2.RegionCoverer, regions []s2.Region) s2.CellUnion {
 	for _, r := range regions {
 		switch region := r.(type) {
 		case s2.Point:
-			cellID := s2.CellFromPoint(region).ID()
-			if !cellID.IsLeaf() {
-				panic("bug in S2")
-			}
+			cellID := cellIDCoveringPoint(region, rc.MaxLevel)
 			u = append(u, cellID)
 		case *s2.Polyline:
 			// TODO(sumeer): for long lines could also pick some intermediate
 			// points along the line. Decide based on experiments.
 			for _, p := range *region {
-				cellID := s2.CellFromPoint(p).ID()
+				cellID := cellIDCoveringPoint(p, rc.MaxLevel)
 				u = append(u, cellID)
 			}
 		case *s2.Polygon:
@@ -347,7 +373,7 @@ func innerCovering(rc *s2.RegionCoverer, regions []s2.Region) s2.CellUnion {
 			if region.NumLoops() > 0 {
 				loop := region.Loop(0)
 				for _, p := range loop.Vertices() {
-					cellID := s2.CellFromPoint(p).ID()
+					cellID := cellIDCoveringPoint(p, rc.MaxLevel)
 					u = append(u, cellID)
 				}
 				// Arbitrary threshold value. This is to avoid computing an expensive
@@ -377,6 +403,14 @@ func innerCovering(rc *s2.RegionCoverer, regions []s2.Region) s2.CellUnion {
 	// largest cell. Decide based on experiments.
 
 	return u
+}
+
+func cellIDCoveringPoint(point s2.Point, level int) s2.CellID {
+	cellID := s2.CellFromPoint(point).ID()
+	if !cellID.IsLeaf() {
+		panic("bug in S2")
+	}
+	return cellID.Parent(level)
 }
 
 // ancestorCells returns the set of cells containing these cells, not
@@ -417,7 +451,7 @@ func invertedIndexKeys(_ context.Context, rc *s2.RegionCoverer, r []s2.Region) [
 
 // TODO(sumeer): examine RegionCoverer carefully to see if we can strengthen
 // the covering invariant, which would increase the efficiency of covers() and
-// remove the need for testingInnerCovering().
+// remove the need for TestingInnerCovering().
 //
 // Helper for Covers.
 func covers(c context.Context, rc *s2.RegionCoverer, r []s2.Region) UnionKeySpans {
@@ -432,6 +466,10 @@ func covers(c context.Context, rc *s2.RegionCoverer, r []s2.Region) UnionKeySpan
 // scans.
 func intersects(_ context.Context, rc *s2.RegionCoverer, r []s2.Region) UnionKeySpans {
 	covering := covering(rc, r)
+	return intersectsUsingCovering(covering)
+}
+
+func intersectsUsingCovering(covering s2.CellUnion) UnionKeySpans {
 	querySpans := make([]KeySpan, len(covering))
 	for i, cid := range covering {
 		querySpans[i] = KeySpan{Start: Key(cid.RangeMin()), End: Key(cid.RangeMax())}

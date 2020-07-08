@@ -60,6 +60,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ui"
@@ -83,6 +84,7 @@ import (
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/opentracing/opentracing-go"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 var (
@@ -169,10 +171,61 @@ type Server struct {
 
 	sqlServer *sqlServer
 
+	// Created in NewServer but initialized (made usable) in `(*Server).Start`.
+	externalStorageBuilder *externalStorageBuilder
+
 	// The following fields are populated at start time, i.e. in `(*Server).Start`.
 
 	startTime time.Time
 	engines   Engines
+}
+
+// externalStorageBuilder is a wrapper around the ExternalStorage factory
+// methods. It allows us to separate the creation and initialization of the
+// builder between NewServer() and Start() respectively.
+// TODO(adityamaru): Consider moving this to pkg/storage/cloudimpl at a future
+// stage of the ongoing refactor.
+type externalStorageBuilder struct {
+	conf              base.ExternalIODirConfig
+	settings          *cluster.Settings
+	blobClientFactory blobs.BlobClientFactory
+	initCalled        bool
+	ie                *sql.InternalExecutor
+	db                *kv.DB
+}
+
+func (e *externalStorageBuilder) init(
+	conf base.ExternalIODirConfig,
+	settings *cluster.Settings,
+	blobClientFactory blobs.BlobClientFactory,
+	ie *sql.InternalExecutor,
+	db *kv.DB,
+) {
+	e.conf = conf
+	e.settings = settings
+	e.blobClientFactory = blobClientFactory
+	e.initCalled = true
+	e.ie = ie
+	e.db = db
+}
+
+func (e *externalStorageBuilder) makeExternalStorage(
+	ctx context.Context, dest roachpb.ExternalStorage,
+) (cloud.ExternalStorage, error) {
+	if !e.initCalled {
+		return nil, errors.New("cannot create external storage before init")
+	}
+	return cloudimpl.MakeExternalStorage(ctx, dest, e.conf, e.settings, e.blobClientFactory, e.ie,
+		e.db)
+}
+
+func (e *externalStorageBuilder) makeExternalStorageFromURI(
+	ctx context.Context, uri string, user string,
+) (cloud.ExternalStorage, error) {
+	if !e.initCalled {
+		return nil, errors.New("cannot create external storage before init")
+	}
+	return cloudimpl.ExternalStorageFromURI(ctx, uri, e.conf, e.settings, e.blobClientFactory, user, e.ie, e.db)
 }
 
 // NewServer creates a Server from a server.Config.
@@ -203,27 +256,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		stopper.AddCloser(tr)
 	}
 
-	// Attempt to load TLS configs right away, failures are permanent.
-	if !cfg.Insecure {
-		// TODO(peter): Call methods on CertificateManager directly. Need to call
-		// base.wrapError or similar on the resulting error.
-		if _, err := cfg.GetServerTLSConfig(); err != nil {
-			return nil, err
-		}
-		if _, err := cfg.GetUIServerTLSConfig(); err != nil {
-			return nil, err
-		}
-		if _, err := cfg.GetClientTLSConfig(); err != nil {
-			return nil, err
-		}
-		cm, err := cfg.GetCertificateManager()
-		if err != nil {
-			return nil, err
-		}
-		cm.RegisterSignalHandler(stopper)
-		registry.AddMetricStruct(cm.Metrics())
-	}
-
 	// Add a dynamic log tag value for the node ID.
 	//
 	// We need to pass an ambient context to the various server components, but we
@@ -243,23 +275,25 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	ctx := cfg.AmbientCtx.AnnotateCtx(context.Background())
 
-	// Check the compatibility between the configured addresses and that
-	// provided in certificates. This also logs the certificate
-	// addresses in all cases to aid troubleshooting.
-	// This must be called after the certificate manager was initialized
-	// and after ValidateAddrs().
-	cfg.CheckCertificateAddrs(ctx)
-
 	var rpcContext *rpc.Context
 	if knobs := cfg.TestingKnobs.Server; knobs != nil {
 		serverKnobs := knobs.(*TestingKnobs)
-		rpcContext = rpc.NewContextWithTestingKnobs(
-			cfg.AmbientCtx, cfg.Config, clock, stopper, cfg.Settings,
-			serverKnobs.ContextTestingKnobs,
-		)
+		rpcContext = rpc.NewContext(rpc.ContextOptions{
+			AmbientCtx: cfg.AmbientCtx,
+			Config:     cfg.Config,
+			Clock:      clock,
+			Stopper:    stopper,
+			Settings:   cfg.Settings,
+			Knobs:      serverKnobs.ContextTestingKnobs,
+		})
 	} else {
-		rpcContext = rpc.NewContext(cfg.AmbientCtx, cfg.Config, clock, stopper,
-			cfg.Settings)
+		rpcContext = rpc.NewContext(rpc.ContextOptions{
+			AmbientCtx: cfg.AmbientCtx,
+			Config:     cfg.Config,
+			Clock:      clock,
+			Stopper:    stopper,
+			Settings:   cfg.Settings,
+		})
 	}
 	rpcContext.HeartbeatCB = func() {
 		if err := rpcContext.RemoteClocks.VerifyClockOffset(ctx); err != nil {
@@ -267,6 +301,34 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		}
 	}
 	registry.AddMetricStruct(rpcContext.Metrics())
+
+	// Attempt to load TLS configs right away, failures are permanent.
+	if !cfg.Insecure {
+		// TODO(peter): Call methods on CertificateManager directly. Need to call
+		// base.wrapError or similar on the resulting error.
+		if _, err := rpcContext.GetServerTLSConfig(); err != nil {
+			return nil, err
+		}
+		if _, err := rpcContext.GetUIServerTLSConfig(); err != nil {
+			return nil, err
+		}
+		if _, err := rpcContext.GetClientTLSConfig(); err != nil {
+			return nil, err
+		}
+		cm, err := rpcContext.GetCertificateManager()
+		if err != nil {
+			return nil, err
+		}
+		cm.RegisterSignalHandler(stopper)
+		registry.AddMetricStruct(cm.Metrics())
+	}
+
+	// Check the compatibility between the configured addresses and that
+	// provided in certificates. This also logs the certificate
+	// addresses in all cases to aid troubleshooting.
+	// This must be called after the certificate manager was initialized
+	// and after ValidateAddrs().
+	rpcContext.CheckCertificateAddrs(ctx)
 
 	grpcServer := newGRPCServer(rpcContext)
 
@@ -307,15 +369,17 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	retryOpts.Closer = stopper.ShouldQuiesce()
 	distSenderCfg := kvcoord.DistSenderConfig{
-		AmbientCtx:      cfg.AmbientCtx,
-		Settings:        st,
-		Clock:           clock,
-		RPCContext:      rpcContext,
-		RPCRetryOptions: &retryOpts,
-		TestingKnobs:    clientTestingKnobs,
-		NodeDialer:      nodeDialer,
+		AmbientCtx:         cfg.AmbientCtx,
+		Settings:           st,
+		Clock:              clock,
+		NodeDescs:          g,
+		RPCContext:         rpcContext,
+		RPCRetryOptions:    &retryOpts,
+		NodeDialer:         nodeDialer,
+		FirstRangeProvider: g,
+		TestingKnobs:       clientTestingKnobs,
 	}
-	distSender := kvcoord.NewDistSender(distSenderCfg, g)
+	distSender := kvcoord.NewDistSender(distSenderCfg)
 	registry.AddMetricStruct(distSender.Metrics())
 
 	txnMetrics := kvcoord.MakeTxnMetrics(cfg.HistogramWindowInterval())
@@ -379,26 +443,16 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	internalExecutor := &sql.InternalExecutor{}
 	jobRegistry := &jobs.Registry{} // ditto
 
-	// This function defines how ExternalStorage objects are created.
-	externalStorage := func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
-		return cloud.MakeExternalStorage(
-			ctx, dest, cfg.ExternalIODirConfig, st,
-			blobs.NewBlobClientFactory(
-				nodeIDContainer.Get(),
-				nodeDialer,
-				st.ExternalIODir,
-			),
-		)
+	// Create an ExternalStorageBuilder. This is only usable after Start() where
+	// we initialize all the configuration params.
+	externalStorageBuilder := &externalStorageBuilder{}
+	externalStorage := func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.
+		ExternalStorage, error) {
+		return externalStorageBuilder.makeExternalStorage(ctx, dest)
 	}
-	externalStorageFromURI := func(ctx context.Context, uri string) (cloud.ExternalStorage, error) {
-		return cloud.ExternalStorageFromURI(
-			ctx, uri, cfg.ExternalIODirConfig, st,
-			blobs.NewBlobClientFactory(
-				nodeIDContainer.Get(),
-				nodeDialer,
-				st.ExternalIODir,
-			),
-		)
+	externalStorageFromURI := func(ctx context.Context, uri string,
+		user string) (cloud.ExternalStorage, error) {
+		return externalStorageBuilder.makeExternalStorageFromURI(ctx, uri, user)
 	}
 
 	protectedtsProvider, err := ptprovider.New(ptprovider.Config{
@@ -549,12 +603,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		stopper:                  stopper,
 		clock:                    clock,
 		runtime:                  runtimeSampler,
-		tenantID:                 roachpb.SystemTenantID,
 		db:                       db,
 		registry:                 registry,
 		sessionRegistry:          sessionRegistry,
 		circularInternalExecutor: internalExecutor,
-		jobRegistry:              jobRegistry,
+		circularJobRegistry:      jobRegistry,
 		jobAdoptionStopFile:      jobAdoptionStopFile,
 		protectedtsProvider:      protectedtsProvider,
 	})
@@ -566,35 +619,36 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	node.InitLogger(sqlServer.execCfg)
 
 	*lateBoundServer = Server{
-		nodeIDContainer:       nodeIDContainer,
-		cfg:                   cfg,
-		st:                    st,
-		clock:                 clock,
-		rpcContext:            rpcContext,
-		grpc:                  grpcServer,
-		gossip:                g,
-		nodeDialer:            nodeDialer,
-		nodeLiveness:          nodeLiveness,
-		storePool:             storePool,
-		tcsFactory:            tcsFactory,
-		distSender:            distSender,
-		db:                    db,
-		node:                  node,
-		registry:              registry,
-		recorder:              recorder,
-		runtime:               runtimeSampler,
-		admin:                 sAdmin,
-		status:                sStatus,
-		authentication:        sAuth,
-		tsDB:                  tsDB,
-		tsServer:              &sTS,
-		raftTransport:         raftTransport,
-		stopper:               stopper,
-		debug:                 debugServer,
-		replicationReporter:   replicationReporter,
-		protectedtsProvider:   protectedtsProvider,
-		protectedtsReconciler: protectedtsReconciler,
-		sqlServer:             sqlServer,
+		nodeIDContainer:        nodeIDContainer,
+		cfg:                    cfg,
+		st:                     st,
+		clock:                  clock,
+		rpcContext:             rpcContext,
+		grpc:                   grpcServer,
+		gossip:                 g,
+		nodeDialer:             nodeDialer,
+		nodeLiveness:           nodeLiveness,
+		storePool:              storePool,
+		tcsFactory:             tcsFactory,
+		distSender:             distSender,
+		db:                     db,
+		node:                   node,
+		registry:               registry,
+		recorder:               recorder,
+		runtime:                runtimeSampler,
+		admin:                  sAdmin,
+		status:                 sStatus,
+		authentication:         sAuth,
+		tsDB:                   tsDB,
+		tsServer:               &sTS,
+		raftTransport:          raftTransport,
+		stopper:                stopper,
+		debug:                  debugServer,
+		replicationReporter:    replicationReporter,
+		protectedtsProvider:    protectedtsProvider,
+		protectedtsReconciler:  protectedtsReconciler,
+		sqlServer:              sqlServer,
+		externalStorageBuilder: externalStorageBuilder,
 	}
 	return lateBoundServer, err
 }
@@ -965,7 +1019,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.rpcContext.SetLocalInternalServer(s.node)
 
 	// Load the TLS configuration for the HTTP server.
-	uiTLSConfig, err := s.cfg.GetUIServerTLSConfig()
+	uiTLSConfig, err := s.rpcContext.GetUIServerTLSConfig()
 	if err != nil {
 		return err
 	}
@@ -995,6 +1049,14 @@ func (s *Server) Start(ctx context.Context) error {
 		return errors.Wrap(err, "failed to create engines")
 	}
 	s.stopper.AddCloser(&s.engines)
+
+	// Initialize the external storage builders configuration params now that the
+	// engines have been created. The object can be used to create ExternalStorage
+	// objects hereafter.
+	fileTableInternalExecutor := sql.MakeInternalExecutor(ctx, s.PGServer().SQLServer, sql.MemoryMetrics{}, s.st)
+	s.externalStorageBuilder.init(s.cfg.ExternalIODirConfig, s.st,
+		blobs.NewBlobClientFactory(s.nodeIDContainer.Get(),
+			s.nodeDialer, s.st.ExternalIODir), &fileTableInternalExecutor, s.db)
 
 	bootstrapVersion := s.cfg.Settings.Version.BinaryVersion()
 	if knobs := s.cfg.TestingKnobs.Server; knobs != nil {
@@ -1118,13 +1180,6 @@ func (s *Server) Start(ctx context.Context) error {
 			<-knobs.PauseAfterGettingRPCAddress
 		}
 	}
-
-	// Enable the debug endpoints first to provide an earlier window into what's
-	// going on with the node in advance of exporting node functionality.
-	//
-	// TODO(marc): when cookie-based authentication exists, apply it to all web
-	// endpoints.
-	s.mux.Handle(debug.Endpoint, s.debug)
 
 	// Initialize grpc-gateway mux and context in order to get the /health
 	// endpoint working even before the node has fully initialized.
@@ -1371,7 +1426,7 @@ func (s *Server) Start(ctx context.Context) error {
 		s.cfg.NodeAttributes,
 		s.cfg.Locality,
 		s.cfg.LocalityAddresses,
-		s.sqlServer.execCfg.DistSQLPlanner.SetNodeDesc,
+		s.sqlServer.execCfg.DistSQLPlanner.SetNodeInfo,
 	); err != nil {
 		return err
 	}
@@ -1523,8 +1578,35 @@ func (s *Server) Start(ctx context.Context) error {
 	// The /login endpoint is, by definition, available pre-authentication.
 	s.mux.Handle(loginPath, gwMux)
 	s.mux.Handle(logoutPath, authHandler)
+
 	// The /_status/vars endpoint is not authenticated either. Useful for monitoring.
 	s.mux.Handle(statusVars, http.HandlerFunc(s.status.handleVars))
+
+	// Register debugging endpoints.
+	var debugHandler http.Handler = s.debug
+	if s.cfg.RequireWebSession() {
+		// TODO(bdarnell): Refactor our authentication stack.
+		// authenticationMux guarantees that we have a non-empty user
+		// session, but our machinery for verifying the roles of a user
+		// lives on adminServer and is tied to GRPC metadata.
+		debugHandler = newAuthenticationMux(s.authentication, http.HandlerFunc(
+			func(w http.ResponseWriter, req *http.Request) {
+				md := forwardAuthenticationMetadata(req.Context(), req)
+				authCtx := metadata.NewIncomingContext(req.Context(), md)
+				_, err := s.admin.requireAdminUser(authCtx)
+				if errors.Is(err, errInsufficientPrivilege) {
+					http.Error(w, "admin privilege required", http.StatusUnauthorized)
+					return
+				} else if err != nil {
+					log.Infof(authCtx, "web session error: %s", err)
+					http.Error(w, "error checking authentication", http.StatusInternalServerError)
+					return
+				}
+				s.debug.ServeHTTP(w, req)
+			}))
+	}
+	s.mux.Handle(debug.Endpoint, debugHandler)
+
 	log.Event(ctx, "added http endpoints")
 
 	// Attempt to upgrade cluster version.
@@ -1569,6 +1651,10 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := s.debug.RegisterEngines(s.cfg.Stores.Specs, s.engines); err != nil {
 		return errors.Wrapf(err, "failed to register engines with debug server")
 	}
+
+	// Start scheduled jobs daemon.
+	jobs.StartJobSchedulerDaemon(
+		ctx, s.stopper, &s.st.SV, jobs.ProdJobSchedulerEnv, s.db, s.sqlServer.internalExecutor)
 
 	log.Event(ctx, "server ready")
 	return nil

@@ -39,9 +39,12 @@ const (
 )
 
 func readCreateTableFromStore(
-	ctx context.Context, filename string, externalStorageFromURI cloud.ExternalStorageFromURIFactory,
+	ctx context.Context,
+	filename string,
+	externalStorageFromURI cloud.ExternalStorageFromURIFactory,
+	user string,
 ) (*tree.CreateTable, error) {
-	store, err := externalStorageFromURI(ctx, filename)
+	store, err := externalStorageFromURI(ctx, filename, user)
 	if err != nil {
 		return nil, err
 	}
@@ -88,6 +91,7 @@ var NoFKs = fkHandler{resolver: make(fkResolver)}
 // unique_rowid().
 func MakeSimpleTableDescriptor(
 	ctx context.Context,
+	semaCtx *tree.SemaContext,
 	st *cluster.Settings,
 	create *tree.CreateTable,
 	parentID, tableID sqlbase.ID,
@@ -142,7 +146,6 @@ func MakeSimpleTableDescriptor(
 	}
 	create.Defs = filteredDefs
 
-	semaCtx := tree.MakeSemaContext()
 	evalCtx := tree.EvalContext{
 		Context:  ctx,
 		Sequence: &importSequenceOperators{},
@@ -161,7 +164,7 @@ func MakeSimpleTableDescriptor(
 		hlc.Timestamp{WallTime: walltime},
 		sqlbase.NewDefaultPrivilegeDescriptor(),
 		affected,
-		&semaCtx,
+		semaCtx,
 		&evalCtx,
 		&sessiondata.SessionData{}, /* sessionData */
 		false,                      /* temporary */

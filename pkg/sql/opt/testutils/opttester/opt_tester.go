@@ -26,6 +26,7 @@ import (
 	"strings"
 	"testing"
 	"text/tabwriter"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -187,6 +188,10 @@ type Flags struct {
 
 	// CascadeLevels limits the depth of recursive cascades for build-cascades.
 	CascadeLevels int
+
+	// NoStableFolds controls whether constant folding for normalization includes
+	// stable operators.
+	NoStableFolds bool
 }
 
 // New constructs a new instance of the OptTester for the given SQL statement.
@@ -200,12 +205,15 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 		semaCtx: tree.MakeSemaContext(),
 		evalCtx: tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
+	// To allow opttester tests to use now(), we hardcode a preset transaction
+	// time. May 10, 2017 is a historic day: the release date of CockroachDB 1.0.
+	ot.evalCtx.TxnTimestamp = time.Date(2017, 05, 10, 13, 0, 0, 0, time.UTC)
 
 	// Set any OptTester-wide session flags here.
 
+	ot.evalCtx.SessionData.User = "opttester"
+	ot.evalCtx.SessionData.Database = "defaultdb"
 	ot.evalCtx.SessionData.ZigzagJoinEnabled = true
-	ot.evalCtx.SessionData.OptimizerFKChecks = true
-	ot.evalCtx.SessionData.OptimizerFKCascades = true
 	ot.evalCtx.SessionData.OptimizerUseHistograms = true
 	ot.evalCtx.SessionData.OptimizerUseMultiColStats = true
 	ot.evalCtx.SessionData.ReorderJoinsLimit = opt.DefaultJoinOrderLimit
@@ -309,6 +317,9 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    See formatFlags for all flags. Multiple flags can be specified; each flag
 //    modifies the existing set of the flags.
 //
+//  - no-stable-folds: disallows constant folding for stable operators; only
+//                     used with "norm".
+//
 //  - fully-qualify-names: fully qualify all column names in the test output.
 //
 //  - expect: fail the test if the rules specified by name do not match.
@@ -397,7 +408,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			}
 			pgerr := pgerror.Flatten(err)
 			text := strings.TrimSpace(pgerr.Error())
-			if pgerr.Code != pgcode.Uncategorized {
+			if pgcode.MakeCode(pgerr.Code) != pgcode.Uncategorized {
 				// Output Postgres error code if it's available.
 				return fmt.Sprintf("error (%s): %s\n", pgerr.Code, text)
 			}
@@ -414,7 +425,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			}
 			pgerr := pgerror.Flatten(err)
 			text := strings.TrimSpace(pgerr.Error())
-			if pgerr.Code != pgcode.Uncategorized {
+			if pgcode.MakeCode(pgerr.Code) != pgcode.Uncategorized {
 				// Output Postgres error code if it's available.
 				return fmt.Sprintf("error (%s): %s\n", pgerr.Code, text)
 			}
@@ -599,6 +610,9 @@ func (ot *OptTester) postProcess(tb testing.TB, d *datadriven.TestData, e opt.Ex
 // Fills in lazily-derived properties (for display).
 func fillInLazyProps(e opt.Expr) {
 	if rel, ok := e.(memo.RelExpr); ok {
+		// These properties are derived from the normalized expression.
+		rel = rel.FirstExpr()
+
 		// Derive columns that are candidates for pruning.
 		norm.DerivePruneCols(rel)
 
@@ -607,9 +621,6 @@ func fillInLazyProps(e opt.Expr) {
 
 		// Make sure the interesting orderings are calculated.
 		xform.DeriveInterestingOrderings(rel)
-
-		// Make sure the multiplicity is populated.
-		memo.DeriveJoinMultiplicity(rel)
 	}
 
 	for i, n := 0, e.ChildCount(); i < n; i++ {
@@ -657,6 +668,9 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 		f.FullyQualifyNames = true
 		// Hiding qualifications defeats the purpose.
 		f.ExprFormat &= ^memo.ExprFmtHideQualifications
+
+	case "no-stable-folds":
+		f.NoStableFolds = true
 
 	case "disable":
 		if len(arg.Vals) == 0 {
@@ -803,6 +817,9 @@ func (ot *OptTester) OptNorm() (opt.Expr, error) {
 		ot.seenRules.Add(int(ruleName))
 		return true
 	})
+	if !ot.Flags.NoStableFolds {
+		o.Factory().FoldingControl().AllowStableFolds()
+	}
 	return ot.optimizeExpr(o)
 }
 
@@ -818,6 +835,7 @@ func (ot *OptTester) Optimize() (opt.Expr, error) {
 		ot.seenRules.Add(int(ruleName))
 		return true
 	})
+	o.Factory().FoldingControl().AllowStableFolds()
 	return ot.optimizeExpr(o)
 }
 

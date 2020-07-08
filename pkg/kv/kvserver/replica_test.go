@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"os"
 	"reflect"
 	"regexp"
 	"sort"
@@ -56,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -75,6 +75,7 @@ import (
 	"go.etcd.io/etcd/raft/raftpb"
 	"go.etcd.io/etcd/raft/tracker"
 	"golang.org/x/net/trace"
+	"golang.org/x/time/rate"
 )
 
 // allSpans is a SpanSet that covers *everything* for use in tests that don't
@@ -215,8 +216,13 @@ func (tc *testContext) StartWithStoreConfigAndVersion(
 	// Setup fake zone config handler.
 	config.TestingSetupZoneConfigHook(stopper)
 	if tc.gossip == nil {
-		rpcContext := rpc.NewContext(
-			cfg.AmbientCtx, &base.Config{Insecure: true}, cfg.Clock, stopper, cfg.Settings)
+		rpcContext := rpc.NewContext(rpc.ContextOptions{
+			AmbientCtx: cfg.AmbientCtx,
+			Config:     &base.Config{Insecure: true},
+			Clock:      cfg.Clock,
+			Stopper:    stopper,
+			Settings:   cfg.Settings,
+		})
 		server := rpc.NewServer(rpcContext) // never started
 		tc.gossip = gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), cfg.DefaultZoneConfig)
 	}
@@ -285,7 +291,7 @@ func (tc *testContext) StartWithStoreConfigAndVersion(
 				tc.store.Engine(),
 				enginepb.MVCCStats{},
 				*testDesc,
-				roachpb.BootstrapLease(),
+				roachpb.Lease{},
 				hlc.Timestamp{},
 				stateloader.TruncatedStateUnreplicated,
 			); err != nil {
@@ -396,7 +402,7 @@ func (tc *testContext) addBogusReplicaToRangeDesc(
 		Header: roachpb.Header{Timestamp: tc.Clock().Now()},
 	}
 	descKey := keys.RangeDescriptorKey(oldDesc.StartKey)
-	if err := updateRangeDescriptor(&ba, descKey, dbDescKV.Value, &newDesc); err != nil {
+	if err := updateRangeDescriptor(&ba, descKey, dbDescKV.Value.TagAndDataBytes(), &newDesc); err != nil {
 		return roachpb.ReplicaDescriptor{}, err
 	}
 	if err := tc.store.DB().Run(ctx, &ba); err != nil {
@@ -935,10 +941,13 @@ func TestReplicaRangeBoundsChecking(t *testing.T) {
 	if mismatchErr, ok := pErr.GetDetail().(*roachpb.RangeKeyMismatchError); !ok {
 		t.Errorf("expected range key mismatch error: %s", pErr)
 	} else {
-		if mismatchedDesc := mismatchErr.MismatchedRange; mismatchedDesc == nil || mismatchedDesc.RangeID != firstRepl.RangeID {
+		require.Len(t, mismatchErr.Ranges(), 2)
+		mismatchedDesc := mismatchErr.Ranges()[0].Desc
+		suggestedDesc := mismatchErr.Ranges()[1].Desc
+		if mismatchedDesc.RangeID != firstRepl.RangeID {
 			t.Errorf("expected mismatched range to be %d, found %v", firstRepl.RangeID, mismatchedDesc)
 		}
-		if suggestedDesc := mismatchErr.SuggestedRange; suggestedDesc == nil || suggestedDesc.RangeID != newRepl.RangeID {
+		if suggestedDesc.RangeID != newRepl.RangeID {
 			t.Errorf("expected suggested range to be %d, found %v", newRepl.RangeID, suggestedDesc)
 		}
 	}
@@ -1592,18 +1601,11 @@ func putArgs(key roachpb.Key, value []byte) roachpb.PutRequest {
 }
 
 func cPutArgs(key roachpb.Key, value, expValue []byte) roachpb.ConditionalPutRequest {
-	var optExpV *roachpb.Value
 	if expValue != nil {
-		expV := roachpb.MakeValueFromBytes(expValue)
-		optExpV = &expV
+		expValue = roachpb.MakeValueFromBytes(expValue).TagAndDataBytes()
 	}
-	return roachpb.ConditionalPutRequest{
-		RequestHeader: roachpb.RequestHeader{
-			Key: key,
-		},
-		Value:    roachpb.MakeValueFromBytes(value),
-		ExpValue: optExpV,
-	}
+	req := roachpb.NewConditionalPut(key, roachpb.MakeValueFromBytes(value), expValue, false /* allowNotExist */)
+	return *req.(*roachpb.ConditionalPutRequest)
 }
 
 func iPutArgs(key roachpb.Key, value []byte) roachpb.InitPutRequest {
@@ -3267,7 +3269,7 @@ func TestReplicaTxnIdempotency(t *testing.T) {
 			if foundVal == nil {
 				return nil
 			}
-			if foundVal.EqualData(*val) {
+			if foundVal.EqualTagAndData(*val) {
 				return nil
 			}
 		}
@@ -6030,7 +6032,7 @@ func TestRangeStatsComputation(t *testing.T) {
 	// The initial stats contain no lease, but there will be an initial
 	// nontrivial lease requested with the first write below.
 	baseStats.Add(enginepb.MVCCStats{
-		SysBytes: 24,
+		SysBytes: 28,
 	})
 
 	// Our clock might not be set to zero.
@@ -6327,7 +6329,7 @@ func TestReplicaCorruption(t *testing.T) {
 	}
 
 	// Should have laid down marker file to prevent startup.
-	_, err := os.Stat(base.PreventedStartupFile(tc.engine.GetAuxiliaryDir()))
+	_, err := tc.engine.Stat(base.PreventedStartupFile(tc.engine.GetAuxiliaryDir()))
 	require.NoError(t, err)
 
 	// Should have triggered fatal error.
@@ -6711,7 +6713,7 @@ func TestBatchErrorWithIndex(t *testing.T) {
 	ba.Add(&roachpb.ConditionalPutRequest{
 		RequestHeader: roachpb.RequestHeader{Key: roachpb.Key("k")},
 		Value:         roachpb.MakeValueFromString("irrelevant"),
-		ExpValue:      nil, // not true after above Put
+		ExpBytes:      nil, // not true after above Put
 	})
 	// This one is never executed.
 	ba.Add(&roachpb.GetRequest{
@@ -8989,7 +8991,7 @@ func TestErrorInRaftApplicationClearsIntents(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	splitKey := roachpb.Key("b")
-	if err := kvDB.AdminSplit(context.Background(), splitKey, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := kvDB.AdminSplit(context.Background(), splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -9576,9 +9578,11 @@ func TestConsistenctQueueErrorFromCheckConsistency(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		// Do this twice because it used to deadlock. See #25456.
 		sysCfg := tc.store.Gossip().GetSystemConfig()
-		if err := tc.store.consistencyQueue.process(ctx, tc.repl, sysCfg); !testutils.IsError(err, "boom") {
+		processed, err := tc.store.consistencyQueue.process(ctx, tc.repl, sysCfg)
+		if !testutils.IsError(err, "boom") {
 			t.Fatal(err)
 		}
+		assert.False(t, processed)
 	}
 }
 
@@ -9616,7 +9620,7 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 		// Regression test for #31870.
 		snap := tc.engine.NewSnapshot()
 		defer snap.Close()
-		res, err := tc.repl.sha512(context.Background(), *tc.repl.Desc(), tc.engine, nil /* diff */, roachpb.ChecksumMode_CHECK_FULL)
+		res, err := tc.repl.sha512(context.Background(), *tc.repl.Desc(), tc.engine, nil /* diff */, roachpb.ChecksumMode_CHECK_FULL, limit.NewLimiter(rate.Inf))
 		if err != nil {
 			return hlc.Timestamp{}, err
 		}
@@ -12085,7 +12089,7 @@ func TestProposalNotAcknowledgedOrReproposedAfterApplication(t *testing.T) {
 
 	stopper.Quiesce(ctx)
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
-		regexp.MustCompile("net/trace"))
+		regexp.MustCompile("net/trace"), log.WithFlattenedSensitiveData)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -12187,7 +12191,7 @@ func TestLaterReproposalsDoNotReuseContext(t *testing.T) {
 	// Check and see if the trace package logged an error.
 	log.Flush()
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
-		regexp.MustCompile("net/trace"))
+		regexp.MustCompile("net/trace"), log.WithFlattenedSensitiveData)
 	if err != nil {
 		t.Fatal(err)
 	}

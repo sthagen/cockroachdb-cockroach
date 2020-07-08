@@ -12,6 +12,7 @@ package colexec
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"testing"
@@ -66,12 +67,16 @@ func TestMain(m *testing.M) {
 		testDiskAcc = &diskAcc
 		defer testDiskAcc.Close(ctx)
 
-		// Pick a random batch size in [minBatchSize, coldata.MaxBatchSize]
-		// range. The randomization can be disabled using COCKROACH_RANDOMIZE_BATCH_SIZE=false.
-		randomBatchSize := generateBatchSize()
-		fmt.Printf("coldata.BatchSize() is set to %d\n", randomBatchSize)
-		if err := coldata.SetBatchSizeForTests(randomBatchSize); err != nil {
-			colexecerror.InternalError(err)
+		flag.Parse()
+		if f := flag.Lookup("test.bench"); f == nil || f.Value.String() == "" {
+			// If we're running benchmarks, don't set a random batch size.
+			// Pick a random batch size in [minBatchSize, coldata.MaxBatchSize]
+			// range. The randomization can be disabled using COCKROACH_RANDOMIZE_BATCH_SIZE=false.
+			randomBatchSize := generateBatchSize()
+			fmt.Printf("coldata.BatchSize() is set to %d\n", randomBatchSize)
+			if err := coldata.SetBatchSizeForTests(randomBatchSize); err != nil {
+				colexecerror.InternalError(err)
+			}
 		}
 		return m.Run()
 	}())
@@ -85,7 +90,21 @@ func generateBatchSize() int {
 	randomizeBatchSize := envutil.EnvOrDefaultBool("COCKROACH_RANDOMIZE_BATCH_SIZE", true)
 	if randomizeBatchSize {
 		rng, _ := randutil.NewPseudoRand()
-		return minBatchSize + rng.Intn(coldata.MaxBatchSize-minBatchSize)
+		// sizesToChooseFrom specifies some predetermined and one random sizes
+		// that we will choose from. Such distribution is chosen due to the
+		// fact that most of our unit tests don't have a lot of data, so in
+		// order to exercise the multi-batch behavior we favor really small
+		// batch sizes. On the other hand, we also want to occasionally
+		// exercise that we handle batch sizes larger than default one
+		// correctly.
+		var sizesToChooseFrom = []int{
+			minBatchSize,
+			minBatchSize + 1,
+			minBatchSize + 2,
+			coldata.BatchSize(),
+			minBatchSize + rng.Intn(coldata.MaxBatchSize-minBatchSize),
+		}
+		return sizesToChooseFrom[rng.Intn(len(sizesToChooseFrom))]
 	}
 	return coldata.BatchSize()
 }

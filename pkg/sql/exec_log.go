@@ -188,7 +188,7 @@ func (p *planner) maybeLogStatementInternal(
 		logger.Logf(ctx, "%s %q %s %q %s %.3f %d %s %d",
 			lbl, appName, logTrigger, stmtStr, plStr, age, rows, auditErrStr, numRetries)
 	}
-	if queryDuration > slowLogThreshold {
+	if slowQueryLogEnabled && queryDuration > slowLogThreshold {
 		logger := p.execCfg.SlowQueryLogger
 		logger.Logf(ctx, "%.3fms %s %q %s %q %s %d %q %d",
 			age, lbl, appName, logTrigger, stmtStr, plStr, rows, execErrStr, numRetries)
@@ -216,7 +216,7 @@ func (p *planner) maybeLogStatementInternal(
 // call to this method elsewhere must find a way to ensure that
 // contributors who later add features do not have to remember to call
 // this to get it right.
-func (p *planner) maybeAudit(desc sqlbase.DescriptorProto, priv privilege.Kind) {
+func (p *planner) maybeAudit(desc sqlbase.DescriptorInterface, priv privilege.Kind) {
 	wantedMode := desc.GetAuditMode()
 	if wantedMode == sqlbase.TableDescriptor_DISABLED {
 		return
@@ -233,7 +233,7 @@ func (p *planner) maybeAudit(desc sqlbase.DescriptorProto, priv privilege.Kind) 
 // auditEvent represents an audit event for a single table.
 type auditEvent struct {
 	// The descriptor being audited.
-	desc sqlbase.DescriptorProto
+	desc sqlbase.DescriptorInterface
 	// Whether the event was for INSERT/DELETE/UPDATE.
 	writing bool
 }

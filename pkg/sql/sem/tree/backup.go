@@ -10,6 +10,8 @@
 
 package tree
 
+import "github.com/cockroachdb/errors"
+
 // DescriptorCoverage specifies whether or not a subset of descriptors were
 // requested or if all the descriptors were requested, so all the descriptors
 // are covered in a given backup.
@@ -29,6 +31,15 @@ const (
 	AllDescriptors
 )
 
+// BackupOptions describes options for the BACKUP execution.
+type BackupOptions struct {
+	CaptureRevisionHistory bool
+	EncryptionPassphrase   Expr
+	Detached               bool
+}
+
+var _ NodeFormatter = &BackupOptions{}
+
 // Backup represents a BACKUP statement.
 type Backup struct {
 	Targets            TargetList
@@ -36,7 +47,7 @@ type Backup struct {
 	To                 PartitionedBackup
 	IncrementalFrom    Exprs
 	AsOf               AsOfClause
-	Options            KVOptions
+	Options            BackupOptions
 }
 
 var _ Statement = &Backup{}
@@ -46,8 +57,9 @@ func (node *Backup) Format(ctx *FmtCtx) {
 	ctx.WriteString("BACKUP ")
 	if node.DescriptorCoverage == RequestedDescriptors {
 		ctx.FormatNode(&node.Targets)
+		ctx.WriteString(" ")
 	}
-	ctx.WriteString(" TO ")
+	ctx.WriteString("TO ")
 	ctx.FormatNode(&node.To)
 	if node.AsOf.Expr != nil {
 		ctx.WriteString(" ")
@@ -57,7 +69,8 @@ func (node *Backup) Format(ctx *FmtCtx) {
 		ctx.WriteString(" INCREMENTAL FROM ")
 		ctx.FormatNode(&node.IncrementalFrom)
 	}
-	if node.Options != nil {
+
+	if !node.Options.IsDefault() {
 		ctx.WriteString(" WITH ")
 		ctx.FormatNode(&node.Options)
 	}
@@ -79,8 +92,9 @@ func (node *Restore) Format(ctx *FmtCtx) {
 	ctx.WriteString("RESTORE ")
 	if node.DescriptorCoverage == RequestedDescriptors {
 		ctx.FormatNode(&node.Targets)
+		ctx.WriteString(" ")
 	}
-	ctx.WriteString(" FROM ")
+	ctx.WriteString("FROM ")
 	for i := range node.From {
 		if i > 0 {
 			ctx.WriteString(", ")
@@ -136,4 +150,63 @@ func (node *PartitionedBackup) Format(ctx *FmtCtx) {
 	if len(*node) > 1 {
 		ctx.WriteString(")")
 	}
+}
+
+// Format implements the NodeFormatter interface
+func (o *BackupOptions) Format(ctx *FmtCtx) {
+	var addSep bool
+	maybeAddSep := func() {
+		if addSep {
+			ctx.WriteString(", ")
+		}
+		addSep = true
+	}
+	if o.CaptureRevisionHistory {
+		ctx.WriteString("revision_history")
+		addSep = true
+	}
+
+	if o.EncryptionPassphrase != nil {
+		maybeAddSep()
+		ctx.WriteString("encryption_passphrase=")
+		o.EncryptionPassphrase.Format(ctx)
+	}
+
+	if o.Detached {
+		maybeAddSep()
+		ctx.WriteString("detached")
+	}
+}
+
+// CombineWith merges other backup options into this backup options struct.
+// An error is returned if the same option merged multiple times.
+func (o *BackupOptions) CombineWith(other *BackupOptions) error {
+	if o.CaptureRevisionHistory {
+		if other.CaptureRevisionHistory {
+			return errors.New("revision_history option specified multiple times")
+		}
+	} else {
+		o.CaptureRevisionHistory = other.CaptureRevisionHistory
+	}
+
+	if o.EncryptionPassphrase == nil {
+		o.EncryptionPassphrase = other.EncryptionPassphrase
+	} else if other.EncryptionPassphrase != nil {
+		return errors.New("encryption_passphrase specified multiple times")
+	}
+
+	if o.Detached {
+		if other.Detached {
+			return errors.New("detached option specified multiple times")
+		}
+	} else {
+		o.Detached = other.Detached
+	}
+
+	return nil
+}
+
+// IsDefault returns true if this backup options struct has default value.
+func (o BackupOptions) IsDefault() bool {
+	return o == BackupOptions{}
 }

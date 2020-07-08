@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -28,7 +29,6 @@ type Inserter struct {
 	Helper                rowHelper
 	InsertCols            []sqlbase.ColumnDescriptor
 	InsertColIDtoRowIndex map[sqlbase.ColumnID]int
-	Fks                   fkExistenceCheckForInsert
 
 	// For allocation avoidance.
 	marshaled []roachpb.Value
@@ -46,8 +46,6 @@ func MakeInserter(
 	codec keys.SQLCodec,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	insertCols []sqlbase.ColumnDescriptor,
-	checkFKs checkFKConstraints,
-	fkTables FkTableMetadata,
 	alloc *sqlbase.DatumAlloc,
 ) (Inserter, error) {
 	ri := Inserter{
@@ -63,13 +61,6 @@ func MakeInserter(
 		}
 	}
 
-	if checkFKs == CheckFKs {
-		var err error
-		if ri.Fks, err = makeFkExistenceCheckHelperForInsert(ctx, txn, codec, tableDesc, fkTables,
-			ri.InsertColIDtoRowIndex, alloc); err != nil {
-			return ri, err
-		}
-	}
 	return ri, nil
 }
 
@@ -115,7 +106,7 @@ func insertInvertedPutFn(
 }
 
 type putter interface {
-	CPut(key, value interface{}, expValue *roachpb.Value)
+	CPut(key, value interface{}, expValue []byte)
 	Put(key, value interface{})
 	InitPut(key, value interface{}, failOnTombstones bool)
 	Del(key ...interface{})
@@ -127,8 +118,8 @@ func (ri *Inserter) InsertRow(
 	ctx context.Context,
 	b putter,
 	values []tree.Datum,
+	ignoreIndexes util.FastIntSet,
 	overwrite bool,
-	checkFKs checkFKConstraints,
 	traceKV bool,
 ) error {
 	if len(values) != len(ri.InsertCols) {
@@ -151,15 +142,6 @@ func (ri *Inserter) InsertRow(
 		}
 	}
 
-	if ri.Fks.checker != nil && checkFKs == CheckFKs {
-		if err := ri.Fks.addAllIdxChecks(ctx, values, traceKV); err != nil {
-			return err
-		}
-		if err := ri.Fks.checker.runCheck(ctx, nil, values); err != nil {
-			return err
-		}
-	}
-
 	// We don't want to insert any empty k/v's, so set includeEmpty to false.
 	// Consider the following case:
 	// TABLE t (
@@ -173,7 +155,7 @@ func (ri *Inserter) InsertRow(
 	// We don't want to insert empty k/v's like this, so we
 	// set includeEmpty to false.
 	primaryIndexKey, secondaryIndexEntries, err := ri.Helper.encodeIndexes(
-		ri.InsertColIDtoRowIndex, values, false /* includeEmpty */)
+		ri.InsertColIDtoRowIndex, values, ignoreIndexes, false /* includeEmpty */)
 	if err != nil {
 		return err
 	}

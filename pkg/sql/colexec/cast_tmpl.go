@@ -24,10 +24,9 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
@@ -35,9 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
-
-// Remove unused warning.
-var _ = execgen.UNSAFEGET
 
 // {{/*
 
@@ -59,12 +55,7 @@ const _RIGHT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
 // _RIGHT_TYPE_WIDTH is the template variable.
 const _RIGHT_TYPE_WIDTH = 0
 
-func _CAST(to, from interface{}) {
-	colexecerror.InternalError("")
-}
-
-// This will be replaced with execgen.UNSAFEGET.
-func _L_UNSAFEGET(to, from interface{}) interface{} {
+func _CAST(to, from, fromCol interface{}) {
 	colexecerror.InternalError("")
 }
 
@@ -105,21 +96,24 @@ func cast(inputVec, outputVec coldata.Vec, n int, sel []int) {
 								if inputNulls.NullAt(i) {
 									outputNulls.SetNull(i)
 								} else {
-									v := _L_UNSAFEGET(inputCol, i)
+									v := inputCol.Get(i)
 									var r _R_GO_TYPE
-									_CAST(r, v)
+									_CAST(r, v, inputCol)
 									_R_SET(outputCol, i, r)
 								}
 							}
 						} else {
+							// Remove bounds checks for inputCol[i] and outputCol[i].
 							inputCol = _L_SLICE(inputCol, 0, n)
-							for execgen.RANGE(i, inputCol, 0, n) {
+							_ = inputCol.Get(n - 1)
+							_ = outputCol.Get(n - 1)
+							for i := 0; i < n; i++ {
 								if inputNulls.NullAt(i) {
 									outputNulls.SetNull(i)
 								} else {
-									v := _L_UNSAFEGET(inputCol, i)
+									v := inputCol.Get(i)
 									var r _R_GO_TYPE
-									_CAST(r, v)
+									_CAST(r, v, inputCol)
 									_R_SET(outputCol, i, r)
 								}
 							}
@@ -128,17 +122,20 @@ func cast(inputVec, outputVec coldata.Vec, n int, sel []int) {
 						if sel != nil {
 							sel = sel[:n]
 							for _, i := range sel {
-								v := _L_UNSAFEGET(inputCol, i)
+								v := inputCol.Get(i)
 								var r _R_GO_TYPE
-								_CAST(r, v)
+								_CAST(r, v, inputCol)
 								_R_SET(outputCol, i, r)
 							}
 						} else {
+							// Remove bounds checks for inputCol[i] and outputCol[i].
 							inputCol = _L_SLICE(inputCol, 0, n)
-							for execgen.RANGE(i, inputCol, 0, n) {
-								v := _L_UNSAFEGET(inputCol, i)
+							_ = inputCol.Get(n - 1)
+							_ = outputCol.Get(n - 1)
+							for i := 0; i < n; i++ {
+								v := inputCol.Get(i)
 								var r _R_GO_TYPE
-								_CAST(r, v)
+								_CAST(r, v, inputCol)
 								_R_SET(outputCol, i, r)
 							}
 						}

@@ -1017,7 +1017,7 @@ func TestStoreZoneUpdateAndRangeSplit(t *testing.T) {
 	descID := uint32(keys.MinUserDescID)
 	zoneConfig := zonepb.DefaultZoneConfig()
 	zoneConfig.RangeMaxBytes = proto.Int64(maxBytes)
-	config.TestingSetZoneConfig(descID, zoneConfig)
+	config.TestingSetZoneConfig(config.SystemTenantObjectID(descID), zoneConfig)
 
 	// Trigger gossip callback.
 	if err := store.Gossip().AddInfoProto(gossip.KeySystemConfig, &config.SystemConfigEntries{}, 0); err != nil {
@@ -1079,7 +1079,7 @@ func TestStoreRangeSplitWithMaxBytesUpdate(t *testing.T) {
 	descID := uint32(keys.MinUserDescID)
 	zoneConfig := zonepb.DefaultZoneConfig()
 	zoneConfig.RangeMaxBytes = proto.Int64(maxBytes)
-	config.TestingSetZoneConfig(descID, zoneConfig)
+	config.TestingSetZoneConfig(config.SystemTenantObjectID(descID), zoneConfig)
 
 	// Trigger gossip callback.
 	if err := store.Gossip().AddInfoProto(gossip.KeySystemConfig, &config.SystemConfigEntries{}, 0); err != nil {
@@ -1303,7 +1303,7 @@ func TestStoreRangeSystemSplits(t *testing.T) {
 		for i := keys.MinUserDescID; i <= userTableMax; i++ {
 			// We don't care about the value, just the key.
 			key := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(i))
-			if err := txn.Put(ctx, key, sqlbase.WrapDescriptor(&sqlbase.TableDescriptor{})); err != nil {
+			if err := txn.Put(ctx, key, (&sqlbase.TableDescriptor{}).DescriptorProto()); err != nil {
 				return err
 			}
 		}
@@ -1325,6 +1325,9 @@ func TestStoreRangeSystemSplits(t *testing.T) {
 		}
 		ids := schema.DescriptorIDs()
 		maxID := uint32(ids[len(ids)-1])
+		if maxPseudo := keys.MaxPseudoTableID; maxID < maxPseudo {
+			maxID = maxPseudo
+		}
 		for i := uint32(keys.MaxSystemConfigDescID + 1); i <= maxID; i++ {
 			expKeys = append(expKeys,
 				testutils.MakeKey(keys.Meta2Prefix, keys.SystemSQLCodec.TablePrefix(i)),
@@ -1367,7 +1370,7 @@ func TestStoreRangeSystemSplits(t *testing.T) {
 		// This time, only write the last table descriptor. Splits only occur for
 		// the descriptor we add. We don't care about the value, just the key.
 		k := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(userTableMax))
-		return txn.Put(ctx, k, sqlbase.WrapDescriptor(&sqlbase.TableDescriptor{}))
+		return txn.Put(ctx, k, (&sqlbase.TableDescriptor{}).DescriptorProto())
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1702,9 +1705,9 @@ func TestStoreSplitTimestampCacheDifferentLeaseHolder(t *testing.T) {
 		}
 		return replica
 	}
-	blacklistedLeaseHolder := leaseHolder(leftKey)
-	log.Infof(ctx, "blacklisting replica %+v for leases", blacklistedLeaseHolder)
-	noLeaseForDesc.Store(&blacklistedLeaseHolder)
+	blocklistedLeaseHolder := leaseHolder(leftKey)
+	log.Infof(ctx, "blocklisting replica %+v for leases", blocklistedLeaseHolder)
+	noLeaseForDesc.Store(&blocklistedLeaseHolder)
 
 	// Pull the trigger. This actually also reads the RHS descriptor after the
 	// split, so when this returns, we've got the leases set up already.
@@ -1724,9 +1727,9 @@ func TestStoreSplitTimestampCacheDifferentLeaseHolder(t *testing.T) {
 	}
 
 	if currentLHSLeaseHolder := leaseHolder(leftKey); !reflect.DeepEqual(
-		currentLHSLeaseHolder, blacklistedLeaseHolder) {
+		currentLHSLeaseHolder, blocklistedLeaseHolder) {
 		t.Fatalf("lease holder changed from %+v to %+v, should de-flake this test",
-			blacklistedLeaseHolder, currentLHSLeaseHolder)
+			blocklistedLeaseHolder, currentLHSLeaseHolder)
 	}
 
 	// This write (to the right-hand side of the split) should hit the
@@ -1752,7 +1755,7 @@ func TestStoreSplitTimestampCacheDifferentLeaseHolder(t *testing.T) {
 	// that it's the same ReplicaID, which is not required but should always
 	// hold).
 	if rhsLease := leaseHolder(rightKey); !reflect.DeepEqual(
-		rhsLease, blacklistedLeaseHolder,
+		rhsLease, blocklistedLeaseHolder,
 	) {
 		t.Errorf("expected LHS and RHS to have same lease holder")
 	}
@@ -1929,6 +1932,10 @@ func TestStoreSplitGCThreshold(t *testing.T) {
 // and the uninitialized replica reacting to messages.
 func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	// Skipping as part of test-infra-team flaky test cleanup.
+	t.Skip("https://github.com/cockroachdb/cockroach/issues/50809")
+
 	mtc := &multiTestContext{}
 	storeCfg := kvserver.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableMergeQueue = true

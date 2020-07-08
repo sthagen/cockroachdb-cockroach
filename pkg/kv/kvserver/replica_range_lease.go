@@ -543,8 +543,8 @@ func (r *Replica) leaseStatus(
 	if lease.Type() == roachpb.LeaseExpiration {
 		expiration = lease.GetExpiration()
 	} else {
-		var err error
-		status.Liveness, err = r.store.cfg.NodeLiveness.GetLiveness(lease.Replica.NodeID)
+		l, err := r.store.cfg.NodeLiveness.GetLiveness(lease.Replica.NodeID)
+		status.Liveness = l.Liveness
 		if err != nil || status.Liveness.Epoch < lease.Epoch {
 			// If lease validity can't be determined (e.g. gossip is down
 			// and liveness info isn't available for owner), we can neither
@@ -738,6 +738,23 @@ func (r *Replica) GetLease() (roachpb.Lease, roachpb.Lease) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.getLeaseRLocked()
+}
+
+// GetDescAndLease atomically reads the range's current descriptor and lease.
+func (r *Replica) GetDescAndLease(ctx context.Context) (roachpb.RangeDescriptor, roachpb.Lease) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	l, _ /* nextLease */ := r.getLeaseRLocked()
+	desc := r.descRLocked()
+
+	// Sanity check the lease.
+	if !l.Empty() {
+		if _, ok := desc.GetReplicaDescriptorByID(l.Replica.ReplicaID); !ok {
+			log.Fatalf(ctx, "leaseholder replica not in descriptor; desc: %s, lease: %s", desc, l)
+		}
+	}
+
+	return *desc, l
 }
 
 func (r *Replica) getLeaseRLocked() (roachpb.Lease, roachpb.Lease) {

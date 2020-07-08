@@ -80,6 +80,11 @@ type Overload struct {
 	// SpecializedVecBuiltin is used to let the vectorized engine
 	// know when an Overload has a specialized vectorized operator.
 	SpecializedVecBuiltin SpecializedVectorizedBuiltin
+
+	// IgnoreVolatilityCheck ignores checking the functions overload's
+	// volatility against Postgres's volatility at test time.
+	// This should be used with caution.
+	IgnoreVolatilityCheck bool
 }
 
 // params implements the overloadImpl interface.
@@ -664,7 +669,7 @@ func typeCheckOverloadedExprs(
 			s.overloadIdxs = filterOverloads(s.overloads, s.overloadIdxs,
 				func(o overloadImpl) bool {
 					semaCtx := MakeSemaContext()
-					_, err := constExpr.ResolveAsType(&semaCtx, o.params().GetAt(i))
+					_, err := constExpr.ResolveAsType(ctx, &semaCtx, o.params().GetAt(i))
 					return err == nil
 				})
 		}

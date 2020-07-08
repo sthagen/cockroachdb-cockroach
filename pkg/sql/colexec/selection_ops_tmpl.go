@@ -24,16 +24,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
-
-// Remove unused warning.
-var _ = execgen.UNSAFEGET
 
 // {{/*
 // Declarations to make the template compile properly.
@@ -67,7 +63,7 @@ func _SEL_CONST_LOOP(_HAS_NULLS bool) { // */}}
 		sel = sel[:n]
 		for _, i := range sel {
 			var cmp bool
-			arg := execgen.UNSAFEGET(col, i)
+			arg := col.Get(i)
 			_ASSIGN_CMP(cmp, arg, p.constArg, _, col, _)
 			// {{if _HAS_NULLS}}
 			isNull = nulls.NullAt(i)
@@ -82,10 +78,10 @@ func _SEL_CONST_LOOP(_HAS_NULLS bool) { // */}}
 	} else {
 		batch.SetSelection(true)
 		sel := batch.Selection()
-		col = execgen.SLICE(col, 0, n)
-		for execgen.RANGE(i, col, 0, n) {
+		_ = col.Get(n - 1)
+		for i := 0; i < n; i++ {
 			var cmp bool
-			arg := execgen.UNSAFEGET(col, i)
+			arg := col.Get(i)
 			_ASSIGN_CMP(cmp, arg, p.constArg, _, col, _)
 			// {{if _HAS_NULLS}}
 			isNull = nulls.NullAt(i)
@@ -112,8 +108,8 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 		sel = sel[:n]
 		for _, i := range sel {
 			var cmp bool
-			arg1 := execgen.UNSAFEGET(col1, i)
-			arg2 := _R_UNSAFEGET(col2, i)
+			arg1 := col1.Get(i)
+			arg2 := col2.Get(i)
 			_ASSIGN_CMP(cmp, arg1, arg2, _, col1, col2)
 			// {{if _HAS_NULLS}}
 			isNull = nulls.NullAt(i)
@@ -128,18 +124,12 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 	} else {
 		batch.SetSelection(true)
 		sel := batch.Selection()
-		// {{if not (eq .Left.VecMethod "Bytes")}}
-		// {{/* Slice is a noop for Bytes type, so col1Len below might contain an
-		// incorrect value. In order to keep bounds check elimination for all other
-		// types, we simply omit this code snippet for Bytes. */}}
-		col1 = execgen.SLICE(col1, 0, n)
-		col1Len := execgen.LEN(col1)
-		col2 = _R_SLICE(col2, 0, col1Len)
-		// {{end}}
-		for execgen.RANGE(i, col1, 0, n) {
+		_ = col1.Get(n - 1)
+		_ = col2.Get(n - 1)
+		for i := 0; i < n; i++ {
 			var cmp bool
-			arg1 := execgen.UNSAFEGET(col1, i)
-			arg2 := _R_UNSAFEGET(col2, i)
+			arg1 := col1.Get(i)
+			arg2 := col2.Get(i)
 			_ASSIGN_CMP(cmp, arg1, arg2, _, col1, col2)
 			// {{if _HAS_NULLS}}
 			isNull = nulls.NullAt(i)
@@ -285,16 +275,13 @@ func GetSelectionConstOperator(
 	input colexecbase.Operator,
 	colIdx int,
 	constArg tree.Datum,
-	overloadHelper overloadHelper,
+	binFn *tree.BinOp,
 ) (colexecbase.Operator, error) {
-	c, err := getDatumToPhysicalFn(constType)(constArg)
-	if err != nil {
-		return nil, err
-	}
+	c := GetDatumToPhysicalFn(constType)(constArg)
 	selConstOpBase := selConstOpBase{
 		OneInputNode:   NewOneInputNode(input),
 		colIdx:         colIdx,
-		overloadHelper: overloadHelper,
+		overloadHelper: overloadHelper{binFn: binFn},
 	}
 	switch cmpOp {
 	// {{range .CmpOps}}
@@ -334,13 +321,13 @@ func GetSelectionOperator(
 	input colexecbase.Operator,
 	col1Idx int,
 	col2Idx int,
-	overloadHelper overloadHelper,
+	binFn *tree.BinOp,
 ) (colexecbase.Operator, error) {
 	selOpBase := selOpBase{
 		OneInputNode:   NewOneInputNode(input),
 		col1Idx:        col1Idx,
 		col2Idx:        col2Idx,
-		overloadHelper: overloadHelper,
+		overloadHelper: overloadHelper{binFn: binFn},
 	}
 	switch cmpOp {
 	// {{range .CmpOps}}

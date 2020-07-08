@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -1570,8 +1571,8 @@ func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 			hint = ""
 		}
 		// In any case report that there was an error while parsing.
-		err := errors.New(message)
-		err = pgerror.WithCandidateCode(err, code)
+		err := errors.Newf("%s", message)
+		err = pgerror.WithCandidateCode(err, pgcode.MakeCode(code))
 		if hint != "" {
 			err = errors.WithHint(err, hint)
 		}

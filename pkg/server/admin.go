@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -78,6 +78,7 @@ func nonTableDescriptorRangeCount() int64 {
 		keys.TimeseriesRangesID,
 		keys.LivenessRangesID,
 		keys.PublicSchemaID,
+		keys.TenantsRangesID,
 	}))
 }
 
@@ -637,6 +638,7 @@ func generateTableSpan(tableID sqlbase.ID) roachpb.Span {
 func (s *adminServer) TableStats(
 	ctx context.Context, req *serverpb.TableStatsRequest,
 ) (*serverpb.TableStatsResponse, error) {
+	ctx = s.server.AnnotateCtx(ctx)
 	// TODO(someone): perform authorization based on the requesting user's
 	// SELECT privilege over the requested table.
 	userName, err := s.requireAdminUser(ctx)
@@ -662,6 +664,7 @@ func (s *adminServer) TableStats(
 func (s *adminServer) NonTableStats(
 	ctx context.Context, req *serverpb.NonTableStatsRequest,
 ) (*serverpb.NonTableStatsResponse, error) {
+	ctx = s.server.AnnotateCtx(ctx)
 	if _, err := s.requireAdminUser(ctx); err != nil {
 		return nil, err
 	}
@@ -699,9 +702,8 @@ func (s *adminServer) NonTableStats(
 		}
 	}
 
-	// There are four empty ranges for table descriptors 17, 18, 19, and 22 that
-	// aren't actually tables (a.k.a. MetaRangesID, SystemRangesID,
-	// TimeseriesRangesID, and LivenessRangesID in pkg/keys).
+	// There are six empty ranges for table descriptors 17, 18, 19, 22, 29, and
+	// 37 that aren't actually tables (a.k.a. the PseudoTableIDs in pkg/keys).
 	// No data is ever really written to them since they don't have actual
 	// tables. Some backend work could probably be done to eliminate these empty
 	// ranges, but it may be more trouble than it's worth. In the meantime,
@@ -1021,22 +1023,22 @@ func (s *adminServer) RangeLog(
 		var event kvserverpb.RangeLogEvent
 		var ts time.Time
 		if err := scanner.ScanIndex(row, 0, &ts); err != nil {
-			return nil, errors.Wrap(err, fmt.Sprintf("Timestamp didn't parse correctly: %s", row[0].String()))
+			return nil, errors.Wrapf(err, "timestamp didn't parse correctly: %s", row[0].String())
 		}
 		event.Timestamp = ts
 		var rangeID int64
 		if err := scanner.ScanIndex(row, 1, &rangeID); err != nil {
-			return nil, errors.Wrap(err, fmt.Sprintf("RangeID didn't parse correctly: %s", row[1].String()))
+			return nil, errors.Wrapf(err, "RangeID didn't parse correctly: %s", row[1].String())
 		}
 		event.RangeID = roachpb.RangeID(rangeID)
 		var storeID int64
 		if err := scanner.ScanIndex(row, 2, &storeID); err != nil {
-			return nil, errors.Wrap(err, fmt.Sprintf("StoreID didn't parse correctly: %s", row[2].String()))
+			return nil, errors.Wrapf(err, "StoreID didn't parse correctly: %s", row[2].String())
 		}
 		event.StoreID = roachpb.StoreID(int32(storeID))
 		var eventTypeString string
 		if err := scanner.ScanIndex(row, 3, &eventTypeString); err != nil {
-			return nil, errors.Wrap(err, fmt.Sprintf("EventType didn't parse correctly: %s", row[3].String()))
+			return nil, errors.Wrapf(err, "EventType didn't parse correctly: %s", row[3].String())
 		}
 		if eventType, ok := kvserverpb.RangeLogEventType_value[eventTypeString]; ok {
 			event.EventType = kvserverpb.RangeLogEventType(eventType)
@@ -1047,7 +1049,7 @@ func (s *adminServer) RangeLog(
 		var otherRangeID int64
 		if row[4].String() != "NULL" {
 			if err := scanner.ScanIndex(row, 4, &otherRangeID); err != nil {
-				return nil, errors.Wrap(err, fmt.Sprintf("OtherRangeID didn't parse correctly: %s", row[4].String()))
+				return nil, errors.Wrapf(err, "OtherRangeID didn't parse correctly: %s", row[4].String())
 			}
 			event.OtherRangeID = roachpb.RangeID(otherRangeID)
 		}
@@ -1056,10 +1058,10 @@ func (s *adminServer) RangeLog(
 		if row[5].String() != "NULL" {
 			var info string
 			if err := scanner.ScanIndex(row, 5, &info); err != nil {
-				return nil, errors.Wrap(err, fmt.Sprintf("info didn't parse correctly: %s", row[5].String()))
+				return nil, errors.Wrapf(err, "info didn't parse correctly: %s", row[5].String())
 			}
 			if err := json.Unmarshal([]byte(info), &event.Info); err != nil {
-				return nil, errors.Wrap(err, fmt.Sprintf("info didn't parse correctly: %s", info))
+				return nil, errors.Wrapf(err, "info didn't parse correctly: %s", info)
 			}
 			if event.Info.NewDesc != nil {
 				if !includeRawKeys {
@@ -1240,12 +1242,7 @@ func (s *adminServer) Settings(
 		keys = settings.Keys()
 	}
 
-	sessionUser, err := userFromContext(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	isAdmin, err := s.hasAdminRole(ctx, sessionUser)
+	_, isAdmin, err := s.getUserAndRole(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1713,11 +1710,9 @@ func (s *adminServer) Decommission(
 	ctx context.Context, req *serverpb.DecommissionRequest,
 ) (*serverpb.DecommissionStatusResponse, error) {
 	nodeIDs := req.NodeIDs
-	if nodeIDs == nil {
-		// If no NodeIDs are specified, decommission the current node. This is
-		// used by `quit --decommission`.
-		// TODO(knz): This behavior is deprecated in 20.1. Remove in 20.2.
-		nodeIDs = []roachpb.NodeID{s.server.NodeID()}
+
+	if len(nodeIDs) == 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "no node ID specified")
 	}
 
 	// Mark the target nodes as decommissioning. They'll find out as they
@@ -1904,6 +1899,9 @@ func (s *adminServer) DataDistribution(
 func (s *adminServer) EnqueueRange(
 	ctx context.Context, req *serverpb.EnqueueRangeRequest,
 ) (*serverpb.EnqueueRangeResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.server.AnnotateCtx(ctx)
+
 	if _, err := s.requireAdminUser(ctx); err != nil {
 		return nil, err
 	}
@@ -1911,9 +1909,6 @@ func (s *adminServer) EnqueueRange(
 	if !debug.GatewayRemoteAllowed(ctx, s.server.ClusterSettings()) {
 		return nil, remoteDebuggingErr
 	}
-
-	ctx = propagateGatewayMetadata(ctx)
-	ctx = s.server.AnnotateCtx(ctx)
 
 	if req.NodeID < 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "node_id must be non-negative; got %d", req.NodeID)
@@ -2023,7 +2018,9 @@ func (s *adminServer) enqueueRangeLocal(
 		return response, nil
 	}
 	response.Details[0].Events = recordedSpansToTraceEvents(traceSpans)
-	response.Details[0].Error = processErr
+	if processErr != nil {
+		response.Details[0].Error = processErr.Error()
+	}
 	return response, nil
 }
 

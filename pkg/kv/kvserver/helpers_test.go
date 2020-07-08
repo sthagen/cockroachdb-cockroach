@@ -24,7 +24,6 @@ import (
 	"unsafe"
 
 	circuit "github.com/cockroachdb/circuitbreaker"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
@@ -91,10 +90,18 @@ func (s *Store) ComputeMVCCStats() (enginepb.MVCCStats, error) {
 
 // ConsistencyQueueShouldQueue invokes the shouldQueue method on the
 // store's consistency queue.
-func (s *Store) ConsistencyQueueShouldQueue(
-	ctx context.Context, now hlc.Timestamp, r *Replica, cfg *config.SystemConfig,
+func ConsistencyQueueShouldQueue(
+	ctx context.Context,
+	now hlc.Timestamp,
+	desc *roachpb.RangeDescriptor,
+	getQueueLastProcessed func(ctx context.Context) (hlc.Timestamp, error),
+	isNodeLive func(nodeID roachpb.NodeID) (bool, error),
+	disableLastProcessedCheck bool,
+	interval time.Duration,
 ) (bool, float64) {
-	return s.consistencyQueue.shouldQueue(ctx, now, r, cfg)
+	return consistencyQueueShouldQueueImpl(ctx, now, consistencyShouldQueueData{
+		desc, getQueueLastProcessed, isNodeLive,
+		disableLastProcessedCheck, interval})
 }
 
 // LogReplicaChangeTest adds a fake replica change event to the log for the
@@ -166,7 +173,8 @@ func manualQueue(s *Store, q queueImpl, repl *Replica) error {
 		return fmt.Errorf("%s: system config not yet available", s)
 	}
 	ctx := repl.AnnotateCtx(context.Background())
-	return q.process(ctx, repl, cfg)
+	_, err := q.process(ctx, repl, cfg)
+	return err
 }
 
 // ManualGC processes the specified replica using the store's GC queue.
@@ -500,13 +508,13 @@ func (r *Replica) ReadProtectedTimestamps(ctx context.Context) {
 }
 
 func (nl *NodeLiveness) SetDrainingInternal(
-	ctx context.Context, liveness kvserverpb.Liveness, drain bool,
+	ctx context.Context, liveness LivenessRecord, drain bool,
 ) error {
 	return nl.setDrainingInternal(ctx, liveness, drain, nil /* reporter */)
 }
 
 func (nl *NodeLiveness) SetDecommissioningInternal(
-	ctx context.Context, nodeID roachpb.NodeID, liveness kvserverpb.Liveness, decommission bool,
+	ctx context.Context, nodeID roachpb.NodeID, liveness LivenessRecord, decommission bool,
 ) (changeCommitted bool, err error) {
 	return nl.setDecommissioningInternal(ctx, nodeID, liveness, decommission)
 }

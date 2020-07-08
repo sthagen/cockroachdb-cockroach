@@ -147,7 +147,7 @@ func ResolveType(
 
 // FormatTypeReference formats a ResolvableTypeReference.
 func (ctx *FmtCtx) FormatTypeReference(ref ResolvableTypeReference) {
-	if ctx.HasFlags(fmtFormatUserDefinedTypesAsIDs) {
+	if ctx.HasFlags(fmtStaticallyFormatUserDefinedTypes) {
 		switch t := ref.(type) {
 		case *types.T:
 			if t.UserDefined() {
@@ -156,6 +156,10 @@ func (ctx *FmtCtx) FormatTypeReference(ref ResolvableTypeReference) {
 				return
 			}
 		}
+	}
+	if idRef, ok := ref.(*IDTypeReference); ok && ctx.indexedTypeFormatter != nil {
+		ctx.indexedTypeFormatter(ctx, idRef)
+		return
 	}
 	ctx.WriteString(ref.SQLString())
 }
@@ -218,6 +222,42 @@ func IsReferenceSerialType(ref ResolvableTypeReference) bool {
 		return types.IsSerialType(typ)
 	}
 	return false
+}
+
+// TypeCollectorVisitor is an expression visitor that collects all explicit
+// ID type references in an expression.
+type TypeCollectorVisitor struct {
+	IDs map[uint32]struct{}
+}
+
+// VisitPre implements the Visitor interface.
+func (v *TypeCollectorVisitor) VisitPre(expr Expr) (bool, Expr) {
+	switch t := expr.(type) {
+	case Datum:
+		if t.ResolvedType().UserDefined() {
+			v.IDs[t.ResolvedType().StableTypeID()] = struct{}{}
+		}
+	case *IsOfTypeExpr:
+		for _, ref := range t.Types {
+			if idref, ok := ref.(*IDTypeReference); ok {
+				v.IDs[idref.ID] = struct{}{}
+			}
+		}
+	case *CastExpr:
+		if idref, ok := t.Type.(*IDTypeReference); ok {
+			v.IDs[idref.ID] = struct{}{}
+		}
+	case *AnnotateTypeExpr:
+		if idref, ok := t.Type.(*IDTypeReference); ok {
+			v.IDs[idref.ID] = struct{}{}
+		}
+	}
+	return true, expr
+}
+
+// VisitPost implements the Visitor interface.
+func (v *TypeCollectorVisitor) VisitPost(e Expr) Expr {
+	return e
 }
 
 // TestingMapTypeResolver is a fake type resolver for testing purposes.

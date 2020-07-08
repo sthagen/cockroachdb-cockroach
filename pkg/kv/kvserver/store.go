@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -837,17 +836,22 @@ func NewStore(
 	s.txnWaitMetrics = txnwait.NewMetrics(cfg.HistogramWindowInterval)
 	s.metrics.registry.AddMetricStruct(s.txnWaitMetrics)
 
-	s.compactor = compactor.NewCompactor(
-		s.cfg.Settings,
-		s.engine,
-		func() (roachpb.StoreCapacity, error) {
-			return s.Capacity(false /* useCached */)
-		},
-		func(ctx context.Context) {
-			s.asyncGossipStore(ctx, "compactor-initiated rocksdb compaction", false /* useCached */)
-		},
-	)
-	s.metrics.registry.AddMetricStruct(s.compactor.Metrics)
+	// Pebble's compaction picker is aware of range deletions and will account
+	// for them during compaction picking, so don't create a compactor for
+	// Pebble.
+	if s.engine.Type() != enginepb.EngineTypePebble {
+		s.compactor = compactor.NewCompactor(
+			s.cfg.Settings,
+			s.engine,
+			func() (roachpb.StoreCapacity, error) {
+				return s.Capacity(false /* useCached */)
+			},
+			func(ctx context.Context) {
+				s.asyncGossipStore(ctx, "compactor-initiated rocksdb compaction", false /* useCached */)
+			},
+		)
+		s.metrics.registry.AddMetricStruct(s.compactor.Metrics)
+	}
 
 	s.snapshotApplySem = make(chan struct{}, cfg.concurrentSnapshotApplyLimit)
 
@@ -1563,7 +1567,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	}
 
 	// Start the storage engine compactor.
-	if envutil.EnvOrDefaultBool("COCKROACH_ENABLE_COMPACTOR", true) {
+	if envutil.EnvOrDefaultBool("COCKROACH_ENABLE_COMPACTOR", true) && s.compactor != nil {
 		s.compactor.Start(s.AnnotateCtx(context.Background()), s.stopper)
 	}
 
@@ -1950,6 +1954,38 @@ func (s *Store) recordNewPerSecondStats(newQPS, newWPS float64) {
 func (s *Store) VisitReplicas(visitor func(*Replica) (wantMore bool)) {
 	v := newStoreReplicaVisitor(s)
 	v.Visit(visitor)
+}
+
+// VisitReplicasByKey invokes the visitor on all the replicas for ranges that
+// overlap [startKey, endKey), or until the visitor returns false. Replicas are
+// visited in key order. store.mu is held during the visiting.
+//
+// The argument to the visitor is either a *Replica or *ReplicaPlaceholder.
+// Returned replicas might be IsDestroyed(); if the visitor cares, it needs to
+// protect against it itself.
+func (s *Store) VisitReplicasByKey(
+	ctx context.Context,
+	startKey, endKey roachpb.RKey,
+	visitor func(context.Context, KeyRange) (wantMore bool),
+) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if endKey.Less(startKey) {
+		log.Fatalf(ctx, "endKey < startKey (%s < %s)", endKey, startKey)
+	}
+	// Align startKey on a range start. Otherwise the AscendRange below would skip
+	// startKey's range.
+	s.mu.replicasByKey.DescendLessOrEqual(rangeBTreeKey(startKey), func(item btree.Item) bool {
+		// No-op if startKey is the start of a range.
+		startKey = item.(KeyRange).startKey()
+		return false
+	})
+
+	// Iterate though overlapping replicas.
+	s.mu.replicasByKey.AscendRange(rangeBTreeKey(startKey), rangeBTreeKey(endKey),
+		func(item btree.Item) bool {
+			return visitor(ctx, item.(KeyRange))
+		})
 }
 
 // WriteLastUpTimestamp records the supplied timestamp into the "last up" key
@@ -2460,7 +2496,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 // is returned.
 func (s *Store) checkpoint(ctx context.Context, tag string) (string, error) {
 	checkpointBase := filepath.Join(s.engine.GetAuxiliaryDir(), "checkpoints")
-	_ = os.MkdirAll(checkpointBase, 0700)
+	_ = s.engine.MkdirAll(checkpointBase)
 
 	checkpointDir := filepath.Join(checkpointBase, tag)
 	if err := s.engine.CreateCheckpoint(checkpointDir); err != nil {
@@ -2501,7 +2537,7 @@ func (s *Store) ComputeMetrics(ctx context.Context, tick int) error {
 
 	sstables := s.engine.GetSSTables()
 	s.metrics.RdbNumSSTables.Update(int64(sstables.Len()))
-	readAmp := sstables.ReadAmplification()
+	readAmp := sstables.ReadAmplification(int(stats.L0SublevelCount))
 	s.metrics.RdbReadAmplification.Update(int64(readAmp))
 	s.metrics.RdbPendingCompaction.Update(stats.PendingCompactionBytesEstimate)
 	// Log this metric infrequently (with current configurations,
@@ -2594,7 +2630,7 @@ func (s *Store) AllocatorDryRun(ctx context.Context, repl *Replica) (tracing.Rec
 // power an admin debug endpoint.
 func (s *Store) ManuallyEnqueue(
 	ctx context.Context, queueName string, repl *Replica, skipShouldQueue bool,
-) (tracing.Recording, string, error) {
+) (recording tracing.Recording, processError error, enqueueError error) {
 	ctx = repl.AnnotateCtx(ctx)
 
 	var queue queueImpl
@@ -2606,12 +2642,12 @@ func (s *Store) ManuallyEnqueue(
 		}
 	}
 	if queue == nil {
-		return nil, "", errors.Errorf("unknown queue type %q", queueName)
+		return nil, nil, errors.Errorf("unknown queue type %q", queueName)
 	}
 
 	sysCfg := s.cfg.Gossip.GetSystemConfig()
 	if sysCfg == nil {
-		return nil, "", errors.New("cannot run queue without a valid system config; make sure the cluster " +
+		return nil, nil, errors.New("cannot run queue without a valid system config; make sure the cluster " +
 			"has been initialized and all nodes connected to it")
 	}
 
@@ -2620,10 +2656,10 @@ func (s *Store) ManuallyEnqueue(
 	if needsLease {
 		hasLease, pErr := repl.getLeaseForGossip(ctx)
 		if pErr != nil {
-			return nil, "", pErr.GoError()
+			return nil, nil, pErr.GoError()
 		}
 		if !hasLease {
-			return nil, fmt.Sprintf("replica %v does not have the range lease", repl), nil
+			return nil, errors.Newf("replica %v does not have the range lease", repl), nil
 		}
 	}
 
@@ -2636,16 +2672,14 @@ func (s *Store) ManuallyEnqueue(
 		shouldQueue, priority := queue.shouldQueue(ctx, s.cfg.Clock.Now(), repl, sysCfg)
 		log.Eventf(ctx, "shouldQueue=%v, priority=%f", shouldQueue, priority)
 		if !shouldQueue {
-			return collect(), "", nil
+			return collect(), nil, nil
 		}
 	}
 
 	log.Eventf(ctx, "running %s.process", queueName)
-	err := queue.process(ctx, repl, sysCfg)
-	if err != nil {
-		return collect(), err.Error(), nil
-	}
-	return collect(), "", nil
+	processed, processErr := queue.process(ctx, repl, sysCfg)
+	log.Eventf(ctx, "processed: %t", processed)
+	return collect(), processErr, nil
 }
 
 // GetClusterVersion reads the the cluster version from the store-local version

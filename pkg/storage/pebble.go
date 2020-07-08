@@ -313,6 +313,15 @@ func DefaultPebbleOptions() *pebble.Options {
 		MinFlushRate:                4 << 20, // 4 MB/sec
 		TablePropertyCollectors:     PebbleTablePropertyCollectors,
 	}
+	opts.Experimental.L0SublevelCompactions = true
+	// This value for FlushSplitBytes was arrived through some experimentation
+	// with TPCC import performance. More experimentation might be needed to
+	// optimize this for other workloads.
+	opts.Experimental.FlushSplitBytes = 10 << 20 // 10 MB
+	// Automatically flush 10s after the first range tombstone is added to a
+	// memtable. This ensures that we can reclaim space even when there's no
+	// activity on the database generating flushes.
+	opts.Experimental.DeleteRangeFlushDelay = 10 * time.Second
 
 	for i := 0; i < len(opts.Levels); i++ {
 		l := &opts.Levels[i]
@@ -472,24 +481,9 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 		}
 	}
 
-	var auxDir string
-	if cfg.Dir == "" {
-		// TODO(peter): This is horribly hacky but matches what RocksDB does. For
-		// in-memory instances, we create an on-disk auxiliary directory. This is
-		// necessary because various tests expect the auxiliary directory to
-		// actually exist on disk even though they don't actually write files to
-		// the directory. See SSTSnapshotStorage for one example of this bad
-		// behavior.
-		var err error
-		auxDir, err = ioutil.TempDir(os.TempDir(), "cockroach-auxiliary")
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		auxDir = cfg.Opts.FS.PathJoin(cfg.Dir, base.AuxiliaryDir)
-		if err := cfg.Opts.FS.MkdirAll(auxDir, 0755); err != nil {
-			return nil, err
-		}
+	auxDir := cfg.Opts.FS.PathJoin(cfg.Dir, base.AuxiliaryDir)
+	if err := cfg.Opts.FS.MkdirAll(auxDir, 0755); err != nil {
+		return nil, err
 	}
 
 	fileRegistry, statsHandler, err := ResolveEncryptedEnvOptions(&cfg)
@@ -580,18 +574,6 @@ func (p *Pebble) Close() {
 		return
 	}
 	p.closed = true
-
-	if p.path == "" {
-		// Remove the temporary directory when the engine is in-memory. This
-		// matches the RocksDB behavior.
-		//
-		// TODO(peter): The aux-dir shouldn't be on-disk for in-memory
-		// engines. This is just a wart that needs to be removed.
-		if err := os.RemoveAll(p.auxDir); err != nil {
-			p.logger.Infof("%v", err)
-		}
-	}
-
 	_ = p.db.Close()
 }
 
@@ -800,6 +782,7 @@ func (p *Pebble) GetStats() (*Stats, error) {
 		TableReadersMemEstimate:        m.TableCache.Size,
 		PendingCompactionBytesEstimate: int64(m.Compact.EstimatedDebt),
 		L0FileCount:                    m.Levels[0].NumFiles,
+		L0SublevelCount:                int64(m.Levels[0].Sublevels),
 	}, nil
 }
 
@@ -998,27 +981,11 @@ var _ fs.FS = &Pebble{}
 
 // Create implements the FS interface.
 func (p *Pebble) Create(name string) (fs.File, error) {
-	// TODO(peter): On RocksDB, the MemEnv allows creating a file when the parent
-	// directory does not exist. Various tests in the storage package depend on
-	// this because they are accidentally creating the required directory on the
-	// actual filesystem instead of in the memory filesystem. See
-	// diskSideloadedStorage and SSTSnapshotStrategy.
-	if p.InMem() {
-		_ = p.fs.MkdirAll(p.fs.PathDir(name), 0755)
-	}
 	return p.fs.Create(name)
 }
 
 // CreateWithSync implements the FS interface.
 func (p *Pebble) CreateWithSync(name string, bytesPerSync int) (fs.File, error) {
-	// TODO(peter): On RocksDB, the MemEnv allows creating a file when the parent
-	// directory does not exist. Various tests in the storage package depend on
-	// this because they are accidentally creating the required directory on the
-	// actual filesystem instead of in the memory filesystem. See
-	// diskSideloadedStorage and SSTSnapshotStrategy.
-	if p.InMem() {
-		_ = p.fs.MkdirAll(p.fs.PathDir(name), 0755)
-	}
 	f, err := p.fs.Create(name)
 	if err != nil {
 		return nil, err
@@ -1056,6 +1023,11 @@ func (p *Pebble) List(name string) ([]string, error) {
 	dirents, err := p.fs.List(name)
 	sort.Strings(dirents)
 	return dirents, err
+}
+
+// Stat implements the FS interface.
+func (p *Pebble) Stat(name string) (os.FileInfo, error) {
+	return p.fs.Stat(name)
 }
 
 // CreateCheckpoint implements the Engine interface.

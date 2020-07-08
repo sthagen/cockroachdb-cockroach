@@ -35,17 +35,29 @@ func registerAcceptance(r *testRegistry) {
 		{name: "build-info", fn: runBuildInfo},
 		{name: "build-analyze", fn: runBuildAnalyze},
 		{name: "cli/node-status", fn: runCLINodeStatus},
-		{name: "decommission", fn: runDecommissionAcceptance},
+		{
+			name: "decommission", fn: runDecommissionAcceptance,
+			skip: `https://github.com/cockroachdb/cockroach/issues/50919
+https://github.com/cockroachdb/cockroach/issues/50861
+https://github.com/cockroachdb/cockroach/issues/50640
+https://github.com/cockroachdb/cockroach/issues/48676`,
+		},
 		{name: "cluster-init", fn: runClusterInit},
 		{name: "event-log", fn: runEventLog},
 		{name: "gossip/peerings", fn: runGossipPeerings},
 		{name: "gossip/restart", fn: runGossipRestart},
 		{name: "gossip/restart-node-one", fn: runGossipRestartNodeOne},
 		{name: "gossip/locality-address", fn: runCheckLocalityIPAddress},
+		{
+			name:       "multitenant",
+			minVersion: "v20.2.0", // multitenancy is introduced in this cycle
+			fn:         runAcceptanceMultitenant,
+		},
 		{name: "rapid-restart", fn: runRapidRestart},
 		{
 			name: "many-splits", fn: runManySplits,
 			minVersion: "v19.2.0", // SQL syntax unsupported on 19.1.x
+			skip:       "https://github.com/cockroachdb/cockroach/issues/47325",
 		},
 		{name: "status-server", fn: runStatusServer},
 		{

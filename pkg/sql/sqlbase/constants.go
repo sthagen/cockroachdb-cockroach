@@ -57,6 +57,8 @@ const (
 	CrdbInternalClusterSessionsTableID
 	CrdbInternalClusterSettingsTableID
 	CrdbInternalCreateStmtsTableID
+	CrdbInternalCreateTypeStmtsTableID
+	CrdbInternalDatabasesTableID
 	CrdbInternalFeatureUsageID
 	CrdbInternalForwardDependenciesTableID
 	CrdbInternalGossipNodesTableID

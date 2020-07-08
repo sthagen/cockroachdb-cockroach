@@ -38,16 +38,17 @@ var SupportedAggFns = []execinfrapb.AggregatorSpec_Func{
 // aggregateFunc is an aggregate function that performs computation on a batch
 // when Compute(batch) is called and writes the output to the Vec passed in
 // in Init. The aggregateFunc performs an aggregation per group and outputs the
-// aggregation once the end of the group is reached. If the end of the group is
-// not reached before the batch is finished, the aggregateFunc will store a
-// carry value that it will use next time Compute is called. Note that this
-// carry value is stored at the output index. Therefore if any memory
+// aggregation once the start of the new group is reached. If the end of the
+// group is not reached before the batch is finished, the aggregateFunc will
+// store a carry value that it will use next time Compute is called. Note that
+// this carry value is stored at the output index. Therefore if any memory
 // modification of the output vector is made, the caller *MUST* copy the value
 // at the current index inclusive for a correct aggregation.
 type aggregateFunc interface {
 	// Init sets the groups for the aggregation and the output vector. Each index
 	// in groups corresponds to a column value in the input batch. true represents
-	// the first value of a new group.
+	// the start of a new group. Note that the very first group in the whole
+	// input should *not* be marked as a start of a new group.
 	Init(groups []bool, vec coldata.Vec)
 
 	// Reset resets the aggregate function for another run. Primarily used for
@@ -61,11 +62,7 @@ type aggregateFunc interface {
 	// computation.
 	CurrentOutputIndex() int
 	// SetOutputIndex sets the output index to write to. The value for the current
-	// index is carried over. Note that calling SetOutputIndex is a noop if
-	// CurrentOutputIndex returns a negative value (i.e. the aggregate function
-	// has not yet performed any computation). This method also has the side
-	// effect of clearing the NULLs bitmap of the output buffer past the given
-	// index.
+	// index is carried over.
 	SetOutputIndex(idx int)
 
 	// Compute computes the aggregation on the input batch.
@@ -120,34 +117,77 @@ func newAggregateFuncsAlloc(
 	aggTyps [][]*types.T,
 	aggFns []execinfrapb.AggregatorSpec_Func,
 	allocSize int64,
+	isHashAgg bool,
 ) (*aggregateFuncsAlloc, error) {
 	funcAllocs := make([]aggregateFuncAlloc, len(aggFns))
 	for i := range aggFns {
 		var err error
 		switch aggFns[i] {
 		case execinfrapb.AggregatorSpec_ANY_NOT_NULL:
-			funcAllocs[i], err = newAnyNotNullAggAlloc(allocator, aggTyps[i][0], allocSize)
+			if isHashAgg {
+				funcAllocs[i], err = newAnyNotNullHashAggAlloc(allocator, aggTyps[i][0], allocSize)
+			} else {
+				funcAllocs[i], err = newAnyNotNullOrderedAggAlloc(allocator, aggTyps[i][0], allocSize)
+			}
 		case execinfrapb.AggregatorSpec_AVG:
-			funcAllocs[i], err = newAvgAggAlloc(allocator, aggTyps[i][0], allocSize)
-		case execinfrapb.AggregatorSpec_SUM, execinfrapb.AggregatorSpec_SUM_INT:
-			funcAllocs[i], err = newSumAggAlloc(allocator, aggTyps[i][0], allocSize)
+			if isHashAgg {
+				funcAllocs[i], err = newAvgHashAggAlloc(allocator, aggTyps[i][0], allocSize)
+			} else {
+				funcAllocs[i], err = newAvgOrderedAggAlloc(allocator, aggTyps[i][0], allocSize)
+			}
+		case execinfrapb.AggregatorSpec_SUM:
+			if isHashAgg {
+				funcAllocs[i], err = newSumHashAggAlloc(allocator, aggTyps[i][0], allocSize)
+			} else {
+				funcAllocs[i], err = newSumOrderedAggAlloc(allocator, aggTyps[i][0], allocSize)
+			}
+		case execinfrapb.AggregatorSpec_SUM_INT:
+			if isHashAgg {
+				funcAllocs[i], err = newSumIntHashAggAlloc(allocator, aggTyps[i][0], allocSize)
+			} else {
+				funcAllocs[i], err = newSumIntOrderedAggAlloc(allocator, aggTyps[i][0], allocSize)
+			}
 		case execinfrapb.AggregatorSpec_COUNT_ROWS:
-			funcAllocs[i] = newCountRowsAggAlloc(allocator, allocSize)
+			if isHashAgg {
+				funcAllocs[i] = newCountRowsHashAggAlloc(allocator, allocSize)
+			} else {
+				funcAllocs[i] = newCountRowsOrderedAggAlloc(allocator, allocSize)
+			}
 		case execinfrapb.AggregatorSpec_COUNT:
-			funcAllocs[i] = newCountAggAlloc(allocator, allocSize)
+			if isHashAgg {
+				funcAllocs[i] = newCountHashAggAlloc(allocator, allocSize)
+			} else {
+				funcAllocs[i] = newCountOrderedAggAlloc(allocator, allocSize)
+			}
 		case execinfrapb.AggregatorSpec_MIN:
-			funcAllocs[i], err = newMinAggAlloc(allocator, aggTyps[i][0], allocSize)
+			if isHashAgg {
+				funcAllocs[i] = newMinHashAggAlloc(allocator, aggTyps[i][0], allocSize)
+			} else {
+				funcAllocs[i] = newMinOrderedAggAlloc(allocator, aggTyps[i][0], allocSize)
+			}
 		case execinfrapb.AggregatorSpec_MAX:
-			funcAllocs[i], err = newMaxAggAlloc(allocator, aggTyps[i][0], allocSize)
+			if isHashAgg {
+				funcAllocs[i] = newMaxHashAggAlloc(allocator, aggTyps[i][0], allocSize)
+			} else {
+				funcAllocs[i] = newMaxOrderedAggAlloc(allocator, aggTyps[i][0], allocSize)
+			}
 		case execinfrapb.AggregatorSpec_BOOL_AND:
-			funcAllocs[i] = newBoolAndAggAlloc(allocator, allocSize)
+			if isHashAgg {
+				funcAllocs[i] = newBoolAndHashAggAlloc(allocator, allocSize)
+			} else {
+				funcAllocs[i] = newBoolAndOrderedAggAlloc(allocator, allocSize)
+			}
 		case execinfrapb.AggregatorSpec_BOOL_OR:
-			funcAllocs[i] = newBoolOrAggAlloc(allocator, allocSize)
+			if isHashAgg {
+				funcAllocs[i] = newBoolOrHashAggAlloc(allocator, allocSize)
+			} else {
+				funcAllocs[i] = newBoolOrOrderedAggAlloc(allocator, allocSize)
+			}
 		// NOTE: if you're adding an implementation of a new aggregate
 		// function, make sure to account for the memory under that struct in
 		// its constructor.
 		default:
-			return nil, errors.Errorf("unsupported columnar aggregate function %s", aggFns[i].String())
+			return nil, errors.AssertionFailedf("didn't find aggregateFuncAlloc for %s", aggFns[i].String())
 		}
 
 		if err != nil {
@@ -164,7 +204,7 @@ func newAggregateFuncsAlloc(
 // sizeOfAggregateFunc is the size of some aggregateFunc implementation.
 // countAgg was chosen arbitrarily, but it's important that we use a pointer to
 // the aggregate function struct.
-const sizeOfAggregateFunc = int64(unsafe.Sizeof(&countAgg{}))
+const sizeOfAggregateFunc = int64(unsafe.Sizeof(&countHashAgg{}))
 
 func (a *aggregateFuncsAlloc) makeAggregateFuncs() []aggregateFunc {
 	if len(a.returnFuncs) == 0 {
@@ -184,34 +224,19 @@ func (a *aggregateFuncsAlloc) makeAggregateFuncs() []aggregateFunc {
 	return funcs
 }
 
-func makeAggregateFuncsOutputTypes(
+// MakeAggregateFuncsOutputTypes produces the output types for a given set of
+// aggregates.
+func MakeAggregateFuncsOutputTypes(
 	aggTyps [][]*types.T, aggFns []execinfrapb.AggregatorSpec_Func,
 ) ([]*types.T, error) {
+	var err error
 	outTyps := make([]*types.T, len(aggFns))
-
-	for i := range aggFns {
-		// Set the output type of the aggregate.
-		switch aggFns[i] {
-		case execinfrapb.AggregatorSpec_COUNT_ROWS, execinfrapb.AggregatorSpec_COUNT:
-			// TODO(jordan): this is a somewhat of a hack. The aggregate functions
-			// should come with their own output types, somehow.
-			outTyps[i] = types.Int
-		case
-			execinfrapb.AggregatorSpec_ANY_NOT_NULL,
-			execinfrapb.AggregatorSpec_AVG,
-			execinfrapb.AggregatorSpec_SUM,
-			execinfrapb.AggregatorSpec_SUM_INT,
-			execinfrapb.AggregatorSpec_MIN,
-			execinfrapb.AggregatorSpec_MAX,
-			execinfrapb.AggregatorSpec_BOOL_AND,
-			execinfrapb.AggregatorSpec_BOOL_OR:
-			// Output types are the input types for now.
-			outTyps[i] = aggTyps[i][0]
-		default:
-			return nil, errors.Errorf("unsupported columnar aggregate function %s", aggFns[i].String())
+	for i, aggFn := range aggFns {
+		_, outTyps[i], err = execinfrapb.GetAggregateInfo(aggFn, aggTyps[i]...)
+		if err != nil {
+			return nil, err
 		}
 	}
-
 	return outTyps, nil
 }
 
@@ -219,72 +244,16 @@ func makeAggregateFuncsOutputTypes(
 // corresponding to each aggregation function.
 func extractAggTypes(aggCols [][]uint32, typs []*types.T) [][]*types.T {
 	aggTyps := make([][]*types.T, len(aggCols))
-
 	for aggIdx := range aggCols {
 		aggTyps[aggIdx] = make([]*types.T, len(aggCols[aggIdx]))
 		for i, colIdx := range aggCols[aggIdx] {
 			aggTyps[aggIdx][i] = typs[colIdx]
 		}
 	}
-
 	return aggTyps
 }
 
-// isAggregateSupported returns whether the aggregate function that operates on
-// columns of types 'inputTypes' (which can be empty in case of COUNT_ROWS) is
-// supported.
-func isAggregateSupported(
-	allocator *colmem.Allocator, aggFn execinfrapb.AggregatorSpec_Func, inputTypes []*types.T,
-) (bool, error) {
-	switch aggFn {
-	case execinfrapb.AggregatorSpec_SUM:
-		switch inputTypes[0].Family() {
-		case types.IntFamily:
-			// TODO(alfonso): plan ordinary SUM on integer types by casting to DECIMAL
-			// at the end, mod issues with overflow. Perhaps to avoid the overflow
-			// issues, at first, we could plan SUM for all types besides Int64.
-			return false, errors.Newf("sum on int cols not supported (use sum_int)")
-		}
-	case execinfrapb.AggregatorSpec_SUM_INT:
-		// TODO(yuzefovich): support this case through vectorize.
-		if inputTypes[0].Width() != 64 {
-			return false, errors.Newf("sum_int is only supported on Int64 through vectorized")
-		}
-	}
-
-	// We're only interested in resolving the aggregate functions and will not
-	// be actually creating them with the alloc, so we use 0 as the allocation
-	// size.
-	_, err := newAggregateFuncsAlloc(
-		allocator,
-		[][]*types.T{inputTypes},
-		[]execinfrapb.AggregatorSpec_Func{aggFn},
-		0, /* allocSize */
-	)
-	if err != nil {
-		return false, err
-	}
-	outputTypes, err := makeAggregateFuncsOutputTypes(
-		[][]*types.T{inputTypes},
-		[]execinfrapb.AggregatorSpec_Func{aggFn},
-	)
-	if err != nil {
-		return false, err
-	}
-	_, retType, err := execinfrapb.GetAggregateInfo(aggFn, inputTypes...)
-	if err != nil {
-		return false, err
-	}
-	// The columnar aggregates will return the same physical output type as their
-	// input. However, our current builtin resolution might say that the return
-	// type is the canonical for the family (for example, MAX on INT4 is said to
-	// return INT8), so we explicitly check whether the type the columnar
-	// aggregate returns and the type the planning code will expect it to return
-	// are the same. If they are not, we fallback to row-by-row engine.
-	if !retType.Identical(outputTypes[0]) {
-		// TODO(yuzefovich): support this case through vectorize. Probably it needs
-		// to be done at the same time as #38845.
-		return false, errors.Newf("aggregates with different input and output types are not supported")
-	}
-	return true, nil
+type aggAllocBase struct {
+	allocator *colmem.Allocator
+	allocSize int64
 }

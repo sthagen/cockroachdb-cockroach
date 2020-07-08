@@ -27,7 +27,7 @@ import (
 
 type createSequenceNode struct {
 	n      *tree.CreateSequence
-	dbDesc *sqlbase.DatabaseDescriptor
+	dbDesc *sqlbase.ImmutableDatabaseDescriptor
 }
 
 func (p *planner) CreateSequence(ctx context.Context, n *tree.CreateSequence) (planNode, error) {
@@ -57,7 +57,7 @@ func (n *createSequenceNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("sequence"))
 	isTemporary := n.n.Temporary
 
-	_, schemaID, err := getTableCreateParams(params, n.dbDesc.ID, isTemporary, n.n.Name.Table())
+	_, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), isTemporary, n.n.Name.Table())
 	if err != nil {
 		if sqlbase.IsRelationAlreadyExistsError(err) && n.n.IfNotExists {
 			return nil
@@ -76,7 +76,7 @@ func (n *createSequenceNode) startExec(params runParams) error {
 func doCreateSequence(
 	params runParams,
 	context string,
-	dbDesc *DatabaseDescriptor,
+	dbDesc *sqlbase.ImmutableDatabaseDescriptor,
 	schemaID sqlbase.ID,
 	name *TableName,
 	isTemporary bool,
@@ -95,13 +95,19 @@ func doCreateSequence(
 		telemetry.Inc(sqltelemetry.CreateTempSequenceCounter)
 	}
 
+	// creationTime is initialized to a zero value and populated at read time.
+	// See the comment in desc.MaybeIncrementVersion.
+	//
+	// TODO(ajwerner): remove the timestamp from MakeSequenceTableDesc, it's
+	// currently relied on in import and restore code and tests.
+	var creationTime hlc.Timestamp
 	desc, err := MakeSequenceTableDesc(
 		name.Table(),
 		opts,
-		dbDesc.ID,
+		dbDesc.GetID(),
 		schemaID,
 		id,
-		params.creationTimeForNewTableDescriptor(),
+		creationTime,
 		privs,
 		isTemporary,
 		&params,
@@ -116,7 +122,7 @@ func doCreateSequence(
 	key := sqlbase.MakeObjectNameKey(
 		params.ctx,
 		params.ExecCfg().Settings,
-		dbDesc.ID,
+		dbDesc.GetID(),
 		schemaID,
 		name.Table(),
 	).Key(params.ExecCfg().Codec)
@@ -170,7 +176,7 @@ func MakeSequenceTableDesc(
 	isTemporary bool,
 	params *runParams,
 ) (sqlbase.MutableTableDescriptor, error) {
-	desc := InitTableDescriptor(
+	desc := sqlbase.InitTableDescriptor(
 		id,
 		parentID,
 		schemaID,

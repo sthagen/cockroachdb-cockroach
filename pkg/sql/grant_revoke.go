@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -104,7 +105,7 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 		}
 	}
 
-	var descriptors []sqlbase.DescriptorProto
+	var descriptors []sqlbase.DescriptorInterface
 	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
 	// TODO(vivek): check if the cache can be used.
 	p.runWithOptions(resolveFlags{skipCache: true}, func() {
@@ -142,7 +143,7 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 		}
 
 		switch d := descriptor.(type) {
-		case *sqlbase.DatabaseDescriptor:
+		case *sqlbase.ImmutableDatabaseDescriptor:
 			if err := d.Validate(); err != nil {
 				return err
 			}
@@ -161,9 +162,10 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 		case *sqlbase.MutableTableDescriptor:
 			// TODO (lucy): This should probably have a single consolidated job like
 			// DROP DATABASE.
-			// TODO (lucy): Have more consistent/informative names for dependent jobs.
 			if err := p.createOrUpdateSchemaChangeJob(
-				ctx, d, "updating privileges", sqlbase.InvalidMutationID,
+				ctx, d,
+				fmt.Sprintf("updating privileges for table %d", d.ID),
+				sqlbase.InvalidMutationID,
 			); err != nil {
 				return err
 			}

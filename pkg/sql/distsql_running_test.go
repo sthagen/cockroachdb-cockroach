@@ -138,7 +138,6 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 			rw,
 			stmt.AST.StatementType(),
 			execCfg.RangeDescriptorCache,
-			execCfg.LeaseHolderCache,
 			txn,
 			func(ts hlc.Timestamp) {
 				execCfg.Clock.Update(ts)
@@ -155,11 +154,10 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 		defer p.curPlan.close(ctx)
 
 		evalCtx := p.ExtendedEvalContext()
-		planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, nil /* txn */)
-		// We need isLocal = false so that we executing the plan involves marshaling
+		// We need distribute = true so that executing the plan involves marshaling
 		// the root txn meta to leaf txns. Local flows can start in aborted txns
 		// because they just use the root txn.
-		planCtx.isLocal = false
+		planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, nil /* txn */, true /* distribute */)
 		planCtx.planner = p
 		planCtx.stmtType = recv.stmtType
 
@@ -202,7 +200,6 @@ func TestDistSQLReceiverErrorRanking(t *testing.T) {
 		rw,
 		tree.Rows, /* StatementType */
 		nil,       /* rangeCache */
-		nil,       /* leaseCache */
 		txn,
 		func(hlc.Timestamp) {}, /* updateClock */
 		&SessionTracing{},

@@ -116,7 +116,7 @@ func (dsp *DistSQLPlanner) initRunners() {
 // It will first attempt to set up all remote flows using the dsp workers if
 // available or sequentially if not, and then finally set up the gateway flow,
 // whose output is the DistSQLReceiver provided. This flow is then returned to
-// be run.
+// be run. It also returns a boolean indicating whether the flow is vectorized.
 func (dsp *DistSQLPlanner) setupFlows(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
@@ -126,7 +126,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 	localState distsql.LocalState,
 	vectorizeThresholdMet bool,
 ) (context.Context, flowinfra.Flow, error) {
-	thisNodeID := dsp.nodeDesc.NodeID
+	thisNodeID := dsp.gatewayNodeID
 	_, ok := flows[thisNodeID]
 	if !ok {
 		return nil, nil, errors.AssertionFailedf("missing gateway flow")
@@ -158,16 +158,13 @@ func (dsp *DistSQLPlanner) setupFlows(
 			// the execution time.
 			setupReq.EvalContext.Vectorize = int32(sessiondata.VectorizeOff)
 		} else {
-			fuseOpt := flowinfra.FuseNormally
-			if localState.IsLocal {
-				fuseOpt = flowinfra.FuseAggressively
-			}
 			// Now we check to see whether or not to even try vectorizing the flow.
 			// The goal here is to determine up front whether all of the flows can be
 			// vectorized. If any of them can't, turn off the setting.
 			// TODO(yuzefovich): this is a safe but quite inefficient way of setting
 			// up vectorized flows since the flows will effectively be planned twice.
-			for _, spec := range flows {
+			for scheduledOnNodeID, spec := range flows {
+				scheduledOnRemoteNode := scheduledOnNodeID != thisNodeID
 				if _, err := colflow.SupportsVectorized(
 					ctx, &execinfra.FlowCtx{
 						EvalCtx: &evalCtx.EvalContext,
@@ -178,7 +175,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 							VecFDSemaphore: dsp.distSQLSrv.VecFDSemaphore,
 						},
 						NodeID: evalCtx.NodeID,
-					}, spec.Processors, fuseOpt, recv,
+					}, spec.Processors, localState.IsLocal, recv, scheduledOnRemoteNode,
 				); err != nil {
 					// Vectorization attempt failed with an error.
 					returnVectorizationSetupError := false
@@ -323,13 +320,8 @@ func (dsp *DistSQLPlanner) Run(
 		leafInputState = &tis
 	}
 
-	if err := planCtx.sanityCheckAddresses(); err != nil {
-		recv.SetError(err)
-		return func() {}
-	}
-
-	flows := plan.GenerateFlowSpecs(dsp.nodeDesc.NodeID /* gateway */)
-	if _, ok := flows[dsp.nodeDesc.NodeID]; !ok {
+	flows := plan.GenerateFlowSpecs()
+	if _, ok := flows[dsp.gatewayNodeID]; !ok {
 		recv.SetError(errors.Errorf("expected to find gateway flow"))
 		return func() {}
 	}
@@ -380,7 +372,6 @@ func (dsp *DistSQLPlanner) Run(
 	defer dsp.distSQLSrv.ServerConfig.Metrics.QueryStop()
 
 	recv.outputTypes = plan.ResultTypes
-	recv.resultToStreamColMap = plan.PlanToStreamColMap
 
 	vectorizedThresholdMet := plan.MaxEstimatedRowCount >= evalCtx.SessionData.VectorizeRowCountThreshold
 
@@ -398,6 +389,10 @@ func (dsp *DistSQLPlanner) Run(
 
 	if finishedSetupFn != nil {
 		finishedSetupFn()
+	}
+
+	if planCtx.planner != nil && flow.IsVectorized() {
+		planCtx.planner.curPlan.flags.Set(planFlagVectorized)
 	}
 
 	// Check that flows that were forced to be planned locally also have no concurrency.
@@ -443,8 +438,8 @@ func (dsp *DistSQLPlanner) Run(
 // This is where the DistSQL execution meets the SQL Session - the RowContainer
 // comes from a client Session.
 //
-// DistSQLReceiver also update the RangeDescriptorCache and the LeaseholderCache
-// in response to DistSQL metadata about misplanned ranges.
+// DistSQLReceiver also update the RangeDescriptorCache in response to DistSQL
+// metadata about misplanned ranges.
 type DistSQLReceiver struct {
 	ctx context.Context
 
@@ -455,10 +450,6 @@ type DistSQLReceiver struct {
 
 	// outputTypes are the types of the result columns produced by the plan.
 	outputTypes []*types.T
-
-	// resultToStreamColMap maps result columns to columns in the rowexec results
-	// stream.
-	resultToStreamColMap []int
 
 	// noColsRequired indicates that the caller is only interested in the
 	// existence of a single row. Used by subqueries in EXISTS mode.
@@ -484,7 +475,6 @@ type DistSQLReceiver struct {
 	closed bool
 
 	rangeCache *kvcoord.RangeDescriptorCache
-	leaseCache *kvcoord.LeaseHolderCache
 	tracing    *SessionTracing
 	cleanup    func()
 
@@ -520,19 +510,32 @@ type rowResultWriter interface {
 	Err() error
 }
 
-type metadataResultWriter interface {
+// MetadataResultWriter is used to stream metadata rather than row results in a
+// DistSQL flow.
+type MetadataResultWriter interface {
 	AddMeta(ctx context.Context, meta *execinfrapb.ProducerMetadata)
 }
 
-type metadataCallbackWriter struct {
+// MetadataCallbackWriter wraps a rowResultWriter to stream metadata in a
+// DistSQL flow. It executes a given callback when metadata is added.
+type MetadataCallbackWriter struct {
 	rowResultWriter
 	fn func(ctx context.Context, meta *execinfrapb.ProducerMetadata) error
 }
 
-func (w *metadataCallbackWriter) AddMeta(ctx context.Context, meta *execinfrapb.ProducerMetadata) {
+// AddMeta implements the MetadataResultWriter interface.
+func (w *MetadataCallbackWriter) AddMeta(ctx context.Context, meta *execinfrapb.ProducerMetadata) {
 	if err := w.fn(ctx, meta); err != nil {
 		w.SetError(err)
 	}
+}
+
+// NewMetadataCallbackWriter creates a new MetadataCallbackWriter.
+func NewMetadataCallbackWriter(
+	rowResultWriter rowResultWriter,
+	metaFn func(ctx context.Context, meta *execinfrapb.ProducerMetadata) error,
+) *MetadataCallbackWriter {
+	return &MetadataCallbackWriter{rowResultWriter: rowResultWriter, fn: metaFn}
 }
 
 // errOnlyResultWriter is a rowResultWriter that only supports receiving an
@@ -578,7 +581,6 @@ func MakeDistSQLReceiver(
 	resultWriter rowResultWriter,
 	stmtType tree.StatementType,
 	rangeCache *kvcoord.RangeDescriptorCache,
-	leaseCache *kvcoord.LeaseHolderCache,
 	txn *kv.Txn,
 	updateClock func(observedTs hlc.Timestamp),
 	tracing *SessionTracing,
@@ -590,7 +592,6 @@ func MakeDistSQLReceiver(
 		cleanup:      cleanup,
 		resultWriter: resultWriter,
 		rangeCache:   rangeCache,
-		leaseCache:   leaseCache,
 		txn:          txn,
 		updateClock:  updateClock,
 		stmtType:     stmtType,
@@ -613,7 +614,6 @@ func (r *DistSQLReceiver) clone() *DistSQLReceiver {
 		ctx:         r.ctx,
 		cleanup:     func() {},
 		rangeCache:  r.rangeCache,
-		leaseCache:  r.leaseCache,
 		txn:         r.txn,
 		updateClock: r.updateClock,
 		stmtType:    tree.Rows,
@@ -669,9 +669,7 @@ func (r *DistSQLReceiver) Push(
 			}
 		}
 		if len(meta.Ranges) > 0 {
-			if err := r.updateCaches(r.ctx, meta.Ranges); err != nil && r.resultWriter.Err() == nil {
-				r.resultWriter.SetError(err)
-			}
+			r.rangeCache.Insert(r.ctx, meta.Ranges...)
 		}
 		if len(meta.TraceData) > 0 {
 			span := opentracing.SpanFromContext(r.ctx)
@@ -692,7 +690,7 @@ func (r *DistSQLReceiver) Push(
 			meta.Metrics.Release()
 			meta.Release()
 		}
-		if metaWriter, ok := r.resultWriter.(metadataResultWriter); ok {
+		if metaWriter, ok := r.resultWriter.(MetadataResultWriter); ok {
 			metaWriter.AddMeta(r.ctx, meta)
 		}
 		return r.status
@@ -729,16 +727,16 @@ func (r *DistSQLReceiver) Push(
 		r.status = execinfra.ConsumerClosed
 	} else {
 		if r.row == nil {
-			r.row = make(tree.Datums, len(r.resultToStreamColMap))
+			r.row = make(tree.Datums, len(row))
 		}
-		for i, resIdx := range r.resultToStreamColMap {
-			err := row[resIdx].EnsureDecoded(r.outputTypes[resIdx], &r.alloc)
+		for i, encDatum := range row {
+			err := encDatum.EnsureDecoded(r.outputTypes[i], &r.alloc)
 			if err != nil {
 				r.resultWriter.SetError(err)
 				r.status = execinfra.ConsumerClosed
 				return r.status
 			}
-			r.row[i] = row[resIdx].Datum
+			r.row[i] = encDatum.Datum
 		}
 	}
 	r.tracing.TraceExecRowsResult(r.ctx, r.row)
@@ -797,30 +795,6 @@ func (r *DistSQLReceiver) Types() []*types.T {
 	return r.outputTypes
 }
 
-// updateCaches takes information about some ranges that were mis-planned and
-// updates the range descriptor and lease-holder caches accordingly.
-//
-// TODO(andrei): updating these caches is not perfect: we can clobber newer
-// information that someone else has populated because there's no timing info
-// anywhere. We also may fail to remove stale info from the LeaseHolderCache if
-// the ids of the ranges that we get are different than the ids in that cache.
-func (r *DistSQLReceiver) updateCaches(ctx context.Context, ranges []roachpb.RangeInfo) error {
-	// Update the RangeDescriptorCache.
-	rngDescs := make([]roachpb.RangeDescriptor, len(ranges))
-	for i, ri := range ranges {
-		rngDescs[i] = ri.Desc
-	}
-	if err := r.rangeCache.InsertRangeDescriptors(ctx, rngDescs...); err != nil {
-		return err
-	}
-
-	// Update the LeaseHolderCache.
-	for _, ri := range ranges {
-		r.leaseCache.Update(ctx, ri.Desc.RangeID, ri.Lease.Replica.StoreID)
-	}
-	return nil
-}
-
 // PlanAndRunSubqueries returns false if an error was encountered and sets that
 // error in the provided receiver.
 func (dsp *DistSQLPlanner) PlanAndRunSubqueries(
@@ -875,20 +849,13 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	subqueryMemAccount := subqueryMonitor.MakeBoundAccount()
 	defer subqueryMemAccount.Close(ctx)
 
-	var subqueryPlanCtx *PlanningCtx
 	var distributeSubquery bool
 	if maybeDistribute {
-		distributeSubquery = willDistributePlan(
+		distributeSubquery = getPlanDistribution(
 			ctx, planner.execCfg.NodeID, planner.SessionData().DistSQLMode, subqueryPlan.plan,
-		)
+		).WillDistribute()
 	}
-	if distributeSubquery {
-		subqueryPlanCtx = dsp.NewPlanningCtx(ctx, evalCtx, planner.txn)
-	} else {
-		subqueryPlanCtx = dsp.newLocalPlanningCtx(ctx, evalCtx)
-	}
-
-	subqueryPlanCtx.isLocal = !distributeSubquery
+	subqueryPlanCtx := dsp.NewPlanningCtx(ctx, evalCtx, planner.txn, distributeSubquery)
 	subqueryPlanCtx.planner = planner
 	subqueryPlanCtx.stmtType = tree.Rows
 	if planner.collectBundle {
@@ -899,11 +866,11 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	// Don't close the top-level plan from subqueries - someone else will handle
 	// that.
 	subqueryPlanCtx.ignoreClose = true
-	subqueryPhysPlan, err := dsp.createPlanForNode(subqueryPlanCtx, subqueryPlan.plan)
+	subqueryPhysPlan, err := dsp.createPhysPlan(subqueryPlanCtx, subqueryPlan.plan)
 	if err != nil {
 		return err
 	}
-	dsp.FinalizePlan(subqueryPlanCtx, &subqueryPhysPlan)
+	dsp.FinalizePlan(subqueryPlanCtx, subqueryPhysPlan)
 
 	// TODO(arjun): #28264: We set up a row container, wrap it in a row
 	// receiver, and use it and serialize the results of the subquery. The type
@@ -915,17 +882,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 		subqueryRecv.noColsRequired = true
 		typ = sqlbase.ColTypeInfoFromColTypes([]*types.T{})
 	} else {
-		// Apply the PlanToStreamColMap projection to the ResultTypes to get the
-		// final set of output types for the subquery. The reason this is necessary
-		// is that the output schema of a query sometimes contains columns necessary
-		// to merge the streams, but that aren't required by the final output of the
-		// query. These get projected out, so we need to similarly adjust the
-		// expected result types of the subquery here.
-		colTypes := make([]*types.T, len(subqueryPhysPlan.PlanToStreamColMap))
-		for i, resIdx := range subqueryPhysPlan.PlanToStreamColMap {
-			colTypes[i] = subqueryPhysPlan.ResultTypes[resIdx]
-		}
-		typ = sqlbase.ColTypeInfoFromColTypes(colTypes)
+		typ = sqlbase.ColTypeInfoFromColTypes(subqueryPhysPlan.ResultTypes)
 	}
 	rows = rowcontainer.NewRowContainer(subqueryMemAccount, typ, 0)
 	defer rows.Close(ctx)
@@ -933,7 +890,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	subqueryRowReceiver := NewRowResultWriter(rows)
 	subqueryRecv.resultWriter = subqueryRowReceiver
 	subqueryPlans[planIdx].started = true
-	dsp.Run(subqueryPlanCtx, planner.txn, &subqueryPhysPlan, subqueryRecv, evalCtx, nil /* finishedSetupFn */)()
+	dsp.Run(subqueryPlanCtx, planner.txn, subqueryPhysPlan, subqueryRecv, evalCtx, nil /* finishedSetupFn */)()
 	if subqueryRecv.commErr != nil {
 		return subqueryRecv.commErr
 	}
@@ -1010,19 +967,19 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 	evalCtx *extendedEvalContext,
 	planCtx *PlanningCtx,
 	txn *kv.Txn,
-	plan planNode,
+	plan planMaybePhysical,
 	recv *DistSQLReceiver,
 ) (cleanup func()) {
 	log.VEventf(ctx, 1, "creating DistSQL plan with isLocal=%v", planCtx.isLocal)
 
-	physPlan, err := dsp.createPlanForNode(planCtx, plan)
+	physPlan, err := dsp.createPhysPlan(planCtx, plan)
 	if err != nil {
 		recv.SetError(err)
 		return func() {}
 	}
-	dsp.FinalizePlan(planCtx, &physPlan)
+	dsp.FinalizePlan(planCtx, physPlan)
 	recv.expectedRowsRead = int64(physPlan.TotalEstimatedScannedRows)
-	return dsp.Run(planCtx, txn, &physPlan, recv, evalCtx, nil /* finishedSetupFn */)
+	return dsp.Run(planCtx, txn, physPlan, recv, evalCtx, nil /* finishedSetupFn */)
 }
 
 // PlanAndRunCascadesAndChecks runs any cascade and check queries.
@@ -1076,14 +1033,14 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 		}
 
 		evalCtx := evalCtxFactory()
-		execFactory := makeExecFactory(planner)
+		execFactory := newExecFactory(planner)
 		// The cascading query is allowed to autocommit only if it is the last
 		// cascade and there are no check queries to run.
 		if len(plan.checkPlans) > 0 || i < len(plan.cascades)-1 {
 			execFactory.disableAutoCommit()
 		}
 		cascadePlan, err := plan.cascades[i].PlanFn(
-			ctx, &planner.semaCtx, &evalCtx.EvalContext, &execFactory, buf, buf.bufferedRows.Len(),
+			ctx, &planner.semaCtx, &evalCtx.EvalContext, execFactory, buf, buf.bufferedRows.Len(),
 		)
 		if err != nil {
 			recv.SetError(err)
@@ -1165,7 +1122,7 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 // planAndRunPostquery runs a cascade or check query.
 func (dsp *DistSQLPlanner) planAndRunPostquery(
 	ctx context.Context,
-	postqueryPlan planNode,
+	postqueryPlan planMaybePhysical,
 	planner *planner,
 	evalCtx *extendedEvalContext,
 	recv *DistSQLReceiver,
@@ -1186,20 +1143,13 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 	postqueryMemAccount := postqueryMonitor.MakeBoundAccount()
 	defer postqueryMemAccount.Close(ctx)
 
-	var postqueryPlanCtx *PlanningCtx
 	var distributePostquery bool
 	if maybeDistribute {
-		distributePostquery = willDistributePlan(
+		distributePostquery = getPlanDistribution(
 			ctx, planner.execCfg.NodeID, planner.SessionData().DistSQLMode, postqueryPlan,
-		)
+		).WillDistribute()
 	}
-	if distributePostquery {
-		postqueryPlanCtx = dsp.NewPlanningCtx(ctx, evalCtx, planner.txn)
-	} else {
-		postqueryPlanCtx = dsp.newLocalPlanningCtx(ctx, evalCtx)
-	}
-
-	postqueryPlanCtx.isLocal = !distributePostquery
+	postqueryPlanCtx := dsp.NewPlanningCtx(ctx, evalCtx, planner.txn, distributePostquery)
 	postqueryPlanCtx.planner = planner
 	postqueryPlanCtx.stmtType = tree.Rows
 	postqueryPlanCtx.ignoreClose = true
@@ -1209,17 +1159,17 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 		}
 	}
 
-	postqueryPhysPlan, err := dsp.createPlanForNode(postqueryPlanCtx, postqueryPlan)
+	postqueryPhysPlan, err := dsp.createPhysPlan(postqueryPlanCtx, postqueryPlan)
 	if err != nil {
 		return err
 	}
-	dsp.FinalizePlan(postqueryPlanCtx, &postqueryPhysPlan)
+	dsp.FinalizePlan(postqueryPlanCtx, postqueryPhysPlan)
 
 	postqueryRecv := recv.clone()
 	// TODO(yuzefovich): at the moment, errOnlyResultWriter is sufficient here,
 	// but it may not be the case when we support cascades through the optimizer.
 	postqueryRecv.resultWriter = &errOnlyResultWriter{}
-	dsp.Run(postqueryPlanCtx, planner.txn, &postqueryPhysPlan, postqueryRecv, evalCtx, nil /* finishedSetupFn */)()
+	dsp.Run(postqueryPlanCtx, planner.txn, postqueryPhysPlan, postqueryRecv, evalCtx, nil /* finishedSetupFn */)()
 	if postqueryRecv.commErr != nil {
 		return postqueryRecv.commErr
 	}

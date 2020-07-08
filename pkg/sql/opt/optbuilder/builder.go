@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/exprgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
@@ -231,7 +232,7 @@ func (b *Builder) buildStmt(
 	stmt tree.Statement, desiredTypes []*types.T, inScope *scope,
 ) (outScope *scope) {
 	if b.insideViewDef {
-		// A black list of statements that can't be used from inside a view.
+		// A blocklist of statements that can't be used from inside a view.
 		switch stmt := stmt.(type) {
 		case *tree.Delete, *tree.Insert, *tree.Update, *tree.CreateTable, *tree.CreateView,
 			*tree.Split, *tree.Unsplit, *tree.Relocate,
@@ -337,4 +338,41 @@ func (b *Builder) allocScope() *scope {
 	b.scopeAlloc = b.scopeAlloc[1:]
 	r.builder = b
 	return r
+}
+
+// trackReferencedColumnForViews is used to add a column to the view's
+// dependencies. This should be called whenever a column reference is made in a
+// view query.
+func (b *Builder) trackReferencedColumnForViews(col *scopeColumn) {
+	if b.trackViewDeps {
+		for i := range b.viewDeps {
+			dep := b.viewDeps[i]
+			if ord, ok := dep.ColumnIDToOrd[col.id]; ok {
+				dep.ColumnOrdinals.Add(ord)
+			}
+			b.viewDeps[i] = dep
+		}
+	}
+}
+
+func (b *Builder) maybeTrackRegclassDependenciesForViews(texpr tree.TypedExpr) {
+	if b.trackViewDeps {
+		if texpr.ResolvedType() == types.RegClass {
+			// We do not add a dependency if the RegClass Expr contains variables,
+			// we cannot resolve the variables in this context. This matches Postgres
+			// behavior.
+			if !tree.ContainsVars(texpr) {
+				regclass, err := texpr.Eval(b.evalCtx)
+				if err != nil {
+					panic(err)
+				}
+				tn := tree.MakeUnqualifiedTableName(tree.Name(regclass.String()))
+				ds, _ := b.resolveDataSource(&tn, privilege.SELECT)
+
+				b.viewDeps = append(b.viewDeps, opt.ViewDep{
+					DataSource: ds,
+				})
+			}
+		}
+	}
 }

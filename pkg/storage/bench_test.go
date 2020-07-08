@@ -441,7 +441,7 @@ func runMVCCConditionalPut(
 	defer eng.Close()
 
 	b.SetBytes(int64(valueSize))
-	var expected *roachpb.Value
+	var expected []byte
 	if createFirst {
 		for i := 0; i < b.N; i++ {
 			key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
@@ -450,7 +450,7 @@ func runMVCCConditionalPut(
 				b.Fatalf("failed put: %+v", err)
 			}
 		}
-		expected = &value
+		expected = value.TagAndDataBytes()
 	}
 
 	b.ResetTimer()
@@ -981,5 +981,49 @@ func runBatchApplyBatchRepr(
 		batch.Close()
 	}
 
+	b.StopTimer()
+}
+
+func runExportToSst(
+	b *testing.B, emk engineMaker, numKeys int, numRevisions int, exportAllRevisions bool,
+) {
+	dir, cleanup := testutils.TempDir(b)
+	defer cleanup()
+	engine := emk(b, dir)
+	defer engine.Close()
+
+	batch := engine.NewWriteOnlyBatch()
+	for i := 0; i < numKeys; i++ {
+		key := make([]byte, 16)
+		key = append(key, 'a', 'a', 'a')
+		key = encoding.EncodeUint32Ascending(key, uint32(i))
+
+		for j := 0; j < numRevisions; j++ {
+			err := batch.Put(MVCCKey{Key: key, Timestamp: hlc.Timestamp{WallTime: int64(j + 1), Logical: 0}}, []byte("foobar"))
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	if err := batch.Commit(true); err != nil {
+		b.Fatal(err)
+	}
+	batch.Close()
+	if err := engine.Flush(); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		startTS := hlc.Timestamp{WallTime: int64(numRevisions / 2)}
+		endTS := hlc.Timestamp{WallTime: int64(numRevisions + 2)}
+		_, _, _, err := engine.ExportToSst(roachpb.KeyMin, roachpb.KeyMax, startTS, endTS, exportAllRevisions, 0 /* targetSize */, 0 /* maxSize */, IterOptions{
+			LowerBound: roachpb.KeyMin,
+			UpperBound: roachpb.KeyMax,
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
 	b.StopTimer()
 }

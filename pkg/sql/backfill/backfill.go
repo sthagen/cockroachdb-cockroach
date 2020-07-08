@@ -17,14 +17,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/errors"
 )
 
 // MutationFilter is the type of a simple predicate on a mutation.
@@ -64,9 +65,12 @@ type ColumnBackfiller struct {
 func (cb *ColumnBackfiller) Init(
 	ctx context.Context, evalCtx *tree.EvalContext, desc *sqlbase.ImmutableTableDescriptor,
 ) error {
+	cols := desc.Columns
 	cb.evalCtx = evalCtx
 	var dropped []sqlbase.ColumnDescriptor
 	if len(desc.Mutations) > 0 {
+		cols = make([]sqlbase.ColumnDescriptor, 0, len(desc.Columns)+len(desc.Mutations))
+		cols = append(cols, desc.Columns...)
 		for _, m := range desc.Mutations {
 			if ColumnMutationFilter(m) {
 				desc := *m.GetColumn()
@@ -76,27 +80,67 @@ func (cb *ColumnBackfiller) Init(
 				case sqlbase.DescriptorMutation_DROP:
 					dropped = append(dropped, desc)
 				}
+				cols = append(cols, desc)
 			}
 		}
 	}
-	defaultExprs, err := sqlbase.MakeDefaultExprs(
-		ctx, cb.added, &transform.ExprTransformContext{}, cb.evalCtx,
-	)
-	if err != nil {
-		return err
+
+	colTyps := make([]*types.T, len(cols))
+	for i := range cols {
+		colTyps[i] = cols[i].Type
 	}
-	var txCtx transform.ExprTransformContext
-	computedExprs, err := sqlbase.MakeComputedExprs(
-		ctx,
-		cb.added,
-		desc,
-		tree.NewUnqualifiedTableName(tree.Name(desc.Name)),
-		&txCtx,
-		cb.evalCtx,
-		true, /* addingCols */
-	)
-	if err != nil {
-		return err
+
+	var defaultExprs, computedExprs []tree.TypedExpr
+	// Set up a closure to hydrate and preprocess expressions needed for
+	// the backfill.
+	hydrateTypes := func(ctx context.Context, evalCtx *tree.EvalContext) error {
+		// Hydrate all the types present in the table.
+		if err := execinfrapb.HydrateTypeSlice(cb.evalCtx, colTyps); err != nil {
+			return err
+		}
+		// Set up a SemaContext to type check the default and computed expressions.
+		semaCtx := tree.MakeSemaContext()
+		semaCtx.TypeResolver = cb.evalCtx.TypeResolver
+		var err error
+		defaultExprs, err = sqlbase.MakeDefaultExprs(
+			ctx, cb.added, &transform.ExprTransformContext{}, cb.evalCtx, &semaCtx,
+		)
+		if err != nil {
+			return err
+		}
+		var txCtx transform.ExprTransformContext
+		computedExprs, err = schemaexpr.MakeComputedExprs(
+			ctx,
+			cb.added,
+			desc,
+			tree.NewUnqualifiedTableName(tree.Name(desc.Name)),
+			&txCtx,
+			cb.evalCtx,
+			&semaCtx,
+			true, /* addingCols */
+		)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if cb.evalCtx.Txn != nil {
+		// If we have a txn, then use it.
+		if err := hydrateTypes(ctx, cb.evalCtx); err != nil {
+			return err
+		}
+	} else {
+		// Otherwise, create one. We fall into this case when performing
+		// a distributed backfill outside of a transaction.
+		if err := cb.evalCtx.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			cb.evalCtx.Txn = txn
+			return hydrateTypes(ctx, cb.evalCtx)
+		}); err != nil {
+			return err
+		}
+		// Reset the evalCtx's transaction after type the expressions are processed.
+		cb.evalCtx.Txn = nil
 	}
 
 	cb.updateCols = append(cb.added, dropped...)
@@ -144,37 +188,11 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 	ctx context.Context,
 	txn *kv.Txn,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
-	otherTables []*sqlbase.ImmutableTableDescriptor,
 	sp roachpb.Span,
 	chunkSize int64,
 	alsoCommit bool,
 	traceKV bool,
 ) (roachpb.Key, error) {
-	fkTables, _ := row.MakeFkMetadata(
-		ctx,
-		tableDesc,
-		row.CheckUpdates,
-		row.NoLookup,
-		row.NoCheckPrivilege,
-		nil, /* AnalyzeExprFunction */
-		nil, /* CheckHelper */
-	)
-	for i, fkTableDesc := range otherTables {
-		found, ok := fkTables[fkTableDesc.ID]
-		if !ok {
-			// We got passed an extra table for some reason - just ignore it.
-			continue
-		}
-
-		found.Desc = otherTables[i]
-		fkTables[fkTableDesc.ID] = found
-	}
-	for id, table := range fkTables {
-		if table.Desc == nil {
-			// We weren't passed all of the tables that we need by the coordinator.
-			return roachpb.Key{}, errors.AssertionFailedf("table %v not sent by coordinator", id)
-		}
-	}
 	// TODO(dan): Tighten up the bound on the requestedCols parameter to
 	// makeRowUpdater.
 	requestedCols := make([]sqlbase.ColumnDescriptor, 0, len(tableDesc.Columns)+len(cb.added))
@@ -185,12 +203,9 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 		txn,
 		cb.evalCtx.Codec,
 		tableDesc,
-		fkTables,
 		cb.updateCols,
 		requestedCols,
 		row.UpdaterOnlyColumns,
-		row.CheckFKs,
-		cb.evalCtx,
 		&cb.alloc,
 	)
 	if err != nil {
@@ -267,7 +282,7 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 			}
 		}
 		if _, err := ru.UpdateRow(
-			ctx, b, oldValues, updateValues, row.CheckFKs, traceKV,
+			ctx, b, oldValues, updateValues, traceKV,
 		); err != nil {
 			return roachpb.Key{}, err
 		}
@@ -362,6 +377,25 @@ func (ib *IndexBackfiller) Init(
 	ib.types = make([]*types.T, len(cols))
 	for i := range cols {
 		ib.types[i] = cols[i].Type
+	}
+
+	// Hydrate types used by the backfiller.
+	// TODO (rohany): As part of #49261, this needs to use cached enum data.
+	if evalCtx.Txn != nil {
+		// If the evalCtx has a transaction (if the schema change is running on a
+		// new table within a transaction), then use that.
+		if err := execinfrapb.HydrateTypeSlice(evalCtx, ib.types); err != nil {
+			return err
+		}
+	} else {
+		// Otherwise, make a new transaction. This case will happen when we are
+		// performing a distributed schema change outside of a transaction.
+		if err := ib.evalCtx.DB.Txn(evalCtx.Context, func(_ context.Context, txn *kv.Txn) error {
+			evalCtx.Txn = txn
+			return execinfrapb.HydrateTypeSlice(evalCtx, ib.types)
+		}); err != nil {
+			return err
+		}
 	}
 
 	ib.colIdxMap = make(map[sqlbase.ColumnID]int, len(cols))

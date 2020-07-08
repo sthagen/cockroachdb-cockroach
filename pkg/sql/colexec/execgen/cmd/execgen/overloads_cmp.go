@@ -242,7 +242,7 @@ func (c decimalIntCustomizer) getCmpOpCompareFunc() compareFunc {
 		t := template.Must(template.New("").Parse(`
 			{
 				tmpDec := &_overloadHelper.tmpDec1
-				tmpDec.SetFinite(int64({{.Right}}), 0)
+				tmpDec.SetInt64(int64({{.Right}}))
 				{{.Target}} = tree.CompareDecimals(&{{.Left}}, tmpDec)
 			}
 		`))
@@ -280,7 +280,7 @@ func (c intDecimalCustomizer) getCmpOpCompareFunc() compareFunc {
 		t := template.Must(template.New("").Parse(`
 			{
 				tmpDec := &_overloadHelper.tmpDec1
-				tmpDec.SetFinite(int64({{.Left}}), 0)
+				tmpDec.SetInt64(int64({{.Left}}))
 				{{.Target}} = tree.CompareDecimals(tmpDec, &{{.Right}})
 			}
 		`))
@@ -331,9 +331,19 @@ func (c intervalCustomizer) getCmpOpCompareFunc() compareFunc {
 	}
 }
 
+// getDatumVecVariableName returns the variable name for a datumVec given
+// leftCol and rightCol (either of which could be "_" - meaning there is no
+// vector in scope for the corresponding side).
+func getDatumVecVariableName(leftCol, rightCol string) string {
+	if leftCol == "_" {
+		return rightCol
+	}
+	return leftCol
+}
+
 func (c datumCustomizer) getCmpOpCompareFunc() compareFunc {
 	return func(targetElem, leftElem, rightElem, leftCol, rightCol string) string {
-		datumVecVariableName := getDatumVecVariableName(leftCol, rightCol, false /* preferRightSide */)
+		datumVecVariableName := getDatumVecVariableName(leftCol, rightCol)
 		return fmt.Sprintf(`
 			%s = %s.(*coldataext.Datum).CompareDatum(%s, %s)
 		`, targetElem, leftElem, datumVecVariableName, rightElem)

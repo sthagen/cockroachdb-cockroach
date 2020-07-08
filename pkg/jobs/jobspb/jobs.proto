@@ -62,22 +62,25 @@ message BackupProgress {
 }
 
 message RestoreDetails {
-  message TableRewrite {
-    uint32 table_id = 1 [
-      (gogoproto.customname) = "TableID",
+  message DescriptorRewrite {
+    uint32 id = 1 [
+      (gogoproto.customname) = "ID",
       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
     ];
     uint32 parent_id = 2 [
       (gogoproto.customname) = "ParentID",
       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
     ];
+    // ToExisting represents whether this descriptor is being remapped to a
+    // descriptor that already exists in the cluster.
+    bool to_existing = 3;
   }
   message BackupLocalityInfo {
     map<string, string> uris_by_original_locality_kv = 1 [(gogoproto.customname) = "URIsByOriginalLocalityKV"];
   }
   reserved 1;
   util.hlc.Timestamp end_time = 4 [(gogoproto.nullable) = false];
-  map<uint32, TableRewrite> table_rewrites = 2 [
+  map<uint32, DescriptorRewrite> descriptor_rewrites = 2 [
     (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
   ];
   // URIs contains one URI for each backup (full or incremental) corresponding
@@ -353,6 +356,9 @@ message CreateStatsDetails {
 
     // Indicates whether this column stat should include a histogram.
     bool has_histogram = 2;
+
+    // Indicates whether this column stat is over an inverted index.
+    bool inverted = 3;
   }
   string name = 1;
   sqlbase.TableDescriptor table = 2 [(gogoproto.nullable) = false];

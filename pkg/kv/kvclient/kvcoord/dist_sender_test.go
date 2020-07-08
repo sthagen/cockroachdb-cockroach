@@ -88,16 +88,19 @@ var (
 		EndKey:   roachpb.RKeyMax,
 		InternalReplicas: []roachpb.ReplicaDescriptor{
 			{
-				NodeID:  1,
-				StoreID: 1,
+				ReplicaID: 1,
+				NodeID:    1,
+				StoreID:   1,
 			},
 			{
-				NodeID:  2,
-				StoreID: 2,
+				ReplicaID: 2,
+				NodeID:    2,
+				StoreID:   2,
 			},
 			{
-				NodeID:  3,
-				StoreID: 3,
+				ReplicaID: 3,
+				NodeID:    3,
+				StoreID:   3,
 			},
 		},
 	}
@@ -167,6 +170,13 @@ func (l *simpleTransportAdapter) NextReplica() roachpb.ReplicaDescriptor {
 		return l.replicas[l.nextReplica].ReplicaDescriptor
 	}
 	return roachpb.ReplicaDescriptor{}
+}
+
+func (l *simpleTransportAdapter) SkipReplica() {
+	if l.IsExhausted() {
+		return
+	}
+	l.nextReplica++
 }
 
 func (*simpleTransportAdapter) MoveToFront(roachpb.ReplicaDescriptor) {
@@ -288,7 +298,7 @@ func TestSendRPCOrder(t *testing.T) {
 			// Compare only the first two resulting addresses.
 			expReplica: []roachpb.NodeID{5, 4, 0, 0, 0},
 		},
-		// Put with matching attributes that finds the lease holder (node 3).
+		// Put with matching attributes that finds the lease holder (node 2).
 		// Should address the lease holder and the two nodes matching the attributes
 		// (the last and second to last) in that order.
 		{
@@ -348,6 +358,7 @@ func TestSendRPCOrder(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
@@ -357,7 +368,7 @@ func TestSendRPCOrder(t *testing.T) {
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
 
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 
 	for n, tc := range testCases {
 		t.Run("", func(t *testing.T) {
@@ -378,14 +389,15 @@ func TestSendRPCOrder(t *testing.T) {
 				}
 			}
 
-			ds.leaseHolderCache.Update(
-				ctx, rangeID, roachpb.StoreID(0),
-			)
-			if tc.leaseHolder > 0 {
-				ds.leaseHolderCache.Update(
-					ctx, rangeID, descriptor.InternalReplicas[tc.leaseHolder-1].StoreID,
-				)
+			ds.rangeCache.Clear()
+			var lease roachpb.Lease
+			if tc.leaseHolder != 0 {
+				lease.Replica = descriptor.InternalReplicas[tc.leaseHolder-1]
 			}
+			ds.rangeCache.Insert(ctx, roachpb.RangeInfo{
+				Desc:  descriptor,
+				Lease: lease,
+			})
 
 			args := tc.args
 			{
@@ -447,7 +459,7 @@ func (mdb MockRangeDescriptorDB) withMetaRecursion(
 	return func(key roachpb.RKey, useReverseScan bool) (rs, preRs []roachpb.RangeDescriptor, err error) {
 		metaKey := keys.RangeMetaKey(key)
 		if !metaKey.Equal(roachpb.RKeyMin) {
-			_, _, err := rdc.LookupRangeDescriptorWithEvictionToken(context.Background(), metaKey, nil, useReverseScan)
+			_, err := rdc.LookupWithEvictionToken(context.Background(), metaKey, EvictionToken{}, useReverseScan)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -518,6 +530,7 @@ func TestImmutableBatchArgs(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
@@ -527,7 +540,7 @@ func TestImmutableBatchArgs(t *testing.T) {
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
 
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 
 	txn := roachpb.MakeTransaction(
 		"test", nil /* baseKey */, roachpb.NormalUserPriority,
@@ -551,68 +564,90 @@ func TestImmutableBatchArgs(t *testing.T) {
 	}
 }
 
-// TestRetryOnNotLeaseHolderError verifies that the DistSender correctly updates the
-// lease holder cache and retries when receiving a NotLeaseHolderError.
+// TestRetryOnNotLeaseHolderError verifies that the DistSender correctly updates
+// the leaseholder in the range cache and retries when receiving a
+// NotLeaseHolderError.
 func TestRetryOnNotLeaseHolderError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
-	g := makeGossip(t, stopper, rpcContext)
-	leaseHolder := roachpb.ReplicaDescriptor{
+	recognizedLeaseHolder := testUserRangeDescriptor3Replicas.Replicas().Voters()[1]
+	unrecognizedLeaseHolder := roachpb.ReplicaDescriptor{
 		NodeID:  99,
 		StoreID: 999,
 	}
-	first := true
 
-	var testFn simpleSendFn = func(
-		_ context.Context,
-		_ SendOptions,
-		_ ReplicaSlice,
-		args roachpb.BatchRequest,
-	) (*roachpb.BatchResponse, error) {
-		reply := &roachpb.BatchResponse{}
-		if first {
-			reply.Error = roachpb.NewError(
-				&roachpb.NotLeaseHolderError{LeaseHolder: &leaseHolder})
-			first = false
+	testutils.RunTrueAndFalse(t, "leaseholder in descriptor", func(t *testing.T, lhRecognized bool) {
+		stopper := stop.NewStopper()
+		defer stopper.Stop(context.Background())
+
+		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+		rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+		g := makeGossip(t, stopper, rpcContext)
+		for _, n := range testUserRangeDescriptor3Replicas.Replicas().Voters() {
+			require.NoError(t, g.AddInfoProto(
+				gossip.MakeNodeIDKey(n.NodeID),
+				newNodeDesc(n.NodeID),
+				gossip.NodeDescriptorTTL,
+			))
+		}
+
+		first := true
+
+		var testFn simpleSendFn = func(
+			_ context.Context,
+			_ SendOptions,
+			_ ReplicaSlice,
+			args roachpb.BatchRequest,
+		) (*roachpb.BatchResponse, error) {
+			reply := &roachpb.BatchResponse{}
+			if first {
+				leaseHolder := recognizedLeaseHolder
+				if !lhRecognized {
+					leaseHolder = unrecognizedLeaseHolder
+				}
+
+				reply.Error = roachpb.NewError(
+					&roachpb.NotLeaseHolderError{LeaseHolder: &leaseHolder})
+				first = false
+				return reply, nil
+			}
+			// Return an error to avoid activating a code path that would update the
+			// cache with the leaseholder from the successful response. That's not
+			// what this test wants to test.
+			reply.Error = roachpb.NewErrorf("boom")
 			return reply, nil
 		}
-		// Return an error to avoid activating a code path that would
-		// populate the leaseholder cache from the successful response.
-		// That's not what this test wants to test.
-		reply.Error = roachpb.NewErrorf("boom")
-		return reply, nil
-	}
 
-	cfg := DistSenderConfig{
-		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
-		Clock:      clock,
-		RPCContext: rpcContext,
-		TestingKnobs: ClientTestingKnobs{
-			TransportFactory: adaptSimpleTransport(testFn),
-		},
-		RangeDescriptorDB: defaultMockRangeDescriptorDB,
-		NodeDialer:        nodedialer.New(rpcContext, gossip.AddressResolver(g)),
-		Settings:          cluster.MakeTestingClusterSettings(),
-	}
-	ds := NewDistSender(cfg, g)
-	v := roachpb.MakeValueFromString("value")
-	put := roachpb.NewPut(roachpb.Key("a"), v)
-	if _, pErr := kv.SendWrapped(context.Background(), ds, put); !testutils.IsPError(pErr, "boom") {
-		t.Fatalf("unexpected error: %v", pErr)
-	}
-	if first {
-		t.Errorf("The command did not retry")
-	}
-	rangeID := roachpb.RangeID(2)
-	if cur, ok := ds.leaseHolderCache.Lookup(context.Background(), rangeID); !ok {
-		t.Errorf("lease holder cache was not updated: expected %+v", leaseHolder)
-	} else if cur != leaseHolder.StoreID {
-		t.Errorf("lease holder cache was not updated: expected %d, got %d", leaseHolder.StoreID, cur)
-	}
+		cfg := DistSenderConfig{
+			AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
+			Clock:      clock,
+			NodeDescs:  g,
+			RPCContext: rpcContext,
+			TestingKnobs: ClientTestingKnobs{
+				TransportFactory: adaptSimpleTransport(testFn),
+			},
+			RangeDescriptorDB: threeReplicaMockRangeDescriptorDB,
+			NodeDialer:        nodedialer.New(rpcContext, gossip.AddressResolver(g)),
+			Settings:          cluster.MakeTestingClusterSettings(),
+		}
+		ds := NewDistSender(cfg)
+		v := roachpb.MakeValueFromString("value")
+		put := roachpb.NewPut(roachpb.Key("a"), v)
+		if _, pErr := kv.SendWrapped(context.Background(), ds, put); !testutils.IsPError(pErr, "boom") {
+			t.Fatalf("unexpected error: %v", pErr)
+		}
+		if first {
+			t.Fatal("the request did not retry")
+		}
+		rng := ds.rangeCache.GetCached(testUserRangeDescriptor.StartKey, false /* inverted */)
+		require.NotNil(t, rng)
+
+		if lhRecognized {
+			require.Equal(t, recognizedLeaseHolder, rng.Lease.Replica)
+		} else {
+			require.Equal(t, roachpb.ReplicaDescriptor{}, rng.Lease.Replica)
+		}
+	})
 }
 
 // TestBackoffOnNotLeaseHolderErrorDuringTransfer verifies that the DistSender
@@ -621,7 +656,8 @@ func TestRetryOnNotLeaseHolderError(t *testing.T) {
 func TestBackoffOnNotLeaseHolderErrorDuringTransfer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
 
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
@@ -667,6 +703,7 @@ func TestBackoffOnNotLeaseHolderErrorDuringTransfer(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
@@ -683,20 +720,22 @@ func TestBackoffOnNotLeaseHolderErrorDuringTransfer(t *testing.T) {
 		leaseSequences []roachpb.LeaseSequence
 		expected       int64
 	}{
-		{[]roachpb.LeaseSequence{1, 0, 1, 2}, 2},
+		{[]roachpb.LeaseSequence{2, 1, 2, 3}, 2},
 		{[]roachpb.LeaseSequence{0}, 0},
-		{[]roachpb.LeaseSequence{1, 0, 1, 2, 1}, 3},
+		{[]roachpb.LeaseSequence{2, 1, 2, 3, 2}, 3},
 	} {
-		sequences = c.leaseSequences
-		ds := NewDistSender(cfg, g)
-		v := roachpb.MakeValueFromString("value")
-		put := roachpb.NewPut(roachpb.Key("a"), v)
-		if _, pErr := kv.SendWrapped(context.Background(), ds, put); !testutils.IsPError(pErr, "boom") {
-			t.Fatalf("%d: unexpected error: %v", i, pErr)
-		}
-		if got := ds.Metrics().InLeaseTransferBackoffs.Count(); got != c.expected {
-			t.Fatalf("%d: expected %d backoffs, got %d", i, c.expected, got)
-		}
+		t.Run("", func(t *testing.T) {
+			sequences = c.leaseSequences
+			ds := NewDistSender(cfg)
+			v := roachpb.MakeValueFromString("value")
+			put := roachpb.NewPut(roachpb.Key("a"), v)
+			if _, pErr := kv.SendWrapped(ctx, ds, put); !testutils.IsPError(pErr, "boom") {
+				t.Fatalf("%d: unexpected error: %v", i, pErr)
+			}
+			if got := ds.Metrics().InLeaseTransferBackoffs.Count(); got != c.expected {
+				t.Fatalf("%d: expected %d backoffs, got %d", i, c.expected, got)
+			}
+		})
 	}
 }
 
@@ -740,35 +779,41 @@ func TestDistSenderDownNodeEvictLeaseholder(t *testing.T) {
 		}
 	}
 
+	desc := roachpb.RangeDescriptor{
+		RangeID:  1,
+		StartKey: roachpb.RKeyMin,
+		EndKey:   roachpb.RKeyMax,
+		InternalReplicas: []roachpb.ReplicaDescriptor{
+			{
+				NodeID:  1,
+				StoreID: 1,
+			},
+			{
+				NodeID:  2,
+				StoreID: 2,
+			},
+		},
+	}
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(transport),
 		},
-		RangeDescriptorDB: mockRangeDescriptorDBForDescs(
-			roachpb.RangeDescriptor{
-				RangeID:  1,
-				StartKey: roachpb.RKeyMin,
-				EndKey:   roachpb.RKeyMax,
-				InternalReplicas: []roachpb.ReplicaDescriptor{
-					{
-						NodeID:  1,
-						StoreID: 1,
-					},
-					{
-						NodeID:  2,
-						StoreID: 2,
-					},
-				},
-			}),
-		NodeDialer: nodedialer.New(rpcContext, gossip.AddressResolver(g)),
-		Settings:   cluster.MakeTestingClusterSettings(),
+		RangeDescriptorDB: mockRangeDescriptorDBForDescs(desc),
+		NodeDialer:        nodedialer.New(rpcContext, gossip.AddressResolver(g)),
+		Settings:          cluster.MakeTestingClusterSettings(),
 	}
 
-	ds := NewDistSender(cfg, g)
-	ds.LeaseHolderCache().Update(ctx, roachpb.RangeID(1), roachpb.StoreID(1))
+	ds := NewDistSender(cfg)
+	var lease roachpb.Lease
+	lease.Replica = roachpb.ReplicaDescriptor{StoreID: 1}
+	ds.rangeCache.Insert(ctx, roachpb.RangeInfo{
+		Desc:  desc,
+		Lease: lease,
+	})
 
 	var ba roachpb.BatchRequest
 	ba.RangeID = 1
@@ -784,11 +829,8 @@ func TestDistSenderDownNodeEvictLeaseholder(t *testing.T) {
 		t.Errorf("contacted n1: %t, contacted n2: %t", contacted1, contacted2)
 	}
 
-	if storeID, ok := ds.LeaseHolderCache().Lookup(ctx, roachpb.RangeID(1)); !ok {
-		t.Fatalf("expected new leaseholder to be cached")
-	} else if exp := roachpb.StoreID(2); storeID != exp {
-		t.Fatalf("expected lease holder for r1 to be cached as s%d, but got s%d", exp, storeID)
-	}
+	rng := ds.rangeCache.GetCached(testUserRangeDescriptor.StartKey, false /* inverted */)
+	require.Equal(t, roachpb.StoreID(2), rng.Lease.Replica.StoreID)
 }
 
 // TestRetryOnDescriptorLookupError verifies that the DistSender retries a descriptor
@@ -810,6 +852,7 @@ func TestRetryOnDescriptorLookupError(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(stubRPCSendFn),
@@ -828,7 +871,7 @@ func TestRetryOnDescriptorLookupError(t *testing.T) {
 		NodeDialer: nodedialer.New(rpcContext, gossip.AddressResolver(g)),
 		Settings:   cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 	put := roachpb.NewPut(roachpb.Key("a"), roachpb.MakeValueFromString("value"))
 	// Error on descriptor lookup, second attempt successful.
 	if _, pErr := kv.SendWrapped(context.Background(), ds, put); pErr != nil {
@@ -883,6 +926,7 @@ func TestEvictOnFirstRangeGossip(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: SenderTransportFactory(
@@ -890,19 +934,22 @@ func TestEvictOnFirstRangeGossip(t *testing.T) {
 				kv.SenderFunc(sender),
 			),
 		},
-		RangeDescriptorDB: rDB,
-		NodeDialer:        nodedialer.New(rpcContext, gossip.AddressResolver(g)),
-		Settings:          cluster.MakeTestingClusterSettings(),
+		// Provide both FirstRangeProvider and RangeDescriptorDB to listen to
+		// changes to the first range while still using a MockRangeDescriptorDB.
+		FirstRangeProvider: g,
+		RangeDescriptorDB:  rDB,
+		NodeDialer:         nodedialer.New(rpcContext, gossip.AddressResolver(g)),
+		Settings:           cluster.MakeTestingClusterSettings(),
 	}
 
-	ds := NewDistSender(cfg, g).withMetaRecursion()
+	ds := NewDistSender(cfg).withMetaRecursion()
 
 	anyKey := roachpb.Key("anything")
 	rAnyKey := keys.MustAddr(anyKey)
 
 	call := func() {
-		if _, _, err := ds.rangeCache.LookupRangeDescriptorWithEvictionToken(
-			context.Background(), rAnyKey, nil, false,
+		if _, err := ds.rangeCache.LookupWithEvictionToken(
+			context.Background(), rAnyKey, EvictionToken{}, false,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -939,97 +986,128 @@ func TestEvictOnFirstRangeGossip(t *testing.T) {
 
 func TestEvictCacheOnError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	// if rpcError is true, the first attempt gets an RPC error, otherwise
-	// the RPC call succeeds but there is an error in the RequestHeader.
+	// The first attempt gets a BatchResponse with replicaError in the header, if
+	// replicaError set. If not set, the first attempt gets an RPC error. The
+	// second attempt, if any, succeeds.
 	// Currently lease holder and cached range descriptor are treated equally.
 	// TODO(bdarnell): refactor to cover different types of retryable errors.
+	const errString = "boom"
+
+	// One of the subtests returns a RangeKeyMismatchError simulating the request
+	// falling on the lhs after a split, whereas the request wanted the rhs.
+	splitKey := roachpb.RKey("a")
+	lhs := roachpb.RangeDescriptor{
+		RangeID:  testUserRangeDescriptor.RangeID,
+		StartKey: testUserRangeDescriptor.StartKey,
+		EndKey:   splitKey,
+		InternalReplicas: []roachpb.ReplicaDescriptor{
+			{
+				NodeID:  1,
+				StoreID: 1,
+			},
+		},
+	}
+	rhs := roachpb.RangeDescriptor{
+		RangeID:  testUserRangeDescriptor.RangeID,
+		StartKey: splitKey,
+		EndKey:   testUserRangeDescriptor.EndKey,
+		InternalReplicas: []roachpb.ReplicaDescriptor{
+			{
+				NodeID:  1,
+				StoreID: 1,
+			},
+		},
+	}
+
+	rangeMismachErr := roachpb.NewRangeKeyMismatchError(
+		context.Background(), nil, nil, &lhs, nil /* lease */)
+	rangeMismachErr.AppendRangeInfo(context.Background(), rhs, roachpb.Lease{})
+
 	testCases := []struct {
 		canceledCtx            bool
-		rpcError               bool
 		replicaError           error
 		shouldClearLeaseHolder bool
 		shouldClearReplica     bool
 	}{
-		{false, false, nil, false, false},                              // non-retryable replica error
-		{false, false, &roachpb.RangeKeyMismatchError{}, false, false}, // RangeKeyMismatch replica error
-		{false, true, &roachpb.RangeKeyMismatchError{}, false, false},  // RPC error aka all nodes dead
-		{false, false, &roachpb.RangeNotFoundError{}, false, false},    // RangeNotFound replica error
-		{false, true, &roachpb.RangeNotFoundError{}, false, false},     // RPC error aka all nodes dead
-		{true, false, nil, false, false},                               // canceled context
+		{false, errors.New(errString), false, false},         // non-retryable replica error
+		{false, rangeMismachErr, false, false},               // RangeKeyMismatch replica error
+		{false, &roachpb.RangeNotFoundError{}, false, false}, // RangeNotFound replica error
+		{false, nil, false, false},                           // RPC error
+		{true, nil, false, false},                            // canceled context
 	}
 
-	const errString = "boom"
+	for _, tc := range testCases {
+		t.Run("", func(t *testing.T) {
+			stopper := stop.NewStopper()
+			defer stopper.Stop(context.Background())
 
-	for i, tc := range testCases {
-		stopper := stop.NewStopper()
-		defer stopper.Stop(context.Background())
-
-		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-		rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
-		g := makeGossip(t, stopper, rpcContext)
-		leaseHolder := roachpb.ReplicaDescriptor{
-			NodeID:  99,
-			StoreID: 999,
-		}
-		first := true
-
-		ctx, cancel := context.WithCancel(context.Background())
-
-		var testFn simpleSendFn = func(
-			ctx context.Context,
-			_ SendOptions,
-			_ ReplicaSlice,
-			args roachpb.BatchRequest,
-		) (*roachpb.BatchResponse, error) {
-			if !first {
-				return args.CreateReply(), nil
+			clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+			rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+			g := makeGossip(t, stopper, rpcContext)
+			leaseHolder := roachpb.ReplicaDescriptor{
+				NodeID:  99,
+				StoreID: 999,
 			}
-			first = false
-			if tc.canceledCtx {
-				cancel()
-				return nil, ctx.Err()
-			}
-			if tc.rpcError {
-				return nil, roachpb.NewSendError(errString)
-			}
-			var err error
-			if tc.replicaError != nil {
-				err = tc.replicaError
-			} else {
-				err = errors.New(errString)
-			}
-			reply := &roachpb.BatchResponse{}
-			reply.Error = roachpb.NewError(err)
-			return reply, nil
-		}
+			first := true
 
-		cfg := DistSenderConfig{
-			AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
-			Clock:      clock,
-			RPCContext: rpcContext,
-			TestingKnobs: ClientTestingKnobs{
-				TransportFactory: adaptSimpleTransport(testFn),
-			},
-			RangeDescriptorDB: defaultMockRangeDescriptorDB,
-			NodeDialer:        nodedialer.New(rpcContext, gossip.AddressResolver(g)),
-			Settings:          cluster.MakeTestingClusterSettings(),
-		}
-		ds := NewDistSender(cfg, g)
-		ds.leaseHolderCache.Update(context.Background(), 1, leaseHolder.StoreID)
-		key := roachpb.Key("a")
-		put := roachpb.NewPut(key, roachpb.MakeValueFromString("value"))
+			ctx, cancel := context.WithCancel(context.Background())
 
-		if _, pErr := kv.SendWrapped(ctx, ds, put); pErr != nil && !testutils.IsPError(pErr, errString) && !testutils.IsError(pErr.GoError(), ctx.Err().Error()) {
-			t.Errorf("put encountered unexpected error: %s", pErr)
-		}
-		if _, ok := ds.leaseHolderCache.Lookup(context.Background(), 1); ok != !tc.shouldClearLeaseHolder {
-			t.Errorf("%d: lease holder cache eviction: shouldClearLeaseHolder=%t, but value is %t", i, tc.shouldClearLeaseHolder, ok)
-		}
-		if cachedDesc, err := ds.rangeCache.GetCachedRangeDescriptor(roachpb.RKey(key), false /* inverted */); err != nil {
-			t.Error(err)
-		} else if cachedDesc == nil != tc.shouldClearReplica {
-			t.Errorf("%d: unexpected second replica lookup behavior: wanted=%t", i, tc.shouldClearReplica)
-		}
+			var testFn simpleSendFn = func(
+				ctx context.Context,
+				_ SendOptions,
+				_ ReplicaSlice,
+				args roachpb.BatchRequest,
+			) (*roachpb.BatchResponse, error) {
+				if !first {
+					return args.CreateReply(), nil
+				}
+				first = false
+				if tc.canceledCtx {
+					cancel()
+					return nil, ctx.Err()
+				}
+				if tc.replicaError == nil {
+					return nil, errors.New(errString)
+				}
+				reply := &roachpb.BatchResponse{}
+				reply.Error = roachpb.NewError(tc.replicaError)
+				return reply, nil
+			}
+
+			cfg := DistSenderConfig{
+				AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
+				Clock:      clock,
+				NodeDescs:  g,
+				RPCContext: rpcContext,
+				TestingKnobs: ClientTestingKnobs{
+					TransportFactory: adaptSimpleTransport(testFn),
+				},
+				RangeDescriptorDB: defaultMockRangeDescriptorDB,
+				NodeDialer:        nodedialer.New(rpcContext, gossip.AddressResolver(g)),
+				Settings:          cluster.MakeTestingClusterSettings(),
+			}
+			ds := NewDistSender(cfg)
+
+			var lease roachpb.Lease
+			lease.Replica = leaseHolder
+			ds.rangeCache.Insert(ctx, roachpb.RangeInfo{
+				Desc:  testUserRangeDescriptor,
+				Lease: lease,
+			})
+
+			key := roachpb.Key("b")
+			put := roachpb.NewPut(key, roachpb.MakeValueFromString("value"))
+
+			if _, pErr := kv.SendWrapped(ctx, ds, put); pErr != nil && !testutils.IsPError(pErr, errString) && !testutils.IsError(pErr.GoError(), ctx.Err().Error()) {
+				t.Errorf("put encountered unexpected error: %s", pErr)
+			}
+			rng := ds.rangeCache.GetCached(testUserRangeDescriptor.StartKey, false /* inverted */)
+			if tc.shouldClearReplica {
+				require.Nil(t, rng)
+			} else if tc.shouldClearLeaseHolder {
+				require.True(t, rng.Lease.Empty())
+			}
+		})
 	}
 }
 
@@ -1075,6 +1153,7 @@ func TestEvictCacheOnUnknownLeaseHolder(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
@@ -1083,7 +1162,7 @@ func TestEvictCacheOnUnknownLeaseHolder(t *testing.T) {
 		NodeDialer:        nodedialer.New(rpcContext, gossip.AddressResolver(g)),
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 	key := roachpb.Key("a")
 	put := roachpb.NewPut(key, roachpb.MakeValueFromString("value"))
 
@@ -1177,14 +1256,16 @@ func TestRetryOnWrongReplicaError(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
 		},
-		NodeDialer: nodedialer.New(rpcContext, gossip.AddressResolver(g)),
-		Settings:   cluster.MakeTestingClusterSettings(),
+		NodeDialer:         nodedialer.New(rpcContext, gossip.AddressResolver(g)),
+		FirstRangeProvider: g,
+		Settings:           cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 	scan := roachpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false)
 	if _, err := kv.SendWrapped(context.Background(), ds, scan); err != nil {
 		t.Errorf("scan encountered error: %s", err)
@@ -1208,15 +1289,21 @@ func TestRetryOnWrongReplicaErrorWithSuggestion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Updated below, after it has first been returned.
-	goodRangeDescriptor := testUserRangeDescriptor
-	badRangeDescriptor := testUserRangeDescriptor
-	badRangeDescriptor.EndKey = roachpb.RKey("zBad")
-	badRangeDescriptor.RangeID++
+	// The test is gonna send the request first to staleDesc, but it reaches the
+	// rhsDesc, which redirects it to lhsDesc.
+	staleDesc := testUserRangeDescriptor
+	lhsDesc := testUserRangeDescriptor
+	lhsDesc.EndKey = roachpb.RKey("m")
+	lhsDesc.RangeID = staleDesc.RangeID + 1
+	lhsDesc.Generation = staleDesc.Generation + 1
+	rhsDesc := testUserRangeDescriptor
+	rhsDesc.StartKey = roachpb.RKey("m")
+	rhsDesc.RangeID = staleDesc.RangeID + 2
+	rhsDesc.Generation = staleDesc.Generation + 2
 	firstLookup := true
 
 	var testFn simpleSendFn = func(
-		_ context.Context,
+		ctx context.Context,
 		_ SendOptions,
 		_ ReplicaSlice,
 		ba roachpb.BatchRequest,
@@ -1246,7 +1333,7 @@ func TestRetryOnWrongReplicaErrorWithSuggestion(t *testing.T) {
 			br := &roachpb.BatchResponse{}
 			r := &roachpb.ScanResponse{}
 			var kv roachpb.KeyValue
-			if err := kv.Value.SetProto(&badRangeDescriptor); err != nil {
+			if err := kv.Value.SetProto(&staleDesc); err != nil {
 				t.Fatal(err)
 			}
 			r.Rows = append(r.Rows, kv)
@@ -1256,16 +1343,14 @@ func TestRetryOnWrongReplicaErrorWithSuggestion(t *testing.T) {
 
 		// When the Scan first turns up, provide the correct descriptor as a
 		// suggestion for future range descriptor lookups.
-		if ba.RangeID == badRangeDescriptor.RangeID {
+		if ba.RangeID == staleDesc.RangeID {
 			var br roachpb.BatchResponse
-			br.Error = roachpb.NewError(&roachpb.RangeKeyMismatchError{
-				RequestStartKey: rs.Key.AsRawKey(),
-				RequestEndKey:   rs.EndKey.AsRawKey(),
-				SuggestedRange:  &goodRangeDescriptor,
-			})
+			err := roachpb.NewRangeKeyMismatchError(ctx, rs.Key.AsRawKey(), rs.EndKey.AsRawKey(), &rhsDesc, nil /* lease */)
+			err.AppendRangeInfo(ctx, lhsDesc, roachpb.Lease{})
+			br.Error = roachpb.NewError(err)
 			return &br, nil
-		} else if ba.RangeID != goodRangeDescriptor.RangeID {
-			t.Fatalf("unexpected RangeID %d provided in request %v", ba.RangeID, ba)
+		} else if ba.RangeID != lhsDesc.RangeID {
+			t.Fatalf("unexpected RangeID %d provided in request %v. expected: %s", ba.RangeID, ba, lhsDesc.RangeID)
 		}
 		return ba.CreateReply(), nil
 	}
@@ -1273,14 +1358,16 @@ func TestRetryOnWrongReplicaErrorWithSuggestion(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
 		},
-		NodeDialer: nodedialer.New(rpcContext, gossip.AddressResolver(g)),
-		Settings:   cluster.MakeTestingClusterSettings(),
+		NodeDialer:         nodedialer.New(rpcContext, gossip.AddressResolver(g)),
+		FirstRangeProvider: g,
+		Settings:           cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 	scan := roachpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false)
 	if _, err := kv.SendWrapped(context.Background(), ds, scan); err != nil {
 		t.Errorf("scan encountered error: %s", err)
@@ -1299,11 +1386,13 @@ func TestGetFirstRangeDescriptor(t *testing.T) {
 	}
 	n.Start()
 	ds := NewDistSender(DistSenderConfig{
-		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
-		RPCContext: n.RPCContext,
-		NodeDialer: nodedialer.New(n.RPCContext, gossip.AddressResolver(n.Nodes[0].Gossip)),
-		Settings:   cluster.MakeTestingClusterSettings(),
-	}, n.Nodes[0].Gossip)
+		AmbientCtx:         log.AmbientContext{Tracer: tracing.NewTracer()},
+		NodeDescs:          n.Nodes[0].Gossip,
+		RPCContext:         n.RPCContext,
+		NodeDialer:         nodedialer.New(n.RPCContext, gossip.AddressResolver(n.Nodes[0].Gossip)),
+		FirstRangeProvider: n.Nodes[0].Gossip,
+		Settings:           cluster.MakeTestingClusterSettings(),
+	})
 	if _, err := ds.FirstRange(); err == nil {
 		t.Errorf("expected not to find first range descriptor")
 	}
@@ -1391,6 +1480,7 @@ func TestSendRPCRetry(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
@@ -1398,7 +1488,7 @@ func TestSendRPCRetry(t *testing.T) {
 		RangeDescriptorDB: descDB,
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 	scan := roachpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false)
 	sr, err := kv.SendWrappedWith(context.Background(), ds, roachpb.Header{MaxSpanRequestKeys: 1}, scan)
 	if err != nil {
@@ -1415,8 +1505,9 @@ func TestSendRPCRetry(t *testing.T) {
 // the next Replica is tried.
 func TestSendRPCRangeNotFoundError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
+	defer stopper.Stop(ctx)
 
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
@@ -1466,8 +1557,10 @@ func TestSendRPCRangeNotFoundError(t *testing.T) {
 		seen[ba.Replica.ReplicaID] = struct{}{}
 		if len(seen) <= 2 {
 			if len(seen) == 1 {
-				// Add to the leaseholder cache to verify that the response evicts it.
-				ds.leaseHolderCache.Update(context.Background(), ba.RangeID, ba.Replica.StoreID)
+				// Pretend that this replica is the leaseholder in the cache to verify
+				// that the response evicts it.
+				rng := ds.rangeCache.GetCached(descriptor.StartKey, false /* inverse */)
+				rng.Lease.Replica = ba.Replica
 			}
 			br.Error = roachpb.NewError(roachpb.NewRangeNotFoundError(ba.RangeID, ba.Replica.StoreID))
 			return br, nil
@@ -1478,6 +1571,7 @@ func TestSendRPCRangeNotFoundError(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
@@ -1485,17 +1579,16 @@ func TestSendRPCRangeNotFoundError(t *testing.T) {
 		RangeDescriptorDB: descDB,
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
-	ds = NewDistSender(cfg, g)
+	ds = NewDistSender(cfg)
 	get := roachpb.NewGet(roachpb.Key("b"))
-	_, err := kv.SendWrapped(context.Background(), ds, get)
+	_, err := kv.SendWrapped(ctx, ds, get)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if storeID, found := ds.leaseHolderCache.Lookup(context.Background(), roachpb.RangeID(1)); !found {
-		t.Fatal("expected a cached leaseholder")
-	} else if storeID != leaseholderStoreID {
-		t.Fatalf("unexpected cached leaseholder s%d, expected s%d", storeID, leaseholderStoreID)
-	}
+
+	rng := ds.rangeCache.GetCached(descriptor.StartKey, false /* inverted */)
+	require.NotNil(t, rng)
+	require.Equal(t, leaseholderStoreID, rng.Lease.Replica.StoreID)
 }
 
 // TestGetNodeDescriptor checks that the Node descriptor automatically gets
@@ -1509,11 +1602,13 @@ func TestGetNodeDescriptor(t *testing.T) {
 	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
 	g := makeGossip(t, stopper, rpcContext)
 	ds := NewDistSender(DistSenderConfig{
-		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
-		RPCContext: rpcContext,
-		Clock:      clock,
-		Settings:   cluster.MakeTestingClusterSettings(),
-	}, g)
+		AmbientCtx:         log.AmbientContext{Tracer: tracing.NewTracer()},
+		Clock:              clock,
+		NodeDescs:          g,
+		RPCContext:         rpcContext,
+		FirstRangeProvider: g,
+		Settings:           cluster.MakeTestingClusterSettings(),
+	})
 	g.NodeID.Reset(5)
 	if err := g.SetNodeDescriptor(newNodeDesc(5)); err != nil {
 		t.Fatal(err)
@@ -1585,6 +1680,7 @@ func TestMultiRangeGapReverse(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx:        log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:             clock,
+		NodeDescs:         g,
 		RPCContext:        rpcContext,
 		RangeDescriptorDB: rdb,
 		TestingKnobs: ClientTestingKnobs{
@@ -1596,7 +1692,7 @@ func TestMultiRangeGapReverse(t *testing.T) {
 		Settings: cluster.MakeTestingClusterSettings(),
 	}
 
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 
 	txn := roachpb.MakeTransaction("foo", nil, 1.0, clock.Now(), 0)
 
@@ -1688,6 +1784,7 @@ func TestMultiRangeMergeStaleDescriptor(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
@@ -1705,7 +1802,7 @@ func TestMultiRangeMergeStaleDescriptor(t *testing.T) {
 		}),
 		Settings: cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 	scan := roachpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false)
 	// Set the Txn info to avoid an OpRequiresTxnError.
 	reply, err := kv.SendWrappedWith(context.Background(), ds, roachpb.Header{
@@ -1734,6 +1831,7 @@ func TestRangeLookupOptionOnReverseScan(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(stubRPCSendFn),
@@ -1749,7 +1847,7 @@ func TestRangeLookupOptionOnReverseScan(t *testing.T) {
 		}),
 		Settings: cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 	rScan := &roachpb.ReverseScanRequest{
 		RequestHeader: roachpb.RequestHeader{Key: roachpb.Key("a"), EndKey: roachpb.Key("b")},
 	}
@@ -1771,12 +1869,13 @@ func TestClockUpdateOnResponse(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx:        log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:             clock,
+		NodeDescs:         g,
 		RPCContext:        rpcContext,
 		RangeDescriptorDB: defaultMockRangeDescriptorDB,
 		NodeDialer:        nodedialer.New(rpcContext, gossip.AddressResolver(g)),
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 
 	expectedErr := roachpb.NewError(errors.New("boom"))
 
@@ -1850,6 +1949,7 @@ func TestTruncateWithSpanAndDescriptor(t *testing.T) {
 				StoreID: 1,
 			},
 		},
+		Generation: 1,
 	}
 	var descriptor2 = roachpb.RangeDescriptor{
 		RangeID:  3,
@@ -1861,6 +1961,7 @@ func TestTruncateWithSpanAndDescriptor(t *testing.T) {
 				StoreID: 1,
 			},
 		},
+		Generation: 2,
 	}
 	descDB := MockRangeDescriptorDB(func(key roachpb.RKey, _ bool) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error) {
 		if key.Less(testMetaRangeDescriptor.EndKey) {
@@ -1904,6 +2005,7 @@ func TestTruncateWithSpanAndDescriptor(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(sendStub),
@@ -1911,7 +2013,7 @@ func TestTruncateWithSpanAndDescriptor(t *testing.T) {
 		RangeDescriptorDB: descDB,
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 
 	// Send a batch request containing two puts. In the first
 	// attempt, the span of the descriptor found in the cache is
@@ -2032,6 +2134,7 @@ func TestTruncateWithLocalSpanAndDescriptor(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(sendStub),
@@ -2039,7 +2142,7 @@ func TestTruncateWithLocalSpanAndDescriptor(t *testing.T) {
 		RangeDescriptorDB: descDB,
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 
 	// Send a batch request contains two scans. In the first
 	// attempt, the range of the descriptor found in the cache is
@@ -2225,6 +2328,7 @@ func TestMultiRangeWithEndTxn(t *testing.T) {
 		cfg := DistSenderConfig{
 			AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 			Clock:      clock,
+			NodeDescs:  g,
 			RPCContext: rpcContext,
 			TestingKnobs: ClientTestingKnobs{
 				TransportFactory: adaptSimpleTransport(testFn),
@@ -2232,7 +2336,7 @@ func TestMultiRangeWithEndTxn(t *testing.T) {
 			RangeDescriptorDB: descDB,
 			Settings:          cluster.MakeTestingClusterSettings(),
 		}
-		ds := NewDistSender(cfg, g)
+		ds := NewDistSender(cfg)
 		ds.DisableParallelBatches()
 
 		// Send a batch request containing two puts.
@@ -2360,6 +2464,7 @@ func TestParallelCommitSplitFromQueryIntents(t *testing.T) {
 			cfg := DistSenderConfig{
 				AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 				Clock:      clock,
+				NodeDescs:  g,
 				RPCContext: rpcContext,
 				TestingKnobs: ClientTestingKnobs{
 					TransportFactory: adaptSimpleTransport(testFn),
@@ -2367,7 +2472,7 @@ func TestParallelCommitSplitFromQueryIntents(t *testing.T) {
 				RangeDescriptorDB: defaultMockRangeDescriptorDB,
 				Settings:          cluster.MakeTestingClusterSettings(),
 			}
-			ds := NewDistSender(cfg, g)
+			ds := NewDistSender(cfg)
 			ds.DisableParallelBatches()
 
 			// Send a batch request containing the requests.
@@ -2476,6 +2581,7 @@ func TestParallelCommitsDetectIntentMissingCause(t *testing.T) {
 			cfg := DistSenderConfig{
 				AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 				Clock:      clock,
+				NodeDescs:  g,
 				RPCContext: rpcContext,
 				TestingKnobs: ClientTestingKnobs{
 					TransportFactory: adaptSimpleTransport(testFn),
@@ -2483,7 +2589,7 @@ func TestParallelCommitsDetectIntentMissingCause(t *testing.T) {
 				RangeDescriptorDB: defaultMockRangeDescriptorDB,
 				Settings:          cluster.MakeTestingClusterSettings(),
 			}
-			ds := NewDistSender(cfg, g)
+			ds := NewDistSender(cfg)
 
 			// Send a parallel commit batch request.
 			var ba roachpb.BatchRequest
@@ -2554,6 +2660,7 @@ func TestCountRanges(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(stubRPCSendFn),
@@ -2561,7 +2668,7 @@ func TestCountRanges(t *testing.T) {
 		RangeDescriptorDB: descDB,
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 
 	// Verify counted ranges.
 	keyIn := func(desc roachpb.RangeDescriptor) roachpb.RKey {
@@ -2647,6 +2754,7 @@ func TestGatewayNodeID(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
@@ -2654,7 +2762,7 @@ func TestGatewayNodeID(t *testing.T) {
 		RangeDescriptorDB: defaultMockRangeDescriptorDB,
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 	var ba roachpb.BatchRequest
 	ba.Add(roachpb.NewPut(roachpb.Key("a"), roachpb.MakeValueFromString("value")))
 	if _, err := ds.Send(context.Background(), ba); err != nil {
@@ -2729,7 +2837,7 @@ func TestMultipleErrorsMerged(t *testing.T) {
 	retryErr := roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "test err")
 	abortErr := roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_ABORTED_RECORD_FOUND)
 	conditionFailedErr := &roachpb.ConditionFailedError{}
-	sendErr := &roachpb.SendError{}
+	sendErr := sendError{}
 	ambiguousErr := &roachpb.AmbiguousResultError{}
 	randomErr := &roachpb.IntegerOverflowError{}
 
@@ -2842,6 +2950,7 @@ func TestMultipleErrorsMerged(t *testing.T) {
 				cfg := DistSenderConfig{
 					AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 					Clock:      clock,
+					NodeDescs:  g,
 					RPCContext: rpcContext,
 					TestingKnobs: ClientTestingKnobs{
 						TransportFactory: adaptSimpleTransport(testFn),
@@ -2850,7 +2959,7 @@ func TestMultipleErrorsMerged(t *testing.T) {
 					Settings:          cluster.MakeTestingClusterSettings(),
 					RPCRetryOptions:   &retry.Options{MaxRetries: 1},
 				}
-				ds := NewDistSender(cfg, g)
+				ds := NewDistSender(cfg)
 
 				var ba roachpb.BatchRequest
 				ba.Txn = txn.Clone()
@@ -2983,6 +3092,7 @@ func TestErrorIndexAlignment(t *testing.T) {
 			cfg := DistSenderConfig{
 				AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 				Clock:      clock,
+				NodeDescs:  g,
 				RPCContext: rpcContext,
 				TestingKnobs: ClientTestingKnobs{
 					TransportFactory: adaptSimpleTransport(testFn),
@@ -2990,7 +3100,7 @@ func TestErrorIndexAlignment(t *testing.T) {
 				RangeDescriptorDB: descDB,
 				Settings:          cluster.MakeTestingClusterSettings(),
 			}
-			ds := NewDistSender(cfg, g)
+			ds := NewDistSender(cfg)
 			ds.DisableParallelBatches()
 
 			var ba roachpb.BatchRequest
@@ -3025,7 +3135,8 @@ func TestErrorIndexAlignment(t *testing.T) {
 func TestCanSendToFollower(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
 
 	old := CanSendToFollower
 	defer func() { CanSendToFollower = old }()
@@ -3060,6 +3171,7 @@ func TestCanSendToFollower(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
@@ -3110,23 +3222,28 @@ func TestCanSendToFollower(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			sentTo = ReplicaInfo{}
 			canSend = c.canSendToFollower
-			ds := NewDistSender(cfg, g)
+			ds := NewDistSender(cfg)
 			ds.clusterID = &base.ClusterIDContainer{}
-			// set 2 to be the leaseholder
-			ds.LeaseHolderCache().Update(context.Background(), 2 /* rangeID */, 2 /* storeID */)
-			_, pErr := kv.SendWrappedWith(context.Background(), ds, c.header, c.msg)
+			// Make store 2 the leaseholder.
+			var lease roachpb.Lease
+			lease.Replica = testUserRangeDescriptor3Replicas.InternalReplicas[1]
+			ds.rangeCache.Insert(ctx, roachpb.RangeInfo{
+				Desc:  testUserRangeDescriptor3Replicas,
+				Lease: lease,
+			})
+			_, pErr := kv.SendWrappedWith(ctx, ds, c.header, c.msg)
 			require.Nil(t, pErr)
 			if sentTo.NodeID != c.expectedNode {
 				t.Fatalf("%d: unexpected replica: %v != %v", i, sentTo.NodeID, c.expectedNode)
 			}
-			// Check that the leaseholder cache doesn't change, even if the request is
-			// served by a follower. This tests a regression for a bug we've had where
-			// we were always updating the leaseholder cache on successful RPCs
-			// because we erroneously assumed that a success must come from the
+			// Check that the leaseholder in the cache doesn't change, even if the
+			// request is served by a follower. This tests a regression for a bug
+			// we've had where we were always updating the leaseholder on successful
+			// RPCs because we erroneously assumed that a success must come from the
 			// leaseholder.
-			storeID, ok := ds.LeaseHolderCache().Lookup(context.Background(), 2 /* rangeID */)
-			require.True(t, ok)
-			require.Equal(t, roachpb.StoreID(2), storeID)
+			rng := ds.rangeCache.GetCached(testUserRangeDescriptor.StartKey, false /* inverted */)
+			require.NotNil(t, rng)
+			require.Equal(t, roachpb.StoreID(2), rng.Lease.Replica.StoreID)
 		})
 	}
 }
@@ -3135,8 +3252,9 @@ func TestCanSendToFollower(t *testing.T) {
 // from the cache.
 func TestEvictMetaRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
+	defer stopper.Stop(ctx)
 
 	testutils.RunTrueAndFalse(t, "hasSuggestedRange", func(t *testing.T, hasSuggestedRange bool) {
 		splitKey := keys.RangeMetaKey(roachpb.RKey("b"))
@@ -3251,13 +3369,10 @@ func TestEvictMetaRange(t *testing.T) {
 
 				reply := ba.CreateReply()
 				// Return a RangeKeyMismatchError to simulate the range being stale.
-				err := &roachpb.RangeKeyMismatchError{
-					RequestStartKey: rs.Key.AsRawKey(),
-					RequestEndKey:   rs.EndKey.AsRawKey(),
-					MismatchedRange: &testMeta2RangeDescriptor1,
-				}
+				err := roachpb.NewRangeKeyMismatchError(
+					ctx, rs.Key.AsRawKey(), rs.EndKey.AsRawKey(), &testMeta2RangeDescriptor1, nil /* lease */)
 				if hasSuggestedRange {
-					err.SuggestedRange = &testMeta2RangeDescriptor2
+					err.AppendRangeInfo(ctx, testMeta2RangeDescriptor2, roachpb.Lease{})
 				}
 				reply.Error = roachpb.NewError(err)
 				return reply, nil
@@ -3276,48 +3391,47 @@ func TestEvictMetaRange(t *testing.T) {
 		cfg := DistSenderConfig{
 			AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 			Clock:      clock,
+			NodeDescs:  g,
 			RPCContext: rpcContext,
 			TestingKnobs: ClientTestingKnobs{
 				TransportFactory: adaptSimpleTransport(testFn),
 			},
-			NodeDialer: nodedialer.New(rpcContext, gossip.AddressResolver(g)),
-			Settings:   cluster.MakeTestingClusterSettings(),
+			NodeDialer:         nodedialer.New(rpcContext, gossip.AddressResolver(g)),
+			FirstRangeProvider: g,
+			Settings:           cluster.MakeTestingClusterSettings(),
 		}
-		ds := NewDistSender(cfg, g)
+		ds := NewDistSender(cfg)
 
 		scan := roachpb.NewScan(roachpb.Key("a"), roachpb.Key("b"), false)
-		if _, pErr := kv.SendWrapped(context.Background(), ds, scan); pErr != nil {
+		if _, pErr := kv.SendWrapped(ctx, ds, scan); pErr != nil {
 			t.Fatalf("scan encountered error: %s", pErr)
 		}
 
 		// Verify that there is one meta2 cached range.
-		if cachedRange, err := ds.rangeCache.GetCachedRangeDescriptor(keys.RangeMetaKey(roachpb.RKey("a")), false); err != nil {
-			t.Fatal(err)
-		} else if !cachedRange.StartKey.Equal(keys.Meta2Prefix) || !cachedRange.EndKey.Equal(testMetaEndKey) {
+		cachedRange := ds.rangeCache.GetCached(keys.RangeMetaKey(roachpb.RKey("a")), false)
+		if !cachedRange.Desc.StartKey.Equal(keys.Meta2Prefix) || !cachedRange.Desc.EndKey.Equal(testMetaEndKey) {
 			t.Fatalf("expected cached meta2 range to be [%s, %s), actual [%s, %s)",
-				keys.Meta2Prefix, testMetaEndKey, cachedRange.StartKey, cachedRange.EndKey)
+				keys.Meta2Prefix, testMetaEndKey, cachedRange.Desc.StartKey, cachedRange.Desc.EndKey)
 		}
 
 		// Simulate a split on the meta2 range and mark it as stale.
 		isStale = true
 
 		scan = roachpb.NewScan(roachpb.Key("b"), roachpb.Key("c"), false)
-		if _, pErr := kv.SendWrapped(context.Background(), ds, scan); pErr != nil {
+		if _, pErr := kv.SendWrapped(ctx, ds, scan); pErr != nil {
 			t.Fatalf("scan encountered error: %s", pErr)
 		}
 
 		// Verify that there are two meta2 cached ranges.
-		if cachedRange, err := ds.rangeCache.GetCachedRangeDescriptor(keys.RangeMetaKey(roachpb.RKey("a")), false); err != nil {
-			t.Fatal(err)
-		} else if !cachedRange.StartKey.Equal(keys.Meta2Prefix) || !cachedRange.EndKey.Equal(splitKey) {
+		cachedRange = ds.rangeCache.GetCached(keys.RangeMetaKey(roachpb.RKey("a")), false)
+		if !cachedRange.Desc.StartKey.Equal(keys.Meta2Prefix) || !cachedRange.Desc.EndKey.Equal(splitKey) {
 			t.Fatalf("expected cached meta2 range to be [%s, %s), actual [%s, %s)",
-				keys.Meta2Prefix, splitKey, cachedRange.StartKey, cachedRange.EndKey)
+				keys.Meta2Prefix, splitKey, cachedRange.Desc.StartKey, cachedRange.Desc.EndKey)
 		}
-		if cachedRange, err := ds.rangeCache.GetCachedRangeDescriptor(keys.RangeMetaKey(roachpb.RKey("b")), false); err != nil {
-			t.Fatal(err)
-		} else if !cachedRange.StartKey.Equal(splitKey) || !cachedRange.EndKey.Equal(testMetaEndKey) {
+		cachedRange = ds.rangeCache.GetCached(keys.RangeMetaKey(roachpb.RKey("b")), false)
+		if !cachedRange.Desc.StartKey.Equal(splitKey) || !cachedRange.Desc.EndKey.Equal(testMetaEndKey) {
 			t.Fatalf("expected cached meta2 range to be [%s, %s), actual [%s, %s)",
-				splitKey, testMetaEndKey, cachedRange.StartKey, cachedRange.EndKey)
+				splitKey, testMetaEndKey, cachedRange.Desc.StartKey, cachedRange.Desc.EndKey)
 		}
 	})
 }
@@ -3384,6 +3498,7 @@ func TestConnectionClass(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: adaptSimpleTransport(testFn),
@@ -3395,7 +3510,7 @@ func TestConnectionClass(t *testing.T) {
 		RangeDescriptorDB: rDB,
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
-	ds := NewDistSender(cfg, g)
+	ds := NewDistSender(cfg)
 
 	// Check the three important cases to ensure they are sent with the correct
 	// ConnectionClass.
@@ -3451,7 +3566,7 @@ func TestEvictionTokenCoalesce(t *testing.T) {
 
 	var ds *DistSender
 	var testFn simpleSendFn = func(
-		_ context.Context,
+		ctx context.Context,
 		_ SendOptions,
 		_ ReplicaSlice,
 		ba roachpb.BatchRequest,
@@ -3463,11 +3578,10 @@ func TestEvictionTokenCoalesce(t *testing.T) {
 			return br, nil
 		}
 		if !kv.TestingIsRangeLookup(ba) {
-			// Return a SendError so DistSender retries the first range lookup in the
+			// Return a sendError so DistSender retries the first range lookup in the
 			// user key-space for both batches.
 			if atomic.AddInt32(&sendErrors, 1) <= 2 {
-				br.Error = roachpb.NewError(&roachpb.SendError{})
-				return br, nil
+				return nil, newSendError("boom")
 			}
 			return br, nil
 		}
@@ -3519,17 +3633,19 @@ func TestEvictionTokenCoalesce(t *testing.T) {
 	cfg := DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Clock:      clock,
+		NodeDescs:  g,
 		RPCContext: rpcContext,
-		TestingKnobs: ClientTestingKnobs{
-			TransportFactory: adaptSimpleTransport(testFn),
-		},
-		NodeDialer: nodedialer.New(rpcContext, gossip.AddressResolver(g)),
 		RPCRetryOptions: &retry.Options{
 			MaxRetries: 1,
 		},
-		Settings: cluster.MakeTestingClusterSettings(),
+		NodeDialer:         nodedialer.New(rpcContext, gossip.AddressResolver(g)),
+		FirstRangeProvider: g,
+		Settings:           cluster.MakeTestingClusterSettings(),
+		TestingKnobs: ClientTestingKnobs{
+			TransportFactory: adaptSimpleTransport(testFn),
+		},
 	}
-	ds = NewDistSender(cfg, g)
+	ds = NewDistSender(cfg)
 
 	var batchWaitGroup sync.WaitGroup
 	putFn := func(key, value string) {
@@ -3568,5 +3684,313 @@ func TestDistSenderSlowLogMessage(t *testing.T) {
 		exp := `slow RPC finished after 8.16s (120 attempts)`
 		act := slowRangeRPCReturnWarningStr(dur, attempts)
 		require.Equal(t, exp, act)
+	}
+}
+
+// Test the following scenario: the DistSender sends a request that results in a
+// sendError, meaning that the descriptor is probably stale. The descriptor is
+// then refreshed, and it turns out that the range had split in the meantime.
+// Thus, the request now needs to be divided. The test checks that the request
+// is divided before being sent to the new descriptor. This acts as a regression
+// test, since we used to blindly try the non-divided request against the
+// smaller range, only to get an entirely predictable RangeKeyMismatchError.
+func TestRequestSubdivisionAfterDescriptorChange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+	g := makeGossip(t, stopper, rpcContext)
+
+	// First request will be sent to an unsplit descriptor.
+	var initialDesc = roachpb.RangeDescriptor{
+		RangeID:    roachpb.RangeID(1),
+		Generation: 1,
+		StartKey:   roachpb.RKeyMin,
+		EndKey:     roachpb.RKeyMax,
+		InternalReplicas: []roachpb.ReplicaDescriptor{
+			{
+				NodeID:  1,
+				StoreID: 1,
+			},
+		},
+	}
+
+	// But the 2nd attempt will use the split ones.
+	splitKey := roachpb.RKey("b")
+	splitDescs := []roachpb.RangeDescriptor{{
+		RangeID:    roachpb.RangeID(1),
+		Generation: 2,
+		StartKey:   roachpb.RKeyMin,
+		EndKey:     splitKey,
+		InternalReplicas: []roachpb.ReplicaDescriptor{
+			{
+				NodeID:  1,
+				StoreID: 1,
+			},
+		},
+	}, {
+		RangeID:    roachpb.RangeID(2),
+		Generation: 2,
+		StartKey:   splitKey,
+		EndKey:     roachpb.RKeyMax,
+		InternalReplicas: []roachpb.ReplicaDescriptor{
+			{
+				NodeID:  1,
+				StoreID: 1,
+			},
+		},
+	}}
+
+	initialRDB := MockRangeDescriptorDB(func(key roachpb.RKey, reverse bool) (
+		[]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error,
+	) {
+		return []roachpb.RangeDescriptor{initialDesc}, nil, nil
+	})
+	splitRDB := MockRangeDescriptorDB(func(key roachpb.RKey, reverse bool) (
+		[]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error,
+	) {
+		if key.Less(splitKey) {
+			return splitDescs[0:1], nil, nil
+		}
+		return splitDescs[1:], nil, nil
+	})
+
+	returnErr := true
+	var switchToSplitDesc func()
+	var transportFn = func(
+		_ context.Context,
+		opts SendOptions,
+		replicas ReplicaSlice,
+		ba roachpb.BatchRequest,
+	) (*roachpb.BatchResponse, error) {
+		if returnErr {
+			// First time around we return an RPC error. Next time around, make sure
+			// the DistSender tries gets the split descriptors.
+			if len(ba.Requests) != 2 {
+				// Sanity check - first attempt should have the unsplit batch.
+				rep := ba.CreateReply()
+				rep.Error = roachpb.NewErrorf("expected divided batches with one request each, got: %s", ba)
+				return rep, nil
+			}
+			switchToSplitDesc()
+			returnErr = false
+			return nil, errors.New("boom")
+		}
+		rep := ba.CreateReply()
+		if len(ba.Requests) != 1 {
+			rep.Error = roachpb.NewErrorf("expected divided batches with one request each, got: %s", ba)
+		}
+		return rep, nil
+	}
+
+	cfg := DistSenderConfig{
+		AmbientCtx:        log.AmbientContext{Tracer: tracing.NewTracer()},
+		Clock:             clock,
+		NodeDescs:         g,
+		RPCContext:        rpcContext,
+		RangeDescriptorDB: initialRDB,
+		TestingKnobs: ClientTestingKnobs{
+			TransportFactory: adaptSimpleTransport(transportFn),
+		},
+		Settings: cluster.MakeTestingClusterSettings(),
+	}
+
+	ds := NewDistSender(cfg)
+	switchToSplitDesc = func() {
+		ds.rangeCache.db = splitRDB
+	}
+
+	// We're going to send a batch with two gets, on different sides of the split.
+	// The DistSender will first use the unsplit descriptor, and we'll inject an
+	// RPC error which will cause the eviction of the descriptor from the cache.
+	// Then, we'll switch the descriptor db that the DistSender uses to the
+	// version that returns a split descriptor (see switchToSplitDesc). From this
+	// moment on, we check that the sent batches only consist of single requests -
+	// which proves that the original batch was split.
+
+	var ba roachpb.BatchRequest
+	get := &roachpb.GetRequest{}
+	get.Key = roachpb.Key("a")
+	ba.Add(get)
+	get = &roachpb.GetRequest{}
+	get.Key = roachpb.Key("c")
+	ba.Add(get)
+	// Inconsistent read because otherwise the batch will ask to be re-sent in a
+	// txn when split.
+	ba.ReadConsistency = roachpb.INCONSISTENT
+
+	if _, pErr := ds.Send(ctx, ba); pErr != nil {
+		t.Fatal(pErr)
+	}
+}
+
+// Test that DistSender.sendToReplicas() deals well with descriptor updates.
+func TestSendToReplicasSkipsStaleReplicas(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+
+	ns := &mockNodeStore{
+		nodes: []roachpb.NodeDescriptor{
+			{
+				NodeID:  1,
+				Address: util.UnresolvedAddr{},
+			},
+			{
+				NodeID:  2,
+				Address: util.UnresolvedAddr{},
+			},
+			{
+				NodeID:  3,
+				Address: util.UnresolvedAddr{},
+			},
+		},
+	}
+	var desc = roachpb.RangeDescriptor{
+		RangeID:    roachpb.RangeID(1),
+		Generation: 1,
+		StartKey:   roachpb.RKeyMin,
+		EndKey:     roachpb.RKeyMax,
+		InternalReplicas: []roachpb.ReplicaDescriptor{
+			{NodeID: 1, StoreID: 1, ReplicaID: 1},
+			{NodeID: 2, StoreID: 2, ReplicaID: 2},
+		},
+	}
+	var updatedDesc = roachpb.RangeDescriptor{
+		RangeID:    roachpb.RangeID(1),
+		Generation: 2,
+		StartKey:   roachpb.RKeyMin,
+		EndKey:     roachpb.RKeyMax,
+		InternalReplicas: []roachpb.ReplicaDescriptor{
+			{NodeID: 1, StoreID: 1, ReplicaID: 1},
+			{NodeID: 4, StoreID: 4, ReplicaID: 4},
+		},
+	}
+
+	for _, tc := range []struct {
+		name string
+		// updatedDesc, if not nil, is used to update the range cache in the middle
+		// of the first RPC.
+		updatedDesc *roachpb.RangeDescriptor
+		// expLeaseholder is the leaseholder that the cache is expected to be
+		// populated with after the RPC. If 0, the cache is expected to not have an
+		// entry corresponding to the descriptor in question - i.e. we expect the
+		// descriptor to have been evicted.
+		expLeaseholder roachpb.ReplicaID
+	}{
+		{
+			name: "no intervening update",
+			// In this test, the NotLeaseHolderError will point to a replica that's
+			// not part of the cached descriptor. The cached descriptor is going to be
+			// considered stale and evicted.
+			updatedDesc:    nil,
+			expLeaseholder: 0,
+		},
+		{
+			name: "intervening update",
+			// In this test, the NotLeaseHolderError will point to a replica that's
+			// part of the cached descriptor (at the time when the DistSender gets the
+			// error). Thus, the cache entry will be updated with the lease.
+			updatedDesc:    &updatedDesc,
+			expLeaseholder: 4,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := cluster.MakeTestingClusterSettings()
+			getRangeDescCacheSize := func() int64 {
+				return 1 << 20
+			}
+			rc := NewRangeDescriptorCache(st, nil /* db */, getRangeDescCacheSize, stopper)
+			rc.Insert(ctx, roachpb.RangeInfo{
+				Desc: desc,
+				Lease: roachpb.Lease{
+					Replica: roachpb.ReplicaDescriptor{
+						NodeID: 1, StoreID: 1, ReplicaID: 1,
+					},
+				},
+			})
+			ent, err := rc.Lookup(ctx, roachpb.RKeyMin)
+			require.NoError(t, err)
+			tok := EvictionToken{
+				rdc:   rc,
+				entry: ent,
+			}
+
+			var called bool
+			var transportFn = func(
+				_ context.Context,
+				opts SendOptions,
+				replicas ReplicaSlice,
+				ba roachpb.BatchRequest,
+			) (*roachpb.BatchResponse, error) {
+				// We don't expect more than one RPC because we return a lease pointing
+				// to a replica that's not in the descriptor that sendToReplicas() was
+				// originally called with. sendToReplicas() doesn't deal with that; it
+				// returns a sendError and expects that caller to retry.
+				if called {
+					return nil, errors.New("unexpected 2nd call")
+				}
+				called = true
+				nlhe := &roachpb.NotLeaseHolderError{
+					RangeID: desc.RangeID,
+					LeaseHolder: &roachpb.ReplicaDescriptor{
+						NodeID:    4,
+						StoreID:   4,
+						ReplicaID: 4,
+					},
+					CustomMsg: "injected",
+				}
+				if tc.updatedDesc != nil {
+					rc.Insert(ctx, roachpb.RangeInfo{Desc: *tc.updatedDesc})
+				}
+				br := &roachpb.BatchResponse{}
+				br.Error = roachpb.NewError(nlhe)
+				return br, nil
+			}
+
+			cfg := DistSenderConfig{
+				AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
+				Clock:      clock,
+				NodeDescs:  ns,
+				RPCContext: rpcContext,
+				RangeDescriptorDB: MockRangeDescriptorDB(func(key roachpb.RKey, reverse bool) (
+					[]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error,
+				) {
+					// These tests only deal with the low-level sendToReplicas(). Nobody
+					// should be reading descriptor from the database, but the DistSender
+					// insists on having a non-nil one.
+					return nil, nil, errors.New("range desc db unexpectedly used")
+				}),
+				TestingKnobs: ClientTestingKnobs{
+					TransportFactory: adaptSimpleTransport(transportFn),
+				},
+				Settings: cluster.MakeTestingClusterSettings(),
+			}
+
+			ds := NewDistSender(cfg)
+
+			var ba roachpb.BatchRequest
+			get := &roachpb.GetRequest{}
+			get.Key = roachpb.Key("a")
+			ba.Add(get)
+			_, err = ds.sendToReplicas(ctx, ba, tok, false /* withCommit */)
+			require.IsType(t, sendError{}, err)
+			require.Regexp(t, "NotLeaseHolderError", err)
+			cached := rc.GetCached(desc.StartKey, false /* inverted */)
+			if tc.expLeaseholder == 0 {
+				// Check that the descriptor was removed from the cache.
+				require.Nil(t, cached)
+			} else {
+				require.NotNil(t, cached)
+				require.Equal(t, tc.expLeaseholder, cached.Lease.Replica.ReplicaID)
+			}
+		})
 	}
 }

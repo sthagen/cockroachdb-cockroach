@@ -6,7 +6,9 @@ const: 1 [type=int]
 build-scalar
 1 + 2
 ----
-const: 3 [type=int]
+plus [type=int]
+ ├── const: 1 [type=int]
+ └── const: 2 [type=int]
 
 build-scalar vars=(string)
 @1
@@ -230,9 +232,10 @@ if(false, NULL, 1)
 ----
 case [type=int]
  ├── false [type=bool]
- ├── when [type=unknown]
+ ├── when [type=int]
  │    ├── true [type=bool]
- │    └── null [type=unknown]
+ │    └── cast: INT8 [type=int]
+ │         └── null [type=unknown]
  └── const: 1 [type=int]
 
 build-scalar
@@ -240,9 +243,10 @@ if(true, NULL, 1)
 ----
 case [type=int]
  ├── true [type=bool]
- ├── when [type=unknown]
+ ├── when [type=int]
  │    ├── true [type=bool]
- │    └── null [type=unknown]
+ │    └── cast: INT8 [type=int]
+ │         └── null [type=unknown]
  └── const: 1 [type=int]
 
 build-scalar
@@ -253,16 +257,17 @@ case [type=int]
  ├── when [type=int]
  │    ├── true [type=bool]
  │    └── const: 1 [type=int]
- └── null [type=unknown]
+ └── cast: INT8 [type=int]
+      └── null [type=unknown]
 
 build-scalar
 nullif(1, 2)
 ----
 case [type=int]
  ├── const: 1 [type=int]
- ├── when [type=unknown]
+ ├── when [type=int]
  │    ├── const: 2 [type=int]
- │    └── null [type=unknown]
+ │    └── null [type=int]
  └── const: 1 [type=int]
 
 build-scalar
@@ -271,9 +276,9 @@ nullif(NULL, 0)
 case [type=int]
  ├── cast: INT8 [type=int]
  │    └── null [type=unknown]
- ├── when [type=unknown]
+ ├── when [type=int]
  │    ├── const: 0 [type=int]
- │    └── null [type=unknown]
+ │    └── null [type=int]
  └── cast: INT8 [type=int]
       └── null [type=unknown]
 
@@ -282,9 +287,9 @@ nullif(0, NULL)
 ----
 case [type=int]
  ├── const: 0 [type=int]
- ├── when [type=unknown]
+ ├── when [type=int]
  │    ├── null [type=unknown]
- │    └── null [type=unknown]
+ │    └── null [type=int]
  └── const: 0 [type=int]
 
 build-scalar vars=(string)
@@ -350,14 +355,12 @@ false [type=bool]
 build-scalar
 1::decimal
 ----
-cast: DECIMAL [type=decimal]
- └── const: 1 [type=decimal]
+const: 1 [type=decimal]
 
 build-scalar
 1::float
 ----
-cast: FLOAT8 [type=float]
- └── const: 1.0 [type=float]
+const: 1.0 [type=float]
 
 build-scalar
 1.1::int
@@ -371,10 +374,23 @@ build-scalar
 const: '2010-05-12 00:00:00+00:00' [type=timestamp]
 
 build-scalar
+'now'::timestamp
+----
+cast: TIMESTAMP [type=timestamp]
+ └── const: 'now' [type=string]
+
+build-scalar
+'2010-05-12'::timestamp - 'now'
+----
+minus [type=interval]
+ ├── const: '2010-05-12 00:00:00+00:00' [type=timestamp]
+ └── cast: TIMESTAMP [type=timestamp]
+      └── const: 'now' [type=string]
+
+build-scalar
 '123'::int
 ----
-cast: INT8 [type=int]
- └── const: 123 [type=int]
+const: 123 [type=int]
 
 build-scalar vars=(int, int)
 IFNULL(@1, @2)
@@ -460,7 +476,7 @@ case [type=int]
  │    │    ├── variable: "@1":1 [type=int]
  │    │    └── const: 5 [type=int]
  │    └── const: 1 [type=int]
- └── null [type=unknown]
+ └── null [type=int]
 
 build-scalar vars=(int)
 CASE @1 WHEN 5 THEN 1 END
@@ -470,7 +486,7 @@ case [type=int]
  ├── when [type=int]
  │    ├── const: 5 [type=int]
  │    └── const: 1 [type=int]
- └── null [type=unknown]
+ └── null [type=int]
 
 build-scalar vars=(int)
 @1 BETWEEN 1 AND 4
@@ -1081,7 +1097,9 @@ tuple [type=tuple{int, string, float}]
  │    └── const: 1 [type=int]
  ├── indirection [type=string]
  │    ├── variable: "@2":2 [type=string[]]
- │    └── const: 2 [type=int]
+ │    └── plus [type=int]
+ │         ├── const: 1 [type=int]
+ │         └── const: 1 [type=int]
  └── indirection [type=float]
       ├── variable: "@3":3 [type=float[]]
       └── variable: "@4":4 [type=int]
@@ -1225,3 +1243,19 @@ if-err [type=decimal]
  │    └── variable: "@1":1 [type=decimal]
  └── err-code
       └── const: '10000' [type=string]
+
+# Verify that we build a Coalesce of the correct type when the inputs
+# are NULL (#50978).
+build-scalar
+CASE WHEN true THEN 1234:::OID ELSE COALESCE(NULL, NULL) END
+----
+case [type=oid]
+ ├── true [type=bool]
+ ├── when [type=oid]
+ │    ├── true [type=bool]
+ │    └── const: 1234 [type=oid]
+ └── coalesce [type=oid]
+      ├── cast: OID [type=oid]
+      │    └── null [type=unknown]
+      └── cast: OID [type=oid]
+           └── null [type=unknown]

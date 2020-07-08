@@ -12,7 +12,6 @@ package main
 
 import (
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 
@@ -21,12 +20,7 @@ import (
 
 const anyNotNullAggTmpl = "pkg/sql/colexec/any_not_null_agg_tmpl.go"
 
-func genAnyNotNullAgg(wr io.Writer) error {
-	t, err := ioutil.ReadFile(anyNotNullAggTmpl)
-	if err != nil {
-		return err
-	}
-
+func genAnyNotNullAgg(inputFileContents string, wr io.Writer) error {
 	r := strings.NewReplacer(
 		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
 		"_TYPE_WIDTH", typeWidthReplacement,
@@ -35,10 +29,10 @@ func genAnyNotNullAgg(wr io.Writer) error {
 		"_TYPE", "{{.VecMethod}}",
 		"TemplateType", "{{.VecMethod}}",
 	)
-	s := r.Replace(string(t))
+	s := r.Replace(inputFileContents)
 
-	findAnyNotNull := makeFunctionRegex("_FIND_ANY_NOT_NULL", 4)
-	s = findAnyNotNull.ReplaceAllString(s, `{{template "findAnyNotNull" buildDict "Global" . "HasNulls" $4}}`)
+	findAnyNotNull := makeFunctionRegex("_FIND_ANY_NOT_NULL", 5)
+	s = findAnyNotNull.ReplaceAllString(s, `{{template "findAnyNotNull" buildDict "Global" . "HasNulls" $5}}`)
 
 	s = replaceManipulationFuncs(s)
 
@@ -51,5 +45,5 @@ func genAnyNotNullAgg(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genAnyNotNullAgg, "any_not_null_agg.eg.go", anyNotNullAggTmpl)
+	registerAggGenerator(genAnyNotNullAgg, "any_not_null_agg.eg.go", anyNotNullAggTmpl)
 }

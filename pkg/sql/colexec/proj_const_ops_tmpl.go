@@ -23,6 +23,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
@@ -32,9 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
-
-// Remove unused warning.
-var _ = execgen.UNSAFEGET
 
 // {{/*
 // Declarations to make the template compile properly.
@@ -57,12 +55,6 @@ type _NON_CONST_GOTYPESLICE interface{}
 // _ASSIGN is the template function for assigning the first input to the result
 // of computation an operation on the second and the third inputs.
 func _ASSIGN(_, _, _, _, _, _ interface{}) {
-	colexecerror.InternalError("")
-}
-
-// _RETURN_UNSAFEGET is the template function that will be replaced by
-// "execgen.UNSAFEGET" which uses _RET_TYP.
-func _RETURN_UNSAFEGET(_, _ interface{}) interface{} {
 	colexecerror.InternalError("")
 }
 
@@ -138,8 +130,8 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 		}
 	} else {
 		col = execgen.SLICE(col, 0, n)
-		_ = _RETURN_UNSAFEGET(projCol, n-1)
-		for execgen.RANGE(i, col, 0, n) {
+		_ = projCol.Get(n - 1)
+		for i := 0; i < n; i++ {
 			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
 		}
 	}
@@ -163,7 +155,7 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 	if !colNulls.NullAt(i) {
 		// We only want to perform the projection operation if the value is not null.
 		// {{end}}
-		arg := execgen.UNSAFEGET(col, i)
+		arg := col.Get(i)
 		// {{if _IS_CONST_LEFT}}
 		_ASSIGN(projCol[i], p.constArg, arg, projCol, _, col)
 		// {{else}}
@@ -199,7 +191,16 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 // {{range .RightFamilies}}
 // {{range .RightWidths}}
 
+// {{if not _IS_CONST_LEFT}}
+// {{/*
+//     Comparison operators are always normalized so that the constant is on
+//     the right side, so we skip generating the code when the constant is on
+//     the left.
+// */}}
+
 // {{template "projConstOp" .}}
+
+// {{end}}
 
 // {{end}}
 // {{end}}
@@ -219,7 +220,8 @@ func GetProjection_CONST_SIDEConstOperator(
 	colIdx int,
 	constArg tree.Datum,
 	outputIdx int,
-	overloadHelper overloadHelper,
+	binFn *tree.BinOp,
+	evalCtx *tree.EvalContext,
 ) (colexecbase.Operator, error) {
 	input = newVectorTypeEnforcer(allocator, input, outputType, outputIdx)
 	projConstOpBase := projConstOpBase{
@@ -227,20 +229,14 @@ func GetProjection_CONST_SIDEConstOperator(
 		allocator:      allocator,
 		colIdx:         colIdx,
 		outputIdx:      outputIdx,
-		overloadHelper: overloadHelper,
+		overloadHelper: overloadHelper{binFn: binFn, evalCtx: evalCtx},
 	}
-	var (
-		c   interface{}
-		err error
-	)
+	var c interface{}
 	// {{if _IS_CONST_LEFT}}
-	c, err = getDatumToPhysicalFn(leftType)(constArg)
+	c = GetDatumToPhysicalFn(leftType)(constArg)
 	// {{else}}
-	c, err = getDatumToPhysicalFn(rightType)(constArg)
+	c = GetDatumToPhysicalFn(rightType)(constArg)
 	// {{end}}
-	if err != nil {
-		return nil, err
-	}
 	switch op.(type) {
 	case tree.BinaryOperator:
 		switch op {
@@ -248,6 +244,7 @@ func GetProjection_CONST_SIDEConstOperator(
 		case tree._NAME:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			// {{range .LeftFamilies}}
+			// {{$leftFamilyStr := .LeftCanonicalFamilyStr}}
 			case _LEFT_CANONICAL_TYPE_FAMILY:
 				switch leftType.Width() {
 				// {{range .LeftWidths}}
@@ -261,7 +258,20 @@ func GetProjection_CONST_SIDEConstOperator(
 							return &_OP_CONST_NAME{
 								projConstOpBase: projConstOpBase,
 								// {{if _IS_CONST_LEFT}}
+								// {{if eq $leftFamilyStr "typeconv.DatumVecCanonicalTypeFamily"}}
+								// {{/*
+								//     Binary operations are evaluated using coldataext.Datum.BinFn
+								//     method which requires that we have *coldataext.Datum on the
+								//     left, so we create that at the operator construction time to
+								//     avoid runtime conversion. Note that when the constant is on
+								//     the right side, then the left element necessarily comes from
+								//     the vector and will be of the desired type, so no additional
+								//     work is needed.
+								// */}}
+								constArg: &coldataext.Datum{Datum: c.(tree.Datum)},
+								// {{else}}
 								constArg: c.(_L_GO_TYPE),
+								// {{end}}
 								// {{else}}
 								constArg: c.(_R_GO_TYPE),
 								// {{end}}
@@ -276,12 +286,19 @@ func GetProjection_CONST_SIDEConstOperator(
 			}
 			// {{end}}
 		}
+	// {{if not _IS_CONST_LEFT}}
+	// {{/*
+	//     Comparison operators are always normalized so that the constant is on
+	//     the right side, so we skip generating the code when the constant is on
+	//     the left.
+	// */}}
 	case tree.ComparisonOperator:
 		switch op {
 		// {{range .CmpOps}}
 		case tree._NAME:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			// {{range .LeftFamilies}}
+			// {{$leftFamilyStr := .LeftCanonicalFamilyStr}}
 			case _LEFT_CANONICAL_TYPE_FAMILY:
 				switch leftType.Width() {
 				// {{range .LeftWidths}}
@@ -294,11 +311,7 @@ func GetProjection_CONST_SIDEConstOperator(
 						case _RIGHT_TYPE_WIDTH:
 							return &_OP_CONST_NAME{
 								projConstOpBase: projConstOpBase,
-								// {{if _IS_CONST_LEFT}}
-								constArg: c.(_L_GO_TYPE),
-								// {{else}}
-								constArg: c.(_R_GO_TYPE),
-								// {{end}}
+								constArg:        c.(_R_GO_TYPE),
 							}, nil
 							// {{end}}
 						}
@@ -310,6 +323,7 @@ func GetProjection_CONST_SIDEConstOperator(
 			}
 			// {{end}}
 		}
+		// {{end}}
 	}
 	return nil, errors.Errorf("couldn't find overload for %s %s %s", leftType.Name(), op, rightType.Name())
 }

@@ -31,11 +31,11 @@ func CreateTestTableDescriptor(
 	parentID, id sqlbase.ID,
 	schema string,
 	privileges *sqlbase.PrivilegeDescriptor,
-) (sqlbase.TableDescriptor, error) {
+) (*sqlbase.MutableTableDescriptor, error) {
 	st := cluster.MakeTestingClusterSettings()
 	stmt, err := parser.ParseOne(schema)
 	if err != nil {
-		return sqlbase.TableDescriptor{}, err
+		return nil, err
 	}
 	semaCtx := tree.MakeSemaContext()
 	evalCtx := tree.MakeTestingEvalContext(st)
@@ -56,7 +56,7 @@ func CreateTestTableDescriptor(
 			&sessiondata.SessionData{}, /* sessionData */
 			false,                      /* temporary */
 		)
-		return desc.TableDescriptor, err
+		return &desc, err
 	case *tree.CreateSequence:
 		desc, err := MakeSequenceTableDesc(
 			n.Name.Table(),
@@ -67,9 +67,9 @@ func CreateTestTableDescriptor(
 			false, /* temporary */
 			nil,   /* params */
 		)
-		return desc.TableDescriptor, err
+		return &desc, err
 	default:
-		return sqlbase.TableDescriptor{}, errors.Errorf("unexpected AST %T", stmt.AST)
+		return nil, errors.Errorf("unexpected AST %T", stmt.AST)
 	}
 }
 
@@ -125,7 +125,6 @@ func (dsp *DistSQLPlanner) Exec(
 		rw,
 		stmt.AST.StatementType(),
 		execCfg.RangeDescriptorCache,
-		execCfg.LeaseHolderCache,
 		p.txn,
 		func(ts hlc.Timestamp) {
 			execCfg.Clock.Update(ts)
@@ -135,8 +134,7 @@ func (dsp *DistSQLPlanner) Exec(
 	defer recv.Release()
 
 	evalCtx := p.ExtendedEvalContext()
-	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p.txn)
-	planCtx.isLocal = !distribute
+	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p.txn, distribute)
 	planCtx.planner = p
 	planCtx.stmtType = recv.stmtType
 

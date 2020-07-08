@@ -18,6 +18,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -45,11 +46,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -340,7 +343,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	ts := s.(*TestServer)
 	tds := db.NonTransactionalSender()
 
-	if err := ts.node.storeCfg.DB.AdminSplit(ctx, "m", "m", hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := ts.node.storeCfg.DB.AdminSplit(ctx, "m", hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
 	}
 	writes := []roachpb.Key{roachpb.Key("a"), roachpb.Key("z")}
@@ -439,7 +442,7 @@ func TestMultiRangeScanWithPagination(t *testing.T) {
 			tds := db.NonTransactionalSender()
 
 			for _, sk := range tc.splitKeys {
-				if err := ts.node.storeCfg.DB.AdminSplit(ctx, sk, sk, hlc.MaxTimestamp /* expirationTime */); err != nil {
+				if err := ts.node.storeCfg.DB.AdminSplit(ctx, sk, hlc.MaxTimestamp /* expirationTime */); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -547,10 +550,9 @@ func TestSystemConfigGossip(t *testing.T) {
 
 	key := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, keys.MaxReservedDescID)
 	valAt := func(i int) *sqlbase.Descriptor {
-		return sqlbase.WrapDescriptor(&sqlbase.DatabaseDescriptor{
-			ID:   sqlbase.ID(i),
-			Name: "foo",
-		})
+		return sqlbase.NewInitialDatabaseDescriptor(
+			sqlbase.ID(i), "foo",
+		).DescriptorProto()
 	}
 
 	// Register a callback for gossip updates.
@@ -1090,4 +1092,19 @@ Binary built without web UI.
 			}
 		}
 	})
+}
+
+func TestGWRuntimeMarshalProto(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	// Regression test against:
+	// https://github.com/cockroachdb/cockroach/issues/49842
+	runtime.DefaultHTTPError(
+		ctx,
+		runtime.NewServeMux(),
+		&protoutil.ProtoPb{}, // calls XXX_size
+		&httptest.ResponseRecorder{},
+		nil, /* request */
+		errors.New("boom"),
+	)
 }

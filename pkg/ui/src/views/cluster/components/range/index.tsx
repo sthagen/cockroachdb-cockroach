@@ -164,7 +164,7 @@ class RangeSelect extends React.Component<RangeSelectProps, RangeSelectState> {
       onClick={this.handleOptionButtonOnClick(option)}
       ghost
     >
-      <span className="dropdown__range-title">{this.props.selected.title !== "Custom" && option.value === "Custom" ? "--" : option.timeLabel}</span>
+      <span className="range__range-title">{this.props.selected.title !== "Custom" && option.value === "Custom" ? "--" : option.timeLabel}</span>
       <span className="__option-label">{option.value === "Custom" ? "Custom date range" : option.value}</span>
     </Button>
   )
@@ -290,7 +290,6 @@ class RangeSelect extends React.Component<RangeSelectProps, RangeSelectState> {
             allowClear={false}
             format={`${timePickerFormat} ${moment(start).isSame(moment.utc(), "minute") && "[- Now]" || ""}`}
             use12Hours
-            addon={this.renderTimePickerAddon(DateTypes.DATE_FROM)}
             onChange={this.onChangeDate(DateTypes.DATE_FROM)}
             disabledHours={isSameDate && this.getDisabledHours(true) || undefined}
             disabledMinutes={isSameDate && this.getDisabledMinutes(true) || undefined}

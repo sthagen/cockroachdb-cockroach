@@ -19,9 +19,9 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// boolOrUnknownToSelOp plans an infrastructure necessary to convert a column
+// BoolOrUnknownToSelOp plans an infrastructure necessary to convert a column
 // of either Bool or Unknown type into a selection vector on the input batches.
-func boolOrUnknownToSelOp(
+func BoolOrUnknownToSelOp(
 	input colexecbase.Operator, typs []*types.T, vecIdx int,
 ) (colexecbase.Operator, error) {
 	switch typs[vecIdx].Family() {
@@ -82,10 +82,11 @@ func (p *boolVecToSelOp) Next(ctx context.Context) coldata.Batch {
 		} else {
 			batch.SetSelection(true)
 			sel := batch.Selection()
-			for i := range outputCol[:n] {
+			col := outputCol[:n]
+			for i := range col {
 				var inc int
 				// Ditto above: replace a conditional with a data dependency.
-				if outputCol[i] {
+				if col[i] {
 					inc = 1
 				}
 				sel[idx] = i
@@ -124,7 +125,7 @@ func boolVecToSel64(vec []bool, sel []int) []int {
 // boolVecToSelOp directly with the desired boolean slice.
 //
 // NOTE: if the column can be of a type other than boolean,
-// boolOrUnknownToSelOp *must* be used instead.
+// BoolOrUnknownToSelOp *must* be used instead.
 func newBoolVecToSelOp(input colexecbase.Operator, colIdx int) colexecbase.Operator {
 	d := selBoolOp{OneInputNode: NewOneInputNode(input), colIdx: colIdx}
 	ret := &boolVecToSelOp{OneInputNode: NewOneInputNode(&d)}

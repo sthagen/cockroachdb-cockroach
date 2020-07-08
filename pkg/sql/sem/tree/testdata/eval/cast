@@ -378,6 +378,11 @@ eval
 'he'
 
 eval
+'a🐛b🏠c'::char(3)
+----
+e'a\U0001F41Bb'
+
+eval
 'hello'::bytes
 ----
 '\x68656c6c6f'
@@ -573,6 +578,26 @@ eval
 '2010-09-28 12:00:00.1-04'::timestamptz::text
 ----
 '2010-09-28 16:00:00.1+00:00'
+
+eval
+'1969-12-30-01.00.00'::timestamp
+----
+'1969-12-30 01:00:00+00:00'
+
+eval
+'1969-12-30 01.00.00'::timestamp
+----
+'1969-12-30 01:00:00+00:00'
+
+eval
+'1969-12-30 01.00.00.12300'::timestamp
+----
+'1969-12-30 01:00:00.123+00:00'
+
+eval
+'1969-12-30-01.00.00.'::timestamp
+----
+'1969-12-30 01:00:00+00:00'
 
 eval
 '12h2m1s23ms'::interval
@@ -1024,6 +1049,11 @@ ARRAY['hello','world']::char(2)[]
 ----
 ARRAY['he','wo']
 
+eval
+ARRAY['a🐛b🏠c','def']::char(2)[]
+----
+ARRAY[e'a\U0001F41B','de']
+
 # regression for #45850
 eval
 cast(B'11011' || B'00' as bit varying(8))
@@ -1070,3 +1100,35 @@ eval
 '-10'::interval::decimal
 ----
 -10.000000000
+
+eval
+'{hello,a🐛b🏠c}'::VARCHAR(2)[]
+----
+ARRAY['he',e'a\U0001F41B']
+
+# Test the same cast, but not with a literal constant (see #50132).
+eval
+('{he' || ',a🐛b🏠}')::VARCHAR(2)[]
+----
+ARRAY['he',e'a\U0001F41B']
+
+# Chars should truncate trailing space characters.
+eval
+'hello '::char(100)
+----
+'hello'
+
+eval
+'hello t'::char(100)
+----
+'hello t'
+
+eval
+'hello '::string::char(100)
+----
+'hello'
+
+eval
+'hello t'::string::char(100)
+----
+'hello t'

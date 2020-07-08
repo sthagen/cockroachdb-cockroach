@@ -30,11 +30,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/stats"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -75,11 +72,6 @@ var useTBI = settings.RegisterBoolSetting(
 	true,
 )
 
-var backupOptionExpectValues = map[string]sql.KVStringOptValidate{
-	backupOptRevisionHistory: sql.KVStringOptRequireNoValue,
-	backupOptEncPassphrase:   sql.KVStringOptRequireValue,
-}
-
 type tableAndIndex struct {
 	tableID sqlbase.ID
 	indexID sqlbase.IndexID
@@ -88,24 +80,33 @@ type tableAndIndex struct {
 // spansForAllTableIndexes returns non-overlapping spans for every index and
 // table passed in. They would normally overlap if any of them are interleaved.
 func spansForAllTableIndexes(
-	codec keys.SQLCodec, tables []*sqlbase.TableDescriptor, revs []BackupManifest_DescriptorRevision,
+	codec keys.SQLCodec,
+	tables []sqlbase.TableDescriptorInterface,
+	revs []BackupManifest_DescriptorRevision,
 ) []roachpb.Span {
 
 	added := make(map[tableAndIndex]bool, len(tables))
 	sstIntervalTree := interval.NewTree(interval.ExclusiveOverlapper)
 	for _, table := range tables {
-		for _, index := range table.AllNonDropIndexes() {
-			if err := sstIntervalTree.Insert(intervalSpan(table.IndexSpan(codec, index.ID)), false); err != nil {
+		tableDesc := table.TableDesc()
+		for _, index := range tableDesc.AllNonDropIndexes() {
+			if err := sstIntervalTree.Insert(intervalSpan(tableDesc.IndexSpan(codec, index.ID)), false); err != nil {
 				panic(errors.NewAssertionErrorWithWrappedErrf(err, "IndexSpan"))
 			}
-			added[tableAndIndex{tableID: table.ID, indexID: index.ID}] = true
+			added[tableAndIndex{tableID: table.GetID(), indexID: index.ID}] = true
 		}
 	}
 	// If there are desc revisions, ensure that we also add any index spans
 	// in them that we didn't already get above e.g. indexes or tables that are
 	// not in latest because they were dropped during the time window in question.
 	for _, rev := range revs {
-		if tbl := rev.Desc.Table(hlc.Timestamp{}); tbl != nil {
+		// If the table was dropped during the last interval, it will have
+		// at least 2 revisions, and the first one should have the table in a PUBLIC
+		// state. We want (and do) ignore tables that have been dropped for the
+		// entire interval. DROPPED tables should never later become PUBLIC.
+		// TODO(pbardea): Consider and test the interaction between revision_history
+		// backups and OFFLINE tables.
+		if tbl := rev.Desc.Table(hlc.Timestamp{}); tbl != nil && tbl.State != sqlbase.TableDescriptor_DROP {
 			for _, idx := range tbl.AllNonDropIndexes() {
 				key := tableAndIndex{tableID: tbl.ID, indexID: idx.ID}
 				if !added[key] {
@@ -223,20 +224,17 @@ func getURIsByLocalityKV(to []string, appendPath string) (string, map[string]str
 }
 
 func backupJobDescription(
-	p sql.PlanHookState,
-	backup *tree.Backup,
-	to []string,
-	incrementalFrom []string,
-	opts map[string]string,
+	p sql.PlanHookState, backup *tree.Backup, to []string, incrementalFrom []string,
 ) (string, error) {
 	b := &tree.Backup{
-		AsOf:    backup.AsOf,
-		Options: optsToKVOptions(opts),
-		Targets: backup.Targets,
+		AsOf:               backup.AsOf,
+		Options:            backup.Options,
+		Targets:            backup.Targets,
+		DescriptorCoverage: backup.DescriptorCoverage,
 	}
 
 	for _, t := range to {
-		sanitizedTo, err := cloud.SanitizeExternalStorageURI(t, nil /* extraParams */)
+		sanitizedTo, err := cloudimpl.SanitizeExternalStorageURI(t, nil /* extraParams */)
 		if err != nil {
 			return "", err
 		}
@@ -244,7 +242,7 @@ func backupJobDescription(
 	}
 
 	for _, from := range incrementalFrom {
-		sanitizedFrom, err := cloud.SanitizeExternalStorageURI(from, nil /* extraParams */)
+		sanitizedFrom, err := cloudimpl.SanitizeExternalStorageURI(from, nil /* extraParams */)
 		if err != nil {
 			return "", err
 		}
@@ -272,18 +270,14 @@ func backupPlanHook(
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-	optsFn, err := p.TypeAsStringOpts(ctx, backupStmt.Options, backupOptionExpectValues)
-	if err != nil {
-		return nil, nil, nil, false, err
-	}
 
-	header := sqlbase.ResultColumns{
-		{Name: "job_id", Typ: types.Int},
-		{Name: "status", Typ: types.String},
-		{Name: "fraction_completed", Typ: types.Float},
-		{Name: "rows", Typ: types.Int},
-		{Name: "index_entries", Typ: types.Int},
-		{Name: "bytes", Typ: types.Int},
+	var pwFn func() (string, error)
+	if backupStmt.Options.EncryptionPassphrase != nil {
+		fn, err := p.TypeAsString(ctx, backupStmt.Options.EncryptionPassphrase, "BACKUP")
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+		pwFn = fn
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -301,8 +295,8 @@ func backupPlanHook(
 			return err
 		}
 
-		if !p.ExtendedEvalContext().TxnImplicit {
-			return errors.Errorf("BACKUP cannot be used inside a transaction")
+		if !(p.ExtendedEvalContext().TxnImplicit || backupStmt.Options.Detached) {
+			return errors.Errorf("BACKUP cannot be used inside a transaction without DETACHED option")
 		}
 
 		to, err := toFn()
@@ -327,13 +321,8 @@ func backupPlanHook(
 			}
 		}
 
-		opts, err := optsFn()
-		if err != nil {
-			return err
-		}
-
 		mvccFilter := MVCCFilter_Latest
-		if _, ok := opts[backupOptRevisionHistory]; ok {
+		if backupStmt.Options.CaptureRevisionHistory {
 			mvccFilter = MVCCFilter_All
 		}
 
@@ -342,36 +331,27 @@ func backupPlanHook(
 			return err
 		}
 
-		statsCache := p.ExecCfg().TableStatsCache
-		tableStatistics := make([]*stats.TableStatisticProto, 0)
-		var tables []*sqlbase.TableDescriptor
+		var tables []sqlbase.TableDescriptorInterface
+		statsFiles := make(map[sqlbase.ID]string)
 		for _, desc := range targetDescs {
 			if dbDesc := desc.GetDatabase(); dbDesc != nil {
-				if err := p.CheckPrivilege(ctx, dbDesc, privilege.SELECT); err != nil {
+				db := sqlbase.NewImmutableDatabaseDescriptor(*dbDesc)
+				if err := p.CheckPrivilege(ctx, db, privilege.SELECT); err != nil {
 					return err
 				}
 			}
 			if tableDesc := desc.Table(hlc.Timestamp{}); tableDesc != nil {
-				if err := p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
+				// TODO(ajwerner): This construction of a wrapper is unfortunate and should
+				// go away in this PR.
+				table := sqlbase.NewImmutableTableDescriptor(*tableDesc)
+				if err := p.CheckPrivilege(ctx, table, privilege.SELECT); err != nil {
 					return err
 				}
-				tables = append(tables, tableDesc)
+				tables = append(tables, table)
 
-				// If the table has any user defined types, error out.
-				for _, col := range tableDesc.Columns {
-					if col.Type.UserDefined() {
-						return unimplemented.NewWithIssue(48689, "user defined types in backup")
-					}
-				}
-
-				// Collect all the table stats for this table.
-				tableStatisticsAcc, err := statsCache.GetTableStats(ctx, tableDesc.GetID())
-				if err != nil {
-					return err
-				}
-				for i := range tableStatisticsAcc {
-					tableStatistics = append(tableStatistics, &tableStatisticsAcc[i].TableStatisticProto)
-				}
+				// TODO (anzo): look into the tradeoffs of having all objects in the array to be in the same file,
+				// vs having each object in a separate file, or somewhere in between.
+				statsFiles[tableDesc.GetID()] = BackupStatisticsFileName
 			}
 		}
 
@@ -382,15 +362,19 @@ func backupPlanHook(
 		makeCloudStorage := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI
 
 		var encryptionPassphrase []byte
-		if passphrase, ok := opts[backupOptEncPassphrase]; ok {
-			encryptionPassphrase = []byte(passphrase)
+		if pwFn != nil {
+			pw, err := pwFn()
+			if err != nil {
+				return err
+			}
+			encryptionPassphrase = []byte(pw)
 		}
 
 		defaultURI, urisByLocalityKV, err := getURIsByLocalityKV(to, "")
 		if err != nil {
 			return err
 		}
-		defaultStore, err := makeCloudStorage(ctx, defaultURI)
+		defaultStore, err := makeCloudStorage(ctx, defaultURI, p.User())
 		if err != nil {
 			return err
 		}
@@ -406,7 +390,7 @@ func backupPlanHook(
 		g := ctxgroup.WithContext(ctx)
 		if len(incrementalFrom) > 0 {
 			if encryptionPassphrase != nil {
-				exportStore, err := makeCloudStorage(ctx, incrementalFrom[0])
+				exportStore, err := makeCloudStorage(ctx, incrementalFrom[0], p.User())
 				if err != nil {
 					return err
 				}
@@ -431,7 +415,7 @@ func backupPlanHook(
 					// descriptors around.
 					uri := incrementalFrom[i]
 					desc, err := ReadBackupManifestFromURI(
-						ctx, uri, makeCloudStorage, encryption,
+						ctx, uri, p.User(), makeCloudStorage, encryption,
 					)
 					if err != nil {
 						return errors.Wrapf(err, "failed to read backup from %q", uri)
@@ -501,7 +485,7 @@ func backupPlanHook(
 				// Close the old store before overwriting the reference with the new
 				// subdir store.
 				defaultStore.Close()
-				defaultStore, err = makeCloudStorage(ctx, defaultURI)
+				defaultStore, err = makeCloudStorage(ctx, defaultURI, p.User())
 				if err != nil {
 					return errors.Wrap(err, "re-opening layer-specific destination location")
 				}
@@ -562,6 +546,7 @@ func backupPlanHook(
 				prevBackups,
 				nil, /*backupLocalityInfo*/
 				keys.MinKey,
+				p.User(),
 				func(span covering.Range, start, end hlc.Timestamp) error {
 					if (start == hlc.Timestamp{}) {
 						newSpans = append(newSpans, roachpb.Span{Key: span.Start, EndKey: span.End})
@@ -591,20 +576,20 @@ func backupPlanHook(
 		// of requiring full backups after schema changes remains.
 
 		backupManifest := BackupManifest{
-			StartTime:          startTime,
-			EndTime:            endTime,
-			MVCCFilter:         mvccFilter,
-			Descriptors:        targetDescs,
-			DescriptorChanges:  revs,
-			CompleteDbs:        completeDBs,
-			Spans:              spans,
-			IntroducedSpans:    newSpans,
-			FormatVersion:      BackupFormatDescriptorTrackingVersion,
-			BuildInfo:          build.GetInfo(),
-			NodeID:             nodeID,
-			ClusterID:          p.ExecCfg().ClusterID(),
-			Statistics:         tableStatistics,
-			DescriptorCoverage: backupStmt.DescriptorCoverage,
+			StartTime:           startTime,
+			EndTime:             endTime,
+			MVCCFilter:          mvccFilter,
+			Descriptors:         targetDescs,
+			DescriptorChanges:   revs,
+			CompleteDbs:         completeDBs,
+			Spans:               spans,
+			IntroducedSpans:     newSpans,
+			FormatVersion:       BackupFormatDescriptorTrackingVersion,
+			BuildInfo:           build.GetInfo(),
+			NodeID:              nodeID,
+			ClusterID:           p.ExecCfg().ClusterID(),
+			StatisticsFilenames: statsFiles,
+			DescriptorCoverage:  backupStmt.DescriptorCoverage,
 		}
 
 		// Sanity check: re-run the validation that RESTORE will do, but this time
@@ -615,6 +600,7 @@ func backupPlanHook(
 			append(prevBackups, backupManifest),
 			nil, /*backupLocalityInfo*/
 			keys.MinKey,
+			p.User(),
 			errOnMissingRange,
 		); err != nil {
 			return err
@@ -627,7 +613,7 @@ func backupPlanHook(
 			return err
 		}
 
-		description, err := backupJobDescription(p, backupStmt, to, incrementalFrom, opts)
+		description, err := backupJobDescription(p, backupStmt, to, incrementalFrom)
 		if err != nil {
 			return err
 		}
@@ -639,7 +625,7 @@ func backupPlanHook(
 			if err != nil {
 				return err
 			}
-			exportStore, err := makeCloudStorage(ctx, defaultURI)
+			exportStore, err := makeCloudStorage(ctx, defaultURI, p.User())
 			if err != nil {
 				return err
 			}
@@ -671,40 +657,7 @@ func backupPlanHook(
 			backupDetails.ProtectedTimestampRecord = &protectedtsID
 		}
 
-		jr := jobs.Record{
-			Description: description,
-			Username:    p.User(),
-			DescriptorIDs: func() (sqlDescIDs []sqlbase.ID) {
-				for _, sqlDesc := range backupManifest.Descriptors {
-					sqlDescIDs = append(sqlDescIDs, sqlDesc.GetID())
-				}
-				return sqlDescIDs
-			}(),
-			Details:  backupDetails,
-			Progress: jobspb.BackupProgress{},
-		}
-		var sj *jobs.StartableJob
-		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-			sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn, resultsCh)
-			if err != nil {
-				return err
-			}
-			if len(spans) > 0 {
-				tsToProtect := endTime
-				rec := jobsprotectedts.MakeRecord(*backupDetails.ProtectedTimestampRecord, *sj.ID(), tsToProtect, spans)
-				return p.ExecCfg().ProtectedTimestampProvider.Protect(ctx, txn, rec)
-			}
-			return nil
-		}); err != nil {
-			if sj != nil {
-				if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
-					log.Warningf(ctx, "failed to cleanup StartableJob: %v", cleanupErr)
-				}
-			}
-		}
-
-		// Collect telemetry.
-		{
+		collectTelemetry := func() {
 			telemetry.Count("backup.total.started")
 			if startTime.IsEmpty() {
 				telemetry.Count("backup.span.full")
@@ -729,13 +682,65 @@ func backupPlanHook(
 			}
 		}
 
+		jr := jobs.Record{
+			Description: description,
+			Username:    p.User(),
+			DescriptorIDs: func() (sqlDescIDs []sqlbase.ID) {
+				for _, sqlDesc := range backupManifest.Descriptors {
+					sqlDescIDs = append(sqlDescIDs, sqlDesc.GetID())
+				}
+				return sqlDescIDs
+			}(),
+			Details:  backupDetails,
+			Progress: jobspb.BackupProgress{},
+		}
+
+		if backupStmt.Options.Detached {
+			// When running in detached mode, we simply create the job record.
+			// We do not wait for the job to finish.
+			if err := utilccl.StartAsyncJob(ctx, p, &jr, resultsCh); err != nil {
+				return err
+			}
+			collectTelemetry()
+			return nil
+		}
+
+		var sj *jobs.StartableJob
+		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+			sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn, resultsCh)
+			if err != nil {
+				return err
+			}
+			if len(spans) > 0 {
+				tsToProtect := endTime
+				if !startTime.IsEmpty() {
+					tsToProtect = startTime
+				}
+				rec := jobsprotectedts.MakeRecord(*backupDetails.ProtectedTimestampRecord, *sj.ID(), tsToProtect, spans)
+				return p.ExecCfg().ProtectedTimestampProvider.Protect(ctx, txn, rec)
+			}
+			return nil
+		}); err != nil {
+			if sj != nil {
+				if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
+					log.Warningf(ctx, "failed to cleanup StartableJob: %v", cleanupErr)
+				}
+			}
+		}
+
+		collectTelemetry()
+
 		errCh, err := sj.Start(ctx)
 		if err != nil {
 			return err
 		}
 		return <-errCh
 	}
-	return fn, header, nil, false, nil
+
+	if backupStmt.Options.Detached {
+		return fn, utilccl.DetachedJobExecutionResultHeader, nil, false, nil
+	}
+	return fn, utilccl.BulkJobExecutionResultHeader, nil, false, nil
 }
 
 // checkForNewTables returns an error if any new tables were introduced with the

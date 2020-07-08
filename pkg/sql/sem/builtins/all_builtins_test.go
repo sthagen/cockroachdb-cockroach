@@ -52,7 +52,7 @@ func TestOverloadsHaveVolatility(t *testing.T) {
 //     JOIN pg_type AS pg1 ON (lhs.typ = pg1.oid)
 //     JOIN pg_type AS pg2 ON (lhs.prorettype = pg2.oid) GROUP BY lhs.oid, proname, pg2.typname, provolatile, proleakproof) a
 //     ORDER BY proname, args
-// ) TO '/tmp/pg_proc_provolatile_dump.csv' WITH CSV DELIMIER '|' HEADER;
+// ) TO '/tmp/pg_proc_provolatile_dump.csv' WITH CSV DELIMITER '|' HEADER;
 func TestOverloadsVolatilityMatchesPostgres(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	csvPath := filepath.Join("testdata", "pg_proc_provolatile_dump.csv")
@@ -140,10 +140,10 @@ func TestOverloadsVolatilityMatchesPostgres(t *testing.T) {
 
 	// Check each builtin against Postgres.
 	for name, builtin := range builtins {
-		if builtin.props.IgnoreVolatilityCheck {
-			continue
-		}
 		for idx, overload := range builtin.overloads {
+			if overload.IgnoreVolatilityCheck {
+				continue
+			}
 			postgresVolatility, found := findOverloadVolatility(name, overload)
 			if !found {
 				continue

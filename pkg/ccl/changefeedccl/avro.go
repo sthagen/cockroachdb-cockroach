@@ -14,7 +14,7 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/errors"
-	"github.com/linkedin/goavro"
+	"github.com/linkedin/goavro/v2"
 )
 
 // The file contains a very specific marriage between avro and our SQL schemas.
@@ -181,7 +181,7 @@ func columnDescToAvroSchema(colDesc *sqlbase.ColumnDescriptor) (*avroSchemaField
 			return []byte(d.(*tree.DGeography).EWKB()), nil
 		}
 		schema.decodeFn = func(x interface{}) (tree.Datum, error) {
-			g, err := geo.ParseGeographyFromEWKBRaw(geopb.EWKB(x.([]byte)))
+			g, err := geo.ParseGeographyFromEWKBUnsafe(geopb.EWKB(x.([]byte)))
 			if err != nil {
 				return nil, err
 			}
@@ -193,7 +193,7 @@ func columnDescToAvroSchema(colDesc *sqlbase.ColumnDescriptor) (*avroSchemaField
 			return []byte(d.(*tree.DGeometry).EWKB()), nil
 		}
 		schema.decodeFn = func(x interface{}) (tree.Datum, error) {
-			g, err := geo.ParseGeometryFromEWKBRaw(geopb.EWKB(x.([]byte)))
+			g, err := geo.ParseGeometryFromEWKBUnsafe(geopb.EWKB(x.([]byte)))
 			if err != nil {
 				return nil, err
 			}
@@ -256,7 +256,8 @@ func columnDescToAvroSchema(colDesc *sqlbase.ColumnDescriptor) (*avroSchemaField
 			return d.(*tree.DTimeTZ).TimeTZ.String(), nil
 		}
 		schema.decodeFn = func(x interface{}) (tree.Datum, error) {
-			return tree.ParseDTimeTZ(nil, x.(string), time.Microsecond)
+			d, _, err := tree.ParseDTimeTZ(nil, x.(string), time.Microsecond)
+			return d, err
 		}
 	case types.TimestampFamily:
 		avroType = avroLogicalType{

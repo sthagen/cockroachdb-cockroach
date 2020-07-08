@@ -89,7 +89,7 @@ func (n *scrubNode) startExec(params runParams) error {
 		// If the tableName provided refers to a view and error will be
 		// returned here.
 		tableDesc, err := params.p.ResolveExistingObjectEx(
-			params.ctx, n.n.Table, true /*required*/, resolver.ResolveRequireTableDesc)
+			params.ctx, n.n.Table, true /*required*/, tree.ResolveRequireTableDesc)
 		if err != nil {
 			return err
 		}
@@ -160,7 +160,7 @@ func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tr
 		return err
 	}
 
-	schemas, err := p.Tables().GetSchemasForDatabase(ctx, p.txn, dbDesc.ID)
+	schemas, err := p.Tables().GetSchemasForDatabase(ctx, p.txn, dbDesc.GetID())
 	if err != nil {
 		return err
 	}
@@ -477,7 +477,6 @@ func scrubRunDistSQL(
 		rowResultWriter,
 		tree.Rows,
 		p.ExecCfg().RangeDescriptorCache,
-		p.ExecCfg().LeaseHolderCache,
 		p.txn,
 		func(ts hlc.Timestamp) {
 			p.ExecCfg().Clock.Update(ts)

@@ -637,7 +637,8 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 			// (Re-)compute the client connection URL. We cannot do this
 			// earlier (e.g. above, in the runStart function) because
 			// at this time the address and port have not been resolved yet.
-			pgURL, err := serverCfg.PGURL(url.User(security.RootUser))
+			sCtx := rpc.MakeSecurityContext(serverCfg.Config)
+			pgURL, err := sCtx.PGURL(url.User(security.RootUser))
 			if err != nil {
 				log.Errorf(ctx, "failed computing the URL: %v", err)
 				return
@@ -690,11 +691,11 @@ If problems persist, please see %s.`
 
 	// Set up the Geospatial library.
 	// We need to make sure this happens before any queries involving geospatial data is executed.
-	loc, err := geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, demoCtx.geoLibsDir)
+	loc, err := geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, startCtx.geoLibsDir)
 	if err != nil {
 		log.Infof(ctx, "could not initialize GEOS - geospatial functions may not be available: %v", err)
 	} else {
-		log.Infof(ctx, "GEOS initialized at %s", loc)
+		log.Infof(ctx, "GEOS loaded from directory %s", loc)
 	}
 
 	// Beyond this point, the configuration is set and the server is
@@ -760,11 +761,11 @@ If problems persist, please see %s.`
 			// Attempt to start the server.
 			if err := s.Start(ctx); err != nil {
 				if le := (*server.ListenError)(nil); errors.As(err, &le) {
-					const errorPrefix = "consider changing the port via --"
+					const errorPrefix = "consider changing the port via --%s"
 					if le.Addr == serverCfg.Addr {
-						err = errors.Wrap(err, errorPrefix+cliflags.ListenAddr.Name)
+						err = errors.Wrapf(err, errorPrefix, cliflags.ListenAddr.Name)
 					} else if le.Addr == serverCfg.HTTPAddr {
-						err = errors.Wrap(err, errorPrefix+cliflags.ListenHTTPAddr.Name)
+						err = errors.Wrapf(err, errorPrefix, cliflags.ListenHTTPAddr.Name)
 					}
 				}
 
@@ -809,7 +810,8 @@ If problems persist, please see %s.`
 			// (Re-)compute the client connection URL. We cannot do this
 			// earlier (e.g. above, in the runStart function) because
 			// at this time the address and port have not been resolved yet.
-			pgURL, err := serverCfg.PGURL(url.User(security.RootUser))
+			sCtx := rpc.MakeSecurityContext(serverCfg.Config)
+			pgURL, err := sCtx.PGURL(url.User(security.RootUser))
 			if err != nil {
 				log.Errorf(ctx, "failed computing the URL: %v", err)
 				return err
@@ -1039,25 +1041,41 @@ If problems persist, please see %s.`
 	// forcefully terminated.
 
 	const hardShutdownHint = " - node may take longer to restart & clients may need to wait for leases to expire"
-	select {
-	case sig := <-signalCh:
-		// This new signal is not welcome, as it interferes with the graceful
-		// shutdown process.
-		log.Shoutf(shutdownCtx, log.Severity_ERROR,
-			"received signal '%s' during shutdown, initiating hard shutdown%s",
-			log.Safe(sig), log.Safe(hardShutdownHint))
-		handleSignalDuringShutdown(sig)
-		panic("unreachable")
+	for {
+		select {
+		case sig := <-signalCh:
+			switch sig {
+			case termSignal:
+				// Double SIGTERM, or SIGTERM after another signal: continue
+				// the graceful shutdown.
+				log.Infof(shutdownCtx, "received additional signal '%s'; continuing graceful shutdown", sig)
+				continue
+			case quitSignal:
+				// A SIGQUIT is received during the "graceful shutdown" phase
+				// initiated by another signal. Take this as a request to get
+				// the stacks at this point.
+				log.DumpStacks(shutdownCtx)
+			}
 
-	case <-stopper.IsStopped():
-		const msgDone = "server drained and shutdown completed"
-		log.Infof(shutdownCtx, msgDone)
-		fmt.Fprintln(os.Stdout, msgDone)
+			// This new signal is not welcome, as it interferes with the graceful
+			// shutdown process.
+			log.Shoutf(shutdownCtx, log.Severity_ERROR,
+				"received signal '%s' during shutdown, initiating hard shutdown%s",
+				log.Safe(sig), log.Safe(hardShutdownHint))
+			handleSignalDuringShutdown(sig)
+			panic("unreachable")
 
-	case <-stopWithoutDrain:
-		const msgDone = "too early to drain; used hard shutdown instead"
-		log.Infof(shutdownCtx, msgDone)
-		fmt.Fprintln(os.Stdout, msgDone)
+		case <-stopper.IsStopped():
+			const msgDone = "server drained and shutdown completed"
+			log.Infof(shutdownCtx, msgDone)
+			fmt.Fprintln(os.Stdout, msgDone)
+
+		case <-stopWithoutDrain:
+			const msgDone = "too early to drain; used hard shutdown instead"
+			log.Infof(shutdownCtx, msgDone)
+			fmt.Fprintln(os.Stdout, msgDone)
+		}
+		break
 	}
 
 	return returnErr
@@ -1223,11 +1241,6 @@ func setupAndInitializeLoggingAndProfiling(
 			return nil, err
 		}
 
-		// NB: this message is a crutch until #33458 is addressed. Without it,
-		// the calls to log.Shout below can be the first use of logging, hitting
-		// the bug described in the issue.
-		log.Infof(ctx, "logging to directory %s", logDir)
-
 		// Start the log file GC daemon to remove files that make the log
 		// directory too large.
 		log.StartGCDaemon(ctx)
@@ -1241,6 +1254,14 @@ func setupAndInitializeLoggingAndProfiling(
 				stopper.AddCloser(storage.InitRocksDBLogger(ctx))
 			}
 		}()
+	}
+
+	// Initialize the redirection of stderr and log redaction.  Note,
+	// this function must be called even if there is no log directory
+	// configured, to verify whether the combination of requested flags
+	// is valid.
+	if _, err := log.SetupRedactionAndStderrRedirects(); err != nil {
+		return nil, err
 	}
 
 	// We want to be careful to still produce useful debug dumps if the
@@ -1330,13 +1351,13 @@ func getClientGRPCConn(
 	// as that of nodes in the cluster.
 	clock := hlc.NewClock(hlc.UnixNano, 0)
 	stopper := stop.NewStopper()
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: cfg.Settings.Tracer},
-		cfg.Config,
-		clock,
-		stopper,
-		cfg.Settings,
-	)
+	rpcContext := rpc.NewContext(rpc.ContextOptions{
+		AmbientCtx: log.AmbientContext{Tracer: cfg.Settings.Tracer},
+		Config:     cfg.Config,
+		Clock:      clock,
+		Stopper:    stopper,
+		Settings:   cfg.Settings,
+	})
 	addr, err := addrWithDefaultHost(cfg.AdvertiseAddr)
 	if err != nil {
 		stopper.Stop(ctx)

@@ -19,8 +19,10 @@ import (
 	"strings"
 )
 
-var sqlAlchemyResultRegex = regexp.MustCompile(`^(?P<test>test.*::.*::[^ \[\]]*(?:\[.*])?) (?P<result>.*)$`)
+var sqlAlchemyResultRegex = regexp.MustCompile(`^(?P<test>test.*::.*::[^ \[\]]*(?:\[.*])?) (?P<result>\w+)\s+\[.+]$`)
 var sqlAlchemyReleaseTagRegex = regexp.MustCompile(`^rel_(?P<major>\d+)_(?P<minor>\d+)_(?P<point>\d+)$`)
+
+var supportedSQLAlchemyTag = "rel_1_3_17"
 
 // This test runs the SQLAlchemy dialect test suite against a single Cockroach
 // node.
@@ -54,9 +56,7 @@ func registerSQLAlchemy(r *testRegistry) {
 			t.Fatal(err)
 		}
 		c.l.Printf("Latest sqlalchemy release is %s.", latestTag)
-
-		// TODO: using the latest version requires the dialect to implement `get_isolation_levels`
-		latestTag = "rel_1_3_14"
+		c.l.Printf("Supported sqlalchemy release is %s.", supportedSQLAlchemyTag)
 
 		if err := repeatRunE(
 			ctx, c, node, "update apt-get",
@@ -98,8 +98,7 @@ func registerSQLAlchemy(r *testRegistry) {
 			c,
 			node,
 			"install pytest",
-			// Unpin pytest once sqlalchemy rel_1_3_16 is released (https://github.com/sqlalchemy/sqlalchemy/issues/5201)
-			`sudo pip3 install --upgrade --force-reinstall setuptools pytest==5.3.5 pytest-xdist psycopg2`,
+			`sudo pip3 install --upgrade --force-reinstall setuptools pytest pytest-xdist psycopg2`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -142,7 +141,7 @@ func registerSQLAlchemy(r *testRegistry) {
 			c,
 			"https://github.com/sqlalchemy/sqlalchemy.git",
 			"/mnt/data1/sqlalchemy",
-			latestTag,
+			supportedSQLAlchemyTag,
 			node,
 		); err != nil {
 			t.Fatal(err)
@@ -155,18 +154,19 @@ func registerSQLAlchemy(r *testRegistry) {
 			t.Fatal(err)
 		}
 
-		blacklistName, expectedFailures, ignoredlistName, ignoredlist := sqlAlchemyBlacklists.getLists(version)
+		blocklistName, expectedFailures, ignoredlistName, ignoredlist := sqlAlchemyBlocklists.getLists(version)
 		if expectedFailures == nil {
-			t.Fatalf("No sqlalchemy blacklist defined for cockroach version %s", version)
+			t.Fatalf("No sqlalchemy blocklist defined for cockroach version %s", version)
 		}
-		c.l.Printf("Running cockroach version %s, using blacklist %s, using ignoredlist %s",
-			version, blacklistName, ignoredlistName)
+		c.l.Printf("Running cockroach version %s, using blocklist %s, using ignoredlist %s",
+			version, blocklistName, ignoredlistName)
 
 		t.Status("running sqlalchemy test suite")
 		// Note that this is expected to return an error, since the test suite
 		// will fail. And it is safe to swallow it here.
 		rawResults, _ := c.RunWithBuffer(ctx, t.l, node,
-			`cd /mnt/data1/sqlalchemy/ && pytest -s --maxfail=0 `+
+			`cd /mnt/data1/sqlalchemy/ && pytest --maxfail=0 `+
+				`--requirements=cockroachdb.sqlalchemy.test_requirements:Requirements `+
 				`--dburi=cockroachdb://root@localhost:26257/defaultdb?sslmode=disable `+
 				`test/dialect/test_suite.py`)
 
@@ -222,7 +222,7 @@ func registerSQLAlchemy(r *testRegistry) {
 		}
 
 		results.summarizeAll(
-			t, "sqlalchemy" /* ormName */, blacklistName, expectedFailures, version, latestTag)
+			t, "sqlalchemy" /* ormName */, blocklistName, expectedFailures, version, supportedSQLAlchemyTag)
 	}
 
 	r.Add(testSpec{

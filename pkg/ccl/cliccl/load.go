@@ -18,8 +18,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/cli"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -55,18 +57,20 @@ func runLoadShow(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	basepath := args[0]
 	if !strings.Contains(basepath, "://") {
-		basepath = cloud.MakeLocalStorageURI(basepath)
+		basepath = cloudimpl.MakeLocalStorageURI(basepath)
 	}
 
-	externalStorageFromURI := func(ctx context.Context, uri string) (cloud.ExternalStorage, error) {
-		return cloud.ExternalStorageFromURI(ctx, uri, base.ExternalIODirConfig{},
-			cluster.NoSettings, blobs.TestEmptyBlobClientFactory)
+	externalStorageFromURI := func(ctx context.Context, uri string,
+		user string) (cloud.ExternalStorage, error) {
+		return cloudimpl.ExternalStorageFromURI(ctx, uri, base.ExternalIODirConfig{},
+			cluster.NoSettings, blobs.TestEmptyBlobClientFactory, user, nil, nil)
 	}
 	// This reads the raw backup descriptor (with table descriptors possibly not
 	// upgraded from the old FK representation, or even older formats). If more
 	// fields are added to the output, the table descriptors may need to be
 	// upgraded.
-	desc, err := backupccl.ReadBackupManifestFromURI(ctx, basepath, externalStorageFromURI, nil)
+	desc, err := backupccl.ReadBackupManifestFromURI(ctx, basepath, security.RootUser,
+		externalStorageFromURI, nil)
 	if err != nil {
 		return err
 	}

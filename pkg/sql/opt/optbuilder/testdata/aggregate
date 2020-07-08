@@ -458,7 +458,7 @@ project
       │    ├── scan kv
       │    │    └── columns: k:1!null v:2 w:3 s:4
       │    └── projections
-      │         └── 3 [as=column6:6]
+      │         └── 1 + 2 [as=column6:6]
       └── aggregations
            └── count-rows [as=count_rows:5]
 
@@ -1502,7 +1502,7 @@ build
 SELECT avg(1::int)::float, avg(2::float)::float, avg(3::decimal)::float
 ----
 project
- ├── columns: avg:7 avg:8 avg:9
+ ├── columns: avg:7 avg:4 avg:8
  ├── scalar-group-by
  │    ├── columns: avg:2 avg:4 avg:6
  │    ├── project
@@ -1510,9 +1510,9 @@ project
  │    │    ├── values
  │    │    │    └── ()
  │    │    └── projections
- │    │         ├── 1::INT8 [as=column1:1]
- │    │         ├── 2.0::FLOAT8 [as=column3:3]
- │    │         └── 3::DECIMAL [as=column5:5]
+ │    │         ├── 1 [as=column1:1]
+ │    │         ├── 2.0 [as=column3:3]
+ │    │         └── 3 [as=column5:5]
  │    └── aggregations
  │         ├── avg [as=avg:2]
  │         │    └── column1:1
@@ -1522,8 +1522,7 @@ project
  │              └── column5:5
  └── projections
       ├── avg:2::FLOAT8 [as=avg:7]
-      ├── avg:4::FLOAT8 [as=avg:8]
-      └── avg:6::FLOAT8 [as=avg:9]
+      └── avg:6::FLOAT8 [as=avg:8]
 
 build
 SELECT count(2::int), count(3::float), count(4::decimal)
@@ -1535,9 +1534,9 @@ scalar-group-by
  │    ├── values
  │    │    └── ()
  │    └── projections
- │         ├── 2::INT8 [as=column1:1]
- │         ├── 3.0::FLOAT8 [as=column3:3]
- │         └── 4::DECIMAL [as=column5:5]
+ │         ├── 2 [as=column1:1]
+ │         ├── 3.0 [as=column3:3]
+ │         └── 4 [as=column5:5]
  └── aggregations
       ├── count [as=count:2]
       │    └── column1:1
@@ -1556,9 +1555,9 @@ scalar-group-by
  │    ├── values
  │    │    └── ()
  │    └── projections
- │         ├── 1::INT8 [as=column1:1]
- │         ├── 2.0::FLOAT8 [as=column3:3]
- │         └── 3::DECIMAL [as=column5:5]
+ │         ├── 1 [as=column1:1]
+ │         ├── 2.0 [as=column3:3]
+ │         └── 3 [as=column5:5]
  └── aggregations
       ├── sum [as=sum:2]
       │    └── column1:1
@@ -1577,9 +1576,9 @@ scalar-group-by
  │    ├── values
  │    │    └── ()
  │    └── projections
- │         ├── 1::INT8 [as=column1:1]
- │         ├── 1.0::FLOAT8 [as=column3:3]
- │         └── 1::DECIMAL [as=column5:5]
+ │         ├── 1 [as=column1:1]
+ │         ├── 1.0 [as=column3:3]
+ │         └── 1 [as=column5:5]
  └── aggregations
       ├── variance [as=variance:2]
       │    └── column1:1
@@ -1598,9 +1597,9 @@ scalar-group-by
  │    ├── values
  │    │    └── ()
  │    └── projections
- │         ├── 1::INT8 [as=column1:1]
- │         ├── 1.0::FLOAT8 [as=column3:3]
- │         └── 1::DECIMAL [as=column5:5]
+ │         ├── 1 [as=column1:1]
+ │         ├── 1.0 [as=column3:3]
+ │         └── 1 [as=column5:5]
  └── aggregations
       ├── std-dev [as=stddev:2]
       │    └── column1:1
@@ -2629,19 +2628,18 @@ build
 SELECT max((k+v)/(k-v)) AS r, (k+v)*(k-v) AS s FROM kv GROUP BY k+v, (k+v)/(k-v), (k+v)*(k-v)
 ----
 project
- ├── columns: r:6 s:9
+ ├── columns: r:6 s:8
  └── group-by
-      ├── columns: max:6 column7:7 column8:8 column9:9
-      ├── grouping columns: column7:7 column8:8 column9:9
+      ├── columns: column5:5 max:6 column7:7 column8:8
+      ├── grouping columns: column5:5 column7:7 column8:8
       ├── project
-      │    ├── columns: column5:5 column7:7 column8:8 column9:9
+      │    ├── columns: column5:5 column7:7 column8:8
       │    ├── scan kv
       │    │    └── columns: k:1!null v:2 w:3 s:4
       │    └── projections
       │         ├── (k:1 + v:2) / (k:1 - v:2) [as=column5:5]
       │         ├── k:1 + v:2 [as=column7:7]
-      │         ├── (k:1 + v:2) / (k:1 - v:2) [as=column8:8]
-      │         └── (k:1 + v:2) * (k:1 - v:2) [as=column9:9]
+      │         └── (k:1 + v:2) * (k:1 - v:2) [as=column8:8]
       └── aggregations
            └── max [as=max:6]
                 └── column5:5
@@ -2798,7 +2796,7 @@ scalar-group-by
  │    ├── scan kv
  │    │    └── columns: k:1!null v:2 w:3 s:4
  │    └── projections
- │         └── 'abcxyz' [as=column5:5]
+ │         └── 'abc' || 'xyz' [as=column5:5]
  └── aggregations
       └── string-agg [as=string_agg:6]
            ├── s:4
@@ -3941,3 +3939,38 @@ scalar-group-by
  └── aggregations
       └── const-agg [as=percentile_cont:6]
            └── percentile_cont:6
+
+# Regression test for #46914.
+exec-ddl
+CREATE TABLE t0(c0 INT)
+----
+
+build format=(show-types,show-scalars)
+SELECT * FROM t0 GROUP BY t0.c0 HAVING min((CASE WHEN false THEN NULL END):::FLOAT) IS NOT NAN
+----
+project
+ ├── columns: c0:1(int)
+ └── select
+      ├── columns: c0:1(int) min:4(float!null)
+      ├── group-by
+      │    ├── columns: c0:1(int) min:4(float)
+      │    ├── grouping columns: c0:1(int)
+      │    ├── project
+      │    │    ├── columns: column3:3(float) c0:1(int)
+      │    │    ├── scan t0
+      │    │    │    └── columns: c0:1(int) rowid:2(int!null)
+      │    │    └── projections
+      │    │         └── case [as=column3:3, type=float]
+      │    │              ├── true [type=bool]
+      │    │              ├── when [type=float]
+      │    │              │    ├── false [type=bool]
+      │    │              │    └── cast: FLOAT8 [type=float]
+      │    │              │         └── null [type=unknown]
+      │    │              └── null [type=float]
+      │    └── aggregations
+      │         └── min [as=min:4, type=float]
+      │              └── variable: column3:3 [type=float]
+      └── filters
+           └── ne [type=bool]
+                ├── variable: min:4 [type=float]
+                └── const: NaN [type=float]

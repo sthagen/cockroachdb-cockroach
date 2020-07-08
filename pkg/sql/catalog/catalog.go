@@ -15,25 +15,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
-// Descriptor provides table information for results from a name lookup.
-type Descriptor interface {
-	tree.NameResolutionResult
+// Descriptor is an interface for retrieved catalog descriptors.
+type Descriptor = sqlbase.DescriptorInterface
 
-	// DatabaseDesc returns the underlying database descriptor, or nil if the
-	// descriptor is not a table backed object.
-	DatabaseDesc() *sqlbase.DatabaseDescriptor
-
-	// SchemaDesc returns the underlying schema descriptor, or nil if the
-	// descriptor is not a table backed object.
-	SchemaDesc() *sqlbase.SchemaDescriptor
-
-	// TableDesc returns the underlying table descriptor, or nil if the
-	// descriptor is not a table backed object.
-	TableDesc() *sqlbase.TableDescriptor
-
-	// TypeDesc returns the underlying type descriptor, or nil if the
-	// descriptor is not a type backed object.
-	TypeDesc() *sqlbase.TypeDescriptor
+// MutableDescriptor represents a descriptor undergoing in-memory mutations
+// as part of a schema change.
+type MutableDescriptor interface {
+	Descriptor
+	// MaybeIncrementVersion sets the version of the descriptor to
+	// ClusterVersion.Version + 1.
+	// TODO (lucy): It's not a good idea to have callers handle incrementing the
+	// version manually. Find a better API for this. Maybe creating a new mutable
+	// descriptor should increment the version on the mutable copy from the
+	// outset.
+	MaybeIncrementVersion()
+	// Immutable returns an immutable copy of this descriptor.
+	Immutable() Descriptor
 }
 
 // VirtualSchemas is a collection of VirtualSchemas.
@@ -57,11 +54,6 @@ type VirtualObject interface {
 // TableEntry is the value type of FkTableMetadata: An optional table
 // descriptor, populated when the table is public/leasable, and an IsAdding
 // flag.
-//
-// This also includes an optional CheckHelper for the table (for CHECK
-// constraints). This is needed for FK work because CASCADE actions
-// can modify rows, and CHECK constraints must be applied to rows
-// modified by CASCADE.
 type TableEntry struct {
 	// Desc is the descriptor of the table. This can be nil if eg.
 	// the table is not public.
@@ -69,10 +61,4 @@ type TableEntry struct {
 
 	// IsAdding indicates the descriptor is being created.
 	IsAdding bool
-
-	// CheckHelper is the utility responsible for CHECK constraint
-	// checks. The lookup function (see TableLookupFunction below) needs
-	// not populate this field; this is populated by the lookup queue
-	// below.
-	CheckHelper *sqlbase.CheckHelper
 }

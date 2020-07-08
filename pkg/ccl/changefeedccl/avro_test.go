@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -48,8 +48,9 @@ func parseTableDesc(createTableStmt string) (*sqlbase.TableDescriptor, error) {
 	st := cluster.MakeTestingClusterSettings()
 	const parentID = sqlbase.ID(keys.MaxReservedDescID + 1)
 	const tableID = sqlbase.ID(keys.MaxReservedDescID + 2)
+	semaCtx := tree.MakeSemaContext()
 	mutDesc, err := importccl.MakeSimpleTableDescriptor(
-		ctx, st, createTable, parentID, tableID, importccl.NoFKs, hlc.UnixNano())
+		ctx, &semaCtx, st, createTable, parentID, tableID, importccl.NoFKs, hlc.UnixNano())
 	if err != nil {
 		return nil, err
 	}
@@ -80,13 +81,13 @@ func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.E
 		for colIdx, expr := range rowTuple {
 			col := &tableDesc.Columns[colIdx]
 			typedExpr, err := sqlbase.SanitizeVarFreeExpr(
-				ctx, expr, col.Type, "avro", &semaCtx, false /* allowImpure */)
+				ctx, expr, col.Type, "avro", &semaCtx, tree.VolatilityStable)
 			if err != nil {
 				return nil, err
 			}
 			datum, err := typedExpr.Eval(evalCtx)
 			if err != nil {
-				return nil, errors.Wrap(err, typedExpr.String())
+				return nil, errors.Wrapf(err, "evaluating %s", typedExpr)
 			}
 			row = append(row, sqlbase.DatumToEncDatum(col.Type, datum))
 		}

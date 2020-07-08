@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -86,7 +86,7 @@ func showBackupPlanHook(
 			return err
 		}
 
-		store, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, str)
+		store, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, str, p.User())
 		if err != nil {
 			return errors.Wrapf(err, "make storage")
 		}
@@ -104,7 +104,7 @@ func showBackupPlanHook(
 
 		incPaths, err := findPriorBackups(ctx, store)
 		if err != nil {
-			if errors.Is(err, cloud.ErrListingUnsupported) {
+			if errors.Is(err, cloudimpl.ErrListingUnsupported) {
 				// If we do not support listing, we have to just assume there are none
 				// and show the specified base.
 				log.Warningf(ctx, "storage sink %T does not support listing, only resolving the base backup", store)
@@ -126,7 +126,7 @@ func showBackupPlanHook(
 				return err
 			}
 			// Blank the stats to prevent memory blowup.
-			m.Statistics = nil
+			m.DeprecatedStatistics = nil
 			manifests[i+1] = m
 		}
 
@@ -191,9 +191,9 @@ func backupShowerDefault(
 			for _, manifest := range manifests {
 				descs := make(map[sqlbase.ID]string)
 				for _, descriptor := range manifest.Descriptors {
-					if database := descriptor.GetDatabase(); database != nil {
-						if _, ok := descs[database.ID]; !ok {
-							descs[database.ID] = database.Name
+					if descriptor.GetDatabase() != nil {
+						if _, ok := descs[descriptor.GetID()]; !ok {
+							descs[descriptor.GetID()] = descriptor.GetName()
 						}
 					}
 				}
@@ -241,7 +241,8 @@ func backupShowerDefault(
 								FKDisplayMode:  sql.OmitMissingFKClausesFromCreate,
 								IgnoreComments: true,
 							}
-							schema, err := p.ShowCreate(ctx, dbName, manifest.Descriptors, table, displayOptions)
+							schema, err := p.ShowCreate(ctx, dbName, manifest.Descriptors,
+								sqlbase.NewImmutableTableDescriptor(*table), displayOptions)
 							if err != nil {
 								continue
 							}

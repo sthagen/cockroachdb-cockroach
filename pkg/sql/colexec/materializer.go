@@ -32,19 +32,19 @@ type Materializer struct {
 	input colexecbase.Operator
 	typs  []*types.T
 
-	da sqlbase.DatumAlloc
+	drainHelper *drainHelper
 
 	// runtime fields --
 
-	// curIdx represents the current index into the column batch: the next row the
-	// Materializer will emit.
+	// curIdx represents the current index into the column batch: the next row
+	// the Materializer will emit.
 	curIdx int
 	// batch is the current Batch the Materializer is processing.
 	batch coldata.Batch
-	// colvecs is the unwrapped batch.
-	colvecs []coldata.Vec
-	// sel is the selection vector on the batch.
-	sel []int
+	// converter contains the converted vectors of the current batch. Note that
+	// if the batch had a selection vector on top of it, the converted vectors
+	// will be "dense" and contain only tuples that were selected.
+	converter *vecToDatumConverter
 
 	// row is the memory used for the output row.
 	row sqlbase.EncDatumRow
@@ -65,6 +65,61 @@ type Materializer struct {
 	// termination.
 	closers []IdempotentCloser
 }
+
+// drainHelper is a utility struct that wraps MetadataSources in a RowSource
+// interface. This is done so that the Materializer can drain MetadataSources
+// in the vectorized input tree as inputs, rather than draining them in the
+// trailing metadata state, which is meant only for internal metadata
+// generation.
+type drainHelper struct {
+	execinfrapb.MetadataSources
+	ctx          context.Context
+	bufferedMeta []execinfrapb.ProducerMetadata
+}
+
+var _ execinfra.RowSource = &drainHelper{}
+
+func newDrainHelper(sources execinfrapb.MetadataSources) *drainHelper {
+	return &drainHelper{
+		MetadataSources: sources,
+	}
+}
+
+// OutputTypes implements the RowSource interface.
+func (d *drainHelper) OutputTypes() []*types.T {
+	colexecerror.InternalError("unimplemented")
+	// Unreachable code.
+	return nil
+}
+
+// Start implements the RowSource interface.
+func (d *drainHelper) Start(ctx context.Context) context.Context {
+	d.ctx = ctx
+	return ctx
+}
+
+// Next implements the RowSource interface.
+func (d *drainHelper) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
+	if d.bufferedMeta == nil {
+		d.bufferedMeta = d.DrainMeta(d.ctx)
+		if d.bufferedMeta == nil {
+			// Still nil, avoid more calls to DrainMeta.
+			d.bufferedMeta = []execinfrapb.ProducerMetadata{}
+		}
+	}
+	if len(d.bufferedMeta) == 0 {
+		return nil, nil
+	}
+	meta := d.bufferedMeta[0]
+	d.bufferedMeta = d.bufferedMeta[1:]
+	return nil, &meta
+}
+
+// ConsumerDone implements the RowSource interface.
+func (d *drainHelper) ConsumerDone() {}
+
+// ConsumerClosed implements the RowSource interface.
+func (d *drainHelper) ConsumerClosed() {}
 
 const materializerProcName = "materializer"
 
@@ -93,10 +148,13 @@ func NewMaterializer(
 	cancelFlow func() context.CancelFunc,
 ) (*Materializer, error) {
 	m := &Materializer{
-		input:   input,
-		typs:    typs,
-		row:     make(sqlbase.EncDatumRow, len(typs)),
-		closers: toClose,
+		input:       input,
+		typs:        typs,
+		drainHelper: newDrainHelper(metadataSourcesQueue),
+		// nil vecIdxsToConvert indicates that we want to convert all vectors.
+		converter: newVecToDatumConverter(len(typs), nil /* vecIdxsToConvert */),
+		row:       make(sqlbase.EncDatumRow, len(typs)),
+		closers:   toClose,
 	}
 
 	if err := m.ProcessorBase.Init(
@@ -110,13 +168,10 @@ func NewMaterializer(
 		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
+			InputsToDrain: []execinfra.RowSource{m.drainHelper},
 			TrailingMetaCallback: func(ctx context.Context) []execinfrapb.ProducerMetadata {
-				var trailingMeta []execinfrapb.ProducerMetadata
-				for _, src := range metadataSourcesQueue {
-					trailingMeta = append(trailingMeta, src.DrainMeta(ctx)...)
-				}
 				m.InternalClose()
-				return trailingMeta
+				return nil
 			},
 		},
 	); err != nil {
@@ -147,6 +202,7 @@ func (m *Materializer) Child(nth int, verbose bool) execinfra.OpNode {
 // Start is part of the execinfra.RowSource interface.
 func (m *Materializer) Start(ctx context.Context) context.Context {
 	m.input.Init()
+	ctx = m.drainHelper.Start(ctx)
 	return m.ProcessorBase.StartInternal(ctx, materializerProcName)
 }
 
@@ -164,24 +220,21 @@ func (m *Materializer) next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadat
 		if m.batch == nil || m.curIdx >= m.batch.Length() {
 			// Get a fresh batch.
 			m.batch = m.input.Next(m.Ctx)
-
 			if m.batch.Length() == 0 {
 				m.MoveToDraining(nil /* err */)
 				return nil, m.DrainHelper()
 			}
 			m.curIdx = 0
-			m.colvecs = m.batch.ColVecs()
-			m.sel = m.batch.Selection()
+			m.converter.convertBatch(m.batch)
 		}
-		rowIdx := m.curIdx
-		if m.sel != nil {
-			rowIdx = m.sel[m.curIdx]
+
+		for colIdx := range m.typs {
+			// Note that we don't need to apply the selection vector of the
+			// batch to index m.curIdx because vecToDatumConverter returns a
+			// "dense" datum column.
+			m.row[colIdx].Datum = m.converter.getDatumColumn(colIdx)[m.curIdx]
 		}
 		m.curIdx++
-
-		for colIdx, typ := range m.typs {
-			m.row[colIdx].Datum = PhysicalTypeColElemToDatum(m.colvecs[colIdx], rowIdx, &m.da, typ)
-		}
 		// Note that there is no post-processing to be done in the
 		// materializer, so we do not use ProcessRowHelper and emit the row
 		// directly.

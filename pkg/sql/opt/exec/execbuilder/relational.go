@@ -215,8 +215,8 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	case *memo.LookupJoinExpr:
 		ep, err = b.buildLookupJoin(t)
 
-	case *memo.GeoLookupJoinExpr:
-		ep, err = b.buildGeoLookupJoin(t)
+	case *memo.InvertedJoinExpr:
+		ep, err = b.buildInvertedJoin(t)
 
 	case *memo.ZigzagJoinExpr:
 		ep, err = b.buildZigzagJoin(t)
@@ -241,6 +241,9 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 
 	case *memo.InsertExpr:
 		ep, err = b.buildInsert(t)
+
+	case *memo.InvertedFilterExpr:
+		ep, err = b.buildInvertedFilter(t)
 
 	case *memo.UpdateExpr:
 		ep, err = b.buildUpdate(t)
@@ -494,6 +497,7 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		tab.Index(scan.Index),
 		needed,
 		scan.Constraint,
+		scan.InvertedConstraint,
 		hardLimit,
 		softLimit,
 		// HardLimit.Reverse() is taken into account by ScanIsReverse.
@@ -528,6 +532,30 @@ func (b *Builder) buildSelect(sel *memo.SelectExpr) (execPlan, error) {
 		return execPlan{}, err
 	}
 	return res, nil
+}
+
+func (b *Builder) buildInvertedFilter(invFilter *memo.InvertedFilterExpr) (execPlan, error) {
+	input, err := b.buildRelational(invFilter.Input)
+	if err != nil {
+		return execPlan{}, err
+	}
+	// A filtering node does not modify the schema.
+	res := execPlan{outputCols: input.outputCols}
+	invertedCol := input.getNodeColumnOrdinal(invFilter.InvertedColumn)
+	res.root, err = b.factory.ConstructInvertedFilter(
+		input.root, invFilter.InvertedExpression, invertedCol,
+	)
+	if err != nil {
+		return execPlan{}, err
+	}
+	// Apply a post-projection to remove the inverted column.
+	//
+	// TODO(rytaft): the invertedFilter used to do this post-projection, but we
+	// had difficulty integrating that behavior. Investigate and restore that
+	// original behavior.
+	return b.applySimpleProject(
+		res, invFilter.Relational().OutputCols, invFilter.ProvidedPhysical().Ordering,
+	)
 }
 
 // applySimpleProject adds a simple projection on top of an existing plan.
@@ -948,7 +976,7 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 		item := &aggregations[i]
 		agg := item.Agg
 
-		var filterOrd exec.NodeColumnOrdinal = -1
+		var filterOrd exec.NodeColumnOrdinal = tree.NoColumnIdx
 		if aggFilter, ok := agg.(*memo.AggFilterExpr); ok {
 			filter, ok := aggFilter.Filter.(*memo.VariableExpr)
 			if !ok {
@@ -964,7 +992,7 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 			agg = aggDistinct.Input
 		}
 
-		name, overload := memo.FindAggregateOverload(agg)
+		name, _ := memo.FindAggregateOverload(agg)
 
 		// Accumulate variable arguments in argCols and constant arguments in
 		// constArgs. Constant arguments must follow variable arguments.
@@ -987,7 +1015,6 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 
 		aggInfos[i] = exec.AggInfo{
 			FuncName:   name,
-			Builtin:    overload,
 			Distinct:   distinct,
 			ResultType: item.Agg.DataType(),
 			ArgCols:    argCols,
@@ -1333,10 +1360,6 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 
 	tab := md.Table(join.Table)
 	idx := tab.Index(join.Index)
-	var eqCols opt.ColSet
-	for i := range join.KeyCols {
-		eqCols.Add(join.Table.ColumnID(idx.Column(i).Ordinal))
-	}
 
 	res.root, err = b.factory.ConstructLookupJoin(
 		joinOpToJoinType(join.JoinType),
@@ -1355,12 +1378,16 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 
 	// Apply a post-projection if Cols doesn't contain all input columns.
 	if !inputCols.SubsetOf(join.Cols) {
-		return b.applySimpleProject(res, join.Cols, join.ProvidedPhysical().Ordering)
+		outCols := join.Cols
+		if join.JoinType == opt.SemiJoinOp || join.JoinType == opt.AntiJoinOp {
+			outCols = join.Cols.Intersection(inputCols)
+		}
+		return b.applySimpleProject(res, outCols, join.ProvidedPhysical().Ordering)
 	}
 	return res, nil
 }
 
-func (b *Builder) buildGeoLookupJoin(join *memo.GeoLookupJoinExpr) (execPlan, error) {
+func (b *Builder) buildInvertedJoin(join *memo.InvertedJoinExpr) (execPlan, error) {
 	input, err := b.buildRelational(join.Input)
 	if err != nil {
 		return execPlan{}, err
@@ -1370,6 +1397,11 @@ func (b *Builder) buildGeoLookupJoin(join *memo.GeoLookupJoinExpr) (execPlan, er
 
 	inputCols := join.Input.Relational().OutputCols
 	lookupCols := join.Cols.Difference(inputCols)
+
+	// Add the inverted column since it will be referenced in the inverted
+	// expression and needs a corresponding indexed var. It will be projected
+	// away below.
+	lookupCols.Add(join.InvertedCol)
 
 	lookupOrdinals, lookupColMap := b.getColumns(lookupCols, join.Table)
 	allCols := joinOutputMap(input.outputCols, lookupColMap)
@@ -1384,6 +1416,10 @@ func (b *Builder) buildGeoLookupJoin(join *memo.GeoLookupJoinExpr) (execPlan, er
 		ivh:     tree.MakeIndexedVarHelper(nil /* container */, allCols.Len()),
 		ivarMap: allCols,
 	}
+	invertedExpr, err := b.buildScalar(&ctx, join.InvertedExpr)
+	if err != nil {
+		return execPlan{}, err
+	}
 	onExpr, err := b.buildScalar(&ctx, &join.On)
 	if err != nil {
 		return execPlan{}, err
@@ -1392,13 +1428,13 @@ func (b *Builder) buildGeoLookupJoin(join *memo.GeoLookupJoinExpr) (execPlan, er
 	tab := md.Table(join.Table)
 	idx := tab.Index(join.Index)
 
-	res.root, err = b.factory.ConstructGeoLookupJoin(
+	res.root, err = b.factory.ConstructInvertedJoin(
 		joinOpToJoinType(join.JoinType),
-		join.GeoRelationshipType,
+		invertedExpr,
 		input.root,
 		tab,
 		idx,
-		input.getNodeColumnOrdinal(join.GeoCol),
+		input.getNodeColumnOrdinal(join.InputCol),
 		lookupOrdinals,
 		onExpr,
 		res.reqOrdering(join),
@@ -1407,11 +1443,8 @@ func (b *Builder) buildGeoLookupJoin(join *memo.GeoLookupJoinExpr) (execPlan, er
 		return execPlan{}, err
 	}
 
-	// Apply a post-projection if Cols doesn't contain all input columns.
-	if !inputCols.SubsetOf(join.Cols) {
-		return b.applySimpleProject(res, join.Cols, join.ProvidedPhysical().Ordering)
-	}
-	return res, nil
+	// Apply a post-projection to remove the inverted column.
+	return b.applySimpleProject(res, join.Cols, join.ProvidedPhysical().Ordering)
 }
 
 func (b *Builder) buildZigzagJoin(join *memo.ZigzagJoinExpr) (execPlan, error) {

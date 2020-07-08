@@ -593,7 +593,9 @@ func (r *testRunner) runTest(
 	defer func() {
 		t.end = timeutil.Now()
 
-		if err := recover(); err != nil {
+		// We only have to record panics if the panic'd value is not the sentinel
+		// produced by t.Fatal*().
+		if err := recover(); err != nil && err != errTestFatal {
 			t.mu.Lock()
 			t.mu.failed = true
 			t.mu.output = append(t.mu.output, t.decorate(0 /* skip */, fmt.Sprint(err))...)
@@ -744,7 +746,9 @@ func (r *testRunner) runTest(
 
 		// This is the call to actually run the test.
 		defer func() {
-			if r := recover(); r != nil {
+			// We only have to record panics if the panic'd value is not the sentinel
+			// produced by t.Fatal*().
+			if r := recover(); r != nil && r != errTestFatal {
 				// TODO(andreimatei): prevent the cluster from being reused.
 				t.Fatalf("test panicked: %v", r)
 			}
@@ -807,7 +811,7 @@ func (r *testRunner) runTest(
 			// We really shouldn't get here unless the test code somehow managed
 			// to deadlock without blocking on anything remote - since we killed
 			// everything.
-			msg := "test timed out and afterwards failed to respond to cancelation"
+			const msg = "test timed out and afterwards failed to respond to cancelation"
 			t.l.PrintfCtx(ctx, msg)
 			r.collectClusterLogs(ctx, c, t.l)
 			// We return an error here because the test goroutine is still running, so
@@ -816,13 +820,25 @@ func (r *testRunner) runTest(
 		}
 	}
 
-	// Detect replica divergence (i.e. ranges in which replicas have arrived
-	// at the same log position with different states).
-	c.FailOnReplicaDivergence(ctx, t)
 	// Detect dead nodes in an inner defer. Note that this will call
 	// t.printfAndFail() when appropriate, which will cause the code below to
 	// enter the t.Failed() branch.
 	c.FailOnDeadNodes(ctx, t)
+
+	if !t.Failed() {
+		// Detect replica divergence (i.e. ranges in which replicas have arrived
+		// at the same log position with different states).
+		//
+		// We avoid trying to do this when t.Failed() (and in particular when there
+		// are dead nodes) because for reasons @tbg does not understand this gets
+		// stuck occasionally, which really ruins the roachtest run. The method
+		// below already uses a ctx timeout and SQL statement_timeout, but it does
+		// not seem to be enough.
+		//
+		// TODO(testinfra): figure out why this can still get stuck despite the
+		// above.
+		c.FailOnReplicaDivergence(ctx, t)
+	}
 
 	if t.Failed() {
 		r.collectClusterLogs(ctx, c, t.l)
@@ -1142,9 +1158,9 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 	// (see runVersionUpgrade). The same is true for adding a new key to this
 	// map.
 	verMap := map[string]string{
-		"20.2": "20.1.0",
-		"20.1": "19.2.7",
-		"19.2": "19.1.5",
+		"20.2": "20.1.3",
+		"20.1": "19.2.9",
+		"19.2": "19.1.10",
 		"19.1": "2.1.9",
 		"2.2":  "2.1.9",
 		"2.1":  "2.0.7",

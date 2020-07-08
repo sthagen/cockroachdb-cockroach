@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -38,11 +39,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
-
-func strToValue(s string) *roachpb.Value {
-	v := roachpb.MakeValueFromBytes([]byte(s))
-	return &v
-}
 
 // createTestDB creates a local test server and starts it. The caller
 // is responsible for stopping the test server.
@@ -221,19 +217,17 @@ func TestTxnCoordSenderCondenseLockSpans(t *testing.T) {
 		return resp, nil
 	}
 	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
-	ds := NewDistSender(
-		DistSenderConfig{
-			AmbientCtx: ambient,
-			Clock:      s.Clock,
-			RPCContext: s.Cfg.RPCContext,
-			TestingKnobs: ClientTestingKnobs{
-				TransportFactory: adaptSimpleTransport(sendFn),
-			},
-			RangeDescriptorDB: descDB,
-			Settings:          cluster.MakeTestingClusterSettings(),
+	ds := NewDistSender(DistSenderConfig{
+		AmbientCtx: ambient,
+		Clock:      s.Clock,
+		NodeDescs:  s.Gossip,
+		RPCContext: s.Cfg.RPCContext,
+		TestingKnobs: ClientTestingKnobs{
+			TransportFactory: adaptSimpleTransport(sendFn),
 		},
-		s.Gossip,
-	)
+		RangeDescriptorDB: descDB,
+		Settings:          cluster.MakeTestingClusterSettings(),
+	})
 	tsf := NewTxnCoordSenderFactory(
 		TxnCoordSenderFactoryConfig{
 			AmbientCtx: ambient,
@@ -294,7 +288,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 	keyA := roachpb.Key("a")
 	keyC := roachpb.Key("c")
 	splitKey := roachpb.Key("b")
-	if err := s.DB.AdminSplit(ctx, splitKey /* spanKey */, splitKey /* splitKey */, hlc.MaxTimestamp /* expirationTimestamp */); err != nil {
+	if err := s.DB.AdminSplit(ctx, splitKey /* splitKey */, hlc.MaxTimestamp /* expirationTimestamp */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -534,7 +528,7 @@ func TestTxnCoordSenderAddLockOnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	{
-		err := txn.CPut(ctx, key, []byte("x"), strToValue("born to fail"))
+		err := txn.CPut(ctx, key, []byte("x"), kvclientutils.StrToCPutExistingValue("born to fail"))
 		if !errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
 			t.Fatal(err)
 		}
@@ -1133,7 +1127,7 @@ func TestTxnAbortCount(t *testing.T) {
 
 	value := []byte("value")
 
-	intentionalErrText := "intentional error to cause abort"
+	const intentionalErrText = "intentional error to cause abort"
 	// Test aborted transaction.
 	if err := s.DB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		key := []byte("key-abort")

@@ -18,12 +18,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
@@ -109,13 +111,17 @@ var validCasts = []castInfo{
 
 	// Casts to GeographyFamily.
 	{from: types.UnknownFamily, to: types.GeographyFamily, volatility: VolatilityImmutable},
+	{from: types.BytesFamily, to: types.GeographyFamily, volatility: VolatilityImmutable},
+	{from: types.JsonFamily, to: types.GeographyFamily, volatility: VolatilityImmutable},
 	{from: types.StringFamily, to: types.GeographyFamily, volatility: VolatilityImmutable},
 	{from: types.CollatedStringFamily, to: types.GeographyFamily, volatility: VolatilityImmutable},
 	{from: types.GeographyFamily, to: types.GeographyFamily, volatility: VolatilityImmutable},
 	{from: types.GeometryFamily, to: types.GeographyFamily, volatility: VolatilityImmutable},
 
-	// Casts to GeographyFamily.
+	// Casts to GeometryFamily.
 	{from: types.UnknownFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
+	{from: types.BytesFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
+	{from: types.JsonFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
 	{from: types.StringFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
 	{from: types.CollatedStringFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
 	{from: types.GeographyFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
@@ -143,7 +149,7 @@ var validCasts = []castInfo{
 	{from: types.StringFamily, to: types.StringFamily, volatility: VolatilityImmutable},
 	{from: types.CollatedStringFamily, to: types.StringFamily, volatility: VolatilityImmutable},
 	{from: types.BitFamily, to: types.StringFamily, volatility: VolatilityImmutable},
-	{from: types.ArrayFamily, to: types.StringFamily, volatility: VolatilityImmutable},
+	{from: types.ArrayFamily, to: types.StringFamily, volatility: VolatilityStable},
 	{from: types.TupleFamily, to: types.StringFamily, volatility: VolatilityImmutable},
 	{from: types.GeometryFamily, to: types.StringFamily, volatility: VolatilityImmutable},
 	{from: types.GeographyFamily, to: types.StringFamily, volatility: VolatilityImmutable},
@@ -169,7 +175,7 @@ var validCasts = []castInfo{
 	{from: types.StringFamily, to: types.CollatedStringFamily, volatility: VolatilityImmutable},
 	{from: types.CollatedStringFamily, to: types.CollatedStringFamily, volatility: VolatilityImmutable},
 	{from: types.BitFamily, to: types.CollatedStringFamily, volatility: VolatilityImmutable},
-	{from: types.ArrayFamily, to: types.CollatedStringFamily, volatility: VolatilityImmutable},
+	{from: types.ArrayFamily, to: types.CollatedStringFamily, volatility: VolatilityStable},
 	{from: types.TupleFamily, to: types.CollatedStringFamily, volatility: VolatilityImmutable},
 	{from: types.GeometryFamily, to: types.CollatedStringFamily, volatility: VolatilityImmutable},
 	{from: types.GeographyFamily, to: types.CollatedStringFamily, volatility: VolatilityImmutable},
@@ -192,6 +198,8 @@ var validCasts = []castInfo{
 	{from: types.CollatedStringFamily, to: types.BytesFamily, volatility: VolatilityImmutable},
 	{from: types.BytesFamily, to: types.BytesFamily, volatility: VolatilityImmutable},
 	{from: types.UuidFamily, to: types.BytesFamily, volatility: VolatilityImmutable},
+	{from: types.GeometryFamily, to: types.BytesFamily, volatility: VolatilityImmutable},
+	{from: types.GeographyFamily, to: types.BytesFamily, volatility: VolatilityImmutable},
 
 	// Casts to DateFamily.
 	{from: types.UnknownFamily, to: types.DateFamily, volatility: VolatilityImmutable},
@@ -276,12 +284,17 @@ var validCasts = []castInfo{
 	{from: types.UnknownFamily, to: types.JsonFamily, volatility: VolatilityImmutable},
 	{from: types.StringFamily, to: types.JsonFamily, volatility: VolatilityImmutable},
 	{from: types.JsonFamily, to: types.JsonFamily, volatility: VolatilityImmutable},
+	{from: types.GeometryFamily, to: types.JsonFamily, volatility: VolatilityImmutable},
+	{from: types.GeographyFamily, to: types.JsonFamily, volatility: VolatilityImmutable},
 
 	// Casts to EnumFamily.
 	{from: types.UnknownFamily, to: types.EnumFamily, volatility: VolatilityImmutable},
 	{from: types.StringFamily, to: types.EnumFamily, volatility: VolatilityImmutable},
 	{from: types.EnumFamily, to: types.EnumFamily, volatility: VolatilityImmutable},
 	{from: types.BytesFamily, to: types.EnumFamily, volatility: VolatilityImmutable},
+
+	// Casts to TupleFamily.
+	{from: types.UnknownFamily, to: types.TupleFamily, volatility: VolatilityImmutable},
 }
 
 type castsMapKey struct {
@@ -301,6 +314,27 @@ func init() {
 		key := castsMapKey{from: c.from, to: c.to}
 		castsMap[key] = c
 	}
+}
+
+// lookupCast returns the information for a valid cast.
+// Returns nil if this is not a valid cast.
+func lookupCast(from, to types.Family) *castInfo {
+	return castsMap[castsMapKey{from: from, to: to}]
+}
+
+// LookupCastVolatility returns the volatility of a valid cast.
+func LookupCastVolatility(from, to *types.T) (_ Volatility, ok bool) {
+	fromFamily := from.Family()
+	toFamily := to.Family()
+	// Special case for casting between arrays.
+	if fromFamily == types.ArrayFamily && toFamily == types.ArrayFamily {
+		return LookupCastVolatility(from.ArrayContents(), to.ArrayContents())
+	}
+	cast := lookupCast(fromFamily, toFamily)
+	if cast == nil {
+		return 0, false
+	}
+	return cast.volatility, true
 }
 
 // PerformCast performs a cast from the provided Datum to the specified
@@ -489,16 +523,16 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 		switch v := d.(type) {
 		case *DBool:
 			if *v {
-				dd.SetFinite(1, 0)
+				dd.SetInt64(1)
 			}
 		case *DInt:
-			dd.SetFinite(int64(*v), 0)
+			dd.SetInt64(int64(*v))
 		case *DDate:
 			// TODO(mjibson): This cast is unsupported by postgres. Should we remove ours?
 			if !v.IsFinite() {
 				return nil, errDecOutOfRange
 			}
-			dd.SetFinite(v.UnixEpochDays(), 0)
+			dd.SetInt64(v.UnixEpochDays())
 		case *DFloat:
 			_, err = dd.SetFloat64(float64(*v))
 		case *DDecimal:
@@ -600,17 +634,26 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 				return NewDName(s), nil
 			}
 
+			// bpchar types truncate trailing whitespace.
+			if t.Oid() == oid.T_bpchar {
+				s = strings.TrimRight(s, " ")
+			}
+
 			// If the string type specifies a limit we truncate to that limit:
 			//   'hello'::CHAR(2) -> 'he'
 			// This is true of all the string type variants.
-			if t.Width() > 0 && int(t.Width()) < len(s) {
-				s = s[:t.Width()]
+			if t.Width() > 0 {
+				s = util.TruncateString(s, int(t.Width()))
 			}
 			return NewDString(s), nil
 		case types.CollatedStringFamily:
+			// bpchar types truncate trailing whitespace.
+			if t.Oid() == oid.T_bpchar {
+				s = strings.TrimRight(s, " ")
+			}
 			// Ditto truncation like for TString.
-			if t.Width() > 0 && int(t.Width()) < len(s) {
-				s = s[:t.Width()]
+			if t.Width() > 0 {
+				s = util.TruncateString(s, int(t.Width()))
 			}
 			return NewDCollatedString(s, t.Locale(), &ctx.CollationEnv)
 		}
@@ -625,6 +668,10 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			return NewDBytes(DBytes(t.GetBytes())), nil
 		case *DBytes:
 			return d, nil
+		case *DGeography:
+			return NewDBytes(DBytes(t.Geography.EWKB())), nil
+		case *DGeometry:
+			return NewDBytes(DBytes(t.Geometry.EWKB())), nil
 		}
 
 	case types.UuidFamily:
@@ -659,7 +706,7 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			if err := geo.GeospatialTypeFitsColumnMetadata(
 				d.Geography,
 				t.InternalType.GeoMetadata.SRID,
-				t.InternalType.GeoMetadata.Shape,
+				t.InternalType.GeoMetadata.ShapeType,
 			); err != nil {
 				return nil, err
 			}
@@ -672,8 +719,24 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			if err := geo.GeospatialTypeFitsColumnMetadata(
 				g,
 				t.InternalType.GeoMetadata.SRID,
-				t.InternalType.GeoMetadata.Shape,
+				t.InternalType.GeoMetadata.ShapeType,
 			); err != nil {
+				return nil, err
+			}
+			return &DGeography{g}, nil
+		case *DJSON:
+			t, err := d.AsText()
+			if err != nil {
+				return nil, err
+			}
+			g, err := geo.ParseGeographyFromGeoJSON([]byte(*t))
+			if err != nil {
+				return nil, err
+			}
+			return &DGeography{g}, nil
+		case *DBytes:
+			g, err := geo.ParseGeographyFromEWKB(geopb.EWKB(*d))
+			if err != nil {
 				return nil, err
 			}
 			return &DGeography{g}, nil
@@ -688,7 +751,7 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			if err := geo.GeospatialTypeFitsColumnMetadata(
 				d.Geometry,
 				t.InternalType.GeoMetadata.SRID,
-				t.InternalType.GeoMetadata.Shape,
+				t.InternalType.GeoMetadata.ShapeType,
 			); err != nil {
 				return nil, err
 			}
@@ -697,19 +760,41 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			if err := geo.GeospatialTypeFitsColumnMetadata(
 				d.Geography,
 				t.InternalType.GeoMetadata.SRID,
-				t.InternalType.GeoMetadata.Shape,
+				t.InternalType.GeoMetadata.ShapeType,
 			); err != nil {
 				return nil, err
 			}
-			return &DGeometry{d.AsGeometry()}, nil
+			g, err := d.AsGeometry()
+			if err != nil {
+				return nil, err
+			}
+			return &DGeometry{g}, nil
+		case *DJSON:
+			t, err := d.AsText()
+			if err != nil {
+				return nil, err
+			}
+			g, err := geo.ParseGeometryFromGeoJSON([]byte(*t))
+			if err != nil {
+				return nil, err
+			}
+			return &DGeometry{g}, nil
+		case *DBytes:
+			g, err := geo.ParseGeometryFromEWKB(geopb.EWKB(*d))
+			if err != nil {
+				return nil, err
+			}
+			return &DGeometry{g}, nil
 		}
 
 	case types.DateFamily:
 		switch d := d.(type) {
 		case *DString:
-			return ParseDDate(ctx, string(*d))
+			res, _, err := ParseDDate(ctx, string(*d))
+			return res, err
 		case *DCollatedString:
-			return ParseDDate(ctx, d.Contents)
+			res, _, err := ParseDDate(ctx, d.Contents)
+			return res, err
 		case *DDate:
 			return d, nil
 		case *DInt:
@@ -726,9 +811,11 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 		roundTo := TimeFamilyPrecisionToRoundDuration(t.Precision())
 		switch d := d.(type) {
 		case *DString:
-			return ParseDTime(ctx, string(*d), roundTo)
+			res, _, err := ParseDTime(ctx, string(*d), roundTo)
+			return res, err
 		case *DCollatedString:
-			return ParseDTime(ctx, d.Contents, roundTo)
+			res, _, err := ParseDTime(ctx, d.Contents, roundTo)
+			return res, err
 		case *DTime:
 			return d.Round(roundTo), nil
 		case *DTimeTZ:
@@ -750,9 +837,11 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 		roundTo := TimeFamilyPrecisionToRoundDuration(t.Precision())
 		switch d := d.(type) {
 		case *DString:
-			return ParseDTimeTZ(ctx, string(*d), roundTo)
+			res, _, err := ParseDTimeTZ(ctx, string(*d), roundTo)
+			return res, err
 		case *DCollatedString:
-			return ParseDTimeTZ(ctx, d.Contents, roundTo)
+			res, _, err := ParseDTimeTZ(ctx, d.Contents, roundTo)
+			return res, err
 		case *DTime:
 			return NewDTimeTZFromLocation(timeofday.TimeOfDay(*d).Round(roundTo), ctx.GetLocation()), nil
 		case *DTimeTZ:
@@ -766,9 +855,11 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 		// TODO(knz): Timestamp from float, decimal.
 		switch d := d.(type) {
 		case *DString:
-			return ParseDTimestamp(ctx, string(*d), roundTo)
+			res, _, err := ParseDTimestamp(ctx, string(*d), roundTo)
+			return res, err
 		case *DCollatedString:
-			return ParseDTimestamp(ctx, d.Contents, roundTo)
+			res, _, err := ParseDTimestamp(ctx, d.Contents, roundTo)
+			return res, err
 		case *DDate:
 			t, err := d.ToTime()
 			if err != nil {
@@ -793,9 +884,11 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 		// TODO(knz): TimestampTZ from float, decimal.
 		switch d := d.(type) {
 		case *DString:
-			return ParseDTimestampTZ(ctx, string(*d), roundTo)
+			res, _, err := ParseDTimestampTZ(ctx, string(*d), roundTo)
+			return res, err
 		case *DCollatedString:
-			return ParseDTimestampTZ(ctx, d.Contents, roundTo)
+			res, _, err := ParseDTimestampTZ(ctx, d.Contents, roundTo)
+			return res, err
 		case *DDate:
 			t, err := d.ToTime()
 			if err != nil {
@@ -857,11 +950,24 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			return ParseDJSON(string(*v))
 		case *DJSON:
 			return v, nil
+		case *DGeography:
+			j, err := geo.SpatialObjectToGeoJSON(v.Geography.SpatialObject(), -1, geo.SpatialObjectToGeoJSONFlagZero)
+			if err != nil {
+				return nil, err
+			}
+			return ParseDJSON(string(j))
+		case *DGeometry:
+			j, err := geo.SpatialObjectToGeoJSON(v.Geometry.SpatialObject(), -1, geo.SpatialObjectToGeoJSONFlagZero)
+			if err != nil {
+				return nil, err
+			}
+			return ParseDJSON(string(j))
 		}
 	case types.ArrayFamily:
 		switch v := d.(type) {
 		case *DString:
-			return ParseDArrayFromString(ctx, string(*v), t.ArrayContents())
+			res, _, err := ParseDArrayFromString(ctx, string(*v), t.ArrayContents())
+			return res, err
 		case *DArray:
 			dcast := NewDArray(t.ArrayContents())
 			for _, e := range v.Array {

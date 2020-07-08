@@ -213,6 +213,12 @@ func (*AlterRole) cclOnlyStatement() {}
 func (*AlterRole) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
+func (*Analyze) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*Analyze) StatementTag() string { return "ANALYZE" }
+
+// StatementType implements the Statement interface.
 func (*Backup) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -221,6 +227,16 @@ func (*Backup) StatementTag() string { return "BACKUP" }
 func (*Backup) cclOnlyStatement() {}
 
 func (*Backup) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*ScheduledBackup) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ScheduledBackup) StatementTag() string { return "SCHEDULED BACKUP" }
+
+func (*ScheduledBackup) cclOnlyStatement() {}
+
+func (*ScheduledBackup) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
 func (*BeginTransaction) StatementType() StatementType { return Ack }
@@ -806,6 +822,14 @@ func (*ShowSavepointStatus) StatementTag() string { return "SHOW SAVEPOINT STATU
 func (*ShowSavepointStatus) observerStatement() {}
 
 // StatementType implements the Statement interface.
+func (*ShowLastQueryStatistics) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowLastQueryStatistics) StatementTag() string { return "SHOW LAST QUERY STATISTICS" }
+
+func (*ShowLastQueryStatistics) observerStatement() {}
+
+// StatementType implements the Statement interface.
 func (*ShowUsers) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -919,6 +943,7 @@ func (n *AlterTableSetNotNull) String() string           { return AsString(n) }
 func (n *AlterType) String() string                      { return AsString(n) }
 func (n *AlterRole) String() string                      { return AsString(n) }
 func (n *AlterSequence) String() string                  { return AsString(n) }
+func (n *Analyze) String() string                        { return AsString(n) }
 func (n *Backup) String() string                         { return AsString(n) }
 func (n *BeginTransaction) String() string               { return AsString(n) }
 func (n *ControlJobs) String() string                    { return AsString(n) }
@@ -972,6 +997,7 @@ func (n *RollbackToSavepoint) String() string            { return AsString(n) }
 func (n *RollbackTransaction) String() string            { return AsString(n) }
 func (n *Savepoint) String() string                      { return AsString(n) }
 func (n *Scatter) String() string                        { return AsString(n) }
+func (n *ScheduledBackup) String() string                { return AsString(n) }
 func (n *Scrub) String() string                          { return AsString(n) }
 func (n *Select) String() string                         { return AsString(n) }
 func (n *SelectClause) String() string                   { return AsString(n) }
@@ -1009,6 +1035,7 @@ func (n *ShowTableStats) String() string                 { return AsString(n) }
 func (n *ShowTables) String() string                     { return AsString(n) }
 func (n *ShowTraceForSession) String() string            { return AsString(n) }
 func (n *ShowTransactionStatus) String() string          { return AsString(n) }
+func (n *ShowLastQueryStatistics) String() string        { return AsString(n) }
 func (n *ShowUsers) String() string                      { return AsString(n) }
 func (n *ShowVar) String() string                        { return AsString(n) }
 func (n *ShowZoneConfig) String() string                 { return AsString(n) }

@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
@@ -25,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/text/language"
 )
@@ -41,9 +40,6 @@ type SemaContext struct {
 
 	// IVarContainer is used to resolve the types of IndexedVars.
 	IVarContainer IndexedVarContainer
-
-	// Location references the *Location on the current Session.
-	Location **time.Location
 
 	// SearchPath indicates where to search for unqualified function
 	// names. The path elements must be normalized via Name.Normalize()
@@ -138,8 +134,11 @@ const (
 	// This is used e.g. when processing the calls inside ROWS FROM.
 	RejectNestedGenerators
 
-	// RejectImpureFunctions rejects any non-const functions like now().
-	RejectImpureFunctions
+	// RejectStableFunctions rejects any stable functions.
+	RejectStableFunctions
+
+	// RejectVolatileFunctions rejects any volatile functions.
+	RejectVolatileFunctions
 
 	// RejectSubqueries rejects subqueries in scalar contexts.
 	RejectSubqueries
@@ -164,10 +163,6 @@ type ScalarProperties struct {
 	// SeenGenerator is set to true if the expression originally
 	// contained a SRF.
 	SeenGenerator bool
-
-	// SeenImpureFunctions is set to true if the expression originally
-	// contained an impure function.
-	SeenImpure bool
 
 	// inFuncExpr is temporarily set to true while type checking the
 	// parameters of a function. Used to process RejectNestedGenerators
@@ -201,19 +196,6 @@ func (sc *SemaContext) isUnresolvedPlaceholder(expr Expr) bool {
 		return false
 	}
 	return sc.Placeholders.IsUnresolvedPlaceholder(expr)
-}
-
-// GetLocation returns the session timezone.
-func (sc *SemaContext) GetLocation() *time.Location {
-	if sc == nil || sc.Location == nil || *sc.Location == nil {
-		return time.UTC
-	}
-	return *sc.Location
-}
-
-// GetRelativeParseTime implements ParseTimeContext.
-func (sc *SemaContext) GetRelativeParseTime() time.Time {
-	return timeutil.Now().In(sc.GetLocation())
 }
 
 // GetTypeResolver returns the TypeReferenceResolver.
@@ -268,10 +250,6 @@ func TypeCheck(
 			"the desired type for tree.TypeCheck cannot be nil, use types.Any instead: %T", expr)
 	}
 
-	expr, err := FoldConstantLiterals(expr)
-	if err != nil {
-		return nil, err
-	}
 	return expr.TypeCheck(ctx, semaCtx, desired)
 }
 
@@ -443,8 +421,8 @@ func isCastDeepValid(castFrom, castTo *types.T) (bool, telemetry.Counter) {
 		return castFrom.Equivalent(castTo), sqltelemetry.EnumCastCounter
 	}
 
-	cast, ok := castsMap[castsMapKey{from: fromFamily, to: toFamily}]
-	if !ok {
+	cast := lookupCast(fromFamily, toFamily)
+	if cast == nil {
 		return false, nil
 	}
 	return true, cast.counter
@@ -459,29 +437,25 @@ func isEmptyArray(expr Expr) bool {
 func (expr *CastExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, _ *types.T,
 ) (TypedExpr, error) {
-	// The desired type provided to a CastExpr is ignored. Instead,
-	// types.Any is passed to the child of the cast. There are two
-	// exceptions, described below.
+	// The desired type provided to a CastExpr is ignored. Instead, types.Any is
+	// passed to the child of the cast. There are a few exceptions, described
+	// below.
 	desired := types.Any
 	exprType, err := ResolveType(ctx, expr.Type, semaCtx.GetTypeResolver())
 	if err != nil {
 		return nil, err
 	}
+	expr.Type = exprType
 	switch {
 	case isConstant(expr.Expr):
-		if canConstantBecome(expr.Expr.(Constant), exprType) {
+		c := expr.Expr.(Constant)
+		if canConstantBecome(c, exprType) {
 			// If a Constant is subject to a cast which it can naturally become (which
-			// is in its resolvable type set), we desire the cast's type for the Constant,
-			// which will result in the CastExpr becoming an identity cast.
+			// is in its resolvable type set), we desire the cast's type for the
+			// Constant. In many cases, the CastExpr will then become a no-op and will
+			// be elided below. In other cases, the types may be equivalent but not
+			// Identical (e.g. string vs char(2)) and the CastExpr is still needed.
 			desired = exprType
-
-			// If the type doesn't have any possible parameters (like length,
-			// precision), the CastExpr becomes a no-op and can be elided.
-			switch exprType.Family() {
-			case types.BoolFamily, types.DateFamily, types.TimeFamily, types.TimestampFamily, types.TimestampTZFamily,
-				types.IntervalFamily, types.BytesFamily:
-				return expr.Expr.TypeCheck(ctx, semaCtx, exprType)
-			}
 		}
 	case semaCtx.isUnresolvedPlaceholder(expr.Expr):
 		// This case will be triggered if ProcessPlaceholderAnnotations found
@@ -504,11 +478,17 @@ func (expr *CastExpr) TypeCheck(
 		return nil, err
 	}
 
+	// Elide the cast if it is a no-op.
+	if typedSubExpr.ResolvedType().Identical(exprType) {
+		return typedSubExpr, nil
+	}
+
 	castFrom := typedSubExpr.ResolvedType()
 
 	if ok, c := isCastDeepValid(castFrom, exprType); ok {
 		telemetry.Inc(c)
 		expr.Expr = typedSubExpr
+		expr.Type = exprType
 		expr.typ = exprType
 		return expr, nil
 	}
@@ -558,6 +538,7 @@ func (expr *AnnotateTypeExpr) TypeCheck(
 	if err != nil {
 		return nil, err
 	}
+	expr.Type = annotateType
 	subExpr, err := typeCheckAndRequire(
 		ctx,
 		semaCtx,
@@ -694,7 +675,7 @@ func (expr *CoalesceExpr) TypeCheck(
 ) (TypedExpr, error) {
 	typedSubExprs, retType, err := TypeCheckSameTypedExprs(ctx, semaCtx, desired, expr.Exprs...)
 	if err != nil {
-		return nil, decorateTypeCheckError(err, fmt.Sprintf("incompatible %s expressions", expr.Name))
+		return nil, decorateTypeCheckError(err, "incompatible %s expressions", log.Safe(expr.Name))
 	}
 
 	for i, subExpr := range typedSubExprs {
@@ -772,7 +753,7 @@ func NewInvalidNestedSRFError(context string) error {
 // NewInvalidFunctionUsageError creates a rejection for a special function.
 func NewInvalidFunctionUsageError(class FunctionClass, context string) error {
 	var cat string
-	var code string
+	var code pgcode.Code
 	switch class {
 	case AggregateClass:
 		cat = "aggregate"
@@ -842,15 +823,34 @@ func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *FunctionDefinitio
 		}
 		sc.Properties.Derived.SeenGenerator = true
 	}
-	if def.Impure {
-		if sc.Properties.required.rejectFlags&RejectImpureFunctions != 0 {
+	return nil
+}
+
+// checkOverloadUsage checks whether the given built-in overload is allowed in
+// the current context.
+func (sc *SemaContext) checkOverloadUsage(overload *Overload) error {
+	if sc == nil {
+		return nil
+	}
+	switch overload.Volatility {
+	case VolatilityVolatile:
+		if sc.Properties.required.rejectFlags&RejectVolatileFunctions != 0 {
 			// The code FeatureNotSupported is a bit misleading here,
 			// because we probably can't support the feature at all. However
 			// this error code matches PostgreSQL's in the same conditions.
 			return pgerror.Newf(pgcode.FeatureNotSupported,
-				"impure functions are not allowed in %s", sc.Properties.required.context)
+				"volatile functions are not allowed in %s", sc.Properties.required.context)
 		}
-		sc.Properties.Derived.SeenImpure = true
+	case VolatilityStable:
+		if sc.Properties.required.rejectFlags&RejectStableFunctions != 0 {
+			// The code FeatureNotSupported is a bit misleading here,
+			// because we probably can't support the feature at all. However
+			// this error code matches PostgreSQL's in the same conditions.
+			return pgerror.Newf(pgcode.FeatureNotSupported,
+				"context-dependent functions are not allowed in %s",
+				sc.Properties.required.context,
+			)
+		}
 	}
 	return nil
 }
@@ -909,8 +909,7 @@ func (expr *FuncExpr) TypeCheck(
 
 	typedSubExprs, fns, err := typeCheckOverloadedExprs(ctx, semaCtx, desired, def.Definition, false, expr.Exprs...)
 	if err != nil {
-		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue,
-			"%s()", def.Name)
+		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s()", def.Name)
 	}
 
 	// If the function is an aggregate that does not accept null arguments and we
@@ -1038,6 +1037,9 @@ func (expr *FuncExpr) TypeCheck(
 			strings.Join(typeNames, ", "),
 		)
 	}
+	if err := semaCtx.checkOverloadUsage(overloadImpl); err != nil {
+		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s()", def.Name)
+	}
 	if overloadImpl.counter != nil {
 		telemetry.Inc(overloadImpl.counter)
 	}
@@ -1117,6 +1119,7 @@ func (expr *IsOfTypeExpr) TypeCheck(
 		if err != nil {
 			return nil, err
 		}
+		expr.Types[i] = typ
 		expr.resolvedTypes[i] = typ
 	}
 	expr.Expr = exprTyped
@@ -1355,16 +1358,16 @@ func (expr PartitionMaxVal) TypeCheck(
 
 // TypeCheck implements the Expr interface.
 func (expr *NumVal) TypeCheck(
-	_ context.Context, semaCtx *SemaContext, desired *types.T,
+	ctx context.Context, semaCtx *SemaContext, desired *types.T,
 ) (TypedExpr, error) {
-	return typeCheckConstant(expr, semaCtx, desired)
+	return typeCheckConstant(ctx, semaCtx, expr, desired)
 }
 
 // TypeCheck implements the Expr interface.
 func (expr *StrVal) TypeCheck(
-	_ context.Context, semaCtx *SemaContext, desired *types.T,
+	ctx context.Context, semaCtx *SemaContext, desired *types.T,
 ) (TypedExpr, error) {
-	return typeCheckConstant(expr, semaCtx, desired)
+	return typeCheckConstant(ctx, semaCtx, expr, desired)
 }
 
 // TypeCheck implements the Expr interface.
@@ -1842,31 +1845,12 @@ func typeCheckSubqueryWithIn(left, right *types.T) error {
 			return pgerror.Newf(pgcode.InvalidParameterValue,
 				unsupportedCompErrFmt, fmt.Sprintf(compSignatureFmt, left, In, right))
 		}
-		// If the left type is NULL or is a tuple containing NULLS, then it won't
-		// be equivalent to the right type, but should pass type-checking.
-		if hasUnknownFamily(left) {
-			return nil
-		}
-		if !left.Equivalent(right.TupleContents()[0]) {
+		if !left.EquivalentOrNull(right.TupleContents()[0]) {
 			return pgerror.Newf(pgcode.InvalidParameterValue,
 				unsupportedCompErrFmt, fmt.Sprintf(compSignatureFmt, left, In, right))
 		}
 	}
 	return nil
-}
-
-func hasUnknownFamily(t *types.T) bool {
-	if t.Family() == types.UnknownFamily {
-		return true
-	}
-	if t.Family() == types.TupleFamily {
-		for _, tc := range t.TupleContents() {
-			if hasUnknownFamily(tc) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func typeCheckComparisonOp(

@@ -140,9 +140,6 @@ type sqlServerArgs struct {
 	// samplerProcessor.
 	runtime execinfra.RuntimeStats
 
-	// The tenant that the SQL server runs on the behalf of.
-	tenantID roachpb.TenantID
-
 	// SQL uses KV, both for non-DistSQL and DistSQL execution.
 	db *kv.DB
 
@@ -161,7 +158,7 @@ type sqlServerArgs struct {
 	// The protected timestamps KV subsystem depends on this, so we pass a
 	// pointer to an empty struct in this configuration, which newSQLServer
 	// fills.
-	jobRegistry         *jobs.Registry
+	circularJobRegistry *jobs.Registry
 	jobAdoptionStopFile string
 
 	// The executorConfig uses the provider.
@@ -170,7 +167,7 @@ type sqlServerArgs struct {
 
 func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	execCfg := &sql.ExecutorConfig{}
-	codec := keys.MakeSQLCodec(cfg.tenantID)
+	codec := keys.MakeSQLCodec(cfg.SQLConfig.TenantID)
 
 	// Create blob service for inter-node file sharing.
 	blobService, err := blobs.NewBlobService(cfg.Settings.ExternalIODir)
@@ -179,7 +176,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	}
 	blobspb.RegisterBlobServer(cfg.grpcServer, blobService)
 
-	jobRegistry := cfg.jobRegistry
+	jobRegistry := cfg.circularJobRegistry
 
 	{
 		regLiveness := cfg.nodeLiveness
@@ -356,7 +353,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 
 	nodeInfo := sql.NodeInfo{
 		AdminURL:  cfg.AdminURL,
-		PGURL:     cfg.PGURL,
+		PGURL:     cfg.rpcContext.PGURL,
 		ClusterID: cfg.rpcContext.ClusterID.Get,
 		NodeID:    cfg.nodeIDContainer,
 	}
@@ -393,7 +390,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		VirtualSchemas:          virtualSchemas,
 		HistogramWindowInterval: cfg.HistogramWindowInterval(),
 		RangeDescriptorCache:    cfg.distSender.RangeDescriptorCache(),
-		LeaseHolderCache:        cfg.distSender.LeaseHolderCache(),
 		RoleMemberCache:         &sql.MembershipCache{},
 		TestingKnobs:            sqlExecutorTestingKnobs,
 
@@ -401,8 +397,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 			ctx,
 			execinfra.Version,
 			cfg.Settings,
-			// The node descriptor will be set later, once it is initialized.
-			roachpb.NodeDescriptor{},
+			roachpb.NodeID(cfg.nodeIDContainer.SQLInstanceID()),
 			cfg.rpcContext,
 			distSQLServer,
 			cfg.distSender,

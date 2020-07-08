@@ -162,6 +162,7 @@ WHERE ((c.relkind = 'r'::CHAR) OR (c.relkind = 'f'::CHAR)) AND (n.nspname = 'pub
 ----
 project
  ├── columns: oid:1!null schemaname:29!null tablename:2!null relacl:26 tableowner:133 description:134 relkind:17!null cluster:92 hasoids:20!null hasindexes:13!null hasrules:22!null tablespace:33 param:27 hastriggers:23!null unlogged:15!null ftoptions:120 srvname:122 reltuples:10!null inhtable:135!null inhschemaname:69 inhtablename:42
+ ├── stable
  ├── fd: ()-->(29), (1)-->(2,10,13,15,17,20,22,23,26,27,33,133,134), (2)-->(1,10,13,15,17,20,22,23,26,27,33,133,134)
  ├── group-by
  │    ├── columns: c.oid:1!null c.relname:2!null c.relowner:5!null c.reltuples:10!null c.relhasindex:13!null c.relpersistence:15!null c.relkind:17!null c.relhasoids:20!null c.relhasrules:22!null c.relhastriggers:23!null c.relacl:26 c.reloptions:27 n.nspname:29!null spcname:33 c2.relname:42 n2.nspname:69 ci.relname:92 ftoptions:120 srvname:122 count_rows:132!null rownum:136!null
@@ -196,11 +197,11 @@ project
  │    │    │         │    │    │    ├── columns: c.oid:1!null c.relname:2!null c.relnamespace:3!null c.relowner:5!null c.reltablespace:8!null c.reltuples:10!null c.relhasindex:13!null c.relpersistence:15!null c.relkind:17!null c.relhasoids:20!null c.relhasrules:22!null c.relhastriggers:23!null c.relacl:26 c.reloptions:27 n.oid:28!null n.nspname:29!null t.oid:32 spcname:33 i.inhrelid:38 i.inhparent:39 c2.oid:41 c2.relname:42 c2.relnamespace:43 n2.oid:68 n2.nspname:69 indexrelid:72 indrelid:73 indisclustered:79
  │    │    │         │    │    │    ├── fd: ()-->(3,28,29), (1)-->(2,5,8,10,13,15,17,20,22,23,26,27,32,33), (2)-->(1,5,8,10,13,15,17,20,22,23,26,27), (3)==(28), (28)==(3), (32)-->(33), (33)-->(32), (41)-->(42,43), (42,43)-->(41), (39)==(41), (41)==(39), (68)~~>(69), (69)~~>(68), (72)-->(73)
  │    │    │         │    │    │    ├── select
- │    │    │         │    │    │    │    ├── columns: i.inhrelid:38 i.inhparent:39 c2.oid:41 c2.relname:42 c2.relnamespace:43 n2.oid:68 n2.nspname:69 indexrelid:72!null indrelid:73!null indisclustered:79!null
+ │    │    │         │    │    │    │    ├── columns: indexrelid:72!null indrelid:73!null indisclustered:79!null
  │    │    │         │    │    │    │    ├── key: (72)
  │    │    │         │    │    │    │    ├── fd: ()-->(79), (72)-->(73)
  │    │    │         │    │    │    │    ├── scan ind
- │    │    │         │    │    │    │    │    ├── columns: i.inhrelid:38 i.inhparent:39 c2.oid:41 c2.relname:42 c2.relnamespace:43 n2.oid:68 n2.nspname:69 indexrelid:72!null indrelid:73!null indisclustered:79!null
+ │    │    │         │    │    │    │    │    ├── columns: indexrelid:72!null indrelid:73!null indisclustered:79!null
  │    │    │         │    │    │    │    │    ├── key: (72)
  │    │    │         │    │    │    │    │    └── fd: (72)-->(73,79)
  │    │    │         │    │    │    │    └── filters
@@ -210,9 +211,11 @@ project
  │    │    │         │    │    │    │    ├── fd: ()-->(3,28,29), (1)-->(2,5,8,10,13,15,17,20,22,23,26,27,32,33), (2)-->(1,5,8,10,13,15,17,20,22,23,26,27), (3)==(28), (28)==(3), (32)-->(33), (33)-->(32), (41)-->(42,43), (42,43)-->(41), (39)==(41), (41)==(39), (68)~~>(69), (69)~~>(68)
  │    │    │         │    │    │    │    ├── left-join (hash)
  │    │    │         │    │    │    │    │    ├── columns: i.inhrelid:38!null i.inhparent:39!null c2.oid:41!null c2.relname:42!null c2.relnamespace:43!null n2.oid:68 n2.nspname:69
+ │    │    │         │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-more)
  │    │    │         │    │    │    │    │    ├── fd: (41)-->(42,43), (42,43)-->(41), (39)==(41), (41)==(39), (68)-->(69), (69)-->(68)
  │    │    │         │    │    │    │    │    ├── inner-join (hash)
  │    │    │         │    │    │    │    │    │    ├── columns: i.inhrelid:38!null i.inhparent:39!null c2.oid:41!null c2.relname:42!null c2.relnamespace:43!null
+ │    │    │         │    │    │    │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
  │    │    │         │    │    │    │    │    │    ├── fd: (41)-->(42,43), (42,43)-->(41), (39)==(41), (41)==(39)
  │    │    │         │    │    │    │    │    │    ├── scan i
  │    │    │         │    │    │    │    │    │    │    └── columns: i.inhrelid:38!null i.inhparent:39!null
@@ -236,6 +239,7 @@ project
  │    │    │         │    │    │    │    │    ├── fd: ()-->(3,28,29), (1)-->(2,5,8,10,13,15,17,20,22,23,26,27,32,33), (2)-->(1,5,8,10,13,15,17,20,22,23,26,27), (3)==(28), (28)==(3), (32)-->(33), (33)-->(32)
  │    │    │         │    │    │    │    │    ├── inner-join (hash)
  │    │    │         │    │    │    │    │    │    ├── columns: c.oid:1!null c.relname:2!null c.relnamespace:3!null c.relowner:5!null c.reltablespace:8!null c.reltuples:10!null c.relhasindex:13!null c.relpersistence:15!null c.relkind:17!null c.relhasoids:20!null c.relhasrules:22!null c.relhastriggers:23!null c.relacl:26 c.reloptions:27 n.oid:28!null n.nspname:29!null
+ │    │    │         │    │    │    │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
  │    │    │         │    │    │    │    │    │    ├── key: (1)
  │    │    │         │    │    │    │    │    │    ├── fd: ()-->(3,28,29), (1)-->(2,5,8,10,13,15,17,20,22,23,26,27), (2)-->(1,5,8,10,13,15,17,20,22,23,26,27), (3)==(28), (28)==(3)
  │    │    │         │    │    │    │    │    │    ├── select
@@ -308,6 +312,6 @@ project
  │         └── const-agg [as=srvname:122, outer=(122)]
  │              └── srvname:122
  └── projections
-      ├── pg_get_userbyid(c.relowner:5) [as=tableowner:133, outer=(5)]
-      ├── obj_description(c.oid:1) [as=description:134, outer=(1)]
+      ├── pg_get_userbyid(c.relowner:5) [as=tableowner:133, outer=(5), stable]
+      ├── obj_description(c.oid:1) [as=description:134, outer=(1), stable]
       └── count_rows:132 > 0 [as=inhtable:135, outer=(132)]

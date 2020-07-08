@@ -15,11 +15,11 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/geo/geoprojbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/errors"
 )
 
 // pgExtension is virtual schema which contains virtual tables and/or views
@@ -38,14 +38,14 @@ var pgExtension = virtualSchema{
 
 func postgisColumnsTablePopulator(
 	matchingFamily types.Family,
-) func(context.Context, *planner, *DatabaseDescriptor, func(...tree.Datum) error) error {
-	return func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+) func(context.Context, *planner, *sqlbase.ImmutableDatabaseDescriptor, func(...tree.Datum) error) error {
+	return func(ctx context.Context, p *planner, dbContext *sqlbase.ImmutableDatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachTableDesc(
 			ctx,
 			p,
 			dbContext,
 			hideVirtual,
-			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
+			func(db *sqlbase.ImmutableDatabaseDescriptor, scName string, table *sqlbase.ImmutableTableDescriptor) error {
 				if !table.IsPhysicalTable() {
 					return nil
 				}
@@ -62,12 +62,12 @@ func postgisColumnsTablePopulator(
 					}
 
 					var datumNDims tree.Datum
-					switch m.Shape {
-					case geopb.Shape_Point, geopb.Shape_LineString, geopb.Shape_Polygon,
-						geopb.Shape_MultiPoint, geopb.Shape_MultiLineString, geopb.Shape_MultiPolygon,
-						geopb.Shape_GeometryCollection:
+					switch m.ShapeType {
+					case geopb.ShapeType_Point, geopb.ShapeType_LineString, geopb.ShapeType_Polygon,
+						geopb.ShapeType_MultiPoint, geopb.ShapeType_MultiLineString, geopb.ShapeType_MultiPolygon,
+						geopb.ShapeType_GeometryCollection:
 						datumNDims = tree.NewDInt(2)
-					case geopb.Shape_Geometry, geopb.Shape_Unset:
+					case geopb.ShapeType_Geometry, geopb.ShapeType_Unset:
 						// For geometry_columns, the query in PostGIS COALESCES the value to 2.
 						// Otherwise, the value is NULL.
 						if matchingFamily == types.GeometryFamily {
@@ -77,9 +77,9 @@ func postgisColumnsTablePopulator(
 						}
 					}
 
-					shapeName := m.Shape.String()
-					if m.Shape == geopb.Shape_Unset {
-						shapeName = geopb.Shape_Geometry.String()
+					shapeName := m.ShapeType.String()
+					if m.ShapeType == geopb.ShapeType_Unset {
+						shapeName = geopb.ShapeType_Geometry.String()
 					}
 
 					if err := addRow(
@@ -140,7 +140,18 @@ CREATE TABLE pg_extension.spatial_ref_sys (
 	srtext varchar(2048),
 	proj4text varchar(2048)
 )`,
-	generator: func(ctx context.Context, p *planner, db *DatabaseDescriptor) (virtualTableGenerator, cleanupFunc, error) {
-		return nil, func() {}, errors.Newf("not yet implemented")
+	populate: func(ctx context.Context, p *planner, dbContext *sqlbase.ImmutableDatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		for _, projection := range geoprojbase.Projections {
+			if err := addRow(
+				tree.NewDInt(tree.DInt(projection.SRID)),
+				tree.NewDString(projection.AuthName),
+				tree.NewDInt(tree.DInt(projection.AuthSRID)),
+				tree.NewDString(projection.SRText),
+				tree.NewDString(projection.Proj4Text.String()),
+			); err != nil {
+				return err
+			}
+		}
+		return nil
 	},
 }

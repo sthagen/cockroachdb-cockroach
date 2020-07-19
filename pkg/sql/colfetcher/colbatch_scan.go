@@ -39,14 +39,12 @@ import (
 // from kv, presenting it as coldata.Batches via the exec.Operator interface.
 type colBatchScan struct {
 	colexecbase.ZeroInputNode
-	spans     roachpb.Spans
-	flowCtx   *execinfra.FlowCtx
-	rf        *cFetcher
-	limitHint int64
-	ctx       context.Context
-	// maxResults is non-zero if there is a limit on the total number of rows
-	// that the colBatchScan will read.
-	maxResults uint64
+	spans       roachpb.Spans
+	flowCtx     *execinfra.FlowCtx
+	rf          *cFetcher
+	limitHint   int64
+	parallelize bool
+	ctx         context.Context
 	// init is true after Init() has been called.
 	init bool
 }
@@ -57,8 +55,7 @@ func (s *colBatchScan) Init() {
 	s.ctx = context.Background()
 	s.init = true
 
-	limitBatches := execinfra.ScanShouldLimitBatches(s.maxResults, s.limitHint, s.flowCtx)
-
+	limitBatches := !s.parallelize
 	if err := s.rf.StartScan(
 		s.ctx, s.flowCtx.Txn, s.spans,
 		limitBatches, s.limitHint, s.flowCtx.TraceKV,
@@ -90,7 +87,7 @@ func (s *colBatchScan) DrainMeta(ctx context.Context) []execinfrapb.ProducerMeta
 	if !s.flowCtx.Local {
 		nodeID, ok := s.flowCtx.NodeID.OptionalNodeID()
 		if ok {
-			ranges := execinfra.MisplannedRanges(ctx, s.rf.GetRangesInfo(), nodeID)
+			ranges := execinfra.MisplannedRanges(ctx, s.spans, nodeID, s.flowCtx.Cfg.RangeCache)
 			if ranges != nil {
 				trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
 			}
@@ -140,9 +137,13 @@ func NewColBatchScan(
 
 	columnIdxMap := spec.Table.ColumnIdxMapWithMutations(returnMutations)
 	fetcher := cFetcher{}
+	if spec.IsCheck {
+		// cFetchers don't support these checks.
+		return nil, errors.AssertionFailedf("attempting to create a cFetcher with the IsCheck flag set")
+	}
 	if _, _, err := initCRowFetcher(
 		flowCtx.Codec(), allocator, &fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap,
-		spec.Reverse, neededColumns, spec.IsCheck, spec.Visibility, spec.LockingStrength,
+		spec.Reverse, neededColumns, spec.Visibility, spec.LockingStrength,
 	); err != nil {
 		return nil, err
 	}
@@ -153,11 +154,13 @@ func NewColBatchScan(
 		spans[i] = spec.Spans[i].Span
 	}
 	return &colBatchScan{
-		spans:      spans,
-		flowCtx:    flowCtx,
-		rf:         &fetcher,
-		limitHint:  limitHint,
-		maxResults: spec.MaxResults,
+		spans:     spans,
+		flowCtx:   flowCtx,
+		rf:        &fetcher,
+		limitHint: limitHint,
+		// Parallelize shouldn't be set when there's a limit hint, but double-check
+		// just in case.
+		parallelize: spec.Parallelize && limitHint == 0,
 	}, nil
 }
 
@@ -171,7 +174,6 @@ func initCRowFetcher(
 	colIdxMap map[sqlbase.ColumnID]int,
 	reverseScan bool,
 	valNeededForCol util.FastIntSet,
-	isCheck bool,
 	scanVisibility execinfrapb.ScanVisibility,
 	lockStr sqlbase.ScanLockingStrength,
 ) (index *sqlbase.IndexDescriptor, isSecondaryIndex bool, err error) {
@@ -193,9 +195,7 @@ func initCRowFetcher(
 		Cols:             cols,
 		ValNeededForCol:  valNeededForCol,
 	}
-	if err := fetcher.Init(
-		codec, allocator, reverseScan, lockStr, true /* returnRangeInfo */, isCheck, tableArgs,
-	); err != nil {
+	if err := fetcher.Init(codec, allocator, reverseScan, lockStr, tableArgs); err != nil {
 		return nil, false, err
 	}
 

@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geogfn"
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/geo/geomfn"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoprojbase"
@@ -59,7 +60,6 @@ type infoBuilder struct {
 	info         string
 	libraryUsage libraryUsage
 	precision    string
-	canUseIndex  bool
 }
 
 func (ib infoBuilder) String() string {
@@ -79,9 +79,6 @@ func (ib infoBuilder) String() string {
 	}
 	if ib.libraryUsage&usesPROJ != 0 {
 		sb.WriteString("\n\nThis function utilizes the PROJ library for coordinate projections.")
-	}
-	if ib.canUseIndex {
-		sb.WriteString("\n\nThis function will automatically use any available index.")
 	}
 	return sb.String()
 }
@@ -1573,6 +1570,23 @@ Flags shown square brackets after the geometry type have the following meaning:
 			tree.VolatilityImmutable,
 		),
 	),
+	"st_force2d": makeBuiltin(
+		defProps(),
+		geometryOverload1(
+			func(ctx *tree.EvalContext, g *tree.DGeometry) (tree.Datum, error) {
+				ret, err := geomfn.ForceLayout(g.Geometry, geom.XY)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(ret), nil
+			},
+			types.Geometry,
+			infoBuilder{
+				info: "Returns a Geometry which only contains X and Y coordinates.",
+			},
+			tree.VolatilityImmutable,
+		),
+	),
 	"st_numgeometries": makeBuiltin(
 		defProps(),
 		geometryOverload1(
@@ -1951,7 +1965,6 @@ The azimuth is angle is referenced from north, and is positive clockwise: North 
 			infoBuilder{
 				info:         "Returns the distance in meters between geography_a and geography_b. " + usesSpheroidMessage + spheroidDistanceMessage,
 				libraryUsage: usesGeographicLib,
-				canUseIndex:  true,
 			},
 			tree.VolatilityImmutable,
 		),
@@ -1979,10 +1992,69 @@ The azimuth is angle is referenced from north, and is positive clockwise: North 
 			Info: infoBuilder{
 				info:         "Returns the distance in meters between geography_a and geography_b." + spheroidDistanceMessage,
 				libraryUsage: usesGeographicLib | usesS2,
-				canUseIndex:  true,
 			}.String(),
 			Volatility: tree.VolatilityImmutable,
 		},
+	),
+	"st_distancesphere": makeBuiltin(
+		defProps(),
+		geometryOverload2(
+			func(ctx *tree.EvalContext, a, b *tree.DGeometry) (tree.Datum, error) {
+				aGeog, err := a.Geometry.AsGeography()
+				if err != nil {
+					return nil, err
+				}
+				bGeog, err := b.Geometry.AsGeography()
+				if err != nil {
+					return nil, err
+				}
+				ret, err := geogfn.Distance(aGeog, bGeog, geogfn.UseSphere)
+				if err != nil {
+					if geo.IsEmptyGeometryError(err) {
+						return tree.DNull, nil
+					}
+					return nil, err
+				}
+				return tree.NewDFloat(tree.DFloat(ret)), nil
+			},
+			types.Float,
+			infoBuilder{
+				info: "Returns the distance in meters between geometry_a and geometry_b assuming the coordinates " +
+					"represent lng/lat points on a sphere.",
+				libraryUsage: usesS2,
+			},
+			tree.VolatilityImmutable,
+		),
+	),
+	"st_distancespheroid": makeBuiltin(
+		defProps(),
+		geometryOverload2(
+			func(ctx *tree.EvalContext, a, b *tree.DGeometry) (tree.Datum, error) {
+				aGeog, err := a.Geometry.AsGeography()
+				if err != nil {
+					return nil, err
+				}
+				bGeog, err := b.Geometry.AsGeography()
+				if err != nil {
+					return nil, err
+				}
+				ret, err := geogfn.Distance(aGeog, bGeog, geogfn.UseSpheroid)
+				if err != nil {
+					if geo.IsEmptyGeometryError(err) {
+						return tree.DNull, nil
+					}
+					return nil, err
+				}
+				return tree.NewDFloat(tree.DFloat(ret)), nil
+			},
+			types.Float,
+			infoBuilder{
+				info: "Returns the distance in meters between geometry_a and geometry_b assuming the coordinates " +
+					"represent lng/lat points on a spheroid." + spheroidDistanceMessage,
+				libraryUsage: usesGeographicLib | usesS2,
+			},
+			tree.VolatilityImmutable,
+		),
 	),
 	"st_maxdistance": makeBuiltin(
 		defProps(),
@@ -2021,7 +2093,7 @@ The azimuth is angle is referenced from north, and is positive clockwise: North 
 			types.Geometry,
 			infoBuilder{
 				info: `Returns the LineString corresponds to the max distance across every pair of points comprising the ` +
-					`given geometries. 
+					`given geometries.
 
 Note if geometries are the same, it will return the LineString with the maximum distance between the geometry's ` +
 					`vertexes. The function will return the longest line that was discovered first when comparing maximum ` +
@@ -2046,7 +2118,7 @@ Note if geometries are the same, it will return the LineString with the maximum 
 			types.Geometry,
 			infoBuilder{
 				info: `Returns the LineString corresponds to the minimum distance across every pair of points comprising ` +
-					`the given geometries. 
+					`the given geometries.
 
 Note if geometries are the same, it will return the LineString with the minimum distance between the geometry's ` +
 					`vertexes. The function will return the shortest line that was discovered first when comparing minimum ` +
@@ -2067,7 +2139,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 			infoBuilder{
 				info:         "Returns true if no point in geometry_b is outside geometry_a.",
 				libraryUsage: usesGEOS,
-				canUseIndex:  true,
 			},
 		),
 		geographyOverload2BinaryPredicate(
@@ -2075,7 +2146,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 			infoBuilder{
 				info:         `Returns true if no point in geography_b is outside geography_a.`,
 				libraryUsage: usesS2,
-				canUseIndex:  true,
 			},
 		),
 	),
@@ -2086,7 +2156,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 			infoBuilder{
 				info:         `Returns true if no point in geometry_a is outside geometry_b`,
 				libraryUsage: usesGEOS,
-				canUseIndex:  true,
 			},
 		),
 		geographyOverload2BinaryPredicate(
@@ -2095,7 +2164,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 				info:         `Returns true if no point in geography_a is outside geography_b.`,
 				libraryUsage: usesS2,
 				precision:    "1cm",
-				canUseIndex:  true,
 			},
 		),
 	),
@@ -2107,7 +2175,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 				info: "Returns true if no points of geometry_b lie in the exterior of geometry_a, " +
 					"and there is at least one point in the interior of geometry_b that lies in the interior of geometry_a.",
 				libraryUsage: usesGEOS,
-				canUseIndex:  true,
 			},
 		),
 	),
@@ -2118,7 +2185,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 			infoBuilder{
 				info:         "Returns true if geometry_b intersects the interior of geometry_a but not the boundary or exterior of geometry_a.",
 				libraryUsage: usesGEOS,
-				canUseIndex:  true,
 			},
 		),
 	),
@@ -2129,7 +2195,16 @@ Note if geometries are the same, it will return the LineString with the minimum 
 			infoBuilder{
 				info:         "Returns true if geometry_a has some - but not all - interior points in common with geometry_b.",
 				libraryUsage: usesGEOS,
-				canUseIndex:  true,
+			},
+		),
+	),
+	"st_disjoint": makeBuiltin(
+		defProps(),
+		geometryOverload2BinaryPredicate(
+			geomfn.Disjoint,
+			infoBuilder{
+				info:         "Returns true if geometry_a does not overlap, touch or is within geometry_b.",
+				libraryUsage: usesGEOS,
 			},
 		),
 	),
@@ -2204,7 +2279,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 				info:         "Returns true if any of geography_a is within distance meters of geography_b." + usesSpheroidMessage + spheroidDistanceMessage,
 				libraryUsage: usesGeographicLib,
 				precision:    "1cm",
-				canUseIndex:  true,
 			}.String(),
 			Volatility: tree.VolatilityImmutable,
 		},
@@ -2232,7 +2306,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 				info:         "Returns true if any of geography_a is within distance meters of geography_b." + spheroidDistanceMessage,
 				libraryUsage: usesGeographicLib | usesS2,
 				precision:    "1cm",
-				canUseIndex:  true,
 			}.String(),
 			Volatility: tree.VolatilityImmutable,
 		},
@@ -2245,7 +2318,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 				info: "Returns true if geometry_a is spatially equal to geometry_b, " +
 					"i.e. ST_Within(geometry_a, geometry_b) = ST_Within(geometry_b, geometry_a) = true.",
 				libraryUsage: usesGEOS,
-				canUseIndex:  true,
 			},
 		),
 	),
@@ -2257,7 +2329,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 				info:         "Returns true if geometry_a shares any portion of space with geometry_b.",
 				libraryUsage: usesGEOS,
 				precision:    "1cm",
-				canUseIndex:  true,
 			},
 		),
 		geographyOverload2BinaryPredicate(
@@ -2266,7 +2337,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 				info:         `Returns true if geography_a shares any portion of space with geography_b.`,
 				libraryUsage: usesS2,
 				precision:    "1cm",
-				canUseIndex:  true,
 			},
 		),
 	),
@@ -2278,7 +2348,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 				info: "Returns true if geometry_a intersects but does not completely contain geometry_b, or vice versa. " +
 					`"Does not completely" implies ST_Within(geometry_a, geometry_b) = ST_Within(geometry_b, geometry_a) = false.`,
 				libraryUsage: usesGEOS,
-				canUseIndex:  true,
 			},
 		),
 	),
@@ -2290,7 +2359,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 				info: "Returns true if the only points in common between geometry_a and geometry_b are on the boundary. " +
 					"Note points do not touch other points.",
 				libraryUsage: usesGEOS,
-				canUseIndex:  true,
 			},
 		),
 	),
@@ -2301,7 +2369,6 @@ Note if geometries are the same, it will return the LineString with the minimum 
 			infoBuilder{
 				info:         "Returns true if geometry_a is completely inside geometry_b.",
 				libraryUsage: usesGEOS,
-				canUseIndex:  true,
 			},
 		),
 	),
@@ -2352,7 +2419,122 @@ Note if geometries are the same, it will return the LineString with the minimum 
 		},
 	),
 
+	//
+	// Validity checks
+	//
+
+	"st_isvalid": makeBuiltin(
+		defProps(),
+		geometryOverload1(
+			func(ctx *tree.EvalContext, g *tree.DGeometry) (tree.Datum, error) {
+				ret, err := geomfn.IsValid(g.Geometry)
+				if err != nil {
+					return nil, err
+				}
+				return tree.MakeDBool(tree.DBool(ret)), nil
+			},
+			types.Bool,
+			infoBuilder{
+				info:         `Returns whether the geometry is valid as defined by the OGC spec.`,
+				libraryUsage: usesGEOS,
+			},
+			tree.VolatilityImmutable,
+		),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+				{"flags", types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := args[0].(*tree.DGeometry)
+				flags := int(*args[1].(*tree.DInt))
+				validDetail, err := geomfn.IsValidDetail(g.Geometry, flags)
+				if err != nil {
+					return nil, err
+				}
+				return tree.MakeDBool(tree.DBool(validDetail.IsValid)), nil
+			},
+			Info: infoBuilder{
+				info: `Returns whether the geometry is valid.
+
+For flags=0, validity is defined by the OGC spec.
+
+For flags=1, validity considers self-intersecting rings forming holes as valid as per ESRI. This is not valid under OGC and CRDB spatial operations may not operate correctly.`,
+				libraryUsage: usesGEOS,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
+	"st_isvalidreason": makeBuiltin(
+		defProps(),
+		geometryOverload1(
+			func(ctx *tree.EvalContext, g *tree.DGeometry) (tree.Datum, error) {
+				ret, err := geomfn.IsValidReason(g.Geometry)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDString(ret), nil
+			},
+			types.String,
+			infoBuilder{
+				info:         `Returns a string containing the reason the geometry is invalid along with the point of interest, or "Valid Geometry" if it is valid. Validity is defined by the OGC spec.`,
+				libraryUsage: usesGEOS,
+			},
+			tree.VolatilityImmutable,
+		),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+				{"flags", types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := args[0].(*tree.DGeometry)
+				flags := int(*args[1].(*tree.DInt))
+				validDetail, err := geomfn.IsValidDetail(g.Geometry, flags)
+				if err != nil {
+					return nil, err
+				}
+				if validDetail.IsValid {
+					return tree.NewDString("Valid Geometry"), nil
+				}
+				return tree.NewDString(validDetail.Reason), nil
+			},
+			Info: infoBuilder{
+				info: `Returns the reason the geometry is invalid or "Valid Geometry" if it is valid.
+
+For flags=0, validity is defined by the OGC spec.
+
+For flags=1, validity considers self-intersecting rings forming holes as valid as per ESRI. This is not valid under OGC and CRDB spatial operations may not operate correctly.`,
+				libraryUsage: usesGEOS,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
+	"st_makevalid": makeBuiltin(
+		defProps(),
+		geometryOverload1(
+			func(ctx *tree.EvalContext, g *tree.DGeometry) (tree.Datum, error) {
+				validGeom, err := geomfn.MakeValid(g.Geometry)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(validGeom), err
+			},
+			types.Geometry,
+			infoBuilder{
+				info:         "Returns a valid form of the given geometry according to the OGC spec.",
+				libraryUsage: usesGEOS,
+			},
+			tree.VolatilityImmutable,
+		),
+	),
+
+	//
 	// Topology operations
+	//
+
 	"st_centroid": makeBuiltin(
 		defProps(),
 		append(
@@ -2405,6 +2587,24 @@ Note if geometries are the same, it will return the LineString with the minimum 
 				tree.VolatilityImmutable,
 			),
 		)...,
+	),
+	"st_convexhull": makeBuiltin(
+		defProps(),
+		geometryOverload1(
+			func(ctx *tree.EvalContext, g *tree.DGeometry) (tree.Datum, error) {
+				convexHull, err := geomfn.ConvexHull(g.Geometry)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(convexHull), err
+			},
+			types.Geometry,
+			infoBuilder{
+				info:         "Returns a geometry that represents the Convex Hull of the given geometry.",
+				libraryUsage: usesGEOS,
+			},
+			tree.VolatilityImmutable,
+		),
 	),
 	"st_pointonsurface": makeBuiltin(
 		defProps(),
@@ -3408,6 +3608,26 @@ func toUseSphereOrSpheroid(useSpheroid *tree.DBool) geogfn.UseSphereOrSpheroid {
 }
 
 func initGeoBuiltins() {
+	for indexBuiltinName := range geoindex.RelationshipMap {
+		builtin, exists := geoBuiltins[indexBuiltinName]
+		if !exists {
+			panic("expected builtin: " + indexBuiltinName)
+		}
+		// Copy the builtin and add an underscore on the name.
+		overloads := make([]tree.Overload, len(builtin.overloads))
+		for i, ovCopy := range builtin.overloads {
+			builtin.overloads[i].Info += "\n\nThis function variant will attempt to utilize any available geospatial index."
+
+			ovCopy.Info += "\n\nThis function variant does not utilize any geospatial index."
+			overloads[i] = ovCopy
+		}
+		underscoreBuiltin := makeBuiltin(
+			builtin.props,
+			overloads...,
+		)
+		geoBuiltins["_"+indexBuiltinName] = underscoreBuiltin
+	}
+
 	for k, v := range geoBuiltins {
 		if _, exists := builtins[k]; exists {
 			panic("duplicate builtin: " + k)

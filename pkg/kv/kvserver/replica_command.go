@@ -525,7 +525,7 @@ func (r *Replica) executeAdminCommandWithDescriptor(
 	// in a retry loop. Note that this is speculative; there wasn't an incident
 	// that suggested this.
 	retryOpts.RandomizationFactor = 0.5
-	lastErr := ctx.Err()
+	var lastErr error
 	for retryable := retry.StartWithCtx(ctx, retryOpts); retryable.Next(); {
 		// The replica may have been destroyed since the start of the retry loop.
 		// We need to explicitly check this condition. Having a valid lease, as we
@@ -2381,7 +2381,7 @@ func (r *Replica) adminScatter(
 	// queue would do on its own (#17341), do so after the replicate queue is
 	// done by transferring the lease to any of the given N replicas with
 	// probability 1/N of choosing each.
-	if args.RandomizeLeases && r.OwnsValidLease(r.store.Clock().Now()) {
+	if args.RandomizeLeases && r.OwnsValidLease(ctx, r.store.Clock().Now()) {
 		desc := r.Desc()
 		// Learner replicas aren't allowed to become the leaseholder or raft leader,
 		// so only consider the `Voters` replicas.

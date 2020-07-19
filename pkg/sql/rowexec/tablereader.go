@@ -35,12 +35,9 @@ import (
 type tableReader struct {
 	execinfra.ProcessorBase
 
-	spans     roachpb.Spans
-	limitHint int64
-
-	// maxResults is non-zero if there is a limit on the total number of rows
-	// that the tableReader will read.
-	maxResults uint64
+	spans       roachpb.Spans
+	limitHint   int64
+	parallelize bool
 
 	// See TableReaderSpec.MaxTimestampAgeNanos.
 	maxTimestampAge time.Duration
@@ -86,7 +83,9 @@ func newTableReader(
 	tr := trPool.Get().(*tableReader)
 
 	tr.limitHint = execinfra.LimitHint(spec.LimitHint, post)
-	tr.maxResults = spec.MaxResults
+	// Parallelize shouldn't be set when there's a limit hint, but double-check
+	// just in case.
+	tr.parallelize = spec.Parallelize && tr.limitHint == 0
 	tr.maxTimestampAge = time.Duration(spec.MaxTimestampAgeNanos)
 
 	returnMutations := spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic
@@ -157,7 +156,7 @@ func (tr *tableReader) Start(ctx context.Context) context.Context {
 
 	ctx = tr.StartInternal(ctx, tableReaderProcName)
 
-	limitBatches := execinfra.ScanShouldLimitBatches(tr.maxResults, tr.limitHint, tr.FlowCtx)
+	limitBatches := !tr.parallelize
 	log.VEventf(ctx, 1, "starting scan with limitBatches %t", limitBatches)
 	var err error
 	if tr.maxTimestampAge == 0 {
@@ -278,7 +277,7 @@ func (tr *tableReader) generateMeta(ctx context.Context) []execinfrapb.ProducerM
 	if !tr.ignoreMisplannedRanges {
 		nodeID, ok := tr.FlowCtx.NodeID.OptionalNodeID()
 		if ok {
-			ranges := execinfra.MisplannedRanges(ctx, tr.fetcher.GetRangesInfo(), nodeID)
+			ranges := execinfra.MisplannedRanges(ctx, tr.spans, nodeID, tr.FlowCtx.Cfg.RangeCache)
 			if ranges != nil {
 				trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
 			}

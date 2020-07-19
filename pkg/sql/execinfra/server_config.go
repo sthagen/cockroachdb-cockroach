@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -62,7 +63,7 @@ import (
 //
 // ATTENTION: When updating these fields, add to version_history.txt explaining
 // what changed.
-const Version execinfrapb.DistSQLVersion = 30
+const Version execinfrapb.DistSQLVersion = 31
 
 // MinAcceptedVersion is the oldest version that the server is
 // compatible with; see above.
@@ -159,6 +160,12 @@ type ServerConfig struct {
 	// subsystem. It is queried during the GC process and in the handling of
 	// AdminVerifyProtectedTimestampRequest.
 	ProtectedTimestampProvider protectedts.Provider
+
+	// RangeCache is used by processors that were supposed to have been planned on
+	// the leaseholders of the data ranges that they're consuming. These
+	// processors query the cache to see if they should communicate updates to the
+	// gateway.
+	RangeCache *kvcoord.RangeDescriptorCache
 }
 
 // RuntimeStats is an interface through which the rowexec layer can get
@@ -211,6 +218,10 @@ type TestingKnobs struct {
 	// stall time and bytes sent. It replaces them with a zero value.
 	DeterministicStats bool
 
+	// CheckVectorizedFlowIsClosedCorrectly checks that all components in a flow
+	// were closed explicitly in flow.Cleanup.
+	CheckVectorizedFlowIsClosedCorrectly bool
+
 	// Changefeed contains testing knobs specific to the changefeed system.
 	Changefeed base.ModuleTestingKnobs
 
@@ -223,6 +234,9 @@ type TestingKnobs struct {
 
 	// Forces bulk adder flush every time a KV batch is processed.
 	BulkAdderFlushesEveryBatch bool
+
+	// JobsTestingKnobs is jobs infra specific testing knobs.
+	JobsTestingKnobs base.ModuleTestingKnobs
 }
 
 // MetadataTestLevel represents the types of queries where metadata test

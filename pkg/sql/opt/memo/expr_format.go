@@ -499,7 +499,6 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			f.formatMutationCols(e, tp, "insert-mapping:", t.InsertCols, t.Table)
 			f.formatColList(e, tp, "check columns:", t.CheckCols)
 			f.formatColList(e, tp, "partial index put columns:", t.PartialIndexPutCols)
-			f.formatColList(e, tp, "partial index del columns:", t.PartialIndexDelCols)
 			f.formatMutationCommon(tp, &t.MutationPrivate)
 		}
 
@@ -511,6 +510,8 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			f.formatColList(e, tp, "fetch columns:", t.FetchCols)
 			f.formatMutationCols(e, tp, "update-mapping:", t.UpdateCols, t.Table)
 			f.formatColList(e, tp, "check columns:", t.CheckCols)
+			f.formatColList(e, tp, "partial index put columns:", t.PartialIndexPutCols)
+			f.formatColList(e, tp, "partial index del columns:", t.PartialIndexDelCols)
 			f.formatMutationCommon(tp, &t.MutationPrivate)
 		}
 
@@ -538,6 +539,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 				tp.Child("columns: <none>")
 			}
 			f.formatColList(e, tp, "fetch columns:", t.FetchCols)
+			f.formatColList(e, tp, "partial index del columns:", t.PartialIndexDelCols)
 			f.formatMutationCommon(tp, &t.MutationPrivate)
 		}
 
@@ -646,7 +648,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 
 		if join, ok := e.(joinWithMultiplicity); ok {
 			mult := join.getMultiplicity()
-			if s := mult.String(); s != "" {
+			if s := mult.Format(e.Op()); s != "" {
 				tp.Childf("multiplicity: %s", s)
 			}
 		}
@@ -1220,6 +1222,7 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 	case *ScanPrivate:
 		// Don't output name of index if it's the primary index.
 		tab := f.Memo.metadata.Table(t.Table)
+		tabMeta := f.Memo.metadata.TableMeta(t.Table)
 		if t.Index == cat.PrimaryIndex {
 			fmt.Fprintf(f.Buffer, " %s", tableAlias(f, t.Table))
 		} else {
@@ -1228,7 +1231,7 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 		if ScanIsReverseFn(f.Memo.Metadata(), t, &physProps.Ordering) {
 			f.Buffer.WriteString(",rev")
 		}
-		if _, ok := tab.Index(t.Index).Predicate(); ok {
+		if IsPartialIndex(tabMeta, t.Index) {
 			f.Buffer.WriteString(",partial")
 		}
 

@@ -121,40 +121,6 @@ func ResolveTableIndex(
 	return found, foundTabName, nil
 }
 
-// ConvertColumnIDsToOrdinals converts a list of ColumnIDs (such as from a
-// tree.TableRef), to a list of ordinal positions of columns within the given
-// table. See tree.Table for more information on column ordinals.
-func ConvertColumnIDsToOrdinals(tab Table, columns []tree.ColumnID) (ordinals []int) {
-	ordinals = make([]int, len(columns))
-	for i, c := range columns {
-		ord := 0
-		cnt := tab.ColumnCount()
-		for ord < cnt {
-			if tab.Column(ord).ColID() == StableID(c) {
-				break
-			}
-			ord++
-		}
-		if ord >= cnt {
-			panic(pgerror.Newf(pgcode.UndefinedColumn,
-				"column [%d] does not exist", c))
-		}
-		ordinals[i] = ord
-	}
-	return ordinals
-}
-
-// FindTableColumnByName returns the ordinal of the non-mutation column having
-// the given name, if one exists in the given table. Otherwise, it returns -1.
-func FindTableColumnByName(tab Table, name tree.Name) int {
-	for ord, n := 0, tab.ColumnCount(); ord < n; ord++ {
-		if tab.Column(ord).ColName() == name {
-			return ord
-		}
-	}
-	return -1
-}
-
 // FormatTable nicely formats a catalog table using a treeprinter for debugging
 // and testing.
 func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
@@ -164,7 +130,7 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 	}
 
 	var buf bytes.Buffer
-	for i := 0; i < tab.DeletableColumnCount(); i++ {
+	for i := 0; i < tab.ColumnCount(); i++ {
 		buf.Reset()
 		formatColumn(tab.Column(i), IsMutationColumn(tab, i), &buf)
 		child.Child(buf.String())
@@ -347,4 +313,42 @@ func formatFamily(family Family, buf *bytes.Buffer) {
 		buf.WriteString(string(col.ColName()))
 	}
 	buf.WriteString(")")
+}
+
+// InterleaveAncestorDescendant returns ok=true if a and b are interleaved
+// indexes and one of them is the ancestor of the other.
+// If a is an ancestor of b, aIsAncestor is true.
+// If b is an ancestor of a, aIsAncestor is false.
+func InterleaveAncestorDescendant(a, b Index) (ok bool, aIsAncestor bool) {
+	aCount := a.InterleaveAncestorCount()
+	bCount := b.InterleaveAncestorCount()
+	// If a is the ancestor of b; then:
+	//  - a has a smaller ancestor count;
+	//  - a's ancestors are a prefix of b's ancestors;
+	//  - a shows up in b's ancestor list on the position that would allow them to
+	//    share a's ancestors.
+	//
+	// For example:
+	//    x
+	//    |
+	//    y
+	//    |
+	//    a  (ancestors: x, y)
+	//    |
+	//    z
+	//    |
+	//    b  (ancestors: x, y, a, z)
+	if aCount < bCount {
+		tabID, idxID, _ := b.InterleaveAncestor(aCount)
+		if tabID == a.Table().ID() && idxID == a.ID() {
+			return true, true // a is the ancestor
+		}
+	} else if bCount < aCount {
+		tabID, idxID, _ := a.InterleaveAncestor(bCount)
+		if tabID == b.Table().ID() && idxID == b.ID() {
+			return true, false // a is not the ancestor
+		}
+	}
+
+	return false, false
 }

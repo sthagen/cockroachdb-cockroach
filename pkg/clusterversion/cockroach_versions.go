@@ -69,6 +69,10 @@ const (
 	VersionAddScheduledJobsTable
 	VersionUserDefinedSchemas
 	VersionNoOriginFKIndexes
+	VersionClientRangeInfosOnBatchResponse
+	VersionNodeMembershipStatus
+	VersionRangeStatsRespHasDesc
+	VersionMinPasswordLength
 
 	// Add new versions here (step one of two).
 )
@@ -523,6 +527,29 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		// indexes on the origin side of the relationship.
 		Key:     VersionNoOriginFKIndexes,
 		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 9},
+	},
+	{
+		// VersionClientRangeInfosOnBatchResponse moves the response RangeInfos from
+		// individual response headers to the batch header.
+		Key:     VersionClientRangeInfosOnBatchResponse,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 10},
+	},
+	{
+		// VersionNodeMembershipStatus gates the usage of the MembershipStatus
+		// enum in the Liveness proto. See comment on proto definition for more
+		// details.
+		Key:     VersionNodeMembershipStatus,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 11},
+	},
+	{
+		// VersionRangeStatsRespHasDesc adds the RangeStatsResponse.RangeInfo field.
+		Key:     VersionRangeStatsRespHasDesc,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 12},
+	},
+	{
+		// VersionMinPasswordLength adds the server.user_login.min_password_length setting.
+		Key:     VersionMinPasswordLength,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 13},
 	},
 
 	// Add new versions here (step two of two).

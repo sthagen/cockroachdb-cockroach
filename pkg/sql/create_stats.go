@@ -168,10 +168,11 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		if err != nil {
 			return nil, err
 		}
-		fqTableName, err = n.p.getQualifiedTableName(ctx, &tableDesc.TableDescriptor)
+		fqName, err := n.p.getQualifiedTableName(ctx, &tableDesc.TableDescriptor)
 		if err != nil {
 			return nil, err
 		}
+		fqTableName = fqName.FQString()
 	}
 
 	if tableDesc.IsVirtualTable() {
@@ -434,8 +435,7 @@ func (r *createStatsResumer) Resume(
 			txn.SetFixedTimestamp(ctx, *details.AsOf)
 		}
 
-		planCtx := dsp.NewPlanningCtx(ctx, evalCtx, txn, true /* distribute */)
-		planCtx.planner = p
+		planCtx := dsp.NewPlanningCtx(ctx, evalCtx, p, txn, true /* distribute */)
 		if err := dsp.planAndRunCreateStats(
 			ctx, evalCtx, planCtx, txn, r.job, NewRowResultWriter(rows),
 		); err != nil {

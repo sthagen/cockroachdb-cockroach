@@ -30,10 +30,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -56,6 +54,7 @@ import (
 // NB: if you're adding a new one, you'll also have to update TestZip.
 func TestZipContainsAllInternalTables(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
@@ -122,7 +121,7 @@ func TestZip(t *testing.T) {
 	})
 	defer c.cleanup()
 
-	out, err := c.RunWithCapture("debug zip " + os.DevNull)
+	out, err := c.RunWithCapture("debug zip --cpu-profile-duration=0 " + os.DevNull)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +162,7 @@ create table defaultdb."pg_catalog.pg_class"(x int);
 create table defaultdb."../system"(x int);
 `})
 
-	out, err := c.RunWithCapture("debug zip " + os.DevNull)
+	out, err := c.RunWithCapture("debug zip --cpu-profile-duration=0 " + os.DevNull)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +183,7 @@ create table defaultdb."../system"(x int);
 // need the SSL certs dir to run a CLI test securely.
 func TestUnavailableZip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	if testing.Short() {
 		t.Skip("short flag")
@@ -238,7 +238,7 @@ func TestUnavailableZip(t *testing.T) {
 	defer func() { stderr = log.OrigStderr }()
 
 	// Keep the timeout short so that the test doesn't take forever.
-	out, err := c.RunWithCapture("debug zip " + os.DevNull + " --timeout=.5s")
+	out, err := c.RunWithCapture("debug zip --cpu-profile-duration=0 " + os.DevNull + " --timeout=.5s")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,6 +284,9 @@ func eraseNonDeterministicZipOutput(out string) string {
 // need the SSL certs dir to run a CLI test securely.
 func TestPartialZip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	t.Skip("https://github.com/cockroachdb/cockroach/issues/51538")
 
 	if testing.Short() {
 		t.Skip("short flag")
@@ -312,7 +315,9 @@ func TestPartialZip(t *testing.T) {
 	stderr = os.Stdout
 	defer func() { stderr = log.OrigStderr }()
 
-	out, err := c.RunWithCapture("debug zip " + os.DevNull)
+	// NB: we spend a second profiling here to make sure it actually tries the
+	// down nodes (and fails only there, succeeding on the available node).
+	out, err := c.RunWithCapture("debug zip --cpu-profile-duration=1s " + os.DevNull)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +331,7 @@ func TestPartialZip(t *testing.T) {
 		})
 
 	// Now do it again and exclude the down node explicitly.
-	out, err = c.RunWithCapture("debug zip " + os.DevNull + " --exclude-nodes=2")
+	out, err = c.RunWithCapture("debug zip " + os.DevNull + " --exclude-nodes=2 --cpu-profile-duration=1s")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,32 +343,28 @@ func TestPartialZip(t *testing.T) {
 		})
 
 	// Now mark the stopped node as decommissioned, and check that zip
-	// skips over it automatically.
-	s := tc.Server(0)
-	conn, err := s.RPCContext().GRPCDialNode(s.ServingRPCAddr(), s.NodeID(),
-		rpc.DefaultClass).Connect(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	// skips over it automatically. We specifically use --wait=none because
+	// we're decommissioning a node in a 3-node cluster, so there's no node to
+	// up-replicate the under-replicated ranges to.
+	{
+		_, err := c.RunWithCapture(fmt.Sprintf("node decommission --wait=none %d", 2))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	as := serverpb.NewAdminClient(conn)
-	req := &serverpb.DecommissionRequest{
-		NodeIDs:         []roachpb.NodeID{2},
-		Decommissioning: true,
-	}
-	if _, err := as.Decommission(context.Background(), req); err != nil {
-		t.Fatal(err)
-	}
+
 	// We use .Override() here instead of SET CLUSTER SETTING in SQL to
 	// override the 1m15s minimum placed on the cluster setting. There
 	// is no risk to see the override bumped due to a gossip update
 	// because this setting is not otherwise set in the test cluster.
+	s := tc.Server(0)
 	kvserver.TimeUntilStoreDead.Override(&s.ClusterSettings().SV, kvserver.TestTimeUntilStoreDead)
 
 	datadriven.RunTest(t, "testdata/zip/partial2",
 		func(t *testing.T, td *datadriven.TestData) string {
 
 			testutils.SucceedsSoon(t, func() error {
-				out, err = c.RunWithCapture("debug zip " + os.DevNull)
+				out, err = c.RunWithCapture("debug zip --cpu-profile-duration=0 " + os.DevNull)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -392,6 +393,7 @@ func TestPartialZip(t *testing.T) {
 // This checks that SQL retry errors are properly handled.
 func TestZipRetries(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
 	defer s.Stopper().Stop(context.Background())
@@ -456,6 +458,7 @@ test/generate_series(1,15000) as t(x).4.txt.err.txt
 // This test the operation of zip over secure clusters.
 func TestToHex(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	dir, cleanupFn := testutils.TempDir(t)
 	defer cleanupFn()
@@ -469,7 +472,7 @@ func TestToHex(t *testing.T) {
 	// Create a job to have non-empty system.jobs table.
 	c.RunWithArgs([]string{"sql", "-e", "CREATE STATISTICS foo FROM system.namespace"})
 
-	_, err := c.RunWithCapture("debug zip " + dir + "/debug.zip")
+	_, err := c.RunWithCapture("debug zip --cpu-profile-duration=0 " + dir + "/debug.zip")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,6 +547,7 @@ func TestToHex(t *testing.T) {
 
 func TestNodeRangeSelection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()

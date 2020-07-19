@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
@@ -28,9 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
-
-// scopeOrdinal identifies an ordinal position with a list of scope columns.
-type scopeOrdinal int
 
 // scope is used for the build process and maintains the variables that have
 // been bound within the current scope as columnProps. Variables bound in the
@@ -221,14 +219,17 @@ func (s *scope) appendColumnsFromScope(src *scope) {
 	}
 }
 
-// appendColumnsFromTable adds all columns from the given table metadata to this
-// scope.
+// appendColumnsFromTable adds all non-mutation columns from the given table
+// metadata to this scope.
 func (s *scope) appendColumnsFromTable(tabMeta *opt.TableMeta, alias *tree.TableName) {
 	tab := tabMeta.Table
 	if s.cols == nil {
 		s.cols = make([]scopeColumn, 0, tab.ColumnCount())
 	}
 	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		if cat.IsMutationColumn(tab, i) {
+			continue
+		}
 		tabCol := tab.Column(i)
 		s.cols = append(s.cols, scopeColumn{
 			name:   tabCol.ColName(),

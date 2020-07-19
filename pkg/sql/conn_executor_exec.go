@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -89,8 +90,14 @@ func (ex *connExecutor) execStmt(
 	case stateNoTxn:
 		ev, payload = ex.execStmtInNoTxnState(ctx, stmt)
 	case stateOpen:
-		if ex.server.cfg.Settings.IsCPUProfiling() {
+		if ex.server.cfg.Settings.CPUProfileType() == cluster.CPUProfileWithLabels {
+			remoteAddr := "internal"
+			if rAddr := ex.sessionData.RemoteAddr; rAddr != nil {
+				remoteAddr = rAddr.String()
+			}
 			labels := pprof.Labels(
+				"appname", ex.sessionData.ApplicationName,
+				"addr", remoteAddr,
 				"stmt.tag", stmt.AST.StatementTag(),
 				"stmt.anonymized", stmt.AnonymizedStr,
 			)
@@ -875,8 +882,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	defer recv.Release()
 
 	evalCtx := planner.ExtendedEvalContext()
-	planCtx := ex.server.cfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, planner.txn, distribute)
-	planCtx.planner = planner
+	planCtx := ex.server.cfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, planner, planner.txn, distribute)
 	planCtx.stmtType = recv.stmtType
 	if planner.collectBundle {
 		planCtx.saveDiagram = func(diagram execinfrapb.FlowDiagram) {

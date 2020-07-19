@@ -304,6 +304,10 @@
 <tr><td><a name="greatest"></a><code>greatest(anyelement...) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Returns the element with the greatest value.</p>
 </span></td></tr>
 <tr><td><a name="least"></a><code>least(anyelement...) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Returns the element with the lowest value.</p>
+</span></td></tr>
+<tr><td><a name="num_nonnulls"></a><code>num_nonnulls(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of nonnull arguments.</p>
+</span></td></tr>
+<tr><td><a name="num_nulls"></a><code>num_nulls(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of null arguments.</p>
 </span></td></tr></tbody>
 </table>
 
@@ -679,6 +683,78 @@ has no relationship with the commit order of concurrent transactions.</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
+<tr><td><a name="_st_contains"></a><code>_st_contains(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no points of geometry_b lie in the exterior of geometry_a, and there is at least one point in the interior of geometry_b that lies in the interior of geometry_a.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_containsproperly"></a><code>_st_containsproperly(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_b intersects the interior of geometry_a but not the boundary or exterior of geometry_a.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_coveredby"></a><code>_st_coveredby(geography_a: geography, geography_b: geography) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geography_a is outside geography_b.</p>
+<p>The calculations performed are have a precision of 1cm.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_coveredby"></a><code>_st_coveredby(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geometry_a is outside geometry_b</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_covers"></a><code>_st_covers(geography_a: geography, geography_b: geography) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geography_b is outside geography_a.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_covers"></a><code>_st_covers(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geometry_b is outside geometry_a.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_crosses"></a><code>_st_crosses(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a has some - but not all - interior points in common with geometry_b.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_dfullywithin"></a><code>_st_dfullywithin(geometry_a: geometry, geometry_b: geometry, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if every pair of points comprising geometry_a and geometry_b are within distance units. In other words, the ST_MaxDistance between geometry_a and geometry_b is less than or equal to distance units.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_dwithin"></a><code>_st_dwithin(geography_a: geography, geography_b: geography, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geography_a is within distance meters of geography_b. Uses a spheroid to perform the operation.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
+<p>The calculations performed are have a precision of 1cm.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_dwithin"></a><code>_st_dwithin(geography_a: geography, geography_b: geography, distance: <a href="float.html">float</a>, use_spheroid: <a href="bool.html">bool</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geography_a is within distance meters of geography_b.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
+<p>The calculations performed are have a precision of 1cm.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_dwithin"></a><code>_st_dwithin(geometry_a: geometry, geometry_b: geometry, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geometry_a is within distance units of geometry_b.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_equals"></a><code>_st_equals(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a is spatially equal to geometry_b, i.e. ST_Within(geometry_a, geometry_b) = ST_Within(geometry_b, geometry_a) = true.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_intersects"></a><code>_st_intersects(geography_a: geography, geography_b: geography) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geography_a shares any portion of space with geography_b.</p>
+<p>The calculations performed are have a precision of 1cm.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_intersects"></a><code>_st_intersects(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a shares any portion of space with geometry_b.</p>
+<p>The calculations performed are have a precision of 1cm.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_overlaps"></a><code>_st_overlaps(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a intersects but does not completely contain geometry_b, or vice versa. “Does not completely” implies ST_Within(geometry_a, geometry_b) = ST_Within(geometry_b, geometry_a) = false.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_touches"></a><code>_st_touches(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if the only points in common between geometry_a and geometry_b are on the boundary. Note points do not touch other points.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="_st_within"></a><code>_st_within(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a is completely inside geometry_b.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This function variant does not utilize any geospatial index.</p>
+</span></td></tr>
 <tr><td><a name="addgeometrycolumn"></a><code>addgeometrycolumn(catalog_name: <a href="string.html">string</a>, schema_name: <a href="string.html">string</a>, table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>, srid: <a href="int.html">int</a>, type: <a href="string.html">string</a>, dimension: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Adds a new geometry column to an existing table and returns metadata about the column created.</p>
 </span></td></tr>
 <tr><td><a name="addgeometrycolumn"></a><code>addgeometrycolumn(catalog_name: <a href="string.html">string</a>, schema_name: <a href="string.html">string</a>, table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>, srid: <a href="int.html">int</a>, type: <a href="string.html">string</a>, dimension: <a href="int.html">int</a>, use_typmod: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Adds a new geometry column to an existing table and returns metadata about the column created.</p>
@@ -896,66 +972,81 @@ given Geometry.</p>
 </span></td></tr>
 <tr><td><a name="st_contains"></a><code>st_contains(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no points of geometry_b lie in the exterior of geometry_a, and there is at least one point in the interior of geometry_b that lies in the interior of geometry_a.</p>
 <p>This function utilizes the GEOS module.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_containsproperly"></a><code>st_containsproperly(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_b intersects the interior of geometry_a but not the boundary or exterior of geometry_a.</p>
 <p>This function utilizes the GEOS module.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="st_convexhull"></a><code>st_convexhull(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a geometry that represents the Convex Hull of the given geometry.</p>
+<p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_coveredby"></a><code>st_coveredby(geography_a: geography, geography_b: geography) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geography_a is outside geography_b.</p>
 <p>The calculations performed are have a precision of 1cm.</p>
 <p>This function utilizes the S2 library for spherical calculations.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_coveredby"></a><code>st_coveredby(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geometry_a is outside geometry_b</p>
 <p>This function utilizes the GEOS module.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_covers"></a><code>st_covers(geography_a: geography, geography_b: geography) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geography_b is outside geography_a.</p>
 <p>This function utilizes the S2 library for spherical calculations.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_covers"></a><code>st_covers(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no point in geometry_b is outside geometry_a.</p>
 <p>This function utilizes the GEOS module.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_crosses"></a><code>st_crosses(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a has some - but not all - interior points in common with geometry_b.</p>
 <p>This function utilizes the GEOS module.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_dfullywithin"></a><code>st_dfullywithin(geometry_a: geometry, geometry_b: geometry, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if every pair of points comprising geometry_a and geometry_b are within distance units. In other words, the ST_MaxDistance between geometry_a and geometry_b is less than or equal to distance units.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="st_disjoint"></a><code>st_disjoint(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a does not overlap, touch or is within geometry_b.</p>
+<p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_distance"></a><code>st_distance(geography_a: geography, geography_b: geography) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the distance in meters between geography_a and geography_b.  Uses a spheroid to perform the operation.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
 <p>This function utilizes the GeographicLib library for spheroid calculations.</p>
-<p>This function will automatically use any available index.</p>
 </span></td></tr>
 <tr><td><a name="st_distance"></a><code>st_distance(geography_a: geography, geography_b: geography, use_spheroid: <a href="bool.html">bool</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the distance in meters between geography_a and geography_b.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
 <p>This function utilizes the S2 library for spherical calculations.</p>
 <p>This function utilizes the GeographicLib library for spheroid calculations.</p>
-<p>This function will automatically use any available index.</p>
 </span></td></tr>
 <tr><td><a name="st_distance"></a><code>st_distance(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the distance between the given geometries.</p>
+</span></td></tr>
+<tr><td><a name="st_distancesphere"></a><code>st_distancesphere(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the distance in meters between geometry_a and geometry_b assuming the coordinates represent lng/lat points on a sphere.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+</span></td></tr>
+<tr><td><a name="st_distancespheroid"></a><code>st_distancespheroid(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the distance in meters between geometry_a and geometry_b assuming the coordinates represent lng/lat points on a spheroid.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
 </span></td></tr>
 <tr><td><a name="st_dwithin"></a><code>st_dwithin(geography_a: geography, geography_b: geography, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geography_a is within distance meters of geography_b. Uses a spheroid to perform the operation.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
 <p>The calculations performed are have a precision of 1cm.</p>
 <p>This function utilizes the GeographicLib library for spheroid calculations.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_dwithin"></a><code>st_dwithin(geography_a: geography, geography_b: geography, distance: <a href="float.html">float</a>, use_spheroid: <a href="bool.html">bool</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geography_a is within distance meters of geography_b.&quot;\n\nWhen operating on a spheroid, this function will use the sphere to calculate the closest two points using S2. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
 <p>The calculations performed are have a precision of 1cm.</p>
 <p>This function utilizes the S2 library for spherical calculations.</p>
 <p>This function utilizes the GeographicLib library for spheroid calculations.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_dwithin"></a><code>st_dwithin(geometry_a: geometry, geometry_b: geometry, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geometry_a is within distance units of geometry_b.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_endpoint"></a><code>st_endpoint(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the last point of a geometry which has shape LineString. Returns NULL if the geometry is not a LineString.</p>
 </span></td></tr>
 <tr><td><a name="st_equals"></a><code>st_equals(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a is spatially equal to geometry_b, i.e. ST_Within(geometry_a, geometry_b) = ST_Within(geometry_b, geometry_a) = true.</p>
 <p>This function utilizes the GEOS module.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_exteriorring"></a><code>st_exteriorring(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the exterior ring of a Polygon as a LineString. Returns NULL if the shape is not a Polygon.</p>
+</span></td></tr>
+<tr><td><a name="st_force2d"></a><code>st_force2d(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry which only contains X and Y coordinates.</p>
 </span></td></tr>
 <tr><td><a name="st_geogfromewkb"></a><code>st_geogfromewkb(val: <a href="bytes.html">bytes</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns the Geography from an EWKB representation.</p>
 </span></td></tr>
@@ -1018,12 +1109,28 @@ given Geometry.</p>
 <tr><td><a name="st_intersects"></a><code>st_intersects(geography_a: geography, geography_b: geography) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geography_a shares any portion of space with geography_b.</p>
 <p>The calculations performed are have a precision of 1cm.</p>
 <p>This function utilizes the S2 library for spherical calculations.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_intersects"></a><code>st_intersects(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a shares any portion of space with geometry_b.</p>
 <p>The calculations performed are have a precision of 1cm.</p>
 <p>This function utilizes the GEOS module.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
+</span></td></tr>
+<tr><td><a name="st_isvalid"></a><code>st_isvalid(geometry: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the geometry is valid as defined by the OGC spec.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_isvalid"></a><code>st_isvalid(geometry: geometry, flags: <a href="int.html">int</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the geometry is valid.</p>
+<p>For flags=0, validity is defined by the OGC spec.</p>
+<p>For flags=1, validity considers self-intersecting rings forming holes as valid as per ESRI. This is not valid under OGC and CRDB spatial operations may not operate correctly.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_isvalidreason"></a><code>st_isvalidreason(geometry: geometry) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns a string containing the reason the geometry is invalid along with the point of interest, or “Valid Geometry” if it is valid. Validity is defined by the OGC spec.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_isvalidreason"></a><code>st_isvalidreason(geometry: geometry, flags: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the reason the geometry is invalid or “Valid Geometry” if it is valid.</p>
+<p>For flags=0, validity is defined by the OGC spec.</p>
+<p>For flags=1, validity considers self-intersecting rings forming holes as valid as per ESRI. This is not valid under OGC and CRDB spatial operations may not operate correctly.</p>
+<p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_length"></a><code>st_length(geography: geography) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the length of the given geography in meters. Uses a spheroid to perform the operation.</p>
 <p>This function utilizes the GeographicLib library for spheroid calculations.</p>
@@ -1071,6 +1178,9 @@ given Geometry.</p>
 <tr><td><a name="st_makepolygon"></a><code>st_makepolygon(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a new Polygon with the given outer LineString.</p>
 </span></td></tr>
 <tr><td><a name="st_makepolygon"></a><code>st_makepolygon(outer: geometry, interior: anyelement[]) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a new Polygon with the given outer LineString and interior (hole) LineString(s).</p>
+</span></td></tr>
+<tr><td><a name="st_makevalid"></a><code>st_makevalid(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a valid form of the given geometry according to the OGC spec.</p>
+<p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_maxdistance"></a><code>st_maxdistance(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the maximum distance across every pair of points comprising the given geometries. Note if the geometries are the same, it will return the maximum distance between the geometry’s vertexes.</p>
 </span></td></tr>
@@ -1154,7 +1264,7 @@ given Geometry.</p>
 </span></td></tr>
 <tr><td><a name="st_overlaps"></a><code>st_overlaps(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a intersects but does not completely contain geometry_b, or vice versa. “Does not completely” implies ST_Within(geometry_a, geometry_b) = ST_Within(geometry_b, geometry_a) = false.</p>
 <p>This function utilizes the GEOS module.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_perimeter"></a><code>st_perimeter(geography: geography) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the perimeter of the given geography in meters. Uses a spheroid to perform the operation.</p>
 <p>This function utilizes the GeographicLib library for spheroid calculations.</p>
@@ -1252,7 +1362,7 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 </span></td></tr>
 <tr><td><a name="st_touches"></a><code>st_touches(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if the only points in common between geometry_a and geometry_b are on the boundary. Note points do not touch other points.</p>
 <p>This function utilizes the GEOS module.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_transform"></a><code>st_transform(geometry: geometry, from_proj_text: <a href="string.html">string</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Transforms a geometry into the coordinate reference system assuming the from_proj_text to the new to_proj_text by projecting its coordinates. The supplied SRID is set on the new geometry.</p>
 <p>This function utilizes the PROJ library for coordinate projections.</p>
@@ -1271,7 +1381,7 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 </span></td></tr>
 <tr><td><a name="st_within"></a><code>st_within(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a is completely inside geometry_b.</p>
 <p>This function utilizes the GEOS module.</p>
-<p>This function will automatically use any available index.</p>
+<p>This function variant will attempt to utilize any available geospatial index.</p>
 </span></td></tr>
 <tr><td><a name="st_wkbtosql"></a><code>st_wkbtosql(val: <a href="bytes.html">bytes</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB (or EWKB) representation.</p>
 </span></td></tr>

@@ -45,6 +45,7 @@ import (
 // plan; planning will be performed outside of the transaction.
 func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	s, sqlDB, db := serverutils.StartServer(t, base.TestServerArgs{})
@@ -157,8 +158,7 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 		// We need distribute = true so that executing the plan involves marshaling
 		// the root txn meta to leaf txns. Local flows can start in aborted txns
 		// because they just use the root txn.
-		planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, nil /* txn */, true /* distribute */)
-		planCtx.planner = p
+		planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p, nil /* txn */, true /* distribute */)
 		planCtx.stmtType = recv.stmtType
 
 		execCfg.DistSQLPlanner.PlanAndRun(
@@ -181,6 +181,7 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 // come along.
 func TestDistSQLReceiverErrorRanking(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// This test goes through the trouble of creating a server because it wants to
 	// create a txn. It creates the txn because it wants to test an interaction

@@ -195,10 +195,12 @@ func init() {
 		quitCmd,
 
 		sqlShellCmd,
+		stmtDiagCmd,
 		authCmd,
 		nodeCmd,
 		dumpCmd,
 		nodeLocalCmd,
+		userFileCmd,
 
 		// Miscellaneous commands.
 		// TODO(pmattis): stats

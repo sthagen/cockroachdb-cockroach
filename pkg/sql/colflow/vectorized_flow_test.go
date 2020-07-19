@@ -44,13 +44,13 @@ func (c callbackRemoteComponentCreator) newOutbox(
 	input colexecbase.Operator,
 	typs []*types.T,
 	metadataSources []execinfrapb.MetadataSource,
-	toClose []colexec.IdempotentCloser,
+	toClose []colexec.Closer,
 ) (*colrpc.Outbox, error) {
 	return c.newOutboxFn(allocator, input, typs, metadataSources)
 }
 
 func (c callbackRemoteComponentCreator) newInbox(
-	allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID,
+	ctx context.Context, allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID,
 ) (*colrpc.Inbox, error) {
 	return c.newInboxFn(allocator, typs, streamID)
 }
@@ -202,7 +202,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 			return colrpc.NewOutbox(allocator, op, typs, sources, nil /* toClose */)
 		},
 		newInboxFn: func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error) {
-			inbox, err := colrpc.NewInbox(allocator, typs, streamID)
+			inbox, err := colrpc.NewInbox(context.Background(), allocator, typs, streamID)
 			inboxToNumInputTypes[inbox] = typs
 			return inbox, err
 		},

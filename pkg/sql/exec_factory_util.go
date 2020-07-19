@@ -294,3 +294,76 @@ func hasDuplicates(cols []exec.NodeColumnOrdinal) bool {
 	}
 	return false
 }
+
+func constructVirtualScan(
+	ef exec.Factory,
+	p *planner,
+	table cat.Table,
+	index cat.Index,
+	params exec.ScanParams,
+	reqOrdering exec.OutputOrdering,
+	// delayedNodeCallback is a callback function that performs custom setup
+	// that varies by exec.Factory implementations.
+	delayedNodeCallback func(*delayedNode) (exec.Node, error),
+) (exec.Node, error) {
+	tn := &table.(*optVirtualTable).name
+	virtual, err := p.getVirtualTabler().getVirtualTableEntry(tn)
+	if err != nil {
+		return nil, err
+	}
+	indexDesc := index.(*optVirtualIndex).desc
+	columns, constructor := virtual.getPlanInfo(
+		table.(*optVirtualTable).desc.TableDesc(),
+		indexDesc, params.IndexConstraint)
+
+	n, err := delayedNodeCallback(&delayedNode{
+		name:            fmt.Sprintf("%s@%s", table.Name(), index.Name()),
+		columns:         columns,
+		indexConstraint: params.IndexConstraint,
+		constructor: func(ctx context.Context, p *planner) (planNode, error) {
+			return constructor(ctx, p, tn.Catalog())
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for explicit use of the dummy column.
+	if params.NeededCols.Contains(0) {
+		return nil, errors.Errorf("use of %s column not allowed.", table.Column(0).ColName())
+	}
+	if params.Locking != nil {
+		// We shouldn't have allowed SELECT FOR UPDATE for a virtual table.
+		return nil, errors.AssertionFailedf("locking cannot be used with virtual table")
+	}
+	if needed := params.NeededCols; needed.Len() != len(columns) {
+		// We are selecting a subset of columns; we need a projection.
+		cols := make([]exec.NodeColumnOrdinal, 0, needed.Len())
+		colNames := make([]string, len(cols))
+		for ord, ok := needed.Next(0); ok; ord, ok = needed.Next(ord + 1) {
+			cols = append(cols, exec.NodeColumnOrdinal(ord-1))
+			colNames = append(colNames, columns[ord-1].Name)
+		}
+		n, err = ef.ConstructSimpleProject(n, cols, colNames, nil /* reqOrdering */)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if params.HardLimit != 0 {
+		n, err = ef.ConstructLimit(n, tree.NewDInt(tree.DInt(params.HardLimit)), nil /* offset */)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// reqOrdering will be set if the optimizer expects that the output of the
+	// exec.Node that we're returning will actually have a legitimate ordering.
+	// Virtual indexes never provide a legitimate ordering, so we have to make
+	// sure to sort if we have a required ordering.
+	if len(reqOrdering) != 0 {
+		n, err = ef.ConstructSort(n, sqlbase.ColumnOrdering(reqOrdering), 0)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return n, nil
+}

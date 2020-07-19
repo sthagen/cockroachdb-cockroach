@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
@@ -368,7 +369,7 @@ func (s *statusServer) Allocator(
 						}
 						return true, err
 					}
-					if !rep.OwnsValidLease(store.Clock().Now()) {
+					if !rep.OwnsValidLease(ctx, store.Clock().Now()) {
 						return false, nil
 					}
 					allocatorSpans, err := store.AllocatorDryRun(ctx, rep)
@@ -391,7 +392,7 @@ func (s *statusServer) Allocator(
 				// Not found: continue.
 				continue
 			}
-			if !rep.OwnsValidLease(store.Clock().Now()) {
+			if !rep.OwnsValidLease(ctx, store.Clock().Now()) {
 				continue
 			}
 			allocatorSpans, err := store.AllocatorDryRun(ctx, rep)
@@ -1057,7 +1058,27 @@ func (s *statusServer) Profile(
 			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 		}
 		return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
-
+	case serverpb.ProfileRequest_CPU:
+		var buf bytes.Buffer
+		if err := debug.CPUProfileDo(s.st, cluster.CPUProfileWithLabels, func() error {
+			duration := 30 * time.Second
+			if req.Seconds != 0 {
+				duration = time.Duration(req.Seconds) * time.Second
+			}
+			if err := pprof.StartCPUProfile(&buf); err != nil {
+				return err
+			}
+			defer pprof.StopCPUProfile()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(duration):
+				return nil
+			}
+		}); err != nil {
+			return nil, err
+		}
+		return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
 	default:
 		return nil, grpcstatus.Errorf(codes.InvalidArgument, "unknown profile: %s", req.Type)
 	}

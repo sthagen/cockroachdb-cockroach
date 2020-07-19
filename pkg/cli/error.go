@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -268,6 +269,14 @@ func MaybeDecorateGRPCError(
 			if pgcode.MakeCode(string(wErr.Code)) == pgcode.ProtocolViolation {
 				return connSecurityHint()
 			}
+
+			// Are we running a v20.2 binary against a v20.1 server?
+			if strings.Contains(wErr.Message, "column \"membership\" does not exist") {
+				// The v20.2 binary makes use of columns not present in v20.1,
+				// so this is a disallowed operation. Surface a better error
+				// code here.
+				return fmt.Errorf("cannot use a v20.2 cli against servers running v20.1")
+			}
 			// Otherwise, there was a regular SQL error. Just report
 			// that.
 			return err
@@ -338,6 +347,16 @@ func MaybeDecorateGRPCError(
 			return fmt.Errorf(
 				"server requires GSSAPI authentication for this user.\n" +
 					"The CockroachDB CLI does not support GSSAPI authentication; use 'psql' instead")
+		}
+
+		// Are we trying to re-initialize an initialized cluster?
+		if strings.Contains(err.Error(), server.ErrClusterInitialized.Error()) {
+			// We really want to use errors.Is() here but this would require
+			// error serialization support in gRPC.
+			// This is not yet performed in CockroachDB even though the error
+			// library now has infrastructure to do so, see:
+			// https://github.com/cockroachdb/errors/pull/14
+			return server.ErrClusterInitialized
 		}
 
 		// Nothing we can special case, just return what we have.

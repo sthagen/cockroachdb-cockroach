@@ -630,7 +630,7 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %token <str> START STATISTICS STATUS STDIN STRICT STRING STORAGE STORE STORED STORING SUBSTRING
 %token <str> SYMMETRIC SYNTAX SYSTEM SQRT SUBSCRIPTION
 
-%token <str> TABLE TABLES TEMP TEMPLATE TEMPORARY TESTING_RELOCATE EXPERIMENTAL_RELOCATE TEXT THEN
+%token <str> TABLE TABLES TEMP TEMPLATE TEMPORARY TENANT TESTING_RELOCATE EXPERIMENTAL_RELOCATE TEXT THEN
 %token <str> TIES TIME TIMETZ TIMESTAMP TIMESTAMPTZ TO THROTTLING TRAILING TRACE TRANSACTION TREAT TRIGGER TRIM TRUE
 %token <str> TRUNCATE TRUSTED TYPE
 %token <str> TRACING
@@ -1941,12 +1941,12 @@ alter_type_stmt:
       },
     }
   }
-| ALTER TYPE type_name RENAME TO type_name
+| ALTER TYPE type_name RENAME TO name
   {
     $$.val = &tree.AlterType{
       Type: $3.unresolvedObjectName(),
       Cmd: &tree.AlterTypeRename{
-        NewName: $6.unresolvedObjectName(),
+        NewName: $6,
       },
     }
   }
@@ -3325,7 +3325,7 @@ deallocate_stmt:
 // %Text:
 // Grant privileges:
 //   GRANT {ALL | <privileges...> } ON <targets...> TO <grantees...>
-// Grant role membership (CCL only):
+// Grant role membership:
 //   GRANT <roles...> TO <grantees...> [WITH ADMIN OPTION]
 //
 // Privileges:
@@ -3356,7 +3356,7 @@ grant_stmt:
 // %Text:
 // Revoke privileges:
 //   REVOKE {ALL | <privileges...> } ON <targets...> FROM <grantees...>
-// Revoke role membership (CCL only):
+// Revoke role membership:
 //   REVOKE [ADMIN OPTION FOR] <roles...> FROM <grantees...>
 //
 // Privileges:
@@ -4706,6 +4706,14 @@ targets:
   {
     $$.val = tree.TargetList{Tables: $2.tablePatterns()}
   }
+| TENANT iconst64
+  {
+    tenID := uint64($2.int64())
+    if tenID == 0 {
+		  return setErr(sqllex, errors.New("invalid tenant ID"))
+	  }
+    $$.val = tree.TargetList{Tenant: roachpb.MakeTenantID(tenID)}
+  }
 | DATABASE name_list
   {
     $$.val = tree.TargetList{Databases: $2.nameList()}
@@ -6002,11 +6010,11 @@ opt_using_gin_btree:
   {
     /* FORCE DOC */
     switch $2 {
-      case "gin":
+      case "gin", "gist":
         $$.val = true
       case "btree":
         $$.val = false
-      case "hash", "gist", "spgist", "brin":
+      case "hash", "spgist", "brin":
         return unimplemented(sqllex, "index using " + $2)
       default:
         sqllex.Error("unrecognized access method: " + $2)
@@ -10715,6 +10723,7 @@ unreserved_keyword:
 | TEMP
 | TEMPLATE
 | TEMPORARY
+| TENANT
 | TESTING_RELOCATE
 | TEXT
 | TIES

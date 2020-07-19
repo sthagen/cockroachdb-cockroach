@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -34,6 +35,7 @@ import (
 // becomes the leaseholder. See #48553 for more details.
 func TestClosedTimestampWorksWhenRequestsAreSentToNonLeaseHolders(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	// Set an incredibly long timeout so we don't need to risk node liveness
@@ -94,7 +96,7 @@ func TestClosedTimestampWorksWhenRequestsAreSentToNonLeaseHolders(t *testing.T) 
 		target := tc.Target(serverIdx)
 		transferLease(repl.Desc(), target)
 		testutils.SucceedsSoon(t, func() error {
-			if !repl.OwnsValidLease(db1.Clock().Now()) {
+			if !repl.OwnsValidLease(ctx, db1.Clock().Now()) {
 				return errors.Errorf("don't yet have the lease")
 			}
 			return nil

@@ -17,11 +17,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestTestServerArgsForTransientCluster(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
 		nodeID            roachpb.NodeID
@@ -37,11 +39,12 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 			sqlPoolMemorySize: 2 << 10,
 			cacheSize:         1 << 10,
 			expected: base.TestServerArgs{
-				PartOfCluster:     true,
-				JoinAddr:          "127.0.0.1",
-				DisableTLSForHTTP: true,
-				SQLMemoryPoolSize: 2 << 10,
-				CacheSize:         1 << 10,
+				PartOfCluster:           true,
+				JoinAddr:                "127.0.0.1",
+				DisableTLSForHTTP:       true,
+				SQLMemoryPoolSize:       2 << 10,
+				CacheSize:               1 << 10,
+				NoAutoInitializeCluster: true,
 			},
 		},
 		{
@@ -50,11 +53,12 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 			sqlPoolMemorySize: 4 << 10,
 			cacheSize:         4 << 10,
 			expected: base.TestServerArgs{
-				PartOfCluster:     true,
-				JoinAddr:          "127.0.0.1",
-				DisableTLSForHTTP: true,
-				SQLMemoryPoolSize: 4 << 10,
-				CacheSize:         4 << 10,
+				PartOfCluster:           true,
+				JoinAddr:                "127.0.0.1",
+				DisableTLSForHTTP:       true,
+				SQLMemoryPoolSize:       4 << 10,
+				CacheSize:               4 << 10,
+				NoAutoInitializeCluster: true,
 			},
 		},
 	}

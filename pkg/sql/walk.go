@@ -21,8 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/errors"
 )
 
 type observeVerbosity int
@@ -181,46 +179,21 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			// we know we will get only one result from the scan. There are cases
 			// in which "parallel" will be printed out even though the spans cover
 			// a single range, but there is nothing we can do about that.
-			if n.canParallelize() && (len(n.spans) > 1 || n.maxResults > 1) {
+			if n.parallelize {
 				v.observer.attr(name, "parallel", "")
 			}
 			if n.index.IsPartial() {
 				v.observer.attr(name, "partial index", "")
 			}
-			if n.hardLimit > 0 && isFilterTrue(n.filter) {
+			if n.hardLimit > 0 {
 				v.observer.attr(name, "limit", fmt.Sprintf("%d", n.hardLimit))
 			}
 			if n.lockingStrength != sqlbase.ScanLockingStrength_FOR_NONE {
-				strength := ""
-				switch n.lockingStrength {
-				case sqlbase.ScanLockingStrength_FOR_KEY_SHARE:
-					strength = "for key share"
-				case sqlbase.ScanLockingStrength_FOR_SHARE:
-					strength = "for share"
-				case sqlbase.ScanLockingStrength_FOR_NO_KEY_UPDATE:
-					strength = "for no key update"
-				case sqlbase.ScanLockingStrength_FOR_UPDATE:
-					strength = "for update"
-				default:
-					panic(errors.AssertionFailedf("unexpected strength"))
-				}
-				v.observer.attr(name, "locking strength", strength)
+				v.observer.attr(name, "locking strength", n.lockingStrength.PrettyString())
 			}
 			if n.lockingWaitPolicy != sqlbase.ScanLockingWaitPolicy_BLOCK {
-				wait := ""
-				switch n.lockingWaitPolicy {
-				case sqlbase.ScanLockingWaitPolicy_SKIP:
-					wait = "skip locked"
-				case sqlbase.ScanLockingWaitPolicy_ERROR:
-					wait = "nowait"
-				default:
-					panic(errors.AssertionFailedf("unexpected wait policy"))
-				}
-				v.observer.attr(name, "locking wait policy", wait)
+				v.observer.attr(name, "locking wait policy", n.lockingWaitPolicy.PrettyString())
 			}
-		}
-		if v.observer.expr != nil {
-			v.expr(name, "filter", -1, n.filter)
 		}
 
 	case *filterNode:
@@ -246,7 +219,6 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 				cols[i] = inputCols[c].Name
 			}
 			v.observer.attr(name, "key columns", strings.Join(cols, ", "))
-			v.expr(name, "filter", -1, n.table.filter)
 		}
 		n.input = v.visit(n.input)
 
@@ -369,7 +341,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 				for i := range eqCols {
 					eqCols[i].Name = fmt.Sprintf("(%s=%s)", n.pred.leftColNames[i], n.pred.rightColNames[i])
 				}
-				v.observer.attr(name, "mergeJoinOrder", formatOrdering(n.mergeJoinOrdering, eqCols))
+				v.observer.attr(name, "mergeJoinOrder", n.mergeJoinOrdering.String(eqCols))
 			}
 		}
 		if v.observer.expr != nil {
@@ -377,6 +349,58 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		}
 		n.left.plan = v.visit(n.left.plan)
 		n.right.plan = v.visit(n.right.plan)
+
+	case *interleavedJoinNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "type", joinTypeStr(n.joinType))
+			v.observer.attr(name, "left table", fmt.Sprintf("%s@%s", n.left.desc.Name, n.left.index.Name))
+		}
+		if v.observer.spans != nil {
+			v.observer.spans(name, "left spans", n.left.index, n.left.spans, n.left.hardLimit != 0)
+		}
+		if v.observer.attr != nil {
+			if n.left.index.IsPartial() {
+				v.observer.attr(name, "left partial index", "")
+			}
+		}
+		if v.observer.expr != nil {
+			v.expr(name, "left filter", -1, n.leftFilter)
+		}
+		if v.observer.attr != nil {
+			v.observer.attr(name, "right table", fmt.Sprintf("%s@%s", n.right.desc.Name, n.right.index.Name))
+		}
+		if v.observer.spans != nil {
+			v.observer.spans(name, "right spans", n.right.index, n.right.spans, n.right.hardLimit != 0)
+		}
+		if v.observer.attr != nil {
+			if n.right.index.IsPartial() {
+				v.observer.attr(name, "right partial index", "")
+			}
+		}
+		if v.observer.expr != nil {
+			v.expr(name, "right filter", -1, n.rightFilter)
+			v.expr(name, "pred", -1, n.onCond)
+		}
+		if v.observer.attr != nil {
+			ancestor := "left"
+			lockingStrength, lockingWaitPolicy := n.left.lockingStrength, n.left.lockingWaitPolicy
+			if !n.leftIsAncestor {
+				ancestor = "right"
+				lockingStrength, lockingWaitPolicy = n.right.lockingStrength, n.right.lockingWaitPolicy
+			}
+			v.observer.attr(name, "ancestor", ancestor)
+
+			if lockingStrength != sqlbase.ScanLockingStrength_FOR_NONE {
+				v.observer.attr(name, "locking strength", lockingStrength.PrettyString())
+			}
+			if lockingWaitPolicy != sqlbase.ScanLockingWaitPolicy_BLOCK {
+				v.observer.attr(name, "locking wait policy", lockingWaitPolicy.PrettyString())
+			}
+		}
+
+		if v.observer.expr != nil {
+			v.expr(name, "pred", -1, n.onCond)
+		}
 
 	case *invertedFilterNode:
 		if v.observer.attr != nil {
@@ -452,9 +476,9 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *sortNode:
 		if v.observer.attr != nil {
 			columns := planColumns(n.plan)
-			v.observer.attr(name, "order", formatOrdering(n.ordering, columns))
+			v.observer.attr(name, "order", n.ordering.String(columns))
 			if p := n.alreadyOrderedPrefix; p > 0 {
-				v.observer.attr(name, "already ordered", formatOrdering(n.ordering[:p], columns))
+				v.observer.attr(name, "already ordered", n.ordering[:p].String(columns))
 			}
 		}
 		n.plan = v.visit(n.plan)
@@ -495,7 +519,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 				v.observer.attr(name, "group by", strings.Join(cols, ", "))
 			}
 			if len(n.groupColOrdering) > 0 {
-				v.observer.attr(name, "ordered", formatOrdering(n.groupColOrdering, inputCols))
+				v.observer.attr(name, "ordered", n.groupColOrdering.String(inputCols))
 			}
 			if n.isScalar {
 				v.observer.attr(name, "scalar", "")
@@ -819,26 +843,6 @@ func (v *planVisitor) metadataTuples(nodeName string, tuples [][]tree.TypedExpr)
 	}
 }
 
-func formatOrdering(ordering sqlbase.ColumnOrdering, columns sqlbase.ResultColumns) string {
-	var buf bytes.Buffer
-	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
-	for i, o := range ordering {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		prefix := byte('+')
-		if o.Direction == encoding.Descending {
-			prefix = byte('-')
-		}
-		buf.WriteByte(prefix)
-
-		fmtCtx.FormatNameP(&columns[o.ColIdx].Name)
-		_, _ = fmtCtx.WriteTo(&buf)
-	}
-	fmtCtx.Close()
-	return buf.String()
-}
-
 // formatValuesSize returns a string of the form "5 columns, 1 row".
 func formatValuesSize(numRows, numCols int) string {
 	return fmt.Sprintf(
@@ -951,6 +955,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&indexJoinNode{}):         "index-join",
 	reflect.TypeOf(&insertNode{}):            "insert",
 	reflect.TypeOf(&insertFastPathNode{}):    "insert-fast-path",
+	reflect.TypeOf(&interleavedJoinNode{}):   "interleaved-join",
 	reflect.TypeOf(&invertedFilterNode{}):    "inverted-filter",
 	reflect.TypeOf(&invertedJoinNode{}):      "inverted-join",
 	reflect.TypeOf(&joinNode{}):              "join",

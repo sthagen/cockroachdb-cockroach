@@ -90,6 +90,11 @@ func (rk RKey) Less(otherRK RKey) bool {
 	return bytes.Compare(rk, otherRK) < 0
 }
 
+// Compare compares the two RKeys.
+func (rk RKey) Compare(other RKey) int {
+	return bytes.Compare(rk, other)
+}
+
 // Equal checks for byte-wise equality.
 func (rk RKey) Equal(other []byte) bool {
 	return bytes.Equal(rk, other)
@@ -847,11 +852,10 @@ func MakeTransaction(
 			Priority:       MakePriority(userPriority),
 			Sequence:       0, // 1-indexed, incremented before each Request
 		},
-		Name:                    name,
-		LastHeartbeat:           now,
-		ReadTimestamp:           now,
-		MaxTimestamp:            maxTS,
-		DeprecatedOrigTimestamp: now, // For compatibility with 19.2.
+		Name:          name,
+		LastHeartbeat: now,
+		ReadTimestamp: now,
+		MaxTimestamp:  maxTS,
 	}
 }
 
@@ -860,10 +864,6 @@ func MakeTransaction(
 func (t Transaction) LastActive() hlc.Timestamp {
 	ts := t.LastHeartbeat
 	ts.Forward(t.ReadTimestamp)
-
-	// For compatibility with 19.2, handle the case where ReadTimestamp isn't
-	// set.
-	ts.Forward(t.DeprecatedOrigTimestamp)
 	return ts
 }
 
@@ -977,7 +977,6 @@ func (t *Transaction) Restart(
 		t.WriteTimestamp = timestamp
 	}
 	t.ReadTimestamp = t.WriteTimestamp
-	t.DeprecatedOrigTimestamp = t.WriteTimestamp // For 19.2 compatibility.
 	// Upgrade priority to the maximum of:
 	// - the current transaction priority
 	// - a random priority created from userPriority
@@ -1093,7 +1092,6 @@ func (t *Transaction) Update(o *Transaction) {
 	// Forward each of the transaction timestamps.
 	t.WriteTimestamp.Forward(o.WriteTimestamp)
 	t.LastHeartbeat.Forward(o.LastHeartbeat)
-	t.DeprecatedOrigTimestamp.Forward(o.DeprecatedOrigTimestamp)
 	t.MaxTimestamp.Forward(o.MaxTimestamp)
 	t.ReadTimestamp.Forward(o.ReadTimestamp)
 

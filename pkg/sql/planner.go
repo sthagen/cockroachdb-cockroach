@@ -291,14 +291,14 @@ func newInternalPlanner(
 	p.semaCtx.SearchPath = sd.SearchPath
 	p.semaCtx.TypeResolver = p
 
-	plannerMon := mon.MakeUnlimitedMonitor(ctx,
+	plannerMon := mon.NewUnlimitedMonitor(ctx,
 		fmt.Sprintf("internal-planner.%s.%s", user, opName),
 		mon.MemoryResource,
 		memMetrics.CurBytesCount, memMetrics.MaxBytesHist,
 		noteworthyInternalMemoryUsageBytes, execCfg.Settings)
 
 	p.extendedEvalCtx = internalExtendedEvalCtx(
-		ctx, sd, dataMutator, tables, txn, ts, ts, execCfg, &plannerMon,
+		ctx, sd, dataMutator, tables, txn, ts, ts, execCfg, plannerMon,
 	)
 	p.extendedEvalCtx.Planner = p
 	p.extendedEvalCtx.PrivilegedAccessor = p
@@ -492,10 +492,11 @@ func (p *planner) LookupTableByID(
 	}
 	// TODO (rohany): This shouldn't be needed once the descs.Collection always
 	//  returns descriptors with hydrated types.
-	if err := p.maybeHydrateTypesInDescriptor(ctx, table); err != nil {
+	hydratedDesc, err := p.maybeHydrateTypesInDescriptor(ctx, table)
+	if err != nil {
 		return catalog.TableEntry{}, err
 	}
-	return catalog.TableEntry{Desc: table}, nil
+	return catalog.TableEntry{Desc: hydratedDesc.(*sqlbase.ImmutableTableDescriptor)}, nil
 }
 
 // TypeAsString enforces (not hints) that the given expression typechecks as a

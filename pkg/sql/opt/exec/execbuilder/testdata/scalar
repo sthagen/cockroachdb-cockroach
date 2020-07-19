@@ -581,26 +581,28 @@ render       ·              ·                                    ("coalesce") 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT a FROM t WHERE a BETWEEN b AND d
 ----
-·          distribution  local                  ·          ·
-·          vectorized    true                   ·          ·
-render     ·             ·                      (a)        ·
- │         render 0      a                      ·          ·
- └── scan  ·             ·                      (a, b, d)  ·
-·          table         t@primary              ·          ·
-·          spans         FULL SCAN              ·          ·
-·          filter        (a >= b) AND (a <= d)  ·          ·
+·               distribution  local                  ·          ·
+·               vectorized    true                   ·          ·
+render          ·             ·                      (a)        ·
+ │              render 0      a                      ·          ·
+ └── filter     ·             ·                      (a, b, d)  ·
+      │         filter        (a >= b) AND (a <= d)  ·          ·
+      └── scan  ·             ·                      (a, b, d)  ·
+·               table         t@primary              ·          ·
+·               spans         FULL SCAN              ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT a FROM t WHERE a NOT BETWEEN b AND d
 ----
-·          distribution  local               ·          ·
-·          vectorized    true                ·          ·
-render     ·             ·                   (a)        ·
- │         render 0      a                   ·          ·
- └── scan  ·             ·                   (a, b, d)  ·
-·          table         t@primary           ·          ·
-·          spans         FULL SCAN           ·          ·
-·          filter        (a < b) OR (a > d)  ·          ·
+·               distribution  local               ·          ·
+·               vectorized    true                ·          ·
+render          ·             ·                   (a)        ·
+ │              render 0      a                   ·          ·
+ └── filter     ·             ·                   (a, b, d)  ·
+      │         filter        (a < b) OR (a > d)  ·          ·
+      └── scan  ·             ·                   (a, b, d)  ·
+·               table         t@primary           ·          ·
+·               spans         FULL SCAN           ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT a BETWEEN SYMMETRIC b AND d AS r FROM t
@@ -706,7 +708,7 @@ EXPLAIN (VERBOSE) SELECT * FROM pg_attribute WHERE attrelid='t'::regclass
 ----
 ·              distribution  local                                   ·                                                                                                                                                                                                                                              ·
 ·              vectorized    false                                   ·                                                                                                                                                                                                                                              ·
-virtual table  ·             ·                                       (attrelid, attname, atttypid, attstattarget, attlen, attnum, attndims, attcacheoff, atttypmod, attbyval, attstorage, attalign, attnotnull, atthasdef, attisdropped, attislocal, attinhcount, attcollation, attacl, attoptions, attfdwoptions)  ·
+virtual table  ·             ·                                       (attrelid, attname, atttypid, attstattarget, attlen, attnum, attndims, attcacheoff, atttypmod, attbyval, attstorage, attalign, attnotnull, atthasdef, attidentity, attgenerated, attisdropped, attislocal, attinhcount, attcollation, attacl, attoptions, attfdwoptions)  ·
 ·              source        pg_attribute@pg_attribute_attrelid_idx  ·                                                                                                                                                                                                                                              ·
 ·              constraint    /2: [/t - /t]                           ·                                                                                                                                                                                                                                              ·
 

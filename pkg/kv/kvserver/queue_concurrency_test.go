@@ -42,6 +42,7 @@ func constantTimeoutFunc(d time.Duration) func(*cluster.Settings, replicaInQueue
 // impl, which are defined at the end of the file.
 func TestBaseQueueConcurrent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	stopper := stop.NewStopper()
@@ -173,7 +174,7 @@ func (fr *fakeReplica) redirectOnOrAcquireLease(
 	// baseQueue only checks that the returned error is nil.
 	return kvserverpb.LeaseStatus{}, nil
 }
-func (fr *fakeReplica) IsLeaseValid(roachpb.Lease, hlc.Timestamp) bool { return true }
+func (fr *fakeReplica) IsLeaseValid(context.Context, roachpb.Lease, hlc.Timestamp) bool { return true }
 func (fr *fakeReplica) GetLease() (roachpb.Lease, roachpb.Lease) {
 	return roachpb.Lease{}, roachpb.Lease{}
 }

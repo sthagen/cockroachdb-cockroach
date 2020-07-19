@@ -1102,7 +1102,9 @@ func (r *Replica) checkExecutionCanProceed(
 		return err
 	} else if err := r.checkSpanInRangeRLocked(ctx, rSpan); err != nil {
 		return err
-	} else if err := r.checkTSAboveGCThresholdRLocked(ba.Timestamp, st, ba.IsAdmin()); err != nil {
+	} else if err := r.checkTSAboveGCThresholdRLocked(
+		ba.EarliestActiveTimestamp(), st, ba.IsAdmin(),
+	); err != nil {
 		return err
 	} else if g.HoldingLatches() && st != nil {
 		// Only check for a pending merge if latches are held and the Range
@@ -1126,7 +1128,7 @@ func (r *Replica) checkExecutionCanProceedForRangeFeed(
 	now := r.Clock().Now()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	status := r.leaseStatus(*r.mu.state.Lease, now, r.mu.minLeaseProposedTS)
+	status := r.leaseStatus(ctx, *r.mu.state.Lease, now, r.mu.minLeaseProposedTS)
 	if _, err := r.isDestroyedRLocked(); err != nil {
 		return err
 	} else if err := r.checkSpanInRangeRLocked(ctx, rSpan); err != nil {
@@ -1511,7 +1513,7 @@ func (r *Replica) maybeTransferRaftLeadershipLocked(ctx context.Context) {
 		return
 	}
 	lease := *r.mu.state.Lease
-	if lease.OwnedBy(r.StoreID()) || !r.isLeaseValidRLocked(lease, r.Clock().Now()) {
+	if lease.OwnedBy(r.StoreID()) || !r.isLeaseValidRLocked(ctx, lease, r.Clock().Now()) {
 		return
 	}
 	raftStatus := r.raftStatusRLocked()

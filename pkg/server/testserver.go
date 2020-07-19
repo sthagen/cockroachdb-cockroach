@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
@@ -100,10 +101,13 @@ func makeTestBaseConfig(st *cluster.Settings) BaseConfig {
 	// makeTestConfigFromParams). Call TestServer.ServingRPCAddr() and
 	// .ServingSQLAddr() for the full address (including bound port).
 	baseCfg.Addr = util.TestAddr.String()
-	baseCfg.SQLAddr = util.TestAddr.String()
 	baseCfg.AdvertiseAddr = util.TestAddr.String()
+	baseCfg.SQLAddr = util.TestAddr.String()
 	baseCfg.SQLAdvertiseAddr = util.TestAddr.String()
 	baseCfg.SplitListenSQL = true
+	baseCfg.TenantAddr = util.TestAddr.String()
+	baseCfg.TenantAdvertiseAddr = util.TestAddr.String()
+	baseCfg.SplitListenTenant = true
 	baseCfg.HTTPAddr = util.TestAddr.String()
 	// Set standard user for intra-cluster traffic.
 	baseCfg.User = security.NodeUser
@@ -146,6 +150,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	}
 	cfg.ClusterName = params.ClusterName
 	cfg.Insecure = params.Insecure
+	cfg.AutoInitializeCluster = !params.NoAutoInitializeCluster
 	cfg.SocketFile = params.SocketFile
 	cfg.RetryOptions = params.RetryOptions
 	cfg.Locality = params.Locality
@@ -201,13 +206,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.AdvertiseAddr = util.IsolatedTestAddr.String()
 		cfg.SQLAddr = util.IsolatedTestAddr.String()
 		cfg.SQLAdvertiseAddr = util.IsolatedTestAddr.String()
+		cfg.TenantAddr = util.IsolatedTestAddr.String()
+		cfg.TenantAdvertiseAddr = util.IsolatedTestAddr.String()
 		cfg.HTTPAddr = util.IsolatedTestAddr.String()
-	} else {
-		cfg.Addr = util.TestAddr.String()
-		cfg.AdvertiseAddr = util.TestAddr.String()
-		cfg.SQLAddr = util.TestAddr.String()
-		cfg.SQLAdvertiseAddr = util.TestAddr.String()
-		cfg.HTTPAddr = util.TestAddr.String()
 	}
 	if params.Addr != "" {
 		cfg.Addr = params.Addr
@@ -216,6 +217,10 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.SQLAddr != "" {
 		cfg.SQLAddr = params.SQLAddr
 		cfg.SQLAdvertiseAddr = params.SQLAddr
+	}
+	if params.TenantAddr != "" {
+		cfg.TenantAddr = params.TenantAddr
+		cfg.TenantAdvertiseAddr = params.TenantAddr
 	}
 	if params.HTTPAddr != "" {
 		cfg.HTTPAddr = params.HTTPAddr
@@ -437,7 +442,7 @@ const fakeNodeID = roachpb.NodeID(123456789)
 
 func makeSQLServerArgs(
 	stopper *stop.Stopper, kvClusterName string, baseCfg BaseConfig, sqlCfg SQLConfig,
-) sqlServerArgs {
+) (sqlServerArgs, error) {
 	st := baseCfg.Settings
 	baseCfg.AmbientCtx.AddLogTag("sql", nil)
 	// TODO(tbg): this is needed so that the RPC heartbeats between the testcluster
@@ -448,6 +453,10 @@ func makeSQLServerArgs(
 	baseCfg.ClusterName = kvClusterName
 
 	clock := hlc.NewClock(hlc.UnixNano, time.Duration(baseCfg.MaxOffset))
+
+	// TODO(tbg): expose this registry via prometheus. See:
+	// https://github.com/cockroachdb/cockroach/issues/47905
+	registry := metric.NewRegistry()
 
 	var rpcTestingKnobs rpc.ContextTestingKnobs
 	if p, ok := baseCfg.TestingKnobs.Server.(*TestingKnobs); ok {
@@ -462,18 +471,14 @@ func makeSQLServerArgs(
 		Knobs:      rpcTestingKnobs,
 	})
 
-	// TODO(tbg): expose this registry via prometheus. See:
-	// https://github.com/cockroachdb/cockroach/issues/47905
-	registry := metric.NewRegistry()
-
 	var dsKnobs kvcoord.ClientTestingKnobs
 	if dsKnobsP, ok := baseCfg.TestingKnobs.DistSQL.(*kvcoord.ClientTestingKnobs); ok {
 		dsKnobs = *dsKnobsP
 	}
 	rpcRetryOptions := base.DefaultRetryOptions()
 
-	// TODO(nvb): this use of Gossip needs to go. Tracked in:
-	// https://github.com/cockroachdb/cockroach/issues/47909
+	// TODO(ajwerner): this use of Gossip needs to go. Tracked in:
+	// https://github.com/cockroachdb/cockroach/issues/47150
 	var g *gossip.Gossip
 	{
 		var nodeID base.NodeIDContainer
@@ -493,21 +498,28 @@ func makeSQLServerArgs(
 		)
 	}
 
-	nodeDialer := nodedialer.New(
+	tenantProxy, err := kvtenant.Factory.NewProxy(
+		baseCfg.AmbientCtx,
 		rpcContext,
-		gossip.AddressResolver(g), // TODO(nvb): break gossip dep
+		rpcRetryOptions,
+		sqlCfg.TenantKVAddrs,
 	)
+	if err != nil {
+		return sqlServerArgs{}, err
+	}
+	resolver := kvtenant.AddressResolver(tenantProxy)
+	nodeDialer := nodedialer.New(rpcContext, resolver)
+
 	dsCfg := kvcoord.DistSenderConfig{
-		AmbientCtx:         baseCfg.AmbientCtx,
-		Settings:           st,
-		Clock:              clock,
-		NodeDescs:          g,
-		RPCRetryOptions:    &rpcRetryOptions,
-		RPCContext:         rpcContext,
-		NodeDialer:         nodeDialer,
-		RangeDescriptorDB:  nil, // use DistSender itself
-		FirstRangeProvider: g,
-		TestingKnobs:       dsKnobs,
+		AmbientCtx:        baseCfg.AmbientCtx,
+		Settings:          st,
+		Clock:             clock,
+		NodeDescs:         tenantProxy,
+		RPCRetryOptions:   &rpcRetryOptions,
+		RPCContext:        rpcContext,
+		NodeDialer:        nodeDialer,
+		RangeDescriptorDB: tenantProxy,
+		TestingKnobs:      dsKnobs,
 	}
 	ds := kvcoord.NewDistSender(dsCfg)
 
@@ -575,7 +587,7 @@ func makeSQLServerArgs(
 			nodeDialer:   nodeDialer,
 			grpcServer:   dummyRPCServer,
 			recorder:     dummyRecorder,
-			isMeta1Leaseholder: func(timestamp hlc.Timestamp) (bool, error) {
+			isMeta1Leaseholder: func(_ context.Context, timestamp hlc.Timestamp) (bool, error) {
 				return false, errors.New("isMeta1Leaseholder is not available to secondary tenants")
 			},
 			nodeIDContainer: idContainer,
@@ -586,6 +598,7 @@ func makeSQLServerArgs(
 				uri, user string) (cloud.ExternalStorage, error) {
 				return nil, errors.New("external uri storage is not available to secondary tenants")
 			},
+			tenantProxy: tenantProxy,
 		},
 		SQLConfig:                &sqlCfg,
 		BaseConfig:               &baseCfg,
@@ -598,17 +611,19 @@ func makeSQLServerArgs(
 		circularInternalExecutor: circularInternalExecutor,
 		circularJobRegistry:      &jobs.Registry{},
 		protectedtsProvider:      protectedTSProvider,
-	}
+	}, nil
 }
 
 // StartTenant starts a SQL tenant communicating with this TestServer.
 func (ts *TestServer) StartTenant(params base.TestTenantArgs) (pgAddr string, _ error) {
 	ctx := context.Background()
 
-	if _, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(
-		ctx, "testserver-create-tenant", nil /* txn */, fmt.Sprintf("SELECT crdb_internal.create_tenant(%d)", params.TenantID.ToUint64()),
-	); err != nil {
-		return "", err
+	if !params.Existing {
+		if _, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(
+			ctx, "testserver-create-tenant", nil /* txn */, "SELECT crdb_internal.create_tenant($1, $2)", params.TenantID.ToUint64(), params.TenantInfo,
+		); err != nil {
+			return "", err
+		}
 	}
 
 	st := cluster.MakeTestingClusterSettings()
@@ -637,7 +652,10 @@ func StartTenant(
 	baseCfg BaseConfig,
 	sqlCfg SQLConfig,
 ) (pgAddr string, _ error) {
-	args := makeSQLServerArgs(stopper, kvClusterName, baseCfg, sqlCfg)
+	args, err := makeSQLServerArgs(stopper, kvClusterName, baseCfg, sqlCfg)
+	if err != nil {
+		return "", err
+	}
 	s, err := newSQLServer(ctx, args)
 	if err != nil {
 		return "", err
@@ -675,6 +693,8 @@ func StartTenant(
 	)
 	orphanedLeasesTimeThresholdNanos := args.clock.Now().WallTime
 
+	// TODO(ajwerner): this use of Gossip needs to go. Tracked in:
+	// https://github.com/cockroachdb/cockroach/issues/47150
 	{
 		rs := make([]resolver.Resolver, len(sqlCfg.TenantKVAddrs))
 		for i := range rs {
@@ -771,6 +791,12 @@ func (ts *TestServer) ServingSQLAddr() string {
 	return ts.cfg.SQLAdvertiseAddr
 }
 
+// ServingTenantAddr returns the server's Tenant address. Should be used by
+// tenant SQL processes.
+func (ts *TestServer) ServingTenantAddr() string {
+	return ts.cfg.TenantAdvertiseAddr
+}
+
 // HTTPAddr returns the server's HTTP address. Should be used by clients.
 func (ts *TestServer) HTTPAddr() string {
 	return ts.cfg.HTTPAddr
@@ -782,15 +808,21 @@ func (ts *TestServer) RPCAddr() string {
 	return ts.cfg.Addr
 }
 
-// DrainClients exports the drainClients() method for use by tests.
-func (ts *TestServer) DrainClients(ctx context.Context) error {
-	return ts.drainClients(ctx, nil /* reporter */)
-}
-
 // SQLAddr returns the server's listening SQL address.
 // Note: use ServingSQLAddr() instead unless there is a specific reason not to.
 func (ts *TestServer) SQLAddr() string {
 	return ts.cfg.SQLAddr
+}
+
+// TenantAddr returns the server's listening Tenant address.
+// Note: use ServingTenantAddr() instead unless there is a specific reason not to.
+func (ts *TestServer) TenantAddr() string {
+	return ts.cfg.TenantAddr
+}
+
+// DrainClients exports the drainClients() method for use by tests.
+func (ts *TestServer) DrainClients(ctx context.Context) error {
+	return ts.drainClients(ctx, nil /* reporter */)
 }
 
 // WriteSummaries implements TestServerInterface.

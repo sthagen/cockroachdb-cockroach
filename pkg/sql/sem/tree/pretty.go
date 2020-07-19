@@ -12,8 +12,10 @@ package tree
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
@@ -1979,6 +1981,9 @@ func (node *TargetList) docRow(p *PrettyCfg) pretty.TableRow {
 	if node.Databases != nil {
 		return p.row("DATABASE", p.Doc(&node.Databases))
 	}
+	if node.Tenant != (roachpb.TenantID{}) {
+		return p.row("TENANT", pretty.Text(strconv.FormatUint(node.Tenant.ToUint64(), 10)))
+	}
 	return p.row("TABLE", p.Doc(&node.Tables))
 }
 
@@ -2063,13 +2068,15 @@ func (node *Export) doc(p *PrettyCfg) pretty.Doc {
 
 func (node *Explain) doc(p *PrettyCfg) pretty.Doc {
 	d := pretty.Keyword("EXPLAIN")
+	showMode := node.Mode != ExplainPlan
 	// ANALYZE is a special case because it is a statement implemented as an
 	// option to EXPLAIN.
 	if node.Flags[ExplainFlagAnalyze] {
 		d = pretty.ConcatSpace(d, pretty.Keyword("ANALYZE"))
+		showMode = true
 	}
 	var opts []pretty.Doc
-	if node.Mode != ExplainPlan {
+	if showMode {
 		opts = append(opts, pretty.Keyword(node.Mode.String()))
 	}
 	for f := ExplainFlag(1); f <= numExplainFlags; f++ {

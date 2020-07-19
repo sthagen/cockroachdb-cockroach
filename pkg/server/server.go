@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/container"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptreconcile"
@@ -142,7 +143,9 @@ type Server struct {
 	clock           *hlc.Clock
 	rpcContext      *rpc.Context
 	// The gRPC server on which the different RPC handlers will be registered.
-	grpc         *grpcServer
+	grpc *grpcServer
+	// The optional tenant gRPC used by SQL tenants.
+	tenantGRPC   *grpcServer
 	gossip       *gossip.Gossip
 	nodeDialer   *nodedialer.Dialer
 	nodeLiveness *kvserver.NodeLiveness
@@ -330,14 +333,20 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// and after ValidateAddrs().
 	rpcContext.CheckCertificateAddrs(ctx)
 
-	grpcServer := newGRPCServer(rpcContext)
+	grpc := newGRPCServer(rpcContext)
+
+	// TODO(tbg): pass a different rpcContext here.
+	var tenantGRPC *grpcServer
+	if cfg.SplitListenTenant {
+		tenantGRPC = newGRPCServer(rpcContext)
+	}
 
 	g := gossip.New(
 		cfg.AmbientCtx,
 		&rpcContext.ClusterID,
 		nodeIDContainer,
 		rpcContext,
-		grpcServer.Server,
+		grpc.Server,
 		stopper,
 		registry,
 		cfg.Locality,
@@ -425,7 +434,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	)
 
 	raftTransport := kvserver.NewRaftTransport(
-		cfg.AmbientCtx, st, nodeDialer, grpcServer.Server, stopper,
+		cfg.AmbientCtx, st, nodeDialer, grpc.Server, stopper,
 	)
 
 	tsDB := ts.NewDB(db, cfg.Settings)
@@ -527,9 +536,12 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		storeCfg, recorder, registry, stopper,
 		txnMetrics, nil /* execCfg */, &rpcContext.ClusterID)
 	lateBoundNode = node
-	roachpb.RegisterInternalServer(grpcServer.Server, node)
-	kvserver.RegisterPerReplicaServer(grpcServer.Server, node.perReplicaServer)
-	node.storeCfg.ClosedTimestamp.RegisterClosedTimestampServer(grpcServer.Server)
+	roachpb.RegisterInternalServer(grpc.Server, node)
+	if tenantGRPC != nil {
+		roachpb.RegisterInternalServer(tenantGRPC.Server, node)
+	}
+	kvserver.RegisterPerReplicaServer(grpc.Server, node.perReplicaServer)
+	node.storeCfg.ClosedTimestamp.RegisterClosedTimestampServer(grpc.Server)
 	replicationReporter := reports.NewReporter(
 		db, node.stores, storePool, st, nodeLiveness, internalExecutor)
 
@@ -572,7 +584,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		if reflect.ValueOf(gw).IsNil() {
 			return nil, errors.Errorf("%d: nil", i)
 		}
-		gw.RegisterService(grpcServer.Server)
+		gw.RegisterService(grpc.Server)
 	}
 
 	var jobAdoptionStopFile string
@@ -591,7 +603,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			nodeLiveness:           sqlbase.MakeOptionalNodeLiveness(nodeLiveness),
 			gossip:                 gossip.MakeExposedGossip(g),
 			nodeDialer:             nodeDialer,
-			grpcServer:             grpcServer.Server,
+			grpcServer:             grpc.Server,
 			recorder:               recorder,
 			nodeIDContainer:        idContainer,
 			externalStorage:        externalStorage,
@@ -624,7 +636,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		st:                     st,
 		clock:                  clock,
 		rpcContext:             rpcContext,
-		grpc:                   grpcServer,
+		grpc:                   grpc,
+		tenantGRPC:             tenantGRPC,
 		gossip:                 g,
 		nodeDialer:             nodeDialer,
 		nodeLiveness:           nodeLiveness,
@@ -763,21 +776,25 @@ func inspectEngines(
 // file", these are written once the listeners are available, before the server
 // is necessarily ready to serve.
 type listenerInfo struct {
-	listenRPC    string // the (RPC) listen address, rewritten after name resolution and port allocation
-	advertiseRPC string // contains the original addr part of --listen/--advertise, with actual port number after port allocation if original was 0
-	listenHTTP   string // the HTTP endpoint
-	listenSQL    string // the SQL endpoint, rewritten after name resolution and port allocation
-	advertiseSQL string // contains the original addr part of --sql-addr, with actual port number after port allocation if original was 0
+	listenRPC       string // the (RPC) listen address, rewritten after name resolution and port allocation
+	advertiseRPC    string // contains the original addr part of --listen/--advertise, with actual port number after port allocation if original was 0
+	listenSQL       string // the SQL endpoint, rewritten after name resolution and port allocation
+	advertiseSQL    string // contains the original addr part of --sql-addr, with actual port number after port allocation if original was 0
+	listenTenant    string // the tenant KV endpoint, rewritten after name resolution and port allocation
+	advertiseTenant string // contains the original addr part of --tenant-addr, with actual port number after port allocation if original was 0
+	listenHTTP      string // the HTTP endpoint
 }
 
 // Iter returns a mapping of file names to desired contents.
 func (li listenerInfo) Iter() map[string]string {
 	return map[string]string{
-		"cockroach.advertise-addr":     li.advertiseRPC,
-		"cockroach.http-addr":          li.listenHTTP,
-		"cockroach.listen-addr":        li.listenRPC,
-		"cockroach.sql-addr":           li.listenSQL,
-		"cockroach.advertise-sql-addr": li.advertiseSQL,
+		"cockroach.listen-addr":           li.listenRPC,
+		"cockroach.advertise-addr":        li.advertiseRPC,
+		"cockroach.sql-addr":              li.listenSQL,
+		"cockroach.advertise-sql-addr":    li.advertiseSQL,
+		"cockroach.tenant-addr":           li.listenTenant,
+		"cockroach.advertise-tenant-addr": li.advertiseTenant,
+		"cockroach.http-addr":             li.listenHTTP,
 	}
 }
 
@@ -1249,11 +1266,13 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Write listener info files early in the startup sequence. `listenerInfo` has a comment.
 	listenerFiles := listenerInfo{
-		listenRPC:    s.cfg.Addr,
-		advertiseRPC: s.cfg.AdvertiseAddr,
-		listenSQL:    s.cfg.SQLAddr,
-		advertiseSQL: s.cfg.SQLAdvertiseAddr,
-		listenHTTP:   s.cfg.HTTPAdvertiseAddr,
+		listenRPC:       s.cfg.Addr,
+		advertiseRPC:    s.cfg.AdvertiseAddr,
+		listenSQL:       s.cfg.SQLAddr,
+		advertiseSQL:    s.cfg.SQLAdvertiseAddr,
+		listenTenant:    s.cfg.TenantAddr,
+		advertiseTenant: s.cfg.TenantAdvertiseAddr,
+		listenHTTP:      s.cfg.HTTPAdvertiseAddr,
 	}.Iter()
 
 	for _, storeSpec := range s.cfg.Stores.Specs {
@@ -1274,6 +1293,7 @@ func (s *Server) Start(ctx context.Context) error {
 	listenAddrU := util.NewUnresolvedAddr("tcp", s.cfg.Addr)
 	advAddrU := util.NewUnresolvedAddr("tcp", s.cfg.AdvertiseAddr)
 	advSQLAddrU := util.NewUnresolvedAddr("tcp", s.cfg.SQLAdvertiseAddr)
+	advTenantAddrU := util.NewUnresolvedAddr("tcp", s.cfg.TenantAdvertiseAddr)
 	filtered := s.cfg.FilterGossipBootstrapResolvers(ctx, listenAddrU, advAddrU)
 
 	s.gossip.Start(advAddrU, filtered)
@@ -1283,27 +1303,23 @@ func (s *Server) Start(ctx context.Context) error {
 		defer time.AfterFunc(30*time.Second, s.cfg.DelayedBootstrapFn).Stop()
 	}
 
-	// Set up calling s.cfg.ReadyFn at the right time. Essentially, this call
-	// determines when `./cockroach [...] --background` returns. For any initialized
-	// nodes (i.e. already part of a cluster) this is when this method returns
-	// (assuming there's no error). For nodes that need to join a cluster, we
-	// return once the initServer is ready to accept requests.
-	var onSuccessfulReturnFn, onInitServerReady func()
-	selfBootstrap := initServer.NeedsInit() && len(s.cfg.GossipBootstrapResolvers) == 0
+	// We self bootstrap for when we're configured to do so, which should only
+	// happen during tests and for `cockroach start-single-node`.
+	selfBootstrap := s.cfg.AutoInitializeCluster && initServer.NeedsInit()
 	if selfBootstrap {
-		// If a new node is started without join flags, self-bootstrap.
-		//
-		// Note: this is behavior slated for removal, see:
-		// https://github.com/cockroachdb/cockroach/pull/44112
-		_, err := initServer.Bootstrap(ctx, &serverpb.BootstrapRequest{})
-		switch {
-		case err == nil:
-			log.Infof(ctx, "**** add additional nodes by specifying --join=%s", s.cfg.AdvertiseAddr)
-		case errors.Is(err, ErrClusterInitialized):
-		default:
-			// Process is shutting down.
+		if _, err := initServer.Bootstrap(ctx, &serverpb.BootstrapRequest{}); err != nil {
+			return err
 		}
+	} else {
+		log.Info(ctx, "awaiting init command or join with an already initialized node.")
 	}
+
+	// Set up calling s.cfg.ReadyFn at the right time. Essentially, this call
+	// determines when `./cockroach [...] --background` returns. For any
+	// initialized nodes (i.e. already part of a cluster) this is when this
+	// method returns (assuming there's no error). For nodes that need to join a
+	// cluster, we return once the initServer is ready to accept requests.
+	var onSuccessfulReturnFn, onInitServerReady func()
 	{
 		readyFn := func(bool) {}
 		if s.cfg.ReadyFn != nil {
@@ -1319,7 +1335,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// This opens the main listener. When the listener is open, we can call
-	// initServerReadyFn since any request initated to the initServer at that
+	// initServerReadyFn since any request initiated to the initServer at that
 	// point will reach it once ServeAndWait starts handling the queue of incoming
 	// connections.
 	startRPCServer(workersCtx)
@@ -1420,7 +1436,9 @@ func (s *Server) Start(ctx context.Context) error {
 	// we're joining an existing cluster for the first time.
 	if err := s.node.start(
 		ctx,
-		advAddrU, advSQLAddrU,
+		advAddrU,
+		advSQLAddrU,
+		advTenantAddrU,
 		*state,
 		s.cfg.ClusterName,
 		s.cfg.NodeAttributes,
@@ -1456,7 +1474,15 @@ func (s *Server) Start(ctx context.Context) error {
 	})
 
 	// We can now add the node registry.
-	s.recorder.AddNode(s.registry, s.node.Descriptor, s.node.startedAt, s.cfg.AdvertiseAddr, s.cfg.HTTPAdvertiseAddr, s.cfg.SQLAdvertiseAddr)
+	s.recorder.AddNode(
+		s.registry,
+		s.node.Descriptor,
+		s.node.startedAt,
+		s.cfg.AdvertiseAddr,
+		s.cfg.HTTPAdvertiseAddr,
+		s.cfg.SQLAdvertiseAddr,
+		s.cfg.TenantAdvertiseAddr,
+	)
 
 	// Begin recording runtime statistics.
 	if err := s.startSampleEnvironment(ctx, base.DefaultMetricsSampleInterval); err != nil {
@@ -1478,6 +1504,9 @@ func (s *Server) Start(ctx context.Context) error {
 	})
 
 	s.grpc.setMode(modeOperational)
+	if s.tenantGRPC != nil {
+		s.tenantGRPC.setMode(modeOperational)
+	}
 
 	log.Infof(ctx, "starting %s server at %s (use: %s)",
 		s.cfg.HTTPRequestScheme(), s.cfg.HTTPAddr, s.cfg.HTTPAdvertiseAddr)
@@ -1652,10 +1681,6 @@ func (s *Server) Start(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to register engines with debug server")
 	}
 
-	// Start scheduled jobs daemon.
-	jobs.StartJobSchedulerDaemon(
-		ctx, s.stopper, &s.st.SV, jobs.ProdJobSchedulerEnv, s.db, s.sqlServer.internalExecutor)
-
 	log.Event(ctx, "server ready")
 	return nil
 }
@@ -1717,8 +1742,8 @@ func (s *Server) startListenRPCAndSQL(
 			return pgwire.Match(r)
 		})
 		// Also if the pg port is not split, the actual listen
-		// and advertise address for SQL become equal to that of RPC,
-		// regardless of what was configured.
+		// and advertise addresses for SQL become equal to that
+		// of RPC, regardless of what was configured.
 		s.cfg.SQLAddr = s.cfg.Addr
 		s.cfg.SQLAdvertiseAddr = s.cfg.AdvertiseAddr
 	}
@@ -1760,6 +1785,40 @@ func (s *Server) startListenRPCAndSQL(
 				netutil.FatalIfUnexpected(m.Serve())
 			})
 		})
+	}
+
+	if s.cfg.SplitListenTenant {
+		tenantL, err := listen(ctx, &s.cfg.TenantAddr, &s.cfg.TenantAdvertiseAddr, "tenant")
+		if err != nil {
+			return nil, nil, err
+		}
+		log.Eventf(ctx, "listening on tenant port %s", s.cfg.TenantAddr)
+
+		// The shutdown worker.
+		s.stopper.RunWorker(workersCtx, func(context.Context) {
+			<-s.stopper.ShouldQuiesce()
+			netutil.FatalIfUnexpected(tenantL.Close())
+			<-s.stopper.ShouldStop()
+			s.tenantGRPC.Stop()
+		})
+
+		// Compose startup functions.
+		startPrimaryRPCServer := startRPCServer
+		startTenantRPCServer := func(ctx context.Context) {
+			s.stopper.RunWorker(workersCtx, func(context.Context) {
+				netutil.FatalIfUnexpected(s.tenantGRPC.Serve(tenantL))
+			})
+		}
+		startRPCServer = func(ctx context.Context) {
+			startPrimaryRPCServer(ctx)
+			startTenantRPCServer(ctx)
+		}
+	} else {
+		// If the tenant port is not split, the actual listen and advertise
+		// addresses for tenant KV become equal to that of RPC, regardless
+		// of what was configured.
+		s.cfg.TenantAddr = s.cfg.Addr
+		s.cfg.TenantAdvertiseAddr = s.cfg.AdvertiseAddr
 	}
 
 	return pgL, startRPCServer, nil
@@ -1880,20 +1939,40 @@ func (s *sqlServer) startServeSQL(
 }
 
 // Decommission idempotently sets the decommissioning flag for specified nodes.
-func (s *Server) Decommission(ctx context.Context, setTo bool, nodeIDs []roachpb.NodeID) error {
-	eventLogger := sql.MakeEventLogger(s.sqlServer.execCfg)
-	eventType := sql.EventLogNodeDecommissioned
-	if !setTo {
-		eventType = sql.EventLogNodeRecommissioned
-	}
-	for _, nodeID := range nodeIDs {
-		changeCommitted, err := s.nodeLiveness.SetDecommissioning(ctx, nodeID, setTo)
-		if err != nil {
-			return errors.Wrapf(err, "during liveness update %d -> %t", nodeID, setTo)
+func (s *Server) Decommission(
+	ctx context.Context, targetStatus kvserverpb.MembershipStatus, nodeIDs []roachpb.NodeID,
+) error {
+	if !s.st.Version.IsActive(ctx, clusterversion.VersionNodeMembershipStatus) {
+		if targetStatus.Decommissioned() {
+			// In mixed-version cluster settings, we need to ensure that we're
+			// on-the-wire compatible with nodes only familiar with the boolean
+			// representation of membership state. We do the simple thing and
+			// simply disallow the setting of the fully decommissioned state until
+			// we're guaranteed to be on v20.2.
+			targetStatus = kvserverpb.MembershipStatus_DECOMMISSIONING
 		}
-		if changeCommitted {
+	}
+
+	eventLogger := sql.MakeEventLogger(s.sqlServer.execCfg)
+	var eventType sql.EventLogType
+	if targetStatus.Decommissioning() {
+		eventType = sql.EventLogNodeDecommissioning
+	} else if targetStatus.Decommissioned() {
+		eventType = sql.EventLogNodeDecommissioned
+	} else if targetStatus.Active() {
+		eventType = sql.EventLogNodeRecommissioned
+	} else {
+		panic("unexpected target membership status")
+	}
+
+	for _, nodeID := range nodeIDs {
+		statusChanged, err := s.nodeLiveness.SetMembershipStatus(ctx, nodeID, targetStatus)
+		if err != nil {
+			return err
+		}
+		if statusChanged {
 			// If we die right now or if this transaction fails to commit, the
-			// commissioning event will not be recorded to the event log. While we
+			// membership event will not be recorded to the event log. While we
 			// could insert the event record in the same transaction as the liveness
 			// update, this would force a 2PC and potentially leave write intents in
 			// the node liveness range. Better to make the event logging best effort

@@ -41,9 +41,10 @@ const (
 	DefaultHTTPPort = "8080"
 
 	// NB: net.JoinHostPort is not a constant.
-	defaultAddr     = ":" + DefaultPort
-	defaultHTTPAddr = ":" + DefaultHTTPPort
-	defaultSQLAddr  = ":" + DefaultPort
+	defaultAddr       = ":" + DefaultPort
+	defaultSQLAddr    = ":" + DefaultPort
+	defaultTenantAddr = ":" + DefaultPort
+	defaultHTTPAddr   = ":" + DefaultHTTPPort
 
 	// NetworkTimeout is the timeout used for network operations.
 	NetworkTimeout = 3 * time.Second
@@ -190,6 +191,18 @@ type Config struct {
 	// This is computed from SQLAddr if specified otherwise Addr.
 	SQLAdvertiseAddr string
 
+	// SplitListenTenant indicates whether to listen for tenant
+	// KV clients on a separate address from RPC requests.
+	SplitListenTenant bool
+
+	// TenantAddr is the configured tenant KV listen address.
+	// This is used if SplitListenTenant is set to true.
+	TenantAddr string
+
+	// TenantAdvertiseAddr is the advertised tenant KV address.
+	// This is computed from TenantAddr if specified otherwise Addr.
+	TenantAdvertiseAddr string
+
 	// HTTPAddr is the configured HTTP listen address.
 	HTTPAddr string
 
@@ -208,6 +221,15 @@ type Config struct {
 	// Enables the use of an PTP hardware clock user space API for HLC current time.
 	// This contains the path to the device to be used (i.e. /dev/ptp0)
 	ClockDevicePath string
+
+	// AutoInitializeCluster, if set, causes the server to bootstrap the
+	// cluster. Note that if two nodes are started with this flag set
+	// and also configured to join each other, each node will bootstrap
+	// its own unique cluster and the join will fail.
+	//
+	// The flag exists mostly for the benefit of tests, and for
+	// `cockroach start-single-node`.
+	AutoInitializeCluster bool
 }
 
 // HistogramWindowInterval is used to determine the approximate length of time
@@ -241,6 +263,9 @@ func (cfg *Config) InitDefaults() {
 	cfg.SplitListenSQL = false
 	cfg.SQLAddr = defaultSQLAddr
 	cfg.SQLAdvertiseAddr = cfg.SQLAddr
+	cfg.SplitListenTenant = false
+	cfg.TenantAddr = defaultTenantAddr
+	cfg.TenantAdvertiseAddr = cfg.TenantAddr
 	cfg.SSLCertsDir = DefaultCertsDirectory
 	cfg.RPCHeartbeatInterval = defaultRPCHeartbeatInterval
 	cfg.ClusterName = ""
@@ -532,7 +557,7 @@ func TempStorageConfigFromEnv(
 	} else {
 		monitorName = "temp disk storage"
 	}
-	monitor := mon.MakeMonitor(
+	monitor := mon.NewMonitor(
 		monitorName,
 		mon.DiskResource,
 		nil,             /* curCount */
@@ -544,7 +569,7 @@ func TempStorageConfigFromEnv(
 	monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
 	return TempStorageConfig{
 		InMemory: inMem,
-		Mon:      &monitor,
+		Mon:      monitor,
 		Spec:     useStore,
 	}
 }

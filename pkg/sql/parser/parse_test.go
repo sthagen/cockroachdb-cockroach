@@ -1460,6 +1460,8 @@ func TestParse(t *testing.T) {
 		{`BACKUP DATABASE foo TO ($1, $2)`},
 		{`BACKUP DATABASE foo TO ($1, $2) INCREMENTAL FROM 'baz'`},
 
+		{`BACKUP TENANT 36 TO 'bar'`},
+
 		{`RESTORE TABLE foo FROM 'bar'`},
 		{`EXPLAIN RESTORE TABLE foo FROM 'bar'`},
 		{`RESTORE TABLE foo FROM $1`},
@@ -1477,6 +1479,8 @@ func TestParse(t *testing.T) {
 		{`RESTORE DATABASE foo FROM $1, ($2, $3)`},
 		{`RESTORE DATABASE foo FROM ($1, $2), ($3, $4)`},
 		{`RESTORE DATABASE foo FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1'`},
+
+		{`RESTORE TENANT 36 FROM ($1, $2) AS OF SYSTEM TIME '1'`},
 
 		{`BACKUP TABLE foo TO 'bar' WITH revision_history, detached`},
 		{`RESTORE TABLE foo FROM 'bar' WITH key1, key2 = 'value'`},
@@ -1564,6 +1568,8 @@ func TestParse2(t *testing.T) {
 		{`CREATE INDEX ON a (b) INCLUDE (c)`, `CREATE INDEX ON a (b) STORING (c)`},
 
 		{`CREATE INDEX a ON b USING GIN (c)`,
+			`CREATE INVERTED INDEX a ON b (c)`},
+		{`CREATE INDEX a ON b USING GIST (c)`,
 			`CREATE INVERTED INDEX a ON b (c)`},
 		{`CREATE UNIQUE INDEX a ON b USING GIN (c)`,
 			`CREATE UNIQUE INVERTED INDEX a ON b (c)`},
@@ -2907,6 +2913,49 @@ EXPLAIN EXECUTE a
 HINT: try \h EXPLAIN`,
 		},
 		{
+			`EXPLAIN ANALYZE (PLAN) SELECT 1`,
+			`at or near "EOF": syntax error: EXPLAIN ANALYZE cannot be used with PLAN
+DETAIL: source SQL:
+EXPLAIN ANALYZE (PLAN) SELECT 1
+                               ^`,
+		},
+		{
+			`EXPLAIN (ANALYZE, PLAN) SELECT 1`,
+			`at or near "analyze": syntax error
+DETAIL: source SQL:
+EXPLAIN (ANALYZE, PLAN) SELECT 1
+         ^
+HINT: try \h <SELECTCLAUSE>`,
+		},
+		{
+			`EXPLAIN ANALYZE (OPT) SELECT 1`,
+			`at or near "EOF": syntax error: EXPLAIN ANALYZE cannot be used with OPT
+DETAIL: source SQL:
+EXPLAIN ANALYZE (OPT) SELECT 1
+                              ^`,
+		},
+		{
+			`EXPLAIN ANALYZE (VEC) SELECT 1`,
+			`at or near "EOF": syntax error: EXPLAIN ANALYZE cannot be used with VEC
+DETAIL: source SQL:
+EXPLAIN ANALYZE (VEC) SELECT 1
+                              ^`,
+		},
+		{
+			`EXPLAIN (DEBUG) SELECT 1`,
+			`at or near "EOF": syntax error: DEBUG flag can only be used with EXPLAIN ANALYZE
+DETAIL: source SQL:
+EXPLAIN (DEBUG) SELECT 1
+                        ^`,
+		},
+		{
+			`EXPLAIN (PLAN, DEBUG) SELECT 1`,
+			`at or near "EOF": syntax error: DEBUG flag can only be used with EXPLAIN ANALYZE
+DETAIL: source SQL:
+EXPLAIN (PLAN, DEBUG) SELECT 1
+                              ^`,
+		},
+		{
 			`SELECT $0`,
 			`lexical error: placeholder index must be between 1 and 65536
 DETAIL: source SQL:
@@ -3372,7 +3421,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar RESTRICT, DROP ATTRIBUTE foo`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
 
 		{`CREATE INDEX a ON b USING HASH (c)`, 0, `index using hash`, ``},
-		{`CREATE INDEX a ON b USING GIST (c)`, 0, `index using gist`, ``},
 		{`CREATE INDEX a ON b USING SPGIST (c)`, 0, `index using spgist`, ``},
 		{`CREATE INDEX a ON b USING BRIN (c)`, 0, `index using brin`, ``},
 

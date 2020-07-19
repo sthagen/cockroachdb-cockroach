@@ -153,11 +153,9 @@ var validationMap = []struct {
 	{
 		obj: ColumnDescriptor{},
 		fieldMap: map[string]validationStatusInfo{
-			"Name": {status: thisFieldReferencesNoObjects},
-			"ID":   {status: thisFieldReferencesNoObjects},
-			"Type": {
-				status: todoIAmKnowinglyAddingTechDebt,
-				reason: "initial import: TODO(rohan): add validation for custom types"},
+			"Name":     {status: thisFieldReferencesNoObjects},
+			"ID":       {status: thisFieldReferencesNoObjects},
+			"Type":     {status: iSolemnlySwearThisFieldIsValidated},
 			"Nullable": {status: thisFieldReferencesNoObjects},
 			"DefaultExpr": {
 				status: todoIAmKnowinglyAddingTechDebt,
@@ -194,6 +192,22 @@ var validationMap = []struct {
 			"OnDelete":          {status: thisFieldReferencesNoObjects},
 			"OnUpdate":          {status: thisFieldReferencesNoObjects},
 			"Match":             {status: thisFieldReferencesNoObjects},
+		},
+	},
+	{
+		obj: TypeDescriptor{},
+		fieldMap: map[string]validationStatusInfo{
+			"Name":             {status: iSolemnlySwearThisFieldIsValidated},
+			"ID":               {status: iSolemnlySwearThisFieldIsValidated},
+			"Version":          {status: thisFieldReferencesNoObjects},
+			"ModificationTime": {status: thisFieldReferencesNoObjects},
+			"DrainingNames":    {status: thisFieldReferencesNoObjects},
+			"ParentID":         {status: iSolemnlySwearThisFieldIsValidated},
+			"ParentSchemaID":   {status: iSolemnlySwearThisFieldIsValidated},
+			"Kind":             {status: thisFieldReferencesNoObjects},
+			"ArrayTypeID":      {status: iSolemnlySwearThisFieldIsValidated},
+			"EnumMembers":      {status: iSolemnlySwearThisFieldIsValidated},
+			"Alias":            {status: iSolemnlySwearThisFieldIsValidated},
 		},
 	},
 }

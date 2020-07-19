@@ -165,12 +165,10 @@ type CCLOnlyStatement interface {
 var _ CCLOnlyStatement = &Backup{}
 var _ CCLOnlyStatement = &ShowBackup{}
 var _ CCLOnlyStatement = &Restore{}
-var _ CCLOnlyStatement = &CreateRole{}
-var _ CCLOnlyStatement = &GrantRole{}
-var _ CCLOnlyStatement = &RevokeRole{}
 var _ CCLOnlyStatement = &CreateChangefeed{}
 var _ CCLOnlyStatement = &Import{}
 var _ CCLOnlyStatement = &Export{}
+var _ CCLOnlyStatement = &ScheduledBackup{}
 
 // StatementType implements the Statement interface.
 func (*AlterIndex) StatementType() StatementType { return DDL }
@@ -370,8 +368,6 @@ func (*CreateRole) StatementType() StatementType { return Ack }
 // StatementTag returns a short string identifying the type of statement.
 func (*CreateRole) StatementTag() string { return "CREATE ROLE" }
 
-func (*CreateRole) cclOnlyStatement() {}
-
 func (*CreateRole) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
@@ -500,8 +496,6 @@ func (*GrantRole) StatementType() StatementType { return DDL }
 // StatementTag returns a short string identifying the type of statement.
 func (*GrantRole) StatementTag() string { return "GRANT" }
 
-func (*GrantRole) cclOnlyStatement() {}
-
 // StatementType implements the Statement interface.
 func (n *Insert) StatementType() StatementType { return n.Returning.statementType() }
 
@@ -597,8 +591,6 @@ func (*RevokeRole) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*RevokeRole) StatementTag() string { return "REVOKE" }
-
-func (*RevokeRole) cclOnlyStatement() {}
 
 // StatementType implements the Statement interface.
 func (*RollbackToSavepoint) StatementType() StatementType { return Ack }

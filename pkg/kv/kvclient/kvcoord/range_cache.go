@@ -39,6 +39,8 @@ import (
 // RangeCache.
 type rangeCacheKey roachpb.RKey
 
+var maxCacheKey interface{} = rangeCacheKey(roachpb.RKeyMax)
+
 func (a rangeCacheKey) String() string {
 	return roachpb.Key(a).String()
 }
@@ -63,6 +65,7 @@ type RangeDescriptorDB interface {
 
 	// FirstRange returns the descriptor for the first Range. This is the
 	// Range containing all meta1 entries.
+	// TODO(nvanbenschoten): pull this detail in DistSender.
 	FirstRange() (*roachpb.RangeDescriptor, error)
 }
 
@@ -477,6 +480,44 @@ func (rdc *RangeDescriptorCache) Lookup(
 		return nil, err
 	}
 	return tok.entry, nil
+}
+
+// GetCachedOverlapping returns all the cached entries which overlap a given
+// span.
+func (rdc *RangeDescriptorCache) GetCachedOverlapping(
+	ctx context.Context, span roachpb.RSpan,
+) []*kvbase.RangeCacheEntry {
+	rdc.rangeCache.RLock()
+	defer rdc.rangeCache.RUnlock()
+	rawEntries := rdc.getCachedOverlappingRLocked(ctx, span)
+	entries := make([]*kvbase.RangeCacheEntry, len(rawEntries))
+	for i, e := range rawEntries {
+		entries[i] = rdc.getValue(e)
+	}
+	return entries
+}
+
+func (rdc *RangeDescriptorCache) getCachedOverlappingRLocked(
+	ctx context.Context, span roachpb.RSpan,
+) []*cache.Entry {
+	start := rangeCacheKey(keys.RangeMetaKey(span.Key).Next())
+	var res []*cache.Entry
+	// We iterate from the range meta key after RangeMetaKey(desc.StartKey) to the
+	// end of the key space and we stop when we hit a descriptor to the right of
+	// span. Notice the Next() we use for the start key to avoid clearing the
+	// descriptor that ends where span starts: for example, if we are inserting
+	// ["b", "c"), we should not evict ["a", "b").
+	rdc.rangeCache.cache.DoRangeEntry(func(e *cache.Entry) (exit bool) {
+		cached := rdc.getValue(e)
+		// Stop when we hit a descriptor to the right of span. The end key is
+		// exclusive, so if span is [a,b) and we hit [b,c), we stop.
+		if span.EndKey.Compare(cached.Desc.StartKey) <= 0 {
+			return true
+		}
+		res = append(res, e)
+		return false // continue iterating
+	}, start, maxCacheKey)
+	return res
 }
 
 // lookupInternal is called from Lookup or from tests.
@@ -894,7 +935,7 @@ func (rdc *RangeDescriptorCache) insertLockedInner(
 		// Before adding a new entry, make sure we clear out any
 		// pre-existing, overlapping entries which might have been
 		// re-inserted due to concurrent range lookups.
-		ok, newerEntry := rdc.clearOlderOverlapping(ctx, ent)
+		ok, newerEntry := rdc.clearOlderOverlappingLocked(ctx, ent)
 		if !ok {
 			// The descriptor we tried to insert is already in the cache, or is stale.
 			// We might have gotten a newer cache entry, if the descriptor in the
@@ -917,7 +958,15 @@ func (rdc *RangeDescriptorCache) getValue(entry *cache.Entry) *kvbase.RangeCache
 	return entry.Value.(*kvbase.RangeCacheEntry)
 }
 
-// clearOlderOverlapping clears any stale cache entries which overlap the
+func (rdc *RangeDescriptorCache) clearOlderOverlapping(
+	ctx context.Context, newEntry *kvbase.RangeCacheEntry,
+) (ok bool, newerEntry *kvbase.RangeCacheEntry) {
+	rdc.rangeCache.Lock()
+	defer rdc.rangeCache.Unlock()
+	return rdc.clearOlderOverlappingLocked(ctx, newEntry)
+}
+
+// clearOlderOverlappingLocked clears any stale cache entries which overlap the
 // specified descriptor. Returns true if the clearing succeeds, and false if any
 // overlapping newer descriptor is found (or if the descriptor we're trying to
 // insert is already in the cache). If false is returned, a cache entry might
@@ -927,66 +976,33 @@ func (rdc *RangeDescriptorCache) getValue(entry *cache.Entry) *kvbase.RangeCache
 //
 // Note that even if false is returned, older descriptors are still cleared from
 // the cache.
-func (rdc *RangeDescriptorCache) clearOlderOverlapping(
+func (rdc *RangeDescriptorCache) clearOlderOverlappingLocked(
 	ctx context.Context, newEntry *kvbase.RangeCacheEntry,
 ) (ok bool, newerEntry *kvbase.RangeCacheEntry) {
-	startMeta := keys.RangeMetaKey(newEntry.Desc.StartKey)
-	endMeta := keys.RangeMetaKey(newEntry.Desc.EndKey)
-	var entriesToEvict []*cache.Entry
+	log.VEventf(ctx, 2, "clearing entries overlapping %s", newEntry.Desc)
 	newest := true
-
-	// Try to clear the descriptor that covers the end key of desc, if any. For
-	// example, if we are inserting a [/Min, "m") descriptor, we should check if
-	// we should evict an existing [/Min, /Max) descriptor.
-	entry, ok := rdc.rangeCache.cache.CeilEntry(rangeCacheKey(endMeta))
-	if ok {
-		cached := rdc.getValue(entry)
-		// It might be possible that the range descriptor immediately following
-		// desc.EndKey does not contain desc.EndKey, so we explicitly check that it
-		// overlaps. For example, if we are inserting ["a", "c"), we don't want to
-		// check ["c", "d"). We do, however, want to check ["b", "c"), which is why
-		// the end key is inclusive.
-		if cached.Desc.StartKey.Less(newEntry.Desc.EndKey) && !cached.Desc.EndKey.Less(newEntry.Desc.EndKey) {
-			if newEntry.NewerThan(cached) {
-				entriesToEvict = append(entriesToEvict, entry)
-			} else {
-				// A newer descriptor already exists in cache.
-				newest = false
-
-				// If we found a similar, but newer, descriptor, return it. There's no
-				// point in continuing - there cannot be any other overlapping
-				// descriptors in the cache.
-				if descsCompatible(&cached.Desc, &newEntry.Desc) {
-					return false, cached
+	var newerFound *kvbase.RangeCacheEntry
+	overlapping := rdc.getCachedOverlappingRLocked(ctx, newEntry.Desc.RSpan())
+	for _, e := range overlapping {
+		entry := rdc.getValue(e)
+		if newEntry.NewerThan(entry) {
+			if log.V(2) {
+				log.Infof(ctx, "clearing overlapping descriptor: key=%s entry=%s", e.Key, rdc.getValue(e))
+			}
+			rdc.rangeCache.cache.DelEntry(e)
+		} else {
+			newest = false
+			if descsCompatible(&entry.Desc, &newEntry.Desc) {
+				newerFound = entry
+				// We've found a similar descriptor in the cache; there can't be any
+				// other overlapping ones so let's stop the iteration.
+				if len(overlapping) != 1 {
+					log.Errorf(ctx, "%s", errors.AssertionFailedf(
+						"found compatible descriptor but also got multiple overlapping results. newEntry: %s. overlapping: %s",
+						newEntry, overlapping).Error())
 				}
 			}
 		}
 	}
-
-	// Try to clear any descriptors whose end key is contained by the descriptor
-	// we are inserting. We iterate from the range meta key after
-	// RangeMetaKey(desc.StartKey) to RangeMetaKey(desc.EndKey) to avoid clearing
-	// the descriptor that ends when desc starts. For example, if we are
-	// inserting ["b", "c"), we should not evict ["a", "b").
-	//
-	// Descriptors could be cleared from the cache in the event of a merge or a
-	// lot of concurrency. For example, if ranges ["a", "b") and ["b", "c") are
-	// merged, we should clear both of these if we are inserting ["a", "c").
-	rdc.rangeCache.cache.DoRangeEntry(func(e *cache.Entry) bool {
-		cached := rdc.getValue(e)
-		if newEntry.NewerThan(cached) {
-			entriesToEvict = append(entriesToEvict, e)
-		} else {
-			newest = false
-		}
-		return false
-	}, rangeCacheKey(startMeta.Next()), rangeCacheKey(endMeta))
-
-	for _, e := range entriesToEvict {
-		if log.V(2) {
-			log.Infof(ctx, "clearing overlapping descriptor: key=%s entry=%s", e.Key, rdc.getValue(e))
-		}
-		rdc.rangeCache.cache.DelEntry(e)
-	}
-	return newest, nil
+	return newest, newerFound
 }

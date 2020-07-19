@@ -480,7 +480,7 @@ func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
 			pkOrdinals.Add(c.Ordinal)
 		}
 		// Add the rest of the columns in the table.
-		for i, n := 0, tt.DeletableColumnCount(); i < n; i++ {
+		for i, n := 0, tt.ColumnCount(); i < n; i++ {
 			if !pkOrdinals.Contains(i) {
 				idx.addColumnByOrdinal(tt, i, tree.Ascending, nonKeyCol)
 			}

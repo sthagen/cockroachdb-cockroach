@@ -71,31 +71,17 @@ func (ef *execFactory) ConstructValues(
 
 // ConstructScan is part of the exec.Factory interface.
 func (ef *execFactory) ConstructScan(
-	table cat.Table,
-	index cat.Index,
-	needed exec.TableColumnOrdinalSet,
-	indexConstraint *constraint.Constraint,
-	invertedConstraint invertedexpr.InvertedSpans,
-	hardLimit int64,
-	softLimit int64,
-	reverse bool,
-	maxResults uint64,
-	reqOrdering exec.OutputOrdering,
-	rowCount float64,
-	locking *tree.LockingItem,
+	table cat.Table, index cat.Index, params exec.ScanParams, reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
 	if table.IsVirtualTable() {
-		return ef.constructVirtualScan(
-			table, index, needed, indexConstraint, hardLimit, softLimit, reverse, maxResults,
-			reqOrdering, rowCount, locking,
-		)
+		return ef.constructVirtualScan(table, index, params, reqOrdering)
 	}
 
 	tabDesc := table.(*optTable).desc
 	indexDesc := index.(*optIndex).desc
 	// Create a scanNode.
 	scan := ef.planner.Scan()
-	colCfg := makeScanColumnsConfig(table, needed)
+	colCfg := makeScanColumnsConfig(table, params.NeededCols)
 
 	sb := span.MakeBuilder(ef.planner.ExecCfg().Codec, tabDesc.TableDesc(), indexDesc)
 
@@ -110,22 +96,21 @@ func (ef *execFactory) ConstructScan(
 		return nil, err
 	}
 
-	if indexConstraint != nil && indexConstraint.IsContradiction() {
+	if params.IndexConstraint != nil && params.IndexConstraint.IsContradiction() {
 		return newZeroNode(scan.resultColumns), nil
 	}
 
 	scan.index = indexDesc
-	scan.hardLimit = hardLimit
-	scan.softLimit = softLimit
+	scan.hardLimit = params.HardLimit
+	scan.softLimit = params.SoftLimit
 
-	scan.reverse = reverse
-	scan.maxResults = maxResults
-	scan.parallelScansEnabled = sqlbase.ParallelScans.Get(&ef.planner.extendedEvalCtx.Settings.SV)
+	scan.reverse = params.Reverse
+	scan.parallelize = params.Parallelize
 	var err error
-	if invertedConstraint != nil {
-		scan.spans, err = GenerateInvertedSpans(invertedConstraint, sb)
+	if params.InvertedConstraint != nil {
+		scan.spans, err = GenerateInvertedSpans(params.InvertedConstraint, sb)
 	} else {
-		scan.spans, err = sb.SpansFromConstraint(indexConstraint, needed, false /* forDelete */)
+		scan.spans, err = sb.SpansFromConstraint(params.IndexConstraint, params.NeededCols, false /* forDelete */)
 	}
 	if err != nil {
 		return nil, err
@@ -138,85 +123,21 @@ func (ef *execFactory) ConstructScan(
 		return nil, err
 	}
 	scan.reqOrdering = ReqOrdering(reqOrdering)
-	scan.estimatedRowCount = uint64(rowCount)
-	if locking != nil {
-		scan.lockingStrength = sqlbase.ToScanLockingStrength(locking.Strength)
-		scan.lockingWaitPolicy = sqlbase.ToScanLockingWaitPolicy(locking.WaitPolicy)
+	scan.estimatedRowCount = uint64(params.EstimatedRowCount)
+	if params.Locking != nil {
+		scan.lockingStrength = sqlbase.ToScanLockingStrength(params.Locking.Strength)
+		scan.lockingWaitPolicy = sqlbase.ToScanLockingWaitPolicy(params.Locking.WaitPolicy)
 	}
 	return scan, nil
 }
 
 func (ef *execFactory) constructVirtualScan(
-	table cat.Table,
-	index cat.Index,
-	needed exec.TableColumnOrdinalSet,
-	indexConstraint *constraint.Constraint,
-	hardLimit int64,
-	softLimit int64,
-	reverse bool,
-	maxResults uint64,
-	reqOrdering exec.OutputOrdering,
-	rowCount float64,
-	locking *tree.LockingItem,
+	table cat.Table, index cat.Index, params exec.ScanParams, reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
-	tn := &table.(*optVirtualTable).name
-	virtual, err := ef.planner.getVirtualTabler().getVirtualTableEntry(tn)
-	if err != nil {
-		return nil, err
-	}
-	indexDesc := index.(*optVirtualIndex).desc
-	columns, constructor := virtual.getPlanInfo(
-		table.(*optVirtualTable).desc.TableDesc(),
-		indexDesc, indexConstraint)
-
-	var n exec.Node
-	n = &delayedNode{
-		name:            fmt.Sprintf("%s@%s", table.Name(), index.Name()),
-		columns:         columns,
-		indexConstraint: indexConstraint,
-		constructor: func(ctx context.Context, p *planner) (planNode, error) {
-			return constructor(ctx, p, tn.Catalog())
-		},
-	}
-
-	// Check for explicit use of the dummy column.
-	if needed.Contains(0) {
-		return nil, errors.Errorf("use of %s column not allowed.", table.Column(0).ColName())
-	}
-	if locking != nil {
-		// We shouldn't have allowed SELECT FOR UPDATE for a virtual table.
-		return nil, errors.AssertionFailedf("locking cannot be used with virtual table")
-	}
-	if needed.Len() != len(columns) {
-		// We are selecting a subset of columns; we need a projection.
-		cols := make([]exec.NodeColumnOrdinal, 0, needed.Len())
-		colNames := make([]string, len(cols))
-		for ord, ok := needed.Next(0); ok; ord, ok = needed.Next(ord + 1) {
-			cols = append(cols, exec.NodeColumnOrdinal(ord-1))
-			colNames = append(colNames, columns[ord-1].Name)
-		}
-		n, err = ef.ConstructSimpleProject(n, cols, colNames, nil /* reqOrdering */)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if hardLimit != 0 {
-		n, err = ef.ConstructLimit(n, tree.NewDInt(tree.DInt(hardLimit)), nil /* offset */)
-		if err != nil {
-			return nil, err
-		}
-	}
-	// reqOrdering will be set if the optimizer expects that the output of the
-	// exec.Node that we're returning will actually have a legitimate ordering.
-	// Virtual indexes never provide a legitimate ordering, so we have to make
-	// sure to sort if we have a required ordering.
-	if len(reqOrdering) != 0 {
-		n, err = ef.ConstructSort(n, sqlbase.ColumnOrdering(reqOrdering), 0)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return n, nil
+	return constructVirtualScan(
+		ef, ef.planner, table, index, params, reqOrdering,
+		func(d *delayedNode) (exec.Node, error) { return d, nil },
+	)
 }
 
 func asDataSource(n exec.Node) planDataSource {
@@ -231,14 +152,6 @@ func asDataSource(n exec.Node) planDataSource {
 func (ef *execFactory) ConstructFilter(
 	n exec.Node, filter tree.TypedExpr, reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
-	// Push the filter into the scanNode. We cannot do this if the scanNode has a
-	// limit (it would make the limit apply AFTER the filter).
-	if s, ok := n.(*scanNode); ok && s.filter == nil && s.hardLimit == 0 {
-		s.filter = s.filterVars.Rebind(filter)
-		// Note: if the filter statically evaluates to true, s.filter stays nil.
-		s.reqOrdering = ReqOrdering(reqOrdering)
-		return s, nil
-	}
 	// Create a filterNode.
 	src := asDataSource(n)
 	f := &filterNode{
@@ -393,6 +306,63 @@ func (ef *execFactory) ConstructMergeJoin(
 	node.reqOrdering = ReqOrdering(reqOrdering)
 
 	return node, nil
+}
+
+// ConstructInterleavedJoin is part of the exec.Factory interface.
+func (ef *execFactory) ConstructInterleavedJoin(
+	joinType sqlbase.JoinType,
+	leftTable cat.Table,
+	leftIndex cat.Index,
+	leftParams exec.ScanParams,
+	leftFilter tree.TypedExpr,
+	rightTable cat.Table,
+	rightIndex cat.Index,
+	rightParams exec.ScanParams,
+	rightFilter tree.TypedExpr,
+	leftIsAncestor bool,
+	onCond tree.TypedExpr,
+	reqOrdering exec.OutputOrdering,
+) (exec.Node, error) {
+	n := &interleavedJoinNode{
+		joinType:       joinType,
+		leftIsAncestor: leftIsAncestor,
+	}
+
+	left, err := ef.ConstructScan(leftTable, leftIndex, leftParams, nil /* reqOrdering */)
+	if err != nil {
+		return nil, err
+	}
+	n.left = left.(*scanNode)
+
+	right, err := ef.ConstructScan(rightTable, rightIndex, rightParams, nil /* reqOrdering */)
+	if err != nil {
+		return nil, err
+	}
+	n.right = right.(*scanNode)
+
+	if leftFilter != nil {
+		f := &filterNode{
+			source: asDataSource(n.left),
+		}
+		ivarHelper := tree.MakeIndexedVarHelper(f, len(f.source.columns))
+		n.leftFilter = ivarHelper.Rebind(leftFilter)
+	}
+
+	if rightFilter != nil {
+		f := &filterNode{
+			source: asDataSource(n.right),
+		}
+		ivarHelper := tree.MakeIndexedVarHelper(f, len(f.source.columns))
+		n.rightFilter = ivarHelper.Rebind(rightFilter)
+	}
+
+	pred := makePredicate(joinType, n.left.resultColumns, n.right.resultColumns)
+	n.columns = pred.cols
+	n.onCond = pred.iVarHelper.Rebind(onCond)
+
+	n.reqOrdering = ReqOrdering(reqOrdering)
+
+	return n, nil
 }
 
 // ConstructScalarGroupBy is part of the exec.Factory interface.
@@ -1837,7 +1807,7 @@ func (rb *renderBuilder) setOutput(exprs tree.TypedExprs, columns sqlbase.Result
 // included if their ordinal position in the table schema is in the cols set.
 func makeColDescList(table cat.Table, cols exec.TableColumnOrdinalSet) []sqlbase.ColumnDescriptor {
 	colDescs := make([]sqlbase.ColumnDescriptor, 0, cols.Len())
-	for i, n := 0, table.DeletableColumnCount(); i < n; i++ {
+	for i, n := 0, table.ColumnCount(); i < n; i++ {
 		if !cols.Contains(i) {
 			continue
 		}

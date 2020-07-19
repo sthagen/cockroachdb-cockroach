@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 	"github.com/pmezard/go-difflib/difflib"
@@ -332,11 +333,11 @@ func runTestsWithTyps(
 				"non-nulls in the input tuples, we expect for all nulls injection to "+
 				"change the output")
 		}
-		if c, ok := originalOp.(IdempotentCloser); ok {
-			require.NoError(t, c.IdempotentClose(ctx))
+		if c, ok := originalOp.(Closer); ok {
+			require.NoError(t, c.Close(ctx))
 		}
-		if c, ok := opWithNulls.(IdempotentCloser); ok {
-			require.NoError(t, c.IdempotentClose(ctx))
+		if c, ok := opWithNulls.(Closer); ok {
+			require.NoError(t, c.Close(ctx))
 		}
 	})
 }
@@ -459,10 +460,10 @@ func runTestsWithoutAllNullsInjection(
 						assert.False(t, maybeHasNulls(b))
 					}
 				}
-				if c, ok := op.(IdempotentCloser); ok {
+				if c, ok := op.(Closer); ok {
 					// Some operators need an explicit Close if not drained completely of
 					// input.
-					assert.NoError(t, c.IdempotentClose(ctx))
+					assert.NoError(t, c.Close(ctx))
 				}
 			}
 		})
@@ -1285,6 +1286,7 @@ func (f *finiteChunksSource) Next(ctx context.Context) coldata.Batch {
 
 func TestOpTestInputOutput(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	inputs := []tuples{
 		{
 			{1, 2, 100},
@@ -1304,6 +1306,7 @@ func TestOpTestInputOutput(t *testing.T) {
 
 func TestRepeatableBatchSource(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	typs := []*types.T{types.Int}
 	batch := testAllocator.NewMemBatch(typs)
 	batchLen := 10
@@ -1328,6 +1331,7 @@ func TestRepeatableBatchSource(t *testing.T) {
 
 func TestRepeatableBatchSourceWithFixedSel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	typs := []*types.T{types.Int}
 	batch := testAllocator.NewMemBatch(typs)
 	rng, _ := randutil.NewPseudoRand()

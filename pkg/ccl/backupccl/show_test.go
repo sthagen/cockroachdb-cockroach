@@ -19,11 +19,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
 )
 
 func TestShowBackup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	const numAccounts = 11
 	_, tc, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitNone)
@@ -190,7 +192,6 @@ func TestShowBackup(t *testing.T) {
 				b INT8 NULL,
 				CONSTRAINT "primary" PRIMARY KEY (a ASC),
 				CONSTRAINT fk_b_ref_fksrc FOREIGN KEY (b) REFERENCES fksrc(a),
-				INDEX fkreftable_auto_index_fk_b_ref_fksrc (b ASC),
 				FAMILY "primary" (a, b)
 			)`
 		wantDiffDB := `CREATE TABLE fkreftable (
@@ -198,7 +199,6 @@ func TestShowBackup(t *testing.T) {
 				b INT8 NULL,
 				CONSTRAINT "primary" PRIMARY KEY (a ASC),
 				CONSTRAINT fk_b_ref_fksrc FOREIGN KEY (b) REFERENCES data.public.fksrc(a),
-				INDEX fkreftable_auto_index_fk_b_ref_fksrc (b ASC),
 				FAMILY "primary" (a, b)
 			)`
 
@@ -224,7 +224,6 @@ func TestShowBackup(t *testing.T) {
 				a INT8 NOT NULL,
 				b INT8 NULL,
 				CONSTRAINT "primary" PRIMARY KEY (a ASC),
-				INDEX fkreftable_auto_index_fk_b_ref_fksrc (b ASC),
 				FAMILY "primary" (a, b)
 			)`
 

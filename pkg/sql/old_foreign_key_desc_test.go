@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // The goal of this test is to validate a case that could happen in a
@@ -33,13 +34,14 @@ import (
 // old version descriptor and ensures that everything is OK.
 func TestOldForeignKeyRepresentationGetsUpgraded(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
-CREATE TABLE t.t1 (x INT);
+CREATE TABLE t.t1 (x INT, INDEX i (x));
 CREATE TABLE t.t2 (x INT, UNIQUE INDEX (x));
 ALTER TABLE t.t1 ADD CONSTRAINT fk1 FOREIGN KEY (x) REFERENCES t.t2 (x);
 CREATE INDEX ON t.t1 (x);
@@ -118,7 +120,7 @@ CREATE INDEX ON t.t1 (x);
 		t.Fatal(err)
 	}
 	// Run a DROP INDEX statement and ensure that the downgraded descriptor gets upgraded successfully.
-	if _, err := sqlDB.Exec(`DROP INDEX t.t1@t1_auto_index_fk1`); err != nil {
+	if _, err := sqlDB.Exec(`DROP INDEX t.t1@i`); err != nil {
 		t.Fatal(err)
 	}
 	desc = sqlbase.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t2")

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
@@ -66,6 +68,7 @@ func ensureRangeEqual(
 // or it contains the final value, but never a value in between.
 func TestEngineBatchCommit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	numWrites := 10000
 	key := mvccKey("a")
 	finalVal := []byte(strconv.Itoa(numWrites - 1))
@@ -126,6 +129,7 @@ func TestEngineBatchCommit(t *testing.T) {
 
 func TestEngineBatchStaleCachedIterator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	// Prevent regression of a bug which caused spurious MVCC errors due to an
 	// invalid optimization which let an iterator return key-value pairs which
 	// had since been deleted from the underlying engine.
@@ -207,6 +211,7 @@ func TestEngineBatchStaleCachedIterator(t *testing.T) {
 
 func TestEngineBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	for _, engineImpl := range mvccEngineImpls {
 		t.Run(engineImpl.name, func(t *testing.T) {
@@ -349,6 +354,7 @@ func TestEngineBatch(t *testing.T) {
 
 func TestEnginePutGetDelete(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	for _, engineImpl := range mvccEngineImpls {
 		t.Run(engineImpl.name, func(t *testing.T) {
@@ -434,6 +440,7 @@ func addMergeTimestamp(t *testing.T, data []byte, ts int64) []byte {
 // exhaustively in the merge tests themselves.
 func TestEngineMerge(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	engineBytes := make([][][]byte, len(mvccEngineImpls))
 	for engineIndex, engineImpl := range mvccEngineImpls {
@@ -525,6 +532,7 @@ func TestEngineMerge(t *testing.T) {
 
 func TestEngineMustExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	test := func(engineType enginepb.EngineType, errStr string) {
 		tempDir, dirCleanupFn := testutils.TempDir(t)
@@ -550,6 +558,7 @@ func TestEngineMustExist(t *testing.T) {
 
 func TestEngineTimeBound(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	for _, engineImpl := range mvccEngineImpls {
 		t.Run(engineImpl.name, func(t *testing.T) {
@@ -712,6 +721,7 @@ func TestEngineTimeBound(t *testing.T) {
 
 func TestFlushWithSSTables(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	for _, engineImpl := range mvccEngineImpls {
 		t.Run(engineImpl.name, func(t *testing.T) {
@@ -749,6 +759,7 @@ func TestFlushWithSSTables(t *testing.T) {
 
 func TestEngineScan1(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	for _, engineImpl := range mvccEngineImpls {
 		t.Run(engineImpl.name, func(t *testing.T) {
@@ -831,6 +842,7 @@ func verifyScan(start, end roachpb.Key, max int64, expKeys []MVCCKey, engine Eng
 
 func TestEngineScan2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	// TODO(Tobias): Merge this with TestEngineScan1 and remove
 	// either verifyScan or the other helper function.
 
@@ -901,6 +913,7 @@ func testEngineDeleteRange(t *testing.T, clearRange func(engine Engine, start, e
 
 func TestEngineDeleteRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testEngineDeleteRange(t, func(engine Engine, start, end MVCCKey) error {
 		return engine.ClearRange(start, end)
 	})
@@ -908,6 +921,7 @@ func TestEngineDeleteRange(t *testing.T) {
 
 func TestEngineDeleteRangeBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testEngineDeleteRange(t, func(engine Engine, start, end MVCCKey) error {
 		batch := engine.NewWriteOnlyBatch()
 		defer batch.Close()
@@ -925,6 +939,7 @@ func TestEngineDeleteRangeBatch(t *testing.T) {
 
 func TestEngineDeleteIterRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testEngineDeleteRange(t, func(engine Engine, start, end MVCCKey) error {
 		iter := engine.NewIterator(IterOptions{UpperBound: roachpb.KeyMax})
 		defer iter.Close()
@@ -934,6 +949,7 @@ func TestEngineDeleteIterRange(t *testing.T) {
 
 func TestSnapshot(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	for _, engineImpl := range mvccEngineImpls {
 		t.Run(engineImpl.name, func(t *testing.T) {
@@ -993,6 +1009,7 @@ func TestSnapshot(t *testing.T) {
 // engine operations.
 func TestSnapshotMethods(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	for _, engineImpl := range mvccEngineImpls {
 		t.Run(engineImpl.name, func(t *testing.T) {
@@ -1092,6 +1109,7 @@ func insertKeysAndValues(keys []MVCCKey, values [][]byte, engine Engine, t *test
 
 func TestCreateCheckpoint(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	dir, cleanup := testutils.TempDir(t)
 	defer cleanup()
@@ -1124,6 +1142,7 @@ func TestCreateCheckpoint(t *testing.T) {
 
 func TestIngestDelayLimit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	s := cluster.MakeTestingClusterSettings()
 
 	max, ramp := time.Second*5, time.Second*5/10
@@ -1153,6 +1172,7 @@ func (s stringSorter) Less(i int, j int) bool { return strings.Compare(s[i], s[j
 
 func TestEngineFS(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	for _, engineImpl := range mvccEngineImpls {
 		t.Run(engineImpl.name, func(t *testing.T) {
@@ -1363,6 +1383,7 @@ var engineRealFSImpls = []engineImpl{
 
 func TestEngineFSFileNotFoundError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	for _, engineImpl := range engineRealFSImpls {
 		t.Run(engineImpl.name, func(t *testing.T) {
@@ -1421,8 +1442,69 @@ func TestEngineFSFileNotFoundError(t *testing.T) {
 	}
 }
 
+// TestSupportPrev tests that SupportsPrev works as expected.
+func TestSupportsPrev(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	opts := IterOptions{LowerBound: keys.MinKey, UpperBound: keys.MaxKey}
+	type engineTest struct {
+		engineIterSupportsPrev   bool
+		batchIterSupportsPrev    bool
+		snapshotIterSupportsPrev bool
+	}
+	runTest := func(t *testing.T, eng Engine, et engineTest) {
+		t.Run("engine", func(t *testing.T) {
+			it := eng.NewIterator(opts)
+			defer it.Close()
+			require.Equal(t, et.engineIterSupportsPrev, it.SupportsPrev())
+		})
+		t.Run("batch", func(t *testing.T) {
+			batch := eng.NewBatch()
+			defer batch.Close()
+			batchIt := batch.NewIterator(opts)
+			defer batchIt.Close()
+			require.Equal(t, et.batchIterSupportsPrev, batchIt.SupportsPrev())
+		})
+		t.Run("snapshot", func(t *testing.T) {
+			snap := eng.NewSnapshot()
+			defer snap.Close()
+			snapIt := snap.NewIterator(opts)
+			defer snapIt.Close()
+			require.Equal(t, et.snapshotIterSupportsPrev, snapIt.SupportsPrev())
+		})
+	}
+	t.Run("pebble", func(t *testing.T) {
+		eng := newPebbleInMem(context.Background(), roachpb.Attributes{}, 1<<20)
+		defer eng.Close()
+		runTest(t, eng, engineTest{
+			engineIterSupportsPrev:   true,
+			batchIterSupportsPrev:    true,
+			snapshotIterSupportsPrev: true,
+		})
+	})
+	t.Run("rocksdb", func(t *testing.T) {
+		eng := newRocksDBInMem(roachpb.Attributes{}, 1<<20)
+		defer eng.Close()
+		runTest(t, eng, engineTest{
+			engineIterSupportsPrev:   true,
+			batchIterSupportsPrev:    false,
+			snapshotIterSupportsPrev: true,
+		})
+	})
+	t.Run("tee", func(t *testing.T) {
+		eng := newTeeInMem(context.Background(), roachpb.Attributes{}, 1<<20)
+		defer eng.Close()
+		runTest(t, eng, engineTest{
+			engineIterSupportsPrev:   true,
+			batchIterSupportsPrev:    false,
+			snapshotIterSupportsPrev: true,
+		})
+	})
+}
+
 func TestFS(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	var engineImpls []engineImpl
 	engineImpls = append(engineImpls, engineRealFSImpls...)

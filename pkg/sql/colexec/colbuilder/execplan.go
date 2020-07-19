@@ -387,7 +387,7 @@ func (r opResult) createDiskBackedSort(
 				args.FDSemaphore,
 				diskAccount,
 			)
-			r.ToClose = append(r.ToClose, es.(colexec.IdempotentCloser))
+			r.ToClose = append(r.ToClose, es.(colexec.Closer))
 			return es
 		},
 		args.TestingKnobs.SpillingCallbackFn,
@@ -470,6 +470,7 @@ func (r opResult) createAndWrapRowSource(
 	// own, so the used memory will be accounted for.
 	r.Op, r.IsStreaming = c, true
 	r.MetadataSources = append(r.MetadataSources, c)
+	r.ToClose = append(r.ToClose, c)
 	return nil
 }
 
@@ -839,7 +840,7 @@ func NewColOperator(
 							args.TestingKnobs.DelegateFDAcquisitions,
 							diskAccount,
 						)
-						result.ToClose = append(result.ToClose, ehj.(colexec.IdempotentCloser))
+						result.ToClose = append(result.ToClose, ehj.(colexec.Closer))
 						return ehj
 					},
 					args.TestingKnobs.SpillingCallbackFn,
@@ -908,7 +909,7 @@ func NewColOperator(
 			}
 
 			result.Op = mj
-			result.ToClose = append(result.ToClose, mj.(colexec.IdempotentCloser))
+			result.ToClose = append(result.ToClose, mj.(colexec.Closer))
 			result.ColumnTypes = make([]*types.T, len(leftTypes)+len(rightTypes))
 			copy(result.ColumnTypes, leftTypes)
 			if !core.MergeJoiner.Type.ShouldIncludeRightColsInOutput() {
@@ -1025,8 +1026,8 @@ func NewColOperator(
 					)
 					// NewRelativeRankOperator sometimes returns a constOp when there
 					// are no ordering columns, so we check that the returned operator
-					// is an IdempotentCloser.
-					if c, ok := result.Op.(colexec.IdempotentCloser); ok {
+					// is an Closer.
+					if c, ok := result.Op.(colexec.Closer); ok {
 						result.ToClose = append(result.ToClose, c)
 					}
 				default:
@@ -1282,7 +1283,7 @@ func (r opResult) createBufferingUnlimitedMemAccount(
 func (r opResult) createStandaloneMemAccount(
 	ctx context.Context, flowCtx *execinfra.FlowCtx, name string,
 ) *mon.BoundAccount {
-	standaloneMemMonitor := mon.MakeMonitor(
+	standaloneMemMonitor := mon.NewMonitor(
 		name+"-standalone",
 		mon.MemoryResource,
 		nil,           /* curCount */
@@ -1291,7 +1292,7 @@ func (r opResult) createStandaloneMemAccount(
 		math.MaxInt64, /* noteworthy */
 		flowCtx.Cfg.Settings,
 	)
-	r.OpMonitors = append(r.OpMonitors, &standaloneMemMonitor)
+	r.OpMonitors = append(r.OpMonitors, standaloneMemMonitor)
 	standaloneMemMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
 	standaloneMemAccount := standaloneMemMonitor.MakeBoundAccount()
 	r.OpAccounts = append(r.OpAccounts, &standaloneMemAccount)
@@ -1945,21 +1946,23 @@ func planLogicalProjectionOp(
 	input = colexec.NewBatchSchemaSubsetEnforcer(allocator, input, typs, resultIdx, len(typs))
 	switch expr.(type) {
 	case *tree.AndExpr:
-		outputOp = colexec.NewAndProjOp(
+		outputOp, err = colexec.NewAndProjOp(
 			allocator,
 			input, leftProjOpChain, rightProjOpChain,
 			leftFeedOp, rightFeedOp,
+			typs[leftIdx], typs[rightIdx],
 			leftIdx, rightIdx, resultIdx,
 		)
 	case *tree.OrExpr:
-		outputOp = colexec.NewOrProjOp(
+		outputOp, err = colexec.NewOrProjOp(
 			allocator,
 			input, leftProjOpChain, rightProjOpChain,
 			leftFeedOp, rightFeedOp,
+			typs[leftIdx], typs[rightIdx],
 			leftIdx, rightIdx, resultIdx,
 		)
 	}
-	return outputOp, resultIdx, typs, internalMemUsedLeft + internalMemUsedRight, nil
+	return outputOp, resultIdx, typs, internalMemUsedLeft + internalMemUsedRight, err
 }
 
 // planIsNullProjectionOp plans the operator for IS NULL and IS NOT NULL

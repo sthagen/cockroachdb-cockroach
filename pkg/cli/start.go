@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -77,9 +78,7 @@ part of the same cluster. The other nodes do not need to be started
 yet, and if the address of the other nodes to be added are not yet
 known it is legal for the first node to join itself.
 
-If --join is not specified, the cluster will also be initialized.
-THIS BEHAVIOR IS DEPRECATED; consider using 'cockroach init' or
-'cockroach start-single-node' instead.
+To initialize the cluster, use 'cockroach init'.
 `,
 	Example: `  cockroach start --insecure --store=attrs=ssd,path=/mnt/ssd1 --join=host:port,[host:port]`,
 	Args:    cobra.NoArgs,
@@ -209,7 +208,7 @@ func initMemProfile(ctx context.Context, dir string) {
 	}()
 }
 
-func initCPUProfile(ctx context.Context, dir string) {
+func initCPUProfile(ctx context.Context, dir string, st *cluster.Settings) {
 	const cpuprof = "cpuprof."
 	gcProfiles(dir, cpuprof, maxSizePerProfile)
 
@@ -240,33 +239,31 @@ func initCPUProfile(ctx context.Context, dir string) {
 		}()
 
 		for {
-			func() {
+			// Grab a profile.
+			if err := debug.CPUProfileDo(st, cluster.CPUProfileDefault, func() error {
 				const format = "2006-01-02T15_04_05.999"
-				suffix := timeutil.Now().Add(cpuProfileInterval).Format(format)
-				f, err := os.Create(filepath.Join(dir, cpuprof+suffix))
-				if err != nil {
-					log.Warningf(ctx, "error creating go cpu file %s", err)
-					return
+
+				var buf bytes.Buffer
+				// Start the new profile. Write to a buffer so we can name the file only
+				// when we know the time at end of profile.
+				if err := pprof.StartCPUProfile(&buf); err != nil {
+					return err
 				}
 
-				// Stop the current profile if it exists.
-				if currentProfile != nil {
-					pprof.StopCPUProfile()
-					currentProfile.Close()
-					currentProfile = nil
-					gcProfiles(dir, cpuprof, maxSizePerProfile)
-				}
+				<-t.C
 
-				// Start the new profile.
-				if err := pprof.StartCPUProfile(f); err != nil {
-					log.Warningf(ctx, "unable to start cpu profile: %v", err)
-					f.Close()
-					return
-				}
-				currentProfile = f
-			}()
+				pprof.StopCPUProfile()
 
-			<-t.C
+				suffix := timeutil.Now().Format(format)
+				if err := ioutil.WriteFile(filepath.Join(dir, cpuprof+suffix), buf.Bytes(), 0644); err != nil {
+					return err
+				}
+				gcProfiles(dir, cpuprof, maxSizePerProfile)
+				return nil
+			}); err != nil {
+				// Log errors, but continue. There's always next time.
+				log.Infof(ctx, "error during CPU profile: %s", err)
+			}
 		}
 	}()
 }
@@ -447,8 +444,13 @@ func runStartSingleNode(cmd *cobra.Command, args []string) error {
 		return errCannotUseJoin
 	}
 	// Now actually set the flag as changed so that the start code
-	// doesn't warn that it was not set.
+	// doesn't warn that it was not set. This is all to let `start-single-node`
+	// get by without the use of --join flags.
 	joinFlag.Changed = true
+
+	// Make the node auto-init the cluster if not done already.
+	serverCfg.AutoInitializeCluster = true
+
 	return runStart(cmd, args, true /*disableReplication*/)
 }
 
@@ -461,9 +463,8 @@ func runStartJoin(cmd *cobra.Command, args []string) error {
 // of other active nodes used to join this node to the cockroach
 // cluster, if this is its first time connecting.
 //
-// If the argument disableReplication is true and we are starting
-// a fresh cluster, the replication factor will be disabled in
-// all zone configs.
+// If the argument disableReplication is set the replication factor
+// will be set to 1 all zone configs.
 func runStart(cmd *cobra.Command, args []string, disableReplication bool) error {
 	tBegin := timeutil.Now()
 
@@ -493,6 +494,22 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 	// signals later, some startup logging might be lost.
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, drainSignals...)
+
+	// SIGQUIT is handled differently: for SIGQUIT we spawn a goroutine
+	// and we always handle it, no matter at which point during
+	// execution we are. This makes it possible to use SIGQUIT to
+	// inspect a running process and determine what it is currently
+	// doing, even if it gets stuck somewhere.
+	if quitSignal != nil {
+		quitSignalCh := make(chan os.Signal, 1)
+		signal.Notify(quitSignalCh, quitSignal)
+		go func() {
+			for {
+				<-quitSignalCh
+				log.DumpStacks(context.Background())
+			}
+		}()
+	}
 
 	// Set up a cancellable context for the entire start command.
 	// The context will be canceled at the end.
@@ -539,9 +556,10 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 
 	// Check the --join flag.
 	if !flagSetForCmd(cmd).Lookup(cliflags.Join.Name).Changed {
-		log.Shout(ctx, log.Severity_WARNING,
-			"running 'cockroach start' without --join is deprecated.\n"+
-				"Consider using 'cockroach start-single-node' or 'cockroach init' instead.")
+		err := errors.WithHint(
+			errors.New("no --join flags provided to 'cockroach start'"),
+			"Consider using 'cockroach init' or 'cockroach start-single-node' instead")
+		return err
 	}
 
 	// Now perform additional configuration tweaks specific to the start
@@ -938,9 +956,6 @@ If problems persist, please see %s.`
 			}
 			msgDouble := "Note: a second interrupt will skip graceful shutdown and terminate forcefully"
 			fmt.Fprintln(os.Stdout, msgDouble)
-
-		case quitSignal:
-			log.DumpStacks(shutdownCtx)
 		}
 
 		// Start the draining process in a separate goroutine so that it
@@ -1050,11 +1065,6 @@ If problems persist, please see %s.`
 				// the graceful shutdown.
 				log.Infof(shutdownCtx, "received additional signal '%s'; continuing graceful shutdown", sig)
 				continue
-			case quitSignal:
-				// A SIGQUIT is received during the "graceful shutdown" phase
-				// initiated by another signal. Take this as a request to get
-				// the stacks at this point.
-				log.DumpStacks(shutdownCtx)
 			}
 
 			// This new signal is not welcome, as it interferes with the graceful
@@ -1314,7 +1324,7 @@ func setupAndInitializeLoggingAndProfiling(
 	log.Infof(ctx, "%s", info.Short())
 
 	initMemProfile(ctx, outputDirectory)
-	initCPUProfile(ctx, outputDirectory)
+	initCPUProfile(ctx, outputDirectory, serverCfg.Settings)
 	initBlockProfile()
 	initMutexProfile()
 

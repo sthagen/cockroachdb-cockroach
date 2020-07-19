@@ -297,7 +297,7 @@ func isSQLCommand(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "sql", "dump", "workload", "nodelocal":
+	case "sql", "dump", "workload", "nodelocal", "userfile", "statement-diag":
 		return true
 	case "node":
 		if len(args) == 0 {
@@ -1265,6 +1265,7 @@ func Example_sql_table() {
 
 func TestRenderHTML(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	cols := []string{"colname"}
 	align := "d"
@@ -1393,6 +1394,7 @@ func Example_cert() {
 // help template does not break.
 func TestFlagUsage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	expUsage := `Usage:
   cockroach [command]
@@ -1403,11 +1405,13 @@ Available Commands:
   init              initialize a cluster
   cert              create ca, node, and client certs
   sql               open a sql shell
+  statement-diag    commands for managing statement diagnostics bundles
   auth-session      log in and out of HTTP sessions
   node              list, inspect, drain or remove nodes
   dump              dump sql tables
 
   nodelocal         upload and delete nodelocal files
+  userfile          upload and delete user scoped files
   demo              open a demo sql shell
   gen               generate auxiliary files
   version           output version information
@@ -1520,7 +1524,7 @@ func Example_node() {
 func TestCLITimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	c := newCLITest(cliTestParams{})
+	c := newCLITest(cliTestParams{t: t})
 	defer c.cleanup()
 
 	// Wrap the meat of the test in a retry loop. Setting a timeout like this is
@@ -1794,6 +1798,7 @@ func extractFields(line string) ([]string, error) {
 
 func TestGenMan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Generate man pages in a temp directory.
 	manpath, err := ioutil.TempDir("", "TestGenMan")
@@ -1827,6 +1832,7 @@ func TestGenMan(t *testing.T) {
 
 func TestGenAutocomplete(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Get a unique path to which we can write our autocomplete files.
 	acdir, err := ioutil.TempDir("", "TestGenAutoComplete")

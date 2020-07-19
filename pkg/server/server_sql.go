@@ -27,11 +27,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -70,6 +72,7 @@ type sqlServer struct {
 	internalExecutor *sql.InternalExecutor
 	leaseMgr         *lease.Manager
 	blobService      *blobs.Service
+	tenantProxy      kvtenant.Proxy
 	// sessionRegistry can be queried for info on running SQL sessions. It is
 	// shared between the sql.Server and the statusServer.
 	sessionRegistry        *sql.SessionRegistry
@@ -94,11 +97,13 @@ type sqlServerOptionalArgs struct {
 	// DistSQL uses rpcContext to set up flows. Less centrally, the executor
 	// also uses rpcContext in a number of places to learn whether the server
 	// is running insecure, and to read the cluster name.
+	// TODO(nvanbenschoten): move off this struct.
 	rpcContext *rpc.Context
 
 	// SQL mostly uses the DistSender "wrapped" under a *kv.DB, but SQL also
 	// uses range descriptors and leaseholders, which DistSender maintains,
 	// for debugging and DistSQL planning purposes.
+	// TODO(nvanbenschoten): move off this struct.
 	distSender *kvcoord.DistSender
 	// statusServer gives access to the Status service.
 	statusServer serverpb.OptionalStatusServer
@@ -109,19 +114,25 @@ type sqlServerOptionalArgs struct {
 	// diagnostics registry, and the lease manager.
 	gossip gossip.DeprecatedGossip
 	// Used by DistSQLConfig and DistSQLPlanner.
+	// TODO(nvanbenschoten): move off this struct.
 	nodeDialer *nodedialer.Dialer
 	// To register blob and DistSQL servers.
 	grpcServer *grpc.Server
 	// Used by executorConfig.
 	recorder *status.MetricsRecorder
 	// For the temporaryObjectCleaner.
-	isMeta1Leaseholder func(hlc.Timestamp) (bool, error)
+	isMeta1Leaseholder func(context.Context, hlc.Timestamp) (bool, error)
 	// DistSQL, lease management, and others want to know the node they're on.
 	nodeIDContainer *base.SQLIDContainer
 
 	// Used by backup/restore.
 	externalStorage        cloud.ExternalStorageFactory
 	externalStorageFromURI cloud.ExternalStorageFromURIFactory
+
+	// TODO(nvanbenschoten): Move to a second "optional" args struct. One for
+	// dependencies that are only available if the SQL server runs NOT as part
+	// of a KV node.
+	tenantProxy kvtenant.Proxy
 }
 
 type sqlServerArgs struct {
@@ -230,7 +241,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 
 	// We do not set memory monitors or a noteworthy limit because the children of
 	// this monitor will be setting their own noteworthy limits.
-	rootSQLMemoryMonitor := mon.MakeMonitor(
+	rootSQLMemoryMonitor := mon.NewMonitor(
 		"root",
 		mon.MemoryResource,
 		nil,           /* curCount */
@@ -244,11 +255,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	// bulkMemoryMonitor is the parent to all child SQL monitors tracking bulk
 	// operations (IMPORT, index backfill). It is itself a child of the
 	// ParentMemoryMonitor.
-	bulkMemoryMonitor := mon.MakeMonitorInheritWithLimit("bulk-mon", 0 /* limit */, &rootSQLMemoryMonitor)
+	bulkMemoryMonitor := mon.NewMonitorInheritWithLimit("bulk-mon", 0 /* limit */, rootSQLMemoryMonitor)
 	bulkMetrics := bulk.MakeBulkMetrics(cfg.HistogramWindowInterval())
 	cfg.registry.AddMetricStruct(bulkMetrics)
 	bulkMemoryMonitor.SetMetrics(bulkMetrics.CurBytesCount, bulkMetrics.MaxBytesHist)
-	bulkMemoryMonitor.Start(context.Background(), &rootSQLMemoryMonitor, mon.BoundAccount{})
+	bulkMemoryMonitor.Start(context.Background(), rootSQLMemoryMonitor, mon.BoundAccount{})
 
 	// Set up the DistSQL temp engine.
 
@@ -307,13 +318,13 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		VecFDSemaphore: semaphore.New(envutil.EnvOrDefaultInt("COCKROACH_VEC_MAX_OPEN_FDS", colexec.VecMaxOpenFDsLimit)),
 		DiskMonitor:    cfg.TempStorageConfig.Mon,
 
-		ParentMemoryMonitor: &rootSQLMemoryMonitor,
+		ParentMemoryMonitor: rootSQLMemoryMonitor,
 		BulkAdder: func(
 			ctx context.Context, db *kv.DB, ts hlc.Timestamp, opts kvserverbase.BulkAdderOptions,
 		) (kvserverbase.BulkAdder, error) {
 			// Attach a child memory monitor to enable control over the BulkAdder's
 			// memory usage.
-			bulkMon := execinfra.NewMonitor(ctx, &bulkMemoryMonitor, fmt.Sprintf("bulk-adder-monitor"))
+			bulkMon := execinfra.NewMonitor(ctx, bulkMemoryMonitor, fmt.Sprintf("bulk-adder-monitor"))
 			return bulk.MakeBulkAdder(ctx, db, cfg.distSender.RangeDescriptorCache(), cfg.Settings, ts, opts, bulkMon)
 		},
 
@@ -326,6 +337,8 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 
 		ExternalStorage:        cfg.externalStorage,
 		ExternalStorageFromURI: cfg.externalStorageFromURI,
+
+		RangeCache: cfg.distSender.RangeDescriptorCache(),
 	}
 	cfg.TempStorageConfig.Mon.SetMetrics(distSQLMetrics.CurDiskBytesCount, distSQLMetrics.MaxDiskBytesHist)
 	if distSQLTestingKnobs := cfg.TestingKnobs.DistSQL; distSQLTestingKnobs != nil {
@@ -462,6 +475,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	} else {
 		execCfg.SchemaChangerTestingKnobs = new(sql.SchemaChangerTestingKnobs)
 	}
+	if sqlTypeSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLTypeSchemaChanger; sqlTypeSchemaChangerTestingKnobs != nil {
+		execCfg.TypeSchemaChangerTestingKnobs = sqlTypeSchemaChangerTestingKnobs.(*sql.TypeSchemaChangerTestingKnobs)
+	} else {
+		execCfg.TypeSchemaChangerTestingKnobs = new(sql.TypeSchemaChangerTestingKnobs)
+	}
 	if gcJobTestingKnobs := cfg.TestingKnobs.GCJob; gcJobTestingKnobs != nil {
 		execCfg.GCJobTestingKnobs = gcJobTestingKnobs.(*sql.GCJobTestingKnobs)
 	} else {
@@ -481,6 +499,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	if tenantKnobs := cfg.TestingKnobs.TenantTestingKnobs; tenantKnobs != nil {
 		execCfg.TenantTestingKnobs = tenantKnobs.(*sql.TenantTestingKnobs)
 	}
+	distSQLCfg.TestingKnobs.JobsTestingKnobs = cfg.TestingKnobs.JobsTestingKnobs
 
 	statsRefresher := stats.MakeRefresher(
 		cfg.Settings,
@@ -498,7 +517,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		cfg.Config,
 		cfg.Settings,
 		sqlMemMetrics,
-		&rootSQLMemoryMonitor,
+		rootSQLMemoryMonitor,
 		cfg.HistogramWindowInterval(),
 		execCfg,
 	)
@@ -557,6 +576,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		internalExecutor:        cfg.circularInternalExecutor,
 		leaseMgr:                leaseMgr,
 		blobService:             blobService,
+		tenantProxy:             cfg.tenantProxy,
 		sessionRegistry:         cfg.sessionRegistry,
 		jobRegistry:             jobRegistry,
 		statsRefresher:          statsRefresher,
@@ -577,6 +597,14 @@ func (s *sqlServer) start(
 	socketFile string,
 	orphanedLeasesTimeThresholdNanos int64,
 ) error {
+	// If necessary, start the tenant proxy first, to ensure all other
+	// components can properly route to KV nodes.
+	if s.tenantProxy != nil {
+		if err := s.tenantProxy.Start(ctx); err != nil {
+			return err
+		}
+	}
+
 	s.temporaryObjectCleaner.Start(ctx, stopper)
 	s.distSQLServer.Start()
 	s.pgServer.Start(ctx, stopper)
@@ -662,6 +690,24 @@ func (s *sqlServer) start(
 	// Delete all orphaned table leases created by a prior instance of this
 	// node. This also uses SQL.
 	s.leaseMgr.DeleteOrphanedLeases(orphanedLeasesTimeThresholdNanos)
+
+	// Start scheduled jobs daemon.
+	jobs.StartJobSchedulerDaemon(
+		ctx,
+		stopper,
+		&scheduledjobs.JobExecutionConfig{
+			Settings:         s.execCfg.Settings,
+			InternalExecutor: s.internalExecutor,
+			DB:               s.execCfg.DB,
+			TestingKnobs:     knobs.JobsTestingKnobs,
+			PlanHookMaker: func(opName string, txn *kv.Txn, user string) (interface{}, func()) {
+				// This is a hack to get around a Go package dependency cycle. See comment
+				// in sql/jobs/registry.go on planHookMaker.
+				return sql.NewInternalPlanner(opName, txn, user, &sql.MemoryMetrics{}, s.execCfg)
+			},
+		},
+		scheduledjobs.ProdJobSchedulerEnv,
+	)
 
 	return nil
 }

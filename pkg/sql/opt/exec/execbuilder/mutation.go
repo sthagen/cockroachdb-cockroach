@@ -274,7 +274,8 @@ func (b *Builder) buildUpdate(upd *memo.UpdateExpr) (execPlan, error) {
 	//
 	// TODO(andyk): Using ensureColumns here can result in an extra Render.
 	// Upgrade execution engine to not require this.
-	cnt := len(upd.FetchCols) + len(upd.UpdateCols) + len(upd.PassthroughCols) + len(upd.CheckCols)
+	cnt := len(upd.FetchCols) + len(upd.UpdateCols) + len(upd.PassthroughCols) +
+		len(upd.CheckCols) + len(upd.PartialIndexPutCols) + len(upd.PartialIndexDelCols)
 	colList := make(opt.ColList, 0, cnt)
 	colList = appendColsWhenPresent(colList, upd.FetchCols)
 	colList = appendColsWhenPresent(colList, upd.UpdateCols)
@@ -286,6 +287,8 @@ func (b *Builder) buildUpdate(upd *memo.UpdateExpr) (execPlan, error) {
 		colList = appendColsWhenPresent(colList, upd.PassthroughCols)
 	}
 	colList = appendColsWhenPresent(colList, upd.CheckCols)
+	colList = appendColsWhenPresent(colList, upd.PartialIndexPutCols)
+	colList = appendColsWhenPresent(colList, upd.PartialIndexDelCols)
 
 	input, err := b.buildMutationInput(upd, upd.Input, colList, &upd.MutationPrivate)
 	if err != nil {
@@ -699,7 +702,7 @@ func mutationOutputColMap(mutation memo.RelExpr) opt.ColMap {
 
 	var colMap opt.ColMap
 	ord := 0
-	for i, n := 0, tab.DeletableColumnCount(); i < n; i++ {
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
 		colID := private.Table.ColumnID(i)
 		if outCols.Contains(colID) {
 			colMap.Set(int(colID), ord)

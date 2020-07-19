@@ -330,6 +330,9 @@ func newInterleavedReaderJoiner(
 			numAncestorPKCols = len(index.ColumnIDs)
 		}
 
+		if table.Post.Limit != 0 || table.Post.Offset != 0 {
+			return nil, errors.AssertionFailedf("interleaved joiner cannot be used with limits")
+		}
 		if err := tables[i].post.Init(
 			&table.Post, table.Desc.ColumnTypes(), flowCtx.NewEvalCtx(), nil, /*output*/
 		); err != nil {
@@ -432,7 +435,6 @@ func (irj *interleavedReaderJoiner) initRowFetcher(
 		flowCtx.Codec(),
 		reverseScan,
 		lockStr,
-		true, /* returnRangeInfo */
 		true, /* isCheck */
 		alloc,
 		args...,
@@ -453,7 +455,7 @@ func (irj *interleavedReaderJoiner) generateMeta(
 	var trailingMeta []execinfrapb.ProducerMetadata
 	nodeID, ok := irj.FlowCtx.NodeID.OptionalNodeID()
 	if ok {
-		ranges := execinfra.MisplannedRanges(ctx, irj.fetcher.GetRangesInfo(), nodeID)
+		ranges := execinfra.MisplannedRanges(irj.Ctx, irj.allSpans, nodeID, irj.FlowCtx.Cfg.RangeCache)
 		if ranges != nil {
 			trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
 		}

@@ -532,12 +532,13 @@ lookup-join  ·                      ·
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM t WHERE k % 2 = 0
 ----
-·     distribution  local        ·       ·
-·     vectorized    true         ·       ·
-scan  ·             ·            (k, v)  ·
-·     table         t@primary    ·       ·
-·     spans         FULL SCAN    ·       ·
-·     filter        (k % 2) = 0  ·       ·
+·          distribution  local        ·       ·
+·          vectorized    true         ·       ·
+filter     ·             ·            (k, v)  ·
+ │         filter        (k % 2) = 0  ·       ·
+ └── scan  ·             ·            (k, v)  ·
+·          table         t@primary    ·       ·
+·          spans         FULL SCAN    ·       ·
 
 query TTT
 EXPLAIN VALUES (1, 2, 3), (4, 5, 6)
@@ -645,15 +646,6 @@ scan  ·             ·          (k int, v int)  ·
 ·     spans         FULL SCAN  ·               ·
 
 query TTTTT
-EXPLAIN (TYPES,SYMVARS) SELECT k FROM t
-----
-·     distribution  local      ·        ·
-·     vectorized    true       ·        ·
-scan  ·             ·          (k int)  ·
-·     table         t@primary  ·        ·
-·     spans         FULL SCAN  ·        ·
-
-query TTTTT
 EXPLAIN (TYPES,VERBOSE) SELECT k FROM t
 ----
 ·     distribution  local      ·        ·
@@ -665,12 +657,13 @@ scan  ·             ·          (k int)  ·
 query TTTTT
 EXPLAIN (TYPES) SELECT * FROM t WHERE v > 123
 ----
-·     distribution  local                          ·               ·
-·     vectorized    true                           ·               ·
-scan  ·             ·                              (k int, v int)  ·
-·     table         t@primary                      ·               ·
-·     spans         FULL SCAN                      ·               ·
-·     filter        ((v)[int] > (123)[int])[bool]  ·               ·
+·          distribution  local                          ·               ·
+·          vectorized    true                           ·               ·
+filter     ·             ·                              (k int, v int)  ·
+ │         filter        ((v)[int] > (123)[int])[bool]  ·               ·
+ └── scan  ·             ·                              (k int, v int)  ·
+·          table         t@primary                      ·               ·
+·          spans         FULL SCAN                      ·               ·
 
 query TTTTT
 EXPLAIN (TYPES) VALUES (1, 2, 3), (4, 5, 6)
@@ -699,39 +692,41 @@ render       ·             ·                               (z int, v int)     
 query TTTTT
 EXPLAIN (TYPES) DELETE FROM t WHERE v > 1
 ----
-·                    distribution  local                        ·               ·
-·                    vectorized    false                        ·               ·
-count                ·             ·                            ()              ·
- └── delete          ·             ·                            ()              ·
-      │              from          t                            ·               ·
-      │              strategy      deleter                      ·               ·
-      │              auto commit   ·                            ·               ·
-      └── render     ·             ·                            (k int)         ·
-           │         render 0      (k)[int]                     ·               ·
-           └── scan  ·             ·                            (k int, v int)  ·
-·                    table         t@primary                    ·               ·
-·                    spans         FULL SCAN                    ·               ·
-·                    filter        ((v)[int] > (1)[int])[bool]  ·               ·
+·                         distribution  local                        ·               ·
+·                         vectorized    false                        ·               ·
+count                     ·             ·                            ()              ·
+ └── delete               ·             ·                            ()              ·
+      │                   from          t                            ·               ·
+      │                   strategy      deleter                      ·               ·
+      │                   auto commit   ·                            ·               ·
+      └── render          ·             ·                            (k int)         ·
+           │              render 0      (k)[int]                     ·               ·
+           └── filter     ·             ·                            (k int, v int)  ·
+                │         filter        ((v)[int] > (1)[int])[bool]  ·               ·
+                └── scan  ·             ·                            (k int, v int)  ·
+·                         table         t@primary                    ·               ·
+·                         spans         FULL SCAN                    ·               ·
 
 query TTTTT
 EXPLAIN (TYPES) UPDATE t SET v = k + 1 WHERE v > 123
 ----
-·                    distribution  local                          ·                          ·
-·                    vectorized    false                          ·                          ·
-count                ·             ·                              ()                         ·
- └── update          ·             ·                              ()                         ·
-      │              table         t                              ·                          ·
-      │              set           v                              ·                          ·
-      │              strategy      updater                        ·                          ·
-      │              auto commit   ·                              ·                          ·
-      └── render     ·             ·                              (k int, v int, v_new int)  ·
-           │         render 0      (k)[int]                       ·                          ·
-           │         render 1      (v)[int]                       ·                          ·
-           │         render 2      ((k)[int] + (1)[int])[int]     ·                          ·
-           └── scan  ·             ·                              (k int, v int)             ·
-·                    table         t@primary                      ·                          ·
-·                    spans         FULL SCAN                      ·                          ·
-·                    filter        ((v)[int] > (123)[int])[bool]  ·                          ·
+·                         distribution  local                          ·                          ·
+·                         vectorized    false                          ·                          ·
+count                     ·             ·                              ()                         ·
+ └── update               ·             ·                              ()                         ·
+      │                   table         t                              ·                          ·
+      │                   set           v                              ·                          ·
+      │                   strategy      updater                        ·                          ·
+      │                   auto commit   ·                              ·                          ·
+      └── render          ·             ·                              (k int, v int, v_new int)  ·
+           │              render 0      (k)[int]                       ·                          ·
+           │              render 1      (v)[int]                       ·                          ·
+           │              render 2      ((k)[int] + (1)[int])[int]     ·                          ·
+           └── filter     ·             ·                              (k int, v int)             ·
+                │         filter        ((v)[int] > (123)[int])[bool]  ·                          ·
+                └── scan  ·             ·                              (k int, v int)             ·
+·                         table         t@primary                      ·                          ·
+·                         spans         FULL SCAN                      ·                          ·
 
 query TTTTT
 EXPLAIN (TYPES) VALUES (1) UNION VALUES (2)
@@ -782,12 +777,13 @@ CREATE TABLE tt (x INT, y INT, INDEX a(x), INDEX b(y))
 query TTTTT
 EXPLAIN (TYPES) SELECT * FROM tt WHERE x < 10 AND y > 10
 ----
-·     distribution  local                                                                      ·               ·
-·     vectorized    true                                                                       ·               ·
-scan  ·             ·                                                                          (x int, y int)  ·
-·     table         tt@primary                                                                 ·               ·
-·     spans         FULL SCAN                                                                  ·               ·
-·     filter        ((((x)[int] < (10)[int])[bool]) AND (((y)[int] > (10)[int])[bool]))[bool]  ·               ·
+·          distribution  local                                                                      ·               ·
+·          vectorized    true                                                                       ·               ·
+filter     ·             ·                                                                          (x int, y int)  ·
+ │         filter        ((((x)[int] < (10)[int])[bool]) AND (((y)[int] > (10)[int])[bool]))[bool]  ·               ·
+ └── scan  ·             ·                                                                          (x int, y int)  ·
+·          table         tt@primary                                                                 ·               ·
+·          spans         FULL SCAN                                                                  ·               ·
 
 # TODO(radu): we don't support placeholders with no values.
 #query TTTTT
@@ -947,7 +943,7 @@ inner-join (hash)
  ├── columns: a:1 b:2 k:4 v:5
  ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
  ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(4)=99, null(4)=0]
- ├── cost: 2219.95
+ ├── cost: 2219.96
  ├── fd: (4)-->(5), (1)==(4), (4)==(1)
  ├── prune: (2,5)
  ├── scan tc
@@ -988,7 +984,7 @@ sort
  ├── columns: a:1 b:2  [hidden: column4:4]
  ├── immutable
  ├── stats: [rows=333.333333]
- ├── cost: 1179.25548
+ ├── cost: 1179.26548
  ├── fd: (1,2)-->(4)
  ├── ordering: +4
  ├── prune: (1,2,4)
@@ -997,7 +993,7 @@ sort
       ├── columns: column4:4 a:1 b:2
       ├── immutable
       ├── stats: [rows=333.333333]
-      ├── cost: 1116.70667
+      ├── cost: 1116.71667
       ├── fd: (1,2)-->(4)
       ├── prune: (1,2,4)
       ├── interesting orderings: (+1)
@@ -1005,7 +1001,7 @@ sort
       │    ├── columns: a:1 b:2
       │    ├── immutable
       │    ├── stats: [rows=333.333333]
-      │    ├── cost: 1110.03
+      │    ├── cost: 1110.04
       │    ├── interesting orderings: (+1)
       │    ├── scan tc
       │    │    ├── columns: a:1 b:2
@@ -1025,7 +1021,7 @@ sort
  ├── columns: a:1(int) b:2(int)  [hidden: column4:4(int)]
  ├── immutable
  ├── stats: [rows=333.333333]
- ├── cost: 1179.25548
+ ├── cost: 1179.26548
  ├── fd: (1,2)-->(4)
  ├── ordering: +4
  ├── prune: (1,2,4)
@@ -1034,7 +1030,7 @@ sort
       ├── columns: column4:4(int) a:1(int) b:2(int)
       ├── immutable
       ├── stats: [rows=333.333333]
-      ├── cost: 1116.70667
+      ├── cost: 1116.71667
       ├── fd: (1,2)-->(4)
       ├── prune: (1,2,4)
       ├── interesting orderings: (+1)
@@ -1042,7 +1038,7 @@ sort
       │    ├── columns: a:1(int) b:2(int)
       │    ├── immutable
       │    ├── stats: [rows=333.333333]
-      │    ├── cost: 1110.03
+      │    ├── cost: 1110.04
       │    ├── interesting orderings: (+1)
       │    ├── scan tc
       │    │    ├── columns: a:1(int) b:2(int)

@@ -251,34 +251,20 @@ func (t *pebbleTimeBoundPropCollector) Name() string {
 	return "TimeBoundTblPropCollectorFactory"
 }
 
-var _ pebble.NeedCompacter = &pebbleDeleteRangeCollector{}
+// pebbleDeleteRangeCollector is the equivalent table collector as the RocksDB
+// DeleteRangeTblPropCollector. Pebble does not require it because Pebble will
+// prioritize its own compactions of range tombstones.
+type pebbleDeleteRangeCollector struct{}
 
-// pebbleDeleteRangeCollector marks an sstable for compaction that contains a
-// range tombstone.
-type pebbleDeleteRangeCollector struct {
-	numRangeTombstones int
-}
-
-func (c *pebbleDeleteRangeCollector) Add(key pebble.InternalKey, value []byte) error {
-	if key.Kind() == pebble.InternalKeyKindRangeDelete {
-		c.numRangeTombstones++
-	}
+func (pebbleDeleteRangeCollector) Add(_ pebble.InternalKey, _ []byte) error {
 	return nil
 }
 
-// NeedCompact implements the pebble.NeedCompacter interface.
-func (c *pebbleDeleteRangeCollector) NeedCompact() bool {
-	// NB: Mark any file containing range deletions as requiring a
-	// compaction. This ensures that range deletions are quickly compacted out
-	// of existence.
-	return c.numRangeTombstones > 0
-}
-
-func (*pebbleDeleteRangeCollector) Finish(userProps map[string]string) error {
+func (pebbleDeleteRangeCollector) Finish(_ map[string]string) error {
 	return nil
 }
 
-func (*pebbleDeleteRangeCollector) Name() string {
+func (pebbleDeleteRangeCollector) Name() string {
 	// This constant needs to match the one used by the RocksDB version of this
 	// table property collector. DO NOT CHANGE.
 	return "DeleteRangeTblPropCollectorFactory"
@@ -314,10 +300,6 @@ func DefaultPebbleOptions() *pebble.Options {
 		TablePropertyCollectors:     PebbleTablePropertyCollectors,
 	}
 	opts.Experimental.L0SublevelCompactions = true
-	// This value for FlushSplitBytes was arrived through some experimentation
-	// with TPCC import performance. More experimentation might be needed to
-	// optimize this for other workloads.
-	opts.Experimental.FlushSplitBytes = 10 << 20 // 10 MB
 	// Automatically flush 10s after the first range tombstone is added to a
 	// memtable. This ensures that we can reclaim space even when there's no
 	// activity on the database generating flushes.
@@ -334,6 +316,12 @@ func DefaultPebbleOptions() *pebble.Options {
 		}
 		l.EnsureDefaults()
 	}
+
+	// Set the value for FlushSplitBytes to 2x the L0 TargetFileSize. This
+	// should generally create flush split keys after every pair of
+	// L0 files. The 2x factor helps to reduce some cases of excessive flush
+	// splitting, and the overhead that comes with that.
+	opts.Experimental.FlushSplitBytes = 2 * opts.Levels[0].TargetFileSize
 
 	// Do not create bloom filters for the last level (i.e. the largest level
 	// which contains data in the LSM store). This configuration reduces the size

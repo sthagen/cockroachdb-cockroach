@@ -239,6 +239,11 @@ var insertFastPathClusterMode = settings.RegisterBoolSetting(
 	true,
 )
 
+var planInterleavedJoins = settings.RegisterBoolSetting(
+	"sql.distsql.interleaved_joins.enabled",
+	"if set we plan interleaved table joins instead of merge joins when possible",
+	true,
+)
 var experimentalAlterColumnTypeGeneralMode = settings.RegisterBoolSetting(
 	"sql.defaults.experimental_alter_column_type.enabled",
 	"default value for experimental_alter_column_type session setting; "+
@@ -651,13 +656,14 @@ type ExecutorConfig struct {
 	InternalExecutor *InternalExecutor
 	QueryCache       *querycache.C
 
-	TestingKnobs              ExecutorTestingKnobs
-	PGWireTestingKnobs        *PGWireTestingKnobs
-	SchemaChangerTestingKnobs *SchemaChangerTestingKnobs
-	GCJobTestingKnobs         *GCJobTestingKnobs
-	DistSQLRunTestingKnobs    *execinfra.TestingKnobs
-	EvalContextTestingKnobs   tree.EvalContextTestingKnobs
-	TenantTestingKnobs        *TenantTestingKnobs
+	TestingKnobs                  ExecutorTestingKnobs
+	PGWireTestingKnobs            *PGWireTestingKnobs
+	SchemaChangerTestingKnobs     *SchemaChangerTestingKnobs
+	TypeSchemaChangerTestingKnobs *TypeSchemaChangerTestingKnobs
+	GCJobTestingKnobs             *GCJobTestingKnobs
+	DistSQLRunTestingKnobs        *execinfra.TestingKnobs
+	EvalContextTestingKnobs       tree.EvalContextTestingKnobs
+	TenantTestingKnobs            *TenantTestingKnobs
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval.
 	HistogramWindowInterval time.Duration
 
@@ -2073,6 +2079,10 @@ func (m *sessionDataMutator) SetImplicitSelectForUpdate(val bool) {
 
 func (m *sessionDataMutator) SetInsertFastPath(val bool) {
 	m.data.InsertFastPath = val
+}
+
+func (m *sessionDataMutator) SetInterleavedJoins(val bool) {
+	m.data.InterleavedJoins = val
 }
 
 func (m *sessionDataMutator) SetSerialNormalizationMode(val sessiondata.SerialNormalizationMode) {

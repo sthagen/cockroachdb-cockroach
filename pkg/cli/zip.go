@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -378,6 +379,68 @@ func runDebugZip(cmd *cobra.Command, args []string) (retErr error) {
 			livenessByNodeID = lresponse.Statuses
 		}
 
+		// Collect CPU profiles in parallel over all nodes (this is useful since
+		// these profiles contain profiler labels, which can then be correlated
+		// across nodes). Do this first and in isolation, before other zip
+		// operations possibly influence the node.
+		if zipCtx.cpuProfDuration > 0 {
+			var wg sync.WaitGroup
+			type profData struct {
+				data []byte
+				err  error
+			}
+
+			// NB: this takes care not to produce non-deterministic log output.
+			resps := make([]profData, len(nodeList))
+			for i := range nodeList {
+				if livenessByNodeID[nodeList[i].Desc.NodeID] == kvserverpb.NodeLivenessStatus_DECOMMISSIONED {
+					continue
+				}
+				wg.Add(1)
+				go func(ctx context.Context, i int) {
+					defer wg.Done()
+
+					secs := int32(zipCtx.cpuProfDuration / time.Second)
+					if secs < 1 {
+						secs = 1
+					}
+
+					var pd profData
+					err := contextutil.RunWithTimeout(ctx, "fetch cpu profile", timeout+zipCtx.cpuProfDuration, func(ctx context.Context) error {
+						resp, err := status.Profile(ctx, &serverpb.ProfileRequest{
+							NodeId:  fmt.Sprintf("%d", nodeList[i].Desc.NodeID),
+							Type:    serverpb.ProfileRequest_CPU,
+							Seconds: secs,
+						})
+						if err != nil {
+							return err
+						}
+						pd = profData{data: resp.Data}
+						return nil
+					})
+					if err != nil {
+						resps[i] = profData{err: err}
+					} else {
+						resps[i] = pd
+					}
+				}(baseCtx, i)
+			}
+
+			fmt.Print("requesting CPU profiles... ")
+			wg.Wait()
+			fmt.Println("ok")
+
+			for i, pd := range resps {
+				if len(pd.data) == 0 && pd.err == nil {
+					continue // skipped node
+				}
+				prefix := fmt.Sprintf("%s/%s", nodesPrefix, fmt.Sprintf("%d", nodeList[i].Desc.NodeID))
+				if err := z.createRawOrError(prefix+"/cpu.pprof", pd.data, pd.err); err != nil {
+					return err
+				}
+			}
+		}
+
 		for _, node := range nodeList {
 			nodeID := node.Desc.NodeID
 
@@ -414,12 +477,7 @@ func runDebugZip(cmd *cobra.Command, args []string) (retErr error) {
 			// not work and if it doesn't, we let the invalid curSQLConn get
 			// used anyway so that anything that does *not* need it will
 			// still happen.
-			sqlAddr := node.Desc.SQLAddress
-			if sqlAddr.IsEmpty() {
-				// No SQL address: either a pre-19.2 node, or same address for both
-				// SQL and RPC.
-				sqlAddr = node.Desc.Address
-			}
+			sqlAddr := node.Desc.CheckedSQLAddress()
 			curSQLConn := guessNodeURL(sqlConn.url, sqlAddr.AddressField)
 			if err := z.createJSON(prefix+"/status.json", node); err != nil {
 				return err
@@ -685,6 +743,16 @@ func runDebugZip(cmd *cobra.Command, args []string) (retErr error) {
 					}
 				}
 			}
+		}
+	}
+
+	// Add a little helper script to draw attention to the existence of tags in
+	// the profiles.
+	{
+		if err := z.createRaw(base+"/pprof-summary.sh", []byte(`#!/bin/sh
+find . -name cpu.pprof | xargs go tool pprof -tags
+`)); err != nil {
+			return err
 		}
 	}
 

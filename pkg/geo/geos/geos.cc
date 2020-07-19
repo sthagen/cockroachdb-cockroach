@@ -83,10 +83,17 @@ typedef int (*CR_GEOS_BufferParams_setSingleSided_r)(CR_GEOS_Handle, CR_GEOS_Buf
 typedef CR_GEOS_Geometry (*CR_GEOS_BufferWithParams_r)(CR_GEOS_Handle, CR_GEOS_Geometry,
                                                        CR_GEOS_BufferParams, double width);
 
+typedef char (*CR_GEOS_isValid_r)(CR_GEOS_Handle, CR_GEOS_Geometry);
+typedef char* (*CR_GEOS_isValidReason_r)(CR_GEOS_Handle, CR_GEOS_Geometry);
+typedef char (*CR_GEOS_isValidDetail_r)(CR_GEOS_Handle, CR_GEOS_Geometry, int flags, char** reason,
+                                        CR_GEOS_Geometry* loc);
+typedef CR_GEOS_Geometry (*CR_GEOS_MakeValid_r)(CR_GEOS_Handle, CR_GEOS_Geometry);
+
 typedef int (*CR_GEOS_Area_r)(CR_GEOS_Handle, CR_GEOS_Geometry, double*);
 typedef int (*CR_GEOS_Length_r)(CR_GEOS_Handle, CR_GEOS_Geometry, double*);
 
 typedef CR_GEOS_Geometry (*CR_GEOS_Centroid_r)(CR_GEOS_Handle, CR_GEOS_Geometry);
+typedef CR_GEOS_Geometry (*CR_GEOS_ConvexHull_r)(CR_GEOS_Handle, CR_GEOS_Geometry);
 typedef CR_GEOS_Geometry (*CR_GEOS_Union_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
 typedef CR_GEOS_Geometry (*CR_GEOS_Intersection_r)(CR_GEOS_Handle, CR_GEOS_Geometry,
                                                    CR_GEOS_Geometry);
@@ -100,6 +107,7 @@ typedef char (*CR_GEOS_Covers_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geome
 typedef char (*CR_GEOS_CoveredBy_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
 typedef char (*CR_GEOS_Contains_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
 typedef char (*CR_GEOS_Crosses_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
+typedef char (*CR_GEOS_Disjoint_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
 typedef char (*CR_GEOS_Equals_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
 typedef char (*CR_GEOS_Intersects_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
 typedef char (*CR_GEOS_Overlaps_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
@@ -158,10 +166,16 @@ struct CR_GEOS {
   CR_GEOS_WKBReader_destroy_r GEOSWKBReader_destroy_r;
   CR_GEOS_WKBReader_read_r GEOSWKBReader_read_r;
 
+  CR_GEOS_isValid_r GEOSisValid_r;
+  CR_GEOS_isValidReason_r GEOSisValidReason_r;
+  CR_GEOS_isValidDetail_r GEOSisValidDetail_r;
+  CR_GEOS_MakeValid_r GEOSMakeValid_r;
+
   CR_GEOS_Area_r GEOSArea_r;
   CR_GEOS_Length_r GEOSLength_r;
 
   CR_GEOS_Centroid_r GEOSGetCentroid_r;
+  CR_GEOS_ConvexHull_r GEOSConvexHull_r;
   CR_GEOS_Union_r GEOSUnion_r;
   CR_GEOS_PointOnSurface_r GEOSPointOnSurface_r;
   CR_GEOS_Intersection_r GEOSIntersection_r;
@@ -174,6 +188,7 @@ struct CR_GEOS {
   CR_GEOS_CoveredBy_r GEOSCoveredBy_r;
   CR_GEOS_Contains_r GEOSContains_r;
   CR_GEOS_Crosses_r GEOSCrosses_r;
+  CR_GEOS_Disjoint_r GEOSDisjoint_r;
   CR_GEOS_Equals_r GEOSEquals_r;
   CR_GEOS_Intersects_r GEOSIntersects_r;
   CR_GEOS_Overlaps_r GEOSOverlaps_r;
@@ -229,9 +244,14 @@ struct CR_GEOS {
     INIT(GEOSGeomTypeId_r);
     INIT(GEOSSetSRID_r);
     INIT(GEOSGetSRID_r);
+    INIT(GEOSisValid_r);
+    INIT(GEOSisValidReason_r);
+    INIT(GEOSisValidDetail_r);
+    INIT(GEOSMakeValid_r);
     INIT(GEOSArea_r);
     INIT(GEOSLength_r);
     INIT(GEOSGetCentroid_r);
+    INIT(GEOSConvexHull_r);
     INIT(GEOSUnion_r);
     INIT(GEOSPointOnSurface_r);
     INIT(GEOSIntersection_r);
@@ -241,6 +261,7 @@ struct CR_GEOS {
     INIT(GEOSCoveredBy_r);
     INIT(GEOSContains_r);
     INIT(GEOSCrosses_r);
+    INIT(GEOSDisjoint_r);
     INIT(GEOSEquals_r);
     INIT(GEOSIntersects_r);
     INIT(GEOSOverlaps_r);
@@ -514,6 +535,102 @@ CR_GEOS_Status CR_GEOS_Length(CR_GEOS* lib, CR_GEOS_Slice a, double* ret) {
 }
 
 //
+// Validity checking.
+//
+
+CR_GEOS_Status CR_GEOS_IsValid(CR_GEOS* lib, CR_GEOS_Slice g, char* ret) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+  auto geom = CR_GEOS_GeometryFromSlice(lib, handle, g);
+  *ret = 0;
+  if (geom != nullptr) {
+    auto r = lib->GEOSisValid_r(handle, geom);
+    if (r == 2) {
+      if (error.length() == 0) {
+        error.assign(CR_GEOS_NO_ERROR_DEFINED_MESSAGE);
+      }
+    } else {
+      *ret = r;
+    }
+    lib->GEOSGeom_destroy_r(handle, geom);
+  }
+  lib->GEOS_finish_r(handle);
+  return toGEOSString(error.data(), error.length());
+}
+
+CR_GEOS_Status CR_GEOS_IsValidReason(CR_GEOS* lib, CR_GEOS_Slice g, CR_GEOS_String* ret) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+  auto geom = CR_GEOS_GeometryFromSlice(lib, handle, g);
+  *ret = {.data = NULL, .len = 0};
+  if (geom != nullptr) {
+    auto r = lib->GEOSisValidReason_r(handle, geom);
+    if (r != NULL) {
+      *ret = toGEOSString(r, strlen(r));
+      lib->GEOSFree_r(handle, r);
+    }
+    lib->GEOSGeom_destroy_r(handle, geom);
+  }
+  lib->GEOS_finish_r(handle);
+  return toGEOSString(error.data(), error.length());
+}
+
+CR_GEOS_Status CR_GEOS_IsValidDetail(CR_GEOS* lib, CR_GEOS_Slice g, int flags, char* retIsValid,
+                                     CR_GEOS_String* retReason, CR_GEOS_String* retLocationEWKB) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+  auto geom = CR_GEOS_GeometryFromSlice(lib, handle, g);
+  *retReason = {.data = NULL, .len = 0};
+  *retLocationEWKB = {.data = NULL, .len = 0};
+  if (geom != nullptr) {
+    char* reason = NULL;
+    CR_GEOS_Geometry loc = NULL;
+    auto r = lib->GEOSisValidDetail_r(handle, geom, flags, &reason, &loc);
+
+    if (r == 2) {
+      if (error.length() == 0) {
+        error.assign(CR_GEOS_NO_ERROR_DEFINED_MESSAGE);
+      }
+    } else {
+      *retIsValid = r;
+    }
+
+    if (reason != NULL) {
+      *retReason = toGEOSString(reason, strlen(reason));
+      lib->GEOSFree_r(handle, reason);
+    }
+
+    if (loc != NULL) {
+      auto srid = lib->GEOSGetSRID_r(handle, geom);
+      CR_GEOS_writeGeomToEWKB(lib, handle, loc, retLocationEWKB, srid);
+      lib->GEOSGeom_destroy_r(handle, loc);
+    }
+
+    lib->GEOSGeom_destroy_r(handle, geom);
+  }
+  lib->GEOS_finish_r(handle);
+  return toGEOSString(error.data(), error.length());
+}
+
+CR_GEOS_Status CR_GEOS_MakeValid(CR_GEOS* lib, CR_GEOS_Slice g, CR_GEOS_String* validEWKB) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+  auto geom = CR_GEOS_GeometryFromSlice(lib, handle, g);
+  *validEWKB = {.data = NULL, .len = 0};
+  if (geom != nullptr) {
+    auto validGeom = lib->GEOSMakeValid_r(handle, geom);
+    if (validGeom != nullptr) {
+      auto srid = lib->GEOSGetSRID_r(handle, geom);
+      CR_GEOS_writeGeomToEWKB(lib, handle, validGeom, validEWKB, srid);
+      lib->GEOSGeom_destroy_r(handle, validGeom);
+    }
+    lib->GEOSGeom_destroy_r(handle, geom);
+  }
+  lib->GEOS_finish_r(handle);
+  return toGEOSString(error.data(), error.length());
+}
+
+//
 // Topology operators.
 //
 
@@ -528,6 +645,24 @@ CR_GEOS_Status CR_GEOS_Centroid(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_String* c
       auto srid = lib->GEOSGetSRID_r(handle, geom);
       CR_GEOS_writeGeomToEWKB(lib, handle, centroidGeom, centroidEWKB, srid);
       lib->GEOSGeom_destroy_r(handle, centroidGeom);
+    }
+    lib->GEOSGeom_destroy_r(handle, geom);
+  }
+  lib->GEOS_finish_r(handle);
+  return toGEOSString(error.data(), error.length());
+}
+
+CR_GEOS_Status CR_GEOS_ConvexHull(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_String* convexHullEWKB) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+  auto geom = CR_GEOS_GeometryFromSlice(lib, handle, a);
+  *convexHullEWKB = {.data = NULL, .len = 0};
+  if (geom != nullptr) {
+    auto convexHullGeom = lib->GEOSConvexHull_r(handle, geom);
+    if (convexHullGeom != nullptr) {
+      auto srid = lib->GEOSGetSRID_r(handle, geom);
+      CR_GEOS_writeGeomToEWKB(lib, handle, convexHullGeom, convexHullEWKB, srid);
+      lib->GEOSGeom_destroy_r(handle, convexHullGeom);
     }
     lib->GEOSGeom_destroy_r(handle, geom);
   }
@@ -689,6 +824,10 @@ CR_GEOS_Status CR_GEOS_Contains(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_Slice b, 
 
 CR_GEOS_Status CR_GEOS_Crosses(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_Slice b, char* ret) {
   return CR_GEOS_BinaryPredicate(lib, lib->GEOSCrosses_r, a, b, ret);
+}
+
+CR_GEOS_Status CR_GEOS_Disjoint(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_Slice b, char* ret) {
+  return CR_GEOS_BinaryPredicate(lib, lib->GEOSDisjoint_r, a, b, ret);
 }
 
 CR_GEOS_Status CR_GEOS_Equals(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_Slice b, char* ret) {

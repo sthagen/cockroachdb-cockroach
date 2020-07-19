@@ -383,11 +383,11 @@ func (sc *SchemaChanger) dropConstraints(
 	if err != nil {
 		return nil, err
 	}
-	if err := sc.waitToUpdateLeases(ctx, sc.tableID); err != nil {
+	if err := waitToUpdateLeases(ctx, sc.leaseMgr, sc.tableID); err != nil {
 		return nil, err
 	}
 	for id := range fksByBackrefTable {
-		if err := sc.waitToUpdateLeases(ctx, id); err != nil {
+		if err := waitToUpdateLeases(ctx, sc.leaseMgr, id); err != nil {
 			return nil, err
 		}
 	}
@@ -490,11 +490,11 @@ func (sc *SchemaChanger) addConstraints(
 	if _, err := sc.leaseMgr.PublishMultiple(ctx, tableIDsToUpdate, update, nil); err != nil {
 		return err
 	}
-	if err := sc.waitToUpdateLeases(ctx, sc.tableID); err != nil {
+	if err := waitToUpdateLeases(ctx, sc.leaseMgr, sc.tableID); err != nil {
 		return err
 	}
 	for id := range fksByBackrefTable {
-		if err := sc.waitToUpdateLeases(ctx, id); err != nil {
+		if err := waitToUpdateLeases(ctx, sc.leaseMgr, id); err != nil {
 			return err
 		}
 	}
@@ -883,7 +883,7 @@ func (sc *SchemaChanger) distBackfill(
 			)
 			defer recv.Release()
 
-			planCtx := sc.distSQLPlanner.NewPlanningCtx(ctx, &evalCtx, txn, true /* distribute */)
+			planCtx := sc.distSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil /* planner */, txn, true /* distribute */)
 			plan, err := sc.distSQLPlanner.createBackfiller(
 				planCtx, backfillType, *tableDesc.TableDesc(), duration, chunkSize, todoSpans, readAsOf,
 			)

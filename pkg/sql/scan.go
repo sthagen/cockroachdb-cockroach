@@ -69,24 +69,18 @@ type scanNode struct {
 
 	reqOrdering ReqOrdering
 
-	// filter that can be evaluated using only this table/index; it contains
-	// tree.IndexedVar leaves generated using filterVars.
-	filter     tree.TypedExpr
-	filterVars tree.IndexedVarHelper
-
 	// if non-zero, hardLimit indicates that the scanNode only needs to provide
-	// this many rows (after applying any filter). It is a "hard" guarantee that
-	// Next will only be called this many times.
+	// this many rows.
 	hardLimit int64
-	// if non-zero, softLimit is an estimation that only this many rows (after
-	// applying any filter) might be needed. It is a (potentially optimistic)
-	// "hint". If hardLimit is set (non-zero), softLimit must be unset (zero).
+	// if non-zero, softLimit is an estimation that only this many rows might be
+	// needed. It is a (potentially optimistic) "hint". If hardLimit is set
+	// (non-zero), softLimit must be unset (zero).
 	softLimit int64
 
 	disableBatchLimits bool
 
-	// Should be set to true if sqlbase.ParallelScans is true.
-	parallelScansEnabled bool
+	// See exec.Factory.ConstructScan.
+	parallelize bool
 
 	// Is this a full scan of an index?
 	isFull bool
@@ -94,10 +88,6 @@ type scanNode struct {
 	// Indicates if this scanNode will do a physical data check. This is
 	// only true when running SCRUB commands.
 	isCheck bool
-
-	// maxResults, if greater than 0, is the maximum number of results that a
-	// scan is guaranteed to return.
-	maxResults uint64
 
 	// estimatedRowCount is the estimated number of rows that this scanNode will
 	// output. When there are no statistics to make the estimation, it will be
@@ -181,35 +171,12 @@ func (n *scanNode) disableBatchLimit() {
 	n.softLimit = 0
 }
 
-// canParallelize returns true if this scanNode can be parallelized at the
-// distSender level safely.
-func (n *scanNode) canParallelize() bool {
-	// We choose only to parallelize if we are certain that no more than
-	// ParallelScanResultThreshold results will be returned, to prevent potential
-	// memory blowup.
-	// We can't parallelize if we have a non-zero limit hint, since DistSender
-	// is limited to running limited batches serially.
-	return n.maxResults != 0 &&
-		n.maxResults < execinfra.ParallelScanResultThreshold &&
-		n.limitHint() == 0 &&
-		n.parallelScansEnabled
-}
-
 func (n *scanNode) limitHint() int64 {
 	var limitHint int64
 	if n.hardLimit != 0 {
 		limitHint = n.hardLimit
-		if !isFilterTrue(n.filter) {
-			// The limit is hard, but it applies after the filter; read a multiple of
-			// the limit to avoid needing a second batch. The multiple should be an
-			// estimate for the selectivity of the filter, but we have no way of
-			// calculating that right now.
-			limitHint *= 2
-		}
 	} else {
-		// Like above, read a multiple of the limit when the limit is "soft".
-		// TODO(yuzefovich): shouldn't soft limit already account for the
-		// selectivity of any filter and whatnot?
+		// Read a multiple of the limit when the limit is "soft" to avoid needing a second batch.
 		limitHint = n.softLimit * 2
 	}
 	return limitHint
@@ -342,6 +309,5 @@ func (n *scanNode) initDescDefaults(colCfg scanColumnsConfig) error {
 	for i, c := range n.cols {
 		n.colIdxMap[c.ID] = i
 	}
-	n.filterVars = tree.MakeIndexedVarHelper(n, len(n.cols))
 	return nil
 }

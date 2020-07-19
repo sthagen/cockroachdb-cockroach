@@ -49,6 +49,7 @@ func initCLIDefaults() {
 	setNetworkBenchContextDefaults()
 	setSqlfmtContextDefaults()
 	setDemoContextDefaults()
+	setStmtDiagContextDefaults()
 	setAuthContextDefaults()
 
 	initPreFlagsDefaults()
@@ -91,6 +92,7 @@ func setServerContextDefaults() {
 
 	serverCfg.KVConfig.GoroutineDumpDirName = ""
 	serverCfg.KVConfig.HeapProfileDirName = ""
+	serverCfg.AutoInitializeCluster = false
 	serverCfg.KVConfig.ReadyFn = nil
 	serverCfg.KVConfig.DelayedBootstrapFn = nil
 	serverCfg.KVConfig.JoinList = nil
@@ -238,6 +240,9 @@ var zipCtx struct {
 	// redactLogs indicates whether log files should be redacted
 	// server-side during retrieval.
 	redactLogs bool
+
+	// Duration (in seconds) to run CPU profile for.
+	cpuProfDuration time.Duration
 }
 
 // setZipContextDefaults set the default values in zipCtx.  This
@@ -246,6 +251,7 @@ var zipCtx struct {
 func setZipContextDefaults() {
 	zipCtx.nodes = nodeSelection{}
 	zipCtx.redactLogs = false
+	zipCtx.cpuProfDuration = 5 * time.Second
 }
 
 // dumpCtx captures the command-line parameters of the `dump` command.
@@ -504,6 +510,16 @@ func setDemoContextDefaults() {
 	demoCtx.disableLicenseAcquisition = false
 	demoCtx.transientCluster = nil
 	demoCtx.insecure = false
+}
+
+// stmtDiagCtx captures the command-line parameters of the 'statement-diag'
+// command.
+var stmtDiagCtx struct {
+	all bool
+}
+
+func setStmtDiagContextDefaults() {
+	stmtDiagCtx.all = false
 }
 
 // GetServerCfgStores provides direct public access to the StoreSpecList inside

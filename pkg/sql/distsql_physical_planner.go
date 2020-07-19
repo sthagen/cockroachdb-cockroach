@@ -405,6 +405,26 @@ func checkSupportForPlanNode(node planNode) (distRecommendation, error) {
 		}
 		return rec, nil
 
+	case *interleavedJoinNode:
+		if err := checkExpr(n.leftFilter); err != nil {
+			return cannotDistribute, err
+		}
+		if err := checkExpr(n.rightFilter); err != nil {
+			return cannotDistribute, err
+		}
+		if err := checkExpr(n.onCond); err != nil {
+			return cannotDistribute, err
+		}
+		if n.left.lockingStrength != sqlbase.ScanLockingStrength_FOR_NONE ||
+			n.right.lockingStrength != sqlbase.ScanLockingStrength_FOR_NONE {
+			// Scans that are performing row-level locking cannot currently be
+			// distributed because their locks would not be propagated back to
+			// the root transaction coordinator.
+			// TODO(nvanbenschoten): lift this restriction.
+			return cannotDistribute, cannotDistributeRowLevelLockingErr
+		}
+		return shouldDistribute, nil
+
 	case *limitNode:
 		// Note that we don't need to check whether we support distribution of
 		// n.countExpr or n.offsetExpr because those expressions are evaluated
@@ -447,14 +467,6 @@ func checkSupportForPlanNode(node planNode) (distRecommendation, error) {
 		// previous behavior we continue to ignore the soft limits for now.
 		// TODO(yuzefovich): pay attention to the soft limits.
 		rec := canDistribute
-		// We recommend running scans distributed if we have a filtering
-		// expression or if we have a full table scan.
-		if n.filter != nil {
-			if err := checkExpr(n.filter); err != nil {
-				return cannotDistribute, err
-			}
-			rec = rec.compose(shouldDistribute)
-		}
 		// Check if we are doing a full scan.
 		if n.isFull {
 			rec = rec.compose(shouldDistribute)
@@ -939,14 +951,7 @@ func initTableReaderSpec(
 		return s, execinfrapb.PostProcessSpec{}, nil
 	}
 
-	filter, err := physicalplan.MakeExpression(n.filter, planCtx, indexVarMap)
-	if err != nil {
-		return nil, execinfrapb.PostProcessSpec{}, err
-	}
-	post := execinfrapb.PostProcessSpec{
-		Filter: filter,
-	}
-
+	var post execinfrapb.PostProcessSpec
 	if n.hardLimit != 0 {
 		post.Limit = uint64(n.hardLimit)
 	} else if n.softLimit != 0 {
@@ -1122,7 +1127,7 @@ func (dsp *DistSQLPlanner) createTableReaders(
 			spans:                  n.spans,
 			reverse:                n.reverse,
 			scanVisibility:         n.colCfg.visibility,
-			maxResults:             n.maxResults,
+			parallelize:            n.parallelize,
 			estimatedRowCount:      n.estimatedRowCount,
 			reqOrdering:            n.reqOrdering,
 			cols:                   n.cols,
@@ -1142,7 +1147,7 @@ type tableReaderPlanningInfo struct {
 	spans                  []roachpb.Span
 	reverse                bool
 	scanVisibility         execinfrapb.ScanVisibility
-	maxResults             uint64
+	parallelize            bool
 	estimatedRowCount      uint64
 	reqOrdering            ReqOrdering
 	cols                   []*sqlbase.ColumnDescriptor
@@ -1198,7 +1203,7 @@ func (dsp *DistSQLPlanner) planTableReaders(
 			tr.Spans = append(tr.Spans, execinfrapb.TableReaderSpan{Span: sp.Spans[j]})
 		}
 
-		tr.MaxResults = info.maxResults
+		tr.Parallelize = info.parallelize
 		p.TotalEstimatedScannedRows += info.estimatedRowCount
 		if info.estimatedRowCount > p.MaxEstimatedRowCount {
 			p.MaxEstimatedRowCount = info.estimatedRowCount
@@ -1273,22 +1278,25 @@ func (dsp *DistSQLPlanner) selectRenders(
 	return nil
 }
 
-// addSorters adds sorters corresponding to a sortNode and updates the plan to
-// reflect the sort node.
-func (dsp *DistSQLPlanner) addSorters(p *PhysicalPlan, n *sortNode) {
+// addSorters adds sorters corresponding to the ordering and updates the plan
+// accordingly. When alreadyOrderedPrefix is non-zero, the input is already
+// ordered on the prefix ordering[:alreadyOrderedPrefix].
+func (dsp *DistSQLPlanner) addSorters(
+	p *PhysicalPlan, ordering sqlbase.ColumnOrdering, alreadyOrderedPrefix int,
+) {
 	// Sorting is needed; we add a stage of sorting processors.
-	ordering := execinfrapb.ConvertToMappedSpecOrdering(n.ordering, p.PlanToStreamColMap)
+	outputOrdering := execinfrapb.ConvertToMappedSpecOrdering(ordering, p.PlanToStreamColMap)
 
 	p.AddNoGroupingStage(
 		execinfrapb.ProcessorCoreUnion{
 			Sorter: &execinfrapb.SorterSpec{
-				OutputOrdering:   ordering,
-				OrderingMatchLen: uint32(n.alreadyOrderedPrefix),
+				OutputOrdering:   outputOrdering,
+				OrderingMatchLen: uint32(alreadyOrderedPrefix),
 			},
 		},
 		execinfrapb.PostProcessSpec{},
 		p.ResultTypes,
-		ordering,
+		outputOrdering,
 	)
 }
 
@@ -1909,13 +1917,7 @@ func (dsp *DistSQLPlanner) createPlanForIndexJoin(
 		LockingWaitPolicy: n.table.lockingWaitPolicy,
 	}
 
-	filter, err := physicalplan.MakeExpression(
-		n.table.filter, planCtx, nil /* indexVarMap */)
-	if err != nil {
-		return nil, err
-	}
 	post := execinfrapb.PostProcessSpec{
-		Filter:     filter,
 		Projection: true,
 	}
 
@@ -2346,18 +2348,6 @@ func getTypesForPlanResult(node planNode, planToStreamColMap []int) ([]*types.T,
 func (dsp *DistSQLPlanner) createPlanForJoin(
 	planCtx *PlanningCtx, n *joinNode,
 ) (*PhysicalPlan, error) {
-	// See if we can create an interleave join plan.
-	if planInterleavedJoins.Get(&dsp.st.SV) {
-		plan, ok, err := dsp.tryCreatePlanForInterleavedJoin(planCtx, n)
-		if err != nil {
-			return nil, err
-		}
-		// An interleave join plan could be used. Return it.
-		if ok {
-			return plan, nil
-		}
-	}
-
 	leftPlan, err := dsp.createPhysPlanForPlanNode(planCtx, n.left.plan)
 	if err != nil {
 		return nil, err
@@ -2531,6 +2521,9 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 	case *joinNode:
 		plan, err = dsp.createPlanForJoin(planCtx, n)
 
+	case *interleavedJoinNode:
+		plan, err = dsp.createPlanForInterleavedJoin(planCtx, n)
+
 	case *limitNode:
 		plan, err = dsp.createPhysPlanForPlanNode(planCtx, n.plan)
 		if err != nil {
@@ -2572,7 +2565,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 			return nil, err
 		}
 
-		dsp.addSorters(plan, n)
+		dsp.addSorters(plan, n.ordering, n.alreadyOrderedPrefix)
 
 	case *unaryNode:
 		plan, err = dsp.createPlanForUnary(planCtx, n)
@@ -3422,9 +3415,9 @@ func (dsp *DistSQLPlanner) createPlanForExport(
 // lightweight version PlanningCtx is returned that can be used when the caller
 // knows plans will only be run on one node. It is coerced to false on SQL
 // SQL tenants (in which case only local planning is supported), regardless of
-// the passed-in value.
+// the passed-in value. planner argument can be left nil.
 func (dsp *DistSQLPlanner) NewPlanningCtx(
-	ctx context.Context, evalCtx *extendedEvalContext, txn *kv.Txn, distribute bool,
+	ctx context.Context, evalCtx *extendedEvalContext, planner *planner, txn *kv.Txn, distribute bool,
 ) *PlanningCtx {
 	// Tenants can not distribute plans.
 	distribute = distribute && evalCtx.Codec.ForSystemTenant()
@@ -3432,6 +3425,7 @@ func (dsp *DistSQLPlanner) NewPlanningCtx(
 		ctx:             ctx,
 		ExtendedEvalCtx: evalCtx,
 		isLocal:         !distribute,
+		planner:         planner,
 	}
 	if !distribute {
 		return planCtx

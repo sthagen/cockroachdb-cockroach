@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -130,7 +131,8 @@ func (p *planner) LookupObject(
 
 	// The returned object may contain types.T that need hydrating.
 	if objDesc != nil {
-		if err := p.maybeHydrateTypesInDescriptor(ctx, objDesc); err != nil {
+		objDesc, err = p.maybeHydrateTypesInDescriptor(ctx, objDesc)
+		if err != nil {
 			return false, nil, err
 		}
 	}
@@ -205,15 +207,32 @@ func (p *planner) ResolveTypeByID(ctx context.Context, id uint32) (*types.T, err
 // TODO (rohany): Once we lease types, this should be pushed down into the
 //  leased object collection.
 func (p *planner) maybeHydrateTypesInDescriptor(
-	ctx context.Context, objDesc tree.NameResolutionResult,
-) error {
+	ctx context.Context, objDesc catalog.Descriptor,
+) (catalog.Descriptor, error) {
 	// As of now, only {Mutable,Immutable}TableDescriptor have types.T that
 	// need to be hydrated.
-	tableDesc := objDesc.(catalog.Descriptor).TableDesc()
-	if tableDesc == nil {
-		return nil
+	switch t := objDesc.(type) {
+	case *sqlbase.MutableTableDescriptor:
+		// MutableTableDescriptors are safe to modify in place.
+		if err := sqlbase.HydrateTypesInTableDescriptor(t.TableDesc(), p.makeTypeLookupFn(ctx)); err != nil {
+			return nil, err
+		}
+		return objDesc, nil
+	case *sqlbase.ImmutableTableDescriptor:
+		// ImmutableTableDescriptors need to be copied before hydration. If there
+		// aren't any user defined types in the descriptor, then just return.
+		if !t.ContainsUserDefinedTypes() {
+			return objDesc, nil
+		}
+		// Make a copy of the underlying TableDescriptor.
+		desc := protoutil.Clone(t.TableDesc()).(*sqlbase.TableDescriptor)
+		if err := sqlbase.HydrateTypesInTableDescriptor(desc, p.makeTypeLookupFn(ctx)); err != nil {
+			return nil, err
+		}
+		return sqlbase.NewImmutableTableDescriptor(*desc), nil
+	default:
+		return objDesc, nil
 	}
-	return sqlbase.HydrateTypesInTableDescriptor(tableDesc, p.makeTypeLookupFn(ctx))
 }
 
 // ObjectLookupFlags is part of the resolver.SchemaResolver interface.
@@ -285,22 +304,22 @@ func getDescriptorsFromTargetList(
 // reverse of the Resolve() functions.
 func (p *planner) getQualifiedTableName(
 	ctx context.Context, desc *sqlbase.TableDescriptor,
-) (string, error) {
+) (*tree.TableName, error) {
 	dbDesc, err := sqlbase.GetDatabaseDescFromID(ctx, p.txn, p.ExecCfg().Codec, desc.ParentID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	schemaID := desc.GetParentSchemaID()
 	schemaName, err := resolver.ResolveSchemaNameByID(ctx, p.txn, p.ExecCfg().Codec, desc.ParentID, schemaID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	tbName := tree.MakeTableNameWithSchema(
 		tree.Name(dbDesc.GetName()),
 		tree.Name(schemaName),
 		tree.Name(desc.Name),
 	)
-	return tbName.String(), nil
+	return &tbName, nil
 }
 
 // findTableContainingIndex returns the descriptor of a table
@@ -651,6 +670,18 @@ func getTableAsTableName(
 	tableName = tree.MakeTableName(tree.Name(tableDbDesc.GetName()), tree.Name(table.Name))
 	tableName.ExplicitSchema = tableDbDesc.GetName() != dbPrefix
 	return tableName, nil
+}
+
+// ResolveMutableTypeDescriptor resolves a type descriptor for mutable access.
+func (p *planner) ResolveMutableTypeDescriptor(
+	ctx context.Context, name *tree.UnresolvedObjectName, required bool,
+) (*sqlbase.MutableTypeDescriptor, error) {
+	tn, desc, err := resolver.ResolveMutableType(ctx, p, name, required)
+	if err != nil {
+		return nil, err
+	}
+	name.SetAnnotation(&p.semaCtx.Annotations, tn)
+	return desc, nil
 }
 
 // The versions below are part of the work for #34240.

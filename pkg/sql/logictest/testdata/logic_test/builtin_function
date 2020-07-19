@@ -1342,6 +1342,22 @@ SELECT regexp_replace('ReRe','R(e)','1\\1','g');
 ----
 1\11\1
 
+# Regression test for #51289.
+query T
+SELECT regexp_replace('TIMESTAMP(6)', '.*(\((\d+)\))?.*', '\2')
+----
+·
+
+query T
+SELECT regexp_replace('TIMESTAMP(6)', '.*(\((\d+)\)).*', '\2')
+----
+6
+
+query T
+SELECT regexp_replace('TIMESTAMP(6)', '.*(\((\d+)\)?).*', '\2')
+----
+6
+
 query B
 SELECT unique_rowid() < unique_rowid()
 ----
@@ -2741,3 +2757,17 @@ SELECT set_bit(b'', 0, 1)
 
 query error set_bit\(\): new bit must be 0 or 1.
 SELECT set_bit(b'\145\x6C\l', 0, 2)
+
+statement ok
+CREATE TABLE nulls_test(a INT, b STRING)
+
+statement ok
+INSERT INTO nulls_test VALUES(1, 'foo'), (1, NULL), (NULL, 'foo'), (NULL, NULL)
+
+query II rowsort
+SELECT num_nulls(a, b), num_nonnulls(a, b) FROM nulls_test
+----
+0  2
+1  1
+1  1
+2  0

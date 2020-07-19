@@ -454,6 +454,45 @@ The port number should be the same as in --listen-addr unless port
 forwarding is set up on an intermediate firewall/router.`,
 	}
 
+	AdvertiseHost = FlagInfo{
+		Name:        "advertise-host",
+		Description: `Alias for --advertise-addr. Deprecated.`,
+	}
+
+	AdvertisePort = FlagInfo{
+		Name:        "advertise-port",
+		Description: `Deprecated. Use --advertise-addr=<host>:<port>.`,
+	}
+
+	ListenSQLAddr = FlagInfo{
+		Name: "sql-addr",
+		Description: `
+The hostname or IP address to bind to for SQL clients, for example
+--sql-addr=myhost:26257 or --sql-addr=:26257 (listen on all interfaces).
+If left unspecified, the address specified by --listen-addr will be
+used for both RPC and SQL connections.
+<PRE>
+
+</PRE>
+If specified but the address part is omitted, the address part
+defaults to the address part of --listen-addr.
+If specified but the port number is omitted, the port number
+defaults to 26257.
+<PRE>
+
+</PRE>
+To actually use separate bindings, it is recommended to specify
+both flags and use a different port number via --listen-addr, for
+example --sql-addr=:26257 --listen-addr=:26258. Ensure that
+--join is set accordingly on other nodes. It is also possible
+to use the same port number but separate host addresses.
+<PRE>
+
+</PRE>
+An IPv6 address can also be specified with the notation [...], for
+example [::1]:26257 or [fe80::f6f2:::]:26257.`,
+	}
+
 	SQLAdvertiseAddr = FlagInfo{
 		Name: "advertise-sql-addr",
 		Description: `
@@ -479,43 +518,57 @@ The port number should be the same as in --sql-addr unless port
 forwarding is set up on an intermediate firewall/router.`,
 	}
 
-	AdvertiseHost = FlagInfo{
-		Name:        "advertise-host",
-		Description: `Alias for --advertise-addr. Deprecated.`,
-	}
-
-	AdvertisePort = FlagInfo{
-		Name:        "advertise-port",
-		Description: `Deprecated. Use --advertise-addr=<host>:<port>.`,
-	}
-
-	ListenSQLAddr = FlagInfo{
-		Name: "sql-addr",
+	ListenTenantAddr = FlagInfo{
+		Name: "tenant-addr",
 		Description: `
-The hostname or IP address to bind to for SQL clients, for example
---sql-addr=myhost:26257 or --sql-addr=:26257 (listen on all interfaces).
-If left unspecified, the address specified by --listen-addr will be
-used for both RPC and SQL connections.
+The hostname or IP address to bind to for tenant KV clients, for example
+--tenant-addr=myhost:26257 or --tenant-addr=:26257 (listen on all
+interfaces). If left unspecified, the address specified by --listen-addr
+will be used for both RPC and SQL connections.
 <PRE>
 
 </PRE>
-If specified but the address part is omitted, the address part
-defaults to the address part of --listen-addr.
-If specified but the port number is omitted, the port
-number defaults to 26257.
+If specified but the address part is omitted, the address part defaults
+to the address part of --listen-addr. If specified but the port number
+is omitted, the port number defaults to 26257.
 <PRE>
 
 </PRE>
-To actually use separate bindings, it is recommended to specify
-both flags and use a different port number via --listen-addr, for
-example --sql-addr=:26257 --listen-addr=:26258. Ensure that
---join is set accordingly on other nodes. It is also possible
-to use the same port number but separate host addresses.
+To actually use separate bindings, it is recommended to specify both
+flags and use a different port number via --listen-addr, for example
+--tenant-addr=:36257 --listen-addr=:26257. Ensure that --join is set
+accordingly on other nodes. It is also possible to use the same port
+number but separate host addresses.
 <PRE>
 
 </PRE>
 An IPv6 address can also be specified with the notation [...], for
 example [::1]:26257 or [fe80::f6f2:::]:26257.`,
+	}
+
+	TenantAdvertiseAddr = FlagInfo{
+		Name: "advertise-tenant-addr",
+		Description: `
+The address/hostname and port to advertise to tenant SQL nodes for
+tenant KV communication. It must resolve and be routable from other
+nodes in the cluster.
+<PRE>
+
+</PRE>
+If left unspecified, it defaults to the setting of --tenant-addr. If the
+flag is provided but either the address part or the port part is left
+unspecified, that particular part defaults to the same part in
+--tenant-addr.
+<PRE>
+
+</PRE>
+An IPv6 address can also be specified with the notation [...], for
+example [::1]:26257 or [fe80::f6f2:::]:26257.
+<PRE>
+
+</PRE>
+The port number should be the same as in --tenant-addr unless port
+forwarding is set up on an intermediate firewall/router.`,
 	}
 
 	ListenHTTPAddr = FlagInfo{
@@ -939,14 +992,16 @@ drain all active client connections and migrate away range leases.`,
 	Wait = FlagInfo{
 		Name: "wait",
 		Description: `
-Specifies when to return after having marked the targets as decommissioning.
+Specifies when to return during the decommissioning process.
 Takes any of the following values:
 <PRE>
 
-- all: waits until all target nodes' replica counts have dropped to zero.
-  This is the default.
-- none: marks the targets as decommissioning, but does not wait for the
-  process to complete. Use when polling manually from an external system.
+  - all   waits until all target nodes' replica counts have dropped to zero and
+          marks the nodes as fully decommissioned. This is the default.
+  - none  marks the targets as decommissioning, but does not wait for the
+          replica counts to drop to zero before returning. If the replica counts
+          are found to be zero, nodes are marked as fully decommissioned. Use
+          when polling manually from an external system.
 </PRE>`,
 	}
 
@@ -1200,5 +1255,23 @@ log entries. Note that this flag only operates on log entries;
 other items retrieved by the zip command may still consider
 confidential data or PII.
 `,
+	}
+
+	ZipCPUProfileDuration = FlagInfo{
+		Name: "cpu-profile-duration",
+		Description: `
+Fetch CPU profiles from the cluster with the specified sample duration.
+The zip command will block for the duration specified. Zero disables this feature.
+`,
+	}
+
+	StmtDiagDeleteAll = FlagInfo{
+		Name:        "all",
+		Description: `Delete all bundles.`,
+	}
+
+	StmtDiagCancelAll = FlagInfo{
+		Name:        "all",
+		Description: `Cancel all outstanding requests.`,
 	}
 )

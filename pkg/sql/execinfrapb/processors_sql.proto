@@ -88,9 +88,15 @@ message TableReaderSpec {
   // schema changes.
   optional ScanVisibility visibility = 7 [(gogoproto.nullable) = false];
 
-  // If non-zero, this is a guarantee for the upper bound of rows a TableReader
-  // will read. If 0, the number of results is unbounded.
-  optional uint64 max_results = 8 [(gogoproto.nullable) = false];
+  // This field used to be an upper bound for the number of rows we will read;
+  // replaced by the parallelize field. 
+  reserved 8;
+
+  // If set, the TableReader can read all the spans in parallel, without any
+  // batch limits. This should only be the case when there is a known upper
+  // bound on the number of rows we can read, and when there is no limit or
+  // limit hint.
+  optional bool parallelize = 12 [(gogoproto.nullable) = false];
 
   // If non-zero, this enables inconsistent historical scanning where different
   // batches can be read with different timestamps. This is used for
@@ -598,6 +604,8 @@ message AggregatorSpec {
     PERCENTILE_CONT_IMPL = 26;
     JSON_OBJECT_AGG = 27;
     JSONB_OBJECT_AGG = 28;
+    VAR_POP = 29;
+    STDDEV_POP = 30;
   }
 
   enum Type {
@@ -658,7 +666,7 @@ message AggregatorSpec {
 // performs intermediate filtering on rows from each table, and performs a
 // join on the rows from the 2+ tables.
 //
-// Limitations: the InterleavedReaderJoiner currently supports only equality INNER joins
+// Limitations: the InterleavedReaderJoiner currently supports only equality joins
 // on the full interleave prefix.
 // See https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20171025_interleaved_table_joins.md.
 //
@@ -697,8 +705,8 @@ message InterleavedReaderJoinerSpec {
     repeated TableReaderSpan spans = 5 [(gogoproto.nullable) = false];
   }
 
-  // For the common case of two tables, table at index 0 is the left/parent
-  // table and table at index 1 is the right/child table.
+  // The tables can be in any order. The processor figures out internally the
+  // hierarchy between them.
   repeated Table tables = 1 [(gogoproto.nullable) = false];
 
   // Reader component

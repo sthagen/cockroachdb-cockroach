@@ -71,6 +71,7 @@ func pauseNodeLivenessHeartbeats(mtc *multiTestContext, pause bool) {
 
 func TestNodeLiveness(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 3)
@@ -128,6 +129,7 @@ func TestNodeLiveness(t *testing.T) {
 
 func TestNodeLivenessInitialIncrement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 1)
@@ -167,6 +169,7 @@ func verifyEpochIncremented(t *testing.T, mtc *multiTestContext, nodeIdx int) {
 // node is invoked when it changes from state false to true.
 func TestNodeIsLiveCallback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 3)
@@ -214,6 +217,7 @@ func TestNodeIsLiveCallback(t *testing.T) {
 // this node updates its own liveness status.
 func TestNodeHeartbeatCallback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 3)
@@ -268,6 +272,8 @@ func TestNodeHeartbeatCallback(t *testing.T) {
 // live.
 func TestNodeLivenessEpochIncrement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
@@ -337,6 +343,7 @@ func TestNodeLivenessEpochIncrement(t *testing.T) {
 // restarted, the node liveness records are re-gossiped immediately.
 func TestNodeLivenessRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 2)
@@ -398,6 +405,7 @@ func TestNodeLivenessRestart(t *testing.T) {
 // clobbering in place.
 func TestNodeLivenessSelf(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 1)
@@ -457,6 +465,7 @@ func TestNodeLivenessSelf(t *testing.T) {
 
 func TestNodeLivenessGetIsLiveMap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 3)
@@ -501,6 +510,7 @@ func TestNodeLivenessGetIsLiveMap(t *testing.T) {
 
 func TestNodeLivenessGetLivenesses(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 3)
@@ -557,6 +567,7 @@ func TestNodeLivenessGetLivenesses(t *testing.T) {
 // to heartbeat all succeed.
 func TestNodeLivenessConcurrentHeartbeats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 1)
@@ -590,6 +601,7 @@ func TestNodeLivenessConcurrentHeartbeats(t *testing.T) {
 // attempts to increment liveness of another node all succeed.
 func TestNodeLivenessConcurrentIncrementEpochs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 2)
@@ -624,6 +636,7 @@ func TestNodeLivenessConcurrentIncrementEpochs(t *testing.T) {
 // nodes once they are aware of its draining state.
 func TestNodeLivenessSetDraining(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 3)
@@ -721,6 +734,7 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 
 func TestNodeLivenessRetryAmbiguousResultError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	var injectError atomic.Value
 	var injectedErrorCount int32
@@ -768,8 +782,11 @@ func verifyNodeIsDecommissioning(t *testing.T, mtc *multiTestContext, nodeID roa
 		for _, nl := range mtc.nodeLivenesses {
 			livenesses := nl.GetLivenesses()
 			for _, liveness := range livenesses {
-				if liveness.Decommissioning != (liveness.NodeID == nodeID) {
-					return errors.Errorf("unexpected Decommissioning value of %v for node %v", liveness.Decommissioning, liveness.NodeID)
+				if liveness.NodeID != nodeID {
+					continue
+				}
+				if !liveness.Membership.Decommissioning() {
+					return errors.Errorf("unexpected Membership value of %v for node %v", liveness.Membership, liveness.NodeID)
 				}
 			}
 		}
@@ -779,6 +796,7 @@ func verifyNodeIsDecommissioning(t *testing.T, mtc *multiTestContext, nodeID roa
 
 func TestNodeLivenessStatusMap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	if testing.Short() {
 		t.Skip("short")
 	}
@@ -844,15 +862,15 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 	log.Infof(ctx, "done shutting down node %d", deadNodeID)
 
 	decommissioningNodeID := tc.Server(2).NodeID()
-	log.Infof(ctx, "decommissioning node %d", decommissioningNodeID)
-	if err := firstServer.Decommission(ctx, true, []roachpb.NodeID{decommissioningNodeID}); err != nil {
+	log.Infof(ctx, "marking node %d as decommissioning", decommissioningNodeID)
+	if err := firstServer.Decommission(ctx, kvserverpb.MembershipStatus_DECOMMISSIONING, []roachpb.NodeID{decommissioningNodeID}); err != nil {
 		t.Fatal(err)
 	}
-	log.Infof(ctx, "done decommissioning node %d", decommissioningNodeID)
+	log.Infof(ctx, "marked node %d as decommissioning", decommissioningNodeID)
 
 	removedNodeID := tc.Server(3).NodeID()
-	log.Infof(ctx, "decommissioning and shutting down node %d", removedNodeID)
-	if err := firstServer.Decommission(ctx, true, []roachpb.NodeID{removedNodeID}); err != nil {
+	log.Infof(ctx, "marking node %d as decommissioning and shutting it down", removedNodeID)
+	if err := firstServer.Decommission(ctx, kvserverpb.MembershipStatus_DECOMMISSIONING, []roachpb.NodeID{removedNodeID}); err != nil {
 		t.Fatal(err)
 	}
 	tc.StopServer(3)
@@ -931,13 +949,14 @@ func testNodeLivenessSetDecommissioning(t *testing.T, decommissionNodeIdx int) {
 	// Verify success on failed update of a liveness record that already has the
 	// given decommissioning setting.
 	if _, err := callerNodeLiveness.SetDecommissioningInternal(
-		ctx, nodeID, kvserver.LivenessRecord{}, false,
+		ctx, nodeID, kvserver.LivenessRecord{}, kvserverpb.MembershipStatus_ACTIVE,
 	); err != nil {
 		t.Fatal(err)
 	}
 
 	// Set a node to decommissioning state.
-	if _, err := callerNodeLiveness.SetDecommissioning(ctx, nodeID, true); err != nil {
+	if _, err := callerNodeLiveness.SetMembershipStatus(
+		ctx, nodeID, kvserverpb.MembershipStatus_DECOMMISSIONING); err != nil {
 		t.Fatal(err)
 	}
 	verifyNodeIsDecommissioning(t, mtc, nodeID)
@@ -958,6 +977,7 @@ func testNodeLivenessSetDecommissioning(t *testing.T, decommissionNodeIdx int) {
 // node's liveness record is updated and remains after restart.
 func TestNodeLivenessSetDecommissioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	// Sets itself to decommissioning.
 	testNodeLivenessSetDecommissioning(t, 0)
 	// Set another node to decommissioning.
@@ -971,6 +991,7 @@ func TestNodeLivenessSetDecommissioning(t *testing.T) {
 // See (*NodeLiveness).SetDecommissioning for details.
 func TestNodeLivenessDecommissionAbsent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	mtc := &multiTestContext{}
 	defer mtc.Stop()
@@ -983,8 +1004,8 @@ func TestNodeLivenessDecommissionAbsent(t *testing.T) {
 	const goneNodeID = roachpb.NodeID(10000)
 
 	// When the node simply never existed, expect an error.
-	if _, err := mtc.nodeLivenesses[0].SetDecommissioning(
-		ctx, goneNodeID, true,
+	if _, err := mtc.nodeLivenesses[0].SetMembershipStatus(
+		ctx, goneNodeID, kvserverpb.MembershipStatus_DECOMMISSIONING,
 	); !errors.Is(err, kvserver.ErrNoLivenessRecord) {
 		t.Fatal(err)
 	}
@@ -994,36 +1015,42 @@ func TestNodeLivenessDecommissionAbsent(t *testing.T) {
 		NodeID:     goneNodeID,
 		Epoch:      1,
 		Expiration: hlc.LegacyTimestamp(mtc.clock().Now()),
+		Membership: kvserverpb.MembershipStatus_ACTIVE,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
 
 	// Decommission from second node.
-	if committed, err := mtc.nodeLivenesses[1].SetDecommissioning(ctx, goneNodeID, true); err != nil {
+	if committed, err := mtc.nodeLivenesses[1].SetMembershipStatus(
+		ctx, goneNodeID, kvserverpb.MembershipStatus_DECOMMISSIONING); err != nil {
 		t.Fatal(err)
 	} else if !committed {
 		t.Fatal("no change committed")
 	}
 	// Re-decommission from first node.
-	if committed, err := mtc.nodeLivenesses[0].SetDecommissioning(ctx, goneNodeID, true); err != nil {
+	if committed, err := mtc.nodeLivenesses[0].SetMembershipStatus(
+		ctx, goneNodeID, kvserverpb.MembershipStatus_DECOMMISSIONING); err != nil {
 		t.Fatal(err)
 	} else if committed {
 		t.Fatal("spurious change committed")
 	}
 	// Recommission from first node.
-	if committed, err := mtc.nodeLivenesses[0].SetDecommissioning(ctx, goneNodeID, false); err != nil {
+	if committed, err := mtc.nodeLivenesses[0].SetMembershipStatus(
+		ctx, goneNodeID, kvserverpb.MembershipStatus_ACTIVE); err != nil {
 		t.Fatal(err)
 	} else if !committed {
 		t.Fatal("no change committed")
 	}
 	// Decommission from second node (a second time).
-	if committed, err := mtc.nodeLivenesses[1].SetDecommissioning(ctx, goneNodeID, true); err != nil {
+	if committed, err := mtc.nodeLivenesses[1].SetMembershipStatus(
+		ctx, goneNodeID, kvserverpb.MembershipStatus_DECOMMISSIONING); err != nil {
 		t.Fatal(err)
 	} else if !committed {
 		t.Fatal("no change committed")
 	}
 	// Recommission from third node.
-	if committed, err := mtc.nodeLivenesses[2].SetDecommissioning(ctx, goneNodeID, false); err != nil {
+	if committed, err := mtc.nodeLivenesses[2].SetMembershipStatus(
+		ctx, goneNodeID, kvserverpb.MembershipStatus_ACTIVE); err != nil {
 		t.Fatal(err)
 	} else if !committed {
 		t.Fatal("no change committed")

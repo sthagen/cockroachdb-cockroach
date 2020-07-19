@@ -30,11 +30,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
 func TestShowCreateTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -178,8 +180,6 @@ func TestShowCreateTable(t *testing.T) {
 	k INT8 NULL,
 	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items(a, b),
 	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES items(c),
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC),
 	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
@@ -198,8 +198,6 @@ func TestShowCreateTable(t *testing.T) {
 	k INT8 NULL,
 	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items(a, b) MATCH FULL,
 	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES items(c) MATCH FULL,
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC),
 	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
@@ -213,7 +211,6 @@ func TestShowCreateTable(t *testing.T) {
 			expect: `CREATE TABLE %s (
 	x INT8 NULL,
 	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.public.foo(x),
-	INDEX %[1]s_auto_index_fk_ref (x ASC),
 	FAMILY "primary" (x, rowid)
 )`,
 		},
@@ -232,8 +229,6 @@ func TestShowCreateTable(t *testing.T) {
 	k INT8 NULL,
 	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items(a, b) ON DELETE SET DEFAULT,
 	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES items(c) ON DELETE SET NULL,
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC),
 	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
@@ -282,8 +277,6 @@ func TestShowCreateTable(t *testing.T) {
 	l INT8 NULL DEFAULT 4:::INT8,
 	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items(a, b) ON DELETE SET DEFAULT,
 	CONSTRAINT fk_k_ref_items FOREIGN KEY (k, l) REFERENCES items(a, b) MATCH FULL ON UPDATE CASCADE,
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC, l ASC),
 	FAMILY "primary" (i, j, k, l, rowid)
 )`,
 		},
@@ -335,6 +328,7 @@ func TestShowCreateTable(t *testing.T) {
 
 func TestShowCreateView(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -429,6 +423,7 @@ func TestShowCreateView(t *testing.T) {
 
 func TestShowCreateSequence(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -506,6 +501,7 @@ func TestShowCreateSequence(t *testing.T) {
 
 func TestShowQueries(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	const multiByte = "💩"
 	const selectBase = "SELECT * FROM "
@@ -654,6 +650,7 @@ func TestShowQueries(t *testing.T) {
 
 func TestShowSessions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	var conn *gosql.DB
 
@@ -765,6 +762,7 @@ func TestShowSessions(t *testing.T) {
 
 func TestShowSessionPrivileges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	params.Insecure = true
@@ -841,6 +839,7 @@ func TestShowSessionPrivileges(t *testing.T) {
 
 func TestLintClusterSettingNames(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -963,6 +962,7 @@ func TestLintClusterSettingNames(t *testing.T) {
 // more details, see #28033.
 func TestCancelQueriesRace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())

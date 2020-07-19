@@ -15,6 +15,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geomfn"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/geo/geoprojbase"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
 	"github.com/cockroachdb/errors"
 	"github.com/golang/geo/r3"
@@ -32,15 +34,15 @@ type s2GeometryIndex struct {
 
 var _ GeometryIndex = (*s2GeometryIndex)(nil)
 
+// We adjust the clipping bounds to be smaller by this fraction, since using
+// the endpoints of face 0 in S2 causes coverings to spill out of that face.
+const clippingBoundsDelta = 0.01
+
 // NewS2GeometryIndex returns an index with the given configuration. All reads and
 // writes on this index must use the same config. Writes must use the same
 // config to correctly process deletions. Reads must use the same config since
 // the bounds affect when a read needs to look at the exceedsBoundsCellID.
 func NewS2GeometryIndex(cfg S2GeometryConfig) GeometryIndex {
-	// We adjust the clipping bounds to be smaller by this fraction, since using
-	// the endpoints of face 0 in S2 causes coverings to spill out of that face.
-	const boundsDelta = 0.01
-
 	// TODO(sumeer): Sanity check cfg.
 	return &s2GeometryIndex{
 		rc: &s2.RegionCoverer{
@@ -53,21 +55,55 @@ func NewS2GeometryIndex(cfg S2GeometryConfig) GeometryIndex {
 		maxX:   cfg.MaxX,
 		minY:   cfg.MinY,
 		maxY:   cfg.MaxY,
-		deltaX: boundsDelta * (cfg.MaxX - cfg.MinX),
-		deltaY: boundsDelta * (cfg.MaxY - cfg.MinY),
+		deltaX: clippingBoundsDelta * (cfg.MaxX - cfg.MinX),
+		deltaY: clippingBoundsDelta * (cfg.MaxY - cfg.MinY),
 	}
 }
+
+// TODO(sumeer): also support index config with parameters specified by CREATE
+// INDEX.
 
 // DefaultGeometryIndexConfig returns a default config for a geometry index.
 func DefaultGeometryIndexConfig() *Config {
 	return &Config{
 		S2Geometry: &S2GeometryConfig{
 			// Arbitrary bounding box.
-			// TODO(sumeer): replace with parameters specified by CREATE INDEX.
 			MinX:     -10000,
 			MaxX:     10000,
 			MinY:     -10000,
 			MaxY:     10000,
+			S2Config: defaultS2Config()},
+	}
+}
+
+// GeometryIndexConfigForSRID returns a geometry index config for srid.
+func GeometryIndexConfigForSRID(srid geopb.SRID) *Config {
+	p, exists := geoprojbase.Projection(srid)
+	if !exists || p.Bounds == nil {
+		return DefaultGeometryIndexConfig()
+	}
+	b := p.Bounds
+	minX, maxX, minY, maxY := b.MinX, b.MaxX, b.MinY, b.MaxY
+	// There are projections where the min and max are equal e.g. 3571.
+	// We need to have a valid rectangle as the geometry index bounds.
+	if maxX-minX < 1 {
+		maxX++
+	}
+	if maxY-minY < 1 {
+		maxY++
+	}
+	// Expand the bounds by 2x the clippingBoundsDelta, to
+	// ensure that shapes touching the bounds don't get
+	// clipped.
+	boundsExpansion := 2 * clippingBoundsDelta
+	deltaX := (maxX - minX) * boundsExpansion
+	deltaY := (maxY - minY) * boundsExpansion
+	return &Config{
+		S2Geometry: &S2GeometryConfig{
+			MinX:     minX - deltaX,
+			MaxX:     maxX + deltaX,
+			MinY:     minY - deltaY,
+			MaxY:     maxY + deltaY,
 			S2Config: defaultS2Config()},
 	}
 }
@@ -78,6 +114,44 @@ const exceedsBoundsCellID = s2.CellID(^uint64(0))
 
 // TODO(sumeer): adjust code to handle precision issues with floating point
 // arithmetic.
+
+// covererWithBBoxFallback first computes the covering for the provided
+// regions (which were computed using geom), and if the covering is too
+// broad (contains faces other than 0), falls back to using the bounding
+// box of geom to compute the covering.
+type covererWithBBoxFallback struct {
+	s    *s2GeometryIndex
+	geom geom.T
+}
+
+var _ covererInterface = covererWithBBoxFallback{}
+
+func (rc covererWithBBoxFallback) covering(regions []s2.Region) s2.CellUnion {
+	cu := simpleCovererImpl{rc: rc.s.rc}.covering(regions)
+	if isBadCovering(cu) {
+		bbox := geo.BoundingBoxFromGeomTGeometryType(rc.geom)
+		flatCoords := []float64{
+			bbox.LoX, bbox.LoY, bbox.HiX, bbox.LoY, bbox.HiX, bbox.HiY, bbox.LoX, bbox.HiY,
+			bbox.LoX, bbox.LoY}
+		bboxT := geom.NewPolygonFlat(geom.XY, flatCoords, []int{len(flatCoords)})
+		bboxRegions := rc.s.s2RegionsFromPlanarGeomT(bboxT)
+		bboxCU := simpleCovererImpl{rc: rc.s.rc}.covering(bboxRegions)
+		if !isBadCovering(bboxCU) {
+			cu = bboxCU
+		}
+	}
+	return cu
+}
+
+func isBadCovering(cu s2.CellUnion) bool {
+	for _, c := range cu {
+		if c.Face() != 0 {
+			// Good coverings should not see a face other than 0.
+			return true
+		}
+	}
+	return false
+}
 
 // InvertedIndexKeys implements the GeometryIndex interface.
 func (s *s2GeometryIndex) InvertedIndexKeys(c context.Context, g *geo.Geometry) ([]Key, error) {
@@ -92,7 +166,7 @@ func (s *s2GeometryIndex) InvertedIndexKeys(c context.Context, g *geo.Geometry) 
 	var keys []Key
 	if gt != nil {
 		r := s.s2RegionsFromPlanarGeomT(gt)
-		keys = invertedIndexKeys(c, s.rc, r)
+		keys = invertedIndexKeys(c, covererWithBBoxFallback{s: s, geom: gt}, r)
 	}
 	if clipped {
 		keys = append(keys, Key(exceedsBoundsCellID))
@@ -139,7 +213,7 @@ func (s *s2GeometryIndex) Intersects(c context.Context, g *geo.Geometry) (UnionK
 	var spans UnionKeySpans
 	if gt != nil {
 		r := s.s2RegionsFromPlanarGeomT(gt)
-		spans = intersects(c, s.rc, r)
+		spans = intersects(c, covererWithBBoxFallback{s: s, geom: gt}, r)
 	}
 	if clipped {
 		// And lookup all shapes that exceed the bounds.
@@ -175,6 +249,9 @@ func (s *s2GeometryIndex) convertToGeomTAndTryClip(g *geo.Geometry) (geom.T, boo
 	gt, err := g.AsGeomT()
 	if err != nil {
 		return nil, false, err
+	}
+	if gt.Empty() {
+		return gt, false, nil
 	}
 	clipped := false
 	if s.geomExceedsBounds(gt) {
@@ -290,10 +367,13 @@ func (s *s2GeometryIndex) planarPointToS2Point(x float64, y float64) s2.Point {
 	return face0UVToXYZPoint(u, v)
 }
 
-// TODO(sumeer): this is similar to s2RegionsFromGeomT() but needs to do
+// TODO(sumeer): this is similar to S2RegionsFromGeomT() but needs to do
 // a different point conversion. If these functions do not diverge further,
 // and turn out not to be performance critical, merge the two implementations.
 func (s *s2GeometryIndex) s2RegionsFromPlanarGeomT(geomRepr geom.T) []s2.Region {
+	if geomRepr.Empty() {
+		return nil
+	}
 	var regions []s2.Region
 	switch repr := geomRepr.(type) {
 	case *geom.Point:

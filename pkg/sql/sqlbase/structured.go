@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -206,11 +207,18 @@ type ImmutableTableDescriptor struct {
 
 	allChecks []TableDescriptor_CheckConstraint
 
+	// partialIndexOrds contains the ordinal of each partial index.
+	partialIndexOrds util.FastIntSet
+
 	// ReadableColumns is a list of columns (including those undergoing a schema change)
 	// which can be scanned. Columns in the process of a schema change
 	// are all set to nullable while column backfilling is still in
 	// progress, as mutation columns may have NULL values.
 	ReadableColumns []ColumnDescriptor
+
+	// columnsWithUDTs is a set of indexes into publicAndNonPublicCols containing
+	// indexes of columns that contain user defined types.
+	columnsWithUDTs []int
 
 	// TODO (lucy): populate these and use them
 	// inboundFKs  []*ForeignKeyConstraint
@@ -339,6 +347,20 @@ func NewImmutableTableDescriptor(tbl TableDescriptor) *ImmutableTableDescriptor 
 	desc.allChecks = make([]TableDescriptor_CheckConstraint, len(tbl.Checks))
 	for i, c := range tbl.Checks {
 		desc.allChecks[i] = *c
+	}
+
+	// Track partial index ordinals.
+	for i := range publicAndNonPublicIndexes {
+		if publicAndNonPublicIndexes[i].IsPartial() {
+			desc.partialIndexOrds.Add(i)
+		}
+	}
+
+	// Remember what columns have user defined types.
+	for i := range desc.publicAndNonPublicCols {
+		if desc.publicAndNonPublicCols[i].Type.UserDefined() {
+			desc.columnsWithUDTs = append(desc.columnsWithUDTs, i)
+		}
 	}
 
 	return desc
@@ -1291,7 +1313,7 @@ func (desc *TableDescriptor) GetAllReferencedTypeIDs(
 		if err != nil {
 			return err
 		}
-		expr.Walk(visitor)
+		tree.WalkExpr(visitor, expr)
 		return nil
 	}
 
@@ -1868,6 +1890,31 @@ func (desc *TableDescriptor) validateCrossReferences(
 		}
 	}
 	// TODO(dan): Also validate SharedPrefixLen in the interleaves.
+
+	// Validate the all types present in the descriptor exist. typeMap caches
+	// accesses to TypeDescriptors, and is wrapped by getType.
+	typeMap := make(map[ID]*TypeDescriptor)
+	getType := func(id ID) (*TypeDescriptor, error) {
+		if typeDesc, ok := typeMap[id]; ok {
+			return typeDesc, nil
+		}
+		typeDesc, err := GetTypeDescFromID(ctx, txn, codec, id)
+		if err != nil {
+			return nil, errors.Wrapf(err, "type ID %d in descriptor not found", id)
+		}
+		typeMap[id] = typeDesc.TypeDesc()
+		return typeDesc.TypeDesc(), nil
+	}
+	typeIDs, err := desc.GetAllReferencedTypeIDs(getType)
+	if err != nil {
+		return err
+	}
+	for _, id := range typeIDs {
+		if _, err := getType(id); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -2833,6 +2880,12 @@ func (desc *TableDescriptor) FindActiveColumnByID(id ColumnID) (*ColumnDescripto
 		}
 	}
 	return nil, fmt.Errorf("column-id \"%d\" does not exist", id)
+}
+
+// ContainsUserDefinedTypes returns whether or not this table descriptor has
+// any columns of user defined types.
+func (desc *ImmutableTableDescriptor) ContainsUserDefinedTypes() bool {
+	return len(desc.columnsWithUDTs) > 0
 }
 
 // FindReadableColumnByID finds the readable column with specified ID. The
@@ -4358,6 +4411,12 @@ func (desc *ImmutableTableDescriptor) DeletableIndexes() []IndexDescriptor {
 // DeleteOnlyIndexes returns a list of delete-only mutation indexes.
 func (desc *ImmutableTableDescriptor) DeleteOnlyIndexes() []IndexDescriptor {
 	return desc.publicAndNonPublicIndexes[len(desc.Indexes)+desc.writeOnlyIndexCount:]
+}
+
+// PartialIndexOrds returns a set containing the ordinal of each partial index
+// defined on the table.
+func (desc *ImmutableTableDescriptor) PartialIndexOrds() util.FastIntSet {
+	return desc.partialIndexOrds
 }
 
 // DatabaseDesc implements the ObjectDescriptor interface.

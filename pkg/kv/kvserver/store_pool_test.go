@@ -128,6 +128,7 @@ func createTestStorePool(
 // correctly updates a store's details.
 func TestStorePoolGossipUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	stopper, g, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false, /* deterministic */
 		func() int { return 0 }, /* NodeCount */
@@ -194,6 +195,7 @@ func verifyStoreList(
 // that are live and match the attribute criteria.
 func TestStorePoolGetStoreList(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	// We're going to manually mark stores dead in this test.
 	stopper, g, _, sp, mnl := createTestStorePool(
 		TestTimeUntilStoreDead, false, /* deterministic */
@@ -351,6 +353,7 @@ func TestStorePoolGetStoreList(t *testing.T) {
 // properly.
 func TestStoreListFilter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	constraints := []zonepb.ConstraintsConjunction{
 		{
@@ -443,6 +446,7 @@ func TestStoreListFilter(t *testing.T) {
 
 func TestStorePoolUpdateLocalStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
 	// We're going to manually mark stores dead in this test.
@@ -564,6 +568,7 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 // the local copy of store before that store has been gossiped will be a no-op.
 func TestStorePoolUpdateLocalStoreBeforeGossip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
@@ -617,6 +622,7 @@ func TestStorePoolUpdateLocalStoreBeforeGossip(t *testing.T) {
 
 func TestStorePoolGetStoreDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	stopper, g, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
@@ -637,6 +643,7 @@ func TestStorePoolGetStoreDetails(t *testing.T) {
 
 func TestStorePoolFindDeadReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	stopper, g, _, sp, mnl := createTestStorePool(
 		TestTimeUntilStoreDead, false, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
@@ -740,6 +747,7 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 // order.
 func TestStorePoolDefaultState(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	stopper, _, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
@@ -765,6 +773,7 @@ func TestStorePoolDefaultState(t *testing.T) {
 
 func TestStorePoolThrottle(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	stopper, g, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
@@ -803,6 +812,7 @@ func TestStorePoolThrottle(t *testing.T) {
 
 func TestGetLocalities(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	stopper, g, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
@@ -874,6 +884,7 @@ func TestGetLocalities(t *testing.T) {
 
 func TestStorePoolDecommissioningReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	stopper, g, _, sp, mnl := createTestStorePool(
 		TestTimeUntilStoreDead, false, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
@@ -966,6 +977,7 @@ func TestStorePoolDecommissioningReplicas(t *testing.T) {
 
 func TestNodeLivenessLivenessStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	now := timeutil.Now()
 	threshold := 5 * time.Minute
 
@@ -981,8 +993,7 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 				Expiration: hlc.LegacyTimestamp{
 					WallTime: now.Add(5 * time.Minute).UnixNano(),
 				},
-				Decommissioning: false,
-				Draining:        false,
+				Draining: false,
 			},
 			expected: kvserverpb.NodeLivenessStatus_LIVE,
 		},
@@ -994,8 +1005,7 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 					// Expires just slightly in the future.
 					WallTime: now.UnixNano() + 1,
 				},
-				Decommissioning: false,
-				Draining:        false,
+				Draining: false,
 			},
 			expected: kvserverpb.NodeLivenessStatus_LIVE,
 		},
@@ -1008,8 +1018,7 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 					// Just expired.
 					WallTime: now.UnixNano(),
 				},
-				Decommissioning: false,
-				Draining:        false,
+				Draining: false,
 			},
 			expected: kvserverpb.NodeLivenessStatus_UNAVAILABLE,
 		},
@@ -1021,8 +1030,7 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 				Expiration: hlc.LegacyTimestamp{
 					WallTime: now.UnixNano(),
 				},
-				Decommissioning: false,
-				Draining:        false,
+				Draining: false,
 			},
 			expected: kvserverpb.NodeLivenessStatus_UNAVAILABLE,
 		},
@@ -1034,8 +1042,7 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 				Expiration: hlc.LegacyTimestamp{
 					WallTime: now.Add(-threshold).UnixNano() + 1,
 				},
-				Decommissioning: false,
-				Draining:        false,
+				Draining: false,
 			},
 			expected: kvserverpb.NodeLivenessStatus_UNAVAILABLE,
 		},
@@ -1047,8 +1054,7 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 				Expiration: hlc.LegacyTimestamp{
 					WallTime: now.Add(-threshold).UnixNano(),
 				},
-				Decommissioning: false,
-				Draining:        false,
+				Draining: false,
 			},
 			expected: kvserverpb.NodeLivenessStatus_DEAD,
 		},
@@ -1060,12 +1066,12 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 				Expiration: hlc.LegacyTimestamp{
 					WallTime: now.Add(time.Second).UnixNano(),
 				},
-				Decommissioning: true,
-				Draining:        false,
+				Membership: kvserverpb.MembershipStatus_DECOMMISSIONING,
+				Draining:   false,
 			},
 			expected: kvserverpb.NodeLivenessStatus_DECOMMISSIONING,
 		},
-		// Decommissioned.
+		// Decommissioning + expired.
 		{
 			liveness: kvserverpb.Liveness{
 				NodeID: 1,
@@ -1073,8 +1079,37 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 				Expiration: hlc.LegacyTimestamp{
 					WallTime: now.Add(-threshold).UnixNano(),
 				},
-				Decommissioning: true,
-				Draining:        false,
+				Membership: kvserverpb.MembershipStatus_DECOMMISSIONING,
+				Draining:   false,
+			},
+			expected: kvserverpb.NodeLivenessStatus_DECOMMISSIONED,
+		},
+		// Decommissioned + live.
+		{
+			liveness: kvserverpb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(time.Second).UnixNano(),
+				},
+				Membership: kvserverpb.MembershipStatus_DECOMMISSIONED,
+				Draining:   false,
+			},
+			// Despite having marked the node as fully decommissioned, through
+			// this NodeLivenessStatus API we still surface the node as
+			// "Decommissioning". See #50707 for more details.
+			expected: kvserverpb.NodeLivenessStatus_DECOMMISSIONING,
+		},
+		// Decommissioned + expired.
+		{
+			liveness: kvserverpb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(-threshold).UnixNano(),
+				},
+				Membership: kvserverpb.MembershipStatus_DECOMMISSIONED,
+				Draining:   false,
 			},
 			expected: kvserverpb.NodeLivenessStatus_DECOMMISSIONED,
 		},
@@ -1086,8 +1121,7 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 				Expiration: hlc.LegacyTimestamp{
 					WallTime: now.Add(5 * time.Minute).UnixNano(),
 				},
-				Decommissioning: false,
-				Draining:        true,
+				Draining: true,
 			},
 			expected: kvserverpb.NodeLivenessStatus_UNAVAILABLE,
 		},

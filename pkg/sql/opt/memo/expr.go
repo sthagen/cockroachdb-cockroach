@@ -449,6 +449,10 @@ func (fj *FullJoinExpr) initUnexportedFields(mem *Memo) {
 	initJoinMultiplicity(fj)
 }
 
+func (sj *SemiJoinExpr) initUnexportedFields(mem *Memo) {
+	initJoinMultiplicity(sj)
+}
+
 func (lj *LookupJoinExpr) initUnexportedFields(mem *Memo) {
 	// lookupProps are initialized as necessary by the logical props builder.
 }
@@ -473,6 +477,7 @@ type joinWithMultiplicity interface {
 var _ joinWithMultiplicity = &InnerJoinExpr{}
 var _ joinWithMultiplicity = &LeftJoinExpr{}
 var _ joinWithMultiplicity = &FullJoinExpr{}
+var _ joinWithMultiplicity = &SemiJoinExpr{}
 
 func (ij *InnerJoinExpr) setMultiplicity(multiplicity props.JoinMultiplicity) {
 	ij.multiplicity = multiplicity
@@ -496,6 +501,14 @@ func (fj *FullJoinExpr) setMultiplicity(multiplicity props.JoinMultiplicity) {
 
 func (fj *FullJoinExpr) getMultiplicity() props.JoinMultiplicity {
 	return fj.multiplicity
+}
+
+func (sj *SemiJoinExpr) setMultiplicity(multiplicity props.JoinMultiplicity) {
+	sj.multiplicity = multiplicity
+}
+
+func (sj *SemiJoinExpr) getMultiplicity() props.JoinMultiplicity {
+	return sj.multiplicity
 }
 
 // WindowFrame denotes the definition of a window frame for an individual
@@ -555,11 +568,10 @@ func (s *ScanPrivate) IsCanonical() bool {
 // IsUnfiltered returns true if the ScanPrivate will produce all rows in the
 // table.
 func (s *ScanPrivate) IsUnfiltered(md *opt.Metadata) bool {
-	_, isPartialIndex := md.Table(s.Table).Index(s.Index).Predicate()
-	return !isPartialIndex &&
-		(s.Constraint == nil || s.Constraint.IsUnconstrained()) &&
+	return (s.Constraint == nil || s.Constraint.IsUnconstrained()) &&
 		s.InvertedConstraint == nil &&
-		s.HardLimit == 0
+		s.HardLimit == 0 &&
+		!s.UsesPartialIndex(md)
 }
 
 // IsLocking returns true if the ScanPrivate is configured to use a row-level
@@ -568,6 +580,22 @@ func (s *ScanPrivate) IsUnfiltered(md *opt.Metadata) bool {
 // as part of the row retrieval of a DELETE or UPDATE statement.
 func (s *ScanPrivate) IsLocking() bool {
 	return s.Locking != nil
+}
+
+// UsesPartialIndex returns true if the ScanPrivate indicates a scan over a
+// partial index.
+func (s *ScanPrivate) UsesPartialIndex(md *opt.Metadata) bool {
+	tabMeta := md.TableMeta(s.Table)
+	return IsPartialIndex(tabMeta, s.Index)
+}
+
+// PartialIndexPredicate returns the FiltersExpr representing the predicate of
+// the partial index that the scan uses. If the scan does not use a partial
+// index, this function panics. UsesPartialIndex should be called first to
+// determine if the scan operates over a partial index.
+func (s *ScanPrivate) PartialIndexPredicate(md *opt.Metadata) FiltersExpr {
+	tabMeta := md.TableMeta(s.Table)
+	return PartialIndexPredicate(tabMeta, s.Index)
 }
 
 // NeedResults returns true if the mutation operator can return the rows that
@@ -612,7 +640,7 @@ func (m *MutationPrivate) MapToInputCols(tabCols opt.ColSet) opt.ColSet {
 // AddEquivTableCols adds an FD to the given set that declares an equivalence
 // between each table column and its corresponding input column.
 func (m *MutationPrivate) AddEquivTableCols(md *opt.Metadata, fdset *props.FuncDepSet) {
-	for i, n := 0, md.Table(m.Table).DeletableColumnCount(); i < n; i++ {
+	for i, n := 0, md.Table(m.Table).ColumnCount(); i < n; i++ {
 		t := m.Table.ColumnID(i)
 		id := m.MapToInputID(t)
 		if id != 0 {
@@ -801,6 +829,22 @@ func OutputColumnIsAlwaysNull(e RelExpr, col opt.ColumnID) bool {
 	}
 
 	return false
+}
+
+// IsPartialIndex returns true if the table's index at the given ordinal is
+// a partial index.
+func IsPartialIndex(tabMeta *opt.TableMeta, ord cat.IndexOrdinal) bool {
+	_, isPartial := tabMeta.PartialIndexPredicates[ord]
+	return isPartial
+}
+
+// PartialIndexPredicate returns the FiltersExpr representing the partial index
+// predicate at the given index ordinal. If the index at the ordinal is not a
+// partial index, this function panics. IsPartialIndex should be used first to
+// determine if the index is a partial index.
+func PartialIndexPredicate(tabMeta *opt.TableMeta, ord cat.IndexOrdinal) FiltersExpr {
+	p := tabMeta.PartialIndexPredicates[ord]
+	return *p.(*FiltersExpr)
 }
 
 // FKCascades stores metadata necessary for building cascading queries.

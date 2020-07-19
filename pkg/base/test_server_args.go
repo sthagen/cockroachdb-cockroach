@@ -48,6 +48,8 @@ type TestServerArgs struct {
 	Addr string
 	// SQLAddr (if nonempty) is the SQL address to use for the test server.
 	SQLAddr string
+	// TenantAddr (if nonempty) is the tenant KV address to use for the test server.
+	TenantAddr string
 	// HTTPAddr (if nonempty) is the HTTP address to use for the test server.
 	HTTPAddr string
 	// DisableTLSForHTTP if set, disables TLS for the HTTP interface.
@@ -88,6 +90,11 @@ type TestServerArgs struct {
 	TimeSeriesQueryMemoryBudget int64
 	SQLMemoryPoolSize           int64
 	CacheSize                   int64
+
+	// By default, test servers have AutoInitializeCluster=true set in
+	// their config. If NoAutoInitializeCluster is set, that behavior is disabled
+	// and the test becomes responsible for initializing the cluster.
+	NoAutoInitializeCluster bool
 
 	// If set, this will be appended to the Postgres URL by functions that
 	// automatically open a connection to the server. That's equivalent to running
@@ -158,7 +165,7 @@ func DefaultTestTempStorageConfig(st *cluster.Settings) TempStorageConfig {
 func DefaultTestTempStorageConfigWithSize(
 	st *cluster.Settings, maxSizeBytes int64,
 ) TempStorageConfig {
-	monitor := mon.MakeMonitor(
+	monitor := mon.NewMonitor(
 		"in-mem temp storage",
 		mon.DiskResource,
 		nil,             /* curCount */
@@ -170,7 +177,7 @@ func DefaultTestTempStorageConfigWithSize(
 	monitor.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
 	return TempStorageConfig{
 		InMemory: true,
-		Mon:      &monitor,
+		Mon:      monitor,
 	}
 }
 
@@ -198,6 +205,14 @@ const (
 // TestServer.
 type TestTenantArgs struct {
 	TenantID roachpb.TenantID
+
+	// TenantInfo is the metadata used if creating a tenant.
+	TenantInfo []byte
+
+	// Existing, if true, indicates an existing tenant, rather than a new tenant
+	// to be created by StartTenant.
+	Existing bool
+
 	// AllowSettingClusterSettings, if true, allows the tenant to set in-memory
 	// cluster settings.
 	AllowSettingClusterSettings bool

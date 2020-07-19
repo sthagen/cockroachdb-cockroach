@@ -36,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -117,8 +116,8 @@ type conn struct {
 // 3) The reader's context is canceled (happens when the server is draining but
 // the connection was busy and hasn't quit yet): the reader notices the canceled
 // context and, like above, closes the processor.
-// 4) The processor encouters an error. This error can come from various fatal
-// conditions encoutered internally by the processor, or from a network
+// 4) The processor encounters an error. This error can come from various fatal
+// conditions encountered internally by the processor, or from a network
 // communication error encountered while flushing results to the network.
 // The processor will cancel the reader's context and terminate.
 // Note that query processing errors are different; they don't cause the
@@ -126,10 +125,10 @@ type conn struct {
 //
 // Draining notes:
 //
-// The reader notices that the server is draining by polling the draining()
-// closure passed to serveConn. At that point, the reader delegates the
+// The reader notices that the server is draining by polling the IsDraining
+// closure passed to serveImpl. At that point, the reader delegates the
 // responsibility of closing the connection to the statement processor: it will
-// push a DrainRequest to the stmtBuf which signal the processor to quit ASAP.
+// push a DrainRequest to the stmtBuf which signals the processor to quit ASAP.
 // The processor will quit immediately upon seeing that command if it's not
 // currently in a transaction. If it is in a transaction, it will wait until the
 // first time a Sync command is processed outside of a transaction - the logic
@@ -152,7 +151,7 @@ func (s *Server) serveConn(
 	c.testingLogEnabled = atomic.LoadInt32(&s.testingLogEnabled) > 0
 
 	// Do the reading of commands from the network.
-	c.serveImpl(ctx, s.IsDraining, s.SQLServer, reserved, authOpt, s.stopper)
+	c.serveImpl(ctx, s.IsDraining, s.SQLServer, reserved, authOpt)
 }
 
 func newConn(
@@ -210,7 +209,6 @@ func (c *conn) serveImpl(
 	sqlServer *sql.Server,
 	reserved mon.BoundAccount,
 	authOpt authOptions,
-	stopper *stop.Stopper,
 ) {
 	defer func() { _ = c.conn.Close() }()
 
@@ -305,7 +303,6 @@ func (c *conn) serveImpl(
 
 	var err error
 	var terminateSeen bool
-	var doingExtendedQueryMessage bool
 
 	// We need an intSizer, which we're ultimately going to get from the
 	// authenticator once authentication succeeds (because it will actually be a
@@ -352,6 +349,12 @@ Loop:
 			}
 		}
 
+		// TODO(jordan): there's one big missing piece of implementation here.
+		// In Postgres, if an error is encountered during extended protocol mode,
+		// the protocol skips all messages until a Sync is received to "regain
+		// protocol synchronization". We don't do this. If this becomes a problem,
+		// we should copy their behavior.
+
 		switch typ {
 		case pgwirebase.ClientMsgPassword:
 			// This messages are only acceptable during the auth phase, handled above.
@@ -361,17 +364,6 @@ Loop:
 				&c.msgBuilder, &c.writerState.buf)
 			break Loop
 		case pgwirebase.ClientMsgSimpleQuery:
-			if doingExtendedQueryMessage {
-				if err = c.stmtBuf.Push(
-					ctx,
-					sql.SendError{
-						Err: pgwirebase.NewProtocolViolationErrorf(
-							"SimpleQuery not allowed while in extended protocol mode"),
-					},
-				); err != nil {
-					break
-				}
-			}
 			if err = c.handleSimpleQuery(
 				ctx, &c.readBuf, timeReceived, intSizer.GetUnqualifiedIntSize(),
 			); err != nil {
@@ -380,23 +372,18 @@ Loop:
 			err = c.stmtBuf.Push(ctx, sql.Sync{})
 
 		case pgwirebase.ClientMsgExecute:
-			doingExtendedQueryMessage = true
 			err = c.handleExecute(ctx, &c.readBuf, timeReceived)
 
 		case pgwirebase.ClientMsgParse:
-			doingExtendedQueryMessage = true
 			err = c.handleParse(ctx, &c.readBuf, intSizer.GetUnqualifiedIntSize())
 
 		case pgwirebase.ClientMsgDescribe:
-			doingExtendedQueryMessage = true
 			err = c.handleDescribe(ctx, &c.readBuf)
 
 		case pgwirebase.ClientMsgBind:
-			doingExtendedQueryMessage = true
 			err = c.handleBind(ctx, &c.readBuf)
 
 		case pgwirebase.ClientMsgClose:
-			doingExtendedQueryMessage = true
 			err = c.handleClose(ctx, &c.readBuf)
 
 		case pgwirebase.ClientMsgTerminate:
@@ -404,7 +391,6 @@ Loop:
 			break Loop
 
 		case pgwirebase.ClientMsgSync:
-			doingExtendedQueryMessage = false
 			// We're starting a batch here. If the client continues using the extended
 			// protocol and encounters an error, everything until the next sync
 			// message has to be skipped. See:
@@ -413,7 +399,6 @@ Loop:
 			err = c.stmtBuf.Push(ctx, sql.Sync{})
 
 		case pgwirebase.ClientMsgFlush:
-			doingExtendedQueryMessage = true
 			err = c.handleFlush(ctx)
 
 		case pgwirebase.ClientMsgCopyData, pgwirebase.ClientMsgCopyDone, pgwirebase.ClientMsgCopyFail:

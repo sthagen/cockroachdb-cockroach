@@ -68,6 +68,7 @@ var (
 		"input value must be <= %d (maximum Unicode code point)", utf8.MaxRune)
 	errStringTooLarge = pgerror.Newf(pgcode.ProgramLimitExceeded,
 		"requested length too large, exceeds %s", humanizeutil.IBytes(maxAllocatedStringSize))
+	errInvalidNull = pgerror.New(pgcode.InvalidParameterValue, "input cannot be NULL")
 	// SequenceNameArg represents the name of sequence (string) arguments in
 	// builtin functions.
 	SequenceNameArg = "sequence_name"
@@ -3216,6 +3217,7 @@ may increase either contention or retry errors, or both.`,
 	"crdb_internal.create_tenant": makeBuiltin(
 		tree.FunctionProperties{
 			Category:     categoryMultiTenancy,
+			NullableArgs: true,
 			Undocumented: true,
 		},
 		tree.Overload{
@@ -3224,6 +3226,9 @@ may increase either contention or retry errors, or both.`,
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if err := requireNonNull(args[0]); err != nil {
+					return nil, err
+				}
 				sTenID := int64(tree.MustBeDInt(args[0]))
 				if sTenID <= 0 {
 					return nil, pgerror.New(pgcode.InvalidParameterValue, "tenant ID must be positive")
@@ -3243,11 +3248,17 @@ may increase either contention or retry errors, or both.`,
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if err := requireNonNull(args[0]); err != nil {
+					return nil, err
+				}
 				sTenID := int64(tree.MustBeDInt(args[0]))
 				if sTenID <= 0 {
 					return nil, pgerror.New(pgcode.InvalidParameterValue, "tenant ID must be positive")
 				}
-				tenInfo := []byte(tree.MustBeDBytes(args[1]))
+				var tenInfo []byte
+				if args[1] != tree.DNull {
+					tenInfo = []byte(tree.MustBeDBytes(args[1]))
+				}
 				if err := ctx.Tenant.CreateTenant(ctx.Context, uint64(sTenID), tenInfo); err != nil {
 					return nil, err
 				}
@@ -3953,6 +3964,53 @@ may increase either contention or retry errors, or both.`,
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
 			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
+	"num_nulls": makeBuiltin(
+		tree.FunctionProperties{
+			Category:     categoryComparison,
+			NullableArgs: true,
+		},
+		tree.Overload{
+			Types: tree.VariadicType{
+				VarType: types.Any,
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				var numNulls int
+				for _, arg := range args {
+					if arg == tree.DNull {
+						numNulls++
+					}
+				}
+				return tree.NewDInt(tree.DInt(numNulls)), nil
+			},
+			Info:       "Returns the number of null arguments.",
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
+	"num_nonnulls": makeBuiltin(
+		tree.FunctionProperties{
+			Category:     categoryComparison,
+			NullableArgs: true,
+		},
+		tree.Overload{
+			Types: tree.VariadicType{
+				VarType: types.Any,
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				var numNonNulls int
+				for _, arg := range args {
+					if arg != tree.DNull {
+						numNonNulls++
+					}
+				}
+				return tree.NewDInt(tree.DInt(numNonNulls)), nil
+			},
+			Info:       "Returns the number of nonnull arguments.",
+			Volatility: tree.VolatilityImmutable,
 		},
 	),
 }
@@ -5144,11 +5202,16 @@ func regexpReplace(ctx *tree.EvalContext, s, pattern, to, sqlFlags string) (tree
 						// & refers to the entire match.
 						newString.WriteString(s[matchStart:matchEnd])
 					} else {
-						idx := int(to[i] - '0')
-						// regexpReplace expects references to "out-of-bounds" capture groups
-						// to be ignored.
-						if 2*idx < len(matchIndex) {
-							newString.WriteString(s[matchIndex[2*idx]:matchIndex[2*idx+1]])
+						captureGroupNumber := int(to[i] - '0')
+						// regexpReplace expects references to "out-of-bounds"
+						// and empty (when the corresponding match indices
+						// are negative) capture groups to be ignored.
+						if matchIndexPos := 2 * captureGroupNumber; matchIndexPos < len(matchIndex) {
+							startPos := matchIndex[matchIndexPos]
+							endPos := matchIndex[matchIndexPos+1]
+							if startPos >= 0 {
+								newString.WriteString(s[startPos:endPos])
+							}
 						}
 					}
 				}
@@ -5957,4 +6020,11 @@ func recentTimestamp(ctx *tree.EvalContext) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return ctx.StmtTimestamp.Add(offset), nil
+}
+
+func requireNonNull(d tree.Datum) error {
+	if d == tree.DNull {
+		return errInvalidNull
+	}
+	return nil
 }

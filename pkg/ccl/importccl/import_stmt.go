@@ -686,6 +686,16 @@ func importPlanHook(
 				jobDesc = descStr
 			}
 
+			for _, tbl := range tableDescs {
+				// For reasons relating to #37691, we disallow user defined types in
+				// the standard IMPORT case.
+				for _, col := range tbl.Columns {
+					if col.Type.UserDefined() {
+						return errors.Newf("IMPORT cannot be used with user defined types; use IMPORT INTO instead")
+					}
+				}
+			}
+
 			tableDetails = make([]jobspb.ImportDetails_Table, len(tableDescs))
 			for i := range tableDescs {
 				tableDetails[i] = jobspb.ImportDetails_Table{Desc: tableDescs[i], SeqVal: seqVals[tableDescs[i].ID], IsNew: true}
@@ -858,14 +868,15 @@ func prepareNewTableDescsForIngestion(
 	importTables []jobspb.ImportDetails_Table,
 	parentID sqlbase.ID,
 ) ([]*sqlbase.TableDescriptor, error) {
-	var tableDescs []*sqlbase.TableDescriptor
-	for _, i := range importTables {
+	tableDescs := make([]*sqlbase.TableDescriptor, len(importTables))
+	for i := range importTables {
 		// TODO (rohany): Use keys.PublicSchemaID for now, revisit this once we
 		//  support user defined schemas.
-		if err := backupccl.CheckObjectExists(ctx, txn, p.ExecCfg().Codec, parentID, keys.PublicSchemaID, i.Desc.Name); err != nil {
+		if err := backupccl.CheckObjectExists(ctx, txn, p.ExecCfg().Codec, parentID,
+			keys.PublicSchemaID, importTables[i].Desc.Name); err != nil {
 			return nil, err
 		}
-		tableDescs = append(tableDescs, i.Desc)
+		tableDescs[i] = importTables[i].Desc
 	}
 
 	// Verification steps have passed, generate a new table ID if we're
@@ -890,17 +901,24 @@ func prepareNewTableDescsForIngestion(
 		return nil, err
 	}
 
-	tables := make([]sqlbase.TableDescriptorInterface, len(tableDescs))
+	newMutableTableDescriptors := make([]sqlbase.TableDescriptorInterface, len(tableDescs))
 	for i := range tableDescs {
 		tableDescs[i].State = sqlbase.TableDescriptor_OFFLINE
 		tableDescs[i].OfflineReason = "importing"
-		tables[i] = sqlbase.NewMutableCreatedTableDescriptor(*tableDescs[i])
+		newMutableTableDescriptors[i] = sqlbase.NewMutableCreatedTableDescriptor(*tableDescs[i])
 	}
 
+	// newMutableTableDescriptors is a slice of *MutableTableDescriptor. Each
+	// MutableTableDescriptor at index i in newMutableTableDescriptors, has an
+	// underlying copy of the TableDescriptor at index i in tableDescs. Since all
+	// mutations to the underlying TableDescriptor will henceforth occur on this
+	// MutableTableDescriptor, tableDescs should not be used beyond this point.
+	tableDescs = nil
+
 	var seqValKVs []roachpb.KeyValue
-	for i := range tables {
-		tableDesc := tables[i].TableDesc()
-		if v, ok := seqVals[tables[i].GetID()]; ok && v != 0 {
+	for i := range newMutableTableDescriptors {
+		tableDesc := newMutableTableDescriptors[i].TableDesc()
+		if v, ok := seqVals[newMutableTableDescriptors[i].GetID()]; ok && v != 0 {
 			key, val, err := sql.MakeSequenceKeyVal(p.ExecCfg().Codec, tableDesc, v, false)
 			if err != nil {
 				return nil, err
@@ -914,11 +932,18 @@ func prepareNewTableDescsForIngestion(
 	// Write the new TableDescriptors and flip the namespace entries over to
 	// them. After this call, any queries on a table will be served by the newly
 	// imported data.
-	if err := backupccl.WriteDescriptors(ctx, txn, nil /* databases */, tables, nil, tree.RequestedDescriptors, p.ExecCfg().Settings, seqValKVs); err != nil {
+	if err := backupccl.WriteDescriptors(ctx, txn, nil, /* databases */
+		newMutableTableDescriptors, nil, tree.RequestedDescriptors,
+		p.ExecCfg().Settings, seqValKVs); err != nil {
 		return nil, errors.Wrapf(err, "creating importTables")
 	}
 
-	return tableDescs, nil
+	newPreparedTableDescs := make([]*sqlbase.TableDescriptor, len(newMutableTableDescriptors))
+	for i := range newMutableTableDescriptors {
+		newPreparedTableDescs[i] = newMutableTableDescriptors[i].TableDesc()
+	}
+
+	return newPreparedTableDescs, nil
 }
 
 // Prepares descriptors for existing tables being imported into.
@@ -978,7 +1003,7 @@ func (r *importResumer) prepareTableDescsForIngestion(
 		importDetails := details
 		importDetails.Tables = make([]jobspb.ImportDetails_Table, len(details.Tables))
 
-		newTableDescToIdx := make(map[*sqlbase.TableDescriptor]int, len(importDetails.Tables))
+		newTablenameToIdx := make(map[string]int, len(importDetails.Tables))
 		var hasExistingTables bool
 		var err error
 		var newTableDescs []jobspb.ImportDetails_Table
@@ -996,7 +1021,7 @@ func (r *importResumer) prepareTableDescsForIngestion(
 
 				hasExistingTables = true
 			} else {
-				newTableDescToIdx[table.Desc] = i
+				newTablenameToIdx[table.Desc.Name] = i
 				newTableDescs = append(newTableDescs, table)
 			}
 		}
@@ -1014,12 +1039,15 @@ func (r *importResumer) prepareTableDescsForIngestion(
 			if err != nil {
 				return err
 			}
-			for i, table := range res {
-				importDetails.Tables[i] = jobspb.ImportDetails_Table{Desc: table,
-					Name:       details.Tables[i].Name,
-					SeqVal:     details.Tables[i].SeqVal,
-					IsNew:      details.Tables[i].IsNew,
-					TargetCols: details.Tables[i].TargetCols}
+
+			for _, desc := range res {
+				i := newTablenameToIdx[desc.Name]
+				table := details.Tables[i]
+				importDetails.Tables[i] = jobspb.ImportDetails_Table{Desc: desc,
+					Name:       table.Name,
+					SeqVal:     table.SeqVal,
+					IsNew:      table.IsNew,
+					TargetCols: table.TargetCols}
 			}
 		}
 

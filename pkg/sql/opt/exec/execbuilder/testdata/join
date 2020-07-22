@@ -94,32 +94,31 @@ EXPLAIN SELECT * FROM
   JOIN twocolumn AS c (d, e) ON a.b = c.d AND c.d = onecolumn.x
 LIMIT 1
 ----
-·                         distribution  local
-·                         vectorized    true
-render                    ·             ·
- └── limit                ·             ·
-      │                   count         1
-      └── hash-join       ·             ·
-           │              type          inner
-           │              equality      (x) = (x)
-           ├── hash-join  ·             ·
-           │    │         type          inner
-           │    │         equality      (x) = (x)
-           │    ├── scan  ·             ·
-           │    │         table         twocolumn@primary
-           │    │         spans         FULL SCAN
-           │    └── scan  ·             ·
-           │              table         onecolumn@primary
-           │              spans         FULL SCAN
-           └── hash-join  ·             ·
-                │         type          inner
-                │         equality      (x) = (x)
-                ├── scan  ·             ·
-                │         table         onecolumn@primary
-                │         spans         FULL SCAN
-                └── scan  ·             ·
-·                         table         twocolumn@primary
-·                         spans         FULL SCAN
+·                    distribution  local
+·                    vectorized    true
+limit                ·             ·
+ │                   count         1
+ └── hash-join       ·             ·
+      │              type          inner
+      │              equality      (x) = (x)
+      ├── hash-join  ·             ·
+      │    │         type          inner
+      │    │         equality      (x) = (x)
+      │    ├── scan  ·             ·
+      │    │         table         onecolumn@primary
+      │    │         spans         FULL SCAN
+      │    └── scan  ·             ·
+      │              table         twocolumn@primary
+      │              spans         FULL SCAN
+      └── hash-join  ·             ·
+           │         type          inner
+           │         equality      (x) = (x)
+           ├── scan  ·             ·
+           │         table         onecolumn@primary
+           │         spans         FULL SCAN
+           └── scan  ·             ·
+·                    table         twocolumn@primary
+·                    spans         FULL SCAN
 
 # The following queries verify that only the necessary columns are scanned.
 query TTTTT
@@ -353,75 +352,61 @@ SELECT level, node_type, field, description FROM [EXPLAIN (VERBOSE) SELECT
 3   ·                          right cols are key  ·
 4   hash-join                  ·                   ·
 4   ·                          type                inner
-4   ·                          equality            (objid) = (oid)
+4   ·                          equality            (oid) = (relnamespace)
 5   render                     ·                   ·
-5   ·                          render 0            objid
-5   ·                          render 1            refobjid
+5   ·                          render 0            oid
+5   ·                          render 1            nspname
 6   virtual table              ·                   ·
-6   ·                          source              pg_depend@primary
-5   cross-join                 ·                   ·
+6   ·                          source              pg_namespace@primary
+5   hash-join                  ·                   ·
 5   ·                          type                inner
-5   ·                          pred                (attnum = confkey[generate_series]) AND (attnum = conkey[generate_series])
+5   ·                          equality            (objid) = (oid)
+6   render                     ·                   ·
+6   ·                          render 0            objid
+6   ·                          render 1            refobjid
+7   virtual table              ·                   ·
+7   ·                          source              pg_depend@primary
 6   hash-join                  ·                   ·
 6   ·                          type                inner
-6   ·                          equality            (conrelid) = (oid)
-7   hash-join                  ·                   ·
+6   ·                          equality            (relnamespace) = (oid)
+7   cross-join                 ·                   ·
 7   ·                          type                inner
-7   ·                          equality            (oid) = (relnamespace)
+7   ·                          pred                (attnum = confkey[generate_series]) AND (attnum = conkey[generate_series])
+8   project set                ·                   ·
+8   ·                          render 0            generate_series(1, 32)
+9   emptyrow                   ·                   ·
+8   virtual-table-lookup-join  ·                   ·
+8   ·                          table               pg_attribute@pg_attribute_attrelid_idx
+8   ·                          type                inner
+8   ·                          equality            (oid) = (attrelid)
+9   virtual-table-lookup-join  ·                   ·
+9   ·                          table               pg_class@pg_class_oid_idx
+9   ·                          type                inner
+9   ·                          equality            (attrelid) = (oid)
+10  virtual-table-lookup-join  ·                   ·
+10  ·                          table               pg_attribute@pg_attribute_attrelid_idx
+10  ·                          type                inner
+10  ·                          equality            (confrelid) = (attrelid)
+11  virtual-table-lookup-join  ·                   ·
+11  ·                          table               pg_constraint@pg_constraint_conrelid_idx
+11  ·                          type                inner
+11  ·                          equality            (oid) = (conrelid)
+11  ·                          pred                contype = 'f'
+12  filter                     ·                   ·
+12  ·                          filter              relname = 'orders'
+13  render                     ·                   ·
+13  ·                          render 0            oid
+13  ·                          render 1            relname
+13  ·                          render 2            relnamespace
+14  virtual table              ·                   ·
+14  ·                          source              pg_class@primary
+7   filter                     ·                   ·
+7   ·                          filter              nspname = 'public'
 8   render                     ·                   ·
 8   ·                          render 0            oid
 8   ·                          render 1            nspname
 9   virtual table              ·                   ·
 9   ·                          source              pg_namespace@primary
-8   virtual-table-lookup-join  ·                   ·
-8   ·                          table               pg_class@pg_class_oid_idx
-8   ·                          type                inner
-8   ·                          equality            (attrelid) = (oid)
-9   virtual-table-lookup-join  ·                   ·
-9   ·                          table               pg_attribute@pg_attribute_attrelid_idx
-9   ·                          type                inner
-9   ·                          equality            (confrelid) = (attrelid)
-10  filter                     ·                   ·
-10  ·                          filter              contype = 'f'
-11  render                     ·                   ·
-11  ·                          render 0            oid
-11  ·                          render 1            conname
-11  ·                          render 2            contype
-11  ·                          render 3            condeferrable
-11  ·                          render 4            condeferred
-11  ·                          render 5            conrelid
-11  ·                          render 6            confrelid
-11  ·                          render 7            confupdtype
-11  ·                          render 8            confdeltype
-11  ·                          render 9            conkey
-11  ·                          render 10           confkey
-12  virtual table              ·                   ·
-12  ·                          source              pg_constraint@primary
-7   hash-join                  ·                   ·
-7   ·                          type                inner
-7   ·                          equality            (oid) = (relnamespace)
-8   filter                     ·                   ·
-8   ·                          filter              nspname = 'public'
-9   render                     ·                   ·
-9   ·                          render 0            oid
-9   ·                          render 1            nspname
-10  virtual table              ·                   ·
-10  ·                          source              pg_namespace@primary
-8   virtual-table-lookup-join  ·                   ·
-8   ·                          table               pg_attribute@pg_attribute_attrelid_idx
-8   ·                          type                inner
-8   ·                          equality            (oid) = (attrelid)
-9   filter                     ·                   ·
-9   ·                          filter              relname = 'orders'
-10  render                     ·                   ·
-10  ·                          render 0            oid
-10  ·                          render 1            relname
-10  ·                          render 2            relnamespace
-11  virtual table              ·                   ·
-11  ·                          source              pg_class@primary
-6   project set                ·                   ·
-6   ·                          render 0            generate_series(1, 32)
-7   emptyrow                   ·                   ·
 4   filter                     ·                   ·
 4   ·                          filter              relkind = 'i'
 5   render                     ·                   ·
@@ -488,10 +473,10 @@ render               ·             ·                 (a, b, n, sq)           �
  │                   render 1      b                 ·                       ·
  │                   render 2      n                 ·                       ·
  │                   render 3      sq                ·                       ·
- └── hash-join       ·             ·                 (column6, a, b, n, sq)  ·
+ └── hash-join       ·             ·                 (column8, a, b, n, sq)  ·
       │              type          inner             ·                       ·
-      │              equality      (column6) = (sq)  ·                       ·
-      ├── render     ·             ·                 (column6, a, b)         ·
+      │              equality      (column8) = (sq)  ·                       ·
+      ├── render     ·             ·                 (column8, a, b)         ·
       │    │         render 0      a + b             ·                       ·
       │    │         render 1      a                 ·                       ·
       │    │         render 2      b                 ·                       ·
@@ -542,10 +527,10 @@ render               ·             ·                 (a, b, n, sq)           �
  │                   render 1      b                 ·                       ·
  │                   render 2      n                 ·                       ·
  │                   render 3      sq                ·                       ·
- └── hash-join       ·             ·                 (column6, a, b, n, sq)  ·
+ └── hash-join       ·             ·                 (column8, a, b, n, sq)  ·
       │              type          full outer        ·                       ·
-      │              equality      (column6) = (sq)  ·                       ·
-      ├── render     ·             ·                 (column6, a, b)         ·
+      │              equality      (column8) = (sq)  ·                       ·
+      ├── render     ·             ·                 (column8, a, b)         ·
       │    │         render 0      a + b             ·                       ·
       │    │         render 1      a                 ·                       ·
       │    │         render 2      b                 ·                       ·
@@ -566,12 +551,12 @@ render                    ·             ·                    (a, b, n, sq)    
  │                        render 1      b                    ·                       ·
  │                        render 2      n                    ·                       ·
  │                        render 3      sq                   ·                       ·
- └── filter               ·             ·                    (column6, a, b, n, sq)  ·
+ └── filter               ·             ·                    (column8, a, b, n, sq)  ·
       │                   filter        (b % 2) != (sq % 2)  ·                       ·
-      └── hash-join       ·             ·                    (column6, a, b, n, sq)  ·
+      └── hash-join       ·             ·                    (column8, a, b, n, sq)  ·
            │              type          full outer           ·                       ·
-           │              equality      (column6) = (sq)     ·                       ·
-           ├── render     ·             ·                    (column6, a, b)         ·
+           │              equality      (column8) = (sq)     ·                       ·
+           ├── render     ·             ·                    (column8, a, b)         ·
            │    │         render 0      a + b                ·                       ·
            │    │         render 1      a                    ·                       ·
            │    │         render 2      b                    ·                       ·

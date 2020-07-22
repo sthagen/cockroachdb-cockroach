@@ -58,27 +58,22 @@ CREATE TABLE u (b string)
 query TTTTT
 EXPLAIN (VERBOSE) SELECT t.*, u.*, generate_series(1,2), generate_series(3, 4) FROM t, u
 ----
-·                             distribution  local                  ·                                         ·
-·                             vectorized    true                   ·                                         ·
-render                        ·             ·                      (a, b, generate_series, generate_series)  ·
- │                            render 0      a                      ·                                         ·
- │                            render 1      b                      ·                                         ·
- │                            render 2      generate_series        ·                                         ·
- │                            render 3      generate_series        ·                                         ·
- └── cross-join               ·             ·                      (b, generate_series, generate_series, a)  ·
-      │                       type          cross                  ·                                         ·
-      ├── cross-join          ·             ·                      (b, generate_series, generate_series)     ·
-      │    │                  type          cross                  ·                                         ·
-      │    ├── scan           ·             ·                      (b)                                       ·
-      │    │                  table         u@primary              ·                                         ·
-      │    │                  spans         FULL SCAN              ·                                         ·
-      │    └── project set    ·             ·                      (generate_series, generate_series)        ·
-      │         │             render 0      generate_series(1, 2)  ·                                         ·
-      │         │             render 1      generate_series(3, 4)  ·                                         ·
-      │         └── emptyrow  ·             ·                      ()                                        ·
-      └── scan                ·             ·                      (a)                                       ·
-·                             table         t@primary              ·                                         ·
-·                             spans         FULL SCAN              ·                                         ·
+·                   distribution  local                  ·                                         ·
+·                   vectorized    true                   ·                                         ·
+cross-join          ·             ·                      (a, b, generate_series, generate_series)  ·
+ │                  type          cross                  ·                                         ·
+ ├── cross-join     ·             ·                      (a, b)                                    ·
+ │    │             type          cross                  ·                                         ·
+ │    ├── scan      ·             ·                      (a)                                       ·
+ │    │             table         t@primary              ·                                         ·
+ │    │             spans         FULL SCAN              ·                                         ·
+ │    └── scan      ·             ·                      (b)                                       ·
+ │                  table         u@primary              ·                                         ·
+ │                  spans         FULL SCAN              ·                                         ·
+ └── project set    ·             ·                      (generate_series, generate_series)        ·
+      │             render 0      generate_series(1, 2)  ·                                         ·
+      │             render 1      generate_series(3, 4)  ·                                         ·
+      └── emptyrow  ·             ·                      ()                                        ·
 
 subtest correlated_SRFs
 
@@ -243,17 +238,17 @@ render                              ·                   ·                     
                 │                   render 0            id                        ·                                             ·
                 │                   render 1            data                      ·                                             ·
                 │                   render 2            "?column?"                ·                                             ·
-                └── hash-join       ·                   ·                         (column8, id, data, column9, "?column?")      ·
+                └── hash-join       ·                   ·                         (column10, id, data, column11, "?column?")    ·
                      │              type                left outer                ·                                             ·
-                     │              equality            (column8) = (column9)     ·                                             ·
-                     ├── render     ·                   ·                         (column8, id, data)                           ·
+                     │              equality            (column10) = (column11)   ·                                             ·
+                     ├── render     ·                   ·                         (column10, id, data)                          ·
                      │    │         render 0            data->>'name'             ·                                             ·
                      │    │         render 1            id                        ·                                             ·
                      │    │         render 2            data                      ·                                             ·
                      │    └── scan  ·                   ·                         (id, data)                                    ·
                      │              table               groups@primary            ·                                             ·
                      │              spans               FULL SCAN                 ·                                             ·
-                     └── render     ·                   ·                         (column9, "?column?")                         ·
+                     └── render     ·                   ·                         (column11, "?column?")                        ·
                           │         render 0            data->>'name'             ·                                             ·
                           │         render 1            data->'members'           ·                                             ·
                           └── scan  ·                   ·                         (data)                                        ·

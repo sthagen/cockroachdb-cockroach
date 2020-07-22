@@ -131,7 +131,6 @@ func constructExplainPlanNode(
 			options:       options,
 			plan:          p.main,
 			subqueryPlans: p.subqueryPlans,
-			stmtType:      stmtType,
 		}, nil
 
 	case tree.ExplainPlan:
@@ -142,7 +141,6 @@ func constructExplainPlanNode(
 			context.TODO(),
 			options,
 			&p.planComponents,
-			stmtType,
 		)
 
 	default:
@@ -366,4 +364,18 @@ func constructVirtualScan(
 		}
 	}
 	return n, nil
+}
+
+func collectSystemColumnsFromCfg(
+	colCfg *scanColumnsConfig,
+) (systemColumns []sqlbase.SystemColumnKind, systemColumnOrdinals []int) {
+	for i, id := range colCfg.wantedColumns {
+		sysColKind := sqlbase.GetSystemColumnKindFromColumnID(sqlbase.ColumnID(id))
+		if sysColKind != sqlbase.SystemColumnKind_NONE {
+			// The scan is requested to produce a system column.
+			systemColumns = append(systemColumns, sysColKind)
+			systemColumnOrdinals = append(systemColumnOrdinals, i)
+		}
+	}
+	return systemColumns, systemColumnOrdinals
 }

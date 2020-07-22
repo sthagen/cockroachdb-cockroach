@@ -164,7 +164,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
 			AvoidCached: n.p.avoidCachedDescriptors,
 		}}
-		tableDesc, err = n.p.Tables().GetTableVersionByID(ctx, n.p.txn, sqlbase.ID(t.TableID), flags)
+		tableDesc, err = n.p.Descriptors().GetTableVersionByID(ctx, n.p.txn, sqlbase.ID(t.TableID), flags)
 		if err != nil {
 			return nil, err
 		}
@@ -470,10 +470,10 @@ func (r *createStatsResumer) Resume(
 		return err
 	}
 
-	// Invalidate the local cache synchronously; this guarantees that the next
-	// statement in the same session won't use a stale cache (whereas the gossip
-	// update is handled asynchronously).
-	evalCtx.ExecCfg.TableStatsCache.InvalidateTableStats(ctx, r.tableID)
+	// Refresh the local cache if Gossip is not available.
+	if _, ok := evalCtx.ExecCfg.Gossip.Optional(47925); !ok {
+		evalCtx.ExecCfg.TableStatsCache.RefreshTableStats(ctx, r.tableID)
+	}
 
 	// Record this statistics creation in the event log.
 	if !createStatsPostEvents.Get(&evalCtx.Settings.SV) {

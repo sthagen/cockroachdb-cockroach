@@ -659,10 +659,14 @@ func (sc *SchemaChanger) truncateIndexes(
 				// Hydrate types used in the retrieved table.
 				// TODO (rohany): This can be removed once table access from the
 				//  desc.Collection returns tables with hydrated types.
-				typLookup := func(id sqlbase.ID) (*tree.TypeName, sqlbase.TypeDescriptorInterface, error) {
+				typLookup := func(ctx context.Context, id sqlbase.ID) (*tree.TypeName, sqlbase.TypeDescriptorInterface, error) {
 					return resolver.ResolveTypeDescByID(ctx, txn, sc.execCfg.Codec, id, tree.ObjectLookupFlags{})
 				}
-				if err := sqlbase.HydrateTypesInTableDescriptor(tableDesc.TableDesc(), typLookup); err != nil {
+				if err := sqlbase.HydrateTypesInTableDescriptor(
+					ctx,
+					tableDesc.TableDesc(),
+					sqlbase.TypeLookupFunc(typLookup),
+				); err != nil {
 					return err
 				}
 
@@ -1204,7 +1208,7 @@ func (sc *SchemaChanger) validateForwardIndexes(
 			}
 			tc := descs.NewCollection(sc.leaseMgr, sc.settings)
 			// pretend that the schema has been modified.
-			if err := tc.AddUncommittedTable(*desc); err != nil {
+			if err := tc.AddUncommittedDescriptor(desc); err != nil {
 				return err
 			}
 
@@ -1386,7 +1390,7 @@ func runSchemaChangesInTxn(
 				if doneColumnBackfill || !sqlbase.ColumnNeedsBackfill(m.GetColumn()) {
 					break
 				}
-				if err := columnBackfillInTxn(ctx, planner.Txn(), planner.Tables(), planner.EvalContext(), immutDesc, traceKV); err != nil {
+				if err := columnBackfillInTxn(ctx, planner.Txn(), planner.Descriptors(), planner.EvalContext(), immutDesc, traceKV); err != nil {
 					return err
 				}
 				doneColumnBackfill = true
@@ -1408,7 +1412,7 @@ func runSchemaChangesInTxn(
 					if selfReference {
 						referencedTableDesc = tableDesc
 					} else {
-						lookup, err := planner.Tables().GetMutableTableVersionByID(ctx, fk.ReferencedTableID, planner.Txn())
+						lookup, err := planner.Descriptors().GetMutableTableVersionByID(ctx, fk.ReferencedTableID, planner.Txn())
 						if err != nil {
 							return errors.Errorf("error resolving referenced table ID %d: %v", fk.ReferencedTableID, err)
 						}
@@ -1447,7 +1451,7 @@ func runSchemaChangesInTxn(
 					break
 				}
 				if err := columnBackfillInTxn(
-					ctx, planner.Txn(), planner.Tables(), planner.EvalContext(), immutDesc, traceKV,
+					ctx, planner.Txn(), planner.Descriptors(), planner.EvalContext(), immutDesc, traceKV,
 				); err != nil {
 					return err
 				}
@@ -1516,7 +1520,7 @@ func runSchemaChangesInTxn(
 				}
 				if len(oldIndex.Interleave.Ancestors) != 0 {
 					ancestorInfo := oldIndex.Interleave.Ancestors[len(oldIndex.Interleave.Ancestors)-1]
-					ancestor, err := planner.Tables().GetMutableTableVersionByID(ctx, ancestorInfo.TableID, planner.txn)
+					ancestor, err := planner.Descriptors().GetMutableTableVersionByID(ctx, ancestorInfo.TableID, planner.txn)
 					if err != nil {
 						return err
 					}
@@ -1556,7 +1560,7 @@ func runSchemaChangesInTxn(
 		switch c.ConstraintType {
 		case sqlbase.ConstraintToUpdate_CHECK, sqlbase.ConstraintToUpdate_NOT_NULL:
 			if err := validateCheckInTxn(
-				ctx, planner.Tables().LeaseManager(), &planner.semaCtx, planner.EvalContext(), tableDesc, planner.txn, c.Check.Name,
+				ctx, planner.Descriptors().LeaseManager(), &planner.semaCtx, planner.EvalContext(), tableDesc, planner.txn, c.Check.Name,
 			); err != nil {
 				return err
 			}
@@ -1613,7 +1617,7 @@ func validateCheckInTxn(
 	if tableDesc.Version > tableDesc.ClusterVersion.Version {
 		newTc := descs.NewCollection(leaseMgr, evalCtx.Settings)
 		// pretend that the schema has been modified.
-		if err := newTc.AddUncommittedTable(*tableDesc); err != nil {
+		if err := newTc.AddUncommittedDescriptor(tableDesc); err != nil {
 			return err
 		}
 
@@ -1654,7 +1658,7 @@ func validateFkInTxn(
 	if tableDesc.Version > tableDesc.ClusterVersion.Version {
 		newTc := descs.NewCollection(leaseMgr, evalCtx.Settings)
 		// pretend that the schema has been modified.
-		if err := newTc.AddUncommittedTable(*tableDesc); err != nil {
+		if err := newTc.AddUncommittedDescriptor(tableDesc); err != nil {
 			return err
 		}
 

@@ -929,7 +929,7 @@ func writeTableDesc(
 	ctx context.Context, db *kv.DB, tableDesc *sqlbase.MutableTableDescriptor,
 ) error {
 	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		if err := txn.SetSystemConfigTrigger(); err != nil {
+		if err := txn.SetSystemConfigTrigger(true /* forSystemTenant */); err != nil {
 			return err
 		}
 		tableDesc.ModificationTime = txn.CommitTimestamp()
@@ -984,7 +984,7 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	// Simulate a migration upgrading the table descriptor's format version after
 	// the table has been dropped but before the truncation has occurred.
 	var err error
-	tableDesc, err = sqlbase.GetMutableTableDescFromID(ctx, kvDB.NewTxn(ctx, ""), keys.SystemSQLCodec, tableDesc.ID)
+	tableDesc, err = sqlbase.TestingGetMutableTableDescFromID(ctx, kvDB.NewTxn(ctx, ""), keys.SystemSQLCodec, tableDesc.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

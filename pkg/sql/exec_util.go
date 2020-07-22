@@ -148,10 +148,20 @@ const ReorderJoinsLimitClusterSettingName = "sql.defaults.reorder_joins_limit"
 
 // ReorderJoinsLimitClusterValue controls the cluster default for the maximum
 // number of joins reordered.
-var ReorderJoinsLimitClusterValue = settings.RegisterNonNegativeIntSetting(
+var ReorderJoinsLimitClusterValue = settings.RegisterValidatedIntSetting(
 	ReorderJoinsLimitClusterSettingName,
 	"default number of joins to reorder",
 	opt.DefaultJoinOrderLimit,
+	func(limit int64) error {
+		if limit < 0 || limit > opt.MaxReorderJoinsLimit {
+			return pgerror.Newf(pgcode.InvalidParameterValue,
+				"cannot set %s to a value less than 0 or greater than %v",
+				ReorderJoinsLimitClusterSettingName,
+				opt.MaxReorderJoinsLimit,
+			)
+		}
+		return nil
+	},
 )
 
 var requireExplicitPrimaryKeysClusterMode = settings.RegisterBoolSetting(
@@ -249,6 +259,14 @@ var experimentalAlterColumnTypeGeneralMode = settings.RegisterBoolSetting(
 	"default value for experimental_alter_column_type session setting; "+
 		"enables the use of ALTER COLUMN TYPE for general conversions",
 	false,
+)
+
+var clusterIdleInSessionTimeout = settings.RegisterNonNegativeDurationSetting(
+	"sql.defaults.idle_in_session_timeout",
+	"default value for the idle_in_session_timeout; "+
+		"enables automatically killing sessions that exceed the "+
+		"idle_in_session_timeout threshold",
+	0,
 )
 
 // ExperimentalDistSQLPlanningClusterSettingName is the name for the cluster
@@ -2116,6 +2134,10 @@ func (m *sessionDataMutator) SetReadOnly(val bool) {
 
 func (m *sessionDataMutator) SetStmtTimeout(timeout time.Duration) {
 	m.data.StmtTimeout = timeout
+}
+
+func (m *sessionDataMutator) SetIdleInSessionTimeout(timeout time.Duration) {
+	m.data.IdleInSessionTimeout = timeout
 }
 
 func (m *sessionDataMutator) SetAllowPrepareAsOptPlan(val bool) {

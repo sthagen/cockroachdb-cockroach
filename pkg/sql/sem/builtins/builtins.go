@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -2864,6 +2865,32 @@ may increase either contention or retry errors, or both.`,
 
 	"jsonb_array_length": makeBuiltin(jsonProps(), jsonArrayLengthImpl),
 
+	"crdb_internal.pb_to_json": makeBuiltin(
+		jsonProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"pbname", types.String},
+				{"data", types.Bytes},
+			},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				msg, err := protoreflect.DecodeMessage(
+					string(tree.MustBeDString(args[0])),
+					[]byte(tree.MustBeDBytes(args[1])),
+				)
+				if err != nil {
+					return nil, err
+				}
+				j, err := protoreflect.MessageToJSON(msg)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDJSON(j), nil
+			},
+			Info:       "Converts protocol message to its JSONB representation.",
+			Volatility: tree.VolatilityImmutable,
+		}),
+
 	// Enum functions.
 	"enum_first": makeBuiltin(
 		tree.FunctionProperties{NullableArgs: true, Category: categoryEnum},
@@ -2875,7 +2902,7 @@ may increase either contention or retry errors, or both.`,
 					return nil, pgerror.Newf(pgcode.NullValueNotAllowed, "argument cannot be NULL")
 				}
 				arg := args[0].(*tree.DEnum)
-				min, ok := arg.Min(evalCtx)
+				min, ok := arg.MinWriteable()
 				if !ok {
 					return nil, errors.Newf("enum %s contains no values", arg.ResolvedType().Name())
 				}
@@ -2896,7 +2923,7 @@ may increase either contention or retry errors, or both.`,
 					return nil, pgerror.Newf(pgcode.NullValueNotAllowed, "argument cannot be NULL")
 				}
 				arg := args[0].(*tree.DEnum)
-				max, ok := arg.Max(evalCtx)
+				max, ok := arg.MaxWriteable()
 				if !ok {
 					return nil, errors.Newf("enum %s contains no values", arg.ResolvedType().Name())
 				}
@@ -2920,6 +2947,10 @@ may increase either contention or retry errors, or both.`,
 				typ := arg.EnumTyp
 				arr := tree.NewDArray(typ)
 				for i := range typ.TypeMeta.EnumData.LogicalRepresentations {
+					// Read-only members should be excluded.
+					if typ.TypeMeta.EnumData.IsMemberReadOnly[i] {
+						continue
+					}
 					enum := &tree.DEnum{
 						EnumTyp:     typ,
 						PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[i],
@@ -2983,6 +3014,10 @@ may increase either contention or retry errors, or both.`,
 				}
 				arr := tree.NewDArray(typ)
 				for i := bottom; i <= top; i++ {
+					// Read-only members should be excluded.
+					if typ.TypeMeta.EnumData.IsMemberReadOnly[i] {
+						continue
+					}
 					enum := &tree.DEnum{
 						EnumTyp:     typ,
 						PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[i],
@@ -3185,6 +3220,19 @@ may increase either contention or retry errors, or both.`,
 			},
 			Info:       "Returns the version of CockroachDB this node is running.",
 			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
+	"crdb_internal.approximate_timestamp": makeBuiltin(
+		tree.FunctionProperties{Category: categorySystemInfo},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"timestamp", types.Decimal}},
+			ReturnType: tree.FixedReturnType(types.Timestamp),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				return tree.DecimalToInexactDTimestamp(args[0].(*tree.DDecimal))
+			},
+			Info:       "Converts the crdb_internal_mvcc_timestamp column into an approximate timestamp.",
+			Volatility: tree.VolatilityImmutable,
 		},
 	),
 

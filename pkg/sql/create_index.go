@@ -161,11 +161,15 @@ func MakeIndexDescriptor(
 		if err != nil {
 			return nil, err
 		}
-		if columnDesc.Type.InternalType.Family == types.GeometryFamily {
-			indexDesc.GeoConfig = *geoindex.GeometryIndexConfigForSRID(columnDesc.Type.GeoSRIDOrZero())
+		switch columnDesc.Type.Family() {
+		case types.GeometryFamily:
+			config, err := geoindex.GeometryIndexConfigForSRID(columnDesc.Type.GeoSRIDOrZero())
+			if err != nil {
+				return nil, err
+			}
+			indexDesc.GeoConfig = *config
 			telemetry.Inc(sqltelemetry.GeometryInvertedIndexCounter)
-		}
-		if columnDesc.Type.InternalType.Family == types.GeographyFamily {
+		case types.GeographyFamily:
 			indexDesc.GeoConfig = *geoindex.DefaultGeographyIndexConfig()
 			telemetry.Inc(sqltelemetry.GeographyInvertedIndexCounter)
 		}
@@ -419,6 +423,11 @@ func (n *createIndexNode) startExec(params runParams) error {
 	if err := params.p.writeSchemaChange(
 		params.ctx, n.tableDesc, mutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
 	); err != nil {
+		return err
+	}
+
+	// Add all newly created type back references.
+	if err := params.p.addBackRefsFromAllTypesInTable(params.ctx, n.tableDesc); err != nil {
 		return err
 	}
 

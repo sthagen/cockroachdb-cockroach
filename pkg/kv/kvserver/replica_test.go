@@ -10404,35 +10404,35 @@ func TestReplicaShouldCampaignOnWake(t *testing.T) {
 		},
 	}
 
-	followerWithoutLeader := raft.Status{BasicStatus: raft.BasicStatus{
+	followerWithoutLeader := raft.BasicStatus{
 		SoftState: raft.SoftState{
 			RaftState: raft.StateFollower,
 			Lead:      0,
 		},
-	}}
-	followerWithLeader := raft.Status{BasicStatus: raft.BasicStatus{
+	}
+	followerWithLeader := raft.BasicStatus{
 		SoftState: raft.SoftState{
 			RaftState: raft.StateFollower,
 			Lead:      1,
 		},
-	}}
-	candidate := raft.Status{BasicStatus: raft.BasicStatus{
+	}
+	candidate := raft.BasicStatus{
 		SoftState: raft.SoftState{
 			RaftState: raft.StateCandidate,
 			Lead:      0,
 		},
-	}}
-	leader := raft.Status{BasicStatus: raft.BasicStatus{
+	}
+	leader := raft.BasicStatus{
 		SoftState: raft.SoftState{
 			RaftState: raft.StateLeader,
 			Lead:      1,
 		},
-	}}
+	}
 
 	tests := []struct {
 		leaseStatus kvserverpb.LeaseStatus
 		lease       roachpb.Lease
-		raftStatus  raft.Status
+		raftStatus  raft.BasicStatus
 		exp         bool
 	}{
 		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID}, myLease, followerWithoutLeader, true},
@@ -12774,4 +12774,100 @@ support contract. Otherwise, please open an issue at:
 `
 
 	require.Equal(t, exp, act)
+}
+
+// Test that, depending on the request's ClientRangeInfo, descriptor and lease
+// updates are returned.
+func TestRangeInfoReturned(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	var tc testContext
+	tc.Start(t, stopper)
+
+	key := roachpb.Key("a")
+	gArgs := getArgs(key)
+
+	desc, lease := tc.repl.GetDescAndLease(ctx)
+	ri := &roachpb.RangeInfo{Desc: desc, Lease: lease}
+	staleDescGen := desc.Generation - 1
+	staleLeaseSeq := lease.Sequence - 1
+
+	for _, test := range []struct {
+		req *roachpb.ClientRangeInfo
+		exp *roachpb.RangeInfo
+	}{
+		{
+			req: nil,
+			exp: nil,
+		},
+		{
+			// Empty client info. This case shouldn't happen.
+			req: &roachpb.ClientRangeInfo{},
+			exp: ri,
+		},
+		{
+			// Correct descriptor, missing lease.
+			req: &roachpb.ClientRangeInfo{
+				DescriptorGeneration: ri.Desc.Generation,
+			},
+			exp: ri,
+		},
+		{
+			// Correct descriptor, stale lease.
+			req: &roachpb.ClientRangeInfo{
+				DescriptorGeneration: ri.Desc.Generation,
+				LeaseSequence:        staleLeaseSeq,
+			},
+			exp: ri,
+		},
+		{
+			// Correct descriptor, correct lease.
+			req: &roachpb.ClientRangeInfo{
+				DescriptorGeneration: ri.Desc.Generation,
+				LeaseSequence:        ri.Lease.Sequence,
+			},
+			exp: nil, // No update should be returned.
+		},
+		{
+			// Stale descriptor, no lease.
+			req: &roachpb.ClientRangeInfo{
+				DescriptorGeneration: staleDescGen,
+			},
+			exp: ri,
+		},
+		{
+			// Stale descriptor, stale lease.
+			req: &roachpb.ClientRangeInfo{
+				DescriptorGeneration: staleDescGen,
+				LeaseSequence:        staleLeaseSeq,
+			},
+			exp: ri,
+		},
+		{
+			// Stale desc, good lease. This case shouldn't happen.
+			req: &roachpb.ClientRangeInfo{
+				DescriptorGeneration: staleDescGen,
+				LeaseSequence:        staleLeaseSeq,
+			},
+			exp: ri,
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			ba := roachpb.BatchRequest{}
+			ba.Add(&gArgs)
+			ba.Header.ClientRangeInfo = test.req
+			br, pErr := tc.Sender().Send(ctx, ba)
+			require.Nil(t, pErr)
+			if test.exp == nil {
+				require.Empty(t, br.RangeInfos)
+			} else {
+				require.Len(t, br.RangeInfos, 1)
+				require.Equal(t, br.RangeInfos[0], *test.exp)
+			}
+		})
+	}
 }

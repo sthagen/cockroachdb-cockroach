@@ -324,18 +324,21 @@ func makeMetrics(internal bool) Metrics {
 
 // Start starts the Server's background processing.
 func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
-	gossipUpdateC := s.cfg.Gossip.DeprecatedRegisterSystemConfigChannel(47150)
-	stopper.RunWorker(ctx, func(ctx context.Context) {
-		for {
-			select {
-			case <-gossipUpdateC:
-				sysCfg := s.cfg.Gossip.DeprecatedSystemConfig(47150)
-				s.dbCache.updateSystemConfig(sysCfg)
-			case <-stopper.ShouldStop():
-				return
+	if s.cfg.Codec.ForSystemTenant() {
+		gossipUpdateC := s.cfg.Gossip.DeprecatedRegisterSystemConfigChannel(47150)
+		stopper.RunWorker(ctx, func(ctx context.Context) {
+			for {
+				select {
+				case <-gossipUpdateC:
+					sysCfg := s.cfg.Gossip.DeprecatedSystemConfig(47150)
+					s.dbCache.updateSystemConfig(sysCfg)
+				case <-stopper.ShouldStop():
+					return
+				}
 			}
-		}
-	})
+		})
+	}
+
 	// Start a loop to clear SQL stats at the max reset interval. This is
 	// to ensure that we always have some worker clearing SQL stats to avoid
 	// continually allocating space for the SQL stats. Additionally, spawn
@@ -1508,7 +1511,7 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 		// Closing the res will flush the connection's buffer.
 		res = ex.clientComm.CreateFlushResult(pos)
 	default:
-		panic(fmt.Sprintf("unsupported command type: %T", cmd))
+		panic(errors.AssertionFailedf("unsupported command type: %T", cmd))
 	}
 
 	var advInfo advanceInfo
@@ -1572,7 +1575,7 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 	case stayInPlace:
 		// Nothing to do. The same statement will be executed again.
 	default:
-		panic(fmt.Sprintf("unexpected advance code: %s", advInfo.code))
+		panic(errors.AssertionFailedf("unexpected advance code: %s", advInfo.code))
 	}
 
 	if err := ex.updateTxnRewindPosMaybe(ctx, cmd, pos, advInfo); err != nil {
@@ -1656,7 +1659,7 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 		// (i.e. we don't do anything if txnRewindPos != pos).
 
 		if advInfo.code != advanceOne {
-			panic(fmt.Sprintf("unexpected advanceCode: %s", advInfo.code))
+			panic(errors.AssertionFailedf("unexpected advanceCode: %s", advInfo.code))
 		}
 
 		var canAdvance bool
@@ -1687,7 +1690,7 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 			case Flush:
 				canAdvance = true
 			default:
-				panic(fmt.Sprintf("unsupported cmd: %T", cmd))
+				panic(errors.AssertionFailedf("unsupported cmd: %T", cmd))
 			}
 			if canAdvance {
 				ex.setTxnRewindPos(ctx, pos+1)
@@ -1703,7 +1706,7 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 // won't ever need them again.
 func (ex *connExecutor) setTxnRewindPos(ctx context.Context, pos CmdPos) {
 	if pos <= ex.extraTxnState.txnRewindPos {
-		panic(fmt.Sprintf("can only move the  txnRewindPos forward. "+
+		panic(errors.AssertionFailedf("can only move the  txnRewindPos forward. "+
 			"Was: %d; new value: %d", ex.extraTxnState.txnRewindPos, pos))
 	}
 	ex.extraTxnState.txnRewindPos = pos
@@ -1733,7 +1736,7 @@ func stateToTxnStatusIndicator(s fsm.State) TransactionStatusIndicator {
 	case stateInternalError:
 		return InTxnBlock
 	default:
-		panic(fmt.Sprintf("unknown state: %T", s))
+		panic(errors.AssertionFailedf("unknown state: %T", s))
 	}
 }
 
@@ -1813,7 +1816,7 @@ func (ex *connExecutor) execCopyIn(
 			ctx, cmd.Conn, cmd.Stmt, txnOpt, ex.server.cfg,
 			// execInsertPlan
 			func(ctx context.Context, p *planner, res RestrictedCommandResult) error {
-				_, _, err := ex.execWithDistSQLEngine(ctx, p, tree.RowsAffected, res, false /* distribute */, nil /* progressAtomic */)
+				_, err := ex.execWithDistSQLEngine(ctx, p, tree.RowsAffected, res, false /* distribute */, nil /* progressAtomic */)
 				return err
 			},
 		)

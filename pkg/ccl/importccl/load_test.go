@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -117,8 +118,8 @@ func TestImportChunking(t *testing.T) {
 	}
 
 	ts := hlc.Timestamp{WallTime: hlc.UnixNano()}
-	desc, err := importccl.Load(ctx, tc.Conns[0], bankBuf(numAccounts), "data",
-		"nodelocal://0"+dir, ts, chunkSize, dir, dir, security.RootUser)
+	desc, err := importccl.Load(ctx, tc.Conns[0], bankBuf(numAccounts),
+		"data", security.RootUser, dir, "nodelocal://0"+dir, ts, chunkSize)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -152,17 +153,15 @@ func TestImportOutOfOrder(t *testing.T) {
 	fmt.Fprintf(&buf, "INSERT INTO %s VALUES (%s);\n", bankData.Name, strings.Join(row1, `,`))
 
 	ts := hlc.Timestamp{WallTime: hlc.UnixNano()}
-	_, err := importccl.Load(ctx, tc.Conns[0], &buf, "data", "nodelocal://0/foo", ts,
-		0, dir, dir, security.RootUser)
+	_, err := importccl.Load(ctx, tc.Conns[0], &buf, "data", security.RootUser,
+		dir, "nodelocal://0/foo", ts, 0)
 	if !testutils.IsError(err, "out of order row") {
 		t.Fatalf("expected out of order row, got: %+v", err)
 	}
 }
 
 func BenchmarkLoad(b *testing.B) {
-	if testing.Short() {
-		b.Skip("TODO: fix benchmark")
-	}
+	skip.UnderShort(b, "TODO: fix benchmark")
 	// NB: This benchmark takes liberties in how b.N is used compared to the go
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
@@ -180,8 +179,8 @@ func BenchmarkLoad(b *testing.B) {
 	buf := bankBuf(b.N)
 	b.SetBytes(int64(buf.Len() / b.N))
 	b.ResetTimer()
-	if _, err := importccl.Load(ctx, tc.Conns[0], buf, "data", dir, ts,
-		0, dir, dir, security.RootUser); err != nil {
+	if _, err := importccl.Load(ctx, tc.Conns[0], buf, "data", security.RootUser,
+		dir, "nodelocal://0", ts, 0); err != nil {
 		b.Fatalf("%+v", err)
 	}
 }

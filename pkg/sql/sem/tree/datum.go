@@ -2153,8 +2153,10 @@ var dZeroTimestamp = &DTimestamp{}
 
 // time.Time formats.
 const (
-	// TimestampOutputFormat is used to output all timestamps.
-	TimestampOutputFormat = "2006-01-02 15:04:05.999999-07:00"
+	// TimestampTZOutputFormat is used to output all TimestampTZs.
+	TimestampTZOutputFormat = "2006-01-02 15:04:05.999999-07:00"
+	// TimestampOutputFormat is used to output all Timestamps.
+	TimestampOutputFormat = "2006-01-02 15:04:05.999999"
 )
 
 // ParseDTimestamp parses and returns the *DTimestamp Datum value represented by
@@ -2498,7 +2500,7 @@ func (d *DTimestampTZ) Format(ctx *FmtCtx) {
 	if !bareStrings {
 		ctx.WriteByte('\'')
 	}
-	ctx.WriteString(d.Time.Format(TimestampOutputFormat))
+	ctx.WriteString(d.Time.Format(TimestampTZOutputFormat))
 	if !bareStrings {
 		ctx.WriteByte('\'')
 	}
@@ -3852,6 +3854,12 @@ func MakeDEnumFromLogicalRepresentation(typ *types.T, rep string) (*DEnum, error
 	if err != nil {
 		return nil, err
 	}
+	// If this enum member is read only, we cannot construct it from the logical
+	// representation. This is to ensure that it will not be written until all
+	// nodes in the cluster are able to decode the physical representation.
+	if typ.TypeMeta.EnumData.IsMemberReadOnly[idx] {
+		return nil, errors.Newf("enum label %q is not yet public", rep)
+	}
 	return &DEnum{
 		EnumTyp:     typ,
 		PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[idx],
@@ -3860,8 +3868,6 @@ func MakeDEnumFromLogicalRepresentation(typ *types.T, rep string) (*DEnum, error
 }
 
 // MakeAllDEnumsInType generates a slice of all values in an enum.
-// TODO (rohany): In the future, take an option of whether to include
-//  non-writeable enum values or not.
 func MakeAllDEnumsInType(typ *types.T) []Datum {
 	result := make([]Datum, len(typ.TypeMeta.EnumData.LogicalRepresentations))
 	for i := 0; i < len(result); i++ {
@@ -3998,6 +4004,42 @@ func (d *DEnum) IsMin(_ *EvalContext) bool {
 // AmbiguousFormat implements the Datum interface.
 func (d *DEnum) AmbiguousFormat() bool {
 	return true
+}
+
+// MaxWriteable returns the largest member of the enum that is writeable.
+func (d *DEnum) MaxWriteable() (Datum, bool) {
+	enumData := d.EnumTyp.TypeMeta.EnumData
+	if len(enumData.PhysicalRepresentations) == 0 {
+		return nil, false
+	}
+	for i := len(enumData.PhysicalRepresentations) - 1; i >= 0; i-- {
+		if !enumData.IsMemberReadOnly[i] {
+			return &DEnum{
+				EnumTyp:     d.EnumTyp,
+				PhysicalRep: enumData.PhysicalRepresentations[i],
+				LogicalRep:  enumData.LogicalRepresentations[i],
+			}, true
+		}
+	}
+	return nil, false
+}
+
+// MinWriteable returns the smallest member of the enum that is writeable.
+func (d *DEnum) MinWriteable() (Datum, bool) {
+	enumData := d.EnumTyp.TypeMeta.EnumData
+	if len(enumData.PhysicalRepresentations) == 0 {
+		return nil, false
+	}
+	for i := 0; i < len(enumData.PhysicalRepresentations); i++ {
+		if !enumData.IsMemberReadOnly[i] {
+			return &DEnum{
+				EnumTyp:     d.EnumTyp,
+				PhysicalRep: enumData.PhysicalRepresentations[i],
+				LogicalRep:  enumData.LogicalRepresentations[i],
+			}, true
+		}
+	}
+	return nil, false
 }
 
 // DOid is the Postgres OID datum. It can represent either an OID type or any

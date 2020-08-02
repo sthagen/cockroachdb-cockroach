@@ -266,8 +266,7 @@ func (ru *Updater) UpdateRow(
 	batch *kv.Batch,
 	oldValues []tree.Datum,
 	updateValues []tree.Datum,
-	ignoreIndexesForPut util.FastIntSet,
-	ignoreIndexesForDel util.FastIntSet,
+	pm PartialIndexUpdateHelper,
 	traceKV bool,
 ) ([]tree.Datum, error) {
 	if len(oldValues) != len(ru.FetchCols) {
@@ -347,7 +346,9 @@ func (ru *Updater) UpdateRow(
 		// exists in ignoreIndexesForDel and ignoreIndexesForPut, respectively.
 		// Index IDs in these sets indicate that old and new values for the row
 		// do not satisfy a partial index's predicate expression.
-		if !ignoreIndexesForDel.Contains(int(index.ID)) {
+		if pm.IgnoreForDel.Contains(int(index.ID)) {
+			ru.oldIndexEntries[i] = nil
+		} else {
 			ru.oldIndexEntries[i], err = sqlbase.EncodeSecondaryIndex(
 				ru.Helper.Codec,
 				ru.Helper.TableDesc.TableDesc(),
@@ -360,7 +361,9 @@ func (ru *Updater) UpdateRow(
 				return nil, err
 			}
 		}
-		if !ignoreIndexesForPut.Contains(int(index.ID)) {
+		if pm.IgnoreForPut.Contains(int(index.ID)) {
+			ru.newIndexEntries[i] = nil
+		} else {
 			ru.newIndexEntries[i], err = sqlbase.EncodeSecondaryIndex(
 				ru.Helper.Codec,
 				ru.Helper.TableDesc.TableDesc(),
@@ -410,11 +413,11 @@ func (ru *Updater) UpdateRow(
 	}
 
 	if rowPrimaryKeyChanged {
-		if err := ru.rd.DeleteRow(ctx, batch, oldValues, ignoreIndexesForDel, traceKV); err != nil {
+		if err := ru.rd.DeleteRow(ctx, batch, oldValues, pm, traceKV); err != nil {
 			return nil, err
 		}
 		if err := ru.ri.InsertRow(
-			ctx, batch, ru.newValues, ignoreIndexesForPut, false /* ignoreConflicts */, traceKV,
+			ctx, batch, ru.newValues, pm, false /* ignoreConflicts */, traceKV,
 		); err != nil {
 			return nil, err
 		}

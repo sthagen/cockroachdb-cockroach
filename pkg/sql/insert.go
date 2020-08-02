@@ -14,10 +14,10 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -54,15 +54,9 @@ type insertRun struct {
 	// insertCols are the columns being inserted into.
 	insertCols []sqlbase.ColumnDescriptor
 
-	// rowCount is the number of rows in the current batch.
-	rowCount int
-
 	// done informs a new call to BatchedNext() that the previous call to
 	// BatchedNext() has completed the work already.
 	done bool
-
-	// rows contains the accumulated result rows if rowsNeeded is set.
-	rows *rowcontainer.RowContainer
 
 	// resultRowBuffer is used to prepare a result row for accumulation
 	// into the row container above, when rowsNeeded is set.
@@ -94,7 +88,7 @@ func (r *insertRun) initRowContainer(
 	if !r.rowsNeeded {
 		return
 	}
-	r.rows = rowcontainer.NewRowContainer(
+	r.ti.rows = rowcontainer.NewRowContainer(
 		params.EvalContext().Mon.MakeBoundAccount(),
 		sqlbase.ColTypeInfoFromResCols(columns),
 		rowCapacity,
@@ -139,54 +133,42 @@ func (r *insertRun) processSourceRow(params runParams, rowVals tree.Datums) erro
 		return err
 	}
 
-	// Create a set of index IDs to not write to. Indexes should not be written
-	// to when they are partial indexes and the row does not satisfy the
+	// Create a set of partial index IDs to not write to. Indexes should not be
+	// written to when they are partial indexes and the row does not satisfy the
 	// predicate. This set is passed as a parameter to tableInserter.row below.
-	var ignoreIndexes util.FastIntSet
+	var pm row.PartialIndexUpdateHelper
 	partialIndexOrds := r.ti.tableDesc().PartialIndexOrds()
 	if !partialIndexOrds.Empty() {
 		partialIndexPutVals := rowVals[len(r.insertCols)+r.checkOrds.Len():]
-		colIdx := 0
-		indexes := r.ti.tableDesc().Indexes
-		for i, ok := partialIndexOrds.Next(0); ok; i, ok = partialIndexOrds.Next(i + 1) {
-			index := &indexes[i]
-			if index.IsPartial() {
-				val, err := tree.GetBool(partialIndexPutVals[colIdx])
-				if err != nil {
-					return err
-				}
 
-				if !val {
-					// If the value of the column for the index predicate expression
-					// is false, the row should not be added to the partial index.
-					ignoreIndexes.Add(int(index.ID))
-				}
-
-				colIdx++
-			}
+		err := pm.Init(partialIndexPutVals, tree.Datums{}, r.ti.tableDesc())
+		if err != nil {
+			return err
 		}
-	}
 
-	// Truncate rowVals so that it no longer includes partial index predicate
-	// values.
-	rowVals = rowVals[:len(r.insertCols)+r.checkOrds.Len()]
+		// Truncate rowVals so that it no longer includes partial index predicate
+		// values.
+		rowVals = rowVals[:len(r.insertCols)+r.checkOrds.Len()]
+	}
 
 	// Verify the CHECK constraint results, if any.
 	if !r.checkOrds.Empty() {
 		checkVals := rowVals[len(r.insertCols):]
-		if err := checkMutationInput(params.ctx, &params.p.semaCtx, r.ti.tableDesc(), r.checkOrds, checkVals); err != nil {
+		if err := checkMutationInput(
+			params.ctx, &params.p.semaCtx, r.ti.tableDesc(), r.checkOrds, checkVals,
+		); err != nil {
 			return err
 		}
 		rowVals = rowVals[:len(r.insertCols)]
 	}
 
 	// Queue the insert in the KV batch.
-	if err := r.ti.row(params.ctx, rowVals, ignoreIndexes, r.traceKV); err != nil {
+	if err := r.ti.row(params.ctx, rowVals, pm, r.traceKV); err != nil {
 		return err
 	}
 
 	// If result rows need to be accumulated, do it.
-	if r.rows != nil {
+	if r.ti.rows != nil {
 		for i, val := range rowVals {
 			// The downstream consumer will want the rows in the order of
 			// the table descriptor, not that of insertCols. Reorder them
@@ -198,7 +180,7 @@ func (r *insertRun) processSourceRow(params runParams, rowVals tree.Datums) erro
 			}
 		}
 
-		if _, err := r.rows.AddRow(params.ctx, r.resultRowBuffer); err != nil {
+		if _, err := r.ti.rows.AddRow(params.ctx, r.resultRowBuffer); err != nil {
 			return err
 		}
 	}
@@ -239,11 +221,8 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 
 	tracing.AnnotateTrace()
 
-	// Advance one batch. First, clear the current batch.
-	n.run.rowCount = 0
-	if n.run.rows != nil {
-		n.run.rows.Clear(params.ctx)
-	}
+	// Advance one batch. First, clear the last batch.
+	n.run.ti.clearLastBatch(params.ctx)
 
 	// Now consume/accumulate the rows for this batch.
 	lastBatch := false
@@ -273,19 +252,13 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 			return false, err
 		}
 
-		n.run.rowCount++
-
 		// Are we done yet with the current batch?
-		if n.run.ti.curBatchSize() >= maxInsertBatchSize {
+		if n.run.ti.currentBatchSize >= maxInsertBatchSize {
 			break
 		}
 	}
 
-	if n.run.rowCount > 0 {
-		if err := n.run.ti.atBatchEnd(params.ctx, n.run.traceKV); err != nil {
-			return false, err
-		}
-
+	if n.run.ti.currentBatchSize > 0 {
 		if !lastBatch {
 			// We only run/commit the batch if there were some rows processed
 			// in this batch.
@@ -296,7 +269,7 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 	}
 
 	if lastBatch {
-		if _, err := n.run.ti.finalize(params.ctx, n.run.traceKV); err != nil {
+		if err := n.run.ti.finalize(params.ctx); err != nil {
 			return false, err
 		}
 		// Remember we're done for the next call to BatchedNext().
@@ -304,23 +277,20 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 	}
 
 	// Possibly initiate a run of CREATE STATISTICS.
-	params.ExecCfg().StatsRefresher.NotifyMutation(n.run.ti.tableDesc().ID, n.run.rowCount)
+	params.ExecCfg().StatsRefresher.NotifyMutation(n.run.ti.tableDesc().ID, n.run.ti.lastBatchSize)
 
-	return n.run.rowCount > 0, nil
+	return n.run.ti.lastBatchSize > 0, nil
 }
 
 // BatchedCount implements the batchedPlanNode interface.
-func (n *insertNode) BatchedCount() int { return n.run.rowCount }
+func (n *insertNode) BatchedCount() int { return n.run.ti.lastBatchSize }
 
 // BatchedCount implements the batchedPlanNode interface.
-func (n *insertNode) BatchedValues(rowIdx int) tree.Datums { return n.run.rows.At(rowIdx) }
+func (n *insertNode) BatchedValues(rowIdx int) tree.Datums { return n.run.ti.rows.At(rowIdx) }
 
 func (n *insertNode) Close(ctx context.Context) {
 	n.source.Close(ctx)
 	n.run.ti.close(ctx)
-	if n.run.rows != nil {
-		n.run.rows.Close(ctx)
-	}
 	*n = insertNode{}
 	insertNodePool.Put(n)
 }

@@ -55,8 +55,6 @@ type cdcTestArgs struct {
 }
 
 func cdcBasicTest(ctx context.Context, t *test, c *cluster, args cdcTestArgs) {
-	t.Skip("flaky #51543", "https://github.com/cockroachdb/cockroach/issues/51543")
-
 	// Skip the poller test on v19.2. After 19.2 is out, we should likely delete
 	// the test entirely.
 	if !args.rangefeed && t.buildVersion.Compare(version.MustParse(`v19.1.0-0`)) > 0 {
@@ -227,7 +225,6 @@ func cdcBasicTest(ctx context.Context, t *test, c *cluster, args cdcTestArgs) {
 }
 
 func runCDCBank(ctx context.Context, t *test, c *cluster) {
-	t.Skip("flaky #51543", "https://github.com/cockroachdb/cockroach/issues/51543")
 
 	// Make the logs dir on every node to work around the `roachprod get logs`
 	// spam.
@@ -378,7 +375,6 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 // end-to-end (including the schema registry default of requiring backward
 // compatibility within a topic).
 func runCDCSchemaRegistry(ctx context.Context, t *test, c *cluster) {
-	t.Skip("flaky #51543", "https://github.com/cockroachdb/cockroach/issues/51543")
 
 	crdbNodes, kafkaNode := c.Node(1), c.Node(1)
 	c.Put(ctx, cockroach, "./cockroach", crdbNodes)
@@ -512,7 +508,7 @@ func registerCDC(r *testRegistry) {
 
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("cdc/tpcc-1000/rangefeed=%t", useRangeFeed),
-		Owner:      `cdc`,
+		Owner:      OwnerCDC,
 		MinVersion: "v2.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -528,7 +524,7 @@ func registerCDC(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("cdc/initial-scan/rangefeed=%t", useRangeFeed),
-		Owner:      `cdc`,
+		Owner:      OwnerCDC,
 		MinVersion: "v2.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -545,7 +541,7 @@ func registerCDC(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:  "cdc/poller/rangefeed=false",
-		Owner: `cdc`,
+		Owner: OwnerCDC,
 		// When testing a 2.1 binary, we use the poller for all the other tests
 		// and this is close enough to cdc/tpcc-1000 test to be redundant, so
 		// skip it.
@@ -682,7 +678,7 @@ func (k kafkaManager) install(ctx context.Context) {
 	k.c.status("installing kafka")
 	folder := k.basePath()
 	k.c.Run(ctx, k.nodes, `mkdir -p `+folder)
-	k.c.Run(ctx, k.nodes, `curl -s https://packages.confluent.io/archive/4.0/confluent-oss-4.0.0-2.11.tar.gz | tar -xz -C `+folder)
+	k.c.Run(ctx, k.nodes, `curl https://storage.googleapis.com/cockroach-fixtures/tools/confluent-oss-4.0.0-2.11.tar.gz | tar -xz -C `+folder)
 	if !k.c.isLocal() {
 		k.c.Run(ctx, k.nodes, `mkdir -p logs`)
 		k.c.Run(ctx, k.nodes, `sudo apt-get -q update 2>&1 > logs/apt-get-update.log`)

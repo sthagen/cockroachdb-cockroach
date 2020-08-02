@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -190,7 +191,7 @@ func TestTxnWaitQueueCancel(t *testing.T) {
 	}
 
 	q := tc.repl.concMgr.TxnWaitQueue()
-	q.Enable()
+	q.Enable(1 /* leaseSeq */)
 	if err := checkAllGaugesZero(tc); err != nil {
 		t.Fatal(err.Error())
 	}
@@ -257,7 +258,7 @@ func TestTxnWaitQueueUpdateTxn(t *testing.T) {
 	req2.PusherTxn = *pusher2
 
 	q := tc.repl.concMgr.TxnWaitQueue()
-	q.Enable()
+	q.Enable(1 /* leaseSeq */)
 	q.EnqueueTxn(txn)
 	m := tc.store.txnWaitMetrics
 	assert.EqualValues(tc, 1, m.PusheeWaiting.Value())
@@ -353,7 +354,7 @@ func TestTxnWaitQueueTxnSilentlyCompletes(t *testing.T) {
 	// teeing engine is being used. See
 	// https://github.com/cockroachdb/cockroach/issues/42656 for more context.
 	if storage.DefaultStorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
-		t.Skip("disabled on teeing engine")
+		skip.IgnoreLint(t, "disabled on teeing engine")
 	}
 	tc := testContext{}
 	ctx := context.Background()
@@ -376,7 +377,7 @@ func TestTxnWaitQueueTxnSilentlyCompletes(t *testing.T) {
 	}
 
 	q := tc.repl.concMgr.TxnWaitQueue()
-	q.Enable()
+	q.Enable(1 /* leaseSeq */)
 	q.EnqueueTxn(txn)
 
 	retCh := make(chan RespWithErr, 2)
@@ -452,7 +453,7 @@ func TestTxnWaitQueueUpdateNotPushedTxn(t *testing.T) {
 	}
 
 	q := tc.repl.concMgr.TxnWaitQueue()
-	q.Enable()
+	q.Enable(1 /* leaseSeq */)
 	q.EnqueueTxn(txn)
 
 	retCh := make(chan RespWithErr, 1)
@@ -528,7 +529,7 @@ func TestTxnWaitQueuePusheeExpires(t *testing.T) {
 	}
 
 	q := tc.repl.concMgr.TxnWaitQueue()
-	q.Enable()
+	q.Enable(1 /* leaseSeq */)
 	q.EnqueueTxn(txn)
 
 	retCh := make(chan RespWithErr, 2)
@@ -632,7 +633,7 @@ func TestTxnWaitQueuePusherUpdate(t *testing.T) {
 				}
 
 				q := tc.repl.concMgr.TxnWaitQueue()
-				q.Enable()
+				q.Enable(1 /* leaseSeq */)
 				q.EnqueueTxn(txn)
 
 				retCh := make(chan RespWithErr, 1)
@@ -747,7 +748,7 @@ func TestTxnWaitQueueDependencyCycle(t *testing.T) {
 	}
 
 	q := tc.repl.concMgr.TxnWaitQueue()
-	q.Enable()
+	q.Enable(1 /* leaseSeq */)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -839,7 +840,7 @@ func TestTxnWaitQueueDependencyCycleWithPriorityInversion(t *testing.T) {
 	}
 
 	q := tc.repl.concMgr.TxnWaitQueue()
-	q.Enable()
+	q.Enable(1 /* leaseSeq */)
 
 	for _, txn := range []*roachpb.Transaction{txnA, txnB} {
 		q.EnqueueTxn(txn)

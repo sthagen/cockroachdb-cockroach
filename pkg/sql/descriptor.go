@@ -90,7 +90,7 @@ func (p *planner) createDatabase(
 	// be created in every database in >= 20.2.
 	if shouldCreatePublicSchema {
 		// Every database must be initialized with the public schema.
-		if err := p.createSchemaWithID(ctx, sqlbase.NewPublicSchemaKey(id).Key(p.ExecCfg().Codec), keys.PublicSchemaID); err != nil {
+		if err := p.createSchemaNamespaceEntry(ctx, sqlbase.NewPublicSchemaKey(id).Key(p.ExecCfg().Codec), keys.PublicSchemaID); err != nil {
 			return nil, true, err
 		}
 	}
@@ -143,6 +143,9 @@ func (p *planner) createDescriptorWithID(
 
 	if mutType, ok := descriptor.(*sqlbase.MutableTypeDescriptor); ok {
 		if err := mutType.Validate(ctx, p.txn, p.ExecCfg().Codec); err != nil {
+			return err
+		}
+		if err := p.Descriptors().AddUncommittedDescriptor(mutType); err != nil {
 			return err
 		}
 	}

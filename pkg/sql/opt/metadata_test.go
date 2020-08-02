@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -29,6 +30,7 @@ func TestMetadata(t *testing.T) {
 	tabID := md.AddTable(&testcat.Table{}, &tree.TableName{})
 	seqID := md.AddSequence(&testcat.Sequence{})
 	md.AddView(&testcat.View{})
+	md.AddUserDefinedType(types.MakeEnum(15210, 15418))
 
 	// Call Init and add objects from catalog, verifying that IDs have been reset.
 	testCat := testcat.New()
@@ -54,6 +56,11 @@ func TestMetadata(t *testing.T) {
 		t.Fatalf("unexpected views")
 	}
 
+	md.AddUserDefinedType(types.MakeEnum(15150, 15251))
+	if len(md.AllUserDefinedTypes()) != 1 {
+		t.Fatalf("unexpected types")
+	}
+
 	md.AddDependency(opt.DepByName(&tab.TabName), tab, privilege.CREATE)
 	depsUpToDate, err := md.CheckDependencies(context.Background(), testCat)
 	if err == nil || depsUpToDate {
@@ -61,6 +68,8 @@ func TestMetadata(t *testing.T) {
 	}
 
 	// Call CopyFrom and verify that same objects are present in new metadata.
+	expr := &memo.ProjectExpr{}
+	md.AddWithBinding(1, expr)
 	var mdNew opt.Metadata
 	mdNew.CopyFrom(&md)
 	if mdNew.Schema(schID) != testCat.Schema() {
@@ -82,9 +91,26 @@ func TestMetadata(t *testing.T) {
 		t.Fatalf("unexpected view")
 	}
 
+	if ts := mdNew.AllUserDefinedTypes(); len(ts) != 1 && ts[15150].Equal(types.MakeEnum(15150, 15251)) {
+		t.Fatalf("unexpected type")
+	}
+
 	depsUpToDate, err = md.CheckDependencies(context.Background(), testCat)
 	if err == nil || depsUpToDate {
 		t.Fatalf("expected table privilege to be revoked in metadata copy")
+	}
+
+	paniced := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				paniced = true
+			}
+		}()
+		mdNew.WithBinding(1)
+	}()
+	if !paniced {
+		t.Fatalf("with bindings should not be copied!")
 	}
 }
 

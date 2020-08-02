@@ -1355,6 +1355,8 @@ func (desc *TableDescriptor) GetAllReferencedTypeIDs(
 	for id := range ids {
 		result = append(result, id)
 	}
+	// Sort the output so that the order is deterministic.
+	sort.Sort(result)
 	return result, nil
 }
 
@@ -2908,6 +2910,22 @@ func (desc *ImmutableTableDescriptor) ContainsUserDefinedTypes() bool {
 	return len(desc.columnsWithUDTs) > 0
 }
 
+// UserDefinedTypeColsHaveSameVersion returns whether this descriptor's columns
+// with user defined type metadata have the same versions of metadata as in the
+// other descriptor. Note that this function is only valid on two descriptors
+// representing the same table at the same version.
+func (desc *ImmutableTableDescriptor) UserDefinedTypeColsHaveSameVersion(
+	otherDesc *ImmutableTableDescriptor,
+) bool {
+	for _, idx := range desc.columnsWithUDTs {
+		this, other := desc.publicAndNonPublicCols[idx].Type, otherDesc.publicAndNonPublicCols[idx].Type
+		if this.TypeMeta.Version != other.TypeMeta.Version {
+			return false
+		}
+	}
+	return true
+}
+
 // FindReadableColumnByID finds the readable column with specified ID. The
 // column may be undergoing a schema change and is marked nullable regardless
 // of its configuration. It returns true if the column is undergoing a
@@ -3910,7 +3928,9 @@ func (desc *Descriptor) Dropped() bool {
 	switch t := desc.Union.(type) {
 	case *Descriptor_Table:
 		return t.Table.Dropped()
-	case *Descriptor_Database, *Descriptor_Type, *Descriptor_Schema:
+	case *Descriptor_Type:
+		return t.Type.Dropped()
+	case *Descriptor_Database, *Descriptor_Schema:
 		return false
 	default:
 		debug.PrintStack()

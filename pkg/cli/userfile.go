@@ -17,14 +17,19 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"strings"
+	"path"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
-const defaultQualifiedDBSchemaName = "defaultdb.public."
+const (
+	defaultUserfileScheme      = "userfile"
+	defaultQualifiedNamePrefix = "defaultdb.public.userfiles_"
+)
 
 var userFileUploadCmd = &cobra.Command{
 	Use:   "upload <source> <destination>",
@@ -32,8 +37,33 @@ var userFileUploadCmd = &cobra.Command{
 	Long: `
 Uploads a file to the user scoped file storage using a SQL connection.
 `,
-	Args: cobra.MinimumNArgs(2),
+	Args: cobra.MinimumNArgs(1),
 	RunE: maybeShoutError(runUserFileUpload),
+}
+
+var userFileListCmd = &cobra.Command{
+	Use:   "ls <file|dir glob>",
+	Short: "List files matching the provided glob",
+	Long: `
+Lists the files stored in the user scoped file storage which match the glob, using a SQL connection.
+`,
+	Args: cobra.MinimumNArgs(0),
+	RunE: maybeShoutError(runUserFileList),
+}
+
+func runUserFileList(cmd *cobra.Command, args []string) error {
+	conn, err := makeSQLClient("cockroach userfile", useDefaultDb)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var glob string
+	if len(args) > 0 {
+		glob = args[0]
+	}
+
+	return listUserFile(context.Background(), conn, glob)
 }
 
 func runUserFileUpload(cmd *cobra.Command, args []string) error {
@@ -44,14 +74,19 @@ func runUserFileUpload(cmd *cobra.Command, args []string) error {
 	defer conn.Close()
 
 	source := args[0]
-	destination := args[1]
+
+	var destination string
+	if len(args) == 2 {
+		destination = args[1]
+	}
+
 	reader, err := openUserFile(source)
 	if err != nil {
 		return err
 	}
 	defer reader.Close()
 
-	return uploadUserFile(context.Background(), conn, reader, destination)
+	return uploadUserFile(context.Background(), conn, reader, source, destination)
 }
 
 func openUserFile(source string) (io.ReadCloser, error) {
@@ -69,8 +104,117 @@ func openUserFile(source string) (io.ReadCloser, error) {
 	return f, nil
 }
 
+// Construct the userfile ExternalStorage URI from CLI args.
+func constructUserfileDestinationURI(source, destination, user string) string {
+	// User has not specified a destination URI/path. We use the default URI
+	// scheme and host, and the basename from the source arg as the path.
+	if destination == "" {
+		sourceFilename := path.Base(source)
+		userFileURL := url.URL{
+			Scheme: defaultUserfileScheme,
+			Host:   defaultQualifiedNamePrefix + user,
+			Path:   sourceFilename,
+		}
+		return userFileURL.String()
+	}
+
+	// If the destination is a well-formed userfile URI of the form
+	// userfile://db.schema.tablename_prefix/path/to/file, then we
+	// use that as the final URI.
+	var userfileURI *url.URL
+	var err error
+	if userfileURI, err = url.ParseRequestURI(destination); err == nil {
+		if userfileURI.Scheme == defaultUserfileScheme && userfileURI.Host != "" {
+			return userfileURI.String()
+		}
+	}
+
+	// If destination is not a well formed userfile URI, we use the default
+	// userfile URI schema and host, and the destination as the path.
+	userFileURL := url.URL{
+		Scheme: defaultUserfileScheme,
+		Host:   defaultQualifiedNamePrefix + user,
+		Path:   destination,
+	}
+	return userFileURL.String()
+}
+
+func constructUserfileListURI(glob, user string) string {
+	// User has not specified a glob pattern and so we construct a URI which will
+	// list all the files stored in the UserFileTableStorage.
+	if glob == "" {
+		userFileURL := url.URL{
+			Scheme: defaultUserfileScheme,
+			Host:   defaultQualifiedNamePrefix + user,
+			Path:   "",
+		}
+		return userFileURL.String()
+	}
+
+	// If the destination is a well-formed userfile URI of the form
+	// userfile://db.schema.tablename_prefix/glob/pattern, then we
+	// use that as the final URI.
+	if userfileURL, err := url.ParseRequestURI(glob); err == nil {
+		if userfileURL.Scheme == defaultUserfileScheme && userfileURL.Host != "" {
+			return userfileURL.String()
+		}
+	}
+
+	// If destination is not a well formed userfile URI, we use the default
+	// userfile URI schema and host, and the glob as the path.
+	userfileURL := url.URL{
+		Scheme: defaultUserfileScheme,
+		Host:   defaultQualifiedNamePrefix + user,
+		Path:   glob,
+	}
+
+	return userfileURL.String()
+}
+
+func listUserFile(ctx context.Context, conn *sqlConn, glob string) error {
+	if err := conn.ensureConn(); err != nil {
+		return err
+	}
+
+	connURL, err := url.Parse(conn.url)
+	if err != nil {
+		return err
+	}
+
+	userfileListURI := constructUserfileListURI(glob, connURL.User.Username())
+	unescapedUserfileListURI, err := url.PathUnescape(userfileListURI)
+	if err != nil {
+		return err
+	}
+
+	userfileParsedURL, err := url.ParseRequestURI(unescapedUserfileListURI)
+	if err != nil {
+		return err
+	}
+	userFileTableConf := roachpb.ExternalStorage_FileTable{
+		User:               connURL.User.Username(),
+		QualifiedTableName: userfileParsedURL.Host,
+		Path:               userfileParsedURL.Path,
+	}
+	f, err := cloudimpl.MakeSQLConnFileTableStorage(ctx, userFileTableConf, conn.conn.(driver.QueryerContext))
+	if err != nil {
+		return err
+	}
+
+	files, err := f.ListFiles(ctx, "")
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		fmt.Println(file)
+	}
+
+	return nil
+}
+
 func uploadUserFile(
-	ctx context.Context, conn *sqlConn, reader io.Reader, destination string,
+	ctx context.Context, conn *sqlConn, reader io.Reader, source, destination string,
 ) error {
 	if err := conn.ensureConn(); err != nil {
 		return err
@@ -81,14 +225,6 @@ func uploadUserFile(
 		return err
 	}
 
-	// TODO(adityamaru): In the future we may want to allow users to specify a
-	// fully qualified db.schema.table where their underlying SQL file tables will
-	// be created. Enforcing the filepath to begin with a / allows for easy
-	// disambiguation between the qualified name and the filepath.
-	if !strings.HasPrefix(destination, "/") {
-		return errors.Newf("userfile upload destination path must begin with /")
-	}
-
 	connURL, err := url.Parse(conn.url)
 	if err != nil {
 		return err
@@ -97,15 +233,11 @@ func uploadUserFile(
 	// Construct the userfile URI as the destination for the CopyIn stmt.
 	// Currently we hardcode the db.schema prefix, in the future we might allow
 	// users to specify this.
-	userfileURL := url.URL{
-		Scheme: "userfile",
-		Host:   defaultQualifiedDBSchemaName + connURL.User.Username(),
-		Path:   destination,
-	}
+	userfileURI := constructUserfileDestinationURI(source, destination, connURL.User.Username())
 
 	// Accounts for filenames with arbitrary unicode characters. url.URL escapes
 	// these characters by default when setting the Path above.
-	unescapedUserfileURL, err := url.PathUnescape(userfileURL.String())
+	unescapedUserfileURL, err := url.PathUnescape(userfileURI)
 	if err != nil {
 		return err
 	}
@@ -153,12 +285,13 @@ func uploadUserFile(
 
 var userFileCmds = []*cobra.Command{
 	userFileUploadCmd,
+	userFileListCmd,
 }
 
 var userFileCmd = &cobra.Command{
 	Use:   "userfile [command]",
-	Short: "upload and delete user scoped files",
-	Long:  "Upload and delete files from the user scoped file storage.",
+	Short: "upload, list and delete user scoped files",
+	Long:  "Upload, list and delete files from the user scoped file storage.",
 	RunE:  usageAndErr,
 }
 

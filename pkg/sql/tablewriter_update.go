@@ -15,10 +15,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 // tableUpdater handles writing kvs and forming table rows for updates.
@@ -34,7 +32,7 @@ func (*tableUpdater) desc() string { return "updater" }
 
 // init is part of the tableWriter interface.
 func (tu *tableUpdater) init(_ context.Context, txn *kv.Txn, _ *tree.EvalContext) error {
-	tu.tableWriterBase.init(txn)
+	tu.tableWriterBase.init(txn, tu.tableDesc())
 	return nil
 }
 
@@ -42,7 +40,9 @@ func (tu *tableUpdater) init(_ context.Context, txn *kv.Txn, _ *tree.EvalContext
 // We don't implement this because tu.ru.UpdateRow wants two slices
 // and it would be a shame to split the incoming slice on every call.
 // Instead provide a separate rowForUpdate() below.
-func (tu *tableUpdater) row(context.Context, tree.Datums, util.FastIntSet, bool) error {
+func (tu *tableUpdater) row(
+	context.Context, tree.Datums, row.PartialIndexUpdateHelper, bool,
+) error {
 	panic("unimplemented")
 }
 
@@ -50,34 +50,17 @@ func (tu *tableUpdater) row(context.Context, tree.Datums, util.FastIntSet, bool)
 func (tu *tableUpdater) rowForUpdate(
 	ctx context.Context,
 	oldValues, updateValues tree.Datums,
-	ignoreIndexesForPut util.FastIntSet,
-	ignoreIndexesForDel util.FastIntSet,
+	pm row.PartialIndexUpdateHelper,
 	traceKV bool,
 ) (tree.Datums, error) {
-	tu.batchSize++
-	return tu.ru.UpdateRow(ctx, tu.b, oldValues, updateValues, ignoreIndexesForPut, ignoreIndexesForDel, traceKV)
-}
-
-// atBatchEnd is part of the tableWriter interface.
-func (tu *tableUpdater) atBatchEnd(_ context.Context, _ bool) error { return nil }
-
-// flushAndStartNewBatch is part of the tableWriter interface.
-func (tu *tableUpdater) flushAndStartNewBatch(ctx context.Context) error {
-	return tu.tableWriterBase.flushAndStartNewBatch(ctx, tu.tableDesc())
-}
-
-// finalize is part of the tableWriter interface.
-func (tu *tableUpdater) finalize(ctx context.Context, _ bool) (*rowcontainer.RowContainer, error) {
-	return nil, tu.tableWriterBase.finalize(ctx, tu.tableDesc())
+	tu.currentBatchSize++
+	return tu.ru.UpdateRow(ctx, tu.b, oldValues, updateValues, pm, traceKV)
 }
 
 // tableDesc is part of the tableWriter interface.
 func (tu *tableUpdater) tableDesc() *sqlbase.ImmutableTableDescriptor {
 	return tu.ru.Helper.TableDesc
 }
-
-// close is part of the tableWriter interface.
-func (tu *tableUpdater) close(_ context.Context) {}
 
 // walkExprs is part of the tableWriter interface.
 func (tu *tableUpdater) walkExprs(_ func(desc string, index int, expr tree.TypedExpr)) {}

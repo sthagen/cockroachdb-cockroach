@@ -12,8 +12,10 @@ package cloudimpl
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path"
 	"strings"
@@ -26,9 +28,12 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+const defaultUserfileScheme = "userfile"
+
 type fileTableStorage struct {
 	fs     *filetable.FileToTableSystem
 	cfg    roachpb.ExternalStorage_FileTable
+	db     *kv.DB
 	prefix string // relative filepath
 }
 
@@ -58,7 +63,29 @@ func makeFileTableStorage(
 			cfg.Path, path.Clean(cfg.Path))
 	}
 
-	fileToTableSystem, err := filetable.NewFileToTableSystem(ctx, cfg.QualifiedTableName, ie, db,
+	executor := filetable.MakeInternalFileToTableExecutor(ie, db)
+	fileToTableSystem, err := filetable.NewFileToTableSystem(ctx, cfg.QualifiedTableName, executor,
+		cfg.User)
+	if err != nil {
+		return nil, err
+	}
+	return &fileTableStorage{
+		fs:     fileToTableSystem,
+		cfg:    cfg,
+		db:     db,
+		prefix: cfg.Path,
+	}, nil
+}
+
+// MakeSQLConnFileTableStorage returns an instance of a FileTableStorage which
+// uses a network connection backed SQL executor. This is used by the CLI to
+// interact with the underlying FileToTableSystem. It only supports a subset of
+// methods compared to the internal SQL connection backed FileTableStorage.
+func MakeSQLConnFileTableStorage(
+	ctx context.Context, cfg roachpb.ExternalStorage_FileTable, conn driver.QueryerContext,
+) (cloud.ExternalStorage, error) {
+	executor := filetable.MakeSQLConnFileToTableExecutor(conn)
+	fileToTableSystem, err := filetable.NewFileToTableSystem(ctx, cfg.QualifiedTableName, executor,
 		cfg.User)
 	if err != nil {
 		return nil, err
@@ -77,8 +104,12 @@ func MakeUserFileStorageURI(qualifiedTableName, filename string) string {
 }
 
 func makeUserFileURIWithQualifiedName(qualifiedTableName, path string) string {
-	path = strings.TrimPrefix(path, "/")
-	return fmt.Sprintf("userfile://%s/%s", qualifiedTableName, path)
+	userfileURL := url.URL{
+		Scheme: defaultUserfileScheme,
+		Host:   qualifiedTableName,
+		Path:   path,
+	}
+	return userfileURL.String()
 }
 
 // Close implements the ExternalStorage interface and is a no-op.
@@ -95,13 +126,34 @@ func (f *fileTableStorage) Conf() roachpb.ExternalStorage {
 	}
 }
 
+// Userfile storage does not provide file system semantics and thus to prevent
+// user surprises we reject file paths which are different pre- and
+// post-normalization. We already enforce this on prefix when the
+// fileTableStorage is instantiated, so this method enforces the same on
+// basename.
+func checkBaseAndJoinFilePath(prefix, basename string) (string, error) {
+	if basename == "" {
+		return prefix, nil
+	}
+
+	if path.Clean(basename) != basename {
+		return "", errors.Newf("basename %s changes to %s on normalization. "+
+			"userfile does not permit such constructs.", basename, path.Clean(basename))
+	}
+	return path.Join(prefix, basename), nil
+}
+
 // ReadFile implements the ExternalStorage interface and returns the contents of
 // the file stored in the user scoped FileToTableSystem.
 func (f *fileTableStorage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
-	reader, err := f.fs.ReadFile(ctx, path.Join(f.prefix, basename))
+	filepath, err := checkBaseAndJoinFilePath(f.prefix, basename)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := f.fs.ReadFile(ctx, filepath)
 	if os.IsNotExist(err) {
 		return nil, errors.Wrapf(ErrFileDoesNotExist,
-			"file %s does not exist in the UserFileTableSystem", path.Join(f.prefix, basename))
+			"file %s does not exist in the UserFileTableSystem", filepath)
 	}
 
 	return reader, err
@@ -112,27 +164,45 @@ func (f *fileTableStorage) ReadFile(ctx context.Context, basename string) (io.Re
 func (f *fileTableStorage) WriteFile(
 	ctx context.Context, basename string, content io.ReadSeeker,
 ) error {
-	writer, err := f.fs.NewFileWriter(ctx, path.Join(f.prefix, basename), filetable.ChunkDefaultSize)
+	filepath, err := checkBaseAndJoinFilePath(f.prefix, basename)
 	if err != nil {
 		return err
 	}
+	err = f.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		writer, err := f.fs.NewFileWriter(ctx, filepath, filetable.ChunkDefaultSize, txn)
+		if err != nil {
+			return err
+		}
 
-	if _, err = io.Copy(writer, content); err != nil {
-		return errors.Wrap(err, "failed to write using the FileTable writer")
+		if _, err = io.Copy(writer, content); err != nil {
+			return errors.Wrap(err, "failed to write using the FileTable writer")
+		}
+
+		if err := writer.Close(); err != nil {
+			return errors.Wrap(err, "failed to close the FileTable writer")
+		}
+
+		return nil
+	})
+
+	return err
+}
+
+// This method is different from the utility method getPrefixBeforeWildcard() in
+// external_storage.go in that it does not invoke path.Dir on the return value.
+func getPrefixBeforeWildcardForFileTable(p string) string {
+	globIndex := strings.IndexAny(p, "*?[")
+	if globIndex < 0 {
+		return p
 	}
-
-	if err := writer.Close(); err != nil {
-		return errors.Wrap(err, "failed to close the FileTable writer")
-	}
-
-	return nil
+	return p[:globIndex]
 }
 
 // ListFiles implements the ExternalStorage interface and lists the files stored
 // in the user scoped FileToTableSystem.
 func (f *fileTableStorage) ListFiles(ctx context.Context, patternSuffix string) ([]string, error) {
 	var fileList []string
-	matches, err := f.fs.ListFiles(ctx, getPrefixBeforeWildcard(f.prefix))
+	matches, err := f.fs.ListFiles(ctx, getPrefixBeforeWildcardForFileTable(f.prefix))
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to match pattern provided")
 	}
@@ -142,10 +212,26 @@ func (f *fileTableStorage) ListFiles(ctx context.Context, patternSuffix string) 
 		if containsGlob(f.prefix) {
 			return nil, errors.New("prefix cannot contain globs pattern when passing an explicit pattern")
 		}
-		pattern = path.Join(pattern, patternSuffix)
+		pattern, err = checkBaseAndJoinFilePath(pattern, patternSuffix)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	for _, match := range matches {
+		// If there is no glob pattern, then the user wishes to list all the uploaded
+		// files stored in the userfile table storage.
+		if f.prefix == "" {
+			match = strings.TrimPrefix(match, "/")
+			unescapedURI, err := url.PathUnescape(makeUserFileURIWithQualifiedName(f.cfg.
+				QualifiedTableName, match))
+			if err != nil {
+				return nil, err
+			}
+			fileList = append(fileList, unescapedURI)
+			continue
+		}
+
 		doesMatch, matchErr := path.Match(pattern, match)
 		if matchErr != nil {
 			continue
@@ -159,8 +245,13 @@ func (f *fileTableStorage) ListFiles(ctx context.Context, patternSuffix string) 
 				fileList = append(fileList, strings.TrimPrefix(strings.TrimPrefix(match, f.prefix),
 					"/"))
 			} else {
-				fileList = append(fileList, makeUserFileURIWithQualifiedName(f.cfg.QualifiedTableName,
-					match))
+				match = strings.TrimPrefix(match, "/")
+				unescapedURI, err := url.PathUnescape(makeUserFileURIWithQualifiedName(f.cfg.
+					QualifiedTableName, match))
+				if err != nil {
+					return nil, err
+				}
+				fileList = append(fileList, unescapedURI)
 			}
 		}
 	}
@@ -171,11 +262,19 @@ func (f *fileTableStorage) ListFiles(ctx context.Context, patternSuffix string) 
 // Delete implements the ExternalStorage interface and deletes the file from the
 // user scoped FileToTableSystem.
 func (f *fileTableStorage) Delete(ctx context.Context, basename string) error {
-	return f.fs.DeleteFile(ctx, path.Join(f.prefix, basename))
+	filepath, err := checkBaseAndJoinFilePath(f.prefix, basename)
+	if err != nil {
+		return err
+	}
+	return f.fs.DeleteFile(ctx, filepath)
 }
 
 // Size implements the ExternalStorage interface and returns the size of the
 // file stored in the user scoped FileToTableSystem.
 func (f *fileTableStorage) Size(ctx context.Context, basename string) (int64, error) {
-	return f.fs.FileSize(ctx, path.Join(f.prefix, basename))
+	filepath, err := checkBaseAndJoinFilePath(f.prefix, basename)
+	if err != nil {
+		return 0, err
+	}
+	return f.fs.FileSize(ctx, filepath)
 }

@@ -77,10 +77,13 @@ func DefaultGeometryIndexConfig() *Config {
 }
 
 // GeometryIndexConfigForSRID returns a geometry index config for srid.
-func GeometryIndexConfigForSRID(srid geopb.SRID) *Config {
+func GeometryIndexConfigForSRID(srid geopb.SRID) (*Config, error) {
+	if srid == 0 {
+		return DefaultGeometryIndexConfig(), nil
+	}
 	p, exists := geoprojbase.Projection(srid)
-	if !exists || p.Bounds == nil {
-		return DefaultGeometryIndexConfig()
+	if !exists {
+		return nil, errors.Newf("expected definition for SRID %d", srid)
 	}
 	b := p.Bounds
 	minX, maxX, minY, maxY := b.MinX, b.MaxX, b.MinY, b.MaxY
@@ -91,6 +94,21 @@ func GeometryIndexConfigForSRID(srid geopb.SRID) *Config {
 	}
 	if maxY-minY < 1 {
 		maxY++
+	}
+	// We are covering shapes using cells that are square. If we have shapes
+	// that start off as well-behaved wrt square cells, we do not wish to
+	// distort them significantly. Hence, we equalize MaxX-MinX and MaxY-MinY
+	// in the index bounds.
+	diffX := maxX - minX
+	diffY := maxY - minY
+	if diffX > diffY {
+		adjustment := (diffX - diffY) / 2
+		minY -= adjustment
+		maxY += adjustment
+	} else {
+		adjustment := (diffY - diffX) / 2
+		minX -= adjustment
+		maxX += adjustment
 	}
 	// Expand the bounds by 2x the clippingBoundsDelta, to
 	// ensure that shapes touching the bounds don't get
@@ -105,7 +123,7 @@ func GeometryIndexConfigForSRID(srid geopb.SRID) *Config {
 			MinY:     minY - deltaY,
 			MaxY:     maxY + deltaY,
 			S2Config: defaultS2Config()},
-	}
+	}, nil
 }
 
 // A cell id unused by S2. We use it to index geometries that exceed the
@@ -216,7 +234,8 @@ func (s *s2GeometryIndex) Intersects(c context.Context, g *geo.Geometry) (UnionK
 		spans = intersects(c, covererWithBBoxFallback{s: s, geom: gt}, r)
 	}
 	if clipped {
-		// And lookup all shapes that exceed the bounds.
+		// And lookup all shapes that exceed the bounds. The exceedsBoundsCellID is the largest
+		// possible key, so appending it maintains the sorted order of spans.
 		spans = append(spans, KeySpan{Start: Key(exceedsBoundsCellID), End: Key(exceedsBoundsCellID)})
 	}
 	return spans, nil

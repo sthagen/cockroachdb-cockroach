@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 // optTableUpserter implements the upsert operation when it is planned by the
@@ -63,10 +62,6 @@ type optTableUpserter struct {
 	// collectRows is true.
 	insertReorderingRequired bool
 
-	// resultCount is the number of upserts. Mirrors rowsUpserted.Len() if
-	// collectRows is set, counted separately otherwise.
-	resultCount int
-
 	// fetchCols indicate which columns need to be fetched from the target table,
 	// in order to detect whether a conflict has occurred, as well as to provide
 	// existing values for updates.
@@ -105,7 +100,7 @@ var _ tableWriter = &optTableUpserter{}
 func (tu *optTableUpserter) init(
 	ctx context.Context, txn *kv.Txn, evalCtx *tree.EvalContext,
 ) error {
-	tu.tableWriterBase.init(txn)
+	tu.tableWriterBase.init(txn, tu.ri.Helper.TableDesc)
 
 	// collectRows, set upon initialization, indicates whether or not we want
 	// rows returned from the operation.
@@ -122,9 +117,8 @@ func (tu *optTableUpserter) init(
 		// because even though we might insert values into mutation columns, we
 		// never return them back to the user.
 		tu.colIDToReturnIndex = map[sqlbase.ColumnID]int{}
-		tableDesc := tu.tableDesc()
-		for i := range tableDesc.Columns {
-			id := tableDesc.Columns[i].ID
+		for i := range tu.tableDesc().Columns {
+			id := tu.tableDesc().Columns[i].ID
 			tu.colIDToReturnIndex[id] = i
 		}
 
@@ -149,13 +143,10 @@ func (tu *optTableUpserter) flushAndStartNewBatch(ctx context.Context) error {
 	if tu.collectRows {
 		tu.rowsUpserted.Clear(ctx)
 	}
-	return tu.tableWriterBase.flushAndStartNewBatch(ctx, tu.tableDesc())
+	return tu.tableWriterBase.flushAndStartNewBatch(ctx)
 }
 
-// batchedCount is part of the batchedTableWriter interface.
-func (tu *optTableUpserter) batchedCount() int { return tu.resultCount }
-
-// batchedValues is part of the batchedTableWriter interface.
+// batchedValues is a helper in implementing batchedPlanNode interface.
 func (tu *optTableUpserter) batchedValues(rowIdx int) tree.Datums {
 	if !tu.collectRows {
 		panic("return row requested but collect rows was not set")
@@ -165,16 +156,10 @@ func (tu *optTableUpserter) batchedValues(rowIdx int) tree.Datums {
 
 // close is part of the tableWriter interface.
 func (tu *optTableUpserter) close(ctx context.Context) {
+	tu.tableWriterBase.close(ctx)
 	if tu.rowsUpserted != nil {
 		tu.rowsUpserted.Close(ctx)
 	}
-}
-
-// finalize is part of the tableWriter interface.
-func (tu *optTableUpserter) finalize(
-	ctx context.Context, traceKV bool,
-) (*rowcontainer.RowContainer, error) {
-	return nil, tu.tableWriterBase.finalize(ctx, tu.tableDesc())
 }
 
 // makeResultFromRow reshapes a row that was inserted or updated to a row
@@ -205,13 +190,10 @@ func (tu *optTableUpserter) makeResultFromRow(
 func (*optTableUpserter) desc() string { return "opt upserter" }
 
 // row is part of the tableWriter interface.
-// TODO(mgartner): Use ignoreIndexes to avoid writing to partial indexes when
-// the row does not match the partial index predicate.
 func (tu *optTableUpserter) row(
-	ctx context.Context, row tree.Datums, ignoreIndexes util.FastIntSet, traceKV bool,
+	ctx context.Context, row tree.Datums, pm row.PartialIndexUpdateHelper, traceKV bool,
 ) error {
-	tu.batchSize++
-	tu.resultCount++
+	tu.currentBatchSize++
 
 	// Consult the canary column to determine whether to insert or update. For
 	// more details on how canary columns work, see the block comment on
@@ -220,11 +202,11 @@ func (tu *optTableUpserter) row(
 	if tu.canaryOrdinal == -1 {
 		// No canary column means that existing row should be overwritten (i.e.
 		// the insert and update columns are the same, so no need to choose).
-		return tu.insertNonConflictingRow(ctx, tu.b, row[:insertEnd], true /* overwrite */, traceKV)
+		return tu.insertNonConflictingRow(ctx, tu.b, row[:insertEnd], pm, true /* overwrite */, traceKV)
 	}
 	if row[tu.canaryOrdinal] == tree.DNull {
 		// No conflict, so insert a new row.
-		return tu.insertNonConflictingRow(ctx, tu.b, row[:insertEnd], false /* overwrite */, traceKV)
+		return tu.insertNonConflictingRow(ctx, tu.b, row[:insertEnd], pm, false /* overwrite */, traceKV)
 	}
 
 	// If no columns need to be updated, then possibly collect the unchanged row.
@@ -244,28 +226,24 @@ func (tu *optTableUpserter) row(
 		tu.b,
 		row[insertEnd:fetchEnd],
 		row[fetchEnd:updateEnd],
+		pm,
 		tu.tableDesc(),
 		traceKV,
 	)
-}
-
-// atBatchEnd is part of the tableWriter interface.
-func (tu *optTableUpserter) atBatchEnd(ctx context.Context, traceKV bool) error {
-	// Nothing to do, because the row method does everything.
-	return nil
 }
 
 // insertNonConflictingRow inserts the given source row into the table when
 // there was no conflict. If the RETURNING clause was specified, then the
 // inserted row is stored in the rowsUpserted collection.
 func (tu *optTableUpserter) insertNonConflictingRow(
-	ctx context.Context, b *kv.Batch, insertRow tree.Datums, overwrite, traceKV bool,
+	ctx context.Context,
+	b *kv.Batch,
+	insertRow tree.Datums,
+	pm row.PartialIndexUpdateHelper,
+	overwrite, traceKV bool,
 ) error {
 	// Perform the insert proper.
-	// TODO(mgartner): Pass ignoreIndexes to InsertRow and do not write index
-	// entries for indexes in the set.
-	var ignoreIndexes util.FastIntSet
-	if err := tu.ri.InsertRow(ctx, b, insertRow, ignoreIndexes, overwrite, traceKV); err != nil {
+	if err := tu.ri.InsertRow(ctx, b, insertRow, pm, overwrite, traceKV); err != nil {
 		return err
 	}
 
@@ -310,6 +288,7 @@ func (tu *optTableUpserter) updateConflictingRow(
 	b *kv.Batch,
 	fetchRow tree.Datums,
 	updateValues tree.Datums,
+	pm row.PartialIndexUpdateHelper,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	traceKV bool,
 ) error {
@@ -327,10 +306,7 @@ func (tu *optTableUpserter) updateConflictingRow(
 	// Queue the update in KV. This also returns an "update row"
 	// containing the updated values for every column in the
 	// table. This is useful for RETURNING, which we collect below.
-	// TODO(mgartner): Add partial index IDs to ignoreIndexes that we should
-	// not add entries to or delete entries from.
-	var ignoreIndexes util.FastIntSet
-	_, err := tu.ru.UpdateRow(ctx, b, fetchRow, updateValues, ignoreIndexes, ignoreIndexes, traceKV)
+	_, err := tu.ru.UpdateRow(ctx, b, fetchRow, updateValues, pm, traceKV)
 	if err != nil {
 		return err
 	}

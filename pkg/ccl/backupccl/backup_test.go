@@ -52,6 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -63,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
+	"github.com/jackc/pgx"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -780,7 +782,7 @@ func TestBackupRestoreCheckpointing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	t.Skip("https://github.com/cockroachdb/cockroach/issues/33357")
+	skip.WithIssue(t, 33357)
 
 	defer func(oldInterval time.Duration) {
 		BackupCheckpointInterval = oldInterval
@@ -1018,7 +1020,7 @@ func getHighWaterMark(jobID int64, sqlDB *gosql.DB) (roachpb.Key, error) {
 func TestBackupRestoreControlJob(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	t.Skip("#24136")
+	skip.WithIssue(t, 24136)
 
 	// force every call to update
 	defer jobs.TestingSetProgressThresholds()()
@@ -1296,8 +1298,7 @@ func TestBackupRestoreUserDefinedTypes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// TODO (rohany): Add tests for backup/restore with revision history and
-	//  incremental backups once types can change.
+	// TODO (rohany): Add some tests for backup/restore with revision history.
 
 	// Test full cluster backup/restore.
 	t.Run("full-cluster", func(t *testing.T) {
@@ -1350,6 +1351,12 @@ INSERT INTO d2.t2 VALUES (ARRAY['bye']), (ARRAY['cya']);
 		sqlDBRestore.ExpectErr(t, `pq: type "d.public._greeting" already exists`, `CREATE TYPE d._greeting AS ENUM ('hello', 'hiya')`)
 		sqlDBRestore.ExpectErr(t, `pq: type "d2.public.farewell" already exists`, `CREATE TYPE d2.farewell AS ENUM ('go', 'away')`)
 		sqlDBRestore.ExpectErr(t, `pq: type "d2.public._farewell" already exists`, `CREATE TYPE d2._farewell AS ENUM ('go', 'away')`)
+
+		// We shouldn't be able to drop the types since there are tables that
+		// depend on them. These tests ensure that the back references from types
+		// to tables that use them are handled correctly by backup and restore.
+		sqlDBRestore.ExpectErr(t, `pq: cannot drop type "greeting" because other objects \(\[d.public.t1 d.public.t2\]\) still depend on it`, `DROP TYPE d.greeting`)
+		sqlDBRestore.ExpectErr(t, `pq: cannot drop type "farewell" because other objects \(\[d2.public.t1 d2.public.t2\]\) still depend on it`, `DROP TYPE d2.farewell`)
 	})
 
 	// Test backup/restore of a database.
@@ -1398,6 +1405,12 @@ CREATE TABLE d.expr (
 		sqlDB.ExpectErr(t, `pq: type "d.public._greeting" already exists`, `CREATE TYPE d._greeting AS ENUM ('hello', 'hiya')`)
 		sqlDB.ExpectErr(t, `pq: type "d.public.farewell" already exists`, `CREATE TYPE d.farewell AS ENUM ('hello', 'hiya')`)
 		sqlDB.ExpectErr(t, `pq: type "d.public._farewell" already exists`, `CREATE TYPE d._farewell AS ENUM ('hello', 'hiya')`)
+
+		// We shouldn't be able to drop the types since there are tables that
+		// depend on them. These tests ensure that the back references from types
+		// to tables that use them are handled correctly by backup and restore.
+		sqlDB.ExpectErr(t, `pq: cannot drop type "greeting" because other objects \(\[d.public.t1 d.public.t2 d.public.expr d.public.t3\]\) still depend on it`, `DROP TYPE d.greeting`)
+		sqlDB.ExpectErr(t, `pq: cannot drop type "farewell" because other objects \(\[d.public.t3\]\) still depend on it`, `DROP TYPE d.farewell`)
 	})
 
 	// Test backup/restore of a single table.
@@ -1464,8 +1477,6 @@ INSERT INTO d.t3 VALUES ('hi');
 	// Test cases where we attempt to remap types in the backup to types that
 	// already exist in the cluster.
 	t.Run("backup-remap", func(t *testing.T) {
-		// TODO (rohany): Add a test for remapping to enums that are compatible
-		//  but not the same once ALTER TYPE is possibe.
 		_, _, sqlDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, 0, InitNone)
 		defer cleanupFn()
 		sqlDB.Exec(t, `
@@ -1487,6 +1498,9 @@ INSERT INTO d.t2 VALUES (ARRAY['hello']);
 			// Check that the table data is restored correctly and the types aren't touched.
 			sqlDB.CheckQueryResults(t, `SELECT 'hello'::d.greeting, ARRAY['hello']::d.greeting[]`, [][]string{{"hello", "{hello}"}})
 			sqlDB.CheckQueryResults(t, `SELECT * FROM d.t ORDER BY x`, [][]string{{"hello"}, {"howdy"}})
+
+			// d.t should be added as a back reference to greeting.
+			sqlDB.ExpectErr(t, `pq: cannot drop type "greeting" because other objects \(\[d.public.t2 d.public.t\]\) still depend on it`, `DROP TYPE d.greeting`)
 		}
 
 		{
@@ -1513,6 +1527,9 @@ INSERT INTO d.t2 VALUES (ARRAY['hello']);
 			sqlDB.Exec(t, `RESTORE TABLE d.t2 FROM 'nodelocal://0/test2/' WITH into_db = 'd2'`)
 			sqlDB.CheckQueryResults(t, `SELECT * FROM d2.t2 ORDER BY x`, [][]string{{"{hello}"}})
 			sqlDB.Exec(t, `INSERT INTO d2.t2 VALUES (ARRAY['hi'::d2.greeting])`)
+
+			// d2.t and d2.t2 should both have back references to d2.greeting.
+			sqlDB.ExpectErr(t, `pq: cannot drop type "greeting" because other objects \(\[d2.public.t d2.public.t2\]\) still depend on it`, `DROP TYPE d2.greeting`)
 		}
 
 		{
@@ -1552,6 +1569,23 @@ INSERT INTO d.t2 VALUES (ARRAY['hello']);
 			sqlDB.Exec(t, `RESTORE TABLE d5.tb1 FROM 'nodelocal://0/test3/' WITH into_db = 'd6'`)
 			sqlDB.Exec(t, `INSERT INTO d6.tb1 VALUES (ARRAY['v1']::d6._typ1)`)
 		}
+
+		{
+			// Test a case where we restore to an existing enum that is compatible with,
+			// but not the same as greeting.
+			sqlDB.Exec(t, `CREATE DATABASE d7`)
+			sqlDB.Exec(t, `CREATE TYPE d7.greeting AS ENUM ('hello', 'howdy', 'hi')`)
+			// Now add a value to greeting -- this will keep the internal representations
+			// of the existing enum members the same.
+			sqlDB.Exec(t, `ALTER TYPE d7.greeting ADD VALUE 'greetings' BEFORE 'howdy'`)
+
+			// We should be able to restore d.greeting using d7.greeting.
+			sqlDB.Exec(t, `RESTORE TABLE d.t FROM 'nodelocal://0/test/' WITH into_db = 'd7'`)
+			sqlDB.Exec(t, `INSERT INTO d7.t VALUES ('greetings')`)
+			sqlDB.CheckQueryResults(t, `SELECT * FROM d7.t ORDER BY x`, [][]string{{"hello"}, {"greetings"}, {"howdy"}})
+			// d7.t should have a back reference from d7.greeting.
+			sqlDB.ExpectErr(t, `pq: cannot drop type "greeting" because other objects \(\[d7.public.t\]\) still depend on it`, `DROP TYPE d7.greeting`)
+		}
 	})
 
 	t.Run("incremental", func(t *testing.T) {
@@ -1576,6 +1610,37 @@ INSERT INTO d.t VALUES ('hello'), ('howdy');
 			sqlDB.Exec(t, `CREATE DATABASE d2`)
 			sqlDB.Exec(t, `RESTORE TABLE d.t FROM 'nodelocal://0/test/' WITH into_db = 'd2'`)
 			sqlDB.CheckQueryResults(t, `SELECT 'hello'::d2.newname`, [][]string{{"hello"}})
+		}
+
+		{
+			// Create a database with a type, and take a backup.
+			sqlDB.Exec(t, `CREATE DATABASE d3`)
+			sqlDB.Exec(t, `BACKUP DATABASE d3 TO 'nodelocal://0/test2/'`)
+
+			// Now create a new type in that database.
+			sqlDB.Exec(t, `CREATE TYPE d3.farewell AS ENUM ('bye', 'cya')`)
+
+			// Perform an incremental backup, which should pick up the new type.
+			sqlDB.Exec(t, `BACKUP DATABASE d3 TO 'nodelocal://0/test2/'`)
+
+			// Until #51362 lands we have to manually clean up this type before the
+			// DROP DATABASE statement otherwise we'll leave behind an orphaned desc.
+			sqlDB.Exec(t, `DROP TYPE d3.farewell`)
+
+			// Now restore it.
+			sqlDB.Exec(t, `DROP DATABASE d3`)
+			sqlDB.Exec(t, `RESTORE DATABASE d3 FROM 'nodelocal://0/test2/'`)
+			// Check that we are able to use the type.
+			sqlDB.Exec(t, `CREATE TABLE d3.t (x d3.farewell)`)
+			sqlDB.Exec(t, `DROP TABLE d3.t`)
+
+			// If we drop the type and back up again, it should be gone.
+			sqlDB.Exec(t, `DROP TYPE d3.farewell`)
+
+			sqlDB.Exec(t, `BACKUP DATABASE d3 TO 'nodelocal://0/test2/'`)
+			sqlDB.Exec(t, `DROP DATABASE d3`)
+			sqlDB.Exec(t, `RESTORE DATABASE d3 FROM 'nodelocal://0/test2/'`)
+			sqlDB.ExpectErr(t, `pq: type "d3.farewell" does not exist`, `CREATE TABLE d3.t (x d3.farewell)`)
 		}
 	})
 }
@@ -4357,4 +4422,125 @@ func TestBackupRestoreTenant(t *testing.T) {
 
 		restoreTenant20.CheckQueryResults(t, `select * from foo.qux`, tenant20.QueryStr(t, `select * from foo.qux`))
 	})
+}
+
+// TestClientDisconnect ensures that an backup job can complete even if
+// the client connection which started it closes.
+func TestClientDisconnect(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const restoreDB = "restoredb"
+
+	testCases := []struct {
+		jobType    string
+		jobCommand string
+	}{
+		{
+			jobType:    "BACKUP",
+			jobCommand: fmt.Sprintf("BACKUP TO '%s'", LocalFoo),
+		},
+		{
+			jobType:    "RESTORE",
+			jobCommand: fmt.Sprintf("RESTORE data.* FROM '%s' WITH into_db='%s'", LocalFoo, restoreDB),
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.jobType, func(t *testing.T) {
+			// When completing an export request, signal the a request has been sent and
+			// then wait to be signaled.
+			allowResponse := make(chan struct{})
+			gotRequest := make(chan struct{}, 1)
+			args := base.TestClusterArgs{}
+			args.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
+				TestingResponseFilter: func(ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+					for _, ru := range br.Responses {
+						switch ru.GetInner().(type) {
+						case *roachpb.ExportResponse, *roachpb.ImportResponse:
+							select {
+							case gotRequest <- struct{}{}:
+							default:
+							}
+							select {
+							case <-allowResponse:
+							case <-ctx.Done(): // Deal with test failures.
+							}
+						}
+					}
+					return nil
+				},
+			}
+			ctx, tc, sqlDB, _, cleanup := backupRestoreTestSetupWithParams(t, MultiNode, 1 /* numAccounts */, InitNone, args)
+			defer cleanup()
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			conn := tc.ServerConn(0)
+			sqlDB.Exec(t, "SET CLUSTER SETTING kv.protectedts.poll_interval = '100ms';")
+
+			// If we're testing restore, we first create a backup file to restore.
+			if testCase.jobType == "RESTORE" {
+				close(allowResponse)
+				sqlDB.Exec(t, fmt.Sprintf("CREATE DATABASE %s", restoreDB))
+				sqlDB.Exec(t, "BACKUP TO $1", LocalFoo)
+				allowResponse = make(chan struct{})
+			}
+
+			// Make credentials for the new connection.
+			sqlDB.Exec(t, `CREATE USER testuser`)
+			sqlDB.Exec(t, `GRANT admin TO testuser`)
+			pgURL, cleanup := sqlutils.PGUrl(t, tc.Server(0).ServingSQLAddr(),
+				"TestClientDisconnect-testuser", url.User("testuser"))
+			defer cleanup()
+
+			// Kick off the job on a new connection which we're going to close.
+			done := make(chan struct{})
+			ctxToCancel, cancel := context.WithCancel(ctx)
+			defer cancel()
+			go func() {
+				defer close(done)
+				connCfg, err := pgx.ParseConnectionString(pgURL.String())
+				assert.NoError(t, err)
+				db, err := pgx.Connect(connCfg)
+				assert.NoError(t, err)
+				defer func() { _ = db.Close() }()
+				_, err = db.ExecEx(ctxToCancel, testCase.jobCommand, nil /* options */)
+				assert.Equal(t, context.Canceled, err)
+			}()
+
+			// Wait for the job to start.
+			var jobID string
+			testutils.SucceedsSoon(t, func() error {
+				row := conn.QueryRow(
+					"SELECT job_id FROM [SHOW JOBS] WHERE job_type = $1 ORDER BY created DESC LIMIT 1",
+					testCase.jobType,
+				)
+				return row.Scan(&jobID)
+			})
+
+			// Wait for it to actually start.
+			<-gotRequest
+
+			// Cancel the job's context and wait for the goroutine to exit.
+			cancel()
+			<-done
+
+			// Allow the job to proceed.
+			close(allowResponse)
+
+			// Wait for the job to get marked as succeeded.
+			testutils.SucceedsSoon(t, func() error {
+				var status string
+				if err := conn.QueryRow("SELECT status FROM [SHOW JOB " + jobID + "]").Scan(&status); err != nil {
+					return err
+				}
+				const succeeded = "succeeded"
+				if status != succeeded {
+					return errors.Errorf("expected %s, got %v", succeeded, status)
+				}
+				return nil
+			})
+		})
+	}
 }

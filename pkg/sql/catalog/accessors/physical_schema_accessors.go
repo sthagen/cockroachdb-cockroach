@@ -56,7 +56,8 @@ type CachedPhysicalAccessor struct {
 	catalog.Accessor
 	tc *descs.Collection
 	// Used to avoid allocations.
-	tn tree.TableName
+	tableName tree.TableName
+	typeName  tree.TypeName
 }
 
 var _ catalog.Accessor = &CachedPhysicalAccessor{}
@@ -103,11 +104,11 @@ func (a *CachedPhysicalAccessor) GetDatabaseDesc(
 	return a.Accessor.GetDatabaseDesc(ctx, txn, codec, name, flags)
 }
 
-// IsValidSchema implements the Accessor interface.
-func (a *CachedPhysicalAccessor) IsValidSchema(
-	ctx context.Context, txn *kv.Txn, _ keys.SQLCodec, dbID sqlbase.ID, scName string,
-) (bool, sqlbase.ID, error) {
-	return a.tc.ResolveSchemaID(ctx, txn, dbID, scName)
+// GetSchema implements the Accessor interface.
+func (a *CachedPhysicalAccessor) GetSchema(
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, dbID sqlbase.ID, scName string,
+) (bool, sqlbase.ResolvedSchema, error) {
+	return a.tc.ResolveSchema(ctx, txn, dbID, scName)
 }
 
 // GetObjectDesc implements the Accessor interface.
@@ -121,20 +122,30 @@ func (a *CachedPhysicalAccessor) GetObjectDesc(
 ) (catalog.Descriptor, error) {
 	switch flags.DesiredObjectKind {
 	case tree.TypeObject:
-		// TypeObjects are not caches so fall through to the underlying physical
-		// Accessor.
-		return a.Accessor.GetObjectDesc(ctx, txn, settings, codec, db, schema, object, flags)
-	case tree.TableObject:
-		a.tn = tree.MakeTableNameWithSchema(tree.Name(db), tree.Name(schema), tree.Name(object))
+		a.typeName = tree.MakeNewQualifiedTypeName(db, schema, object)
 		if flags.RequireMutable {
-			table, err := a.tc.GetMutableTableDescriptor(ctx, txn, &a.tn, flags)
+			typ, err := a.tc.GetMutableTypeDescriptor(ctx, txn, &a.typeName, flags)
+			if typ == nil {
+				return nil, err
+			}
+			return typ, err
+		}
+		typ, err := a.tc.GetTypeVersion(ctx, txn, &a.typeName, flags)
+		if typ == nil {
+			return nil, err
+		}
+		return typ, err
+	case tree.TableObject:
+		a.tableName = tree.MakeTableNameWithSchema(tree.Name(db), tree.Name(schema), tree.Name(object))
+		if flags.RequireMutable {
+			table, err := a.tc.GetMutableTableDescriptor(ctx, txn, &a.tableName, flags)
 			if table == nil {
 				// return nil interface.
 				return nil, err
 			}
 			return table, err
 		}
-		table, err := a.tc.GetTableVersion(ctx, txn, &a.tn, flags)
+		table, err := a.tc.GetTableVersion(ctx, txn, &a.tableName, flags)
 		if table == nil {
 			// return nil interface.
 			return nil, err

@@ -203,33 +203,34 @@ render                                       ·             ·
 query TTT
 SELECT * FROM [EXPLAIN SHOW TABLES WITH COMMENT] WHERE field != 'size'
 ----
-·                                                 distribution  local
-·                                                 vectorized    false
-render                                            ·             ·
- └── sort                                         ·             ·
-      │                                           order         +nspname,+relname
-      └── render                                  ·             ·
-           └── hash-join                          ·             ·
-                │                                 type          left outer
-                │                                 equality      (oid) = (objoid)
-                ├── hash-join                     ·             ·
-                │    │                            type          inner
-                │    │                            equality      (oid) = (relnamespace)
-                │    ├── filter                   ·             ·
-                │    │    │                       filter        nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
-                │    │    └── render              ·             ·
-                │    │         └── virtual table  ·             ·
-                │    │                            source        pg_namespace@primary
-                │    └── filter                   ·             ·
-                │         │                       filter        relkind IN ('S', 'r', 'v')
-                │         └── render              ·             ·
-                │              └── virtual table  ·             ·
-                │                                 source        pg_class@primary
-                └── filter                        ·             ·
-                     │                            filter        objsubid = 0
-                     └── render                   ·             ·
-                          └── virtual table       ·             ·
-·                                                 source        pg_description@primary
+·                                                 distribution       local
+·                                                 vectorized         false
+render                                            ·                  ·
+ └── sort                                         ·                  ·
+      │                                           order              +nspname,+relname
+      └── render                                  ·                  ·
+           └── hash-join                          ·                  ·
+                │                                 type               inner
+                │                                 equality           (oid) = (relnamespace)
+                ├── filter                        ·                  ·
+                │    │                            filter             nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
+                │    └── render                   ·                  ·
+                │         └── virtual table       ·                  ·
+                │                                 source             pg_namespace@primary
+                └── hash-join                     ·                  ·
+                     │                            type               left outer
+                     │                            equality           (oid) = (objoid)
+                     │                            left cols are key  ·
+                     ├── filter                   ·                  ·
+                     │    │                       filter             relkind IN ('S', 'r', 'v')
+                     │    └── render              ·                  ·
+                     │         └── virtual table  ·                  ·
+                     │                            source             pg_class@primary
+                     └── filter                   ·                  ·
+                          │                       filter             objsubid = 0
+                          └── render              ·                  ·
+                               └── virtual table  ·                  ·
+·                                                 source             pg_description@primary
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW DATABASE] WHERE field != 'size'
@@ -601,16 +602,16 @@ CREATE TABLE tc (a INT, b INT, INDEX c(a), FAMILY "primary" (a, b, rowid))
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM tc WHERE a = 10 ORDER BY b
 ----
-·                distribution  local       ·                   ·
-·                vectorized    true        ·                   ·
-sort             ·             ·           (a, b)              +b
- │               order         +b          ·                   ·
- └── index-join  ·             ·           (a, b)              ·
-      │          table         tc@primary  ·                   ·
-      │          key columns   rowid       ·                   ·
-      └── scan   ·             ·           (a, rowid[hidden])  ·
-·                table         tc@c        ·                   ·
-·                spans         /10-/11     ·                   ·
+·                distribution  local       ·           ·
+·                vectorized    true        ·           ·
+sort             ·             ·           (a, b)      +b
+ │               order         +b          ·           ·
+ └── index-join  ·             ·           (a, b)      ·
+      │          table         tc@primary  ·           ·
+      │          key columns   rowid       ·           ·
+      └── scan   ·             ·           (a, rowid)  ·
+·                table         tc@c        ·           ·
+·                spans         /10-/11     ·           ·
 
 query TTTTT colnames
 EXPLAIN (TYPES) INSERT INTO t VALUES (1, 2)

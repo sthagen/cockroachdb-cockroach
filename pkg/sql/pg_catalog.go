@@ -23,8 +23,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -1006,6 +1009,20 @@ func (r oneAtATimeSchemaResolver) getTableByID(id sqlbase.ID) (*TableDescriptor,
 	return table.Desc.TableDesc(), nil
 }
 
+func (r oneAtATimeSchemaResolver) getSchemaByID(
+	id sqlbase.ID,
+) (*sqlbase.ImmutableSchemaDescriptor, error) {
+	// TODO (rohany): This should use the descs.Collection.
+	sc, err := catalogkv.GetDescriptorByID(r.ctx, r.p.txn, r.p.ExecCfg().Codec, id)
+	if err != nil {
+		return nil, err
+	}
+	if sc == nil || sc.SchemaDesc() == nil {
+		return nil, sqlbase.NewUndefinedSchemaError(fmt.Sprintf("[%d]", id))
+	}
+	return sc.(*sqlbase.ImmutableSchemaDescriptor), nil
+}
+
 // makeAllRelationsVirtualTableWithDescriptorIDIndex creates a virtual table that searches through
 // all table descriptors in the system. It automatically adds a virtual index implementation to the
 // table id column as well. The input schema must have a single INDEX definition
@@ -1944,7 +1961,7 @@ CREATE TABLE pg_catalog.pg_operator (
 				leftType = tree.NewDOid(tree.DInt(params.Types()[0].Oid()))
 				rightType = tree.NewDOid(tree.DInt(params.Types()[1].Oid()))
 			default:
-				panic(fmt.Sprintf("Unexpected operator %s with %d params",
+				panic(errors.AssertionFailedf("Unexpected operator %s with %d params",
 					opName, params.Length()))
 			}
 			returnType := tree.NewDOid(tree.DInt(returnTyper(nil).Oid()))
@@ -2805,10 +2822,12 @@ CREATE TABLE pg_catalog.pg_type (
 
 				// Check if it is a user defined type.
 				id := sqlbase.ID(types.UserDefinedTypeOIDToID(ooid))
-				// TODO (rohany): This access should go through the desc.Collection.
-				typDesc, err := sqlbase.GetTypeDescFromID(ctx, p.txn, keys.SystemSQLCodec, id)
+				typDesc, err := p.Descriptors().GetTypeVersionByID(ctx, p.txn, id, tree.ObjectLookupFlags{})
 				if err != nil {
 					if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
+						return false, nil
+					}
+					if pgerror.GetPGCode(err) == pgcode.UndefinedObject {
 						return false, nil
 					}
 					return false, err

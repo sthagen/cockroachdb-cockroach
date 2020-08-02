@@ -930,6 +930,39 @@ has no relationship with the commit order of concurrent transactions.</p>
 <tr><td><a name="st_azimuth"></a><code>st_azimuth(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the azimuth in radians of the segment defined by the given point geometries, or NULL if the two points are coincident.</p>
 <p>The azimuth is angle is referenced from north, and is positive clockwise: North = 0; East = π/2; South = π; West = 3π/2.</p>
 </span></td></tr>
+<tr><td><a name="st_buffer"></a><code>st_buffer(geography: geography, distance: <a href="float.html">float</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns a Geometry that represents all points whose distance is less than or equal to the given distance
+from the given Geometry.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This operation is done by transforming the object into a Geometry. This occurs by translating
+the Geography objects into Geometry objects before applying an LAEA, UTM or Web Mercator
+based projection based on the bounding boxes of the given Geography objects. When the result is
+calculated, the result is transformed back into a Geography with SRID 4326.</p>
+</span></td></tr>
+<tr><td><a name="st_buffer"></a><code>st_buffer(geography: geography, distance: <a href="float.html">float</a>, buffer_style_params: <a href="string.html">string</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns a Geometry that represents all points whose distance is less than or equal to the given distance from the
+given Geometry.</p>
+<p>This variant takes in a space separate parameter string, which will augment the buffer styles. Valid parameters are:</p>
+<ul>
+<li>quad_segs=&lt;int&gt;, default 8</li>
+<li>endcap=&lt;round|flat|butt|square&gt;, default round</li>
+<li>join=&lt;round|mitre|miter|bevel&gt;, default round</li>
+<li>side=&lt;both|left|right&gt;, default both</li>
+<li>mitre_limit=&lt;float&gt;, default 5.0</li>
+</ul>
+<p>This function utilizes the GEOS module.</p>
+<p>This operation is done by transforming the object into a Geometry. This occurs by translating
+the Geography objects into Geometry objects before applying an LAEA, UTM or Web Mercator
+based projection based on the bounding boxes of the given Geography objects. When the result is
+calculated, the result is transformed back into a Geography with SRID 4326.</p>
+</span></td></tr>
+<tr><td><a name="st_buffer"></a><code>st_buffer(geography: geography, distance: <a href="float.html">float</a>, quad_segs: <a href="int.html">int</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns a Geometry that represents all points whose distance is less than or equal to the given distance from the
+given Geometry.</p>
+<p>This variant approximates the circle into quad_seg segments per line (the default is 8).</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This operation is done by transforming the object into a Geometry. This occurs by translating
+the Geography objects into Geometry objects before applying an LAEA, UTM or Web Mercator
+based projection based on the bounding boxes of the given Geography objects. When the result is
+calculated, the result is transformed back into a Geography with SRID 4326.</p>
+</span></td></tr>
 <tr><td><a name="st_buffer"></a><code>st_buffer(geometry: geometry, distance: <a href="decimal.html">decimal</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that represents all points whose distance is less than or equal to the given distance
 from the given Geometry.</p>
 <p>This function utilizes the GEOS module.</p>
@@ -1128,6 +1161,14 @@ Bottom Left.</p>
 </span></td></tr>
 <tr><td><a name="st_geographyfromtext"></a><code>st_geographyfromtext(val: <a href="string.html">string</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns the Geography from a WKT or EWKT representation.</p>
 </span></td></tr>
+<tr><td><a name="st_geohash"></a><code>st_geohash(geography: geography) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns a GeoHash representation of the geeographywith full precision if a point is provided, or with variable precision based on the size of the feature.</p>
+</span></td></tr>
+<tr><td><a name="st_geohash"></a><code>st_geohash(geography: geography, precision: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns a GeoHash representation of the geography with the supplied precision.</p>
+</span></td></tr>
+<tr><td><a name="st_geohash"></a><code>st_geohash(geometry: geometry) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns a GeoHash representation of the geometry with full precision if a point is provided, or with variable precision based on the size of the feature. This will error any coordinates are outside the bounds of longitude/latitude.</p>
+</span></td></tr>
+<tr><td><a name="st_geohash"></a><code>st_geohash(geometry: geometry, precision: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns a GeoHash representation of the geometry with the supplied precision. This will error any coordinates are outside the bounds of longitude/latitude.</p>
+</span></td></tr>
 <tr><td><a name="st_geomcollfromtext"></a><code>st_geomcollfromtext(str: <a href="string.html">string</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKT or EWKT representation with an SRID. If the shape underneath is not GeometryCollection, NULL is returned. If the SRID is present in both the EWKT and the argument, the argument value is used.</p>
 </span></td></tr>
 <tr><td><a name="st_geomcollfromtext"></a><code>st_geomcollfromtext(val: <a href="string.html">string</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKT or EWKT representation. If the shape underneath is not GeometryCollection, NULL is returned.</p>
@@ -1163,8 +1204,19 @@ Bottom Left.</p>
 </span></td></tr>
 <tr><td><a name="st_interiorringn"></a><code>st_interiorringn(geometry: geometry, n: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the n-th (1-indexed) interior ring of a Polygon as a LineString. Returns NULL if the shape is not a Polygon, or the ring does not exist.</p>
 </span></td></tr>
+<tr><td><a name="st_intersection"></a><code>st_intersection(geography_a: geography, geography_b: geography) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns the point intersections of the given geographies.</p>
+<p>This operation is done by transforming the object into a Geometry. This occurs by translating
+the Geography objects into Geometry objects before applying an LAEA, UTM or Web Mercator
+based projection based on the bounding boxes of the given Geography objects. When the result is
+calculated, the result is transformed back into a Geography with SRID 4326.</p>
+<p>This function utilizes the GEOS module.</p>
+</span></td></tr>
 <tr><td><a name="st_intersection"></a><code>st_intersection(geometry_a: geometry, geometry_b: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the point intersections of the given geometries.</p>
 <p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_intersection"></a><code>st_intersection(geometry_a_str: <a href="string.html">string</a>, geometry_b_str: <a href="string.html">string</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the point intersections of the given geometries.</p>
+<p>This function utilizes the GEOS module.</p>
+<p>This variant will cast all geometry_str arguments into Geometry types.</p>
 </span></td></tr>
 <tr><td><a name="st_intersects"></a><code>st_intersects(geography_a: geography, geography_b: geography) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geography_a shares any portion of space with geography_b.</p>
 <p>The calculations performed are have a precision of 1cm.</p>
@@ -1400,6 +1452,8 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 <tr><td><a name="st_relate"></a><code>st_relate(geometry_a: geometry, geometry_b: geometry, pattern: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the DE-9IM spatial relation between geometry_a and geometry_b matches the DE-9IM pattern.</p>
 <p>This function utilizes the GEOS module.</p>
 </span></td></tr>
+<tr><td><a name="st_relatematch"></a><code>st_relatematch(intersection_matrix: <a href="string.html">string</a>, pattern: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the given DE-9IM intersection matrix satisfies the given pattern.</p>
+</span></td></tr>
 <tr><td><a name="st_segmentize"></a><code>st_segmentize(geography: geography, max_segment_length_meters: <a href="float.html">float</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns a modified Geography having no segment longer than the given max_segment_length meters.</p>
 <p>The calculations are done on a sphere.</p>
 <p>This function utilizes the S2 library for spherical calculations.</p>
@@ -1565,6 +1619,8 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 <tr><td><a name="array_to_json"></a><code>array_to_json(array: anyelement[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Returns the array as JSON or JSONB.</p>
 </span></td></tr>
 <tr><td><a name="array_to_json"></a><code>array_to_json(array: anyelement[], pretty_bool: <a href="bool.html">bool</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Returns the array as JSON or JSONB.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.pb_to_json"></a><code>crdb_internal.pb_to_json(pbname: <a href="string.html">string</a>, data: <a href="bytes.html">bytes</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Converts protocol message to its JSONB representation.</p>
 </span></td></tr>
 <tr><td><a name="json_array_length"></a><code>json_array_length(json: jsonb) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of elements in the outermost JSON or JSONB array.</p>
 </span></td></tr>
@@ -1974,6 +2030,8 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 developers and its definition may change without prior notice.</p>
 <p>Note that uses of this function disable server-side optimizations and
 may increase either contention or retry errors, or both.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.approximate_timestamp"></a><code>crdb_internal.approximate_timestamp(timestamp: <a href="decimal.html">decimal</a>) &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Converts the crdb_internal_mvcc_timestamp column into an approximate timestamp.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.check_consistency"></a><code>crdb_internal.check_consistency(stats_only: <a href="bool.html">bool</a>, start_key: <a href="bytes.html">bytes</a>, end_key: <a href="bytes.html">bytes</a>) &rarr; tuple{int AS range_id, bytes AS start_key, string AS start_key_pretty, string AS status, string AS detail}</code></td><td><span class="funcdesc"><p>Runs a consistency check on ranges touching the specified key range. an empty start or end key is treated as the minimum and maximum possible, respectively. stats_only should only be set to false when targeting a small number of ranges to avoid overloading the cluster. Each returned row contains the range ID, the status (a roachpb.CheckConsistencyResponse_Status), and verbose detail.</p>
 <p>Example usage:

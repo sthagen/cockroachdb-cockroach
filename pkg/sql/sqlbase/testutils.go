@@ -26,6 +26,8 @@ import (
 
 	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geogen"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -175,7 +177,7 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 			// int8(rng.Uint64()) to get negative numbers, too
 			return tree.NewDInt(tree.DInt(int8(rng.Uint64())))
 		default:
-			panic(fmt.Sprintf("int with an unexpected width %d", typ.Width()))
+			panic(errors.AssertionFailedf("int with an unexpected width %d", typ.Width()))
 		}
 	case types.FloatFamily:
 		switch typ.Width() {
@@ -184,18 +186,24 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 		case 32:
 			return tree.NewDFloat(tree.DFloat(float32(rng.NormFloat64())))
 		default:
-			panic(fmt.Sprintf("float with an unexpected width %d", typ.Width()))
+			panic(errors.AssertionFailedf("float with an unexpected width %d", typ.Width()))
 		}
 	case types.GeographyFamily:
-		// TODO(otan): generate fake data properly.
-		return tree.NewDGeography(
-			geo.MustParseGeographyFromEWKB([]byte("\x01\x01\x00\x00\x20\xe6\x10\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f")),
-		)
+		gm, err := typ.GeoMetadata()
+		if err != nil {
+			panic(err)
+		}
+		srid := gm.SRID
+		if srid == 0 {
+			srid = geopb.DefaultGeographySRID
+		}
+		return tree.NewDGeography(geogen.RandomGeography(rng, srid))
 	case types.GeometryFamily:
-		// TODO(otan): generate fake data properly.
-		return tree.NewDGeometry(
-			geo.MustParseGeometryFromEWKB([]byte("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f")),
-		)
+		gm, err := typ.GeoMetadata()
+		if err != nil {
+			panic(err)
+		}
+		return tree.NewDGeometry(geogen.RandomGeometry(rng, gm.SRID))
 	case types.DecimalFamily:
 		d := &tree.DDecimal{}
 		// int64(rng.Uint64()) to get negative numbers, too
@@ -317,7 +325,7 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 		}
 		return d
 	default:
-		panic(fmt.Sprintf("invalid type %v", typ.DebugString()))
+		panic(errors.AssertionFailedf("invalid type %v", typ.DebugString()))
 	}
 }
 
@@ -785,7 +793,7 @@ func randInterestingDatum(rng *rand.Rand, typ *types.T) tree.Datum {
 		for _, sc := range types.Scalar {
 			// Panic if a scalar type doesn't have an interesting datum.
 			if sc == typ {
-				panic(fmt.Sprintf("no interesting datum for type %s found", typ.String()))
+				panic(errors.AssertionFailedf("no interesting datum for type %s found", typ.String()))
 			}
 		}
 		return nil
@@ -804,7 +812,7 @@ func randInterestingDatum(rng *rand.Rand, typ *types.T) tree.Datum {
 		case 8:
 			return tree.NewDInt(tree.DInt(int8(tree.MustBeDInt(special))))
 		default:
-			panic(fmt.Sprintf("int with an unexpected width %d", typ.Width()))
+			panic(errors.AssertionFailedf("int with an unexpected width %d", typ.Width()))
 		}
 	case types.FloatFamily:
 		switch typ.Width() {
@@ -813,7 +821,7 @@ func randInterestingDatum(rng *rand.Rand, typ *types.T) tree.Datum {
 		case 32:
 			return tree.NewDFloat(tree.DFloat(float32(*special.(*tree.DFloat))))
 		default:
-			panic(fmt.Sprintf("float with an unexpected width %d", typ.Width()))
+			panic(errors.AssertionFailedf("float with an unexpected width %d", typ.Width()))
 		}
 	default:
 		return special

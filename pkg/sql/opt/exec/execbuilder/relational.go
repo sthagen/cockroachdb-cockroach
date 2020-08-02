@@ -293,6 +293,9 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	case *memo.ControlJobsExpr:
 		ep, err = b.buildControlJobs(t)
 
+	case *memo.ControlSchedulesExpr:
+		ep, err = b.buildControlSchedules(t)
+
 	case *memo.CancelQueriesExpr:
 		ep, err = b.buildCancelQueries(t)
 
@@ -673,6 +676,10 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 	rightExpr := join.Child(1).(memo.RelExpr)
 	rightProps := rightExpr.Relational()
 	filters := join.Child(2).(*memo.FiltersExpr)
+
+	if len(memo.WithUses(rightExpr)) != 0 {
+		return execPlan{}, fmt.Errorf("references to WITH expressions from correlated subqueries are unsupported")
+	}
 
 	leftPlan, err := b.buildRelational(leftExpr)
 	if err != nil {
@@ -1777,7 +1784,7 @@ func (b *Builder) buildRecursiveCTE(rec *memo.RecursiveCTEExpr) (execPlan, error
 		withExprs: b.withExprs[:len(b.withExprs):len(b.withExprs)],
 	}
 
-	fn := func(bufferRef exec.BufferNode) (exec.Plan, error) {
+	fn := func(bufferRef exec.Node) (exec.Plan, error) {
 		// Use a separate builder each time.
 		innerBld := *innerBldTemplate
 		innerBld.addBuiltWithExpr(rec.WithID, initial.outputCols, bufferRef)
@@ -1810,11 +1817,9 @@ func (b *Builder) buildRecursiveCTE(rec *memo.RecursiveCTEExpr) (execPlan, error
 func (b *Builder) buildWithScan(withScan *memo.WithScanExpr) (execPlan, error) {
 	e := b.findBuiltWithExpr(withScan.With)
 	if e == nil {
-		err := errors.WithHint(
-			errors.Errorf("couldn't find WITH expression %q with ID %d", withScan.Name, withScan.With),
-			"references to WITH expressions from correlated subqueries are unsupported",
+		return execPlan{}, errors.AssertionFailedf(
+			"couldn't find With expression with ID %d", withScan.With,
 		)
-		return execPlan{}, err
 	}
 
 	var label bytes.Buffer
@@ -2258,7 +2263,7 @@ func (b *Builder) ensureColumns(
 		// No projection necessary.
 		if colNames != nil {
 			var err error
-			input.root, err = b.factory.RenameColumns(input.root, colNames)
+			input.root, err = b.factory.ConstructRenameColumns(input.root, colNames)
 			if err != nil {
 				return execPlan{}, err
 			}

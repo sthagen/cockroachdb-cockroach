@@ -87,7 +87,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 	lr := physicalplan.NewSpanResolver(
 		s3.Cfg.Settings,
 		s3.DistSenderI().(*kvcoord.DistSender),
-		gossip.MakeExposedGossip(s3.Gossip()),
+		s3.Gossip(),
 		s3.GetNode().Descriptor, nil,
 		replicaoracle.BinPackingChoice)
 
@@ -196,7 +196,7 @@ func TestSpanResolver(t *testing.T) {
 	lr := physicalplan.NewSpanResolver(
 		s.(*server.TestServer).Cfg.Settings,
 		s.DistSenderI().(*kvcoord.DistSender),
-		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		s.GossipI().(*gossip.Gossip),
 		s.(*server.TestServer).GetNode().Descriptor, nil,
 		replicaoracle.BinPackingChoice)
 
@@ -292,7 +292,7 @@ func TestMixedDirections(t *testing.T) {
 	lr := physicalplan.NewSpanResolver(
 		s.(*server.TestServer).Cfg.Settings,
 		s.DistSenderI().(*kvcoord.DistSender),
-		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		s.GossipI().(*gossip.Gossip),
 		s.(*server.TestServer).GetNode().Descriptor,
 		nil,
 		replicaoracle.BinPackingChoice)
@@ -411,7 +411,7 @@ func resolveSpans(
 
 func onlyReplica(rng roachpb.RangeDescriptor) rngInfo {
 	if len(rng.InternalReplicas) != 1 {
-		panic(fmt.Sprintf("expected one replica in %+v", rng))
+		panic(errors.AssertionFailedf("expected one replica in %+v", rng))
 	}
 	return rngInfo{ReplicaDescriptor: rng.InternalReplicas[0], rngDesc: rng}
 }
@@ -422,7 +422,7 @@ func selectReplica(nodeID roachpb.NodeID, rng roachpb.RangeDescriptor) rngInfo {
 			return rngInfo{ReplicaDescriptor: rep, rngDesc: rng}
 		}
 	}
-	panic(fmt.Sprintf("no replica on node %d in: %s", nodeID, &rng))
+	panic(errors.AssertionFailedf("no replica on node %d in: %s", nodeID, &rng))
 }
 
 func expectResolved(actual [][]rngInfo, expected ...[]rngInfo) error {

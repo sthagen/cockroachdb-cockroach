@@ -12,7 +12,6 @@ package execinfrapb
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -62,7 +61,7 @@ func ConvertToMappedSpecOrdering(
 		if planToStreamColMap != nil {
 			colIdx = planToStreamColMap[c.ColIdx]
 			if colIdx == -1 {
-				panic(fmt.Sprintf("column %d in sort ordering not available", c.ColIdx))
+				panic(errors.AssertionFailedf("column %d in sort ordering not available", c.ColIdx))
 			}
 		}
 		specOrdering.Columns[i].ColIdx = uint32(colIdx)
@@ -94,7 +93,7 @@ func makeTypeLookupFunc(
 	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec,
 ) sqlbase.TypeLookupFunc {
 	return func(ctx context.Context, id sqlbase.ID) (*tree.TypeName, sqlbase.TypeDescriptorInterface, error) {
-		return resolver.ResolveTypeDescByID(ctx, txn, codec, id, tree.ObjectLookupFlags{})
+		return resolver.ResolveTypeDescByID(ctx, txn, codec, id, tree.ObjectLookupFlagsWithRequired())
 	}
 }
 
@@ -138,7 +137,7 @@ func ExprFmtCtxBase(evalCtx *tree.EvalContext) *tree.FmtCtx {
 		func(fmtCtx *tree.FmtCtx, p *tree.Placeholder) {
 			d, err := p.Eval(evalCtx)
 			if err != nil {
-				panic(fmt.Sprintf("failed to serialize placeholder: %s", err))
+				panic(errors.AssertionFailedf("failed to serialize placeholder: %s", err))
 			}
 			d.Format(fmtCtx)
 		})

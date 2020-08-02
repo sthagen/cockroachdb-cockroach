@@ -410,6 +410,11 @@ func (m *Manager) PublishMultiple(
 				if err != nil {
 					return err
 				}
+				// Due to details in #51417, it is possible for a user to request a
+				// descriptor which no longer exists. In that case, just return an error.
+				if descsToUpdate[id] == nil {
+					return sqlbase.ErrDescriptorNotFound
+				}
 
 				if expectedVersions[id] != descsToUpdate[id].GetVersion() {
 					// The version changed out from under us. Someone else must be
@@ -645,7 +650,7 @@ func (l *descriptorSet) insert(s *descriptorVersionState) {
 func (l *descriptorSet) remove(s *descriptorVersionState) {
 	i, match := l.findIndex(s.GetVersion())
 	if !match {
-		panic(fmt.Sprintf("can't find lease to remove: %s", s))
+		panic(errors.AssertionFailedf("can't find lease to remove: %s", s))
 	}
 	l.data = append(l.data[:i], l.data[i+1:]...)
 }
@@ -1088,7 +1093,7 @@ func (t *descriptorState) release(
 			log.VEventf(context.TODO(), 2, "release: %s", s.stringLocked())
 		}
 		if s.mu.refcount < 0 {
-			panic(fmt.Sprintf("negative ref count: %s", s))
+			panic(errors.AssertionFailedf("negative ref count: %s", s))
 		}
 
 		if s.mu.refcount == 0 && s.mu.lease != nil && removeOnceDereferenced {
@@ -1359,7 +1364,7 @@ func (c *nameCache) get(
 	defer desc.mu.Unlock()
 
 	if !NameMatchesDescriptor(desc, parentID, parentSchemaID, name) {
-		panic(fmt.Sprintf("Out of sync entry in the name cache. "+
+		panic(errors.AssertionFailedf("Out of sync entry in the name cache. "+
 			"Cache entry: (%d, %d, %q) -> %d. Lease: (%d, %d, %q).",
 			parentID, parentSchemaID, name,
 			desc.GetID(),

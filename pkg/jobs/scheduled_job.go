@@ -126,6 +126,10 @@ func (j *ScheduledJob) HasRecurringSchedule() bool {
 
 // ScheduleNextRun updates next run based on job schedule.
 func (j *ScheduledJob) ScheduleNextRun() error {
+	if !j.HasRecurringSchedule() {
+		return errors.Newf(
+			"cannot set next run for schedule %d (empty schedule)", j.rec.ScheduleID)
+	}
 	expr, err := cronexpr.Parse(j.rec.ScheduleExpr)
 	if err != nil {
 		return errors.Wrapf(err, "parsing schedule expression: %q", j.rec.ScheduleExpr)
@@ -200,6 +204,7 @@ func (j *ScheduledJob) InitFromDatums(datums []tree.Datum, cols []sqlbase.Result
 
 	record := reflect.ValueOf(&j.rec).Elem()
 
+	numInitialized := 0
 	for i, col := range cols {
 		native, err := datumToNative(datums[i])
 		if err != nil {
@@ -239,6 +244,11 @@ func (j *ScheduledJob) InitFromDatums(datums []tree.Datum, cols []sqlbase.Result
 			}
 			field.Set(rv)
 		}
+		numInitialized++
+	}
+
+	if numInitialized == 0 {
+		return errors.New("did not initialize any schedule field")
 	}
 
 	j.scheduledTime = j.rec.NextRun
@@ -289,7 +299,7 @@ func (j *ScheduledJob) Update(ctx context.Context, ex sqlutil.InternalExecutor, 
 	}
 
 	if j.rec.ScheduleID == 0 {
-		return errors.New("cannot update job: missing schedule id")
+		return errors.New("cannot update schedule: missing schedule id")
 	}
 
 	cols, qargs, err := j.marshalChanges()

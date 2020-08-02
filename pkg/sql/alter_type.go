@@ -55,7 +55,7 @@ func (n *alterTypeNode) startExec(params runParams) error {
 	var err error
 	switch t := n.n.Cmd.(type) {
 	case *tree.AlterTypeAddValue:
-		err = unimplemented.NewWithIssue(48670, "ALTER TYPE ADD VALUE unsupported")
+		err = params.p.addEnumValue(params, n, t)
 	case *tree.AlterTypeRenameValue:
 		err = params.p.renameTypeValue(params, n, t.OldVal, t.NewVal)
 	case *tree.AlterTypeRename:
@@ -69,6 +69,15 @@ func (n *alterTypeNode) startExec(params runParams) error {
 		return err
 	}
 	return n.desc.Validate(params.ctx, params.p.txn, params.ExecCfg().Codec)
+}
+
+func (p *planner) addEnumValue(
+	params runParams, n *alterTypeNode, node *tree.AlterTypeAddValue,
+) error {
+	if err := n.desc.AddEnumValue(node); err != nil {
+		return err
+	}
+	return p.writeTypeChange(params.ctx, n.desc, tree.AsStringWithFQNames(n.n, params.Ann()))
 }
 
 func (p *planner) renameType(params runParams, n *alterTypeNode, newName string) error {
@@ -114,14 +123,13 @@ func (p *planner) renameType(params runParams, n *alterTypeNode, newName string)
 	if err != nil {
 		return err
 	}
-	// TODO (rohany): This should use a method on the desc collection instead.
-	arrayDesc, err := sqlbase.GetTypeDescFromID(params.ctx, p.txn, p.ExecCfg().Codec, n.desc.ArrayTypeID)
+	arrayDesc, err := p.Descriptors().GetMutableTypeVersionByID(params.ctx, p.txn, n.desc.ArrayTypeID)
 	if err != nil {
 		return err
 	}
 	if err := p.performRenameTypeDesc(
 		params.ctx,
-		sqlbase.NewMutableExistingTypeDescriptor(*arrayDesc.TypeDesc()),
+		arrayDesc,
 		newArrayName,
 		tree.AsStringWithFQNames(n.n, params.Ann()),
 	); err != nil {

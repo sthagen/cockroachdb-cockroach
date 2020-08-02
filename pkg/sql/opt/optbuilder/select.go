@@ -95,12 +95,11 @@ func (b *Builder) buildDataSource(
 			}
 
 			outScope.expr = b.factory.ConstructWithScan(&memo.WithScanPrivate{
-				With:         cte.id,
-				Name:         string(cte.name.Alias),
-				InCols:       inCols,
-				OutCols:      outCols,
-				BindingProps: cte.bindingProps,
-				ID:           b.factory.Metadata().NextUniqueID(),
+				With:    cte.id,
+				Name:    string(cte.name.Alias),
+				InCols:  inCols,
+				OutCols: outCols,
+				ID:      b.factory.Metadata().NextUniqueID(),
 			})
 
 			return outScope
@@ -164,13 +163,13 @@ func (b *Builder) buildDataSource(
 		}
 
 		id := b.factory.Memo().NextWithID()
+		b.factory.Metadata().AddWithBinding(id, innerScope.expr)
 		cte := cteSource{
 			name:         tree.AliasClause{},
 			cols:         innerScope.makePresentationWithHiddenCols(),
 			originalExpr: source.Statement,
 			expr:         innerScope.expr,
 			id:           id,
-			bindingProps: innerScope.expr.Relational(),
 		}
 		b.cteStack[len(b.cteStack)-1] = append(b.cteStack[len(b.cteStack)-1], cte)
 
@@ -193,12 +192,11 @@ func (b *Builder) buildDataSource(
 		}
 
 		outScope.expr = b.factory.ConstructWithScan(&memo.WithScanPrivate{
-			With:         cte.id,
-			Name:         string(cte.name.Alias),
-			InCols:       inCols,
-			OutCols:      outCols,
-			BindingProps: cte.bindingProps,
-			ID:           b.factory.Metadata().NextUniqueID(),
+			With:    cte.id,
+			Name:    string(cte.name.Alias),
+			InCols:  inCols,
+			OutCols: outCols,
+			ID:      b.factory.Metadata().NextUniqueID(),
 		})
 
 		return outScope
@@ -720,17 +718,10 @@ func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta) {
 		filter := b.factory.ConstructFiltersItem(scalar)
 
 		// Expressions with non-immutable operators are not supported as partial
-		// index predicates, so add a replacement expression of False. This is
-		// done for two reasons:
-		//
-		//   1. TableMeta.PartialIndexPredicates is a source of truth within the
-		//      optimizer for determining which indexes are partial. It is safer
-		//      to use a False predicate than no predicate so that the optimizer
-		//      won't incorrectly assume that the index is a full index.
-		//   2. A partial index with a False predicate will never be used to
-		//      satisfy a query, effectively making these non-immutable partial
-		//      index predicates not possible to use.
-		//
+		// index predicates, so add a replacement expression of False. A partial
+		// index with a False predicate will never be used to satisfy a query.
+		// It is safer to use a False predicate than no predicate so that the
+		// optimizer won't incorrectly assume that the index is a full index.
 		if filter.ScalarProps().VolatilitySet.HasStable() || filter.ScalarProps().VolatilitySet.HasVolatile() {
 			fals := memo.FiltersExpr{b.factory.ConstructFiltersItem(memo.FalseSingleton)}
 			tabMeta.AddPartialIndexPredicate(indexOrd, &fals)
@@ -836,13 +827,13 @@ func (b *Builder) buildCTEs(with *tree.With, inScope *scope) (outScope *scope) {
 		}
 
 		id := b.factory.Memo().NextWithID()
+		b.factory.Metadata().AddWithBinding(id, cteExpr)
 
 		addedCTEs[i] = cteSource{
 			name:         cte.Name,
 			cols:         cteCols,
 			originalExpr: cte.Stmt,
 			expr:         cteExpr,
-			bindingProps: cteExpr.Relational(),
 			id:           id,
 			mtr:          cte.Mtr,
 		}

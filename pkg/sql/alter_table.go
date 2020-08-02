@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -387,72 +388,76 @@ func (n *alterTableNode) startExec(params runParams) error {
 					"column %q is referenced by the primary key", colToDrop.Name)
 			}
 			for _, idx := range n.tableDesc.AllNonDropIndexes() {
-				// We automatically drop indexes on that column that only
-				// index that column (and no other columns). If CASCADE is
-				// specified, we also drop other indices that refer to this
-				// column.  The criteria to determine whether an index "only
-				// indexes that column":
-				//
-				// Assume a table created with CREATE TABLE foo (a INT, b INT).
-				// Then assume the user issues ALTER TABLE foo DROP COLUMN a.
-				//
-				// INDEX i1 ON foo(a) -> i1 deleted
-				// INDEX i2 ON foo(a) STORING(b) -> i2 deleted
-				// INDEX i3 ON foo(a, b) -> i3 not deleted unless CASCADE is specified.
-				// INDEX i4 ON foo(b) STORING(a) -> i4 not deleted unless CASCADE is specified.
+				// We automatically drop indexes that reference the column
+				// being dropped.
 
 				// containsThisColumn becomes true if the index is defined
 				// over the column being dropped.
 				containsThisColumn := false
-				// containsOnlyThisColumn becomes false if the index also
-				// includes non-PK columns other than the one being dropped.
-				containsOnlyThisColumn := true
 
 				// Analyze the index.
 				for _, id := range idx.ColumnIDs {
 					if id == colToDrop.ID {
 						containsThisColumn = true
-					} else {
-						containsOnlyThisColumn = false
+						break
 					}
 				}
-				for _, id := range idx.ExtraColumnIDs {
-					if n.tableDesc.PrimaryIndex.ContainsColumnID(id) {
-						// All secondary indices necessary contain the PK
-						// columns, too. (See the comments on the definition of
-						// IndexDescriptor). The presence of a PK column in the
-						// secondary index should thus not be seen as a
-						// sufficient reason to reject the DROP.
-						continue
-					}
-					if id == colToDrop.ID {
-						containsThisColumn = true
+				if !containsThisColumn {
+					for _, id := range idx.ExtraColumnIDs {
+						if n.tableDesc.PrimaryIndex.ContainsColumnID(id) {
+							// All secondary indices necessary contain the PK
+							// columns, too. (See the comments on the definition of
+							// IndexDescriptor). The presence of a PK column in the
+							// secondary index should thus not be seen as a
+							// sufficient reason to reject the DROP.
+							continue
+						}
+						if id == colToDrop.ID {
+							containsThisColumn = true
+							break
+						}
 					}
 				}
-				// The loop above this comment is for the old STORING encoding. The
-				// loop below is for the new encoding (where the STORING columns are
-				// always in the value part of a KV).
-				for _, id := range idx.StoreColumnIDs {
-					if id == colToDrop.ID {
+				if !containsThisColumn {
+					// The loop above this comment is for the old STORING encoding. The
+					// loop below is for the new encoding (where the STORING columns are
+					// always in the value part of a KV).
+					for _, id := range idx.StoreColumnIDs {
+						if id == colToDrop.ID {
+							containsThisColumn = true
+							break
+						}
+					}
+				}
+
+				// If the column being dropped is referenced in the partial
+				// index predicate, then the index should be dropped.
+				if !containsThisColumn && idx.IsPartial() {
+					expr, err := parser.ParseExpr(idx.Predicate)
+					if err != nil {
+						return err
+					}
+
+					colIDs, err := schemaexpr.ExtractColumnIDs(n.tableDesc, expr)
+					if err != nil {
+						return err
+					}
+
+					if colIDs.Contains(colToDrop.ID) {
 						containsThisColumn = true
 					}
 				}
 
 				// Perform the DROP.
 				if containsThisColumn {
-					if containsOnlyThisColumn || t.DropBehavior == tree.DropCascade {
-						jobDesc := fmt.Sprintf("removing index %q dependent on column %q which is being"+
-							" dropped; full details: %s", idx.Name, colToDrop.ColName(),
-							tree.AsStringWithFQNames(n.n, params.Ann()))
-						if err := params.p.dropIndexByName(
-							params.ctx, tn, tree.UnrestrictedName(idx.Name), n.tableDesc, false,
-							t.DropBehavior, ignoreIdxConstraint, jobDesc,
-						); err != nil {
-							return err
-						}
-					} else {
-						return pgerror.Newf(pgcode.InvalidColumnReference,
-							"column %q is referenced by existing index %q", colToDrop.Name, idx.Name)
+					jobDesc := fmt.Sprintf("removing index %q dependent on column %q which is being"+
+						" dropped; full details: %s", idx.Name, colToDrop.ColName(),
+						tree.AsStringWithFQNames(n.n, params.Ann()))
+					if err := params.p.dropIndexByName(
+						params.ctx, tn, tree.UnrestrictedName(idx.Name), n.tableDesc, false,
+						t.DropBehavior, ignoreIdxConstraint, jobDesc,
+					); err != nil {
+						return err
 					}
 				}
 			}
@@ -746,6 +751,11 @@ func (n *alterTableNode) startExec(params runParams) error {
 	if err := params.p.writeSchemaChange(
 		params.ctx, n.tableDesc, mutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
 	); err != nil {
+		return err
+	}
+
+	// Add all newly created type back references.
+	if err := params.p.addBackRefsFromAllTypesInTable(params.ctx, n.tableDesc); err != nil {
 		return err
 	}
 

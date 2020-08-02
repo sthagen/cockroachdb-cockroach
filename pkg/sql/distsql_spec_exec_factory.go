@@ -707,7 +707,7 @@ func (e *distSQLSpecExecFactory) ConstructWindow(
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: window")
 }
 
-func (e *distSQLSpecExecFactory) RenameColumns(
+func (e *distSQLSpecExecFactory) ConstructRenameColumns(
 	input exec.Node, colNames []string,
 ) (exec.Node, error) {
 	var inputCols sqlbase.ResultColumns
@@ -834,7 +834,7 @@ func (e *distSQLSpecExecFactory) ConstructCreateTable(
 
 func (e *distSQLSpecExecFactory) ConstructCreateView(
 	schema cat.Schema,
-	viewName string,
+	viewName *cat.DataSourceName,
 	ifNotExists bool,
 	replace bool,
 	temporary bool,
@@ -856,7 +856,7 @@ func (e *distSQLSpecExecFactory) ConstructSaveTable(
 }
 
 func (e *distSQLSpecExecFactory) ConstructErrorIfRows(
-	input exec.Node, mkErr func(tree.Datums) error,
+	input exec.Node, mkErr exec.MkErrFn,
 ) (exec.Node, error) {
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: error if rows")
 }
@@ -887,14 +887,12 @@ func (e *distSQLSpecExecFactory) ConstructAlterTableRelocate(
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: alter table relocate")
 }
 
-func (e *distSQLSpecExecFactory) ConstructBuffer(
-	input exec.Node, label string,
-) (exec.BufferNode, error) {
+func (e *distSQLSpecExecFactory) ConstructBuffer(input exec.Node, label string) (exec.Node, error) {
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: buffer")
 }
 
 func (e *distSQLSpecExecFactory) ConstructScanBuffer(
-	ref exec.BufferNode, label string,
+	ref exec.Node, label string,
 ) (exec.Node, error) {
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: scan buffer")
 }
@@ -907,6 +905,12 @@ func (e *distSQLSpecExecFactory) ConstructRecursiveCTE(
 
 func (e *distSQLSpecExecFactory) ConstructControlJobs(
 	command tree.JobCommand, input exec.Node,
+) (exec.Node, error) {
+	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: control jobs")
+}
+
+func (e *distSQLSpecExecFactory) ConstructControlSchedules(
+	command tree.ScheduleCommand, input exec.Node,
 ) (exec.Node, error) {
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: control jobs")
 }
@@ -948,8 +952,9 @@ func (e *distSQLSpecExecFactory) constructHashOrMergeJoin(
 	resultColumns := getJoinResultColumns(joinType, leftPhysPlan.ResultColumns, rightPhysPlan.ResultColumns)
 	leftMap, rightMap := leftPhysPlan.PlanToStreamColMap, rightPhysPlan.PlanToStreamColMap
 	helper := &joinPlanningHelper{
-		numLeftCols:             len(leftPhysPlan.ResultColumns),
-		numRightCols:            len(rightPhysPlan.ResultColumns),
+		numLeftOutCols:          len(leftPhysPlan.ResultTypes),
+		numRightOutCols:         len(rightPhysPlan.ResultTypes),
+		numAllLeftCols:          len(leftPhysPlan.ResultTypes),
 		leftPlanToStreamColMap:  leftMap,
 		rightPlanToStreamColMap: rightMap,
 	}

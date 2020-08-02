@@ -255,12 +255,30 @@ func backupJobDescription(
 	return tree.AsStringWithFQNames(b, ann), nil
 }
 
+// annotatedBackupStatement is a tree.Backup, optionally
+// annotated with the scheduling information.
+type annotatedBackupStatement struct {
+	*tree.Backup
+	*jobs.CreatedByInfo
+}
+
+func getBackupStatement(stmt tree.Statement) *annotatedBackupStatement {
+	switch backup := stmt.(type) {
+	case *annotatedBackupStatement:
+		return backup
+	case *tree.Backup:
+		return &annotatedBackupStatement{Backup: backup}
+	default:
+		return nil
+	}
+}
+
 // backupPlanHook implements PlanHookFn.
 func backupPlanHook(
 	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
 ) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
-	backupStmt, ok := stmt.(*tree.Backup)
-	if !ok {
+	backupStmt := getBackupStatement(stmt)
+	if backupStmt == nil {
 		return nil, nil, nil, false, nil
 	}
 
@@ -403,7 +421,7 @@ func backupPlanHook(
 			defaultStore.Close()
 		}()
 
-		var encryption *roachpb.FileEncryptionOptions
+		var encryption *jobspb.BackupEncryptionOptions
 		var prevBackups []BackupManifest
 		g := ctxgroup.WithContext(ctx)
 		if len(incrementalFrom) > 0 {
@@ -417,7 +435,7 @@ func backupPlanHook(
 				if err != nil {
 					return err
 				}
-				encryption = &roachpb.FileEncryptionOptions{
+				encryption = &jobspb.BackupEncryptionOptions{
 					Key: storageccl.GenerateKey(encryptionPassphrase, opts.Salt),
 				}
 			}
@@ -456,7 +474,7 @@ func backupPlanHook(
 					if err != nil {
 						return err
 					}
-					encryption = &roachpb.FileEncryptionOptions{
+					encryption = &jobspb.BackupEncryptionOptions{
 						Key: storageccl.GenerateKey(encryptionPassphrase, encOpts.Salt),
 					}
 				}
@@ -666,7 +684,7 @@ func backupPlanHook(
 			return err
 		}
 
-		description, err := backupJobDescription(p, backupStmt, to, incrementalFrom)
+		description, err := backupJobDescription(p, backupStmt.Backup, to, incrementalFrom)
 		if err != nil {
 			return err
 		}
@@ -686,7 +704,8 @@ func backupPlanHook(
 			if err := writeEncryptionOptions(ctx, &EncryptionInfo{Salt: salt}, exportStore); err != nil {
 				return err
 			}
-			encryption = &roachpb.FileEncryptionOptions{Key: storageccl.GenerateKey(encryptionPassphrase, salt)}
+			encryption = &jobspb.BackupEncryptionOptions{Key: storageccl.GenerateKey(
+				encryptionPassphrase, salt)}
 		}
 
 		// TODO (lucy): For partitioned backups, also add verification for other
@@ -756,8 +775,9 @@ func backupPlanHook(
 				}
 				return sqlDescIDs
 			}(),
-			Details:  backupDetails,
-			Progress: jobspb.BackupProgress{},
+			Details:   backupDetails,
+			Progress:  jobspb.BackupProgress{},
+			CreatedBy: backupStmt.CreatedByInfo,
 		}
 
 		if backupStmt.Options.Detached {
@@ -795,11 +815,7 @@ func backupPlanHook(
 
 		collectTelemetry()
 
-		errCh, err := sj.Start(ctx)
-		if err != nil {
-			return err
-		}
-		return <-errCh
+		return sj.Run(ctx)
 	}
 
 	if backupStmt.Options.Detached {

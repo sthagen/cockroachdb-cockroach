@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -210,9 +211,11 @@ func (c *cliTest) restartServer(params cliTestParams) {
 // cleanup cleans up after the test, stopping the server if necessary.
 // The log files are removed if the test has succeeded.
 func (c *cliTest) cleanup() {
-	if c.t != nil {
-		defer c.logScope.Close(c.t)
-	}
+	defer func() {
+		if c.t != nil {
+			c.logScope.Close(c.t)
+		}
+	}()
 
 	// Restore stderr.
 	stderr = log.OrigStderr
@@ -382,9 +385,7 @@ func (c cliTest) RunWithCAArgs(origArgs []string) {
 func TestQuit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	if testing.Short() {
-		t.Skip("short flag")
-	}
+	skip.UnderShort(t)
 
 	c := newCLITest(cliTestParams{t: t})
 	defer c.cleanup()
@@ -1411,7 +1412,7 @@ Available Commands:
   dump              dump sql tables
 
   nodelocal         upload and delete nodelocal files
-  userfile          upload and delete user scoped files
+  userfile          upload, list and delete user scoped files
   demo              open a demo sql shell
   gen               generate auxiliary files
   version           output version information
@@ -1553,7 +1554,7 @@ SQLSTATE: 57014
 func TestNodeStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	t.Skip("currently flaky: #38151")
+	skip.WithIssue(t, 38151)
 
 	start := timeutil.Now()
 	c := newCLITest(cliTestParams{})
@@ -2043,6 +2044,6 @@ func Example_dump_no_visible_columns() {
 	// sql -e create table t(x int); set sql_safe_updates=false; alter table t drop x
 	// ALTER TABLE
 	// dump defaultdb
-	// CREATE TABLE t (FAMILY "primary" (rowid)
+	// CREATE TABLE public.t (FAMILY "primary" (rowid)
 	// );
 }

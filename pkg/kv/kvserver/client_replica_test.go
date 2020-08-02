@@ -40,15 +40,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -1512,7 +1513,7 @@ func TestRangeInfo(t *testing.T) {
 		return nil
 	})
 	lhsLease, _ := lhsReplica0.GetLease()
-	rhsLease, _ := rhsReplica0.GetLease()
+	rhsDesc, rhsLease := rhsReplica0.GetDescAndLease(ctx)
 
 	send := func(args roachpb.Request, returnRangeInfo bool, txn *roachpb.Transaction) *roachpb.BatchResponse {
 		ba := roachpb.BatchRequest{
@@ -1530,11 +1531,17 @@ func TestRangeInfo(t *testing.T) {
 		return br
 	}
 
-	// Verify range info is not set if unrequested.
+	// Populate the range cache so that the request will be sent to the right
+	// leaseholder, and it will have the up-to-date ClientRangeInfo populated.
+	mtc.distSenders[0].RangeDescriptorCache().Insert(ctx,
+		roachpb.RangeInfo{Desc: rhsDesc, Lease: rhsLease})
+
+	// Verify range info is not set if the request is sent with up-to-date
+	// ClientRangeInfo.
 	getArgs := getArgs(splitKey.AsRawKey())
 	br := send(getArgs, false /* returnRangeInfo */, nil /* txn */)
 	if len(br.RangeInfos) > 0 {
-		t.Errorf("expected empty range infos if unrequested; got %v", br.RangeInfos)
+		t.Fatalf("expected empty range infos if unrequested; got %v", br.RangeInfos)
 	}
 
 	// Verify range info on a get request.
@@ -1713,9 +1720,9 @@ func TestSystemZoneConfigs(t *testing.T) {
 	// This test is relatively slow and resource intensive. When run under
 	// stressrace on a loaded machine (as in the nightly tests), sometimes the
 	// SucceedsSoon conditions below take longer than the allotted time (#25273).
-	if testing.Short() || testutils.NightlyStress() || util.RaceEnabled {
-		t.Skip()
-	}
+	skip.UnderRace(t)
+	skip.UnderShort(t)
+	skip.UnderStress(t)
 
 	// This test relies on concurrently waiting for a value to change in the
 	// underlying engine(s). Since the teeing engine does not respond well to
@@ -1723,7 +1730,7 @@ func TestSystemZoneConfigs(t *testing.T) {
 	// teeing engine is being used. See
 	// https://github.com/cockroachdb/cockroach/issues/42656 for more context.
 	if storage.DefaultStorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
-		t.Skip("disabled on teeing engine")
+		skip.IgnoreLint(t, "disabled on teeing engine")
 	}
 
 	ctx := context.Background()
@@ -2196,7 +2203,7 @@ func TestReplicaTombstone(t *testing.T) {
 	// teeing engine is being used. See
 	// https://github.com/cockroachdb/cockroach/issues/42656 for more context.
 	if storage.DefaultStorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
-		t.Skip("disabled on teeing engine")
+		skip.IgnoreLint(t, "disabled on teeing engine")
 	}
 
 	t.Run("(1) ChangeReplicasTrigger", func(t *testing.T) {
@@ -3228,6 +3235,124 @@ func TestProposalOverhead(t *testing.T) {
 
 }
 
+// TestDiscoverIntentAcrossLeaseTransferAwayAndBack tests a scenario where a
+// read hits an intent, but only informs its lock-table about the discovered
+// intent after the corresponding range's lease has been transferred away and
+// back. If the intent is replaced during this time and the replacement intent
+// has made its way into the lock-table, the initial read's discovery should not
+// hit an assertion failure. It used to.
+//
+// The test uses a TestCluster to mirror the setup from:
+//   concurrency/testdata/concurrency_manager/discover_lock_after_lease_race
+func TestDiscoverIntentAcrossLeaseTransferAwayAndBack(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	// Detect when txn2 has completed its read of txn1's intent and block.
+	var txn2ID atomic.Value
+	var txn2BBlockOnce sync.Once
+	txn2BlockedC := make(chan chan struct{})
+	knobs := &kvserver.StoreTestingKnobs{}
+	knobs.EvalKnobs.TestingPostEvalFilter = func(args kvserverbase.FilterArgs) *roachpb.Error {
+		if txn := args.Hdr.Txn; txn != nil && txn.ID == txn2ID.Load() {
+			txn2BBlockOnce.Do(func() {
+				if !errors.HasType(args.Err, (*roachpb.WriteIntentError)(nil)) {
+					t.Errorf("expected WriteIntentError; got %v", args.Err)
+				}
+
+				unblockCh := make(chan struct{})
+				txn2BlockedC <- unblockCh
+				<-unblockCh
+			})
+		}
+		return nil
+	}
+
+	// Detect when txn4 discovers txn3's intent and begins to push.
+	var txn4ID atomic.Value
+	txn4PushingC := make(chan struct{}, 1)
+	knobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+		if !ba.IsSinglePushTxnRequest() {
+			return nil
+		}
+		if ba.Requests[0].GetPushTxn().PusherTxn.ID == txn4ID.Load() {
+			select {
+			case txn4PushingC <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}
+
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{Knobs: base.TestingKnobs{Store: knobs}},
+	})
+	defer tc.Stopper().Stop(ctx)
+	kvDB := tc.Servers[0].DB()
+
+	key := []byte("a")
+	rangeDesc, err := tc.LookupRange(key)
+	require.NoError(t, err)
+
+	// Transfer the lease to Server 0 so we start in a known state.
+	err = tc.TransferRangeLease(rangeDesc, tc.Target(0))
+	require.NoError(t, err)
+
+	// txn1 writes the first intent.
+	txn1 := kvDB.NewTxn(ctx, "txn1")
+	err = txn1.Put(ctx, key, "val1")
+	require.NoError(t, err)
+
+	// txn2 reads the first intent. Should block during evaluation.
+	txn2 := kvDB.NewTxn(ctx, "txn2")
+	txn2ID.Store(txn2.ID())
+	err2C := make(chan error)
+	go func() {
+		_, err := txn2.Get(ctx, key)
+		err2C <- err
+	}()
+	txn2UnblockC := <-txn2BlockedC
+
+	// Transfer the lease to Server 1.
+	err = tc.TransferRangeLease(rangeDesc, tc.Target(1))
+	require.NoError(t, err)
+
+	// Roll back txn1.
+	err = txn1.Rollback(ctx)
+	require.NoError(t, err)
+
+	// txn3 writes the second intent.
+	txn3 := kvDB.NewTxn(ctx, "txn3")
+	err = txn3.Put(ctx, key, "val3")
+	require.NoError(t, err)
+
+	// Make sure txn3 creates its record before a lease transfer to avoid it
+	// being aborted.
+	hb, hbH := heartbeatArgs(txn3.TestingCloneTxn(), kvDB.Clock().Now())
+	_, pErr := kv.SendWrappedWith(ctx, kvDB.GetFactory().NonTransactionalSender(), hbH, hb)
+	require.NoError(t, pErr.GoError())
+
+	// Transfer the lease back to Server 0.
+	err = tc.TransferRangeLease(rangeDesc, tc.Target(0))
+	require.NoError(t, err)
+
+	// txn4 reads the second intent. Should discover intent and wait in lockTable.
+	txn4 := kvDB.NewTxn(ctx, "txn4")
+	txn4ID.Store(txn4.ID())
+	err4C := make(chan error)
+	go func() {
+		_, err := txn4.Get(ctx, key)
+		err4C <- err
+	}()
+	<-txn4PushingC
+	close(txn2UnblockC)
+
+	err = txn3.Rollback(ctx)
+	require.NoError(t, err)
+	require.NoError(t, <-err2C)
+	require.NoError(t, <-err4C)
+}
+
 // getRangeInfo retreives range info by performing a get against the provided
 // key and setting the ReturnRangeInfo flag to true.
 func getRangeInfo(
@@ -3257,4 +3382,124 @@ func makeReplicationTargets(ids ...int) (targets []roachpb.ReplicationTarget) {
 		})
 	}
 	return targets
+}
+
+// TestTenantID tests that the tenant ID is properly set.
+// This test examines the following behaviors:
+//
+//  (1) When range is split off for a tenant, that it gets the right tenant ID.
+//  (2) When a replica is created with a raft message, it does not have a
+//     tenant ID, but then when it is initialized, it gets one.
+//  (3) When a store starts up, it assigns the right tenant ID.
+func TestTenantID(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	defer server.CloseAllStickyInMemEngines()
+	ctx := context.Background()
+	// Create a config with a sticky-in-mem engine so we can restart the server.
+	// We also configure the settings to be as robust as possible to problems
+	// during stressrace as the setup of the rpc connections seems to somehow
+	// fail sometimes when using secure connections.
+	raftConfig := base.RaftConfig{
+		// Prevent failures under stressrace.
+		RangeLeaseRaftElectionTimeoutMultiplier: 10000,
+	}
+	stickySpecTestServerArgs := base.TestServerArgs{
+		RaftConfig: raftConfig,
+		Insecure:   true,
+		StoreSpecs: []base.StoreSpec{
+			{
+				InMemory:               true,
+				StickyInMemoryEngineID: "1",
+			},
+		},
+	}
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs:      stickySpecTestServerArgs,
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	tenant2 := roachpb.MakeTenantID(2)
+	tenant2Prefix := keys.MakeTenantPrefix(tenant2)
+	t.Run("(1) initial set", func(t *testing.T) {
+		// Ensure that a normal range has the system tenant.
+		{
+			_, repl := getFirstStoreReplica(t, tc.Server(0), keys.UserTableDataMin)
+			ri := repl.State()
+			require.Equal(t, roachpb.SystemTenantID.ToUint64(), ri.TenantID, "%v", repl)
+		}
+		// Ensure that a range with a tenant prefix has the proper tenant ID.
+		tc.SplitRangeOrFatal(t, tenant2Prefix)
+		{
+			_, repl := getFirstStoreReplica(t, tc.Server(0), tenant2Prefix)
+			ri := repl.State()
+			require.Equal(t, tenant2.ToUint64(), ri.TenantID, "%v", repl)
+		}
+	})
+	t.Run("(2) not set before snapshot", func(t *testing.T) {
+		_, repl := getFirstStoreReplica(t, tc.Server(0), tenant2Prefix)
+		sawSnapshot := make(chan struct{}, 1)
+		blockSnapshot := make(chan struct{})
+		tc.AddServer(t, base.TestServerArgs{
+			RaftConfig: raftConfig,
+			Insecure:   true,
+			Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
+					BeforeSnapshotSSTIngestion: func(
+						snapshot kvserver.IncomingSnapshot,
+						request_type kvserver.SnapshotRequest_Type,
+						strings []string,
+					) error {
+						if snapshot.State.Desc.RangeID == repl.RangeID {
+							select {
+							case sawSnapshot <- struct{}{}:
+							default:
+							}
+							<-blockSnapshot
+						}
+						return nil
+					},
+				},
+			},
+		})
+
+		// We're going to block the snapshot. We need to retry adding the replica
+		// to the second node as under stressrace, failures can occur due to
+		// networking handshake timeouts.
+		addReplicaErr := make(chan error)
+		addReplica := func() {
+			_, err := tc.AddReplicas(tenant2Prefix, tc.Target(1))
+			addReplicaErr <- err
+		}
+		go addReplica()
+		if err := retry.ForDuration(3*time.Minute, func() error {
+			select {
+			case <-sawSnapshot:
+				return nil
+			case err := <-addReplicaErr:
+				go addReplica()
+				return err
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		uninitializedRepl, _, err := tc.Server(1).GetStores().(*kvserver.Stores).GetReplicaForRangeID(repl.RangeID)
+		require.NoError(t, err)
+		ri := uninitializedRepl.State()
+		require.Equal(t, uint64(0), ri.TenantID)
+		close(blockSnapshot)
+		require.NoError(t, <-addReplicaErr)
+		ri = uninitializedRepl.State() // now initialized
+		require.Equal(t, tenant2.ToUint64(), ri.TenantID)
+	})
+	t.Run("(3) upon restart", func(t *testing.T) {
+		tc.StopServer(0)
+		tc.AddServer(t, stickySpecTestServerArgs)
+		_, repl := getFirstStoreReplica(t, tc.Server(2), tenant2Prefix)
+		ri := repl.State()
+		require.Equal(t, tenant2.ToUint64(), ri.TenantID, "%v", repl)
+	})
+
 }

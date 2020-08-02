@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -653,6 +654,12 @@ func rewriteTypeDescs(types []*sqlbase.TypeDescriptor, descriptorRewrites DescRe
 		}
 		typ.ID = rewrite.ID
 		typ.ParentID = rewrite.ParentID
+		for i := range typ.ReferencingDescriptorIDs {
+			id := typ.ReferencingDescriptorIDs[i]
+			if rw, ok := descriptorRewrites[id]; ok {
+				typ.ReferencingDescriptorIDs[i] = rw.ID
+			}
+		}
 		switch t := typ.Kind; t {
 		case sqlbase.TypeDescriptor_ENUM:
 			if rw, ok := descriptorRewrites[typ.ArrayTypeID]; ok {
@@ -983,14 +990,14 @@ func doRestorePlan(
 		baseStores[i] = store
 	}
 
-	var encryption *roachpb.FileEncryptionOptions
+	var encryption *jobspb.BackupEncryptionOptions
 	if passphrase, ok := opts[backupOptEncPassphrase]; ok {
 		opts, err := readEncryptionOptions(ctx, baseStores[0])
 		if err != nil {
 			return err
 		}
 		encryptionKey := storageccl.GenerateKey([]byte(passphrase), opts.Salt)
-		encryption = &roachpb.FileEncryptionOptions{Key: encryptionKey}
+		encryption = &jobspb.BackupEncryptionOptions{Key: encryptionKey}
 	}
 
 	defaultURIs, mainBackupManifests, localityInfo, err := resolveBackupManifests(
@@ -1113,7 +1120,7 @@ func doRestorePlan(
 		}
 	}
 
-	_, errCh, err := p.ExecCfg().JobRegistry.CreateAndStartJob(ctx, resultsCh, jobs.Record{
+	jr := jobs.Record{
 		Description: description,
 		Username:    p.User(),
 		DescriptorIDs: func() (sqlDescIDs []sqlbase.ID) {
@@ -1134,11 +1141,23 @@ func doRestorePlan(
 			Tenants:            tenants,
 		},
 		Progress: jobspb.RestoreProgress{},
-	})
-	if err != nil {
-		return err
 	}
-	return <-errCh
+	var sj *jobs.StartableJob
+	if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+		sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn, resultsCh)
+		if err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		if sj != nil {
+			if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
+				log.Warningf(ctx, "failed to cleanup StartableJob: %v", cleanupErr)
+			}
+		}
+	}
+
+	return sj.Run(ctx)
 }
 
 func init() {

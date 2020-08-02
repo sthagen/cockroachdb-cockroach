@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -32,9 +33,10 @@ import (
 )
 
 type testHelper struct {
-	env   *jobstest.JobSchedulerTestEnv
-	cfg   *scheduledjobs.JobExecutionConfig
-	sqlDB *sqlutils.SQLRunner
+	env    *jobstest.JobSchedulerTestEnv
+	server serverutils.TestServerInterface
+	cfg    *scheduledjobs.JobExecutionConfig
+	sqlDB  *sqlutils.SQLRunner
 }
 
 // newTestHelper creates and initializes appropriate state for a test,
@@ -45,35 +47,46 @@ type testHelper struct {
 // is disabled by this test helper.
 // If you want to run daemon, invoke it directly.
 func newTestHelper(t *testing.T) (*testHelper, func()) {
-	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{
-		Knobs: base.TestingKnobs{
-			JobsTestingKnobs: &TestingKnobs{
-				TakeOverJobsScheduling: func(_ func(ctx context.Context, maxSchedules int64, txn *kv.Txn) error) {
-				},
-			},
+	return newTestHelperForTables(t, jobstest.UseTestTables)
+}
+
+func newTestHelperForTables(
+	t *testing.T, envTableType jobstest.EnvTablesType,
+) (*testHelper, func()) {
+	knobs := &TestingKnobs{
+		TakeOverJobsScheduling: func(_ func(ctx context.Context, maxSchedules int64, txn *kv.Txn) error) {
 		},
+	}
+	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{JobsTestingKnobs: knobs},
 	})
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	// Setup test scheduled jobs table.
-	env := jobstest.NewJobSchedulerTestEnv(jobstest.UseTestTables, timeutil.Now())
+	env := jobstest.NewJobSchedulerTestEnv(envTableType, timeutil.Now())
 
-	sqlDB.Exec(t, jobstest.GetScheduledJobsTableSchema(env))
-	sqlDB.Exec(t, jobstest.GetJobsTableSchema(env))
+	if envTableType == jobstest.UseTestTables {
+		sqlDB.Exec(t, jobstest.GetScheduledJobsTableSchema(env))
+		sqlDB.Exec(t, jobstest.GetJobsTableSchema(env))
+	}
 
 	restoreRegistry := settings.TestingSaveRegistry()
 	return &testHelper{
-			env: env,
+			env:    env,
+			server: s,
 			cfg: &scheduledjobs.JobExecutionConfig{
 				Settings:         s.ClusterSettings(),
 				InternalExecutor: s.InternalExecutor().(sqlutil.InternalExecutor),
 				DB:               kvDB,
+				TestingKnobs:     knobs,
 			},
 			sqlDB: sqlDB,
 		}, func() {
-			sqlDB.Exec(t, "DROP TABLE "+env.SystemJobsTableName())
-			sqlDB.Exec(t, "DROP TABLE "+env.ScheduledJobsTableName())
+			if envTableType == jobstest.UseTestTables {
+				sqlDB.Exec(t, "DROP TABLE "+env.SystemJobsTableName())
+				sqlDB.Exec(t, "DROP TABLE "+env.ScheduledJobsTableName())
+			}
 			s.Stopper().Stop(context.Background())
 			restoreRegistry()
 		}
@@ -128,4 +141,22 @@ func registerScopedScheduledJobExecutor(name string, ex ScheduledJobExecutor) fu
 	return func() {
 		delete(registeredExecutorFactories, name)
 	}
+}
+
+// addFakeJob adds a fake job associated with the specified scheduleID.
+// Returns the id of the newly created job.
+func addFakeJob(t *testing.T, h *testHelper, scheduleID int64, status Status, txn *kv.Txn) int64 {
+	payload := []byte("fake payload")
+	datums, err := h.cfg.InternalExecutor.QueryRowEx(context.Background(), "fake-job", txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		fmt.Sprintf(`
+INSERT INTO %s (created_by_type, created_by_id, status, payload) 
+VALUES ($1, $2, $3, $4) 
+RETURNING id`,
+			h.env.SystemJobsTableName(),
+		),
+		CreatedByScheduledJobs, scheduleID, status, payload,
+	)
+	require.NoError(t, err)
+	return int64(tree.MustBeDInt(datums[0]))
 }

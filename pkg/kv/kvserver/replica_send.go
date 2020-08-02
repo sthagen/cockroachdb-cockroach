@@ -116,19 +116,21 @@ func (r *Replica) sendWithRangeID(
 		}
 	}
 
-	r.maybeAddRangeInfoToResponse(ctx, ba, pErr, br)
+	// Return range information if it was requested. Note that we don't return it
+	// on errors because the code doesn't currently support returning both a br
+	// and a pErr here. Also, some errors (e.g. NotLeaseholderError) have custom
+	// ways of returning range info.
+	if pErr == nil {
+		r.maybeAddRangeInfoToResponse(ctx, ba, br)
+	}
 
 	return br, pErr
 }
 
 func (r *Replica) maybeAddRangeInfoToResponse(
-	ctx context.Context, ba *roachpb.BatchRequest, pErr *roachpb.Error, br *roachpb.BatchResponse,
+	ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse,
 ) {
-	// Return range information if it was requested. Note that we don't return it
-	// on errors because the code doesn't currently support returning both a br
-	// and a pErr here. Also, some errors (e.g. NotLeaseholderError) have custom
-	// ways of returning range info.
-	if ba.ReturnRangeInfo && pErr == nil {
+	if ba.ReturnRangeInfo {
 		desc, lease := r.GetDescAndLease(ctx)
 		br.RangeInfos = []roachpb.RangeInfo{{Desc: desc, Lease: lease}}
 
@@ -142,6 +144,31 @@ func (r *Replica) maybeAddRangeInfoToResponse(
 				reply.SetHeader(header)
 			}
 		}
+	} else if ba.ClientRangeInfo != nil {
+		returnRangeInfoIfClientStale(ctx, br, r, *ba.ClientRangeInfo)
+	}
+}
+
+// returnRangeInfoIfClientStale populates br.RangeInfos if the client doesn't
+// have up-to-date info about the range's descriptor and lease.
+func returnRangeInfoIfClientStale(
+	ctx context.Context, br *roachpb.BatchResponse, r *Replica, cinfo roachpb.ClientRangeInfo,
+) {
+	desc, lease := r.GetDescAndLease(ctx)
+	// Compare the client's info with the replica's info to detect if the client
+	// has stale knowledge. Note that the client can have more recent knowledge
+	// than the replica in case this is a follower.
+	needInfo := (cinfo.LeaseSequence < lease.Sequence) ||
+		(cinfo.DescriptorGeneration < desc.Generation)
+	if !needInfo {
+		return
+	}
+	log.VEventf(ctx, 3, "client had stale range info; returning an update")
+	br.RangeInfos = []roachpb.RangeInfo{
+		{
+			Desc:  desc,
+			Lease: lease,
+		},
 	}
 }
 
@@ -288,7 +315,7 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 		switch t := pErr.GetDetail().(type) {
 		case *roachpb.WriteIntentError:
 			// Drop latches, but retain lock wait-queues.
-			if g, pErr = r.handleWriteIntentError(ctx, ba, g, pErr, t); pErr != nil {
+			if g, pErr = r.handleWriteIntentError(ctx, ba, g, status.Lease, pErr, t); pErr != nil {
 				return nil, pErr
 			}
 		case *roachpb.TransactionPushError:
@@ -359,6 +386,7 @@ func (r *Replica) handleWriteIntentError(
 	ctx context.Context,
 	ba *roachpb.BatchRequest,
 	g *concurrency.Guard,
+	lease roachpb.Lease,
 	pErr *roachpb.Error,
 	t *roachpb.WriteIntentError,
 ) (*concurrency.Guard, *roachpb.Error) {
@@ -366,7 +394,7 @@ func (r *Replica) handleWriteIntentError(
 		return g, pErr
 	}
 	// g's latches will be dropped, but it retains its spot in lock wait-queues.
-	return r.concMgr.HandleWriterIntentError(ctx, g, t)
+	return r.concMgr.HandleWriterIntentError(ctx, g, lease.Sequence, t)
 }
 
 func (r *Replica) handleTransactionPushError(

@@ -3,12 +3,6 @@
 statement ok
 SET experimental_enable_enums=true;
 
-statement error pq: unimplemented: DROP TYPE
-DROP TYPE mytype
-
-statement error pq: unimplemented: DROP TYPE
-DROP TYPE IF EXISTS mytype
-
 statement ok
 CREATE TYPE t AS ENUM ()
 
@@ -144,9 +138,6 @@ true true
 # when firing but unable to complete the type check.
 statement error pq: invalid input value for enum greeting: "notagreeting"
 SELECT 'hello'::greeting = 'notagreeting'
-
-statement error pq: unimplemented: ALTER TYPE ADD VALUE unsupported
-ALTER TYPE greeting ADD VALUE 'hola' AFTER 'hello'
 
 statement error pq: unimplemented: ALTER TYPE SET SCHEMA unsupported
 ALTER TYPE greeting SET SCHEMA newschema
@@ -388,7 +379,7 @@ SELECT b'\xFF'::as_bytes
 query TT
 SHOW CREATE t1
 ----
-t1  CREATE TABLE t1 (
+t1  CREATE TABLE public.t1 (
     x public.greeting NULL,
     INDEX i (x ASC),
     FAMILY "primary" (x, rowid)
@@ -399,7 +390,7 @@ t1  CREATE TABLE t1 (
 query T
 SELECT create_statement FROM crdb_internal.create_statements WHERE descriptor_name = 't1'
 ----
-CREATE TABLE t1 (
+CREATE TABLE public.t1 (
    x public.greeting NULL,
    INDEX i (x ASC),
    FAMILY "primary" (x, rowid)
@@ -462,7 +453,7 @@ FROM
 WHERE
   descriptor_name = 'enum_array' AND column_name = 'x'
 ----
-x  family:ArrayFamily width:0 precision:0 locale:"" visible_type:0 oid:100064 array_contents:<InternalType:<family:EnumFamily width:0 precision:0 locale:"" visible_type:0 oid:100063 time_precision_is_set:false udt_metadata:<stable_type_id:63 stable_array_type_id:64 > > TypeMeta:<> > time_precision_is_set:false udt_metadata:<stable_type_id:64 stable_array_type_id:0 >
+x  family:ArrayFamily width:0 precision:0 locale:"" visible_type:0 oid:100064 array_contents:<InternalType:<family:EnumFamily width:0 precision:0 locale:"" visible_type:0 oid:100063 time_precision_is_set:false udt_metadata:<stable_type_id:63 stable_array_type_id:64 > > TypeMeta:<Version:0 > > time_precision_is_set:false udt_metadata:<stable_type_id:64 stable_array_type_id:0 >
 
 # Test tables using enums in DEFAULT expressions.
 statement ok
@@ -484,7 +475,7 @@ SELECT * FROM enum_default
 query TT
 SHOW CREATE enum_default
 ----
-enum_default  CREATE TABLE enum_default (
+enum_default  CREATE TABLE public.enum_default (
               x INT8 NULL,
               y public.greeting NULL DEFAULT 'hello':::public.greeting,
               z BOOL NULL DEFAULT 'hello':::public.greeting IS OF (public.greeting, public.greeting),
@@ -539,7 +530,7 @@ SELECT * FROM enum_computed
 query TT
 SHOW CREATE enum_computed
 ----
-enum_computed  CREATE TABLE enum_computed (
+enum_computed  CREATE TABLE public.enum_computed (
                x INT8 NULL,
                y public.greeting NULL AS ('hello':::public.greeting) STORED,
                z BOOL NULL AS (w = 'howdy':::public.greeting) STORED,
@@ -574,7 +565,7 @@ INSERT INTO enum_checks VALUES ('hello')
 query TT
 SHOW CREATE enum_checks
 ----
-enum_checks  CREATE TABLE enum_checks (
+enum_checks  CREATE TABLE public.enum_checks (
              x public.greeting NULL,
              FAMILY "primary" (x, rowid),
              CONSTRAINT check_x CHECK (x = 'hello':::public.greeting),
@@ -805,9 +796,11 @@ SELECT * from enum_ctas
 ----
 hi howdy {hello}
 
+statement ok
+DROP TABLE enum_ctas
+
 # Test basic CTAS in a transaction.
 statement ok
-DROP TABLE enum_ctas;
 BEGIN;
 CREATE TABLE enum_ctas AS TABLE enum_ctas_base
 
@@ -1070,3 +1063,33 @@ SELECT * FROM t51474 INTERSECT ALL SELECT * FROM t51474
 ----
 hello
 howdy
+
+# Transactions which create or modify types must not distribute their
+# plans to remote nodes.
+statement ok
+BEGIN;
+CREATE TYPE local_type AS ENUM ('local');
+CREATE TABLE local_table (x INT);
+INSERT INTO local_table VALUES (1), (2)
+
+query TTT
+SELECT * FROM [EXPLAIN SELECT * FROM local_table] LIMIT 1
+----
+·     distribution  local
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN;
+ALTER TYPE greeting RENAME TO greeting_local;
+CREATE TABLE local_table (x INT);
+INSERT INTO local_table VALUES (1), (2)
+
+query TTT
+SELECT * FROM [EXPLAIN SELECT * FROM local_table] LIMIT 1
+----
+·     distribution  local
+
+statement ok
+ROLLBACK

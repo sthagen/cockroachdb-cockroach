@@ -134,10 +134,7 @@ func isPermanentSchemaChangeError(err error) bool {
 	// Ignore error thrown because of a read at a very old timestamp.
 	// The Backfill will grab a new timestamp to read at for the rest
 	// of the backfill.
-	// TODO(knz): this should really use errors.Is(). However until/unless
-	// we are not receiving errors from 19.1 any more, a string
-	// comparison must remain.
-	if strings.Contains(err.Error(), "must be after replica GC threshold") {
+	if errors.HasType(err, (*roachpb.BatchTimestampBeforeGCError)(nil)) {
 		return false
 	}
 
@@ -220,6 +217,10 @@ func (sc *SchemaChanger) maybeBackfillCreateTableAs(
 		p, cleanup := NewInternalPlanner("ctasBackfill", txn, security.RootUser, &MemoryMetrics{}, sc.execCfg)
 		defer cleanup()
 		localPlanner := p.(*planner)
+		// TODO (rohany): This is a hack and should be removed once #51865 lands.
+		// In case we used this planner to access any descriptors, we need to
+		// release any leases we might have acquired during planning and execution.
+		defer func() { localPlanner.Descriptors().ReleaseAll(ctx) }()
 		stmt, err := parser.ParseOne(table.CreateQuery)
 		if err != nil {
 			return err
@@ -266,7 +267,7 @@ func (sc *SchemaChanger) maybeBackfillCreateTableAs(
 		defer recv.Release()
 
 		willDistribute := getPlanDistribution(
-			ctx, localPlanner.execCfg.NodeID,
+			ctx, localPlanner, localPlanner.execCfg.NodeID,
 			localPlanner.extendedEvalCtx.SessionData.DistSQLMode,
 			localPlanner.curPlan.main,
 		).WillDistribute()
@@ -315,7 +316,7 @@ func (sc *SchemaChanger) maybeMakeAddTablePublic(
 
 		fks := table.AllActiveAndInactiveForeignKeys()
 		for _, fk := range fks {
-			if err := waitToUpdateLeases(ctx, sc.leaseMgr, fk.ReferencedTableID); err != nil {
+			if err := WaitToUpdateLeases(ctx, sc.leaseMgr, fk.ReferencedTableID); err != nil {
 				return err
 			}
 		}
@@ -495,7 +496,7 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 	// returns, so that the new schema is live everywhere. This is not needed for
 	// correctness but is done to make the UI experience/tests predictable.
 	waitToUpdateLeases := func(refreshStats bool) error {
-		if err := waitToUpdateLeases(ctx, sc.leaseMgr, sc.tableID); err != nil {
+		if err := WaitToUpdateLeases(ctx, sc.leaseMgr, sc.tableID); err != nil {
 			if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
 				return err
 			}
@@ -573,7 +574,7 @@ func (sc *SchemaChanger) handlePermanentSchemaChangeError(
 	// returns, so that the new schema is live everywhere. This is not needed for
 	// correctness but is done to make the UI experience/tests predictable.
 	waitToUpdateLeases := func(refreshStats bool) error {
-		if err := waitToUpdateLeases(ctx, sc.leaseMgr, sc.tableID); err != nil {
+		if err := WaitToUpdateLeases(ctx, sc.leaseMgr, sc.tableID); err != nil {
 			if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
 				return err
 			}
@@ -731,12 +732,12 @@ func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) erro
 	log.Info(ctx, "finished stepping through state machine")
 
 	// wait for the state change to propagate to all leases.
-	return waitToUpdateLeases(ctx, sc.leaseMgr, sc.tableID)
+	return WaitToUpdateLeases(ctx, sc.leaseMgr, sc.tableID)
 }
 
-// Wait until the entire cluster has been updated to the latest version
-// of the descriptor.
-func waitToUpdateLeases(ctx context.Context, leaseMgr *lease.Manager, descID sqlbase.ID) error {
+// WaitToUpdateLeases until the entire cluster has been updated to the latest
+// version of the descriptor.
+func WaitToUpdateLeases(ctx context.Context, leaseMgr *lease.Manager, descID sqlbase.ID) error {
 	// Aggressively retry because there might be a user waiting for the
 	// schema change to complete.
 	retryOpts := retry.Options{
@@ -762,6 +763,7 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 	// We make a call to PublishMultiple to handle the situation to add Foreign Key backreferences.
 	var fksByBackrefTable map[sqlbase.ID][]*sqlbase.ConstraintToUpdate
 	var interleaveParents map[sqlbase.ID]struct{}
+	var referencedTypeIDs []sqlbase.ID
 	err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		fksByBackrefTable = make(map[sqlbase.ID][]*sqlbase.ConstraintToUpdate)
 		interleaveParents = make(map[sqlbase.ID]struct{})
@@ -770,6 +772,18 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+
+		referencedTypeIDs, err = desc.GetAllReferencedTypeIDs(func(id sqlbase.ID) (*sqlbase.TypeDescriptor, error) {
+			desc, err := sqlbase.GetTypeDescFromID(ctx, txn, sc.execCfg.Codec, id)
+			if err != nil {
+				return nil, err
+			}
+			return desc.TypeDesc(), nil
+		})
+		if err != nil {
+			return err
+		}
+
 		for _, mutation := range desc.Mutations {
 			if mutation.MutationID != sc.mutationID {
 				break
@@ -979,10 +993,32 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 				break
 			}
 		}
+
+		// Now that all mutations have been applied, find the new set of referenced
+		// type descriptors. If this table has been dropped in the mean time, then
+		// don't install any backreferences.
+		if !scTable.Dropped() {
+			newReferencedTypeIDs, err := scTable.GetAllReferencedTypeIDs(func(id sqlbase.ID) (*TypeDescriptor, error) {
+				return descs[id].(*sqlbase.MutableTypeDescriptor).TypeDesc(), nil
+			})
+			if err != nil {
+				return err
+			}
+
+			// Update the set of back references.
+			for _, id := range referencedTypeIDs {
+				descs[id].(*sqlbase.MutableTypeDescriptor).RemoveReferencingDescriptorID(scTable.ID)
+			}
+			for _, id := range newReferencedTypeIDs {
+				descs[id].(*sqlbase.MutableTypeDescriptor).AddReferencingDescriptorID(scTable.ID)
+			}
+		}
+
 		return nil
 	}
 
-	_, err = sc.leaseMgr.PublishMultiple(ctx, tableIDsToUpdate, update, func(txn *kv.Txn) error {
+	descsToUpdate := append(tableIDsToUpdate, referencedTypeIDs...)
+	_, err = sc.leaseMgr.PublishMultiple(ctx, descsToUpdate, update, func(txn *kv.Txn) error {
 		schemaChangeEventType := EventLogFinishSchemaChange
 		if isRollback {
 			schemaChangeEventType = EventLogFinishSchemaRollback
@@ -1293,11 +1329,11 @@ func (sc *SchemaChanger) maybeReverseMutations(ctx context.Context, causingError
 		return err
 	}
 
-	if err := waitToUpdateLeases(ctx, sc.leaseMgr, sc.tableID); err != nil {
+	if err := WaitToUpdateLeases(ctx, sc.leaseMgr, sc.tableID); err != nil {
 		return err
 	}
 	for id := range fksByBackrefTable {
-		if err := waitToUpdateLeases(ctx, sc.leaseMgr, id); err != nil {
+		if err := WaitToUpdateLeases(ctx, sc.leaseMgr, id); err != nil {
 			return err
 		}
 	}
@@ -1405,7 +1441,7 @@ func (sc *SchemaChanger) deleteIndexMutationsWithReversedColumns(
 							// the DELETE_ONLY state.
 							if mutation.Direction != sqlbase.DescriptorMutation_ADD ||
 								mutation.State != sqlbase.DescriptorMutation_DELETE_ONLY {
-								panic(fmt.Sprintf("mutation in bad state: %+v", mutation))
+								panic(errors.AssertionFailedf("mutation in bad state: %+v", mutation))
 							}
 							log.Warningf(ctx, "drop schema change mutation: %+v", mutation)
 							dropMutations[mutation.MutationID] = struct{}{}
@@ -1462,13 +1498,13 @@ func (sc *SchemaChanger) reverseMutation(
 		}
 
 		if notStarted && mutation.State != sqlbase.DescriptorMutation_DELETE_ONLY {
-			panic(fmt.Sprintf("mutation in bad state: %+v", mutation))
+			panic(errors.AssertionFailedf("mutation in bad state: %+v", mutation))
 		}
 
 	case sqlbase.DescriptorMutation_DROP:
 		mutation.Direction = sqlbase.DescriptorMutation_ADD
 		if notStarted && mutation.State != sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY {
-			panic(fmt.Sprintf("mutation in bad state: %+v", mutation))
+			panic(errors.AssertionFailedf("mutation in bad state: %+v", mutation))
 		}
 	}
 	return mutation, columns

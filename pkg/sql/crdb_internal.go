@@ -660,8 +660,10 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   service_lat_var     FLOAT NOT NULL,
   overhead_lat_avg    FLOAT NOT NULL,
   overhead_lat_var    FLOAT NOT NULL,
-  bytes_read          INT NOT NULL,
-  rows_read           INT NOT NULL,
+  bytes_read_avg      FLOAT NOT NULL,
+  bytes_read_var      FLOAT NOT NULL,
+  rows_read_avg       FLOAT NOT NULL,
+  rows_read_var       FLOAT NOT NULL,
   implicit_txn        BOOL NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ *sqlbase.ImmutableDatabaseDescriptor, addRow func(...tree.Datum) error) error {
@@ -738,8 +740,10 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 					tree.NewDFloat(tree.DFloat(s.data.ServiceLat.GetVariance(s.data.Count))),
 					tree.NewDFloat(tree.DFloat(s.data.OverheadLat.Mean)),
 					tree.NewDFloat(tree.DFloat(s.data.OverheadLat.GetVariance(s.data.Count))),
-					tree.NewDInt(tree.DInt(s.data.BytesRead)),
-					tree.NewDInt(tree.DInt(s.data.RowsRead)),
+					tree.NewDFloat(tree.DFloat(s.data.BytesRead.Mean)),
+					tree.NewDFloat(tree.DFloat(s.data.BytesRead.GetVariance(s.data.Count))),
+					tree.NewDFloat(tree.DFloat(s.data.RowsRead.Mean)),
+					tree.NewDFloat(tree.DFloat(s.data.RowsRead.GetVariance(s.data.Count))),
 					tree.MakeDBool(tree.DBool(stmtKey.implicitTxn)),
 				)
 				s.Unlock()
@@ -1469,29 +1473,30 @@ CREATE TABLE crdb_internal.create_statements (
 		var stmt, createNofk string
 		alterStmts := tree.NewDArray(types.String)
 		validateStmts := tree.NewDArray(types.String)
+		namePrefix := tree.ObjectNamePrefix{SchemaName: tree.Name(scName), ExplicitSchema: true}
+		name := tree.MakeTableNameFromPrefix(namePrefix, tree.Name(table.Name))
 		var err error
 		if table.IsView() {
 			descType = typeView
-			stmt, err = ShowCreateView(ctx, (*tree.Name)(&table.Name), table)
+			stmt, err = ShowCreateView(ctx, &name, table)
 		} else if table.IsSequence() {
 			descType = typeSequence
-			stmt, err = ShowCreateSequence(ctx, (*tree.Name)(&table.Name), table)
+			stmt, err = ShowCreateSequence(ctx, &name, table)
 		} else {
 			descType = typeTable
-			tn := (*tree.Name)(&table.Name)
 			displayOptions := ShowCreateDisplayOptions{
 				FKDisplayMode: OmitFKClausesFromCreate,
 			}
-			createNofk, err = ShowCreateTable(ctx, p, tn, contextName, table, lookup, displayOptions)
+			createNofk, err = ShowCreateTable(ctx, p, &name, contextName, table, lookup, displayOptions)
 			if err != nil {
 				return err
 			}
-			if err := showAlterStatementWithInterleave(ctx, tn, contextName, lookup, table.Indexes, table, alterStmts,
+			if err := showAlterStatementWithInterleave(ctx, &name, contextName, lookup, table.Indexes, table, alterStmts,
 				validateStmts); err != nil {
 				return err
 			}
 			displayOptions.FKDisplayMode = IncludeFkClausesInCreate
-			stmt, err = ShowCreateTable(ctx, p, tn, contextName, table, lookup, displayOptions)
+			stmt, err = ShowCreateTable(ctx, p, &name, contextName, table, lookup, displayOptions)
 		}
 		if err != nil {
 			return err
@@ -1528,7 +1533,7 @@ CREATE TABLE crdb_internal.create_statements (
 
 func showAlterStatementWithInterleave(
 	ctx context.Context,
-	tn *tree.Name,
+	tn *tree.TableName,
 	contextName string,
 	lCtx simpleSchemaResolver,
 	allIdx []sqlbase.IndexDescriptor,
@@ -1585,7 +1590,7 @@ func showAlterStatementWithInterleave(
 
 			var tableName tree.TableName
 			if lCtx != nil {
-				tableName, err = getTableAsTableName(lCtx, table, contextName)
+				tableName, err = getTableNameFromTableDescriptor(lCtx, table.TableDesc(), contextName)
 				if err != nil {
 					return err
 				}

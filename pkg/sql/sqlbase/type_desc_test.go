@@ -240,7 +240,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			TypeDescriptor{Name: "t", ID: 1},
 		},
 		{
-			`enum members are not sorted [{[2] a} {[1] b}]`,
+			`enum members are not sorted [{[2] a ALL} {[1] b ALL}]`,
 			TypeDescriptor{
 				Name:     "t",
 				ID:       1,
@@ -335,6 +335,18 @@ func TestValidateTypeDesc(t *testing.T) {
 				ParentSchemaID: 101,
 				Kind:           TypeDescriptor_ENUM,
 				ArrayTypeID:    500,
+			},
+		},
+		{
+			"referencing descriptor 500 does not exist",
+			TypeDescriptor{
+				Name:                     "t",
+				ID:                       1,
+				ParentID:                 100,
+				ParentSchemaID:           101,
+				Kind:                     TypeDescriptor_ENUM,
+				ArrayTypeID:              102,
+				ReferencingDescriptorIDs: []ID{500},
 			},
 		},
 	}

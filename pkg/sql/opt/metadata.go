@@ -17,6 +17,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -118,6 +120,15 @@ type Metadata struct {
 	// sequences stores information about each metadata sequence, indexed by SequenceID.
 	sequences []cat.Sequence
 
+	// userDefinedTypes contains all user defined types present in expressions
+	// in this query.
+	// TODO (rohany): This only contains user defined types present in the query
+	//  because the installation of type metadata in tables doesn't go through
+	//  the type resolver that the optimizer hijacks. However, we could update
+	//  this map when adding a table via metadata.AddTable.
+	userDefinedTypes      map[uint32]struct{}
+	userDefinedTypesSlice []*types.T
+
 	// deps stores information about all data source objects depended on by the
 	// query, as well as the privileges required to access them. The objects are
 	// deduplicated: any name/object pair shows up at most once.
@@ -133,6 +144,10 @@ type Metadata struct {
 
 	// currUniqueID is the highest UniqueID that has been assigned.
 	currUniqueID UniqueID
+
+	// withBindings store bindings for relational expressions inside With or
+	// mutation operators, used to determine the logical properties of WithScan.
+	withBindings map[WithID]Expr
 
 	// NOTE! When adding fields here, update Init, CopyFrom and TestMetadata.
 }
@@ -197,6 +212,10 @@ func (md *Metadata) Init() {
 	md.views = md.views[:0]
 
 	md.currUniqueID = 0
+
+	md.withBindings = nil
+	md.userDefinedTypes = nil
+	md.userDefinedTypesSlice = nil
 }
 
 // CopyFrom initializes the metadata with a copy of the provided metadata.
@@ -206,12 +225,22 @@ func (md *Metadata) Init() {
 // the copy.
 func (md *Metadata) CopyFrom(from *Metadata) {
 	if len(md.schemas) != 0 || len(md.cols) != 0 || len(md.tables) != 0 ||
-		len(md.sequences) != 0 || len(md.deps) != 0 || len(md.views) != 0 {
+		len(md.sequences) != 0 || len(md.deps) != 0 || len(md.views) != 0 ||
+		len(md.userDefinedTypes) != 0 || len(md.userDefinedTypesSlice) != 0 {
 		panic(errors.AssertionFailedf("CopyFrom requires empty destination"))
 	}
 	md.schemas = append(md.schemas, from.schemas...)
 	md.cols = append(md.cols, from.cols...)
 	md.tables = append(md.tables, from.tables...)
+
+	if (md.userDefinedTypes) == nil {
+		md.userDefinedTypes = make(map[uint32]struct{})
+	}
+	for i := range from.userDefinedTypesSlice {
+		typ := from.userDefinedTypesSlice[i]
+		md.userDefinedTypes[typ.StableTypeID()] = struct{}{}
+		md.userDefinedTypesSlice = append(md.userDefinedTypesSlice, typ)
+	}
 
 	// Clear table annotations. These objects can be mutable and can't be safely
 	// shared between different metadata instances.
@@ -225,6 +254,9 @@ func (md *Metadata) CopyFrom(from *Metadata) {
 	md.deps = append(md.deps, from.deps...)
 	md.views = append(md.views, from.views...)
 	md.currUniqueID = from.currUniqueID
+
+	// We cannot copy the bound expressions; they must be rebuilt in the new memo.
+	md.withBindings = nil
 }
 
 // DepByName is used with AddDependency when the data source was looked up using a
@@ -306,6 +338,20 @@ func (md *Metadata) CheckDependencies(
 			privs &= ^(1 << priv)
 		}
 	}
+	// Check that all of the user defined types present have not changed.
+	for _, typ := range md.AllUserDefinedTypes() {
+		toCheck, err := catalog.ResolveTypeByID(ctx, typ.StableTypeID())
+		if err != nil {
+			// Handle when the type no longer exists.
+			if pgerror.GetPGCode(err) == pgcode.UndefinedObject {
+				return false, nil
+			}
+			return false, err
+		}
+		if typ.TypeMeta.Version != toCheck.TypeMeta.Version {
+			return false, nil
+		}
+	}
 	return true, nil
 }
 
@@ -319,6 +365,25 @@ func (md *Metadata) AddSchema(sch cat.Schema) SchemaID {
 // id.
 func (md *Metadata) Schema(schID SchemaID) cat.Schema {
 	return md.schemas[schID-1]
+}
+
+// AddUserDefinedType adds a user defined type to the metadata for this query.
+func (md *Metadata) AddUserDefinedType(typ *types.T) {
+	if !typ.UserDefined() {
+		return
+	}
+	if md.userDefinedTypes == nil {
+		md.userDefinedTypes = make(map[uint32]struct{})
+	}
+	if _, ok := md.userDefinedTypes[typ.StableTypeID()]; !ok {
+		md.userDefinedTypes[typ.StableTypeID()] = struct{}{}
+		md.userDefinedTypesSlice = append(md.userDefinedTypesSlice, typ)
+	}
+}
+
+// AllUserDefinedTypes returns all user defined types contained in this query.
+func (md *Metadata) AllUserDefinedTypes() []*types.T {
+	return md.userDefinedTypesSlice
 }
 
 // AddTable indexes a new reference to a table within the query. Separate
@@ -566,3 +631,21 @@ func (md *Metadata) AllDataSourceNames(
 // WithID=0 is reserved to mean "unknown expression".
 // See the comment for Metadata for more details on identifiers.
 type WithID uint64
+
+// AddWithBinding associates a WithID to its bound expression.
+func (md *Metadata) AddWithBinding(id WithID, expr Expr) {
+	if md.withBindings == nil {
+		md.withBindings = make(map[WithID]Expr)
+	}
+	md.withBindings[id] = expr
+}
+
+// WithBinding returns the bound expression for the given WithID.
+// Panics with an assertion error if there is none.
+func (md *Metadata) WithBinding(id WithID) Expr {
+	res, ok := md.withBindings[id]
+	if !ok {
+		panic(errors.AssertionFailedf("no binding for WithID %d", id))
+	}
+	return res
+}

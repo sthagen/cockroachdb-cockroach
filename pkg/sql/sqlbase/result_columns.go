@@ -11,10 +11,9 @@
 package sqlbase
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 // ResultColumn contains the name and type of a SQL "cell".
@@ -58,7 +57,7 @@ func resultColumnsFromColDescs(
 		colDesc := getColDesc(i)
 		typ := colDesc.Type
 		if typ == nil {
-			panic(fmt.Sprintf("unsupported column type: %s", colDesc.Type.Family()))
+			panic(errors.AssertionFailedf("unsupported column type: %s", colDesc.Type.Family()))
 		}
 		cols[i] = ResultColumn{
 			Name:           colDesc.Name,
@@ -104,8 +103,9 @@ func (r ResultColumns) NodeFormatter(colIdx int) tree.NodeFormatter {
 }
 
 // String formats result columns to a string.
-// The column types are printed if the argument specifies so.
-func (r ResultColumns) String(printTypes bool) string {
+// The column types are printed if printTypes is true.
+// The hidden property is printed if showHidden is true.
+func (r ResultColumns) String(printTypes bool, showHidden bool) string {
 	f := tree.NewFmtCtx(tree.FmtSimple)
 	f.WriteByte('(')
 	for i := range r {
@@ -125,7 +125,7 @@ func (r ResultColumns) String(printTypes bool) string {
 			hasProps = true
 			f.WriteString(prop)
 		}
-		if rCol.Hidden {
+		if showHidden && rCol.Hidden {
 			outputProp("hidden")
 		}
 		if hasProps {

@@ -916,7 +916,7 @@ func shouldDistributeGivenRecAndMode(
 	case sessiondata.DistSQLOn, sessiondata.DistSQLAlways:
 		return rec != cannotDistribute
 	}
-	panic(fmt.Sprintf("unhandled distsql mode %v", mode))
+	panic(errors.AssertionFailedf("unhandled distsql mode %v", mode))
 }
 
 // getPlanDistribution returns the PlanDistribution that plan will have. If
@@ -926,12 +926,20 @@ func shouldDistributeGivenRecAndMode(
 // the plan.
 func getPlanDistribution(
 	ctx context.Context,
+	p *planner,
 	nodeID *base.SQLIDContainer,
 	distSQLMode sessiondata.DistSQLExecMode,
 	plan planMaybePhysical,
 ) physicalplan.PlanDistribution {
 	if plan.isPhysicalPlan() {
 		return plan.physPlan.Distribution
+	}
+
+	// If this transaction has modified or created any types, it is not safe to
+	// distribute due to limitations around leasing descriptors modified in the
+	// current transaction.
+	if p.Descriptors().HasUncommittedTypes() {
+		return physicalplan.LocalPlan
 	}
 
 	if _, singleTenant := nodeID.OptionalNodeID(); !singleTenant {
@@ -1022,7 +1030,7 @@ func golangFillQueryArguments(args ...interface{}) (tree.Datums, error) {
 				}
 			}
 			if d == nil {
-				panic(fmt.Sprintf("unexpected type %T", arg))
+				panic(errors.AssertionFailedf("unexpected type %T", arg))
 			}
 		}
 		res[i] = d
@@ -2209,12 +2217,12 @@ func (s *sqlStatsCollector) recordStatement(
 	numRows int,
 	err error,
 	parseLat, planLat, runLat, svcLat, ovhLat float64,
-	bytesRead, rowsRead int64,
+	stats topLevelQueryStats,
 ) {
 	s.appStats.recordStatement(
 		stmt, samplePlanDescription, distSQLUsed, vectorized, implicitTxn,
 		automaticRetryCount, numRows, err, parseLat, planLat, runLat, svcLat,
-		ovhLat, bytesRead, rowsRead,
+		ovhLat, stats,
 	)
 }
 

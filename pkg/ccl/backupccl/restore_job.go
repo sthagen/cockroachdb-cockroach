@@ -491,7 +491,13 @@ func WriteDescriptors(
 			// Depending on which cluster version we are restoring to, we decide which
 			// namespace table to write the descriptor into. This may cause wrong
 			// behavior if the cluster version is bumped DURING a restore.
-			tkey := sqlbase.MakePublicTableNameKey(ctx, settings, table.ParentID, table.Name)
+			tkey := sqlbase.MakeObjectNameKey(
+				ctx,
+				settings,
+				table.ParentID,
+				table.GetParentSchemaID(),
+				table.Name,
+			)
 			b.CPut(tkey.Key(keys.SystemSQLCodec), table.ID, nil)
 		}
 
@@ -597,7 +603,7 @@ func restore(
 	oldTableIDs []sqlbase.ID,
 	spans []roachpb.Span,
 	job *jobs.Job,
-	encryption *roachpb.FileEncryptionOptions,
+	encryption *jobspb.BackupEncryptionOptions,
 	user string,
 ) (RowCount, error) {
 	// A note about contexts and spans in this method: the top-level context
@@ -706,6 +712,17 @@ func restore(
 		defer tracing.FinishSpan(progressSpan)
 		return progressLogger.Loop(ctx, requestFinishedCh)
 	})
+
+	// Wrap the relevant BackupEncryptionOptions to be used by the KV
+	// ImportRequest.
+	// TODO(adityamaru): Move this wrapping to when the Restore DataSpec is being
+	// created once we switch to using DistSQL for RESTORE. This is how BACKUP
+	// does it currently.
+	var fileEncryption *roachpb.FileEncryptionOptions
+	if encryption != nil {
+		fileEncryption = &roachpb.FileEncryptionOptions{Key: encryption.Key}
+	}
+
 	g.GoCtx(func(ctx context.Context) error {
 		log.Eventf(restoreCtx, "commencing import of data with concurrency %d", maxConcurrentImports)
 		for readyForImportSpan := range readyForImportCh {
@@ -724,7 +741,7 @@ func restore(
 				Files:         readyForImportSpan.files,
 				EndTime:       endTime,
 				Rekeys:        rekeys,
-				Encryption:    encryption,
+				Encryption:    fileEncryption,
 			}
 
 			log.VEventf(restoreCtx, 1, "importing %d of %d", idx, len(importSpans))
@@ -794,7 +811,7 @@ func loadBackupSQLDescs(
 	ctx context.Context,
 	p sql.PlanHookState,
 	details jobspb.RestoreDetails,
-	encryption *roachpb.FileEncryptionOptions,
+	encryption *jobspb.BackupEncryptionOptions,
 ) ([]BackupManifest, BackupManifest, []sqlbase.Descriptor, error) {
 	backupManifests, err := loadBackupManifests(ctx, details.URIs,
 		p.User(), p.ExecCfg().DistSQLSrv.ExternalStorageFromURI, encryption)
@@ -843,7 +860,7 @@ type restoreResumer struct {
 func getStatisticsFromBackup(
 	ctx context.Context,
 	exportStore cloud.ExternalStorage,
-	encryption *roachpb.FileEncryptionOptions,
+	encryption *jobspb.BackupEncryptionOptions,
 	backup BackupManifest,
 ) ([]*stats.TableStatisticProto, error) {
 	// This part deals with pre-20.2 stats format where backup statistics
@@ -995,9 +1012,14 @@ func createImportingDescriptors(
 	// case, we don't want to create namespace and descriptor entries for those
 	// types. So collect only the types that we need to write here.
 	var typesToWrite []sqlbase.TypeDescriptorInterface
+	// We need to know what existing types we are remapping to, so collect them.
+	existingTypeIDs := make(map[sqlbase.ID]struct{})
 	for i := range types {
 		typ := types[i]
-		if !details.DescriptorRewrites[typ.GetID()].ToExisting {
+		rewrite := details.DescriptorRewrites[typ.GetID()]
+		if rewrite.ToExisting {
+			existingTypeIDs[rewrite.ID] = struct{}{}
+		} else {
 			typesToWrite = append(typesToWrite, typ)
 		}
 	}
@@ -1017,11 +1039,61 @@ func createImportingDescriptors(
 		desc.OfflineReason = "restoring"
 	}
 
+	// Collect all types after they have had their ID's rewritten.
+	typesByID := make(map[sqlbase.ID]*sqlbase.TypeDescriptor)
+	for i := range types {
+		typ := types[i].TypeDesc()
+		typesByID[typ.ID] = typ
+	}
+
 	if !details.PrepareCompleted {
 		err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			// Write the new TableDescriptors which are set in the OFFLINE state.
 			if err := WriteDescriptors(ctx, txn, databases, tables, typesToWrite, details.DescriptorCoverage, r.settings, nil /* extra */); err != nil {
 				return errors.Wrapf(err, "restoring %d TableDescriptors from %d databases", len(r.tables), len(databases))
+			}
+
+			// We could be restoring tables that point to existing types. We need to
+			// ensure that those existing types are updated with back references pointing
+			// to the new tables being restored.
+			b := txn.NewBatch()
+			for _, table := range tables {
+				// Collect all types used by this table.
+				typeIDs, err := table.TableDesc().GetAllReferencedTypeIDs(func(id sqlbase.ID) (*sqlbase.TypeDescriptor, error) {
+					return typesByID[id], nil
+				})
+				if err != nil {
+					return err
+				}
+				for _, id := range typeIDs {
+					// If the type was restored as part of the backup, then the backreference
+					// already exists.
+					_, ok := existingTypeIDs[id]
+					if !ok {
+						continue
+					}
+					// Otherwise, add a backreference to this table.
+					desc, err := catalogkv.GetMutableDescriptorByID(ctx, txn, keys.SystemSQLCodec, id)
+					if err != nil {
+						return err
+					}
+					typDesc := desc.(*sqlbase.MutableTypeDescriptor)
+					typDesc.AddReferencingDescriptorID(table.GetID())
+					if err := catalogkv.WriteDescToBatch(
+						ctx,
+						false, /* kvTrace */
+						p.ExecCfg().Settings,
+						b,
+						keys.SystemSQLCodec,
+						typDesc.ID,
+						typDesc,
+					); err != nil {
+						return err
+					}
+				}
+			}
+			if err := txn.Run(ctx, b); err != nil {
+				return err
 			}
 
 			for _, tenant := range details.Tenants {
@@ -1041,6 +1113,13 @@ func createImportingDescriptors(
 		})
 		if err != nil {
 			return nil, nil, nil, nil, err
+		}
+
+		// Wait for one version on any existing changed types.
+		for existing := range existingTypeIDs {
+			if err := sql.WaitToUpdateLeases(ctx, p.ExecCfg().LeaseManager, existing); err != nil {
+				return nil, nil, nil, nil, err
+			}
 		}
 	}
 

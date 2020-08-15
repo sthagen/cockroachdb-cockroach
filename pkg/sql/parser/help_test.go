@@ -69,6 +69,10 @@ func TestContextualHelp(t *testing.T) {
 		{`ALTER SEQUENCE blah RENAME ??`, `ALTER SEQUENCE`},
 		{`ALTER SEQUENCE blah RENAME TO blih ??`, `ALTER SEQUENCE`},
 
+		{`ALTER SCHEMA ??`, `ALTER SCHEMA`},
+		{`ALTER SCHEMA x RENAME ??`, `ALTER SCHEMA`},
+		{`ALTER SCHEMA x OWNER ??`, `ALTER SCHEMA`},
+
 		{`ALTER USER IF ??`, `ALTER ROLE`},
 		{`ALTER USER foo WITH PASSWORD ??`, `ALTER ROLE`},
 
@@ -182,6 +186,8 @@ func TestContextualHelp(t *testing.T) {
 		{`DROP SCHEDULE ???`, `DROP SCHEDULES`},
 		{`DROP SCHEDULES ???`, `DROP SCHEDULES`},
 
+		{`DROP SCHEMA ??`, `DROP SCHEMA`},
+
 		{`EXPLAIN (??`, `EXPLAIN`},
 		{`EXPLAIN SELECT 1 ??`, `SELECT`},
 		{`EXPLAIN INSERT INTO xx (SELECT 1) ??`, `INSERT`},
@@ -280,6 +286,9 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW JOBS ??`, `SHOW JOBS`},
 		{`SHOW AUTOMATIC JOBS ??`, `SHOW JOBS`},
 
+		{`SHOW SCHEDULE ??`, `SHOW SCHEDULES`},
+		{`SHOW SCHEDULES ??`, `SHOW SCHEDULES`},
+
 		{`SHOW BACKUP 'foo' ??`, `SHOW BACKUP`},
 
 		{`SHOW CLUSTER SETTING all ??`, `SHOW CLUSTER SETTING`},
@@ -297,6 +306,8 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW CREATE SEQUENCE blah ??`, `SHOW CREATE`},
 
 		{`SHOW DATABASES ??`, `SHOW DATABASES`},
+
+		{`SHOW ENUMS ??`, `SHOW ENUMS`},
 
 		{`SHOW GRANTS ON ??`, `SHOW GRANTS`},
 		{`SHOW GRANTS ON foo FOR ??`, `SHOW GRANTS`},
@@ -388,6 +399,8 @@ func TestContextualHelp(t *testing.T) {
 
 		{`COMMIT TRANSACTION ??`, `COMMIT`},
 		{`END ??`, `COMMIT`},
+
+		{`REFRESH ??`, `REFRESH`},
 
 		{`ROLLBACK TRANSACTION ??`, `ROLLBACK`},
 		{`ROLLBACK TO ??`, `ROLLBACK`},

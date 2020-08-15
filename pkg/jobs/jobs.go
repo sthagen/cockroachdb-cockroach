@@ -16,14 +16,17 @@ import (
 	"reflect"
 	"sync/atomic"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -61,7 +64,7 @@ type Record struct {
 	Description   string
 	Statement     string
 	Username      string
-	DescriptorIDs sqlbase.IDs
+	DescriptorIDs descpb.IDs
 	Details       jobspb.Details
 	Progress      jobspb.ProgressDetails
 	RunningStatus RunningStatus
@@ -142,14 +145,14 @@ var (
 	errJobCanceled = errors.New("job canceled by user")
 )
 
-// isOldSchemaChangeJob returns whether the provided payload is for a job that
-// is a 19.2-style schema change, and therefore cannot be run or updated in 20.1
-// (without first having undergone a migration).
-// TODO (lucy): Remove this in 20.2. (I think it's possible in theory for a 19.2
+// deprecatedIsOldSchemaChangeJob returns whether the provided payload is for a
+// job that is a 19.2-style schema change, and therefore cannot be run or
+// updated in 20.1 (without first having undergone a migration).
+// TODO(lucy): Remove this in 20.2. (I think it's possible in theory for a 19.2
 // schema change job to persist on a 20.1 cluster indefinitely, since the
 // migration is asynchronous, so this will take some care beyond just removing
 // the format version gate.)
-func isOldSchemaChangeJob(payload *jobspb.Payload) bool {
+func deprecatedIsOldSchemaChangeJob(payload *jobspb.Payload) bool {
 	schemaChangeDetails, ok := payload.UnwrapDetails().(jobspb.SchemaChangeDetails)
 	return ok && schemaChangeDetails.FormatVersion < jobspb.JobResumerFormatVersion
 }
@@ -195,6 +198,12 @@ func (j *Job) ID() *int64 {
 // was not set.
 func (j *Job) CreatedBy() *CreatedByInfo {
 	return j.createdBy
+}
+
+// taskName is the name for the async task on the registry stopper that will
+// execute this job.
+func (j *Job) taskName() string {
+	return fmt.Sprintf(`job-%d`, *j.ID())
 }
 
 // Created records the creation of a new job in the system.jobs table and
@@ -423,7 +432,7 @@ func (j *Job) cancelRequested(ctx context.Context, fn func(context.Context, *kv.
 		// could encounter.
 		//
 		// TODO (lucy): Remove this in 20.2.
-		if isOldSchemaChangeJob(md.Payload) {
+		if deprecatedIsOldSchemaChangeJob(md.Payload) {
 			return errors.Newf(
 				"schema change job was created in earlier version, and cannot be " +
 					"canceled in this version until the upgrade is finalized and an internal migration is complete")
@@ -474,7 +483,7 @@ func (j *Job) pauseRequested(ctx context.Context, fn onPauseRequestFunc) error {
 		// possible in 19.2.
 		//
 		// TODO (lucy): Remove this in 20.2.
-		if isOldSchemaChangeJob(md.Payload) {
+		if deprecatedIsOldSchemaChangeJob(md.Payload) {
 			return errors.Newf(
 				"schema change job was created in earlier version, and cannot be " +
 					"paused in this version until the upgrade is finalized and an internal migration is complete")
@@ -495,6 +504,7 @@ func (j *Job) pauseRequested(ctx context.Context, fn onPauseRequestFunc) error {
 			ju.UpdateProgress(md.Progress)
 		}
 		ju.UpdateStatus(StatusPauseRequested)
+		log.Infof(ctx, "job %d: pause requested recorded", *j.ID())
 		return nil
 	})
 }
@@ -695,7 +705,13 @@ func (j *Job) load(ctx context.Context) error {
 	var createdBy *CreatedByInfo
 
 	if err := j.runInTxn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		const stmt = "SELECT payload, progress, created_by_type, created_by_id FROM system.jobs WHERE id = $1"
+		const newStmt = "SELECT payload, progress, created_by_type, created_by_id FROM system.jobs WHERE id = $1"
+		const oldStmt = "SELECT payload, progress FROM system.jobs WHERE id = $1"
+		hasCreatedBy := j.registry.settings.Version.IsActive(ctx, clusterversion.VersionAlterSystemJobsAddCreatedByColumns)
+		stmt := oldStmt
+		if hasCreatedBy {
+			stmt = newStmt
+		}
 		row, err := j.registry.ex.QueryRowEx(
 			ctx, "load-job-query", txn, sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 			stmt, *j.ID())
@@ -713,8 +729,11 @@ func (j *Job) load(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		createdBy, err = unmarshalCreatedBy(row[2], row[3])
-		return err
+		if hasCreatedBy {
+			createdBy, err = unmarshalCreatedBy(row[2], row[3])
+			return err
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -774,7 +793,7 @@ func (j *Job) adopt(ctx context.Context, oldLease *jobspb.Lease) error {
 			return errors.Errorf("current lease %v did not match expected lease %v",
 				md.Payload.Lease, oldLease)
 		}
-		md.Payload.Lease = j.registry.newLease()
+		md.Payload.Lease = j.registry.deprecatedNewLease()
 		if md.Payload.StartedMicros == 0 {
 			md.Payload.StartedMicros = timeutil.ToUnixMicros(j.registry.clock.Now().GoTime())
 		}
@@ -874,11 +893,16 @@ func (sj *StartableJob) Start(ctx context.Context) (errCh <-chan error, err erro
 	if err := sj.started(ctx); err != nil {
 		return nil, err
 	}
-	errCh, err = sj.registry.resume(sj.resumerCtx, sj.resumer, sj.resultsCh, sj.Job, sj.cleanup)
-	if err != nil {
+	ec := make(chan error, 1)
+	if err := sj.registry.stopper.RunAsyncTask(ctx, sj.taskName(), func(ctx context.Context) {
+		sj.registry.runJob(
+			sj.resumerCtx, sj.resumer, sj.resultsCh, ec, sj.Job, StatusRunning, sj.taskName(), sj.cleanup,
+		)
+	}); err != nil {
+		sj.cleanup()
 		return nil, err
 	}
-	return errCh, nil
+	return ec, nil
 }
 
 // Run will resume the job and wait for it to finish or the context to be

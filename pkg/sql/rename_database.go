@@ -14,6 +14,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -31,8 +33,10 @@ type renameDatabaseNode struct {
 }
 
 // RenameDatabase renames the database.
-// Privileges: superuser, DROP on source database.
+// Privileges: Ownership or superuser + DROP on source database.
 //   Notes: postgres requires superuser, db owner, or "CREATEDB".
+//          Postgres requires non-superuser owners to have
+//          CREATEDB privilege to rename a DB.
 //          mysql >= 5.1.23 does not allow database renames.
 func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (planNode, error) {
 	if n.Name == "" || n.NewName == "" {
@@ -43,17 +47,26 @@ func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (p
 		return nil, pgerror.DangerousStatementf("RENAME DATABASE on current database")
 	}
 
-	if err := p.RequireAdminRole(ctx, "ALTER DATABASE ... RENAME"); err != nil {
-		return nil, err
-	}
-
 	dbDesc, err := p.ResolveUncachedDatabaseByName(ctx, string(n.Name), true /*required*/)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := p.CheckPrivilege(ctx, dbDesc, privilege.DROP); err != nil {
+	hasOwnership, err := p.HasOwnership(ctx, dbDesc)
+	if err != nil {
 		return nil, err
+	}
+
+	// If the user is not the db owner, they must have admin privilege and have
+	//  drop privilege on the db.
+	if !hasOwnership {
+		if err := p.RequireAdminRole(ctx, "ALTER DATABASE ... RENAME"); err != nil {
+			return nil, err
+		}
+
+		if err := p.CheckPrivilege(ctx, dbDesc, privilege.DROP); err != nil {
+			return nil, err
+		}
 	}
 
 	if n.Name == n.NewName {
@@ -116,7 +129,10 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 				tbNames[i].Catalog(),
 				tbNames[i].Schema(),
 				tbNames[i].Table(),
-				tree.ObjectLookupFlags{CommonLookupFlags: lookupFlags},
+				tree.ObjectLookupFlags{
+					CommonLookupFlags: lookupFlags,
+					DesiredObjectKind: tree.TableObject,
+				},
 			)
 			if err != nil {
 				return err
@@ -124,9 +140,9 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 			if objDesc == nil {
 				continue
 			}
-			tbDesc := objDesc.TableDesc()
-			for _, dependedOn := range tbDesc.DependedOnBy {
-				dependentDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, p.ExecCfg().Codec, dependedOn.ID)
+			tbDesc := objDesc.(sqlbase.TableDescriptor)
+			for _, dependedOn := range tbDesc.GetDependedOnBy() {
+				dependentDesc, err := catalogkv.MustGetTableDescByID(ctx, p.txn, p.ExecCfg().Codec, dependedOn.ID)
 				if err != nil {
 					return err
 				}
@@ -148,7 +164,7 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 				tbTableName := tree.MakeTableNameWithSchema(
 					tree.Name(dbDesc.GetName()),
 					tree.Name(schema),
-					tree.Name(tbDesc.Name),
+					tree.Name(tbDesc.GetName()),
 				)
 				var dependentDescQualifiedString string
 				if dbDesc.GetID() != dependentDesc.ParentID || tbDesc.GetParentSchemaID() != dependentDesc.GetParentSchemaID() {
@@ -214,9 +230,9 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 // This is a workaround for #45411 until #34416 is resolved.
 func isAllowedDependentDescInRenameDatabase(
 	ctx context.Context,
-	dependedOn sqlbase.TableDescriptor_Reference,
-	tbDesc *sqlbase.TableDescriptor,
-	dependentDesc *sqlbase.TableDescriptor,
+	dependedOn descpb.TableDescriptor_Reference,
+	tbDesc sqlbase.TableDescriptor,
+	dependentDesc *sqlbase.ImmutableTableDescriptor,
 	dbName string,
 ) (bool, string, error) {
 	// If it is a sequence, and it does not contain the database name, then we have

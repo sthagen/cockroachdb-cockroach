@@ -2164,7 +2164,7 @@ FROM pg_catalog.pg_constraint
 WHERE conrelid='pg_constraintdef_test'::regclass
 ----
 UNIQUE (b ASC)
-FOREIGN KEY (a) REFERENCES public.pg_indexdef_test(a) ON DELETE CASCADE
+FOREIGN KEY (a) REFERENCES pg_indexdef_test(a) ON DELETE CASCADE
 CHECK ((c > a))
 
 # These functions always return NULL since we don't support comments on vtable columns and databases.
@@ -2371,7 +2371,7 @@ SELECT crdb_internal.check_consistency(true, '\x03', '\x02')
 query ITT
 SELECT range_id, status, regexp_replace(detail, '[0-9]+', '', 'g') FROM crdb_internal.check_consistency(true, '\x02', '\xffff') WHERE range_id = 1
 ----
-1  RANGE_CONSISTENT  stats: {ContainsEstimates: LastUpdateNanos: IntentAge: GCBytesAge: LiveBytes: LiveCount: KeyBytes: KeyCount: ValBytes: ValCount: IntentBytes: IntentCount: SysBytes: SysCount:}
+1  RANGE_CONSISTENT  stats: {ContainsEstimates: LastUpdateNanos: IntentAge: GCBytesAge: LiveBytes: LiveCount: KeyBytes: KeyCount: ValBytes: ValCount: IntentBytes: IntentCount: SysBytes: SysCount: AbortSpanBytes:}
 
 # Without explicit keys, scans all ranges (we don't test this too precisely to
 # avoid flaking the test when the range count changes, just want to know that
@@ -2758,6 +2758,8 @@ SELECT set_bit(b'', 0, 1)
 query error set_bit\(\): new bit must be 0 or 1.
 SELECT set_bit(b'\145\x6C\l', 0, 2)
 
+subtest num_nulls_test
+
 statement ok
 CREATE TABLE nulls_test(a INT, b STRING)
 
@@ -2772,6 +2774,8 @@ SELECT num_nulls(a, b), num_nonnulls(a, b) FROM nulls_test
 1  1
 2  0
 
+subtest pb_to_json
+
 query T
 select crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor)->'database'->>'name' from system.descriptor where id=1
 ----
@@ -2780,3 +2784,39 @@ system
 
 query error pq: crdb_internal.pb_to_json\(\): unknown proto message type cockroach.sql.sqlbase.descriptor
 select crdb_internal.pb_to_json('cockroach.sql.sqlbase.descriptor', descriptor)->'database'->>'name' from system.descriptor where id=1
+
+query B
+SELECT (SELECT * FROM [SHOW crdb_version]) = version()
+----
+true
+
+query B
+select crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor)) = descriptor from system.descriptor where id = 1
+----
+true
+
+subtest regexp_split
+
+query T
+SELECT regexp_split_to_table('3aa0AAa1', 'a+')
+----
+3
+0AA
+1
+
+query T
+SELECT regexp_split_to_table('3aa0AAa1', 'a+', 'i')
+----
+3
+0
+1
+
+query T
+SELECT regexp_split_to_array('3aa0AAa1', 'a+')
+----
+{3,0AA,1}
+
+query T
+SELECT regexp_split_to_array('3aaa0AAa1', 'a+', 'i')
+----
+{3,0,1}

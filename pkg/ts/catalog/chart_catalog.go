@@ -81,18 +81,6 @@ var charts = []sectionDescription{
 				Metrics:     []string{"security.certificate.expiration.ui-ca"},
 			},
 			{
-				Title:       "Tenant Server CA Cert Expiration",
-				Downsampler: DescribeAggregator_MAX,
-				Aggregator:  DescribeAggregator_MAX,
-				Metrics:     []string{"security.certificate.expiration.ca-server-tenant"},
-			},
-			{
-				Title:       "Tenant Server Cert Expiration",
-				Downsampler: DescribeAggregator_MAX,
-				Aggregator:  DescribeAggregator_MAX,
-				Metrics:     []string{"security.certificate.expiration.server-tenant"},
-			},
-			{
 				Title:       "Tenant Client CA Cert Expiration",
 				Downsampler: DescribeAggregator_MAX,
 				Aggregator:  DescribeAggregator_MAX,
@@ -781,6 +769,7 @@ var charts = []sectionDescription{
 			{
 				Title: "Size",
 				Metrics: []string{
+					"abortspanbytes",
 					"intentbytes",
 					"keybytes",
 					"livebytes",
@@ -1092,6 +1081,10 @@ var charts = []sectionDescription{
 			{
 				Title:   "Epoch Increment Count",
 				Metrics: []string{"liveness.epochincrements"},
+			},
+			{
+				Title:   "Heartbeats In-Flight",
+				Metrics: []string{"liveness.heartbeatsinflight"},
 			},
 			{
 				Title:   "Heartbeat Latency",
@@ -1436,6 +1429,32 @@ var charts = []sectionDescription{
 			{
 				Title:   "Total",
 				Metrics: []string{"sql.distsql.flows.total"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{SQLLayer, "SQL Livness"}},
+		Charts: []chartDescription{
+			{
+				Title: "Session Writes",
+				Metrics: []string{
+					"sqlliveness.write_successes",
+					"sqlliveness.write_failures",
+				},
+			},
+			{
+				Title: "IsAlive cache",
+				Metrics: []string{
+					"sqlliveness.is_alive.cache_hits",
+					"sqlliveness.is_alive.cache_misses",
+				},
+			},
+			{
+				Title: "Session deletion",
+				Metrics: []string{
+					"sqlliveness.sessions_deletion_runs",
+					"sqlliveness.sessions_deleted",
+				},
 			},
 		},
 	},
@@ -2039,6 +2058,7 @@ var charts = []sectionDescription{
 			{
 				Title: "Size",
 				Metrics: []string{
+					"abortspanbytes",
 					"intentbytes",
 					"keybytes",
 					"livebytes",

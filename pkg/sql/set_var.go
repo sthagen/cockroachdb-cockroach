@@ -12,13 +12,17 @@ package sql
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -104,6 +108,14 @@ func unresolvedNameToStrVal(expr tree.Expr) tree.Expr {
 
 func (n *setVarNode) startExec(params runParams) error {
 	var strVal string
+
+	if _, ok := DummyVars[n.name]; ok {
+		telemetry.Inc(sqltelemetry.DummySessionVarValueCounter(n.name))
+		params.p.SendClientNotice(
+			params.ctx,
+			pgnotice.NewWithSeverityf("WARNING", "setting session var %q is a no-op", n.name),
+		)
+	}
 	if n.typedValues != nil {
 		for i, v := range n.typedValues {
 			d, err := v.Eval(params.EvalContext())
@@ -173,6 +185,28 @@ func getStringVal(evalCtx *tree.EvalContext, name string, values []tree.TypedExp
 		return "", newSingleArgVarError(name)
 	}
 	return datumAsString(evalCtx, name, values[0])
+}
+
+func datumAsFloat(evalCtx *tree.EvalContext, name string, value tree.TypedExpr) (float64, error) {
+	val, err := value.Eval(evalCtx)
+	if err != nil {
+		return 0, err
+	}
+	switch v := tree.UnwrapDatum(evalCtx, val).(type) {
+	case *tree.DString:
+		return strconv.ParseFloat(string(*v), 64)
+	case *tree.DInt:
+		return float64(*v), nil
+	case *tree.DFloat:
+		return float64(*v), nil
+	case *tree.DDecimal:
+		return v.Decimal.Float64()
+	}
+	err = pgerror.Newf(pgcode.InvalidParameterValue,
+		"parameter %q requires an float value", name)
+	err = errors.WithDetailf(err,
+		"%s is a %s", value, errors.Safe(val.ResolvedType()))
+	return 0, err
 }
 
 func datumAsInt(evalCtx *tree.EvalContext, name string, value tree.TypedExpr) (int64, error) {

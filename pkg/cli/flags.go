@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -458,10 +459,10 @@ func init() {
 		}
 	}
 
-	// Log flags.
-	logCmds := append(StartCmds, demoCmd)
-	logCmds = append(logCmds, demoCmd.Commands()...)
-	for _, cmd := range logCmds {
+	// Flags that apply to commands that start servers.
+	serverCmds := append(StartCmds, demoCmd)
+	serverCmds = append(serverCmds, demoCmd.Commands()...)
+	for _, cmd := range serverCmds {
 		f := cmd.Flags()
 		varFlag(f, &startCtx.logDir, cliflags.LogDir)
 		varFlag(f,
@@ -473,6 +474,21 @@ func init() {
 		varFlag(f,
 			pflag.PFlagFromGoFlag(flag.Lookup(logflags.LogFileVerbosityThresholdName)).Value,
 			cliflags.LogFileVerbosity)
+
+		// Report flag usage for server commands in telemetry. We do this
+		// only for server commands, as there is no point in accumulating
+		// telemetry if there's no telemetry reporting loop being started.
+		AddPersistentPreRunE(cmd, func(cmd *cobra.Command, _ []string) error {
+			prefix := "cli." + cmd.Name()
+			// Count flag usage.
+			cmd.Flags().Visit(func(fl *pflag.Flag) {
+				telemetry.Count(prefix + ".explicitflags." + fl.Name)
+			})
+			// Also report use of the command on its own. This is necessary
+			// so we can compute flag usage as a % of total command invocations.
+			telemetry.Count(prefix + ".runs")
+			return nil
+		})
 	}
 
 	for _, cmd := range certCmds {
@@ -486,7 +502,6 @@ func init() {
 	for _, cmd := range []*cobra.Command{
 		createCACertCmd,
 		createClientCACertCmd,
-		mtCreateTenantServerCACertCmd,
 		mtCreateTenantClientCACertCmd,
 	} {
 		f := cmd.Flags()
@@ -499,7 +514,6 @@ func init() {
 	for _, cmd := range []*cobra.Command{
 		createNodeCertCmd,
 		createClientCertCmd,
-		mtCreateTenantServerCertCmd,
 		mtCreateTenantClientCertCmd,
 	} {
 		f := cmd.Flags()
@@ -512,8 +526,6 @@ func init() {
 		createClientCACertCmd,
 		createNodeCertCmd,
 		createClientCertCmd,
-		mtCreateTenantServerCACertCmd,
-		mtCreateTenantServerCertCmd,
 		mtCreateTenantClientCACertCmd,
 		mtCreateTenantClientCertCmd,
 	} {
@@ -527,8 +539,6 @@ func init() {
 
 	// The certs dir is given to all clientCmds below, but the following are not clientCmds.
 	for _, cmd := range []*cobra.Command{
-		mtCreateTenantServerCACertCmd,
-		mtCreateTenantServerCertCmd,
 		mtCreateTenantClientCACertCmd,
 		mtCreateTenantClientCertCmd,
 	} {

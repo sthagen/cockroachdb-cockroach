@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -529,9 +528,6 @@ func TestPGPreparedQuery(t *testing.T) {
 		{"SHOW DATABASE", []preparedQueryTest{
 			baseTest.Results("defaultdb"),
 		}},
-		{"SELECT descriptor FROM system.descriptor WHERE descriptor != $1 LIMIT 1", []preparedQueryTest{
-			baseTest.SetArgs([]byte("abc")).Results([]byte("\x12%\n\x06system\x10\x01\x1a\x15\n\t\n\x05admin\x100\n\b\n\x04root\x100\"\x00(\x01")),
-		}},
 		{"SHOW COLUMNS FROM system.users", []preparedQueryTest{
 			baseTest.
 				Results("username", "STRING", false, gosql.NullBool{}, "", "{primary}", false).
@@ -542,11 +538,11 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("d").Results("defaultdb").Results("postgres").Results("system"),
 		}},
 		{"SHOW GRANTS ON system.users", []preparedQueryTest{
-			baseTest.Results("system", "public", "users", sqlbase.AdminRole, "DELETE").
-				Results("system", "public", "users", sqlbase.AdminRole, "GRANT").
-				Results("system", "public", "users", sqlbase.AdminRole, "INSERT").
-				Results("system", "public", "users", sqlbase.AdminRole, "SELECT").
-				Results("system", "public", "users", sqlbase.AdminRole, "UPDATE").
+			baseTest.Results("system", "public", "users", security.AdminRole, "DELETE").
+				Results("system", "public", "users", security.AdminRole, "GRANT").
+				Results("system", "public", "users", security.AdminRole, "INSERT").
+				Results("system", "public", "users", security.AdminRole, "SELECT").
+				Results("system", "public", "users", security.AdminRole, "UPDATE").
 				Results("system", "public", "users", security.RootUser, "DELETE").
 				Results("system", "public", "users", security.RootUser, "GRANT").
 				Results("system", "public", "users", security.RootUser, "INSERT").
@@ -557,7 +553,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("users", "primary", false, 1, "username", "ASC", false, false),
 		}},
 		{"SHOW TABLES FROM system", []preparedQueryTest{
-			baseTest.Results("public", "comments", "table").Others(27),
+			baseTest.Results("public", "comments", "table", gosql.NullString{}).Others(28),
 		}},
 		{"SHOW SCHEMAS FROM system", []preparedQueryTest{
 			baseTest.Results("crdb_internal").Others(4),
@@ -760,6 +756,9 @@ func TestPGPreparedQuery(t *testing.T) {
 		}},
 		{"SELECT $1::TIMETZ", []preparedQueryTest{
 			baseTest.SetArgs("12:00:00+0330").Results("0000-01-01T12:00:00+03:30"),
+		}},
+		{"SELECT $1::BOX2D", []preparedQueryTest{
+			baseTest.SetArgs("BOX(1 2,3 4)").Results("BOX(1 2,3 4)"),
 		}},
 		{"SELECT $1::GEOGRAPHY", []preparedQueryTest{
 			baseTest.SetArgs("POINT(1.0 1.0)").Results("0101000020E6100000000000000000F03F000000000000F03F"),

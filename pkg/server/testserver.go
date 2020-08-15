@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -45,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -61,6 +61,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -218,9 +219,16 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.SQLAddr = params.SQLAddr
 		cfg.SQLAdvertiseAddr = params.SQLAddr
 	}
-	if params.TenantAddr != "" {
-		cfg.TenantAddr = params.TenantAddr
-		cfg.TenantAdvertiseAddr = params.TenantAddr
+	if params.TenantAddr != nil {
+		addr := *params.TenantAddr
+		if addr == "" {
+			// Empty address disables the tenant server.
+			cfg.SplitListenTenant = false
+			cfg.TenantAddr = ""
+		} else {
+			cfg.TenantAddr = addr
+			cfg.TenantAdvertiseAddr = addr
+		}
 	}
 	if params.HTTPAddr != "" {
 		cfg.HTTPAddr = params.HTTPAddr
@@ -324,6 +332,14 @@ func (ts *TestServer) Gossip() *gossip.Gossip {
 func (ts *TestServer) Clock() *hlc.Clock {
 	if ts != nil {
 		return ts.clock
+	}
+	return nil
+}
+
+// SQLLivenessProvider returns the sqlliveness.Provider as an interface{}.
+func (ts *TestServer) SQLLivenessProvider() interface{} {
+	if ts != nil {
+		return ts.sqlServer.execCfg.SQLLivenessReader
 	}
 	return nil
 }
@@ -463,6 +479,7 @@ func makeSQLServerArgs(
 		rpcTestingKnobs = p.ContextTestingKnobs
 	}
 	rpcContext := rpc.NewContext(rpc.ContextOptions{
+		TenantID:   sqlCfg.TenantID,
 		AmbientCtx: baseCfg.AmbientCtx,
 		Config:     baseCfg.Config,
 		Clock:      clock,
@@ -477,48 +494,28 @@ func makeSQLServerArgs(
 	}
 	rpcRetryOptions := base.DefaultRetryOptions()
 
-	// TODO(ajwerner): this use of Gossip needs to go. Tracked in:
-	// https://github.com/cockroachdb/cockroach/issues/47150
-	var g *gossip.Gossip
-	{
-		var nodeID base.NodeIDContainer
-		nodeID.Set(context.Background(), fakeNodeID)
-		var clusterID base.ClusterIDContainer
-		dummyGossipGRPC := rpc.NewServer(rpcContext) // never Serve()s anything
-		g = gossip.New(
-			baseCfg.AmbientCtx,
-			&clusterID,
-			&nodeID,
-			rpcContext,
-			dummyGossipGRPC,
-			stopper,
-			registry,
-			baseCfg.Locality,
-			&baseCfg.DefaultZoneConfig,
-		)
+	tcCfg := kvtenant.ConnectorConfig{
+		AmbientCtx:        baseCfg.AmbientCtx,
+		RPCContext:        rpcContext,
+		RPCRetryOptions:   rpcRetryOptions,
+		DefaultZoneConfig: &baseCfg.DefaultZoneConfig,
 	}
-
-	tenantProxy, err := kvtenant.Factory.NewProxy(
-		baseCfg.AmbientCtx,
-		rpcContext,
-		rpcRetryOptions,
-		sqlCfg.TenantKVAddrs,
-	)
+	tenantConnect, err := kvtenant.Factory.NewConnector(tcCfg, sqlCfg.TenantKVAddrs)
 	if err != nil {
 		return sqlServerArgs{}, err
 	}
-	resolver := kvtenant.AddressResolver(tenantProxy)
+	resolver := kvtenant.AddressResolver(tenantConnect)
 	nodeDialer := nodedialer.New(rpcContext, resolver)
 
 	dsCfg := kvcoord.DistSenderConfig{
 		AmbientCtx:        baseCfg.AmbientCtx,
 		Settings:          st,
 		Clock:             clock,
-		NodeDescs:         tenantProxy,
+		NodeDescs:         tenantConnect,
 		RPCRetryOptions:   &rpcRetryOptions,
 		RPCContext:        rpcContext,
 		NodeDialer:        nodeDialer,
-		RangeDescriptorDB: tenantProxy,
+		RangeDescriptorDB: tenantConnect,
 		TestingKnobs:      dsKnobs,
 	}
 	ds := kvcoord.NewDistSender(dsCfg)
@@ -571,13 +568,12 @@ func makeSQLServerArgs(
 	// We don't need this for anything except some services that want a gRPC
 	// server to register against (but they'll never get RPCs at the time of
 	// writing): the blob service and DistSQL.
-	dummyRPCServer := rpc.NewServer(rpcContext)
-	noStatusServer := serverpb.MakeOptionalStatusServer(nil)
+	dummyRPCServer := grpc.NewServer()
 	return sqlServerArgs{
 		sqlServerOptionalKVArgs: sqlServerOptionalKVArgs{
-			statusServer: noStatusServer,
+			statusServer: serverpb.MakeOptionalStatusServer(nil),
 			nodeLiveness: sqlbase.MakeOptionalNodeLiveness(nil),
-			gossip:       gossip.MakeUnexposedGossip(g),
+			gossip:       gossip.MakeOptionalGossip(nil),
 			grpcServer:   dummyRPCServer,
 			recorder:     dummyRecorder,
 			isMeta1Leaseholder: func(_ context.Context, timestamp hlc.Timestamp) (bool, error) {
@@ -593,7 +589,7 @@ func makeSQLServerArgs(
 			},
 		},
 		sqlServerOptionalTenantArgs: sqlServerOptionalTenantArgs{
-			tenantProxy: tenantProxy,
+			tenantConnect: tenantConnect,
 		},
 		SQLConfig:                &sqlCfg,
 		BaseConfig:               &baseCfg,
@@ -601,7 +597,8 @@ func makeSQLServerArgs(
 		clock:                    clock,
 		runtime:                  status.NewRuntimeStatSampler(context.Background(), clock),
 		rpcContext:               rpcContext,
-		nodeDescs:                tenantProxy,
+		nodeDescs:                tenantConnect,
+		systemConfigProvider:     tenantConnect,
 		nodeDialer:               nodeDialer,
 		distSender:               ds,
 		db:                       db,
@@ -627,13 +624,14 @@ func (ts *TestServer) StartTenant(params base.TestTenantArgs) (pgAddr string, _ 
 
 	st := cluster.MakeTestingClusterSettings()
 	sqlCfg := makeTestSQLConfig(st, params.TenantID)
+	sqlCfg.TenantKVAddrs = []string{ts.ServingTenantAddr()}
+	sqlCfg.TenantIDCodecOverride = params.TenantIDCodecOverride
 	baseCfg := makeTestBaseConfig(st)
 	if params.AllowSettingClusterSettings {
 		baseCfg.TestingKnobs.TenantTestingKnobs = &sql.TenantTestingKnobs{
 			ClusterSettingsUpdater: st.MakeUpdater(),
 		}
 	}
-	sqlCfg.TenantKVAddrs = []string{ts.RPCAddr()}
 	return StartTenant(
 		ctx,
 		ts.Stopper(),
@@ -692,22 +690,6 @@ func StartTenant(
 	)
 	orphanedLeasesTimeThresholdNanos := args.clock.Now().WallTime
 
-	// TODO(ajwerner): this use of Gossip needs to go. Tracked in:
-	// https://github.com/cockroachdb/cockroach/issues/47150
-	{
-		rs := make([]resolver.Resolver, len(sqlCfg.TenantKVAddrs))
-		for i := range rs {
-			var err error
-			rs[i], err = resolver.NewResolver(sqlCfg.TenantKVAddrs[i])
-			if err != nil {
-				return "", err
-			}
-		}
-		// NB: gossip server is not bound to any address, so the advertise addr does
-		// not matter.
-		args.gossip.Start(pgL.Addr(), rs)
-	}
-
 	if err := s.start(ctx,
 		args.stopper,
 		args.TestingKnobs,
@@ -751,8 +733,8 @@ func ExpectedInitialRangeCount(
 			maxSystemDescriptorID = descID
 		}
 	}
-	if maxSystemDescriptorID < sqlbase.ID(keys.MaxPseudoTableID) {
-		maxSystemDescriptorID = sqlbase.ID(keys.MaxPseudoTableID)
+	if maxSystemDescriptorID < descpb.ID(keys.MaxPseudoTableID) {
+		maxSystemDescriptorID = descpb.ID(keys.MaxPseudoTableID)
 	}
 	systemTableSplits := int(maxSystemDescriptorID - keys.MaxSystemConfigDescID)
 

@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -60,6 +61,7 @@ var backillerSSTSize = settings.RegisterByteSizeSetting(
 )
 
 func newIndexBackfiller(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.BackfillerSpec,
@@ -79,11 +81,7 @@ func newIndexBackfiller(
 	}
 	ib.backfiller.chunks = ib
 
-	// Copy in the DB pointer from flowCtx into evalCtx, because the Init
-	// step needs access to the DB.
-	evalCtx := flowCtx.NewEvalCtx()
-	evalCtx.DB = flowCtx.Cfg.DB
-	if err := ib.IndexBackfiller.Init(evalCtx, ib.desc); err != nil {
+	if err := ib.IndexBackfiller.InitForDistributedUse(ctx, flowCtx, ib.desc); err != nil {
 		return nil, err
 	}
 
@@ -142,7 +140,7 @@ func (ib *indexBackfiller) wrapDupError(ctx context.Context, orig error) error {
 
 func (ib *indexBackfiller) runChunk(
 	tctx context.Context,
-	mutations []sqlbase.DescriptorMutation,
+	mutations []descpb.DescriptorMutation,
 	sp roachpb.Span,
 	chunkSize int64,
 	readAsOf hlc.Timestamp,

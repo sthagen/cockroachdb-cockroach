@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -71,7 +72,7 @@ func performGC(
 		}
 
 		// Drop database zone config when all the tables have been GCed.
-		if details.ParentID != sqlbase.InvalidID && isDoneGC(progress) {
+		if details.ParentID != descpb.InvalidID && isDoneGC(progress) {
 			if err := deleteDatabaseZoneConfig(ctx, execCfg.DB, execCfg.Codec, details.ParentID); err != nil {
 				return false, errors.Wrap(err, "deleting database zone config")
 			}
@@ -96,6 +97,25 @@ func (r schemaChangeGCResumer) Resume(
 	if err != nil {
 		return err
 	}
+
+	// If there are any interleaved indexes to drop as part of a table TRUNCATE
+	// operation, then drop the indexes before waiting on the GC timer.
+	if len(details.InterleavedIndexes) > 0 {
+		// Before deleting any indexes, ensure that old versions of the table
+		// descriptor are no longer in use.
+		if err := sql.WaitToUpdateLeases(ctx, execCfg.LeaseManager, details.InterleavedTable.ID); err != nil {
+			return err
+		}
+		if err := sql.TruncateInterleavedIndexes(
+			ctx,
+			execCfg,
+			sqlbase.NewImmutableTableDescriptor(*details.InterleavedTable),
+			details.InterleavedIndexes,
+		); err != nil {
+			return err
+		}
+	}
+
 	zoneCfgFilter, gossipUpdateC := setupConfigWatcher(execCfg)
 	tableDropTimes, indexDropTimes := getDropTimes(details)
 
@@ -126,7 +146,7 @@ func (r schemaChangeGCResumer) Resume(
 			// TTL whenever we get an update on one of the tables/indexes (or the db)
 			// that this job is responsible for, and computing the earliest deadline
 			// from our set of cached TTL values.
-			cfg := execCfg.Gossip.DeprecatedSystemConfig(47150)
+			cfg := execCfg.SystemConfig.GetSystemConfig()
 			zoneConfigUpdated := false
 			zoneCfgFilter.ForModified(cfg, func(kv roachpb.KeyValue) {
 				zoneConfigUpdated = true

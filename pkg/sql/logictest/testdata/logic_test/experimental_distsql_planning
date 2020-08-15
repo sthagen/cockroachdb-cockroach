@@ -100,3 +100,21 @@ SELECT v FROM kv ORDER BY v DESC
 1
 1
 NULL
+
+# Check that an SRF is supported.
+query I colnames
+SELECT * FROM generate_series(1, 3)
+----
+generate_series
+1
+2
+3
+
+# Check that distinct is supported.
+query I rowsort
+SELECT DISTINCT v FROM kv
+----
+1
+2
+NULL
+3

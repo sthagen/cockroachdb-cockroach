@@ -69,6 +69,12 @@ func ClearRange(
 	to := args.EndKey
 	var pd result.Result
 
+	if !args.Deadline.IsEmpty() {
+		if now := cArgs.EvalCtx.Clock().Now(); args.Deadline.LessEq(now) {
+			return result.Result{}, errors.Errorf("ClearRange has deadline %s <= %s", args.Deadline, now)
+		}
+	}
+
 	// Before clearing, compute the delta in MVCCStats.
 	statsDelta, err := computeStatsDelta(ctx, readWriter, cArgs, from, to)
 	if err != nil {
@@ -134,7 +140,7 @@ func computeStatsDelta(
 		// access to the stats. Concurrent changes to range-local keys are
 		// explicitly ignored (i.e. SysCount, SysBytes).
 		delta = cArgs.EvalCtx.GetMVCCStats()
-		delta.SysCount, delta.SysBytes = 0, 0 // no change to system stats
+		delta.SysCount, delta.SysBytes, delta.AbortSpanBytes = 0, 0, 0 // no change to system stats
 	}
 
 	// If we can't use the fast stats path, or race test is enabled,

@@ -11,7 +11,7 @@ package colexec
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 )
 
 const _ = "template_collectProbeOuter"
@@ -24,7 +24,7 @@ func collectProbeOuter_false(
 		currentID := hj.ht.probeScratch.headID[i]
 
 		for {
-			if nResults >= hj.outputBatchSize {
+			if nResults >= coldata.BatchSize() {
 				hj.probeState.prevBatch = batch
 				hj.probeState.prevBatchResumeIdx = i
 				return nResults
@@ -70,7 +70,7 @@ func collectProbeOuter_true(
 		currentID := hj.ht.probeScratch.headID[i]
 
 		for {
-			if nResults >= hj.outputBatchSize {
+			if nResults >= coldata.BatchSize() {
 				hj.probeState.prevBatch = batch
 				hj.probeState.prevBatchResumeIdx = i
 				return nResults
@@ -116,7 +116,7 @@ func collectProbeNoOuter_false(
 	for i := hj.probeState.prevBatchResumeIdx; i < batchSize; i++ {
 		currentID := hj.ht.probeScratch.headID[i]
 		for currentID != 0 {
-			if nResults >= hj.outputBatchSize {
+			if nResults >= coldata.BatchSize() {
 				hj.probeState.prevBatch = batch
 				hj.probeState.prevBatchResumeIdx = i
 				return nResults
@@ -148,7 +148,7 @@ func collectProbeNoOuter_true(
 	for i := hj.probeState.prevBatchResumeIdx; i < batchSize; i++ {
 		currentID := hj.ht.probeScratch.headID[i]
 		for currentID != 0 {
-			if nResults >= hj.outputBatchSize {
+			if nResults >= coldata.BatchSize() {
 				hj.probeState.prevBatch = batch
 				hj.probeState.prevBatchResumeIdx = i
 				return nResults
@@ -349,14 +349,14 @@ func (hj *hashJoiner) collect(batch coldata.Batch, batchSize int, sel []int) int
 	} else {
 		if sel != nil {
 			switch hj.spec.joinType {
-			case sqlbase.LeftAntiJoin, sqlbase.ExceptAllJoin:
+			case descpb.LeftAntiJoin, descpb.ExceptAllJoin:
 				nResults = collectAnti_true(hj, batchSize, nResults, batch, sel)
 			default:
 				nResults = collectProbeNoOuter_true(hj, batchSize, nResults, batch, sel)
 			}
 		} else {
 			switch hj.spec.joinType {
-			case sqlbase.LeftAntiJoin, sqlbase.ExceptAllJoin:
+			case descpb.LeftAntiJoin, descpb.ExceptAllJoin:
 				nResults = collectAnti_false(hj, batchSize, nResults, batch, sel)
 			default:
 				nResults = collectProbeNoOuter_false(hj, batchSize, nResults, batch, sel)
@@ -384,7 +384,7 @@ func (hj *hashJoiner) distinctCollect(batch coldata.Batch, batchSize int, sel []
 	} else {
 		if sel != nil {
 			switch hj.spec.joinType {
-			case sqlbase.LeftAntiJoin, sqlbase.ExceptAllJoin:
+			case descpb.LeftAntiJoin, descpb.ExceptAllJoin:
 				// For LEFT ANTI and EXCEPT ALL joins we don't care whether the build
 				// (right) side was distinct, so we only have single variation of COLLECT
 				// method.
@@ -394,7 +394,7 @@ func (hj *hashJoiner) distinctCollect(batch coldata.Batch, batchSize int, sel []
 			}
 		} else {
 			switch hj.spec.joinType {
-			case sqlbase.LeftAntiJoin, sqlbase.ExceptAllJoin:
+			case descpb.LeftAntiJoin, descpb.ExceptAllJoin:
 				// For LEFT ANTI and EXCEPT ALL joins we don't care whether the build
 				// (right) side was distinct, so we only have single variation of COLLECT
 				// method.

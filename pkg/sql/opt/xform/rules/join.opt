@@ -2,33 +2,18 @@
 # join.opt contains exploration rules for the Join operator.
 # =============================================================================
 
-# ReorderJoins matches the first expression of an inner join group and adds to
-# the memo all valid join orderings that do not introduce cross joins.
-# Currently, ReorderJoins can only reorder InnerJoins. If the join has join
-# hints or the size of the join tree exceeds ReorderJoinsLimit, the join tree is
+# ReorderJoins matches the first expression of a join group and adds to the memo
+# all valid join orderings that do not introduce cross joins. If the join has
+# join hints or is the result of a previous join reordering, the join tree is
 # not reordered. For more information, see the comment in join_order_builder.go.
 #
 # Citations: [8]
 [ReorderJoins, Explore]
 (InnerJoin | SemiJoin | AntiJoin | LeftJoin | FullJoin
-    *
-    *
-    *
-    $joinPrivate:* &
-        (NoJoinHints $joinPrivate) &
-        (ShouldReorderJoins (Root))
+    * & (ShouldReorderJoins (Root))
 )
 =>
 (ReorderJoins)
-
-# CommuteJoin creates a Join with the left and right inputs swapped. This is
-# useful for other rules that convert joins to other operators (like merge
-# join).
-# If any join hints are specified, we keep the order in the query.
-[CommuteJoin, Explore]
-(InnerJoin | FullJoin $left:* $right:* $on:* $private:*)
-=>
-((OpName) $right $left $on (CommuteJoinFlags $private))
 
 # CommuteLeftJoin creates a Join with the left and right inputs swapped.
 # This is symmetric with the CommuteRightJoin normalization rule.
@@ -122,36 +107,44 @@
 =>
 (GenerateLookupJoins (OpName) $left $scanPrivate $on $private)
 
-# GenerateGeoLookupJoins creates GeoLookupJoin operators for all geospatial
-# indexes (of the Scan table) which allow it. See the GenerateGeoLookupJoins
+# GenerateInvertedJoins creates InvertedJoin operators for all inverted
+# indexes (of the Scan table) which allow it. See the GenerateInvertedJoins
 # custom function for more details.
 # TODO(rytaft): Add support for LeftJoin.
-[GenerateGeoLookupJoins, Explore]
+[GenerateInvertedJoins, Explore]
 (InnerJoin | SemiJoin | AntiJoin
     $left:*
     (Scan $scanPrivate:*) &
         (IsCanonicalScan $scanPrivate) &
         (HasInvertedIndexes $scanPrivate)
-    $on:[
-        ...
-        (FiltersItem
-            $fn:(Function) &
-                (IsGeoIndexFunction $fn) &
-                (FirstArgIsVariable $fn) &
-                (SecondArgIsVariable $fn)
-        )
-        ...
-    ]
+    $on:*
     $private:*
 )
 =>
-(GenerateGeoLookupJoins
+(GenerateInvertedJoins (OpName) $left $scanPrivate $on $private)
+
+# GenerateInvertedJoinsFromSelect is similar to GenerateInvertedJoins, but
+# applies when the input is a Select.
+# TODO(rytaft): Add support for LeftJoin.
+[GenerateInvertedJoinsFromSelect, Explore]
+(InnerJoin | SemiJoin | AntiJoin
+    $left:*
+    (Select
+        (Scan $scanPrivate:*) &
+            (IsCanonicalScan $scanPrivate) &
+            (HasInvertedIndexes $scanPrivate)
+        $filters:*
+    )
+    $on:*
+    $private:*
+)
+=>
+(GenerateInvertedJoins
     (OpName)
     $left
     $scanPrivate
-    $on
+    (ConcatFilters $on $filters)
     $private
-    $fn
 )
 
 # GenerateZigzagJoins creates ZigzagJoin operators for all index pairs (of the

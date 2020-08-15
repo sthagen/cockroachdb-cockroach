@@ -42,7 +42,6 @@ extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobu
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<1> scc_info_AdminUnsplitRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<1> scc_info_AdminUnsplitResponse;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<1> scc_info_BulkOpSummary;
-extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<1> scc_info_ClearRangeRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<1> scc_info_ClearRangeResponse;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<1> scc_info_ComputeChecksumResponse;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<1> scc_info_ConditionalPutResponse;
@@ -82,12 +81,12 @@ extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobu
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_AddSSTableRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_AdminChangeReplicasResponse;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_AdminRelocateRangeRequest;
-extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_AdminScatterResponse;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_AdminSplitRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_AdminVerifyProtectedTimestampRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_AdminVerifyProtectedTimestampResponse;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_CheckConsistencyRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_CheckConsistencyResponse;
+extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_ClearRangeRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_ComputeChecksumRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_ConditionalPutRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_EndTxnResponse;
@@ -115,6 +114,7 @@ extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobu
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_SubsumeRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_TransferLeaseRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_WriteBatchRequest;
+extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<3> scc_info_AdminScatterResponse;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<3> scc_info_ExportResponse;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<3> scc_info_GCRequest;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fapi_2eproto ::google::protobuf::internal::SCCInfo<3> scc_info_RangeStatsResponse;
@@ -1134,9 +1134,10 @@ static void InitDefaultsClearRangeRequest() {
   ::cockroach::roachpb::ClearRangeRequest::InitAsDefaultInstance();
 }
 
-::google::protobuf::internal::SCCInfo<1> scc_info_ClearRangeRequest =
-    {{ATOMIC_VAR_INIT(::google::protobuf::internal::SCCInfoBase::kUninitialized), 1, InitDefaultsClearRangeRequest}, {
-      &protobuf_roachpb_2fapi_2eproto::scc_info_RequestHeader.base,}};
+::google::protobuf::internal::SCCInfo<2> scc_info_ClearRangeRequest =
+    {{ATOMIC_VAR_INIT(::google::protobuf::internal::SCCInfoBase::kUninitialized), 2, InitDefaultsClearRangeRequest}, {
+      &protobuf_roachpb_2fapi_2eproto::scc_info_RequestHeader.base,
+      &protobuf_util_2fhlc_2ftimestamp_2eproto::scc_info_Timestamp.base,}};
 
 static void InitDefaultsClearRangeResponse() {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
@@ -2366,10 +2367,11 @@ static void InitDefaultsAdminScatterResponse() {
   ::cockroach::roachpb::AdminScatterResponse::InitAsDefaultInstance();
 }
 
-::google::protobuf::internal::SCCInfo<2> scc_info_AdminScatterResponse =
-    {{ATOMIC_VAR_INIT(::google::protobuf::internal::SCCInfoBase::kUninitialized), 2, InitDefaultsAdminScatterResponse}, {
+::google::protobuf::internal::SCCInfo<3> scc_info_AdminScatterResponse =
+    {{ATOMIC_VAR_INIT(::google::protobuf::internal::SCCInfoBase::kUninitialized), 3, InitDefaultsAdminScatterResponse}, {
       &protobuf_roachpb_2fapi_2eproto::scc_info_ResponseHeader.base,
-      &protobuf_roachpb_2fapi_2eproto::scc_info_AdminScatterResponse_Range.base,}};
+      &protobuf_roachpb_2fapi_2eproto::scc_info_AdminScatterResponse_Range.base,
+      &protobuf_roachpb_2fdata_2eproto::scc_info_RangeInfo.base,}};
 
 static void InitDefaultsAdminVerifyProtectedTimestampRequest() {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
@@ -7076,9 +7078,18 @@ void DeleteRangeResponse::InternalSwap(DeleteRangeResponse* other) {
 void ClearRangeRequest::InitAsDefaultInstance() {
   ::cockroach::roachpb::_ClearRangeRequest_default_instance_._instance.get_mutable()->header_ = const_cast< ::cockroach::roachpb::RequestHeader*>(
       ::cockroach::roachpb::RequestHeader::internal_default_instance());
+  ::cockroach::roachpb::_ClearRangeRequest_default_instance_._instance.get_mutable()->deadline_ = const_cast< ::cockroach::util::hlc::Timestamp*>(
+      ::cockroach::util::hlc::Timestamp::internal_default_instance());
+}
+void ClearRangeRequest::clear_deadline() {
+  if (GetArenaNoVirtual() == NULL && deadline_ != NULL) {
+    delete deadline_;
+  }
+  deadline_ = NULL;
 }
 #if !defined(_MSC_VER) || _MSC_VER >= 1900
 const int ClearRangeRequest::kHeaderFieldNumber;
+const int ClearRangeRequest::kDeadlineFieldNumber;
 #endif  // !defined(_MSC_VER) || _MSC_VER >= 1900
 
 ClearRangeRequest::ClearRangeRequest()
@@ -7097,11 +7108,18 @@ ClearRangeRequest::ClearRangeRequest(const ClearRangeRequest& from)
   } else {
     header_ = NULL;
   }
+  if (from.has_deadline()) {
+    deadline_ = new ::cockroach::util::hlc::Timestamp(*from.deadline_);
+  } else {
+    deadline_ = NULL;
+  }
   // @@protoc_insertion_point(copy_constructor:cockroach.roachpb.ClearRangeRequest)
 }
 
 void ClearRangeRequest::SharedCtor() {
-  header_ = NULL;
+  ::memset(&header_, 0, static_cast<size_t>(
+      reinterpret_cast<char*>(&deadline_) -
+      reinterpret_cast<char*>(&header_)) + sizeof(deadline_));
 }
 
 ClearRangeRequest::~ClearRangeRequest() {
@@ -7111,6 +7129,7 @@ ClearRangeRequest::~ClearRangeRequest() {
 
 void ClearRangeRequest::SharedDtor() {
   if (this != internal_default_instance()) delete header_;
+  if (this != internal_default_instance()) delete deadline_;
 }
 
 void ClearRangeRequest::SetCachedSize(int size) const {
@@ -7132,6 +7151,10 @@ void ClearRangeRequest::Clear() {
     delete header_;
   }
   header_ = NULL;
+  if (GetArenaNoVirtual() == NULL && deadline_ != NULL) {
+    delete deadline_;
+  }
+  deadline_ = NULL;
   _internal_metadata_.Clear();
 }
 
@@ -7156,6 +7179,17 @@ bool ClearRangeRequest::MergePartialFromCodedStream(
             static_cast< ::google::protobuf::uint8>(10u /* 10 & 0xFF */)) {
           DO_(::google::protobuf::internal::WireFormatLite::ReadMessage(
                input, mutable_header()));
+        } else {
+          goto handle_unusual;
+        }
+        break;
+      }
+
+      case 2: {
+        if (static_cast< ::google::protobuf::uint8>(tag) ==
+            static_cast< ::google::protobuf::uint8>(18u /* 18 & 0xFF */)) {
+          DO_(::google::protobuf::internal::WireFormatLite::ReadMessage(
+               input, mutable_deadline()));
         } else {
           goto handle_unusual;
         }
@@ -7193,6 +7227,11 @@ void ClearRangeRequest::SerializeWithCachedSizes(
       1, this->_internal_header(), output);
   }
 
+  if (this->has_deadline()) {
+    ::google::protobuf::internal::WireFormatLite::WriteMessage(
+      2, this->_internal_deadline(), output);
+  }
+
   output->WriteRaw((::google::protobuf::internal::GetProto3PreserveUnknownsDefault()   ? _internal_metadata_.unknown_fields()   : _internal_metadata_.default_instance()).data(),
                    static_cast<int>((::google::protobuf::internal::GetProto3PreserveUnknownsDefault()   ? _internal_metadata_.unknown_fields()   : _internal_metadata_.default_instance()).size()));
   // @@protoc_insertion_point(serialize_end:cockroach.roachpb.ClearRangeRequest)
@@ -7208,6 +7247,12 @@ size_t ClearRangeRequest::ByteSizeLong() const {
     total_size += 1 +
       ::google::protobuf::internal::WireFormatLite::MessageSize(
         *header_);
+  }
+
+  if (this->has_deadline()) {
+    total_size += 1 +
+      ::google::protobuf::internal::WireFormatLite::MessageSize(
+        *deadline_);
   }
 
   int cached_size = ::google::protobuf::internal::ToCachedSize(total_size);
@@ -7230,6 +7275,9 @@ void ClearRangeRequest::MergeFrom(const ClearRangeRequest& from) {
   if (from.has_header()) {
     mutable_header()->::cockroach::roachpb::RequestHeader::MergeFrom(from.header());
   }
+  if (from.has_deadline()) {
+    mutable_deadline()->::cockroach::util::hlc::Timestamp::MergeFrom(from.deadline());
+  }
 }
 
 void ClearRangeRequest::CopyFrom(const ClearRangeRequest& from) {
@@ -7250,6 +7298,7 @@ void ClearRangeRequest::Swap(ClearRangeRequest* other) {
 void ClearRangeRequest::InternalSwap(ClearRangeRequest* other) {
   using std::swap;
   swap(header_, other->header_);
+  swap(deadline_, other->deadline_);
   _internal_metadata_.Swap(&other->_internal_metadata_);
 }
 
@@ -27444,9 +27493,13 @@ void AdminScatterResponse::InitAsDefaultInstance() {
   ::cockroach::roachpb::_AdminScatterResponse_default_instance_._instance.get_mutable()->header_ = const_cast< ::cockroach::roachpb::ResponseHeader*>(
       ::cockroach::roachpb::ResponseHeader::internal_default_instance());
 }
+void AdminScatterResponse::clear_range_infos() {
+  range_infos_.Clear();
+}
 #if !defined(_MSC_VER) || _MSC_VER >= 1900
 const int AdminScatterResponse::kHeaderFieldNumber;
-const int AdminScatterResponse::kRangesFieldNumber;
+const int AdminScatterResponse::kDeprecatedRangesFieldNumber;
+const int AdminScatterResponse::kRangeInfosFieldNumber;
 #endif  // !defined(_MSC_VER) || _MSC_VER >= 1900
 
 AdminScatterResponse::AdminScatterResponse()
@@ -27459,7 +27512,8 @@ AdminScatterResponse::AdminScatterResponse()
 AdminScatterResponse::AdminScatterResponse(const AdminScatterResponse& from)
   : ::google::protobuf::MessageLite(),
       _internal_metadata_(NULL),
-      ranges_(from.ranges_) {
+      deprecated_ranges_(from.deprecated_ranges_),
+      range_infos_(from.range_infos_) {
   _internal_metadata_.MergeFrom(from._internal_metadata_);
   if (from.has_header()) {
     header_ = new ::cockroach::roachpb::ResponseHeader(*from.header_);
@@ -27497,7 +27551,8 @@ void AdminScatterResponse::Clear() {
   // Prevent compiler warnings about cached_has_bits being unused
   (void) cached_has_bits;
 
-  ranges_.Clear();
+  deprecated_ranges_.Clear();
+  range_infos_.Clear();
   if (GetArenaNoVirtual() == NULL && header_ != NULL) {
     delete header_;
   }
@@ -27536,7 +27591,18 @@ bool AdminScatterResponse::MergePartialFromCodedStream(
         if (static_cast< ::google::protobuf::uint8>(tag) ==
             static_cast< ::google::protobuf::uint8>(18u /* 18 & 0xFF */)) {
           DO_(::google::protobuf::internal::WireFormatLite::ReadMessage(
-                input, add_ranges()));
+                input, add_deprecated_ranges()));
+        } else {
+          goto handle_unusual;
+        }
+        break;
+      }
+
+      case 3: {
+        if (static_cast< ::google::protobuf::uint8>(tag) ==
+            static_cast< ::google::protobuf::uint8>(26u /* 26 & 0xFF */)) {
+          DO_(::google::protobuf::internal::WireFormatLite::ReadMessage(
+                input, add_range_infos()));
         } else {
           goto handle_unusual;
         }
@@ -27575,10 +27641,18 @@ void AdminScatterResponse::SerializeWithCachedSizes(
   }
 
   for (unsigned int i = 0,
-      n = static_cast<unsigned int>(this->ranges_size()); i < n; i++) {
+      n = static_cast<unsigned int>(this->deprecated_ranges_size()); i < n; i++) {
     ::google::protobuf::internal::WireFormatLite::WriteMessage(
       2,
-      this->ranges(static_cast<int>(i)),
+      this->deprecated_ranges(static_cast<int>(i)),
+      output);
+  }
+
+  for (unsigned int i = 0,
+      n = static_cast<unsigned int>(this->range_infos_size()); i < n; i++) {
+    ::google::protobuf::internal::WireFormatLite::WriteMessage(
+      3,
+      this->range_infos(static_cast<int>(i)),
       output);
   }
 
@@ -27594,12 +27668,22 @@ size_t AdminScatterResponse::ByteSizeLong() const {
   total_size += (::google::protobuf::internal::GetProto3PreserveUnknownsDefault()   ? _internal_metadata_.unknown_fields()   : _internal_metadata_.default_instance()).size();
 
   {
-    unsigned int count = static_cast<unsigned int>(this->ranges_size());
+    unsigned int count = static_cast<unsigned int>(this->deprecated_ranges_size());
     total_size += 1UL * count;
     for (unsigned int i = 0; i < count; i++) {
       total_size +=
         ::google::protobuf::internal::WireFormatLite::MessageSize(
-          this->ranges(static_cast<int>(i)));
+          this->deprecated_ranges(static_cast<int>(i)));
+    }
+  }
+
+  {
+    unsigned int count = static_cast<unsigned int>(this->range_infos_size());
+    total_size += 1UL * count;
+    for (unsigned int i = 0; i < count; i++) {
+      total_size +=
+        ::google::protobuf::internal::WireFormatLite::MessageSize(
+          this->range_infos(static_cast<int>(i)));
     }
   }
 
@@ -27626,7 +27710,8 @@ void AdminScatterResponse::MergeFrom(const AdminScatterResponse& from) {
   ::google::protobuf::uint32 cached_has_bits = 0;
   (void) cached_has_bits;
 
-  ranges_.MergeFrom(from.ranges_);
+  deprecated_ranges_.MergeFrom(from.deprecated_ranges_);
+  range_infos_.MergeFrom(from.range_infos_);
   if (from.has_header()) {
     mutable_header()->::cockroach::roachpb::ResponseHeader::MergeFrom(from.header());
   }
@@ -27649,7 +27734,8 @@ void AdminScatterResponse::Swap(AdminScatterResponse* other) {
 }
 void AdminScatterResponse::InternalSwap(AdminScatterResponse* other) {
   using std::swap;
-  CastToBase(&ranges_)->InternalSwap(CastToBase(&other->ranges_));
+  CastToBase(&deprecated_ranges_)->InternalSwap(CastToBase(&other->deprecated_ranges_));
+  CastToBase(&range_infos_)->InternalSwap(CastToBase(&other->range_infos_));
   swap(header_, other->header_);
   _internal_metadata_.Swap(&other->_internal_metadata_);
 }
@@ -35611,6 +35697,7 @@ const int Header::kRangeIdFieldNumber;
 const int Header::kUserPriorityFieldNumber;
 const int Header::kTxnFieldNumber;
 const int Header::kReadConsistencyFieldNumber;
+const int Header::kWaitPolicyFieldNumber;
 const int Header::kMaxSpanRequestKeysFieldNumber;
 const int Header::kTargetBytesFieldNumber;
 const int Header::kDistinctSpansFieldNumber;
@@ -35653,15 +35740,15 @@ Header::Header(const Header& from)
     client_range_info_ = NULL;
   }
   ::memcpy(&range_id_, &from.range_id_,
-    static_cast<size_t>(reinterpret_cast<char*>(&can_forward_read_timestamp_) -
-    reinterpret_cast<char*>(&range_id_)) + sizeof(can_forward_read_timestamp_));
+    static_cast<size_t>(reinterpret_cast<char*>(&target_bytes_) -
+    reinterpret_cast<char*>(&range_id_)) + sizeof(target_bytes_));
   // @@protoc_insertion_point(copy_constructor:cockroach.roachpb.Header)
 }
 
 void Header::SharedCtor() {
   ::memset(&timestamp_, 0, static_cast<size_t>(
-      reinterpret_cast<char*>(&can_forward_read_timestamp_) -
-      reinterpret_cast<char*>(&timestamp_)) + sizeof(can_forward_read_timestamp_));
+      reinterpret_cast<char*>(&target_bytes_) -
+      reinterpret_cast<char*>(&timestamp_)) + sizeof(target_bytes_));
 }
 
 Header::~Header() {
@@ -35708,8 +35795,8 @@ void Header::Clear() {
   }
   client_range_info_ = NULL;
   ::memset(&range_id_, 0, static_cast<size_t>(
-      reinterpret_cast<char*>(&can_forward_read_timestamp_) -
-      reinterpret_cast<char*>(&range_id_)) + sizeof(can_forward_read_timestamp_));
+      reinterpret_cast<char*>(&target_bytes_) -
+      reinterpret_cast<char*>(&range_id_)) + sizeof(target_bytes_));
   _internal_metadata_.Clear();
 }
 
@@ -35913,6 +36000,21 @@ bool Header::MergePartialFromCodedStream(
         break;
       }
 
+      // .cockroach.kv.kvserver.concurrency.lock.WaitPolicy wait_policy = 18;
+      case 18: {
+        if (static_cast< ::google::protobuf::uint8>(tag) ==
+            static_cast< ::google::protobuf::uint8>(144u /* 144 & 0xFF */)) {
+          int value;
+          DO_((::google::protobuf::internal::WireFormatLite::ReadPrimitive<
+                   int, ::google::protobuf::internal::WireFormatLite::TYPE_ENUM>(
+                 input, &value)));
+          set_wait_policy(static_cast< ::cockroach::kv::kvserver::concurrency::lock::WaitPolicy >(value));
+        } else {
+          goto handle_unusual;
+        }
+        break;
+      }
+
       default: {
       handle_unusual:
         if (tag == 0) {
@@ -36009,6 +36111,12 @@ void Header::SerializeWithCachedSizes(
       17, this->_internal_client_range_info(), output);
   }
 
+  // .cockroach.kv.kvserver.concurrency.lock.WaitPolicy wait_policy = 18;
+  if (this->wait_policy() != 0) {
+    ::google::protobuf::internal::WireFormatLite::WriteEnum(
+      18, this->wait_policy(), output);
+  }
+
   output->WriteRaw((::google::protobuf::internal::GetProto3PreserveUnknownsDefault()   ? _internal_metadata_.unknown_fields()   : _internal_metadata_.default_instance()).data(),
                    static_cast<int>((::google::protobuf::internal::GetProto3PreserveUnknownsDefault()   ? _internal_metadata_.unknown_fields()   : _internal_metadata_.default_instance()).size()));
   // @@protoc_insertion_point(serialize_end:cockroach.roachpb.Header)
@@ -36075,13 +36183,6 @@ size_t Header::ByteSizeLong() const {
         this->gateway_node_id());
   }
 
-  // int64 target_bytes = 15;
-  if (this->target_bytes() != 0) {
-    total_size += 1 +
-      ::google::protobuf::internal::WireFormatLite::Int64Size(
-        this->target_bytes());
-  }
-
   // bool distinct_spans = 9;
   if (this->distinct_spans() != 0) {
     total_size += 1 + 1;
@@ -36100,6 +36201,19 @@ size_t Header::ByteSizeLong() const {
   // bool can_forward_read_timestamp = 16;
   if (this->can_forward_read_timestamp() != 0) {
     total_size += 2 + 1;
+  }
+
+  // .cockroach.kv.kvserver.concurrency.lock.WaitPolicy wait_policy = 18;
+  if (this->wait_policy() != 0) {
+    total_size += 2 +
+      ::google::protobuf::internal::WireFormatLite::EnumSize(this->wait_policy());
+  }
+
+  // int64 target_bytes = 15;
+  if (this->target_bytes() != 0) {
+    total_size += 1 +
+      ::google::protobuf::internal::WireFormatLite::Int64Size(
+        this->target_bytes());
   }
 
   int cached_size = ::google::protobuf::internal::ToCachedSize(total_size);
@@ -36146,9 +36260,6 @@ void Header::MergeFrom(const Header& from) {
   if (from.gateway_node_id() != 0) {
     set_gateway_node_id(from.gateway_node_id());
   }
-  if (from.target_bytes() != 0) {
-    set_target_bytes(from.target_bytes());
-  }
   if (from.distinct_spans() != 0) {
     set_distinct_spans(from.distinct_spans());
   }
@@ -36160,6 +36271,12 @@ void Header::MergeFrom(const Header& from) {
   }
   if (from.can_forward_read_timestamp() != 0) {
     set_can_forward_read_timestamp(from.can_forward_read_timestamp());
+  }
+  if (from.wait_policy() != 0) {
+    set_wait_policy(from.wait_policy());
+  }
+  if (from.target_bytes() != 0) {
+    set_target_bytes(from.target_bytes());
   }
 }
 
@@ -36189,11 +36306,12 @@ void Header::InternalSwap(Header* other) {
   swap(max_span_request_keys_, other->max_span_request_keys_);
   swap(read_consistency_, other->read_consistency_);
   swap(gateway_node_id_, other->gateway_node_id_);
-  swap(target_bytes_, other->target_bytes_);
   swap(distinct_spans_, other->distinct_spans_);
   swap(return_range_info_, other->return_range_info_);
   swap(async_consensus_, other->async_consensus_);
   swap(can_forward_read_timestamp_, other->can_forward_read_timestamp_);
+  swap(wait_policy_, other->wait_policy_);
+  swap(target_bytes_, other->target_bytes_);
   _internal_metadata_.Swap(&other->_internal_metadata_);
 }
 

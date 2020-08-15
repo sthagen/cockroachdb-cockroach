@@ -26,6 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -33,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -70,7 +71,7 @@ func (t tuple) String() string {
 	return sb.String()
 }
 
-func (t tuple) less(other tuple) bool {
+func (t tuple) less(other tuple, evalCtx *tree.EvalContext) bool {
 	for i := range t {
 		// If either side is nil, we short circuit the comparison. For nil, we
 		// define: nil < {any_none_nil}
@@ -80,6 +81,15 @@ func (t tuple) less(other tuple) bool {
 			return true
 		} else if t[i] != nil && other[i] == nil {
 			return false
+		}
+		// Check whether we have datum-backed values.
+		if d1, ok := t[i].(tree.Datum); ok {
+			d2 := other[i].(tree.Datum)
+			cmp := d1.Compare(evalCtx, d2)
+			if cmp == 0 {
+				continue
+			}
+			return cmp < 0
 		}
 
 		lhsVal := reflect.ValueOf(t[i])
@@ -96,20 +106,6 @@ func (t tuple) less(other tuple) bool {
 				return true
 			} else {
 				return false
-			}
-		}
-
-		// Since the expected values are provided as strings, we convert the json
-		// values here to strings so we can use the string lexical ordering. This is
-		// because json orders certain values differently (e.g. null) compared to
-		// string.
-		if strings.Contains(lhsVal.Type().String(), "json") {
-			lhsStr := lhsVal.Interface().(fmt.Stringer).String()
-			rhsStr := rhsVal.Interface().(fmt.Stringer).String()
-			if lhsStr == rhsStr {
-				continue
-			} else {
-				return lhsStr < rhsStr
 			}
 		}
 
@@ -183,7 +179,7 @@ func (t tuples) String() string {
 }
 
 // sort returns a copy of sorted tuples.
-func (t tuples) sort() tuples {
+func (t tuples) sort(evalCtx *tree.EvalContext) tuples {
 	b := make(tuples, len(t))
 	for i := range b {
 		b[i] = make(tuple, len(t[i]))
@@ -192,7 +188,7 @@ func (t tuples) sort() tuples {
 	sort.SliceStable(b, func(i, j int) bool {
 		lhs := b[i]
 		rhs := b[j]
-		return lhs.less(rhs)
+		return lhs.less(rhs, evalCtx)
 	})
 	return b
 }
@@ -208,8 +204,6 @@ const (
 	unorderedVerifier
 )
 
-type verifierFn func(output *opTestOutput) error
-
 // maybeHasNulls is a helper function that returns whether any of the columns in b
 // (maybe) have nulls.
 func maybeHasNulls(b coldata.Batch) bool {
@@ -224,14 +218,7 @@ func maybeHasNulls(b coldata.Batch) bool {
 	return false
 }
 
-type testRunner func(*testing.T, []tuples, [][]*types.T, tuples, interface{}, func([]colexecbase.Operator) (colexecbase.Operator, error))
-
-// variableOutputBatchSizeInitializer is implemented by operators that can be
-// initialized with variable output size batches. This allows runTests to
-// increase test coverage of these operators.
-type variableOutputBatchSizeInitializer interface {
-	initWithOutputBatchSize(int)
-}
+type testRunner func(*testing.T, []tuples, [][]*types.T, tuples, verifierType, func([]colexecbase.Operator) (colexecbase.Operator, error))
 
 // runTests is a helper that automatically runs your tests with varied batch
 // sizes and with and without a random selection vector.
@@ -243,7 +230,7 @@ func runTests(
 	t *testing.T,
 	tups []tuples,
 	expected tuples,
-	verifier interface{},
+	verifier verifierType,
 	constructor func(inputs []colexecbase.Operator) (colexecbase.Operator, error),
 ) {
 	runTestsWithTyps(t, tups, nil /* typs */, expected, verifier, constructor)
@@ -259,12 +246,16 @@ func runTestsWithTyps(
 	tups []tuples,
 	typs [][]*types.T,
 	expected tuples,
-	verifier interface{},
+	verifier verifierType,
 	constructor func(inputs []colexecbase.Operator) (colexecbase.Operator, error),
 ) {
 	runTestsWithoutAllNullsInjection(t, tups, typs, expected, verifier, constructor)
 
-	t.Run("allNullsInjection", func(t *testing.T) {
+	{
+		ctx := context.Background()
+		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+		defer evalCtx.Stop(ctx)
+		log.Info(ctx, "allNullsInjection")
 		// This test replaces all values in the input tuples with nulls and ensures
 		// that the output is different from the "original" output (i.e. from the
 		// one that is returned without nulls injection).
@@ -298,7 +289,6 @@ func runTestsWithTyps(
 			op.Init()
 			return op
 		}
-		ctx := context.Background()
 		originalOp := opConstructor(false /* injectAllNulls */)
 		opWithNulls := opConstructor(true /* injectAllNulls */)
 		foundDifference := false
@@ -318,7 +308,7 @@ func runTestsWithTyps(
 				originalTuples = append(originalTuples, getTupleFromBatch(originalBatch, i))
 				tuplesWithNulls = append(tuplesWithNulls, getTupleFromBatch(batchWithNulls, i))
 			}
-			if err := assertTuplesSetsEqual(originalTuples, tuplesWithNulls); err != nil {
+			if err := assertTuplesSetsEqual(originalTuples, tuplesWithNulls, evalCtx); err != nil {
 				// err is non-nil which means that the batches are different.
 				foundDifference = true
 				break
@@ -339,7 +329,7 @@ func runTestsWithTyps(
 		if c, ok := opWithNulls.(Closer); ok {
 			require.NoError(t, c.Close(ctx))
 		}
-	})
+	}
 }
 
 // runTestsWithoutAllNullsInjection is the same as runTests, but it skips the
@@ -352,27 +342,18 @@ func runTestsWithoutAllNullsInjection(
 	tups []tuples,
 	typs [][]*types.T,
 	expected tuples,
-	verifier interface{},
+	verifier verifierType,
 	constructor func(inputs []colexecbase.Operator) (colexecbase.Operator, error),
 ) {
+	ctx := context.Background()
+	verifyFn := (*opTestOutput).VerifyAnyOrder
 	skipVerifySelAndNullsResets := true
-	var verifyFn verifierFn
-	switch v := verifier.(type) {
-	case verifierType:
-		switch v {
-		case orderedVerifier:
-			verifyFn = (*opTestOutput).Verify
-			// Note that this test makes sense only if we expect tuples to be
-			// returned in the same order (otherwise the second batch's selection
-			// vector or nulls info can be different and that is totally valid).
-			skipVerifySelAndNullsResets = false
-		case unorderedVerifier:
-			verifyFn = (*opTestOutput).VerifyAnyOrder
-		default:
-			colexecerror.InternalError(fmt.Sprintf("unexpected verifierType %d", v))
-		}
-	case verifierFn:
-		verifyFn = v
+	if verifier == orderedVerifier {
+		verifyFn = (*opTestOutput).Verify
+		// Note that this test makes sense only if we expect tuples to be
+		// returned in the same order (otherwise the second batch's selection
+		// vector or nulls info can be different and that is totally valid).
+		skipVerifySelAndNullsResets = false
 	}
 	runTestsWithFn(t, tups, typs, func(t *testing.T, inputs []colexecbase.Operator) {
 		op, err := constructor(inputs)
@@ -386,90 +367,83 @@ func runTestsWithoutAllNullsInjection(
 	})
 
 	if !skipVerifySelAndNullsResets {
-		t.Run("verifySelAndNullResets", func(t *testing.T) {
-			// This test ensures that operators that "own their own batches", such as
-			// any operator that has to reshape its output, are not affected by
-			// downstream modification of batches.
-			// We run the main loop twice: once to determine what the operator would
-			// output on its second Next call (we need the first call to Next to get a
-			// reference to a batch to modify), and a second time to modify the batch
-			// and verify that this does not change the operator output.
-			// NOTE: this test makes sense only if the operator returns two non-zero
-			// length batches (if not, we short-circuit the test since the operator
-			// doesn't have to restore anything on a zero-length batch).
-			var (
-				secondBatchHasSelection, secondBatchHasNulls bool
-				inputTypes                                   []*types.T
-			)
-			for round := 0; round < 2; round++ {
-				inputSources := make([]colexecbase.Operator, len(tups))
-				for i, tup := range tups {
-					if typs != nil {
-						inputTypes = typs[i]
-					}
-					inputSources[i] = newOpTestInput(1 /* batchSize */, tup, inputTypes)
+		log.Info(ctx, "verifySelAndNullResets")
+		// This test ensures that operators that "own their own batches", such as
+		// any operator that has to reshape its output, are not affected by
+		// downstream modification of batches.
+		// We run the main loop twice: once to determine what the operator would
+		// output on its second Next call (we need the first call to Next to get a
+		// reference to a batch to modify), and a second time to modify the batch
+		// and verify that this does not change the operator output.
+		// NOTE: this test makes sense only if the operator returns two non-zero
+		// length batches (if not, we short-circuit the test since the operator
+		// doesn't have to restore anything on a zero-length batch).
+		var (
+			secondBatchHasSelection, secondBatchHasNulls bool
+			inputTypes                                   []*types.T
+		)
+		for round := 0; round < 2; round++ {
+			inputSources := make([]colexecbase.Operator, len(tups))
+			for i, tup := range tups {
+				if typs != nil {
+					inputTypes = typs[i]
 				}
-				op, err := constructor(inputSources)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if vbsiOp, ok := op.(variableOutputBatchSizeInitializer); ok {
-					// initialize the operator with a very small output batch size to
-					// increase the likelihood that multiple batches will be output.
-					vbsiOp.initWithOutputBatchSize(1)
+				inputSources[i] = newOpTestInput(1 /* batchSize */, tup, inputTypes)
+			}
+			op, err := constructor(inputSources)
+			if err != nil {
+				t.Fatal(err)
+			}
+			op.Init()
+			b := op.Next(ctx)
+			if b.Length() == 0 {
+				return
+			}
+			if round == 1 {
+				if secondBatchHasSelection {
+					b.SetSelection(false)
 				} else {
-					op.Init()
+					b.SetSelection(true)
 				}
-				ctx := context.Background()
-				b := op.Next(ctx)
-				if b.Length() == 0 {
-					return
-				}
-				if round == 1 {
-					if secondBatchHasSelection {
-						b.SetSelection(false)
-					} else {
-						b.SetSelection(true)
+				if secondBatchHasNulls {
+					// ResetInternalBatch will throw away the null information.
+					b.ResetInternalBatch()
+				} else {
+					for i := 0; i < b.Width(); i++ {
+						b.ColVec(i).Nulls().SetNulls()
 					}
-					if secondBatchHasNulls {
-						// ResetInternalBatch will throw away the null information.
-						b.ResetInternalBatch()
-					} else {
-						for i := 0; i < b.Width(); i++ {
-							b.ColVec(i).Nulls().SetNulls()
-						}
-					}
-				}
-				b = op.Next(ctx)
-				if b.Length() == 0 {
-					return
-				}
-				if round == 0 {
-					secondBatchHasSelection = b.Selection() != nil
-					secondBatchHasNulls = maybeHasNulls(b)
-				}
-				if round == 1 {
-					if secondBatchHasSelection {
-						assert.NotNil(t, b.Selection())
-					} else {
-						assert.Nil(t, b.Selection())
-					}
-					if secondBatchHasNulls {
-						assert.True(t, maybeHasNulls(b))
-					} else {
-						assert.False(t, maybeHasNulls(b))
-					}
-				}
-				if c, ok := op.(Closer); ok {
-					// Some operators need an explicit Close if not drained completely of
-					// input.
-					assert.NoError(t, c.Close(ctx))
 				}
 			}
-		})
+			b = op.Next(ctx)
+			if b.Length() == 0 {
+				return
+			}
+			if round == 0 {
+				secondBatchHasSelection = b.Selection() != nil
+				secondBatchHasNulls = maybeHasNulls(b)
+			}
+			if round == 1 {
+				if secondBatchHasSelection {
+					assert.NotNil(t, b.Selection())
+				} else {
+					assert.Nil(t, b.Selection())
+				}
+				if secondBatchHasNulls {
+					assert.True(t, maybeHasNulls(b))
+				} else {
+					assert.False(t, maybeHasNulls(b))
+				}
+			}
+			if c, ok := op.(Closer); ok {
+				// Some operators need an explicit Close if not drained completely of
+				// input.
+				assert.NoError(t, c.Close(ctx))
+			}
+		}
 	}
 
-	t.Run("randomNullsInjection", func(t *testing.T) {
+	{
+		log.Info(ctx, "randomNullsInjection")
 		// This test randomly injects nulls in the input tuples and ensures that
 		// the operator doesn't panic.
 		inputSources := make([]colexecbase.Operator, len(tups))
@@ -487,10 +461,9 @@ func runTestsWithoutAllNullsInjection(
 			t.Fatal(err)
 		}
 		op.Init()
-		ctx := context.Background()
 		for b := op.Next(ctx); b.Length() > 0; b = op.Next(ctx) {
 		}
-	})
+	}
 }
 
 // runTestsWithFn is like runTests, but the input function is responsible for
@@ -525,27 +498,26 @@ func runTestsWithFn(
 
 	for _, batchSize := range batchSizes {
 		for _, useSel := range []bool{false, true} {
-			t.Run(fmt.Sprintf("batchSize=%d/sel=%t", batchSize, useSel), func(t *testing.T) {
-				inputSources := make([]colexecbase.Operator, len(tups))
-				var inputTypes []*types.T
-				if useSel {
-					for i, tup := range tups {
-						if typs != nil {
-							inputTypes = typs[i]
-						}
-						rng, _ := randutil.NewPseudoRand()
-						inputSources[i] = newOpTestSelInput(rng, batchSize, tup, inputTypes)
+			log.Infof(context.Background(), "batchSize=%d/sel=%t", batchSize, useSel)
+			inputSources := make([]colexecbase.Operator, len(tups))
+			var inputTypes []*types.T
+			if useSel {
+				for i, tup := range tups {
+					if typs != nil {
+						inputTypes = typs[i]
 					}
-				} else {
-					for i, tup := range tups {
-						if typs != nil {
-							inputTypes = typs[i]
-						}
-						inputSources[i] = newOpTestInput(batchSize, tup, inputTypes)
-					}
+					rng, _ := randutil.NewPseudoRand()
+					inputSources[i] = newOpTestSelInput(rng, batchSize, tup, inputTypes)
 				}
-				test(t, inputSources)
-			})
+			} else {
+				for i, tup := range tups {
+					if typs != nil {
+						inputTypes = typs[i]
+					}
+					inputSources[i] = newOpTestInput(batchSize, tup, inputTypes)
+				}
+			}
+			test(t, inputSources)
 		}
 	}
 }
@@ -562,19 +534,35 @@ func runTestsWithFixedSel(
 	test func(t *testing.T, inputs []colexecbase.Operator),
 ) {
 	for _, batchSize := range []int{1, 2, 3, 16, 1024} {
-		t.Run(fmt.Sprintf("batchSize=%d/fixedSel", batchSize), func(t *testing.T) {
-			inputSources := make([]colexecbase.Operator, len(tups))
-			for i, tup := range tups {
-				inputSources[i] = newOpFixedSelTestInput(sel, batchSize, tup, typs)
-			}
-			test(t, inputSources)
-		})
+		log.Infof(context.Background(), "batchSize=%d/fixedSel", batchSize)
+		inputSources := make([]colexecbase.Operator, len(tups))
+		for i, tup := range tups {
+			inputSources[i] = newOpFixedSelTestInput(sel, batchSize, tup, typs)
+		}
+		test(t, inputSources)
 	}
+}
+
+func stringToDatum(val string, typ *types.T, evalCtx *tree.EvalContext) tree.Datum {
+	expr, err := parser.ParseExpr(val)
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
+	semaCtx := tree.MakeSemaContext()
+	typedExpr, err := tree.TypeCheck(context.Background(), expr, &semaCtx, typ)
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
+	d, err := typedExpr.Eval(evalCtx)
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
+	return d
 }
 
 // setColVal is a test helper function to set the given value at the equivalent
 // col[idx]. This function is slow due to reflection.
-func setColVal(vec coldata.Vec, idx int, val interface{}) {
+func setColVal(vec coldata.Vec, idx int, val interface{}, evalCtx *tree.EvalContext) {
 	canonicalTypeFamily := vec.CanonicalTypeFamily()
 	if canonicalTypeFamily == types.BytesFamily {
 		var (
@@ -607,22 +595,14 @@ func setColVal(vec coldata.Vec, idx int, val interface{}) {
 		switch v := val.(type) {
 		case *coldataext.Datum:
 			vec.Datum().Set(idx, v)
+		case tree.Datum:
+			vec.Datum().Set(idx, v)
+		case string:
+			vec.Datum().Set(idx, stringToDatum(v, vec.Type(), evalCtx))
+		case json.JSON:
+			vec.Datum().Set(idx, &tree.DJSON{JSON: v})
 		default:
-			switch vec.Type().Family() {
-			case types.JsonFamily:
-				if jsonStr, ok := val.(string); ok {
-					jobj, err := json.ParseJSON(jsonStr)
-					if err != nil {
-						colexecerror.InternalError(
-							fmt.Sprintf("unable to parse json object: %v: %v", jobj, err))
-					}
-					vec.Datum().Set(idx, &tree.DJSON{JSON: jobj})
-				} else if jobj, ok := val.(json.JSON); ok {
-					vec.Datum().Set(idx, &tree.DJSON{JSON: jobj})
-				}
-			default:
-				colexecerror.InternalError(fmt.Sprintf("unexpected datum-backed type: %s", vec.Type()))
-			}
+			colexecerror.InternalError(fmt.Sprintf("unexpected type %T of datum-backed value: %v", v, v))
 		}
 	} else {
 		reflect.ValueOf(vec.Col()).Index(idx).Set(reflect.ValueOf(val).Convert(reflect.TypeOf(vec.Col()).Elem()))
@@ -672,6 +652,7 @@ type opTestInput struct {
 	useSel    bool
 	rng       *rand.Rand
 	selection []int
+	evalCtx   *tree.EvalContext
 
 	// injectAllNulls determines whether opTestInput will replace all values in
 	// the input tuples with nulls.
@@ -692,6 +673,7 @@ func newOpTestInput(batchSize int, tuples tuples, typs []*types.T) *opTestInput 
 		batchSize: batchSize,
 		tuples:    tuples,
 		typs:      typs,
+		evalCtx:   tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 	return ret
 }
@@ -703,6 +685,7 @@ func newOpTestSelInput(rng *rand.Rand, batchSize int, tuples tuples, typs []*typ
 		batchSize: batchSize,
 		tuples:    tuples,
 		typs:      typs,
+		evalCtx:   tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 	return ret
 }
@@ -714,7 +697,7 @@ func (s *opTestInput) Init() {
 		}
 		s.typs = extrapolateTypesFromTuples(s.tuples)
 	}
-	s.batch = testAllocator.NewMemBatch(s.typs)
+	s.batch = testAllocator.NewMemBatchWithMaxCapacity(s.typs)
 
 	s.selection = make([]int, coldata.BatchSize())
 	for i := range s.selection {
@@ -815,29 +798,31 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 					case types.BytesFamily:
 						newBytes := make([]byte, rng.Intn(16)+1)
 						rng.Read(newBytes)
-						setColVal(vec, outputIdx, newBytes)
+						setColVal(vec, outputIdx, newBytes, s.evalCtx)
 					case types.IntervalFamily:
-						setColVal(vec, outputIdx, duration.MakeDuration(rng.Int63(), rng.Int63(), rng.Int63()))
+						setColVal(vec, outputIdx, duration.MakeDuration(rng.Int63(), rng.Int63(), rng.Int63()), s.evalCtx)
 					case typeconv.DatumVecCanonicalTypeFamily:
 						switch vec.Type().Family() {
 						case types.JsonFamily:
 							newBytes := make([]byte, rng.Intn(16)+1)
 							rng.Read(newBytes)
 							j := json.FromString(string(newBytes))
-							setColVal(vec, outputIdx, j)
+							setColVal(vec, outputIdx, j, s.evalCtx)
+						case types.TupleFamily:
+							setColVal(vec, outputIdx, stringToDatum("(NULL)", vec.Type(), s.evalCtx), s.evalCtx)
 						default:
 							colexecerror.InternalError(fmt.Sprintf("unexpected datum-backed type: %s", vec.Type()))
 						}
 					default:
 						if val, ok := quick.Value(reflect.TypeOf(vec.Col()).Elem(), rng); ok {
-							setColVal(vec, outputIdx, val.Interface())
+							setColVal(vec, outputIdx, val.Interface(), s.evalCtx)
 						} else {
 							colexecerror.InternalError(fmt.Sprintf("could not generate a random value of type %s", vec.Type()))
 						}
 					}
 				}
 			} else {
-				setColVal(vec, outputIdx, tups[j][i])
+				setColVal(vec, outputIdx, tups[j][i], s.evalCtx)
 			}
 		}
 	}
@@ -855,6 +840,7 @@ type opFixedSelTestInput struct {
 	tuples    tuples
 	batch     coldata.Batch
 	sel       []int
+	evalCtx   *tree.EvalContext
 	// idx is the index of the tuple to be emitted next. We need to maintain it
 	// in case the provided selection vector or provided tuples (if sel is nil)
 	// is longer than requested batch size.
@@ -874,6 +860,7 @@ func newOpFixedSelTestInput(
 		sel:       sel,
 		tuples:    tuples,
 		typs:      typs,
+		evalCtx:   tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 	return ret
 }
@@ -886,7 +873,7 @@ func (s *opFixedSelTestInput) Init() {
 		s.typs = extrapolateTypesFromTuples(s.tuples)
 	}
 
-	s.batch = testAllocator.NewMemBatch(s.typs)
+	s.batch = testAllocator.NewMemBatchWithMaxCapacity(s.typs)
 	tupleLen := len(s.tuples[0])
 	for _, i := range s.sel {
 		if len(s.tuples[i]) != tupleLen {
@@ -913,7 +900,7 @@ func (s *opFixedSelTestInput) Init() {
 				if s.tuples[j][i] == nil {
 					vec.Nulls().SetNull(j)
 				} else {
-					setColVal(vec, j, s.tuples[j][i])
+					setColVal(vec, j, s.tuples[j][i], s.evalCtx)
 				}
 			}
 		}
@@ -939,7 +926,7 @@ func (s *opFixedSelTestInput) Next(context.Context) coldata.Batch {
 				} else {
 					// Automatically convert the Go values into exec.Type slice elements using
 					// reflection. This is slow, but acceptable for tests.
-					setColVal(vec, j, s.tuples[s.idx+j][i])
+					setColVal(vec, j, s.tuples[s.idx+j][i], s.evalCtx)
 				}
 			}
 		}
@@ -965,6 +952,7 @@ func (s *opFixedSelTestInput) Next(context.Context) coldata.Batch {
 type opTestOutput struct {
 	OneInputNode
 	expected tuples
+	evalCtx  *tree.EvalContext
 
 	curIdx int
 	batch  coldata.Batch
@@ -978,6 +966,7 @@ func newOpTestOutput(input colexecbase.Operator, expected tuples) *opTestOutput 
 	return &opTestOutput{
 		OneInputNode: NewOneInputNode(input),
 		expected:     expected,
+		evalCtx:      tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 }
 
@@ -1003,19 +992,7 @@ func getTupleFromBatch(batch coldata.Batch, tupleIdx int) tuple {
 				newDec.Set(&colDec[tupleIdx])
 				val = reflect.ValueOf(newDec)
 			} else if vec.CanonicalTypeFamily() == typeconv.DatumVecCanonicalTypeFamily {
-				d := vec.Datum().Get(tupleIdx).(*coldataext.Datum)
-				if d.Datum == tree.DNull {
-					val = reflect.ValueOf(tree.DNull)
-				} else {
-					switch vec.Type().Family() {
-					case types.CollatedStringFamily:
-						val = reflect.ValueOf(d)
-					case types.JsonFamily:
-						val = reflect.ValueOf(d.Datum.(*tree.DJSON).JSON)
-					default:
-						colexecerror.InternalError(fmt.Sprintf("unexpected datum-backed type: %s", vec.Type()))
-					}
-				}
+				val = reflect.ValueOf(vec.Datum().Get(tupleIdx).(*coldataext.Datum).Datum)
 			} else {
 				val = reflect.ValueOf(vec.Col()).Index(tupleIdx)
 			}
@@ -1053,7 +1030,7 @@ func (r *opTestOutput) Verify() error {
 		}
 		actual = append(actual, tup)
 	}
-	return assertTuplesOrderedEqual(r.expected, actual)
+	return assertTuplesOrderedEqual(r.expected, actual, r.evalCtx)
 }
 
 // VerifyAnyOrder ensures that the input to this opTestOutput produced the same
@@ -1071,13 +1048,13 @@ func (r *opTestOutput) VerifyAnyOrder() error {
 		}
 		actual = append(actual, tup)
 	}
-	return assertTuplesSetsEqual(r.expected, actual)
+	return assertTuplesSetsEqual(r.expected, actual, r.evalCtx)
 }
 
 // tupleEquals checks that two tuples are equal, using a slow,
 // reflection-based method to do the comparison. Reflection is used so that
 // values can be compared in a type-agnostic way.
-func tupleEquals(expected tuple, actual tuple) bool {
+func tupleEquals(expected tuple, actual tuple, evalCtx *tree.EvalContext) bool {
 	if len(expected) != len(actual) {
 		return false
 	}
@@ -1097,6 +1074,7 @@ func tupleEquals(expected tuple, actual tuple) bool {
 					}
 				}
 			}
+			// Special case for decimals.
 			if d1, ok := actual[i].(apd.Decimal); ok {
 				if f2, ok := expected[i].(float64); ok {
 					d2, _, err := apd.NewFromString(fmt.Sprintf("%f", f2))
@@ -1107,22 +1085,28 @@ func tupleEquals(expected tuple, actual tuple) bool {
 					}
 				}
 			}
-			if j1, ok := actual[i].(json.JSON); ok {
-				if j2, ok := expected[i].(json.JSON); ok {
-					if cmp, err := j1.Compare(j2); err == nil && cmp == 0 {
-						continue
-					}
-				} else if str2, ok := expected[i].(string); ok {
-					j2, err := json.ParseJSON(str2)
-					if err != nil {
-						return false
-					}
-					if cmp, err := j1.Compare(j2); err == nil && cmp == 0 {
-						continue
-					}
+			// Special case for datum-backed types.
+			if d1, ok := actual[i].(tree.Datum); ok {
+				if d, ok := d1.(*coldataext.Datum); ok {
+					d1 = d.Datum
+				}
+				var d2 tree.Datum
+				switch d := expected[i].(type) {
+				case *coldataext.Datum:
+					d2 = d.Datum
+				case tree.Datum:
+					d2 = d
+				case string:
+					d2 = stringToDatum(d, d1.ResolvedType(), evalCtx)
+				default:
+					return false
+				}
+				if d1.Compare(evalCtx, d2) == 0 {
+					continue
 				}
 				return false
 			}
+			// Default case.
 			if !reflect.DeepEqual(
 				reflect.ValueOf(actual[i]).Convert(reflect.TypeOf(expected[i])).Interface(),
 				expected[i],
@@ -1159,23 +1143,23 @@ func makeError(expected tuples, actual tuples) error {
 }
 
 // assertTuplesSetsEqual asserts that two sets of tuples are equal.
-func assertTuplesSetsEqual(expected tuples, actual tuples) error {
+func assertTuplesSetsEqual(expected tuples, actual tuples, evalCtx *tree.EvalContext) error {
 	if len(expected) != len(actual) {
 		return makeError(expected, actual)
 	}
-	actual = actual.sort()
-	expected = expected.sort()
-	return assertTuplesOrderedEqual(expected, actual)
+	actual = actual.sort(evalCtx)
+	expected = expected.sort(evalCtx)
+	return assertTuplesOrderedEqual(expected, actual, evalCtx)
 }
 
 // assertTuplesOrderedEqual asserts that two permutations of tuples are equal
 // in order.
-func assertTuplesOrderedEqual(expected tuples, actual tuples) error {
+func assertTuplesOrderedEqual(expected tuples, actual tuples, evalCtx *tree.EvalContext) error {
 	if len(expected) != len(actual) {
 		return errors.Errorf("expected %+v, actual %+v", expected, actual)
 	}
 	for i := range expected {
-		if !tupleEquals(expected[i], actual[i]) {
+		if !tupleEquals(expected[i], actual[i], evalCtx) {
 			return makeError(expected, actual)
 		}
 	}
@@ -1308,7 +1292,7 @@ func TestRepeatableBatchSource(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	typs := []*types.T{types.Int}
-	batch := testAllocator.NewMemBatch(typs)
+	batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	batchLen := 10
 	if coldata.BatchSize() < batchLen {
 		batchLen = coldata.BatchSize()
@@ -1333,7 +1317,7 @@ func TestRepeatableBatchSourceWithFixedSel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	typs := []*types.T{types.Int}
-	batch := testAllocator.NewMemBatch(typs)
+	batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	rng, _ := randutil.NewPseudoRand()
 	batchSize := 10
 	if batchSize > coldata.BatchSize() {
@@ -1395,7 +1379,7 @@ type chunkingBatchSource struct {
 	batch  coldata.Batch
 }
 
-var _ colexecbase.Operator = &chunkingBatchSource{}
+var _ ResettableOperator = &chunkingBatchSource{}
 
 // newChunkingBatchSource returns a new chunkingBatchSource with the given
 // column types, columns, and length.
@@ -1408,7 +1392,7 @@ func newChunkingBatchSource(typs []*types.T, cols []coldata.Vec, len int) *chunk
 }
 
 func (c *chunkingBatchSource) Init() {
-	c.batch = testAllocator.NewMemBatch(c.typs)
+	c.batch = testAllocator.NewMemBatchWithMaxCapacity(c.typs)
 	for i := range c.cols {
 		c.batch.ColVec(i).SetCol(c.cols[i].Col())
 		c.batch.ColVec(i).SetNulls(c.cols[i].Nulls())
@@ -1438,7 +1422,7 @@ func (c *chunkingBatchSource) Next(context.Context) coldata.Batch {
 	return c.batch
 }
 
-func (c *chunkingBatchSource) reset() {
+func (c *chunkingBatchSource) reset(context.Context) {
 	c.curIdx = 0
 }
 
@@ -1447,7 +1431,7 @@ func (c *chunkingBatchSource) reset() {
 // called.
 type joinTestCase struct {
 	description           string
-	joinType              sqlbase.JoinType
+	joinType              descpb.JoinType
 	leftTuples            tuples
 	leftTypes             []*types.T
 	leftOutCols           []uint32
@@ -1461,16 +1445,11 @@ type joinTestCase struct {
 	leftEqColsAreKey      bool
 	rightEqColsAreKey     bool
 	expected              tuples
-	outputBatchSize       int
 	skipAllNullsInjection bool
 	onExpr                execinfrapb.Expression
 }
 
 func (tc *joinTestCase) init() {
-	if tc.outputBatchSize == 0 {
-		tc.outputBatchSize = coldata.BatchSize()
-	}
-
 	if len(tc.leftDirections) == 0 {
 		tc.leftDirections = make([]execinfrapb.Ordering_Column_Direction, len(tc.leftTypes))
 		for i := range tc.leftDirections {

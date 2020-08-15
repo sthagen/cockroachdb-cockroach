@@ -333,9 +333,11 @@ func registerTPCC(r *testRegistry) {
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			duration := 30 * time.Minute
 			runTPCC(ctx, t, c, tpccOptions{
-				Warehouses:   100,
-				Duration:     duration,
-				ExtraRunArgs: "--wait=false --tolerate-errors",
+				Warehouses: 100,
+				Duration:   duration,
+				// For chaos tests, we don't want to use the default method because it
+				// involves preparing statements on all connections (see #51785).
+				ExtraRunArgs: "--method=simple --wait=false --tolerate-errors",
 				Chaos: func() Chaos {
 					return Chaos{
 						Timer: Periodic{
@@ -695,9 +697,15 @@ func loadTPCCBench(
 	// Split and scatter the tables. Ramp up to the expected load in the desired
 	// distribution. This should allow for load-based rebalancing to help
 	// distribute load. Optionally pass some load configuration-specific flags.
+	method := ""
+	if b.Chaos {
+		// For chaos tests, we don't want to use the default method because it
+		// involves preparing statements on all connections (see #51785).
+		method = "--method=simple"
+	}
 	cmd = fmt.Sprintf("./workload run tpcc --warehouses=%d --workers=%d --max-rate=%d "+
-		"--wait=false --duration=%s --scatter --tolerate-errors {pgurl%s}",
-		b.LoadWarehouses, b.LoadWarehouses, b.LoadWarehouses/2, rebalanceWait, roachNodes)
+		"--wait=false --duration=%s --scatter --tolerate-errors %s {pgurl%s}",
+		b.LoadWarehouses, b.LoadWarehouses, b.LoadWarehouses/2, rebalanceWait, method, roachNodes)
 	if out, err := c.RunWithBuffer(ctx, c.l, loadNode, cmd); err != nil {
 		return errors.Wrapf(err, "failed with output %q", string(out))
 	}
@@ -788,7 +796,10 @@ func runTPCCBench(ctx context.Context, t *test, c *cluster, b tpccBenchSpec) {
 	}
 	defer func() { _ = os.RemoveAll(resultsDir) }()
 	s := search.NewLineSearcher(1, b.LoadWarehouses, b.EstimatedMax, initStepSize, precision)
+	iteration := 0
 	if res, err := s.Search(func(warehouses int) (bool, error) {
+		iteration++
+		t.l.Printf("initializing cluster for %d warehouses (search attempt: %d)", warehouses, iteration)
 		m := newMonitor(ctx, c, roachNodes)
 		// Restart the cluster before each iteration to help eliminate
 		// inter-trial interactions.
@@ -849,7 +860,11 @@ func runTPCCBench(ctx context.Context, t *test, c *cluster, b tpccBenchSpec) {
 				default:
 					panic("unexpected")
 				}
-
+				if b.Chaos {
+					// For chaos tests, we don't want to use the default method because it
+					// involves preparing statements on all connections (see #51785).
+					extraFlags += " --method=simple"
+				}
 				t.Status(fmt.Sprintf("running benchmark, warehouses=%d", warehouses))
 				histogramsPath := fmt.Sprintf("%s/warehouses=%d/stats.json", perfArtifactsDir, activeWarehouses)
 				cmd := fmt.Sprintf("./workload run tpcc --warehouses=%d --active-warehouses=%d "+
@@ -890,11 +905,11 @@ func runTPCCBench(ctx context.Context, t *test, c *cluster, b tpccBenchSpec) {
 		// Print the result.
 		if failErr == nil {
 			ttycolor.Stdout(ttycolor.Green)
-			t.l.Printf("--- PASS: tpcc %d resulted in %.1f tpmC (%.1f%% of max tpmC)\n\n",
+			t.l.Printf("--- SEARCH ITER PASS: TPCC %d resulted in %.1f tpmC (%.1f%% of max tpmC)\n\n",
 				warehouses, res.TpmC(), res.Efficiency())
 		} else {
 			ttycolor.Stdout(ttycolor.Red)
-			t.l.Printf("--- FAIL: tpcc %d resulted in %.1f tpmC and failed due to %v",
+			t.l.Printf("--- SEARCH ITER FAIL: TPCC %d resulted in %.1f tpmC and failed due to %v",
 				warehouses, res.TpmC(), failErr)
 		}
 		ttycolor.Stdout(ttycolor.Reset)

@@ -217,7 +217,7 @@ func NewProcessor(
 		}
 		switch core.Backfiller.Type {
 		case execinfrapb.BackfillerSpec_Index:
-			return newIndexBackfiller(flowCtx, processorID, *core.Backfiller, post, outputs[0])
+			return newIndexBackfiller(ctx, flowCtx, processorID, *core.Backfiller, post, outputs[0])
 		case execinfrapb.BackfillerSpec_Column:
 			return newColumnBackfiller(ctx, flowCtx, processorID, *core.Backfiller, post, outputs[0])
 		}
@@ -253,7 +253,7 @@ func NewProcessor(
 		return NewBackupDataProcessor(flowCtx, processorID, *core.BackupData, outputs[0])
 	}
 	if core.SplitAndScatter != nil {
-		if err := checkNumInOut(inputs, outputs, 1, 1); err != nil {
+		if err := checkNumInOut(inputs, outputs, 0, 1); err != nil {
 			return nil, err
 		}
 		if NewSplitAndScatterProcessor == nil {
@@ -320,7 +320,7 @@ func NewProcessor(
 			return nil, err
 		}
 		processor := localProcessors[*core.LocalPlanNode.RowSourceIdx]
-		if err := processor.InitWithOutput(post, outputs[0]); err != nil {
+		if err := processor.InitWithOutput(flowCtx, post, outputs[0]); err != nil {
 			return nil, err
 		}
 		if numInputs == 1 {

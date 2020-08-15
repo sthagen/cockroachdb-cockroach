@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -55,9 +56,8 @@ func (n *createSequenceNode) ReadingOwnWrites() {}
 
 func (n *createSequenceNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("sequence"))
-	isTemporary := n.n.Temporary
 
-	_, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), isTemporary, &n.n.Name)
+	_, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), n.n.Persistence, &n.n.Name)
 	if err != nil {
 		if sqlbase.IsRelationAlreadyExistsError(err) && n.n.IfNotExists {
 			return nil
@@ -66,7 +66,7 @@ func (n *createSequenceNode) startExec(params runParams) error {
 	}
 
 	return doCreateSequence(
-		params, n.n.String(), n.dbDesc, schemaID, &n.n.Name, isTemporary, n.n.Options,
+		params, n.n.String(), n.dbDesc, schemaID, &n.n.Name, n.n.Persistence, n.n.Options,
 		tree.AsStringWithFQNames(n.n, params.Ann()),
 	)
 }
@@ -77,9 +77,9 @@ func doCreateSequence(
 	params runParams,
 	context string,
 	dbDesc *sqlbase.ImmutableDatabaseDescriptor,
-	schemaID sqlbase.ID,
+	schemaID descpb.ID,
 	name *TableName,
-	isTemporary bool,
+	persistence tree.Persistence,
 	opts tree.SequenceOptions,
 	jobDesc string,
 ) error {
@@ -88,10 +88,9 @@ func doCreateSequence(
 		return err
 	}
 
-	// Inherit permissions from the database descriptor.
-	privs := dbDesc.GetPrivileges()
+	privs := createInheritedPrivilegesFromDBDesc(dbDesc, params.SessionData().User)
 
-	if isTemporary {
+	if persistence.IsTemporary() {
 		telemetry.Inc(sqltelemetry.CreateTempSequenceCounter)
 	}
 
@@ -109,7 +108,7 @@ func doCreateSequence(
 		id,
 		creationTime,
 		privs,
-		isTemporary,
+		persistence,
 		&params,
 	)
 	if err != nil {
@@ -119,7 +118,7 @@ func doCreateSequence(
 	// makeSequenceTableDesc already validates the table. No call to
 	// desc.ValidateTable() needed here.
 
-	key := sqlbase.MakeObjectNameKey(
+	key := catalogkv.MakeObjectNameKey(
 		params.ctx,
 		params.ExecCfg().Settings,
 		dbDesc.GetID(),
@@ -168,12 +167,12 @@ func (*createSequenceNode) Close(context.Context)        {}
 func MakeSequenceTableDesc(
 	sequenceName string,
 	sequenceOptions tree.SequenceOptions,
-	parentID sqlbase.ID,
-	schemaID sqlbase.ID,
-	id sqlbase.ID,
+	parentID descpb.ID,
+	schemaID descpb.ID,
+	id descpb.ID,
 	creationTime hlc.Timestamp,
-	privileges *sqlbase.PrivilegeDescriptor,
-	isTemporary bool,
+	privileges *descpb.PrivilegeDescriptor,
+	persistence tree.Persistence,
 	params *runParams,
 ) (sqlbase.MutableTableDescriptor, error) {
 	desc := sqlbase.InitTableDescriptor(
@@ -183,28 +182,28 @@ func MakeSequenceTableDesc(
 		sequenceName,
 		creationTime,
 		privileges,
-		isTemporary,
+		persistence,
 	)
 
 	// Mimic a table with one column, "value".
-	desc.Columns = []sqlbase.ColumnDescriptor{
+	desc.Columns = []descpb.ColumnDescriptor{
 		{
 			ID:   sqlbase.SequenceColumnID,
 			Name: sqlbase.SequenceColumnName,
 			Type: types.Int,
 		},
 	}
-	desc.PrimaryIndex = sqlbase.IndexDescriptor{
+	desc.PrimaryIndex = descpb.IndexDescriptor{
 		ID:               keys.SequenceIndexID,
 		Name:             sqlbase.PrimaryKeyIndexName,
-		ColumnIDs:        []sqlbase.ColumnID{sqlbase.SequenceColumnID},
+		ColumnIDs:        []descpb.ColumnID{sqlbase.SequenceColumnID},
 		ColumnNames:      []string{sqlbase.SequenceColumnName},
-		ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC},
+		ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 	}
-	desc.Families = []sqlbase.ColumnFamilyDescriptor{
+	desc.Families = []descpb.ColumnFamilyDescriptor{
 		{
 			ID:              keys.SequenceColumnFamilyID,
-			ColumnIDs:       []sqlbase.ColumnID{sqlbase.SequenceColumnID},
+			ColumnIDs:       []descpb.ColumnID{sqlbase.SequenceColumnID},
 			ColumnNames:     []string{sqlbase.SequenceColumnName},
 			Name:            "primary",
 			DefaultColumnID: sqlbase.SequenceColumnID,
@@ -212,7 +211,7 @@ func MakeSequenceTableDesc(
 	}
 
 	// Fill in options, starting with defaults then overriding.
-	opts := &sqlbase.TableDescriptor_SequenceOpts{
+	opts := &descpb.TableDescriptor_SequenceOpts{
 		Increment: 1,
 	}
 	err := assignSequenceOptions(opts, sequenceOptions, true /* setDefaults */, params, id)
@@ -223,7 +222,7 @@ func MakeSequenceTableDesc(
 
 	// A sequence doesn't have dependencies and thus can be made public
 	// immediately.
-	desc.State = sqlbase.TableDescriptor_PUBLIC
+	desc.State = descpb.TableDescriptor_PUBLIC
 
 	return desc, desc.ValidateTable()
 }

@@ -660,6 +660,9 @@ func (expr *DInt) Walk(_ Visitor) Expr { return expr }
 func (expr *DInterval) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
+func (expr *DBox2D) Walk(_ Visitor) Expr { return expr }
+
+// Walk implements the Expr interface.
 func (expr *DGeography) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
@@ -1031,8 +1034,7 @@ func (stmt *ParenSelect) walkStmt(v Visitor) Statement {
 // copyNode makes a copy of this Statement without recursing in any child Statements.
 func (stmt *Restore) copyNode() *Restore {
 	stmtCopy := *stmt
-	stmtCopy.From = append([]PartitionedBackup(nil), stmt.From...)
-	stmtCopy.Options = append(KVOptions(nil), stmt.Options...)
+	stmtCopy.From = append([]StringOrPlaceholderOptList(nil), stmt.From...)
 	return &stmtCopy
 }
 
@@ -1059,13 +1061,24 @@ func (stmt *Restore) walkStmt(v Visitor) Statement {
 			}
 		}
 	}
-	{
-		opts, changed := walkKVOptions(v, stmt.Options)
+
+	if stmt.Options.EncryptionPassphrase != nil {
+		pw, changed := WalkExpr(v, stmt.Options.EncryptionPassphrase)
 		if changed {
 			if ret == stmt {
 				ret = stmt.copyNode()
 			}
-			ret.Options = opts
+			ret.Options.EncryptionPassphrase = pw
+		}
+	}
+
+	if stmt.Options.IntoDB != nil {
+		intoDB, changed := WalkExpr(v, stmt.Options.IntoDB)
+		if changed {
+			if ret == stmt {
+				ret = stmt.copyNode()
+			}
+			ret.Options.IntoDB = intoDB
 		}
 	}
 	return ret

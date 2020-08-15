@@ -43,6 +43,7 @@ func (s CallbackMetadataSource) DrainMeta(ctx context.Context) []ProducerMetadat
 
 func newInsecureRPCContext(stopper *stop.Stopper) *rpc.Context {
 	return rpc.NewContext(rpc.ContextOptions{
+		TenantID:   roachpb.SystemTenantID,
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
 		Config:     &base.Config{Insecure: true},
 		Clock:      hlc.NewClock(hlc.UnixNano, time.Nanosecond),
@@ -133,8 +134,8 @@ type MockDialer struct {
 	}
 }
 
-// Dial establishes a grpc connection once.
-func (d *MockDialer) Dial(
+// DialNoBreaker establishes a grpc connection once.
+func (d *MockDialer) DialNoBreaker(
 	context.Context, roachpb.NodeID, rpc.ConnectionClass,
 ) (*grpc.ClientConn, error) {
 	d.mu.Lock()

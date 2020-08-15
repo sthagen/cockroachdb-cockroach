@@ -187,6 +187,22 @@ func (*AlterTable) StatementTag() string { return "ALTER TABLE" }
 func (*AlterTable) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
+func (*AlterTableSetSchema) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterTableSetSchema) StatementTag() string { return "ALTER TABLE SET SCHEMA" }
+
+func (*AlterTableSetSchema) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterSchema) StatementType() StatementType { return DDL }
+
+// StatementTag implements the Statement interface.
+func (*AlterSchema) StatementTag() string { return "ALTER SCHEMA" }
+
+func (*AlterSchema) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
 func (*AlterType) StatementType() StatementType { return DDL }
 
 // StatementTag implements the Statement interface.
@@ -475,6 +491,12 @@ func (*DropType) StatementType() StatementType { return DDL }
 func (*DropType) StatementTag() string { return "DROP TYPE" }
 
 // StatementType implements the Statement interface.
+func (*DropSchema) StatementType() StatementType { return DDL }
+
+// StatementTag implements the Statement interface.
+func (*DropSchema) StatementTag() string { return "DROP SCHEMA" }
+
+// StatementType implements the Statement interface.
 func (*Execute) StatementType() StatementType { return Unknown }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -537,6 +559,12 @@ func (*Prepare) StatementType() StatementType { return Ack }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*Prepare) StatementTag() string { return "PREPARE" }
+
+// StatementType implements the Statement interface.
+func (*RefreshMaterializedView) StatementType() StatementType { return DDL }
+
+// StatementTag implements the Statement interface.
+func (*RefreshMaterializedView) StatementTag() string { return "REFRESH MATERIALIZED VIEW" }
 
 // StatementType implements the Statement interface.
 func (*ReleaseSavepoint) StatementType() StatementType { return Ack }
@@ -740,6 +768,12 @@ func (*ShowDatabases) StatementType() StatementType { return Rows }
 func (*ShowDatabases) StatementTag() string { return "SHOW DATABASES" }
 
 // StatementType implements the Statement interface.
+func (*ShowEnums) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowEnums) StatementTag() string { return "SHOW ENUMS" }
+
+// StatementType implements the Statement interface.
 func (*ShowTraceForSession) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -804,6 +838,12 @@ func (*ShowHistogram) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*ShowHistogram) StatementTag() string { return "SHOW HISTOGRAM" }
+
+// StatementType implements the Statement interface.
+func (*ShowSchedules) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowSchedules) StatementTag() string { return "SHOW SCHEDULES" }
 
 // StatementType implements the Statement interface.
 func (*ShowSyntax) StatementType() StatementType { return Rows }
@@ -937,6 +977,7 @@ func (*ValuesClause) StatementType() StatementType { return Rows }
 func (*ValuesClause) StatementTag() string { return "VALUES" }
 
 func (n *AlterIndex) String() string                     { return AsString(n) }
+func (n *AlterSchema) String() string                    { return AsString(n) }
 func (n *AlterTable) String() string                     { return AsString(n) }
 func (n *AlterTableCmds) String() string                 { return AsString(n) }
 func (n *AlterTableAddColumn) String() string            { return AsString(n) }
@@ -948,6 +989,7 @@ func (n *AlterTableDropNotNull) String() string          { return AsString(n) }
 func (n *AlterTableDropStored) String() string           { return AsString(n) }
 func (n *AlterTableSetDefault) String() string           { return AsString(n) }
 func (n *AlterTableSetNotNull) String() string           { return AsString(n) }
+func (n *AlterTableSetSchema) String() string            { return AsString(n) }
 func (n *AlterType) String() string                      { return AsString(n) }
 func (n *AlterRole) String() string                      { return AsString(n) }
 func (n *AlterSequence) String() string                  { return AsString(n) }
@@ -979,6 +1021,7 @@ func (n *Deallocate) String() string                     { return AsString(n) }
 func (n *Delete) String() string                         { return AsString(n) }
 func (n *DropDatabase) String() string                   { return AsString(n) }
 func (n *DropIndex) String() string                      { return AsString(n) }
+func (n *DropSchema) String() string                     { return AsString(n) }
 func (n *DropTable) String() string                      { return AsString(n) }
 func (n *DropType) String() string                       { return AsString(n) }
 func (n *DropView) String() string                       { return AsString(n) }
@@ -996,6 +1039,7 @@ func (n *ParenSelect) String() string                    { return AsString(n) }
 func (n *Prepare) String() string                        { return AsString(n) }
 func (n *ReleaseSavepoint) String() string               { return AsString(n) }
 func (n *Relocate) String() string                       { return AsString(n) }
+func (n *RefreshMaterializedView) String() string        { return AsString(n) }
 func (n *RenameColumn) String() string                   { return AsString(n) }
 func (n *RenameDatabase) String() string                 { return AsString(n) }
 func (n *RenameIndex) String() string                    { return AsString(n) }
@@ -1026,8 +1070,10 @@ func (n *ShowConstraints) String() string                { return AsString(n) }
 func (n *ShowCreate) String() string                     { return AsString(n) }
 func (n *ShowDatabases) String() string                  { return AsString(n) }
 func (n *ShowDatabaseIndexes) String() string            { return AsString(n) }
+func (n *ShowEnums) String() string                      { return AsString(n) }
 func (n *ShowGrants) String() string                     { return AsString(n) }
 func (n *ShowHistogram) String() string                  { return AsString(n) }
+func (n *ShowSchedules) String() string                  { return AsString(n) }
 func (n *ShowIndexes) String() string                    { return AsString(n) }
 func (n *ShowPartitions) String() string                 { return AsString(n) }
 func (n *ShowJobs) String() string                       { return AsString(n) }

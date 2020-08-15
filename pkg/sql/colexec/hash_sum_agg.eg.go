@@ -49,15 +49,13 @@ func newSumHashAggAlloc(
 }
 
 type sumInt16HashAgg struct {
+	hashAggregateFuncBase
 	scratch struct {
-		curIdx int
 		// curAgg holds the running total, so we can index into the slice once per
 		// group, instead of on each iteration.
 		curAgg apd.Decimal
 		// vec points to the output vector we are updating.
 		vec []apd.Decimal
-		// nulls points to the output null vector that we are updating.
-		nulls *coldata.Nulls
 		// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 		// for the group that is currently being aggregated.
 		foundNonNullForCurrentGroup bool
@@ -69,36 +67,28 @@ var _ aggregateFunc = &sumInt16HashAgg{}
 
 const sizeOfSumInt16HashAgg = int64(unsafe.Sizeof(sumInt16HashAgg{}))
 
-func (a *sumInt16HashAgg) Init(groups []bool, v coldata.Vec) {
-	a.scratch.vec = v.Decimal()
-	a.scratch.nulls = v.Nulls()
+func (a *sumInt16HashAgg) Init(groups []bool, vec coldata.Vec) {
+	a.hashAggregateFuncBase.Init(groups, vec)
+	a.scratch.vec = vec.Decimal()
 	a.Reset()
 }
 
 func (a *sumInt16HashAgg) Reset() {
-	a.scratch.curIdx = 0
+	a.hashAggregateFuncBase.Reset()
 	a.scratch.foundNonNullForCurrentGroup = false
-	a.scratch.nulls.UnsetNulls()
 }
 
-func (a *sumInt16HashAgg) CurrentOutputIndex() int {
-	return a.scratch.curIdx
-}
-
-func (a *sumInt16HashAgg) SetOutputIndex(idx int) {
-	a.scratch.curIdx = idx
-}
-
-func (a *sumInt16HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
+func (a *sumInt16HashAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
 	// In order to inline the templated code of overloads, we need to have a
 	// "_overloadHelper" local variable of type "overloadHelper".
 	_overloadHelper := a.overloadHelper
-	inputLen := b.Length()
-	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
+	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Int16(), vec.Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			sel = sel[:inputLen]
+	{
+		sel = sel[:inputLen]
+		if nulls.MaybeHasNulls() {
 			for _, i := range sel {
 
 				var isNull bool
@@ -118,50 +108,7 @@ func (a *sumInt16HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 				}
 			}
 		} else {
-			col = col[:inputLen]
-			for i := range col {
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-
-					{
-
-						tmpDec := &_overloadHelper.tmpDec1
-						tmpDec.SetInt64(int64(col[i]))
-						if _, err := tree.ExactCtx.Add(&a.scratch.curAgg, &a.scratch.curAgg, tmpDec); err != nil {
-							colexecerror.ExpectedError(err)
-						}
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		}
-	} else {
-		if sel != nil {
-			sel = sel[:inputLen]
 			for _, i := range sel {
-
-				var isNull bool
-				isNull = false
-				if !isNull {
-
-					{
-
-						tmpDec := &_overloadHelper.tmpDec1
-						tmpDec.SetInt64(int64(col[i]))
-						if _, err := tree.ExactCtx.Add(&a.scratch.curAgg, &a.scratch.curAgg, tmpDec); err != nil {
-							colexecerror.ExpectedError(err)
-						}
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		} else {
-			col = col[:inputLen]
-			for i := range col {
 
 				var isNull bool
 				isNull = false
@@ -183,20 +130,15 @@ func (a *sumInt16HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
-func (a *sumInt16HashAgg) Flush() {
+func (a *sumInt16HashAgg) Flush(outputIdx int) {
 	// The aggregation is finished. Flush the last value. If we haven't found
 	// any non-nulls for this group so far, the output for this group should be
 	// null.
 	if !a.scratch.foundNonNullForCurrentGroup {
-		a.scratch.nulls.SetNull(a.scratch.curIdx)
+		a.nulls.SetNull(outputIdx)
 	} else {
-		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+		a.scratch.vec[outputIdx] = a.scratch.curAgg
 	}
-	a.scratch.curIdx++
-}
-
-func (a *sumInt16HashAgg) HandleEmptyInputScalar() {
-	a.scratch.nulls.SetNull(0)
 }
 
 type sumInt16HashAggAlloc struct {
@@ -217,15 +159,13 @@ func (a *sumInt16HashAggAlloc) newAggFunc() aggregateFunc {
 }
 
 type sumInt32HashAgg struct {
+	hashAggregateFuncBase
 	scratch struct {
-		curIdx int
 		// curAgg holds the running total, so we can index into the slice once per
 		// group, instead of on each iteration.
 		curAgg apd.Decimal
 		// vec points to the output vector we are updating.
 		vec []apd.Decimal
-		// nulls points to the output null vector that we are updating.
-		nulls *coldata.Nulls
 		// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 		// for the group that is currently being aggregated.
 		foundNonNullForCurrentGroup bool
@@ -237,36 +177,28 @@ var _ aggregateFunc = &sumInt32HashAgg{}
 
 const sizeOfSumInt32HashAgg = int64(unsafe.Sizeof(sumInt32HashAgg{}))
 
-func (a *sumInt32HashAgg) Init(groups []bool, v coldata.Vec) {
-	a.scratch.vec = v.Decimal()
-	a.scratch.nulls = v.Nulls()
+func (a *sumInt32HashAgg) Init(groups []bool, vec coldata.Vec) {
+	a.hashAggregateFuncBase.Init(groups, vec)
+	a.scratch.vec = vec.Decimal()
 	a.Reset()
 }
 
 func (a *sumInt32HashAgg) Reset() {
-	a.scratch.curIdx = 0
+	a.hashAggregateFuncBase.Reset()
 	a.scratch.foundNonNullForCurrentGroup = false
-	a.scratch.nulls.UnsetNulls()
 }
 
-func (a *sumInt32HashAgg) CurrentOutputIndex() int {
-	return a.scratch.curIdx
-}
-
-func (a *sumInt32HashAgg) SetOutputIndex(idx int) {
-	a.scratch.curIdx = idx
-}
-
-func (a *sumInt32HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
+func (a *sumInt32HashAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
 	// In order to inline the templated code of overloads, we need to have a
 	// "_overloadHelper" local variable of type "overloadHelper".
 	_overloadHelper := a.overloadHelper
-	inputLen := b.Length()
-	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
+	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Int32(), vec.Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			sel = sel[:inputLen]
+	{
+		sel = sel[:inputLen]
+		if nulls.MaybeHasNulls() {
 			for _, i := range sel {
 
 				var isNull bool
@@ -286,50 +218,7 @@ func (a *sumInt32HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 				}
 			}
 		} else {
-			col = col[:inputLen]
-			for i := range col {
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-
-					{
-
-						tmpDec := &_overloadHelper.tmpDec1
-						tmpDec.SetInt64(int64(col[i]))
-						if _, err := tree.ExactCtx.Add(&a.scratch.curAgg, &a.scratch.curAgg, tmpDec); err != nil {
-							colexecerror.ExpectedError(err)
-						}
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		}
-	} else {
-		if sel != nil {
-			sel = sel[:inputLen]
 			for _, i := range sel {
-
-				var isNull bool
-				isNull = false
-				if !isNull {
-
-					{
-
-						tmpDec := &_overloadHelper.tmpDec1
-						tmpDec.SetInt64(int64(col[i]))
-						if _, err := tree.ExactCtx.Add(&a.scratch.curAgg, &a.scratch.curAgg, tmpDec); err != nil {
-							colexecerror.ExpectedError(err)
-						}
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		} else {
-			col = col[:inputLen]
-			for i := range col {
 
 				var isNull bool
 				isNull = false
@@ -351,20 +240,15 @@ func (a *sumInt32HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
-func (a *sumInt32HashAgg) Flush() {
+func (a *sumInt32HashAgg) Flush(outputIdx int) {
 	// The aggregation is finished. Flush the last value. If we haven't found
 	// any non-nulls for this group so far, the output for this group should be
 	// null.
 	if !a.scratch.foundNonNullForCurrentGroup {
-		a.scratch.nulls.SetNull(a.scratch.curIdx)
+		a.nulls.SetNull(outputIdx)
 	} else {
-		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+		a.scratch.vec[outputIdx] = a.scratch.curAgg
 	}
-	a.scratch.curIdx++
-}
-
-func (a *sumInt32HashAgg) HandleEmptyInputScalar() {
-	a.scratch.nulls.SetNull(0)
 }
 
 type sumInt32HashAggAlloc struct {
@@ -385,15 +269,13 @@ func (a *sumInt32HashAggAlloc) newAggFunc() aggregateFunc {
 }
 
 type sumInt64HashAgg struct {
+	hashAggregateFuncBase
 	scratch struct {
-		curIdx int
 		// curAgg holds the running total, so we can index into the slice once per
 		// group, instead of on each iteration.
 		curAgg apd.Decimal
 		// vec points to the output vector we are updating.
 		vec []apd.Decimal
-		// nulls points to the output null vector that we are updating.
-		nulls *coldata.Nulls
 		// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 		// for the group that is currently being aggregated.
 		foundNonNullForCurrentGroup bool
@@ -405,36 +287,28 @@ var _ aggregateFunc = &sumInt64HashAgg{}
 
 const sizeOfSumInt64HashAgg = int64(unsafe.Sizeof(sumInt64HashAgg{}))
 
-func (a *sumInt64HashAgg) Init(groups []bool, v coldata.Vec) {
-	a.scratch.vec = v.Decimal()
-	a.scratch.nulls = v.Nulls()
+func (a *sumInt64HashAgg) Init(groups []bool, vec coldata.Vec) {
+	a.hashAggregateFuncBase.Init(groups, vec)
+	a.scratch.vec = vec.Decimal()
 	a.Reset()
 }
 
 func (a *sumInt64HashAgg) Reset() {
-	a.scratch.curIdx = 0
+	a.hashAggregateFuncBase.Reset()
 	a.scratch.foundNonNullForCurrentGroup = false
-	a.scratch.nulls.UnsetNulls()
 }
 
-func (a *sumInt64HashAgg) CurrentOutputIndex() int {
-	return a.scratch.curIdx
-}
-
-func (a *sumInt64HashAgg) SetOutputIndex(idx int) {
-	a.scratch.curIdx = idx
-}
-
-func (a *sumInt64HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
+func (a *sumInt64HashAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
 	// In order to inline the templated code of overloads, we need to have a
 	// "_overloadHelper" local variable of type "overloadHelper".
 	_overloadHelper := a.overloadHelper
-	inputLen := b.Length()
-	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
+	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Int64(), vec.Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			sel = sel[:inputLen]
+	{
+		sel = sel[:inputLen]
+		if nulls.MaybeHasNulls() {
 			for _, i := range sel {
 
 				var isNull bool
@@ -454,50 +328,7 @@ func (a *sumInt64HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 				}
 			}
 		} else {
-			col = col[:inputLen]
-			for i := range col {
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-
-					{
-
-						tmpDec := &_overloadHelper.tmpDec1
-						tmpDec.SetInt64(int64(col[i]))
-						if _, err := tree.ExactCtx.Add(&a.scratch.curAgg, &a.scratch.curAgg, tmpDec); err != nil {
-							colexecerror.ExpectedError(err)
-						}
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		}
-	} else {
-		if sel != nil {
-			sel = sel[:inputLen]
 			for _, i := range sel {
-
-				var isNull bool
-				isNull = false
-				if !isNull {
-
-					{
-
-						tmpDec := &_overloadHelper.tmpDec1
-						tmpDec.SetInt64(int64(col[i]))
-						if _, err := tree.ExactCtx.Add(&a.scratch.curAgg, &a.scratch.curAgg, tmpDec); err != nil {
-							colexecerror.ExpectedError(err)
-						}
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		} else {
-			col = col[:inputLen]
-			for i := range col {
 
 				var isNull bool
 				isNull = false
@@ -519,20 +350,15 @@ func (a *sumInt64HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
-func (a *sumInt64HashAgg) Flush() {
+func (a *sumInt64HashAgg) Flush(outputIdx int) {
 	// The aggregation is finished. Flush the last value. If we haven't found
 	// any non-nulls for this group so far, the output for this group should be
 	// null.
 	if !a.scratch.foundNonNullForCurrentGroup {
-		a.scratch.nulls.SetNull(a.scratch.curIdx)
+		a.nulls.SetNull(outputIdx)
 	} else {
-		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+		a.scratch.vec[outputIdx] = a.scratch.curAgg
 	}
-	a.scratch.curIdx++
-}
-
-func (a *sumInt64HashAgg) HandleEmptyInputScalar() {
-	a.scratch.nulls.SetNull(0)
 }
 
 type sumInt64HashAggAlloc struct {
@@ -553,15 +379,13 @@ func (a *sumInt64HashAggAlloc) newAggFunc() aggregateFunc {
 }
 
 type sumDecimalHashAgg struct {
+	hashAggregateFuncBase
 	scratch struct {
-		curIdx int
 		// curAgg holds the running total, so we can index into the slice once per
 		// group, instead of on each iteration.
 		curAgg apd.Decimal
 		// vec points to the output vector we are updating.
 		vec []apd.Decimal
-		// nulls points to the output null vector that we are updating.
-		nulls *coldata.Nulls
 		// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 		// for the group that is currently being aggregated.
 		foundNonNullForCurrentGroup bool
@@ -572,33 +396,25 @@ var _ aggregateFunc = &sumDecimalHashAgg{}
 
 const sizeOfSumDecimalHashAgg = int64(unsafe.Sizeof(sumDecimalHashAgg{}))
 
-func (a *sumDecimalHashAgg) Init(groups []bool, v coldata.Vec) {
-	a.scratch.vec = v.Decimal()
-	a.scratch.nulls = v.Nulls()
+func (a *sumDecimalHashAgg) Init(groups []bool, vec coldata.Vec) {
+	a.hashAggregateFuncBase.Init(groups, vec)
+	a.scratch.vec = vec.Decimal()
 	a.Reset()
 }
 
 func (a *sumDecimalHashAgg) Reset() {
-	a.scratch.curIdx = 0
+	a.hashAggregateFuncBase.Reset()
 	a.scratch.foundNonNullForCurrentGroup = false
-	a.scratch.nulls.UnsetNulls()
 }
 
-func (a *sumDecimalHashAgg) CurrentOutputIndex() int {
-	return a.scratch.curIdx
-}
-
-func (a *sumDecimalHashAgg) SetOutputIndex(idx int) {
-	a.scratch.curIdx = idx
-}
-
-func (a *sumDecimalHashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	inputLen := b.Length()
-	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
+func (a *sumDecimalHashAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
+	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Decimal(), vec.Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			sel = sel[:inputLen]
+	{
+		sel = sel[:inputLen]
+		if nulls.MaybeHasNulls() {
 			for _, i := range sel {
 
 				var isNull bool
@@ -617,48 +433,7 @@ func (a *sumDecimalHashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 				}
 			}
 		} else {
-			col = col[:inputLen]
-			for i := range col {
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-
-					{
-
-						_, err := tree.ExactCtx.Add(&a.scratch.curAgg, &a.scratch.curAgg, &col[i])
-						if err != nil {
-							colexecerror.ExpectedError(err)
-						}
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		}
-	} else {
-		if sel != nil {
-			sel = sel[:inputLen]
 			for _, i := range sel {
-
-				var isNull bool
-				isNull = false
-				if !isNull {
-
-					{
-
-						_, err := tree.ExactCtx.Add(&a.scratch.curAgg, &a.scratch.curAgg, &col[i])
-						if err != nil {
-							colexecerror.ExpectedError(err)
-						}
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		} else {
-			col = col[:inputLen]
-			for i := range col {
 
 				var isNull bool
 				isNull = false
@@ -679,20 +454,15 @@ func (a *sumDecimalHashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
-func (a *sumDecimalHashAgg) Flush() {
+func (a *sumDecimalHashAgg) Flush(outputIdx int) {
 	// The aggregation is finished. Flush the last value. If we haven't found
 	// any non-nulls for this group so far, the output for this group should be
 	// null.
 	if !a.scratch.foundNonNullForCurrentGroup {
-		a.scratch.nulls.SetNull(a.scratch.curIdx)
+		a.nulls.SetNull(outputIdx)
 	} else {
-		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+		a.scratch.vec[outputIdx] = a.scratch.curAgg
 	}
-	a.scratch.curIdx++
-}
-
-func (a *sumDecimalHashAgg) HandleEmptyInputScalar() {
-	a.scratch.nulls.SetNull(0)
 }
 
 type sumDecimalHashAggAlloc struct {
@@ -713,15 +483,13 @@ func (a *sumDecimalHashAggAlloc) newAggFunc() aggregateFunc {
 }
 
 type sumFloat64HashAgg struct {
+	hashAggregateFuncBase
 	scratch struct {
-		curIdx int
 		// curAgg holds the running total, so we can index into the slice once per
 		// group, instead of on each iteration.
 		curAgg float64
 		// vec points to the output vector we are updating.
 		vec []float64
-		// nulls points to the output null vector that we are updating.
-		nulls *coldata.Nulls
 		// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 		// for the group that is currently being aggregated.
 		foundNonNullForCurrentGroup bool
@@ -732,33 +500,25 @@ var _ aggregateFunc = &sumFloat64HashAgg{}
 
 const sizeOfSumFloat64HashAgg = int64(unsafe.Sizeof(sumFloat64HashAgg{}))
 
-func (a *sumFloat64HashAgg) Init(groups []bool, v coldata.Vec) {
-	a.scratch.vec = v.Float64()
-	a.scratch.nulls = v.Nulls()
+func (a *sumFloat64HashAgg) Init(groups []bool, vec coldata.Vec) {
+	a.hashAggregateFuncBase.Init(groups, vec)
+	a.scratch.vec = vec.Float64()
 	a.Reset()
 }
 
 func (a *sumFloat64HashAgg) Reset() {
-	a.scratch.curIdx = 0
+	a.hashAggregateFuncBase.Reset()
 	a.scratch.foundNonNullForCurrentGroup = false
-	a.scratch.nulls.UnsetNulls()
 }
 
-func (a *sumFloat64HashAgg) CurrentOutputIndex() int {
-	return a.scratch.curIdx
-}
-
-func (a *sumFloat64HashAgg) SetOutputIndex(idx int) {
-	a.scratch.curIdx = idx
-}
-
-func (a *sumFloat64HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	inputLen := b.Length()
-	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
+func (a *sumFloat64HashAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
+	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Float64(), vec.Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			sel = sel[:inputLen]
+	{
+		sel = sel[:inputLen]
+		if nulls.MaybeHasNulls() {
 			for _, i := range sel {
 
 				var isNull bool
@@ -774,42 +534,7 @@ func (a *sumFloat64HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 				}
 			}
 		} else {
-			col = col[:inputLen]
-			for i := range col {
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-
-					{
-
-						a.scratch.curAgg = float64(a.scratch.curAgg) + float64(col[i])
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		}
-	} else {
-		if sel != nil {
-			sel = sel[:inputLen]
 			for _, i := range sel {
-
-				var isNull bool
-				isNull = false
-				if !isNull {
-
-					{
-
-						a.scratch.curAgg = float64(a.scratch.curAgg) + float64(col[i])
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		} else {
-			col = col[:inputLen]
-			for i := range col {
 
 				var isNull bool
 				isNull = false
@@ -827,20 +552,15 @@ func (a *sumFloat64HashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
-func (a *sumFloat64HashAgg) Flush() {
+func (a *sumFloat64HashAgg) Flush(outputIdx int) {
 	// The aggregation is finished. Flush the last value. If we haven't found
 	// any non-nulls for this group so far, the output for this group should be
 	// null.
 	if !a.scratch.foundNonNullForCurrentGroup {
-		a.scratch.nulls.SetNull(a.scratch.curIdx)
+		a.nulls.SetNull(outputIdx)
 	} else {
-		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+		a.scratch.vec[outputIdx] = a.scratch.curAgg
 	}
-	a.scratch.curIdx++
-}
-
-func (a *sumFloat64HashAgg) HandleEmptyInputScalar() {
-	a.scratch.nulls.SetNull(0)
 }
 
 type sumFloat64HashAggAlloc struct {
@@ -861,15 +581,13 @@ func (a *sumFloat64HashAggAlloc) newAggFunc() aggregateFunc {
 }
 
 type sumIntervalHashAgg struct {
+	hashAggregateFuncBase
 	scratch struct {
-		curIdx int
 		// curAgg holds the running total, so we can index into the slice once per
 		// group, instead of on each iteration.
 		curAgg duration.Duration
 		// vec points to the output vector we are updating.
 		vec []duration.Duration
-		// nulls points to the output null vector that we are updating.
-		nulls *coldata.Nulls
 		// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 		// for the group that is currently being aggregated.
 		foundNonNullForCurrentGroup bool
@@ -880,33 +598,25 @@ var _ aggregateFunc = &sumIntervalHashAgg{}
 
 const sizeOfSumIntervalHashAgg = int64(unsafe.Sizeof(sumIntervalHashAgg{}))
 
-func (a *sumIntervalHashAgg) Init(groups []bool, v coldata.Vec) {
-	a.scratch.vec = v.Interval()
-	a.scratch.nulls = v.Nulls()
+func (a *sumIntervalHashAgg) Init(groups []bool, vec coldata.Vec) {
+	a.hashAggregateFuncBase.Init(groups, vec)
+	a.scratch.vec = vec.Interval()
 	a.Reset()
 }
 
 func (a *sumIntervalHashAgg) Reset() {
-	a.scratch.curIdx = 0
+	a.hashAggregateFuncBase.Reset()
 	a.scratch.foundNonNullForCurrentGroup = false
-	a.scratch.nulls.UnsetNulls()
 }
 
-func (a *sumIntervalHashAgg) CurrentOutputIndex() int {
-	return a.scratch.curIdx
-}
-
-func (a *sumIntervalHashAgg) SetOutputIndex(idx int) {
-	a.scratch.curIdx = idx
-}
-
-func (a *sumIntervalHashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	inputLen := b.Length()
-	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
+func (a *sumIntervalHashAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
+	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Interval(), vec.Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			sel = sel[:inputLen]
+	{
+		sel = sel[:inputLen]
+		if nulls.MaybeHasNulls() {
 			for _, i := range sel {
 
 				var isNull bool
@@ -917,32 +627,7 @@ func (a *sumIntervalHashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 				}
 			}
 		} else {
-			col = col[:inputLen]
-			for i := range col {
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-					a.scratch.curAgg = a.scratch.curAgg.Add(col[i])
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		}
-	} else {
-		if sel != nil {
-			sel = sel[:inputLen]
 			for _, i := range sel {
-
-				var isNull bool
-				isNull = false
-				if !isNull {
-					a.scratch.curAgg = a.scratch.curAgg.Add(col[i])
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		} else {
-			col = col[:inputLen]
-			for i := range col {
 
 				var isNull bool
 				isNull = false
@@ -955,20 +640,15 @@ func (a *sumIntervalHashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
-func (a *sumIntervalHashAgg) Flush() {
+func (a *sumIntervalHashAgg) Flush(outputIdx int) {
 	// The aggregation is finished. Flush the last value. If we haven't found
 	// any non-nulls for this group so far, the output for this group should be
 	// null.
 	if !a.scratch.foundNonNullForCurrentGroup {
-		a.scratch.nulls.SetNull(a.scratch.curIdx)
+		a.nulls.SetNull(outputIdx)
 	} else {
-		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+		a.scratch.vec[outputIdx] = a.scratch.curAgg
 	}
-	a.scratch.curIdx++
-}
-
-func (a *sumIntervalHashAgg) HandleEmptyInputScalar() {
-	a.scratch.nulls.SetNull(0)
 }
 
 type sumIntervalHashAggAlloc struct {

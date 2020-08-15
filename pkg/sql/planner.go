@@ -19,6 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -76,7 +78,7 @@ type extendedEvalContext struct {
 	Jobs *jobsCollection
 
 	// SchemaChangeJobCache refers to schemaChangeJobsCache in extraTxnState.
-	SchemaChangeJobCache map[sqlbase.ID]*jobs.Job
+	SchemaChangeJobCache map[descpb.ID]*jobs.Job
 
 	schemaAccessors *schemaInterface
 
@@ -122,6 +124,10 @@ type schemaInterface struct {
 // If one needs to be created outside of a Session, use makeInternalPlanner().
 type planner struct {
 	txn *kv.Txn
+
+	// isInternalPlanner is set to true when this planner is not bound to
+	// a SQL session.
+	isInternalPlanner bool
 
 	// Reference to the corresponding sql Statement for this query.
 	stmt *Statement
@@ -208,7 +214,7 @@ type planner struct {
 	// resolution processes to disallow cross database references. In particular,
 	// the type resolution steps will disallow resolution of types that have a
 	// parentID != contextDatabaseID when it is set.
-	contextDatabaseID sqlbase.ID
+	contextDatabaseID descpb.ID
 }
 
 func (ctx *extendedEvalContext) setSessionID(sessionID ClusterWideID) {
@@ -249,7 +255,7 @@ func newInternalPlanner(
 	ctx := logtags.AddTag(context.Background(), opName, "")
 
 	sd := &sessiondata.SessionData{
-		SearchPath:    sqlbase.DefaultSearchPath,
+		SearchPath:    catconstants.DefaultSearchPath,
 		User:          user,
 		Database:      "system",
 		SequenceState: sessiondata.NewSequenceState(),
@@ -286,6 +292,7 @@ func newInternalPlanner(
 	p.txn = txn
 	p.stmt = nil
 	p.cancelChecker = sqlbase.NewCancelChecker(ctx)
+	p.isInternalPlanner = true
 
 	p.semaCtx = tree.MakeSemaContext()
 	p.semaCtx.SearchPath = sd.SearchPath
@@ -310,7 +317,6 @@ func newInternalPlanner(
 	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	p.extendedEvalCtx.NodeID = execCfg.NodeID
 	p.extendedEvalCtx.Locality = execCfg.Locality
-	p.extendedEvalCtx.TypeResolver = p
 
 	p.sessionDataMutator = dataMutator
 	p.autoCommit = false
@@ -477,7 +483,7 @@ func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tre
 // TODO (SQLSchema): This should call into the set of SchemaAccessors instead
 //  of having its own logic for lookups.
 func (p *planner) LookupTableByID(
-	ctx context.Context, tableID sqlbase.ID,
+	ctx context.Context, tableID descpb.ID,
 ) (catalog.TableEntry, error) {
 	if entry, err := p.getVirtualTabler().getVirtualTableEntryByID(tableID); err == nil {
 		return catalog.TableEntry{Desc: sqlbase.NewImmutableTableDescriptor(*entry.desc)}, nil
@@ -678,6 +684,11 @@ func (p *planner) TypeAsStringArray(
 // SessionData is part of the PlanHookState interface.
 func (p *planner) SessionData() *sessiondata.SessionData {
 	return p.EvalContext().SessionData
+}
+
+// Ann is a shortcut for the Annotations from the eval context.
+func (p *planner) Ann() *tree.Annotations {
+	return p.ExtendedEvalContext().EvalContext.Annotations
 }
 
 // txnModesSetter is an interface used by SQL execution to influence the current

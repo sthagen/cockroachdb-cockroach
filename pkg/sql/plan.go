@@ -15,10 +15,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
-	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -136,8 +136,10 @@ type planNodeReadingOwnWrites interface {
 }
 
 var _ planNode = &alterIndexNode{}
+var _ planNode = &alterSchemaNode{}
 var _ planNode = &alterSequenceNode{}
 var _ planNode = &alterTableNode{}
+var _ planNode = &alterTableSetSchemaNode{}
 var _ planNode = &alterTypeNode{}
 var _ planNode = &bufferNode{}
 var _ planNode = &cancelQueriesNode{}
@@ -157,6 +159,7 @@ var _ planNode = &deleteRangeNode{}
 var _ planNode = &distinctNode{}
 var _ planNode = &dropDatabaseNode{}
 var _ planNode = &dropIndexNode{}
+var _ planNode = &dropSchemaNode{}
 var _ planNode = &dropSequenceNode{}
 var _ planNode = &dropTableNode{}
 var _ planNode = &dropTypeNode{}
@@ -178,6 +181,7 @@ var _ planNode = &limitNode{}
 var _ planNode = &max1RowNode{}
 var _ planNode = &ordinalityNode{}
 var _ planNode = &projectSetNode{}
+var _ planNode = &refreshMaterializedViewNode{}
 var _ planNode = &recursiveCTENode{}
 var _ planNode = &relocateNode{}
 var _ planNode = &renameColumnNode{}
@@ -216,6 +220,7 @@ var _ planNodeFastPath = &controlJobsNode{}
 var _ planNodeFastPath = &controlSchedulesNode{}
 
 var _ planNodeReadingOwnWrites = &alterIndexNode{}
+var _ planNodeReadingOwnWrites = &alterSchemaNode{}
 var _ planNodeReadingOwnWrites = &alterSequenceNode{}
 var _ planNodeReadingOwnWrites = &alterTableNode{}
 var _ planNodeReadingOwnWrites = &alterTypeNode{}
@@ -225,7 +230,9 @@ var _ planNodeReadingOwnWrites = &createTableNode{}
 var _ planNodeReadingOwnWrites = &createTypeNode{}
 var _ planNodeReadingOwnWrites = &createViewNode{}
 var _ planNodeReadingOwnWrites = &changePrivilegesNode{}
+var _ planNodeReadingOwnWrites = &dropSchemaNode{}
 var _ planNodeReadingOwnWrites = &dropTypeNode{}
+var _ planNodeReadingOwnWrites = &refreshMaterializedViewNode{}
 var _ planNodeReadingOwnWrites = &setZoneConfigNode{}
 
 // planNodeRequireSpool serves as marker for nodes whose parent must
@@ -319,39 +326,17 @@ type planMaybePhysical struct {
 	physPlan *physicalPlanTop
 }
 
-func (p *planMaybePhysical) isPhysicalPlan() bool {
-	return p.physPlan != nil
+func makePlanMaybePhysical(physPlan *PhysicalPlan, planNodesToClose []planNode) planMaybePhysical {
+	return planMaybePhysical{
+		physPlan: &physicalPlanTop{
+			PhysicalPlan:     physPlan,
+			planNodesToClose: planNodesToClose,
+		},
+	}
 }
 
-func (p *planMaybePhysical) isPartiallyDistributed() bool {
-	// By default, we assume that the plan is "local" (it doesn't matter
-	// whether the plan is actually "distributed" or not, only that is not
-	// "partially distributed").
-	distribution := physicalplan.LocalPlan
-	// Next we check all possible scenarios in which we might have partially
-	// distributed plans.
-	if p.isPhysicalPlan() {
-		distribution = p.physPlan.Distribution
-	} else {
-		// Even when the whole plan is not physical, we might have EXPLAIN
-		// planNodes that themselves contain a physical plan, so we need to
-		// peek inside of those.
-		switch n := p.planNode.(type) {
-		case *explainPlanNode:
-			if n.plan.main.isPhysicalPlan() {
-				distribution = n.plan.main.physPlan.Distribution
-			}
-		case *explainDistSQLNode:
-			if n.plan.main.isPhysicalPlan() {
-				distribution = n.plan.main.physPlan.Distribution
-			}
-		case *explainVecNode:
-			if n.plan.isPhysicalPlan() {
-				distribution = n.plan.physPlan.Distribution
-			}
-		}
-	}
-	return distribution == physicalplan.PartiallyDistributedPlan
+func (p *planMaybePhysical) isPhysicalPlan() bool {
+	return p.physPlan != nil
 }
 
 func (p *planMaybePhysical) planColumns() sqlbase.ResultColumns {
@@ -506,8 +491,8 @@ func (p *planner) maybePlanHook(ctx context.Context, stmt tree.Statement) (planN
 
 // Mark transaction as operating on the system DB if the descriptor id
 // is within the SystemConfig range.
-func (p *planner) maybeSetSystemConfig(id sqlbase.ID) error {
-	if !sqlbase.IsSystemConfigID(id) {
+func (p *planner) maybeSetSystemConfig(id descpb.ID) error {
+	if !descpb.IsSystemConfigID(id) {
 		return nil
 	}
 	// Mark transaction as operating on the system DB.
@@ -549,6 +534,9 @@ const (
 	// planFlagVectorized is set if the plan is executed via the vectorized
 	// engine.
 	planFlagVectorized
+
+	// planFlagTenant is set if the plan is executed on behalf of a tenant.
+	planFlagTenant
 )
 
 func (pf planFlags) IsSet(flag planFlags) bool {

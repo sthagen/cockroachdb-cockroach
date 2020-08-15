@@ -14,8 +14,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -33,12 +35,13 @@ type createViewNode struct {
 	viewName *tree.TableName
 	// viewQuery contains the view definition, with all table names fully
 	// qualified.
-	viewQuery   string
-	ifNotExists bool
-	replace     bool
-	temporary   bool
-	dbDesc      *sqlbase.ImmutableDatabaseDescriptor
-	columns     sqlbase.ResultColumns
+	viewQuery    string
+	ifNotExists  bool
+	replace      bool
+	persistence  tree.Persistence
+	materialized bool
+	dbDesc       *sqlbase.ImmutableDatabaseDescriptor
+	columns      sqlbase.ResultColumns
 
 	// planDeps tracks which tables and views the view being created
 	// depends on. This is collected during the construction of
@@ -55,31 +58,31 @@ func (n *createViewNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("view"))
 
 	viewName := n.viewName.Object()
-	isTemporary := n.temporary
+	persistence := n.persistence
 	log.VEventf(params.ctx, 2, "dependencies for view %s:\n%s", viewName, n.planDeps.String())
 
 	// First check the backrefs and see if any of them are temporary.
 	// If so, promote this view to temporary.
-	backRefMutables := make(map[sqlbase.ID]*sqlbase.MutableTableDescriptor, len(n.planDeps))
+	backRefMutables := make(map[descpb.ID]*sqlbase.MutableTableDescriptor, len(n.planDeps))
 	for id, updated := range n.planDeps {
 		backRefMutable := params.p.Descriptors().GetUncommittedTableByID(id)
 		if backRefMutable == nil {
 			backRefMutable = sqlbase.NewMutableExistingTableDescriptor(*updated.desc.TableDesc())
 		}
-		if !isTemporary && backRefMutable.Temporary {
+		if !persistence.IsTemporary() && backRefMutable.Temporary {
 			// This notice is sent from pg, let's imitate.
 			params.p.SendClientNotice(
 				params.ctx,
 				pgnotice.Newf(`view "%s" will be a temporary view`, viewName),
 			)
-			isTemporary = true
+			persistence = tree.PersistenceTemporary
 		}
 		backRefMutables[id] = backRefMutable
 	}
 
 	var replacingDesc *sqlbase.MutableTableDescriptor
 
-	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), isTemporary, n.viewName)
+	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), persistence, n.viewName)
 	if err != nil {
 		switch {
 		case !sqlbase.IsRelationAlreadyExistsError(err):
@@ -109,12 +112,11 @@ func (n *createViewNode) startExec(params runParams) error {
 		}
 	}
 
-	if isTemporary {
+	if n.persistence.IsTemporary() {
 		telemetry.Inc(sqltelemetry.CreateTempViewCounter)
 	}
 
-	// Inherit permissions from the database descriptor.
-	privs := n.dbDesc.GetPrivileges()
+	privs := createInheritedPrivilegesFromDBDesc(n.dbDesc, params.SessionData().User)
 
 	var newDesc *sqlbase.MutableTableDescriptor
 
@@ -150,10 +152,30 @@ func (n *createViewNode) startExec(params runParams) error {
 			privs,
 			&params.p.semaCtx,
 			params.p.EvalContext(),
-			isTemporary,
+			n.persistence,
 		)
 		if err != nil {
 			return err
+		}
+
+		if n.materialized {
+			// Ensure all nodes are the correct version.
+			if !params.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.VersionMaterializedViews) {
+				return pgerror.New(pgcode.FeatureNotSupported,
+					"all nodes are not the correct version to use materialized views")
+			}
+			// If the view is materialized, set up some more state on the view descriptor.
+			// In particular,
+			// * mark the descriptor as a materialized view
+			// * mark the state as adding and remember the AsOf time to perform
+			//   the view query
+			// * use AllocateIDs to give the view descriptor a primary key
+			desc.IsMaterializedView = true
+			desc.State = descpb.TableDescriptor_ADD
+			desc.CreateAsOfTime = params.p.Txn().ReadTimestamp()
+			if err := desc.AllocateIDs(); err != nil {
+				return err
+			}
 		}
 
 		// Collect all the tables/views this view depends on.
@@ -194,7 +216,7 @@ func (n *createViewNode) startExec(params runParams) error {
 		if err := params.p.writeSchemaChange(
 			params.ctx,
 			backRefMutable,
-			sqlbase.InvalidMutationID,
+			descpb.InvalidMutationID,
 			fmt.Sprintf("updating view reference %q in table %s(%d)", n.viewName,
 				updated.desc.Name, updated.desc.ID,
 			),
@@ -247,15 +269,15 @@ func makeViewTableDesc(
 	ctx context.Context,
 	viewName string,
 	viewQuery string,
-	parentID sqlbase.ID,
-	schemaID sqlbase.ID,
-	id sqlbase.ID,
+	parentID descpb.ID,
+	schemaID descpb.ID,
+	id descpb.ID,
 	resultColumns []sqlbase.ResultColumn,
 	creationTime hlc.Timestamp,
-	privileges *sqlbase.PrivilegeDescriptor,
+	privileges *descpb.PrivilegeDescriptor,
 	semaCtx *tree.SemaContext,
 	evalCtx *tree.EvalContext,
-	temporary bool,
+	persistence tree.Persistence,
 ) (sqlbase.MutableTableDescriptor, error) {
 	desc := sqlbase.InitTableDescriptor(
 		id,
@@ -264,12 +286,13 @@ func makeViewTableDesc(
 		viewName,
 		creationTime,
 		privileges,
-		temporary,
+		persistence,
 	)
 	desc.ViewQuery = viewQuery
 	if err := addResultColumns(ctx, semaCtx, evalCtx, &desc, resultColumns); err != nil {
 		return sqlbase.MutableTableDescriptor{}, err
 	}
+
 	return desc, nil
 }
 
@@ -282,12 +305,12 @@ func (p *planner) replaceViewDesc(
 	ctx context.Context,
 	n *createViewNode,
 	toReplace *sqlbase.MutableTableDescriptor,
-	backRefMutables map[sqlbase.ID]*sqlbase.MutableTableDescriptor,
+	backRefMutables map[descpb.ID]*sqlbase.MutableTableDescriptor,
 ) (*sqlbase.MutableTableDescriptor, error) {
 	// Set the query to the new query.
 	toReplace.ViewQuery = n.viewQuery
 	// Reset the columns to add the new result columns onto.
-	toReplace.Columns = make([]sqlbase.ColumnDescriptor, 0, len(n.columns))
+	toReplace.Columns = make([]descpb.ColumnDescriptor, 0, len(n.columns))
 	toReplace.NextColumnID = 0
 	if err := addResultColumns(ctx, &p.semaCtx, p.EvalContext(), toReplace, n.columns); err != nil {
 		return nil, err
@@ -321,7 +344,7 @@ func (p *planner) replaceViewDesc(
 			if err := p.writeSchemaChange(
 				ctx,
 				desc,
-				sqlbase.InvalidMutationID,
+				descpb.InvalidMutationID,
 				fmt.Sprintf("removing view reference for %q from %s(%d)", n.viewName,
 					desc.Name, desc.ID,
 				),
@@ -333,14 +356,14 @@ func (p *planner) replaceViewDesc(
 
 	// Since the view query has been replaced, the dependencies that this
 	// table descriptor had are gone.
-	toReplace.DependsOn = make([]sqlbase.ID, 0, len(n.planDeps))
+	toReplace.DependsOn = make([]descpb.ID, 0, len(n.planDeps))
 	for backrefID := range n.planDeps {
 		toReplace.DependsOn = append(toReplace.DependsOn, backrefID)
 	}
 
 	// Since we are replacing an existing view here, we need to write the new
 	// descriptor into place.
-	if err := p.writeSchemaChange(ctx, toReplace, sqlbase.InvalidMutationID,
+	if err := p.writeSchemaChange(ctx, toReplace, descpb.InvalidMutationID,
 		fmt.Sprintf("CREATE OR REPLACE VIEW %q AS %q", n.viewName, n.viewQuery),
 	); err != nil {
 		return nil, err
@@ -376,7 +399,7 @@ func addResultColumns(
 // verifyReplacingViewColumns ensures that the new set of view columns must
 // have at least the same prefix of columns as the old view. We attempt to
 // match the postgres error message in each of the error cases below.
-func verifyReplacingViewColumns(oldColumns, newColumns []sqlbase.ColumnDescriptor) error {
+func verifyReplacingViewColumns(oldColumns, newColumns []descpb.ColumnDescriptor) error {
 	if len(newColumns) < len(oldColumns) {
 		return pgerror.Newf(pgcode.InvalidTableDefinition, "cannot drop columns from view")
 	}

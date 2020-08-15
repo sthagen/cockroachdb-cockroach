@@ -16,7 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -34,34 +34,34 @@ func makeAny(t *testing.T, msg protoutil.Message) *pbtypes.Any {
 func TestMessageToJSONBRoundTrip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	for _, tc := range []struct {
+	testCases := []struct {
 		pbname  string
 		message protoutil.Message
 	}{
 		{ // Just a simple Message
 			pbname: "cockroach.sql.sqlbase.Descriptor",
-			message: &sqlbase.Descriptor{
-				Union: &sqlbase.Descriptor_Table{
-					Table: &sqlbase.TableDescriptor{Name: "the table"},
+			message: &descpb.Descriptor{
+				Union: &descpb.Descriptor_Table{
+					Table: &descpb.TableDescriptor{Name: "the table"},
 				},
 			},
 		},
 		{ // Message with an array
 			pbname: "cockroach.sql.sqlbase.ColumnDescriptor",
-			message: &sqlbase.ColumnDescriptor{
+			message: &descpb.ColumnDescriptor{
 				Name:            "column",
 				ID:              123,
-				OwnsSequenceIds: []sqlbase.ID{3, 2, 1},
+				OwnsSequenceIds: []descpb.ID{3, 2, 1},
 			},
 		},
 		{ // Message with an array and other embedded descriptors
 			pbname: "cockroach.sql.sqlbase.IndexDescriptor",
-			message: &sqlbase.IndexDescriptor{
+			message: &descpb.IndexDescriptor{
 				Name:             "myidx",
-				ID:               42,
+				ID:               500,
 				Unique:           true,
 				ColumnNames:      []string{"foo", "bar", "buz"},
-				ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC},
+				ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				GeoConfig: geoindex.Config{
 					S2Geography: &geoindex.S2GeographyConfig{S2Config: &geoindex.S2Config{
 						MinLevel: 123,
@@ -80,36 +80,61 @@ func TestMessageToJSONBRoundTrip(t *testing.T) {
 			message: &tracing.RecordedSpan{
 				TraceID: 123,
 				Tags:    map[string]string{"one": "1", "two": "2", "three": "3"},
-				Stats:   makeAny(t, &sqlbase.ColumnDescriptor{Name: "bogus stats"}),
+				Stats:   makeAny(t, &descpb.ColumnDescriptor{Name: "bogus stats"}),
 			},
 		},
 		{ // Message deeply nested inside other message
 			pbname:  "cockroach.sql.sqlbase.TableDescriptor.SequenceOpts.SequenceOwner",
-			message: &sqlbase.TableDescriptor_SequenceOpts_SequenceOwner{OwnerColumnID: 123},
+			message: &descpb.TableDescriptor_SequenceOpts_SequenceOwner{OwnerColumnID: 123},
 		},
-	} {
-		t.Run(tc.pbname, func(t *testing.T) {
-			protoData, err := protoutil.Marshal(tc.message)
-			require.NoError(t, err)
-
-			// Decode proto bytes to message and compare.
-			decoded, err := DecodeMessage(tc.pbname, protoData)
-			require.NoError(t, err)
-			require.Equal(t, tc.message, decoded)
-
-			// Encode message as json
-			jsonb, err := MessageToJSON(decoded)
-			require.NoError(t, err)
-
-			// Recreate message from json
-			fromJSON := reflect.New(reflect.TypeOf(tc.message).Elem()).Interface().(protoutil.Message)
-
-			json := &jsonpb.Unmarshaler{}
-			require.NoError(t, json.Unmarshal(strings.NewReader(jsonb.String()), fromJSON))
-
-			require.Equal(t, tc.message, fromJSON)
-		})
 	}
+
+	t.Run("pb-to-json-round-trip", func(t *testing.T) {
+		for _, tc := range testCases {
+			t.Run(tc.pbname, func(t *testing.T) {
+				protoData, err := protoutil.Marshal(tc.message)
+				require.NoError(t, err)
+
+				// Decode proto bytes to message and compare.
+				decoded, err := DecodeMessage(tc.pbname, protoData)
+				require.NoError(t, err)
+				require.Equal(t, tc.message, decoded)
+
+				// Encode message as json
+				jsonb, err := MessageToJSON(decoded)
+				require.NoError(t, err)
+
+				// Recreate message from json
+				fromJSON := reflect.New(reflect.TypeOf(tc.message).Elem()).Interface().(protoutil.Message)
+
+				json := &jsonpb.Unmarshaler{}
+				require.NoError(t, json.Unmarshal(strings.NewReader(jsonb.String()), fromJSON))
+
+				require.Equal(t, tc.message, fromJSON)
+			})
+		}
+	})
+
+	t.Run("identity-round-trip", func(t *testing.T) {
+		for _, tc := range testCases {
+			t.Run(tc.pbname, func(t *testing.T) {
+				jsonb, err := MessageToJSON(tc.message)
+				require.NoError(t, err)
+
+				fromJSON, err := NewMessage(tc.pbname)
+				require.NoError(t, err)
+
+				fromJSONBytes, err := JSONBMarshalToMessage(jsonb, fromJSON)
+				require.NoError(t, err)
+
+				expectedBytes, err := protoutil.Marshal(tc.message)
+				require.NoError(t, err)
+
+				require.Equal(t, expectedBytes, fromJSONBytes)
+			})
+		}
+	})
+
 }
 
 // Ensure we don't blow up when asking to convert invalid

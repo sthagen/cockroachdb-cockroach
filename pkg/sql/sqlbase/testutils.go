@@ -12,7 +12,6 @@ package sqlbase
 
 import (
 	"bytes"
-	"context"
 	gosql "database/sql"
 	"fmt"
 	"math"
@@ -29,16 +28,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/geo/geogen"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -50,85 +47,6 @@ import (
 )
 
 // This file contains utility functions for tests (in other packages).
-
-// TestingGetMutableExistingTableDescriptor retrieves a MutableTableDescriptor
-// directly from the KV layer.
-func TestingGetMutableExistingTableDescriptor(
-	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
-) *MutableTableDescriptor {
-	return NewMutableExistingTableDescriptor(*TestingGetTableDescriptor(kvDB, codec, database, table))
-}
-
-func testingGetDescriptor(
-	ctx context.Context, kvDB *kv.DB, codec keys.SQLCodec, database string, object string,
-) (hlc.Timestamp, *Descriptor) {
-	dKey := NewDatabaseKey(database)
-	gr, err := kvDB.Get(ctx, dKey.Key(codec))
-	if err != nil {
-		panic(err)
-	}
-	if !gr.Exists() {
-		panic("database missing")
-	}
-	dbDescID := ID(gr.ValueInt())
-
-	tKey := NewPublicTableKey(dbDescID, object)
-	gr, err = kvDB.Get(ctx, tKey.Key(codec))
-	if err != nil {
-		panic(err)
-	}
-	if !gr.Exists() {
-		panic("object missing")
-	}
-
-	descKey := MakeDescMetadataKey(codec, ID(gr.ValueInt()))
-	desc := &Descriptor{}
-	ts, err := kvDB.GetProtoTs(ctx, descKey, desc)
-	if err != nil || desc.Equal(Descriptor{}) {
-		log.Fatalf(ctx, "proto with id %d missing. err: %v", gr.ValueInt(), err)
-	}
-	return ts, desc
-}
-
-// TestingGetTypeDescriptor retrieves a type descriptor directly from the kv layer.
-//
-// This function should be moved wherever TestingGetTableDescriptor is moved.
-func TestingGetTypeDescriptor(
-	kvDB *kv.DB, codec keys.SQLCodec, database string, object string,
-) *TypeDescriptor {
-	_, desc := testingGetDescriptor(context.TODO(), kvDB, codec, database, object)
-	return desc.GetType()
-}
-
-// TestingGetTableDescriptor retrieves a table descriptor directly from the KV
-// layer.
-//
-// TODO(ajwerner): Move this to catalogkv and/or question the very existence of
-// this function. Consider renaming to TestingGetTableDescriptorByName or
-// removing it altogether.
-func TestingGetTableDescriptor(
-	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
-) *TableDescriptor {
-	ctx := context.TODO()
-	ts, desc := testingGetDescriptor(ctx, kvDB, codec, database, table)
-	tableDesc := desc.Table(ts)
-	if tableDesc == nil {
-		return nil
-	}
-	err := tableDesc.MaybeFillInDescriptor(ctx, kvDB, codec)
-	if err != nil {
-		log.Fatalf(ctx, "failure to fill in descriptor. err: %v", err)
-	}
-	return tableDesc
-}
-
-// TestingGetImmutableTableDescriptor retrieves an immutable table descriptor
-// directly from the KV layer.
-func TestingGetImmutableTableDescriptor(
-	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
-) *ImmutableTableDescriptor {
-	return NewImmutableTableDescriptor(*TestingGetTableDescriptor(kvDB, codec, database, table))
-}
 
 // RandDatum generates a random Datum of the given type.
 // If nullOk is true, the datum can be DNull.
@@ -188,6 +106,11 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 		default:
 			panic(errors.AssertionFailedf("float with an unexpected width %d", typ.Width()))
 		}
+	case types.Box2DFamily:
+		b := geo.NewCartesianBoundingBox()
+		b.AddPoint(rng.NormFloat64(), rng.NormFloat64())
+		b.AddPoint(rng.NormFloat64(), rng.NormFloat64())
+		return tree.NewDBox2D(b)
 	case types.GeographyFamily:
 		gm, err := typ.GeoMetadata()
 		if err != nil {
@@ -591,6 +514,9 @@ var (
 			// TODO(mjibson): fix intervals to stop overflowing then this can be larger.
 			&tree.DInterval{Duration: duration.MakeDuration(0, 0, 290*12)},
 		},
+		types.Box2DFamily: {
+			&tree.DBox2D{CartesianBoundingBox: &geo.CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: -10, HiX: 10, LoY: -10, HiY: 10}}},
+		},
 		types.GeographyFamily: {
 			// NOTE(otan): we cannot use WKT here because roachtests do not have geos uploaded.
 			// If we parse WKT ourselves or upload GEOS on every roachtest, we may be able to avoid this.
@@ -925,8 +851,8 @@ func RandSortingTypes(rng *rand.Rand, numCols int) []*types.T {
 }
 
 // RandDatumEncoding returns a random DatumEncoding value.
-func RandDatumEncoding(rng *rand.Rand) DatumEncoding {
-	return DatumEncoding(rng.Intn(len(DatumEncoding_value)))
+func RandDatumEncoding(rng *rand.Rand) descpb.DatumEncoding {
+	return descpb.DatumEncoding(rng.Intn(len(descpb.DatumEncoding_value)))
 }
 
 // RandEncodableType wraps RandType in order to workaround #36736, which fails
@@ -1053,7 +979,9 @@ func RandEncDatumRowsOfTypes(rng *rand.Rand, numRows int, types []*types.T) EncD
 //  - bool (converts to DBool)
 //  - int (converts to DInt)
 //  - string (converts to DString)
-func TestingMakePrimaryIndexKey(desc *TableDescriptor, vals ...interface{}) (roachpb.Key, error) {
+func TestingMakePrimaryIndexKey(
+	desc *ImmutableTableDescriptor, vals ...interface{},
+) (roachpb.Key, error) {
 	index := &desc.PrimaryIndex
 	if len(vals) > len(index.ColumnIDs) {
 		return nil, errors.Errorf("got %d values, PK has %d columns", len(vals), len(index.ColumnIDs))
@@ -1087,7 +1015,7 @@ func TestingMakePrimaryIndexKey(desc *TableDescriptor, vals ...interface{}) (roa
 	}
 	// Create the ColumnID to index in datums slice map needed by
 	// MakeIndexKeyPrefix.
-	colIDToRowIndex := make(map[ColumnID]int)
+	colIDToRowIndex := make(map[descpb.ColumnID]int)
 	for i := range vals {
 		colIDToRowIndex[index.ColumnIDs[i]] = i
 	}
@@ -1335,36 +1263,49 @@ func ColumnFamilyMutator(rng *rand.Rand, stmt tree.Statement) (changed bool) {
 	return true
 }
 
+// tableInfo is a helper struct that contains information necessary for mutating
+// indexes. It is used by IndexStoringMutator and PartialIndexMutator.
 type tableInfo struct {
-	columnNames []tree.Name
-	pkCols      []tree.Name
+	columnNames      []tree.Name
+	columnsTableDefs []*tree.ColumnTableDef
+	pkCols           []tree.Name
 }
 
-// IndexStoringMutator is mutations.StatementMutator, but lives here to prevent
-// dependency cycles with RandCreateTable.
-func IndexStoringMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Statement, bool) {
-	changed := false
-	tables := map[tree.Name]tableInfo{}
-	getTableInfoFromCreateStatement := func(ct *tree.CreateTable) tableInfo {
-		var columnNames []tree.Name
-		var pkCols []tree.Name
-		for _, def := range ct.Defs {
-			switch ast := def.(type) {
-			case *tree.ColumnTableDef:
-				columnNames = append(columnNames, ast.Name)
-				if ast.PrimaryKey.IsPrimaryKey {
-					pkCols = []tree.Name{ast.Name}
-				}
-			case *tree.UniqueConstraintTableDef:
-				if ast.PrimaryKey {
-					for _, elem := range ast.Columns {
-						pkCols = append(pkCols, elem.Column)
+// getTableInfoFromCreateStatements collects tableInfo from every CreateTable
+// statement in the given list of statements.
+func getTableInfoFromCreateStatements(stmts []tree.Statement) map[tree.Name]tableInfo {
+	tables := make(map[tree.Name]tableInfo)
+	for _, stmt := range stmts {
+		switch ast := stmt.(type) {
+		case *tree.CreateTable:
+			info := tableInfo{}
+			for _, def := range ast.Defs {
+				switch ast := def.(type) {
+				case *tree.ColumnTableDef:
+					info.columnNames = append(info.columnNames, ast.Name)
+					info.columnsTableDefs = append(info.columnsTableDefs, ast)
+					if ast.PrimaryKey.IsPrimaryKey {
+						info.pkCols = []tree.Name{ast.Name}
+					}
+				case *tree.UniqueConstraintTableDef:
+					if ast.PrimaryKey {
+						for _, elem := range ast.Columns {
+							info.pkCols = append(info.pkCols, elem.Column)
+						}
 					}
 				}
 			}
+			tables[ast.Table.ObjectName] = info
 		}
-		return tableInfo{columnNames: columnNames, pkCols: pkCols}
 	}
+	return tables
+}
+
+// IndexStoringMutator is a mutations.MultiStatementMutator, but lives here to
+// prevent dependency cycles with RandCreateTable.
+func IndexStoringMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Statement, bool) {
+	changed := false
+	tables := getTableInfoFromCreateStatements(stmts)
 	mapFromIndexCols := func(cols []tree.Name) map[tree.Name]struct{} {
 		colMap := map[tree.Name]struct{}{}
 		for _, col := range cols {
@@ -1405,9 +1346,10 @@ func IndexStoringMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Stateme
 				changed = true
 			}
 		case *tree.CreateTable:
-			// Write down this table for later.
-			tableInfo := getTableInfoFromCreateStatement(ast)
-			tables[ast.Table.ObjectName] = tableInfo
+			tableInfo, ok := tables[ast.Table.ObjectName]
+			if !ok {
+				panic("table info could not be found")
+			}
 			for _, def := range ast.Defs {
 				var idx *tree.IndexTableDef
 				switch defType := def.(type) {
@@ -1436,6 +1378,68 @@ func IndexStoringMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Stateme
 	return stmts, changed
 }
 
+// PartialIndexMutator is a mutations.MultiStatementMutator, but lives here to
+// prevent dependency cycles with RandCreateTable. This mutator adds random
+// partial index predicate expressions to indexes.
+func PartialIndexMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Statement, bool) {
+	changed := false
+	tables := getTableInfoFromCreateStatements(stmts)
+	for _, stmt := range stmts {
+		switch ast := stmt.(type) {
+		case *tree.CreateIndex:
+			// TODO(mgartner): Create partial inverted indexes when they are
+			// fully supported.
+			if ast.Inverted {
+				continue
+			}
+
+			tableInfo, ok := tables[ast.Table.ObjectName]
+			if !ok {
+				continue
+			}
+
+			// If the index is not already a partial index, make it a partial
+			// index with a 50% chance.
+			if ast.Predicate == nil && rng.Intn(2) == 0 {
+				tn := tree.MakeUnqualifiedTableName(ast.Table.ObjectName)
+				ast.Predicate = randPartialIndexPredicateFromCols(rng, tableInfo.columnsTableDefs, &tn)
+				changed = true
+			}
+		case *tree.CreateTable:
+			tableInfo, ok := tables[ast.Table.ObjectName]
+			if !ok {
+				panic("table info could not be found")
+			}
+			for _, def := range ast.Defs {
+				var idx *tree.IndexTableDef
+				switch defType := def.(type) {
+				case *tree.IndexTableDef:
+					idx = defType
+				case *tree.UniqueConstraintTableDef:
+					if !defType.PrimaryKey {
+						idx = &defType.IndexTableDef
+					}
+				}
+
+				// TODO(mgartner): Create partial inverted indexes when they are
+				// fully supported.
+				if idx == nil || idx.Inverted {
+					continue
+				}
+
+				// If the index is not already a partial index, make it a partial
+				// index with a 50% chance.
+				if idx.Predicate == nil && rng.Intn(2) == 0 {
+					tn := tree.MakeUnqualifiedTableName(ast.Table.ObjectName)
+					idx.Predicate = randPartialIndexPredicateFromCols(rng, tableInfo.columnsTableDefs, &tn)
+					changed = true
+				}
+			}
+		}
+	}
+	return stmts, changed
+}
+
 // randColumnTableDef produces a random ColumnTableDef, with a random type and
 // nullability.
 func randColumnTableDef(rand *rand.Rand, tableIdx int, colIdx int) *tree.ColumnTableDef {
@@ -1449,6 +1453,8 @@ func randColumnTableDef(rand *rand.Rand, tableIdx int, colIdx int) *tree.ColumnT
 	return columnDef
 }
 
+// randIndexTableDefFromCols creates an IndexTableDef with a random subset of
+// the given columns and a random direction.
 func randIndexTableDefFromCols(
 	rng *rand.Rand, columnTableDefs []*tree.ColumnTableDef,
 ) tree.IndexTableDef {
@@ -1471,6 +1477,110 @@ func randIndexTableDefFromCols(
 		})
 	}
 	return tree.IndexTableDef{Columns: indexElemList}
+}
+
+// randPartialIndexPredicateFromCols creates a partial index expression with a
+// random subset of the given columns. There is a possibility that a partial
+// index expression cannot be created for the given columns, in which case nil
+// is returned. This happens when none of the columns have types that are
+// supported for creating partial index predicate expressions. See
+// isAllowedPartialIndexColType for details on which types are supported.
+func randPartialIndexPredicateFromCols(
+	rng *rand.Rand, columnTableDefs []*tree.ColumnTableDef, tableName *tree.TableName,
+) tree.Expr {
+	// Shuffle the columns.
+	cpy := make([]*tree.ColumnTableDef, len(columnTableDefs))
+	copy(cpy, columnTableDefs)
+	rng.Shuffle(len(cpy), func(i, j int) { cpy[i], cpy[j] = cpy[j], cpy[i] })
+
+	// Select a random number of columns (at least 1). Loop through the columns
+	// to find columns with types that are currently supported for generating
+	// partial index expressions.
+	nCols := rng.Intn(len(cpy)) + 1
+	cols := make([]*tree.ColumnTableDef, 0, nCols)
+	for _, col := range cpy {
+		if isAllowedPartialIndexColType(col) {
+			cols = append(cols, col)
+		}
+		if len(cols) == nCols {
+			break
+		}
+	}
+
+	// Build a boolean expression tree with containing a reference to each
+	// column.
+	var e tree.Expr
+	for _, columnTableDef := range cols {
+		expr := randBoolColumnExpr(rng, columnTableDef, tableName)
+		// If an expression has already been built, combine the previous and
+		// current expression with an AndExpr or OrExpr.
+		if e != nil {
+			expr = randAndOrExpr(rng, e, expr)
+		}
+		e = expr
+	}
+	return e
+}
+
+// isAllowedPartialIndexColType returns true if the column type is supported and
+// the column can be included in generating random partial index predicate
+// expressions. Currently, the following types are supported:
+//
+//   - Booleans
+//   - Types that are valid in comparison operations (=, !=, <, <=, >, >=).
+//
+// This function must be kept in sync with the implementation of
+// randBoolColumnExpr.
+func isAllowedPartialIndexColType(columnTableDef *tree.ColumnTableDef) bool {
+	switch fam := columnTableDef.Type.(*types.T).Family(); fam {
+	case types.BoolFamily, types.IntFamily, types.FloatFamily, types.DecimalFamily,
+		types.StringFamily, types.DateFamily, types.TimeFamily, types.TimeTZFamily,
+		types.TimestampFamily, types.TimestampTZFamily, types.BytesFamily:
+		return true
+	default:
+		return false
+	}
+}
+
+var cmpOps = []tree.ComparisonOperator{tree.EQ, tree.NE, tree.LT, tree.LE, tree.GE, tree.GT}
+
+// randBoolColumnExpr returns a random boolean expression with the given column.
+func randBoolColumnExpr(
+	rng *rand.Rand, columnTableDef *tree.ColumnTableDef, tableName *tree.TableName,
+) tree.Expr {
+	varExpr := tree.NewColumnItem(tableName, columnTableDef.Name)
+	t := columnTableDef.Type.(*types.T)
+
+	// If the column is a boolean, then return it or NOT it as an expression.
+	if t.Family() == types.BoolFamily {
+		if rng.Intn(2) == 0 {
+			return &tree.NotExpr{Expr: varExpr}
+		}
+		return varExpr
+	}
+
+	// Otherwise, return a comparison expression with a random comparison
+	// operator, the column as the left side, and an interesting datum as the
+	// right side.
+	op := cmpOps[rng.Intn(len(cmpOps))]
+	datum := randInterestingDatum(rng, t)
+	return &tree.ComparisonExpr{Operator: op, Left: varExpr, Right: datum}
+}
+
+// randAndOrExpr combines the left and right expressions with either an OrExpr
+// or an AndExpr.
+func randAndOrExpr(rng *rand.Rand, left, right tree.Expr) tree.Expr {
+	if rng.Intn(2) == 0 {
+		return &tree.OrExpr{
+			Left:  left,
+			Right: right,
+		}
+	}
+
+	return &tree.AndExpr{
+		Left:  left,
+		Right: right,
+	}
 }
 
 // The following variables are useful for testing.

@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -54,7 +55,7 @@ func (p *planner) createDatabase(
 
 	dbName := string(database.Name)
 	shouldCreatePublicSchema := true
-	dKey := sqlbase.MakeDatabaseNameKey(ctx, p.ExecCfg().Settings, dbName)
+	dKey := catalogkv.MakeDatabaseNameKey(ctx, p.ExecCfg().Settings, dbName)
 	// TODO(solon): This conditional can be removed in 20.2. Every database
 	// is created with a public schema for cluster version >= 20.1, so we can remove
 	// the `shouldCreatePublicSchema` logic as well.
@@ -62,7 +63,7 @@ func (p *planner) createDatabase(
 		shouldCreatePublicSchema = false
 	}
 
-	if exists, _, err := sqlbase.LookupDatabaseID(ctx, p.txn, p.ExecCfg().Codec, dbName); err == nil && exists {
+	if exists, _, err := catalogkv.LookupDatabaseID(ctx, p.txn, p.ExecCfg().Codec, dbName); err == nil && exists {
 		if database.IfNotExists {
 			// Noop.
 			return nil, false, nil
@@ -81,7 +82,7 @@ func (p *planner) createDatabase(
 	// MutableDatabaseDescriptor and where/how this will interact with the
 	// descs.Collection (now it happens well above this call, which is probably
 	// fine).
-	desc := sqlbase.NewInitialDatabaseDescriptor(id, string(database.Name))
+	desc := sqlbase.NewInitialDatabaseDescriptor(id, string(database.Name), p.SessionData().User)
 	if err := p.createDescriptorWithID(ctx, dKey.Key(p.ExecCfg().Codec), id, desc, nil, jobDesc); err != nil {
 		return nil, true, err
 	}
@@ -101,8 +102,8 @@ func (p *planner) createDatabase(
 func (p *planner) createDescriptorWithID(
 	ctx context.Context,
 	idKey roachpb.Key,
-	id sqlbase.ID,
-	descriptor sqlbase.DescriptorInterface,
+	id descpb.ID,
+	descriptor sqlbase.Descriptor,
 	st *cluster.Settings,
 	jobDesc string,
 ) error {
@@ -169,7 +170,7 @@ func (p *planner) createDescriptorWithID(
 			ctx,
 			mutDesc,
 			jobDesc,
-			sqlbase.InvalidMutationID); err != nil {
+			descpb.InvalidMutationID); err != nil {
 			return err
 		}
 	}

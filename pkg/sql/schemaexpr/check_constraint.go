@@ -15,12 +15,13 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-// CheckConstraintBuilder creates sqlbase.TableDescriptor_CheckConstraints from
+// CheckConstraintBuilder creates descpb.TableDescriptor_CheckConstraints from
 // tree.CheckConstraintTableDefs. See Build for more details.
 type CheckConstraintBuilder struct {
 	ctx       context.Context
@@ -35,10 +36,10 @@ type CheckConstraintBuilder struct {
 	inUseNames map[string]struct{}
 }
 
-// NewCheckConstraintBuilder returns a CheckConstraintBuilder struct that can
-// be used to build sqlbase.TableDescriptor_CheckConstraints. See Build for more
+// MakeCheckConstraintBuilder returns a CheckConstraintBuilder struct that can
+// be used to build descpb.TableDescriptor_CheckConstraints. See Build for more
 // details.
-func NewCheckConstraintBuilder(
+func MakeCheckConstraintBuilder(
 	ctx context.Context,
 	tableName tree.TableName,
 	desc *sqlbase.MutableTableDescriptor,
@@ -60,7 +61,7 @@ func (b *CheckConstraintBuilder) MarkNameInUse(name string) {
 }
 
 // Build validates the input tree.CheckConstraintTableDef and, if valid, returns
-// a sqlbase.TableDescriptor_CheckConstraint. If the input constraint does not
+// a descpb.TableDescriptor_CheckConstraint. If the input constraint does not
 // have a name, Build generates a name based on the variables referenced in the
 // check expression.
 //
@@ -75,7 +76,7 @@ func (b *CheckConstraintBuilder) MarkNameInUse(name string) {
 // predicates, but using them can lead to unexpected behavior.
 func (b *CheckConstraintBuilder) Build(
 	c *tree.CheckConstraintTableDef,
-) (*sqlbase.TableDescriptor_CheckConstraint, error) {
+) (*descpb.TableDescriptor_CheckConstraint, error) {
 	name := string(c.Name)
 
 	if name == "" {
@@ -88,7 +89,7 @@ func (b *CheckConstraintBuilder) Build(
 
 	// Verify that the expression results in a boolean and does not use
 	// invalid functions.
-	typedExpr, colIDs, err := DequalifyAndValidateExpr(
+	expr, colIDs, err := DequalifyAndValidateExpr(
 		b.ctx,
 		b.desc,
 		c.Expr,
@@ -102,8 +103,8 @@ func (b *CheckConstraintBuilder) Build(
 		return nil, err
 	}
 
-	return &sqlbase.TableDescriptor_CheckConstraint{
-		Expr:      tree.Serialize(typedExpr),
+	return &descpb.TableDescriptor_CheckConstraint{
+		Expr:      expr,
 		Name:      name,
 		ColumnIDs: colIDs.Ordered(),
 		Hidden:    c.Hidden,
@@ -160,7 +161,7 @@ func (b *CheckConstraintBuilder) DefaultName(expr tree.Expr) (string, error) {
 	var nameBuf bytes.Buffer
 	nameBuf.WriteString("check")
 
-	err := iterColDescriptors(b.desc, expr, func(c *sqlbase.ColumnDescriptor) error {
+	err := iterColDescriptors(b.desc, expr, func(c *descpb.ColumnDescriptor) error {
 		nameBuf.WriteByte('_')
 		nameBuf.WriteString(c.Name)
 		return nil

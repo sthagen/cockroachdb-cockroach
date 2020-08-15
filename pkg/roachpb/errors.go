@@ -364,6 +364,11 @@ func (e *RangeNotFoundError) message(_ *Error) string {
 
 var _ ErrorDetailInterface = &RangeNotFoundError{}
 
+// IsRangeNotFoundError returns true if err contains a *RangeNotFoundError.
+func IsRangeNotFoundError(err error) bool {
+	return errors.HasType(err, (*RangeNotFoundError)(nil))
+}
+
 // NewRangeKeyMismatchError initializes a new RangeKeyMismatchError.
 //
 // desc and lease represent info about the range that the request was
@@ -421,7 +426,7 @@ func (e *RangeKeyMismatchError) Ranges() []RangeInfo {
 	if len(e.rangesInternal) != 0 {
 		return e.rangesInternal
 	}
-	// Fallback for 20.1 errors. Remove in 20.3.
+	// Fallback for 20.1 errors. Remove in 21.1.
 	ranges := []RangeInfo{{Desc: e.DeprecatedMismatchedRange}}
 	if e.DeprecatedSuggestedRange != nil {
 		ranges = append(ranges, RangeInfo{Desc: *e.DeprecatedSuggestedRange})
@@ -454,6 +459,12 @@ var _ ErrorDetailInterface = &RangeKeyMismatchError{}
 // an explanatory message.
 func NewAmbiguousResultError(msg string) *AmbiguousResultError {
 	return &AmbiguousResultError{Message: msg}
+}
+
+// NewAmbiguousResultErrorf initializes a new AmbiguousResultError with
+// an explanatory format and set of arguments.
+func NewAmbiguousResultErrorf(format string, args ...interface{}) *AmbiguousResultError {
+	return NewAmbiguousResultError(fmt.Sprintf(format, args...))
 }
 
 func (e *AmbiguousResultError) Error() string {
@@ -924,8 +935,3 @@ func (e *IndeterminateCommitError) message(pErr *Error) string {
 }
 
 var _ ErrorDetailInterface = &IndeterminateCommitError{}
-
-// IsRangeNotFoundError returns true if err contains a *RangeNotFoundError.
-func IsRangeNotFoundError(err error) bool {
-	return errors.HasType(err, (*RangeNotFoundError)(nil))
-}

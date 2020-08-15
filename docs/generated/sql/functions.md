@@ -29,6 +29,8 @@
 </span></td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: <a href="uuid.html">uuid</a>[], elem: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
+<tr><td><a name="array_append"></a><code>array_append(array: box2d[], elem: box2d) &rarr; box2d[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
+</span></td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: geography[], elem: geography) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: geometry[], elem: geometry) &rarr; geometry[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
@@ -64,6 +66,8 @@
 <tr><td><a name="array_cat"></a><code>array_cat(left: <a href="timestamp.html">timestamptz</a>[], right: <a href="timestamp.html">timestamptz</a>[]) &rarr; <a href="timestamp.html">timestamptz</a>[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td></tr>
 <tr><td><a name="array_cat"></a><code>array_cat(left: <a href="uuid.html">uuid</a>[], right: <a href="uuid.html">uuid</a>[]) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
+</span></td></tr>
+<tr><td><a name="array_cat"></a><code>array_cat(left: box2d[], right: box2d[]) &rarr; box2d[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td></tr>
 <tr><td><a name="array_cat"></a><code>array_cat(left: geography[], right: geography[]) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td></tr>
@@ -105,6 +109,8 @@
 </span></td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: <a href="uuid.html">uuid</a>[], elem: <a href="uuid.html">uuid</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
+<tr><td><a name="array_position"></a><code>array_position(array: box2d[], elem: box2d) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
+</span></td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: geography[], elem: geography) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: geometry[], elem: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
@@ -140,6 +146,8 @@
 <tr><td><a name="array_positions"></a><code>array_positions(array: <a href="timestamp.html">timestamptz</a>[], elem: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_positions"></a><code>array_positions(array: <a href="uuid.html">uuid</a>[], elem: <a href="uuid.html">uuid</a>) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
+</span></td></tr>
+<tr><td><a name="array_positions"></a><code>array_positions(array: box2d[], elem: box2d) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_positions"></a><code>array_positions(array: geography[], elem: geography) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
@@ -177,6 +185,8 @@
 </span></td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: <a href="uuid.html">uuid</a>, array: <a href="uuid.html">uuid</a>[]) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
+<tr><td><a name="array_prepend"></a><code>array_prepend(elem: box2d, array: box2d[]) &rarr; box2d[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
+</span></td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: geography, array: geography[]) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: geometry, array: geometry[]) &rarr; geometry[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
@@ -213,6 +223,8 @@
 </span></td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: <a href="uuid.html">uuid</a>[], elem: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
 </span></td></tr>
+<tr><td><a name="array_remove"></a><code>array_remove(array: box2d[], elem: box2d) &rarr; box2d[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
+</span></td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: geography[], elem: geography) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: geometry[], elem: geometry) &rarr; geometry[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
@@ -248,6 +260,8 @@
 <tr><td><a name="array_replace"></a><code>array_replace(array: <a href="timestamp.html">timestamptz</a>[], toreplace: <a href="timestamp.html">timestamptz</a>, replacewith: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="timestamp.html">timestamptz</a>[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_replace"></a><code>array_replace(array: <a href="uuid.html">uuid</a>[], toreplace: <a href="uuid.html">uuid</a>, replacewith: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
+</span></td></tr>
+<tr><td><a name="array_replace"></a><code>array_replace(array: box2d[], toreplace: box2d, replacewith: box2d) &rarr; box2d[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_replace"></a><code>array_replace(array: geography[], toreplace: geography, replacewith: geography) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td></tr>
@@ -380,14 +394,7 @@ significant than <code>element</code> to zero (or one, for day and month)</p>
 <p>Compatible elements: millennium, century, decade, year, quarter, month,
 week, day, hour, minute, second, millisecond, microsecond.</p>
 </span></td></tr>
-<tr><td><a name="experimental_follower_read_timestamp"></a><code>experimental_follower_read_timestamp() &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Returns a timestamp which is very likely to be safe to perform
-against a follower replica.</p>
-<p>This function is intended to be used with an AS OF SYSTEM TIME clause to perform
-historical reads against a time which is recent but sufficiently old for reads
-to be performed against the closest replica as opposed to the currently
-leaseholder for a given range.</p>
-<p>Note that this function requires an enterprise license on a CCL distribution to
-return without an error.</p>
+<tr><td><a name="experimental_follower_read_timestamp"></a><code>experimental_follower_read_timestamp() &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Same as follower_read_timestamp. This name is deprecated.</p>
 </span></td></tr>
 <tr><td><a name="experimental_strftime"></a><code>experimental_strftime(input: <a href="date.html">date</a>, extract_format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>From <code>input</code>, extracts and formats the time as identified in <code>extract_format</code> using standard <code>strftime</code> notation (though not all formatting is supported).</p>
 </span></td></tr>
@@ -427,6 +434,15 @@ timezone, timezone_hour, timezone_minute</p>
 <tr><td><a name="extract_duration"></a><code>extract_duration(element: <a href="string.html">string</a>, input: <a href="interval.html">interval</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Extracts <code>element</code> from <code>input</code>.
 Compatible elements: hour, minute, second, millisecond, microsecond.
 This is deprecated in favor of <code>extract</code> which supports duration.</p>
+</span></td></tr>
+<tr><td><a name="follower_read_timestamp"></a><code>follower_read_timestamp() &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Returns a timestamp which is very likely to be safe to perform
+against a follower replica.</p>
+<p>This function is intended to be used with an AS OF SYSTEM TIME clause to perform
+historical reads against a time which is recent but sufficiently old for reads
+to be performed against the closest replica as opposed to the currently
+leaseholder for a given range.</p>
+<p>Note that this function requires an enterprise license on a CCL distribution to
+return without an error.</p>
 </span></td></tr>
 <tr><td><a name="localtimestamp"></a><code>localtimestamp() &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Returns the time of the current transaction.</p>
 <p>The value is based on a timestamp picked when the transaction starts
@@ -770,6 +786,10 @@ has no relationship with the commit order of concurrent transactions.</p>
 <tr><td><a name="geometrytype"></a><code>geometrytype(geometry: geometry) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the type of geometry as a string.</p>
 <p>This function utilizes the GEOS module.</p>
 </span></td></tr>
+<tr><td><a name="geomfromewkb"></a><code>geomfromewkb(val: <a href="bytes.html">bytes</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from an EWKB representation.</p>
+</span></td></tr>
+<tr><td><a name="geomfromewkt"></a><code>geomfromewkt(val: <a href="string.html">string</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from an EWKT representation.</p>
+</span></td></tr>
 <tr><td><a name="postgis_addbbox"></a><code>postgis_addbbox(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Compatibility placeholder function with PostGIS. This does not perform any operation on the Geometry.</p>
 </span></td></tr>
 <tr><td><a name="postgis_dropbbox"></a><code>postgis_dropbbox(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Compatibility placeholder function with PostGIS. This does not perform any operation on the Geometry.</p>
@@ -889,6 +909,14 @@ has no relationship with the commit order of concurrent transactions.</p>
 <li>8: GeoJSON Short CRS if not EPSG:4326 (default for Geometry)</li>
 </ul>
 <p>This variant will cast all geometry_str arguments into Geometry types.</p>
+</span></td></tr>
+<tr><td><a name="st_asgeojson"></a><code>st_asgeojson(row: tuple) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the GeoJSON representation of a given Geometry. Coordinates have a maximum of 9 decimal digits.</p>
+</span></td></tr>
+<tr><td><a name="st_asgeojson"></a><code>st_asgeojson(row: tuple, geo_column: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the GeoJSON representation of a given Geometry, using geo_column as the geometry for the given Feature. Coordinates have a maximum of 9 decimal digits.</p>
+</span></td></tr>
+<tr><td><a name="st_asgeojson"></a><code>st_asgeojson(row: tuple, geo_column: <a href="string.html">string</a>, max_decimal_digits: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the GeoJSON representation of a given Geometry, using geo_column as the geometry for the given Feature. max_decimal_digits will be output for each coordinate value.</p>
+</span></td></tr>
+<tr><td><a name="st_asgeojson"></a><code>st_asgeojson(row: tuple, geo_column: <a href="string.html">string</a>, max_decimal_digits: <a href="int.html">int</a>, pretty: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the GeoJSON representation of a given Geometry, using geo_column as the geometry for the given Feature. max_decimal_digits will be output for each coordinate value. Output will be pretty printed in JSON if pretty is true.</p>
 </span></td></tr>
 <tr><td><a name="st_ashexewkb"></a><code>st_ashexewkb(geography: geography) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the EWKB representation in hex of a given Geography.</p>
 </span></td></tr>
@@ -1454,11 +1482,19 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 </span></td></tr>
 <tr><td><a name="st_relatematch"></a><code>st_relatematch(intersection_matrix: <a href="string.html">string</a>, pattern: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the given DE-9IM intersection matrix satisfies the given pattern.</p>
 </span></td></tr>
+<tr><td><a name="st_scale"></a><code>st_scale(g: geometry, factor: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry scaled by taking in a Geometry as the factor</p>
+</span></td></tr>
+<tr><td><a name="st_scale"></a><code>st_scale(g: geometry, factor: geometry, origin: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry scaled by the Geometry factor relative to a false origin</p>
+</span></td></tr>
+<tr><td><a name="st_scale"></a><code>st_scale(geometry: geometry, x_factor: <a href="float.html">float</a>, y_factor: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry scaled by the given factors</p>
+</span></td></tr>
 <tr><td><a name="st_segmentize"></a><code>st_segmentize(geography: geography, max_segment_length_meters: <a href="float.html">float</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns a modified Geography having no segment longer than the given max_segment_length meters.</p>
 <p>The calculations are done on a sphere.</p>
 <p>This function utilizes the S2 library for spherical calculations.</p>
 </span></td></tr>
 <tr><td><a name="st_segmentize"></a><code>st_segmentize(geometry: geometry, max_segment_length: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry having no segment longer than the given max_segment_length. Length units are in units of spatial reference.</p>
+</span></td></tr>
+<tr><td><a name="st_setpoint"></a><code>st_setpoint(line_string: geometry, index: <a href="int.html">int</a>, point: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Sets the Point at the given 0-based index and returns the modified LineString geometry</p>
 </span></td></tr>
 <tr><td><a name="st_setsrid"></a><code>st_setsrid(geography: geography, srid: <a href="int.html">int</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Sets a Geography to a new SRID without transforming the coordinates.</p>
 </span></td></tr>
@@ -1508,6 +1544,8 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 </span></td></tr>
 <tr><td><a name="st_transform"></a><code>st_transform(geometry: geometry, to_proj_text: <a href="string.html">string</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Transforms a geometry into the coordinate reference system referenced by the projection text by projecting its coordinates.</p>
 <p>This function utilizes the PROJ library for coordinate projections.</p>
+</span></td></tr>
+<tr><td><a name="st_translate"></a><code>st_translate(g: geometry, deltaX: <a href="float.html">float</a>, deltaY: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry translated by the given deltas</p>
 </span></td></tr>
 <tr><td><a name="st_union"></a><code>st_union(geometry_a: geometry, geometry_b: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the union of the given geometries as a single Geometry object.</p>
 <p>This function utilizes the GEOS module.</p>
@@ -1620,6 +1658,8 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 </span></td></tr>
 <tr><td><a name="array_to_json"></a><code>array_to_json(array: anyelement[], pretty_bool: <a href="bool.html">bool</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Returns the array as JSON or JSONB.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.json_to_pb"></a><code>crdb_internal.json_to_pb(pbname: <a href="string.html">string</a>, json: jsonb) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Convert JSONB data to protocol message bytes</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.pb_to_json"></a><code>crdb_internal.pb_to_json(pbname: <a href="string.html">string</a>, data: <a href="bytes.html">bytes</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Converts protocol message to its JSONB representation.</p>
 </span></td></tr>
 <tr><td><a name="json_array_length"></a><code>json_array_length(json: jsonb) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of elements in the outermost JSON or JSONB array.</p>
@@ -1676,6 +1716,96 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 </span></td></tr></tbody>
 </table>
 
+### Multi-tenancy functions
+
+<table>
+<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a name="crdb_internal.sql_liveness_is_alive"></a><code>crdb_internal.sql_liveness_is_alive(session_id: <a href="bytes.html">bytes</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Checks is given sqlliveness session id is not expired</p>
+</span></td></tr></tbody>
+</table>
+
+### STRING[] functions
+
+<table>
+<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a name="regexp_split_to_array"></a><code>regexp_split_to_array(string: <a href="string.html">string</a>, pattern: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>Split string using a POSIX regular expression as the delimiter.</p>
+</span></td></tr>
+<tr><td><a name="regexp_split_to_array"></a><code>regexp_split_to_array(string: <a href="string.html">string</a>, pattern: <a href="string.html">string</a>, flags: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>Split string using a POSIX regular expression as the delimiter with flags.</p>
+<p>CockroachDB supports the following flags:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>c</strong></td>
+<td>Case-sensitive matching</td>
+</tr>
+<tr>
+<td><strong>g</strong></td>
+<td>Global matching (match each substring instead of only the first)</td>
+</tr>
+<tr>
+<td><strong>i</strong></td>
+<td>Case-insensitive matching</td>
+</tr>
+<tr>
+<td><strong>m</strong> or <strong>n</strong></td>
+<td>Newline-sensitive (see below)</td>
+</tr>
+<tr>
+<td><strong>p</strong></td>
+<td>Partial newline-sensitive matching (see below)</td>
+</tr>
+<tr>
+<td><strong>s</strong></td>
+<td>Newline-insensitive (default)</td>
+</tr>
+<tr>
+<td><strong>w</strong></td>
+<td>Inverse partial newline-sensitive matching (see below)</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th><code>.</code> and <code>[^...]</code> match newlines</th>
+<th><code>^</code> and <code>$</code> match line boundaries</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>s</td>
+<td>yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td>w</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>p</td>
+<td>no</td>
+<td>no</td>
+</tr>
+<tr>
+<td>m/n</td>
+<td>no</td>
+<td>yes</td>
+</tr>
+</tbody>
+</table>
+</span></td></tr></tbody>
+</table>
+
 ### Sequence functions
 
 <table>
@@ -1686,6 +1816,8 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 <tr><td><a name="lastval"></a><code>lastval() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return value most recently obtained with nextval in this session.</p>
 </span></td></tr>
 <tr><td><a name="nextval"></a><code>nextval(sequence_name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Advances the given sequence and returns its new value.</p>
+</span></td></tr>
+<tr><td><a name="pg_get_serial_sequence"></a><code>pg_get_serial_sequence(table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the name of the sequence used by the given column_name in the table table_name.</p>
 </span></td></tr>
 <tr><td><a name="setval"></a><code>setval(sequence_name: <a href="string.html">string</a>, value: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Set the given sequence’s current value. The next call to nextval will return <code>value + Increment</code></p>
 </span></td></tr>
@@ -1741,6 +1873,80 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 <tr><td><a name="jsonb_object_keys"></a><code>jsonb_object_keys(input: jsonb) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns sorted set of keys in the outermost JSON object.</p>
 </span></td></tr>
 <tr><td><a name="pg_get_keywords"></a><code>pg_get_keywords() &rarr; tuple{string AS word, string AS catcode, string AS catdesc}</code></td><td><span class="funcdesc"><p>Produces a virtual table containing the keywords known to the SQL parser.</p>
+</span></td></tr>
+<tr><td><a name="regexp_split_to_table"></a><code>regexp_split_to_table(string: <a href="string.html">string</a>, pattern: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Split string using a POSIX regular expression as the delimiter.</p>
+</span></td></tr>
+<tr><td><a name="regexp_split_to_table"></a><code>regexp_split_to_table(string: <a href="string.html">string</a>, pattern: <a href="string.html">string</a>, flags: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Split string using a POSIX regular expression as the delimiter with flags.</p>
+<p>CockroachDB supports the following flags:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>c</strong></td>
+<td>Case-sensitive matching</td>
+</tr>
+<tr>
+<td><strong>g</strong></td>
+<td>Global matching (match each substring instead of only the first)</td>
+</tr>
+<tr>
+<td><strong>i</strong></td>
+<td>Case-insensitive matching</td>
+</tr>
+<tr>
+<td><strong>m</strong> or <strong>n</strong></td>
+<td>Newline-sensitive (see below)</td>
+</tr>
+<tr>
+<td><strong>p</strong></td>
+<td>Partial newline-sensitive matching (see below)</td>
+</tr>
+<tr>
+<td><strong>s</strong></td>
+<td>Newline-insensitive (default)</td>
+</tr>
+<tr>
+<td><strong>w</strong></td>
+<td>Inverse partial newline-sensitive matching (see below)</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th><code>.</code> and <code>[^...]</code> match newlines</th>
+<th><code>^</code> and <code>$</code> match line boundaries</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>s</td>
+<td>yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td>w</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>p</td>
+<td>no</td>
+<td>no</td>
+</tr>
+<tr>
+<td>m/n</td>
+<td>no</td>
+<td>yes</td>
+</tr>
+</tbody>
+</table>
 </span></td></tr>
 <tr><td><a name="unnest"></a><code>unnest(anyelement[], anyelement[], anyelement[]...) &rarr; tuple</code></td><td><span class="funcdesc"><p>Returns the input arrays as a set of rows</p>
 </span></td></tr>

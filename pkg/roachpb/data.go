@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -431,6 +432,17 @@ func (v *Value) SetGeo(so geopb.SpatialObject) error {
 	return nil
 }
 
+// SetBox2D encodes the specified Box2D value into the bytes field of the
+// receiver, sets the tag and clears the checksum.
+func (v *Value) SetBox2D(b *geo.CartesianBoundingBox) {
+	v.ensureRawBytes(headerSize + 32)
+	encoding.EncodeUint64Ascending(v.RawBytes[headerSize:headerSize], math.Float64bits(b.LoX))
+	encoding.EncodeUint64Ascending(v.RawBytes[headerSize+8:headerSize+8], math.Float64bits(b.HiX))
+	encoding.EncodeUint64Ascending(v.RawBytes[headerSize+16:headerSize+16], math.Float64bits(b.LoY))
+	encoding.EncodeUint64Ascending(v.RawBytes[headerSize+24:headerSize+24], math.Float64bits(b.HiY))
+	v.setTag(ValueType_BOX2D)
+}
+
 // SetBool encodes the specified bool value into the bytes field of the
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetBool(b bool) {
@@ -566,6 +578,43 @@ func (v Value) GetGeo() (geopb.SpatialObject, error) {
 	var ret geopb.SpatialObject
 	err := protoutil.Unmarshal(v.dataBytes(), &ret)
 	return ret, err
+}
+
+// GetBox2D decodes a geo value from the bytes field of the receiver. If the
+// tag is not BOX2D an error will be returned.
+func (v Value) GetBox2D() (*geo.CartesianBoundingBox, error) {
+	if tag := v.GetTag(); tag != ValueType_BOX2D {
+		return nil, fmt.Errorf("value type is not %s: %s", ValueType_BOX2D, tag)
+	}
+	box := &geo.CartesianBoundingBox{}
+	dataBytes := v.dataBytes()
+	if len(dataBytes) != 32 {
+		return nil, fmt.Errorf("float64 value should be exactly 32 bytes: %d", len(dataBytes))
+	}
+	var err error
+	var val uint64
+	dataBytes, val, err = encoding.DecodeUint64Ascending(dataBytes)
+	if err != nil {
+		return nil, err
+	}
+	box.LoX = math.Float64frombits(val)
+	dataBytes, val, err = encoding.DecodeUint64Ascending(dataBytes)
+	if err != nil {
+		return nil, err
+	}
+	box.HiX = math.Float64frombits(val)
+	dataBytes, val, err = encoding.DecodeUint64Ascending(dataBytes)
+	if err != nil {
+		return nil, err
+	}
+	box.LoY = math.Float64frombits(val)
+	_, val, err = encoding.DecodeUint64Ascending(dataBytes)
+	if err != nil {
+		return nil, err
+	}
+	box.HiY = math.Float64frombits(val)
+
+	return box, nil
 }
 
 // GetBool decodes a bool value from the bytes field of the receiver. If the
@@ -1780,6 +1829,15 @@ func (l Lease) Type() LeaseType {
 	return LeaseEpoch
 }
 
+// Speculative returns true if this lease instance doesn't correspond to a
+// committed lease (or at least to a lease that's *known* to have committed).
+// For example, nodes sometimes guess who a leaseholder might be and synthesize
+// a more or less complete lease struct. Such cases are identified by an empty
+// Sequence.
+func (l Lease) Speculative() bool {
+	return l.Sequence == 0
+}
+
 // Equivalent determines whether ol is considered the same lease
 // for the purposes of matching leases when executing a command.
 // For expiration-based leases, extensions are allowed.
@@ -1876,7 +1934,7 @@ func (l *Lease) Equal(that interface{}) bool {
 		if ok {
 			that1 = &that2
 		} else {
-			return false
+			panic(fmt.Sprintf("attempting to compare lease to %T", that))
 		}
 	}
 	if that1 == nil {

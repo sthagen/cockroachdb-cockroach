@@ -13,13 +13,13 @@ package schemaexpr
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -32,9 +32,9 @@ type ComputedColumnValidator struct {
 	tableName *tree.TableName
 }
 
-// NewComputedColumnValidator returns an ComputedColumnValidator struct that can
-// be used to validate computed columns. See Validate for more details.
-func NewComputedColumnValidator(
+// MakeComputedColumnValidator returns an ComputedColumnValidator struct that
+// can be used to validate computed columns. See Validate for more details.
+func MakeComputedColumnValidator(
 	ctx context.Context,
 	desc *sqlbase.MutableTableDescriptor,
 	semaCtx *tree.SemaContext,
@@ -69,7 +69,7 @@ func (v *ComputedColumnValidator) Validate(d *tree.ColumnTableDef) error {
 
 	var depColIDs sqlbase.TableColSet
 	// First, check that no column in the expression is a computed column.
-	err := iterColDescriptors(v.desc, d.Computed.Expr, func(c *sqlbase.ColumnDescriptor) error {
+	err := iterColDescriptors(v.desc, d.Computed.Expr, func(c *descpb.ColumnDescriptor) error {
 		if c.IsComputed() {
 			return pgerror.New(pgcode.InvalidTableDefinition,
 				"computed columns cannot reference other computed columns")
@@ -92,14 +92,14 @@ func (v *ComputedColumnValidator) Validate(d *tree.ColumnTableDef) error {
 				// We don't depend on this column.
 				continue
 			}
-			for _, action := range []sqlbase.ForeignKeyReference_Action{
+			for _, action := range []descpb.ForeignKeyReference_Action{
 				fk.OnDelete,
 				fk.OnUpdate,
 			} {
 				switch action {
-				case sqlbase.ForeignKeyReference_CASCADE,
-					sqlbase.ForeignKeyReference_SET_NULL,
-					sqlbase.ForeignKeyReference_SET_DEFAULT:
+				case descpb.ForeignKeyReference_CASCADE,
+					descpb.ForeignKeyReference_SET_NULL,
+					descpb.ForeignKeyReference_SET_DEFAULT:
 					return pgerror.New(pgcode.InvalidTableDefinition,
 						"computed columns cannot reference non-restricted FK columns")
 				}
@@ -115,8 +115,9 @@ func (v *ComputedColumnValidator) Validate(d *tree.ColumnTableDef) error {
 
 	// Check that the type of the expression is of type defType and that there
 	// are no variable expressions (besides dummyColumnItems) and no impure
-	// functions.
-	typedExpr, _, err := DequalifyAndValidateExpr(
+	// functions. In order to safely serialize user defined types and their
+	// members, we need to serialize the typed expression here.
+	expr, _, err := DequalifyAndValidateExpr(
 		v.ctx,
 		v.desc,
 		d.Computed.Expr,
@@ -130,15 +131,13 @@ func (v *ComputedColumnValidator) Validate(d *tree.ColumnTableDef) error {
 		return err
 	}
 
-	// Get the column that this definition points to.
+	// Get the column that this definition points to and assign the serialized
+	// expression.
 	targetCol, _, err := v.desc.FindColumnByName(d.Name)
 	if err != nil {
 		return err
 	}
-	// In order to safely serialize user defined types and their members, we
-	// need to serialize the typed expression here.
-	s := tree.Serialize(typedExpr)
-	targetCol.ComputeExpr = &s
+	targetCol.ComputeExpr = &expr
 
 	return nil
 }
@@ -147,8 +146,8 @@ func (v *ComputedColumnValidator) Validate(d *tree.ColumnTableDef) error {
 // computed column. The function errs if any existing computed columns or
 // computed columns being added reference the given column.
 // TODO(mgartner): Add unit tests for ValidateNoDependents.
-func (v *ComputedColumnValidator) ValidateNoDependents(col *sqlbase.ColumnDescriptor) error {
-	checkComputed := func(c *sqlbase.ColumnDescriptor) error {
+func (v *ComputedColumnValidator) ValidateNoDependents(col *descpb.ColumnDescriptor) error {
+	checkComputed := func(c *descpb.ColumnDescriptor) error {
 		if !c.IsComputed() {
 			return nil
 		}
@@ -159,7 +158,7 @@ func (v *ComputedColumnValidator) ValidateNoDependents(col *sqlbase.ColumnDescri
 			return errors.WithAssertionFailure(err)
 		}
 
-		return iterColDescriptors(v.desc, expr, func(colVar *sqlbase.ColumnDescriptor) error {
+		return iterColDescriptors(v.desc, expr, func(colVar *descpb.ColumnDescriptor) error {
 			if colVar.ID == col.ID {
 				return pgerror.Newf(
 					pgcode.InvalidColumnReference,
@@ -181,7 +180,7 @@ func (v *ComputedColumnValidator) ValidateNoDependents(col *sqlbase.ColumnDescri
 	for i := range v.desc.Mutations {
 		mut := &v.desc.Mutations[i]
 		mutCol := mut.GetColumn()
-		if mut.Direction == sqlbase.DescriptorMutation_ADD && mutCol != nil {
+		if mut.Direction == descpb.DescriptorMutation_ADD && mutCol != nil {
 			if err := checkComputed(mutCol); err != nil {
 				return err
 			}
@@ -191,42 +190,23 @@ func (v *ComputedColumnValidator) ValidateNoDependents(col *sqlbase.ColumnDescri
 	return nil
 }
 
-// descContainer is a helper type that implements tree.IndexedVarContainer; it
-// is used to type check computed columns and does not support evaluation.
-type descContainer struct {
-	cols []sqlbase.ColumnDescriptor
-}
-
-func (j *descContainer) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
-	panic("unsupported")
-}
-
-func (j *descContainer) IndexedVarResolvedType(idx int) *types.T {
-	return j.cols[idx].Type
-}
-
-func (*descContainer) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	return nil
-}
-
 // MakeComputedExprs returns a slice of the computed expressions for the
 // slice of input column descriptors, or nil if none of the input column
 // descriptors have computed expressions.
+//
 // The length of the result slice matches the length of the input column
 // descriptors. For every column that has no computed expression, a NULL
 // expression is reported.
-// addingCols indicates if the input column descriptors are being added
-// and allows type checking of the compute expressions to reference
-// input columns earlier in the slice.
+//
+// Note that the order of columns is critical. Expressions cannot reference
+// columns that come after them in cols.
 func MakeComputedExprs(
 	ctx context.Context,
-	cols []sqlbase.ColumnDescriptor,
+	cols []descpb.ColumnDescriptor,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	tn *tree.TableName,
-	txCtx *transform.ExprTransformContext,
 	evalCtx *tree.EvalContext,
 	semaCtx *tree.SemaContext,
-	addingCols bool,
 ) ([]tree.TypedExpr, error) {
 	// Check to see if any of the columns have computed expressions. If there
 	// are none, we don't bother with constructing the map as the expressions
@@ -251,40 +231,25 @@ func MakeComputedExprs(
 			exprStrings = append(exprStrings, *col.ComputeExpr)
 		}
 	}
+
 	exprs, err := parser.ParseExprs(exprStrings)
 	if err != nil {
 		return nil, err
 	}
 
-	// We need an ivarHelper and sourceInfo, unlike DEFAULT, since computed
-	// columns can reference other columns and thus need to be able to resolve
-	// column names (at this stage they only need to resolve the types so that
-	// the expressions can be typechecked - we have no need to evaluate them).
-	iv := &descContainer{tableDesc.Columns}
-	ivarHelper := tree.MakeIndexedVarHelper(iv, len(tableDesc.Columns))
+	nr := newNameResolver(evalCtx, tableDesc.ID, tn, columnDescriptorsToPtrs(tableDesc.Columns))
+	nr.addIVarContainerToSemaCtx(semaCtx)
 
-	source := sqlbase.NewSourceInfoForSingleTable(*tn, sqlbase.ResultColumnsFromColDescs(tableDesc.GetID(), tableDesc.Columns))
-	semaCtx.IVarContainer = iv
-
-	addColumnInfo := func(col *sqlbase.ColumnDescriptor) {
-		ivarHelper.AppendSlot()
-		iv.cols = append(iv.cols, *col)
-		newCols := sqlbase.ResultColumnsFromColDescs(tableDesc.GetID(), []sqlbase.ColumnDescriptor{*col})
-		source.SourceColumns = append(source.SourceColumns, newCols...)
-	}
-
+	var txCtx transform.ExprTransformContext
 	compExprIdx := 0
 	for i := range cols {
 		col := &cols[i]
 		if !col.IsComputed() {
 			computedExprs = append(computedExprs, tree.DNull)
-			if addingCols {
-				addColumnInfo(col)
-			}
+			nr.addColumn(col)
 			continue
 		}
-		expr, err := sqlbase.ResolveNames(
-			exprs[compExprIdx], source, ivarHelper, evalCtx.SessionData.SearchPath)
+		expr, err := nr.resolveNames(exprs[compExprIdx])
 		if err != nil {
 			return nil, err
 		}
@@ -298,9 +263,7 @@ func MakeComputedExprs(
 		}
 		computedExprs = append(computedExprs, typedExpr)
 		compExprIdx++
-		if addingCols {
-			addColumnInfo(col)
-		}
+		nr.addColumn(col)
 	}
 	return computedExprs, nil
 }

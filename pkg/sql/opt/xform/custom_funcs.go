@@ -71,15 +71,14 @@ func (c *CustomFuncs) IsLocking(scan *memo.ScanPrivate) bool {
 	return scan.IsLocking()
 }
 
-// GenerateIndexScans enumerates all non-inverted and non-partial secondary
-// indexes on the given Scan operator's table and generates an alternate Scan
-// operator for each index that includes the set of needed columns specified in
-// the ScanOpDef.
+// GenerateIndexScans enumerates all non-inverted secondary indexes on the given
+// Scan operator's table and generates an alternate Scan operator for each index
+// that includes the set of needed columns specified in the ScanOpDef.
 //
-// Partial indexes do not index every row in the table and they can only be used
-// in cases where a query filter implies the partial index predicate.
-// GenerateIndexScans does not deal with filters. Therefore, partial indexes
-// cannot be considered for non-constrained index scans.
+// This transformation can only consider partial indexes that are guaranteed to
+// index every row in the table. Therefore, only partial indexes with predicates
+// that always evaluate to true are considered. Such an index is pseudo-partial
+// in that it behaves the exactly the same as a non-partial secondary index.
 //
 // NOTE: This does not generate index joins for non-covering indexes (except in
 //       case of ForceIndex). Index joins are usually only introduced "one level
@@ -89,9 +88,23 @@ func (c *CustomFuncs) IsLocking(scan *memo.ScanPrivate) bool {
 //       rows from the table. See ConstrainScans and LimitScans for cases where
 //       index joins are introduced into the memo.
 func (c *CustomFuncs) GenerateIndexScans(grp memo.RelExpr, scanPrivate *memo.ScanPrivate) {
+	md := c.e.mem.Metadata()
+	tabMeta := md.TableMeta(scanPrivate.Table)
+
 	// Iterate over all non-inverted and non-partial secondary indexes.
-	iter := makeScanIndexIter(c.e.mem, scanPrivate, rejectPrimaryIndex|rejectInvertedIndexes|rejectPartialIndexes)
+	iter := makeScanIndexIter(c.e.mem, scanPrivate, rejectPrimaryIndex|rejectInvertedIndexes)
 	for iter.Next() {
+		// If the secondary index is a partial index with a predicate that always
+		// evaluates to true, it contains all rows in the table, and can be used
+		// for an unconstrained index scan.
+		_, isPartialIndex := md.Table(scanPrivate.Table).Index(iter.IndexOrdinal()).Predicate()
+		if isPartialIndex {
+			pred := memo.PartialIndexPredicate(tabMeta, iter.IndexOrdinal())
+			if !pred.IsTrue() {
+				continue
+			}
+		}
+
 		// If the secondary index includes the set of needed columns, then construct
 		// a new Scan operator using that index.
 		if iter.IsCovering() {
@@ -999,20 +1012,17 @@ func (c *CustomFuncs) GenerateInvertedIndexScans(
 			}
 		}
 
-		invertedCol := scanPrivate.Table.ColumnID(iter.Index().Column(0).Ordinal)
-
 		// Construct new ScanOpDef with the new index and constraint.
 		newScanPrivate := *scanPrivate
 		newScanPrivate.Index = iter.IndexOrdinal()
 		newScanPrivate.Constraint = constraint
 		newScanPrivate.InvertedConstraint = spansToRead
 
-		// Though the index is marked as containing the column being indexed, it
-		// doesn't actually, and it's only valid to extract the primary key columns
-		// from it. However, the inverted key column is still needed if there is an
+		// We scan the PK columns, and the inverted key column if there is an
 		// inverted filter.
 		pkCols := sb.primaryKeyCols()
 		newScanPrivate.Cols = pkCols.Copy()
+		invertedCol := scanPrivate.Table.ColumnID(iter.Index().Column(0).Ordinal)
 		if spanExpr != nil {
 			newScanPrivate.Cols.Add(invertedCol)
 		}
@@ -1051,14 +1061,25 @@ func (c *CustomFuncs) initIdxConstraintForIndex(
 	// which does not take part in an index scan). Note that the OrderingColumn
 	// slice cannot be reused, as Instance.Init can use it in the constraint.
 	md := c.e.mem.Metadata()
-	index := md.Table(tabID).Index(indexOrd)
+	tab := md.Table(tabID)
+	index := tab.Index(indexOrd)
 	columns := make([]opt.OrderingColumn, index.LaxKeyColumnCount())
 	var notNullCols opt.ColSet
 	for i := range columns {
 		col := index.Column(i)
-		colID := tabID.ColumnID(col.Ordinal)
+		ordinal := col.Ordinal
+		nullable := col.IsNullable()
+		if isInverted && i == 0 {
+			// We pass the real column to the index constraint generator (instead of
+			// the virtual column).
+			// TODO(radu): improve the inverted index constraint generator to handle
+			// this internally.
+			ordinal = col.InvertedSourceColumnOrdinal()
+			nullable = tab.Column(ordinal).IsNullable()
+		}
+		colID := tabID.ColumnID(ordinal)
 		columns[i] = opt.MakeOrderingColumn(colID, col.Descending)
-		if !col.IsNullable() {
+		if !nullable {
 			notNullCols.Add(colID)
 		}
 	}
@@ -1080,8 +1101,8 @@ func (c *CustomFuncs) tryConstrainIndex(
 ) (constraint *constraint.Constraint, remainingFilters memo.FiltersExpr, ok bool) {
 	// Start with fast check to rule out indexes that cannot be constrained.
 	if !isInverted &&
-		!c.canMaybeConstrainIndex(requiredFilters, tabID, indexOrd) &&
-		!c.canMaybeConstrainIndex(optionalFilters, tabID, indexOrd) {
+		!c.canMaybeConstrainNonInvertedIndex(requiredFilters, tabID, indexOrd) &&
+		!c.canMaybeConstrainNonInvertedIndex(optionalFilters, tabID, indexOrd) {
 		return nil, nil, false
 	}
 
@@ -1121,9 +1142,9 @@ func (c *CustomFuncs) allInvIndexConstraints(
 	return constraints, true
 }
 
-// canMaybeConstrainIndex returns true if we should try to constrain a given
-// index by the given filter. It returns false if it is impossible for the
-// filter can constrain the scan.
+// canMaybeConstrainNonInvertedIndex returns true if we should try to constrain
+// a given non-inverted index by the given filter. It returns false if it is
+// impossible for the filter can constrain the scan.
 //
 // If any of the three following statements are true, then it is
 // possible that the index can be constrained:
@@ -1132,7 +1153,7 @@ func (c *CustomFuncs) allInvIndexConstraints(
 //   2. The constraints are not tight (see props.Scalar.TightConstraints).
 //   3. Any of the filter's constraints start with the first index column.
 //
-func (c *CustomFuncs) canMaybeConstrainIndex(
+func (c *CustomFuncs) canMaybeConstrainNonInvertedIndex(
 	filters memo.FiltersExpr, tabID opt.TableID, indexOrd int,
 ) bool {
 	md := c.e.mem.Metadata()
@@ -1519,33 +1540,6 @@ func (c *CustomFuncs) getKnownScanConstraint(
 //
 // ----------------------------------------------------------------------
 
-// CommuteJoinFlags returns a join private for the commuted join (where the left
-// and right sides are swapped). It adjusts any join flags that are specific to
-// one side.
-func (c *CustomFuncs) CommuteJoinFlags(p *memo.JoinPrivate) *memo.JoinPrivate {
-	if p.Flags.Empty() {
-		return p
-	}
-
-	// swap is a helper function which swaps the values of two (single-bit) flags.
-	swap := func(f, a, b memo.JoinFlags) memo.JoinFlags {
-		// If the bits are different, flip them both.
-		if f.Has(a) != f.Has(b) {
-			f ^= (a | b)
-		}
-		return f
-	}
-	f := p.Flags
-	f = swap(f, memo.AllowLookupJoinIntoLeft, memo.AllowLookupJoinIntoRight)
-	f = swap(f, memo.AllowHashJoinStoreLeft, memo.AllowHashJoinStoreRight)
-	if p.Flags == f {
-		return p
-	}
-	res := *p
-	res.Flags = f
-	return &res
-}
-
 // GenerateMergeJoins spawns MergeJoinOps, based on any interesting orderings.
 func (c *CustomFuncs) GenerateMergeJoins(
 	grp memo.RelExpr,
@@ -1575,8 +1569,15 @@ func (c *CustomFuncs) GenerateMergeJoins(
 	orders := DeriveInterestingOrderings(left).Copy()
 	orders.RestrictToCols(leftEq.ToSet())
 
-	if !joinPrivate.Flags.Has(memo.AllowHashJoinStoreLeft) &&
-		!joinPrivate.Flags.Has(memo.AllowHashJoinStoreRight) {
+	if (!joinPrivate.Flags.Has(memo.AllowHashJoinStoreLeft) &&
+		!joinPrivate.Flags.Has(memo.AllowHashJoinStoreRight)) ||
+		c.e.evalCtx.SessionData.ReorderJoinsLimit == 0 {
+		// If we are using a hint, or the join limit is set to zero, the join won't
+		// be commuted. Add the orderings from the right side.
+		rightOrders := DeriveInterestingOrderings(right).Copy()
+		rightOrders.RestrictToCols(leftEq.ToSet())
+		orders = append(orders, rightOrders...)
+
 		// If we don't allow hash join, we must do our best to generate a merge
 		// join, even if it means sorting both sides. We append an arbitrary
 		// ordering, in case the interesting orderings don't result in any merge
@@ -1888,66 +1889,42 @@ func (c *CustomFuncs) GenerateLookupJoins(
 	}
 }
 
-// GenerateGeoLookupJoins is similar to GenerateLookupJoins, but instead
-// of generating lookup joins with regular indexes, it generates geospatial
-// lookup joins with inverted geospatial indexes. Since these indexes are not
-// covering, all geospatial lookup joins must be wrapped in an index join with
-// the primary index of the table. See the description of Case 2 in the comment
-// above GenerateLookupJoins for details about how this works.
-// TODO(rytaft): generalize this function to be GenerateInvertedJoins and add
-//  support for JSON and array inverted indexes.
-// TODO(rytaft): handle more complicated geo-spatial expressions
-//  e.g. ST_Intersects(x, y) AND ST_Covers(x, y) where y is the indexed value.
-func (c *CustomFuncs) GenerateGeoLookupJoins(
+// GenerateInvertedJoins is similar to GenerateLookupJoins, but instead
+// of generating lookup joins with regular indexes, it generates lookup joins
+// with inverted indexes. Similar to GenerateLookupJoins, there are two cases
+// depending on whether or not the index is covering. See the comment above
+// GenerateLookupJoins for details.
+// TODO(rytaft): add support for JSON and array inverted indexes.
+func (c *CustomFuncs) GenerateInvertedJoins(
 	grp memo.RelExpr,
 	joinType opt.Operator,
 	input memo.RelExpr,
 	scanPrivate *memo.ScanPrivate,
 	on memo.FiltersExpr,
 	joinPrivate *memo.JoinPrivate,
-	fn opt.ScalarExpr,
 ) {
 	if !joinPrivate.Flags.Has(memo.AllowLookupJoinIntoRight) {
 		return
 	}
 
-	// Geospatial lookup joins are not covering, so we must wrap them in an
-	// index join.
-	if scanPrivate.Flags.NoIndexJoin {
-		return
-	}
-
-	inputProps := input.Relational()
-	function := fn.(*memo.FunctionExpr)
-
-	// Try to extract an inverted join condition from the given function. If
-	// unsuccessful, try to extract a join condition from an equivalent function
-	// in which the arguments are commuted. For example:
-	//
-	//   ST_Intersects(g1, g2) <-> ST_Intersects(g2, g1)
-	//   ST_Covers(g1, g2) <-> ST_CoveredBy(g2, g1)
-	//
-	// See TryGetInvertedJoinCondFromGeoFunc for more details.
-	fn, inputGeoCol, indexGeoCol, ok := invertedidx.TryGetInvertedJoinCondFromGeoFunc(
-		c.e.f, function, false /* commuteArgs */, inputProps,
-	)
-	if !ok {
-		fn, inputGeoCol, indexGeoCol, ok = invertedidx.TryGetInvertedJoinCondFromGeoFunc(
-			c.e.f, function, true /* commuteArgs */, inputProps,
-		)
-		if !ok {
-			// This function cannot serve as a join condition.
-			return
-		}
-	}
-
+	inputCols := input.Relational().OutputCols
 	var pkCols opt.ColList
 
 	// TODO(mgartner): Use partial indexes for geolookup joins when the
 	// predicate is implied by the on filter.
 	iter := makeScanIndexIter(c.e.mem, scanPrivate, rejectNonInvertedIndexes|rejectPartialIndexes)
 	for iter.Next() {
-		if scanPrivate.Table.ColumnID(iter.Index().Column(0).Ordinal) != indexGeoCol {
+		// Check whether the filter can constrain the index.
+		invertedExpr := invertedidx.TryJoinGeoIndex(
+			c.e.evalCtx.Context, c.e.f, on, scanPrivate.Table, iter.Index(), inputCols,
+		)
+		if invertedExpr == nil {
+			continue
+		}
+
+		// Geospatial lookup joins are not covering, so we must wrap them in an
+		// index join.
+		if scanPrivate.Flags.NoIndexJoin {
 			continue
 		}
 
@@ -1960,9 +1937,9 @@ func (c *CustomFuncs) GenerateGeoLookupJoins(
 			}
 		}
 
-		// Though the index is marked as containing the geospatial column being
-		// indexed, it doesn't actually, and it is only valid to extract the
-		// primary key columns from it.
+		// Though the index is marked as containing the column being indexed, it
+		// doesn't actually, and it is only valid to extract the primary key
+		// columns from it.
 		indexCols := pkCols.ToSet()
 
 		lookupJoin := memo.InvertedJoinExpr{Input: input}
@@ -1970,10 +1947,9 @@ func (c *CustomFuncs) GenerateGeoLookupJoins(
 		lookupJoin.JoinType = joinType
 		lookupJoin.Table = scanPrivate.Table
 		lookupJoin.Index = iter.IndexOrdinal()
-		lookupJoin.InvertedExpr = fn
-		lookupJoin.InvertedCol = indexGeoCol
-		lookupJoin.InputCol = inputGeoCol
-		lookupJoin.Cols = indexCols.Union(inputProps.OutputCols)
+		lookupJoin.InvertedExpr = invertedExpr
+		lookupJoin.InvertedCol = scanPrivate.Table.ColumnID(iter.Index().Column(0).Ordinal)
+		lookupJoin.Cols = indexCols.Union(inputCols)
 
 		var indexJoin memo.LookupJoinExpr
 
@@ -1992,40 +1968,12 @@ func (c *CustomFuncs) GenerateGeoLookupJoins(
 		indexJoin.Table = scanPrivate.Table
 		indexJoin.Index = cat.PrimaryIndex
 		indexJoin.KeyCols = pkCols
-		indexJoin.Cols = scanPrivate.Cols.Union(inputProps.OutputCols)
+		indexJoin.Cols = scanPrivate.Cols.Union(inputCols)
 		indexJoin.LookupColsAreTableKey = true
 
 		// Create the LookupJoin for the index join in the same group.
 		c.e.mem.AddLookupJoinToGroup(&indexJoin, grp)
 	}
-}
-
-// IsGeoIndexFunction returns true if the given function is a geospatial
-// function that can be index-accelerated.
-func (c *CustomFuncs) IsGeoIndexFunction(fn opt.ScalarExpr) bool {
-	return invertedidx.IsGeoIndexFunction(fn)
-}
-
-// FirstArgIsVariable returns true if the first argument to the given
-// function is a variable.
-func (c *CustomFuncs) FirstArgIsVariable(fn opt.ScalarExpr) bool {
-	return argNumIsVariable(fn, 0)
-}
-
-// SecondArgIsVariable returns true if the second argument to the given
-// function is a variable.
-func (c *CustomFuncs) SecondArgIsVariable(fn opt.ScalarExpr) bool {
-	return argNumIsVariable(fn, 1)
-}
-
-func argNumIsVariable(fn opt.ScalarExpr, index int) bool {
-	function := fn.(*memo.FunctionExpr)
-	numArgs := function.Args.ChildCount()
-	if index >= numArgs {
-		return false
-	}
-	_, ok := function.Args.Child(index).(*memo.VariableExpr)
-	return ok
 }
 
 // findConstantFilter tries to find a filter that is exactly equivalent to
@@ -2582,42 +2530,11 @@ func (c *CustomFuncs) GenerateInvertedIndexZigzagJoins(
 	}
 }
 
-// deriveJoinSize returns the number of nodes in the root's connected component
-// after removing all non-join nodes in the tree (can be zero). It is used to
-// decide whether join reordering rules should fire.
-func (c *CustomFuncs) deriveJoinSize(e memo.RelExpr) int {
-	relProps := e.Relational()
-	if relProps.IsAvailable(props.JoinSize) {
-		return relProps.Rule.JoinSize
-	}
-	relProps.SetAvailable(props.JoinSize)
-
-	switch j := e.(type) {
-	case *memo.InnerJoinExpr, *memo.SemiJoinExpr, *memo.AntiJoinExpr,
-		*memo.LeftJoinExpr, *memo.FullJoinExpr:
-		if !j.Private().(*memo.JoinPrivate).Flags.Empty() {
-			// A join with flags cannot be reordered; don't consider it for join size.
-			relProps.Rule.JoinSize = 0
-		} else {
-			left := j.Child(0).(memo.RelExpr)
-			right := j.Child(1).(memo.RelExpr)
-			relProps.Rule.JoinSize = 1 + c.deriveJoinSize(left) + c.deriveJoinSize(right)
-		}
-
-	default:
-		relProps.Rule.JoinSize = 0
-	}
-
-	return relProps.Rule.JoinSize
-}
-
 // ShouldReorderJoins returns whether the optimizer should attempt to find
-// a better ordering of inner joins. This is the case if:
-//   1. The given expression is the first expression of its group. This is to
-//      avoid duplicate work (for example, matching on the commuted version of
-//      a join that has already been reordered).
-//   2. The size of the join tree is greater than one and does not exceed
-//      ReorderJoinsLimit.
+// a better ordering of inner joins. This is the case if the given expression is
+// the first expression of its group, and the join tree rooted at the expression
+// has not previously been reordered. This is to avoid duplicate work. In
+// addition, a join cannot be reordered if it has join hints.
 func (c *CustomFuncs) ShouldReorderJoins(root memo.RelExpr) bool {
 	// Only match the first expression of a group to avoid duplicate work.
 	if root != root.FirstExpr() {
@@ -2628,23 +2545,17 @@ func (c *CustomFuncs) ShouldReorderJoins(root memo.RelExpr) bool {
 	if !ok {
 		panic(errors.AssertionFailedf("operator does not have a join private: %v", root.Op()))
 	}
-	if private.WasReordered {
-		// All orderings have already been considered for the join tree rooted at
-		// this join.
-		return false
-	}
 
-	// Don't match if joinSize is 1, because only commutation is possible for a
-	// single join.
-	joinSize := c.deriveJoinSize(root)
-	return joinSize > 1 && joinSize <= c.e.evalCtx.SessionData.ReorderJoinsLimit
+	// Ensure that this join expression was not added to the memo by a previous
+	// reordering, as well as that the join does not have hints.
+	return !private.WasReordered && c.NoJoinHints(private)
 }
 
 // ReorderJoins adds alternate orderings of the given join tree to the memo. The
 // first expression of the memo group is used for construction of the join
 // graph. For more information, see the comment in join_order_builder.go.
 func (c *CustomFuncs) ReorderJoins(grp memo.RelExpr) memo.RelExpr {
-	c.e.o.JoinOrderBuilder().Init(c.e.f)
+	c.e.o.JoinOrderBuilder().Init(c.e.f, c.e.evalCtx)
 	c.e.o.JoinOrderBuilder().Reorder(grp.FirstExpr())
 	return grp
 }
@@ -3071,39 +2982,19 @@ func (c *CustomFuncs) canMaybeConstrainIndexWithCols(sp *memo.ScanPrivate, cols 
 	for iter.Next() {
 		// Iterate through all indexes of the table and return true if cols
 		// intersect with the index's key columns.
-		indexColumns := tabMeta.IndexKeyColumns(iter.IndexOrdinal())
-		if cols.Intersects(indexColumns) {
-			return true
+		index := iter.Index()
+		for i, n := 0, index.KeyColumnCount(); i < n; i++ {
+			ord := index.Column(i).Ordinal
+			if i == 0 && index.IsInverted() {
+				ord = index.Column(i).InvertedSourceColumnOrdinal()
+			}
+			if cols.Contains(tabMeta.MetaID.ColumnID(ord)) {
+				return true
+			}
 		}
 	}
 
 	return false
-}
-
-// DuplicateScanPrivate constructs a new ScanPrivate with new table and column
-// IDs. Only the Index, Flags and Locking fields are copied from the old
-// ScanPrivate, so the new ScanPrivate will not have constraints even if the old
-// one did.
-func (c *CustomFuncs) DuplicateScanPrivate(sp *memo.ScanPrivate) *memo.ScanPrivate {
-	md := c.e.mem.Metadata()
-	tabMeta := md.TableMeta(sp.Table)
-	newTableID := md.AddTable(tabMeta.Table, &tabMeta.Alias)
-
-	var newColIDs opt.ColSet
-	cols := sp.Cols
-	for col, ok := cols.Next(0); ok; col, ok = cols.Next(col + 1) {
-		ord := tabMeta.MetaID.ColumnOrdinal(col)
-		newColID := newTableID.ColumnID(ord)
-		newColIDs.Add(newColID)
-	}
-
-	return &memo.ScanPrivate{
-		Table:   newTableID,
-		Index:   sp.Index,
-		Cols:    newColIDs,
-		Flags:   sp.Flags,
-		Locking: sp.Locking,
-	}
 }
 
 // MapScanFilterCols returns a new FiltersExpr with all the src column IDs in
@@ -3129,21 +3020,15 @@ func (c *CustomFuncs) MapScanFilterCols(
 
 	// Map each column in src to a column in dst based on the relative position
 	// of both the src and dst ColumnIDs in the ColSet.
-	var colMap util.FastIntMap
+	var colMap opt.ColMap
 	dstCol, _ := dst.Cols.Next(0)
 	for srcCol, ok := src.Cols.Next(0); ok; srcCol, ok = src.Cols.Next(srcCol + 1) {
 		colMap.Set(int(srcCol), int(dstCol))
 		dstCol, _ = dst.Cols.Next(dstCol + 1)
 	}
 
-	// Map the columns of each filter in the FiltersExpr.
-	newFilters := make([]memo.FiltersItem, len(filters))
-	for i := range filters {
-		expr := c.MapFiltersItemCols(&filters[i], colMap)
-		newFilters[i] = c.e.f.ConstructFiltersItem(expr)
-	}
-
-	return newFilters
+	newFilters := c.RemapCols(&filters, colMap).(*memo.FiltersExpr)
+	return *newFilters
 }
 
 // MakeSetPrivateForSplitDisjunction constructs a new SetPrivate with column sets

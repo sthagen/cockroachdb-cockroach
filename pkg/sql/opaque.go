@@ -24,18 +24,20 @@ import (
 )
 
 type opaqueMetadata struct {
-	info string
-	plan planNode
+	info    string
+	plan    planNode
+	columns sqlbase.ResultColumns
 }
 
 var _ opt.OpaqueMetadata = &opaqueMetadata{}
 
-func (o *opaqueMetadata) ImplementsOpaqueMetadata() {}
-func (o *opaqueMetadata) String() string            { return o.info }
+func (o *opaqueMetadata) ImplementsOpaqueMetadata()      {}
+func (o *opaqueMetadata) String() string                 { return o.info }
+func (o *opaqueMetadata) Columns() sqlbase.ResultColumns { return o.columns }
 
 func buildOpaque(
 	ctx context.Context, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext, stmt tree.Statement,
-) (opt.OpaqueMetadata, sqlbase.ResultColumns, error) {
+) (opt.OpaqueMetadata, error) {
 	p := evalCtx.Planner.(*planner)
 
 	// Opaque statements handle their own scalar arguments, with no help from the
@@ -49,8 +51,12 @@ func buildOpaque(
 	switch n := stmt.(type) {
 	case *tree.AlterIndex:
 		plan, err = p.AlterIndex(ctx, n)
+	case *tree.AlterSchema:
+		plan, err = p.AlterSchema(ctx, n)
 	case *tree.AlterTable:
 		plan, err = p.AlterTable(ctx, n)
+	case *tree.AlterTableSetSchema:
+		plan, err = p.AlterTableSetSchema(ctx, n)
 	case *tree.AlterType:
 		plan, err = p.AlterType(ctx, n)
 	case *tree.AlterRole:
@@ -91,6 +97,8 @@ func buildOpaque(
 		plan, err = p.DropIndex(ctx, n)
 	case *tree.DropRole:
 		plan, err = p.DropRole(ctx, n)
+	case *tree.DropSchema:
+		plan, err = p.DropSchema(ctx, n)
 	case *tree.DropTable:
 		plan, err = p.DropTable(ctx, n)
 	case *tree.DropType:
@@ -103,6 +111,8 @@ func buildOpaque(
 		plan, err = p.Grant(ctx, n)
 	case *tree.GrantRole:
 		plan, err = p.GrantRole(ctx, n)
+	case *tree.RefreshMaterializedView:
+		plan, err = p.RefreshMaterializedView(ctx, n)
 	case *tree.RenameColumn:
 		plan, err = p.RenameColumn(ctx, n)
 	case *tree.RenameDatabase:
@@ -148,26 +158,29 @@ func buildOpaque(
 	case tree.CCLOnlyStatement:
 		plan, err = p.maybePlanHook(ctx, stmt)
 		if plan == nil && err == nil {
-			return nil, nil, pgerror.Newf(pgcode.CCLRequired,
+			return nil, pgerror.Newf(pgcode.CCLRequired,
 				"a CCL binary is required to use this statement type: %T", stmt)
 		}
 	default:
-		return nil, nil, errors.AssertionFailedf("unknown opaque statement %T", stmt)
+		return nil, errors.AssertionFailedf("unknown opaque statement %T", stmt)
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	res := &opaqueMetadata{
-		info: stmt.StatementTag(),
-		plan: plan,
+		info:    stmt.StatementTag(),
+		plan:    plan,
+		columns: planColumns(plan),
 	}
-	return res, planColumns(plan), nil
+	return res, nil
 }
 
 func init() {
 	for _, stmt := range []tree.Statement{
 		&tree.AlterIndex{},
+		&tree.AlterSchema{},
 		&tree.AlterTable{},
+		&tree.AlterTableSetSchema{},
 		&tree.AlterType{},
 		&tree.AlterSequence{},
 		&tree.AlterRole{},
@@ -187,6 +200,7 @@ func init() {
 		&tree.Discard{},
 		&tree.DropDatabase{},
 		&tree.DropIndex{},
+		&tree.DropSchema{},
 		&tree.DropTable{},
 		&tree.DropType{},
 		&tree.DropView{},
@@ -194,6 +208,7 @@ func init() {
 		&tree.DropSequence{},
 		&tree.Grant{},
 		&tree.GrantRole{},
+		&tree.RefreshMaterializedView{},
 		&tree.RenameColumn{},
 		&tree.RenameDatabase{},
 		&tree.RenameIndex{},

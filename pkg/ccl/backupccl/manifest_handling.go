@@ -18,10 +18,13 @@ import (
 	"path"
 	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	descpb "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -54,6 +57,9 @@ const (
 	// BackupStatisticsFileName is the file name used to store the serialized table
 	// statistics for the tables being backed up.
 	BackupStatisticsFileName = "BACKUP-STATISTICS"
+
+	dateBasedFolderName = "/20060102/150405.00"
+	latestFileName      = "LATEST"
 )
 
 // BackupFileDescriptors is an alias on which to implement sort's interface.
@@ -93,9 +99,11 @@ func readBackupManifestFromStore(
 	encryption *jobspb.BackupEncryptionOptions,
 ) (BackupManifest, error) {
 
-	backupManifest, err := readBackupManifest(ctx, exportStore, BackupManifestName, encryption)
+	backupManifest, err := readBackupManifest(ctx, exportStore, BackupManifestName,
+		encryption)
 	if err != nil {
-		newManifest, newErr := readBackupManifest(ctx, exportStore, BackupNewManifestName, encryption)
+		newManifest, newErr := readBackupManifest(ctx, exportStore, BackupNewManifestName,
+			encryption)
 		if newErr != nil {
 			return BackupManifest{}, err
 		}
@@ -162,11 +170,17 @@ func readBackupManifest(
 		return BackupManifest{}, err
 	}
 	if encryption != nil {
-		descBytes, err = storageccl.DecryptFile(descBytes, encryption.Key)
+		encryptionKey, err := getEncryptionKey(ctx, encryption, exportStore.Settings(),
+			exportStore.ExternalIOConf())
+		if err != nil {
+			return BackupManifest{}, err
+		}
+		descBytes, err = storageccl.DecryptFile(descBytes, encryptionKey)
 		if err != nil {
 			return BackupManifest{}, err
 		}
 	}
+
 	fileType := http.DetectContentType(descBytes)
 	if fileType == ZipType {
 		descBytes, err = DecompressData(descBytes)
@@ -179,7 +193,8 @@ func readBackupManifest(
 	if err := protoutil.Unmarshal(descBytes, &backupManifest); err != nil {
 		if encryption == nil && storageccl.AppearsEncrypted(descBytes) {
 			return BackupManifest{}, errors.Wrapf(
-				err, "file appears encrypted -- try specifying %q", backupOptEncPassphrase)
+				err, "file appears encrypted -- try specifying one of \"%s\" or \"%s\"",
+				backupOptEncPassphrase, backupOptEncKMS)
 		}
 		return BackupManifest{}, err
 	}
@@ -219,11 +234,17 @@ func readBackupPartitionDescriptor(
 		return BackupPartitionDescriptor{}, err
 	}
 	if encryption != nil {
-		descBytes, err = storageccl.DecryptFile(descBytes, encryption.Key)
+		encryptionKey, err := getEncryptionKey(ctx, encryption, exportStore.Settings(),
+			exportStore.ExternalIOConf())
+		if err != nil {
+			return BackupPartitionDescriptor{}, err
+		}
+		descBytes, err = storageccl.DecryptFile(descBytes, encryptionKey)
 		if err != nil {
 			return BackupPartitionDescriptor{}, err
 		}
 	}
+
 	fileType := http.DetectContentType(descBytes)
 	if fileType == ZipType {
 		descBytes, err = DecompressData(descBytes)
@@ -257,7 +278,12 @@ func readTableStatistics(
 		return nil, err
 	}
 	if encryption != nil {
-		statsBytes, err = storageccl.DecryptFile(statsBytes, encryption.Key)
+		encryptionKey, err := getEncryptionKey(ctx, encryption, exportStore.Settings(),
+			exportStore.ExternalIOConf())
+		if err != nil {
+			return nil, err
+		}
+		statsBytes, err = storageccl.DecryptFile(statsBytes, encryptionKey)
 		if err != nil {
 			return nil, err
 		}
@@ -289,13 +315,54 @@ func writeBackupManifest(
 	}
 
 	if encryption != nil {
-		descBuf, err = storageccl.EncryptFile(descBuf, encryption.Key)
+		encryptionKey, err := getEncryptionKey(ctx, encryption, settings, exportStore.ExternalIOConf())
+		if err != nil {
+			return err
+		}
+		descBuf, err = storageccl.EncryptFile(descBuf, encryptionKey)
 		if err != nil {
 			return err
 		}
 	}
 
 	return exportStore.WriteFile(ctx, filename, bytes.NewReader(descBuf))
+}
+
+func getEncryptionKey(
+	ctx context.Context,
+	encryption *jobspb.BackupEncryptionOptions,
+	settings *cluster.Settings,
+	ioConf base.ExternalIODirConfig,
+) ([]byte, error) {
+	if encryption == nil {
+		return nil, errors.New("FileEncryptionOptions is nil when retrieving encryption key")
+	}
+	switch encryption.Mode {
+	case jobspb.EncryptionMode_Passphrase:
+		return encryption.Key, nil
+	case jobspb.EncryptionMode_KMS:
+		// Contact the selected KMS to derive the decrypted data key.
+		kms, err := cloud.KMSFromURI(encryption.KMSInfo.Uri, &backupKMSEnv{
+			settings: settings,
+			conf:     &ioConf,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		defer func() {
+			_ = kms.Close()
+		}()
+
+		plaintextDataKey, err := kms.Decrypt(ctx, encryption.KMSInfo.EncryptedDataKey)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to decrypt data key")
+		}
+
+		return plaintextDataKey, nil
+	}
+
+	return nil, errors.New("invalid encryption mode")
 }
 
 // writeBackupPartitionDescriptor writes metadata (containing a locality KV and
@@ -317,7 +384,12 @@ func writeBackupPartitionDescriptor(
 		return errors.Wrap(err, "compressing backup partition descriptor")
 	}
 	if encryption != nil {
-		descBuf, err = storageccl.EncryptFile(descBuf, encryption.Key)
+		encryptionKey, err := getEncryptionKey(ctx, encryption, exportStore.Settings(),
+			exportStore.ExternalIOConf())
+		if err != nil {
+			return err
+		}
+		descBuf, err = storageccl.EncryptFile(descBuf, encryptionKey)
 		if err != nil {
 			return err
 		}
@@ -341,7 +413,12 @@ func writeTableStatistics(
 		return err
 	}
 	if encryption != nil {
-		statsBuf, err = storageccl.EncryptFile(statsBuf, encryption.Key)
+		encryptionKey, err := getEncryptionKey(ctx, encryption, exportStore.Settings(),
+			exportStore.ExternalIOConf())
+		if err != nil {
+			return err
+		}
+		statsBuf, err = storageccl.EncryptFile(statsBuf, encryptionKey)
 		if err != nil {
 			return err
 		}
@@ -359,7 +436,8 @@ func loadBackupManifests(
 	backupManifests := make([]BackupManifest, len(uris))
 
 	for i, uri := range uris {
-		desc, err := ReadBackupManifestFromURI(ctx, uri, user, makeExternalStorageFromURI, encryption)
+		desc, err := ReadBackupManifestFromURI(ctx, uri, user, makeExternalStorageFromURI,
+			encryption)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to read backup descriptor")
 		}
@@ -638,13 +716,46 @@ func getBackupIndexAtTime(backupManifests []BackupManifest, asOf hlc.Timestamp) 
 	return backupManifestIndex, nil
 }
 
+// unwrapDescriptor takes a descriptor retrieved from a backup manifest and
+// constructs the appropriate MutableDescriptor object implied by that object.
+// It assumes and will panic if the ModificationTime for the descriptors are
+// not set.
+//
+// TODO(ajwerner): This may prove problematic for backups of database
+// descriptors without modification time.
+func unwrapDescriptor(ctx context.Context, desc *descpb.Descriptor) catalog.MutableDescriptor {
+	sqlbase.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(ctx, desc, hlc.Timestamp{})
+	table, database, typ, schema := sqlbase.TableFromDescriptor(desc, hlc.Timestamp{}),
+		desc.GetDatabase(), desc.GetType(), desc.GetSchema()
+	switch {
+	case table != nil:
+		return sqlbase.NewMutableExistingTableDescriptor(*table)
+	case database != nil:
+		return sqlbase.NewMutableExistingDatabaseDescriptor(*database)
+	case typ != nil:
+		return sqlbase.NewMutableExistingTypeDescriptor(*typ)
+	case schema != nil:
+		return sqlbase.NewMutableExistingSchemaDescriptor(*schema)
+	default:
+		log.Fatalf(ctx, "failed to unwrap descriptor of type %T", desc.Union)
+		return nil // unreachable
+	}
+}
+
 func loadSQLDescsFromBackupsAtTime(
 	backupManifests []BackupManifest, asOf hlc.Timestamp,
 ) ([]sqlbase.Descriptor, BackupManifest) {
 	lastBackupManifest := backupManifests[len(backupManifests)-1]
 
+	unwrapDescriptors := func(raw []descpb.Descriptor) []sqlbase.Descriptor {
+		ret := make([]sqlbase.Descriptor, 0, len(raw))
+		for i := range raw {
+			ret = append(ret, unwrapDescriptor(context.TODO(), &raw[i]))
+		}
+		return ret
+	}
 	if asOf.IsEmpty() {
-		return lastBackupManifest.Descriptors, lastBackupManifest
+		return unwrapDescriptors(lastBackupManifest.Descriptors), lastBackupManifest
 	}
 
 	for _, b := range backupManifests {
@@ -654,10 +765,10 @@ func loadSQLDescsFromBackupsAtTime(
 		lastBackupManifest = b
 	}
 	if len(lastBackupManifest.DescriptorChanges) == 0 {
-		return lastBackupManifest.Descriptors, lastBackupManifest
+		return unwrapDescriptors(lastBackupManifest.Descriptors), lastBackupManifest
 	}
 
-	byID := make(map[sqlbase.ID]*sqlbase.Descriptor, len(lastBackupManifest.Descriptors))
+	byID := make(map[descpb.ID]*descpb.Descriptor, len(lastBackupManifest.Descriptors))
 	for _, rev := range lastBackupManifest.DescriptorChanges {
 		if asOf.Less(rev.Time) {
 			break
@@ -670,21 +781,19 @@ func loadSQLDescsFromBackupsAtTime(
 	}
 
 	allDescs := make([]sqlbase.Descriptor, 0, len(byID))
-	for _, desc := range byID {
-		if t := desc.Table(hlc.Timestamp{}); t != nil {
-			// A table revisions may have been captured before it was in a DB that is
-			// backed up -- if the DB is missing, filter the table.
-			if byID[t.ParentID] == nil {
-				continue
-			}
+	for _, raw := range byID {
+		// A revision may have been captured before it was in a DB that is
+		// backed up -- if the DB is missing, filter the object.
+		desc := unwrapDescriptor(context.TODO(), raw)
+		var isObject bool
+		switch desc.(type) {
+		case sqlbase.TableDescriptor, sqlbase.TypeDescriptor:
+			isObject = true
 		}
-		if t := desc.GetType(); t != nil {
-			// We apply the same filter for types as well.
-			if byID[t.ParentID] == nil {
-				continue
-			}
+		if isObject && byID[desc.GetParentID()] == nil {
+			continue
 		}
-		allDescs = append(allDescs, *desc)
+		allDescs = append(allDescs, desc)
 	}
 	return allDescs, lastBackupManifest
 }

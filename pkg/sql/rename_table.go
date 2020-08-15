@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -55,7 +56,7 @@ func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNod
 		return newZeroNode(nil /* columns */), nil
 	}
 
-	if tableDesc.State != sqlbase.TableDescriptor_PUBLIC {
+	if tableDesc.State != descpb.TableDescriptor_PUBLIC {
 		return nil, sqlbase.NewUndefinedRelationError(&oldTn)
 	}
 
@@ -68,8 +69,10 @@ func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNod
 	// of everything they depend on. Rather than trying to rewrite the view's
 	// query with the new name, we simply disallow such renames for now.
 	if len(tableDesc.DependedOnBy) > 0 {
-		return nil, p.dependentViewRenameError(
-			ctx, tableDesc.TypeName(), oldTn.String(), tableDesc.ParentID, tableDesc.DependedOnBy[0].ID)
+		return nil, p.dependentViewError(
+			ctx, tableDesc.TypeName(), oldTn.String(),
+			tableDesc.ParentID, tableDesc.DependedOnBy[0].ID, "rename",
+		)
 	}
 
 	return &renameTableNode{n: n, oldTn: &oldTn, newTn: &newTn, tableDesc: tableDesc}, nil
@@ -142,49 +145,13 @@ func (n *renameTableNode) startExec(params runParams) error {
 		return nil
 	}
 
-	tableDesc.SetName(newTn.Table())
-	tableDesc.ParentID = targetDbDesc.GetID()
-
-	newTbKey := sqlbase.MakeObjectNameKey(ctx, params.ExecCfg().Settings,
-		targetDbDesc.GetID(), tableDesc.GetParentSchemaID(), newTn.Table()).Key(p.ExecCfg().Codec)
-
-	if err := tableDesc.Validate(ctx, p.txn, p.ExecCfg().Codec); err != nil {
-		return err
-	}
-
-	descID := tableDesc.GetID()
-	parentSchemaID := tableDesc.GetParentSchemaID()
-
-	renameDetails := sqlbase.NameInfo{
-		ParentID:       prevDBID,
-		ParentSchemaID: parentSchemaID,
-		Name:           oldTn.Table()}
-	tableDesc.DrainingNames = append(tableDesc.DrainingNames, renameDetails)
-	if err := p.writeSchemaChange(
-		ctx, tableDesc, sqlbase.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
-	); err != nil {
-		return err
-	}
-
-	// We update the descriptor to the new name, but also leave the mapping of the
-	// old name to the id, so that the name is not reused until the schema changer
-	// has made sure it's not in use any more.
-	b := &kv.Batch{}
-	if p.extendedEvalCtx.Tracing.KVTracingEnabled() {
-		log.VEventf(ctx, 2, "CPut %s -> %d", newTbKey, descID)
-	}
-	err := catalogkv.WriteDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(),
-		p.EvalContext().Settings, b, p.ExecCfg().Codec, descID, tableDesc)
-	if err != nil {
-		return err
-	}
-
-	exists, id, err := sqlbase.LookupPublicTableID(
+	exists, id, err := catalogkv.LookupPublicTableID(
 		params.ctx, params.p.txn, p.ExecCfg().Codec, targetDbDesc.GetID(), newTn.Table(),
 	)
 	if err == nil && exists {
 		// Try and see what kind of object we collided with.
-		desc, err := catalogkv.GetDescriptorByID(params.ctx, params.p.txn, p.ExecCfg().Codec, id)
+		desc, err := catalogkv.GetAnyDescriptorByID(
+			params.ctx, params.p.txn, p.ExecCfg().Codec, id, catalogkv.Immutable)
 		if err != nil {
 			return sqlbase.WrapErrorWhileConstructingObjectAlreadyExistsErr(err)
 		}
@@ -193,8 +160,43 @@ func (n *renameTableNode) startExec(params runParams) error {
 		return err
 	}
 
-	b.CPut(newTbKey, descID, nil)
-	return p.txn.Run(ctx, b)
+	tableDesc.SetName(newTn.Table())
+	tableDesc.ParentID = targetDbDesc.GetID()
+
+	if err := tableDesc.Validate(ctx, p.txn, p.ExecCfg().Codec); err != nil {
+		return err
+	}
+
+	descID := tableDesc.GetID()
+	parentSchemaID := tableDesc.GetParentSchemaID()
+
+	renameDetails := descpb.NameInfo{
+		ParentID:       prevDBID,
+		ParentSchemaID: parentSchemaID,
+		Name:           oldTn.Table()}
+	tableDesc.AddDrainingName(renameDetails)
+
+	if err := p.writeSchemaChange(
+		ctx, tableDesc, descpb.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
+	); err != nil {
+		return err
+	}
+
+	if err == nil && exists {
+		// Try and see what kind of object we collided with.
+		desc, err := catalogkv.GetAnyDescriptorByID(params.ctx, params.p.txn, p.ExecCfg().Codec, id, catalogkv.Immutable)
+		if err != nil {
+			return sqlbase.WrapErrorWhileConstructingObjectAlreadyExistsErr(err)
+		}
+		return sqlbase.MakeObjectAlreadyExistsError(desc.DescriptorProto(), newTn.Table())
+	} else if err != nil {
+		return err
+	}
+
+	newTbKey := catalogkv.MakeObjectNameKey(ctx, params.ExecCfg().Settings,
+		targetDbDesc.GetID(), tableDesc.GetParentSchemaID(), newTn.Table())
+
+	return p.writeNameKey(ctx, newTbKey, descID)
 }
 
 func (n *renameTableNode) Next(runParams) (bool, error) { return false, nil }
@@ -203,10 +205,10 @@ func (n *renameTableNode) Close(context.Context)        {}
 
 // TODO(a-robinson): Support renaming objects depended on by views once we have
 // a better encoding for view queries (#10083).
-func (p *planner) dependentViewRenameError(
-	ctx context.Context, typeName, objName string, parentID, viewID sqlbase.ID,
+func (p *planner) dependentViewError(
+	ctx context.Context, typeName, objName string, parentID, viewID descpb.ID, op string,
 ) error {
-	viewDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, p.ExecCfg().Codec, viewID)
+	viewDesc, err := catalogkv.MustGetTableDescByID(ctx, p.txn, p.ExecCfg().Codec, viewID)
 	if err != nil {
 		return err
 	}
@@ -216,13 +218,25 @@ func (p *planner) dependentViewRenameError(
 		if err != nil {
 			log.Warningf(ctx, "unable to retrieve name of view %d: %v", viewID, err)
 			return sqlbase.NewDependentObjectErrorf(
-				"cannot rename %s %q because a view depends on it",
-				typeName, objName)
+				"cannot %s %s %q because a view depends on it",
+				op, typeName, objName)
 		}
 		viewName = viewFQName.FQString()
 	}
 	return errors.WithHintf(
-		sqlbase.NewDependentObjectErrorf("cannot rename %s %q because view %q depends on it",
-			typeName, objName, viewName),
+		sqlbase.NewDependentObjectErrorf("cannot %s %s %q because view %q depends on it",
+			op, typeName, objName, viewName),
 		"you can drop %s instead.", viewName)
+}
+
+// writeNameKey writes a name key to a batch and runs the batch.
+func (p *planner) writeNameKey(ctx context.Context, key sqlbase.DescriptorKey, ID descpb.ID) error {
+	marshalledKey := key.Key(p.ExecCfg().Codec)
+	b := &kv.Batch{}
+	if p.extendedEvalCtx.Tracing.KVTracingEnabled() {
+		log.VEventf(ctx, 2, "CPut %s -> %d", marshalledKey, ID)
+	}
+	b.CPut(marshalledKey, ID, nil)
+
+	return p.txn.Run(ctx, b)
 }

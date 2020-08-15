@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -30,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -112,6 +112,30 @@ func parseBoolVar(varName, val string) (bool, error) {
 			"parameter \"%s\" requires a Boolean value", varName)
 	}
 	return b, nil
+}
+
+// makeDummyBooleanSessionVar generates a sessionVar for a bool session setting.
+// These functions allow the setting to be changed, but whose values are not used.
+// They are logged to telemetry and output a notice that these are unused.
+func makeDummyBooleanSessionVar(
+	name string,
+	getFunc func(*extendedEvalContext) string,
+	setFunc func(*sessionDataMutator, bool),
+	sv func(_ *settings.Values) string,
+) sessionVar {
+	return sessionVar{
+		GetStringVal: makePostgresBoolGetStringValFn(name),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parseBoolVar(name, s)
+			if err != nil {
+				return err
+			}
+			setFunc(m, b)
+			return nil
+		},
+		Get:           getFunc,
+		GlobalDefault: sv,
+	}
 }
 
 // varGen is the main definition array for all session variables.
@@ -884,7 +908,7 @@ var varGen = map[string]sessionVar{
 			return evalCtx.SessionData.SearchPath.String()
 		},
 		GlobalDefault: func(sv *settings.Values) string {
-			return sqlbase.DefaultSearchPath.String()
+			return catconstants.DefaultSearchPath.String()
 		},
 	},
 
@@ -914,7 +938,9 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
-	`crdb_version`: makeReadOnlyVar(build.GetInfo().Short()),
+	`crdb_version`: makeReadOnlyVarWithFn(func() string {
+		return build.GetInfo().Short()
+	}),
 
 	// CockroachDB extension
 	`session_id`: {
@@ -1143,10 +1169,22 @@ var varGen = map[string]sessionVar{
 const compatErrMsg = "this parameter is currently recognized only for compatibility and has no effect in CockroachDB."
 
 func init() {
+	for k, v := range DummyVars {
+		varGen[k] = v
+	}
 	// Initialize delegate.ValidVars.
 	for v := range varGen {
 		delegate.ValidVars[v] = struct{}{}
 	}
+	// Initialize varNames.
+	varNames = func() []string {
+		res := make([]string, 0, len(varGen))
+		for vName := range varGen {
+			res = append(res, vName)
+		}
+		sort.Strings(res)
+		return res
+	}()
 }
 
 // makePostgresBoolGetStringValFn returns a function that evaluates and returns
@@ -1177,6 +1215,13 @@ func makeReadOnlyVar(value string) sessionVar {
 	return sessionVar{
 		Get:           func(_ *extendedEvalContext) string { return value },
 		GlobalDefault: func(_ *settings.Values) string { return value },
+	}
+}
+
+func makeReadOnlyVarWithFn(fn func() string) sessionVar {
+	return sessionVar{
+		Get:           func(_ *extendedEvalContext) string { return fn() },
+		GlobalDefault: func(_ *settings.Values) string { return fn() },
 	}
 }
 
@@ -1280,14 +1325,7 @@ func IsSessionVariableConfigurable(varName string) (exists, configurable bool) {
 	return exists, v.Set != nil
 }
 
-var varNames = func() []string {
-	res := make([]string, 0, len(varGen))
-	for vName := range varGen {
-		res = append(res, vName)
-	}
-	sort.Strings(res)
-	return res
-}()
+var varNames []string
 
 // getSingleBool returns the boolean if the input Datum is a DBool,
 // and returns a detailed error message if not.
@@ -1317,7 +1355,6 @@ func getSessionVar(name string, missingOk bool) (bool, sessionVar, error) {
 		return false, sessionVar{}, pgerror.Newf(pgcode.UndefinedObject,
 			"unrecognized configuration parameter %q", name)
 	}
-
 	return true, v, nil
 }
 
@@ -1330,7 +1367,6 @@ func (p *planner) GetSessionVar(
 	if err != nil || !ok {
 		return ok, "", err
 	}
-
 	return true, v.Get(&p.extendedEvalCtx), nil
 }
 

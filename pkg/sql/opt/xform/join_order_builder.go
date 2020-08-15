@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
@@ -248,7 +249,8 @@ type OnAddJoinFunc func(left, right, all, refs []memo.RelExpr, op opt.Operator)
 //
 // Citations: [8]
 type JoinOrderBuilder struct {
-	f *norm.Factory
+	f       *norm.Factory
+	evalCtx *tree.EvalContext
 
 	// vertexes is the set of base relations that form the vertexes of the join
 	// graph. Any RelExpr can be a vertex, including a join (e.g. in case where
@@ -282,6 +284,11 @@ type JoinOrderBuilder struct {
 	// The group for a single base relation is simply the base relation itself.
 	plans map[vertexSet]memo.RelExpr
 
+	// joinCount counts the number of joins that have been added to the join
+	// graph. It is used to ensure that the number of joins that are reordered at
+	// once does not exceed the session limit.
+	joinCount int
+
 	onReorderFunc OnReorderFunc
 
 	onAddJoinFunc OnAddJoinFunc
@@ -290,18 +297,19 @@ type JoinOrderBuilder struct {
 // Init initializes a new JoinOrderBuilder with the given factory. The join
 // graph is reset, so a JoinOrderBuilder can be reused. Callback functions are
 // not reset.
-func (jb *JoinOrderBuilder) Init(f *norm.Factory) {
+func (jb *JoinOrderBuilder) Init(f *norm.Factory, evalCtx *tree.EvalContext) {
 	jb.f = f
+	jb.evalCtx = evalCtx
 
 	jb.vertexes = []memo.RelExpr{}
 	jb.edges = []edge{}
 	jb.nonInnerEdges = edgeSet{}
 	jb.innerEdges = edgeSet{}
 	jb.plans = map[vertexSet]memo.RelExpr{}
+	jb.joinCount = 0
 }
 
-// Reorder adds all valid (non-commutative) orderings of the given join to the
-// memo.
+// Reorder adds all valid orderings of the given join to the memo.
 func (jb *JoinOrderBuilder) Reorder(join memo.RelExpr) {
 	switch t := join.(type) {
 	case *memo.InnerJoinExpr, *memo.SemiJoinExpr, *memo.AntiJoinExpr,
@@ -332,12 +340,10 @@ func (jb *JoinOrderBuilder) Reorder(join memo.RelExpr) {
 	}
 }
 
-// populateGraph traverses the given subtree and initializes the vertexes and
-// edges of the join hypergraph. populateGraph returns the sets of vertexes and
-// edges that were added to the graph during traversal of the subtree.
-//
-// TODO(drewk): Rather than only matching at or below the join order limit,
-//  iteratively optimize shallow sub-sections of the tree using the limit.
+// populateGraph traverses the given subtree up to ReorderJoinsLimit and
+// initializes the vertexes and edges of the join hypergraph. populateGraph
+// returns the sets of vertexes and edges that were added to the graph during
+// traversal of the subtree.
 func (jb *JoinOrderBuilder) populateGraph(rel memo.RelExpr) (vertexSet, edgeSet) {
 	// Remember starting set of vertexes and edges so that the vertexes and
 	// edges added during the traversal of the tree rooted at this node can be
@@ -348,10 +354,12 @@ func (jb *JoinOrderBuilder) populateGraph(rel memo.RelExpr) (vertexSet, edgeSet)
 	switch t := rel.(type) {
 	case *memo.InnerJoinExpr, *memo.SemiJoinExpr, *memo.AntiJoinExpr,
 		*memo.LeftJoinExpr, *memo.FullJoinExpr:
+		jb.joinCount++
+
 		flags := t.Private().(*memo.JoinPrivate).Flags
-		if !flags.Empty() {
-			// If the join has flags, we can't reorder it. Simply treat it as a base
-			// relation.
+		if !flags.Empty() || jb.joinCount > jb.evalCtx.SessionData.ReorderJoinsLimit {
+			// If the join has flags or the join limit has been reached, we can't
+			// reorder. Simply treat the join as a base relation.
 			jb.addBaseRelation(t)
 			break
 		}
@@ -392,11 +400,6 @@ func (jb *JoinOrderBuilder) populateGraph(rel memo.RelExpr) (vertexSet, edgeSet)
 
 	default:
 		jb.addBaseRelation(t)
-
-		// Initialize the plan for this vertex.
-		idx := vertexIndex(len(jb.vertexes) - 1)
-		relSet := vertexSet(0).add(idx)
-		jb.plans[relSet] = t
 	}
 
 	// Use set difference operations to return all vertexes and edges added to the
@@ -515,11 +518,9 @@ func (jb *JoinOrderBuilder) addJoins(s1, s2 vertexSet) {
 		}
 		if e.checkNonInnerJoin(s2, s1) {
 			// If joining s1, s2 is not valid, try s2, s1. We only do this if the
-			// s1, s2 join fails, because commutation (for full joins) is handled by
-			// the CommuteJoin rule.
-			//
-			// This is necessary because we only iterate s1 up to subset / 2 in
-			// DPSube(). Take this transformation as an example:
+			// s1, s2 join fails, because commutation is handled by the addJoin
+			// function. This is necessary because we only iterate s1 up to subset / 2
+			// in DPSube(). Take this transformation as an example:
 			//
 			//    SELECT *
 			//    FROM (SELECT * FROM xy LEFT JOIN ab ON x = a)
@@ -619,6 +620,7 @@ func (jb *JoinOrderBuilder) makeTransitiveEdge(col1, col2 opt.ColumnID) {
 // makeEdge returns a new edge given an operator and set of filters.
 func (jb *JoinOrderBuilder) makeEdge(op *operator, filters memo.FiltersExpr) (e *edge) {
 	e = &edge{op: op, filters: filters}
+	e.calcNullRejectedRels(jb)
 	e.calcSES(jb)
 	e.calcTES(jb.edges)
 	return e
@@ -657,6 +659,7 @@ func (jb *JoinOrderBuilder) addJoin(
 		// Hook for testing purposes.
 		jb.callOnAddJoinFunc(s1, s2, joinFilters, op)
 	}
+
 	left := jb.plans[s1]
 	right := jb.plans[s2]
 	union := s1.union(s2)
@@ -664,6 +667,16 @@ func (jb *JoinOrderBuilder) addJoin(
 		jb.addToGroup(op, left, right, joinFilters, selectFilters, jb.plans[union])
 	} else {
 		jb.plans[union] = jb.memoize(op, left, right, joinFilters, selectFilters)
+	}
+
+	if commute(op) {
+		// Also add the commuted version of the join to the memo.
+		jb.addToGroup(op, right, left, joinFilters, selectFilters, jb.plans[union])
+
+		if jb.onAddJoinFunc != nil {
+			// Hook for testing purposes.
+			jb.callOnAddJoinFunc(s2, s1, joinFilters, op)
+		}
 	}
 }
 
@@ -830,6 +843,11 @@ func (jb *JoinOrderBuilder) allEdges() edgeSet {
 func (jb *JoinOrderBuilder) addBaseRelation(rel memo.RelExpr) {
 	jb.checkSize()
 	jb.vertexes = append(jb.vertexes, rel)
+
+	// Initialize the plan for this vertex.
+	idx := vertexIndex(len(jb.vertexes) - 1)
+	relSet := vertexSet(0).add(idx)
+	jb.plans[relSet] = rel
 }
 
 // checkSize panics if the number of relations is greater than or equal to
@@ -908,6 +926,10 @@ type edge struct {
 	// ON conditions.
 	filters memo.FiltersExpr
 
+	// nullRejectedRels is the set of vertexes on which nulls are rejected by the
+	// filters.
+	nullRejectedRels vertexSet
+
 	// ses is the syntactic eligibility set of the edge; in other words, it is the
 	// set of base relations referenced by the filters field.
 	ses vertexSet
@@ -969,7 +991,19 @@ type conflictRule struct {
 	to   vertexSet
 }
 
-// calcSES initializes the ses relation set of the edge with all relations
+// calcNullRejectedRels initializes the notNullRels vertex set of the edge with
+// all relations on which nulls are rejected by the edge's filters.
+func (e *edge) calcNullRejectedRels(jb *JoinOrderBuilder) {
+	var nullRejectedCols opt.ColSet
+	for i := range e.filters {
+		if constraints := e.filters[i].ScalarProps().Constraints; constraints != nil {
+			nullRejectedCols.UnionWith(constraints.ExtractNotNullCols(jb.evalCtx))
+		}
+	}
+	e.nullRejectedRels = jb.getRelations(nullRejectedCols)
+}
+
+// calcSES initializes the ses vertex set of the edge with all relations
 // referenced by the edge's predicate (syntactic eligibility set from paper). If
 // a join uses a predicate in its ON condition, all relations in the SES must be
 // part of the join's inputs. For example, in this query:
@@ -1236,6 +1270,11 @@ func (e *edge) checkRules(s1, s2 vertexSet) bool {
 	return true
 }
 
+// commute returns true if the given join operator type is commutable.
+func commute(op opt.Operator) bool {
+	return op == opt.InnerJoinOp || op == opt.FullJoinOp
+}
+
 // assoc returns true if two joins with the operator types and filters described
 // by the given edges are associative with each other. An example of an
 // application of the associative property:
@@ -1255,8 +1294,8 @@ func (e *edge) checkRules(s1, s2 vertexSet) bool {
 //    )
 //    ON x = a
 //
-func assoc(edge1, edge2 *edge) bool {
-	if edge2.ses.intersects(edge1.op.leftVertexes) || edge1.ses.intersects(edge2.op.rightVertexes) {
+func assoc(edgeA, edgeB *edge) bool {
+	if edgeB.ses.intersects(edgeA.op.leftVertexes) || edgeA.ses.intersects(edgeB.op.rightVertexes) {
 		// Ensure that application of the associative property would not lead to
 		// 'orphaned' predicates, where one or more referenced relations are not in
 		// the resulting join's inputs. Take as an example this reordering that
@@ -1274,7 +1313,7 @@ func assoc(edge1, edge2 *edge) bool {
 		// in that join's inputs. Therefore, this transformation is invalid.
 		return false
 	}
-	return assocTable[getOpIdx(edge1.op.joinType)][getOpIdx(edge2.op.joinType)]
+	return checkProperty(assocTable, edgeA, edgeB)
 }
 
 // leftAsscom returns true if two joins with the operator types and filters
@@ -1295,13 +1334,13 @@ func assoc(edge1, edge2 *edge) bool {
 //    )
 //    INNER JOIN ab ON x = a
 //
-func leftAsscom(edge1, edge2 *edge) bool {
-	if edge2.ses.intersects(edge1.op.rightVertexes) || edge1.ses.intersects(edge2.op.rightVertexes) {
+func leftAsscom(edgeA, edgeB *edge) bool {
+	if edgeB.ses.intersects(edgeA.op.rightVertexes) || edgeA.ses.intersects(edgeB.op.rightVertexes) {
 		// Ensure that application of the left-asscom property would not lead to
 		// 'orphaned' predicates. See the assoc() comment for why this is necessary.
 		return false
 	}
-	return leftAsscomTable[getOpIdx(edge1.op.joinType)][getOpIdx(edge2.op.joinType)]
+	return checkProperty(leftAsscomTable, edgeA, edgeB)
 }
 
 // rightAsscom returns true if two joins with the operator types and filters
@@ -1324,19 +1363,172 @@ func leftAsscom(edge1, edge2 *edge) bool {
 //    )
 //    ON x = a
 //
-func rightAsscom(edge1, edge2 *edge) bool {
-	if edge2.ses.intersects(edge1.op.leftVertexes) || edge1.ses.intersects(edge2.op.leftVertexes) {
+func rightAsscom(edgeA, edgeB *edge) bool {
+	if edgeB.ses.intersects(edgeA.op.leftVertexes) || edgeA.ses.intersects(edgeB.op.leftVertexes) {
 		// Ensure that application of the right-asscom property would not lead to
 		// 'orphaned' predicates. See the assoc() comment for why this is necessary.
 		return false
 	}
-	return rightAsscomTable[getOpIdx(edge1.op.joinType)][getOpIdx(edge2.op.joinType)]
+	return checkProperty(rightAsscomTable, edgeA, edgeB)
 }
 
-// getOpIdx returns an index into the join property lookup tables given a join
-// operator type.
-func getOpIdx(op opt.Operator) int {
-	switch op {
+// lookupTableEntry is an entry in one of the join property lookup tables
+// defined below (associative, left-asscom and right-asscom properties). A
+// lookupTableEntry can be unconditionally true or false, as well as true
+// conditional on the null-rejecting properties of the edge filters.
+type lookupTableEntry uint8
+
+const (
+	// never indicates that the transformation represented by the table entry is
+	// unconditionally incorrect.
+	never lookupTableEntry = 0
+
+	// always indicates that the transformation represented by the table entry is
+	// unconditionally correct.
+	always lookupTableEntry = 1 << (iota - 1)
+
+	// filterA indicates that the filters of the "A" join operator must reject
+	// nulls for the set of vertexes specified by rejectsOnLeftA, rejectsOnRightA,
+	// etc.
+	filterA
+
+	// filterB indicates that the filters of the "B" join operator must reject
+	// nulls for the set of vertexes specified by rejectsOnLeftA, rejectsOnRightA,
+	// etc.
+	filterB
+
+	// rejectsOnLeftA indicates that the filters must reject nulls for the left
+	// input relations of operator "A".
+	rejectsOnLeftA
+
+	// rejectsOnLeftA indicates that the filters must reject nulls for the right
+	// input relations of operator "A".
+	rejectsOnRightA
+
+	// rejectsOnLeftA indicates that the filters must reject nulls for the right
+	// input relations of operator "B".
+	rejectsOnRightB
+
+	// table2Note1 indicates that the filters of operator "B" must reject nulls on
+	// the relations of the right input of operator "A".
+	// Citations: [8] Table 2 Footnote 1.
+	table2Note1 = filterB | rejectsOnRightA
+
+	// table2Note2 indicates that the filters of operators "A" and "B" must reject
+	// nulls on the relations of the right input of operator "A".
+	// Citations: [8] Table 2 Footnote 2.
+	table2Note2 = (filterA | filterB) | rejectsOnRightA
+
+	// table3Note1 indicates that the filters of operator "A" must reject nulls on
+	// the relations of the left input of operator "A".
+	// Citations: [8] Table 3 Footnote 1.
+	table3Note1 = filterA | rejectsOnLeftA
+
+	// table3Note2 indicates that the filters of operator "B" must reject nulls on
+	// the relations of the right input of operator "B".
+	// Citations: [8] Table 3 Footnote 1]2.
+	table3Note2 = filterB | rejectsOnRightB
+
+	// table3Note3 indicates that the filters of operators "A" and "B" must reject
+	// nulls on the relations of the left input of operator "A".
+	// Citations: [8] Table 3 Footnote 3.
+	table3Note3 = (filterA | filterB) | rejectsOnLeftA
+
+	// table3Note4 indicates that the filters of operators "A" and "B" must reject
+	// nulls on the relations of the right input of operator "B".
+	// Citations: [8] Table 3 Footnote 4.
+	table3Note4 = (filterA | filterB) | rejectsOnRightB
+)
+
+// assocTable is a lookup table indicating whether it is correct to apply the
+// associative transformation to pairs of join operators.
+// citations: [8] table 2
+var assocTable = [5][5]lookupTableEntry{
+	//             inner-B semi-B  anti-B  left-B  full-B
+	/* inner-A */ {always, always, always, always, never},
+	/* semi-A  */ {never, never, never, never, never},
+	/* anti-A  */ {never, never, never, never, never},
+	/* left-A  */ {never, never, never, table2Note1, never},
+	/* full-A  */ {never, never, never, table2Note1, table2Note2},
+}
+
+// leftAsscomTable is a lookup table indicating whether it is correct to apply
+// the left-asscom transformation to pairs of join operators.
+// citations: [8] table 3
+var leftAsscomTable = [5][5]lookupTableEntry{
+	//             inner-B semi-B  anti-B  left-B  full-B
+	/* inner-A */ {always, always, always, always, never},
+	/* semi-A  */ {always, always, always, always, never},
+	/* anti-A  */ {always, always, always, always, never},
+	/* left-A  */ {always, always, always, always, table3Note1},
+	/* full-A  */ {never, never, never, table3Note2, table3Note3},
+}
+
+// rightAsscomTable is a lookup table indicating whether it is correct to apply
+// the right-asscom transformation to pairs of join operators.
+// citations: [8] table 3
+var rightAsscomTable = [5][5]lookupTableEntry{
+	//             inner-B semi-B anti-B left-B full-B
+	/* inner-A */ {always, never, never, never, never},
+	/* semi-A  */ {never, never, never, never, never},
+	/* anti-A  */ {never, never, never, never, never},
+	/* left-A  */ {never, never, never, never, never},
+	/* full-A  */ {never, never, never, never, table3Note4},
+}
+
+// checkProperty returns true if the transformation represented by the given
+// property lookup table is allowed for the two given edges. Note that while
+// most table entries are either true or false, some are conditionally true,
+// depending on the null-rejecting properties of the edge filters (for example,
+// association for two full joins).
+func checkProperty(table [5][5]lookupTableEntry, edgeA, edgeB *edge) bool {
+	entry := table[getOpIdx(edgeA)][getOpIdx(edgeB)]
+
+	if entry == never {
+		// Application of this transformation property is unconditionally incorrect.
+		return false
+	}
+	if entry == always {
+		// Application of this transformation property is unconditionally correct.
+		return true
+	}
+
+	// This property is conditionally applicable. Get the relations that must be
+	// null-rejected by the filters.
+	var candidateNullRejectRels vertexSet
+	if entry&rejectsOnLeftA != 0 {
+		// Filters must null-reject on the left input vertexes of edgeA.
+		candidateNullRejectRels = edgeA.op.leftVertexes
+	} else if entry&rejectsOnRightA != 0 {
+		// Filters must null-reject on the right input vertexes of edgeA.
+		candidateNullRejectRels = edgeA.op.rightVertexes
+	} else if entry&rejectsOnRightB != 0 {
+		// Filters must null-reject on the right input vertexes of edgeB.
+		candidateNullRejectRels = edgeB.op.rightVertexes
+	}
+
+	// Check whether the edge filters reject nulls on nullRejectRelations.
+	if entry&filterA != 0 {
+		// The filters of edgeA must reject nulls on one or more of the relations in
+		// nullRejectRelations.
+		if !edgeA.nullRejectedRels.intersects(candidateNullRejectRels) {
+			return false
+		}
+	}
+	if entry&filterB != 0 {
+		// The filters of edgeB must reject nulls on one or more of the relations in
+		// nullRejectRelations.
+		if !edgeB.nullRejectedRels.intersects(candidateNullRejectRels) {
+			return false
+		}
+	}
+	return true
+}
+
+// getOpIdx returns an index into the join property lookup tables given an edge
+// with an associated operator type.
+func getOpIdx(e *edge) int {
+	switch e.op.joinType {
 	case opt.InnerJoinOp:
 		return 0
 
@@ -1353,47 +1545,8 @@ func getOpIdx(op opt.Operator) int {
 		return 4
 
 	default:
-		panic(errors.AssertionFailedf("invalid operator: %v", op))
+		panic(errors.AssertionFailedf("invalid operator: %v", e.op.joinType))
 	}
-}
-
-// assocTable is a lookup table indicating whether pairs of join operator types
-// are associative.
-// citations: [8] table 2
-//
-// TODO(drewk): a few of these 'false' entries can be conditionally 'true',
-//  depending on whether the filters reject nulls. Handle these.
-var assocTable = [5][5]bool{
-	/*           inner semi  anti  left  full */
-	/* inner */ {true, true, true, true, false},
-	/* semi  */ {false, false, false, false, false},
-	/* anti  */ {false, false, false, false, false},
-	/* left  */ {false, false, false, false, false},
-	/* full  */ {false, false, false, false, false},
-}
-
-// leftAsscomTable is a lookup table indicating whether a given pair of join
-// operator types follow the left-asscom property.
-// citations: [8] table 3
-var leftAsscomTable = [5][5]bool{
-	/*           inner semi  anti  left  full */
-	/* inner */ {true, true, true, true, false},
-	/* semi  */ {true, true, true, true, false},
-	/* anti  */ {true, true, true, true, false},
-	/* left  */ {true, true, true, true, false},
-	/* full  */ {false, false, false, false, false},
-}
-
-// rightAsscomTable is a lookup table indicating whether a given pair of join
-// operator types follows the right-asscom property.
-// citations: [8] table 3
-var rightAsscomTable = [5][5]bool{
-	/*           inner semi   anti   left   full */
-	/* inner */ {true, false, false, false, false},
-	/* semi  */ {false, false, false, false, false},
-	/* anti  */ {false, false, false, false, false},
-	/* left  */ {false, false, false, false, false},
-	/* full  */ {false, false, false, false, false},
 }
 
 type edgeSet = util.FastIntSet

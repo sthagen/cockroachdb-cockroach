@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
@@ -24,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -138,11 +140,16 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		if colMeta.Table != opt.TableID(0) {
 			// Get the cat.Table that this column references.
 			tab := md.Table(colMeta.Table)
-			resultCols[i].TableID = sqlbase.ID(tab.ID())
+			resultCols[i].TableID = descpb.ID(tab.ID())
 			// Convert the metadata opt.ColumnID to its ordinal position in the table.
 			colOrdinal := colMeta.Table.ColumnOrdinal(col.ID)
 			// Use that ordinal position to retrieve the column's stable ID.
-			resultCols[i].PGAttributeNum = sqlbase.ColumnID(tab.Column(colOrdinal).ColID())
+			switch col := tab.Column(colOrdinal).(type) {
+			case *descpb.ColumnDescriptor:
+				resultCols[i].PGAttributeNum = col.GetPGAttributeNum()
+			default:
+				resultCols[i].PGAttributeNum = uint32(col.ColID())
+			}
 		}
 	}
 
@@ -204,7 +211,10 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 		if p.Descriptors().HasUncommittedTypes() {
 			planningMode = distSQLLocalOnlyPlanning
 		}
-		bld = execbuilder.New(newDistSQLSpecExecFactory(p, planningMode), execMemo, &opc.catalog, root, p.EvalContext())
+		bld = execbuilder.New(
+			newDistSQLSpecExecFactory(p, planningMode), execMemo, &opc.catalog, root,
+			p.EvalContext(), p.autoCommit,
+		)
 		plan, err = bld.Build()
 		if err != nil {
 			if mode == sessiondata.ExperimentalDistSQLPlanningAlways &&
@@ -221,15 +231,22 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 			// We will fallback to the old path.
 		}
 		if err == nil {
+			// TODO(yuzefovich): think through whether subqueries or
+			// postqueries can be distributed. If that's the case, we might
+			// need to also look at the plan distribution of those.
 			m := plan.(*planTop).main
-			if m.isPartiallyDistributed() && p.SessionData().PartiallyDistributedPlansDisabled {
+			isPartiallyDistributed := m.physPlan.Distribution == physicalplan.PartiallyDistributedPlan
+			if isPartiallyDistributed && p.SessionData().PartiallyDistributedPlansDisabled {
 				// The planning has succeeded, but we've created a partially
 				// distributed plan yet the session variable prohibits such
 				// plan distribution - we need to replan with a new factory
 				// that forces local planning.
 				// TODO(yuzefovich): remove this logic when deleting old
 				// execFactory.
-				bld = execbuilder.New(newDistSQLSpecExecFactory(p, distSQLLocalOnlyPlanning), execMemo, &opc.catalog, root, p.EvalContext())
+				bld = execbuilder.New(
+					newDistSQLSpecExecFactory(p, distSQLLocalOnlyPlanning), execMemo, &opc.catalog, root,
+					p.EvalContext(), p.autoCommit,
+				)
 				plan, err = bld.Build()
 			}
 		}
@@ -244,7 +261,9 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 	if bld == nil {
 		// If bld is non-nil, then experimental planning has succeeded and has
 		// already created a plan.
-		bld = execbuilder.New(newExecFactory(p), execMemo, &opc.catalog, root, p.EvalContext())
+		bld = execbuilder.New(
+			newExecFactory(p), execMemo, &opc.catalog, root, p.EvalContext(), p.autoCommit,
+		)
 		plan, err = bld.Build()
 		if err != nil {
 			return err

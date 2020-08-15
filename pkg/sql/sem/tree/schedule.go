@@ -22,7 +22,7 @@ type ScheduledBackup struct {
 	Recurrence      Expr
 	FullBackup      *FullBackupClause /* nil implies choose default */
 	Targets         *TargetList       /* nil implies tree.AllDescriptors coverage */
-	To              PartitionedBackup
+	To              StringOrPlaceholderOptList
 	BackupOptions   BackupOptions
 	ScheduleOptions KVOptions
 }
@@ -44,7 +44,7 @@ func (node *ScheduledBackup) Format(ctx *FmtCtx) {
 		node.Targets.Format(ctx)
 	}
 
-	ctx.WriteString(" TO ")
+	ctx.WriteString(" INTO ")
 	ctx.FormatNode(&node.To)
 
 	if !node.BackupOptions.IsDefault() {

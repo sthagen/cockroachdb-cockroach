@@ -117,6 +117,7 @@ func (ag *aggregatorBase) init(
 	// grouped-by values for each bucket.  ag.funcs is updated to contain all
 	// the functions which need to be fed values.
 	ag.inputTypes = input.OutputTypes()
+	semaCtx := flowCtx.TypeResolverFactory.NewSemaContext(flowCtx.EvalCtx.Txn)
 	for i, aggInfo := range spec.Aggregations {
 		if aggInfo.FilterColIdx != nil {
 			col := *aggInfo.FilterColIdx
@@ -130,40 +131,17 @@ func (ag *aggregatorBase) init(
 				)
 			}
 		}
-		argTypes := make([]*types.T, len(aggInfo.ColIdx)+len(aggInfo.Arguments))
-		for j, c := range aggInfo.ColIdx {
-			if c >= uint32(len(ag.inputTypes)) {
-				return errors.Errorf("ColIdx out of range (%d)", aggInfo.ColIdx)
-			}
-			argTypes[j] = ag.inputTypes[c]
-		}
-
-		arguments := make(tree.Datums, len(aggInfo.Arguments))
-		for j, argument := range aggInfo.Arguments {
-			h := execinfra.ExprHelper{}
-			// Pass nil types and row - there are no variables in these expressions.
-			if err := h.Init(argument, nil /* types */, flowCtx.EvalCtx); err != nil {
-				return errors.Wrapf(err, "%s", argument)
-			}
-			d, err := h.Eval(nil /* row */)
-			if err != nil {
-				return errors.Wrapf(err, "%s", argument)
-			}
-			argTypes[len(aggInfo.ColIdx)+j] = d.ResolvedType()
-			arguments[j] = d
-		}
-
-		aggConstructor, retType, err := execinfrapb.GetAggregateInfo(aggInfo.Func, argTypes...)
+		constructor, arguments, outputType, err := execinfrapb.GetAggregateConstructor(
+			flowCtx.EvalCtx, semaCtx, &aggInfo, ag.inputTypes,
+		)
 		if err != nil {
 			return err
 		}
-
-		ag.funcs[i] = ag.newAggregateFuncHolder(aggConstructor, arguments)
+		ag.funcs[i] = ag.newAggregateFuncHolder(constructor, arguments)
 		if aggInfo.Distinct {
 			ag.funcs[i].seen = make(map[string]struct{})
 		}
-
-		ag.outputTypes[i] = retType
+		ag.outputTypes[i] = outputType
 	}
 
 	return ag.ProcessorBase.Init(
@@ -577,9 +555,12 @@ func (ag *orderedAggregator) accumulateRows() (
 	return aggEmittingRows, nil, nil
 }
 
+// getAggResults returns the new aggregatorState and the results from the
+// bucket. The bucket is closed.
 func (ag *aggregatorBase) getAggResults(
 	bucket aggregateFuncs,
 ) (aggregatorState, sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
+	defer bucket.close(ag.Ctx)
 	for i, b := range bucket {
 		result, err := b.Result()
 		if err != nil {
@@ -592,7 +573,6 @@ func (ag *aggregatorBase) getAggResults(
 		}
 		ag.row[i] = sqlbase.DatumToEncDatum(ag.outputTypes[i], result)
 	}
-	bucket.close(ag.Ctx)
 
 	if outRow := ag.ProcessRowHelper(ag.row); outRow != nil {
 		return aggEmittingRows, outRow, nil
@@ -662,7 +642,7 @@ func (ag *hashAggregator) emitRow() (
 	// NOTE: accounting for the memory under aggregate builtins in the bucket
 	// is updated in getAggResults (the bucket will be closed), however, we
 	// choose to not reduce our estimate of the map's internal footprint
-	// because it is error-prone to estimate the new footprint (we don't
+	// because it is error-prone to estimate the new footprint (we don't know
 	// whether and when Go runtime will release some of the underlying memory).
 	// This behavior is ok, though, since actual usage of buckets will be lower
 	// than what we accounted for - in the worst case, the query might hit a
@@ -902,7 +882,6 @@ type aggregateFuncHolder struct {
 	// aggregate, for instance, the separator in string_agg.
 	arguments tree.Datums
 
-	group *aggregatorBase
 	seen  map[string]struct{}
 	arena *stringarena.Arena
 }
@@ -918,7 +897,6 @@ func (ag *aggregatorBase) newAggregateFuncHolder(
 ) *aggregateFuncHolder {
 	return &aggregateFuncHolder{
 		create:    create,
-		group:     ag,
 		arena:     &ag.arena,
 		arguments: arguments,
 	}

@@ -24,6 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -197,58 +199,58 @@ var pgCatalog = virtualSchema{
 		"pg_user_mappings",
 		"pg_views",
 	),
-	tableDefs: map[sqlbase.ID]virtualSchemaDef{
-		sqlbase.PgCatalogAmTableID:                  pgCatalogAmTable,
-		sqlbase.PgCatalogAttrDefTableID:             pgCatalogAttrDefTable,
-		sqlbase.PgCatalogAttributeTableID:           pgCatalogAttributeTable,
-		sqlbase.PgCatalogAuthIDTableID:              pgCatalogAuthIDTable,
-		sqlbase.PgCatalogAuthMembersTableID:         pgCatalogAuthMembersTable,
-		sqlbase.PgCatalogAvailableExtensionsTableID: pgCatalogAvailableExtensionsTable,
-		sqlbase.PgCatalogCastTableID:                pgCatalogCastTable,
-		sqlbase.PgCatalogClassTableID:               pgCatalogClassTable,
-		sqlbase.PgCatalogCollationTableID:           pgCatalogCollationTable,
-		sqlbase.PgCatalogConstraintTableID:          pgCatalogConstraintTable,
-		sqlbase.PgCatalogConversionTableID:          pgCatalogConversionTable,
-		sqlbase.PgCatalogDatabaseTableID:            pgCatalogDatabaseTable,
-		sqlbase.PgCatalogDefaultACLTableID:          pgCatalogDefaultACLTable,
-		sqlbase.PgCatalogDependTableID:              pgCatalogDependTable,
-		sqlbase.PgCatalogDescriptionTableID:         pgCatalogDescriptionTable,
-		sqlbase.PgCatalogSharedDescriptionTableID:   pgCatalogSharedDescriptionTable,
-		sqlbase.PgCatalogEnumTableID:                pgCatalogEnumTable,
-		sqlbase.PgCatalogEventTriggerTableID:        pgCatalogEventTriggerTable,
-		sqlbase.PgCatalogExtensionTableID:           pgCatalogExtensionTable,
-		sqlbase.PgCatalogForeignDataWrapperTableID:  pgCatalogForeignDataWrapperTable,
-		sqlbase.PgCatalogForeignServerTableID:       pgCatalogForeignServerTable,
-		sqlbase.PgCatalogForeignTableTableID:        pgCatalogForeignTableTable,
-		sqlbase.PgCatalogIndexTableID:               pgCatalogIndexTable,
-		sqlbase.PgCatalogIndexesTableID:             pgCatalogIndexesTable,
-		sqlbase.PgCatalogInheritsTableID:            pgCatalogInheritsTable,
-		sqlbase.PgCatalogLanguageTableID:            pgCatalogLanguageTable,
-		sqlbase.PgCatalogLocksTableID:               pgCatalogLocksTable,
-		sqlbase.PgCatalogMatViewsTableID:            pgCatalogMatViewsTable,
-		sqlbase.PgCatalogNamespaceTableID:           pgCatalogNamespaceTable,
-		sqlbase.PgCatalogOperatorTableID:            pgCatalogOperatorTable,
-		sqlbase.PgCatalogPreparedStatementsTableID:  pgCatalogPreparedStatementsTable,
-		sqlbase.PgCatalogPreparedXactsTableID:       pgCatalogPreparedXactsTable,
-		sqlbase.PgCatalogProcTableID:                pgCatalogProcTable,
-		sqlbase.PgCatalogAggregateTableID:           pgCatalogAggregateTable,
-		sqlbase.PgCatalogRangeTableID:               pgCatalogRangeTable,
-		sqlbase.PgCatalogRewriteTableID:             pgCatalogRewriteTable,
-		sqlbase.PgCatalogRolesTableID:               pgCatalogRolesTable,
-		sqlbase.PgCatalogSecLabelsTableID:           pgCatalogSecLabelsTable,
-		sqlbase.PgCatalogSequencesTableID:           pgCatalogSequencesTable,
-		sqlbase.PgCatalogSettingsTableID:            pgCatalogSettingsTable,
-		sqlbase.PgCatalogShdependTableID:            pgCatalogShdependTable,
-		sqlbase.PgCatalogUserTableID:                pgCatalogUserTable,
-		sqlbase.PgCatalogUserMappingTableID:         pgCatalogUserMappingTable,
-		sqlbase.PgCatalogTablesTableID:              pgCatalogTablesTable,
-		sqlbase.PgCatalogTablespaceTableID:          pgCatalogTablespaceTable,
-		sqlbase.PgCatalogTriggerTableID:             pgCatalogTriggerTable,
-		sqlbase.PgCatalogTypeTableID:                pgCatalogTypeTable,
-		sqlbase.PgCatalogViewsTableID:               pgCatalogViewsTable,
-		sqlbase.PgCatalogStatActivityTableID:        pgCatalogStatActivityTable,
-		sqlbase.PgCatalogSecurityLabelTableID:       pgCatalogSecurityLabelTable,
-		sqlbase.PgCatalogSharedSecurityLabelTableID: pgCatalogSharedSecurityLabelTable,
+	tableDefs: map[descpb.ID]virtualSchemaDef{
+		catconstants.PgCatalogAmTableID:                  pgCatalogAmTable,
+		catconstants.PgCatalogAttrDefTableID:             pgCatalogAttrDefTable,
+		catconstants.PgCatalogAttributeTableID:           pgCatalogAttributeTable,
+		catconstants.PgCatalogAuthIDTableID:              pgCatalogAuthIDTable,
+		catconstants.PgCatalogAuthMembersTableID:         pgCatalogAuthMembersTable,
+		catconstants.PgCatalogAvailableExtensionsTableID: pgCatalogAvailableExtensionsTable,
+		catconstants.PgCatalogCastTableID:                pgCatalogCastTable,
+		catconstants.PgCatalogClassTableID:               pgCatalogClassTable,
+		catconstants.PgCatalogCollationTableID:           pgCatalogCollationTable,
+		catconstants.PgCatalogConstraintTableID:          pgCatalogConstraintTable,
+		catconstants.PgCatalogConversionTableID:          pgCatalogConversionTable,
+		catconstants.PgCatalogDatabaseTableID:            pgCatalogDatabaseTable,
+		catconstants.PgCatalogDefaultACLTableID:          pgCatalogDefaultACLTable,
+		catconstants.PgCatalogDependTableID:              pgCatalogDependTable,
+		catconstants.PgCatalogDescriptionTableID:         pgCatalogDescriptionTable,
+		catconstants.PgCatalogSharedDescriptionTableID:   pgCatalogSharedDescriptionTable,
+		catconstants.PgCatalogEnumTableID:                pgCatalogEnumTable,
+		catconstants.PgCatalogEventTriggerTableID:        pgCatalogEventTriggerTable,
+		catconstants.PgCatalogExtensionTableID:           pgCatalogExtensionTable,
+		catconstants.PgCatalogForeignDataWrapperTableID:  pgCatalogForeignDataWrapperTable,
+		catconstants.PgCatalogForeignServerTableID:       pgCatalogForeignServerTable,
+		catconstants.PgCatalogForeignTableTableID:        pgCatalogForeignTableTable,
+		catconstants.PgCatalogIndexTableID:               pgCatalogIndexTable,
+		catconstants.PgCatalogIndexesTableID:             pgCatalogIndexesTable,
+		catconstants.PgCatalogInheritsTableID:            pgCatalogInheritsTable,
+		catconstants.PgCatalogLanguageTableID:            pgCatalogLanguageTable,
+		catconstants.PgCatalogLocksTableID:               pgCatalogLocksTable,
+		catconstants.PgCatalogMatViewsTableID:            pgCatalogMatViewsTable,
+		catconstants.PgCatalogNamespaceTableID:           pgCatalogNamespaceTable,
+		catconstants.PgCatalogOperatorTableID:            pgCatalogOperatorTable,
+		catconstants.PgCatalogPreparedStatementsTableID:  pgCatalogPreparedStatementsTable,
+		catconstants.PgCatalogPreparedXactsTableID:       pgCatalogPreparedXactsTable,
+		catconstants.PgCatalogProcTableID:                pgCatalogProcTable,
+		catconstants.PgCatalogAggregateTableID:           pgCatalogAggregateTable,
+		catconstants.PgCatalogRangeTableID:               pgCatalogRangeTable,
+		catconstants.PgCatalogRewriteTableID:             pgCatalogRewriteTable,
+		catconstants.PgCatalogRolesTableID:               pgCatalogRolesTable,
+		catconstants.PgCatalogSecLabelsTableID:           pgCatalogSecLabelsTable,
+		catconstants.PgCatalogSequencesTableID:           pgCatalogSequencesTable,
+		catconstants.PgCatalogSettingsTableID:            pgCatalogSettingsTable,
+		catconstants.PgCatalogShdependTableID:            pgCatalogShdependTable,
+		catconstants.PgCatalogUserTableID:                pgCatalogUserTable,
+		catconstants.PgCatalogUserMappingTableID:         pgCatalogUserMappingTable,
+		catconstants.PgCatalogTablesTableID:              pgCatalogTablesTable,
+		catconstants.PgCatalogTablespaceTableID:          pgCatalogTablespaceTable,
+		catconstants.PgCatalogTriggerTableID:             pgCatalogTriggerTable,
+		catconstants.PgCatalogTypeTableID:                pgCatalogTypeTable,
+		catconstants.PgCatalogViewsTableID:               pgCatalogViewsTable,
+		catconstants.PgCatalogStatActivityTableID:        pgCatalogStatActivityTable,
+		catconstants.PgCatalogSecurityLabelTableID:       pgCatalogSecurityLabelTable,
+		catconstants.PgCatalogSharedSecurityLabelTableID: pgCatalogSharedSecurityLabelTable,
 	},
 	// Postgres's catalogs are ill-defined when there is no current
 	// database set. Simply reject any attempts to use them in that
@@ -401,7 +403,7 @@ CREATE TABLE pg_catalog.pg_attrdef (
 		lookup simpleSchemaResolver,
 		addRow func(...tree.Datum) error) error {
 		colNum := 0
-		return forEachColumnInTable(table, func(column *sqlbase.ColumnDescriptor) error {
+		return forEachColumnInTable(table, func(column *descpb.ColumnDescriptor) error {
 			colNum++
 			if column.DefaultExpr == nil {
 				// pg_attrdef only expects rows for columns with default values.
@@ -424,9 +426,9 @@ CREATE TABLE pg_catalog.pg_attrdef (
 				defSrc = tree.NewDString(ctx.String())
 			}
 			return addRow(
-				h.ColumnOid(table.ID, column.ID),                     // oid
-				tableOid(table.ID),                                   // adrelid
-				tree.NewDInt(tree.DInt(column.GetLogicalColumnID())), // adnum
+				h.ColumnOid(table.ID, column.ID),                    // oid
+				tableOid(table.ID),                                  // adrelid
+				tree.NewDInt(tree.DInt(column.GetPGAttributeNum())), // adnum
 				defSrc, // adbin
 				defSrc, // adsrc
 			)
@@ -469,7 +471,7 @@ CREATE TABLE pg_catalog.pg_attribute (
 		lookup simpleSchemaResolver,
 		addRow func(...tree.Datum) error) error {
 		// addColumn adds adds either a table or a index column to the pg_attribute table.
-		addColumn := func(column *sqlbase.ColumnDescriptor, attRelID tree.Datum, colID sqlbase.ColumnID) error {
+		addColumn := func(column *descpb.ColumnDescriptor, attRelID tree.Datum, attNum uint32) error {
 			colTyp := column.Type
 			// Sets the attgenerated column to 's' if the column is generated/
 			// computed, zero byte otherwise.
@@ -480,14 +482,14 @@ CREATE TABLE pg_catalog.pg_attribute (
 				isColumnComputed = ""
 			}
 			return addRow(
-				attRelID,                       // attrelid
-				tree.NewDName(column.Name),     // attname
-				typOid(colTyp),                 // atttypid
-				zeroVal,                        // attstattarget
-				typLen(colTyp),                 // attlen
-				tree.NewDInt(tree.DInt(colID)), // attnum
-				zeroVal,                        // attndims
-				negOneVal,                      // attcacheoff
+				attRelID,                        // attrelid
+				tree.NewDName(column.Name),      // attname
+				typOid(colTyp),                  // atttypid
+				zeroVal,                         // attstattarget
+				typLen(colTyp),                  // attlen
+				tree.NewDInt(tree.DInt(attNum)), // attnum
+				zeroVal,                         // attndims
+				negOneVal,                       // attcacheoff
 				tree.NewDInt(tree.DInt(colTyp.TypeModifier())), // atttypmod
 				tree.DNull, // attbyval (see pg_type.typbyval)
 				tree.DNull, // attstorage
@@ -507,19 +509,19 @@ CREATE TABLE pg_catalog.pg_attribute (
 		}
 
 		// Columns for table.
-		if err := forEachColumnInTable(table, func(column *sqlbase.ColumnDescriptor) error {
+		if err := forEachColumnInTable(table, func(column *descpb.ColumnDescriptor) error {
 			tableID := tableOid(table.ID)
-			return addColumn(column, tableID, column.GetLogicalColumnID())
+			return addColumn(column, tableID, column.GetPGAttributeNum())
 		}); err != nil {
 			return err
 		}
 
 		// Columns for each index.
-		return forEachIndexInTable(table, func(index *sqlbase.IndexDescriptor) error {
+		return forEachIndexInTable(table, func(index *descpb.IndexDescriptor) error {
 			return forEachColumnInIndex(table, index,
-				func(column *sqlbase.ColumnDescriptor) error {
+				func(column *descpb.ColumnDescriptor) error {
 					idxID := h.IndexOid(table.ID, index.ID)
-					return addColumn(column, idxID, column.GetLogicalColumnID())
+					return addColumn(column, idxID, column.GetPGAttributeNum())
 				},
 			)
 		})
@@ -568,7 +570,7 @@ CREATE TABLE pg_catalog.pg_authid (
 	populate: func(ctx context.Context, p *planner, _ *sqlbase.ImmutableDatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
 		return forEachRole(ctx, p, func(username string, isRole bool, noLogin bool, rolValidUntil *time.Time) error {
-			isRoot := tree.DBool(username == security.RootUser || username == sqlbase.AdminRole)
+			isRoot := tree.DBool(username == security.RootUser || username == security.AdminRole)
 			isRoleDBool := tree.DBool(isRole)
 			roleCanLogin := tree.DBool(!noLogin)
 			roleValidUntilValue := tree.DNull
@@ -639,10 +641,11 @@ CREATE TABLE pg_catalog.pg_available_extensions (
 }
 
 var (
-	relKindTable    = tree.NewDString("r")
-	relKindIndex    = tree.NewDString("i")
-	relKindView     = tree.NewDString("v")
-	relKindSequence = tree.NewDString("S")
+	relKindTable            = tree.NewDString("r")
+	relKindIndex            = tree.NewDString("i")
+	relKindView             = tree.NewDString("v")
+	relKindMaterializedView = tree.NewDString("m")
+	relKindSequence         = tree.NewDString("S")
 
 	relPersistencePermanent = tree.NewDString("p")
 )
@@ -690,6 +693,9 @@ CREATE TABLE pg_catalog.pg_class (
 		relAm := forwardIndexOid
 		if table.IsView() {
 			relKind = relKindView
+			if table.MaterializedView() {
+				relKind = relKindMaterializedView
+			}
 			relAm = oidZero
 		} else if table.IsSequence() {
 			relKind = relKindSequence
@@ -737,9 +743,9 @@ CREATE TABLE pg_catalog.pg_class (
 		}
 
 		// Indexes.
-		return forEachIndexInTable(table, func(index *sqlbase.IndexDescriptor) error {
+		return forEachIndexInTable(table, func(index *descpb.IndexDescriptor) error {
 			indexType := forwardIndexOid
-			if index.Type == sqlbase.IndexDescriptor_INVERTED {
+			if index.Type == descpb.IndexDescriptor_INVERTED {
 				indexType = invertedIndexOid
 			}
 			return addRow(
@@ -831,22 +837,22 @@ var (
 	fkActionSetNull    = tree.NewDString("n")
 	fkActionSetDefault = tree.NewDString("d")
 
-	fkActionMap = map[sqlbase.ForeignKeyReference_Action]tree.Datum{
-		sqlbase.ForeignKeyReference_NO_ACTION:   fkActionNone,
-		sqlbase.ForeignKeyReference_RESTRICT:    fkActionRestrict,
-		sqlbase.ForeignKeyReference_CASCADE:     fkActionCascade,
-		sqlbase.ForeignKeyReference_SET_NULL:    fkActionSetNull,
-		sqlbase.ForeignKeyReference_SET_DEFAULT: fkActionSetDefault,
+	fkActionMap = map[descpb.ForeignKeyReference_Action]tree.Datum{
+		descpb.ForeignKeyReference_NO_ACTION:   fkActionNone,
+		descpb.ForeignKeyReference_RESTRICT:    fkActionRestrict,
+		descpb.ForeignKeyReference_CASCADE:     fkActionCascade,
+		descpb.ForeignKeyReference_SET_NULL:    fkActionSetNull,
+		descpb.ForeignKeyReference_SET_DEFAULT: fkActionSetDefault,
 	}
 
 	fkMatchTypeFull    = tree.NewDString("f")
 	fkMatchTypePartial = tree.NewDString("p")
 	fkMatchTypeSimple  = tree.NewDString("s")
 
-	fkMatchMap = map[sqlbase.ForeignKeyReference_Match]tree.Datum{
-		sqlbase.ForeignKeyReference_SIMPLE:  fkMatchTypeSimple,
-		sqlbase.ForeignKeyReference_FULL:    fkMatchTypeFull,
-		sqlbase.ForeignKeyReference_PARTIAL: fkMatchTypePartial,
+	fkMatchMap = map[descpb.ForeignKeyReference_Match]tree.Datum{
+		descpb.ForeignKeyReference_SIMPLE:  fkMatchTypeSimple,
+		descpb.ForeignKeyReference_FULL:    fkMatchTypeFull,
+		descpb.ForeignKeyReference_PARTIAL: fkMatchTypePartial,
 	}
 )
 
@@ -883,7 +889,7 @@ func populateTableConstraints(
 		// Determine constraint kind-specific fields.
 		var err error
 		switch con.Kind {
-		case sqlbase.ConstraintTypePK:
+		case descpb.ConstraintTypePK:
 			oid = h.PrimaryKeyConstraintOid(db, scName, table.TableDesc(), con.Index)
 			contype = conTypePKey
 			conindid = h.IndexOid(table.ID, con.Index.ID)
@@ -894,7 +900,7 @@ func populateTableConstraints(
 			}
 			condef = tree.NewDString(table.PrimaryKeyString())
 
-		case sqlbase.ConstraintTypeFK:
+		case descpb.ConstraintTypeFK:
 			oid = h.ForeignKeyConstraintOid(db, scName, table.TableDesc(), con.FK)
 			contype = conTypeFK
 			// Foreign keys don't have a single linked index. Pick the first one
@@ -926,12 +932,17 @@ func populateTableConstraints(
 				return err
 			}
 			var buf bytes.Buffer
-			if err := showForeignKeyConstraint(&buf, db.GetName(), table, con.FK, tableLookup); err != nil {
+			if err := showForeignKeyConstraint(
+				&buf, db.GetName(),
+				table, con.FK,
+				tableLookup,
+				p.extendedEvalCtx.SessionData.SearchPath,
+			); err != nil {
 				return err
 			}
 			condef = tree.NewDString(buf.String())
 
-		case sqlbase.ConstraintTypeUnique:
+		case descpb.ConstraintTypeUnique:
 			oid = h.UniqueConstraintOid(db, scName, table.TableDesc(), con.Index)
 			contype = conTypeUnique
 			conindid = h.IndexOid(table.ID, con.Index.ID)
@@ -945,7 +956,7 @@ func populateTableConstraints(
 			f.WriteByte(')')
 			condef = tree.NewDString(f.CloseAndGetString())
 
-		case sqlbase.ConstraintTypeCheck:
+		case descpb.ConstraintTypeCheck:
 			oid = h.CheckConstraintOid(db, scName, table.TableDesc(), con.CheckConstraint)
 			contype = conTypeCheck
 			if conkey, err = colIDArrayToDatum(con.CheckConstraint.ColumnIDs); err != nil {
@@ -996,31 +1007,32 @@ type oneAtATimeSchemaResolver struct {
 }
 
 func (r oneAtATimeSchemaResolver) getDatabaseByID(
-	id sqlbase.ID,
+	id descpb.ID,
 ) (*sqlbase.ImmutableDatabaseDescriptor, error) {
 	return r.p.Descriptors().DatabaseCache().GetDatabaseDescByID(r.ctx, r.p.txn, id)
 }
 
-func (r oneAtATimeSchemaResolver) getTableByID(id sqlbase.ID) (*TableDescriptor, error) {
+func (r oneAtATimeSchemaResolver) getTableByID(id descpb.ID) (sqlbase.TableDescriptor, error) {
 	table, err := r.p.LookupTableByID(r.ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	return table.Desc.TableDesc(), nil
+	return table.Desc, nil
 }
 
 func (r oneAtATimeSchemaResolver) getSchemaByID(
-	id sqlbase.ID,
+	id descpb.ID,
 ) (*sqlbase.ImmutableSchemaDescriptor, error) {
 	// TODO (rohany): This should use the descs.Collection.
-	sc, err := catalogkv.GetDescriptorByID(r.ctx, r.p.txn, r.p.ExecCfg().Codec, id)
+	desc, err := catalogkv.GetAnyDescriptorByID(r.ctx, r.p.txn, r.p.ExecCfg().Codec, id, catalogkv.Immutable)
 	if err != nil {
 		return nil, err
 	}
-	if sc == nil || sc.SchemaDesc() == nil {
+	sc, ok := desc.(*sqlbase.ImmutableSchemaDescriptor)
+	if !ok {
 		return nil, sqlbase.NewUndefinedSchemaError(fmt.Sprintf("[%d]", id))
 	}
-	return sc.(*sqlbase.ImmutableSchemaDescriptor), nil
+	return sc, nil
 }
 
 // makeAllRelationsVirtualTableWithDescriptorIDIndex creates a virtual table that searches through
@@ -1055,16 +1067,16 @@ func makeAllRelationsVirtualTableWithDescriptorIDIndex(
 				partial: includesIndexEntries,
 				populate: func(ctx context.Context, constraint tree.Datum, p *planner, db *sqlbase.ImmutableDatabaseDescriptor,
 					addRow func(...tree.Datum) error) (bool, error) {
-					var id sqlbase.ID
+					var id descpb.ID
 					d := tree.UnwrapDatum(p.EvalContext(), constraint)
 					if d == tree.DNull {
 						return false, nil
 					}
 					switch t := d.(type) {
 					case *tree.DOid:
-						id = sqlbase.ID(t.DInt)
+						id = descpb.ID(t.DInt)
 					case *tree.DInt:
-						id = sqlbase.ID(*t)
+						id = descpb.ID(*t)
 					default:
 						return false, errors.AssertionFailedf("unexpected type %T for table id column in virtual table %s",
 							d, schemaDef)
@@ -1146,7 +1158,7 @@ CREATE TABLE pg_catalog.pg_constraint (
 
 // colIDArrayToDatum returns an int[] containing the ColumnIDs, or NULL if there
 // are no ColumnIDs.
-func colIDArrayToDatum(arr []sqlbase.ColumnID) (tree.Datum, error) {
+func colIDArrayToDatum(arr []descpb.ColumnID) (tree.Datum, error) {
 	if len(arr) == 0 {
 		return tree.DNull, nil
 	}
@@ -1161,7 +1173,7 @@ func colIDArrayToDatum(arr []sqlbase.ColumnID) (tree.Datum, error) {
 
 // colIDArrayToVector returns an INT2VECTOR containing the ColumnIDs, or NULL if
 // there are no ColumnIDs.
-func colIDArrayToVector(arr []sqlbase.ColumnID) (tree.Datum, error) {
+func colIDArrayToVector(arr []descpb.ColumnID) (tree.Datum, error) {
 	dArr, err := colIDArrayToDatum(arr)
 	if err != nil {
 		return nil, err
@@ -1312,7 +1324,7 @@ CREATE TABLE pg_catalog.pg_depend (
 			pgConstraintTableOid := tableOid(pgConstraintsDesc.ID)
 			pgClassTableOid := tableOid(pgClassDesc.ID)
 			if table.IsSequence() &&
-				!table.SequenceOpts.SequenceOwner.Equal(sqlbase.TableDescriptor_SequenceOpts_SequenceOwner{}) {
+				!table.SequenceOpts.SequenceOwner.Equal(descpb.TableDescriptor_SequenceOpts_SequenceOwner{}) {
 				refObjID := tableOid(table.SequenceOpts.SequenceOwner.OwnerTableID)
 				refObjSubID := tree.NewDInt(tree.DInt(table.SequenceOpts.SequenceOwner.OwnerColumnID))
 				objID := tableOid(table.GetID())
@@ -1331,7 +1343,7 @@ CREATE TABLE pg_catalog.pg_depend (
 				return err
 			}
 			for _, con := range conInfo {
-				if con.Kind != sqlbase.ConstraintTypeFK {
+				if con.Kind != descpb.ConstraintTypeFK {
 					continue
 				}
 
@@ -1421,13 +1433,13 @@ CREATE TABLE pg_catalog.pg_description (
 				continue
 			case keys.ColumnCommentType, keys.TableCommentType:
 				objID = tree.NewDOid(tree.MustBeDInt(objID))
-				classOid = tree.NewDOid(sqlbase.PgCatalogClassTableID)
+				classOid = tree.NewDOid(catconstants.PgCatalogClassTableID)
 			case keys.IndexCommentType:
 				objID = makeOidHasher().IndexOid(
-					sqlbase.ID(tree.MustBeDInt(objID)),
-					sqlbase.IndexID(tree.MustBeDInt(objSubID)))
+					descpb.ID(tree.MustBeDInt(objID)),
+					descpb.IndexID(tree.MustBeDInt(objSubID)))
 				objSubID = tree.DZero
-				classOid = tree.NewDOid(sqlbase.PgCatalogClassTableID)
+				classOid = tree.NewDOid(catconstants.PgCatalogClassTableID)
 			}
 			if err := addRow(
 				objID,
@@ -1462,8 +1474,8 @@ CREATE TABLE pg_catalog.pg_shdescription (
 				// Only database comments are exported in this table.
 				continue
 			}
-			classOid := tree.NewDOid(sqlbase.PgCatalogDatabaseTableID)
-			objID := sqlbase.ID(tree.MustBeDInt(comment[0]))
+			classOid := tree.NewDOid(catconstants.PgCatalogDatabaseTableID)
+			objID := descpb.ID(tree.MustBeDInt(comment[0]))
 			if err := addRow(
 				tableOid(objID),
 				classOid,
@@ -1490,13 +1502,13 @@ CREATE TABLE pg_catalog.pg_enum (
 
 		return forEachTypeDesc(ctx, p, dbContext, func(_ *sqlbase.ImmutableDatabaseDescriptor, _ string, typDesc *sqlbase.ImmutableTypeDescriptor) error {
 			// We only want to iterate over ENUM types.
-			if typDesc.Kind != sqlbase.TypeDescriptor_ENUM {
+			if typDesc.Kind != descpb.TypeDescriptor_ENUM {
 				return nil
 			}
 			// Generate a row for each member of the enum. We don't represent enums
 			// internally using floats for ordering like Postgres, so just pick a
 			// float entry for the rows.
-			typOID := tree.NewDOid(tree.DInt(types.StableTypeIDToOID(uint32(typDesc.GetID()))))
+			typOID := tree.NewDOid(tree.DInt(sqlbase.TypeIDToOID(typDesc.GetID())))
 			for i, member := range typDesc.EnumMembers {
 				if err := addRow(
 					h.EnumEntryOid(typOID, member.PhysicalRepresentation),
@@ -1644,7 +1656,7 @@ CREATE TABLE pg_catalog.pg_index (
 		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /* virtual tables do not have indexes */
 			func(db *sqlbase.ImmutableDatabaseDescriptor, scName string, table *sqlbase.ImmutableTableDescriptor) error {
 				tableOid := tableOid(table.ID)
-				return forEachIndexInTable(table, func(index *sqlbase.IndexDescriptor) error {
+				return forEachIndexInTable(table, func(index *descpb.IndexDescriptor) error {
 					isMutation, isWriteOnly :=
 						table.GetIndexMutationCapabilities(index.ID)
 					isReady := isMutation && isWriteOnly
@@ -1669,7 +1681,7 @@ CREATE TABLE pg_catalog.pg_index (
 						// Currently, nulls always appear first if the order is ascending,
 						// and always appear last if the order is descending.
 						var thisIndOption tree.DInt
-						if index.ColumnDirections[i] == sqlbase.IndexDescriptor_ASC {
+						if index.ColumnDirections[i] == descpb.IndexDescriptor_ASC {
 							thisIndOption = indoptionNullsFirst
 						} else {
 							thisIndOption = indoptionDesc
@@ -1733,7 +1745,7 @@ CREATE TABLE pg_catalog.pg_indexes (
 			func(db *sqlbase.ImmutableDatabaseDescriptor, scName string, table *sqlbase.ImmutableTableDescriptor, tableLookup tableLookupFn) error {
 				scNameName := tree.NewDName(scName)
 				tblName := tree.NewDName(table.Name)
-				return forEachIndexInTable(table, func(index *sqlbase.IndexDescriptor) error {
+				return forEachIndexInTable(table, func(index *descpb.IndexDescriptor) error {
 					def, err := indexDefFromDescriptor(ctx, p, db, table, index, tableLookup)
 					if err != nil {
 						return err
@@ -1759,7 +1771,7 @@ func indexDefFromDescriptor(
 	p *planner,
 	db *sqlbase.ImmutableDatabaseDescriptor,
 	table *sqlbase.ImmutableTableDescriptor,
-	index *sqlbase.IndexDescriptor,
+	index *descpb.IndexDescriptor,
 	tableLookup tableLookupFn,
 ) (string, error) {
 	indexDef := tree.CreateIndex{
@@ -1768,14 +1780,14 @@ func indexDefFromDescriptor(
 		Unique:   index.Unique,
 		Columns:  make(tree.IndexElemList, len(index.ColumnNames)),
 		Storing:  make(tree.NameList, len(index.StoreColumnNames)),
-		Inverted: index.Type == sqlbase.IndexDescriptor_INVERTED,
+		Inverted: index.Type == descpb.IndexDescriptor_INVERTED,
 	}
 	for i, name := range index.ColumnNames {
 		elem := tree.IndexElem{
 			Column:    tree.Name(name),
 			Direction: tree.Ascending,
 		}
-		if index.ColumnDirections[i] == sqlbase.IndexDescriptor_DESC {
+		if index.ColumnDirections[i] == descpb.IndexDescriptor_DESC {
 			elem.Direction = tree.Descending
 		}
 		indexDef.Columns[i] = elem
@@ -1789,7 +1801,7 @@ func indexDefFromDescriptor(
 		if err != nil {
 			return "", err
 		}
-		parentDb, err := tableLookup.getDatabaseByID(parentTable.ParentID)
+		parentDb, err := tableLookup.getDatabaseByID(parentTable.GetParentID())
 		if err != nil {
 			return "", err
 		}
@@ -1799,7 +1811,8 @@ func indexDefFromDescriptor(
 		}
 		fields := index.ColumnNames[:sharedPrefixLen]
 		intlDef := &tree.InterleaveDef{
-			Parent: tree.MakeTableName(tree.Name(parentDb.GetName()), tree.Name(parentTable.Name)),
+			Parent: tree.MakeTableName(tree.Name(parentDb.GetName()),
+				tree.Name(parentTable.GetName())),
 			Fields: make(tree.NameList, len(fields)),
 		}
 		for i, field := range fields {
@@ -1906,7 +1919,7 @@ CREATE TABLE pg_catalog.pg_namespace (
 		h := makeOidHasher()
 		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
 			func(db *sqlbase.ImmutableDatabaseDescriptor) error {
-				return forEachSchemaName(ctx, p, db, func(s string) error {
+				return forEachSchemaName(ctx, p, db, func(s string, _ bool) error {
 					return addRow(
 						h.NamespaceOid(db, s), // oid
 						tree.NewDString(s),    // nspname
@@ -2348,7 +2361,7 @@ CREATE TABLE pg_catalog.pg_roles (
 		h := makeOidHasher()
 		return forEachRole(ctx, p,
 			func(username string, isRole bool, noLogin bool, rolValidUntil *time.Time) error {
-				isRoot := tree.DBool(username == security.RootUser || username == sqlbase.AdminRole)
+				isRoot := tree.DBool(username == security.RootUser || username == security.AdminRole)
 				isRoleDBool := tree.DBool(isRole)
 				roleCanLogin := tree.DBool(!noLogin)
 				roleValidUntilValue := tree.DNull
@@ -2792,6 +2805,11 @@ CREATE TABLE pg_catalog.pg_type (
 
 				// Now generate rows for user defined types in this database.
 				return forEachTypeDesc(ctx, p, dbContext, func(_ *sqlbase.ImmutableDatabaseDescriptor, _ string, typDesc *sqlbase.ImmutableTypeDescriptor) error {
+					schema, err := p.getSchemaNameFromID(ctx, typDesc.ParentSchemaID)
+					if err != nil {
+						return err
+					}
+					nspOid := h.NamespaceOid(db, schema)
 					typ, err := typDesc.MakeTypesT(ctx, tree.NewUnqualifiedTypeName(tree.Name(typDesc.GetName())), p)
 					if err != nil {
 						return err
@@ -2821,7 +2839,7 @@ CREATE TABLE pg_catalog.pg_type (
 				}
 
 				// Check if it is a user defined type.
-				id := sqlbase.ID(types.UserDefinedTypeOIDToID(ooid))
+				id := sqlbase.UserDefinedTypeOIDToID(ooid)
 				typDesc, err := p.Descriptors().GetTypeVersionByID(ctx, p.txn, id, tree.ObjectLookupFlags{})
 				if err != nil {
 					if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
@@ -2832,6 +2850,11 @@ CREATE TABLE pg_catalog.pg_type (
 					}
 					return false, err
 				}
+				schema, err := p.getSchemaNameFromID(ctx, typDesc.ParentSchemaID)
+				if err != nil {
+					return false, err
+				}
+				nspOid = h.NamespaceOid(db, schema)
 				typ, err = typDesc.MakeTypesT(ctx, tree.NewUnqualifiedTypeName(tree.Name(typDesc.GetName())), p)
 				if err != nil {
 					return false, err
@@ -3017,6 +3040,7 @@ var datumToTypeCategory = map[types.Family]*tree.DString{
 	types.FloatFamily:       typCategoryNumeric,
 	types.IntFamily:         typCategoryNumeric,
 	types.IntervalFamily:    typCategoryTimespan,
+	types.Box2DFamily:       typCategoryUserDefined,
 	types.GeographyFamily:   typCategoryUserDefined,
 	types.GeometryFamily:    typCategoryUserDefined,
 	types.JsonFamily:        typCategoryUserDefined,
@@ -3273,20 +3297,20 @@ func (h oidHasher) writeSchema(scName string) {
 	h.writeStr(scName)
 }
 
-func (h oidHasher) writeTable(tableID sqlbase.ID) {
+func (h oidHasher) writeTable(tableID descpb.ID) {
 	h.writeUInt32(uint32(tableID))
 }
 
-func (h oidHasher) writeIndex(indexID sqlbase.IndexID) {
+func (h oidHasher) writeIndex(indexID descpb.IndexID) {
 	h.writeUInt32(uint32(indexID))
 }
 
-func (h oidHasher) writeCheckConstraint(check *sqlbase.TableDescriptor_CheckConstraint) {
+func (h oidHasher) writeCheckConstraint(check *descpb.TableDescriptor_CheckConstraint) {
 	h.writeStr(check.Name)
 	h.writeStr(check.Expr)
 }
 
-func (h oidHasher) writeForeignKeyConstraint(fk *sqlbase.ForeignKeyConstraint) {
+func (h oidHasher) writeForeignKeyConstraint(fk *descpb.ForeignKeyConstraint) {
 	h.writeUInt32(uint32(fk.ReferencedTableID))
 	h.writeStr(fk.Name)
 }
@@ -3298,14 +3322,14 @@ func (h oidHasher) NamespaceOid(db *sqlbase.ImmutableDatabaseDescriptor, scName 
 	return h.getOid()
 }
 
-func (h oidHasher) IndexOid(tableID sqlbase.ID, indexID sqlbase.IndexID) *tree.DOid {
+func (h oidHasher) IndexOid(tableID descpb.ID, indexID descpb.IndexID) *tree.DOid {
 	h.writeTypeTag(indexTypeTag)
 	h.writeTable(tableID)
 	h.writeIndex(indexID)
 	return h.getOid()
 }
 
-func (h oidHasher) ColumnOid(tableID sqlbase.ID, columnID sqlbase.ColumnID) *tree.DOid {
+func (h oidHasher) ColumnOid(tableID descpb.ID, columnID descpb.ColumnID) *tree.DOid {
 	h.writeTypeTag(columnTypeTag)
 	h.writeUInt32(uint32(tableID))
 	h.writeUInt32(uint32(columnID))
@@ -3315,8 +3339,8 @@ func (h oidHasher) ColumnOid(tableID sqlbase.ID, columnID sqlbase.ColumnID) *tre
 func (h oidHasher) CheckConstraintOid(
 	db *sqlbase.ImmutableDatabaseDescriptor,
 	scName string,
-	table *sqlbase.TableDescriptor,
-	check *sqlbase.TableDescriptor_CheckConstraint,
+	table *descpb.TableDescriptor,
+	check *descpb.TableDescriptor_CheckConstraint,
 ) *tree.DOid {
 	h.writeTypeTag(checkConstraintTypeTag)
 	h.writeDB(db)
@@ -3329,8 +3353,8 @@ func (h oidHasher) CheckConstraintOid(
 func (h oidHasher) PrimaryKeyConstraintOid(
 	db *sqlbase.ImmutableDatabaseDescriptor,
 	scName string,
-	table *sqlbase.TableDescriptor,
-	pkey *sqlbase.IndexDescriptor,
+	table *descpb.TableDescriptor,
+	pkey *descpb.IndexDescriptor,
 ) *tree.DOid {
 	h.writeTypeTag(pKeyConstraintTypeTag)
 	h.writeDB(db)
@@ -3343,8 +3367,8 @@ func (h oidHasher) PrimaryKeyConstraintOid(
 func (h oidHasher) ForeignKeyConstraintOid(
 	db *sqlbase.ImmutableDatabaseDescriptor,
 	scName string,
-	table *sqlbase.TableDescriptor,
-	fk *sqlbase.ForeignKeyConstraint,
+	table *descpb.TableDescriptor,
+	fk *descpb.ForeignKeyConstraint,
 ) *tree.DOid {
 	h.writeTypeTag(fkConstraintTypeTag)
 	h.writeDB(db)
@@ -3357,8 +3381,8 @@ func (h oidHasher) ForeignKeyConstraintOid(
 func (h oidHasher) UniqueConstraintOid(
 	db *sqlbase.ImmutableDatabaseDescriptor,
 	scName string,
-	table *sqlbase.TableDescriptor,
-	index *sqlbase.IndexDescriptor,
+	table *descpb.TableDescriptor,
+	index *descpb.IndexDescriptor,
 ) *tree.DOid {
 	h.writeTypeTag(uniqueConstraintTypeTag)
 	h.writeDB(db)
@@ -3412,11 +3436,11 @@ func (h oidHasher) EnumEntryOid(typOID *tree.DOid, physicalRep []byte) *tree.DOi
 	return h.getOid()
 }
 
-func tableOid(id sqlbase.ID) *tree.DOid {
+func tableOid(id descpb.ID) *tree.DOid {
 	return tree.NewDOid(tree.DInt(id))
 }
 
-func dbOid(id sqlbase.ID) *tree.DOid {
+func dbOid(id descpb.ID) *tree.DOid {
 	return tree.NewDOid(tree.DInt(id))
 }
 

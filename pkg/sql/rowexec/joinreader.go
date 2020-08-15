@@ -14,6 +14,7 @@ import (
 	"context"
 	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -68,9 +69,9 @@ type joinReader struct {
 
 	diskMonitor *mon.BytesMonitor
 
-	desc      sqlbase.TableDescriptor
-	index     *sqlbase.IndexDescriptor
-	colIdxMap map[sqlbase.ColumnID]int
+	desc      sqlbase.ImmutableTableDescriptor
+	index     *descpb.IndexDescriptor
+	colIdxMap map[descpb.ColumnID]int
 
 	// fetcher wraps the row.Fetcher used to perform lookups. This enables the
 	// joinReader to wrap the fetcher with a stat collector when necessary.
@@ -89,6 +90,10 @@ type joinReader struct {
 	// Batch size for fetches. Not a constant so we can lower for testing.
 	batchSizeBytes    int64
 	curBatchSizeBytes int64
+
+	// rowsRead is the total number of rows that this fetcher read from
+	// disk.
+	rowsRead int64
 
 	// State variables for each batch of input rows.
 	scratchInputRows sqlbase.EncDatumRows
@@ -129,7 +134,7 @@ func newJoinReader(
 		return nil, errors.Errorf("unsupported joinReaderType")
 	}
 	jr := &joinReader{
-		desc:       spec.Table,
+		desc:       sqlbase.MakeImmutableTableDescriptor(spec.Table),
 		input:      input,
 		inputTypes: input.OutputTypes(),
 		lookupCols: lookupCols,
@@ -157,7 +162,7 @@ func newJoinReader(
 	jr.readerType = readerType
 
 	// Add all requested system columns to the output.
-	sysColTypes, sysColDescs, err := sqlbase.GetSystemColumnTypesAndDescriptors(&jr.desc, spec.SystemColumns)
+	sysColTypes, sysColDescs, err := sqlbase.GetSystemColumnTypesAndDescriptors(jr.desc.TableDesc(), spec.SystemColumns)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +281,7 @@ func (jr *joinReader) initJoinReaderStrategy(
 		jr.strategy = &joinReaderNoOrderingStrategy{
 			joinerBase:           &jr.joinerBase,
 			defaultSpanGenerator: spanGenerator,
-			isPartialJoin:        jr.joinType == sqlbase.LeftSemiJoin || jr.joinType == sqlbase.LeftAntiJoin,
+			isPartialJoin:        jr.joinType == descpb.LeftSemiJoin || jr.joinType == descpb.LeftAntiJoin,
 		}
 		return
 	}
@@ -308,17 +313,17 @@ func (jr *joinReader) initJoinReaderStrategy(
 	jr.strategy = &joinReaderOrderingStrategy{
 		joinerBase:           &jr.joinerBase,
 		defaultSpanGenerator: spanGenerator,
-		isPartialJoin:        jr.joinType == sqlbase.LeftSemiJoin || jr.joinType == sqlbase.LeftAntiJoin,
+		isPartialJoin:        jr.joinType == descpb.LeftSemiJoin || jr.joinType == descpb.LeftAntiJoin,
 		lookedUpRows:         drc,
 	}
 }
 
 // getIndexColSet returns a set of all column indices for the given index.
 func getIndexColSet(
-	index *sqlbase.IndexDescriptor, colIdxMap map[sqlbase.ColumnID]int,
+	index *descpb.IndexDescriptor, colIdxMap map[descpb.ColumnID]int,
 ) util.FastIntSet {
 	cols := util.MakeFastIntSet()
-	err := index.RunOverAllColumns(func(id sqlbase.ColumnID) error {
+	err := index.RunOverAllColumns(func(id descpb.ColumnID) error {
 		cols.Add(colIdxMap[id])
 		return nil
 	})
@@ -480,6 +485,7 @@ func (jr *joinReader) performLookup() (joinReaderState, *execinfrapb.ProducerMet
 			// Done with this input batch.
 			break
 		}
+		jr.rowsRead++
 
 		if nextState, err := jr.strategy.processLookedUpRow(jr.Ctx, lookedUpRow, key); err != nil {
 			jr.MoveToDraining(err)
@@ -581,10 +587,17 @@ func (jr *joinReader) outputStatsToTrace() {
 }
 
 func (jr *joinReader) generateMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
+	trailingMeta := make([]execinfrapb.ProducerMetadata, 1)
+	meta := &trailingMeta[0]
+	meta.Metrics = execinfrapb.GetMetricsMeta()
+	meta.Metrics.RowsRead = jr.rowsRead
+	meta.Metrics.BytesRead = jr.fetcher.GetBytesRead()
 	if tfs := execinfra.GetLeafTxnFinalState(ctx, jr.FlowCtx.Txn); tfs != nil {
-		return []execinfrapb.ProducerMetadata{{LeafTxnFinalState: tfs}}
+		trailingMeta = append(trailingMeta,
+			execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs},
+		)
 	}
-	return nil
+	return trailingMeta
 }
 
 // DrainMeta is part of the MetadataSource interface.

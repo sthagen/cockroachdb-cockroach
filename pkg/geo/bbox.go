@@ -11,7 +11,10 @@
 package geo
 
 import (
+	"fmt"
 	"math"
+	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/errors"
@@ -36,6 +39,63 @@ func NewCartesianBoundingBox() *CartesianBoundingBox {
 			HiY: -math.MaxFloat64,
 		},
 	}
+}
+
+// Repr is the string representation of the CartesianBoundingBox.
+func (b *CartesianBoundingBox) Repr() string {
+	// fmt.Sprintf with %f does not truncate leading zeroes, so use
+	// FormatFloat instead.
+	return fmt.Sprintf(
+		"BOX(%s %s,%s %s)",
+		strconv.FormatFloat(b.LoX, 'f', -1, 64),
+		strconv.FormatFloat(b.LoY, 'f', -1, 64),
+		strconv.FormatFloat(b.HiX, 'f', -1, 64),
+		strconv.FormatFloat(b.HiY, 'f', -1, 64),
+	)
+}
+
+// ParseCartesianBoundingBox parses a box2d string into a bounding box.
+func ParseCartesianBoundingBox(s string) (*CartesianBoundingBox, error) {
+	b := &CartesianBoundingBox{}
+	var prefix string
+	numScanned, err := fmt.Sscanf(s, "%3s(%f %f,%f %f)", &prefix, &b.LoX, &b.LoY, &b.HiX, &b.HiY)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error parsing box2d")
+	}
+	if numScanned != 5 || strings.ToLower(prefix) != "box" {
+		return nil, errors.Newf("expected format 'box(min_x min_y,max_x max_y)'")
+	}
+	return b, nil
+}
+
+// Compare returns the comparison between two bounding boxes.
+// Compare lower dimensions before higher ones, i.e. X, then Y.
+func (b *CartesianBoundingBox) Compare(o *CartesianBoundingBox) int {
+	if b.LoX < o.LoX {
+		return -1
+	} else if b.LoX > o.LoX {
+		return 1
+	}
+
+	if b.HiX < o.HiX {
+		return -1
+	} else if b.HiX > o.HiX {
+		return 1
+	}
+
+	if b.LoY < o.LoY {
+		return -1
+	} else if b.LoY > o.LoY {
+		return 1
+	}
+
+	if b.HiY < o.HiY {
+		return -1
+	} else if b.HiY > o.HiY {
+		return 1
+	}
+
+	return 0
 }
 
 // AddPoint adds a point to the BoundingBox coordinates.
@@ -140,18 +200,73 @@ func BoundingBoxFromGeomTGeometryType(g geom.T) *CartesianBoundingBox {
 	return bbox
 }
 
-// boundingBoxFromGeomTGeographyType returns an appropriate bounding box for a Geography type.
+// boundingBoxFromGeomTGeographyType returns an appropriate bounding box for a
+// Geography type. There are marginally invalid shapes for which we want
+// bounding boxes that are correct regardless of the validity of the shape,
+// since validity checks may return slightly different results in S2 and the
+// other libraries we use. Therefore, instead of constructing s2.Region(s)
+// from the shape, which will expose us to S2's validity checks, we use the
+// points and lines directly to compute the bounding box.
 func boundingBoxFromGeomTGeographyType(g geom.T) (s2.Rect, error) {
 	if g.Empty() {
 		return s2.EmptyRect(), nil
 	}
-	regions, err := S2RegionsFromGeomT(g, EmptyBehaviorOmit)
-	if err != nil {
-		return s2.EmptyRect(), err
-	}
 	rect := s2.EmptyRect()
-	for _, region := range regions {
-		rect = rect.Union(region.RectBound())
+	switch g := g.(type) {
+	case *geom.Point:
+		return geogPointsBBox(g), nil
+	case *geom.MultiPoint:
+		return geogPointsBBox(g), nil
+	case *geom.LineString:
+		return geogLineBBox(g), nil
+	case *geom.MultiLineString:
+		for i := 0; i < g.NumLineStrings(); i++ {
+			rect = rect.Union(geogLineBBox(g.LineString(i)))
+		}
+	case *geom.Polygon:
+		for i := 0; i < g.NumLinearRings(); i++ {
+			rect = rect.Union(geogLineBBox(g.LinearRing(i)))
+		}
+	case *geom.MultiPolygon:
+		for i := 0; i < g.NumPolygons(); i++ {
+			polyRect, err := boundingBoxFromGeomTGeographyType(g.Polygon(i))
+			if err != nil {
+				return s2.EmptyRect(), err
+			}
+			rect = rect.Union(polyRect)
+		}
+	case *geom.GeometryCollection:
+		for i := 0; i < g.NumGeoms(); i++ {
+			collRect, err := boundingBoxFromGeomTGeographyType(g.Geom(i))
+			if err != nil {
+				return s2.EmptyRect(), err
+			}
+			rect = rect.Union(collRect)
+		}
+	default:
+		return s2.EmptyRect(), errors.Errorf("unknown type %T", g)
 	}
 	return rect, nil
+}
+
+// geogPointsBBox constructs a bounding box, represented as a s2.Rect, for the set
+// of points contained in g.
+func geogPointsBBox(g geom.T) s2.Rect {
+	rect := s2.EmptyRect()
+	flatCoords := g.FlatCoords()
+	for i := 0; i < len(flatCoords); i += g.Stride() {
+		rect = rect.AddPoint(s2.LatLngFromDegrees(flatCoords[i+1], flatCoords[i]))
+	}
+	return rect
+}
+
+// geogLineBBox constructs a bounding box, represented as a s2.Rect, for the line
+// or ring/loop represented by g.
+func geogLineBBox(g geom.T) s2.Rect {
+	bounder := s2.NewRectBounder()
+	flatCoords := g.FlatCoords()
+	for i := 0; i < len(flatCoords); i += g.Stride() {
+		bounder.AddPoint(s2.PointFromLatLng(s2.LatLngFromDegrees(flatCoords[i+1], flatCoords[i])))
+	}
+	return bounder.RectBound()
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -39,12 +40,12 @@ func TestDecodeTableValueToCol(t *testing.T) {
 		datums[i] = datum
 		var err error
 		fmt.Println(datum)
-		buf, err = sqlbase.EncodeTableValue(buf, sqlbase.ColumnID(encoding.NoColumnID), datum, scratch)
+		buf, err = sqlbase.EncodeTableValue(buf, descpb.ColumnID(encoding.NoColumnID), datum, scratch)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	batch := coldata.NewMemBatchWithSize(typs, 1 /* size */, coldataext.NewExtendedColumnFactory(nil /*evalCtx */))
+	batch := coldata.NewMemBatchWithCapacity(typs, 1 /* capacity */, coldataext.NewExtendedColumnFactory(nil /*evalCtx */))
 	for i := 0; i < nCols; i++ {
 		typeOffset, dataOffset, _, typ, err := encoding.DecodeValueTag(buf)
 		fmt.Println(typ)

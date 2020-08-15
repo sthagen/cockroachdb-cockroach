@@ -38,6 +38,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -47,6 +49,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -107,6 +110,27 @@ func categorizeType(t *types.T) string {
 }
 
 var digitNames = [...]string{"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
+
+const regexpFlagInfo = `
+
+CockroachDB supports the following flags:
+
+| Flag           | Description                                                       |
+|----------------|-------------------------------------------------------------------|
+| **c**          | Case-sensitive matching                                           |
+| **g**          | Global matching (match each substring instead of only the first)  |
+| **i**          | Case-insensitive matching                                         |
+| **m** or **n** | Newline-sensitive (see below)                                     |
+| **p**          | Partial newline-sensitive matching (see below)                    |
+| **s**          | Newline-insensitive (default)                                     |
+| **w**          | Inverse partial newline-sensitive matching (see below)            |
+
+| Mode | ` + "`.` and `[^...]` match newlines | `^` and `$` match line boundaries" + `|
+|------|----------------------------------|--------------------------------------|
+| s    | yes                              | no                                   |
+| w    | yes                              | yes                                  |
+| p    | no                               | no                                   |
+| m/n  | no                               | yes                                  |`
 
 // builtinDefinition represents a built-in function before it becomes
 // a tree.FunctionDefinition.
@@ -1435,26 +1459,36 @@ var builtins = map[string]builtinDefinition{
 				return result, nil
 			},
 			Info: "Replaces matches for the regular expression `regex` in `input` with the regular " +
-				"expression `replace` using `flags`." + `
+				"expression `replace` using `flags`." + regexpFlagInfo,
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
 
-CockroachDB supports the following flags:
-
-| Flag           | Description                                                       |
-|----------------|-------------------------------------------------------------------|
-| **c**          | Case-sensitive matching                                           |
-| **g**          | Global matching (match each substring instead of only the first)  |
-| **i**          | Case-insensitive matching                                         |
-| **m** or **n** | Newline-sensitive (see below)                                     |
-| **p**          | Partial newline-sensitive matching (see below)                    |
-| **s**          | Newline-insensitive (default)                                     |
-| **w**          | Inverse partial newline-sensitive matching (see below)            |
-
-| Mode | ` + "`.` and `[^...]` match newlines | `^` and `$` match line boundaries" + `|
-|------|----------------------------------|--------------------------------------|
-| s    | yes                              | no                                   |
-| w    | yes                              | yes                                  |
-| p    | no                               | no                                   |
-| m/n  | no                               | yes                                  |`,
+	"regexp_split_to_array": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"string", types.String},
+				{"pattern", types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.MakeArray(types.String)),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				return regexpSplitToArray(ctx, args, false /* hasFlags */)
+			},
+			Info:       "Split string using a POSIX regular expression as the delimiter.",
+			Volatility: tree.VolatilityImmutable,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"string", types.String},
+				{"pattern", types.String},
+				{"flags", types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.MakeArray(types.String)),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				return regexpSplitToArray(ctx, args, true /* hasFlags */)
+			},
+			Info:       "Split string using a POSIX regular expression as the delimiter with flags." + regexpFlagInfo,
 			Volatility: tree.VolatilityImmutable,
 		},
 	),
@@ -1802,6 +1836,35 @@ CockroachDB supports the following flags:
 		},
 	),
 
+	"pg_get_serial_sequence": makeBuiltin(
+		tree.FunctionProperties{
+			Category: categorySequences,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"table_name", types.String}, {"column_name", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				tableName := tree.MustBeDString(args[0])
+				columnName := tree.MustBeDString(args[1])
+				qualifiedName, err := parser.ParseQualifiedTableName(string(tableName))
+				if err != nil {
+					return nil, err
+				}
+				res, err := evalCtx.Sequence.GetSerialSequenceNameFromColumn(evalCtx.Ctx(), qualifiedName, tree.Name(columnName))
+				if err != nil {
+					return nil, err
+				}
+				if res == nil {
+					return tree.DNull, nil
+				}
+				res.ExplicitCatalog = false
+				return tree.NewDString(fmt.Sprintf(`%s.%s`, res.Schema(), res.Object())), nil
+			},
+			Info:       "Returns the name of the sequence used by the given column_name in the table table_name.",
+			Volatility: tree.VolatilityStable,
+		},
+	),
+
 	"lastval": makeBuiltin(
 		tree.FunctionProperties{
 			Category: categorySequences,
@@ -2063,13 +2126,7 @@ CockroachDB supports the following flags:
 		tree.Overload{
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				ts, err := recentTimestamp(ctx)
-				if err != nil {
-					return nil, err
-				}
-				return tree.MakeDTimestampTZ(ts, time.Microsecond)
-			},
+			Fn:         followerReadTimestamp,
 			Info: `Returns a timestamp which is very likely to be safe to perform
 against a follower replica.
 
@@ -2080,6 +2137,17 @@ leaseholder for a given range.
 
 Note that this function requires an enterprise license on a CCL distribution to
 return without an error.`,
+			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
+	tree.FollowerReadTimestampExperimentalFunctionName: makeBuiltin(
+		tree.FunctionProperties{},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.TimestampTZ),
+			Fn:         followerReadTimestamp,
+			Info:       fmt.Sprintf("Same as %s. This name is deprecated.", tree.FollowerReadTimestampFunctionName),
 			Volatility: tree.VolatilityVolatile,
 		},
 	),
@@ -2891,6 +2959,29 @@ may increase either contention or retry errors, or both.`,
 			Volatility: tree.VolatilityImmutable,
 		}),
 
+	"crdb_internal.json_to_pb": makeBuiltin(
+		jsonProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"pbname", types.String},
+				{"json", types.Jsonb},
+			},
+			ReturnType: tree.FixedReturnType(types.Bytes),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				msg, err := protoreflect.NewMessage(string(tree.MustBeDString(args[0])))
+				if err != nil {
+					return nil, err
+				}
+				data, err := protoreflect.JSONBMarshalToMessage(tree.MustBeDJSON(args[1]).JSON, msg)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDBytes(tree.DBytes(data)), nil
+			},
+			Info:       "Convert JSONB data to protocol message bytes",
+			Volatility: tree.VolatilityImmutable,
+		}),
+
 	// Enum functions.
 	"enum_first": makeBuiltin(
 		tree.FunctionProperties{NullableArgs: true, Category: categoryEnum},
@@ -3364,15 +3455,16 @@ may increase either contention or retry errors, or both.`,
 				}
 
 				// Get the referenced table and index.
-				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, ctx.Codec, sqlbase.ID(tableID))
+				// TODO(ajwerner): This is awful, we should be able to resolve this
+				// thing using the usual tools rather than going through the DB.
+				tableDesc, err := catalogkv.MustGetTableDescByID(ctx.Context, ctx.Txn, ctx.Codec, descpb.ID(tableID))
 				if err != nil {
 					return nil, err
 				}
-				indexDesc, err := tableDesc.FindIndexByID(sqlbase.IndexID(indexID))
+				indexDesc, err := tableDesc.FindIndexByID(descpb.IndexID(indexID))
 				if err != nil {
 					return nil, err
 				}
-
 				// Collect the index columns. If the index is a non-unique secondary
 				// index, it might have some extra key columns.
 				indexColIDs := indexDesc.ColumnIDs
@@ -3446,7 +3538,7 @@ may increase either contention or retry errors, or both.`,
 
 				// Create a column id to row index map. In this case, each column ID
 				// just maps to the i'th ordinal.
-				colMap := make(map[sqlbase.ColumnID]int)
+				colMap := make(map[descpb.ColumnID]int)
 				for i, id := range indexColIDs {
 					colMap[id] = i
 				}
@@ -3798,11 +3890,12 @@ may increase either contention or retry errors, or both.`,
 				tableID := int(tree.MustBeDInt(args[0]))
 				indexID := int(tree.MustBeDInt(args[1]))
 				g := tree.MustBeDGeography(args[2])
-				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, ctx.Codec, sqlbase.ID(tableID))
+				// TODO(ajwerner): This should be able to use the normal lookup mechanisms.
+				tableDesc, err := catalogkv.MustGetTableDescByID(ctx.Context, ctx.Txn, ctx.Codec, descpb.ID(tableID))
 				if err != nil {
 					return nil, err
 				}
-				indexDesc, err := tableDesc.FindIndexByID(sqlbase.IndexID(indexID))
+				indexDesc, err := tableDesc.FindIndexByID(descpb.IndexID(indexID))
 				if err != nil {
 					return nil, err
 				}
@@ -3832,11 +3925,11 @@ may increase either contention or retry errors, or both.`,
 				tableID := int(tree.MustBeDInt(args[0]))
 				indexID := int(tree.MustBeDInt(args[1]))
 				g := tree.MustBeDGeometry(args[2])
-				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, ctx.Codec, sqlbase.ID(tableID))
+				tableDesc, err := catalogkv.MustGetTableDescByID(ctx.Context, ctx.Txn, ctx.Codec, descpb.ID(tableID))
 				if err != nil {
 					return nil, err
 				}
-				indexDesc, err := tableDesc.FindIndexByID(sqlbase.IndexID(indexID))
+				indexDesc, err := tableDesc.FindIndexByID(descpb.IndexID(indexID))
 				if err != nil {
 					return nil, err
 				}
@@ -4012,6 +4105,25 @@ may increase either contention or retry errors, or both.`,
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
 			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
+	// Returns true iff the given sqlliveness session is not expired.
+	"crdb_internal.sql_liveness_is_alive": makeBuiltin(
+		tree.FunctionProperties{Category: categoryMultiTenancy},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"session_id", types.Bytes}},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				sid := sqlliveness.SessionID(*(args[0].(*tree.DBytes)))
+				live, err := evalCtx.SQLLivenessReader.IsAlive(evalCtx.Context, sid)
+				if err != nil {
+					return tree.MakeDBool(true), err
+				}
+				return tree.MakeDBool(tree.DBool(live)), nil
+			},
+			Info:       "Checks is given sqlliveness session id is not expired",
+			Volatility: tree.VolatilityStable,
 		},
 	),
 
@@ -5192,6 +5304,36 @@ func (k regexpFlagKey) Pattern() (string, error) {
 	return regexpEvalFlags(k.sqlPattern, k.sqlFlags)
 }
 
+func regexpSplit(ctx *tree.EvalContext, args tree.Datums, hasFlags bool) ([]string, error) {
+	s := string(tree.MustBeDString(args[0]))
+	pattern := string(tree.MustBeDString(args[1]))
+	sqlFlags := ""
+	if hasFlags {
+		sqlFlags = string(tree.MustBeDString(args[2]))
+	}
+	patternRe, err := ctx.ReCache.GetRegexp(regexpFlagKey{pattern, sqlFlags})
+	if err != nil {
+		return nil, err
+	}
+	return patternRe.Split(s, -1), nil
+}
+
+func regexpSplitToArray(
+	ctx *tree.EvalContext, args tree.Datums, hasFlags bool,
+) (tree.Datum, error) {
+	words, err := regexpSplit(ctx, args, hasFlags /* hasFlags */)
+	if err != nil {
+		return nil, err
+	}
+	result := tree.NewDArray(types.String)
+	for _, word := range words {
+		if err := result.Append(tree.NewDString(word)); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
 func regexpReplace(ctx *tree.EvalContext, s, pattern, to, sqlFlags string) (tree.Datum, error) {
 	patternRe, err := ctx.ReCache.GetRegexp(regexpFlagKey{pattern, sqlFlags})
 	if err != nil {
@@ -5933,7 +6075,7 @@ func asJSONBuildObjectKey(d tree.Datum, loc *time.Location) (string, error) {
 		), nil
 	case *tree.DBool, *tree.DInt, *tree.DFloat, *tree.DDecimal, *tree.DTimestamp,
 		*tree.DDate, *tree.DUuid, *tree.DInterval, *tree.DBytes, *tree.DIPAddr, *tree.DOid,
-		*tree.DTime, *tree.DTimeTZ, *tree.DBitArray, *tree.DGeography, *tree.DGeometry:
+		*tree.DTime, *tree.DTimeTZ, *tree.DBitArray, *tree.DGeography, *tree.DGeometry, *tree.DBox2D:
 		return tree.AsStringWithFlags(d, tree.FmtBareStrings), nil
 	default:
 		return "", errors.AssertionFailedf("unexpected type %T for key value", d)
@@ -6075,4 +6217,12 @@ func requireNonNull(d tree.Datum) error {
 		return errInvalidNull
 	}
 	return nil
+}
+
+func followerReadTimestamp(ctx *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
+	ts, err := recentTimestamp(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return tree.MakeDTimestampTZ(ts, time.Microsecond)
 }

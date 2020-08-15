@@ -19,11 +19,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	descpb "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -40,7 +40,7 @@ type mockScatterer struct {
 // This mock implementation of the split and scatterer simulates a scattering of
 // ranges.
 func (s *mockScatterer) splitAndScatterKey(
-	_ context.Context, _ *kv.DB, _ *storageccl.KeyRewriter, _ roachpb.Key,
+	_ context.Context, _ *kv.DB, _ *storageccl.KeyRewriter, _ roachpb.Key, _ bool,
 ) (roachpb.NodeID, error) {
 	s.Lock()
 	defer s.Unlock()
@@ -215,7 +215,7 @@ func TestSplitAndScatterProcessor(t *testing.T) {
 				Encodings: []execinfrapb.OutputRouterSpec_RangeRouterSpec_ColumnEncoding{
 					{
 						Column:   0,
-						Encoding: sqlbase.DatumEncoding_ASCENDING_KEY,
+						Encoding: descpb.DatumEncoding_ASCENDING_KEY,
 					},
 				},
 				DefaultDest: &defaultStream,

@@ -31,8 +31,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -156,6 +157,17 @@ func (c *transientCluster) start(
 		serv := serverFactory.New(args).(*server.TestServer)
 		if i == 0 {
 			c.s = serv
+			// The first node connects its Settings instance to the `log`
+			// package for crash reporting.
+			//
+			// There's a known shortcoming with this approach: restarting
+			// node 1 using the \demo commands will break this connection:
+			// if the user changes the cluster setting after restarting node
+			// 1, the `log` package will not see this change.
+			//
+			// TODO(knz): re-connect the `log` package every time the first
+			// node is restarted and gets a new `Settings` instance.
+			settings.SetCanonicalValuesContainer(&serv.ClusterSettings().SV)
 		}
 		servers = append(servers, serv)
 
@@ -312,6 +324,9 @@ func testServerArgsForTransientCluster(
 		SQLMemoryPoolSize:       demoCtx.sqlPoolMemorySize,
 		CacheSize:               demoCtx.cacheSize,
 		NoAutoInitializeCluster: true,
+		// This disables the tenant server. We could enable it but would have to
+		// generate the suitable certs at the caller who wishes to do so.
+		TenantAddr: new(string),
 	}
 
 	if demoCtx.localities != nil {
@@ -549,7 +564,7 @@ func (c *transientCluster) getNetworkURLForServer(
 ) (string, error) {
 	options := url.Values{}
 	if includeAppName {
-		options.Add("application_name", sqlbase.ReportableAppNamePrefix+"cockroach demo")
+		options.Add("application_name", catconstants.ReportableAppNamePrefix+"cockroach demo")
 	}
 	sqlURL := url.URL{
 		Scheme: "postgres",
@@ -661,7 +676,7 @@ func (c *transientCluster) runWorkload(
 
 	// Dummy registry to prove to the Opser.
 	reg := histogram.NewRegistry(time.Duration(100) * time.Millisecond)
-	ops, err := opser.Ops(sqlUrls, reg)
+	ops, err := opser.Ops(ctx, sqlUrls, reg)
 	if err != nil {
 		return errors.Wrap(err, "unable to create workload")
 	}

@@ -55,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -76,8 +77,7 @@ import (
 
 const (
 	// rangeIDAllocCount is the number of Range IDs to allocate per allocation.
-	rangeIDAllocCount                 = 10
-	defaultRaftHeartbeatIntervalTicks = 5
+	rangeIDAllocCount = 10
 
 	// defaultRaftEntryCacheSize is the default size in bytes for a
 	// store's Raft log entry cache.
@@ -179,7 +179,6 @@ func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 		AmbientCtx:                  log.AmbientContext{Tracer: st.Tracer},
 		Clock:                       clock,
 		CoalescedHeartbeatsInterval: 50 * time.Millisecond,
-		RaftHeartbeatIntervalTicks:  1,
 		ScanInterval:                10 * time.Minute,
 		HistogramWindowInterval:     metric.TestSampleInterval,
 		EnableEpochRangeLeases:      true,
@@ -189,6 +188,7 @@ func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 
 	// Use shorter Raft tick settings in order to minimize start up and failover
 	// time in tests.
+	sc.RaftHeartbeatIntervalTicks = 1
 	sc.RaftElectionTimeoutTicks = 3
 	sc.RaftTickInterval = 100 * time.Millisecond
 	sc.SetDefaults()
@@ -662,9 +662,6 @@ type StoreConfig struct {
 	// the quiesce cadence.
 	CoalescedHeartbeatsInterval time.Duration
 
-	// RaftHeartbeatIntervalTicks is the number of ticks that pass between heartbeats.
-	RaftHeartbeatIntervalTicks int
-
 	// ScanInterval is the default value for the scan interval
 	ScanInterval time.Duration
 
@@ -750,9 +747,6 @@ func (sc *StoreConfig) SetDefaults() {
 
 	if sc.CoalescedHeartbeatsInterval == 0 {
 		sc.CoalescedHeartbeatsInterval = sc.RaftTickInterval / 2
-	}
-	if sc.RaftHeartbeatIntervalTicks == 0 {
-		sc.RaftHeartbeatIntervalTicks = defaultRaftHeartbeatIntervalTicks
 	}
 	if sc.RaftEntryCacheSize == 0 {
 		sc.RaftEntryCacheSize = defaultRaftEntryCacheSize
@@ -1241,9 +1235,13 @@ func IterateIDPrefixKeys(
 	reader storage.Reader,
 	keyFn func(roachpb.RangeID) roachpb.Key,
 	msg protoutil.Message,
-	f func(_ roachpb.RangeID) (more bool, _ error),
+	f func(c iterutil.Cur) error,
 ) error {
 	rangeID := roachpb.RangeID(1)
+
+	iterState := iterutil.NewState()
+	iterState.Elem = new(roachpb.RangeID)
+
 	iter := reader.NewIterator(storage.IterOptions{
 		UpperBound: keys.LocalRangeIDPrefix.PrefixEnd().AsRawKey(),
 	})
@@ -1298,9 +1296,12 @@ func IterateIDPrefixKeys(
 			return errors.Errorf("unable to unmarshal %s into %T", unsafeKey.Key, msg)
 		}
 
-		more, err := f(rangeID)
-		if !more || err != nil {
+		*iterState.Elem.(*roachpb.RangeID) = rangeID
+		if err := f(iterState.Current()); err != nil {
 			return err
+		}
+		if iterState.Done() {
+			return nil
 		}
 		rangeID++
 	}
@@ -2225,6 +2226,16 @@ func (s *Store) Stopper() *stop.Stopper { return s.stopper }
 
 // TestingKnobs accessor.
 func (s *Store) TestingKnobs() *StoreTestingKnobs { return &s.cfg.TestingKnobs }
+
+// ClosedTimestamp accessor.
+func (s *Store) ClosedTimestamp() *container.Container {
+	return s.cfg.ClosedTimestamp
+}
+
+// NodeLiveness accessor.
+func (s *Store) NodeLiveness() *NodeLiveness {
+	return s.cfg.NodeLiveness
+}
 
 // IsDraining accessor.
 func (s *Store) IsDraining() bool {

@@ -181,7 +181,7 @@ memo expect=ReorderJoins
 SELECT * FROM abc, stu, xyz WHERE abc.a=stu.s AND stu.s=xyz.x
 ----
 memo (optimized, ~36KB, required=[presentation: a:1,b:2,c:3,s:6,t:7,u:8,x:10,y:11,z:12])
- ├── G1: (inner-join G2 G3 G4) (inner-join G5 G6 G7) (inner-join G8 G9 G7) (inner-join G3 G2 G4) (merge-join G2 G3 G10 inner-join,+1,+6) (inner-join G6 G5 G7) (merge-join G5 G6 G10 inner-join,+6,+10) (inner-join G9 G8 G7) (merge-join G8 G9 G10 inner-join,+6,+10) (lookup-join G8 G10 xyz@xy,keyCols=[6],outCols=(1-3,6-8,10-12)) (merge-join G3 G2 G10 inner-join,+6,+1) (lookup-join G3 G10 abc@ab,keyCols=[6],outCols=(1-3,6-8,10-12)) (merge-join G6 G5 G10 inner-join,+10,+6) (lookup-join G6 G10 stu,keyCols=[10],outCols=(1-3,6-8,10-12)) (merge-join G9 G8 G10 inner-join,+10,+6)
+ ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (inner-join G5 G6 G7) (inner-join G6 G5 G7) (inner-join G8 G9 G7) (inner-join G9 G8 G7) (merge-join G2 G3 G10 inner-join,+1,+6) (merge-join G3 G2 G10 inner-join,+6,+1) (lookup-join G3 G10 abc@ab,keyCols=[6],outCols=(1-3,6-8,10-12)) (merge-join G5 G6 G10 inner-join,+6,+10) (merge-join G6 G5 G10 inner-join,+10,+6) (lookup-join G6 G10 stu,keyCols=[10],outCols=(1-3,6-8,10-12)) (merge-join G8 G9 G10 inner-join,+6,+10) (lookup-join G8 G10 xyz@xy,keyCols=[6],outCols=(1-3,6-8,10-12)) (merge-join G9 G8 G10 inner-join,+10,+6)
  │    └── [presentation: a:1,b:2,c:3,s:6,t:7,u:8,x:10,y:11,z:12]
  │         ├── best: (merge-join G5="[ordering: +6]" G6="[ordering: +(1|10)]" G10 inner-join,+6,+10)
  │         └── cost: 12980.08
@@ -316,7 +316,7 @@ memo (optimized, ~34KB, required=[presentation: pid1:1,cid1:2,gcid1:3,gca1:4,ca1
  │    └── []
  │         ├── best: (project G2 G3 pid1 cid1 gcid1 gca1 ca1 pa1)
  │         └── cost: 2767.07
- ├── G2: (inner-join G4 G5 G6) (inner-join G7 G8 G9) (inner-join G10 G11 G9) (inner-join G5 G4 G6) (merge-join G4 G5 G12 inner-join,+1,+10) (lookup-join G4 G12 parent1,keyCols=[1],outCols=(1-4,6-8,10,11)) (inner-join G8 G7 G9) (merge-join G7 G8 G12 inner-join,+1,+2,+6,+7) (inner-join G11 G10 G9) (merge-join G10 G11 G12 inner-join,+6,+7,+1,+2) (merge-join G5 G4 G12 inner-join,+10,+1) (merge-join G8 G7 G12 inner-join,+6,+7,+1,+2) (lookup-join G8 G12 grandchild1,keyCols=[6 7],outCols=(1-4,6-8,10,11)) (merge-join G11 G10 G12 inner-join,+1,+2,+6,+7) (lookup-join G11 G12 child1,keyCols=[1 2],outCols=(1-4,6-8,10,11))
+ ├── G2: (inner-join G4 G5 G6) (inner-join G7 G8 G9) (inner-join G8 G7 G9) (inner-join G10 G11 G9) (inner-join G11 G10 G9) (inner-join G5 G4 G6) (merge-join G4 G5 G12 inner-join,+1,+10) (lookup-join G4 G12 parent1,keyCols=[1],outCols=(1-4,6-8,10,11)) (merge-join G7 G8 G12 inner-join,+1,+2,+6,+7) (merge-join G8 G7 G12 inner-join,+6,+7,+1,+2) (lookup-join G8 G12 grandchild1,keyCols=[6 7],outCols=(1-4,6-8,10,11)) (merge-join G10 G11 G12 inner-join,+6,+7,+1,+2) (merge-join G11 G10 G12 inner-join,+1,+2,+6,+7) (lookup-join G11 G12 child1,keyCols=[1 2],outCols=(1-4,6-8,10,11)) (merge-join G5 G4 G12 inner-join,+10,+1)
  │    ├── [ordering: +(1|6|10)]
  │    │    ├── best: (lookup-join G4="[ordering: +(1|6)]" G12 parent1,keyCols=[1],outCols=(1-4,6-8,10,11))
  │    │    └── cost: 2766.06
@@ -582,15 +582,29 @@ memo (optimized, ~13KB, required=[presentation: a:1,b:2,c:3,v:6,s:7,t:8,u:9])
  ├── G22: (variable b)
  └── G23: (const 2)
 
-# No-op case because a single join can only be commuted (this is handled by
-# CommuteJoin).
-opt expect-not=ReorderJoins format=hide-all
+# Only commutation is possible for a single join.
+exploretrace rule=ReorderJoins format=hide-all
 SELECT * FROM abc, stu WHERE a = s
 ----
-inner-join (merge)
- ├── scan abc@ab
- ├── scan stu
- └── filters (true)
+----
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  inner-join (hash)
+   ├── scan abc
+   ├── scan stu
+   └── filters
+        └── a = s
+
+New expression 1 of 1:
+  inner-join (hash)
+   ├── scan stu
+   ├── scan abc
+   └── filters
+        └── a = s
+----
+----
 
 # No-op case because the joins have join flags.
 opt expect-not=ReorderJoins format=hide-all
@@ -628,8 +642,7 @@ inner-join-apply
  └── filters
       └── a = column1
 
-# No-op case because LeftJoin is (currently) not matched.
-opt expect-not=ReorderJoins format=hide-all
+opt expect=ReorderJoins format=hide-all
 SELECT *
 FROM abc
 LEFT JOIN stu
@@ -642,7 +655,7 @@ left-join (merge)
 
 # Don't add a join between xyz and stu to the memo (because doing so would
 # create a cross join).
-memo
+exploretrace rule=ReorderJoins format=hide-all
 SELECT *
 FROM stu
 INNER JOIN abc
@@ -650,58 +663,78 @@ ON s = a
 INNER JOIN xyz
 ON b = y
 ----
-memo (optimized, ~27KB, required=[presentation: s:1,t:2,u:3,a:5,b:6,c:7,x:10,y:11,z:12])
- ├── G1: (inner-join G2 G3 G4) (inner-join G5 G6 G7) (inner-join G3 G2 G4) (merge-join G2 G3 G8 inner-join,+6,+11) (lookup-join G2 G8 xyz@yz,keyCols=[6],outCols=(1-3,5-7,10-12)) (inner-join G6 G5 G7) (merge-join G5 G6 G8 inner-join,+1,+5) (merge-join G3 G2 G8 inner-join,+11,+6) (merge-join G6 G5 G8 inner-join,+5,+1) (lookup-join G6 G8 stu,keyCols=[5],outCols=(1-3,5-7,10-12))
- │    └── [presentation: s:1,t:2,u:3,a:5,b:6,c:7,x:10,y:11,z:12]
- │         ├── best: (inner-join G2 G3 G4)
- │         └── cost: 14072.69
- ├── G2: (inner-join G5 G9 G7) (inner-join G9 G5 G7) (merge-join G5 G9 G8 inner-join,+1,+5) (lookup-join G5 G8 abc@ab,keyCols=[1],outCols=(1-3,5-7)) (merge-join G9 G5 G8 inner-join,+5,+1) (lookup-join G9 G8 stu,keyCols=[5],outCols=(1-3,5-7))
- │    ├── [ordering: +6]
- │    │    ├── best: (sort G2)
- │    │    └── cost: 14737.60
- │    └── []
- │         ├── best: (merge-join G5="[ordering: +1]" G9="[ordering: +5]" G8 inner-join,+1,+5)
- │         └── cost: 11880.05
- ├── G3: (scan xyz,cols=(10-12)) (scan xyz@xy,cols=(10-12)) (scan xyz@yz,cols=(10-12))
- │    ├── [ordering: +11]
- │    │    ├── best: (scan xyz@yz,cols=(10-12))
- │    │    └── cost: 1070.02
- │    └── []
- │         ├── best: (scan xyz,cols=(10-12))
- │         └── cost: 1070.02
- ├── G4: (filters G10)
- ├── G5: (scan stu,cols=(1-3)) (scan stu@uts,cols=(1-3))
- │    ├── [ordering: +1]
- │    │    ├── best: (scan stu,cols=(1-3))
- │    │    └── cost: 10600.02
- │    └── []
- │         ├── best: (scan stu,cols=(1-3))
- │         └── cost: 10600.02
- ├── G6: (inner-join G9 G3 G4) (inner-join G3 G9 G4) (merge-join G9 G3 G8 inner-join,+6,+11) (lookup-join G9 G8 xyz@yz,keyCols=[6],outCols=(5-7,10-12)) (merge-join G3 G9 G8 inner-join,+11,+6) (lookup-join G3 G8 abc@bc,keyCols=[11],outCols=(5-7,10-12))
- │    ├── [ordering: +5]
- │    │    ├── best: (sort G6)
- │    │    └── cost: 5053.06
- │    └── []
- │         ├── best: (merge-join G9="[ordering: +6]" G3="[ordering: +11]" G8 inner-join,+6,+11)
- │         └── cost: 2258.06
- ├── G7: (filters G11)
- ├── G8: (filters)
- ├── G9: (scan abc,cols=(5-7)) (scan abc@ab,cols=(5-7)) (scan abc@bc,cols=(5-7))
- │    ├── [ordering: +5]
- │    │    ├── best: (scan abc@ab,cols=(5-7))
- │    │    └── cost: 1070.02
- │    ├── [ordering: +6]
- │    │    ├── best: (scan abc@bc,cols=(5-7))
- │    │    └── cost: 1070.02
- │    └── []
- │         ├── best: (scan abc,cols=(5-7))
- │         └── cost: 1070.02
- ├── G10: (eq G12 G13)
- ├── G11: (eq G14 G15)
- ├── G12: (variable b)
- ├── G13: (variable y)
- ├── G14: (variable s)
- └── G15: (variable a)
+----
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  inner-join (hash)
+   ├── inner-join (hash)
+   │    ├── scan stu
+   │    ├── scan abc
+   │    └── filters
+   │         └── s = a
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+New expression 1 of 1:
+  inner-join (hash)
+   ├── inner-join (hash)
+   │    ├── scan abc
+   │    ├── scan stu
+   │    └── filters
+   │         └── s = a
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  inner-join (hash)
+   ├── inner-join (merge)
+   │    ├── scan stu
+   │    ├── scan abc@ab
+   │    └── filters (true)
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+New expression 1 of 3:
+  inner-join (hash)
+   ├── scan stu
+   ├── inner-join (hash)
+   │    ├── scan abc
+   │    ├── scan xyz
+   │    └── filters
+   │         └── b = y
+   └── filters
+        └── s = a
+
+New expression 2 of 3:
+  inner-join (hash)
+   ├── inner-join (hash)
+   │    ├── scan abc
+   │    ├── scan xyz
+   │    └── filters
+   │         └── b = y
+   ├── scan stu
+   └── filters
+        └── s = a
+
+New expression 3 of 3:
+  inner-join (hash)
+   ├── scan xyz
+   ├── inner-join (merge)
+   │    ├── scan stu
+   │    ├── scan abc@ab
+   │    └── filters (true)
+   └── filters
+        └── b = y
+----
+----
 
 # Left join under an inner join. Push the inner join into the left input of the
 # left join.
@@ -838,7 +871,7 @@ project
 
 # Inner join in the right input of a left join; no reordering is valid apart
 # from commutation.
-memo expect=ReorderJoins
+exploretrace rule=ReorderJoins format=hide-all
 SELECT *
 FROM small
 LEFT JOIN
@@ -850,42 +883,54 @@ LEFT JOIN
 ) large
 ON small.m = large.m
 ----
-memo (optimized, ~16KB, required=[presentation: m:1,n:2,m:5])
- ├── G1: (project G2 G3 m n m)
- │    └── [presentation: m:1,n:2,m:5]
- │         ├── best: (project G2 G3 m n m)
- │         └── cost: 106250127813.24
- ├── G2: (left-join G4 G5 G6) (right-join G5 G4 G6)
- │    └── []
- │         ├── best: (right-join G5 G4 G6)
- │         └── cost: 106250127813.13
- ├── G3: (projections)
- ├── G4: (scan small,cols=(1,2))
- │    └── []
- │         ├── best: (scan small,cols=(1,2))
- │         └── cost: 10.52
- ├── G5: (inner-join G7 G8 G9) (inner-join G8 G7 G9)
- │    └── []
- │         ├── best: (inner-join G7 G8 G9)
- │         └── cost: 106250115551.06
- ├── G6: (filters G10)
- ├── G7: (scan large,cols=(5,6))
- │    └── []
- │         ├── best: (scan large,cols=(5,6))
- │         └── cost: 105000000000.02
- ├── G8: (scan medium,cols=(10))
- │    └── []
- │         ├── best: (scan medium,cols=(10))
- │         └── cost: 104000.02
- ├── G9: (filters G11)
- ├── G10: (eq G12 G13)
- ├── G11: (eq G14 G15)
- ├── G12: (variable small.m)
- ├── G13: (variable large.m)
- ├── G14: (variable large.n)
- └── G15: (variable medium.n)
+----
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  project
+   └── left-join (hash)
+        ├── scan small
+        ├── inner-join (hash)
+        │    ├── scan large
+        │    ├── scan medium
+        │    └── filters
+        │         └── large.n = medium.n
+        └── filters
+             └── small.m = large.m
 
-memo expect=ReorderJoins
+New expression 1 of 1:
+  project
+   └── left-join (hash)
+        ├── scan small
+        ├── inner-join (hash)
+        │    ├── scan medium
+        │    ├── scan large
+        │    └── filters
+        │         └── large.n = medium.n
+        └── filters
+             └── small.m = large.m
+
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  project
+   └── left-join (hash)
+        ├── scan small
+        ├── inner-join (hash)
+        │    ├── scan large
+        │    ├── scan medium
+        │    └── filters
+        │         └── large.n = medium.n
+        └── filters
+             └── small.m = large.m
+
+No new expressions.
+----
+----
+
+exploretrace rule=ReorderJoins format=hide-all
 SELECT *
 FROM
 (
@@ -897,73 +942,407 @@ INNER JOIN small
 ON result.a = small.n AND (small.m = result.b OR result.b IS NULL)
 INNER JOIN xyz ON True
 ----
-memo (optimized, ~29KB, required=[presentation: a:2,b:6,m:9,n:10,x:13,y:14,z:15])
- ├── G1: (project G2 G3 n n m n x y z)
- │    └── [presentation: a:2,b:6,m:9,n:10,x:13,y:14,z:15]
- │         ├── best: (project G2 G3 n n m n x y z)
- │         └── cost: 106250763119.61
- ├── G2: (inner-join G4 G5 G6) (inner-join G5 G4 G6)
- │    └── []
- │         ├── best: (inner-join G4 G5 G6)
- │         └── cost: 106250436419.60
- ├── G3: (projections)
- ├── G4: (inner-join G7 G8 G9) (select G10 G11) (inner-join G8 G7 G9)
- │    └── []
- │         ├── best: (select G10 G11)
- │         └── cost: 106250108223.69
- ├── G5: (scan xyz,cols=(13-15)) (scan xyz@xy,cols=(13-15)) (scan xyz@yz,cols=(13-15))
- │    └── []
- │         ├── best: (scan xyz,cols=(13-15))
- │         └── cost: 1070.02
- ├── G6: (filters)
- ├── G7: (left-join G12 G13 G14) (right-join G13 G12 G14)
- │    └── []
- │         ├── best: (right-join G13 G12 G14)
- │         └── cost: 106251106750.06
- ├── G8: (scan small,cols=(9,10))
- │    └── []
- │         ├── best: (scan small,cols=(9,10))
- │         └── cost: 10.52
- ├── G9: (filters G15 G16)
- ├── G10: (left-join G17 G13 G14) (right-join G13 G17 G14)
- │    └── []
- │         ├── best: (right-join G13 G17 G14)
- │         └── cost: 106250107243.57
- ├── G11: (filters G16)
- ├── G12: (scan medium,cols=(1,2))
- │    └── []
- │         ├── best: (scan medium,cols=(1,2))
- │         └── cost: 105000.02
- ├── G13: (scan large,cols=(5,6))
- │    └── []
- │         ├── best: (scan large,cols=(5,6))
- │         └── cost: 105000000000.02
- ├── G14: (filters G18)
- ├── G15: (eq G19 G20)
- ├── G16: (or G21 G22)
- ├── G17: (inner-join G12 G8 G23) (inner-join G8 G12 G23)
- │    └── []
- │         ├── best: (inner-join G12 G8 G23)
- │         └── cost: 106261.72
- ├── G18: (eq G24 G25)
- ├── G19: (variable medium.n)
- ├── G20: (variable small.n)
- ├── G21: (eq G26 G27)
- ├── G22: (is G27 G28)
- ├── G23: (filters G15)
- ├── G24: (variable large.m)
- ├── G25: (variable medium.m)
- ├── G26: (variable small.m)
- ├── G27: (variable large.n)
- └── G28: (null)
+----
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  project
+   └── inner-join (cross)
+        ├── inner-join (hash)
+        │    ├── left-join (hash)
+        │    │    ├── scan medium
+        │    │    ├── scan large
+        │    │    └── filters
+        │    │         └── large.m = medium.m
+        │    ├── scan small
+        │    └── filters
+        │         ├── medium.n = small.n
+        │         └── (small.m = large.n) OR (large.n IS NULL)
+        ├── scan xyz
+        └── filters (true)
 
-# --------------------------------------------------
-# CommuteJoin
-# --------------------------------------------------
+No new expressions.
+
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  project
+   └── inner-join (cross)
+        ├── inner-join (hash)
+        │    ├── right-join (hash)
+        │    │    ├── scan large
+        │    │    ├── scan medium
+        │    │    └── filters
+        │    │         └── large.m = medium.m
+        │    ├── scan small
+        │    └── filters
+        │         ├── medium.n = small.n
+        │         └── (small.m = large.n) OR (large.n IS NULL)
+        ├── scan xyz
+        └── filters (true)
+
+New expression 1 of 2:
+  project
+   └── inner-join (cross)
+        ├── select
+        │    ├── left-join (hash)
+        │    │    ├── inner-join (hash)
+        │    │    │    ├── scan medium
+        │    │    │    ├── scan small
+        │    │    │    └── filters
+        │    │    │         └── medium.n = small.n
+        │    │    ├── scan large
+        │    │    └── filters
+        │    │         └── large.m = medium.m
+        │    └── filters
+        │         └── (small.m = large.n) OR (large.n IS NULL)
+        ├── scan xyz
+        └── filters (true)
+
+New expression 2 of 2:
+  project
+   └── inner-join (cross)
+        ├── inner-join (hash)
+        │    ├── scan small
+        │    ├── right-join (hash)
+        │    │    ├── scan large
+        │    │    ├── scan medium
+        │    │    └── filters
+        │    │         └── large.m = medium.m
+        │    └── filters
+        │         ├── medium.n = small.n
+        │         └── (small.m = large.n) OR (large.n IS NULL)
+        ├── scan xyz
+        └── filters (true)
+
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  project
+   └── inner-join (cross)
+        ├── select
+        │    ├── right-join (hash)
+        │    │    ├── scan large
+        │    │    ├── inner-join (hash)
+        │    │    │    ├── scan medium
+        │    │    │    ├── scan small
+        │    │    │    └── filters
+        │    │    │         └── medium.n = small.n
+        │    │    └── filters
+        │    │         └── large.m = medium.m
+        │    └── filters
+        │         └── (small.m = large.n) OR (large.n IS NULL)
+        ├── scan xyz
+        └── filters (true)
+
+New expression 1 of 1:
+  project
+   └── inner-join (cross)
+        ├── scan xyz
+        ├── select
+        │    ├── right-join (hash)
+        │    │    ├── scan large
+        │    │    ├── inner-join (hash)
+        │    │    │    ├── scan medium
+        │    │    │    ├── scan small
+        │    │    │    └── filters
+        │    │    │         └── medium.n = small.n
+        │    │    └── filters
+        │    │         └── large.m = medium.m
+        │    └── filters
+        │         └── (small.m = large.n) OR (large.n IS NULL)
+        └── filters (true)
+----
+----
+
+# Full join on top of a full join.
+exploretrace rule=ReorderJoins format=hide-all
+SELECT * FROM abc
+FULL JOIN stu ON s = a
+FULL JOIN xyz ON b = y
+----
+----
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  full-join (hash)
+   ├── full-join (hash)
+   │    ├── scan abc
+   │    ├── scan stu
+   │    └── filters
+   │         └── s = a
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+New expression 1 of 1:
+  full-join (hash)
+   ├── full-join (hash)
+   │    ├── scan stu
+   │    ├── scan abc
+   │    └── filters
+   │         └── s = a
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  full-join (hash)
+   ├── full-join (merge)
+   │    ├── scan abc@ab
+   │    ├── scan stu
+   │    └── filters (true)
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+New expression 1 of 3:
+  full-join (hash)
+   ├── full-join (hash)
+   │    ├── scan abc
+   │    ├── scan xyz
+   │    └── filters
+   │         └── b = y
+   ├── scan stu
+   └── filters
+        └── s = a
+
+New expression 2 of 3:
+  full-join (hash)
+   ├── scan stu
+   ├── full-join (hash)
+   │    ├── scan abc
+   │    ├── scan xyz
+   │    └── filters
+   │         └── b = y
+   └── filters
+        └── s = a
+
+New expression 3 of 3:
+  full-join (hash)
+   ├── scan xyz
+   ├── full-join (merge)
+   │    ├── scan abc@ab
+   │    ├── scan stu
+   │    └── filters (true)
+   └── filters
+        └── b = y
+----
+----
+
+# Full join on top of a full join. Lower join is in right input of upper join.
+exploretrace rule=ReorderJoins format=hide-all
+SELECT * FROM abc
+FULL JOIN
+(
+  SELECT * FROM stu
+  FULL JOIN xyz ON t = y
+) f(s, t, u, x, y, z)
+ON a = x
+----
+----
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  full-join (hash)
+   ├── scan abc
+   ├── full-join (hash)
+   │    ├── scan stu
+   │    ├── scan xyz
+   │    └── filters
+   │         └── t = y
+   └── filters
+        └── a = x
+
+New expression 1 of 1:
+  full-join (hash)
+   ├── scan abc
+   ├── full-join (hash)
+   │    ├── scan xyz
+   │    ├── scan stu
+   │    └── filters
+   │         └── t = y
+   └── filters
+        └── a = x
+
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  full-join (hash)
+   ├── scan abc
+   ├── full-join (hash)
+   │    ├── scan stu
+   │    ├── scan xyz
+   │    └── filters
+   │         └── t = y
+   └── filters
+        └── a = x
+
+New expression 1 of 3:
+  full-join (hash)
+   ├── full-join (hash)
+   │    ├── scan stu
+   │    ├── scan xyz
+   │    └── filters
+   │         └── t = y
+   ├── scan abc
+   └── filters
+        └── a = x
+
+New expression 2 of 3:
+  full-join (hash)
+   ├── scan stu
+   ├── full-join (hash)
+   │    ├── scan abc
+   │    ├── scan xyz
+   │    └── filters
+   │         └── a = x
+   └── filters
+        └── t = y
+
+New expression 3 of 3:
+  full-join (hash)
+   ├── full-join (hash)
+   │    ├── scan abc
+   │    ├── scan xyz
+   │    └── filters
+   │         └── a = x
+   ├── scan stu
+   └── filters
+        └── t = y
+----
+----
+
+# Left join on top of a left join.
+exploretrace rule=ReorderJoins format=hide-all
+SELECT * FROM abc
+LEFT JOIN stu ON s = a
+LEFT JOIN xyz ON b = y
+----
+----
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  left-join (hash)
+   ├── left-join (hash)
+   │    ├── scan abc
+   │    ├── scan stu
+   │    └── filters
+   │         └── s = a
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+No new expressions.
+
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  left-join (hash)
+   ├── left-join (merge)
+   │    ├── scan abc@ab
+   │    ├── scan stu
+   │    └── filters (true)
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+New expression 1 of 1:
+  left-join (hash)
+   ├── left-join (hash)
+   │    ├── scan abc
+   │    ├── scan xyz
+   │    └── filters
+   │         └── b = y
+   ├── scan stu
+   └── filters
+        └── s = a
+----
+----
+
+# Left join on top of a full join.
+exploretrace rule=ReorderJoins format=hide-all
+SELECT * FROM abc
+FULL JOIN stu ON s = a
+LEFT JOIN xyz ON b = y
+----
+----
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  left-join (hash)
+   ├── full-join (hash)
+   │    ├── scan abc
+   │    ├── scan stu
+   │    └── filters
+   │         └── s = a
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+New expression 1 of 1:
+  left-join (hash)
+   ├── full-join (hash)
+   │    ├── scan stu
+   │    ├── scan abc
+   │    └── filters
+   │         └── s = a
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  left-join (hash)
+   ├── full-join (merge)
+   │    ├── scan abc@ab
+   │    ├── scan stu
+   │    └── filters (true)
+   ├── scan xyz
+   └── filters
+        └── b = y
+
+New expression 1 of 2:
+  full-join (hash)
+   ├── left-join (hash)
+   │    ├── scan abc
+   │    ├── scan xyz
+   │    └── filters
+   │         └── b = y
+   ├── scan stu
+   └── filters
+        └── s = a
+
+New expression 2 of 2:
+  full-join (hash)
+   ├── scan stu
+   ├── left-join (hash)
+   │    ├── scan abc
+   │    ├── scan xyz
+   │    └── filters
+   │         └── b = y
+   └── filters
+        └── s = a
+----
+----
 
 # Verify that the reversed join expressions get added to the memo, and there
 # are no duplicates.
-memo
+memo expect=ReorderJoins
 SELECT * FROM abc JOIN xyz ON a=z
 ----
 memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
@@ -991,7 +1370,7 @@ memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G7: (variable a)
  └── G8: (variable z)
 
-memo
+memo expect=ReorderJoins
 SELECT * FROM abc FULL OUTER JOIN xyz ON a=z
 ----
 memo (optimized, ~9KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
@@ -1020,7 +1399,7 @@ memo (optimized, ~9KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  └── G8: (variable z)
 
 # Verify that we swap to get the smaller side on the right.
-opt
+opt expect=ReorderJoins
 SELECT * FROM abc INNER JOIN xyz ON a=c WHERE b=1
 ----
 inner-join (cross)
@@ -1040,7 +1419,7 @@ inner-join (cross)
  └── filters (true)
 
 # Verify that the hash join hint prevents swapping the sides.
-opt
+opt expect-not=ReorderJoins
 SELECT * FROM abc INNER HASH JOIN xyz ON a=c WHERE b=1
 ----
 inner-join (cross)
@@ -1060,7 +1439,7 @@ inner-join (cross)
  │    └── columns: x:6 y:7 z:8
  └── filters (true)
 
-opt
+opt expect=ReorderJoins
 SELECT * FROM (SELECT * FROM abc WHERE b=1) FULL OUTER JOIN xyz ON a=z
 ----
 full-join (hash)
@@ -1077,11 +1456,11 @@ full-join (hash)
 # Verify that commuting works correctly when there is a lookup join hint
 # (specifically that it returns the original expression and flags when applied
 # twice; if it didn't, we'd see more inner-join expressions).
-memo
+memo expect=ReorderJoins
 SELECT * FROM abc INNER LOOKUP JOIN xyz ON a=x
 ----
 memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
- ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (lookup-join G2 G5 xyz@xy,keyCols=[1],outCols=(1-3,6-8))
+ ├── G1: (inner-join G2 G3 G4) (lookup-join G2 G5 xyz@xy,keyCols=[1],outCols=(1-3,6-8))
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (lookup-join G2 G5 xyz@xy,keyCols=[1],outCols=(1-3,6-8))
  │         └── cost: 23150.03
@@ -1098,6 +1477,63 @@ memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G6: (eq G7 G8)
  ├── G7: (variable a)
  └── G8: (variable x)
+
+# Verify that setting the join limit to 1 allows only commutation.
+exploretrace rule=ReorderJoins format=hide-all join-limit=1
+SELECT * FROM abc
+INNER JOIN stu ON s = a
+INNER JOIN xyz ON s = x
+----
+----
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  inner-join (hash)
+   ├── inner-join (hash)
+   │    ├── scan abc
+   │    ├── scan stu
+   │    └── filters
+   │         └── s = a
+   ├── scan xyz
+   └── filters
+        └── s = x
+
+New expression 1 of 1:
+  inner-join (hash)
+   ├── inner-join (hash)
+   │    ├── scan stu
+   │    ├── scan abc
+   │    └── filters
+   │         └── s = a
+   ├── scan xyz
+   └── filters
+        └── s = x
+
+================================================================================
+ReorderJoins
+================================================================================
+Source expression:
+  inner-join (hash)
+   ├── inner-join (merge)
+   │    ├── scan abc@ab
+   │    ├── scan stu
+   │    └── filters (true)
+   ├── scan xyz
+   └── filters
+        └── s = x
+
+New expression 1 of 1:
+  inner-join (hash)
+   ├── scan xyz
+   ├── inner-join (merge)
+   │    ├── scan abc@ab
+   │    ├── scan stu
+   │    └── filters (true)
+   └── filters
+        └── s = x
+----
+----
 
 # --------------------------------------------------
 # CommuteLeftJoin
@@ -1244,8 +1680,8 @@ memo (optimized, ~12KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
 memo
 SELECT * FROM abc INNER HASH JOIN xyz ON a=x
 ----
-memo (optimized, ~9KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
- ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4)
+memo (optimized, ~8KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
+ ├── G1: (inner-join G2 G3 G4)
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (inner-join G2 G3 G4)
  │         └── cost: 2180.06
@@ -2012,7 +2448,7 @@ memo
 SELECT a,b,n,m FROM small INNER HASH JOIN abcd ON a=m
 ----
 memo (optimized, ~8KB, required=[presentation: a:5,b:6,n:2,m:1])
- ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4)
+ ├── G1: (inner-join G2 G3 G4)
  │    └── [presentation: a:5,b:6,n:2,m:1]
  │         ├── best: (inner-join G2 G3 G4)
  │         └── cost: 1079.17
@@ -2552,9 +2988,9 @@ anti-join (hash)
       ├── m:1 = a:5 [outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
       └── n:2 = c:7 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
 
-# --------------------------------------------------
-# GenerateGeospatialLookupJoins
-# --------------------------------------------------
+# -------------------------------------------------------
+# GenerateInvertedJoins + GenerateInvertedJoinsFromSelect
+# -------------------------------------------------------
 
 exec-ddl
 CREATE TABLE nyc_census_blocks (
@@ -2624,7 +3060,7 @@ ALTER TABLE nyc_neighborhoods INJECT STATISTICS '[
 
 # This query calculates the population density of two different neighborhoods
 # in New York City.
-opt expect=GenerateGeoLookupJoins
+opt expect=GenerateInvertedJoins
 SELECT
   n.name,
   Sum(c.popn_total) / (ST_Area(n.geom) / 1000000.0) AS popn_per_sqkm
@@ -2636,41 +3072,41 @@ OR n.name = 'Upper East Side'
 GROUP BY n.name, n.geom
 ----
 project
- ├── columns: name:14!null popn_per_sqkm:18
+ ├── columns: name:15!null popn_per_sqkm:20
  ├── immutable
  ├── group-by
- │    ├── columns: name:14!null n.geom:15 sum:17
- │    ├── grouping columns: name:14!null n.geom:15
+ │    ├── columns: name:15!null n.geom:16 sum:19
+ │    ├── grouping columns: name:15!null n.geom:16
  │    ├── immutable
- │    ├── key: (14,15)
- │    ├── fd: (14,15)-->(17)
+ │    ├── key: (15,16)
+ │    ├── fd: (15,16)-->(19)
  │    ├── inner-join (lookup nyc_census_blocks)
- │    │    ├── columns: popn_total:3 c.boroname:9!null c.geom:10 n.boroname:13!null name:14!null n.geom:15
+ │    │    ├── columns: popn_total:3 c.boroname:9!null c.geom:10 n.boroname:14!null name:15!null n.geom:16
  │    │    ├── key columns: [1] = [1]
  │    │    ├── lookup columns are key
  │    │    ├── immutable
- │    │    ├── fd: (9)==(13), (13)==(9)
+ │    │    ├── fd: (9)==(14), (14)==(9)
  │    │    ├── inner-join (inverted-lookup nyc_census_blocks@nyc_census_blocks_geo_idx)
- │    │    │    ├── columns: c.gid:1!null n.boroname:13 name:14!null n.geom:15
+ │    │    │    ├── columns: c.gid:1!null n.boroname:14 name:15!null n.geom:16
  │    │    │    ├── inverted-expr
- │    │    │    │    └── st_intersects(n.geom:15, c.geom:10)
+ │    │    │    │    └── st_intersects(n.geom:16, c.geom:10)
  │    │    │    ├── select
- │    │    │    │    ├── columns: n.boroname:13 name:14!null n.geom:15
+ │    │    │    │    ├── columns: n.boroname:14 name:15!null n.geom:16
  │    │    │    │    ├── scan n
- │    │    │    │    │    └── columns: n.boroname:13 name:14 n.geom:15
+ │    │    │    │    │    └── columns: n.boroname:14 name:15 n.geom:16
  │    │    │    │    └── filters
- │    │    │    │         └── (name:14 = 'Upper West Side') OR (name:14 = 'Upper East Side') [outer=(14), constraints=(/14: [/'Upper East Side' - /'Upper East Side'] [/'Upper West Side' - /'Upper West Side']; tight)]
+ │    │    │    │         └── (name:15 = 'Upper West Side') OR (name:15 = 'Upper East Side') [outer=(15), constraints=(/15: [/'Upper East Side' - /'Upper East Side'] [/'Upper West Side' - /'Upper West Side']; tight)]
  │    │    │    └── filters (true)
  │    │    └── filters
- │    │         ├── st_intersects(n.geom:15, c.geom:10) [outer=(10,15), immutable]
- │    │         └── c.boroname:9 = n.boroname:13 [outer=(9,13), constraints=(/9: (/NULL - ]; /13: (/NULL - ]), fd=(9)==(13), (13)==(9)]
+ │    │         ├── st_intersects(n.geom:16, c.geom:10) [outer=(10,16), immutable]
+ │    │         └── c.boroname:9 = n.boroname:14 [outer=(9,14), constraints=(/9: (/NULL - ]; /14: (/NULL - ]), fd=(9)==(14), (14)==(9)]
  │    └── aggregations
- │         └── sum [as=sum:17, outer=(3)]
+ │         └── sum [as=sum:19, outer=(3)]
  │              └── popn_total:3
  └── projections
-      └── sum:17 / (st_area(n.geom:15) / 1e+06) [as=popn_per_sqkm:18, outer=(15,17), immutable]
+      └── sum:19 / (st_area(n.geom:16) / 1e+06) [as=popn_per_sqkm:20, outer=(16,19), immutable]
 
-memo expect=GenerateGeoLookupJoins
+memo expect=GenerateInvertedJoins
 SELECT
   n.name,
   Sum(c.popn_total) / (ST_Area(n.geom) / 1000000.0) AS popn_per_sqkm
@@ -2681,63 +3117,68 @@ WHERE n.name = 'Upper West Side'
 OR n.name = 'Upper East Side'
 GROUP BY n.name, n.geom
 ----
-memo (optimized, ~23KB, required=[presentation: name:14,popn_per_sqkm:18])
+memo (optimized, ~28KB, required=[presentation: name:15,popn_per_sqkm:20])
  ├── G1: (project G2 G3 name)
- │    └── [presentation: name:14,popn_per_sqkm:18]
+ │    └── [presentation: name:15,popn_per_sqkm:20]
  │         ├── best: (project G2 G3 name)
  │         └── cost: 7308.28
- ├── G2: (group-by G4 G5 cols=(14,15))
+ ├── G2: (group-by G4 G5 cols=(15,16))
  │    └── []
- │         ├── best: (group-by G4 G5 cols=(14,15))
+ │         ├── best: (group-by G4 G5 cols=(15,16))
  │         └── cost: 7308.23
  ├── G3: (projections G6)
- ├── G4: (inner-join G7 G8 G9) (inner-join G8 G7 G9) (lookup-join G10 G9 nyc_census_blocks,keyCols=[1],outCols=(3,9,10,13-15))
+ ├── G4: (inner-join G7 G8 G9) (inner-join G8 G7 G9) (lookup-join G10 G11 nyc_neighborhoods,keyCols=[13],outCols=(3,9,10,14-16)) (lookup-join G12 G9 nyc_census_blocks,keyCols=[1],outCols=(3,9,10,14-16))
  │    └── []
- │         ├── best: (lookup-join G10 G9 nyc_census_blocks,keyCols=[1],outCols=(3,9,10,13-15))
+ │         ├── best: (lookup-join G12 G9 nyc_census_blocks,keyCols=[1],outCols=(3,9,10,14-16))
  │         └── cost: 7301.98
- ├── G5: (aggregations G11)
- ├── G6: (div G12 G13)
+ ├── G5: (aggregations G13)
+ ├── G6: (div G14 G15)
  ├── G7: (scan c,cols=(3,9,10))
  │    └── []
  │         ├── best: (scan c,cols=(3,9,10))
  │         └── cost: 43837.24
- ├── G8: (select G14 G15)
+ ├── G8: (select G16 G17)
  │    └── []
- │         ├── best: (select G14 G15)
+ │         ├── best: (select G16 G17)
  │         └── cost: 139.36
- ├── G9: (filters G16 G17)
- ├── G10: (inverted-join G8 G18 nyc_census_blocks@nyc_census_blocks_geo_idx)
+ ├── G9: (filters G18 G19)
+ ├── G10: (inverted-join G7 G20 nyc_neighborhoods@nyc_neighborhoods_geo_idx)
  │    └── []
- │         ├── best: (inverted-join G8 G18 nyc_census_blocks@nyc_census_blocks_geo_idx)
+ │         ├── best: (inverted-join G7 G20 nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+ │         └── cost: 921807.54
+ ├── G11: (filters G18 G19 G21)
+ ├── G12: (inverted-join G8 G20 nyc_census_blocks@nyc_census_blocks_geo_idx)
+ │    └── []
+ │         ├── best: (inverted-join G8 G20 nyc_census_blocks@nyc_census_blocks_geo_idx)
  │         └── cost: 1762.17
- ├── G11: (sum G19)
- ├── G12: (variable sum)
- ├── G13: (div G20 G21)
- ├── G14: (scan n,cols=(13-15))
+ ├── G13: (sum G22)
+ ├── G14: (variable sum)
+ ├── G15: (div G23 G24)
+ ├── G16: (scan n,cols=(14-16))
  │    └── []
- │         ├── best: (scan n,cols=(13-15))
+ │         ├── best: (scan n,cols=(14-16))
  │         └── cost: 138.05
- ├── G15: (filters G22)
- ├── G16: (function G23 st_intersects)
- ├── G17: (eq G24 G25)
- ├── G18: (filters)
- ├── G19: (variable popn_total)
- ├── G20: (function G26 st_area)
- ├── G21: (const 1e+06)
- ├── G22: (or G27 G28)
- ├── G23: (scalar-list G29 G30)
- ├── G24: (variable c.boroname)
- ├── G25: (variable n.boroname)
- ├── G26: (scalar-list G29)
- ├── G27: (eq G31 G32)
- ├── G28: (eq G31 G33)
- ├── G29: (variable n.geom)
- ├── G30: (variable c.geom)
- ├── G31: (variable name)
- ├── G32: (const 'Upper West Side')
- └── G33: (const 'Upper East Side')
+ ├── G17: (filters G21)
+ ├── G18: (function G25 st_intersects)
+ ├── G19: (eq G26 G27)
+ ├── G20: (filters)
+ ├── G21: (or G28 G29)
+ ├── G22: (variable popn_total)
+ ├── G23: (function G30 st_area)
+ ├── G24: (const 1e+06)
+ ├── G25: (scalar-list G31 G32)
+ ├── G26: (variable c.boroname)
+ ├── G27: (variable n.boroname)
+ ├── G28: (eq G33 G34)
+ ├── G29: (eq G33 G35)
+ ├── G30: (scalar-list G31)
+ ├── G31: (variable n.geom)
+ ├── G32: (variable c.geom)
+ ├── G33: (variable name)
+ ├── G34: (const 'Upper West Side')
+ └── G35: (const 'Upper East Side')
 
-opt expect=GenerateGeoLookupJoins
+opt expect=GenerateInvertedJoins
 SELECT
   n.name, c.boroname
 FROM nyc_census_blocks AS c
@@ -2745,25 +3186,25 @@ JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
 ON ST_DWithin(c.geom, n.geom, 50)
 ----
 project
- ├── columns: name:14 boroname:9
+ ├── columns: name:15 boroname:9
  ├── immutable
  └── inner-join (lookup nyc_neighborhoods)
-      ├── columns: c.boroname:9 c.geom:10 name:14 n.geom:15
-      ├── key columns: [12] = [12]
+      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── key columns: [13] = [13]
       ├── lookup columns are key
       ├── immutable
       ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
-      │    ├── columns: c.boroname:9 c.geom:10 n.gid:12!null
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
       │    ├── inverted-expr
-      │    │    └── st_dwithin(c.geom:10, n.geom:15, 50.0)
+      │    │    └── st_dwithin(c.geom:10, n.geom:16, 50.0)
       │    ├── scan c
       │    │    └── columns: c.boroname:9 c.geom:10
       │    └── filters (true)
       └── filters
-           └── st_dwithin(c.geom:10, n.geom:15, 50.0) [outer=(10,15), immutable]
+           └── st_dwithin(c.geom:10, n.geom:16, 50.0) [outer=(10,16), immutable]
 
 # Same test as above, but with arguments commuted.
-opt expect=GenerateGeoLookupJoins
+opt expect=GenerateInvertedJoins
 SELECT
   n.name, c.boroname
 FROM nyc_census_blocks AS c
@@ -2771,24 +3212,24 @@ JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
 ON ST_DWithin(n.geom, c.geom, 50)
 ----
 project
- ├── columns: name:14 boroname:9
+ ├── columns: name:15 boroname:9
  ├── immutable
  └── inner-join (lookup nyc_neighborhoods)
-      ├── columns: c.boroname:9 c.geom:10 name:14 n.geom:15
-      ├── key columns: [12] = [12]
+      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── key columns: [13] = [13]
       ├── lookup columns are key
       ├── immutable
       ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
-      │    ├── columns: c.boroname:9 c.geom:10 n.gid:12!null
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
       │    ├── inverted-expr
-      │    │    └── st_dwithin(n.geom:15, c.geom:10, 50.0)
+      │    │    └── st_dwithin(c.geom:10, n.geom:16, 50.0)
       │    ├── scan c
       │    │    └── columns: c.boroname:9 c.geom:10
       │    └── filters (true)
       └── filters
-           └── st_dwithin(n.geom:15, c.geom:10, 50.0) [outer=(10,15), immutable]
+           └── st_dwithin(n.geom:16, c.geom:10, 50.0) [outer=(10,16), immutable]
 
-opt expect=GenerateGeoLookupJoins
+opt expect=GenerateInvertedJoins
 SELECT
   n.name, c.boroname
 FROM nyc_census_blocks AS c
@@ -2796,25 +3237,25 @@ JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
 ON ST_Covers(c.geom, n.geom)
 ----
 project
- ├── columns: name:14 boroname:9
+ ├── columns: name:15 boroname:9
  ├── immutable
  └── inner-join (lookup nyc_neighborhoods)
-      ├── columns: c.boroname:9 c.geom:10 name:14 n.geom:15
-      ├── key columns: [12] = [12]
+      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── key columns: [13] = [13]
       ├── lookup columns are key
       ├── immutable
       ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
-      │    ├── columns: c.boroname:9 c.geom:10 n.gid:12!null
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
       │    ├── inverted-expr
-      │    │    └── st_covers(c.geom:10, n.geom:15)
+      │    │    └── st_covers(c.geom:10, n.geom:16)
       │    ├── scan c
       │    │    └── columns: c.boroname:9 c.geom:10
       │    └── filters (true)
       └── filters
-           └── st_covers(c.geom:10, n.geom:15) [outer=(10,15), immutable]
+           └── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable]
 
 # Same test as above, but with arguments commuted.
-opt expect=GenerateGeoLookupJoins
+opt expect=GenerateInvertedJoins
 SELECT
   n.name, c.boroname
 FROM nyc_census_blocks AS c
@@ -2822,22 +3263,154 @@ JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
 ON ST_Covers(n.geom, c.geom)
 ----
 project
- ├── columns: name:14 boroname:9
+ ├── columns: name:15 boroname:9
  ├── immutable
  └── inner-join (lookup nyc_neighborhoods)
-      ├── columns: c.boroname:9 c.geom:10 name:14 n.geom:15
-      ├── key columns: [12] = [12]
+      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── key columns: [13] = [13]
       ├── lookup columns are key
       ├── immutable
       ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
-      │    ├── columns: c.boroname:9 c.geom:10 n.gid:12!null
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
       │    ├── inverted-expr
-      │    │    └── st_coveredby(c.geom:10, n.geom:15)
+      │    │    └── st_coveredby(c.geom:10, n.geom:16)
       │    ├── scan c
       │    │    └── columns: c.boroname:9 c.geom:10
       │    └── filters (true)
       └── filters
-           └── st_covers(n.geom:15, c.geom:10) [outer=(10,15), immutable]
+           └── st_covers(n.geom:16, c.geom:10) [outer=(10,16), immutable]
+
+# Complex join filter.
+opt expect=GenerateInvertedJoins
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON ST_Covers(n.geom, c.geom)
+  AND (ST_DWithin(c.geom, n.geom, 50) OR ST_Intersects(n.geom, 'LINESTRING ( 0 0, 0 2 )'::geometry))
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_coveredby(c.geom:10, n.geom:16) AND (st_dwithin(c.geom:10, n.geom:16, 50.0) OR st_intersects('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', n.geom:16))
+      │    ├── scan c
+      │    │    └── columns: c.boroname:9 c.geom:10
+      │    └── filters (true)
+      └── filters
+           ├── st_covers(n.geom:16, c.geom:10) [outer=(10,16), immutable]
+           └── st_dwithin(c.geom:10, n.geom:16, 50.0) OR st_intersects(n.geom:16, '0102000000020000000000000000000000000000000000000000000000000000000000000000000040') [outer=(10,16), immutable]
+
+opt expect=GenerateInvertedJoinsFromSelect
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON ST_Covers(c.geom, n.geom)
+AND ST_Covers('LINESTRING ( 0 0, 0 2 )', n.geom)
+AND ST_Covers(c.geom, 'LINESTRING ( 0 0, 0 2 )')
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (lookup nyc_census_blocks)
+      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── key columns: [1] = [1]
+      ├── lookup columns are key
+      ├── immutable
+      ├── inner-join (inverted-lookup nyc_census_blocks@nyc_census_blocks_geo_idx)
+      │    ├── columns: c.gid:1!null name:15 n.geom:16
+      │    ├── inverted-expr
+      │    │    └── st_coveredby(n.geom:16, c.geom:10) AND st_coveredby('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', c.geom:10)
+      │    ├── immutable
+      │    ├── select
+      │    │    ├── columns: name:15 n.geom:16
+      │    │    ├── immutable
+      │    │    ├── index-join nyc_neighborhoods
+      │    │    │    ├── columns: name:15 n.geom:16
+      │    │    │    └── inverted-filter
+      │    │    │         ├── columns: n.gid:13!null
+      │    │    │         ├── inverted expression: /18
+      │    │    │         │    ├── tight: false
+      │    │    │         │    └── union spans: ["\x89", "\xfd ")
+      │    │    │         ├── key: (13)
+      │    │    │         └── scan n@nyc_neighborhoods_geo_idx
+      │    │    │              ├── columns: n.gid:13!null n.geom_inverted_key:18!null
+      │    │    │              ├── inverted constraint: /18/13
+      │    │    │              │    └── spans: ["\x89", "\xfd ")
+      │    │    │              ├── flags: force-index=nyc_neighborhoods_geo_idx
+      │    │    │              ├── key: (13)
+      │    │    │              └── fd: (13)-->(18)
+      │    │    └── filters
+      │    │         └── st_covers('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', n.geom:16) [outer=(16), immutable]
+      │    └── filters (true)
+      └── filters
+           ├── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable]
+           └── st_covers(c.geom:10, '0102000000020000000000000000000000000000000000000000000000000000000000000000000040') [outer=(10), immutable]
+
+opt expect=GenerateInvertedJoinsFromSelect
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON ST_Covers(c.geom, n.geom) AND c.boroname = 'Manhattan' AND n.name LIKE 'Upper%'
+----
+project
+ ├── columns: name:15!null boroname:9!null
+ ├── immutable
+ ├── fd: ()-->(9)
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9!null c.geom:10 name:15!null n.geom:16
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── fd: ()-->(9)
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9!null c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_covers(c.geom:10, n.geom:16)
+      │    ├── fd: ()-->(9)
+      │    ├── select
+      │    │    ├── columns: c.boroname:9!null c.geom:10
+      │    │    ├── fd: ()-->(9)
+      │    │    ├── scan c
+      │    │    │    └── columns: c.boroname:9 c.geom:10
+      │    │    └── filters
+      │    │         └── c.boroname:9 = 'Manhattan' [outer=(9), constraints=(/9: [/'Manhattan' - /'Manhattan']; tight), fd=()-->(9)]
+      │    └── filters (true)
+      └── filters
+           ├── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable]
+           └── name:15 LIKE 'Upper%' [outer=(15), constraints=(/15: [/'Upper' - /'Uppes'); tight)]
+
+# It's not possible to generate an inverted join when there is an OR with a
+# non-geospatial function.
+opt expect=GenerateInvertedJoins
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON ST_Covers(c.geom, n.geom) OR n.name LIKE 'Upper%'
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (cross)
+      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── immutable
+      ├── scan c
+      │    └── columns: c.boroname:9 c.geom:10
+      ├── scan n
+      │    ├── columns: name:15 n.geom:16
+      │    └── flags: force-index=nyc_neighborhoods_geo_idx
+      └── filters
+           └── st_covers(c.geom:10, n.geom:16) OR (name:15 LIKE 'Upper%') [outer=(10,15,16), immutable]
 
 # --------------------------------------------------
 # GenerateZigZagJoins
@@ -2874,7 +3447,7 @@ inner-join (zigzag pqr@q pqr@r)
 memo
 SELECT q,r FROM pqr WHERE q = 1 AND r = 2
 ----
-memo (optimized, ~14KB, required=[presentation: q:2,r:3])
+memo (optimized, ~13KB, required=[presentation: q:2,r:3])
  ├── G1: (select G2 G3) (zigzag-join G3 pqr@q pqr@r) (select G4 G5) (select G6 G7) (select G8 G7)
  │    └── [presentation: q:2,r:3]
  │         ├── best: (zigzag-join G3 pqr@q pqr@r)
@@ -2955,7 +3528,7 @@ inner-join (lookup pqr)
 memo
 SELECT q,r,s FROM pqr WHERE q = 1 AND r = 2
 ----
-memo (optimized, ~16KB, required=[presentation: q:2,r:3,s:4])
+memo (optimized, ~15KB, required=[presentation: q:2,r:3,s:4])
  ├── G1: (select G2 G3) (lookup-join G4 G5 pqr,keyCols=[1],outCols=(2-4)) (select G6 G7) (select G8 G9) (select G10 G9)
  │    └── [presentation: q:2,r:3,s:4]
  │         ├── best: (lookup-join G4 G5 pqr,keyCols=[1],outCols=(2-4))
@@ -3074,7 +3647,7 @@ inner-join (zigzag pqr@rs pqr@ts)
 memo
 SELECT r,t FROM pqr WHERE r = 1 AND t = 'foo'
 ----
-memo (optimized, ~14KB, required=[presentation: r:3,t:5])
+memo (optimized, ~13KB, required=[presentation: r:3,t:5])
  ├── G1: (select G2 G3) (zigzag-join G3 pqr@rs pqr@ts) (select G4 G5) (select G6 G5) (select G7 G8)
  │    └── [presentation: r:3,t:5]
  │         ├── best: (zigzag-join G3 pqr@rs pqr@ts)
@@ -3508,7 +4081,7 @@ SELECT 1 FROM (VALUES (1), (1)) JOIN (VALUES (1), (1), (1)) ON true
 UNION ALL
 SELECT 1 FROM (VALUES (1), (1), (1)) JOIN (VALUES (1), (1)) ON true
 ----
-memo (optimized, ~19KB, required=[presentation: ?column?:7])
+memo (optimized, ~18KB, required=[presentation: ?column?:7])
  ├── G1: (union-all G2 G3)
  │    └── [presentation: ?column?:7]
  │         ├── best: (union-all G2 G3)

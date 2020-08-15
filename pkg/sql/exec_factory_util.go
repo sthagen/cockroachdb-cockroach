@@ -14,14 +14,15 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -102,7 +103,11 @@ func makeScanColumnsConfig(table cat.Table, cols exec.TableColumnOrdinalSet) sca
 		visibility:    execinfra.ScanVisibilityPublicAndNotPublic,
 	}
 	for c, ok := cols.Next(0); ok; c, ok = cols.Next(c + 1) {
-		desc := table.Column(c).(*sqlbase.ColumnDescriptor)
+		ord := c
+		if cat.IsVirtualColumn(table, c) {
+			ord = table.Column(ord).InvertedSourceColumnOrdinal()
+		}
+		desc := table.Column(ord).(*descpb.ColumnDescriptor)
 		colCfg.wantedColumns = append(colCfg.wantedColumns, tree.ColumnID(desc.ID))
 	}
 	return colCfg
@@ -128,9 +133,8 @@ func constructExplainPlanNode(
 
 	case tree.ExplainVec:
 		return &explainVecNode{
-			options:       options,
-			plan:          p.main,
-			subqueryPlans: p.subqueryPlans,
+			options: options,
+			plan:    p.planComponents,
 		}, nil
 
 	case tree.ExplainPlan:
@@ -140,7 +144,7 @@ func constructExplainPlanNode(
 		return planner.makeExplainPlanNodeWithPlan(
 			context.TODO(),
 			options,
-			&p.planComponents,
+			p.planComponents,
 		)
 
 	default:
@@ -235,64 +239,6 @@ func convertOrdinalsToInts(ordinals []exec.NodeColumnOrdinal) []int {
 	return ints
 }
 
-func constructSimpleProjectForPlanNode(
-	n planNode, cols []exec.NodeColumnOrdinal, colNames []string, reqOrdering exec.OutputOrdering,
-) (exec.Node, error) {
-	// If the top node is already a renderNode, just rearrange the columns. But
-	// we don't want to duplicate a rendering expression (in case it is expensive
-	// to compute or has side-effects); so if we have duplicates we avoid this
-	// optimization (and add a new renderNode).
-	if r, ok := n.(*renderNode); ok && !hasDuplicates(cols) {
-		oldCols, oldRenders := r.columns, r.render
-		r.columns = make(sqlbase.ResultColumns, len(cols))
-		r.render = make([]tree.TypedExpr, len(cols))
-		for i, ord := range cols {
-			r.columns[i] = oldCols[ord]
-			if colNames != nil {
-				r.columns[i].Name = colNames[i]
-			}
-			r.render[i] = oldRenders[ord]
-		}
-		r.reqOrdering = ReqOrdering(reqOrdering)
-		return r, nil
-	}
-	var inputCols sqlbase.ResultColumns
-	if colNames == nil {
-		// We will need the names of the input columns.
-		inputCols = planColumns(n.(planNode))
-	}
-
-	var rb renderBuilder
-	rb.init(n, reqOrdering)
-
-	exprs := make(tree.TypedExprs, len(cols))
-	for i, col := range cols {
-		exprs[i] = rb.r.ivarHelper.IndexedVar(int(col))
-	}
-	var resultTypes []*types.T
-	if colNames != nil {
-		// We will need updated result types.
-		resultTypes = make([]*types.T, len(cols))
-		for i := range exprs {
-			resultTypes[i] = exprs[i].ResolvedType()
-		}
-	}
-	resultCols := getResultColumnsForSimpleProject(cols, colNames, resultTypes, inputCols)
-	rb.setOutput(exprs, resultCols)
-	return rb.res, nil
-}
-
-func hasDuplicates(cols []exec.NodeColumnOrdinal) bool {
-	var set util.FastIntSet
-	for _, c := range cols {
-		if set.Contains(int(c)) {
-			return true
-		}
-		set.Add(int(c))
-	}
-	return false
-}
-
 func constructVirtualScan(
 	ef exec.Factory,
 	p *planner,
@@ -311,7 +257,7 @@ func constructVirtualScan(
 	}
 	indexDesc := index.(*optVirtualIndex).desc
 	columns, constructor := virtual.getPlanInfo(
-		table.(*optVirtualTable).desc.TableDesc(),
+		table.(*optVirtualTable).desc,
 		indexDesc, params.IndexConstraint)
 
 	n, err := delayedNodeCallback(&delayedNode{
@@ -337,12 +283,10 @@ func constructVirtualScan(
 	if needed := params.NeededCols; needed.Len() != len(columns) {
 		// We are selecting a subset of columns; we need a projection.
 		cols := make([]exec.NodeColumnOrdinal, 0, needed.Len())
-		colNames := make([]string, len(cols))
 		for ord, ok := needed.Next(0); ok; ord, ok = needed.Next(ord + 1) {
 			cols = append(cols, exec.NodeColumnOrdinal(ord-1))
-			colNames = append(colNames, columns[ord-1].Name)
 		}
-		n, err = ef.ConstructSimpleProject(n, cols, colNames, nil /* reqOrdering */)
+		n, err = ef.ConstructSimpleProject(n, cols, nil /* reqOrdering */)
 		if err != nil {
 			return nil, err
 		}
@@ -358,7 +302,7 @@ func constructVirtualScan(
 	// Virtual indexes never provide a legitimate ordering, so we have to make
 	// sure to sort if we have a required ordering.
 	if len(reqOrdering) != 0 {
-		n, err = ef.ConstructSort(n, sqlbase.ColumnOrdering(reqOrdering), 0)
+		n, err = ef.ConstructSort(n, reqOrdering, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -368,14 +312,22 @@ func constructVirtualScan(
 
 func collectSystemColumnsFromCfg(
 	colCfg *scanColumnsConfig,
-) (systemColumns []sqlbase.SystemColumnKind, systemColumnOrdinals []int) {
+) (systemColumns []descpb.SystemColumnKind, systemColumnOrdinals []int) {
 	for i, id := range colCfg.wantedColumns {
-		sysColKind := sqlbase.GetSystemColumnKindFromColumnID(sqlbase.ColumnID(id))
-		if sysColKind != sqlbase.SystemColumnKind_NONE {
+		sysColKind := sqlbase.GetSystemColumnKindFromColumnID(descpb.ColumnID(id))
+		if sysColKind != descpb.SystemColumnKind_NONE {
 			// The scan is requested to produce a system column.
 			systemColumns = append(systemColumns, sysColKind)
 			systemColumnOrdinals = append(systemColumnOrdinals, i)
 		}
 	}
 	return systemColumns, systemColumnOrdinals
+}
+
+func constructOpaque(metadata opt.OpaqueMetadata) (planNode, error) {
+	o, ok := metadata.(*opaqueMetadata)
+	if !ok {
+		return nil, errors.AssertionFailedf("unexpected OpaqueMetadata object type %T", metadata)
+	}
+	return o.plan, nil
 }

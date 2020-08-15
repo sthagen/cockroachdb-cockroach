@@ -307,7 +307,7 @@ A file preventing this node from restarting was placed at:
 // forward sequence number jump (i.e. a skipped lease). This behavior can
 // be disabled by passing permitJump as true.
 func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, permitJump bool) {
-	r.mu.Lock()
+	r.mu.RLock()
 	replicaID := r.mu.replicaID
 	// Pull out the last lease known to this Replica. It's possible that this is
 	// not actually the last lease in the Range's lease sequence because the
@@ -316,7 +316,32 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 	// lease update. All other forms of lease updates should be continuous
 	// without jumps (see permitJump).
 	prevLease := *r.mu.state.Lease
-	r.mu.Unlock()
+	r.mu.RUnlock()
+
+	// Sanity check to make sure that the lease sequence is moving in the right
+	// direction.
+	if s1, s2 := prevLease.Sequence, newLease.Sequence; s1 != 0 {
+		// We're at a version that supports lease sequence numbers.
+		switch {
+		case s2 < s1:
+			log.Fatalf(ctx, "lease sequence inversion, prevLease=%s, newLease=%s",
+				log.Safe(prevLease), log.Safe(newLease))
+		case s2 == s1:
+			// If the sequence numbers are the same, make sure they're actually
+			// the same lease. This can happen when callers are using
+			// leasePostApply for some of its side effects, like with
+			// splitPostApply. It can also happen during lease extensions.
+			if !prevLease.Equivalent(newLease) {
+				log.Fatalf(ctx, "sequence identical for different leases, prevLease=%s, newLease=%s",
+					log.Safe(prevLease), log.Safe(newLease))
+			}
+		case s2 == s1+1:
+			// Lease sequence incremented by 1. Expected case.
+		case s2 > s1+1 && !permitJump:
+			log.Fatalf(ctx, "lease sequence jump, prevLease=%s, newLease=%s",
+				log.Safe(prevLease), log.Safe(newLease))
+		}
+	}
 
 	iAmTheLeaseHolder := newLease.Replica.ReplicaID == replicaID
 	// NB: in the case in which a node restarts, minLeaseProposedTS forces it to
@@ -338,7 +363,13 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 		// progress, as only the old leaseholder would have been explicitly notified
 		// of the merge. If there is a merge in progress, maybeWatchForMerge will
 		// arrange to block all traffic to this replica unless the merge aborts.
-		if err := r.maybeWatchForMerge(ctx); err != nil {
+		// NB: If the subsumed range changes leaseholders after subsumption,
+		// `freezeStart` will be zero and we will effectively be blocking all read
+		// requests.
+		// TODO(aayush): In the future, if we permit co-operative lease transfers
+		// when a range is subsumed, it should be relatively straightforward to
+		// allow historical reads on the subsumed RHS after such lease transfers.
+		if err := r.maybeWatchForMerge(ctx, hlc.Timestamp{} /* freezeStart */); err != nil {
 			// We were unable to determine whether a merge was in progress. We cannot
 			// safely proceed.
 			log.Fatalf(ctx, "failed checking for in-progress merge while installing new lease %s: %s",
@@ -367,31 +398,6 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 
 	// Inform the concurrency manager that the lease holder has been updated.
 	r.concMgr.OnRangeLeaseUpdated(newLease.Sequence, iAmTheLeaseHolder)
-
-	// Sanity check to make sure that the lease sequence is moving in the right
-	// direction.
-	if s1, s2 := prevLease.Sequence, newLease.Sequence; s1 != 0 {
-		// We're at a version that supports lease sequence numbers.
-		switch {
-		case s2 < s1:
-			log.Fatalf(ctx, "lease sequence inversion, prevLease=%s, newLease=%s",
-				log.Safe(prevLease), log.Safe(newLease))
-		case s2 == s1:
-			// If the sequence numbers are the same, make sure they're actually
-			// the same lease. This can happen when callers are using
-			// leasePostApply for some of its side effects, like with
-			// splitPostApply. It can also happen during lease extensions.
-			if !prevLease.Equivalent(newLease) {
-				log.Fatalf(ctx, "sequence identical for different leases, prevLease=%s, newLease=%s",
-					log.Safe(prevLease), log.Safe(newLease))
-			}
-		case s2 == s1+1:
-			// Lease sequence incremented by 1. Expected case.
-		case s2 > s1+1 && !permitJump:
-			log.Fatalf(ctx, "lease sequence jump, prevLease=%s, newLease=%s",
-				log.Safe(prevLease), log.Safe(newLease))
-		}
-	}
 
 	// Ordering is critical here. We only install the new lease after we've
 	// checked for an in-progress merge and updated the timestamp cache. If the
@@ -610,8 +616,8 @@ func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult re
 	if lResult.EndTxns != nil {
 		log.Fatalf(ctx, "LocalEvalResult.EndTxns should be nil: %+v", lResult.EndTxns)
 	}
-	if lResult.MaybeWatchForMerge {
-		log.Fatalf(ctx, "LocalEvalResult.MaybeWatchForMerge should be false")
+	if !lResult.FreezeStart.IsEmpty() {
+		log.Fatalf(ctx, "LocalEvalResult.FreezeStart should have been handled and reset: %s", lResult.FreezeStart)
 	}
 
 	if lResult.AcquiredLocks != nil {
@@ -809,6 +815,13 @@ func (r *Replica) evaluateProposal(
 				log.Fatalf(ctx, "cannot propose negative ContainsEstimates "+
 					"without VersionContainsEstimatesCounter in %s", ba.Summary())
 			}
+		}
+
+		// If the cluster version doesn't track abort span size in MVCCStats, we
+		// zero it out to prevent inconsistencies in MVCCStats across nodes in a
+		// possibly mixed-version cluster.
+		if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.VersionAbortSpanBytes) {
+			res.Replicated.Delta.AbortSpanBytes = 0
 		}
 
 		// If the RangeAppliedState key is not being used and the cluster version is

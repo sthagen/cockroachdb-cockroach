@@ -35,8 +35,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -561,9 +563,9 @@ func TestSystemConfigGossip(t *testing.T) {
 	ts := s.(*TestServer)
 
 	key := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, keys.MaxReservedDescID)
-	valAt := func(i int) *sqlbase.Descriptor {
+	valAt := func(i int) *descpb.Descriptor {
 		return sqlbase.NewInitialDatabaseDescriptor(
-			sqlbase.ID(i), "foo",
+			descpb.ID(i), "foo", security.AdminRole,
 		).DescriptorProto()
 	}
 
@@ -615,7 +617,7 @@ func TestSystemConfigGossip(t *testing.T) {
 		}
 
 		// Make sure the returned value is valAt(2).
-		var got sqlbase.Descriptor
+		var got descpb.Descriptor
 		if err := val.GetProto(&got); err != nil {
 			return err
 		}

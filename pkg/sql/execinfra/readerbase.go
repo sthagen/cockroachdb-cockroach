@@ -73,28 +73,24 @@ func MisplannedRanges(
 	log.VEvent(ctx, 2, "checking range cache to see if range info updates should be communicated to the gateway")
 	misplanned := make(map[roachpb.RangeID]struct{})
 	for _, sp := range spans {
-		rstart, err := keys.Addr(sp.Key)
+		rSpan, err := keys.SpanAddr(sp)
 		if err != nil {
 			panic(err)
 		}
-		rend, err := keys.Addr(sp.EndKey)
-		if err != nil {
-			panic(err)
-		}
-		rsp := roachpb.RSpan{Key: rstart, EndKey: rend}
-		overlapping := rdc.GetCachedOverlapping(ctx, rsp)
+		overlapping := rdc.GetCachedOverlapping(ctx, rSpan)
 
 		for _, ri := range overlapping {
-			if _, ok := misplanned[ri.Desc.RangeID]; ok {
+			if _, ok := misplanned[ri.Desc().RangeID]; ok {
 				// We're already returning info about this range.
 				continue
 			}
 			// Ranges with unknown leases are not returned, as the current node might
 			// actually have the lease without the local cache knowing about it.
-			if !ri.Lease.Empty() && ri.Lease.Replica.NodeID != nodeID {
+			l := ri.Lease()
+			if l != nil && l.Replica.NodeID != nodeID {
 				misplannedRanges = append(misplannedRanges, roachpb.RangeInfo{
-					Desc:  ri.Desc,
-					Lease: ri.Lease,
+					Desc:  *ri.Desc(),
+					Lease: *l,
 				})
 			}
 		}

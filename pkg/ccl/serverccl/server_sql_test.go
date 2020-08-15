@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -42,7 +43,11 @@ func TestSQLServer(t *testing.T) {
 	tc := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 
-	db := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+	db := serverutils.StartTenant(
+		t,
+		tc.Server(0),
+		base.TestTenantArgs{TenantID: roachpb.MakeTenantID(security.EmbeddedTenantIDs()[0])},
+	)
 	defer db.Close()
 	r := sqlutils.MakeSQLRunner(db)
 	r.QueryStr(t, `SELECT 1`)
@@ -71,4 +76,21 @@ func TestTenantCannotSetClusterSetting(t *testing.T) {
 	ok := errors.As(err, &pqErr)
 	require.True(t, ok, "expected err to be a *pq.Error but is of type %T. error is: %v", err)
 	require.Equal(t, pq.ErrorCode(pgcode.InsufficientPrivilege.String()), pqErr.Code, "err %v has unexpected code", err)
+}
+
+func TestTenantUnauthenticatedAccess(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	tc := serverutils.StartTestCluster(t, 1, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+
+	_, err := tc.Server(0).StartTenant(base.TestTenantArgs{
+		TenantID: roachpb.MakeTenantID(security.EmbeddedTenantIDs()[0]),
+		// Configure the SQL server to access the wrong tenant keyspace.
+		TenantIDCodecOverride: roachpb.MakeTenantID(security.EmbeddedTenantIDs()[1]),
+	})
+	require.Error(t, err)
+	require.Regexp(t, `Unauthenticated desc = requested key /Tenant/11/System/"system-version/" not fully contained in tenant keyspace /Tenant/1{0-1}`, err)
 }

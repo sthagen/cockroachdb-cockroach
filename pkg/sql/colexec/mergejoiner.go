@@ -12,17 +12,16 @@ package colexec
 
 import (
 	"context"
-	"math"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
@@ -239,7 +238,7 @@ func NewMergeJoinOp(
 	memoryLimit int64,
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
-	joinType sqlbase.JoinType,
+	joinType descpb.JoinType,
 	left colexecbase.Operator,
 	right colexecbase.Operator,
 	leftTypes []*types.T,
@@ -330,21 +329,21 @@ func NewMergeJoinOp(
 	}
 	var mergeJoinerOp ResettableOperator
 	switch joinType {
-	case sqlbase.InnerJoin:
+	case descpb.InnerJoin:
 		mergeJoinerOp = &mergeJoinInnerOp{base}
-	case sqlbase.LeftOuterJoin:
+	case descpb.LeftOuterJoin:
 		mergeJoinerOp = &mergeJoinLeftOuterOp{base}
-	case sqlbase.RightOuterJoin:
+	case descpb.RightOuterJoin:
 		mergeJoinerOp = &mergeJoinRightOuterOp{base}
-	case sqlbase.FullOuterJoin:
+	case descpb.FullOuterJoin:
 		mergeJoinerOp = &mergeJoinFullOuterOp{base}
-	case sqlbase.LeftSemiJoin:
+	case descpb.LeftSemiJoin:
 		mergeJoinerOp = &mergeJoinLeftSemiOp{base}
-	case sqlbase.LeftAntiJoin:
+	case descpb.LeftAntiJoin:
 		mergeJoinerOp = &mergeJoinLeftAntiOp{base}
-	case sqlbase.IntersectAllJoin:
+	case descpb.IntersectAllJoin:
 		mergeJoinerOp = &mergeJoinIntersectAllOp{base}
-	case sqlbase.ExceptAllJoin:
+	case descpb.ExceptAllJoin:
 		mergeJoinerOp = &mergeJoinExceptAllOp{base}
 	default:
 		return nil, errors.AssertionFailedf("merge join of type %s not supported", joinType)
@@ -411,7 +410,7 @@ func newMergeJoinBase(
 	memoryLimit int64,
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
-	joinType sqlbase.JoinType,
+	joinType descpb.JoinType,
 	left colexecbase.Operator,
 	right colexecbase.Operator,
 	leftTypes []*types.T,
@@ -484,13 +483,13 @@ type mergeJoinBase struct {
 	memoryLimit        int64
 	diskQueueCfg       colcontainer.DiskQueueCfg
 	fdSemaphore        semaphore.Semaphore
-	joinType           sqlbase.JoinType
+	joinType           descpb.JoinType
 	left               mergeJoinInput
 	right              mergeJoinInput
 
 	// Output buffer definition.
-	output          coldata.Batch
-	outputBatchSize int
+	output      coldata.Batch
+	outputTypes []*types.T
 	// outputReady is a flag to indicate that merge joiner is ready to emit an
 	// output batch.
 	outputReady bool
@@ -532,40 +531,26 @@ func (o *mergeJoinBase) InternalMemoryUsage() int {
 }
 
 func (o *mergeJoinBase) Init() {
-	o.initWithOutputBatchSize(coldata.BatchSize())
-}
-
-func (o *mergeJoinBase) initWithOutputBatchSize(outBatchSize int) {
-	outputTypes := append([]*types.T{}, o.left.sourceTypes...)
+	o.outputTypes = append([]*types.T{}, o.left.sourceTypes...)
 	if o.joinType.ShouldIncludeRightColsInOutput() {
-		outputTypes = append(outputTypes, o.right.sourceTypes...)
+		o.outputTypes = append(o.outputTypes, o.right.sourceTypes...)
 	}
-	o.output = o.unlimitedAllocator.NewMemBatchWithSize(outputTypes, outBatchSize)
 	o.left.source.Init()
 	o.right.source.Init()
-	o.outputBatchSize = outBatchSize
-	// If there are no output columns, then the operator is for a COUNT query,
-	// in which case we treat the output batch size as the max int.
-	if o.output.Width() == 0 {
-		o.outputBatchSize = math.MaxInt64
-	}
-
 	o.proberState.lBufferedGroup.spillingQueue = newSpillingQueue(
 		o.unlimitedAllocator, o.left.sourceTypes, o.memoryLimit,
-		o.diskQueueCfg, o.fdSemaphore, coldata.BatchSize(), o.diskAcc,
+		o.diskQueueCfg, o.fdSemaphore, o.diskAcc,
 	)
-	o.proberState.lBufferedGroup.firstTuple = make([]coldata.Vec, len(o.left.sourceTypes))
-	for colIdx, t := range o.left.sourceTypes {
-		o.proberState.lBufferedGroup.firstTuple[colIdx] = o.unlimitedAllocator.NewMemColumn(t, 1)
-	}
+	o.proberState.lBufferedGroup.firstTuple = o.unlimitedAllocator.NewMemBatchWithFixedCapacity(
+		o.left.sourceTypes, 1, /* capacity */
+	).ColVecs()
 	o.proberState.rBufferedGroup.spillingQueue = newRewindableSpillingQueue(
 		o.unlimitedAllocator, o.right.sourceTypes, o.memoryLimit,
-		o.diskQueueCfg, o.fdSemaphore, coldata.BatchSize(), o.diskAcc,
+		o.diskQueueCfg, o.fdSemaphore, o.diskAcc,
 	)
-	o.proberState.rBufferedGroup.firstTuple = make([]coldata.Vec, len(o.right.sourceTypes))
-	for colIdx, t := range o.right.sourceTypes {
-		o.proberState.rBufferedGroup.firstTuple[colIdx] = o.unlimitedAllocator.NewMemColumn(t, 1)
-	}
+	o.proberState.rBufferedGroup.firstTuple = o.unlimitedAllocator.NewMemBatchWithFixedCapacity(
+		o.right.sourceTypes, 1, /* capacity */
+	).ColVecs()
 
 	o.builderState.lGroups = make([]group, 1)
 	o.builderState.rGroups = make([]group, 1)
@@ -596,29 +581,18 @@ func (o *mergeJoinBase) appendToBufferedGroup(
 	}
 	var (
 		bufferedGroup *mjBufferedGroup
-		scratchBatch  coldata.Batch
 		sourceTypes   []*types.T
 	)
 	if input == &o.left {
 		sourceTypes = o.left.sourceTypes
 		bufferedGroup = &o.proberState.lBufferedGroup
-		// TODO(yuzefovich): uncomment when spillingQueue actually copies the
-		// enqueued batches when those are kept in memory.
-		//if o.scratch.lBufferedGroupBatch == nil {
-		//	o.scratch.lBufferedGroupBatch = o.unlimitedAllocator.NewMemBatch(o.left.sourceTypes)
-		//}
-		//scratchBatch = o.scratch.lBufferedGroupBatch
 	} else {
 		sourceTypes = o.right.sourceTypes
 		bufferedGroup = &o.proberState.rBufferedGroup
-		// TODO(yuzefovich): uncomment when spillingQueue actually copies the
-		// enqueued batches when those are kept in memory.
-		//if o.scratch.rBufferedGroupBatch == nil {
-		//	o.scratch.rBufferedGroupBatch = o.unlimitedAllocator.NewMemBatch(o.right.sourceTypes)
-		//}
-		//scratchBatch = o.scratch.rBufferedGroupBatch
 	}
-	scratchBatch = o.unlimitedAllocator.NewMemBatchWithSize(sourceTypes, groupLength)
+	// TODO(yuzefovich): reuse the same scratch batches when spillingQueue
+	// actually copies the enqueued batch when those are kept in memory.
+	scratchBatch := o.unlimitedAllocator.NewMemBatchWithFixedCapacity(sourceTypes, groupLength)
 	if bufferedGroup.numTuples == 0 {
 		o.unlimitedAllocator.PerformOperation(bufferedGroup.firstTuple, func() {
 			for colIdx := range sourceTypes {

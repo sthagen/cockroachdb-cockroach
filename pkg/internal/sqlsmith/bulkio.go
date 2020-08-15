@@ -107,8 +107,8 @@ func makeBackup(s *Smither) (tree.Statement, bool) {
 	s.lock.Unlock()
 
 	return &tree.Backup{
-		Targets: targets,
-		To:      tree.PartitionedBackup{tree.NewStrVal(name)},
+		Targets: &targets,
+		To:      tree.StringOrPlaceholderOptList{tree.NewStrVal(name)},
 		AsOf:    makeAsOf(s),
 		Options: tree.BackupOptions{CaptureRevisionHistory: s.coin()},
 	}, true
@@ -141,13 +141,10 @@ func makeRestore(s *Smither) (tree.Statement, bool) {
 
 	return &tree.Restore{
 		Targets: targets,
-		From:    []tree.PartitionedBackup{{tree.NewStrVal(name)}},
+		From:    []tree.StringOrPlaceholderOptList{{tree.NewStrVal(name)}},
 		AsOf:    makeAsOf(s),
-		Options: tree.KVOptions{
-			tree.KVOption{
-				Key:   "into_db",
-				Value: tree.NewStrVal(string(db)),
-			},
+		Options: tree.RestoreOptions{
+			IntoDB: tree.NewDString("into_db"),
 		},
 	}, true
 }

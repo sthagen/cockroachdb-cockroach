@@ -27,7 +27,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/database"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -325,12 +327,12 @@ func makeMetrics(internal bool) Metrics {
 // Start starts the Server's background processing.
 func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
 	if s.cfg.Codec.ForSystemTenant() {
-		gossipUpdateC := s.cfg.Gossip.DeprecatedRegisterSystemConfigChannel(47150)
+		gossipUpdateC := s.cfg.SystemConfig.RegisterSystemConfigChannel()
 		stopper.RunWorker(ctx, func(ctx context.Context) {
 			for {
 				select {
 				case <-gossipUpdateC:
-					sysCfg := s.cfg.Gossip.DeprecatedSystemConfig(47150)
+					sysCfg := s.cfg.SystemConfig.GetSystemConfig()
 					s.dbCache.updateSystemConfig(sysCfg)
 				case <-stopper.ShouldStop():
 					return
@@ -528,7 +530,7 @@ func (s *Server) populateMinimalSessionData(sd *sessiondata.SessionData) {
 		}
 	}
 	if len(sd.SearchPath.GetPathArray()) == 0 {
-		sd.SearchPath = sqlbase.DefaultSearchPath
+		sd.SearchPath = catconstants.DefaultSearchPath
 	}
 }
 
@@ -632,16 +634,17 @@ func (s *Server) newConnExecutor(
 	ex.phaseTimes[sessionInit] = timeutil.Now()
 	ex.extraTxnState.prepStmtsNamespace = prepStmtNamespace{
 		prepStmts: make(map[string]*PreparedStatement),
-		portals:   make(map[string]*PreparedPortal),
+		portals:   make(map[string]PreparedPortal),
 	}
 	ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos = prepStmtNamespace{
 		prepStmts: make(map[string]*PreparedStatement),
-		portals:   make(map[string]*PreparedPortal),
+		portals:   make(map[string]PreparedPortal),
 	}
+	ex.extraTxnState.prepStmtsNamespaceMemAcc = ex.sessionMon.MakeBoundAccount()
 	ex.extraTxnState.descCollection = descs.MakeCollection(s.cfg.LeaseManager,
 		s.cfg.Settings, s.dbCache.getDatabaseCache(), s.dbCache)
 	ex.extraTxnState.txnRewindPos = -1
-	ex.extraTxnState.schemaChangeJobsCache = make(map[sqlbase.ID]*jobs.Job)
+	ex.extraTxnState.schemaChangeJobsCache = make(map[descpb.ID]*jobs.Job)
 	ex.mu.ActiveQueries = make(map[ClusterWideID]*queryMeta)
 	ex.machine = fsm.MakeMachine(TxnStateTransitions, stateNoTxn{}, &ex.state)
 
@@ -810,6 +813,28 @@ func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{})
 func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 	ex.sessionEventf(ctx, "finishing connExecutor")
 
+	txnEv := noEvent
+	if _, noTxn := ex.machine.CurState().(stateNoTxn); !noTxn {
+		txnEv = txnRollback
+	}
+
+	if closeType == normalClose {
+		// We'll cleanup the SQL txn by creating a non-retriable (commit:true) event.
+		// This event is guaranteed to be accepted in every state.
+		ev := eventNonRetriableErr{IsCommit: fsm.True}
+		payload := eventNonRetriableErrPayload{err: pgerror.Newf(pgcode.AdminShutdown,
+			"connExecutor closing")}
+		if err := ex.machine.ApplyWithPayload(ctx, ev, payload); err != nil {
+			log.Warningf(ctx, "error while cleaning up connExecutor: %s", err)
+		}
+	} else if closeType == externalTxnClose {
+		ex.state.finishExternalTxn()
+	}
+
+	if err := ex.resetExtraTxnState(ctx, ex.server.dbCache, txnEv); err != nil {
+		log.Warningf(ctx, "error while cleaning up connExecutor: %s", err)
+	}
+
 	if ex.hasCreatedTemporarySchema && !ex.server.cfg.TestingKnobs.DisableTempObjectsCleanupOnSessionExit {
 		ie := MakeInternalExecutor(ctx, ex.server, MemoryMetrics{}, ex.server.cfg.Settings)
 		err := cleanupSessionTempObjects(
@@ -830,32 +855,15 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 		}
 	}
 
-	ev := noEvent
-	if _, noTxn := ex.machine.CurState().(stateNoTxn); !noTxn {
-		ev = txnRollback
-	}
-
-	if closeType == normalClose {
-		// We'll cleanup the SQL txn by creating a non-retriable (commit:true) event.
-		// This event is guaranteed to be accepted in every state.
-		ev := eventNonRetriableErr{IsCommit: fsm.True}
-		payload := eventNonRetriableErrPayload{err: pgerror.Newf(pgcode.AdminShutdown,
-			"connExecutor closing")}
-		if err := ex.machine.ApplyWithPayload(ctx, ev, payload); err != nil {
-			log.Warningf(ctx, "error while cleaning up connExecutor: %s", err)
-		}
-	} else if closeType == externalTxnClose {
-		ex.state.finishExternalTxn()
-	}
-
-	if err := ex.resetExtraTxnState(ctx, ex.server.dbCache, ev); err != nil {
-		log.Warningf(ctx, "error while cleaning up connExecutor: %s", err)
-	}
-
 	if closeType != panicClose {
 		// Close all statements and prepared portals.
-		ex.extraTxnState.prepStmtsNamespace.resetTo(ctx, prepStmtNamespace{})
-		ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.resetTo(ctx, prepStmtNamespace{})
+		ex.extraTxnState.prepStmtsNamespace.resetTo(
+			ctx, prepStmtNamespace{}, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+		)
+		ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.resetTo(
+			ctx, prepStmtNamespace{}, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+		)
+		ex.extraTxnState.prepStmtsNamespaceMemAcc.Close(ctx)
 	}
 
 	if ex.sessionTracing.Enabled() {
@@ -950,7 +958,7 @@ type connExecutor struct {
 		// schemaChangeJobsCache is a map of descriptor IDs to Jobs.
 		// Used in createOrUpdateSchemaChangeJob so we can check if a job has been
 		// queued up for the given ID.
-		schemaChangeJobsCache map[sqlbase.ID]*jobs.Job
+		schemaChangeJobsCache map[descpb.ID]*jobs.Job
 
 		// autoRetryCounter keeps track of the which iteration of a transaction
 		// auto-retry we're currently in. It's 0 whenever the transaction state is not
@@ -989,6 +997,12 @@ type connExecutor struct {
 		// txnRewindPos is advanced. Prepared statements are shared between the two
 		// collections, but these collections are periodically reconciled.
 		prepStmtsNamespaceAtTxnRewindPos prepStmtNamespace
+
+		// prepStmtsNamespaceMemAcc is the memory account that is shared
+		// between prepStmtsNamespace and prepStmtsNamespaceAtTxnRewindPos. It
+		// tracks the memory usage of portals and should be closed upon
+		// connExecutor's closure.
+		prepStmtsNamespaceMemAcc mon.BoundAccount
 
 		// onTxnFinish (if non-nil) will be called when txn is finished (either
 		// committed or aborted). It is set when txn is started but can remain
@@ -1136,7 +1150,7 @@ type prepStmtNamespace struct {
 	// session.
 	prepStmts map[string]*PreparedStatement
 	// portals contains the portals currently available on the session.
-	portals map[string]*PreparedPortal
+	portals map[string]PreparedPortal
 }
 
 func (ns prepStmtNamespace) String() string {
@@ -1156,13 +1170,15 @@ func (ns prepStmtNamespace) String() string {
 // references are release and all the to's references are duplicated.
 //
 // An empty `to` can be passed in to deallocate everything.
-func (ns *prepStmtNamespace) resetTo(ctx context.Context, to prepStmtNamespace) {
+func (ns *prepStmtNamespace) resetTo(
+	ctx context.Context, to prepStmtNamespace, prepStmtsNamespaceMemAcc *mon.BoundAccount,
+) {
 	for name, p := range ns.prepStmts {
 		p.decRef(ctx)
 		delete(ns.prepStmts, name)
 	}
 	for name, p := range ns.portals {
-		p.decRef(ctx)
+		p.decRef(ctx, prepStmtsNamespaceMemAcc, name)
 		delete(ns.portals, name)
 	}
 
@@ -1188,12 +1204,12 @@ func (ex *connExecutor) resetExtraTxnState(
 	}
 
 	ex.extraTxnState.descCollection.ReleaseAll(ctx)
-
 	ex.extraTxnState.descCollection.ResetDatabaseCache(dbCacheHolder.getDatabaseCache())
+	ex.extraTxnState.descCollection.ResetSchemaCache()
 
 	// Close all portals.
 	for name, p := range ex.extraTxnState.prepStmtsNamespace.portals {
-		p.decRef(ctx)
+		p.decRef(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc, name)
 		delete(ex.extraTxnState.prepStmtsNamespace.portals, name)
 	}
 
@@ -1398,10 +1414,11 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 		// ExecPortal is handled like ExecStmt, except that the placeholder info
 		// is taken from the portal.
 
-		portal, ok := ex.extraTxnState.prepStmtsNamespace.portals[tcmd.Name]
+		portalName := tcmd.Name
+		portal, ok := ex.extraTxnState.prepStmtsNamespace.portals[portalName]
 		if !ok {
 			err := pgerror.Newf(
-				pgcode.InvalidCursorName, "unknown portal %q", tcmd.Name)
+				pgcode.InvalidCursorName, "unknown portal %q", portalName)
 			ev = eventNonRetriableErr{IsCommit: fsm.False}
 			payload = eventNonRetriableErrPayload{err: err}
 			res = ex.clientComm.CreateErrorResult(pos)
@@ -1441,18 +1458,11 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 			pos, portal.OutFormats,
 			ex.sessionData.DataConversion,
 			tcmd.Limit,
-			tcmd.Name,
+			portalName,
 			ex.implicitTxn(),
 		)
 		res = stmtRes
-		curStmt := Statement{
-			Statement:     portal.Stmt.Statement,
-			Prepared:      portal.Stmt,
-			ExpectedTypes: portal.Stmt.Columns,
-			AnonymizedStr: portal.Stmt.AnonymizedStr,
-		}
-		stmtCtx := withStatement(ctx, ex.curStmt)
-		ev, payload, err = ex.execStmt(stmtCtx, curStmt, stmtRes, pinfo)
+		ev, payload, err = ex.execPortal(ctx, portal, portalName, stmtRes, pinfo)
 		if err != nil {
 			return err
 		}
@@ -1773,13 +1783,20 @@ func (ex *connExecutor) execCopyIn(
 	}
 
 	// If we're in an explicit txn, then the copying will be done within that
-	// txn. Otherwise, we tell the copyMachine to manage its own transactions.
+	// txn. Otherwise, we tell the copyMachine to manage its own transactions
+	// and give it a closure to reset the accumulated extraTxnState.
 	var txnOpt copyTxnOpt
 	if isOpen {
 		txnOpt = copyTxnOpt{
 			txn:           ex.state.mu.txn,
 			txnTimestamp:  ex.state.sqlTimestamp,
 			stmtTimestamp: ex.server.cfg.Clock.PhysicalTime(),
+		}
+	} else {
+		txnOpt = copyTxnOpt{
+			resetExtraTxnState: func(ctx context.Context) error {
+				return ex.resetExtraTxnState(ctx, ex.server.dbCache, noEvent)
+			},
 		}
 	}
 
@@ -1858,14 +1875,16 @@ func (ex *connExecutor) generateID() ClusterWideID {
 // prepStmtsNamespaceAtTxnRewindPos that's not part of prepStmtsNamespace.
 func (ex *connExecutor) commitPrepStmtNamespace(ctx context.Context) {
 	ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.resetTo(
-		ctx, ex.extraTxnState.prepStmtsNamespace)
+		ctx, ex.extraTxnState.prepStmtsNamespace, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+	)
 }
 
 // commitPrepStmtNamespace deallocates everything in prepStmtsNamespace that's
 // not part of prepStmtsNamespaceAtTxnRewindPos.
 func (ex *connExecutor) rewindPrepStmtNamespace(ctx context.Context) {
 	ex.extraTxnState.prepStmtsNamespace.resetTo(
-		ctx, ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos)
+		ctx, ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+	)
 }
 
 // getRewindTxnCapability checks whether rewinding to the position previously
@@ -2025,7 +2044,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			ReCache:            ex.server.reCache,
 			InternalExecutor:   &ie,
 			DB:                 ex.server.cfg.DB,
-			TypeResolver:       p,
+			SQLLivenessReader:  ex.server.cfg.SQLLivenessReader,
 		},
 		SessionMutator:       ex.dataMutator,
 		VirtualSchemas:       ex.server.cfg.VirtualSchemas,
@@ -2580,7 +2599,9 @@ func (ps connExPrepStmtsAccessor) Delete(ctx context.Context, name string) bool 
 
 // DeleteAll is part of the preparedStatementsAccessor interface.
 func (ps connExPrepStmtsAccessor) DeleteAll(ctx context.Context) {
-	ps.ex.extraTxnState.prepStmtsNamespace.resetTo(ctx, prepStmtNamespace{})
+	ps.ex.extraTxnState.prepStmtsNamespace.resetTo(
+		ctx, prepStmtNamespace{}, &ps.ex.extraTxnState.prepStmtsNamespaceMemAcc,
+	)
 }
 
 // contextStatementKey is an empty type for the handle associated with the

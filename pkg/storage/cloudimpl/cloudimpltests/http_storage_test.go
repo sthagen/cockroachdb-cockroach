@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -246,7 +247,7 @@ func TestHttpGet(t *testing.T) {
 				return nil
 			})
 
-			store, err := cloudimpl.MakeHTTPStorage(s.URL, testSettings)
+			store, err := cloudimpl.MakeHTTPStorage(s.URL, testSettings, base.ExternalIODirConfig{})
 			require.NoError(t, err)
 
 			var file io.ReadCloser
@@ -281,7 +282,7 @@ func TestHttpGetWithCancelledContext(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer s.Close()
 
-	store, err := cloudimpl.MakeHTTPStorage(s.URL, testSettings)
+	store, err := cloudimpl.MakeHTTPStorage(s.URL, testSettings, base.ExternalIODirConfig{})
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, store.Close())
@@ -338,4 +339,51 @@ func TestExternalStorageCanUseHTTPProxy(t *testing.T) {
 	require.NoError(t, err)
 
 	require.EqualValues(t, "proxied-http://my-server/file", string(data))
+}
+
+type alwaysRefuseConnectionDialer struct {
+	net.Dialer
+}
+
+func (d *alwaysRefuseConnectionDialer) DialContext(
+	_ context.Context, _, _ string,
+) (net.Conn, error) {
+	return nil, econnrefused
+}
+
+func TestExhaustRetries(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Override DialContext implementation in http transport.
+	dialer := &alwaysRefuseConnectionDialer{}
+
+	// Override transport to return antagonistic connection.
+	transport := http.DefaultTransport.(*http.Transport)
+	transport.DialContext =
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, addr)
+		}
+
+	defer func() {
+		transport.DialContext = nil
+	}()
+
+	// Override retry options to retry faster.
+	defer func(opts retry.Options) {
+		cloudimpl.HTTPRetryOptions = opts
+	}(cloudimpl.HTTPRetryOptions)
+
+	cloudimpl.HTTPRetryOptions.InitialBackoff = 1 * time.Microsecond
+	cloudimpl.HTTPRetryOptions.MaxBackoff = 10 * time.Millisecond
+	cloudimpl.HTTPRetryOptions.MaxRetries = 10
+
+	store, err := cloudimpl.MakeHTTPStorage(
+		"http://does.not.matter", testSettings, base.ExternalIODirConfig{})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, store.Close())
+	}()
+
+	_, err = store.ReadFile(context.Background(), "/something")
+	require.Error(t, err)
 }

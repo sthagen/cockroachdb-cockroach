@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -34,16 +35,52 @@ type createIndexNode struct {
 	tableDesc *sqlbase.MutableTableDescriptor
 }
 
+type indexStorageParamObserver struct{}
+
+var _ storageParamObserver = (*indexStorageParamObserver)(nil)
+
+func (a *indexStorageParamObserver) apply(
+	evalCtx *tree.EvalContext, key string, expr tree.Datum,
+) error {
+	switch key {
+	case `fillfactor`:
+		return applyFillFactorStorageParam(evalCtx, key, expr)
+	case `vacuum_cleanup_index_scale_factor`,
+		`buffering`,
+		`fastupdate`,
+		`gin_pending_list_limit`,
+		`pages_per_range`,
+		`autosummarize`:
+		return unimplemented.NewWithIssuef(43299, "storage parameter %q", key)
+	}
+	return errors.Errorf("invalid storage parameter %q", key)
+}
+
 // CreateIndex creates an index.
 // Privileges: CREATE on table.
 //   notes: postgres requires CREATE on the table.
 //          mysql requires INDEX on the table.
 func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNode, error) {
 	tableDesc, err := p.ResolveMutableTableDescriptor(
-		ctx, &n.Table, true /*required*/, tree.ResolveRequireTableDesc,
+		ctx, &n.Table, true /*required*/, tree.ResolveRequireTableOrViewDesc,
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	if tableDesc.IsView() && !tableDesc.MaterializedView() {
+		return nil, pgerror.Newf(pgcode.WrongObjectType, "%q is not a table or materialized view", tableDesc.Name)
+	}
+
+	if tableDesc.MaterializedView() {
+		if n.Interleave != nil {
+			return nil, pgerror.New(pgcode.InvalidObjectDefinition,
+				"cannot create interleaved index on materialized view")
+		}
+		if n.Sharded != nil {
+			return nil, pgerror.New(pgcode.InvalidObjectDefinition,
+				"cannot create hash sharded index on materialized view")
+		}
 	}
 
 	if err := p.CheckPrivilege(ctx, tableDesc, privilege.CREATE); err != nil {
@@ -61,7 +98,7 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 func (p *planner) setupFamilyAndConstraintForShard(
 	ctx context.Context,
 	tableDesc *MutableTableDescriptor,
-	shardCol *sqlbase.ColumnDescriptor,
+	shardCol *descpb.ColumnDescriptor,
 	idxColumns []string,
 	buckets int32,
 ) error {
@@ -94,7 +131,7 @@ func (p *planner) setupFamilyAndConstraintForShard(
 		inuseNames[k] = struct{}{}
 	}
 
-	ckBuilder := schemaexpr.NewCheckConstraintBuilder(ctx, p.tableName, tableDesc, &p.semaCtx)
+	ckBuilder := schemaexpr.MakeCheckConstraintBuilder(ctx, p.tableName, tableDesc, &p.semaCtx)
 	ckName, err := ckBuilder.DefaultName(ckDef.Expr)
 	if err != nil {
 		return err
@@ -106,8 +143,8 @@ func (p *planner) setupFamilyAndConstraintForShard(
 		if err != nil {
 			return err
 		}
-		ck.Validity = sqlbase.ConstraintValidity_Validating
-		tableDesc.AddCheckMutation(ck, sqlbase.DescriptorMutation_ADD)
+		ck.Validity = descpb.ConstraintValidity_Validating
+		tableDesc.AddCheckMutation(ck, descpb.DescriptorMutation_ADD)
 	}
 	return nil
 }
@@ -118,7 +155,7 @@ func (p *planner) setupFamilyAndConstraintForShard(
 // a hash sharded index.
 func MakeIndexDescriptor(
 	params runParams, n *tree.CreateIndex, tableDesc *sqlbase.MutableTableDescriptor,
-) (*sqlbase.IndexDescriptor, error) {
+) (*descpb.IndexDescriptor, error) {
 	// Ensure that the columns we want to index exist before trying to create the
 	// index.
 	if err := validateIndexColumnsExist(tableDesc, n.Columns); err != nil {
@@ -129,7 +166,7 @@ func MakeIndexDescriptor(
 	if err := tableDesc.ValidateIndexNameIsUnique(string(n.Name)); err != nil {
 		return nil, err
 	}
-	indexDesc := sqlbase.IndexDescriptor{
+	indexDesc := descpb.IndexDescriptor{
 		Name:              string(n.Name),
 		Unique:            n.Unique,
 		StoreColumnNames:  n.Storing.ToStrings(),
@@ -156,7 +193,7 @@ func MakeIndexDescriptor(
 		if n.Unique {
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes can't be unique")
 		}
-		indexDesc.Type = sqlbase.IndexDescriptor_INVERTED
+		indexDesc.Type = descpb.IndexDescriptor_INVERTED
 		columnDesc, _, err := tableDesc.FindColumnByName(n.Columns[0].Column)
 		if err != nil {
 			return nil, err
@@ -208,20 +245,29 @@ func MakeIndexDescriptor(
 	if n.Predicate != nil {
 		// TODO(mgartner): remove this once partial indexes are fully supported.
 		if !params.SessionData().PartialIndexes {
-			return nil, unimplemented.NewWithIssue(9683, "partial indexes are not supported")
+			return nil, pgerror.Newf(pgcode.FeatureNotSupported,
+				"session variable experimental_partial_indexes is set to false, cannot create a partial index")
 		}
 
-		idxValidator := schemaexpr.NewIndexPredicateValidator(params.ctx, n.Table, tableDesc, &params.p.semaCtx)
+		idxValidator := schemaexpr.MakeIndexPredicateValidator(params.ctx, n.Table, tableDesc, &params.p.semaCtx)
 		expr, err := idxValidator.Validate(n.Predicate)
 		if err != nil {
 			return nil, err
 		}
-
-		// Store the serialized predicate expression in the IndexDescriptor.
-		indexDesc.Predicate = tree.Serialize(expr)
+		indexDesc.Predicate = expr
 	}
 
 	if err := indexDesc.FillColumns(n.Columns); err != nil {
+		return nil, err
+	}
+
+	if err := applyStorageParameters(
+		params.ctx,
+		params.p.SemaCtx(),
+		params.EvalContext(),
+		n.StorageParams,
+		&indexStorageParamObserver{},
+	); err != nil {
 		return nil, err
 	}
 	return &indexDesc, nil
@@ -263,9 +309,9 @@ func setupShardedIndex(
 	columns *tree.IndexElemList,
 	bucketsExpr tree.Expr,
 	tableDesc *sqlbase.MutableTableDescriptor,
-	indexDesc *sqlbase.IndexDescriptor,
+	indexDesc *descpb.IndexDescriptor,
 	isNewTable bool,
-) (shard *sqlbase.ColumnDescriptor, newColumn bool, err error) {
+) (shard *descpb.ColumnDescriptor, newColumn bool, err error) {
 	st := evalCtx.Settings
 	if !st.Version.IsActive(ctx, clusterversion.VersionHashShardedIndexes) {
 		return nil, false, invalidClusterForShardedIndexError
@@ -292,7 +338,7 @@ func setupShardedIndex(
 		Direction: tree.Ascending,
 	}
 	*columns = append(tree.IndexElemList{shardIdxElem}, *columns...)
-	indexDesc.Sharded = sqlbase.ShardedDescriptor{
+	indexDesc.Sharded = descpb.ShardedDescriptor{
 		IsSharded:    true,
 		Name:         shardCol.Name,
 		ShardBuckets: buckets,
@@ -306,7 +352,7 @@ func setupShardedIndex(
 // buckets.
 func maybeCreateAndAddShardCol(
 	shardBuckets int, desc *sqlbase.MutableTableDescriptor, colNames []string, isNewTable bool,
-) (col *sqlbase.ColumnDescriptor, created bool, err error) {
+) (col *descpb.ColumnDescriptor, created bool, err error) {
 	shardCol, err := makeShardColumnDesc(colNames, shardBuckets)
 	if err != nil {
 		return nil, false, err
@@ -332,7 +378,7 @@ func maybeCreateAndAddShardCol(
 		if isNewTable {
 			desc.AddColumn(shardCol)
 		} else {
-			desc.AddColumnMutation(shardCol, sqlbase.DescriptorMutation_ADD)
+			desc.AddColumnMutation(shardCol, descpb.DescriptorMutation_ADD)
 		}
 		created = true
 	}
@@ -383,9 +429,9 @@ func (n *createIndexNode) startExec(params runParams) error {
 
 	// If all nodes in the cluster know how to handle secondary indexes with column families,
 	// write the new version into the index descriptor.
-	encodingVersion := sqlbase.BaseIndexFormatVersion
+	encodingVersion := descpb.BaseIndexFormatVersion
 	if params.p.EvalContext().Settings.Version.IsActive(params.ctx, clusterversion.VersionSecondaryIndexColumnFamilies) {
-		encodingVersion = sqlbase.SecondaryIndexFamilyFormatVersion
+		encodingVersion = descpb.SecondaryIndexFamilyFormatVersion
 	}
 	indexDesc.Version = encodingVersion
 
@@ -399,7 +445,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 	}
 
 	mutationIdx := len(n.tableDesc.Mutations)
-	if err := n.tableDesc.AddIndexMutation(indexDesc, sqlbase.DescriptorMutation_ADD); err != nil {
+	if err := n.tableDesc.AddIndexMutation(indexDesc, descpb.DescriptorMutation_ADD); err != nil {
 		return err
 	}
 	if err := n.tableDesc.AllocateIDs(); err != nil {

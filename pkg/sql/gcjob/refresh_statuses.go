@@ -24,6 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -36,9 +38,9 @@ import (
 func refreshTables(
 	ctx context.Context,
 	execCfg *sql.ExecutorConfig,
-	tableIDs []sqlbase.ID,
-	tableDropTimes map[sqlbase.ID]int64,
-	indexDropTimes map[sqlbase.IndexID]int64,
+	tableIDs []descpb.ID,
+	tableDropTimes map[descpb.ID]int64,
+	indexDropTimes map[descpb.IndexID]int64,
 	jobID int64,
 	progress *jobspb.SchemaChangeGCProgress,
 ) (expired bool, earliestDeadline time.Time) {
@@ -75,19 +77,19 @@ func refreshTables(
 func updateStatusForGCElements(
 	ctx context.Context,
 	execCfg *sql.ExecutorConfig,
-	tableID sqlbase.ID,
-	tableDropTimes map[sqlbase.ID]int64,
-	indexDropTimes map[sqlbase.IndexID]int64,
+	tableID descpb.ID,
+	tableDropTimes map[descpb.ID]int64,
+	indexDropTimes map[descpb.IndexID]int64,
 	progress *jobspb.SchemaChangeGCProgress,
 ) (expired bool, timeToNextTrigger time.Time) {
 	defTTL := execCfg.DefaultZoneConfig.GC.TTLSeconds
-	cfg := execCfg.Gossip.DeprecatedSystemConfig(47150)
+	cfg := execCfg.SystemConfig.GetSystemConfig()
 	protectedtsCache := execCfg.ProtectedTimestampProvider
 
 	earliestDeadline := timeutil.Unix(0, int64(math.MaxInt64))
 
 	if err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		table, err := sqlbase.GetTableDescFromID(ctx, txn, execCfg.Codec, tableID)
+		table, err := catalogkv.MustGetTableDescByID(ctx, txn, execCfg.Codec, tableID)
 		if err != nil {
 			return err
 		}
@@ -134,8 +136,8 @@ func updateTableStatus(
 	execCfg *sql.ExecutorConfig,
 	ttlSeconds int64,
 	protectedtsCache protectedts.Cache,
-	table *sqlbase.TableDescriptor,
-	tableDropTimes map[sqlbase.ID]int64,
+	table *sqlbase.ImmutableTableDescriptor,
+	tableDropTimes map[descpb.ID]int64,
 	progress *jobspb.SchemaChangeGCProgress,
 ) time.Time {
 	deadline := timeutil.Unix(0, int64(math.MaxInt64))
@@ -179,10 +181,10 @@ func updateIndexesStatus(
 	ctx context.Context,
 	execCfg *sql.ExecutorConfig,
 	tableTTL int32,
-	table *sqlbase.TableDescriptor,
+	table *sqlbase.ImmutableTableDescriptor,
 	protectedtsCache protectedts.Cache,
 	zoneCfg *zonepb.ZoneConfig,
-	indexDropTimes map[sqlbase.IndexID]int64,
+	indexDropTimes map[descpb.IndexID]int64,
 	progress *jobspb.SchemaChangeGCProgress,
 ) (expired bool, soonestDeadline time.Time) {
 	// Update the deadline for indexes that are being dropped, if any.
@@ -224,7 +226,7 @@ func updateIndexesStatus(
 
 // Helpers.
 
-func getIndexTTL(tableTTL int32, placeholder *zonepb.ZoneConfig, indexID sqlbase.IndexID) int32 {
+func getIndexTTL(tableTTL int32, placeholder *zonepb.ZoneConfig, indexID descpb.IndexID) int32 {
 	ttlSeconds := tableTTL
 	if placeholder != nil {
 		if subzone := placeholder.GetSubzone(
@@ -270,8 +272,8 @@ func isProtected(
 func setupConfigWatcher(
 	execCfg *sql.ExecutorConfig,
 ) (gossip.SystemConfigDeltaFilter, <-chan struct{}) {
-	k := execCfg.Codec.IndexPrefix(uint32(keys.ZonesTableID), uint32(keys.ZonesTablePrimaryIndexID))
+	k := execCfg.Codec.IndexPrefix(keys.ZonesTableID, keys.ZonesTablePrimaryIndexID)
 	zoneCfgFilter := gossip.MakeSystemConfigDeltaFilter(k)
-	gossipUpdateC := execCfg.Gossip.DeprecatedRegisterSystemConfigChannel(47150)
+	gossipUpdateC := execCfg.SystemConfig.RegisterSystemConfigChannel()
 	return zoneCfgFilter, gossipUpdateC
 }

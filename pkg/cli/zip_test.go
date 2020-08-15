@@ -32,7 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -74,6 +74,7 @@ table_name NOT IN (
 	'index_columns',
 	'table_columns',
 	'table_indexes',
+	'table_row_statistics',
 	'ranges',
 	'ranges_no_leases',
 	'predefined_comments',
@@ -230,8 +231,8 @@ func TestUnavailableZip(t *testing.T) {
 		t:          t,
 		TestServer: tc.Server(0).(*server.TestServer),
 	}
+	defer func(prevStderr *os.File) { stderr = prevStderr }(stderr)
 	stderr = os.Stdout
-	defer func() { stderr = log.OrigStderr }()
 
 	// Keep the timeout short so that the test doesn't take forever.
 	out, err := c.RunWithCapture("debug zip --cpu-profile-duration=0 " + os.DevNull + " --timeout=.5s")
@@ -304,8 +305,8 @@ func TestPartialZip(t *testing.T) {
 		t:          t,
 		TestServer: tc.Server(0).(*server.TestServer),
 	}
+	defer func(prevStderr *os.File) { stderr = prevStderr }(stderr)
 	stderr = os.Stdout
-	defer func() { stderr = log.OrigStderr }()
 
 	// NB: we spend a second profiling here to make sure it actually tries the
 	// down nodes (and fails only there, succeeding on the available node).
@@ -488,7 +489,7 @@ func TestToHex(t *testing.T) {
 			{idx: -1, msg: &jobspb.Progress{}},
 		},
 		"debug/system.descriptor.txt": {
-			{idx: 2, msg: &sqlbase.Descriptor{}},
+			{idx: 2, msg: &descpb.Descriptor{}},
 		},
 	}
 

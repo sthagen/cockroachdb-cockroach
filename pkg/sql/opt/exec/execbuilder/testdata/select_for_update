@@ -19,6 +19,7 @@ EXPLAIN SELECT * FROM t FOR UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -29,6 +30,7 @@ EXPLAIN SELECT * FROM t FOR NO KEY UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for no key update
@@ -39,6 +41,7 @@ EXPLAIN SELECT * FROM t FOR SHARE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for share
@@ -49,6 +52,7 @@ EXPLAIN SELECT * FROM t FOR KEY SHARE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for key share
@@ -59,6 +63,7 @@ EXPLAIN SELECT * FROM t FOR KEY SHARE FOR SHARE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for share
@@ -69,6 +74,7 @@ EXPLAIN SELECT * FROM t FOR KEY SHARE FOR SHARE FOR NO KEY UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for no key update
@@ -79,6 +85,7 @@ EXPLAIN SELECT * FROM t FOR KEY SHARE FOR SHARE FOR NO KEY UPDATE FOR UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -89,6 +96,7 @@ EXPLAIN SELECT * FROM t FOR UPDATE OF t
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -103,6 +111,7 @@ EXPLAIN SELECT 1 FROM t FOR UPDATE OF t
 ·          vectorized        true
 render     ·                 ·
  └── scan  ·                 ·
+·          missing stats     ·
 ·          table             t@primary
 ·          spans             FULL SCAN
 ·          locking strength  for update
@@ -113,6 +122,7 @@ EXPLAIN SELECT * FROM t WHERE a = 1 FOR UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             /1-/1/#
 ·     locking strength  for update
@@ -123,6 +133,7 @@ EXPLAIN SELECT * FROM t WHERE a = 1 FOR NO KEY UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             /1-/1/#
 ·     locking strength  for no key update
@@ -133,6 +144,7 @@ EXPLAIN SELECT * FROM t WHERE a = 1 FOR SHARE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             /1-/1/#
 ·     locking strength  for share
@@ -143,6 +155,7 @@ EXPLAIN SELECT * FROM t WHERE a = 1 FOR KEY SHARE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             /1-/1/#
 ·     locking strength  for key share
@@ -153,6 +166,7 @@ EXPLAIN SELECT * FROM t WHERE a = 1 FOR KEY SHARE FOR SHARE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             /1-/1/#
 ·     locking strength  for share
@@ -163,6 +177,7 @@ EXPLAIN SELECT * FROM t WHERE a = 1 FOR KEY SHARE FOR SHARE FOR NO KEY UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             /1-/1/#
 ·     locking strength  for no key update
@@ -173,6 +188,7 @@ EXPLAIN SELECT * FROM t WHERE a = 1 FOR KEY SHARE FOR SHARE FOR NO KEY UPDATE FO
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             /1-/1/#
 ·     locking strength  for update
@@ -183,6 +199,7 @@ EXPLAIN SELECT * FROM t WHERE a = 1 FOR UPDATE OF t
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             /1-/1/#
 ·     locking strength  for update
@@ -197,6 +214,7 @@ EXPLAIN SELECT 1 FROM t WHERE a = 1 FOR UPDATE OF t
 ·          vectorized        true
 render     ·                 ·
  └── scan  ·                 ·
+·          missing stats     ·
 ·          table             t@primary
 ·          spans             /1-/1/#
 ·          locking strength  for update
@@ -211,6 +229,7 @@ EXPLAIN SELECT * FROM t AS t2 FOR UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -224,6 +243,7 @@ EXPLAIN SELECT * FROM t AS t2 FOR UPDATE OF t2
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -239,6 +259,7 @@ EXPLAIN SELECT * FROM [53 AS t] FOR UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -249,6 +270,7 @@ EXPLAIN SELECT * FROM [53 AS t] FOR UPDATE OF t
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -266,6 +288,7 @@ EXPLAIN SELECT * FROM v FOR UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -276,6 +299,7 @@ EXPLAIN SELECT * FROM v FOR UPDATE OF v
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -299,6 +323,7 @@ EXPLAIN SELECT * FROM v AS v2 FOR UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -312,6 +337,7 @@ EXPLAIN SELECT * FROM v AS v2 FOR UPDATE OF v2
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -330,6 +356,7 @@ EXPLAIN SELECT * FROM (SELECT a FROM t) FOR UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -340,6 +367,7 @@ EXPLAIN SELECT * FROM (SELECT a FROM t FOR UPDATE)
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -350,6 +378,7 @@ EXPLAIN SELECT * FROM (SELECT a FROM t FOR NO KEY UPDATE) FOR KEY SHARE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for no key update
@@ -360,6 +389,7 @@ EXPLAIN SELECT * FROM (SELECT a FROM t FOR KEY SHARE) FOR NO KEY UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for no key update
@@ -373,6 +403,7 @@ EXPLAIN SELECT * FROM (SELECT a FROM t FOR UPDATE OF t)
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -383,6 +414,7 @@ EXPLAIN SELECT * FROM (SELECT a FROM t) AS r FOR UPDATE
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -393,6 +425,7 @@ EXPLAIN SELECT * FROM (SELECT a FROM t FOR UPDATE) AS r
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -406,6 +439,7 @@ EXPLAIN SELECT * FROM (SELECT a FROM t FOR UPDATE OF t) AS r
 ·     distribution      local
 ·     vectorized        true
 scan  ·                 ·
+·     missing stats     ·
 ·     table             t@primary
 ·     spans             FULL SCAN
 ·     locking strength  for update
@@ -413,19 +447,20 @@ scan  ·                 ·
 query TTT
 EXPLAIN SELECT (SELECT a FROM t) FOR UPDATE
 ----
-·                    distribution  local
-·                    vectorized    false
-root                 ·             ·
- ├── values          ·             ·
- │                   size          1 column, 1 row
- └── subquery        ·             ·
-      │              id            @S1
-      │              original sql  (SELECT a FROM t)
-      │              exec mode     one row
-      └── max1row    ·             ·
-           └── scan  ·             ·
-·                    table         t@primary
-·                    spans         FULL SCAN
+·                    distribution   local
+·                    vectorized     false
+root                 ·              ·
+ ├── values          ·              ·
+ │                   size           1 column, 1 row
+ └── subquery        ·              ·
+      │              id             @S1
+      │              original sql   (SELECT a FROM t)
+      │              exec mode      one row
+      └── max1row    ·              ·
+           └── scan  ·              ·
+·                    missing stats  ·
+·                    table          t@primary
+·                    spans          FULL SCAN
 
 query TTT
 EXPLAIN SELECT (SELECT a FROM t FOR UPDATE)
@@ -441,6 +476,7 @@ root                 ·                 ·
       │              exec mode         one row
       └── max1row    ·                 ·
            └── scan  ·                 ·
+·                    missing stats     ·
 ·                    table             t@primary
 ·                    spans             FULL SCAN
 ·                    locking strength  for update
@@ -462,6 +498,7 @@ root                 ·                 ·
       │              exec mode         one row
       └── max1row    ·                 ·
            └── scan  ·                 ·
+·                    missing stats     ·
 ·                    table             t@primary
 ·                    spans             FULL SCAN
 ·                    locking strength  for update
@@ -469,19 +506,20 @@ root                 ·                 ·
 query TTT
 EXPLAIN SELECT (SELECT a FROM t) AS r FOR UPDATE
 ----
-·                    distribution  local
-·                    vectorized    false
-root                 ·             ·
- ├── values          ·             ·
- │                   size          1 column, 1 row
- └── subquery        ·             ·
-      │              id            @S1
-      │              original sql  (SELECT a FROM t)
-      │              exec mode     one row
-      └── max1row    ·             ·
-           └── scan  ·             ·
-·                    table         t@primary
-·                    spans         FULL SCAN
+·                    distribution   local
+·                    vectorized     false
+root                 ·              ·
+ ├── values          ·              ·
+ │                   size           1 column, 1 row
+ └── subquery        ·              ·
+      │              id             @S1
+      │              original sql   (SELECT a FROM t)
+      │              exec mode      one row
+      └── max1row    ·              ·
+           └── scan  ·              ·
+·                    missing stats  ·
+·                    table          t@primary
+·                    spans          FULL SCAN
 
 query TTT
 EXPLAIN SELECT (SELECT a FROM t FOR UPDATE) AS r
@@ -497,6 +535,7 @@ root                 ·                 ·
       │              exec mode         one row
       └── max1row    ·                 ·
            └── scan  ·                 ·
+·                    missing stats     ·
 ·                    table             t@primary
 ·                    spans             FULL SCAN
 ·                    locking strength  for update
@@ -518,6 +557,7 @@ root                 ·                 ·
       │              exec mode         one row
       └── max1row    ·                 ·
            └── scan  ·                 ·
+·                    missing stats     ·
 ·                    table             t@primary
 ·                    spans             FULL SCAN
 ·                    locking strength  for update
@@ -527,8 +567,8 @@ EXPLAIN SELECT * FROM t WHERE a IN (SELECT b FROM t) FOR UPDATE
 ----
 ·                    distribution           local
 ·                    vectorized             true
-render               ·                      ·
- └── lookup-join     ·                      ·
+project              ·                      ·
+ └── lookup join     ·                      ·
       │              table                  t@primary
       │              type                   inner
       │              equality               (b) = (a)
@@ -537,6 +577,7 @@ render               ·                      ·
       └── distinct   ·                      ·
            │         distinct on            b
            └── scan  ·                      ·
+·                    missing stats          ·
 ·                    table                  t@primary
 ·                    spans                  FULL SCAN
 
@@ -545,8 +586,8 @@ EXPLAIN SELECT * FROM t WHERE a IN (SELECT b FROM t FOR UPDATE)
 ----
 ·                    distribution           local
 ·                    vectorized             true
-render               ·                      ·
- └── lookup-join     ·                      ·
+project              ·                      ·
+ └── lookup join     ·                      ·
       │              table                  t@primary
       │              type                   inner
       │              equality               (b) = (a)
@@ -555,6 +596,7 @@ render               ·                      ·
       └── distinct   ·                      ·
            │         distinct on            b
            └── scan  ·                      ·
+·                    missing stats          ·
 ·                    table                  t@primary
 ·                    spans                  FULL SCAN
 ·                    locking strength       for update
@@ -564,8 +606,8 @@ EXPLAIN SELECT * FROM t WHERE a IN (SELECT b FROM t) FOR UPDATE OF t
 ----
 ·                    distribution           local
 ·                    vectorized             true
-render               ·                      ·
- └── lookup-join     ·                      ·
+project              ·                      ·
+ └── lookup join     ·                      ·
       │              table                  t@primary
       │              type                   inner
       │              equality               (b) = (a)
@@ -574,6 +616,7 @@ render               ·                      ·
       └── distinct   ·                      ·
            │         distinct on            b
            └── scan  ·                      ·
+·                    missing stats          ·
 ·                    table                  t@primary
 ·                    spans                  FULL SCAN
 
@@ -582,8 +625,8 @@ EXPLAIN SELECT * FROM t WHERE a IN (SELECT b FROM t FOR UPDATE OF t)
 ----
 ·                    distribution           local
 ·                    vectorized             true
-render               ·                      ·
- └── lookup-join     ·                      ·
+project              ·                      ·
+ └── lookup join     ·                      ·
       │              table                  t@primary
       │              type                   inner
       │              equality               (b) = (a)
@@ -592,6 +635,7 @@ render               ·                      ·
       └── distinct   ·                      ·
            │         distinct on            b
            └── scan  ·                      ·
+·                    missing stats          ·
 ·                    table                  t@primary
 ·                    spans                  FULL SCAN
 ·                    locking strength       for update
@@ -610,60 +654,64 @@ render               ·                      ·
 query TTT
 EXPLAIN SELECT * FROM [SELECT a FROM t] FOR UPDATE
 ----
-·          distribution  local
-·          vectorized    true
-render     ·             ·
- └── scan  ·             ·
-·          table         t@primary
-·          spans         FULL SCAN
+·          distribution   local
+·          vectorized     true
+render     ·              ·
+ └── scan  ·              ·
+·          missing stats  ·
+·          table          t@primary
+·          spans          FULL SCAN
 
 query TTT
 EXPLAIN WITH cte AS (SELECT a FROM t) SELECT * FROM cte FOR UPDATE
 ----
-·          distribution  local
-·          vectorized    true
-render     ·             ·
- └── scan  ·             ·
-·          table         t@primary
-·          spans         FULL SCAN
+·          distribution   local
+·          vectorized     true
+render     ·              ·
+ └── scan  ·              ·
+·          missing stats  ·
+·          table          t@primary
+·          spans          FULL SCAN
 
 query TTT
 EXPLAIN SELECT * FROM [SELECT a FROM t FOR UPDATE]
 ----
-·                      distribution      local
-·                      vectorized        false
-root                   ·                 ·
- ├── scan buffer node  ·                 ·
- │                     label             buffer 1
- └── subquery          ·                 ·
-      │                id                @S1
-      │                original sql      SELECT a FROM t FOR UPDATE
-      │                exec mode         all rows
-      └── buffer node  ·                 ·
-           │           label             buffer 1
-           └── scan    ·                 ·
-·                      table             t@primary
-·                      spans             FULL SCAN
-·                      locking strength  for update
+·                    distribution      local
+·                    vectorized        false
+root                 ·                 ·
+ ├── scan buffer     ·                 ·
+ │                   label             buffer 1
+ └── subquery        ·                 ·
+      │              id                @S1
+      │              original sql      SELECT a FROM t FOR UPDATE
+      │              exec mode         all rows
+      └── buffer     ·                 ·
+           │         label             buffer 1
+           └── scan  ·                 ·
+·                    missing stats     ·
+·                    table             t@primary
+·                    spans             FULL SCAN
+·                    locking strength  for update
 
 query TTT
 EXPLAIN WITH cte AS (SELECT a FROM t FOR UPDATE) SELECT * FROM cte
 ----
-·                      distribution      local
-·                      vectorized        false
-root                   ·                 ·
- ├── scan buffer node  ·                 ·
- │                     label             buffer 1 (cte)
- └── subquery          ·                 ·
-      │                id                @S1
-      │                original sql      SELECT a FROM t FOR UPDATE
-      │                exec mode         all rows
-      └── buffer node  ·                 ·
-           │           label             buffer 1 (cte)
-           └── scan    ·                 ·
-·                      table             t@primary
-·                      spans             FULL SCAN
-·                      locking strength  for update
+·                    distribution      local
+·                    vectorized        false
+root                 ·                 ·
+ ├── scan buffer     ·                 ·
+ │                   label             buffer 1 (cte)
+ └── subquery        ·                 ·
+      │              id                @S1
+      │              original sql      SELECT a FROM t FOR UPDATE
+      │              exec mode         all rows
+      └── buffer     ·                 ·
+           │         label             buffer 1 (cte)
+           └── scan  ·                 ·
+·                    missing stats     ·
+·                    table             t@primary
+·                    spans             FULL SCAN
+·                    locking strength  for update
 
 # Verify that the unused CTE doesn't get eliminated.
 # TODO(radu): we should at least not buffer the rows in this case.
@@ -671,22 +719,24 @@ query TTT
 EXPLAIN WITH sfu AS (SELECT a FROM t FOR UPDATE)
 SELECT c FROM u
 ----
-·                      distribution      local
-·                      vectorized        true
-root                   ·                 ·
- ├── scan              ·                 ·
- │                     table             u@primary
- │                     spans             FULL SCAN
- └── subquery          ·                 ·
-      │                id                @S1
-      │                original sql      SELECT a FROM t FOR UPDATE
-      │                exec mode         all rows
-      └── buffer node  ·                 ·
-           │           label             buffer 1 (sfu)
-           └── scan    ·                 ·
-·                      table             t@primary
-·                      spans             FULL SCAN
-·                      locking strength  for update
+·                    distribution      local
+·                    vectorized        true
+root                 ·                 ·
+ ├── scan            ·                 ·
+ │                   missing stats     ·
+ │                   table             u@primary
+ │                   spans             FULL SCAN
+ └── subquery        ·                 ·
+      │              id                @S1
+      │              original sql      SELECT a FROM t FOR UPDATE
+      │              exec mode         all rows
+      └── buffer     ·                 ·
+           │         label             buffer 1 (sfu)
+           └── scan  ·                 ·
+·                    missing stats     ·
+·                    table             t@primary
+·                    spans             FULL SCAN
+·                    locking strength  for update
 
 # ------------------------------------------------------------------------------
 # Tests with joins.
@@ -697,18 +747,20 @@ EXPLAIN SELECT * FROM t JOIN u USING (a) FOR UPDATE
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for update
@@ -718,18 +770,20 @@ EXPLAIN SELECT * FROM t JOIN u USING (a) FOR UPDATE OF t
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 
@@ -738,17 +792,19 @@ EXPLAIN SELECT * FROM t JOIN u USING (a) FOR UPDATE OF u
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for update
@@ -758,18 +814,20 @@ EXPLAIN SELECT * FROM t JOIN u USING (a) FOR UPDATE OF t, u
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for update
@@ -779,18 +837,20 @@ EXPLAIN SELECT * FROM t JOIN u USING (a) FOR UPDATE OF t FOR SHARE OF u
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for share
@@ -803,18 +863,20 @@ EXPLAIN SELECT * FROM t AS t2 JOIN u AS u2 USING (a) FOR UPDATE OF t2 FOR SHARE 
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for share
@@ -824,18 +886,20 @@ EXPLAIN SELECT * FROM t JOIN u USING (a) FOR KEY SHARE FOR UPDATE
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for update
@@ -845,18 +909,20 @@ EXPLAIN SELECT * FROM t JOIN u USING (a) FOR KEY SHARE FOR NO KEY UPDATE OF t
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for no key update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for key share
@@ -866,18 +932,20 @@ EXPLAIN SELECT * FROM t JOIN u USING (a) FOR SHARE FOR NO KEY UPDATE OF t FOR UP
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for no key update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for update
@@ -891,18 +959,20 @@ EXPLAIN SELECT * FROM t AS t2 JOIN u AS u2 USING (a) FOR UPDATE
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for update
@@ -921,18 +991,20 @@ EXPLAIN SELECT * FROM t AS t2 JOIN u AS u2 USING (a) FOR UPDATE OF t2
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 
@@ -941,17 +1013,19 @@ EXPLAIN SELECT * FROM t AS t2 JOIN u AS u2 USING (a) FOR UPDATE OF u2
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for update
@@ -961,18 +1035,20 @@ EXPLAIN SELECT * FROM t AS t2 JOIN u AS u2 USING (a) FOR UPDATE OF t2, u2
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for update
@@ -986,18 +1062,20 @@ EXPLAIN SELECT * FROM (t JOIN u AS u2 USING (a)) j FOR UPDATE
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for update
@@ -1016,18 +1094,20 @@ EXPLAIN SELECT * FROM (t JOIN u AS u2 USING (a)) j FOR UPDATE OF j
 ----
 ·                distribution        local
 ·                vectorized          true
-render           ·                   ·
- └── merge-join  ·                   ·
+project          ·                   ·
+ └── merge join  ·                   ·
       │          type                inner
       │          equality            (a) = (a)
       │          left cols are key   ·
       │          right cols are key  ·
       │          mergeJoinOrder      +"(a=a)"
       ├── scan   ·                   ·
+      │          missing stats       ·
       │          table               t@primary
       │          spans               FULL SCAN
       │          locking strength    for update
       └── scan   ·                   ·
+·                missing stats       ·
 ·                table               u@primary
 ·                spans               FULL SCAN
 ·                locking strength    for update
@@ -1041,13 +1121,15 @@ EXPLAIN SELECT * FROM t, u FOR UPDATE
 ----
 ·           distribution      local
 ·           vectorized        true
-cross-join  ·                 ·
+cross join  ·                 ·
  │          type              cross
  ├── scan   ·                 ·
+ │          missing stats     ·
  │          table             t@primary
  │          spans             FULL SCAN
  │          locking strength  for update
  └── scan   ·                 ·
+·           missing stats     ·
 ·           table             u@primary
 ·           spans             FULL SCAN
 ·           locking strength  for update
@@ -1057,13 +1139,15 @@ EXPLAIN SELECT * FROM t, u FOR UPDATE OF t
 ----
 ·           distribution      local
 ·           vectorized        true
-cross-join  ·                 ·
+cross join  ·                 ·
  │          type              cross
  ├── scan   ·                 ·
+ │          missing stats     ·
  │          table             t@primary
  │          spans             FULL SCAN
  │          locking strength  for update
  └── scan   ·                 ·
+·           missing stats     ·
 ·           table             u@primary
 ·           spans             FULL SCAN
 
@@ -1072,13 +1156,15 @@ EXPLAIN SELECT * FROM t, u FOR SHARE OF t FOR UPDATE OF u
 ----
 ·           distribution      local
 ·           vectorized        true
-cross-join  ·                 ·
+cross join  ·                 ·
  │          type              cross
  ├── scan   ·                 ·
+ │          missing stats     ·
  │          table             t@primary
  │          spans             FULL SCAN
  │          locking strength  for share
  └── scan   ·                 ·
+·           missing stats     ·
 ·           table             u@primary
 ·           spans             FULL SCAN
 ·           locking strength  for update
@@ -1088,13 +1174,15 @@ EXPLAIN SELECT * FROM t, LATERAL (SELECT * FROM u) sub FOR UPDATE
 ----
 ·           distribution      local
 ·           vectorized        true
-cross-join  ·                 ·
+cross join  ·                 ·
  │          type              cross
  ├── scan   ·                 ·
+ │          missing stats     ·
  │          table             t@primary
  │          spans             FULL SCAN
  │          locking strength  for update
  └── scan   ·                 ·
+·           missing stats     ·
 ·           table             u@primary
 ·           spans             FULL SCAN
 ·           locking strength  for update
@@ -1107,12 +1195,14 @@ EXPLAIN SELECT * FROM t, LATERAL (SELECT * FROM u) sub FOR UPDATE OF sub
 ----
 ·           distribution      local
 ·           vectorized        true
-cross-join  ·                 ·
+cross join  ·                 ·
  │          type              cross
  ├── scan   ·                 ·
+ │          missing stats     ·
  │          table             t@primary
  │          spans             FULL SCAN
  └── scan   ·                 ·
+·           missing stats     ·
 ·           table             u@primary
 ·           spans             FULL SCAN
 ·           locking strength  for update

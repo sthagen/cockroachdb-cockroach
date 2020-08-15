@@ -43,6 +43,9 @@ func TryDelegate(
 	case *tree.ShowDatabases:
 		return d.delegateShowDatabases(t)
 
+	case *tree.ShowEnums:
+		return d.delegateShowEnums()
+
 	case *tree.ShowCreate:
 		return d.delegateShowCreate(t)
 
@@ -108,6 +111,9 @@ func TryDelegate(
 
 	case *tree.ShowTransactionStatus:
 		return d.delegateShowVar(&tree.ShowVar{Name: "transaction_status"})
+
+	case *tree.ShowSchedules:
+		return d.delegateShowSchedules(t)
 
 	case *tree.ControlJobsForSchedules:
 		return d.delegateJobControl(t)

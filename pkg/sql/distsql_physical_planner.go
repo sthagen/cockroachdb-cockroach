@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -86,7 +87,7 @@ type DistSQLPlanner struct {
 	runnerChan chan runnerRequest
 
 	// gossip handle used to check node version compatibility.
-	gossip gossip.DeprecatedGossip
+	gossip gossip.OptionalGossip
 
 	nodeDialer *nodedialer.Dialer
 
@@ -128,7 +129,7 @@ func NewDistSQLPlanner(
 	distSQLSrv *distsql.ServerImpl,
 	distSender *kvcoord.DistSender,
 	nodeDescs kvcoord.NodeDescStore,
-	gw gossip.DeprecatedGossip,
+	gw gossip.OptionalGossip,
 	stopper *stop.Stopper,
 	isLive func(roachpb.NodeID) (bool, error),
 	nodeDialer *nodedialer.Dialer,
@@ -418,8 +419,8 @@ func checkSupportForPlanNode(node planNode) (distRecommendation, error) {
 		if err := checkExpr(n.onCond); err != nil {
 			return cannotDistribute, err
 		}
-		if n.left.lockingStrength != sqlbase.ScanLockingStrength_FOR_NONE ||
-			n.right.lockingStrength != sqlbase.ScanLockingStrength_FOR_NONE {
+		if n.left.lockingStrength != descpb.ScanLockingStrength_FOR_NONE ||
+			n.right.lockingStrength != descpb.ScanLockingStrength_FOR_NONE {
 			// Scans that are performing row-level locking cannot currently be
 			// distributed because their locks would not be propagated back to
 			// the root transaction coordinator.
@@ -443,6 +444,11 @@ func checkSupportForPlanNode(node planNode) (distRecommendation, error) {
 		}
 		return shouldDistribute, nil
 
+	case *ordinalityNode:
+		// WITH ORDINALITY never gets distributed so that the gateway node can
+		// always number each row in order.
+		return cannotDistribute, nil
+
 	case *projectSetNode:
 		return checkSupportForPlanNode(n.source)
 
@@ -455,7 +461,7 @@ func checkSupportForPlanNode(node planNode) (distRecommendation, error) {
 		return checkSupportForPlanNode(n.source.plan)
 
 	case *scanNode:
-		if n.lockingStrength != sqlbase.ScanLockingStrength_FOR_NONE {
+		if n.lockingStrength != descpb.ScanLockingStrength_FOR_NONE {
 			// Scans that are performing row-level locking cannot currently be
 			// distributed because their locks would not be propagated back to
 			// the root transaction coordinator.
@@ -716,7 +722,7 @@ type SpanPartition struct {
 }
 
 type distSQLNodeHealth struct {
-	gossip     gossip.DeprecatedGossip
+	gossip     gossip.OptionalGossip
 	isLive     func(roachpb.NodeID) (bool, error)
 	connHealth func(roachpb.NodeID, rpc.ConnectionClass) error
 }
@@ -802,23 +808,19 @@ func (dsp *DistSQLPlanner) PartitionSpans(
 	nodeMap := make(map[roachpb.NodeID]int)
 	it := planCtx.spanIter
 	for _, span := range spans {
-		// rspan is the span we are currently partitioning.
-		var rspan roachpb.RSpan
-		var err error
-		if rspan.Key, err = keys.Addr(span.Key); err != nil {
-			return nil, err
-		}
-		if rspan.EndKey, err = keys.Addr(span.EndKey); err != nil {
+		// rSpan is the span we are currently partitioning.
+		rSpan, err := keys.SpanAddr(span)
+		if err != nil {
 			return nil, err
 		}
 
 		var lastNodeID roachpb.NodeID
 		// lastKey maintains the EndKey of the last piece of `span`.
-		lastKey := rspan.Key
+		lastKey := rSpan.Key
 		if log.V(1) {
 			log.Infof(ctx, "partitioning span %s", span)
 		}
-		// We break up rspan into its individual ranges (which may or
+		// We break up rSpan into its individual ranges (which may or
 		// may not be on separate nodes). We then create "partitioned
 		// spans" using the end keys of these individual ranges.
 		for it.Seek(ctx, span, kvcoord.Ascending); ; it.Next(ctx) {
@@ -845,8 +847,8 @@ func (dsp *DistSQLPlanner) PartitionSpans(
 
 			// Limit the end key to the end of the span we are resolving.
 			endKey := desc.EndKey
-			if rspan.EndKey.Less(endKey) {
-				endKey = rspan.EndKey
+			if rSpan.EndKey.Less(endKey) {
+				endKey = rSpan.EndKey
 			}
 
 			nodeID := replDesc.NodeID
@@ -882,7 +884,7 @@ func (dsp *DistSQLPlanner) PartitionSpans(
 				})
 			}
 
-			if !endKey.Less(rspan.EndKey) {
+			if !endKey.Less(rSpan.EndKey) {
 				// Done.
 				break
 			}
@@ -910,7 +912,7 @@ func (dsp *DistSQLPlanner) nodeVersionIsCompatible(nodeID roachpb.NodeID) bool {
 }
 
 func getIndexIdx(
-	index *sqlbase.IndexDescriptor, desc *sqlbase.ImmutableTableDescriptor,
+	index *descpb.IndexDescriptor, desc *sqlbase.ImmutableTableDescriptor,
 ) (uint32, error) {
 	if index.ID == desc.PrimaryIndex.ID {
 		return 0, nil
@@ -967,7 +969,7 @@ func initTableReaderSpec(
 // scanNodeOrdinal returns the index of a column with the given ID.
 func tableOrdinal(
 	desc *sqlbase.ImmutableTableDescriptor,
-	colID sqlbase.ColumnID,
+	colID descpb.ColumnID,
 	visibility execinfrapb.ScanVisibility,
 ) int {
 	for i := range desc.Columns {
@@ -996,7 +998,7 @@ func tableOrdinal(
 // toTableOrdinals returns a mapping from column ordinals in cols to table
 // reader column ordinals.
 func toTableOrdinals(
-	cols []*sqlbase.ColumnDescriptor,
+	cols []*descpb.ColumnDescriptor,
 	desc *sqlbase.ImmutableTableDescriptor,
 	visibility execinfrapb.ScanVisibility,
 ) []int {
@@ -1010,7 +1012,7 @@ func toTableOrdinals(
 // getOutputColumnsFromColsForScan returns the indices of the columns that are
 // returned by a scanNode or a tableReader.
 // If remap is not nil, the column ordinals are remapped accordingly.
-func getOutputColumnsFromColsForScan(cols []*sqlbase.ColumnDescriptor, remap []int) []uint32 {
+func getOutputColumnsFromColsForScan(cols []*descpb.ColumnDescriptor, remap []int) []uint32 {
 	outputColumns := make([]uint32, len(cols))
 	// TODO(radu): if we have a scan with a filter, cols will include the
 	// columns needed for the filter, even if they aren't needed for the next
@@ -1163,9 +1165,9 @@ type tableReaderPlanningInfo struct {
 	parallelize           bool
 	estimatedRowCount     uint64
 	reqOrdering           ReqOrdering
-	cols                  []*sqlbase.ColumnDescriptor
+	cols                  []*descpb.ColumnDescriptor
 	colsToTableOrdinalMap []int
-	systemColumns         []sqlbase.SystemColumnKind
+	systemColumns         []descpb.SystemColumnKind
 	systemColumnOrdinals  []int
 }
 
@@ -1254,7 +1256,7 @@ func (dsp *DistSQLPlanner) planTableReaders(
 
 	outCols := getOutputColumnsFromColsForScan(info.cols, info.colsToTableOrdinalMap)
 	planToStreamColMap := make([]int, len(info.cols))
-	descColumnIDs := make([]sqlbase.ColumnID, 0, len(info.desc.Columns))
+	descColumnIDs := make([]descpb.ColumnID, 0, len(info.desc.Columns))
 	for i := range info.desc.Columns {
 		descColumnIDs = append(descColumnIDs, info.desc.Columns[i].ID)
 	}
@@ -2027,7 +2029,7 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 		}
 	}
 
-	if n.joinType == sqlbase.LeftSemiJoin || n.joinType == sqlbase.LeftAntiJoin {
+	if n.joinType == descpb.LeftSemiJoin || n.joinType == descpb.LeftAntiJoin {
 		// For anti/semi join, we only produce the input columns.
 		planToStreamColMap, post.OutputColumns, types = truncateToInputForLookupJoins(
 			numInputNodeCols, planToStreamColMap, post.OutputColumns, types)
@@ -2128,7 +2130,6 @@ func (dsp *DistSQLPlanner) createPlanForInvertedJoin(
 	if err != nil {
 		return nil, err
 	}
-	invertedJoinerSpec.LookupColumn = uint32(plan.PlanToStreamColMap[n.inputCol])
 
 	numInputNodeCols, planToStreamColMap, post, types :=
 		mappingHelperForLookupJoins(plan, n.input, n.table)
@@ -2148,7 +2149,7 @@ func (dsp *DistSQLPlanner) createPlanForInvertedJoin(
 		}
 	}
 
-	if n.joinType == sqlbase.LeftSemiJoin || n.joinType == sqlbase.LeftAntiJoin {
+	if n.joinType == descpb.LeftSemiJoin || n.joinType == descpb.LeftAntiJoin {
 		// For anti/semi join, we only produce the input columns.
 		planToStreamColMap, post.OutputColumns, types = truncateToInputForLookupJoins(
 			numInputNodeCols, planToStreamColMap, post.OutputColumns, types)
@@ -2172,7 +2173,7 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 	p := MakePhysicalPlan(dsp.gatewayNodeID)
 	plan = &p
 
-	tables := make([]sqlbase.TableDescriptor, len(n.sides))
+	tables := make([]descpb.TableDescriptor, len(n.sides))
 	indexOrdinals := make([]uint32, len(n.sides))
 	cols := make([]execinfrapb.Columns, len(n.sides))
 	numStreamCols := 0
@@ -2197,7 +2198,7 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 		Tables:        tables,
 		IndexOrdinals: indexOrdinals,
 		EqColumns:     cols,
-		Type:          sqlbase.InnerJoin,
+		Type:          descpb.InnerJoin,
 	}
 	zigzagJoinerSpec.FixedValues = make([]*execinfrapb.ValuesCoreSpec, len(n.sides))
 
@@ -2668,7 +2669,7 @@ func (dsp *DistSQLPlanner) wrapPlan(planCtx *PlanningCtx, n planNode) (*Physical
 	if err := walkPlan(planCtx.ctx, n, planObserver{
 		enterNode: func(ctx context.Context, nodeName string, plan planNode) (bool, error) {
 			switch plan.(type) {
-			case *explainDistSQLNode, *explainPlanNode, *explainVecNode:
+			case *explainDistSQLNode, *explainPlanNode, *explainVecNode, *explainNewPlanNode:
 				// Don't continue recursing into explain nodes - they need to be left
 				// alone since they handle their own planning later.
 				return false, nil
@@ -2781,7 +2782,7 @@ func (dsp *DistSQLPlanner) createValuesPlan(
 	}
 
 	for i, t := range resultTypes {
-		s.Columns[i].Encoding = sqlbase.DatumEncoding_VALUE
+		s.Columns[i].Encoding = descpb.DatumEncoding_VALUE
 		s.Columns[i].Type = t
 	}
 
@@ -2829,7 +2830,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForTuples(
 				return nil, err
 			}
 			encDatum := sqlbase.DatumToEncDatum(typs[colIdx], datum)
-			buf, err = encDatum.Encode(typs[colIdx], &a, sqlbase.DatumEncoding_VALUE, buf)
+			buf, err = encDatum.Encode(typs[colIdx], &a, descpb.DatumEncoding_VALUE, buf)
 			if err != nil {
 				return nil, err
 			}
@@ -2861,19 +2862,25 @@ func (dsp *DistSQLPlanner) createPlanForZero(
 	return dsp.createValuesPlan(types, 0 /* numRows */, nil /* rawBytes */)
 }
 
-func createDistinctSpec(n *distinctNode, cols []int) *execinfrapb.DistinctSpec {
+func createDistinctSpec(
+	distinctOnColIdxs util.FastIntSet,
+	columnsInOrder util.FastIntSet,
+	nullsAreDistinct bool,
+	errorOnDup string,
+	cols []int,
+) *execinfrapb.DistinctSpec {
 	var orderedColumns []uint32
-	if !n.columnsInOrder.Empty() {
-		orderedColumns = make([]uint32, 0, n.columnsInOrder.Len())
-		for i, ok := n.columnsInOrder.Next(0); ok; i, ok = n.columnsInOrder.Next(i + 1) {
+	if !columnsInOrder.Empty() {
+		orderedColumns = make([]uint32, 0, columnsInOrder.Len())
+		for i, ok := columnsInOrder.Next(0); ok; i, ok = columnsInOrder.Next(i + 1) {
 			orderedColumns = append(orderedColumns, uint32(cols[i]))
 		}
 	}
 
 	var distinctColumns []uint32
-	if !n.distinctOnColIdxs.Empty() {
+	if !distinctOnColIdxs.Empty() {
 		for planCol, streamCol := range cols {
-			if streamCol != -1 && n.distinctOnColIdxs.Contains(planCol) {
+			if streamCol != -1 && distinctOnColIdxs.Contains(planCol) {
 				distinctColumns = append(distinctColumns, uint32(streamCol))
 			}
 		}
@@ -2889,8 +2896,8 @@ func createDistinctSpec(n *distinctNode, cols []int) *execinfrapb.DistinctSpec {
 	return &execinfrapb.DistinctSpec{
 		OrderedColumns:   orderedColumns,
 		DistinctColumns:  distinctColumns,
-		NullsAreDistinct: n.nullsAreDistinct,
-		ErrorOnDup:       n.errorOnDup,
+		NullsAreDistinct: nullsAreDistinct,
+		ErrorOnDup:       errorOnDup,
 	}
 }
 
@@ -2901,26 +2908,39 @@ func (dsp *DistSQLPlanner) createPlanForDistinct(
 	if err != nil {
 		return nil, err
 	}
-	currentResultRouters := plan.ResultRouters
+	spec := createDistinctSpec(
+		n.distinctOnColIdxs,
+		n.columnsInOrder,
+		n.nullsAreDistinct,
+		n.errorOnDup,
+		plan.PlanToStreamColMap,
+	)
+	dsp.addDistinctProcessors(plan, spec, n.reqOrdering)
+	return plan, nil
+}
 
+func (dsp *DistSQLPlanner) addDistinctProcessors(
+	plan *PhysicalPlan, spec *execinfrapb.DistinctSpec, reqOrdering ReqOrdering,
+) {
 	distinctSpec := execinfrapb.ProcessorCoreUnion{
-		Distinct: createDistinctSpec(n, plan.PlanToStreamColMap),
+		Distinct: spec,
 	}
-
-	if len(currentResultRouters) == 1 {
-		plan.AddNoGroupingStage(distinctSpec, execinfrapb.PostProcessSpec{}, plan.ResultTypes, plan.MergeOrdering)
-		return plan, nil
-	}
-
-	// TODO(arjun): This is potentially memory inefficient if we don't have any sorted columns.
+	defer func() {
+		plan.SetMergeOrdering(dsp.convertOrdering(reqOrdering, plan.PlanToStreamColMap))
+	}()
 
 	// Add distinct processors local to each existing current result processor.
 	plan.AddNoGroupingStage(distinctSpec, execinfrapb.PostProcessSpec{}, plan.ResultTypes, plan.MergeOrdering)
+	if !plan.IsLastStageDistributed() {
+		return
+	}
 
-	// TODO(arjun): We could distribute this final stage by hash.
-	plan.AddSingleGroupStage(dsp.gatewayNodeID, distinctSpec, execinfrapb.PostProcessSpec{}, plan.ResultTypes)
-
-	return plan, nil
+	nodes := getNodesOfRouters(plan.ResultRouters, plan.Processors)
+	plan.AddStageOnNodes(
+		nodes, distinctSpec, execinfrapb.PostProcessSpec{},
+		distinctSpec.Distinct.DistinctColumns, plan.ResultTypes,
+		plan.MergeOrdering, plan.ResultRouters,
+	)
 }
 
 func (dsp *DistSQLPlanner) createPlanForOrdinality(
@@ -2946,7 +2966,7 @@ func (dsp *DistSQLPlanner) createPlanForOrdinality(
 }
 
 func createProjectSetSpec(
-	planCtx *PlanningCtx, n *projectSetNode, indexVarMap []int,
+	planCtx *PlanningCtx, n *projectSetPlanningInfo, indexVarMap []int,
 ) (*execinfrapb.ProjectSetSpec, error) {
 	spec := execinfrapb.ProjectSetSpec{
 		Exprs:            make([]execinfrapb.Expression, len(n.exprs)),
@@ -2976,15 +2996,21 @@ func (dsp *DistSQLPlanner) createPlanForProjectSet(
 	if err != nil {
 		return nil, err
 	}
+	err = dsp.addProjectSet(plan, planCtx, &n.projectSetPlanningInfo)
+	return plan, err
+}
+
+// addProjectSet adds a grouping stage consisting of a single
+// projectSetProcessor that is planned on the gateway.
+func (dsp *DistSQLPlanner) addProjectSet(
+	plan *PhysicalPlan, planCtx *PlanningCtx, info *projectSetPlanningInfo,
+) error {
 	numResults := len(plan.ResultTypes)
 
-	indexVarMap := makePlanToStreamColMap(len(n.columns))
-	copy(indexVarMap, plan.PlanToStreamColMap)
-
 	// Create the project set processor spec.
-	projectSetSpec, err := createProjectSetSpec(planCtx, n, indexVarMap)
+	projectSetSpec, err := createProjectSetSpec(planCtx, info, plan.PlanToStreamColMap)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	spec := execinfrapb.ProcessorCoreUnion{
 		ProjectSet: projectSetSpec,
@@ -3002,8 +3028,7 @@ func (dsp *DistSQLPlanner) createPlanForProjectSet(
 	for i := range projectSetSpec.GeneratedColumns {
 		plan.PlanToStreamColMap = append(plan.PlanToStreamColMap, numResults+i)
 	}
-
-	return plan, nil
+	return nil
 }
 
 // isOnlyOnGateway returns true if a physical plan is executed entirely on the
@@ -3418,10 +3443,10 @@ func (dsp *DistSQLPlanner) createPlanForExport(
 	}
 
 	core := execinfrapb.ProcessorCoreUnion{CSVWriter: &execinfrapb.CSVWriterSpec{
-		Destination:      n.fileName,
-		NamePattern:      exportFilePatternDefault,
+		Destination:      n.destination,
+		NamePattern:      n.fileNamePattern,
 		Options:          n.csvOpts,
-		ChunkRows:        int64(n.chunkSize),
+		ChunkRows:        int64(n.chunkRows),
 		CompressionCodec: n.fileCompression,
 	}}
 

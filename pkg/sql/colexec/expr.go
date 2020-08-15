@@ -14,7 +14,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -26,7 +25,7 @@ import (
 type ExprHelper interface {
 	// ProcessExpr processes the given expression and returns a well-typed
 	// expression.
-	ProcessExpr(execinfrapb.Expression, *tree.EvalContext, []*types.T) (tree.TypedExpr, error)
+	ProcessExpr(execinfrapb.Expression, *tree.SemaContext, *tree.EvalContext, []*types.T) (tree.TypedExpr, error)
 }
 
 // ExprDeserialization describes how expression deserialization should be
@@ -61,7 +60,7 @@ func NewExprHelper(exprDeserialization ExprDeserialization) ExprHelper {
 // defaultExprHelper is an ExprHelper that takes advantage of already present
 // well-typed expression in LocalExpr when set.
 type defaultExprHelper struct {
-	helper execinfra.ExprHelper
+	helper execinfrapb.ExprHelper
 }
 
 var _ ExprHelper = &defaultExprHelper{}
@@ -73,31 +72,37 @@ func NewDefaultExprHelper() ExprHelper {
 }
 
 func (h *defaultExprHelper) ProcessExpr(
-	expr execinfrapb.Expression, evalCtx *tree.EvalContext, typs []*types.T,
+	expr execinfrapb.Expression,
+	semaCtx *tree.SemaContext,
+	evalCtx *tree.EvalContext,
+	typs []*types.T,
 ) (tree.TypedExpr, error) {
 	if expr.LocalExpr != nil {
 		return expr.LocalExpr, nil
 	}
 	h.helper.Types = typs
 	tempVars := tree.MakeIndexedVarHelper(&h.helper, len(typs))
-	return execinfra.DeserializeExpr(expr.Expr, evalCtx, &tempVars)
+	return execinfrapb.DeserializeExpr(expr.Expr, semaCtx, evalCtx, &tempVars)
 }
 
 // forcedDeserializationExprHelper is an ExprHelper that always deserializes
 // (namely, parses, type-checks, and evaluates the constants) the provided
 // expression, completely ignoring LocalExpr field if set.
 type forcedDeserializationExprHelper struct {
-	helper execinfra.ExprHelper
+	helper execinfrapb.ExprHelper
 }
 
 var _ ExprHelper = &forcedDeserializationExprHelper{}
 
 func (h *forcedDeserializationExprHelper) ProcessExpr(
-	expr execinfrapb.Expression, evalCtx *tree.EvalContext, typs []*types.T,
+	expr execinfrapb.Expression,
+	semaCtx *tree.SemaContext,
+	evalCtx *tree.EvalContext,
+	typs []*types.T,
 ) (tree.TypedExpr, error) {
 	h.helper.Types = typs
 	tempVars := tree.MakeIndexedVarHelper(&h.helper, len(typs))
-	return execinfra.DeserializeExpr(expr.Expr, evalCtx, &tempVars)
+	return execinfrapb.DeserializeExpr(expr.Expr, semaCtx, evalCtx, &tempVars)
 }
 
 // Remove unused warning.

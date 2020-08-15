@@ -27,9 +27,8 @@ func newCountRowsHashAggAlloc(
 
 // countRowsHashAgg supports either COUNT(*) or COUNT(col) aggregate.
 type countRowsHashAgg struct {
+	hashAggregateFuncBase
 	vec    []int64
-	nulls  *coldata.Nulls
-	curIdx int
 	curAgg int64
 }
 
@@ -38,55 +37,37 @@ var _ aggregateFunc = &countRowsHashAgg{}
 const sizeOfCountRowsHashAgg = int64(unsafe.Sizeof(countRowsHashAgg{}))
 
 func (a *countRowsHashAgg) Init(groups []bool, vec coldata.Vec) {
+	a.hashAggregateFuncBase.Init(groups, vec)
 	a.vec = vec.Int64()
-	a.nulls = vec.Nulls()
 	a.Reset()
 }
 
 func (a *countRowsHashAgg) Reset() {
-	a.curIdx = 0
+	a.hashAggregateFuncBase.Reset()
 	a.curAgg = 0
-	a.nulls.UnsetNulls()
 }
 
-func (a *countRowsHashAgg) CurrentOutputIndex() int {
-	return a.curIdx
-}
-
-func (a *countRowsHashAgg) SetOutputIndex(idx int) {
-	a.curIdx = idx
-}
-
-func (a *countRowsHashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	inputLen := b.Length()
-	sel := b.Selection()
-	var i int
-
+func (a *countRowsHashAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
 	{
-		if sel != nil {
-			for _, i = range sel[:inputLen] {
-
-				var y int64
-				y = int64(1)
-				a.curAgg += y
-			}
-		} else {
-			for i = 0; i < inputLen; i++ {
-
-				var y int64
-				y = int64(1)
-				a.curAgg += y
-			}
+		{
+			// We don't need to pay attention to nulls (either because it's a
+			// COUNT_ROWS aggregate or because there are no nulls), and we're
+			// performing a hash aggregation (meaning there is a single group),
+			// so all inputLen tuples contribute to the count.
+			a.curAgg += int64(inputLen)
 		}
 	}
 }
 
-func (a *countRowsHashAgg) Flush() {
-	a.vec[a.curIdx] = a.curAgg
-	a.curIdx++
+func (a *countRowsHashAgg) Flush(outputIdx int) {
+	a.vec[outputIdx] = a.curAgg
 }
 
 func (a *countRowsHashAgg) HandleEmptyInputScalar() {
+	// COUNT aggregates are special because they return zero in case of an
+	// empty input in the scalar context.
 	a.vec[0] = 0
 }
 
@@ -118,9 +99,8 @@ func newCountHashAggAlloc(
 
 // countHashAgg supports either COUNT(*) or COUNT(col) aggregate.
 type countHashAgg struct {
+	hashAggregateFuncBase
 	vec    []int64
-	nulls  *coldata.Nulls
-	curIdx int
 	curAgg int64
 }
 
@@ -129,37 +109,26 @@ var _ aggregateFunc = &countHashAgg{}
 const sizeOfCountHashAgg = int64(unsafe.Sizeof(countHashAgg{}))
 
 func (a *countHashAgg) Init(groups []bool, vec coldata.Vec) {
+	a.hashAggregateFuncBase.Init(groups, vec)
 	a.vec = vec.Int64()
-	a.nulls = vec.Nulls()
 	a.Reset()
 }
 
 func (a *countHashAgg) Reset() {
-	a.curIdx = 0
+	a.hashAggregateFuncBase.Reset()
 	a.curAgg = 0
-	a.nulls.UnsetNulls()
 }
 
-func (a *countHashAgg) CurrentOutputIndex() int {
-	return a.curIdx
-}
-
-func (a *countHashAgg) SetOutputIndex(idx int) {
-	a.curIdx = idx
-}
-
-func (a *countHashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	inputLen := b.Length()
-	sel := b.Selection()
-	var i int
-
+func (a *countHashAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
 	// If this is a COUNT(col) aggregator and there are nulls in this batch,
 	// we must check each value for nullity. Note that it is only legal to do a
 	// COUNT aggregate on a single column.
-	nulls := b.ColVec(int(inputIdxs[0])).Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			for _, i = range sel[:inputLen] {
+	nulls := vecs[inputIdxs[0]].Nulls()
+	{
+		if nulls.MaybeHasNulls() {
+			for _, i := range sel[:inputLen] {
 
 				var y int64
 				y = int64(0)
@@ -169,41 +138,22 @@ func (a *countHashAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 				a.curAgg += y
 			}
 		} else {
-			for i = 0; i < inputLen; i++ {
-
-				var y int64
-				y = int64(0)
-				if !nulls.NullAt(i) {
-					y = 1
-				}
-				a.curAgg += y
-			}
-		}
-	} else {
-		if sel != nil {
-			for _, i = range sel[:inputLen] {
-
-				var y int64
-				y = int64(1)
-				a.curAgg += y
-			}
-		} else {
-			for i = 0; i < inputLen; i++ {
-
-				var y int64
-				y = int64(1)
-				a.curAgg += y
-			}
+			// We don't need to pay attention to nulls (either because it's a
+			// COUNT_ROWS aggregate or because there are no nulls), and we're
+			// performing a hash aggregation (meaning there is a single group),
+			// so all inputLen tuples contribute to the count.
+			a.curAgg += int64(inputLen)
 		}
 	}
 }
 
-func (a *countHashAgg) Flush() {
-	a.vec[a.curIdx] = a.curAgg
-	a.curIdx++
+func (a *countHashAgg) Flush(outputIdx int) {
+	a.vec[outputIdx] = a.curAgg
 }
 
 func (a *countHashAgg) HandleEmptyInputScalar() {
+	// COUNT aggregates are special because they return zero in case of an
+	// empty input in the scalar context.
 	a.vec[0] = 0
 }
 

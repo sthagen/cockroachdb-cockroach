@@ -1,4 +1,4 @@
-# LogicTest: !3node-tenant(50049)
+# LogicTest: !3node-tenant(49854)
 
 statement ok
 SET experimental_enable_enums=true;
@@ -138,9 +138,6 @@ true true
 # when firing but unable to complete the type check.
 statement error pq: invalid input value for enum greeting: "notagreeting"
 SELECT 'hello'::greeting = 'notagreeting'
-
-statement error pq: unimplemented: ALTER TYPE SET SCHEMA unsupported
-ALTER TYPE greeting SET SCHEMA newschema
 
 # Tests for enum builtins.
 statement ok
@@ -419,7 +416,7 @@ SELECT * FROM enum_array
 query TTT
 SELECT pg_typeof(x), pg_typeof(x[1]), pg_typeof(ARRAY['hello']::_greeting) FROM enum_array LIMIT 1
 ----
-public.greeting[]  public.greeting  public.greeting[]
+greeting[]  greeting  greeting[]
 
 # Ensure that the implicitly created array type will tolerate collisions.
 # _collision will create __collision as its implicit array type, so the
@@ -453,7 +450,7 @@ FROM
 WHERE
   descriptor_name = 'enum_array' AND column_name = 'x'
 ----
-x  family:ArrayFamily width:0 precision:0 locale:"" visible_type:0 oid:100064 array_contents:<InternalType:<family:EnumFamily width:0 precision:0 locale:"" visible_type:0 oid:100063 time_precision_is_set:false udt_metadata:<stable_type_id:63 stable_array_type_id:64 > > TypeMeta:<Version:0 > > time_precision_is_set:false udt_metadata:<stable_type_id:64 stable_array_type_id:0 >
+x  family:ArrayFamily width:0 precision:0 locale:"" visible_type:0 oid:100064 array_contents:<InternalType:<family:EnumFamily width:0 precision:0 locale:"" visible_type:0 oid:100063 time_precision_is_set:false udt_metadata:<array_type_oid:100064 > > TypeMeta:<Version:0 > > time_precision_is_set:false
 
 # Test tables using enums in DEFAULT expressions.
 statement ok
@@ -584,7 +581,7 @@ statement error pq: failed to satisfy CHECK constraint \(x > 'hello':::public.gr
 INSERT INTO enum_checks VALUES ('hello')
 
 # Try adding a check that fails validation.
-statement error pq: validation of CHECK "x = 'hello':::public.greeting" failed
+statement error pq: validation of CHECK "x = 'hello':::greeting" failed
 ALTER TABLE enum_checks ADD CHECK (x = 'hello')
 
 # Check the above cases, but in a transaction.
@@ -1093,3 +1090,48 @@ SELECT * FROM [EXPLAIN SELECT * FROM local_table] LIMIT 1
 
 statement ok
 ROLLBACK
+
+# This test case ensures that DistSQL flows don't attempt to use the lease
+# manager to access type data once the current transaction has already modified
+# or created a type.
+statement ok
+BEGIN;
+CREATE TYPE local_type AS ENUM ('local');
+CREATE TABLE local_table (x local_type);
+INSERT INTO local_table VALUES ('local')
+
+query T
+SELECT * FROM local_table
+----
+local
+
+statement ok
+ROLLBACK
+
+query TTT
+SHOW ENUMS
+----
+public as_bytes   bytes
+public dbs        postgres|mysql|spanner|cockroach
+public farewell   bye|seeya
+public greeting   hello|howdy|hi
+public greeting2  hello
+public int        Z|S of int
+public notbad     dup|DUP
+
+statement ok
+SET experimental_enable_user_defined_schemas = true;
+CREATE SCHEMA uds;
+CREATE TYPE uds.typ AS ENUM ('schema')
+
+query TTT
+SHOW ENUMS
+----
+public as_bytes   bytes
+public dbs        postgres|mysql|spanner|cockroach
+public farewell   bye|seeya
+public greeting   hello|howdy|hi
+public greeting2  hello
+public int        Z|S of int
+public notbad     dup|DUP
+uds    typ        schema

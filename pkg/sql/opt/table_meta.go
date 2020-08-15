@@ -108,6 +108,9 @@ var tableAnnIDCount TableAnnID
 const maxTableAnnIDCount = 2
 
 // TableMeta stores information about one of the tables stored in the metadata.
+//
+// NOTE: Metadata.DuplicateTable must be kept in sync with changes to this
+// struct.
 type TableMeta struct {
 	// MetaID is the identifier for this table that is unique within the query
 	// metadata.
@@ -147,8 +150,8 @@ type TableMeta struct {
 	// Computed columns with non-immutable operators are omitted.
 	ComputedCols map[ColumnID]ScalarExpr
 
-	// PartialIndexPredicates is a map from an index ordinal on the table to
-	// a ScalarExpr representing the predicate on the corresponding partial
+	// PartialIndexPredicates is a map from index ordinals on the table to
+	// *FiltersExprs representing the predicate on the corresponding partial
 	// index. If an index is not a partial index, it will not have an entry in
 	// the map.
 	PartialIndexPredicates map[cat.IndexOrdinal]ScalarExpr
@@ -187,6 +190,25 @@ func (tm *TableMeta) IndexKeyColumns(indexOrd int) ColSet {
 	var indexCols ColSet
 	for i, n := 0, index.KeyColumnCount(); i < n; i++ {
 		ord := index.Column(i).Ordinal
+		indexCols.Add(tm.MetaID.ColumnID(ord))
+	}
+	return indexCols
+}
+
+// IndexKeyColumnsMapVirtual returns the metadata IDs for the set of strict key
+// columns in the given index. Inverted index columns are mapped to their source
+// column.
+func (tm *TableMeta) IndexKeyColumnsMapVirtual(indexOrd int) ColSet {
+	index := tm.Table.Index(indexOrd)
+
+	var indexCols ColSet
+	for i, n := 0, index.KeyColumnCount(); i < n; i++ {
+		ord := 0
+		if i == 0 && index.IsInverted() {
+			ord = index.Column(i).InvertedSourceColumnOrdinal()
+		} else {
+			ord = index.Column(i).Ordinal
+		}
 		indexCols.Add(tm.MetaID.ColumnID(ord))
 	}
 	return indexCols

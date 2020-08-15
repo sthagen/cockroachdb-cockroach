@@ -12,17 +12,15 @@ package sql
 
 import (
 	"context"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/errors"
 )
 
 type createSchemaNode struct {
@@ -31,26 +29,6 @@ type createSchemaNode struct {
 
 func (n *createSchemaNode) startExec(params runParams) error {
 	return params.p.createUserDefinedSchema(params, n.n)
-}
-
-func (p *planner) schemaExists(
-	ctx context.Context, parentID sqlbase.ID, schema string,
-) (bool, error) {
-	// Check statically known schemas.
-	if schema == tree.PublicSchema {
-		return true, nil
-	}
-	for _, s := range virtualSchemas {
-		if s.name == schema {
-			return true, nil
-		}
-	}
-	// Now lookup in the namespace for other schemas.
-	exists, _, err := sqlbase.LookupObjectID(ctx, p.txn, p.ExecCfg().Codec, parentID, keys.RootNamespaceID, schema)
-	if err != nil {
-		return false, err
-	}
-	return exists, nil
 }
 
 func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema) error {
@@ -84,10 +62,8 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 		return pgerror.Newf(pgcode.DuplicateSchema, "schema %q already exists", n.Schema)
 	}
 
-	// Schemas starting with "pg_" are not allowed.
-	if strings.HasPrefix(n.Schema, sessiondata.PgSchemaPrefix) {
-		err := pgerror.Newf(pgcode.ReservedName, "unacceptable schema name %q", n.Schema)
-		err = errors.WithDetail(err, `The prefix "pg_" is reserved for system schemas.`)
+	// Check validity of the schema name.
+	if err := sqlbase.IsSchemaNameValid(n.Schema); err != nil {
 		return err
 	}
 
@@ -110,21 +86,24 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 		return err
 	}
 
+	// Inherit the parent privileges.
+	privs := db.GetPrivileges()
+	privs.SetOwner(params.SessionData().User)
+
 	// Create the SchemaDescriptor.
-	desc := sqlbase.NewMutableCreatedSchemaDescriptor(sqlbase.SchemaDescriptor{
-		ParentID: db.ID,
-		Name:     n.Schema,
-		ID:       id,
-		// Inherit the parent privileges.
-		Privileges: db.GetPrivileges(),
+	desc := sqlbase.NewMutableCreatedSchemaDescriptor(descpb.SchemaDescriptor{
+		ParentID:   db.ID,
+		Name:       n.Schema,
+		ID:         id,
+		Privileges: privs,
 	})
 
 	// Update the parent database with this schema information.
 	mutDB := sqlbase.NewMutableExistingDatabaseDescriptor(*db.DatabaseDesc())
 	if mutDB.Schemas == nil {
-		mutDB.Schemas = make(map[string]sqlbase.DatabaseDescriptor_SchemaInfo)
+		mutDB.Schemas = make(map[string]descpb.DatabaseDescriptor_SchemaInfo)
 	}
-	mutDB.Schemas[desc.Name] = sqlbase.DatabaseDescriptor_SchemaInfo{
+	mutDB.Schemas[desc.Name] = descpb.DatabaseDescriptor_SchemaInfo{
 		ID:      desc.ID,
 		Dropped: false,
 	}

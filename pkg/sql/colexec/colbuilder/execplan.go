@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
@@ -29,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -160,16 +160,6 @@ func isSupported(mode sessiondata.VectorizeExecMode, spec *execinfrapb.Processor
 			if agg.FilterColIdx != nil {
 				return errors.Newf("filtering aggregation not supported")
 			}
-			if len(agg.Arguments) > 0 {
-				return errors.Newf("aggregates with arguments not supported")
-			}
-			inputTypes := make([]*types.T, len(agg.ColIdx))
-			for pos, colIdx := range agg.ColIdx {
-				inputTypes[pos] = spec.Input[0].ColumnTypes[colIdx]
-			}
-			if err := isAggregateSupported(agg.Func, inputTypes); err != nil {
-				return err
-			}
 		}
 		return nil
 
@@ -191,7 +181,7 @@ func isSupported(mode sessiondata.VectorizeExecMode, spec *execinfrapb.Processor
 		return nil
 
 	case core.HashJoiner != nil:
-		if !core.HashJoiner.OnExpr.Empty() && core.HashJoiner.Type != sqlbase.InnerJoin {
+		if !core.HashJoiner.OnExpr.Empty() && core.HashJoiner.Type != descpb.InnerJoin {
 			return errors.Newf("can't plan vectorized non-inner hash joins with ON expressions")
 		}
 		leftInput, rightInput := spec.Input[0], spec.Input[1]
@@ -207,7 +197,7 @@ func isSupported(mode sessiondata.VectorizeExecMode, spec *execinfrapb.Processor
 
 	case core.MergeJoiner != nil:
 		if !core.MergeJoiner.OnExpr.Empty() &&
-			core.MergeJoiner.Type != sqlbase.InnerJoin {
+			core.MergeJoiner.Type != descpb.InnerJoin {
 			return errors.Errorf("can't plan non-inner merge join with ON expressions")
 		}
 		return nil
@@ -660,11 +650,9 @@ func NewColOperator(
 			}
 
 			var groupCols, orderedCols util.FastIntSet
-
 			for _, col := range aggSpec.OrderedGroupCols {
 				orderedCols.Add(int(col))
 			}
-
 			needHash := false
 			for _, col := range aggSpec.GroupCols {
 				if !orderedCols.Contains(int(col)) {
@@ -676,23 +664,19 @@ func NewColOperator(
 				return r, errors.AssertionFailedf("ordered cols must be a subset of grouping cols")
 			}
 
-			aggTyps := make([][]*types.T, len(aggSpec.Aggregations))
-			aggCols := make([][]uint32, len(aggSpec.Aggregations))
-			aggFns := make([]execinfrapb.AggregatorSpec_Func, len(aggSpec.Aggregations))
-			for i, agg := range aggSpec.Aggregations {
-				aggTyps[i] = make([]*types.T, len(agg.ColIdx))
-				for j, colIdx := range agg.ColIdx {
-					aggTyps[i][j] = spec.Input[0].ColumnTypes[colIdx]
-				}
-				aggCols[i] = agg.ColIdx
-				aggFns[i] = agg.Func
-			}
-			result.ColumnTypes, err = colexec.MakeAggregateFuncsOutputTypes(aggTyps, aggFns)
+			inputTypes := make([]*types.T, len(spec.Input[0].ColumnTypes))
+			copy(inputTypes, spec.Input[0].ColumnTypes)
+			evalCtx := flowCtx.NewEvalCtx()
+			var constructors []execinfrapb.AggregateConstructor
+			var constArguments []tree.Datums
+			semaCtx := flowCtx.TypeResolverFactory.NewSemaContext(flowCtx.EvalCtx.Txn)
+			constructors, constArguments, result.ColumnTypes, err = colexec.ProcessAggregations(
+				evalCtx, semaCtx, aggSpec.Aggregations, inputTypes,
+			)
 			if err != nil {
 				return r, err
 			}
-			typs := make([]*types.T, len(spec.Input[0].ColumnTypes))
-			copy(typs, spec.Input[0].ColumnTypes)
+
 			if needHash {
 				hashAggregatorMemAccount := streamingMemAccount
 				if !useStreamingMemAccountForBuffering {
@@ -704,17 +688,21 @@ func NewColOperator(
 					// "unlimited") amount of memory to the aggregator.
 					hashAggregatorMemAccount = result.createBufferingUnlimitedMemAccount(ctx, flowCtx, "hash-aggregator")
 				}
+				evalCtx.SingleDatumAggMemAccount = hashAggregatorMemAccount
 				result.Op, err = colexec.NewHashAggregator(
-					colmem.NewAllocator(ctx, hashAggregatorMemAccount, factory), inputs[0], typs, aggFns,
-					aggSpec.GroupCols, aggCols,
+					colmem.NewAllocator(ctx, hashAggregatorMemAccount, factory),
+					inputs[0], inputTypes, aggSpec, evalCtx, constructors,
+					constArguments, result.ColumnTypes,
 				)
 			} else {
+				evalCtx.SingleDatumAggMemAccount = streamingMemAccount
 				result.Op, err = colexec.NewOrderedAggregator(
-					streamingAllocator, inputs[0], typs, aggFns,
-					aggSpec.GroupCols, aggCols, aggSpec.IsScalar(),
+					streamingAllocator, inputs[0], inputTypes, aggSpec, evalCtx,
+					constructors, constArguments, result.ColumnTypes, aggSpec.IsScalar(),
 				)
 				result.IsStreaming = true
 			}
+			result.ToClose = append(result.ToClose, result.Op.(colexec.Closer))
 
 		case core.Distinct != nil:
 			if err := checkNumIn(inputs, 1); err != nil {
@@ -853,7 +841,7 @@ func NewColOperator(
 				copy(result.ColumnTypes[len(leftTypes):], rightTypes)
 			}
 
-			if !core.HashJoiner.OnExpr.Empty() && core.HashJoiner.Type == sqlbase.InnerJoin {
+			if !core.HashJoiner.OnExpr.Empty() && core.HashJoiner.Type == descpb.InnerJoin {
 				if err =
 					result.planAndMaybeWrapOnExprAsFilter(
 						ctx, flowCtx, args, core.HashJoiner.OnExpr, factory,
@@ -878,7 +866,7 @@ func NewColOperator(
 			joinType := core.MergeJoiner.Type
 			var onExpr *execinfrapb.Expression
 			if !core.MergeJoiner.OnExpr.Empty() {
-				if joinType != sqlbase.InnerJoin {
+				if joinType != descpb.InnerJoin {
 					return r, errors.AssertionFailedf(
 						"ON expression (%s) was unexpectedly planned for merge joiner with join type %s",
 						core.MergeJoiner.OnExpr.String(), core.MergeJoiner.Type.String(),
@@ -1130,7 +1118,7 @@ func (r opResult) planAndMaybeWrapOnExprAsFilter(
 		ColumnTypes: r.ColumnTypes,
 	}
 	if err := ppr.planFilterExpr(
-		ctx, flowCtx.NewEvalCtx(), onExpr, args.StreamingMemAccount, factory, args.ExprHelper,
+		ctx, flowCtx, flowCtx.NewEvalCtx(), onExpr, args.StreamingMemAccount, factory, args.ExprHelper,
 	); err != nil {
 		// ON expression planning failed. Fall back to planning the filter
 		// using row execution.
@@ -1183,7 +1171,7 @@ func (r *postProcessResult) planPostProcessSpec(
 ) error {
 	if !post.Filter.Empty() {
 		if err := r.planFilterExpr(
-			ctx, flowCtx.NewEvalCtx(), post.Filter, args.StreamingMemAccount, factory, args.ExprHelper,
+			ctx, flowCtx, flowCtx.NewEvalCtx(), post.Filter, args.StreamingMemAccount, factory, args.ExprHelper,
 		); err != nil {
 			return err
 		}
@@ -1193,10 +1181,11 @@ func (r *postProcessResult) planPostProcessSpec(
 		r.addProjection(post.OutputColumns)
 	} else if post.RenderExprs != nil {
 		log.VEventf(ctx, 2, "planning render expressions %+v", post.RenderExprs)
+		semaCtx := flowCtx.TypeResolverFactory.NewSemaContext(flowCtx.EvalCtx.Txn)
 		var renderedCols []uint32
 		for _, renderExpr := range post.RenderExprs {
 			var renderInternalMem int
-			expr, err := args.ExprHelper.ProcessExpr(renderExpr, flowCtx.EvalCtx, r.ColumnTypes)
+			expr, err := args.ExprHelper.ProcessExpr(renderExpr, semaCtx, flowCtx.EvalCtx, r.ColumnTypes)
 			if err != nil {
 				return err
 			}
@@ -1327,6 +1316,7 @@ func (r opResult) updateWithPostProcessResult(ppr postProcessResult) {
 
 func (r *postProcessResult) planFilterExpr(
 	ctx context.Context,
+	flowCtx *execinfra.FlowCtx,
 	evalCtx *tree.EvalContext,
 	filter execinfrapb.Expression,
 	acc *mon.BoundAccount,
@@ -1334,7 +1324,8 @@ func (r *postProcessResult) planFilterExpr(
 	helper colexec.ExprHelper,
 ) error {
 	var selectionInternalMem int
-	expr, err := helper.ProcessExpr(filter, evalCtx, r.ColumnTypes)
+	semaCtx := flowCtx.TypeResolverFactory.NewSemaContext(evalCtx.Txn)
+	expr, err := helper.ProcessExpr(filter, semaCtx, evalCtx, r.ColumnTypes)
 	if err != nil {
 		return err
 	}
@@ -1447,13 +1438,17 @@ func planSelectionOperators(
 		op, resultIdx, typs, internalMemUsed, err = planProjectionOperators(
 			ctx, evalCtx, t.TypedInnerExpr(), columnTypes, input, acc, factory,
 		)
-		op = colexec.NewIsNullSelOp(op, resultIdx, false)
+		op = colexec.NewIsNullSelOp(
+			op, resultIdx, false /* negate */, typs[resultIdx].Family() == types.TupleFamily,
+		)
 		return op, resultIdx, typs, internalMemUsed, err
 	case *tree.IsNotNullExpr:
 		op, resultIdx, typs, internalMemUsed, err = planProjectionOperators(
 			ctx, evalCtx, t.TypedInnerExpr(), columnTypes, input, acc, factory,
 		)
-		op = colexec.NewIsNullSelOp(op, resultIdx, true)
+		op = colexec.NewIsNullSelOp(
+			op, resultIdx, true /* negate */, typs[resultIdx].Family() == types.TupleFamily,
+		)
 		return op, resultIdx, typs, internalMemUsed, err
 	case *tree.ComparisonExpr:
 		cmpOp := t.Operator
@@ -1465,38 +1460,44 @@ func planSelectionOperators(
 		}
 		lTyp := ct[leftIdx]
 		if constArg, ok := t.Right.(tree.Datum); ok {
-			if t.Operator == tree.Like || t.Operator == tree.NotLike {
-				negate := t.Operator == tree.NotLike
+			switch cmpOp {
+			case tree.Like, tree.NotLike:
+				negate := cmpOp == tree.NotLike
 				op, err = colexec.GetLikeOperator(
-					evalCtx, leftOp, leftIdx, string(tree.MustBeDString(constArg)), negate)
-				return op, resultIdx, ct, internalMemUsedLeft, err
-			}
-			if t.Operator == tree.In || t.Operator == tree.NotIn {
-				negate := t.Operator == tree.NotIn
+					evalCtx, leftOp, leftIdx, string(tree.MustBeDString(constArg)), negate,
+				)
+			case tree.In, tree.NotIn:
+				negate := cmpOp == tree.NotIn
 				datumTuple, ok := tree.AsDTuple(constArg)
-				if !ok {
-					err = errors.Errorf("IN is only supported for constant expressions")
-					return nil, resultIdx, ct, internalMemUsed, err
+				if !ok || tupleContainsTuples(datumTuple) {
+					// Optimized IN operator is supported only on constant
+					// expressions that don't contain tuples (because tuples
+					// require special null-handling logic), so we fallback to
+					// the default comparison operator.
+					break
 				}
 				op, err = colexec.GetInOperator(lTyp, leftOp, leftIdx, datumTuple, negate)
-				return op, resultIdx, ct, internalMemUsedLeft, err
-			}
-			if t.Operator == tree.IsDistinctFrom || t.Operator == tree.IsNotDistinctFrom {
-				if t.Right != tree.DNull {
-					err = errors.Errorf("IS DISTINCT FROM and IS NOT DISTINCT FROM are supported only with NULL argument")
-					return nil, resultIdx, ct, internalMemUsed, err
+			case tree.IsDistinctFrom, tree.IsNotDistinctFrom:
+				if constArg != tree.DNull {
+					// Optimized IsDistinctFrom and IsNotDistinctFrom are
+					// supported only with NULL argument, so we fallback to the
+					// default comparison operator.
+					break
 				}
 				// IS NOT DISTINCT FROM NULL is synonymous with IS NULL and IS
 				// DISTINCT FROM NULL is synonymous with IS NOT NULL (except for
 				// tuples). Therefore, negate when the operator is IS DISTINCT
 				// FROM NULL.
-				negate := t.Operator == tree.IsDistinctFrom
-				op = colexec.NewIsNullSelOp(leftOp, leftIdx, negate)
-				return op, resultIdx, ct, internalMemUsedLeft, err
+				negate := cmpOp == tree.IsDistinctFrom
+				op = colexec.NewIsNullSelOp(leftOp, leftIdx, negate, false /* isTupleNull */)
 			}
-			op, err := colexec.GetSelectionConstOperator(
-				lTyp, t.TypedRight().ResolvedType(), cmpOp, leftOp, leftIdx, constArg, nil, /* binFn */
-			)
+			if op == nil {
+				// op hasn't been created yet, so let's try the constructor for
+				// all other selection operators.
+				op, err = colexec.GetSelectionConstOperator(
+					cmpOp, leftOp, ct, leftIdx, constArg, evalCtx, t,
+				)
+			}
 			return op, resultIdx, ct, internalMemUsedLeft, err
 		}
 		rightOp, rightIdx, ct, internalMemUsedRight, err := planProjectionOperators(
@@ -1506,7 +1507,7 @@ func planSelectionOperators(
 			return nil, resultIdx, ct, internalMemUsed, err
 		}
 		op, err := colexec.GetSelectionOperator(
-			lTyp, ct[rightIdx], cmpOp, rightOp, leftIdx, rightIdx, nil, /* binFn */
+			cmpOp, rightOp, ct, leftIdx, rightIdx, evalCtx, t,
 		)
 		return op, resultIdx, ct, internalMemUsedLeft + internalMemUsedRight, err
 	default:
@@ -1565,6 +1566,20 @@ func planProjectionOperators(
 	acc *mon.BoundAccount,
 	factory coldata.ColumnFactory,
 ) (op colexecbase.Operator, resultIdx int, typs []*types.T, internalMemUsed int, err error) {
+	// projectDatum is a helper function that adds a new constant projection
+	// operator for the given datum. typs are updated accordingly.
+	projectDatum := func(datum tree.Datum) (colexecbase.Operator, error) {
+		resultIdx = len(columnTypes)
+		datumType := datum.ResolvedType()
+		typs = appendOneType(columnTypes, datumType)
+		if datumType.Family() == types.UnknownFamily {
+			// We handle Unknown type by planning a special constant null
+			// operator.
+			return colexec.NewConstNullOp(colmem.NewAllocator(ctx, acc, factory), input, resultIdx), nil
+		}
+		constVal := colexec.GetDatumToPhysicalFn(datumType)(datum)
+		return colexec.NewConstOp(colmem.NewAllocator(ctx, acc, factory), input, datumType, constVal, resultIdx)
+	}
 	resultIdx = -1
 	switch t := expr.(type) {
 	case *tree.IndexedVar:
@@ -1572,7 +1587,7 @@ func planProjectionOperators(
 	case *tree.ComparisonExpr:
 		return planProjectionExpr(
 			ctx, evalCtx, t.Operator, t.ResolvedType(), t.TypedLeft(), t.TypedRight(),
-			columnTypes, input, acc, factory, nil, /* binFn */
+			columnTypes, input, acc, factory, nil /* binFn */, t,
 		)
 	case *tree.BinaryExpr:
 		if err = checkSupportedBinaryExpr(t.TypedLeft(), t.TypedRight(), t.ResolvedType()); err != nil {
@@ -1580,10 +1595,9 @@ func planProjectionOperators(
 		}
 		return planProjectionExpr(
 			ctx, evalCtx, t.Operator, t.ResolvedType(), t.TypedLeft(), t.TypedRight(),
-			columnTypes, input, acc, factory, t.Fn,
+			columnTypes, input, acc, factory, t.Fn.Fn, nil, /* cmpExpr */
 		)
 	case *tree.IsNullExpr:
-		t.TypedInnerExpr()
 		return planIsNullProjectionOp(ctx, evalCtx, t.ResolvedType(), t.TypedInnerExpr(), columnTypes, input, acc, false /* negate */, factory)
 	case *tree.IsNotNullExpr:
 		return planIsNullProjectionOp(ctx, evalCtx, t.ResolvedType(), t.TypedInnerExpr(), columnTypes, input, acc, true /* negate */, factory)
@@ -1626,21 +1640,46 @@ func planProjectionOperators(
 		typs = appendOneType(typs, t.ResolvedType())
 		return op, resultIdx, typs, internalMemUsed, err
 	case tree.Datum:
-		datumType := t.ResolvedType()
-		resultIdx = len(columnTypes)
-		typs = appendOneType(columnTypes, datumType)
-		if datumType.Family() == types.UnknownFamily {
-			// We handle Unknown type by planning a special constant null
-			// operator.
-			op = colexec.NewConstNullOp(colmem.NewAllocator(ctx, acc, factory), input, resultIdx)
-			return op, resultIdx, typs, internalMemUsed, nil
+		op, err = projectDatum(t)
+		return op, resultIdx, typs, internalMemUsed, err
+	case *tree.Tuple:
+		isConstTuple := true
+		for _, expr := range t.Exprs {
+			if _, isDatum := expr.(tree.Datum); !isDatum {
+				isConstTuple = false
+				break
+			}
 		}
-		constVal := colexec.GetDatumToPhysicalFn(datumType)(t)
-		op, err := colexec.NewConstOp(colmem.NewAllocator(ctx, acc, factory), input, datumType, constVal, resultIdx)
-		if err != nil {
-			return nil, resultIdx, typs, internalMemUsed, err
+		if isConstTuple {
+			// Tuple expression is a constant, so we can evaluate it and
+			// project the resulting datum.
+			tuple, err := t.Eval(evalCtx)
+			if err != nil {
+				return nil, resultIdx, typs, internalMemUsed, err
+			}
+			op, err = projectDatum(tuple)
+			return op, resultIdx, typs, internalMemUsed, err
 		}
-		return op, resultIdx, typs, internalMemUsed, nil
+		outputType := t.ResolvedType()
+		typs = make([]*types.T, len(columnTypes))
+		copy(typs, columnTypes)
+		tupleContentsIdxs := make([]int, len(t.Exprs))
+		for i, expr := range t.Exprs {
+			var memUsed int
+			input, tupleContentsIdxs[i], typs, memUsed, err = planProjectionOperators(
+				ctx, evalCtx, expr.(tree.TypedExpr), typs, input, acc, factory,
+			)
+			internalMemUsed += memUsed
+			if err != nil {
+				return nil, resultIdx, typs, internalMemUsed, err
+			}
+		}
+		resultIdx = len(typs)
+		op = colexec.NewTupleProjOp(
+			colmem.NewAllocator(ctx, acc, factory), typs, tupleContentsIdxs, outputType, input, resultIdx,
+		)
+		typs = appendOneType(typs, outputType)
+		return op, resultIdx, typs, internalMemUsed, err
 	case *tree.CaseExpr:
 		if t.Expr != nil {
 			return nil, resultIdx, typs, internalMemUsed, errors.New("CASE <expr> WHEN expressions unsupported")
@@ -1791,11 +1830,13 @@ func planProjectionExpr(
 	input colexecbase.Operator,
 	acc *mon.BoundAccount,
 	factory coldata.ColumnFactory,
-	binFn *tree.BinOp,
+	binFn tree.TwoArgFn,
+	cmpExpr *tree.ComparisonExpr,
 ) (op colexecbase.Operator, resultIdx int, typs []*types.T, internalMemUsed int, err error) {
 	if err := checkSupportedProjectionExpr(left, right); err != nil {
 		return nil, resultIdx, typs, internalMemUsed, err
 	}
+	allocator := colmem.NewAllocator(ctx, acc, factory)
 	resultIdx = -1
 	// There are 3 cases. Either the left is constant, the right is constant,
 	// or neither are constant.
@@ -1815,8 +1856,8 @@ func planProjectionExpr(
 		// The projection result will be outputted to a new column which is appended
 		// to the input batch.
 		op, err = colexec.GetProjectionLConstOperator(
-			colmem.NewAllocator(ctx, acc, factory), left.ResolvedType(), typs[rightIdx], outputType,
-			projOp, input, rightIdx, lConstArg, resultIdx, binFn, evalCtx,
+			allocator, typs, left.ResolvedType(), outputType, projOp, input,
+			rightIdx, lConstArg, resultIdx, evalCtx, binFn, cmpExpr,
 		)
 	} else {
 		var (
@@ -1830,41 +1871,63 @@ func planProjectionExpr(
 			return nil, resultIdx, typs, internalMemUsed, err
 		}
 		internalMemUsed += internalMemUsedLeft
+		// Note that this check exists only for testing purposes. On the
+		// regular workloads, we expect that tree.Tuples have already been
+		// pre-evaluated. We also don't need fully-fledged planning as we have
+		// for tree.Tuple in planProjectionOperators because the tests only
+		// use constant tuples.
+		if tuple, ok := right.(*tree.Tuple); ok {
+			tupleDatum, err := tuple.Eval(evalCtx)
+			if err != nil {
+				return nil, resultIdx, typs, internalMemUsed, err
+			}
+			right = tupleDatum
+		}
 		if rConstArg, rConst := right.(tree.Datum); rConst {
 			// Case 2: The right is constant.
 			// The projection result will be outputted to a new column which is appended
 			// to the input batch.
 			resultIdx = len(typs)
-			if projOp == tree.Like || projOp == tree.NotLike {
+			switch projOp {
+			case tree.Like, tree.NotLike:
 				negate := projOp == tree.NotLike
 				op, err = colexec.GetLikeProjectionOperator(
-					colmem.NewAllocator(ctx, acc, factory), evalCtx, input, leftIdx, resultIdx,
+					allocator, evalCtx, input, leftIdx, resultIdx,
 					string(tree.MustBeDString(rConstArg)), negate,
 				)
-			} else if projOp == tree.In || projOp == tree.NotIn {
+			case tree.In, tree.NotIn:
 				negate := projOp == tree.NotIn
 				datumTuple, ok := tree.AsDTuple(rConstArg)
-				if !ok {
-					err = errors.Errorf("IN operator supported only on constant expressions")
-					return nil, resultIdx, typs, internalMemUsed, err
+				if !ok || tupleContainsTuples(datumTuple) {
+					// Optimized IN operator is supported only on constant
+					// expressions that don't contain tuples (because tuples
+					// require special null-handling logic), so we fallback to
+					// the default comparison operator.
+					break
 				}
 				op, err = colexec.GetInProjectionOperator(
-					colmem.NewAllocator(ctx, acc, factory), typs[leftIdx], input, leftIdx,
-					resultIdx, datumTuple, negate,
+					allocator, typs[leftIdx], input, leftIdx, resultIdx, datumTuple, negate,
 				)
-			} else if projOp == tree.IsDistinctFrom || projOp == tree.IsNotDistinctFrom {
+			case tree.IsDistinctFrom, tree.IsNotDistinctFrom:
 				if right != tree.DNull {
-					err = errors.Errorf("IS DISTINCT FROM and IS NOT DISTINCT FROM are supported only with NULL argument")
-					return nil, resultIdx, typs, internalMemUsed, err
+					// Optimized IsDistinctFrom and IsNotDistinctFrom are
+					// supported only with NULL argument, so we fallback to the
+					// default comparison operator.
+					break
 				}
 				// IS NULL is replaced with IS NOT DISTINCT FROM NULL, so we want to
 				// negate when IS DISTINCT FROM is used.
 				negate := projOp == tree.IsDistinctFrom
-				op = colexec.NewIsNullProjOp(colmem.NewAllocator(ctx, acc, factory), input, leftIdx, resultIdx, negate)
-			} else {
+				op = colexec.NewIsNullProjOp(
+					allocator, input, leftIdx, resultIdx, negate, false, /* isTupleNull */
+				)
+			}
+			if op == nil {
+				// op hasn't been created yet, so let's try the constructor for
+				// all other projection operators.
 				op, err = colexec.GetProjectionRConstOperator(
-					colmem.NewAllocator(ctx, acc, factory), typs[leftIdx], right.ResolvedType(), outputType,
-					projOp, input, leftIdx, rConstArg, resultIdx, binFn, evalCtx,
+					allocator, typs, right.ResolvedType(), outputType, projOp,
+					input, leftIdx, rConstArg, resultIdx, evalCtx, binFn, cmpExpr,
 				)
 			}
 		} else {
@@ -1882,8 +1945,8 @@ func planProjectionExpr(
 			internalMemUsed += internalMemUsedRight
 			resultIdx = len(typs)
 			op, err = colexec.GetProjectionOperator(
-				colmem.NewAllocator(ctx, acc, factory), typs[leftIdx], typs[rightIdx], outputType,
-				projOp, input, leftIdx, rightIdx, resultIdx, binFn, evalCtx,
+				allocator, typs, outputType, projOp, input, leftIdx, rightIdx,
+				resultIdx, evalCtx, binFn, cmpExpr,
 			)
 		}
 	}
@@ -1981,7 +2044,10 @@ func planIsNullProjectionOp(
 		ctx, evalCtx, expr, columnTypes, input, acc, factory,
 	)
 	outputIdx := len(typs)
-	op = colexec.NewIsNullProjOp(colmem.NewAllocator(ctx, acc, factory), op, resultIdx, outputIdx, negate)
+	isTupleNull := typs[resultIdx].Family() == types.TupleFamily
+	op = colexec.NewIsNullProjOp(
+		colmem.NewAllocator(ctx, acc, factory), op, resultIdx, outputIdx, negate, isTupleNull,
+	)
 	typs = appendOneType(typs, outputType)
 	return op, outputIdx, typs, internalMemUsed, err
 }
@@ -1995,4 +2061,13 @@ func appendOneType(typs []*types.T, t *types.T) []*types.T {
 	copy(newTyps, typs)
 	newTyps[len(newTyps)-1] = t
 	return newTyps
+}
+
+func tupleContainsTuples(tuple *tree.DTuple) bool {
+	for _, typ := range tuple.ResolvedType().TupleContents() {
+		if typ.Family() == types.TupleFamily {
+			return true
+		}
+	}
+	return false
 }

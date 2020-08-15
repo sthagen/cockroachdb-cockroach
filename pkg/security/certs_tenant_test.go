@@ -25,7 +25,7 @@ import (
 	"golang.org/x/exp/rand"
 )
 
-func makeTenantCerts(t *testing.T, tenant string) (certsDir string, cleanup func()) {
+func makeTenantCerts(t *testing.T, tenant uint64) (certsDir string, cleanup func()) {
 	certsDir, cleanup = tempDir(t)
 
 	// Make certs for the tenant CA (= auth broker). In production, these would be
@@ -50,12 +50,12 @@ func makeTenantCerts(t *testing.T, tenant string) (certsDir string, cleanup func
 	require.NoError(t, security.WriteTenantClientPair(certsDir, tenantCerts, false /* overwrite */))
 
 	// The server also needs to show certs trusted by the client. These are the
-	// TenantServer certs.
+	// node certs.
 	serverCAKeyPath := filepath.Join(certsDir, "name-does-not-matter-too.key")
-	require.NoError(t, security.CreateTenantServerCAPair(
+	require.NoError(t, security.CreateCAPair(
 		certsDir, serverCAKeyPath, testKeySize, 1000*time.Hour, false, false,
 	))
-	require.NoError(t, security.CreateTenantServerPair(
+	require.NoError(t, security.CreateNodePair(
 		certsDir, serverCAKeyPath, testKeySize, 500*time.Hour, false, []string{"127.0.0.1"}))
 	return certsDir, cleanup
 }
@@ -81,18 +81,19 @@ func TestTenantCertificates(t *testing.T) {
 func testTenantCertificatesInner(t *testing.T, embedded bool) {
 	defer leaktest.AfterTest(t)()
 
-	var tenant, certsDir string
+	var certsDir string
+	var tenant uint64
 	if !embedded {
 		// Don't mock assets in this test, we're creating our own one-off certs.
 		security.ResetAssetLoader()
 		defer ResetTest()
-		tenant = fmt.Sprint(rand.Int63())
+		tenant = uint64(rand.Int63())
 		var cleanup func()
 		certsDir, cleanup = makeTenantCerts(t, tenant)
 		defer cleanup()
 	} else {
-		certsDir = security.EmbeddedTenantCertsDir
-		tenant = fmt.Sprint(security.EmbeddedTenantID)
+		certsDir = security.EmbeddedCertsDir
+		tenant = security.EmbeddedTenantIDs()[0]
 	}
 
 	// Now set up the config a server would use. The client will trust it based on
@@ -113,11 +114,12 @@ func testTenantCertificatesInner(t *testing.T, embedded bool) {
 	// server (which will validate them using the tenant CA).
 	clientTLSConfig, err := cm.GetTenantClientTLSConfig()
 	require.NoError(t, err)
+	require.NotNil(t, clientTLSConfig)
 
 	// Set up a HTTPS server using server TLS config, set up a http client using the
 	// client TLS config, make a request.
 
-	ln, err := net.Listen("tcp", "localhost:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
 	httpServer := http.Server{
@@ -142,5 +144,5 @@ func testTenantCertificatesInner(t *testing.T, embedded bool) {
 	defer resp.Body.Close()
 	b, err := ioutil.ReadAll(resp.Body)
 	require.NoError(t, err)
-	require.Equal(t, "hello, tenant "+tenant, string(b))
+	require.Equal(t, fmt.Sprintf("hello, tenant %d", tenant), string(b))
 }

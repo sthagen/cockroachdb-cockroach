@@ -320,11 +320,20 @@ message DeleteRangeResponse {
 //
 // NOTE: it is important that this method only be invoked on a key
 // range which is guaranteed to be both inactive and not see future
-// writes. Ignoring this warning may result in data loss.
+// writes (until Deadline, if set, below).
+// Ignoring this warning may result in data loss.
 message ClearRangeRequest {
   option (gogoproto.equal) = true;
 
   RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+
+  // Deadline can be set to a time at or after which the server will refuse to
+  // execute this ClearRange request, providing a form of replay protection:
+  // if a caller sets this to a time in the near future, they can then wait for
+  // that time (plus max offset) to have passed at which point they can reuse
+  // the span they cleared without fear of this request being replayed later and
+  // clearing subsequent writes.
+  util.hlc.Timestamp deadline = 2 [(gogoproto.nullable) = false];
 }
 
 // A ClearRangeResponse is the return value from the ClearRange() method.
@@ -1544,11 +1553,14 @@ message AdminScatterRequest {
 message AdminScatterResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 
+
   message Range {
     Span span = 1 [(gogoproto.nullable) = false];
     reserved 2;
   }
-  repeated Range ranges = 2 [(gogoproto.nullable) = false];
+  // This field is deprecated in 20.2 in favor of RangeInfos.
+  repeated Range deprecated_ranges = 2 [(gogoproto.nullable) = false];
+  repeated RangeInfo range_infos = 3 [(gogoproto.nullable) = false];
 }
 
 // AdminVerifyProtectedTimestampRequest is the argument to the
@@ -1885,6 +1897,15 @@ message Header {
   // operations. The default is CONSISTENT. This value is ignored for
   // write operations.
   ReadConsistencyType read_consistency = 6;
+  // wait_policy specifies the desired behavior for the batch request if it
+  // encounters a conflicting lock held by another active transaction.
+  //
+  // If an Error wait policy is set and a conflicting lock held by an active
+  // transaction is encountered, a WriteIntentError will be returned.
+  //
+  // If the desired behavior is to block on the conflicting lock up to some
+  // maximum duration, use the Block wait policy and set a context timeout.
+  kv.kvserver.concurrency.lock.WaitPolicy wait_policy = 18;
   // If set to a non-zero value, the total number of keys touched by requests in
   // the batch is limited. A resume span will be provided on the response of the
   // requests that were not able to run to completion before the limit was

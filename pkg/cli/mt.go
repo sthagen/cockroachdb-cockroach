@@ -12,13 +12,16 @@ package cli
 
 import "github.com/spf13/cobra"
 
+// AddMTCommand adds a subcommand to `./cockroach mt`.
+func AddMTCommand(cmd *cobra.Command) {
+	mtCmd.AddCommand(cmd)
+}
+
 func init() {
 	cockroachCmd.AddCommand(mtCmd)
 	mtCmd.AddCommand(mtStartSQLCmd)
 
 	mtCertsCmd.AddCommand(
-		mtCreateTenantServerCACertCmd,
-		mtCreateTenantServerCertCmd,
 		mtCreateTenantClientCACertCmd,
 		mtCreateTenantClientCertCmd,
 	)

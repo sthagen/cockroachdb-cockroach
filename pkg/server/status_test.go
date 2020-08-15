@@ -40,7 +40,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -354,6 +355,7 @@ func startServer(t *testing.T) *TestServer {
 
 func newRPCTestContext(ts *TestServer, cfg *base.Config) *rpc.Context {
 	rpcContext := rpc.NewContext(rpc.ContextOptions{
+		TenantID:   roachpb.SystemTenantID,
 		AmbientCtx: log.AmbientContext{Tracer: ts.ClusterSettings().Tracer},
 		Config:     cfg,
 		Clock:      ts.Clock(),
@@ -534,7 +536,7 @@ func TestStatusLocalLogs(t *testing.T) {
 	if err := getStatusJSONProto(ts, "logfiles/local", &wrapper); err != nil {
 		t.Fatal(err)
 	}
-	if a, e := len(wrapper.Files), 2; a != e {
+	if a, e := len(wrapper.Files), 1; a != e {
 		t.Fatalf("expected %d log files; got %d", e, a)
 	}
 
@@ -704,17 +706,14 @@ func TestStatusLogRedaction(t *testing.T) {
 			if err := getStatusJSONProto(ts, "logfiles/local", &wrapper); err != nil {
 				t.Fatal(err)
 			}
-			// We expect a main log and a stderr log.
-			if a, e := len(wrapper.Files), 2; a != e {
+			// We expect only the main log.
+			if a, e := len(wrapper.Files), 1; a != e {
 				t.Fatalf("expected %d log files; got %d: %+v", e, a, wrapper.Files)
 			}
-			var file log.FileInfo
-			// Find the main log.
-			for _, f := range wrapper.Files {
-				if !strings.Contains("stderr", f.Name) {
-					file = f
-					break
-				}
+			file := wrapper.Files[0]
+			// Assert that the log that's present is not a stderr log.
+			if strings.Contains("stderr", file.Name) {
+				t.Fatalf("expected main log, found %v", file.Name)
 			}
 
 			for _, tc := range testData {
@@ -1271,8 +1270,8 @@ func TestCertificatesResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// We expect 4 certificates: CA, node, and client certs for root, testuser.
-	if a, e := len(response.Certificates), 4; a != e {
+	// We expect 5 certificates: CA, node, and client certs for root, testuser, testuser2.
+	if a, e := len(response.Certificates), 5; a != e {
 		t.Errorf("expected %d certificates, found %d", e, a)
 	}
 
@@ -1592,7 +1591,7 @@ func TestStatusAPIStatements(t *testing.T) {
 			// be automatically retried, confusing the test success check.
 			continue
 		}
-		if strings.HasPrefix(respStatement.Key.KeyData.App, sqlbase.InternalAppNamePrefix) {
+		if strings.HasPrefix(respStatement.Key.KeyData.App, catconstants.InternalAppNamePrefix) {
 			// We ignore internal queries, these are not relevant for the
 			// validity of this test.
 			continue
@@ -1791,12 +1790,12 @@ func TestJobStatusResponse(t *testing.T) {
 			Details: jobspb.ImportDetails{
 				Tables: []jobspb.ImportDetails_Table{
 					{
-						Desc: &sqlbase.TableDescriptor{
+						Desc: &descpb.TableDescriptor{
 							ID: 1,
 						},
 					},
 					{
-						Desc: &sqlbase.TableDescriptor{
+						Desc: &descpb.TableDescriptor{
 							ID: 2,
 						},
 					},
@@ -1804,7 +1803,7 @@ func TestJobStatusResponse(t *testing.T) {
 				URIs: []string{"a", "b"},
 			},
 			Progress:      jobspb.ImportProgress{},
-			DescriptorIDs: []sqlbase.ID{1, 2, 3},
+			DescriptorIDs: []descpb.ID{1, 2, 3},
 		},
 		nil)
 	if err != nil {

@@ -38,6 +38,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -755,6 +757,24 @@ COPY t (a, b, c) FROM stdin;
 			err: "expected 2 columns, got 3",
 		},
 		{
+			name: "out-of-order and omitted COPY columns",
+			typ:  "PGDUMP",
+			data: `
+CREATE TABLE "public"."tbl" ("a" int primary key, "B" string, "c" int, d int DEFAULT 6);
+COPY "public"."tbl" (c, "a", "B") FROM STDIN;
+5	1	carrot
+9	3	mango
+\.
+END;
+			`,
+			query: map[string][][]string{
+				`SELECT a, "B", c, d FROM tbl`: {
+					{"1", "carrot", "5", "6"},
+					{"3", "mango", "9", "6"},
+				},
+			},
+		},
+		{
 			name: "fk",
 			typ:  "PGDUMP",
 			data: testPgdumpFk,
@@ -855,6 +875,17 @@ COPY t (a, b, c) FROM stdin;
 			},
 		},
 		{
+			name: "case sensitive table names",
+			typ:  "PGDUMP",
+			data: `
+				CREATE TABLE t ("sPoNgE" int8);
+				INSERT INTO t ("sPoNgE") VALUES (1337);
+			`,
+			query: map[string][][]string{
+				`SELECT * from t`: {{"1337"}},
+			},
+		},
+		{
 			name: "sequence",
 			typ:  "PGDUMP",
 			data: `
@@ -872,6 +903,27 @@ COPY t (a, b, c) FROM stdin;
 			query: map[string][][]string{
 				`SELECT nextval('i_seq')`:    {{"11"}},
 				`SHOW CREATE SEQUENCE i_seq`: {{"i_seq", "CREATE SEQUENCE i_seq MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1"}},
+			},
+		},
+		{
+			name: "ALTER COLUMN x SET NOT NULL",
+			typ:  "PGDUMP",
+			data: `
+				CREATE TABLE t (a INT8 PRIMARY KEY, b INT8);
+				ALTER TABLE t ALTER COLUMN a SET NOT NULL;
+			`,
+			query: map[string][][]string{
+				`SHOW CREATE TABLE t`: {
+					{
+						"t",
+						`CREATE TABLE public.t (
+	a INT8 NOT NULL,
+	b INT8 NULL,
+	CONSTRAINT "primary" PRIMARY KEY (a ASC),
+	FAMILY "primary" (a, b)
+)`,
+					},
+				},
 			},
 		},
 		{
@@ -1642,11 +1694,10 @@ func TestImportCSVStmt(t *testing.T) {
 		// to the failed import will be one higher than the ID of the empty database
 		// it was created in.
 		dbID := sqlutils.QueryDatabaseID(t, sqlDB.DB, "failedimport")
-		tableID := sqlbase.ID(dbID + 1)
-		var td *sqlbase.TableDescriptor
-		if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			var err error
-			td, err = sqlbase.GetTableDescFromID(ctx, txn, keys.SystemSQLCodec, tableID)
+		tableID := descpb.ID(dbID + 1)
+		var td *sqlbase.ImmutableTableDescriptor
+		if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+			td, err = catalogkv.MustGetTableDescByID(ctx, txn, keys.SystemSQLCodec, tableID)
 			return err
 		}); err != nil {
 			t.Fatal(err)
@@ -1667,7 +1718,7 @@ func TestImportCSVStmt(t *testing.T) {
 		tests.CheckKeyCount(t, kvDB, td.TableSpan(keys.SystemSQLCodec), 0)
 		// Expect that the table descriptor is deleted.
 		if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			_, err := sqlbase.GetTableDescFromID(ctx, txn, keys.SystemSQLCodec, tableID)
+			_, err := catalogkv.MustGetTableDescByID(ctx, txn, keys.SystemSQLCodec, tableID)
 			if !testutils.IsError(err, "descriptor not found") {
 				return err
 			}
@@ -1818,15 +1869,9 @@ IMPORT TABLE import_with_db_privs (a INT8 PRIMARY KEY, b STRING) CSV DATA (%s)`,
 		sqlDB.Exec(t, `USE uds`)
 		sqlDB.Exec(t, `CREATE SCHEMA sc`)
 		// Now import into a table under sc.
-		sqlDB.Exec(t, fmt.Sprintf(`IMPORT TABLE uds.sc.t (a INT8 PRIMARY KEY, b STRING) CSV DATA (%s)`, testFiles.files[0]))
-		// Verify that the table was created and has the right number of rows.
-		var result int
-		sqlDB.QueryRow(t, `SELECT count(*) FROM uds.sc.t`).Scan(&result)
-		require.Equal(t, rowsPerFile, result)
-		// Try the same thing, but with IMPORT INTO.
-		sqlDB.Exec(t, `DROP TABLE uds.sc.t`)
 		sqlDB.Exec(t, `CREATE TABLE uds.sc.t (a INT8 PRIMARY KEY, b STRING)`)
 		sqlDB.Exec(t, fmt.Sprintf(`IMPORT INTO uds.sc.t (a, b) CSV DATA (%s)`, testFiles.files[0]))
+		var result int
 		sqlDB.QueryRow(t, `SELECT count(*) FROM uds.sc.t`).Scan(&result)
 		require.Equal(t, rowsPerFile, result)
 	})
@@ -1835,12 +1880,15 @@ IMPORT TABLE import_with_db_privs (a INT8 PRIMARY KEY, b STRING) CSV DATA (%s)`,
 func TestExportImportRoundTrip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 	baseDir, cleanup := testutils.TempDir(t)
 	defer cleanup()
+
 	tc := testcluster.StartTestCluster(
 		t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{ExternalIODir: baseDir}})
 	defer tc.Stopper().Stop(ctx)
+
 	conn := tc.Conns[0]
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
@@ -1854,19 +1902,19 @@ func TestExportImportRoundTrip(t *testing.T) {
 		// with a unique directory name per run.
 		{
 			stmts: `EXPORT INTO CSV 'nodelocal://0/%[1]s' FROM SELECT ARRAY['a', 'b', 'c'];
-							IMPORT TABLE t (x TEXT[]) CSV DATA ('nodelocal://0/%[1]s/n1.0.csv')`,
+							IMPORT TABLE t (x TEXT[]) CSV DATA ('nodelocal://0/%[1]s/export*-n1.0.csv')`,
 			tbl:      "t",
 			expected: `SELECT ARRAY['a', 'b', 'c']`,
 		},
 		{
 			stmts: `EXPORT INTO CSV 'nodelocal://0/%[1]s' FROM SELECT ARRAY[b'abc', b'\141\142\143', b'\x61\x62\x63'];
-							IMPORT TABLE t (x BYTES[]) CSV DATA ('nodelocal://0/%[1]s/n1.0.csv')`,
+							IMPORT TABLE t (x BYTES[]) CSV DATA ('nodelocal://0/%[1]s/export*-n1.0.csv')`,
 			tbl:      "t",
 			expected: `SELECT ARRAY[b'abc', b'\141\142\143', b'\x61\x62\x63']`,
 		},
 		{
 			stmts: `EXPORT INTO CSV 'nodelocal://0/%[1]s' FROM SELECT 'dog' COLLATE en;
-							IMPORT TABLE t (x STRING COLLATE en) CSV DATA ('nodelocal://0/%[1]s/n1.0.csv')`,
+							IMPORT TABLE t (x STRING COLLATE en) CSV DATA ('nodelocal://0/%[1]s/export*-n1.0.csv')`,
 			tbl:      "t",
 			expected: `SELECT 'dog' COLLATE en`,
 		},
@@ -2916,7 +2964,7 @@ func BenchmarkCSVConvertRecord(b *testing.B) {
 	semaCtx := tree.MakeSemaContext()
 	evalCtx := tree.MakeTestingEvalContext(st)
 
-	tableDesc, err := MakeSimpleTableDescriptor(ctx, &semaCtx, st, create, sqlbase.ID(100), keys.PublicSchemaID, sqlbase.ID(100), NoFKs, 1)
+	tableDesc, err := MakeSimpleTableDescriptor(ctx, &semaCtx, st, create, descpb.ID(100), keys.PublicSchemaID, descpb.ID(100), NoFKs, 1)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -2928,10 +2976,9 @@ func BenchmarkCSVConvertRecord(b *testing.B) {
 		}
 	}()
 
-	descr := tableDesc.TableDesc()
 	importCtx := &parallelImportContext{
 		evalCtx:   &evalCtx,
-		tableDesc: descr,
+		tableDesc: tableDesc.Immutable().(*sqlbase.ImmutableTableDescriptor),
 		kvCh:      kvCh,
 	}
 
@@ -3356,7 +3403,7 @@ func BenchmarkDelimitedConvertRecord(b *testing.B) {
 	semaCtx := tree.MakeSemaContext()
 	evalCtx := tree.MakeTestingEvalContext(st)
 
-	tableDesc, err := MakeSimpleTableDescriptor(ctx, &semaCtx, st, create, sqlbase.ID(100), keys.PublicSchemaID, sqlbase.ID(100), NoFKs, 1)
+	tableDesc, err := MakeSimpleTableDescriptor(ctx, &semaCtx, st, create, descpb.ID(100), keys.PublicSchemaID, descpb.ID(100), NoFKs, 1)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -3368,15 +3415,15 @@ func BenchmarkDelimitedConvertRecord(b *testing.B) {
 		}
 	}()
 
-	descr := tableDesc.TableDesc()
-	cols := make(tree.NameList, len(descr.Columns))
-	for i, col := range descr.Columns {
+	cols := make(tree.NameList, len(tableDesc.Columns))
+	for i, col := range tableDesc.Columns {
 		cols[i] = tree.Name(col.Name)
 	}
 	r, err := newMysqloutfileReader(roachpb.MySQLOutfileOptions{
 		RowSeparator:   '\n',
 		FieldSeparator: '\t',
-	}, kvCh, 0, 0, descr, &evalCtx)
+	}, kvCh, 0, 0,
+		tableDesc.Immutable().(*sqlbase.ImmutableTableDescriptor), &evalCtx)
 	require.NoError(b, err)
 
 	producer := &csvBenchmarkStream{
@@ -3457,8 +3504,8 @@ func BenchmarkPgCopyConvertRecord(b *testing.B) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
 
-	tableDesc, err := MakeSimpleTableDescriptor(ctx, &semaCtx, st, create, sqlbase.ID(100), keys.PublicSchemaID,
-		sqlbase.ID(100), NoFKs, 1)
+	tableDesc, err := MakeSimpleTableDescriptor(ctx, &semaCtx, st, create, descpb.ID(100), keys.PublicSchemaID,
+		descpb.ID(100), NoFKs, 1)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -3470,16 +3517,16 @@ func BenchmarkPgCopyConvertRecord(b *testing.B) {
 		}
 	}()
 
-	descr := tableDesc.TableDesc()
-	cols := make(tree.NameList, len(descr.Columns))
-	for i, col := range descr.Columns {
+	cols := make(tree.NameList, len(tableDesc.Columns))
+	for i, col := range tableDesc.Columns {
 		cols[i] = tree.Name(col.Name)
 	}
 	r, err := newPgCopyReader(roachpb.PgCopyOptions{
 		Delimiter:  '\t',
 		Null:       `\N`,
 		MaxRowSize: 4096,
-	}, kvCh, 0, 0, descr, &evalCtx)
+	}, kvCh, 0, 0,
+		tableDesc.Immutable().(*sqlbase.ImmutableTableDescriptor), &evalCtx)
 	require.NoError(b, err)
 
 	producer := &csvBenchmarkStream{
@@ -3720,6 +3767,10 @@ func TestImportLivenessWithRestart(t *testing.T) {
 	const nodes = 1
 	nl := jobs.NewFakeNodeLiveness(nodes)
 	serverArgs := base.TestServerArgs{
+		Settings: cluster.MakeTestingClusterSettingsWithVersions(
+			roachpb.Version{Major: 20, Minor: 1},
+			roachpb.Version{Major: 20, Minor: 1},
+			true),
 		Knobs: base.TestingKnobs{
 			RegistryLiveness: nl,
 		},
@@ -3851,6 +3902,10 @@ func TestImportLivenessWithLeniency(t *testing.T) {
 	const nodes = 1
 	nl := jobs.NewFakeNodeLiveness(nodes)
 	serverArgs := base.TestServerArgs{
+		Settings: cluster.MakeTestingClusterSettingsWithVersions(
+			roachpb.Version{Major: 20, Minor: 1},
+			roachpb.Version{Major: 20, Minor: 1},
+			true),
 		Knobs: base.TestingKnobs{
 			RegistryLiveness: nl,
 		},
@@ -4438,6 +4493,11 @@ func TestImportPgDump(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("glob-multi", func(t *testing.T) {
+		sqlDB.ExpectErr(t, "SQL dump files must be imported individually", `IMPORT PGDUMP 'nodelocal://0/*'`)
+	})
+
 	t.Run("target-cols-reordered", func(t *testing.T) {
 		data := `
 				CREATE TABLE "t" ("a" INT, "b" INT DEFAULT 42, "c" INT);
@@ -4481,40 +4541,62 @@ func TestImportPgDumpGeo(t *testing.T) {
 	ctx := context.Background()
 	baseDir := filepath.Join("testdata", "pgdump")
 	args := base.TestServerArgs{ExternalIODir: baseDir}
-	tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: args})
-	defer tc.Stopper().Stop(ctx)
-	conn := tc.Conns[0]
-	sqlDB := sqlutils.MakeSQLRunner(conn)
 
-	// Import geo.sql.
-	sqlDB.Exec(t, `CREATE DATABASE importdb; SET DATABASE = importdb`)
-	sqlDB.Exec(t, "IMPORT PGDUMP 'nodelocal://0/geo.sql'")
+	t.Run("geo_shp2pgsql.sql", func(t *testing.T) {
+		tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: args})
+		defer tc.Stopper().Stop(ctx)
+		conn := tc.Conns[0]
+		sqlDB := sqlutils.MakeSQLRunner(conn)
 
-	// Execute geo.sql.
-	sqlDB.Exec(t, `CREATE DATABASE execdb; SET DATABASE = execdb`)
-	geoSQL, err := ioutil.ReadFile(filepath.Join(baseDir, "geo.sql"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	sqlDB.Exec(t, string(geoSQL))
+		sqlDB.Exec(t, `CREATE DATABASE importdb; SET DATABASE = importdb`)
+		sqlDB.Exec(t, "IMPORT PGDUMP 'nodelocal://0/geo_shp2pgsql.sql'")
 
-	// Verify both created tables are identical.
-	importCreate := sqlDB.QueryStr(t, "SELECT create_statement FROM [SHOW CREATE importdb.nyc_census_blocks]")
-	// Families are slightly different due to rowid showing up in exec but
-	// not import (possibly due to the ALTER TABLE statement that makes
-	// gid a primary key), so add that into import to match exec.
-	importCreate[0][0] = strings.Replace(importCreate[0][0], "boroname, geom", "boroname, rowid, geom", 1)
-	sqlDB.CheckQueryResults(t, "SELECT create_statement FROM [SHOW CREATE execdb.nyc_census_blocks]", importCreate)
+		sqlDB.Exec(t, `CREATE DATABASE execdb; SET DATABASE = execdb`)
+		geoSQL, err := ioutil.ReadFile(filepath.Join(baseDir, "geo_shp2pgsql.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sqlDB.Exec(t, string(geoSQL))
 
-	importCols := "blkid, popn_total, popn_white, popn_black, popn_nativ, popn_asian, popn_other, boroname"
-	importSelect := sqlDB.QueryStr(t, fmt.Sprintf(
-		"SELECT (%s) FROM importdb.nyc_census_blocks ORDER BY PRIMARY KEY importdb.nyc_census_blocks",
-		importCols,
-	))
-	sqlDB.CheckQueryResults(t, fmt.Sprintf(
-		"SELECT (%s) FROM execdb.nyc_census_blocks ORDER BY PRIMARY KEY execdb.nyc_census_blocks",
-		importCols,
-	), importSelect)
+		// Verify both created tables are identical.
+		importCreate := sqlDB.QueryStr(t, "SELECT create_statement FROM [SHOW CREATE importdb.nyc_census_blocks]")
+		// Families are slightly different due to rowid showing up in exec but
+		// not import (possibly due to the ALTER TABLE statement that makes
+		// gid a primary key), so add that into import to match exec.
+		importCreate[0][0] = strings.Replace(importCreate[0][0], "boroname, geom", "boroname, rowid, geom", 1)
+		sqlDB.CheckQueryResults(t, "SELECT create_statement FROM [SHOW CREATE execdb.nyc_census_blocks]", importCreate)
+
+		importCols := "blkid, popn_total, popn_white, popn_black, popn_nativ, popn_asian, popn_other, boroname"
+		importSelect := sqlDB.QueryStr(t, fmt.Sprintf(
+			"SELECT (%s) FROM importdb.nyc_census_blocks ORDER BY PRIMARY KEY importdb.nyc_census_blocks",
+			importCols,
+		))
+		sqlDB.CheckQueryResults(t, fmt.Sprintf(
+			"SELECT (%s) FROM execdb.nyc_census_blocks ORDER BY PRIMARY KEY execdb.nyc_census_blocks",
+			importCols,
+		), importSelect)
+	})
+
+	t.Run("geo_ogr2ogr.sql", func(t *testing.T) {
+		tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: args})
+		defer tc.Stopper().Stop(ctx)
+		conn := tc.Conns[0]
+		sqlDB := sqlutils.MakeSQLRunner(conn)
+
+		sqlDB.Exec(t, `CREATE DATABASE importdb; SET DATABASE = importdb`)
+		sqlDB.Exec(t, "IMPORT PGDUMP 'nodelocal://0/geo_ogr2ogr.sql'")
+
+		sqlDB.Exec(t, `CREATE DATABASE execdb; SET DATABASE = execdb`)
+		geoSQL, err := ioutil.ReadFile(filepath.Join(baseDir, "geo_ogr2ogr.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sqlDB.Exec(t, string(geoSQL))
+
+		// Verify both created tables are identical.
+		importCreate := sqlDB.QueryStr(t, `SELECT create_statement FROM [SHOW CREATE importdb."HydroNode"]`)
+		sqlDB.CheckQueryResults(t, `SELECT create_statement FROM [SHOW CREATE execdb."HydroNode"]`, importCreate)
+	})
 }
 
 func TestImportCockroachDump(t *testing.T) {
@@ -4755,15 +4837,9 @@ func TestImportAvro(t *testing.T) {
 	t.Run("user-defined-schemas", func(t *testing.T) {
 		sqlDB.Exec(t, `SET experimental_enable_user_defined_schemas = true`)
 		sqlDB.Exec(t, `CREATE SCHEMA myschema`)
-		// Test with normal IMPORT.
-		sqlDB.Exec(t, `IMPORT TABLE myschema.simple (i INT8 PRIMARY KEY, s text, b bytea) AVRO DATA ($1)`, simpleOcf)
-		var numRows int
-		sqlDB.QueryRow(t, `SELECT count(*) FROM myschema.simple`).Scan(&numRows)
-		require.True(t, numRows > 0)
-		// Test with IMPORT INTO.
-		sqlDB.Exec(t, `DROP TABLE myschema.simple`)
 		sqlDB.Exec(t, `CREATE TABLE myschema.simple (i INT8 PRIMARY KEY, s text, b bytea)`)
 		sqlDB.Exec(t, `IMPORT INTO myschema.simple (i, s, b) AVRO DATA ($1)`, simpleOcf)
+		var numRows int
 		sqlDB.QueryRow(t, `SELECT count(*) FROM myschema.simple`).Scan(&numRows)
 		require.True(t, numRows > 0)
 	})

@@ -59,8 +59,10 @@ var (
 	cloud                         = gce
 	encrypt          encryptValue = "false"
 	instanceType     string
+	localSSD         bool
 	workload         string
 	roachprod        string
+	createArgs       []string
 	buildTag         string
 	clusterName      string
 	clusterWipe      bool
@@ -708,6 +710,10 @@ func isSSD(machineType string) bool {
 	if cloud != aws {
 		panic("can only differentiate SSDs based on machine type on AWS")
 	}
+	if !localSSD {
+		// Overridden by the user using a cmd arg.
+		return false
+	}
 
 	typeAndSize := strings.Split(machineType, ".")
 	if len(typeAndSize) == 2 {
@@ -926,6 +932,9 @@ func (s *clusterSpec) args() []string {
 	}
 	if s.Lifetime != 0 {
 		args = append(args, "--lifetime="+s.Lifetime.String())
+	}
+	if len(createArgs) > 0 {
+		args = append(args, createArgs...)
 	}
 	return args
 }
@@ -1228,7 +1237,7 @@ func (f *clusterFactory) newCluster(
 
 	sargs := []string{roachprod, "create", c.name, "-n", fmt.Sprint(c.spec.NodeCount)}
 	sargs = append(sargs, cfg.spec.args()...)
-	if !cfg.useIOBarrier {
+	if !cfg.useIOBarrier && localSSD {
 		sargs = append(sargs, "--local-ssd-no-ext4-barrier")
 	}
 
@@ -1485,6 +1494,38 @@ func (c *cluster) FetchLogs(ctx context.Context) error {
 		}
 
 		return execCmd(ctx, c.l, roachprod, "get", c.name, "logs" /* src */, path /* dest */)
+	})
+}
+
+// FetchDiskUsage collects a summary of the disk usage on nodes.
+func (c *cluster) FetchDiskUsage(ctx context.Context) error {
+	// TODO(jackson): This is temporary for debugging out-of-disk-space
+	// failures like #44845.
+	if c.spec.NodeCount == 0 || c.isLocal() {
+		// No nodes can happen during unit tests and implies nothing to do.
+		// Also, don't grab disk usage on local runs.
+		return nil
+	}
+
+	c.l.Printf("fetching disk usage\n")
+	c.status("fetching disk usage")
+
+	// Don't hang forever.
+	return contextutil.RunWithTimeout(ctx, "disk usage", 20*time.Second, func(ctx context.Context) error {
+		const name = "diskusage.txt"
+		path := filepath.Join(c.t.ArtifactsDir(), name)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			return err
+		}
+		if err := execCmd(
+			ctx, c.l, roachprod, "ssh", c.name, "--",
+			"/bin/bash", "-c", "'du -c /mnt/data1 > "+name+"'",
+		); err != nil {
+			// Don't error out because it might've worked on some nodes. Fetching will
+			// error out below but will get everything it can first.
+			c.l.Printf("during disk usage fetching: %s", err)
+		}
+		return execCmd(ctx, c.l, roachprod, "get", c.name, name /* src */, path /* dest */)
 	})
 }
 

@@ -72,15 +72,14 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		t.Run(tc.desc, func(t *testing.T) {
-			runTests(t, []tuples{tc.inputTuples}, tc.outputTuples, orderedVerifier,
-				func(input []colexecbase.Operator) (colexecbase.Operator, error) {
-					return createTestProjectingOperator(
-						ctx, flowCtx, input[0], tc.inputTypes,
-						tc.expr, false, /* canFallbackToRowexec */
-					)
-				})
-		})
+		log.Infof(ctx, "%s", tc.desc)
+		runTests(t, []tuples{tc.inputTuples}, tc.outputTuples, orderedVerifier,
+			func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+				return createTestProjectingOperator(
+					ctx, flowCtx, input[0], tc.inputTypes,
+					tc.expr, false, /* canFallbackToRowexec */
+				)
+			})
 	}
 }
 
@@ -96,7 +95,7 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 		},
 	}
 
-	batch := testAllocator.NewMemBatch([]*types.T{types.Int})
+	batch := testAllocator.NewMemBatchWithMaxCapacity([]*types.T{types.Int})
 	col := batch.ColVec(0).Int64()
 
 	for i := 0; i < coldata.BatchSize(); i++ {
@@ -156,10 +155,11 @@ func BenchmarkBuiltinFunctions(b *testing.B) {
 // and the specialized operator.
 func BenchmarkCompareSpecializedOperators(b *testing.B) {
 	ctx := context.Background()
-	tctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	defer evalCtx.Stop(ctx)
 
 	typs := []*types.T{types.String, types.Int, types.Int}
-	batch := testAllocator.NewMemBatch(typs)
+	batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	outputIdx := 3
 	bCol := batch.ColVec(0).Bytes()
 	sCol := batch.ColVec(1).Int64()
@@ -190,7 +190,7 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 	defaultOp := &defaultBuiltinFuncOperator{
 		OneInputNode:        NewOneInputNode(source),
 		allocator:           testAllocator,
-		evalCtx:             tctx,
+		evalCtx:             evalCtx,
 		funcExpr:            typedExpr.(*tree.FuncExpr),
 		outputIdx:           outputIdx,
 		columnTypes:         typs,

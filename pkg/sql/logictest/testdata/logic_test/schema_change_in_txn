@@ -32,8 +32,8 @@ COMMIT
 query TTTTB
 SHOW CONSTRAINTS FROM test.child
 ----
-child  fk_child_parent_id  FOREIGN KEY  FOREIGN KEY (parent_id) REFERENCES public.parent(id)  false
-child  primary             PRIMARY KEY  PRIMARY KEY (id ASC)                                  true
+child  fk_child_parent_id  FOREIGN KEY  FOREIGN KEY (parent_id) REFERENCES parent(id)  false
+child  primary             PRIMARY KEY  PRIMARY KEY (id ASC)                           true
 
 statement ok
 ALTER TABLE test.child VALIDATE CONSTRAINT fk_child_parent_id
@@ -41,8 +41,8 @@ ALTER TABLE test.child VALIDATE CONSTRAINT fk_child_parent_id
 query TTTTB
 SHOW CONSTRAINTS FROM test.child
 ----
-child  fk_child_parent_id  FOREIGN KEY  FOREIGN KEY (parent_id) REFERENCES public.parent(id)  true
-child  primary             PRIMARY KEY  PRIMARY KEY (id ASC)                                  true
+child  fk_child_parent_id  FOREIGN KEY  FOREIGN KEY (parent_id) REFERENCES parent(id)  true
+child  primary             PRIMARY KEY  PRIMARY KEY (id ASC)                           true
 
 statement ok
 DROP TABLE test.child, test.parent
@@ -74,8 +74,8 @@ COMMIT
 query TTTTB
 SHOW CONSTRAINTS FROM test.child
 ----
-child  fk_child_parent_id  FOREIGN KEY  FOREIGN KEY (parent_id) REFERENCES public.parent(id)  true
-child  primary             PRIMARY KEY  PRIMARY KEY (id ASC)                                  true
+child  fk_child_parent_id  FOREIGN KEY  FOREIGN KEY (parent_id) REFERENCES parent(id)  true
+child  primary             PRIMARY KEY  PRIMARY KEY (id ASC)                           true
 
 statement ok
 DROP TABLE test.child, test.parent
@@ -658,11 +658,8 @@ TRUNCATE want
 statement ok
 INSERT INTO want (k,v) VALUES ('a', 'b')
 
-statement ok
-CREATE INDEX foo on want (v)
-
 query TT
-SELECT * FROM want@foo
+SELECT * FROM want
 ----
 a b
 
@@ -680,8 +677,7 @@ BEGIN
 statement ok
 TRUNCATE orders
 
-# table orders is not visible to the transaction #17949
-statement error pgcode 42P01 relation "orders" does not exist
+statement ok
 INSERT INTO orders (k,v) VALUES ('a', 'b')
 
 statement ok
@@ -693,8 +689,7 @@ BEGIN
 statement ok
 TRUNCATE customers CASCADE
 
-# table customers is not visible to the transaction #17949
-statement error pgcode 42P01 relation "customers" does not exist
+statement ok
 INSERT INTO customers (k) VALUES ('b')
 
 statement ok
@@ -1520,8 +1515,8 @@ COMMIT
 query TTTTB
 SHOW CONSTRAINTS FROM y
 ----
-y  fk_b_ref_x  FOREIGN KEY  FOREIGN KEY (b) REFERENCES public.x(b)  true
-y  primary     PRIMARY KEY  PRIMARY KEY (a ASC)                     true
+y  fk_b_ref_x  FOREIGN KEY  FOREIGN KEY (b) REFERENCES x(b)  true
+y  primary     PRIMARY KEY  PRIMARY KEY (a ASC)              true
 
 # Also test dropping the index on the referenced side
 statement ok

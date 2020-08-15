@@ -15,8 +15,11 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -99,7 +102,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	}
 
 	txn := kvDB.NewTxn(ctx, "lookup-test-db-id")
-	found, dbID, err := sqlbase.LookupDatabaseID(ctx, txn, codec, "test")
+	found, dbID, err := catalogkv.LookupDatabaseID(ctx, txn, codec, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,16 +130,16 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	if _, err := kvDB.Inc(ctx, codec.DescIDSequenceKey(), 1); err != nil {
 		t.Fatal(err)
 	}
-	mKey := sqlbase.MakeDescMetadataKey(codec, sqlbase.ID(idCounter))
+	mKey := sqlbase.MakeDescMetadataKey(codec, descpb.ID(idCounter))
 	// Fill the dummy descriptor with garbage.
 	desc := sqlbase.InitTableDescriptor(
-		sqlbase.ID(idCounter),
+		descpb.ID(idCounter),
 		dbID,
 		keys.PublicSchemaID,
 		"rel",
 		hlc.Timestamp{},
-		&sqlbase.PrivilegeDescriptor{},
-		false,
+		&descpb.PrivilegeDescriptor{},
+		tree.PersistencePermanent,
 	)
 	if err := desc.AllocateIDs(); err != nil {
 		t.Fatal(err)

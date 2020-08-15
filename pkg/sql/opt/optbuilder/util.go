@@ -446,13 +446,13 @@ func (b *Builder) resolveAndBuildScalar(
 // In Postgres, qualifying an object name with pg_temp is equivalent to explicitly
 // specifying TEMP/TEMPORARY in the CREATE syntax. resolveTemporaryStatus returns
 // true if either(or both) of these conditions are true.
-func resolveTemporaryStatus(name *tree.TableName, explicitTemp bool) bool {
+func resolveTemporaryStatus(name *tree.TableName, persistence tree.Persistence) bool {
 	// An explicit schema can only be provided in the CREATE TEMP TABLE statement
 	// iff it is pg_temp.
-	if explicitTemp && name.ExplicitSchema && name.SchemaName != sessiondata.PgTempSchemaName {
+	if persistence.IsTemporary() && name.ExplicitSchema && name.SchemaName != sessiondata.PgTempSchemaName {
 		panic(pgerror.New(pgcode.InvalidTableDefinition, "cannot create temporary relation in non-temporary schema"))
 	}
-	return name.SchemaName == sessiondata.PgTempSchemaName || explicitTemp
+	return name.SchemaName == sessiondata.PgTempSchemaName || persistence.IsTemporary()
 }
 
 // resolveSchemaForCreate returns the schema that will contain a newly created
@@ -532,6 +532,11 @@ func (b *Builder) resolveTableForMutation(
 
 	if outerAlias != nil {
 		alias = *outerAlias
+	}
+
+	// We can't mutate materialized views.
+	if tab.IsMaterializedView() {
+		panic(pgerror.Newf(pgcode.WrongObjectType, "cannot mutate materialized view %q", tab.Name()))
 	}
 
 	return tab, depName, alias, columns
@@ -640,7 +645,7 @@ func resolveNumericColumnRefs(tab cat.Table, columns []tree.ColumnID) (ordinals 
 		ord := 0
 		cnt := tab.ColumnCount()
 		for ord < cnt {
-			if tab.Column(ord).ColID() == cat.StableID(c) && !cat.IsMutationColumn(tab, ord) {
+			if tab.Column(ord).ColID() == cat.StableID(c) && cat.IsSelectableColumn(tab, ord) {
 				break
 			}
 			ord++
@@ -663,4 +668,37 @@ func findPublicTableColumnByName(tab cat.Table, name tree.Name) int {
 		}
 	}
 	return -1
+}
+
+type columnKinds struct {
+	// If true, include columns being added or dropped from the table. These
+	// are currently required by the execution engine as "fetch columns", when
+	// performing mutation DML statements (INSERT, UPDATE, UPSERT, DELETE).
+	includeMutations bool
+
+	// If true, include system columns.
+	includeSystem bool
+
+	// If true, include virtual columns.
+	includeVirtual bool
+}
+
+// tableOrdinals returns a slice of ordinals that correspond to table columns of
+// the desired kinds.
+func tableOrdinals(tab cat.Table, k columnKinds) []int {
+	n := tab.ColumnCount()
+	shouldInclude := [...]bool{
+		cat.Ordinary:   true,
+		cat.WriteOnly:  k.includeMutations,
+		cat.DeleteOnly: k.includeMutations,
+		cat.System:     k.includeSystem,
+		cat.Virtual:    k.includeVirtual,
+	}
+	ordinals := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		if shouldInclude[tab.ColumnKind(i)] {
+			ordinals = append(ordinals, i)
+		}
+	}
+	return ordinals
 }

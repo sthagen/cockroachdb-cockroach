@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -64,7 +65,7 @@ import (
 func SplitTable(
 	t *testing.T,
 	tc serverutils.TestClusterInterface,
-	desc *sqlbase.TableDescriptor,
+	desc *sqlbase.ImmutableTableDescriptor,
 	sps []SplitPoint,
 ) {
 	if tc.ReplicationMode() != base.ReplicationManual {
@@ -161,11 +162,22 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 				return
 			default:
 				// Split the table at a random row.
-				desc := sqlbase.TestingGetTableDescriptor(cdb, keys.SystemSQLCodec, "test", "t")
+				var tableDesc *sqlbase.ImmutableTableDescriptor
+				require.NoError(t, cdb.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+					desc, err := catalogkv.UncachedPhysicalAccessor{}.GetObjectDesc(ctx,
+						txn, tc.Server(0).ClusterSettings(), keys.SystemSQLCodec,
+						"test", "public", "t",
+						tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveAnyTableKind))
+					if err != nil {
+						return err
+					}
+					tableDesc = desc.(*sqlbase.ImmutableTableDescriptor)
+					return nil
+				}))
 
 				val := rng.Intn(n)
 				t.Logf("splitting at %d", val)
-				pik, err := sqlbase.TestingMakePrimaryIndexKey(desc, val)
+				pik, err := sqlbase.TestingMakePrimaryIndexKey(tableDesc, val)
 				if err != nil {
 					panic(err)
 				}
@@ -278,15 +290,17 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 			{
 				Desc: descs[0],
 				Lease: roachpb.Lease{
-					Replica: roachpb.ReplicaDescriptor{NodeID: 1, StoreID: 1, ReplicaID: 1},
-					Start:   hlc.MinTimestamp,
+					Replica:  roachpb.ReplicaDescriptor{NodeID: 1, StoreID: 1, ReplicaID: 1},
+					Start:    hlc.MinTimestamp,
+					Sequence: 1,
 				},
 			},
 			{
 				Desc: descs[1],
 				Lease: roachpb.Lease{
-					Replica: roachpb.ReplicaDescriptor{NodeID: 2, StoreID: 2, ReplicaID: 2},
-					Start:   hlc.MinTimestamp,
+					Replica:  roachpb.ReplicaDescriptor{NodeID: 2, StoreID: 2, ReplicaID: 2},
+					Start:    hlc.MinTimestamp,
+					Sequence: 1,
 				},
 			},
 		}})
@@ -298,8 +312,9 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 			{
 				Desc: descs[2],
 				Lease: roachpb.Lease{
-					Replica: roachpb.ReplicaDescriptor{NodeID: 3, StoreID: 3, ReplicaID: 3},
-					Start:   hlc.MinTimestamp,
+					Replica:  roachpb.ReplicaDescriptor{NodeID: 3, StoreID: 3, ReplicaID: 3},
+					Start:    hlc.MinTimestamp,
+					Sequence: 1,
 				},
 			},
 		}})
@@ -310,8 +325,8 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 	for i := range descs {
 		ri := rangeCache.GetCached(descs[i].StartKey, false /* inclusive */)
 		require.NotNilf(t, ri, "failed to find range for key: %s", descs[i].StartKey)
-		require.Equal(t, descs[i], ri.Desc)
-		require.False(t, ri.Lease.Empty())
+		require.Equal(t, &descs[i], ri.Desc())
+		require.NotNil(t, ri.Lease())
 	}
 }
 
@@ -321,6 +336,8 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 func TestDistSQLRangeCachesIntegrationTest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.WithIssue(t, 52682)
 
 	// We're going to setup a cluster with 4 nodes. The last one will not be a
 	// target of any replication so that its caches stay virgin.
@@ -820,7 +837,7 @@ func TestPartitionSpans(t *testing.T) {
 				ranges: tc.ranges,
 			}
 
-			gw := gossip.MakeExposedGossip(mockGossip)
+			gw := gossip.MakeOptionalGossip(mockGossip)
 			dsp := DistSQLPlanner{
 				planVersion:   execinfra.Version,
 				st:            cluster.MakeTestingClusterSettings(),
@@ -1008,7 +1025,7 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 				ranges: ranges,
 			}
 
-			gw := gossip.MakeExposedGossip(mockGossip)
+			gw := gossip.MakeOptionalGossip(mockGossip)
 			dsp := DistSQLPlanner{
 				planVersion:   tc.planVersion,
 				st:            cluster.MakeTestingClusterSettings(),
@@ -1107,7 +1124,7 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 		ranges: ranges,
 	}
 
-	gw := gossip.MakeExposedGossip(mockGossip)
+	gw := gossip.MakeOptionalGossip(mockGossip)
 	dsp := DistSQLPlanner{
 		planVersion:   execinfra.Version,
 		st:            cluster.MakeTestingClusterSettings(),
@@ -1213,7 +1230,7 @@ func TestCheckNodeHealth(t *testing.T) {
 		{notLive, "not using n5 due to liveness: node n5 is not live"},
 	}
 
-	gw := gossip.MakeExposedGossip(mockGossip)
+	gw := gossip.MakeOptionalGossip(mockGossip)
 	for _, test := range livenessTests {
 		t.Run("liveness", func(t *testing.T) {
 			h := distSQLNodeHealth{

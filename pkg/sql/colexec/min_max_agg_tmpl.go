@@ -116,11 +116,12 @@ func newMax_AGGKINDAggAlloc(
 // {{range .}}
 
 type _AGG_TYPE_AGGKINDAgg struct {
-	allocator *colmem.Allocator
 	// {{if eq "_AGGKIND" "Ordered"}}
-	groups []bool
+	orderedAggregateFuncBase
+	// {{else}}
+	hashAggregateFuncBase
 	// {{end}}
-	curIdx int
+	allocator *colmem.Allocator
 	// curAgg holds the running min/max, so we can index into the slice once per
 	// group, instead of on each iteration.
 	// NOTE: if foundNonNullForCurrentGroup is false, curAgg is undefined.
@@ -129,8 +130,6 @@ type _AGG_TYPE_AGGKINDAgg struct {
 	col _RET_GOTYPESLICE
 	// vec is the same as col before conversion from coldata.Vec.
 	vec coldata.Vec
-	// nulls points to the output null vector that we are updating.
-	nulls *coldata.Nulls
 	// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 	// for the group that is currently being aggregated.
 	foundNonNullForCurrentGroup bool
@@ -140,58 +139,63 @@ var _ aggregateFunc = &_AGG_TYPE_AGGKINDAgg{}
 
 const sizeOf_AGG_TYPE_AGGKINDAgg = int64(unsafe.Sizeof(_AGG_TYPE_AGGKINDAgg{}))
 
-func (a *_AGG_TYPE_AGGKINDAgg) Init(groups []bool, v coldata.Vec) {
+func (a *_AGG_TYPE_AGGKINDAgg) Init(groups []bool, vec coldata.Vec) {
 	// {{if eq "_AGGKIND" "Ordered"}}
-	a.groups = groups
+	a.orderedAggregateFuncBase.Init(groups, vec)
+	// {{else}}
+	a.hashAggregateFuncBase.Init(groups, vec)
 	// {{end}}
-	a.vec = v
-	a.col = v._RET_TYPE()
-	a.nulls = v.Nulls()
+	a.vec = vec
+	a.col = vec._RET_TYPE()
 	a.Reset()
 }
 
 func (a *_AGG_TYPE_AGGKINDAgg) Reset() {
-	a.curIdx = 0
+	// {{if eq "_AGGKIND" "Ordered"}}
+	a.orderedAggregateFuncBase.Reset()
+	// {{else}}
+	a.hashAggregateFuncBase.Reset()
+	// {{end}}
 	a.foundNonNullForCurrentGroup = false
-	a.nulls.UnsetNulls()
 }
 
-func (a *_AGG_TYPE_AGGKINDAgg) CurrentOutputIndex() int {
-	return a.curIdx
-}
-
-func (a *_AGG_TYPE_AGGKINDAgg) SetOutputIndex(idx int) {
-	a.curIdx = idx
-}
-
-func (a *_AGG_TYPE_AGGKINDAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	inputLen := b.Length()
-	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
+func (a *_AGG_TYPE_AGGKINDAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
+	vec := vecs[inputIdxs[0]]
 	col, nulls := vec._TYPE(), vec.Nulls()
 	a.allocator.PerformOperation(
 		[]coldata.Vec{a.vec},
 		func() {
-			if nulls.MaybeHasNulls() {
-				if sel != nil {
-					sel = sel[:inputLen]
-					for _, i := range sel {
-						_ACCUMULATE_MINMAX(a, nulls, i, true)
-					}
-				} else {
-					col = execgen.SLICE(col, 0, inputLen)
+			// {{if eq "_AGGKIND" "Ordered"}}
+			groups := a.groups
+			// {{/*
+			// We don't need to check whether sel is non-nil when performing
+			// hash aggregation because the hash aggregator always uses non-nil
+			// sel to specify the tuples to be aggregated.
+			// */}}
+			if sel == nil {
+				_ = groups[inputLen-1]
+				col = execgen.SLICE(col, 0, inputLen)
+				if nulls.MaybeHasNulls() {
 					for i := 0; i < inputLen; i++ {
 						_ACCUMULATE_MINMAX(a, nulls, i, true)
 					}
-				}
-			} else {
-				if sel != nil {
-					sel = sel[:inputLen]
-					for _, i := range sel {
+				} else {
+					for i := 0; i < inputLen; i++ {
 						_ACCUMULATE_MINMAX(a, nulls, i, false)
 					}
+				}
+			} else
+			// {{end}}
+			{
+				sel = sel[:inputLen]
+				if nulls.MaybeHasNulls() {
+					for _, i := range sel {
+						_ACCUMULATE_MINMAX(a, nulls, i, true)
+					}
 				} else {
-					col = execgen.SLICE(col, 0, inputLen)
-					for i := 0; i < inputLen; i++ {
+					for _, i := range sel {
 						_ACCUMULATE_MINMAX(a, nulls, i, false)
 					}
 				}
@@ -200,20 +204,24 @@ func (a *_AGG_TYPE_AGGKINDAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	)
 }
 
-func (a *_AGG_TYPE_AGGKINDAgg) Flush() {
+func (a *_AGG_TYPE_AGGKINDAgg) Flush(outputIdx int) {
 	// The aggregation is finished. Flush the last value. If we haven't found
 	// any non-nulls for this group so far, the output for this group should
 	// be null.
-	if !a.foundNonNullForCurrentGroup {
-		a.nulls.SetNull(a.curIdx)
-	} else {
-		execgen.SET(a.col, a.curIdx, a.curAgg)
-	}
+	// {{if eq "_AGGKIND" "Ordered"}}
+	// Go around "argument overwritten before first use" linter error.
+	_ = outputIdx
+	outputIdx = a.curIdx
 	a.curIdx++
-}
-
-func (a *_AGG_TYPE_AGGKINDAgg) HandleEmptyInputScalar() {
-	a.nulls.SetNull(0)
+	// {{end}}
+	if !a.foundNonNullForCurrentGroup {
+		a.nulls.SetNull(outputIdx)
+	} else {
+		// TODO(yuzefovich): think about whether it is ok for this SET call to
+		// not be registered with the allocator on types with variable sizes
+		// (e.g. Bytes).
+		execgen.SET(a.col, outputIdx, a.curAgg)
+	}
 }
 
 type _AGG_TYPE_AGGKINDAggAlloc struct {
@@ -245,7 +253,7 @@ func _ACCUMULATE_MINMAX(a *_AGG_TYPE_AGGKINDAgg, nulls *coldata.Nulls, i int, _H
 	// {{define "accumulateMinMax"}}
 
 	// {{if eq "_AGGKIND" "Ordered"}}
-	if a.groups[i] {
+	if groups[i] {
 		// If we encounter a new group, and we haven't found any non-nulls for the
 		// current group, the output for this group should be null.
 		if !a.foundNonNullForCurrentGroup {

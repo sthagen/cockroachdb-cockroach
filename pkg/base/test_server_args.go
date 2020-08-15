@@ -48,8 +48,10 @@ type TestServerArgs struct {
 	Addr string
 	// SQLAddr (if nonempty) is the SQL address to use for the test server.
 	SQLAddr string
-	// TenantAddr (if nonempty) is the tenant KV address to use for the test server.
-	TenantAddr string
+	// TenantAddr is the tenant KV address to use for the test server. If this
+	// is nil, the tenant server will be set up using a random port. If this
+	// is the empty string, no tenant server will be set up.
+	TenantAddr *string
 	// HTTPAddr (if nonempty) is the HTTP address to use for the test server.
 	HTTPAddr string
 	// DisableTLSForHTTP if set, disables TLS for the HTTP interface.
@@ -216,4 +218,8 @@ type TestTenantArgs struct {
 	// AllowSettingClusterSettings, if true, allows the tenant to set in-memory
 	// cluster settings.
 	AllowSettingClusterSettings bool
+
+	// TenantIDCodecOverride overrides the tenant ID used to construct the SQL
+	// server's codec, but nothing else (e.g. its certs). Used for testing.
+	TenantIDCodecOverride roachpb.TenantID
 }

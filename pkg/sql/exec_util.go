@@ -59,6 +59,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -652,27 +653,29 @@ type ExecutorConfig struct {
 	Locality          roachpb.Locality
 	AmbientCtx        log.AmbientContext
 	DB                *kv.DB
-	Gossip            gossip.DeprecatedGossip
+	Gossip            gossip.OptionalGossip
+	SystemConfig      config.SystemConfigProvider
 	DistSender        *kvcoord.DistSender
 	RPCContext        *rpc.Context
 	LeaseManager      *lease.Manager
 	Clock             *hlc.Clock
 	DistSQLSrv        *distsql.ServerImpl
 	// StatusServer gives access to the Status service.
-	StatusServer     serverpb.OptionalStatusServer
-	MetricsRecorder  nodeStatusGenerator
-	SessionRegistry  *SessionRegistry
-	JobRegistry      *jobs.Registry
-	VirtualSchemas   *VirtualSchemaHolder
-	DistSQLPlanner   *DistSQLPlanner
-	TableStatsCache  *stats.TableStatisticsCache
-	StatsRefresher   *stats.Refresher
-	ExecLogger       *log.SecondaryLogger
-	AuditLogger      *log.SecondaryLogger
-	SlowQueryLogger  *log.SecondaryLogger
-	AuthLogger       *log.SecondaryLogger
-	InternalExecutor *InternalExecutor
-	QueryCache       *querycache.C
+	StatusServer      serverpb.OptionalStatusServer
+	MetricsRecorder   nodeStatusGenerator
+	SessionRegistry   *SessionRegistry
+	SQLLivenessReader sqlliveness.Reader
+	JobRegistry       *jobs.Registry
+	VirtualSchemas    *VirtualSchemaHolder
+	DistSQLPlanner    *DistSQLPlanner
+	TableStatsCache   *stats.TableStatisticsCache
+	StatsRefresher    *stats.Refresher
+	ExecLogger        *log.SecondaryLogger
+	AuditLogger       *log.SecondaryLogger
+	SlowQueryLogger   *log.SecondaryLogger
+	AuthLogger        *log.SecondaryLogger
+	InternalExecutor  *InternalExecutor
+	QueryCache        *querycache.C
 
 	TestingKnobs                  ExecutorTestingKnobs
 	PGWireTestingKnobs            *PGWireTestingKnobs
@@ -697,6 +700,8 @@ type ExecutorConfig struct {
 
 	// StmtDiagnosticsRecorder deals with recording statement diagnostics.
 	StmtDiagnosticsRecorder *stmtdiagnostics.Registry
+
+	ExternalIODirConfig base.ExternalIODirConfig
 }
 
 // Organization returns the value of cluster.organization.
@@ -1050,6 +1055,7 @@ func checkResultType(typ *types.T) error {
 	case types.FloatFamily:
 	case types.DecimalFamily:
 	case types.BytesFamily:
+	case types.Box2DFamily:
 	case types.GeographyFamily:
 	case types.GeometryFamily:
 	case types.StringFamily:
@@ -2034,6 +2040,14 @@ func (m *sessionDataMutator) SetDefaultTransactionPriority(val tree.UserPriority
 
 func (m *sessionDataMutator) SetDefaultReadOnly(val bool) {
 	m.data.DefaultReadOnly = val
+}
+
+func (m *sessionDataMutator) SetEnableSeqScan(val bool) {
+	m.data.EnableSeqScan = val
+}
+
+func (m *sessionDataMutator) SetSynchronousCommit(val bool) {
+	m.data.SynchronousCommit = val
 }
 
 func (m *sessionDataMutator) SetDistSQLMode(val sessiondata.DistSQLExecMode) {

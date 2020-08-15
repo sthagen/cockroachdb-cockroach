@@ -13,6 +13,7 @@ package rpc
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -25,7 +26,6 @@ import (
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -48,7 +48,6 @@ import (
 	"google.golang.org/grpc/encoding"
 	encodingproto "google.golang.org/grpc/encoding/proto"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
 )
 
 func init() {
@@ -113,47 +112,43 @@ func spanInclusionFuncForClient(
 	return parentSpanCtx != nil && !tracing.IsNoopContext(parentSpanCtx)
 }
 
-func requireSuperUser(ctx context.Context) error {
-	// TODO(marc): grpc's authentication model (which gives credential access in
-	// the request handler) doesn't really fit with the current design of the
-	// security package (which assumes that TLS state is only given at connection
-	// time) - that should be fixed.
-	if grpcutil.IsLocalRequestContext(ctx) {
-		// This is an in-process request. Bypass authentication check.
-	} else if peer, ok := peer.FromContext(ctx); ok {
-		if tlsInfo, ok := peer.AuthInfo.(credentials.TLSInfo); ok {
-			certUsers, err := security.GetCertificateUsers(&tlsInfo.State)
-			if err != nil {
-				return err
-			}
-			// TODO(benesch): the vast majority of RPCs should be limited to just
-			// NodeUser. This is not a security concern, as RootUser has access to
-			// read and write all data, merely good hygiene. For example, there is
-			// no reason to permit the root user to send raw Raft RPCs.
-			if !security.ContainsUser(security.NodeUser, certUsers) &&
-				!security.ContainsUser(security.RootUser, certUsers) {
-				return errors.Errorf("user %s is not allowed to perform this RPC", certUsers)
-			}
+type serverOpts struct {
+	interceptor func(fullMethod string) error
+	tenant      bool
+}
+
+// ServerOption is a configuration option passed to NewServer.
+type ServerOption func(*serverOpts)
+
+// ForTenant is an option to NewServer that results in the server being set
+// up to validate incoming tenants. With this option the server still uses
+// KV-internal node certificates but listens on a dedicated port.
+func ForTenant(opts *serverOpts) {
+	opts.tenant = true
+}
+
+// WithInterceptor adds an additional interceptor. The interceptor is called before
+// streaming and unary RPCs and may inject an error.
+//
+// This option can only be used once (i.e. interceptors can not be chained).
+func WithInterceptor(f func(fullMethod string) error) ServerOption {
+	return func(opts *serverOpts) {
+		if opts.interceptor != nil {
+			panic("interceptor can only be set once")
 		}
-	} else {
-		return errors.New("internal authentication error: TLSInfo is not available in request context")
+		opts.interceptor = f
 	}
-	return nil
 }
 
-// NewServer is a thin wrapper around grpc.NewServer that registers a heartbeat
-// service.
-func NewServer(ctx *Context) *grpc.Server {
-	return NewServerWithInterceptor(ctx, nil)
-}
-
-// NewServerWithInterceptor is like NewServer, but accepts an additional
-// interceptor which is called before streaming and unary RPCs and may inject an
-// error.
-func NewServerWithInterceptor(
-	ctx *Context, interceptor func(fullMethod string) error,
-) *grpc.Server {
-	opts := []grpc.ServerOption{
+// NewServer sets up an RPC server. Depending on the ServerOptions, the Server
+// either expects incoming connections from KV nodes, or from tenant SQL
+// servers.
+func NewServer(ctx *Context, opts ...ServerOption) *grpc.Server {
+	var o serverOpts
+	for _, f := range opts {
+		f(&o)
+	}
+	grpcOpts := []grpc.ServerOption{
 		// The limiting factor for lowering the max message size is the fact
 		// that a single large kv can be sent over the network in one message.
 		// Our maximum kv size is unlimited, so we need this to be very large.
@@ -177,11 +172,17 @@ func NewServerWithInterceptor(
 		grpc.StatsHandler(&ctx.stats),
 	}
 	if !ctx.Config.Insecure {
-		tlsConfig, err := ctx.GetServerTLSConfig()
+		var tlsConfig *tls.Config
+		var err error
+		if !o.tenant {
+			tlsConfig, err = ctx.GetServerTLSConfig()
+		} else {
+			tlsConfig, err = ctx.GetTenantServerTLSConfig()
+		}
 		if err != nil {
 			panic(err)
 		}
-		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConfig)))
+		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(tlsConfig)))
 	}
 
 	// These interceptors will be called in the order in which they appear, i.e.
@@ -190,29 +191,21 @@ func NewServerWithInterceptor(
 	var streamInterceptor []grpc.StreamServerInterceptor
 
 	if !ctx.Config.Insecure {
-		unaryInterceptor = append(unaryInterceptor, func(
-			ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler,
-		) (interface{}, error) {
-			if err := requireSuperUser(ctx); err != nil {
-				return nil, err
-			}
-			return handler(ctx, req)
-		})
-		streamInterceptor = append(streamInterceptor, func(
-			srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler,
-		) error {
-			if err := requireSuperUser(stream.Context()); err != nil {
-				return err
-			}
-			return handler(srv, stream)
-		})
+		var a auth
+		if !o.tenant {
+			a = kvAuth{}
+		} else {
+			a = tenantAuth{}
+		}
+		unaryInterceptor = append(unaryInterceptor, a.AuthUnary())
+		streamInterceptor = append(streamInterceptor, a.AuthStream())
 	}
 
-	if interceptor != nil {
+	if o.interceptor != nil {
 		unaryInterceptor = append(unaryInterceptor, func(
 			ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler,
 		) (interface{}, error) {
-			if err := interceptor(info.FullMethod); err != nil {
+			if err := o.interceptor(info.FullMethod); err != nil {
 				return nil, err
 			}
 			return handler(ctx, req)
@@ -221,7 +214,7 @@ func NewServerWithInterceptor(
 		streamInterceptor = append(streamInterceptor, func(
 			srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler,
 		) error {
-			if err := interceptor(info.FullMethod); err != nil {
+			if err := o.interceptor(info.FullMethod); err != nil {
 				return err
 			}
 			return handler(srv, stream)
@@ -250,10 +243,10 @@ func NewServerWithInterceptor(
 		// https://github.com/grpc-ecosystem/go-grpc-middleware/tree/master/tracing/opentracing
 	}
 
-	opts = append(opts, grpc.ChainUnaryInterceptor(unaryInterceptor...))
-	opts = append(opts, grpc.ChainStreamInterceptor(streamInterceptor...))
+	grpcOpts = append(grpcOpts, grpc.ChainUnaryInterceptor(unaryInterceptor...))
+	grpcOpts = append(grpcOpts, grpc.ChainStreamInterceptor(streamInterceptor...))
 
-	s := grpc.NewServer(opts...)
+	s := grpc.NewServer(grpcOpts...)
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:                                 ctx.Clock,
 		remoteClockMonitor:                    ctx.RemoteClocks,
@@ -398,8 +391,9 @@ type connKey struct {
 }
 
 // ContextOptions are passed to NewContext to set up a new *Context.
-// All pointer fields are required.
+// All pointer fields and TenantID are required.
 type ContextOptions struct {
+	TenantID   roachpb.TenantID
 	AmbientCtx log.AmbientContext
 	Config     *base.Config
 	Clock      *hlc.Clock
@@ -409,6 +403,9 @@ type ContextOptions struct {
 }
 
 func (c ContextOptions) validate() error {
+	if c.TenantID == (roachpb.TenantID{}) {
+		return errors.New("must specify TenantID")
+	}
 	if c.Config == nil {
 		return errors.New("Config must be set")
 	}
@@ -434,7 +431,7 @@ func NewContext(opts ContextOptions) *Context {
 
 	ctx := &Context{
 		ContextOptions:  opts,
-		SecurityContext: MakeSecurityContext(opts.Config),
+		SecurityContext: MakeSecurityContext(opts.Config, opts.TenantID),
 		breakerClock: breakerClock{
 			clock: opts.Clock,
 		},
@@ -712,7 +709,13 @@ func (ctx *Context) grpcDialOptions(
 	if ctx.Config.Insecure {
 		dialOpts = append(dialOpts, grpc.WithInsecure())
 	} else {
-		tlsConfig, err := ctx.GetClientTLSConfig()
+		var tlsConfig *tls.Config
+		var err error
+		if ctx.tenID == roachpb.SystemTenantID {
+			tlsConfig, err = ctx.GetClientTLSConfig()
+		} else {
+			tlsConfig, err = ctx.GetTenantClientTLSConfig()
+		}
 		if err != nil {
 			return nil, err
 		}

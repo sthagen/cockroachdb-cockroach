@@ -1,6 +1,6 @@
 module github.com/cockroachdb/cockroach
 
-go 1.14
+go 1.13
 
 require (
 	cloud.google.com/go v0.34.0
@@ -36,7 +36,7 @@ require (
 	github.com/cockroachdb/cockroach-go v0.0.0-20200504194139-73ffeee90b62
 	github.com/cockroachdb/crlfmt v0.0.0-20200116191136-a78e1c207bc0
 	github.com/cockroachdb/datadriven v0.0.0-20200714090401-bf6692d28da5
-	github.com/cockroachdb/errors v1.5.0
+	github.com/cockroachdb/errors v1.6.1
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.13.0
 	github.com/cockroachdb/logtags v0.0.0-20190617123548-eb05cc24525f
@@ -133,6 +133,7 @@ require (
 	github.com/prometheus/client_model v0.2.0
 	github.com/prometheus/common v0.9.1
 	github.com/prometheus/procfs v0.0.10 // indirect
+	github.com/pseudomuto/protoc-gen-doc v1.3.2
 	github.com/rcrowley/go-metrics v0.0.0-20190826022208-cac0b30c2563
 	github.com/sasha-s/go-deadlock v0.2.0
 	github.com/shirou/gopsutil v2.20.6+incompatible

@@ -11,6 +11,7 @@
 package builtins
 
 import (
+	gojson "encoding/json"
 	"fmt"
 	"strings"
 
@@ -51,8 +52,7 @@ const spheroidDistanceMessage = `"\n\nWhen operating on a spheroid, this functio
 	`This follows observed PostGIS behavior.`
 
 const (
-	defaultGeoJSONDecimalDigits = 9
-	defaultWKTDecimalDigits     = 15
+	defaultWKTDecimalDigits = 15
 )
 
 // infoBuilder is used to build a detailed info string that is consistent between
@@ -1163,16 +1163,109 @@ var geoBuiltins = map[string]builtinDefinition{
 
 	"st_asgeojson": makeBuiltin(
 		defProps(),
+		tree.Overload{
+			Types:      tree.ArgTypes{{"row", types.AnyTuple}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				tuple := args[0].(*tree.DTuple)
+				return stAsGeoJSONFromTuple(
+					ctx,
+					tuple,
+					"", /* geoColumn */
+					geo.DefaultGeoJSONDecimalDigits,
+					false, /* pretty */
+				)
+			},
+			Info: infoBuilder{
+				info: fmt.Sprintf(
+					"Returns the GeoJSON representation of a given Geometry. Coordinates have a maximum of %d decimal digits.",
+					geo.DefaultGeoJSONDecimalDigits,
+				),
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"row", types.AnyTuple}, {"geo_column", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				tuple := args[0].(*tree.DTuple)
+				return stAsGeoJSONFromTuple(
+					ctx,
+					tuple,
+					string(tree.MustBeDString(args[1])),
+					geo.DefaultGeoJSONDecimalDigits,
+					false, /* pretty */
+				)
+			},
+			Info: infoBuilder{
+				info: fmt.Sprintf(
+					"Returns the GeoJSON representation of a given Geometry, using geo_column as the geometry for the given Feature. Coordinates have a maximum of %d decimal digits.",
+					geo.DefaultGeoJSONDecimalDigits,
+				),
+			}.String(),
+			Volatility: tree.VolatilityStable,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"row", types.AnyTuple},
+				{"geo_column", types.String},
+				{"max_decimal_digits", types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				tuple := args[0].(*tree.DTuple)
+				return stAsGeoJSONFromTuple(
+					ctx,
+					tuple,
+					string(tree.MustBeDString(args[1])),
+					int(tree.MustBeDInt(args[2])),
+					false, /* pretty */
+				)
+			},
+			Info: infoBuilder{
+				info: fmt.Sprintf(
+					"Returns the GeoJSON representation of a given Geometry, using geo_column as the geometry for the given Feature. " +
+						"max_decimal_digits will be output for each coordinate value.",
+				),
+			}.String(),
+			Volatility: tree.VolatilityStable,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"row", types.AnyTuple},
+				{"geo_column", types.String},
+				{"max_decimal_digits", types.Int},
+				{"pretty", types.Bool},
+			},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				tuple := args[0].(*tree.DTuple)
+				return stAsGeoJSONFromTuple(
+					ctx,
+					tuple,
+					string(tree.MustBeDString(args[1])),
+					int(tree.MustBeDInt(args[2])),
+					bool(tree.MustBeDBool(args[3])),
+				)
+			},
+			Info: infoBuilder{
+				info: fmt.Sprintf(
+					"Returns the GeoJSON representation of a given Geometry, using geo_column as the geometry for the given Feature. " +
+						"max_decimal_digits will be output for each coordinate value. Output will be pretty printed in JSON if pretty is true.",
+				),
+			}.String(),
+			Volatility: tree.VolatilityStable,
+		},
 		geometryOverload1(
 			func(_ *tree.EvalContext, g *tree.DGeometry) (tree.Datum, error) {
-				geojson, err := geo.SpatialObjectToGeoJSON(g.Geometry.SpatialObject(), defaultGeoJSONDecimalDigits, geo.SpatialObjectToGeoJSONFlagShortCRSIfNot4326)
+				geojson, err := geo.SpatialObjectToGeoJSON(g.Geometry.SpatialObject(), geo.DefaultGeoJSONDecimalDigits, geo.SpatialObjectToGeoJSONFlagShortCRSIfNot4326)
 				return tree.NewDString(string(geojson)), err
 			},
 			types.String,
 			infoBuilder{
 				info: fmt.Sprintf(
 					"Returns the GeoJSON representation of a given Geometry. Coordinates have a maximum of %d decimal digits.",
-					defaultGeoJSONDecimalDigits,
+					geo.DefaultGeoJSONDecimalDigits,
 				),
 			},
 			tree.VolatilityImmutable,
@@ -1222,14 +1315,14 @@ Options is a flag that can be bitmasked. The options are:
 		},
 		geographyOverload1(
 			func(_ *tree.EvalContext, g *tree.DGeography) (tree.Datum, error) {
-				geojson, err := geo.SpatialObjectToGeoJSON(g.Geography.SpatialObject(), defaultGeoJSONDecimalDigits, geo.SpatialObjectToGeoJSONFlagZero)
+				geojson, err := geo.SpatialObjectToGeoJSON(g.Geography.SpatialObject(), geo.DefaultGeoJSONDecimalDigits, geo.SpatialObjectToGeoJSONFlagZero)
 				return tree.NewDString(string(geojson)), err
 			},
 			types.String,
 			infoBuilder{
 				info: fmt.Sprintf(
 					"Returns the GeoJSON representation of a given Geography. Coordinates have a maximum of %d decimal digits.",
-					defaultGeoJSONDecimalDigits,
+					geo.DefaultGeoJSONDecimalDigits,
 				),
 			},
 			tree.VolatilityImmutable,
@@ -3029,6 +3122,141 @@ For flags=1, validity considers self-intersecting rings forming holes as valid a
 			Volatility: tree.VolatilityImmutable,
 		},
 	),
+	"st_translate": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"g", types.Geometry},
+				{"deltaX", types.Float},
+				{"deltaY", types.Float},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := args[0].(*tree.DGeometry)
+				deltaX := float64(*args[1].(*tree.DFloat))
+				deltaY := float64(*args[2].(*tree.DFloat))
+
+				ret, err := geomfn.Translate(g.Geometry, []float64{deltaX, deltaY})
+				if err != nil {
+					return nil, err
+				}
+
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a modified Geometry translated by the given deltas`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
+	"st_scale": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+				{"x_factor", types.Float},
+				{"y_factor", types.Float},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := args[0].(*tree.DGeometry)
+				xFactor := float64(*args[1].(*tree.DFloat))
+				yFactor := float64(*args[2].(*tree.DFloat))
+
+				ret, err := geomfn.Scale(g.Geometry, []float64{xFactor, yFactor})
+				if err != nil {
+					return nil, err
+				}
+
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a modified Geometry scaled by the given factors`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"g", types.Geometry},
+				{"factor", types.Geometry},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := args[0].(*tree.DGeometry)
+				factor, err := args[1].(*tree.DGeometry).AsGeomT()
+				if err != nil {
+					return nil, err
+				}
+
+				pointFactor, ok := factor.(*geom.Point)
+				if !ok {
+					return nil, errors.Newf("a Point must be used as the scaling factor")
+				}
+
+				ret, err := geomfn.Scale(g.Geometry, pointFactor.FlatCoords())
+				if err != nil {
+					return nil, err
+				}
+
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a modified Geometry scaled by taking in a Geometry as the factor`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"g", types.Geometry},
+				{"factor", types.Geometry},
+				{"origin", types.Geometry},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := args[0].(*tree.DGeometry)
+				factor := args[1].(*tree.DGeometry)
+				origin := args[2].(*tree.DGeometry)
+
+				ret, err := geomfn.ScaleRelativeToOrigin(g.Geometry, factor.Geometry, origin.Geometry)
+				if err != nil {
+					return nil, err
+				}
+
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a modified Geometry scaled by the Geometry factor relative to a false origin`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
+	"st_setpoint": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"line_string", types.Geometry},
+				{"index", types.Int},
+				{"point", types.Geometry},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				lineString := args[0].(*tree.DGeometry)
+				index := int(*args[1].(*tree.DInt))
+				point := args[2].(*tree.DGeometry)
+
+				ret, err := geomfn.SetPoint(lineString.Geometry, index, point.Geometry)
+				if err != nil {
+					return nil, err
+				}
+
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Sets the Point at the given 0-based index and returns the modified LineString geometry`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
 	"st_segmentize": makeBuiltin(
 		defProps(),
 		tree.Overload{
@@ -3774,6 +4002,8 @@ func initGeoBuiltins() {
 		alias       string
 		builtinName string
 	}{
+		{"geomfromewkt", "st_geomfromewkt"},
+		{"geomfromewkb", "st_geomfromewkb"},
 		{"st_geogfromtext", "st_geographyfromtext"},
 		{"st_geomfromtext", "st_geometryfromtext"},
 		{"st_numinteriorring", "st_numinteriorrings"},
@@ -3821,7 +4051,7 @@ func initGeoBuiltins() {
 		// TODO(#48883): uncomment
 		// "st_assvg",
 		// TODO(#48886): uncomment
-		//"st_astwkb",
+		// "st_astwkb",
 		"st_astext",
 		"st_buffer",
 		"st_centroid",
@@ -3990,19 +4220,13 @@ func appendStrArgOverloadForGeometryArgOverloads(def builtinDefinition) builtinD
 		// Wrap the overloads to cast to Geometry.
 		newOverload.Types = newArgTypes
 		newOverload.Fn = func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			var err error
-			argsToCast.ForEach(func(i int) {
+			for i, ok := argsToCast.Next(0); ok; i, ok = argsToCast.Next(i + 1) {
 				arg := string(tree.MustBeDString(args[i]))
-				var g *geo.Geometry
-				g, err = geo.ParseGeometry(arg)
+				g, err := geo.ParseGeometry(arg)
 				if err != nil {
-					// This will be caught by the check outside the closure.
-					return
+					return nil, err
 				}
 				args[i] = tree.NewDGeometry(g)
-			})
-			if err != nil {
-				return nil, err
 			}
 			return ov.Fn(ctx, args)
 		}
@@ -4017,4 +4241,104 @@ This variant will cast all geometry_str arguments into Geometry types.
 
 	def.overloads = newOverloads
 	return def
+}
+
+// stAsGeoJSONFromTuple returns a *tree.DString representing JSON output
+// for ST_AsGeoJSON.
+func stAsGeoJSONFromTuple(
+	ctx *tree.EvalContext, tuple *tree.DTuple, geoColumn string, numDecimalDigits int, pretty bool,
+) (*tree.DString, error) {
+	typ := tuple.ResolvedType()
+	labels := typ.TupleLabels()
+
+	var geometry json.JSON
+	properties := json.NewObjectBuilder(len(tuple.D))
+
+	foundGeoColumn := false
+	for i, d := range tuple.D {
+		var label string
+		if labels != nil {
+			label = labels[i]
+		}
+		// If label is not specified, append `f + index` as the name, in line with
+		// row_to_json.
+		if label == "" {
+			label = fmt.Sprintf("f%d", i+1)
+		}
+		// If the geoColumn is not specified and the geometry is not found,
+		// take a look.
+		// Also take a look if the column label is the column we desire.
+		if (geoColumn == "" && geometry == nil) || geoColumn == label {
+			// If we can parse the data type as Geometry or Geography,
+			// we've found it.
+			if g, ok := d.(*tree.DGeometry); ok {
+				foundGeoColumn = true
+				var err error
+				geometry, err = json.FromSpatialObject(g.SpatialObject(), numDecimalDigits)
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if g, ok := d.(*tree.DGeography); ok {
+				foundGeoColumn = true
+				var err error
+				geometry, err = json.FromSpatialObject(g.SpatialObject(), numDecimalDigits)
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+
+			if geoColumn == label {
+				foundGeoColumn = true
+				// If the entry is NULL, skip the current entry.
+				// Otherwise, we found the column but it was the wrong type, in which case,
+				// we error out.
+				if d == tree.DNull {
+					continue
+				}
+				return nil, errors.Newf(
+					"expected column %s to be a geo type, but it is of type %s",
+					geoColumn,
+					d.ResolvedType().SQLString(),
+				)
+			}
+		}
+		tupleJSON, err := tree.AsJSON(d, ctx.GetLocation())
+		if err != nil {
+			return nil, err
+		}
+		properties.Add(label, tupleJSON)
+	}
+	// If we have not found a column with the matching name, error out.
+	if !foundGeoColumn && geoColumn != "" {
+		return nil, errors.Newf("%q column not found", geoColumn)
+	}
+	// If geometry is still NULL, we either found no geometry columns
+	// or the found geometry column is NULL. Return a NULL type, a la
+	// PostGIS.
+	if geometry == nil {
+		geometryBuilder := json.NewObjectBuilder(1)
+		geometryBuilder.Add("type", json.NullJSONValue)
+		geometry = geometryBuilder.Build()
+	}
+	retJSON := json.NewObjectBuilder(3)
+	retJSON.Add("type", json.FromString("Feature"))
+	retJSON.Add("geometry", geometry)
+	retJSON.Add("properties", properties.Build())
+	retString := retJSON.Build().String()
+	if !pretty {
+		return tree.NewDString(retString), nil
+	}
+	var reserializedJSON map[string]interface{}
+	err := gojson.Unmarshal([]byte(retString), &reserializedJSON)
+	if err != nil {
+		return nil, err
+	}
+	marshalledIndent, err := gojson.MarshalIndent(reserializedJSON, "", "\t")
+	if err != nil {
+		return nil, err
+	}
+	return tree.NewDString(string(marshalledIndent)), nil
 }

@@ -73,6 +73,9 @@ const (
 	VersionNodeMembershipStatus
 	VersionRangeStatsRespHasDesc
 	VersionMinPasswordLength
+	VersionAbortSpanBytes
+	VersionAlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable
+	VersionMaterializedViews
 
 	// Add new versions here (step one of two).
 )
@@ -550,6 +553,23 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		// VersionMinPasswordLength adds the server.user_login.min_password_length setting.
 		Key:     VersionMinPasswordLength,
 		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 13},
+	},
+	{
+		// VersionAbortSpanBytes adds a field to MVCCStats
+		// (MVCCStats.AbortSpanBytes) that tracks the size of a
+		// range's abort span.
+		Key:     VersionAbortSpanBytes,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 14},
+	},
+	{
+		// VersionAlterSystemJobsTableAddLeaseColumn is a version which modified system.jobs table.
+		Key:     VersionAlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 15},
+	},
+	{
+		// VersionMaterializedViews enables the use of materialized views.
+		Key:     VersionMaterializedViews,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 16},
 	},
 
 	// Add new versions here (step two of two).

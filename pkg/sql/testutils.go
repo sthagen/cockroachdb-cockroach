@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -28,9 +29,9 @@ import (
 // other tables.
 func CreateTestTableDescriptor(
 	ctx context.Context,
-	parentID, id sqlbase.ID,
+	parentID, id descpb.ID,
 	schema string,
-	privileges *sqlbase.PrivilegeDescriptor,
+	privileges *descpb.PrivilegeDescriptor,
 ) (*sqlbase.MutableTableDescriptor, error) {
 	st := cluster.MakeTestingClusterSettings()
 	stmt, err := parser.ParseOne(schema)
@@ -54,7 +55,7 @@ func CreateTestTableDescriptor(
 			&semaCtx,
 			&evalCtx,
 			&sessiondata.SessionData{}, /* sessionData */
-			false,                      /* temporary */
+			tree.PersistencePermanent,
 		)
 		return &desc, err
 	case *tree.CreateSequence:
@@ -64,8 +65,8 @@ func CreateTestTableDescriptor(
 			parentID, keys.PublicSchemaID, id,
 			hlc.Timestamp{}, /* creationTime */
 			privileges,
-			false, /* temporary */
-			nil,   /* params */
+			tree.PersistencePermanent,
+			nil, /* params */
 		)
 		return &desc, err
 	default:

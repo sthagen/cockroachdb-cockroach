@@ -2722,11 +2722,23 @@ class ClearRangeRequest : public ::google::protobuf::MessageLite /* @@protoc_ins
   ::cockroach::roachpb::RequestHeader* mutable_header();
   void set_allocated_header(::cockroach::roachpb::RequestHeader* header);
 
+  bool has_deadline() const;
+  void clear_deadline();
+  static const int kDeadlineFieldNumber = 2;
+  private:
+  const ::cockroach::util::hlc::Timestamp& _internal_deadline() const;
+  public:
+  const ::cockroach::util::hlc::Timestamp& deadline() const;
+  ::cockroach::util::hlc::Timestamp* release_deadline();
+  ::cockroach::util::hlc::Timestamp* mutable_deadline();
+  void set_allocated_deadline(::cockroach::util::hlc::Timestamp* deadline);
+
   // @@protoc_insertion_point(class_scope:cockroach.roachpb.ClearRangeRequest)
  private:
 
   ::google::protobuf::internal::InternalMetadataWithArenaLite _internal_metadata_;
   ::cockroach::roachpb::RequestHeader* header_;
+  ::cockroach::util::hlc::Timestamp* deadline_;
   mutable ::google::protobuf::internal::CachedSize _cached_size_;
   friend struct ::protobuf_roachpb_2fapi_2eproto::TableStruct;
 };
@@ -12650,16 +12662,27 @@ class AdminScatterResponse : public ::google::protobuf::MessageLite /* @@protoc_
 
   // accessors -------------------------------------------------------
 
-  int ranges_size() const;
-  void clear_ranges();
-  static const int kRangesFieldNumber = 2;
-  ::cockroach::roachpb::AdminScatterResponse_Range* mutable_ranges(int index);
+  int deprecated_ranges_size() const;
+  void clear_deprecated_ranges();
+  static const int kDeprecatedRangesFieldNumber = 2;
+  ::cockroach::roachpb::AdminScatterResponse_Range* mutable_deprecated_ranges(int index);
   ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::AdminScatterResponse_Range >*
-      mutable_ranges();
-  const ::cockroach::roachpb::AdminScatterResponse_Range& ranges(int index) const;
-  ::cockroach::roachpb::AdminScatterResponse_Range* add_ranges();
+      mutable_deprecated_ranges();
+  const ::cockroach::roachpb::AdminScatterResponse_Range& deprecated_ranges(int index) const;
+  ::cockroach::roachpb::AdminScatterResponse_Range* add_deprecated_ranges();
   const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::AdminScatterResponse_Range >&
-      ranges() const;
+      deprecated_ranges() const;
+
+  int range_infos_size() const;
+  void clear_range_infos();
+  static const int kRangeInfosFieldNumber = 3;
+  ::cockroach::roachpb::RangeInfo* mutable_range_infos(int index);
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::RangeInfo >*
+      mutable_range_infos();
+  const ::cockroach::roachpb::RangeInfo& range_infos(int index) const;
+  ::cockroach::roachpb::RangeInfo* add_range_infos();
+  const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::RangeInfo >&
+      range_infos() const;
 
   bool has_header() const;
   void clear_header();
@@ -12676,7 +12699,8 @@ class AdminScatterResponse : public ::google::protobuf::MessageLite /* @@protoc_
  private:
 
   ::google::protobuf::internal::InternalMetadataWithArenaLite _internal_metadata_;
-  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::AdminScatterResponse_Range > ranges_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::AdminScatterResponse_Range > deprecated_ranges_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::RangeInfo > range_infos_;
   ::cockroach::roachpb::ResponseHeader* header_;
   mutable ::google::protobuf::internal::CachedSize _cached_size_;
   friend struct ::protobuf_roachpb_2fapi_2eproto::TableStruct;
@@ -15843,12 +15867,6 @@ class Header : public ::google::protobuf::MessageLite /* @@protoc_insertion_poin
   ::google::protobuf::int32 gateway_node_id() const;
   void set_gateway_node_id(::google::protobuf::int32 value);
 
-  // int64 target_bytes = 15;
-  void clear_target_bytes();
-  static const int kTargetBytesFieldNumber = 15;
-  ::google::protobuf::int64 target_bytes() const;
-  void set_target_bytes(::google::protobuf::int64 value);
-
   // bool distinct_spans = 9;
   void clear_distinct_spans();
   static const int kDistinctSpansFieldNumber = 9;
@@ -15873,6 +15891,18 @@ class Header : public ::google::protobuf::MessageLite /* @@protoc_insertion_poin
   bool can_forward_read_timestamp() const;
   void set_can_forward_read_timestamp(bool value);
 
+  // .cockroach.kv.kvserver.concurrency.lock.WaitPolicy wait_policy = 18;
+  void clear_wait_policy();
+  static const int kWaitPolicyFieldNumber = 18;
+  ::cockroach::kv::kvserver::concurrency::lock::WaitPolicy wait_policy() const;
+  void set_wait_policy(::cockroach::kv::kvserver::concurrency::lock::WaitPolicy value);
+
+  // int64 target_bytes = 15;
+  void clear_target_bytes();
+  static const int kTargetBytesFieldNumber = 15;
+  ::google::protobuf::int64 target_bytes() const;
+  void set_target_bytes(::google::protobuf::int64 value);
+
   // @@protoc_insertion_point(class_scope:cockroach.roachpb.Header)
  private:
 
@@ -15886,11 +15916,12 @@ class Header : public ::google::protobuf::MessageLite /* @@protoc_insertion_poin
   ::google::protobuf::int64 max_span_request_keys_;
   int read_consistency_;
   ::google::protobuf::int32 gateway_node_id_;
-  ::google::protobuf::int64 target_bytes_;
   bool distinct_spans_;
   bool return_range_info_;
   bool async_consensus_;
   bool can_forward_read_timestamp_;
+  int wait_policy_;
+  ::google::protobuf::int64 target_bytes_;
   mutable ::google::protobuf::internal::CachedSize _cached_size_;
   friend struct ::protobuf_roachpb_2fapi_2eproto::TableStruct;
 };
@@ -19241,6 +19272,53 @@ inline void ClearRangeRequest::set_allocated_header(::cockroach::roachpb::Reques
   }
   header_ = header;
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.ClearRangeRequest.header)
+}
+
+inline bool ClearRangeRequest::has_deadline() const {
+  return this != internal_default_instance() && deadline_ != NULL;
+}
+inline const ::cockroach::util::hlc::Timestamp& ClearRangeRequest::_internal_deadline() const {
+  return *deadline_;
+}
+inline const ::cockroach::util::hlc::Timestamp& ClearRangeRequest::deadline() const {
+  const ::cockroach::util::hlc::Timestamp* p = deadline_;
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.ClearRangeRequest.deadline)
+  return p != NULL ? *p : *reinterpret_cast<const ::cockroach::util::hlc::Timestamp*>(
+      &::cockroach::util::hlc::_Timestamp_default_instance_);
+}
+inline ::cockroach::util::hlc::Timestamp* ClearRangeRequest::release_deadline() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.ClearRangeRequest.deadline)
+  
+  ::cockroach::util::hlc::Timestamp* temp = deadline_;
+  deadline_ = NULL;
+  return temp;
+}
+inline ::cockroach::util::hlc::Timestamp* ClearRangeRequest::mutable_deadline() {
+  
+  if (deadline_ == NULL) {
+    auto* p = CreateMaybeMessage<::cockroach::util::hlc::Timestamp>(GetArenaNoVirtual());
+    deadline_ = p;
+  }
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.ClearRangeRequest.deadline)
+  return deadline_;
+}
+inline void ClearRangeRequest::set_allocated_deadline(::cockroach::util::hlc::Timestamp* deadline) {
+  ::google::protobuf::Arena* message_arena = GetArenaNoVirtual();
+  if (message_arena == NULL) {
+    delete reinterpret_cast< ::google::protobuf::MessageLite*>(deadline_);
+  }
+  if (deadline) {
+    ::google::protobuf::Arena* submessage_arena = NULL;
+    if (message_arena != submessage_arena) {
+      deadline = ::google::protobuf::internal::GetOwnedMessage(
+          message_arena, deadline, submessage_arena);
+    }
+    
+  } else {
+    
+  }
+  deadline_ = deadline;
+  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.ClearRangeRequest.deadline)
 }
 
 // -------------------------------------------------------------------
@@ -28861,33 +28939,59 @@ inline void AdminScatterResponse::set_allocated_header(::cockroach::roachpb::Res
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.AdminScatterResponse.header)
 }
 
-inline int AdminScatterResponse::ranges_size() const {
-  return ranges_.size();
+inline int AdminScatterResponse::deprecated_ranges_size() const {
+  return deprecated_ranges_.size();
 }
-inline void AdminScatterResponse::clear_ranges() {
-  ranges_.Clear();
+inline void AdminScatterResponse::clear_deprecated_ranges() {
+  deprecated_ranges_.Clear();
 }
-inline ::cockroach::roachpb::AdminScatterResponse_Range* AdminScatterResponse::mutable_ranges(int index) {
-  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.AdminScatterResponse.ranges)
-  return ranges_.Mutable(index);
+inline ::cockroach::roachpb::AdminScatterResponse_Range* AdminScatterResponse::mutable_deprecated_ranges(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.AdminScatterResponse.deprecated_ranges)
+  return deprecated_ranges_.Mutable(index);
 }
 inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::AdminScatterResponse_Range >*
-AdminScatterResponse::mutable_ranges() {
-  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.AdminScatterResponse.ranges)
-  return &ranges_;
+AdminScatterResponse::mutable_deprecated_ranges() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.AdminScatterResponse.deprecated_ranges)
+  return &deprecated_ranges_;
 }
-inline const ::cockroach::roachpb::AdminScatterResponse_Range& AdminScatterResponse::ranges(int index) const {
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.AdminScatterResponse.ranges)
-  return ranges_.Get(index);
+inline const ::cockroach::roachpb::AdminScatterResponse_Range& AdminScatterResponse::deprecated_ranges(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.AdminScatterResponse.deprecated_ranges)
+  return deprecated_ranges_.Get(index);
 }
-inline ::cockroach::roachpb::AdminScatterResponse_Range* AdminScatterResponse::add_ranges() {
-  // @@protoc_insertion_point(field_add:cockroach.roachpb.AdminScatterResponse.ranges)
-  return ranges_.Add();
+inline ::cockroach::roachpb::AdminScatterResponse_Range* AdminScatterResponse::add_deprecated_ranges() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.AdminScatterResponse.deprecated_ranges)
+  return deprecated_ranges_.Add();
 }
 inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::AdminScatterResponse_Range >&
-AdminScatterResponse::ranges() const {
-  // @@protoc_insertion_point(field_list:cockroach.roachpb.AdminScatterResponse.ranges)
-  return ranges_;
+AdminScatterResponse::deprecated_ranges() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.AdminScatterResponse.deprecated_ranges)
+  return deprecated_ranges_;
+}
+
+inline int AdminScatterResponse::range_infos_size() const {
+  return range_infos_.size();
+}
+inline ::cockroach::roachpb::RangeInfo* AdminScatterResponse::mutable_range_infos(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.AdminScatterResponse.range_infos)
+  return range_infos_.Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::RangeInfo >*
+AdminScatterResponse::mutable_range_infos() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.AdminScatterResponse.range_infos)
+  return &range_infos_;
+}
+inline const ::cockroach::roachpb::RangeInfo& AdminScatterResponse::range_infos(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.AdminScatterResponse.range_infos)
+  return range_infos_.Get(index);
+}
+inline ::cockroach::roachpb::RangeInfo* AdminScatterResponse::add_range_infos() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.AdminScatterResponse.range_infos)
+  return range_infos_.Add();
+}
+inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::RangeInfo >&
+AdminScatterResponse::range_infos() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.AdminScatterResponse.range_infos)
+  return range_infos_;
 }
 
 // -------------------------------------------------------------------
@@ -34331,6 +34435,20 @@ inline void Header::set_read_consistency(::cockroach::roachpb::ReadConsistencyTy
   
   read_consistency_ = value;
   // @@protoc_insertion_point(field_set:cockroach.roachpb.Header.read_consistency)
+}
+
+// .cockroach.kv.kvserver.concurrency.lock.WaitPolicy wait_policy = 18;
+inline void Header::clear_wait_policy() {
+  wait_policy_ = 0;
+}
+inline ::cockroach::kv::kvserver::concurrency::lock::WaitPolicy Header::wait_policy() const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.Header.wait_policy)
+  return static_cast< ::cockroach::kv::kvserver::concurrency::lock::WaitPolicy >(wait_policy_);
+}
+inline void Header::set_wait_policy(::cockroach::kv::kvserver::concurrency::lock::WaitPolicy value) {
+  
+  wait_policy_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.roachpb.Header.wait_policy)
 }
 
 // int64 max_span_request_keys = 8;

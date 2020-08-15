@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
@@ -846,11 +847,11 @@ func fetchDescVersionModificationTime(
 				t.Fatal(errors.New(`value was dropped or truncated`))
 			}
 			value := roachpb.Value{RawBytes: unsafeValue}
-			var desc sqlbase.Descriptor
+			var desc descpb.Descriptor
 			if err := value.GetProto(&desc); err != nil {
 				t.Fatal(err)
 			}
-			if tableDesc := desc.Table(k.Timestamp); tableDesc != nil {
+			if tableDesc := sqlbase.TableFromDescriptor(&desc, k.Timestamp); tableDesc != nil {
 				if int(tableDesc.Version) == version {
 					return tableDesc.ModificationTime
 				}
@@ -1320,13 +1321,13 @@ func TestChangefeedTruncateRenameDrop(t *testing.T) {
 		assertPayloads(t, truncate, []string{`truncate: [1]->{"after": {"a": 1}}`})
 		assertPayloads(t, truncateCascade, []string{`truncate_cascade: [1]->{"after": {"b": 1}}`})
 		sqlDB.Exec(t, `TRUNCATE TABLE truncate CASCADE`)
-		if _, err := truncate.Next(); !testutils.IsError(err, `"truncate" was dropped or truncated`) {
-			t.Errorf(`expected ""truncate" was dropped or truncated" error got: %+v`, err)
+		if _, err := truncate.Next(); !testutils.IsError(err, `"truncate" was truncated`) {
+			t.Fatalf(`expected ""truncate" was truncated" error got: %+v`, err)
 		}
 		if _, err := truncateCascade.Next(); !testutils.IsError(
-			err, `"truncate_cascade" was dropped or truncated`,
+			err, `"truncate_cascade" was truncated`,
 		) {
-			t.Errorf(`expected ""truncate_cascade" was dropped or truncated" error got: %+v`, err)
+			t.Fatalf(`expected ""truncate_cascade" was truncated" error got: %+v`, err)
 		}
 
 		sqlDB.Exec(t, `CREATE TABLE rename (a INT PRIMARY KEY)`)

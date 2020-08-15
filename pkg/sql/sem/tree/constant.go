@@ -67,7 +67,7 @@ func typeCheckConstant(
 	ctx context.Context, semaCtx *SemaContext, c Constant, desired *types.T,
 ) (ret TypedExpr, err error) {
 	avail := c.AvailableTypes()
-	if desired.Family() != types.AnyFamily {
+	if !desired.IsAmbiguous() {
 		for _, typ := range avail {
 			if desired.Equivalent(typ) {
 				return c.ResolveAsType(ctx, semaCtx, desired)
@@ -458,12 +458,14 @@ var (
 		types.String,
 		types.Bytes,
 		types.Bool,
+		types.Box2D,
 		types.Int,
 		types.Float,
 		types.Decimal,
 		types.Date,
 		types.StringArray,
 		types.IntArray,
+		types.Box2D,
 		types.Geography,
 		types.Geometry,
 		types.DecimalArray,

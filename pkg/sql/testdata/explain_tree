@@ -65,8 +65,7 @@ render                                                                          
            │                        render 1     (@1)[int]
            │                        render 2     (@2)[decimal]
            └── group                                                                        (cid int, sum decimal)
-                │                   aggregate 0  cid
-                │                   aggregate 1  sum(value)
+                │                   aggregate 0  sum(value)
                 │                   group by     cid
                 └── render                                                                  (cid int, value decimal)
                      │              render 0     (@1)[int]
@@ -104,8 +103,6 @@ children:
     - name: group
       attrs:
       - key: aggregate 0
-        value: cid
-      - key: aggregate 1
         value: sum(value)
       - key: group by
         value: cid
@@ -155,7 +152,7 @@ render                                                    (cid int, date date, v
  │                   render 0            (@1)[int]
  │                   render 1            (@3)[date]
  │                   render 2            (@2)[decimal]
- └── hash-join                                            (cid int, value decimal, date date, date date)
+ └── hash join                                            (cid int, value decimal, date date, date date)
       │              type                inner
       │              equality            (date) = (date)
       │              right cols are key
@@ -180,7 +177,7 @@ attrs:
 - key: render
   value: value
 children:
-- name: hash-join
+- name: hash join
   attrs:
   - key: type
     value: inner

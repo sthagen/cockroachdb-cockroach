@@ -13,6 +13,7 @@ package schemaexpr
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -21,8 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-// DequalifyColumnRefs returns an expression with database nad table names
-// stripped from qualified column names.
+// DequalifyColumnRefs returns a serialized expression with database and table
+// names stripped from qualified column names.
 //
 // For example:
 //
@@ -34,6 +35,18 @@ import (
 // or partial index predicates are created. If the table name was not stripped,
 // these expressions would become invalid if the table is renamed.
 func DequalifyColumnRefs(
+	ctx context.Context, source *sqlbase.DataSourceInfo, expr tree.Expr,
+) (string, error) {
+	e, err := dequalifyColumnRefs(ctx, source, expr)
+	if err != nil {
+		return "", err
+	}
+	return tree.Serialize(e), nil
+}
+
+// dequalifyColumnRefs returns an expression with database and table names
+// stripped from qualified column names.
+func dequalifyColumnRefs(
 	ctx context.Context, source *sqlbase.DataSourceInfo, expr tree.Expr,
 ) (tree.Expr, error) {
 	resolver := sqlbase.ColumnResolver{Source: source}
@@ -60,13 +73,14 @@ func DequalifyColumnRefs(
 	)
 }
 
-// FormatColumnForDisplay formats a column descriptor as a SQL string, and displays
-// user defined types in serialized expressions with human friendly formatting.
+// FormatColumnForDisplay formats a column descriptor as a SQL string. It
+// converts user defined types in default and computed expressions to a
+// human-readable form.
 func FormatColumnForDisplay(
 	ctx context.Context,
+	tbl sqlbase.TableDescriptor,
+	desc *descpb.ColumnDescriptor,
 	semaCtx *tree.SemaContext,
-	tbl *sqlbase.ImmutableTableDescriptor,
-	desc *sqlbase.ColumnDescriptor,
 ) (string, error) {
 	f := tree.NewFmtCtx(tree.FmtSimple)
 	f.FormatNameP(&desc.Name)
@@ -79,19 +93,19 @@ func FormatColumnForDisplay(
 	}
 	if desc.DefaultExpr != nil {
 		f.WriteString(" DEFAULT ")
-		typed, err := DeserializeTableDescExpr(ctx, semaCtx, tbl, *desc.DefaultExpr)
+		defExpr, err := FormatExprForDisplay(ctx, tbl, *desc.DefaultExpr, semaCtx)
 		if err != nil {
 			return "", err
 		}
-		f.WriteString(tree.SerializeForDisplay(typed))
+		f.WriteString(defExpr)
 	}
 	if desc.IsComputed() {
 		f.WriteString(" AS (")
-		typed, err := DeserializeTableDescExpr(ctx, semaCtx, tbl, *desc.ComputeExpr)
+		compExpr, err := FormatExprForDisplay(ctx, tbl, *desc.ComputeExpr, semaCtx)
 		if err != nil {
 			return "", err
 		}
-		f.WriteString(tree.SerializeForDisplay(typed))
+		f.WriteString(compExpr)
 		f.WriteString(") STORED")
 	}
 	return f.CloseAndGetString(), nil
@@ -135,7 +149,7 @@ func RenameColumn(expr string, from tree.Name, to tree.Name) (string, error) {
 // If the expression references a column that does not exist in the table
 // descriptor, iterColDescriptors errs with pgcode.UndefinedColumn.
 func iterColDescriptors(
-	desc *sqlbase.MutableTableDescriptor, rootExpr tree.Expr, f func(*sqlbase.ColumnDescriptor) error,
+	desc *sqlbase.MutableTableDescriptor, rootExpr tree.Expr, f func(*descpb.ColumnDescriptor) error,
 ) error {
 	_, err := tree.SimpleVisit(rootExpr, func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		vBase, ok := expr.(tree.VarName)
@@ -218,7 +232,7 @@ func (d *dummyColumn) ResolvedType() *types.T {
 // If the expression references a column that does not exist in the table
 // descriptor, replaceColumnVars errs with pgcode.UndefinedColumn.
 func replaceColumnVars(
-	desc sqlbase.TableDescriptorInterface, rootExpr tree.Expr,
+	desc sqlbase.TableDescriptor, rootExpr tree.Expr,
 ) (tree.Expr, sqlbase.TableColSet, error) {
 	var colIDs sqlbase.TableColSet
 
@@ -251,4 +265,14 @@ func replaceColumnVars(
 	})
 
 	return newExpr, colIDs, err
+}
+
+// columnDescriptorsToPtrs returns a list of references to the input
+// ColumnDescriptors.
+func columnDescriptorsToPtrs(cols []descpb.ColumnDescriptor) []*descpb.ColumnDescriptor {
+	ptrs := make([]*descpb.ColumnDescriptor, len(cols))
+	for i := range cols {
+		ptrs[i] = &cols[i]
+	}
+	return ptrs
 }

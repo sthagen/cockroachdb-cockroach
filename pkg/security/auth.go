@@ -24,6 +24,15 @@ const (
 	NodeUser = "node"
 	// RootUser is the default cluster administrator.
 	RootUser = "root"
+
+	// AdminRole is the default (and non-droppable) role with superuser privileges.
+	AdminRole = "admin"
+
+	// PublicRole is the special "public" pseudo-role.
+	// All users are implicit members of "public". The role cannot be created,
+	// dropped, assigned to another role, and is generally not listed.
+	// It can be granted privileges, implicitly granting them to all users (current and future).
+	PublicRole = "public"
 )
 
 var certPrincipalMap struct {
@@ -129,6 +138,17 @@ func UserAuthCertHook(insecureMode bool, tlsState *tls.ConnectionState) (UserAut
 		// If running in insecure mode, we have nothing to verify it against.
 		if insecureMode {
 			return nil, nil
+		}
+
+		// The client certificate should not be a tenant client type. For now just
+		// check that it doesn't have OU=Tenants. It would make sense to add
+		// explicit OU=Users to all client certificates and to check for match.
+		ous := tlsState.PeerCertificates[0].Subject.OrganizationalUnit
+		for _, ou := range ous {
+			if ou == tenantsOU {
+				return nil,
+					errors.Errorf("using tenant client certificate as user certificate is not allowed")
+			}
 		}
 
 		// The client certificate user must match the requested user,

@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -47,9 +48,26 @@ func runImport(
 ) (*roachpb.BulkOpSummary, error) {
 	// Used to send ingested import rows to the KV layer.
 	kvCh := make(chan row.KVBatch, 10)
-	evalCtx := flowCtx.NewEvalCtx()
-	evalCtx.DB = flowCtx.Cfg.DB
-	conv, err := makeInputConverter(ctx, spec, evalCtx, kvCh)
+
+	// Install type metadata in all of the import tables. The DB is nil in some
+	// tests, so check first here.
+	if flowCtx.Cfg.DB != nil {
+		if err := flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			resolver := flowCtx.TypeResolverFactory.NewTypeResolver(txn)
+			for _, table := range spec.Tables {
+				if err := sqlbase.HydrateTypesInTableDescriptor(ctx, table.Desc, resolver); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		// Release leases on any accessed types now that type metadata is installed.
+		flowCtx.TypeResolverFactory.Descriptors.ReleaseAll(ctx)
+	}
+
+	conv, err := makeInputConverter(ctx, spec, flowCtx.NewEvalCtx(), kvCh)
 	if err != nil {
 		return nil, err
 	}
@@ -375,13 +393,13 @@ func newImportRowError(err error, row string, num int64) error {
 
 // parallelImportContext describes state associated with the import.
 type parallelImportContext struct {
-	walltime   int64                    // Import time stamp.
-	numWorkers int                      // Parallelism
-	batchSize  int                      // Number of records to batch
-	evalCtx    *tree.EvalContext        // Evaluation context.
-	tableDesc  *sqlbase.TableDescriptor // Table descriptor we're importing into.
-	targetCols tree.NameList            // List of columns to import.  nil if importing all columns.
-	kvCh       chan row.KVBatch         // Channel for sending KV batches.
+	walltime   int64                             // Import time stamp.
+	numWorkers int                               // Parallelism
+	batchSize  int                               // Number of records to batch
+	evalCtx    *tree.EvalContext                 // Evaluation context.
+	tableDesc  *sqlbase.ImmutableTableDescriptor // Table descriptor we're importing into.
+	targetCols tree.NameList                     // List of columns to import.  nil if importing all columns.
+	kvCh       chan row.KVBatch                  // Channel for sending KV batches.
 }
 
 // importFileContext describes state specific to a file being imported.

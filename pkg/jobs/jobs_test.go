@@ -28,11 +28,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -323,6 +325,7 @@ func TestRegistryLifecycle(t *testing.T) {
 		rts.mu.e.ResumeExit++
 		rts.mu.e.Success = true
 		rts.check(t, jobs.StatusSucceeded)
+		t.Log("Done")
 	})
 
 	t.Run("create separately success", func(t *testing.T) {
@@ -542,6 +545,8 @@ func TestRegistryLifecycle(t *testing.T) {
 
 	// Verify that pause and cancel in a rollback do nothing.
 	t.Run("rollback", func(t *testing.T) {
+		skip.WithIssue(t, 52767, "flaky")
+
 		rts := registryTestSuite{}
 		rts.setUp(t)
 		defer rts.tearDown()
@@ -882,7 +887,7 @@ func TestJobLifecycle(t *testing.T) {
 		woodyJob, woodyExp := createJob(jobs.Record{
 			Description:   "There's a snake in my boot!",
 			Username:      "Woody Pride",
-			DescriptorIDs: []sqlbase.ID{1, 2, 3},
+			DescriptorIDs: []descpb.ID{1, 2, 3},
 			Details:       jobspb.RestoreDetails{},
 			Progress:      jobspb.RestoreProgress{},
 		})
@@ -940,7 +945,7 @@ func TestJobLifecycle(t *testing.T) {
 		buzzRecord := jobs.Record{
 			Description:   "To infinity and beyond!",
 			Username:      "Buzz Lightyear",
-			DescriptorIDs: []sqlbase.ID{3, 2, 1},
+			DescriptorIDs: []descpb.ID{3, 2, 1},
 			Details:       jobspb.BackupDetails{},
 			Progress:      jobspb.BackupProgress{},
 		}
@@ -991,7 +996,7 @@ func TestJobLifecycle(t *testing.T) {
 		sidJob, sidExp := createJob(jobs.Record{
 			Description:   "The toys! The toys are alive!",
 			Username:      "Sid Phillips",
-			DescriptorIDs: []sqlbase.ID{6, 6, 6},
+			DescriptorIDs: []descpb.ID{6, 6, 6},
 			Details:       jobspb.RestoreDetails{},
 			Progress:      jobspb.RestoreProgress{},
 		})
@@ -2087,7 +2092,7 @@ func TestStartableJob(t *testing.T) {
 	rec := jobs.Record{
 		Description:   "There's a snake in my boot!",
 		Username:      "Woody Pride",
-		DescriptorIDs: []sqlbase.ID{1, 2, 3},
+		DescriptorIDs: []descpb.ID{1, 2, 3},
 		Details:       jobspb.RestoreDetails{},
 		Progress:      jobspb.RestoreProgress{},
 	}
@@ -2281,12 +2286,13 @@ func TestUnmigratedSchemaChangeJobs(t *testing.T) {
 	// The default FormatVersion value in SchemaChangeDetails corresponds to a
 	// pre-20.1 job.
 	rec := jobs.Record{
-		DescriptorIDs: []sqlbase.ID{1},
+		DescriptorIDs: []descpb.ID{1},
 		Details:       jobspb.SchemaChangeDetails{},
 		Progress:      jobspb.SchemaChangeProgress{},
 	}
 
 	t.Run("job is not adopted", func(t *testing.T) {
+		defer jobs.ResetConstructors()()
 		resuming := make(chan struct{})
 		jobs.RegisterConstructor(jobspb.TypeSchemaChange, func(_ *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 			return jobs.FakeResumer{

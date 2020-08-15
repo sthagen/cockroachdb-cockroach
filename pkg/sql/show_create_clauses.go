@@ -17,8 +17,10 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -38,7 +40,7 @@ type comment struct {
 
 // selectComment retrieves all the comments pertaining to a table (comments on the table
 // itself but also column and index comments.)
-func selectComment(ctx context.Context, p PlanHookState, tableID sqlbase.ID) (tc *tableComments) {
+func selectComment(ctx context.Context, p PlanHookState, tableID descpb.ID) (tc *tableComments) {
 	query := fmt.Sprintf("SELECT type, object_id, sub_id, comment FROM system.comments WHERE object_id = %d", tableID)
 
 	commentRows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
@@ -100,13 +102,12 @@ func ShowCreateView(
 // showComments prints out the COMMENT statements sufficient to populate a
 // table's comments, including its index and column comments.
 func showComments(
-	table *sqlbase.ImmutableTableDescriptor, tc *tableComments, buf *bytes.Buffer,
+	tn *tree.TableName, table *sqlbase.ImmutableTableDescriptor, tc *tableComments, buf *bytes.Buffer,
 ) error {
 	if tc == nil {
 		return nil
 	}
 	f := tree.NewFmtCtx(tree.FmtSimple)
-	tn := tree.MakeUnqualifiedTableName(tree.Name(table.Name))
 	un := tn.ToUnresolvedObjectName()
 	if tc.comment != nil {
 		f.WriteString(";\n")
@@ -117,7 +118,7 @@ func showComments(
 	}
 
 	for _, columnComment := range tc.columns {
-		col, err := table.FindColumnByID(sqlbase.ColumnID(columnComment.subID))
+		col, err := table.FindColumnByID(descpb.ColumnID(columnComment.subID))
 		if err != nil {
 			return err
 		}
@@ -133,7 +134,7 @@ func showComments(
 	}
 
 	for _, indexComment := range tc.indexes {
-		idx, err := table.FindIndexByID(sqlbase.IndexID(indexComment.subID))
+		idx, err := table.FindIndexByID(descpb.IndexID(indexComment.subID))
 		if err != nil {
 			return err
 		}
@@ -141,7 +142,7 @@ func showComments(
 		f.WriteString(";\n")
 		f.FormatNode(&tree.CommentOnIndex{
 			Index: tree.TableIndexName{
-				Table: tn,
+				Table: *tn,
 				Index: tree.UnrestrictedName(idx.Name),
 			},
 			Comment: &indexComment.comment,
@@ -153,13 +154,15 @@ func showComments(
 }
 
 // showForeignKeyConstraint returns a valid SQL representation of a FOREIGN KEY
-// clause for a given index.
+// clause for a given index. If the table's schema name is in the searchPath, then the
+// schema name will not be included in the result.
 func showForeignKeyConstraint(
 	buf *bytes.Buffer,
 	dbPrefix string,
 	originTable *sqlbase.ImmutableTableDescriptor,
-	fk *sqlbase.ForeignKeyConstraint,
+	fk *descpb.ForeignKeyConstraint,
 	lCtx simpleSchemaResolver,
+	searchPath sessiondata.SearchPath,
 ) error {
 	var refNames []string
 	var originNames []string
@@ -173,6 +176,7 @@ func showForeignKeyConstraint(
 		if err != nil {
 			return err
 		}
+		fkTableName.ExplicitSchema = !searchPath.Contains(fkTableName.SchemaName.String())
 		refNames, err = fkTable.NamesForColumnIDs(fk.ReferencedColumnIDs)
 		if err != nil {
 			return err
@@ -197,15 +201,15 @@ func showForeignKeyConstraint(
 	formatQuoteNames(buf, refNames...)
 	buf.WriteByte(')')
 	// We omit MATCH SIMPLE because it is the default.
-	if fk.Match != sqlbase.ForeignKeyReference_SIMPLE {
+	if fk.Match != descpb.ForeignKeyReference_SIMPLE {
 		buf.WriteByte(' ')
 		buf.WriteString(fk.Match.String())
 	}
-	if fk.OnDelete != sqlbase.ForeignKeyReference_NO_ACTION {
+	if fk.OnDelete != descpb.ForeignKeyReference_NO_ACTION {
 		buf.WriteString(" ON DELETE ")
 		buf.WriteString(fk.OnDelete.String())
 	}
-	if fk.OnUpdate != sqlbase.ForeignKeyReference_NO_ACTION {
+	if fk.OnUpdate != descpb.ForeignKeyReference_NO_ACTION {
 		buf.WriteString(" ON UPDATE ")
 		buf.WriteString(fk.OnUpdate.String())
 	}
@@ -264,7 +268,7 @@ func showFamilyClause(desc *sqlbase.ImmutableTableDescriptor, f *tree.FmtCtx) {
 // it is equal to the given dbPrefix. This allows us to elide the prefix
 // when the given index is interleaved in a table of the current database.
 func showCreateInterleave(
-	idx *sqlbase.IndexDescriptor, buf *bytes.Buffer, dbPrefix string, lCtx simpleSchemaResolver,
+	idx *descpb.IndexDescriptor, buf *bytes.Buffer, dbPrefix string, lCtx simpleSchemaResolver,
 ) error {
 	if len(idx.Interleave.Ancestors) == 0 {
 		return nil
@@ -302,9 +306,9 @@ func showCreateInterleave(
 func ShowCreatePartitioning(
 	a *sqlbase.DatumAlloc,
 	codec keys.SQLCodec,
-	tableDesc sqlbase.TableDescriptorInterface,
-	idxDesc *sqlbase.IndexDescriptor,
-	partDesc *sqlbase.PartitioningDescriptor,
+	tableDesc sqlbase.TableDescriptor,
+	idxDesc *descpb.IndexDescriptor,
+	partDesc *descpb.PartitioningDescriptor,
 	buf *bytes.Buffer,
 	indent int,
 	colOffset int,
@@ -354,7 +358,7 @@ func ShowCreatePartitioning(
 				buf.WriteString(`, `)
 			}
 			tuple, _, err := sqlbase.DecodePartitionTuple(
-				a, codec, tableDesc.TableDesc(), idxDesc, partDesc, values, fakePrefixDatums)
+				a, codec, tableDesc, idxDesc, partDesc, values, fakePrefixDatums)
 			if err != nil {
 				return err
 			}
@@ -378,14 +382,14 @@ func ShowCreatePartitioning(
 		buf.WriteString(part.Name)
 		buf.WriteString(" VALUES FROM ")
 		fromTuple, _, err := sqlbase.DecodePartitionTuple(
-			a, codec, tableDesc.TableDesc(), idxDesc, partDesc, part.FromInclusive, fakePrefixDatums)
+			a, codec, tableDesc, idxDesc, partDesc, part.FromInclusive, fakePrefixDatums)
 		if err != nil {
 			return err
 		}
 		buf.WriteString(fromTuple.String())
 		buf.WriteString(" TO ")
 		toTuple, _, err := sqlbase.DecodePartitionTuple(
-			a, codec, tableDesc.TableDesc(), idxDesc, partDesc, part.ToExclusive, fakePrefixDatums)
+			a, codec, tableDesc, idxDesc, partDesc, part.ToExclusive, fakePrefixDatums)
 		if err != nil {
 			return err
 		}
@@ -416,11 +420,11 @@ func showConstraintClause(
 			f.WriteString(" ")
 		}
 		f.WriteString("CHECK (")
-		typed, err := schemaexpr.DeserializeTableDescExpr(ctx, semaCtx, desc, e.Expr)
+		expr, err := schemaexpr.FormatExprForDisplay(ctx, desc, e.Expr, semaCtx)
 		if err != nil {
 			return err
 		}
-		f.WriteString(tree.SerializeForDisplay(typed))
+		f.WriteString(expr)
 		f.WriteString(")")
 	}
 	f.WriteString("\n)")

@@ -14,8 +14,10 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
@@ -86,7 +88,7 @@ func ShowCreateTable(
 			f.WriteString(",")
 		}
 		f.WriteString("\n\t")
-		colstr, err := schemaexpr.FormatColumnForDisplay(ctx, &p.RunParams(ctx).p.semaCtx, desc, col)
+		colstr, err := schemaexpr.FormatColumnForDisplay(ctx, desc, col, &p.RunParams(ctx).p.semaCtx)
 		if err != nil {
 			return "", err
 		}
@@ -113,7 +115,17 @@ func ShowCreateTable(
 			fkCtx.WriteString(",\n\tCONSTRAINT ")
 			fkCtx.FormatNameP(&fk.Name)
 			fkCtx.WriteString(" ")
-			if err := showForeignKeyConstraint(&fkCtx.Buffer, dbPrefix, desc, fk, lCtx); err != nil {
+			// Passing in EmptySearchPath causes the schema name to show up in the
+			// constraint definition, which we need for `cockroach dump` output to be
+			// usable.
+			if err := showForeignKeyConstraint(
+				&fkCtx.Buffer,
+				dbPrefix,
+				desc,
+				fk,
+				lCtx,
+				sessiondata.EmptySearchPath,
+			); err != nil {
 				if displayOptions.FKDisplayMode == OmitMissingFKClausesFromCreate {
 					continue
 				} else { // When FKDisplayMode == IncludeFkClausesInCreate.
@@ -142,7 +154,11 @@ func ShowCreateTable(
 		if idx.ID != desc.PrimaryIndex.ID && includeInterleaveClause {
 			// Showing the primary index is handled above.
 			f.WriteString(",\n\t")
-			f.WriteString(idx.SQLString(&sqlbase.AnonymousTable))
+			idxStr, err := schemaexpr.FormatIndexForDisplay(ctx, desc, &descpb.AnonymousTable, idx, &p.RunParams(ctx).p.semaCtx)
+			if err != nil {
+				return "", err
+			}
+			f.WriteString(idxStr)
 			// Showing the INTERLEAVE and PARTITION BY for the primary index are
 			// handled last.
 
@@ -177,7 +193,7 @@ func ShowCreateTable(
 	}
 
 	if !displayOptions.IgnoreComments {
-		if err := showComments(desc, selectComment(ctx, p, desc.ID), &f.Buffer); err != nil {
+		if err := showComments(tn, desc, selectComment(ctx, p, desc.ID), &f.Buffer); err != nil {
 			return "", err
 		}
 	}
@@ -208,7 +224,7 @@ func formatQuoteNames(buf *bytes.Buffer, names ...string) {
 func (p *planner) ShowCreate(
 	ctx context.Context,
 	dbPrefix string,
-	allDescs []sqlbase.Descriptor,
+	allDescs []descpb.Descriptor,
 	desc *sqlbase.ImmutableTableDescriptor,
 	displayOptions ShowCreateDisplayOptions,
 ) (string, error) {

@@ -60,27 +60,60 @@ CREATE TABLE public.c (
   FAMILY fam_0_a_rowid (a, rowid),
   FAMILY fam_1_b (b)
 );
-COMMENT ON TABLE c IS 'table';
-COMMENT ON COLUMN c.a IS 'column';
-COMMENT ON INDEX c@c_a_b_idx IS 'index'  CREATE TABLE public.c (
-                                         a INT8 NOT NULL,
-                                         b INT8 NULL,
-                                         INDEX c_a_b_idx (a ASC, b ASC),
-                                         FAMILY fam_0_a_rowid (a, rowid),
-                                         FAMILY fam_1_b (b)
+COMMENT ON TABLE public.c IS 'table';
+COMMENT ON COLUMN public.c.a IS 'column';
+COMMENT ON INDEX public.c@c_a_b_idx IS 'index'  CREATE TABLE public.c (
+                                                a INT8 NOT NULL,
+                                                b INT8 NULL,
+                                                INDEX c_a_b_idx (a ASC, b ASC),
+                                                FAMILY fam_0_a_rowid (a, rowid),
+                                                FAMILY fam_1_b (b)
 );
-COMMENT ON TABLE c IS 'table';
-COMMENT ON COLUMN c.a IS 'column';
-COMMENT ON INDEX c@c_a_b_idx IS 'index'  {}  {}
+COMMENT ON TABLE public.c IS 'table';
+COMMENT ON COLUMN public.c.a IS 'column';
+COMMENT ON INDEX public.c@c_a_b_idx IS 'index'  {}  {}
+
+query T noticetrace
+CREATE UNLOGGED TABLE unlogged_tbl (col int PRIMARY KEY)
+----
+NOTICE: UNLOGGED TABLE will behave as a regular table in CockroachDB
+
+query TT
+SHOW CREATE TABLE unlogged_tbl
+----
+unlogged_tbl  CREATE TABLE public.unlogged_tbl (
+              col INT8 NOT NULL,
+              CONSTRAINT "primary" PRIMARY KEY (col ASC),
+              FAMILY "primary" (col)
+)
 
 statement error invalid storage parameter "foo"
 CREATE TABLE a (b INT) WITH (foo=100);
 
-statement error argument of fillfactor must be type int, not type bool
+statement error parameter "fillfactor" requires an float value
 CREATE TABLE a (b INT) WITH (fillfactor=true);
 
 statement error unimplemented: storage parameter "toast_tuple_target"
 CREATE TABLE a (b INT) WITH (toast_tuple_target=100);
 
-statement ok
-CREATE TABLE a (b INT) WITH (fillfactor=100);
+query T noticetrace
+CREATE TABLE a (b INT) WITH (fillfactor=99.9)
+----
+NOTICE: storage parameter "fillfactor" is ignored
+
+query T noticetrace
+CREATE INDEX a_idx ON a(b) WITH (fillfactor=50)
+----
+NOTICE: storage parameter "fillfactor" is ignored
+
+query T noticetrace
+DROP TABLE a CASCADE; CREATE TABLE a (b INT) WITH (autovacuum_enabled=off)
+----
+NOTICE: storage parameter "autovacuum_enabled = 'off'" is ignored
+
+query T noticetrace
+DROP TABLE a CASCADE; CREATE TABLE a (b INT) WITH (autovacuum_enabled=on)
+----
+
+statement error parameter "autovacuum_enabled" requires a Boolean value
+DROP TABLE a CASCADE; CREATE TABLE a (b INT) WITH (autovacuum_enabled='11')

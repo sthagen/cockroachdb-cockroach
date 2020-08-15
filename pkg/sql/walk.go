@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -50,7 +51,7 @@ type planObserver struct {
 
 	// spans is invoked for spans embedded in each node. hardLimitSet indicates
 	// whether the node will "touch" a limited number of rows.
-	spans func(nodeName, fieldName string, index *sqlbase.IndexDescriptor, spans []roachpb.Span, hardLimitSet bool)
+	spans func(nodeName, fieldName string, index *descpb.IndexDescriptor, spans []roachpb.Span, hardLimitSet bool)
 
 	// attr is invoked for non-expression metadata in each node.
 	attr func(nodeName, fieldName, attr string)
@@ -186,10 +187,10 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			if n.hardLimit > 0 {
 				v.observer.attr(name, "limit", fmt.Sprintf("%d", n.hardLimit))
 			}
-			if n.lockingStrength != sqlbase.ScanLockingStrength_FOR_NONE {
+			if n.lockingStrength != descpb.ScanLockingStrength_FOR_NONE {
 				v.observer.attr(name, "locking strength", n.lockingStrength.PrettyString())
 			}
-			if n.lockingWaitPolicy != sqlbase.ScanLockingWaitPolicy_BLOCK {
+			if n.lockingWaitPolicy != descpb.ScanLockingWaitPolicy_BLOCK {
 				v.observer.attr(name, "locking wait policy", n.lockingWaitPolicy.PrettyString())
 			}
 		}
@@ -284,7 +285,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 
 	case *zigzagJoinNode:
 		if v.observer.attr != nil {
-			v.observer.attr(name, "type", joinTypeStr(sqlbase.InnerJoin))
+			v.observer.attr(name, "type", joinTypeStr(descpb.InnerJoin))
 			if v.observer.expr != nil && n.onCond != nil && n.onCond != tree.DBoolTrue {
 				v.expr(name, "pred", -1, n.onCond)
 			}
@@ -313,7 +314,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *joinNode:
 		if v.observer.attr != nil {
 			jType := joinTypeStr(n.joinType)
-			if n.joinType == sqlbase.InnerJoin && len(n.pred.leftColNames) == 0 && n.pred.onCond == nil {
+			if n.joinType == descpb.InnerJoin && len(n.pred.leftColNames) == 0 && n.pred.onCond == nil {
 				jType = "cross"
 			}
 			v.observer.attr(name, "type", jType)
@@ -378,10 +379,10 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			}
 			v.observer.attr(name, "ancestor", ancestor)
 
-			if lockingStrength != sqlbase.ScanLockingStrength_FOR_NONE {
+			if lockingStrength != descpb.ScanLockingStrength_FOR_NONE {
 				v.observer.attr(name, "locking strength", lockingStrength.PrettyString())
 			}
-			if lockingWaitPolicy != sqlbase.ScanLockingWaitPolicy_BLOCK {
+			if lockingWaitPolicy != descpb.ScanLockingWaitPolicy_BLOCK {
 				v.observer.attr(name, "locking wait policy", lockingWaitPolicy.PrettyString())
 			}
 		}
@@ -474,7 +475,12 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *groupNode:
 		if v.observer.attr != nil {
 			inputCols := planColumns(n.plan)
+			aggIdx := 0
 			for i, agg := range n.funcs {
+				if _, ok := n.aggIsGroupingColumn(i); ok {
+					// Don't show grouping columns as aggregations.
+					continue
+				}
 				var buf bytes.Buffer
 				if groupingCol, ok := n.aggIsGroupingColumn(i); ok {
 					buf.WriteString(inputCols[groupingCol].Name)
@@ -485,8 +491,8 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 							buf.WriteString("DISTINCT ")
 						}
 
-						for i, idx := range agg.argRenderIdxs {
-							if i != 0 {
+						for j, idx := range agg.argRenderIdxs {
+							if j != 0 {
 								buf.WriteString(", ")
 							}
 							buf.WriteString(inputCols[idx].Name)
@@ -497,7 +503,8 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 						fmt.Fprintf(&buf, " FILTER (WHERE %s)", inputCols[agg.filterRenderIdx].Name)
 					}
 				}
-				v.observer.attr(name, fmt.Sprintf("aggregate %d", i), buf.String())
+				v.observer.attr(name, fmt.Sprintf("aggregate %d", aggIdx), buf.String())
+				aggIdx++
 			}
 			if len(n.groupCols) > 0 {
 				var cols []string
@@ -712,10 +719,10 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		// represented physically. We don't yet have a walker over such
 		// representation, so we simply short-circuit.
 		// TODO(yuzefovich): implement that walker and use it here.
-		if n.plan.planNode == nil {
+		if n.plan.main.planNode == nil {
 			return
 		}
-		n.plan.planNode = v.visit(n.plan.planNode)
+		n.plan.main.planNode = v.visit(n.plan.main.planNode)
 
 	case *ordinalityNode:
 		n.source = v.visit(n.source)
@@ -797,7 +804,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 
 	case *exportNode:
 		if v.observer.attr != nil {
-			v.observer.attr(name, "destination", n.fileName)
+			v.observer.attr(name, "destination", n.destination)
 		}
 		n.source = v.visit(n.source)
 	}
@@ -836,7 +843,7 @@ func (v *planVisitor) metadataTuples(nodeName string, tuples [][]tree.TypedExpr)
 
 // formatTable returns a string of the form "<table_name>@<index_name>", or
 // "<table_name>@<index_name> (partial index)" if the index is partial.
-func formatTable(desc *sqlbase.ImmutableTableDescriptor, index *sqlbase.IndexDescriptor) string {
+func formatTable(desc *sqlbase.ImmutableTableDescriptor, index *descpb.IndexDescriptor) string {
 	partial := ""
 	if index.IsPartial() {
 		partial = " (partial index)"
@@ -871,12 +878,12 @@ func nodeName(plan planNode) string {
 
 	case *joinNode:
 		if len(n.mergeJoinOrdering) > 0 {
-			return "merge-join"
+			return "merge join"
 		}
 		if len(n.pred.leftEqualityIndices) == 0 {
-			return "cross-join"
+			return "cross join"
 		}
-		return "hash-join"
+		return "hash join"
 	}
 
 	name, ok := planNodeNames[reflect.TypeOf(plan)]
@@ -887,19 +894,19 @@ func nodeName(plan planNode) string {
 	return name
 }
 
-func joinTypeStr(t sqlbase.JoinType) string {
+func joinTypeStr(t descpb.JoinType) string {
 	switch t {
-	case sqlbase.InnerJoin:
+	case descpb.InnerJoin:
 		return "inner"
-	case sqlbase.LeftOuterJoin:
+	case descpb.LeftOuterJoin:
 		return "left outer"
-	case sqlbase.RightOuterJoin:
+	case descpb.RightOuterJoin:
 		return "right outer"
-	case sqlbase.FullOuterJoin:
+	case descpb.FullOuterJoin:
 		return "full outer"
-	case sqlbase.LeftSemiJoin:
+	case descpb.LeftSemiJoin:
 		return "semi"
-	case sqlbase.LeftAntiJoin:
+	case descpb.LeftAntiJoin:
 		return "anti"
 	}
 	panic(errors.AssertionFailedf("unknown join type %s", t))
@@ -909,100 +916,105 @@ func joinTypeStr(t sqlbase.JoinType) string {
 // strings are constant and not precomputed so that the type names can
 // be changed without changing the output of "EXPLAIN".
 var planNodeNames = map[reflect.Type]string{
-	reflect.TypeOf(&alterIndexNode{}):        "alter index",
-	reflect.TypeOf(&alterSequenceNode{}):     "alter sequence",
-	reflect.TypeOf(&alterTableNode{}):        "alter table",
-	reflect.TypeOf(&alterTypeNode{}):         "alter type",
-	reflect.TypeOf(&alterRoleNode{}):         "alter role",
-	reflect.TypeOf(&applyJoinNode{}):         "apply-join",
-	reflect.TypeOf(&bufferNode{}):            "buffer node",
-	reflect.TypeOf(&cancelQueriesNode{}):     "cancel queries",
-	reflect.TypeOf(&cancelSessionsNode{}):    "cancel sessions",
-	reflect.TypeOf(&changePrivilegesNode{}):  "change privileges",
-	reflect.TypeOf(&commentOnColumnNode{}):   "comment on column",
-	reflect.TypeOf(&commentOnDatabaseNode{}): "comment on database",
-	reflect.TypeOf(&commentOnIndexNode{}):    "comment on index",
-	reflect.TypeOf(&commentOnTableNode{}):    "comment on table",
-	reflect.TypeOf(&controlJobsNode{}):       "control jobs",
-	reflect.TypeOf(&controlSchedulesNode{}):  "control schedules",
-	reflect.TypeOf(&createDatabaseNode{}):    "create database",
-	reflect.TypeOf(&createIndexNode{}):       "create index",
-	reflect.TypeOf(&createSequenceNode{}):    "create sequence",
-	reflect.TypeOf(&createSchemaNode{}):      "create schema",
-	reflect.TypeOf(&createStatsNode{}):       "create statistics",
-	reflect.TypeOf(&createTableNode{}):       "create table",
-	reflect.TypeOf(&createTypeNode{}):        "create type",
-	reflect.TypeOf(&CreateRoleNode{}):        "create user/role",
-	reflect.TypeOf(&createViewNode{}):        "create view",
-	reflect.TypeOf(&delayedNode{}):           "virtual table",
-	reflect.TypeOf(&deleteNode{}):            "delete",
-	reflect.TypeOf(&deleteRangeNode{}):       "delete range",
-	reflect.TypeOf(&distinctNode{}):          "distinct",
-	reflect.TypeOf(&dropDatabaseNode{}):      "drop database",
-	reflect.TypeOf(&dropIndexNode{}):         "drop index",
-	reflect.TypeOf(&dropSequenceNode{}):      "drop sequence",
-	reflect.TypeOf(&dropTableNode{}):         "drop table",
-	reflect.TypeOf(&dropTypeNode{}):          "drop type",
-	reflect.TypeOf(&DropRoleNode{}):          "drop user/role",
-	reflect.TypeOf(&dropViewNode{}):          "drop view",
-	reflect.TypeOf(&errorIfRowsNode{}):       "error if rows",
-	reflect.TypeOf(&explainDistSQLNode{}):    "explain distsql",
-	reflect.TypeOf(&explainPlanNode{}):       "explain plan",
-	reflect.TypeOf(&explainVecNode{}):        "explain vectorized",
-	reflect.TypeOf(&exportNode{}):            "export",
-	reflect.TypeOf(&filterNode{}):            "filter",
-	reflect.TypeOf(&GrantRoleNode{}):         "grant role",
-	reflect.TypeOf(&groupNode{}):             "group",
-	reflect.TypeOf(&hookFnNode{}):            "plugin",
-	reflect.TypeOf(&indexJoinNode{}):         "index-join",
-	reflect.TypeOf(&insertNode{}):            "insert",
-	reflect.TypeOf(&insertFastPathNode{}):    "insert-fast-path",
-	reflect.TypeOf(&interleavedJoinNode{}):   "interleaved-join",
-	reflect.TypeOf(&invertedFilterNode{}):    "inverted-filter",
-	reflect.TypeOf(&invertedJoinNode{}):      "inverted-join",
-	reflect.TypeOf(&joinNode{}):              "join",
-	reflect.TypeOf(&limitNode{}):             "limit",
-	reflect.TypeOf(&lookupJoinNode{}):        "lookup-join",
-	reflect.TypeOf(&max1RowNode{}):           "max1row",
-	reflect.TypeOf(&ordinalityNode{}):        "ordinality",
-	reflect.TypeOf(&projectSetNode{}):        "project set",
-	reflect.TypeOf(&recursiveCTENode{}):      "recursive cte node",
-	reflect.TypeOf(&relocateNode{}):          "relocate",
-	reflect.TypeOf(&renameColumnNode{}):      "rename column",
-	reflect.TypeOf(&renameDatabaseNode{}):    "rename database",
-	reflect.TypeOf(&renameIndexNode{}):       "rename index",
-	reflect.TypeOf(&renameTableNode{}):       "rename table",
-	reflect.TypeOf(&renderNode{}):            "render",
-	reflect.TypeOf(&RevokeRoleNode{}):        "revoke role",
-	reflect.TypeOf(&rowCountNode{}):          "count",
-	reflect.TypeOf(&rowSourceToPlanNode{}):   "row source to plan node",
-	reflect.TypeOf(&saveTableNode{}):         "save table",
-	reflect.TypeOf(&scanBufferNode{}):        "scan buffer node",
-	reflect.TypeOf(&scanNode{}):              "scan",
-	reflect.TypeOf(&scatterNode{}):           "scatter",
-	reflect.TypeOf(&scrubNode{}):             "scrub",
-	reflect.TypeOf(&sequenceSelectNode{}):    "sequence select",
-	reflect.TypeOf(&serializeNode{}):         "run",
-	reflect.TypeOf(&setClusterSettingNode{}): "set cluster setting",
-	reflect.TypeOf(&setVarNode{}):            "set",
-	reflect.TypeOf(&setZoneConfigNode{}):     "configure zone",
-	reflect.TypeOf(&showFingerprintsNode{}):  "showFingerprints",
-	reflect.TypeOf(&showTraceNode{}):         "show trace for",
-	reflect.TypeOf(&showTraceReplicaNode{}):  "replica trace",
-	reflect.TypeOf(&sortNode{}):              "sort",
-	reflect.TypeOf(&splitNode{}):             "split",
-	reflect.TypeOf(&unsplitNode{}):           "unsplit",
-	reflect.TypeOf(&unsplitAllNode{}):        "unsplit all",
-	reflect.TypeOf(&spoolNode{}):             "spool",
-	reflect.TypeOf(&truncateNode{}):          "truncate",
-	reflect.TypeOf(&unaryNode{}):             "emptyrow",
-	reflect.TypeOf(&unionNode{}):             "union",
-	reflect.TypeOf(&updateNode{}):            "update",
-	reflect.TypeOf(&upsertNode{}):            "upsert",
-	reflect.TypeOf(&valuesNode{}):            "values",
-	reflect.TypeOf(&virtualTableNode{}):      "virtual table values",
-	reflect.TypeOf(&vTableLookupJoinNode{}):  "virtual-table-lookup-join",
-	reflect.TypeOf(&windowNode{}):            "window",
-	reflect.TypeOf(&zeroNode{}):              "norows",
-	reflect.TypeOf(&zigzagJoinNode{}):        "zigzag-join",
+	reflect.TypeOf(&alterIndexNode{}):              "alter index",
+	reflect.TypeOf(&alterSequenceNode{}):           "alter sequence",
+	reflect.TypeOf(&alterSchemaNode{}):             "alter schema",
+	reflect.TypeOf(&alterTableNode{}):              "alter table",
+	reflect.TypeOf(&alterTableSetSchemaNode{}):     "alter table set schema",
+	reflect.TypeOf(&alterTypeNode{}):               "alter type",
+	reflect.TypeOf(&alterRoleNode{}):               "alter role",
+	reflect.TypeOf(&applyJoinNode{}):               "apply join",
+	reflect.TypeOf(&bufferNode{}):                  "buffer",
+	reflect.TypeOf(&cancelQueriesNode{}):           "cancel queries",
+	reflect.TypeOf(&cancelSessionsNode{}):          "cancel sessions",
+	reflect.TypeOf(&changePrivilegesNode{}):        "change privileges",
+	reflect.TypeOf(&commentOnColumnNode{}):         "comment on column",
+	reflect.TypeOf(&commentOnDatabaseNode{}):       "comment on database",
+	reflect.TypeOf(&commentOnIndexNode{}):          "comment on index",
+	reflect.TypeOf(&commentOnTableNode{}):          "comment on table",
+	reflect.TypeOf(&controlJobsNode{}):             "control jobs",
+	reflect.TypeOf(&controlSchedulesNode{}):        "control schedules",
+	reflect.TypeOf(&createDatabaseNode{}):          "create database",
+	reflect.TypeOf(&createIndexNode{}):             "create index",
+	reflect.TypeOf(&createSequenceNode{}):          "create sequence",
+	reflect.TypeOf(&createSchemaNode{}):            "create schema",
+	reflect.TypeOf(&createStatsNode{}):             "create statistics",
+	reflect.TypeOf(&createTableNode{}):             "create table",
+	reflect.TypeOf(&createTypeNode{}):              "create type",
+	reflect.TypeOf(&CreateRoleNode{}):              "create user/role",
+	reflect.TypeOf(&createViewNode{}):              "create view",
+	reflect.TypeOf(&delayedNode{}):                 "virtual table",
+	reflect.TypeOf(&deleteNode{}):                  "delete",
+	reflect.TypeOf(&deleteRangeNode{}):             "delete range",
+	reflect.TypeOf(&distinctNode{}):                "distinct",
+	reflect.TypeOf(&dropDatabaseNode{}):            "drop database",
+	reflect.TypeOf(&dropIndexNode{}):               "drop index",
+	reflect.TypeOf(&dropSequenceNode{}):            "drop sequence",
+	reflect.TypeOf(&dropSchemaNode{}):              "drop schema",
+	reflect.TypeOf(&dropTableNode{}):               "drop table",
+	reflect.TypeOf(&dropTypeNode{}):                "drop type",
+	reflect.TypeOf(&DropRoleNode{}):                "drop user/role",
+	reflect.TypeOf(&dropViewNode{}):                "drop view",
+	reflect.TypeOf(&errorIfRowsNode{}):             "error if rows",
+	reflect.TypeOf(&explainDistSQLNode{}):          "explain distsql",
+	reflect.TypeOf(&explainPlanNode{}):             "explain plan",
+	reflect.TypeOf(&explainNewPlanNode{}):          "explain plan",
+	reflect.TypeOf(&explainVecNode{}):              "explain vectorized",
+	reflect.TypeOf(&exportNode{}):                  "export",
+	reflect.TypeOf(&filterNode{}):                  "filter",
+	reflect.TypeOf(&GrantRoleNode{}):               "grant role",
+	reflect.TypeOf(&groupNode{}):                   "group",
+	reflect.TypeOf(&hookFnNode{}):                  "plugin",
+	reflect.TypeOf(&indexJoinNode{}):               "index join",
+	reflect.TypeOf(&insertNode{}):                  "insert",
+	reflect.TypeOf(&insertFastPathNode{}):          "insert fast path",
+	reflect.TypeOf(&interleavedJoinNode{}):         "interleaved join",
+	reflect.TypeOf(&invertedFilterNode{}):          "inverted filter",
+	reflect.TypeOf(&invertedJoinNode{}):            "inverted join",
+	reflect.TypeOf(&joinNode{}):                    "join",
+	reflect.TypeOf(&limitNode{}):                   "limit",
+	reflect.TypeOf(&lookupJoinNode{}):              "lookup join",
+	reflect.TypeOf(&max1RowNode{}):                 "max1row",
+	reflect.TypeOf(&ordinalityNode{}):              "ordinality",
+	reflect.TypeOf(&projectSetNode{}):              "project set",
+	reflect.TypeOf(&recursiveCTENode{}):            "recursive cte",
+	reflect.TypeOf(&refreshMaterializedViewNode{}): "refresh materialized view",
+	reflect.TypeOf(&relocateNode{}):                "relocate",
+	reflect.TypeOf(&renameColumnNode{}):            "rename column",
+	reflect.TypeOf(&renameDatabaseNode{}):          "rename database",
+	reflect.TypeOf(&renameIndexNode{}):             "rename index",
+	reflect.TypeOf(&renameTableNode{}):             "rename table",
+	reflect.TypeOf(&renderNode{}):                  "render",
+	reflect.TypeOf(&RevokeRoleNode{}):              "revoke role",
+	reflect.TypeOf(&rowCountNode{}):                "count",
+	reflect.TypeOf(&rowSourceToPlanNode{}):         "row source to plan node",
+	reflect.TypeOf(&saveTableNode{}):               "save table",
+	reflect.TypeOf(&scanBufferNode{}):              "scan buffer",
+	reflect.TypeOf(&scanNode{}):                    "scan",
+	reflect.TypeOf(&scatterNode{}):                 "scatter",
+	reflect.TypeOf(&scrubNode{}):                   "scrub",
+	reflect.TypeOf(&sequenceSelectNode{}):          "sequence select",
+	reflect.TypeOf(&serializeNode{}):               "run",
+	reflect.TypeOf(&setClusterSettingNode{}):       "set cluster setting",
+	reflect.TypeOf(&setVarNode{}):                  "set",
+	reflect.TypeOf(&setZoneConfigNode{}):           "configure zone",
+	reflect.TypeOf(&showFingerprintsNode{}):        "show fingerprints",
+	reflect.TypeOf(&showTraceNode{}):               "show trace for",
+	reflect.TypeOf(&showTraceReplicaNode{}):        "replica trace",
+	reflect.TypeOf(&sortNode{}):                    "sort",
+	reflect.TypeOf(&splitNode{}):                   "split",
+	reflect.TypeOf(&unsplitNode{}):                 "unsplit",
+	reflect.TypeOf(&unsplitAllNode{}):              "unsplit all",
+	reflect.TypeOf(&spoolNode{}):                   "spool",
+	reflect.TypeOf(&truncateNode{}):                "truncate",
+	reflect.TypeOf(&unaryNode{}):                   "emptyrow",
+	reflect.TypeOf(&unionNode{}):                   "union",
+	reflect.TypeOf(&updateNode{}):                  "update",
+	reflect.TypeOf(&upsertNode{}):                  "upsert",
+	reflect.TypeOf(&valuesNode{}):                  "values",
+	reflect.TypeOf(&virtualTableNode{}):            "virtual table values",
+	reflect.TypeOf(&vTableLookupJoinNode{}):        "virtual table lookup join",
+	reflect.TypeOf(&windowNode{}):                  "window",
+	reflect.TypeOf(&zeroNode{}):                    "norows",
+	reflect.TypeOf(&zigzagJoinNode{}):              "zigzag join",
 }

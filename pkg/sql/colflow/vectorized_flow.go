@@ -274,9 +274,14 @@ func (f *vectorizedFlow) IsVectorized() bool {
 	return true
 }
 
-// ConcurrentExecution is part of the flowinfra.Flow interface.
-func (f *vectorizedFlow) ConcurrentExecution() bool {
-	return f.operatorConcurrency || f.FlowBase.ConcurrentExecution()
+// ConcurrentTxnUse is part of the flowinfra.Flow interface. It is conservative
+// in that it returns that there is concurrent txn use as soon as any operator
+// concurrency is detected. This should be inconsequential for local flows that
+// use the RootTxn (which are the cases in which we care about this return
+// value), because only unordered synchronizers introduce operator concurrency
+// at the time of writing.
+func (f *vectorizedFlow) ConcurrentTxnUse() bool {
+	return f.operatorConcurrency || f.FlowBase.ConcurrentTxnUse()
 }
 
 // Release releases this vectorizedFlow back to the pool.
@@ -586,7 +591,15 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 		// derive a separate child context for each outbox.
 		var outboxCancelFn context.CancelFunc
 		ctx, outboxCancelFn = context.WithCancel(ctx)
-		outbox.Run(ctx, s.nodeDialer, stream.TargetNodeID, s.flowID, stream.StreamID, outboxCancelFn)
+		outbox.Run(
+			ctx,
+			s.nodeDialer,
+			stream.TargetNodeID,
+			s.flowID,
+			stream.StreamID,
+			outboxCancelFn,
+			flowinfra.SettingFlowStreamTimeout.Get(&flowCtx.Cfg.Settings.SV),
+		)
 		currentOutboxes := atomic.AddInt32(&s.numOutboxes, -1)
 		// When the last Outbox on this node exits, we want to make sure that
 		// everything is shutdown; namely, we need to call cancelFn if:
@@ -718,9 +731,11 @@ func (s *vectorizedFlowCreator) setupInput(
 	// don't do that. However, all operators (apart from the colBatchScan) get
 	// their types from InputSyncSpec, so this is a convenient place to do the
 	// hydration so that all operators get the valid types.
-	if err := execinfrapb.HydrateTypeSlice(flowCtx.EvalCtx, input.ColumnTypes); err != nil {
+	resolver := flowCtx.TypeResolverFactory.NewTypeResolver(flowCtx.EvalCtx.Txn)
+	if err := resolver.HydrateTypeSlice(ctx, input.ColumnTypes); err != nil {
 		return nil, nil, nil, err
 	}
+
 	for _, inputStream := range input.Streams {
 		switch inputStream.Type {
 		case execinfrapb.StreamEndpointSpec_LOCAL:

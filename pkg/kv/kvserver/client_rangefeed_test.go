@@ -20,6 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -65,7 +67,8 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 		const junkDescriptorID = 42
 		require.GreaterOrEqual(t, keys.MaxReservedDescID, junkDescriptorID)
 		junkDescriptorKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, junkDescriptorID)
-		junkDescriptor := sqlbase.NewInitialDatabaseDescriptor(junkDescriptorID, "junk")
+		junkDescriptor := sqlbase.NewInitialDatabaseDescriptor(
+			junkDescriptorID, "junk", security.AdminRole)
 		require.NoError(t, db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			if err := txn.SetSystemConfigTrigger(true /* forSystemTenant */); err != nil {
 				return err
@@ -80,7 +83,7 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 			}
 
 			if ev.Val != nil && ev.Val.Key.Equal(junkDescriptorKey) {
-				var gotProto sqlbase.Descriptor
+				var gotProto descpb.Descriptor
 				require.NoError(t, ev.Val.Value.GetProto(&gotProto))
 				require.EqualValues(t, junkDescriptor.DescriptorProto(), &gotProto)
 				break

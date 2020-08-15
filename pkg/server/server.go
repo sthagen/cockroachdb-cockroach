@@ -278,26 +278,20 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	ctx := cfg.AmbientCtx.AnnotateCtx(context.Background())
 
-	var rpcContext *rpc.Context
+	rpcCtxOpts := rpc.ContextOptions{
+		TenantID:   roachpb.SystemTenantID,
+		AmbientCtx: cfg.AmbientCtx,
+		Config:     cfg.Config,
+		Clock:      clock,
+		Stopper:    stopper,
+		Settings:   cfg.Settings,
+	}
 	if knobs := cfg.TestingKnobs.Server; knobs != nil {
 		serverKnobs := knobs.(*TestingKnobs)
-		rpcContext = rpc.NewContext(rpc.ContextOptions{
-			AmbientCtx: cfg.AmbientCtx,
-			Config:     cfg.Config,
-			Clock:      clock,
-			Stopper:    stopper,
-			Settings:   cfg.Settings,
-			Knobs:      serverKnobs.ContextTestingKnobs,
-		})
-	} else {
-		rpcContext = rpc.NewContext(rpc.ContextOptions{
-			AmbientCtx: cfg.AmbientCtx,
-			Config:     cfg.Config,
-			Clock:      clock,
-			Stopper:    stopper,
-			Settings:   cfg.Settings,
-		})
+		rpcCtxOpts.Knobs = serverKnobs.ContextTestingKnobs
 	}
+	rpcContext := rpc.NewContext(rpcCtxOpts)
+
 	rpcContext.HeartbeatCB = func() {
 		if err := rpcContext.RemoteClocks.VerifyClockOffset(ctx); err != nil {
 			log.Fatalf(ctx, "%v", err)
@@ -335,10 +329,9 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	grpc := newGRPCServer(rpcContext)
 
-	// TODO(tbg): pass a different rpcContext here.
 	var tenantGRPC *grpcServer
 	if cfg.SplitListenTenant {
-		tenantGRPC = newGRPCServer(rpcContext)
+		tenantGRPC = newGRPCServer(rpcContext, rpc.ForTenant)
 	}
 
 	g := gossip.New(
@@ -599,7 +592,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		sqlServerOptionalKVArgs: sqlServerOptionalKVArgs{
 			statusServer:           serverpb.MakeOptionalStatusServer(sStatus),
 			nodeLiveness:           sqlbase.MakeOptionalNodeLiveness(nodeLiveness),
-			gossip:                 gossip.MakeExposedGossip(g),
+			gossip:                 gossip.MakeOptionalGossip(g),
 			grpcServer:             grpc.Server,
 			recorder:               recorder,
 			nodeIDContainer:        idContainer,
@@ -614,6 +607,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		runtime:                  runtimeSampler,
 		rpcContext:               rpcContext,
 		nodeDescs:                g,
+		systemConfigProvider:     g,
 		nodeDialer:               nodeDialer,
 		distSender:               distSender,
 		db:                       db,
@@ -1639,9 +1633,6 @@ func (s *Server) Start(ctx context.Context) error {
 
 	log.Event(ctx, "added http endpoints")
 
-	// Attempt to upgrade cluster version.
-	s.startAttemptUpgrade(ctx)
-
 	// Record node start in telemetry. Get the right counter for this storage
 	// engine type as well as type of start (initial boot vs restart).
 	nodeStartCounter := "storage.engine."
@@ -1681,6 +1672,11 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := s.debug.RegisterEngines(s.cfg.Stores.Specs, s.engines); err != nil {
 		return errors.Wrapf(err, "failed to register engines with debug server")
 	}
+
+	// Attempt to upgrade cluster version now that the sql server has been
+	// started. At this point we know that all sqlmigrations have successfully
+	// been run so it is safe to upgrade to the binary's current version.
+	s.startAttemptUpgrade(ctx)
 
 	log.Event(ctx, "server ready")
 	return nil
@@ -1991,43 +1987,65 @@ func (s *Server) Decommission(
 }
 
 // startSampleEnvironment begins the heap profiler worker.
-func (s *Server) startSampleEnvironment(ctx context.Context, frequency time.Duration) error {
+func (s *Server) startSampleEnvironment(
+	ctx context.Context, minSampleInterval time.Duration,
+) error {
 	// Immediately record summaries once on server startup.
 	ctx = s.AnnotateCtx(ctx)
 
-	// We're not going to take heap profiles or goroutine dumps if
-	// running only with in-memory stores.  This helps some tests that
-	// can't write any files.
-	allStoresInMem := true
-	for _, storeSpec := range s.cfg.Stores.Specs {
-		if !storeSpec.InMemory {
-			allStoresInMem = false
-			break
-		}
-	}
-
+	// Initialize a goroutine dumper if we have an output directory
+	// specified.
 	var goroutineDumper *goroutinedumper.GoroutineDumper
-	var heapProfiler *heapprofiler.HeapProfiler
-
-	if !allStoresInMem {
-		var err error
-		if s.cfg.GoroutineDumpDirName != "" {
-			if err := os.MkdirAll(s.cfg.GoroutineDumpDirName, 0755); err != nil {
-				return errors.Wrap(err, "creating goroutine dump dir")
-			}
-			goroutineDumper, err = goroutinedumper.NewGoroutineDumper(s.cfg.GoroutineDumpDirName)
+	if s.cfg.GoroutineDumpDirName != "" {
+		hasValidDumpDir := true
+		if err := os.MkdirAll(s.cfg.GoroutineDumpDirName, 0755); err != nil {
+			// This is possible when running with only in-memory stores;
+			// in that case the start-up code sets the output directory
+			// to the current directory (.). If wrunning the process
+			// from a directory which is not writable, we won't
+			// be able to create a sub-directory here.
+			log.Warningf(ctx, "cannot create goroutine dump dir -- goroutine dumps will be disabled: %v", err)
+			hasValidDumpDir = false
+		}
+		if hasValidDumpDir {
+			var err error
+			goroutineDumper, err = goroutinedumper.NewGoroutineDumper(ctx, s.cfg.GoroutineDumpDirName, s.ClusterSettings())
 			if err != nil {
 				return errors.Wrap(err, "starting goroutine dumper worker")
 			}
 		}
+	}
 
-		if s.cfg.HeapProfileDirName != "" {
-			if err := os.MkdirAll(s.cfg.HeapProfileDirName, 0755); err != nil {
-				return errors.Wrap(err, "creating heap profiles dir")
-			}
-			heapProfiler, err = heapprofiler.NewHeapProfiler(s.cfg.HeapProfileDirName, s.ClusterSettings())
+	// Initialize a heap profiler if we have an output directory
+	// specified.
+	var heapProfiler *heapprofiler.HeapProfiler
+	var nonGoAllocProfiler *heapprofiler.NonGoAllocProfiler
+	var statsProfiler *heapprofiler.StatsProfiler
+	if s.cfg.HeapProfileDirName != "" {
+		hasValidDumpDir := true
+		if err := os.MkdirAll(s.cfg.HeapProfileDirName, 0755); err != nil {
+			// This is possible when running with only in-memory stores;
+			// in that case the start-up code sets the output directory
+			// to the current directory (.). If wrunning the process
+			// from a directory which is not writable, we won't
+			// be able to create a sub-directory here.
+			log.Warningf(ctx, "cannot create memory dump dir -- memory profile dumps will be disabled: %v", err)
+			hasValidDumpDir = false
+		}
+
+		if hasValidDumpDir {
+			var err error
+			heapProfiler, err = heapprofiler.NewHeapProfiler(ctx, s.cfg.HeapProfileDirName, s.ClusterSettings())
 			if err != nil {
 				return errors.Wrap(err, "starting heap profiler worker")
+			}
+			nonGoAllocProfiler, err = heapprofiler.NewNonGoAllocProfiler(ctx, s.cfg.HeapProfileDirName, s.ClusterSettings())
+			if err != nil {
+				return errors.Wrap(err, "starting non-go alloc profiler worker")
+			}
+			statsProfiler, err = heapprofiler.NewStatsProfiler(ctx, s.cfg.HeapProfileDirName, s.ClusterSettings())
+			if err != nil {
+				return errors.Wrap(err, "starting memory stats collector worker")
 			}
 		}
 	}
@@ -2039,7 +2057,7 @@ func (s *Server) startSampleEnvironment(ctx context.Context, frequency time.Dura
 
 		timer := timeutil.NewTimer()
 		defer timer.Stop()
-		timer.Reset(frequency)
+		timer.Reset(minSampleInterval)
 
 		for {
 			select {
@@ -2047,7 +2065,7 @@ func (s *Server) startSampleEnvironment(ctx context.Context, frequency time.Dura
 				return
 			case <-timer.C:
 				timer.Read = true
-				timer.Reset(frequency)
+				timer.Reset(minSampleInterval)
 
 				// We read the heap stats on another goroutine and give up after 1s.
 				// This is necessary because as of Go 1.12, runtime.ReadMemStats()
@@ -2079,14 +2097,16 @@ func (s *Server) startSampleEnvironment(ctx context.Context, frequency time.Dura
 				}
 
 				curStats := goMemStats.Load().(*status.GoMemStats)
-				s.runtime.SampleEnvironment(ctx, *curStats)
+				cgoStats := status.GetCGoMemStats(ctx)
+				s.runtime.SampleEnvironment(ctx, curStats, cgoStats)
 				if goroutineDumper != nil {
 					goroutineDumper.MaybeDump(ctx, s.ClusterSettings(), s.runtime.Goroutines.Value())
 				}
 				if heapProfiler != nil {
-					heapProfiler.MaybeTakeProfile(ctx, curStats.MemStats)
+					heapProfiler.MaybeTakeProfile(ctx, s.runtime.GoAllocBytes.Value())
+					nonGoAllocProfiler.MaybeTakeProfile(ctx, s.runtime.CgoTotalBytes.Value())
+					statsProfiler.MaybeTakeProfile(ctx, s.runtime.RSSBytes.Value(), curStats, cgoStats)
 				}
-
 			}
 		}
 	})

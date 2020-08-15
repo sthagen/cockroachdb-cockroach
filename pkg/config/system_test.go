@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -62,8 +63,9 @@ func sqlKV(tableID uint32, indexID, descID uint64) roachpb.KeyValue {
 }
 
 func descriptor(descID uint64) roachpb.KeyValue {
-	k := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(descID))
-	v := sqlbase.TableDescriptor{}
+	id := descpb.ID(descID)
+	k := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, id)
+	v := sqlbase.NewImmutableTableDescriptor(descpb.TableDescriptor{ID: id})
 	kv := roachpb.KeyValue{Key: k}
 	if err := kv.Value.SetProto(v.DescriptorProto()); err != nil {
 		panic(err)
@@ -205,7 +207,7 @@ func TestGetLargestID(t *testing.T) {
 			maxDescID := config.SystemTenantObjectID(descIDs[len(descIDs)-1])
 			kvs, _ /* splits */ := ms.GetInitialValues()
 			pseudoIDs := keys.PseudoTableIDs
-			const pseudoIDIsMax = true // NOTE: will change as new system objects are added
+			const pseudoIDIsMax = false // NOTE: change to false if adding new system not pseudo objects.
 			if pseudoIDIsMax {
 				maxDescID = config.SystemTenantObjectID(keys.MaxPseudoTableID)
 			}

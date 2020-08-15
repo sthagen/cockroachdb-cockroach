@@ -21,6 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -47,6 +49,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slprovider"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
@@ -72,7 +76,7 @@ type sqlServer struct {
 	internalExecutor *sql.InternalExecutor
 	leaseMgr         *lease.Manager
 	blobService      *blobs.Service
-	tenantProxy      kvtenant.Proxy
+	tenantConnect    kvtenant.Connector
 	// sessionRegistry can be queried for info on running SQL sessions. It is
 	// shared between the sql.Server and the statusServer.
 	sessionRegistry        *sql.SessionRegistry
@@ -85,6 +89,7 @@ type sqlServer struct {
 	// sqlMemMetrics are used to track memory usage of sql sessions.
 	sqlMemMetrics           sql.MemoryMetrics
 	stmtDiagnosticsRegistry *stmtdiagnostics.Registry
+	sqlLivenessProvider     sqlliveness.Provider
 }
 
 // sqlServerOptionalKVArgs are the arguments supplied to newSQLServer which are
@@ -101,7 +106,7 @@ type sqlServerOptionalKVArgs struct {
 	// Gossip is relied upon by distSQLCfg (execinfra.ServerConfig), the executor
 	// config, the DistSQL planner, the table statistics cache, the statements
 	// diagnostics registry, and the lease manager.
-	gossip gossip.DeprecatedGossip
+	gossip gossip.OptionalGossip
 	// To register blob and DistSQL servers.
 	grpcServer *grpc.Server
 	// Used by executorConfig.
@@ -119,7 +124,7 @@ type sqlServerOptionalKVArgs struct {
 // sqlServerOptionalTenantArgs are the arguments supplied to newSQLServer which
 // are only available if the SQL server runs as part of a standalone SQL node.
 type sqlServerOptionalTenantArgs struct {
-	tenantProxy kvtenant.Proxy
+	tenantConnect kvtenant.Connector
 }
 
 type sqlServerArgs struct {
@@ -147,6 +152,9 @@ type sqlServerArgs struct {
 	// Used by DistSQLPlanner.
 	nodeDescs kvcoord.NodeDescStore
 
+	// Used by the executor config.
+	systemConfigProvider config.SystemConfigProvider
+
 	// Used by DistSQLPlanner.
 	nodeDialer *nodedialer.Dialer
 
@@ -170,6 +178,9 @@ type sqlServerArgs struct {
 	// TODO(tbg): make this less hacky.
 	circularInternalExecutor *sql.InternalExecutor // empty initially
 
+	// Stores and deletes expired liveness sessions.
+	sqlLivenessProvider sqlliveness.Provider
+
 	// The protected timestamps KV subsystem depends on this, so we pass a
 	// pointer to an empty struct in this configuration, which newSQLServer
 	// fills.
@@ -183,6 +194,9 @@ type sqlServerArgs struct {
 func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	execCfg := &sql.ExecutorConfig{}
 	codec := keys.MakeSQLCodec(cfg.SQLConfig.TenantID)
+	if override := cfg.SQLConfig.TenantIDCodecOverride; override != (roachpb.TenantID{}) {
+		codec = keys.MakeSQLCodec(override)
+	}
 
 	// Create blob service for inter-node file sharing.
 	blobService, err := blobs.NewBlobService(cfg.Settings.ExternalIODir)
@@ -198,6 +212,12 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		if testingLiveness := cfg.TestingKnobs.RegistryLiveness; testingLiveness != nil {
 			regLiveness = sqlbase.MakeOptionalNodeLiveness(testingLiveness.(*jobs.FakeNodeLiveness))
 		}
+
+		cfg.sqlLivenessProvider = slprovider.New(
+			cfg.stopper, cfg.clock, cfg.db, cfg.circularInternalExecutor, cfg.Settings,
+		)
+		cfg.registry.AddMetricStruct(cfg.sqlLivenessProvider.Metrics())
+
 		*jobRegistry = *jobs.MakeRegistry(
 			cfg.AmbientCtx,
 			cfg.stopper,
@@ -206,6 +226,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 			cfg.db,
 			cfg.circularInternalExecutor,
 			cfg.nodeIDContainer,
+			cfg.sqlLivenessProvider,
 			cfg.Settings,
 			cfg.HistogramWindowInterval(),
 			func(opName, user string) (interface{}, func()) {
@@ -334,10 +355,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 
 		Metrics: &distSQLMetrics,
 
-		JobRegistry:  jobRegistry,
-		Gossip:       cfg.gossip,
-		NodeDialer:   cfg.nodeDialer,
-		LeaseManager: leaseMgr,
+		SQLLivenessReader: cfg.sqlLivenessProvider,
+		JobRegistry:       jobRegistry,
+		Gossip:            cfg.gossip,
+		NodeDialer:        cfg.nodeDialer,
+		LeaseManager:      leaseMgr,
 
 		ExternalStorage:        cfg.externalStorage,
 		ExternalStorageFromURI: cfg.externalStorageFromURI,
@@ -397,6 +419,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		AmbientCtx:              cfg.AmbientCtx,
 		DB:                      cfg.db,
 		Gossip:                  cfg.gossip,
+		SystemConfig:            cfg.systemConfigProvider,
 		MetricsRecorder:         cfg.recorder,
 		DistSender:              cfg.distSender,
 		RPCContext:              cfg.rpcContext,
@@ -405,6 +428,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		DistSQLSrv:              distSQLServer,
 		StatusServer:            cfg.statusServer,
 		SessionRegistry:         cfg.sessionRegistry,
+		SQLLivenessReader:       cfg.sqlLivenessProvider,
 		JobRegistry:             jobRegistry,
 		VirtualSchemas:          virtualSchemas,
 		HistogramWindowInterval: cfg.HistogramWindowInterval(),
@@ -470,6 +494,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 
 		QueryCache:                 querycache.New(cfg.QueryCacheSize),
 		ProtectedTimestampProvider: cfg.protectedtsProvider,
+		ExternalIODirConfig:        cfg.ExternalIODirConfig,
 	}
 
 	cfg.stopper.AddCloser(execCfg.ExecLogger)
@@ -582,7 +607,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		internalExecutor:        cfg.circularInternalExecutor,
 		leaseMgr:                leaseMgr,
 		blobService:             blobService,
-		tenantProxy:             cfg.tenantProxy,
+		tenantConnect:           cfg.tenantConnect,
 		sessionRegistry:         cfg.sessionRegistry,
 		jobRegistry:             jobRegistry,
 		statsRefresher:          statsRefresher,
@@ -591,6 +616,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		adminMemMetrics:         adminMemMetrics,
 		sqlMemMetrics:           sqlMemMetrics,
 		stmtDiagnosticsRegistry: stmtDiagnosticsRegistry,
+		sqlLivenessProvider:     cfg.sqlLivenessProvider,
 	}, nil
 }
 
@@ -605,12 +631,12 @@ func (s *sqlServer) start(
 ) error {
 	// If necessary, start the tenant proxy first, to ensure all other
 	// components can properly route to KV nodes.
-	if s.tenantProxy != nil {
-		if err := s.tenantProxy.Start(ctx); err != nil {
+	if s.tenantConnect != nil {
+		if err := s.tenantConnect.Start(ctx); err != nil {
 			return err
 		}
 	}
-
+	s.sqlLivenessProvider.Start(ctx)
 	s.temporaryObjectCleaner.Start(ctx, stopper)
 	s.distSQLServer.Start()
 	s.pgServer.Start(ctx, stopper)
@@ -664,11 +690,31 @@ func (s *sqlServer) start(
 	}
 
 	var bootstrapVersion roachpb.Version
-	if err := s.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		return txn.GetProto(ctx, keys.BootstrapVersionKey, &bootstrapVersion)
-	}); err != nil {
-		return err
+	if s.execCfg.Codec.ForSystemTenant() {
+		if err := s.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			return txn.GetProto(ctx, keys.BootstrapVersionKey, &bootstrapVersion)
+		}); err != nil {
+			return err
+		}
+	} else {
+		// We don't currently track the bootstrap version of each secondary tenant.
+		// For this to be meaningful, we'd need to record the binary version of the
+		// SQL gateway that processed the crdb_internal.create_tenant function which
+		// created the tenant, as this is what dictates the MetadataSchema that was
+		// in effect when the secondary tenant was constructed. This binary version
+		// very well may differ from the cluster-wide bootstrap version at which the
+		// system tenant was bootstrapped.
+		//
+		// Since we don't record this version anywhere, we do the next-best thing
+		// and pass a lower-bound on the bootstrap version. We know that no tenants
+		// could have been created before the start of the v20.2 dev cycle, so we
+		// pass VersionStart20_2. bootstrapVersion is only used to avoid performing
+		// superfluous but necessarily idempotent SQL migrations, so at worst, we're
+		// doing more work than strictly necessary during the first time that the
+		// migrations are run.
+		bootstrapVersion = clusterversion.VersionByKey(clusterversion.VersionStart20_2)
 	}
+
 	// Run startup migrations (note: these depend on jobs subsystem running).
 	if err := migMgr.EnsureMigrations(ctx, bootstrapVersion); err != nil {
 		return errors.Wrap(err, "ensuring SQL migrations")

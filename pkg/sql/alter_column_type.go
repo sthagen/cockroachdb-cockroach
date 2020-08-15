@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -54,7 +55,7 @@ var alterColTypeInCombinationNotSupportedErr = unimplemented.NewWithIssuef(
 func AlterColumnType(
 	ctx context.Context,
 	tableDesc *sqlbase.MutableTableDescriptor,
-	col *sqlbase.ColumnDescriptor,
+	col *descpb.ColumnDescriptor,
 	t *tree.AlterTableAlterColumnType,
 	params runParams,
 	cmds tree.AlterTableCmds,
@@ -135,7 +136,7 @@ func AlterColumnType(
 func alterColumnTypeGeneral(
 	ctx context.Context,
 	tableDesc *sqlbase.MutableTableDescriptor,
-	col *sqlbase.ColumnDescriptor,
+	col *descpb.ColumnDescriptor,
 	toType *types.T,
 	using tree.Expr,
 	params runParams,
@@ -172,7 +173,7 @@ func alterColumnTypeGeneral(
 
 	// Disallow ALTER COLUMN TYPE general for columns that have a constraint.
 	for i := range tableDesc.Checks {
-		uses, err := tableDesc.Checks[i].UsesColumn(tableDesc.TableDesc(), col.ID)
+		uses, err := tableDesc.CheckConstraintUsesColumn(tableDesc.Checks[i], col.ID)
 		if err != nil {
 			return err
 		}
@@ -238,7 +239,7 @@ func alterColumnTypeGeneral(
 	var inverseExpr string
 	if using != nil {
 		// Validate the provided using expr and ensure it has the correct type.
-		typedExpr, _, err := schemaexpr.DequalifyAndValidateExpr(
+		expr, _, err := schemaexpr.DequalifyAndValidateExpr(
 			ctx,
 			tableDesc,
 			using,
@@ -252,8 +253,7 @@ func alterColumnTypeGeneral(
 		if err != nil {
 			return err
 		}
-		s := tree.Serialize(typedExpr)
-		newColComputeExpr = &s
+		newColComputeExpr = &expr
 
 		insertedValToString := tree.CastExpr{
 			Expr:       &tree.ColumnItem{ColumnName: tree.Name(col.Name)},
@@ -327,7 +327,7 @@ func alterColumnTypeGeneral(
 		}
 	}
 
-	newCol := sqlbase.ColumnDescriptor{
+	newCol := descpb.ColumnDescriptor{
 		Name:            shadowColName,
 		Type:            toType,
 		Nullable:        col.Nullable,
@@ -349,13 +349,13 @@ func alterColumnTypeGeneral(
 		return err
 	}
 
-	tableDesc.AddColumnMutation(&newCol, sqlbase.DescriptorMutation_ADD)
+	tableDesc.AddColumnMutation(&newCol, descpb.DescriptorMutation_ADD)
 
 	if err := tableDesc.AllocateIDs(); err != nil {
 		return err
 	}
 
-	swapArgs := &sqlbase.ComputedColumnSwap{
+	swapArgs := &descpb.ComputedColumnSwap{
 		OldColumnId: col.ID,
 		NewColumnId: newCol.ID,
 		InverseExpr: inverseExpr,

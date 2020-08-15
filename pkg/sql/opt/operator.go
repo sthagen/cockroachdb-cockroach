@@ -14,6 +14,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -205,6 +206,7 @@ var AggregateOpReverseMap = map[Operator]string{
 	PercentileContOp:  "percentile_cont_impl",
 	VarPopOp:          "var_pop",
 	StdDevPopOp:       "stddev_pop",
+	STMakeLineOp:      "st_makeline",
 }
 
 // WindowOpReverseMap maps from an optimizer operator type to the name of a
@@ -249,6 +251,21 @@ var NegateOpMap = map[Operator]Operator{
 	IsNotOp:        IsOp,
 }
 
+// ScalarOperatorTransmitsNulls returns true if the given scalar operator always
+// returns NULL when at least one of its inputs is NULL.
+func ScalarOperatorTransmitsNulls(op Operator) bool {
+	switch op {
+	case BitandOp, BitorOp, BitxorOp, PlusOp, MinusOp, MultOp, DivOp, FloorDivOp,
+		ModOp, PowOp, EqOp, NeOp, LtOp, GtOp, LeOp, GeOp, LikeOp, NotLikeOp, ILikeOp,
+		NotILikeOp, SimilarToOp, NotSimilarToOp, RegMatchOp, NotRegMatchOp, RegIMatchOp,
+		NotRegIMatchOp, ConstOp:
+		return true
+
+	default:
+		return false
+	}
+}
+
 // BoolOperatorRequiresNotNullArgs returns true if the operator can never
 // evaluate to true if one of its children is NULL.
 func BoolOperatorRequiresNotNullArgs(op Operator) bool {
@@ -284,7 +301,7 @@ func AggregateIgnoresNulls(op Operator) bool {
 	case AnyNotNullAggOp, AvgOp, BitAndAggOp, BitOrAggOp, BoolAndOp, BoolOrOp,
 		ConstNotNullAggOp, CorrOp, CountOp, MaxOp, MinOp, SqrDiffOp, StdDevOp,
 		StringAggOp, SumOp, SumIntOp, VarianceOp, XorAggOp, PercentileDiscOp,
-		PercentileContOp, StdDevPopOp, VarPopOp:
+		PercentileContOp, STMakeLineOp, StdDevPopOp, VarPopOp:
 		return true
 
 	case ArrayAggOp, ConcatAggOp, ConstAggOp, CountRowsOp, FirstAggOp, JsonAggOp,
@@ -305,7 +322,7 @@ func AggregateIsNullOnEmpty(op Operator) bool {
 	case AnyNotNullAggOp, ArrayAggOp, AvgOp, BitAndAggOp,
 		BitOrAggOp, BoolAndOp, BoolOrOp, ConcatAggOp, ConstAggOp,
 		ConstNotNullAggOp, CorrOp, FirstAggOp, JsonAggOp, JsonbAggOp,
-		MaxOp, MinOp, SqrDiffOp, StdDevOp, StringAggOp, SumOp, SumIntOp,
+		MaxOp, MinOp, SqrDiffOp, StdDevOp, STMakeLineOp, StringAggOp, SumOp, SumIntOp,
 		VarianceOp, XorAggOp, PercentileDiscOp, PercentileContOp,
 		JsonObjectAggOp, JsonbObjectAggOp, StdDevPopOp, VarPopOp:
 		return true
@@ -331,7 +348,7 @@ func AggregateIsNeverNullOnNonNullInput(op Operator) bool {
 	case AnyNotNullAggOp, ArrayAggOp, AvgOp, BitAndAggOp,
 		BitOrAggOp, BoolAndOp, BoolOrOp, ConcatAggOp, ConstAggOp,
 		ConstNotNullAggOp, CountOp, CountRowsOp, FirstAggOp,
-		JsonAggOp, JsonbAggOp, MaxOp, MinOp, SqrDiffOp,
+		JsonAggOp, JsonbAggOp, MaxOp, MinOp, SqrDiffOp, STMakeLineOp,
 		StringAggOp, SumOp, SumIntOp, XorAggOp, PercentileDiscOp, PercentileContOp,
 		JsonObjectAggOp, JsonbObjectAggOp, StdDevPopOp, VarPopOp:
 		return true
@@ -374,7 +391,7 @@ func AggregatesCanMerge(inner, outer Operator) bool {
 
 	case AnyNotNullAggOp, BitAndAggOp, BitOrAggOp, BoolAndOp,
 		BoolOrOp, ConstAggOp, ConstNotNullAggOp, FirstAggOp,
-		MaxOp, MinOp, SumOp, SumIntOp, XorAggOp:
+		MaxOp, MinOp, STMakeLineOp, SumOp, SumIntOp, XorAggOp:
 		return inner == outer
 
 	case CountOp, CountRowsOp:
@@ -402,8 +419,8 @@ func AggregateIgnoresDuplicates(op Operator) bool {
 
 	case ArrayAggOp, AvgOp, ConcatAggOp, CountOp, CorrOp, CountRowsOp, SumIntOp,
 		SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, JsonAggOp, JsonbAggOp,
-		StringAggOp, PercentileDiscOp, PercentileContOp, StdDevPopOp, VarPopOp,
-		JsonObjectAggOp, JsonbObjectAggOp:
+		StringAggOp, PercentileDiscOp, PercentileContOp, StdDevPopOp, STMakeLineOp,
+		VarPopOp, JsonObjectAggOp, JsonbObjectAggOp:
 		return false
 
 	default:
@@ -419,6 +436,9 @@ type OpaqueMetadata interface {
 	// String is a short description used when printing optimizer trees and when
 	// forming error messages; it should be the SQL statement tag.
 	String() string
+
+	// Columns returns the columns that are produced by this operator.
+	Columns() sqlbase.ResultColumns
 }
 
 func init() {

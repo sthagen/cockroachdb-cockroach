@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -29,10 +30,10 @@ import (
 	"github.com/cockroachdb/logtags"
 )
 
-// writeTypeChange should be called on a mutated type descriptor to ensure that
+// writeTypeSchemaChange should be called on a mutated type descriptor to ensure that
 // the descriptor gets written to a batch, as well as ensuring that a job is
 // created to perform the schema change on the type.
-func (p *planner) writeTypeChange(
+func (p *planner) writeTypeSchemaChange(
 	ctx context.Context, typeDesc *sqlbase.MutableTypeDescriptor, jobDesc string,
 ) error {
 	// Check if there is an active job for this type, otherwise create one.
@@ -52,7 +53,7 @@ func (p *planner) writeTypeChange(
 		jobRecord := jobs.Record{
 			Description:   jobDesc,
 			Username:      p.User(),
-			DescriptorIDs: sqlbase.IDs{typeDesc.ID},
+			DescriptorIDs: descpb.IDs{typeDesc.ID},
 			Details: jobspb.TypeSchemaChangeDetails{
 				TypeID: typeDesc.ID,
 			},
@@ -68,6 +69,12 @@ func (p *planner) writeTypeChange(
 		log.Infof(ctx, "queued new type change job %d for type %d", *newJob.ID(), typeDesc.ID)
 	}
 
+	return p.writeTypeDesc(ctx, typeDesc)
+}
+
+func (p *planner) writeTypeDesc(
+	ctx context.Context, typeDesc *sqlbase.MutableTypeDescriptor,
+) error {
 	// Maybe increment the type's version.
 	typeDesc.MaybeIncrementVersion()
 
@@ -94,7 +101,7 @@ func (p *planner) writeTypeChange(
 
 // typeSchemaChanger is the struct that actually runs the type schema change.
 type typeSchemaChanger struct {
-	typeID  sqlbase.ID
+	typeID  descpb.ID
 	execCfg *ExecutorConfig
 }
 
@@ -102,6 +109,9 @@ type typeSchemaChanger struct {
 type TypeSchemaChangerTestingKnobs struct {
 	// RunBeforeExec runs at the start of the typeSchemaChanger.
 	RunBeforeExec func() error
+	// RunBeforeEnumMemberPromotion runs before enum members are promoted from
+	// readable to all permissions in the typeSchemaChanger.
+	RunBeforeEnumMemberPromotion func()
 }
 
 // ModuleTestingKnobs implements the ModuleTestingKnobs interface.
@@ -112,11 +122,12 @@ func (t *typeSchemaChanger) getTypeDescFromStore(
 ) (*sqlbase.ImmutableTypeDescriptor, error) {
 	var typeDesc *sqlbase.ImmutableTypeDescriptor
 	if err := t.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		var err error
-		typeDesc, err = sqlbase.GetTypeDescFromID(ctx, txn, t.execCfg.Codec, t.typeID)
+		desc, err := catalogkv.GetDescriptorByID(ctx, txn, t.execCfg.Codec, t.typeID,
+			catalogkv.Immutable, catalogkv.TypeDescriptorKind, true /* required */)
 		if err != nil {
 			return err
 		}
+		typeDesc = desc.(*sqlbase.ImmutableTypeDescriptor)
 		return nil
 	}); err != nil {
 		return nil, err
@@ -144,7 +155,7 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 	if len(typeDesc.DrainingNames) > 0 {
 		if err := drainNamesForDescriptor(
 			ctx,
-			t.typeID,
+			typeDesc,
 			leaseMgr,
 			codec,
 			nil, /* beforeDrainNames */
@@ -154,24 +165,27 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 	}
 
 	// If there are any read only enum members, promote them to writeable.
-	if typeDesc.Kind == sqlbase.TypeDescriptor_ENUM {
+	if typeDesc.Kind == descpb.TypeDescriptor_ENUM {
 		hasNonPublic := false
 		for _, member := range typeDesc.EnumMembers {
-			if member.Capability == sqlbase.TypeDescriptor_EnumMember_READ_ONLY {
+			if member.Capability == descpb.TypeDescriptor_EnumMember_READ_ONLY {
 				hasNonPublic = true
 				break
 			}
 		}
 		if hasNonPublic {
+			if fn := t.execCfg.TypeSchemaChangerTestingKnobs.RunBeforeEnumMemberPromotion; fn != nil {
+				fn()
+			}
 			// The version of the array type needs to get bumped as well so that
 			// changes to the underlying type are picked up.
-			update := func(_ *kv.Txn, descs map[sqlbase.ID]catalog.MutableDescriptor) error {
+			update := func(_ *kv.Txn, descs map[descpb.ID]catalog.MutableDescriptor) error {
 				typeDesc := descs[typeDesc.ID].(*sqlbase.MutableTypeDescriptor)
 				didModify := false
 				for i := range typeDesc.EnumMembers {
 					member := &typeDesc.EnumMembers[i]
-					if member.Capability == sqlbase.TypeDescriptor_EnumMember_READ_ONLY {
-						member.Capability = sqlbase.TypeDescriptor_EnumMember_ALL
+					if member.Capability == descpb.TypeDescriptor_EnumMember_READ_ONLY {
+						member.Capability = descpb.TypeDescriptor_EnumMember_ALL
 						didModify = true
 					}
 				}
@@ -182,7 +196,7 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 			}
 			if _, err := leaseMgr.PublishMultiple(
 				ctx,
-				[]sqlbase.ID{typeDesc.ID, typeDesc.ArrayTypeID},
+				[]descpb.ID{typeDesc.ID, typeDesc.ArrayTypeID},
 				update,
 				func(*kv.Txn) error { return nil },
 			); err != nil {
@@ -213,6 +227,39 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 	return nil
 }
 
+// execWithRetry is a wrapper around exec that retries the type schema change
+// on retryable errors.
+func (t *typeSchemaChanger) execWithRetry(ctx context.Context) error {
+	// Set up the type changer to be retried.
+	opts := retry.Options{
+		InitialBackoff: 100 * time.Millisecond,
+		MaxBackoff:     20 * time.Second,
+		Multiplier:     1.5,
+	}
+	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
+		tcErr := t.exec(ctx)
+		switch {
+		case tcErr == nil:
+			return nil
+		case errors.Is(tcErr, sqlbase.ErrDescriptorNotFound):
+			// If the descriptor for the ID can't be found, we assume that another
+			// job executed already and dropped the type.
+			log.Infof(
+				ctx,
+				"descriptor %d not found for type change job; assuming it was dropped, and exiting",
+				t.typeID,
+			)
+			return nil
+		case !isPermanentSchemaChangeError(tcErr):
+			// If this isn't a permanent error, then retry.
+			log.Infof(ctx, "retrying type schema change due to retriable error %v", tcErr)
+		default:
+			return tcErr
+		}
+	}
+	return nil
+}
+
 func (t *typeSchemaChanger) logTags() *logtags.Buffer {
 	buf := &logtags.Buffer{}
 	buf.Add("typeChangeExec", nil)
@@ -233,34 +280,7 @@ func (t *typeChangeResumer) Resume(
 		typeID:  t.job.Details().(jobspb.TypeSchemaChangeDetails).TypeID,
 		execCfg: phs.(*planner).execCfg,
 	}
-	// Set up the type changer to be retried.
-	opts := retry.Options{
-		InitialBackoff: 100 * time.Millisecond,
-		MaxBackoff:     20 * time.Second,
-		Multiplier:     1.5,
-	}
-	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
-		tcErr := tc.exec(ctx)
-		switch {
-		case tcErr == nil:
-			return nil
-		case errors.Is(tcErr, sqlbase.ErrDescriptorNotFound):
-			// If the descriptor for the ID can't be found, we assume that another
-			// job executed already and dropped the type.
-			log.Infof(
-				ctx,
-				"descriptor %d not found for type change job; assuming it was dropped, and exiting",
-				tc.typeID,
-			)
-			return nil
-		case !isPermanentSchemaChangeError(tcErr):
-			// If this isn't a permanent error, then retry.
-			log.Infof(ctx, "retrying type schema change due to retriable error %v", tcErr)
-		default:
-			return tcErr
-		}
-	}
-	return nil
+	return tc.execWithRetry(ctx)
 }
 
 // OnFailOrCancel implements the jobs.Resumer interface.
@@ -277,7 +297,7 @@ func (t *typeChangeResumer) OnFailOrCancel(ctx context.Context, phs interface{})
 	if len(typeDesc.DrainingNames) > 0 {
 		if err := drainNamesForDescriptor(
 			ctx,
-			tc.typeID,
+			typeDesc,
 			tc.execCfg.LeaseManager,
 			tc.execCfg.Codec,
 			nil, /* beforeDrainNames */

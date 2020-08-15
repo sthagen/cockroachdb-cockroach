@@ -215,6 +215,15 @@ func TestTypes(t *testing.T) {
 			},
 			MakeGeometry(geopb.ShapeType_MultiPoint, 4325),
 		},
+		// BOX2D
+		{
+			Box2D,
+			&T{InternalType: InternalType{Family: Box2DFamily, Oid: oidext.T_box2d, Locale: &emptyLocale}},
+		},
+		{
+			Box2D,
+			MakeScalar(Box2DFamily, oidext.T_box2d, 0, 0, emptyLocale),
+		},
 
 		// INET
 		{INet, &T{InternalType: InternalType{
@@ -501,10 +510,9 @@ func TestTypes(t *testing.T) {
 		{MakeEnum(15210, 15213), &T{InternalType: InternalType{
 			Family: EnumFamily,
 			Locale: &emptyLocale,
-			Oid:    StableTypeIDToOID(15210),
+			Oid:    15210,
 			UDTMetadata: &PersistentUserDefinedTypeMetadata{
-				StableTypeID:      15210,
-				StableArrayTypeID: 15213,
+				ArrayTypeOID: 15213,
 			},
 		}}},
 	}

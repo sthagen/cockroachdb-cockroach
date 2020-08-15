@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
@@ -660,6 +661,11 @@ func (h *hasher) HashMaterializeClause(val tree.MaterializeClause) {
 	h.HashBool(val.Materialize)
 }
 
+func (h *hasher) HashPersistence(val tree.Persistence) {
+	h.hash ^= internHash(val)
+	h.hash *= prime64
+}
+
 // ----------------------------------------------------------------------
 //
 // Equality functions
@@ -1052,6 +1058,10 @@ func (h *hasher) IsMaterializeClauseEqual(l, r tree.MaterializeClause) bool {
 	return l.Set == r.Set && l.Materialize == r.Materialize
 }
 
+func (h *hasher) IsPersistenceEqual(l, r tree.Persistence) bool {
+	return l == r
+}
+
 // encodeDatum turns the given datum into an encoded string of bytes. If two
 // datums are equivalent, then their encoded bytes will be identical.
 // Conversely, if two datums are not equivalent, then their encoded bytes will
@@ -1071,7 +1081,7 @@ func encodeDatum(b []byte, val tree.Datum) []byte {
 		}
 	}
 
-	b, err = sqlbase.EncodeTableValue(b, sqlbase.ColumnID(encoding.NoColumnID), val, nil /* scratch */)
+	b, err = sqlbase.EncodeTableValue(b, descpb.ColumnID(encoding.NoColumnID), val, nil /* scratch */)
 	if err != nil {
 		panic(err)
 	}

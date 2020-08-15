@@ -164,14 +164,28 @@ type MVCCKeyValue struct {
 	Value []byte
 }
 
-// isSysLocal returns whether the whether the key is system-local.
+// isSysLocal returns whether the key is system-local.
 func isSysLocal(key roachpb.Key) bool {
 	return key.Compare(keys.LocalMax) < 0
 }
 
-// updateStatsForInline updates stat counters for an inline value.
-// These are simpler as they don't involve intents or multiple
-// versions.
+// isAbortSpanKey returns whether the key is an abort span key.
+func isAbortSpanKey(key roachpb.Key) bool {
+	if !bytes.HasPrefix(key, keys.LocalRangeIDPrefix) {
+		return false
+	}
+
+	_ /* rangeID */, infix, suffix, _ /* detail */, err := keys.DecodeRangeIDKey(key)
+	if err != nil {
+		return false
+	}
+	hasAbortSpanSuffix := infix.Equal(keys.LocalRangeIDReplicatedInfix) && suffix.Equal(keys.LocalAbortSpanSuffix)
+	return hasAbortSpanSuffix
+}
+
+// updateStatsForInline updates stat counters for an inline value
+// (abort span entries for example). These are simpler as they don't
+// involve intents or multiple versions.
 func updateStatsForInline(
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
@@ -183,6 +197,12 @@ func updateStatsForInline(
 		if sys {
 			ms.SysBytes -= (origMetaKeySize + origMetaValSize)
 			ms.SysCount--
+			// We only do this check in updateStatsForInline since
+			// abort span keys are always inlined - we don't associate
+			// timestamps with them.
+			if isAbortSpanKey(key) {
+				ms.AbortSpanBytes -= (origMetaKeySize + origMetaValSize)
+			}
 		} else {
 			ms.LiveBytes -= (origMetaKeySize + origMetaValSize)
 			ms.LiveCount--
@@ -197,6 +217,9 @@ func updateStatsForInline(
 		if sys {
 			ms.SysBytes += metaKeySize + metaValSize
 			ms.SysCount++
+			if isAbortSpanKey(key) {
+				ms.AbortSpanBytes += metaKeySize + metaValSize
+			}
 		} else {
 			ms.LiveBytes += metaKeySize + metaValSize
 			ms.LiveCount++
@@ -1322,6 +1345,7 @@ func replayTransactionalWrite(
 ) error {
 	var found bool
 	var writtenValue []byte
+	var writtenValueSafety valueSafety
 	var err error
 	metaKey := MakeMVCCMetadataKey(key)
 	if txn.Sequence == meta.Txn.Sequence {
@@ -1332,7 +1356,7 @@ func replayTransactionalWrite(
 		defer getBuf.release()
 		getBuf.meta = buf.meta
 		var exVal *roachpb.Value
-		if exVal, _, _, err = mvccGetInternal(
+		if exVal, _, writtenValueSafety, err = mvccGetInternal(
 			ctx, iter, metaKey, timestamp, true /* consistent */, unsafeValue, txn, getBuf); err != nil {
 			return err
 		}
@@ -1341,6 +1365,7 @@ func replayTransactionalWrite(
 	} else {
 		// Get the value from the intent history.
 		writtenValue, found = meta.GetIntentValue(txn.Sequence)
+		writtenValueSafety = safeValue
 	}
 	if !found {
 		return errors.Errorf("transaction %s with sequence %d missing an intent with lower sequence %d",
@@ -1360,8 +1385,14 @@ func replayTransactionalWrite(
 			prevVal := prevIntent.Value
 
 			exVal = &roachpb.Value{RawBytes: prevVal}
-		}
-		if exVal == nil {
+		} else {
+			// We're going to be using the iterator again, so make sure the
+			// existing writtenValue bytes are safe and won't be corrupted.
+			if writtenValueSafety == unsafeValue {
+				writtenValue = append([]byte(nil), writtenValue...)
+				writtenValueSafety = safeValue
+			}
+
 			// If the previous value at the key wasn't written by this
 			// transaction, or it was hidden by a rolled back seqnum, we
 			// look at last committed value on the key.
@@ -3577,6 +3608,9 @@ func ComputeStatsGo(
 			if isSys {
 				ms.SysBytes += totalBytes
 				ms.SysCount++
+				if isAbortSpanKey(unsafeKey.Key) {
+					ms.AbortSpanBytes += totalBytes
+				}
 			} else {
 				if !meta.Deleted {
 					ms.LiveBytes += totalBytes

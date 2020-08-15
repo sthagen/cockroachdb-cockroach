@@ -18,6 +18,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
@@ -41,21 +43,14 @@ func validateCheckExpr(
 	ie *InternalExecutor,
 	txn *kv.Txn,
 ) error {
-	expr, err := schemaexpr.DeserializeTableDescExpr(ctx, semaCtx, tableDesc, exprStr)
+	expr, err := schemaexpr.FormatExprForDisplay(ctx, tableDesc, exprStr, semaCtx)
 	if err != nil {
 		return err
 	}
-	// Construct AST and then convert to a string, to avoid problems with escaping the check expression
-	tblref := tree.TableRef{TableID: int64(tableDesc.GetID()), As: tree.AliasClause{Alias: "t"}}
-	sel := &tree.SelectClause{
-		Exprs: sqlbase.ColumnsSelectors(tableDesc.Columns),
-		From:  tree.From{Tables: []tree.TableExpr{&tblref}},
-		Where: &tree.Where{Type: tree.AstWhere, Expr: &tree.NotExpr{Expr: expr}},
-	}
-	lim := &tree.Limit{Count: tree.NewDInt(1)}
-	stmt := &tree.Select{Select: sel, Limit: lim}
-	queryStr := tree.AsStringWithFlags(stmt, tree.FmtSerializable)
-	log.Infof(ctx, "Validating check constraint %q with query %q", tree.SerializeForDisplay(expr), queryStr)
+	colSelectors := sqlbase.ColumnsSelectors(tableDesc.Columns)
+	columns := tree.AsStringWithFlags(&colSelectors, tree.FmtSerializable)
+	queryStr := fmt.Sprintf(`SELECT %s FROM [%d AS t] WHERE NOT (%s) LIMIT 1`, columns, tableDesc.GetID(), exprStr)
+	log.Infof(ctx, "Validating check constraint %q with query %q", expr, queryStr)
 
 	rows, err := ie.QueryRow(ctx, "validate check constraint", txn, queryStr)
 	if err != nil {
@@ -64,7 +59,7 @@ func validateCheckExpr(
 	if rows.Len() > 0 {
 		return pgerror.Newf(pgcode.CheckViolation,
 			"validation of CHECK %q failed on row: %s",
-			tree.SerializeForDisplay(expr), labeledRowValues(tableDesc.Columns, rows))
+			expr, labeledRowValues(tableDesc.Columns, rows))
 	}
 	return nil
 }
@@ -82,7 +77,7 @@ func validateCheckExpr(
 //   (a_id IS NULL OR b_id IS NULL) AND (a_id IS NOT NULL OR b_id IS NOT NULL)
 // LIMIT 1;
 func matchFullUnacceptableKeyQuery(
-	srcTbl *sqlbase.TableDescriptor, fk *sqlbase.ForeignKeyConstraint, limitResults bool,
+	srcTbl sqlbase.TableDescriptor, fk *descpb.ForeignKeyConstraint, limitResults bool,
 ) (sql string, colNames []string, _ error) {
 	nCols := len(fk.OriginColumnIDs)
 	srcCols := make([]string, nCols)
@@ -100,7 +95,7 @@ func matchFullUnacceptableKeyQuery(
 		srcNotNullExistsClause[i] = fmt.Sprintf("%s IS NOT NULL", srcCols[i])
 	}
 
-	for _, id := range srcTbl.PrimaryIndex.ColumnIDs {
+	for _, id := range srcTbl.GetPrimaryIndex().ColumnIDs {
 		alreadyPresent := false
 		for _, otherID := range fk.OriginColumnIDs {
 			if id == otherID {
@@ -124,7 +119,7 @@ func matchFullUnacceptableKeyQuery(
 	return fmt.Sprintf(
 		`SELECT %[1]s FROM [%[2]d AS tbl] WHERE (%[3]s) AND (%[4]s) %[5]s`,
 		strings.Join(returnedCols, ","),              // 1
-		srcTbl.ID,                                    // 2
+		srcTbl.GetID(),                               // 2
 		strings.Join(srcNullExistsClause, " OR "),    // 3
 		strings.Join(srcNotNullExistsClause, " OR "), // 4
 		limit, // 5
@@ -153,9 +148,9 @@ func matchFullUnacceptableKeyQuery(
 // TODO(radu): change this to a query which executes as an anti-join when we
 // remove the heuristic planner.
 func nonMatchingRowQuery(
-	srcTbl *sqlbase.TableDescriptor,
-	fk *sqlbase.ForeignKeyConstraint,
-	targetTbl *sqlbase.TableDescriptor,
+	srcTbl sqlbase.TableDescriptor,
+	fk *descpb.ForeignKeyConstraint,
+	targetTbl sqlbase.TableDescriptor,
 	limitResults bool,
 ) (sql string, originColNames []string, _ error) {
 	originColNames, err := srcTbl.NamesForColumnIDs(fk.OriginColumnIDs)
@@ -163,7 +158,7 @@ func nonMatchingRowQuery(
 		return "", nil, err
 	}
 	// Get primary key columns not included in the FK
-	for _, pkColID := range srcTbl.PrimaryIndex.ColumnIDs {
+	for _, pkColID := range srcTbl.GetPrimaryIndex().ColumnIDs {
 		found := false
 		for _, id := range fk.OriginColumnIDs {
 			if pkColID == id {
@@ -216,9 +211,9 @@ func nonMatchingRowQuery(
 		 WHERE %[7]s IS NULL %[8]s`,
 		strings.Join(qualifiedSrcCols, ", "), // 1
 		strings.Join(srcCols, ", "),          // 2
-		srcTbl.ID,                            // 3
+		srcTbl.GetID(),                       // 3
 		strings.Join(srcWhere, " AND "),      // 4
-		targetTbl.ID,                         // 5
+		targetTbl.GetID(),                    // 5
 		strings.Join(on, " AND "),            // 6
 		// Sufficient to check the first column to see whether there was no matching row
 		targetCols[0], // 7
@@ -233,17 +228,18 @@ func nonMatchingRowQuery(
 // reuse an existing client.Txn safely.
 func validateForeignKey(
 	ctx context.Context,
-	srcTable *sqlbase.TableDescriptor,
-	fk *sqlbase.ForeignKeyConstraint,
+	srcTable *sqlbase.MutableTableDescriptor,
+	fk *descpb.ForeignKeyConstraint,
 	ie *InternalExecutor,
 	txn *kv.Txn,
 	codec keys.SQLCodec,
 ) error {
-	targetTable, err := sqlbase.GetTableDescFromID(ctx, txn, codec, fk.ReferencedTableID)
+	desc, err := catalogkv.GetDescriptorByID(ctx, txn, codec, fk.ReferencedTableID, catalogkv.Immutable,
+		catalogkv.TableDescriptorKind, true /* required */)
 	if err != nil {
 		return err
 	}
-
+	targetTable := desc.(sqlbase.TableDescriptor)
 	nCols := len(fk.OriginColumnIDs)
 
 	referencedColumnNames, err := targetTable.NamesForColumnIDs(fk.ReferencedColumnIDs)
@@ -254,7 +250,7 @@ func validateForeignKey(
 	// For MATCH FULL FKs, first check whether any disallowed keys containing both
 	// null and non-null values exist.
 	// (The matching options only matter for FKs with more than one column.)
-	if nCols > 1 && fk.Match == sqlbase.ForeignKeyReference_FULL {
+	if nCols > 1 && fk.Match == descpb.ForeignKeyReference_FULL {
 		query, colNames, err := matchFullUnacceptableKeyQuery(
 			srcTable, fk, true, /* limitResults */
 		)
@@ -265,7 +261,7 @@ func validateForeignKey(
 		log.Infof(ctx, "Validating MATCH FULL FK %q (%q [%v] -> %q [%v]) with query %q",
 			fk.Name,
 			srcTable.Name, colNames,
-			targetTable.Name, referencedColumnNames,
+			targetTable.GetName(), referencedColumnNames,
 			query,
 		)
 
@@ -290,7 +286,7 @@ func validateForeignKey(
 
 	log.Infof(ctx, "Validating FK %q (%q [%v] -> %q [%v]) with query %q",
 		fk.Name,
-		srcTable.Name, colNames, targetTable.Name, referencedColumnNames,
+		srcTable.Name, colNames, targetTable.GetName(), referencedColumnNames,
 		query,
 	)
 
@@ -301,7 +297,7 @@ func validateForeignKey(
 	if values.Len() > 0 {
 		return pgerror.Newf(pgcode.ForeignKeyViolation,
 			"foreign key violation: %q row %s has no match in %q",
-			srcTable.Name, formatValues(colNames, values), targetTable.Name)
+			srcTable.Name, formatValues(colNames, values), targetTable.GetName())
 	}
 	return nil
 }
@@ -360,14 +356,14 @@ func checkMutationInput(
 		} else if !res && checkVals[colIdx] != tree.DNull {
 			// Failed to satisfy CHECK constraint, so unwrap the serialized
 			// check expression to display to the user.
-			expr, exprErr := schemaexpr.DeserializeTableDescExpr(ctx, semaCtx, tabDesc, checks[i].Expr)
-			if exprErr != nil {
+			expr, err := schemaexpr.FormatExprForDisplay(ctx, tabDesc, checks[i].Expr, semaCtx)
+			if err != nil {
 				// If we ran into an error trying to read the check constraint, wrap it
 				// and return.
-				return errors.Wrapf(exprErr, "failed to satisfy CHECK constraint (%s)", checks[i].Expr)
+				return errors.Wrapf(err, "failed to satisfy CHECK constraint (%s)", checks[i].Expr)
 			}
 			return pgerror.Newf(
-				pgcode.CheckViolation, "failed to satisfy CHECK constraint (%s)", tree.SerializeForDisplay(expr),
+				pgcode.CheckViolation, "failed to satisfy CHECK constraint (%s)", expr,
 			)
 		}
 		colIdx++

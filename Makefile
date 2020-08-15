@@ -121,7 +121,7 @@ TESTCONFIG :=
 SUBTESTS :=
 
 ## Test timeout to use for the linter.
-LINTTIMEOUT := 20m
+LINTTIMEOUT := 30m
 
 ## Test timeout to use for regular tests.
 TESTTIMEOUT := 30m
@@ -319,9 +319,7 @@ endif
 # Force vendor directory to rebuild.
 .PHONY: vendor_rebuild
 vendor_rebuild: bin/.submodules-initialized
-	# Use -mod=mod, as -mod=vendor will try install from the vendor directory
-	# which may be mismatching upon rebuild.
-	$(GO_INSTALL) -v -mod=mod github.com/goware/modvendor
+	$(GO_INSTALL) -v github.com/goware/modvendor
 	./build/vendor_rebuild.sh
 
 # Tell Make to delete the target if its recipe fails. Otherwise, if a recipe
@@ -383,6 +381,7 @@ bin/.bootstrap: $(GITHOOKS) | bin/.submodules-initialized
 		github.com/mattn/goveralls \
 		github.com/mibk/dupl \
 		github.com/mmatczuk/go_generics/cmd/go_generics \
+		github.com/pseudomuto/protoc-gen-doc/cmd/protoc-gen-doc \
 		github.com/wadey/gocovmerge \
 		golang.org/x/lint/golint \
 		golang.org/x/perf/cmd/benchstat \
@@ -850,13 +849,16 @@ SQLPARSER_TARGETS = \
 
 PROTOBUF_TARGETS := bin/.go_protobuf_sources bin/.gw_protobuf_sources bin/.cpp_protobuf_sources bin/.cpp_ccl_protobuf_sources
 
-DOCGEN_TARGETS := bin/.docgen_bnfs bin/.docgen_functions docs/generated/redact_safe.md
+DOCGEN_TARGETS := bin/.docgen_bnfs bin/.docgen_functions docs/generated/redact_safe.md bin/.docgen_http
 
 EXECGEN_TARGETS = \
   pkg/col/coldata/vec.eg.go \
   pkg/sql/colexec/and_or_projection.eg.go \
   pkg/sql/colexec/cast.eg.go \
   pkg/sql/colexec/const.eg.go \
+  pkg/sql/colexec/default_cmp_expr.eg.go \
+  pkg/sql/colexec/default_cmp_proj_ops.eg.go \
+  pkg/sql/colexec/default_cmp_sel_ops.eg.go \
   pkg/sql/colexec/distinct.eg.go \
   pkg/sql/colexec/hashjoiner.eg.go \
   pkg/sql/colexec/hashtable_distinct.eg.go \
@@ -868,10 +870,12 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/hash_bool_and_or_agg.eg.go \
   pkg/sql/colexec/hash_concat_agg.eg.go \
   pkg/sql/colexec/hash_count_agg.eg.go \
+  pkg/sql/colexec/hash_default_agg.eg.go \
   pkg/sql/colexec/hash_min_max_agg.eg.go \
   pkg/sql/colexec/hash_sum_agg.eg.go \
   pkg/sql/colexec/hash_sum_int_agg.eg.go \
   pkg/sql/colexec/hash_utils.eg.go \
+  pkg/sql/colexec/is_null_ops.eg.go \
   pkg/sql/colexec/like_ops.eg.go \
   pkg/sql/colexec/mergejoinbase.eg.go \
   pkg/sql/colexec/mergejoiner_exceptall.eg.go \
@@ -887,6 +891,7 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/ordered_bool_and_or_agg.eg.go \
   pkg/sql/colexec/ordered_concat_agg.eg.go \
   pkg/sql/colexec/ordered_count_agg.eg.go \
+  pkg/sql/colexec/ordered_default_agg.eg.go \
   pkg/sql/colexec/ordered_min_max_agg.eg.go \
   pkg/sql/colexec/ordered_sum_agg.eg.go \
   pkg/sql/colexec/ordered_sum_int_agg.eg.go \
@@ -916,7 +921,8 @@ OPTGEN_TARGETS = \
 	pkg/sql/opt/norm/factory.og.go \
 	pkg/sql/opt/rule_name.og.go \
 	pkg/sql/opt/rule_name_string.go \
-	pkg/sql/opt/exec/factory.og.go
+	pkg/sql/opt/exec/factory.og.go \
+	pkg/sql/opt/exec/explain/explain_factory.og.go
 
 go-targets-ccl := \
 	$(COCKROACH) $(COCKROACHSHORT) \
@@ -1557,6 +1563,14 @@ bin/.docgen_functions: bin/docgen
 	docgen functions docs/generated/sql --quiet
 	touch $@
 
+bin/.docgen_http: bin/docgen $(PROTOC)
+	docgen http \
+		--protoc $(PROTOC) \
+		--gendoc ./bin/protoc-gen-doc \
+		--out docs/generated/http \
+		--protobuf pkg:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH):$(ERRORS_PATH)
+	touch $@
+
 .PHONY: docs/generated/redact_safe.md
 
 docs/generated/redact_safe.md:
@@ -1611,6 +1625,9 @@ pkg/sql/opt/norm/factory.og.go: $(optgen-defs) $(optgen-norm-rules) bin/optgen
 
 pkg/sql/opt/exec/factory.og.go: $(optgen-defs) $(optgen-exec-defs) bin/optgen
 	optgen -out $@ execfactory $(optgen-exec-defs)
+
+pkg/sql/opt/exec/explain/explain_factory.og.go: $(optgen-defs) $(optgen-exec-defs) bin/optgen
+	optgen -out $@ execexplain $(optgen-exec-defs)
 
 # Format non-generated .cc and .h files in libroach using clang-format.
 .PHONY: c-deps-fmt

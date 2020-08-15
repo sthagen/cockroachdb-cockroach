@@ -700,7 +700,7 @@ func (expr *ComparisonExpr) TypeCheck(
 	var cmpOp *CmpOp
 	var alwaysNull bool
 	var err error
-	if expr.Operator.hasSubOperator() {
+	if expr.Operator.HasSubOperator() {
 		leftTyped, rightTyped, cmpOp, alwaysNull, err = typeCheckComparisonOpWithSubOperator(
 			ctx,
 			semaCtx,
@@ -736,7 +736,7 @@ func (expr *ComparisonExpr) TypeCheck(
 	}
 
 	expr.Left, expr.Right = leftTyped, rightTyped
-	expr.fn = cmpOp
+	expr.Fn = cmpOp
 	expr.typ = types.Bool
 	return expr, nil
 }
@@ -1621,6 +1621,12 @@ func (d *DInterval) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (Ty
 
 // TypeCheck implements the Expr interface. It is implemented as an idempotent
 // identity function for Datum.
+func (d *DBox2D) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedExpr, error) {
+	return d, nil
+}
+
+// TypeCheck implements the Expr interface. It is implemented as an idempotent
+// identity function for Datum.
 func (d *DGeography) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedExpr, error) {
 	return d, nil
 }
@@ -1745,7 +1751,7 @@ func typeCheckComparisonOpWithSubOperator(
 
 	// Determine the set of comparisons are possible for the sub-operation,
 	// which will be memoized.
-	foldedOp, _, _, _, _ := foldComparisonExpr(subOp, nil, nil)
+	foldedOp, _, _, _, _ := FoldComparisonExpr(subOp, nil, nil)
 	ops := CmpOps[foldedOp]
 
 	var cmpTypeLeft, cmpTypeRight *types.T
@@ -1870,7 +1876,7 @@ func typeCheckSubqueryWithIn(left, right *types.T) error {
 func typeCheckComparisonOp(
 	ctx context.Context, semaCtx *SemaContext, op ComparisonOperator, left, right Expr,
 ) (_ TypedExpr, _ TypedExpr, _ *CmpOp, alwaysNull bool, _ error) {
-	foldedOp, foldedLeft, foldedRight, switched, _ := foldComparisonExpr(op, left, right)
+	foldedOp, foldedLeft, foldedRight, switched, _ := FoldComparisonExpr(op, left, right)
 	ops := CmpOps[foldedOp]
 
 	_, leftIsTuple := foldedLeft.(*Tuple)
@@ -2589,7 +2595,7 @@ func (v stripFuncsVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 	case *BinaryExpr:
 		t.Fn = nil
 	case *ComparisonExpr:
-		t.fn = nil
+		t.Fn = nil
 	case *FuncExpr:
 		t.fn = nil
 		t.fnProps = nil

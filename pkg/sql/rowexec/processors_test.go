@@ -27,8 +27,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -274,9 +276,10 @@ func TestPostProcess(t *testing.T) {
 			outBuf := &distsqlutils.RowBuffer{}
 
 			var out execinfra.ProcOutputHelper
+			semaCtx := tree.MakeSemaContext()
 			evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			defer evalCtx.Stop(context.Background())
-			if err := out.Init(&tc.post, inBuf.OutputTypes(), evalCtx, outBuf); err != nil {
+			if err := out.Init(&tc.post, inBuf.OutputTypes(), &semaCtx, evalCtx, outBuf); err != nil {
 				t.Fatal(err)
 			}
 
@@ -886,7 +889,7 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 						for _, tableName := range errorOriginSpec.tableNames {
 							filters[nodeIdx].tableIDsToFilter = append(
 								filters[nodeIdx].tableIDsToFilter,
-								int(sqlbase.TestingGetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "test", tableName).ID),
+								int(catalogkv.TestingGetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "test", tableName).ID),
 							)
 						}
 						filters[nodeIdx].Unlock()
@@ -919,5 +922,54 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 				}()
 			})
 		}
+	})
+}
+
+// TestFlowConcurrenTxnUse tests that FlowBase correctly returns whether there
+// will be concurrent txn usage. This test lives in this package for easier
+// instantiation of processors.
+func TestFlowConcurrentTxnUse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	t.Run("TestSingleGoroutine", func(t *testing.T) {
+		flow := &flowinfra.FlowBase{}
+		flow.SetProcessors([]execinfra.Processor{
+			// samplerProcessor is used here and the other subtests because it does
+			// not implement RowSource and so must be run in a separate goroutine (it
+			// cannot be fused).
+			&samplerProcessor{
+				input: &tableReader{},
+			},
+		})
+		require.False(t, flow.ConcurrentTxnUse(), "expected no concurrent txn use because there is only one goroutine")
+	})
+	t.Run("TestMultipleGoroutinesWithNoConcurrentTxnUse", func(t *testing.T) {
+		flow := &flowinfra.FlowBase{}
+		// This is a common plan for stats collection. Neither processor implements
+		// RowSource, so the sampleAggregator must be run in a separate goroutine
+		// with a RowChannel connecting the two.
+		flow.SetProcessors([]execinfra.Processor{
+			&samplerProcessor{
+				input: &tableReader{},
+			},
+			&sampleAggregator{
+				input: &execinfra.RowChannel{},
+			},
+		})
+		require.False(t, flow.ConcurrentTxnUse(), "expected no concurrent txn use because the tableReader should be the only txn user")
+	})
+	t.Run("TestMultipleGoroutinesWithConcurrentTxnUse", func(t *testing.T) {
+		flow := &flowinfra.FlowBase{}
+		// This is a scenario that should never happen, but is useful for testing
+		// (multiple concurrent samplerProcessors).
+		flow.SetProcessors([]execinfra.Processor{
+			&samplerProcessor{
+				input: &tableReader{},
+			},
+			&samplerProcessor{
+				input: &tableReader{},
+			},
+		})
+		require.True(t, flow.ConcurrentTxnUse(), "expected concurrent txn use given that there are two tableReaders each in a separate goroutine")
 	})
 }

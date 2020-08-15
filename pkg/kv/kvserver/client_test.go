@@ -129,6 +129,7 @@ func createTestStoreWithOpts(
 	storeCfg.AmbientCtx = ac
 
 	rpcContext := rpc.NewContext(rpc.ContextOptions{
+		TenantID:   roachpb.SystemTenantID,
 		AmbientCtx: ac,
 		Config:     &base.Config{Insecure: true},
 		Clock:      storeCfg.Clock,
@@ -373,6 +374,7 @@ func (m *multiTestContext) Start(t testing.TB, numStores int) {
 	st := cluster.MakeTestingClusterSettings()
 	if m.rpcContext == nil {
 		m.rpcContext = rpc.NewContext(rpc.ContextOptions{
+			TenantID:   roachpb.SystemTenantID,
 			AmbientCtx: log.AmbientContext{Tracer: st.Tracer},
 			Config:     &base.Config{Insecure: true},
 			Clock:      m.clock(),
@@ -1626,7 +1628,7 @@ func verifyRangeStats(
 		return err
 	}
 	// Clear system counts as these are expected to vary.
-	ms.SysBytes, ms.SysCount = 0, 0
+	ms.SysBytes, ms.SysCount, ms.AbortSpanBytes = 0, 0, 0
 	if ms != expMS {
 		return errors.Errorf("expected and actual stats differ:\n%s", pretty.Diff(expMS, ms))
 	}

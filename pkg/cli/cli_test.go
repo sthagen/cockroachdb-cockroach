@@ -51,6 +51,7 @@ type cliTest struct {
 	*server.TestServer
 	certsDir    string
 	cleanupFunc func() error
+	prevStderr  *os.File
 
 	// t is the testing.T instance used for this test.
 	// Example_xxx tests may have this set to nil.
@@ -99,6 +100,8 @@ func createTestCerts(certsDir string) (cleanup func() error) {
 		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey),
 		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootCert),
 		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootKey),
+
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedTenantClientCACert),
 	}
 
 	for _, a := range assets {
@@ -157,6 +160,7 @@ func newCLITest(params cliTestParams) cliTest {
 	// Ensure that CLI error messages and anything meant for the
 	// original stderr is redirected to stdout, where it can be
 	// captured.
+	c.prevStderr = stderr
 	stderr = os.Stdout
 
 	return c
@@ -218,7 +222,7 @@ func (c *cliTest) cleanup() {
 	}()
 
 	// Restore stderr.
-	stderr = log.OrigStderr
+	stderr = c.prevStderr
 
 	log.Info(context.Background(), "stopping server and cleaning up CLI test")
 
@@ -441,6 +445,10 @@ func Example_demo() {
 	// find the certs that demo sets up.
 	security.ResetAssetLoader()
 	for _, cmd := range testData {
+		// `demo` sets up a server and log file redirection, which asserts
+		// that the logging subsystem has not been initialized yet. Fake
+		// this to be true.
+		log.TestingResetActive()
 		c.RunWithArgs(cmd)
 	}
 
@@ -1361,15 +1369,17 @@ func Example_misc_table() {
 	//     hai
 	// (1 row)
 	// sql --format=table -e explain select s, 'foo' from t.t
-	//     tree    |    field     | description
-	// ------------+--------------+--------------
-	//             | distribution | full
-	//             | vectorized   | false
-	//   render    |              |
-	//    └── scan |              |
-	//             | table        | t@primary
-	//             | spans        | FULL SCAN
-	// (6 rows)
+	//        tree      |     field     | description
+	// -----------------+---------------+--------------
+	//                  | distribution  | full
+	//                  | vectorized    | false
+	//   project        |               |
+	//    └── render    |               |
+	//         └── scan |               |
+	//                  | missing stats |
+	//                  | table         | t@primary
+	//                  | spans         | FULL SCAN
+	// (8 rows)
 }
 
 func Example_cert() {

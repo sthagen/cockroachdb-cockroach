@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -47,7 +48,7 @@ type explainPlanNode struct {
 // makeExplainPlanNodeWithPlan instantiates a planNode that EXPLAINs an
 // underlying plan.
 func (p *planner) makeExplainPlanNodeWithPlan(
-	ctx context.Context, opts *tree.ExplainOptions, plan *planComponents,
+	ctx context.Context, opts *tree.ExplainOptions, plan planComponents,
 ) (planNode, error) {
 	flags := explain.MakeFlags(opts)
 
@@ -59,13 +60,13 @@ func (p *planner) makeExplainPlanNodeWithPlan(
 	columns = append(sqlbase.ResultColumns(nil), columns...)
 
 	node := &explainPlanNode{
-		plan: *plan,
+		plan: plan,
 		run: explainPlanRun{
 			results: p.newContainerValuesNode(columns, 0),
 		},
 	}
 
-	node.explainer.init(flags)
+	node.explainer.init(flags, !p.ExecCfg().Codec.ForSystemTenant())
 
 	noPlaceholderFlags := tree.FmtExpr(
 		tree.FmtSymbolicSubqueries, flags.ShowTypes, false /* symbolicVars */, flags.Verbose,
@@ -128,10 +129,32 @@ type explainer struct {
 	showPlaceholderValues func(ctx *tree.FmtCtx, placeholder *tree.Placeholder)
 
 	ob *explain.OutputBuilder
+
+	// fieldsToSkipInSpans is how many fields to skip when pretty-printing spans.
+	// Usually 2, but can be 4 when running EXPLAIN from a tenant since there will
+	// be an extra tenant prefix and ID. For example:
+	//  - /51/1/1 is a key read as a system tenant where the first two values are
+	//    the table ID and the index ID.
+	//  - /Tenant/10/51/1/1 is a key read as a non-system tenant where the first
+	//    four values are the special tenant prefix byte and tenant ID, followed
+	//    by the table ID and the index ID.
+	fieldsToSkipInSpans int
 }
 
-func (e *explainer) init(flags explain.Flags) {
-	*e = explainer{flags: flags}
+// init initializes an explainer with the given explain.Flags. Additionally,
+// isTenantPlan specifies whether the plan that will be explained is executed on
+// behalf of a tenant. This lets the explainer know that the tenant prefix
+// should be stripped when printing spans.
+func (e *explainer) init(flags explain.Flags, isTenantPlan bool) {
+	*e = explainer{
+		flags: flags,
+		// fieldsToSkipInSpans is 2 by default because the explainer will skip the
+		// table and index ID.
+		fieldsToSkipInSpans: 2,
+	}
+	if isTenantPlan {
+		e.fieldsToSkipInSpans = 4
+	}
 	e.ob = explain.NewOutputBuilder(flags)
 }
 
@@ -263,7 +286,7 @@ func observePlan(
 // infrastructure.
 func planToString(ctx context.Context, p *planTop) string {
 	var e explainer
-	e.init(explain.Flags{Verbose: true, ShowTypes: true})
+	e.init(explain.Flags{Verbose: true, ShowTypes: true}, p.flags.IsSet(planFlagTenant))
 	e.fmtFlags = tree.FmtExpr(tree.FmtSymbolicSubqueries, true, true, true)
 
 	e.populate(ctx, &p.planComponents, explainSubqueryFmtFlags)
@@ -280,11 +303,11 @@ func getAttrForSpansAll(hardLimitSet bool) string {
 // spans implements the planObserver interface.
 func (e *explainer) spans(
 	nodeName, fieldName string,
-	index *sqlbase.IndexDescriptor,
+	index *descpb.IndexDescriptor,
 	spans []roachpb.Span,
 	hardLimitSet bool,
 ) {
-	spanss := sqlbase.PrettySpans(index, spans, 2)
+	spanss := sqlbase.PrettySpans(index, spans, e.fieldsToSkipInSpans)
 	if spanss != "" {
 		if spanss == "-" {
 			spanss = getAttrForSpansAll(hardLimitSet)

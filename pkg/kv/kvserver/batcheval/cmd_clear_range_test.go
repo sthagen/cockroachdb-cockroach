@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -121,8 +122,8 @@ func TestCmdClearRangeBytesThreshold(t *testing.T) {
 
 			// Verify cArgs.Stats is equal to the stats we wrote.
 			newStats := stats
-			newStats.SysBytes, newStats.SysCount = 0, 0       // ignore these values
-			cArgs.Stats.SysBytes, cArgs.Stats.SysCount = 0, 0 // these too, as GC threshold is updated
+			newStats.SysBytes, newStats.SysCount, newStats.AbortSpanBytes = 0, 0, 0          // ignore these values
+			cArgs.Stats.SysBytes, cArgs.Stats.SysCount, cArgs.Stats.AbortSpanBytes = 0, 0, 0 // these too, as GC threshold is updated
 			newStats.Add(*cArgs.Stats)
 			newStats.AgeTo(0) // pin at LastUpdateNanos==0
 			if !newStats.Equal(enginepb.MVCCStats{}) {
@@ -149,5 +150,62 @@ func TestCmdClearRangeBytesThreshold(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestCmdClearRangeDeadline(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	eng := storage.NewDefaultInMem()
+	defer eng.Close()
+
+	var stats enginepb.MVCCStats
+	startKey, endKey := roachpb.Key("0000"), roachpb.Key("9999")
+	desc := roachpb.RangeDescriptor{
+		RangeID: 99, StartKey: roachpb.RKey(startKey), EndKey: roachpb.RKey(endKey),
+	}
+
+	manual := hlc.NewManualClock(123)
+	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+
+	args := roachpb.ClearRangeRequest{
+		RequestHeader: roachpb.RequestHeader{Key: startKey, EndKey: endKey},
+	}
+
+	cArgs := CommandArgs{
+		Header:  roachpb.Header{RangeID: desc.RangeID},
+		EvalCtx: (&MockEvalCtx{Desc: &desc, Clock: clock, Stats: stats}).EvalContext(),
+		Stats:   &enginepb.MVCCStats{},
+		Args:    &args,
+	}
+
+	batch := eng.NewBatch()
+	defer batch.Close()
+
+	// no deadline
+	args.Deadline = hlc.Timestamp{}
+	if _, err := ClearRange(ctx, batch, cArgs, &roachpb.ClearRangeResponse{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// before deadline
+	args.Deadline = hlc.Timestamp{WallTime: 124}
+	if _, err := ClearRange(ctx, batch, cArgs, &roachpb.ClearRangeResponse{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// at deadline.
+	args.Deadline = hlc.Timestamp{WallTime: 123}
+	if _, err := ClearRange(ctx, batch, cArgs, &roachpb.ClearRangeResponse{}); err == nil {
+		t.Fatal("expected deadline error")
+	}
+
+	// after deadline
+	args.Deadline = hlc.Timestamp{WallTime: 122}
+	if _, err := ClearRange(
+		ctx, batch, cArgs, &roachpb.ClearRangeResponse{},
+	); !testutils.IsError(err, "ClearRange has deadline") {
+		t.Fatal("expected deadline error")
 	}
 }

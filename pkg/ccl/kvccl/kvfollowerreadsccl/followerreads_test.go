@@ -197,14 +197,15 @@ func TestOracleFactory(t *testing.T) {
 func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	skip.WithIssue(t, 52681)
 	// This test sleeps for a few sec.
 	skip.UnderShort(t)
 
 	ctx := context.Background()
-	// The test uses experimental_follower_read_timestamp().
+	// The test uses follower_read_timestamp().
 	defer utilccl.TestingEnableEnterprise()()
 
-	historicalQuery := `SELECT * FROM test AS OF SYSTEM TIME experimental_follower_read_timestamp() WHERE k=2`
+	historicalQuery := `SELECT * FROM test AS OF SYSTEM TIME follower_read_timestamp() WHERE k=2`
 	recCh := make(chan tracing.Recording, 1)
 
 	var n2Addr, n3Addr syncutil.AtomicString
@@ -247,7 +248,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	n1.Exec(t, `CREATE TABLE test (k INT PRIMARY KEY)`)
 	n1.Exec(t, `ALTER TABLE test EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2], 1)`)
 	// Speed up closing of timestamps, as we'll in order to be able to use
-	// experimental_follower_read_timestamp().
+	// follower_read_timestamp().
 	// Every 0.2s we'll close the timestamp from 0.4s ago. We'll attempt follower reads
 	// for anything below 0.4s * (1 + 0.5 * 20) = 4.4s.
 	n1.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '0.4s'`)
@@ -271,12 +272,12 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	n4Cache := tc.Server(3).DistSenderI().(*kvcoord.DistSender).RangeDescriptorCache()
 	entry := n4Cache.GetCached(tablePrefix, false /* inverted */)
 	require.NotNil(t, entry)
-	require.False(t, entry.Lease.Empty())
-	require.Equal(t, roachpb.StoreID(1), entry.Lease.Replica.StoreID)
+	require.False(t, entry.Lease().Empty())
+	require.Equal(t, roachpb.StoreID(1), entry.Lease().Replica.StoreID)
 	require.Equal(t, []roachpb.ReplicaDescriptor{
 		{NodeID: 1, StoreID: 1, ReplicaID: 1},
 		{NodeID: 2, StoreID: 2, ReplicaID: 2},
-	}, entry.Desc.Replicas().All())
+	}, entry.Desc().Replicas().All())
 
 	// Relocate the follower. n2 will no longer have a replica.
 	n1.Exec(t, `ALTER TABLE test EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,3], 1)`)
@@ -292,12 +293,12 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	// Check that the cache was properly updated.
 	entry = n4Cache.GetCached(tablePrefix, false /* inverted */)
 	require.NotNil(t, entry)
-	require.False(t, entry.Lease.Empty())
-	require.Equal(t, roachpb.StoreID(1), entry.Lease.Replica.StoreID)
+	require.False(t, entry.Lease().Empty())
+	require.Equal(t, roachpb.StoreID(1), entry.Lease().Replica.StoreID)
 	require.Equal(t, []roachpb.ReplicaDescriptor{
 		{NodeID: 1, StoreID: 1, ReplicaID: 1},
 		{NodeID: 3, StoreID: 3, ReplicaID: 3},
-	}, entry.Desc.Replicas().All())
+	}, entry.Desc().Replicas().All())
 
 	// Make a note of the follower reads metric on n3. We'll check that it was
 	// incremented.

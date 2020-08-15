@@ -13,6 +13,7 @@ package sqlbase
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -24,9 +25,10 @@ import (
 // The length of the result slice matches the length of the input column descriptors.
 // For every column that has no default expression, a NULL expression is reported
 // as default.
+// TODO(mgartner): Move this to the schemaexpr package.
 func MakeDefaultExprs(
 	ctx context.Context,
-	cols []ColumnDescriptor,
+	cols []descpb.ColumnDescriptor,
 	txCtx *transform.ExprTransformContext,
 	evalCtx *tree.EvalContext,
 	semaCtx *tree.SemaContext,
@@ -84,13 +86,13 @@ func MakeDefaultExprs(
 // and returns the defaultExprs for cols.
 func ProcessDefaultColumns(
 	ctx context.Context,
-	cols []ColumnDescriptor,
+	cols []descpb.ColumnDescriptor,
 	tableDesc *ImmutableTableDescriptor,
 	txCtx *transform.ExprTransformContext,
 	evalCtx *tree.EvalContext,
 	semaCtx *tree.SemaContext,
-) ([]ColumnDescriptor, []tree.TypedExpr, error) {
-	cols = processColumnSet(cols, tableDesc, func(col *ColumnDescriptor) bool {
+) ([]descpb.ColumnDescriptor, []tree.TypedExpr, error) {
+	cols = processColumnSet(cols, tableDesc, func(col *descpb.ColumnDescriptor) bool {
 		return col.DefaultExpr != nil
 	})
 	defaultExprs, err := MakeDefaultExprs(ctx, cols, txCtx, evalCtx, semaCtx)
@@ -98,9 +100,11 @@ func ProcessDefaultColumns(
 }
 
 func processColumnSet(
-	cols []ColumnDescriptor, tableDesc *ImmutableTableDescriptor, inSet func(*ColumnDescriptor) bool,
-) []ColumnDescriptor {
-	colIDSet := make(map[ColumnID]struct{}, len(cols))
+	cols []descpb.ColumnDescriptor,
+	tableDesc *ImmutableTableDescriptor,
+	inSet func(*descpb.ColumnDescriptor) bool,
+) []descpb.ColumnDescriptor {
+	colIDSet := make(map[descpb.ColumnID]struct{}, len(cols))
 	for i := range cols {
 		colIDSet[cols[i].ID] = struct{}{}
 	}

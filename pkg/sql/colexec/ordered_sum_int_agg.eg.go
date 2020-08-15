@@ -41,16 +41,13 @@ func newSumIntOrderedAggAlloc(
 }
 
 type sumIntInt16OrderedAgg struct {
-	groups  []bool
+	orderedAggregateFuncBase
 	scratch struct {
-		curIdx int
 		// curAgg holds the running total, so we can index into the slice once per
 		// group, instead of on each iteration.
 		curAgg int64
 		// vec points to the output vector we are updating.
 		vec []int64
-		// nulls points to the output null vector that we are updating.
-		nulls *coldata.Nulls
 		// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 		// for the group that is currently being aggregated.
 		foundNonNullForCurrentGroup bool
@@ -61,45 +58,38 @@ var _ aggregateFunc = &sumIntInt16OrderedAgg{}
 
 const sizeOfSumIntInt16OrderedAgg = int64(unsafe.Sizeof(sumIntInt16OrderedAgg{}))
 
-func (a *sumIntInt16OrderedAgg) Init(groups []bool, v coldata.Vec) {
-	a.groups = groups
-	a.scratch.vec = v.Int64()
-	a.scratch.nulls = v.Nulls()
+func (a *sumIntInt16OrderedAgg) Init(groups []bool, vec coldata.Vec) {
+	a.orderedAggregateFuncBase.Init(groups, vec)
+	a.scratch.vec = vec.Int64()
 	a.Reset()
 }
 
 func (a *sumIntInt16OrderedAgg) Reset() {
-	a.scratch.curIdx = 0
+	a.orderedAggregateFuncBase.Reset()
 	a.scratch.foundNonNullForCurrentGroup = false
-	a.scratch.nulls.UnsetNulls()
 }
 
-func (a *sumIntInt16OrderedAgg) CurrentOutputIndex() int {
-	return a.scratch.curIdx
-}
-
-func (a *sumIntInt16OrderedAgg) SetOutputIndex(idx int) {
-	a.scratch.curIdx = idx
-}
-
-func (a *sumIntInt16OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	inputLen := b.Length()
-	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
+func (a *sumIntInt16OrderedAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
+	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Int16(), vec.Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			sel = sel[:inputLen]
-			for _, i := range sel {
+	groups := a.groups
+	if sel == nil {
+		_ = groups[inputLen-1]
+		col = col[:inputLen]
+		if nulls.MaybeHasNulls() {
+			for i := range col {
 
-				if a.groups[i] {
+				if groups[i] {
 					// If we encounter a new group, and we haven't found any non-nulls for the
 					// current group, the output for this group should be null.
 					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
+						a.nulls.SetNull(a.curIdx)
 					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
 					}
-					a.scratch.curIdx++
+					a.curIdx++
 					a.scratch.curAgg = zeroInt64Value
 
 					a.scratch.foundNonNullForCurrentGroup = false
@@ -121,53 +111,17 @@ func (a *sumIntInt16OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 				}
 			}
 		} else {
-			col = col[:inputLen]
 			for i := range col {
 
-				if a.groups[i] {
+				if groups[i] {
 					// If we encounter a new group, and we haven't found any non-nulls for the
 					// current group, the output for this group should be null.
 					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
+						a.nulls.SetNull(a.curIdx)
 					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
 					}
-					a.scratch.curIdx++
-					a.scratch.curAgg = zeroInt64Value
-
-					a.scratch.foundNonNullForCurrentGroup = false
-				}
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-
-					{
-						result := int64(a.scratch.curAgg) + int64(col[i])
-						if (result < int64(a.scratch.curAgg)) != (int64(col[i]) < 0) {
-							colexecerror.ExpectedError(tree.ErrIntOutOfRange)
-						}
-						a.scratch.curAgg = result
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		}
-	} else {
-		if sel != nil {
-			sel = sel[:inputLen]
-			for _, i := range sel {
-
-				if a.groups[i] {
-					// If we encounter a new group, and we haven't found any non-nulls for the
-					// current group, the output for this group should be null.
-					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
-					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
-					}
-					a.scratch.curIdx++
+					a.curIdx++
 					a.scratch.curAgg = zeroInt64Value
 
 				}
@@ -187,19 +141,53 @@ func (a *sumIntInt16OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 					a.scratch.foundNonNullForCurrentGroup = true
 				}
 			}
-		} else {
-			col = col[:inputLen]
-			for i := range col {
+		}
+	} else {
+		sel = sel[:inputLen]
+		if nulls.MaybeHasNulls() {
+			for _, i := range sel {
 
-				if a.groups[i] {
+				if groups[i] {
 					// If we encounter a new group, and we haven't found any non-nulls for the
 					// current group, the output for this group should be null.
 					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
+						a.nulls.SetNull(a.curIdx)
 					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
 					}
-					a.scratch.curIdx++
+					a.curIdx++
+					a.scratch.curAgg = zeroInt64Value
+
+					a.scratch.foundNonNullForCurrentGroup = false
+				}
+
+				var isNull bool
+				isNull = nulls.NullAt(i)
+				if !isNull {
+
+					{
+						result := int64(a.scratch.curAgg) + int64(col[i])
+						if (result < int64(a.scratch.curAgg)) != (int64(col[i]) < 0) {
+							colexecerror.ExpectedError(tree.ErrIntOutOfRange)
+						}
+						a.scratch.curAgg = result
+					}
+
+					a.scratch.foundNonNullForCurrentGroup = true
+				}
+			}
+		} else {
+			for _, i := range sel {
+
+				if groups[i] {
+					// If we encounter a new group, and we haven't found any non-nulls for the
+					// current group, the output for this group should be null.
+					if !a.scratch.foundNonNullForCurrentGroup {
+						a.nulls.SetNull(a.curIdx)
+					} else {
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
+					}
+					a.curIdx++
 					a.scratch.curAgg = zeroInt64Value
 
 				}
@@ -223,20 +211,19 @@ func (a *sumIntInt16OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
-func (a *sumIntInt16OrderedAgg) Flush() {
+func (a *sumIntInt16OrderedAgg) Flush(outputIdx int) {
 	// The aggregation is finished. Flush the last value. If we haven't found
 	// any non-nulls for this group so far, the output for this group should be
 	// null.
+	// Go around "argument overwritten before first use" linter error.
+	_ = outputIdx
+	outputIdx = a.curIdx
+	a.curIdx++
 	if !a.scratch.foundNonNullForCurrentGroup {
-		a.scratch.nulls.SetNull(a.scratch.curIdx)
+		a.nulls.SetNull(outputIdx)
 	} else {
-		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+		a.scratch.vec[outputIdx] = a.scratch.curAgg
 	}
-	a.scratch.curIdx++
-}
-
-func (a *sumIntInt16OrderedAgg) HandleEmptyInputScalar() {
-	a.scratch.nulls.SetNull(0)
 }
 
 type sumIntInt16OrderedAggAlloc struct {
@@ -257,16 +244,13 @@ func (a *sumIntInt16OrderedAggAlloc) newAggFunc() aggregateFunc {
 }
 
 type sumIntInt32OrderedAgg struct {
-	groups  []bool
+	orderedAggregateFuncBase
 	scratch struct {
-		curIdx int
 		// curAgg holds the running total, so we can index into the slice once per
 		// group, instead of on each iteration.
 		curAgg int64
 		// vec points to the output vector we are updating.
 		vec []int64
-		// nulls points to the output null vector that we are updating.
-		nulls *coldata.Nulls
 		// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 		// for the group that is currently being aggregated.
 		foundNonNullForCurrentGroup bool
@@ -277,45 +261,38 @@ var _ aggregateFunc = &sumIntInt32OrderedAgg{}
 
 const sizeOfSumIntInt32OrderedAgg = int64(unsafe.Sizeof(sumIntInt32OrderedAgg{}))
 
-func (a *sumIntInt32OrderedAgg) Init(groups []bool, v coldata.Vec) {
-	a.groups = groups
-	a.scratch.vec = v.Int64()
-	a.scratch.nulls = v.Nulls()
+func (a *sumIntInt32OrderedAgg) Init(groups []bool, vec coldata.Vec) {
+	a.orderedAggregateFuncBase.Init(groups, vec)
+	a.scratch.vec = vec.Int64()
 	a.Reset()
 }
 
 func (a *sumIntInt32OrderedAgg) Reset() {
-	a.scratch.curIdx = 0
+	a.orderedAggregateFuncBase.Reset()
 	a.scratch.foundNonNullForCurrentGroup = false
-	a.scratch.nulls.UnsetNulls()
 }
 
-func (a *sumIntInt32OrderedAgg) CurrentOutputIndex() int {
-	return a.scratch.curIdx
-}
-
-func (a *sumIntInt32OrderedAgg) SetOutputIndex(idx int) {
-	a.scratch.curIdx = idx
-}
-
-func (a *sumIntInt32OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	inputLen := b.Length()
-	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
+func (a *sumIntInt32OrderedAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
+	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Int32(), vec.Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			sel = sel[:inputLen]
-			for _, i := range sel {
+	groups := a.groups
+	if sel == nil {
+		_ = groups[inputLen-1]
+		col = col[:inputLen]
+		if nulls.MaybeHasNulls() {
+			for i := range col {
 
-				if a.groups[i] {
+				if groups[i] {
 					// If we encounter a new group, and we haven't found any non-nulls for the
 					// current group, the output for this group should be null.
 					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
+						a.nulls.SetNull(a.curIdx)
 					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
 					}
-					a.scratch.curIdx++
+					a.curIdx++
 					a.scratch.curAgg = zeroInt64Value
 
 					a.scratch.foundNonNullForCurrentGroup = false
@@ -337,53 +314,17 @@ func (a *sumIntInt32OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 				}
 			}
 		} else {
-			col = col[:inputLen]
 			for i := range col {
 
-				if a.groups[i] {
+				if groups[i] {
 					// If we encounter a new group, and we haven't found any non-nulls for the
 					// current group, the output for this group should be null.
 					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
+						a.nulls.SetNull(a.curIdx)
 					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
 					}
-					a.scratch.curIdx++
-					a.scratch.curAgg = zeroInt64Value
-
-					a.scratch.foundNonNullForCurrentGroup = false
-				}
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-
-					{
-						result := int64(a.scratch.curAgg) + int64(col[i])
-						if (result < int64(a.scratch.curAgg)) != (int64(col[i]) < 0) {
-							colexecerror.ExpectedError(tree.ErrIntOutOfRange)
-						}
-						a.scratch.curAgg = result
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		}
-	} else {
-		if sel != nil {
-			sel = sel[:inputLen]
-			for _, i := range sel {
-
-				if a.groups[i] {
-					// If we encounter a new group, and we haven't found any non-nulls for the
-					// current group, the output for this group should be null.
-					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
-					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
-					}
-					a.scratch.curIdx++
+					a.curIdx++
 					a.scratch.curAgg = zeroInt64Value
 
 				}
@@ -403,19 +344,53 @@ func (a *sumIntInt32OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 					a.scratch.foundNonNullForCurrentGroup = true
 				}
 			}
-		} else {
-			col = col[:inputLen]
-			for i := range col {
+		}
+	} else {
+		sel = sel[:inputLen]
+		if nulls.MaybeHasNulls() {
+			for _, i := range sel {
 
-				if a.groups[i] {
+				if groups[i] {
 					// If we encounter a new group, and we haven't found any non-nulls for the
 					// current group, the output for this group should be null.
 					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
+						a.nulls.SetNull(a.curIdx)
 					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
 					}
-					a.scratch.curIdx++
+					a.curIdx++
+					a.scratch.curAgg = zeroInt64Value
+
+					a.scratch.foundNonNullForCurrentGroup = false
+				}
+
+				var isNull bool
+				isNull = nulls.NullAt(i)
+				if !isNull {
+
+					{
+						result := int64(a.scratch.curAgg) + int64(col[i])
+						if (result < int64(a.scratch.curAgg)) != (int64(col[i]) < 0) {
+							colexecerror.ExpectedError(tree.ErrIntOutOfRange)
+						}
+						a.scratch.curAgg = result
+					}
+
+					a.scratch.foundNonNullForCurrentGroup = true
+				}
+			}
+		} else {
+			for _, i := range sel {
+
+				if groups[i] {
+					// If we encounter a new group, and we haven't found any non-nulls for the
+					// current group, the output for this group should be null.
+					if !a.scratch.foundNonNullForCurrentGroup {
+						a.nulls.SetNull(a.curIdx)
+					} else {
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
+					}
+					a.curIdx++
 					a.scratch.curAgg = zeroInt64Value
 
 				}
@@ -439,20 +414,19 @@ func (a *sumIntInt32OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
-func (a *sumIntInt32OrderedAgg) Flush() {
+func (a *sumIntInt32OrderedAgg) Flush(outputIdx int) {
 	// The aggregation is finished. Flush the last value. If we haven't found
 	// any non-nulls for this group so far, the output for this group should be
 	// null.
+	// Go around "argument overwritten before first use" linter error.
+	_ = outputIdx
+	outputIdx = a.curIdx
+	a.curIdx++
 	if !a.scratch.foundNonNullForCurrentGroup {
-		a.scratch.nulls.SetNull(a.scratch.curIdx)
+		a.nulls.SetNull(outputIdx)
 	} else {
-		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+		a.scratch.vec[outputIdx] = a.scratch.curAgg
 	}
-	a.scratch.curIdx++
-}
-
-func (a *sumIntInt32OrderedAgg) HandleEmptyInputScalar() {
-	a.scratch.nulls.SetNull(0)
 }
 
 type sumIntInt32OrderedAggAlloc struct {
@@ -473,16 +447,13 @@ func (a *sumIntInt32OrderedAggAlloc) newAggFunc() aggregateFunc {
 }
 
 type sumIntInt64OrderedAgg struct {
-	groups  []bool
+	orderedAggregateFuncBase
 	scratch struct {
-		curIdx int
 		// curAgg holds the running total, so we can index into the slice once per
 		// group, instead of on each iteration.
 		curAgg int64
 		// vec points to the output vector we are updating.
 		vec []int64
-		// nulls points to the output null vector that we are updating.
-		nulls *coldata.Nulls
 		// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 		// for the group that is currently being aggregated.
 		foundNonNullForCurrentGroup bool
@@ -493,45 +464,38 @@ var _ aggregateFunc = &sumIntInt64OrderedAgg{}
 
 const sizeOfSumIntInt64OrderedAgg = int64(unsafe.Sizeof(sumIntInt64OrderedAgg{}))
 
-func (a *sumIntInt64OrderedAgg) Init(groups []bool, v coldata.Vec) {
-	a.groups = groups
-	a.scratch.vec = v.Int64()
-	a.scratch.nulls = v.Nulls()
+func (a *sumIntInt64OrderedAgg) Init(groups []bool, vec coldata.Vec) {
+	a.orderedAggregateFuncBase.Init(groups, vec)
+	a.scratch.vec = vec.Int64()
 	a.Reset()
 }
 
 func (a *sumIntInt64OrderedAgg) Reset() {
-	a.scratch.curIdx = 0
+	a.orderedAggregateFuncBase.Reset()
 	a.scratch.foundNonNullForCurrentGroup = false
-	a.scratch.nulls.UnsetNulls()
 }
 
-func (a *sumIntInt64OrderedAgg) CurrentOutputIndex() int {
-	return a.scratch.curIdx
-}
-
-func (a *sumIntInt64OrderedAgg) SetOutputIndex(idx int) {
-	a.scratch.curIdx = idx
-}
-
-func (a *sumIntInt64OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	inputLen := b.Length()
-	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
+func (a *sumIntInt64OrderedAgg) Compute(
+	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+) {
+	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Int64(), vec.Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			sel = sel[:inputLen]
-			for _, i := range sel {
+	groups := a.groups
+	if sel == nil {
+		_ = groups[inputLen-1]
+		col = col[:inputLen]
+		if nulls.MaybeHasNulls() {
+			for i := range col {
 
-				if a.groups[i] {
+				if groups[i] {
 					// If we encounter a new group, and we haven't found any non-nulls for the
 					// current group, the output for this group should be null.
 					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
+						a.nulls.SetNull(a.curIdx)
 					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
 					}
-					a.scratch.curIdx++
+					a.curIdx++
 					a.scratch.curAgg = zeroInt64Value
 
 					a.scratch.foundNonNullForCurrentGroup = false
@@ -553,53 +517,17 @@ func (a *sumIntInt64OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 				}
 			}
 		} else {
-			col = col[:inputLen]
 			for i := range col {
 
-				if a.groups[i] {
+				if groups[i] {
 					// If we encounter a new group, and we haven't found any non-nulls for the
 					// current group, the output for this group should be null.
 					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
+						a.nulls.SetNull(a.curIdx)
 					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
 					}
-					a.scratch.curIdx++
-					a.scratch.curAgg = zeroInt64Value
-
-					a.scratch.foundNonNullForCurrentGroup = false
-				}
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-
-					{
-						result := int64(a.scratch.curAgg) + int64(col[i])
-						if (result < int64(a.scratch.curAgg)) != (int64(col[i]) < 0) {
-							colexecerror.ExpectedError(tree.ErrIntOutOfRange)
-						}
-						a.scratch.curAgg = result
-					}
-
-					a.scratch.foundNonNullForCurrentGroup = true
-				}
-			}
-		}
-	} else {
-		if sel != nil {
-			sel = sel[:inputLen]
-			for _, i := range sel {
-
-				if a.groups[i] {
-					// If we encounter a new group, and we haven't found any non-nulls for the
-					// current group, the output for this group should be null.
-					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
-					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
-					}
-					a.scratch.curIdx++
+					a.curIdx++
 					a.scratch.curAgg = zeroInt64Value
 
 				}
@@ -619,19 +547,53 @@ func (a *sumIntInt64OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 					a.scratch.foundNonNullForCurrentGroup = true
 				}
 			}
-		} else {
-			col = col[:inputLen]
-			for i := range col {
+		}
+	} else {
+		sel = sel[:inputLen]
+		if nulls.MaybeHasNulls() {
+			for _, i := range sel {
 
-				if a.groups[i] {
+				if groups[i] {
 					// If we encounter a new group, and we haven't found any non-nulls for the
 					// current group, the output for this group should be null.
 					if !a.scratch.foundNonNullForCurrentGroup {
-						a.scratch.nulls.SetNull(a.scratch.curIdx)
+						a.nulls.SetNull(a.curIdx)
 					} else {
-						a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
 					}
-					a.scratch.curIdx++
+					a.curIdx++
+					a.scratch.curAgg = zeroInt64Value
+
+					a.scratch.foundNonNullForCurrentGroup = false
+				}
+
+				var isNull bool
+				isNull = nulls.NullAt(i)
+				if !isNull {
+
+					{
+						result := int64(a.scratch.curAgg) + int64(col[i])
+						if (result < int64(a.scratch.curAgg)) != (int64(col[i]) < 0) {
+							colexecerror.ExpectedError(tree.ErrIntOutOfRange)
+						}
+						a.scratch.curAgg = result
+					}
+
+					a.scratch.foundNonNullForCurrentGroup = true
+				}
+			}
+		} else {
+			for _, i := range sel {
+
+				if groups[i] {
+					// If we encounter a new group, and we haven't found any non-nulls for the
+					// current group, the output for this group should be null.
+					if !a.scratch.foundNonNullForCurrentGroup {
+						a.nulls.SetNull(a.curIdx)
+					} else {
+						a.scratch.vec[a.curIdx] = a.scratch.curAgg
+					}
+					a.curIdx++
 					a.scratch.curAgg = zeroInt64Value
 
 				}
@@ -655,20 +617,19 @@ func (a *sumIntInt64OrderedAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
-func (a *sumIntInt64OrderedAgg) Flush() {
+func (a *sumIntInt64OrderedAgg) Flush(outputIdx int) {
 	// The aggregation is finished. Flush the last value. If we haven't found
 	// any non-nulls for this group so far, the output for this group should be
 	// null.
+	// Go around "argument overwritten before first use" linter error.
+	_ = outputIdx
+	outputIdx = a.curIdx
+	a.curIdx++
 	if !a.scratch.foundNonNullForCurrentGroup {
-		a.scratch.nulls.SetNull(a.scratch.curIdx)
+		a.nulls.SetNull(outputIdx)
 	} else {
-		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
+		a.scratch.vec[outputIdx] = a.scratch.curAgg
 	}
-	a.scratch.curIdx++
-}
-
-func (a *sumIntInt64OrderedAgg) HandleEmptyInputScalar() {
-	a.scratch.nulls.SetNull(0)
 }
 
 type sumIntInt64OrderedAggAlloc struct {

@@ -16,12 +16,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -130,8 +132,13 @@ func NewColBatchScan(
 	limitHint := execinfra.LimitHint(spec.LimitHint, post)
 
 	returnMutations := spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic
-	typs := spec.Table.ColumnTypesWithMutations(returnMutations)
-	columnIdxMap := spec.Table.ColumnIdxMapWithMutations(returnMutations)
+	// TODO(ajwerner): The need to construct an ImmutableTableDescriptor here
+	// indicates that we're probably doing this wrong. Instead we should be
+	// just seting the ID and Version in the spec or something like that and
+	// retrieving the hydrated ImmutableTableDescriptor from cache.
+	table := sqlbase.NewImmutableTableDescriptor(spec.Table)
+	typs := table.ColumnTypesWithMutations(returnMutations)
+	columnIdxMap := table.ColumnIdxMapWithMutations(returnMutations)
 	// Add all requested system columns to the output.
 	sysColTypes, sysColDescs, err := sqlbase.GetSystemColumnTypesAndDescriptors(&spec.Table, spec.SystemColumns)
 	if err != nil {
@@ -142,18 +149,22 @@ func NewColBatchScan(
 		columnIdxMap[sysColDescs[i].ID] = len(columnIdxMap)
 	}
 
+	semaCtx := tree.MakeSemaContext()
 	evalCtx := flowCtx.NewEvalCtx()
 	// Before we can safely use types from the table descriptor, we need to
 	// make sure they are hydrated. In row execution engine it is done during
 	// the processor initialization, but neither ColBatchScan nor cFetcher are
 	// processors, so we need to do the hydration ourselves.
-	if err := execinfrapb.HydrateTypeSlice(evalCtx, typs); err != nil {
+	resolver := flowCtx.TypeResolverFactory.NewTypeResolver(evalCtx.Txn)
+	semaCtx.TypeResolver = resolver
+	if err := resolver.HydrateTypeSlice(evalCtx.Context, typs); err != nil {
 		return nil, err
 	}
 	helper := execinfra.ProcOutputHelper{}
 	if err := helper.Init(
 		post,
 		typs,
+		&semaCtx,
 		evalCtx,
 		nil, /* output */
 	); err != nil {
@@ -196,15 +207,15 @@ func initCRowFetcher(
 	codec keys.SQLCodec,
 	allocator *colmem.Allocator,
 	fetcher *cFetcher,
-	desc *sqlbase.TableDescriptor,
+	desc *descpb.TableDescriptor,
 	indexIdx int,
-	colIdxMap map[sqlbase.ColumnID]int,
+	colIdxMap map[descpb.ColumnID]int,
 	reverseScan bool,
 	valNeededForCol util.FastIntSet,
 	scanVisibility execinfrapb.ScanVisibility,
-	lockStr sqlbase.ScanLockingStrength,
-	systemColumnDescs []sqlbase.ColumnDescriptor,
-) (index *sqlbase.IndexDescriptor, isSecondaryIndex bool, err error) {
+	lockStr descpb.ScanLockingStrength,
+	systemColumnDescs []descpb.ColumnDescriptor,
+) (index *descpb.IndexDescriptor, isSecondaryIndex bool, err error) {
 	immutDesc := sqlbase.NewImmutableTableDescriptor(*desc)
 	index, isSecondaryIndex, err = immutDesc.FindIndexByIndexIdx(indexIdx)
 	if err != nil {

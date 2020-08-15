@@ -11,6 +11,9 @@ package backupccl
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -28,6 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
@@ -141,7 +146,7 @@ func splitAndFilterSpans(
 }
 
 // clusterNodeCount returns the approximate number of nodes in the cluster.
-func clusterNodeCount(gw gossip.DeprecatedGossip) (int, error) {
+func clusterNodeCount(gw gossip.OptionalGossip) (int, error) {
 	g, err := gw.OptionalErr(47970)
 	if err != nil {
 		return 0, err
@@ -271,8 +276,8 @@ func backup(
 	})
 
 	pkIDs := make(map[uint64]bool)
-	for _, desc := range backupManifest.Descriptors {
-		if t := desc.Table(hlc.Timestamp{}); t != nil {
+	for i := range backupManifest.Descriptors {
+		if t := sqlbase.TableFromDescriptor(&backupManifest.Descriptors[i], hlc.Timestamp{}); t != nil {
 			pkIDs[roachpb.BulkOpSummaryID(uint64(t.ID), uint64(t.PrimaryIndex.ID))] = true
 		}
 	}
@@ -344,8 +349,8 @@ func backup(
 		return RowCount{}, err
 	}
 	var tableStatistics []*stats.TableStatisticProto
-	for _, desc := range backupManifest.Descriptors {
-		if tableDesc := desc.Table(hlc.Timestamp{}); tableDesc != nil {
+	for i := range backupManifest.Descriptors {
+		if tableDesc := sqlbase.TableFromDescriptor(&backupManifest.Descriptors[i], hlc.Timestamp{}); tableDesc != nil {
 			// Collect all the table stats for this table.
 			tableStatisticsAcc, err := statsCache.GetTableStats(ctx, tableDesc.GetID())
 			if err != nil {
@@ -433,6 +438,7 @@ func (b *backupResumer) Resume(
 	if err != nil {
 		return errors.Wrapf(err, "make storage")
 	}
+	defer defaultStore.Close()
 	storageByLocalityKV := make(map[string]*roachpb.ExternalStorage)
 	for kv, uri := range details.URIsByLocalityKV {
 		conf, err := cloudimpl.ExternalStorageConfFromURI(uri, p.User())
@@ -447,7 +453,8 @@ func (b *backupResumer) Resume(
 	// they could be using either the new or the old foreign key
 	// representations. We should just preserve whatever representation the
 	// table descriptors were using and leave them alone.
-	if desc, err := readBackupManifest(ctx, defaultStore, BackupManifestCheckpointName, details.Encryption); err == nil {
+	if desc, err := readBackupManifest(ctx, defaultStore, BackupManifestCheckpointName,
+		details.Encryption); err == nil {
 		// If the checkpoint is from a different cluster, it's meaningless to us.
 		// More likely though are dummy/lock-out checkpoints with no ClusterID.
 		if desc.ClusterID.Equal(p.ExecCfg().ClusterID()) {
@@ -502,6 +509,36 @@ func (b *backupResumer) Resume(
 		}
 	}
 
+	// If this is a full backup that was automatically nested in a collection of
+	// backups, record the path under which we wrote it to the LATEST file in the
+	// root of the collection. Note: this file *not* encrypted, as it only
+	// contains the name of another file that is in the same folder -- if you can
+	// get to this file to read it, you could already find its contents from the
+	// listing of the directory it is in -- it exists only to save us a
+	// potentially expensive listing of a giant backup collection to find the most
+	// recent completed entry.
+	if backupManifest.StartTime.IsEmpty() && details.CollectionURI != "" {
+		backupURI, err := url.Parse(details.URI)
+		if err != nil {
+			return err
+		}
+		collectionURI, err := url.Parse(details.CollectionURI)
+		if err != nil {
+			return err
+		}
+
+		suffix := strings.TrimPrefix(path.Clean(backupURI.Path), path.Clean(collectionURI.Path))
+
+		c, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, details.CollectionURI, p.User())
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		if err := c.WriteFile(ctx, latestFileName, strings.NewReader(suffix)); err != nil {
+			return err
+		}
+	}
+
 	resultsCh <- tree.Datums{
 		tree.NewDInt(tree.DInt(*b.job.ID())),
 		tree.NewDString(string(jobs.StatusSucceeded)),
@@ -534,7 +571,25 @@ func (b *backupResumer) Resume(
 		}
 	}
 
+	b.maybeNotifyScheduledJobCompletion(ctx, jobs.StatusSucceeded, p.ExecCfg().InternalExecutor)
+
 	return nil
+}
+
+func (b *backupResumer) maybeNotifyScheduledJobCompletion(
+	ctx context.Context, jobStatus jobs.Status, ex sqlutil.InternalExecutor,
+) {
+	if b.job.CreatedBy() == nil || b.job.CreatedBy().Name != jobs.CreatedByScheduledJobs {
+		return
+	}
+	info := b.job.CreatedBy()
+
+	if err := jobs.NotifyJobTermination(
+		ctx, nil /* env */, *b.job.ID(), jobStatus, info.ID, ex, nil); err != nil {
+		log.Warningf(ctx,
+			"failed to notify schedule %d of completion of job %d; err=%s",
+			info.ID, *b.job.ID(), err)
+	}
 }
 
 func (b *backupResumer) clearStats(ctx context.Context, DB *kv.DB) error {
@@ -557,6 +612,12 @@ func (b *backupResumer) clearStats(ctx context.Context, DB *kv.DB) error {
 
 // OnFailOrCancel is part of the jobs.Resumer interface.
 func (b *backupResumer) OnFailOrCancel(ctx context.Context, phs interface{}) error {
+	defer b.maybeNotifyScheduledJobCompletion(
+		ctx,
+		jobs.StatusFailed,
+		phs.(sql.PlanHookState).ExecCfg().InternalExecutor,
+	)
+
 	telemetry.Count("backup.total.failed")
 	telemetry.CountBucketed("backup.duration-sec.failed",
 		int64(timeutil.Since(timeutil.FromUnixMicros(b.job.Payload().StartedMicros)).Seconds()))
@@ -577,14 +638,11 @@ func (b *backupResumer) deleteCheckpoint(
 		details := b.job.Details().(jobspb.BackupDetails)
 		// For all backups, partitioned or not, the main BACKUP manifest is stored at
 		// details.URI.
-		conf, err := cloudimpl.ExternalStorageConfFromURI(details.URI, user)
+		exportStore, err := cfg.DistSQLSrv.ExternalStorageFromURI(ctx, details.URI, user)
 		if err != nil {
 			return err
 		}
-		exportStore, err := cfg.DistSQLSrv.ExternalStorage(ctx, conf)
-		if err != nil {
-			return err
-		}
+		defer exportStore.Close()
 		return exportStore.Delete(ctx, BackupManifestCheckpointName)
 	}(); err != nil {
 		log.Warningf(ctx, "unable to delete checkpointed backup descriptor: %+v", err)

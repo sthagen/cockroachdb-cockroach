@@ -234,6 +234,7 @@ type Cascade struct {
 		execFactory Factory,
 		bufferRef Node,
 		numBufferedRows int,
+		allowAutoCommit bool,
 	) (Plan, error)
 }
 
@@ -264,3 +265,36 @@ type InsertFastPathFKCheck struct {
 // MkErrFn is a function that generates an error which includes values from a
 // relevant row.
 type MkErrFn func(tree.Datums) error
+
+// ExplainFactory is an extension of Factory used when constructing a plan that
+// can be explained. It allows annotation of nodes with extra information.
+type ExplainFactory interface {
+	Factory
+
+	// AnnotateNode annotates a constructed Node with extra information.
+	AnnotateNode(n Node, id ExplainAnnotationID, value interface{})
+}
+
+// ExplainAnnotationID identifies the type of a node annotation.
+type ExplainAnnotationID int
+
+const (
+	// EstimatedStatsID is an annotation with a *EstimatedStats value.
+	EstimatedStatsID ExplainAnnotationID = iota
+)
+
+// EstimatedStats  contains estimated statistics about a given operator.
+type EstimatedStats struct {
+	// TableStatsAvailable is true if all the tables involved by this operator
+	// (directly or indirectly) had table statistics.
+	TableStatsAvailable bool
+	// RowCount is the estimated number of rows produced by the operator.
+	RowCount float64
+	// Cost is the estimated cost of the operator. This cost includes the costs of
+	// the child operators.
+	Cost float64
+}
+
+// BuildPlanForExplainFn builds an execution plan against the given
+// ExplainFactory.
+type BuildPlanForExplainFn func(ef ExplainFactory) (Plan, error)

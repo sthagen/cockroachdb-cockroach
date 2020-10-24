@@ -18,8 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -43,11 +43,19 @@ func (p *planner) schemaExists(
 	return exists, nil
 }
 
-func (p *planner) writeSchemaDescChange(
-	ctx context.Context, desc *sqlbase.MutableSchemaDescriptor, jobDesc string,
-) error {
-	desc.MaybeIncrementVersion()
+func (p *planner) writeSchemaDesc(ctx context.Context, desc *schemadesc.Mutable) error {
+	b := p.txn.NewBatch()
+	if err := p.Descriptors().WriteDescToBatch(
+		ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(), desc, b,
+	); err != nil {
+		return err
+	}
+	return p.txn.Run(ctx, b)
+}
 
+func (p *planner) writeSchemaDescChange(
+	ctx context.Context, desc *schemadesc.Mutable, jobDesc string,
+) error {
 	job, jobExists := p.extendedEvalCtx.SchemaChangeJobCache[desc.ID]
 	if jobExists {
 		// Update it.
@@ -66,8 +74,10 @@ func (p *planner) writeSchemaDescChange(
 			Username:      p.User(),
 			DescriptorIDs: descpb.IDs{desc.ID},
 			Details: jobspb.SchemaChangeDetails{
-				DescID:        desc.ID,
-				FormatVersion: jobspb.JobResumerFormatVersion,
+				DescID: desc.ID,
+				// The version distinction for database jobs doesn't matter for schema
+				// jobs.
+				FormatVersion: jobspb.DatabaseJobFormatVersion,
 			},
 			Progress: jobspb.SchemaChangeProgress{},
 		}
@@ -78,21 +88,5 @@ func (p *planner) writeSchemaDescChange(
 		log.Infof(ctx, "queued new schema change job %d for schema %d", *newJob.ID(), desc.ID)
 	}
 
-	if err := p.Descriptors().AddUncommittedDescriptor(desc); err != nil {
-		return err
-	}
-
-	b := p.txn.NewBatch()
-	if err := catalogkv.WriteDescToBatch(
-		ctx,
-		p.extendedEvalCtx.Tracing.KVTracingEnabled(),
-		p.ExecCfg().Settings,
-		b,
-		p.ExecCfg().Codec,
-		desc.ID,
-		desc,
-	); err != nil {
-		return err
-	}
-	return p.txn.Run(ctx, b)
+	return p.writeSchemaDesc(ctx, desc)
 }

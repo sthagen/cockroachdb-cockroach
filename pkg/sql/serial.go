@@ -15,11 +15,11 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -47,11 +47,11 @@ var virtualSequenceOpts = tree.SequenceOptions{
 // parent database where it should be created.
 // The ColumnTableDef is not mutated in-place; instead a new one is returned.
 func (p *planner) processSerialInColumnDef(
-	ctx context.Context, d *tree.ColumnTableDef, tableName *TableName,
+	ctx context.Context, d *tree.ColumnTableDef, tableName *tree.TableName,
 ) (
 	*tree.ColumnTableDef,
-	*sqlbase.ImmutableDatabaseDescriptor,
-	*TableName,
+	catalog.DatabaseDescriptor,
+	*tree.TableName,
 	tree.SequenceOptions,
 	error,
 ) {
@@ -117,13 +117,13 @@ func (p *planner) processSerialInColumnDef(
 		tree.Name(tableName.Table() + "_" + string(d.Name) + "_seq"))
 
 	// The first step in the search is to prepare the seqName to fill in
-	// the catalog/schema parent. This is what ResolveUncachedDatabase does.
+	// the catalog/schema parent. This is what ResolveTargetObject does.
 	//
 	// Here and below we skip the cache because name resolution using
 	// the cache does not work (well) if the txn retries and the
 	// descriptor was written already in an early txn attempt.
 	un := seqName.ToUnresolvedObjectName()
-	dbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, un)
+	dbDesc, prefix, err := p.ResolveTargetObject(ctx, un)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -170,7 +170,7 @@ func (p *planner) processSerialInColumnDef(
 // This is currently used by bulk I/O import statements which do not
 // (yet?) support customization of the SERIAL behavior.
 func SimplifySerialInColumnDefWithRowID(
-	ctx context.Context, d *tree.ColumnTableDef, tableName *TableName,
+	ctx context.Context, d *tree.ColumnTableDef, tableName *tree.TableName,
 ) error {
 	if !d.IsSerial {
 		// Column is not SERIAL: nothing to do.
@@ -196,7 +196,7 @@ func SimplifySerialInColumnDefWithRowID(
 	return nil
 }
 
-func assertValidSerialColumnDef(d *tree.ColumnTableDef, tableName *TableName) error {
+func assertValidSerialColumnDef(d *tree.ColumnTableDef, tableName *tree.TableName) error {
 	if d.HasDefaultExpr() {
 		// SERIAL implies a new default expression, we can't have one to
 		// start with. This is the error produced by pg in such case.

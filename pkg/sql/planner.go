@@ -19,19 +19,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -56,8 +59,13 @@ type extendedEvalContext struct {
 	// tracing state should be done through the sessionDataMutator.
 	Tracing *SessionTracing
 
-	// StatusServer gives access to the Status service.
-	StatusServer serverpb.OptionalStatusServer
+	// NodesStatusServer gives access to the NodesStatus service. Unavailable to
+	// tenants.
+	NodesStatusServer serverpb.OptionalNodesStatusServer
+
+	// SQLStatusServer gives access to a subset of the serverpb.Status service
+	// that is available to both system and non-system tenants.
+	SQLStatusServer serverpb.SQLStatusServer
 
 	// MemMetrics represent the group of metrics to which execution should
 	// contribute.
@@ -175,7 +183,7 @@ type planner struct {
 
 	// cancelChecker is used by planNodes to check for cancellation of the associated
 	// query.
-	cancelChecker *sqlbase.CancelChecker
+	cancelChecker *cancelchecker.CancelChecker
 
 	// collectBundle is set when we are collecting a diagnostics bundle for a
 	// statement; it triggers saving of extra information like the plan string.
@@ -191,20 +199,20 @@ type planner struct {
 
 	// Avoid allocations by embedding commonly used objects and visitors.
 	txCtx                 transform.ExprTransformContext
-	nameResolutionVisitor sqlbase.NameResolutionVisitor
+	nameResolutionVisitor schemaexpr.NameResolutionVisitor
 	tableName             tree.TableName
 
 	// Use a common datum allocator across all the plan nodes. This separates the
 	// plan lifetime from the lifetime of returned results allowing plan nodes to
 	// be pool allocated.
-	alloc *sqlbase.DatumAlloc
+	alloc *rowenc.DatumAlloc
 
 	// optPlanningCtx stores the optimizer planning context, which contains
 	// data structures that can be reused between queries (for efficiency).
 	optPlanningCtx optPlanningCtx
 
 	// noticeSender allows the sending of notices.
-	// Do not use this object directly; use the SendClientNotice() method
+	// Do not use this object directly; use the BufferClientNotice() method
 	// instead.
 	noticeSender noticeSender
 
@@ -255,18 +263,20 @@ func newInternalPlanner(
 	ctx := logtags.AddTag(context.Background(), opName, "")
 
 	sd := &sessiondata.SessionData{
-		SearchPath:    catconstants.DefaultSearchPath,
-		User:          user,
-		Database:      "system",
-		SequenceState: sessiondata.NewSequenceState(),
-		DataConversion: sessiondata.DataConversionConfig{
-			Location: time.UTC,
+		SessionData: sessiondatapb.SessionData{
+			Database: "system",
+			User:     user,
 		},
+		SearchPath:    sessiondata.DefaultSearchPathForUser(user),
+		SequenceState: sessiondata.NewSequenceState(),
+		Location:      time.UTC,
 	}
 	// The table collection used by the internal planner does not rely on the
-	// DatabaseCache and there are no subscribers to the DatabaseCache, so we can
-	// leave it uninitialized.
-	tables := descs.NewCollection(execCfg.LeaseManager, execCfg.Settings)
+	// deprecatedDatabaseCache and there are no subscribers to the
+	// deprecatedDatabaseCache, so we can leave it uninitialized.
+	// Furthermore, we're not concerned about the efficiency of querying tables
+	// with user-defined types, hence the nil hydratedTables.
+	tables := descs.NewCollection(execCfg.Settings, execCfg.LeaseManager, nil /* hydratedTables */)
 	dataMutator := &sessionDataMutator{
 		data: sd,
 		defaults: SessionDefaults(map[string]string{
@@ -287,11 +297,11 @@ func newInternalPlanner(
 		ts = readTimestamp.GoTime()
 	}
 
-	p := &planner{execCfg: execCfg, alloc: &sqlbase.DatumAlloc{}}
+	p := &planner{execCfg: execCfg, alloc: &rowenc.DatumAlloc{}}
 
 	p.txn = txn
 	p.stmt = nil
-	p.cancelChecker = sqlbase.NewCancelChecker(ctx)
+	p.cancelChecker = cancelchecker.NewCancelChecker(ctx)
 	p.isInternalPlanner = true
 
 	p.semaCtx = tree.MakeSemaContext()
@@ -333,6 +343,17 @@ func newInternalPlanner(
 	return p, func() {
 		// Note that we capture ctx here. This is only valid as long as we create
 		// the context as explained at the top of the method.
+
+		// The collection will accumulate descriptors read during planning as well
+		// as type descriptors read during execution on the local node. Many users
+		// of the internal planner do set the `skipCache` flag on the resolver but
+		// this is not respected by type resolution underneath execution. That
+		// subtle details means that the type descriptor used by execution may be
+		// stale, but that must be okay. Correctness concerns aside, we must release
+		// the leases to ensure that we don't leak a descriptor lease.
+		p.Descriptors().ReleaseAll(ctx)
+
+		// Stop the memory monitor.
 		plannerMon.Stop(ctx)
 	}
 }
@@ -369,14 +390,14 @@ func internalExtendedEvalCtx(
 			TxnTimestamp:     txnTimestamp,
 			InternalExecutor: execCfg.InternalExecutor,
 		},
-		SessionMutator:  dataMutator,
-		VirtualSchemas:  execCfg.VirtualSchemas,
-		Tracing:         &SessionTracing{},
-		StatusServer:    execCfg.StatusServer,
-		Descs:           tables,
-		ExecCfg:         execCfg,
-		schemaAccessors: newSchemaInterface(tables, execCfg.VirtualSchemas),
-		DistSQLPlanner:  execCfg.DistSQLPlanner,
+		SessionMutator:    dataMutator,
+		VirtualSchemas:    execCfg.VirtualSchemas,
+		Tracing:           &SessionTracing{},
+		NodesStatusServer: execCfg.NodesStatusServer,
+		Descs:             tables,
+		ExecCfg:           execCfg,
+		schemaAccessors:   newSchemaInterface(tables, execCfg.VirtualSchemas),
+		DistSQLPlanner:    execCfg.DistSQLPlanner,
 	}
 }
 
@@ -484,19 +505,16 @@ func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tre
 //  of having its own logic for lookups.
 func (p *planner) LookupTableByID(
 	ctx context.Context, tableID descpb.ID,
-) (catalog.TableEntry, error) {
+) (*tabledesc.Immutable, error) {
 	if entry, err := p.getVirtualTabler().getVirtualTableEntryByID(tableID); err == nil {
-		return catalog.TableEntry{Desc: sqlbase.NewImmutableTableDescriptor(*entry.desc)}, nil
+		return entry.desc, nil
 	}
 	flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{AvoidCached: p.avoidCachedDescriptors}}
 	table, err := p.Descriptors().GetTableVersionByID(ctx, p.txn, tableID, flags)
 	if err != nil {
-		if catalog.HasAddingTableError(err) {
-			return catalog.TableEntry{IsAdding: true}, nil
-		}
-		return catalog.TableEntry{}, err
+		return nil, err
 	}
-	return catalog.TableEntry{Desc: table}, nil
+	return table, nil
 }
 
 // TypeAsString enforces (not hints) that the given expression typechecks as a

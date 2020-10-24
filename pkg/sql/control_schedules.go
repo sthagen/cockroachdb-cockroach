@@ -17,8 +17,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
 )
 
@@ -26,6 +28,17 @@ type controlSchedulesNode struct {
 	rows    planNode
 	command tree.ScheduleCommand
 	numRows int
+}
+
+func collectTelemetry(command tree.ScheduleCommand) {
+	switch command {
+	case tree.PauseSchedule:
+		telemetry.Inc(sqltelemetry.ScheduledBackupControlCounter("pause"))
+	case tree.ResumeSchedule:
+		telemetry.Inc(sqltelemetry.ScheduledBackupControlCounter("resume"))
+	case tree.DropSchedule:
+		telemetry.Inc(sqltelemetry.ScheduledBackupControlCounter("drop"))
+	}
 }
 
 // FastPathResults implements the planNodeFastPath interface.
@@ -53,7 +66,7 @@ func loadSchedule(params runParams, scheduleID tree.Datum) (*jobs.ScheduledJob, 
 	datums, cols, err := params.ExecCfg().InternalExecutor.QueryWithCols(
 		params.ctx,
 		"load-schedule",
-		params.EvalContext().Txn, sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		params.EvalContext().Txn, sessiondata.InternalExecutorOverride{User: security.RootUser},
 		fmt.Sprintf(
 			"SELECT schedule_id, schedule_expr FROM %s WHERE schedule_id = $1",
 			env.ScheduledJobsTableName(),
@@ -90,7 +103,7 @@ func deleteSchedule(params runParams, scheduleID int64) error {
 		params.ctx,
 		"delete-schedule",
 		params.EvalContext().Txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUser},
 		fmt.Sprintf(
 			"DELETE FROM %s WHERE schedule_id = $1",
 			env.ScheduledJobsTableName(),
@@ -122,7 +135,7 @@ func (n *controlSchedulesNode) startExec(params runParams) error {
 
 		switch n.command {
 		case tree.PauseSchedule:
-			schedule.Pause("operator paused")
+			schedule.Pause()
 			err = updateSchedule(params, schedule)
 		case tree.ResumeSchedule:
 			err = schedule.ScheduleNextRun()
@@ -134,6 +147,7 @@ func (n *controlSchedulesNode) startExec(params runParams) error {
 		default:
 			err = errors.AssertionFailedf("unhandled command %s", n.command)
 		}
+		collectTelemetry(n.command)
 
 		if err != nil {
 			return err

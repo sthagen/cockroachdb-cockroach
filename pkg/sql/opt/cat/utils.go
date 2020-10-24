@@ -132,7 +132,7 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 	var buf bytes.Buffer
 	for i := 0; i < tab.ColumnCount(); i++ {
 		buf.Reset()
-		formatColumn(tab.Column(i), tab.ColumnKind(i), &buf)
+		formatColumn(tab.Column(i), &buf)
 		child.Child(buf.String())
 	}
 
@@ -189,7 +189,7 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 		buf.Reset()
 
 		idxCol := idx.Column(i)
-		formatColumn(idxCol.Column, tab.ColumnKind(idxCol.Ordinal), &buf)
+		formatColumn(idxCol.Column, &buf)
 		if idxCol.Descending {
 			fmt.Fprintf(&buf, " desc")
 		}
@@ -288,7 +288,7 @@ func formatCatalogFKRef(
 	)
 }
 
-func formatColumn(col Column, kind ColumnKind, buf *bytes.Buffer) {
+func formatColumn(col *Column, buf *bytes.Buffer) {
 	fmt.Fprintf(buf, "%s %s", col.ColName(), col.DatumType())
 	if !col.IsNullable() {
 		fmt.Fprintf(buf, " not null")
@@ -302,13 +302,15 @@ func formatColumn(col Column, kind ColumnKind, buf *bytes.Buffer) {
 	if col.IsHidden() {
 		fmt.Fprintf(buf, " [hidden]")
 	}
-	switch kind {
+	switch col.Kind() {
 	case WriteOnly, DeleteOnly:
 		fmt.Fprintf(buf, " [mutation]")
 	case System:
 		fmt.Fprintf(buf, " [system]")
-	case Virtual:
-		fmt.Fprintf(buf, " [virtual]")
+	case VirtualInverted:
+		fmt.Fprintf(buf, " [virtual-inverted]")
+	case VirtualComputed:
+		fmt.Fprintf(buf, " [virtual-computed]")
 	}
 }
 
@@ -322,42 +324,4 @@ func formatFamily(family Family, buf *bytes.Buffer) {
 		buf.WriteString(string(col.ColName()))
 	}
 	buf.WriteString(")")
-}
-
-// InterleaveAncestorDescendant returns ok=true if a and b are interleaved
-// indexes and one of them is the ancestor of the other.
-// If a is an ancestor of b, aIsAncestor is true.
-// If b is an ancestor of a, aIsAncestor is false.
-func InterleaveAncestorDescendant(a, b Index) (ok bool, aIsAncestor bool) {
-	aCount := a.InterleaveAncestorCount()
-	bCount := b.InterleaveAncestorCount()
-	// If a is the ancestor of b; then:
-	//  - a has a smaller ancestor count;
-	//  - a's ancestors are a prefix of b's ancestors;
-	//  - a shows up in b's ancestor list on the position that would allow them to
-	//    share a's ancestors.
-	//
-	// For example:
-	//    x
-	//    |
-	//    y
-	//    |
-	//    a  (ancestors: x, y)
-	//    |
-	//    z
-	//    |
-	//    b  (ancestors: x, y, a, z)
-	if aCount < bCount {
-		tabID, idxID, _ := b.InterleaveAncestor(aCount)
-		if tabID == a.Table().ID() && idxID == a.ID() {
-			return true, true // a is the ancestor
-		}
-	} else if bCount < aCount {
-		tabID, idxID, _ := a.InterleaveAncestor(bCount)
-		if tabID == b.Table().ID() && idxID == b.ID() {
-			return true, false // a is not the ancestor
-		}
-	}
-
-	return false, false
 }

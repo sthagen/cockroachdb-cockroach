@@ -240,7 +240,16 @@ func (bc *baseCache) Get(key interface{}) (value interface{}, ok bool) {
 		bc.access(e)
 		return e.Value, true
 	}
-	return
+	return nil, false
+}
+
+// StealthyGet looks up a key's value from the cache but does not consider it an
+// "access" (with respect to the policy).
+func (bc *baseCache) StealthyGet(key interface{}) (value interface{}, ok bool) {
+	if e := bc.store.get(key); e != nil {
+		return e.Value, true
+	}
+	return nil, false
 }
 
 // Del removes the provided key from the cache.
@@ -455,6 +464,17 @@ func (oc *OrderedCache) Do(f func(k, v interface{}) bool) bool {
 // whether the iteration exited early.
 func (oc *OrderedCache) DoRangeEntry(f func(e *Entry) bool, from, to interface{}) bool {
 	return oc.llrb.DoRange(func(e llrb.Comparable) bool {
+		return f(e.(*Entry))
+	}, &Entry{Key: from}, &Entry{Key: to})
+}
+
+// DoRangeReverseEntry invokes f on all cache entries in the range (to, from]. from
+// should be higher than to.
+// f returns a boolean indicating the traversal is done. If f returns true, the
+// DoRangeReverseEntry loop will exit; false, it will continue.
+// DoRangeReverseEntry returns whether the iteration exited early.
+func (oc *OrderedCache) DoRangeReverseEntry(f func(e *Entry) bool, from, to interface{}) bool {
+	return oc.llrb.DoRangeReverse(func(e llrb.Comparable) bool {
 		return f(e.(*Entry))
 	}, &Entry{Key: from}, &Entry{Key: to})
 }

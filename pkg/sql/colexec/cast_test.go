@@ -20,8 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -66,7 +66,7 @@ func TestRandomizedCast(t *testing.T) {
 		}
 	}
 
-	collatedStringType := types.MakeCollatedString(types.String, *sqlbase.RandCollationLocale(rng))
+	collatedStringType := types.MakeCollatedString(types.String, *rowenc.RandCollationLocale(rng))
 	collatedStringVec := testColumnFactory.MakeColumn(collatedStringType, 1 /* n */).(coldata.DatumVec)
 	getCollatedStringsThatCanBeCastAsBools := func() []tree.Datum {
 		var res []tree.Datum
@@ -88,7 +88,7 @@ func TestRandomizedCast(t *testing.T) {
 		// getValidSet (when non-nil) is a function that returns a set of valid
 		// datums of fromTyp type that can be cast to toTyp type. The test
 		// harness will be randomly choosing a datum from this set. This
-		// function should be specified when sqlbase.RandDatum will take ages
+		// function should be specified when rowenc.RandDatum will take ages
 		// (if ever) to generate the datum that is valid for a cast.
 		getValidSet func() []tree.Datum
 		// Some types casting can fail, so retry if we generate a datum that is
@@ -133,12 +133,12 @@ func TestRandomizedCast(t *testing.T) {
 			} else {
 				// We don't allow any NULL datums to be generated, so disable
 				// this ability in the RandDatum function.
-				fromDatum = sqlbase.RandDatum(rng, c.fromTyp, false)
+				fromDatum = rowenc.RandDatum(rng, c.fromTyp, false)
 				toDatum, err = tree.PerformCast(&evalCtx, fromDatum, c.toTyp)
 				if c.retryGeneration {
 					for err != nil {
 						// If we are allowed to retry, make a new datum and cast it on error.
-						fromDatum = sqlbase.RandDatum(rng, c.fromTyp, false)
+						fromDatum = rowenc.RandDatum(rng, c.fromTyp, false)
 						toDatum, err = tree.PerformCast(&evalCtx, fromDatum, c.toTyp)
 					}
 				}

@@ -87,19 +87,7 @@ CREATE TABLE p (
     i INT,
     f FLOAT,
     s STRING,
-    b BOOL,
-    INDEX if_s (i) STORING (f, s) WHERE s = 'foo'
-)
-----
-
-exec-ddl
-CREATE TABLE q (
-    i INT,
-    s STRING,
-    b BOOL,
-    INDEX i (i),
-    INDEX i_gt_0 (i) WHERE i > 0,
-    INDEX s_eq_foo (s) WHERE s = 'foo'
+    b BOOL
 )
 ----
 
@@ -118,6 +106,10 @@ CREATE TABLE no_explicit_primary_key
 # GeneratePartialIndexScans
 # --------------------------------------------------
 
+exec-ddl
+CREATE INDEX idx ON p (i) STORING (f, s) WHERE s = 'foo'
+----
+
 # Generate a lone partial index scan when the index is covering and there are no
 # remaining filters.
 opt expect=GeneratePartialIndexScans
@@ -125,7 +117,7 @@ SELECT i FROM p WHERE s = 'foo'
 ----
 project
  ├── columns: i:1
- └── scan p@if_s,partial
+ └── scan p@idx,partial
       ├── columns: i:1 s:3!null
       └── fd: ()-->(3)
 
@@ -139,8 +131,9 @@ project
  └── select
       ├── columns: i:1 f:2 s:3!null
       ├── fd: ()-->(3)
-      ├── scan p@if_s,partial
-      │    └── columns: i:1 f:2 s:3
+      ├── scan p@idx,partial
+      │    ├── columns: i:1 f:2 s:3!null
+      │    └── fd: ()-->(3)
       └── filters
            └── (i:1 = 1) OR (f:2 = 2.0) [outer=(1,2)]
 
@@ -154,10 +147,10 @@ project
  └── index-join p
       ├── columns: s:3!null b:4
       ├── fd: ()-->(3)
-      └── scan p@if_s,partial
-           ├── columns: s:3 rowid:5!null
+      └── scan p@idx,partial
+           ├── columns: s:3!null rowid:5!null
            ├── key: (5)
-           └── fd: (5)-->(3)
+           └── fd: ()-->(3)
 
 # Generate a partial index scan inside a select inside an index-join when the
 # index is not covering and there are remaining filters that are covered by the
@@ -171,13 +164,13 @@ project
       ├── columns: i:1 f:2 s:3!null b:4
       ├── fd: ()-->(3)
       └── select
-           ├── columns: i:1 f:2 s:3 rowid:5!null
+           ├── columns: i:1 f:2 s:3!null rowid:5!null
            ├── key: (5)
-           ├── fd: (5)-->(1-3)
-           ├── scan p@if_s,partial
-           │    ├── columns: i:1 f:2 s:3 rowid:5!null
+           ├── fd: ()-->(3), (5)-->(1,2)
+           ├── scan p@idx,partial
+           │    ├── columns: i:1 f:2 s:3!null rowid:5!null
            │    ├── key: (5)
-           │    └── fd: (5)-->(1-3)
+           │    └── fd: ()-->(3), (5)-->(1,2)
            └── filters
                 └── (i:1 = 1) OR (f:2 = 2.0) [outer=(1,2)]
 
@@ -194,83 +187,89 @@ project
       ├── fd: ()-->(3,4)
       ├── index-join p
       │    ├── columns: s:3 b:4
-      │    └── scan p@if_s,partial
-      │         ├── columns: s:3 rowid:5!null
+      │    ├── fd: ()-->(3)
+      │    └── scan p@idx,partial
+      │         ├── columns: s:3!null rowid:5!null
       │         ├── key: (5)
-      │         └── fd: (5)-->(3)
+      │         └── fd: ()-->(3)
       └── filters
            └── b:4 [outer=(4), constraints=(/4: [/true - /true]; tight), fd=()-->(4)]
 
 # Generate a partial index scan inside a Select/IndexJoin/Select when the index
 # is not covering and the remaining filters are partially covered by the index.
 opt expect=GeneratePartialIndexScans
-SELECT b FROM p WHERE s = 'foo' AND i = 1 AND b
+SELECT b FROM p WHERE s = 'foo' AND f = 1 AND b
 ----
 project
  ├── columns: b:4!null
  ├── fd: ()-->(4)
  └── select
-      ├── columns: i:1!null s:3!null b:4!null
-      ├── fd: ()-->(1,3,4)
+      ├── columns: f:2!null s:3!null b:4!null
+      ├── fd: ()-->(2-4)
       ├── index-join p
-      │    ├── columns: i:1 s:3 b:4
-      │    ├── fd: ()-->(1)
+      │    ├── columns: f:2 s:3 b:4
+      │    ├── fd: ()-->(2,3)
       │    └── select
-      │         ├── columns: i:1!null s:3 rowid:5!null
+      │         ├── columns: f:2!null s:3!null rowid:5!null
       │         ├── key: (5)
-      │         ├── fd: ()-->(1), (5)-->(3)
-      │         ├── scan p@if_s,partial
-      │         │    ├── columns: i:1 s:3 rowid:5!null
+      │         ├── fd: ()-->(2,3)
+      │         ├── scan p@idx,partial
+      │         │    ├── columns: f:2 s:3!null rowid:5!null
       │         │    ├── key: (5)
-      │         │    └── fd: (5)-->(1,3)
+      │         │    └── fd: ()-->(3), (5)-->(2)
       │         └── filters
-      │              └── i:1 = 1 [outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
+      │              └── f:2 = 1.0 [outer=(2), constraints=(/2: [/1.0 - /1.0]; tight), fd=()-->(2)]
       └── filters
            └── b:4 [outer=(4), constraints=(/4: [/true - /true]; tight), fd=()-->(4)]
 
 # Generate multiple partial index scans when there are multiple partial indexes
 # that have predicates implied by the filters.
-memo expect=GeneratePartialIndexScans
-SELECT * FROM q WHERE i > 0 AND s = 'foo'
+
+exec-ddl
+CREATE INDEX idx2 ON p (s) WHERE i > 0
 ----
-memo (optimized, ~11KB, required=[presentation: i:1,s:2,b:3])
- ├── G1: (select G2 G3) (select G4 G5) (select G6 G7) (select G8 G5)
- │    └── [presentation: i:1,s:2,b:3]
- │         ├── best: (select G6 G7)
- │         └── cost: 51.34
- ├── G2: (scan q,cols=(1-3))
+
+memo expect=GeneratePartialIndexScans
+SELECT * FROM p WHERE i > 0 AND s = 'foo'
+----
+memo (optimized, ~13KB, required=[presentation: i:1,f:2,s:3,b:4])
+ ├── G1: (select G2 G3) (index-join G4 p,cols=(1-4)) (index-join G5 p,cols=(1-4)) (index-join G6 p,cols=(1-4)) (index-join G7 p,cols=(1-4))
+ │    └── [presentation: i:1,f:2,s:3,b:4]
+ │         ├── best: (index-join G4 p,cols=(1-4))
+ │         └── cost: 49.00
+ ├── G2: (scan p,cols=(1-4))
  │    └── []
- │         ├── best: (scan q,cols=(1-3))
- │         └── cost: 1070.02
- ├── G3: (filters G9 G10)
- ├── G4: (index-join G11 q,cols=(1-3))
+ │         ├── best: (scan p,cols=(1-4))
+ │         └── cost: 1094.02
+ ├── G3: (filters G8 G9)
+ ├── G4: (select G10 G11)
  │    └── []
- │         ├── best: (index-join G11 q,cols=(1-3))
- │         └── cost: 1706.69
- ├── G5: (filters G10)
- ├── G6: (index-join G12 q,cols=(1-3))
+ │         ├── best: (select G10 G11)
+ │         └── cost: 14.93
+ ├── G5: (select G12 G13)
  │    └── []
- │         ├── best: (index-join G12 q,cols=(1-3))
- │         └── cost: 51.22
- ├── G7: (filters G9)
- ├── G8: (index-join G13 q,cols=(1-3))
+ │         ├── best: (select G12 G13)
+ │         └── cost: 354.03
+ ├── G6: (scan p@idx,partial,cols=(1-3,5),constrained)
  │    └── []
- │         ├── best: (index-join G13 q,cols=(1-3))
- │         └── cost: 1706.69
- ├── G9: (gt G14 G15)
- ├── G10: (eq G16 G17)
- ├── G11: (scan q@i_gt_0,partial,cols=(1,4))
+ │         ├── best: (scan p@idx,partial,cols=(1-3,5),constrained)
+ │         └── cost: 14.09
+ ├── G7: (scan p@idx2,partial,cols=(3,5),constrained)
  │    └── []
- │         ├── best: (scan q@i_gt_0,partial,cols=(1,4))
- │         └── cost: 346.68
- ├── G12: (scan q@s_eq_foo,partial,cols=(2,4))
+ │         ├── best: (scan p@idx2,partial,cols=(3,5),constrained)
+ │         └── cost: 13.72
+ ├── G8: (gt G14 G15)
+ ├── G9: (eq G16 G17)
+ ├── G10: (scan p@idx,partial,cols=(1-3,5))
  │    └── []
- │         ├── best: (scan q@s_eq_foo,partial,cols=(2,4))
- │         └── cost: 10.41
- ├── G13: (scan q@i,cols=(1,4),constrained)
+ │         ├── best: (scan p@idx,partial,cols=(1-3,5))
+ │         └── cost: 14.81
+ ├── G11: (filters G8)
+ ├── G12: (scan p@idx2,partial,cols=(3,5))
  │    └── []
- │         ├── best: (scan q@i,cols=(1,4),constrained)
- │         └── cost: 346.68
+ │         ├── best: (scan p@idx2,partial,cols=(3,5))
+ │         └── cost: 350.68
+ ├── G13: (filters G9)
  ├── G14: (variable i)
  ├── G15: (const 0)
  ├── G16: (variable s)
@@ -278,27 +277,35 @@ memo (optimized, ~11KB, required=[presentation: i:1,s:2,b:3])
 
 # Do not generate a partial index scan when the predicate is not implied by the
 # filter.
-memo
+memo expect-not=GeneratePartialIndexScans
 SELECT i FROM p WHERE s = 'bar'
 ----
-memo (optimized, ~5KB, required=[presentation: i:1])
+memo (optimized, ~8KB, required=[presentation: i:1])
  ├── G1: (project G2 G3 i)
  │    └── [presentation: i:1]
  │         ├── best: (project G2 G3 i)
- │         └── cost: 1080.15
+ │         └── cost: 1084.15
  ├── G2: (select G4 G5)
  │    └── []
  │         ├── best: (select G4 G5)
- │         └── cost: 1080.04
+ │         └── cost: 1084.04
  ├── G3: (projections)
  ├── G4: (scan p,cols=(1,3))
  │    └── []
  │         ├── best: (scan p,cols=(1,3))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G5: (filters G6)
  ├── G6: (eq G7 G8)
  ├── G7: (variable s)
  └── G8: (const 'bar')
+
+exec-ddl
+DROP INDEX idx
+----
+
+exec-ddl
+DROP INDEX idx2
+----
 
 # --------------------------------------------------
 # GenerateConstrainedScans
@@ -321,11 +328,11 @@ memo (optimized, ~5KB, required=[presentation: k:1])
  ├── G1: (select G2 G3) (scan a,cols=(1),constrained)
  │    └── [presentation: k:1]
  │         ├── best: (scan a,cols=(1),constrained)
- │         └── cost: 1.05
+ │         └── cost: 5.05
  ├── G2: (scan a,cols=(1)) (scan a@u,cols=(1)) (scan a@v,cols=(1))
  │    └── []
  │         ├── best: (scan a,cols=(1))
- │         └── cost: 1040.02
+ │         └── cost: 1044.02
  ├── G3: (filters G4)
  ├── G4: (eq G5 G6)
  ├── G5: (variable k)
@@ -350,16 +357,16 @@ memo (optimized, ~6KB, required=[presentation: k:1])
  ├── G1: (project G2 G3 k)
  │    └── [presentation: k:1]
  │         ├── best: (project G2 G3 k)
- │         └── cost: 350.17
+ │         └── cost: 354.17
  ├── G2: (select G4 G5) (scan a@v,cols=(1,3),constrained)
  │    └── []
  │         ├── best: (scan a@v,cols=(1,3),constrained)
- │         └── cost: 346.86
+ │         └── cost: 350.86
  ├── G3: (projections)
  ├── G4: (scan a,cols=(1,3)) (scan a@u,cols=(1,3)) (scan a@v,cols=(1,3))
  │    └── []
  │         ├── best: (scan a,cols=(1,3))
- │         └── cost: 1050.02
+ │         └── cost: 1054.02
  ├── G5: (filters G6)
  ├── G6: (gt G7 G8)
  ├── G7: (variable v)
@@ -387,21 +394,21 @@ memo (optimized, ~8KB, required=[presentation: k:1])
  ├── G1: (project G2 G3 k)
  │    └── [presentation: k:1]
  │         ├── best: (project G2 G3 k)
- │         └── cost: 1.07
+ │         └── cost: 5.07
  ├── G2: (select G4 G5) (select G6 G7) (scan a@u,cols=(1,2),constrained)
  │    └── []
  │         ├── best: (scan a@u,cols=(1,2),constrained)
- │         └── cost: 1.05
+ │         └── cost: 5.05
  ├── G3: (projections)
  ├── G4: (scan a,cols=(1,2)) (scan a@u,cols=(1,2)) (scan a@v,cols=(1,2))
  │    └── []
  │         ├── best: (scan a,cols=(1,2))
- │         └── cost: 1050.02
+ │         └── cost: 1054.02
  ├── G5: (filters G8 G9)
  ├── G6: (scan a,cols=(1,2),constrained)
  │    └── []
  │         ├── best: (scan a,cols=(1,2),constrained)
- │         └── cost: 1.06
+ │         └── cost: 5.06
  ├── G7: (filters G8)
  ├── G8: (eq G10 G11)
  ├── G9: (eq G12 G13)
@@ -433,21 +440,21 @@ memo (optimized, ~8KB, required=[presentation: k:1])
  ├── G1: (project G2 G3 k)
  │    └── [presentation: k:1]
  │         ├── best: (project G2 G3 k)
- │         └── cost: 1.07
+ │         └── cost: 5.07
  ├── G2: (select G4 G5) (select G6 G7) (scan a@u,cols=(1,2),constrained)
  │    └── []
  │         ├── best: (scan a@u,cols=(1,2),constrained)
- │         └── cost: 1.05
+ │         └── cost: 5.05
  ├── G3: (projections)
  ├── G4: (scan a,cols=(1,2)) (scan a@u,cols=(1,2)) (scan a@v,cols=(1,2))
  │    └── []
  │         ├── best: (scan a,cols=(1,2))
- │         └── cost: 1050.02
+ │         └── cost: 1054.02
  ├── G5: (filters G8 G9)
  ├── G6: (scan a,cols=(1,2),constrained)
  │    └── []
  │         ├── best: (scan a,cols=(1,2),constrained)
- │         └── cost: 1.06
+ │         └── cost: 5.06
  ├── G7: (filters G8)
  ├── G8: (eq G10 G11)
  ├── G9: (eq G12 G13)
@@ -485,26 +492,26 @@ memo (optimized, ~9KB, required=[presentation: k:1])
  ├── G1: (project G2 G3 k)
  │    └── [presentation: k:1]
  │         ├── best: (project G2 G3 k)
- │         └── cost: 1.12
+ │         └── cost: 5.12
  ├── G2: (select G4 G5) (select G6 G7) (select G8 G9)
  │    └── []
  │         ├── best: (select G8 G9)
- │         └── cost: 1.10
+ │         └── cost: 5.10
  ├── G3: (projections)
  ├── G4: (scan a,cols=(1-3)) (scan a@u,cols=(1-3)) (scan a@v,cols=(1-3))
  │    └── []
  │         ├── best: (scan a,cols=(1-3))
- │         └── cost: 1060.02
+ │         └── cost: 1064.02
  ├── G5: (filters G10 G11)
  ├── G6: (scan a@u,cols=(1-3),constrained)
  │    └── []
  │         ├── best: (scan a@u,cols=(1-3),constrained)
- │         └── cost: 10.61
+ │         └── cost: 14.61
  ├── G7: (filters G11)
  ├── G8: (scan a@v,cols=(1-3),constrained)
  │    └── []
  │         ├── best: (scan a@v,cols=(1-3),constrained)
- │         └── cost: 1.07
+ │         └── cost: 5.07
  ├── G9: (filters G10)
  ├── G10: (eq G12 G13)
  ├── G11: (eq G14 G15)
@@ -577,16 +584,16 @@ memo (optimized, ~6KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G1: (select G2 G3) (index-join G4 b,cols=(1-4))
  │    └── [presentation: k:1,u:2,v:3,j:4]
  │         ├── best: (index-join G4 b,cols=(1-4))
- │         └── cost: 51.32
+ │         └── cost: 75.12
  ├── G2: (scan b,cols=(1-4))
  │    └── []
  │         ├── best: (scan b,cols=(1-4))
- │         └── cost: 1080.02
+ │         └── cost: 1084.02
  ├── G3: (filters G5)
  ├── G4: (scan b@v,cols=(1,3),constrained)
  │    └── []
  │         ├── best: (scan b@v,cols=(1,3),constrained)
- │         └── cost: 10.41
+ │         └── cost: 14.41
  ├── G5: (range G6)
  ├── G6: (and G7 G8)
  ├── G7: (ge G9 G10)
@@ -639,27 +646,27 @@ memo (optimized, ~8KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G1: (select G2 G3) (select G4 G5) (index-join G6 b,cols=(1-4))
  │    └── [presentation: k:1,u:2,v:3,j:4]
  │         ├── best: (index-join G6 b,cols=(1-4))
- │         └── cost: 24.17
+ │         └── cost: 47.19
  ├── G2: (scan b,cols=(1-4))
  │    └── []
  │         ├── best: (scan b,cols=(1-4))
- │         └── cost: 1080.02
+ │         └── cost: 1084.02
  ├── G3: (filters G7 G8)
  ├── G4: (scan b,cols=(1-4),constrained)
  │    └── []
  │         ├── best: (scan b,cols=(1-4),constrained)
- │         └── cost: 360.01
+ │         └── cost: 364.01
  ├── G5: (filters G7)
  ├── G6: (select G9 G10)
  │    └── []
  │         ├── best: (select G9 G10)
- │         └── cost: 10.53
+ │         └── cost: 14.53
  ├── G7: (range G11)
  ├── G8: (gt G12 G13)
  ├── G9: (scan b@v,cols=(1,3),constrained)
  │    └── []
  │         ├── best: (scan b@v,cols=(1,3),constrained)
- │         └── cost: 10.41
+ │         └── cost: 14.41
  ├── G10: (filters G8)
  ├── G11: (and G14 G15)
  ├── G12: (variable k)
@@ -737,23 +744,23 @@ memo (optimized, ~7KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G1: (select G2 G3) (select G4 G5)
  │    └── [presentation: k:1,u:2,v:3,j:4]
  │         ├── best: (select G4 G5)
- │         └── cost: 51.44
+ │         └── cost: 75.24
  ├── G2: (scan b,cols=(1-4))
  │    └── []
  │         ├── best: (scan b,cols=(1-4))
- │         └── cost: 1080.02
+ │         └── cost: 1084.02
  ├── G3: (filters G6 G7)
  ├── G4: (index-join G8 b,cols=(1-4))
  │    └── []
  │         ├── best: (index-join G8 b,cols=(1-4))
- │         └── cost: 51.32
+ │         └── cost: 75.12
  ├── G5: (filters G7)
  ├── G6: (range G9)
  ├── G7: (eq G10 G11)
  ├── G8: (scan b@v,cols=(1,3),constrained)
  │    └── []
  │         ├── best: (scan b@v,cols=(1,3),constrained)
- │         └── cost: 10.41
+ │         └── cost: 14.41
  ├── G9: (and G12 G13)
  ├── G10: (plus G14 G15)
  ├── G11: (const 1)
@@ -801,21 +808,21 @@ memo (optimized, ~9KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G1: (select G2 G3) (select G4 G5) (select G6 G7)
  │    └── [presentation: k:1,u:2,v:3,j:4]
  │         ├── best: (select G6 G7)
- │         └── cost: 24.23
+ │         └── cost: 34.83
  ├── G2: (scan b,cols=(1-4))
  │    └── []
  │         ├── best: (scan b,cols=(1-4))
- │         └── cost: 1080.02
+ │         └── cost: 1084.02
  ├── G3: (filters G8 G9 G10)
  ├── G4: (scan b,cols=(1-4),constrained)
  │    └── []
  │         ├── best: (scan b,cols=(1-4),constrained)
- │         └── cost: 360.01
+ │         └── cost: 364.01
  ├── G5: (filters G8 G9)
  ├── G6: (index-join G11 b,cols=(1-4))
  │    └── []
  │         ├── best: (index-join G11 b,cols=(1-4))
- │         └── cost: 24.17
+ │         └── cost: 34.77
  ├── G7: (filters G9)
  ├── G8: (range G12)
  ├── G9: (eq G13 G14)
@@ -823,7 +830,7 @@ memo (optimized, ~9KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G11: (select G17 G18)
  │    └── []
  │         ├── best: (select G17 G18)
- │         └── cost: 10.53
+ │         └── cost: 14.53
  ├── G12: (and G19 G20)
  ├── G13: (plus G15 G21)
  ├── G14: (const 1)
@@ -832,7 +839,7 @@ memo (optimized, ~9KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G17: (scan b@v,cols=(1,3),constrained)
  │    └── []
  │         ├── best: (scan b@v,cols=(1,3),constrained)
- │         └── cost: 10.41
+ │         └── cost: 14.41
  ├── G18: (filters G10)
  ├── G19: (ge G22 G14)
  ├── G20: (le G22 G23)
@@ -869,22 +876,22 @@ memo (optimized, ~7KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G1: (select G2 G3) (select G4 G3)
  │    └── [presentation: k:1,u:2,v:3,j:4]
  │         ├── best: (select G4 G3)
- │         └── cost: 411.25
+ │         └── cost: 573.65
  ├── G2: (scan b,cols=(1-4))
  │    └── []
  │         ├── best: (scan b,cols=(1-4))
- │         └── cost: 1080.02
+ │         └── cost: 1084.02
  ├── G3: (filters G5 G6)
  ├── G4: (index-join G7 b,cols=(1-4))
  │    └── []
  │         ├── best: (index-join G7 b,cols=(1-4))
- │         └── cost: 410.42
+ │         └── cost: 572.82
  ├── G5: (gt G8 G9)
  ├── G6: (lt G8 G10)
  ├── G7: (scan b@u,cols=(1,2),constrained)
  │    └── []
  │         ├── best: (scan b@u,cols=(1,2),constrained)
- │         └── cost: 83.21
+ │         └── cost: 87.21
  ├── G8: (tuple G11)
  ├── G9: (tuple G12)
  ├── G10: (tuple G13)
@@ -958,10 +965,663 @@ select
  └── filters
       └── (k:1 + u:2) = 1 [outer=(1,2), immutable]
 
+exec-ddl
+CREATE TABLE kifs
+(
+    k INT PRIMARY KEY,
+    i INT,
+    f FLOAT,
+    s STRING,
+    j JSON,
+    INDEX s_idx (s) STORING (i, f),
+    INDEX si_idx (s DESC, i DESC) STORING (j)
+)
+----
+
+# Constrain the kifs@si_idx so that an index join is generated.
+exploretrace rule=GenerateConstrainedScans
+SELECT s, i, f FROM kifs WHERE s='foo' ORDER BY s, k, i
+----
+----
+================================================================================
+GenerateConstrainedScans
+================================================================================
+Source expression:
+  select
+   ├── columns: s:4!null i:2 f:3  [hidden: k:1!null]
+   ├── key: (1)
+   ├── fd: ()-->(4), (1)-->(2,3)
+   ├── ordering: +1 opt(4) [actual: +1]
+   ├── scan kifs@s_idx
+   │    ├── columns: k:1!null i:2 f:3 s:4
+   │    ├── key: (1)
+   │    ├── fd: (1)-->(2-4)
+   │    └── ordering: +1 opt(4) [actual: +4,+1]
+   └── filters
+        └── s:4 = 'foo' [outer=(4), constraints=(/4: [/'foo' - /'foo']; tight), fd=()-->(4)]
+
+New expression 1 of 2:
+  scan kifs@s_idx
+   ├── columns: s:4!null i:2 f:3  [hidden: k:1!null]
+   ├── constraint: /4/1: [/'foo' - /'foo']
+   ├── key: (1)
+   ├── fd: ()-->(4), (1)-->(2,3)
+   └── ordering: +1 opt(4) [actual: +1]
+
+New expression 2 of 2:
+  sort
+   ├── columns: s:4!null i:2 f:3  [hidden: k:1!null]
+   ├── key: (1)
+   ├── fd: ()-->(4), (1)-->(2,3)
+   ├── ordering: +1 opt(4) [actual: +1]
+   └── index-join kifs
+        ├── columns: k:1!null i:2 f:3 s:4!null
+        ├── key: (1)
+        ├── fd: ()-->(4), (1)-->(2,3)
+        └── scan kifs@si_idx
+             ├── columns: k:1!null i:2 s:4!null
+             ├── constraint: /-4/-2/1: [/'foo' - /'foo']
+             ├── key: (1)
+             └── fd: ()-->(4), (1)-->(2)
+----
+----
+
+memo
+SELECT s, i, f FROM kifs WHERE s='foo' ORDER BY s DESC, i
+----
+memo (optimized, ~6KB, required=[presentation: s:4,i:2,f:3] [ordering: +2 opt(4)])
+ ├── G1: (select G2 G3) (scan kifs@s_idx,cols=(2-4),constrained) (index-join G4 kifs,cols=(2-4))
+ │    ├── [presentation: s:4,i:2,f:3] [ordering: +2 opt(4)]
+ │    │    ├── best: (sort G1)
+ │    │    └── cost: 15.58
+ │    └── []
+ │         ├── best: (scan kifs@s_idx,cols=(2-4),constrained)
+ │         └── cost: 14.71
+ ├── G2: (scan kifs,cols=(2-4)) (scan kifs@s_idx,cols=(2-4))
+ │    ├── [ordering: +2 opt(4)]
+ │    │    ├── best: (sort G2)
+ │    │    └── cost: 1293.35
+ │    └── []
+ │         ├── best: (scan kifs@s_idx,cols=(2-4))
+ │         └── cost: 1074.02
+ ├── G3: (filters G5)
+ ├── G4: (scan kifs@si_idx,cols=(1,2,4),constrained)
+ │    ├── [ordering: +2 opt(4)]
+ │    │    ├── best: (scan kifs@si_idx,rev,cols=(1,2,4),constrained)
+ │    │    └── cost: 15.04
+ │    └── []
+ │         ├── best: (scan kifs@si_idx,cols=(1,2,4),constrained)
+ │         └── cost: 14.71
+ ├── G5: (eq G6 G7)
+ ├── G6: (variable s)
+ └── G7: (const 'foo')
+
+memo
+SELECT j FROM kifs WHERE s = 'foo'
+----
+memo (optimized, ~7KB, required=[presentation: j:5])
+ ├── G1: (project G2 G3 j)
+ │    └── [presentation: j:5]
+ │         ├── best: (project G2 G3 j)
+ │         └── cost: 14.72
+ ├── G2: (select G4 G5) (index-join G6 kifs,cols=(4,5)) (scan kifs@si_idx,cols=(4,5),constrained)
+ │    └── []
+ │         ├── best: (scan kifs@si_idx,cols=(4,5),constrained)
+ │         └── cost: 14.61
+ ├── G3: (projections)
+ ├── G4: (scan kifs,cols=(4,5)) (scan kifs@si_idx,cols=(4,5))
+ │    └── []
+ │         ├── best: (scan kifs@si_idx,cols=(4,5))
+ │         └── cost: 1064.02
+ ├── G5: (filters G7)
+ ├── G6: (scan kifs@s_idx,cols=(1,4),constrained)
+ │    └── []
+ │         ├── best: (scan kifs@s_idx,cols=(1,4),constrained)
+ │         └── cost: 14.61
+ ├── G7: (eq G8 G9)
+ ├── G8: (variable s)
+ └── G9: (const 'foo')
+
+memo
+SELECT i, k FROM kifs WHERE s >= 'foo'
+----
+memo (optimized, ~6KB, required=[presentation: i:2,k:1])
+ ├── G1: (project G2 G3 k i)
+ │    └── [presentation: i:2,k:1]
+ │         ├── best: (project G2 G3 k i)
+ │         └── cost: 364.02
+ ├── G2: (select G4 G5) (scan kifs@s_idx,cols=(1,2,4),constrained) (scan kifs@si_idx,cols=(1,2,4),constrained)
+ │    └── []
+ │         ├── best: (scan kifs@s_idx,cols=(1,2,4),constrained)
+ │         └── cost: 360.68
+ ├── G3: (projections)
+ ├── G4: (scan kifs,cols=(1,2,4)) (scan kifs@s_idx,cols=(1,2,4)) (scan kifs@si_idx,cols=(1,2,4))
+ │    └── []
+ │         ├── best: (scan kifs@s_idx,cols=(1,2,4))
+ │         └── cost: 1074.02
+ ├── G5: (filters G6)
+ ├── G6: (ge G7 G8)
+ ├── G7: (variable s)
+ └── G8: (const 'foo')
+
+# Collated strings are treated properly.
+exec-ddl
+CREATE TABLE x (s STRING COLLATE en_u_ks_level1 PRIMARY KEY)
+----
+
+opt
+SELECT s FROM x WHERE s < 'hello' COLLATE en_u_ks_level1
+----
+scan x
+ ├── columns: s:1!null
+ ├── constraint: /1: [ - /'hello' COLLATE en_u_ks_level1)
+ └── key: (1)
+
+opt
+SELECT s FROM x WHERE s = 'hello' COLLATE en_u_ks_level1
+----
+scan x
+ ├── columns: s:1!null
+ ├── constraint: /1: [/'hello' COLLATE en_u_ks_level1 - /'hello' COLLATE en_u_ks_level1]
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ └── fd: ()-->(1)
+
+# Can't generate spans for other collations.
+opt
+SELECT s FROM x WHERE s COLLATE en = 'hello' COLLATE en
+----
+select
+ ├── columns: s:1!null
+ ├── key: (1)
+ ├── scan x
+ │    ├── columns: s:1!null
+ │    └── key: (1)
+ └── filters
+      └── s:1 COLLATE en = 'hello' COLLATE en [outer=(1)]
+
+# Realistic example where using constraints as filters help.
+# An even more realistic example would have a creation timestamp instead of a
+# seq_num integer, but that makes the plans much more cluttered.
+exec-ddl
+CREATE TABLE "orders" (
+  region STRING NOT NULL,
+  id INT NOT NULL,
+  total DECIMAL NOT NULL,
+  seq_num INT NOT NULL,
+  PRIMARY KEY (region, id),
+  UNIQUE INDEX orders_by_seq_num (region, seq_num, id) STORING (total),
+  CHECK (region IN ('us-east1', 'us-west1', 'europe-west2'))
+)
+----
+
+exec-ddl
+ALTER TABLE "orders" INJECT STATISTICS '[
+  {
+    "columns": ["region"],
+    "distinct_count": 3,
+    "null_count": 0,
+    "row_count": 100,
+    "created_at": "2018-01-01 1:00:00.00000+00:00"
+  },
+  {
+    "columns": ["id"],
+    "distinct_count": 100,
+    "null_count": 0,
+    "row_count": 100,
+    "created_at": "2018-01-01 1:00:00.00000+00:00"
+  },
+  {
+    "columns": ["total"],
+    "distinct_count": 100,
+    "null_count": 0,
+    "row_count": 100,
+    "created_at": "2018-01-01 1:00:00.00000+00:00"
+  },
+  {
+    "columns": ["seq_num"],
+    "distinct_count": 50,
+    "null_count": 0,
+    "row_count": 100,
+    "created_at": "2018-01-01 1:00:00.00000+00:00"
+  }
+]'
+----
+
+opt
+SELECT sum(total) FROM orders WHERE seq_num >= 10 AND seq_num < 20
+----
+scalar-group-by
+ ├── columns: sum:6
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(6)
+ ├── scan orders@orders_by_seq_num
+ │    ├── columns: total:3!null seq_num:4!null
+ │    └── constraint: /1/4/2
+ │         ├── [/'europe-west2'/10 - /'europe-west2'/19]
+ │         ├── [/'us-east1'/10 - /'us-east1'/19]
+ │         └── [/'us-west1'/10 - /'us-west1'/19]
+ └── aggregations
+      └── sum [as=sum:6, outer=(3)]
+           └── total:3
+
+exec-ddl
+CREATE TABLE xyz (
+  x INT PRIMARY KEY,
+  y INT NOT NULL,
+  z STRING NOT NULL,
+  CHECK (x < 10 AND x > 1),
+  CHECK (y < 10 AND y > 1),
+  CHECK (z in ('first', 'second')),
+  INDEX secondary (y, x),
+  INDEX tertiary (z, y, x))
+----
+
+opt
+SELECT x, y  FROM xyz WHERE x > 5
+----
+select
+ ├── columns: x:1!null y:2!null
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── scan xyz@tertiary
+ │    ├── columns: x:1!null y:2!null
+ │    ├── constraint: /3/2/1
+ │    │    ├── [/'first'/2/6 - /'first'/9/9]
+ │    │    └── [/'second'/2/6 - /'second'/9/9]
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2)
+ └── filters
+      └── x:1 > 5 [outer=(1), constraints=(/1: [/6 - ]; tight)]
+
+# TODO(ridwanmsharif): Confirm if this makes sense. I would've expected that the primary index
+#  would be used here. But it isn't the plan being picked. Curious.
+opt
+SELECT * FROM xyz WHERE x > 5
+----
+select
+ ├── columns: x:1!null y:2!null z:3!null
+ ├── key: (1)
+ ├── fd: (1)-->(2,3)
+ ├── scan xyz@tertiary
+ │    ├── columns: x:1!null y:2!null z:3!null
+ │    ├── constraint: /3/2/1
+ │    │    ├── [/'first'/2/6 - /'first'/9/9]
+ │    │    └── [/'second'/2/6 - /'second'/9/9]
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2,3)
+ └── filters
+      └── x:1 > 5 [outer=(1), constraints=(/1: [/6 - ]; tight)]
+
+# Check constraint used only for the non nullable column. Constraints on x are ignored.
+exec-ddl
+CREATE TABLE xy (
+  x INT,
+  y INT NOT NULL,
+  CHECK (x < 10 AND x > 1),
+  CHECK (y < 10 AND y > 1),
+  INDEX secondary (y, x))
+----
+
+opt
+SELECT x, y FROM xy WHERE x > 5
+----
+select
+ ├── columns: x:1!null y:2!null
+ ├── scan xy@secondary
+ │    ├── columns: x:1 y:2!null
+ │    └── constraint: /2/1/3: [/2/6 - /9]
+ └── filters
+      └── x:1 > 5 [outer=(1), constraints=(/1: [/6 - ]; tight)]
+
+# Check constraints that can evaluate to NULL are ignored.
+exec-ddl
+CREATE TABLE null_constraint (
+  y INT NOT NULL,
+  CHECK (y IN (1, 2, NULL)),
+  INDEX index_1 (y))
+----
+
+opt
+SELECT y FROM null_constraint WHERE y > 0
+----
+scan null_constraint@index_1
+ ├── columns: y:1!null
+ └── constraint: /1/2: [/1 - ]
+
+exec-ddl
+CREATE TABLE null_constraint_2 (
+  y INT NOT NULL,
+  CHECK ((y IN (1, 2, NULL)) AND (y > 10)),
+  CHECK (y < 15),
+  INDEX index_1 (y))
+----
+
+opt
+SELECT y FROM null_constraint_2 WHERE y > 0
+----
+scan null_constraint_2@index_1
+ ├── columns: y:1!null
+ └── constraint: /1/2: [/1 - /14]
+
+# Unvalidated constraints are ignored.
+exec-ddl
+CREATE TABLE check_constraint_validity (
+ a int NOT NULL,
+ INDEX secondary (a),
+ CONSTRAINT "check:unvalidated" CHECK (a < 10),
+ CONSTRAINT "check:validated" CHECK (a < 20))
+----
+
+opt
+SELECT * FROM check_constraint_validity WHERE a > 6
+----
+scan check_constraint_validity@secondary
+ ├── columns: a:1!null
+ └── constraint: /1/2: [/7 - /19]
+
+# Test that we can constrain indexes using the results of now().
+exec-ddl
+CREATE TABLE with_time_index (k INT PRIMARY KEY, time TIMESTAMP, INDEX(time))
+----
+
+opt
+SELECT * FROM with_time_index WHERE time > now() - INTERVAL '1 hour'
+----
+scan with_time_index@secondary
+ ├── columns: k:1!null time:2!null
+ ├── constraint: /2/1: [/'2017-05-10 12:00:00.000001' - ]
+ ├── key: (1)
+ └── fd: (1)-->(2)
+
+opt
+SELECT * FROM with_time_index WHERE time >= 'today'
+----
+scan with_time_index@secondary
+ ├── columns: k:1!null time:2!null
+ ├── constraint: /2/1: [/'2017-05-10 00:00:00' - ]
+ ├── key: (1)
+ └── fd: (1)-->(2)
+
+# Constrained partial index scan.
+
+exec-ddl
+CREATE INDEX idx ON p (i) STORING (f, s) WHERE s = 'foo'
+----
+
+opt
+SELECT i FROM p WHERE s = 'foo' AND i > 5 AND i < 10
+----
+project
+ ├── columns: i:1!null
+ └── scan p@idx,partial
+      ├── columns: i:1!null s:3!null
+      ├── constraint: /1/5: [/6 - /9]
+      └── fd: ()-->(3)
+
+exec-ddl
+DROP INDEX idx
+----
+
+# Constrained partial index scan with indexed column in predicate.
+
+exec-ddl
+CREATE INDEX idx ON p (i) WHERE i > 0
+----
+
+opt
+SELECT i FROM p WHERE i > 10 AND i < 20
+----
+scan p@idx,partial
+ ├── columns: i:1!null
+ └── constraint: /1/5: [/11 - /19]
+
+exec-ddl
+DROP INDEX idx
+----
+
+# Constrained partial index scan with index-join.
+
+exec-ddl
+CREATE INDEX idx ON p (i) WHERE s = 'foo'
+----
+
+opt
+SELECT * FROM p WHERE s = 'foo' AND i > 5 AND i < 10
+----
+index-join p
+ ├── columns: i:1!null f:2 s:3!null b:4
+ ├── fd: ()-->(3)
+ └── scan p@idx,partial
+      ├── columns: i:1!null rowid:5!null
+      ├── constraint: /1/5: [/6 - /9]
+      ├── key: (5)
+      └── fd: (5)-->(1)
+
+exec-ddl
+DROP INDEX idx
+----
+
+# Constrained partial index scan with additional filter.
+
+exec-ddl
+CREATE INDEX idx ON p (i) WHERE i > 0
+----
+
+opt
+SELECT i FROM p WHERE i > 10 AND i < 20 AND b
+----
+project
+ ├── columns: i:1!null
+ └── select
+      ├── columns: i:1!null b:4!null
+      ├── fd: ()-->(4)
+      ├── index-join p
+      │    ├── columns: i:1 b:4
+      │    └── scan p@idx,partial
+      │         ├── columns: i:1!null rowid:5!null
+      │         ├── constraint: /1/5: [/11 - /19]
+      │         ├── key: (5)
+      │         └── fd: (5)-->(1)
+      └── filters
+           └── b:4 [outer=(4), constraints=(/4: [/true - /true]; tight), fd=()-->(4)]
+
+exec-ddl
+DROP INDEX idx
+----
+
+# Constrained partial index scan with additional filters before and after an
+# index-join.
+
+exec-ddl
+CREATE INDEX idx ON p (i) STORING (s) where i > 0
+----
+
+opt
+SELECT * FROM p WHERE i > 10 AND i < 20 AND s = 'bar' AND b
+----
+select
+ ├── columns: i:1!null f:2 s:3!null b:4!null
+ ├── fd: ()-->(3,4)
+ ├── index-join p
+ │    ├── columns: i:1 f:2 s:3 b:4
+ │    ├── fd: ()-->(3)
+ │    └── select
+ │         ├── columns: i:1!null s:3!null rowid:5!null
+ │         ├── key: (5)
+ │         ├── fd: ()-->(3), (5)-->(1)
+ │         ├── scan p@idx,partial
+ │         │    ├── columns: i:1!null s:3 rowid:5!null
+ │         │    ├── constraint: /1/5: [/11 - /19]
+ │         │    ├── key: (5)
+ │         │    └── fd: (5)-->(1,3)
+ │         └── filters
+ │              └── s:3 = 'bar' [outer=(3), constraints=(/3: [/'bar' - /'bar']; tight), fd=()-->(3)]
+ └── filters
+      └── b:4 [outer=(4), constraints=(/4: [/true - /true]; tight), fd=()-->(4)]
+
+exec-ddl
+DROP INDEX idx
+----
+
+# Generate multiple partial index scans in the memo when the filter implies
+# multiple partial index predicates.
+
+exec-ddl
+CREATE INDEX idx ON p (s) WHERE i > 0
+----
+
+exec-ddl
+CREATE INDEX idx2 ON p (i) WHERE s = 'foo'
+----
+
+memo
+SELECT i FROM p WHERE i = 3 AND s = 'foo'
+----
+memo (optimized, ~17KB, required=[presentation: i:1])
+ ├── G1: (project G2 G3 i) (project G4 G3 i) (project G5 G3 i)
+ │    └── [presentation: i:1]
+ │         ├── best: (project G5 G3 i)
+ │         └── cost: 14.33
+ ├── G2: (select G6 G7) (select G8 G9) (index-join G4 p,cols=(1,3)) (select G10 G9) (index-join G5 p,cols=(1,3))
+ │    └── []
+ │         ├── best: (index-join G4 p,cols=(1,3))
+ │         └── cost: 21.05
+ ├── G3: (projections)
+ ├── G4: (select G11 G9)
+ │    └── []
+ │         ├── best: (select G11 G9)
+ │         └── cost: 14.53
+ ├── G5: (scan p@idx2,partial,cols=(1,5),constrained)
+ │    └── []
+ │         ├── best: (scan p@idx2,partial,cols=(1,5),constrained)
+ │         └── cost: 14.31
+ ├── G6: (scan p,cols=(1,3))
+ │    └── []
+ │         ├── best: (scan p,cols=(1,3))
+ │         └── cost: 1074.02
+ ├── G7: (filters G12 G13)
+ ├── G8: (index-join G14 p,cols=(1,3))
+ │    └── []
+ │         ├── best: (index-join G14 p,cols=(1,3))
+ │         └── cost: 374.63
+ ├── G9: (filters G12)
+ ├── G10: (index-join G15 p,cols=(1,3))
+ │    └── []
+ │         ├── best: (index-join G15 p,cols=(1,3))
+ │         └── cost: 70.38
+ ├── G11: (scan p@idx2,partial,cols=(1,5))
+ │    └── []
+ │         ├── best: (scan p@idx2,partial,cols=(1,5))
+ │         └── cost: 14.41
+ ├── G12: (eq G16 G17)
+ ├── G13: (eq G18 G19)
+ ├── G14: (select G20 G21)
+ │    └── []
+ │         ├── best: (select G20 G21)
+ │         └── cost: 354.03
+ ├── G15: (scan p@idx,partial,cols=(3,5),constrained)
+ │    └── []
+ │         ├── best: (scan p@idx,partial,cols=(3,5),constrained)
+ │         └── cost: 13.72
+ ├── G16: (variable i)
+ ├── G17: (const 3)
+ ├── G18: (variable s)
+ ├── G19: (const 'foo')
+ ├── G20: (scan p@idx,partial,cols=(3,5))
+ │    └── []
+ │         ├── best: (scan p@idx,partial,cols=(3,5))
+ │         └── cost: 350.68
+ └── G21: (filters G13)
+
+exec-ddl
+DROP INDEX idx
+----
+
+exec-ddl
+DROP INDEX idx2
+----
+
+# Do not use partial indexes when the predicate is not implied by the filter.
+
+exec-ddl
+CREATE INDEX idx ON p (i) WHERE s = 'foo'
+----
+
+memo expect-not=GenerateConstrainedScans
+SELECT i FROM p WHERE s = 'bar' AND i = 5
+----
+memo (optimized, ~7KB, required=[presentation: i:1])
+ ├── G1: (project G2 G3 i)
+ │    └── [presentation: i:1]
+ │         ├── best: (project G2 G3 i)
+ │         └── cost: 1084.07
+ ├── G2: (select G4 G5)
+ │    └── []
+ │         ├── best: (select G4 G5)
+ │         └── cost: 1084.05
+ ├── G3: (projections)
+ ├── G4: (scan p,cols=(1,3))
+ │    └── []
+ │         ├── best: (scan p,cols=(1,3))
+ │         └── cost: 1074.02
+ ├── G5: (filters G6 G7)
+ ├── G6: (eq G8 G9)
+ ├── G7: (eq G10 G11)
+ ├── G8: (variable s)
+ ├── G9: (const 'bar')
+ ├── G10: (variable i)
+ └── G11: (const 5)
+
+exec-ddl
+DROP INDEX idx
+----
+
+# Regression test for #55387. GenerateConstrainedScans should not reduce the
+# input filters when proving partial index implication.
+
+exec-ddl
+CREATE TABLE t55387 (
+    k INT PRIMARY KEY,
+    a INT,
+    b INT,
+    INDEX (a) WHERE a > 1,
+    INDEX (b) WHERE b > 2
+)
+----
+
+opt
+SELECT k FROM t55387 WHERE a > 1 AND b > 3
+----
+project
+ ├── columns: k:1!null
+ ├── key: (1)
+ └── select
+      ├── columns: k:1!null a:2!null b:3!null
+      ├── key: (1)
+      ├── fd: (1)-->(2,3)
+      ├── index-join t55387
+      │    ├── columns: k:1!null a:2 b:3
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(2,3)
+      │    └── select
+      │         ├── columns: k:1!null b:3!null
+      │         ├── key: (1)
+      │         ├── fd: (1)-->(3)
+      │         ├── scan t55387@secondary,partial
+      │         │    ├── columns: k:1!null b:3!null
+      │         │    ├── key: (1)
+      │         │    └── fd: (1)-->(3)
+      │         └── filters
+      │              └── b:3 > 3 [outer=(3), constraints=(/3: [/4 - ]; tight)]
+      └── filters
+           └── a:2 > 1 [outer=(2), constraints=(/2: [/2 - ]; tight)]
+
 # --------------------------------------------------
 # GenerateInvertedIndexScans
 # --------------------------------------------------
-# TODO(justin): these can be serviced without an index join.
+
 # Query only the primary key with no remaining filter.
 opt
 SELECT k FROM b WHERE j @> '{"a": "b"}'
@@ -970,66 +1630,36 @@ project
  ├── columns: k:1!null
  ├── immutable
  ├── key: (1)
- └── index-join b
-      ├── columns: k:1!null j:4
-      ├── immutable
-      ├── key: (1)
-      ├── fd: (1)-->(4)
-      └── scan b@inv_idx
-           ├── columns: k:1!null
-           ├── constraint: /4/1: [/'{"a": "b"}' - /'{"a": "b"}']
-           └── key: (1)
+ └── scan b@inv_idx
+      ├── columns: k:1!null
+      ├── constraint: /4/1: [/'{"a": "b"}' - /'{"a": "b"}']
+      └── key: (1)
 
 memo
 SELECT k FROM b WHERE j @> '{"a": "b"}'
 ----
-memo (optimized, ~6KB, required=[presentation: k:1])
- ├── G1: (project G2 G3 k)
+memo (optimized, ~7KB, required=[presentation: k:1])
+ ├── G1: (project G2 G3 k) (project G4 G3 k)
  │    └── [presentation: k:1]
- │         ├── best: (project G2 G3 k)
- │         └── cost: 567.81
- ├── G2: (select G4 G5) (index-join G6 b,cols=(1,4))
+ │         ├── best: (project G4 G3 k)
+ │         └── cost: 118.42
+ ├── G2: (select G5 G6) (index-join G4 b,cols=(1,4))
  │    └── []
- │         ├── best: (index-join G6 b,cols=(1,4))
- │         └── cost: 566.69
+ │         ├── best: (index-join G4 b,cols=(1,4))
+ │         └── cost: 783.92
  ├── G3: (projections)
- ├── G4: (scan b,cols=(1,4))
- │    └── []
- │         ├── best: (scan b,cols=(1,4))
- │         └── cost: 1060.02
- ├── G5: (filters G7)
- ├── G6: (scan b@inv_idx,cols=(1),constrained)
+ ├── G4: (scan b@inv_idx,cols=(1),constrained)
  │    └── []
  │         ├── best: (scan b@inv_idx,cols=(1),constrained)
- │         └── cost: 114.45
+ │         └── cost: 117.31
+ ├── G5: (scan b,cols=(1,4))
+ │    └── []
+ │         ├── best: (scan b,cols=(1,4))
+ │         └── cost: 1064.02
+ ├── G6: (filters G7)
  ├── G7: (contains G8 G9)
  ├── G8: (variable j)
  └── G9: (const '{"a": "b"}')
-
-# Query only the primary key with a remaining filter. 2+ paths in containment
-# query should favor zigzag joins.
-opt
-SELECT k FROM b WHERE j @> '{"a": "b", "c": "d"}'
-----
-project
- ├── columns: k:1!null
- ├── immutable
- ├── key: (1)
- └── inner-join (lookup b)
-      ├── columns: k:1!null j:4
-      ├── key columns: [1] = [1]
-      ├── lookup columns are key
-      ├── immutable
-      ├── key: (1)
-      ├── fd: (1)-->(4)
-      ├── inner-join (zigzag b@inv_idx b@inv_idx)
-      │    ├── columns: k:1!null
-      │    ├── eq columns: [1] = [1]
-      │    ├── left fixed columns: [4] = ['{"a": "b"}']
-      │    ├── right fixed columns: [4] = ['{"c": "d"}']
-      │    └── filters (true)
-      └── filters
-           └── j:4 @> '{"a": "b", "c": "d"}' [outer=(4), immutable]
 
 # Query requiring an index join with no remaining filter.
 opt
@@ -1041,7 +1671,7 @@ project
  ├── key: (1)
  ├── fd: (1)-->(2)
  └── index-join b
-      ├── columns: k:1!null u:2 j:4
+      ├── columns: k:1!null u:2 j:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(2,4)
@@ -1054,7 +1684,7 @@ opt
 SELECT j, k FROM b WHERE j @> '{"a": "b"}'
 ----
 index-join b
- ├── columns: j:4 k:1!null
+ ├── columns: j:4!null k:1!null
  ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(4)
@@ -1067,7 +1697,7 @@ opt
 SELECT * FROM b WHERE j @> '{"a": "b"}'
 ----
 index-join b
- ├── columns: k:1!null u:2 v:3 j:4
+ ├── columns: k:1!null u:2 v:3 j:4!null
  ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
@@ -1076,51 +1706,11 @@ index-join b
       ├── constraint: /4/1: [/'{"a": "b"}' - /'{"a": "b"}']
       └── key: (1)
 
-# Query requiring a zigzag join with a remaining filter.
-# TODO(itsbilal): remove filter from index join if zigzag join covers it.
-opt
-SELECT j, k FROM b WHERE j @> '{"a": "b", "c": "d"}'
-----
-inner-join (lookup b)
- ├── columns: j:4 k:1!null
- ├── key columns: [1] = [1]
- ├── lookup columns are key
- ├── immutable
- ├── key: (1)
- ├── fd: (1)-->(4)
- ├── inner-join (zigzag b@inv_idx b@inv_idx)
- │    ├── columns: k:1!null
- │    ├── eq columns: [1] = [1]
- │    ├── left fixed columns: [4] = ['{"a": "b"}']
- │    ├── right fixed columns: [4] = ['{"c": "d"}']
- │    └── filters (true)
- └── filters
-      └── j:4 @> '{"a": "b", "c": "d"}' [outer=(4), immutable]
-
-opt
-SELECT * FROM b WHERE j @> '{"a": {"b": "c", "d": "e"}, "f": "g"}'
-----
-inner-join (lookup b)
- ├── columns: k:1!null u:2 v:3 j:4
- ├── key columns: [1] = [1]
- ├── lookup columns are key
- ├── immutable
- ├── key: (1)
- ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
- ├── inner-join (zigzag b@inv_idx b@inv_idx)
- │    ├── columns: k:1!null
- │    ├── eq columns: [1] = [1]
- │    ├── left fixed columns: [4] = ['{"a": {"b": "c"}}']
- │    ├── right fixed columns: [4] = ['{"a": {"d": "e"}}']
- │    └── filters (true)
- └── filters
-      └── j:4 @> '{"a": {"b": "c", "d": "e"}, "f": "g"}' [outer=(4), immutable]
-
 opt
 SELECT * FROM b WHERE j @> '{}'
 ----
 select
- ├── columns: k:1!null u:2 v:3 j:4
+ ├── columns: k:1!null u:2 v:3 j:4!null
  ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
@@ -1129,13 +1719,13 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-4), (3)~~>(1,2,4)
  └── filters
-      └── j:4 @> '{}' [outer=(4), immutable]
+      └── j:4 @> '{}' [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 opt
 SELECT * FROM b WHERE j @> '[]'
 ----
 select
- ├── columns: k:1!null u:2 v:3 j:4
+ ├── columns: k:1!null u:2 v:3 j:4!null
  ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
@@ -1144,13 +1734,13 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-4), (3)~~>(1,2,4)
  └── filters
-      └── j:4 @> '[]' [outer=(4), immutable]
+      └── j:4 @> '[]' [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 opt
 SELECT * FROM b WHERE j @> '2'
 ----
 index-join b
- ├── columns: k:1!null u:2 v:3 j:4
+ ├── columns: k:1!null u:2 v:3 j:4!null
  ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
@@ -1165,7 +1755,7 @@ opt
 SELECT * FROM b WHERE j @> '[{}]'
 ----
 select
- ├── columns: k:1!null u:2 v:3 j:4
+ ├── columns: k:1!null u:2 v:3 j:4!null
  ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
@@ -1174,13 +1764,13 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-4), (3)~~>(1,2,4)
  └── filters
-      └── j:4 @> '[{}]' [outer=(4), immutable]
+      └── j:4 @> '[{}]' [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 opt
 SELECT * FROM b WHERE j @> '{"a": {}}'
 ----
 select
- ├── columns: k:1!null u:2 v:3 j:4
+ ├── columns: k:1!null u:2 v:3 j:4!null
  ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
@@ -1189,13 +1779,13 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-4), (3)~~>(1,2,4)
  └── filters
-      └── j:4 @> '{"a": {}}' [outer=(4), immutable]
+      └── j:4 @> '{"a": {}}' [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 opt
 SELECT * FROM b WHERE j @> '{"a": []}'
 ----
 select
- ├── columns: k:1!null u:2 v:3 j:4
+ ├── columns: k:1!null u:2 v:3 j:4!null
  ├── immutable
  ├── key: (1)
  ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
@@ -1204,7 +1794,20 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-4), (3)~~>(1,2,4)
  └── filters
-      └── j:4 @> '{"a": []}' [outer=(4), immutable]
+      └── j:4 @> '{"a": []}' [outer=(4), immutable, constraints=(/4: (/NULL - ])]
+
+opt
+SELECT * FROM b WHERE j @> '{"a":[[{"b":{"c":[{"d":"e"}]}}]]}'
+----
+index-join b
+ ├── columns: k:1!null u:2 v:3 j:4!null
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ └── scan b@inv_idx
+      ├── columns: k:1!null
+      ├── constraint: /4/1: [/'{"a": [[{"b": {"c": [{"d": "e"}]}}]]}' - /'{"a": [[{"b": {"c": [{"d": "e"}]}}]]}']
+      └── key: (1)
 
 # GenerateInvertedIndexScans propagates row-level locking information.
 opt
@@ -1214,17 +1817,12 @@ project
  ├── columns: k:1!null
  ├── volatile
  ├── key: (1)
- └── index-join b
-      ├── columns: k:1!null j:4
+ └── scan b@inv_idx
+      ├── columns: k:1!null
+      ├── constraint: /4/1: [/'{"a": "b"}' - /'{"a": "b"}']
+      ├── locking: for-update
       ├── volatile
-      ├── key: (1)
-      ├── fd: (1)-->(4)
-      └── scan b@inv_idx
-           ├── columns: k:1!null
-           ├── constraint: /4/1: [/'{"a": "b"}' - /'{"a": "b"}']
-           ├── locking: for-update
-           ├── volatile
-           └── key: (1)
+      └── key: (1)
 
 # Tests for array inverted indexes.
 opt
@@ -1234,38 +1832,10 @@ project
  ├── columns: k:1!null
  ├── immutable
  ├── key: (1)
- └── index-join c
-      ├── columns: k:1!null a:2
-      ├── immutable
-      ├── key: (1)
-      ├── fd: (1)-->(2)
-      └── scan c@inv_idx
-           ├── columns: k:1!null
-           ├── constraint: /2/1: [/ARRAY[1] - /ARRAY[1]]
-           └── key: (1)
-
-opt
-SELECT k FROM c WHERE a @> ARRAY[1,3,1,5]
-----
-project
- ├── columns: k:1!null
- ├── immutable
- ├── key: (1)
- └── inner-join (lookup c)
-      ├── columns: k:1!null a:2
-      ├── key columns: [1] = [1]
-      ├── lookup columns are key
-      ├── immutable
-      ├── key: (1)
-      ├── fd: (1)-->(2)
-      ├── inner-join (zigzag c@inv_idx c@inv_idx)
-      │    ├── columns: k:1!null
-      │    ├── eq columns: [1] = [1]
-      │    ├── left fixed columns: [2] = [ARRAY[1]]
-      │    ├── right fixed columns: [2] = [ARRAY[3]]
-      │    └── filters (true)
-      └── filters
-           └── a:2 @> ARRAY[1,3,1,5] [outer=(2), immutable]
+ └── scan c@inv_idx
+      ├── columns: k:1!null
+      ├── constraint: /2/1: [/ARRAY[1] - /ARRAY[1]]
+      └── key: (1)
 
 opt
 SELECT k FROM c WHERE a @> ARRAY[]::INT[]
@@ -1275,7 +1845,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null a:2
+      ├── columns: k:1!null a:2!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(2)
@@ -1284,7 +1854,7 @@ project
       │    ├── key: (1)
       │    └── fd: (1)-->(2)
       └── filters
-           └── a:2 @> ARRAY[] [outer=(2), immutable]
+           └── a:2 @> ARRAY[] [outer=(2), immutable, constraints=(/2: (/NULL - ])]
 
 opt
 SELECT k FROM c WHERE a IS NULL
@@ -1312,7 +1882,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geog:4
+      ├── columns: k:1!null geog:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(4)
@@ -1325,21 +1895,23 @@ project
       │         ├── inverted expression: /7
       │         │    ├── tight: false
       │         │    └── union spans
-      │         │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │         │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │         │         └── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         ├── pre-filterer expression
+      │         │    └── st_intersects('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4)
       │         ├── key: (1)
       │         └── scan g@geog_idx
       │              ├── columns: k:1!null geog_inverted_key:7!null
       │              ├── inverted constraint: /7/1
       │              │    └── spans
-      │              │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │              │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │              │         └── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
       │              ├── key: (1)
       │              └── fd: (1)-->(7)
       └── filters
-           └── st_intersects('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) [outer=(4), immutable]
+           └── st_intersects('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 # Same test as above, but with commuted arguments.
 opt
@@ -1350,7 +1922,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geog:4
+      ├── columns: k:1!null geog:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(4)
@@ -1363,21 +1935,23 @@ project
       │         ├── inverted expression: /7
       │         │    ├── tight: false
       │         │    └── union spans
-      │         │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │         │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │         │         └── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         ├── pre-filterer expression
+      │         │    └── st_intersects('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4)
       │         ├── key: (1)
       │         └── scan g@geog_idx
       │              ├── columns: k:1!null geog_inverted_key:7!null
       │              ├── inverted constraint: /7/1
       │              │    └── spans
-      │              │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │              │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │              │         └── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
       │              ├── key: (1)
       │              └── fd: (1)-->(7)
       └── filters
-           └── st_intersects(geog:4, '0101000020E61000009279E40F069E45C0BEE36FD63B1D5240') [outer=(4), immutable]
+           └── st_intersects(geog:4, '0101000020E61000009279E40F069E45C0BEE36FD63B1D5240') [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 opt
 SELECT k FROM g WHERE ST_CoveredBy('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'::geometry, geom)
@@ -1387,7 +1961,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geom:3
+      ├── columns: k:1!null geom:3!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(3)
@@ -1400,21 +1974,23 @@ project
       │         ├── inverted expression: /6
       │         │    ├── tight: false
       │         │    └── union spans
-      │         │         ├── ["\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         └── ["\xfd\x11\x00\x00\x00\x00\x00\x00\x00", "\xfd\x11\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfd\x11\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x11\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         └── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
+      │         ├── pre-filterer expression
+      │         │    └── st_coveredby('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3)
       │         ├── key: (1)
       │         └── scan g@geom_idx
       │              ├── columns: k:1!null geom_inverted_key:6!null
       │              ├── inverted constraint: /6/1
       │              │    └── spans
-      │              │         ├── ["\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         └── ["\xfd\x11\x00\x00\x00\x00\x00\x00\x00", "\xfd\x11\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfd\x11\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x11\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         └── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
       │              ├── key: (1)
       │              └── fd: (1)-->(6)
       └── filters
-           └── st_coveredby('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3) [outer=(3), immutable]
+           └── st_coveredby('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3) [outer=(3), immutable, constraints=(/3: (/NULL - ])]
 
 # Same test as above, but with commuted arguments.
 opt
@@ -1425,7 +2001,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geom:3
+      ├── columns: k:1!null geom:3!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(3)
@@ -1437,16 +2013,18 @@ project
       │         ├── columns: k:1!null
       │         ├── inverted expression: /6
       │         │    ├── tight: false
-      │         │    └── union spans: ["\x89", "\xfd ")
+      │         │    └── union spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │         ├── pre-filterer expression
+      │         │    └── st_covers('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3)
       │         ├── key: (1)
       │         └── scan g@geom_idx
       │              ├── columns: k:1!null geom_inverted_key:6!null
       │              ├── inverted constraint: /6/1
-      │              │    └── spans: ["\x89", "\xfd ")
+      │              │    └── spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
       │              ├── key: (1)
       │              └── fd: (1)-->(6)
       └── filters
-           └── st_coveredby(geom:3, '0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000') [outer=(3), immutable]
+           └── st_coveredby(geom:3, '0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000') [outer=(3), immutable, constraints=(/3: (/NULL - ])]
 
 opt
 SELECT k FROM g WHERE ST_DWithin('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'::geometry, geom, 2)
@@ -1456,7 +2034,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geom:3
+      ├── columns: k:1!null geom:3!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(3)
@@ -1468,16 +2046,18 @@ project
       │         ├── columns: k:1!null
       │         ├── inverted expression: /6
       │         │    ├── tight: false
-      │         │    └── union spans: ["\x89", "\xfd ")
+      │         │    └── union spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │         ├── pre-filterer expression
+      │         │    └── st_dwithin('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0)
       │         ├── key: (1)
       │         └── scan g@geom_idx
       │              ├── columns: k:1!null geom_inverted_key:6!null
       │              ├── inverted constraint: /6/1
-      │              │    └── spans: ["\x89", "\xfd ")
+      │              │    └── spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
       │              ├── key: (1)
       │              └── fd: (1)-->(6)
       └── filters
-           └── st_dwithin('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0) [outer=(3), immutable]
+           └── st_dwithin('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0) [outer=(3), immutable, constraints=(/3: (/NULL - ])]
 
 opt
 SELECT k FROM g WHERE ST_DFullyWithin('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'::geometry, geom, 2)
@@ -1487,7 +2067,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geom:3
+      ├── columns: k:1!null geom:3!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(3)
@@ -1499,16 +2079,18 @@ project
       │         ├── columns: k:1!null
       │         ├── inverted expression: /6
       │         │    ├── tight: false
-      │         │    └── union spans: ["\x89", "\xfd ")
+      │         │    └── union spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │         ├── pre-filterer expression
+      │         │    └── st_dfullywithin('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0)
       │         ├── key: (1)
       │         └── scan g@geom_idx
       │              ├── columns: k:1!null geom_inverted_key:6!null
       │              ├── inverted constraint: /6/1
-      │              │    └── spans: ["\x89", "\xfd ")
+      │              │    └── spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
       │              ├── key: (1)
       │              └── fd: (1)-->(6)
       └── filters
-           └── st_dfullywithin('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0) [outer=(3), immutable]
+           └── st_dfullywithin('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0) [outer=(3), immutable, constraints=(/3: (/NULL - ])]
 
 opt
 SELECT k FROM g WHERE ST_DWithin('SRID=4326;POINT(-43.23456 72.4567772)'::geography, geog, 2000)
@@ -1518,7 +2100,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geog:4
+      ├── columns: k:1!null geog:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(4)
@@ -1531,35 +2113,37 @@ project
       │         ├── inverted expression: /7
       │         │    ├── tight: false
       │         │    └── union spans
-      │         │         ├── ["\xfdD\x00\x00\x00\x00\x00\x00\x00", "\xfdD\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdD\x00\x00\x00\x00\x00\x00\x01", "\xfdF")
-      │         │         ├── ["\xfdF\x00\x00\x00\x00\x00\x00\x01", "\xfdH")
-      │         │         ├── ["\xfdH\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │         │         ├── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdP\x00\x00\x00\x00\x00\x00\x01", "\xfdR")
-      │         │         ├── ["\xfdR\x00\x00\x00\x00\x00\x00\x01", "\xfdT")
-      │         │         ├── ["\xfdT\x00\x00\x00\x00\x00\x00\x00", "\xfdT\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdZ\x00\x00\x00\x00\x00\x00\x01", "\xfd\\")
-      │         │         └── ["\xfd\\\x00\x00\x00\x00\x00\x00\x00", "\xfd\\\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdD\x00\x00\x00\x00\x00\x00\x00", "B\xfdD\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdD\x00\x00\x00\x00\x00\x00\x01", "B\xfdF\x00\x00\x00\x00\x00\x00\x00")
+      │         │         ├── ["B\xfdF\x00\x00\x00\x00\x00\x00\x01", "B\xfdH\x00\x00\x00\x00\x00\x00\x00")
+      │         │         ├── ["B\xfdH\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │         │         ├── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdP\x00\x00\x00\x00\x00\x00\x01", "B\xfdR\x00\x00\x00\x00\x00\x00\x00")
+      │         │         ├── ["B\xfdR\x00\x00\x00\x00\x00\x00\x01", "B\xfdT\x00\x00\x00\x00\x00\x00\x00")
+      │         │         ├── ["B\xfdT\x00\x00\x00\x00\x00\x00\x00", "B\xfdT\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdZ\x00\x00\x00\x00\x00\x00\x01", "B\xfd\\\x00\x00\x00\x00\x00\x00\x00")
+      │         │         └── ["B\xfd\\\x00\x00\x00\x00\x00\x00\x00", "B\xfd\\\x00\x00\x00\x00\x00\x00\x00"]
+      │         ├── pre-filterer expression
+      │         │    └── st_dwithin('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4, 2000.0)
       │         ├── key: (1)
       │         └── scan g@geog_idx
       │              ├── columns: k:1!null geog_inverted_key:7!null
       │              ├── inverted constraint: /7/1
       │              │    └── spans
-      │              │         ├── ["\xfdD\x00\x00\x00\x00\x00\x00\x00", "\xfdD\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdD\x00\x00\x00\x00\x00\x00\x01", "\xfdF")
-      │              │         ├── ["\xfdF\x00\x00\x00\x00\x00\x00\x01", "\xfdH")
-      │              │         ├── ["\xfdH\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │              │         ├── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdP\x00\x00\x00\x00\x00\x00\x01", "\xfdR")
-      │              │         ├── ["\xfdR\x00\x00\x00\x00\x00\x00\x01", "\xfdT")
-      │              │         ├── ["\xfdT\x00\x00\x00\x00\x00\x00\x00", "\xfdT\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdZ\x00\x00\x00\x00\x00\x00\x01", "\xfd\\")
-      │              │         └── ["\xfd\\\x00\x00\x00\x00\x00\x00\x00", "\xfd\\\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdD\x00\x00\x00\x00\x00\x00\x00", "B\xfdD\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdD\x00\x00\x00\x00\x00\x00\x01", "B\xfdF\x00\x00\x00\x00\x00\x00\x00")
+      │              │         ├── ["B\xfdF\x00\x00\x00\x00\x00\x00\x01", "B\xfdH\x00\x00\x00\x00\x00\x00\x00")
+      │              │         ├── ["B\xfdH\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │              │         ├── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdP\x00\x00\x00\x00\x00\x00\x01", "B\xfdR\x00\x00\x00\x00\x00\x00\x00")
+      │              │         ├── ["B\xfdR\x00\x00\x00\x00\x00\x00\x01", "B\xfdT\x00\x00\x00\x00\x00\x00\x00")
+      │              │         ├── ["B\xfdT\x00\x00\x00\x00\x00\x00\x00", "B\xfdT\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdZ\x00\x00\x00\x00\x00\x00\x01", "B\xfd\\\x00\x00\x00\x00\x00\x00\x00")
+      │              │         └── ["B\xfd\\\x00\x00\x00\x00\x00\x00\x00", "B\xfd\\\x00\x00\x00\x00\x00\x00\x00"]
       │              ├── key: (1)
       │              └── fd: (1)-->(7)
       └── filters
-           └── st_dwithin('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4, 2000.0) [outer=(4), immutable]
+           └── st_dwithin('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4, 2000.0) [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 opt
 SELECT k FROM g WHERE ST_DWithin('SRID=4326;POINT(-43.23456 72.4567772)'::geography, geog, 2000, false)
@@ -1569,7 +2153,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geog:4
+      ├── columns: k:1!null geog:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(4)
@@ -1582,38 +2166,142 @@ project
       │         ├── inverted expression: /7
       │         │    ├── tight: false
       │         │    └── union spans
-      │         │         ├── ["\xfdD\x00\x00\x00\x00\x00\x00\x00", "\xfdD\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdD\x00\x00\x00\x00\x00\x00\x01", "\xfdF")
-      │         │         ├── ["\xfdF\x00\x00\x00\x00\x00\x00\x01", "\xfdH")
-      │         │         ├── ["\xfdH\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │         │         ├── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdP\x00\x00\x00\x00\x00\x00\x01", "\xfdR")
-      │         │         ├── ["\xfdR\x00\x00\x00\x00\x00\x00\x01", "\xfdT")
-      │         │         ├── ["\xfdT\x00\x00\x00\x00\x00\x00\x00", "\xfdT\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdZ\x00\x00\x00\x00\x00\x00\x01", "\xfd\\")
-      │         │         └── ["\xfd\\\x00\x00\x00\x00\x00\x00\x00", "\xfd\\\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdD\x00\x00\x00\x00\x00\x00\x00", "B\xfdD\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdD\x00\x00\x00\x00\x00\x00\x01", "B\xfdF\x00\x00\x00\x00\x00\x00\x00")
+      │         │         ├── ["B\xfdF\x00\x00\x00\x00\x00\x00\x01", "B\xfdH\x00\x00\x00\x00\x00\x00\x00")
+      │         │         ├── ["B\xfdH\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │         │         ├── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdP\x00\x00\x00\x00\x00\x00\x01", "B\xfdR\x00\x00\x00\x00\x00\x00\x00")
+      │         │         ├── ["B\xfdR\x00\x00\x00\x00\x00\x00\x01", "B\xfdT\x00\x00\x00\x00\x00\x00\x00")
+      │         │         ├── ["B\xfdT\x00\x00\x00\x00\x00\x00\x00", "B\xfdT\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdZ\x00\x00\x00\x00\x00\x00\x01", "B\xfd\\\x00\x00\x00\x00\x00\x00\x00")
+      │         │         └── ["B\xfd\\\x00\x00\x00\x00\x00\x00\x00", "B\xfd\\\x00\x00\x00\x00\x00\x00\x00"]
+      │         ├── pre-filterer expression
+      │         │    └── st_dwithin('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4, 2000.0, false)
       │         ├── key: (1)
       │         └── scan g@geog_idx
       │              ├── columns: k:1!null geog_inverted_key:7!null
       │              ├── inverted constraint: /7/1
       │              │    └── spans
-      │              │         ├── ["\xfdD\x00\x00\x00\x00\x00\x00\x00", "\xfdD\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdD\x00\x00\x00\x00\x00\x00\x01", "\xfdF")
-      │              │         ├── ["\xfdF\x00\x00\x00\x00\x00\x00\x01", "\xfdH")
-      │              │         ├── ["\xfdH\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │              │         ├── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdP\x00\x00\x00\x00\x00\x00\x01", "\xfdR")
-      │              │         ├── ["\xfdR\x00\x00\x00\x00\x00\x00\x01", "\xfdT")
-      │              │         ├── ["\xfdT\x00\x00\x00\x00\x00\x00\x00", "\xfdT\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdZ\x00\x00\x00\x00\x00\x00\x01", "\xfd\\")
-      │              │         └── ["\xfd\\\x00\x00\x00\x00\x00\x00\x00", "\xfd\\\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdD\x00\x00\x00\x00\x00\x00\x00", "B\xfdD\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdD\x00\x00\x00\x00\x00\x00\x01", "B\xfdF\x00\x00\x00\x00\x00\x00\x00")
+      │              │         ├── ["B\xfdF\x00\x00\x00\x00\x00\x00\x01", "B\xfdH\x00\x00\x00\x00\x00\x00\x00")
+      │              │         ├── ["B\xfdH\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │              │         ├── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdP\x00\x00\x00\x00\x00\x00\x01", "B\xfdR\x00\x00\x00\x00\x00\x00\x00")
+      │              │         ├── ["B\xfdR\x00\x00\x00\x00\x00\x00\x01", "B\xfdT\x00\x00\x00\x00\x00\x00\x00")
+      │              │         ├── ["B\xfdT\x00\x00\x00\x00\x00\x00\x00", "B\xfdT\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdZ\x00\x00\x00\x00\x00\x00\x01", "B\xfd\\\x00\x00\x00\x00\x00\x00\x00")
+      │              │         └── ["B\xfd\\\x00\x00\x00\x00\x00\x00\x00", "B\xfd\\\x00\x00\x00\x00\x00\x00\x00"]
       │              ├── key: (1)
       │              └── fd: (1)-->(7)
       └── filters
-           └── st_dwithin('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4, 2000.0, false) [outer=(4), immutable]
+           └── st_dwithin('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4, 2000.0, false) [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
+# Test for ST_DWithinExclusive
+opt
+SELECT k FROM g WHERE ST_DWithinExclusive('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'::geometry, geom, 2)
+----
+project
+ ├── columns: k:1!null
+ ├── immutable
+ ├── key: (1)
+ └── select
+      ├── columns: k:1!null geom:3!null
+      ├── immutable
+      ├── key: (1)
+      ├── fd: (1)-->(3)
+      ├── index-join g
+      │    ├── columns: k:1!null geom:3
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(3)
+      │    └── inverted-filter
+      │         ├── columns: k:1!null
+      │         ├── inverted expression: /6
+      │         │    ├── tight: false
+      │         │    └── union spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │         ├── pre-filterer expression
+      │         │    └── st_dwithinexclusive('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0)
+      │         ├── key: (1)
+      │         └── scan g@geom_idx
+      │              ├── columns: k:1!null geom_inverted_key:6!null
+      │              ├── inverted constraint: /6/1
+      │              │    └── spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │              ├── key: (1)
+      │              └── fd: (1)-->(6)
+      └── filters
+           └── st_dwithinexclusive('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0) [outer=(3), immutable, constraints=(/3: (/NULL - ])]
+
+# Commuted version of previous test.
+opt
+SELECT k FROM g WHERE ST_DWithinExclusive(geom, 'POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'::geometry, 2)
+----
+project
+ ├── columns: k:1!null
+ ├── immutable
+ ├── key: (1)
+ └── select
+      ├── columns: k:1!null geom:3!null
+      ├── immutable
+      ├── key: (1)
+      ├── fd: (1)-->(3)
+      ├── index-join g
+      │    ├── columns: k:1!null geom:3
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(3)
+      │    └── inverted-filter
+      │         ├── columns: k:1!null
+      │         ├── inverted expression: /6
+      │         │    ├── tight: false
+      │         │    └── union spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │         ├── pre-filterer expression
+      │         │    └── st_dwithin('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0)
+      │         ├── key: (1)
+      │         └── scan g@geom_idx
+      │              ├── columns: k:1!null geom_inverted_key:6!null
+      │              ├── inverted constraint: /6/1
+      │              │    └── spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │              ├── key: (1)
+      │              └── fd: (1)-->(6)
+      └── filters
+           └── st_dwithinexclusive(geom:3, '0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', 2.0) [outer=(3), immutable, constraints=(/3: (/NULL - ])]
+
+opt
+SELECT k FROM g WHERE ST_DFullyWithinExclusive('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'::geometry, geom, 2)
+----
+project
+ ├── columns: k:1!null
+ ├── immutable
+ ├── key: (1)
+ └── select
+      ├── columns: k:1!null geom:3!null
+      ├── immutable
+      ├── key: (1)
+      ├── fd: (1)-->(3)
+      ├── index-join g
+      │    ├── columns: k:1!null geom:3
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(3)
+      │    └── inverted-filter
+      │         ├── columns: k:1!null
+      │         ├── inverted expression: /6
+      │         │    ├── tight: false
+      │         │    └── union spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │         ├── pre-filterer expression
+      │         │    └── st_dfullywithinexclusive('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0)
+      │         ├── key: (1)
+      │         └── scan g@geom_idx
+      │              ├── columns: k:1!null geom_inverted_key:6!null
+      │              ├── inverted constraint: /6/1
+      │              │    └── spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │              ├── key: (1)
+      │              └── fd: (1)-->(6)
+      └── filters
+           └── st_dfullywithinexclusive('0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000', geom:3, 2.0) [outer=(3), immutable, constraints=(/3: (/NULL - ])]
 
 # Multiple geospatial functions.
+# NB: the union spans for the following query are a subset of the spans. This is a
+# consequence of how intersectSpanExpression does simplification.
 opt
 SELECT k FROM g
 WHERE ST_Covers('SRID=4326;POINT(-43.23456 72.4567772)'::geography, geog)
@@ -1624,7 +2312,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geog:4
+      ├── columns: k:1!null geog:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(4)
@@ -1636,31 +2324,24 @@ project
       │         ├── columns: k:1!null
       │         ├── inverted expression: /7
       │         │    ├── tight: false
-      │         │    ├── union spans: ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
-      │         │    └── INTERSECTION
-      │         │         ├── span expression
-      │         │         │    ├── tight: false
-      │         │         │    └── union spans
-      │         │         │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         │         └── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │         │         └── span expression
-      │         │              ├── tight: false
-      │         │              └── union spans
-      │         │                   ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │         │                   └── ["\xfdO\x00\x00\x00\x00\x00\x00\x00", "\xfdO\x00\x00\x00\x00\x00\x00\x00"]
+      │         │    └── union spans
+      │         │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdO\x00\x00\x00\x00\x00\x00\x00", "B\xfdO\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         └── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         ├── pre-filterer expression
+      │         │    └── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4)
       │         ├── key: (1)
       │         └── scan g@geog_idx
       │              ├── columns: k:1!null geog_inverted_key:7!null
       │              ├── inverted constraint: /7/1
       │              │    └── spans
-      │              │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │              │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         └── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x01")
       │              ├── key: (1)
       │              └── fd: (1)-->(7)
       └── filters
-           ├── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) [outer=(4), immutable]
-           └── st_coveredby('0101000020E61000009279E40F061E44C0BEE36FD63B9D5140', geog:4) [outer=(4), immutable]
+           ├── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) [outer=(4), immutable, constraints=(/4: (/NULL - ])]
+           └── st_coveredby('0101000020E61000009279E40F061E44C0BEE36FD63B9D5140', geog:4) [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 opt
 SELECT k FROM g
@@ -1672,7 +2353,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geog:4
+      ├── columns: k:1!null geog:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(4)
@@ -1685,21 +2366,19 @@ project
       │         ├── inverted expression: /7
       │         │    ├── tight: false
       │         │    └── union spans
-      │         │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │         │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         └── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x01")
       │         ├── key: (1)
       │         └── scan g@geog_idx
       │              ├── columns: k:1!null geog_inverted_key:7!null
       │              ├── inverted constraint: /7/1
       │              │    └── spans
-      │              │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │              │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         └── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x01")
       │              ├── key: (1)
       │              └── fd: (1)-->(7)
       └── filters
-           └── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) OR st_coveredby('0101000020E61000009279E40F061E44C0BEE36FD63B9D5140', geog:4) [outer=(4), immutable]
+           └── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) OR st_coveredby('0101000020E61000009279E40F061E44C0BEE36FD63B9D5140', geog:4) [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 opt
 SELECT k FROM g
@@ -1712,7 +2391,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geog:4
+      ├── columns: k:1!null geog:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(4)
@@ -1725,9 +2404,9 @@ project
       │         ├── inverted expression: /7
       │         │    ├── tight: false
       │         │    ├── union spans
-      │         │    │    ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │         │    │    ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │         │    │    └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         │    │    ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │         │    │    ├── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │         │    │    └── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
       │         │    └── INTERSECTION
       │         │         ├── span expression
       │         │         │    ├── tight: false
@@ -1736,33 +2415,37 @@ project
       │         │         │         ├── span expression
       │         │         │         │    ├── tight: false
       │         │         │         │    └── union spans
-      │         │         │         │         ├── ["\x80\x90\x00\x00\x00\x00\x00\x00\x00", "\x80\x90\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         │         │         ├── ["\x80\x84\x00\x00\x00\x00\x00\x00\x00", "\x80\x84\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         │         │         └── ["\x80\x81\x00\x00\x00\x00\x00\x00\x00", "\x80\x81\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         │         │         ├── ["B\xfd\x81\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x81\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         │         │         ├── ["B\xfd\x84\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x84\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         │         │         └── ["B\xfd\x90\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x90\x00\x00\x00\x00\x00\x00\x00"]
       │         │         │         └── span expression
       │         │         │              ├── tight: false
       │         │         │              └── union spans
-      │         │         │                   ├── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         │                   ├── ["\xfdD\x00\x00\x00\x00\x00\x00\x00", "\xfdD\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         │                   └── ["\xfdG\x00\x00\x00\x00\x00\x00\x00", "\xfdG\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         │                   ├── ["B\xfdD\x00\x00\x00\x00\x00\x00\x00", "B\xfdD\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         │                   ├── ["B\xfdG\x00\x00\x00\x00\x00\x00\x00", "B\xfdG\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         │                   └── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
       │         │         └── span expression
       │         │              ├── tight: false
       │         │              └── union spans
-      │         │                   ├── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
-      │         │                   ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │         │                   └── ["\xfdO\x00\x00\x00\x00\x00\x00\x00", "\xfdO\x00\x00\x00\x00\x00\x00\x00"]
+      │         │                   ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │         │                   ├── ["B\xfdO\x00\x00\x00\x00\x00\x00\x00", "B\xfdO\x00\x00\x00\x00\x00\x00\x00"]
+      │         │                   └── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
       │         ├── key: (1)
       │         └── scan g@geog_idx
       │              ├── columns: k:1!null geog_inverted_key:7!null
       │              ├── inverted constraint: /7/1
       │              │    └── spans
-      │              │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │              │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdD\x00\x00\x00\x00\x00\x00\x00", "B\xfdD\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdG\x00\x00\x00\x00\x00\x00\x00", "B\xfdG\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x01")
+      │              │         ├── ["B\xfd\x81\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x81\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfd\x84\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x84\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         └── ["B\xfd\x90\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x90\x00\x00\x00\x00\x00\x00\x00"]
       │              ├── key: (1)
       │              └── fd: (1)-->(7)
       └── filters
-           └── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) OR (st_coveredby('0102000020E61000000200000075029A081B9A5DC0F085C954C1F840406DC5FEB27B720440454772F90F814840', geog:4) AND st_coveredby('0101000020E610000058569A94821E46C07BC7DFAC773A4E40', geog:4)) [outer=(4), immutable]
+           └── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) OR (st_coveredby('0102000020E61000000200000075029A081B9A5DC0F085C954C1F840406DC5FEB27B720440454772F90F814840', geog:4) AND st_coveredby('0101000020E610000058569A94821E46C07BC7DFAC773A4E40', geog:4)) [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 # Multiple geospatial functions on different indexes.
 opt
@@ -1775,7 +2458,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geom:3 geog:4
+      ├── columns: k:1!null geom:3!null geog:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(3,4)
@@ -1787,17 +2470,19 @@ project
       │         ├── columns: k:1!null
       │         ├── inverted expression: /6
       │         │    ├── tight: false
-      │         │    └── union spans: ["\x89", "\xfd ")
+      │         │    └── union spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │         ├── pre-filterer expression
+      │         │    └── st_overlaps('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', geom:3)
       │         ├── key: (1)
       │         └── scan g@geom_idx
       │              ├── columns: k:1!null geom_inverted_key:6!null
       │              ├── inverted constraint: /6/1
-      │              │    └── spans: ["\x89", "\xfd ")
+      │              │    └── spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
       │              ├── key: (1)
       │              └── fd: (1)-->(6)
       └── filters
-           ├── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) [outer=(4), immutable]
-           └── st_overlaps('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', geom:3) [outer=(3), immutable]
+           ├── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) [outer=(4), immutable, constraints=(/4: (/NULL - ])]
+           └── st_overlaps('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', geom:3) [outer=(3), immutable, constraints=(/3: (/NULL - ])]
 
 # Cannot use either index in this case.
 opt
@@ -1832,7 +2517,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null geom:3 geog:4
+      ├── columns: k:1!null geom:3 geog:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: (1)-->(3,4)
@@ -1845,21 +2530,19 @@ project
       │         ├── inverted expression: /7
       │         │    ├── tight: false
       │         │    └── union spans
-      │         │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │         │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         └── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x01")
       │         ├── key: (1)
       │         └── scan g@geog_idx
       │              ├── columns: k:1!null geog_inverted_key:7!null
       │              ├── inverted constraint: /7/1
       │              │    └── spans
-      │              │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │              │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │              │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         └── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x01")
       │              ├── key: (1)
       │              └── fd: (1)-->(7)
       └── filters
-           └── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) OR (st_intersects('0101000020E61000009279E40F061E44C0BEE36FD63B9D5140', geog:4) AND st_crosses('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', geom:3)) [outer=(3,4), immutable]
+           └── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) OR (st_intersects('0101000020E61000009279E40F061E44C0BEE36FD63B9D5140', geog:4) AND st_crosses('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', geom:3)) [outer=(3,4), immutable, constraints=(/4: (/NULL - ])]
 
 # Filters on other columns.
 opt
@@ -1872,7 +2555,7 @@ project
  ├── immutable
  ├── key: (1)
  └── select
-      ├── columns: k:1!null v:2!null geog:4
+      ├── columns: k:1!null v:2!null geog:4!null
       ├── immutable
       ├── key: (1)
       ├── fd: ()-->(2), (1)-->(4)
@@ -1885,9 +2568,11 @@ project
       │         ├── inverted expression: /7
       │         │    ├── tight: false
       │         │    └── union spans
-      │         │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │         │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │         │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         ├── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │         │         └── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │         ├── pre-filterer expression
+      │         │    └── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4)
       │         ├── key: (1)
       │         └── select
       │              ├── columns: k:1!null geog_inverted_key:7!null
@@ -1897,17 +2582,1332 @@ project
       │              │    ├── columns: k:1!null geog_inverted_key:7!null
       │              │    ├── inverted constraint: /7/1
       │              │    │    └── spans
-      │              │    │         ├── ["\xfdL\x00\x00\x00\x00\x00\x00\x00", "\xfdL\x00\x00\x00\x00\x00\x00\x00"]
-      │              │    │         ├── ["\xfdN\x00\x00\x00\x00\x00\x00\x01", "\xfdP")
-      │              │    │         └── ["\xfdP\x00\x00\x00\x00\x00\x00\x00", "\xfdP\x00\x00\x00\x00\x00\x00\x00"]
+      │              │    │         ├── ["B\xfdL\x00\x00\x00\x00\x00\x00\x00", "B\xfdL\x00\x00\x00\x00\x00\x00\x00"]
+      │              │    │         ├── ["B\xfdN\x00\x00\x00\x00\x00\x00\x01", "B\xfdP\x00\x00\x00\x00\x00\x00\x00")
+      │              │    │         └── ["B\xfdP\x00\x00\x00\x00\x00\x00\x00", "B\xfdP\x00\x00\x00\x00\x00\x00\x00"]
       │              │    ├── key: (1)
       │              │    └── fd: (1)-->(7)
       │              └── filters
       │                   └── k:1 > 100 [outer=(1), constraints=(/1: [/101 - ]; tight)]
       └── filters
-           ├── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) [outer=(4), immutable]
+           ├── st_covers('0101000020E61000009279E40F069E45C0BEE36FD63B1D5240', geog:4) [outer=(4), immutable, constraints=(/4: (/NULL - ])]
            └── v:2 = 3 [outer=(2), constraints=(/2: [/3 - /3]; tight), fd=()-->(2)]
 
+# Bounding box operations.
+opt
+SELECT k FROM g WHERE 'BOX(1 2, 3 4)'::box2d ~ geom
+----
+project
+ ├── columns: k:1!null
+ ├── immutable
+ ├── key: (1)
+ └── select
+      ├── columns: k:1!null geom:3
+      ├── immutable
+      ├── key: (1)
+      ├── fd: (1)-->(3)
+      ├── index-join g
+      │    ├── columns: k:1!null geom:3
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(3)
+      │    └── inverted-filter
+      │         ├── columns: k:1!null
+      │         ├── inverted expression: /6
+      │         │    ├── tight: false
+      │         │    └── union spans
+      │         │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         └── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x01", "B\xfd\x18\x00\x00\x00\x00\x00\x00\x00")
+      │         ├── pre-filterer expression
+      │         │    └── st_covers('01030000000100000005000000000000000000F03F0000000000000040000000000000F03F00000000000010400000000000000840000000000000104000000000000008400000000000000040000000000000F03F0000000000000040', geom:3)
+      │         ├── key: (1)
+      │         └── scan g@geom_idx
+      │              ├── columns: k:1!null geom_inverted_key:6!null
+      │              ├── inverted constraint: /6/1
+      │              │    └── spans
+      │              │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         └── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x01", "B\xfd\x18\x00\x00\x00\x00\x00\x00\x00")
+      │              ├── key: (1)
+      │              └── fd: (1)-->(6)
+      └── filters
+           └── 'BOX(1 2,3 4)' ~ geom:3 [outer=(3), immutable]
+
+opt
+SELECT k FROM g WHERE geom ~ 'BOX(1 2, 3 4)'::box2d
+----
+project
+ ├── columns: k:1!null
+ ├── immutable
+ ├── key: (1)
+ └── select
+      ├── columns: k:1!null geom:3!null
+      ├── immutable
+      ├── key: (1)
+      ├── fd: (1)-->(3)
+      ├── index-join g
+      │    ├── columns: k:1!null geom:3
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(3)
+      │    └── inverted-filter
+      │         ├── columns: k:1!null
+      │         ├── inverted expression: /6
+      │         │    ├── tight: false
+      │         │    └── union spans
+      │         │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         └── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
+      │         ├── pre-filterer expression
+      │         │    └── st_coveredby('01030000000100000005000000000000000000F03F0000000000000040000000000000F03F00000000000010400000000000000840000000000000104000000000000008400000000000000040000000000000F03F0000000000000040', geom:3)
+      │         ├── key: (1)
+      │         └── scan g@geom_idx
+      │              ├── columns: k:1!null geom_inverted_key:6!null
+      │              ├── inverted constraint: /6/1
+      │              │    └── spans
+      │              │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         └── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
+      │              ├── key: (1)
+      │              └── fd: (1)-->(6)
+      └── filters
+           └── geom:3 ~ 'BOX(1 2,3 4)' [outer=(3), immutable, constraints=(/3: (/NULL - ])]
+
+opt
+SELECT k FROM g WHERE geom ~ 'MULTIPOINT((2.2 2.2), (3.0 3.0))'::geometry
+----
+project
+ ├── columns: k:1!null
+ ├── immutable
+ ├── key: (1)
+ └── select
+      ├── columns: k:1!null geom:3!null
+      ├── immutable
+      ├── key: (1)
+      ├── fd: (1)-->(3)
+      ├── index-join g
+      │    ├── columns: k:1!null geom:3
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(3)
+      │    └── inverted-filter
+      │         ├── columns: k:1!null
+      │         ├── inverted expression: /6
+      │         │    ├── tight: false
+      │         │    ├── union spans
+      │         │    │    ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
+      │         │    │    └── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
+      │         │    └── INTERSECTION
+      │         │         ├── span expression
+      │         │         │    ├── tight: false
+      │         │         │    └── union spans: ["B\xfd\x15\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x15\x00\x00\x00\x00\x00\x00\x00"]
+      │         │         └── span expression
+      │         │              ├── tight: false
+      │         │              └── union spans: ["B\xfd\x11\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x11\x00\x00\x00\x00\x00\x00\x00"]
+      │         ├── pre-filterer expression
+      │         │    └── st_coveredby('01040000000200000001010000009A999999999901409A99999999990140010100000000000000000008400000000000000840', geom:3)
+      │         ├── key: (1)
+      │         └── scan g@geom_idx
+      │              ├── columns: k:1!null geom_inverted_key:6!null
+      │              ├── inverted constraint: /6/1
+      │              │    └── spans
+      │              │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfd\x11\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x11\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         ├── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
+      │              │         └── ["B\xfd\x15\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x15\x00\x00\x00\x00\x00\x00\x00"]
+      │              ├── key: (1)
+      │              └── fd: (1)-->(6)
+      └── filters
+           └── geom:3 ~ '01040000000200000001010000009A999999999901409A99999999990140010100000000000000000008400000000000000840' [outer=(3), immutable, constraints=(/3: (/NULL - ])]
+
+# Tests for partial inverted indexes.
+
+exec-ddl
+CREATE TABLE pi (
+    k INT PRIMARY KEY,
+    s STRING,
+    j JSON
+)
+----
+
+# Partial inverted index scan.
+
+exec-ddl
+CREATE INVERTED INDEX idx ON pi (j) WHERE s = 'foo'
+----
+
+opt
+SELECT k FROM pi WHERE j @> '{"a": "b"}' AND s = 'foo'
+----
+project
+ ├── columns: k:1!null
+ ├── immutable
+ ├── key: (1)
+ └── scan pi@idx,partial
+      ├── columns: k:1!null
+      ├── constraint: /3/1: [/'{"a": "b"}' - /'{"a": "b"}']
+      └── key: (1)
+
+exec-ddl
+DROP INDEX idx
+----
+
+# Partial inverted index scan with indexed column in predicate.
+
+exec-ddl
+CREATE INVERTED INDEX idx ON pi (j) WHERE j @> '{"group": 1}'
+----
+
+opt
+SELECT k FROM pi WHERE j @> '{"a": "b"}' AND j @> '{"group": 1}'
+----
+project
+ ├── columns: k:1!null
+ ├── immutable
+ ├── key: (1)
+ └── scan pi@idx,partial
+      ├── columns: k:1!null
+      ├── constraint: /3/1: [/'{"a": "b"}' - /'{"a": "b"}']
+      └── key: (1)
+
+exec-ddl
+DROP INDEX idx
+----
+
+# Partial inverted index scan with index-join.
+
+exec-ddl
+CREATE INVERTED INDEX idx ON pi (j) WHERE s = 'foo'
+----
+
+opt
+SELECT * FROM pi WHERE j @> '{"a": "b"}' AND s = 'foo'
+----
+index-join pi
+ ├── columns: k:1!null s:2!null j:3!null
+ ├── immutable
+ ├── key: (1)
+ ├── fd: ()-->(2), (1)-->(3)
+ └── scan pi@idx,partial
+      ├── columns: k:1!null
+      ├── constraint: /3/1: [/'{"a": "b"}' - /'{"a": "b"}']
+      └── key: (1)
+
+exec-ddl
+DROP INDEX idx
+----
+
+# Partial inverted index scan with additional filters.
+
+exec-ddl
+CREATE INVERTED INDEX idx ON pi (j) WHERE s IN ('foo', 'bar')
+----
+
+opt
+SELECT * FROM pi WHERE j @> '{"a": "b"}' AND j @> '{"group": 1}' AND s = 'foo'
+----
+select
+ ├── columns: k:1!null s:2!null j:3!null
+ ├── immutable
+ ├── key: (1)
+ ├── fd: ()-->(2), (1)-->(3)
+ ├── index-join pi
+ │    ├── columns: k:1!null s:2 j:3
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2,3)
+ │    └── scan pi@idx,partial
+ │         ├── columns: k:1!null
+ │         ├── constraint: /3/1: [/'{"a": "b"}' - /'{"a": "b"}']
+ │         └── key: (1)
+ └── filters
+      ├── j:3 @> '{"group": 1}' [outer=(3), immutable, constraints=(/3: (/NULL - ])]
+      └── s:2 = 'foo' [outer=(2), constraints=(/2: [/'foo' - /'foo']; tight), fd=()-->(2)]
+
+exec-ddl
+DROP INDEX idx
+----
+
+# Generate multiple partial inverted index scans in the memo when the filter
+# implies multiple partial index predicates.
+
+exec-ddl
+CREATE INVERTED INDEX idx ON pi (j) WHERE s IN ('foo', 'bar')
+----
+
+exec-ddl
+CREATE INVERTED INDEX idx2 ON pi (j) WHERE s = 'bar'
+----
+
+memo
+SELECT * FROM pi WHERE j @> '{"a": "b"}' AND s = 'bar'
+----
+memo (optimized, ~10KB, required=[presentation: k:1,s:2,j:3])
+ ├── G1: (select G2 G3) (select G4 G5) (index-join G6 pi,cols=(1-3))
+ │    └── [presentation: k:1,s:2,j:3]
+ │         ├── best: (index-join G6 pi,cols=(1-3))
+ │         └── cost: 11.82
+ ├── G2: (scan pi,cols=(1-3))
+ │    └── []
+ │         ├── best: (scan pi,cols=(1-3))
+ │         └── cost: 1064.02
+ ├── G3: (filters G7 G8)
+ ├── G4: (index-join G9 pi,cols=(1-3))
+ │    └── []
+ │         ├── best: (index-join G9 pi,cols=(1-3))
+ │         └── cost: 19.62
+ ├── G5: (filters G8)
+ ├── G6: (scan pi@idx2,partial,cols=(1),constrained)
+ │    └── []
+ │         ├── best: (scan pi@idx2,partial,cols=(1),constrained)
+ │         └── cost: 5.14
+ ├── G7: (contains G10 G11)
+ ├── G8: (eq G12 G13)
+ ├── G9: (scan pi@idx,partial,cols=(1),constrained)
+ │    └── []
+ │         ├── best: (scan pi@idx,partial,cols=(1),constrained)
+ │         └── cost: 6.28
+ ├── G10: (variable j)
+ ├── G11: (const '{"a": "b"}')
+ ├── G12: (variable s)
+ └── G13: (const 'bar')
+
+exec-ddl
+DROP INDEX idx
+----
+
+exec-ddl
+DROP INDEX idx2
+----
+
+# Do not generate a partial inverted index scan when the predicate is not
+# implied by the filter.
+
+exec-ddl
+CREATE INVERTED INDEX idx ON pi (j) WHERE s IN ('foo', 'bar')
+----
+
+memo expect-not=GenerateInvertedIndexScans
+SELECT * FROM pi WHERE j @> '{"a": "b"}' AND s = 'baz'
+----
+memo (optimized, ~6KB, required=[presentation: k:1,s:2,j:3])
+ ├── G1: (select G2 G3)
+ │    └── [presentation: k:1,s:2,j:3]
+ │         ├── best: (select G2 G3)
+ │         └── cost: 1074.05
+ ├── G2: (scan pi,cols=(1-3))
+ │    └── []
+ │         ├── best: (scan pi,cols=(1-3))
+ │         └── cost: 1064.02
+ ├── G3: (filters G4 G5)
+ ├── G4: (contains G6 G7)
+ ├── G5: (eq G8 G9)
+ ├── G6: (variable j)
+ ├── G7: (const '{"a": "b"}')
+ ├── G8: (variable s)
+ └── G9: (const 'baz')
+
+exec-ddl
+DROP INDEX idx
+----
+
+# --------------------------------------------------
+# GenerateZigzagJoins
+# --------------------------------------------------
+
+exec-ddl
+CREATE TABLE pqr
+(
+    p INT PRIMARY KEY,
+    q INT,
+    r INT,
+    s STRING,
+    t STRING,
+    INDEX q (q),
+    INDEX r (r),
+    INDEX s (s) STORING (r),
+    INDEX rs (r,s),
+    INDEX ts (t,s)
+)
+----
+
+exec-ddl
+CREATE TABLE zz (
+    a INT8 PRIMARY KEY,
+    b INT8 NULL,
+    c INT8 NULL,
+    INDEX idx_b (b ASC),
+    CONSTRAINT idx_c UNIQUE (c)
+)
+----
+
+exec-ddl
+CREATE TABLE zz_redundant (
+    a INT8 PRIMARY KEY,
+    b INT8 NULL,
+    c INT8 NULL,
+    INDEX idx_u (b ASC, c ASC),
+    INDEX idx_v (b ASC, c ASC)
+)
+----
+
+# Simple zigzag case - where all requested columns are in the indexes being
+# joined.
+opt
+SELECT q,r FROM pqr WHERE q = 1 AND r = 2
+----
+inner-join (zigzag pqr@q pqr@r)
+ ├── columns: q:2!null r:3!null
+ ├── eq columns: [1] = [1]
+ ├── left fixed columns: [2] = [1]
+ ├── right fixed columns: [3] = [2]
+ ├── fd: ()-->(2,3)
+ └── filters
+      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+      └── r:3 = 2 [outer=(3), constraints=(/3: [/2 - /2]; tight), fd=()-->(3)]
+
+opt
+SELECT q,r FROM pqr WHERE q = 1 AND r IS NULL
+----
+inner-join (zigzag pqr@q pqr@r)
+ ├── columns: q:2!null r:3
+ ├── eq columns: [1] = [1]
+ ├── left fixed columns: [2] = [1]
+ ├── right fixed columns: [3] = [NULL]
+ ├── fd: ()-->(2,3)
+ └── filters
+      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+      └── r:3 IS NULL [outer=(3), constraints=(/3: [/NULL - /NULL]; tight), fd=()-->(3)]
+
+memo
+SELECT q,r FROM pqr WHERE q = 1 AND r = 2
+----
+memo (optimized, ~13KB, required=[presentation: q:2,r:3])
+ ├── G1: (select G2 G3) (select G4 G5) (select G6 G7) (select G8 G7) (zigzag-join G3 pqr@q pqr@r)
+ │    └── [presentation: q:2,r:3]
+ │         ├── best: (zigzag-join G3 pqr@q pqr@r)
+ │         └── cost: 1.93
+ ├── G2: (scan pqr,cols=(2,3))
+ │    └── []
+ │         ├── best: (scan pqr,cols=(2,3))
+ │         └── cost: 1074.02
+ ├── G3: (filters G9 G10)
+ ├── G4: (index-join G11 pqr,cols=(2,3))
+ │    └── []
+ │         ├── best: (index-join G11 pqr,cols=(2,3))
+ │         └── cost: 75.12
+ ├── G5: (filters G10)
+ ├── G6: (index-join G12 pqr,cols=(2,3))
+ │    └── []
+ │         ├── best: (index-join G12 pqr,cols=(2,3))
+ │         └── cost: 75.12
+ ├── G7: (filters G9)
+ ├── G8: (index-join G13 pqr,cols=(2,3))
+ │    └── []
+ │         ├── best: (index-join G13 pqr,cols=(2,3))
+ │         └── cost: 75.22
+ ├── G9: (eq G14 G15)
+ ├── G10: (eq G16 G17)
+ ├── G11: (scan pqr@q,cols=(1,2),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@q,cols=(1,2),constrained)
+ │         └── cost: 14.41
+ ├── G12: (scan pqr@r,cols=(1,3),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@r,cols=(1,3),constrained)
+ │         └── cost: 14.41
+ ├── G13: (scan pqr@rs,cols=(1,3),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@rs,cols=(1,3),constrained)
+ │         └── cost: 14.51
+ ├── G14: (variable q)
+ ├── G15: (const 1)
+ ├── G16: (variable r)
+ └── G17: (const 2)
+
+# Case where the fixed columns are extracted from a complicated expression.
+opt
+SELECT q,r FROM pqr WHERE q = 1 AND ((r < 1 AND r > 1) OR (r >= 2 AND r <= 2))
+----
+inner-join (zigzag pqr@q pqr@r)
+ ├── columns: q:2!null r:3!null
+ ├── eq columns: [1] = [1]
+ ├── left fixed columns: [2] = [1]
+ ├── right fixed columns: [3] = [2]
+ ├── fd: ()-->(2,3)
+ └── filters
+      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+      └── ((r:3 < 1) AND (r:3 > 1)) OR ((r:3 >= 2) AND (r:3 <= 2)) [outer=(3), constraints=(/3: [/2 - /2]; tight), fd=()-->(3)]
+
+# Nested zigzag case - zigzag join needs to be wrapped in a lookup join to
+# satisfy required columns.
+opt
+SELECT q,r,s FROM pqr WHERE q = 1 AND r = 2
+----
+inner-join (lookup pqr)
+ ├── columns: q:2!null r:3!null s:4
+ ├── key columns: [1] = [1]
+ ├── lookup columns are key
+ ├── fd: ()-->(2,3)
+ ├── inner-join (zigzag pqr@q pqr@r)
+ │    ├── columns: p:1!null q:2!null r:3!null
+ │    ├── eq columns: [1] = [1]
+ │    ├── left fixed columns: [2] = [1]
+ │    ├── right fixed columns: [3] = [2]
+ │    ├── fd: ()-->(2,3)
+ │    └── filters
+ │         ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+ │         └── r:3 = 2 [outer=(3), constraints=(/3: [/2 - /2]; tight), fd=()-->(3)]
+ └── filters (true)
+
+memo
+SELECT q,r,s FROM pqr WHERE q = 1 AND r = 2
+----
+memo (optimized, ~15KB, required=[presentation: q:2,r:3,s:4])
+ ├── G1: (select G2 G3) (select G4 G5) (select G6 G7) (select G8 G7) (lookup-join G9 G10 pqr,keyCols=[1],outCols=(2-4))
+ │    └── [presentation: q:2,r:3,s:4]
+ │         ├── best: (lookup-join G9 G10 pqr,keyCols=[1],outCols=(2-4))
+ │         └── cost: 7.48
+ ├── G2: (scan pqr,cols=(2-4))
+ │    └── []
+ │         ├── best: (scan pqr,cols=(2-4))
+ │         └── cost: 1084.02
+ ├── G3: (filters G11 G12)
+ ├── G4: (index-join G13 pqr,cols=(2-4))
+ │    └── []
+ │         ├── best: (index-join G13 pqr,cols=(2-4))
+ │         └── cost: 75.22
+ ├── G5: (filters G12)
+ ├── G6: (index-join G14 pqr,cols=(2-4))
+ │    └── []
+ │         ├── best: (index-join G14 pqr,cols=(2-4))
+ │         └── cost: 75.22
+ ├── G7: (filters G11)
+ ├── G8: (index-join G15 pqr,cols=(2-4))
+ │    └── []
+ │         ├── best: (index-join G15 pqr,cols=(2-4))
+ │         └── cost: 75.32
+ ├── G9: (zigzag-join G3 pqr@q pqr@r)
+ │    └── []
+ │         ├── best: (zigzag-join G3 pqr@q pqr@r)
+ │         └── cost: 1.94
+ ├── G10: (filters)
+ ├── G11: (eq G16 G17)
+ ├── G12: (eq G18 G19)
+ ├── G13: (scan pqr@q,cols=(1,2),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@q,cols=(1,2),constrained)
+ │         └── cost: 14.41
+ ├── G14: (scan pqr@r,cols=(1,3),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@r,cols=(1,3),constrained)
+ │         └── cost: 14.41
+ ├── G15: (scan pqr@rs,cols=(1,3,4),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@rs,cols=(1,3,4),constrained)
+ │         └── cost: 14.61
+ ├── G16: (variable q)
+ ├── G17: (const 1)
+ ├── G18: (variable r)
+ └── G19: (const 2)
+
+# Zigzag with fixed columns of different types.
+opt
+SELECT q,s FROM pqr WHERE q = 1 AND s = 'foo'
+----
+inner-join (zigzag pqr@q pqr@s)
+ ├── columns: q:2!null s:4!null
+ ├── eq columns: [1] = [1]
+ ├── left fixed columns: [2] = [1]
+ ├── right fixed columns: [4] = ['foo']
+ ├── fd: ()-->(2,4)
+ └── filters
+      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+      └── s:4 = 'foo' [outer=(4), constraints=(/4: [/'foo' - /'foo']; tight), fd=()-->(4)]
+
+memo
+SELECT q,s FROM pqr WHERE q = 1 AND s = 'foo'
+----
+memo (optimized, ~11KB, required=[presentation: q:2,s:4])
+ ├── G1: (select G2 G3) (select G4 G5) (select G6 G7) (zigzag-join G3 pqr@q pqr@s)
+ │    └── [presentation: q:2,s:4]
+ │         ├── best: (zigzag-join G3 pqr@q pqr@s)
+ │         └── cost: 1.94
+ ├── G2: (scan pqr,cols=(2,4))
+ │    └── []
+ │         ├── best: (scan pqr,cols=(2,4))
+ │         └── cost: 1074.02
+ ├── G3: (filters G8 G9)
+ ├── G4: (index-join G10 pqr,cols=(2,4))
+ │    └── []
+ │         ├── best: (index-join G10 pqr,cols=(2,4))
+ │         └── cost: 75.12
+ ├── G5: (filters G9)
+ ├── G6: (index-join G11 pqr,cols=(2,4))
+ │    └── []
+ │         ├── best: (index-join G11 pqr,cols=(2,4))
+ │         └── cost: 75.22
+ ├── G7: (filters G8)
+ ├── G8: (eq G12 G13)
+ ├── G9: (eq G14 G15)
+ ├── G10: (scan pqr@q,cols=(1,2),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@q,cols=(1,2),constrained)
+ │         └── cost: 14.41
+ ├── G11: (scan pqr@s,cols=(1,4),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@s,cols=(1,4),constrained)
+ │         └── cost: 14.51
+ ├── G12: (variable q)
+ ├── G13: (const 1)
+ ├── G14: (variable s)
+ └── G15: (const 'foo')
+
+# Zigzag with implicit equality column in addition to primary key:
+# indexes on (r,s) and (t,s) should be chosen even though s is not being fixed
+# in the ON clause.
+opt
+SELECT r,t FROM pqr WHERE r = 1 AND t = 'foo'
+----
+inner-join (zigzag pqr@rs pqr@ts)
+ ├── columns: r:3!null t:5!null
+ ├── eq columns: [4 1] = [4 1]
+ ├── left fixed columns: [3] = [1]
+ ├── right fixed columns: [5] = ['foo']
+ ├── fd: ()-->(3,5)
+ └── filters
+      ├── r:3 = 1 [outer=(3), constraints=(/3: [/1 - /1]; tight), fd=()-->(3)]
+      └── t:5 = 'foo' [outer=(5), constraints=(/5: [/'foo' - /'foo']; tight), fd=()-->(5)]
+
+memo
+SELECT r,t FROM pqr WHERE r = 1 AND t = 'foo'
+----
+memo (optimized, ~13KB, required=[presentation: r:3,t:5])
+ ├── G1: (select G2 G3) (select G4 G5) (select G6 G5) (select G7 G8) (zigzag-join G3 pqr@rs pqr@ts)
+ │    └── [presentation: r:3,t:5]
+ │         ├── best: (zigzag-join G3 pqr@rs pqr@ts)
+ │         └── cost: 1.95
+ ├── G2: (scan pqr,cols=(3,5))
+ │    └── []
+ │         ├── best: (scan pqr,cols=(3,5))
+ │         └── cost: 1074.02
+ ├── G3: (filters G9 G10)
+ ├── G4: (index-join G11 pqr,cols=(3,5))
+ │    └── []
+ │         ├── best: (index-join G11 pqr,cols=(3,5))
+ │         └── cost: 75.12
+ ├── G5: (filters G10)
+ ├── G6: (index-join G12 pqr,cols=(3,5))
+ │    └── []
+ │         ├── best: (index-join G12 pqr,cols=(3,5))
+ │         └── cost: 75.22
+ ├── G7: (index-join G13 pqr,cols=(3,5))
+ │    └── []
+ │         ├── best: (index-join G13 pqr,cols=(3,5))
+ │         └── cost: 75.22
+ ├── G8: (filters G9)
+ ├── G9: (eq G14 G15)
+ ├── G10: (eq G16 G17)
+ ├── G11: (scan pqr@r,cols=(1,3),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@r,cols=(1,3),constrained)
+ │         └── cost: 14.41
+ ├── G12: (scan pqr@rs,cols=(1,3),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@rs,cols=(1,3),constrained)
+ │         └── cost: 14.51
+ ├── G13: (scan pqr@ts,cols=(1,5),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@ts,cols=(1,5),constrained)
+ │         └── cost: 14.51
+ ├── G14: (variable r)
+ ├── G15: (const 1)
+ ├── G16: (variable t)
+ └── G17: (const 'foo')
+
+# Zigzag with choice between indexes for multiple equality predicates.
+opt
+SELECT p,q,r,s FROM pqr WHERE q = 1 AND r = 1 AND s = 'foo'
+----
+inner-join (zigzag pqr@q pqr@s)
+ ├── columns: p:1!null q:2!null r:3!null s:4!null
+ ├── eq columns: [1] = [1]
+ ├── left fixed columns: [2] = [1]
+ ├── right fixed columns: [4] = ['foo']
+ ├── key: (1)
+ ├── fd: ()-->(2-4)
+ └── filters
+      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+      ├── r:3 = 1 [outer=(3), constraints=(/3: [/1 - /1]; tight), fd=()-->(3)]
+      └── s:4 = 'foo' [outer=(4), constraints=(/4: [/'foo' - /'foo']; tight), fd=()-->(4)]
+
+# Tests for zigzag joins over partial indexes.
+
+exec-ddl
+CREATE TABLE zz_partial (
+    k INT PRIMARY KEY,
+    i INT,
+    j INT,
+    b1 BOOL,
+    b2 BOOL,
+    s STRING
+)
+----
+
+exec-ddl
+CREATE INDEX i ON zz_partial (i) WHERE b1
+----
+
+exec-ddl
+CREATE INDEX j ON zz_partial (j) WHERE b2
+----
+
+# Generate a zigzag join over two partial indexes.
+opt expect=GenerateZigzagJoins
+SELECT k FROM zz_partial WHERE i = 10 AND b1 AND j = 20 AND b2
+----
+project
+ ├── columns: k:1!null
+ ├── key: (1)
+ └── inner-join (lookup zz_partial)
+      ├── columns: k:1!null i:2!null j:3!null b1:4!null b2:5!null
+      ├── key columns: [1] = [1]
+      ├── lookup columns are key
+      ├── key: (1)
+      ├── fd: ()-->(2-5)
+      ├── inner-join (zigzag zz_partial@i zz_partial@j)
+      │    ├── columns: k:1!null i:2!null j:3!null
+      │    ├── eq columns: [1] = [1]
+      │    ├── left fixed columns: [2] = [10]
+      │    ├── right fixed columns: [3] = [20]
+      │    ├── fd: ()-->(2,3)
+      │    └── filters
+      │         ├── i:2 = 10 [outer=(2), constraints=(/2: [/10 - /10]; tight), fd=()-->(2)]
+      │         └── j:3 = 20 [outer=(3), constraints=(/3: [/20 - /20]; tight), fd=()-->(3)]
+      └── filters (true)
+
+# Don't generate a zigzag join when the first index predicate is not implied.
+opt expect-not=GenerateZigzagJoins format=hide-all
+SELECT k FROM zz_partial WHERE i = 10 AND j = 20 AND b2
+----
+project
+ └── select
+      ├── index-join zz_partial
+      │    └── select
+      │         ├── scan zz_partial@j,partial
+      │         └── filters
+      │              └── j = 20
+      └── filters
+           └── i = 10
+
+# Don't generate a zigzag join when the second index predicate is not implied.
+opt expect-not=GenerateZigzagJoins format=hide-all
+SELECT k FROM zz_partial WHERE i = 10 AND b1 AND j = 20
+----
+project
+ └── select
+      ├── index-join zz_partial
+      │    └── select
+      │         ├── scan zz_partial@i,partial
+      │         └── filters
+      │              └── i = 10
+      └── filters
+           └── j = 20
+
+exec-ddl
+DROP INDEX j
+----
+
+exec-ddl
+CREATE INDEX j ON zz_partial (j)
+----
+
+# Generate a zigzag join over one partial and one non-partial index.
+opt expect=GenerateZigzagJoins
+SELECT k FROM zz_partial WHERE i = 10 AND b1 AND j = 20
+----
+project
+ ├── columns: k:1!null
+ ├── key: (1)
+ └── inner-join (lookup zz_partial)
+      ├── columns: k:1!null i:2!null j:3!null b1:4!null
+      ├── key columns: [1] = [1]
+      ├── lookup columns are key
+      ├── key: (1)
+      ├── fd: ()-->(2-4)
+      ├── inner-join (zigzag zz_partial@i zz_partial@j)
+      │    ├── columns: k:1!null i:2!null j:3!null
+      │    ├── eq columns: [1] = [1]
+      │    ├── left fixed columns: [2] = [10]
+      │    ├── right fixed columns: [3] = [20]
+      │    ├── fd: ()-->(2,3)
+      │    └── filters
+      │         ├── i:2 = 10 [outer=(2), constraints=(/2: [/10 - /10]; tight), fd=()-->(2)]
+      │         └── j:3 = 20 [outer=(3), constraints=(/3: [/20 - /20]; tight), fd=()-->(3)]
+      └── filters (true)
+
+# Don't generate a zigzag join when the partial index predicate is not implied.
+opt expect-not=GenerateZigzagJoins format=hide-all
+SELECT k FROM zz_partial WHERE i = 10 AND j = 20
+----
+project
+ └── select
+      ├── index-join zz_partial
+      │    └── scan zz_partial@j
+      │         └── constraint: /3/1: [/20 - /20]
+      └── filters
+           └── i = 10
+
+exec-ddl
+DROP INDEX i
+----
+
+exec-ddl
+DROP INDEX j
+----
+
+exec-ddl
+CREATE INDEX i ON zz_partial (i) WHERE i = 10
+----
+
+exec-ddl
+CREATE INDEX j ON zz_partial (j)
+----
+
+# Don't generate a zigzag join when the expression that fixes the left columns
+# is removed during partial index implication of the left index.
+opt expect-not=GenerateZigzagJoins format=hide-all
+SELECT k FROM zz_partial WHERE i = 10 AND j = 20
+----
+project
+ └── select
+      ├── index-join zz_partial
+      │    └── scan zz_partial@i,partial
+      └── filters
+           └── j = 20
+
+exec-ddl
+DROP INDEX i
+----
+
+exec-ddl
+DROP INDEX j
+----
+
+exec-ddl
+CREATE INDEX i ON zz_partial (i)
+----
+
+exec-ddl
+CREATE INDEX j ON zz_partial (j) WHERE j = 20
+----
+
+# Don't generate a zigzag join when the expression that fixes the right columns
+# is removed during partial index implication of the right index.
+opt expect-not=GenerateZigzagJoins format=hide-all
+SELECT k FROM zz_partial WHERE i = 10 AND j = 20
+----
+project
+ └── select
+      ├── index-join zz_partial
+      │    └── scan zz_partial@j,partial
+      └── filters
+           └── i = 10
+
+exec-ddl
+DROP INDEX i
+----
+
+exec-ddl
+DROP INDEX j
+----
+
+exec-ddl
+CREATE INDEX zz_partial_s ON zz_partial (s)
+----
+
+exec-ddl
+CREATE INDEX j ON zz_partial (j) WHERE s = 'foo'
+----
+
+# Don't generate a zigzag join when the expression that fixes the left columns
+# is removed during partial index implication of the right index.
+opt expect-not=GenerateZigzagJoins format=hide-all
+SELECT k FROM zz_partial WHERE s = 'foo' AND j = 20
+----
+project
+ └── scan zz_partial@j,partial
+      └── constraint: /3/1: [/20 - /20]
+
+exec-ddl
+DROP INDEX zz_partial_s
+----
+
+exec-ddl
+DROP INDEX j
+----
+
+exec-ddl
+CREATE INDEX i ON zz_partial (i) WHERE s = 'foo'
+----
+
+exec-ddl
+CREATE INDEX zz_partial_s ON zz_partial (s)
+----
+
+# Don't generate a zigzag join when the expression that fixes the right columns
+# is removed during partial index implication of the left index.
+opt expect-not=GenerateZigzagJoins format=hide-all
+SELECT k FROM zz_partial WHERE i = 10 AND s = 'foo'
+----
+project
+ └── scan zz_partial@i,partial
+      └── constraint: /2/1: [/10 - /10]
+
+exec-ddl
+DROP INDEX i
+----
+
+exec-ddl
+DROP INDEX zz_partial_s
+----
+
+exec-ddl
+CREATE INDEX i ON zz_partial (i)
+----
+
+exec-ddl
+CREATE INDEX b1 ON zz_partial (b1) WHERE s = 'foo'
+----
+
+exec-ddl
+CREATE INDEX j ON zz_partial (j)
+----
+
+# The filters should be reset during each iteration over the left and right
+# indexes if they are reduced while proving partial index implication. In this
+# test, (s = 'foo') must be applied after the zigzag join.
+opt expect=GenerateZigzagJoins
+SELECT k FROM zz_partial WHERE i = 10 AND j = 20 AND b1 AND s = 'foo'
+----
+project
+ ├── columns: k:1!null
+ ├── key: (1)
+ └── inner-join (lookup zz_partial)
+      ├── columns: k:1!null i:2!null j:3!null b1:4!null s:6!null
+      ├── key columns: [1] = [1]
+      ├── lookup columns are key
+      ├── key: (1)
+      ├── fd: ()-->(2-4,6)
+      ├── inner-join (zigzag zz_partial@i zz_partial@j)
+      │    ├── columns: k:1!null i:2!null j:3!null
+      │    ├── eq columns: [1] = [1]
+      │    ├── left fixed columns: [2] = [10]
+      │    ├── right fixed columns: [3] = [20]
+      │    ├── fd: ()-->(2,3)
+      │    └── filters
+      │         ├── i:2 = 10 [outer=(2), constraints=(/2: [/10 - /10]; tight), fd=()-->(2)]
+      │         └── j:3 = 20 [outer=(3), constraints=(/3: [/20 - /20]; tight), fd=()-->(3)]
+      └── filters
+           ├── b1:4 [outer=(4), constraints=(/4: [/true - /true]; tight), fd=()-->(4)]
+           └── s:6 = 'foo' [outer=(6), constraints=(/6: [/'foo' - /'foo']; tight), fd=()-->(6)]
+
+# Don't generate a zigzag which has the PK as its equality columns against
+# nullable unique indexes where the primary key is not part of the indexed
+# columns.
+
+# Regression test for #36051: prior to fixing this, we would try to use the PK
+# as the equality column here, but it's not actually part of the key so we
+# can't zigzag on it.
+opt expect-not=GenerateZigzagJoins
+SELECT * FROM zz WHERE b IS NULL AND c = 2
+----
+select
+ ├── columns: a:1!null b:2 c:3!null
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ ├── fd: ()-->(1-3)
+ ├── index-join zz
+ │    ├── columns: a:1!null b:2 c:3
+ │    ├── cardinality: [0 - 1]
+ │    ├── key: ()
+ │    ├── fd: ()-->(1-3)
+ │    └── scan zz@idx_c
+ │         ├── columns: a:1!null c:3!null
+ │         ├── constraint: /3: [/2 - /2]
+ │         ├── cardinality: [0 - 1]
+ │         ├── key: ()
+ │         └── fd: ()-->(1,3)
+ └── filters
+      └── b:2 IS NULL [outer=(2), constraints=(/2: [/NULL - /NULL]; tight), fd=()-->(2)]
+
+memo
+SELECT p,q,r,s FROM pqr WHERE q = 1 AND r = 1 AND s = 'foo'
+----
+memo (optimized, ~31KB, required=[presentation: p:1,q:2,r:3,s:4])
+ ├── G1: (select G2 G3) (select G4 G5) (select G6 G7) (select G8 G9) (select G10 G9) (lookup-join G11 G12 pqr,keyCols=[1],outCols=(1-4)) (zigzag-join G3 pqr@q pqr@s) (zigzag-join G3 pqr@q pqr@rs) (lookup-join G13 G9 pqr,keyCols=[1],outCols=(1-4))
+ │    └── [presentation: p:1,q:2,r:3,s:4]
+ │         ├── best: (zigzag-join G3 pqr@q pqr@s)
+ │         └── cost: 1.95
+ ├── G2: (scan pqr,cols=(1-4))
+ │    └── []
+ │         ├── best: (scan pqr,cols=(1-4))
+ │         └── cost: 1094.02
+ ├── G3: (filters G14 G15 G16)
+ ├── G4: (index-join G17 pqr,cols=(1-4))
+ │    └── []
+ │         ├── best: (index-join G17 pqr,cols=(1-4))
+ │         └── cost: 75.22
+ ├── G5: (filters G15 G16)
+ ├── G6: (index-join G18 pqr,cols=(1-4))
+ │    └── []
+ │         ├── best: (index-join G18 pqr,cols=(1-4))
+ │         └── cost: 75.22
+ ├── G7: (filters G14 G16)
+ ├── G8: (index-join G19 pqr,cols=(1-4))
+ │    └── []
+ │         ├── best: (index-join G19 pqr,cols=(1-4))
+ │         └── cost: 21.76
+ ├── G9: (filters G14)
+ ├── G10: (index-join G20 pqr,cols=(1-4))
+ │    └── []
+ │         ├── best: (index-join G20 pqr,cols=(1-4))
+ │         └── cost: 10.51
+ ├── G11: (zigzag-join G21 pqr@q pqr@r)
+ │    └── []
+ │         ├── best: (zigzag-join G21 pqr@q pqr@r)
+ │         └── cost: 1.94
+ ├── G12: (filters G16)
+ ├── G13: (zigzag-join G5 pqr@r pqr@s)
+ │    └── []
+ │         ├── best: (zigzag-join G5 pqr@r pqr@s)
+ │         └── cost: 1.95
+ ├── G14: (eq G22 G23)
+ ├── G15: (eq G24 G23)
+ ├── G16: (eq G25 G26)
+ ├── G17: (scan pqr@q,cols=(1,2),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@q,cols=(1,2),constrained)
+ │         └── cost: 14.41
+ ├── G18: (scan pqr@r,cols=(1,3),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@r,cols=(1,3),constrained)
+ │         └── cost: 14.41
+ ├── G19: (select G27 G28)
+ │    └── []
+ │         ├── best: (select G27 G28)
+ │         └── cost: 14.73
+ ├── G20: (scan pqr@rs,cols=(1,3,4),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@rs,cols=(1,3,4),constrained)
+ │         └── cost: 4.98
+ ├── G21: (filters G14 G15)
+ ├── G22: (variable q)
+ ├── G23: (const 1)
+ ├── G24: (variable r)
+ ├── G25: (variable s)
+ ├── G26: (const 'foo')
+ ├── G27: (scan pqr@s,cols=(1,3,4),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@s,cols=(1,3,4),constrained)
+ │         └── cost: 14.61
+ └── G28: (filters G15)
+
+# Zigzag joins cannot be planned for indexes where equality columns do not
+# immediately follow fixed columns. Here, the only index on t is (t,s,p) and
+# s is not a fixed or equal column, so a zigzag join shouldn't be planned.
+opt
+SELECT q,t FROM pqr WHERE q = 1 AND t = 'foo'
+----
+select
+ ├── columns: q:2!null t:5!null
+ ├── fd: ()-->(2,5)
+ ├── index-join pqr
+ │    ├── columns: q:2 t:5
+ │    ├── fd: ()-->(2)
+ │    └── scan pqr@q
+ │         ├── columns: p:1!null q:2!null
+ │         ├── constraint: /2/1: [/1 - /1]
+ │         ├── key: (1)
+ │         └── fd: ()-->(2)
+ └── filters
+      └── t:5 = 'foo' [outer=(5), constraints=(/5: [/'foo' - /'foo']; tight), fd=()-->(5)]
+
+memo
+SELECT q,t FROM pqr WHERE q = 1 AND t = 'foo'
+----
+memo (optimized, ~9KB, required=[presentation: q:2,t:5])
+ ├── G1: (select G2 G3) (select G4 G5) (select G6 G7)
+ │    └── [presentation: q:2,t:5]
+ │         ├── best: (select G4 G5)
+ │         └── cost: 75.24
+ ├── G2: (scan pqr,cols=(2,5))
+ │    └── []
+ │         ├── best: (scan pqr,cols=(2,5))
+ │         └── cost: 1074.02
+ ├── G3: (filters G8 G9)
+ ├── G4: (index-join G10 pqr,cols=(2,5))
+ │    └── []
+ │         ├── best: (index-join G10 pqr,cols=(2,5))
+ │         └── cost: 75.12
+ ├── G5: (filters G9)
+ ├── G6: (index-join G11 pqr,cols=(2,5))
+ │    └── []
+ │         ├── best: (index-join G11 pqr,cols=(2,5))
+ │         └── cost: 75.22
+ ├── G7: (filters G8)
+ ├── G8: (eq G12 G13)
+ ├── G9: (eq G14 G15)
+ ├── G10: (scan pqr@q,cols=(1,2),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@q,cols=(1,2),constrained)
+ │         └── cost: 14.41
+ ├── G11: (scan pqr@ts,cols=(1,5),constrained)
+ │    └── []
+ │         ├── best: (scan pqr@ts,cols=(1,5),constrained)
+ │         └── cost: 14.51
+ ├── G12: (variable q)
+ ├── G13: (const 1)
+ ├── G14: (variable t)
+ └── G15: (const 'foo')
+
+# Don't zigzag on two identical indexes.
+memo
+SELECT c FROM zz_redundant WHERE b = 1
+----
+memo (optimized, ~6KB, required=[presentation: c:3])
+ ├── G1: (project G2 G3 c)
+ │    └── [presentation: c:3]
+ │         ├── best: (project G2 G3 c)
+ │         └── cost: 14.62
+ ├── G2: (select G4 G5) (scan zz_redundant@idx_u,cols=(2,3),constrained) (scan zz_redundant@idx_v,cols=(2,3),constrained)
+ │    └── []
+ │         ├── best: (scan zz_redundant@idx_u,cols=(2,3),constrained)
+ │         └── cost: 14.51
+ ├── G3: (projections)
+ ├── G4: (scan zz_redundant,cols=(2,3)) (scan zz_redundant@idx_u,cols=(2,3)) (scan zz_redundant@idx_v,cols=(2,3))
+ │    └── []
+ │         ├── best: (scan zz_redundant,cols=(2,3))
+ │         └── cost: 1054.02
+ ├── G5: (filters G6)
+ ├── G6: (eq G7 G8)
+ ├── G7: (variable b)
+ └── G8: (const 1)
+
+# GenerateZigzagJoins is disabled in the presence of a row-level locking clause.
+opt
+SELECT q,r FROM pqr WHERE q = 1 AND r = 2 FOR UPDATE
+----
+select
+ ├── columns: q:2!null r:3!null
+ ├── volatile
+ ├── fd: ()-->(2,3)
+ ├── index-join pqr
+ │    ├── columns: q:2 r:3
+ │    ├── volatile
+ │    ├── fd: ()-->(2)
+ │    └── scan pqr@q
+ │         ├── columns: p:1!null q:2!null
+ │         ├── constraint: /2/1: [/1 - /1]
+ │         ├── locking: for-update
+ │         ├── volatile
+ │         ├── key: (1)
+ │         └── fd: ()-->(2)
+ └── filters
+      └── r:3 = 2 [outer=(3), constraints=(/3: [/2 - /2]; tight), fd=()-->(3)]
+
+# --------------------------------------------------
+# GenerateInvertedIndexZigzagJoins
+# --------------------------------------------------
+
+exec-ddl
+CREATE TABLE t5 (
+    a INT PRIMARY KEY,
+    b JSONB,
+    c INT,
+    INVERTED INDEX b_idx(b)
+)
+----
+
+# Query only the primary key with a remaining filter. 2+ paths in containment
+# query should favor zigzag joins.
+opt
+SELECT k FROM b WHERE j @> '{"a": "b", "c": "d"}'
+----
+project
+ ├── columns: k:1!null
+ ├── immutable
+ ├── key: (1)
+ └── inner-join (lookup b)
+      ├── columns: k:1!null j:4!null
+      ├── key columns: [1] = [1]
+      ├── lookup columns are key
+      ├── immutable
+      ├── key: (1)
+      ├── fd: (1)-->(4)
+      ├── inner-join (zigzag b@inv_idx b@inv_idx)
+      │    ├── columns: k:1!null
+      │    ├── eq columns: [1] = [1]
+      │    ├── left fixed columns: [4] = ['{"a": "b"}']
+      │    ├── right fixed columns: [4] = ['{"c": "d"}']
+      │    └── filters (true)
+      └── filters
+           └── j:4 @> '{"a": "b", "c": "d"}' [outer=(4), immutable, constraints=(/4: (/NULL - ])]
+
+# Query requiring a zigzag join with a remaining filter.
+# TODO(itsbilal): remove filter from index join if zigzag join covers it.
+opt
+SELECT j, k FROM b WHERE j @> '{"a": "b", "c": "d"}'
+----
+inner-join (lookup b)
+ ├── columns: j:4!null k:1!null
+ ├── key columns: [1] = [1]
+ ├── lookup columns are key
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(4)
+ ├── inner-join (zigzag b@inv_idx b@inv_idx)
+ │    ├── columns: k:1!null
+ │    ├── eq columns: [1] = [1]
+ │    ├── left fixed columns: [4] = ['{"a": "b"}']
+ │    ├── right fixed columns: [4] = ['{"c": "d"}']
+ │    └── filters (true)
+ └── filters
+      └── j:4 @> '{"a": "b", "c": "d"}' [outer=(4), immutable, constraints=(/4: (/NULL - ])]
+
+opt
+SELECT * FROM b WHERE j @> '{"a": {"b": "c", "d": "e"}, "f": "g"}'
+----
+inner-join (lookup b)
+ ├── columns: k:1!null u:2 v:3 j:4!null
+ ├── key columns: [1] = [1]
+ ├── lookup columns are key
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ ├── inner-join (zigzag b@inv_idx b@inv_idx)
+ │    ├── columns: k:1!null
+ │    ├── eq columns: [1] = [1]
+ │    ├── left fixed columns: [4] = ['{"a": {"b": "c"}}']
+ │    ├── right fixed columns: [4] = ['{"a": {"d": "e"}}']
+ │    └── filters (true)
+ └── filters
+      └── j:4 @> '{"a": {"b": "c", "d": "e"}, "f": "g"}' [outer=(4), immutable, constraints=(/4: (/NULL - ])]
+
+opt
+SELECT k FROM c WHERE a @> ARRAY[1,3,1,5]
+----
+project
+ ├── columns: k:1!null
+ ├── immutable
+ ├── key: (1)
+ └── inner-join (lookup c)
+      ├── columns: k:1!null a:2!null
+      ├── key columns: [1] = [1]
+      ├── lookup columns are key
+      ├── immutable
+      ├── key: (1)
+      ├── fd: (1)-->(2)
+      ├── inner-join (zigzag c@inv_idx c@inv_idx)
+      │    ├── columns: k:1!null
+      │    ├── eq columns: [1] = [1]
+      │    ├── left fixed columns: [2] = [ARRAY[1]]
+      │    ├── right fixed columns: [2] = [ARRAY[3]]
+      │    └── filters (true)
+      └── filters
+           └── a:2 @> ARRAY[1,3,1,5] [outer=(2), immutable, constraints=(/2: (/NULL - ])]
+
+# Two paths. Should generate a zigzag join.
+opt
+SELECT b,a FROM t5 WHERE b @> '{"a":1, "c":2}'
+----
+inner-join (lookup t5)
+ ├── columns: b:2!null a:1!null
+ ├── key columns: [1] = [1]
+ ├── lookup columns are key
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── inner-join (zigzag t5@b_idx t5@b_idx)
+ │    ├── columns: a:1!null
+ │    ├── eq columns: [1] = [1]
+ │    ├── left fixed columns: [2] = ['{"a": 1}']
+ │    ├── right fixed columns: [2] = ['{"c": 2}']
+ │    └── filters (true)
+ └── filters
+      └── b:2 @> '{"a": 1, "c": 2}' [outer=(2), immutable, constraints=(/2: (/NULL - ])]
+
+memo
+SELECT a FROM t5 WHERE b @> '{"a":1, "c":2}'
+----
+memo (optimized, ~14KB, required=[presentation: a:1])
+ ├── G1: (project G2 G3 a)
+ │    └── [presentation: a:1]
+ │         ├── best: (project G2 G3 a)
+ │         └── cost: 100.53
+ ├── G2: (select G4 G5) (select G6 G5) (lookup-join G7 G5 t5,keyCols=[1],outCols=(1,2))
+ │    └── []
+ │         ├── best: (lookup-join G7 G5 t5,keyCols=[1],outCols=(1,2))
+ │         └── cost: 100.40
+ ├── G3: (projections)
+ ├── G4: (scan t5,cols=(1,2))
+ │    └── []
+ │         ├── best: (scan t5,cols=(1,2))
+ │         └── cost: 1054.02
+ ├── G5: (filters G8)
+ ├── G6: (index-join G9 t5,cols=(1,2))
+ │    └── []
+ │         ├── best: (index-join G9 t5,cols=(1,2))
+ │         └── cost: 782.82
+ ├── G7: (zigzag-join G10 t5@b_idx t5@b_idx)
+ │    └── []
+ │         ├── best: (zigzag-join G10 t5@b_idx t5@b_idx)
+ │         └── cost: 25.69
+ ├── G8: (contains G11 G12)
+ ├── G9: (scan t5@b_idx,cols=(1),constrained)
+ │    └── []
+ │         ├── best: (scan t5@b_idx,cols=(1),constrained)
+ │         └── cost: 117.31
+ ├── G10: (filters)
+ ├── G11: (variable b)
+ └── G12: (const '{"a": 1, "c": 2}')
+
+# Three or more paths. Should generate zigzag joins.
+opt
+SELECT b,a FROM t5 WHERE b @> '{"a":[{"b":"c", "d":3}, 5]}'
+----
+inner-join (lookup t5)
+ ├── columns: b:2!null a:1!null
+ ├── key columns: [1] = [1]
+ ├── lookup columns are key
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── inner-join (zigzag t5@b_idx t5@b_idx)
+ │    ├── columns: a:1!null
+ │    ├── eq columns: [1] = [1]
+ │    ├── left fixed columns: [2] = ['{"a": [{"b": "c"}]}']
+ │    ├── right fixed columns: [2] = ['{"a": [{"d": 3}]}']
+ │    └── filters (true)
+ └── filters
+      └── b:2 @> '{"a": [{"b": "c", "d": 3}, 5]}' [outer=(2), immutable, constraints=(/2: (/NULL - ])]
+
+# GenerateInvertedIndexZigzagJoins is disabled in the presence of a row-level
+# locking clause.
+opt expect-not=GenerateInvertedIndexZigzagJoins
+SELECT b,a FROM t5 WHERE b @> '{"a":1, "c":2}' FOR UPDATE
+----
+select
+ ├── columns: b:2!null a:1!null
+ ├── volatile
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── index-join t5
+ │    ├── columns: a:1!null b:2
+ │    ├── volatile
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2)
+ │    └── scan t5@b_idx
+ │         ├── columns: a:1!null
+ │         ├── constraint: /2/1: [/'{"a": 1}' - /'{"a": 1}']
+ │         ├── locking: for-update
+ │         ├── volatile
+ │         └── key: (1)
+ └── filters
+      └── b:2 @> '{"a": 1, "c": 2}' [outer=(2), immutable, constraints=(/2: (/NULL - ])]
 
 # --------------------------------------------------
 # SplitDisjunction
@@ -2197,7 +4197,7 @@ project
       │    │    ├── key: ()
       │    │    └── fd: ()-->(1,4)
       │    └── index-join b
-      │         ├── columns: k:7!null j:10
+      │         ├── columns: k:7!null j:10!null
       │         ├── immutable
       │         ├── key: (7)
       │         ├── fd: (7)-->(10)
@@ -2235,7 +4235,7 @@ project
       │    │    ├── key: ()
       │    │    └── fd: ()-->(1,2)
       │    └── index-join c
-      │         ├── columns: k:6!null a:7
+      │         ├── columns: k:6!null a:7!null
       │         ├── immutable
       │         ├── key: (6)
       │         ├── fd: (6)-->(7)
@@ -2922,30 +4922,20 @@ project
       │    │    ├── columns: k:1!null a:2!null b:3
       │    │    ├── key: (1)
       │    │    ├── fd: ()-->(2), (1)-->(3)
-      │    │    └── select
+      │    │    └── scan t52207@idx_a,partial
       │    │         ├── columns: k:1!null a:2!null
+      │    │         ├── constraint: /2/1: [/1 - /1]
       │    │         ├── key: (1)
-      │    │         ├── fd: ()-->(2)
-      │    │         ├── scan t52207@idx_a,partial
-      │    │         │    ├── columns: k:1!null a:2
-      │    │         │    ├── key: (1)
-      │    │         │    └── fd: (1)-->(2)
-      │    │         └── filters
-      │    │              └── a:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+      │    │         └── fd: ()-->(2)
       │    └── index-join t52207
       │         ├── columns: k:5!null a:6 b:7!null
       │         ├── key: (5)
       │         ├── fd: ()-->(7), (5)-->(6)
-      │         └── select
+      │         └── scan t52207@idx_b,partial
       │              ├── columns: k:5!null b:7!null
+      │              ├── constraint: /7/5: [/1 - /1]
       │              ├── key: (5)
-      │              ├── fd: ()-->(7)
-      │              ├── scan t52207@idx_b,partial
-      │              │    ├── columns: k:5!null b:7
-      │              │    ├── key: (5)
-      │              │    └── fd: (5)-->(7)
-      │              └── filters
-      │                   └── b:7 = 1 [outer=(7), constraints=(/7: [/1 - /1]; tight), fd=()-->(7)]
+      │              └── fd: ()-->(7)
       └── aggregations
            ├── const-agg [as=a:2, outer=(2)]
            │    └── a:2
@@ -3132,7 +5122,6 @@ scalar-group-by
  └── aggregations
       └── count-rows [as=count_rows:6]
 
-
 # Multi-column primary key.
 opt expect=SplitDisjunctionAddKey
 SELECT u, v FROM f WHERE u = 1 OR v = 2
@@ -3239,7 +5228,7 @@ project
       │    │         ├── key: (1)
       │    │         └── fd: ()-->(2)
       │    └── index-join b
-      │         ├── columns: k:7!null u:8 j:10
+      │         ├── columns: k:7!null u:8 j:10!null
       │         ├── immutable
       │         ├── key: (7)
       │         ├── fd: (7)-->(8,10)
@@ -3281,7 +5270,7 @@ project
       │    │         ├── key: (1)
       │    │         └── fd: ()-->(3)
       │    └── index-join c
-      │         ├── columns: k:6!null a:7 u:8
+      │         ├── columns: k:6!null a:7!null u:8
       │         ├── immutable
       │         ├── key: (6)
       │         ├── fd: (6)-->(7,8)

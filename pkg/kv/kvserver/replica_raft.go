@@ -905,7 +905,7 @@ func (r *Replica) tick(livenessMap IsLiveMap) (bool, error) {
 		return false, nil
 	}
 
-	r.maybeTransferRaftLeadershipLocked(ctx)
+	r.maybeTransferRaftLeadershipToLeaseholderLocked(ctx)
 
 	// For followers, we update lastUpdateTimes when we step a message from them
 	// into the local Raft group. The leader won't hit that path, so we update
@@ -1046,6 +1046,7 @@ func (r *Replica) maybeCoalesceHeartbeat(
 	msg raftpb.Message,
 	toReplica, fromReplica roachpb.ReplicaDescriptor,
 	quiesce bool,
+	lagging laggingReplicaSet,
 ) bool {
 	var hbMap map[roachpb.StoreIdent][]RaftHeartbeat
 	switch msg.Type {
@@ -1059,12 +1060,14 @@ func (r *Replica) maybeCoalesceHeartbeat(
 		return false
 	}
 	beat := RaftHeartbeat{
-		RangeID:       r.RangeID,
-		ToReplicaID:   toReplica.ReplicaID,
-		FromReplicaID: fromReplica.ReplicaID,
-		Term:          msg.Term,
-		Commit:        msg.Commit,
-		Quiesce:       quiesce,
+		RangeID:                           r.RangeID,
+		ToReplicaID:                       toReplica.ReplicaID,
+		FromReplicaID:                     fromReplica.ReplicaID,
+		Term:                              msg.Term,
+		Commit:                            msg.Commit,
+		Quiesce:                           quiesce,
+		LaggingFollowersOnQuiesce:         lagging,
+		LaggingFollowersOnQuiesceAccurate: quiesce,
 	}
 	if log.V(4) {
 		log.Infof(ctx, "coalescing beat: %+v", beat)
@@ -1171,7 +1174,7 @@ func (r *Replica) sendRaftMessage(ctx context.Context, msg raftpb.Message) {
 		return
 	}
 
-	if r.maybeCoalesceHeartbeat(ctx, msg, toReplica, fromReplica, false) {
+	if r.maybeCoalesceHeartbeat(ctx, msg, toReplica, fromReplica, false, nil) {
 		return
 	}
 
@@ -1564,17 +1567,6 @@ func (r *Replica) maybeAcquireSnapshotMergeLock(
 		subsumedRepls = append(subsumedRepls, sRepl)
 		endKey = sRepl.Desc().EndKey
 	}
-	// TODO(benesch): we may be unnecessarily forcing another Raft snapshot here
-	// by subsuming too much. Consider the case where [a, b) and [c, e) first
-	// merged into [a, e), then split into [a, d) and [d, e), and we're applying a
-	// snapshot that spans this merge and split. The bounds of this snapshot will
-	// be [a, d), so we'll subsume [c, e). But we're still a member of [d, e)!
-	// We'll currently be forced to get a Raft snapshot to catch up. Ideally, we'd
-	// subsume only half of [c, e) and synthesize a new RHS [d, e), effectively
-	// applying both the split and merge during snapshot application. This isn't a
-	// huge deal, though: we're probably behind enough that the RHS would need to
-	// get caught up with a Raft snapshot anyway, even if we synthesized it
-	// properly.
 	return subsumedRepls, func() {
 		for _, sr := range subsumedRepls {
 			sr.raftMu.Unlock()

@@ -838,6 +838,11 @@ const (
 	UnboundedFollowing
 )
 
+// IsOffset returns true if the WindowFrameBoundType is an offset.
+func (ft WindowFrameBoundType) IsOffset() bool {
+	return ft == OffsetPreceding || ft == OffsetFollowing
+}
+
 // WindowFrameBound specifies the offset and the type of boundary.
 type WindowFrameBound struct {
 	BoundType  WindowFrameBoundType
@@ -846,7 +851,7 @@ type WindowFrameBound struct {
 
 // HasOffset returns whether node contains an offset.
 func (node *WindowFrameBound) HasOffset() bool {
-	return node.BoundType == OffsetPreceding || node.BoundType == OffsetFollowing
+	return node.BoundType.IsOffset()
 }
 
 // WindowFrameBounds specifies boundaries of the window frame.
@@ -1027,9 +1032,10 @@ func (s LockingStrength) Max(s2 LockingStrength) LockingStrength {
 	return LockingStrength(max(byte(s), byte(s2)))
 }
 
-// LockingWaitPolicy represents the possible policies for dealing with rows
-// being locked by FOR UPDATE/SHARE clauses (i.e., it represents the NOWAIT
-// and SKIP LOCKED options).
+// LockingWaitPolicy represents the possible policies for handling conflicting
+// locks held by other active transactions when attempting to lock rows due to
+// FOR UPDATE/SHARE clauses (i.e. it represents the NOWAIT and SKIP LOCKED
+// options).
 type LockingWaitPolicy byte
 
 // The ordering of the variants is important, because the highest numerical

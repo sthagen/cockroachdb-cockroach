@@ -14,11 +14,13 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	// Import builtins so they are reflected in tree.FunDefs.
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -172,7 +174,7 @@ FROM
 		// Try to construct type information from the resulting row.
 		switch {
 		case len(members) > 0:
-			typ := types.MakeEnum(sqlbase.TypeIDToOID(descpb.ID(id)), 0 /* arrayTypeID */)
+			typ := types.MakeEnum(typedesc.TypeIDToOID(descpb.ID(id)), 0 /* arrayTypeID */)
 			typ.TypeMeta = types.UserDefinedTypeMetadata{
 				Name: &types.UserDefinedTypeName{
 					Schema: scName,
@@ -202,7 +204,7 @@ FROM
 	return &typeInfo{
 		udts:        udtMapping,
 		scalarTypes: append(udts, types.Scalar...),
-		seedTypes:   append(udts, sqlbase.SeedTypes...),
+		seedTypes:   append(udts, rowenc.SeedTypes...),
 	}, nil
 }
 
@@ -246,10 +248,13 @@ ORDER BY
 			return fmt.Errorf("zero columns for %s.%s", lastCatalog, lastName)
 		}
 		// All non virtual tables contain implicit system columns.
-		currentCols = append(currentCols, &tree.ColumnTableDef{
-			Name: sqlbase.MVCCTimestampColumnName,
-			Type: sqlbase.MVCCTimestampColumnType,
-		})
+		for i := range colinfo.AllSystemColumnDescs {
+			col := &colinfo.AllSystemColumnDescs[i]
+			currentCols = append(currentCols, &tree.ColumnTableDef{
+				Name: tree.Name(col.Name),
+				Type: col.Type,
+			})
+		}
 		tables = append(tables, &tableRef{
 			TableName: tree.NewTableName(lastCatalog, lastName),
 			Columns:   currentCols,

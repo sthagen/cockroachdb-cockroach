@@ -16,13 +16,17 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/errors"
@@ -827,7 +831,7 @@ var pgBuiltins = map[string]builtinDefinition{
 		},
 	),
 
-	"format_type": makeBuiltin(tree.FunctionProperties{NullableArgs: true},
+	"format_type": makeBuiltin(tree.FunctionProperties{NullableArgs: true, DistsqlBlocklist: true},
 		tree.Overload{
 			Types:      tree.ArgTypes{{"type_oid", types.Oid}, {"typemod", types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
@@ -838,9 +842,25 @@ var pgBuiltins = map[string]builtinDefinition{
 					return tree.DNull, nil
 				}
 				maybeTypmod := args[1]
-				typ, ok := types.OidToType[oid.Oid(int(oidArg.(*tree.DOid).DInt))]
+				oid := oid.Oid(int(oidArg.(*tree.DOid).DInt))
+				typ, ok := types.OidToType[oid]
 				if !ok {
-					return tree.NewDString(fmt.Sprintf("unknown (OID=%s)", oidArg)), nil
+					// If the type wasn't statically known, try looking it up as a user
+					// defined type.
+					var err error
+					typ, err = ctx.Planner.ResolveTypeByOID(ctx.Context, oid)
+					if err != nil {
+						// If the error is a descriptor does not exist error, then swallow it.
+						unknown := tree.NewDString(fmt.Sprintf("unknown (OID=%s)", oidArg))
+						switch {
+						case errors.Is(err, catalog.ErrDescriptorNotFound):
+							return unknown, nil
+						case pgerror.GetPGCode(err) == pgcode.UndefinedObject:
+							return unknown, nil
+						default:
+							return nil, err
+						}
+					}
 				}
 				var hasTypmod bool
 				var typmod int
@@ -1817,6 +1837,31 @@ SELECT description
 			Volatility: tree.VolatilityStable,
 		},
 	),
+
+	// pg_column_size(any) - number of bytes used to store a particular value
+	// (possibly compressed)
+
+	// Database Object Size Functions, see: https://www.postgresql.org/docs/9.4/functions-admin.html
+	"pg_column_size": makeBuiltin(defProps(),
+		tree.Overload{
+			Types: tree.VariadicType{
+				VarType: types.Any,
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				var totalSize int
+				for _, arg := range args {
+					encodeTableValue, err := rowenc.EncodeTableValue(nil, descpb.ColumnID(encoding.NoColumnID), arg, nil)
+					if err != nil {
+						return tree.DNull, err
+					}
+					totalSize += len(encodeTableValue)
+				}
+				return tree.NewDInt(tree.DInt(totalSize)), nil
+			},
+			Info:       "Return size in bytes of the column provided as an argument",
+			Volatility: tree.VolatilityImmutable,
+		}),
 }
 
 func getSessionVar(ctx *tree.EvalContext, settingName string, missingOk bool) (tree.Datum, error) {

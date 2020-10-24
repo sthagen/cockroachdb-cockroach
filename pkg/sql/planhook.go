@@ -13,12 +13,14 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -34,7 +36,7 @@ import (
 // plan execution.
 type planHookFn func(
 	context.Context, tree.Statement, PlanHookState,
-) (fn PlanHookRowFn, header sqlbase.ResultColumns, subplans []planNode, avoidBuffering bool, err error)
+) (fn PlanHookRowFn, header colinfo.ResultColumns, subplans []planNode, avoidBuffering bool, err error)
 
 // PlanHookRowFn describes the row-production for hook-created plans. The
 // channel argument is used to return results to the plan's runner. It's
@@ -91,12 +93,12 @@ type PlanHookState interface {
 	BumpRoleMembershipTableVersion(ctx context.Context) error
 	EvalAsOfTimestamp(ctx context.Context, asOf tree.AsOfClause) (hlc.Timestamp, error)
 	ResolveUncachedDatabaseByName(
-		ctx context.Context, dbName string, required bool) (*UncachedDatabaseDescriptor, error)
+		ctx context.Context, dbName string, required bool) (*dbdesc.Immutable, error)
 	ResolveMutableTableDescriptor(
-		ctx context.Context, tn *TableName, required bool, requiredType tree.RequiredTableKind,
-	) (table *MutableTableDescriptor, err error)
+		ctx context.Context, tn *tree.TableName, required bool, requiredType tree.RequiredTableKind,
+	) (table *tabledesc.Mutable, err error)
 	ShowCreate(
-		ctx context.Context, dbPrefix string, allDescs []descpb.Descriptor, desc *sqlbase.ImmutableTableDescriptor, displayOptions ShowCreateDisplayOptions,
+		ctx context.Context, dbPrefix string, allDescs []descpb.Descriptor, desc *tabledesc.Immutable, displayOptions ShowCreateDisplayOptions,
 	) (string, error)
 }
 
@@ -122,7 +124,7 @@ type hookFnNode struct {
 	optColumnsSlot
 
 	f        PlanHookRowFn
-	header   sqlbase.ResultColumns
+	header   colinfo.ResultColumns
 	subplans []planNode
 
 	run hookFnRun

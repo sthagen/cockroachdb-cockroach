@@ -22,11 +22,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -42,11 +42,14 @@ func TestMysqldumpDataReader(t *testing.T) {
 	files := getMysqldumpTestdata(t)
 
 	ctx := context.Background()
-	table := descForTable(t, `CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea)`, 10, 20, NoFKs)
+	table := descForTable(ctx, t, `CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea)`, 10, 20, NoFKs)
 	tables := map[string]*execinfrapb.ReadImportDataSpec_ImportTable{"simple": {Desc: table.TableDesc()}}
 
 	kvCh := make(chan row.KVBatch, 10)
-	converter, err := newMysqldumpReader(ctx, kvCh, tables, testEvalCtx)
+	// When creating a new dump reader, we need to pass in the walltime that will be used as
+	// a parameter used for generating unique rowid, random, and gen_random_uuid as default
+	// expressions. Here, the parameter doesn't matter so we pass in 0.
+	converter, err := newMysqldumpReader(ctx, kvCh, 0 /*walltime*/, tables, testEvalCtx)
 
 	if err != nil {
 		t.Fatal(err)
@@ -124,16 +127,17 @@ func readMysqlCreateFrom(
 func TestMysqldumpSchemaReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 
 	files := getMysqldumpTestdata(t)
 
-	simpleTable := descForTable(t, readFile(t, `simple.cockroach-schema.sql`), expectedParent, 52, NoFKs)
-	referencedSimple := descForTable(t, readFile(t, `simple.cockroach-schema.sql`), expectedParent, 52, NoFKs)
+	simpleTable := descForTable(ctx, t, readFile(t, `simple.cockroach-schema.sql`), expectedParent, 52, NoFKs)
+	referencedSimple := descForTable(ctx, t, readFile(t, `simple.cockroach-schema.sql`), expectedParent, 52, NoFKs)
 	fks := fkHandler{
 		allowed: true,
-		resolver: fkResolver(map[string]*sqlbase.MutableTableDescriptor{
-			referencedSimple.Name: sqlbase.NewMutableCreatedTableDescriptor(*referencedSimple.TableDesc())},
-		),
+		resolver: fkResolver(map[string]*tabledesc.Mutable{
+			referencedSimple.Name: referencedSimple,
+		}),
 	}
 
 	t.Run("simple", func(t *testing.T) {
@@ -143,14 +147,14 @@ func TestMysqldumpSchemaReader(t *testing.T) {
 	})
 
 	t.Run("second", func(t *testing.T) {
-		secondTable := descForTable(t, readFile(t, `second.cockroach-schema.sql`), expectedParent, 53, fks)
+		secondTable := descForTable(ctx, t, readFile(t, `second.cockroach-schema.sql`), expectedParent, 53, fks)
 		expected := secondTable
 		got := readMysqlCreateFrom(t, files.second, "", 53, fks)
 		compareTables(t, expected.TableDesc(), got)
 	})
 
 	t.Run("everything", func(t *testing.T) {
-		expected := descForTable(t, readFile(t, `everything.cockroach-schema.sql`), expectedParent, 53, NoFKs)
+		expected := descForTable(ctx, t, readFile(t, `everything.cockroach-schema.sql`), expectedParent, 53, NoFKs)
 		got := readMysqlCreateFrom(t, files.everything, "", 53, NoFKs)
 		compareTables(t, expected.TableDesc(), got)
 	})
@@ -163,7 +167,7 @@ func TestMysqldumpSchemaReader(t *testing.T) {
 
 	t.Run("third-in-multi", func(t *testing.T) {
 		skip := fkHandler{allowed: true, skip: true, resolver: make(fkResolver)}
-		expected := descForTable(t, readFile(t, `third.cockroach-schema.sql`), expectedParent, 52, skip)
+		expected := descForTable(ctx, t, readFile(t, `third.cockroach-schema.sql`), expectedParent, 52, skip)
 		got := readMysqlCreateFrom(t, files.wholeDB, "third", 51, skip)
 		compareTables(t, expected.TableDesc(), got)
 	})
@@ -211,8 +215,8 @@ func compareTables(t *testing.T, expected, got *descpb.TableDescriptor) {
 		ctx := context.Background()
 		semaCtx := tree.MakeSemaContext()
 		tableName := &descpb.AnonymousTable
-		expectedDesc := sqlbase.NewImmutableTableDescriptor(*expected)
-		gotDesc := sqlbase.NewImmutableTableDescriptor(*got)
+		expectedDesc := tabledesc.NewImmutable(*expected)
+		gotDesc := tabledesc.NewImmutable(*got)
 		e, err := schemaexpr.FormatIndexForDisplay(ctx, expectedDesc, tableName, &expected.Indexes[i], &semaCtx)
 		if err != nil {
 			t.Fatalf("unexpected error: %s", err)

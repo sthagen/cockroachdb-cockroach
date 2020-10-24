@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -246,6 +247,10 @@ type Replica struct {
 	// centerpiece of transaction contention handling.
 	concMgr concurrency.Manager
 
+	// tenantLimiter rate limits requests on a per-tenant basis and accumulates
+	// metrics about it.
+	tenantLimiter tenantrate.Limiter
+
 	mu struct {
 		// Protects all fields in the mu struct.
 		syncutil.RWMutex
@@ -256,6 +261,11 @@ type Replica struct {
 		// Is the range quiescent? Quiescent ranges are not Tick()'d and unquiesce
 		// whenever a Raft operation is performed.
 		quiescent bool
+		// laggingFollowersOnQuiesce is the set of dead replicas that are not
+		// up-to-date with the rest of the quiescent Raft group. Nil if !quiescent.
+		laggingFollowersOnQuiesce laggingReplicaSet
+		// TODO(nvanbenschoten): remove in v21.1.
+		laggingFollowersOnQuiesceAccurate bool
 		// mergeComplete is non-nil if a merge is in-progress, in which case any
 		// requests should be held until the completion of the merge is signaled by
 		// the closing of the channel.
@@ -894,12 +904,6 @@ func (r *Replica) getMergeCompleteChRLocked() chan struct{} {
 	return r.mu.mergeComplete
 }
 
-func (r *Replica) mergeInProgress() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.mergeInProgressRLocked()
-}
-
 func (r *Replica) mergeInProgressRLocked() bool {
 	return r.mu.mergeComplete != nil
 }
@@ -1032,6 +1036,8 @@ func (r *Replica) State() kvserverpb.RangeInfo {
 	// it's best to keep it out of the Replica.mu critical section.
 	ri.RangefeedRegistrations = int64(r.numRangefeedRegistrations())
 
+	ri.LockTable = r.concMgr.LockTableDebug()
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	ri.ReplicaState = *(protoutil.Clone(&r.mu.state)).(*kvserverpb.ReplicaState)
@@ -1106,42 +1112,45 @@ func (r *Replica) assertStateLocked(ctx context.Context, reader storage.Reader) 
 // able to serve traffic or that the request is not compatible with the state of
 // the Range.
 //
-// The method accepts a concurrency Guard and a LeaseStatus parameter. These are
-// used to indicate whether the caller has acquired latches and checked the
-// Range lease. The method will only check for a pending merge if both of these
-// conditions are true. If either !g.HoldingLatches() or st.State !=
-// LeaseState_VALID then the method will not check for a pending merge. Callers
-// might be ok with this if they know that they will end up checking for a
-// pending merge at some later time.
+// The method accepts a concurrency Guard, which is used to indicate whether the
+// caller has acquired latches. When this condition is false, the batch request
+// will not wait for a pending merge to conclude before proceeding. Callers might
+// be ok with this if they know that they will end up checking for a pending
+// merge at some later time.
+//
+// NB: We record and return the result of `mergeInProgress()` here because we use
+// it to assert that no request that bumps the LeaseAppliedIndex of a range is
+// proposed to Raft while a range is subsumed. This is a correctness invariant
+// for range merges. See comment block inside Subsume() in cmd_subsume.go for
+// more details.
 func (r *Replica) checkExecutionCanProceed(
 	ctx context.Context, ba *roachpb.BatchRequest, g *concurrency.Guard, st *kvserverpb.LeaseStatus,
-) error {
+) (bool, error) {
 	rSpan, err := keys.Range(ba.Requests)
 	if err != nil {
-		return err
+		return false, err
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	mergeInProgress := r.mergeInProgressRLocked()
 	if _, err := r.isDestroyedRLocked(); err != nil {
-		return err
+		return mergeInProgress, err
 	} else if err := r.checkSpanInRangeRLocked(ctx, rSpan); err != nil {
-		return err
+		return mergeInProgress, err
 	} else if err := r.checkTSAboveGCThresholdRLocked(
 		ba.EarliestActiveTimestamp(), st, ba.IsAdmin(),
 	); err != nil {
-		return err
-	} else if g.HoldingLatches() && st.State == kvserverpb.LeaseState_VALID {
-		// Only check for a pending merge if latches are held and the Range
-		// lease is held by this Replica. Without both of these conditions,
-		// checkForPendingMergeRLocked could return false negatives.
-		//
-		// In practice, this means that follower reads or any request where
-		// concurrency.shouldAcquireLatches() == false (e.g. lease requests)
-		// will not check for a pending merge before executing and, as such,
-		// can execute while a range is in a merge's critical phase.
-		return r.checkForPendingMergeRLocked(ba)
+		return mergeInProgress, err
+	} else if mergeInProgress && g.HoldingLatches() {
+		// We only call `shouldWaitForPendingMergeRLocked` if we're currently holding
+		// latches. In practice, this means that any request where
+		// concurrency.shouldAcquireLatches() == false (e.g. RequestLeaseRequests) will
+		// not wait for a pending merge before executing and, as such, can execute while
+		// a range is in a merge's critical phase (i.e. while the RHS of the merge is
+		// subsumed).
+		return mergeInProgress, r.shouldWaitForPendingMergeRLocked(ctx, ba)
 	}
-	return nil
+	return mergeInProgress, nil
 }
 
 // checkExecutionCanProceedForRangeFeed returns an error if a rangefeed request
@@ -1195,18 +1204,23 @@ func (r *Replica) checkTSAboveGCThresholdRLocked(
 	}
 }
 
-// checkForPendingMergeRLocked determines whether the replica is being merged
-// into its left-hand neighbor. If so, an error is returned to prevent the
-// request from proceeding until the merge completes.
-func (r *Replica) checkForPendingMergeRLocked(ba *roachpb.BatchRequest) error {
-	if r.getMergeCompleteChRLocked() == nil {
+// shouldWaitForPendingMergeRLocked determines whether the given batch request
+// should wait for an on-going merge to conclude before being allowed to proceed.
+// If not, an error is returned to prevent the request from proceeding until the
+// merge completes.
+func (r *Replica) shouldWaitForPendingMergeRLocked(
+	ctx context.Context, ba *roachpb.BatchRequest,
+) error {
+	if !r.mergeInProgressRLocked() {
+		log.Fatal(ctx, "programming error: shouldWaitForPendingMergeRLocked should"+
+			" only be called when a range merge is in progress")
 		return nil
 	}
+
 	if ba.IsSingleSubsumeRequest() {
 		return nil
 	}
 
-	// The range is being merged into its left-hand neighbor.
 	if ba.IsReadOnly() {
 		freezeStart := r.getFreezeStartRLocked()
 		ts := ba.Timestamp
@@ -1233,7 +1247,7 @@ func (r *Replica) checkForPendingMergeRLocked(ba *roachpb.BatchRequest) error {
 			// before the `mergeCompleteCh` channel is removed. Let's say the read
 			// timestamp of this request is X (with X <= freezeStart), and let's
 			// denote its uncertainty interval by [X, Y).
-			// 3. By the time this request reaches `checkForPendingMergeRLocked`, the
+			// 3. By the time this request reaches `shouldWaitForPendingMergeRLocked`, the
 			// merge has committed so all subsequent requests are directed to the
 			// leaseholder of the (subsuming) left-hand range but this pre-merge range
 			// hasn't been destroyed yet.
@@ -1563,22 +1577,22 @@ func (r *Replica) maybeWatchForMerge(ctx context.Context, freezeStart hlc.Timest
 	return err
 }
 
-func (r *Replica) maybeTransferRaftLeadership(ctx context.Context) {
+func (r *Replica) maybeTransferRaftLeadershipToLeaseholder(ctx context.Context) {
 	r.mu.Lock()
-	r.maybeTransferRaftLeadershipLocked(ctx)
+	r.maybeTransferRaftLeadershipToLeaseholderLocked(ctx)
 	r.mu.Unlock()
 }
 
-// maybeTransferRaftLeadershipLocked attempts to transfer the leadership away
-// from this node to the leaseholder, if this node is the current raft leader
-// but not the leaseholder. We don't attempt to transfer leadership if the
-// leaseholder is behind on applying the log.
+// maybeTransferRaftLeadershipToLeaseholderLocked attempts to transfer the
+// leadership away from this node to the leaseholder, if this node is the
+// current raft leader but not the leaseholder. We don't attempt to transfer
+// leadership if the leaseholder is behind on applying the log.
 //
 // We like it when leases and raft leadership are collocated because that
 // facilitates quick command application (requests generally need to make it to
 // both the lease holder and the raft leader before being applied by other
 // replicas).
-func (r *Replica) maybeTransferRaftLeadershipLocked(ctx context.Context) {
+func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(ctx context.Context) {
 	if r.store.TestingKnobs().DisableLeaderFollowsLeaseholder {
 		return
 	}

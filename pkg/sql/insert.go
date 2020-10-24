@@ -14,11 +14,11 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -40,7 +40,7 @@ type insertNode struct {
 	// columns is set if this INSERT is returning any rows, to be
 	// consumed by a renderNode upstream. This occurs when there is a
 	// RETURNING clause with some scalar expressions.
-	columns sqlbase.ResultColumns
+	columns colinfo.ResultColumns
 
 	run insertRun
 }
@@ -83,16 +83,13 @@ type insertRun struct {
 	traceKV bool
 }
 
-func (r *insertRun) initRowContainer(
-	params runParams, columns sqlbase.ResultColumns, rowCapacity int,
-) {
+func (r *insertRun) initRowContainer(params runParams, columns colinfo.ResultColumns) {
 	if !r.rowsNeeded {
 		return
 	}
 	r.ti.rows = rowcontainer.NewRowContainer(
 		params.EvalContext().Mon.MakeBoundAccount(),
-		sqlbase.ColTypeInfoFromResCols(columns),
-		rowCapacity,
+		colinfo.ColTypeInfoFromResCols(columns),
 	)
 
 	// In some cases (e.g. `INSERT INTO t (a) ...`) the data source
@@ -110,12 +107,7 @@ func (r *insertRun) initRowContainer(
 		r.resultRowBuffer[i] = tree.DNull
 	}
 
-	colIDToRetIndex := make(map[descpb.ColumnID]int)
-	cols := r.ti.tableDesc().Columns
-	for i := range cols {
-		colIDToRetIndex[cols[i].ID] = i
-	}
-
+	colIDToRetIndex := r.ti.tableDesc().ColumnIdxMap()
 	r.rowIdxToTabColIdx = make([]int, len(r.insertCols))
 	for i, col := range r.insertCols {
 		if idx, ok := colIDToRetIndex[col.ID]; !ok {
@@ -189,17 +181,11 @@ func (r *insertRun) processSourceRow(params runParams, rowVals tree.Datums) erro
 	return nil
 }
 
-// maxInsertBatchSize is the max number of entries in the KV batch for
-// the insert operation (including secondary index updates, FK
-// cascading updates, etc), before the current KV batch is executed
-// and a new batch is started.
-var maxInsertBatchSize = 10000
-
 func (n *insertNode) startExec(params runParams) error {
 	// Cache traceKV during execution, to avoid re-evaluating it for every row.
 	n.run.traceKV = params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 
-	n.run.initRowContainer(params, n.columns, 0 /* rowCapacity */)
+	n.run.initRowContainer(params, n.columns)
 
 	return n.run.ti.init(params.ctx, params.p.txn, params.EvalContext())
 }
@@ -254,7 +240,7 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 		}
 
 		// Are we done yet with the current batch?
-		if n.run.ti.currentBatchSize >= maxInsertBatchSize {
+		if n.run.ti.currentBatchSize >= n.run.ti.maxBatchSize {
 			break
 		}
 	}
@@ -278,7 +264,7 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 	}
 
 	// Possibly initiate a run of CREATE STATISTICS.
-	params.ExecCfg().StatsRefresher.NotifyMutation(n.run.ti.tableDesc().ID, n.run.ti.lastBatchSize)
+	params.ExecCfg().StatsRefresher.NotifyMutation(n.run.ti.tableDesc().GetID(), n.run.ti.lastBatchSize)
 
 	return n.run.ti.lastBatchSize > 0, nil
 }
@@ -299,11 +285,4 @@ func (n *insertNode) Close(ctx context.Context) {
 // See planner.autoCommit.
 func (n *insertNode) enableAutoCommit() {
 	n.run.ti.enableAutoCommit()
-}
-
-// TestingSetInsertBatchSize exports a constant for testing only.
-func TestingSetInsertBatchSize(val int) func() {
-	oldVal := maxInsertBatchSize
-	maxInsertBatchSize = val
-	return func() { maxInsertBatchSize = oldVal }
 }

@@ -14,10 +14,11 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/mutations"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -73,7 +74,7 @@ type tableWriter interface {
 
 	// tableDesc returns the TableDescriptor for the table that the tableWriter
 	// will modify.
-	tableDesc() *sqlbase.ImmutableTableDescriptor
+	tableDesc() catalog.TableDescriptor
 
 	// close frees all resources held by the tableWriter.
 	close(context.Context)
@@ -99,11 +100,15 @@ type tableWriterBase struct {
 	// txn is the current KV transaction.
 	txn *kv.Txn
 	// desc is the descriptor of the table that we're writing.
-	desc *sqlbase.ImmutableTableDescriptor
+	desc catalog.TableDescriptor
 	// is autoCommit turned on.
 	autoCommit autoCommitOpt
 	// b is the current batch.
 	b *kv.Batch
+	// maxBatchSize determines the maximum number of entries in the KV batch
+	// for a mutation operation. By default, it will be set to 10k but can be
+	// a different value in tests.
+	maxBatchSize int
 	// currentBatchSize is the size of the current batch. It is updated on
 	// every row() call and is reset once a new batch is started.
 	currentBatchSize int
@@ -115,10 +120,11 @@ type tableWriterBase struct {
 	rows *rowcontainer.RowContainer
 }
 
-func (tb *tableWriterBase) init(txn *kv.Txn, tableDesc *sqlbase.ImmutableTableDescriptor) {
+func (tb *tableWriterBase) init(txn *kv.Txn, tableDesc catalog.TableDescriptor) {
 	tb.txn = txn
 	tb.desc = tableDesc
 	tb.b = txn.NewBatch()
+	tb.maxBatchSize = mutations.MaxBatchSize()
 }
 
 // flushAndStartNewBatch shares the common flushAndStartNewBatch() code between

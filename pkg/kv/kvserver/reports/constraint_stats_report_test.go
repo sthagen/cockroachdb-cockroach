@@ -27,8 +27,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/keysutils"
@@ -760,7 +762,7 @@ func compileTestCase(tc baseReportTestCase) (compiledTestCase, error) {
 			}
 		}
 		sysCfgBuilder.addDBDesc(dbID,
-			sqlbase.NewInitialDatabaseDescriptor(descpb.ID(dbID), db.name, security.AdminRole))
+			&dbdesc.NewInitial(descpb.ID(dbID), db.name, security.AdminRole).Immutable)
 
 		for _, table := range db.tables {
 			tableID := objectCounter
@@ -861,7 +863,7 @@ func generateTableZone(t table, tableDesc descpb.TableDescriptor) (*zonepb.ZoneC
 		var err error
 		tableZone.SubzoneSpans, err = sql.GenerateSubzoneSpans(
 			nil, uuid.UUID{} /* clusterID */, keys.SystemSQLCodec,
-			sqlbase.NewImmutableTableDescriptor(tableDesc), tableZone.Subzones, false /* hasNewSubzones */)
+			tabledesc.NewImmutable(tableDesc), tableZone.Subzones, false /* hasNewSubzones */)
 		if err != nil {
 			return nil, errors.Wrap(err, "error generating subzone spans")
 		}
@@ -1076,7 +1078,7 @@ func (b *systemConfigBuilder) addTableDesc(id int, tableDesc descpb.TableDescrip
 		panic(fmt.Sprintf("parent not set for table %q", tableDesc.Name))
 	}
 	// Write the table to the SystemConfig, in the descriptors table.
-	k := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, descpb.ID(id))
+	k := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, descpb.ID(id))
 	desc := &descpb.Descriptor{
 		Union: &descpb.Descriptor_Table{
 			Table: &tableDesc,
@@ -1084,7 +1086,7 @@ func (b *systemConfigBuilder) addTableDesc(id int, tableDesc descpb.TableDescrip
 	}
 	// Use a bogus timestamp for the descriptor modification time.
 	ts := hlc.Timestamp{WallTime: 123}
-	sqlbase.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(context.Background(), desc, ts)
+	descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(context.Background(), desc, ts)
 	var v roachpb.Value
 	if err := v.SetProto(desc); err != nil {
 		panic(err)
@@ -1093,9 +1095,9 @@ func (b *systemConfigBuilder) addTableDesc(id int, tableDesc descpb.TableDescrip
 }
 
 // addTableDesc adds a database descriptor to the SystemConfig.
-func (b *systemConfigBuilder) addDBDesc(id int, dbDesc *sqlbase.ImmutableDatabaseDescriptor) {
+func (b *systemConfigBuilder) addDBDesc(id int, dbDesc *dbdesc.Immutable) {
 	// Write the table to the SystemConfig, in the descriptors table.
-	k := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, descpb.ID(id))
+	k := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, descpb.ID(id))
 	var v roachpb.Value
 	if err := v.SetProto(dbDesc.DescriptorProto()); err != nil {
 		panic(err)

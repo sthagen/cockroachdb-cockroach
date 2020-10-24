@@ -71,7 +71,7 @@ func (r *Registry) AddMetric(metric Iterable) {
 	defer r.Unlock()
 	r.tracked = append(r.tracked, metric)
 	if log.V(2) {
-		log.Infof(context.TODO(), "Added metric: %s (%T)", metric.GetName(), metric)
+		log.Infof(context.TODO(), "added metric: %s (%T)", metric.GetName(), metric)
 	}
 }
 
@@ -90,7 +90,7 @@ func (r *Registry) AddMetricStruct(metricStruct interface{}) {
 		tname := tfield.Name
 		if !vfield.CanInterface() {
 			if log.V(2) {
-				log.Infof(ctx, "Skipping unexported field %s", tname)
+				log.Infof(ctx, "skipping unexported field %s", tname)
 			}
 			continue
 		}
@@ -114,24 +114,24 @@ func (r *Registry) AddMetricStruct(metricStruct interface{}) {
 func (r *Registry) addMetricValue(
 	ctx context.Context, val reflect.Value, name string, skipNil bool,
 ) {
+	if val.Kind() == reflect.Ptr && val.IsNil() {
+		if skipNil {
+			if log.V(2) {
+				log.Infof(ctx, "skipping nil metric field %s", name)
+			}
+		} else {
+			log.Fatalf(ctx, "found nil metric field %s", name)
+		}
+		return
+	}
 	switch typ := val.Interface().(type) {
 	case Iterable:
-		if val.Kind() == reflect.Ptr && val.IsNil() {
-			if skipNil {
-				if log.V(2) {
-					log.Infof(ctx, "Skipping nil metric field %s", name)
-				}
-			} else {
-				log.Fatalf(ctx, "Found nil metric field %s", name)
-			}
-			return
-		}
 		r.AddMetric(typ)
 	case Struct:
 		r.AddMetricStruct(typ)
 	default:
 		if log.V(2) {
-			log.Infof(ctx, "Skipping non-metric field %s", name)
+			log.Infof(ctx, "skipping non-metric field %s", name)
 		}
 	}
 }

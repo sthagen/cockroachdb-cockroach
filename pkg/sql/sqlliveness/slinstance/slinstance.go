@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/cockroachdb/errors"
 )
 
 var (
@@ -42,7 +41,7 @@ var (
 	DefaultHeartBeat = settings.RegisterNonNegativeDurationSetting(
 		"server.sqlliveness.heartbeat",
 		"duration heart beats to push session expiration further out in time",
-		time.Second,
+		5*time.Second,
 	)
 )
 
@@ -72,12 +71,13 @@ func (s *session) Expiration() hlc.Timestamp { return s.exp }
 // loop to extend the existing sessions' expirations or creating a new session
 // to replace a session that has expired and deleted from the table.
 type Instance struct {
-	clock   *hlc.Clock
-	stopper *stop.Stopper
-	storage Writer
-	ttl     func() time.Duration
-	hb      func() time.Duration
-	mu      struct {
+	clock    *hlc.Clock
+	settings *cluster.Settings
+	stopper  *stop.Stopper
+	storage  Writer
+	ttl      func() time.Duration
+	hb       func() time.Duration
+	mu       struct {
 		started bool
 		syncutil.Mutex
 		blockCh chan struct{}
@@ -121,8 +121,6 @@ func (l *Instance) createSession(ctx context.Context) (*session, error) {
 		MaxBackoff:     2 * time.Second,
 		Multiplier:     1.5,
 	}
-	ctx, cancel := l.stopper.WithCancelOnQuiesce(ctx)
-	defer cancel()
 	everySecond := log.Every(time.Second)
 	var err error
 	for i, r := 0, retry.StartWithCtx(ctx, opts); r.Next(); {
@@ -132,7 +130,7 @@ func (l *Instance) createSession(ctx context.Context) (*session, error) {
 				break
 			}
 			if everySecond.ShouldLog() {
-				log.Errorf(ctx, "Failed to create a session at %d-th attempt: %v", i, err.Error())
+				log.Errorf(ctx, "failed to create a session at %d-th attempt: %v", i, err.Error())
 			}
 			continue
 		}
@@ -141,7 +139,7 @@ func (l *Instance) createSession(ctx context.Context) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Infof(ctx, "Created new SQL liveness session %s", s.ID())
+	log.Infof(ctx, "created new SQL liveness session %s", s.ID())
 	return s, nil
 }
 
@@ -153,8 +151,6 @@ func (l *Instance) extendSession(ctx context.Context, s sqlliveness.Session) (bo
 		MaxBackoff:     2 * time.Second,
 		Multiplier:     1.5,
 	}
-	ctx, cancel := l.stopper.WithCancelOnQuiesce(ctx)
-	defer cancel()
 	var err error
 	var found bool
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
@@ -184,13 +180,13 @@ func (l *Instance) heartbeatLoop(ctx context.Context) {
 	defer func() {
 		log.Warning(ctx, "exiting heartbeat loop")
 	}()
+	ctx, cancel := l.stopper.WithCancelOnQuiesce(ctx)
+	defer cancel()
 	t := timeutil.NewTimer()
 	t.Reset(0)
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		case <-l.stopper.ShouldQuiesce():
 			return
 		case <-t.C:
 			t.Read = true
@@ -216,7 +212,7 @@ func (l *Instance) heartbeatLoop(ctx context.Context) {
 				continue
 			}
 			if log.V(2) {
-				log.Infof(ctx, "Extended SQL liveness session %s", s.ID())
+				log.Infof(ctx, "extended SQL liveness session %s", s.ID())
 			}
 			t.Reset(l.hb())
 		}
@@ -229,7 +225,10 @@ func NewSQLInstance(
 	stopper *stop.Stopper, clock *hlc.Clock, storage Writer, settings *cluster.Settings,
 ) *Instance {
 	l := &Instance{
-		clock: clock, storage: storage, stopper: stopper,
+		clock:    clock,
+		settings: settings,
+		storage:  storage,
+		stopper:  stopper,
 		ttl: func() time.Duration {
 			return DefaultTTL.Get(&settings.SV)
 		},
@@ -249,7 +248,7 @@ func (l *Instance) Start(ctx context.Context) {
 		return
 	}
 	log.Infof(ctx, "starting SQL liveness instance")
-	l.stopper.RunWorker(ctx, l.heartbeatLoop)
+	_ = l.stopper.RunAsyncTask(ctx, "slinstance", l.heartbeatLoop)
 	l.mu.started = true
 }
 
@@ -260,7 +259,7 @@ func (l *Instance) Session(ctx context.Context) (sqlliveness.Session, error) {
 	l.mu.Lock()
 	if !l.mu.started {
 		l.mu.Unlock()
-		return nil, errors.New("the Instance has not been started yet")
+		return nil, sqlliveness.NotStartedError
 	}
 	l.mu.Unlock()
 

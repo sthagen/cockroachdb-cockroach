@@ -21,9 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,8 +45,8 @@ func TestVectorizedInternalPanic(t *testing.T) {
 	}
 
 	nRows, nCols := 1, 1
-	types := sqlbase.OneIntCol
-	input := execinfra.NewRepeatableRowSource(types, sqlbase.MakeIntRows(nRows, nCols))
+	types := rowenc.OneIntCol
+	input := execinfra.NewRepeatableRowSource(types, rowenc.MakeIntRows(nRows, nCols))
 
 	col, err := colexec.NewColumnarizer(ctx, testAllocator, &flowCtx, 0 /* processorID */, input)
 	if err != nil {
@@ -91,8 +92,8 @@ func TestNonVectorizedPanicPropagation(t *testing.T) {
 	}
 
 	nRows, nCols := 1, 1
-	types := sqlbase.OneIntCol
-	input := execinfra.NewRepeatableRowSource(types, sqlbase.MakeIntRows(nRows, nCols))
+	types := rowenc.OneIntCol
+	input := execinfra.NewRepeatableRowSource(types, rowenc.MakeIntRows(nRows, nCols))
 
 	col, err := colexec.NewColumnarizer(ctx, testAllocator, &flowCtx, 0 /* processorID */, input)
 	if err != nil {
@@ -145,7 +146,7 @@ func (e *testVectorizedInternalPanicEmitter) Init() {
 func (e *testVectorizedInternalPanicEmitter) Next(ctx context.Context) coldata.Batch {
 	if !e.emitBatch {
 		e.emitBatch = true
-		colexecerror.InternalError("")
+		colexecerror.InternalError(errors.AssertionFailedf(""))
 	}
 
 	e.emitBatch = false

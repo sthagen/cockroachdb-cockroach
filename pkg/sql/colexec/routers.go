@@ -12,7 +12,6 @@ package colexec
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -164,7 +163,7 @@ func (o *routerOutputOp) Child(nth int, verbose bool) execinfra.OpNode {
 	if nth == 0 {
 		return o.input
 	}
-	colexecerror.InternalError(fmt.Sprintf("invalid index %d", nth))
+	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }
@@ -505,8 +504,6 @@ const (
 // returned by the constructor.
 type HashRouter struct {
 	OneInputNode
-	// types are the input types.
-	types []*types.T
 	// hashCols is a slice of indices of the columns used for hashing.
 	hashCols []uint32
 
@@ -517,7 +514,7 @@ type HashRouter struct {
 	metadataSources execinfrapb.MetadataSources
 	// closers is a slice of Closers that need to be closed when the hash router
 	// terminates.
-	closers Closers
+	closers colexecbase.Closers
 
 	// unblockedEventsChan is a channel shared between the HashRouter and its
 	// outputs. outputs send events on this channel when they are unblocked by a
@@ -565,7 +562,7 @@ func NewHashRouter(
 	fdSemaphore semaphore.Semaphore,
 	diskAccounts []*mon.BoundAccount,
 	toDrain []execinfrapb.MetadataSource,
-	toClose []Closer,
+	toClose []colexecbase.Closer,
 ) (*HashRouter, []colexecbase.DrainableOperator) {
 	if diskQueueCfg.CacheMode != colcontainer.DiskQueueCacheModeDefault {
 		colexecerror.InternalError(errors.Errorf("hash router instantiated with incompatible disk queue cache mode: %d", diskQueueCfg.CacheMode))
@@ -596,21 +593,19 @@ func NewHashRouter(
 		outputs[i] = op
 		outputsAsOps[i] = op
 	}
-	return newHashRouterWithOutputs(input, types, hashCols, unblockEventsChan, outputs, toDrain, toClose), outputsAsOps
+	return newHashRouterWithOutputs(input, hashCols, unblockEventsChan, outputs, toDrain, toClose), outputsAsOps
 }
 
 func newHashRouterWithOutputs(
 	input colexecbase.Operator,
-	types []*types.T,
 	hashCols []uint32,
 	unblockEventsChan <-chan struct{},
 	outputs []routerOutput,
 	toDrain []execinfrapb.MetadataSource,
-	toClose []Closer,
+	toClose []colexecbase.Closer,
 ) *HashRouter {
 	r := &HashRouter{
 		OneInputNode:        NewOneInputNode(input),
-		types:               types,
 		hashCols:            hashCols,
 		outputs:             outputs,
 		closers:             toClose,
@@ -739,7 +734,7 @@ func (r *HashRouter) processNextBatch(ctx context.Context) bool {
 		return true
 	}
 
-	selections := r.tupleDistributor.distribute(ctx, b, r.types, r.hashCols)
+	selections := r.tupleDistributor.distribute(ctx, b, r.hashCols)
 	for i, o := range r.outputs {
 		if o.addBatch(ctx, b, selections[i]) {
 			// This batch blocked the output.

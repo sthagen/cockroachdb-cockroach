@@ -1,4 +1,6 @@
-# LogicTest: !3node-tenant(52567)
+# LogicTest: default-configs local-mixed-20.1-20.2
+# The mixed configuration is enabled to test backward compatibility for database
+# schema changes.
 
 # Test default database-level permissions.
 # Default user is root.
@@ -38,7 +40,7 @@ REVOKE ALL ON DATABASE a FROM bar
 # Switch to a user without any privileges.
 user testuser
 
-statement error only users with the admin role are allowed to CREATE DATABASE
+statement error permission denied to create database
 CREATE DATABASE b
 
 statement error user testuser does not have DROP privilege on database a
@@ -73,7 +75,7 @@ GRANT SELECT ON DATABASE a TO testuser
 
 user testuser
 
-statement error only users with the admin role are allowed to CREATE DATABASE
+statement error permission denied to create database
 CREATE DATABASE b
 
 statement error user testuser does not have DROP privilege on database a
@@ -108,7 +110,7 @@ GRANT ALL ON DATABASE a TO testuser
 
 user testuser
 
-statement error only users with the admin role are allowed to CREATE DATABASE
+statement error permission denied to create database
 CREATE DATABASE b
 
 statement ok

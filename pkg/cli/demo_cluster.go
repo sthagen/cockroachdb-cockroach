@@ -32,10 +32,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
@@ -53,6 +51,9 @@ type transientCluster struct {
 	stopper    *stop.Stopper
 	s          *server.TestServer
 	servers    []*server.TestServer
+
+	adminPassword string
+	adminUser     string
 }
 
 func (c *transientCluster) checkConfigAndSetupLogging(
@@ -75,20 +76,12 @@ func (c *transientCluster) checkConfigAndSetupLogging(
 		}
 	}
 
-	// Set up logging. For demo/transient server we use non-standard
-	// behavior where we avoid file creation if possible.
-	fl := flagSetForCmd(cmd)
-	df := fl.Lookup(cliflags.LogDir.Name)
-	sf := fl.Lookup(logflags.LogToStderrName)
-	if !df.Changed && !sf.Changed {
-		// User did not request logging flags; shut down all logging.
-		// Otherwise, the demo command would cause a cockroach-data
-		// directory to appear in the current directory just for logs.
-		_ = df.Value.Set("")
-		df.Changed = true
-		_ = sf.Value.Set(log.Severity_NONE.String())
-		sf.Changed = true
-	}
+	// Override the default server store spec.
+	//
+	// This is needed because the logging setup code peeks into this to
+	// decide how to enable logging.
+	serverCfg.Stores.Specs = nil
+
 	c.stopper, err = setupAndInitializeLoggingAndProfiling(ctx, cmd)
 	if err != nil {
 		return err
@@ -181,7 +174,7 @@ func (c *transientCluster) start(
 		// the start routine needs to wait for the latency map construction after their RPC address has been computed.
 		if demoCtx.simulateLatency {
 			go func(i int) {
-				if err := serv.Start(args); err != nil {
+				if err := serv.Start(); err != nil {
 					errCh <- err
 				} else {
 					// Block until the ReadyFn has been called before continuing.
@@ -191,7 +184,7 @@ func (c *transientCluster) start(
 			}(i)
 			<-servRPCReadyCh
 		} else {
-			if err := serv.Start(args); err != nil {
+			if err := serv.Start(); err != nil {
 				return err
 			}
 			// Block until the ReadyFn has been called before continuing.
@@ -274,20 +267,19 @@ func (c *transientCluster) start(
 		}
 	}
 
-	// Create the root password if running in secure mode. We'll
-	// need that for the URL.
-	if !demoCtx.insecure {
-		if err := c.setupUserAuth(ctx); err != nil {
-			return err
-		}
+	// Run the SQL initialization. This takes care of setting up the
+	// initial replication factor for small clusters and creating the
+	// admin user.
+	const demoUsername = "demo"
+	demoPassword, err := runInitialSQL(ctx, c.s.Server, demoCtx.nodes < 3, demoUsername)
+	if err != nil {
+		return err
 	}
-
-	if demoCtx.nodes < 3 {
-		// Set up the default zone configuration. We are using an in-memory store
-		// so we really want to disable replication.
-		if err := cliDisableReplication(ctx, c.s.Server); err != nil {
-			return err
-		}
+	c.adminUser = demoUsername
+	c.adminPassword = demoPassword
+	if demoCtx.insecure {
+		c.adminUser = security.RootUser
+		c.adminPassword = "unused"
 	}
 
 	// Prepare the URL for use by the SQL shell.
@@ -485,7 +477,7 @@ func (c *transientCluster) RestartNode(nodeID roachpb.NodeID) error {
 		close(readyCh)
 	}
 
-	if err := serv.Start(args); err != nil {
+	if err := serv.Start(); err != nil {
 		return err
 	}
 
@@ -582,21 +574,11 @@ func (c *transientCluster) getNetworkURLForServer(
 		sqlURL.User = url.User(security.RootUser)
 		options.Add("sslmode", "disable")
 	} else {
-		sqlURL.User = url.UserPassword(security.RootUser, defaultRootPassword)
+		sqlURL.User = url.UserPassword(c.adminUser, c.adminPassword)
 		options.Add("sslmode", "require")
 	}
 	sqlURL.RawQuery = options.Encode()
 	return sqlURL.String(), nil
-}
-
-func (c *transientCluster) setupUserAuth(ctx context.Context) error {
-	ie := c.s.InternalExecutor().(*sql.InternalExecutor)
-	_, err := ie.Exec(ctx, "set-root-password", nil, /* txn*/
-		`ALTER USER $1 WITH PASSWORD $2`,
-		security.RootUser,
-		defaultRootPassword,
-	)
-	return err
 }
 
 func (c *transientCluster) setupWorkload(
@@ -699,7 +681,7 @@ func (c *transientCluster) runWorkload(
 						// Only log an error and return when the workload function throws
 						// an error, because errors these errors should be ignored, and
 						// should not interrupt the rest of the demo.
-						log.Warningf(ctx, "Error running workload query: %+v\n", err)
+						log.Warningf(ctx, "error running workload query: %+v", err)
 						return
 					}
 				}
@@ -768,12 +750,16 @@ func (c *transientCluster) sockForServer(nodeID roachpb.NodeID) unixSocketDetail
 	return unixSocketDetails{
 		socketDir:  c.demoDir,
 		portNumber: defaultPort + int(nodeID) - 1,
+		username:   c.adminUser,
+		password:   c.adminPassword,
 	}
 }
 
 type unixSocketDetails struct {
 	socketDir  string
 	portNumber int
+	username   string
+	password   string
 }
 
 func (s unixSocketDetails) exists() bool {
@@ -798,7 +784,7 @@ func (s unixSocketDetails) String() string {
 	// mode the password is not checked on the server.
 	sqlURL := url.URL{
 		Scheme:   "postgres",
-		User:     url.UserPassword(security.RootUser, defaultRootPassword),
+		User:     url.UserPassword(s.username, s.password),
 		RawQuery: options.Encode(),
 	}
 	return sqlURL.String()

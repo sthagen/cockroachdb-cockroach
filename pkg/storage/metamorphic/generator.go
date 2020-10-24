@@ -36,17 +36,6 @@ func makeStorageConfig(path string) base.StorageConfig {
 	}
 }
 
-func createTestRocksDBEngine(path string, seed int64) (storage.Engine, error) {
-	cache := storage.NewRocksDBCache(1 << 20)
-	defer cache.Release()
-	cfg := storage.RocksDBConfig{
-		StorageConfig: makeStorageConfig(path),
-		ReadOnly:      false,
-	}
-
-	return storage.NewRocksDB(cfg, cache)
-}
-
 func createTestPebbleEngine(path string, seed int64) (storage.Engine, error) {
 	pebbleConfig := storage.PebbleConfig{
 		StorageConfig: makeStorageConfig(path),
@@ -110,8 +99,6 @@ func createTestPebbleVarOpts(path string, seed int64) (storage.Engine, error) {
 	opts.MaxOpenFiles = int(rngIntRange(rng, 20, 2000))
 	opts.MemTableSize = 1 << rngIntRange(rng, 10, 28)
 	opts.MemTableStopWritesThreshold = int(rngIntRange(rng, 2, 7))
-	opts.MinCompactionRate = int(rngIntRange(rng, 1<<8, 8<<20))
-	opts.MinFlushRate = int(rngIntRange(rng, 1<<8, 4<<20))
 	opts.MaxConcurrentCompactions = int(rngIntRange(rng, 1, 4))
 
 	opts.Cache = pebble.NewCache(1 << rngIntRange(rng, 1, 30))
@@ -136,7 +123,6 @@ func (e *engineImpl) String() string {
 	return e.name
 }
 
-var engineImplRocksDB = engineImpl{"rocksdb", createTestRocksDBEngine}
 var engineImplPebble = engineImpl{"pebble", createTestPebbleEngine}
 var engineImplPebbleManySSTs = engineImpl{"pebble_many_ssts", createTestPebbleManySSTs}
 var engineImplPebbleVarOpts = engineImpl{"pebble_var_opts", createTestPebbleVarOpts}

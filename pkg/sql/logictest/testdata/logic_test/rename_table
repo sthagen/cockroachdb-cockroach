@@ -1,5 +1,3 @@
-# LogicTest: !3node-tenant(52567)
-
 statement error pgcode 42P01 relation "foo" does not exist
 ALTER TABLE foo RENAME TO bar
 
@@ -21,10 +19,10 @@ SELECT * FROM kv
 1 2
 3 4
 
-query TTTI
+query TTTTI
 SHOW TABLES
 ----
-public  kv  table  0
+public  kv  table  root  0
 
 statement ok
 ALTER TABLE kv RENAME TO new_kv
@@ -38,10 +36,10 @@ SELECT * FROM new_kv
 1 2
 3 4
 
-query TTTI
+query TTTTI
 SHOW TABLES
 ----
-public  new_kv  table  0
+public  new_kv  table  root  0
 
 # check the name in the descriptor, which is used by SHOW GRANTS, is also changed
 query TTTTT
@@ -97,11 +95,11 @@ GRANT CREATE ON DATABASE test TO testuser
 statement ok
 ALTER TABLE test.t RENAME TO t2
 
-query TTTI
+query TTTTI
 SHOW TABLES
 ----
-public  new_kv  table  0
-public  t2      table  0
+public  new_kv  table  root  0
+public  t2      table  root  0
 
 user testuser
 
@@ -124,15 +122,15 @@ ALTER TABLE test.new_kv RENAME TO test2.t
 statement ok
 ALTER TABLE test.t2 RENAME TO test2.t2
 
-query TTTI
+query TTTTI
 SHOW TABLES
 ----
 
-query TTTI
+query TTTTI
 SHOW TABLES FROM test2
 ----
-public  t   table  NULL
-public  t2  table  NULL
+public  t   table  root  NULL
+public  t2  table  root  NULL
 
 user root
 
@@ -211,25 +209,6 @@ INSERT INTO d.kv (k,v) VALUES ('g', 'h')
 statement ok
 ROLLBACK
 
-# The reuse of a name is allowed.
-statement ok
-BEGIN
-
-statement ok
-ALTER DATABASE d RENAME TO dnew
-
-statement ok
-CREATE DATABASE d
-
-statement ok
-CREATE TABLE d.kv (k CHAR PRIMARY KEY, v CHAR)
-
-statement ok
-INSERT INTO d.kv (k,v) VALUES ('a', 'b')
-
-statement ok
-COMMIT
-
 # Check that on a rollback a database name cannot be used.
 statement ok
 BEGIN
@@ -265,10 +244,10 @@ INSERT INTO d.kv2 (k,v) VALUES ('c', 'd')
 statement ok
 USE d
 
-query TTTI
+query TTTTI
 SHOW TABLES
 ----
-public  kv  table  0
+public  kv  table  root  0
 
 query TTT
 EXPLAIN ALTER TABLE kv RENAME TO kv2
@@ -278,7 +257,118 @@ EXPLAIN ALTER TABLE kv RENAME TO kv2
 rename table  ·             ·
 
 # Verify that the EXPLAIN above does not actually rename the table (#30543)
-query TTTI
+query TTTTI
 SHOW TABLES
 ----
-public  kv  table  0
+public  kv  table  root  0
+
+# Test that tables can't be renamed to a different database unless both the
+# old and new schemas are in the public schema.
+subtest rename_table_across_dbs
+
+statement ok
+CREATE DATABASE olddb
+
+statement ok
+CREATE DATABASE newdb
+
+statement ok
+USE olddb
+
+statement ok
+CREATE SCHEMA oldsc
+
+statement ok
+USE newdb
+
+statement ok
+CREATE SCHEMA newsc
+
+statement ok
+CREATE TABLE olddb.public.tbl1();
+
+statement ok
+CREATE TABLE olddb.oldsc.tbl2();
+
+statement error pgcode 42602 cannot change database of table
+ALTER TABLE olddb.public.tbl1 RENAME TO newdb.newsc.tbl1
+
+statement error pgcode 42602 cannot change database of table
+ALTER TABLE olddb.oldsc.tbl2 RENAME TO newdb.public.tbl2
+
+statement error pgcode 42602 cannot change database of table
+ALTER TABLE olddb.oldsc.tbl2 RENAME TO newdb.newsc.tbl2
+
+# Try different but equivalent names.
+
+statement error pgcode 42602 cannot change database of table
+ALTER TABLE olddb.tbl1 RENAME TO newdb.newsc.tbl1
+
+statement error pgcode 42602 cannot change database of table
+ALTER TABLE olddb.oldsc.tbl2 RENAME TO newdb.tbl2
+
+# Using the public schemas should still work.
+
+statement ok
+ALTER TABLE olddb.public.tbl1 RENAME TO newdb.public.tbl1
+
+statement ok
+DROP DATABASE olddb CASCADE
+
+statement ok
+DROP DATABASE newdb CASCADE
+
+subtest rename_table_using_types_to_different_database_not_allowed_55709
+
+statement ok
+CREATE DATABASE olddb
+
+statement ok
+CREATE DATABASE newdb
+
+statement ok
+USE olddb
+
+statement ok
+CREATE TYPE typ AS ENUM ('foo')
+
+statement ok
+CREATE TABLE tbl(a typ)
+
+statement error pgcode 55000 cannot change database of table if any of its column types are user-defined
+ALTER TABLE tbl RENAME TO newdb.tbl
+
+# Try it in a transaction with non-public columns.
+
+statement ok
+CREATE TABLE tbl2()
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE tbl2 ADD COLUMN b typ
+
+statement error pgcode 55000 cannot change database of table if any of its column types are user-defined
+ALTER TABLE tbl2 RENAME TO newdb.tbl2
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE tbl DROP COLUMN a
+
+statement error pgcode 55000 cannot change database of table if any of its column types are user-defined
+ALTER TABLE tbl RENAME TO newdb.tbl
+
+statement ok
+ROLLBACK
+
+statement ok
+DROP DATABASE olddb CASCADE
+
+statement ok
+DROP DATABASE newdb CASCADE

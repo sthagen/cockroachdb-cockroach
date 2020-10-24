@@ -133,7 +133,7 @@ func (ds *DistSender) partialRangeFeed(
 	// Start a retry loop for sending the batch to the range.
 	for r := retry.StartWithCtx(ctx, ds.rpcRetryOptions); r.Next(); {
 		// If we've cleared the descriptor on a send failure, re-lookup.
-		if rangeInfo.token.Empty() {
+		if !rangeInfo.token.Valid() {
 			var err error
 			ri, err := ds.getRoutingInfo(ctx, rangeInfo.rs.Key, EvictionToken{}, false)
 			if err != nil {
@@ -175,7 +175,7 @@ func (ds *DistSender) partialRangeFeed(
 			case errors.HasType(err, (*roachpb.RangeFeedRetryError)(nil)):
 				var t *roachpb.RangeFeedRetryError
 				if ok := errors.As(err, &t); !ok {
-					panic(fmt.Sprintf("wrong error type: %T", err))
+					panic(errors.AssertionFailedf("wrong error type: %T", err))
 				}
 				switch t.Reason {
 				case roachpb.RangeFeedRetryError_REASON_REPLICA_REMOVED,
@@ -236,7 +236,7 @@ func (ds *DistSender) singleRangeFeed(
 	// The RangeFeed is not used for system critical traffic so use a DefaultClass
 	// connection regardless of the range.
 	opts := SendOptions{class: rpc.DefaultClass}
-	transport, err := ds.transportFactory(opts, ds.nodeDialer, replicas)
+	transport, err := ds.transportFactory(opts, ds.nodeDialer, replicas.Descriptors())
 	if err != nil {
 		return args.Timestamp, err
 	}

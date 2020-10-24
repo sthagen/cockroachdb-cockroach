@@ -152,6 +152,11 @@ func (i *Iterator) UnsafeKey() storage.MVCCKey {
 	return i.i.UnsafeKey()
 }
 
+// UnsafeRawKey is part of the engine.Iterator interface.
+func (i *Iterator) UnsafeRawKey() []byte {
+	return i.i.UnsafeRawKey()
+}
+
 // UnsafeValue is part of the engine.Iterator interface.
 func (i *Iterator) UnsafeValue() []byte {
 	return i.i.UnsafeValue()
@@ -310,9 +315,7 @@ func (s spanSetReader) GetProto(
 	return s.r.GetProto(key, msg)
 }
 
-func (s spanSetReader) Iterate(
-	start, end roachpb.Key, f func(storage.MVCCKeyValue) (bool, error),
-) error {
+func (s spanSetReader) Iterate(start, end roachpb.Key, f func(storage.MVCCKeyValue) error) error {
 	if s.spansOnly {
 		if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start, EndKey: end}); err != nil {
 			return err

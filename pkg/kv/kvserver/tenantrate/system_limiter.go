@@ -18,13 +18,18 @@ type systemLimiter struct {
 	tenantMetrics
 }
 
-func (s systemLimiter) Wait(ctx context.Context, writeBytes int64) error {
+func (s systemLimiter) Wait(ctx context.Context, isWrite bool, writeBytes int64) error {
+	if isWrite {
+		s.writeRequestsAdmitted.Inc(1)
+	} else {
+		s.readRequestsAdmitted.Inc(1)
+	}
 	s.writeBytesAdmitted.Inc(writeBytes)
-	s.requestsAdmitted.Inc(1)
 	return nil
 }
 
 func (s systemLimiter) RecordRead(ctx context.Context, readBytes int64) {
+	s.readBytesAdmitted.Inc(readBytes)
 }
 
 var _ Limiter = (*systemLimiter)(nil)

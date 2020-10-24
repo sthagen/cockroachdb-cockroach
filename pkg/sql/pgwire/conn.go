@@ -25,13 +25,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -163,6 +164,7 @@ func newConn(
 		metrics:     metrics,
 		rd:          *bufio.NewReader(netConn),
 		sv:          sv,
+		readBuf:     pgwirebase.MakeReadBuffer(pgwirebase.ReadBufferOptionWithClusterSettings(sv)),
 	}
 	c.stmtBuf.Init()
 	c.res.released = true
@@ -212,7 +214,11 @@ func (c *conn) serveImpl(
 ) {
 	defer func() { _ = c.conn.Close() }()
 
-	ctx = logtags.AddTag(ctx, "user", c.sessionArgs.User)
+	if c.sessionArgs.User == security.RootUser || c.sessionArgs.User == security.NodeUser {
+		ctx = logtags.AddTag(ctx, "user", log.Safe(c.sessionArgs.User))
+	} else {
+		ctx = logtags.AddTag(ctx, "user", c.sessionArgs.User)
+	}
 
 	inTestWithoutSQL := sqlServer == nil
 	var authLogger *log.SecondaryLogger
@@ -320,6 +326,47 @@ Loop:
 		typ, n, err = c.readBuf.ReadTypedMsg(&c.rd)
 		c.metrics.BytesInCount.Inc(int64(n))
 		if err != nil {
+			// Only perform this logic on ClientMsgSimpleQuery for v20.2.
+			// We cannot safely do the rest of this (i.e. for portals) without doing
+			// the todo message by jordan regarding error in extended protocol state
+			// below.
+			if pgwirebase.IsMessageTooBigError(err) && typ == pgwirebase.ClientMsgSimpleQuery {
+				log.VInfof(ctx, 1, "pgwire: found big error message; attempting to slurp bytes and return error: %s", err)
+
+				// Slurp the remaining bytes.
+				slurpN, slurpErr := c.readBuf.SlurpBytes(&c.rd, pgwirebase.GetMessageTooBigSize(err))
+				c.metrics.BytesInCount.Inc(int64(slurpN))
+				if slurpErr != nil {
+					log.VInfof(ctx, 1, "pgwire: error slurping remaining bytes: %s", slurpErr)
+					break Loop
+				}
+
+				// Write out the error over pgwire.
+				if err := writeErr(
+					ctx,
+					&sqlServer.GetExecutorConfig().Settings.SV,
+					err,
+					&c.msgBuilder,
+					&c.writerState.buf,
+				); err != nil {
+					log.VInfof(ctx, 1, "pgwire: error writing too big error message to the client")
+					break Loop
+				}
+
+				// We have to send the sync message back as well.
+				if err = c.stmtBuf.Push(ctx, sql.Sync{}); err != nil {
+					log.VInfof(ctx, 1, "pgwire: error writing sync to the client whilst message is too big")
+					break Loop
+				}
+
+				// We need to continue processing here for pgwire clients to be able to
+				// successfully read the error message off pgwire.
+				// If break here, we terminate the connection., The client will instead see that
+				// we terminated the connection prematurely (as opposed to seeing a ClientMsgTerminate
+				// packet) and instead return a broken pipe or io.EOF error message.
+				continue Loop
+			}
+			log.VEventf(ctx, 1, "pgwire: error reading input: %s", err)
 			break Loop
 		}
 		timeReceived := timeutil.Now()
@@ -596,7 +643,7 @@ func (c *conn) bufferParamStatus(param, value string) error {
 	return c.msgBuilder.finishMsg(&c.writerState.buf)
 }
 
-func (c *conn) bufferNotice(ctx context.Context, noticeErr error) error {
+func (c *conn) bufferNotice(ctx context.Context, noticeErr pgnotice.Notice) error {
 	c.msgBuilder.initMsg(pgwirebase.ServerMsgNoticeResponse)
 	return writeErrFields(ctx, c.sv, noticeErr, &c.msgBuilder, &c.writerState.buf)
 }
@@ -780,6 +827,12 @@ func (c *conn) handleParse(
 		sqlTypeHints = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
 		for i, t := range inTypeHints {
 			if t == 0 {
+				continue
+			}
+			// If the OID is user defined, then write nil into the type hints and let
+			// the consumer of the PrepareStmt resolve the types.
+			if types.IsOIDUserDefinedType(t) {
+				sqlTypeHints[i] = nil
 				continue
 			}
 			v, ok := types.OidToType[t]
@@ -1007,7 +1060,7 @@ func (c *conn) handleFlush(ctx context.Context) error {
 }
 
 // BeginCopyIn is part of the pgwirebase.Conn interface.
-func (c *conn) BeginCopyIn(ctx context.Context, columns []sqlbase.ResultColumn) error {
+func (c *conn) BeginCopyIn(ctx context.Context, columns []colinfo.ResultColumn) error {
 	c.msgBuilder.initMsg(pgwirebase.ServerMsgCopyInResponse)
 	c.msgBuilder.writeByte(byte(pgwirebase.FormatText))
 	c.msgBuilder.putInt16(int16(len(columns)))
@@ -1095,7 +1148,8 @@ func (c *conn) bufferRow(
 	ctx context.Context,
 	row tree.Datums,
 	formatCodes []pgwirebase.FormatCode,
-	conv sessiondata.DataConversionConfig,
+	conv sessiondatapb.DataConversionConfig,
+	sessionLoc *time.Location,
 	types []*types.T,
 ) {
 	c.msgBuilder.initMsg(pgwirebase.ServerMsgDataRow)
@@ -1107,9 +1161,9 @@ func (c *conn) bufferRow(
 		}
 		switch fmtCode {
 		case pgwirebase.FormatText:
-			c.msgBuilder.writeTextDatum(ctx, col, conv, types[i])
+			c.msgBuilder.writeTextDatum(ctx, col, conv, sessionLoc, types[i])
 		case pgwirebase.FormatBinary:
-			c.msgBuilder.writeBinaryDatum(ctx, col, conv.Location, types[i])
+			c.msgBuilder.writeBinaryDatum(ctx, col, sessionLoc, types[i])
 		default:
 			c.msgBuilder.setError(errors.Errorf("unsupported format code %s", fmtCode))
 		}
@@ -1190,7 +1244,6 @@ func writeErr(
 func writeErrFields(
 	ctx context.Context, sv *settings.Values, err error, msgBuilder *writeBuffer, w io.Writer,
 ) error {
-	// Now send the error to the client.
 	pgErr := pgerror.Flatten(err)
 
 	msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldSeverity)
@@ -1200,13 +1253,18 @@ func writeErrFields(
 	msgBuilder.writeTerminatedString(pgErr.Code)
 
 	if pgErr.Detail != "" {
-		msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFileldDetail)
+		msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldDetail)
 		msgBuilder.writeTerminatedString(pgErr.Detail)
 	}
 
 	if pgErr.Hint != "" {
-		msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFileldHint)
+		msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldHint)
 		msgBuilder.writeTerminatedString(pgErr.Hint)
+	}
+
+	if pgErr.ConstraintName != "" {
+		msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldConstraintName)
+		msgBuilder.writeTerminatedString(pgErr.ConstraintName)
 	}
 
 	if pgErr.Source != nil {
@@ -1260,7 +1318,7 @@ func (c *conn) bufferNoDataMsg() {
 // If an error is returned, it has also been saved on c.err.
 func (c *conn) writeRowDescription(
 	ctx context.Context,
-	columns []sqlbase.ResultColumn,
+	columns []colinfo.ResultColumn,
 	formatCodes []pgwirebase.FormatCode,
 	w io.Writer,
 ) error {
@@ -1376,12 +1434,13 @@ func (c *conn) CreateStatementResult(
 	descOpt sql.RowDescOpt,
 	pos sql.CmdPos,
 	formatCodes []pgwirebase.FormatCode,
-	conv sessiondata.DataConversionConfig,
+	conv sessiondatapb.DataConversionConfig,
+	location *time.Location,
 	limit int,
 	portalName string,
 	implicitTxn bool,
 ) sql.CommandResult {
-	return c.newCommandResult(descOpt, pos, stmt, formatCodes, conv, limit, portalName, implicitTxn)
+	return c.newCommandResult(descOpt, pos, stmt, formatCodes, conv, location, limit, portalName, implicitTxn)
 }
 
 // CreateSyncResult is part of the sql.ClientComm interface.

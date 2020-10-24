@@ -43,7 +43,7 @@ type vecToDatumWidthTmplInfo struct {
 
 // AssignConverted returns a string that performs a conversion of the element
 // in typedCol at position tupleIdx and assigns the result to targetElem.
-// datumAlloc is the name of *sqlbase.DatumAlloc struct that can be used to
+// datumAlloc is the name of *rowenc.DatumAlloc struct that can be used to
 // allocate new datums.
 func (i vecToDatumWidthTmplInfo) AssignConverted(
 	targetElem, typedCol, tupleIdx, datumAlloc string,
@@ -88,7 +88,7 @@ var vecToDatumConversionTmpls = map[types.Family]string{
 	typeconv.DatumVecCanonicalTypeFamily: `%[1]s = %[2]s.Get(%[3]s).(*coldataext.Datum).Datum`,
 }
 
-const vecToDatumTmpl = "pkg/sql/colexec/vec_to_datum_tmpl.go"
+const vecToDatumTmpl = "pkg/sql/colconv/vec_to_datum_tmpl.go"
 
 func genVecToDatum(inputFileContents string, wr io.Writer) error {
 	r := strings.NewReplacer(

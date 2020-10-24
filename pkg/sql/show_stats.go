@@ -14,16 +14,17 @@ import (
 	"context"
 	encjson "encoding/json"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/errors"
 )
 
-var showTableStatsColumns = sqlbase.ResultColumns{
+var showTableStatsColumns = colinfo.ResultColumns{
 	{Name: "statistics_name", Typ: types.String},
 	{Name: "column_names", Typ: types.StringArray},
 	{Name: "created", Typ: types.Timestamp},
@@ -33,7 +34,7 @@ var showTableStatsColumns = sqlbase.ResultColumns{
 	{Name: "histogram_id", Typ: types.Int},
 }
 
-var showTableStatsJSONColumns = sqlbase.ResultColumns{
+var showTableStatsJSONColumns = colinfo.ResultColumns{
 	{Name: "statistics", Typ: types.Jsonb},
 }
 
@@ -170,7 +171,7 @@ func (p *planner) ShowTableStats(ctx context.Context, n *tree.ShowTableStats) (p
 	}, nil
 }
 
-func statColumnString(desc *ImmutableTableDescriptor, colID tree.Datum) string {
+func statColumnString(desc *tabledesc.Immutable, colID tree.Datum) string {
 	id := descpb.ColumnID(*colID.(*tree.DInt))
 	colDesc, err := desc.FindColumnByID(id)
 	if err != nil {

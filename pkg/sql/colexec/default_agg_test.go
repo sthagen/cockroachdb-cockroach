@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -140,14 +141,14 @@ func TestDefaultAggregateFunc(t *testing.T) {
 				if err := tc.init(); err != nil {
 					t.Fatal(err)
 				}
-				constructors, constArguments, outputTypes, err := ProcessAggregations(
+				constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
 					&evalCtx, &semaCtx, tc.spec.Aggregations, tc.typs,
 				)
 				require.NoError(t, err)
 				runTestsWithTyps(t, []tuples{tc.input}, [][]*types.T{tc.typs}, tc.expected, unorderedVerifier,
 					func(input []colexecbase.Operator) (colexecbase.Operator, error) {
 						return agg.new(
-							testAllocator, input[0], tc.typs, tc.spec, &evalCtx,
+							testAllocator, testMemAcc, input[0], tc.typs, tc.spec, &evalCtx,
 							constructors, constArguments, outputTypes, false, /* isScalar */
 						)
 					})
@@ -157,11 +158,15 @@ func TestDefaultAggregateFunc(t *testing.T) {
 }
 
 func BenchmarkDefaultAggregateFunction(b *testing.B) {
+	const numInputBatches = 64
 	aggFn := execinfrapb.AggregatorSpec_STRING_AGG
 	for _, agg := range aggTypes {
 		for _, groupSize := range []int{1, 2, 32, 128, coldata.BatchSize() / 2, coldata.BatchSize()} {
 			for _, nullProb := range []float64{0.0, nullProbability} {
-				benchmarkAggregateFunction(b, agg, aggFn, []*types.T{types.String, types.String}, groupSize, nullProb)
+				benchmarkAggregateFunction(
+					b, agg, aggFn, []*types.T{types.String, types.String}, groupSize,
+					0 /* distinctProb */, nullProb, numInputBatches,
+				)
 			}
 		}
 	}

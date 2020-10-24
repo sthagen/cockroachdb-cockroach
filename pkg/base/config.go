@@ -41,10 +41,9 @@ const (
 	DefaultHTTPPort = "8080"
 
 	// NB: net.JoinHostPort is not a constant.
-	defaultAddr       = ":" + DefaultPort
-	defaultSQLAddr    = ":" + DefaultPort
-	defaultTenantAddr = ":" + DefaultPort
-	defaultHTTPAddr   = ":" + DefaultHTTPPort
+	defaultAddr     = ":" + DefaultPort
+	defaultSQLAddr  = ":" + DefaultPort
+	defaultHTTPAddr = ":" + DefaultHTTPPort
 
 	// NetworkTimeout is the timeout used for network operations.
 	NetworkTimeout = 3 * time.Second
@@ -128,7 +127,7 @@ var (
 	// is responsible for ensuring the raft log doesn't grow without bound by
 	// making sure the leader doesn't get too far ahead.
 	defaultRaftLogTruncationThreshold = envutil.EnvOrDefaultInt64(
-		"COCKROACH_RAFT_LOG_TRUNCATION_THRESHOLD", 8<<20 /* 8 MB */)
+		"COCKROACH_RAFT_LOG_TRUNCATION_THRESHOLD", 16<<20 /* 16 MB */)
 
 	// defaultRaftMaxSizePerMsg specifies the maximum aggregate byte size of Raft
 	// log entries that a leader will send to followers in a single MsgApp.
@@ -150,9 +149,18 @@ var (
 // Config is embedded by server.Config. A base config is not meant to be used
 // directly, but embedding configs should call cfg.InitDefaults().
 type Config struct {
-	// Insecure specifies whether to use SSL or not.
+	// Insecure specifies whether to disable security checks throughout
+	// the code base.
 	// This is really not recommended.
+	// See: https://github.com/cockroachdb/cockroach/issues/53404
 	Insecure bool
+
+	// AcceptSQLWithoutTLS, when set, makes it possible for SQL
+	// clients to authenticate without TLS on a secure cluster.
+	//
+	// Authentication is, as usual, subject to the HBA configuration: in
+	// the default case, password authentication is still mandatory.
+	AcceptSQLWithoutTLS bool
 
 	// SSLCAKey is used to sign new certs.
 	SSLCAKey string
@@ -195,18 +203,6 @@ type Config struct {
 	// SQLAdvertiseAddr is the advertised SQL address.
 	// This is computed from SQLAddr if specified otherwise Addr.
 	SQLAdvertiseAddr string
-
-	// SplitListenTenant indicates whether to listen for tenant
-	// KV clients on a separate address from RPC requests.
-	SplitListenTenant bool
-
-	// TenantAddr is the configured tenant KV listen address.
-	// This is used if SplitListenTenant is set to true.
-	TenantAddr string
-
-	// TenantAdvertiseAddr is the advertised tenant KV address.
-	// This is computed from TenantAddr if specified otherwise Addr.
-	TenantAdvertiseAddr string
 
 	// HTTPAddr is the configured HTTP listen address.
 	HTTPAddr string
@@ -268,14 +264,12 @@ func (cfg *Config) InitDefaults() {
 	cfg.SplitListenSQL = false
 	cfg.SQLAddr = defaultSQLAddr
 	cfg.SQLAdvertiseAddr = cfg.SQLAddr
-	cfg.SplitListenTenant = false
-	cfg.TenantAddr = defaultTenantAddr
-	cfg.TenantAdvertiseAddr = cfg.TenantAddr
 	cfg.SSLCertsDir = DefaultCertsDirectory
 	cfg.RPCHeartbeatInterval = defaultRPCHeartbeatInterval
 	cfg.ClusterName = ""
 	cfg.DisableClusterNameVerification = false
 	cfg.ClockDevicePath = ""
+	cfg.AcceptSQLWithoutTLS = false
 }
 
 // HTTPRequestScheme returns "http" or "https" based on the value of
@@ -535,6 +529,8 @@ type TempStorageConfig struct {
 	Mon *mon.BytesMonitor
 	// Spec stores the StoreSpec this TempStorageConfig will use.
 	Spec StoreSpec
+	// Settings stores the cluster.Settings this TempStoreConfig will use.
+	Settings *cluster.Settings
 }
 
 // ExternalIODirConfig describes various configuration options pertaining
@@ -584,6 +580,7 @@ func TempStorageConfigFromEnv(
 		InMemory: inMem,
 		Mon:      monitor,
 		Spec:     useStore,
+		Settings: st,
 	}
 }
 

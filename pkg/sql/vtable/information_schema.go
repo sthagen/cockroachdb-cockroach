@@ -10,6 +10,21 @@
 
 package vtable
 
+// InformationSchemaColumnUDTUsage describes the schema of the
+// information_schema.column_udt_usage table.
+// Postgres: https://www.postgresql.org/docs/current/infoschema-column-udt-usage.html
+const InformationSchemaColumnUDTUsage = `
+CREATE TABLE information_schema.column_udt_usage (
+  UDT_CATALOG   STRING NOT NULL,
+  UDT_SCHEMA    STRING NOT NULL,
+  UDT_NAME      STRING NOT NULL,
+  TABLE_CATALOG STRING NOT NULL,
+  TABLE_SCHEMA  STRING NOT NULL,
+  TABLE_NAME    STRING NOT NULL,
+  COLUMN_NAME   STRING NOT NULL
+)
+`
+
 // InformationSchemaColumns describes the schema of the
 // information_schema.columns table.
 // Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-columns.html
@@ -136,6 +151,5 @@ CREATE TABLE information_schema.tables (
 	TABLE_NAME         STRING NOT NULL,
 	TABLE_TYPE         STRING NOT NULL,
 	IS_INSERTABLE_INTO STRING NOT NULL,
-	VERSION            INT,
-  INDEX(TABLE_NAME)
+	VERSION            INT
 )`

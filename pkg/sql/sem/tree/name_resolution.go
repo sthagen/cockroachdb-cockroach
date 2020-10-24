@@ -512,6 +512,14 @@ func (n *UnresolvedName) ResolveFunction(
 		// it in the global namespace.
 		prefix = ""
 	}
+	if prefix == sessiondata.PublicSchemaName {
+		// If the user specified public, it may be from a PostgreSQL extension.
+		// Double check the function definition allows resolution on the public
+		// schema, and resolve as such if appropriate.
+		if d, ok := FunDefs[function]; ok && d.AvailableOnPublicSchema {
+			return d, nil
+		}
+	}
 
 	if prefix != "" {
 		fullName = prefix + "." + function
@@ -563,9 +571,18 @@ func newSourceNotFoundError(fmt string, args ...interface{}) error {
 type CommonLookupFlags struct {
 	// if required is set, lookup will return an error if the item is not found.
 	Required bool
+	// RequireMutable specifies whether to return a mutable descriptor.
+	RequireMutable bool
 	// if AvoidCached is set, lookup will avoid the cache (if any).
 	AvoidCached bool
+	// IncludeOffline specifies if offline descriptors should be visible.
+	IncludeOffline bool
+	// IncludeOffline specifies if dropped descriptors should be visible.
+	IncludeDropped bool
 }
+
+// SchemaLookupFlags is the flag struct suitable for GetSchema().
+type SchemaLookupFlags = CommonLookupFlags
 
 // DatabaseLookupFlags is the flag struct suitable for GetDatabaseDesc().
 type DatabaseLookupFlags = CommonLookupFlags
@@ -632,10 +649,6 @@ func (r RequiredTableKind) String() string {
 // ObjectLookupFlags is the flag struct suitable for GetObjectDesc().
 type ObjectLookupFlags struct {
 	CommonLookupFlags
-	// return a MutableTableDescriptor
-	RequireMutable         bool
-	IncludeOffline         bool
-	IncludeDropped         bool
 	AllowWithoutPrimaryKey bool
 	// Control what type of object is being requested.
 	DesiredObjectKind DesiredObjectKind

@@ -18,9 +18,10 @@ import (
 	"unicode"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/errors"
@@ -42,7 +43,8 @@ func newPgCopyReader(
 	kvCh chan row.KVBatch,
 	walltime int64,
 	parallelism int,
-	tableDesc *sqlbase.ImmutableTableDescriptor,
+	tableDesc *tabledesc.Immutable,
+	targetCols tree.NameList,
 	evalCtx *tree.EvalContext,
 ) (*pgCopyReader, error) {
 	return &pgCopyReader{
@@ -51,6 +53,7 @@ func newPgCopyReader(
 			numWorkers: parallelism,
 			evalCtx:    evalCtx,
 			tableDesc:  tableDesc,
+			targetCols: targetCols,
 			kvCh:       kvCh,
 		},
 		opts: opts,
@@ -324,7 +327,7 @@ func (p *pgCopyConsumer) FillDatums(
 		if s == nil {
 			conv.Datums[i] = tree.DNull
 		} else {
-			conv.Datums[i], err = sqlbase.ParseDatumStringAs(conv.VisibleColTypes[i], *s, conv.EvalCtx)
+			conv.Datums[i], err = rowenc.ParseDatumStringAs(conv.VisibleColTypes[i], *s, conv.EvalCtx)
 			if err != nil {
 				col := conv.VisibleCols[i]
 				return newImportRowError(fmt.Errorf(

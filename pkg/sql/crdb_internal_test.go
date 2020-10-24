@@ -22,16 +22,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -58,9 +61,9 @@ func TestGetAllNamesInternal(t *testing.T) {
 
 	err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		batch := txn.NewBatch()
-		batch.Put(sqlbase.NewTableKey(999, 444, "bob").Key(keys.SystemSQLCodec), 9999)
-		batch.Put(sqlbase.NewDeprecatedTableKey(1000, "alice").Key(keys.SystemSQLCodec), 10000)
-		batch.Put(sqlbase.NewDeprecatedTableKey(999, "overwrite_me_old_value").Key(keys.SystemSQLCodec), 9999)
+		batch.Put(catalogkeys.NewTableKey(999, 444, "bob").Key(keys.SystemSQLCodec), 9999)
+		batch.Put(catalogkeys.NewDeprecatedTableKey(1000, "alice").Key(keys.SystemSQLCodec), 10000)
+		batch.Put(catalogkeys.NewDeprecatedTableKey(999, "overwrite_me_old_value").Key(keys.SystemSQLCodec), 9999)
 		return txn.CommitInBatch(ctx, batch)
 	})
 	require.NoError(t, err)
@@ -97,7 +100,7 @@ func TestRangeLocalityBasedOnNodeIDs(t *testing.T) {
 	assert.NoError(t, tc.Servers[0].DB().Put(ctx, keys.StoreIDGenerator, 2))
 
 	// NodeID=2, StoreID=3
-	tc.AddServer(t,
+	tc.AddAndStartServer(t,
 		base.TestServerArgs{
 			Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "node", Value: "2"}}},
 		},
@@ -108,7 +111,7 @@ func TestRangeLocalityBasedOnNodeIDs(t *testing.T) {
 	assert.NoError(t, tc.Servers[0].DB().Put(ctx, keys.StoreIDGenerator, 1))
 
 	// NodeID=3, StoreID=2
-	tc.AddServer(t,
+	tc.AddAndStartServer(t,
 		base.TestServerArgs{
 			Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "node", Value: "3"}}},
 		},
@@ -148,7 +151,7 @@ func TestGossipAlertsTable(t *testing.T) {
 
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
 	row, err := ie.QueryRowEx(ctx, "test", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUser},
 		"SELECT * FROM crdb_internal.gossip_alerts WHERE store_id = 123")
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +214,7 @@ CREATE TABLE t.test (k INT);
 		t.Fatal(err)
 	}
 	colDef := alterCmd.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
-	col, _, _, err := sqlbase.MakeColumnDefDescs(ctx, colDef, nil, nil)
+	col, _, _, err := tabledesc.MakeColumnDefDescs(ctx, colDef, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +229,7 @@ CREATE TABLE t.test (k INT);
 		if err := txn.SetSystemConfigTrigger(true /* forSystemTenant */); err != nil {
 			return err
 		}
-		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), tableDesc.DescriptorProto())
+		return txn.Put(ctx, catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), tableDesc.DescriptorProto())
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -323,13 +326,15 @@ INSERT INTO t.t VALUES (1);
 	}
 
 	// Look up the schema first so only the read txn is recorded in
-	// kv trace logs.
-	if _, err := sqlDB.Exec(`SELECT * FROM t.t`); err != nil {
+	// kv trace logs. We explicitly specify the schema to avoid an extra failed
+	// lease acquisition, which occurs in a separate transaction, to work around
+	// a current limitation in schema resolution. See #53301.
+	if _, err := sqlDB.Exec(`SELECT * FROM t.public.t`); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := sqlDB.Exec(
-		`SET tracing=on,kv; SELECT * FROM t.t; SET TRACING=off`); err != nil {
+		`SET tracing=on,kv; SELECT * FROM t.public.t; SET TRACING=off`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -433,4 +438,69 @@ VALUES ($1, 'StatusRunning', repeat('a', $2)::BYTES, repeat('a', $2)::BYTES)`, i
 			t.Fatal(err)
 		}
 	})
+}
+
+// TestInvalidObjects table descriptors that don't validate will show up in
+// table `crdb_internal.invalid_objects`.
+func TestInvalidObjects(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// The descriptor changes made must have an immediate effect
+	// so disable leases on tables.
+	defer lease.TestingDisableTableLeases()()
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		Store: &kvserver.StoreTestingKnobs{
+			DisableMergeQueue: true,
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	var id int
+	var dbName, schemaName, objName, errStr string
+	// No inconsistency should be found so this should return ErrNoRow.
+	require.Error(t, sqlDB.QueryRow(`SELECT * FROM "".crdb_internal.invalid_objects`).
+		Scan(&id, dbName, schemaName, objName, errStr))
+
+	// Now introduce an inconsistency.
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT);
+CREATE TABLE fktbl (id INT PRIMARY KEY);
+CREATE TABLE tbl (customer INT NOT NULL REFERENCES fktbl (id));
+INSERT INTO system.users VALUES ('node', NULL, true);
+GRANT node TO root;
+DELETE FROM system.descriptor WHERE id=52;
+DELETE FROM system.descriptor WHERE id=54;
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	require.NoError(t, sqlDB.QueryRow(`SELECT id FROM system.descriptor ORDER BY id DESC LIMIT 1`).
+		Scan(&id))
+	require.Equal(t, 55, id)
+
+	rows, err := sqlDB.Query(`SELECT * FROM "".crdb_internal.invalid_objects ORDER BY id`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	require.True(t, rows.Next())
+	require.NoError(t, rows.Scan(&id, &dbName, &schemaName, &objName, &errStr))
+	require.Equal(t, 53, id)
+	require.Equal(t, "", dbName)
+	require.Equal(t, "", schemaName)
+	require.Equal(t, "desc 53: parentID 52 does not exist", errStr)
+
+	require.True(t, rows.Next())
+	require.NoError(t, rows.Scan(&id, &dbName, &schemaName, &objName, &errStr))
+	require.Equal(t, 55, id)
+	require.Equal(t, "defaultdb", dbName)
+	require.Equal(t, "public", schemaName)
+	require.Equal(t, "desc 55: invalid foreign key: missing table=54: descriptor not found", errStr)
+
+	require.False(t, rows.Next())
 }

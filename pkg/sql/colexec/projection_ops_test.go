@@ -19,11 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -114,7 +115,7 @@ func TestGetProjectionConstOperator(t *testing.T) {
 	outputIdx := 5
 	op, err := GetProjectionRConstOperator(
 		testAllocator, inputTypes, types.Float, types.Float, binOp, input, colIdx,
-		constArg, outputIdx, nil /* evalCtx */, nil /* binFn */, nil, /* cmpExpr */
+		constArg, outputIdx, nil /* EvalCtx */, nil /* BinFn */, nil, /* cmpExpr */
 	)
 	if err != nil {
 		t.Error(err)
@@ -146,7 +147,7 @@ func TestGetProjectionConstMixedTypeOperator(t *testing.T) {
 	outputIdx := 5
 	op, err := GetProjectionRConstOperator(
 		testAllocator, inputTypes, types.Int2, types.Int, cmpOp, input, colIdx,
-		constArg, outputIdx, nil /* evalCtx */, nil /* binFn */, nil, /* cmpExpr */
+		constArg, outputIdx, nil /* EvalCtx */, nil /* BinFn */, nil, /* cmpExpr */
 	)
 	if err != nil {
 		t.Error(err)
@@ -185,7 +186,7 @@ func TestRandomComparisons(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
 
 	expected := make([]bool, numTuples)
-	var da sqlbase.DatumAlloc
+	var da rowenc.DatumAlloc
 	lDatums := make([]tree.Datum, numTuples)
 	rDatums := make([]tree.Datum, numTuples)
 	for _, typ := range types.Scalar {
@@ -213,8 +214,8 @@ func TestRandomComparisons(t *testing.T) {
 				},
 			)
 		}
-		ColVecToDatumAndDeselect(lDatums, lVec, numTuples, nil /* sel */, &da)
-		ColVecToDatumAndDeselect(rDatums, rVec, numTuples, nil /* sel */, &da)
+		colconv.ColVecToDatumAndDeselect(lDatums, lVec, numTuples, nil /* sel */, &da)
+		colconv.ColVecToDatumAndDeselect(rDatums, rVec, numTuples, nil /* sel */, &da)
 		supportedCmpOps := []tree.ComparisonOperator{tree.EQ, tree.NE, tree.LT, tree.LE, tree.GT, tree.GE}
 		if typ.Family() == types.JsonFamily {
 			supportedCmpOps = []tree.ComparisonOperator{tree.EQ, tree.NE}
@@ -274,7 +275,7 @@ func TestGetProjectionOperator(t *testing.T) {
 	outputIdx := 9
 	op, err := GetProjectionOperator(
 		testAllocator, inputTypes, types.Int2, binOp, input, col1Idx, col2Idx,
-		outputIdx, nil /* evalCtx */, nil /* binFn */, nil, /* cmpExpr */
+		outputIdx, nil /* EvalCtx */, nil /* BinFn */, nil, /* cmpExpr */
 	)
 	if err != nil {
 		t.Error(err)

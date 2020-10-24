@@ -22,10 +22,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -83,7 +83,7 @@ type fkHandler struct {
 // NoFKs is used by formats that do not support FKs.
 var NoFKs = fkHandler{resolver: make(fkResolver)}
 
-// MakeSimpleTableDescriptor creates a MutableTableDescriptor from a CreateTable parse
+// MakeSimpleTableDescriptor creates a Mutable from a CreateTable parse
 // node without the full machinery. Many parts of the syntax are unsupported
 // (see the implementation and TestMakeSimpleTableDescriptorErrors for details),
 // but this is enough for our csv IMPORT and for some unit tests.
@@ -99,7 +99,7 @@ func MakeSimpleTableDescriptor(
 	parentID, parentSchemaID, tableID descpb.ID,
 	fks fkHandler,
 	walltime int64,
-) (*sqlbase.MutableTableDescriptor, error) {
+) (*tabledesc.Mutable, error) {
 	create.HoistConstraints()
 	if create.IfNotExists {
 		return nil, unimplemented.NewWithIssueDetailf(42846, "import.if-no-exists", "unsupported IF NOT EXISTS")
@@ -120,11 +120,6 @@ func MakeSimpleTableDescriptor(
 			*tree.UniqueConstraintTableDef:
 			// ignore
 		case *tree.ColumnTableDef:
-			if def.Computed.Expr != nil {
-				return nil, unimplemented.NewWithIssueDetailf(42846, "import.computed",
-					"computed columns not supported: %s", tree.AsString(def))
-			}
-
 			if err := sql.SimplifySerialInColumnDefWithRowID(ctx, def, &create.Table); err != nil {
 				return nil, err
 			}
@@ -152,9 +147,9 @@ func MakeSimpleTableDescriptor(
 		Context:  ctx,
 		Sequence: &importSequenceOperators{},
 	}
-	affected := make(map[descpb.ID]*sqlbase.MutableTableDescriptor)
+	affected := make(map[descpb.ID]*tabledesc.Mutable)
 
-	tableDesc, err := sql.MakeTableDesc(
+	tableDesc, err := sql.NewTableDesc(
 		ctx,
 		nil, /* txn */
 		fks.resolver,
@@ -174,19 +169,19 @@ func MakeSimpleTableDescriptor(
 	if err != nil {
 		return nil, err
 	}
-	if err := fixDescriptorFKState(tableDesc.TableDesc()); err != nil {
+	if err := fixDescriptorFKState(tableDesc); err != nil {
 		return nil, err
 	}
 
-	return &tableDesc, nil
+	return tableDesc, nil
 }
 
 // fixDescriptorFKState repairs validity and table states set during descriptor
-// creation. sql.MakeTableDesc and ResolveFK set the table to the ADD state
+// creation. sql.NewTableDesc and ResolveFK set the table to the ADD state
 // and mark references an validated. This function sets the table to PUBLIC
 // and the FKs to unvalidated.
-func fixDescriptorFKState(tableDesc *descpb.TableDescriptor) error {
-	tableDesc.State = descpb.TableDescriptor_PUBLIC
+func fixDescriptorFKState(tableDesc *tabledesc.Mutable) error {
+	tableDesc.State = descpb.DescriptorState_PUBLIC
 	for i := range tableDesc.OutboundFKs {
 		tableDesc.OutboundFKs[i].Validity = descpb.ConstraintValidity_Unvalidated
 	}
@@ -254,7 +249,7 @@ func (so *importSequenceOperators) SetSequenceValue(
 	return errSequenceOperators
 }
 
-type fkResolver map[string]*sqlbase.MutableTableDescriptor
+type fkResolver map[string]*tabledesc.Mutable
 
 var _ resolver.SchemaResolver = fkResolver{}
 
@@ -286,8 +281,7 @@ func (r fkResolver) CommonLookupFlags(required bool) tree.CommonLookupFlags {
 // Implements the sql.SchemaResolver interface.
 func (r fkResolver) ObjectLookupFlags(required bool, requireMutable bool) tree.ObjectLookupFlags {
 	return tree.ObjectLookupFlags{
-		CommonLookupFlags: tree.CommonLookupFlags{Required: required},
-		RequireMutable:    requireMutable,
+		CommonLookupFlags: tree.CommonLookupFlags{Required: required, RequireMutable: requireMutable},
 	}
 }
 
@@ -318,6 +312,8 @@ func (r fkResolver) LookupSchema(
 }
 
 // Implements the sql.SchemaResolver interface.
-func (r fkResolver) LookupTableByID(ctx context.Context, id descpb.ID) (catalog.TableEntry, error) {
-	return catalog.TableEntry{}, errSchemaResolver
+func (r fkResolver) LookupTableByID(
+	ctx context.Context, id descpb.ID,
+) (*tabledesc.Immutable, error) {
+	return nil, errSchemaResolver
 }

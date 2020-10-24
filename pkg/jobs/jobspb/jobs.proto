@@ -17,6 +17,7 @@ import "gogoproto/gogo.proto";
 import "roachpb/data.proto";
 import "roachpb/io-formats.proto";
 import "sql/catalog/descpb/structured.proto";
+import "sql/catalog/descpb/tenant.proto";
 import "util/hlc/timestamp.proto";
 
 message Lease {
@@ -59,6 +60,23 @@ message BackupEncryptionOptions {
   KMSInfo kms_info  = 3 [(gogoproto.customname) = "KMSInfo"];
 }
 
+// EncryptionInfo is stored IN PLAINTEXT along side collections of encrypted
+// files stored outside of cockroach, for example by BACKUP/RESTORE.
+message EncryptionInfo {
+  enum Scheme {
+    AES256GCM = 0;
+  }
+  option (gogoproto.equal) = true;
+
+  Scheme scheme = 1;
+  bytes salt = 2;
+
+  // EncryptedDataKeyByKMSMasterKeyID is a mapping from the hashed master key
+  // identifier of a KMS to the encrypted version of the DataKey obtained from
+  // that KMS.
+  map<string, bytes> encryptedDataKeyByKMSMasterKeyID = 3;
+}
+
 
 message BackupDetails {
   util.hlc.Timestamp start_time = 1 [(gogoproto.nullable) = false];
@@ -72,7 +90,8 @@ message BackupDetails {
   // partitioned backups.
   map<string, string> uris_by_locality_kv = 5 [(gogoproto.customname) = "URIsByLocalityKV"];
   bytes backup_manifest = 4;
-  BackupEncryptionOptions encryption = 6;
+  BackupEncryptionOptions encryption_options = 6;
+  EncryptionInfo encryption_info = 9;
 
   // ProtectedTimestampRecord is the ID of the protected timestamp record
   // corresponding to this job. While the job ought to clean up the record
@@ -121,6 +140,10 @@ message RestoreDetails {
   // backup may also have files in other stores.
   repeated string uris = 3 [(gogoproto.customname) = "URIs"];
   repeated BackupLocalityInfo backup_locality_info = 7 [(gogoproto.nullable) = false];
+
+  // We keep track of the descriptors that we're creating as part of the
+  // restore.
+  repeated sqlbase.DatabaseDescriptor database_descs = 16;
   repeated sqlbase.TableDescriptor table_descs = 5;
   // TypeDescs contains the type descriptors written as part of this restore.
   // Note that it does not include type descriptors existing in the cluster
@@ -130,20 +153,22 @@ message RestoreDetails {
   // Like TypeDescs, it does not include existing schema descriptors in the
   // cluster that backed up schemas are remapped to.
   repeated sqlbase.SchemaDescriptor schema_descs = 15;
-  message Tenant {
-    uint64 id = 1 [(gogoproto.customname) = "ID"];
-    bytes info = 2;
-  }
-  repeated Tenant tenants = 13 [(gogoproto.nullable) = false];
+  repeated sqlbase.TenantInfo tenants = 13 [(gogoproto.nullable) = false];
+
   string override_db = 6 [(gogoproto.customname) = "OverrideDB"];
+
+  // The restore job has several atomic stages. For now, we keep track of which
+  // stages have completed via these flags.
   bool prepare_completed = 8;
   bool stats_inserted = 9;
-  bool tables_published = 10;
+  // DescriptorsPublished indicates whether or not the descriptors written in
+  // the job have been transactionally updated after the data was restored.
+  bool descriptors_published = 10;
   int32 descriptor_coverage = 11 [
     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/tree.DescriptorCoverage"
   ];
   BackupEncryptionOptions encryption = 12;
-  // NEXT ID: 14.
+  // NEXT ID: 17.
 }
 
 message RestoreProgress {
@@ -156,6 +181,7 @@ message ImportDetails {
     string name = 18;
     int64 seq_val = 19;
     bool is_new = 20;
+    bool was_empty = 22;
     repeated string target_cols = 21;
     reserved 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17;
   }
@@ -303,6 +329,9 @@ message SchemaChangeDetails {
   // statement. We collect the types here rather than creating individual DROP
   // TYPE jobs for each dropped type.
   repeated uint32 dropped_types = 8 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
+  // dropped_schemas holds the set of schemas to drop as part of a DROP SCHEMA
+  // or DROP DATABASE cascade statement.
+  repeated uint32 dropped_schemas = 9 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
   // The descriptor ID of the dropped database which created this job.
   uint32 dropped_database_id = 4 [
     (gogoproto.customname) = "DroppedDatabaseID",
@@ -437,6 +466,11 @@ message CreateStatsDetails {
 
     // Indicates whether this column stat is over an inverted index.
     bool inverted = 3;
+
+    // If this column stat includes a histogram, indicates the maximum number
+    // of buckets that should be created. If this field is unset, a default
+    // maximum of 200 buckets are created.
+    uint32 histogram_max_buckets = 4;
   }
   string name = 1;
   sqlbase.TableDescriptor table = 2 [(gogoproto.nullable) = false];

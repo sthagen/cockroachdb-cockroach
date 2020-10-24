@@ -18,10 +18,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -38,7 +40,7 @@ type dropTableNode struct {
 
 type toDelete struct {
 	tn   tree.ObjectName
-	desc *sqlbase.MutableTableDescriptor
+	desc *tabledesc.Mutable
 }
 
 // DropTable drops a table.
@@ -163,7 +165,7 @@ func (*dropTableNode) Close(context.Context)        {}
 // If the table does not exist, this function returns a nil descriptor.
 func (p *planner) prepareDrop(
 	ctx context.Context, name *tree.TableName, required bool, requiredType tree.RequiredTableKind,
-) (*sqlbase.MutableTableDescriptor, error) {
+) (*tabledesc.Mutable, error) {
 	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, name, required, requiredType)
 	if err != nil {
 		return nil, err
@@ -171,20 +173,35 @@ func (p *planner) prepareDrop(
 	if tableDesc == nil {
 		return nil, err
 	}
-	if err := p.prepareDropWithTableDesc(ctx, tableDesc); err != nil {
+	if err := p.canDropTable(ctx, tableDesc, true /* checkOwnership */); err != nil {
 		return nil, err
 	}
 	return tableDesc, nil
 }
 
-// prepareDropWithTableDesc behaves as prepareDrop, except it assumes the
-// table descriptor is already fetched. This is useful for DropDatabase,
-// as prepareDrop requires resolving a TableName when DropDatabase already
-// has it resolved.
-func (p *planner) prepareDropWithTableDesc(
-	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor,
+// canDropTable returns an error if the user cannot drop the table.
+func (p *planner) canDropTable(
+	ctx context.Context, tableDesc *tabledesc.Mutable, checkOwnership bool,
 ) error {
-	return p.CheckPrivilege(ctx, tableDesc, privilege.DROP)
+	var err error
+	hasOwnership := false
+	// This checkOwnership stuff is rather unfortunate, but is required when an
+	// active session has created a temporary object in a database that is being
+	// dropped by a different session. The session trying to drop the database
+	// can't resolve the temporary schema, and would therefore return an
+	// error if we tried to check for ownership on the schema.
+	if checkOwnership {
+		// If the user owns the schema the table is part of, they can drop the table.
+		hasOwnership, err = p.HasOwnershipOnSchema(ctx, tableDesc.GetParentSchemaID())
+		if err != nil {
+			return err
+		}
+	}
+	if !hasOwnership {
+		return p.CheckPrivilege(ctx, tableDesc, privilege.DROP)
+	}
+
+	return nil
 }
 
 // canRemoveFKBackReference returns an error if the input backreference isn't
@@ -244,13 +261,10 @@ func (p *planner) removeInterleave(ctx context.Context, ref descpb.ForeignKeyRef
 
 // dropTableImpl does the work of dropping a table (and everything that depends
 // on it if `cascade` is enabled). It returns a list of view names that were
-// dropped due to `cascade` behavior. droppingDatabase indicates whether this
-// table is being dropped as part of a `DROP DATABASE CASCADE` operation.
+// dropped due to `cascade` behavior. droppingParent indicates whether this
+// table's parent (either database or schema) is being dropped.
 func (p *planner) dropTableImpl(
-	ctx context.Context,
-	tableDesc *sqlbase.MutableTableDescriptor,
-	droppingDatabase bool,
-	jobDesc string,
+	ctx context.Context, tableDesc *tabledesc.Mutable, droppingParent bool, jobDesc string,
 ) ([]string, error) {
 	var droppedViews []string
 
@@ -297,7 +311,7 @@ func (p *planner) dropTableImpl(
 
 	// Drop sequences that the columns of the table own.
 	for _, col := range tableDesc.Columns {
-		if err := p.dropSequencesOwnedByCol(ctx, &col, !droppingDatabase); err != nil {
+		if err := p.dropSequencesOwnedByCol(ctx, &col, !droppingParent); err != nil {
 			return droppedViews, err
 		}
 	}
@@ -315,7 +329,7 @@ func (p *planner) dropTableImpl(
 		if viewDesc.Dropped() {
 			continue
 		}
-		cascadedViews, err := p.dropViewImpl(ctx, viewDesc, !droppingDatabase, "dropping dependent view", tree.DropCascade)
+		cascadedViews, err := p.dropViewImpl(ctx, viewDesc, !droppingParent, "dropping dependent view", tree.DropCascade)
 		if err != nil {
 			return droppedViews, err
 		}
@@ -331,20 +345,18 @@ func (p *planner) dropTableImpl(
 	// Remove any references to types that this table has if a job is meant to be
 	// queued. If not, then the job that is handling the drop table will also
 	// clean up all of the types to be dropped.
-	if !droppingDatabase {
+	if !droppingParent {
 		if err := p.removeBackRefsFromAllTypesInTable(ctx, tableDesc); err != nil {
 			return droppedViews, err
 		}
 	}
 
-	err = p.initiateDropTable(ctx, tableDesc, !droppingDatabase, jobDesc, true /* drain name */)
+	err = p.initiateDropTable(ctx, tableDesc, !droppingParent, jobDesc, true /* drain name */)
 	return droppedViews, err
 }
 
 // unsplitRangesForTable unsplit any manually split ranges within the table span.
-func (p *planner) unsplitRangesForTable(
-	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor,
-) error {
+func (p *planner) unsplitRangesForTable(ctx context.Context, tableDesc *tabledesc.Mutable) error {
 	// Gate this on being the system tenant because secondary tenants aren't
 	// allowed to scan the meta ranges directly.
 	if p.ExecCfg().Codec.ForSystemTenant() {
@@ -377,11 +389,7 @@ func (p *planner) unsplitRangesForTable(
 // TRUNCATE which directly deletes the old name to id map and doesn't need
 // drain the old map.
 func (p *planner) initiateDropTable(
-	ctx context.Context,
-	tableDesc *sqlbase.MutableTableDescriptor,
-	queueJob bool,
-	jobDesc string,
-	drainName bool,
+	ctx context.Context, tableDesc *tabledesc.Mutable, queueJob bool, jobDesc string, drainName bool,
 ) error {
 	if tableDesc.Dropped() {
 		return errors.Errorf("table %q is already being dropped", tableDesc.Name)
@@ -405,7 +413,7 @@ func (p *planner) initiateDropTable(
 		return err
 	}
 
-	tableDesc.State = descpb.TableDescriptor_DROP
+	tableDesc.State = descpb.DescriptorState_DROP
 	if drainName {
 		parentSchemaID := tableDesc.GetParentSchemaID()
 
@@ -446,9 +454,9 @@ func (p *planner) initiateDropTable(
 }
 
 func (p *planner) removeFKForBackReference(
-	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor, ref *descpb.ForeignKeyConstraint,
+	ctx context.Context, tableDesc *tabledesc.Mutable, ref *descpb.ForeignKeyConstraint,
 ) error {
-	var originTableDesc *sqlbase.MutableTableDescriptor
+	var originTableDesc *tabledesc.Mutable
 	// We don't want to lookup/edit a second copy of the same table.
 	if tableDesc.ID == ref.OriginTableID {
 		originTableDesc = tableDesc
@@ -464,7 +472,7 @@ func (p *planner) removeFKForBackReference(
 		return nil
 	}
 
-	if err := removeFKForBackReferenceFromTable(originTableDesc, ref, tableDesc.TableDesc()); err != nil {
+	if err := removeFKForBackReferenceFromTable(originTableDesc, ref, tableDesc); err != nil {
 		return err
 	}
 	// No job description, since this is presumably part of some larger schema change.
@@ -475,13 +483,13 @@ func (p *planner) removeFKForBackReference(
 // remove the foreign key constraint that corresponds to the supplied
 // backreference, which is a member of the supplied referencedTableDesc.
 func removeFKForBackReferenceFromTable(
-	originTableDesc *sqlbase.MutableTableDescriptor,
+	originTableDesc *tabledesc.Mutable,
 	backref *descpb.ForeignKeyConstraint,
-	referencedTableDesc *descpb.TableDescriptor,
+	referencedTableDesc catalog.TableDescriptor,
 ) error {
 	matchIdx := -1
 	for i, fk := range originTableDesc.OutboundFKs {
-		if fk.ReferencedTableID == referencedTableDesc.ID && fk.Name == backref.Name {
+		if fk.ReferencedTableID == referencedTableDesc.GetID() && fk.Name == backref.Name {
 			// We found a match! We want to delete it from the list now.
 			matchIdx = i
 			break
@@ -504,9 +512,9 @@ func removeFKForBackReferenceFromTable(
 // removeFKBackReference removes the FK back reference from the table that is
 // referenced by the input constraint.
 func (p *planner) removeFKBackReference(
-	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor, ref *descpb.ForeignKeyConstraint,
+	ctx context.Context, tableDesc *tabledesc.Mutable, ref *descpb.ForeignKeyConstraint,
 ) error {
-	var referencedTableDesc *sqlbase.MutableTableDescriptor
+	var referencedTableDesc *tabledesc.Mutable
 	// We don't want to lookup/edit a second copy of the same table.
 	if tableDesc.ID == ref.ReferencedTableID {
 		referencedTableDesc = tableDesc
@@ -522,7 +530,7 @@ func (p *planner) removeFKBackReference(
 		return nil
 	}
 
-	if err := removeFKBackReferenceFromTable(referencedTableDesc, ref.Name, tableDesc.TableDesc()); err != nil {
+	if err := removeFKBackReferenceFromTable(referencedTableDesc, ref.Name, tableDesc); err != nil {
 		return err
 	}
 	// No job description, since this is presumably part of some larger schema change.
@@ -533,13 +541,11 @@ func (p *planner) removeFKBackReference(
 // remove the foreign key backreference that corresponds to the supplied fk,
 // which is a member of the supplied originTableDesc.
 func removeFKBackReferenceFromTable(
-	referencedTableDesc *sqlbase.MutableTableDescriptor,
-	fkName string,
-	originTableDesc *descpb.TableDescriptor,
+	referencedTableDesc *tabledesc.Mutable, fkName string, originTableDesc catalog.TableDescriptor,
 ) error {
 	matchIdx := -1
 	for i, backref := range referencedTableDesc.InboundFKs {
-		if backref.OriginTableID == originTableDesc.ID && backref.Name == fkName {
+		if backref.OriginTableID == originTableDesc.GetID() && backref.Name == fkName {
 			// We found a match! We want to delete it from the list now.
 			matchIdx = i
 			break
@@ -550,7 +556,7 @@ func removeFKBackReferenceFromTable(
 		// matched the foreign key constraint that we were trying to delete.
 		// This really shouldn't happen...
 		return errors.AssertionFailedf("there was no foreign key backreference "+
-			"for constraint %q on table %q", fkName, originTableDesc.Name)
+			"for constraint %q on table %q", fkName, originTableDesc.GetName())
 	}
 	// Delete our match.
 	referencedTableDesc.InboundFKs = append(referencedTableDesc.InboundFKs[:matchIdx], referencedTableDesc.InboundFKs[matchIdx+1:]...)
@@ -558,13 +564,13 @@ func removeFKBackReferenceFromTable(
 }
 
 func (p *planner) removeInterleaveBackReference(
-	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor, idx *descpb.IndexDescriptor,
+	ctx context.Context, tableDesc *tabledesc.Mutable, idx *descpb.IndexDescriptor,
 ) error {
 	if len(idx.Interleave.Ancestors) == 0 {
 		return nil
 	}
 	ancestor := idx.Interleave.Ancestors[len(idx.Interleave.Ancestors)-1]
-	var t *sqlbase.MutableTableDescriptor
+	var t *tabledesc.Mutable
 	if ancestor.TableID == tableDesc.ID {
 		t = tableDesc
 	} else {
@@ -618,14 +624,12 @@ func removeMatchingReferences(
 	return updatedRefs
 }
 
-func (p *planner) removeTableComments(
-	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor,
-) error {
+func (p *planner) removeTableComments(ctx context.Context, tableDesc *tabledesc.Mutable) error {
 	_, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 		ctx,
 		"delete-table-comments",
 		p.txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUser},
 		"DELETE FROM system.comments WHERE object_id=$1",
 		tableDesc.ID)
 	if err != nil {

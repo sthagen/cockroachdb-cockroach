@@ -224,12 +224,12 @@ func (p *pendingLeaseRequest) InitOrJoinRequest(
 		*reqLease.Expiration = status.Timestamp.Add(int64(p.repl.store.cfg.RangeLeaseActiveDuration()), 0)
 	} else {
 		// Get the liveness for the next lease holder and set the epoch in the lease request.
-		liveness, err := p.repl.store.cfg.NodeLiveness.GetLiveness(nextLeaseHolder.NodeID)
-		if err != nil {
+		liveness, ok := p.repl.store.cfg.NodeLiveness.GetLiveness(nextLeaseHolder.NodeID)
+		if !ok {
 			llHandle.resolve(roachpb.NewError(&roachpb.LeaseRejectedError{
 				Existing:  status.Lease,
 				Requested: reqLease,
-				Message:   fmt.Sprintf("couldn't request lease for %+v: %v", nextLeaseHolder, err),
+				Message:   fmt.Sprintf("couldn't request lease for %+v: %v", nextLeaseHolder, errLivenessRecordCacheMiss),
 			}))
 			return llHandle
 		}
@@ -543,17 +543,17 @@ func (r *Replica) leaseStatus(
 	if lease.Type() == roachpb.LeaseExpiration {
 		expiration = lease.GetExpiration()
 	} else {
-		l, err := r.store.cfg.NodeLiveness.GetLiveness(lease.Replica.NodeID)
+		l, ok := r.store.cfg.NodeLiveness.GetLiveness(lease.Replica.NodeID)
 		status.Liveness = l.Liveness
-		if err != nil || status.Liveness.Epoch < lease.Epoch {
+		if !ok || status.Liveness.Epoch < lease.Epoch {
 			// If lease validity can't be determined (e.g. gossip is down
 			// and liveness info isn't available for owner), we can neither
 			// use the lease nor do we want to attempt to acquire it.
-			if err != nil {
+			if !ok {
 				if leaseStatusLogLimiter.ShouldLog() {
 					ctx = r.AnnotateCtx(ctx)
 					log.Warningf(ctx, "can't determine lease status of %s due to node liveness error: %+v",
-						lease.Replica, err)
+						lease.Replica, errLivenessRecordCacheMiss)
 				}
 			}
 			status.State = kvserverpb.LeaseState_ERROR
@@ -588,7 +588,7 @@ func (r *Replica) leaseStatus(
 // including the node liveness table must use expiration leases to avoid
 // circular dependencies on the node liveness table.
 func (r *Replica) requiresExpiringLeaseRLocked() bool {
-	return r.store.cfg.NodeLiveness == nil || !r.store.cfg.EnableEpochRangeLeases ||
+	return r.store.cfg.NodeLiveness == nil ||
 		r.mu.state.Desc.StartKey.Less(roachpb.RKey(keys.NodeLivenessKeyMax))
 }
 
@@ -754,7 +754,14 @@ func (r *Replica) GetDescAndLease(ctx context.Context) (roachpb.RangeDescriptor,
 	// Sanity check the lease.
 	if !l.Empty() {
 		if _, ok := desc.GetReplicaDescriptorByID(l.Replica.ReplicaID); !ok {
-			log.Fatalf(ctx, "leaseholder replica not in descriptor; desc: %s, lease: %s", desc, l)
+			// I wish this could be a Fatal, but unfortunately it's possible for the
+			// lease to be incoherent with the descriptor after a leaseholder was
+			// brutally removed through `cockroach debug unsafe-remove-dead-replicas`.
+			log.Errorf(ctx, "leaseholder replica not in descriptor; desc: %s, lease: %s", desc, l)
+			// Let's not return an incoherent lease; for example if we end up
+			// returning it to a client through a br.RangeInfos, the client will freak
+			// out.
+			l = roachpb.Lease{}
 		}
 	}
 

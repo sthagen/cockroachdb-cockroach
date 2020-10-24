@@ -16,8 +16,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -58,7 +58,7 @@ type ProcOutputHelper struct {
 	// If output is nil, one can invoke ProcessRow to obtain the
 	// post-processed row directly.
 	output   RowReceiver
-	RowAlloc sqlbase.EncDatumRowAlloc
+	RowAlloc rowenc.EncDatumRowAlloc
 
 	filter *execinfrapb.ExprHelper
 	// renderExprs has length > 0 if we have a rendering. Only one of renderExprs
@@ -69,7 +69,7 @@ type ProcOutputHelper struct {
 	// which case outputCols will be 0-length but non-nil.
 	outputCols []uint32
 
-	outputRow sqlbase.EncDatumRow
+	outputRow rowenc.EncDatumRow
 
 	// OutputTypes is the schema of the rows produced by the processor after
 	// post-processing (i.e. the rows that are pushed through a router).
@@ -229,7 +229,7 @@ func (h *ProcOutputHelper) NeededColumns() (colIdxs util.FastIntSet) {
 //
 // Note: check out rowexec.emitHelper() for a useful wrapper.
 func (h *ProcOutputHelper) EmitRow(
-	ctx context.Context, row sqlbase.EncDatumRow,
+	ctx context.Context, row rowenc.EncDatumRow,
 ) (ConsumerStatus, error) {
 	if h.output == nil {
 		panic("output RowReceiver not initialized for emitting rows")
@@ -277,8 +277,8 @@ func (h *ProcOutputHelper) EmitRow(
 // limit is returned at the same time as a DrainRequested status. In that case,
 // the caller is supposed to both deal with the row and start draining.
 func (h *ProcOutputHelper) ProcessRow(
-	ctx context.Context, row sqlbase.EncDatumRow,
-) (_ sqlbase.EncDatumRow, moreRowsOK bool, _ error) {
+	ctx context.Context, row rowenc.EncDatumRow,
+) (_ rowenc.EncDatumRow, moreRowsOK bool, _ error) {
 	if h.rowIdx >= h.maxRowIdx {
 		return nil, false, nil
 	}
@@ -309,7 +309,7 @@ func (h *ProcOutputHelper) ProcessRow(
 			if err != nil {
 				return nil, false, err
 			}
-			h.outputRow[i] = sqlbase.DatumToEncDatum(h.OutputTypes[i], datum)
+			h.outputRow[i] = rowenc.DatumToEncDatum(h.OutputTypes[i], datum)
 		}
 	} else if h.outputCols != nil {
 		// Projection.
@@ -598,7 +598,10 @@ func (pb *ProcessorBase) MoveToDraining(err error) {
 		// However, calling it with an error in states other than StateRunning is
 		// not permitted.
 		if err != nil {
-			log.Fatalf(pb.Ctx, "MoveToDraining called in state %s with err: %s",
+			log.ReportOrPanic(
+				pb.Ctx,
+				&pb.FlowCtx.Cfg.Settings.SV,
+				"MoveToDraining called in state %s with err: %+v",
 				pb.State, err)
 		}
 		return
@@ -625,7 +628,11 @@ func (pb *ProcessorBase) MoveToDraining(err error) {
 // also moves from StateDraining to StateTrailingMeta when appropriate.
 func (pb *ProcessorBase) DrainHelper() *execinfrapb.ProducerMetadata {
 	if pb.State == StateRunning {
-		log.Fatal(pb.Ctx, "drain helper called in StateRunning")
+		log.ReportOrPanic(
+			pb.Ctx,
+			&pb.FlowCtx.Cfg.Settings.SV,
+			"drain helper called in StateRunning",
+		)
 	}
 
 	// trailingMeta always has priority; it seems like a good idea because it
@@ -696,7 +703,12 @@ func (pb *ProcessorBase) popTrailingMeta() *execinfrapb.ProducerMetadata {
 // draining its inputs (if it wants to drain them).
 func (pb *ProcessorBase) moveToTrailingMeta() {
 	if pb.State == StateTrailingMeta || pb.State == StateExhausted {
-		log.Fatalf(pb.Ctx, "moveToTrailingMeta called in state: %s", pb.State)
+		log.ReportOrPanic(
+			pb.Ctx,
+			&pb.FlowCtx.Cfg.Settings.SV,
+			"moveToTrailingMeta called in state: %s",
+			pb.State,
+		)
 	}
 
 	if pb.FinishTrace != nil {
@@ -727,7 +739,7 @@ func (pb *ProcessorBase) moveToTrailingMeta() {
 // nil, in which case the caller shouldn't return anything to its consumer; it
 // should continue processing other rows, with the awareness that the processor
 // might have been transitioned to the draining phase.
-func (pb *ProcessorBase) ProcessRowHelper(row sqlbase.EncDatumRow) sqlbase.EncDatumRow {
+func (pb *ProcessorBase) ProcessRowHelper(row rowenc.EncDatumRow) rowenc.EncDatumRow {
 	outRow, ok, err := pb.Out.ProcessRow(pb.Ctx, row)
 	if err != nil {
 		pb.MoveToDraining(err)

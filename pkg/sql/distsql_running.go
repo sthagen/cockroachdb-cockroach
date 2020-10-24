@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -32,10 +33,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
@@ -91,12 +92,12 @@ func (req runnerRequest) run() {
 	req.resultChan <- res
 }
 
-func (dsp *DistSQLPlanner) initRunners() {
+func (dsp *DistSQLPlanner) initRunners(ctx context.Context) {
 	// This channel has to be unbuffered because we want to only be able to send
 	// requests if a worker is actually there to receive them.
 	dsp.runnerChan = make(chan runnerRequest)
 	for i := 0; i < numRunners; i++ {
-		dsp.stopper.RunWorker(context.TODO(), func(context.Context) {
+		dsp.stopper.RunWorker(ctx, func(context.Context) {
 			runnerChan := dsp.runnerChan
 			stopChan := dsp.stopper.ShouldStop()
 			for {
@@ -150,13 +151,13 @@ func (dsp *DistSQLPlanner) setupFlows(
 		resultChan = make(chan runnerResult, len(flows)-1)
 	}
 
-	if evalCtx.SessionData.VectorizeMode != sessiondata.VectorizeOff {
-		if !vectorizeThresholdMet && (evalCtx.SessionData.VectorizeMode == sessiondata.Vectorize201Auto || evalCtx.SessionData.VectorizeMode == sessiondata.VectorizeOn) {
+	if evalCtx.SessionData.VectorizeMode != sessiondatapb.VectorizeOff {
+		if !vectorizeThresholdMet && (evalCtx.SessionData.VectorizeMode == sessiondatapb.Vectorize201Auto || evalCtx.SessionData.VectorizeMode == sessiondatapb.VectorizeOn) {
 			// Vectorization is not justified for this flow because the expected
 			// amount of data is too small and the overhead of pre-allocating data
 			// structures needed for the vectorized engine is expected to dominate
 			// the execution time.
-			setupReq.EvalContext.Vectorize = int32(sessiondata.VectorizeOff)
+			setupReq.EvalContext.SessionData.VectorizeMode = sessiondatapb.VectorizeOff
 		} else {
 			// Now we check to see whether or not to even try vectorizing the flow.
 			// The goal here is to determine up front whether all of the flows can be
@@ -167,7 +168,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 			// TODO (rohany): This is unfortunate that this call to setup vectorize makes
 			//  it's own flow context rather than being able to use the one that is made
 			//  later.
-			flowCtx := dsp.distSQLSrv.NewFlowContext(execinfrapb.FlowID{}, &evalCtx.EvalContext, setupReq.TraceKV, localState)
+			flowCtx := dsp.distSQLSrv.NewFlowContext(ctx, execinfrapb.FlowID{}, &evalCtx.EvalContext, setupReq.TraceKV, localState)
 			// This flowCtx is only used during the vectorize check, so we need to
 			// clean up any accessed descriptors after checking.
 			defer func() {
@@ -181,7 +182,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 				); err != nil {
 					// Vectorization attempt failed with an error.
 					returnVectorizationSetupError := false
-					if evalCtx.SessionData.VectorizeMode == sessiondata.VectorizeExperimentalAlways {
+					if evalCtx.SessionData.VectorizeMode == sessiondatapb.VectorizeExperimentalAlways {
 						returnVectorizationSetupError = true
 						// If running with VectorizeExperimentalAlways, this check makes sure
 						// that we can still run SET statements (mostly to set vectorize to
@@ -205,7 +206,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 					}
 					// Vectorization is not supported for this flow, so we override the
 					// setting.
-					setupReq.EvalContext.Vectorize = int32(sessiondata.VectorizeOff)
+					setupReq.EvalContext.SessionData.VectorizeMode = sessiondatapb.VectorizeOff
 					break
 				}
 			}
@@ -372,9 +373,9 @@ func (dsp *DistSQLPlanner) Run(
 		}
 		_, url, err := execinfrapb.GeneratePlanDiagramURL(stmtStr, flows, false /* showInputTypes */)
 		if err != nil {
-			log.Infof(ctx, "Error generating diagram: %s", err)
+			log.Infof(ctx, "error generating diagram: %s", err)
 		} else {
-			log.Infof(ctx, "Plan diagram URL:\n%s", url.String())
+			log.Infof(ctx, "plan diagram URL:\n%s", url.String())
 		}
 	}
 
@@ -419,7 +420,7 @@ func (dsp *DistSQLPlanner) Run(
 
 	// TODO(radu): this should go through the flow scheduler.
 	if err := flow.Run(ctx, func() {}); err != nil {
-		log.Fatalf(ctx, "unexpected error from syncFlow.Start(): %s "+
+		log.Fatalf(ctx, "unexpected error from syncFlow.Start(): %v\n"+
 			"The error should have gone to the consumer.", err)
 	}
 
@@ -483,7 +484,7 @@ type DistSQLReceiver struct {
 
 	row    tree.Datums
 	status execinfra.ConsumerStatus
-	alloc  sqlbase.DatumAlloc
+	alloc  rowenc.DatumAlloc
 	closed bool
 
 	rangeCache *kvcoord.RangeDescriptorCache
@@ -640,7 +641,7 @@ func (r *DistSQLReceiver) SetError(err error) {
 
 // Push is part of the RowReceiver interface.
 func (r *DistSQLReceiver) Push(
-	row sqlbase.EncDatumRow, meta *execinfrapb.ProducerMetadata,
+	row rowenc.EncDatumRow, meta *execinfrapb.ProducerMetadata,
 ) execinfra.ConsumerStatus {
 	if meta != nil {
 		if meta.LeafTxnFinalState != nil {
@@ -805,14 +806,16 @@ func (r *DistSQLReceiver) Types() []*types.T {
 }
 
 // PlanAndRunSubqueries returns false if an error was encountered and sets that
-// error in the provided receiver.
+// error in the provided receiver. Note that if false is returned, then this
+// function will have closed all the subquery plans because it assumes that the
+// caller will not try to run the main plan given that the subqueries'
+// evaluation failed.
 func (dsp *DistSQLPlanner) PlanAndRunSubqueries(
 	ctx context.Context,
 	planner *planner,
 	evalCtxFactory func() *extendedEvalContext,
 	subqueryPlans []subquery,
 	recv *DistSQLReceiver,
-	maybeDistribute bool,
 ) bool {
 	for planIdx, subqueryPlan := range subqueryPlans {
 		if err := dsp.planAndRunSubquery(
@@ -823,9 +826,16 @@ func (dsp *DistSQLPlanner) PlanAndRunSubqueries(
 			evalCtxFactory(),
 			subqueryPlans,
 			recv,
-			maybeDistribute,
 		); err != nil {
 			recv.SetError(err)
+			// Usually we leave the closure of subqueries to occur when the
+			// whole plan is being closed (i.e. planTop.close); however, since
+			// we've encountered an error, we might never get to the point of
+			// closing the whole plan, so we choose to defensively close the
+			// subqueries here.
+			for i := range subqueryPlans {
+				subqueryPlans[i].plan.Close(ctx)
+			}
 			return false
 		}
 	}
@@ -841,7 +851,6 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	evalCtx *extendedEvalContext,
 	subqueryPlans []subquery,
 	recv *DistSQLReceiver,
-	maybeDistribute bool,
 ) error {
 	subqueryMonitor := mon.NewMonitor(
 		"subquery",
@@ -858,12 +867,9 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	subqueryMemAccount := subqueryMonitor.MakeBoundAccount()
 	defer subqueryMemAccount.Close(ctx)
 
-	var distributeSubquery bool
-	if maybeDistribute {
-		distributeSubquery = getPlanDistribution(
-			ctx, planner, planner.execCfg.NodeID, planner.SessionData().DistSQLMode, subqueryPlan.plan,
-		).WillDistribute()
-	}
+	distributeSubquery := getPlanDistribution(
+		ctx, planner, planner.execCfg.NodeID, planner.SessionData().DistSQLMode, subqueryPlan.plan,
+	).WillDistribute()
 	subqueryPlanCtx := dsp.NewPlanningCtx(ctx, evalCtx, planner, planner.txn, distributeSubquery)
 	subqueryPlanCtx.stmtType = tree.Rows
 	if planner.collectBundle {
@@ -884,15 +890,15 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	// receiver, and use it and serialize the results of the subquery. The type
 	// of the results stored in the container depends on the type of the subquery.
 	subqueryRecv := recv.clone()
-	var typ sqlbase.ColTypeInfo
+	var typ colinfo.ColTypeInfo
 	var rows *rowcontainer.RowContainer
 	if subqueryPlan.execMode == rowexec.SubqueryExecModeExists {
 		subqueryRecv.noColsRequired = true
-		typ = sqlbase.ColTypeInfoFromColTypes([]*types.T{})
+		typ = colinfo.ColTypeInfoFromColTypes([]*types.T{})
 	} else {
-		typ = sqlbase.ColTypeInfoFromColTypes(subqueryPhysPlan.ResultTypes)
+		typ = colinfo.ColTypeInfoFromColTypes(subqueryPhysPlan.ResultTypes)
 	}
-	rows = rowcontainer.NewRowContainer(subqueryMemAccount, typ, 0)
+	rows = rowcontainer.NewRowContainer(subqueryMemAccount, typ)
 	defer rows.Close(ctx)
 
 	subqueryRowReceiver := NewRowResultWriter(rows)
@@ -914,7 +920,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 		var result tree.DTuple
 		for rows.Len() > 0 {
 			row := rows.At(0)
-			rows.PopFirst()
+			rows.PopFirst(ctx)
 			if row.Len() == 1 {
 				// This seems hokey, but if we don't do this then the subquery expands
 				// to a tuple of tuples instead of a tuple of values and an expression
@@ -1004,7 +1010,6 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 	evalCtxFactory func() *extendedEvalContext,
 	plan *planComponents,
 	recv *DistSQLReceiver,
-	maybeDistribute bool,
 ) bool {
 	if len(plan.cascades) == 0 && len(plan.checkPlans) == 0 {
 		return false
@@ -1020,10 +1025,14 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 		// TODO(radu): this requires keeping all previous plans "alive" until the
 		// very end. We may want to make copies of the buffer nodes and clean up
 		// everything else.
-		buf := plan.cascades[i].Buffer.(*bufferNode)
-		if buf.bufferedRows.Len() == 0 {
-			// No rows were actually modified.
-			continue
+		buf := plan.cascades[i].Buffer
+		var numBufferedRows int
+		if buf != nil {
+			numBufferedRows = buf.(*bufferNode).bufferedRows.Len()
+			if numBufferedRows == 0 {
+				// No rows were actually modified.
+				continue
+			}
 		}
 
 		log.VEventf(ctx, 1, "executing cascade for constraint %s", plan.cascades[i].FKName)
@@ -1050,13 +1059,13 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 		}
 		cascadePlan, err := plan.cascades[i].PlanFn(
 			ctx, &planner.semaCtx, &evalCtx.EvalContext, execFactory,
-			buf, buf.bufferedRows.Len(), allowAutoCommit,
+			buf, numBufferedRows, allowAutoCommit,
 		)
 		if err != nil {
 			recv.SetError(err)
 			return false
 		}
-		cp := cascadePlan.(*planTop)
+		cp := cascadePlan.(*planComponents)
 		plan.cascades[i].plan = cp.main
 		if len(cp.subqueryPlans) > 0 {
 			recv.SetError(errors.AssertionFailedf("cascades should not have subqueries"))
@@ -1089,7 +1098,6 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 			planner,
 			evalCtx,
 			recv,
-			maybeDistribute,
 		); err != nil {
 			recv.SetError(err)
 			return false
@@ -1119,7 +1127,6 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 			planner,
 			evalCtxFactory(),
 			recv,
-			maybeDistribute,
 		); err != nil {
 			recv.SetError(err)
 			return false
@@ -1136,7 +1143,6 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 	planner *planner,
 	evalCtx *extendedEvalContext,
 	recv *DistSQLReceiver,
-	maybeDistribute bool,
 ) error {
 	postqueryMonitor := mon.NewMonitor(
 		"postquery",
@@ -1153,12 +1159,9 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 	postqueryMemAccount := postqueryMonitor.MakeBoundAccount()
 	defer postqueryMemAccount.Close(ctx)
 
-	var distributePostquery bool
-	if maybeDistribute {
-		distributePostquery = getPlanDistribution(
-			ctx, planner, planner.execCfg.NodeID, planner.SessionData().DistSQLMode, postqueryPlan,
-		).WillDistribute()
-	}
+	distributePostquery := getPlanDistribution(
+		ctx, planner, planner.execCfg.NodeID, planner.SessionData().DistSQLMode, postqueryPlan,
+	).WillDistribute()
 	postqueryPlanCtx := dsp.NewPlanningCtx(ctx, evalCtx, planner, planner.txn, distributePostquery)
 	postqueryPlanCtx.stmtType = tree.Rows
 	postqueryPlanCtx.ignoreClose = true

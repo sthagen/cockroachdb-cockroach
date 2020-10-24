@@ -11,6 +11,7 @@
 package optbuilder
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -19,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
@@ -256,7 +257,7 @@ func (b *Builder) addColumn(scope *scope, alias string, expr tree.TypedExpr) *sc
 	return &scope.cols[len(scope.cols)-1]
 }
 
-func (b *Builder) synthesizeResultColumns(scope *scope, cols sqlbase.ResultColumns) {
+func (b *Builder) synthesizeResultColumns(scope *scope, cols colinfo.ResultColumns) {
 	for i := range cols {
 		c := b.synthesizeColumn(scope, cols[i].Name, cols[i].Typ, nil /* expr */, nil /* scalar */)
 		if cols[i].Hidden {
@@ -551,7 +552,7 @@ func (b *Builder) resolveTable(
 	ds, resName := b.resolveDataSource(tn, priv)
 	tab, ok := ds.(cat.Table)
 	if !ok {
-		panic(sqlbase.NewWrongObjectTypeError(tn, "table"))
+		panic(sqlerrors.NewWrongObjectTypeError(tn, "table"))
 	}
 	return tab, resName
 }
@@ -563,7 +564,7 @@ func (b *Builder) resolveTableRef(ref *tree.TableRef, priv privilege.Kind) cat.T
 	ds := b.resolveDataSourceRef(ref, priv)
 	tab, ok := ds.(cat.Table)
 	if !ok {
-		panic(sqlbase.NewWrongObjectTypeError(ref, "table"))
+		panic(sqlerrors.NewWrongObjectTypeError(ref, "table"))
 	}
 	return tab
 }
@@ -645,7 +646,8 @@ func resolveNumericColumnRefs(tab cat.Table, columns []tree.ColumnID) (ordinals 
 		ord := 0
 		cnt := tab.ColumnCount()
 		for ord < cnt {
-			if tab.Column(ord).ColID() == cat.StableID(c) && cat.IsSelectableColumn(tab, ord) {
+			col := tab.Column(ord)
+			if col.IsSelectable() && col.ColID() == cat.StableID(c) {
 				break
 			}
 			ord++
@@ -663,7 +665,8 @@ func resolveNumericColumnRefs(tab cat.Table, columns []tree.ColumnID) (ordinals 
 // returns -1.
 func findPublicTableColumnByName(tab cat.Table, name tree.Name) int {
 	for ord, n := 0, tab.ColumnCount(); ord < n; ord++ {
-		if tab.Column(ord).ColName() == name && !cat.IsMutationColumn(tab, ord) {
+		col := tab.Column(ord)
+		if col.ColName() == name && !col.IsMutation() {
 			return ord
 		}
 	}
@@ -679,8 +682,11 @@ type columnKinds struct {
 	// If true, include system columns.
 	includeSystem bool
 
-	// If true, include virtual columns.
-	includeVirtual bool
+	// If true, include virtual inverted index columns.
+	includeVirtualInverted bool
+
+	// If true, include virtual computed columns.
+	includeVirtualComputed bool
 }
 
 // tableOrdinals returns a slice of ordinals that correspond to table columns of
@@ -688,15 +694,16 @@ type columnKinds struct {
 func tableOrdinals(tab cat.Table, k columnKinds) []int {
 	n := tab.ColumnCount()
 	shouldInclude := [...]bool{
-		cat.Ordinary:   true,
-		cat.WriteOnly:  k.includeMutations,
-		cat.DeleteOnly: k.includeMutations,
-		cat.System:     k.includeSystem,
-		cat.Virtual:    k.includeVirtual,
+		cat.Ordinary:        true,
+		cat.WriteOnly:       k.includeMutations,
+		cat.DeleteOnly:      k.includeMutations,
+		cat.System:          k.includeSystem,
+		cat.VirtualInverted: k.includeVirtualInverted,
+		cat.VirtualComputed: k.includeVirtualComputed,
 	}
 	ordinals := make([]int, 0, n)
 	for i := 0; i < n; i++ {
-		if shouldInclude[tab.ColumnKind(i)] {
+		if shouldInclude[tab.Column(i).Kind()] {
 			ordinals = append(ordinals, i)
 		}
 	}

@@ -184,7 +184,7 @@ func TestReplicateQueueUpReplicate(t *testing.T) {
 		t.Fatalf("replica count, want 1, current %d", len(desc.InternalReplicas))
 	}
 
-	tc.AddServer(t, base.TestServerArgs{})
+	tc.AddAndStartServer(t, base.TestServerArgs{})
 
 	if err := tc.Servers[0].Stores().VisitStores(func(s *kvserver.Store) error {
 		return s.ForceReplicationScanAndProcess()
@@ -209,7 +209,7 @@ func TestReplicateQueueUpReplicate(t *testing.T) {
 		t.Fatalf("expected %d replicas in purgatory, but found %d", expected, n)
 	}
 
-	tc.AddServer(t, base.TestServerArgs{})
+	tc.AddAndStartServer(t, base.TestServerArgs{})
 
 	// Now wait until the replicas have been up-replicated to the
 	// desired number.
@@ -358,7 +358,7 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderStress(t, 38565)
-	skip.UnderRace(t, 38565)
+	skip.UnderRaceWithIssue(t, 38565)
 	skip.UnderShort(t, 38565)
 	ctx := context.Background()
 

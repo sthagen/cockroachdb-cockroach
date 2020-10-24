@@ -321,7 +321,7 @@ func runDecommissionNode(cmd *cobra.Command, args []string) error {
 
 	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
 	if err != nil {
-		return errors.Wrap(err, "Failed to connect to the node")
+		return errors.Wrap(err, "failed to connect to the node")
 	}
 	defer finish()
 
@@ -337,7 +337,17 @@ func runDecommissionNode(cmd *cobra.Command, args []string) error {
 	}
 
 	c := serverpb.NewAdminClient(conn)
-	return runDecommissionNodeImpl(ctx, c, nodeCtx.nodeDecommissionWait, nodeIDs)
+	if err := runDecommissionNodeImpl(ctx, c, nodeCtx.nodeDecommissionWait, nodeIDs); err != nil {
+		cause := errors.UnwrapAll(err)
+		if s, ok := status.FromError(cause); ok && s.Code() == codes.NotFound {
+			// Are we trying to decommision a node that does not
+			// exist? See Server.Decommission for where this specific grpc error
+			// code is generated.
+			return errors.New("node does not exist")
+		}
+		return err
+	}
+	return nil
 }
 
 func handleNodeDecommissionSelf(
@@ -544,7 +554,7 @@ func runRecommissionNode(cmd *cobra.Command, args []string) error {
 
 	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
 	if err != nil {
-		return errors.Wrap(err, "Failed to connect to the node")
+		return errors.Wrap(err, "failed to connect to the node")
 	}
 	defer finish()
 
@@ -566,12 +576,20 @@ func runRecommissionNode(cmd *cobra.Command, args []string) error {
 	}
 	resp, err := c.Decommission(ctx, req)
 	if err != nil {
+		cause := errors.UnwrapAll(err)
 		// If it's a specific illegal membership transition error, we try to
 		// surface a more readable message to the user. See
 		// ValidateLivenessTransition in kvserverpb/liveness.go for where this
 		// error is generated.
-		if s, ok := status.FromError(err); ok && s.Code() == codes.FailedPrecondition {
+		if s, ok := status.FromError(cause); ok && s.Code() == codes.FailedPrecondition {
 			return errors.Newf("%s", s.Message())
+		}
+		if s, ok := status.FromError(cause); ok && s.Code() == codes.NotFound {
+			// Are we trying to recommission node that does not
+			// exist? See Server.Decommission for where this specific grpc error
+			// code is generated.
+			fmt.Fprintln(stderr)
+			return errors.New("node does not exist")
 		}
 		return err
 	}
@@ -590,7 +608,7 @@ configurable via cluster settings.`,
 	RunE: MaybeDecorateGRPCError(runDrain),
 }
 
-// runNodeDrain calls the Drain RPC without the flag to stop the
+// runDrain calls the Drain RPC without the flag to stop the
 // server process.
 func runDrain(cmd *cobra.Command, args []string) (err error) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -625,7 +643,7 @@ var nodeCmds = []*cobra.Command{
 
 var nodeCmd = &cobra.Command{
 	Use:   "node [command]",
-	Short: "list, inspect, drain or remove nodes",
+	Short: "list, inspect, drain or remove nodes\n",
 	Long:  "List, inspect, drain or remove nodes.",
 	RunE:  usageAndErr,
 }

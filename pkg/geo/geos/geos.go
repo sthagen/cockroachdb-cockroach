@@ -170,12 +170,14 @@ func initGEOS(dirs []string) (*C.CR_GEOS, string, error) {
 	var err error
 	for _, dir := range dirs {
 		var ret *C.CR_GEOS
-		errStr := C.CR_GEOS_Init(
-			goToCSlice([]byte(filepath.Join(dir, getLibraryExt(libgeoscFileName)))),
-			goToCSlice([]byte(filepath.Join(dir, getLibraryExt(libgeosFileName)))),
-			&ret,
+		newErr := statusToError(
+			C.CR_GEOS_Init(
+				goToCSlice([]byte(filepath.Join(dir, getLibraryExt(libgeoscFileName)))),
+				goToCSlice([]byte(filepath.Join(dir, getLibraryExt(libgeosFileName)))),
+				&ret,
+			),
 		)
-		if errStr.data == nil {
+		if newErr == nil {
 			return ret, dir, nil
 		}
 		err = errors.CombineErrors(
@@ -183,7 +185,7 @@ func initGEOS(dirs []string) (*C.CR_GEOS, string, error) {
 			errors.Newf(
 				"geos: cannot load GEOS from dir %q: %s",
 				dir,
-				string(cSliceToUnsafeGoBytes(errStr)),
+				newErr,
 			),
 		)
 	}
@@ -204,13 +206,9 @@ func goToCSlice(b []byte) C.CR_GEOS_Slice {
 	}
 }
 
-// c{String,Slice}ToUnsafeGoBytes convert a CR_GEOS_{String,Slice} to a Go
+// cStringToUnsafeGoBytes convert a CR_GEOS_String to a Go
 // byte slice that refer to the underlying C memory.
 func cStringToUnsafeGoBytes(s C.CR_GEOS_String) []byte {
-	return cToUnsafeGoBytes(s.data, s.len)
-}
-
-func cSliceToUnsafeGoBytes(s C.CR_GEOS_Slice) []byte {
 	return cToUnsafeGoBytes(s.data, s.len)
 }
 
@@ -328,6 +326,32 @@ func Area(ewkb geopb.EWKB) (float64, error) {
 	return float64(area), nil
 }
 
+// Boundary returns the boundary of an EWKB.
+func Boundary(ewkb geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_Boundary(g, goToCSlice(ewkb), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// Difference returns the difference between two EWKB.
+func Difference(ewkb1 geopb.EWKB, ewkb2 geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var diffEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_Difference(g, goToCSlice(ewkb1), goToCSlice(ewkb2), &diffEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(diffEWKB), nil
+}
+
 // Length returns the length of an EWKB.
 func Length(ewkb geopb.EWKB) (float64, error) {
 	g, err := ensureInitInternal()
@@ -339,6 +363,45 @@ func Length(ewkb geopb.EWKB) (float64, error) {
 		return 0, err
 	}
 	return float64(length), nil
+}
+
+// Normalize returns the geometry in its normalized form.
+func Normalize(a geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_Normalize(g, goToCSlice(a), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// LineMerge merges multilinestring constituents.
+func LineMerge(a geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_LineMerge(g, goToCSlice(a), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// IsSimple returns whether the EWKB is simple.
+func IsSimple(ewkb geopb.EWKB) (bool, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return false, err
+	}
+	var ret C.char
+	if err := statusToError(C.CR_GEOS_IsSimple(g, goToCSlice(ewkb), &ret)); err != nil {
+		return false, err
+	}
+	return ret == 1, nil
 }
 
 // Centroid returns the centroid of an EWKB.
@@ -354,6 +417,23 @@ func Centroid(ewkb geopb.EWKB) (geopb.EWKB, error) {
 	return cStringToSafeGoBytes(cEWKB), nil
 }
 
+// MinimumBoundingCircle returns minimum bounding circle of an EWKB
+func MinimumBoundingCircle(ewkb geopb.EWKB) (geopb.EWKB, geopb.EWKB, float64, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	var centerEWKB C.CR_GEOS_String
+	var polygonEWKB C.CR_GEOS_String
+	var radius C.double
+
+	if err := statusToError(C.CR_GEOS_MinimumBoundingCircle(g, goToCSlice(ewkb), &radius, &centerEWKB, &polygonEWKB)); err != nil {
+		return nil, nil, 0, err
+	}
+	return cStringToSafeGoBytes(polygonEWKB), cStringToSafeGoBytes(centerEWKB), float64(radius), nil
+
+}
+
 // ConvexHull returns an EWKB which returns the convex hull of the given EWKB.
 func ConvexHull(ewkb geopb.EWKB) (geopb.EWKB, error) {
 	g, err := ensureInitInternal()
@@ -362,6 +442,37 @@ func ConvexHull(ewkb geopb.EWKB) (geopb.EWKB, error) {
 	}
 	var cEWKB C.CR_GEOS_String
 	if err := statusToError(C.CR_GEOS_ConvexHull(g, goToCSlice(ewkb), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// Simplify returns an EWKB which returns the simplified EWKB.
+func Simplify(ewkb geopb.EWKB, tolerance float64) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(
+		C.CR_GEOS_Simplify(g, goToCSlice(ewkb), &cEWKB, C.double(tolerance)),
+	); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// TopologyPreserveSimplify returns an EWKB which returns the simplified EWKB
+// with the topology preserved.
+func TopologyPreserveSimplify(ewkb geopb.EWKB, tolerance float64) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(
+		C.CR_GEOS_TopologyPreserveSimplify(g, goToCSlice(ewkb), &cEWKB, C.double(tolerance)),
+	); err != nil {
 		return nil, err
 	}
 	return cStringToSafeGoBytes(cEWKB), nil
@@ -406,6 +517,19 @@ func Union(a geopb.EWKB, b geopb.EWKB) (geopb.EWKB, error) {
 	return cStringToSafeGoBytes(cEWKB), nil
 }
 
+// SymDifference returns an EWKB which is the symmetric difference of shapes A and B.
+func SymDifference(a geopb.EWKB, b geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_SymDifference(g, goToCSlice(a), goToCSlice(b), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
 // InterpolateLine returns the point along the given LineString which is at
 // a given distance from starting point.
 // Note: For distance less than 0 it returns start point similarly for distance
@@ -438,8 +562,36 @@ func MinDistance(a geopb.EWKB, b geopb.EWKB) (float64, error) {
 	return float64(distance), nil
 }
 
-// ClipEWKBByRect clips a EWKB to the specified rectangle.
-func ClipEWKBByRect(
+// MinimumClearance returns the minimum distance a vertex can move to result in an
+// invalid geometry.
+func MinimumClearance(ewkb geopb.EWKB) (float64, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return 0, err
+	}
+	var distance C.double
+	if err := statusToError(C.CR_GEOS_MinimumClearance(g, goToCSlice(ewkb), &distance)); err != nil {
+		return 0, err
+	}
+	return float64(distance), nil
+}
+
+// MinimumClearanceLine returns the line spanning the minimum clearance a vertex can
+// move before producing an invalid geometry.
+func MinimumClearanceLine(ewkb geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var clearanceEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_MinimumClearanceLine(g, goToCSlice(ewkb), &clearanceEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(clearanceEWKB), nil
+}
+
+// ClipByRect clips a EWKB to the specified rectangle.
+func ClipByRect(
 	ewkb geopb.EWKB, xMin float64, yMin float64, xMax float64, yMax float64,
 ) (geopb.EWKB, error) {
 	g, err := ensureInitInternal()
@@ -447,7 +599,7 @@ func ClipEWKBByRect(
 		return nil, err
 	}
 	var cEWKB C.CR_GEOS_String
-	if err := statusToError(C.CR_GEOS_ClipEWKBByRect(g, goToCSlice(ewkb), C.double(xMin),
+	if err := statusToError(C.CR_GEOS_ClipByRect(g, goToCSlice(ewkb), C.double(xMin),
 		C.double(yMin), C.double(xMax), C.double(yMax), &cEWKB)); err != nil {
 		return nil, err
 	}
@@ -584,6 +736,66 @@ func Within(a geopb.EWKB, b geopb.EWKB) (bool, error) {
 	return ret == 1, nil
 }
 
+// FrechetDistance returns the Frechet distance between the geometries.
+func FrechetDistance(a, b geopb.EWKB) (float64, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return 0, err
+	}
+	var distance C.double
+	if err := statusToError(
+		C.CR_GEOS_FrechetDistance(g, goToCSlice(a), goToCSlice(b), &distance),
+	); err != nil {
+		return 0, err
+	}
+	return float64(distance), nil
+}
+
+// FrechetDistanceDensify returns the Frechet distance between the geometries.
+func FrechetDistanceDensify(a, b geopb.EWKB, densifyFrac float64) (float64, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return 0, err
+	}
+	var distance C.double
+	if err := statusToError(
+		C.CR_GEOS_FrechetDistanceDensify(g, goToCSlice(a), goToCSlice(b), C.double(densifyFrac), &distance),
+	); err != nil {
+		return 0, err
+	}
+	return float64(distance), nil
+}
+
+// HausdorffDistance returns the Hausdorff distance between the geometries.
+func HausdorffDistance(a, b geopb.EWKB) (float64, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return 0, err
+	}
+	var distance C.double
+	if err := statusToError(
+		C.CR_GEOS_HausdorffDistance(g, goToCSlice(a), goToCSlice(b), &distance),
+	); err != nil {
+		return 0, err
+	}
+	return float64(distance), nil
+}
+
+// HausdorffDistanceDensify returns the Hausdorff distance between the geometries.
+func HausdorffDistanceDensify(a, b geopb.EWKB, densifyFrac float64) (float64, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return 0, err
+	}
+	var distance C.double
+	if err := statusToError(
+		C.CR_GEOS_HausdorffDistanceDensify(g, goToCSlice(a), goToCSlice(b), C.double(densifyFrac), &distance),
+	); err != nil {
+		return 0, err
+	}
+	return float64(distance), nil
+}
+
 //
 // DE-9IM related
 //
@@ -596,6 +808,22 @@ func Relate(a geopb.EWKB, b geopb.EWKB) (string, error) {
 	}
 	var ret C.CR_GEOS_String
 	if err := statusToError(C.CR_GEOS_Relate(g, goToCSlice(a), goToCSlice(b), &ret)); err != nil {
+		return "", err
+	}
+	if ret.data == nil {
+		return "", errors.Newf("expected DE-9IM string but found nothing")
+	}
+	return string(cStringToSafeGoBytes(ret)), nil
+}
+
+// RelateBoundaryNodeRule returns the DE-9IM relation between A and B given a boundary node rule.
+func RelateBoundaryNodeRule(a geopb.EWKB, b geopb.EWKB, bnr int) (string, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return "", err
+	}
+	var ret C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_RelateBoundaryNodeRule(g, goToCSlice(a), goToCSlice(b), C.int(bnr), &ret)); err != nil {
 		return "", err
 	}
 	if ret.data == nil {
@@ -693,6 +921,21 @@ func MakeValid(ewkb geopb.EWKB) (geopb.EWKB, error) {
 	}
 	var cEWKB C.CR_GEOS_String
 	if err := statusToError(C.CR_GEOS_MakeValid(g, goToCSlice(ewkb), &cEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// SharedPaths Returns a EWKB containing paths shared by the two given EWKBs.
+func SharedPaths(a geopb.EWKB, b geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(
+		C.CR_GEOS_SharedPaths(g, goToCSlice(a), goToCSlice(b), &cEWKB),
+	); err != nil {
 		return nil, err
 	}
 	return cStringToSafeGoBytes(cEWKB), nil

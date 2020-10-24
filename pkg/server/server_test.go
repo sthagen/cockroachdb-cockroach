@@ -38,8 +38,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -562,9 +563,9 @@ func TestSystemConfigGossip(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	ts := s.(*TestServer)
 
-	key := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, keys.MaxReservedDescID)
+	key := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, keys.MaxReservedDescID)
 	valAt := func(i int) *descpb.Descriptor {
-		return sqlbase.NewInitialDatabaseDescriptor(
+		return dbdesc.NewInitial(
 			descpb.ID(i), "foo", security.AdminRole,
 		).DescriptorProto()
 	}
@@ -657,13 +658,11 @@ func TestListenerFileCreation(t *testing.T) {
 	}
 
 	li := listenerInfo{
-		listenRPC:       s.RPCAddr(),
-		advertiseRPC:    s.ServingRPCAddr(),
-		listenSQL:       s.SQLAddr(),
-		advertiseSQL:    s.ServingSQLAddr(),
-		listenTenant:    s.TenantAddr(),
-		advertiseTenant: s.ServingTenantAddr(),
-		listenHTTP:      s.HTTPAddr(),
+		listenRPC:    s.RPCAddr(),
+		advertiseRPC: s.ServingRPCAddr(),
+		listenSQL:    s.SQLAddr(),
+		advertiseSQL: s.ServingSQLAddr(),
+		listenHTTP:   s.HTTPAddr(),
 	}
 	expectedFiles := li.Iter()
 
@@ -1042,7 +1041,7 @@ Binary built without web UI.
 			expected := fmt.Sprintf(
 				htmlTemplate,
 				fmt.Sprintf(
-					`{"ExperimentalUseLogin":false,"LoginEnabled":false,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d"}`,
+					`{"ExperimentalUseLogin":false,"LoginEnabled":false,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","PasswordLoginEnabled":true,"OIDCLoginEnabled":false,"OIDCButtonText":""}`,
 					build.GetInfo().Tag,
 					build.VersionPrefix(),
 					1,
@@ -1077,7 +1076,7 @@ Binary built without web UI.
 			{
 				loggedInClient,
 				fmt.Sprintf(
-					`{"ExperimentalUseLogin":true,"LoginEnabled":true,"LoggedInUser":"authentic_user","Tag":"%s","Version":"%s","NodeID":"%d"}`,
+					`{"ExperimentalUseLogin":true,"LoginEnabled":true,"LoggedInUser":"authentic_user","Tag":"%s","Version":"%s","NodeID":"%d","PasswordLoginEnabled":true,"OIDCLoginEnabled":false,"OIDCButtonText":""}`,
 					build.GetInfo().Tag,
 					build.VersionPrefix(),
 					1,
@@ -1086,7 +1085,7 @@ Binary built without web UI.
 			{
 				loggedOutClient,
 				fmt.Sprintf(
-					`{"ExperimentalUseLogin":true,"LoginEnabled":true,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d"}`,
+					`{"ExperimentalUseLogin":true,"LoginEnabled":true,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","PasswordLoginEnabled":true,"OIDCLoginEnabled":false,"OIDCButtonText":""}`,
 					build.GetInfo().Tag,
 					build.VersionPrefix(),
 					1,

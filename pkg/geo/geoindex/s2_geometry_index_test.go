@@ -29,7 +29,7 @@ func TestS2GeometryIndexBasic(t *testing.T) {
 
 	ctx := context.Background()
 	var index GeometryIndex
-	shapes := make(map[string]*geo.Geometry)
+	shapes := make(map[string]geo.Geometry)
 	datadriven.RunTest(t, "testdata/s2_geometry", func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "init":
@@ -78,10 +78,10 @@ func TestS2GeometryIndexBasic(t *testing.T) {
 	})
 }
 
-func TestClipEWKBByRect(t *testing.T) {
+func TestClipByRect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	var g *geo.Geometry
+	var g geo.Geometry
 	var err error
 	datadriven.RunTest(t, "testdata/clip", func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
@@ -97,8 +97,13 @@ func TestClipEWKBByRect(t *testing.T) {
 			d.ScanArgs(t, "ymin", &yMin)
 			d.ScanArgs(t, "xmax", &xMax)
 			d.ScanArgs(t, "ymax", &yMax)
-			ewkb, err := geos.ClipEWKBByRect(
-				g.EWKB(), float64(xMin), float64(yMin), float64(xMax), float64(yMax))
+			ewkb, err := geos.ClipByRect(
+				g.EWKB(),
+				float64(xMin),
+				float64(yMin),
+				float64(xMax),
+				float64(yMax),
+			)
 			if err != nil {
 				return err.Error()
 			}
@@ -133,9 +138,9 @@ func TestNoClippingAtSRIDBounds(t *testing.T) {
 			xCorners := []float64{b.MinX, b.MinX, b.MaxX, b.MaxX}
 			yCorners := []float64{b.MinY, b.MaxY, b.MaxY, b.MinY}
 			for i := range xCorners {
-				g, err := geo.NewGeometryFromPointCoords(xCorners[i], yCorners[i])
+				g, err := geo.MakeGeometryFromPointCoords(xCorners[i], yCorners[i])
 				require.NoError(t, err)
-				keys, err := index.InvertedIndexKeys(context.Background(), g)
+				keys, _, err := index.InvertedIndexKeys(context.Background(), g)
 				require.NoError(t, err)
 				require.Equal(t, 1, len(keys))
 				require.NotEqual(t, Key(exceedsBoundsCellID), keys[0],

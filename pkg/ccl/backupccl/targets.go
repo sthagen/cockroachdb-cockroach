@@ -13,30 +13,32 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
 
 type descriptorsMatched struct {
 	// All descriptors that match targets plus their parent databases.
-	descs []sqlbase.Descriptor
+	descs []catalog.Descriptor
 
 	// The databases from which all tables were matched (eg a.* or DATABASE a).
 	expandedDB []descpb.ID
 
 	// Explicitly requested DBs (e.g. DATABASE a).
-	requestedDBs []sqlbase.DatabaseDescriptor
+	requestedDBs []catalog.DatabaseDescriptor
 }
 
 func (d descriptorsMatched) checkExpansions(coveredDBs []descpb.ID) error {
@@ -60,9 +62,11 @@ func (d descriptorsMatched) checkExpansions(coveredDBs []descpb.ID) error {
 // descriptorResolver is the helper struct that enables reuse of the
 // standard name resolution algorithm.
 type descriptorResolver struct {
-	descByID map[descpb.ID]sqlbase.Descriptor
+	descByID map[descpb.ID]catalog.Descriptor
 	// Map: db name -> dbID
 	dbsByName map[string]descpb.ID
+	// Map: dbID -> schema name -> schemaID
+	schemasByName map[descpb.ID]map[string]descpb.ID
 	// Map: dbID -> schema name -> obj name -> obj ID
 	objsByName map[descpb.ID]map[string]map[string]descpb.ID
 }
@@ -79,7 +83,7 @@ func (r *descriptorResolver) LookupSchema(
 	if _, ok := schemas[scName]; ok {
 		// TODO (rohany): Not sure if we want to change this to also
 		//  use the resolved schema struct.
-		if dbDesc, ok := r.descByID[dbID].(sqlbase.DatabaseDescriptor); ok {
+		if dbDesc, ok := r.descByID[dbID].(catalog.DatabaseDescriptor); ok {
 			return true, dbDesc, nil
 		}
 	}
@@ -109,26 +113,29 @@ func (r *descriptorResolver) LookupObject(
 
 // newDescriptorResolver prepares a descriptorResolver for the given
 // known set of descriptors.
-func newDescriptorResolver(descs []sqlbase.Descriptor) (*descriptorResolver, error) {
+func newDescriptorResolver(descs []catalog.Descriptor) (*descriptorResolver, error) {
 	r := &descriptorResolver{
-		descByID:   make(map[descpb.ID]sqlbase.Descriptor),
-		dbsByName:  make(map[string]descpb.ID),
-		objsByName: make(map[descpb.ID]map[string]map[string]descpb.ID),
+		descByID:      make(map[descpb.ID]catalog.Descriptor),
+		schemasByName: make(map[descpb.ID]map[string]descpb.ID),
+		dbsByName:     make(map[string]descpb.ID),
+		objsByName:    make(map[descpb.ID]map[string]map[string]descpb.ID),
 	}
 
 	// Iterate to find the databases first. We need that because we also
 	// check the ParentID for tables, and all the valid parents must be
 	// known before we start to check that.
 	for _, desc := range descs {
-		if _, isDB := desc.(sqlbase.DatabaseDescriptor); isDB {
+		if _, isDB := desc.(catalog.DatabaseDescriptor); isDB {
 			if _, ok := r.dbsByName[desc.GetName()]; ok {
 				return nil, errors.Errorf("duplicate database name: %q used for ID %d and %d",
 					desc.GetName(), r.dbsByName[desc.GetName()], desc.GetID())
 			}
 			r.dbsByName[desc.GetName()] = desc.GetID()
 			r.objsByName[desc.GetID()] = make(map[string]map[string]descpb.ID)
+			r.schemasByName[desc.GetID()] = make(map[string]descpb.ID)
 			// Always add an entry for the public schema.
 			r.objsByName[desc.GetID()][tree.PublicSchema] = make(map[string]descpb.ID)
+			r.schemasByName[desc.GetID()][tree.PublicSchema] = keys.PublicSchemaID
 		}
 
 		// Incidentally, also remember all the descriptors by ID.
@@ -141,19 +148,26 @@ func newDescriptorResolver(descs []sqlbase.Descriptor) (*descriptorResolver, err
 
 	// Add all schemas to the resolver.
 	for _, desc := range descs {
-		if sc, ok := desc.(sqlbase.SchemaDescriptor); ok {
+		if sc, ok := desc.(catalog.SchemaDescriptor); ok {
 			schemaMap := r.objsByName[sc.GetParentID()]
 			if schemaMap == nil {
 				schemaMap = make(map[string]map[string]descpb.ID)
 			}
 			schemaMap[sc.GetName()] = make(map[string]descpb.ID)
 			r.objsByName[sc.GetParentID()] = schemaMap
+
+			schemaNameMap := r.schemasByName[sc.GetParentID()]
+			if schemaNameMap == nil {
+				schemaNameMap = make(map[string]descpb.ID)
+			}
+			schemaNameMap[sc.GetName()] = sc.GetID()
+			r.schemasByName[sc.GetParentID()] = schemaNameMap
 		}
 	}
 
 	// registerDesc is a closure that registers a Descriptor into the resolver's
 	// object registry.
-	registerDesc := func(parentID descpb.ID, desc sqlbase.Descriptor, kind string) error {
+	registerDesc := func(parentID descpb.ID, desc catalog.Descriptor, kind string) error {
 		parentDesc, ok := r.descByID[parentID]
 		if !ok {
 			return errors.Errorf("%s %q has unknown ParentID %d", kind, desc.GetName(), parentID)
@@ -174,7 +188,7 @@ func newDescriptorResolver(descs []sqlbase.Descriptor) (*descriptorResolver, err
 			if !ok {
 				return errors.Errorf("schema %d not found for desc %d", scID, desc.GetID())
 			}
-			scDesc, ok := scDescI.(sqlbase.SchemaDescriptor)
+			scDesc, ok := scDescI.(catalog.SchemaDescriptor)
 			if !ok {
 				return errors.Errorf("descriptor %d is not a schema", scDescI.GetID())
 			}
@@ -201,10 +215,13 @@ func newDescriptorResolver(descs []sqlbase.Descriptor) (*descriptorResolver, err
 			continue
 		}
 		var typeToRegister string
-		switch desc.(type) {
-		case sqlbase.TableDescriptor:
+		switch desc := desc.(type) {
+		case catalog.TableDescriptor:
+			if desc.TableDesc().Temporary {
+				continue
+			}
 			typeToRegister = "table"
-		case sqlbase.TypeDescriptor:
+		case catalog.TypeDescriptor:
 			typeToRegister = "type"
 		}
 		if typeToRegister != "" {
@@ -229,12 +246,9 @@ func descriptorsMatchingTargets(
 	ctx context.Context,
 	currentDatabase string,
 	searchPath sessiondata.SearchPath,
-	descriptors []sqlbase.Descriptor,
+	descriptors []catalog.Descriptor,
 	targets tree.TargetList,
 ) (descriptorsMatched, error) {
-	// TODO(dan): once CockroachDB supports schemas in addition to
-	// catalogs, then this method will need to support it.
-
 	ret := descriptorsMatched{}
 
 	resolver, err := newDescriptorResolver(descriptors)
@@ -254,7 +268,7 @@ func descriptorsMatchingTargets(
 			desc := resolver.descByID[dbID]
 			ret.descs = append(ret.descs, desc)
 			ret.requestedDBs = append(ret.requestedDBs,
-				desc.(sqlbase.DatabaseDescriptor))
+				desc.(catalog.DatabaseDescriptor))
 			ret.expandedDB = append(ret.expandedDB, dbID)
 			alreadyRequestedDBs[dbID] = struct{}{}
 			alreadyExpandedDBs[dbID] = struct{}{}
@@ -262,11 +276,39 @@ func descriptorsMatchingTargets(
 	}
 
 	alreadyRequestedSchemas := make(map[descpb.ID]struct{})
-	maybeAddSchemaDesc := func(id descpb.ID) {
+	maybeAddSchemaDesc := func(id descpb.ID, requirePublic bool) error {
+		// Only add user defined schemas.
+		if id == keys.PublicSchemaID {
+			return nil
+		}
 		if _, ok := alreadyRequestedSchemas[id]; !ok {
+			schemaDesc := resolver.descByID[id]
+			if err := catalog.FilterDescriptorState(
+				schemaDesc, tree.CommonLookupFlags{},
+			); err != nil {
+				if requirePublic {
+					return errors.Wrapf(err, "schema %d was expected to be PUBLIC", id)
+				}
+				// If the schema is not public, but we don't require it to be, ignore
+				// it.
+				return nil
+			}
 			alreadyRequestedSchemas[id] = struct{}{}
 			ret.descs = append(ret.descs, resolver.descByID[id])
 		}
+
+		return nil
+	}
+	getSchemaIDByName := func(scName string, dbID descpb.ID) (descpb.ID, error) {
+		schemas, ok := resolver.schemasByName[dbID]
+		if !ok {
+			return 0, errors.Newf("database with ID %d not found", dbID)
+		}
+		schemaID, ok := schemas[scName]
+		if !ok {
+			return 0, errors.Newf("schema with name %s not found in DB %d", scName, dbID)
+		}
+		return schemaID, nil
 	}
 
 	alreadyRequestedTypes := make(map[descpb.ID]struct{})
@@ -279,12 +321,12 @@ func descriptorsMatchingTargets(
 			ret.descs = append(ret.descs, resolver.descByID[id])
 		}
 	}
-	getTypeByID := func(id descpb.ID) (sqlbase.TypeDescriptor, error) {
+	getTypeByID := func(id descpb.ID) (catalog.TypeDescriptor, error) {
 		desc, ok := resolver.descByID[id]
 		if !ok {
 			return nil, errors.Newf("type with ID %d not found", id)
 		}
-		typeDesc, ok := desc.(sqlbase.TypeDescriptor)
+		typeDesc, ok := desc.(catalog.TypeDescriptor)
 		if !ok {
 			return nil, errors.Newf("descriptor %d is not a type, but a %T", id, desc)
 		}
@@ -315,14 +357,17 @@ func descriptorsMatchingTargets(
 			if !found {
 				return ret, doesNotExistErr
 			}
-			tableDesc := descI.(sqlbase.TableDescriptor)
-			// If tableDesc is nil, then we resolved a type instead, so error out.
-			if tableDesc == nil {
+			tableDesc, isTable := descI.(catalog.TableDescriptor)
+			// If the type assertion didn't work, then we resolved a type instead, so
+			// error out.
+			if !isTable {
 				return ret, doesNotExistErr
 			}
 
 			// Verify that the table is in the correct state.
-			if err := catalog.FilterDescriptorState(tableDesc); err != nil {
+			if err := catalog.FilterDescriptorState(
+				tableDesc, tree.CommonLookupFlags{},
+			); err != nil {
 				// Return a does not exist error if explicitly asking for this table.
 				return ret, doesNotExistErr
 			}
@@ -339,10 +384,10 @@ func descriptorsMatchingTargets(
 				alreadyRequestedTables[tableDesc.GetID()] = struct{}{}
 				ret.descs = append(ret.descs, tableDesc)
 			}
-			// If this table is a member of a user defined schema, then request the
-			// user defined schema.
-			if tableDesc.GetParentSchemaID() != keys.PublicSchemaID {
-				maybeAddSchemaDesc(tableDesc.GetParentSchemaID())
+			// Since the table was directly requested, so is the schema. If the table
+			// is PUBLIC, we expect the schema to also be PUBLIC.
+			if err := maybeAddSchemaDesc(tableDesc.GetParentSchemaID(), true /* requirePublic */); err != nil {
+				return ret, err
 			}
 			// Get all the types used by this table.
 			typeIDs, err := tableDesc.GetAllReferencedTypeIDs(getTypeByID)
@@ -359,9 +404,9 @@ func descriptorsMatchingTargets(
 				return ret, err
 			}
 			if !found {
-				return ret, sqlbase.NewInvalidWildcardError(tree.ErrString(p))
+				return ret, sqlerrors.NewInvalidWildcardError(tree.ErrString(p))
 			}
-			desc := descI.(sqlbase.DatabaseDescriptor)
+			desc := descI.(catalog.DatabaseDescriptor)
 
 			// If the database is not requested already, request it now.
 			dbID := desc.GetID()
@@ -383,12 +428,22 @@ func descriptorsMatchingTargets(
 
 	// Then process the database expansions.
 	for dbID := range alreadyExpandedDBs {
-		for _, schemas := range resolver.objsByName[dbID] {
+		for schemaName, schemas := range resolver.objsByName[dbID] {
+			schemaID, err := getSchemaIDByName(schemaName, dbID)
+			if err != nil {
+				return ret, err
+			}
+			if err := maybeAddSchemaDesc(schemaID, false /* requirePublic */); err != nil {
+				return ret, err
+			}
+
 			for _, id := range schemas {
 				desc := resolver.descByID[id]
 				switch desc := desc.(type) {
-				case sqlbase.TableDescriptor:
-					if err := catalog.FilterDescriptorState(desc); err != nil {
+				case catalog.TableDescriptor:
+					if err := catalog.FilterDescriptorState(
+						desc, tree.CommonLookupFlags{},
+					); err != nil {
 						// Don't include this table in the expansion since it's not in a valid
 						// state. Silently fail since this table was not directly requested,
 						// but was just part of an expansion.
@@ -400,7 +455,12 @@ func descriptorsMatchingTargets(
 					// If this table is a member of a user defined schema, then request the
 					// user defined schema.
 					if desc.GetParentSchemaID() != keys.PublicSchemaID {
-						maybeAddSchemaDesc(desc.GetParentSchemaID())
+						// Note, that although we're processing the database expansions,
+						// since the table is in a PUBLIC state, we also expect the schema
+						// to be in a similar state.
+						if err := maybeAddSchemaDesc(desc.GetParentSchemaID(), true /* requirePublic */); err != nil {
+							return ret, err
+						}
 					}
 					// Get all the types used by this table.
 					typeIDs, err := desc.GetAllReferencedTypeIDs(getTypeByID)
@@ -410,7 +470,7 @@ func descriptorsMatchingTargets(
 					for _, id := range typeIDs {
 						maybeAddTypeDesc(id)
 					}
-				case sqlbase.TypeDescriptor:
+				case catalog.TypeDescriptor:
 					maybeAddTypeDesc(desc.GetID())
 				}
 			}
@@ -430,9 +490,10 @@ func getRelevantDescChanges(
 	ctx context.Context,
 	db *kv.DB,
 	startTime, endTime hlc.Timestamp,
-	descs []sqlbase.Descriptor,
+	descs []catalog.Descriptor,
 	expanded []descpb.ID,
 	priorIDs map[descpb.ID]descpb.ID,
+	descriptorCoverage tree.DescriptorCoverage,
 ) ([]BackupManifest_DescriptorRevision, error) {
 
 	allChanges, err := getAllDescChanges(ctx, db, startTime, endTime, priorIDs)
@@ -459,14 +520,12 @@ func getRelevantDescChanges(
 	// obviously interesting to our backup.
 	for _, i := range descs {
 		interestingIDs[i.GetID()] = struct{}{}
-		if table, isTable := i.(sqlbase.TableDescriptor); isTable {
+		if table, isTable := i.(catalog.TableDescriptor); isTable {
 
 			for j := table.GetReplacementOf().ID; j != descpb.InvalidID; j = priorIDs[j] {
 				interestingIDs[j] = struct{}{}
 			}
 		}
-		// TODO (rohany): Once we start tracking modification time on type
-		//  descriptors we need to consider them here.
 	}
 
 	// We're also interested in any desc that belonged to a DB we're backing up.
@@ -484,14 +543,13 @@ func getRelevantDescChanges(
 			return nil, err
 		}
 		for _, i := range starting {
-			// TODO(ajwerner): Determine whether types and schemas need any special
-			// treatment here.
-			if table, isTable := i.(sqlbase.TableDescriptor); isTable {
+			switch desc := i.(type) {
+			case catalog.TableDescriptor, catalog.TypeDescriptor, catalog.SchemaDescriptor:
 				// We need to add to interestingIDs so that if we later see a delete for
 				// this ID we still know it is interesting to us, even though we will not
 				// have a parentID at that point (since the delete is a nil desc).
-				if _, ok := interestingParents[table.GetParentID()]; ok {
-					interestingIDs[table.GetID()] = struct{}{}
+				if _, ok := interestingParents[desc.GetParentID()]; ok {
+					interestingIDs[desc.GetID()] = struct{}{}
 				}
 			}
 			if _, ok := interestingIDs[i.GetID()]; ok {
@@ -508,18 +566,33 @@ func getRelevantDescChanges(
 		}
 	}
 
+	isInterestingID := func(id descpb.ID) bool {
+		// We're interested in changes to all descriptors if we're targeting all
+		// descriptors except for the system database itself.
+		if descriptorCoverage == tree.AllDescriptors && id != keys.SystemDatabaseID {
+			return true
+		}
+		// A change to an ID that we're interested in is obviously interesting.
+		if _, ok := interestingIDs[id]; ok {
+			return true
+		}
+		return false
+	}
+
 	for _, change := range allChanges {
 		// A change to an ID that we are interested in is obviously interesting --
 		// a change is also interesting if it is to a table that has a parent that
 		// we are interested and thereafter it also becomes an ID in which we are
 		// interested in changes (since, as mentioned above, to decide if deletes
 		// are interesting).
-		if _, ok := interestingIDs[change.ID]; ok {
+		if isInterestingID(change.ID) {
 			interestingChanges = append(interestingChanges, change)
 		} else if change.Desc != nil {
-			if table := sqlbase.TableFromDescriptor(change.Desc, hlc.Timestamp{}); table != nil {
-				if _, ok := interestingParents[table.ParentID]; ok {
-					interestingIDs[table.ID] = struct{}{}
+			desc := catalogkv.UnwrapDescriptorRaw(ctx, change.Desc)
+			switch desc := desc.(type) {
+			case catalog.TableDescriptor, catalog.TypeDescriptor, catalog.SchemaDescriptor:
+				if _, ok := interestingParents[desc.GetParentID()]; ok {
+					interestingIDs[desc.GetID()] = struct{}{}
 					interestingChanges = append(interestingChanges, change)
 				}
 			}
@@ -564,13 +637,21 @@ func getAllDescChanges(
 				if err := rev.GetProto(&desc); err != nil {
 					return nil, err
 				}
+
+				// We update the modification time for the descriptors here with the
+				// timestamp of the KV row so that we can identify the appropriate
+				// descriptors to use during restore.
+				// Note that the modification time of descriptors on disk is usually 0.
+				// See the comment on MaybeSetDescriptorModificationTime... for more.
+				descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(ctx, &desc, rev.Timestamp)
+
+				// Collect the prior IDs of table descriptors, as the ID may have been
+				// changed during truncate.
 				r.Desc = &desc
-				t := sqlbase.TableFromDescriptor(&desc, rev.Timestamp)
+				t := descpb.TableFromDescriptor(&desc, rev.Timestamp)
 				if t != nil && t.ReplacementOf.ID != descpb.InvalidID {
 					priorIDs[t.ID] = t.ReplacementOf.ID
 				}
-				// TODO (rohany): Once we track modification time on type descriptors,
-				//  they need to be checked for updates here.
 			}
 			res = append(res, r)
 		}
@@ -578,14 +659,16 @@ func getAllDescChanges(
 	return res, nil
 }
 
-func ensureInterleavesIncluded(tables []sqlbase.TableDescriptor) error {
+func ensureInterleavesIncluded(tables []catalog.TableDescriptor) error {
 	inBackup := make(map[descpb.ID]bool, len(tables))
 	for _, t := range tables {
 		inBackup[t.GetID()] = true
 	}
 
 	for _, table := range tables {
-		if err := table.ForeachNonDropIndex(func(index *descpb.IndexDescriptor) error {
+		if err := table.ForeachIndex(catalog.IndexOpts{
+			AddMutations: true,
+		}, func(index *descpb.IndexDescriptor, _ bool) error {
 			for _, a := range index.Interleave.Ancestors {
 				if !inBackup[a.TableID] {
 					return errors.Errorf(
@@ -610,13 +693,13 @@ func ensureInterleavesIncluded(tables []sqlbase.TableDescriptor) error {
 
 func loadAllDescs(
 	ctx context.Context, db *kv.DB, asOf hlc.Timestamp,
-) ([]sqlbase.Descriptor, error) {
-	var allDescs []sqlbase.Descriptor
+) ([]catalog.Descriptor, error) {
+	var allDescs []catalog.Descriptor
 	if err := db.Txn(
 		ctx,
 		func(ctx context.Context, txn *kv.Txn) (err error) {
 			txn.SetFixedTimestamp(ctx, asOf)
-			allDescs, err = catalogkv.GetAllDescriptors(ctx, txn, keys.SystemSQLCodec)
+			allDescs, err = catalogkv.GetAllDescriptors(ctx, txn, keys.SystemSQLCodec, true /* validate */)
 			return err
 		}); err != nil {
 		return nil, err
@@ -628,7 +711,7 @@ func loadAllDescs(
 // returns the resulting descriptors.
 func ResolveTargetsToDescriptors(
 	ctx context.Context, p sql.PlanHookState, endTime hlc.Timestamp, targets *tree.TargetList,
-) ([]sqlbase.Descriptor, []descpb.ID, error) {
+) ([]catalog.Descriptor, []descpb.ID, error) {
 	allDescs, err := loadAllDescs(ctx, p.ExecCfg().DB, endTime)
 	if err != nil {
 		return nil, nil, err
@@ -654,8 +737,8 @@ func ResolveTargetsToDescriptors(
 // fullClusterTargets, but rather than returning the entire database
 // descriptor as the second argument, it only returns their IDs.
 func fullClusterTargetsBackup(
-	allDescs []sqlbase.Descriptor,
-) ([]sqlbase.Descriptor, []descpb.ID, error) {
+	allDescs []catalog.Descriptor,
+) ([]catalog.Descriptor, []descpb.ID, error) {
 	fullClusterDescs, fullClusterDBs, err := fullClusterTargets(allDescs)
 	if err != nil {
 		return nil, nil, err
@@ -671,10 +754,10 @@ func fullClusterTargetsBackup(
 // fullClusterTargets returns all of the tableDescriptors to be included in a
 // full cluster backup, and all the user databases.
 func fullClusterTargets(
-	allDescs []sqlbase.Descriptor,
-) ([]sqlbase.Descriptor, []*sqlbase.ImmutableDatabaseDescriptor, error) {
-	fullClusterDescs := make([]sqlbase.Descriptor, 0, len(allDescs))
-	fullClusterDBs := make([]*sqlbase.ImmutableDatabaseDescriptor, 0)
+	allDescs []catalog.Descriptor,
+) ([]catalog.Descriptor, []*dbdesc.Immutable, error) {
+	fullClusterDescs := make([]catalog.Descriptor, 0, len(allDescs))
+	fullClusterDBs := make([]*dbdesc.Immutable, 0)
 
 	systemTablesToBackup := make(map[string]struct{}, len(fullClusterSystemTables))
 	for _, tableName := range fullClusterSystemTables {
@@ -683,14 +766,14 @@ func fullClusterTargets(
 
 	for _, desc := range allDescs {
 		switch desc := desc.(type) {
-		case sqlbase.DatabaseDescriptor:
-			dbDesc := sqlbase.NewImmutableDatabaseDescriptor(*desc.DatabaseDesc())
+		case catalog.DatabaseDescriptor:
+			dbDesc := dbdesc.NewImmutable(*desc.DatabaseDesc())
 			fullClusterDescs = append(fullClusterDescs, desc)
-			if dbDesc.GetID() != sqlbase.SystemDB.GetID() {
+			if dbDesc.GetID() != systemschema.SystemDB.GetID() {
 				// The only database that isn't being fully backed up is the system DB.
 				fullClusterDBs = append(fullClusterDBs, dbDesc)
 			}
-		case sqlbase.TableDescriptor:
+		case catalog.TableDescriptor:
 			if desc.GetParentID() == keys.SystemDatabaseID {
 				// Add only the system tables that we plan to include in a full cluster
 				// backup.
@@ -699,13 +782,13 @@ func fullClusterTargets(
 				}
 			} else {
 				// Add all user tables that are not in a DROP state.
-				if desc.GetState() != descpb.TableDescriptor_DROP {
+				if desc.GetState() != descpb.DescriptorState_DROP {
 					fullClusterDescs = append(fullClusterDescs, desc)
 				}
 			}
-		case sqlbase.SchemaDescriptor:
+		case catalog.SchemaDescriptor:
 			fullClusterDescs = append(fullClusterDescs, desc)
-		case sqlbase.TypeDescriptor:
+		case catalog.TypeDescriptor:
 			fullClusterDescs = append(fullClusterDescs, desc)
 		}
 	}
@@ -743,34 +826,37 @@ func CheckObjectExists(
 		// Find what object we collided with.
 		desc, err := catalogkv.GetAnyDescriptorByID(ctx, txn, codec, id, catalogkv.Immutable)
 		if err != nil {
-			return sqlbase.WrapErrorWhileConstructingObjectAlreadyExistsErr(err)
+			return sqlerrors.WrapErrorWhileConstructingObjectAlreadyExistsErr(err)
 		}
-		return sqlbase.MakeObjectAlreadyExistsError(desc.DescriptorProto(), name)
+		return sqlerrors.MakeObjectAlreadyExistsError(desc.DescriptorProto(), name)
 	}
 	return nil
 }
 
 func fullClusterTargetsRestore(
-	allDescs []sqlbase.Descriptor,
-) ([]sqlbase.Descriptor, []sqlbase.DatabaseDescriptor, []jobspb.RestoreDetails_Tenant, error) {
+	allDescs []catalog.Descriptor, lastBackupManifest BackupManifest,
+) ([]catalog.Descriptor, []catalog.DatabaseDescriptor, []descpb.TenantInfo, error) {
 	fullClusterDescs, fullClusterDBs, err := fullClusterTargets(allDescs)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	filteredDescs := make([]sqlbase.Descriptor, 0, len(fullClusterDescs))
+	filteredDescs := make([]catalog.Descriptor, 0, len(fullClusterDescs))
 	for _, desc := range fullClusterDescs {
-		if _, isDefaultDB := sqlbase.DefaultUserDBs[desc.GetName()]; !isDefaultDB && desc.GetID() != keys.SystemDatabaseID {
+		if _, isDefaultDB := catalogkeys.DefaultUserDBs[desc.GetName()]; !isDefaultDB && desc.GetID() != keys.SystemDatabaseID {
 			filteredDescs = append(filteredDescs, desc)
 		}
 	}
-	filteredDBs := make([]sqlbase.DatabaseDescriptor, 0, len(fullClusterDBs))
+	filteredDBs := make([]catalog.DatabaseDescriptor, 0, len(fullClusterDBs))
 	for _, db := range fullClusterDBs {
-		if _, isDefaultDB := sqlbase.DefaultUserDBs[db.GetName()]; !isDefaultDB && db.GetID() != keys.SystemDatabaseID {
+		if _, isDefaultDB := catalogkeys.DefaultUserDBs[db.GetName()]; !isDefaultDB && db.GetID() != keys.SystemDatabaseID {
 			filteredDBs = append(filteredDBs, db)
 		}
 	}
 
-	return filteredDescs, filteredDBs, nil, nil
+	// Restore all tenants during full-cluster restore.
+	tenants := lastBackupManifest.Tenants
+
+	return filteredDescs, filteredDBs, tenants, nil
 }
 
 func selectTargets(
@@ -780,11 +866,11 @@ func selectTargets(
 	targets tree.TargetList,
 	descriptorCoverage tree.DescriptorCoverage,
 	asOf hlc.Timestamp,
-) ([]sqlbase.Descriptor, []sqlbase.DatabaseDescriptor, []jobspb.RestoreDetails_Tenant, error) {
+) ([]catalog.Descriptor, []catalog.DatabaseDescriptor, []descpb.TenantInfo, error) {
 	allDescs, lastBackupManifest := loadSQLDescsFromBackupsAtTime(backupManifests, asOf)
 
 	if descriptorCoverage == tree.AllDescriptors {
-		return fullClusterTargetsRestore(allDescs)
+		return fullClusterTargetsRestore(allDescs, lastBackupManifest)
 	}
 
 	if targets.Tenant != (roachpb.TenantID{}) {
@@ -792,7 +878,7 @@ func selectTargets(
 			// TODO(dt): for now it is zero-or-one but when that changes, we should
 			// either keep it sorted or build a set here.
 			if tenant.ID == targets.Tenant.ToUint64() {
-				return nil, nil, []jobspb.RestoreDetails_Tenant{{ID: tenant.ID, Info: tenant.Info}}, nil
+				return nil, nil, []descpb.TenantInfo{tenant}, nil
 			}
 		}
 		return nil, nil, nil, errors.Errorf("tenant %d not in backup", targets.Tenant.ToUint64())

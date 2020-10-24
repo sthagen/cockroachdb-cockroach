@@ -20,14 +20,19 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	_ "github.com/lib/pq"
+	"github.com/stretchr/testify/require"
 )
 
-var v201 = roachpb.Version{Major: 20, Minor: 1}
+var (
+	v201 = roachpb.Version{Major: 20, Minor: 1}
+	v202 = roachpb.Version{Major: 20, Minor: 2}
+)
 
 // Feature tests that are invoked between each step of the version upgrade test.
 // Tests can use u.clusterVersion to determine which version is active at the
@@ -84,13 +89,12 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster, buildVersion ve
 	// is necessary after every release. For example, the day `master` becomes
 	// the 20.2 release, this test will fail because it is missing a fixture for
 	// 20.1; run the test (on 20.1) with the bool flipped to create the fixture.
-	// Check it in (instructions are on the 'checkpointer' struct) and off we
-	// go.
+	// Check it in (instructions will be logged below) and off we go.
 	if false {
 		// The version to create/update the fixture for. Must be released (i.e.
 		// can download it from the homepage); if that is not the case use the
 		// empty string which uses the local cockroach binary.
-		newV := "19.2.6"
+		newV := "20.1.7"
 		predV, err := PredecessorVersion(*version.MustParse("v" + newV))
 		if err != nil {
 			t.Fatal(err)
@@ -100,6 +104,20 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster, buildVersion ve
 
 	testFeaturesStep := versionUpgradeTestFeatures.step(c.All())
 	schemaChangeStep := runSchemaChangeWorkloadStep(c.All().randNode()[0], 10 /* maxOps */, 2 /* concurrency */)
+	backupStep := func(ctx context.Context, t *test, u *versionUpgradeTest) {
+		// This check was introduced for the system.tenants table and the associated
+		// changes to full-cluster backup to include tenants. It mostly wants to
+		// check that 20.1 (which does not have system.tenants) and 20.2 (which
+		// does have the table) can both run full cluster backups.
+		//
+		// This step can be removed once 20.2 is released.
+		if u.binaryVersion(ctx, t, 1).Major != 20 {
+			return
+		}
+		dest := fmt.Sprintf("nodelocal://0/%d", timeutil.Now().UnixNano())
+		_, err := u.conn(ctx, t, 1).ExecContext(ctx, `BACKUP TO $1`, dest)
+		require.NoError(t, err)
+	}
 
 	// The steps below start a cluster at predecessorVersion (from a fixture),
 	// then start an upgrade that is rolled back, and finally start and finalize
@@ -134,6 +152,7 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster, buildVersion ve
 		// Run a quick schemachange workload in between each upgrade.
 		// The maxOps is 10 to keep the test runtime under 1-2 minutes.
 		schemaChangeStep,
+		backupStep,
 		// Roll back again. Note that bad things would happen if the cluster had
 		// ignored our request to not auto-upgrade. The `autoupgrade` roachtest
 		// exercises this in more detail, so here we just rely on things working
@@ -141,15 +160,18 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster, buildVersion ve
 		binaryUpgradeStep(c.All(), predecessorVersion),
 		testFeaturesStep,
 		schemaChangeStep,
+		backupStep,
 		// Roll nodes forward, this time allowing them to upgrade, and waiting
 		// for it to happen.
 		binaryUpgradeStep(c.All(), ""),
 		allowAutoUpgradeStep(1),
 		testFeaturesStep,
 		schemaChangeStep,
+		backupStep,
 		waitForUpgradeStep(c.All()),
 		testFeaturesStep,
 		schemaChangeStep,
+		backupStep,
 	)
 
 	u.run(ctx, t)
@@ -302,7 +324,11 @@ func uploadAndStartFromCheckpointFixture(nodes nodeListOption, v string) version
 func binaryUpgradeStep(nodes nodeListOption, newVersion string) versionStep {
 	return func(ctx context.Context, t *test, u *versionUpgradeTest) {
 		c := u.c
-		args := u.uploadVersion(ctx, t, nodes, newVersion)
+
+		// NB: We could technically stage the binary on all nodes before
+		// restarting each one, but on Unix it's invalid to write to an
+		// executable file while it is currently running. So we do the
+		// simple thing and upload it serially instead.
 
 		// Restart nodes in a random order; otherwise node 1 would be running all
 		// the migrations and it probably also has all the leases.
@@ -312,6 +338,7 @@ func binaryUpgradeStep(nodes nodeListOption, newVersion string) versionStep {
 		for _, node := range nodes {
 			t.l.Printf("restarting node %d", node)
 			c.Stop(ctx, c.Node(node))
+			args := u.uploadVersion(ctx, t, c.Node(node), newVersion)
 			c.Start(ctx, t, c.Node(node), args, startArgsDontEncrypt)
 			t.l.Printf("node %d now running binary version %s", node, u.binaryVersion(ctx, t, node))
 
@@ -411,6 +438,11 @@ func stmtFeatureTest(
 			}
 			db := u.conn(ctx, t, i)
 			if _, err := db.ExecContext(ctx, stmt, args...); err != nil {
+				if testutils.IsError(err, "no inbound stream connection") && u.clusterVersion(ctx, t, i).Less(v202) {
+					// This error has been fixed in 20.2+ but may still occur on earlier
+					// versions.
+					return true // skipped
+				}
 				t.Fatal(err)
 			}
 			return false
@@ -468,8 +500,15 @@ func makeVersionFixtureAndFatal(
 			// compatible).
 			name := checkpointName(u.binaryVersion(ctx, t, 1).String())
 			u.c.Stop(ctx, c.All())
-			c.Run(ctx, c.All(), cockroach, "debug", "rocksdb", "--db={store-dir}",
-				"checkpoint", "--checkpoint_dir={store-dir}/"+name)
+
+			c.Run(ctx, c.All(), cockroach, "debug", "pebble", "db", "checkpoint",
+				"{store-dir}", "{store-dir}/"+name)
+			// The `cluster-bootstrapped` marker can already be found within
+			// store-dir, but the rocksdb checkpoint step above does not pick it
+			// up as it isn't recognized by RocksDB. We copy the marker
+			// manually, it's necessary for roachprod created clusters. See
+			// #54761.
+			c.Run(ctx, c.Node(1), "cp", "{store-dir}/cluster-bootstrapped", "{store-dir}/"+name)
 			c.Run(ctx, c.All(), "tar", "-C", "{store-dir}/"+name, "-czf", "{log-dir}/"+name+".tgz", ".")
 			t.Fatalf(`successfully created checkpoints; failing test on purpose.
 
@@ -478,7 +517,7 @@ result:
 
 for i in 1 2 3 4; do
   mkdir -p pkg/cmd/roachtest/fixtures/${i} && \
-  mv artifacts/acceptance/version-upgrade/run_1/${i}.logs/checkpoint-*.tgz \
+  mv artifacts/acceptance/version-upgrade/run_1/logs/${i}.unredacted/checkpoint-*.tgz \
      pkg/cmd/roachtest/fixtures/${i}/
 done
 `)

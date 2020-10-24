@@ -574,7 +574,7 @@ func TestGCQueueProcess(t *testing.T) {
 			func(ctx context.Context, intents []roachpb.Intent) error {
 				return nil
 			},
-			func(ctx context.Context, txn *roachpb.Transaction, intents []roachpb.LockUpdate) error {
+			func(ctx context.Context, txn *roachpb.Transaction) error {
 				return nil
 			})
 	}()
@@ -893,9 +893,9 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	outsideTxnPrefixEnd := keys.TransactionKey(outsideKey.Next(), uuid.UUID{})
 	var count int
 	if _, err := storage.MVCCIterate(ctx, tc.store.Engine(), outsideTxnPrefix, outsideTxnPrefixEnd, hlc.Timestamp{},
-		storage.MVCCScanOptions{}, func(roachpb.KeyValue) (bool, error) {
+		storage.MVCCScanOptions{}, func(roachpb.KeyValue) error {
 			count++
-			return false, nil
+			return nil
 		}); err != nil {
 		t.Fatal(err)
 	}
@@ -973,16 +973,16 @@ func TestGCQueueIntentResolution(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		meta := &enginepb.MVCCMetadata{}
 		return tc.store.Engine().Iterate(roachpb.KeyMin, roachpb.KeyMax,
-			func(kv storage.MVCCKeyValue) (bool, error) {
+			func(kv storage.MVCCKeyValue) error {
 				if !kv.Key.IsValue() {
 					if err := protoutil.Unmarshal(kv.Value, meta); err != nil {
-						return false, err
+						return err
 					}
 					if meta.Txn != nil {
-						return false, errors.Errorf("non-nil Txn after GC for key %s", kv.Key)
+						return errors.Errorf("non-nil Txn after GC for key %s", kv.Key)
 					}
 				}
-				return false, nil
+				return nil
 			})
 	})
 }

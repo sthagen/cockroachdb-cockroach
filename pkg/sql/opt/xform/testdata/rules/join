@@ -58,16 +58,6 @@ CREATE TABLE zz (
 ----
 
 exec-ddl
-CREATE TABLE zz_redundant (
-    a INT8 PRIMARY KEY,
-    b INT8 NULL,
-    c INT8 NULL,
-    INDEX idx_u (b ASC, c ASC),
-    INDEX idx_v (b ASC, c ASC)
-)
-----
-
-exec-ddl
 CREATE TABLE large (m INT, n INT)
 ----
 
@@ -184,51 +174,51 @@ memo (optimized, ~36KB, required=[presentation: a:1,b:2,c:3,s:6,t:7,u:8,x:10,y:1
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (inner-join G5 G6 G7) (inner-join G6 G5 G7) (inner-join G8 G9 G7) (inner-join G9 G8 G7) (merge-join G2 G3 G10 inner-join,+1,+6) (merge-join G3 G2 G10 inner-join,+6,+1) (lookup-join G3 G10 abc@ab,keyCols=[6],outCols=(1-3,6-8,10-12)) (merge-join G5 G6 G10 inner-join,+6,+10) (merge-join G6 G5 G10 inner-join,+10,+6) (lookup-join G6 G10 stu,keyCols=[10],outCols=(1-3,6-8,10-12)) (merge-join G8 G9 G10 inner-join,+6,+10) (lookup-join G8 G10 xyz@xy,keyCols=[6],outCols=(1-3,6-8,10-12)) (merge-join G9 G8 G10 inner-join,+10,+6)
  │    └── [presentation: a:1,b:2,c:3,s:6,t:7,u:8,x:10,y:11,z:12]
  │         ├── best: (merge-join G5="[ordering: +6]" G6="[ordering: +(1|10)]" G10 inner-join,+6,+10)
- │         └── cost: 12980.08
+ │         └── cost: 12992.08
  ├── G2: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    ├── [ordering: +1]
  │    │    ├── best: (scan abc@ab,cols=(1-3))
- │    │    └── cost: 1070.02
+ │    │    └── cost: 1074.02
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G3: (inner-join G5 G9 G7) (inner-join G9 G5 G7) (merge-join G5 G9 G10 inner-join,+6,+10) (lookup-join G5 G10 xyz@xy,keyCols=[6],outCols=(6-8,10-12)) (merge-join G9 G5 G10 inner-join,+10,+6) (lookup-join G9 G10 stu,keyCols=[10],outCols=(6-8,10-12))
  │    ├── [ordering: +(6|10)]
  │    │    ├── best: (merge-join G5="[ordering: +6]" G9="[ordering: +10]" G10 inner-join,+6,+10)
- │    │    └── cost: 11880.05
+ │    │    └── cost: 11888.05
  │    └── []
  │         ├── best: (merge-join G5="[ordering: +6]" G9="[ordering: +10]" G10 inner-join,+6,+10)
- │         └── cost: 11880.05
+ │         └── cost: 11888.05
  ├── G4: (filters G11)
  ├── G5: (scan stu,cols=(6-8)) (scan stu@uts,cols=(6-8))
  │    ├── [ordering: +6]
  │    │    ├── best: (scan stu,cols=(6-8))
- │    │    └── cost: 10600.02
+ │    │    └── cost: 10604.02
  │    └── []
  │         ├── best: (scan stu,cols=(6-8))
- │         └── cost: 10600.02
+ │         └── cost: 10604.02
  ├── G6: (inner-join G2 G9 G12) (inner-join G9 G2 G12) (merge-join G2 G9 G10 inner-join,+1,+10) (lookup-join G2 G10 xyz@xy,keyCols=[1],outCols=(1-3,10-12)) (merge-join G9 G2 G10 inner-join,+10,+1) (lookup-join G9 G10 abc@ab,keyCols=[10],outCols=(1-3,10-12))
  │    ├── [ordering: +(1|10)]
  │    │    ├── best: (merge-join G2="[ordering: +1]" G9="[ordering: +10]" G10 inner-join,+1,+10)
- │    │    └── cost: 2170.05
+ │    │    └── cost: 2178.05
  │    └── []
  │         ├── best: (merge-join G2="[ordering: +1]" G9="[ordering: +10]" G10 inner-join,+1,+10)
- │         └── cost: 2170.05
+ │         └── cost: 2178.05
  ├── G7: (filters G13)
  ├── G8: (inner-join G2 G5 G4) (inner-join G5 G2 G4) (merge-join G2 G5 G10 inner-join,+1,+6) (lookup-join G2 G10 stu,keyCols=[1],outCols=(1-3,6-8)) (merge-join G5 G2 G10 inner-join,+6,+1) (lookup-join G5 G10 abc@ab,keyCols=[6],outCols=(1-3,6-8))
  │    ├── [ordering: +(1|6)]
  │    │    ├── best: (merge-join G2="[ordering: +1]" G5="[ordering: +6]" G10 inner-join,+1,+6)
- │    │    └── cost: 11880.05
+ │    │    └── cost: 11888.05
  │    └── []
  │         ├── best: (merge-join G2="[ordering: +1]" G5="[ordering: +6]" G10 inner-join,+1,+6)
- │         └── cost: 11880.05
+ │         └── cost: 11888.05
  ├── G9: (scan xyz,cols=(10-12)) (scan xyz@xy,cols=(10-12)) (scan xyz@yz,cols=(10-12))
  │    ├── [ordering: +10]
  │    │    ├── best: (scan xyz@xy,cols=(10-12))
- │    │    └── cost: 1070.02
+ │    │    └── cost: 1074.02
  │    └── []
  │         ├── best: (scan xyz,cols=(10-12))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G10: (filters)
  ├── G11: (eq G14 G15)
  ├── G12: (filters G16)
@@ -312,74 +302,74 @@ memo (optimized, ~34KB, required=[presentation: pid1:1,cid1:2,gcid1:3,gca1:4,ca1
  ├── G1: (project G2 G3 pid1 cid1 gcid1 gca1 ca1 pa1)
  │    ├── [presentation: pid1:1,cid1:2,gcid1:3,gca1:4,ca1:8,pa1:11] [ordering: +1]
  │    │    ├── best: (project G2="[ordering: +(1|6|10)]" G3 pid1 cid1 gcid1 gca1 ca1 pa1)
- │    │    └── cost: 2767.07
+ │    │    └── cost: 2775.07
  │    └── []
  │         ├── best: (project G2 G3 pid1 cid1 gcid1 gca1 ca1 pa1)
- │         └── cost: 2767.07
+ │         └── cost: 2775.07
  ├── G2: (inner-join G4 G5 G6) (inner-join G7 G8 G9) (inner-join G8 G7 G9) (inner-join G10 G11 G9) (inner-join G11 G10 G9) (inner-join G5 G4 G6) (merge-join G4 G5 G12 inner-join,+1,+10) (lookup-join G4 G12 parent1,keyCols=[1],outCols=(1-4,6-8,10,11)) (merge-join G7 G8 G12 inner-join,+1,+2,+6,+7) (merge-join G8 G7 G12 inner-join,+6,+7,+1,+2) (lookup-join G8 G12 grandchild1,keyCols=[6 7],outCols=(1-4,6-8,10,11)) (merge-join G10 G11 G12 inner-join,+6,+7,+1,+2) (merge-join G11 G10 G12 inner-join,+1,+2,+6,+7) (lookup-join G11 G12 child1,keyCols=[1 2],outCols=(1-4,6-8,10,11)) (merge-join G5 G4 G12 inner-join,+10,+1)
  │    ├── [ordering: +(1|6|10)]
  │    │    ├── best: (lookup-join G4="[ordering: +(1|6)]" G12 parent1,keyCols=[1],outCols=(1-4,6-8,10,11))
- │    │    └── cost: 2766.06
+ │    │    └── cost: 2774.06
  │    └── []
  │         ├── best: (lookup-join G4 G12 parent1,keyCols=[1],outCols=(1-4,6-8,10,11))
- │         └── cost: 2766.06
+ │         └── cost: 2774.06
  ├── G3: (projections)
  ├── G4: (inner-join G7 G10 G9) (inner-join G10 G7 G9) (merge-join G7 G10 G12 inner-join,+1,+2,+6,+7) (lookup-join G7 G12 child1,keyCols=[1 2],outCols=(1-4,6-8)) (merge-join G10 G7 G12 inner-join,+6,+7,+1,+2) (lookup-join G10 G12 grandchild1,keyCols=[6 7],outCols=(1-4,6-8))
  │    ├── [ordering: +(1|6)]
  │    │    ├── best: (merge-join G7="[ordering: +1,+2]" G10="[ordering: +6,+7]" G12 inner-join,+1,+2,+6,+7)
- │    │    └── cost: 2161.05
+ │    │    └── cost: 2169.05
  │    └── []
  │         ├── best: (merge-join G7="[ordering: +1,+2]" G10="[ordering: +6,+7]" G12 inner-join,+1,+2,+6,+7)
- │         └── cost: 2161.05
+ │         └── cost: 2169.05
  ├── G5: (scan parent1,cols=(10,11))
  │    ├── [ordering: +10]
  │    │    ├── best: (scan parent1,cols=(10,11))
- │    │    └── cost: 1040.02
+ │    │    └── cost: 1044.02
  │    └── []
  │         ├── best: (scan parent1,cols=(10,11))
- │         └── cost: 1040.02
+ │         └── cost: 1044.02
  ├── G6: (filters G13)
  ├── G7: (scan grandchild1,cols=(1-4))
  │    ├── [ordering: +1,+2]
  │    │    ├── best: (scan grandchild1,cols=(1-4))
- │    │    └── cost: 1080.02
+ │    │    └── cost: 1084.02
  │    ├── [ordering: +1]
  │    │    ├── best: (scan grandchild1,cols=(1-4))
- │    │    └── cost: 1080.02
+ │    │    └── cost: 1084.02
  │    └── []
  │         ├── best: (scan grandchild1,cols=(1-4))
- │         └── cost: 1080.02
+ │         └── cost: 1084.02
  ├── G8: (inner-join G10 G5 G14) (inner-join G5 G10 G14) (merge-join G10 G5 G12 inner-join,+6,+10) (lookup-join G10 G12 parent1,keyCols=[6],outCols=(6-8,10,11)) (merge-join G5 G10 G12 inner-join,+10,+6) (lookup-join G5 G12 child1,keyCols=[10],outCols=(6-8,10,11))
  │    ├── [ordering: +(6|10),+7]
  │    │    ├── best: (sort G8)
- │    │    └── cost: 2360.34
+ │    │    └── cost: 2368.34
  │    ├── [ordering: +(6|10)]
  │    │    ├── best: (merge-join G10="[ordering: +6]" G5="[ordering: +10]" G12 inner-join,+6,+10)
- │    │    └── cost: 2130.05
+ │    │    └── cost: 2138.05
  │    └── []
  │         ├── best: (merge-join G10="[ordering: +6]" G5="[ordering: +10]" G12 inner-join,+6,+10)
- │         └── cost: 2130.05
+ │         └── cost: 2138.05
  ├── G9: (filters G15 G16)
  ├── G10: (scan child1,cols=(6-8))
  │    ├── [ordering: +6,+7]
  │    │    ├── best: (scan child1,cols=(6-8))
- │    │    └── cost: 1060.02
+ │    │    └── cost: 1064.02
  │    ├── [ordering: +6]
  │    │    ├── best: (scan child1,cols=(6-8))
- │    │    └── cost: 1060.02
+ │    │    └── cost: 1064.02
  │    └── []
  │         ├── best: (scan child1,cols=(6-8))
- │         └── cost: 1060.02
+ │         └── cost: 1064.02
  ├── G11: (inner-join G7 G5 G6) (inner-join G5 G7 G6) (merge-join G7 G5 G12 inner-join,+1,+10) (lookup-join G7 G12 parent1,keyCols=[1],outCols=(1-4,10,11)) (merge-join G5 G7 G12 inner-join,+10,+1) (lookup-join G5 G12 grandchild1,keyCols=[10],outCols=(1-4,10,11))
  │    ├── [ordering: +(1|10),+2]
  │    │    ├── best: (sort G11)
- │    │    └── cost: 2380.34
+ │    │    └── cost: 2388.34
  │    ├── [ordering: +(1|10)]
  │    │    ├── best: (merge-join G7="[ordering: +1]" G5="[ordering: +10]" G12 inner-join,+1,+10)
- │    │    └── cost: 2150.05
+ │    │    └── cost: 2158.05
  │    └── []
  │         ├── best: (merge-join G7="[ordering: +1]" G5="[ordering: +10]" G12 inner-join,+1,+10)
- │         └── cost: 2150.05
+ │         └── cost: 2158.05
  ├── G12: (filters)
  ├── G13: (eq G17 G18)
  ├── G14: (filters G19)
@@ -400,38 +390,38 @@ memo (optimized, ~24KB, required=[presentation: a:1,b:2,c:3,s:6,t:7,u:8,x:10,y:1
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4)
  │    └── [presentation: a:1,b:2,c:3,s:6,t:7,u:8,x:10,y:11,z:12,p:15,q:16,r:17,s:18,t:19]
  │         ├── best: (inner-join G3 G2 G4)
- │         └── cost: 325035476.19
+ │         └── cost: 325035492.19
  ├── G2: (select G5 G6) (scan abc@ab,cols=(1-3),constrained)
  │    └── []
  │         ├── best: (scan abc@ab,cols=(1-3),constrained)
- │         └── cost: 1.08
+ │         └── cost: 5.08
  ├── G3: (inner-join G7 G8 G4) (inner-join G8 G7 G4)
  │    └── []
  │         ├── best: (inner-join G8 G7 G4)
- │         └── cost: 100035475.08
+ │         └── cost: 100035487.08
  ├── G4: (filters)
  ├── G5: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G6: (filters G9)
  ├── G7: (scan stu,cols=(6-8)) (scan stu@uts,cols=(6-8))
  │    └── []
  │         ├── best: (scan stu,cols=(6-8))
- │         └── cost: 10600.02
+ │         └── cost: 10604.02
  ├── G8: (inner-join G10 G11 G4) (inner-join G11 G10 G4)
  │    └── []
  │         ├── best: (inner-join G10 G11 G4)
- │         └── cost: 12200.05
+ │         └── cost: 12208.05
  ├── G9: (eq G12 G13)
  ├── G10: (scan xyz,cols=(10-12)) (scan xyz@xy,cols=(10-12)) (scan xyz@yz,cols=(10-12))
  │    └── []
  │         ├── best: (scan xyz,cols=(10-12))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G11: (scan pqr,cols=(15-19))
  │    └── []
  │         ├── best: (scan pqr,cols=(15-19))
- │         └── cost: 1100.02
+ │         └── cost: 1104.02
  ├── G12: (variable a)
  └── G13: (const 1)
 
@@ -446,53 +436,53 @@ memo (optimized, ~31KB, required=[presentation: s:1,t:2,u:3,a:5,b:6,c:7,x:10,y:1
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (merge-join G2 G3 G5 inner-join,+3,+5) (merge-join G3 G2 G5 inner-join,+5,+3) (lookup-join G3 G5 stu@uts,keyCols=[5],outCols=(1-3,5-7,10-12,15-19))
  │    └── [presentation: s:1,t:2,u:3,a:5,b:6,c:7,x:10,y:11,z:12,p:15,q:16,r:17,s:18,t:19]
  │         ├── best: (merge-join G2="[ordering: +3]" G3="[ordering: +(5|10|15)]" G5 inner-join,+3,+5)
- │         └── cost: 14110.11
+ │         └── cost: 14126.11
  ├── G2: (scan stu,cols=(1-3)) (scan stu@uts,cols=(1-3))
  │    ├── [ordering: +3]
  │    │    ├── best: (scan stu@uts,cols=(1-3))
- │    │    └── cost: 10600.02
+ │    │    └── cost: 10604.02
  │    └── []
  │         ├── best: (scan stu,cols=(1-3))
- │         └── cost: 10600.02
+ │         └── cost: 10604.02
  ├── G3: (inner-join G6 G7 G8) (inner-join G7 G6 G8) (merge-join G6 G7 G5 inner-join,+5,+10) (merge-join G7 G6 G5 inner-join,+10,+5) (lookup-join G7 G5 abc@ab,keyCols=[10],outCols=(5-7,10-12,15-19))
  │    ├── [ordering: +(5|10|15)]
  │    │    ├── best: (merge-join G6="[ordering: +5]" G7="[ordering: +(10|15)]" G5 inner-join,+5,+10)
- │    │    └── cost: 3300.08
+ │    │    └── cost: 3312.08
  │    └── []
  │         ├── best: (merge-join G6="[ordering: +5]" G7="[ordering: +(10|15)]" G5 inner-join,+5,+10)
- │         └── cost: 3300.08
+ │         └── cost: 3312.08
  ├── G4: (filters G9)
  ├── G5: (filters)
  ├── G6: (scan abc,cols=(5-7)) (scan abc@ab,cols=(5-7)) (scan abc@bc,cols=(5-7))
  │    ├── [ordering: +5]
  │    │    ├── best: (scan abc@ab,cols=(5-7))
- │    │    └── cost: 1070.02
+ │    │    └── cost: 1074.02
  │    └── []
  │         ├── best: (scan abc,cols=(5-7))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G7: (inner-join G10 G11 G12) (inner-join G11 G10 G12) (merge-join G10 G11 G5 inner-join,+10,+15) (lookup-join G10 G5 pqr,keyCols=[10],outCols=(10-12,15-19)) (merge-join G11 G10 G5 inner-join,+15,+10) (lookup-join G11 G5 xyz@xy,keyCols=[15],outCols=(10-12,15-19))
  │    ├── [ordering: +(10|15)]
  │    │    ├── best: (merge-join G10="[ordering: +10]" G11="[ordering: +15]" G5 inner-join,+10,+15)
- │    │    └── cost: 2200.05
+ │    │    └── cost: 2208.05
  │    └── []
  │         ├── best: (merge-join G10="[ordering: +10]" G11="[ordering: +15]" G5 inner-join,+10,+15)
- │         └── cost: 2200.05
+ │         └── cost: 2208.05
  ├── G8: (filters G13)
  ├── G9: (eq G14 G15)
  ├── G10: (scan xyz,cols=(10-12)) (scan xyz@xy,cols=(10-12)) (scan xyz@yz,cols=(10-12))
  │    ├── [ordering: +10]
  │    │    ├── best: (scan xyz@xy,cols=(10-12))
- │    │    └── cost: 1070.02
+ │    │    └── cost: 1074.02
  │    └── []
  │         ├── best: (scan xyz,cols=(10-12))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G11: (scan pqr,cols=(15-19))
  │    ├── [ordering: +15]
  │    │    ├── best: (scan pqr,cols=(15-19))
- │    │    └── cost: 1100.02
+ │    │    └── cost: 1104.02
  │    └── []
  │         ├── best: (scan pqr,cols=(15-19))
- │         └── cost: 1100.02
+ │         └── cost: 1104.02
  ├── G12: (filters G16)
  ├── G13: (eq G15 G17)
  ├── G14: (variable u)
@@ -540,11 +530,11 @@ memo (optimized, ~13KB, required=[presentation: a:1,b:2,c:3,v:6,s:7,t:8,u:9])
  ├── G1: (inner-join-apply G2 G3 G4)
  │    └── [presentation: a:1,b:2,c:3,v:6,s:7,t:8,u:9]
  │         ├── best: (inner-join-apply G2 G3 G4)
- │         └── cost: 1164.53
+ │         └── cost: 1168.53
  ├── G2: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G3: (inner-join G5 G6 G7) (inner-join G6 G5 G7) (lookup-join G5 G8 stu,keyCols=[6],outCols=(6-9)) (merge-join G6 G5 G8 inner-join,+7,+6)
  │    └── []
  │         ├── best: (lookup-join G5 G8 stu,keyCols=[6],outCols=(6-9))
@@ -560,10 +550,10 @@ memo (optimized, ~13KB, required=[presentation: a:1,b:2,c:3,v:6,s:7,t:8,u:9])
  ├── G6: (scan stu,cols=(7-9)) (scan stu@uts,cols=(7-9))
  │    ├── [ordering: +7]
  │    │    ├── best: (scan stu,cols=(7-9))
- │    │    └── cost: 10600.02
+ │    │    └── cost: 10604.02
  │    └── []
  │         ├── best: (scan stu,cols=(7-9))
- │         └── cost: 10600.02
+ │         └── cost: 10604.02
  ├── G7: (filters G11)
  ├── G8: (filters)
  ├── G9: (eq G12 G13)
@@ -643,13 +633,16 @@ inner-join-apply
       └── a = column1
 
 opt expect=ReorderJoins format=hide-all
-SELECT *
-FROM abc
-LEFT JOIN stu
-ON a = s
+SELECT * FROM abc
+LEFT JOIN stu ON a = s
+LEFT JOIN small ON a = m
 ----
 left-join (merge)
- ├── scan abc@ab
+ ├── left-join (merge)
+ │    ├── scan abc@ab
+ │    ├── sort
+ │    │    └── scan small
+ │    └── filters (true)
  ├── scan stu
  └── filters (true)
 
@@ -1349,21 +1342,21 @@ memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (merge-join G2 G3 G5 inner-join,+1,+8) (lookup-join G3 G5 abc@ab,keyCols=[8],outCols=(1-3,6-8))
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (inner-join G2 G3 G4)
- │         └── cost: 2179.96
+ │         └── cost: 2187.96
  ├── G2: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    ├── [ordering: +1]
  │    │    ├── best: (scan abc@ab,cols=(1-3))
- │    │    └── cost: 1070.02
+ │    │    └── cost: 1074.02
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G3: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    ├── [ordering: +8]
  │    │    ├── best: (sort G3)
- │    │    └── cost: 1289.35
+ │    │    └── cost: 1293.35
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G4: (filters G6)
  ├── G5: (filters)
  ├── G6: (eq G7 G8)
@@ -1377,21 +1370,21 @@ memo (optimized, ~9KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G1: (full-join G2 G3 G4) (full-join G3 G2 G4) (merge-join G2 G3 G5 full-join,+1,+8)
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (full-join G2 G3 G4)
- │         └── cost: 2180.06
+ │         └── cost: 2188.06
  ├── G2: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    ├── [ordering: +1]
  │    │    ├── best: (scan abc@ab,cols=(1-3))
- │    │    └── cost: 1070.02
+ │    │    └── cost: 1074.02
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G3: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    ├── [ordering: +8]
  │    │    ├── best: (sort G3)
- │    │    └── cost: 1289.35
+ │    │    └── cost: 1293.35
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G4: (filters G6)
  ├── G5: (filters)
  ├── G6: (eq G7 G8)
@@ -1463,15 +1456,15 @@ memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G1: (inner-join G2 G3 G4) (lookup-join G2 G5 xyz@xy,keyCols=[1],outCols=(1-3,6-8))
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (lookup-join G2 G5 xyz@xy,keyCols=[1],outCols=(1-3,6-8))
- │         └── cost: 23150.03
+ │         └── cost: 23154.03
  ├── G2: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G3: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G4: (filters G6)
  ├── G5: (filters)
  ├── G6: (eq G7 G8)
@@ -1546,21 +1539,21 @@ memo (optimized, ~9KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G1: (left-join G2 G3 G4) (right-join G3 G2 G4) (merge-join G2 G3 G5 left-join,+1,+8)
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (left-join G2 G3 G4)
- │         └── cost: 2180.06
+ │         └── cost: 2188.06
  ├── G2: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    ├── [ordering: +1]
  │    │    ├── best: (scan abc@ab,cols=(1-3))
- │    │    └── cost: 1070.02
+ │    │    └── cost: 1074.02
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G3: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    ├── [ordering: +8]
  │    │    ├── best: (sort G3)
- │    │    └── cost: 1289.35
+ │    │    └── cost: 1293.35
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G4: (filters G6)
  ├── G5: (filters)
  ├── G6: (eq G7 G8)
@@ -1593,21 +1586,21 @@ memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G1: (left-join G2 G3 G4) (right-join G3 G2 G4) (lookup-join G2 G5 abc@ab,keyCols=[8],outCols=(1-3,6-8)) (merge-join G3 G2 G5 right-join,+1,+8)
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (left-join G2 G3 G4)
- │         └── cost: 2180.06
+ │         └── cost: 2188.06
  ├── G2: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    ├── [ordering: +8]
  │    │    ├── best: (sort G2)
- │    │    └── cost: 1289.35
+ │    │    └── cost: 1293.35
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G3: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    ├── [ordering: +1]
  │    │    ├── best: (scan abc@ab,cols=(1-3))
- │    │    └── cost: 1070.02
+ │    │    └── cost: 1074.02
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G4: (filters G6)
  ├── G5: (filters)
  ├── G6: (eq G7 G8)
@@ -1627,6 +1620,228 @@ left-join (hash)
  │    └── fd: ()-->(2)
  └── filters
       └── a:1 = z:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
+
+# -----------------------------------------------------
+# CommuteSemiJoin
+# -----------------------------------------------------
+
+exec-ddl
+CREATE TABLE def (d INT, e INT, f INT, PRIMARY KEY (d, e));
+----
+
+exec-ddl
+ALTER TABLE abc INJECT STATISTICS '[
+  {
+    "columns": ["a"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 100,
+    "distinct_count": 100
+  },
+  {
+    "columns": ["b"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 100,
+    "distinct_count": 100
+  }
+]'
+----
+
+exec-ddl
+ALTER TABLE def INJECT STATISTICS '[
+  {
+    "columns": ["d"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 10000
+  },
+  {
+    "columns": ["e"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 10000
+  }
+]'
+----
+
+# Test the CommuteSemiJoinRule creates an appropriate inner join.
+opt
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=f)
+----
+semi-join (hash)
+ ├── columns: a:1 b:2 c:3
+ ├── scan abc
+ │    └── columns: a:1 b:2 c:3
+ ├── scan def
+ │    └── columns: f:8
+ └── filters
+      └── a:1 = f:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
+
+# Test that we don't commute a SemiJoin when the On conditions are not
+# equalities. For example, in this test we have a Lt condition.
+opt expect-not=CommuteSemiJoin
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a < e)
+----
+semi-join (cross)
+ ├── columns: a:1 b:2 c:3
+ ├── scan abc
+ │    └── columns: a:1 b:2 c:3
+ ├── scan def
+ │    └── columns: e:7!null
+ └── filters
+      └── a:1 < e:7 [outer=(1,7), constraints=(/1: (/NULL - ]; /7: (/NULL - ])]
+
+# Test that we don't commute a SemiJoin when the On conditions are not
+# equalities. For example, in this test we have an Or condition.
+opt expect-not=CommuteSemiJoin
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=d OR c=e)
+----
+semi-join (cross)
+ ├── columns: a:1 b:2 c:3
+ ├── scan abc
+ │    └── columns: a:1 b:2 c:3
+ ├── scan def
+ │    ├── columns: d:6!null e:7!null
+ │    └── key: (6,7)
+ └── filters
+      └── (a:1 = d:6) OR (c:3 = e:7) [outer=(1,3,6,7)]
+
+opt disable=CommuteSemiJoin format=show-all
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=d AND c=e)
+----
+semi-join (lookup def)
+ ├── columns: a:1(int) b:2(int) c:3(int)
+ ├── key columns: [1 3] = [6 7]
+ ├── lookup columns are key
+ ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(3)=10, null(3)=0]
+ ├── cost: 511.050394
+ ├── prune: (2)
+ ├── interesting orderings: (+1,+2) (+2,+3)
+ ├── scan t.public.abc
+ │    ├── columns: t.public.abc.a:1(int) t.public.abc.b:2(int) t.public.abc.c:3(int)
+ │    ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(3)=10, null(3)=1]
+ │    ├── cost: 111.02
+ │    ├── prune: (1-3)
+ │    ├── interesting orderings: (+1,+2) (+2,+3)
+ │    └── unfiltered-cols: (1-5)
+ └── filters (true)
+
+# TODO(rytaft): See stats/join tests. Since we don't collect the stats properly
+# for SemiJoins, we prefer the InnerJoin plan over the SemiJoin one more times
+# than necessary.
+opt format=show-all
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=d AND c=e)
+----
+semi-join (lookup def)
+ ├── columns: a:1(int) b:2(int) c:3(int)
+ ├── key columns: [1 3] = [6 7]
+ ├── lookup columns are key
+ ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(3)=10, null(3)=0]
+ ├── cost: 511.050394
+ ├── prune: (2)
+ ├── interesting orderings: (+1,+2) (+2,+3)
+ ├── scan t.public.abc
+ │    ├── columns: t.public.abc.a:1(int) t.public.abc.b:2(int) t.public.abc.c:3(int)
+ │    ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(3)=10, null(3)=1]
+ │    ├── cost: 111.02
+ │    ├── prune: (1-3)
+ │    ├── interesting orderings: (+1,+2) (+2,+3)
+ │    └── unfiltered-cols: (1-5)
+ └── filters (true)
+
+exec-ddl
+CREATE TABLE customers (id INT PRIMARY KEY, name STRING)
+----
+
+exec-ddl
+CREATE TABLE orders (id INT PRIMARY KEY, cust_id INT REFERENCES customers (id), order_date DATE, INDEX (order_date) STORING (cust_id))
+----
+
+exec-ddl
+ALTER TABLE customers INJECT STATISTICS '[
+  {
+    "columns": ["id"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 100000,
+    "distinct_count": 100000
+  }
+]'
+----
+
+exec-ddl
+ALTER TABLE orders INJECT STATISTICS '[
+  {
+    "columns": ["id"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000000,
+    "distinct_count": 1000000
+  },
+  {
+    "columns": ["cust_id"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000000,
+    "distinct_count": 10000000
+  },
+  {
+    "columns": ["order_date"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000000,
+    "distinct_count": 1000000
+  }
+]'
+----
+
+opt disable=CommuteSemiJoin
+SELECT *
+FROM customers c
+WHERE EXISTS(SELECT * FROM orders o WHERE o.cust_id=c.id AND o.order_date='2019-01-01')
+----
+semi-join (merge)
+ ├── columns: id:1!null name:2
+ ├── left ordering: +1
+ ├── right ordering: +5
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── scan c
+ │    ├── columns: c.id:1!null name:2
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2)
+ │    └── ordering: +1
+ ├── sort
+ │    ├── columns: cust_id:5 order_date:6!null
+ │    ├── fd: ()-->(6)
+ │    ├── ordering: +5 opt(6) [actual: +5]
+ │    └── scan o@secondary
+ │         ├── columns: cust_id:5 order_date:6!null
+ │         ├── constraint: /6/4: [/'2019-01-01' - /'2019-01-01']
+ │         └── fd: ()-->(6)
+ └── filters (true)
+
+# The CommuteSemiJoin rule allows a much better plan because we can use
+# a lookup join.
+opt
+SELECT *
+FROM customers c
+WHERE EXISTS(SELECT * FROM orders o WHERE o.cust_id=c.id AND o.order_date='2019-01-01')
+----
+project
+ ├── columns: id:1!null name:2
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ └── inner-join (lookup customers)
+      ├── columns: c.id:1!null name:2 cust_id:5!null
+      ├── key columns: [5] = [1]
+      ├── lookup columns are key
+      ├── key: (5)
+      ├── fd: (1)-->(2), (1)==(5), (5)==(1)
+      ├── distinct-on
+      │    ├── columns: cust_id:5
+      │    ├── grouping columns: cust_id:5
+      │    ├── key: (5)
+      │    └── scan o@secondary
+      │         ├── columns: cust_id:5 order_date:6!null
+      │         ├── constraint: /6/4: [/'2019-01-01' - /'2019-01-01']
+      │         └── fd: ()-->(6)
+      └── filters (true)
 
 # --------------------------------------------------
 # GenerateMergeJoins
@@ -1655,21 +1870,21 @@ memo (optimized, ~12KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (merge-join G2 G3 G5 inner-join,+1,+6) (lookup-join G2 G5 xyz@xy,keyCols=[1],outCols=(1-3,6-8)) (merge-join G3 G2 G5 inner-join,+6,+1) (lookup-join G3 G5 abc@ab,keyCols=[6],outCols=(1-3,6-8))
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (merge-join G2="[ordering: +1]" G3="[ordering: +6]" G5 inner-join,+1,+6)
- │         └── cost: 2170.05
+ │         └── cost: 1197.05
  ├── G2: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    ├── [ordering: +1]
  │    │    ├── best: (scan abc@ab,cols=(1-3))
- │    │    └── cost: 1070.02
+ │    │    └── cost: 111.02
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 111.02
  ├── G3: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    ├── [ordering: +6]
  │    │    ├── best: (scan xyz@xy,cols=(6-8))
- │    │    └── cost: 1070.02
+ │    │    └── cost: 1074.02
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G4: (filters G6)
  ├── G5: (filters)
  ├── G6: (eq G7 G8)
@@ -1684,15 +1899,15 @@ memo (optimized, ~8KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G1: (inner-join G2 G3 G4)
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (inner-join G2 G3 G4)
- │         └── cost: 2180.06
+ │         └── cost: 1204.81
  ├── G2: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 111.02
  ├── G3: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G4: (filters G5)
  ├── G5: (eq G6 G7)
  ├── G6: (variable a)
@@ -1738,14 +1953,14 @@ SELECT * FROM abc JOIN xyz ON a=x AND b=y WHERE b=1 AND y=1
 inner-join (hash)
  ├── columns: a:1!null b:2!null c:3 x:6!null y:7!null z:8
  ├── fd: ()-->(2,7), (1)==(6), (6)==(1), (2)==(7), (7)==(2)
- ├── scan abc@bc
- │    ├── columns: a:1 b:2!null c:3
- │    ├── constraint: /2/3/4: [/1 - /1]
- │    └── fd: ()-->(2)
  ├── scan xyz@yz
  │    ├── columns: x:6 y:7!null z:8
  │    ├── constraint: /7/8/9: [/1 - /1]
  │    └── fd: ()-->(7)
+ ├── scan abc@bc
+ │    ├── columns: a:1 b:2!null c:3
+ │    ├── constraint: /2/3/4: [/1 - /1]
+ │    └── fd: ()-->(2)
  └── filters
       ├── a:1 = x:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
       └── b:2 = y:7 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
@@ -1758,27 +1973,27 @@ memo (optimized, ~15KB, required=[presentation: s:1,t:2,u:3,s:5,t:6,u:7])
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (merge-join G2 G3 G5 inner-join,+1,+2,+3,+5,+6,+7) (merge-join G2 G3 G5 inner-join,+3,+2,+1,+7,+6,+5) (lookup-join G2 G5 stu,keyCols=[1 2 3],outCols=(1-3,5-7)) (lookup-join G2 G5 stu@uts,keyCols=[3 2 1],outCols=(1-3,5-7)) (merge-join G3 G2 G5 inner-join,+5,+6,+7,+1,+2,+3) (merge-join G3 G2 G5 inner-join,+7,+6,+5,+3,+2,+1) (lookup-join G3 G5 stu,keyCols=[5 6 7],outCols=(1-3,5-7)) (lookup-join G3 G5 stu@uts,keyCols=[7 6 5],outCols=(1-3,5-7))
  │    └── [presentation: s:1,t:2,u:3,s:5,t:6,u:7]
  │         ├── best: (merge-join G2="[ordering: +1,+2,+3]" G3="[ordering: +5,+6,+7]" G5 inner-join,+1,+2,+3,+5,+6,+7)
- │         └── cost: 21400.05
+ │         └── cost: 21408.05
  ├── G2: (scan l,cols=(1-3)) (scan l@uts,cols=(1-3))
  │    ├── [ordering: +1,+2,+3]
  │    │    ├── best: (scan l,cols=(1-3))
- │    │    └── cost: 10600.02
+ │    │    └── cost: 10604.02
  │    ├── [ordering: +3,+2,+1]
  │    │    ├── best: (scan l@uts,cols=(1-3))
- │    │    └── cost: 10600.02
+ │    │    └── cost: 10604.02
  │    └── []
  │         ├── best: (scan l,cols=(1-3))
- │         └── cost: 10600.02
+ │         └── cost: 10604.02
  ├── G3: (scan r,cols=(5-7)) (scan r@uts,cols=(5-7))
  │    ├── [ordering: +5,+6,+7]
  │    │    ├── best: (scan r,cols=(5-7))
- │    │    └── cost: 10600.02
+ │    │    └── cost: 10604.02
  │    ├── [ordering: +7,+6,+5]
  │    │    ├── best: (scan r@uts,cols=(5-7))
- │    │    └── cost: 10600.02
+ │    │    └── cost: 10604.02
  │    └── []
  │         ├── best: (scan r,cols=(5-7))
- │         └── cost: 10600.02
+ │         └── cost: 10604.02
  ├── G4: (filters G6 G7 G8)
  ├── G5: (filters)
  ├── G6: (eq G9 G10)
@@ -1965,29 +2180,29 @@ memo (optimized, ~13KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4)
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (inner-join G3 G2 G4)
- │         └── cost: 2161.68
+ │         └── cost: 1208.58
  ├── G2: (select G5 G6) (select G7 G6) (select G8 G6)
  │    └── []
- │         ├── best: (select G8 G6)
- │         └── cost: 1069.23
+ │         ├── best: (select G7 G6)
+ │         └── cost: 112.03
  ├── G3: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
- │         └── cost: 1070.02
+ │         └── cost: 1074.02
  ├── G4: (filters)
  ├── G5: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 111.02
  ├── G6: (filters G9)
  ├── G7: (scan abc@ab,cols=(1-3),constrained)
  │    └── []
  │         ├── best: (scan abc@ab,cols=(1-3),constrained)
- │         └── cost: 1070.01
+ │         └── cost: 111.01
  ├── G8: (scan abc@bc,cols=(1-3),constrained)
  │    └── []
  │         ├── best: (scan abc@bc,cols=(1-3),constrained)
- │         └── cost: 1059.31
+ │         └── cost: 111.01
  ├── G9: (eq G10 G11)
  ├── G10: (variable a)
  └── G11: (variable b)
@@ -2002,16 +2217,16 @@ SELECT * FROM abc JOIN kfloat ON a=k
 memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,k:6])
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4)
  │    └── [presentation: a:1,b:2,c:3,k:6]
- │         ├── best: (inner-join G2 G3 G4)
- │         └── cost: 12120.06
+ │         ├── best: (inner-join G3 G2 G4)
+ │         └── cost: 2149.31
  ├── G2: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
- │         └── cost: 1070.02
+ │         └── cost: 111.02
  ├── G3: (scan kfloat,cols=(6))
  │    └── []
  │         ├── best: (scan kfloat,cols=(6))
- │         └── cost: 1020.02
+ │         └── cost: 1024.02
  ├── G4: (filters G5)
  ├── G5: (eq G6 G7)
  ├── G6: (variable a)
@@ -2090,6 +2305,32 @@ left-join (merge)
  │    └── filters (true)
  └── filters (true)
 
+# Generate a merge join with two partial indexes.
+
+exec-ddl
+CREATE TABLE partial_a (a INT, INDEX (a) WHERE a > 0)
+----
+
+exec-ddl
+CREATE TABLE partial_b (b INT, INDEX (b) WHERE b > 0)
+----
+
+opt
+SELECT a, b FROM partial_a JOIN partial_b ON a = b WHERE a > 0 AND b > 0
+----
+inner-join (merge)
+ ├── columns: a:1!null b:4!null
+ ├── left ordering: +1
+ ├── right ordering: +4
+ ├── fd: (1)==(4), (4)==(1)
+ ├── scan partial_a@secondary,partial
+ │    ├── columns: a:1!null
+ │    └── ordering: +1
+ ├── scan partial_b@secondary,partial
+ │    ├── columns: b:4!null
+ │    └── ordering: +4
+ └── filters (true)
+
 # --------------------------------------------------
 # GenerateLookupJoins
 # --------------------------------------------------
@@ -2124,6 +2365,18 @@ left-join (lookup abcd@secondary)
  ├── scan small
  │    └── columns: m:1 n:2
  └── filters (true)
+
+# Covering case, left-join, extra filter bound by index.
+opt
+SELECT a,b,n,m FROM small LEFT JOIN abcd ON a=m AND b>n
+----
+left-join (lookup abcd@secondary)
+ ├── columns: a:5 b:6 n:2 m:1
+ ├── key columns: [1] = [5]
+ ├── scan small
+ │    └── columns: m:1 n:2
+ └── filters
+      └── b:6 > n:2 [outer=(2,6), constraints=(/2: (/NULL - ]; /6: (/NULL - ])]
 
 # Non-covering case.
 opt
@@ -2451,15 +2704,15 @@ memo (optimized, ~8KB, required=[presentation: a:5,b:6,n:2,m:1])
  ├── G1: (inner-join G2 G3 G4)
  │    └── [presentation: a:5,b:6,n:2,m:1]
  │         ├── best: (inner-join G2 G3 G4)
- │         └── cost: 1079.17
+ │         └── cost: 1087.17
  ├── G2: (scan small,cols=(1,2))
  │    └── []
  │         ├── best: (scan small,cols=(1,2))
- │         └── cost: 10.52
+ │         └── cost: 14.52
  ├── G3: (scan abcd,cols=(5,6)) (scan abcd@secondary,cols=(5,6))
  │    └── []
  │         ├── best: (scan abcd@secondary,cols=(5,6))
- │         └── cost: 1050.02
+ │         └── cost: 1054.02
  ├── G4: (filters G5)
  ├── G5: (eq G6 G7)
  ├── G6: (variable a)
@@ -2988,6 +3241,292 @@ anti-join (hash)
       ├── m:1 = a:5 [outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
       └── n:2 = c:7 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
 
+# --------------------------------------------------
+# GenerateLookupJoinsWithFilter + Partial Indexes
+# --------------------------------------------------
+
+exec-ddl
+CREATE TABLE partial_tab (
+    k INT PRIMARY KEY,
+    i INT,
+    s STRING
+)
+----
+
+exec-ddl
+ALTER TABLE partial_tab INJECT STATISTICS '[
+  {
+    "columns": ["i"],
+    "created_at": "2018-05-01 1:00:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 10000
+  },
+  {
+    "columns": ["s"],
+    "created_at": "2018-05-01 1:00:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 50
+  }
+]'
+----
+
+# Storing the index predicate column.
+
+exec-ddl
+CREATE INDEX partial_idx ON partial_tab (i) STORING (s) WHERE s IN ('foo', 'bar', 'baz')
+----
+
+# Lookup inner-join with no remaining filters.
+opt expect=GenerateLookupJoinsWithFilter
+SELECT m FROM small JOIN partial_tab ON n = i WHERE s IN ('foo', 'bar', 'baz')
+----
+project
+ ├── columns: m:1
+ └── inner-join (lookup partial_tab@partial_idx,partial)
+      ├── columns: m:1 n:2!null i:6!null s:7!null
+      ├── key columns: [2] = [6]
+      ├── fd: (2)==(6), (6)==(2)
+      ├── scan small
+      │    └── columns: m:1 n:2
+      └── filters (true)
+
+# Lookup inner-join with remaining filters.
+opt expect=GenerateLookupJoinsWithFilter
+SELECT m FROM small JOIN partial_tab ON n = i WHERE s = 'foo'
+----
+project
+ ├── columns: m:1
+ └── inner-join (lookup partial_tab@partial_idx,partial)
+      ├── columns: m:1 n:2!null i:6!null s:7!null
+      ├── key columns: [2] = [6]
+      ├── fd: ()-->(7), (2)==(6), (6)==(2)
+      ├── scan small
+      │    └── columns: m:1 n:2
+      └── filters
+           └── s:7 = 'foo' [outer=(7), constraints=(/7: [/'foo' - /'foo']; tight), fd=()-->(7)]
+
+# Lookup semi-join.
+opt expect=GenerateLookupJoinsWithFilter
+SELECT m FROM small WHERE EXISTS (SELECT 1 FROM partial_tab WHERE s = 'foo' AND n = i)
+----
+project
+ ├── columns: m:1
+ └── semi-join (lookup partial_tab@partial_idx,partial)
+      ├── columns: m:1 n:2
+      ├── key columns: [2] = [6]
+      ├── scan small
+      │    └── columns: m:1 n:2
+      └── filters
+           └── s:7 = 'foo' [outer=(7), constraints=(/7: [/'foo' - /'foo']; tight), fd=()-->(7)]
+
+# Lookup anti-join.
+opt expect=GenerateLookupJoinsWithFilter
+SELECT m FROM small WHERE NOT EXISTS (SELECT 1 FROM partial_tab WHERE s = 'foo' AND n = i)
+----
+project
+ ├── columns: m:1
+ └── anti-join (lookup partial_tab@partial_idx,partial)
+      ├── columns: m:1 n:2
+      ├── key columns: [2] = [6]
+      ├── scan small
+      │    └── columns: m:1 n:2
+      └── filters
+           └── s:7 = 'foo' [outer=(7), constraints=(/7: [/'foo' - /'foo']; tight), fd=()-->(7)]
+
+# Do not generate a lookup join when the predicate is not implied by the filter.
+opt
+SELECT m FROM small JOIN partial_tab ON n = i WHERE s = 'not_implied'
+----
+project
+ ├── columns: m:1
+ └── inner-join (hash)
+      ├── columns: m:1 n:2!null i:6!null s:7!null
+      ├── fd: ()-->(7), (2)==(6), (6)==(2)
+      ├── select
+      │    ├── columns: i:6 s:7!null
+      │    ├── fd: ()-->(7)
+      │    ├── scan partial_tab
+      │    │    ├── columns: i:6 s:7
+      │    │    └── partial index predicates
+      │    │         └── partial_idx: filters
+      │    │              └── s:7 IN ('bar', 'baz', 'foo') [outer=(7), constraints=(/7: [/'bar' - /'bar'] [/'baz' - /'baz'] [/'foo' - /'foo']; tight)]
+      │    └── filters
+      │         └── s:7 = 'not_implied' [outer=(7), constraints=(/7: [/'not_implied' - /'not_implied']; tight), fd=()-->(7)]
+      ├── scan small
+      │    └── columns: m:1 n:2
+      └── filters
+           └── n:2 = i:6 [outer=(2,6), constraints=(/2: (/NULL - ]; /6: (/NULL - ]), fd=(2)==(6), (6)==(2)]
+
+exec-ddl
+DROP INDEX partial_idx
+----
+
+# Not storing the index predicate column.
+
+exec-ddl
+CREATE INDEX partial_idx ON partial_tab (i) WHERE s IN ('foo', 'bar', 'baz')
+----
+
+# The remaining filters are empty when the query filters exactly match the
+# partial index predicate.
+#
+# TODO(mgartner): The outer inner-join is not necessary here and should be
+# eliminated, like in EliminateIndexJoinInsideProject.
+opt expect=GenerateLookupJoinsWithFilter
+SELECT m FROM small JOIN partial_tab ON n = i WHERE s IN ('foo', 'bar', 'baz')
+----
+project
+ ├── columns: m:1
+ └── inner-join (lookup partial_tab)
+      ├── columns: m:1 n:2!null i:6!null s:7!null
+      ├── key columns: [5] = [5]
+      ├── lookup columns are key
+      ├── fd: (2)==(6), (6)==(2)
+      ├── inner-join (lookup partial_tab@partial_idx,partial)
+      │    ├── columns: m:1 n:2!null k:5!null i:6!null
+      │    ├── key columns: [2] = [6]
+      │    ├── fd: (5)-->(6), (2)==(6), (6)==(2)
+      │    ├── scan small
+      │    │    └── columns: m:1 n:2
+      │    └── filters (true)
+      └── filters (true)
+
+# The remaining filters are not empty when the query filters imply but do not
+# exactly match the partial index predicate.
+opt expect=GenerateLookupJoinsWithFilter
+SELECT m FROM small JOIN partial_tab ON n = i WHERE s = 'foo'
+----
+project
+ ├── columns: m:1
+ └── inner-join (lookup partial_tab)
+      ├── columns: m:1 n:2!null i:6!null s:7!null
+      ├── key columns: [5] = [5]
+      ├── lookup columns are key
+      ├── fd: ()-->(7), (2)==(6), (6)==(2)
+      ├── inner-join (lookup partial_tab@partial_idx,partial)
+      │    ├── columns: m:1 n:2!null k:5!null i:6!null
+      │    ├── key columns: [2] = [6]
+      │    ├── fd: (5)-->(6), (2)==(6), (6)==(2)
+      │    ├── scan small
+      │    │    └── columns: m:1 n:2
+      │    └── filters (true)
+      └── filters
+           └── s:7 = 'foo' [outer=(7), constraints=(/7: [/'foo' - /'foo']; tight), fd=()-->(7)]
+
+# Generate a lookup semi-join when the index does not cover "s", but the
+# reference to "s" no longer exists in the filters.
+opt expect=GenerateLookupJoinsWithFilter
+SELECT m FROM small WHERE EXISTS (SELECT 1 FROM partial_tab WHERE s IN ('foo', 'bar', 'baz') AND n = i)
+----
+project
+ ├── columns: m:1
+ └── semi-join (lookup partial_tab@partial_idx,partial)
+      ├── columns: m:1 n:2
+      ├── key columns: [2] = [6]
+      ├── scan small
+      │    └── columns: m:1 n:2
+      └── filters (true)
+
+# We should not generate a lookup semi-join when the index does not cover "s"
+# which is referenced in the remaining filter.
+opt expect-not=GenerateLookupJoinsWithFilter
+SELECT m FROM small WHERE EXISTS (SELECT 1 FROM partial_tab WHERE s = 'foo' AND n = i)
+----
+project
+ ├── columns: m:1
+ └── semi-join (hash)
+      ├── columns: m:1 n:2
+      ├── scan small
+      │    └── columns: m:1 n:2
+      ├── select
+      │    ├── columns: i:6 s:7!null
+      │    ├── fd: ()-->(7)
+      │    ├── index-join partial_tab
+      │    │    ├── columns: i:6 s:7
+      │    │    └── scan partial_tab@partial_idx,partial
+      │    │         ├── columns: k:5!null i:6
+      │    │         ├── key: (5)
+      │    │         └── fd: (5)-->(6)
+      │    └── filters
+      │         └── s:7 = 'foo' [outer=(7), constraints=(/7: [/'foo' - /'foo']; tight), fd=()-->(7)]
+      └── filters
+           └── n:2 = i:6 [outer=(2,6), constraints=(/2: (/NULL - ]; /6: (/NULL - ]), fd=(2)==(6), (6)==(2)]
+
+# Generate a lookup anti-join when the index does not cover "s", but the
+# reference to "s" no longer exists in the filters.
+opt expect=GenerateLookupJoinsWithFilter
+SELECT m FROM small WHERE NOT EXISTS (SELECT 1 FROM partial_tab WHERE s IN ('foo', 'bar', 'baz') AND n = i)
+----
+project
+ ├── columns: m:1
+ └── anti-join (lookup partial_tab@partial_idx,partial)
+      ├── columns: m:1 n:2
+      ├── key columns: [2] = [6]
+      ├── scan small
+      │    └── columns: m:1 n:2
+      └── filters (true)
+
+# We should not generate a lookup anti-join when the index does not cover "s"
+# which is referenced in the remaining filter.
+opt expect-not=GenerateLookupJoinsWithFilter
+SELECT m FROM small WHERE NOT EXISTS (SELECT 1 FROM partial_tab WHERE s = 'foo' AND n = i)
+----
+project
+ ├── columns: m:1
+ └── anti-join (hash)
+      ├── columns: m:1 n:2
+      ├── scan small
+      │    └── columns: m:1 n:2
+      ├── select
+      │    ├── columns: i:6 s:7!null
+      │    ├── fd: ()-->(7)
+      │    ├── index-join partial_tab
+      │    │    ├── columns: i:6 s:7
+      │    │    └── scan partial_tab@partial_idx,partial
+      │    │         ├── columns: k:5!null i:6
+      │    │         ├── key: (5)
+      │    │         └── fd: (5)-->(6)
+      │    └── filters
+      │         └── s:7 = 'foo' [outer=(7), constraints=(/7: [/'foo' - /'foo']; tight), fd=()-->(7)]
+      └── filters
+           └── n:2 = i:6 [outer=(2,6), constraints=(/2: (/NULL - ]; /6: (/NULL - ]), fd=(2)==(6), (6)==(2)]
+
+# A lookup semi-join on a partial index should have the same cost as a lookup
+# semi-join on a non-partial index.
+exec-ddl
+CREATE INDEX full_idx ON partial_tab (i)
+----
+
+opt format=show-cost
+SELECT m FROM small WHERE EXISTS (SELECT 1 FROM partial_tab WHERE n = i)
+----
+project
+ ├── columns: m:1
+ ├── cost: 234.836
+ └── semi-join (lookup partial_tab@full_idx)
+      ├── columns: m:1 n:2
+      ├── key columns: [2] = [6]
+      ├── cost: 234.726
+      ├── scan small
+      │    ├── columns: m:1 n:2
+      │    └── cost: 14.52
+      └── filters (true)
+
+opt format=show-cost
+SELECT m FROM small WHERE EXISTS (SELECT 1 FROM partial_tab WHERE s IN ('foo', 'bar', 'baz') AND n = i)
+----
+project
+ ├── columns: m:1
+ ├── cost: 234.836
+ └── semi-join (lookup partial_tab@partial_idx,partial)
+      ├── columns: m:1 n:2
+      ├── key columns: [2] = [6]
+      ├── cost: 234.726
+      ├── scan small
+      │    ├── columns: m:1 n:2
+      │    └── cost: 14.52
+      └── filters (true)
+
 # -------------------------------------------------------
 # GenerateInvertedJoins + GenerateInvertedJoinsFromSelect
 # -------------------------------------------------------
@@ -3075,13 +3614,13 @@ project
  ├── columns: name:15!null popn_per_sqkm:20
  ├── immutable
  ├── group-by
- │    ├── columns: name:15!null n.geom:16 sum:19
- │    ├── grouping columns: name:15!null n.geom:16
+ │    ├── columns: name:15!null n.geom:16!null sum:19
+ │    ├── grouping columns: name:15!null n.geom:16!null
  │    ├── immutable
  │    ├── key: (15,16)
  │    ├── fd: (15,16)-->(19)
  │    ├── inner-join (lookup nyc_census_blocks)
- │    │    ├── columns: popn_total:3 c.boroname:9!null c.geom:10 n.boroname:14!null name:15!null n.geom:16
+ │    │    ├── columns: popn_total:3 c.boroname:9!null c.geom:10!null n.boroname:14!null name:15!null n.geom:16!null
  │    │    ├── key columns: [1] = [1]
  │    │    ├── lookup columns are key
  │    │    ├── immutable
@@ -3098,7 +3637,7 @@ project
  │    │    │    │         └── (name:15 = 'Upper West Side') OR (name:15 = 'Upper East Side') [outer=(15), constraints=(/15: [/'Upper East Side' - /'Upper East Side'] [/'Upper West Side' - /'Upper West Side']; tight)]
  │    │    │    └── filters (true)
  │    │    └── filters
- │    │         ├── st_intersects(n.geom:16, c.geom:10) [outer=(10,16), immutable]
+ │    │         ├── st_intersects(n.geom:16, c.geom:10) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
  │    │         └── c.boroname:9 = n.boroname:14 [outer=(9,14), constraints=(/9: (/NULL - ]; /14: (/NULL - ]), fd=(9)==(14), (14)==(9)]
  │    └── aggregations
  │         └── sum [as=sum:19, outer=(3)]
@@ -3121,43 +3660,43 @@ memo (optimized, ~28KB, required=[presentation: name:15,popn_per_sqkm:20])
  ├── G1: (project G2 G3 name)
  │    └── [presentation: name:15,popn_per_sqkm:20]
  │         ├── best: (project G2 G3 name)
- │         └── cost: 7308.28
+ │         └── cost: 7312.15
  ├── G2: (group-by G4 G5 cols=(15,16))
  │    └── []
  │         ├── best: (group-by G4 G5 cols=(15,16))
- │         └── cost: 7308.23
+ │         └── cost: 7312.10
  ├── G3: (projections G6)
  ├── G4: (inner-join G7 G8 G9) (inner-join G8 G7 G9) (lookup-join G10 G11 nyc_neighborhoods,keyCols=[13],outCols=(3,9,10,14-16)) (lookup-join G12 G9 nyc_census_blocks,keyCols=[1],outCols=(3,9,10,14-16))
  │    └── []
  │         ├── best: (lookup-join G12 G9 nyc_census_blocks,keyCols=[1],outCols=(3,9,10,14-16))
- │         └── cost: 7301.98
+ │         └── cost: 7305.98
  ├── G5: (aggregations G13)
  ├── G6: (div G14 G15)
  ├── G7: (scan c,cols=(3,9,10))
  │    └── []
  │         ├── best: (scan c,cols=(3,9,10))
- │         └── cost: 43837.24
+ │         └── cost: 43841.24
  ├── G8: (select G16 G17)
  │    └── []
  │         ├── best: (select G16 G17)
- │         └── cost: 139.36
+ │         └── cost: 143.36
  ├── G9: (filters G18 G19)
  ├── G10: (inverted-join G7 G20 nyc_neighborhoods@nyc_neighborhoods_geo_idx)
  │    └── []
  │         ├── best: (inverted-join G7 G20 nyc_neighborhoods@nyc_neighborhoods_geo_idx)
- │         └── cost: 921807.54
+ │         └── cost: 921811.54
  ├── G11: (filters G18 G19 G21)
  ├── G12: (inverted-join G8 G20 nyc_census_blocks@nyc_census_blocks_geo_idx)
  │    └── []
  │         ├── best: (inverted-join G8 G20 nyc_census_blocks@nyc_census_blocks_geo_idx)
- │         └── cost: 1762.17
+ │         └── cost: 1766.17
  ├── G13: (sum G22)
  ├── G14: (variable sum)
  ├── G15: (div G23 G24)
  ├── G16: (scan n,cols=(14-16))
  │    └── []
  │         ├── best: (scan n,cols=(14-16))
- │         └── cost: 138.05
+ │         └── cost: 142.05
  ├── G17: (filters G21)
  ├── G18: (function G25 st_intersects)
  ├── G19: (eq G26 G27)
@@ -3189,7 +3728,7 @@ project
  ├── columns: name:15 boroname:9
  ├── immutable
  └── inner-join (lookup nyc_neighborhoods)
-      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
       ├── key columns: [13] = [13]
       ├── lookup columns are key
       ├── immutable
@@ -3201,7 +3740,7 @@ project
       │    │    └── columns: c.boroname:9 c.geom:10
       │    └── filters (true)
       └── filters
-           └── st_dwithin(c.geom:10, n.geom:16, 50.0) [outer=(10,16), immutable]
+           └── st_dwithin(c.geom:10, n.geom:16, 50.0) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
 
 # Same test as above, but with arguments commuted.
 opt expect=GenerateInvertedJoins
@@ -3215,7 +3754,7 @@ project
  ├── columns: name:15 boroname:9
  ├── immutable
  └── inner-join (lookup nyc_neighborhoods)
-      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
       ├── key columns: [13] = [13]
       ├── lookup columns are key
       ├── immutable
@@ -3227,7 +3766,7 @@ project
       │    │    └── columns: c.boroname:9 c.geom:10
       │    └── filters (true)
       └── filters
-           └── st_dwithin(n.geom:16, c.geom:10, 50.0) [outer=(10,16), immutable]
+           └── st_dwithin(n.geom:16, c.geom:10, 50.0) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
 
 opt expect=GenerateInvertedJoins
 SELECT
@@ -3240,7 +3779,7 @@ project
  ├── columns: name:15 boroname:9
  ├── immutable
  └── inner-join (lookup nyc_neighborhoods)
-      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
       ├── key columns: [13] = [13]
       ├── lookup columns are key
       ├── immutable
@@ -3252,7 +3791,7 @@ project
       │    │    └── columns: c.boroname:9 c.geom:10
       │    └── filters (true)
       └── filters
-           └── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable]
+           └── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
 
 # Same test as above, but with arguments commuted.
 opt expect=GenerateInvertedJoins
@@ -3266,7 +3805,7 @@ project
  ├── columns: name:15 boroname:9
  ├── immutable
  └── inner-join (lookup nyc_neighborhoods)
-      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
       ├── key columns: [13] = [13]
       ├── lookup columns are key
       ├── immutable
@@ -3278,7 +3817,59 @@ project
       │    │    └── columns: c.boroname:9 c.geom:10
       │    └── filters (true)
       └── filters
-           └── st_covers(n.geom:16, c.geom:10) [outer=(10,16), immutable]
+           └── st_covers(n.geom:16, c.geom:10) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+
+# Case for ST_DWithinExclusive.
+opt expect=GenerateInvertedJoins
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON ST_DWithinExclusive(c.geom, n.geom, 50)
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_dwithinexclusive(c.geom:10, n.geom:16, 50.0)
+      │    ├── scan c
+      │    │    └── columns: c.boroname:9 c.geom:10
+      │    └── filters (true)
+      └── filters
+           └── st_dwithinexclusive(c.geom:10, n.geom:16, 50.0) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+
+# Commuted version of previous test.
+opt expect=GenerateInvertedJoins
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON ST_DWithinExclusive(n.geom, c.geom, 50)
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_dwithin(c.geom:10, n.geom:16, 50.0)
+      │    ├── scan c
+      │    │    └── columns: c.boroname:9 c.geom:10
+      │    └── filters (true)
+      └── filters
+           └── st_dwithinexclusive(n.geom:16, c.geom:10, 50.0) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
 
 # Complex join filter.
 opt expect=GenerateInvertedJoins
@@ -3293,7 +3884,7 @@ project
  ├── columns: name:15 boroname:9
  ├── immutable
  └── inner-join (lookup nyc_neighborhoods)
-      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
       ├── key columns: [13] = [13]
       ├── lookup columns are key
       ├── immutable
@@ -3305,8 +3896,58 @@ project
       │    │    └── columns: c.boroname:9 c.geom:10
       │    └── filters (true)
       └── filters
-           ├── st_covers(n.geom:16, c.geom:10) [outer=(10,16), immutable]
-           └── st_dwithin(c.geom:10, n.geom:16, 50.0) OR st_intersects(n.geom:16, '0102000000020000000000000000000000000000000000000000000000000000000000000000000040') [outer=(10,16), immutable]
+           ├── st_covers(n.geom:16, c.geom:10) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+           └── st_dwithin(c.geom:10, n.geom:16, 50.0) OR st_intersects(n.geom:16, '0102000000020000000000000000000000000000000000000000000000000000000000000000000040') [outer=(10,16), immutable, constraints=(/16: (/NULL - ])]
+
+opt expect=GenerateInvertedJoins
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON ST_DFullyWithin(c.geom, n.geom, 50)
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_dfullywithin(c.geom:10, n.geom:16, 50.0)
+      │    ├── scan c
+      │    │    └── columns: c.boroname:9 c.geom:10
+      │    └── filters (true)
+      └── filters
+           └── st_dfullywithin(c.geom:10, n.geom:16, 50.0) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+
+opt expect=GenerateInvertedJoins
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON ST_DFullyWithinExclusive(c.geom, n.geom, 50)
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_dfullywithinexclusive(c.geom:10, n.geom:16, 50.0)
+      │    ├── scan c
+      │    │    └── columns: c.boroname:9 c.geom:10
+      │    └── filters (true)
+      └── filters
+           └── st_dfullywithinexclusive(c.geom:10, n.geom:16, 50.0) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
 
 opt expect=GenerateInvertedJoinsFromSelect
 SELECT
@@ -3321,17 +3962,17 @@ project
  ├── columns: name:15 boroname:9
  ├── immutable
  └── inner-join (lookup nyc_census_blocks)
-      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
       ├── key columns: [1] = [1]
       ├── lookup columns are key
       ├── immutable
       ├── inner-join (inverted-lookup nyc_census_blocks@nyc_census_blocks_geo_idx)
-      │    ├── columns: c.gid:1!null name:15 n.geom:16
+      │    ├── columns: c.gid:1!null name:15 n.geom:16!null
       │    ├── inverted-expr
       │    │    └── st_coveredby(n.geom:16, c.geom:10) AND st_coveredby('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', c.geom:10)
       │    ├── immutable
       │    ├── select
-      │    │    ├── columns: name:15 n.geom:16
+      │    │    ├── columns: name:15 n.geom:16!null
       │    │    ├── immutable
       │    │    ├── index-join nyc_neighborhoods
       │    │    │    ├── columns: name:15 n.geom:16
@@ -3339,21 +3980,23 @@ project
       │    │    │         ├── columns: n.gid:13!null
       │    │    │         ├── inverted expression: /18
       │    │    │         │    ├── tight: false
-      │    │    │         │    └── union spans: ["\x89", "\xfd ")
+      │    │    │         │    └── union spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
+      │    │    │         ├── pre-filterer expression
+      │    │    │         │    └── st_covers('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', n.geom:16)
       │    │    │         ├── key: (13)
       │    │    │         └── scan n@nyc_neighborhoods_geo_idx
       │    │    │              ├── columns: n.gid:13!null n.geom_inverted_key:18!null
       │    │    │              ├── inverted constraint: /18/13
-      │    │    │              │    └── spans: ["\x89", "\xfd ")
+      │    │    │              │    └── spans: ["B\x89", "B\xfd \x00\x00\x00\x00\x00\x00\x00")
       │    │    │              ├── flags: force-index=nyc_neighborhoods_geo_idx
       │    │    │              ├── key: (13)
       │    │    │              └── fd: (13)-->(18)
       │    │    └── filters
-      │    │         └── st_covers('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', n.geom:16) [outer=(16), immutable]
+      │    │         └── st_covers('0102000000020000000000000000000000000000000000000000000000000000000000000000000040', n.geom:16) [outer=(16), immutable, constraints=(/16: (/NULL - ])]
       │    └── filters (true)
       └── filters
-           ├── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable]
-           └── st_covers(c.geom:10, '0102000000020000000000000000000000000000000000000000000000000000000000000000000040') [outer=(10), immutable]
+           ├── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+           └── st_covers(c.geom:10, '0102000000020000000000000000000000000000000000000000000000000000000000000000000040') [outer=(10), immutable, constraints=(/10: (/NULL - ])]
 
 opt expect=GenerateInvertedJoinsFromSelect
 SELECT
@@ -3367,7 +4010,7 @@ project
  ├── immutable
  ├── fd: ()-->(9)
  └── inner-join (lookup nyc_neighborhoods)
-      ├── columns: c.boroname:9!null c.geom:10 name:15!null n.geom:16
+      ├── columns: c.boroname:9!null c.geom:10!null name:15!null n.geom:16!null
       ├── key columns: [13] = [13]
       ├── lookup columns are key
       ├── immutable
@@ -3386,12 +4029,12 @@ project
       │    │         └── c.boroname:9 = 'Manhattan' [outer=(9), constraints=(/9: [/'Manhattan' - /'Manhattan']; tight), fd=()-->(9)]
       │    └── filters (true)
       └── filters
-           ├── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable]
+           ├── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
            └── name:15 LIKE 'Upper%' [outer=(15), constraints=(/15: [/'Upper' - /'Uppes'); tight)]
 
 # It's not possible to generate an inverted join when there is an OR with a
 # non-geospatial function.
-opt expect=GenerateInvertedJoins
+opt expect-not=GenerateInvertedJoins
 SELECT
   n.name, c.boroname
 FROM nyc_census_blocks AS c
@@ -3412,618 +4055,861 @@ project
       └── filters
            └── st_covers(c.geom:10, n.geom:16) OR (name:15 LIKE 'Upper%') [outer=(10,15,16), immutable]
 
-# --------------------------------------------------
-# GenerateZigZagJoins
-# --------------------------------------------------
-
-# Simple zigzag case - where all requested columns are in the indexes being
-# joined.
-opt
-SELECT q,r FROM pqr WHERE q = 1 AND r = 2
-----
-inner-join (zigzag pqr@q pqr@r)
- ├── columns: q:2!null r:3!null
- ├── eq columns: [1] = [1]
- ├── left fixed columns: [2] = [1]
- ├── right fixed columns: [3] = [2]
- ├── fd: ()-->(2,3)
- └── filters
-      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
-      └── r:3 = 2 [outer=(3), constraints=(/3: [/2 - /2]; tight), fd=()-->(3)]
-
-opt
-SELECT q,r FROM pqr WHERE q = 1 AND r IS NULL
-----
-inner-join (zigzag pqr@q pqr@r)
- ├── columns: q:2!null r:3
- ├── eq columns: [1] = [1]
- ├── left fixed columns: [2] = [1]
- ├── right fixed columns: [3] = [NULL]
- ├── fd: ()-->(2,3)
- └── filters
-      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
-      └── r:3 IS NULL [outer=(3), constraints=(/3: [/NULL - /NULL]; tight), fd=()-->(3)]
-
-memo
-SELECT q,r FROM pqr WHERE q = 1 AND r = 2
-----
-memo (optimized, ~13KB, required=[presentation: q:2,r:3])
- ├── G1: (select G2 G3) (zigzag-join G3 pqr@q pqr@r) (select G4 G5) (select G6 G7) (select G8 G7)
- │    └── [presentation: q:2,r:3]
- │         ├── best: (zigzag-join G3 pqr@q pqr@r)
- │         └── cost: 1.93
- ├── G2: (scan pqr,cols=(2,3))
- │    └── []
- │         ├── best: (scan pqr,cols=(2,3))
- │         └── cost: 1070.02
- ├── G3: (filters G9 G10)
- ├── G4: (index-join G11 pqr,cols=(2,3))
- │    └── []
- │         ├── best: (index-join G11 pqr,cols=(2,3))
- │         └── cost: 51.22
- ├── G5: (filters G10)
- ├── G6: (index-join G12 pqr,cols=(2,3))
- │    └── []
- │         ├── best: (index-join G12 pqr,cols=(2,3))
- │         └── cost: 51.22
- ├── G7: (filters G9)
- ├── G8: (index-join G13 pqr,cols=(2,3))
- │    └── []
- │         ├── best: (index-join G13 pqr,cols=(2,3))
- │         └── cost: 51.32
- ├── G9: (eq G14 G15)
- ├── G10: (eq G16 G17)
- ├── G11: (scan pqr@q,cols=(1,2),constrained)
- │    └── []
- │         ├── best: (scan pqr@q,cols=(1,2),constrained)
- │         └── cost: 10.41
- ├── G12: (scan pqr@r,cols=(1,3),constrained)
- │    └── []
- │         ├── best: (scan pqr@r,cols=(1,3),constrained)
- │         └── cost: 10.41
- ├── G13: (scan pqr@rs,cols=(1,3),constrained)
- │    └── []
- │         ├── best: (scan pqr@rs,cols=(1,3),constrained)
- │         └── cost: 10.51
- ├── G14: (variable q)
- ├── G15: (const 1)
- ├── G16: (variable r)
- └── G17: (const 2)
-
-# Case where the fixed columns are extracted from a complicated expression.
-opt
-SELECT q,r FROM pqr WHERE q = 1 AND ((r < 1 AND r > 1) OR (r >= 2 AND r <= 2))
-----
-inner-join (zigzag pqr@q pqr@r)
- ├── columns: q:2!null r:3!null
- ├── eq columns: [1] = [1]
- ├── left fixed columns: [2] = [1]
- ├── right fixed columns: [3] = [2]
- ├── fd: ()-->(2,3)
- └── filters
-      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
-      └── ((r:3 < 1) AND (r:3 > 1)) OR ((r:3 >= 2) AND (r:3 <= 2)) [outer=(3), constraints=(/3: [/2 - /2]; tight), fd=()-->(3)]
-
-# Nested zigzag case - zigzag join needs to be wrapped in a lookup join to
-# satisfy required columns.
-opt
-SELECT q,r,s FROM pqr WHERE q = 1 AND r = 2
-----
-inner-join (lookup pqr)
- ├── columns: q:2!null r:3!null s:4
- ├── key columns: [1] = [1]
- ├── lookup columns are key
- ├── fd: ()-->(2,3)
- ├── inner-join (zigzag pqr@q pqr@r)
- │    ├── columns: p:1!null q:2!null r:3!null
- │    ├── eq columns: [1] = [1]
- │    ├── left fixed columns: [2] = [1]
- │    ├── right fixed columns: [3] = [2]
- │    ├── fd: ()-->(2,3)
- │    └── filters
- │         ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
- │         └── r:3 = 2 [outer=(3), constraints=(/3: [/2 - /2]; tight), fd=()-->(3)]
- └── filters (true)
-
-memo
-SELECT q,r,s FROM pqr WHERE q = 1 AND r = 2
-----
-memo (optimized, ~15KB, required=[presentation: q:2,r:3,s:4])
- ├── G1: (select G2 G3) (lookup-join G4 G5 pqr,keyCols=[1],outCols=(2-4)) (select G6 G7) (select G8 G9) (select G10 G9)
- │    └── [presentation: q:2,r:3,s:4]
- │         ├── best: (lookup-join G4 G5 pqr,keyCols=[1],outCols=(2-4))
- │         └── cost: 7.48
- ├── G2: (scan pqr,cols=(2-4))
- │    └── []
- │         ├── best: (scan pqr,cols=(2-4))
- │         └── cost: 1080.02
- ├── G3: (filters G11 G12)
- ├── G4: (zigzag-join G3 pqr@q pqr@r)
- │    └── []
- │         ├── best: (zigzag-join G3 pqr@q pqr@r)
- │         └── cost: 1.94
- ├── G5: (filters)
- ├── G6: (index-join G13 pqr,cols=(2-4))
- │    └── []
- │         ├── best: (index-join G13 pqr,cols=(2-4))
- │         └── cost: 51.32
- ├── G7: (filters G12)
- ├── G8: (index-join G14 pqr,cols=(2-4))
- │    └── []
- │         ├── best: (index-join G14 pqr,cols=(2-4))
- │         └── cost: 51.32
- ├── G9: (filters G11)
- ├── G10: (index-join G15 pqr,cols=(2-4))
- │    └── []
- │         ├── best: (index-join G15 pqr,cols=(2-4))
- │         └── cost: 51.52
- ├── G11: (eq G16 G17)
- ├── G12: (eq G18 G19)
- ├── G13: (scan pqr@q,cols=(1,2),constrained)
- │    └── []
- │         ├── best: (scan pqr@q,cols=(1,2),constrained)
- │         └── cost: 10.41
- ├── G14: (scan pqr@r,cols=(1,3),constrained)
- │    └── []
- │         ├── best: (scan pqr@r,cols=(1,3),constrained)
- │         └── cost: 10.41
- ├── G15: (scan pqr@rs,cols=(1,3,4),constrained)
- │    └── []
- │         ├── best: (scan pqr@rs,cols=(1,3,4),constrained)
- │         └── cost: 10.61
- ├── G16: (variable q)
- ├── G17: (const 1)
- ├── G18: (variable r)
- └── G19: (const 2)
-
-# Zigzag with fixed columns of different types.
-opt
-SELECT q,s FROM pqr WHERE q = 1 AND s = 'foo'
-----
-inner-join (zigzag pqr@q pqr@s)
- ├── columns: q:2!null s:4!null
- ├── eq columns: [1] = [1]
- ├── left fixed columns: [2] = [1]
- ├── right fixed columns: [4] = ['foo']
- ├── fd: ()-->(2,4)
- └── filters
-      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
-      └── s:4 = 'foo' [outer=(4), constraints=(/4: [/'foo' - /'foo']; tight), fd=()-->(4)]
-
-memo
-SELECT q,s FROM pqr WHERE q = 1 AND s = 'foo'
-----
-memo (optimized, ~11KB, required=[presentation: q:2,s:4])
- ├── G1: (select G2 G3) (zigzag-join G3 pqr@q pqr@s) (select G4 G5) (select G6 G7)
- │    └── [presentation: q:2,s:4]
- │         ├── best: (zigzag-join G3 pqr@q pqr@s)
- │         └── cost: 1.94
- ├── G2: (scan pqr,cols=(2,4))
- │    └── []
- │         ├── best: (scan pqr,cols=(2,4))
- │         └── cost: 1070.02
- ├── G3: (filters G8 G9)
- ├── G4: (index-join G10 pqr,cols=(2,4))
- │    └── []
- │         ├── best: (index-join G10 pqr,cols=(2,4))
- │         └── cost: 51.22
- ├── G5: (filters G9)
- ├── G6: (index-join G11 pqr,cols=(2,4))
- │    └── []
- │         ├── best: (index-join G11 pqr,cols=(2,4))
- │         └── cost: 51.32
- ├── G7: (filters G8)
- ├── G8: (eq G12 G13)
- ├── G9: (eq G14 G15)
- ├── G10: (scan pqr@q,cols=(1,2),constrained)
- │    └── []
- │         ├── best: (scan pqr@q,cols=(1,2),constrained)
- │         └── cost: 10.41
- ├── G11: (scan pqr@s,cols=(1,4),constrained)
- │    └── []
- │         ├── best: (scan pqr@s,cols=(1,4),constrained)
- │         └── cost: 10.51
- ├── G12: (variable q)
- ├── G13: (const 1)
- ├── G14: (variable s)
- └── G15: (const 'foo')
-
-# Zigzag with implicit equality column in addition to primary key:
-# indexes on (r,s) and (t,s) should be chosen even though s is not being fixed
-# in the ON clause.
-opt
-SELECT r,t FROM pqr WHERE r = 1 AND t = 'foo'
-----
-inner-join (zigzag pqr@rs pqr@ts)
- ├── columns: r:3!null t:5!null
- ├── eq columns: [4 1] = [4 1]
- ├── left fixed columns: [3] = [1]
- ├── right fixed columns: [5] = ['foo']
- ├── fd: ()-->(3,5)
- └── filters
-      ├── r:3 = 1 [outer=(3), constraints=(/3: [/1 - /1]; tight), fd=()-->(3)]
-      └── t:5 = 'foo' [outer=(5), constraints=(/5: [/'foo' - /'foo']; tight), fd=()-->(5)]
-
-memo
-SELECT r,t FROM pqr WHERE r = 1 AND t = 'foo'
-----
-memo (optimized, ~13KB, required=[presentation: r:3,t:5])
- ├── G1: (select G2 G3) (zigzag-join G3 pqr@rs pqr@ts) (select G4 G5) (select G6 G5) (select G7 G8)
- │    └── [presentation: r:3,t:5]
- │         ├── best: (zigzag-join G3 pqr@rs pqr@ts)
- │         └── cost: 1.95
- ├── G2: (scan pqr,cols=(3,5))
- │    └── []
- │         ├── best: (scan pqr,cols=(3,5))
- │         └── cost: 1070.02
- ├── G3: (filters G9 G10)
- ├── G4: (index-join G11 pqr,cols=(3,5))
- │    └── []
- │         ├── best: (index-join G11 pqr,cols=(3,5))
- │         └── cost: 51.22
- ├── G5: (filters G10)
- ├── G6: (index-join G12 pqr,cols=(3,5))
- │    └── []
- │         ├── best: (index-join G12 pqr,cols=(3,5))
- │         └── cost: 51.32
- ├── G7: (index-join G13 pqr,cols=(3,5))
- │    └── []
- │         ├── best: (index-join G13 pqr,cols=(3,5))
- │         └── cost: 51.32
- ├── G8: (filters G9)
- ├── G9: (eq G14 G15)
- ├── G10: (eq G16 G17)
- ├── G11: (scan pqr@r,cols=(1,3),constrained)
- │    └── []
- │         ├── best: (scan pqr@r,cols=(1,3),constrained)
- │         └── cost: 10.41
- ├── G12: (scan pqr@rs,cols=(1,3),constrained)
- │    └── []
- │         ├── best: (scan pqr@rs,cols=(1,3),constrained)
- │         └── cost: 10.51
- ├── G13: (scan pqr@ts,cols=(1,5),constrained)
- │    └── []
- │         ├── best: (scan pqr@ts,cols=(1,5),constrained)
- │         └── cost: 10.51
- ├── G14: (variable r)
- ├── G15: (const 1)
- ├── G16: (variable t)
- └── G17: (const 'foo')
-
-# Zigzag with choice between indexes for multiple equality predicates.
-opt
-SELECT p,q,r,s FROM pqr WHERE q = 1 AND r = 1 AND s = 'foo'
-----
-inner-join (zigzag pqr@q pqr@s)
- ├── columns: p:1!null q:2!null r:3!null s:4!null
- ├── eq columns: [1] = [1]
- ├── left fixed columns: [2] = [1]
- ├── right fixed columns: [4] = ['foo']
- ├── key: (1)
- ├── fd: ()-->(2-4)
- └── filters
-      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
-      ├── r:3 = 1 [outer=(3), constraints=(/3: [/1 - /1]; tight), fd=()-->(3)]
-      └── s:4 = 'foo' [outer=(4), constraints=(/4: [/'foo' - /'foo']; tight), fd=()-->(4)]
-
-# Don't generate a zigzag which has the PK as its equality columns against
-# nullable unique indexes where the primary key is not part of the indexed
-# columns.
-
-# Regression test for #36051: prior to fixing this, we would try to use the PK
-# as the equality column here, but it's not actually part of the key so we
-# can't zigzag on it.
-opt
-SELECT * FROM zz WHERE b IS NULL AND c = 2
-----
-select
- ├── columns: a:1!null b:2 c:3!null
- ├── cardinality: [0 - 1]
- ├── key: ()
- ├── fd: ()-->(1-3)
- ├── index-join zz
- │    ├── columns: a:1!null b:2 c:3
- │    ├── cardinality: [0 - 1]
- │    ├── key: ()
- │    ├── fd: ()-->(1-3)
- │    └── scan zz@idx_c
- │         ├── columns: a:1!null c:3!null
- │         ├── constraint: /3: [/2 - /2]
- │         ├── cardinality: [0 - 1]
- │         ├── key: ()
- │         └── fd: ()-->(1,3)
- └── filters
-      └── b:2 IS NULL [outer=(2), constraints=(/2: [/NULL - /NULL]; tight), fd=()-->(2)]
-
-memo
-SELECT p,q,r,s FROM pqr WHERE q = 1 AND r = 1 AND s = 'foo'
-----
-memo (optimized, ~31KB, required=[presentation: p:1,q:2,r:3,s:4])
- ├── G1: (select G2 G3) (lookup-join G4 G5 pqr,keyCols=[1],outCols=(1-4)) (zigzag-join G3 pqr@q pqr@s) (zigzag-join G3 pqr@q pqr@rs) (lookup-join G6 G7 pqr,keyCols=[1],outCols=(1-4)) (select G8 G9) (select G10 G11) (select G12 G7) (select G13 G7)
- │    └── [presentation: p:1,q:2,r:3,s:4]
- │         ├── best: (zigzag-join G3 pqr@q pqr@s)
- │         └── cost: 1.95
- ├── G2: (scan pqr,cols=(1-4))
- │    └── []
- │         ├── best: (scan pqr,cols=(1-4))
- │         └── cost: 1090.02
- ├── G3: (filters G14 G15 G16)
- ├── G4: (zigzag-join G17 pqr@q pqr@r)
- │    └── []
- │         ├── best: (zigzag-join G17 pqr@q pqr@r)
- │         └── cost: 1.94
- ├── G5: (filters G16)
- ├── G6: (zigzag-join G9 pqr@r pqr@s)
- │    └── []
- │         ├── best: (zigzag-join G9 pqr@r pqr@s)
- │         └── cost: 1.95
- ├── G7: (filters G14)
- ├── G8: (index-join G18 pqr,cols=(1-4))
- │    └── []
- │         ├── best: (index-join G18 pqr,cols=(1-4))
- │         └── cost: 51.42
- ├── G9: (filters G15 G16)
- ├── G10: (index-join G19 pqr,cols=(1-4))
- │    └── []
- │         ├── best: (index-join G19 pqr,cols=(1-4))
- │         └── cost: 51.42
- ├── G11: (filters G14 G16)
- ├── G12: (index-join G20 pqr,cols=(1-4))
- │    └── []
- │         ├── best: (index-join G20 pqr,cols=(1-4))
- │         └── cost: 15.48
- ├── G13: (index-join G21 pqr,cols=(1-4))
- │    └── []
- │         ├── best: (index-join G21 pqr,cols=(1-4))
- │         └── cost: 4.72
- ├── G14: (eq G22 G23)
- ├── G15: (eq G24 G23)
- ├── G16: (eq G25 G26)
- ├── G17: (filters G14 G15)
- ├── G18: (scan pqr@q,cols=(1,2),constrained)
- │    └── []
- │         ├── best: (scan pqr@q,cols=(1,2),constrained)
- │         └── cost: 10.41
- ├── G19: (scan pqr@r,cols=(1,3),constrained)
- │    └── []
- │         ├── best: (scan pqr@r,cols=(1,3),constrained)
- │         └── cost: 10.41
- ├── G20: (select G27 G28)
- │    └── []
- │         ├── best: (select G27 G28)
- │         └── cost: 10.73
- ├── G21: (scan pqr@rs,cols=(1,3,4),constrained)
- │    └── []
- │         ├── best: (scan pqr@rs,cols=(1,3,4),constrained)
- │         └── cost: 0.98
- ├── G22: (variable q)
- ├── G23: (const 1)
- ├── G24: (variable r)
- ├── G25: (variable s)
- ├── G26: (const 'foo')
- ├── G27: (scan pqr@s,cols=(1,3,4),constrained)
- │    └── []
- │         ├── best: (scan pqr@s,cols=(1,3,4),constrained)
- │         └── cost: 10.61
- └── G28: (filters G15)
-
-# Zigzag joins cannot be planned for indexes where equality columns do not
-# immediately follow fixed columns. Here, the only index on t is (t,s,p) and
-# s is not a fixed or equal column, so a zigzag join shouldn't be planned.
-opt
-SELECT q,t FROM pqr WHERE q = 1 AND t = 'foo'
-----
-select
- ├── columns: q:2!null t:5!null
- ├── fd: ()-->(2,5)
- ├── index-join pqr
- │    ├── columns: q:2 t:5
- │    ├── fd: ()-->(2)
- │    └── scan pqr@q
- │         ├── columns: p:1!null q:2!null
- │         ├── constraint: /2/1: [/1 - /1]
- │         ├── key: (1)
- │         └── fd: ()-->(2)
- └── filters
-      └── t:5 = 'foo' [outer=(5), constraints=(/5: [/'foo' - /'foo']; tight), fd=()-->(5)]
-
-memo
-SELECT q,t FROM pqr WHERE q = 1 AND t = 'foo'
-----
-memo (optimized, ~9KB, required=[presentation: q:2,t:5])
- ├── G1: (select G2 G3) (select G4 G5) (select G6 G7)
- │    └── [presentation: q:2,t:5]
- │         ├── best: (select G4 G5)
- │         └── cost: 51.34
- ├── G2: (scan pqr,cols=(2,5))
- │    └── []
- │         ├── best: (scan pqr,cols=(2,5))
- │         └── cost: 1070.02
- ├── G3: (filters G8 G9)
- ├── G4: (index-join G10 pqr,cols=(2,5))
- │    └── []
- │         ├── best: (index-join G10 pqr,cols=(2,5))
- │         └── cost: 51.22
- ├── G5: (filters G9)
- ├── G6: (index-join G11 pqr,cols=(2,5))
- │    └── []
- │         ├── best: (index-join G11 pqr,cols=(2,5))
- │         └── cost: 51.32
- ├── G7: (filters G8)
- ├── G8: (eq G12 G13)
- ├── G9: (eq G14 G15)
- ├── G10: (scan pqr@q,cols=(1,2),constrained)
- │    └── []
- │         ├── best: (scan pqr@q,cols=(1,2),constrained)
- │         └── cost: 10.41
- ├── G11: (scan pqr@ts,cols=(1,5),constrained)
- │    └── []
- │         ├── best: (scan pqr@ts,cols=(1,5),constrained)
- │         └── cost: 10.51
- ├── G12: (variable q)
- ├── G13: (const 1)
- ├── G14: (variable t)
- └── G15: (const 'foo')
-
-# Don't zigzag on two identical indexes.
-memo
-SELECT c FROM zz_redundant WHERE b = 1
-----
-memo (optimized, ~6KB, required=[presentation: c:3])
- ├── G1: (project G2 G3 c)
- │    └── [presentation: c:3]
- │         ├── best: (project G2 G3 c)
- │         └── cost: 10.62
- ├── G2: (select G4 G5) (scan zz_redundant@idx_u,cols=(2,3),constrained) (scan zz_redundant@idx_v,cols=(2,3),constrained)
- │    └── []
- │         ├── best: (scan zz_redundant@idx_u,cols=(2,3),constrained)
- │         └── cost: 10.51
- ├── G3: (projections)
- ├── G4: (scan zz_redundant,cols=(2,3)) (scan zz_redundant@idx_u,cols=(2,3)) (scan zz_redundant@idx_v,cols=(2,3))
- │    └── []
- │         ├── best: (scan zz_redundant,cols=(2,3))
- │         └── cost: 1050.02
- ├── G5: (filters G6)
- ├── G6: (eq G7 G8)
- ├── G7: (variable b)
- └── G8: (const 1)
-
-# GenerateZigzagJoins is disabled in the presence of a row-level locking clause.
-opt
-SELECT q,r FROM pqr WHERE q = 1 AND r = 2 FOR UPDATE
-----
-select
- ├── columns: q:2!null r:3!null
- ├── volatile
- ├── fd: ()-->(2,3)
- ├── index-join pqr
- │    ├── columns: q:2 r:3
- │    ├── volatile
- │    ├── fd: ()-->(2)
- │    └── scan pqr@q
- │         ├── columns: p:1!null q:2!null
- │         ├── constraint: /2/1: [/1 - /1]
- │         ├── locking: for-update
- │         ├── volatile
- │         ├── key: (1)
- │         └── fd: ()-->(2)
- └── filters
-      └── r:3 = 2 [outer=(3), constraints=(/3: [/2 - /2]; tight), fd=()-->(3)]
-
-# --------------------------------------------------
-# GenerateInvertedIndexZigzagJoins
-# --------------------------------------------------
-
-exec-ddl
-CREATE TABLE t5 (
-    a INT PRIMARY KEY,
-    b JSONB,
-    c INT,
-    INVERTED INDEX b_idx(b)
+# Semi-joins are supported by converting them to an inner join wrapped in
+# a DistinctOn and a Project.
+opt expect=(GenerateInvertedJoins,ConvertSemiToInnerJoin)
+SELECT *
+FROM nyc_census_blocks AS c
+WHERE EXISTS (
+  SELECT * FROM nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n WHERE ST_Covers(c.geom, n.geom)
 )
 ----
-
-# One path. Should generate a scan constrained on the inverted index.
-opt
-SELECT b,a FROM t5 WHERE b @> '{"a":1}'
-----
-index-join t5
- ├── columns: b:2 a:1!null
+project
+ ├── columns: gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 boroname:9 geom:10
  ├── immutable
  ├── key: (1)
- ├── fd: (1)-->(2)
- └── scan t5@b_idx
-      ├── columns: a:1!null
-      ├── constraint: /2/1: [/'{"a": 1}' - /'{"a": 1}']
-      └── key: (1)
+ ├── fd: (1)-->(2-10)
+ └── distinct-on
+      ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10!null
+      ├── grouping columns: c.gid:1!null
+      ├── internal-ordering: +1
+      ├── immutable
+      ├── key: (1)
+      ├── fd: (1)-->(2-10)
+      ├── inner-join (lookup nyc_neighborhoods)
+      │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10!null n.geom:16!null
+      │    ├── key columns: [13] = [13]
+      │    ├── lookup columns are key
+      │    ├── immutable
+      │    ├── fd: (1)-->(2-10)
+      │    ├── ordering: +1
+      │    ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10 n.gid:13!null
+      │    │    ├── inverted-expr
+      │    │    │    └── st_covers(c.geom:10, n.geom:16)
+      │    │    ├── key: (1,13)
+      │    │    ├── fd: (1)-->(2-10)
+      │    │    ├── ordering: +1
+      │    │    ├── scan c
+      │    │    │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10
+      │    │    │    ├── key: (1)
+      │    │    │    ├── fd: (1)-->(2-10)
+      │    │    │    └── ordering: +1
+      │    │    └── filters (true)
+      │    └── filters
+      │         └── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+      └── aggregations
+           ├── const-agg [as=blkid:2, outer=(2)]
+           │    └── blkid:2
+           ├── const-agg [as=popn_total:3, outer=(3)]
+           │    └── popn_total:3
+           ├── const-agg [as=popn_white:4, outer=(4)]
+           │    └── popn_white:4
+           ├── const-agg [as=popn_black:5, outer=(5)]
+           │    └── popn_black:5
+           ├── const-agg [as=popn_nativ:6, outer=(6)]
+           │    └── popn_nativ:6
+           ├── const-agg [as=popn_asian:7, outer=(7)]
+           │    └── popn_asian:7
+           ├── const-agg [as=popn_other:8, outer=(8)]
+           │    └── popn_other:8
+           ├── const-agg [as=c.boroname:9, outer=(9)]
+           │    └── c.boroname:9
+           └── const-agg [as=c.geom:10, outer=(10)]
+                └── c.geom:10
 
-opt
-SELECT b,a FROM t5 WHERE b @> '{"a":[[{"b":{"c":[{"d":"e"}]}}]]}'
-----
-index-join t5
- ├── columns: b:2 a:1!null
- ├── immutable
- ├── key: (1)
- ├── fd: (1)-->(2)
- └── scan t5@b_idx
-      ├── columns: a:1!null
-      ├── constraint: /2/1: [/'{"a": [[{"b": {"c": [{"d": "e"}]}}]]}' - /'{"a": [[{"b": {"c": [{"d": "e"}]}}]]}']
-      └── key: (1)
+# Anti-joins are supported by converting them to a paired-join consisting of
+# a left outer inverted join followed by a left anti lookup join.
 
-# Two paths. Should generate a zigzag join.
-opt
-SELECT b,a FROM t5 WHERE b @> '{"a":1, "c":2}'
+# Anti-join in which the right-hand side is a Scan.
+opt expect=GenerateInvertedJoins
+SELECT *
+FROM nyc_census_blocks AS c
+WHERE NOT EXISTS (
+  SELECT * FROM nyc_neighborhoods AS n WHERE ST_Covers(c.geom, n.geom)
+)
 ----
-inner-join (lookup t5)
- ├── columns: b:2 a:1!null
- ├── key columns: [1] = [1]
+anti-join (lookup nyc_neighborhoods)
+ ├── columns: gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 boroname:9 geom:10
+ ├── key columns: [13] = [13]
  ├── lookup columns are key
  ├── immutable
  ├── key: (1)
- ├── fd: (1)-->(2)
- ├── inner-join (zigzag t5@b_idx t5@b_idx)
- │    ├── columns: a:1!null
- │    ├── eq columns: [1] = [1]
- │    ├── left fixed columns: [2] = ['{"a": 1}']
- │    ├── right fixed columns: [2] = ['{"c": 2}']
+ ├── fd: (1)-->(2-10)
+ ├── left-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+ │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10 n.gid:13 continuation:19
+ │    ├── inverted-expr
+ │    │    └── st_covers(c.geom:10, n.geom:16)
+ │    ├── key: (1,13)
+ │    ├── fd: (1)-->(2-10), (13)-->(19)
+ │    ├── scan c
+ │    │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2-10)
  │    └── filters (true)
  └── filters
-      └── b:2 @> '{"a": 1, "c": 2}' [outer=(2), immutable]
+      └── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
 
-memo
-SELECT a FROM t5 WHERE b @> '{"a":1, "c":2}'
+# Anti-join in which the right-hand side is a Scan wrapped in a Select.
+# In this test, the nyc_neighborhoods.name column is needed for the predicate.
+opt expect=GenerateInvertedJoinsFromSelect
+SELECT boroname
+FROM nyc_census_blocks AS c
+WHERE NOT EXISTS (
+  SELECT 1 FROM nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n WHERE ST_Covers(c.geom, n.geom)
+  AND c.boroname = 'Manhattan' AND n.name LIKE 'Upper%'
+)
 ----
-memo (optimized, ~14KB, required=[presentation: a:1])
- ├── G1: (project G2 G3 a)
- │    └── [presentation: a:1]
- │         ├── best: (project G2 G3 a)
- │         └── cost: 100.53
- ├── G2: (select G4 G5) (lookup-join G6 G5 t5,keyCols=[1],outCols=(1,2)) (select G7 G5)
- │    └── []
- │         ├── best: (lookup-join G6 G5 t5,keyCols=[1],outCols=(1,2))
- │         └── cost: 100.40
- ├── G3: (projections)
- ├── G4: (scan t5,cols=(1,2))
- │    └── []
- │         ├── best: (scan t5,cols=(1,2))
- │         └── cost: 1050.02
- ├── G5: (filters G8)
- ├── G6: (zigzag-join G9 t5@b_idx t5@b_idx)
- │    └── []
- │         ├── best: (zigzag-join G9 t5@b_idx t5@b_idx)
- │         └── cost: 25.69
- ├── G7: (index-join G10 t5,cols=(1,2))
- │    └── []
- │         ├── best: (index-join G10 t5,cols=(1,2))
- │         └── cost: 565.58
- ├── G8: (contains G11 G12)
- ├── G9: (filters)
- ├── G10: (scan t5@b_idx,cols=(1),constrained)
- │    └── []
- │         ├── best: (scan t5@b_idx,cols=(1),constrained)
- │         └── cost: 114.45
- ├── G11: (variable b)
- └── G12: (const '{"a": 1, "c": 2}')
+project
+ ├── columns: boroname:9
+ ├── immutable
+ └── anti-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9 c.geom:10
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── left-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13 continuation:20
+      │    ├── inverted-expr
+      │    │    └── st_covers(c.geom:10, n.geom:16)
+      │    ├── fd: (13)-->(20)
+      │    ├── scan c
+      │    │    └── columns: c.boroname:9 c.geom:10
+      │    └── filters
+      │         └── c.boroname:9 = 'Manhattan' [outer=(9), constraints=(/9: [/'Manhattan' - /'Manhattan']; tight), fd=()-->(9)]
+      └── filters
+           ├── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+           └── name:15 LIKE 'Upper%' [outer=(15), constraints=(/15: [/'Upper' - /'Uppes'); tight)]
 
-# Three or more paths. Should generate zigzag joins.
+# Left joins are supported by converting them to a paired-join consisting of a
+# left outer inverted join followed by a left outer lookup join.
+opt expect=GenerateInvertedJoins
+SELECT *
+FROM nyc_census_blocks AS c
+LEFT JOIN nyc_neighborhoods AS n ON ST_Covers(c.geom, n.geom)
+----
+left-join (lookup nyc_neighborhoods)
+ ├── columns: gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 boroname:9 geom:10 gid:13 boroname:14 name:15 geom:16
+ ├── key columns: [13] = [13]
+ ├── lookup columns are key
+ ├── immutable
+ ├── key: (1,13)
+ ├── fd: (1)-->(2-10), (13)-->(14-16)
+ ├── left-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+ │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10 n.gid:13 continuation:19
+ │    ├── inverted-expr
+ │    │    └── st_covers(c.geom:10, n.geom:16)
+ │    ├── key: (1,13)
+ │    ├── fd: (1)-->(2-10), (13)-->(19)
+ │    ├── scan c
+ │    │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2-10)
+ │    └── filters (true)
+ └── filters
+      └── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+
+# Case with a CTE and GROUP BY wrapping the left join.
+opt expect=(GenerateInvertedJoins)
+WITH q AS (
+  SELECT * FROM nyc_census_blocks WHERE boroname = 'Manhattan'
+)
+SELECT count(*), (SELECT count(*) FROM q) FROM (
+  SELECT n.boroname
+  FROM q
+  LEFT JOIN nyc_neighborhoods AS n ON ST_Intersects(q.geom, n.geom)
+) GROUP BY boroname
+----
+with &1 (q)
+ ├── columns: count:29!null count:41
+ ├── immutable
+ ├── fd: ()-->(41)
+ ├── select
+ │    ├── columns: nyc_census_blocks.gid:1!null nyc_census_blocks.blkid:2 nyc_census_blocks.popn_total:3 nyc_census_blocks.popn_white:4 nyc_census_blocks.popn_black:5 nyc_census_blocks.popn_nativ:6 nyc_census_blocks.popn_asian:7 nyc_census_blocks.popn_other:8 nyc_census_blocks.boroname:9!null nyc_census_blocks.geom:10
+ │    ├── key: (1)
+ │    ├── fd: ()-->(9), (1)-->(2-8,10)
+ │    ├── scan nyc_census_blocks
+ │    │    ├── columns: nyc_census_blocks.gid:1!null nyc_census_blocks.blkid:2 nyc_census_blocks.popn_total:3 nyc_census_blocks.popn_white:4 nyc_census_blocks.popn_black:5 nyc_census_blocks.popn_nativ:6 nyc_census_blocks.popn_asian:7 nyc_census_blocks.popn_other:8 nyc_census_blocks.boroname:9 nyc_census_blocks.geom:10
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2-10)
+ │    └── filters
+ │         └── nyc_census_blocks.boroname:9 = 'Manhattan' [outer=(9), constraints=(/9: [/'Manhattan' - /'Manhattan']; tight), fd=()-->(9)]
+ └── project
+      ├── columns: count:41 count_rows:29!null
+      ├── immutable
+      ├── fd: ()-->(41)
+      ├── group-by
+      │    ├── columns: n.boroname:24 count_rows:29!null
+      │    ├── grouping columns: n.boroname:24
+      │    ├── immutable
+      │    ├── key: (24)
+      │    ├── fd: (24)-->(29)
+      │    ├── left-join (lookup nyc_neighborhoods)
+      │    │    ├── columns: geom:22 n.boroname:24 n.geom:26
+      │    │    ├── key columns: [23] = [23]
+      │    │    ├── lookup columns are key
+      │    │    ├── immutable
+      │    │    ├── left-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    │    │    ├── columns: geom:22 n.gid:23 continuation:42
+      │    │    │    ├── inverted-expr
+      │    │    │    │    └── st_intersects(geom:22, n.geom:26)
+      │    │    │    ├── fd: (23)-->(42)
+      │    │    │    ├── with-scan &1 (q)
+      │    │    │    │    ├── columns: geom:22
+      │    │    │    │    └── mapping:
+      │    │    │    │         └──  nyc_census_blocks.geom:10 => geom:22
+      │    │    │    └── filters (true)
+      │    │    └── filters
+      │    │         └── st_intersects(geom:22, n.geom:26) [outer=(22,26), immutable, constraints=(/22: (/NULL - ]; /26: (/NULL - ])]
+      │    └── aggregations
+      │         └── count-rows [as=count_rows:29]
+      └── projections
+           └── subquery [as=count:41, subquery]
+                └── scalar-group-by
+                     ├── columns: count_rows:40!null
+                     ├── cardinality: [1 - 1]
+                     ├── key: ()
+                     ├── fd: ()-->(40)
+                     ├── with-scan &1 (q)
+                     │    └── mapping:
+                     └── aggregations
+                          └── count-rows [as=count_rows:40]
+
+# Unable to use inverted index due to inner join on the right side.
 opt
-SELECT b,a FROM t5 WHERE b @> '{"a":[{"b":"c", "d":3}, 5]}'
+SELECT *
+FROM nyc_census_blocks AS c
+LEFT JOIN (
+  SELECT n1.*, n2.name FROM nyc_neighborhoods n1 JOIN nyc_neighborhoods n2 ON n1.boroname LIKE n2.boroname
+) AS n ON ST_Covers(c.geom, n.geom)
 ----
-inner-join (lookup t5)
- ├── columns: b:2 a:1!null
- ├── key columns: [1] = [1]
+project
+ ├── columns: gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 boroname:9 geom:10 gid:13 boroname:14 name:15 geom:16 name:21
+ ├── immutable
+ ├── fd: (1)-->(2-10), (13)-->(14-16)
+ └── left-join (cross)
+      ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10 n1.gid:13 n1.boroname:14 n1.name:15 n1.geom:16 n2.boroname:20 n2.name:21
+      ├── immutable
+      ├── fd: (1)-->(2-10), (13)-->(14-16)
+      ├── scan c
+      │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10
+      │    ├── key: (1)
+      │    └── fd: (1)-->(2-10)
+      ├── inner-join (cross)
+      │    ├── columns: n1.gid:13!null n1.boroname:14!null n1.name:15 n1.geom:16 n2.boroname:20!null n2.name:21
+      │    ├── fd: (13)-->(14-16)
+      │    ├── scan n1
+      │    │    ├── columns: n1.gid:13!null n1.boroname:14 n1.name:15 n1.geom:16
+      │    │    ├── key: (13)
+      │    │    └── fd: (13)-->(14-16)
+      │    ├── scan n2
+      │    │    └── columns: n2.boroname:20 n2.name:21
+      │    └── filters
+      │         └── n1.boroname:14 LIKE n2.boroname:20 [outer=(14,20), constraints=(/14: (/NULL - ]; /20: (/NULL - ])]
+      └── filters
+           └── st_covers(c.geom:10, n1.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+
+# Not using inverted index due to lack of geospatial function in the ON condition.
+opt
+SELECT *
+FROM nyc_census_blocks AS c
+LEFT JOIN nyc_neighborhoods AS n ON c.boroname LIKE n.boroname
+----
+left-join (cross)
+ ├── columns: gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 boroname:9 geom:10 gid:13 boroname:14 name:15 geom:16
+ ├── key: (1,13)
+ ├── fd: (1)-->(2-10), (13)-->(14-16)
+ ├── scan c
+ │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-10)
+ ├── scan n
+ │    ├── columns: n.gid:13!null n.boroname:14 name:15 n.geom:16
+ │    ├── key: (13)
+ │    └── fd: (13)-->(14-16)
+ └── filters
+      └── c.boroname:9 LIKE n.boroname:14 [outer=(9,14), constraints=(/9: (/NULL - ]; /14: (/NULL - ])]
+
+# Bounding box operations.
+opt expect=GenerateInvertedJoins
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON c.geom::box2d && n.geom
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_intersects(c.geom:10::BOX2D::GEOMETRY, n.geom:16)
+      │    ├── scan c
+      │    │    └── columns: c.boroname:9 c.geom:10
+      │    └── filters (true)
+      └── filters
+           └── c.geom:10::BOX2D && n.geom:16 [outer=(10,16), immutable]
+
+opt expect=GenerateInvertedJoins
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON c.geom::box2d ~ n.geom
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_covers(c.geom:10::BOX2D::GEOMETRY, n.geom:16)
+      │    ├── scan c
+      │    │    └── columns: c.boroname:9 c.geom:10
+      │    └── filters (true)
+      └── filters
+           └── c.geom:10::BOX2D ~ n.geom:16 [outer=(10,16), immutable]
+
+opt expect=GenerateInvertedJoins
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON n.geom ~ c.geom::box2d
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9 c.geom:10 name:15 n.geom:16!null
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_coveredby(c.geom:10::BOX2D::GEOMETRY, n.geom:16)
+      │    ├── scan c
+      │    │    └── columns: c.boroname:9 c.geom:10
+      │    └── filters (true)
+      └── filters
+           └── n.geom:16 ~ c.geom:10::BOX2D [outer=(10,16), immutable, constraints=(/16: (/NULL - ])]
+
+opt expect=GenerateInvertedJoins
+SELECT
+  n.name, c.boroname
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON n.geom ~ c.geom
+----
+project
+ ├── columns: name:15 boroname:9
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.boroname:9 c.geom:10!null name:15 n.geom:16!null
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx)
+      │    ├── columns: c.boroname:9 c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_coveredby(c.geom:10, n.geom:16)
+      │    ├── scan c
+      │    │    └── columns: c.boroname:9 c.geom:10
+      │    └── filters (true)
+      └── filters
+           └── n.geom:16 ~ c.geom:10 [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+
+# -------------------------------------------------------
+# GenerateInvertedJoinsFromSelect + Partial Indexes
+# -------------------------------------------------------
+
+exec-ddl
+DROP INDEX nyc_census_blocks_geo_idx
+----
+
+exec-ddl
+DROP INDEX nyc_neighborhoods_geo_idx
+----
+
+exec-ddl
+CREATE INVERTED INDEX nyc_neighborhoods_geo_idx ON nyc_neighborhoods (geom) WHERE boroname IN ('Manhattan', 'Brooklyn')
+----
+
+# Inverted inner-join with no remaining filters.
+opt expect=GenerateInvertedJoinsFromSelect
+SELECT c.gid
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON ST_Covers(c.geom, n.geom) AND n.boroname IN ('Manhattan', 'Brooklyn')
+----
+project
+ ├── columns: gid:1!null
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.gid:1!null c.geom:10!null n.boroname:14!null n.geom:16!null
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── fd: (1)-->(10)
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx,partial)
+      │    ├── columns: c.gid:1!null c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_covers(c.geom:10, n.geom:16)
+      │    ├── key: (1,13)
+      │    ├── fd: (1)-->(10)
+      │    ├── scan c
+      │    │    ├── columns: c.gid:1!null c.geom:10
+      │    │    ├── key: (1)
+      │    │    └── fd: (1)-->(10)
+      │    └── filters (true)
+      └── filters
+           └── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+
+# Inverted inner-join with remaining filters.
+opt expect=GenerateInvertedJoinsFromSelect
+SELECT c.gid
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n
+ON ST_Covers(c.geom, n.geom) AND n.boroname = 'Manhattan'
+----
+project
+ ├── columns: gid:1!null
+ ├── immutable
+ └── inner-join (lookup nyc_neighborhoods)
+      ├── columns: c.gid:1!null c.geom:10!null n.boroname:14!null n.geom:16!null
+      ├── key columns: [13] = [13]
+      ├── lookup columns are key
+      ├── immutable
+      ├── fd: ()-->(14), (1)-->(10)
+      ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx,partial)
+      │    ├── columns: c.gid:1!null c.geom:10 n.gid:13!null
+      │    ├── inverted-expr
+      │    │    └── st_covers(c.geom:10, n.geom:16)
+      │    ├── key: (1,13)
+      │    ├── fd: (1)-->(10)
+      │    ├── scan c
+      │    │    ├── columns: c.gid:1!null c.geom:10
+      │    │    ├── key: (1)
+      │    │    └── fd: (1)-->(10)
+      │    └── filters (true)
+      └── filters
+           ├── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+           └── n.boroname:14 = 'Manhattan' [outer=(14), constraints=(/14: [/'Manhattan' - /'Manhattan']; tight), fd=()-->(14)]
+
+# Inverted "semi-join".
+opt expect=(GenerateInvertedJoinsFromSelect,ConvertSemiToInnerJoin)
+SELECT *
+FROM nyc_census_blocks AS c
+WHERE EXISTS (
+  SELECT * FROM nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n WHERE ST_Covers(c.geom, n.geom) AND n.boroname = 'Manhattan'
+)
+----
+project
+ ├── columns: gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 boroname:9 geom:10
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-10)
+ └── distinct-on
+      ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10!null
+      ├── grouping columns: c.gid:1!null
+      ├── internal-ordering: +1 opt(14)
+      ├── immutable
+      ├── key: (1)
+      ├── fd: (1)-->(2-10)
+      ├── inner-join (lookup nyc_neighborhoods)
+      │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10!null n.boroname:14!null n.geom:16!null
+      │    ├── key columns: [13] = [13]
+      │    ├── lookup columns are key
+      │    ├── immutable
+      │    ├── fd: ()-->(14), (1)-->(2-10)
+      │    ├── ordering: +1 opt(14) [actual: +1]
+      │    ├── inner-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx,partial)
+      │    │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10 n.gid:13!null
+      │    │    ├── inverted-expr
+      │    │    │    └── st_covers(c.geom:10, n.geom:16)
+      │    │    ├── key: (1,13)
+      │    │    ├── fd: (1)-->(2-10)
+      │    │    ├── ordering: +1
+      │    │    ├── scan c
+      │    │    │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10
+      │    │    │    ├── key: (1)
+      │    │    │    ├── fd: (1)-->(2-10)
+      │    │    │    └── ordering: +1
+      │    │    └── filters (true)
+      │    └── filters
+      │         ├── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+      │         └── n.boroname:14 = 'Manhattan' [outer=(14), constraints=(/14: [/'Manhattan' - /'Manhattan']; tight), fd=()-->(14)]
+      └── aggregations
+           ├── const-agg [as=blkid:2, outer=(2)]
+           │    └── blkid:2
+           ├── const-agg [as=popn_total:3, outer=(3)]
+           │    └── popn_total:3
+           ├── const-agg [as=popn_white:4, outer=(4)]
+           │    └── popn_white:4
+           ├── const-agg [as=popn_black:5, outer=(5)]
+           │    └── popn_black:5
+           ├── const-agg [as=popn_nativ:6, outer=(6)]
+           │    └── popn_nativ:6
+           ├── const-agg [as=popn_asian:7, outer=(7)]
+           │    └── popn_asian:7
+           ├── const-agg [as=popn_other:8, outer=(8)]
+           │    └── popn_other:8
+           ├── const-agg [as=c.boroname:9, outer=(9)]
+           │    └── c.boroname:9
+           └── const-agg [as=c.geom:10, outer=(10)]
+                └── c.geom:10
+
+# Inverted "anti-join".
+opt expect=GenerateInvertedJoinsFromSelect
+SELECT *
+FROM nyc_census_blocks AS c
+WHERE NOT EXISTS (
+  SELECT * FROM nyc_neighborhoods@nyc_neighborhoods_geo_idx AS n WHERE ST_Covers(c.geom, n.geom) AND n.boroname = 'Manhattan'
+)
+----
+anti-join (lookup nyc_neighborhoods)
+ ├── columns: gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 boroname:9 geom:10
+ ├── key columns: [13] = [13]
  ├── lookup columns are key
  ├── immutable
  ├── key: (1)
- ├── fd: (1)-->(2)
- ├── inner-join (zigzag t5@b_idx t5@b_idx)
- │    ├── columns: a:1!null
- │    ├── eq columns: [1] = [1]
- │    ├── left fixed columns: [2] = ['{"a": [{"b": "c"}]}']
- │    ├── right fixed columns: [2] = ['{"a": [{"d": 3}]}']
+ ├── fd: (1)-->(2-10)
+ ├── left-join (inverted-lookup nyc_neighborhoods@nyc_neighborhoods_geo_idx,partial)
+ │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10 n.gid:13 continuation:20
+ │    ├── inverted-expr
+ │    │    └── st_covers(c.geom:10, n.geom:16)
+ │    ├── key: (1,13)
+ │    ├── fd: (1)-->(2-10), (13)-->(20)
+ │    ├── scan c
+ │    │    ├── columns: c.gid:1!null blkid:2 popn_total:3 popn_white:4 popn_black:5 popn_nativ:6 popn_asian:7 popn_other:8 c.boroname:9 c.geom:10
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2-10)
  │    └── filters (true)
  └── filters
-      └── b:2 @> '{"a": [{"b": "c", "d": 3}, 5]}' [outer=(2), immutable]
+      ├── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+      └── n.boroname:14 = 'Manhattan' [outer=(14), constraints=(/14: [/'Manhattan' - /'Manhattan']; tight), fd=()-->(14)]
+
+# Do no generate an inverted join when the predicate is not implied by the
+# filter.
+opt expect-not=(GenerateInvertedJoins,GenerateInvertedJoinsFromSelect)
+SELECT c.gid
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods AS n
+ON ST_Covers(c.geom, n.geom) AND n.boroname = 'Queens'
+----
+project
+ ├── columns: gid:1!null
+ ├── immutable
+ └── inner-join (cross)
+      ├── columns: c.gid:1!null c.geom:10!null n.boroname:14!null n.geom:16!null
+      ├── immutable
+      ├── fd: ()-->(14), (1)-->(10)
+      ├── scan c
+      │    ├── columns: c.gid:1!null c.geom:10
+      │    ├── key: (1)
+      │    └── fd: (1)-->(10)
+      ├── select
+      │    ├── columns: n.boroname:14!null n.geom:16
+      │    ├── fd: ()-->(14)
+      │    ├── scan n
+      │    │    ├── columns: n.boroname:14 n.geom:16
+      │    │    └── partial index predicates
+      │    │         └── nyc_neighborhoods_geo_idx: filters
+      │    │              └── n.boroname:14 IN ('Brooklyn', 'Manhattan') [outer=(14), constraints=(/14: [/'Brooklyn' - /'Brooklyn'] [/'Manhattan' - /'Manhattan']; tight)]
+      │    └── filters
+      │         └── n.boroname:14 = 'Queens' [outer=(14), constraints=(/14: [/'Queens' - /'Queens']; tight), fd=()-->(14)]
+      └── filters
+           └── st_covers(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+
+# -----------------------------------------------------
+# ConvertSemiToInnerJoin
+# -----------------------------------------------------
+
+# This rule applies when the On conditions are not equalities. For example,
+# in this test we have a Lt condition. It allows us to use a lookup join even
+# though the index is not covering.
+opt expect=ConvertSemiToInnerJoin
+SELECT * from pqr WHERE EXISTS (SELECT * FROM zz WHERE a = 0 AND q = b AND r < c)
+----
+project
+ ├── columns: p:1!null q:2 r:3 s:4 t:5
+ ├── key: (1)
+ ├── fd: (1)-->(2-5)
+ └── project
+      ├── columns: p:1!null q:2!null r:3!null s:4 t:5
+      ├── key: (1)
+      ├── fd: ()-->(2), (1)-->(3-5)
+      └── inner-join (lookup pqr)
+           ├── columns: p:1!null q:2!null r:3!null s:4 t:5 a:7!null b:8!null c:9!null
+           ├── key columns: [1] = [1]
+           ├── lookup columns are key
+           ├── key: (1)
+           ├── fd: ()-->(2,7-9), (1)-->(3-5), (2)==(8), (8)==(2)
+           ├── inner-join (lookup pqr@q)
+           │    ├── columns: p:1!null q:2!null a:7!null b:8!null c:9
+           │    ├── key columns: [8] = [2]
+           │    ├── key: (1)
+           │    ├── fd: ()-->(2,7-9), (2)==(8), (8)==(2)
+           │    ├── scan zz
+           │    │    ├── columns: a:7!null b:8 c:9
+           │    │    ├── constraint: /7: [/0 - /0]
+           │    │    ├── cardinality: [0 - 1]
+           │    │    ├── key: ()
+           │    │    └── fd: ()-->(7-9)
+           │    └── filters (true)
+           └── filters
+                └── r:3 < c:9 [outer=(3,9), constraints=(/3: (/NULL - ]; /9: (/NULL - ])]
+
+# In this test we have an Or condition.
+opt expect=ConvertSemiToInnerJoin
+SELECT * from pqr WHERE EXISTS (SELECT * FROM zz WHERE a = 0 AND q = b AND (p = a OR r = c))
+----
+project
+ ├── columns: p:1!null q:2 r:3 s:4 t:5
+ ├── key: (1)
+ ├── fd: (1)-->(2-5)
+ └── project
+      ├── columns: p:1!null q:2!null r:3 s:4 t:5
+      ├── key: (1)
+      ├── fd: ()-->(2), (1)-->(3-5)
+      └── inner-join (lookup pqr)
+           ├── columns: p:1!null q:2!null r:3 s:4 t:5 a:7!null b:8!null c:9
+           ├── key columns: [1] = [1]
+           ├── lookup columns are key
+           ├── key: (1)
+           ├── fd: ()-->(2,7-9), (1)-->(3-5), (2)==(8), (8)==(2)
+           ├── inner-join (lookup pqr@q)
+           │    ├── columns: p:1!null q:2!null a:7!null b:8!null c:9
+           │    ├── key columns: [8] = [2]
+           │    ├── key: (1)
+           │    ├── fd: ()-->(2,7-9), (2)==(8), (8)==(2)
+           │    ├── scan zz
+           │    │    ├── columns: a:7!null b:8 c:9
+           │    │    ├── constraint: /7: [/0 - /0]
+           │    │    ├── cardinality: [0 - 1]
+           │    │    ├── key: ()
+           │    │    └── fd: ()-->(7-9)
+           │    └── filters (true)
+           └── filters
+                └── (p:1 = 0) OR (r:3 = c:9) [outer=(1,3,9)]
+
+# In this case we need to add the key back to zz since it was pruned during
+# normalization.
+opt expect=ConvertSemiToInnerJoin
+SELECT b, c from zz WHERE EXISTS (SELECT * FROM pqr WHERE p = 0 AND q = b AND (p = c OR r = c))
+----
+project
+ ├── columns: b:2 c:3
+ ├── lax-key: (2,3)
+ ├── fd: (3)~~>(2)
+ └── project
+      ├── columns: a:1!null b:2!null c:3!null
+      ├── key: (1)
+      ├── fd: ()-->(2), (1)-->(3), (3)-->(1)
+      └── inner-join (lookup zz)
+           ├── columns: a:1!null b:2!null c:3!null p:5!null q:6!null r:7
+           ├── key columns: [1] = [1]
+           ├── lookup columns are key
+           ├── key: (1)
+           ├── fd: ()-->(2,5-7), (1)-->(3), (3)-->(1), (2)==(6), (6)==(2)
+           ├── inner-join (lookup zz@idx_b)
+           │    ├── columns: a:1!null b:2!null p:5!null q:6!null r:7
+           │    ├── key columns: [6] = [2]
+           │    ├── key: (1)
+           │    ├── fd: ()-->(2,5-7), (2)==(6), (6)==(2)
+           │    ├── scan pqr
+           │    │    ├── columns: p:5!null q:6 r:7
+           │    │    ├── constraint: /5: [/0 - /0]
+           │    │    ├── cardinality: [0 - 1]
+           │    │    ├── key: ()
+           │    │    └── fd: ()-->(5-7)
+           │    └── filters (true)
+           └── filters
+                └── (c:3 = 0) OR (r:7 = c:3) [outer=(3,7), constraints=(/3: (/NULL - ])]
+
+# --------------------------------------------------
+# PushJoinIntoIndexJoin
+# --------------------------------------------------
+
+opt expect=PushJoinIntoIndexJoin
+SELECT * FROM abc INNER JOIN (SELECT * FROM pqr ORDER BY q LIMIT 5) ON a=q
+----
+inner-join (lookup pqr)
+ ├── columns: a:1!null b:2 c:3 p:6!null q:7!null r:8 s:9 t:10
+ ├── key columns: [6] = [6]
+ ├── lookup columns are key
+ ├── fd: (6)-->(7-10), (1)==(7), (7)==(1)
+ ├── inner-join (lookup abc@ab)
+ │    ├── columns: a:1!null b:2 c:3 p:6!null q:7!null
+ │    ├── key columns: [7] = [1]
+ │    ├── fd: (6)-->(7), (1)==(7), (7)==(1)
+ │    ├── scan pqr@q
+ │    │    ├── columns: p:6!null q:7
+ │    │    ├── limit: 5
+ │    │    ├── key: (6)
+ │    │    └── fd: (6)-->(7)
+ │    └── filters (true)
+ └── filters (true)
+
+# Cross join case. The plan produced by PushJoinIntoIndexJoin isn't chosen
+# because the cross join doesn't filter rows.
+opt expect=PushJoinIntoIndexJoin
+SELECT * FROM abc CROSS JOIN (SELECT * FROM pqr ORDER BY q LIMIT 5)
+----
+inner-join (cross)
+ ├── columns: a:1 b:2 c:3 p:6!null q:7 r:8 s:9 t:10
+ ├── fd: (6)-->(7-10)
+ ├── scan abc
+ │    └── columns: a:1 b:2 c:3
+ ├── index-join pqr
+ │    ├── columns: p:6!null q:7 r:8 s:9 t:10
+ │    ├── cardinality: [0 - 5]
+ │    ├── key: (6)
+ │    ├── fd: (6)-->(7-10)
+ │    └── scan pqr@q
+ │         ├── columns: p:6!null q:7
+ │         ├── limit: 5
+ │         ├── key: (6)
+ │         └── fd: (6)-->(7)
+ └── filters (true)
+
+# No-op case because the index join is the right input of the LeftJoin.
+opt expect-not=PushJoinIntoIndexJoin
+SELECT * FROM abc LEFT JOIN (SELECT * FROM pqr ORDER BY q LIMIT 5) ON a=q
+----
+left-join (merge)
+ ├── columns: a:1 b:2 c:3 p:6 q:7 r:8 s:9 t:10
+ ├── left ordering: +1
+ ├── right ordering: +7
+ ├── fd: (6)-->(7-10)
+ ├── scan abc@ab
+ │    ├── columns: a:1 b:2 c:3
+ │    └── ordering: +1
+ ├── index-join pqr
+ │    ├── columns: p:6!null q:7 r:8 s:9 t:10
+ │    ├── cardinality: [0 - 5]
+ │    ├── key: (6)
+ │    ├── fd: (6)-->(7-10)
+ │    ├── ordering: +7
+ │    └── scan pqr@q
+ │         ├── columns: p:6!null q:7
+ │         ├── limit: 5
+ │         ├── key: (6)
+ │         ├── fd: (6)-->(7)
+ │         └── ordering: +7
+ └── filters (true)
+
+# No-op case because the InnerJoin has join hints.
+opt expect-not=PushJoinIntoIndexJoin
+SELECT * FROM (SELECT * FROM pqr ORDER BY q LIMIT 5) INNER HASH JOIN abc ON a=q
+----
+inner-join (hash)
+ ├── columns: p:1!null q:2!null r:3 s:4 t:5 a:7!null b:8 c:9
+ ├── flags: force hash join (store right side)
+ ├── fd: (1)-->(2-5), (2)==(7), (7)==(2)
+ ├── index-join pqr
+ │    ├── columns: p:1!null q:2 r:3 s:4 t:5
+ │    ├── cardinality: [0 - 5]
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-5)
+ │    └── scan pqr@q
+ │         ├── columns: p:1!null q:2
+ │         ├── limit: 5
+ │         ├── key: (1)
+ │         └── fd: (1)-->(2)
+ ├── scan abc
+ │    └── columns: a:7 b:8 c:9
+ └── filters
+      └── a:7 = q:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
+
+# No-op case because the ON condition references a column that doesn't come from
+# the input of the index join or the right side of the InnerJoin.
+opt expect-not=PushJoinIntoIndexJoin
+SELECT * FROM (SELECT * FROM pqr ORDER BY q LIMIT 5) INNER JOIN abc ON a=r
+----
+inner-join (lookup abc@ab)
+ ├── columns: p:1!null q:2 r:3!null s:4 t:5 a:7!null b:8 c:9
+ ├── key columns: [3] = [7]
+ ├── fd: (1)-->(2-5), (3)==(7), (7)==(3)
+ ├── index-join pqr
+ │    ├── columns: p:1!null q:2 r:3 s:4 t:5
+ │    ├── cardinality: [0 - 5]
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-5)
+ │    └── scan pqr@q
+ │         ├── columns: p:1!null q:2
+ │         ├── limit: 5
+ │         ├── key: (1)
+ │         └── fd: (1)-->(2)
+ └── filters (true)
+
+# No-op case because the right side of the InnerJoin has outer columns.
+opt expect-not=PushJoinIntoIndexJoin disable=(TryDecorrelateProject)
+SELECT * 
+FROM stu
+INNER JOIN LATERAL (
+   SELECT *
+   FROM (SELECT * FROM pqr ORDER BY q LIMIT 5)
+   INNER JOIN (SELECT *, a*s FROM abc)
+   ON a=q
+)
+ON True
+----
+inner-join-apply
+ ├── columns: s:1!null t:2!null u:3!null p:5!null q:6!null r:7 s:8 t:9 a:11!null b:12 c:13 "?column?":16
+ ├── immutable
+ ├── fd: (1-3,5)-->(6-9), (1-3,11)-->(16), (6)==(11), (11)==(6)
+ ├── scan stu
+ │    ├── columns: stu.s:1!null stu.t:2!null u:3!null
+ │    └── key: (1-3)
+ ├── inner-join (merge)
+ │    ├── columns: p:5!null q:6!null r:7 pqr.s:8 pqr.t:9 a:11!null b:12 c:13 "?column?":16
+ │    ├── left ordering: +6
+ │    ├── right ordering: +11
+ │    ├── outer: (1)
+ │    ├── immutable
+ │    ├── fd: (5)-->(6-9), (11)-->(16), (6)==(11), (11)==(6)
+ │    ├── index-join pqr
+ │    │    ├── columns: p:5!null q:6 r:7 pqr.s:8 pqr.t:9
+ │    │    ├── cardinality: [0 - 5]
+ │    │    ├── key: (5)
+ │    │    ├── fd: (5)-->(6-9)
+ │    │    ├── ordering: +6
+ │    │    └── scan pqr@q
+ │    │         ├── columns: p:5!null q:6
+ │    │         ├── limit: 5
+ │    │         ├── key: (5)
+ │    │         ├── fd: (5)-->(6)
+ │    │         └── ordering: +6
+ │    ├── project
+ │    │    ├── columns: "?column?":16 a:11 b:12 c:13
+ │    │    ├── outer: (1)
+ │    │    ├── immutable
+ │    │    ├── fd: (11)-->(16)
+ │    │    ├── ordering: +11
+ │    │    ├── scan abc@ab
+ │    │    │    ├── columns: a:11 b:12 c:13
+ │    │    │    └── ordering: +11
+ │    │    └── projections
+ │    │         └── a:11 * stu.s:1 [as="?column?":16, outer=(1,11), immutable]
+ │    └── filters (true)
+ └── filters (true)
+
+# --------------------------------------------------
+# Misc
+# --------------------------------------------------
 
 # Regression test for issue where zero-column expressions could exist multiple
 # times in the tree, causing collisions.
@@ -4299,415 +5185,3 @@ union-all
       │    └── filters (true)
       └── projections
            └── 1 [as="?column?":6]
-
-exec-ddl
-CREATE TABLE def (d INT, e INT, f INT, PRIMARY KEY (d, e));
-----
-
-exec-ddl
-ALTER TABLE abc INJECT STATISTICS '[
-  {
-    "columns": ["a"],
-    "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 100,
-    "distinct_count": 100
-  },
-  {
-    "columns": ["a"],
-    "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 100,
-    "distinct_count": 100
-  }
-]'
-----
-
-exec-ddl
-ALTER TABLE def INJECT STATISTICS '[
-  {
-    "columns": ["d"],
-    "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 10000,
-    "distinct_count": 10000
-  },
-  {
-    "columns": ["e"],
-    "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 10000,
-    "distinct_count": 10000
-  }
-]'
-----
-
-# Test the CommuteSemiJoinRule creates an appropriate inner join.
-opt
-SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=f)
-----
-semi-join (hash)
- ├── columns: a:1 b:2 c:3
- ├── scan abc
- │    └── columns: a:1 b:2 c:3
- ├── scan def
- │    └── columns: f:8
- └── filters
-      └── a:1 = f:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
-
-# Test that we don't commute a SemiJoin when the On conditions are not
-# equalities. For example, in this test we have a Lt condition.
-opt expect-not=CommuteSemiJoin
-SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a < e)
-----
-semi-join (cross)
- ├── columns: a:1 b:2 c:3
- ├── scan abc
- │    └── columns: a:1 b:2 c:3
- ├── scan def
- │    └── columns: e:7!null
- └── filters
-      └── a:1 < e:7 [outer=(1,7), constraints=(/1: (/NULL - ]; /7: (/NULL - ])]
-
-# Test that we don't commute a SemiJoin when the On conditions are not
-# equalities. For example, in this test we have an Or condition.
-opt expect-not=CommuteSemiJoin
-SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=d OR c=e)
-----
-semi-join (cross)
- ├── columns: a:1 b:2 c:3
- ├── scan abc
- │    └── columns: a:1 b:2 c:3
- ├── scan def
- │    ├── columns: d:6!null e:7!null
- │    └── key: (6,7)
- └── filters
-      └── (a:1 = d:6) OR (c:3 = e:7) [outer=(1,3,6,7)]
-
-opt disable=CommuteSemiJoin format=show-all
-SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=d AND c=e)
-----
-semi-join (lookup def)
- ├── columns: a:1(int) b:2(int) c:3(int)
- ├── key columns: [1 3] = [6 7]
- ├── lookup columns are key
- ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(3)=10, null(3)=0]
- ├── cost: 507.050394
- ├── prune: (2)
- ├── interesting orderings: (+1,+2) (+2,+3)
- ├── scan t.public.abc
- │    ├── columns: t.public.abc.a:1(int) t.public.abc.b:2(int) t.public.abc.c:3(int)
- │    ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(3)=10, null(3)=1]
- │    ├── cost: 107.02
- │    ├── prune: (1-3)
- │    ├── interesting orderings: (+1,+2) (+2,+3)
- │    └── unfiltered-cols: (1-5)
- └── filters (true)
-
-# TODO(rytaft): See stats/join tests. Since we don't collect the stats properly
-# for SemiJoins, we prefer the InnerJoin plan over the SemiJoin one more times
-# than necessary.
-opt format=show-all
-SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=d AND c=e)
-----
-semi-join (lookup def)
- ├── columns: a:1(int) b:2(int) c:3(int)
- ├── key columns: [1 3] = [6 7]
- ├── lookup columns are key
- ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(3)=10, null(3)=0]
- ├── cost: 507.050394
- ├── prune: (2)
- ├── interesting orderings: (+1,+2) (+2,+3)
- ├── scan t.public.abc
- │    ├── columns: t.public.abc.a:1(int) t.public.abc.b:2(int) t.public.abc.c:3(int)
- │    ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(3)=10, null(3)=1]
- │    ├── cost: 107.02
- │    ├── prune: (1-3)
- │    ├── interesting orderings: (+1,+2) (+2,+3)
- │    └── unfiltered-cols: (1-5)
- └── filters (true)
-
-exec-ddl
-CREATE TABLE customers (id INT PRIMARY KEY, name STRING)
-----
-
-exec-ddl
-CREATE TABLE orders (id INT PRIMARY KEY, cust_id INT REFERENCES customers (id), order_date DATE, INDEX (order_date) STORING (cust_id))
-----
-
-exec-ddl
-ALTER TABLE customers INJECT STATISTICS '[
-  {
-    "columns": ["id"],
-    "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 100000,
-    "distinct_count": 100000
-  }
-]'
-----
-
-exec-ddl
-ALTER TABLE orders INJECT STATISTICS '[
-  {
-    "columns": ["id"],
-    "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 1000000,
-    "distinct_count": 1000000
-  },
-  {
-    "columns": ["cust_id"],
-    "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 1000000,
-    "distinct_count": 10000000
-  },
-  {
-    "columns": ["order_date"],
-    "created_at": "2018-01-01 1:00:00.00000+00:00",
-    "row_count": 1000000,
-    "distinct_count": 1000000
-  }
-]'
-----
-
-opt disable=CommuteSemiJoin
-SELECT *
-FROM customers c
-WHERE EXISTS(SELECT * FROM orders o WHERE o.cust_id=c.id AND o.order_date='2019-01-01')
-----
-semi-join (merge)
- ├── columns: id:1!null name:2
- ├── left ordering: +1
- ├── right ordering: +5
- ├── key: (1)
- ├── fd: (1)-->(2)
- ├── scan c
- │    ├── columns: c.id:1!null name:2
- │    ├── key: (1)
- │    ├── fd: (1)-->(2)
- │    └── ordering: +1
- ├── sort
- │    ├── columns: cust_id:5 order_date:6!null
- │    ├── fd: ()-->(6)
- │    ├── ordering: +5 opt(6) [actual: +5]
- │    └── scan o@secondary
- │         ├── columns: cust_id:5 order_date:6!null
- │         ├── constraint: /6/4: [/'2019-01-01' - /'2019-01-01']
- │         └── fd: ()-->(6)
- └── filters (true)
-
-# The CommuteSemiJoin rule allows a much better plan because we can use
-# a lookup join.
-opt
-SELECT *
-FROM customers c
-WHERE EXISTS(SELECT * FROM orders o WHERE o.cust_id=c.id AND o.order_date='2019-01-01')
-----
-project
- ├── columns: id:1!null name:2
- ├── key: (1)
- ├── fd: (1)-->(2)
- └── inner-join (lookup customers)
-      ├── columns: c.id:1!null name:2 cust_id:5!null
-      ├── key columns: [5] = [1]
-      ├── lookup columns are key
-      ├── key: (5)
-      ├── fd: (1)-->(2), (1)==(5), (5)==(1)
-      ├── distinct-on
-      │    ├── columns: cust_id:5
-      │    ├── grouping columns: cust_id:5
-      │    ├── key: (5)
-      │    └── scan o@secondary
-      │         ├── columns: cust_id:5 order_date:6!null
-      │         ├── constraint: /6/4: [/'2019-01-01' - /'2019-01-01']
-      │         └── fd: ()-->(6)
-      └── filters (true)
-
-# GenerateInvertedIndexZigzagJoins is disabled in the presence of a row-level
-# locking clause.
-opt
-SELECT b,a FROM t5 WHERE b @> '{"a":1, "c":2}' FOR UPDATE
-----
-select
- ├── columns: b:2 a:1!null
- ├── volatile
- ├── key: (1)
- ├── fd: (1)-->(2)
- ├── index-join t5
- │    ├── columns: a:1!null b:2
- │    ├── volatile
- │    ├── key: (1)
- │    ├── fd: (1)-->(2)
- │    └── scan t5@b_idx
- │         ├── columns: a:1!null
- │         ├── constraint: /2/1: [/'{"a": 1}' - /'{"a": 1}']
- │         ├── locking: for-update
- │         ├── volatile
- │         └── key: (1)
- └── filters
-      └── b:2 @> '{"a": 1, "c": 2}' [outer=(2), immutable]
-
-# --------------------------------------------------
-# PushJoinIntoIndexJoin
-# --------------------------------------------------
-
-opt expect=PushJoinIntoIndexJoin
-SELECT * FROM abc INNER JOIN (SELECT * FROM pqr ORDER BY q LIMIT 5) ON a=q
-----
-inner-join (lookup pqr)
- ├── columns: a:1!null b:2 c:3 p:6!null q:7!null r:8 s:9 t:10
- ├── key columns: [6] = [6]
- ├── lookup columns are key
- ├── fd: (6)-->(7-10), (1)==(7), (7)==(1)
- ├── inner-join (lookup abc@ab)
- │    ├── columns: a:1!null b:2 c:3 p:6!null q:7!null
- │    ├── key columns: [7] = [1]
- │    ├── fd: (6)-->(7), (1)==(7), (7)==(1)
- │    ├── scan pqr@q
- │    │    ├── columns: p:6!null q:7
- │    │    ├── limit: 5
- │    │    ├── key: (6)
- │    │    └── fd: (6)-->(7)
- │    └── filters (true)
- └── filters (true)
-
-# Cross join case. The plan produced by PushJoinIntoIndexJoin isn't chosen
-# because the cross join doesn't filter rows.
-opt expect=PushJoinIntoIndexJoin
-SELECT * FROM abc CROSS JOIN (SELECT * FROM pqr ORDER BY q LIMIT 5)
-----
-inner-join (cross)
- ├── columns: a:1 b:2 c:3 p:6!null q:7 r:8 s:9 t:10
- ├── fd: (6)-->(7-10)
- ├── scan abc
- │    └── columns: a:1 b:2 c:3
- ├── index-join pqr
- │    ├── columns: p:6!null q:7 r:8 s:9 t:10
- │    ├── cardinality: [0 - 5]
- │    ├── key: (6)
- │    ├── fd: (6)-->(7-10)
- │    └── scan pqr@q
- │         ├── columns: p:6!null q:7
- │         ├── limit: 5
- │         ├── key: (6)
- │         └── fd: (6)-->(7)
- └── filters (true)
-
-# No-op case because the index join is the right input of the LeftJoin.
-opt expect-not=PushJoinIntoIndexJoin
-SELECT * FROM abc LEFT JOIN (SELECT * FROM pqr ORDER BY q LIMIT 5) ON a=q
-----
-left-join (merge)
- ├── columns: a:1 b:2 c:3 p:6 q:7 r:8 s:9 t:10
- ├── left ordering: +1
- ├── right ordering: +7
- ├── fd: (6)-->(7-10)
- ├── scan abc@ab
- │    ├── columns: a:1 b:2 c:3
- │    └── ordering: +1
- ├── index-join pqr
- │    ├── columns: p:6!null q:7 r:8 s:9 t:10
- │    ├── cardinality: [0 - 5]
- │    ├── key: (6)
- │    ├── fd: (6)-->(7-10)
- │    ├── ordering: +7
- │    └── scan pqr@q
- │         ├── columns: p:6!null q:7
- │         ├── limit: 5
- │         ├── key: (6)
- │         ├── fd: (6)-->(7)
- │         └── ordering: +7
- └── filters (true)
-
-# No-op case because the InnerJoin has join hints.
-opt expect-not=PushJoinIntoIndexJoin
-SELECT * FROM (SELECT * FROM pqr ORDER BY q LIMIT 5) INNER HASH JOIN abc ON a=q
-----
-inner-join (hash)
- ├── columns: p:1!null q:2!null r:3 s:4 t:5 a:7!null b:8 c:9
- ├── flags: force hash join (store right side)
- ├── fd: (1)-->(2-5), (2)==(7), (7)==(2)
- ├── index-join pqr
- │    ├── columns: p:1!null q:2 r:3 s:4 t:5
- │    ├── cardinality: [0 - 5]
- │    ├── key: (1)
- │    ├── fd: (1)-->(2-5)
- │    └── scan pqr@q
- │         ├── columns: p:1!null q:2
- │         ├── limit: 5
- │         ├── key: (1)
- │         └── fd: (1)-->(2)
- ├── scan abc
- │    └── columns: a:7 b:8 c:9
- └── filters
-      └── a:7 = q:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
-
-# No-op case because the ON condition references a column that doesn't come from
-# the input of the index join or the right side of the InnerJoin.
-opt expect-not=PushJoinIntoIndexJoin
-SELECT * FROM (SELECT * FROM pqr ORDER BY q LIMIT 5) INNER JOIN abc ON a=r
-----
-inner-join (hash)
- ├── columns: p:1!null q:2 r:3!null s:4 t:5 a:7!null b:8 c:9
- ├── fd: (1)-->(2-5), (3)==(7), (7)==(3)
- ├── scan abc
- │    └── columns: a:7 b:8 c:9
- ├── index-join pqr
- │    ├── columns: p:1!null q:2 r:3 s:4 t:5
- │    ├── cardinality: [0 - 5]
- │    ├── key: (1)
- │    ├── fd: (1)-->(2-5)
- │    └── scan pqr@q
- │         ├── columns: p:1!null q:2
- │         ├── limit: 5
- │         ├── key: (1)
- │         └── fd: (1)-->(2)
- └── filters
-      └── a:7 = r:3 [outer=(3,7), constraints=(/3: (/NULL - ]; /7: (/NULL - ]), fd=(3)==(7), (7)==(3)]
-
-# No-op case because the right side of the InnerJoin has outer columns.
-opt expect-not=PushJoinIntoIndexJoin disable=(TryDecorrelateProject)
-SELECT * 
-FROM stu
-INNER JOIN LATERAL (
-   SELECT *
-   FROM (SELECT * FROM pqr ORDER BY q LIMIT 5)
-   INNER JOIN (SELECT *, a*s FROM abc)
-   ON a=q
-)
-ON True
-----
-inner-join-apply
- ├── columns: s:1!null t:2!null u:3!null p:5!null q:6!null r:7 s:8 t:9 a:11!null b:12 c:13 "?column?":16
- ├── immutable
- ├── fd: (1-3,5)-->(6-9), (1-3,11)-->(16), (6)==(11), (11)==(6)
- ├── scan stu
- │    ├── columns: stu.s:1!null stu.t:2!null u:3!null
- │    └── key: (1-3)
- ├── inner-join (merge)
- │    ├── columns: p:5!null q:6!null r:7 pqr.s:8 pqr.t:9 a:11!null b:12 c:13 "?column?":16
- │    ├── left ordering: +6
- │    ├── right ordering: +11
- │    ├── outer: (1)
- │    ├── immutable
- │    ├── fd: (5)-->(6-9), (11)-->(16), (6)==(11), (11)==(6)
- │    ├── index-join pqr
- │    │    ├── columns: p:5!null q:6 r:7 pqr.s:8 pqr.t:9
- │    │    ├── cardinality: [0 - 5]
- │    │    ├── key: (5)
- │    │    ├── fd: (5)-->(6-9)
- │    │    ├── ordering: +6
- │    │    └── scan pqr@q
- │    │         ├── columns: p:5!null q:6
- │    │         ├── limit: 5
- │    │         ├── key: (5)
- │    │         ├── fd: (5)-->(6)
- │    │         └── ordering: +6
- │    ├── project
- │    │    ├── columns: "?column?":16 a:11 b:12 c:13
- │    │    ├── outer: (1)
- │    │    ├── immutable
- │    │    ├── fd: (11)-->(16)
- │    │    ├── ordering: +11
- │    │    ├── scan abc@ab
- │    │    │    ├── columns: a:11 b:12 c:13
- │    │    │    └── ordering: +11
- │    │    └── projections
- │    │         └── a:11 * stu.s:1 [as="?column?":16, outer=(1,11), immutable]
- │    └── filters (true)
- └── filters (true)

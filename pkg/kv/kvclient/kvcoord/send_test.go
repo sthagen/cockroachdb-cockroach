@@ -34,6 +34,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var _ roachpb.InternalServer = Node(0)
+
 type Node time.Duration
 
 func (n Node) Batch(
@@ -58,6 +60,10 @@ func (n Node) RangeFeed(_ *roachpb.RangeFeedRequest, _ roachpb.Internal_RangeFee
 func (n Node) GossipSubscription(
 	_ *roachpb.GossipSubscriptionRequest, _ roachpb.Internal_GossipSubscriptionServer,
 ) error {
+	panic("unimplemented")
+}
+
+func (n Node) Join(context.Context, *roachpb.JoinNodeRequest) (*roachpb.JoinNodeResponse, error) {
 	panic("unimplemented")
 }
 
@@ -99,7 +105,7 @@ func TestSendToOneClient(t *testing.T) {
 // firstNErrorTransport is a mock transport that sends an error on
 // requests to the first N addresses, then succeeds.
 type firstNErrorTransport struct {
-	replicas  ReplicaSlice
+	replicas  []roachpb.ReplicaDescriptor
 	numErrors int
 	numSent   int
 }
@@ -126,7 +132,7 @@ func (f *firstNErrorTransport) NextInternalClient(
 }
 
 func (f *firstNErrorTransport) NextReplica() roachpb.ReplicaDescriptor {
-	return f.replicas[f.numSent].ReplicaDescriptor
+	return f.replicas[f.numSent]
 }
 
 func (f *firstNErrorTransport) SkipReplica() {
@@ -185,7 +191,7 @@ func TestComplexScenarios(t *testing.T) {
 			func(
 				_ SendOptions,
 				_ *nodedialer.Dialer,
-				replicas ReplicaSlice,
+				replicas []roachpb.ReplicaDescriptor,
 			) (Transport, error) {
 				return &firstNErrorTransport{
 					replicas:  replicas,

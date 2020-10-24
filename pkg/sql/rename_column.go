@@ -13,13 +13,15 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/errors"
 )
 
@@ -27,7 +29,7 @@ var errEmptyColumnName = pgerror.New(pgcode.Syntax, "empty column name")
 
 type renameColumnNode struct {
 	n         *tree.RenameColumn
-	tableDesc *sqlbase.MutableTableDescriptor
+	tableDesc *tabledesc.Mutable
 }
 
 // RenameColumn renames the column.
@@ -72,7 +74,9 @@ func (n *renameColumnNode) startExec(params runParams) error {
 		return nil
 	}
 
-	if err := tableDesc.Validate(ctx, p.txn, p.ExecCfg().Codec); err != nil {
+	if err := tableDesc.Validate(
+		ctx, catalogkv.NewOneLevelUncachedDescGetter(p.txn, p.ExecCfg().Codec),
+	); err != nil {
 		return err
 	}
 
@@ -85,7 +89,7 @@ func (n *renameColumnNode) startExec(params runParams) error {
 // the column being renamed is a generated column for a hash sharded index.
 func (p *planner) renameColumn(
 	ctx context.Context,
-	tableDesc *sqlbase.MutableTableDescriptor,
+	tableDesc *tabledesc.Mutable,
 	oldName, newName *tree.Name,
 	allowRenameOfShardColumn bool,
 ) (changed bool, err error) {
@@ -141,7 +145,7 @@ func (p *planner) renameColumn(
 		}
 	}
 	if columnNotFoundErr == nil {
-		return false, sqlbase.NewColumnAlreadyExistsError(tree.ErrString(newName), tableDesc.Name)
+		return false, sqlerrors.NewColumnAlreadyExistsError(tree.ErrString(newName), tableDesc.Name)
 	}
 
 	// Rename the column in CHECK constraints.
@@ -183,7 +187,7 @@ func (p *planner) renameColumn(
 		if !shardedDesc.IsSharded {
 			return
 		}
-		oldShardColName := tree.Name(sqlbase.GetShardColumnName(
+		oldShardColName := tree.Name(tabledesc.GetShardColumnName(
 			shardedDesc.ColumnNames, shardedDesc.ShardBuckets))
 		var changed bool
 		for i, c := range shardedDesc.ColumnNames {
@@ -197,7 +201,7 @@ func (p *planner) renameColumn(
 		}
 		newName, alreadyRenamed := shardColumnsToRename[oldShardColName]
 		if !alreadyRenamed {
-			newName = tree.Name(sqlbase.GetShardColumnName(
+			newName = tree.Name(tabledesc.GetShardColumnName(
 				shardedDesc.ColumnNames, shardedDesc.ShardBuckets))
 			shardColumnsToRename[oldShardColName] = newName
 		}

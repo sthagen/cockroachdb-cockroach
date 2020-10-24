@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/errors"
 )
 
 // Details is a marker interface for job details proto structs.
@@ -67,7 +68,7 @@ func DetailsType(d isPayload_Details) Type {
 	case *Payload_TypeSchemaChange:
 		return TypeTypeSchemaChange
 	default:
-		panic(fmt.Sprintf("Payload.Type called on a payload with an unknown details type: %T", d))
+		panic(errors.AssertionFailedf("Payload.Type called on a payload with an unknown details type: %T", d))
 	}
 }
 
@@ -97,7 +98,7 @@ func WrapProgressDetails(details ProgressDetails) interface {
 	case TypeSchemaChangeProgress:
 		return &Progress_TypeSchemaChange{TypeSchemaChange: &d}
 	default:
-		panic(fmt.Sprintf("WrapProgressDetails: unknown details type %T", d))
+		panic(errors.AssertionFailedf("WrapProgressDetails: unknown details type %T", d))
 	}
 }
 
@@ -185,7 +186,7 @@ func WrapPayloadDetails(details Details) interface {
 	case TypeSchemaChangeDetails:
 		return &Payload_TypeSchemaChange{TypeSchemaChange: &d}
 	default:
-		panic(fmt.Sprintf("jobs.WrapPayloadDetails: unknown details type %T", d))
+		panic(errors.AssertionFailedf("jobs.WrapPayloadDetails: unknown details type %T", d))
 	}
 }
 
@@ -207,7 +208,23 @@ const (
 	// fields, and, more generally, flags the job as being suitable for the job
 	// registry to adopt.
 	JobResumerFormatVersion
+	// DatabaseJobFormatVersion indicates that database schema changes are
+	// run in the schema change job.
+	DatabaseJobFormatVersion
 
 	// Silence unused warning.
 	_ = BaseFormatVersion
 )
+
+// SafeValue implements the redact.SafeValue interface.
+func (Type) SafeValue() {}
+
+// NumJobTypes is the number of jobs types.
+const NumJobTypes = 10
+
+func init() {
+	if len(Type_name) != NumJobTypes {
+		panic(fmt.Errorf("NumJobTypes (%d) does not match generated job type name map length (%d)",
+			NumJobTypes, len(Type_name)))
+	}
+}

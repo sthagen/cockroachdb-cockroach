@@ -27,11 +27,39 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 )
+
+func TestCloser(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	st := cluster.MakeTestingClusterSettings()
+	start := timeutil.Now()
+	timeSource := timeutil.NewManualTime(start)
+	factory := tenantrate.NewLimiterFactory(st, &tenantrate.TestingKnobs{
+		TimeSource: timeSource,
+	})
+	tenant := roachpb.MakeTenantID(2)
+	closer := make(chan struct{})
+	limiter := factory.GetTenant(tenant, closer)
+	ctx := context.Background()
+	// First Wait call will not block.
+	require.NoError(t, limiter.Wait(ctx, false, 1))
+	errCh := make(chan error, 1)
+	go func() { errCh <- limiter.Wait(ctx, false, 1<<30) }()
+	testutils.SucceedsSoon(t, func() error {
+		if timers := timeSource.Timers(); len(timers) != 1 {
+			return errors.Errorf("expected 1 timer, found %d", len(timers))
+		}
+		return nil
+	})
+	close(closer)
+	require.Regexp(t, "closer", <-errCh)
+}
 
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -47,7 +75,7 @@ type testState struct {
 	running     map[string]*launchState
 	rl          *tenantrate.LimiterFactory
 	m           *metric.Registry
-	clock       *quotapool.ManualTime
+	clock       *timeutil.ManualTime
 	settings    *cluster.Settings
 }
 
@@ -56,6 +84,7 @@ type launchState struct {
 	tenantID   roachpb.TenantID
 	ctx        context.Context
 	cancel     context.CancelFunc
+	isWrite    bool
 	writeBytes int64
 	reserveCh  chan error
 }
@@ -111,7 +140,7 @@ func (ts *testState) init(t *testing.T, d *datadriven.TestData) string {
 	ts.initialized = true
 	ts.running = make(map[string]*launchState)
 	ts.tenants = make(map[roachpb.TenantID][]tenantrate.Limiter)
-	ts.clock = quotapool.NewManualTime(t0)
+	ts.clock = timeutil.NewManualTime(t0)
 	ts.settings = cluster.MakeTestingClusterSettings()
 	limits := tenantrate.LimitConfigsFromSettings(ts.settings)
 	parseLimits(t, d, &limits)
@@ -174,6 +203,7 @@ func (ts *testState) launch(t *testing.T, d *datadriven.TestData) string {
 	var cmds []struct {
 		ID         string
 		Tenant     uint64
+		IsWrite    bool
 		WriteBytes int64
 	}
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &cmds); err != nil {
@@ -185,6 +215,7 @@ func (ts *testState) launch(t *testing.T, d *datadriven.TestData) string {
 		s.tenantID = roachpb.MakeTenantID(cmd.Tenant)
 		s.ctx, s.cancel = context.WithCancel(context.Background())
 		s.reserveCh = make(chan error, 1)
+		s.isWrite = cmd.IsWrite
 		s.writeBytes = cmd.WriteBytes
 		ts.running[s.id] = &s
 		lims := ts.tenants[s.tenantID]
@@ -193,7 +224,7 @@ func (ts *testState) launch(t *testing.T, d *datadriven.TestData) string {
 		}
 		go func() {
 			// We'll not worry about ever releasing tenant Limiters.
-			s.reserveCh <- lims[0].Wait(s.ctx, s.writeBytes)
+			s.reserveCh <- lims[0].Wait(s.ctx, s.isWrite, s.writeBytes)
 		}()
 	}
 	return ts.FormatRunning()
@@ -296,7 +327,8 @@ func (ts *testState) recordRead(t *testing.T, d *datadriven.TestData) string {
 
 // metrics will print out the prometheus metric values. The command takes an
 // argument as a regular expression over the values. The metrics are printed in
-// lexicographical order.
+// lexicographical order. The command will retry until the output matches to
+// make it more robust to races in metric recording.
 //
 // For example:
 //
@@ -309,12 +341,15 @@ func (ts *testState) recordRead(t *testing.T, d *datadriven.TestData) string {
 //  kv_tenant_rate_limit_read_bytes_admitted 0
 //  kv_tenant_rate_limit_read_bytes_admitted{tenant_id="2"} 0
 //  kv_tenant_rate_limit_read_bytes_admitted{tenant_id="system"} 100
-//  kv_tenant_rate_limit_requests_admitted 0
-//  kv_tenant_rate_limit_requests_admitted{tenant_id="2"} 0
-//  kv_tenant_rate_limit_requests_admitted{tenant_id="system"} 0
+//  kv_tenant_rate_limit_read_requests_admitted 0
+//  kv_tenant_rate_limit_read_requests_admitted{tenant_id="2"} 0
+//  kv_tenant_rate_limit_read_requests_admitted{tenant_id="system"} 0
 //  kv_tenant_rate_limit_write_bytes_admitted 50
 //  kv_tenant_rate_limit_write_bytes_admitted{tenant_id="2"} 50
 //  kv_tenant_rate_limit_write_bytes_admitted{tenant_id="system"} 0
+//  kv_tenant_rate_limit_write_requests_admitted 0
+//  kv_tenant_rate_limit_write_requests_admitted{tenant_id="2"} 0
+//  kv_tenant_rate_limit_write_requests_admitted{tenant_id="system"} 0
 //
 // Or with a regular expression:
 //
@@ -324,6 +359,20 @@ func (ts *testState) recordRead(t *testing.T, d *datadriven.TestData) string {
 //  kv_tenant_rate_limit_write_bytes_admitted{tenant_id="2"} 50
 //
 func (ts *testState) metrics(t *testing.T, d *datadriven.TestData) string {
+	exp := strings.TrimSpace(d.Expected)
+	if err := testutils.SucceedsSoonError(func() error {
+		got := ts.getMetricsText(t, d)
+		if got != exp {
+			return errors.Errorf("got: %q, exp: %q", got, exp)
+		}
+		return nil
+	}); err != nil {
+		d.Fatalf(t, "failed to find expected timers: %v", err)
+	}
+	return d.Expected
+}
+
+func (ts *testState) getMetricsText(t *testing.T, d *datadriven.TestData) string {
 	ex := metric.MakePrometheusExporter()
 	ex.ScrapeRegistry(ts.m, true /* includeChildMetrics */)
 	var in bytes.Buffer
@@ -347,7 +396,8 @@ func (ts *testState) metrics(t *testing.T, d *datadriven.TestData) string {
 		d.Fatalf(t, "failed to process metrics: %v", err)
 	}
 	sort.Strings(outLines)
-	return strings.Join(outLines, "\n")
+	metricsText := strings.Join(outLines, "\n")
+	return metricsText
 }
 
 // timers waits for the set of open timers to match the expected output.
@@ -402,7 +452,7 @@ func (ts *testState) getTenants(t *testing.T, d *datadriven.TestData) string {
 	tenantIDs := parseTenantIDs(t, d)
 	for i := range tenantIDs {
 		id := roachpb.MakeTenantID(tenantIDs[i])
-		ts.tenants[id] = append(ts.tenants[id], ts.rl.GetTenant(id))
+		ts.tenants[id] = append(ts.tenants[id], ts.rl.GetTenant(id, nil /* closer */))
 	}
 	return ts.FormatTenants()
 }

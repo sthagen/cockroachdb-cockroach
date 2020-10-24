@@ -33,8 +33,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -146,8 +146,7 @@ var schemas = [...]string{
 		s_order_cnt  integer,
 		s_remote_cnt integer,
 		s_data       varchar(50),
-		primary key (s_w_id, s_i_id),
-		index stock_item_fk_idx (s_i_id)
+		primary key (s_w_id, s_i_id)
 	)
 	`,
 	`
@@ -508,7 +507,7 @@ func (h *harness) prepareUsingAPI(tb testing.TB) {
 
 		id := tree.PlaceholderIdx(i)
 		typ, _ := h.semaCtx.Placeholders.ValueType(id)
-		texpr, err := sqlbase.SanitizeVarFreeExpr(
+		texpr, err := schemaexpr.SanitizeVarFreeExpr(
 			context.Background(),
 			parg,
 			typ,

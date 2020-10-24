@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 var binaryOpDecMethod = map[tree.BinaryOperator]string{
@@ -202,6 +203,10 @@ func registerBinOpOutputTypes() {
 	for _, intWidth := range supportedWidthsByCanonicalTypeFamily[types.IntFamily] {
 		binOpOutputTypes[tree.JSONFetchVal][typePair{typeconv.DatumVecCanonicalTypeFamily, anyWidth, types.IntFamily, intWidth}] = types.Any
 	}
+
+	binOpOutputTypes[tree.JSONFetchValPath] = map[typePair]*types.T{
+		{typeconv.DatumVecCanonicalTypeFamily, anyWidth, typeconv.DatumVecCanonicalTypeFamily, anyWidth}: types.Any,
+	}
 }
 
 func newBinaryOverloadBase(op tree.BinaryOperator) *overloadBase {
@@ -278,7 +283,7 @@ func (bytesCustomizer) getBinOpAssignFunc() assignFunc {
 			}
 			`, leftElem, rightElem, set(types.BytesFamily, caller, idx, "r"))
 		} else {
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		return result
 	}
@@ -415,7 +420,7 @@ func (c intCustomizer) getBinOpAssignFunc() assignFunc {
 				upperBound = "math.MaxInt32"
 				lowerBound = "math.MinInt32"
 			default:
-				colexecerror.InternalError(fmt.Sprintf("unhandled integer width %d", c.width))
+				colexecerror.InternalError(errors.AssertionFailedf("unhandled integer width %d", c.width))
 			}
 
 			args["UpperBound"] = upperBound
@@ -446,7 +451,7 @@ func (c intCustomizer) getBinOpAssignFunc() assignFunc {
 				if {{.Right}} == 0 {
 					colexecerror.ExpectedError(tree.ErrDivByZero)
 				}
-				leftTmpDec, rightTmpDec := &_overloadHelper.tmpDec1, &_overloadHelper.tmpDec2
+				leftTmpDec, rightTmpDec := &_overloadHelper.TmpDec1, &_overloadHelper.TmpDec2
 				leftTmpDec.SetInt64(int64({{.Left}}))
 				rightTmpDec.SetInt64(int64({{.Right}}))
 				if _, err := tree.{{.Ctx}}.Quo(&{{.Target}}, leftTmpDec, rightTmpDec); err != nil {
@@ -459,7 +464,7 @@ func (c intCustomizer) getBinOpAssignFunc() assignFunc {
 
 			t = template.Must(template.New("").Parse(`
 			{
-				leftTmpDec, rightTmpDec := &_overloadHelper.tmpDec1, &_overloadHelper.tmpDec2
+				leftTmpDec, rightTmpDec := &_overloadHelper.TmpDec1, &_overloadHelper.TmpDec2
 				leftTmpDec.SetInt64(int64({{.Left}}))
 				rightTmpDec.SetInt64(int64({{.Right}}))
 				if _, err := tree.{{.Ctx}}.Pow(leftTmpDec, leftTmpDec, rightTmpDec); err != nil {
@@ -495,7 +500,7 @@ func (c intCustomizer) getBinOpAssignFunc() assignFunc {
 			`, execgen.BinaryOpName[binOp])))
 
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.OpStr))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.OpStr))
 		}
 
 		if err := t.Execute(&buf, args); err != nil {
@@ -524,7 +529,7 @@ func (c decimalIntCustomizer) getBinOpAssignFunc() assignFunc {
 					colexecerror.ExpectedError(tree.ErrDivByZero)
 				}
 				{{end}}
-				tmpDec := &_overloadHelper.tmpDec1
+				tmpDec := &_overloadHelper.TmpDec1
 				tmpDec.SetInt64(int64({{.Right}}))
 				if _, err := tree.{{.Ctx}}.{{.Op}}(&{{.Target}}, &{{.Left}}, tmpDec); err != nil {
 					colexecerror.ExpectedError(err)
@@ -557,7 +562,7 @@ func (c intDecimalCustomizer) getBinOpAssignFunc() assignFunc {
 					colexecerror.ExpectedError(tree.ErrDivByZero)
 				}
 				{{end}}
-				tmpDec := &_overloadHelper.tmpDec1
+				tmpDec := &_overloadHelper.TmpDec1
 				tmpDec.SetInt64(int64({{.Left}}))
 				_, err := tree.{{.Ctx}}.{{.Op}}(&{{.Target}}, tmpDec, &{{.Right}})
 				if err != nil {
@@ -582,7 +587,7 @@ func (c timestampCustomizer) getBinOpAssignFunc() assignFunc {
 		  `,
 				targetElem, leftElem, rightElem)
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		// This code is unreachable, but the compiler cannot infer that.
 		return ""
@@ -599,7 +604,7 @@ func (c intervalCustomizer) getBinOpAssignFunc() assignFunc {
 			return fmt.Sprintf(`%[1]s = %[2]s.Sub(%[3]s)`,
 				targetElem, leftElem, rightElem)
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		// This code is unreachable, but the compiler cannot infer that.
 		return ""
@@ -616,7 +621,7 @@ func (c timestampIntervalCustomizer) getBinOpAssignFunc() assignFunc {
 			return fmt.Sprintf(`%[1]s = duration.Add(%[2]s, %[3]s.Mul(-1))`,
 				targetElem, leftElem, rightElem)
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		// This code is unreachable, but the compiler cannot infer that.
 		return ""
@@ -630,7 +635,7 @@ func (c intervalTimestampCustomizer) getBinOpAssignFunc() assignFunc {
 			return fmt.Sprintf(`%[1]s = duration.Add(%[3]s, %[2]s)`,
 				targetElem, leftElem, rightElem)
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		return ""
 	}
@@ -650,7 +655,7 @@ func (c intervalIntCustomizer) getBinOpAssignFunc() assignFunc {
 				%[1]s = %[2]s.Div(int64(%[3]s))`,
 				targetElem, leftElem, rightElem)
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		return ""
 	}
@@ -663,7 +668,7 @@ func (c intIntervalCustomizer) getBinOpAssignFunc() assignFunc {
 			return fmt.Sprintf(`%[1]s = %[3]s.Mul(int64(%[2]s))`,
 				targetElem, leftElem, rightElem)
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		return ""
 	}
@@ -683,7 +688,7 @@ func (c intervalFloatCustomizer) getBinOpAssignFunc() assignFunc {
 				%[1]s = %[2]s.DivFloat(float64(%[3]s))`,
 				targetElem, leftElem, rightElem)
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		return ""
 	}
@@ -696,7 +701,7 @@ func (c floatIntervalCustomizer) getBinOpAssignFunc() assignFunc {
 			return fmt.Sprintf(`%[1]s = %[3]s.MulFloat(float64(%[2]s))`,
 				targetElem, leftElem, rightElem)
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		return ""
 	}
@@ -714,7 +719,7 @@ func (c intervalDecimalCustomizer) getBinOpAssignFunc() assignFunc {
 		  %[1]s = %[2]s.MulFloat(f)`,
 				targetElem, leftElem, rightElem)
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		return ""
 	}
@@ -733,7 +738,7 @@ func (c decimalIntervalCustomizer) getBinOpAssignFunc() assignFunc {
 				targetElem, leftElem, rightElem)
 
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
+			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
 		return ""
 	}
@@ -756,12 +761,15 @@ func executeBinOpOnDatums(prelude, targetElem, leftColdataExtDatum, rightDatumEl
 	}
 	return fmt.Sprintf(`
 			%s
-			_res, err := %s.BinFn(_overloadHelper.binFn, _overloadHelper.evalCtx, %s)
+			_res, err := %s.BinFn(_overloadHelper.BinFn, _overloadHelper.EvalCtx, %s)
 			if err != nil {
 				colexecerror.ExpectedError(err)
 			}
+			if _res == tree.DNull {
+				_outNulls.SetNull(%s)
+			}
 			%s
-		`, prelude, leftColdataExtDatum, rightDatumElem,
+		`, prelude, leftColdataExtDatum, rightDatumElem, idxVariable,
 		set(typeconv.DatumVecCanonicalTypeFamily, vecVariable, idxVariable, "_res"),
 	)
 }
@@ -804,7 +812,7 @@ func convertNativeToDatum(
 			runtimeConversion = fmt.Sprintf("tree.DBytes(%s)", nativeElem)
 		}
 	default:
-		colexecerror.InternalError(fmt.Sprintf("unexpected canonical type family: %s", canonicalTypeFamily))
+		colexecerror.InternalError(errors.AssertionFailedf("unexpected canonical type family: %s", canonicalTypeFamily))
 	}
 	return fmt.Sprintf(`
 			_convertedNativeElem := %[1]s
@@ -855,7 +863,7 @@ func parseNonIndexableTargetElem(targetElem string) (caller string, index string
 	// the closing square bracket.
 	tokens := strings.Split(targetElem[:len(targetElem)-1], "[")
 	if len(tokens) != 2 {
-		colexecerror.InternalError("unexpectedly len(tokens) != 2")
+		colexecerror.InternalError(errors.AssertionFailedf("unexpectedly len(tokens) != 2"))
 	}
 	caller = tokens[0]
 	index = tokens[1]

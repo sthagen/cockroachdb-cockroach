@@ -13,11 +13,11 @@ package exec
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
@@ -73,7 +73,7 @@ type ScanParams struct {
 //
 // The node must be able to support this output ordering given its other
 // configuration parameters.
-type OutputOrdering sqlbase.ColumnOrdering
+type OutputOrdering colinfo.ColumnOrdering
 
 // Subquery encapsulates information about a subquery that is part of a plan.
 type Subquery struct {
@@ -145,7 +145,7 @@ type AggInfo struct {
 // passed through to the execution engine.
 type WindowInfo struct {
 	// Cols is the set of columns that are returned from the windowing operator.
-	Cols sqlbase.ResultColumns
+	Cols colinfo.ResultColumns
 
 	// TODO(justin): refactor this to be a single array of structs.
 
@@ -167,14 +167,7 @@ type WindowInfo struct {
 	Partition []NodeColumnOrdinal
 
 	// Ordering is the set of input columns to order on.
-	Ordering sqlbase.ColumnOrdering
-
-	// RangeOffsetColumn is the column ID of a single column from ORDER BY clause
-	// when window frame has RANGE mode of framing and at least one 'offset'
-	// boundary. We store it separately because the ordering might be simplified
-	// (when that single column is in Partition), but the execution still needs
-	// to know the original ordering.
-	RangeOffsetColumn NodeColumnOrdinal
+	Ordering colinfo.ColumnOrdering
 }
 
 // ExplainEnvData represents the data that's going to be displayed in EXPLAIN (env).
@@ -196,12 +189,12 @@ type KVOption struct {
 // RecursiveCTEIterationFn creates a plan for an iteration of WITH RECURSIVE,
 // given the result of the last iteration (as a node created by
 // ConstructBuffer).
-type RecursiveCTEIterationFn func(bufferRef Node) (Plan, error)
+type RecursiveCTEIterationFn func(ef Factory, bufferRef Node) (Plan, error)
 
 // ApplyJoinPlanRightSideFn creates a plan for an iteration of ApplyJoin, given
 // a row produced from the left side. The plan is guaranteed to produce the
 // rightColumns passed to ConstructApplyJoin (in order).
-type ApplyJoinPlanRightSideFn func(leftRow tree.Datums) (Plan, error)
+type ApplyJoinPlanRightSideFn func(ef Factory, leftRow tree.Datums) (Plan, error)
 
 // Cascade describes a cascading query. The query uses a node created by
 // ConstructBuffer as an input; it should only be triggered if this buffer is
@@ -211,7 +204,7 @@ type Cascade struct {
 	FKName string
 
 	// Buffer is the Node returned by ConstructBuffer which stores the input to
-	// the mutation.
+	// the mutation. It is nil if the cascade does not require a buffer.
 	Buffer Node
 
 	// PlanFn builds the cascade query and creates the plan for it.
@@ -223,6 +216,9 @@ type Cascade struct {
 	// however, we allow the execution engine to provide a different copy or
 	// implementation of the node (e.g. to facilitate early cleanup of the
 	// original plan).
+	//
+	// If the cascade does not require input buffering (Buffer is nil), then
+	// bufferRef should be nil and numBufferedRows should be 0.
 	//
 	// This method does not mutate any captured state; it is ok to call PlanFn
 	// methods concurrently (provided that they don't use a single non-thread-safe
@@ -237,10 +233,6 @@ type Cascade struct {
 		allowAutoCommit bool,
 	) (Plan, error)
 }
-
-// InsertFastPathMaxRows is the maximum number of rows for which we can use the
-// insert fast path.
-const InsertFastPathMaxRows = 10000
 
 // InsertFastPathFKCheck contains information about a foreign key check to be
 // performed by the insert fast-path (see ConstructInsertFastPath). It

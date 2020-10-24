@@ -19,8 +19,7 @@ import (
 var djangoReleaseTagRegex = regexp.MustCompile(`^(?P<major>\d+)\.(?P<minor>\d+)(\.(?P<point>\d+))?$`)
 var djangoCockroachDBReleaseTagRegex = regexp.MustCompile(`^(?P<major>\d+)\.(?P<minor>\d+)$`)
 
-var djangoSupportedTag = "cockroach-3.0.x"
-var djangoCockroachDBSupportedTag = "3.0.2"
+var djangoSupportedTag = "cockroach-3.1.x"
 
 func registerDjango(r *testRegistry) {
 	runDjango := func(
@@ -62,15 +61,15 @@ func registerDjango(r *testRegistry) {
 			c,
 			node,
 			"install dependencies",
-			`sudo apt-get -qq install make python3.6 libpq-dev python3.6-dev gcc python3-setuptools python-setuptools build-essential`,
+			`sudo apt-get -qq install make python3.7 libpq-dev python3.7-dev gcc python3-setuptools python-setuptools build-essential`,
 		); err != nil {
 			t.Fatal(err)
 		}
 
 		if err := repeatRunE(
-			ctx, c, node, "set python3.6 as default", `
+			ctx, c, node, "set python3.7 as default", `
     		sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.5 1
-    		sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.6 2
+    		sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.7 2
     		sudo update-alternatives --config python3`,
 		); err != nil {
 			t.Fatal(err)
@@ -78,7 +77,7 @@ func registerDjango(r *testRegistry) {
 
 		if err := repeatRunE(
 			ctx, c, node, "install pip",
-			`curl https://bootstrap.pypa.io/get-pip.py | sudo -H python3.6`,
+			`curl https://bootstrap.pypa.io/get-pip.py | sudo -H python3.7`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -127,7 +126,6 @@ func registerDjango(r *testRegistry) {
 			t.Fatal(err)
 		}
 		c.l.Printf("Latest django-cockroachdb release is %s.", djangoCockroachDBLatestTag)
-		c.l.Printf("Supported django-cockroachdb release is %s.", djangoCockroachDBSupportedTag)
 
 		if err := repeatGitCloneE(
 			ctx,
@@ -135,7 +133,7 @@ func registerDjango(r *testRegistry) {
 			c,
 			"https://github.com/cockroachdb/django-cockroachdb",
 			"/mnt/data1/django/tests/django-cockroachdb",
-			djangoCockroachDBSupportedTag,
+			"master",
 			node,
 		); err != nil {
 			t.Fatal(err)
@@ -207,9 +205,9 @@ func registerDjango(r *testRegistry) {
 	}
 
 	r.Add(testSpec{
-		MinVersion: "v19.2.0",
+		MinVersion: "v20.1.0",
 		Name:       "django",
-		Owner:      OwnerAppDev,
+		Owner:      OwnerSQLExperience,
 		Cluster:    makeClusterSpec(1, cpu(16)),
 		Tags:       []string{`default`, `orm`},
 		Run: func(ctx context.Context, t *test, c *cluster) {

@@ -99,12 +99,12 @@ type RuleSet = util.FastIntSet
 type OptTester struct {
 	Flags Flags
 
-	catalog   cat.Catalog
-	sql       string
-	ctx       context.Context
-	semaCtx   tree.SemaContext
-	evalCtx   tree.EvalContext
-	seenRules RuleSet
+	catalog      cat.Catalog
+	sql          string
+	ctx          context.Context
+	semaCtx      tree.SemaContext
+	evalCtx      tree.EvalContext
+	appliedRules RuleSet
 
 	builder strings.Builder
 }
@@ -148,6 +148,10 @@ type Flags struct {
 	// to pass.
 	UnexpectedRules RuleSet
 
+	// ExpectedMatchOnlyRules is a set of exploration rules which must match but
+	// not generate new expressions for the test to pass.
+	ExpectedMatchOnlyRules RuleSet
+
 	// ColStats is a list of ColSets for which a column statistic is requested.
 	ColStats []opt.ColSet
 
@@ -159,6 +163,10 @@ type Flags struct {
 
 	// JoinLimit is the default value for SessionData.ReorderJoinsLimit.
 	JoinLimit int
+
+	// PreferLookupJoinsForFK is the default value for
+	// SessionData.PreferLookupJoinsForFKs.
+	PreferLookupJoinsForFKs bool
 
 	// Locality specifies the location of the planning node as a set of user-
 	// defined key/value pairs, ordered from most inclusive to least inclusive.
@@ -222,7 +230,6 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 	ot.evalCtx.SessionData.OptimizerUseMultiColStats = true
 	ot.evalCtx.SessionData.ReorderJoinsLimit = opt.DefaultJoinOrderLimit
 	ot.evalCtx.SessionData.InsertFastPath = true
-	ot.evalCtx.SessionData.InterleavedJoins = true
 
 	return ot
 }
@@ -329,9 +336,13 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //
 //  - fully-qualify-names: fully qualify all column names in the test output.
 //
-//  - expect: fail the test if the rules specified by name do not match.
+//  - expect: fail the test if the rules specified by name are not "applied".
+//    For normalization rules, "applied" means that the rule's pattern matched
+//    an expression. For exploration rules, "applied" means that the rule's
+//    pattern matched an expression and the rule generated one or more new
+//    expressions in the memo.
 //
-//  - expect-not: fail the test if the rules specified by name match.
+//  - expect-not: fail the test if the rules specified by name are "applied".
 //
 //  - disable: disables optimizer rules by name. Examples:
 //      opt disable=ConstrainScan
@@ -392,10 +403,8 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		}
 	}
 
-	defer func(oldValue int) {
-		ot.evalCtx.SessionData.ReorderJoinsLimit = oldValue
-	}(ot.evalCtx.SessionData.ReorderJoinsLimit)
 	ot.evalCtx.SessionData.ReorderJoinsLimit = ot.Flags.JoinLimit
+	ot.evalCtx.SessionData.PreferLookupJoinsForFKs = ot.Flags.PreferLookupJoinsForFKs
 
 	ot.Flags.Verbose = datadriven.Verbose()
 	ot.evalCtx.TestingKnobs.OptimizerCostPerturbation = ot.Flags.PerturbCost
@@ -608,14 +617,14 @@ func (ot *OptTester) postProcess(tb testing.TB, d *datadriven.TestData, e opt.Ex
 		}
 	}
 
-	if !ot.Flags.ExpectedRules.SubsetOf(ot.seenRules) {
-		unseen := ot.Flags.ExpectedRules.Difference(ot.seenRules)
+	if !ot.Flags.ExpectedRules.SubsetOf(ot.appliedRules) {
+		unseen := ot.Flags.ExpectedRules.Difference(ot.appliedRules)
 		d.Fatalf(tb, "expected to see %s, but was not triggered. Did see %s",
-			formatRuleSet(unseen), formatRuleSet(ot.seenRules))
+			formatRuleSet(unseen), formatRuleSet(ot.appliedRules))
 	}
 
-	if ot.Flags.UnexpectedRules.Intersects(ot.seenRules) {
-		seen := ot.Flags.UnexpectedRules.Intersection(ot.seenRules)
+	if ot.Flags.UnexpectedRules.Intersects(ot.appliedRules) {
+		seen := ot.Flags.UnexpectedRules.Intersection(ot.appliedRules)
 		d.Fatalf(tb, "expected not to see %s, but it was triggered", formatRuleSet(seen))
 	}
 }
@@ -706,6 +715,9 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 			return errors.Wrap(err, "join-limit")
 		}
 		f.JoinLimit = int(limit)
+
+	case "prefer-lookup-joins-for-fks":
+		f.PreferLookupJoinsForFKs = true
 
 	case "rule":
 		if len(arg.Vals) != 1 {
@@ -856,8 +868,10 @@ func (ot *OptTester) OptNorm() (opt.Expr, error) {
 		if ot.Flags.DisableRules.Contains(int(ruleName)) {
 			return false
 		}
-		ot.seenRules.Add(int(ruleName))
 		return true
+	})
+	o.NotifyOnAppliedRule(func(ruleName opt.RuleName, source, target opt.Expr) {
+		ot.appliedRules.Add(int(ruleName))
 	})
 	if !ot.Flags.NoStableFolds {
 		o.Factory().FoldingControl().AllowStableFolds()
@@ -871,11 +885,14 @@ func (ot *OptTester) OptNorm() (opt.Expr, error) {
 func (ot *OptTester) Optimize() (opt.Expr, error) {
 	o := ot.makeOptimizer()
 	o.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
-		if ot.Flags.DisableRules.Contains(int(ruleName)) {
-			return false
+		return !ot.Flags.DisableRules.Contains(int(ruleName))
+	})
+	o.NotifyOnAppliedRule(func(ruleName opt.RuleName, source, target opt.Expr) {
+		// Exploration rules are marked as "applied" if they generate one or
+		// more new expressions.
+		if target != nil {
+			ot.appliedRules.Add(int(ruleName))
 		}
-		ot.seenRules.Add(int(ruleName))
-		return true
 	})
 	o.Factory().FoldingControl().AllowStableFolds()
 	return ot.optimizeExpr(o)
@@ -910,12 +927,11 @@ func (ot *OptTester) ExprNorm() (opt.Expr, error) {
 	f.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
 		// exprgen.Build doesn't run optimization, so we don't need to explicitly
 		// disallow exploration rules here.
+		return !ot.Flags.DisableRules.Contains(int(ruleName))
+	})
 
-		if ot.Flags.DisableRules.Contains(int(ruleName)) {
-			return false
-		}
-		ot.seenRules.Add(int(ruleName))
-		return true
+	f.NotifyOnAppliedRule(func(ruleName opt.RuleName, source, target opt.Expr) {
+		ot.appliedRules.Add(int(ruleName))
 	})
 
 	return exprgen.Build(ot.catalog, &f, ot.sql)
@@ -1403,19 +1419,24 @@ func (ot *OptTester) createTableAs(name tree.TableName, rel memo.RelExpr) (*test
 
 	// Create each of the columns and their estimated stats for the test catalog
 	// table.
-	columns := make([]*testcat.Column, outputCols.Len())
+	columns := make([]cat.Column, outputCols.Len())
 	jsonStats := make([]stats.JSONStatistic, outputCols.Len())
 	i := 0
 	for col, ok := outputCols.Next(0); ok; col, ok = outputCols.Next(col + 1) {
 		colMeta := rel.Memo().Metadata().ColumnMeta(col)
 		colName := colNameGen.GenerateName(col)
 
-		columns[i] = &testcat.Column{
-			Ordinal:  i,
-			Name:     colName,
-			Type:     colMeta.Type,
-			Nullable: !relProps.NotNullCols.Contains(col),
-		}
+		columns[i].InitNonVirtual(
+			i,
+			cat.StableID(i+1),
+			tree.Name(colName),
+			cat.Ordinary,
+			colMeta.Type,
+			!relProps.NotNullCols.Contains(col),
+			false, /* hidden */
+			nil,   /* defaultExpr */
+			nil,   /* computedExpr */
+		)
 
 		// Make sure we have estimated stats for this column.
 		colSet := opt.MakeColSet(col)

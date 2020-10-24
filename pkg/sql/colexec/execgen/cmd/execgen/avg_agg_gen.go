@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 type avgTmplInfo struct {
@@ -58,7 +59,7 @@ func (a avgTmplInfo) AssignDivInt64(targetElem, leftElem, rightElem, _, _, _ str
 	case toVecMethod(types.IntervalFamily, anyWidth):
 		return fmt.Sprintf("%s = %s.Div(int64(%s))", targetElem, leftElem, rightElem)
 	}
-	colexecerror.InternalError("unsupported avg agg type")
+	colexecerror.InternalError(errors.AssertionFailedf("unsupported avg agg type"))
 	// This code is unreachable, but the compiler cannot infer that.
 	return ""
 }
@@ -68,7 +69,7 @@ var (
 	_ = avgTmplInfo{}.AssignDivInt64
 )
 
-const avgAggTmpl = "pkg/sql/colexec/avg_agg_tmpl.go"
+const avgAggTmpl = "pkg/sql/colexec/colexecagg/avg_agg_tmpl.go"
 
 func genAvgAgg(inputFileContents string, wr io.Writer) error {
 	r := strings.NewReplacer(

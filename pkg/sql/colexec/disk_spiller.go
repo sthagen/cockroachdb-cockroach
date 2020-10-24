@@ -12,14 +12,14 @@ package colexec
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/errors"
 )
 
 // oneInputDiskSpiller is an Operator that manages the fallback from a one
@@ -201,7 +201,7 @@ func (d *diskSpillerBase) Next(ctx context.Context) coldata.Batch {
 			batch = d.inMemoryOp.Next(ctx)
 		},
 	); err != nil {
-		if sqlbase.IsOutOfMemoryError(err) &&
+		if sqlerrors.IsOutOfMemoryError(err) &&
 			strings.Contains(err.Error(), d.inMemoryMemMonitorName) {
 			d.spilled = true
 			if d.spillingCallbackFn != nil {
@@ -246,7 +246,7 @@ func (d *diskSpillerBase) Close(ctx context.Context) error {
 	if !d.close() {
 		return nil
 	}
-	if c, ok := d.diskBackedOp.(Closer); ok {
+	if c, ok := d.diskBackedOp.(colexecbase.Closer); ok {
 		return c.Close(ctx)
 	}
 	return nil
@@ -278,7 +278,7 @@ func (d *diskSpillerBase) Child(nth int, verbose bool) execinfra.OpNode {
 	case 0:
 		return d.inMemoryOp
 	default:
-		colexecerror.InternalError(fmt.Sprintf("invalid index %d", nth))
+		colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 		// This code is unreachable, but the compiler cannot infer that.
 		return nil
 	}

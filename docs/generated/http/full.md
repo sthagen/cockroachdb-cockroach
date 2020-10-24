@@ -4,7 +4,7 @@
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -19,7 +19,7 @@
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -73,7 +73,7 @@
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -88,7 +88,7 @@
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -126,7 +126,7 @@
 Don't introduce additional usages of this RPC. See #50707 for more details.
 The underlying response type is something we're looking to get rid of.
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -137,7 +137,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -171,7 +171,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -186,7 +186,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -196,7 +196,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -211,7 +211,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -402,7 +402,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -418,7 +418,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -549,7 +549,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -564,7 +564,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -574,7 +574,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -589,7 +589,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -623,7 +623,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -639,7 +639,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -684,7 +684,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -699,7 +699,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -745,7 +745,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -760,7 +760,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -786,12 +786,12 @@ The underlying response type is something we're looking to get rid of.
 | application_name | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | Application name specified by the client. |
 | active_queries | [ActiveQuery](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.ActiveQuery) | repeated | Queries in progress on this session. |
 | start | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListSessionsResponse-google.protobuf.Timestamp) |  | Timestamp of session's start. |
-| kv_txn_id | [bytes](#cockroach.server.serverpb.ListSessionsResponse-bytes) |  | ID of the current KV transaction for this session. Nil if the session doesn't currently have a transaction. |
-| active_txn | [TxnInfo](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.TxnInfo) |  | Information about the txn in progress on this session. Nil if the session doesn't currently have a transaction. |
 | last_active_query | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | SQL string of the last query executed on this session. |
 | id | [bytes](#cockroach.server.serverpb.ListSessionsResponse-bytes) |  | ID of the session (uint128 represented as raw bytes). |
 | alloc_bytes | [int64](#cockroach.server.serverpb.ListSessionsResponse-int64) |  | Number of currently allocated bytes in the session memory monitor. |
 | max_alloc_bytes | [int64](#cockroach.server.serverpb.ListSessionsResponse-int64) |  | High water mark of allocated bytes in the session memory monitor. |
+| active_txn | [TxnInfo](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.TxnInfo) |  | Information about the txn in progress on this session. Nil if the session doesn't currently have a transaction. |
+| last_active_query_anon | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The SQL statement fingerprint of the last query executed on this session, compatible with StatementStatisticsKey. |
 
 
 
@@ -809,6 +809,7 @@ The underlying response type is something we're looking to get rid of.
 | is_distributed | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  | True if this query is distributed. |
 | phase | [ActiveQuery.Phase](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.ActiveQuery.Phase) |  | phase stores the current phase of execution for this query. |
 | progress | [float](#cockroach.server.serverpb.ListSessionsResponse-float) |  |  |
+| sql_anon | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The SQL statement fingerprint, compatible with StatementStatisticsKey. |
 
 
 
@@ -822,6 +823,16 @@ The underlying response type is something we're looking to get rid of.
 | id | [bytes](#cockroach.server.serverpb.ListSessionsResponse-bytes) |  |  |
 | start | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListSessionsResponse-google.protobuf.Timestamp) |  | The start timestamp of the transaction. |
 | txn_description | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | txn_description is a text description of the underlying kv.Txn, intended for troubleshooting purposes. |
+| num_statements_executed | [int32](#cockroach.server.serverpb.ListSessionsResponse-int32) |  | num_statements_executed is the number of statements that were executed so far on this transaction. |
+| num_retries | [int32](#cockroach.server.serverpb.ListSessionsResponse-int32) |  | num_retries is the number of times that this transaction was retried. |
+| num_auto_retries | [int32](#cockroach.server.serverpb.ListSessionsResponse-int32) |  | num_retries is the number of times that this transaction was automatically retried by the SQL executor. |
+| deadline | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListSessionsResponse-google.protobuf.Timestamp) |  | The deadline by which the transaction must be committed. |
+| implicit | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  | implicit is true if this transaction was an implicit SQL transaction. |
+| alloc_bytes | [int64](#cockroach.server.serverpb.ListSessionsResponse-int64) |  | Number of currently allocated bytes in the txn memory monitor. |
+| max_alloc_bytes | [int64](#cockroach.server.serverpb.ListSessionsResponse-int64) |  | High water mark of allocated bytes in the txn memory monitor. |
+| read_only | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  |  |
+| is_historical | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  |  |
+| priority | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  |  |
 
 
 
@@ -846,7 +857,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -861,7 +872,7 @@ The underlying response type is something we're looking to get rid of.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -887,12 +898,12 @@ The underlying response type is something we're looking to get rid of.
 | application_name | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | Application name specified by the client. |
 | active_queries | [ActiveQuery](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.ActiveQuery) | repeated | Queries in progress on this session. |
 | start | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListSessionsResponse-google.protobuf.Timestamp) |  | Timestamp of session's start. |
-| kv_txn_id | [bytes](#cockroach.server.serverpb.ListSessionsResponse-bytes) |  | ID of the current KV transaction for this session. Nil if the session doesn't currently have a transaction. |
-| active_txn | [TxnInfo](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.TxnInfo) |  | Information about the txn in progress on this session. Nil if the session doesn't currently have a transaction. |
 | last_active_query | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | SQL string of the last query executed on this session. |
 | id | [bytes](#cockroach.server.serverpb.ListSessionsResponse-bytes) |  | ID of the session (uint128 represented as raw bytes). |
 | alloc_bytes | [int64](#cockroach.server.serverpb.ListSessionsResponse-int64) |  | Number of currently allocated bytes in the session memory monitor. |
 | max_alloc_bytes | [int64](#cockroach.server.serverpb.ListSessionsResponse-int64) |  | High water mark of allocated bytes in the session memory monitor. |
+| active_txn | [TxnInfo](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.TxnInfo) |  | Information about the txn in progress on this session. Nil if the session doesn't currently have a transaction. |
+| last_active_query_anon | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The SQL statement fingerprint of the last query executed on this session, compatible with StatementStatisticsKey. |
 
 
 
@@ -910,6 +921,7 @@ The underlying response type is something we're looking to get rid of.
 | is_distributed | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  | True if this query is distributed. |
 | phase | [ActiveQuery.Phase](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.ActiveQuery.Phase) |  | phase stores the current phase of execution for this query. |
 | progress | [float](#cockroach.server.serverpb.ListSessionsResponse-float) |  |  |
+| sql_anon | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The SQL statement fingerprint, compatible with StatementStatisticsKey. |
 
 
 
@@ -923,6 +935,16 @@ The underlying response type is something we're looking to get rid of.
 | id | [bytes](#cockroach.server.serverpb.ListSessionsResponse-bytes) |  |  |
 | start | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListSessionsResponse-google.protobuf.Timestamp) |  | The start timestamp of the transaction. |
 | txn_description | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | txn_description is a text description of the underlying kv.Txn, intended for troubleshooting purposes. |
+| num_statements_executed | [int32](#cockroach.server.serverpb.ListSessionsResponse-int32) |  | num_statements_executed is the number of statements that were executed so far on this transaction. |
+| num_retries | [int32](#cockroach.server.serverpb.ListSessionsResponse-int32) |  | num_retries is the number of times that this transaction was retried. |
+| num_auto_retries | [int32](#cockroach.server.serverpb.ListSessionsResponse-int32) |  | num_retries is the number of times that this transaction was automatically retried by the SQL executor. |
+| deadline | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListSessionsResponse-google.protobuf.Timestamp) |  | The deadline by which the transaction must be committed. |
+| implicit | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  | implicit is true if this transaction was an implicit SQL transaction. |
+| alloc_bytes | [int64](#cockroach.server.serverpb.ListSessionsResponse-int64) |  | Number of currently allocated bytes in the txn memory monitor. |
+| max_alloc_bytes | [int64](#cockroach.server.serverpb.ListSessionsResponse-int64) |  | High water mark of allocated bytes in the txn memory monitor. |
+| read_only | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  |  |
+| is_historical | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  |  |
+| priority | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  |  |
 
 
 
@@ -943,24 +965,20 @@ The underlying response type is something we're looking to get rid of.
 
 ## CancelQuery
 
-`GET /_status/cancel_query/{node_id}`
+`POST /_status/cancel_query/{node_id}`
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| node_id | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | ID of gateway node for the query to be canceled.
-
-TODO(itsbilal): use [(gogoproto.customname) = "NodeID"] below. Need to figure out how to teach grpc-gateway about custom names.
-
-node_id is a string so that "local" can be used to specify that no forwarding is necessary. |
+| node_id | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | ID of gateway node for the query to be canceled.<br><br>TODO(itsbilal): use [(gogoproto.customname) = "NodeID"] below. Need to figure out how to teach grpc-gateway about custom names.<br><br>node_id is a string so that "local" can be used to specify that no forwarding is necessary. |
 | query_id | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | ID of query to be canceled (converted to string). |
-| username | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | Username of the user making this cancellation request. |
+| username | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | Username of the user making this cancellation request. This may be omitted if the user is the same as the one issuing the CancelQueryRequest. |
 
 
 
@@ -968,7 +986,7 @@ node_id is a string so that "local" can be used to specify that no forwarding is
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -986,22 +1004,20 @@ node_id is a string so that "local" can be used to specify that no forwarding is
 
 ## CancelSession
 
-`GET /_status/cancel_session/{node_id}`
+`POST /_status/cancel_session/{node_id}`
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| node_id | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | TODO(abhimadan): use [(gogoproto.customname) = "NodeID"] below. Need to figure out how to teach grpc-gateway about custom names.
-
-node_id is a string so that "local" can be used to specify that no forwarding is necessary. |
+| node_id | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | TODO(abhimadan): use [(gogoproto.customname) = "NodeID"] below. Need to figure out how to teach grpc-gateway about custom names.<br><br>node_id is a string so that "local" can be used to specify that no forwarding is necessary. |
 | session_id | [bytes](#cockroach.server.serverpb.CancelSessionRequest-bytes) |  |  |
-| username | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  |  |
+| username | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | Username of the user making this cancellation request. This may be omitted if the user is the same as the one issuing the CancelSessionRequest. |
 
 
 
@@ -1009,7 +1025,7 @@ node_id is a string so that "local" can be used to specify that no forwarding is
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1035,7 +1051,7 @@ in that span. This is designed to compute stats specific to a SQL table:
 it will be called with the highest/lowest key for a SQL table, and return
 information about the resources on a node used by that table.
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1052,7 +1068,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1075,7 +1091,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1091,7 +1107,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1112,7 +1128,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1129,7 +1145,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1150,7 +1166,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1165,7 +1181,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1186,7 +1202,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1204,7 +1220,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1238,7 +1254,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1253,7 +1269,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1274,7 +1290,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1292,7 +1308,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1313,7 +1329,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1335,7 +1351,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1356,7 +1372,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1371,7 +1387,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1424,14 +1440,14 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| node_id | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  | If left empty, hot ranges for all nodes/stores will be returned. |
+| node_id | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  | NodeID indicates which node to query for a hot range report. It is posssible to populate any node ID; if the node receiving the request is not the target node, it will forward the request to the target node.<br><br>If left empty, the request is forwarded to every node in the cluster. |
 
 
 
@@ -1439,15 +1455,15 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| node_id | [int32](#cockroach.server.serverpb.HotRangesResponse-int32) |  | NodeID is the node that submitted all the requests. |
-| hot_ranges_by_node_id | [HotRangesResponse.HotRangesByNodeIdEntry](#cockroach.server.serverpb.HotRangesResponse-cockroach.server.serverpb.HotRangesResponse.HotRangesByNodeIdEntry) | repeated |  |
+| node_id | [int32](#cockroach.server.serverpb.HotRangesResponse-int32) |  | NodeID is the node that received the HotRangesRequest and forwarded requests to the selected target node(s). |
+| hot_ranges_by_node_id | [HotRangesResponse.HotRangesByNodeIdEntry](#cockroach.server.serverpb.HotRangesResponse-cockroach.server.serverpb.HotRangesResponse.HotRangesByNodeIdEntry) | repeated | HotRangesByNodeID contains a hot range report for each selected target node ID in the HotRangesRequest. |
 
 
 
@@ -1471,8 +1487,8 @@ information about the resources on a node used by that table.
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| error_message | [string](#cockroach.server.serverpb.HotRangesResponse-string) |  |  |
-| stores | [HotRangesResponse.StoreResponse](#cockroach.server.serverpb.HotRangesResponse-cockroach.server.serverpb.HotRangesResponse.StoreResponse) | repeated |  |
+| error_message | [string](#cockroach.server.serverpb.HotRangesResponse-string) |  | ErrorMessage is set to a non-empty string if this target node was unable to produce a hot range report.<br><br>The contents of this string indicates the cause of the failure. |
+| stores | [HotRangesResponse.StoreResponse](#cockroach.server.serverpb.HotRangesResponse-cockroach.server.serverpb.HotRangesResponse.StoreResponse) | repeated | Stores contains the hot ranges report if no error was encountered. There is one part to the report for each store in the target node. |
 
 
 
@@ -1483,8 +1499,8 @@ information about the resources on a node used by that table.
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| store_id | [int32](#cockroach.server.serverpb.HotRangesResponse-int32) |  |  |
-| hot_ranges | [HotRangesResponse.HotRange](#cockroach.server.serverpb.HotRangesResponse-cockroach.server.serverpb.HotRangesResponse.HotRange) | repeated |  |
+| store_id | [int32](#cockroach.server.serverpb.HotRangesResponse-int32) |  | StoreID identifies the store for which the report was produced. |
+| hot_ranges | [HotRangesResponse.HotRange](#cockroach.server.serverpb.HotRangesResponse-cockroach.server.serverpb.HotRangesResponse.HotRange) | repeated | HotRanges is the hot ranges report for this store on the target node. |
 
 
 
@@ -1495,8 +1511,8 @@ information about the resources on a node used by that table.
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| desc | [cockroach.roachpb.RangeDescriptor](#cockroach.server.serverpb.HotRangesResponse-cockroach.roachpb.RangeDescriptor) |  |  |
-| queries_per_second | [double](#cockroach.server.serverpb.HotRangesResponse-double) |  |  |
+| desc | [cockroach.roachpb.RangeDescriptor](#cockroach.server.serverpb.HotRangesResponse-cockroach.roachpb.RangeDescriptor) |  | Desc is the descriptor of the range for which the report was produced.<br><br>Note: this field is generally RESERVED and will likely be removed or replaced in a later version. See: https://github.com/cockroachdb/cockroach/issues/53212 |
+| queries_per_second | [double](#cockroach.server.serverpb.HotRangesResponse-double) |  | QueriesPerSecond is the recent number of queries per second on this range. |
 
 
 
@@ -1509,7 +1525,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1524,7 +1540,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1682,7 +1698,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1697,7 +1713,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1707,7 +1723,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1722,7 +1738,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1759,7 +1775,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1774,7 +1790,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1784,6 +1800,7 @@ information about the resources on a node used by that table.
 | statements | [StatementsResponse.CollectedStatementStatistics](#cockroach.server.serverpb.StatementsResponse-cockroach.server.serverpb.StatementsResponse.CollectedStatementStatistics) | repeated |  |
 | last_reset | [google.protobuf.Timestamp](#cockroach.server.serverpb.StatementsResponse-google.protobuf.Timestamp) |  | Timestamp of the last stats reset. |
 | internal_app_name_prefix | [string](#cockroach.server.serverpb.StatementsResponse-string) |  | If set and non-empty, indicates the prefix to application_name used for statements/queries issued internally by CockroachDB. |
+| transactions | [StatementsResponse.ExtendedCollectedTransactionStatistics](#cockroach.server.serverpb.StatementsResponse-cockroach.server.serverpb.StatementsResponse.ExtendedCollectedTransactionStatistics) | repeated | Transactions is transaction-level statistics for the collection of statements in this response. |
 
 
 
@@ -1796,6 +1813,7 @@ information about the resources on a node used by that table.
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | key | [StatementsResponse.ExtendedStatementStatisticsKey](#cockroach.server.serverpb.StatementsResponse-cockroach.server.serverpb.StatementsResponse.ExtendedStatementStatisticsKey) |  |  |
+| id | [uint64](#cockroach.server.serverpb.StatementsResponse-uint64) |  |  |
 | stats | [cockroach.sql.StatementStatistics](#cockroach.server.serverpb.StatementsResponse-cockroach.sql.StatementStatistics) |  |  |
 
 
@@ -1814,6 +1832,18 @@ information about the resources on a node used by that table.
 
 
 
+<a name="cockroach.server.serverpb.StatementsResponse-cockroach.server.serverpb.StatementsResponse.ExtendedCollectedTransactionStatistics"></a>
+#### StatementsResponse.ExtendedCollectedTransactionStatistics
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| stats_data | [cockroach.sql.CollectedTransactionStatistics](#cockroach.server.serverpb.StatementsResponse-cockroach.sql.CollectedTransactionStatistics) |  |  |
+| node_id | [int32](#cockroach.server.serverpb.StatementsResponse-int32) |  |  |
+
+
+
+
+
 
 ## CreateStatementDiagnosticsReport
 
@@ -1821,7 +1851,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1836,7 +1866,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1872,7 +1902,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1883,7 +1913,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1919,7 +1949,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1934,7 +1964,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -1969,7 +1999,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -1984,7 +2014,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 
@@ -2017,7 +2047,7 @@ information about the resources on a node used by that table.
 
 
 
-### Request Parameters
+#### Request Parameters
 
 
 
@@ -2032,7 +2062,7 @@ information about the resources on a node used by that table.
 
 
 
-### Response Parameters
+#### Response Parameters
 
 
 

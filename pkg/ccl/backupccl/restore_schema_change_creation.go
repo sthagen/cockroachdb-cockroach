@@ -18,8 +18,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	descpb "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -121,7 +122,7 @@ func createTypeChangeJobFromDesc(
 	codec keys.SQLCodec,
 	txn *kv.Txn,
 	username string,
-	typ sqlbase.TypeDescriptor,
+	typ catalog.TypeDescriptor,
 ) (*jobs.StartableJob, error) {
 	record := jobs.Record{
 		Description:   fmt.Sprintf("RESTORING: type %d", typ.GetID()),
@@ -151,7 +152,7 @@ func createSchemaChangeJobsFromMutations(
 	codec keys.SQLCodec,
 	txn *kv.Txn,
 	username string,
-	tableDesc *sqlbase.MutableTableDescriptor,
+	tableDesc *tabledesc.Mutable,
 ) ([]*jobs.StartableJob, error) {
 	mutationJobs := make([]descpb.TableDescriptor_MutationJob, 0, len(tableDesc.Mutations))
 	newJobs := make([]*jobs.StartableJob, 0, len(tableDesc.Mutations))
@@ -183,7 +184,9 @@ func createSchemaChangeJobsFromMutations(
 				DescID:          tableDesc.ID,
 				TableMutationID: mutationID,
 				ResumeSpanList:  spanList,
-				FormatVersion:   jobspb.JobResumerFormatVersion,
+				// The version distinction for database jobs doesn't matter for a schema
+				// change on a single table.
+				FormatVersion: jobspb.DatabaseJobFormatVersion,
 			},
 			Progress: jobspb.SchemaChangeProgress{},
 		}

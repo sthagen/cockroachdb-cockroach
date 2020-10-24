@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -131,8 +131,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	clusterID := &cfg.RPCContext.ClusterID
 	server := rpc.NewServer(cfg.RPCContext) // never started
 	ltc.Gossip = gossip.New(ambient, clusterID, nc, cfg.RPCContext, server, ltc.stopper, metric.NewRegistry(), roachpb.Locality{}, zonepb.DefaultZoneConfigRef())
-	ltc.Eng = storage.NewInMem(ambient.AnnotateCtx(context.Background()),
-		storage.DefaultStorageEngine, roachpb.Attributes{}, 50<<20)
+	ltc.Eng = storage.NewInMem(ambient.AnnotateCtx(context.Background()), roachpb.Attributes{}, 50<<20)
 	ltc.stopper.AddCloser(ltc.Eng)
 
 	ltc.Stores = kvserver.NewStores(ambient, ltc.Clock)
@@ -145,7 +144,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	ltc.dbContext = &kv.DBContext{
 		UserPriority: roachpb.NormalUserPriority,
 		Stopper:      ltc.stopper,
-		NodeID:       base.NewSQLIDContainer(0, &nodeIDContainer, true /* exposed */),
+		NodeID:       base.NewSQLIDContainer(0, &nodeIDContainer),
 	}
 	ltc.DB = kv.NewDBWithContext(cfg.AmbientCtx, factory, ltc.Clock, *ltc.dbContext)
 	transport := kvserver.NewDummyRaftTransport(cfg.Settings)
@@ -162,16 +161,16 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	cfg.Gossip = ltc.Gossip
 	cfg.HistogramWindowInterval = metric.TestSampleInterval
 	active, renewal := cfg.NodeLivenessDurations()
-	cfg.NodeLiveness = kvserver.NewNodeLiveness(
-		cfg.AmbientCtx,
-		cfg.Clock,
-		cfg.DB,
-		cfg.Gossip,
-		active,
-		renewal,
-		cfg.Settings,
-		cfg.HistogramWindowInterval,
-	)
+	cfg.NodeLiveness = kvserver.NewNodeLiveness(kvserver.NodeLivenessOptions{
+		AmbientCtx:              cfg.AmbientCtx,
+		Clock:                   cfg.Clock,
+		DB:                      cfg.DB,
+		Gossip:                  cfg.Gossip,
+		LivenessThreshold:       active,
+		RenewalDuration:         renewal,
+		Settings:                cfg.Settings,
+		HistogramWindowInterval: cfg.HistogramWindowInterval,
+	})
 	kvserver.TimeUntilStoreDead.Override(&cfg.Settings.SV, kvserver.TestTimeUntilStoreDead)
 	cfg.StorePool = kvserver.NewStorePool(
 		cfg.AmbientCtx,
@@ -198,7 +197,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	var initialValues []roachpb.KeyValue
 	var splits []roachpb.RKey
 	if !ltc.DontCreateSystemRanges {
-		schema := sqlbase.MakeMetadataSchema(
+		schema := bootstrap.MakeMetadataSchema(
 			keys.SystemSQLCodec, cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig,
 		)
 		var tableSplits []roachpb.RKey
@@ -221,8 +220,16 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		t.Fatalf("unable to start local test cluster: %s", err)
 	}
 
+	// The heartbeat loop depends on gossip to retrieve the node ID, so we're
+	// sure to set it first.
+	nc.Set(ctx, nodeDesc.NodeID)
+	if err := ltc.Gossip.SetNodeDescriptor(nodeDesc); err != nil {
+		t.Fatalf("unable to set node descriptor: %s", err)
+	}
+
 	if !ltc.DisableLivenessHeartbeat {
-		cfg.NodeLiveness.StartHeartbeat(ctx, ltc.stopper, []storage.Engine{ltc.Eng}, nil /* alive */)
+		cfg.NodeLiveness.Start(ctx,
+			kvserver.NodeLivenessStartOptions{Stopper: ltc.stopper, Engines: []storage.Engine{ltc.Eng}})
 	}
 
 	if err := ltc.Store.Start(ctx, ltc.stopper); err != nil {
@@ -230,10 +237,6 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	}
 
 	ltc.Stores.AddStore(ltc.Store)
-	nc.Set(ctx, nodeDesc.NodeID)
-	if err := ltc.Gossip.SetNodeDescriptor(nodeDesc); err != nil {
-		t.Fatalf("unable to set node descriptor: %s", err)
-	}
 	ltc.Cfg = cfg
 }
 

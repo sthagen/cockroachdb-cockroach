@@ -29,7 +29,7 @@ docker_login_with_google() {
 }
 
 docker_login() {
-  echo "${DOCKER_AUTH}" | docker login --username "${DOCKER_ID}" --password-stdin
+  echo "${DOCKER_ACCESS_TOKEN}" | docker login --username "${DOCKER_ID}" --password-stdin
 }
 
 configure_docker_creds() {
@@ -59,5 +59,6 @@ configure_git_ssh_key() {
 }
 
 push_to_git() {
-  GIT_SSH_COMMAND="ssh -i .cockroach-teamcity-key" git push $1 $2
+  # $@ passes all arguments to this function to the command
+  GIT_SSH_COMMAND="ssh -i .cockroach-teamcity-key" git push "$@"
 }

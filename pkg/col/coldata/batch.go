@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -41,8 +42,8 @@ type Batch interface {
 	// ColVecs returns all of the underlying Vecs in this batch.
 	ColVecs() []Vec
 	// Selection, if not nil, returns the selection vector on this batch: a
-	// densely-packed list of the indices in each column that have not been
-	// filtered out by a previous step.
+	// densely-packed list of the *increasing* indices in each column that have
+	// not been filtered out by a previous step.
 	Selection() []int
 	// SetSelection sets whether this batch is using its selection vector or not.
 	SetSelection(bool)
@@ -72,15 +73,21 @@ type Batch interface {
 
 var _ Batch = &MemBatch{}
 
-// TODO(jordan): tune.
-const defaultBatchSize = 1024
+// defaultBatchSize is the size of batches that is used in the non-test setting.
+// Initially, 1024 was picked based on MonetDB/X100 paper and was later
+// confirmed to be very good using tpchvec/bench benchmark on TPC-H queries
+// (the best number according to that benchmark was 1280, but it was negligibly
+// better, so we decided to keep 1024 as it is a power of 2).
+var defaultBatchSize = int64(util.ConstantWithMetamorphicTestRange(
+	1024, /* defaultValue */
+	// min is set to 3 to match colexec's minBatchSize setting.
+	3, /* min */
+	MaxBatchSize,
+))
 
-var batchSize int64 = defaultBatchSize
+var batchSize = defaultBatchSize
 
 // BatchSize is the maximum number of tuples that fit in a column batch.
-// TODO(yuzefovich): we are treating this method almost as if it were a
-// constant while it performs an atomic operation. Think through whether it has
-// a noticeable performance hit.
 func BatchSize() int {
 	return int(atomic.LoadInt64(&batchSize))
 }

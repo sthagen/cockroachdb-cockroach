@@ -21,7 +21,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colfetcher"
@@ -29,7 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -127,13 +129,30 @@ func (r *opResult) resetToState(ctx context.Context, arg colexec.NewColOperatorR
 	*r.NewColOperatorResult = arg
 }
 
+func needHashAggregator(aggSpec *execinfrapb.AggregatorSpec) (bool, error) {
+	var groupCols, orderedCols util.FastIntSet
+	for _, col := range aggSpec.OrderedGroupCols {
+		orderedCols.Add(int(col))
+	}
+	for _, col := range aggSpec.GroupCols {
+		if !orderedCols.Contains(int(col)) {
+			return true, nil
+		}
+		groupCols.Add(int(col))
+	}
+	if !orderedCols.SubsetOf(groupCols) {
+		return false, errors.AssertionFailedf("ordered cols must be a subset of grouping cols")
+	}
+	return false, nil
+}
+
 // isSupported checks whether we have a columnar operator equivalent to a
 // processor described by spec. Note that it doesn't perform any other checks
 // (like validity of the number of inputs).
-func isSupported(mode sessiondata.VectorizeExecMode, spec *execinfrapb.ProcessorSpec) error {
+func isSupported(mode sessiondatapb.VectorizeExecMode, spec *execinfrapb.ProcessorSpec) error {
 	core := spec.Core
-	isFullVectorization := mode == sessiondata.VectorizeOn ||
-		mode == sessiondata.VectorizeExperimentalAlways
+	isFullVectorization := mode == sessiondatapb.VectorizeOn ||
+		mode == sessiondatapb.VectorizeExperimentalAlways
 
 	switch {
 	case core.Noop != nil:
@@ -153,12 +172,13 @@ func isSupported(mode sessiondata.VectorizeExecMode, spec *execinfrapb.Processor
 
 	case core.Aggregator != nil:
 		aggSpec := core.Aggregator
+		needHash, err := needHashAggregator(aggSpec)
+		if err != nil {
+			return err
+		}
 		for _, agg := range aggSpec.Aggregations {
-			if agg.Distinct {
-				return errors.Newf("distinct aggregation not supported")
-			}
-			if agg.FilterColIdx != nil {
-				return errors.Newf("filtering aggregation not supported")
+			if agg.FilterColIdx != nil && !needHash {
+				return errors.Newf("filtering ordered aggregation not supported")
 			}
 		}
 		return nil
@@ -377,7 +397,7 @@ func (r opResult) createDiskBackedSort(
 				args.FDSemaphore,
 				diskAccount,
 			)
-			r.ToClose = append(r.ToClose, es.(colexec.Closer))
+			r.ToClose = append(r.ToClose, es.(colexecbase.Closer))
 			return es
 		},
 		args.TestingKnobs.SpillingCallbackFn,
@@ -411,9 +431,9 @@ func (r opResult) createAndWrapRowSource(
 	}
 	if spec.Core.JoinReader == nil {
 		switch flowCtx.EvalCtx.SessionData.VectorizeMode {
-		case sessiondata.Vectorize201Auto:
+		case sessiondatapb.Vectorize201Auto:
 			return errors.New("rowexec processor wrapping for non-JoinReader core unsupported in vectorize=201auto mode")
-		case sessiondata.VectorizeExperimentalAlways:
+		case sessiondatapb.VectorizeExperimentalAlways:
 			return causeToWrap
 		}
 	}
@@ -436,6 +456,9 @@ func (r opResult) createAndWrapRowSource(
 			)
 			if err != nil {
 				return nil, err
+			}
+			if ioReader, ok := proc.(execinfra.IOReader); ok {
+				r.IOReader = ioReader
 			}
 			var (
 				rs execinfra.RowSource
@@ -510,7 +533,7 @@ func NewColOperator(
 			result.OpMonitors = result.OpMonitors[:0]
 		}
 		if panicErr != nil {
-			colexecerror.InternalError(panicErr)
+			colexecerror.InternalError(log.PanicAsError(0, panicErr))
 		}
 	}()
 	spec := args.Spec
@@ -555,6 +578,19 @@ func NewColOperator(
 		if core.MetadataTestReceiver != nil {
 			return r, errors.Newf("core.MetadataTestReceiver is not supported")
 		}
+		// We do not wrap Change{Aggregator,Frontier} because these processors
+		// are very row-oriented and the Columnarizer might block indefinitely
+		// while buffering coldata.BatchSize() tuples to emit as a single
+		// batch.
+		if core.ChangeAggregator != nil {
+			return r, errors.Newf("core.ChangeAggregator is not supported")
+		}
+		if core.ChangeFrontier != nil {
+			return r, errors.Newf("core.ChangeFrontier is not supported")
+		}
+		// We do not wrap InvertedFilterer because that processor just happen
+		// to work due to the inverted data not being decoded which the
+		// ColBatchScan will attempt to do and will fail. See #50695.
 		if core.InvertedFilterer != nil {
 			// colfetcher.cfetcher currently tries to decode the inverted
 			// column needed for inverted filtering, but that inverted column is
@@ -605,11 +641,12 @@ func NewColOperator(
 			if err := checkNumIn(inputs, 0); err != nil {
 				return r, err
 			}
-			scanOp, err := colfetcher.NewColBatchScan(streamingAllocator, flowCtx, core.TableReader, post)
+			scanOp, err := colfetcher.NewColBatchScan(ctx, streamingAllocator, flowCtx, core.TableReader, post)
 			if err != nil {
 				return r, err
 			}
 			result.Op, result.IsStreaming = scanOp, true
+			result.IOReader = scanOp
 			result.MetadataSources = append(result.MetadataSources, scanOp)
 			// colBatchScan is wrapped with a cancel checker below, so we need to
 			// log its creation separately.
@@ -649,28 +686,18 @@ func NewColOperator(
 				break
 			}
 
-			var groupCols, orderedCols util.FastIntSet
-			for _, col := range aggSpec.OrderedGroupCols {
-				orderedCols.Add(int(col))
+			var needHash bool
+			needHash, err = needHashAggregator(aggSpec)
+			if err != nil {
+				return r, err
 			}
-			needHash := false
-			for _, col := range aggSpec.GroupCols {
-				if !orderedCols.Contains(int(col)) {
-					needHash = true
-				}
-				groupCols.Add(int(col))
-			}
-			if !orderedCols.SubsetOf(groupCols) {
-				return r, errors.AssertionFailedf("ordered cols must be a subset of grouping cols")
-			}
-
 			inputTypes := make([]*types.T, len(spec.Input[0].ColumnTypes))
 			copy(inputTypes, spec.Input[0].ColumnTypes)
 			evalCtx := flowCtx.NewEvalCtx()
 			var constructors []execinfrapb.AggregateConstructor
 			var constArguments []tree.Datums
 			semaCtx := flowCtx.TypeResolverFactory.NewSemaContext(flowCtx.EvalCtx.Txn)
-			constructors, constArguments, result.ColumnTypes, err = colexec.ProcessAggregations(
+			constructors, constArguments, result.ColumnTypes, err = colexecagg.ProcessAggregations(
 				evalCtx, semaCtx, aggSpec.Aggregations, inputTypes,
 			)
 			if err != nil {
@@ -691,18 +718,18 @@ func NewColOperator(
 				evalCtx.SingleDatumAggMemAccount = hashAggregatorMemAccount
 				result.Op, err = colexec.NewHashAggregator(
 					colmem.NewAllocator(ctx, hashAggregatorMemAccount, factory),
-					inputs[0], inputTypes, aggSpec, evalCtx, constructors,
-					constArguments, result.ColumnTypes,
+					hashAggregatorMemAccount, inputs[0], inputTypes, aggSpec,
+					evalCtx, constructors, constArguments, result.ColumnTypes,
 				)
 			} else {
 				evalCtx.SingleDatumAggMemAccount = streamingMemAccount
 				result.Op, err = colexec.NewOrderedAggregator(
-					streamingAllocator, inputs[0], inputTypes, aggSpec, evalCtx,
-					constructors, constArguments, result.ColumnTypes, aggSpec.IsScalar(),
+					streamingAllocator, streamingMemAccount, inputs[0], inputTypes, aggSpec,
+					evalCtx, constructors, constArguments, result.ColumnTypes, aggSpec.IsScalar(),
 				)
 				result.IsStreaming = true
 			}
-			result.ToClose = append(result.ToClose, result.Op.(colexec.Closer))
+			result.ToClose = append(result.ToClose, result.Op.(colexecbase.Closer))
 
 		case core.Distinct != nil:
 			if err := checkNumIn(inputs, 1); err != nil {
@@ -731,7 +758,7 @@ func NewColOperator(
 				// input is about 0.01 or less.
 				result.Op = colexec.NewUnorderedDistinct(
 					colmem.NewAllocator(ctx, distinctMemAccount, factory), inputs[0],
-					core.Distinct.DistinctColumns, result.ColumnTypes, colexec.HashTableNumBuckets,
+					core.Distinct.DistinctColumns, result.ColumnTypes,
 				)
 			}
 
@@ -755,11 +782,16 @@ func NewColOperator(
 
 			hashJoinerMemMonitorName := fmt.Sprintf("hash-joiner-%d", spec.ProcessorID)
 			var hashJoinerMemAccount *mon.BoundAccount
+			var hashJoinerUnlimitedAllocator *colmem.Allocator
 			if useStreamingMemAccountForBuffering {
 				hashJoinerMemAccount = streamingMemAccount
+				hashJoinerUnlimitedAllocator = streamingAllocator
 			} else {
 				hashJoinerMemAccount = result.createMemAccountForSpillStrategy(
 					ctx, flowCtx, hashJoinerMemMonitorName,
+				)
+				hashJoinerUnlimitedAllocator = colmem.NewAllocator(
+					ctx, result.createBufferingUnlimitedMemAccount(ctx, flowCtx, hashJoinerMemMonitorName), factory,
 				)
 			}
 			// It is valid for empty set of equality columns to be considered as
@@ -778,8 +810,10 @@ func NewColOperator(
 			if err != nil {
 				return r, err
 			}
+
 			inMemoryHashJoiner := colexec.NewHashJoiner(
-				colmem.NewAllocator(ctx, hashJoinerMemAccount, factory), hjSpec, inputs[0], inputs[1],
+				colmem.NewAllocator(ctx, hashJoinerMemAccount, factory),
+				hashJoinerUnlimitedAllocator, hjSpec, inputs[0], inputs[1],
 			)
 			if args.TestingKnobs.DiskSpillingDisabled {
 				// We will not be creating a disk-backed hash joiner because we're
@@ -794,9 +828,8 @@ func NewColOperator(
 					func(inputOne, inputTwo colexecbase.Operator) colexecbase.Operator {
 						monitorNamePrefix := "external-hash-joiner"
 						unlimitedAllocator := colmem.NewAllocator(
-							ctx, result.createBufferingUnlimitedMemAccount(
-								ctx, flowCtx, monitorNamePrefix,
-							), factory)
+							ctx, result.createBufferingUnlimitedMemAccount(ctx, flowCtx, monitorNamePrefix), factory,
+						)
 						// Make a copy of the DiskQueueCfg and set defaults for the hash
 						// joiner. The cache mode is chosen to automatically close the cache
 						// belonging to partitions at a parent level when repartitioning.
@@ -827,7 +860,7 @@ func NewColOperator(
 							args.TestingKnobs.DelegateFDAcquisitions,
 							diskAccount,
 						)
-						result.ToClose = append(result.ToClose, ehj.(colexec.Closer))
+						result.ToClose = append(result.ToClose, ehj.(colexecbase.Closer))
 						return ehj
 					},
 					args.TestingKnobs.SpillingCallbackFn,
@@ -896,7 +929,7 @@ func NewColOperator(
 			}
 
 			result.Op = mj
-			result.ToClose = append(result.ToClose, mj.(colexec.Closer))
+			result.ToClose = append(result.ToClose, mj.(colexecbase.Closer))
 			result.ColumnTypes = make([]*types.T, len(leftTypes)+len(rightTypes))
 			copy(result.ColumnTypes, leftTypes)
 			if !core.MergeJoiner.Type.ShouldIncludeRightColsInOutput() {
@@ -1014,7 +1047,7 @@ func NewColOperator(
 					// NewRelativeRankOperator sometimes returns a constOp when there
 					// are no ordering columns, so we check that the returned operator
 					// is an Closer.
-					if c, ok := result.Op.(colexec.Closer); ok {
+					if c, ok := result.Op.(colexecbase.Closer); ok {
 						result.ToClose = append(result.ToClose, c)
 					}
 				default:
@@ -1577,7 +1610,7 @@ func planProjectionOperators(
 			// operator.
 			return colexec.NewConstNullOp(colmem.NewAllocator(ctx, acc, factory), input, resultIdx), nil
 		}
-		constVal := colexec.GetDatumToPhysicalFn(datumType)(datum)
+		constVal := colconv.GetDatumToPhysicalFn(datumType)(datum)
 		return colexec.NewConstOp(colmem.NewAllocator(ctx, acc, factory), input, datumType, constVal, resultIdx)
 	}
 	resultIdx = -1
@@ -1990,7 +2023,7 @@ func planLogicalProjectionOp(
 		typedLeft = t.TypedLeft()
 		typedRight = t.TypedRight()
 	default:
-		colexecerror.InternalError(fmt.Sprintf("unexpected logical expression type %s", t.String()))
+		colexecerror.InternalError(errors.AssertionFailedf("unexpected logical expression type %s", t.String()))
 	}
 	leftProjOpChain, leftIdx, typs, internalMemUsedLeft, err = planProjectionOperators(
 		ctx, evalCtx, typedLeft, typs, leftFeedOp, acc, factory,

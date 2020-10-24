@@ -15,12 +15,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
 // TestingKnobs configures a LimiterFactory for testing.
 type TestingKnobs struct {
-	TimeSource quotapool.TimeSource
+	TimeSource timeutil.TimeSource
 }
 
 // LimiterFactory constructs and manages per-tenant Limiters.
@@ -64,8 +65,9 @@ func NewLimiterFactory(st *cluster.Settings, knobs *TestingKnobs) *LimiterFactor
 
 // GetTenant gets or creates a limiter for the given tenant. The limiters are
 // reference counted; call Destroy on the returned limiter when it is no longer
-// in use.
-func (rl *LimiterFactory) GetTenant(tenantID roachpb.TenantID) Limiter {
+// in use. If the closer channel is non-nil, closing it will lead to any blocked
+// requests becoming unblocked.
+func (rl *LimiterFactory) GetTenant(tenantID roachpb.TenantID, closer <-chan struct{}) Limiter {
 
 	if tenantID == roachpb.SystemTenantID {
 		return &rl.systemLimiter
@@ -79,6 +81,9 @@ func (rl *LimiterFactory) GetTenant(tenantID roachpb.TenantID) Limiter {
 		var options []quotapool.Option
 		if rl.knobs.TimeSource != nil {
 			options = append(options, quotapool.WithTimeSource(rl.knobs.TimeSource))
+		}
+		if closer != nil {
+			options = append(options, quotapool.WithCloser(closer))
 		}
 		rcLim = new(refCountedLimiter)
 		rcLim.lim.init(rl, tenantID, rl.mu.limits, rl.metrics.tenantMetrics(tenantID), options...)

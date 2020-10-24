@@ -28,14 +28,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -45,8 +46,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgproto3/v2"
 	"github.com/jackc/pgx"
-	"github.com/jackc/pgx/pgproto3"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -185,6 +186,211 @@ func TestConn(t *testing.T) {
 	}
 }
 
+func TestConnMessageTooBig(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	params, _ := tests.CreateTestServerParams()
+	s, mainDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+
+	// Form a 1MB string.
+	longStr := "a"
+	for len(longStr) < 1<<20 {
+		longStr += longStr
+	}
+	shortStr := "b"
+
+	_, err := mainDB.Exec("CREATE TABLE tbl(str TEXT)")
+	require.NoError(t, err)
+
+	testCases := []struct {
+		desc              string
+		shortStrAction    func(*pgx.Conn) error
+		longStrAction     func(*pgx.Conn) error
+		postLongStrAction func(*pgx.Conn) error
+		expectedErrRegex  string
+	}{
+		{
+			desc: "simple query",
+			shortStrAction: func(c *pgx.Conn) error {
+				_, err := c.Exec(fmt.Sprintf(`SELECT '%s'`, shortStr))
+				return err
+			},
+			longStrAction: func(c *pgx.Conn) error {
+				_, err := c.Exec(fmt.Sprintf(`SELECT '%s'`, longStr))
+				return err
+			},
+			postLongStrAction: func(c *pgx.Conn) error {
+				_, err := c.Exec("SELECT 1")
+				return err
+			},
+			expectedErrRegex: "message size 1.0 MiB bigger than maximum allowed message size 32 KiB",
+		},
+		{
+			desc: "copy",
+			shortStrAction: func(c *pgx.Conn) error {
+				_, err := c.CopyFrom(
+					pgx.Identifier{"tbl"},
+					[]string{"str"},
+					pgx.CopyFromRows([][]interface{}{
+						{shortStr},
+					}),
+				)
+				return err
+			},
+			longStrAction: func(c *pgx.Conn) error {
+				_, err := c.CopyFrom(
+					pgx.Identifier{"tbl"},
+					[]string{"str"},
+					pgx.CopyFromRows([][]interface{}{
+						{longStr},
+					}),
+				)
+				return err
+			},
+			postLongStrAction: func(c *pgx.Conn) error {
+				_, err := c.CopyFrom(
+					pgx.Identifier{"tbl"},
+					[]string{"str"},
+					pgx.CopyFromRows([][]interface{}{
+						{shortStr},
+					}),
+				)
+				return err
+			},
+			expectedErrRegex: "message size 1.0 MiB bigger than maximum allowed message size 32 KiB",
+		},
+		{
+			desc: "prepared statement has string",
+			shortStrAction: func(c *pgx.Conn) error {
+				_, err := c.Prepare("short_statement", fmt.Sprintf("SELECT $1::string, '%s'", shortStr))
+				if err != nil {
+					return err
+				}
+				r := c.QueryRow("short_statement", shortStr)
+				var str string
+				return r.Scan(&str, &str)
+			},
+			longStrAction: func(c *pgx.Conn) error {
+				_, err := c.Prepare("long_statement", fmt.Sprintf("SELECT $1::string, '%s'", longStr))
+				if err != nil {
+					return err
+				}
+				r := c.QueryRow("long_statement", shortStr)
+				var str string
+				return r.Scan(&str, &str)
+			},
+			expectedErrRegex: "(EOF)|(broken pipe)|(connection reset by peer)|(write tcp)",
+		},
+		{
+			desc: "prepared statement with argument",
+			shortStrAction: func(c *pgx.Conn) error {
+				_, err := c.Prepare("short_arg", "SELECT $1::string")
+				if err != nil {
+					return err
+				}
+				r := c.QueryRow("short_arg", shortStr)
+				var str string
+				return r.Scan(&str)
+			},
+			longStrAction: func(c *pgx.Conn) error {
+				_, err := c.Prepare("long_arg", "SELECT $1::string")
+				if err != nil {
+					return err
+				}
+				r := c.QueryRow("long_arg", longStr)
+				var str string
+				return r.Scan(&str)
+			},
+			expectedErrRegex: "(EOF)|(broken pipe)|(connection reset by peer)|(write tcp)",
+		},
+	}
+
+	pgURL, cleanup := sqlutils.PGUrl(
+		t,
+		s.ServingSQLAddr(),
+		"TestBigClientMessage",
+		url.User(security.RootUser),
+	)
+	defer cleanup()
+
+	t.Run("allow big messages", func(t *testing.T) {
+		for _, tc := range testCases {
+			t.Run(tc.desc, func(t *testing.T) {
+				conf, err := pgx.ParseConnectionString(pgURL.String())
+				require.NoError(t, err)
+
+				t.Run("short string", func(t *testing.T) {
+					c, err := pgx.Connect(conf)
+					require.NoError(t, err)
+					defer func() { _ = c.Close() }()
+					require.NoError(t, tc.shortStrAction(c))
+				})
+
+				t.Run("long string", func(t *testing.T) {
+					c, err := pgx.Connect(conf)
+					require.NoError(t, err)
+					defer func() { _ = c.Close() }()
+					require.NoError(t, tc.longStrAction(c))
+				})
+			})
+		}
+	})
+
+	// Set the cluster setting to be less than 1MB.
+	_, err = mainDB.Exec(`SET CLUSTER SETTING sql.conn.max_read_buffer_message_size = '32 KiB'`)
+	require.NoError(t, err)
+
+	t.Run("disallow big messages", func(t *testing.T) {
+		for _, tc := range testCases {
+			t.Run(tc.desc, func(t *testing.T) {
+				conf, err := pgx.ParseConnectionString(pgURL.String())
+				require.NoError(t, err)
+
+				t.Run("short string", func(t *testing.T) {
+					c, err := pgx.Connect(conf)
+					require.NoError(t, err)
+					defer func() { _ = c.Close() }()
+					require.NoError(t, tc.shortStrAction(c))
+				})
+
+				t.Run("long string", func(t *testing.T) {
+					var gotErr error
+					var c *pgx.Conn
+					defer func() {
+						if c != nil {
+							_ = c.Close()
+						}
+					}()
+					// Allow the cluster setting to propagate.
+					testutils.SucceedsSoon(t, func() error {
+						var err error
+						c, err = pgx.Connect(conf)
+						require.NoError(t, err)
+
+						err = tc.longStrAction(c)
+						if err != nil {
+							gotErr = err
+							return nil
+						}
+						defer func() { _ = c.Close() }()
+						return errors.Newf("expected error")
+					})
+
+					// We should still be able to use the connection afterwards.
+					require.Error(t, gotErr)
+					require.Regexp(t, tc.expectedErrRegex, gotErr.Error())
+
+					if tc.postLongStrAction != nil {
+						require.NoError(t, tc.postLongStrAction(c))
+					}
+				})
+			})
+		}
+	})
+}
+
 // processPgxStartup processes the first few queries that the pgx driver
 // automatically sends on a new connection that has been established.
 func processPgxStartup(ctx context.Context, s serverutils.TestServerInterface, c *conn) error {
@@ -228,7 +434,7 @@ func execQuery(
 ) error {
 	rows, cols, err := s.InternalExecutor().(sqlutil.InternalExecutor).QueryWithCols(
 		ctx, "test", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser, Database: "system"},
+		sessiondata.InternalExecutorOverride{User: security.RootUser, Database: "system"},
 		query,
 	)
 	if err != nil {
@@ -318,7 +524,7 @@ func waitForClientConn(ln net.Listener) (*conn, error) {
 		return nil, err
 	}
 
-	var buf pgwirebase.ReadBuffer
+	buf := pgwirebase.MakeReadBuffer()
 	_, err = buf.ReadUntypedMsg(conn)
 	if err != nil {
 		return nil, err
@@ -341,11 +547,10 @@ func waitForClientConn(ln net.Listener) (*conn, error) {
 	return pgwireConn, nil
 }
 
-func makeTestingConvCfg() sessiondata.DataConversionConfig {
-	return sessiondata.DataConversionConfig{
-		Location:          time.UTC,
-		BytesEncodeFormat: lex.BytesEncodeHex,
-	}
+func makeTestingConvCfg() (sessiondatapb.DataConversionConfig, *time.Location) {
+	return sessiondatapb.DataConversionConfig{
+		BytesEncodeFormat: sessiondatapb.BytesEncodeHex,
+	}, time.UTC
 }
 
 // sendResult serializes a set of rows in pgwire format and sends them on a
@@ -354,18 +559,18 @@ func makeTestingConvCfg() sessiondata.DataConversionConfig {
 // TODO(andrei): Tests using this should probably switch to using the similar
 // routines in the connection once conn learns how to write rows.
 func sendResult(
-	ctx context.Context, c *conn, cols sqlbase.ResultColumns, rows []tree.Datums,
+	ctx context.Context, c *conn, cols colinfo.ResultColumns, rows []tree.Datums,
 ) error {
 	if err := c.writeRowDescription(ctx, cols, nil /* formatCodes */, c.conn); err != nil {
 		return err
 	}
 
-	defaultConv := makeTestingConvCfg()
+	defaultConv, defaultLoc := makeTestingConvCfg()
 	for _, row := range rows {
 		c.msgBuilder.initMsg(pgwirebase.ServerMsgDataRow)
 		c.msgBuilder.putInt16(int16(len(row)))
 		for i, col := range row {
-			c.msgBuilder.writeTextDatum(ctx, col, defaultConv, cols[i].Typ)
+			c.msgBuilder.writeTextDatum(ctx, col, defaultConv, defaultLoc, cols[i].Typ)
 		}
 
 		if err := c.msgBuilder.finishMsg(c.conn); err != nil {
@@ -1031,10 +1236,7 @@ func TestConnCloseCancelsAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fe, err := pgproto3.NewFrontend(conn, conn)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fe := pgproto3.NewFrontend(pgproto3.NewChunkReader(conn), conn)
 	if err := fe.Send(&pgproto3.StartupMessage{ProtocolVersion: version30}); err != nil {
 		t.Fatal(err)
 	}

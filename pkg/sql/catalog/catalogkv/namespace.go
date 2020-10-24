@@ -17,8 +17,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -58,6 +58,40 @@ import (
 // this can cause issues in mixed version clusters. Please use the provided
 // removal/lookup methods for those cases.
 
+// WriteObjectNamespaceEntryRemovalToBatch writes Del operations to b for
+// both the deprecated and new system.namespace table (if one exists).
+func WriteObjectNamespaceEntryRemovalToBatch(
+	ctx context.Context,
+	b *kv.Batch,
+	codec keys.SQLCodec,
+	parentID descpb.ID,
+	parentSchemaID descpb.ID,
+	name string,
+	KVTrace bool,
+) {
+	var toDelete []catalogkeys.DescriptorKey
+	// The (parentID, name) mapping could be in either the new system.namespace
+	// or the deprecated version. Thus we try to remove the mapping from both.
+	if parentID == keys.RootNamespaceID {
+		toDelete = append(toDelete, catalogkeys.NewDatabaseKey(name))
+		// TODO(solon): This can be completely removed in 20.2.
+		toDelete = append(toDelete, catalogkeys.NewDeprecatedDatabaseKey(name))
+	} else if parentSchemaID == keys.RootNamespaceID {
+		// Schemas were introduced in 20.1.
+		toDelete = append(toDelete, catalogkeys.NewSchemaKey(parentID, name))
+	} else {
+		toDelete = append(toDelete, catalogkeys.NewTableKey(parentID, parentSchemaID, name))
+		// TODO(solon): This can be completely removed in 20.2.
+		toDelete = append(toDelete, catalogkeys.NewDeprecatedTableKey(parentID, name))
+	}
+	for _, delKey := range toDelete {
+		if KVTrace {
+			log.VEventf(ctx, 2, "Del %s", delKey)
+		}
+		b.Del(delKey.Key(codec))
+	}
+}
+
 // RemoveObjectNamespaceEntry removes entries from both the deprecated and
 // new system.namespace table (if one exists).
 func RemoveObjectNamespaceEntry(
@@ -70,36 +104,8 @@ func RemoveObjectNamespaceEntry(
 	KVTrace bool,
 ) error {
 	b := txn.NewBatch()
-	var toDelete []sqlbase.DescriptorKey
-	// The (parentID, name) mapping could be in either the new system.namespace
-	// or the deprecated version. Thus we try to remove the mapping from both.
-	if parentID == keys.RootNamespaceID {
-		toDelete = append(toDelete, sqlbase.NewDatabaseKey(name))
-		// TODO(solon): This can be completely removed in 20.2.
-		toDelete = append(toDelete, sqlbase.NewDeprecatedDatabaseKey(name))
-	} else if parentSchemaID == keys.RootNamespaceID {
-		// Schemas were introduced in 20.1.
-		toDelete = append(toDelete, sqlbase.NewSchemaKey(parentID, name))
-	} else {
-		toDelete = append(toDelete, sqlbase.NewTableKey(parentID, parentSchemaID, name))
-		// TODO(solon): This can be completely removed in 20.2.
-		toDelete = append(toDelete, sqlbase.NewDeprecatedTableKey(parentID, name))
-	}
-	for _, delKey := range toDelete {
-		if KVTrace {
-			log.VEventf(ctx, 2, "Del %s", delKey)
-		}
-		b.Del(delKey.Key(codec))
-	}
+	WriteObjectNamespaceEntryRemovalToBatch(ctx, b, codec, parentID, parentSchemaID, name, KVTrace)
 	return txn.Run(ctx, b)
-}
-
-// RemovePublicTableNamespaceEntry is a wrapper around RemoveObjectNamespaceEntry
-// for public tables.
-func RemovePublicTableNamespaceEntry(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, parentID descpb.ID, name string,
-) error {
-	return RemoveObjectNamespaceEntry(ctx, txn, codec, parentID, keys.PublicSchemaID, name, false /* KVTrace */)
 }
 
 // RemoveSchemaNamespaceEntry is a wrapper around RemoveObjectNamespaceEntry
@@ -108,14 +114,6 @@ func RemoveSchemaNamespaceEntry(
 	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, parentID descpb.ID, name string,
 ) error {
 	return RemoveObjectNamespaceEntry(ctx, txn, codec, parentID, keys.RootNamespaceID, name, false /* KVTrace */)
-}
-
-// RemoveDatabaseNamespaceEntry is a wrapper around RemoveObjectNamespaceEntry
-// for databases.
-func RemoveDatabaseNamespaceEntry(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, name string, KVTrace bool,
-) error {
-	return RemoveObjectNamespaceEntry(ctx, txn, codec, keys.RootNamespaceID, keys.RootNamespaceID, name, KVTrace)
 }
 
 // MakeObjectNameKey returns a key in the system.namespace table for
@@ -129,18 +127,18 @@ func MakeObjectNameKey(
 	parentID descpb.ID,
 	parentSchemaID descpb.ID,
 	name string,
-) sqlbase.DescriptorKey {
+) catalogkeys.DescriptorKey {
 	// TODO(solon): This if condition can be removed in 20.2
 	if !settings.Version.IsActive(ctx, clusterversion.VersionNamespaceTableWithSchemas) {
-		return sqlbase.NewDeprecatedTableKey(parentID, name)
+		return catalogkeys.NewDeprecatedTableKey(parentID, name)
 	}
-	var key sqlbase.DescriptorKey
+	var key catalogkeys.DescriptorKey
 	if parentID == keys.RootNamespaceID {
-		key = sqlbase.NewDatabaseKey(name)
+		key = catalogkeys.NewDatabaseKey(name)
 	} else if parentSchemaID == keys.RootNamespaceID {
-		key = sqlbase.NewSchemaKey(parentID, name)
+		key = catalogkeys.NewSchemaKey(parentID, name)
 	} else {
-		key = sqlbase.NewTableKey(parentID, parentSchemaID, name)
+		key = catalogkeys.NewTableKey(parentID, parentSchemaID, name)
 	}
 	return key
 }
@@ -148,14 +146,14 @@ func MakeObjectNameKey(
 // MakePublicTableNameKey is a wrapper around MakeObjectNameKey for public tables.
 func MakePublicTableNameKey(
 	ctx context.Context, settings *cluster.Settings, parentID descpb.ID, name string,
-) sqlbase.DescriptorKey {
+) catalogkeys.DescriptorKey {
 	return MakeObjectNameKey(ctx, settings, parentID, keys.PublicSchemaID, name)
 }
 
 // MakeDatabaseNameKey is a wrapper around MakeObjectNameKey for databases.
 func MakeDatabaseNameKey(
 	ctx context.Context, settings *cluster.Settings, name string,
-) sqlbase.DescriptorKey {
+) catalogkeys.DescriptorKey {
 	return MakeObjectNameKey(ctx, settings, keys.RootNamespaceID, keys.RootNamespaceID, name)
 }
 
@@ -170,13 +168,13 @@ func LookupObjectID(
 	parentSchemaID descpb.ID,
 	name string,
 ) (bool, descpb.ID, error) {
-	var key sqlbase.DescriptorKey
+	var key catalogkeys.DescriptorKey
 	if parentID == keys.RootNamespaceID {
-		key = sqlbase.NewDatabaseKey(name)
+		key = catalogkeys.NewDatabaseKey(name)
 	} else if parentSchemaID == keys.RootNamespaceID {
-		key = sqlbase.NewSchemaKey(parentID, name)
+		key = catalogkeys.NewSchemaKey(parentID, name)
 	} else {
-		key = sqlbase.NewTableKey(parentID, parentSchemaID, name)
+		key = catalogkeys.NewTableKey(parentID, parentSchemaID, name)
 	}
 	log.Eventf(ctx, "looking up descriptor ID for name key %q", key.Key(codec))
 	res, err := txn.Get(ctx, key.Key(codec))
@@ -203,11 +201,11 @@ func LookupObjectID(
 		return false, descpb.InvalidID, nil
 	}
 
-	var dKey sqlbase.DescriptorKey
+	var dKey catalogkeys.DescriptorKey
 	if parentID == keys.RootNamespaceID {
-		dKey = sqlbase.NewDeprecatedDatabaseKey(name)
+		dKey = catalogkeys.NewDeprecatedDatabaseKey(name)
 	} else {
-		dKey = sqlbase.NewDeprecatedTableKey(parentID, name)
+		dKey = catalogkeys.NewDeprecatedTableKey(parentID, name)
 	}
 	log.Eventf(ctx, "looking up descriptor ID for name key %q", dKey.Key(codec))
 	res, err = txn.Get(ctx, dKey.Key(codec))

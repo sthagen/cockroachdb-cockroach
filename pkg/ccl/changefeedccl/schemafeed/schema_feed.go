@@ -20,10 +20,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -40,7 +42,7 @@ import (
 
 // TableEvent represents a change to a table descriptor.
 type TableEvent struct {
-	Before, After *sqlbase.ImmutableTableDescriptor
+	Before, After *tabledesc.Immutable
 }
 
 // Timestamp refers to the ModificationTime of the After table descriptor.
@@ -119,8 +121,74 @@ type SchemaFeed struct {
 		// of the table descriptor seen by the poller. This is needed to determine
 		// when a backilling mutation has successfully completed - this can only
 		// be determining by comparing a version to the previous version.
-		previousTableVersion map[descpb.ID]*sqlbase.ImmutableTableDescriptor
+		previousTableVersion map[descpb.ID]*tabledesc.Immutable
+
+		// typeDeps tracks dependencies from target tables to user defined types
+		// that they use.
+		typeDeps typeDependencyTracker
 	}
+}
+
+type typeDependencyTracker struct {
+	deps map[descpb.ID][]descpb.ID
+}
+
+func (t *typeDependencyTracker) addDependency(typeID, tableID descpb.ID) {
+	deps, ok := t.deps[typeID]
+	if !ok {
+		t.deps[typeID] = []descpb.ID{tableID}
+	} else {
+		// Check if we already contain this dependency. If so, noop.
+		for _, dep := range deps {
+			if dep == tableID {
+				return
+			}
+		}
+		t.deps[typeID] = append(deps, tableID)
+	}
+}
+
+func (t *typeDependencyTracker) removeDependency(typeID, tableID descpb.ID) {
+	deps, ok := t.deps[typeID]
+	if !ok {
+		return
+	}
+	for i := range deps {
+		if deps[i] == tableID {
+			deps = append(deps[:i], deps[i+1:]...)
+			break
+		}
+	}
+	if len(deps) == 0 {
+		delete(t.deps, typeID)
+	} else {
+		t.deps[typeID] = deps
+	}
+}
+
+func (t *typeDependencyTracker) purgeTable(tbl *tabledesc.Immutable) {
+	if !tbl.ContainsUserDefinedTypes() {
+		return
+	}
+	for _, colOrd := range tbl.GetColumnOrdinalsWithUserDefinedTypes() {
+		colTyp := tbl.DeletableColumns()[colOrd].Type
+		t.removeDependency(typedesc.UserDefinedTypeOIDToID(colTyp.Oid()), tbl.GetID())
+	}
+}
+
+func (t *typeDependencyTracker) ingestTable(tbl *tabledesc.Immutable) {
+	if !tbl.ContainsUserDefinedTypes() {
+		return
+	}
+	for _, colOrd := range tbl.GetColumnOrdinalsWithUserDefinedTypes() {
+		colTyp := tbl.DeletableColumns()[colOrd].Type
+		t.addDependency(typedesc.UserDefinedTypeOIDToID(colTyp.Oid()), tbl.GetID())
+	}
+}
+
+func (t *typeDependencyTracker) containsType(id descpb.ID) bool {
+	_, ok := t.deps[id]
+	return ok
 }
 
 type tableHistoryWaiter struct {
@@ -139,8 +207,9 @@ func New(cfg Config) *SchemaFeed {
 		targets:  cfg.Targets,
 		leaseMgr: cfg.LeaseManager,
 	}
-	m.mu.previousTableVersion = make(map[descpb.ID]*sqlbase.ImmutableTableDescriptor)
+	m.mu.previousTableVersion = make(map[descpb.ID]*tabledesc.Immutable)
 	m.mu.highWater = cfg.InitialHighWater
+	m.mu.typeDeps = typeDependencyTracker{deps: make(map[descpb.ID][]descpb.ID)}
 	return m
 }
 
@@ -186,7 +255,7 @@ func (tf *SchemaFeed) primeInitialTableDescs(ctx context.Context) error {
 	tf.mu.Lock()
 	initialTableDescTs := tf.mu.highWater
 	tf.mu.Unlock()
-	var initialDescs []*sqlbase.ImmutableTableDescriptor
+	var initialDescs []catalog.Descriptor
 	initialTableDescsFn := func(ctx context.Context, txn *kv.Txn) error {
 		initialDescs = initialDescs[:0]
 		txn.SetFixedTimestamp(ctx, initialTableDescTs)
@@ -203,7 +272,16 @@ func (tf *SchemaFeed) primeInitialTableDescs(ctx context.Context) error {
 	if err := tf.db.Txn(ctx, initialTableDescsFn); err != nil {
 		return err
 	}
-	return tf.ingestDescriptors(ctx, hlc.Timestamp{}, initialTableDescTs, initialDescs, tf.validateTable)
+
+	tf.mu.Lock()
+	// Register all types used by the initial set of tables.
+	for _, desc := range initialDescs {
+		tbl := desc.(*tabledesc.Immutable)
+		tf.mu.typeDeps.ingestTable(tbl)
+	}
+	tf.mu.Unlock()
+
+	return tf.ingestDescriptors(ctx, hlc.Timestamp{}, initialTableDescTs, initialDescs, tf.validateDescriptor)
 }
 
 func (tf *SchemaFeed) pollTableHistory(ctx context.Context) error {
@@ -225,11 +303,11 @@ func (tf *SchemaFeed) updateTableHistory(ctx context.Context, endTS hlc.Timestam
 	if endTS.LessEq(startTS) {
 		return nil
 	}
-	descs, err := fetchTableDescriptorVersions(ctx, tf.db, startTS, endTS, tf.targets)
+	descs, err := tf.fetchDescriptorVersions(ctx, tf.db, startTS, endTS)
 	if err != nil {
 		return err
 	}
-	return tf.ingestDescriptors(ctx, startTS, endTS, descs, tf.validateTable)
+	return tf.ingestDescriptors(ctx, startTS, endTS, descs, tf.validateDescriptor)
 }
 
 // Peek returns all events which have not been popped which happen at or
@@ -322,11 +400,12 @@ func (tf *SchemaFeed) waitForTS(ctx context.Context, ts hlc.Timestamp) error {
 	}
 }
 
-func descLess(a, b *sqlbase.ImmutableTableDescriptor) bool {
-	if a.ModificationTime.Equal(b.ModificationTime) {
+func descLess(a, b catalog.Descriptor) bool {
+	aTime, bTime := a.GetModificationTime(), b.GetModificationTime()
+	if aTime.Equal(bTime) {
 		return a.GetID() < b.GetID()
 	}
-	return a.ModificationTime.Less(b.ModificationTime)
+	return aTime.Less(bTime)
 }
 
 // ingestDescriptors checks the given descriptors against the invariant check
@@ -334,17 +413,17 @@ func descLess(a, b *sqlbase.ImmutableTableDescriptor) bool {
 // required that the descriptors represent a transactional kv read between the
 // two given timestamps.
 //
-// validateFn is exposed for testing, in production it is tf.validateTable.
+// validateFn is exposed for testing, in production it is tf.validateDescriptor.
 func (tf *SchemaFeed) ingestDescriptors(
 	ctx context.Context,
 	startTS, endTS hlc.Timestamp,
-	descs []*sqlbase.ImmutableTableDescriptor,
-	validateFn func(ctx context.Context, desc *sqlbase.ImmutableTableDescriptor) error,
+	descs []catalog.Descriptor,
+	validateFn func(ctx context.Context, earliestTsBeingIngested hlc.Timestamp, desc catalog.Descriptor) error,
 ) error {
 	sort.Slice(descs, func(i, j int) bool { return descLess(descs[i], descs[j]) })
 	var validateErr error
 	for _, desc := range descs {
-		if err := validateFn(ctx, desc); validateErr == nil {
+		if err := validateFn(ctx, startTS, desc); validateErr == nil {
 			validateErr = err
 		}
 	}
@@ -395,7 +474,7 @@ func (e TableEvent) String() string {
 	return formatEvent(e)
 }
 
-func formatDesc(desc *sqlbase.ImmutableTableDescriptor) string {
+func formatDesc(desc *tabledesc.Immutable) string {
 	return fmt.Sprintf("%d:%d@%v", desc.ID, desc.Version, desc.ModificationTime)
 }
 
@@ -403,55 +482,79 @@ func formatEvent(e TableEvent) string {
 	return fmt.Sprintf("%v->%v", formatDesc(e.Before), formatDesc(e.After))
 }
 
-func (tf *SchemaFeed) validateTable(
-	ctx context.Context, desc *sqlbase.ImmutableTableDescriptor,
+func (tf *SchemaFeed) validateDescriptor(
+	ctx context.Context, earliestTsBeingIngested hlc.Timestamp, desc catalog.Descriptor,
 ) error {
-	if err := changefeedbase.ValidateTable(tf.targets, desc); err != nil {
-		return err
-	}
 	tf.mu.Lock()
 	defer tf.mu.Unlock()
-	log.Infof(ctx, "validate %v", formatDesc(desc))
-	if lastVersion, ok := tf.mu.previousTableVersion[desc.ID]; ok {
-		// NB: Writes can occur to a table
-		if desc.ModificationTime.LessEq(lastVersion.ModificationTime) {
+	switch desc := desc.(type) {
+	case *typedesc.Immutable:
+		if !tf.mu.typeDeps.containsType(desc.GetID()) {
 			return nil
 		}
-
-		// To avoid race conditions with the lease manager, at this point we force
-		// the manager to acquire the freshest descriptor of this table from the
-		// store. In normal operation, the lease manager returns the newest
-		// descriptor it knows about for the timestamp, assuming it's still
-		// allowed; without this explicit load, the lease manager might therefore
-		// return the previous version of the table, which is still technically
-		// allowed by the schema change system.
-		if err := tf.leaseMgr.AcquireFreshestFromStore(ctx, desc.ID); err != nil {
+		// If a interesting type changed, then we just want to force the lease
+		// manager to acquire the freshest version of the type.
+		return tf.leaseMgr.AcquireFreshestFromStore(ctx, desc.ID)
+	case *tabledesc.Immutable:
+		if err := changefeedbase.ValidateTable(tf.targets, desc); err != nil {
 			return err
 		}
+		log.Infof(ctx, "validate %v", formatDesc(desc))
+		if lastVersion, ok := tf.mu.previousTableVersion[desc.ID]; ok {
+			// NB: Writes can occur to a table
+			if desc.ModificationTime.LessEq(lastVersion.ModificationTime) {
+				return nil
+			}
 
-		e := TableEvent{
-			Before: lastVersion,
-			After:  desc,
+			// To avoid race conditions with the lease manager, at this point we force
+			// the manager to acquire the freshest descriptor of this table from the
+			// store. In normal operation, the lease manager returns the newest
+			// descriptor it knows about for the timestamp, assuming it's still
+			// allowed; without this explicit load, the lease manager might therefore
+			// return the previous version of the table, which is still technically
+			// allowed by the schema change system.
+			if err := tf.leaseMgr.AcquireFreshestFromStore(ctx, desc.ID); err != nil {
+				return err
+			}
+
+			// Purge the old version of the table from the type mapping.
+			tf.mu.typeDeps.purgeTable(lastVersion)
+
+			e := TableEvent{
+				Before: lastVersion,
+				After:  desc,
+			}
+			shouldFilter, err := tf.filter.shouldFilter(ctx, e)
+			log.Infof(ctx, "validate shouldFilter %v %v", formatEvent(e), shouldFilter)
+			if err != nil {
+				return err
+			}
+			if !shouldFilter {
+				// Only sort the tail of the events from earliestTsBeingIngested.
+				// The head could already have been handed out and sorting is not
+				// stable.
+				idxToSort := sort.Search(len(tf.mu.events), func(i int) bool {
+					return !tf.mu.events[i].After.ModificationTime.Less(earliestTsBeingIngested)
+				})
+				tf.mu.events = append(tf.mu.events, e)
+				toSort := tf.mu.events[idxToSort:]
+				sort.Slice(toSort, func(i, j int) bool {
+					return descLess(toSort[i].After, toSort[j].After)
+				})
+			}
 		}
-		shouldFilter, err := tf.filter.shouldFilter(ctx, e)
-		log.Infof(ctx, "validate shouldFilter %v %v", formatEvent(e), shouldFilter)
-		if err != nil {
-			return err
-		}
-		if !shouldFilter {
-			tf.mu.events = append(tf.mu.events, e)
-			sort.Slice(tf.mu.events, func(i, j int) bool {
-				return descLess(tf.mu.events[i].After, tf.mu.events[j].After)
-			})
-		}
+		// Add the types used by the table into the dependency tracker.
+		tf.mu.typeDeps.ingestTable(desc)
+		tf.mu.previousTableVersion[desc.ID] = desc
+		return nil
+	default:
+		return errors.AssertionFailedf("unexpected descriptor type %T", desc)
 	}
-	tf.mu.previousTableVersion[desc.ID] = desc
-	return nil
 }
 
-func fetchTableDescriptorVersions(
-	ctx context.Context, db *kv.DB, startTS, endTS hlc.Timestamp, targets jobspb.ChangefeedTargets,
-) ([]*sqlbase.ImmutableTableDescriptor, error) {
+func (tf *SchemaFeed) fetchDescriptorVersions(
+	ctx context.Context, db *kv.DB, startTS, endTS hlc.Timestamp,
+) ([]catalog.Descriptor, error) {
 	if log.V(2) {
 		log.Infof(ctx, `fetching table descs (%s,%s]`, startTS, endTS)
 	}
@@ -475,7 +578,10 @@ func fetchTableDescriptorVersions(
 		return nil, errors.Wrapf(err, `fetching changes for %s`, span)
 	}
 
-	var tableDescs []*sqlbase.ImmutableTableDescriptor
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+
+	var descs []catalog.Descriptor
 	for _, file := range res.(*roachpb.ExportResponse).Files {
 		if err := func() error {
 			it, err := storage.NewMemSSTIterator(file.SST, false /* verify */)
@@ -494,31 +600,44 @@ func fetchTableDescriptorVersions(
 				if err != nil {
 					return err
 				}
-				_, tableID, err := encoding.DecodeUvarintAscending(remaining)
+				_, id, err := encoding.DecodeUvarintAscending(remaining)
 				if err != nil {
 					return err
 				}
-				origName, ok := targets[descpb.ID(tableID)]
-				if !ok {
-					// Uninteresting table.
+
+				origName, isTable := tf.targets[descpb.ID(id)]
+				isType := tf.mu.typeDeps.containsType(descpb.ID(id))
+				// Check if the descriptor is an interesting table or type.
+				if !(isTable || isType) {
+					// Uninteresting descriptor.
 					continue
 				}
+
 				unsafeValue := it.UnsafeValue()
 				if unsafeValue == nil {
-					return errors.Errorf(`"%v" was dropped or truncated`, origName)
+					name := origName.StatementTimeName
+					if name == "" {
+						name = fmt.Sprintf("desc(%d)", id)
+					}
+					return errors.Errorf(`"%v" was dropped or truncated`, name)
 				}
+
+				// Unmarshal the descriptor.
 				value := roachpb.Value{RawBytes: unsafeValue}
 				var desc descpb.Descriptor
 				if err := value.GetProto(&desc); err != nil {
 					return err
 				}
-				if tableDesc := sqlbase.TableFromDescriptor(&desc, k.Timestamp); tableDesc != nil {
-					tableDescs = append(tableDescs, sqlbase.NewImmutableTableDescriptor(*tableDesc))
+
+				if tableDesc := descpb.TableFromDescriptor(&desc, k.Timestamp); tableDesc != nil {
+					descs = append(descs, tabledesc.NewImmutable(*tableDesc))
+				} else if typeDesc := descpb.TypeFromDescriptor(&desc, k.Timestamp); typeDesc != nil {
+					descs = append(descs, typedesc.NewImmutable(*typeDesc))
 				}
 			}
 		}(); err != nil {
 			return nil, err
 		}
 	}
-	return tableDescs, nil
+	return descs, nil
 }

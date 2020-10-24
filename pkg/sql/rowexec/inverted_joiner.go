@@ -13,20 +13,20 @@ package rowexec
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedidx"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -41,7 +41,10 @@ import (
 // higher scan throughput of larger batches and the cost of spilling the
 // scanned rows to disk. The spilling cost will probably be dominated by
 // the de-duping cost, since it incurs a read.
-const invertedJoinerBatchSize = 10
+var invertedJoinerBatchSize = util.ConstantWithMetamorphicTestValue(
+	100, /* defaultValue */
+	1,   /* metamorphicValue */
+)
 
 // invertedJoinerState represents the state of the processor.
 type invertedJoinerState int
@@ -62,7 +65,7 @@ type invertedJoiner struct {
 
 	runningState invertedJoinerState
 	diskMonitor  *mon.BytesMonitor
-	desc         sqlbase.ImmutableTableDescriptor
+	desc         tabledesc.Immutable
 	// The map from ColumnIDs in the table to the column position.
 	colIdxMap map[descpb.ColumnID]int
 	index     *descpb.IndexDescriptor
@@ -71,15 +74,15 @@ type invertedJoiner struct {
 	invertedColID descpb.ColumnID
 
 	onExprHelper execinfrapb.ExprHelper
-	combinedRow  sqlbase.EncDatumRow
+	combinedRow  rowenc.EncDatumRow
 
 	joinType descpb.JoinType
 
 	// fetcher wraps the row.Fetcher used to perform scans. This enables the
 	// invertedJoiner to wrap the fetcher with a stat collector when necessary.
 	fetcher  rowFetcher
-	alloc    sqlbase.DatumAlloc
-	rowAlloc sqlbase.EncDatumRowAlloc
+	alloc    rowenc.DatumAlloc
+	rowAlloc rowenc.EncDatumRowAlloc
 
 	// The row retrieved from the index represents the columns of the table
 	// with the datums corresponding to the columns in the index populated.
@@ -93,23 +96,24 @@ type invertedJoiner struct {
 	// to the keyRow, and add to the row container, which de-duplicates the
 	// primary keys. The index assigned by the container is the keyIndex in the
 	// addIndexRow() call mentioned earlier.
-	keyRow              sqlbase.EncDatumRow
+	keyRow              rowenc.EncDatumRow
 	keyTypes            []*types.T
 	tableRowToKeyRowMap map[int]int
 	// The reverse transformation, from a key row to a table row, is done
 	// before evaluating the onExpr.
-	tableRow            sqlbase.EncDatumRow
+	tableRow            rowenc.EncDatumRow
 	keyRowToTableRowMap []int
 
 	// The input being joined using the index.
 	input                execinfra.RowSource
 	inputTypes           []*types.T
 	datumsToInvertedExpr invertedexpr.DatumsToInvertedExpr
+	canPreFilter         bool
 	// Batch size for fetches. Not a constant so we can lower for testing.
 	batchSize int
 
 	// State variables for each batch of input rows.
-	inputRows       sqlbase.EncDatumRows
+	inputRows       rowenc.EncDatumRows
 	batchedExprEval batchedInvertedExprEvaluator
 	// The row indexes that are the result of the inverted expression evaluation
 	// of the join. These will be further filtered using the onExpr.
@@ -138,7 +142,9 @@ type invertedJoiner struct {
 	spanBuilder *span.Builder
 	// A row with one element, corresponding to an encoded inverted column
 	// value. Used to construct the span of the index for that value.
-	invertedColRow sqlbase.EncDatumRow
+	invertedColRow rowenc.EncDatumRow
+
+	outputContinuationCol bool
 }
 
 var _ execinfra.Processor = &invertedJoiner{}
@@ -161,7 +167,7 @@ func newInvertedJoiner(
 	output execinfra.RowReceiver,
 ) (execinfra.RowSourcedProcessor, error) {
 	ij := &invertedJoiner{
-		desc:                 sqlbase.MakeImmutableTableDescriptor(spec.Table),
+		desc:                 tabledesc.MakeImmutable(spec.Table),
 		input:                input,
 		inputTypes:           input.OutputTypes(),
 		datumsToInvertedExpr: datumsToInvertedExpr,
@@ -180,9 +186,9 @@ func newInvertedJoiner(
 	indexColumnIDs, _ := ij.index.FullColumnIDs()
 	// Inverted joins are not used for mutations.
 	tableColumns := ij.desc.ColumnsWithMutations(false /* mutations */)
-	ij.keyRow = make(sqlbase.EncDatumRow, len(indexColumnIDs)-1)
+	ij.keyRow = make(rowenc.EncDatumRow, len(indexColumnIDs)-1)
 	ij.keyTypes = make([]*types.T, len(ij.keyRow))
-	ij.tableRow = make(sqlbase.EncDatumRow, len(tableColumns))
+	ij.tableRow = make(rowenc.EncDatumRow, len(tableColumns))
 	ij.tableRowToKeyRowMap = make(map[int]int)
 	ij.keyRowToTableRowMap = make([]int, len(indexColumnIDs)-1)
 	for i := 1; i < len(indexColumnIDs); i++ {
@@ -200,11 +206,17 @@ func newInvertedJoiner(
 	if ij.joinType == descpb.InnerJoin || ij.joinType == descpb.LeftOuterJoin {
 		outputColCount += len(rightColTypes)
 		includeRightCols = true
+		if spec.OutputGroupContinuationForLeftRow {
+			outputColCount++
+		}
 	}
 	outputColTypes := make([]*types.T, 0, outputColCount)
 	outputColTypes = append(outputColTypes, ij.inputTypes...)
 	if includeRightCols {
 		outputColTypes = append(outputColTypes, rightColTypes...)
+	}
+	if spec.OutputGroupContinuationForLeftRow {
+		outputColTypes = append(outputColTypes, types.Bool)
 	}
 	if err := ij.ProcessorBase.Init(
 		ij, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
@@ -226,7 +238,11 @@ func newInvertedJoiner(
 	if err := ij.onExprHelper.Init(spec.OnExpr, onExprColTypes, semaCtx, ij.EvalCtx); err != nil {
 		return nil, err
 	}
-	ij.combinedRow = make(sqlbase.EncDatumRow, 0, len(onExprColTypes))
+	combinedRowLen := len(onExprColTypes)
+	if spec.OutputGroupContinuationForLeftRow {
+		combinedRowLen++
+	}
+	ij.combinedRow = make(rowenc.EncDatumRow, 0, combinedRowLen)
 
 	if ij.datumsToInvertedExpr == nil {
 		var invertedExprHelper execinfrapb.ExprHelper
@@ -239,6 +255,10 @@ func newInvertedJoiner(
 		if err != nil {
 			return nil, err
 		}
+	}
+	ij.canPreFilter = ij.datumsToInvertedExpr.CanPreFilter()
+	if ij.canPreFilter {
+		ij.batchedExprEval.filterer = ij.datumsToInvertedExpr
 	}
 
 	var fetcher row.Fetcher
@@ -257,8 +277,9 @@ func newInvertedJoiner(
 	// and so do not need to see in-progress schema changes.
 	_, _, err = initRowFetcher(
 		flowCtx, &fetcher, &ij.desc, int(spec.IndexIdx), ij.colIdxMap, false, /* reverse */
-		allIndexCols, false /* isCheck */, &ij.alloc, execinfra.ScanVisibilityPublic,
-		descpb.ScanLockingStrength_FOR_NONE, nil, /* systemColumns */
+		allIndexCols, false /* isCheck */, flowCtx.EvalCtx.Mon, &ij.alloc, execinfra.ScanVisibilityPublic,
+		descpb.ScanLockingStrength_FOR_NONE, descpb.ScanLockingWaitPolicy_BLOCK,
+		nil, /* systemColumns */
 	)
 	if err != nil {
 		return nil, err
@@ -290,8 +311,9 @@ func newInvertedJoiner(
 		ij.FlowCtx.Cfg.TempStorage,
 		ij.MemMonitor,
 		ij.diskMonitor,
-		0, /* rowCapacity */
 	)
+
+	ij.outputContinuationCol = spec.OutputGroupContinuationForLeftRow
 
 	return ij, nil
 }
@@ -306,15 +328,15 @@ func (ij *invertedJoiner) generateSpan(enc []byte) (roachpb.Span, error) {
 	// true, since JSON inverted columns use a custom encoding. But since we
 	// are providing an already encoded Datum, the following will eventually
 	// fall through to EncDatum.Encode() which will reuse the encoded bytes.
-	encDatum := sqlbase.EncDatumFromEncoded(descpb.DatumEncoding_ASCENDING_KEY, enc)
+	encDatum := rowenc.EncDatumFromEncoded(descpb.DatumEncoding_ASCENDING_KEY, enc)
 	ij.invertedColRow = append(ij.invertedColRow[:0], encDatum)
 	span, _, err := ij.spanBuilder.SpanFromEncDatums(ij.invertedColRow, 1 /* prefixLen */)
 	return span, err
 }
 
-func (ij *invertedJoiner) generateSpans(invertedSpans []invertedSpan) (roachpb.Spans, error) {
-	var spans []roachpb.Span
-	for _, span := range invertedSpans {
+func (ij *invertedJoiner) generateSpans(invertedSpans []invertedSpan) ([]roachpb.Span, error) {
+	spans := make([]roachpb.Span, len(invertedSpans))
+	for i, span := range invertedSpans {
 		startSpan, err := ij.generateSpan(span.Start)
 		if err != nil {
 			return nil, err
@@ -325,13 +347,13 @@ func (ij *invertedJoiner) generateSpans(invertedSpans []invertedSpan) (roachpb.S
 			return nil, err
 		}
 		startSpan.EndKey = endSpan.Key
-		spans = append(spans, startSpan)
+		spans[i] = startSpan
 	}
 	return spans, nil
 }
 
 // Next is part of the RowSource interface.
-func (ij *invertedJoiner) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
+func (ij *invertedJoiner) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	// The join is implemented as follows:
 	// - Read the input rows in batches.
 	// - For each batch, map the rows to SpanExpressionProtos and initialize
@@ -343,7 +365,7 @@ func (ij *invertedJoiner) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMeta
 	// - Retrieve the results from the batch evaluator and buffer in joinedRowIdx,
 	//   and use the emitCursor to emit rows.
 	for ij.State == execinfra.StateRunning {
-		var row sqlbase.EncDatumRow
+		var row rowenc.EncDatumRow
 		var meta *execinfrapb.ProducerMetadata
 		switch ij.runningState {
 		case ijReadingInput:
@@ -384,7 +406,7 @@ func (ij *invertedJoiner) readInput() (invertedJoinerState, *execinfrapb.Produce
 			break
 		}
 
-		expr, err := ij.datumsToInvertedExpr.Convert(ij.Ctx, row)
+		expr, preFilterState, err := ij.datumsToInvertedExpr.Convert(ij.Ctx, row)
 		if err != nil {
 			ij.MoveToDraining(err)
 			return ijStateUnknown, ij.DrainHelper()
@@ -403,8 +425,14 @@ func (ij *invertedJoiner) readInput() (invertedJoinerState, *execinfrapb.Produce
 			// The nil serves as a marker that will result in an empty set as the
 			// evaluation result.
 			ij.batchedExprEval.exprs = append(ij.batchedExprEval.exprs, nil)
+			if ij.canPreFilter {
+				ij.batchedExprEval.preFilterState = append(ij.batchedExprEval.preFilterState, nil)
+			}
 		} else {
 			ij.batchedExprEval.exprs = append(ij.batchedExprEval.exprs, expr)
+			if ij.canPreFilter {
+				ij.batchedExprEval.preFilterState = append(ij.batchedExprEval.preFilterState, preFilterState)
+			}
 		}
 	}
 
@@ -426,14 +454,14 @@ func (ij *invertedJoiner) readInput() (invertedJoinerState, *execinfrapb.Produce
 		}
 		return ijEmittingRows, nil
 	}
+	// NB: spans is already sorted, and that sorting is preserved when
+	// generating indexSpans.
 	indexSpans, err := ij.generateSpans(spans)
 	if err != nil {
 		ij.MoveToDraining(err)
 		return ijStateUnknown, ij.DrainHelper()
 	}
 
-	// Sort the spans for locality of reads.
-	sort.Sort(indexSpans)
 	log.VEventf(ij.Ctx, 1, "scanning %d spans", len(indexSpans))
 	if err = ij.fetcher.StartScan(
 		ij.Ctx, ij.FlowCtx.Txn, indexSpans, false /* limitBatches */, 0, /* limitHint */
@@ -460,13 +488,23 @@ func (ij *invertedJoiner) performScan() (invertedJoinerState, *execinfrapb.Produ
 			break
 		}
 		encInvertedVal := scannedRow[ij.colIdxMap[ij.invertedColID]].EncodedBytes()
-		ij.transformToKeyRow(scannedRow)
-		rowIdx, err := ij.keyRows.AddRow(ij.Ctx, ij.keyRow)
+		shouldAdd, err := ij.batchedExprEval.prepareAddIndexRow(encInvertedVal)
 		if err != nil {
 			ij.MoveToDraining(err)
 			return ijStateUnknown, ij.DrainHelper()
 		}
-		ij.batchedExprEval.addIndexRow(encInvertedVal, rowIdx)
+		if shouldAdd {
+			ij.transformToKeyRow(scannedRow)
+			rowIdx, err := ij.keyRows.AddRow(ij.Ctx, ij.keyRow)
+			if err != nil {
+				ij.MoveToDraining(err)
+				return ijStateUnknown, ij.DrainHelper()
+			}
+			if err = ij.batchedExprEval.addIndexRow(rowIdx); err != nil {
+				ij.MoveToDraining(err)
+				return ijStateUnknown, ij.DrainHelper()
+			}
+		}
 	}
 	ij.joinedRowIdx = ij.batchedExprEval.evaluate()
 	ij.keyRows.SetupForRead(ij.Ctx, ij.joinedRowIdx)
@@ -475,11 +513,14 @@ func (ij *invertedJoiner) performScan() (invertedJoinerState, *execinfrapb.Produ
 	return ijEmittingRows, nil
 }
 
+var trueEncDatum = rowenc.DatumToEncDatum(types.Bool, tree.DBoolTrue)
+var falseEncDatum = rowenc.DatumToEncDatum(types.Bool, tree.DBoolFalse)
+
 // emitRow returns the next row from ij.emitCursor, if present. Otherwise it
 // prepares for another input batch.
 func (ij *invertedJoiner) emitRow() (
 	invertedJoinerState,
-	sqlbase.EncDatumRow,
+	rowenc.EncDatumRow,
 	*execinfrapb.ProducerMetadata,
 ) {
 	// Finished processing the batch.
@@ -511,7 +552,8 @@ func (ij *invertedJoiner) emitRow() (
 		if !seenMatch {
 			switch ij.joinType {
 			case descpb.LeftOuterJoin:
-				return ijEmittingRows, ij.renderUnmatchedRow(ij.inputRows[inputRowIdx]), nil
+				ij.renderUnmatchedRow(ij.inputRows[inputRowIdx])
+				return ijEmittingRows, ij.combinedRow, nil
 			case descpb.LeftAntiJoin:
 				return ijEmittingRows, ij.inputRows[inputRowIdx], nil
 			}
@@ -543,9 +585,22 @@ func (ij *invertedJoiner) emitRow() (
 		return nil
 	}
 	if renderedRow != nil {
+		seenMatch := ij.emitCursor.seenMatch
 		ij.emitCursor.seenMatch = true
 		switch ij.joinType {
 		case descpb.InnerJoin, descpb.LeftOuterJoin:
+			if ij.outputContinuationCol {
+				if seenMatch {
+					// This is not the first row output for this left row, so set the
+					// group continuation to true.
+					ij.combinedRow = append(ij.combinedRow, trueEncDatum)
+				} else {
+					// This is the first row output for this left row, so set the group
+					// continuation to false.
+					ij.combinedRow = append(ij.combinedRow, falseEncDatum)
+				}
+				renderedRow = ij.combinedRow
+			}
 			return ijEmittingRows, renderedRow, nil
 		case descpb.LeftSemiJoin:
 			// Skip the rest of the joined rows.
@@ -567,8 +622,9 @@ func (ij *invertedJoiner) emitRow() (
 }
 
 // render constructs a row with columns from both sides. The ON condition is
-// evaluated; if it fails, returns nil.
-func (ij *invertedJoiner) render(lrow, rrow sqlbase.EncDatumRow) (sqlbase.EncDatumRow, error) {
+// evaluated; if it fails, returns nil. When it returns a non-nil row, it is
+// identical to ij.combinedRow.
+func (ij *invertedJoiner) render(lrow, rrow rowenc.EncDatumRow) (rowenc.EncDatumRow, error) {
 	ij.combinedRow = append(ij.combinedRow[:0], lrow...)
 	ij.combinedRow = append(ij.combinedRow, rrow...)
 	if ij.onExprHelper.Expr != nil {
@@ -580,23 +636,30 @@ func (ij *invertedJoiner) render(lrow, rrow sqlbase.EncDatumRow) (sqlbase.EncDat
 	return ij.combinedRow, nil
 }
 
-// renderUnmatchedRow creates a result row given an unmatched row.
-func (ij *invertedJoiner) renderUnmatchedRow(row sqlbase.EncDatumRow) sqlbase.EncDatumRow {
-	ij.combinedRow = append(ij.combinedRow[:0], row...)
+// renderUnmatchedRow creates a result row given an unmatched row and
+// stores it in ij.combinedRow.
+func (ij *invertedJoiner) renderUnmatchedRow(row rowenc.EncDatumRow) {
 	ij.combinedRow = ij.combinedRow[:cap(ij.combinedRow)]
+	// Copy the left row.
+	copy(ij.combinedRow, row)
+	// Set the remaining columns to NULL.
 	for i := len(row); i < len(ij.combinedRow); i++ {
 		ij.combinedRow[i].Datum = tree.DNull
 	}
-	return ij.combinedRow
+	if ij.outputContinuationCol {
+		// The last column is the continuation column, so set it to false since
+		// this is the only output row for this group.
+		ij.combinedRow[len(ij.combinedRow)-1] = falseEncDatum
+	}
 }
 
-func (ij *invertedJoiner) transformToKeyRow(row sqlbase.EncDatumRow) {
+func (ij *invertedJoiner) transformToKeyRow(row rowenc.EncDatumRow) {
 	for i, rowIdx := range ij.keyRowToTableRowMap {
 		ij.keyRow[i] = row[rowIdx]
 	}
 }
 
-func (ij *invertedJoiner) transformToTableRow(keyRow sqlbase.EncDatumRow) {
+func (ij *invertedJoiner) transformToTableRow(keyRow rowenc.EncDatumRow) {
 	for r, k := range ij.tableRowToKeyRowMap {
 		ij.tableRow[r] = keyRow[k]
 	}
@@ -618,6 +681,9 @@ func (ij *invertedJoiner) ConsumerClosed() {
 
 func (ij *invertedJoiner) close() {
 	if ij.InternalClose() {
+		if ij.fetcher != nil {
+			ij.fetcher.Close(ij.Ctx)
+		}
 		if ij.keyRows != nil {
 			ij.keyRows.Close(ij.Ctx)
 		}

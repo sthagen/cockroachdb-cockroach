@@ -23,16 +23,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/covering"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
@@ -263,7 +265,7 @@ func backup(
 
 				backupManifest.Files = checkpointFiles
 				err := writeBackupManifest(
-					ctx, settings, defaultStore, BackupManifestCheckpointName, encryption, backupManifest,
+					ctx, settings, defaultStore, backupManifestCheckpointName, encryption, backupManifest,
 				)
 				if err != nil {
 					log.Errorf(ctx, "unable to checkpoint backup descriptor: %+v", err)
@@ -277,7 +279,7 @@ func backup(
 
 	pkIDs := make(map[uint64]bool)
 	for i := range backupManifest.Descriptors {
-		if t := sqlbase.TableFromDescriptor(&backupManifest.Descriptors[i], hlc.Timestamp{}); t != nil {
+		if t := descpb.TableFromDescriptor(&backupManifest.Descriptors[i], hlc.Timestamp{}); t != nil {
 			pkIDs[roachpb.BulkOpSummaryID(uint64(t.ID), uint64(t.PrimaryIndex.ID))] = true
 		}
 	}
@@ -323,7 +325,7 @@ func backup(
 			// ensures uniqueness, and the kv string appended to the end is for
 			// readability.
 			filename := fmt.Sprintf("%s_%d_%s",
-				BackupPartitionDescriptorPrefix, nextPartitionedDescFilenameID, sanitizeLocalityKV(kv))
+				backupPartitionDescriptorPrefix, nextPartitionedDescFilenameID, sanitizeLocalityKV(kv))
 			nextPartitionedDescFilenameID++
 			backupManifest.PartitionDescriptorFilenames = append(backupManifest.PartitionDescriptorFilenames, filename)
 			desc := BackupPartitionDescriptor{
@@ -345,12 +347,12 @@ func backup(
 		}
 	}
 
-	if err := writeBackupManifest(ctx, settings, defaultStore, BackupManifestName, encryption, backupManifest); err != nil {
+	if err := writeBackupManifest(ctx, settings, defaultStore, backupManifestName, encryption, backupManifest); err != nil {
 		return RowCount{}, err
 	}
 	var tableStatistics []*stats.TableStatisticProto
 	for i := range backupManifest.Descriptors {
-		if tableDesc := sqlbase.TableFromDescriptor(&backupManifest.Descriptors[i], hlc.Timestamp{}); tableDesc != nil {
+		if tableDesc := descpb.TableFromDescriptor(&backupManifest.Descriptors[i], hlc.Timestamp{}); tableDesc != nil {
 			// Collect all the table stats for this table.
 			tableStatisticsAcc, err := statsCache.GetTableStats(ctx, tableDesc.GetID())
 			if err != nil {
@@ -365,7 +367,7 @@ func backup(
 		Statistics: tableStatistics,
 	}
 
-	if err := writeTableStatistics(ctx, defaultStore, BackupStatisticsFileName, encryption, &statsTable); err != nil {
+	if err := writeTableStatistics(ctx, defaultStore, backupStatisticsFileName, encryption, &statsTable); err != nil {
 		return RowCount{}, err
 	}
 
@@ -406,6 +408,33 @@ func (b *backupResumer) Resume(
 	details := b.job.Details().(jobspb.BackupDetails)
 	p := phs.(sql.PlanHookState)
 
+	// For all backups, partitioned or not, the main BACKUP manifest is stored at
+	// details.URI.
+	defaultConf, err := cloudimpl.ExternalStorageConfFromURI(details.URI, p.User())
+	if err != nil {
+		return errors.Wrapf(err, "export configuration")
+	}
+	defaultStore, err := p.ExecCfg().DistSQLSrv.ExternalStorage(ctx, defaultConf)
+	if err != nil {
+		return errors.Wrapf(err, "make storage")
+	}
+	defer defaultStore.Close()
+
+	// EncryptionInfo is non-nil only when new encryption information has been
+	// generated during BACKUP planning.
+	redactedURI := RedactURIForErrorMessage(details.URI)
+	if details.EncryptionInfo != nil {
+		if err := writeEncryptionInfoIfNotExists(ctx, details.EncryptionInfo,
+			defaultStore); err != nil {
+			return errors.Wrapf(err, "creating encryption info file to %s", redactedURI)
+		}
+	}
+
+	if err := createCheckpointIfNotExists(ctx, p.ExecCfg().Settings, defaultStore,
+		details.EncryptionOptions); err != nil {
+		return errors.Wrapf(err, "creating checkpoint to %s", redactedURI)
+	}
+
 	ptsID := details.ProtectedTimestampRecord
 	if ptsID != nil && !b.testingKnobs.ignoreProtectedTimestamps {
 		if err := p.ExecCfg().ProtectedTimestampProvider.Verify(ctx, *ptsID); err != nil {
@@ -428,17 +457,7 @@ func (b *backupResumer) Resume(
 		return pgerror.Wrapf(err, pgcode.DataCorrupted,
 			"unmarshal backup descriptor")
 	}
-	// For all backups, partitioned or not, the main BACKUP manifest is stored at
-	// details.URI.
-	defaultConf, err := cloudimpl.ExternalStorageConfFromURI(details.URI, p.User())
-	if err != nil {
-		return errors.Wrapf(err, "export configuration")
-	}
-	defaultStore, err := p.ExecCfg().DistSQLSrv.ExternalStorage(ctx, defaultConf)
-	if err != nil {
-		return errors.Wrapf(err, "make storage")
-	}
-	defer defaultStore.Close()
+
 	storageByLocalityKV := make(map[string]*roachpb.ExternalStorage)
 	for kv, uri := range details.URIsByLocalityKV {
 		conf, err := cloudimpl.ExternalStorageConfFromURI(uri, p.User())
@@ -453,8 +472,8 @@ func (b *backupResumer) Resume(
 	// they could be using either the new or the old foreign key
 	// representations. We should just preserve whatever representation the
 	// table descriptors were using and leave them alone.
-	if desc, err := readBackupManifest(ctx, defaultStore, BackupManifestCheckpointName,
-		details.Encryption); err == nil {
+	if desc, err := readBackupManifest(ctx, defaultStore, backupManifestCheckpointName,
+		details.EncryptionOptions); err == nil {
 		// If the checkpoint is from a different cluster, it's meaningless to us.
 		// More likely though are dummy/lock-out checkpoints with no ClusterID.
 		if desc.ClusterID.Equal(p.ExecCfg().ClusterID()) {
@@ -488,15 +507,14 @@ func (b *backupResumer) Resume(
 		&backupManifest,
 		checkpointDesc,
 		p.ExecCfg().DistSQLSrv.ExternalStorage,
-		details.Encryption,
+		details.EncryptionOptions,
 		statsCache,
 	)
 	if err != nil {
 		return err
 	}
 
-	err = b.clearStats(ctx, p.ExecCfg().DB)
-	if err != nil {
+	if err := b.clearStats(ctx, p.ExecCfg().DB); err != nil {
 		log.Warningf(ctx, "unable to clear stats from job payload: %+v", err)
 	}
 	b.deleteCheckpoint(ctx, p.ExecCfg(), p.User())
@@ -571,24 +589,50 @@ func (b *backupResumer) Resume(
 		}
 	}
 
-	b.maybeNotifyScheduledJobCompletion(ctx, jobs.StatusSucceeded, p.ExecCfg().InternalExecutor)
-
+	b.maybeNotifyScheduledJobCompletion(ctx, jobs.StatusSucceeded, p.ExecCfg())
 	return nil
 }
 
 func (b *backupResumer) maybeNotifyScheduledJobCompletion(
-	ctx context.Context, jobStatus jobs.Status, ex sqlutil.InternalExecutor,
+	ctx context.Context, jobStatus jobs.Status, exec *sql.ExecutorConfig,
 ) {
-	if b.job.CreatedBy() == nil || b.job.CreatedBy().Name != jobs.CreatedByScheduledJobs {
-		return
+	env := scheduledjobs.ProdJobSchedulerEnv
+	if knobs, ok := exec.DistSQLSrv.TestingKnobs.JobsTestingKnobs.(*jobs.TestingKnobs); ok {
+		if knobs.JobSchedulerEnv != nil {
+			env = knobs.JobSchedulerEnv
+		}
 	}
-	info := b.job.CreatedBy()
 
-	if err := jobs.NotifyJobTermination(
-		ctx, nil /* env */, *b.job.ID(), jobStatus, info.ID, ex, nil); err != nil {
-		log.Warningf(ctx,
-			"failed to notify schedule %d of completion of job %d; err=%s",
-			info.ID, *b.job.ID(), err)
+	if err := exec.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		// Do not rely on b.job containing created_by_id.  Query it directly.
+		datums, err := exec.InternalExecutor.QueryRowEx(
+			ctx,
+			"lookup-schedule-info",
+			txn,
+			sessiondata.InternalExecutorOverride{User: security.NodeUser},
+			fmt.Sprintf(
+				"SELECT created_by_id FROM %s WHERE id=$1 AND created_by_type=$2",
+				env.SystemJobsTableName()),
+			*b.job.ID(), jobs.CreatedByScheduledJobs)
+
+		if err != nil {
+			return errors.Wrap(err, "schedule info lookup")
+		}
+		if datums == nil {
+			// Not a scheduled backup.
+			return nil
+		}
+
+		scheduleID := int64(tree.MustBeDInt(datums[0]))
+		if err := jobs.NotifyJobTermination(
+			ctx, env, *b.job.ID(), jobStatus, b.job.Details(), scheduleID, exec.InternalExecutor, txn); err != nil {
+			log.Warningf(ctx,
+				"failed to notify schedule %d of completion of job %d; err=%s",
+				scheduleID, *b.job.ID(), err)
+		}
+		return nil
+	}); err != nil {
+		log.Errorf(ctx, "maybeNotifySchedule error: %v", err)
 	}
 }
 
@@ -615,7 +659,7 @@ func (b *backupResumer) OnFailOrCancel(ctx context.Context, phs interface{}) err
 	defer b.maybeNotifyScheduledJobCompletion(
 		ctx,
 		jobs.StatusFailed,
-		phs.(sql.PlanHookState).ExecCfg().InternalExecutor,
+		phs.(sql.PlanHookState).ExecCfg(),
 	)
 
 	telemetry.Count("backup.total.failed")
@@ -624,6 +668,9 @@ func (b *backupResumer) OnFailOrCancel(ctx context.Context, phs interface{}) err
 
 	p := phs.(sql.PlanHookState)
 	cfg := p.ExecCfg()
+	if err := b.clearStats(ctx, p.ExecCfg().DB); err != nil {
+		log.Warningf(ctx, "unable to clear stats from job payload: %+v", err)
+	}
 	b.deleteCheckpoint(ctx, cfg, p.User())
 	return cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		return b.releaseProtectedTimestamp(ctx, txn, cfg.ProtectedTimestampProvider)
@@ -643,7 +690,7 @@ func (b *backupResumer) deleteCheckpoint(
 			return err
 		}
 		defer exportStore.Close()
-		return exportStore.Delete(ctx, BackupManifestCheckpointName)
+		return exportStore.Delete(ctx, backupManifestCheckpointName)
 	}(); err != nil {
 		log.Warningf(ctx, "unable to delete checkpointed backup descriptor: %+v", err)
 	}

@@ -525,6 +525,46 @@ var (
 	DecimalArray = &T{InternalType: InternalType{
 		Family: ArrayFamily, ArrayContents: Decimal, Oid: oid.T__numeric, Locale: &emptyLocale}}
 
+	// BoolArray is the type of an array value having Bool-typed elements.
+	BoolArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: Bool, Oid: oid.T__bool, Locale: &emptyLocale}}
+
+	// UUIDArray is the type of an array value having UUID-typed elements.
+	UUIDArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: Uuid, Oid: oid.T__uuid, Locale: &emptyLocale}}
+
+	// TimeArray is the type of an array value having Date-typed elements.
+	DateArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: Date, Oid: oid.T__date, Locale: &emptyLocale}}
+
+	// TimeArray is the type of an array value having Time-typed elements.
+	TimeArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: Time, Oid: oid.T__time, Locale: &emptyLocale}}
+
+	// TimeTZArray is the type of an array value having TimeTZ-typed elements.
+	TimeTZArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: TimeTZ, Oid: oid.T__timetz, Locale: &emptyLocale}}
+
+	// TimestampArray is the type of an array value having Timestamp-typed elements.
+	TimestampArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: Timestamp, Oid: oid.T__timestamp, Locale: &emptyLocale}}
+
+	// TimestampTZArray is the type of an array value having TimestampTZ-typed elements.
+	TimestampTZArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: TimestampTZ, Oid: oid.T__timestamptz, Locale: &emptyLocale}}
+
+	// IntervalArray is the type of an array value having Interval-typed elements.
+	IntervalArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: Interval, Oid: oid.T__interval, Locale: &emptyLocale}}
+
+	// INetArray is the type of an array value having INet-typed elements.
+	INetArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: INet, Oid: oid.T__inet, Locale: &emptyLocale}}
+
+	// VarBitArray is the type of an array value having VarBit-typed elements.
+	VarBitArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: VarBit, Oid: oid.T__varbit, Locale: &emptyLocale}}
+
 	// Int2Vector is a type-alias for an array of Int2 values with a different
 	// OID (T_int2vector instead of T__int2). It is a special VECTOR type used
 	// by Postgres in system tables. Int2vectors are 0-indexed, unlike normal arrays.
@@ -1150,7 +1190,7 @@ func (t *T) TypeModifier() int32 {
 	}
 	if width := t.Width(); width != 0 {
 		switch t.Family() {
-		case StringFamily:
+		case StringFamily, CollatedStringFamily:
 			// Postgres adds 4 to the attypmod for bounded string types, the
 			// var header size.
 			typeModifier = width + 4
@@ -1219,8 +1259,14 @@ func RemapUserDefinedTypeOIDs(t *T, newOID, newArrayOID oid.Oid) {
 
 // UserDefined returns whether or not t is a user defined type.
 func (t *T) UserDefined() bool {
+	return IsOIDUserDefinedType(t.Oid())
+}
+
+// IsOIDUserDefinedType returns whether or not o corresponds to a user
+// defined type.
+func IsOIDUserDefinedType(o oid.Oid) bool {
 	// Types with OIDs larger than the predefined max are user defined.
-	return t.Oid() > oidext.CockroachPredefinedOIDMax
+	return o > oidext.CockroachPredefinedOIDMax
 }
 
 var familyNames = map[Family]string{
@@ -1436,6 +1482,8 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 		return buf.String()
 	case BoolFamily:
 		return "boolean"
+	case Box2DFamily:
+		return "box2d"
 	case BytesFamily:
 		return "bytea"
 	case DateFamily:
@@ -2308,6 +2356,16 @@ func (t *T) IsAmbiguous() bool {
 	return false
 }
 
+// IsNumeric returns true iff this type is an integer, float, or decimal.
+func (t *T) IsNumeric() bool {
+	switch t.Family() {
+	case IntFamily, FloatFamily, DecimalFamily:
+		return true
+	default:
+		return false
+	}
+}
+
 // EnumGetIdxOfPhysical returns the index within the TypeMeta's slice of
 // enum physical representations that matches the input byte slice.
 func (t *T) EnumGetIdxOfPhysical(phys []byte) (int, error) {
@@ -2470,6 +2528,12 @@ func (t *T) stringTypeSQL() string {
 	return typName
 }
 
+// IsHydrated returns true if this is a user-defined type and the TypeMeta
+// is hydrated.
+func (t *T) IsHydrated() bool {
+	return t.UserDefined() && t.TypeMeta != (UserDefinedTypeMetadata{})
+}
+
 var typNameLiterals map[string]*T
 
 func init() {
@@ -2571,6 +2635,7 @@ var postgresPredefinedTypeIssues = map[string]int{
 	"box":           21286,
 	"cidr":          18846,
 	"circle":        21286,
+	"jsonpath":      22513,
 	"line":          21286,
 	"lseg":          21286,
 	"macaddr":       -1,

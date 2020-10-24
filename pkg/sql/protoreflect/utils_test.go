@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/gogo/protobuf/jsonpb"
 	pbtypes "github.com/gogo/protobuf/types"
 	"github.com/stretchr/testify/require"
@@ -76,8 +76,8 @@ func TestMessageToJSONBRoundTrip(t *testing.T) {
 		},
 		{ // Message with embedded google.protobuf.Any message;
 			// nested inside other message; with maps
-			pbname: "cockroach.util.tracing.RecordedSpan",
-			message: &tracing.RecordedSpan{
+			pbname: "cockroach.util.tracing.tracingpb.RecordedSpan",
+			message: &tracingpb.RecordedSpan{
 				TraceID: 123,
 				Tags:    map[string]string{"one": "1", "two": "2", "three": "3"},
 				Stats:   makeAny(t, &descpb.ColumnDescriptor{Name: "bogus stats"}),
@@ -101,7 +101,7 @@ func TestMessageToJSONBRoundTrip(t *testing.T) {
 				require.Equal(t, tc.message, decoded)
 
 				// Encode message as json
-				jsonb, err := MessageToJSON(decoded)
+				jsonb, err := MessageToJSON(decoded, false /* emitDefaults */)
 				require.NoError(t, err)
 
 				// Recreate message from json
@@ -118,7 +118,7 @@ func TestMessageToJSONBRoundTrip(t *testing.T) {
 	t.Run("identity-round-trip", func(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.pbname, func(t *testing.T) {
-				jsonb, err := MessageToJSON(tc.message)
+				jsonb, err := MessageToJSON(tc.message, false /* emitDefaults */)
 				require.NoError(t, err)
 
 				fromJSON, err := NewMessage(tc.pbname)

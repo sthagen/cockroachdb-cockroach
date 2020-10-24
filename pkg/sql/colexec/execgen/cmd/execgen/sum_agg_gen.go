@@ -11,7 +11,6 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"strings"
 	"text/template"
@@ -19,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 type sumTmplInfo struct {
@@ -65,15 +65,15 @@ func getSumAddOverload(inputType *types.T) assignFunc {
 		}
 	}
 	if overload == nil {
-		colexecerror.InternalError(fmt.Sprintf("unexpectedly didn't find plus binary overload for %s", inputType.String()))
+		colexecerror.InternalError(errors.AssertionFailedf("unexpectedly didn't find plus binary overload for %s", inputType.String()))
 	}
 	if len(overload.WidthOverloads) != 1 {
-		colexecerror.InternalError(fmt.Sprintf("unexpectedly plus binary overload for %s doesn't contain a single overload", inputType.String()))
+		colexecerror.InternalError(errors.AssertionFailedf("unexpectedly plus binary overload for %s doesn't contain a single overload", inputType.String()))
 	}
 	return overload.WidthOverloads[0].AssignFunc
 }
 
-const sumAggTmpl = "pkg/sql/colexec/sum_agg_tmpl.go"
+const sumAggTmpl = "pkg/sql/colexec/colexecagg/sum_agg_tmpl.go"
 
 func genSumAgg(inputFileContents string, wr io.Writer, isSumInt bool) error {
 	r := strings.NewReplacer(

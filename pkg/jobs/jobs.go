@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/opentracing/opentracing-go"
 )
 
@@ -45,6 +46,7 @@ type Job struct {
 	id        *int64
 	createdBy *CreatedByInfo
 	txn       *kv.Txn
+	sessionID sqlliveness.SessionID
 	mu        struct {
 		syncutil.Mutex
 		payload  jobspb.Payload
@@ -107,6 +109,13 @@ func init() {
 // Status represents the status of a job in the system.jobs table.
 type Status string
 
+// SafeFormat implements redact.SafeFormatter.
+func (s Status) SafeFormat(sp redact.SafePrinter, verb rune) {
+	sp.SafeString(redact.SafeString(s))
+}
+
+var _ redact.SafeFormatter = Status("")
+
 // RunningStatus represents the more detailed status of a running job in
 // the system.jobs table.
 type RunningStatus string
@@ -145,13 +154,17 @@ var (
 	errJobCanceled = errors.New("job canceled by user")
 )
 
+// HasErrJobCanceled returns true if the error contains the error set as the
+// job's FinalResumError when it has been canceled.
+func HasErrJobCanceled(err error) bool {
+	return errors.Is(err, errJobCanceled)
+}
+
 // deprecatedIsOldSchemaChangeJob returns whether the provided payload is for a
 // job that is a 19.2-style schema change, and therefore cannot be run or
 // updated in 20.1 (without first having undergone a migration).
-// TODO(lucy): Remove this in 20.2. (I think it's possible in theory for a 19.2
-// schema change job to persist on a 20.1 cluster indefinitely, since the
-// migration is asynchronous, so this will take some care beyond just removing
-// the format version gate.)
+// TODO (lucy): The plan is to mark all 19.2 jobs as failed in a 20.2 startup
+// migration. Once we do that, this can remain as an assertion.
 func deprecatedIsOldSchemaChangeJob(payload *jobspb.Payload) bool {
 	schemaChangeDetails, ok := payload.UnwrapDetails().(jobspb.SchemaChangeDetails)
 	return ok && schemaChangeDetails.FormatVersion < jobspb.JobResumerFormatVersion
@@ -204,16 +217,6 @@ func (j *Job) CreatedBy() *CreatedByInfo {
 // execute this job.
 func (j *Job) taskName() string {
 	return fmt.Sprintf(`job-%d`, *j.ID())
-}
-
-// Created records the creation of a new job in the system.jobs table and
-// remembers the assigned ID of the job in the Job. The job information is read
-// from the Record field at the time Created is called.
-func (j *Job) created(ctx context.Context) error {
-	if j.ID() != nil {
-		return errors.Errorf("job already created with ID %v", *j.ID())
-	}
-	return j.insert(ctx, j.registry.makeJobID(), nil /* lease */)
 }
 
 // Started marks the tracked job as started.
@@ -329,8 +332,8 @@ func (j *Job) FractionProgressed(ctx context.Context, progressedFn FractionProgr
 		}
 		if fractionCompleted < 0.0 || fractionCompleted > 1.0 {
 			return errors.Errorf(
-				"Job: fractionCompleted %f is outside allowable range [0.0, 1.0] (job %d)",
-				fractionCompleted, *j.ID(),
+				"job %d: fractionCompleted %f is outside allowable range [0.0, 1.0]",
+				*j.ID(), fractionCompleted,
 			)
 		}
 		md.Progress.Progress = &jobspb.Progress_FractionCompleted{
@@ -355,8 +358,8 @@ func (j *Job) HighWaterProgressed(ctx context.Context, progressedFn HighWaterPro
 		}
 		if highWater.Less(hlc.Timestamp{}) {
 			return errors.Errorf(
-				"Job: high-water %s is outside allowable range > 0.0 (job %d)",
-				highWater, *j.ID(),
+				"job %d: high-water %s is outside allowable range > 0.0",
+				*j.ID(), highWater,
 			)
 		}
 		md.Progress.Progress = &jobspb.Progress_HighWater{
@@ -593,7 +596,7 @@ func (j *Job) succeeded(ctx context.Context, fn func(context.Context, *kv.Txn) e
 			return nil
 		}
 		if md.Status != StatusRunning && md.Status != StatusPending {
-			return errors.Errorf("Job with status %s cannot be marked as succeeded", md.Status)
+			return errors.Errorf("job with status %s cannot be marked as succeeded", md.Status)
 		}
 		if fn != nil {
 			if err := fn(ctx, txn); err != nil {
@@ -614,6 +617,9 @@ func (j *Job) succeeded(ctx context.Context, fn func(context.Context, *kv.Txn) e
 // SetDetails sets the details field of the currently running tracked job.
 func (j *Job) SetDetails(ctx context.Context, details interface{}) error {
 	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
+		if err := md.CheckRunningOrReverting(); err != nil {
+			return err
+		}
 		md.Payload.Details = jobspb.WrapPayloadDetails(details)
 		ju.UpdatePayload(md.Payload)
 		return nil
@@ -623,6 +629,9 @@ func (j *Job) SetDetails(ctx context.Context, details interface{}) error {
 // SetProgress sets the details field of the currently running tracked job.
 func (j *Job) SetProgress(ctx context.Context, details interface{}) error {
 	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
+		if err := md.CheckRunningOrReverting(); err != nil {
+			return err
+		}
 		md.Progress.Details = jobspb.WrapProgressDetails(details)
 		ju.UpdateProgress(md.Progress)
 		return nil
@@ -713,7 +722,7 @@ func (j *Job) load(ctx context.Context) error {
 			stmt = newStmt
 		}
 		row, err := j.registry.ex.QueryRowEx(
-			ctx, "load-job-query", txn, sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+			ctx, "load-job-query", txn, sessiondata.InternalExecutorOverride{User: security.RootUser},
 			stmt, *j.ID())
 		if err != nil {
 			return err
@@ -743,65 +752,6 @@ func (j *Job) load(ctx context.Context) error {
 	return nil
 }
 
-func (j *Job) insert(ctx context.Context, id int64, lease *jobspb.Lease) error {
-	if j.id != nil {
-		// Already created - do nothing.
-		return nil
-	}
-
-	j.mu.payload.Lease = lease
-
-	if err := j.runInTxn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		// Note: although the following uses ReadTimestamp and
-		// ReadTimestamp can diverge from the value of now() throughout a
-		// transaction, this may be OK -- we merely required ModifiedMicro
-		// to be equal *or greater* than previously inserted timestamps
-		// computed by now(). For now ReadTimestamp can only move forward
-		// and the assertion ReadTimestamp >= now() holds at all times.
-		j.mu.progress.ModifiedMicros = timeutil.ToUnixMicros(txn.ReadTimestamp().GoTime())
-		payloadBytes, err := protoutil.Marshal(&j.mu.payload)
-		if err != nil {
-			return err
-		}
-		progressBytes, err := protoutil.Marshal(&j.mu.progress)
-		if err != nil {
-			return err
-		}
-
-		if j.createdBy == nil {
-			const stmt = "INSERT INTO system.jobs (id, status, payload, progress) VALUES ($1, $2, $3, $4)"
-			_, err = j.registry.ex.Exec(ctx, "job-insert", txn, stmt, id, StatusRunning, payloadBytes, progressBytes)
-			return err
-		}
-		const stmt = `
-INSERT INTO system.jobs (id, status, payload, progress, created_by_type, created_by_id) 
-VALUES ($1, $2, $3, $4, $5, $6)`
-		_, err = j.registry.ex.Exec(ctx, "job-insert", txn, stmt,
-			id, StatusRunning, payloadBytes, progressBytes, j.createdBy.Name, j.createdBy.ID)
-		return err
-
-	}); err != nil {
-		return err
-	}
-	j.id = &id
-	return nil
-}
-
-func (j *Job) adopt(ctx context.Context, oldLease *jobspb.Lease) error {
-	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
-		if !md.Payload.Lease.Equal(oldLease) {
-			return errors.Errorf("current lease %v did not match expected lease %v",
-				md.Payload.Lease, oldLease)
-		}
-		md.Payload.Lease = j.registry.deprecatedNewLease()
-		if md.Payload.StartedMicros == 0 {
-			md.Payload.StartedMicros = timeutil.ToUnixMicros(j.registry.clock.Now().GoTime())
-		}
-		ju.UpdatePayload(md.Payload)
-		return nil
-	})
-}
-
 // UnmarshalPayload unmarshals and returns the Payload encoded in the input
 // datum, which should be a tree.DBytes.
 func UnmarshalPayload(datum tree.Datum) (*jobspb.Payload, error) {
@@ -809,7 +759,7 @@ func UnmarshalPayload(datum tree.Datum) (*jobspb.Payload, error) {
 	bytes, ok := datum.(*tree.DBytes)
 	if !ok {
 		return nil, errors.Errorf(
-			"Job: failed to unmarshal payload as DBytes (was %T)", datum)
+			"job: failed to unmarshal payload as DBytes (was %T)", datum)
 	}
 	if err := protoutil.Unmarshal([]byte(*bytes), payload); err != nil {
 		return nil, err
@@ -824,7 +774,7 @@ func UnmarshalProgress(datum tree.Datum) (*jobspb.Progress, error) {
 	bytes, ok := datum.(*tree.DBytes)
 	if !ok {
 		return nil, errors.Errorf(
-			"Job: failed to unmarshal Progress as DBytes (was %T)", datum)
+			"job: failed to unmarshal Progress as DBytes (was %T)", datum)
 	}
 	if err := protoutil.Unmarshal([]byte(*bytes), progress); err != nil {
 		return nil, err
@@ -843,10 +793,10 @@ func unmarshalCreatedBy(createdByType, createdByID tree.Datum) (*CreatedByInfo, 
 			return &CreatedByInfo{Name: string(*ds), ID: int64(*id)}, nil
 		}
 		return nil, errors.Errorf(
-			"Job: failed to unmarshal created_by_type as DInt (was %T)", createdByID)
+			"job: failed to unmarshal created_by_type as DInt (was %T)", createdByID)
 	}
 	return nil, errors.Errorf(
-		"Job: failed to unmarshal created_by_type as DString (was %T)", createdByType)
+		"job: failed to unmarshal created_by_type as DString (was %T)", createdByType)
 }
 
 // CurrentStatus returns the current job status from the jobs table or error.
@@ -882,6 +832,11 @@ func (sj *StartableJob) Start(ctx context.Context) (errCh <-chan error, err erro
 		return nil, errors.AssertionFailedf(
 			"StartableJob %d cannot be started more than once", *sj.ID())
 	}
+	if sj.registry.startUsingSQLLivenessAdoption(ctx) && sj.sessionID == "" {
+		return nil, errors.AssertionFailedf(
+			"StartableJob %d cannot be started without sqlliveness session", *sj.ID())
+	}
+
 	defer func() {
 		if err != nil {
 			sj.registry.unregister(*sj.ID())

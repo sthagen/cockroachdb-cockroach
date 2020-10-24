@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geodist"
+	"github.com/cockroachdb/cockroach/pkg/geo/geos"
 	"github.com/cockroachdb/errors"
 	"github.com/twpayne/go-geom"
 	"github.com/twpayne/go-geom/xy/lineintersector"
@@ -35,84 +36,98 @@ const (
 
 // MinDistance returns the minimum distance between geometries A and B.
 // This returns a geo.EmptyGeometryError if either A or B is EMPTY.
-func MinDistance(a *geo.Geometry, b *geo.Geometry) (float64, error) {
+func MinDistance(a geo.Geometry, b geo.Geometry) (float64, error) {
 	if a.SRID() != b.SRID() {
-		return 0, geo.NewMismatchingSRIDsError(a, b)
+		return 0, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
 	}
-	return minDistanceInternal(a, b, 0, geo.EmptyBehaviorOmit)
+	return minDistanceInternal(a, b, 0, geo.EmptyBehaviorOmit, geo.FnInclusive)
 }
 
 // MaxDistance returns the maximum distance across every pair of points comprising
 // geometries A and B.
-func MaxDistance(a *geo.Geometry, b *geo.Geometry) (float64, error) {
+func MaxDistance(a geo.Geometry, b geo.Geometry) (float64, error) {
 	if a.SRID() != b.SRID() {
-		return 0, geo.NewMismatchingSRIDsError(a, b)
+		return 0, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
 	}
-	return maxDistanceInternal(a, b, math.MaxFloat64, geo.EmptyBehaviorOmit)
+	return maxDistanceInternal(a, b, math.MaxFloat64, geo.EmptyBehaviorOmit, geo.FnInclusive)
 }
 
 // DWithin determines if any part of geometry A is within D units of geometry B.
-func DWithin(a *geo.Geometry, b *geo.Geometry, d float64) (bool, error) {
+// If exclusive, DWithin is equivalent to Distance(a, b) < d. Otherwise, DWithin
+// is equivalent to Distance(a, b) <= d.
+func DWithin(
+	a geo.Geometry, b geo.Geometry, d float64, exclusivity geo.FnExclusivity,
+) (bool, error) {
 	if a.SRID() != b.SRID() {
-		return false, geo.NewMismatchingSRIDsError(a, b)
+		return false, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
 	}
 	if d < 0 {
 		return false, errors.Newf("dwithin distance cannot be less than zero")
 	}
-	if !a.CartesianBoundingBox().Buffer(d).Intersects(b.CartesianBoundingBox()) {
+	if !a.CartesianBoundingBox().Buffer(d, d).Intersects(b.CartesianBoundingBox()) {
 		return false, nil
 	}
-	dist, err := minDistanceInternal(a, b, d, geo.EmptyBehaviorError)
+	dist, err := minDistanceInternal(a, b, d, geo.EmptyBehaviorError, exclusivity)
 	if err != nil {
 		// In case of any empty geometries return false.
 		if geo.IsEmptyGeometryError(err) {
 			return false, nil
 		}
 		return false, err
+	}
+	if exclusivity == geo.FnExclusive {
+		return dist < d, nil
 	}
 	return dist <= d, nil
 }
 
-// DFullyWithin determines whether the maximum distance across every pair of points
-// comprising geometries A and B is within D units.
-func DFullyWithin(a *geo.Geometry, b *geo.Geometry, d float64) (bool, error) {
+// DFullyWithin determines whether the maximum distance across every pair of
+// points comprising geometries A and B is within D units. If exclusive,
+// DFullyWithin is equivalent to MaxDistance(a, b) < d. Otherwise, DFullyWithin
+// is equivalent to MaxDistance(a, b) <= d.
+func DFullyWithin(
+	a geo.Geometry, b geo.Geometry, d float64, exclusivity geo.FnExclusivity,
+) (bool, error) {
 	if a.SRID() != b.SRID() {
-		return false, geo.NewMismatchingSRIDsError(a, b)
+		return false, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
 	}
 	if d < 0 {
 		return false, errors.Newf("dwithin distance cannot be less than zero")
 	}
-	if !a.CartesianBoundingBox().Buffer(d).Covers(b.CartesianBoundingBox()) {
+	if !a.CartesianBoundingBox().Buffer(d, d).Covers(b.CartesianBoundingBox()) {
 		return false, nil
 	}
-	dist, err := maxDistanceInternal(a, b, d, geo.EmptyBehaviorError)
+	dist, err := maxDistanceInternal(a, b, d, geo.EmptyBehaviorError, exclusivity)
 	if err != nil {
 		// In case of any empty geometries return false.
 		if geo.IsEmptyGeometryError(err) {
 			return false, nil
 		}
 		return false, err
+	}
+	if exclusivity == geo.FnExclusive {
+		return dist < d, nil
 	}
 	return dist <= d, nil
 }
 
 // LongestLineString returns the LineString corresponds to maximum distance across
 // every pair of points comprising geometries A and B.
-func LongestLineString(a *geo.Geometry, b *geo.Geometry) (*geo.Geometry, error) {
+func LongestLineString(a geo.Geometry, b geo.Geometry) (geo.Geometry, error) {
 	if a.SRID() != b.SRID() {
-		return nil, geo.NewMismatchingSRIDsError(a, b)
+		return geo.Geometry{}, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
 	}
-	u := newGeomMaxDistanceUpdater(math.MaxFloat64)
+	u := newGeomMaxDistanceUpdater(math.MaxFloat64, geo.FnInclusive)
 	return distanceLineStringInternal(a, b, u, geo.EmptyBehaviorOmit)
 }
 
 // ShortestLineString returns the LineString corresponds to minimum distance across
 // every pair of points comprising geometries A and B.
-func ShortestLineString(a *geo.Geometry, b *geo.Geometry) (*geo.Geometry, error) {
+func ShortestLineString(a geo.Geometry, b geo.Geometry) (geo.Geometry, error) {
 	if a.SRID() != b.SRID() {
-		return nil, geo.NewMismatchingSRIDsError(a, b)
+		return geo.Geometry{}, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
 	}
-	u := newGeomMinDistanceUpdater(0)
+	u := newGeomMinDistanceUpdater(0 /*stopAfter */, geo.FnInclusive)
 	return distanceLineStringInternal(a, b, u, geo.EmptyBehaviorOmit)
 }
 
@@ -122,12 +137,12 @@ func ShortestLineString(a *geo.Geometry, b *geo.Geometry) (*geo.Geometry, error)
 // EmptyGeometryError if A or B contains only EMPTY geometries, even if emptyBehavior
 // is set to EmptyBehaviorOmit.
 func distanceLineStringInternal(
-	a *geo.Geometry, b *geo.Geometry, u geodist.DistanceUpdater, emptyBehavior geo.EmptyBehavior,
-) (*geo.Geometry, error) {
+	a geo.Geometry, b geo.Geometry, u geodist.DistanceUpdater, emptyBehavior geo.EmptyBehavior,
+) (geo.Geometry, error) {
 	c := &geomDistanceCalculator{updater: u, boundingBoxIntersects: a.CartesianBoundingBox().Intersects(b.CartesianBoundingBox())}
 	_, err := distanceInternal(a, b, c, emptyBehavior)
 	if err != nil {
-		return nil, err
+		return geo.Geometry{}, err
 	}
 	var coordA, coordB geom.Coord
 	switch u := u.(type) {
@@ -138,19 +153,23 @@ func distanceLineStringInternal(
 		coordA = u.coordA
 		coordB = u.coordB
 	default:
-		return nil, errors.Newf("programmer error: unknown behavior")
+		return geo.Geometry{}, errors.Newf("programmer error: unknown behavior")
 	}
 	lineString := geom.NewLineStringFlat(geom.XY, append(coordA, coordB...)).SetSRID(int(a.SRID()))
-	return geo.NewGeometryFromGeomT(lineString)
+	return geo.MakeGeometryFromGeomT(lineString)
 }
 
 // maxDistanceInternal finds the maximum distance between two geometries.
 // We can re-use the same algorithm as min-distance, allowing skips of checks that involve
 // the interiors or intersections as those will always be less then the maximum min-distance.
 func maxDistanceInternal(
-	a *geo.Geometry, b *geo.Geometry, stopAfterGT float64, emptyBehavior geo.EmptyBehavior,
+	a geo.Geometry,
+	b geo.Geometry,
+	stopAfter float64,
+	emptyBehavior geo.EmptyBehavior,
+	exclusivity geo.FnExclusivity,
 ) (float64, error) {
-	u := newGeomMaxDistanceUpdater(stopAfterGT)
+	u := newGeomMaxDistanceUpdater(stopAfter, exclusivity)
 	c := &geomDistanceCalculator{updater: u, boundingBoxIntersects: a.CartesianBoundingBox().Intersects(b.CartesianBoundingBox())}
 	return distanceInternal(a, b, c, emptyBehavior)
 }
@@ -158,9 +177,13 @@ func maxDistanceInternal(
 // minDistanceInternal finds the minimum distance between two geometries.
 // This implementation is done in-house, as compared to using GEOS.
 func minDistanceInternal(
-	a *geo.Geometry, b *geo.Geometry, stopAfterLE float64, emptyBehavior geo.EmptyBehavior,
+	a geo.Geometry,
+	b geo.Geometry,
+	stopAfter float64,
+	emptyBehavior geo.EmptyBehavior,
+	exclusivity geo.FnExclusivity,
 ) (float64, error) {
-	u := newGeomMinDistanceUpdater(stopAfterLE)
+	u := newGeomMinDistanceUpdater(stopAfter, exclusivity)
 	c := &geomDistanceCalculator{updater: u, boundingBoxIntersects: a.CartesianBoundingBox().Intersects(b.CartesianBoundingBox())}
 	return distanceInternal(a, b, c, emptyBehavior)
 }
@@ -171,7 +194,7 @@ func minDistanceInternal(
 // EmptyGeometryError if A or B contains only EMPTY geometries, even if emptyBehavior
 // is set to EmptyBehaviorOmit.
 func distanceInternal(
-	a *geo.Geometry, b *geo.Geometry, c geodist.DistanceCalculator, emptyBehavior geo.EmptyBehavior,
+	a geo.Geometry, b geo.Geometry, c geodist.DistanceCalculator, emptyBehavior geo.EmptyBehavior,
 ) (float64, error) {
 	// If either side has no geoms, then we error out regardless of emptyBehavior.
 	if a.Empty() || b.Empty() {
@@ -376,10 +399,13 @@ func (c *geomGeodistEdgeCrosser) ChainCrossing(p geodist.Point) (bool, geodist.P
 
 // geomMinDistanceUpdater finds the minimum distance using geom calculations.
 // And preserve the line's endpoints as geom.Coord which corresponds to minimum
-// distance. Methods will return early if it finds a minimum distance <= stopAfterLE.
+// distance. If inclusive, methods will return early if it finds a minimum
+// distance <= stopAfter. Otherwise, methods will return early if it finds a
+// minimum distance < stopAfter.
 type geomMinDistanceUpdater struct {
 	currentValue float64
-	stopAfterLE  float64
+	stopAfter    float64
+	exclusivity  geo.FnExclusivity
 	// coordA represents the first vertex of the edge that holds the maximum distance.
 	coordA geom.Coord
 	// coordB represents the second vertex of the edge that holds the maximum distance.
@@ -392,10 +418,13 @@ var _ geodist.DistanceUpdater = (*geomMinDistanceUpdater)(nil)
 
 // newGeomMinDistanceUpdater returns a new geomMinDistanceUpdater with the
 // correct arguments set up.
-func newGeomMinDistanceUpdater(stopAfterLE float64) *geomMinDistanceUpdater {
+func newGeomMinDistanceUpdater(
+	stopAfter float64, exclusivity geo.FnExclusivity,
+) *geomMinDistanceUpdater {
 	return &geomMinDistanceUpdater{
 		currentValue:        math.MaxFloat64,
-		stopAfterLE:         stopAfterLE,
+		stopAfter:           stopAfter,
+		exclusivity:         exclusivity,
 		coordA:              nil,
 		coordB:              nil,
 		geometricalObjOrder: geometricalObjectsNotFlipped,
@@ -422,7 +451,10 @@ func (u *geomMinDistanceUpdater) Update(aPoint geodist.Point, bPoint geodist.Poi
 			u.coordA = a
 			u.coordB = b
 		}
-		return dist <= u.stopAfterLE
+		if u.exclusivity == geo.FnExclusive {
+			return dist < u.stopAfter
+		}
+		return dist <= u.stopAfter
 	}
 	return false
 }
@@ -447,10 +479,13 @@ func (u *geomMinDistanceUpdater) FlipGeometries() {
 
 // geomMaxDistanceUpdater finds the maximum distance using geom calculations.
 // And preserve the line's endpoints as geom.Coord which corresponds to maximum
-// distance. Methods will return early if it finds a distance > stopAfterGT.
+// distance. If exclusive, methods will return early if it finds that
+// distance >= stopAfter. Otherwise, methods will return early if distance >
+// stopAfter.
 type geomMaxDistanceUpdater struct {
 	currentValue float64
-	stopAfterGT  float64
+	stopAfter    float64
+	exclusivity  geo.FnExclusivity
 
 	// coordA represents the first vertex of the edge that holds the maximum distance.
 	coordA geom.Coord
@@ -466,10 +501,13 @@ var _ geodist.DistanceUpdater = (*geomMaxDistanceUpdater)(nil)
 // correct arguments set up. currentValue is initially populated with least
 // possible value instead of 0 because there may be the case where maximum
 // distance is 0 and we may require to find the line for 0 maximum distance.
-func newGeomMaxDistanceUpdater(stopAfterGT float64) *geomMaxDistanceUpdater {
+func newGeomMaxDistanceUpdater(
+	stopAfter float64, exclusivity geo.FnExclusivity,
+) *geomMaxDistanceUpdater {
 	return &geomMaxDistanceUpdater{
 		currentValue:        -math.MaxFloat64,
-		stopAfterGT:         stopAfterGT,
+		stopAfter:           stopAfter,
+		exclusivity:         exclusivity,
 		coordA:              nil,
 		coordB:              nil,
 		geometricalObjOrder: geometricalObjectsNotFlipped,
@@ -496,7 +534,10 @@ func (u *geomMaxDistanceUpdater) Update(aPoint geodist.Point, bPoint geodist.Poi
 			u.coordA = a
 			u.coordB = b
 		}
-		return dist > u.stopAfterGT
+		if u.exclusivity == geo.FnExclusive {
+			return dist >= u.stopAfter
+		}
+		return dist > u.stopAfter
 	}
 	return false
 }
@@ -668,4 +709,88 @@ func (c *geomDistanceCalculator) ClosestPointToEdge(
 		return p, false
 	}
 	return geodist.Point{GeomPoint: coordAdd(e.V0.GeomPoint, coordMul(ab, r))}, true
+}
+
+// FrechetDistance calculates the Frechet distance between two geometries.
+func FrechetDistance(a, b geo.Geometry) (*float64, error) {
+	if a.Empty() || b.Empty() {
+		return nil, nil
+	}
+	if a.SRID() != b.SRID() {
+		return nil, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
+	}
+	distance, err := geos.FrechetDistance(a.EWKB(), b.EWKB())
+	if err != nil {
+		return nil, err
+	}
+	return &distance, nil
+}
+
+// FrechetDistanceDensify calculates the Frechet distance between two geometries.
+func FrechetDistanceDensify(a, b geo.Geometry, densifyFrac float64) (*float64, error) {
+	// For Frechet distance, we take <= 0 to disable the densifyFrac parameter.
+	// This differs from HausdorffDistance, but follows PostGIS behavior.
+	if densifyFrac <= 0 {
+		return FrechetDistance(a, b)
+	}
+	if a.Empty() || b.Empty() {
+		return nil, nil
+	}
+	if a.SRID() != b.SRID() {
+		return nil, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
+	}
+	distance, err := geos.FrechetDistanceDensify(a.EWKB(), b.EWKB(), densifyFrac)
+	if err != nil {
+		return nil, err
+	}
+	return &distance, nil
+}
+
+// HausdorffDistance calculates the Hausdorff distance between two geometries.
+func HausdorffDistance(a, b geo.Geometry) (*float64, error) {
+	if a.Empty() || b.Empty() {
+		return nil, nil
+	}
+	if a.SRID() != b.SRID() {
+		return nil, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
+	}
+	distance, err := geos.HausdorffDistance(a.EWKB(), b.EWKB())
+	if err != nil {
+		return nil, err
+	}
+	return &distance, nil
+}
+
+// HausdorffDistanceDensify calculates the Hausdorff distance between two geometries.
+func HausdorffDistanceDensify(a, b geo.Geometry, densifyFrac float64) (*float64, error) {
+	if a.Empty() || b.Empty() {
+		return nil, nil
+	}
+	if a.SRID() != b.SRID() {
+		return nil, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
+	}
+	distance, err := geos.HausdorffDistanceDensify(a.EWKB(), b.EWKB(), densifyFrac)
+	if err != nil {
+		return nil, err
+	}
+	return &distance, nil
+}
+
+// ClosestPoint returns the first point located on geometry A on the shortest line between the geometries.
+func ClosestPoint(a, b geo.Geometry) (geo.Geometry, error) {
+	shortestLine, err := ShortestLineString(a, b)
+	if err != nil {
+		return geo.Geometry{}, err
+	}
+	shortestLineT, err := shortestLine.AsGeomT()
+	if err != nil {
+		return geo.Geometry{}, err
+	}
+	closestPoint, err := geo.MakeGeometryFromPointCoords(
+		shortestLineT.(*geom.LineString).Coord(0).X(),
+		shortestLineT.(*geom.LineString).Coord(0).Y())
+	if err != nil {
+		return geo.Geometry{}, err
+	}
+	return closestPoint, nil
 }

@@ -13,19 +13,22 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
 )
 
 type alterTypeNode struct {
 	n    *tree.AlterType
-	desc *sqlbase.MutableTypeDescriptor
+	desc *typedesc.Mutable
 }
 
 // alterTypeNode implements planNode. We set n here to satisfy the linter.
@@ -37,15 +40,24 @@ func (p *planner) AlterType(ctx context.Context, n *tree.AlterType) (planNode, e
 	if err != nil {
 		return nil, err
 	}
-	// The implicit array types are not modifiable.
-	if desc.Kind == descpb.TypeDescriptor_ALIAS {
+
+	// The user needs ownership privilege to alter the type.
+	if err := p.canModifyType(ctx, desc); err != nil {
+		return nil, err
+	}
+
+	switch desc.Kind {
+	case descpb.TypeDescriptor_ALIAS:
+		// The implicit array types are not modifiable.
 		return nil, pgerror.Newf(
 			pgcode.WrongObjectType,
 			"%q is an implicit array type and cannot be modified",
 			tree.AsStringWithFQNames(n.Type, &p.semaCtx.Annotations),
 		)
+	case descpb.TypeDescriptor_ENUM:
+		sqltelemetry.IncrementEnumCounter(sqltelemetry.EnumAlter)
 	}
-	// TODO (rohany): Check permissions here once we track them.
+
 	return &alterTypeNode{
 		n:    n,
 		desc: desc,
@@ -53,16 +65,19 @@ func (p *planner) AlterType(ctx context.Context, n *tree.AlterType) (planNode, e
 }
 
 func (n *alterTypeNode) startExec(params runParams) error {
+	telemetry.Inc(n.n.Cmd.TelemetryCounter())
 	var err error
 	switch t := n.n.Cmd.(type) {
 	case *tree.AlterTypeAddValue:
 		err = params.p.addEnumValue(params.ctx, n, t)
 	case *tree.AlterTypeRenameValue:
-		err = params.p.renameTypeValue(params.ctx, n, t.OldVal, t.NewVal)
+		err = params.p.renameTypeValue(params.ctx, n, string(t.OldVal), string(t.NewVal))
 	case *tree.AlterTypeRename:
-		err = params.p.renameType(params.ctx, n, t.NewName)
+		err = params.p.renameType(params.ctx, n, string(t.NewName))
 	case *tree.AlterTypeSetSchema:
-		err = params.p.setTypeSchema(params.ctx, n, t.Schema)
+		err = params.p.setTypeSchema(params.ctx, n, string(t.Schema))
+	case *tree.AlterTypeOwner:
+		err = params.p.alterTypeOwner(params.ctx, n, string(t.Owner))
 	default:
 		err = errors.AssertionFailedf("unknown alter type cmd %s", t)
 	}
@@ -71,7 +86,8 @@ func (n *alterTypeNode) startExec(params runParams) error {
 	}
 
 	// Validate the type descriptor after the changes.
-	if err := n.desc.Validate(params.ctx, params.p.txn, params.ExecCfg().Codec); err != nil {
+	dg := catalogkv.NewOneLevelUncachedDescGetter(params.p.txn, params.ExecCfg().Codec)
+	if err := n.desc.Validate(params.ctx, dg); err != nil {
 		return err
 	}
 
@@ -98,9 +114,9 @@ func (p *planner) addEnumValue(
 	}
 	// See if the value already exists in the enum or not.
 	for _, member := range n.desc.EnumMembers {
-		if member.LogicalRepresentation == node.NewVal {
+		if member.LogicalRepresentation == string(node.NewVal) {
 			if node.IfNotExists {
-				p.SendClientNotice(
+				p.BufferClientNotice(
 					ctx,
 					pgnotice.Newf("enum label %q already exists, skipping", node.NewVal),
 				)
@@ -134,9 +150,9 @@ func (p *planner) renameType(ctx context.Context, n *alterTypeNode, newName stri
 		// Try and see what kind of object we collided with.
 		desc, err := catalogkv.GetAnyDescriptorByID(ctx, p.txn, p.ExecCfg().Codec, id, catalogkv.Immutable)
 		if err != nil {
-			return sqlbase.WrapErrorWhileConstructingObjectAlreadyExistsErr(err)
+			return sqlerrors.WrapErrorWhileConstructingObjectAlreadyExistsErr(err)
 		}
-		return sqlbase.MakeObjectAlreadyExistsError(desc.DescriptorProto(), newName)
+		return sqlerrors.MakeObjectAlreadyExistsError(desc.DescriptorProto(), newName)
 	} else if err != nil {
 		return err
 	}
@@ -184,7 +200,7 @@ func (p *planner) renameType(ctx context.Context, n *alterTypeNode, newName stri
 // newName and newSchemaID may be the same as the current name and schemaid.
 func (p *planner) performRenameTypeDesc(
 	ctx context.Context,
-	desc *sqlbase.MutableTypeDescriptor,
+	desc *typedesc.Mutable,
 	newName string,
 	newSchemaID descpb.ID,
 	jobDesc string,
@@ -281,7 +297,82 @@ func (p *planner) setTypeSchema(ctx context.Context, n *alterTypeNode, schema st
 	)
 }
 
+func (p *planner) alterTypeOwner(ctx context.Context, n *alterTypeNode, newOwner string) error {
+	typeDesc := n.desc
+
+	privs := typeDesc.GetPrivileges()
+
+	// If the owner we want to set to is the current owner, do a no-op.
+	if newOwner == privs.Owner {
+		return nil
+	}
+
+	arrayDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeDesc.ArrayTypeID)
+	if err != nil {
+		return err
+	}
+
+	if err := p.checkCanAlterTypeAndSetNewOwner(ctx, typeDesc, arrayDesc, newOwner); err != nil {
+		return err
+	}
+
+	if err := p.writeTypeSchemaChange(
+		ctx, typeDesc, tree.AsStringWithFQNames(n.n, p.Ann()),
+	); err != nil {
+		return err
+	}
+
+	return p.writeTypeSchemaChange(
+		ctx, arrayDesc, tree.AsStringWithFQNames(n.n, p.Ann()),
+	)
+}
+
+// checkCanAlterTypeAndSetNewOwner handles privilege checking and setting new owner.
+// Called in ALTER TYPE and REASSIGN OWNED BY.
+func (p *planner) checkCanAlterTypeAndSetNewOwner(
+	ctx context.Context, typeDesc *typedesc.Mutable, arrayTypeDesc *typedesc.Mutable, newOwner string,
+) error {
+
+	if err := p.checkCanAlterToNewOwner(ctx, typeDesc, newOwner); err != nil {
+		return err
+	}
+
+	// Ensure the new owner has CREATE privilege on the type's schema.
+	if err := p.canCreateOnSchema(
+		ctx, typeDesc.GetParentSchemaID(), typeDesc.ParentID, newOwner, checkPublicSchema); err != nil {
+		return err
+	}
+
+	privs := typeDesc.GetPrivileges()
+	privs.SetOwner(newOwner)
+
+	// Also have to change the owner of the implicit array type.
+	arrayTypeDesc.Privileges.SetOwner(newOwner)
+
+	return nil
+}
+
 func (n *alterTypeNode) Next(params runParams) (bool, error) { return false, nil }
 func (n *alterTypeNode) Values() tree.Datums                 { return tree.Datums{} }
 func (n *alterTypeNode) Close(ctx context.Context)           {}
 func (n *alterTypeNode) ReadingOwnWrites()                   {}
+
+func (p *planner) canModifyType(ctx context.Context, desc *typedesc.Mutable) error {
+	hasAdmin, err := p.HasAdminRole(ctx)
+	if err != nil {
+		return err
+	}
+	if hasAdmin {
+		return nil
+	}
+
+	hasOwnership, err := p.HasOwnership(ctx, desc)
+	if err != nil {
+		return err
+	}
+	if !hasOwnership {
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"must be owner of type %s", tree.Name(desc.GetName()))
+	}
+	return nil
+}

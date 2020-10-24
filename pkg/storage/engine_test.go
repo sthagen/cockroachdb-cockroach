@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 func ensureRangeEqual(
@@ -435,6 +436,49 @@ func addMergeTimestamp(t *testing.T, data []byte, ts int64) []byte {
 	return mustMarshal(&v)
 }
 
+var testtime = int64(-446061360000000000)
+
+type tsSample struct {
+	offset int32
+	count  uint32
+	sum    float64
+	max    float64
+	min    float64
+}
+
+// timeSeriesRow generates a simple InternalTimeSeriesData object which starts
+// at the given timestamp and has samples of the given duration. The time series
+// is written using the older sample-row data format. The object is stored in an
+// MVCCMetadata object and marshaled to bytes.
+func timeSeriesRow(start int64, duration int64, samples ...tsSample) []byte {
+	tsv := timeSeriesRowAsValue(start, duration, samples...)
+	return mustMarshal(&enginepb.MVCCMetadataSubsetForMergeSerialization{RawBytes: tsv.RawBytes})
+}
+
+func timeSeriesRowAsValue(start int64, duration int64, samples ...tsSample) roachpb.Value {
+	ts := &roachpb.InternalTimeSeriesData{
+		StartTimestampNanos: start,
+		SampleDurationNanos: duration,
+	}
+	for _, sample := range samples {
+		newSample := roachpb.InternalTimeSeriesSample{
+			Offset: sample.offset,
+			Count:  sample.count,
+			Sum:    sample.sum,
+		}
+		if sample.count > 1 {
+			newSample.Max = proto.Float64(sample.max)
+			newSample.Min = proto.Float64(sample.min)
+		}
+		ts.Samples = append(ts.Samples, newSample)
+	}
+	var v roachpb.Value
+	if err := v.SetProto(ts); err != nil {
+		panic(err)
+	}
+	return v
+}
+
 // TestEngineMerge tests that the passing through of engine merge operations
 // to the goMerge function works as expected. The semantics are tested more
 // exhaustively in the merge tests themselves.
@@ -534,16 +578,14 @@ func TestEngineMustExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	test := func(engineType enginepb.EngineType, errStr string) {
+	test := func(errStr string) {
 		tempDir, dirCleanupFn := testutils.TempDir(t)
 		defer dirCleanupFn()
 
-		_, err := NewEngine(
-			engineType,
-			0, base.StorageConfig{
-				Dir:       tempDir,
-				MustExist: true,
-			})
+		_, err := NewEngine(0, base.StorageConfig{
+			Dir:       tempDir,
+			MustExist: true,
+		})
 		if err == nil {
 			t.Fatal("expected error related to missing directory")
 		}
@@ -552,8 +594,7 @@ func TestEngineMustExist(t *testing.T) {
 		}
 	}
 
-	test(enginepb.EngineTypeRocksDB, "does not exist (create_if_missing is false)")
-	test(enginepb.EngineTypePebble, "no such file or directory")
+	test("no such file or directory")
 }
 
 func TestEngineTimeBound(t *testing.T) {
@@ -719,7 +760,7 @@ func TestEngineTimeBound(t *testing.T) {
 	}
 }
 
-func TestFlushWithSSTables(t *testing.T) {
+func TestFlushNumSSTables(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -749,8 +790,11 @@ func TestFlushWithSSTables(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			ssts := engine.GetSSTables()
-			if len(ssts) == 0 {
+			m, err := engine.GetMetrics()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.NumSSTables == 0 {
 				t.Fatal("expected non-zero sstables, got 0")
 			}
 		})
@@ -1056,13 +1100,13 @@ func TestSnapshotMethods(t *testing.T) {
 
 			// Verify Iterate.
 			index := 0
-			if err := snap.Iterate(roachpb.KeyMin, roachpb.KeyMax, func(kv MVCCKeyValue) (bool, error) {
+			if err := snap.Iterate(roachpb.KeyMin, roachpb.KeyMax, func(kv MVCCKeyValue) error {
 				if !kv.Key.Equal(keys[index]) || !bytes.Equal(kv.Value, vals[index]) {
 					t.Errorf("%d: key/value not equal between expected and snapshot: %s/%s, %s/%s",
 						index, keys[index], vals[index], kv.Key, kv.Value)
 				}
 				index++
-				return false, nil
+				return nil
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -1114,17 +1158,18 @@ func TestCreateCheckpoint(t *testing.T) {
 	dir, cleanup := testutils.TempDir(t)
 	defer cleanup()
 
-	rocksDB, err := NewRocksDB(
-		RocksDBConfig{
+	opts := DefaultPebbleOptions()
+	db, err := NewPebble(
+		context.Background(),
+		PebbleConfig{
 			StorageConfig: base.StorageConfig{
 				Settings: cluster.MakeTestingClusterSettings(),
 				Dir:      dir,
 			},
+			Opts: opts,
 		},
-		RocksDBCache{},
 	)
-
-	db := Engine(rocksDB) // be impl neutral from now on
+	assert.NoError(t, err)
 	defer db.Close()
 
 	dir = filepath.Join(dir, "checkpoint")
@@ -1148,19 +1193,19 @@ func TestIngestDelayLimit(t *testing.T) {
 	max, ramp := time.Second*5, time.Second*5/10
 
 	for _, tc := range []struct {
-		exp   time.Duration
-		stats Stats
+		exp     time.Duration
+		metrics Metrics
 	}{
-		{0, Stats{}},
-		{0, Stats{L0FileCount: 19, L0SublevelCount: -1}},
-		{0, Stats{L0FileCount: 20, L0SublevelCount: -1}},
-		{ramp, Stats{L0FileCount: 21, L0SublevelCount: -1}},
-		{ramp * 2, Stats{L0FileCount: 22, L0SublevelCount: -1}},
-		{ramp * 2, Stats{L0FileCount: 22, L0SublevelCount: 22}},
-		{ramp * 2, Stats{L0FileCount: 55, L0SublevelCount: 22}},
-		{max, Stats{L0FileCount: 55, L0SublevelCount: -1}},
+		{0, Metrics{}},
+		{0, Metrics{L0FileCount: 19, L0SublevelCount: -1}},
+		{0, Metrics{L0FileCount: 20, L0SublevelCount: -1}},
+		{ramp, Metrics{L0FileCount: 21, L0SublevelCount: -1}},
+		{ramp * 2, Metrics{L0FileCount: 22, L0SublevelCount: -1}},
+		{ramp * 2, Metrics{L0FileCount: 22, L0SublevelCount: 22}},
+		{ramp * 2, Metrics{L0FileCount: 55, L0SublevelCount: 22}},
+		{max, Metrics{L0FileCount: 55, L0SublevelCount: -1}},
 	} {
-		require.Equal(t, tc.exp, calculatePreIngestDelay(s, &tc.stats))
+		require.Equal(t, tc.exp, calculatePreIngestDelay(s, &tc.metrics))
 	}
 }
 
@@ -1344,21 +1389,6 @@ type engineImpl struct {
 
 // These FS implementations are not in-memory.
 var engineRealFSImpls = []engineImpl{
-	{"rocksdb", func(t *testing.T, dir string) Engine {
-		db, err := NewRocksDB(
-			RocksDBConfig{
-				StorageConfig: base.StorageConfig{
-					Settings: cluster.MakeTestingClusterSettings(),
-					Dir:      dir,
-				},
-			},
-			RocksDBCache{},
-		)
-		if err != nil {
-			t.Fatalf("could not create new rocksdb instance at %s: %+v", dir, err)
-		}
-		return db
-	}},
 	{"pebble", func(t *testing.T, dir string) Engine {
 
 		opts := DefaultPebbleOptions()
@@ -1474,29 +1504,11 @@ func TestSupportsPrev(t *testing.T) {
 		})
 	}
 	t.Run("pebble", func(t *testing.T) {
-		eng := newPebbleInMem(context.Background(), roachpb.Attributes{}, 1<<20)
+		eng := newPebbleInMem(context.Background(), roachpb.Attributes{}, 1<<20, nil /* settings */)
 		defer eng.Close()
 		runTest(t, eng, engineTest{
 			engineIterSupportsPrev:   true,
 			batchIterSupportsPrev:    true,
-			snapshotIterSupportsPrev: true,
-		})
-	})
-	t.Run("rocksdb", func(t *testing.T) {
-		eng := newRocksDBInMem(roachpb.Attributes{}, 1<<20)
-		defer eng.Close()
-		runTest(t, eng, engineTest{
-			engineIterSupportsPrev:   true,
-			batchIterSupportsPrev:    false,
-			snapshotIterSupportsPrev: true,
-		})
-	})
-	t.Run("tee", func(t *testing.T) {
-		eng := newTeeInMem(context.Background(), roachpb.Attributes{}, 1<<20)
-		defer eng.Close()
-		runTest(t, eng, engineTest{
-			engineIterSupportsPrev:   true,
-			batchIterSupportsPrev:    false,
 			snapshotIterSupportsPrev: true,
 		})
 	})
@@ -1509,12 +1521,6 @@ func TestFS(t *testing.T) {
 	var engineImpls []engineImpl
 	engineImpls = append(engineImpls, engineRealFSImpls...)
 	engineImpls = append(engineImpls,
-		engineImpl{
-			name: "rocksdb_mem",
-			create: func(_ *testing.T, _ string) Engine {
-				return createTestRocksDBEngine()
-			},
-		},
 		engineImpl{
 			name: "pebble_mem",
 			create: func(_ *testing.T, _ string) Engine {

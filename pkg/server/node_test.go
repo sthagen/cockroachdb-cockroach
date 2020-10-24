@@ -77,6 +77,7 @@ func TestBootstrapCluster(t *testing.T) {
 	for _, kv := range res.KVs {
 		foundKeys = append(foundKeys, kv.Key)
 	}
+	const firstNodeID = 1
 	var expectedKeys = keySlice{
 		testutils.MakeKey(roachpb.Key("\x02"), roachpb.KeyMax),
 		testutils.MakeKey(roachpb.Key("\x03"), roachpb.KeyMax),
@@ -84,6 +85,7 @@ func TestBootstrapCluster(t *testing.T) {
 		roachpb.Key("\x04node-idgen"),
 		roachpb.Key("\x04range-idgen"),
 		roachpb.Key("\x04store-idgen"),
+		keys.NodeLivenessKey(firstNodeID),
 	}
 	for _, splitKey := range config.StaticSplits() {
 		meta2Key := keys.RangeMetaKey(splitKey)
@@ -189,7 +191,7 @@ func TestNodeJoin(t *testing.T) {
 
 	numNodes := len(perNode)
 
-	s := serverutils.StartTestCluster(t, numNodes, args)
+	s := serverutils.StartNewTestCluster(t, numNodes, args)
 	defer s.Stopper().Stop(ctx)
 
 	// Verify all stores are initialized.

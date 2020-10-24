@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -130,13 +132,13 @@ func entries(
 	canCache := true
 
 	var ent raftpb.Entry
-	scanFunc := func(kv roachpb.KeyValue) (bool, error) {
+	scanFunc := func(kv roachpb.KeyValue) error {
 		if err := kv.Value.GetProto(&ent); err != nil {
-			return false, err
+			return err
 		}
 		// Exit early if we have any gaps or it has been compacted.
 		if ent.Index != expectedIndex {
-			return true, nil
+			return iterutil.StopIteration()
 		}
 		expectedIndex++
 
@@ -147,7 +149,7 @@ func entries(
 					ctx, rangeID, ent, sideloaded, eCache,
 				)
 				if err != nil {
-					return true, err
+					return err
 				}
 				if newEnt != nil {
 					ent = *newEnt
@@ -160,11 +162,17 @@ func entries(
 		if size > maxBytes {
 			exceededMaxBytes = true
 			if len(ents) > 0 {
-				return exceededMaxBytes, nil
+				if exceededMaxBytes {
+					return iterutil.StopIteration()
+				}
+				return nil
 			}
 		}
 		ents = append(ents, ent)
-		return exceededMaxBytes, nil
+		if exceededMaxBytes {
+			return iterutil.StopIteration()
+		}
+		return nil
 	}
 
 	if err := iterateEntries(ctx, reader, rangeID, expectedIndex, hi, scanFunc); err != nil {
@@ -223,7 +231,7 @@ func iterateEntries(
 	reader storage.Reader,
 	rangeID roachpb.RangeID,
 	lo, hi uint64,
-	scanFunc func(roachpb.KeyValue) (bool, error),
+	scanFunc func(roachpb.KeyValue) error,
 ) error {
 	_, err := storage.MVCCIterate(
 		ctx, reader,
@@ -1024,6 +1032,15 @@ func (r *Replica) clearSubsumedReplicaDiskData(
 	keyRanges := getKeyRanges(desc)
 	totalKeyRanges := append([]rditer.KeyRange(nil), keyRanges[:]...)
 	for _, sr := range subsumedRepls {
+		// We mark the replica as destroyed so that new commands are not
+		// accepted. This destroy status will be detected after the batch
+		// commits by clearSubsumedReplicaInMemoryData() to finish the removal.
+		sr.mu.Lock()
+		sr.mu.destroyStatus.Set(
+			roachpb.NewRangeNotFoundError(sr.RangeID, sr.store.StoreID()),
+			destroyReasonRemoved)
+		sr.mu.Unlock()
+
 		// We have to create an SST for the subsumed replica's range-id local keys.
 		subsumedReplSSTFile := &storage.MemFile{}
 		subsumedReplSST := storage.MakeIngestionSSTWriter(subsumedReplSSTFile)
@@ -1138,7 +1155,8 @@ func (r *Replica) clearSubsumedReplicaInMemoryData(
 		// replicas themselves is protected by their raftMus, which are held from
 		// start to finish.
 		if err := r.store.removeInitializedReplicaRaftMuLocked(ctx, sr, subsumedNextReplicaID, RemoveOptions{
-			DestroyData: false, // data is already destroyed
+			// The data was already destroyed by clearSubsumedReplicaDiskData.
+			DestroyData: false,
 		}); err != nil {
 			return err
 		}
@@ -1163,8 +1181,8 @@ func extractRangeFromEntries(logEntries [][]byte) (string, error) {
 			return "", err
 		}
 
-		firstIndex = string(firstAndLastLogEntries[0].Index)
-		lastIndex = string(firstAndLastLogEntries[1].Index)
+		firstIndex = strconv.FormatUint(firstAndLastLogEntries[0].Index, 10)
+		lastIndex = strconv.FormatUint(firstAndLastLogEntries[1].Index, 10)
 	}
 	return fmt.Sprintf("[%s, %s]", firstIndex, lastIndex), nil
 }

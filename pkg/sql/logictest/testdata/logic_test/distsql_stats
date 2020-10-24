@@ -203,8 +203,6 @@ SET CLUSTER SETTING sql.stats.multi_column_collection.enabled = false
 statement ok
 CREATE STATISTICS s3 FROM data
 
-# With default column statistics, only index columns (plus boolean columns)
-# have a histogram_id (specifically the first column in each index).
 query TIIIB colnames
 SELECT column_names, row_count, distinct_count, null_count, histogram_id IS NOT NULL AS has_histogram
 FROM [SHOW STATISTICS FOR TABLE data]
@@ -253,8 +251,6 @@ DROP INDEX data@c_idx; DROP INDEX data@data_c_b_idx
 statement ok
 CREATE STATISTICS s5 FROM [53]
 
-# We should still get stats for column c, but now column c is added later as a
-# non-index column, resulting in a different ordering of the rows.
 query TIII colnames
 SELECT column_names, row_count, distinct_count, null_count
 FROM [SHOW STATISTICS FOR TABLE data]
@@ -596,11 +592,10 @@ ORDER BY statistics_name, column_names::STRING
 ----
 statistics_name  column_names  row_count  distinct_count  null_count  has_histogram
 arr_stats        {rowid}       4          4               0           true
-arr_stats_x      {x}           4          3               1           true
+arr_stats_x      {x}           4          3               1           false
 
 # Test that enum columns always have histograms collected for them.
 statement ok
-SET experimental_enable_enums=true;
 CREATE TYPE e AS ENUM ('hello', 'howdy', 'hi');
 CREATE TABLE et (x e, y e, PRIMARY KEY (x));
 INSERT INTO et VALUES ('hello', 'hello'), ('howdy', 'howdy'), ('hi', 'hi');
@@ -691,7 +686,6 @@ SELECT count(*)
 statement ok
 SET tracing=off
 
-
 query TTIIIB colnames
 SELECT
   statistics_name,
@@ -706,13 +700,13 @@ ORDER BY
   statistics_name, column_names
 ----
 statistics_name  column_names    row_count  distinct_count  null_count  has_histogram
-s                {last_updated}  5          1               0           false
+s                {last_updated}  5          1               0           true
 s                {profile_id}    5          5               0           true
 s                {user_profile}  5          4               1           true
 
 
 # Test that individual columns in primary keys always have histograms collected
-# for them.
+# for them, with up to 200 buckets.
 
 statement ok
 SET CLUSTER SETTING sql.stats.multi_column_collection.enabled = false
@@ -739,8 +733,20 @@ s                {a}           3          0           true
 s                {b}           3          0           true
 s                {c}           3          0           true
 
+let $hist_id_1
+SELECT histogram_id FROM [SHOW STATISTICS FOR TABLE prim]
+WHERE statistics_name = 's' AND column_names = '{a}'
+
+query TIRI colnames
+SHOW HISTOGRAM $hist_id_1
+----
+upper_bound  range_rows  distinct_range_rows  equal_rows
+1            0           0                    1
+2            0           0                    1
+3            0           0                    1
+
 # Test that individual columns in secondary indexes always have histograms
-# collected for them.
+# collected for them, with up to 200 buckets.
 statement ok
 CREATE TABLE sec (a INT, b INT, c INT, INDEX (a, b, c));
 INSERT INTO sec VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
@@ -764,10 +770,21 @@ s                {b}           3          0           true
 s                {c}           3          0           true
 s                {rowid}       3          0           true
 
+let $hist_id_1
+SELECT histogram_id FROM [SHOW STATISTICS FOR TABLE sec]
+WHERE statistics_name = 's' AND column_names = '{a}'
+
+query TIRI colnames
+SHOW HISTOGRAM $hist_id_1
+----
+upper_bound  range_rows  distinct_range_rows  equal_rows
+1            0           0                    1
+2            0           0                    1
+3            0           0                    1
+
 # Test that columns referenced in partial index predicates always have
-# histograms collected for them.
+# histograms collected for them, with up to 200 buckets.
 statement ok
-SET experimental_partial_indexes=on;
 CREATE TABLE partial (a INT, b INT, c INT, INDEX (a) WHERE b > 0 OR c > 0);
 INSERT INTO partial VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
 CREATE STATISTICS s FROM partial
@@ -789,3 +806,143 @@ s                {a}           3          0           true
 s                {b}           3          0           true
 s                {c}           3          0           true
 s                {rowid}       3          0           true
+
+let $hist_id_1
+SELECT histogram_id FROM [SHOW STATISTICS FOR TABLE partial]
+WHERE statistics_name = 's' AND column_names = '{a}'
+
+query TIRI colnames
+SHOW HISTOGRAM $hist_id_1
+----
+upper_bound  range_rows  distinct_range_rows  equal_rows
+1            0           0                    1
+2            0           0                    1
+3            0           0                    1
+
+# Test that non-index columns have histograms collected for them, with
+# up to 2 buckets.
+statement ok
+CREATE TABLE noind (a INT, b INT, c INT);
+INSERT INTO noind VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
+CREATE STATISTICS s FROM noind
+
+query TTIIB colnames,rowsort
+SELECT
+  statistics_name,
+  column_names,
+  row_count,
+  null_count,
+  histogram_id IS NOT NULL AS has_histogram
+FROM
+  [SHOW STATISTICS FOR TABLE noind]
+ORDER BY
+  column_names::STRING, created
+----
+statistics_name  column_names  row_count  null_count  has_histogram
+s                {a}           3          0           true
+s                {b}           3          0           true
+s                {c}           3          0           true
+s                {rowid}       3          0           true
+
+let $hist_id_1
+SELECT histogram_id FROM [SHOW STATISTICS FOR TABLE noind]
+WHERE statistics_name = 's' AND column_names = '{a}'
+
+query TIRI colnames
+SHOW HISTOGRAM $hist_id_1
+----
+upper_bound  range_rows  distinct_range_rows  equal_rows
+1            0           0                    1
+3            1           1                    1
+
+# Verify that having 0, 1, or 2 inverted indexes on geo types works.
+statement ok
+CREATE TABLE geo_table (
+   id INT8 PRIMARY KEY,
+   geog GEOGRAPHY(GEOMETRY,4326) NULL,
+   geom GEOMETRY(GEOMETRY,3857) NULL
+);
+INSERT INTO geo_table VALUES (1, 'LINESTRING(0 0, 100 100)', ST_GeomFromText('LINESTRING(0 0, 100 100)', 3857));
+CREATE STATISTICS s FROM geo_table;
+
+query TB colnames
+SELECT
+  column_names,
+  histogram_id IS NOT NULL AS has_histogram
+FROM
+  [SHOW STATISTICS FOR TABLE geo_table]
+ORDER BY
+  column_names::STRING, created
+----
+column_names  has_histogram
+{geog}        false
+{geom}        false
+{id}          true
+
+statement ok
+CREATE INDEX geom_idx_1 ON geo_table USING GIST(geom) WITH (geometry_min_x=0, s2_max_level=15);
+CREATE INDEX geog_idx_1 ON geo_table USING GIST(geog) WITH (s2_level_mod=3);
+CREATE STATISTICS s FROM geo_table;
+
+query TB colnames
+SELECT
+  column_names,
+  histogram_id IS NOT NULL AS has_histogram
+FROM
+  [SHOW STATISTICS FOR TABLE geo_table]
+ORDER BY
+  column_names::STRING, created
+----
+column_names  has_histogram
+{geog}        true
+{geom}        true
+{id}          true
+
+statement ok
+CREATE INDEX geom_idx_2 ON geo_table USING GIST(geom) WITH (geometry_min_x=5);
+CREATE INDEX geog_idx_2 ON geo_table USING GIST(geog);
+CREATE STATISTICS s FROM geo_table;
+
+query TB colnames
+SELECT
+  column_names,
+  histogram_id IS NOT NULL AS has_histogram
+FROM
+  [SHOW STATISTICS FOR TABLE geo_table]
+ORDER BY
+  column_names::STRING, created
+----
+column_names  has_histogram
+{geog}        true
+{geom}        true
+{id}          true
+
+# Demonstrate that buckets change when the first chosen index is dropped.
+let $hist_id_1
+SELECT histogram_id FROM [SHOW STATISTICS FOR TABLE geo_table]
+WHERE statistics_name = 's' AND column_names = '{geog}'
+
+query TIRI colnames
+SHOW HISTOGRAM $hist_id_1
+----
+upper_bound                                                                                 range_rows  distinct_range_rows  equal_rows
+'\x42fd1000000000000000000000000000000000bcc00000000000003ffbecde5da115a83ff661bdc396bcdc'  0           0                    1
+'\x42fd5000000000000000000000000000000000bcc00000000000003ffbecde5da115a83ff661bdc396bcdc'  0           0                    1
+
+statement ok
+DROP INDEX geo_table@geog_idx_1;
+CREATE STATISTICS s FROM geo_table;
+
+# Demonstrate that buckets change when the first chosen index is dropped.
+let $hist_id_1
+SELECT histogram_id FROM [SHOW STATISTICS FOR TABLE geo_table]
+WHERE statistics_name = 's' AND column_names = '{geog}'
+
+query TIRI colnames
+SHOW HISTOGRAM $hist_id_1
+----
+upper_bound                                                                                 range_rows  distinct_range_rows  equal_rows
+'\x42fd1000000000000000000000000000000000bcc00000000000003ffbecde5da115a83ff661bdc396bcdc'  0           0                    1
+'\x42fd4500000000000000000000000000000000bcc00000000000003ffbecde5da115a83ff661bdc396bcdc'  0           0                    1
+'\x42fd4700000000000000000000000000000000bcc00000000000003ffbecde5da115a83ff661bdc396bcdc'  0           0                    1
+'\x42fd5ad4000000000000000000000000000000bcc00000000000003ffbecde5da115a83ff661bdc396bcdc'  0           0                    1

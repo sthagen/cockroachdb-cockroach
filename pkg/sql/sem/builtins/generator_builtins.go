@@ -201,6 +201,8 @@ var generators = map[string]builtinDefinition{
 				FixedTypes: []*types.T{types.AnyArray, types.AnyArray},
 				VarType:    types.AnyArray,
 			},
+			// TODO(rafiss): update this or docgen so that functions.md shows the
+			// return type as variadic.
 			func(args []tree.TypedExpr) *types.T {
 				returnTypes := make([]*types.T, len(args))
 				labels := make([]string, len(args))
@@ -1129,7 +1131,8 @@ func makeCheckConsistencyGenerator(
 	ctx *tree.EvalContext, args tree.Datums,
 ) (tree.ValueGenerator, error) {
 	if !ctx.Codec.ForSystemTenant() {
-		return nil, errorutil.UnsupportedWithMultiTenancy()
+		return nil, errorutil.UnsupportedWithMultiTenancy(
+			errorutil.FeatureNotAvailableToNonSystemTenantsIssue)
 	}
 
 	keyFrom := roachpb.Key(*args[1].(*tree.DBytes))

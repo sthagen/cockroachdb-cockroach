@@ -14,13 +14,18 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/sequence"
@@ -28,16 +33,14 @@ import (
 )
 
 type renameDatabaseNode struct {
-	dbDesc  *sqlbase.ImmutableDatabaseDescriptor
+	n       *tree.RenameDatabase
+	dbDesc  *dbdesc.Mutable
 	newName string
 }
 
 // RenameDatabase renames the database.
-// Privileges: Ownership or superuser + DROP on source database.
-//   Notes: postgres requires superuser, db owner, or "CREATEDB".
-//          Postgres requires non-superuser owners to have
-//          CREATEDB privilege to rename a DB.
-//          mysql >= 5.1.23 does not allow database renames.
+// Privileges: superuser + DROP or ownership + CREATEDB privileges
+//   Notes: mysql >= 5.1.23 does not allow database renames.
 func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (planNode, error) {
 	if n.Name == "" || n.NewName == "" {
 		return nil, errEmptyDatabaseName
@@ -47,25 +50,39 @@ func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (p
 		return nil, pgerror.DangerousStatementf("RENAME DATABASE on current database")
 	}
 
-	dbDesc, err := p.ResolveUncachedDatabaseByName(ctx, string(n.Name), true /*required*/)
+	dbDesc, err := p.ResolveMutableDatabaseDescriptor(ctx, string(n.Name), true /*required*/)
 	if err != nil {
 		return nil, err
 	}
 
-	hasOwnership, err := p.HasOwnership(ctx, dbDesc)
+	hasAdmin, err := p.HasAdminRole(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// If the user is not the db owner, they must have admin privilege and have
-	//  drop privilege on the db.
-	if !hasOwnership {
-		if err := p.RequireAdminRole(ctx, "ALTER DATABASE ... RENAME"); err != nil {
-			return nil, err
-		}
-
+	if hasAdmin {
+		// The user must have DROP privileges on the database. This prevents a
+		// superuser from renaming, e.g., the system database.
 		if err := p.CheckPrivilege(ctx, dbDesc, privilege.DROP); err != nil {
 			return nil, err
+		}
+	} else {
+		// Non-superusers must be the owner and have the CREATEDB privilege.
+		hasOwnership, err := p.HasOwnership(ctx, dbDesc)
+		if err != nil {
+			return nil, err
+		}
+		if !hasOwnership {
+			return nil, pgerror.Newf(
+				pgcode.InsufficientPrivilege, "must be owner of database %s", n.Name)
+		}
+		hasCreateDB, err := p.HasRoleOption(ctx, roleoption.CREATEDB)
+		if err != nil {
+			return nil, err
+		}
+		if !hasCreateDB {
+			return nil, pgerror.New(
+				pgcode.InsufficientPrivilege, "permission denied to rename database")
 		}
 	}
 
@@ -75,6 +92,7 @@ func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (p
 	}
 
 	return &renameDatabaseNode{
+		n:       n,
 		dbDesc:  dbDesc,
 		newName: string(n.NewName),
 	}, nil
@@ -140,8 +158,9 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 			if objDesc == nil {
 				continue
 			}
-			tbDesc := objDesc.(sqlbase.TableDescriptor)
-			for _, dependedOn := range tbDesc.GetDependedOnBy() {
+			tbDesc := objDesc.(catalog.TableDescriptor)
+
+			if err := tbDesc.ForeachDependedOnBy(func(dependedOn *descpb.TableDescriptor_Reference) error {
 				dependentDesc, err := catalogkv.MustGetTableDescByID(ctx, p.txn, p.ExecCfg().Codec, dependedOn.ID)
 				if err != nil {
 					return err
@@ -158,7 +177,7 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 					return err
 				}
 				if isAllowed {
-					continue
+					return nil
 				}
 
 				tbTableName := tree.MakeTableNameWithSchema(
@@ -177,7 +196,7 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 							dependentDesc.ID,
 							err,
 						)
-						return sqlbase.NewDependentObjectErrorf(
+						return sqlerrors.NewDependentObjectErrorf(
 							"cannot rename database because a relation depends on relation %q",
 							tbTableName.String())
 					}
@@ -190,7 +209,7 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 					)
 					dependentDescQualifiedString = dependentDescTableName.String()
 				}
-				depErr := sqlbase.NewDependentObjectErrorf(
+				depErr := sqlerrors.NewDependentObjectErrorf(
 					"cannot rename database because relation %q depends on relation %q",
 					dependentDescQualifiedString,
 					tbTableName.String(),
@@ -216,11 +235,31 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 				// Otherwise, we default to the view error message.
 				return errors.WithHintf(depErr,
 					"you can drop %q instead", dependentDescQualifiedString)
+			}); err != nil {
+				return err
 			}
 		}
 	}
 
-	return p.renameDatabase(ctx, dbDesc, n.newName)
+	if err := p.renameDatabase(ctx, dbDesc, n.newName, tree.AsStringWithFQNames(n.n, params.Ann())); err != nil {
+		return err
+	}
+
+	// Log Rename Database event. This is an auditable log event and is recorded
+	// in the same transaction as the table descriptor update.
+	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
+		ctx,
+		p.txn,
+		EventLogRenameDatabase,
+		int32(n.dbDesc.GetID()),
+		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
+		struct {
+			DatabaseName    string
+			Statement       string
+			User            string
+			NewDatabaseName string
+		}{n.n.Name.String(), n.n.String(), p.SessionData().User, n.newName},
+	)
 }
 
 // isAllowedDependentDescInRename determines when rename database is allowed with
@@ -230,9 +269,9 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 // This is a workaround for #45411 until #34416 is resolved.
 func isAllowedDependentDescInRenameDatabase(
 	ctx context.Context,
-	dependedOn descpb.TableDescriptor_Reference,
-	tbDesc sqlbase.TableDescriptor,
-	dependentDesc *sqlbase.ImmutableTableDescriptor,
+	dependedOn *descpb.TableDescriptor_Reference,
+	tbDesc catalog.TableDescriptor,
+	dependentDesc *tabledesc.Immutable,
 	dbName string,
 ) (bool, string, error) {
 	// If it is a sequence, and it does not contain the database name, then we have

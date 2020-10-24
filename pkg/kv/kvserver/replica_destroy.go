@@ -16,6 +16,7 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -79,7 +80,17 @@ func (r *Replica) preDestroyRaftMuLocked(
 	clearRangeIDLocalOnly bool,
 	mustUseClearRange bool,
 ) error {
-	desc := r.Desc()
+	r.mu.RLock()
+	desc := r.descRLocked()
+	removed := r.mu.destroyStatus.Removed()
+	r.mu.RUnlock()
+
+	// The replica must be marked as destroyed before its data is removed. If
+	// not, we risk new commands being accepted and observing the missing data.
+	if !removed {
+		log.Fatalf(ctx, "replica not marked as destroyed before call to preDestroyRaftMuLocked: %v", r)
+	}
+
 	err := clearRangeData(desc, reader, writer, clearRangeIDLocalOnly, mustUseClearRange)
 	if err != nil {
 		return err
@@ -126,6 +137,12 @@ func (r *Replica) postDestroyRaftMuLocked(ctx context.Context, ms enginepb.MVCCS
 	// valid if the replica is initialized.
 	if tenantID, ok := r.TenantID(); ok {
 		r.store.metrics.releaseTenant(ctx, tenantID)
+	}
+
+	// Unhook the tenant rate limiter if we have one.
+	if r.tenantLimiter != nil {
+		r.store.tenantRateLimiters.Release(r.tenantLimiter)
+		r.tenantLimiter = nil
 	}
 
 	return nil
@@ -203,7 +220,9 @@ func (r *Replica) disconnectReplicationRaftMuLocked(ctx context.Context) {
 		// NB: each proposal needs its own version of the error (i.e. don't try to
 		// share the error across proposals).
 		p.finishApplication(ctx, proposalResult{
-			Err: roachpb.NewError(roachpb.NewAmbiguousResultError("removing replica")),
+			Err: roachpb.NewError(
+				roachpb.NewAmbiguousResultError(
+					apply.ErrRemoved.Error())),
 		})
 	}
 	r.mu.internalRaftGroup = nil

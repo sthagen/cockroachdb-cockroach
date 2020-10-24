@@ -383,7 +383,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			var b strings.Builder
 			for i := 0; i < idx.KeyColumnCount(); i++ {
 				b.WriteRune('/')
-				b.WriteString(fmt.Sprintf("%d", t.Table.ColumnID(idx.Column(i).Ordinal)))
+				b.WriteString(fmt.Sprintf("%d", t.Table.ColumnID(idx.Column(i).Ordinal())))
 			}
 			n := tp.Childf("inverted constraint: %s", b.String())
 			ic.Format(n, "spans")
@@ -441,17 +441,21 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		b.WriteString(fmt.Sprintf("%d", t.InvertedColumn))
 		n := tp.Childf("inverted expression: %s", b.String())
 		t.InvertedExpression.Format(n, false /* includeSpansToRead */)
+		if t.PreFiltererState != nil {
+			n := tp.Childf("pre-filterer expression")
+			f.formatExpr(t.PreFiltererState.Expr, n)
+		}
 
 	case *LookupJoinExpr:
 		if !t.Flags.Empty() {
 			tp.Childf("flags: %s", t.Flags.String())
 		}
-		idxCols := make(opt.ColList, len(t.KeyCols))
-		idx := md.Table(t.Table).Index(t.Index)
-		for i := range idxCols {
-			idxCols[i] = t.Table.ColumnID(idx.Column(i).Ordinal)
-		}
 		if !f.HasFlags(ExprFmtHideColumns) {
+			idxCols := make(opt.ColList, len(t.KeyCols))
+			idx := md.Table(t.Table).Index(t.Index)
+			for i := range idxCols {
+				idxCols[i] = t.Table.ColumnID(idx.Column(i).Ordinal())
+			}
 			tp.Childf("key columns: %v = %v", t.KeyCols, idxCols)
 		}
 		if t.LookupColsAreTableKey {
@@ -496,6 +500,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			if len(colList) == 0 {
 				tp.Child("columns: <none>")
 			}
+			f.formatArbiters(tp, t.Arbiters, t.Table)
 			f.formatMutationCols(e, tp, "insert-mapping:", t.InsertCols, t.Table)
 			f.formatColList(e, tp, "check columns:", t.CheckCols)
 			f.formatColList(e, tp, "partial index put columns:", t.PartialIndexPutCols)
@@ -521,7 +526,8 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 				tp.Child("columns: <none>")
 			}
 			if t.CanaryCol != 0 {
-				tp.Childf("canary column: %d", t.CanaryCol)
+				f.formatArbiters(tp, t.Arbiters, t.Table)
+				f.formatColList(e, tp, "canary column:", opt.ColList{t.CanaryCol})
 				f.formatColList(e, tp, "fetch columns:", t.FetchCols)
 				f.formatMutationCols(e, tp, "insert-mapping:", t.InsertCols, t.Table)
 				f.formatMutationCols(e, tp, "update-mapping:", t.UpdateCols, t.Table)
@@ -788,7 +794,8 @@ func (f *ExprFmtCtx) formatScalarWithLabel(
 	case opt.FiltersOp:
 		// Show empty Filters expression as "filters (true)".
 		if scalar.ChildCount() == 0 {
-			tp.Child("filters (true)")
+			f.Buffer.WriteString("filters (true)")
+			tp.Child(f.Buffer.String())
 			return
 		}
 
@@ -1034,6 +1041,26 @@ func (f *ExprFmtCtx) formatScalarPrivate(scalar opt.ScalarExpr) {
 	}
 }
 
+// formatArbiters constructs a new treeprinter child containing the
+// specified list of arbiter indexes.
+func (f *ExprFmtCtx) formatArbiters(
+	tp treeprinter.Node, arbiters cat.IndexOrdinals, tabID opt.TableID,
+) {
+	md := f.Memo.Metadata()
+	tab := md.Table(tabID)
+
+	if len(arbiters) > 0 {
+		f.Buffer.Reset()
+		f.Buffer.WriteString("arbiter indexes:")
+		for _, idx := range arbiters {
+			name := string(tab.Index(idx).Name())
+			f.space()
+			f.Buffer.WriteString(name)
+		}
+		tp.Child(f.Buffer.String())
+	}
+}
+
 func (f *ExprFmtCtx) formatColumns(
 	nd RelExpr, tp treeprinter.Node, cols opt.ColList, presentation physical.Presentation,
 ) {
@@ -1255,17 +1282,29 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 		tab := f.Memo.metadata.Table(t.Table)
 		fmt.Fprintf(f.Buffer, " %s", tab.Name())
 
+	case *InvertedFilterPrivate:
+		col := f.Memo.metadata.ColumnMeta(t.InvertedColumn)
+		fmt.Fprintf(f.Buffer, " %s", col.Alias)
+
 	case *LookupJoinPrivate:
 		tab := f.Memo.metadata.Table(t.Table)
 		if t.Index == cat.PrimaryIndex {
 			fmt.Fprintf(f.Buffer, " %s", tab.Name())
 		} else {
-			fmt.Fprintf(f.Buffer, " %s@%s", tab.Name(), tab.Index(t.Index).Name())
+			partialStr := ""
+			if _, isPartial := tab.Index(t.Index).Predicate(); isPartial {
+				partialStr = ",partial"
+			}
+			fmt.Fprintf(f.Buffer, " %s@%s%s", tab.Name(), tab.Index(t.Index).Name(), partialStr)
 		}
 
 	case *InvertedJoinPrivate:
 		tab := f.Memo.metadata.Table(t.Table)
-		fmt.Fprintf(f.Buffer, " %s@%s", tab.Name(), tab.Index(t.Index).Name())
+		partialStr := ""
+		if _, isPartial := tab.Index(t.Index).Predicate(); isPartial {
+			partialStr = ",partial"
+		}
+		fmt.Fprintf(f.Buffer, " %s@%s%s", tab.Name(), tab.Index(t.Index).Name(), partialStr)
 
 	case *ValuesPrivate:
 		fmt.Fprintf(f.Buffer, " id=v%d", t.ID)

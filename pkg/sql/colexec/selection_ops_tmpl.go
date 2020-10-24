@@ -24,10 +24,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 // {{/*
@@ -48,7 +51,7 @@ const _RIGHT_TYPE_WIDTH = 0
 // _ASSIGN_CMP is the template function for assigning the result of comparing
 // the second input to the third input into the first input.
 func _ASSIGN_CMP(_, _, _, _, _, _ interface{}) int {
-	colexecerror.InternalError("")
+	colexecerror.InternalError(errors.AssertionFailedf(""))
 }
 
 // */}}
@@ -151,7 +154,7 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 type selConstOpBase struct {
 	OneInputNode
 	colIdx         int
-	overloadHelper overloadHelper
+	overloadHelper execgen.OverloadHelper
 }
 
 // selOpBase contains all of the fields for non-constant binary selections.
@@ -159,7 +162,7 @@ type selOpBase struct {
 	OneInputNode
 	col1Idx        int
 	col2Idx        int
-	overloadHelper overloadHelper
+	overloadHelper execgen.OverloadHelper
 }
 
 // {{define "selConstOp"}}
@@ -170,7 +173,7 @@ type _OP_CONST_NAME struct {
 
 func (p *_OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
 	// In order to inline the templated code of overloads, we need to have a
-	// `_overloadHelper` local variable of type `overloadHelper`.
+	// `_overloadHelper` local variable of type `execgen.OverloadHelper`.
 	_overloadHelper := p.overloadHelper
 	// However, the scratch is not used in all of the selection operators, so
 	// we add this to go around "unused" error.
@@ -212,7 +215,7 @@ type _OP_NAME struct {
 
 func (p *_OP_NAME) Next(ctx context.Context) coldata.Batch {
 	// In order to inline the templated code of overloads, we need to have a
-	// `_overloadHelper` local variable of type `overloadHelper`.
+	// `_overloadHelper` local variable of type `execgen.OverloadHelper`.
 	_overloadHelper := p.overloadHelper
 	// However, the scratch is not used in all of the selection operators, so
 	// we add this to go around "unused" error.
@@ -277,7 +280,7 @@ func GetSelectionConstOperator(
 	cmpExpr *tree.ComparisonExpr,
 ) (colexecbase.Operator, error) {
 	leftType, constType := inputTypes[colIdx], constArg.ResolvedType()
-	c := GetDatumToPhysicalFn(constType)(constArg)
+	c := colconv.GetDatumToPhysicalFn(constType)(constArg)
 	selConstOpBase := selConstOpBase{
 		OneInputNode: NewOneInputNode(input),
 		colIdx:       colIdx,
@@ -317,7 +320,7 @@ func GetSelectionConstOperator(
 		selConstOpBase:   selConstOpBase,
 		adapter:          newComparisonExprAdapter(cmpExpr, evalCtx),
 		constArg:         constArg,
-		toDatumConverter: newVecToDatumConverter(len(inputTypes), []int{colIdx}),
+		toDatumConverter: colconv.NewVecToDatumConverter(len(inputTypes), []int{colIdx}),
 	}, nil
 }
 
@@ -372,6 +375,6 @@ func GetSelectionOperator(
 	return &defaultCmpSelOp{
 		selOpBase:        selOpBase,
 		adapter:          newComparisonExprAdapter(cmpExpr, evalCtx),
-		toDatumConverter: newVecToDatumConverter(len(inputTypes), []int{col1Idx, col2Idx}),
+		toDatumConverter: colconv.NewVecToDatumConverter(len(inputTypes), []int{col1Idx, col2Idx}),
 	}, nil
 }

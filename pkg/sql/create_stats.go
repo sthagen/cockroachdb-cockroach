@@ -20,7 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -28,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -61,6 +62,9 @@ func (p *planner) Analyze(ctx context.Context, n *tree.Analyze) (planNode, error
 		p:           p,
 	}, nil
 }
+
+const defaultHistogramBuckets = 200
+const nonIndexColHistogramBuckets = 2
 
 // createStatsNode is a planNode implemented in terms of a function. The
 // startJob function starts a Job during Start, and the remainder of the
@@ -151,7 +155,7 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 // makeJobRecord creates a CreateStats job record which can be used to plan and
 // execute statistics creation.
 func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, error) {
-	var tableDesc *ImmutableTableDescriptor
+	var tableDesc *tabledesc.Immutable
 	var fqTableName string
 	var err error
 	switch t := n.Table.(type) {
@@ -214,19 +218,21 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		if err != nil {
 			return nil, err
 		}
-		isInvIndex := sqlbase.ColumnTypeIsInvertedIndexable(col.Type)
+		isInvIndex := colinfo.ColumnTypeIsInvertedIndexable(col.Type)
 		colStats = []jobspb.CreateStatsDetails_ColStat{{
 			ColumnIDs: columnIDs,
 			// By default, create histograms on all explicitly requested column stats
 			// with a single column that doesn't use an inverted index.
-			HasHistogram: len(columnIDs) == 1 && !isInvIndex,
+			HasHistogram:        len(columnIDs) == 1 && !isInvIndex,
+			HistogramMaxBuckets: defaultHistogramBuckets,
 		}}
 		// Make histograms for inverted index column types.
 		if len(columnIDs) == 1 && isInvIndex {
 			colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
-				ColumnIDs:    columnIDs,
-				HasHistogram: true,
-				Inverted:     true,
+				ColumnIDs:           columnIDs,
+				HasHistogram:        true,
+				Inverted:            true,
+				HistogramMaxBuckets: defaultHistogramBuckets,
 			})
 		}
 	}
@@ -292,7 +298,7 @@ const maxNonIndexCols = 100
 // other columns from the table. We only collect histograms for index columns,
 // plus any other boolean or enum columns (where the "histogram" is tiny).
 func createStatsDefaultColumns(
-	desc *ImmutableTableDescriptor, multiColEnabled bool,
+	desc *tabledesc.Immutable, multiColEnabled bool,
 ) ([]jobspb.CreateStatsDetails_ColStat, error) {
 	colStats := make([]jobspb.CreateStatsDetails_ColStat, 0, len(desc.Indexes)+1)
 
@@ -322,8 +328,9 @@ func createStatsDefaultColumns(
 		}
 
 		colStat := jobspb.CreateStatsDetails_ColStat{
-			ColumnIDs:    colList,
-			HasHistogram: !isInverted,
+			ColumnIDs:           colList,
+			HasHistogram:        !isInverted,
+			HistogramMaxBuckets: defaultHistogramBuckets,
 		}
 		colStats = append(colStats, colStat)
 
@@ -418,9 +425,18 @@ func createStatsDefaultColumns(
 			continue
 		}
 
+		// Non-index columns have very small histograms since it's not worth the
+		// overhead of storing large histograms for these columns. Since bool and
+		// enum types only have a few values anyway, include all possible values
+		// for those types, up to defaultHistogramBuckets.
+		maxHistBuckets := uint32(nonIndexColHistogramBuckets)
+		if col.Type.Family() == types.BoolFamily || col.Type.Family() == types.EnumFamily {
+			maxHistBuckets = defaultHistogramBuckets
+		}
 		colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
-			ColumnIDs:    colList,
-			HasHistogram: col.Type.Family() == types.BoolFamily || col.Type.Family() == types.EnumFamily,
+			ColumnIDs:           colList,
+			HasHistogram:        !colinfo.ColumnTypeIsInvertedIndexable(col.Type),
+			HistogramMaxBuckets: maxHistBuckets,
 		})
 		nonIdxCols++
 	}
@@ -478,8 +494,8 @@ func (r *createStatsResumer) Resume(
 	r.tableID = details.Table.ID
 	evalCtx := p.ExtendedEvalContext()
 
-	ci := sqlbase.ColTypeInfoFromColTypes([]*types.T{})
-	rows := rowcontainer.NewRowContainer(evalCtx.Mon.MakeBoundAccount(), ci, 0)
+	ci := colinfo.ColTypeInfoFromColTypes([]*types.T{})
+	rows := rowcontainer.NewRowContainer(evalCtx.Mon.MakeBoundAccount(), ci)
 	defer func() {
 		if rows != nil {
 			rows.Close(ctx)

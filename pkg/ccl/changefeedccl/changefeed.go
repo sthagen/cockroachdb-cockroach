@@ -21,9 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -54,13 +55,17 @@ type emitEntry struct {
 // returns a closure that may be repeatedly called to advance the changefeed.
 // The returned closure is not threadsafe.
 func kvsToRows(
+	ctx context.Context,
 	codec keys.SQLCodec,
+	settings *cluster.Settings,
+	db *kv.DB,
 	leaseMgr *lease.Manager,
+	hydratedTables *hydratedtables.Cache,
 	details jobspb.ChangefeedDetails,
 	inputFn func(context.Context) (kvfeed.Event, error),
 ) func(context.Context) ([]emitEntry, error) {
 	_, withDiff := details.Opts[changefeedbase.OptDiff]
-	rfCache := newRowFetcherCache(codec, leaseMgr)
+	rfCache := newRowFetcherCache(ctx, codec, settings, leaseMgr, hydratedTables, db)
 
 	var kvs row.SpanKVFetcher
 	appendEmitEntryForKV := func(
@@ -109,7 +114,7 @@ func kvsToRows(
 			if r.row.datums == nil {
 				return nil, errors.AssertionFailedf("unexpected empty datums")
 			}
-			r.row.datums = append(sqlbase.EncDatumRow(nil), r.row.datums...)
+			r.row.datums = append(rowenc.EncDatumRow(nil), r.row.datums...)
 			r.row.deleted = rf.RowIsDeleted()
 			r.row.updated = schemaTimestamp
 
@@ -158,7 +163,7 @@ func kvsToRows(
 			if r.row.prevDatums == nil {
 				return nil, errors.AssertionFailedf("unexpected empty datums")
 			}
-			r.row.prevDatums = append(sqlbase.EncDatumRow(nil), r.row.prevDatums...)
+			r.row.prevDatums = append(rowenc.EncDatumRow(nil), r.row.prevDatums...)
 			r.row.prevDeleted = prevRF.RowIsDeleted()
 
 			// Assert that we don't get a second row from the row.Fetcher. We
@@ -267,7 +272,7 @@ func emitEntries(
 			}
 		}
 		if err := sink.EmitRow(
-			ctx, row.tableDesc.TableDesc(), keyCopy, valueCopy, row.updated,
+			ctx, row.tableDesc, keyCopy, valueCopy, row.updated,
 		); err != nil {
 			return err
 		}

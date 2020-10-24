@@ -16,9 +16,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
@@ -73,27 +73,7 @@ func GetAggregateInfo(
 			constructAgg := func(evalCtx *tree.EvalContext, arguments tree.Datums) tree.AggregateFunc {
 				return b.AggregateFunc(inputTypes, evalCtx, arguments)
 			}
-
-			colTyp := b.FixedReturnType()
-			// If the output type of the aggregation depends on its inputs, then
-			// the output of FixedReturnType will be ambiguous. In the ambiguous
-			// cases, use the information about the input types to construct the
-			// appropriate output type. The tree.ReturnTyper interface is
-			// []tree.TypedExpr -> *types.T, so construct the []tree.TypedExpr
-			// from the types that we know are the inputs. Note that we don't
-			// try to create datums of each input type, and instead use this
-			// "TypedDummy" construct. This is because some types don't have resident
-			// members (like an ENUM with no values), and we shouldn't error out
-			// trying to pick an aggregate spec for those cases.
-			if colTyp.IsAmbiguous() {
-				args := make([]tree.TypedExpr, len(inputTypes))
-				for i, t := range inputTypes {
-					args[i] = &tree.TypedDummy{Typ: t}
-				}
-				// Evaluate ReturnType with the fake input set of arguments.
-				colTyp = b.ReturnType(args)
-			}
-
+			colTyp := b.InferReturnTypeFromInputArgTypes(inputTypes)
 			return constructAgg, colTyp, nil
 		}
 	}
@@ -244,7 +224,8 @@ func GetWindowFunctionInfo(
 			constructAgg := func(evalCtx *tree.EvalContext) tree.WindowFunc {
 				return b.WindowFunc(inputTypes, evalCtx)
 			}
-			return constructAgg, b.FixedReturnType(), nil
+			colTyp := b.InferReturnTypeFromInputArgTypes(inputTypes)
+			return constructAgg, colTyp, nil
 		}
 	}
 	return nil, nil, errors.Errorf(
@@ -335,8 +316,8 @@ func (spec *WindowerSpec_Frame_Bounds) initFromAST(
 			typ := dStartOffset.ResolvedType()
 			spec.Start.OffsetType = DatumInfo{Encoding: descpb.DatumEncoding_VALUE, Type: typ}
 			var buf []byte
-			var a sqlbase.DatumAlloc
-			datum := sqlbase.DatumToEncDatum(typ, dStartOffset)
+			var a rowenc.DatumAlloc
+			datum := rowenc.DatumToEncDatum(typ, dStartOffset)
 			buf, err = datum.Encode(typ, &a, descpb.DatumEncoding_VALUE, buf)
 			if err != nil {
 				return err
@@ -379,8 +360,8 @@ func (spec *WindowerSpec_Frame_Bounds) initFromAST(
 				typ := dEndOffset.ResolvedType()
 				spec.End.OffsetType = DatumInfo{Encoding: descpb.DatumEncoding_VALUE, Type: typ}
 				var buf []byte
-				var a sqlbase.DatumAlloc
-				datum := sqlbase.DatumToEncDatum(typ, dEndOffset)
+				var a rowenc.DatumAlloc
+				datum := rowenc.DatumToEncDatum(typ, dEndOffset)
 				buf, err = datum.Encode(typ, &a, descpb.DatumEncoding_VALUE, buf)
 				if err != nil {
 					return err

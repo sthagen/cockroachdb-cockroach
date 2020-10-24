@@ -476,6 +476,35 @@ message TxnInfo {
   // txn_description is a text description of the underlying kv.Txn, intended
   // for troubleshooting purposes.
   string txn_description = 3;
+
+  // num_statements_executed is the number of statements that were executed so
+  // far on this transaction.
+  int32 num_statements_executed = 4;
+
+  // num_retries is the number of times that this transaction was retried.
+  int32 num_retries = 5;
+
+  // num_retries is the number of times that this transaction was automatically
+  // retried by the SQL executor.
+  int32 num_auto_retries = 6;
+
+  // The deadline by which the transaction must be committed.
+  google.protobuf.Timestamp deadline = 7
+  [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
+
+  // implicit is true if this transaction was an implicit SQL transaction.
+  bool implicit = 8;
+
+  // Number of currently allocated bytes in the txn memory monitor.
+  int64 alloc_bytes = 9;
+  // High water mark of allocated bytes in the txn memory monitor.
+  int64 max_alloc_bytes = 10;
+
+  bool read_only = 11;
+
+  bool is_historical = 12;
+
+  string priority = 13;
 }
 
 // ActiveQuery represents a query in flight on some Session.
@@ -506,6 +535,9 @@ message ActiveQuery {
   Phase phase = 5;
 
   float progress = 6;
+
+  // The SQL statement fingerprint, compatible with StatementStatisticsKey.
+  string sql_anon = 8;
 }
 
 // Request object for ListSessions and ListLocalSessions.
@@ -533,16 +565,8 @@ message Session {
   // Timestamp of session's start.
   google.protobuf.Timestamp start = 6
       [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
-  // ID of the current KV transaction for this session. Nil if the session
-  // doesn't currently have a transaction.
-  bytes kv_txn_id = 7 [
-    (gogoproto.customname) = "KvTxnID",
-    (gogoproto.customtype) =
-        "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
-  ];
-  // Information about the txn in progress on this session. Nil if the
-  // session doesn't currently have a transaction.
-  TxnInfo active_txn = 12;
+  // This used to be active_txn_id until it was moved inside of active_txn.
+  reserved 7;
   // SQL string of the last query executed on this session.
   string last_active_query = 8;
   // ID of the session (uint128 represented as raw bytes).
@@ -551,6 +575,12 @@ message Session {
   int64 alloc_bytes = 10;
   // High water mark of allocated bytes in the session memory monitor.
   int64 max_alloc_bytes = 11;
+  // Information about the txn in progress on this session. Nil if the
+  // session doesn't currently have a transaction.
+  TxnInfo active_txn = 12;
+  // The SQL statement fingerprint of the last query executed on this session,
+  // compatible with StatementStatisticsKey.
+  string last_active_query_anon = 13;
 }
 
 // An error wrapper object for ListSessionsResponse.
@@ -585,7 +615,8 @@ message CancelQueryRequest {
   string node_id = 1;
   // ID of query to be canceled (converted to string).
   string query_id = 2 [ (gogoproto.customname) = "QueryID" ];
-  // Username of the user making this cancellation request.
+  // Username of the user making this cancellation request. This may be omitted
+  // if the user is the same as the one issuing the CancelQueryRequest.
   string username = 3;
 }
 
@@ -605,6 +636,8 @@ message CancelSessionRequest {
   // forwarding is necessary.
   string node_id = 1;
   bytes session_id = 2 [ (gogoproto.customname) = "SessionID" ];
+  // Username of the user making this cancellation request. This may be omitted
+  // if the user is the same as the one issuing the CancelSessionRequest.
   string username = 3;
 }
 
@@ -692,34 +725,80 @@ message ProblemRangesResponse {
   ];
 }
 
+// HotRangesRequest queries one or more cluster nodes for a list
+// of ranges currently considered “hot” by the node(s).
+//
+// The server responds with a HotRangesResponse payload.
 message HotRangesRequest {
-  // If left empty, hot ranges for all nodes/stores will be returned.
+  // NodeID indicates which node to query for a hot range report.
+  // It is posssible to populate any node ID; if the node receiving
+  // the request is not the target node, it will forward the
+  // request to the target node.
+  //
+  // If left empty, the request is forwarded to every node
+  // in the cluster.
   string node_id = 1 [(gogoproto.customname) = "NodeID"];
 }
 
+// HotRangesResponse is the payload produced in response
+// to a HotRangesRequest.
 message HotRangesResponse {
-  message HotRange {
-    cockroach.roachpb.RangeDescriptor desc = 1 [(gogoproto.nullable) = false];
-    double queries_per_second = 2;
-  }
-  message StoreResponse {
-    int32 store_id = 1 [
-      (gogoproto.customname) = "StoreID",
-      (gogoproto.casttype) =
-          "github.com/cockroachdb/cockroach/pkg/roachpb.StoreID"
-    ];
-    repeated HotRange hot_ranges = 2 [(gogoproto.nullable) = false];
-  }
-  message NodeResponse {
-    string error_message = 1;
-    repeated StoreResponse stores = 2;
-  }
-  // NodeID is the node that submitted all the requests.
+  // NodeID is the node that received the HotRangesRequest and
+  // forwarded requests to the selected target node(s).
   int32 node_id = 1 [
     (gogoproto.customname) = "NodeID",
     (gogoproto.casttype) =
         "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"
   ];
+
+  // HotRange is a hot range report for a single store on one of the
+  // target node(s) selected in a HotRangesRequest.
+  message HotRange {
+    // Desc is the descriptor of the range for which the report
+    // was produced.
+    //
+    // Note: this field is generally RESERVED and will likely be removed
+    // or replaced in a later version.
+    // See: https://github.com/cockroachdb/cockroach/issues/53212
+    cockroach.roachpb.RangeDescriptor desc = 1 [(gogoproto.nullable) = false];
+
+    // QueriesPerSecond is the recent number of queries per second
+    // on this range.
+    double queries_per_second = 2;
+  }
+
+  // StoreResponse contains the part of a hot ranges report that
+  // pertains to a single store on a target node.
+  message StoreResponse {
+    // StoreID identifies the store for which the report was
+    // produced.
+    int32 store_id = 1 [
+      (gogoproto.customname) = "StoreID",
+      (gogoproto.casttype) =
+          "github.com/cockroachdb/cockroach/pkg/roachpb.StoreID"
+    ];
+
+    // HotRanges is the hot ranges report for this store
+    // on the target node.
+    repeated HotRange hot_ranges = 2 [(gogoproto.nullable) = false];
+  }
+
+  // NodeResponse is a hot range report for a single target node.
+  message NodeResponse {
+    // ErrorMessage is set to a non-empty string if this target
+    // node was unable to produce a hot range report.
+    //
+    // The contents of this string indicates the cause of the failure.
+    string error_message = 1;
+
+    // Stores contains the hot ranges report if no error was encountered.
+    // There is one part to the report for each store in the
+    // target node.
+    repeated StoreResponse stores = 2;
+  }
+
+  // HotRangesByNodeID contains a hot range report for each selected
+  // target node ID in the HotRangesRequest.
   map<int32, NodeResponse> hot_ranges_by_node_id = 2 [
     (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID",
     (gogoproto.customname) = "HotRangesByNodeID",
@@ -806,11 +885,13 @@ message StatementsResponse {
   message ExtendedStatementStatisticsKey {
     cockroach.sql.StatementStatisticsKey key_data = 1 [(gogoproto.nullable) = false];
     int32 node_id = 2 [(gogoproto.customname) = "NodeID",
-                        (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+                       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
   }
 
   message CollectedStatementStatistics {
     ExtendedStatementStatisticsKey key = 1 [(gogoproto.nullable) = false];
+    uint64 id = 3 [(gogoproto.customname) = "ID",
+                   (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.StmtID"];
     cockroach.sql.StatementStatistics stats = 2 [(gogoproto.nullable) = false];
   }
 
@@ -820,6 +901,16 @@ message StatementsResponse {
   // If set and non-empty, indicates the prefix to application_name
   // used for statements/queries issued internally by CockroachDB.
   string internal_app_name_prefix = 4;
+
+  message ExtendedCollectedTransactionStatistics {
+    cockroach.sql.CollectedTransactionStatistics stats_data = 1 [(gogoproto.nullable) = false];
+    int32 node_id = 2 [(gogoproto.customname) = "NodeID",
+                       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+  }
+
+  // Transactions is transaction-level statistics for the collection of
+  // statements in this response.
+  repeated ExtendedCollectedTransactionStatistics transactions = 5 [(gogoproto.nullable) = false];
 }
 
 message StatementDiagnosticsReport {
@@ -952,12 +1043,14 @@ service Status {
   }
   rpc CancelQuery(CancelQueryRequest) returns (CancelQueryResponse) {
     option (google.api.http) = {
-      get : "/_status/cancel_query/{node_id}"
+      post : "/_status/cancel_query/{node_id}"
+			body: "*"
     };
   }
   rpc CancelSession(CancelSessionRequest) returns (CancelSessionResponse) {
     option (google.api.http) = {
-      get : "/_status/cancel_session/{node_id}"
+      post : "/_status/cancel_session/{node_id}"
+			body: "*"
     };
   }
 

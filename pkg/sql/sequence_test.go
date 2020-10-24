@@ -18,8 +18,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -27,7 +28,7 @@ import (
 )
 
 func BenchmarkSequenceIncrement(b *testing.B) {
-	cluster := serverutils.StartTestCluster(b, 3, base.TestClusterArgs{})
+	cluster := serverutils.StartNewTestCluster(b, 3, base.TestClusterArgs{})
 	defer cluster.Stopper().Stop(context.Background())
 
 	sqlDB := cluster.ServerConn(0)
@@ -54,7 +55,7 @@ func BenchmarkSequenceIncrement(b *testing.B) {
 }
 
 func BenchmarkUniqueRowID(b *testing.B) {
-	cluster := serverutils.StartTestCluster(b, 3, base.TestClusterArgs{})
+	cluster := serverutils.StartNewTestCluster(b, 3, base.TestClusterArgs{})
 	defer cluster.Stopper().Stop(context.Background())
 
 	sqlDB := cluster.ServerConn(0)
@@ -163,7 +164,7 @@ func assertColumnOwnsSequences(
 ) {
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, dbName, tbName)
 	col := tableDesc.GetColumns()[colIdx]
-	var seqDescs []*ImmutableTableDescriptor
+	var seqDescs []*tabledesc.Immutable
 	for _, seqName := range seqNames {
 		seqDescs = append(
 			seqDescs,
@@ -366,7 +367,7 @@ func addOwnedSequence(
 
 	err := kvDB.Put(
 		context.Background(),
-		sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.GetID()),
+		catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.GetID()),
 		tableDesc.DescriptorProto(),
 	)
 	require.NoError(t, err)
@@ -393,14 +394,14 @@ func breakOwnershipMapping(
 
 	err := kvDB.Put(
 		context.Background(),
-		sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.GetID()),
+		catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.GetID()),
 		tableDesc.DescriptorProto(),
 	)
 	require.NoError(t, err)
 
 	err = kvDB.Put(
 		context.Background(),
-		sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, seqDesc.GetID()),
+		catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, seqDesc.GetID()),
 		seqDesc.DescriptorProto(),
 	)
 	require.NoError(t, err)

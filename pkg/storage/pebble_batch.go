@@ -166,9 +166,7 @@ func (p *pebbleBatch) GetProto(
 }
 
 // Iterate implements the Batch interface.
-func (p *pebbleBatch) Iterate(
-	start, end roachpb.Key, f func(MVCCKeyValue) (stop bool, err error),
-) error {
+func (p *pebbleBatch) Iterate(start, end roachpb.Key, f func(MVCCKeyValue) error) error {
 	if p.distinctOpen {
 		panic("distinct batch open")
 	}
@@ -270,7 +268,6 @@ func (p *pebbleBatch) ClearIterRange(iter Iterator, start, end roachpb.Key) erro
 		panic("distinct batch open")
 	}
 
-	type unsafeRawKeyGetter interface{ unsafeRawKey() []byte }
 	// Note that this method has the side effect of modifying iter's bounds.
 	// Since all calls to `ClearIterRange` are on new throwaway iterators with no
 	// lower bounds, calling SetUpperBound should be sufficient and safe.
@@ -287,7 +284,7 @@ func (p *pebbleBatch) ClearIterRange(iter Iterator, start, end roachpb.Key) erro
 			break
 		}
 
-		err = p.batch.Delete(iter.(unsafeRawKeyGetter).unsafeRawKey(), nil)
+		err = p.batch.Delete(iter.UnsafeRawKey(), nil)
 		if err != nil {
 			return err
 		}

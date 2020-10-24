@@ -87,6 +87,37 @@
     (OutputCols $left)
 )
 
+# ConvertSemiToInnerJoin applies in the cases where CommuteSemiJoin does not:
+# when the ON condition is not a simple equality. In this case, we must perform
+# a DisinctOn operation *after* the inner join, followed by a project to remove
+# the right-side columns.
+#
+# Similar to CommuteSemiJoin, this rule allows semi joins to be commuted. This
+# rule is also useful because it allows us to generate lookup joins and
+# inverted lookup joins for cases where the index is not covering.
+[ConvertSemiToInnerJoin, Explore]
+(SemiJoin
+    $left:*
+    $right:*
+    $on:* & ^(IsSimpleEquality $on)
+    $private:* & (NoJoinHints $private)
+)
+=>
+(Project
+    (DistinctOn
+        (InnerJoin
+            $newLeft:(EnsureKey $left)
+            $right
+            $on
+            $private
+        )
+        (MakeAggCols ConstAgg (NonKeyCols $newLeft))
+        (MakeGrouping (KeyCols $newLeft) (EmptyOrdering))
+    )
+    []
+    (OutputCols $left)
+)
+
 # GenerateMergeJoins creates MergeJoin operators for the join, using the
 # interesting orderings property.
 [GenerateMergeJoins, Explore]
@@ -107,12 +138,17 @@
 =>
 (GenerateLookupJoins (OpName) $left $scanPrivate $on $private)
 
+# TODO(rytaft): The following uses paired-joins, in GenerateInvertedJoins.
+# Using paired-joins may be desirable in more cases than just spatial queries.
+# For example, it could enable the use of a lookup join with a non-covering index.
+
 # GenerateInvertedJoins creates InvertedJoin operators for all inverted
 # indexes (of the Scan table) which allow it. See the GenerateInvertedJoins
 # custom function for more details.
-# TODO(rytaft): Add support for LeftJoin.
+# TODO(rytaft): Add support for SemiJoin. Currently it is supported by first
+# converting it to InnerJoin using the rule ConvertSemiToInnerJoin.
 [GenerateInvertedJoins, Explore]
-(InnerJoin | SemiJoin | AntiJoin
+(InnerJoin | LeftJoin | AntiJoin
     $left:*
     (Scan $scanPrivate:*) &
         (IsCanonicalScan $scanPrivate) &
@@ -125,9 +161,8 @@
 
 # GenerateInvertedJoinsFromSelect is similar to GenerateInvertedJoins, but
 # applies when the input is a Select.
-# TODO(rytaft): Add support for LeftJoin.
 [GenerateInvertedJoinsFromSelect, Explore]
-(InnerJoin | SemiJoin | AntiJoin
+(InnerJoin | LeftJoin | AntiJoin
     $left:*
     (Select
         (Scan $scanPrivate:*) &
@@ -146,48 +181,6 @@
     (ConcatFilters $on $filters)
     $private
 )
-
-# GenerateZigzagJoins creates ZigzagJoin operators for all index pairs (of the
-# Scan table) where the prefix column(s) of both indexes is/are fixed to
-# constant values in the filters. See comments in GenerateZigzagJoin and
-# distsqlrun/zigzagjoiner.go for more details on when a zigzag join can be
-# planned.
-#
-# Zigzag joins are prohibited when the source Scan operator has been configured
-# with a row-level locking mode. This is mostly out of convenience so that these
-# row-level locking modes don't need to added to the ZigzagJoin operator. There
-# doesn't seem to be a strong reason to support this, but if one comes up, it
-# should be possible to lift this restriction.
-[GenerateZigzagJoins, Explore]
-(Select
-    (Scan $scan:*) & (IsCanonicalScan $scan) & ^(IsLocking $scan)
-    $filters:*
-)
-=>
-(GenerateZigzagJoins $scan $filters)
-
-# GenerateInvertedIndexZigzagJoins creates ZigzagJoin operators for inverted
-# indexes that can be constrained with two or more distinct constant values.
-# Inverted indexes contain one row for each path-to-leaf in a JSON value, so one
-# row in the primary index could generate multiple inverted index keys. This
-# property can be exploited by zigzag joining on the same inverted index, fixed
-# at any two of the JSON paths we are querying for.
-#
-# Zigzag joins are prohibited when the source Scan operator has been configured
-# with a row-level locking mode. This is mostly out of convenience so that these
-# row-level locking modes don't need to added to the ZigzagJoin operator. There
-# doesn't seem to be a strong reason to support this, but if one comes up, it
-# should be possible to lift this restriction.
-[GenerateInvertedIndexZigzagJoins, Explore]
-(Select
-    (Scan $scan:*) &
-        (IsCanonicalScan $scan) &
-        ^(IsLocking $scan) &
-        (HasInvertedIndexes $scan)
-    $filters:*
-)
-=>
-(GenerateInvertedIndexZigzagJoins $scan $filters)
 
 # GenerateLookupJoinWithFilter creates a LookupJoin alternative for a Join which
 # has a Select->Scan combination as its right input. The filter can get merged

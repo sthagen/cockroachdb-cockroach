@@ -14,60 +14,60 @@ CREATE TABLE pg_catalog.t (x INT)
 query error database "pg_catalog" does not exist
 DROP DATABASE pg_catalog
 
-query TTTI
+query TTTTI
 SHOW TABLES FROM pg_catalog
 ----
-pg_catalog  pg_aggregate             table  NULL
-pg_catalog  pg_am                    table  NULL
-pg_catalog  pg_attrdef               table  NULL
-pg_catalog  pg_attribute             table  NULL
-pg_catalog  pg_auth_members          table  NULL
-pg_catalog  pg_authid                table  NULL
-pg_catalog  pg_available_extensions  table  NULL
-pg_catalog  pg_cast                  table  NULL
-pg_catalog  pg_class                 table  NULL
-pg_catalog  pg_collation             table  NULL
-pg_catalog  pg_constraint            table  NULL
-pg_catalog  pg_conversion            table  NULL
-pg_catalog  pg_database              table  NULL
-pg_catalog  pg_default_acl           table  NULL
-pg_catalog  pg_depend                table  NULL
-pg_catalog  pg_description           table  NULL
-pg_catalog  pg_enum                  table  NULL
-pg_catalog  pg_event_trigger         table  NULL
-pg_catalog  pg_extension             table  NULL
-pg_catalog  pg_foreign_data_wrapper  table  NULL
-pg_catalog  pg_foreign_server        table  NULL
-pg_catalog  pg_foreign_table         table  NULL
-pg_catalog  pg_index                 table  NULL
-pg_catalog  pg_indexes               table  NULL
-pg_catalog  pg_inherits              table  NULL
-pg_catalog  pg_language              table  NULL
-pg_catalog  pg_locks                 table  NULL
-pg_catalog  pg_matviews              table  NULL
-pg_catalog  pg_namespace             table  NULL
-pg_catalog  pg_operator              table  NULL
-pg_catalog  pg_prepared_statements   table  NULL
-pg_catalog  pg_prepared_xacts        table  NULL
-pg_catalog  pg_proc                  table  NULL
-pg_catalog  pg_range                 table  NULL
-pg_catalog  pg_rewrite               table  NULL
-pg_catalog  pg_roles                 table  NULL
-pg_catalog  pg_seclabel              table  NULL
-pg_catalog  pg_seclabels             table  NULL
-pg_catalog  pg_sequence              table  NULL
-pg_catalog  pg_settings              table  NULL
-pg_catalog  pg_shdepend              table  NULL
-pg_catalog  pg_shdescription         table  NULL
-pg_catalog  pg_shseclabel            table  NULL
-pg_catalog  pg_stat_activity         table  NULL
-pg_catalog  pg_tables                table  NULL
-pg_catalog  pg_tablespace            table  NULL
-pg_catalog  pg_trigger               table  NULL
-pg_catalog  pg_type                  table  NULL
-pg_catalog  pg_user                  table  NULL
-pg_catalog  pg_user_mapping          table  NULL
-pg_catalog  pg_views                 table  NULL
+pg_catalog  pg_aggregate             table  NULL  NULL
+pg_catalog  pg_am                    table  NULL  NULL
+pg_catalog  pg_attrdef               table  NULL  NULL
+pg_catalog  pg_attribute             table  NULL  NULL
+pg_catalog  pg_auth_members          table  NULL  NULL
+pg_catalog  pg_authid                table  NULL  NULL
+pg_catalog  pg_available_extensions  table  NULL  NULL
+pg_catalog  pg_cast                  table  NULL  NULL
+pg_catalog  pg_class                 table  NULL  NULL
+pg_catalog  pg_collation             table  NULL  NULL
+pg_catalog  pg_constraint            table  NULL  NULL
+pg_catalog  pg_conversion            table  NULL  NULL
+pg_catalog  pg_database              table  NULL  NULL
+pg_catalog  pg_default_acl           table  NULL  NULL
+pg_catalog  pg_depend                table  NULL  NULL
+pg_catalog  pg_description           table  NULL  NULL
+pg_catalog  pg_enum                  table  NULL  NULL
+pg_catalog  pg_event_trigger         table  NULL  NULL
+pg_catalog  pg_extension             table  NULL  NULL
+pg_catalog  pg_foreign_data_wrapper  table  NULL  NULL
+pg_catalog  pg_foreign_server        table  NULL  NULL
+pg_catalog  pg_foreign_table         table  NULL  NULL
+pg_catalog  pg_index                 table  NULL  NULL
+pg_catalog  pg_indexes               table  NULL  NULL
+pg_catalog  pg_inherits              table  NULL  NULL
+pg_catalog  pg_language              table  NULL  NULL
+pg_catalog  pg_locks                 table  NULL  NULL
+pg_catalog  pg_matviews              table  NULL  NULL
+pg_catalog  pg_namespace             table  NULL  NULL
+pg_catalog  pg_operator              table  NULL  NULL
+pg_catalog  pg_prepared_statements   table  NULL  NULL
+pg_catalog  pg_prepared_xacts        table  NULL  NULL
+pg_catalog  pg_proc                  table  NULL  NULL
+pg_catalog  pg_range                 table  NULL  NULL
+pg_catalog  pg_rewrite               table  NULL  NULL
+pg_catalog  pg_roles                 table  NULL  NULL
+pg_catalog  pg_seclabel              table  NULL  NULL
+pg_catalog  pg_seclabels             table  NULL  NULL
+pg_catalog  pg_sequence              table  NULL  NULL
+pg_catalog  pg_settings              table  NULL  NULL
+pg_catalog  pg_shdepend              table  NULL  NULL
+pg_catalog  pg_shdescription         table  NULL  NULL
+pg_catalog  pg_shseclabel            table  NULL  NULL
+pg_catalog  pg_stat_activity         table  NULL  NULL
+pg_catalog  pg_tables                table  NULL  NULL
+pg_catalog  pg_tablespace            table  NULL  NULL
+pg_catalog  pg_trigger               table  NULL  NULL
+pg_catalog  pg_type                  table  NULL  NULL
+pg_catalog  pg_user                  table  NULL  NULL
+pg_catalog  pg_user_mapping          table  NULL  NULL
+pg_catalog  pg_views                 table  NULL  NULL
 
 # Verify "pg_catalog" is a regular db name
 
@@ -91,60 +91,60 @@ SELECT * FROM pg_catalog.pg_class c WHERE nonexistent_function()
 
 # Verify pg_catalog handles reflection correctly.
 
-query TTTI
+query TTTTI
 SHOW TABLES FROM test.pg_catalog
 ----
-pg_catalog  pg_aggregate             table  NULL
-pg_catalog  pg_am                    table  NULL
-pg_catalog  pg_attrdef               table  NULL
-pg_catalog  pg_attribute             table  NULL
-pg_catalog  pg_auth_members          table  NULL
-pg_catalog  pg_authid                table  NULL
-pg_catalog  pg_available_extensions  table  NULL
-pg_catalog  pg_cast                  table  NULL
-pg_catalog  pg_class                 table  NULL
-pg_catalog  pg_collation             table  NULL
-pg_catalog  pg_constraint            table  NULL
-pg_catalog  pg_conversion            table  NULL
-pg_catalog  pg_database              table  NULL
-pg_catalog  pg_default_acl           table  NULL
-pg_catalog  pg_depend                table  NULL
-pg_catalog  pg_description           table  NULL
-pg_catalog  pg_enum                  table  NULL
-pg_catalog  pg_event_trigger         table  NULL
-pg_catalog  pg_extension             table  NULL
-pg_catalog  pg_foreign_data_wrapper  table  NULL
-pg_catalog  pg_foreign_server        table  NULL
-pg_catalog  pg_foreign_table         table  NULL
-pg_catalog  pg_index                 table  NULL
-pg_catalog  pg_indexes               table  NULL
-pg_catalog  pg_inherits              table  NULL
-pg_catalog  pg_language              table  NULL
-pg_catalog  pg_locks                 table  NULL
-pg_catalog  pg_matviews              table  NULL
-pg_catalog  pg_namespace             table  NULL
-pg_catalog  pg_operator              table  NULL
-pg_catalog  pg_prepared_statements   table  NULL
-pg_catalog  pg_prepared_xacts        table  NULL
-pg_catalog  pg_proc                  table  NULL
-pg_catalog  pg_range                 table  NULL
-pg_catalog  pg_rewrite               table  NULL
-pg_catalog  pg_roles                 table  NULL
-pg_catalog  pg_seclabel              table  NULL
-pg_catalog  pg_seclabels             table  NULL
-pg_catalog  pg_sequence              table  NULL
-pg_catalog  pg_settings              table  NULL
-pg_catalog  pg_shdepend              table  NULL
-pg_catalog  pg_shdescription         table  NULL
-pg_catalog  pg_shseclabel            table  NULL
-pg_catalog  pg_stat_activity         table  NULL
-pg_catalog  pg_tables                table  NULL
-pg_catalog  pg_tablespace            table  NULL
-pg_catalog  pg_trigger               table  NULL
-pg_catalog  pg_type                  table  NULL
-pg_catalog  pg_user                  table  NULL
-pg_catalog  pg_user_mapping          table  NULL
-pg_catalog  pg_views                 table  NULL
+pg_catalog  pg_aggregate             table  NULL  NULL
+pg_catalog  pg_am                    table  NULL  NULL
+pg_catalog  pg_attrdef               table  NULL  NULL
+pg_catalog  pg_attribute             table  NULL  NULL
+pg_catalog  pg_auth_members          table  NULL  NULL
+pg_catalog  pg_authid                table  NULL  NULL
+pg_catalog  pg_available_extensions  table  NULL  NULL
+pg_catalog  pg_cast                  table  NULL  NULL
+pg_catalog  pg_class                 table  NULL  NULL
+pg_catalog  pg_collation             table  NULL  NULL
+pg_catalog  pg_constraint            table  NULL  NULL
+pg_catalog  pg_conversion            table  NULL  NULL
+pg_catalog  pg_database              table  NULL  NULL
+pg_catalog  pg_default_acl           table  NULL  NULL
+pg_catalog  pg_depend                table  NULL  NULL
+pg_catalog  pg_description           table  NULL  NULL
+pg_catalog  pg_enum                  table  NULL  NULL
+pg_catalog  pg_event_trigger         table  NULL  NULL
+pg_catalog  pg_extension             table  NULL  NULL
+pg_catalog  pg_foreign_data_wrapper  table  NULL  NULL
+pg_catalog  pg_foreign_server        table  NULL  NULL
+pg_catalog  pg_foreign_table         table  NULL  NULL
+pg_catalog  pg_index                 table  NULL  NULL
+pg_catalog  pg_indexes               table  NULL  NULL
+pg_catalog  pg_inherits              table  NULL  NULL
+pg_catalog  pg_language              table  NULL  NULL
+pg_catalog  pg_locks                 table  NULL  NULL
+pg_catalog  pg_matviews              table  NULL  NULL
+pg_catalog  pg_namespace             table  NULL  NULL
+pg_catalog  pg_operator              table  NULL  NULL
+pg_catalog  pg_prepared_statements   table  NULL  NULL
+pg_catalog  pg_prepared_xacts        table  NULL  NULL
+pg_catalog  pg_proc                  table  NULL  NULL
+pg_catalog  pg_range                 table  NULL  NULL
+pg_catalog  pg_rewrite               table  NULL  NULL
+pg_catalog  pg_roles                 table  NULL  NULL
+pg_catalog  pg_seclabel              table  NULL  NULL
+pg_catalog  pg_seclabels             table  NULL  NULL
+pg_catalog  pg_sequence              table  NULL  NULL
+pg_catalog  pg_settings              table  NULL  NULL
+pg_catalog  pg_shdepend              table  NULL  NULL
+pg_catalog  pg_shdescription         table  NULL  NULL
+pg_catalog  pg_shseclabel            table  NULL  NULL
+pg_catalog  pg_stat_activity         table  NULL  NULL
+pg_catalog  pg_tables                table  NULL  NULL
+pg_catalog  pg_tablespace            table  NULL  NULL
+pg_catalog  pg_trigger               table  NULL  NULL
+pg_catalog  pg_type                  table  NULL  NULL
+pg_catalog  pg_user                  table  NULL  NULL
+pg_catalog  pg_user_mapping          table  NULL  NULL
+pg_catalog  pg_views                 table  NULL  NULL
 
 query TT colnames
 SHOW CREATE TABLE pg_catalog.pg_namespace
@@ -201,6 +201,7 @@ CREATE TABLE constraint_db.t1 (
   h CHAR(12)[],
   i VARCHAR(20)[],
   j "char",
+  k VARCHAR(10) COLLATE sv,
   UNIQUE INDEX index_key(b, c)
 )
 
@@ -215,7 +216,7 @@ statement ok
 CREATE TABLE constraint_db.t3 (
     a INT,
     b INT CHECK (b > 11),
-    c STRING DEFAULT 'FOO',
+    c STRING DEFAULT 'FOO' CHECK (c != ''),
     CONSTRAINT fk FOREIGN KEY (a, b) REFERENCES constraint_db.t1(b, c),
     INDEX (a, b DESC) STORING (c)
 )
@@ -228,12 +229,12 @@ CREATE VIEW constraint_db.v1 AS SELECT p,a,b,c FROM constraint_db.t1
 query OTOT colnames
 SELECT * FROM pg_catalog.pg_namespace
 ----
-oid         nspname             nspowner  nspacl
-3604332469  crdb_internal       NULL      NULL
-3672231114  information_schema  NULL      NULL
-2508829085  pg_catalog          NULL      NULL
-1841002695  pg_extension        NULL      NULL
-3426283741  public              NULL      NULL
+oid         nspname             nspowner    nspacl
+3604332469  crdb_internal       NULL        NULL
+3672231114  information_schema  NULL        NULL
+2508829085  pg_catalog          NULL        NULL
+1841002695  pg_extension        NULL        NULL
+3426283741  public              2310524507  NULL
 
 ## pg_catalog.pg_database
 
@@ -242,12 +243,12 @@ SELECT oid, datname, datdba, encoding, datcollate, datctype, datistemplate, data
 FROM pg_catalog.pg_database
 ORDER BY oid
 ----
-oid  datname        datdba  encoding  datcollate  datctype    datistemplate  datallowconn
-1    system         NULL    6         en_US.utf8  en_US.utf8  false          true
-50   defaultdb      NULL    6         en_US.utf8  en_US.utf8  false          true
-51   postgres       NULL    6         en_US.utf8  en_US.utf8  false          true
-52   test           NULL    6         en_US.utf8  en_US.utf8  false          true
-54   constraint_db  NULL    6         en_US.utf8  en_US.utf8  false          true
+oid  datname        datdba      encoding  datcollate  datctype    datistemplate  datallowconn
+1    system         3233629770  6         en_US.utf8  en_US.utf8  false          true
+50   defaultdb      1546506610  6         en_US.utf8  en_US.utf8  false          true
+51   postgres       1546506610  6         en_US.utf8  en_US.utf8  false          true
+52   test           1546506610  6         en_US.utf8  en_US.utf8  false          true
+54   constraint_db  1546506610  6         en_US.utf8  en_US.utf8  false          true
 
 query OTIOIIOT colnames
 SELECT oid, datname, datconnlimit, datlastsysoid, datfrozenxid, datminmxid, dattablespace, datacl
@@ -283,9 +284,9 @@ query TTTTBBBB colnames
 SELECT * FROM constraint_db.pg_catalog.pg_tables WHERE schemaname = 'public'
 ----
 schemaname  tablename  tableowner  tablespace  hasindexes  hasrules  hastriggers  rowsecurity
-public      t1         NULL        NULL        true        false     false        false
-public      t2         NULL        NULL        true        false     false        false
-public      t3         NULL        NULL        true        false     false        false
+public      t1         root        NULL        true        false     false        false
+public      t2         root        NULL        true        false     false        false
+public      t3         root        NULL        true        false     false        false
 
 query TB colnames
 SELECT tablename, hasindexes FROM pg_catalog.pg_tables WHERE schemaname = 'information_schema' AND tablename LIKE '%table%'
@@ -310,7 +311,18 @@ query TTTT colnames
 SELECT * FROM pg_catalog.pg_views
 ----
 schemaname  viewname  viewowner  definition
-public      v1        NULL       SELECT p, a, b, c FROM constraint_db.public.t1
+public      v1        root       SELECT p, a, b, c FROM constraint_db.public.t1
+
+## pg_catalog.pg_matviews
+
+statement ok
+CREATE MATERIALIZED VIEW mv1 AS SELECT 1
+
+query TTTTBBT colnames
+SELECT * FROM pg_catalog.pg_matviews
+----
+schemaname  matviewname  matviewowner  tablespace  hasindexes  ispopulated  definition
+public      mv1          root          NULL        false       true         SELECT 1
 
 ## pg_catalog.pg_class
 
@@ -320,18 +332,20 @@ FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-oid         relname       relnamespace  reltype  reloftype  relowner  relam       relfilenode  reltablespace
-55          t1            2332901747    0        0          NULL      2631952481  0            0
-450499963   primary       2332901747    0        0          NULL      2631952481  0            0
-450499960   t1_a_key      2332901747    0        0          NULL      2631952481  0            0
-450499961   index_key     2332901747    0        0          NULL      2631952481  0            0
-56          t2            2332901747    0        0          NULL      2631952481  0            0
-2315049508  primary       2332901747    0        0          NULL      2631952481  0            0
-2315049511  t2_t1_id_idx  2332901747    0        0          NULL      2631952481  0            0
-57          t3            2332901747    0        0          NULL      2631952481  0            0
-969972501   primary       2332901747    0        0          NULL      2631952481  0            0
-969972502   t3_a_b_idx    2332901747    0        0          NULL      2631952481  0            0
-58          v1            2332901747    0        0          NULL      0           0            0
+oid         relname       relnamespace  reltype  reloftype  relowner    relam       relfilenode  reltablespace
+55          t1            2332901747    0        0          1546506610  2631952481  0            0
+450499963   primary       2332901747    0        0          1546506610  2631952481  0            0
+450499960   t1_a_key      2332901747    0        0          1546506610  2631952481  0            0
+450499961   index_key     2332901747    0        0          1546506610  2631952481  0            0
+56          t2            2332901747    0        0          1546506610  2631952481  0            0
+2315049508  primary       2332901747    0        0          1546506610  2631952481  0            0
+2315049511  t2_t1_id_idx  2332901747    0        0          1546506610  2631952481  0            0
+57          t3            2332901747    0        0          1546506610  2631952481  0            0
+969972501   primary       2332901747    0        0          1546506610  2631952481  0            0
+969972502   t3_a_b_idx    2332901747    0        0          1546506610  2631952481  0            0
+58          v1            2332901747    0        0          1546506610  0           0            0
+59          mv1           2332901747    0        0          1546506610  0           0            0
+3660126519  primary       2332901747    0        0          1546506610  2631952481  0            0
 
 query TIRIOBBT colnames
 SELECT relname, relpages, reltuples, relallvisible, reltoastrelid, relhasindex, relisshared, relpersistence
@@ -351,6 +365,8 @@ t3            NULL      NULL       0              0              true         fa
 primary       NULL      NULL       0              0              false        false        p
 t3_a_b_idx    NULL      NULL       0              0              false        false        p
 v1            NULL      NULL       0              0              false        false        p
+mv1           NULL      NULL       0              0              true         false        p
+primary       NULL      NULL       0              0              false        false        p
 
 query TBTIIBB colnames
 SELECT relname, relistemp, relkind, relnatts, relchecks, relhasoids, relhaspkey
@@ -359,17 +375,19 @@ JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE n.nspname = 'public'
 ----
 relname       relistemp  relkind  relnatts  relchecks  relhasoids  relhaspkey
-t1            false      r        11        0          false       true
+t1            false      r        12        0          false       true
 primary       false      i        1         0          false       false
 t1_a_key      false      i        1         0          false       false
 index_key     false      i        2         0          false       false
 t2            false      r        2         0          false       true
 primary       false      i        1         0          false       false
 t2_t1_id_idx  false      i        1         0          false       false
-t3            false      r        4         1          false       true
+t3            false      r        4         2          false       true
 primary       false      i        1         0          false       false
 t3_a_b_idx    false      i        2         0          false       false
 v1            false      v        4         0          false       false
+mv1           false      m        2         0          false       true
+primary       false      i        1         0          false       false
 
 query TBBBITT colnames
 SELECT relname, relhasrules, relhastriggers, relhassubclass, relfrozenxid, relacl, reloptions
@@ -389,6 +407,8 @@ t3            false        false           false           0             NULL   
 primary       false        false           false           0             NULL    NULL
 t3_a_b_idx    false        false           false           0             NULL    NULL
 v1            false        false           false           0             NULL    NULL
+mv1           false        false           false           0             NULL    NULL
+primary       false        false           false           0             NULL    NULL
 
 ## pg_catalog.pg_attribute
 
@@ -399,37 +419,41 @@ JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-attrelid    relname       attname  atttypid  attstattarget  attlen  attnum  attndims  attcacheoff
-55          t1            p        701       0              8       1       0         -1
-55          t1            a        20        0              8       2       0         -1
-55          t1            b        20        0              8       3       0         -1
-55          t1            c        20        0              8       4       0         -1
-55          t1            d        1043      0              -1      5       0         -1
-55          t1            e        1560      0              -1      6       0         -1
-55          t1            f        1700      0              -1      7       0         -1
-55          t1            g        20        0              8       8       0         -1
-55          t1            h        1014      0              -1      9       0         -1
-55          t1            i        1015      0              -1      10      0         -1
-55          t1            j        18        0              1       11      0         -1
-450499963   primary       p        701       0              8       1       0         -1
-450499960   t1_a_key      a        20        0              8       2       0         -1
-450499961   index_key     b        20        0              8       3       0         -1
-450499961   index_key     c        20        0              8       4       0         -1
-56          t2            t1_id    20        0              8       1       0         -1
-56          t2            rowid    20        0              8       2       0         -1
-2315049508  primary       rowid    20        0              8       2       0         -1
-2315049511  t2_t1_id_idx  t1_id    20        0              8       1       0         -1
-57          t3            a        20        0              8       1       0         -1
-57          t3            b        20        0              8       2       0         -1
-57          t3            c        25        0              -1      3       0         -1
-57          t3            rowid    20        0              8       4       0         -1
-969972501   primary       rowid    20        0              8       4       0         -1
-969972502   t3_a_b_idx    a        20        0              8       1       0         -1
-969972502   t3_a_b_idx    b        20        0              8       2       0         -1
-58          v1            p        701       0              8       1       0         -1
-58          v1            a        20        0              8       2       0         -1
-58          v1            b        20        0              8       3       0         -1
-58          v1            c        20        0              8       4       0         -1
+attrelid    relname       attname   atttypid  attstattarget  attlen  attnum  attndims  attcacheoff
+55          t1            p         701       0              8       1       0         -1
+55          t1            a         20        0              8       2       0         -1
+55          t1            b         20        0              8       3       0         -1
+55          t1            c         20        0              8       4       0         -1
+55          t1            d         1043      0              -1      5       0         -1
+55          t1            e         1560      0              -1      6       0         -1
+55          t1            f         1700      0              -1      7       0         -1
+55          t1            g         20        0              8       8       0         -1
+55          t1            h         1014      0              -1      9       0         -1
+55          t1            i         1015      0              -1      10      0         -1
+55          t1            j         18        0              1       11      0         -1
+55          t1            k         1043      0              -1      12      0         -1
+450499963   primary       p         701       0              8       1       0         -1
+450499960   t1_a_key      a         20        0              8       2       0         -1
+450499961   index_key     b         20        0              8       3       0         -1
+450499961   index_key     c         20        0              8       4       0         -1
+56          t2            t1_id     20        0              8       1       0         -1
+56          t2            rowid     20        0              8       2       0         -1
+2315049508  primary       rowid     20        0              8       2       0         -1
+2315049511  t2_t1_id_idx  t1_id     20        0              8       1       0         -1
+57          t3            a         20        0              8       1       0         -1
+57          t3            b         20        0              8       2       0         -1
+57          t3            c         25        0              -1      3       0         -1
+57          t3            rowid     20        0              8       4       0         -1
+969972501   primary       rowid     20        0              8       4       0         -1
+969972502   t3_a_b_idx    a         20        0              8       1       0         -1
+969972502   t3_a_b_idx    b         20        0              8       2       0         -1
+58          v1            p         701       0              8       1       0         -1
+58          v1            a         20        0              8       2       0         -1
+58          v1            b         20        0              8       3       0         -1
+58          v1            c         20        0              8       4       0         -1
+59          mv1           ?column?  20        0              8       1       0         -1
+59          mv1           rowid     20        0              8       2       0         -1
+3660126519  primary       rowid     20        0              8       2       0         -1
 
 query TTIBTTBBTT colnames
 SELECT c.relname, attname, atttypmod, attbyval, attstorage, attalign, attnotnull, atthasdef, attidentity, attgenerated
@@ -438,37 +462,41 @@ JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-relname       attname  atttypmod  attbyval  attstorage  attalign  attnotnull  atthasdef  attidentity  attgenerated
-t1            p        -1         NULL      NULL        NULL      true        false
-t1            a        -1         NULL      NULL        NULL      false       false
-t1            b        -1         NULL      NULL        NULL      false       false
-t1            c        -1         NULL      NULL        NULL      false       true
-t1            d        9          NULL      NULL        NULL      false       false
-t1            e        5          NULL      NULL        NULL      false       false
-t1            f        655371     NULL      NULL        NULL      false       false
-t1            g        -1         NULL      NULL        NULL      false       false                   s
-t1            h        16         NULL      NULL        NULL      false       false
-t1            i        24         NULL      NULL        NULL      false       false
-t1            j        -1         NULL      NULL        NULL      false       false
-primary       p        -1         NULL      NULL        NULL      true        false
-t1_a_key      a        -1         NULL      NULL        NULL      false       false
-index_key     b        -1         NULL      NULL        NULL      false       false
-index_key     c        -1         NULL      NULL        NULL      false       true
-t2            t1_id    -1         NULL      NULL        NULL      false       false
-t2            rowid    -1         NULL      NULL        NULL      true        true
-primary       rowid    -1         NULL      NULL        NULL      true        true
-t2_t1_id_idx  t1_id    -1         NULL      NULL        NULL      false       false
-t3            a        -1         NULL      NULL        NULL      false       false
-t3            b        -1         NULL      NULL        NULL      false       false
-t3            c        -1         NULL      NULL        NULL      false       true
-t3            rowid    -1         NULL      NULL        NULL      true        true
-primary       rowid    -1         NULL      NULL        NULL      true        true
-t3_a_b_idx    a        -1         NULL      NULL        NULL      false       false
-t3_a_b_idx    b        -1         NULL      NULL        NULL      false       false
-v1            p        -1         NULL      NULL        NULL      true        false
-v1            a        -1         NULL      NULL        NULL      true        false
-v1            b        -1         NULL      NULL        NULL      true        false
-v1            c        -1         NULL      NULL        NULL      true        false
+relname       attname   atttypmod  attbyval  attstorage  attalign  attnotnull  atthasdef  attidentity  attgenerated
+t1            p         -1         NULL      NULL        NULL      true        false
+t1            a         -1         NULL      NULL        NULL      false       false
+t1            b         -1         NULL      NULL        NULL      false       false
+t1            c         -1         NULL      NULL        NULL      false       true
+t1            d         9          NULL      NULL        NULL      false       false
+t1            e         5          NULL      NULL        NULL      false       false
+t1            f         655371     NULL      NULL        NULL      false       false
+t1            g         -1         NULL      NULL        NULL      false       false                   s
+t1            h         16         NULL      NULL        NULL      false       false
+t1            i         24         NULL      NULL        NULL      false       false
+t1            j         -1         NULL      NULL        NULL      false       false
+t1            k         14         NULL      NULL        NULL      false       false
+primary       p         -1         NULL      NULL        NULL      true        false
+t1_a_key      a         -1         NULL      NULL        NULL      false       false
+index_key     b         -1         NULL      NULL        NULL      false       false
+index_key     c         -1         NULL      NULL        NULL      false       true
+t2            t1_id     -1         NULL      NULL        NULL      false       false
+t2            rowid     -1         NULL      NULL        NULL      true        true
+primary       rowid     -1         NULL      NULL        NULL      true        true
+t2_t1_id_idx  t1_id     -1         NULL      NULL        NULL      false       false
+t3            a         -1         NULL      NULL        NULL      false       false
+t3            b         -1         NULL      NULL        NULL      false       false
+t3            c         -1         NULL      NULL        NULL      false       true
+t3            rowid     -1         NULL      NULL        NULL      true        true
+primary       rowid     -1         NULL      NULL        NULL      true        true
+t3_a_b_idx    a         -1         NULL      NULL        NULL      false       false
+t3_a_b_idx    b         -1         NULL      NULL        NULL      false       false
+v1            p         -1         NULL      NULL        NULL      true        false
+v1            a         -1         NULL      NULL        NULL      true        false
+v1            b         -1         NULL      NULL        NULL      true        false
+v1            c         -1         NULL      NULL        NULL      true        false
+mv1           ?column?  -1         NULL      NULL        NULL      true        false
+mv1           rowid     -1         NULL      NULL        NULL      true        true
+primary       rowid     -1         NULL      NULL        NULL      true        true
 
 query TTBBITTT colnames
 SELECT c.relname, attname, attisdropped, attislocal, attinhcount, attacl, attoptions, attfdwoptions
@@ -477,37 +505,41 @@ JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-relname       attname  attisdropped  attislocal  attinhcount  attacl  attoptions  attfdwoptions
-t1            p        false         true        0            NULL    NULL        NULL
-t1            a        false         true        0            NULL    NULL        NULL
-t1            b        false         true        0            NULL    NULL        NULL
-t1            c        false         true        0            NULL    NULL        NULL
-t1            d        false         true        0            NULL    NULL        NULL
-t1            e        false         true        0            NULL    NULL        NULL
-t1            f        false         true        0            NULL    NULL        NULL
-t1            g        false         true        0            NULL    NULL        NULL
-t1            h        false         true        0            NULL    NULL        NULL
-t1            i        false         true        0            NULL    NULL        NULL
-t1            j        false         true        0            NULL    NULL        NULL
-primary       p        false         true        0            NULL    NULL        NULL
-t1_a_key      a        false         true        0            NULL    NULL        NULL
-index_key     b        false         true        0            NULL    NULL        NULL
-index_key     c        false         true        0            NULL    NULL        NULL
-t2            t1_id    false         true        0            NULL    NULL        NULL
-t2            rowid    false         true        0            NULL    NULL        NULL
-primary       rowid    false         true        0            NULL    NULL        NULL
-t2_t1_id_idx  t1_id    false         true        0            NULL    NULL        NULL
-t3            a        false         true        0            NULL    NULL        NULL
-t3            b        false         true        0            NULL    NULL        NULL
-t3            c        false         true        0            NULL    NULL        NULL
-t3            rowid    false         true        0            NULL    NULL        NULL
-primary       rowid    false         true        0            NULL    NULL        NULL
-t3_a_b_idx    a        false         true        0            NULL    NULL        NULL
-t3_a_b_idx    b        false         true        0            NULL    NULL        NULL
-v1            p        false         true        0            NULL    NULL        NULL
-v1            a        false         true        0            NULL    NULL        NULL
-v1            b        false         true        0            NULL    NULL        NULL
-v1            c        false         true        0            NULL    NULL        NULL
+relname       attname   attisdropped  attislocal  attinhcount  attacl  attoptions  attfdwoptions
+t1            p         false         true        0            NULL    NULL        NULL
+t1            a         false         true        0            NULL    NULL        NULL
+t1            b         false         true        0            NULL    NULL        NULL
+t1            c         false         true        0            NULL    NULL        NULL
+t1            d         false         true        0            NULL    NULL        NULL
+t1            e         false         true        0            NULL    NULL        NULL
+t1            f         false         true        0            NULL    NULL        NULL
+t1            g         false         true        0            NULL    NULL        NULL
+t1            h         false         true        0            NULL    NULL        NULL
+t1            i         false         true        0            NULL    NULL        NULL
+t1            j         false         true        0            NULL    NULL        NULL
+t1            k         false         true        0            NULL    NULL        NULL
+primary       p         false         true        0            NULL    NULL        NULL
+t1_a_key      a         false         true        0            NULL    NULL        NULL
+index_key     b         false         true        0            NULL    NULL        NULL
+index_key     c         false         true        0            NULL    NULL        NULL
+t2            t1_id     false         true        0            NULL    NULL        NULL
+t2            rowid     false         true        0            NULL    NULL        NULL
+primary       rowid     false         true        0            NULL    NULL        NULL
+t2_t1_id_idx  t1_id     false         true        0            NULL    NULL        NULL
+t3            a         false         true        0            NULL    NULL        NULL
+t3            b         false         true        0            NULL    NULL        NULL
+t3            c         false         true        0            NULL    NULL        NULL
+t3            rowid     false         true        0            NULL    NULL        NULL
+primary       rowid     false         true        0            NULL    NULL        NULL
+t3_a_b_idx    a         false         true        0            NULL    NULL        NULL
+t3_a_b_idx    b         false         true        0            NULL    NULL        NULL
+v1            p         false         true        0            NULL    NULL        NULL
+v1            a         false         true        0            NULL    NULL        NULL
+v1            b         false         true        0            NULL    NULL        NULL
+v1            c         false         true        0            NULL    NULL        NULL
+mv1           ?column?  false         true        0            NULL    NULL        NULL
+mv1           rowid     false         true        0            NULL    NULL        NULL
+primary       rowid     false         true        0            NULL    NULL        NULL
 
 # Check relkind codes.
 statement ok
@@ -567,6 +599,7 @@ t1       d        varchar   3903121477    en-US
 t1       h        _bpchar   3903121477    en-US
 t1       i        _varchar  3903121477    en-US
 t1       j        char      3903121477    en-US
+t1       k        varchar   999873346     sv
 t3       c        text      3903121477    en-US
 
 
@@ -582,18 +615,19 @@ oid         amname    amstrategies  amsupport  amcanorder  amcanorderbyop  amcan
 
 ## pg_catalog.pg_attrdef
 
-query OTOITT colnames
-SELECT ad.oid, c.relname, adrelid, adnum, adbin, adsrc
+query OTOITTT colnames
+SELECT ad.oid, c.relname, adrelid, adnum, adbin, adsrc, pg_get_expr(ad.adbin, ad.adrelid)
 FROM pg_catalog.pg_attrdef ad
 JOIN pg_catalog.pg_class c ON ad.adrelid = c.oid
 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-oid         relname  adrelid  adnum  adbin           adsrc
-1666782879  t1       55       4      12              12
-841178406   t2       56       2      unique_rowid()  unique_rowid()
-2186255414  t3       57       3      'FOO'::STRING   'FOO'::STRING
-2186255409  t3       57       4      unique_rowid()  unique_rowid()
+oid         relname  adrelid  adnum  adbin           adsrc           pg_get_expr
+1666782879  t1       55       4      12              12              12
+841178406   t2       56       2      unique_rowid()  unique_rowid()  unique_rowid()
+2186255414  t3       57       3      'FOO'::STRING   'FOO'::STRING   'FOO'::STRING
+2186255409  t3       57       4      unique_rowid()  unique_rowid()  unique_rowid()
+581442133   mv1      59       2      unique_rowid()  unique_rowid()  unique_rowid()
 
 ## pg_catalog.pg_indexes
 
@@ -610,6 +644,7 @@ crdb_oid    schemaname  tablename  indexname     tablespace
 2315049511  public      t2         t2_t1_id_idx  NULL
 969972501   public      t3         primary       NULL
 969972502   public      t3         t3_a_b_idx    NULL
+3660126519  public      mv1        primary       NULL
 
 query OTTT colnames
 SELECT crdb_oid, tablename, indexname, indexdef
@@ -624,6 +659,7 @@ crdb_oid    tablename  indexname     indexdef
 2315049511  t2         t2_t1_id_idx  CREATE INDEX t2_t1_id_idx ON constraint_db.public.t2 USING btree (t1_id ASC)
 969972501   t3         primary       CREATE UNIQUE INDEX "primary" ON constraint_db.public.t3 USING btree (rowid ASC)
 969972502   t3         t3_a_b_idx    CREATE INDEX t3_a_b_idx ON constraint_db.public.t3 USING btree (a ASC, b DESC) STORING (c)
+3660126519  mv1        primary       CREATE UNIQUE INDEX "primary" ON constraint_db.public.mv1 USING btree (rowid ASC)
 
 ## pg_catalog.pg_index
 
@@ -808,8 +844,9 @@ WHERE n.nspname = 'public'
 ORDER BY con.oid
 ----
 oid         conname    connamespace  contype  condef
+370295511   check_c    2332901747    c        CHECK ((c != ''::STRING))
 2143281868  fk         2332901747    f        FOREIGN KEY (a, b) REFERENCES t1(b, c)
-2792001267  check_b    2332901747    c        CHECK ((b > 11:::INT8))
+2792001267  check_b    2332901747    c        CHECK ((b > 11))
 3572320190  primary    2332901747    p        PRIMARY KEY (p ASC)
 4089604113  fk         2332901747    f        FOREIGN KEY (t1_id) REFERENCES t1(a)
 4243354484  t1_a_key   2332901747    u        UNIQUE (a ASC)
@@ -823,6 +860,7 @@ WHERE n.nspname = 'public'
 ORDER BY con.oid
 ----
 conname    contype  condeferrable  condeferred  convalidated  conrelid  contypid  conindid
+check_c    c        false          false        true          57        0         0
 fk         f        false          false        true          57        0         450499961
 check_b    c        false          false        true          57        0         0
 primary    p        false          false        true          55        0         450499963
@@ -846,6 +884,7 @@ WHERE n.nspname = 'public' AND contype IN ('c', 'p', 'u')
 ORDER BY con.oid
 ----
 conname    confrelid  confupdtype  confdeltype  confmatchtype
+check_c    0          NULL         NULL         NULL
 check_b    0          NULL         NULL         NULL
 primary    0          NULL         NULL         NULL
 t1_a_key   0          NULL         NULL         NULL
@@ -870,6 +909,7 @@ WHERE n.nspname = 'public'
 ORDER BY con.oid
 ----
 conname    conislocal  coninhcount  connoinherit  conkey
+check_c    true        0            true          {3}
 fk         true        0            true          {1,2}
 check_b    true        0            true          {2}
 primary    true        0            true          {1}
@@ -877,18 +917,19 @@ fk         true        0            true          {1}
 t1_a_key   true        0            true          {2}
 index_key  true        0            true          {3,4}
 
-query TTTTTTTT colnames
-SELECT conname, confkey, conpfeqop, conppeqop, conffeqop, conexclop, conbin, consrc
+query TTTTTTTTT colnames
+SELECT conname, confkey, conpfeqop, conppeqop, conffeqop, conexclop, conbin, consrc, pg_get_constraintdef(con.oid) as condef
 FROM pg_catalog.pg_constraint con
 JOIN pg_catalog.pg_namespace n ON con.connamespace = n.oid
 WHERE n.nspname = 'public' AND contype IN ('c', 'p', 'u')
 ORDER BY con.oid
 ----
-conname    confkey  conpfeqop  conppeqop  conffeqop  conexclop  conbin           consrc
-check_b    NULL     NULL       NULL       NULL       NULL       (b > 11:::INT8)  (b > 11:::INT8)
-primary    NULL     NULL       NULL       NULL       NULL       NULL             NULL
-t1_a_key   NULL     NULL       NULL       NULL       NULL       NULL             NULL
-index_key  NULL     NULL       NULL       NULL       NULL       NULL             NULL
+conname    confkey  conpfeqop  conppeqop  conffeqop  conexclop  conbin             consrc             condef
+check_c    NULL     NULL       NULL       NULL       NULL       (c != ''::STRING)  (c != ''::STRING)  CHECK ((c != ''::STRING))
+check_b    NULL     NULL       NULL       NULL       NULL       (b > 11)           (b > 11)           CHECK ((b > 11))
+primary    NULL     NULL       NULL       NULL       NULL       NULL               NULL               PRIMARY KEY (p ASC)
+t1_a_key   NULL     NULL       NULL       NULL       NULL       NULL               NULL               UNIQUE (a ASC)
+index_key  NULL     NULL       NULL       NULL       NULL       NULL               NULL               UNIQUE (b ASC, c ASC)
 
 query TTTTTTTT colnames
 SELECT conname, confkey, conpfeqop, conppeqop, conffeqop, conexclop, conbin, consrc
@@ -909,8 +950,8 @@ FROM pg_catalog.pg_depend
 ORDER BY objid
 ----
 classid     objid       objsubid  refclassid  refobjid   refobjsubid  deptype
-4294967221  2143281868  0         4294967223  450499961  0            n
-4294967221  4089604113  0         4294967223  450499960  0            n
+4294967217  2143281868  0         4294967219  450499961  0            n
+4294967217  4089604113  0         4294967219  450499960  0            n
 
 # All entries in pg_depend are dependency links from the pg_constraint system
 # table to the pg_class system table.
@@ -922,7 +963,7 @@ JOIN pg_class cla ON classid=cla.oid
 JOIN pg_class refcla ON refclassid=refcla.oid
 ----
 classid     refclassid  tablename      reftablename
-4294967221  4294967223  pg_constraint  pg_class
+4294967217  4294967219  pg_constraint  pg_class
 
 # All entries in pg_depend are foreign key constraints that reference an index
 # in pg_class.
@@ -951,7 +992,6 @@ f
 
 ## pg_catalog.pg_enum
 statement ok
-SET experimental_enable_enums=true;
 CREATE TYPE newtype1 AS ENUM ('v1', 'v2');
 CREATE TYPE newtype2 AS ENUM ('v3', 'v4')
 
@@ -959,10 +999,10 @@ query OORT colnames
 SELECT * FROM pg_enum
 ----
 oid         enumtypid  enumsortorder  enumlabel
-1865129000  100064     0              v1
-1865129192  100064     1              v2
-1898684366  100066     0              v3
-1898684174  100066     1              v4
+1881906619  100065     0              v1
+1881906555  100065     1              v2
+1915461985  100067     0              v3
+1915462049  100067     1              v4
 
 ## pg_catalog.pg_type
 
@@ -971,86 +1011,86 @@ SELECT oid, typname, typnamespace, typowner, typlen, typbyval, typtype
 FROM pg_catalog.pg_type
 ORDER BY oid
 ----
-oid     typname        typnamespace  typowner  typlen  typbyval  typtype
-16      bool           1307062959    NULL      1       true      b
-17      bytea          1307062959    NULL      -1      false     b
-18      char           1307062959    NULL      1       true      b
-19      name           1307062959    NULL      -1      false     b
-20      int8           1307062959    NULL      8       true      b
-21      int2           1307062959    NULL      2       true      b
-22      int2vector     1307062959    NULL      -1      false     b
-23      int4           1307062959    NULL      4       true      b
-24      regproc        1307062959    NULL      8       true      b
-25      text           1307062959    NULL      -1      false     b
-26      oid            1307062959    NULL      8       true      b
-30      oidvector      1307062959    NULL      -1      false     b
-700     float4         1307062959    NULL      4       true      b
-701     float8         1307062959    NULL      8       true      b
-705     unknown        1307062959    NULL      0       true      b
-869     inet           1307062959    NULL      24      true      b
-1000    _bool          1307062959    NULL      -1      false     b
-1001    _bytea         1307062959    NULL      -1      false     b
-1002    _char          1307062959    NULL      -1      false     b
-1003    _name          1307062959    NULL      -1      false     b
-1005    _int2          1307062959    NULL      -1      false     b
-1006    _int2vector    1307062959    NULL      -1      false     b
-1007    _int4          1307062959    NULL      -1      false     b
-1008    _regproc       1307062959    NULL      -1      false     b
-1009    _text          1307062959    NULL      -1      false     b
-1013    _oidvector     1307062959    NULL      -1      false     b
-1014    _bpchar        1307062959    NULL      -1      false     b
-1015    _varchar       1307062959    NULL      -1      false     b
-1016    _int8          1307062959    NULL      -1      false     b
-1021    _float4        1307062959    NULL      -1      false     b
-1022    _float8        1307062959    NULL      -1      false     b
-1028    _oid           1307062959    NULL      -1      false     b
-1041    _inet          1307062959    NULL      -1      false     b
-1042    bpchar         1307062959    NULL      -1      false     b
-1043    varchar        1307062959    NULL      -1      false     b
-1082    date           1307062959    NULL      16      true      b
-1083    time           1307062959    NULL      8       true      b
-1114    timestamp      1307062959    NULL      24      true      b
-1115    _timestamp     1307062959    NULL      -1      false     b
-1182    _date          1307062959    NULL      -1      false     b
-1183    _time          1307062959    NULL      -1      false     b
-1184    timestamptz    1307062959    NULL      24      true      b
-1185    _timestamptz   1307062959    NULL      -1      false     b
-1186    interval       1307062959    NULL      24      true      b
-1187    _interval      1307062959    NULL      -1      false     b
-1231    _numeric       1307062959    NULL      -1      false     b
-1266    timetz         1307062959    NULL      16      true      b
-1270    _timetz        1307062959    NULL      -1      false     b
-1560    bit            1307062959    NULL      -1      false     b
-1561    _bit           1307062959    NULL      -1      false     b
-1562    varbit         1307062959    NULL      -1      false     b
-1563    _varbit        1307062959    NULL      -1      false     b
-1700    numeric        1307062959    NULL      -1      false     b
-2202    regprocedure   1307062959    NULL      8       true      b
-2205    regclass       1307062959    NULL      8       true      b
-2206    regtype        1307062959    NULL      8       true      b
-2207    _regprocedure  1307062959    NULL      -1      false     b
-2210    _regclass      1307062959    NULL      -1      false     b
-2211    _regtype       1307062959    NULL      -1      false     b
-2249    record         1307062959    NULL      0       true      p
-2277    anyarray       1307062959    NULL      -1      false     p
-2283    anyelement     1307062959    NULL      -1      false     p
-2287    _record        1307062959    NULL      -1      false     b
-2950    uuid           1307062959    NULL      16      true      b
-2951    _uuid          1307062959    NULL      -1      false     b
-3802    jsonb          1307062959    NULL      -1      false     b
-3807    _jsonb         1307062959    NULL      -1      false     b
-4089    regnamespace   1307062959    NULL      8       true      b
-4090    _regnamespace  1307062959    NULL      -1      false     b
-90000   geometry       1307062959    NULL      -1      false     b
-90001   _geometry      1307062959    NULL      -1      false     b
-90002   geography      1307062959    NULL      -1      false     b
-90003   _geography     1307062959    NULL      -1      false     b
-90004   box2d          1307062959    NULL      8       true      b
-90005   _box2d         1307062959    NULL      -1      false     b
-100064  newtype1       2332901747    NULL      -1      false     e
-100065  _newtype1      2332901747    NULL      -1      false     b
-100066  newtype2       2332901747    NULL      -1      false     e
-100067  _newtype2      2332901747    NULL      -1      false     b
+oid     typname        typnamespace  typowner    typlen  typbyval  typtype
+16      bool           1307062959    NULL        1       true      b
+17      bytea          1307062959    NULL        -1      false     b
+18      char           1307062959    NULL        1       true      b
+19      name           1307062959    NULL        -1      false     b
+20      int8           1307062959    NULL        8       true      b
+21      int2           1307062959    NULL        2       true      b
+22      int2vector     1307062959    NULL        -1      false     b
+23      int4           1307062959    NULL        4       true      b
+24      regproc        1307062959    NULL        8       true      b
+25      text           1307062959    NULL        -1      false     b
+26      oid            1307062959    NULL        8       true      b
+30      oidvector      1307062959    NULL        -1      false     b
+700     float4         1307062959    NULL        4       true      b
+701     float8         1307062959    NULL        8       true      b
+705     unknown        1307062959    NULL        0       true      b
+869     inet           1307062959    NULL        24      true      b
+1000    _bool          1307062959    NULL        -1      false     b
+1001    _bytea         1307062959    NULL        -1      false     b
+1002    _char          1307062959    NULL        -1      false     b
+1003    _name          1307062959    NULL        -1      false     b
+1005    _int2          1307062959    NULL        -1      false     b
+1006    _int2vector    1307062959    NULL        -1      false     b
+1007    _int4          1307062959    NULL        -1      false     b
+1008    _regproc       1307062959    NULL        -1      false     b
+1009    _text          1307062959    NULL        -1      false     b
+1013    _oidvector     1307062959    NULL        -1      false     b
+1014    _bpchar        1307062959    NULL        -1      false     b
+1015    _varchar       1307062959    NULL        -1      false     b
+1016    _int8          1307062959    NULL        -1      false     b
+1021    _float4        1307062959    NULL        -1      false     b
+1022    _float8        1307062959    NULL        -1      false     b
+1028    _oid           1307062959    NULL        -1      false     b
+1041    _inet          1307062959    NULL        -1      false     b
+1042    bpchar         1307062959    NULL        -1      false     b
+1043    varchar        1307062959    NULL        -1      false     b
+1082    date           1307062959    NULL        16      true      b
+1083    time           1307062959    NULL        8       true      b
+1114    timestamp      1307062959    NULL        24      true      b
+1115    _timestamp     1307062959    NULL        -1      false     b
+1182    _date          1307062959    NULL        -1      false     b
+1183    _time          1307062959    NULL        -1      false     b
+1184    timestamptz    1307062959    NULL        24      true      b
+1185    _timestamptz   1307062959    NULL        -1      false     b
+1186    interval       1307062959    NULL        24      true      b
+1187    _interval      1307062959    NULL        -1      false     b
+1231    _numeric       1307062959    NULL        -1      false     b
+1266    timetz         1307062959    NULL        16      true      b
+1270    _timetz        1307062959    NULL        -1      false     b
+1560    bit            1307062959    NULL        -1      false     b
+1561    _bit           1307062959    NULL        -1      false     b
+1562    varbit         1307062959    NULL        -1      false     b
+1563    _varbit        1307062959    NULL        -1      false     b
+1700    numeric        1307062959    NULL        -1      false     b
+2202    regprocedure   1307062959    NULL        8       true      b
+2205    regclass       1307062959    NULL        8       true      b
+2206    regtype        1307062959    NULL        8       true      b
+2207    _regprocedure  1307062959    NULL        -1      false     b
+2210    _regclass      1307062959    NULL        -1      false     b
+2211    _regtype       1307062959    NULL        -1      false     b
+2249    record         1307062959    NULL        0       true      p
+2277    anyarray       1307062959    NULL        -1      false     p
+2283    anyelement     1307062959    NULL        -1      false     p
+2287    _record        1307062959    NULL        -1      false     b
+2950    uuid           1307062959    NULL        16      true      b
+2951    _uuid          1307062959    NULL        -1      false     b
+3802    jsonb          1307062959    NULL        -1      false     b
+3807    _jsonb         1307062959    NULL        -1      false     b
+4089    regnamespace   1307062959    NULL        8       true      b
+4090    _regnamespace  1307062959    NULL        -1      false     b
+90000   geometry       1307062959    NULL        -1      false     b
+90001   _geometry      1307062959    NULL        -1      false     b
+90002   geography      1307062959    NULL        -1      false     b
+90003   _geography     1307062959    NULL        -1      false     b
+90004   box2d          1307062959    NULL        32      true      b
+90005   _box2d         1307062959    NULL        -1      false     b
+100065  newtype1       2332901747    1546506610  -1      false     e
+100066  _newtype1      2332901747    1546506610  -1      false     b
+100067  newtype2       2332901747    1546506610  -1      false     e
+100068  _newtype2      2332901747    1546506610  -1      false     b
 
 query OTTBBTOOO colnames
 SELECT oid, typname, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray
@@ -1133,10 +1173,10 @@ oid     typname        typcategory  typispreferred  typisdefined  typdelim  typr
 90003   _geography     A            false           true          ,         0         90002    0
 90004   box2d          U            false           true          ,         0         0        90005
 90005   _box2d         A            false           true          ,         0         90004    0
-100064  newtype1       E            false           true          ,         0         0        100065
-100065  _newtype1      A            false           true          ,         0         100064   0
-100066  newtype2       E            false           true          ,         0         0        100067
-100067  _newtype2      A            false           true          ,         0         100066   0
+100065  newtype1       E            false           true          ,         0         0        100066
+100066  _newtype1      A            false           true          ,         0         100065   0
+100067  newtype2       E            false           true          ,         0         0        100068
+100068  _newtype2      A            false           true          ,         0         100067   0
 
 query OTOOOOOOO colnames
 SELECT oid, typname, typinput, typoutput, typreceive, typsend, typmodin, typmodout, typanalyze
@@ -1219,10 +1259,10 @@ oid     typname        typinput        typoutput        typreceive        typsen
 90003   _geography     array_in        array_out        array_recv        array_send        0         0          0
 90004   box2d          box2d_in        box2d_out        box2d_recv        box2d_send        0         0          0
 90005   _box2d         array_in        array_out        array_recv        array_send        0         0          0
-100064  newtype1       enum_in         enum_out         enum_recv         enum_send         0         0          0
-100065  _newtype1      array_in        array_out        array_recv        array_send        0         0          0
-100066  newtype2       enum_in         enum_out         enum_recv         enum_send         0         0          0
-100067  _newtype2      array_in        array_out        array_recv        array_send        0         0          0
+100065  newtype1       enum_in         enum_out         enum_recv         enum_send         0         0          0
+100066  _newtype1      array_in        array_out        array_recv        array_send        0         0          0
+100067  newtype2       enum_in         enum_out         enum_recv         enum_send         0         0          0
+100068  _newtype2      array_in        array_out        array_recv        array_send        0         0          0
 
 query OTTTBOI colnames
 SELECT oid, typname, typalign, typstorage, typnotnull, typbasetype, typtypmod
@@ -1305,10 +1345,10 @@ oid     typname        typalign  typstorage  typnotnull  typbasetype  typtypmod
 90003   _geography     NULL      NULL        false       0            -1
 90004   box2d          NULL      NULL        false       0            -1
 90005   _box2d         NULL      NULL        false       0            -1
-100064  newtype1       NULL      NULL        false       0            -1
-100065  _newtype1      NULL      NULL        false       0            -1
-100066  newtype2       NULL      NULL        false       0            -1
-100067  _newtype2      NULL      NULL        false       0            -1
+100065  newtype1       NULL      NULL        false       0            -1
+100066  _newtype1      NULL      NULL        false       0            -1
+100067  newtype2       NULL      NULL        false       0            -1
+100068  _newtype2      NULL      NULL        false       0            -1
 
 query OTIOTTT colnames
 SELECT oid, typname, typndims, typcollation, typdefaultbin, typdefault, typacl
@@ -1391,10 +1431,10 @@ oid     typname        typndims  typcollation  typdefaultbin  typdefault  typacl
 90003   _geography     0         0             NULL           NULL        NULL
 90004   box2d          0         0             NULL           NULL        NULL
 90005   _box2d         0         0             NULL           NULL        NULL
-100064  newtype1       0         0             NULL           NULL        NULL
-100065  _newtype1      0         0             NULL           NULL        NULL
-100066  newtype2       0         0             NULL           NULL        NULL
-100067  _newtype2      0         0             NULL           NULL        NULL
+100065  newtype1       0         0             NULL           NULL        NULL
+100066  _newtype1      0         0             NULL           NULL        NULL
+100067  newtype2       0         0             NULL           NULL        NULL
+100068  _newtype2      0         0             NULL           NULL        NULL
 
 user testuser
 
@@ -1420,10 +1460,10 @@ oid     typname        typnamespace  typowner  typlen  typbyval  typtype
 query OTOOIBT colnames
 SELECT oid, typname, typnamespace, typowner, typlen, typbyval, typtype
 FROM pg_catalog.pg_type
-WHERE oid = 100064
+WHERE oid = 100065
 ----
-oid     typname   typnamespace  typowner  typlen  typbyval  typtype
-100064  newtype1  2332901747    NULL      -1      false     e
+oid     typname   typnamespace  typowner    typlen  typbyval  typtype
+100065  newtype1  2332901747    1546506610  -1      false     e
 
 query OTOOIBT colnames
 SELECT oid, typname, typnamespace, typowner, typlen, typbyval, typtype
@@ -1593,120 +1633,124 @@ SELECT objoid, classoid, objsubid, regexp_replace(description, e'\n.*', '') AS d
   FROM pg_catalog.pg_description
 ----
 objoid      classoid    objsubid  description
-4294967294  4294967223  0         backward inter-descriptor dependencies starting from tables accessible by current user in current database (KV scan)
-4294967292  4294967223  0         built-in functions (RAM/static)
-4294967291  4294967223  0         running queries visible by current user (cluster RPC; expensive!)
-4294967289  4294967223  0         running sessions visible to current user (cluster RPC; expensive!)
-4294967288  4294967223  0         cluster settings (RAM)
-4294967290  4294967223  0         running user transactions visible by the current user (cluster RPC; expensive!)
-4294967287  4294967223  0         CREATE and ALTER statements for all tables accessible by current user in current database (KV scan)
-4294967286  4294967223  0         CREATE statements for all user defined types accessible by the current user in current database (KV scan)
-4294967285  4294967223  0         databases accessible by the current user (KV scan)
-4294967284  4294967223  0         telemetry counters (RAM; local node only)
-4294967283  4294967223  0         forward inter-descriptor dependencies starting from tables accessible by current user in current database (KV scan)
-4294967281  4294967223  0         locally known gossiped health alerts (RAM; local node only)
-4294967280  4294967223  0         locally known gossiped node liveness (RAM; local node only)
-4294967279  4294967223  0         locally known edges in the gossip network (RAM; local node only)
-4294967282  4294967223  0         locally known gossiped node details (RAM; local node only)
-4294967278  4294967223  0         index columns for all indexes accessible by current user in current database (KV scan)
-4294967277  4294967223  0         decoded job metadata from system.jobs (KV scan)
-4294967276  4294967223  0         node details across the entire cluster (cluster RPC; expensive!)
-4294967275  4294967223  0         store details and status (cluster RPC; expensive!)
-4294967274  4294967223  0         acquired table leases (RAM; local node only)
-4294967293  4294967223  0         detailed identification strings (RAM, local node only)
-4294967270  4294967223  0         current values for metrics (RAM; local node only)
-4294967273  4294967223  0         running queries visible by current user (RAM; local node only)
-4294967265  4294967223  0         server parameters, useful to construct connection URLs (RAM, local node only)
-4294967271  4294967223  0         running sessions visible by current user (RAM; local node only)
-4294967261  4294967223  0         statement statistics (in-memory, not durable; local node only). This table is wiped periodically (by default, at least every two hours)
-4294967272  4294967223  0         running user transactions visible by the current user (RAM; local node only)
-4294967256  4294967223  0         per-application transaction statistics (in-memory, not durable; local node only). This table is wiped periodically (by default, at least every two hours)
-4294967269  4294967223  0         defined partitions for all tables/indexes accessible by the current user in the current database (KV scan)
-4294967268  4294967223  0         comments for predefined virtual tables (RAM/static)
-4294967267  4294967223  0         range metadata without leaseholder details (KV join; expensive!)
-4294967264  4294967223  0         ongoing schema changes, across all descriptors accessible by current user (KV scan; expensive!)
-4294967263  4294967223  0         session trace accumulated so far (RAM)
-4294967262  4294967223  0         session variables (RAM)
-4294967260  4294967223  0         details for all columns accessible by current user in current database (KV scan)
-4294967259  4294967223  0         indexes accessible by current user in current database (KV scan)
-4294967257  4294967223  0         the latest stats for all tables accessible by current user in current database (KV scan)
-4294967258  4294967223  0         table descriptors accessible by current user, including non-public and virtual (KV scan; expensive!)
-4294967255  4294967223  0         decoded zone configurations from system.zones (KV scan)
-4294967253  4294967223  0         roles for which the current user has admin option
-4294967252  4294967223  0         roles available to the current user
-4294967251  4294967223  0         check constraints
-4294967250  4294967223  0         column privilege grants (incomplete)
-4294967249  4294967223  0         table and view columns (incomplete)
-4294967248  4294967223  0         columns usage by constraints
-4294967247  4294967223  0         roles for the current user
-4294967246  4294967223  0         column usage by indexes and key constraints
-4294967245  4294967223  0         built-in function parameters (empty - introspection not yet supported)
-4294967244  4294967223  0         foreign key constraints
-4294967243  4294967223  0         privileges granted on table or views (incomplete; see also information_schema.table_privileges; may contain excess users or roles)
-4294967242  4294967223  0         built-in functions (empty - introspection not yet supported)
-4294967240  4294967223  0         schema privileges (incomplete; may contain excess users or roles)
-4294967241  4294967223  0         database schemas (may contain schemata without permission)
-4294967239  4294967223  0         sequences
-4294967238  4294967223  0         index metadata and statistics (incomplete)
-4294967237  4294967223  0         table constraints
-4294967236  4294967223  0         privileges granted on table or views (incomplete; may contain excess users or roles)
-4294967235  4294967223  0         tables and views
-4294967233  4294967223  0         grantable privileges (incomplete)
-4294967234  4294967223  0         views (incomplete)
-4294967231  4294967223  0         aggregated built-in functions (incomplete)
-4294967230  4294967223  0         index access methods (incomplete)
-4294967229  4294967223  0         column default values
-4294967228  4294967223  0         table columns (incomplete - see also information_schema.columns)
-4294967226  4294967223  0         role membership
-4294967227  4294967223  0         authorization identifiers - differs from postgres as we do not display passwords,
-4294967225  4294967223  0         available extensions
-4294967224  4294967223  0         casts (empty - needs filling out)
-4294967223  4294967223  0         tables and relation-like objects (incomplete - see also information_schema.tables/sequences/views)
-4294967222  4294967223  0         available collations (incomplete)
-4294967221  4294967223  0         table constraints (incomplete - see also information_schema.table_constraints)
-4294967220  4294967223  0         encoding conversions (empty - unimplemented)
-4294967219  4294967223  0         available databases (incomplete)
-4294967218  4294967223  0         default ACLs (empty - unimplemented)
-4294967217  4294967223  0         dependency relationships (incomplete)
-4294967216  4294967223  0         object comments
-4294967214  4294967223  0         enum types and labels (empty - feature does not exist)
-4294967213  4294967223  0         event triggers (empty - feature does not exist)
-4294967212  4294967223  0         installed extensions (empty - feature does not exist)
-4294967211  4294967223  0         foreign data wrappers (empty - feature does not exist)
-4294967210  4294967223  0         foreign servers (empty - feature does not exist)
-4294967209  4294967223  0         foreign tables (empty  - feature does not exist)
-4294967208  4294967223  0         indexes (incomplete)
-4294967207  4294967223  0         index creation statements
-4294967206  4294967223  0         table inheritance hierarchy (empty - feature does not exist)
-4294967205  4294967223  0         available languages (empty - feature does not exist)
-4294967204  4294967223  0         locks held by active processes (empty - feature does not exist)
-4294967203  4294967223  0         available materialized views (empty - feature does not exist)
-4294967202  4294967223  0         available namespaces (incomplete; namespaces and databases are congruent in CockroachDB)
-4294967201  4294967223  0         operators (incomplete)
-4294967200  4294967223  0         prepared statements
-4294967199  4294967223  0         prepared transactions (empty - feature does not exist)
-4294967198  4294967223  0         built-in functions (incomplete)
-4294967197  4294967223  0         range types (empty - feature does not exist)
-4294967196  4294967223  0         rewrite rules (empty - feature does not exist)
-4294967195  4294967223  0         database roles
-4294967182  4294967223  0         security labels (empty - feature does not exist)
-4294967194  4294967223  0         security labels (empty)
-4294967193  4294967223  0         sequences (see also information_schema.sequences)
-4294967192  4294967223  0         session variables (incomplete)
-4294967191  4294967223  0         shared dependencies (empty - not implemented)
-4294967215  4294967223  0         shared object comments
-4294967181  4294967223  0         shared security labels (empty - feature not supported)
-4294967183  4294967223  0         backend access statistics (empty - monitoring works differently in CockroachDB)
-4294967188  4294967223  0         tables summary (see also information_schema.tables, pg_catalog.pg_class)
-4294967187  4294967223  0         available tablespaces (incomplete; concept inapplicable to CockroachDB)
-4294967186  4294967223  0         triggers (empty - feature does not exist)
-4294967185  4294967223  0         scalar types (incomplete)
-4294967190  4294967223  0         database users
-4294967189  4294967223  0         local to remote user mapping (empty - feature does not exist)
-4294967184  4294967223  0         view definitions (incomplete - see also information_schema.views)
-4294967179  4294967223  0         Shows all defined geography columns. Matches PostGIS' geography_columns functionality.
-4294967178  4294967223  0         Shows all defined geometry columns. Matches PostGIS' geometry_columns functionality.
-4294967177  4294967223  0         Shows all defined Spatial Reference Identifiers (SRIDs). Matches PostGIS' spatial_ref_sys table.
+4294967294  4294967219  0         backward inter-descriptor dependencies starting from tables accessible by current user in current database (KV scan)
+4294967292  4294967219  0         built-in functions (RAM/static)
+4294967291  4294967219  0         running queries visible by current user (cluster RPC; expensive!)
+4294967289  4294967219  0         running sessions visible to current user (cluster RPC; expensive!)
+4294967288  4294967219  0         cluster settings (RAM)
+4294967290  4294967219  0         running user transactions visible by the current user (cluster RPC; expensive!)
+4294967287  4294967219  0         CREATE and ALTER statements for all tables accessible by current user in current database (KV scan)
+4294967286  4294967219  0         CREATE statements for all user defined types accessible by the current user in current database (KV scan)
+4294967285  4294967219  0         databases accessible by the current user (KV scan)
+4294967284  4294967219  0         telemetry counters (RAM; local node only)
+4294967283  4294967219  0         forward inter-descriptor dependencies starting from tables accessible by current user in current database (KV scan)
+4294967281  4294967219  0         locally known gossiped health alerts (RAM; local node only)
+4294967280  4294967219  0         locally known gossiped node liveness (RAM; local node only)
+4294967279  4294967219  0         locally known edges in the gossip network (RAM; local node only)
+4294967282  4294967219  0         locally known gossiped node details (RAM; local node only)
+4294967278  4294967219  0         index columns for all indexes accessible by current user in current database (KV scan)
+4294967253  4294967219  0         virtual table to validate descriptors
+4294967277  4294967219  0         decoded job metadata from system.jobs (KV scan)
+4294967276  4294967219  0         node details across the entire cluster (cluster RPC; expensive!)
+4294967275  4294967219  0         store details and status (cluster RPC; expensive!)
+4294967274  4294967219  0         acquired table leases (RAM; local node only)
+4294967293  4294967219  0         detailed identification strings (RAM, local node only)
+4294967270  4294967219  0         current values for metrics (RAM; local node only)
+4294967273  4294967219  0         running queries visible by current user (RAM; local node only)
+4294967265  4294967219  0         server parameters, useful to construct connection URLs (RAM, local node only)
+4294967271  4294967219  0         running sessions visible by current user (RAM; local node only)
+4294967261  4294967219  0         statement statistics (in-memory, not durable; local node only). This table is wiped periodically (by default, at least every two hours)
+4294967256  4294967219  0         finer-grained transaction statistics (in-memory, not durable; local node only). This table is wiped periodically (by default, at least every two hours)
+4294967272  4294967219  0         running user transactions visible by the current user (RAM; local node only)
+4294967255  4294967219  0         per-application transaction statistics (in-memory, not durable; local node only). This table is wiped periodically (by default, at least every two hours)
+4294967269  4294967219  0         defined partitions for all tables/indexes accessible by the current user in the current database (KV scan)
+4294967268  4294967219  0         comments for predefined virtual tables (RAM/static)
+4294967267  4294967219  0         range metadata without leaseholder details (KV join; expensive!)
+4294967264  4294967219  0         ongoing schema changes, across all descriptors accessible by current user (KV scan; expensive!)
+4294967263  4294967219  0         session trace accumulated so far (RAM)
+4294967262  4294967219  0         session variables (RAM)
+4294967260  4294967219  0         details for all columns accessible by current user in current database (KV scan)
+4294967259  4294967219  0         indexes accessible by current user in current database (KV scan)
+4294967257  4294967219  0         the latest stats for all tables accessible by current user in current database (KV scan)
+4294967258  4294967219  0         table descriptors accessible by current user, including non-public and virtual (KV scan; expensive!)
+4294967254  4294967219  0         decoded zone configurations from system.zones (KV scan)
+4294967251  4294967219  0         roles for which the current user has admin option
+4294967250  4294967219  0         roles available to the current user
+4294967249  4294967219  0         check constraints
+4294967248  4294967219  0         column privilege grants (incomplete)
+4294967246  4294967219  0         columns with user defined types
+4294967247  4294967219  0         table and view columns (incomplete)
+4294967245  4294967219  0         columns usage by constraints
+4294967244  4294967219  0         roles for the current user
+4294967243  4294967219  0         column usage by indexes and key constraints
+4294967242  4294967219  0         built-in function parameters (empty - introspection not yet supported)
+4294967241  4294967219  0         foreign key constraints
+4294967240  4294967219  0         privileges granted on table or views (incomplete; see also information_schema.table_privileges; may contain excess users or roles)
+4294967239  4294967219  0         built-in functions (empty - introspection not yet supported)
+4294967237  4294967219  0         schema privileges (incomplete; may contain excess users or roles)
+4294967238  4294967219  0         database schemas (may contain schemata without permission)
+4294967236  4294967219  0         sequences
+4294967235  4294967219  0         index metadata and statistics (incomplete)
+4294967234  4294967219  0         table constraints
+4294967233  4294967219  0         privileges granted on table or views (incomplete; may contain excess users or roles)
+4294967232  4294967219  0         tables and views
+4294967231  4294967219  0         type privileges (incomplete; may contain excess users or roles)
+4294967229  4294967219  0         grantable privileges (incomplete)
+4294967230  4294967219  0         views (incomplete)
+4294967227  4294967219  0         aggregated built-in functions (incomplete)
+4294967226  4294967219  0         index access methods (incomplete)
+4294967225  4294967219  0         column default values
+4294967224  4294967219  0         table columns (incomplete - see also information_schema.columns)
+4294967222  4294967219  0         role membership
+4294967223  4294967219  0         authorization identifiers - differs from postgres as we do not display passwords,
+4294967221  4294967219  0         available extensions
+4294967220  4294967219  0         casts (empty - needs filling out)
+4294967219  4294967219  0         tables and relation-like objects (incomplete - see also information_schema.tables/sequences/views)
+4294967218  4294967219  0         available collations (incomplete)
+4294967217  4294967219  0         table constraints (incomplete - see also information_schema.table_constraints)
+4294967216  4294967219  0         encoding conversions (empty - unimplemented)
+4294967215  4294967219  0         available databases (incomplete)
+4294967214  4294967219  0         default ACLs (empty - unimplemented)
+4294967213  4294967219  0         dependency relationships (incomplete)
+4294967212  4294967219  0         object comments
+4294967210  4294967219  0         enum types and labels (empty - feature does not exist)
+4294967209  4294967219  0         event triggers (empty - feature does not exist)
+4294967208  4294967219  0         installed extensions (empty - feature does not exist)
+4294967207  4294967219  0         foreign data wrappers (empty - feature does not exist)
+4294967206  4294967219  0         foreign servers (empty - feature does not exist)
+4294967205  4294967219  0         foreign tables (empty  - feature does not exist)
+4294967204  4294967219  0         indexes (incomplete)
+4294967203  4294967219  0         index creation statements
+4294967202  4294967219  0         table inheritance hierarchy (empty - feature does not exist)
+4294967201  4294967219  0         available languages (empty - feature does not exist)
+4294967200  4294967219  0         locks held by active processes (empty - feature does not exist)
+4294967199  4294967219  0         available materialized views (empty - feature does not exist)
+4294967198  4294967219  0         available namespaces (incomplete; namespaces and databases are congruent in CockroachDB)
+4294967197  4294967219  0         operators (incomplete)
+4294967196  4294967219  0         prepared statements
+4294967195  4294967219  0         prepared transactions (empty - feature does not exist)
+4294967194  4294967219  0         built-in functions (incomplete)
+4294967193  4294967219  0         range types (empty - feature does not exist)
+4294967192  4294967219  0         rewrite rules (empty - feature does not exist)
+4294967191  4294967219  0         database roles
+4294967178  4294967219  0         security labels (empty - feature does not exist)
+4294967190  4294967219  0         security labels (empty)
+4294967189  4294967219  0         sequences (see also information_schema.sequences)
+4294967188  4294967219  0         session variables (incomplete)
+4294967187  4294967219  0         shared dependencies (empty - not implemented)
+4294967211  4294967219  0         shared object comments
+4294967177  4294967219  0         shared security labels (empty - feature not supported)
+4294967179  4294967219  0         backend access statistics (empty - monitoring works differently in CockroachDB)
+4294967184  4294967219  0         tables summary (see also information_schema.tables, pg_catalog.pg_class)
+4294967183  4294967219  0         available tablespaces (incomplete; concept inapplicable to CockroachDB)
+4294967182  4294967219  0         triggers (empty - feature does not exist)
+4294967181  4294967219  0         scalar types (incomplete)
+4294967186  4294967219  0         database users
+4294967185  4294967219  0         local to remote user mapping (empty - feature does not exist)
+4294967180  4294967219  0         view definitions (incomplete - see also information_schema.views)
+4294967175  4294967219  0         Shows all defined geography columns. Matches PostGIS' geography_columns functionality.
+4294967174  4294967219  0         Shows all defined geometry columns. Matches PostGIS' geometry_columns functionality.
+4294967173  4294967219  0         Shows all defined Spatial Reference Identifiers (SRIDs). Matches PostGIS' spatial_ref_sys table.
 
 ## pg_catalog.pg_shdescription
 
@@ -1788,19 +1832,16 @@ default_transaction_isolation                  serializable        NULL      NUL
 default_transaction_priority                   normal              NULL      NULL        NULL        string
 default_transaction_read_only                  off                 NULL      NULL        NULL        string
 disable_partially_distributed_plans            off                 NULL      NULL        NULL        string
+disallow_full_table_scans                      off                 NULL      NULL        NULL        string
 distsql                                        off                 NULL      NULL        NULL        string
 enable_experimental_alter_column_type_general  off                 NULL      NULL        NULL        string
 enable_implicit_select_for_update              on                  NULL      NULL        NULL        string
 enable_insert_fast_path                        on                  NULL      NULL        NULL        string
-enable_interleaved_joins                       on                  NULL      NULL        NULL        string
 enable_seqscan                                 on                  NULL      NULL        NULL        string
 enable_zigzag_join                             on                  NULL      NULL        NULL        string
 experimental_distsql_planning                  off                 NULL      NULL        NULL        string
-experimental_enable_enums                      on                  NULL      NULL        NULL        string
 experimental_enable_hash_sharded_indexes       off                 NULL      NULL        NULL        string
 experimental_enable_temp_tables                off                 NULL      NULL        NULL        string
-experimental_enable_user_defined_schemas       off                 NULL      NULL        NULL        string
-experimental_partial_indexes                   off                 NULL      NULL        NULL        string
 extra_float_digits                             0                   NULL      NULL        NULL        string
 force_savepoint_restart                        off                 NULL      NULL        NULL        string
 foreign_key_cascades_limit                     10000               NULL      NULL        NULL        string
@@ -1815,11 +1856,12 @@ max_index_keys                                 32                  NULL      NUL
 node_id                                        1                   NULL      NULL        NULL        string
 optimizer_use_histograms                       on                  NULL      NULL        NULL        string
 optimizer_use_multicol_stats                   on                  NULL      NULL        NULL        string
+prefer_lookup_joins_for_fks                    off                 NULL      NULL        NULL        string
 reorder_joins_limit                            8                   NULL      NULL        NULL        string
 require_explicit_primary_keys                  off                 NULL      NULL        NULL        string
 results_buffer_size                            16384               NULL      NULL        NULL        string
 row_security                                   off                 NULL      NULL        NULL        string
-search_path                                    public              NULL      NULL        NULL        string
+search_path                                    $user,public        NULL      NULL        NULL        string
 serial_normalization                           rowid               NULL      NULL        NULL        string
 server_encoding                                UTF8                NULL      NULL        NULL        string
 server_version                                 9.5.0               NULL      NULL        NULL        string
@@ -1830,6 +1872,7 @@ standard_conforming_strings                    on                  NULL      NUL
 statement_timeout                              0                   NULL      NULL        NULL        string
 synchronize_seqscans                           on                  NULL      NULL        NULL        string
 synchronous_commit                             on                  NULL      NULL        NULL        string
+testing_vectorize_inject_panics                off                 NULL      NULL        NULL        string
 timezone                                       UTC                 NULL      NULL        NULL        string
 tracing                                        off                 NULL      NULL        NULL        string
 transaction_isolation                          serializable        NULL      NULL        NULL        string
@@ -1860,19 +1903,16 @@ default_transaction_isolation                  serializable        NULL  user   
 default_transaction_priority                   normal              NULL  user     NULL      normal              normal
 default_transaction_read_only                  off                 NULL  user     NULL      off                 off
 disable_partially_distributed_plans            off                 NULL  user     NULL      off                 off
+disallow_full_table_scans                      off                 NULL  user     NULL      off                 off
 distsql                                        off                 NULL  user     NULL      off                 off
 enable_experimental_alter_column_type_general  off                 NULL  user     NULL      off                 off
 enable_implicit_select_for_update              on                  NULL  user     NULL      on                  on
 enable_insert_fast_path                        on                  NULL  user     NULL      on                  on
-enable_interleaved_joins                       on                  NULL  user     NULL      on                  on
 enable_seqscan                                 on                  NULL  user     NULL      on                  on
 enable_zigzag_join                             on                  NULL  user     NULL      on                  on
 experimental_distsql_planning                  off                 NULL  user     NULL      off                 off
-experimental_enable_enums                      on                  NULL  user     NULL      off                 off
 experimental_enable_hash_sharded_indexes       off                 NULL  user     NULL      off                 off
 experimental_enable_temp_tables                off                 NULL  user     NULL      off                 off
-experimental_enable_user_defined_schemas       off                 NULL  user     NULL      off                 off
-experimental_partial_indexes                   off                 NULL  user     NULL      off                 off
 extra_float_digits                             0                   NULL  user     NULL      0                   2
 force_savepoint_restart                        off                 NULL  user     NULL      off                 off
 foreign_key_cascades_limit                     10000               NULL  user     NULL      10000               10000
@@ -1887,11 +1927,12 @@ max_index_keys                                 32                  NULL  user   
 node_id                                        1                   NULL  user     NULL      1                   1
 optimizer_use_histograms                       on                  NULL  user     NULL      on                  on
 optimizer_use_multicol_stats                   on                  NULL  user     NULL      on                  on
+prefer_lookup_joins_for_fks                    off                 NULL  user     NULL      off                 off
 reorder_joins_limit                            8                   NULL  user     NULL      8                   8
 require_explicit_primary_keys                  off                 NULL  user     NULL      off                 off
 results_buffer_size                            16384               NULL  user     NULL      16384               16384
 row_security                                   off                 NULL  user     NULL      off                 off
-search_path                                    public              NULL  user     NULL      public              public
+search_path                                    $user,public        NULL  user     NULL      $user,public        $user,public
 serial_normalization                           rowid               NULL  user     NULL      rowid               rowid
 server_encoding                                UTF8                NULL  user     NULL      UTF8                UTF8
 server_version                                 9.5.0               NULL  user     NULL      9.5.0               9.5.0
@@ -1902,6 +1943,7 @@ standard_conforming_strings                    on                  NULL  user   
 statement_timeout                              0                   NULL  user     NULL      0                   0
 synchronize_seqscans                           on                  NULL  user     NULL      on                  on
 synchronous_commit                             on                  NULL  user     NULL      on                  on
+testing_vectorize_inject_panics                off                 NULL  user     NULL      off                 off
 timezone                                       UTC                 NULL  user     NULL      UTC                 UTC
 tracing                                        off                 NULL  user     NULL      off                 off
 transaction_isolation                          serializable        NULL  user     NULL      serializable        serializable
@@ -1928,19 +1970,16 @@ default_transaction_isolation                  NULL    NULL     NULL     NULL   
 default_transaction_priority                   NULL    NULL     NULL     NULL        NULL
 default_transaction_read_only                  NULL    NULL     NULL     NULL        NULL
 disable_partially_distributed_plans            NULL    NULL     NULL     NULL        NULL
+disallow_full_table_scans                      NULL    NULL     NULL     NULL        NULL
 distsql                                        NULL    NULL     NULL     NULL        NULL
 enable_experimental_alter_column_type_general  NULL    NULL     NULL     NULL        NULL
 enable_implicit_select_for_update              NULL    NULL     NULL     NULL        NULL
 enable_insert_fast_path                        NULL    NULL     NULL     NULL        NULL
-enable_interleaved_joins                       NULL    NULL     NULL     NULL        NULL
 enable_seqscan                                 NULL    NULL     NULL     NULL        NULL
 enable_zigzag_join                             NULL    NULL     NULL     NULL        NULL
 experimental_distsql_planning                  NULL    NULL     NULL     NULL        NULL
-experimental_enable_enums                      NULL    NULL     NULL     NULL        NULL
 experimental_enable_hash_sharded_indexes       NULL    NULL     NULL     NULL        NULL
 experimental_enable_temp_tables                NULL    NULL     NULL     NULL        NULL
-experimental_enable_user_defined_schemas       NULL    NULL     NULL     NULL        NULL
-experimental_partial_indexes                   NULL    NULL     NULL     NULL        NULL
 extra_float_digits                             NULL    NULL     NULL     NULL        NULL
 force_savepoint_restart                        NULL    NULL     NULL     NULL        NULL
 foreign_key_cascades_limit                     NULL    NULL     NULL     NULL        NULL
@@ -1956,6 +1995,7 @@ node_id                                        NULL    NULL     NULL     NULL   
 optimizer                                      NULL    NULL     NULL     NULL        NULL
 optimizer_use_histograms                       NULL    NULL     NULL     NULL        NULL
 optimizer_use_multicol_stats                   NULL    NULL     NULL     NULL        NULL
+prefer_lookup_joins_for_fks                    NULL    NULL     NULL     NULL        NULL
 reorder_joins_limit                            NULL    NULL     NULL     NULL        NULL
 require_explicit_primary_keys                  NULL    NULL     NULL     NULL        NULL
 results_buffer_size                            NULL    NULL     NULL     NULL        NULL
@@ -1972,6 +2012,7 @@ standard_conforming_strings                    NULL    NULL     NULL     NULL   
 statement_timeout                              NULL    NULL     NULL     NULL        NULL
 synchronize_seqscans                           NULL    NULL     NULL     NULL        NULL
 synchronous_commit                             NULL    NULL     NULL     NULL        NULL
+testing_vectorize_inject_panics                NULL    NULL     NULL     NULL        NULL
 timezone                                       NULL    NULL     NULL     NULL        NULL
 tracing                                        NULL    NULL     NULL     NULL        NULL
 transaction_isolation                          NULL    NULL     NULL     NULL        NULL
@@ -2000,8 +2041,8 @@ query OOIIIIIB colnames
 SELECT * FROM pg_catalog.pg_sequence
 ----
 seqrelid  seqtypid  seqstart  seqincrement  seqmax               seqmin  seqcache  seqcycle
-69        20        1         1             9223372036854775807  1       1         false
-70        20        6         2             10                   5       1         false
+70        20        1         1             9223372036854775807  1       1         false
+71        20        6         2             10                   5       1         false
 
 statement ok
 DROP DATABASE seq
@@ -2044,10 +2085,11 @@ JOIN pg_catalog.pg_class c ON def.adrelid = c.oid
 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-1666782879  t1  12
-841178406   t2  unique_rowid()
-2186255414  t3  'FOO'::STRING
-2186255409  t3  unique_rowid()
+1666782879  t1   12
+841178406   t2   unique_rowid()
+2186255414  t3   'FOO'::STRING
+2186255409  t3   unique_rowid()
+581442133   mv1  unique_rowid()
 
 # Verify that a set database shows tables from that database for a non-root
 # user, when that user has permissions.
@@ -2456,7 +2498,7 @@ CREATE INDEX regression_46450_idx ON regression_46450 USING gin(json)
 query TTTTTT
 select * from pg_indexes where indexname = 'regression_46450_idx'
 ----
-1702785641  public  regression_46450  regression_46450_idx  NULL  CREATE INDEX regression_46450_idx ON test.public.regression_46450 USING gin (json ASC)
+357708632  public  regression_46450  regression_46450_idx  NULL  CREATE INDEX regression_46450_idx ON test.public.regression_46450 USING gin (json ASC)
 
 # Make sure that selecting from vtables with indexes in other dbs properly
 # hides descriptors that should be hidden.
@@ -2500,24 +2542,63 @@ primary    CREATE UNIQUE INDEX "primary" ON test.public.geospatial_table USING b
 idxa       CREATE INDEX idxa ON test.public.geospatial_table USING gin (a ASC)
 idxb       CREATE INDEX idxb ON test.public.geospatial_table USING gin (b ASC)
 
+subtest partial_index
+
+statement ok
+SET DATABASE = test
+
+statement ok
+CREATE TYPE testenum AS ENUM ('foo', 'bar', 'baz')
+
+statement ok
+CREATE TABLE partial_index_table (
+  a INT,
+  b testenum,
+  UNIQUE INDEX (a) WHERE a > 0
+)
+
+statement ok
+CREATE UNIQUE INDEX ON partial_index_table (a) WHERE b IN ('foo', 'bar')
+
+query TT colnames
+SELECT indexname, indexdef
+FROM pg_catalog.pg_indexes
+WHERE tablename = 'partial_index_table'
+----
+indexname                   indexdef
+primary                     CREATE UNIQUE INDEX "primary" ON test.public.partial_index_table USING btree (rowid ASC)
+partial_index_table_a_key   CREATE UNIQUE INDEX partial_index_table_a_key ON test.public.partial_index_table USING btree (a ASC) WHERE (a > 0)
+partial_index_table_a_key1  CREATE UNIQUE INDEX partial_index_table_a_key1 ON test.public.partial_index_table USING btree (a ASC) WHERE (b IN ('foo'::public.testenum, 'bar'::public.testenum))
+
+query TT colnames
+SELECT conname, condef
+FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class t
+ON c.conrelid = t.oid
+WHERE t.relname = 'partial_index_table'
+ORDER BY conname
+----
+conname                     condef
+partial_index_table_a_key   UNIQUE (a ASC) WHERE (a > 0)
+partial_index_table_a_key1  UNIQUE (a ASC) WHERE (b IN ('foo'::public.testenum, 'bar'::public.testenum))
+
 subtest regression_46799
 statement ok
-CREATE TABLE t(x INT DEFAULT 1, y INT DEFAULT 1);
+CREATE TABLE t46799 (x INT DEFAULT 1, y INT DEFAULT 1);
 
 query I
-SELECT adnum FROM pg_attrdef WHERE adrelid = 90
+SELECT adnum FROM pg_attrdef WHERE adrelid = 't46799'::REGCLASS
 ----
 1
 2
 3
 
 statement ok
-ALTER TABLE t DROP COLUMN y;
-ALTER TABLE t ADD COLUMN y INT DEFAULT 1;
+ALTER TABLE t46799 DROP COLUMN y;
+ALTER TABLE t46799 ADD COLUMN y INT DEFAULT 1;
 
 # Make sure after adding and dropping the same column, the adnum for the re-added column increases.
 query I
-select adnum from pg_attrdef WHERE adrelid = 90
+select adnum from pg_attrdef WHERE adrelid = 't46799'::REGCLASS
 ----
 1
 3
@@ -2530,13 +2611,13 @@ CREATE TABLE jt (a INT PRIMARY KEY); INSERT INTO jt VALUES(1); INSERT INTO jt VA
 query ITT
 SELECT a, oid, relname FROM jt INNER LOOKUP JOIN pg_class ON a::oid=oid
 ----
-91  91  jt
+95  95  jt
 
 query ITT
 SELECT a, oid, relname FROM jt LEFT OUTER LOOKUP JOIN pg_class ON a::oid=oid
 ----
 1   NULL  NULL
-91  91    jt
+95  95    jt
 
 subtest regression_49207
 statement ok
@@ -2665,3 +2746,23 @@ WHERE
   AND attname = 'x'
 ----
 'howdy'::STRING
+
+# Regression test for limits on virtual index scans. (#53522)
+
+let $testid
+SELECT 't47285'::REGCLASS::OID
+
+query T
+SELECT attname FROM pg_attribute WHERE attrelid = $testid LIMIT 1
+----
+x
+
+# Regression test for #53854.
+statement ok
+SELECT
+  t.typname, t.oid
+FROM
+  pg_catalog.pg_type AS t JOIN pg_catalog.pg_namespace AS n ON t.typnamespace = n.oid
+WHERE
+  n.nspname != 'pg_toast'
+  AND (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class AS c WHERE c.oid = t.typrelid))

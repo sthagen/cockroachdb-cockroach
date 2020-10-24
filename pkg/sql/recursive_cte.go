@@ -13,10 +13,10 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // recursiveCTENode implements the logic for a recursive CTE:
@@ -54,8 +54,7 @@ type recursiveCTERun struct {
 func (n *recursiveCTENode) startExec(params runParams) error {
 	n.workingRows = rowcontainer.NewRowContainer(
 		params.EvalContext().Mon.MakeBoundAccount(),
-		sqlbase.ColTypeInfoFromResCols(getPlanColumns(n.initial, false /* mut */)),
-		0, /* rowCapacity */
+		colinfo.ColTypeInfoFromResCols(getPlanColumns(n.initial, false /* mut */)),
 	)
 	n.nextRowIdx = 0
 	return nil
@@ -104,8 +103,7 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 
 	n.workingRows = rowcontainer.NewRowContainer(
 		params.EvalContext().Mon.MakeBoundAccount(),
-		sqlbase.ColTypeInfoFromResCols(getPlanColumns(n.initial, false /* mut */)),
-		0, /* rowCapacity */
+		colinfo.ColTypeInfoFromResCols(getPlanColumns(n.initial, false /* mut */)),
 	)
 
 	// Set up a bufferNode that can be used as a reference for a scanBufferNode.
@@ -116,12 +114,12 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 		bufferedRows: lastWorkingRows,
 		label:        n.label,
 	}
-	newPlan, err := n.genIterationFn(buf)
+	newPlan, err := n.genIterationFn(newExecFactory(params.p), buf)
 	if err != nil {
 		return false, err
 	}
 
-	if err := runPlanInsidePlan(params, newPlan.(*planTop), n.workingRows); err != nil {
+	if err := runPlanInsidePlan(params, newPlan.(*planComponents), n.workingRows); err != nil {
 		return false, err
 	}
 	n.nextRowIdx = 1

@@ -9,7 +9,7 @@ define Scan {
 
 define Values {
     Rows [][]tree.TypedExpr
-    Columns sqlbase.ResultColumns
+    Columns colinfo.ResultColumns
 }
 
 # Filter applies a filter on the results of the given input node.
@@ -24,6 +24,8 @@ define Filter {
 define InvertedFilter {
     Input exec.Node
     InvFilter *invertedexpr.SpanExpression
+    PreFiltererExpr tree.TypedExpr
+    PreFiltererType *types.T
     InvColumn exec.NodeColumnOrdinal
 }
 
@@ -58,7 +60,7 @@ define SerializingProject {
 # modified.
 define Render {
     Input exec.Node
-    Columns sqlbase.ResultColumns
+    Columns colinfo.ResultColumns
     Exprs tree.TypedExprs
     ReqOrdering exec.OutputOrdering
 }
@@ -77,7 +79,7 @@ define Render {
 define ApplyJoin {
     JoinType descpb.JoinType
     Left exec.Node
-    RightColumns sqlbase.ResultColumns
+    RightColumns colinfo.ResultColumns
     OnCond tree.TypedExpr
     PlanRightSideFn exec.ApplyJoinPlanRightSideFn
 }
@@ -111,39 +113,11 @@ define MergeJoin {
     Left exec.Node
     Right exec.Node
     OnCond tree.TypedExpr
-    LeftOrdering sqlbase.ColumnOrdering
-    RightOrdering sqlbase.ColumnOrdering
+    LeftOrdering colinfo.ColumnOrdering
+    RightOrdering colinfo.ColumnOrdering
     ReqOrdering exec.OutputOrdering
     LeftEqColsAreKey bool
     RightEqColsAreKey bool
-}
-
-# InterleavedJoin runs a join between two interleaved tables. One table is the
-# ancestor of the other in the interleaving hierarchy (as per leftIsAncestor).
-#
-# Semantically, the join is identical to a merge-join between these two
-# tables, where the equality columns are all the index column of the ancestor
-# index.
-#
-# The two scans are guaranteed to have the same direction, and to not have
-# any hard limits.
-#
-# Since the interleaved joiner does a single scan for both tables, only the
-# Locking clause for the ancestor is used.
-#
-define InterleavedJoin {
-    JoinType descpb.JoinType
-    LeftTable cat.Table
-    LeftIndex cat.Index
-    LeftParams exec.ScanParams
-    LeftFilter tree.TypedExpr
-    RightTable cat.Table
-    RightIndex cat.Index
-    RightParams exec.ScanParams
-    RightFilter tree.TypedExpr
-    LeftIsAncestor bool
-    OnCond tree.TypedExpr
-    ReqOrdering exec.OutputOrdering
 }
 
 # GroupBy runs an aggregation. A set of aggregations is performed for each group
@@ -158,7 +132,7 @@ define GroupBy {
     # If set, the input is guaranteed to have this ordering and a "streaming"
     # aggregation is performed (i.e. aggregation happens separately for each
     # distinct set of values on the set of columns in the ordering).
-    GroupColOrdering sqlbase.ColumnOrdering
+    GroupColOrdering colinfo.ColumnOrdering
     Aggregations []exec.AggInfo
     ReqOrdering exec.OutputOrdering
 }
@@ -243,7 +217,9 @@ define LookupJoin {
     EqColsAreKey bool
     LookupCols exec.TableColumnOrdinalSet
     OnCond tree.TypedExpr
+    IsSecondJoinInPairedJoiner bool
     ReqOrdering exec.OutputOrdering
+    Locking *tree.LockingItem
 }
 
 # InvertedJoin performs a lookup join into an inverted index.
@@ -263,6 +239,7 @@ define InvertedJoin {
     Index cat.Index
     LookupCols exec.TableColumnOrdinalSet
     OnCond tree.TypedExpr
+    IsFirstJoinInPairedJoiner bool
     ReqOrdering exec.OutputOrdering
 }
 
@@ -329,7 +306,7 @@ define Max1Row {
 define ProjectSet {
     Input exec.Node
     Exprs tree.TypedExprs
-    ZipCols sqlbase.ResultColumns
+    ZipCols colinfo.ResultColumns
     NumColsPerGen []int
 }
 
@@ -378,6 +355,7 @@ define ShowTrace {
 define Insert {
     Input exec.Node
     Table cat.Table
+    Arbiters cat.IndexOrdinals
     InsertCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
     CheckCols exec.CheckOrdinalSet
@@ -391,7 +369,7 @@ define Insert {
 
 # InsertFastPath implements a special (but very common) case of insert,
 # satisfying the following conditions:
-#  - the input is Values with at most InsertFastPathMaxRows, and there are no
+#  - the input is Values with at most mutations.MaxBatchSize, and there are no
 #    subqueries;
 #  - there are no other mutations in the statement, and the output of the
 #    insert is not processed through side-effecting expressions.
@@ -442,7 +420,7 @@ define Update {
     UpdateCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
     Checks exec.CheckOrdinalSet
-    Passthrough sqlbase.ResultColumns
+    Passthrough colinfo.ResultColumns
 
     # If set, the operator will commit the transaction as part of its execution.
     AutoCommit bool
@@ -475,6 +453,7 @@ define Update {
 define Upsert {
     Input exec.Node
     Table cat.Table
+    Arbiters cat.IndexOrdinals
     CanaryCol exec.NodeColumnOrdinal
     InsertCols exec.TableColumnOrdinalSet
     FetchCols exec.TableColumnOrdinalSet
@@ -561,7 +540,7 @@ define CreateView {
     Persistence tree.Persistence
     Materialized bool
     ViewQuery string
-    Columns sqlbase.ResultColumns
+    Columns colinfo.ResultColumns
     deps opt.ViewDeps
 }
 

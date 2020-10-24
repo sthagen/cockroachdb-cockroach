@@ -1171,14 +1171,14 @@ select
  ├── columns: k:1 str:2
  ├── immutable
  ├── stats: [rows=333.333333]
- ├── cost: 1050.04
+ ├── cost: 1054.04
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── prune: (2)
  ├── scan t2
  │    ├── columns: k:1 str:2
  │    ├── stats: [rows=1000]
- │    ├── cost: 1040.02
+ │    ├── cost: 1044.02
  │    ├── key: (1)
  │    ├── fd: (1)-->(2)
  │    └── prune: (1,2)
@@ -1348,7 +1348,6 @@ DROP TABLE t3
 
 # Ensure that changes to used types in tables invalidate prepared statements.
 statement ok
-SET experimental_enable_enums = true;
 CREATE TYPE greeting AS ENUM ('hello', 'hi');
 CREATE TABLE greeting_table (x greeting NOT NULL, y INT, INDEX (x, y))
 

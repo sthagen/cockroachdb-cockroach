@@ -29,9 +29,9 @@ func (f FmtFlags) HasFlags(subset FmtFlags) bool {
 	return f&subset == subset
 }
 
-// SetFlags sets the given formatting flags.
-func (f *FmtFlags) SetFlags(subset FmtFlags) {
-	*f |= subset
+// HasAnyFlags tests whether any of the given flags are all set.
+func (f FmtFlags) HasAnyFlags(subset FmtFlags) bool {
+	return f&subset != 0
 }
 
 // EncodeFlags returns the subset of the flags that are also lex encode flags.
@@ -117,15 +117,13 @@ const (
 	// the numeric by enclosing them within parentheses.
 	FmtParsableNumerics
 
-	// FmtPGAttrdefAdbin is used to produce expressions formatted in a way that's
-	// as close as possible to what clients expect to live in the pg_attrdef.adbin
-	// column. Specifically, this strips type annotations, since Postgres doesn't
-	// know what those are.
-	FmtPGAttrdefAdbin
-
-	// FmtPGIndexDef is used to produce CREATE INDEX statements that are
-	// compatible with pg_get_indexdef.
-	FmtPGIndexDef
+	// FmtPGCatalog is used to produce expressions formatted in a way that's as
+	// close as possible to what clients expect to live in pg_catalog (e.g.
+	// pg_attrdef.adbin, pg_constraint.condef and pg_indexes.indexdef columns).
+	// Specifically, this strips type annotations (Postgres doesn't know what
+	// those are), adds cast expressions for non-numeric constants, and formats
+	// indexes in Postgres-specific syntax.
+	FmtPGCatalog
 
 	// If set, user defined types and datums of user defined types will be
 	// formatted in a way that is stable across changes to the underlying type.
@@ -299,21 +297,6 @@ func (ctx *FmtCtx) Printf(f string, args ...interface{}) {
 	fmt.Fprintf(&ctx.Buffer, f, args...)
 }
 
-// FmtExpr returns FmtFlags that indicate how the pretty-printer
-// should format expressions.
-func FmtExpr(base FmtFlags, showTypes bool, symbolicVars bool, showTableAliases bool) FmtFlags {
-	if showTypes {
-		base |= FmtShowTypes
-	}
-	if symbolicVars {
-		base |= fmtSymbolicVars
-	}
-	if showTableAliases {
-		base |= FmtShowTableAliases
-	}
-	return base
-}
-
 // SetIndexedVarFormat modifies FmtCtx to customize the printing of
 // IndexedVars using the provided function.
 func (ctx *FmtCtx) SetIndexedVarFormat(fn func(ctx *FmtCtx, idx int)) {
@@ -324,15 +307,6 @@ func (ctx *FmtCtx) SetIndexedVarFormat(fn func(ctx *FmtCtx, idx int)) {
 // StarDatums using the provided function.
 func (ctx *FmtCtx) SetPlaceholderFormat(placeholderFn func(_ *FmtCtx, _ *Placeholder)) {
 	ctx.placeholderFormat = placeholderFn
-}
-
-// WithPlaceholderFormat changes the placeholder formatting function, calls the
-// given function, then restores the placeholder function.
-func (ctx *FmtCtx) WithPlaceholderFormat(placeholderFn func(_ *FmtCtx, _ *Placeholder), fn func()) {
-	old := ctx.placeholderFormat
-	ctx.placeholderFormat = placeholderFn
-	defer func() { ctx.placeholderFormat = old }()
-	fn()
 }
 
 // SetIndexedTypeFormat modifies FmtCtx to customize the printing of
@@ -394,7 +368,7 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 			ctx.WriteByte(')')
 		}
 	}
-	if f.HasFlags(fmtDisambiguateDatumTypes) {
+	if f.HasAnyFlags(fmtDisambiguateDatumTypes | FmtPGCatalog) {
 		var typ *types.T
 		if d, isDatum := n.(Datum); isDatum {
 			if p, isPlaceholder := d.(*Placeholder); isPlaceholder {
@@ -405,8 +379,13 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 			}
 		}
 		if typ != nil {
-			ctx.WriteString(":::")
-			ctx.FormatTypeReference(typ)
+			if f.HasFlags(fmtDisambiguateDatumTypes) {
+				ctx.WriteString(":::")
+				ctx.FormatTypeReference(typ)
+			} else if f.HasFlags(FmtPGCatalog) && !typ.IsNumeric() {
+				ctx.WriteString("::")
+				ctx.FormatTypeReference(typ)
+			}
 		}
 	}
 }

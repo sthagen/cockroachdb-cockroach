@@ -17,7 +17,9 @@ import (
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 )
 
@@ -27,9 +29,59 @@ import (
 // SpanExpressionProto.SpansToRead to determine which spans to read from the
 // inverted index. Then it computes a set expression on the scanned rows as
 // defined by the SpanExpressionProto.Node.
+// For a subset of expressions, it can additionally perform pre-filtering,
+// which is filtering a row before evaluating the set expression (but after
+// the row is retrieved). This pre-filtering looks at additional state encoded
+// in the inverted column.
 type DatumsToInvertedExpr interface {
-	// Convert uses the lookup column to construct an inverted expression.
-	Convert(context.Context, sqlbase.EncDatumRow) (*SpanExpressionProto, error)
+	// CanPreFilter returns true iff this DatumsToInvertedExpr can pre-filter.
+	CanPreFilter() bool
+
+	// Convert uses the lookup column to construct an inverted expression. When
+	// CanPreFilter() is true, and the returned *SpanExpressionProto is non-nil,
+	// the interface{} returned represents an opaque pre-filtering state for
+	// this lookup column.
+	Convert(context.Context, rowenc.EncDatumRow) (*SpanExpressionProto, interface{}, error)
+
+	// PreFilter is used for pre-filtering a looked up row whose inverted column is
+	// represented as enc. The caller has determined the candidate
+	// expressions for whom this row is relevant, and preFilters contains the
+	// pre-filtering state for those expressions. The result slice must be the
+	// same length as preFilters and will contain true when the row is relevant
+	// and false otherwise. It returns true iff there is at least one result
+	// index that has a true value. PreFilter must only be called when CanPreFilter()
+	// is true. This batching of pre-filter application for a looked up row allows
+	// enc to be decoded once.
+	//
+	// For example, when doing an invertedJoin for a geospatial column, say the
+	// left side has a batch of 5 rows. Each of these 5 rows will be used in
+	// Convert calls above, which will each return an interface{}. The 5
+	// interface{} objects contain state for each of these 5 rows that will be
+	// used in pre-filtering. Specifically, for geospatial, this state includes
+	// the bounding box of the shape. When an inverted index row is looked up
+	// and is known to be relevant to left rows 0, 2, 4 (based on the spans in
+	// the SpanExpressionProtos), then PreFilter will be called with
+	// len(preFilters) == 3, containing the three interface{} objects returned
+	// previously for 0, 2, 4. The results will indicate which span expressions
+	// should actually use this inverted index row. More concretely, the span
+	// expressions for ST_Intersects work on cell coverings which are different
+	// from the bounding box, and the pre-filtering works on the bounding box.
+	// The bounding box pre-filtering complements the span expressions, by
+	// eliminating some false positives caused by cell coverings.
+	PreFilter(enc EncInvertedVal, preFilters []interface{}, result []bool) (bool, error)
+}
+
+// PreFiltererStateForInvertedFilterer captures state that needs to be passed
+// around in the optimizer for later construction of the
+// InvertedFiltererSpec.PreFiltererSpec.
+type PreFiltererStateForInvertedFilterer struct {
+	// Typ is the type of the original column that is indexed in the inverted
+	// index.
+	Typ *types.T
+	// Expr is an expression with a single variable.
+	Expr opt.ScalarExpr
+	// Col is the column id of the single variable in the expression.
+	Col opt.ColumnID
 }
 
 // EncInvertedVal is the encoded form of a value in the inverted column.
@@ -178,6 +230,20 @@ func formatSpan(span InvertedSpan) string {
 		strconv.Quote(string(end)), spanEndOpenOrClosed)
 }
 
+// Len implements sort.Interface.
+func (is InvertedSpans) Len() int { return len(is) }
+
+// Less implements sort.Interface, when InvertedSpans is known to contain
+// non-overlapping spans.
+func (is InvertedSpans) Less(i, j int) bool {
+	return bytes.Compare(is[i].Start, is[j].Start) < 0
+}
+
+// Swap implements the sort.Interface.
+func (is InvertedSpans) Swap(i, j int) {
+	is[i], is[j] = is[j], is[i]
+}
+
 // InvertedExpression is the interface representing an expression or sub-expression
 // to be evaluated on the inverted index. Any implementation can be used in the
 // builder functions And() and Or(), but in practice there are two useful
@@ -270,6 +336,8 @@ type InvertedExpression interface {
 	IsTight() bool
 	// SetNotTight sets tight to false.
 	SetNotTight()
+	// Copy makes a copy of the inverted expression.
+	Copy() InvertedExpression
 }
 
 // SpanExpression is an implementation of InvertedExpression.
@@ -332,6 +400,29 @@ func (s *SpanExpression) SetNotTight() {
 	s.Tight = false
 }
 
+// Copy implements the InvertedExpression interface.
+//
+// Copy makes a copy of the SpanExpression and returns it. Copy recurses into
+// the children and makes copies of them as well, so the new struct is
+// independent from the old. It does *not* perform a deep copy of the
+// SpansToRead or FactoredUnionSpans slices, however, because those slices are
+// never modified in place and therefore are safe to reuse.
+func (s *SpanExpression) Copy() InvertedExpression {
+	res := &SpanExpression{
+		Tight:              s.Tight,
+		SpansToRead:        s.SpansToRead,
+		FactoredUnionSpans: s.FactoredUnionSpans,
+		Operator:           s.Operator,
+	}
+	if s.Left != nil {
+		res.Left = s.Left.Copy()
+	}
+	if s.Right != nil {
+		res.Right = s.Right.Copy()
+	}
+	return res
+}
+
 func (s *SpanExpression) String() string {
 	tp := treeprinter.New()
 	n := tp.Child("span expression")
@@ -383,12 +474,12 @@ func (s *SpanExpression) ToProto() *SpanExpressionProto {
 }
 
 func getProtoSpans(spans []InvertedSpan) []SpanExpressionProto_Span {
-	out := make([]SpanExpressionProto_Span, 0, len(spans))
+	out := make([]SpanExpressionProto_Span, len(spans))
 	for i := range spans {
-		out = append(out, SpanExpressionProto_Span{
+		out[i] = SpanExpressionProto_Span{
 			Start: spans[i].Start,
 			End:   spans[i].End,
-		})
+		}
 	}
 	return out
 }
@@ -419,6 +510,11 @@ func (n NonInvertedColExpression) IsTight() bool {
 // SetNotTight implements the InvertedExpression interface.
 func (n NonInvertedColExpression) SetNotTight() {}
 
+// Copy implements the InvertedExpression interface.
+func (n NonInvertedColExpression) Copy() InvertedExpression {
+	return NonInvertedColExpression{}
+}
+
 // ExprForInvertedSpan constructs a leaf-level SpanExpression
 // for an inverted expression. Note that these leaf-level
 // expressions may also have tight = false. Geospatial functions
@@ -442,7 +538,8 @@ func ExprForInvertedSpan(span InvertedSpan, tight bool) *SpanExpression {
 	}
 }
 
-// And of two boolean expressions.
+// And of two boolean expressions. This function may modify both the left and
+// right InvertedExpressions.
 func And(left, right InvertedExpression) InvertedExpression {
 	switch l := left.(type) {
 	case *SpanExpression:
@@ -476,7 +573,8 @@ func And(left, right InvertedExpression) InvertedExpression {
 	}
 }
 
-// Or of two boolean expressions.
+// Or of two boolean expressions. This function may modify both the left and
+// right InvertedExpressions.
 func Or(left, right InvertedExpression) InvertedExpression {
 	switch l := left.(type) {
 	case *SpanExpression:
@@ -534,6 +632,9 @@ func opSpanExpressionAndDefault(
 
 // Intersects two SpanExpressions.
 func intersectSpanExpressions(left, right *SpanExpression) *SpanExpression {
+	// Since we simply union into SpansToRead, we can end up with
+	// FactoredUnionSpans as a subset of SpanToRead *and* both children pruned.
+	// TODO(sumeer): tighten the SpansToRead for this case.
 	expr := &SpanExpression{
 		Tight:              left.Tight && right.Tight,
 		SpansToRead:        unionSpans(left.SpansToRead, right.SpansToRead),

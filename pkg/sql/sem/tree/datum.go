@@ -225,7 +225,7 @@ func (d Datums) IsDistinctFrom(evalCtx *EvalContext, other Datums) bool {
 
 // CompositeDatum is a Datum that may require composite encoding in
 // indexes. Any Datum implementing this interface must also add itself to
-// sqlbase/HasCompositeKeyEncoding.
+// colinfo.HasCompositeKeyEncoding.
 type CompositeDatum interface {
 	Datum
 	// IsComposite returns true if this datum is not round-tripable in a key
@@ -684,6 +684,8 @@ func (d *DInt) Compare(ctx *EvalContext, other Datum) int {
 		v = *t
 	case *DFloat, *DDecimal:
 		return -t.Compare(ctx, d)
+	case *DOid:
+		v = t.DInt
 	default:
 		panic(makeUnsupportedComparisonMessage(d, other))
 	}
@@ -1063,14 +1065,18 @@ func (d *DDecimal) Format(ctx *FmtCtx) {
 	}
 }
 
+// shallowDecimalSize is the size of the fixed-size part of apd.Decimal in
+// bytes.
+const shallowDecimalSize = unsafe.Sizeof(apd.Decimal{})
+
 // SizeOfDecimal returns the size in bytes of an apd.Decimal.
 func SizeOfDecimal(d apd.Decimal) uintptr {
-	return uintptr(cap(d.Coeff.Bits())) * unsafe.Sizeof(big.Word(0))
+	return shallowDecimalSize + uintptr(cap(d.Coeff.Bits()))*unsafe.Sizeof(big.Word(0))
 }
 
 // Size implements the Datum interface.
 func (d *DDecimal) Size() uintptr {
-	return unsafe.Sizeof(*d) + SizeOfDecimal(d.Decimal)
+	return SizeOfDecimal(d.Decimal)
 }
 
 var (
@@ -2160,10 +2166,12 @@ var dZeroTimestamp = &DTimestamp{}
 
 // time.Time formats.
 const (
-	// TimestampTZOutputFormat is used to output all TimestampTZs.
-	TimestampTZOutputFormat = "2006-01-02 15:04:05.999999-07:00"
-	// TimestampOutputFormat is used to output all Timestamps.
-	TimestampOutputFormat = "2006-01-02 15:04:05.999999"
+	// timestampTZOutputFormat is used to output all TimestampTZs.
+	// Note the second offset is missing here -- this is to maintain
+	// backward compatibility with casting timestamptz to strings.
+	timestampTZOutputFormat = "2006-01-02 15:04:05.999999-07:00"
+	// timestampOutputFormat is used to output all Timestamps.
+	timestampOutputFormat = "2006-01-02 15:04:05.999999"
 )
 
 // ParseDTimestamp parses and returns the *DTimestamp Datum value represented by
@@ -2350,7 +2358,7 @@ func (d *DTimestamp) Format(ctx *FmtCtx) {
 	if !bareStrings {
 		ctx.WriteByte('\'')
 	}
-	ctx.WriteString(d.UTC().Format(TimestampOutputFormat))
+	ctx.WriteString(d.UTC().Format(timestampOutputFormat))
 	if !bareStrings {
 		ctx.WriteByte('\'')
 	}
@@ -2507,7 +2515,18 @@ func (d *DTimestampTZ) Format(ctx *FmtCtx) {
 	if !bareStrings {
 		ctx.WriteByte('\'')
 	}
-	ctx.WriteString(d.Time.Format(TimestampTZOutputFormat))
+	ctx.WriteString(d.Time.Format(timestampTZOutputFormat))
+	_, offsetSecs := d.Time.Zone()
+	// Only output remaining seconds offsets if it is available.
+	// This is to maintain backward compatibility with older CRDB versions,
+	// where we only output HH:MM.
+	if secondOffset := offsetSecs % 60; secondOffset != 0 {
+		if secondOffset < 0 {
+			secondOffset = 60 + secondOffset
+		}
+		ctx.WriteByte(':')
+		ctx.WriteString(fmt.Sprintf("%02d", secondOffset))
+	}
 	if !bareStrings {
 		ctx.WriteByte('\'')
 	}
@@ -2721,11 +2740,11 @@ func (d *DInterval) Size() uintptr {
 
 // DGeography is the Geometry Datum.
 type DGeography struct {
-	*geo.Geography
+	geo.Geography
 }
 
 // NewDGeography returns a new Geography Datum.
-func NewDGeography(g *geo.Geography) *DGeography {
+func NewDGeography(g geo.Geography) *DGeography {
 	return &DGeography{Geography: g}
 }
 
@@ -2824,16 +2843,16 @@ func (d *DGeography) Format(ctx *FmtCtx) {
 
 // Size implements the Datum interface.
 func (d *DGeography) Size() uintptr {
-	return unsafe.Sizeof(*d)
+	return d.Geography.SpatialObjectRef().MemSize()
 }
 
 // DGeometry is the Geometry Datum.
 type DGeometry struct {
-	*geo.Geometry
+	geo.Geometry
 }
 
 // NewDGeometry returns a new Geometry Datum.
-func NewDGeometry(g *geo.Geometry) *DGeometry {
+func NewDGeometry(g geo.Geometry) *DGeometry {
 	return &DGeometry{Geometry: g}
 }
 
@@ -2932,16 +2951,16 @@ func (d *DGeometry) Format(ctx *FmtCtx) {
 
 // Size implements the Datum interface.
 func (d *DGeometry) Size() uintptr {
-	return unsafe.Sizeof(*d)
+	return d.Geometry.SpatialObjectRef().MemSize()
 }
 
 // DBox2D is the Datum representation of the Box2D type.
 type DBox2D struct {
-	*geo.CartesianBoundingBox
+	geo.CartesianBoundingBox
 }
 
 // NewDBox2D returns a new Box2D Datum.
-func NewDBox2D(b *geo.CartesianBoundingBox) *DBox2D {
+func NewDBox2D(b geo.CartesianBoundingBox) *DBox2D {
 	return &DBox2D{CartesianBoundingBox: b}
 }
 
@@ -2952,6 +2971,30 @@ func ParseDBox2D(str string) (*DBox2D, error) {
 		return nil, errors.Wrapf(err, "could not parse geometry")
 	}
 	return &DBox2D{CartesianBoundingBox: b}, nil
+}
+
+// AsDBox2D attempts to retrieve a *DBox2D from an Expr, returning a
+// *DBox2D and a flag signifying whether the assertion was successful. The
+// function should be used instead of direct type assertions wherever a
+// *DBox2D wrapped by a *DOidWrapper is possible.
+func AsDBox2D(e Expr) (*DBox2D, bool) {
+	switch t := e.(type) {
+	case *DBox2D:
+		return t, true
+	case *DOidWrapper:
+		return AsDBox2D(t.Wrapped)
+	}
+	return nil, false
+}
+
+// MustBeDBox2D attempts to retrieve a *DBox2D from an Expr, panicking
+// if the assertion fails.
+func MustBeDBox2D(e Expr) *DBox2D {
+	i, ok := AsDBox2D(e)
+	if !ok {
+		panic(errors.AssertionFailedf("expected *DBox2D, found %T", e))
+	}
+	return i
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -2966,7 +3009,7 @@ func (d *DBox2D) Compare(ctx *EvalContext, other Datum) int {
 		return 1
 	}
 	o := other.(*DBox2D)
-	return d.CartesianBoundingBox.Compare(o.CartesianBoundingBox)
+	return d.CartesianBoundingBox.Compare(&o.CartesianBoundingBox)
 }
 
 // Prev implements the Datum interface.
@@ -3017,7 +3060,7 @@ func (d *DBox2D) Format(ctx *FmtCtx) {
 
 // Size implements the Datum interface.
 func (d *DBox2D) Size() uintptr {
-	return unsafe.Sizeof(*d) + unsafe.Sizeof(*d.CartesianBoundingBox)
+	return unsafe.Sizeof(*d) + unsafe.Sizeof(d.CartesianBoundingBox)
 }
 
 // DJSON is the JSON Datum.
@@ -3272,6 +3315,16 @@ func AsDTuple(e Expr) (*DTuple, bool) {
 		return AsDTuple(t.Wrapped)
 	}
 	return nil, false
+}
+
+// MustBeDTuple attempts to retrieve a *DTuple from an Expr, panicking if the
+// assertion fails.
+func MustBeDTuple(e Expr) *DTuple {
+	i, ok := AsDTuple(e)
+	if !ok {
+		panic(errors.AssertionFailedf("expected *DTuple, found %T", e))
+	}
+	return i
 }
 
 // maybePopulateType populates the tuple's type if it hasn't yet been
@@ -4211,14 +4264,20 @@ func (d *DOid) Compare(ctx *EvalContext, other Datum) int {
 		// NULL is less than any non-NULL value.
 		return 1
 	}
-	v, ok := UnwrapDatum(ctx, other).(*DOid)
-	if !ok {
+	var v DInt
+	switch t := UnwrapDatum(ctx, other).(type) {
+	case *DOid:
+		v = t.DInt
+	case *DInt:
+		v = *t
+	default:
 		panic(makeUnsupportedComparisonMessage(d, other))
 	}
-	if d.DInt < v.DInt {
+
+	if d.DInt < v {
 		return -1
 	}
-	if d.DInt > v.DInt {
+	if d.DInt > v {
 		return 1
 	}
 	return 0
@@ -4568,6 +4627,21 @@ func NewDefaultDatum(evalCtx *EvalContext, t *types.T) (d Datum, err error) {
 		return NewDTuple(t, datums...), nil
 	case types.BitFamily:
 		return bitArrayZero, nil
+	case types.EnumFamily:
+		// The scenario in which this arises is when the column is being dropped and
+		// is NOT NULL. If there are no values for this enum, there's nothing that
+		// can be put here so we'll return
+		if len(t.TypeMeta.EnumData.PhysicalRepresentations) == 0 {
+			return nil, pgerror.Newf(
+				pgcode.NotNullViolation,
+				"%s has no values which can be used to satisfy the NOT NULL "+
+					"constraint while adding or dropping",
+				t.Name(),
+			)
+		}
+		// We fall back to using the smallest enum value during the dropping period.
+		return MakeDEnumFromPhysicalRepresentation(t,
+			t.TypeMeta.EnumData.PhysicalRepresentations[0])
 	default:
 		return nil, errors.AssertionFailedf("unhandled type %v", t.SQLString())
 	}
@@ -4627,7 +4701,7 @@ var baseDatumTypeSizes = map[types.Family]struct {
 }{
 	types.UnknownFamily:        {unsafe.Sizeof(dNull{}), fixedSize},
 	types.BoolFamily:           {unsafe.Sizeof(DBool(false)), fixedSize},
-	types.Box2DFamily:          {unsafe.Sizeof(DBox2D{CartesianBoundingBox: &geo.CartesianBoundingBox{}}), fixedSize},
+	types.Box2DFamily:          {unsafe.Sizeof(DBox2D{CartesianBoundingBox: geo.CartesianBoundingBox{}}), fixedSize},
 	types.BitFamily:            {unsafe.Sizeof(DBitArray{}), variableSize},
 	types.IntFamily:            {unsafe.Sizeof(DInt(0)), fixedSize},
 	types.FloatFamily:          {unsafe.Sizeof(DFloat(0.0)), fixedSize},

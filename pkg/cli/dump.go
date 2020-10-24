@@ -23,12 +23,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
@@ -49,6 +49,8 @@ Dump SQL tables of a cockroach database. If the table name
 is omitted, dump all tables in the database.
 `,
 	RunE: MaybeDecorateGRPCError(runDump),
+	Deprecated: "cockroach dump will be removed in a subsequent release.\n" +
+		"For details, see: https://github.com/cockroachdb/cockroach/issues/54040",
 }
 
 // We accept versions that are strictly newer than v2.1.0-alpha.20180416
@@ -201,26 +203,15 @@ func runDump(cmd *cobra.Command, args []string) error {
 		// Dump schema create statements, if any. If connecting to a cockroach version
 		// before 20.2 the list of schemas will be empty, so nothing will be emitted.
 		if shouldDumpSchemas && dumpCtx.dumpMode != dumpDataOnly {
-			if len(schemas) > 0 {
-				if _, err := fmt.Fprintf(w, "SET experimental_enable_user_defined_schemas = true;\n"); err != nil {
+			for _, schema := range schemas {
+				if _, err := fmt.Fprintf(w, "CREATE SCHEMA %s;\n\n", tree.Name(schema)); err != nil {
 					return err
-				}
-				for _, schema := range schemas {
-					if _, err := fmt.Fprintf(w, "CREATE SCHEMA %s;\n\n", tree.Name(schema)); err != nil {
-						return err
-					}
 				}
 			}
 		}
 
 		// Dump any type creation statements.
 		if shouldDumpTypes && dumpCtx.dumpMode != dumpDataOnly {
-			// Only emit the settings change if there are any user defined types.
-			if len(typContext.createStatements) > 0 {
-				if _, err := fmt.Fprintf(w, "SET experimental_enable_enums = true;\n"); err != nil {
-					return err
-				}
-			}
 			for _, stmt := range typContext.createStatements {
 				if _, err := fmt.Fprintf(w, "%s;\n\n", stmt); err != nil {
 					return err
@@ -473,7 +464,7 @@ WHERE
 		// type kind in the typing context.
 		switch {
 		case len(enumMembers) != 0:
-			typ := types.MakeEnum(sqlbase.TypeIDToOID(descpb.ID(id)), 0 /* arrayTypeOID */)
+			typ := types.MakeEnum(typedesc.TypeIDToOID(descpb.ID(id)), 0 /* arrayTypeOID */)
 			typ.TypeMeta = types.UserDefinedTypeMetadata{
 				Name: &types.UserDefinedTypeName{
 					Name:   name,
@@ -1091,6 +1082,11 @@ func dumpTableData(
 					case types.EnumFamily:
 						// Enum values are streamed back in their logical representation.
 						d, err = tree.MakeDEnumFromLogicalRepresentation(ct, string(t))
+						if err != nil {
+							return err
+						}
+					case types.BitFamily:
+						d, err = tree.ParseDBitArray(string(t))
 						if err != nil {
 							return err
 						}

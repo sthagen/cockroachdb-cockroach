@@ -12,7 +12,6 @@ package colexec
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
@@ -22,9 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
-
-// TODO(yuzefovich): tune.
-const partiallyOrderedDistinctNumHashBuckets = 1024
 
 // newPartiallyOrderedDistinct creates a distinct operator on the given
 // distinct columns when we have partial ordering on some of the distinct
@@ -63,10 +59,7 @@ func newPartiallyOrderedDistinct(
 			distinctUnorderedCols = append(distinctUnorderedCols, distinctCol)
 		}
 	}
-	distinct := NewUnorderedDistinct(
-		allocator, chunkerOperator, distinctUnorderedCols, typs,
-		partiallyOrderedDistinctNumHashBuckets,
-	)
+	distinct := NewUnorderedDistinct(allocator, chunkerOperator, distinctUnorderedCols, typs)
 	return &partiallyOrderedDistinct{
 		input:    chunkerOperator,
 		distinct: distinct.(ResettableOperator),
@@ -92,7 +85,7 @@ func (p *partiallyOrderedDistinct) Child(nth int, _ bool) execinfra.OpNode {
 	if nth == 0 {
 		return p.input
 	}
-	colexecerror.InternalError(fmt.Sprintf("invalid index %d", nth))
+	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }
@@ -169,7 +162,7 @@ func (c *chunkerOperator) Child(nth int, _ bool) execinfra.OpNode {
 	if nth == 0 {
 		return c.input
 	}
-	colexecerror.InternalError(fmt.Sprintf("invalid index %d", nth))
+	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }

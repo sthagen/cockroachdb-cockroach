@@ -260,14 +260,7 @@ func NewMergeJoinOp(
 	actualRightOrdering := make([]execinfrapb.Ordering_Column, len(rightOrdering))
 	copy(actualLeftOrdering, leftOrdering)
 	copy(actualRightOrdering, rightOrdering)
-	isNumeric := func(t *types.T) bool {
-		switch t.Family() {
-		case types.IntFamily, types.FloatFamily, types.DecimalFamily:
-			return true
-		default:
-			return false
-		}
-	}
+
 	// Iterate over each equality column and check whether a cast is needed. If
 	// it is needed for some column, then a cast operator is planned on top of
 	// the input from the corresponding side and the types and ordering are
@@ -280,7 +273,7 @@ func NewMergeJoinOp(
 		rightColIdx := rightOrdering[i].ColIdx
 		leftType := leftTypes[leftColIdx]
 		rightType := rightTypes[rightColIdx]
-		if !leftType.Identical(rightType) && isNumeric(leftType) && isNumeric(rightType) {
+		if !leftType.Identical(rightType) && leftType.IsNumeric() && rightType.IsNumeric() {
 			// The types are different and both are numeric, so we need to plan
 			// a cast. There is a hierarchy of valid casts:
 			//   INT2 -> INT4 -> INT8 -> FLOAT -> DECIMAL
@@ -505,7 +498,7 @@ type mergeJoinBase struct {
 }
 
 var _ resetter = &mergeJoinBase{}
-var _ Closer = &mergeJoinBase{}
+var _ colexecbase.Closer = &mergeJoinBase{}
 
 func (o *mergeJoinBase) reset(ctx context.Context) {
 	if r, ok := o.left.source.(resetter); ok {
@@ -777,7 +770,7 @@ func (o *mergeJoinBase) Close(ctx context.Context) error {
 	}
 	var lastErr error
 	for _, op := range []colexecbase.Operator{o.left.source, o.right.source} {
-		if c, ok := op.(Closer); ok {
+		if c, ok := op.(colexecbase.Closer); ok {
 			if err := c.Close(ctx); err != nil {
 				lastErr = err
 			}

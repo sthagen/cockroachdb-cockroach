@@ -30,7 +30,7 @@ var supportedSQLAlchemyTag = "rel_1_3_17"
 func registerSQLAlchemy(r *testRegistry) {
 	r.Add(testSpec{
 		Name:       "sqlalchemy",
-		Owner:      OwnerAppDev,
+		Owner:      OwnerSQLExperience,
 		Cluster:    makeClusterSpec(1),
 		MinVersion: "v2.1.0",
 		Tags:       []string{`default`, `orm`},
@@ -83,7 +83,7 @@ func runSQLAlchemy(ctx context.Context, t *test, c *cluster) {
 	}
 
 	if err := repeatRunE(ctx, c, node, "install pytest", `
-		sudo pip3 install --upgrade --force-reinstall setuptools pytest pytest-xdist psycopg2
+		sudo pip3 install --upgrade --force-reinstall setuptools pytest==6.0.1 pytest-xdist psycopg2
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func runSQLAlchemy(ctx context.Context, t *test, c *cluster) {
 
 	t.Status("installing sqlalchemy-cockroachdb")
 	if err := repeatRunE(ctx, c, node, "installing sqlalchemy=cockroachdb", `
-		cd /mnt/data1/sqlalchemy-cockroachdb && sudo python3 setup.py install
+		cd /mnt/data1/sqlalchemy-cockroachdb && sudo pip3 install .
 	`); err != nil {
 		t.Fatal(err)
 	}

@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
@@ -37,38 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/marusama/semaphore"
 )
-
-// Version identifies the distsql protocol version.
-//
-// This version is separate from the main CockroachDB version numbering; it is
-// only changed when the distsql API changes.
-//
-// The planner populates the version in SetupFlowRequest.
-// A server only accepts requests with versions in the range MinAcceptedVersion
-// to Version.
-//
-// Is is possible used to provide a "window" of compatibility when new features are
-// added. Example:
-//  - we start with Version=1; distsql servers with version 1 only accept
-//    requests with version 1.
-//  - a new distsql feature is added; Version is bumped to 2. The
-//    planner does not yet use this feature by default; it still issues
-//    requests with version 1.
-//  - MinAcceptedVersion is still 1, i.e. servers with version 2
-//    accept both versions 1 and 2.
-//  - after an upgrade cycle, we can enable the feature in the planner,
-//    requiring version 2.
-//  - at some later point, we can choose to deprecate version 1 and have
-//    servers only accept versions >= 2 (by setting
-//    MinAcceptedVersion to 2).
-//
-// ATTENTION: When updating these fields, add to version_history.txt explaining
-// what changed.
-const Version execinfrapb.DistSQLVersion = 31
-
-// MinAcceptedVersion is the oldest version that the server is
-// compatible with; see above.
-const MinAcceptedVersion execinfrapb.DistSQLVersion = 30
 
 // SettingWorkMemBytes is a cluster setting that determines the maximum amount
 // of RAM that a processor can use.
@@ -129,6 +97,10 @@ type ServerConfig struct {
 	// BulkAdder is used by some processors to bulk-ingest data as SSTs.
 	BulkAdder kvserverbase.BulkAdderFactory
 
+	// Child monitor of the bulk monitor which will be used to monitor the memory
+	// used by the column and index backfillers.
+	BackfillerMonitor *mon.BytesMonitor
+
 	// DiskMonitor is used to monitor temporary storage disk usage. Actual disk
 	// space used will be a small multiple (~1.1) of this because of RocksDB
 	// space amplification.
@@ -170,6 +142,10 @@ type ServerConfig struct {
 	// processors query the cache to see if they should communicate updates to the
 	// gateway.
 	RangeCache *kvcoord.RangeDescriptorCache
+
+	// HydratedTables is a node-level cache of table descriptors which utilize
+	// user-defined types.
+	HydratedTables *hydratedtables.Cache
 }
 
 // RuntimeStats is an interface through which the rowexec layer can get

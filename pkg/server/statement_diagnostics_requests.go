@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
 )
 
@@ -68,7 +68,7 @@ func (s *statusServer) CreateStatementDiagnosticsReport(
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.admin.requireAdminUser(ctx); err != nil {
+	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
 		return nil, err
 	}
 
@@ -93,7 +93,7 @@ func (s *statusServer) StatementDiagnosticsRequests(
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.admin.requireAdminUser(ctx); err != nil {
+	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
 		return nil, err
 	}
 
@@ -101,7 +101,7 @@ func (s *statusServer) StatementDiagnosticsRequests(
 
 	// TODO(davidh): Add pagination to this request.
 	rows, err := s.internalExecutor.QueryEx(ctx, "stmt-diag-get-all", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{
+		sessiondata.InternalExecutorOverride{
 			User: security.RootUser,
 		},
 		`SELECT
@@ -162,13 +162,13 @@ func (s *statusServer) StatementDiagnostics(
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.admin.requireAdminUser(ctx); err != nil {
+	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
 		return nil, err
 	}
 
 	var err error
 	row, err := s.internalExecutor.QueryRowEx(ctx, "stmt-diag-get-one", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{
+		sessiondata.InternalExecutorOverride{
 			User: security.RootUser,
 		},
 		`SELECT

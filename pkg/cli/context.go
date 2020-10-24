@@ -89,9 +89,9 @@ func setServerContextDefaults() {
 
 	serverCfg.ClockDevicePath = ""
 	serverCfg.ExternalIODirConfig = base.ExternalIODirConfig{}
+	serverCfg.GoroutineDumpDirName = ""
+	serverCfg.HeapProfileDirName = ""
 
-	serverCfg.KVConfig.GoroutineDumpDirName = ""
-	serverCfg.KVConfig.HeapProfileDirName = ""
 	serverCfg.AutoInitializeCluster = false
 	serverCfg.KVConfig.ReadyFn = nil
 	serverCfg.KVConfig.DelayedBootstrapFn = nil
@@ -154,6 +154,14 @@ type cliContext struct {
 	// extraConnURLOptions contains any additional query URL options
 	// specified in --url that do not have discrete equivalents.
 	extraConnURLOptions url.Values
+
+	// allowUnencryptedClientPassword enables the CLI commands to use
+	// password authentication over non-TLS TCP connections. This is
+	// disallowed by default: the user must opt-in and understand that
+	// CockroachDB does not guarantee confidentiality of a password
+	// provided this way.
+	// TODO(knz): Relax this when SCRAM is implemented.
+	allowUnencryptedClientPassword bool
 }
 
 // cliCtx captures the command-line parameters common to most CLI utilities.
@@ -184,9 +192,10 @@ func setCliContextDefaults() {
 	cliCtx.sqlConnPasswd = ""
 	cliCtx.sqlConnDBName = ""
 	cliCtx.extraConnURLOptions = nil
+	cliCtx.allowUnencryptedClientPassword = false
 }
 
-// sqlCtx captures the command-line parameters of the `sql` command.
+// sqlCtx captures the configuration of the `sql` command.
 // See below for defaults.
 var sqlCtx = struct {
 	*cliContext
@@ -195,7 +204,13 @@ var sqlCtx = struct {
 	setStmts statementsValue
 
 	// execStmts is a list of statements to execute.
+	// Only valid if inputFile is empty.
 	execStmts statementsValue
+
+	// inputFile is the file to read from.
+	// If empty, os.Stdin is used.
+	// Only valid if execStmts is empty.
+	inputFile string
 
 	// repeatDelay indicates that the execStmts should be "watched"
 	// at the specified time interval. Zero disables
@@ -217,6 +232,25 @@ var sqlCtx = struct {
 	// "intelligent behavior" in the SQL shell as possible and become
 	// more verbose (sets echo).
 	debugMode bool
+
+	// Determines whether to display server execution timings in the CLI.
+	enableServerExecutionTimings bool
+
+	// Determine whether to show raw durations.
+	verboseTimings bool
+
+	// Determines whether to stop the client upon encountering an error.
+	errExit bool
+
+	// Determines whether to perform client-side syntax checking.
+	checkSyntax bool
+
+	// autoTrace, when non-empty, encloses the executed statements
+	// by suitable SET TRACING and SHOW TRACE FOR SESSION statements.
+	autoTrace string
+
+	// The string used to produce the value of fullPrompt.
+	customPromptPattern string
 }{cliContext: &cliCtx}
 
 // setSQLContextDefaults set the default values in sqlCtx.  This
@@ -225,11 +259,18 @@ var sqlCtx = struct {
 func setSQLContextDefaults() {
 	sqlCtx.setStmts = nil
 	sqlCtx.execStmts = nil
+	sqlCtx.inputFile = ""
 	sqlCtx.repeatDelay = 0
 	sqlCtx.safeUpdates = false
 	sqlCtx.showTimes = false
 	sqlCtx.debugMode = false
 	sqlCtx.echo = false
+	sqlCtx.enableServerExecutionTimings = false
+	sqlCtx.verboseTimings = false
+	sqlCtx.errExit = false
+	sqlCtx.checkSyntax = false
+	sqlCtx.autoTrace = ""
+	sqlCtx.customPromptPattern = defaultPromptPattern
 }
 
 // zipCtx captures the command-line parameters of the `zip` command.
@@ -302,6 +343,7 @@ var debugCtx struct {
 	ballastSize       base.SizeSpec
 	printSystemConfig bool
 	maxResults        int
+	decodeAsTableDesc string
 }
 
 // setDebugContextDefaults set the default values in debugCtx.  This
@@ -317,6 +359,7 @@ func setDebugContextDefaults() {
 	debugCtx.ballastSize = base.SizeSpec{InBytes: 1000000000}
 	debugCtx.maxResults = 0
 	debugCtx.printSystemConfig = false
+	debugCtx.decodeAsTableDesc = ""
 }
 
 // startCtx captures the command-line arguments for the `start` command.

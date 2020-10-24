@@ -32,44 +32,39 @@ func alterZoneConfigAndClusterSettings(
 	defer db.Close()
 
 	if _, err := db.ExecContext(
-		ctx, `ALTER RANGE default CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+		ctx, `ALTER RANGE default CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
 	); err != nil {
 		return err
 	}
 
 	if _, err := db.ExecContext(
-		ctx, `ALTER DATABASE system CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+		ctx, `ALTER DATABASE system CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
 	); err != nil {
 		return err
 	}
 
 	if _, err := db.ExecContext(
-		ctx, `ALTER TABLE system.public.jobs CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+		ctx, `ALTER TABLE system.public.jobs CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
 	); err != nil {
 		return err
 	}
 
 	if _, err := db.ExecContext(
-		ctx, `ALTER RANGE meta CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+		ctx, `ALTER RANGE meta CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
 	); err != nil {
 		return err
 	}
 
 	if _, err := db.ExecContext(
-		ctx, `ALTER RANGE system CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+		ctx, `ALTER RANGE system CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
 	); err != nil {
 		return err
 	}
 
 	if _, err := db.ExecContext(
-		ctx, `ALTER RANGE liveness CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+		ctx, `ALTER RANGE liveness CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
 	); err != nil {
 		return err
-	}
-
-	// TODO(rafi): remove this check once we stop testing against 2.0 and 2.1
-	if strings.HasPrefix(version, "v2.0") || strings.HasPrefix(version, "v2.1") {
-		return nil
 	}
 
 	if _, err := db.ExecContext(
@@ -78,8 +73,23 @@ func alterZoneConfigAndClusterSettings(
 		return err
 	}
 
-	// Enable temp tables for v20.1
-	if strings.HasPrefix(version, "v20.") {
+	// Shorten the merge queue interval to clean up ranges due to dropped tables.
+	if _, err := db.ExecContext(
+		ctx, `SET CLUSTER SETTING kv.range_merge.queue_interval = '200ms'`,
+	); err != nil {
+		return err
+	}
+
+	// Disable syncs associated with the Raft log which are the primary causes of
+	// fsyncs.
+	if _, err := db.ExecContext(
+		ctx, `SET CLUSTER SETTING kv.raft_log.disable_synchronization_unsafe = 'true'`,
+	); err != nil {
+		return err
+	}
+
+	// Enable temp tables for v20.1+
+	if strings.HasPrefix(version, "v20.") || strings.HasPrefix(version, "v21.") {
 		if _, err := db.ExecContext(
 			ctx, `SET CLUSTER SETTING sql.defaults.experimental_temporary_tables.enabled = 'true';`,
 		); err != nil {
@@ -116,7 +126,7 @@ func newORMTestsResults() *ormTestsResults {
 // against a cockroach node. If an unexpected result is observed (for example,
 // a test unexpectedly failed or passed), a new blocklist is populated.
 func (r *ormTestsResults) summarizeAll(
-	t *test, ormName, blocklistName string, expectedFailures blocklist, version, latestTag string,
+	t *test, ormName, blocklistName string, expectedFailures blocklist, version, tag string,
 ) {
 	// Collect all the tests that were not run.
 	notRunCount := 0
@@ -142,7 +152,7 @@ func (r *ormTestsResults) summarizeAll(
 	t.l.Printf("------------------------\n")
 
 	r.summarizeFailed(
-		t, ormName, blocklistName, expectedFailures, version, latestTag, notRunCount,
+		t, ormName, blocklistName, expectedFailures, version, tag, notRunCount,
 	)
 }
 

@@ -19,10 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -208,7 +210,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 		{
 			"a INT PRIMARY KEY",
 			descpb.IndexDescriptor{
-				Name:             sqlbase.PrimaryKeyIndexName,
+				Name:             tabledesc.PrimaryKeyIndexName,
 				ID:               1,
 				Unique:           true,
 				ColumnNames:      []string{"a"},
@@ -282,7 +284,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 		{
 			"a INT, b INT, PRIMARY KEY (a, b)",
 			descpb.IndexDescriptor{
-				Name:             sqlbase.PrimaryKeyIndexName,
+				Name:             tabledesc.PrimaryKeyIndexName,
 				ID:               1,
 				Unique:           true,
 				ColumnNames:      []string{"a", "b"},
@@ -314,15 +316,16 @@ func TestPrimaryKeyUnspecified(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	s := "CREATE TABLE foo.test (a INT, b INT, CONSTRAINT c UNIQUE (b))"
-	desc, err := CreateTestTableDescriptor(context.Background(), 1, 100, s,
+	ctx := context.Background()
+	desc, err := CreateTestTableDescriptor(ctx, 1, 100, s,
 		descpb.NewDefaultPrivilegeDescriptor(security.AdminRole))
 	if err != nil {
 		t.Fatal(err)
 	}
 	desc.PrimaryIndex = descpb.IndexDescriptor{}
 
-	err = desc.ValidateTable()
-	if !testutils.IsError(err, sqlbase.ErrMissingPrimaryKey.Error()) {
+	err = desc.ValidateTable(ctx)
+	if !testutils.IsError(err, tabledesc.ErrMissingPrimaryKey.Error()) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -336,7 +339,6 @@ func TestCanCloneTableWithUDT(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 	if _, err := sqlDB.Exec(`
-SET experimental_enable_enums=true;
 CREATE DATABASE test;
 CREATE TYPE test.t AS ENUM ('hello');
 CREATE TABLE test.tt (x test.t);
@@ -344,26 +346,26 @@ CREATE TABLE test.tt (x test.t);
 		t.Fatal(err)
 	}
 	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "tt")
-	typLookup := func(ctx context.Context, id descpb.ID) (tree.TypeName, sqlbase.TypeDescriptor, error) {
-		var typeDesc sqlbase.TypeDescriptor
+	typLookup := func(ctx context.Context, id descpb.ID) (tree.TypeName, catalog.TypeDescriptor, error) {
+		var typeDesc catalog.TypeDescriptor
 		if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			desc, err := catalogkv.GetDescriptorByID(ctx, txn, keys.SystemSQLCodec, id,
 				catalogkv.Immutable, catalogkv.TypeDescriptorKind, true /* required */)
 			if err != nil {
 				return err
 			}
-			typeDesc = desc.(sqlbase.TypeDescriptor)
+			typeDesc = desc.(catalog.TypeDescriptor)
 			return nil
 		}); err != nil {
 			return tree.TypeName{}, nil, err
 		}
 		return tree.TypeName{}, typeDesc, nil
 	}
-	if err := sqlbase.HydrateTypesInTableDescriptor(ctx, desc.TableDesc(), sqlbase.TypeLookupFunc(typLookup)); err != nil {
+	if err := typedesc.HydrateTypesInTableDescriptor(ctx, desc.TableDesc(), typedesc.TypeLookupFunc(typLookup)); err != nil {
 		t.Fatal(err)
 	}
 	// Ensure that we can clone this table.
-	_ = protoutil.Clone(desc.TableDesc()).(*TableDescriptor)
+	_ = protoutil.Clone(desc.TableDesc()).(*descpb.TableDescriptor)
 }
 
 // TestSerializedUDTsInTableDescriptor tests that expressions containing
@@ -376,19 +378,19 @@ func TestSerializedUDTsInTableDescriptor(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	getDefault := func(desc *TableDescriptor) string {
+	getDefault := func(desc *tabledesc.Immutable) string {
 		return *desc.Columns[0].DefaultExpr
 	}
-	getComputed := func(desc *TableDescriptor) string {
+	getComputed := func(desc *tabledesc.Immutable) string {
 		return *desc.Columns[0].ComputeExpr
 	}
-	getCheck := func(desc *TableDescriptor) string {
+	getCheck := func(desc *tabledesc.Immutable) string {
 		return desc.Checks[0].Expr
 	}
 	testdata := []struct {
 		colSQL       string
 		expectedExpr string
-		getExpr      func(desc *TableDescriptor) string
+		getExpr      func(desc *tabledesc.Immutable) string
 	}{
 		// Test a simple UDT as the default value.
 		{
@@ -443,7 +445,6 @@ func TestSerializedUDTsInTableDescriptor(t *testing.T) {
 	if _, err := sqlDB.Exec(`
 	CREATE DATABASE test;
 	USE test;
-	SET experimental_enable_enums=true;
 	CREATE TYPE greeting AS ENUM ('hello');
 `); err != nil {
 		t.Fatal(err)
@@ -454,7 +455,7 @@ func TestSerializedUDTsInTableDescriptor(t *testing.T) {
 			t.Fatal(err)
 		}
 		desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
-		found := tc.getExpr(desc.TableDesc())
+		found := tc.getExpr(desc)
 		if tc.expectedExpr != found {
 			t.Errorf("for column %s, found %s, expected %s", tc.colSQL, found, tc.expectedExpr)
 		}

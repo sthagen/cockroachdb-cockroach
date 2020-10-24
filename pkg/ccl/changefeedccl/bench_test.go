@@ -26,8 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -132,9 +132,9 @@ func makeBenchSink() *benchSink {
 }
 
 func (s *benchSink) EmitRow(
-	ctx context.Context, _ *descpb.TableDescriptor, k, v []byte, _ hlc.Timestamp,
+	ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
-	return s.emit(int64(len(k) + len(v)))
+	return s.emit(int64(len(key) + len(value)))
 }
 func (s *benchSink) EmitResolvedTimestamp(ctx context.Context, e Encoder, ts hlc.Timestamp) error {
 	var noTopic string
@@ -232,8 +232,8 @@ func createBenchmarkChangefeed(
 		NeedsInitialScan: needsInitialScan,
 	}
 
-	rowsFn := kvsToRows(s.ExecutorConfig().(sql.ExecutorConfig).Codec,
-		s.LeaseManager().(*lease.Manager), details, buf.Get)
+	cfg := s.ExecutorConfig().(sql.ExecutorConfig)
+	rowsFn := kvsToRows(ctx, cfg.Codec, cfg.Settings, cfg.DB, cfg.LeaseManager, cfg.HydratedTables, details, buf.Get)
 	sf := span.MakeFrontier(spans...)
 	tickFn := emitEntries(s.ClusterSettings(), details, hlc.Timestamp{}, sf,
 		encoder, sink, rowsFn, TestingKnobs{}, metrics)

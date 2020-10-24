@@ -12,6 +12,7 @@ package geo
 
 import (
 	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
@@ -22,12 +23,12 @@ import (
 func TestParseCartesianBoundingBox(t *testing.T) {
 	testCases := []struct {
 		s             string
-		expected      *CartesianBoundingBox
+		expected      CartesianBoundingBox
 		expectedError bool
 	}{
 		{
 			s: "box(1 2,3 4)",
-			expected: &CartesianBoundingBox{
+			expected: CartesianBoundingBox{
 				BoundingBox: geopb.BoundingBox{
 					LoX: 1,
 					LoY: 2,
@@ -38,7 +39,7 @@ func TestParseCartesianBoundingBox(t *testing.T) {
 		},
 		{
 			s: "BOX(1 2,3 4)",
-			expected: &CartesianBoundingBox{
+			expected: CartesianBoundingBox{
 				BoundingBox: geopb.BoundingBox{
 					LoX: 1,
 					LoY: 2,
@@ -62,6 +63,64 @@ func TestParseCartesianBoundingBox(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, tc.expected, ret)
 			}
+		})
+	}
+}
+
+func TestCartesianBoundingBox(t *testing.T) {
+	testCases := []struct {
+		lhs      *CartesianBoundingBox
+		rhs      *CartesianBoundingBox
+		expected *CartesianBoundingBox
+	}{
+		{nil, nil, nil},
+		{
+			nil,
+			&CartesianBoundingBox{
+				BoundingBox: geopb.BoundingBox{
+					LoX: -1, LoY: -1, HiX: 1, HiY: 1,
+				},
+			},
+			&CartesianBoundingBox{
+				BoundingBox: geopb.BoundingBox{
+					LoX: -1, LoY: -1, HiX: 1, HiY: 1,
+				},
+			},
+		},
+		{
+			&CartesianBoundingBox{
+				BoundingBox: geopb.BoundingBox{
+					LoX: -2, LoY: 0, HiX: 1, HiY: 2,
+				},
+			},
+			nil,
+			&CartesianBoundingBox{
+				BoundingBox: geopb.BoundingBox{
+					LoX: -2, LoY: 0, HiX: 1, HiY: 2,
+				},
+			},
+		},
+		{
+			&CartesianBoundingBox{
+				BoundingBox: geopb.BoundingBox{
+					LoX: -2, LoY: 0, HiX: 1, HiY: 2,
+				},
+			},
+			&CartesianBoundingBox{
+				BoundingBox: geopb.BoundingBox{
+					LoX: -1, LoY: -1, HiX: 1, HiY: 1,
+				},
+			},
+			&CartesianBoundingBox{
+				BoundingBox: geopb.BoundingBox{
+					LoX: -2, LoY: -1, HiX: 1, HiY: 2,
+				},
+			},
+		},
+	}
+	for i, tc := range testCases {
+		t.Run(strconv.Itoa(i+1), func(t *testing.T) {
+			require.Equal(t, tc.expected, tc.lhs.Combine(tc.rhs))
 		})
 	}
 }

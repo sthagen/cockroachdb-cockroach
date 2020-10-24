@@ -3804,3 +3804,61 @@ SELECT a, b, rank() OVER w, dense_rank() OVER w, percent_rank() OVER w, cume_dis
 0  2  2  2  1  1
 1  1  1  1  0  0.5
 1  2  2  2  1  1
+
+# Regression test for peer group number computation overflow (#53654).
+query II rowsort
+SELECT
+  max(k) OVER (w GROUPS BETWEEN 9223372036854775807 FOLLOWING AND UNBOUNDED FOLLOWING),
+  max(k) OVER (w GROUPS BETWEEN UNBOUNDED PRECEDING AND 9223372036854775807 FOLLOWING)
+FROM kv WINDOW w AS (PARTITION BY b ORDER BY v)
+----
+NULL  11
+NULL  11
+NULL  11
+NULL  8
+NULL  8
+NULL  7
+NULL  7
+NULL  7
+NULL  7
+
+# Regression test for #53442. Ordering columns are not pruned with RANGE mode
+# and an offset boundary of PRECEDING or FOLLOWING.
+
+statement ok
+CREATE TABLE t53442_a (a INT8 PRIMARY KEY);
+CREATE TABLE t53442_b (b INT2 PRIMARY KEY);
+
+statement ok
+SELECT max(b::INT8) OVER (PARTITION BY b ORDER BY b RANGE 1 PRECEDING)
+FROM t53442_b NATURAL JOIN t53442_a
+WHERE false
+
+statement ok
+SELECT max(b::INT8) OVER (PARTITION BY b ORDER BY a RANGE 1 PRECEDING)
+FROM t53442_b NATURAL JOIN t53442_a
+WHERE false
+
+# Regression test for a crash with json_object_agg used as a window function
+# (#54604).
+statement ok
+CREATE TABLE t54604 (s STRING);
+INSERT INTO t54604 SELECT g::STRING FROM generate_series(1, 5) AS g
+
+query T rowsort
+SELECT json_object_agg(s, s) OVER (ORDER BY s DESC) FROM t54604
+----
+{"1": "1", "2": "2", "3": "3", "4": "4", "5": "5"}
+{"2": "2", "3": "3", "4": "4", "5": "5"}
+{"3": "3", "4": "4", "5": "5"}
+{"4": "4", "5": "5"}
+{"5": "5"}
+
+query T rowsort
+SELECT jsonb_object_agg(s, s) OVER (ORDER BY s RANGE UNBOUNDED PRECEDING) FROM t54604
+----
+{"1": "1"}
+{"1": "1", "2": "2"}
+{"1": "1", "2": "2", "3": "3"}
+{"1": "1", "2": "2", "3": "3", "4": "4"}
+{"1": "1", "2": "2", "3": "3", "4": "4", "5": "5"}

@@ -13,11 +13,11 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -42,12 +42,12 @@ type applyJoinNode struct {
 	pred *joinPredicate
 
 	// columns contains the metadata for the results of this node.
-	columns sqlbase.ResultColumns
+	columns colinfo.ResultColumns
 
 	// rightCols contains the metadata for the result of the right side of this
 	// apply join, as built in the optimization phase. Later on, every re-planning
 	// of the right side will emit these same columns.
-	rightCols sqlbase.ResultColumns
+	rightCols colinfo.ResultColumns
 
 	planRightSideFn exec.ApplyJoinPlanRightSideFn
 
@@ -77,7 +77,7 @@ type applyJoinNode struct {
 func newApplyJoinNode(
 	joinType descpb.JoinType,
 	left planDataSource,
-	rightCols sqlbase.ResultColumns,
+	rightCols colinfo.ResultColumns,
 	pred *joinPredicate,
 	planRightSideFn exec.ApplyJoinPlanRightSideFn,
 ) (planNode, error) {
@@ -108,9 +108,9 @@ func (a *applyJoinNode) startExec(params runParams) error {
 		}
 	}
 	a.run.out = make(tree.Datums, len(a.columns))
-	ci := sqlbase.ColTypeInfoFromResCols(a.rightCols)
+	ci := colinfo.ColTypeInfoFromResCols(a.rightCols)
 	acc := params.EvalContext().Mon.MakeBoundAccount()
-	a.run.rightRows = rowcontainer.NewRowContainer(acc, ci, 0 /* rowCapacity */)
+	a.run.rightRows = rowcontainer.NewRowContainer(acc, ci)
 	return nil
 }
 
@@ -200,11 +200,11 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 		// the right side of the join using the optimizer, with all outer columns
 		// in the right side replaced by the bindings that were defined by the most
 		// recently read left row.
-		p, err := a.planRightSideFn(leftRow)
+		p, err := a.planRightSideFn(newExecFactory(params.p), leftRow)
 		if err != nil {
 			return false, err
 		}
-		plan := p.(*planTop)
+		plan := p.(*planComponents)
 
 		if err := a.runRightSidePlan(params, plan); err != nil {
 			return false, err
@@ -220,7 +220,7 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 // a.run.rightRows, ready for retrieval. An error indicates that something went
 // wrong during execution of the right hand side of the join, and that we should
 // completely give up on the outer join.
-func (a *applyJoinNode) runRightSidePlan(params runParams, plan *planTop) error {
+func (a *applyJoinNode) runRightSidePlan(params runParams, plan *planComponents) error {
 	a.run.curRightRow = 0
 	a.run.rightRows.Clear(params.ctx)
 	return runPlanInsidePlan(params, plan, a.run.rightRows)
@@ -229,7 +229,7 @@ func (a *applyJoinNode) runRightSidePlan(params runParams, plan *planTop) error 
 // runPlanInsidePlan is used to run a plan and gather the results in a row
 // container, as part of the execution of an "outer" plan.
 func runPlanInsidePlan(
-	params runParams, plan *planTop, rowContainer *rowcontainer.RowContainer,
+	params runParams, plan *planComponents, rowContainer *rowcontainer.RowContainer,
 ) error {
 	rowResultWriter := NewRowResultWriter(rowContainer)
 	recv := MakeDistSQLReceiver(
@@ -249,7 +249,6 @@ func runPlanInsidePlan(
 		params.extendedEvalCtx.copy,
 		plan.subqueryPlans,
 		recv,
-		true,
 	) {
 		if err := rowResultWriter.Err(); err != nil {
 			return err
@@ -260,10 +259,13 @@ func runPlanInsidePlan(
 	// Make a copy of the EvalContext so it can be safely modified.
 	evalCtx := params.p.ExtendedEvalContextCopy()
 	plannerCopy := *params.p
-	planCtx := params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.NewPlanningCtx(
-		params.ctx, evalCtx, &plannerCopy, params.p.txn, false, /* distribute */
+	distributePlan := getPlanDistribution(
+		params.ctx, &plannerCopy, plannerCopy.execCfg.NodeID, plannerCopy.SessionData().DistSQLMode, plan.main,
 	)
-	planCtx.planner.curPlan = *plan
+	planCtx := params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.NewPlanningCtx(
+		params.ctx, evalCtx, &plannerCopy, params.p.txn, distributePlan.WillDistribute(),
+	)
+	planCtx.planner.curPlan.planComponents = *plan
 	planCtx.ExtendedEvalCtx.Planner = &plannerCopy
 	planCtx.stmtType = recv.stmtType
 

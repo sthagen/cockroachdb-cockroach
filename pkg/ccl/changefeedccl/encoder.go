@@ -20,9 +20,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -42,7 +43,7 @@ const (
 // value.
 type encodeRow struct {
 	// datums is the new value of a changed table row.
-	datums sqlbase.EncDatumRow
+	datums rowenc.EncDatumRow
 	// updated is the mvcc timestamp corresponding to the latest update in
 	// `datums`.
 	updated hlc.Timestamp
@@ -51,15 +52,15 @@ type encodeRow struct {
 	deleted bool
 	// tableDesc is a TableDescriptor for the table containing `datums`.
 	// It's valid for interpreting the row at `updated`.
-	tableDesc sqlbase.TableDescriptor
+	tableDesc catalog.TableDescriptor
 	// prevDatums is the old value of a changed table row. The field is set
 	// to nil if the before value for changes was not requested (OptDiff).
-	prevDatums sqlbase.EncDatumRow
+	prevDatums rowenc.EncDatumRow
 	// prevDeleted is true if prevDatums is missing or is a deletion.
 	prevDeleted bool
 	// prevTableDesc is a TableDescriptor for the table containing `prevDatums`.
 	// It's valid for interpreting the row at `updated.Prev()`.
-	prevTableDesc sqlbase.TableDescriptor
+	prevTableDesc catalog.TableDescriptor
 }
 
 // Encoder turns a row into a serialized changefeed key, value, or resolved
@@ -99,7 +100,7 @@ func getEncoder(opts map[string]string) (Encoder, error) {
 type jsonEncoder struct {
 	updatedField, beforeField, wrapped, keyOnly, keyInValue bool
 
-	alloc sqlbase.DatumAlloc
+	alloc rowenc.DatumAlloc
 	buf   bytes.Buffer
 }
 
@@ -415,7 +416,7 @@ func (e *confluentAvroEncoder) EncodeValue(ctx context.Context, row encodeRow) (
 			`updated`: row.updated,
 		}
 	}
-	var beforeDatums, afterDatums sqlbase.EncDatumRow
+	var beforeDatums, afterDatums rowenc.EncDatumRow
 	if row.prevDatums != nil && !row.prevDeleted {
 		beforeDatums = row.prevDatums
 	}

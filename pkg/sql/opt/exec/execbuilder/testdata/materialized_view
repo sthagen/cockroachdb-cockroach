@@ -31,8 +31,7 @@ EXPLAIN SELECT * FROM v WHERE y = 3
 ·           vectorized     true
 index join  ·              ·
  │          table          v@primary
- │          key columns    rowid
  └── scan   ·              ·
 ·           missing stats  ·
 ·           table          v@i
-·           spans          /3-/4
+·           spans          [/3 - /3]

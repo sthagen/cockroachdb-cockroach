@@ -22,15 +22,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
-	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -94,26 +94,6 @@ func formatBoolAsPostgresSetting(b bool) string {
 	return "off"
 }
 
-func parseBoolVar(varName, val string) (bool, error) {
-	val = strings.ToLower(val)
-	switch val {
-	case "on":
-		return true, nil
-	case "off":
-		return false, nil
-	case "yes":
-		return true, nil
-	case "no":
-		return false, nil
-	}
-	b, err := strconv.ParseBool(val)
-	if err != nil {
-		return false, pgerror.Newf(pgcode.InvalidParameterValue,
-			"parameter \"%s\" requires a Boolean value", varName)
-	}
-	return b, nil
-}
-
 // makeDummyBooleanSessionVar generates a sessionVar for a bool session setting.
 // These functions allow the setting to be changed, but whose values are not used.
 // They are logged to telemetry and output a notice that these are unused.
@@ -126,7 +106,7 @@ func makeDummyBooleanSessionVar(
 	return sessionVar{
 		GetStringVal: makePostgresBoolGetStringValFn(name),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar(name, s)
+			b, err := paramparse.ParseBoolVar(name, s)
 			if err != nil {
 				return err
 			}
@@ -162,7 +142,7 @@ var varGen = map[string]sessionVar{
 		Set: func(
 			_ context.Context, m *sessionDataMutator, s string,
 		) error {
-			mode, ok := lex.BytesEncodeFormatFromString(s)
+			mode, ok := sessiondatapb.BytesEncodeFormatFromString(s)
 			if !ok {
 				return newVarValueError(`bytea_output`, s, "hex", "escape", "base64")
 			}
@@ -170,9 +150,9 @@ var varGen = map[string]sessionVar{
 			return nil
 		},
 		Get: func(evalCtx *extendedEvalContext) string {
-			return evalCtx.SessionData.DataConversion.BytesEncodeFormat.String()
+			return evalCtx.SessionData.DataConversionConfig.BytesEncodeFormat.String()
 		},
-		GlobalDefault: func(sv *settings.Values) string { return lex.BytesEncodeHex.String() },
+		GlobalDefault: func(sv *settings.Values) string { return sessiondatapb.BytesEncodeHex.String() },
 	},
 
 	`client_min_messages`: {
@@ -308,7 +288,7 @@ var varGen = map[string]sessionVar{
 			if i == 4 {
 				telemetry.Inc(sqltelemetry.DefaultIntSize4Counter)
 			}
-			m.SetDefaultIntSize(int(i))
+			m.SetDefaultIntSize(int32(i))
 			return nil
 		},
 		GlobalDefault: func(sv *settings.Values) string {
@@ -376,7 +356,7 @@ var varGen = map[string]sessionVar{
 	`default_transaction_read_only`: {
 		GetStringVal: makePostgresBoolGetStringValFn("default_transaction_read_only"),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("default_transaction_read_only", s)
+			b, err := paramparse.ParseBoolVar("default_transaction_read_only", s)
 			if err != nil {
 				return err
 			}
@@ -431,7 +411,7 @@ var varGen = map[string]sessionVar{
 	`disable_partially_distributed_plans`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`disable_partially_distributed_plans`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("disable_partially_distributed_plans", s)
+			b, err := paramparse.ParseBoolVar("disable_partially_distributed_plans", s)
 			if err != nil {
 				return err
 			}
@@ -447,48 +427,10 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
-	`experimental_enable_enums`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_enums`),
-		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar(`experimental_enable_enums`, s)
-			if err != nil {
-				return err
-			}
-			m.SetEnumsEnabled(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) string {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData.EnumsEnabled)
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(enumsEnabledClusterMode.Get(sv))
-		},
-	},
-
-	// CockroachDB extension.
-	`experimental_enable_user_defined_schemas`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_user_defined_schemas`),
-		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar(`experimental_enable_user_defined_schemas`, s)
-			if err != nil {
-				return err
-			}
-			m.SetUserDefinedSchemasEnabled(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) string {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData.UserDefinedSchemasEnabled)
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(userDefinedSchemasClusterMode.Get(sv))
-		},
-	},
-
-	// CockroachDB extension.
 	`enable_zigzag_join`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enable_zigzag_join`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("enable_zigzag_join", s)
+			b, err := paramparse.ParseBoolVar("enable_zigzag_join", s)
 			if err != nil {
 				return err
 			}
@@ -530,7 +472,7 @@ var varGen = map[string]sessionVar{
 	`require_explicit_primary_keys`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`require_explicit_primary_keys`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("require_explicit_primary_key", s)
+			b, err := paramparse.ParseBoolVar("require_explicit_primary_key", s)
 			if err != nil {
 				return err
 			}
@@ -548,7 +490,7 @@ var varGen = map[string]sessionVar{
 	// CockroachDB extension.
 	`vectorize`: {
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			mode, ok := sessiondata.VectorizeExecModeFromString(s)
+			mode, ok := sessiondatapb.VectorizeExecModeFromString(s)
 			if !ok {
 				return newVarValueError(`vectorize`, s,
 					"off", "201auto", "on", "experimental_always")
@@ -560,7 +502,7 @@ var varGen = map[string]sessionVar{
 			return evalCtx.SessionData.VectorizeMode.String()
 		},
 		GlobalDefault: func(sv *settings.Values) string {
-			return sessiondata.VectorizeExecMode(
+			return sessiondatapb.VectorizeExecMode(
 				VectorizeClusterMode.Get(sv)).String()
 		},
 	},
@@ -585,6 +527,25 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return strconv.FormatInt(VectorizeRowCountThresholdClusterValue.Get(sv), 10)
+		},
+	},
+
+	// CockroachDB extension.
+	`testing_vectorize_inject_panics`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`testing_vectorize_inject_panics`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("testing_vectorize_inject_panics", s)
+			if err != nil {
+				return err
+			}
+			m.SetTestingVectorizeInjectPanics(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.TestingVectorizeInjectPanics)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(false)
 		},
 	},
 
@@ -632,7 +593,7 @@ var varGen = map[string]sessionVar{
 	`optimizer_use_histograms`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_histograms`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("optimizer_use_histograms", s)
+			b, err := paramparse.ParseBoolVar("optimizer_use_histograms", s)
 			if err != nil {
 				return err
 			}
@@ -651,7 +612,7 @@ var varGen = map[string]sessionVar{
 	`optimizer_use_multicol_stats`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_multicol_stats`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("optimizer_use_multicol_stats", s)
+			b, err := paramparse.ParseBoolVar("optimizer_use_multicol_stats", s)
 			if err != nil {
 				return err
 			}
@@ -667,30 +628,10 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
-	// TODO(mgartner): remove this once partial indexes are fully supported.
-	`experimental_partial_indexes`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`experimental_partial_indexes`),
-		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("experimental_partial_indexes", s)
-			if err != nil {
-				return err
-			}
-			m.SetPartialIndexes(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) string {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData.PartialIndexes)
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(partialIndexClusterMode.Get(sv))
-		},
-	},
-
-	// CockroachDB extension.
 	`enable_implicit_select_for_update`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enable_implicit_select_for_update`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("enabled_implicit_select_for_update", s)
+			b, err := paramparse.ParseBoolVar("enabled_implicit_select_for_update", s)
 			if err != nil {
 				return err
 			}
@@ -709,7 +650,7 @@ var varGen = map[string]sessionVar{
 	`enable_insert_fast_path`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enable_insert_fast_path`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("enable_insert_fast_path", s)
+			b, err := paramparse.ParseBoolVar("enable_insert_fast_path", s)
 			if err != nil {
 				return err
 			}
@@ -721,25 +662,6 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(insertFastPathClusterMode.Get(sv))
-		},
-	},
-
-	// CockroachDB extension.
-	`enable_interleaved_joins`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`enable_interleaved_joins`),
-		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("enable_interleaved_joins", s)
-			if err != nil {
-				return err
-			}
-			m.SetInterleavedJoins(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) string {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData.InterleavedJoins)
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(planInterleavedJoins.Get(sv))
 		},
 	},
 
@@ -780,11 +702,11 @@ var varGen = map[string]sessionVar{
 				return pgerror.Newf(pgcode.InvalidParameterValue,
 					`%d is outside the valid range for parameter "extra_float_digits" (-15 .. 3)`, i)
 			}
-			m.SetExtraFloatDigits(int(i))
+			m.SetExtraFloatDigits(int32(i))
 			return nil
 		},
 		Get: func(evalCtx *extendedEvalContext) string {
-			return fmt.Sprintf("%d", evalCtx.SessionData.DataConversion.ExtraFloatDigits)
+			return fmt.Sprintf("%d", evalCtx.SessionData.DataConversionConfig.ExtraFloatDigits)
 		},
 		GlobalDefault: func(sv *settings.Values) string { return "0" },
 	},
@@ -797,7 +719,7 @@ var varGen = map[string]sessionVar{
 		},
 		GetStringVal: makePostgresBoolGetStringValFn("force_savepoint_restart"),
 		Set: func(_ context.Context, m *sessionDataMutator, val string) error {
-			b, err := parseBoolVar("force_savepoint_restart", val)
+			b, err := paramparse.ParseBoolVar("force_savepoint_restart", val)
 			if err != nil {
 				return err
 			}
@@ -825,10 +747,6 @@ var varGen = map[string]sessionVar{
 
 	// See https://www.postgresql.org/docs/10/static/runtime-config-client.html#GUC-LOC-TIMEOUT
 	`lock_timeout`: makeCompatIntVar(`lock_timeout`, 0),
-
-	// See https://www.postgresql.org/docs/10/static/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT
-	// See also issue #5924.
-	`idle_in_transaction_session_timeout`: makeCompatIntVar(`idle_in_transaction_session_timeout`, 0),
 
 	// Supported for PG compatibility only.
 	// See https://www.postgresql.org/docs/10/static/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS
@@ -863,7 +781,7 @@ var varGen = map[string]sessionVar{
 		},
 		GetStringVal: makePostgresBoolGetStringValFn("sql_safe_updates"),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("sql_safe_updates", s)
+			b, err := paramparse.ParseBoolVar("sql_safe_updates", s)
 			if err != nil {
 				return err
 			}
@@ -871,6 +789,25 @@ var varGen = map[string]sessionVar{
 			return nil
 		},
 		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
+	`prefer_lookup_joins_for_fks`: {
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.PreferLookupJoinsForFKs)
+		},
+		GetStringVal: makePostgresBoolGetStringValFn("prefer_lookup_joins_for_fks"),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("prefer_lookup_joins_for_fks", s)
+			if err != nil {
+				return err
+			}
+			m.SetPreferLookupJoinsForFKs(b)
+			return nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(preferLookupJoinsForFKs.Get(sv))
+		},
 	},
 
 	// See https://www.postgresql.org/docs/10/static/ddl-schemas.html#DDL-SCHEMAS-PATH
@@ -882,7 +819,7 @@ var varGen = map[string]sessionVar{
 			comma := ""
 			var buf bytes.Buffer
 			for _, v := range values {
-				s, err := datumAsString(&evalCtx.EvalContext, "search_path", v)
+				s, err := paramparse.DatumAsString(&evalCtx.EvalContext, "search_path", v)
 				if err != nil {
 					return "", err
 				}
@@ -908,7 +845,7 @@ var varGen = map[string]sessionVar{
 			return evalCtx.SessionData.SearchPath.String()
 		},
 		GlobalDefault: func(sv *settings.Values) string {
-			return catconstants.DefaultSearchPath.String()
+			return sessiondata.DefaultSearchPath.String()
 		},
 	},
 
@@ -1002,10 +939,20 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
+	`idle_in_transaction_session_timeout`: {
+		GetStringVal: makeTimeoutVarGetter(`idle_in_transaction_session_timeout`),
+		Set:          idleInTransactionSessionTimeoutVarSet,
+		Get: func(evalCtx *extendedEvalContext) string {
+			ms := evalCtx.SessionData.StmtTimeout.Nanoseconds() / int64(time.Millisecond)
+			return strconv.FormatInt(ms, 10)
+		},
+		GlobalDefault: func(sv *settings.Values) string { return "0" },
+	},
+
 	// See https://www.postgresql.org/docs/10/static/runtime-config-client.html#GUC-TIMEZONE
 	`timezone`: {
 		Get: func(evalCtx *extendedEvalContext) string {
-			return sessionDataTimeZoneFormat(evalCtx.SessionData.DataConversion.Location)
+			return sessionDataTimeZoneFormat(evalCtx.SessionData.GetLocation())
 		},
 		GetStringVal:  timeZoneVarGetStringVal,
 		Set:           timeZoneVarSet,
@@ -1046,7 +993,7 @@ var varGen = map[string]sessionVar{
 	`transaction_read_only`: {
 		GetStringVal: makePostgresBoolGetStringValFn("transaction_read_only"),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("transaction_read_only", s)
+			b, err := paramparse.ParseBoolVar("transaction_read_only", s)
 			if err != nil {
 				return err
 			}
@@ -1085,7 +1032,7 @@ var varGen = map[string]sessionVar{
 			return formatBoolAsPostgresSetting(evalCtx.SessionData.AllowPrepareAsOptPlan)
 		},
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("allow_prepare_as_opt_plan", s)
+			b, err := paramparse.ParseBoolVar("allow_prepare_as_opt_plan", s)
 			if err != nil {
 				return err
 			}
@@ -1112,7 +1059,7 @@ var varGen = map[string]sessionVar{
 	`experimental_enable_temp_tables`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_temp_tables`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("experimental_enable_temp_tables", s)
+			b, err := paramparse.ParseBoolVar("experimental_enable_temp_tables", s)
 			if err != nil {
 				return err
 			}
@@ -1131,7 +1078,7 @@ var varGen = map[string]sessionVar{
 	`experimental_enable_hash_sharded_indexes`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_hash_sharded_indexes`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("experimental_enable_hash_sharded_indexes", s)
+			b, err := paramparse.ParseBoolVar("experimental_enable_hash_sharded_indexes", s)
 			if err != nil {
 				return err
 			}
@@ -1146,11 +1093,29 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
+	`disallow_full_table_scans`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`disallow_full_table_scan`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar(`disallow_full_table_scans`, s)
+			if err != nil {
+				return err
+			}
+			m.SetDisallowFullTableScans(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.DisallowFullTableScans)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(disallowFullTableScans.Get(sv))
+		},
+	},
+
 	// CockroachDB extension.
 	`enable_experimental_alter_column_type_general`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enable_experimental_alter_column_type_general`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("enable_experimental_alter_column_type_general", s)
+			b, err := paramparse.ParseBoolVar("enable_experimental_alter_column_type_general", s)
 			if err != nil {
 				return err
 			}
@@ -1203,7 +1168,7 @@ func makePostgresBoolGetStringValFn(varName string) getStringValFn {
 		if s, ok := val.(*tree.DString); ok {
 			return string(*s), nil
 		}
-		s, err := getSingleBool(varName, val)
+		s, err := paramparse.GetSingleBool(varName, val)
 		if err != nil {
 			return "", err
 		}
@@ -1252,7 +1217,7 @@ func makeCompatBoolVar(varName string, displayValue, anyValAllowed bool) session
 	return sessionVar{
 		Get: func(_ *extendedEvalContext) string { return displayValStr },
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar(varName, s)
+			b, err := paramparse.ParseBoolVar(varName, s)
 			if err != nil {
 				return err
 			}
@@ -1326,20 +1291,6 @@ func IsSessionVariableConfigurable(varName string) (exists, configurable bool) {
 }
 
 var varNames []string
-
-// getSingleBool returns the boolean if the input Datum is a DBool,
-// and returns a detailed error message if not.
-func getSingleBool(name string, val tree.Datum) (*tree.DBool, error) {
-	b, ok := val.(*tree.DBool)
-	if !ok {
-		err := pgerror.Newf(pgcode.InvalidParameterValue,
-			"parameter %q requires a Boolean value", name)
-		err = errors.WithDetailf(err,
-			"%s is a %s", val, errors.Safe(val.ResolvedType()))
-		return nil, err
-	}
-	return b, nil
-}
 
 func getSessionVar(name string, missingOk bool) (bool, sessionVar, error) {
 	if _, ok := UnsupportedVars[name]; ok {

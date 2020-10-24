@@ -218,7 +218,7 @@ func TestClusterVersionUpgrade(t *testing.T) {
 
 	knobs := base.TestingKnobs{
 		Server: &server.TestingKnobs{
-			BootstrapVersionOverride:       oldVersion,
+			BinaryVersionOverride:          oldVersion,
 			DisableAutomaticVersionUpgrade: 1,
 		},
 	}
@@ -328,7 +328,7 @@ func TestClusterVersionUpgrade(t *testing.T) {
 	// Since the wrapped version setting exposes the new versions, it must
 	// definitely be present on all stores on the first try.
 	if err := tc.Servers[1].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
-		cv, err := kvserver.ReadVersionFromEngineOrZero(ctx, s.Engine())
+		cv, err := kvserver.ReadClusterVersion(ctx, s.Engine())
 		if err != nil {
 			return err
 		}
@@ -421,7 +421,7 @@ func TestClusterVersionMixedVersionTooOld(t *testing.T) {
 	knobs := base.TestingKnobs{
 		Server: &server.TestingKnobs{
 			DisableAutomaticVersionUpgrade: 1,
-			BootstrapVersionOverride:       v0,
+			BinaryVersionOverride:          v0,
 		},
 	}
 	tc := setupMixedCluster(t, knobs, versions, "")

@@ -28,10 +28,16 @@ export function getEventDescription(e: Event$Properties): string {
     case eventTypes.DROP_DATABASE:
       const tableDropText = getDroppedObjectsText(info);
       return `Database Dropped: User ${info.User} dropped database ${info.DatabaseName}. ${tableDropText}`;
+    case eventTypes.RENAME_DATABASE:
+      return `Database Renamed: User ${info.User} renamed database ${info.DatabaseName} to ${info.NewDatabaseName}`;
+    case eventTypes.ALTER_DATABASE_OWNER:
+      return `Database Owner Altered: User ${info.User} altered the owner of database ${info.SchemaName} to ${info.Owner}`;
     case eventTypes.CREATE_TABLE:
       return `Table Created: User ${info.User} created table ${info.TableName}`;
     case eventTypes.DROP_TABLE:
       return `Table Dropped: User ${info.User} dropped table ${info.TableName}`;
+    case eventTypes.RENAME_TABLE:
+      return `Table Renamed: User ${info.User} renamed table ${info.TableName} to ${info.NewTableName}`;
     case eventTypes.TRUNCATE_TABLE:
       return `Table Truncated: User ${info.User} truncated table ${info.TableName}`;
     case eventTypes.ALTER_TABLE:
@@ -79,6 +85,20 @@ export function getEventDescription(e: Event$Properties): string {
       return `Zone Config Removed: User ${info.User} removed the zone config for ${info.Target}`;
     case eventTypes.CREATE_STATISTICS:
       return `Table statistics refreshed for ${info.TableName}`;
+    case eventTypes.GRANT_PRIVILEGE:
+      return `Privileges granted: User ${info.User} granted ${info.Privileges} to ${info.Grantees} on ${info.Target}`;
+    case eventTypes.REVOKE_PRIVILEGE:
+      return `Privileges revoked: User ${info.User} revoked ${info.Privileges} from ${info.Grantees} on ${info.Target}`;
+    case eventTypes.CREATE_SCHEMA:
+      return `Schema Created: User ${info.User} created schema ${info.SchemaName} with owner ${info.Owner}`;
+    case eventTypes.DROP_SCHEMA:
+      return `Schema Dropped: User ${info.User} dropped schema ${info.SchemaName}`;
+    case eventTypes.RENAME_SCHEMA:
+      return `Schema Renamed: User ${info.User} renamed schema ${info.SchemaName} to ${info.NewSchemaName}`;
+    case eventTypes.ALTER_SCHEMA_OWNER:
+      return `Schema Owner Altered: User ${info.User} altered the owner of schema ${info.SchemaName} to ${info.Owner}`;
+    case eventTypes.CONVERT_TO_SCHEMA:
+      return `Database Converted: User ${info.User} converted database ${info.DatabaseName} to a schema with parent database ${info.NewDatabaseName}`;
     default:
       return `Unknown Event Type: ${e.event_type}, content: ${JSON.stringify(info, null, 2)}`;
   }
@@ -89,7 +109,9 @@ export function getEventDescription(e: Event$Properties): string {
 export interface EventInfo {
   User: string;
   DatabaseName?: string;
+  NewDatabaseName?: string;
   TableName?: string;
+  NewTableName?: string;
   IndexName?: string;
   MutationID?: string;
   ViewName?: string;
@@ -99,6 +121,11 @@ export interface EventInfo {
   Target?: string;
   Config?: string;
   Statement?: string;
+  Grantees?: string;
+  Privileges?: string;
+  SchemaName?: string;
+  NewSchemaName?: string;
+  Owner?: string;
   // The following are three names for the same key (it was renamed twice).
   // All ar included for backwards compatibility.
   DroppedTables?: string[];

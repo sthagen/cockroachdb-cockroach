@@ -17,11 +17,12 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -78,31 +79,31 @@ func selectComment(ctx context.Context, p PlanHookState, tableID descpb.ID) (tc 
 // statement used to create the given view. It is used in the implementation of
 // the crdb_internal.create_statements virtual table.
 func ShowCreateView(
-	ctx context.Context, tn *tree.TableName, desc *sqlbase.ImmutableTableDescriptor,
+	ctx context.Context, tn *tree.TableName, desc catalog.TableDescriptor,
 ) (string, error) {
 	f := tree.NewFmtCtx(tree.FmtSimple)
 	f.WriteString("CREATE ")
-	if desc.Temporary {
+	if desc.IsTemporary() {
 		f.WriteString("TEMP ")
 	}
 	f.WriteString("VIEW ")
 	f.FormatNode(tn)
 	f.WriteString(" (")
-	for i := range desc.Columns {
+	for i := range desc.GetPublicColumns() {
 		if i > 0 {
 			f.WriteString(", ")
 		}
-		f.FormatNameP(&desc.Columns[i].Name)
+		f.FormatNameP(&desc.GetColumnAtIdx(i).Name)
 	}
 	f.WriteString(") AS ")
-	f.WriteString(desc.ViewQuery)
+	f.WriteString(desc.GetViewQuery())
 	return f.CloseAndGetString(), nil
 }
 
 // showComments prints out the COMMENT statements sufficient to populate a
 // table's comments, including its index and column comments.
 func showComments(
-	tn *tree.TableName, table *sqlbase.ImmutableTableDescriptor, tc *tableComments, buf *bytes.Buffer,
+	tn *tree.TableName, table catalog.TableDescriptor, tc *tableComments, buf *bytes.Buffer,
 ) error {
 	if tc == nil {
 		return nil
@@ -159,7 +160,7 @@ func showComments(
 func showForeignKeyConstraint(
 	buf *bytes.Buffer,
 	dbPrefix string,
-	originTable *sqlbase.ImmutableTableDescriptor,
+	originTable catalog.TableDescriptor,
 	fk *descpb.ForeignKeyConstraint,
 	lCtx simpleSchemaResolver,
 	searchPath sessiondata.SearchPath,
@@ -219,16 +220,16 @@ func showForeignKeyConstraint(
 // ShowCreateSequence returns a valid SQL representation of the
 // CREATE SEQUENCE statement used to create the given sequence.
 func ShowCreateSequence(
-	ctx context.Context, tn *tree.TableName, desc *sqlbase.ImmutableTableDescriptor,
+	ctx context.Context, tn *tree.TableName, desc catalog.TableDescriptor,
 ) (string, error) {
 	f := tree.NewFmtCtx(tree.FmtSimple)
 	f.WriteString("CREATE ")
-	if desc.Temporary {
+	if desc.IsTemporary() {
 		f.WriteString("TEMP ")
 	}
 	f.WriteString("SEQUENCE ")
 	f.FormatNode(tn)
-	opts := desc.SequenceOpts
+	opts := desc.GetSequenceOpts()
 	f.Printf(" MINVALUE %d", opts.MinValue)
 	f.Printf(" MAXVALUE %d", opts.MaxValue)
 	f.Printf(" INCREMENT %d", opts.Increment)
@@ -241,8 +242,8 @@ func ShowCreateSequence(
 
 // showFamilyClause creates the FAMILY clauses for a CREATE statement, writing them
 // to tree.FmtCtx f
-func showFamilyClause(desc *sqlbase.ImmutableTableDescriptor, f *tree.FmtCtx) {
-	for _, fam := range desc.Families {
+func showFamilyClause(desc catalog.TableDescriptor, f *tree.FmtCtx) {
+	for _, fam := range desc.GetFamilies() {
 		activeColumnNames := make([]string, 0, len(fam.ColumnNames))
 		for i, colID := range fam.ColumnIDs {
 			if _, err := desc.FindActiveColumnByID(colID); err == nil {
@@ -304,9 +305,9 @@ func showCreateInterleave(
 // ShowCreatePartitioning returns a PARTITION BY clause for the specified
 // index, if applicable.
 func ShowCreatePartitioning(
-	a *sqlbase.DatumAlloc,
+	a *rowenc.DatumAlloc,
 	codec keys.SQLCodec,
-	tableDesc sqlbase.TableDescriptor,
+	tableDesc catalog.TableDescriptor,
 	idxDesc *descpb.IndexDescriptor,
 	partDesc *descpb.PartitioningDescriptor,
 	buf *bytes.Buffer,
@@ -357,7 +358,7 @@ func ShowCreatePartitioning(
 			if j != 0 {
 				buf.WriteString(`, `)
 			}
-			tuple, _, err := sqlbase.DecodePartitionTuple(
+			tuple, _, err := rowenc.DecodePartitionTuple(
 				a, codec, tableDesc, idxDesc, partDesc, values, fakePrefixDatums)
 			if err != nil {
 				return err
@@ -381,14 +382,14 @@ func ShowCreatePartitioning(
 		buf.WriteString("\tPARTITION ")
 		buf.WriteString(part.Name)
 		buf.WriteString(" VALUES FROM ")
-		fromTuple, _, err := sqlbase.DecodePartitionTuple(
+		fromTuple, _, err := rowenc.DecodePartitionTuple(
 			a, codec, tableDesc, idxDesc, partDesc, part.FromInclusive, fakePrefixDatums)
 		if err != nil {
 			return err
 		}
 		buf.WriteString(fromTuple.String())
 		buf.WriteString(" TO ")
-		toTuple, _, err := sqlbase.DecodePartitionTuple(
+		toTuple, _, err := rowenc.DecodePartitionTuple(
 			a, codec, tableDesc, idxDesc, partDesc, part.ToExclusive, fakePrefixDatums)
 		if err != nil {
 			return err
@@ -404,10 +405,7 @@ func ShowCreatePartitioning(
 // showConstraintClause creates the CONSTRAINT clauses for a CREATE statement,
 // writing them to tree.FmtCtx f
 func showConstraintClause(
-	ctx context.Context,
-	desc *sqlbase.ImmutableTableDescriptor,
-	semaCtx *tree.SemaContext,
-	f *tree.FmtCtx,
+	ctx context.Context, desc catalog.TableDescriptor, semaCtx *tree.SemaContext, f *tree.FmtCtx,
 ) error {
 	for _, e := range desc.AllActiveAndInactiveChecks() {
 		if e.Hidden {
@@ -420,7 +418,7 @@ func showConstraintClause(
 			f.WriteString(" ")
 		}
 		f.WriteString("CHECK (")
-		expr, err := schemaexpr.FormatExprForDisplay(ctx, desc, e.Expr, semaCtx)
+		expr, err := schemaexpr.FormatExprForDisplay(ctx, desc, e.Expr, semaCtx, tree.FmtParsable)
 		if err != nil {
 			return err
 		}

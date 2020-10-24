@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
 // KVFetcher wraps kvBatchFetcher, providing a NextKV interface that returns the
@@ -34,24 +35,28 @@ type KVFetcher struct {
 }
 
 // NewKVFetcher creates a new KVFetcher.
+// If mon is non-nil, this fetcher will track its fetches and must be Closed.
 func NewKVFetcher(
 	txn *kv.Txn,
 	spans roachpb.Spans,
 	reverse bool,
 	useBatchLimit bool,
 	firstBatchLimit int64,
-	lockStr descpb.ScanLockingStrength,
+	lockStrength descpb.ScanLockingStrength,
+	lockWaitPolicy descpb.ScanLockingWaitPolicy,
+	mon *mon.BytesMonitor,
 ) (*KVFetcher, error) {
 	kvBatchFetcher, err := makeKVBatchFetcher(
-		txn, spans, reverse, useBatchLimit, firstBatchLimit, lockStr,
+		txn, spans, reverse, useBatchLimit, firstBatchLimit, lockStrength, lockWaitPolicy, mon,
 	)
 	return newKVFetcher(&kvBatchFetcher), err
 }
 
 func newKVFetcher(batchFetcher kvBatchFetcher) *KVFetcher {
-	return &KVFetcher{
+	ret := &KVFetcher{
 		kvBatchFetcher: batchFetcher,
 	}
+	return ret
 }
 
 // GetBytesRead returns the number of bytes read by this fetcher.
@@ -119,6 +124,13 @@ func (f *KVFetcher) NextKV(
 	}
 }
 
+// Close releases the resources held by this KVFetcher. It must be called
+// at the end of execution if the fetcher was provisioned with a memory
+// monitor.
+func (f *KVFetcher) Close(ctx context.Context) {
+	f.kvBatchFetcher.close(ctx)
+}
+
 // SpanKVFetcher is a kvBatchFetcher that returns a set slice of kvs.
 type SpanKVFetcher struct {
 	KVs []roachpb.KeyValue
@@ -135,3 +147,5 @@ func (f *SpanKVFetcher) nextBatch(
 	f.KVs = nil
 	return true, res, nil, roachpb.Span{}, nil
 }
+
+func (f *SpanKVFetcher) close(context.Context) {}

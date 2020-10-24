@@ -12,12 +12,17 @@ package schemaexpr
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 // DequalifyAndValidateExpr validates that an expression has the given type
@@ -31,17 +36,17 @@ import (
 // the expression.
 func DequalifyAndValidateExpr(
 	ctx context.Context,
-	desc sqlbase.TableDescriptor,
+	desc catalog.TableDescriptor,
 	expr tree.Expr,
 	typ *types.T,
 	op string,
 	semaCtx *tree.SemaContext,
 	maxVolatility tree.Volatility,
 	tn *tree.TableName,
-) (string, sqlbase.TableColSet, error) {
-	var colIDs sqlbase.TableColSet
-	sourceInfo := sqlbase.NewSourceInfoForSingleTable(
-		*tn, sqlbase.ResultColumnsFromColDescs(
+) (string, TableColSet, error) {
+	var colIDs TableColSet
+	sourceInfo := colinfo.NewSourceInfoForSingleTable(
+		*tn, colinfo.ResultColumnsFromColDescs(
 			desc.GetID(),
 			desc.AllNonDropColumns(),
 		),
@@ -58,7 +63,7 @@ func DequalifyAndValidateExpr(
 		return "", colIDs, err
 	}
 
-	typedExpr, err := sqlbase.SanitizeVarFreeExpr(
+	typedExpr, err := SanitizeVarFreeExpr(
 		ctx,
 		replacedExpr,
 		typ,
@@ -75,10 +80,8 @@ func DequalifyAndValidateExpr(
 }
 
 // ExtractColumnIDs returns the set of column IDs within the given expression.
-func ExtractColumnIDs(
-	desc sqlbase.TableDescriptor, rootExpr tree.Expr,
-) (sqlbase.TableColSet, error) {
-	var colIDs sqlbase.TableColSet
+func ExtractColumnIDs(desc catalog.TableDescriptor, rootExpr tree.Expr) (TableColSet, error) {
+	var colIDs TableColSet
 
 	_, err := tree.SimpleVisit(rootExpr, func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		vBase, ok := expr.(tree.VarName)
@@ -108,33 +111,25 @@ func ExtractColumnIDs(
 	return colIDs, err
 }
 
-// FormatExprForDisplay formats a schema expression string for display by adding
-// type annotations and resolving user defined types.
+// FormatExprForDisplay formats a schema expression string for display. It
+// accepts formatting flags to control things like showing type annotations or
+// type casts.
 func FormatExprForDisplay(
-	ctx context.Context, desc sqlbase.TableDescriptor, exprStr string, semaCtx *tree.SemaContext,
+	ctx context.Context,
+	desc catalog.TableDescriptor,
+	exprStr string,
+	semaCtx *tree.SemaContext,
+	fmtFlags tree.FmtFlags,
 ) (string, error) {
 	expr, err := deserializeExprForFormatting(ctx, desc, exprStr, semaCtx)
 	if err != nil {
 		return "", err
 	}
-	return tree.SerializeForDisplay(expr), nil
-}
-
-// FormatExprForDisplayWithoutTypeAnnotations formats a schema expression string
-// for display, similar to FormatExprForDisplay, but does not add type
-// annotations.
-func FormatExprForDisplayWithoutTypeAnnotations(
-	ctx context.Context, desc sqlbase.TableDescriptor, exprStr string, semaCtx *tree.SemaContext,
-) (string, error) {
-	expr, err := deserializeExprForFormatting(ctx, desc, exprStr, semaCtx)
-	if err != nil {
-		return "", err
-	}
-	return tree.AsString(expr), nil
+	return tree.AsStringWithFlags(expr, fmtFlags), nil
 }
 
 func deserializeExprForFormatting(
-	ctx context.Context, desc sqlbase.TableDescriptor, exprStr string, semaCtx *tree.SemaContext,
+	ctx context.Context, desc catalog.TableDescriptor, exprStr string, semaCtx *tree.SemaContext,
 ) (tree.Expr, error) {
 	expr, err := parser.ParseExpr(exprStr)
 	if err != nil {
@@ -162,7 +157,7 @@ func deserializeExprForFormatting(
 type nameResolver struct {
 	evalCtx    *tree.EvalContext
 	tableID    descpb.ID
-	source     *sqlbase.DataSourceInfo
+	source     *colinfo.DataSourceInfo
 	nrc        *nameResolverIVarContainer
 	ivarHelper *tree.IndexedVarHelper
 }
@@ -171,9 +166,9 @@ type nameResolver struct {
 func newNameResolver(
 	evalCtx *tree.EvalContext, tableID descpb.ID, tn *tree.TableName, cols []*descpb.ColumnDescriptor,
 ) *nameResolver {
-	source := sqlbase.NewSourceInfoForSingleTable(
+	source := colinfo.NewSourceInfoForSingleTable(
 		*tn,
-		sqlbase.ResultColumnsFromColDescPtrs(tableID, cols),
+		colinfo.ResultColumnsFromColDescPtrs(tableID, cols),
 	)
 	nrc := &nameResolverIVarContainer{cols}
 	ivarHelper := tree.MakeIndexedVarHelper(nrc, len(cols))
@@ -190,7 +185,8 @@ func newNameResolver(
 // resolveNames returns an expression equivalent to the input expression with
 // unresolved names replaced with IndexedVars.
 func (nr *nameResolver) resolveNames(expr tree.Expr) (tree.Expr, error) {
-	return sqlbase.ResolveNames(expr, nr.source, *nr.ivarHelper, nr.evalCtx.SessionData.SearchPath)
+	var v NameResolutionVisitor
+	return ResolveNamesUsingVisitor(&v, expr, nr.source, *nr.ivarHelper, nr.evalCtx.SessionData.SearchPath)
 }
 
 // addColumn adds a new column to the nameResolver so that it can be resolved in
@@ -198,7 +194,7 @@ func (nr *nameResolver) resolveNames(expr tree.Expr) (tree.Expr, error) {
 func (nr *nameResolver) addColumn(col *descpb.ColumnDescriptor) {
 	nr.ivarHelper.AppendSlot()
 	nr.nrc.cols = append(nr.nrc.cols, col)
-	newCols := sqlbase.ResultColumnsFromColDescs(nr.tableID, []descpb.ColumnDescriptor{*col})
+	newCols := colinfo.ResultColumnsFromColDescs(nr.tableID, []descpb.ColumnDescriptor{*col})
 	nr.source.SourceColumns = append(nr.source.SourceColumns, newCols...)
 }
 
@@ -231,4 +227,59 @@ func (nrc *nameResolverIVarContainer) IndexedVarResolvedType(idx int) *types.T {
 // IndexVarNodeFormatter implements the tree.IndexedVarContainer interface.
 func (nrc *nameResolverIVarContainer) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
 	return nil
+}
+
+// SanitizeVarFreeExpr verifies that an expression is valid, has the correct
+// type and contains no variable expressions. It returns the type-checked and
+// constant-folded expression.
+func SanitizeVarFreeExpr(
+	ctx context.Context,
+	expr tree.Expr,
+	expectedType *types.T,
+	context string,
+	semaCtx *tree.SemaContext,
+	maxVolatility tree.Volatility,
+) (tree.TypedExpr, error) {
+	if tree.ContainsVars(expr) {
+		return nil, pgerror.Newf(pgcode.Syntax,
+			"variable sub-expressions are not allowed in %s", context)
+	}
+
+	// We need to save and restore the previous value of the field in
+	// semaCtx in case we are recursively called from another context
+	// which uses the properties field.
+	defer semaCtx.Properties.Restore(semaCtx.Properties)
+
+	// Ensure that the expression doesn't contain special functions.
+	flags := tree.RejectSpecial
+
+	switch maxVolatility {
+	case tree.VolatilityImmutable:
+		flags |= tree.RejectStableOperators
+		fallthrough
+
+	case tree.VolatilityStable:
+		flags |= tree.RejectVolatileFunctions
+
+	case tree.VolatilityVolatile:
+		// Allow anything (no flags needed).
+
+	default:
+		panic(errors.AssertionFailedf("maxVolatility %s not supported", maxVolatility))
+	}
+	semaCtx.Properties.Require(context, flags)
+
+	typedExpr, err := tree.TypeCheck(ctx, expr, semaCtx, expectedType)
+	if err != nil {
+		return nil, err
+	}
+
+	actualType := typedExpr.ResolvedType()
+	if !expectedType.Equivalent(actualType) && typedExpr != tree.DNull {
+		// The expression must match the column type exactly unless it is a constant
+		// NULL value.
+		return nil, fmt.Errorf("expected %s expression to have type %s, but '%s' has type %s",
+			context, expectedType, expr, actualType)
+	}
+	return typedExpr, nil
 }

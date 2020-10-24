@@ -19,7 +19,7 @@ import "roachpb/metadata.proto";
 import "storage/enginepb/mvcc.proto";
 import "storage/enginepb/mvcc3.proto";
 import "util/hlc/timestamp.proto";
-import "util/tracing/recorded_span.proto";
+import "util/tracing/tracingpb/recorded_span.proto";
 import "gogoproto/gogo.proto";
 
 // ReadConsistencyType specifies what type of consistency is observed
@@ -657,21 +657,35 @@ message EndTxnRequest {
   // reliably for these transactions - a TransactionStatusError might be
   // returned instead if 1PC execution fails.
   bool require_1pc = 6 [(gogoproto.customname) = "Require1PC"];
-  // CanCommitAtHigherTimestamp indicates that the batch this EndTxn is part of
-  // can be evaluated at a higher timestamp than the transaction's read
-  // timestamp. This is set by the client if the transaction has not performed
-  // any reads that must be refreshed prior to sending this current batch. When
-  // set, it allows the server to handle pushes and write too old conditions
-  // locally.
+  // DeprecatedCanCommitAtHigherTimestamp indicates that the batch this EndTxn
+  // is part of can be evaluated at a higher timestamp than the transaction's
+  // read timestamp. This is set by the client if the transaction has not
+  // performed any reads that must be refreshed prior to sending this current
+  // batch. When set, it allows the server to handle pushes and write too old
+  // conditions locally.
   // TODO(nvanbenschoten): remove this in favor of can_forward_read_timestamp
-  // in v20.2.
-  bool can_commit_at_higher_timestamp = 8;
+  // in v21.1. The flag is not read in v20.2.
+  bool deprecated_can_commit_at_higher_timestamp = 8;
   // True to indicate that lock spans should be resolved with poison=true.
   // This is used when the transaction is being aborted independently of the
   // main thread of client operation, as in the case of an asynchronous abort
   // from the TxnCoordSender on a failed heartbeat. It should only be set to
   // true when commit=false.
   bool poison = 9;
+  // TxnHeartbeating indicates that the transaction's coordinator has launched
+  // its heartbeat loop and that it may have created its transaction record as
+  // PENDING through a HeartbeatTxn request by the time that this EndTxn request
+  // evaluates. If the flag is not set and the transaction has not yet issued a
+  // successful EndTxn requests, the transaction's record can not already exist
+  // (but see the WARNING below).
+  //
+  // For details about transaction record state transitions, see the diagram on
+  // CanCreateTxnRecord. This diagram demonstrates that only EndTxn requests and
+  // HeartbeatTxn requests can create new transaction records.
+  //
+  // WARNING: this flag was introduced in the v20.2 release. v20.1 nodes may not
+  // set this properly so it should not be relied upon for correctness.
+  bool txn_heartbeating = 10;
   reserved 7;
 }
 
@@ -1020,6 +1034,11 @@ message QueryTxnResponse {
   // Contains the current state of the queried transaction. If the queried
   // transaction record does not exist, this will be empty.
   Transaction queried_txn = 2 [(gogoproto.nullable) = false];
+  // txn_record_exists is set if the queried_txn comes from a transaction record
+  // read from the database. If not set, then the txn record was "synthesized".
+  //
+  // The field only started being populated in 20.2, so 20.1 nodes never set it.
+  bool txn_record_exists = 4;
   // Specifies a list of transaction IDs which are waiting on the txn.
   repeated bytes waiting_txns = 3 [(gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"];
 }
@@ -1078,8 +1097,9 @@ message ResolveIntentRequest {
   storage.enginepb.TxnMeta intent_txn = 2 [(gogoproto.nullable) = false];
   // The status of the transaction.
   TransactionStatus status = 3;
-  // Optionally poison the abort span for the transaction the intent's
-  // range.
+  // Optionally poison the abort span for the transaction on the intent's range.
+  // The field is ignored if status != ABORTED (i.e. only intents from ABORTED
+  // txns ever poison the abort spans).
   bool poison = 4;
   // The list of ignored seqnum ranges as per the Transaction record.
   repeated storage.enginepb.IgnoredSeqNumRange ignored_seqnums = 5 [
@@ -1106,8 +1126,9 @@ message ResolveIntentRangeRequest {
   storage.enginepb.TxnMeta intent_txn = 2 [(gogoproto.nullable) = false];
   // The status of the transaction.
   TransactionStatus status = 3;
-  // Optionally poison the abort span for the transaction on all ranges
-  // on which the intents reside.
+  // Optionally poison the abort span for the transaction on all ranges on which
+  // the intents reside. The field is ignored if status != ABORTED (i.e. only
+  // intents from ABORTED txns ever poison the abort spans).
   bool poison = 4;
   // The minimum timestamp for any intents written by this
   // transaction. If present, this value can be used to optimize the
@@ -2079,7 +2100,7 @@ message BatchResponse {
     util.hlc.Timestamp now = 5 [(gogoproto.nullable) = false];
     // collected_spans stores trace spans recorded during the execution of this
     // request.
-    repeated util.tracing.RecordedSpan collected_spans = 6 [(gogoproto.nullable) = false];
+    repeated util.tracing.tracingpb.RecordedSpan collected_spans = 6 [(gogoproto.nullable) = false];
     // Range or list of ranges used to execute the request. The server only
     // populates this if return_range_info is set on the request, or if the
     // server detects the client's client_range_info to be stale.
@@ -2196,10 +2217,31 @@ message GossipSubscriptionEvent {
   Error error = 4;
 }
 
-// Batch and RangeFeed service implemeted by nodes for KV API requests.
+// JoinNodeRequest is used to specify to the server node what the client's
+// binary version is. If it's not compatible with the rest of the cluster, the
+// join attempt is refused.
+message JoinNodeRequest {
+  roachpb.Version binary_version = 1;
+}
+
+// JoinNodeResponse informs the joining node what the cluster id is, what
+// node id was allocated to it, and what store ID to use for its first store. It
+// also informs the node what the current active version is.
+message JoinNodeResponse {
+  bytes cluster_id = 1 [(gogoproto.customname) = "ClusterID"];
+  int32 node_id = 2 [(gogoproto.customname) = "NodeID"];
+  int32 store_id = 3 [(gogoproto.customname) = "StoreID"];
+  roachpb.Version active_version = 4;
+}
+
+// Batch and RangeFeed service implemented by nodes for KV API requests.
 service Internal {
   rpc Batch              (BatchRequest)              returns (BatchResponse)                  {}
   rpc RangeLookup        (RangeLookupRequest)        returns (RangeLookupResponse)            {}
   rpc RangeFeed          (RangeFeedRequest)          returns (stream RangeFeedEvent)          {}
   rpc GossipSubscription (GossipSubscriptionRequest) returns (stream GossipSubscriptionEvent) {}
+
+  // Join a bootstrapped cluster. If the target node is itself not part of a
+  // bootstrapped cluster, an appropriate error is returned.
+  rpc Join(JoinNodeRequest) returns (JoinNodeResponse) { }
 }

@@ -15,10 +15,10 @@ import (
 	"text/template"
 )
 
-const defaultAggTmpl = "pkg/sql/colexec/default_agg_tmpl.go"
+const defaultAggTmpl = "pkg/sql/colexec/colexecagg/default_agg_tmpl.go"
 
 func genDefaultAgg(inputFileContents string, wr io.Writer) error {
-	addTuple := makeFunctionRegex("_ADD_TUPLE", 5)
+	addTuple := makeFunctionRegex("_ADD_TUPLE", 4)
 	s := addTuple.ReplaceAllString(inputFileContents, `{{template "addTuple"}}`)
 
 	tmpl, err := template.New("default_agg").Parse(s)

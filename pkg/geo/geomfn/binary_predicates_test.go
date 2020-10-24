@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,8 +32,8 @@ var (
 
 func TestCovers(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{rightRect, rightRectPoint, true},
@@ -56,8 +57,8 @@ func TestCovers(t *testing.T) {
 
 func TestCoveredBy(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{rightRect, rightRectPoint, false},
@@ -81,8 +82,8 @@ func TestCoveredBy(t *testing.T) {
 
 func TestContains(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{rightRect, rightRectPoint, true},
@@ -108,8 +109,8 @@ func TestContains(t *testing.T) {
 
 func TestContainsProperly(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{rightRect, rightRect, false},
@@ -133,8 +134,8 @@ func TestContainsProperly(t *testing.T) {
 
 func TestCrosses(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{rightRect, rightRectPoint, false},
@@ -160,8 +161,8 @@ func TestCrosses(t *testing.T) {
 
 func TestDisjoint(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{rightRect, rightRectPoint, false},
@@ -184,8 +185,8 @@ func TestDisjoint(t *testing.T) {
 
 func TestEquals(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{emptyLine, emptyRect, true},
@@ -213,8 +214,8 @@ func TestEquals(t *testing.T) {
 
 func TestIntersects(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{rightRect, leftRectPoint, false},
@@ -239,10 +240,82 @@ func TestIntersects(t *testing.T) {
 	})
 }
 
+func TestOrderingEquals(t *testing.T) {
+	testCases := []struct {
+		a        string
+		b        string
+		expected bool
+	}{
+		{"POINT EMPTY", "POINT EMPTY", true},
+		{"POINT (1 1)", "POINT (1 1)", true},
+		{"POINT (1 1)", "POINT (2 2)", false},
+		{"MULTIPOINT EMPTY", "MULTIPOINT EMPTY", true},
+		{"MULTIPOINT (1 1, EMPTY, 2 2)", "MULTIPOINT (1 1, EMPTY, 2 2)", true},
+		{"MULTIPOINT (1 1, 2 2)", "MULTIPOINT (2 2, 1 1)", false},
+		{"MULTIPOINT (1 1, EMPTY, 2 2)", "MULTIPOINT (1 1, 2 2)", false},
+		{"LINESTRING EMPTY", "LINESTRING EMPTY", true},
+		{"LINESTRING (1 1, 2 2)", "LINESTRING (1 1, 2 2)", true},
+		{"LINESTRING (1 1, 2 2)", "LINESTRING (2 2, 1 1)", false},
+		{"LINESTRING (1 1, 2 2)", "LINESTRING (1 1, 2 2, 3 3)", false},
+		{"MULTILINESTRING EMPTY", "MULTILINESTRING EMPTY", true},
+		{
+			"MULTILINESTRING ((1 1, 2 2), EMPTY, (3 3, 4 4))",
+			"MULTILINESTRING ((1 1, 2 2), EMPTY, (3 3, 4 4))",
+			true,
+		},
+		{
+			"MULTILINESTRING ((1 1, 2 2), EMPTY, (3 3, 4 4))",
+			"MULTILINESTRING ((1 1, 2 2), (3 3, 4 4))",
+			false,
+		},
+		{"POLYGON EMPTY", "POLYGON EMPTY", true},
+		{"POLYGON ((1 2, 3 4, 5 6, 1 2))", "POLYGON ((1 2, 3 4, 5 6, 1 2))", true},
+		{"POLYGON ((1 2, 3 4, 5 6, 1 2))", "POLYGON ((1 2, 5 6, 3 4, 1 2))", false},
+		{"MULTIPOLYGON EMPTY", "MULTIPOLYGON EMPTY", true},
+		{
+			"MULTIPOLYGON (((1 2, 3 4, 5 6, 1 2)), EMPTY, ((9 8, 7 6, 5 4, 9 8)))",
+			"MULTIPOLYGON (((1 2, 3 4, 5 6, 1 2)), EMPTY, ((9 8, 7 6, 5 4, 9 8)))",
+			true,
+		},
+		{
+			"MULTIPOLYGON (((1 2, 3 4, 5 6, 1 2)), EMPTY, ((9 8, 7 6, 5 4, 9 8)))",
+			"MULTIPOLYGON (((1 2, 3 4, 5 6, 1 2)), ((9 8, 7 6, 5 4, 9 8)))",
+			false,
+		},
+		{"GEOMETRYCOLLECTION EMPTY", "GEOMETRYCOLLECTION EMPTY", true},
+		{
+			"GEOMETRYCOLLECTION (POINT (1 1), LINESTRING (1 1, 2 2))",
+			"GEOMETRYCOLLECTION (POINT (1 1), LINESTRING (1 1, 2 2))",
+			true,
+		},
+		{
+			"GEOMETRYCOLLECTION (POINT (1 1), LINESTRING (1 1, 2 2))",
+			"GEOMETRYCOLLECTION (LINESTRING (1 1, 2 2), POINT (1 1))",
+			false,
+		},
+		{"POINT EMPTY", "LINESTRING EMPTY", false},
+		{"POINT (1 1)", "MULTIPOINT (1 1)", false},
+		{"SRID=4000;POINT (1 1)", "SRID=4326;POINT (1 1)", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%v, %v", tc.a, tc.b), func(t *testing.T) {
+			a, err := geo.ParseGeometryFromEWKT(geopb.EWKT(tc.a), geopb.DefaultGeometrySRID, false)
+			require.NoError(t, err)
+			b, err := geo.ParseGeometryFromEWKT(geopb.EWKT(tc.b), geopb.DefaultGeometrySRID, false)
+			require.NoError(t, err)
+
+			eq, err := OrderingEquals(a, b)
+			require.NoError(t, err)
+			require.Equal(t, eq, tc.expected)
+		})
+	}
+}
+
 func TestOverlaps(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{rightRect, rightRectPoint, false},
@@ -267,8 +340,8 @@ func TestOverlaps(t *testing.T) {
 
 func TestTouches(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{rightRect, rightRectPoint, false},
@@ -292,8 +365,8 @@ func TestTouches(t *testing.T) {
 
 func TestWithin(t *testing.T) {
 	testCases := []struct {
-		a        *geo.Geometry
-		b        *geo.Geometry
+		a        geo.Geometry
+		b        geo.Geometry
 		expected bool
 	}{
 		{rightRect, rightRectPoint, false},

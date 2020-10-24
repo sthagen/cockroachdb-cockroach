@@ -39,10 +39,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -90,6 +92,7 @@ var errAdminAPIError = status.Errorf(codes.Internal, "An internal server error "
 // A adminServer provides a RESTful HTTP API to administration of
 // the cockroach cluster.
 type adminServer struct {
+	*adminPrivilegeChecker
 	server     *Server
 	memMonitor *mon.BytesMonitor
 }
@@ -101,8 +104,11 @@ var noteworthyAdminMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEW
 
 // newAdminServer allocates and returns a new REST server for
 // administrative APIs.
-func newAdminServer(s *Server) *adminServer {
-	server := &adminServer{server: s}
+func newAdminServer(s *Server, ie *sql.InternalExecutor) *adminServer {
+	server := &adminServer{
+		adminPrivilegeChecker: &adminPrivilegeChecker{ie: ie},
+		server:                s,
+	}
 	// TODO(knz): We do not limit memory usage by admin operations
 	// yet. Is this wise?
 	server.memMonitor = mon.NewUnlimitedMonitor(
@@ -230,7 +236,7 @@ func (s *adminServer) Databases(
 
 	rows, err := s.server.sqlServer.internalExecutor.QueryEx(
 		ctx, "admin-show-dbs", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: sessionUser},
+		sessiondata.InternalExecutorOverride{User: sessionUser},
 		"SHOW DATABASES",
 	)
 	if err != nil {
@@ -270,8 +276,11 @@ func (s *adminServer) DatabaseDetails(
 	// Marshal grants.
 	rows, cols, err := s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-show-grants", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
-		fmt.Sprintf("SHOW GRANTS ON DATABASE %s", escDBName),
+		sessiondata.InternalExecutorOverride{User: userName},
+		// We only want to show the grants on the database.
+		// Since public schemas inherit grants from the database,
+		// it is safe to query only the public schema here.
+		fmt.Sprintf("SELECT * FROM [SHOW GRANTS ON DATABASE %s] WHERE schema_name = 'public'", escDBName),
 	)
 	if s.isNotFoundError(err) {
 		return nil, status.Errorf(codes.NotFound, "%s", err)
@@ -293,10 +302,6 @@ func (s *adminServer) DatabaseDetails(
 			if err := scanner.Scan(row, schemaCol, &schemaName); err != nil {
 				return nil, err
 			}
-			if schemaName != tree.PublicSchema {
-				// We only want to list real tables.
-				continue
-			}
 
 			// Marshal grant, splitting comma-separated privileges into a proper slice.
 			var grant serverpb.DatabaseDetailsResponse_Grant
@@ -315,9 +320,10 @@ func (s *adminServer) DatabaseDetails(
 	// Marshal table names.
 	rows, cols, err = s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-show-tables", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
-		fmt.Sprintf("SHOW TABLES FROM %s", escDBName),
-	)
+		sessiondata.InternalExecutorOverride{User: userName, Database: req.Database},
+		`SELECT table_schema, table_name FROM information_schema.tables
+WHERE table_catalog = $1 AND table_type != 'SYSTEM VIEW';`, req.Database)
+
 	if s.isNotFoundError(err) {
 		return nil, status.Errorf(codes.NotFound, "%s", err)
 	}
@@ -328,33 +334,28 @@ func (s *adminServer) DatabaseDetails(
 	// Marshal table names.
 	{
 		scanner := makeResultScanner(cols)
-		if a, e := len(cols), 4; a != e {
-			return nil, s.serverErrorf("show tables columns mismatch: %d != expected %d", a, e)
-		}
 		for _, row := range rows {
 			var schemaName, tableName string
-			if err := scanner.Scan(row, "schema_name", &schemaName); err != nil {
+			if err := scanner.Scan(row, "table_schema", &schemaName); err != nil {
 				return nil, err
-			}
-			if schemaName != "public" {
-				continue
 			}
 			if err := scanner.Scan(row, "table_name", &tableName); err != nil {
 				return nil, err
 			}
-			resp.TableNames = append(resp.TableNames, tableName)
+			resp.TableNames = append(resp.TableNames, fmt.Sprintf("%s.%s",
+				tree.NameStringP(&schemaName), tree.NameStringP(&tableName)))
 		}
 	}
 
 	// Query the descriptor ID and zone configuration for this database.
 	{
-		path, err := s.queryDescriptorIDPath(ctx, userName, []string{req.Database})
+		databaseID, err := s.queryDatabaseID(ctx, userName, req.Database)
 		if err != nil {
 			return nil, s.serverError(err)
 		}
-		resp.DescriptorID = int64(path[1])
+		resp.DescriptorID = int64(databaseID)
 
-		id, zone, zoneExists, err := s.queryZonePath(ctx, userName, path)
+		id, zone, zoneExists, err := s.queryZonePath(ctx, userName, []descpb.ID{databaseID})
 		if err != nil {
 			return nil, s.serverError(err)
 		}
@@ -365,7 +366,7 @@ func (s *adminServer) DatabaseDetails(
 		resp.ZoneConfig = zone
 
 		switch id {
-		case path[1]:
+		case databaseID:
 			resp.ZoneConfigLevel = serverpb.ZoneConfigurationLevel_DATABASE
 		default:
 			resp.ZoneConfigLevel = serverpb.ZoneConfigurationLevel_CLUSTER
@@ -373,6 +374,34 @@ func (s *adminServer) DatabaseDetails(
 	}
 
 	return &resp, nil
+}
+
+// getFullyQualifiedTableName, given a database name and a tableName that either
+// is a unqualified name or a schema-qualified name, returns a maximally
+// qualified name: either database.table if the input wasn't schema qualified,
+// or database.schema.table if it was.
+func getFullyQualifiedTableName(dbName string, tableName string) (string, error) {
+	name, err := parser.ParseQualifiedTableName(tableName)
+	if err != nil {
+		// If we got a parse error, it could be that the user passed us an unescaped
+		// table name. Quote the whole thing and try again.
+		name, err = parser.ParseQualifiedTableName(tree.NameStringP(&tableName))
+		if err != nil {
+			return "", err
+		}
+	}
+	if !name.ExplicitSchema {
+		// If the schema wasn't explicitly set, craft the qualified table name to be
+		// database.table.
+		name.SchemaName = tree.Name(dbName)
+		name.ExplicitSchema = true
+	} else {
+		// Otherwise, add the database to the beginning of the name:
+		// database.schema.table.
+		name.CatalogName = tree.Name(dbName)
+		name.ExplicitCatalog = true
+	}
+	return name.String(), nil
 }
 
 // TableDetails is an endpoint that returns columns, indices, and other
@@ -386,11 +415,10 @@ func (s *adminServer) TableDetails(
 		return nil, err
 	}
 
-	escDBName := tree.NameStringP(&req.Database)
-	// TODO(cdo): Use real placeholders for the table and database names when we've extended our SQL
-	// grammar to allow that.
-	escTableName := tree.NameStringP(&req.Table)
-	escQualTable := fmt.Sprintf("%s.%s", escDBName, escTableName)
+	escQualTable, err := getFullyQualifiedTableName(req.Database, req.Table)
+	if err != nil {
+		return nil, err
+	}
 
 	var resp serverpb.TableDetailsResponse
 
@@ -398,7 +426,7 @@ func (s *adminServer) TableDetails(
 	rows, cols, err := s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-show-columns",
 		nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		fmt.Sprintf("SHOW COLUMNS FROM %s", escQualTable),
 	)
 	if s.isNotFoundError(err) {
@@ -460,7 +488,7 @@ func (s *adminServer) TableDetails(
 	// Marshal SHOW INDEX result.
 	rows, cols, err = s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-showindex", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		fmt.Sprintf("SHOW INDEX FROM %s", escQualTable),
 	)
 	if s.isNotFoundError(err) {
@@ -513,7 +541,7 @@ func (s *adminServer) TableDetails(
 	// Marshal SHOW GRANTS result.
 	rows, cols, err = s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-show-grants", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		fmt.Sprintf("SHOW GRANTS ON TABLE %s", escQualTable),
 	)
 	if s.isNotFoundError(err) {
@@ -546,7 +574,7 @@ func (s *adminServer) TableDetails(
 	// Marshal SHOW CREATE result.
 	rows, cols, err = s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-show-create", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		fmt.Sprintf("SHOW CREATE %s", escQualTable),
 	)
 	if s.isNotFoundError(err) {
@@ -573,14 +601,17 @@ func (s *adminServer) TableDetails(
 	var tableID descpb.ID
 	// Query the descriptor ID and zone configuration for this table.
 	{
-		path, err := s.queryDescriptorIDPath(ctx, userName, []string{req.Database, req.Table})
+		databaseID, err := s.queryDatabaseID(ctx, userName, req.Database)
 		if err != nil {
 			return nil, s.serverError(err)
 		}
-		tableID = path[2]
+		tableID, err = s.queryTableID(ctx, userName, req.Database, escQualTable)
+		if err != nil {
+			return nil, s.serverError(err)
+		}
 		resp.DescriptorID = int64(tableID)
 
-		id, zone, zoneExists, err := s.queryZonePath(ctx, userName, path)
+		id, zone, zoneExists, err := s.queryZonePath(ctx, userName, []descpb.ID{databaseID, tableID})
 		if err != nil {
 			return nil, s.serverError(err)
 		}
@@ -591,9 +622,9 @@ func (s *adminServer) TableDetails(
 		resp.ZoneConfig = zone
 
 		switch id {
-		case path[1]:
+		case databaseID:
 			resp.ZoneConfigLevel = serverpb.ZoneConfigurationLevel_DATABASE
-		case path[2]:
+		case tableID:
 			resp.ZoneConfigLevel = serverpb.ZoneConfigurationLevel_TABLE
 		default:
 			resp.ZoneConfigLevel = serverpb.ZoneConfigurationLevel_CLUSTER
@@ -634,21 +665,19 @@ func (s *adminServer) TableStats(
 	ctx context.Context, req *serverpb.TableStatsRequest,
 ) (*serverpb.TableStatsResponse, error) {
 	ctx = s.server.AnnotateCtx(ctx)
-	// TODO(someone): perform authorization based on the requesting user's
-	// SELECT privilege over the requested table.
 	userName, err := s.requireAdminUser(ctx)
 	if err != nil {
 		return nil, err
 	}
+	escQualTable, err := getFullyQualifiedTableName(req.Database, req.Table)
+	if err != nil {
+		return nil, err
+	}
 
-	// Get table span.
-	path, err := s.queryDescriptorIDPath(
-		ctx, userName, []string{req.Database, req.Table},
-	)
+	tableID, err := s.queryTableID(ctx, userName, req.Database, escQualTable)
 	if err != nil {
 		return nil, s.serverError(err)
 	}
-	tableID := path[2]
 	tableSpan := generateTableSpan(tableID)
 
 	return s.statsForSpan(ctx, tableSpan)
@@ -850,7 +879,7 @@ func (s *adminServer) Users(
 	query := `SELECT username FROM system.users WHERE "isRole" = false`
 	rows, err := s.server.sqlServer.internalExecutor.QueryEx(
 		ctx, "admin-users", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		query,
 	)
 	if err != nil {
@@ -909,7 +938,7 @@ func (s *adminServer) Events(
 	}
 	rows, cols, err := s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-events", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		q.String(), q.QueryArguments()...)
 	if err != nil {
 		return nil, s.serverError(err)
@@ -1001,7 +1030,7 @@ func (s *adminServer) RangeLog(
 	}
 	rows, cols, err := s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-range-log", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		q.String(), q.QueryArguments()...,
 	)
 	if err != nil {
@@ -1114,7 +1143,7 @@ func (s *adminServer) getUIData(
 	}
 	rows, err := s.server.sqlServer.internalExecutor.QueryEx(
 		ctx, "admin-getUIData", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUser},
 		query.String(), query.QueryArguments()...,
 	)
 	if err != nil {
@@ -1185,7 +1214,7 @@ func (s *adminServer) SetUIData(
 		query := `UPSERT INTO system.ui (key, value, "lastUpdated") VALUES ($1, $2, now())`
 		rowsAffected, err := s.server.sqlServer.internalExecutor.ExecEx(
 			ctx, "admin-set-ui-data", nil, /* txn */
-			sqlbase.InternalExecutorSessionDataOverride{
+			sessiondata.InternalExecutorOverride{
 				User: security.RootUser,
 			},
 			query, makeUIKey(userName, key), val)
@@ -1338,9 +1367,9 @@ func (s *adminServer) checkReadinessForHealthCheck() error {
 
 	// TODO(knz): update this code when progress is made on
 	// https://github.com/cockroachdb/cockroach/issues/45123
-	l, err := s.server.nodeLiveness.GetLiveness(s.server.NodeID())
-	if err != nil {
-		return s.serverError(err)
+	l, ok := s.server.nodeLiveness.GetLiveness(s.server.NodeID())
+	if !ok {
+		return status.Error(codes.Unavailable, "liveness record not found")
 	}
 	if !l.IsLive(s.server.clock.Now().GoTime()) {
 		return status.Errorf(codes.Unavailable, "node is not healthy")
@@ -1429,7 +1458,7 @@ func (s *adminServer) Jobs(
 	}
 	rows, cols, err := s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-jobs", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		q.String(), q.QueryArguments()...,
 	)
 	if err != nil {
@@ -1490,7 +1519,7 @@ func (s *adminServer) Locations(
 ) (*serverpb.LocationsResponse, error) {
 	ctx = s.server.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	_, err := userFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1499,7 +1528,7 @@ func (s *adminServer) Locations(
 	q.Append(`SELECT "localityKey", "localityValue", latitude, longitude FROM system.locations`)
 	rows, cols, err := s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-locations", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: security.RootUser},
 		q.String(),
 	)
 	if err != nil {
@@ -1555,7 +1584,7 @@ func (s *adminServer) QueryPlan(
 		strings.Trim(req.Query, ";"))
 	rows, err := s.server.sqlServer.internalExecutor.QueryEx(
 		ctx, "admin-query-plan", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		explain,
 	)
 	if err != nil {
@@ -1583,7 +1612,7 @@ func (s *adminServer) getStatementBundle(ctx context.Context, id int64, w http.R
 	}
 	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
 		ctx, "admin-stmt-bundle", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: sessionUser},
+		sessiondata.InternalExecutorOverride{User: sessionUser},
 		"SELECT bundle_chunks FROM system.statement_diagnostics WHERE id=$1 AND bundle_chunks IS NOT NULL",
 		id,
 	)
@@ -1602,7 +1631,7 @@ func (s *adminServer) getStatementBundle(ctx context.Context, id int64, w http.R
 	for _, chunkID := range chunkIDs {
 		chunkRow, err := s.server.sqlServer.internalExecutor.QueryRowEx(
 			ctx, "admin-stmt-bundle", nil, /* txn */
-			sqlbase.InternalExecutorSessionDataOverride{User: sessionUser},
+			sessiondata.InternalExecutorOverride{User: sessionUser},
 			"SELECT data FROM system.statement_bundle_chunks WHERE id=$1",
 			chunkID,
 		)
@@ -1676,9 +1705,9 @@ func (s *adminServer) DecommissionStatus(
 	var res serverpb.DecommissionStatusResponse
 
 	for nodeID := range replicaCounts {
-		l, err := s.server.nodeLiveness.GetLiveness(nodeID)
-		if err != nil {
-			return nil, errors.Wrapf(err, "unable to get liveness for %d", nodeID)
+		l, ok := s.server.nodeLiveness.GetLiveness(nodeID)
+		if !ok {
+			return nil, errors.Newf("unable to get liveness for %d", nodeID)
 		}
 		nodeResp := serverpb.DecommissionStatusResponse_Status{
 			NodeID:       l.NodeID,
@@ -1745,7 +1774,7 @@ func (s *adminServer) DataDistribution(
 	tablesQuery := `SELECT name, table_id, database_name, drop_time FROM "".crdb_internal.tables WHERE schema_name = 'public'`
 	rows1, err := s.server.sqlServer.internalExecutor.QueryEx(
 		ctx, "admin-replica-matrix", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		tablesQuery,
 	)
 	if err != nil {
@@ -1787,7 +1816,7 @@ func (s *adminServer) DataDistribution(
 			)
 			rows, err := s.server.sqlServer.internalExecutor.QueryEx(
 				ctx, "admin-replica-matrix", nil, /* txn */
-				sqlbase.InternalExecutorSessionDataOverride{User: userName},
+				sessiondata.InternalExecutorOverride{User: userName},
 				zoneConfigQuery,
 			)
 			if err != nil {
@@ -1864,7 +1893,7 @@ func (s *adminServer) DataDistribution(
 	`
 	rows2, err := s.server.sqlServer.internalExecutor.QueryEx(
 		ctx, "admin-replica-matrix", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		zoneConfigsQuery)
 	if err != nil {
 		return nil, s.serverError(err)
@@ -2095,7 +2124,7 @@ type resultScanner struct {
 	colNameToIdx map[string]int
 }
 
-func makeResultScanner(cols []sqlbase.ResultColumn) resultScanner {
+func makeResultScanner(cols []colinfo.ResultColumn) resultScanner {
 	rs := resultScanner{
 		colNameToIdx: make(map[string]int),
 	}
@@ -2281,7 +2310,7 @@ func (s *adminServer) queryZone(
 		ctx,
 		"admin-query-zone",
 		nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
+		sessiondata.InternalExecutorOverride{User: userName},
 		query,
 		id,
 	)
@@ -2328,23 +2357,22 @@ func (s *adminServer) queryZonePath(
 	return 0, *zonepb.NewZoneConfig(), false, nil
 }
 
-// queryNamespaceID queries for the ID of the namespace with the given name and
-// parent ID.
-func (s *adminServer) queryNamespaceID(
-	ctx context.Context, userName string, parentID descpb.ID, name string,
+// queryDatabaseID queries for the ID of the database with the given name.
+func (s *adminServer) queryDatabaseID(
+	ctx context.Context, userName string, name string,
 ) (descpb.ID, error) {
-	const query = `SELECT crdb_internal.get_namespace_id($1, $2)`
+	const query = `SELECT crdb_internal.get_database_id($1)`
 	rows, cols, err := s.server.sqlServer.internalExecutor.QueryWithCols(
 		ctx, "admin-query-namespace-ID", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: userName},
-		query, parentID, name,
+		sessiondata.InternalExecutorOverride{User: userName},
+		query, name,
 	)
 	if err != nil {
 		return 0, err
 	}
 
 	if len(rows) != 1 {
-		return 0, errors.Errorf("invalid number of rows returned: %s (%d, %s)", query, parentID, name)
+		return 0, errors.Errorf("invalid number of rows returned: %s (%s)", query, name)
 	}
 
 	var id int64
@@ -2352,7 +2380,7 @@ func (s *adminServer) queryNamespaceID(
 	if isNull, err := scanner.IsNull(rows[0], cols[0].Name); err != nil {
 		return 0, err
 	} else if isNull {
-		return 0, errors.Errorf("namespace %s with ParentID %d not found", name, parentID)
+		return 0, errors.Errorf("database %s not found", name)
 	}
 
 	err = scanner.ScanIndex(rows[0], 0, &id)
@@ -2363,22 +2391,20 @@ func (s *adminServer) queryNamespaceID(
 	return descpb.ID(id), nil
 }
 
-// queryDescriptorIDPath converts a path of namespaces into a path of namespace
-// IDs. For example, if this function is called with a database/table name pair,
-// it will return a list of IDs consisting of the root namespace ID, the
-// databases ID, and the table ID (in that order).
-func (s *adminServer) queryDescriptorIDPath(
-	ctx context.Context, userName string, names []string,
-) ([]descpb.ID, error) {
-	path := []descpb.ID{keys.RootNamespaceID}
-	for _, name := range names {
-		id, err := s.queryNamespaceID(ctx, userName, path[len(path)-1], name)
-		if err != nil {
-			return nil, err
-		}
-		path = append(path, id)
+// queryTableID queries for the ID of the table with the given name in the
+// database with the given name. The table name may contain a schema qualifier.
+func (s *adminServer) queryTableID(
+	ctx context.Context, username string, database string, tableName string,
+) (descpb.ID, error) {
+	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
+		ctx, "admin-resolve-name", nil,
+		sessiondata.InternalExecutorOverride{User: username, Database: database},
+		"SELECT $1::regclass::oid", tableName,
+	)
+	if err != nil {
+		return descpb.InvalidID, err
 	}
-	return path, nil
+	return descpb.ID(tree.MustBeDOid(row[0]).DInt), nil
 }
 
 func (s *adminServer) dialNode(
@@ -2396,42 +2422,72 @@ func (s *adminServer) dialNode(
 	return serverpb.NewAdminClient(conn), nil
 }
 
-func (s *adminServer) requireAdminUser(ctx context.Context) (userName string, err error) {
-	userName, isAdmin, err := s.getUserAndRole(ctx)
+// adminPrivilegeChecker is a helper struct to check whether given usernames
+// have admin privileges.
+type adminPrivilegeChecker struct {
+	ie *sql.InternalExecutor
+}
+
+func (c *adminPrivilegeChecker) requireAdminUser(ctx context.Context) (userName string, err error) {
+	userName, isAdmin, err := c.getUserAndRole(ctx)
 	if err != nil {
 		return "", err
 	}
 	if !isAdmin {
-		return "", errInsufficientPrivilege
+		return "", errRequiresAdmin
 	}
 	return userName, nil
 }
 
-func (s *adminServer) getUserAndRole(
+func (c *adminPrivilegeChecker) requireViewActivityPermission(
+	ctx context.Context,
+) (userName string, err error) {
+	userName, isAdmin, err := c.getUserAndRole(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !isAdmin {
+		hasViewActivity, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITY)
+		if err != nil {
+			return "", err
+		}
+		if !hasViewActivity {
+			return "", status.Errorf(
+				codes.PermissionDenied, "this operation requires the %s role option",
+				roleoption.VIEWACTIVITY)
+		}
+	}
+	return userName, nil
+}
+
+func (c *adminPrivilegeChecker) getUserAndRole(
 	ctx context.Context,
 ) (userName string, isAdmin bool, err error) {
 	userName, err = userFromContext(ctx)
 	if err != nil {
 		return "", false, err
 	}
-	isAdmin, err = s.hasAdminRole(ctx, userName)
+	isAdmin, err = c.hasAdminRole(ctx, userName)
 	return userName, isAdmin, err
 }
 
-func (s *adminServer) hasAdminRole(ctx context.Context, sessionUser string) (bool, error) {
-	if sessionUser == security.RootUser {
+func (c *adminPrivilegeChecker) hasAdminRole(ctx context.Context, user string) (bool, error) {
+	if user == security.RootUser {
 		// Shortcut.
 		return true, nil
 	}
-	rows, cols, err := s.server.sqlServer.internalExecutor.QueryWithCols(
+	rows, _, err := c.ie.QueryWithCols(
 		ctx, "check-is-admin", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: sessionUser},
+		sessiondata.InternalExecutorOverride{User: user},
 		"SELECT crdb_internal.is_admin()")
 	if err != nil {
 		return false, err
 	}
-	if len(rows) != 1 || len(cols) != 1 {
+	if len(rows) != 1 {
 		return false, errors.AssertionFailedf("hasAdminRole: expected 1 row, got %d", len(rows))
+	}
+	if len(rows[0]) != 1 {
+		return false, errors.AssertionFailedf("hasAdminRole: expected 1 column, got %d", len(rows[0]))
 	}
 	dbDatum, ok := tree.AsDBool(rows[0][0])
 	if !ok {
@@ -2440,4 +2496,36 @@ func (s *adminServer) hasAdminRole(ctx context.Context, sessionUser string) (boo
 	return bool(dbDatum), nil
 }
 
-var errInsufficientPrivilege = status.Error(codes.PermissionDenied, "this operation requires admin privilege")
+func (c *adminPrivilegeChecker) hasRoleOption(
+	ctx context.Context, user string, roleOption roleoption.Option,
+) (bool, error) {
+	if user == security.RootUser {
+		// Shortcut.
+		return true, nil
+	}
+	rows, _, err := c.ie.QueryWithCols(
+		ctx, "check-role-option", nil, /* txn */
+		sessiondata.InternalExecutorOverride{User: user},
+		"SELECT crdb_internal.has_role_option($1)", roleOption.String())
+	if err != nil {
+		return false, err
+	}
+	if len(rows) != 1 {
+		return false, errors.AssertionFailedf("hasRoleOption: expected 1 row, got %d", len(rows))
+	}
+	if len(rows[0]) != 1 {
+		return false, errors.AssertionFailedf("hasRoleOption: expected 1 column, got %d", len(rows[0]))
+	}
+	dbDatum, ok := tree.AsDBool(rows[0][0])
+	if !ok {
+		return false, errors.AssertionFailedf("hasRoleOption: expected bool, got %T", rows[0][0])
+	}
+	return bool(dbDatum), nil
+}
+
+var errRequiresAdmin = status.Error(codes.PermissionDenied, "this operation requires admin privilege")
+
+func errRequiresRoleOption(option roleoption.Option) error {
+	return status.Errorf(
+		codes.PermissionDenied, "this operation requires %s privilege", option)
+}

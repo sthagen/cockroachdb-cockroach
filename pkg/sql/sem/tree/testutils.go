@@ -81,10 +81,8 @@ func SampleDatum(t *types.T) Datum {
 	case types.OidFamily:
 		return NewDOid(DInt(1009))
 	case types.Box2DFamily:
-		b := geo.NewCartesianBoundingBox()
-		b.AddPoint(1, 2)
-		b.AddPoint(3, 4)
-		return NewDBox2D(b)
+		b := geo.NewCartesianBoundingBox().AddPoint(1, 2).AddPoint(3, 4)
+		return NewDBox2D(*b)
 	case types.GeographyFamily:
 		return NewDGeography(geo.MustParseGeographyFromEWKB([]byte("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f")))
 	case types.GeometryFamily:

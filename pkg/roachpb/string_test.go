@@ -11,7 +11,6 @@
 package roachpb_test
 
 import (
-	"fmt"
 	"testing"
 
 	// Hook up the pretty printer.
@@ -21,6 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/redact"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTransactionString(t *testing.T) {
@@ -56,7 +57,7 @@ func TestTransactionString(t *testing.T) {
 }
 
 func TestBatchRequestString(t *testing.T) {
-	br := roachpb.BatchRequest{}
+	ba := roachpb.BatchRequest{}
 	txn := roachpb.MakeTransaction(
 		"test",
 		nil, /* baseKey */
@@ -64,20 +65,28 @@ func TestBatchRequestString(t *testing.T) {
 		hlc.Timestamp{}, // now
 		0,               // maxOffsetNs
 	)
-	br.Txn = &txn
-	br.WaitPolicy = lock.WaitPolicy_Error
+	txn.ID = uuid.NamespaceDNS
+	ba.Txn = &txn
+	ba.WaitPolicy = lock.WaitPolicy_Error
+	ba.CanForwardReadTimestamp = true
 	for i := 0; i < 100; i++ {
 		var ru roachpb.RequestUnion
 		ru.MustSetInner(&roachpb.GetRequest{})
-		br.Requests = append(br.Requests, ru)
+		ba.Requests = append(ba.Requests, ru)
 	}
 	var ru roachpb.RequestUnion
 	ru.MustSetInner(&roachpb.EndTxnRequest{})
-	br.Requests = append(br.Requests, ru)
+	ba.Requests = append(ba.Requests, ru)
 
-	e := fmt.Sprintf(`[txn: %s], [wait-policy: Error], Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), ... 76 skipped ..., Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), EndTxn(commit:false tsflex:false) [/Min] `,
-		br.Txn.Short())
-	if e != br.String() {
-		t.Fatalf("e = %s\nv = %s", e, br.String())
+	{
+		exp := `Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min),... 76 skipped ..., Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), EndTxn(commit:false) [/Min], [txn: 6ba7b810], [wait-policy: Error], [can-forward-ts]`
+		act := ba.String()
+		require.Equal(t, exp, act)
+	}
+
+	{
+		exp := `Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›),... 76 skipped ..., Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), EndTxn(commit:false) [‹/Min›], [txn: 6ba7b810], [wait-policy: Error], [can-forward-ts]`
+		act := redact.Sprint(ba)
+		require.EqualValues(t, exp, act)
 	}
 }

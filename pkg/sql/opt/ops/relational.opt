@@ -179,6 +179,9 @@ define InvertedFilterPrivate {
     # further by applying set operations on the primary key columns.
     InvertedExpression SpanExpression
 
+    # PreFiltererState represents the optional pre-filtering state.
+    PreFiltererState PreFiltererState
+
     # The InvertedColumn is the id of the inverted column in the input. It is
     # used during execution to map rows from the input to their corresponding
     # spans in the SpanExpression.
@@ -332,6 +335,10 @@ define LookupJoinPrivate {
     # table (and thus each left row matches with at most one table row).
     LookupColsAreTableKey bool
 
+    # IsSecondJoinInPairedJoiner is true if this is the second join of a
+    # paired-joiner used for left joins.
+    IsSecondJoinInPairedJoiner bool
+
     # ConstFilters contains the constant filters that are represented as equality
     # conditions on the KeyCols. These filters are needed by the statistics code to
     # correctly estimate selectivity.
@@ -375,6 +382,14 @@ define InvertedJoinPrivate {
     # InvertedCol is the inverted column in the index that is referenced by
     # InvertedExpr.
     InvertedCol ColumnID
+
+    # IsFirstJoinInPairedJoiner is true if this is the first join of a
+    # paired-joiner used for left joins.
+    IsFirstJoinInPairedJoiner bool
+
+    # ContinuationCol is the column ID of the continuation column when
+    # IsFirstJoinInPairedJoiner is true.
+    ContinuationCol ColumnID
 
     # Cols is the set of columns produced by the inverted join. This set can
     # contain columns from the input and columns from the index. Any columns
@@ -938,14 +953,6 @@ define WindowPrivate {
     # Ordering is the ordering that the window function is computed relative to
     # within each partition.
     Ordering OrderingChoice
-
-    # RangeOffsetColumn is the column ID of a single column from ORDER BY
-    # clause (when there is only one column). We store it separately because
-    # Ordering might be simplified (when that single column is in Partition),
-    # but the execution still needs to know the original ordering with RANGE
-    # mode of framing when at least one of the bounds has "offset". This column
-    # ID is used to reconstruct the Ordering during exec build phase.
-    RangeOffsetColumn ColumnID
 }
 
 # With executes Binding, making its results available to Main. Within Main, the
@@ -1017,9 +1024,20 @@ define WithScanPrivate {
 #    - the Recursive query (which refers to the working table using a specific
 #      WithID) is evaluated; the results are emitted and also saved into a new
 #      "working table" for the next iteration.
-[Relational]
+[Relational, WithBinding]
 define RecursiveCTE {
+    # Binding is a dummy relational expression that is associated with the
+    # WithID; its logical properties are used by WithScan.
+    # TODO(radu): this is a little hacky; investigate other ways to fill out the
+    # WithScan properties in this case.
+    Binding RelExpr
+
+    # Initial is the expression that is executed once and returns the initial
+    # set of rows for the "working table".
     Initial RelExpr
+
+    # Recursive is the expression that is executed repeatedly; it reads the
+    # "working table" using WithScan.
     Recursive RelExpr
     _ RecursiveCTEPrivate
 }

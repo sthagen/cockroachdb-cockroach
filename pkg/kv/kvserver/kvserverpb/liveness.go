@@ -43,7 +43,26 @@ func (l *Liveness) IsDead(now time.Time, threshold time.Duration) bool {
 	return !now.Before(deadAsOf)
 }
 
-func (l *Liveness) String() string {
+// Compare returns an integer comparing two pieces of liveness information,
+// based on which liveness information is more recent.
+func (l *Liveness) Compare(o Liveness) int {
+	// Compare Epoch, and if no change there, Expiration.
+	if l.Epoch != o.Epoch {
+		if l.Epoch < o.Epoch {
+			return -1
+		}
+		return +1
+	}
+	if l.Expiration != o.Expiration {
+		if l.Expiration.Less(o.Expiration) {
+			return -1
+		}
+		return +1
+	}
+	return 0
+}
+
+func (l Liveness) String() string {
 	var extra string
 	if l.Draining || l.Membership.Decommissioning() || l.Membership.Decommissioned() {
 		extra = fmt.Sprintf(" drain:%t membership:%s", l.Draining, l.Membership.String())

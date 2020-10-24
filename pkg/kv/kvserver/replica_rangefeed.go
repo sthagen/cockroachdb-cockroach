@@ -13,11 +13,11 @@ package kvserver
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -101,16 +101,14 @@ func (tp *rangefeedTxnPusher) PushTxns(
 	return pushedTxns, nil
 }
 
-// CleanupTxnIntentsAsync is part of the rangefeed.TxnPusher interface.
-func (tp *rangefeedTxnPusher) CleanupTxnIntentsAsync(
-	ctx context.Context, txns []*roachpb.Transaction,
+// ResolveIntents is part of the rangefeed.TxnPusher interface.
+func (tp *rangefeedTxnPusher) ResolveIntents(
+	ctx context.Context, intents []roachpb.LockUpdate,
 ) error {
-	endTxns := make([]result.EndTxnIntents, len(txns))
-	for i, txn := range txns {
-		endTxns[i].Txn = txn
-		endTxns[i].Poison = true
-	}
-	return tp.ir.CleanupTxnIntentsAsync(ctx, tp.r.RangeID, endTxns, true /* allowSyncProcessing */)
+	return tp.ir.ResolveIntents(ctx, intents,
+		// NB: Poison is ignored for non-ABORTED intents.
+		intentresolver.ResolveOptions{Poison: true},
+	).GoError()
 }
 
 type iteratorWithCloser struct {
@@ -132,7 +130,7 @@ func (r *Replica) RangeFeed(
 ) *roachpb.Error {
 	if !r.isSystemRange() && !RangefeedEnabled.Get(&r.store.cfg.Settings.SV) {
 		return roachpb.NewErrorf("rangefeeds require the kv.rangefeed.enabled setting. See %s",
-			base.DocsURL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
+			docs.URL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
 	}
 	ctx := r.AnnotateCtx(stream.Context())
 
@@ -173,14 +171,19 @@ func (r *Replica) RangeFeed(
 		if err := lim.Begin(ctx); err != nil {
 			return roachpb.NewError(err)
 		}
-		// Finish the iterator limit, but only if we exit before
-		// creating the iterator itself.
-		iterSemRelease = lim.Finish
-		defer func() {
-			if iterSemRelease != nil {
-				iterSemRelease()
-			}
-		}()
+		// Finish the iterator limit if we exit before the iterator finishes.
+		// The release function will be hooked into the Close method on the
+		// iterator below. The sync.Once prevents any races between exiting early
+		// from this call and finishing the catchup scan underneath the
+		// rangefeed.Processor. We need to release here in case we fail to
+		// register the processor, or, more perniciously, in the case where the
+		// processor gets registered by shut down before starting the catchup
+		// scan.
+		var iterSemReleaseOnce sync.Once
+		iterSemRelease = func() {
+			iterSemReleaseOnce.Do(lim.Finish)
+		}
+		defer iterSemRelease()
 	}
 
 	// Lock the raftMu, then register the stream as a new rangefeed registration.
@@ -194,28 +197,30 @@ func (r *Replica) RangeFeed(
 	}
 
 	// Register the stream with a catch-up iterator.
-	var catchUpIter storage.SimpleIterator
+	var catchUpIterFunc rangefeed.IteratorConstructor
 	if usingCatchupIter {
-		innerIter := r.Engine().NewIterator(storage.IterOptions{
-			UpperBound: args.Span.EndKey,
-			// RangeFeed originally intended to use the time-bound iterator
-			// performance optimization. However, they've had correctness issues in
-			// the past (#28358, #34819) and no-one has the time for the due-diligence
-			// necessary to be confidant in their correctness going forward. Not using
-			// them causes the total time spent in RangeFeed catchup on changefeed
-			// over tpcc-1000 to go from 40s -> 4853s, which is quite large but still
-			// workable. See #35122 for details.
-			// MinTimestampHint: args.Timestamp,
-		})
-		catchUpIter = iteratorWithCloser{
-			SimpleIterator: innerIter,
-			close:          iterSemRelease,
+		catchUpIterFunc = func() storage.SimpleIterator {
+
+			innerIter := r.Engine().NewIterator(storage.IterOptions{
+				UpperBound: args.Span.EndKey,
+				// RangeFeed originally intended to use the time-bound iterator
+				// performance optimization. However, they've had correctness issues in
+				// the past (#28358, #34819) and no-one has the time for the due-diligence
+				// necessary to be confidant in their correctness going forward. Not using
+				// them causes the total time spent in RangeFeed catchup on changefeed
+				// over tpcc-1000 to go from 40s -> 4853s, which is quite large but still
+				// workable. See #35122 for details.
+				// MinTimestampHint: args.Timestamp,
+			})
+			catchUpIter := iteratorWithCloser{
+				SimpleIterator: innerIter,
+				close:          iterSemRelease,
+			}
+			return catchUpIter
 		}
-		// Responsibility for releasing the semaphore now passes to the iterator.
-		iterSemRelease = nil
 	}
 	p := r.registerWithRangefeedRaftMuLocked(
-		ctx, rSpan, args.Timestamp, catchUpIter, args.WithDiff, lockedStream, errC,
+		ctx, rSpan, args.Timestamp, catchUpIterFunc, args.WithDiff, lockedStream, errC,
 	)
 	r.raftMu.Unlock()
 
@@ -296,7 +301,7 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 	ctx context.Context,
 	span roachpb.RSpan,
 	startTS hlc.Timestamp,
-	catchupIter storage.SimpleIterator,
+	catchupIter rangefeed.IteratorConstructor,
 	withDiff bool,
 	stream rangefeed.Stream,
 	errC chan<- *roachpb.Error,
@@ -341,16 +346,18 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 	p = rangefeed.NewProcessor(cfg)
 
 	// Start it with an iterator to initialize the resolved timestamp.
-	rtsIter := r.Engine().NewIterator(storage.IterOptions{
-		UpperBound: desc.EndKey.AsRawKey(),
-		// TODO(nvanbenschoten): To facilitate fast restarts of rangefeed
-		// we should periodically persist the resolved timestamp so that we
-		// can initialize the rangefeed using an iterator that only needs to
-		// observe timestamps back to the last recorded resolved timestamp.
-		// This is safe because we know that there are no unresolved intents
-		// at times before a resolved timestamp.
-		// MinTimestampHint: r.ResolvedTimestamp,
-	})
+	rtsIter := func() storage.SimpleIterator {
+		return r.Engine().NewIterator(storage.IterOptions{
+			UpperBound: desc.EndKey.AsRawKey(),
+			// TODO(nvanbenschoten): To facilitate fast restarts of rangefeed
+			// we should periodically persist the resolved timestamp so that we
+			// can initialize the rangefeed using an iterator that only needs to
+			// observe timestamps back to the last recorded resolved timestamp.
+			// This is safe because we know that there are no unresolved intents
+			// at times before a resolved timestamp.
+			// MinTimestampHint: r.ResolvedTimestamp,
+		})
+	}
 	p.Start(r.store.Stopper(), rtsIter)
 
 	// Register with the processor *before* we attach its reference to the
@@ -360,7 +367,6 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 	// server shutdown.
 	reg, filter := p.Register(span, startTS, catchupIter, withDiff, stream, errC)
 	if !reg {
-		catchupIter.Close() // clean up
 		select {
 		case <-r.store.Stopper().ShouldQuiesce():
 			errC <- roachpb.NewError(&roachpb.NodeUnavailableError{})
@@ -458,7 +464,7 @@ func (r *Replica) populatePrevValsInLogicalOpLogRaftMuLocked(
 			// Nothing to do.
 			continue
 		default:
-			panic(fmt.Sprintf("unknown logical op %T", t))
+			panic(errors.AssertionFailedf("unknown logical op %T", t))
 		}
 
 		// Don't read previous values from the reader for operations that are
@@ -532,7 +538,7 @@ func (r *Replica) handleLogicalOpLogRaftMuLocked(
 			// Nothing to do.
 			continue
 		default:
-			panic(fmt.Sprintf("unknown logical op %T", t))
+			panic(errors.AssertionFailedf("unknown logical op %T", t))
 		}
 
 		// Don't read values from the reader for operations that are not needed

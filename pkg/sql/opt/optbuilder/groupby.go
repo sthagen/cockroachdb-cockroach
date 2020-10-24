@@ -825,6 +825,12 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 		return b.factory.ConstructVarPop(args[0])
 	case "st_makeline":
 		return b.factory.ConstructSTMakeLine(args[0])
+	case "st_collect", "st_memcollect":
+		return b.factory.ConstructSTCollect(args[0])
+	case "st_extent":
+		return b.factory.ConstructSTExtent(args[0])
+	case "st_union", "st_memunion":
+		return b.factory.ConstructSTUnion(args[0])
 	case "xor_agg":
 		return b.factory.ConstructXorAgg(args[0])
 	case "json_agg":
@@ -888,7 +894,7 @@ func (b *Builder) allowImplicitGroupingColumn(colID opt.ColumnID, g *groupby) bo
 	}
 	primaryIndex := tab.Index(cat.PrimaryIndex)
 	for i := 0; i < primaryIndex.KeyColumnCount(); i++ {
-		pkCols.Add(colMeta.Table.ColumnID(primaryIndex.Column(i).Ordinal))
+		pkCols.Add(colMeta.Table.IndexColumnID(primaryIndex, i))
 	}
 	// Remove PK columns that are grouping cols and see if there's anything left.
 	groupingCols := g.groupingCols()

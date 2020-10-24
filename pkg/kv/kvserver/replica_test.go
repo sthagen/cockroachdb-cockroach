@@ -66,6 +66,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 	opentracing "github.com/opentracing/opentracing-go"
@@ -228,8 +229,7 @@ func (tc *testContext) StartWithStoreConfigAndVersion(
 		tc.gossip = gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), cfg.DefaultZoneConfig)
 	}
 	if tc.engine == nil {
-		tc.engine = storage.NewInMem(context.Background(), storage.DefaultStorageEngine,
-			roachpb.Attributes{Attrs: []string{"dc1", "mem"}}, 1<<20)
+		tc.engine = storage.NewInMem(context.Background(), roachpb.Attributes{Attrs: []string{"dc1", "mem"}}, 1<<20)
 		stopper.AddCloser(tc.engine)
 	}
 	if tc.transport == nil {
@@ -403,7 +403,7 @@ func (tc *testContext) addBogusReplicaToRangeDesc(
 		Header: roachpb.Header{Timestamp: tc.Clock().Now()},
 	}
 	descKey := keys.RangeDescriptorKey(oldDesc.StartKey)
-	if err := updateRangeDescriptor(&ba, descKey, dbDescKV.Value.TagAndDataBytes(), &newDesc); err != nil {
+	if err := updateRangeDescriptor(ctx, &ba, descKey, dbDescKV.Value.TagAndDataBytes(), &newDesc); err != nil {
 		return roachpb.ReplicaDescriptor{}, err
 	}
 	if err := tc.store.DB().Run(ctx, &ba); err != nil {
@@ -485,69 +485,74 @@ func TestIsOnePhaseCommit(t *testing.T) {
 		withSeq(&roachpb.PutRequest{}, 1),
 		withSeq(&roachpb.EndTxnRequest{Commit: true}, 2),
 	)
-	txnReqsNoRefresh := makeReqs(
-		withSeq(&roachpb.PutRequest{}, 1),
-		withSeq(&roachpb.EndTxnRequest{Commit: true, CanCommitAtHigherTimestamp: true}, 2),
-	)
 	txnReqsRequire1PC := makeReqs(
 		withSeq(&roachpb.PutRequest{}, 1),
 		withSeq(&roachpb.EndTxnRequest{Commit: true, Require1PC: true}, 2),
 	)
 
 	testCases := []struct {
-		ru          []roachpb.RequestUnion
-		isTxn       bool
-		isRestarted bool
-		// isWTO implies isTSOff.
-		isWTO   bool
-		isTSOff bool
-		exp1PC  bool
+		ru           []roachpb.RequestUnion
+		isNonTxn     bool
+		canForwardTS bool
+		isRestarted  bool
+		isWTO        bool // isWTO implies isTSOff
+		isTSOff      bool
+		exp1PC       bool
 	}{
-		{ru: noReqs, isTxn: false, exp1PC: false},
-		{ru: noReqs, isTxn: true, exp1PC: false},
-		{ru: getReq, isTxn: true, exp1PC: false},
-		{ru: putReq, isTxn: true, exp1PC: false},
-		{ru: etReq, isTxn: true, exp1PC: true},
-		{ru: etReq, isTxn: true, isTSOff: true, exp1PC: false},
-		{ru: etReq, isTxn: true, isWTO: true, exp1PC: false},
-		{ru: etReq, isTxn: true, isRestarted: true, exp1PC: false},
-		{ru: etReq, isTxn: true, isRestarted: true, isTSOff: true, exp1PC: false},
-		{ru: etReq, isTxn: true, isRestarted: true, isWTO: true, isTSOff: true, exp1PC: false},
-		{ru: txnReqs[:1], isTxn: true, exp1PC: false},
-		{ru: txnReqs[1:], isTxn: true, exp1PC: false},
-		{ru: txnReqs, isTxn: true, exp1PC: true},
-		{ru: txnReqs, isTxn: true, isTSOff: true, exp1PC: false},
-		{ru: txnReqs, isTxn: true, isWTO: true, exp1PC: false},
-		{ru: txnReqs, isTxn: true, isRestarted: true, exp1PC: false},
-		{ru: txnReqs, isTxn: true, isRestarted: true, isTSOff: true, exp1PC: false},
-		{ru: txnReqs, isTxn: true, isRestarted: true, isWTO: true, exp1PC: false},
-		{ru: txnReqsNoRefresh[:1], isTxn: true, exp1PC: false},
-		{ru: txnReqsNoRefresh[1:], isTxn: true, exp1PC: false},
-		{ru: txnReqsNoRefresh, isTxn: true, exp1PC: true},
-		{ru: txnReqsNoRefresh, isTxn: true, isTSOff: true, exp1PC: true},
-		{ru: txnReqsNoRefresh, isTxn: true, isWTO: true, exp1PC: true},
-		{ru: txnReqsNoRefresh, isTxn: true, isRestarted: true, exp1PC: false},
-		{ru: txnReqsNoRefresh, isTxn: true, isRestarted: true, isTSOff: true, exp1PC: false},
-		{ru: txnReqsNoRefresh, isTxn: true, isRestarted: true, isWTO: true, exp1PC: false},
-		{ru: txnReqsRequire1PC[:1], isTxn: true, exp1PC: false},
-		{ru: txnReqsRequire1PC[1:], isTxn: true, exp1PC: false},
-		{ru: txnReqsRequire1PC, isTxn: true, exp1PC: true},
-		{ru: txnReqsRequire1PC, isTxn: true, isTSOff: true, exp1PC: false},
-		{ru: txnReqsRequire1PC, isTxn: true, isWTO: true, exp1PC: false},
-		{ru: txnReqsRequire1PC, isTxn: true, isRestarted: true, exp1PC: true},
-		{ru: txnReqsRequire1PC, isTxn: true, isRestarted: true, isTSOff: true, exp1PC: false},
-		{ru: txnReqsRequire1PC, isTxn: true, isRestarted: true, isWTO: true, exp1PC: false},
+		{ru: noReqs, isNonTxn: true, exp1PC: false},
+		{ru: noReqs, exp1PC: false},
+		{ru: getReq, exp1PC: false},
+		{ru: putReq, exp1PC: false},
+		{ru: etReq, exp1PC: true},
+		{ru: etReq, isTSOff: true, exp1PC: false},
+		{ru: etReq, isWTO: true, exp1PC: false},
+		{ru: etReq, isRestarted: true, exp1PC: false},
+		{ru: etReq, isRestarted: true, isTSOff: true, exp1PC: false},
+		{ru: etReq, isRestarted: true, isWTO: true, isTSOff: true, exp1PC: false},
+		{ru: etReq, canForwardTS: true, exp1PC: true},
+		{ru: etReq, canForwardTS: true, isTSOff: true, exp1PC: true},
+		{ru: etReq, canForwardTS: true, isWTO: true, exp1PC: true},
+		{ru: etReq, canForwardTS: true, isRestarted: true, exp1PC: false},
+		{ru: etReq, canForwardTS: true, isRestarted: true, isTSOff: true, exp1PC: false},
+		{ru: etReq, canForwardTS: true, isRestarted: true, isWTO: true, isTSOff: true, exp1PC: false},
+		{ru: txnReqs[:1], exp1PC: false},
+		{ru: txnReqs[1:], exp1PC: false},
+		{ru: txnReqs, exp1PC: true},
+		{ru: txnReqs, isTSOff: true, exp1PC: false},
+		{ru: txnReqs, isWTO: true, exp1PC: false},
+		{ru: txnReqs, isRestarted: true, exp1PC: false},
+		{ru: txnReqs, isRestarted: true, isTSOff: true, exp1PC: false},
+		{ru: txnReqs, isRestarted: true, isWTO: true, exp1PC: false},
+		{ru: txnReqs[:1], canForwardTS: true, exp1PC: false},
+		{ru: txnReqs[1:], canForwardTS: true, exp1PC: false},
+		{ru: txnReqs, canForwardTS: true, exp1PC: true},
+		{ru: txnReqs, canForwardTS: true, isTSOff: true, exp1PC: true},
+		{ru: txnReqs, canForwardTS: true, isWTO: true, exp1PC: true},
+		{ru: txnReqs, canForwardTS: true, isRestarted: true, exp1PC: false},
+		{ru: txnReqs, canForwardTS: true, isRestarted: true, isTSOff: true, exp1PC: false},
+		{ru: txnReqs, canForwardTS: true, isRestarted: true, isWTO: true, exp1PC: false},
+		{ru: txnReqsRequire1PC[:1], exp1PC: false},
+		{ru: txnReqsRequire1PC[1:], exp1PC: false},
+		{ru: txnReqsRequire1PC, exp1PC: true},
+		{ru: txnReqsRequire1PC, isTSOff: true, exp1PC: false},
+		{ru: txnReqsRequire1PC, isWTO: true, exp1PC: false},
+		{ru: txnReqsRequire1PC, isRestarted: true, exp1PC: true},
+		{ru: txnReqsRequire1PC, isRestarted: true, isTSOff: true, exp1PC: false},
+		{ru: txnReqsRequire1PC, isRestarted: true, isWTO: true, exp1PC: false},
 	}
 
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	for i, c := range testCases {
 		t.Run(
-			fmt.Sprintf("%d:isTxn:%t,isRestarted:%t,isWTO:%t,isTSOff:%t",
-				i, c.isTxn, c.isRestarted, c.isWTO, c.isTSOff),
+			fmt.Sprintf("%d:isNonTxn:%t,canForwardTS:%t,isRestarted:%t,isWTO:%t,isTSOff:%t",
+				i, c.isNonTxn, c.canForwardTS, c.isRestarted, c.isWTO, c.isTSOff),
 			func(t *testing.T) {
 				ba := roachpb.BatchRequest{Requests: c.ru}
-				if c.isTxn {
+				if !c.isNonTxn {
 					ba.Txn = newTransaction("txn", roachpb.Key("a"), 1, clock)
+					if c.canForwardTS {
+						ba.CanForwardReadTimestamp = true
+					}
 					if c.isRestarted {
 						ba.Txn.Restart(-1, 0, clock.Now())
 					}
@@ -4458,15 +4463,15 @@ func TestRPCRetryProtectionInTxn(t *testing.T) {
 	defer stopper.Stop(ctx)
 	tc.StartWithStoreConfig(t, stopper, cfg)
 
-	testutils.RunTrueAndFalse(t, "CanCommitAtHigherTimestamp", func(t *testing.T, noPriorReads bool) {
+	testutils.RunTrueAndFalse(t, "CanForwardReadTimestamp", func(t *testing.T, noPriorReads bool) {
 		key := roachpb.Key("a")
 		txn := newTransaction("test", key, 1, tc.Clock())
 
 		// Send a batch with put & end txn.
 		var ba roachpb.BatchRequest
+		ba.CanForwardReadTimestamp = noPriorReads
 		put := putArgs(key, []byte("value"))
 		et, _ := endTxnArgs(txn, true)
-		et.CanCommitAtHigherTimestamp = noPriorReads
 		et.LockSpans = []roachpb.Span{{Key: key, EndKey: nil}}
 		ba.Header = roachpb.Header{Txn: txn}
 		ba.Add(&put)
@@ -6432,6 +6437,12 @@ func TestChangeReplicasDuplicateError(t *testing.T) {
 	defer stopper.Stop(context.Background())
 	tc.Start(t, stopper)
 
+	// We now allow adding a replica to the same node, to support rebalances
+	// within the same node when replication is 1x, so add another replica to the
+	// range descriptor to avoid this case.
+	if _, err := tc.addBogusReplicaToRangeDesc(context.Background()); err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
 	chgs := roachpb.MakeReplicationChanges(roachpb.ADD_REPLICA, roachpb.ReplicationTarget{
 		NodeID:  tc.store.Ident.NodeID,
 		StoreID: 9999,
@@ -7575,15 +7586,13 @@ func TestDiffRange(t *testing.T) {
 +    ts:1970-01-01 00:00:00.000001729 +0000 UTC
 +    value:"foo"
 +    raw mvcc_key/value: 6162636465660000000000000006c1000000010d 666f6f
-+0.000000000,0 "foo"
-+    ts:<zero>
++0,0 "foo"
++    ts:1970-01-01 00:00:00 +0000 UTC
 +    value:"foo"
 +    raw mvcc_key/value: 666f6f00 666f6f
 `
 
-	if diff := stringDiff.String(); diff != expDiff {
-		t.Fatalf("expected:\n%s\ngot:\n%s", expDiff, diff)
-	}
+	require.Equal(t, expDiff, stringDiff.String())
 }
 
 func TestSyncSnapshot(t *testing.T) {
@@ -9399,14 +9408,16 @@ func TestSplitMsgApps(t *testing.T) {
 type testQuiescer struct {
 	desc            roachpb.RangeDescriptor
 	numProposals    int
+	pendingQuota    bool
 	status          *raft.Status
 	lastIndex       uint64
 	raftReady       bool
 	ownsValidLease  bool
 	mergeInProgress bool
 	isDestroyed     bool
-	livenessMap     IsLiveMap
-	pendingQuota    bool
+
+	// Not used to implement quiescer, but used by tests.
+	livenessMap IsLiveMap
 }
 
 func (q *testQuiescer) descRLocked() *roachpb.RangeDescriptor {
@@ -9415,6 +9426,10 @@ func (q *testQuiescer) descRLocked() *roachpb.RangeDescriptor {
 
 func (q *testQuiescer) raftStatusRLocked() *raft.Status {
 	return q.status
+}
+
+func (q *testQuiescer) raftBasicStatusRLocked() raft.BasicStatus {
+	return q.status.BasicStatus
 }
 
 func (q *testQuiescer) raftLastIndexLocked() (uint64, error) {
@@ -9495,9 +9510,18 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 				},
 			}
 			q = transform(q)
-			_, ok := shouldReplicaQuiesce(context.Background(), q, hlc.Timestamp{}, q.livenessMap)
-			if expected != ok {
-				t.Fatalf("expected %v, but found %v", expected, ok)
+			_, lagging, ok := shouldReplicaQuiesce(context.Background(), q, hlc.Timestamp{}, q.livenessMap)
+			require.Equal(t, expected, ok)
+			if ok {
+				// Any non-live replicas should be in the laggingReplicaSet.
+				var expLagging laggingReplicaSet
+				for _, rep := range q.descRLocked().Replicas().All() {
+					if l, ok := q.livenessMap[rep.NodeID]; ok && !l.IsLive {
+						expLagging = append(expLagging, l.Liveness)
+					}
+				}
+				sort.Sort(expLagging)
+				require.Equal(t, expLagging, lagging)
 			}
 		})
 	}
@@ -9584,11 +9608,177 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 	// the replica is on a non-live node.
 	for _, i := range []uint64{1, 2, 3} {
 		test(true, func(q *testQuiescer) *testQuiescer {
-			q.livenessMap[roachpb.NodeID(i)] = IsLiveMapEntry{IsLive: false}
+			nodeID := roachpb.NodeID(i)
+			q.livenessMap[nodeID] = IsLiveMapEntry{
+				Liveness: kvserverpb.Liveness{NodeID: nodeID},
+				IsLive:   false,
+			}
 			q.status.Progress[i] = tracker.Progress{Match: invalidIndex}
 			return q
 		})
 	}
+	// Verify no quiescence when replica progress doesn't match, if
+	// given a nil liveness map.
+	for _, i := range []uint64{1, 2, 3} {
+		test(false, func(q *testQuiescer) *testQuiescer {
+			q.livenessMap = nil
+			q.status.Progress[i] = tracker.Progress{Match: invalidIndex}
+			return q
+		})
+	}
+	// Verify no quiescence when replica progress doesn't match, if
+	// liveness map does not contain the lagging replica.
+	for _, i := range []uint64{1, 2, 3} {
+		test(false, func(q *testQuiescer) *testQuiescer {
+			delete(q.livenessMap, roachpb.NodeID(i))
+			q.status.Progress[i] = tracker.Progress{Match: invalidIndex}
+			return q
+		})
+	}
+}
+
+func TestFollowerQuiesceOnNotify(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	test := func(
+		expected bool,
+		transform func(*testQuiescer, RaftMessageRequest) (*testQuiescer, RaftMessageRequest),
+	) {
+		t.Run("", func(t *testing.T) {
+			q := &testQuiescer{
+				status: &raft.Status{
+					BasicStatus: raft.BasicStatus{
+						ID: 2,
+						HardState: raftpb.HardState{
+							Term:   5,
+							Commit: 10,
+						},
+						SoftState: raft.SoftState{
+							Lead: 1,
+						},
+					},
+				},
+				livenessMap: IsLiveMap{
+					1: {IsLive: true},
+					2: {IsLive: true},
+					3: {IsLive: true},
+				},
+			}
+			req := RaftMessageRequest{
+				Message: raftpb.Message{
+					Type:   raftpb.MsgHeartbeat,
+					From:   1,
+					Term:   5,
+					Commit: 10,
+				},
+				Quiesce:                   true,
+				LaggingFollowersOnQuiesce: nil,
+			}
+			q, req = transform(q, req)
+
+			ok := shouldFollowerQuiesceOnNotify(
+				context.Background(),
+				q,
+				req.Message,
+				laggingReplicaSet(req.LaggingFollowersOnQuiesce),
+				q.livenessMap,
+			)
+			require.Equal(t, expected, ok)
+		})
+	}
+
+	test(true, func(q *testQuiescer, req RaftMessageRequest) (*testQuiescer, RaftMessageRequest) {
+		return q, req
+	})
+	test(false, func(q *testQuiescer, req RaftMessageRequest) (*testQuiescer, RaftMessageRequest) {
+		req.Message.Term = 4
+		return q, req
+	})
+	test(false, func(q *testQuiescer, req RaftMessageRequest) (*testQuiescer, RaftMessageRequest) {
+		req.Message.Commit = 9
+		return q, req
+	})
+	test(false, func(q *testQuiescer, req RaftMessageRequest) (*testQuiescer, RaftMessageRequest) {
+		q.numProposals = 1
+		return q, req
+	})
+	// Lagging replica with same liveness information.
+	test(true, func(q *testQuiescer, req RaftMessageRequest) (*testQuiescer, RaftMessageRequest) {
+		l := kvserverpb.Liveness{
+			NodeID:     3,
+			Epoch:      7,
+			Expiration: hlc.LegacyTimestamp{WallTime: 8},
+		}
+		q.livenessMap[l.NodeID] = IsLiveMapEntry{
+			Liveness: l,
+			IsLive:   false,
+		}
+		req.LaggingFollowersOnQuiesce = []kvserverpb.Liveness{l}
+		return q, req
+	})
+	// Lagging replica with older liveness information.
+	test(false, func(q *testQuiescer, req RaftMessageRequest) (*testQuiescer, RaftMessageRequest) {
+		l := kvserverpb.Liveness{
+			NodeID:     3,
+			Epoch:      7,
+			Expiration: hlc.LegacyTimestamp{WallTime: 8},
+		}
+		q.livenessMap[l.NodeID] = IsLiveMapEntry{
+			Liveness: l,
+			IsLive:   false,
+		}
+		lOld := l
+		lOld.Epoch--
+		req.LaggingFollowersOnQuiesce = []kvserverpb.Liveness{lOld}
+		return q, req
+	})
+	test(false, func(q *testQuiescer, req RaftMessageRequest) (*testQuiescer, RaftMessageRequest) {
+		l := kvserverpb.Liveness{
+			NodeID:     3,
+			Epoch:      7,
+			Expiration: hlc.LegacyTimestamp{WallTime: 8},
+		}
+		q.livenessMap[l.NodeID] = IsLiveMapEntry{
+			Liveness: l,
+			IsLive:   false,
+		}
+		lOld := l
+		lOld.Expiration.WallTime--
+		req.LaggingFollowersOnQuiesce = []kvserverpb.Liveness{lOld}
+		return q, req
+	})
+	// Lagging replica with newer liveness information.
+	test(true, func(q *testQuiescer, req RaftMessageRequest) (*testQuiescer, RaftMessageRequest) {
+		l := kvserverpb.Liveness{
+			NodeID:     3,
+			Epoch:      7,
+			Expiration: hlc.LegacyTimestamp{WallTime: 8},
+		}
+		q.livenessMap[l.NodeID] = IsLiveMapEntry{
+			Liveness: l,
+			IsLive:   false,
+		}
+		lNew := l
+		lNew.Epoch++
+		req.LaggingFollowersOnQuiesce = []kvserverpb.Liveness{lNew}
+		return q, req
+	})
+	test(true, func(q *testQuiescer, req RaftMessageRequest) (*testQuiescer, RaftMessageRequest) {
+		l := kvserverpb.Liveness{
+			NodeID:     3,
+			Epoch:      7,
+			Expiration: hlc.LegacyTimestamp{WallTime: 8},
+		}
+		q.livenessMap[l.NodeID] = IsLiveMapEntry{
+			Liveness: l,
+			IsLive:   false,
+		}
+		lNew := l
+		lNew.Expiration.WallTime++
+		req.LaggingFollowersOnQuiesce = []kvserverpb.Liveness{lNew}
+		return q, req
+	})
 }
 
 func TestReplicaRecomputeStats(t *testing.T) {
@@ -9961,7 +10151,7 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 			},
 		},
 		// 1PC serializable transaction will fail instead of retrying if
-		// EndTxnRequest.CanCommitAtHigherTimestamp is not true.
+		// BatchRequest.CanForwardReadTimestamp is not true.
 		{
 			name: "no serverside-refresh of write too old on 1PC txn and refresh spans",
 			setupFn: func() (hlc.Timestamp, error) {
@@ -9988,13 +10178,9 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 			batchFn: func(ts hlc.Timestamp) (ba roachpb.BatchRequest, expTS hlc.Timestamp) {
 				expTS = ts.Next()
 				ba.Txn = newTxn("e", ts.Prev())
+				ba.CanForwardReadTimestamp = true // necessary to indicate serverside-refresh is possible
 				cput := cPutArgs(ba.Txn.Key, []byte("cput"), []byte("put"))
 				et, _ := endTxnArgs(ba.Txn, true /* commit */)
-				// NOTE: setting CanCommitAtHigherTimestamp without
-				// CanForwardReadTimestamp simulates the kinds of batches we
-				// might see in a mixed-version cluster. All new versions will
-				// keep the two flags in-sync.
-				et.CanCommitAtHigherTimestamp = true // necessary to indicate serverside-refresh is possible
 				ba.Add(&cput, &et)
 				assignSeqNumsForReqs(ba.Txn, &cput, &et)
 				return
@@ -10010,10 +10196,9 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 			batchFn: func(ts hlc.Timestamp) (ba roachpb.BatchRequest, expTS hlc.Timestamp) {
 				expTS = ts.Next()
 				ba.Txn = newTxn("e", ts.Prev())
-				ba.CanForwardReadTimestamp = true
+				ba.CanForwardReadTimestamp = true // necessary to indicate serverside-refresh is possible
 				cput := cPutArgs(ba.Txn.Key, []byte("cput"), []byte("put"))
 				et, _ := endTxnArgs(ba.Txn, true /* commit */)
-				et.CanCommitAtHigherTimestamp = true // necessary to indicate serverside-refresh is possible
 				ba.Add(&cput, &et)
 				assignSeqNumsForReqs(ba.Txn, &cput, &et)
 				return
@@ -10044,13 +10229,13 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 
 				ba = roachpb.BatchRequest{}
 				ba.Txn = txn
+				// Indicate local retry is possible, even though we don't currently take
+				// advantage of this.
+				ba.CanForwardReadTimestamp = true
 				cput := cPutArgs(roachpb.Key("e1"), []byte("cput"), []byte("put"))
 				ba.Add(&cput)
 				assignSeqNumsForReqs(ba.Txn, &cput)
 				et, _ := endTxnArgs(ba.Txn, true /* commit */)
-				// Indicate local retry is possible, even though we don't currently take
-				// advantage of this.
-				et.CanCommitAtHigherTimestamp = true
 				ba.Add(&et)
 				assignSeqNumsForReqs(ba.Txn, &et)
 				return
@@ -10104,13 +10289,13 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 				// We're going to execute before any of the writes in setupFn.
 				ts.Logical = 0
 				ba.Txn = newTxn("ga1", ts)
+				ba.CanForwardReadTimestamp = true // necessary to indicate serverside-refresh is possible
 				for i := 1; i <= 3; i++ {
 					cput := cPutArgs(roachpb.Key(fmt.Sprintf("ga%d", i)), []byte("cput"), []byte("put"))
 					ba.Add(&cput)
 					assignSeqNumsForReqs(ba.Txn, &cput)
 				}
 				et, _ := endTxnArgs(ba.Txn, true /* commit */)
-				et.CanCommitAtHigherTimestamp = true // necessary to indicate serverside-refresh is possible
 				ba.Add(&et)
 				assignSeqNumsForReqs(ba.Txn, &et)
 				return
@@ -10139,10 +10324,10 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 				expTS = ts.Next()
 				ba = roachpb.BatchRequest{}
 				ba.Txn = txn
+				ba.CanForwardReadTimestamp = true // necessary to indicate serverside-refresh is possible
 				cput := cPutArgs(ba.Txn.Key, []byte("cput"), []byte("put"))
 				ba.Add(&cput)
 				et, _ := endTxnArgs(ba.Txn, true /* commit */)
-				et.CanCommitAtHigherTimestamp = true // necessary to indicate serverside-refresh is possible
 				ba.Add(&et)
 				assignSeqNumsForReqs(ba.Txn, &cput, &et)
 				return
@@ -10157,11 +10342,11 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 			},
 			batchFn: func(ts hlc.Timestamp) (ba roachpb.BatchRequest, expTS hlc.Timestamp) {
 				ba.Txn = newTxn("a", ts.Prev())
+				ba.CanForwardReadTimestamp = true // necessary to indicate serverside-refresh is possible
 				expTS = ts.Next()
 				cput := putArgs(ba.Txn.Key, []byte("put"))
 				et, _ := endTxnArgs(ba.Txn, true /* commit */)
-				et.Require1PC = true                 // don't allow this to bypass the 1PC optimization
-				et.CanCommitAtHigherTimestamp = true // necessary to indicate serverside-refresh is possible
+				et.Require1PC = true // don't allow this to bypass the 1PC optimization
 				ba.Add(&cput, &et)
 				assignSeqNumsForReqs(ba.Txn, &cput, &et)
 				return
@@ -10210,10 +10395,10 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 				expTS = ts.Next()
 				ba = roachpb.BatchRequest{}
 				ba.Txn = txn
+				ba.CanForwardReadTimestamp = true // necessary to indicate serverside-refresh is possible
 				put2 := putArgs(ba.Txn.Key, []byte("newput"))
 				ba.Add(&put2)
 				et, _ := endTxnArgs(ba.Txn, true /* commit */)
-				et.CanCommitAtHigherTimestamp = true // necessary to indicate serverside-refresh is possible
 				ba.Add(&et)
 				assignSeqNumsForReqs(ba.Txn, &put2, &et)
 				return
@@ -10716,6 +10901,7 @@ func TestTxnRecordLifecycleTransitions(t *testing.T) {
 			run: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
 				et, etH := endTxnArgs(txn, true /* commit */)
 				et.InFlightWrites = inFlightWrites
+				et.TxnHeartbeating = true
 				return sendWrappedWithErr(etH, &et)
 			},
 			expTxn: txnWithStagingStatusAndInFlightWrites,
@@ -10728,6 +10914,7 @@ func TestTxnRecordLifecycleTransitions(t *testing.T) {
 			},
 			run: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
 				et, etH := endTxnArgs(txn, false /* commit */)
+				et.TxnHeartbeating = true
 				return sendWrappedWithErr(etH, &et)
 			},
 			// The transaction record will be eagerly GC-ed.
@@ -10741,6 +10928,7 @@ func TestTxnRecordLifecycleTransitions(t *testing.T) {
 			},
 			run: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
 				et, etH := endTxnArgs(txn, true /* commit */)
+				et.TxnHeartbeating = true
 				return sendWrappedWithErr(etH, &et)
 			},
 			// The transaction record will be eagerly GC-ed.
@@ -10754,6 +10942,7 @@ func TestTxnRecordLifecycleTransitions(t *testing.T) {
 			},
 			run: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
 				et, etH := endTxnArgs(txn, false /* commit */)
+				et.TxnHeartbeating = true
 				return sendWrappedWithErr(etH, &et)
 			},
 			expTxn:           txnWithStatus(roachpb.ABORTED),
@@ -10767,6 +10956,7 @@ func TestTxnRecordLifecycleTransitions(t *testing.T) {
 			},
 			run: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
 				et, etH := endTxnArgs(txn, true /* commit */)
+				et.TxnHeartbeating = true
 				return sendWrappedWithErr(etH, &et)
 			},
 			expTxn:           txnWithStatus(roachpb.COMMITTED),
@@ -11508,21 +11698,15 @@ func TestTxnRecordLifecycleTransitions(t *testing.T) {
 			expTxn: noTxnRecord,
 		},
 		{
-			name: "1PC end transaction after push transaction (timestamp)",
+			name: "end transaction (one-phase commit) after push transaction (timestamp)",
 			setup: func(txn *roachpb.Transaction, now hlc.Timestamp) error {
 				pt := pushTxnArgs(pusher, txn, roachpb.PUSH_TIMESTAMP)
 				pt.PushTo = now
 				return sendWrappedWithErr(roachpb.Header{}, &pt)
 			},
 			run: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
-				et := roachpb.EndTxnRequest{
-					RequestHeader: roachpb.RequestHeader{
-						Key:      txn.Key,
-						Sequence: 1, // This will qualify for 1PC.
-					},
-					Commit: true,
-				}
-				etH := roachpb.Header{Txn: txn}
+				et, etH := endTxnArgs(txn, true /* commit */)
+				et.Sequence = 1 // qualify for 1PC
 				return sendWrappedWithErr(etH, &et)
 			},
 			expError: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
@@ -11531,25 +11715,56 @@ func TestTxnRecordLifecycleTransitions(t *testing.T) {
 			expTxn: noTxnRecord,
 		},
 		{
-			name: "1PC end transaction after push transaction (abort)",
+			name: "end transaction (one-phase commit) after push transaction (abort)",
 			setup: func(txn *roachpb.Transaction, now hlc.Timestamp) error {
 				pt := pushTxnArgs(pusher, txn, roachpb.PUSH_ABORT)
 				pt.PushTo = now
 				return sendWrappedWithErr(roachpb.Header{}, &pt)
 			},
 			run: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
-				et := roachpb.EndTxnRequest{
-					RequestHeader: roachpb.RequestHeader{
-						Key:      txn.Key,
-						Sequence: 1, // This will qualify for 1PC.
-					},
-					Commit: true,
-				}
-				etH := roachpb.Header{Txn: txn}
+				et, etH := endTxnArgs(txn, true /* commit */)
+				et.Sequence = 1 // qualify for 1PC
 				return sendWrappedWithErr(etH, &et)
 			},
 			expError: "TransactionAbortedError(ABORT_REASON_ABORTED_RECORD_FOUND)",
 			expTxn:   noTxnRecord,
+		},
+		{
+			// 1PC is disabled if the transaction already has a record to ensure
+			// that the record is properly cleaned up by the EndTxn request. If
+			// we did not disable 1PC then the test would need txnWithoutChanges
+			// as the expTxn.
+			name: "end transaction (one-phase commit) after heartbeat transaction",
+			setup: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
+				hb, hbH := heartbeatArgs(txn, txn.MinTimestamp)
+				return sendWrappedWithErr(hbH, &hb)
+			},
+			run: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
+				et, etH := endTxnArgs(txn, true /* commit */)
+				et.Sequence = 1 // qualify for 1PC
+				et.TxnHeartbeating = true
+				return sendWrappedWithErr(etH, &et)
+			},
+			expTxn: noTxnRecord,
+		},
+		{
+			// 1PC is disabled if the transaction already has a record to ensure
+			// that the record is properly cleaned up by the EndTxn request. If
+			// we did not disable 1PC then the test would not throw an error.
+			name: "end transaction (one-phase commit required) after heartbeat transaction",
+			setup: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
+				hb, hbH := heartbeatArgs(txn, txn.MinTimestamp)
+				return sendWrappedWithErr(hbH, &hb)
+			},
+			run: func(txn *roachpb.Transaction, _ hlc.Timestamp) error {
+				et, etH := endTxnArgs(txn, true /* commit */)
+				et.Sequence = 1 // qualify for 1PC
+				et.TxnHeartbeating = true
+				et.Require1PC = true
+				return sendWrappedWithErr(etH, &et)
+			},
+			expError: "TransactionStatusError: could not commit in one phase as requested",
+			expTxn:   txnWithoutChanges,
 		},
 		{
 			name: "heartbeat transaction after push transaction (abort)",
@@ -12757,12 +12972,13 @@ func TestRangeUnavailableMessage(t *testing.T) {
 		1: IsLiveMapEntry{IsLive: true},
 	}
 	rs := raft.Status{}
-	act := rangeUnavailableMessage(desc, lm, &rs, &ba, dur)
-	const exp = `have been waiting 60.00s for proposing command RequestLease [/Min,/Min).
+	var s redact.StringBuilder
+	rangeUnavailableMessage(&s, desc, lm, &rs, &ba, dur)
+	const exp = `have been waiting 60.00s for proposing command RequestLease [‹/Min›,‹/Min›).
 This range is likely unavailable.
 Please submit this message to Cockroach Labs support along with the following information:
 
-Descriptor:  r10:{-} [(n1,s10):1, (n2,s20):2, next=3, gen=0]
+Descriptor:  r10:‹{a-z}› [(n1,s10):1, (n2,s20):2, next=3, gen=0]
 Live:        (n1,s10):1
 Non-live:    (n2,s20):2
 Raft Status: {"id":"0","term":0,"vote":"0","commit":0,"lead":"0","raftState":"StateFollower","applied":0,"progress":{},"leadtransferee":"0"}
@@ -12774,8 +12990,9 @@ support contract. Otherwise, please open an issue at:
 
   https://github.com/cockroachdb/cockroach/issues/new/choose
 `
-
-	require.Equal(t, exp, act)
+	act := s.RedactableString()
+	t.Log(act)
+	require.EqualValues(t, exp, act)
 }
 
 // Test that, depending on the request's ClientRangeInfo, descriptor and lease

@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/errors"
 )
@@ -76,7 +76,7 @@ func (i *InternalFileToTableExecutor) Query(
 	result := FileToTableExecutorRows{}
 	var err error
 	result.internalExecResults, err = i.ie.QueryEx(ctx, opName, nil,
-		sqlbase.InternalExecutorSessionDataOverride{User: username}, query, qargs...)
+		sessiondata.InternalExecutorOverride{User: username}, query, qargs...)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +88,7 @@ func (i *InternalFileToTableExecutor) Exec(
 	ctx context.Context, opName, query, username string, qargs ...interface{},
 ) error {
 	_, err := i.ie.ExecEx(ctx, opName, nil,
-		sqlbase.InternalExecutorSessionDataOverride{User: username}, query, qargs...)
+		sessiondata.InternalExecutorOverride{User: username}, query, qargs...)
 	return err
 }
 
@@ -163,18 +163,16 @@ type FileToTableSystem struct {
 
 // FileTable which contains records for every uploaded file.
 const fileTableSchema = `CREATE TABLE %s (filename STRING PRIMARY KEY, 
+file_id UUID UNIQUE NOT NULL DEFAULT gen_random_uuid(),
 file_size INT NOT NULL, 
 username STRING NOT NULL, 
 upload_time TIMESTAMP DEFAULT now())`
 
 // PayloadTable contains the chunked payloads of each file.
-// The Payload table is interleaved in the File table to prevent repetition
-// of filename for every chunk at the KV level.
-const payloadTableSchema = `CREATE TABLE %s (filename STRING, 
+const payloadTableSchema = `CREATE TABLE %s (file_id UUID, 
 byte_offset INT, 
 payload BYTES, 
-PRIMARY KEY(filename, byte_offset)) 
-INTERLEAVE IN PARENT %s(filename)`
+PRIMARY KEY(file_id, byte_offset))`
 
 // GetFQFileTableName returns the qualified File table name.
 func (f *FileToTableSystem) GetFQFileTableName() string {
@@ -187,23 +185,13 @@ func (f *FileToTableSystem) GetFQPayloadTableName() string {
 }
 
 // GetSimpleFileTableName returns the non-qualified File table name.
-func (f *FileToTableSystem) GetSimpleFileTableName() (string, error) {
-	tableName, err := parser.ParseQualifiedTableName(f.qualifiedTableName)
-	if err != nil {
-		return "", err
-	}
-
-	return tableName.ObjectName.String() + fileTableNameSuffix, nil
+func (f *FileToTableSystem) GetSimpleFileTableName(prefix string) (string, error) {
+	return prefix + fileTableNameSuffix, nil
 }
 
 // GetSimplePayloadTableName returns the non-qualified Payload table name.
-func (f *FileToTableSystem) GetSimplePayloadTableName() (string, error) {
-	tableName, err := parser.ParseQualifiedTableName(f.qualifiedTableName)
-	if err != nil {
-		return "", err
-	}
-
-	return tableName.ObjectName.String() + payloadTableNameSuffix, nil
+func (f *FileToTableSystem) GetSimplePayloadTableName(prefix string) (string, error) {
+	return prefix + payloadTableNameSuffix, nil
 }
 
 // GetDatabaseAndSchema returns the database.schema of the current
@@ -215,6 +203,16 @@ func (f *FileToTableSystem) GetDatabaseAndSchema() (string, error) {
 	}
 
 	return tableName.ObjectNamePrefix.String(), nil
+}
+
+// GetTableName returns the table name from the passed FQN.
+func (f *FileToTableSystem) GetTableName() (string, error) {
+	tableName, err := parser.ParseQualifiedTableName(f.qualifiedTableName)
+	if err != nil {
+		return "", err
+	}
+
+	return tableName.ObjectName.String(), nil
 }
 
 func resolveInternalFileToTableExecutor(
@@ -239,6 +237,14 @@ func NewFileToTableSystem(
 	executor FileToTableSystemExecutor,
 	username string,
 ) (*FileToTableSystem, error) {
+	// Check the qualifiedTableName is parseable, so that we can return a useful
+	// error pre-emptively.
+	_, err := parser.ParseQualifiedTableName(qualifiedTableName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to parse qualified table name %s supplied to userfile",
+			qualifiedTableName)
+	}
+
 	f := FileToTableSystem{
 		qualifiedTableName: qualifiedTableName, executor: executor, username: username,
 	}
@@ -293,7 +299,7 @@ func (f *FileToTableSystem) FileSize(ctx context.Context, filename string) (int6
 	getFileSizeQuery := fmt.Sprintf(`SELECT file_size FROM %s WHERE filename=$1`,
 		f.GetFQFileTableName())
 	rows, err := e.ie.QueryRowEx(ctx, "payload-table-storage-size", nil,
-		sqlbase.InternalExecutorSessionDataOverride{User: f.username},
+		sessiondata.InternalExecutorOverride{User: f.username},
 		getFileSizeQuery, filename)
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to get size of file from the payload table")
@@ -361,7 +367,7 @@ func DestroyUserFileSystem(ctx context.Context, f *FileToTableSystem) error {
 		func(ctx context.Context, txn *kv.Txn) error {
 			dropPayloadTableQuery := fmt.Sprintf(`DROP TABLE %s`, f.GetFQPayloadTableName())
 			_, err := e.ie.QueryEx(ctx, "drop-payload-table", txn,
-				sqlbase.InternalExecutorSessionDataOverride{User: f.username},
+				sessiondata.InternalExecutorOverride{User: f.username},
 				dropPayloadTableQuery)
 			if err != nil {
 				return errors.Wrap(err, "failed to drop payload table")
@@ -369,7 +375,7 @@ func DestroyUserFileSystem(ctx context.Context, f *FileToTableSystem) error {
 
 			dropFileTableQuery := fmt.Sprintf(`DROP TABLE %s CASCADE`, f.GetFQFileTableName())
 			_, err = e.ie.QueryEx(ctx, "drop-file-table", txn,
-				sqlbase.InternalExecutorSessionDataOverride{User: f.username},
+				sessiondata.InternalExecutorOverride{User: f.username},
 				dropFileTableQuery)
 			if err != nil {
 				return errors.Wrap(err, "failed to drop file table")
@@ -378,6 +384,42 @@ func DestroyUserFileSystem(ctx context.Context, f *FileToTableSystem) error {
 			return nil
 		}); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (f *FileToTableSystem) getDeleteQuery() string {
+	deleteFileMetadataQueryPlaceholder := `DELETE FROM %s WHERE filename=$1`
+	return fmt.Sprintf(deleteFileMetadataQueryPlaceholder, f.GetFQFileTableName())
+}
+
+func (f *FileToTableSystem) getDeletePayloadQuery() string {
+	deletePayloadQueryPlaceholder := `DELETE FROM %s WHERE file_id IN (
+SELECT file_id FROM %s WHERE filename=$1)`
+	return fmt.Sprintf(deletePayloadQueryPlaceholder, f.GetFQPayloadTableName(),
+		f.GetFQFileTableName())
+}
+
+// deleteFileWithoutTxn differs from DeleteFile in that it performs its delete
+// operation without opening a txn. This allows for it to be run within an
+// already open explicit txn to provide transactional guarantees. This is used
+// by WriteFile to allow for overwriting of an existing file with the same name.
+func (f *FileToTableSystem) deleteFileWithoutTxn(
+	ctx context.Context, filename string, ie *sql.InternalExecutor,
+) error {
+	execSessionDataOverride := sessiondata.InternalExecutorOverride{User: f.username}
+	_, err := ie.ExecEx(ctx, "delete-payload-table",
+		nil /* txn */, execSessionDataOverride, f.getDeletePayloadQuery(), filename)
+	if err != nil {
+		return errors.Wrap(err,
+			"failed to delete from the payload table while preparing for overwrite")
+	}
+
+	_, err = ie.ExecEx(ctx, "delete-file-table", nil, execSessionDataOverride,
+		f.getDeleteQuery(), filename)
+	if err != nil {
+		return errors.Wrap(err, "failed to delete from the file table while preparing for overwrite")
 	}
 
 	return nil
@@ -395,46 +437,40 @@ func (f *FileToTableSystem) DeleteFile(ctx context.Context, filename string) err
 		return txnErr
 	}
 
-	deleteFileQuery := fmt.Sprintf(`DELETE FROM %s WHERE filename=$1`, f.GetFQFileTableName())
-	txnErr = f.executor.Exec(ctx, "delete-file-table", deleteFileQuery,
+	txnErr = f.executor.Exec(ctx, "delete-payload-table", f.getDeletePayloadQuery(),
+		f.username, filename)
+	if txnErr != nil {
+		return errors.Wrap(txnErr, "failed to delete from the payload table")
+	}
+
+	txnErr = f.executor.Exec(ctx, "delete-file-table", f.getDeleteQuery(),
 		f.username, filename)
 	if txnErr != nil {
 		return errors.Wrap(txnErr, "failed to delete from the file table")
-	}
-
-	deletePayloadQuery := fmt.Sprintf(`DELETE FROM %s WHERE filename=$1`,
-		f.GetFQPayloadTableName())
-
-	txnErr = f.executor.Exec(ctx, "delete-payload-table", deletePayloadQuery, f.username,
-		filename)
-	if txnErr != nil {
-		return errors.Wrap(txnErr, "failed to delete from the payload table")
 	}
 
 	return nil
 }
 
 // payloadWriter is responsible for writing the file data (payload) to the user
-// Payload table. It implements the io.Writer interface.
+// Payload table.
 type payloadWriter struct {
-	filename                string
+	fileID                  tree.Datum
 	ie                      *sql.InternalExecutor
+	db                      *kv.DB
 	ctx                     context.Context
-	txn                     *kv.Txn
 	byteOffset              int
-	execSessionDataOverride sqlbase.InternalExecutorSessionDataOverride
+	execSessionDataOverride sessiondata.InternalExecutorOverride
 	fileTableName           string
 	payloadTableName        string
 }
 
-var _ io.Writer = &payloadWriter{}
-
-// Write implements the io.Writer interface by inserting a single row into the
-// Payload table.
-func (p *payloadWriter) Write(buf []byte) (int, error) {
+// WriteChunk inserts a single row into the Payload table as an operation in the
+// transaction txn.
+func (p *payloadWriter) WriteChunk(buf []byte, txn *kv.Txn) (int, error) {
 	insertChunkQuery := fmt.Sprintf(`INSERT INTO %s VALUES ($1, $2, $3)`, p.payloadTableName)
-	_, err := p.ie.QueryEx(p.ctx, "insert-file-chunk", p.txn, p.execSessionDataOverride,
-		insertChunkQuery, p.filename, p.byteOffset, buf)
+	_, err := p.ie.QueryEx(p.ctx, "insert-file-chunk", txn, p.execSessionDataOverride,
+		insertChunkQuery, p.fileID, p.byteOffset, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -452,10 +488,11 @@ func (p *payloadWriter) Write(buf []byte) (int, error) {
 type chunkWriter struct {
 	buf                     *bytes.Buffer
 	pw                      *payloadWriter
-	execSessionDataOverride sqlbase.InternalExecutorSessionDataOverride
+	execSessionDataOverride sessiondata.InternalExecutorOverride
 	fileTableName           string
 	payloadTableName        string
 	chunkSize               int
+	filename                string
 }
 
 var _ io.WriteCloser = &chunkWriter{}
@@ -465,19 +502,36 @@ func newChunkWriter(
 	chunkSize int,
 	filename, username, fileTableName, payloadTableName string,
 	ie *sql.InternalExecutor,
-	txn *kv.Txn,
-) *chunkWriter {
-	execSessionDataOverride := sqlbase.InternalExecutorSessionDataOverride{User: username}
+	db *kv.DB,
+) (*chunkWriter, error) {
+	execSessionDataOverride := sessiondata.InternalExecutorOverride{User: username}
+
+	// Insert file metadata entry into File table. This gives us the generated
+	// UUID of the file.
+	// We update the file_size column value when the ChunkWriter is closed.
+	fileNameQuery := fmt.Sprintf(`INSERT INTO %s VALUES ($1, DEFAULT, $2, $3) RETURNING file_id`,
+		fileTableName)
+
+	res, err := ie.QueryRowEx(ctx, "insert-file-name",
+		nil /* txn */, execSessionDataOverride, fileNameQuery, filename, 0,
+		execSessionDataOverride.User)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil {
+		return nil, errors.Newf("no UUID returned for filename %s", filename)
+	}
+
 	pw := &payloadWriter{
-		filename, ie, ctx, txn, 0,
+		res[0], ie, db, ctx, 0,
 		execSessionDataOverride, fileTableName,
 		payloadTableName}
 	bytesBuffer := bytes.NewBuffer(make([]byte, 0, chunkSize))
 	return &chunkWriter{
 		bytesBuffer, pw, execSessionDataOverride,
 		fileTableName, payloadTableName,
-		chunkSize,
-	}
+		chunkSize, filename,
+	}, nil
 }
 
 // fillAvailableBufferSpace fills the remaining space in the bytes buffer with
@@ -494,11 +548,15 @@ func (w *chunkWriter) fillAvailableBufferSpace(payload []byte) ([]byte, error) {
 	return payload[available:], nil
 }
 
-// Write is responsible for filling up the bytes buffer upto chunkSize, and
-// then forwarding the bytes to the payloadWriter to be written into the SQL
-// tables.
+// Write is responsible for filling up the bytes buffer upto chunkSize, and then
+// forwarding the bytes to the payloadWriter to be written into the SQL tables.
 // Any bytes remaining in the bytes buffer at the end of Write() will be flushed
 // in Close().
+// Write is currently invoked within a explicit txn which does not
+// offer txn retry support. To mitigate this, every time our bytes buffer is of
+// chunkSize we perform the write to payloadWriter within a txn retry loop. Any
+// error encountered during buffering or writing will be bubbled up to the
+// explicit txn, causing it to rollback.
 func (w *chunkWriter) Write(buf []byte) (int, error) {
 	bufLen := len(buf)
 	for len(buf) > 0 {
@@ -508,9 +566,17 @@ func (w *chunkWriter) Write(buf []byte) (int, error) {
 			return 0, err
 		}
 
-		// If the buffer has been filled to capacity, write the chunk.
+		// If the buffer has been filled to capacity, write the chunk inside a txn
+		// retry loop.
 		if w.buf.Len() == w.buf.Cap() {
-			if n, err := w.pw.Write(w.buf.Bytes()); err != nil || n != w.buf.Len() {
+			if err := w.pw.db.Txn(w.pw.ctx, func(ctx context.Context, txn *kv.Txn) error {
+				if n, err := w.pw.WriteChunk(w.buf.Bytes(), txn); err != nil {
+					return err
+				} else if n != w.buf.Len() {
+					return errors.Wrap(io.ErrShortWrite, "error when writing in chunkWriter")
+				}
+				return nil
+			}); err != nil {
 				return 0, err
 			}
 			w.buf.Reset()
@@ -521,8 +587,8 @@ func (w *chunkWriter) Write(buf []byte) (int, error) {
 }
 
 // Close implements the io.Closer interface by flushing the underlying writer
-// thereby writing remaining data to the Payload table. It also inserts a file
-// metadata entry into the File table.
+// thereby writing remaining data to the Payload table. It also updates the file
+// metadata entry in the File table with the number of bytes written.
 //
 // The chunkWriter must be Close()'d, and the error returned should be checked
 // to ensure that the buffer has been flushed and the txn committed. Not
@@ -532,17 +598,25 @@ func (w *chunkWriter) Close() error {
 	// payloadWriter Write() method, then the txn is aborted and the error is
 	// propagated here.
 	if w.buf.Len() > 0 {
-		if n, err := w.pw.Write(w.buf.Bytes()); err != nil || n != w.buf.Len() {
+		if err := w.pw.db.Txn(w.pw.ctx, func(ctx context.Context, txn *kv.Txn) error {
+			if n, err := w.pw.WriteChunk(w.buf.Bytes(), txn); err != nil {
+				return err
+			} else if n != w.buf.Len() {
+				return errors.Wrap(io.ErrShortWrite, "error when closing chunkWriter")
+			}
+			return nil
+		}); err != nil {
 			return err
 		}
 	}
 
-	// Insert file metadata entry into File table.
-	fileNameQuery := fmt.Sprintf(`INSERT INTO %s VALUES ($1, $2, $3)`, w.fileTableName)
+	// Update the file metadata entry file size, now that we know how many bytes
+	// were actually written to the payload table.
+	updateFileSizeQuery := fmt.Sprintf(`UPDATE %s SET file_size=$1 WHERE filename=$2`,
+		w.fileTableName)
+	_, err := w.pw.ie.QueryEx(w.pw.ctx, "update-file-size",
+		nil /* txn */, w.execSessionDataOverride, updateFileSizeQuery, w.pw.byteOffset, w.filename)
 
-	_, err := w.pw.ie.QueryEx(w.pw.ctx, "insert-file-name", w.pw.txn,
-		w.execSessionDataOverride, fileNameQuery, w.pw.filename, w.pw.byteOffset,
-		w.execSessionDataOverride.User)
 	return err
 }
 
@@ -576,30 +650,28 @@ func newFileTableReader(
 	filename, username, fileTableName, payloadTableName string,
 	ie *sql.InternalExecutor,
 ) (io.Reader, error) {
-	query := fmt.Sprintf(`SELECT payload FROM %s WHERE filename=$1`, payloadTableName)
-	rows, err := ie.QueryEx(
-		ctx, "get-filename-payload", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: username}, query, filename,
+	// Get file_id from metadata entry in File table.
+	fileIDQuery := fmt.Sprintf(`SELECT file_id FROM %s WHERE filename=$1`, fileTableName)
+	fileIDRow, err := ie.QueryRowEx(
+		ctx, "get-filename-payload",
+		nil /* txn */, sessiondata.InternalExecutorOverride{User: username}, fileIDQuery, filename,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	// If no payload entries were found, check for a metadata entry. If that does
-	// not exist either, return an does not exist error.
-	if len(rows) == 0 {
-		query := fmt.Sprintf(`SELECT filename FROM %s WHERE filename=$1`, fileTableName)
-		metadataRows, err := ie.QueryEx(
-			ctx, "get-filename-metadata", nil, /* txn */
-			sqlbase.InternalExecutorSessionDataOverride{User: username}, query, filename,
-		)
-		if err != nil {
-			return nil, err
-		}
+	// If no metadata entry was found return a does not exist error.
+	if fileIDRow == nil {
+		return nil, os.ErrNotExist
+	}
 
-		if len(metadataRows) == 0 {
-			return nil, os.ErrNotExist
-		}
+	query := fmt.Sprintf(`SELECT payload FROM %s WHERE file_id=$1`, payloadTableName)
+	rows, err := ie.QueryEx(
+		ctx, "get-filename-payload",
+		nil /* txn */, sessiondata.InternalExecutorOverride{User: username}, query, fileIDRow[0],
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	// Verify that all the payloads are bytes and assemble bytes of filename.
@@ -629,11 +701,18 @@ func (f *FileToTableSystem) ReadFile(ctx context.Context, filename string) (io.R
 func (f *FileToTableSystem) checkIfFileAndPayloadTableExist(
 	ctx context.Context, ie *sql.InternalExecutor,
 ) (bool, error) {
-	fileTableName, err := f.GetSimpleFileTableName()
+	tablePrefix, err := f.GetTableName()
 	if err != nil {
 		return false, err
 	}
-	payloadTableName, err := f.GetSimplePayloadTableName()
+	if tablePrefix == "" {
+		return false, errors.Newf("could not resolve the table name from the FQN %s", f.qualifiedTableName)
+	}
+	fileTableName, err := f.GetSimpleFileTableName(tablePrefix)
+	if err != nil {
+		return false, err
+	}
+	payloadTableName, err := f.GetSimplePayloadTableName(tablePrefix)
 	if err != nil {
 		return false, err
 	}
@@ -642,11 +721,15 @@ func (f *FileToTableSystem) checkIfFileAndPayloadTableExist(
 		return false, err
 	}
 
+	if databaseSchema == "" {
+		return false, errors.Newf("could not resolve the db and schema name from %s", f.qualifiedTableName)
+	}
+
 	tableExistenceQuery := fmt.Sprintf(
 		`SELECT table_name FROM [SHOW TABLES FROM %s] WHERE table_name=$1 OR table_name=$2`,
 		databaseSchema)
 	rows, err := ie.QueryEx(ctx, "tables-exist", nil,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUser},
 		tableExistenceQuery, fileTableName, payloadTableName)
 	if err != nil {
 		return false, err
@@ -665,19 +748,27 @@ func (f *FileToTableSystem) createFileAndPayloadTables(
 	// Create the File and Payload tables to hold the file chunks.
 	fileTableCreateQuery := fmt.Sprintf(fileTableSchema, f.GetFQFileTableName())
 	_, err := ie.QueryEx(ctx, "create-file-table", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: f.username},
+		sessiondata.InternalExecutorOverride{User: f.username},
 		fileTableCreateQuery)
 	if err != nil {
 		return errors.Wrap(err, "failed to create file table to store uploaded file names")
 	}
 
-	payloadTableCreateQuery := fmt.Sprintf(payloadTableSchema, f.GetFQPayloadTableName(),
-		f.GetFQFileTableName())
+	payloadTableCreateQuery := fmt.Sprintf(payloadTableSchema, f.GetFQPayloadTableName())
 	_, err = ie.QueryEx(ctx, "create-payload-table", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: f.username},
+		sessiondata.InternalExecutorOverride{User: f.username},
 		payloadTableCreateQuery)
 	if err != nil {
-		return errors.Wrap(err, "failed to create interleaved table to store chunks of uploaded files")
+		return errors.Wrap(err, "failed to create table to store chunks of uploaded files")
+	}
+
+	addFKQuery := fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT file_id_fk FOREIGN KEY (
+file_id) REFERENCES %s (file_id)`, f.GetFQPayloadTableName(), f.GetFQFileTableName())
+	_, err = ie.ExecEx(ctx, "create-payload-table", txn,
+		sessiondata.InternalExecutorOverride{User: f.username},
+		addFKQuery)
+	if err != nil {
+		return errors.Wrap(err, "failed to add FK constraint to the payload table file_id column")
 	}
 
 	return nil
@@ -691,7 +782,7 @@ func (f *FileToTableSystem) grantCurrentUserTablePrivileges(
 	grantQuery := fmt.Sprintf(`GRANT SELECT, INSERT, DROP, DELETE ON TABLE %s, %s TO %s`,
 		f.GetFQFileTableName(), f.GetFQPayloadTableName(), f.username)
 	_, err := ie.QueryEx(ctx, "grant-user-file-payload-table-access", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUser},
 		grantQuery)
 	if err != nil {
 		return errors.Wrap(err, "failed to grant access privileges to file and payload tables")
@@ -709,7 +800,7 @@ func (f *FileToTableSystem) revokeOtherUserTablePrivileges(
 users WHERE NOT "username" = 'root' AND NOT "username" = 'admin' AND NOT "username" = $1`)
 	rows, err := ie.QueryEx(
 		ctx, "get-users", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUser},
 		getUsersQuery, f.username,
 	)
 	if err != nil {
@@ -725,7 +816,7 @@ users WHERE NOT "username" = 'root' AND NOT "username" = 'admin' AND NOT "userna
 		revokeQuery := fmt.Sprintf(`REVOKE ALL ON TABLE %s, %s FROM %s`,
 			f.GetFQFileTableName(), f.GetFQPayloadTableName(), user)
 		_, err = ie.QueryEx(ctx, "revoke-user-privileges", txn,
-			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+			sessiondata.InternalExecutorOverride{User: security.RootUser},
 			revokeQuery)
 		if err != nil {
 			return errors.Wrap(err, "failed to revoke privileges")
@@ -738,15 +829,25 @@ users WHERE NOT "username" = 'root' AND NOT "username" = 'admin' AND NOT "userna
 // NewFileWriter returns a io.WriteCloser which can be used to write files to
 // the user File and Payload tables. The io.WriteCloser must be closed to flush
 // the last chunk and commit the txn within which all writes occur.
-// An error at any point of the write aborts the txn.
 func (f *FileToTableSystem) NewFileWriter(
-	ctx context.Context, filename string, chunkSize int, txn *kv.Txn,
+	ctx context.Context, filename string, chunkSize int,
 ) (io.WriteCloser, error) {
 	e, err := resolveInternalFileToTableExecutor(f.executor)
 	if err != nil {
 		return nil, err
 	}
 
+	// BACKUP must allow overwriting of files. Since userfile is backed by a SQL
+	// table with filename as a PK, this would cause a constraint violation if
+	// we did not delete the file and its contents before writing.
+	//
+	// NB: userfile upload will error out on the client side if a file with the
+	// same name already exists.
+	err = f.deleteFileWithoutTxn(ctx, filename, e.ie)
+	if err != nil {
+		return nil, err
+	}
+
 	return newChunkWriter(ctx, chunkSize, filename, f.username, f.GetFQFileTableName(),
-		f.GetFQPayloadTableName(), e.ie, txn), nil
+		f.GetFQPayloadTableName(), e.ie, e.db)
 }

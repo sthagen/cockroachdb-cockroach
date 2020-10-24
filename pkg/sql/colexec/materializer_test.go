@@ -19,13 +19,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestColumnarizeMaterialize(t *testing.T) {
@@ -36,10 +42,10 @@ func TestColumnarizeMaterialize(t *testing.T) {
 	nCols := 1 + rng.Intn(4)
 	var typs []*types.T
 	for len(typs) < nCols {
-		typs = append(typs, sqlbase.RandType(rng))
+		typs = append(typs, rowenc.RandType(rng))
 	}
 	nRows := 10000
-	rows := sqlbase.RandEncDatumRowsOfTypes(rng, nRows, typs)
+	rows := rowenc.RandEncDatumRowsOfTypes(rng, nRows, typs)
 	input := execinfra.NewRepeatableRowSource(typs, rows)
 
 	ctx := context.Background()
@@ -177,11 +183,55 @@ func BenchmarkMaterializer(b *testing.B) {
 	}
 }
 
+func TestMaterializerNextErrorAfterConsumerDone(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testError := errors.New("test-induced error")
+	metadataSource := &execinfrapb.CallbackMetadataSource{DrainMetaCb: func(_ context.Context) []execinfrapb.ProducerMetadata {
+		colexecerror.InternalError(testError)
+		// Unreachable
+		return nil
+	}}
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+	flowCtx := &execinfra.FlowCtx{
+		EvalCtx: &evalCtx,
+	}
+
+	m, err := NewMaterializer(
+		flowCtx,
+		0, /* processorID */
+		&colexecbase.CallbackOperator{},
+		nil, /* typ */
+		nil, /* output */
+		[]execinfrapb.MetadataSource{metadataSource},
+		nil, /* toClose */
+		nil, /* outputStatsToTrace */
+		nil, /* cancelFlow */
+	)
+	require.NoError(t, err)
+
+	m.Start(ctx)
+	// Call ConsumerDone.
+	m.ConsumerDone()
+	// We expect Next to panic since DrainMeta panics are currently not caught by
+	// the materializer and it's not clear whether they should be since
+	// implementers of DrainMeta do not return errors as panics.
+	testutils.IsError(
+		colexecerror.CatchVectorizedRuntimeError(func() {
+			m.Next()
+		}),
+		testError.Error(),
+	)
+}
+
 func BenchmarkColumnarizeMaterialize(b *testing.B) {
 	types := []*types.T{types.Int, types.Int}
 	nRows := 10000
 	nCols := 2
-	rows := sqlbase.MakeIntRows(nRows, nCols)
+	rows := rowenc.MakeIntRows(nRows, nCols)
 	input := execinfra.NewRepeatableRowSource(types, rows)
 
 	ctx := context.Background()

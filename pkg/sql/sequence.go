@@ -18,15 +18,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/sequence"
@@ -66,7 +68,7 @@ func (p *planner) GetSerialSequenceNameFromColumn(
 			return nil, nil
 		}
 	}
-	return nil, sqlbase.NewUndefinedColumnError(string(columnName))
+	return nil, colinfo.NewUndefinedColumnError(string(columnName))
 }
 
 // IncrementSequence implements the tree.SequenceOperators interface.
@@ -109,7 +111,7 @@ func (p *planner) IncrementSequence(ctx context.Context, seqName *tree.TableName
 	return val, nil
 }
 
-func boundsExceededError(descriptor *sqlbase.ImmutableTableDescriptor) error {
+func boundsExceededError(descriptor *tabledesc.Immutable) error {
 	seqOpts := descriptor.SequenceOpts
 	isAscending := seqOpts.Increment > 0
 
@@ -175,7 +177,7 @@ func (p *planner) SetSequenceValue(
 			`cannot set the value of virtual sequence %q`, tree.ErrString(seqName))
 	}
 
-	seqValueKey, newVal, err := MakeSequenceKeyVal(p.ExecCfg().Codec, descriptor.TableDesc(), newVal, isCalled)
+	seqValueKey, newVal, err := MakeSequenceKeyVal(p.ExecCfg().Codec, descriptor, newVal, isCalled)
 	if err != nil {
 		return err
 	}
@@ -189,27 +191,27 @@ func (p *planner) SetSequenceValue(
 // MakeSequenceKeyVal returns the key and value of a sequence being set
 // with newVal.
 func MakeSequenceKeyVal(
-	codec keys.SQLCodec, sequence *TableDescriptor, newVal int64, isCalled bool,
+	codec keys.SQLCodec, sequence catalog.TableDescriptor, newVal int64, isCalled bool,
 ) ([]byte, int64, error) {
-	opts := sequence.SequenceOpts
+	opts := sequence.GetSequenceOpts()
 	if newVal > opts.MaxValue || newVal < opts.MinValue {
 		return nil, 0, pgerror.Newf(
 			pgcode.NumericValueOutOfRange,
 			`value %d is out of bounds for sequence "%s" (%d..%d)`,
-			newVal, sequence.Name, opts.MinValue, opts.MaxValue,
+			newVal, sequence.GetName(), opts.MinValue, opts.MaxValue,
 		)
 	}
 	if !isCalled {
-		newVal = newVal - sequence.SequenceOpts.Increment
+		newVal = newVal - opts.Increment
 	}
 
-	seqValueKey := codec.SequenceKey(uint32(sequence.ID))
+	seqValueKey := codec.SequenceKey(uint32(sequence.GetID()))
 	return seqValueKey, newVal, nil
 }
 
 // GetSequenceValue returns the current value of the sequence.
 func (p *planner) GetSequenceValue(
-	ctx context.Context, codec keys.SQLCodec, desc *sqlbase.ImmutableTableDescriptor,
+	ctx context.Context, codec keys.SQLCodec, desc *tabledesc.Immutable,
 ) (int64, error) {
 	if desc.SequenceOpts == nil {
 		return 0, errors.New("descriptor is not a sequence")
@@ -234,6 +236,7 @@ func assignSequenceOptions(
 	setDefaults bool,
 	params *runParams,
 	sequenceID descpb.ID,
+	sequenceParentID descpb.ID,
 ) error {
 	// All other defaults are dependent on the value of increment,
 	// i.e. whether the sequence is ascending or descending.
@@ -323,6 +326,13 @@ func assignSequenceOptions(
 				if err != nil {
 					return err
 				}
+				if tableDesc.ParentID != sequenceParentID &&
+					!allowCrossDatabaseSeqOwner.Get(&params.p.execCfg.Settings.SV) {
+					return pgerror.Newf(pgcode.FeatureNotSupported,
+						"OWNED BY cannot refer to other databases; (see the '%s' cluster setting)",
+						allowCrossDatabaseSeqOwnerSetting,
+					)
+				}
 				// We only want to trigger schema changes if the owner is not what we
 				// want it to be.
 				if opts.SequenceOwner.OwnerTableID != tableDesc.ID ||
@@ -373,7 +383,7 @@ func removeSequenceOwnerIfExists(
 	if err != nil {
 		// Special case error swallowing for #50711 and #50781, which can cause a
 		// column to own sequences that have been dropped/do not exist.
-		if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
+		if errors.Is(err, catalog.ErrDescriptorNotFound) {
 			log.Eventf(ctx, "swallowing error during sequence ownership unlinking: %s", err.Error())
 			return nil
 		}
@@ -414,7 +424,7 @@ func removeSequenceOwnerIfExists(
 
 func resolveColumnItemToDescriptors(
 	ctx context.Context, p *planner, columnItem *tree.ColumnItem,
-) (*MutableTableDescriptor, *descpb.ColumnDescriptor, error) {
+) (*tabledesc.Mutable, *descpb.ColumnDescriptor, error) {
 	var tableName tree.TableName
 	if columnItem.TableName != nil {
 		tableName = columnItem.TableName.ToTableName()
@@ -461,16 +471,16 @@ func addSequenceOwner(
 func maybeAddSequenceDependencies(
 	ctx context.Context,
 	sc resolver.SchemaResolver,
-	tableDesc *sqlbase.MutableTableDescriptor,
+	tableDesc *tabledesc.Mutable,
 	col *descpb.ColumnDescriptor,
 	expr tree.TypedExpr,
-	backrefs map[descpb.ID]*sqlbase.MutableTableDescriptor,
-) ([]*MutableTableDescriptor, error) {
+	backrefs map[descpb.ID]*tabledesc.Mutable,
+) ([]*tabledesc.Mutable, error) {
 	seqNames, err := sequence.GetUsedSequenceNames(expr)
 	if err != nil {
 		return nil, err
 	}
-	var seqDescs []*MutableTableDescriptor
+	var seqDescs []*tabledesc.Mutable
 	for _, seqName := range seqNames {
 		parsedSeqName, err := parser.ParseTableName(seqName)
 		if err != nil {
@@ -478,7 +488,7 @@ func maybeAddSequenceDependencies(
 		}
 		tn := parsedSeqName.ToTableName()
 
-		var seqDesc *MutableTableDescriptor
+		var seqDesc *tabledesc.Mutable
 		p, ok := sc.(*planner)
 		if ok {
 			seqDesc, err = p.ResolveMutableTableDescriptor(ctx, &tn, true /*required*/, tree.ResolveRequireSequenceDesc)
@@ -529,7 +539,7 @@ func (p *planner) dropSequencesOwnedByCol(
 		// Special case error swallowing for #50781, which can cause a
 		// column to own sequences that do not exist.
 		if err != nil {
-			if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
+			if errors.Is(err, catalog.ErrDescriptorNotFound) {
 				log.Eventf(ctx, "swallowing error dropping owned sequences: %s", err.Error())
 				continue
 			}
@@ -556,7 +566,7 @@ func (p *planner) dropSequencesOwnedByCol(
 //   - writes the sequence descriptor and notifies a schema change.
 // The column descriptor is mutated but not saved to persistent storage; the caller must save it.
 func (p *planner) removeSequenceDependencies(
-	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor, col *descpb.ColumnDescriptor,
+	ctx context.Context, tableDesc *tabledesc.Mutable, col *descpb.ColumnDescriptor,
 ) error {
 	for _, sequenceID := range col.UsesSequenceIds {
 		// Get the sequence descriptor so we can remove the reference from it.

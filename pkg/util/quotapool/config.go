@@ -70,9 +70,28 @@ func (f optionFunc) apply(cfg *config) { f(cfg) }
 
 // WithTimeSource is used to configure a quotapool to use the provided
 // TimeSource.
-func WithTimeSource(ts TimeSource) Option {
+func WithTimeSource(ts timeutil.TimeSource) Option {
 	return optionFunc(func(cfg *config) {
 		cfg.timeSource = ts
+	})
+}
+
+// WithCloser allows the client to provide a channel which will lead to the
+// QuotaPool being closed.
+func WithCloser(closer <-chan struct{}) Option {
+	return optionFunc(func(cfg *config) {
+		cfg.closer = closer
+	})
+}
+
+// WithMinimumWait is used with the RateLimiter to control the minimum duration
+// which a goroutine will sleep waiting for quota to accumulate. This
+// can help avoid expensive spinning when the workload consists of many
+// small acquisitions. If used with a regular (not rate limiting) quotapool,
+// this option has no effect.
+func WithMinimumWait(duration time.Duration) Option {
+	return optionFunc(func(cfg *config) {
+		cfg.minimumWait = duration
 	})
 }
 
@@ -80,11 +99,13 @@ type config struct {
 	onAcquisition            AcquisitionFunc
 	onSlowAcquisition        SlowAcquisitionFunc
 	slowAcquisitionThreshold time.Duration
-	timeSource               TimeSource
+	timeSource               timeutil.TimeSource
+	closer                   <-chan struct{}
+	minimumWait              time.Duration
 }
 
 var defaultConfig = config{
-	timeSource: defaultTimeSource{},
+	timeSource: timeutil.DefaultTimeSource{},
 }
 
 func initializeConfig(cfg *config, options ...Option) {

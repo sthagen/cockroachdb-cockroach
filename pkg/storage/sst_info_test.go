@@ -20,58 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
-func TestSSTableInfosString(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	info := func(level int, size int64) SSTableInfo {
-		return SSTableInfo{
-			Level: level,
-			Size:  size,
-		}
-	}
-	tables := SSTableInfos{
-		info(1, 7<<20),
-		info(1, 1<<20),
-		info(1, 63<<10),
-		info(2, 10<<20),
-		info(2, 8<<20),
-		info(2, 13<<20),
-		info(2, 31<<20),
-		info(2, 13<<20),
-		info(2, 30<<20),
-		info(2, 5<<20),
-		info(3, 129<<20),
-		info(3, 129<<20),
-		info(3, 129<<20),
-		info(3, 9<<20),
-		info(3, 129<<20),
-		info(3, 129<<20),
-		info(3, 129<<20),
-		info(3, 93<<20),
-		info(3, 129<<20),
-		info(3, 129<<20),
-		info(3, 122<<20),
-		info(3, 129<<20),
-		info(3, 129<<20),
-		info(3, 129<<20),
-		info(3, 129<<20),
-		info(3, 129<<20),
-		info(3, 129<<20),
-		info(3, 24<<20),
-		info(3, 18<<20),
-	}
-	expected := `1 [   8M  3 ]: 7M 1M 63K
-2 [ 110M  7 ]: 31M 30M 13M[2] 10M 8M 5M
-3 [   2G 19 ]: 129M[14] 122M 93M 24M 18M 9M
-`
-	sort.Sort(tables)
-	s := tables.String()
-	if expected != s {
-		t.Fatalf("expected\n%s\ngot\n%s", expected, s)
-	}
-}
-
 func TestReadAmplification(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -89,7 +37,7 @@ func TestReadAmplification(t *testing.T) {
 		info(0, 0),
 		info(1, 0),
 	}
-	if a, e := tables1.ReadAmplification(-1), 4; a != e {
+	if a, e := tables1.readAmplification(-1), int64(4); a != e {
 		t.Errorf("got %d, expected %d", a, e)
 	}
 
@@ -99,7 +47,7 @@ func TestReadAmplification(t *testing.T) {
 		info(2, 0),
 		info(3, 0),
 	}
-	if a, e := tables2.ReadAmplification(-1), 4; a != e {
+	if a, e := tables2.readAmplification(-1), int64(4); a != e {
 		t.Errorf("got %d, expected %d", a, e)
 	}
 
@@ -114,51 +62,55 @@ func TestReadAmplification(t *testing.T) {
 		info(3, 0),
 		info(6, 0),
 	}
-	if a, e := tables3.ReadAmplification(-1), 7; a != e {
+	if a, e := tables3.readAmplification(-1), int64(7); a != e {
 		t.Errorf("got %d, expected %d", a, e)
 	}
-	if a, e := tables3.ReadAmplification(2), 6; a != e {
+	if a, e := tables3.readAmplification(2), int64(6); a != e {
 		t.Errorf("got %d, expected %d", a, e)
 	}
-	if a, e := tables3.ReadAmplification(1), 5; a != e {
+	if a, e := tables3.readAmplification(1), int64(5); a != e {
 		t.Errorf("got %d, expected %d", a, e)
 	}
+}
+
+func stringToKey(s string) MVCCKey {
+	return MakeMVCCMetadataKey([]byte(s))
 }
 
 func createTestSSTableInfos() SSTableInfos {
 	ssti := SSTableInfos{
 		// Level 0.
-		{Level: 0, Size: 20, Start: key("a"), End: key("z")},
-		{Level: 0, Size: 15, Start: key("a"), End: key("k")},
+		{Level: 0, Size: 20, Start: stringToKey("a"), End: stringToKey("z")},
+		{Level: 0, Size: 15, Start: stringToKey("a"), End: stringToKey("k")},
 		// Level 1.
-		{Level: 1, Size: 200, Start: key("a"), End: key("j")},
-		{Level: 1, Size: 100, Start: key("k"), End: key("o")},
-		{Level: 1, Size: 100, Start: key("r"), End: key("t")},
+		{Level: 1, Size: 200, Start: stringToKey("a"), End: stringToKey("j")},
+		{Level: 1, Size: 100, Start: stringToKey("k"), End: stringToKey("o")},
+		{Level: 1, Size: 100, Start: stringToKey("r"), End: stringToKey("t")},
 		// Level 2.
-		{Level: 2, Size: 201, Start: key("a"), End: key("c")},
-		{Level: 2, Size: 200, Start: key("d"), End: key("f")},
-		{Level: 2, Size: 300, Start: key("h"), End: key("r")},
-		{Level: 2, Size: 405, Start: key("s"), End: key("z")},
+		{Level: 2, Size: 201, Start: stringToKey("a"), End: stringToKey("c")},
+		{Level: 2, Size: 200, Start: stringToKey("d"), End: stringToKey("f")},
+		{Level: 2, Size: 300, Start: stringToKey("h"), End: stringToKey("r")},
+		{Level: 2, Size: 405, Start: stringToKey("s"), End: stringToKey("z")},
 		// Level 3.
-		{Level: 3, Size: 667, Start: key("a"), End: key("c")},
-		{Level: 3, Size: 230, Start: key("d"), End: key("f")},
-		{Level: 3, Size: 332, Start: key("h"), End: key("i")},
-		{Level: 3, Size: 923, Start: key("k"), End: key("n")},
-		{Level: 3, Size: 143, Start: key("n"), End: key("o")},
-		{Level: 3, Size: 621, Start: key("p"), End: key("s")},
-		{Level: 3, Size: 411, Start: key("u"), End: key("x")},
+		{Level: 3, Size: 667, Start: stringToKey("a"), End: stringToKey("c")},
+		{Level: 3, Size: 230, Start: stringToKey("d"), End: stringToKey("f")},
+		{Level: 3, Size: 332, Start: stringToKey("h"), End: stringToKey("i")},
+		{Level: 3, Size: 923, Start: stringToKey("k"), End: stringToKey("n")},
+		{Level: 3, Size: 143, Start: stringToKey("n"), End: stringToKey("o")},
+		{Level: 3, Size: 621, Start: stringToKey("p"), End: stringToKey("s")},
+		{Level: 3, Size: 411, Start: stringToKey("u"), End: stringToKey("x")},
 		// Level 4.
-		{Level: 4, Size: 215, Start: key("a"), End: key("b")},
-		{Level: 4, Size: 211, Start: key("b"), End: key("d")},
-		{Level: 4, Size: 632, Start: key("e"), End: key("f")},
-		{Level: 4, Size: 813, Start: key("f"), End: key("h")},
-		{Level: 4, Size: 346, Start: key("h"), End: key("j")},
-		{Level: 4, Size: 621, Start: key("j"), End: key("l")},
-		{Level: 4, Size: 681, Start: key("m"), End: key("o")},
-		{Level: 4, Size: 521, Start: key("o"), End: key("r")},
-		{Level: 4, Size: 135, Start: key("r"), End: key("t")},
-		{Level: 4, Size: 622, Start: key("t"), End: key("v")},
-		{Level: 4, Size: 672, Start: key("x"), End: key("z")},
+		{Level: 4, Size: 215, Start: stringToKey("a"), End: stringToKey("b")},
+		{Level: 4, Size: 211, Start: stringToKey("b"), End: stringToKey("d")},
+		{Level: 4, Size: 632, Start: stringToKey("e"), End: stringToKey("f")},
+		{Level: 4, Size: 813, Start: stringToKey("f"), End: stringToKey("h")},
+		{Level: 4, Size: 346, Start: stringToKey("h"), End: stringToKey("j")},
+		{Level: 4, Size: 621, Start: stringToKey("j"), End: stringToKey("l")},
+		{Level: 4, Size: 681, Start: stringToKey("m"), End: stringToKey("o")},
+		{Level: 4, Size: 521, Start: stringToKey("o"), End: stringToKey("r")},
+		{Level: 4, Size: 135, Start: stringToKey("r"), End: stringToKey("t")},
+		{Level: 4, Size: 622, Start: stringToKey("t"), End: stringToKey("v")},
+		{Level: 4, Size: 672, Start: stringToKey("x"), End: stringToKey("z")},
 	}
 	sort.Sort(ssti)
 	return ssti

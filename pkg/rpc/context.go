@@ -26,6 +26,7 @@ import (
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -44,10 +45,12 @@ import (
 	"golang.org/x/sync/syncmap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
 	encodingproto "google.golang.org/grpc/encoding/proto"
 	"google.golang.org/grpc/metadata"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 func init() {
@@ -114,29 +117,26 @@ func spanInclusionFuncForClient(
 
 type serverOpts struct {
 	interceptor func(fullMethod string) error
-	tenant      bool
 }
 
 // ServerOption is a configuration option passed to NewServer.
 type ServerOption func(*serverOpts)
 
-// ForTenant is an option to NewServer that results in the server being set
-// up to validate incoming tenants. With this option the server still uses
-// KV-internal node certificates but listens on a dedicated port.
-func ForTenant(opts *serverOpts) {
-	opts.tenant = true
-}
-
 // WithInterceptor adds an additional interceptor. The interceptor is called before
 // streaming and unary RPCs and may inject an error.
-//
-// This option can only be used once (i.e. interceptors can not be chained).
 func WithInterceptor(f func(fullMethod string) error) ServerOption {
 	return func(opts *serverOpts) {
-		if opts.interceptor != nil {
-			panic("interceptor can only be set once")
+		if opts.interceptor == nil {
+			opts.interceptor = f
+		} else {
+			f := opts.interceptor
+			opts.interceptor = func(fullMethod string) error {
+				if err := f(fullMethod); err != nil {
+					return err
+				}
+				return f(fullMethod)
+			}
 		}
-		opts.interceptor = f
 	}
 }
 
@@ -172,13 +172,7 @@ func NewServer(ctx *Context, opts ...ServerOption) *grpc.Server {
 		grpc.StatsHandler(&ctx.stats),
 	}
 	if !ctx.Config.Insecure {
-		var tlsConfig *tls.Config
-		var err error
-		if !o.tenant {
-			tlsConfig, err = ctx.GetServerTLSConfig()
-		} else {
-			tlsConfig, err = ctx.GetTenantServerTLSConfig()
-		}
+		tlsConfig, err := ctx.GetServerTLSConfig()
 		if err != nil {
 			panic(err)
 		}
@@ -191,12 +185,8 @@ func NewServer(ctx *Context, opts ...ServerOption) *grpc.Server {
 	var streamInterceptor []grpc.StreamServerInterceptor
 
 	if !ctx.Config.Insecure {
-		var a auth
-		if !o.tenant {
-			a = kvAuth{}
-		} else {
-			a = tenantAuth{}
-		}
+		a := kvAuth{}
+
 		unaryInterceptor = append(unaryInterceptor, a.AuthUnary())
 		streamInterceptor = append(streamInterceptor, a.AuthStream())
 	}
@@ -224,39 +214,28 @@ func NewServer(ctx *Context, opts ...ServerOption) *grpc.Server {
 	if tracer := ctx.AmbientCtx.Tracer; tracer != nil {
 		// We use a SpanInclusionFunc to save a bit of unnecessary work when
 		// tracing is disabled.
+		inclusionOpt := otgrpc.IncludingSpans(func(
+			parentSpanCtx opentracing.SpanContext,
+			method string,
+			req, resp interface{}) bool {
+			// This anonymous func serves to bind the tracer for
+			// spanInclusionFuncForServer.
+			return spanInclusionFuncForServer(
+				tracer.(*tracing.Tracer), parentSpanCtx, method, req, resp)
+		})
 		unaryInterceptor = append(unaryInterceptor, otgrpc.OpenTracingServerInterceptor(
-			tracer,
-			otgrpc.IncludingSpans(otgrpc.SpanInclusionFunc(
-				func(
-					parentSpanCtx opentracing.SpanContext,
-					method string,
-					req, resp interface{}) bool {
-					// This anonymous func serves to bind the tracer for
-					// spanInclusionFuncForServer.
-					return spanInclusionFuncForServer(
-						tracer.(*tracing.Tracer), parentSpanCtx, method, req, resp)
-				})),
+			tracer, inclusionOpt,
 		))
-		// TODO(tschottdorf): should set up tracing for stream-based RPCs as
-		// well. The otgrpc package has no such facility, but there's also this:
-		//
-		// https://github.com/grpc-ecosystem/go-grpc-middleware/tree/master/tracing/opentracing
+		streamInterceptor = append(streamInterceptor, otgrpc.OpenTracingStreamServerInterceptor(
+			tracer, inclusionOpt,
+		))
 	}
 
 	grpcOpts = append(grpcOpts, grpc.ChainUnaryInterceptor(unaryInterceptor...))
 	grpcOpts = append(grpcOpts, grpc.ChainStreamInterceptor(streamInterceptor...))
 
 	s := grpc.NewServer(grpcOpts...)
-	RegisterHeartbeatServer(s, &HeartbeatService{
-		clock:                                 ctx.Clock,
-		remoteClockMonitor:                    ctx.RemoteClocks,
-		clusterName:                           ctx.ClusterName(),
-		disableClusterNameVerification:        ctx.Config.DisableClusterNameVerification,
-		clusterID:                             &ctx.ClusterID,
-		nodeID:                                &ctx.NodeID,
-		settings:                              ctx.Settings,
-		testingAllowNamedRPCToAnonymousServer: ctx.TestingAllowNamedRPCToAnonymousServer,
-	})
+	RegisterHeartbeatServer(s, ctx.NewHeartbeatService())
 	return s
 }
 
@@ -399,7 +378,15 @@ type ContextOptions struct {
 	Clock      *hlc.Clock
 	Stopper    *stop.Stopper
 	Settings   *cluster.Settings
-	Knobs      ContextTestingKnobs
+	// OnIncomingPing is called when handling a PingRequest, after
+	// preliminary checks but before recording clock offset information.
+	//
+	// It can inject an error.
+	OnIncomingPing func(*PingRequest) error
+	// OnOutgoingPing intercepts outgoing PingRequests. It may inject an
+	// error.
+	OnOutgoingPing func(*PingRequest) error
+	Knobs          ContextTestingKnobs
 }
 
 func (c ContextOptions) validate() error {
@@ -418,6 +405,11 @@ func (c ContextOptions) validate() error {
 	if c.Settings == nil {
 		return errors.New("Settings must be set")
 	}
+
+	// NB: OnOutgoingPing and OnIncomingPing default to noops.
+	// This is used both for testing and the cli.
+	_, _ = c.OnOutgoingPing, c.OnIncomingPing
+
 	return nil
 }
 
@@ -431,7 +423,7 @@ func NewContext(opts ContextOptions) *Context {
 
 	ctx := &Context{
 		ContextOptions:  opts,
-		SecurityContext: MakeSecurityContext(opts.Config, opts.TenantID),
+		SecurityContext: MakeSecurityContext(opts.Config, security.ClusterTLSSettings(opts.Settings), opts.TenantID),
 		breakerClock: breakerClock{
 			clock: opts.Clock,
 		},
@@ -515,6 +507,13 @@ func (a internalClientAdapter) RangeLookup(
 	ctx context.Context, rl *roachpb.RangeLookupRequest, _ ...grpc.CallOption,
 ) (*roachpb.RangeLookupResponse, error) {
 	return a.InternalServer.RangeLookup(ctx, rl)
+}
+
+// Join implements the roachpb.InternalClient interface.
+func (a internalClientAdapter) Join(
+	ctx context.Context, req *roachpb.JoinNodeRequest, _ ...grpc.CallOption,
+) (*roachpb.JoinNodeResponse, error) {
+	return a.InternalServer.Join(ctx, req)
 }
 
 type respStreamClientAdapter struct {
@@ -738,26 +737,38 @@ func (ctx *Context) grpcDialOptions(
 		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.UseCompressor((snappyCompressor{}).Name())))
 	}
 
+	// GRPC uses the HTTPS_PROXY environment variable by default[1]. This is
+	// surprising, and likely undesirable for CRDB because it turns the proxy
+	// into an availability risk and a throughput bottleneck. We disable the use
+	// of proxies by default.
+	//
+	// [1]: https://github.com/grpc/grpc-go/blob/c0736608/Documentation/proxy.md
+	dialOpts = append(dialOpts, grpc.WithNoProxy())
+
 	var unaryInterceptors []grpc.UnaryClientInterceptor
+	var streamInterceptors []grpc.StreamClientInterceptor
 
 	if tracer := ctx.AmbientCtx.Tracer; tracer != nil {
+		var opts []otgrpc.Option
+		// We use a SpanInclusionFunc to circumvent the interceptor's work when
+		// tracing is disabled. Otherwise, the interceptor causes an increase in
+		// the number of packets (even with an empty context!). See #17177.
+		opts = append(opts, otgrpc.IncludingSpans(spanInclusionFuncForClient))
+		// We use a decorator to set the "node" tag. All other spans get the
+		// node tag from context log tags.
+		//
+		// Unfortunately we cannot use the corresponding interceptor on the
+		// server-side of gRPC to set this tag on server spans because that
+		// interceptor runs too late - after a traced RPC's recording had
+		// already been collected. So, on the server-side, the equivalent code
+		// is in setupSpanForIncomingRPC().
+		opts = append(opts, otgrpc.SpanDecorator(func(span opentracing.Span, _ string, _, _ interface{}, _ error) {
+			span.SetTag("node", ctx.NodeID.String())
+		}))
 		unaryInterceptors = append(unaryInterceptors,
-			otgrpc.OpenTracingClientInterceptor(tracer,
-				// We use a SpanInclusionFunc to circumvent the interceptor's work when
-				// tracing is disabled. Otherwise, the interceptor causes an increase in
-				// the number of packets (even with an empty context!). See #17177.
-				otgrpc.IncludingSpans(otgrpc.SpanInclusionFunc(spanInclusionFuncForClient)),
-				// We use a decorator to set the "node" tag. All other spans get the
-				// node tag from context log tags.
-				//
-				// Unfortunately we cannot use the corresponding interceptor on the
-				// server-side of gRPC to set this tag on server spans because that
-				// interceptor runs too late - after a traced RPC's recording had
-				// already been collected. So, on the server-side, the equivalent code
-				// is in setupSpanForIncomingRPC().
-				otgrpc.SpanDecorator(func(span opentracing.Span, _ string, _, _ interface{}, _ error) {
-					span.SetTag("node", ctx.NodeID.String())
-				})))
+			otgrpc.OpenTracingClientInterceptor(tracer, opts...))
+		streamInterceptors = append(streamInterceptors,
+			otgrpc.OpenTracingStreamClientInterceptor(tracer, opts...))
 	}
 	if ctx.Knobs.UnaryClientInterceptor != nil {
 		testingUnaryInterceptor := ctx.Knobs.UnaryClientInterceptor(target, class)
@@ -765,12 +776,18 @@ func (ctx *Context) grpcDialOptions(
 			unaryInterceptors = append(unaryInterceptors, testingUnaryInterceptor)
 		}
 	}
-	dialOpts = append(dialOpts, grpc.WithChainUnaryInterceptor(unaryInterceptors...))
 	if ctx.Knobs.StreamClientInterceptor != nil {
 		testingStreamInterceptor := ctx.Knobs.StreamClientInterceptor(target, class)
 		if testingStreamInterceptor != nil {
-			dialOpts = append(dialOpts, grpc.WithStreamInterceptor(testingStreamInterceptor))
+			streamInterceptors = append(streamInterceptors, testingStreamInterceptor)
 		}
+	}
+
+	if len(unaryInterceptors) > 0 {
+		dialOpts = append(dialOpts, grpc.WithChainUnaryInterceptor(unaryInterceptors...))
+	}
+	if len(streamInterceptors) > 0 {
+		dialOpts = append(dialOpts, grpc.WithChainStreamInterceptor(streamInterceptors...))
 	}
 	return dialOpts, nil
 }
@@ -965,7 +982,7 @@ func (ctx *Context) grpcDialRaw(
 	dialerFunc := dialer.dial
 	if ctx.Knobs.ArtificialLatencyMap != nil {
 		latency := ctx.Knobs.ArtificialLatencyMap[target]
-		log.VEventf(ctx.masterCtx, 1, "Connecting to node %s (%d) with simulated latency %dms", target, remoteNodeID,
+		log.VEventf(ctx.masterCtx, 1, "connecting to node %s (%d) with simulated latency %dms", target, remoteNodeID,
 			latency)
 		dialer := artificialLatencyDialer{
 			dialerFunc: dialerFunc,
@@ -1116,6 +1133,13 @@ func (ctx *Context) runHeartbeat(
 	// Give the first iteration a wait-free heartbeat attempt.
 	heartbeatTimer.Reset(0)
 	everSucceeded := false
+	// Both transient and permanent errors can arise here. Transient errors
+	// set the `heartbeatResult.err` field but retain the connection.
+	// Permanent errors return an error from this method, which means that
+	// the connection will be removed. Errors are presumed transient by
+	// default, but some - like ClusterID or version mismatches, as well as
+	// PermissionDenied errors injected by OnOutgoingPing, are considered permanent.
+	returnErr := false
 	for {
 		select {
 		case <-redialChan:
@@ -1130,18 +1154,29 @@ func (ctx *Context) runHeartbeat(
 			// We re-mint the PingRequest to pick up any asynchronous update to clusterID.
 			clusterID := ctx.ClusterID.Get()
 			request := &PingRequest{
-				Addr:           ctx.Config.Addr,
-				MaxOffsetNanos: maxOffsetNanos,
-				ClusterID:      &clusterID,
-				NodeID:         conn.remoteNodeID,
-				ServerVersion:  ctx.Settings.Version.BinaryVersion(),
+				OriginNodeID:         ctx.NodeID.Get(),
+				OriginAddr:           ctx.Config.Addr,
+				OriginMaxOffsetNanos: maxOffsetNanos,
+				ClusterID:            &clusterID,
+				TargetNodeID:         conn.remoteNodeID,
+				ServerVersion:        ctx.Settings.Version.BinaryVersion(),
+			}
+
+			interceptor := func(*PingRequest) error { return nil }
+			if fn := ctx.OnOutgoingPing; fn != nil {
+				interceptor = fn
 			}
 
 			var response *PingResponse
 			sendTime := ctx.Clock.PhysicalTime()
-			ping := func(goCtx context.Context) (err error) {
+			ping := func(goCtx context.Context) error {
 				// NB: We want the request to fail-fast (the default), otherwise we won't
 				// be notified of transport failures.
+				if err := interceptor(request); err != nil {
+					returnErr = true
+					return err
+				}
+				var err error
 				response, err = heartbeatClient.Ping(goCtx, request)
 				return err
 			}
@@ -1152,9 +1187,13 @@ func (ctx *Context) runHeartbeat(
 				err = ping(goCtx)
 			}
 
+			if s, ok := grpcstatus.FromError(errors.UnwrapAll(err)); ok && s.Code() == codes.PermissionDenied {
+				returnErr = true
+			}
+
 			if err == nil {
 				// We verify the cluster name on the initiator side (instead
-				// of the hearbeat service side, as done for the cluster ID
+				// of the heartbeat service side, as done for the cluster ID
 				// and node ID checks) so that the operator who is starting a
 				// new node in a cluster and mistakenly joins the wrong
 				// cluster gets a chance to see the error message on their
@@ -1163,6 +1202,9 @@ func (ctx *Context) runHeartbeat(
 					err = errors.Wrap(
 						checkClusterName(ctx.Config.ClusterName, response.ClusterName),
 						"cluster name check failed on ping response")
+					if err != nil {
+						returnErr = true
+					}
 				}
 			}
 
@@ -1170,6 +1212,9 @@ func (ctx *Context) runHeartbeat(
 				err = errors.Wrap(
 					checkVersion(goCtx, ctx.Settings, response.ServerVersion),
 					"version compatibility check failed on ping response")
+				if err != nil {
+					returnErr = true
+				}
 			}
 
 			if err == nil {
@@ -1207,11 +1252,29 @@ func (ctx *Context) runHeartbeat(
 			state = updateHeartbeatState(&ctx.metrics, state, hr.state())
 			conn.heartbeatResult.Store(hr)
 			setInitialHeartbeatDone()
+			if returnErr {
+				return err
+			}
 			return nil
 		}); err != nil {
 			return err
 		}
 
 		heartbeatTimer.Reset(ctx.Config.RPCHeartbeatInterval)
+	}
+}
+
+// NewHeartbeatService returns a HeartbeatService initialized from the Context.
+func (ctx *Context) NewHeartbeatService() *HeartbeatService {
+	return &HeartbeatService{
+		clock:                                 ctx.Clock,
+		remoteClockMonitor:                    ctx.RemoteClocks,
+		clusterName:                           ctx.ClusterName(),
+		disableClusterNameVerification:        ctx.Config.DisableClusterNameVerification,
+		clusterID:                             &ctx.ClusterID,
+		nodeID:                                &ctx.NodeID,
+		settings:                              ctx.Settings,
+		onHandlePing:                          ctx.OnIncomingPing,
+		testingAllowNamedRPCToAnonymousServer: ctx.TestingAllowNamedRPCToAnonymousServer,
 	}
 }

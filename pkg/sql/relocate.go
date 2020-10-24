@@ -17,9 +17,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -29,7 +30,7 @@ type relocateNode struct {
 	optColumnsSlot
 
 	relocateLease bool
-	tableDesc     *sqlbase.ImmutableTableDescriptor
+	tableDesc     *tabledesc.Immutable
 	index         *descpb.IndexDescriptor
 	rows          planNode
 
@@ -91,7 +92,7 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 				// Lookup the store in gossip.
 				var storeDesc roachpb.StoreDescriptor
 				gossipStoreKey := gossip.MakeStoreKey(storeID)
-				g, err := params.extendedEvalCtx.ExecCfg.Gossip.OptionalErr()
+				g, err := params.extendedEvalCtx.ExecCfg.Gossip.OptionalErr(54250)
 				if err != nil {
 					return false, err
 				}
@@ -141,7 +142,7 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 func (n *relocateNode) Values() tree.Datums {
 	return tree.Datums{
 		tree.NewDBytes(tree.DBytes(n.run.lastRangeStartKey)),
-		tree.NewDString(keys.PrettyPrint(sqlbase.IndexKeyValDirs(n.index), n.run.lastRangeStartKey)),
+		tree.NewDString(keys.PrettyPrint(catalogkeys.IndexKeyValDirs(n.index), n.run.lastRangeStartKey)),
 	}
 }
 

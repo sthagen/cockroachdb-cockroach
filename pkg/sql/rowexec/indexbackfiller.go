@@ -19,10 +19,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -38,7 +39,7 @@ type indexBackfiller struct {
 
 	adder kvserverbase.BulkAdder
 
-	desc *sqlbase.ImmutableTableDescriptor
+	desc *tabledesc.Immutable
 }
 
 var _ execinfra.Processor = &indexBackfiller{}
@@ -68,8 +69,10 @@ func newIndexBackfiller(
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (*indexBackfiller, error) {
+	indexBackfillerMon := execinfra.NewMonitor(ctx, flowCtx.Cfg.BackfillerMonitor,
+		"index-backfill-mon")
 	ib := &indexBackfiller{
-		desc: sqlbase.NewImmutableTableDescriptor(spec.Table),
+		desc: tabledesc.NewImmutable(spec.Table),
 		backfiller: backfiller{
 			name:        "Index",
 			filter:      backfill.IndexMutationFilter,
@@ -81,7 +84,8 @@ func newIndexBackfiller(
 	}
 	ib.backfiller.chunks = ib
 
-	if err := ib.IndexBackfiller.InitForDistributedUse(ctx, flowCtx, ib.desc); err != nil {
+	if err := ib.IndexBackfiller.InitForDistributedUse(ctx, flowCtx, ib.desc,
+		indexBackfillerMon); err != nil {
 		return nil, err
 	}
 
@@ -109,6 +113,7 @@ func (ib *indexBackfiller) prepare(ctx context.Context) error {
 }
 
 func (ib *indexBackfiller) close(ctx context.Context) {
+	ib.IndexBackfiller.Close(ctx)
 	ib.adder.Close(ctx)
 }
 
@@ -129,8 +134,8 @@ func (ib *indexBackfiller) wrapDupError(ctx context.Context, orig error) error {
 		return orig
 	}
 
-	desc, err := ib.desc.MakeFirstMutationPublic(sqlbase.IncludeConstraints)
-	immutable := sqlbase.NewImmutableTableDescriptor(*desc.TableDesc())
+	desc, err := ib.desc.MakeFirstMutationPublic(tabledesc.IncludeConstraints)
+	immutable := tabledesc.NewImmutable(*desc.TableDesc())
 	if err != nil {
 		return err
 	}
@@ -161,13 +166,14 @@ func (ib *indexBackfiller) runChunk(
 	var key roachpb.Key
 
 	start := timeutil.Now()
-	var entries []sqlbase.IndexEntry
+	var entries []rowenc.IndexEntry
 	if err := ib.flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		txn.SetFixedTimestamp(ctx, readAsOf)
 
 		// TODO(knz): do KV tracing in DistSQL processors.
 		var err error
-		entries, key, err = ib.BuildIndexEntriesChunk(ctx, txn, ib.desc, sp, chunkSize, false /*traceKV*/)
+		entries, key, err = ib.BuildIndexEntriesChunk(ctx, txn, ib.desc, sp,
+			chunkSize, false /*traceKV*/)
 		return err
 	}); err != nil {
 		return nil, err
@@ -180,6 +186,13 @@ func (ib *indexBackfiller) runChunk(
 			return nil, ib.wrapDupError(ctx, err)
 		}
 	}
+
+	// After the index KVs have been copied to the underlying BulkAdder, we can
+	// free the memory which was accounted when building the index entries of the
+	// current chunk.
+	entries = nil
+	ib.Clear(ctx)
+
 	if knobs.RunAfterBackfillChunk != nil {
 		if err := ib.adder.Flush(ctx); err != nil {
 			return nil, ib.wrapDupError(ctx, err)

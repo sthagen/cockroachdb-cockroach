@@ -30,6 +30,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -152,8 +154,15 @@ func newTestProcessorWithTxnPusher(
 		EventChanCap:         testProcessorEventCCap,
 		CheckStreamsInterval: 10 * time.Millisecond,
 	})
-	p.Start(stopper, rtsIter)
+	p.Start(stopper, makeIteratorConstructor(rtsIter))
 	return p, stopper
+}
+
+func makeIteratorConstructor(rtsIter storage.SimpleIterator) IteratorConstructor {
+	if rtsIter == nil {
+		return nil
+	}
+	return func() storage.SimpleIterator { return rtsIter }
 }
 
 func newTestProcessor(rtsIter storage.SimpleIterator) (*Processor, *stop.Stopper) {
@@ -668,25 +677,34 @@ func TestProcessorTxnPushAttempt(t *testing.T) {
 		testNum++
 		switch testNum {
 		case 1:
-			require.Equal(t, 3, len(txns))
-			require.Equal(t, txn1Meta, txns[0])
-			require.Equal(t, txn2Meta, txns[1])
-			require.Equal(t, txn3Meta, txns[2])
+			assert.Equal(t, 3, len(txns))
+			assert.Equal(t, txn1Meta, txns[0])
+			assert.Equal(t, txn2Meta, txns[1])
+			assert.Equal(t, txn3Meta, txns[2])
+			if t.Failed() {
+				return nil, errors.New("test failed")
+			}
 
 			// Push does not succeed. Protos not at larger ts.
 			return []*roachpb.Transaction{txn1Proto, txn2Proto, txn3Proto}, nil
 		case 2:
-			require.Equal(t, 3, len(txns))
-			require.Equal(t, txn1MetaT2Pre, txns[0])
-			require.Equal(t, txn2Meta, txns[1])
-			require.Equal(t, txn3Meta, txns[2])
+			assert.Equal(t, 3, len(txns))
+			assert.Equal(t, txn1MetaT2Pre, txns[0])
+			assert.Equal(t, txn2Meta, txns[1])
+			assert.Equal(t, txn3Meta, txns[2])
+			if t.Failed() {
+				return nil, errors.New("test failed")
+			}
 
 			// Push succeeds. Return new protos.
 			return []*roachpb.Transaction{txn1ProtoT2, txn2ProtoT2, txn3ProtoT2}, nil
 		case 3:
-			require.Equal(t, 2, len(txns))
-			require.Equal(t, txn2MetaT2Post, txns[0])
-			require.Equal(t, txn3MetaT2Post, txns[1])
+			assert.Equal(t, 2, len(txns))
+			assert.Equal(t, txn2MetaT2Post, txns[0])
+			assert.Equal(t, txn3MetaT2Post, txns[1])
+			if t.Failed() {
+				return nil, errors.New("test failed")
+			}
 
 			// Push succeeds. Return new protos.
 			return []*roachpb.Transaction{txn2ProtoT3, txn3ProtoT3}, nil
@@ -694,17 +712,12 @@ func TestProcessorTxnPushAttempt(t *testing.T) {
 			return nil, nil
 		}
 	})
-	tp.mockCleanupTxnIntentsAsync(func(txns []*roachpb.Transaction) error {
-		switch testNum {
-		case 1:
-			require.Equal(t, 0, len(txns))
-		case 2:
-			require.Equal(t, 1, len(txns))
-			require.Equal(t, txn1ProtoT2, txns[0])
-		case 3:
-			require.Equal(t, 1, len(txns))
-			require.Equal(t, txn2ProtoT3, txns[0])
-		default:
+	tp.mockResolveIntentsFn(func(ctx context.Context, intents []roachpb.LockUpdate) error {
+		// There's nothing to assert here. We expect the intents to correspond to
+		// transactions that had their LockSpans populated when we pushed them. This
+		// test doesn't simulate that.
+
+		if testNum > 3 {
 			return nil
 		}
 
@@ -913,8 +926,9 @@ func (p *Processor) syncEventAndRegistrations() {
 // overlapping the given span to fully process their own internal buffers.
 func (p *Processor) syncEventAndRegistrationSpan(span roachpb.Span) {
 	syncC := make(chan struct{})
+	ev := getPooledEvent(event{syncC: syncC, testRegCatchupSpan: span})
 	select {
-	case p.eventC <- event{syncC: syncC, testRegCatchupSpan: span}:
+	case p.eventC <- ev:
 		select {
 		case <-syncC:
 		// Synchronized.
@@ -922,6 +936,7 @@ func (p *Processor) syncEventAndRegistrationSpan(span roachpb.Span) {
 			// Already stopped. Do nothing.
 		}
 	case <-p.stoppedC:
+		putPooledEvent(ev)
 		// Already stopped. Do nothing.
 	}
 }

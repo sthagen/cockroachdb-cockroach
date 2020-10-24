@@ -20,12 +20,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/jsonpb"
 )
@@ -40,15 +42,16 @@ func setExplainBundleResult(
 	ast tree.Statement,
 	trace tracing.Recording,
 	plan *planTop,
+	placeholders *tree.PlaceholderInfo,
 	ie *InternalExecutor,
 	execCfg *ExecutorConfig,
 ) error {
 	res.ResetStmtType(&tree.ExplainAnalyzeDebug{})
-	res.SetColumns(ctx, sqlbase.ExplainAnalyzeDebugColumns)
+	res.SetColumns(ctx, colinfo.ExplainAnalyzeDebugColumns)
 
 	var text []string
 	func() {
-		bundle, err := buildStatementBundle(ctx, execCfg.DB, ie, plan, trace)
+		bundle, err := buildStatementBundle(ctx, execCfg.DB, ie, plan, trace, placeholders)
 		if err != nil {
 			// TODO(radu): we cannot simply set an error on the result here without
 			// changing the executor logic (e.g. an implicit transaction could have
@@ -124,8 +127,8 @@ func traceToJSON(trace tracing.Recording) (tree.Datum, string, error) {
 	return d, str, nil
 }
 
-func normalizeSpan(s tracing.RecordedSpan, trace tracing.Recording) tracing.NormalizedSpan {
-	var n tracing.NormalizedSpan
+func normalizeSpan(s tracingpb.RecordedSpan, trace tracing.Recording) tracingpb.NormalizedSpan {
+	var n tracingpb.NormalizedSpan
 	n.Operation = s.Operation
 	n.StartTime = s.StartTime
 	n.Duration = s.Duration
@@ -151,12 +154,17 @@ type diagnosticsBundle struct {
 // the statement. It generates a bundle for storage in
 // system.statement_diagnostics.
 func buildStatementBundle(
-	ctx context.Context, db *kv.DB, ie *InternalExecutor, plan *planTop, trace tracing.Recording,
+	ctx context.Context,
+	db *kv.DB,
+	ie *InternalExecutor,
+	plan *planTop,
+	trace tracing.Recording,
+	placeholders *tree.PlaceholderInfo,
 ) (diagnosticsBundle, error) {
 	if plan == nil {
 		return diagnosticsBundle{}, errors.AssertionFailedf("execution terminated early")
 	}
-	b := makeStmtBundleBuilder(db, ie, plan, trace)
+	b := makeStmtBundleBuilder(db, ie, plan, trace, placeholders)
 
 	b.addStatement()
 	b.addOptPlans()
@@ -179,16 +187,21 @@ type stmtBundleBuilder struct {
 	db *kv.DB
 	ie *InternalExecutor
 
-	plan  *planTop
-	trace tracing.Recording
+	plan         *planTop
+	trace        tracing.Recording
+	placeholders *tree.PlaceholderInfo
 
 	z memZipper
 }
 
 func makeStmtBundleBuilder(
-	db *kv.DB, ie *InternalExecutor, plan *planTop, trace tracing.Recording,
+	db *kv.DB,
+	ie *InternalExecutor,
+	plan *planTop,
+	trace tracing.Recording,
+	placeholders *tree.PlaceholderInfo,
 ) stmtBundleBuilder {
-	b := stmtBundleBuilder{db: db, ie: ie, plan: plan, trace: trace}
+	b := stmtBundleBuilder{db: db, ie: ie, plan: plan, trace: trace, placeholders: placeholders}
 	b.z.Init()
 	return b
 }
@@ -202,8 +215,19 @@ func (b *stmtBundleBuilder) addStatement() {
 	cfg.Simplify = true
 	cfg.Align = tree.PrettyNoAlign
 	cfg.JSONFmt = true
+	output := cfg.Pretty(b.plan.stmt.AST)
 
-	b.z.AddFile("statement.txt", cfg.Pretty(b.plan.stmt.AST))
+	if b.placeholders != nil && len(b.placeholders.Values) != 0 {
+		var buf bytes.Buffer
+		buf.WriteString(output)
+		buf.WriteString("\n\nArguments:\n")
+		for i, v := range b.placeholders.Values {
+			fmt.Fprintf(&buf, "  %s: %v\n", tree.PlaceholderIdx(i), v)
+		}
+		output = buf.String()
+	}
+
+	b.z.AddFile("statement.txt", output)
 }
 
 // addOptPlans adds the EXPLAIN (OPT) variants as files opt.txt, opt-v.txt,
@@ -223,7 +247,7 @@ func (b *stmtBundleBuilder) addOptPlans() {
 
 // addExecPlan adds the EXPLAIN (VERBOSE) plan as file plan.txt.
 func (b *stmtBundleBuilder) addExecPlan() {
-	if plan := b.plan.instrumentation.planString; plan != "" {
+	if plan := b.plan.planString; plan != "" {
 		b.z.AddFile("plan.txt", plan)
 	}
 }
@@ -428,7 +452,7 @@ func (c *stmtEnvCollector) query(query string) (string, error) {
 		c.ctx,
 		"stmtEnvCollector",
 		nil, /* txn */
-		sqlbase.NoSessionDataOverride,
+		sessiondata.NoSessionDataOverride,
 		query,
 	)
 	if err != nil {
@@ -488,8 +512,6 @@ func (c *stmtEnvCollector) PrintSettings(w io.Writer) error {
 		{sessionSetting: "enable_zigzag_join", clusterSetting: zigzagJoinClusterMode},
 		{sessionSetting: "optimizer_use_histograms", clusterSetting: optUseHistogramsClusterMode},
 		{sessionSetting: "optimizer_use_multicol_stats", clusterSetting: optUseMultiColStatsClusterMode},
-		// TODO(mgartner): remove this once partial indexes are fully supported.
-		{sessionSetting: "experimental_partial_indexes", clusterSetting: partialIndexClusterMode},
 	}
 
 	for _, s := range relevantSettings {

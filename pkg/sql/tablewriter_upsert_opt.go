@@ -14,11 +14,12 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // optTableUpserter implements the upsert operation when it is planned by the
@@ -49,18 +50,15 @@ type optTableUpserter struct {
 	ri row.Inserter
 
 	// Should we collect the rows for a RETURNING clause?
-	collectRows bool
-
-	// Rows returned if collectRows is true.
-	rowsUpserted *rowcontainer.RowContainer
+	rowsNeeded bool
 
 	// A mapping of column IDs to the return index used to shape the resulting
 	// rows to those required by the returning clause. Only required if
-	// collectRows is true.
+	// rowsNeeded is true.
 	colIDToReturnIndex map[descpb.ColumnID]int
 
 	// Do the result rows have a different order than insert rows. Only set if
-	// collectRows is true.
+	// rowsNeeded is true.
 	insertReorderingRequired bool
 
 	// fetchCols indicate which columns need to be fetched from the target table,
@@ -103,25 +101,20 @@ func (tu *optTableUpserter) init(
 ) error {
 	tu.tableWriterBase.init(txn, tu.ri.Helper.TableDesc)
 
-	// collectRows, set upon initialization, indicates whether or not we want
+	// rowsNeeded, set upon initialization, indicates whether or not we want
 	// rows returned from the operation.
-	if tu.collectRows {
+	if tu.rowsNeeded {
 		tu.resultRow = make(tree.Datums, len(tu.returnCols))
-		tu.rowsUpserted = rowcontainer.NewRowContainer(
+		tu.rows = rowcontainer.NewRowContainer(
 			evalCtx.Mon.MakeBoundAccount(),
-			sqlbase.ColTypeInfoFromColDescs(tu.returnCols),
-			0, /* rowCapacity */
+			colinfo.ColTypeInfoFromColDescs(tu.returnCols),
 		)
 
 		// Create the map from colIds to the expected columns.
 		// Note that this map will *not* contain any mutation columns - that's
 		// because even though we might insert values into mutation columns, we
 		// never return them back to the user.
-		tu.colIDToReturnIndex = map[descpb.ColumnID]int{}
-		for i := range tu.tableDesc().Columns {
-			id := tu.tableDesc().Columns[i].ID
-			tu.colIDToReturnIndex[id] = i
-		}
+		tu.colIDToReturnIndex = tu.tableDesc().ColumnIdxMapWithMutations(false /* includeMutations */)
 
 		if len(tu.ri.InsertColIDtoRowIndex) == len(tu.colIDToReturnIndex) {
 			for colID, insertIndex := range tu.ri.InsertColIDtoRowIndex {
@@ -137,30 +130,6 @@ func (tu *optTableUpserter) init(
 	}
 
 	return nil
-}
-
-// flushAndStartNewBatch is part of the tableWriter interface.
-func (tu *optTableUpserter) flushAndStartNewBatch(ctx context.Context) error {
-	if tu.collectRows {
-		tu.rowsUpserted.Clear(ctx)
-	}
-	return tu.tableWriterBase.flushAndStartNewBatch(ctx)
-}
-
-// batchedValues is a helper in implementing batchedPlanNode interface.
-func (tu *optTableUpserter) batchedValues(rowIdx int) tree.Datums {
-	if !tu.collectRows {
-		panic("return row requested but collect rows was not set")
-	}
-	return tu.rowsUpserted.At(rowIdx)
-}
-
-// close is part of the tableWriter interface.
-func (tu *optTableUpserter) close(ctx context.Context) {
-	tu.tableWriterBase.close(ctx)
-	if tu.rowsUpserted != nil {
-		tu.rowsUpserted.Close(ctx)
-	}
 }
 
 // makeResultFromRow reshapes a row that was inserted or updated to a row
@@ -213,10 +182,10 @@ func (tu *optTableUpserter) row(
 	// If no columns need to be updated, then possibly collect the unchanged row.
 	fetchEnd := insertEnd + len(tu.fetchCols)
 	if len(tu.updateCols) == 0 {
-		if !tu.collectRows {
+		if !tu.rowsNeeded {
 			return nil
 		}
-		_, err := tu.rowsUpserted.AddRow(ctx, row[insertEnd:fetchEnd])
+		_, err := tu.rows.AddRow(ctx, row[insertEnd:fetchEnd])
 		return err
 	}
 
@@ -228,7 +197,6 @@ func (tu *optTableUpserter) row(
 		row[insertEnd:fetchEnd],
 		row[fetchEnd:updateEnd],
 		pm,
-		tu.tableDesc(),
 		traceKV,
 	)
 }
@@ -248,7 +216,7 @@ func (tu *optTableUpserter) insertNonConflictingRow(
 		return err
 	}
 
-	if !tu.collectRows {
+	if !tu.rowsNeeded {
 		return nil
 	}
 
@@ -264,7 +232,7 @@ func (tu *optTableUpserter) insertNonConflictingRow(
 				tu.resultRow[retIdx] = tableRow[tabIdx]
 			}
 		}
-		_, err := tu.rowsUpserted.AddRow(ctx, tu.resultRow)
+		_, err := tu.rows.AddRow(ctx, tu.resultRow)
 		return err
 	}
 
@@ -274,7 +242,7 @@ func (tu *optTableUpserter) insertNonConflictingRow(
 			tu.resultRow[retIdx] = insertRow[tabIdx]
 		}
 	}
-	_, err := tu.rowsUpserted.AddRow(ctx, tu.resultRow)
+	_, err := tu.rows.AddRow(ctx, tu.resultRow)
 	return err
 }
 
@@ -290,7 +258,6 @@ func (tu *optTableUpserter) updateConflictingRow(
 	fetchRow tree.Datums,
 	updateValues tree.Datums,
 	pm row.PartialIndexUpdateHelper,
-	tableDesc *sqlbase.ImmutableTableDescriptor,
 	traceKV bool,
 ) error {
 	// Enforce the column constraints.
@@ -313,7 +280,7 @@ func (tu *optTableUpserter) updateConflictingRow(
 	}
 
 	// We only need a result row if we're collecting rows.
-	if !tu.collectRows {
+	if !tu.rowsNeeded {
 		return nil
 	}
 
@@ -341,12 +308,12 @@ func (tu *optTableUpserter) updateConflictingRow(
 
 	// The resulting row may have nil values for columns that aren't
 	// being upserted, updated or fetched.
-	_, err = tu.rowsUpserted.AddRow(ctx, tu.resultRow)
+	_, err = tu.rows.AddRow(ctx, tu.resultRow)
 	return err
 }
 
 // tableDesc is part of the tableWriter interface.
-func (tu *optTableUpserter) tableDesc() *sqlbase.ImmutableTableDescriptor {
+func (tu *optTableUpserter) tableDesc() catalog.TableDescriptor {
 	return tu.ri.Helper.TableDesc
 }
 

@@ -11,6 +11,8 @@
 package optbuilder
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -73,8 +75,7 @@ func (mb *mutationBuilder) buildFKChecksForInsert() {
 	// need to buffer it. This could be a normalization rule, but it's probably
 	// more efficient if we did it in here (or we'd end up building the entire FK
 	// subtrees twice).
-	mb.withID = mb.b.factory.Memo().NextWithID()
-	mb.md.AddWithBinding(mb.withID, mb.outScope.expr)
+	mb.ensureWithID()
 
 	h := &mb.fkCheckHelper
 	for i, n := 0, mb.tab.OutboundForeignKeyCount(); i < n; i++ {
@@ -115,16 +116,14 @@ func (mb *mutationBuilder) buildFKChecksForInsert() {
 //
 // -- Cascades --
 //
-// See onDeleteCascadeBuilder, onDeleteSetBuilder for details.
+// See onDeleteCascadeBuilder, onDeleteFastCascadeBuilder, onDeleteSetBuilder
+// for details.
 //
 func (mb *mutationBuilder) buildFKChecksAndCascadesForDelete() {
 	if mb.tab.InboundForeignKeyCount() == 0 {
 		// No relevant FKs.
 		return
 	}
-
-	mb.withID = mb.b.factory.Memo().NextWithID()
-	mb.md.AddWithBinding(mb.withID, mb.outScope.expr)
 
 	for i, n := 0, mb.tab.InboundForeignKeyCount(); i < n; i++ {
 		h := &mb.fkCheckHelper
@@ -135,14 +134,23 @@ func (mb *mutationBuilder) buildFKChecksAndCascadesForDelete() {
 		//  - with Cascade/SetNull/SetDefault, we create a cascading mutation to
 		//    modify or delete "orphaned" rows in the child table.
 		//  - with Restrict/NoAction, we create a check that causes an error if
-		//    there are any "orhpaned" rows in the child table.
+		//    there are any "orphaned" rows in the child table.
 		if a := h.fk.DeleteReferenceAction(); a != tree.Restrict && a != tree.NoAction {
 			telemetry.Inc(sqltelemetry.ForeignKeyCascadesUseCounter)
 			var builder memo.CascadeBuilder
 			switch a {
 			case tree.Cascade:
-				builder = newOnDeleteCascadeBuilder(mb.tab, i, h.otherTab)
+				// Try the fast builder first; if it cannot be used, use the regular builder.
+				var ok bool
+				builder, ok = tryNewOnDeleteFastCascadeBuilder(
+					mb.b.ctx, mb.md, mb.b.catalog, h.fk, i, mb.tab, h.otherTab, mb.outScope,
+				)
+				if !ok {
+					mb.ensureWithID()
+					builder = newOnDeleteCascadeBuilder(mb.tab, i, h.otherTab)
+				}
 			case tree.SetNull, tree.SetDefault:
+				mb.ensureWithID()
 				builder = newOnDeleteSetBuilder(mb.tab, i, h.otherTab, a)
 			default:
 				panic(errors.AssertionFailedf("unhandled action type %s", a))
@@ -162,6 +170,7 @@ func (mb *mutationBuilder) buildFKChecksAndCascadesForDelete() {
 			continue
 		}
 
+		mb.ensureWithID()
 		fkInput, withScanCols, _ := h.makeFKInputScan(fkInputScanFetchedVals)
 		mb.checks = append(mb.checks, h.buildDeletionCheck(fkInput, withScanCols))
 	}
@@ -230,8 +239,7 @@ func (mb *mutationBuilder) buildFKChecksForUpdate() {
 		return
 	}
 
-	mb.withID = mb.b.factory.Memo().NextWithID()
-	mb.md.AddWithBinding(mb.withID, mb.outScope.expr)
+	mb.ensureWithID()
 
 	// An Update can be thought of an insertion paired with a deletion, so for an
 	// Update we can emit both semi-joins and anti-joins.
@@ -374,8 +382,7 @@ func (mb *mutationBuilder) buildFKChecksForUpsert() {
 		return
 	}
 
-	mb.withID = mb.b.factory.Memo().NextWithID()
-	mb.md.AddWithBinding(mb.withID, mb.outScope.expr)
+	mb.ensureWithID()
 
 	h := &mb.fkCheckHelper
 	for i := 0; i < numOutbound; i++ {
@@ -476,6 +483,19 @@ func (mb *mutationBuilder) inboundFKColsUpdated(fkOrdinal int) bool {
 	return false
 }
 
+// ensureWithID makes sure that withID is initialized (and thus that the input
+// to the mutation will be buffered).
+//
+// Assumes that outScope.expr is the input to the mutation.
+func (mb *mutationBuilder) ensureWithID() {
+	if mb.withID != 0 {
+		return
+	}
+
+	mb.withID = mb.b.factory.Memo().NextWithID()
+	mb.md.AddWithBinding(mb.withID, mb.outScope.expr)
+}
+
 // fkCheckHelper is a type associated with a single FK constraint and is used to
 // build the "leaves" of a FK check expression, namely the WithScan of the
 // mutation input and the Scan of the other table.
@@ -510,17 +530,13 @@ func (h *fkCheckHelper) initWithOutboundFK(mb *mutationBuilder, fkOrdinal int) b
 	}
 
 	refID := h.fk.ReferencedTableID()
-	ref, isAdding, err := mb.b.catalog.ResolveDataSourceByID(mb.b.ctx, cat.Flags{}, refID)
-	if err != nil {
-		if isAdding {
-			// The other table is in the process of being added; ignore the FK relation.
-			return false
-		}
-		panic(err)
+	h.otherTab = resolveTable(mb.b.ctx, mb.b.catalog, refID)
+	if h.otherTab == nil {
+		// The other table is in the process of being added; ignore the FK relation.
+		return false
 	}
 	// We need SELECT privileges on the referenced table.
-	mb.b.checkPrivilege(opt.DepByID(refID), ref, privilege.SELECT)
-	h.otherTab = ref.(cat.Table)
+	mb.b.checkPrivilege(opt.DepByID(refID), h.otherTab, privilege.SELECT)
 
 	numCols := h.fk.ColumnCount()
 	h.allocOrdinals(numCols)
@@ -564,17 +580,12 @@ func (h *fkCheckHelper) initWithInboundFK(mb *mutationBuilder, fkOrdinal int) (o
 	}
 
 	originID := h.fk.OriginTableID()
-	ref, isAdding, err := mb.b.catalog.ResolveDataSourceByID(mb.b.ctx, cat.Flags{}, originID)
-	if err != nil {
-		if isAdding {
-			// The other table is in the process of being added; ignore the FK relation.
-			return false
-		}
-		panic(err)
+	h.otherTab = resolveTable(mb.b.ctx, mb.b.catalog, originID)
+	if h.otherTab == nil {
+		return false
 	}
 	// We need SELECT privileges on the origin table.
-	mb.b.checkPrivilege(opt.DepByID(originID), ref, privilege.SELECT)
-	h.otherTab = ref.(cat.Table)
+	mb.b.checkPrivilege(opt.DepByID(originID), h.otherTab, privilege.SELECT)
 
 	numCols := h.fk.ColumnCount()
 	h.allocOrdinals(numCols)
@@ -584,6 +595,21 @@ func (h *fkCheckHelper) initWithInboundFK(mb *mutationBuilder, fkOrdinal int) (o
 	}
 
 	return true
+}
+
+// resolveTable resolves a table StableID. Returns nil if the table is in the
+// process of being added, in which case it is safe to ignore any FK
+// relation with the table.
+func resolveTable(ctx context.Context, catalog cat.Catalog, id cat.StableID) cat.Table {
+	ref, isAdding, err := catalog.ResolveDataSourceByID(ctx, cat.Flags{}, id)
+	if err != nil {
+		if isAdding {
+			// The table is in the process of being added.
+			return nil
+		}
+		panic(err)
+	}
+	return ref.(cat.Table)
 }
 
 type fkInputScanType uint8
@@ -754,9 +780,11 @@ func (h *fkCheckHelper) buildInsertionCheck() memo.FKChecksItem {
 			),
 		)
 	}
-	antiJoin := f.ConstructAntiJoin(
-		fkInput, scanScope.expr, antiJoinFilters, &memo.JoinPrivate{},
-	)
+	var p memo.JoinPrivate
+	if h.mb.b.evalCtx.SessionData.PreferLookupJoinsForFKs {
+		p.Flags = memo.PreferLookupJoinIntoRight
+	}
+	antiJoin := f.ConstructAntiJoin(fkInput, scanScope.expr, antiJoinFilters, &p)
 
 	return f.ConstructFKChecksItem(antiJoin, &memo.FKChecksItemPrivate{
 		OriginTable:     h.mb.tabID,
@@ -794,9 +822,11 @@ func (h *fkCheckHelper) buildDeletionCheck(
 			),
 		)
 	}
-	semiJoin := f.ConstructSemiJoin(
-		deletedRows, scanScope.expr, semiJoinFilters, &memo.JoinPrivate{},
-	)
+	var p memo.JoinPrivate
+	if h.mb.b.evalCtx.SessionData.PreferLookupJoinsForFKs {
+		p.Flags = memo.PreferLookupJoinIntoRight
+	}
+	semiJoin := f.ConstructSemiJoin(deletedRows, scanScope.expr, semiJoinFilters, &p)
 
 	return f.ConstructFKChecksItem(semiJoin, &memo.FKChecksItemPrivate{
 		OriginTable:     origTabMeta.MetaID,

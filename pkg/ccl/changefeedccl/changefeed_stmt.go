@@ -20,20 +20,27 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -58,14 +65,14 @@ func init() {
 // changefeedPlanHook implements sql.PlanHookFn.
 func changefeedPlanHook(
 	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
+) (sql.PlanHookRowFn, colinfo.ResultColumns, []sql.PlanNode, bool, error) {
 	changefeedStmt, ok := stmt.(*tree.CreateChangefeed)
 	if !ok {
 		return nil, nil, nil, false, nil
 	}
 
 	var sinkURIFn func() (string, error)
-	var header sqlbase.ResultColumns
+	var header colinfo.ResultColumns
 	unspecifiedSink := changefeedStmt.SinkURI == nil
 	avoidBuffering := false
 	if unspecifiedSink {
@@ -77,7 +84,7 @@ func changefeedPlanHook(
 		// value BYTES)` and they correspond exactly to what would be emitted to
 		// a sink.
 		sinkURIFn = func() (string, error) { return ``, nil }
-		header = sqlbase.ResultColumns{
+		header = colinfo.ResultColumns{
 			{Name: "table", Typ: types.String},
 			{Name: "key", Typ: types.Bytes},
 			{Name: "value", Typ: types.Bytes},
@@ -89,7 +96,7 @@ func changefeedPlanHook(
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
-		header = sqlbase.ResultColumns{
+		header = colinfo.ResultColumns{
 			{Name: "job_id", Typ: types.Int},
 		}
 	}
@@ -103,8 +110,12 @@ func changefeedPlanHook(
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
 		defer tracing.FinishSpan(span)
 
-		if err := p.RequireAdminRole(ctx, "CREATE CHANGEFEED"); err != nil {
+		ok, err := p.HasRoleOption(ctx, roleoption.CONTROLCHANGEFEED)
+		if err != nil {
 			return err
+		}
+		if !ok {
+			return pgerror.New(pgcode.InsufficientPrivilege, "permission denied to create changefeed")
 		}
 
 		sinkURI, err := sinkURIFn()
@@ -161,11 +172,16 @@ func changefeedPlanHook(
 		targetDescs, _, err := backupccl.ResolveTargetsToDescriptors(
 			ctx, p, statementTime, &changefeedStmt.Targets)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "failed to resolve targets in the CHANGEFEED stmt")
+		}
+		for _, desc := range targetDescs {
+			if err := p.CheckPrivilege(ctx, desc, privilege.SELECT); err != nil {
+				return err
+			}
 		}
 		targets := make(jobspb.ChangefeedTargets, len(targetDescs))
 		for _, desc := range targetDescs {
-			if table, isTable := desc.(sqlbase.TableDescriptor); isTable {
+			if table, isTable := desc.(catalog.TableDescriptor); isTable {
 				targets[table.GetID()] = jobspb.ChangefeedTarget{
 					StatementTimeName: table.GetName(),
 				}
@@ -238,16 +254,28 @@ func changefeedPlanHook(
 		telemetry.CountBucketed(`changefeed.create.num_tables`, int64(len(targets)))
 
 		if details.SinkURI == `` {
+			telemetry.Count(`changefeed.create.core`)
 			err := distChangefeedFlow(ctx, p, 0 /* jobID */, details, progress, resultsCh)
+			if err != nil {
+				telemetry.Count(`changefeed.core.error`)
+			}
 			return MaybeStripRetryableErrorMarker(err)
 		}
 
 		settings := p.ExecCfg().Settings
+		// Changefeeds are based on the Rangefeed abstraction, which requires the
+		// `kv.rangefeed.enabled` setting to be true.
+		if !kvserver.RangefeedEnabled.Get(&settings.SV) {
+			return errors.Errorf("rangefeeds require the kv.rangefeed.enabled setting. See %s",
+				docs.URL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
+		}
 		if err := utilccl.CheckEnterpriseEnabled(
 			settings, p.ExecCfg().ClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
 		); err != nil {
 			return err
 		}
+
+		telemetry.Count(`changefeed.create.enterprise`)
 
 		// In the case where a user is executing a CREATE CHANGEFEED and is still
 		// waiting for the statement to return, we take the opportunity to ensure
@@ -469,7 +497,7 @@ func validateDetails(details jobspb.ChangefeedDetails) (jobspb.ChangefeedDetails
 }
 
 func validateChangefeedTable(
-	targets jobspb.ChangefeedTargets, tableDesc sqlbase.TableDescriptor,
+	targets jobspb.ChangefeedTargets, tableDesc catalog.TableDescriptor,
 ) error {
 	t, ok := targets[tableDesc.GetID()]
 	if !ok {
@@ -499,7 +527,7 @@ func validateChangefeedTable(
 			tableDesc.GetName(), len(families))
 	}
 
-	if tableDesc.GetState() == descpb.TableDescriptor_DROP {
+	if tableDesc.GetState() == descpb.DescriptorState_DROP {
 		return errors.Errorf(`"%s" was dropped or truncated`, t.StatementTimeName)
 	}
 	if tableDesc.GetName() != t.StatementTimeName {
@@ -624,6 +652,16 @@ func (b *changefeedResumer) OnFailOrCancel(ctx context.Context, planHookState in
 	progress := b.job.Progress()
 	b.maybeCleanUpProtectedTimestamp(ctx, execCfg.DB, execCfg.ProtectedTimestampProvider,
 		progress.GetChangefeed().ProtectedTimestampRecord)
+
+	// If this job has failed (not canceled), increment the counter.
+	if jobs.HasErrJobCanceled(
+		errors.DecodeError(ctx, *b.job.Payload().FinalResumeError),
+	) {
+		telemetry.Count(`changefeed.enterprise.cancel`)
+	} else {
+		telemetry.Count(`changefeed.enterprise.fail`)
+		phs.ExecCfg().JobRegistry.MetricsStruct().Changefeed.(*Metrics).Failures.Inc(1)
+	}
 	return nil
 }
 

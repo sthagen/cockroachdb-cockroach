@@ -12,13 +12,15 @@ package pgwire
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
@@ -45,13 +47,17 @@ const (
 type commandResult struct {
 	// conn is the parent connection of this commandResult.
 	conn *conn
-	// conv indicates the conversion settings for SQL values.
-	conv sessiondata.DataConversionConfig
+	// conv and location indicate the conversion settings for SQL values.
+	conv     sessiondatapb.DataConversionConfig
+	location *time.Location
 	// pos identifies the position of the command within the connection.
 	pos sql.CmdPos
-	// flushBeforeClose contains a list of functions to flush
-	// before a command is closed.
-	flushBeforeCloseFuncs []func(ctx context.Context) error
+
+	// buffer contains items that are sent before the connection is closed.
+	buffer struct {
+		notices            []pgnotice.Notice
+		paramStatusUpdates []paramStatusUpdate
+	}
 
 	err error
 	// errExpected, if set, enforces that an error had been set when Close is
@@ -89,6 +95,15 @@ type commandResult struct {
 	released bool
 }
 
+// paramStatusUpdate is a status update to send to the client when a parameter is
+// updated.
+type paramStatusUpdate struct {
+	// param is the parameter name.
+	param string
+	// val is the new value of the given parameter.
+	val string
+}
+
 var _ sql.CommandResult = &commandResult{}
 
 // Close is part of the CommandResult interface.
@@ -105,12 +120,22 @@ func (r *commandResult) Close(ctx context.Context, t sql.TransactionStatusIndica
 		return
 	}
 
-	for _, f := range r.flushBeforeCloseFuncs {
-		if err := f(ctx); err != nil {
-			panic(errors.AssertionFailedf("unexpected err when closing: %s", err))
+	for _, notice := range r.buffer.notices {
+		if err := r.conn.bufferNotice(ctx, notice); err != nil {
+			panic(errors.AssertionFailedf("unexpected err when sending notice: %s", err))
 		}
 	}
-	r.flushBeforeCloseFuncs = nil
+
+	for _, paramStatusUpdate := range r.buffer.paramStatusUpdates {
+		if err := r.conn.bufferParamStatus(
+			paramStatusUpdate.param,
+			paramStatusUpdate.val,
+		); err != nil {
+			panic(
+				errors.AssertionFailedf("unexpected err when sending parameter status update: %s", err),
+			)
+		}
+	}
 
 	// Send a completion message, specific to the type of result.
 	switch r.typ {
@@ -178,7 +203,7 @@ func (r *commandResult) AddRow(ctx context.Context, row tree.Datums) error {
 	}
 	r.rowsAffected++
 
-	r.conn.bufferRow(ctx, row, r.formatCodes, r.conv, r.types)
+	r.conn.bufferRow(ctx, row, r.formatCodes, r.conv, r.location, r.types)
 	var err error
 	if r.bufferingDisabled {
 		err = r.conn.Flush(r.pos)
@@ -194,26 +219,21 @@ func (r *commandResult) DisableBuffering() {
 	r.bufferingDisabled = true
 }
 
-// AppendParamStatusUpdate is part of the CommandResult interface.
-func (r *commandResult) AppendParamStatusUpdate(param string, val string) {
-	r.flushBeforeCloseFuncs = append(
-		r.flushBeforeCloseFuncs,
-		func(ctx context.Context) error { return r.conn.bufferParamStatus(param, val) },
+// BufferParamStatusUpdate is part of the CommandResult interface.
+func (r *commandResult) BufferParamStatusUpdate(param string, val string) {
+	r.buffer.paramStatusUpdates = append(
+		r.buffer.paramStatusUpdates,
+		paramStatusUpdate{param: param, val: val},
 	)
 }
 
-// AppendNotice is part of the CommandResult interface.
-func (r *commandResult) AppendNotice(noticeErr error) {
-	r.flushBeforeCloseFuncs = append(
-		r.flushBeforeCloseFuncs,
-		func(ctx context.Context) error {
-			return r.conn.bufferNotice(ctx, noticeErr)
-		},
-	)
+// BufferNotice is part of the CommandResult interface.
+func (r *commandResult) BufferNotice(notice pgnotice.Notice) {
+	r.buffer.notices = append(r.buffer.notices, notice)
 }
 
 // SetColumns is part of the CommandResult interface.
-func (r *commandResult) SetColumns(ctx context.Context, cols sqlbase.ResultColumns) {
+func (r *commandResult) SetColumns(ctx context.Context, cols colinfo.ResultColumns) {
 	r.assertNotReleased()
 	r.conn.writerState.fi.registerCmd(r.pos)
 	if r.descOpt == sql.NeedRowDesc {
@@ -240,7 +260,7 @@ func (r *commandResult) SetNoDataRowDescription() {
 }
 
 // SetPrepStmtOutput is part of the DescribeResult interface.
-func (r *commandResult) SetPrepStmtOutput(ctx context.Context, cols sqlbase.ResultColumns) {
+func (r *commandResult) SetPrepStmtOutput(ctx context.Context, cols colinfo.ResultColumns) {
 	r.assertNotReleased()
 	r.conn.writerState.fi.registerCmd(r.pos)
 	_ /* err */ = r.conn.writeRowDescription(ctx, cols, nil /* formatCodes */, &r.conn.writerState.buf)
@@ -248,7 +268,7 @@ func (r *commandResult) SetPrepStmtOutput(ctx context.Context, cols sqlbase.Resu
 
 // SetPortalOutput is part of the DescribeResult interface.
 func (r *commandResult) SetPortalOutput(
-	ctx context.Context, cols sqlbase.ResultColumns, formatCodes []pgwirebase.FormatCode,
+	ctx context.Context, cols colinfo.ResultColumns, formatCodes []pgwirebase.FormatCode,
 ) {
 	r.assertNotReleased()
 	r.conn.writerState.fi.registerCmd(r.pos)
@@ -307,7 +327,8 @@ func (c *conn) newCommandResult(
 	pos sql.CmdPos,
 	stmt tree.Statement,
 	formatCodes []pgwirebase.FormatCode,
-	conv sessiondata.DataConversionConfig,
+	conv sessiondatapb.DataConversionConfig,
+	location *time.Location,
 	limit int,
 	portalName string,
 	implicitTxn bool,
@@ -316,6 +337,7 @@ func (c *conn) newCommandResult(
 	*r = commandResult{
 		conn:           c,
 		conv:           conv,
+		location:       location,
 		pos:            pos,
 		typ:            commandComplete,
 		cmdCompleteTag: stmt.StatementTag(),

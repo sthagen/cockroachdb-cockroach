@@ -102,6 +102,8 @@ type CertificateManager struct {
 	tenantIdentifier uint64
 	CertsLocator
 
+	tlsSettings TLSSettings
+
 	// The metrics struct is initialized at init time and metrics do their
 	// own locking.
 	certMetrics CertificateMetrics
@@ -127,8 +129,6 @@ type CertificateManager struct {
 	// TLS configs. Initialized lazily. Wiped on every successful Load().
 	// Server-side config.
 	serverConfig *tls.Config
-	// Ditto tenant server.
-	tenantServerConfig *tls.Config
 	// Server-side config for the Admin UI.
 	uiServerConfig *tls.Config
 	// Client-side config for the cockroach node.
@@ -152,7 +152,9 @@ type CertificateMetrics struct {
 	TenantClientExpiration   *metric.Gauge
 }
 
-func makeCertificateManager(certsDir string, opts ...Option) *CertificateManager {
+func makeCertificateManager(
+	certsDir string, tlsSettings TLSSettings, opts ...Option,
+) *CertificateManager {
 	var o cmOptions
 	for _, fn := range opts {
 		fn(&o)
@@ -161,6 +163,7 @@ func makeCertificateManager(certsDir string, opts ...Option) *CertificateManager
 	return &CertificateManager{
 		CertsLocator:     MakeCertsLocator(certsDir),
 		tenantIdentifier: o.tenantIdentifier,
+		tlsSettings:      tlsSettings,
 		certMetrics: CertificateMetrics{
 			CAExpiration:             metric.NewGauge(metaCAExpiration),
 			ClientCAExpiration:       metric.NewGauge(metaClientCAExpiration),
@@ -193,8 +196,10 @@ func ForTenant(tenantIdentifier uint64) Option {
 }
 
 // NewCertificateManager creates a new certificate manager.
-func NewCertificateManager(certsDir string, opts ...Option) (*CertificateManager, error) {
-	cm := makeCertificateManager(certsDir, opts...)
+func NewCertificateManager(
+	certsDir string, tlsSettings TLSSettings, opts ...Option,
+) (*CertificateManager, error) {
+	cm := makeCertificateManager(certsDir, tlsSettings, opts...)
 	return cm, cm.LoadCertificates()
 }
 
@@ -202,8 +207,10 @@ func NewCertificateManager(certsDir string, opts ...Option) (*CertificateManager
 // The certsDir is created if it does not exist.
 // This should only be called when generating certificates, the server has
 // no business creating the certs directory.
-func NewCertificateManagerFirstRun(certsDir string, opts ...Option) (*CertificateManager, error) {
-	cm := makeCertificateManager(certsDir, opts...)
+func NewCertificateManagerFirstRun(
+	certsDir string, tlsSettings TLSSettings, opts ...Option,
+) (*CertificateManager, error) {
+	cm := makeCertificateManager(certsDir, tlsSettings, opts...)
 	if err := NewCertificateLoader(cm.certsDir).MaybeCreateCertsDir(); err != nil {
 		return nil, err
 	}
@@ -584,6 +591,17 @@ func (cm *CertificateManager) GetServerTLSConfig() (*tls.Config, error) {
 	}
 	return &tls.Config{
 		GetConfigForClient: cm.getEmbeddedServerTLSConfig,
+		// NB: this is needed to use (*http.Server).ServeTLS, which tries to load
+		// a certificate eagerly from the supplied strings (which are empty in
+		// our case) unless:
+		//
+		// 	(len(config.Certificates) > 0 || config.GetCertificate != nil) == true
+		//
+		// TODO(tbg): should we generally do this for all server certs? The docs
+		// are not clear whether this is a bug or feature.
+		GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return nil, nil
+		},
 	}, nil
 }
 
@@ -615,80 +633,24 @@ func (cm *CertificateManager) getEmbeddedServerTLSConfig(
 		return nil, err
 	}
 
+	tenantClientCA, err := cm.getTenantClientCACertLocked()
+	if err != nil {
+		return nil, err
+	}
+
 	cfg, err := newServerTLSConfig(
+		cm.tlsSettings,
 		nodeCert.FileContents,
 		nodeCert.KeyFileContents,
 		ca.FileContents,
-		clientCA.FileContents)
+		clientCA.FileContents,
+		tenantClientCA.FileContents,
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	cm.serverConfig = cfg
-	return cfg, nil
-}
-
-// GetTenantServerTLSConfig returns a server TLS config with a callback to fetch
-// the latest tenant server TLS config. We still attempt to get the config to
-// make sure the initial call has a valid config loaded.
-func (cm *CertificateManager) GetTenantServerTLSConfig() (*tls.Config, error) {
-	f := cm.getEmbeddedTenantServerTLSConfig
-	if _, err := f(nil); err != nil {
-		return nil, err
-	}
-	return &tls.Config{
-		GetConfigForClient: f,
-		// NB: this is needed to use (*http.Server).ServeTLS, which tries to load
-		// a certificate eagerly from the supplied strings (which are empty in
-		// our case) unless:
-		//
-		// 	(len(config.Certificates) > 0 || config.GetCertificate != nil) == true
-		//
-		// TODO(tbg): should we generally do this for all server certs? The docs
-		// are not clear whether this is a bug or feature.
-		GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return nil, nil
-		},
-	}, nil
-}
-
-// getEmbeddedTenantServerTLSConfig is like getEmbeddedServerTLSConfig, but
-// for serving tenants.
-func (cm *CertificateManager) getEmbeddedTenantServerTLSConfig(
-	_ *tls.ClientHelloInfo,
-) (*tls.Config, error) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if cm.tenantServerConfig != nil {
-		return cm.tenantServerConfig, nil
-	}
-
-	serverCA, err := cm.getCACertLocked()
-	if err != nil {
-		return nil, err
-	}
-
-	serverCert, err := cm.getNodeCertLocked()
-	if err != nil {
-		return nil, err
-	}
-
-	tenantCA, err := cm.getTenantClientCACertLocked()
-	if err != nil {
-		return nil, err
-	}
-
-	cfg, err := newServerTLSConfig(
-		serverCert.FileContents,
-		serverCert.KeyFileContents,
-		serverCA.FileContents,
-		tenantCA.FileContents)
-	if err != nil {
-		return nil, err
-	}
-
-	cm.tenantServerConfig = cfg
 	return cfg, nil
 }
 
@@ -723,6 +685,7 @@ func (cm *CertificateManager) getEmbeddedUIServerTLSConfig(
 	}
 
 	cfg, err := newUIServerTLSConfig(
+		cm.tlsSettings,
 		uiCert.FileContents,
 		uiCert.KeyFileContents)
 	if err != nil {
@@ -824,9 +787,12 @@ func (cm *CertificateManager) getNodeClientCertLocked() (*CertInfo, error) {
 }
 
 // getTenantClientCACertLocked returns the CA cert used to verify tenant client
-// certificates. Use the client CA if it exists, otherwise fall back on the
-// general CA. cm.mu must be held.
+// certificates. Use the tenant client CA if it exists, otherwise fall back to
+// client CA. cm.mu must be held.
 func (cm *CertificateManager) getTenantClientCACertLocked() (*CertInfo, error) {
+	if cm.tenantClientCACert == nil {
+		return cm.getClientCACertLocked()
+	}
 	c := cm.tenantClientCACert
 	if err := checkCertIsValid(c); err != nil {
 		return nil, makeError(err, "problem with tenant client CA certificate")
@@ -865,6 +831,7 @@ func (cm *CertificateManager) GetTenantClientTLSConfig() (*tls.Config, error) {
 	}
 
 	cfg, err := newClientTLSConfig(
+		cm.tlsSettings,
 		tenantClientCert.FileContents,
 		tenantClientCert.KeyFileContents,
 		ca.FileContents)
@@ -896,6 +863,7 @@ func (cm *CertificateManager) GetClientTLSConfig(user string) (*tls.Config, erro
 		}
 
 		cfg, err := newClientTLSConfig(
+			cm.tlsSettings,
 			clientCert.FileContents,
 			clientCert.KeyFileContents,
 			ca.FileContents)
@@ -918,6 +886,7 @@ func (cm *CertificateManager) GetClientTLSConfig(user string) (*tls.Config, erro
 	}
 
 	cfg, err := newClientTLSConfig(
+		cm.tlsSettings,
 		clientCert.FileContents,
 		clientCert.KeyFileContents,
 		ca.FileContents)
@@ -942,7 +911,7 @@ func (cm *CertificateManager) GetUIClientTLSConfig() (*tls.Config, error) {
 		return nil, err
 	}
 
-	cfg, err := newUIClientTLSConfig(uiCA.FileContents)
+	cfg, err := newUIClientTLSConfig(cm.tlsSettings, uiCA.FileContents)
 	if err != nil {
 		return nil, err
 	}

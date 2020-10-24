@@ -124,7 +124,9 @@ func DatumToHLC(evalCtx *EvalContext, stmtTimestamp time.Time, d Datum) (hlc.Tim
 	case *DInterval:
 		ts.WallTime = duration.Add(stmtTimestamp, d.Duration).UnixNano()
 	default:
-		convErr = errors.Errorf("expected timestamp, decimal, or interval, got %s (%T)", d.ResolvedType(), d)
+		convErr = errors.WithSafeDetails(
+			errors.Errorf("expected timestamp, decimal, or interval, got %s", d.ResolvedType()),
+			"go type: %T", d)
 	}
 	if convErr != nil {
 		return ts, convErr

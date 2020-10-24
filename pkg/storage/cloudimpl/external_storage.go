@@ -197,12 +197,14 @@ func ExternalStorageConfFromURI(path, user string) (roachpb.ExternalStorage, err
 		}
 	case "userfile":
 		qualifiedTableName := uri.Host
-		if qualifiedTableName == "" {
-			return conf, errors.Errorf("host component of userfile URI must be a qualified table name")
-		}
-
 		if user == "" {
 			return conf, errors.Errorf("user creating the FileTable ExternalStorage must be specified")
+		}
+
+		// If the import statement does not specify a qualified table name then use
+		// the default to attempt to locate the file(s).
+		if qualifiedTableName == "" {
+			qualifiedTableName = DefaultQualifiedNamePrefix + user
 		}
 
 		conf.Provider = roachpb.ExternalStorageProvider_FileTable
@@ -210,7 +212,9 @@ func ExternalStorageConfFromURI(path, user string) (roachpb.ExternalStorage, err
 		conf.FileTableConfig.QualifiedTableName = qualifiedTableName
 		conf.FileTableConfig.Path = uri.Path
 	default:
-		return conf, errors.Errorf("unsupported storage scheme: %q", uri.Scheme)
+		// TODO(adityamaru): Link dedicated ExternalStorage scheme docs once ready.
+		return conf, errors.Errorf("unsupported storage scheme: %q - refer to docs to find supported"+
+			" storage schemes", uri.Scheme)
 	}
 	return conf, nil
 }
@@ -322,6 +326,51 @@ func URINeedsGlobExpansion(uri string) bool {
 	}
 
 	return containsGlob(parsedURI.Path)
+}
+
+// AccessIsWithExplicitAuth checks if the provided ExternalStorage URI has
+// explicit authentication i.e does not rely on implicit machine credentials to
+// access the resource.
+// The following scenarios are considered implicit access:
+//
+// - implicit AUTH: access will use the node's machine account and only a
+// super user should have the authority to use these credentials.
+//
+// - HTTP/HTTPS/Custom endpoint: requests are made by the server, in the
+// server's network, potentially behind a firewall and only a super user should
+// be able to do this.
+//
+// - nodelocal: this is the node's shared filesystem and so only a super user
+// should be able to interact with it.
+func AccessIsWithExplicitAuth(path string) (bool, string, error) {
+	uri, err := url.Parse(path)
+	if err != nil {
+		return false, "", err
+	}
+	hasExplicitAuth := false
+	switch uri.Scheme {
+	case "s3":
+		auth := uri.Query().Get(AuthParam)
+		hasExplicitAuth = auth == AuthParamSpecified
+
+		// If a custom endpoint has been specified in the S3 URI then this is no
+		// longer an explicit AUTH.
+		hasExplicitAuth = hasExplicitAuth && uri.Query().Get(AWSEndpointParam) == ""
+	case "gs":
+		auth := uri.Query().Get(AuthParam)
+		hasExplicitAuth = auth == AuthParamSpecified
+	case "azure":
+		// Azure does not support implicit authentication i.e. all credentials have
+		// to be specified as part of the URI.
+		hasExplicitAuth = true
+	case "http", "https", "nodelocal":
+		hasExplicitAuth = false
+	case "experimental-workload", "workload", "userfile":
+		hasExplicitAuth = true
+	default:
+		return hasExplicitAuth, "", nil
+	}
+	return hasExplicitAuth, uri.Scheme, nil
 }
 
 func containsGlob(str string) bool {

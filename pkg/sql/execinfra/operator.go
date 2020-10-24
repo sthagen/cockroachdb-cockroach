@@ -18,3 +18,11 @@ type OpNode interface {
 	// Child returns the nth child (input) of the operator.
 	Child(nth int, verbose bool) OpNode
 }
+
+// IOReader is an operator that performs IO reads.
+type IOReader interface {
+	// GetBytesRead returns the number of bytes read from disk by this operator.
+	GetBytesRead() int64
+	// GetRowsRead returns the number of rows read from disk by this operator.
+	GetRowsRead() int64
+}

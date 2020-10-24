@@ -12,14 +12,13 @@ package jobs
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -42,9 +41,15 @@ type ScheduledJobExecutor interface {
 		ctx context.Context,
 		jobID int64,
 		jobStatus Status,
+		details jobspb.Details,
+		env scheduledjobs.JobSchedulerEnv,
 		schedule *ScheduledJob,
+		ex sqlutil.InternalExecutor,
 		txn *kv.Txn,
 	) error
+
+	// Metrics returns optional metric.Struct object for this executor.
+	Metrics() metric.Struct
 }
 
 // ScheduledJobExecutorFactory is a callback to create a ScheduledJobExecutor.
@@ -61,26 +66,50 @@ func RegisterScheduledJobExecutorFactory(name string, factory ScheduledJobExecut
 	registeredExecutorFactories[name] = factory
 }
 
-// NewScheduledJobExecutor creates new ScheduledJobExecutor.
-func NewScheduledJobExecutor(name string) (ScheduledJobExecutor, error) {
+// newScheduledJobExecutor creates new instance of ScheduledJobExecutor.
+func newScheduledJobExecutor(name string) (ScheduledJobExecutor, error) {
 	if factory, ok := registeredExecutorFactories[name]; ok {
 		return factory()
 	}
 	return nil, errors.Newf("executor %q is not registered", name)
 }
 
+var executorRegistry struct {
+	syncutil.Mutex
+	executors map[string]ScheduledJobExecutor
+}
+
+// GetScheduledJobExecutor returns a singleton instance of
+// ScheduledJobExecutor and a flag indicating if that instance was just created.
+func GetScheduledJobExecutor(name string) (ScheduledJobExecutor, bool, error) {
+	executorRegistry.Lock()
+	defer executorRegistry.Unlock()
+	if executorRegistry.executors == nil {
+		executorRegistry.executors = make(map[string]ScheduledJobExecutor)
+	}
+	if ex, ok := executorRegistry.executors[name]; ok {
+		return ex, false, nil
+	}
+	ex, err := newScheduledJobExecutor(name)
+	if err != nil {
+		return nil, false, err
+	}
+	executorRegistry.executors[name] = ex
+	return ex, true, nil
+}
+
 // DefaultHandleFailedRun is a default implementation for handling failed run
 // (either system.job failure, or perhaps error processing the schedule itself).
-func DefaultHandleFailedRun(schedule *ScheduledJob, jobID int64, err error) {
+func DefaultHandleFailedRun(schedule *ScheduledJob, fmtOrMsg string, args ...interface{}) {
 	switch schedule.ScheduleDetails().OnError {
 	case jobspb.ScheduleDetails_RETRY_SOON:
-		schedule.AddScheduleChangeReason("retrying job %d due to failure: %v", jobID, err)
+		schedule.SetScheduleStatus("retrying: "+fmtOrMsg, args...)
 		schedule.SetNextRun(schedule.env.Now().Add(retryFailedJobAfter)) // TODO(yevgeniy): backoff
 	case jobspb.ScheduleDetails_PAUSE_SCHED:
-		schedule.Pause(fmt.Sprintf("schedule paused due job %d failure: %v", jobID, err))
-	default:
-		// Nothing: ScheduleDetails_RETRY_SCHED already handled since
-		// the next run was set when we started running scheduled job.
+		schedule.Pause()
+		schedule.SetScheduleStatus("schedule paused: "+fmtOrMsg, args...)
+	case jobspb.ScheduleDetails_RETRY_SCHED:
+		schedule.SetScheduleStatus("reschedule: "+fmtOrMsg, args...)
 	}
 }
 
@@ -96,6 +125,7 @@ func NotifyJobTermination(
 	env scheduledjobs.JobSchedulerEnv,
 	jobID int64,
 	jobStatus Status,
+	jobDetails jobspb.Details,
 	scheduleID int64,
 	ex sqlutil.InternalExecutor,
 	txn *kv.Txn,
@@ -104,53 +134,21 @@ func NotifyJobTermination(
 		env = scheduledjobs.ProdJobSchedulerEnv
 	}
 
-	// Get the executor for this schedule.
-	schedule, executor, err := lookupScheduleAndExecutor(
-		ctx, env, ex, scheduleID, txn)
+	schedule, err := LoadScheduledJob(ctx, env, scheduleID, ex, txn)
+	if err != nil {
+		return err
+	}
+	executor, _, err := GetScheduledJobExecutor(schedule.ExecutorType())
 	if err != nil {
 		return err
 	}
 
 	// Delegate handling of the job termination to the executor.
-	err = executor.NotifyJobTermination(ctx, jobID, jobStatus, schedule, txn)
+	err = executor.NotifyJobTermination(ctx, jobID, jobStatus, jobDetails, env, schedule, ex, txn)
 	if err != nil {
 		return err
 	}
 
 	// Update this schedule in case executor made changes to it.
 	return schedule.Update(ctx, ex, txn)
-}
-
-func lookupScheduleAndExecutor(
-	ctx context.Context,
-	env scheduledjobs.JobSchedulerEnv,
-	ex sqlutil.InternalExecutor,
-	scheduleID int64,
-	txn *kv.Txn,
-) (*ScheduledJob, ScheduledJobExecutor, error) {
-	rows, cols, err := ex.QueryWithCols(ctx, "lookup-schedule", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
-		fmt.Sprintf(
-			"SELECT schedule_id, schedule_details, executor_type FROM %s WHERE schedule_id = %d",
-			env.ScheduledJobsTableName(), scheduleID))
-
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if len(rows) != 1 {
-		return nil, nil, errors.Newf(
-			"expected to find 1 schedule, found %d with schedule_id=%d",
-			len(rows), scheduleID)
-	}
-
-	j := NewScheduledJob(env)
-	if err := j.InitFromDatums(rows[0], cols); err != nil {
-		return nil, nil, err
-	}
-	executor, err := NewScheduledJobExecutor(j.ExecutorType())
-	if err == nil {
-		return j, executor, nil
-	}
-	return nil, nil, err
 }

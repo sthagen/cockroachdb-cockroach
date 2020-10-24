@@ -19,11 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
@@ -34,7 +35,7 @@ import (
 // the descriptor gets written to a batch, as well as ensuring that a job is
 // created to perform the schema change on the type.
 func (p *planner) writeTypeSchemaChange(
-	ctx context.Context, typeDesc *sqlbase.MutableTypeDescriptor, jobDesc string,
+	ctx context.Context, typeDesc *typedesc.Mutable, jobDesc string,
 ) error {
 	// Check if there is an active job for this type, otherwise create one.
 	job, jobExists := p.extendedEvalCtx.SchemaChangeJobCache[typeDesc.ID]
@@ -72,27 +73,11 @@ func (p *planner) writeTypeSchemaChange(
 	return p.writeTypeDesc(ctx, typeDesc)
 }
 
-func (p *planner) writeTypeDesc(
-	ctx context.Context, typeDesc *sqlbase.MutableTypeDescriptor,
-) error {
-	// Maybe increment the type's version.
-	typeDesc.MaybeIncrementVersion()
-
-	// Add the modified descriptor to the descriptor collection.
-	if err := p.Descriptors().AddUncommittedDescriptor(typeDesc); err != nil {
-		return err
-	}
-
+func (p *planner) writeTypeDesc(ctx context.Context, typeDesc *typedesc.Mutable) error {
 	// Write the type out to a batch.
 	b := p.txn.NewBatch()
-	if err := catalogkv.WriteDescToBatch(
-		ctx,
-		p.extendedEvalCtx.Tracing.KVTracingEnabled(),
-		p.ExecCfg().Settings,
-		b,
-		p.ExecCfg().Codec,
-		typeDesc.ID,
-		typeDesc,
+	if err := p.Descriptors().WriteDescToBatch(
+		ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(), typeDesc, b,
 	); err != nil {
 		return err
 	}
@@ -107,6 +92,8 @@ type typeSchemaChanger struct {
 
 // TypeSchemaChangerTestingKnobs contains testing knobs for the typeSchemaChanger.
 type TypeSchemaChangerTestingKnobs struct {
+	// TypeSchemaChangeJobNoOp returning true will cause the job to be a no-op.
+	TypeSchemaChangeJobNoOp func() bool
 	// RunBeforeExec runs at the start of the typeSchemaChanger.
 	RunBeforeExec func() error
 	// RunBeforeEnumMemberPromotion runs before enum members are promoted from
@@ -117,17 +104,15 @@ type TypeSchemaChangerTestingKnobs struct {
 // ModuleTestingKnobs implements the ModuleTestingKnobs interface.
 func (TypeSchemaChangerTestingKnobs) ModuleTestingKnobs() {}
 
-func (t *typeSchemaChanger) getTypeDescFromStore(
-	ctx context.Context,
-) (*sqlbase.ImmutableTypeDescriptor, error) {
-	var typeDesc *sqlbase.ImmutableTypeDescriptor
+func (t *typeSchemaChanger) getTypeDescFromStore(ctx context.Context) (*typedesc.Immutable, error) {
+	var typeDesc *typedesc.Immutable
 	if err := t.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		desc, err := catalogkv.GetDescriptorByID(ctx, txn, t.execCfg.Codec, t.typeID,
 			catalogkv.Immutable, catalogkv.TypeDescriptorKind, true /* required */)
 		if err != nil {
 			return err
 		}
-		typeDesc = desc.(*sqlbase.ImmutableTypeDescriptor)
+		typeDesc = desc.(*typedesc.Immutable)
 		return nil
 	}); err != nil {
 		return nil, err
@@ -154,60 +139,55 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 	// If there are any names to drain, then do so.
 	if len(typeDesc.DrainingNames) > 0 {
 		if err := drainNamesForDescriptor(
-			ctx,
-			typeDesc,
-			leaseMgr,
-			codec,
-			nil, /* beforeDrainNames */
+			ctx, t.execCfg.Settings, typeDesc.GetID(), t.execCfg.DB, t.execCfg.InternalExecutor,
+			leaseMgr, codec, nil,
 		); err != nil {
 			return err
 		}
 	}
 
 	// If there are any read only enum members, promote them to writeable.
-	if typeDesc.Kind == descpb.TypeDescriptor_ENUM {
-		hasNonPublic := false
-		for _, member := range typeDesc.EnumMembers {
-			if member.Capability == descpb.TypeDescriptor_EnumMember_READ_ONLY {
-				hasNonPublic = true
-				break
-			}
+	if typeDesc.Kind == descpb.TypeDescriptor_ENUM && enumHasNonPublic(typeDesc) {
+		if fn := t.execCfg.TypeSchemaChangerTestingKnobs.RunBeforeEnumMemberPromotion; fn != nil {
+			fn()
 		}
-		if hasNonPublic {
-			if fn := t.execCfg.TypeSchemaChangerTestingKnobs.RunBeforeEnumMemberPromotion; fn != nil {
-				fn()
+		// The version of the array type needs to get bumped as well so that
+		// changes to the underlying type are picked up.
+		run := func(ctx context.Context, txn *kv.Txn, descsCol *descs.Collection) error {
+			typeDesc, err := descsCol.GetMutableTypeVersionByID(ctx, txn, t.typeID)
+			if err != nil {
+				return err
 			}
-			// The version of the array type needs to get bumped as well so that
-			// changes to the underlying type are picked up.
-			update := func(_ *kv.Txn, descs map[descpb.ID]catalog.MutableDescriptor) error {
-				typeDesc := descs[typeDesc.ID].(*sqlbase.MutableTypeDescriptor)
-				didModify := false
-				for i := range typeDesc.EnumMembers {
-					member := &typeDesc.EnumMembers[i]
-					if member.Capability == descpb.TypeDescriptor_EnumMember_READ_ONLY {
-						member.Capability = descpb.TypeDescriptor_EnumMember_ALL
-						didModify = true
-					}
+			didModify := false
+			for i := range typeDesc.EnumMembers {
+				member := &typeDesc.EnumMembers[i]
+				if member.Capability == descpb.TypeDescriptor_EnumMember_READ_ONLY {
+					member.Capability = descpb.TypeDescriptor_EnumMember_ALL
+					didModify = true
 				}
-				if !didModify {
-					return lease.ErrDidntUpdateDescriptor
-				}
+			}
+			if !didModify {
 				return nil
 			}
-			if _, err := leaseMgr.PublishMultiple(
-				ctx,
-				[]descpb.ID{typeDesc.ID, typeDesc.ArrayTypeID},
-				update,
-				func(*kv.Txn) error { return nil },
+			b := txn.NewBatch()
+			if err := descsCol.WriteDescToBatch(
+				ctx, true /* kvTrace */, typeDesc, b,
 			); err != nil {
 				return err
 			}
+			return txn.Run(ctx, b)
+		}
+		if err := descs.Txn(
+			ctx, t.execCfg.Settings, t.execCfg.LeaseManager,
+			t.execCfg.InternalExecutor, t.execCfg.DB, run,
+		); err != nil {
+			return err
 		}
 	}
 
 	// Finally, make sure all of the leases are updated.
 	if err := WaitToUpdateLeases(ctx, leaseMgr, t.typeID); err != nil {
-		if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
+		if errors.Is(err, catalog.ErrDescriptorNotFound) {
 			return nil
 		}
 		return err
@@ -217,7 +197,7 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 	if typeDesc.Dropped() {
 		if err := t.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			b := txn.NewBatch()
-			b.Del(sqlbase.MakeDescMetadataKey(codec, typeDesc.ID))
+			b.Del(catalogkeys.MakeDescMetadataKey(codec, typeDesc.ID))
 			return txn.Run(ctx, b)
 		}); err != nil {
 			return err
@@ -225,6 +205,17 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func enumHasNonPublic(typeDesc *typedesc.Immutable) bool {
+	hasNonPublic := false
+	for _, member := range typeDesc.EnumMembers {
+		if member.Capability == descpb.TypeDescriptor_EnumMember_READ_ONLY {
+			hasNonPublic = true
+			break
+		}
+	}
+	return hasNonPublic
 }
 
 // execWithRetry is a wrapper around exec that retries the type schema change
@@ -241,7 +232,7 @@ func (t *typeSchemaChanger) execWithRetry(ctx context.Context) error {
 		switch {
 		case tcErr == nil:
 			return nil
-		case errors.Is(tcErr, sqlbase.ErrDescriptorNotFound):
+		case errors.Is(tcErr, catalog.ErrDescriptorNotFound):
 			// If the descriptor for the ID can't be found, we assume that another
 			// job executed already and dropped the type.
 			log.Infof(
@@ -276,9 +267,15 @@ type typeChangeResumer struct {
 func (t *typeChangeResumer) Resume(
 	ctx context.Context, phs interface{}, _ chan<- tree.Datums,
 ) error {
+	p := phs.(*planner)
+	if p.execCfg.TypeSchemaChangerTestingKnobs.TypeSchemaChangeJobNoOp != nil {
+		if p.execCfg.TypeSchemaChangerTestingKnobs.TypeSchemaChangeJobNoOp() {
+			return nil
+		}
+	}
 	tc := &typeSchemaChanger{
 		typeID:  t.job.Details().(jobspb.TypeSchemaChangeDetails).TypeID,
-		execCfg: phs.(*planner).execCfg,
+		execCfg: p.execCfg,
 	}
 	return tc.execWithRetry(ctx)
 }
@@ -290,22 +287,11 @@ func (t *typeChangeResumer) OnFailOrCancel(ctx context.Context, phs interface{})
 		typeID:  t.job.Details().(jobspb.TypeSchemaChangeDetails).TypeID,
 		execCfg: phs.(*planner).ExecCfg(),
 	}
-	typeDesc, err := tc.getTypeDescFromStore(ctx)
-	if err != nil {
-		return err
-	}
-	if len(typeDesc.DrainingNames) > 0 {
-		if err := drainNamesForDescriptor(
-			ctx,
-			typeDesc,
-			tc.execCfg.LeaseManager,
-			tc.execCfg.Codec,
-			nil, /* beforeDrainNames */
-		); err != nil {
-			return err
-		}
-	}
-	return nil
+
+	return drainNamesForDescriptor(
+		ctx, tc.execCfg.Settings, tc.typeID, tc.execCfg.DB,
+		tc.execCfg.InternalExecutor, tc.execCfg.LeaseManager, tc.execCfg.Codec, nil,
+	)
 }
 
 func init() {

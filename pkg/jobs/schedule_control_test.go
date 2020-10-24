@@ -15,13 +15,14 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 )
@@ -30,9 +31,6 @@ func TestScheduleControl(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	th, cleanup := newTestHelper(t)
 	defer cleanup()
-
-	// Inject our test environment into schedule control execution via testing knobs.
-	th.cfg.TestingKnobs.(*TestingKnobs).JobSchedulerEnv = th.env
 
 	t.Run("non-existent", func(t *testing.T) {
 		for _, command := range []string{
@@ -182,14 +180,16 @@ func TestJobsControlForSchedules(t *testing.T) {
 					Name: CreatedByScheduledJobs,
 					ID:   scheduleID,
 				}
-				require.NoError(t, registry.NewJob(record).Created(context.Background()))
+				newJob := registry.NewJob(record)
+				require.NoError(t, newJob.Created(context.Background()))
 
 				if tc.command == "resume" {
 					// Job has to be in paused state in order for it to be resumable;
 					// Alas, because we don't actually run real jobs (see comment above),
 					// We can't just pause the job (since it will stay in pause-requested state forever).
 					// So, just force set job status to paused.
-					th.sqlDB.Exec(t, "UPDATE system.jobs SET status=$1 WHERE id=$2", StatusPaused, scheduleID)
+					th.sqlDB.Exec(t, "UPDATE system.jobs SET status=$1 WHERE id=$2", StatusPaused,
+						*newJob.ID())
 				}
 			}
 		}
@@ -208,11 +208,91 @@ func TestJobsControlForSchedules(t *testing.T) {
 				context.Background(),
 				"test-num-effected",
 				nil,
-				sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+				sessiondata.InternalExecutorOverride{User: security.RootUser},
 				jobControl,
 			)
 			require.NoError(t, err)
 			require.Equal(t, numJobs*tc.numSchedules, numEffected)
 		})
+	}
+}
+
+// TestFilterJobsControlForSchedules tests that a ControlJobsForSchedules query
+// does not error out even if the schedule contains a job in a state which is
+// invalid to apply the control command to. This is done by filtering out such
+// jobs prior to executing the control command.
+func TestFilterJobsControlForSchedules(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer ResetConstructors()()
+	th, cleanup := newTestHelperForTables(t, jobstest.UseSystemTables)
+	defer cleanup()
+
+	// Prevent registry from changing job state while running this test.
+	defer TestingSetAdoptAndCancelIntervals(24*time.Hour, 24*time.Hour)()
+
+	registry := th.server.JobRegistry().(*Registry)
+	blockResume := make(chan struct{})
+	defer close(blockResume)
+
+	// Our resume never completes any jobs, until this test completes.
+	RegisterConstructor(jobspb.TypeImport, func(job *Job, _ *cluster.Settings) Resumer {
+		return FakeResumer{
+			OnResume: func(_ context.Context, _ chan<- tree.Datums) error {
+				<-blockResume
+				return nil
+			},
+		}
+	})
+
+	record := Record{
+		Description: "fake job",
+		Username:    "test",
+		Details:     jobspb.ImportDetails{},
+		Progress:    jobspb.ImportProgress{},
+	}
+
+	allJobStates := []Status{StatusPending, StatusRunning, StatusPaused, StatusFailed,
+		StatusReverting, StatusSucceeded, StatusCanceled, StatusCancelRequested, StatusPauseRequested}
+
+	var scheduleID int64 = 123
+	for _, tc := range []struct {
+		command             string
+		validStartingStates []Status
+	}{
+		{"pause", []Status{StatusPending, StatusRunning, StatusReverting}},
+		{"resume", []Status{StatusPaused}},
+		{"cancel", []Status{StatusPending, StatusRunning, StatusPaused}},
+	} {
+		scheduleID++
+		// Create one job of every Status.
+		for _, status := range allJobStates {
+			record.CreatedBy = &CreatedByInfo{
+				Name: CreatedByScheduledJobs,
+				ID:   scheduleID,
+			}
+			newJob := registry.NewJob(record)
+			require.NoError(t, newJob.Created(context.Background()))
+			th.sqlDB.Exec(t, "UPDATE system.jobs SET status=$1 WHERE id=$2", status, *newJob.ID())
+		}
+
+		jobControl := fmt.Sprintf(tc.command+" JOBS FOR SCHEDULE %d", scheduleID)
+		t.Run(jobControl, func(t *testing.T) {
+			// Go through internal executor to execute job control command. This
+			// correctly reports the number of effected rows which should only be
+			// equal to the number of validStartingStates as all the other states are
+			// invalid/no-ops.
+			numEffected, err := th.cfg.InternalExecutor.ExecEx(
+				context.Background(),
+				"test-num-effected",
+				nil,
+				sessiondata.InternalExecutorOverride{User: security.RootUser},
+				jobControl,
+			)
+			require.NoError(t, err)
+			require.Equal(t, len(tc.validStartingStates), numEffected)
+		})
+
+		// Clear the system.jobs table for the next test run.
+		th.sqlDB.Exec(t, "DELETE FROM system.jobs")
 	}
 }

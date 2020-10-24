@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -21,11 +22,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -45,15 +48,27 @@ type setClusterSettingNode struct {
 	value tree.TypedExpr
 }
 
+func checkPrivilegesForSetting(ctx context.Context, p *planner, name string, action string) error {
+	if settings.AdminOnly(name) {
+		return p.RequireAdminRole(ctx, fmt.Sprintf("%s cluster setting '%s'", action, name))
+	}
+	hasModify, err := p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING)
+	if err != nil {
+		return err
+	}
+	if !hasModify {
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"only users with the %s privilege are allowed to %s cluster setting '%s'",
+			roleoption.MODIFYCLUSTERSETTING, action, name)
+	}
+	return nil
+}
+
 // SetClusterSetting sets session variables.
 // Privileges: super user.
 func (p *planner) SetClusterSetting(
 	ctx context.Context, n *tree.SetClusterSetting,
 ) (planNode, error) {
-	if err := p.RequireAdminRole(ctx, "SET CLUSTER SETTING"); err != nil {
-		return nil, err
-	}
-
 	if !p.execCfg.TenantTestingKnobs.CanSetClusterSettings() && !p.execCfg.Codec.ForSystemTenant() {
 		// Setting cluster settings is disabled for phase 2 tenants if a test does
 		// not explicitly allow for setting in-memory cluster settings.
@@ -65,6 +80,10 @@ func (p *planner) SetClusterSetting(
 	v, ok := settings.Lookup(name, settings.LookupForLocalAccess)
 	if !ok {
 		return nil, errors.Errorf("unknown cluster setting '%s'", name)
+	}
+
+	if err := checkPrivilegesForSetting(ctx, p, name, "set"); err != nil {
+		return nil, err
 	}
 
 	setting, ok := v.(settings.WritableSetting)
@@ -83,7 +102,7 @@ func (p *planner) SetClusterSetting(
 		// For DEFAULT, let the value reference be nil. That's a RESET in disguise.
 		if _, ok := n.Value.(tree.DefaultVal); !ok {
 			expr := n.Value
-			expr = unresolvedNameToStrVal(expr)
+			expr = paramparse.UnresolvedNameToStrVal(expr)
 
 			var requiredType *types.T
 			var dummyHelper tree.IndexedVarHelper
@@ -177,7 +196,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			expectedEncodedValue = n.setting.EncodedDefault()
 			if _, err := execCfg.InternalExecutor.ExecEx(
 				ctx, "reset-setting", txn,
-				sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+				sessiondata.InternalExecutorOverride{User: security.RootUser},
 				"DELETE FROM system.settings WHERE name = $1", n.name,
 			); err != nil {
 				return err
@@ -192,7 +211,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			if _, ok := n.setting.(*settings.StateMachineSetting); ok {
 				datums, err := execCfg.InternalExecutor.QueryRowEx(
 					ctx, "retrieve-prev-setting", txn,
-					sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+					sessiondata.InternalExecutorOverride{User: security.RootUser},
 					"SELECT value FROM system.settings WHERE name = $1", n.name,
 				)
 				if err != nil {
@@ -214,7 +233,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			}
 			if _, err = execCfg.InternalExecutor.ExecEx(
 				ctx, "update-setting", txn,
-				sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+				sessiondata.InternalExecutorOverride{User: security.RootUser},
 				`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
 				n.name, encoded, n.setting.Typ(),
 			); err != nil {
@@ -257,7 +276,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			if err != nil {
 				break
 			}
-			validatedExecMode, isValid := sessiondata.VectorizeExecModeFromString(sessiondata.VectorizeExecMode(val).String())
+			validatedExecMode, isValid := sessiondatapb.VectorizeExecModeFromString(sessiondatapb.VectorizeExecMode(val).String())
 			if !isValid {
 				break
 			}

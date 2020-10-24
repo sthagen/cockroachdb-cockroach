@@ -14,9 +14,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -228,7 +229,7 @@ type memBuffer struct {
 
 	allocMu struct {
 		syncutil.Mutex
-		a sqlbase.DatumAlloc
+		a rowenc.DatumAlloc
 	}
 }
 
@@ -237,7 +238,7 @@ func makeMemBuffer(acc mon.BoundAccount, metrics *Metrics) *memBuffer {
 		metrics:  metrics,
 		signalCh: make(chan struct{}, 1),
 	}
-	b.mu.entries.Init(acc, sqlbase.ColTypeInfoFromColTypes(memBufferColTypes), 0 /* rowCapacity */)
+	b.mu.entries.Init(acc, colinfo.ColTypeInfoFromColTypes(memBufferColTypes), 0 /* rowCapacity */)
 	return b
 }
 
@@ -344,7 +345,7 @@ func (b *memBuffer) getRow(ctx context.Context) (tree.Datums, error) {
 		b.mu.Lock()
 		if b.mu.entries.Len() > 0 {
 			row = b.mu.entries.At(0)
-			b.mu.entries.PopFirst()
+			b.mu.entries.PopFirst(ctx)
 		}
 		b.mu.Unlock()
 		if row != nil {

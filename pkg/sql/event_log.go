@@ -29,11 +29,28 @@ const (
 	EventLogCreateDatabase EventLogType = "create_database"
 	// EventLogDropDatabase is recorded when a database is dropped.
 	EventLogDropDatabase EventLogType = "drop_database"
+	// EventLogRenameDatabase is recorded when a database is renamed.
+	EventLogRenameDatabase EventLogType = "rename_database"
+	// EventLogAlterDatabaseOwner is recorded when a database's owner is changed.
+	EventLogAlterDatabaseOwner EventLogType = "alter_database_owner"
+
+	// EventLogCreateSchema is recorded when a schema is created.
+	EventLogCreateSchema EventLogType = "create_schema"
+	// EventLogDropSchema is recorded when a schema is dropped.
+	EventLogDropSchema EventLogType = "drop_schema"
+	// EventLogRenameSchema is recorded when a schema is renamed.
+	EventLogRenameSchema EventLogType = "rename_schema"
+	// EventLogAlterSchemaOwner is recorded when a schema's owner is changed.
+	EventLogAlterSchemaOwner EventLogType = "alter_schema_owner"
+	// EventLogConvertToSchema is recorded when a database is converted to a schema.
+	EventLogConvertToSchema EventLogType = "convert_to_schema"
 
 	// EventLogCreateTable is recorded when a table is created.
 	EventLogCreateTable EventLogType = "create_table"
 	// EventLogDropTable is recorded when a table is dropped.
 	EventLogDropTable EventLogType = "drop_table"
+	// EventLogRenameTable is recorded when a table is renamed.
+	EventLogRenameTable EventLogType = "rename_table"
 	// EventLogTruncateTable is recorded when a table is truncated.
 	EventLogTruncateTable EventLogType = "truncate_table"
 	// EventLogAlterTable is recorded when a table is altered.
@@ -110,6 +127,13 @@ const (
 	// EventLogCreateStatistics is recorded when statistics are collected for a
 	// table.
 	EventLogCreateStatistics EventLogType = "create_statistics"
+
+	// EventLogGrantPrivilege is recorded when privileges are added to a user
+	// for a database object.
+	EventLogGrantPrivilege EventLogType = "grant_privilege"
+	// EventLogRevokePrivilege is recorded when privileges are removed from a
+	// user for a database object.
+	EventLogRevokePrivilege EventLogType = "revoke_privilege"
 )
 
 // EventLogSetClusterSettingDetail is the json details for a settings change.

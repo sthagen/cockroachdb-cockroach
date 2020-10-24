@@ -197,7 +197,6 @@ func TestOracleFactory(t *testing.T) {
 func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	skip.WithIssue(t, 52681)
 	// This test sleeps for a few sec.
 	skip.UnderShort(t)
 
@@ -270,7 +269,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	n1.QueryRow(t, `SELECT id from system.namespace2 WHERE name='test'`).Scan(&tableID)
 	tablePrefix := keys.MustAddr(keys.SystemSQLCodec.TablePrefix(tableID))
 	n4Cache := tc.Server(3).DistSenderI().(*kvcoord.DistSender).RangeDescriptorCache()
-	entry := n4Cache.GetCached(tablePrefix, false /* inverted */)
+	entry := n4Cache.GetCached(ctx, tablePrefix, false /* inverted */)
 	require.NotNil(t, entry)
 	require.False(t, entry.Lease().Empty())
 	require.Equal(t, roachpb.StoreID(1), entry.Lease().Replica.StoreID)
@@ -291,7 +290,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	rec := <-recCh
 	require.False(t, kv.OnlyFollowerReads(rec), "query was not served through follower reads: %s", rec)
 	// Check that the cache was properly updated.
-	entry = n4Cache.GetCached(tablePrefix, false /* inverted */)
+	entry = n4Cache.GetCached(ctx, tablePrefix, false /* inverted */)
 	require.NotNil(t, entry)
 	require.False(t, entry.Lease().Empty())
 	require.Equal(t, roachpb.StoreID(1), entry.Lease().Replica.StoreID)

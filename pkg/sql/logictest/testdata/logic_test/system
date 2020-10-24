@@ -1,44 +1,44 @@
 # LogicTest: !3node-tenant(49854)
-query T
+query TT
 SHOW DATABASES
 ----
-defaultdb
-postgres
-system
-test
+defaultdb  root
+postgres   root
+system     node
+test       root
 
-query TTTT
+query TTTTI
 SHOW TABLES FROM system
 ----
-public  comments                         table  NULL
-public  descriptor                       table  NULL
-public  eventlog                         table  NULL
-public  jobs                             table  NULL
-public  lease                            table  NULL
-public  locations                        table  NULL
-public  namespace                        table  NULL
-public  namespace2                       table  NULL
-public  protected_ts_meta                table  NULL
-public  protected_ts_records             table  NULL
-public  rangelog                         table  NULL
-public  replication_constraint_stats     table  NULL
-public  replication_critical_localities  table  NULL
-public  replication_stats                table  NULL
-public  reports_meta                     table  NULL
-public  role_members                     table  NULL
-public  role_options                     table  NULL
-public  scheduled_jobs                   table  NULL
-public  settings                         table  NULL
-public  sqlliveness                      table  NULL
-public  statement_bundle_chunks          table  NULL
-public  statement_diagnostics            table  NULL
-public  statement_diagnostics_requests   table  NULL
-public  table_statistics                 table  NULL
-public  tenants                          table  NULL
-public  ui                               table  NULL
-public  users                            table  NULL
-public  web_sessions                     table  NULL
-public  zones                            table  NULL
+public  comments                         table  NULL  NULL
+public  descriptor                       table  NULL  NULL
+public  eventlog                         table  NULL  NULL
+public  jobs                             table  NULL  NULL
+public  lease                            table  NULL  NULL
+public  locations                        table  NULL  NULL
+public  namespace                        table  NULL  NULL
+public  namespace2                       table  NULL  NULL
+public  protected_ts_meta                table  NULL  NULL
+public  protected_ts_records             table  NULL  NULL
+public  rangelog                         table  NULL  NULL
+public  replication_constraint_stats     table  NULL  NULL
+public  replication_critical_localities  table  NULL  NULL
+public  replication_stats                table  NULL  NULL
+public  reports_meta                     table  NULL  NULL
+public  role_members                     table  NULL  NULL
+public  role_options                     table  NULL  NULL
+public  scheduled_jobs                   table  NULL  NULL
+public  settings                         table  NULL  NULL
+public  sqlliveness                      table  NULL  NULL
+public  statement_bundle_chunks          table  NULL  NULL
+public  statement_diagnostics            table  NULL  NULL
+public  statement_diagnostics_requests   table  NULL  NULL
+public  table_statistics                 table  NULL  NULL
+public  tenants                          table  NULL  NULL
+public  ui                               table  NULL  NULL
+public  users                            table  NULL  NULL
+public  web_sessions                     table  NULL  NULL
+public  zones                            table  NULL  NULL
 
 query I rowsort
 SELECT id FROM system.descriptor
@@ -173,25 +173,15 @@ query TTTT
 SHOW GRANTS ON DATABASE system
 ----
 system  crdb_internal       admin  GRANT
-system  crdb_internal       admin  SELECT
 system  crdb_internal       root   GRANT
-system  crdb_internal       root   SELECT
 system  information_schema  admin  GRANT
-system  information_schema  admin  SELECT
 system  information_schema  root   GRANT
-system  information_schema  root   SELECT
 system  pg_catalog          admin  GRANT
-system  pg_catalog          admin  SELECT
 system  pg_catalog          root   GRANT
-system  pg_catalog          root   SELECT
 system  pg_extension        admin  GRANT
-system  pg_extension        admin  SELECT
 system  pg_extension        root   GRANT
-system  pg_extension        root   SELECT
 system  public              admin  GRANT
-system  public              admin  SELECT
 system  public              root   GRANT
-system  public              root   SELECT
 
 query TTTTT
 SHOW GRANTS ON system.*
@@ -495,16 +485,16 @@ GRANT DELETE, INSERT ON system.descriptor TO root
 statement error user root does not have ALL privilege on relation descriptor
 GRANT ALL ON system.descriptor TO root
 
-statement error user root must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root must have exactly GRANT, SELECT privileges on system database with ID=.*
 REVOKE GRANT ON DATABASE system FROM root
 
-statement error user root must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root must have exactly GRANT, SELECT privileges on system table with ID=.*
 REVOKE GRANT ON system.namespace FROM root
 
 statement error user root does not have ALL privilege on relation namespace
 REVOKE ALL ON system.namespace FROM root
 
-statement error user root does not have privileges over system object with ID=.*
+statement error user root does not have privileges over system table with ID=.*
 REVOKE GRANT,SELECT ON system.namespace FROM root
 
 statement error user root does not have ALL privilege on database system
@@ -513,7 +503,7 @@ GRANT ALL ON DATABASE system TO admin
 statement error user root does not have DELETE privilege on database system
 GRANT DELETE, INSERT ON DATABASE system TO admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user admin must have exactly GRANT, SELECT privileges on system database with ID=.*
 REVOKE GRANT ON DATABASE system FROM admin
 
 statement error user root does not have ALL privilege on relation namespace
@@ -525,19 +515,19 @@ GRANT DELETE, INSERT ON system.descriptor TO admin
 statement error user root does not have ALL privilege on relation descriptor
 GRANT ALL ON system.descriptor TO admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user admin must have exactly GRANT, SELECT privileges on system table with ID=.*
 REVOKE GRANT ON system.descriptor FROM admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user admin must have exactly GRANT, SELECT privileges on system database with ID=.*
 REVOKE GRANT ON DATABASE system FROM admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user admin must have exactly GRANT, SELECT privileges on system table with ID=.*
 REVOKE GRANT ON system.namespace FROM admin
 
 statement error user root does not have ALL privilege on relation namespace
 REVOKE ALL ON system.namespace FROM admin
 
-statement error user admin does not have privileges over system object with ID=.*
+statement error user admin does not have privileges over system table with ID=.*
 REVOKE GRANT,SELECT ON system.namespace FROM admin
 
 # Some tables (we test system.lease here) used to allow multiple privilege sets for
@@ -572,7 +562,7 @@ FROM system.settings
 WHERE name != 'sql.defaults.distsql'
 AND name != 'sql.stats.automatic_collection.enabled'
 AND name NOT LIKE '%sql.defaults.vectorize%'
-AND name NOT LIKE '%sql.testing.vectorize.batch_size%'
+AND name NOT LIKE '%sql.testing%'
 AND name NOT LIKE '%sql.defaults.experimental_distsql_planning%'
 ORDER BY name
 ----
@@ -592,7 +582,8 @@ WHERE name NOT IN ('version', 'sql.defaults.distsql', 'cluster.secret',
   'sql.stats.automatic_collection.enabled', 'sql.defaults.vectorize',
   'sql.defaults.vectorize_row_count_threshold',
   'sql.testing.vectorize.batch_size',
-  'sql.defaults.experimental_distsql_planning')
+  'sql.defaults.experimental_distsql_planning',
+  'sql.testing.mutations.max_batch_size')
 ORDER BY name
 ----
 diagnostics.reporting.enabled                  true

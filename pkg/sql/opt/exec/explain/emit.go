@@ -16,11 +16,12 @@ import (
 	"math"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
@@ -31,6 +32,14 @@ func Emit(plan *Plan, ob *OutputBuilder, spanFormatFn SpanFormatFn) error {
 	e := makeEmitter(ob, spanFormatFn)
 	var walk func(n *Node) error
 	walk = func(n *Node) error {
+		// In non-verbose mode, we skip all projections.
+		// In verbose mode, we only skip trivial projections (which just rearrange
+		// or rename the columns).
+		if !ob.flags.Verbose {
+			if n.op == serializingProjectOp || n.op == simpleProjectOp {
+				return walk(n.children[0])
+			}
+		}
 		n, columns, ordering := omitTrivialProjections(n)
 		name, err := e.nodeName(n)
 		if err != nil {
@@ -62,7 +71,9 @@ func Emit(plan *Plan, ob *OutputBuilder, spanFormatFn SpanFormatFn) error {
 
 		// This field contains the original subquery (which could have been modified
 		// by optimizer transformations).
-		ob.Attr("original sql", tree.AsStringWithFlags(s.ExprNode, tree.FmtSimple))
+		if s.ExprNode != nil {
+			ob.Attr("original sql", tree.AsStringWithFlags(s.ExprNode, tree.FmtSimple))
+		}
 		var mode string
 		switch s.Mode {
 		case exec.SubqueryExists:
@@ -87,7 +98,9 @@ func Emit(plan *Plan, ob *OutputBuilder, spanFormatFn SpanFormatFn) error {
 	for i := range plan.Cascades {
 		ob.EnterMetaNode("fk-cascade")
 		ob.Attr("fk", plan.Cascades[i].FKName)
-		ob.Attr("input", plan.Cascades[i].Buffer.(*Node).args.(*bufferArgs).Label)
+		if buffer := plan.Cascades[i].Buffer; buffer != nil {
+			ob.Attr("input", buffer.(*Node).args.(*bufferArgs).Label)
+		}
 		ob.LeaveNode()
 	}
 	for _, n := range plan.Checks {
@@ -108,25 +121,44 @@ type SpanFormatFn func(table cat.Table, index cat.Index, scanParams exec.ScanPar
 // omitTrivialProjections returns the given node and its result columns and
 // ordering, unless the node is an identity projection (which just renames
 // columns) - in which case we return the child node and the renamed columns.
-func omitTrivialProjections(n *Node) (*Node, sqlbase.ResultColumns, sqlbase.ColumnOrdering) {
-	if n.op != serializingProjectOp {
+func omitTrivialProjections(n *Node) (*Node, colinfo.ResultColumns, colinfo.ColumnOrdering) {
+	var projection []exec.NodeColumnOrdinal
+	switch n.op {
+	case serializingProjectOp:
+		projection = n.args.(*serializingProjectArgs).Cols
+	case simpleProjectOp:
+		projection = n.args.(*simpleProjectArgs).Cols
+	default:
 		return n, n.Columns(), n.Ordering()
 	}
 
-	projection := n.args.(*serializingProjectArgs).Cols
+	input, inputColumns, inputOrdering := omitTrivialProjections(n.children[0])
 
-	input := n.children[0]
-	// Check if the projection is the identity.
-	// TODO(radu): extend this to omit projections that only reorder or rename columns.
-	if len(projection) != len(input.Columns()) {
+	// Check if the projection is a bijection (i.e. permutation of all input
+	// columnns), and construct the inverse projection.
+	if len(projection) != len(inputColumns) {
 		return n, n.Columns(), n.Ordering()
 	}
-	for i := range projection {
-		if int(projection[i]) != i {
+	inverse := make([]int, len(inputColumns))
+	for i := range inverse {
+		inverse[i] = -1
+	}
+	for i, col := range projection {
+		inverse[int(col)] = i
+	}
+	for i := range inverse {
+		if inverse[i] == -1 {
 			return n, n.Columns(), n.Ordering()
 		}
 	}
-	return input, n.Columns(), input.Ordering()
+	// We will show the child node and its ordering, but with the columns
+	// reordered and renamed according to the parent.
+	ordering := make(colinfo.ColumnOrdering, len(inputOrdering))
+	for i, o := range inputOrdering {
+		ordering[i].ColIdx = inverse[o.ColIdx]
+		ordering[i].Direction = o.Direction
+	}
+	return input, n.Columns(), ordering
 }
 
 // emitter is a helper for emitting explain information for all the operators.
@@ -163,24 +195,38 @@ func (e *emitter) nodeName(n *Node) (string, error) {
 		}
 
 	case hashJoinOp:
+		a := n.args.(*hashJoinArgs)
 		if len(n.args.(*hashJoinArgs).LeftEqCols) == 0 {
-			return "cross join", nil
+			return e.joinNodeName("cross", a.JoinType), nil
 		}
-		return "hash join", nil
+		return e.joinNodeName("hash", a.JoinType), nil
+
+	case mergeJoinOp:
+		a := n.args.(*mergeJoinArgs)
+		return e.joinNodeName("merge", a.JoinType), nil
 
 	case lookupJoinOp:
-		if n.args.(*lookupJoinArgs).Table.IsVirtualTable() {
-			return "virtual table lookup join", nil
+		a := n.args.(*lookupJoinArgs)
+		if a.Table.IsVirtualTable() {
+			return e.joinNodeName("virtual table lookup", a.JoinType), nil
 		}
-		return "lookup join", nil
+		return e.joinNodeName("lookup", a.JoinType), nil
+
+	case invertedJoinOp:
+		a := n.args.(*invertedJoinArgs)
+		return e.joinNodeName("inverted", a.JoinType), nil
+
+	case applyJoinOp:
+		a := n.args.(*applyJoinArgs)
+		return e.joinNodeName("apply", a.JoinType), nil
 
 	case setOpOp:
 		a := n.args.(*setOpArgs)
-		// TODO(radu): fix these terrible names.
-		if a.Typ == tree.UnionOp && a.All {
-			return "append", nil
+		name := strings.ToLower(a.Typ.String())
+		if a.All {
+			name += " all"
 		}
-		return "union", nil
+		return name, nil
 
 	case opaqueOp:
 		a := n.args.(*opaqueArgs)
@@ -198,7 +244,7 @@ var nodeNames = [...]string{
 	alterTableSplitOp:      "split",
 	alterTableUnsplitAllOp: "unsplit all",
 	alterTableUnsplitOp:    "unsplit",
-	applyJoinOp:            "apply join",
+	applyJoinOp:            "", // This node does not have a fixed name.
 	bufferOp:               "buffer",
 	cancelQueriesOp:        "cancel queries",
 	cancelSessionsOp:       "cancel sessions",
@@ -221,20 +267,19 @@ var nodeNames = [...]string{
 	indexJoinOp:            "index join",
 	insertFastPathOp:       "insert fast path",
 	insertOp:               "insert",
-	interleavedJoinOp:      "interleaved join",
 	invertedFilterOp:       "inverted filter",
 	invertedJoinOp:         "inverted join",
 	limitOp:                "limit",
 	lookupJoinOp:           "", // This node does not have a fixed name.
 	max1RowOp:              "max1row",
-	mergeJoinOp:            "merge join",
+	mergeJoinOp:            "", // This node does not have a fixed name.
 	opaqueOp:               "", // This node does not have a fixed name.
 	ordinalityOp:           "ordinality",
 	projectSetOp:           "project set",
 	recursiveCTEOp:         "recursive cte",
 	renderOp:               "render",
 	saveTableOp:            "save table",
-	scalarGroupByOp:        "group",
+	scalarGroupByOp:        "group (scalar)",
 	scanBufferOp:           "scan buffer",
 	scanOp:                 "", // This node does not have a fixed name.
 	sequenceSelectOp:       "sequence select",
@@ -248,6 +293,32 @@ var nodeNames = [...]string{
 	valuesOp:               "", // This node does not have a fixed name.
 	windowOp:               "window",
 	zigzagJoinOp:           "zigzag join",
+}
+
+func (e *emitter) joinNodeName(algo string, joinType descpb.JoinType) string {
+	var typ string
+	switch joinType {
+	case descpb.InnerJoin:
+		// Omit "inner" in non-verbose mode.
+		if !e.ob.flags.Verbose {
+			return fmt.Sprintf("%s join", algo)
+		}
+		typ = "inner"
+
+	case descpb.LeftOuterJoin:
+		typ = "left outer"
+	case descpb.RightOuterJoin:
+		typ = "right outer"
+	case descpb.FullOuterJoin:
+		typ = "full outer"
+	case descpb.LeftSemiJoin:
+		typ = "semi"
+	case descpb.LeftAntiJoin:
+		typ = "anti"
+	default:
+		typ = fmt.Sprintf("invalid: %d", joinType)
+	}
+	return fmt.Sprintf("%s join (%s)", algo, typ)
 }
 
 func (e *emitter) emitNodeAttributes(n *Node) error {
@@ -294,8 +365,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		}
 
 		if a.Params.Parallelize {
-			// TODO(radu): should be Vattr.
-			ob.Attr("parallel", "")
+			ob.VAttr("parallel", "")
 		}
 		e.emitLockingPolicy(a.Params.Locking)
 
@@ -328,9 +398,9 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 
 	case sortOp:
 		a := n.args.(*sortArgs)
-		ob.Attr("order", sqlbase.ColumnOrdering(a.Ordering).String(n.Columns()))
+		ob.Attr("order", colinfo.ColumnOrdering(a.Ordering).String(n.Columns()))
 		if p := a.AlreadyOrderedPrefix; p > 0 {
-			ob.Attr("already ordered", sqlbase.ColumnOrdering(a.Ordering[:p]).String(n.Columns()))
+			ob.Attr("already ordered", colinfo.ColumnOrdering(a.Ordering[:p]).String(n.Columns()))
 		}
 
 	case indexJoinOp:
@@ -341,8 +411,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		for i, c := range a.KeyCols {
 			cols[i] = inputCols[c].Name
 		}
-		// TODO(radu): should be verbose only.
-		ob.Attr("key columns", strings.Join(cols, ", "))
+		ob.VAttr("key columns", strings.Join(cols, ", "))
 
 	case groupByOp:
 		a := n.args.(*groupByArgs)
@@ -375,7 +444,6 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 	case hashJoinOp:
 		a := n.args.(*hashJoinArgs)
 		e.emitJoinAttributes(
-			a.JoinType,
 			a.Left.Columns(), a.Right.Columns(),
 			a.LeftEqCols, a.RightEqCols,
 			a.LeftEqColsAreKey, a.RightEqColsAreKey,
@@ -393,14 +461,13 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 			rightEqCols[i] = exec.NodeColumnOrdinal(a.RightOrdering[i].ColIdx)
 		}
 		e.emitJoinAttributes(
-			a.JoinType,
 			leftCols, rightCols,
 			leftEqCols, rightEqCols,
 			a.LeftEqColsAreKey, a.RightEqColsAreKey,
 			a.OnCond,
 		)
-		eqCols := make(sqlbase.ResultColumns, len(leftEqCols))
-		mergeOrd := make(sqlbase.ColumnOrdering, len(eqCols))
+		eqCols := make(colinfo.ResultColumns, len(leftEqCols))
+		mergeOrd := make(colinfo.ColumnOrdering, len(eqCols))
 		for i := range eqCols {
 			eqCols[i].Name = fmt.Sprintf(
 				"(%s=%s)", leftCols[leftEqCols[i]].Name, rightCols[rightEqCols[i]].Name,
@@ -408,12 +475,10 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 			mergeOrd[i].ColIdx = i
 			mergeOrd[i].Direction = a.LeftOrdering[i].Direction
 		}
-		// TODO(radu): fix this field name,
-		ob.Attr("mergeJoinOrder", mergeOrd.String(eqCols))
+		ob.VAttr("merge ordering", mergeOrd.String(eqCols))
 
 	case applyJoinOp:
 		a := n.args.(*applyJoinArgs)
-		e.emitJoinType(a.JoinType, false /* hasEqCols */)
 		if a.OnCond != nil {
 			ob.Expr("pred", a.OnCond, appendColumns(a.Left.Columns(), a.RightColumns...))
 		}
@@ -421,11 +486,10 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 	case lookupJoinOp:
 		a := n.args.(*lookupJoinArgs)
 		e.emitTableAndIndex("table", a.Table, a.Index)
-		e.emitJoinType(a.JoinType, true /* hasEqCols */)
 		inputCols := a.Input.Columns()
 		rightEqCols := make([]string, len(a.EqCols))
 		for i := range rightEqCols {
-			rightEqCols[i] = string(a.Table.Column(a.Index.Column(i).Ordinal).ColName())
+			rightEqCols[i] = string(a.Index.Column(i).ColName())
 		}
 		ob.Attrf(
 			"equality", "(%s) = (%s)",
@@ -434,36 +498,12 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		)
 		if a.EqColsAreKey {
 			ob.Attr("equality cols are key", "")
-			// TODO(radu): clean this up.
-			ob.Attr("parallel", "")
 		}
 		ob.Expr("pred", a.OnCond, appendColumns(inputCols, tableColumns(a.Table, a.LookupCols)...))
-
-	case interleavedJoinOp:
-		a := n.args.(*interleavedJoinArgs)
-		leftCols := tableColumns(a.LeftTable, a.LeftParams.NeededCols)
-		rightCols := tableColumns(a.RightTable, a.RightParams.NeededCols)
-		e.emitJoinType(a.JoinType, true /* hasEqCols */)
-		e.emitTableAndIndex("left table", a.LeftTable, a.LeftIndex)
-		e.emitSpans("left spans", a.LeftTable, a.LeftIndex, a.LeftParams)
-		ob.Expr("left filter", a.LeftFilter, leftCols)
-		e.emitTableAndIndex("right table", a.RightTable, a.RightIndex)
-		e.emitSpans("right spans", a.RightTable, a.RightIndex, a.RightParams)
-		ob.Expr("right filter", a.RightFilter, rightCols)
-		ob.Expr("pred", a.OnCond, appendColumns(leftCols, rightCols...))
-
-		if a.LeftIsAncestor {
-			ob.Attr("ancestor", "left")
-			e.emitLockingPolicy(a.LeftParams.Locking)
-		} else {
-			ob.Attr("ancestor", "right")
-			e.emitLockingPolicy(a.RightParams.Locking)
-		}
+		e.emitLockingPolicy(a.Locking)
 
 	case zigzagJoinOp:
 		a := n.args.(*zigzagJoinArgs)
-		// TODO(radu): remove this.
-		e.emitJoinType(descpb.InnerJoin, true /* hasEqCols */)
 		leftCols := tableColumns(a.LeftTable, a.LeftCols)
 		rightCols := tableColumns(a.RightTable, a.RightCols)
 		// TODO(radu): we should be passing nil instead of true.
@@ -489,15 +529,12 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 	case invertedJoinOp:
 		a := n.args.(*invertedJoinArgs)
 		e.emitTableAndIndex("table", a.Table, a.Index)
-		e.emitJoinType(a.JoinType, true /* hasEqCols */)
 		cols := appendColumns(a.Input.Columns(), tableColumns(a.Table, a.LookupCols)...)
-		// TODO(radu): add field name.
-		ob.Expr("", a.InvertedExpr, cols)
+		ob.VExpr("inverted expr", a.InvertedExpr, cols)
 		// TODO(radu): we should be passing nil instead of true.
 		if a.OnCond != tree.DBoolTrue {
-			ob.Expr("onExpr", a.OnCond, cols)
+			ob.Expr("on", a.OnCond, cols)
 		}
-		ob.Attr("parallel", "")
 
 	case projectSetOp:
 		a := n.args.(*projectSetArgs)
@@ -533,6 +570,17 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		if a.AutoCommit {
 			ob.Attr("auto commit", "")
 		}
+		if len(a.Arbiters) > 0 {
+			var sb strings.Builder
+			for i, idx := range a.Arbiters {
+				index := a.Table.Index(idx)
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(string(index.Name()))
+			}
+			ob.Attr("arbiter indexes", sb.String())
+		}
 
 	case insertFastPathOp:
 		a := n.args.(*insertFastPathArgs)
@@ -560,6 +608,17 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		)
 		if a.AutoCommit {
 			ob.Attr("auto commit", "")
+		}
+		if len(a.Arbiters) > 0 {
+			var sb strings.Builder
+			for i, idx := range a.Arbiters {
+				index := a.Table.Index(idx)
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(string(index.Name()))
+			}
+			ob.Attr("arbiter indexes", sb.String())
 		}
 
 	case updateOp:
@@ -634,15 +693,46 @@ func (e *emitter) emitTableAndIndex(field string, table cat.Table, index cat.Ind
 func (e *emitter) emitSpans(
 	field string, table cat.Table, index cat.Index, scanParams exec.ScanParams,
 ) {
+	e.ob.Attr(field, e.spansStr(table, index, scanParams))
+}
+
+func (e *emitter) spansStr(table cat.Table, index cat.Index, scanParams exec.ScanParams) string {
 	if scanParams.InvertedConstraint == nil && scanParams.IndexConstraint == nil {
 		if scanParams.HardLimit > 0 {
-			e.ob.Attr(field, "LIMITED SCAN")
-		} else {
-			e.ob.Attr(field, "FULL SCAN")
+			return "LIMITED SCAN"
 		}
-	} else {
-		e.ob.Attr(field, e.spanFormatFn(table, index, scanParams))
+		return "FULL SCAN"
 	}
+
+	// In verbose mode show the physical spans.
+	if e.ob.flags.Verbose {
+		return e.spanFormatFn(table, index, scanParams)
+	}
+
+	// For inverted constraints, just print the number of spans. Inverted key
+	// values are generally not user-readable.
+	if scanParams.InvertedConstraint != nil {
+		n := len(scanParams.InvertedConstraint)
+		return fmt.Sprintf("%d span%s", n, util.Pluralize(int64(n)))
+	}
+
+	// If we must hide values, only show the count.
+	if e.ob.flags.HideValues {
+		n := scanParams.IndexConstraint.Spans.Count()
+		return fmt.Sprintf("%d span%s", n, util.Pluralize(int64(n)))
+	}
+
+	sp := &scanParams.IndexConstraint.Spans
+	// Show up to 4 logical spans.
+	if maxSpans := 4; sp.Count() > maxSpans {
+		trunc := &constraint.Spans{}
+		trunc.Alloc(maxSpans)
+		for i := 0; i < maxSpans; i++ {
+			trunc.Append(sp.Get(i))
+		}
+		return fmt.Sprintf("%s … (%d more)", trunc.String(), sp.Count()-maxSpans)
+	}
+	return sp.String()
 }
 
 func (e *emitter) emitLockingPolicy(locking *tree.LockingItem) {
@@ -652,11 +742,9 @@ func (e *emitter) emitLockingPolicy(locking *tree.LockingItem) {
 	strength := descpb.ToScanLockingStrength(locking.Strength)
 	waitPolicy := descpb.ToScanLockingWaitPolicy(locking.WaitPolicy)
 	if strength != descpb.ScanLockingStrength_FOR_NONE {
-		// TODO(radu): should be Vattr.
 		e.ob.Attr("locking strength", strength.PrettyString())
 	}
 	if waitPolicy != descpb.ScanLockingWaitPolicy_BLOCK {
-		// TODO(radu): should be Vattr.
 		e.ob.Attr("locking wait policy", waitPolicy.PrettyString())
 	}
 }
@@ -677,25 +765,26 @@ func (e *emitter) emitTuples(rows [][]tree.TypedExpr, numColumns int) {
 }
 
 func (e *emitter) emitGroupByAttributes(
-	inputCols sqlbase.ResultColumns,
+	inputCols colinfo.ResultColumns,
 	aggs []exec.AggInfo,
 	groupCols []exec.NodeColumnOrdinal,
-	groupColOrdering sqlbase.ColumnOrdering,
+	groupColOrdering colinfo.ColumnOrdering,
 	isScalar bool,
 ) {
-	// TODO(radu): make this loop verbose only.
-	for i, agg := range aggs {
-		var buf bytes.Buffer
-		fmt.Fprintf(&buf, "%s(", agg.FuncName)
-		if agg.Distinct {
-			buf.WriteString("DISTINCT ")
+	if e.ob.flags.Verbose {
+		for i, agg := range aggs {
+			var buf bytes.Buffer
+			fmt.Fprintf(&buf, "%s(", agg.FuncName)
+			if agg.Distinct {
+				buf.WriteString("DISTINCT ")
+			}
+			buf.WriteString(printColumnList(inputCols, agg.ArgCols))
+			buf.WriteByte(')')
+			if agg.Filter != -1 {
+				fmt.Fprintf(&buf, " FILTER (WHERE %s)", inputCols[agg.Filter].Name)
+			}
+			e.ob.Attr(fmt.Sprintf("aggregate %d", i), buf.String())
 		}
-		buf.WriteString(printColumnList(inputCols, agg.ArgCols))
-		buf.WriteByte(')')
-		if agg.Filter != -1 {
-			fmt.Fprintf(&buf, " FILTER (WHERE %s)", inputCols[agg.Filter].Name)
-		}
-		e.ob.Attr(fmt.Sprintf("aggregate %d", i), buf.String())
 	}
 	if len(groupCols) > 0 {
 		e.ob.Attr("group by", printColumnList(inputCols, groupCols))
@@ -703,21 +792,15 @@ func (e *emitter) emitGroupByAttributes(
 	if len(groupColOrdering) > 0 {
 		e.ob.Attr("ordered", groupColOrdering.String(inputCols))
 	}
-	if isScalar {
-		e.ob.Attr("scalar", "")
-	}
 }
 
 func (e *emitter) emitJoinAttributes(
-	joinType descpb.JoinType,
-	leftCols, rightCols sqlbase.ResultColumns,
+	leftCols, rightCols colinfo.ResultColumns,
 	leftEqCols, rightEqCols []exec.NodeColumnOrdinal,
 	leftEqColsAreKey, rightEqColsAreKey bool,
 	extraOnCond tree.TypedExpr,
 ) {
-	hasEqCols := len(leftEqCols) > 0
-	e.emitJoinType(joinType, hasEqCols)
-	if hasEqCols {
+	if len(leftEqCols) > 0 {
 		e.ob.Attrf("equality", "(%s) = (%s)", printColumnList(leftCols, leftEqCols), printColumnList(rightCols, rightEqCols))
 		if leftEqColsAreKey {
 			e.ob.Attr("left cols are key", "")
@@ -729,32 +812,7 @@ func (e *emitter) emitJoinAttributes(
 	e.ob.Expr("pred", extraOnCond, appendColumns(leftCols, rightCols...))
 }
 
-func (e *emitter) emitJoinType(joinType descpb.JoinType, hasEqCols bool) {
-	ob := e.ob
-	switch joinType {
-	case descpb.InnerJoin:
-		if !hasEqCols {
-			ob.Attr("type", "cross")
-		} else {
-			// TODO(radu): omit this?
-			ob.Attr("type", "inner")
-		}
-	case descpb.LeftOuterJoin:
-		ob.Attr("type", "left outer")
-	case descpb.RightOuterJoin:
-		ob.Attr("type", "right outer")
-	case descpb.FullOuterJoin:
-		ob.Attr("type", "full outer")
-	case descpb.LeftSemiJoin:
-		ob.Attr("type", "semi")
-	case descpb.LeftAntiJoin:
-		ob.Attr("type", "anti")
-	default:
-		ob.Attrf("type", "invalid (%d)", joinType)
-	}
-}
-
-func printColumns(inputCols sqlbase.ResultColumns) string {
+func printColumns(inputCols colinfo.ResultColumns) string {
 	var buf bytes.Buffer
 	for i, col := range inputCols {
 		if i > 0 {
@@ -765,7 +823,7 @@ func printColumns(inputCols sqlbase.ResultColumns) string {
 	return buf.String()
 }
 
-func printColumnList(inputCols sqlbase.ResultColumns, cols []exec.NodeColumnOrdinal) string {
+func printColumnList(inputCols colinfo.ResultColumns, cols []exec.NodeColumnOrdinal) string {
 	var buf bytes.Buffer
 	for i, col := range cols {
 		if i > 0 {
@@ -776,7 +834,7 @@ func printColumnList(inputCols sqlbase.ResultColumns, cols []exec.NodeColumnOrdi
 	return buf.String()
 }
 
-func printColumnSet(inputCols sqlbase.ResultColumns, cols exec.NodeColumnOrdinalSet) string {
+func printColumnSet(inputCols colinfo.ResultColumns, cols exec.NodeColumnOrdinalSet) string {
 	var buf bytes.Buffer
 	prefix := ""
 	cols.ForEach(func(col int) {

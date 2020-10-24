@@ -12,6 +12,7 @@ package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -21,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -114,9 +114,10 @@ func (b *Builder) buildDataSource(
 			return b.buildScan(
 				tabMeta,
 				tableOrdinals(t, columnKinds{
-					includeMutations: false,
-					includeSystem:    true,
-					includeVirtual:   false,
+					includeMutations:       false,
+					includeSystem:          true,
+					includeVirtualInverted: false,
+					includeVirtualComputed: false,
 				}),
 				indexFlags, locking, inScope,
 			)
@@ -397,9 +398,10 @@ func (b *Builder) buildScanFromTableRef(
 		ordinals = resolveNumericColumnRefs(tab, ref.Columns)
 	} else {
 		ordinals = tableOrdinals(tab, columnKinds{
-			includeMutations: false,
-			includeSystem:    true,
-			includeVirtual:   false,
+			includeMutations:       false,
+			includeSystem:          true,
+			includeVirtualInverted: false,
+			includeVirtualComputed: false,
 		})
 	}
 
@@ -458,7 +460,7 @@ func (b *Builder) buildScan(
 		colID := tabID.ColumnID(ord)
 		tabColIDs.Add(colID)
 		name := col.ColName()
-		kind := tab.ColumnKind(ord)
+		kind := col.Kind()
 		outScope.cols[i] = scopeColumn{
 			id:           colID,
 			name:         name,
@@ -517,9 +519,30 @@ func (b *Builder) buildScan(
 
 		b.addCheckConstraintsForTable(tabMeta)
 		b.addComputedColsForTable(tabMeta)
-		b.addPartialIndexPredicatesForTable(tabMeta)
 
 		outScope.expr = b.factory.ConstructScan(&private)
+
+		// Add the partial indexes after constructing the scan so we can use the
+		// logical properties of the scan to fully normalize the index
+		// predicates. Partial index predicates are only added if the outScope
+		// contains all the table's ordinary columns. If it does not, partial
+		// index predicates cannot be built because they may reference columns
+		// not in outScope. In the most common case, the outScope has the same
+		// number of columns as the table and we can skip checking that each
+		// ordinary column exists in outScope.
+		containsAllOrdinaryTableColumns := true
+		if len(outScope.cols) != tab.ColumnCount() {
+			for i := 0; i < tab.ColumnCount(); i++ {
+				col := tab.Column(i)
+				if col.Kind() == cat.Ordinary && !outScope.colSet().Contains(tabID.ColumnID(col.Ordinal())) {
+					containsAllOrdinaryTableColumns = false
+					break
+				}
+			}
+		}
+		if containsAllOrdinaryTableColumns {
+			b.addPartialIndexPredicatesForTable(tabMeta, outScope)
+		}
 
 		if b.trackViewDeps {
 			dep := opt.ViewDep{DataSource: tab}
@@ -569,8 +592,8 @@ func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
 	// Find the non-nullable table columns. Mutation columns can be NULL during
 	// backfill, so they should be excluded.
 	var notNullCols opt.ColSet
-	for i := 0; i < tab.ColumnCount(); i++ {
-		if !tab.Column(i).IsNullable() && !cat.IsMutationColumn(tab, i) {
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		if col := tab.Column(i); !col.IsNullable() && !col.IsMutation() {
 			notNullCols.Add(tabMeta.MetaID.ColumnID(i))
 		}
 	}
@@ -623,7 +646,7 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 		if !tabCol.IsComputed() {
 			continue
 		}
-		if cat.IsMutationColumn(tab, i) {
+		if tabCol.IsMutation() {
 			// Mutation columns can be NULL during backfill, so they won't equal the
 			// computed column expression value (in general).
 			continue
@@ -661,7 +684,7 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 //
 // The predicates are used as "known truths" about table data. Any predicates
 // containing non-immutable operators are omitted.
-func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta) {
+func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta, tableScope *scope) {
 	tab := tabMeta.Table
 
 	// Find the first partial index.
@@ -679,10 +702,6 @@ func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta) {
 		return
 	}
 
-	// Create a scope that can be used for building the scalar expressions.
-	tableScope := b.allocScope()
-	tableScope.appendOrdinaryColumnsFromTable(tabMeta, &tabMeta.Alias)
-
 	// Skip to the first partial index we found above.
 	for ; indexOrd < numIndexes; indexOrd++ {
 		index := tab.Index(indexOrd)
@@ -698,29 +717,13 @@ func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta) {
 			panic(err)
 		}
 
-		texpr := tableScope.resolveAndRequireType(expr, types.Bool)
-
-		var scalar opt.ScalarExpr
-		b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
-			scalar = b.buildScalar(texpr, tableScope, nil, nil, nil)
-		})
-
-		// Wrap the scalar in a FiltersItem.
-		filter := b.factory.ConstructFiltersItem(scalar)
-
-		// Expressions with non-immutable operators are not supported as partial
-		// index predicates.
-		if filter.ScalarProps().VolatilitySet.HasStable() || filter.ScalarProps().VolatilitySet.HasVolatile() {
-			panic(errors.AssertionFailedf("partial index predicate is not immutable"))
+		// Build the partial index predicate as a memo.FiltersExpr and add it
+		// to the table metadata.
+		predExpr, err := b.buildPartialIndexPredicate(tableScope, expr, "index predicate")
+		if err != nil {
+			panic(err)
 		}
-
-		// Wrap the predicate filter expression in a FiltersExpr and normalize
-		// it.
-		filters := memo.FiltersExpr{filter}
-		filters = b.factory.NormalizePartialIndexPredicate(filters)
-
-		// Add the filters to the table metadata.
-		tabMeta.AddPartialIndexPredicate(indexOrd, &filters)
+		tabMeta.AddPartialIndexPredicate(indexOrd, &predExpr)
 	}
 }
 
@@ -730,9 +733,9 @@ func (b *Builder) buildSequenceSelect(
 	md := b.factory.Metadata()
 	outScope = inScope.push()
 
-	cols := make(opt.ColList, len(sqlbase.SequenceSelectColumns))
+	cols := make(opt.ColList, len(colinfo.SequenceSelectColumns))
 
-	for i, c := range sqlbase.SequenceSelectColumns {
+	for i, c := range colinfo.SequenceSelectColumns {
 		cols[i] = md.AddColumn(c.Name, c.Typ)
 	}
 
@@ -1357,13 +1360,12 @@ func (b *Builder) validateLockingInFrom(
 		// Validating locking wait policy.
 		switch li.WaitPolicy {
 		case tree.LockWaitBlock:
-			// Default.
+			// Default. Block on conflicting locks.
 		case tree.LockWaitSkip:
 			panic(unimplementedWithIssueDetailf(40476, "",
 				"SKIP LOCKED lock wait policy is not supported"))
 		case tree.LockWaitError:
-			panic(unimplementedWithIssueDetailf(40476, "",
-				"NOWAIT lock wait policy is not supported"))
+			// Raise an error on conflicting locks.
 		default:
 			panic(errors.AssertionFailedf("unknown locking wait policy: %s", li.WaitPolicy))
 		}

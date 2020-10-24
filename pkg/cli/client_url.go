@@ -190,8 +190,13 @@ func (u urlParser) setInternal(v string, warn bool) error {
 
 		switch sslMode := options.Get("sslmode"); sslMode {
 		case "", "disable":
-			if err := fl.Set(cliflags.ClientInsecure.Name, "true"); err != nil {
-				return errors.Wrapf(err, "setting insecure connection based on --url")
+			if u.sslStrict {
+				// For "strict" mode (RPC client commands) we don't support non-TLS
+				// yet. See https://github.com/cockroachdb/cockroach/issues/54007
+				// Instead, we see a request for no TLS to imply insecure mode.
+				if err := fl.Set(cliflags.ClientInsecure.Name, "true"); err != nil {
+					return errors.Wrapf(err, "setting secure connection based on --url")
+				}
 			}
 		case "require", "verify-ca", "verify-full":
 			if sslMode != "verify-full" && u.sslStrict {
@@ -352,7 +357,7 @@ func (cliCtx *cliContext) makeClientConnURL() (url.URL, error) {
 		if userName == "" {
 			userName = security.RootUser
 		}
-		sCtx := rpc.MakeSecurityContext(cliCtx.Config, roachpb.SystemTenantID)
+		sCtx := rpc.MakeSecurityContext(cliCtx.Config, security.CommandTLSSettings{}, roachpb.SystemTenantID)
 		if err := sCtx.LoadSecurityOptions(
 			opts, userName,
 		); err != nil {

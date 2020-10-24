@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,7 +45,7 @@ func init() {
 	for i, f := range floats {
 		_, err := decs[i].SetFloat64(f)
 		if err != nil {
-			colexecerror.InternalError(fmt.Sprintf("%v", err))
+			colexecerror.InternalError(errors.AssertionFailedf("%v", err))
 		}
 	}
 
@@ -380,22 +381,22 @@ func init() {
 
 			leftTuples: tuples{
 				{0},
-				{HashTableNumBuckets},
-				{HashTableNumBuckets},
-				{HashTableNumBuckets},
+				{coldata.BatchSize()},
+				{coldata.BatchSize()},
+				{coldata.BatchSize()},
 				{0},
-				{HashTableNumBuckets * 2},
+				{coldata.BatchSize() * 2},
 				{1},
 				{1},
-				{HashTableNumBuckets + 1},
+				{coldata.BatchSize() + 1},
 			},
 			rightTuples: tuples{
-				{HashTableNumBuckets},
-				{HashTableNumBuckets * 2},
-				{HashTableNumBuckets * 3},
+				{coldata.BatchSize()},
+				{coldata.BatchSize() * 2},
+				{coldata.BatchSize() * 3},
 				{0},
 				{1},
-				{HashTableNumBuckets + 1},
+				{coldata.BatchSize() + 1},
 			},
 
 			leftEqCols:   []uint32{0},
@@ -408,15 +409,15 @@ func init() {
 			rightEqColsAreKey: false,
 
 			expected: tuples{
-				{HashTableNumBuckets, HashTableNumBuckets},
-				{HashTableNumBuckets, HashTableNumBuckets},
-				{HashTableNumBuckets, HashTableNumBuckets},
-				{HashTableNumBuckets * 2, HashTableNumBuckets * 2},
+				{coldata.BatchSize(), coldata.BatchSize()},
+				{coldata.BatchSize(), coldata.BatchSize()},
+				{coldata.BatchSize(), coldata.BatchSize()},
+				{coldata.BatchSize() * 2, coldata.BatchSize() * 2},
 				{0, 0},
 				{0, 0},
 				{1, 1},
 				{1, 1},
-				{HashTableNumBuckets + 1, HashTableNumBuckets + 1},
+				{coldata.BatchSize() + 1, coldata.BatchSize() + 1},
 			},
 		},
 		{
@@ -501,14 +502,14 @@ func init() {
 			// hash to the same bucket.
 			leftTuples: tuples{
 				{0},
-				{HashTableNumBuckets},
-				{HashTableNumBuckets * 2},
-				{HashTableNumBuckets * 3},
+				{coldata.BatchSize()},
+				{coldata.BatchSize() * 2},
+				{coldata.BatchSize() * 3},
 			},
 			rightTuples: tuples{
 				{0},
-				{HashTableNumBuckets},
-				{HashTableNumBuckets * 3},
+				{coldata.BatchSize()},
+				{coldata.BatchSize() * 3},
 			},
 
 			leftEqCols:   []uint32{0},
@@ -521,8 +522,8 @@ func init() {
 
 			expected: tuples{
 				{0},
-				{HashTableNumBuckets},
-				{HashTableNumBuckets * 3},
+				{coldata.BatchSize()},
+				{coldata.BatchSize() * 3},
 			},
 		},
 		{
@@ -607,17 +608,17 @@ func init() {
 			// Test multiple column with values that hash to the same bucket.
 			leftTuples: tuples{
 				{10, 0, 0},
-				{20, 0, HashTableNumBuckets},
-				{40, HashTableNumBuckets, 0},
-				{50, HashTableNumBuckets, HashTableNumBuckets},
-				{60, HashTableNumBuckets * 2, 0},
-				{70, HashTableNumBuckets * 2, HashTableNumBuckets},
+				{20, 0, coldata.BatchSize()},
+				{40, coldata.BatchSize(), 0},
+				{50, coldata.BatchSize(), coldata.BatchSize()},
+				{60, coldata.BatchSize() * 2, 0},
+				{70, coldata.BatchSize() * 2, coldata.BatchSize()},
 			},
 			rightTuples: tuples{
-				{0, HashTableNumBuckets},
-				{HashTableNumBuckets * 2, HashTableNumBuckets},
+				{0, coldata.BatchSize()},
+				{coldata.BatchSize() * 2, coldata.BatchSize()},
 				{0, 0},
-				{0, HashTableNumBuckets * 2},
+				{0, coldata.BatchSize() * 2},
 			},
 
 			leftEqCols:   []uint32{1, 2},
@@ -629,8 +630,8 @@ func init() {
 			rightEqColsAreKey: true,
 
 			expected: tuples{
-				{20, 0, HashTableNumBuckets},
-				{70, HashTableNumBuckets * 2, HashTableNumBuckets},
+				{20, 0, coldata.BatchSize()},
+				{70, coldata.BatchSize() * 2, coldata.BatchSize()},
 				{10, 0, 0},
 			},
 		},
@@ -1075,7 +1076,7 @@ func BenchmarkHashJoiner(b *testing.B) {
 										)
 										require.NoError(b, err)
 										hj := NewHashJoiner(
-											testAllocator, hjSpec,
+											testAllocator, testAllocator, hjSpec,
 											leftSource, rightSource,
 										)
 										hj.Init()

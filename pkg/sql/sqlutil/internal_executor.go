@@ -14,9 +14,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // InternalExecutor is meant to be used by layers below SQL in the system that
@@ -45,7 +45,7 @@ type InternalExecutor interface {
 		ctx context.Context,
 		opName string,
 		txn *kv.Txn,
-		o sqlbase.InternalExecutorSessionDataOverride,
+		o sessiondata.InternalExecutorOverride,
 		stmt string,
 		qargs ...interface{},
 	) (int, error)
@@ -71,7 +71,7 @@ type InternalExecutor interface {
 		ctx context.Context,
 		opName string,
 		txn *kv.Txn,
-		session sqlbase.InternalExecutorSessionDataOverride,
+		session sessiondata.InternalExecutorOverride,
 		stmt string,
 		qargs ...interface{},
 	) ([]tree.Datums, error)
@@ -80,8 +80,8 @@ type InternalExecutor interface {
 	// of the input query.
 	QueryWithCols(
 		ctx context.Context, opName string, txn *kv.Txn,
-		o sqlbase.InternalExecutorSessionDataOverride, statement string, qargs ...interface{},
-	) ([]tree.Datums, sqlbase.ResultColumns, error)
+		o sessiondata.InternalExecutorOverride, statement string, qargs ...interface{},
+	) ([]tree.Datums, colinfo.ResultColumns, error)
 
 	// QueryRow is like Query, except it returns a single row, or nil if not row is
 	// found, or an error if more that one row is returned.
@@ -100,7 +100,7 @@ type InternalExecutor interface {
 		ctx context.Context,
 		opName string,
 		txn *kv.Txn,
-		session sqlbase.InternalExecutorSessionDataOverride,
+		session sessiondata.InternalExecutorOverride,
 		stmt string,
 		qargs ...interface{},
 	) (tree.Datums, error)

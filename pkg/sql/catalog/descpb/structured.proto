@@ -113,8 +113,8 @@ message ColumnDescriptor {
   // Default expression to use to populate the column on insert if no
   // value is provided. Note that it is not correct to use DefaultExpr
   // as output to display to a user. User defined types within DefaultExpr
-  // have been serialized in a internal format. Instead, format the result
-  // of DeserializeTableDescExpr.
+  // have been serialized in a internal format. Instead, use one of the
+  // schemaexpr.FormatExpr* functions.
   optional string default_expr = 5;
   reserved 9;
   optional bool hidden = 6 [(gogoproto.nullable) = false];
@@ -126,8 +126,8 @@ message ColumnDescriptor {
   // Expression to use to compute the value of this column if this is a
   // computed column. Note that it is not correct to use ComputeExpr
   // as output to display to a user. User defined types within ComputeExpr
-  // have been serialized in a internal format. Instead, format the result
-  // of DeserializeTableDescExpr.
+  // have been serialized in a internal format. Instead, use one of the
+  // schemaexpr.FormatExpr* functions.
   optional string compute_expr = 11;
   // PGAttributeNum must be accessed through the accessor, since it is set
   // lazily, it is incorrect to access it directly.
@@ -152,6 +152,8 @@ enum SystemColumnKind {
   // A system column containing the value of the MVCC timestamp associated
   // with the kv's corresponding to the row.
   MVCCTIMESTAMP = 1;
+  // A system column containing the OID of the table that the row came from.
+  TABLEOID = 2;
 }
 
 // ColumnFamilyDescriptor is set of columns stored together in one kv entry.
@@ -551,6 +553,11 @@ message MaterializedViewRefresh {
   repeated IndexDescriptor new_indexes = 2 [(gogoproto.nullable) = false];
   // AsOf is the timestamp to perform the view query at.
   optional util.hlc.Timestamp as_of = 3 [(gogoproto.nullable) = false];
+  // ShouldBackfill indicates whether or not the schema changer should backfill
+  // the query into the new indexes. This can be false if the `WITH NO DATA` flag
+  // was specified for the `REFRESH MATERIALIZED VIEW` statement. `WITH NO DATA`
+  // indicates that the user just wants the space used by the view to be reclaimed.
+  optional bool should_backfill = 4 [(gogoproto.nullable) = false];
 }
 
 // A DescriptorMutation represents a column or an index that
@@ -707,6 +714,23 @@ message NameInfo {
   optional string name = 2 [(gogoproto.nullable) = false];
 }
 
+// State indicates whether a descriptor is public (i.e., normally visible,
+// resolvable, etc.) or in some other state subject to restrictions.
+// A non-public table descriptor cannot be leased.
+// A schema changer observing DROP set will truncate the table and delete the
+// descriptor.
+// It is illegal to transition DROP to any other state.
+enum DescriptorState {
+  // Descriptor is visible and can be leased.
+  PUBLIC = 0;
+  // Descriptor is being added.
+  ADD = 1;
+  // Descriptor is being dropped.
+  DROP = 2;
+  // Descriptor is offline (e.g. for bulk-ingestion). See offline_reason.
+  OFFLINE = 3;
+}
+
 // A TableDescriptor represents a table or view and is stored in a
 // structured metadata key. The TableDescriptor has a globally-unique ID,
 // while its member {Column,Index}Descriptors have locally-unique IDs.
@@ -819,22 +843,7 @@ message TableDescriptor {
 
   reserved 18;
 
-  // State is set if this TableDescriptor is in the process of being added or deleted.
-  // A non-public table descriptor cannot be leased.
-  // A schema changer observing DROP set will truncate the table and delete the
-  // descriptor.
-  // It is illegal to transition DROP to any other state.
-  enum State {
-    // Not used.
-    PUBLIC = 0;
-    // Descriptor is being added.
-    ADD = 1;
-    // Descriptor is being dropped.
-    DROP = 2;
-    // Descriptor is offline (e.g. for bulk-ingestion). See offline_reason.
-    OFFLINE = 3;
-  }
-  optional State state = 19 [(gogoproto.nullable) = false];
+  optional DescriptorState state = 19 [(gogoproto.nullable) = false];
   optional string offline_reason = 38 [(gogoproto.nullable) = false];
 
   message CheckConstraint {
@@ -842,8 +851,8 @@ message TableDescriptor {
     // Expr is the expression that this check constraint represents.
     // Note that it is not correct to use Expr as output to display
     // to a user. User defined types within Expr have been serialized
-    // in a internal format. Instead, format the result of
-    // DeserializeTableDescExpr.
+    // in a internal format. Instead, use one of the schemaexpr.FormatExpr*
+    // functions.
     optional string expr = 1 [(gogoproto.nullable) = false];
     optional string name = 2 [(gogoproto.nullable) = false];
     optional ConstraintValidity validity = 3 [(gogoproto.nullable) = false];
@@ -1073,6 +1082,9 @@ message DatabaseDescriptor {
   // name resolution to know without a KV lookup whether a database has a
   // child schema with a target name. Temporary schemas are not stored here.
   map<string, SchemaInfo> schemas = 7 [(gogoproto.nullable) = false];
+
+  optional DescriptorState state = 8 [(gogoproto.nullable) = false];
+  optional string offline_reason = 9 [(gogoproto.nullable) = false];
 }
 
 // TypeDescriptor represents a user defined type and is stored in a structured
@@ -1097,6 +1109,8 @@ message TypeDescriptor {
   optional util.hlc.Timestamp modification_time = 10 [(gogoproto.nullable) = false];
   repeated NameInfo draining_names = 11 [(gogoproto.nullable) = false];
 
+  // privileges contains the privileges for the type.
+  optional PrivilegeDescriptor privileges = 14;
 
   // Fields that are shared among all kinds of user defined types.
 
@@ -1114,12 +1128,8 @@ message TypeDescriptor {
   optional uint32 array_type_id = 8
     [(gogoproto.nullable) = false, (gogoproto.customname) = "ArrayTypeID", (gogoproto.casttype) = "ID"];
 
-  // State is set if this TypeDescriptor is in the process of being deleted.
-  enum State {
-    PUBLIC = 0;
-    DROP = 1;
-  }
-  optional State state = 13 [(gogoproto.nullable) = false];
+  optional DescriptorState state = 13 [(gogoproto.nullable) = false];
+  optional string offline_reason = 15 [(gogoproto.nullable) = false];
 
   // Represents the kind of type that this type descriptor represents.
   enum Kind {
@@ -1162,7 +1172,6 @@ message TypeDescriptor {
 
   // alias is the types.T that this descriptor is an alias for.
   optional sql.sem.types.T alias = 7;
-
 }
 
 // SchemaDescriptor represents a physical schema and is stored in a structured
@@ -1180,6 +1189,9 @@ message SchemaDescriptor {
   // id is the schema ID, globally unique across all descriptors.
   optional uint32 id = 3
   [(gogoproto.nullable) = false, (gogoproto.customname) = "ID", (gogoproto.casttype) = "ID"];
+
+  optional DescriptorState state = 8 [(gogoproto.nullable) = false];
+  optional string offline_reason = 9 [(gogoproto.nullable) = false];
 
   // Last modification time of the descriptor.
   optional util.hlc.Timestamp modification_time = 5 [(gogoproto.nullable) = false];

@@ -63,7 +63,7 @@ func (b *indexScanBuilder) primaryKeyCols() opt.ColSet {
 	if b.pkCols.Empty() {
 		primaryIndex := b.c.e.mem.Metadata().Table(b.tabID).Index(cat.PrimaryIndex)
 		for i, cnt := 0, primaryIndex.KeyColumnCount(); i < cnt; i++ {
-			b.pkCols.Add(b.tabID.ColumnID(primaryIndex.Column(i).Ordinal))
+			b.pkCols.Add(b.tabID.IndexColumnID(primaryIndex, i))
 		}
 	}
 	return b.pkCols
@@ -83,7 +83,9 @@ func (b *indexScanBuilder) setScan(scanPrivate *memo.ScanPrivate) {
 // addInvertedFilter wraps the input expression with an InvertedFilter
 // expression having the given span expression.
 func (b *indexScanBuilder) addInvertedFilter(
-	spanExpr *invertedexpr.SpanExpression, invertedCol opt.ColumnID,
+	spanExpr *invertedexpr.SpanExpression,
+	pfState *invertedexpr.PreFiltererStateForInvertedFilterer,
+	invertedCol opt.ColumnID,
 ) {
 	if spanExpr != nil {
 		if b.invertedFilterPrivate.InvertedColumn != 0 {
@@ -94,6 +96,7 @@ func (b *indexScanBuilder) addInvertedFilter(
 		}
 		b.invertedFilterPrivate = memo.InvertedFilterPrivate{
 			InvertedExpression: spanExpr,
+			PreFiltererState:   pfState,
 			InvertedColumn:     invertedCol,
 		}
 	}

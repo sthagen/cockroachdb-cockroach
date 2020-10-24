@@ -19,6 +19,9 @@ import (
 // IndexOrdinal identifies an index (in the context of a Table).
 type IndexOrdinal = int
 
+// IndexOrdinals identifies a list of indexes (in the context of a Table).
+type IndexOrdinals = []IndexOrdinal
+
 // PrimaryIndex selects the primary index of a table when calling the
 // Table.Index method. Every table is guaranteed to have a unique primary
 // index, even if it meant adding a hidden unique rowid column.
@@ -58,11 +61,6 @@ type Index interface {
 	// implicit system columns, which are placed after all physical columns in
 	// the table.
 	ColumnCount() int
-
-	// Predicate returns the partial index predicate expression and true if the
-	// index is a partial index. If it is not a partial index, the empty string
-	// and false are returned.
-	Predicate() (string, bool)
 
 	// KeyColumnCount returns the number of columns in the index that are part
 	// of its unique key. No two rows in the index will have the same values for
@@ -126,6 +124,15 @@ type Index interface {
 	// Column returns the ith IndexColumn within the index definition, where
 	// i < ColumnCount.
 	Column(i int) IndexColumn
+
+	// VirtualInvertedColumn returns the VirtualInverted IndexColumn of the
+	// index. Panics if the index is not an inverted index.
+	VirtualInvertedColumn() IndexColumn
+
+	// Predicate returns the partial index predicate expression and true if the
+	// index is a partial index. If it is not a partial index, the empty string
+	// and false are returned.
+	Predicate() (string, bool)
 
 	// Zone returns the zone which constrains placement of the index's range
 	// replicas. If the index was not explicitly assigned to a zone, then it
@@ -226,11 +233,7 @@ type Index interface {
 type IndexColumn struct {
 	// Column is a reference to the column returned by Table.Column, given the
 	// column ordinal.
-	Column
-
-	// Ordinal is the ordinal position of the indexed column in the table being
-	// indexed. It is always >= 0 and < Table.ColumnCount.
-	Ordinal int
+	*Column
 
 	// Descending is true if the index is ordered from greatest to least on
 	// this column, rather than least to greatest.

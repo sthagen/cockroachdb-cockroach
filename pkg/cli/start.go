@@ -29,12 +29,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -52,7 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/redact"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
@@ -233,39 +235,6 @@ func initTempStorageConfig(
 	return tempStorageConfig, nil
 }
 
-// Checks if the passed-in engine type is default, and if so, resolves it to
-// the storage engine last used to write to the store at dir (or rocksdb if
-// a store wasn't found).
-func resolveStorageEngineType(
-	ctx context.Context, engineType enginepb.EngineType, cfg base.StorageConfig,
-) enginepb.EngineType {
-	if engineType == enginepb.EngineTypeDefault {
-		engineType = enginepb.EngineTypePebble
-		pebbleCfg := &storage.PebbleConfig{
-			StorageConfig: cfg,
-			Opts:          storage.DefaultPebbleOptions(),
-		}
-		pebbleCfg.Opts.EnsureDefaults()
-		pebbleCfg.Opts.ReadOnly = true
-		// Resolve encrypted env options in pebbleCfg and populate pebbleCfg.Opts.FS
-		// if necessary (eg. encrypted-at-rest is enabled).
-		_, _, err := storage.ResolveEncryptedEnvOptions(pebbleCfg)
-		if err != nil {
-			log.Infof(ctx, "unable to setup encrypted env to resolve past engine type: %s", err)
-			return engineType
-		}
-
-		// Check if this storage directory was last written to by rocksdb. In that
-		// case, default to opening a RocksDB engine.
-		if version, err := pebble.GetVersion(cfg.Dir, pebbleCfg.Opts.FS); err == nil {
-			if strings.HasPrefix(version, "rocksdb") {
-				engineType = enginepb.EngineTypeRocksDB
-			}
-		}
-	}
-	return engineType
-}
-
 var errCannotUseJoin = errors.New("cannot use --join with 'cockroach start-single-node' -- use 'cockroach start' instead")
 
 func runStartSingleNode(cmd *cobra.Command, args []string) error {
@@ -281,11 +250,11 @@ func runStartSingleNode(cmd *cobra.Command, args []string) error {
 	// Make the node auto-init the cluster if not done already.
 	serverCfg.AutoInitializeCluster = true
 
-	return runStart(cmd, args, true /*disableReplication*/)
+	return runStart(cmd, args, true /*startSingleNode*/)
 }
 
 func runStartJoin(cmd *cobra.Command, args []string) error {
-	return runStart(cmd, args, false /*disableReplication*/)
+	return runStart(cmd, args, false /*startSingleNode*/)
 }
 
 // runStart starts the cockroach node using --store as the list of
@@ -293,9 +262,9 @@ func runStartJoin(cmd *cobra.Command, args []string) error {
 // of other active nodes used to join this node to the cockroach
 // cluster, if this is its first time connecting.
 //
-// If the argument disableReplication is set the replication factor
-// will be set to 1 all zone configs.
-func runStart(cmd *cobra.Command, args []string, disableReplication bool) error {
+// If the argument startSingleNode is set the replication factor
+// will be set to 1 all zone configs (see initial_sql.go).
+func runStart(cmd *cobra.Command, args []string, startSingleNode bool) error {
 	tBegin := timeutil.Now()
 
 	// First things first: if the user wants background processing,
@@ -400,21 +369,6 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 		return err
 	}
 
-	// Build a minimal StorageConfig out of the first store's spec, with enough
-	// attributes to be able to read encrypted-at-rest store directories.
-	firstSpec := serverCfg.Stores.Specs[0]
-	firstStoreConfig := base.StorageConfig{
-		Attrs:           firstSpec.Attributes,
-		Dir:             firstSpec.Path,
-		Settings:        serverCfg.Settings,
-		UseFileRegistry: firstSpec.UseFileRegistry,
-		ExtraOptions:    firstSpec.ExtraOptions,
-	}
-	// If the storage engine is set to "default", check the engine type used in
-	// this store directory in a past run. If this check fails for any reason,
-	// use Pebble as the default engine type.
-	serverCfg.StorageEngine = resolveStorageEngineType(ctx, serverCfg.StorageEngine, firstStoreConfig)
-
 	// Next we initialize the target directory for temporary storage.
 	// If encryption at rest is enabled in any fashion, we'll want temp
 	// storage to be encrypted too. To achieve this, we use
@@ -431,6 +385,10 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 		ctx, serverCfg.Settings, stopper, serverCfg.Stores.Specs[specIdx],
 	); err != nil {
 		return err
+	}
+
+	if serverCfg.StorageEngine == enginepb.EngineTypeDefault {
+		serverCfg.StorageEngine = enginepb.EngineTypePebble
 	}
 
 	// Initialize the node's configuration from startup parameters.
@@ -485,7 +443,7 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 			// (Re-)compute the client connection URL. We cannot do this
 			// earlier (e.g. above, in the runStart function) because
 			// at this time the address and port have not been resolved yet.
-			sCtx := rpc.MakeSecurityContext(serverCfg.Config, roachpb.SystemTenantID)
+			sCtx := rpc.MakeSecurityContext(serverCfg.Config, security.ClusterTLSSettings(serverCfg.Settings), roachpb.SystemTenantID)
 			pgURL, err := sCtx.PGURL(url.User(security.RootUser))
 			if err != nil {
 				log.Errorf(ctx, "failed computing the URL: %v", err)
@@ -499,7 +457,7 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 
 		if waitForInit {
 			log.Shout(ctx, log.Severity_INFO,
-				"initial startup completed.\n"+
+				"initial startup completed\n"+
 					"Node will now attempt to join a running cluster, or wait for `cockroach init`.\n"+
 					"Client connections will be accepted after this completes successfully.\n"+
 					"Check the log file(s) for progress. ")
@@ -527,7 +485,7 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 - running the 'cockroach init' command if you are trying to initialize a new cluster.
 
 If problems persist, please see %s.`
-		docLink := base.DocsURL("cluster-setup-troubleshooting.html")
+		docLink := docs.URL("cluster-setup-troubleshooting.html")
 		if !startCtx.inBackground {
 			log.Shoutf(context.Background(), log.Severity_WARNING, msg, docLink)
 		} else {
@@ -541,7 +499,7 @@ If problems persist, please see %s.`
 	// We need to make sure this happens before any queries involving geospatial data is executed.
 	loc, err := geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, startCtx.geoLibsDir)
 	if err != nil {
-		log.Infof(ctx, "could not initialize GEOS - geospatial functions may not be available: %v", err)
+		log.Infof(ctx, "could not initialize GEOS - spatial functions may not be available: %v", err)
 	} else {
 		log.Infof(ctx, "GEOS loaded from directory %s", loc)
 	}
@@ -607,7 +565,7 @@ If problems persist, please see %s.`
 			}
 
 			// Attempt to start the server.
-			if err := s.Start(ctx); err != nil {
+			if err := s.PreStart(ctx); err != nil {
 				if le := (*server.ListenError)(nil); errors.As(err, &le) {
 					const errorPrefix = "consider changing the port via --%s"
 					if le.Addr == serverCfg.Addr {
@@ -630,97 +588,96 @@ If problems persist, please see %s.`
 			if !cluster.TelemetryOptOut() {
 				s.PeriodicallyCheckForUpdates(ctx)
 			}
+			initialStart := s.InitialStart()
 
-			initialBoot := s.InitialBoot()
+			// Run SQL for new clusters.
+			// TODO(knz): If/when we want auto-creation of an initial admin user,
+			// this can be achieved here.
+			if _, err := runInitialSQL(ctx, s, startSingleNode, "" /* adminUser */); err != nil {
+				return err
+			}
 
-			if disableReplication && initialBoot {
-				// For start-single-node, set the default replication factor to
-				// 1 so as to avoid warning message and unnecessary rebalance
-				// churn.
-				if err := cliDisableReplication(ctx, s); err != nil {
-					log.Errorf(ctx, "could not disable replication: %v", err)
-					return err
-				}
-				log.Shout(ctx, log.Severity_INFO,
-					"Replication was disabled for this cluster.\n"+
-						"When/if adding nodes in the future, update zone configurations to increase the replication factor.")
+			// Now let SQL clients in.
+			if err := s.AcceptClients(ctx); err != nil {
+				return err
 			}
 
 			// Now inform the user that the server is running and tell the
 			// user about its run-time derived parameters.
-			var buf bytes.Buffer
+			var buf redact.StringBuilder
 			info := build.GetInfo()
-			tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
-			fmt.Fprintf(tw, "CockroachDB node starting at %s (took %0.1fs)\n", timeutil.Now(), timeutil.Since(tBegin).Seconds())
-			fmt.Fprintf(tw, "build:\t%s %s @ %s (%s)\n", info.Distribution, info.Tag, info.Time, info.GoVersion)
-			fmt.Fprintf(tw, "webui:\t%s\n", serverCfg.AdminURL())
+			buf.Printf("CockroachDB node starting at %s (took %0.1fs)\n", timeutil.Now(), timeutil.Since(tBegin).Seconds())
+			buf.Printf("build:\t%s %s @ %s (%s)\n",
+				redact.Safe(info.Distribution), redact.Safe(info.Tag), redact.Safe(info.Time), redact.Safe(info.GoVersion))
+			buf.Printf("webui:\t%s\n", serverCfg.AdminURL())
 
 			// (Re-)compute the client connection URL. We cannot do this
 			// earlier (e.g. above, in the runStart function) because
 			// at this time the address and port have not been resolved yet.
-			sCtx := rpc.MakeSecurityContext(serverCfg.Config, roachpb.SystemTenantID)
+			sCtx := rpc.MakeSecurityContext(serverCfg.Config, security.ClusterTLSSettings(serverCfg.Settings), roachpb.SystemTenantID)
 			pgURL, err := sCtx.PGURL(url.User(security.RootUser))
 			if err != nil {
 				log.Errorf(ctx, "failed computing the URL: %v", err)
 				return err
 			}
-			fmt.Fprintf(tw, "sql:\t%s\n", pgURL)
+			buf.Printf("sql:\t%s\n", pgURL)
 
-			fmt.Fprintf(tw, "RPC client flags:\t%s\n", clientFlagsRPC())
+			buf.Printf("RPC client flags:\t%s\n", clientFlagsRPC())
 			if len(serverCfg.SocketFile) != 0 {
-				fmt.Fprintf(tw, "socket:\t%s\n", serverCfg.SocketFile)
+				buf.Printf("socket:\t%s\n", serverCfg.SocketFile)
 			}
-			fmt.Fprintf(tw, "logs:\t%s\n", flag.Lookup("log-dir").Value)
+			buf.Printf("logs:\t%s\n", flag.Lookup("log-dir").Value)
 			if serverCfg.AuditLogDirName.IsSet() {
-				fmt.Fprintf(tw, "SQL audit logs:\t%s\n", serverCfg.AuditLogDirName)
+				buf.Printf("SQL audit logs:\t%s\n", serverCfg.AuditLogDirName)
 			}
 			if serverCfg.Attrs != "" {
-				fmt.Fprintf(tw, "attrs:\t%s\n", serverCfg.Attrs)
+				buf.Printf("attrs:\t%s\n", serverCfg.Attrs)
 			}
 			if len(serverCfg.Locality.Tiers) > 0 {
-				fmt.Fprintf(tw, "locality:\t%s\n", serverCfg.Locality)
+				buf.Printf("locality:\t%s\n", serverCfg.Locality)
 			}
 			if s.TempDir() != "" {
-				fmt.Fprintf(tw, "temp dir:\t%s\n", s.TempDir())
+				buf.Printf("temp dir:\t%s\n", s.TempDir())
 			}
 			if ext := s.ClusterSettings().ExternalIODir; ext != "" {
-				fmt.Fprintf(tw, "external I/O path: \t%s\n", ext)
+				buf.Printf("external I/O path: \t%s\n", ext)
 			} else {
-				fmt.Fprintf(tw, "external I/O path: \t<disabled>\n")
+				buf.Printf("external I/O path: \t<disabled>\n")
 			}
 			for i, spec := range serverCfg.Stores.Specs {
-				fmt.Fprintf(tw, "store[%d]:\t%s\n", i, spec)
+				buf.Printf("store[%d]:\t%s\n", i, spec)
 			}
-			fmt.Fprintf(tw, "storage engine: \t%s\n", serverCfg.StorageEngine.String())
+			buf.Printf("storage engine: \t%s\n", &serverCfg.StorageEngine)
 			nodeID := s.NodeID()
-			if initialBoot {
+			if initialStart {
 				if nodeID == server.FirstNodeID {
-					fmt.Fprintf(tw, "status:\tinitialized new cluster\n")
+					buf.Printf("status:\tinitialized new cluster\n")
 				} else {
-					fmt.Fprintf(tw, "status:\tinitialized new node, joined pre-existing cluster\n")
+					buf.Printf("status:\tinitialized new node, joined pre-existing cluster\n")
 				}
 			} else {
-				fmt.Fprintf(tw, "status:\trestarted pre-existing node\n")
+				buf.Printf("status:\trestarted pre-existing node\n")
 			}
 
 			if baseCfg.ClusterName != "" {
-				fmt.Fprintf(tw, "cluster name:\t%s\n", baseCfg.ClusterName)
+				buf.Printf("cluster name:\t%s\n", baseCfg.ClusterName)
 			}
 
 			// Remember the cluster ID for log file rotation.
 			clusterID := s.ClusterID().String()
 			log.SetClusterID(clusterID)
-			fmt.Fprintf(tw, "clusterID:\t%s\n", clusterID)
-			fmt.Fprintf(tw, "nodeID:\t%d\n", nodeID)
+			buf.Printf("clusterID:\t%s\n", clusterID)
+			buf.Printf("nodeID:\t%d\n", nodeID)
 
 			// Collect the formatted string and show it to the user.
-			if err := tw.Flush(); err != nil {
+			msg, err := expandTabsInRedactableBytes(buf.RedactableBytes())
+			if err != nil {
 				return err
 			}
-			msg := buf.String()
-			log.Infof(ctx, "node startup completed:\n%s", msg)
+			msgS := msg.ToString()
+			log.Infof(ctx, "node startup completed:\n%s", msgS)
 			if !startCtx.inBackground && !log.LoggingToStderr(log.Severity_INFO) {
-				fmt.Print(msg)
+				fmt.Print(msgS.StripMarkers())
 			}
 
 			return nil
@@ -921,6 +878,22 @@ If problems persist, please see %s.`
 	return returnErr
 }
 
+// expandTabsInRedactableBytes expands tabs in the redactable byte
+// slice, so that columns are aligned. The correctness of this
+// function depends on the assumption that the `tabwriter` does not
+// replace characters.
+func expandTabsInRedactableBytes(s redact.RedactableBytes) (redact.RedactableBytes, error) {
+	var buf bytes.Buffer
+	tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
+	if _, err := tw.Write([]byte(s)); err != nil {
+		return nil, err
+	}
+	if err := tw.Flush(); err != nil {
+		return nil, err
+	}
+	return redact.RedactableBytes(buf.Bytes()), nil
+}
+
 func hintServerCmdFlags(ctx context.Context, cmd *cobra.Command) {
 	pf := flagSetForCmd(cmd)
 
@@ -1027,7 +1000,7 @@ func logOutputDirectory() string {
 // setupAndInitializeLoggingAndProfiling does what it says on the label.
 // Prior to this however it determines suitable defaults for the
 // logging output directory and the verbosity level of stderr logging.
-// We only do this for the "start" command which is why this work
+// We only do this for the "start" and "start-sql" commands which is why this work
 // occurs here and not in an OnInitialize function.
 func setupAndInitializeLoggingAndProfiling(
 	ctx context.Context, cmd *cobra.Command,
@@ -1036,11 +1009,13 @@ func setupAndInitializeLoggingAndProfiling(
 		panic(errors.Newf("logging already active; first used at:\n%s", firstUse))
 	}
 
+	fl := flagSetForCmd(cmd)
+
 	// Default the log directory to the "logs" subdirectory of the first
 	// non-memory store. If more than one non-memory stores is detected,
 	// print a warning.
 	ambiguousLogDirs := false
-	lf := cmd.Flags().Lookup(logflags.LogDirName)
+	lf := fl.Lookup(cliflags.LogDir.Name)
 	if !startCtx.logDir.IsSet() && !lf.Changed {
 		// We only override the log directory if the user has not explicitly
 		// disabled file logging using --log-dir="".
@@ -1055,13 +1030,14 @@ func setupAndInitializeLoggingAndProfiling(
 			}
 			newDir = filepath.Join(spec.Path, "logs")
 		}
+
 		if err := startCtx.logDir.Set(newDir); err != nil {
 			return nil, err
 		}
 	}
 
-	if logDir := startCtx.logDir.String(); logDir != "" {
-		ls := cockroachCmd.PersistentFlags().Lookup(logflags.LogToStderrName)
+	if logDir := logOutputDirectory(); logDir != "" {
+		ls := fl.Lookup(logflags.LogToStderrName)
 		if !ls.Changed {
 			// Unless the settings were overridden by the user, silence
 			// logging to stderr because the messages will go to a log file.
@@ -1081,8 +1057,19 @@ func setupAndInitializeLoggingAndProfiling(
 		// creating a file in an incorrect log directory or if something is
 		// accidentally logging after flag parsing but before the --background
 		// dispatch has occurred.
+		// Note: this uses flag.Lookup() and not fl.Lookup() because we want
+		// to get the original flag set up by the logging package.
 		if err := flag.Lookup(logflags.LogDirName).Value.Set(logDir); err != nil {
 			return nil, err
+		}
+
+		// Enable redactable logs if no other instruction given by the
+		// user. We do this only if we have a logging directory, because
+		// it's not safe to enable redaction markers on stderr.
+		if rl := fl.Lookup(logflags.RedactableLogsName); !rl.Changed {
+			if err := rl.Value.Set("true"); err != nil {
+				return nil, err
+			}
 		}
 
 		// Start the log file GC daemon to remove files that make the log
@@ -1095,7 +1082,6 @@ func setupAndInitializeLoggingAndProfiling(
 				// for the storage engines. We need to do this at the end
 				// because we need to register the loggers.
 				stopper.AddCloser(storage.InitPebbleLogger(ctx))
-				stopper.AddCloser(storage.InitRocksDBLogger(ctx))
 			}
 		}()
 	}
@@ -1106,6 +1092,13 @@ func setupAndInitializeLoggingAndProfiling(
 	// is valid.
 	if _, err := log.SetupRedactionAndStderrRedirects(); err != nil {
 		return nil, err
+	}
+
+	// Record redaction usage for telemetry.
+	if log.RedactableLogsEnabled() {
+		telemetry.Count("server.logging.redactable_logs.enabled")
+	} else {
+		telemetry.Count("server.logging.redactable_logs.disabled")
 	}
 
 	// We want to be careful to still produce useful debug dumps if the
@@ -1138,16 +1131,26 @@ func setupAndInitializeLoggingAndProfiling(
 		// particularly to new users (made worse by it always printing as [n?]).
 		addr := startCtx.serverListenAddr
 		if addr == "" {
-			addr = "<all your IP addresses>"
+			addr = "any of your IP addresses"
 		}
 		log.Shoutf(context.Background(), log.Severity_WARNING,
-			"RUNNING IN INSECURE MODE!\n\n"+
-				"- Your cluster is open for any client that can access %s.\n"+
-				"- Any user, even root, can log in without providing a password.\n"+
-				"- Any user, connecting as root, can read or write any data in your cluster.\n"+
-				"- There is no network encryption nor authentication, and thus no confidentiality.\n\n"+
-				"Check out how to secure your cluster: %s",
-			addr, log.Safe(base.DocsURL("secure-a-cluster.html")))
+			"ALL SECURITY CONTROLS HAVE BEEN DISABLED!\n\n"+
+				"This mode is intended for non-production testing only.\n"+
+				"\n"+
+				"In this mode:\n"+
+				"- Your cluster is open to any client that can access %s.\n"+
+				"- Intruders with access to your machine or network can observe client-server traffic.\n"+
+				"- Intruders can log in without password and read or write any data in the cluster.\n"+
+				"- Intruders can consume all your server's resources and cause unavailability.",
+			addr)
+		log.Shoutf(context.Background(), log.Severity_INFO,
+			"To start a secure server without mandating TLS for clients,\n"+
+				"consider --accept-sql-without-tls instead. For other options, see:\n\n"+
+				"- %s\n"+
+				"- %s",
+			unimplemented.MakeURL(53404),
+			log.Safe(docs.URL("secure-a-cluster.html")),
+		)
 	}
 
 	maybeWarnMemorySizes(ctx)

@@ -14,29 +14,54 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/errors"
 	pbtypes "github.com/gogo/protobuf/types"
 )
 
-type scheduledBackupExecutor struct{}
+type scheduledBackupExecutor struct {
+	metrics backupMetrics
+}
+
+type backupMetrics struct {
+	jobs.ExecutorMetrics
+	rpoMetric *metric.Gauge
+}
+
+var _ metric.Struct = &backupMetrics{}
+
+// MetricStruct implements metric.Struct interface
+func (m *backupMetrics) MetricStruct() {}
 
 var _ jobs.ScheduledJobExecutor = &scheduledBackupExecutor{}
 
 // ExecuteJob implements jobs.ScheduledJobExecutor interface.
-func (se *scheduledBackupExecutor) ExecuteJob(
+func (e *scheduledBackupExecutor) ExecuteJob(
 	ctx context.Context,
 	cfg *scheduledjobs.JobExecutionConfig,
 	env scheduledjobs.JobSchedulerEnv,
 	sj *jobs.ScheduledJob,
 	txn *kv.Txn,
+) error {
+	if err := e.executeBackup(ctx, cfg, sj, txn); err != nil {
+		e.metrics.NumFailed.Inc(1)
+		return err
+	}
+	e.metrics.NumStarted.Inc(1)
+	return nil
+}
+
+func (e *scheduledBackupExecutor) executeBackup(
+	ctx context.Context, cfg *scheduledjobs.JobExecutionConfig, sj *jobs.ScheduledJob, txn *kv.Txn,
 ) error {
 	backupStmt, err := extractBackupStatement(sj)
 	if err != nil {
@@ -70,22 +95,20 @@ func (se *scheduledBackupExecutor) ExecuteJob(
 		}
 	}
 
+	log.Infof(ctx, "Starting scheduled backup %d: %s",
+		sj.ScheduleID(), tree.AsString(backupStmt))
+
 	// Invoke backup plan hook.
-	// TODO(yevgeniy): Invoke backup as the owner of the schedule.
-	hook, cleanup := cfg.PlanHookMaker("exec-backup", txn, security.RootUser)
+	hook, cleanup := cfg.PlanHookMaker("exec-backup", txn, sj.Owner())
 	defer cleanup()
-	planBackup, cols, _, _, err := backupPlanHook(ctx, backupStmt, hook.(sql.PlanHookState))
-
+	backupFn, err := planBackup(ctx, hook.(sql.PlanHookState), backupStmt)
 	if err != nil {
-		return errors.Wrapf(err, "backup eval: %q", tree.AsString(backupStmt))
+		return err
 	}
-	if planBackup == nil {
-		return errors.Newf("backup eval: %q", tree.AsString(backupStmt))
-	}
-	if len(cols) != len(utilccl.DetachedJobExecutionResultHeader) {
-		return errors.Newf("unexpected result columns")
-	}
+	return invokeBackup(ctx, backupFn)
+}
 
+func invokeBackup(ctx context.Context, backupFn sql.PlanHookRowFn) error {
 	resultCh := make(chan tree.Datums) // No need to close
 	g := ctxgroup.WithContext(ctx)
 
@@ -99,24 +122,109 @@ func (se *scheduledBackupExecutor) ExecuteJob(
 	})
 
 	g.GoCtx(func(ctx context.Context) error {
-		if err := planBackup(ctx, nil, resultCh); err != nil {
-			return errors.Wrapf(err, "backup planning error: %q", tree.AsString(backupStmt))
-		}
-		return nil
+		return backupFn(ctx, nil, resultCh)
 	})
 
-	if err := g.Wait(); err != nil {
+	return g.Wait()
+}
+
+func planBackup(
+	ctx context.Context, p sql.PlanHookState, backupStmt tree.Statement,
+) (sql.PlanHookRowFn, error) {
+	fn, cols, _, _, err := backupPlanHook(ctx, backupStmt, p)
+
+	if err != nil {
+		return nil, errors.Wrapf(err, "backup eval: %q", tree.AsString(backupStmt))
+	}
+	if fn == nil {
+		return nil, errors.Newf("backup eval: %q", tree.AsString(backupStmt))
+	}
+	if len(cols) != len(utilccl.DetachedJobExecutionResultHeader) {
+		return nil, errors.Newf("unexpected result columns")
+	}
+	return fn, nil
+}
+
+// NotifyJobTermination implements jobs.ScheduledJobExecutor interface.
+func (e *scheduledBackupExecutor) NotifyJobTermination(
+	ctx context.Context,
+	jobID int64,
+	jobStatus jobs.Status,
+	details jobspb.Details,
+	env scheduledjobs.JobSchedulerEnv,
+	schedule *jobs.ScheduledJob,
+	ex sqlutil.InternalExecutor,
+	txn *kv.Txn,
+) error {
+	if jobStatus == jobs.StatusSucceeded {
+		e.metrics.NumSucceeded.Inc(1)
+		log.Infof(ctx, "backup job %d scheduled by %d succeeded", jobID, schedule.ScheduleID())
+		return e.backupSucceeded(ctx, schedule, details, env, ex, txn)
+	}
+
+	e.metrics.NumFailed.Inc(1)
+	err := errors.Errorf(
+		"backup job %d scheduled by %d failed with status %s",
+		jobID, schedule.ScheduleID(), jobStatus)
+	log.Errorf(ctx, "backup error: %v	", err)
+	jobs.DefaultHandleFailedRun(schedule, "backup job %d failed with err=%v", jobID, err)
+	return nil
+}
+
+func (e *scheduledBackupExecutor) backupSucceeded(
+	ctx context.Context,
+	schedule *jobs.ScheduledJob,
+	details jobspb.Details,
+	env scheduledjobs.JobSchedulerEnv,
+	ex sqlutil.InternalExecutor,
+	txn *kv.Txn,
+) error {
+	args := &ScheduledBackupExecutionArgs{}
+	if err := pbtypes.UnmarshalAny(schedule.ExecutionArgs().Args, args); err != nil {
+		return errors.Wrap(err, "un-marshaling args")
+	}
+
+	// If this schedule is designated as maintaining the "LastBackup" metric used
+	// for monitoring an RPO SLA, update that metric.
+	if args.UpdatesLastBackupMetric {
+		e.metrics.rpoMetric.Update(details.(jobspb.BackupDetails).EndTime.GoTime().Unix())
+	}
+
+	if args.UnpauseOnSuccess == jobs.InvalidScheduleID {
+		return nil
+	}
+
+	s, err := jobs.LoadScheduledJob(ctx, env, args.UnpauseOnSuccess, ex, txn)
+	if err != nil {
 		return err
 	}
+	s.ClearScheduleStatus()
+	if s.HasRecurringSchedule() {
+		if err := s.ScheduleNextRun(); err != nil {
+			return err
+		}
+	}
+	if err := s.Update(ctx, ex, txn); err != nil {
+		return err
+	}
+
+	// Clear UnpauseOnSuccess; caller updates schedule.
+	args.UnpauseOnSuccess = jobs.InvalidScheduleID
+	any, err := pbtypes.MarshalAny(args)
+	if err != nil {
+		return errors.Wrap(err, "marshaling args")
+	}
+	schedule.SetExecutionDetails(
+		schedule.ExecutorType(),
+		jobspb.ExecutionArguments{Args: any},
+	)
 
 	return nil
 }
 
-// NotifyJobTermination implements jobs.ScheduledJobExecutor interface.
-func (se *scheduledBackupExecutor) NotifyJobTermination(
-	ctx context.Context, jobID int64, jobStatus jobs.Status, schedule *jobs.ScheduledJob, txn *kv.Txn,
-) error {
-	return errors.New("unimplemented yet")
+// Metrics implements ScheduledJobExecutor interface
+func (e *scheduledBackupExecutor) Metrics() metric.Struct {
+	return &e.metrics
 }
 
 // extractBackupStatement returns tree.Backup node encoded inside scheduled job.
@@ -148,6 +256,16 @@ func init() {
 	jobs.RegisterScheduledJobExecutorFactory(
 		tree.ScheduledBackupExecutor.InternalName(),
 		func() (jobs.ScheduledJobExecutor, error) {
-			return &scheduledBackupExecutor{}, nil
+			return &scheduledBackupExecutor{
+				metrics: backupMetrics{
+					ExecutorMetrics: jobs.MakeExecutorMetrics(tree.ScheduledBackupExecutor.UserName()),
+					rpoMetric: metric.NewGauge(metric.Metadata{
+						Name:        "schedules.BACKUP.last-completed-time",
+						Help:        "The unix timestamp of the most recently completed backup by a scehedule specified as maintaining this metric",
+						Measurement: "Jobs",
+						Unit:        metric.Unit_TIMESTAMP_SEC,
+					}),
+				},
+			}, nil
 		})
 }

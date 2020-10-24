@@ -299,6 +299,7 @@ func (tc *TxnCoordSender) initCommonInterceptors(
 		refreshFail:                   tc.metrics.RefreshFail,
 		refreshFailWithCondensedSpans: tc.metrics.RefreshFailWithCondensedSpans,
 		refreshMemoryLimitExceeded:    tc.metrics.RefreshMemoryLimitExceeded,
+		refreshAutoRetries:            tc.metrics.RefreshAutoRetries,
 	}
 	tc.interceptorAlloc.txnLockGatekeeper = txnLockGatekeeper{
 		wrapped:                 tc.wrapped,
@@ -1121,10 +1122,6 @@ func (tc *TxnCoordSender) PrepareRetryableError(ctx context.Context, msg string)
 
 // Step is part of the TxnSender interface.
 func (tc *TxnCoordSender) Step(ctx context.Context) error {
-	if tc.typ != kv.RootTxn {
-		return errors.WithContextTags(
-			errors.AssertionFailedf("cannot call Step() in leaf txn"), ctx)
-	}
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.interceptorAlloc.txnSeqNumAllocator.stepLocked(ctx)
@@ -1134,10 +1131,6 @@ func (tc *TxnCoordSender) Step(ctx context.Context) error {
 func (tc *TxnCoordSender) ConfigureStepping(
 	ctx context.Context, mode kv.SteppingMode,
 ) (prevMode kv.SteppingMode) {
-	if tc.typ != kv.RootTxn {
-		panic(errors.WithContextTags(
-			errors.AssertionFailedf("cannot call ConfigureStepping() in leaf txn"), ctx))
-	}
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.interceptorAlloc.txnSeqNumAllocator.configureSteppingLocked(mode)

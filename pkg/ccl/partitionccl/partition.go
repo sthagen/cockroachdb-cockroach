@@ -15,11 +15,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -67,7 +71,7 @@ func valueEncodePartitionTuple(
 			}
 			// NOT NULL is used to signal that a PartitionSpecialValCode follows.
 			value = encoding.EncodeNotNullValue(value, encoding.NoColumnID)
-			value = encoding.EncodeNonsortingUvarint(value, uint64(sqlbase.PartitionDefaultVal))
+			value = encoding.EncodeNonsortingUvarint(value, uint64(rowenc.PartitionDefaultVal))
 			continue
 		case tree.PartitionMinVal:
 			if typ != tree.PartitionByRange {
@@ -75,7 +79,7 @@ func valueEncodePartitionTuple(
 			}
 			// NOT NULL is used to signal that a PartitionSpecialValCode follows.
 			value = encoding.EncodeNotNullValue(value, encoding.NoColumnID)
-			value = encoding.EncodeNonsortingUvarint(value, uint64(sqlbase.PartitionMinVal))
+			value = encoding.EncodeNonsortingUvarint(value, uint64(rowenc.PartitionMinVal))
 			continue
 		case tree.PartitionMaxVal:
 			if typ != tree.PartitionByRange {
@@ -83,7 +87,7 @@ func valueEncodePartitionTuple(
 			}
 			// NOT NULL is used to signal that a PartitionSpecialValCode follows.
 			value = encoding.EncodeNotNullValue(value, encoding.NoColumnID)
-			value = encoding.EncodeNonsortingUvarint(value, uint64(sqlbase.PartitionMaxVal))
+			value = encoding.EncodeNonsortingUvarint(value, uint64(rowenc.PartitionMaxVal))
 			continue
 		case *tree.Placeholder:
 			return nil, unimplemented.NewWithIssuef(
@@ -93,7 +97,18 @@ func valueEncodePartitionTuple(
 		}
 
 		var semaCtx tree.SemaContext
-		typedExpr, err := sqlbase.SanitizeVarFreeExpr(evalCtx.Context, expr, cols[i].Type, "partition",
+
+		// Disallow partitioning by user-defined types because it causes issues
+		// during table descriptor validation.
+		//
+		// TODO(ajwerner): Fix this limitation by reworking validation in the
+		// descs.Collection to operate on hydrated descriptors.
+		if cols[i].Type.UserDefined() {
+			return nil, errors.UnimplementedError(errors.IssueLink{
+				IssueURL: "https://github.com/cockroachdb/cockroach/issues/55342",
+			}, "partitioning by enum values is not supported")
+		}
+		typedExpr, err := schemaexpr.SanitizeVarFreeExpr(evalCtx.Context, expr, cols[i].Type, "partition",
 			&semaCtx,
 			tree.VolatilityImmutable,
 		)
@@ -108,10 +123,10 @@ func valueEncodePartitionTuple(
 		if err != nil {
 			return nil, errors.Wrapf(err, "evaluating %s", typedExpr)
 		}
-		if err := sqlbase.CheckDatumTypeFitsColumnType(&cols[i], datum.ResolvedType()); err != nil {
+		if err := colinfo.CheckDatumTypeFitsColumnType(&cols[i], datum.ResolvedType()); err != nil {
 			return nil, err
 		}
-		value, err = sqlbase.EncodeTableValue(
+		value, err = rowenc.EncodeTableValue(
 			value, descpb.ColumnID(encoding.NoColumnID), datum, scratch,
 		)
 		if err != nil {
@@ -146,7 +161,7 @@ func (replaceMinMaxValVisitor) VisitPost(expr tree.Expr) tree.Expr { return expr
 func createPartitioningImpl(
 	ctx context.Context,
 	evalCtx *tree.EvalContext,
-	tableDesc *sqlbase.MutableTableDescriptor,
+	tableDesc *tabledesc.Mutable,
 	indexDesc *descpb.IndexDescriptor,
 	partBy *tree.PartitionBy,
 	colOffset int,
@@ -246,7 +261,7 @@ func createPartitioning(
 	ctx context.Context,
 	st *cluster.Settings,
 	evalCtx *tree.EvalContext,
-	tableDesc *sqlbase.MutableTableDescriptor,
+	tableDesc *tabledesc.Mutable,
 	indexDesc *descpb.IndexDescriptor,
 	partBy *tree.PartitionBy,
 ) (descpb.PartitioningDescriptor, error) {
@@ -262,16 +277,18 @@ func createPartitioning(
 // selectPartitionExprs constructs an expression for selecting all rows in the
 // given partitions.
 func selectPartitionExprs(
-	evalCtx *tree.EvalContext, tableDesc sqlbase.TableDescriptor, partNames tree.NameList,
+	evalCtx *tree.EvalContext, tableDesc catalog.TableDescriptor, partNames tree.NameList,
 ) (tree.Expr, error) {
 	exprsByPartName := make(map[string]tree.TypedExpr)
 	for _, partName := range partNames {
 		exprsByPartName[string(partName)] = nil
 	}
 
-	a := &sqlbase.DatumAlloc{}
+	a := &rowenc.DatumAlloc{}
 	var prefixDatums []tree.Datum
-	if err := tableDesc.ForeachNonDropIndex(func(idxDesc *descpb.IndexDescriptor) error {
+	if err := tableDesc.ForeachIndex(catalog.IndexOpts{
+		AddMutations: true,
+	}, func(idxDesc *descpb.IndexDescriptor, _ bool) error {
 		genExpr := true
 		return selectPartitionExprsByName(
 			a, evalCtx, tableDesc, idxDesc, &idxDesc.Partitioning, prefixDatums, exprsByPartName, genExpr)
@@ -324,9 +341,9 @@ func selectPartitionExprs(
 // register itself in the map with a placeholder entry (so we can still verify
 // that the requested partitions are all valid).
 func selectPartitionExprsByName(
-	a *sqlbase.DatumAlloc,
+	a *rowenc.DatumAlloc,
 	evalCtx *tree.EvalContext,
-	tableDesc sqlbase.TableDescriptor,
+	tableDesc catalog.TableDescriptor,
 	idxDesc *descpb.IndexDescriptor,
 	partDesc *descpb.PartitioningDescriptor,
 	prefixDatums tree.Datums,
@@ -383,7 +400,7 @@ func selectPartitionExprsByName(
 
 		for _, l := range partDesc.List {
 			for _, valueEncBuf := range l.Values {
-				t, _, err := sqlbase.DecodePartitionTuple(
+				t, _, err := rowenc.DecodePartitionTuple(
 					a, evalCtx.Codec, tableDesc, idxDesc, partDesc, valueEncBuf, prefixDatums)
 				if err != nil {
 					return err

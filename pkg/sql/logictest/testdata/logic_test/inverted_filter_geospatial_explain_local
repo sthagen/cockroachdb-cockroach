@@ -17,49 +17,115 @@ CREATE TABLE geo_table2(
 query T
 SELECT url FROM [EXPLAIN (DISTSQL) SELECT k FROM geo_table2 WHERE ST_Intersects('POINT(3.0 3.0)'::geometry, geom)]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk0uP2jwUhvffr7DOBpD8DbbDZcarVG2mTcUABaS2mkQoxUc0arBT21RUiP9ehUzFXBpasoh0Lo993tf2Htz3AiTMo1H0ekG2tiC3s8kduY8-TUev4jFpv4nni_mHUYc8tHyrG9Zolj77UqAgH99Fs4g4v8y1R-tw5V27NZ3E40U7uGIkuGKdlpRvo8ldtJh9phW66aRAQRuF42yDDuQ9cEgplNas0Dljq9T-2BCrHUhGIdfl1lfplMLKWAS5B5_7AkHCohpkhplC22VAQaHP8uK47GnOsNp3mWuFO6AwLzPtJOly3hc3gvdZb8AG173BzXDw_x-SQ5JpRQJGjP-K1gGFydZLEnIaBjQUkB4omK0_jeh8tkaQ_ED_XUasf6D1qG7zwqNF2-VPtfyuR7vSEqNJKCRxlQ7ifGa9TCBJgmE_SZhgScLY335AUKsLKZ4Aafai2QhxiRHvTa4fjlM0Hmdp801mfwKF2i_5_Aoyzjh7-V33XsQt-fh-hqJz0tQoKLhE0AxdabTDJ2KaVmaHlAKqNdaPwJmtXeHUmtVxmzqcHLljQqHzdZXXQazrUjXgY5ifhcV5WJyFg2dwevjvVwAAAP__Hi5XNQ==
+https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk9uO0zAQhu95Cmtu2kpmaycgkK_CIQtB3ba0lQCtoyrUQ4lI7WA7KKjqu6Mki7oHpbvNhaU5fPb8vyZ7cL8LELCMJ_G7FalsQS4XsytyHX-dT94kUzJ8nyxXy8-TEblp-dU1bNGsffa9wIB8-RgvYuL8OtcercONd8PBfJZMV8PwgpHwgo0GQnyIZ1fxavGNNuhulAIFbRROsx06ENfAIaVQWrNB54xtUvu2IVE1CEYh12Xlm3RKYWMsgtiDz32BIGDVDLLATKEdM6Cg0Gd50V57nDNq3l3nWmENFJZlpp0gYwlvpax_KClrzqSs2WMHPD-X4RJIphUJGTH-J1oHFGaVFyTiNAppFEB6oGAqfxTofLZFEPxAn25Cov-g9agu88KjRTvmd534X4_r0hKjSRQI4hoXiPOZ9aJVFb56KSULmJSMPXYAQa3OxRoz-t3otyI4x4pPJtc36xD0rkNp811m_wKFzjFxf4UZZ5w9_F6_eBAPxO39joLRUVOvoPAcQQt0pdEO74jpu5kdUgqottj9RM5UdoNzazbtM104a7k2odD5rsq7INFdqRnwNsxPwsFpODgJh_fg9PDsXwAAAP__ozFvZw==
 
 query T
 SELECT url FROM [EXPLAIN (DISTSQL) SELECT k, k_plus_one FROM geo_table2 WHERE ST_Intersects('POINT(3.0 3.0)'::geometry, geom)]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk99v2jAQx9_3V1j3UpC8Yjv8aP2UaUu3TBQYIG1TE6EMn1jUYGe2MzEh_vcppFNLO9jIQ6T78bHve3fegvtRgIRZNIzezkllC3IzHd-Su-jLZPgmHpHWu3g2n30atslDyj0l94uyqNzCaGySV2gWPvtWoCCfP0TTiDi_yLVH63DpXetiMo5H81ZwyUhwydoXUr6PxrfRfPqV1ui6nQIFbRSOsjU6kHfAIaVQWrNE54ytXdt9Qqw2IBmFXJeVr90phaWxCHILPvcFgoR5XcgUM4W2w4CCQp_lxf7YxzrD-t5FrhVugMKszLSTpMN5T1wL3mPdPutfdfvXg_7rvzgHJNOKBIwY_x2tAwrjyksSchoGNBSQ7iiYyj-W6Hy2QpB8R_9fRqx_ovWobvLCo0Xb4Yda_sSjTWmJ0SQUkrhaB3E-s14mkCTBoJckTLAkYexfPyCo1ZkUT4Ac78XxRohzGvHR5PphnOLoOEubrzP7Cyg0_ZLPV5BxxtnL76r7wr6QT_czFO2D-R7VFJyjaYquNNrhgZ5jJ7NdSgHVCpt34ExllzixZrm_pjHHe27vUOh8E-WNEesmVBf4FOYnYXEaFifh4Bmc7l79DgAA__8eQVxP
+https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk11v0zAUhu_5Fda5aSuZ1U5AIF-FjwyCura0lQDNURXqQ4mW2sF2UFDV_46SDG3dlI72wtL5eOzzvj3Zg_tVgIBlPInfrUhlC3K5mF2R6_jrfPImmZLh-2S5Wn6ejMhtyw0lN-uyqNzaaOyat2jWPvteYEC-fIwXMXF-nWuP1uHGu-FgPkumq2F4wUh4wUYDIT7Es6t4tfhGG3Q3SoGCNgqn2Q4diGvgkFIordmgc8Y2qX3bkKgaBKOQ67LyTTqlsDEWQezB575AELBqBllgptCOGVBQ6LO8aK-9mzNq3l3nWmENFJZlpp0gYwlvpax_KClrzqSs2VMHPD-X4RJIphUJGTH-J1oHFGaVFyTiNAppFEB6oGAqfyfQ-WyLIPiB_r8Jif6N1qO6zAuPFu2YHzvxrx7XpSVGkygQxDUuEOcz60WrKnz1UkoWMCkZe-oAglqdizVm9LvRb0VwjhWfTK5v1yHoXYfS5rvM_gEKnWPi4Qozzjh7_Hv94lE8EPf3OwpGR_9wr6bwHE0LdKXRDo_09N3MDikFVFvsviNnKrvBuTWb9pkunLVcm1DofFflXZDortQMeB_mJ-HgNBychMMHcHp49jcAAP__Crh0gQ==
 
 query TTT
 EXPLAIN SELECT k, k_plus_one FROM geo_table2 WHERE ST_Intersects('POINT(3.0 3.0)'::geometry, geom)
 ----
-·                                    distribution     local
-·                                    vectorized       false
-project                              ·                ·
- └── filter                          ·                ·
-      │                              filter           st_intersects('010100000000000000000008400000000000000840', geom)
-      └── index join                 ·                ·
-           │                         table            geo_table2@primary
-           │                         key columns      k, k_plus_one
-           └── project               ·                ·
-                └── inverted filter  ·                ·
-                     │               inverted column  geom_inverted_key
-                     │               num spans        31
-                     └── scan        ·                ·
-·                                    missing stats    ·
-·                                    table            geo_table2@geom_index
-·                                    spans            /1152921504606846976-/1152921504606846977 /1152921573326323712-/1152921573326323713 /1152921574400065536-/1152921574400065537 /1152921574668500992-/1152921574668500993 /1152921574735609856-/1152921574735609857 /1152921574739804160-/1152921574739804161 /1152921574740066304-/1152921574740066305 /1152921574740070400-/1152921574740070401 /1152921574740070464-/1152921574740070465 /1152921574740070468-/1152921574740070469 /1152921574740070469-/1152921574740070470 /1152921574740070480-/1152921574740070481 /1152921574740070656-/1152921574740070657 /1152921574740071424-/1152921574740071425 /1152921574740082688-/1152921574740082689 /1152921574740131840-/1152921574740131841 /1152921574740852736-/1152921574740852737 /1152921574752387072-/1152921574752387073 /1152921577621291008-/1152921577621291009 /1152921590506192896-/1152921590506192897 /1152921779484753920-/1152921779484753921 /1152922604118474752-/1152922604118474753 /1152925902653358080-/1152925902653358081 /1152939096792891392-/1152939096792891393 /1152991873351024640-/1152991873351024641 /1153202979583557632-/1153202979583557633 /1154047404513689600-/1154047404513689601 /1157425104234217472-/1157425104234217473 /1170935903116328960-/1170935903116328961 /1224979098644774912-/1224979098644774913 /1441151880758558720-/1441151880758558721
+·                          distribution     local
+·                          vectorized       false
+filter                     ·                ·
+ │                         filter           st_intersects('010100000000000000000008400000000000000840', geom)
+ └── index join            ·                ·
+      │                    table            geo_table2@primary
+      └── inverted filter  ·                ·
+           │               inverted column  geom_inverted_key
+           │               num spans        31
+           └── scan        ·                ·
+·                          missing stats    ·
+·                          table            geo_table2@geom_index
+·                          spans            31 spans
 
 query TTT
 EXPLAIN SELECT k, k_plus_one FROM geo_table2 WHERE ST_DFullyWithin('POINT(3.0 3.0)'::geometry, geom, 1)
 ----
-·                                    distribution     local
-·                                    vectorized       false
-project                              ·                ·
- └── filter                          ·                ·
-      │                              filter           st_dfullywithin('010100000000000000000008400000000000000840', geom, 1.0)
-      └── index join                 ·                ·
-           │                         table            geo_table2@primary
-           │                         key columns      k, k_plus_one
-           └── project               ·                ·
-                └── inverted filter  ·                ·
-                     │               inverted column  geom_inverted_key
-                     │               num spans        20
-                     └── scan        ·                ·
-·                                    missing stats    ·
-·                                    table            geo_table2@geom_index
-·                                    spans            /1152921504606846976-/1152921504606846977 /1152921521786716160-/1152921521786716161 /1152921526081683456-/1152921526081683457 /1152921527155425280-/1152921527155425281 /1152921527155425281-/1152921527692296191/PrefixEnd /1152921538966585345-/1152921573326323711/PrefixEnd /1152921573326323712-/1152921573326323713 /1152921573326323713-/1152921607686062079/PrefixEnd /1152921607686062081-/1152921642045800447/PrefixEnd /1152921779484753920-/1152921779484753921 /1152922604118474752-/1152922604118474753 /1152925902653358080-/1152925902653358081 /1152939096792891392-/1152939096792891393 /1152991873351024640-/1152991873351024641 /1153202979583557632-/1153202979583557633 /1154047404513689600-/1154047404513689601 /1157425104234217472-/1157425104234217473 /1170935903116328960-/1170935903116328961 /1224979098644774912-/1224979098644774913 /1441151880758558720-/1441151880758558721
+·                          distribution     local
+·                          vectorized       false
+filter                     ·                ·
+ │                         filter           st_dfullywithin('010100000000000000000008400000000000000840', geom, 1.0)
+ └── index join            ·                ·
+      │                    table            geo_table2@primary
+      └── inverted filter  ·                ·
+           │               inverted column  geom_inverted_key
+           │               num spans        30
+           └── scan        ·                ·
+·                          missing stats    ·
+·                          table            geo_table2@geom_index
+·                          spans            30 spans
+
+# Bounding box operations.
+statement ok
+SET CLUSTER SETTING sql.spatial.experimental_box2d_comparison_operators.enabled = on
+
+query TTT
+EXPLAIN SELECT k FROM geo_table2 WHERE geom && 'POINT(3.0 3.0)'::geometry
+----
+·                          distribution     local
+·                          vectorized       false
+filter                     ·                ·
+ │                         filter           geom && '010100000000000000000008400000000000000840'
+ └── index join            ·                ·
+      │                    table            geo_table2@primary
+      └── inverted filter  ·                ·
+           │               inverted column  geom_inverted_key
+           │               num spans        31
+           └── scan        ·                ·
+·                          missing stats    ·
+·                          table            geo_table2@geom_index
+·                          spans            31 spans
+
+query TTT
+EXPLAIN SELECT k FROM geo_table2 WHERE 'POINT(3.0 3.0)'::geometry::box2d && geom
+----
+·                          distribution     local
+·                          vectorized       false
+filter                     ·                ·
+ │                         filter           'BOX(3 3,3 3)' && geom
+ └── index join            ·                ·
+      │                    table            geo_table2@primary
+      └── inverted filter  ·                ·
+           │               inverted column  geom_inverted_key
+           │               num spans        31
+           └── scan        ·                ·
+·                          missing stats    ·
+·                          table            geo_table2@geom_index
+·                          spans            31 spans
+
+query TTT
+EXPLAIN SELECT k FROM geo_table2 WHERE 'LINESTRING(1.0 1.0, 5.0 5.0)'::geometry ~ geom
+----
+·                          distribution     local
+·                          vectorized       false
+filter                     ·                ·
+ │                         filter           '010200000002000000000000000000F03F000000000000F03F00000000000014400000000000001440' ~ geom
+ └── index join            ·                ·
+      │                    table            geo_table2@primary
+      └── inverted filter  ·                ·
+           │               inverted column  geom_inverted_key
+           │               num spans        33
+           └── scan        ·                ·
+·                          missing stats    ·
+·                          table            geo_table2@geom_index
+·                          spans            33 spans
+
+query TTT
+EXPLAIN SELECT k FROM geo_table2 WHERE geom ~ 'LINESTRING(1.0 1.0, 5.0 5.0)'::geometry::box2d
+----
+·                          distribution     local
+·                          vectorized       false
+filter                     ·                ·
+ │                         filter           geom ~ 'BOX(1 1,5 5)'
+ └── index join            ·                ·
+      │                    table            geo_table2@primary
+      └── inverted filter  ·                ·
+           │               inverted column  geom_inverted_key
+           │               num spans        30
+           └── scan        ·                ·
+·                          missing stats    ·
+·                          table            geo_table2@geom_index
+·                          spans            30 spans

@@ -22,19 +22,19 @@ package colexec
 import (
 	"container/heap"
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/errors"
 )
 
 // {{/*
@@ -57,7 +57,7 @@ const _TYPE_WIDTH = 0
 type OrderedSynchronizer struct {
 	allocator             *colmem.Allocator
 	inputs                []SynchronizerInput
-	ordering              sqlbase.ColumnOrdering
+	ordering              colinfo.ColumnOrdering
 	typs                  []*types.T
 	canonicalTypeFamilies []types.Family
 
@@ -98,7 +98,7 @@ type OrderedSynchronizer struct {
 
 var (
 	_ colexecbase.Operator = &OrderedSynchronizer{}
-	_ Closer               = &OrderedSynchronizer{}
+	_ colexecbase.Closer   = &OrderedSynchronizer{}
 )
 
 // ChildCount implements the execinfrapb.OpNode interface.
@@ -116,7 +116,7 @@ func NewOrderedSynchronizer(
 	allocator *colmem.Allocator,
 	inputs []SynchronizerInput,
 	typs []*types.T,
-	ordering sqlbase.ColumnOrdering,
+	ordering colinfo.ColumnOrdering,
 ) (*OrderedSynchronizer, error) {
 	return &OrderedSynchronizer{
 		allocator:             allocator,
@@ -176,7 +176,7 @@ func (o *OrderedSynchronizer) Next(ctx context.Context) coldata.Batch {
 						}
 						// {{end}}
 					default:
-						colexecerror.InternalError(fmt.Sprintf("unhandled type %s", o.typs[i].String()))
+						colexecerror.InternalError(errors.AssertionFailedf("unhandled type %s", o.typs[i].String()))
 					}
 				}
 			}
@@ -226,7 +226,7 @@ func (o *OrderedSynchronizer) resetOutput() {
 				}
 			// {{end}}
 			default:
-				colexecerror.InternalError(fmt.Sprintf("unhandled type %s", o.typs[i]))
+				colexecerror.InternalError(errors.AssertionFailedf("unhandled type %s", o.typs[i]))
 			}
 		}
 	}
@@ -283,7 +283,7 @@ func (o *OrderedSynchronizer) compareRow(batchIdx1 int, batchIdx2 int) int {
 			case encoding.Descending:
 				return -res
 			default:
-				colexecerror.InternalError(fmt.Sprintf("unexpected direction value %d", d))
+				colexecerror.InternalError(errors.AssertionFailedf("unexpected direction value %d", d))
 			}
 		}
 	}

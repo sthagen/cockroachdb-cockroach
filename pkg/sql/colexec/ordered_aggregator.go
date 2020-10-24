@@ -14,11 +14,15 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
 
@@ -50,7 +54,7 @@ type orderedAggregator struct {
 	done      bool
 
 	outputTypes        []*types.T
-	inputArgsConverter *vecToDatumConverter
+	inputArgsConverter *colconv.VecToDatumConverter
 
 	// scratch is the Batch to output and variables related to it. Aggregate
 	// function operators write directly to this output batch.
@@ -72,17 +76,20 @@ type orderedAggregator struct {
 	unsafeBatch coldata.Batch
 
 	// groupCol is the slice that aggregateFuncs use to determine whether a value
-	// is part of the current aggregation group. See aggregateFunc.Init for more
-	// information.
+	// is part of the current aggregation group. See colexecagg.AggregateFunc.Init
+	// for more information.
 	groupCol []bool
-	// aggregateFuncs are the aggregator's aggregate function operators.
-	aggregateFuncs []aggregateFunc
+	// bucket is the aggregation bucket that is reused for all aggregation
+	// groups.
+	bucket    aggBucket
+	aggHelper aggregatorHelper
 	// isScalar indicates whether an aggregator is in scalar context.
 	isScalar bool
 	// seenNonEmptyBatch indicates whether a non-empty input batch has been
 	// observed.
 	seenNonEmptyBatch bool
-	toClose           Closers
+	datumAlloc        rowenc.DatumAlloc
+	toClose           colexecbase.Closers
 }
 
 var _ closableOperator = &orderedAggregator{}
@@ -93,6 +100,7 @@ var _ closableOperator = &orderedAggregator{}
 // that the aggregate function should work on.
 func NewOrderedAggregator(
 	allocator *colmem.Allocator,
+	memAccount *mon.BoundAccount,
 	input colexecbase.Operator,
 	inputTypes []*types.T,
 	spec *execinfrapb.AggregatorSpec,
@@ -102,13 +110,18 @@ func NewOrderedAggregator(
 	outputTypes []*types.T,
 	isScalar bool,
 ) (colexecbase.Operator, error) {
+	for _, aggFn := range spec.Aggregations {
+		if aggFn.FilterColIdx != nil {
+			return nil, errors.AssertionFailedf("filtering ordered aggregation is not supported")
+		}
+	}
 	op, groupCol, err := OrderedDistinctColsToOperators(input, spec.GroupCols, inputTypes)
 	if err != nil {
 		return nil, err
 	}
 
 	a := &orderedAggregator{}
-	// The contract of aggregateFunc.Init requires that the very first group in
+	// The contract of AggregateFunc.Init requires that the very first group in
 	// the whole input is not marked as a start of a new group with 'true'
 	// value in groupCol. In order to satisfy that requirement we plan a
 	// oneShotOp that explicitly sets groupCol for the very first tuple it
@@ -130,7 +143,7 @@ func NewOrderedAggregator(
 
 	// We will be reusing the same aggregate functions, so we use 1 as the
 	// allocation size.
-	funcsAlloc, inputArgsConverter, toClose, err := newAggregateFuncsAlloc(
+	funcsAlloc, inputArgsConverter, toClose, err := colexecagg.NewAggregateFuncsAlloc(
 		allocator, inputTypes, spec, evalCtx, constructors, constArguments,
 		outputTypes, 1 /* allocSize */, false, /* isHashAgg */
 	)
@@ -145,12 +158,13 @@ func NewOrderedAggregator(
 		allocator:          allocator,
 		spec:               spec,
 		groupCol:           groupCol,
-		aggregateFuncs:     funcsAlloc.makeAggregateFuncs(),
+		bucket:             aggBucket{fns: funcsAlloc.MakeAggregateFuncs()},
 		isScalar:           isScalar,
 		outputTypes:        outputTypes,
 		inputArgsConverter: inputArgsConverter,
 		toClose:            toClose,
 	}
+	a.aggHelper = newAggregatorHelper(allocator, memAccount, inputTypes, spec, &a.datumAlloc, false /* isHashAgg */, coldata.BatchSize())
 	return a, nil
 }
 
@@ -159,14 +173,11 @@ func (a *orderedAggregator) Init() {
 	// Twice the batchSize is allocated to avoid having to check for overflow
 	// when outputting.
 	a.scratch.Batch = a.allocator.NewMemBatchWithFixedCapacity(a.outputTypes, 2*coldata.BatchSize())
-	for i := 0; i < len(a.outputTypes); i++ {
-		vec := a.scratch.ColVec(i)
-		a.aggregateFuncs[i].Init(a.groupCol, vec)
-	}
+	a.bucket.init(a.scratch.Batch, a.bucket.fns, a.aggHelper.makeSeenMaps(), a.groupCol)
 	// Note that we use a batch with fixed capacity because aggregate functions
 	// hold onto the vectors passed in into their Init method, so we cannot
 	// simply reallocate the output batch.
-	// TODO(yuzefovich): consider changing aggregateFunc interface to allow for
+	// TODO(yuzefovich): consider changing AggregateFunc interface to allow for
 	// updating the output vector.
 	a.unsafeBatch = a.allocator.NewMemBatchWithFixedCapacity(a.outputTypes, coldata.BatchSize())
 }
@@ -203,7 +214,7 @@ func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 				)
 				// Now we need to restore the desired length for the Vec.
 				vec.SetLength(2 * coldata.BatchSize())
-				a.aggregateFuncs[i].SetOutputIndex(newResumeIdx)
+				a.bucket.fns[i].SetOutputIndex(newResumeIdx)
 				// There might have been some NULLs set in the part that we
 				// have just copied over, so we need to unset the NULLs.
 				a.scratch.ColVec(i).Nulls().UnsetNullsAfter(newResumeIdx + 1)
@@ -219,7 +230,7 @@ func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 		if !a.seenNonEmptyBatch {
 			// The input has zero rows.
 			if a.isScalar {
-				for _, fn := range a.aggregateFuncs {
+				for _, fn := range a.bucket.fns {
 					fn.HandleEmptyInputScalar()
 				}
 				// All aggregate functions will output a single value.
@@ -231,22 +242,22 @@ func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 			}
 		} else {
 			if batchLength > 0 {
-				a.inputArgsConverter.convertBatchAndDeselect(batch)
-				sel := batch.Selection()
-				inputVecs := batch.ColVecs()
-				for i, fn := range a.aggregateFuncs {
-					fn.Compute(inputVecs, a.spec.Aggregations[i].ColIdx, batchLength, sel)
-				}
+				a.inputArgsConverter.ConvertBatch(batch)
+				a.aggHelper.performAggregation(
+					ctx, batch.ColVecs(), batchLength, batch.Selection(), &a.bucket, a.groupCol,
+				)
 			} else {
-				for _, fn := range a.aggregateFuncs {
-					// The aggregate function itself is responsible for
-					// tracking the output index, so we pass in an invalid
-					// index which will allow us to catch cases when the
-					// implementation is misbehaving.
-					fn.Flush(-1 /* outputIdx */)
-				}
+				a.allocator.PerformOperation(a.scratch.ColVecs(), func() {
+					for _, fn := range a.bucket.fns {
+						// The aggregate function itself is responsible for
+						// tracking the output index, so we pass in an invalid
+						// index which will allow us to catch cases when the
+						// implementation is misbehaving.
+						fn.Flush(-1 /* outputIdx */)
+					}
+				})
 			}
-			a.scratch.resumeIdx = a.aggregateFuncs[0].CurrentOutputIndex()
+			a.scratch.resumeIdx = a.bucket.fns[0].CurrentOutputIndex()
 		}
 		if batchLength == 0 {
 			a.done = true
@@ -294,7 +305,7 @@ func (a *orderedAggregator) reset(ctx context.Context) {
 	a.done = false
 	a.seenNonEmptyBatch = false
 	a.scratch.resumeIdx = 0
-	for _, fn := range a.aggregateFuncs {
+	for _, fn := range a.bucket.fns {
 		fn.Reset()
 	}
 }

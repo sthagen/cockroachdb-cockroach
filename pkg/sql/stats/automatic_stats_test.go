@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -65,6 +66,8 @@ func TestMaybeRefreshStats(t *testing.T) {
 		kvDB,
 		executor,
 		keys.SystemSQLCodec,
+		s.LeaseManager().(*lease.Manager),
+		s.ClusterSettings(),
 	)
 	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
@@ -142,6 +145,8 @@ func TestAverageRefreshTime(t *testing.T) {
 		kvDB,
 		executor,
 		keys.SystemSQLCodec,
+		s.LeaseManager().(*lease.Manager),
+		s.ClusterSettings(),
 	)
 	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
@@ -371,6 +376,11 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 		`CREATE DATABASE t;
 		CREATE TABLE t.a (k INT PRIMARY KEY);`)
 
+	// Test that stats for tables in user-defined schemas are also refreshed.
+	sqlRun.Exec(t,
+		`CREATE SCHEMA my_schema;
+		CREATE TABLE my_schema.b (j INT PRIMARY KEY);`)
+
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	cache := NewTableStatisticsCache(
 		10, /* cacheSize */
@@ -378,6 +388,8 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 		kvDB,
 		executor,
 		keys.SystemSQLCodec,
+		s.LeaseManager().(*lease.Manager),
+		s.ClusterSettings(),
 	)
 	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
@@ -389,11 +401,18 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// There should be one stat.
+	// There should be one stat for table t.a.
 	sqlRun.CheckQueryResultsRetry(t,
 		`SELECT statistics_name, column_names, row_count FROM [SHOW STATISTICS FOR TABLE t.a]`,
 		[][]string{
 			{"__auto__", "{k}", "0"},
+		})
+
+	// There should be one stat for table my_schema.b.
+	sqlRun.CheckQueryResultsRetry(t,
+		`SELECT statistics_name, column_names, row_count FROM [SHOW STATISTICS FOR TABLE my_schema.b]`,
+		[][]string{
+			{"__auto__", "{j}", "0"},
 		})
 }
 
@@ -416,6 +435,8 @@ func TestNoRetryOnFailure(t *testing.T) {
 		kvDB,
 		executor,
 		keys.SystemSQLCodec,
+		s.LeaseManager().(*lease.Manager),
+		s.ClusterSettings(),
 	)
 	r := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 

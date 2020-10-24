@@ -32,12 +32,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -63,10 +64,7 @@ import (
 // TODO(radu): we should verify that the queries in tests using SplitTable
 // are indeed distributed as intended.
 func SplitTable(
-	t *testing.T,
-	tc serverutils.TestClusterInterface,
-	desc *sqlbase.ImmutableTableDescriptor,
-	sps []SplitPoint,
+	t *testing.T, tc serverutils.TestClusterInterface, desc *tabledesc.Immutable, sps []SplitPoint,
 ) {
 	if tc.ReplicationMode() != base.ReplicationManual {
 		t.Fatal("SplitTable called on a test cluster that was not in manual replication mode")
@@ -74,7 +72,7 @@ func SplitTable(
 
 	rkts := make(map[roachpb.RangeID]rangeAndKT)
 	for _, sp := range sps {
-		pik, err := sqlbase.TestingMakePrimaryIndexKey(desc, sp.Vals...)
+		pik, err := rowenc.TestingMakePrimaryIndexKey(desc, sp.Vals...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -138,7 +136,7 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 
 	const n = 100
 	const numNodes = 1
-	tc := serverutils.StartTestCluster(t, numNodes, base.TestClusterArgs{
+	tc := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{UseDatabase: "test"},
 	})
 
@@ -162,7 +160,7 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 				return
 			default:
 				// Split the table at a random row.
-				var tableDesc *sqlbase.ImmutableTableDescriptor
+				var tableDesc *tabledesc.Immutable
 				require.NoError(t, cdb.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 					desc, err := catalogkv.UncachedPhysicalAccessor{}.GetObjectDesc(ctx,
 						txn, tc.Server(0).ClusterSettings(), keys.SystemSQLCodec,
@@ -171,13 +169,13 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 					if err != nil {
 						return err
 					}
-					tableDesc = desc.(*sqlbase.ImmutableTableDescriptor)
+					tableDesc = desc.(*tabledesc.Immutable)
 					return nil
 				}))
 
 				val := rng.Intn(n)
 				t.Logf("splitting at %d", val)
-				pik, err := sqlbase.TestingMakePrimaryIndexKey(tableDesc, val)
+				pik, err := rowenc.TestingMakePrimaryIndexKey(tableDesc, val)
 				if err != nil {
 					panic(err)
 				}
@@ -268,12 +266,13 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 
 	size := func() int64 { return 2 << 10 }
 	st := cluster.MakeTestingClusterSettings()
 	rangeCache := kvcoord.NewRangeDescriptorCache(st, nil /* db */, size, stop.NewStopper())
 	r := MakeDistSQLReceiver(
-		context.Background(), nil /* resultWriter */, tree.Rows,
+		ctx, nil /* resultWriter */, tree.Rows,
 		rangeCache, nil /* txn */, nil /* updateClock */, &SessionTracing{})
 
 	replicas := []roachpb.ReplicaDescriptor{{ReplicaID: 1}, {ReplicaID: 2}, {ReplicaID: 3}}
@@ -323,7 +322,7 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 	}
 
 	for i := range descs {
-		ri := rangeCache.GetCached(descs[i].StartKey, false /* inclusive */)
+		ri := rangeCache.GetCached(ctx, descs[i].StartKey, false /* inclusive */)
 		require.NotNilf(t, ri, "failed to find range for key: %s", descs[i].StartKey)
 		require.Equal(t, &descs[i], ri.Desc())
 		require.NotNil(t, ri.Lease())
@@ -342,7 +341,7 @@ func TestDistSQLRangeCachesIntegrationTest(t *testing.T) {
 	// We're going to setup a cluster with 4 nodes. The last one will not be a
 	// target of any replication so that its caches stay virgin.
 
-	tc := serverutils.StartTestCluster(t, 4, /* numNodes */
+	tc := serverutils.StartNewTestCluster(t, 4, /* numNodes */
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
@@ -457,7 +456,7 @@ func TestDistSQLDeadHosts(t *testing.T) {
 	const n = 100
 	const numNodes = 5
 
-	tc := serverutils.StartTestCluster(t, numNodes, base.TestClusterArgs{
+	tc := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs:      base.TestServerArgs{UseDatabase: "test"},
 	})
@@ -536,7 +535,7 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numNodes = 2
-	tc := serverutils.StartTestCluster(
+	tc := serverutils.StartNewTestCluster(
 		t,
 		numNodes,
 		base.TestClusterArgs{

@@ -17,11 +17,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -33,44 +37,44 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// TODO(ajwerner): There should be a constructor for an ImmutableTableDescriptor
+	// TODO(ajwerner): There should be a constructor for an Immutable
 	// and really all of the leasable descriptor types which includes its initial
 	// DescriptorMeta. This refactoring precedes the actual adoption of
 	// DescriptorMeta.
-	var descriptors []sqlbase.Descriptor
+	var descriptors []catalog.Descriptor
 	{
 		// Make shorthand type names for syntactic sugar.
 		type scDesc = descpb.SchemaDescriptor
 		type tbDesc = descpb.TableDescriptor
 		type typDesc = descpb.TypeDescriptor
 		ts1 := hlc.Timestamp{WallTime: 1}
-		mkTable := func(descriptor tbDesc) *sqlbase.ImmutableTableDescriptor {
-			desc := sqlbase.NewImmutableTableDescriptor(descriptor)
+		mkTable := func(descriptor tbDesc) *tabledesc.Immutable {
+			desc := tabledesc.NewImmutable(descriptor)
 			desc.ModificationTime = ts1
 			return desc
 		}
-		mkDB := func(id descpb.ID, name string) *sqlbase.ImmutableDatabaseDescriptor {
-			return sqlbase.NewInitialDatabaseDescriptor(id, name, security.AdminRole)
+		mkDB := func(id descpb.ID, name string) *dbdesc.Immutable {
+			return &dbdesc.NewInitial(id, name, security.AdminRole).Immutable
 		}
-		mkTyp := func(desc typDesc) *sqlbase.ImmutableTypeDescriptor {
+		mkTyp := func(desc typDesc) *typedesc.Immutable {
 			// Set a default parent schema for the type descriptors.
 			if desc.ParentSchemaID == descpb.InvalidID {
 				desc.ParentSchemaID = keys.PublicSchemaID
 			}
-			return sqlbase.NewImmutableTypeDescriptor(desc)
+			return typedesc.NewImmutable(desc)
 		}
-		mkSchema := func(desc scDesc) *sqlbase.ImmutableSchemaDescriptor {
-			return sqlbase.NewImmutableSchemaDescriptor(desc)
+		mkSchema := func(desc scDesc) *schemadesc.Immutable {
+			return schemadesc.NewImmutable(desc)
 		}
-		toOid := sqlbase.TypeIDToOID
+		toOid := typedesc.TypeIDToOID
 		typeExpr := "'hello'::@100015 = 'hello'::@100015"
 		typeArrExpr := "'hello'::@100016 = 'hello'::@100016"
-		descriptors = []sqlbase.Descriptor{
+		descriptors = []catalog.Descriptor{
 			mkDB(0, "system"),
 			mkTable(tbDesc{ID: 1, Name: "foo", ParentID: 0}),
 			mkTable(tbDesc{ID: 2, Name: "bar", ParentID: 0}),
 			mkTable(tbDesc{ID: 4, Name: "baz", ParentID: 3}),
-			mkTable(tbDesc{ID: 6, Name: "offline", ParentID: 0, State: descpb.TableDescriptor_OFFLINE}),
+			mkTable(tbDesc{ID: 6, Name: "offline", ParentID: 0, State: descpb.DescriptorState_OFFLINE}),
 			mkDB(3, "data"),
 			mkDB(5, "empty"),
 			// Create some user defined types and tables that reference them.

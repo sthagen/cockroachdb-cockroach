@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
 )
@@ -59,7 +59,7 @@ func (p *planner) CreateRoleNode(
 	opName string,
 	kvOptions tree.KVOptions,
 ) (*CreateRoleNode, error) {
-	if err := p.HasRoleOption(ctx, roleoption.CREATEROLE); err != nil {
+	if err := p.CheckRoleOption(ctx, roleoption.CREATEROLE); err != nil {
 		return nil, err
 	}
 
@@ -67,19 +67,23 @@ func (p *planner) CreateRoleNode(
 		return p.TypeAsStringOrNull(ctx, e, op)
 	}
 	roleOptions, err := kvOptions.ToRoleOptions(asStringOrNull, opName)
-
-	// Using CREATE ROLE syntax enables NOLOGIN by default.
-	if isRole && !roleOptions.Contains(roleoption.LOGIN) &&
-		!roleOptions.Contains(roleoption.NOLOGIN) {
-		roleOptions = append(roleOptions,
-			roleoption.RoleOption{Option: roleoption.NOLOGIN, HasValue: false})
-	}
-
 	if err != nil {
 		return nil, err
 	}
 
 	if err := roleOptions.CheckRoleOptionConflicts(); err != nil {
+		return nil, err
+	}
+
+	// Using CREATE ROLE syntax enables NOLOGIN by default.
+	if isRole && !roleOptions.Contains(roleoption.LOGIN) && !roleOptions.Contains(roleoption.NOLOGIN) {
+		roleOptions = append(roleOptions,
+			roleoption.RoleOption{Option: roleoption.NOLOGIN, HasValue: false})
+	}
+
+	// Check that the requested combination of password options is
+	// compatible with the user's own CREATELOGIN privilege.
+	if err := p.checkPasswordOptionConstraints(ctx, roleOptions, true /* newUser */); err != nil {
 		return nil, err
 	}
 
@@ -154,7 +158,7 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 		params.ctx,
 		opName,
 		params.p.txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUser},
 		fmt.Sprintf(`select "isRole" from %s where username = $1`, userTableName),
 		normalizedUsername,
 	)
@@ -216,7 +220,7 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 			params.ctx,
 			opName,
 			params.p.txn,
-			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+			sessiondata.InternalExecutorOverride{User: security.RootUser},
 			stmt,
 			qargs...,
 		)

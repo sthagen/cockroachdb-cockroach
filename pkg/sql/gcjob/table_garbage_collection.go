@@ -20,8 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -32,8 +33,7 @@ import (
 // The job progress is updated in place, but needs to be persisted to the job.
 func gcTables(
 	ctx context.Context, execCfg *sql.ExecutorConfig, progress *jobspb.SchemaChangeGCProgress,
-) (bool, error) {
-	didGC := false
+) error {
 	if log.V(2) {
 		log.Infof(ctx, "GC is being considered for tables: %+v", progress.Tables)
 	}
@@ -43,22 +43,21 @@ func gcTables(
 			continue
 		}
 
-		var table *sqlbase.ImmutableTableDescriptor
+		var table *tabledesc.Immutable
 		if err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			var err error
 			table, err = catalogkv.MustGetTableDescByID(ctx, txn, execCfg.Codec, droppedTable.ID)
 			return err
 		}); err != nil {
-			if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
+			if errors.Is(err, catalog.ErrDescriptorNotFound) {
 				// This can happen if another GC job created for the same table got to
 				// the table first. See #50344.
 				log.Warningf(ctx, "table descriptor %d not found while attempting to GC, skipping", droppedTable.ID)
 				// Update the details payload to indicate that the table was dropped.
 				markTableGCed(ctx, droppedTable.ID, progress)
-				didGC = true
 				continue
 			}
-			return false, errors.Wrapf(err, "fetching table %d", droppedTable.ID)
+			return errors.Wrapf(err, "fetching table %d", droppedTable.ID)
 		}
 
 		if !table.Dropped() {
@@ -67,29 +66,28 @@ func gcTables(
 		}
 
 		// First, delete all the table data.
-		if err := clearTableData(ctx, execCfg.DB, execCfg.DistSender, execCfg.Codec, table); err != nil {
-			return false, errors.Wrapf(err, "clearing data for table %d", table.ID)
+		if err := ClearTableData(ctx, execCfg.DB, execCfg.DistSender, execCfg.Codec, table); err != nil {
+			return errors.Wrapf(err, "clearing data for table %d", table.ID)
 		}
 
 		// Finished deleting all the table data, now delete the table meta data.
 		if err := dropTableDesc(ctx, execCfg.DB, execCfg.Codec, table); err != nil {
-			return false, errors.Wrapf(err, "dropping table descriptor for table %d", table.ID)
+			return errors.Wrapf(err, "dropping table descriptor for table %d", table.ID)
 		}
 
 		// Update the details payload to indicate that the table was dropped.
 		markTableGCed(ctx, table.ID, progress)
-		didGC = true
 	}
-	return didGC, nil
+	return nil
 }
 
-// clearTableData deletes all of the data in the specified table.
-func clearTableData(
+// ClearTableData deletes all of the data in the specified table.
+func ClearTableData(
 	ctx context.Context,
 	db *kv.DB,
 	distSender *kvcoord.DistSender,
 	codec keys.SQLCodec,
-	table *sqlbase.ImmutableTableDescriptor,
+	table *tabledesc.Immutable,
 ) error {
 	// If DropTime isn't set, assume this drop request is from a version
 	// 1.1 server and invoke legacy code that uses DeleteRange and range GC.

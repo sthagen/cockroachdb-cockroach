@@ -12,7 +12,6 @@ package colexec
 
 import (
 	"context"
-	"fmt"
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
@@ -371,8 +370,12 @@ func NewExternalHashJoiner(
 		partitionsToJoinUsingSortMerge: make([]int, 0),
 		leftJoinerInput:                leftJoinerInput,
 		rightJoinerInput:               rightJoinerInput,
+		// Note that the external hash joiner is responsible for making sure
+		// that partitions to join using in-memory hash joiner fit under the
+		// limit, so we use the same unlimited allocator for both
+		// buildSideAllocator and outputUnlimitedAllocator arguments.
 		inMemHashJoiner: NewHashJoiner(
-			unlimitedAllocator, spec, leftJoinerInput, rightJoinerInput,
+			unlimitedAllocator, unlimitedAllocator, spec, leftJoinerInput, rightJoinerInput,
 		).(*hashJoiner),
 		diskBackedSortMerge: diskBackedSortMerge,
 	}
@@ -429,16 +432,14 @@ func (hj *externalHashJoiner) partitionBatch(
 		return
 	}
 	scratchBatch := hj.scratch.leftBatch
-	sourceSpec := hj.spec.left
+	eqCols := hj.spec.left.eqCols
 	partitioner := hj.leftPartitioner
 	if side == rightSide {
 		scratchBatch = hj.scratch.rightBatch
-		sourceSpec = hj.spec.right
+		eqCols = hj.spec.right.eqCols
 		partitioner = hj.rightPartitioner
 	}
-	selections := hj.tupleDistributor.distribute(
-		ctx, batch, sourceSpec.sourceTypes, sourceSpec.eqCols,
-	)
+	selections := hj.tupleDistributor.distribute(ctx, batch, eqCols)
 	for idx, sel := range selections {
 		partitionIdx := hj.partitionIdxOffset + idx
 		if len(sel) > 0 {
@@ -697,7 +698,7 @@ StateChanged:
 			}
 			return coldata.ZeroBatch
 		default:
-			colexecerror.InternalError(fmt.Sprintf("unexpected externalHashJoinerState %d", hj.state))
+			colexecerror.InternalError(errors.AssertionFailedf("unexpected externalHashJoinerState %d", hj.state))
 		}
 	}
 }
@@ -713,7 +714,7 @@ func (hj *externalHashJoiner) Close(ctx context.Context) error {
 	if err := hj.rightPartitioner.Close(ctx); err != nil && retErr == nil {
 		retErr = err
 	}
-	if err := hj.diskBackedSortMerge.(Closer).Close(ctx); err != nil && retErr == nil {
+	if err := hj.diskBackedSortMerge.(colexecbase.Closer).Close(ctx); err != nil && retErr == nil {
 		retErr = err
 	}
 	if !hj.testingKnobs.delegateFDAcquisitions && hj.fdState.acquiredFDs > 0 {

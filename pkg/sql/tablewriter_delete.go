@@ -15,10 +15,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -29,7 +30,7 @@ type tableDeleter struct {
 	tableWriterBase
 
 	rd    row.Deleter
-	alloc *sqlbase.DatumAlloc
+	alloc *rowenc.DatumAlloc
 }
 
 var _ tableWriter = &tableDeleter{}
@@ -86,7 +87,7 @@ func (td *tableDeleter) deleteAllRowsFast(
 	ctx context.Context, resume roachpb.Span, limit int64, traceKV bool,
 ) (roachpb.Span, error) {
 	if resume.Key == nil {
-		tablePrefix := td.rd.Helper.Codec.TablePrefix(uint32(td.tableDesc().ID))
+		tablePrefix := td.rd.Helper.Codec.TablePrefix(uint32(td.tableDesc().GetID()))
 		// Delete rows and indexes starting with the table's prefix.
 		resume = roachpb.Span{
 			Key:    tablePrefix,
@@ -121,20 +122,24 @@ func (td *tableDeleter) deleteAllRowsScan(
 	var rf row.Fetcher
 	tableArgs := row.FetcherTableArgs{
 		Desc:            td.tableDesc(),
-		Index:           &td.tableDesc().PrimaryIndex,
+		Index:           td.tableDesc().GetPrimaryIndex(),
 		ColIdxMap:       td.rd.FetchColIDtoRowIndex,
 		Cols:            td.rd.FetchCols,
 		ValNeededForCol: valNeededForCol,
 	}
 	if err := rf.Init(
+		ctx,
 		td.rd.Helper.Codec,
 		false, /* reverse */
 		// TODO(nvanbenschoten): it might make sense to use a FOR_UPDATE locking
 		// strength here. Consider hooking this in to the same knob that will
 		// control whether we perform locking implicitly during DELETEs.
 		descpb.ScanLockingStrength_FOR_NONE,
+		descpb.ScanLockingWaitPolicy_BLOCK,
 		false, /* isCheck */
 		td.alloc,
+		// TODO(bulkio): this might need a memory monitor for the slow case of truncate.
+		nil, /* memMonitor */
 		tableArgs,
 	); err != nil {
 		return resume, err
@@ -153,8 +158,12 @@ func (td *tableDeleter) deleteAllRowsScan(
 			resume = roachpb.Span{}
 			break
 		}
-		// TODO(mgartner): Add partial index IDs to pm that we should not delete
-		// entries from.
+		// An empty PartialIndexUpdateHelper is passed here, meaning that DEL
+		// operations will be issued for every partial index, regardless of
+		// whether or not the row is indexed by the partial index.
+		// TODO(mgartner): Try evaluating each partial index predicate
+		// expression for each row and benchmark to determine if it is faster
+		// than simply issuing DEL operations for entries that do not exist.
 		var pm row.PartialIndexUpdateHelper
 		if err = td.row(ctx, datums, pm, traceKV); err != nil {
 			return resume, err
@@ -243,20 +252,24 @@ func (td *tableDeleter) deleteIndexScan(
 	var rf row.Fetcher
 	tableArgs := row.FetcherTableArgs{
 		Desc:            td.tableDesc(),
-		Index:           &td.tableDesc().PrimaryIndex,
+		Index:           td.tableDesc().GetPrimaryIndex(),
 		ColIdxMap:       td.rd.FetchColIDtoRowIndex,
 		Cols:            td.rd.FetchCols,
 		ValNeededForCol: valNeededForCol,
 	}
 	if err := rf.Init(
+		ctx,
 		td.rd.Helper.Codec,
 		false, /* reverse */
 		// TODO(nvanbenschoten): it might make sense to use a FOR_UPDATE locking
 		// strength here. Consider hooking this in to the same knob that will
 		// control whether we perform locking implicitly during DELETEs.
 		descpb.ScanLockingStrength_FOR_NONE,
+		descpb.ScanLockingWaitPolicy_BLOCK,
 		false, /* isCheck */
 		td.alloc,
+		// TODO(bulkio): this might need a memory monitor.
+		nil, /* memMonitor */
 		tableArgs,
 	); err != nil {
 		return resume, err
@@ -286,6 +299,6 @@ func (td *tableDeleter) deleteIndexScan(
 	return resume, td.finalize(ctx)
 }
 
-func (td *tableDeleter) tableDesc() *sqlbase.ImmutableTableDescriptor {
+func (td *tableDeleter) tableDesc() catalog.TableDescriptor {
 	return td.rd.Helper.TableDesc
 }

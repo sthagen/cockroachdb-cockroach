@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
@@ -51,7 +52,7 @@ const _RIGHT_TYPE_WIDTH = 0
 // _ASSIGN is the template function for assigning the first input to the result
 // of computation an operation on the second and the third inputs.
 func _ASSIGN(_, _, _, _, _, _ interface{}) {
-	colexecerror.InternalError("")
+	colexecerror.InternalError(errors.AssertionFailedf(""))
 }
 
 // */}}
@@ -66,7 +67,7 @@ type projConstOpBase struct {
 	allocator      *colmem.Allocator
 	colIdx         int
 	outputIdx      int
-	overloadHelper overloadHelper
+	overloadHelper execgen.OverloadHelper
 }
 
 // projOpBase contains all of the fields for non-constant projections.
@@ -76,7 +77,7 @@ type projOpBase struct {
 	col1Idx        int
 	col2Idx        int
 	outputIdx      int
-	overloadHelper overloadHelper
+	overloadHelper execgen.OverloadHelper
 }
 
 // {{define "projOp"}}
@@ -87,7 +88,7 @@ type _OP_NAME struct {
 
 func (p _OP_NAME) Next(ctx context.Context) coldata.Batch {
 	// In order to inline the templated code of overloads, we need to have a
-	// `_overloadHelper` local variable of type `overloadHelper`.
+	// `_overloadHelper` local variable of type `execgen.OverloadHelper`.
 	_overloadHelper := p.overloadHelper
 	// However, the scratch is not used in all of the projection operators, so
 	// we add this to go around "unused" error.
@@ -98,25 +99,31 @@ func (p _OP_NAME) Next(ctx context.Context) coldata.Batch {
 		return coldata.ZeroBatch
 	}
 	projVec := batch.ColVec(p.outputIdx)
-	if projVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		projVec.Nulls().UnsetNulls()
-	}
-	projCol := projVec._RET_TYP()
-	vec1 := batch.ColVec(p.col1Idx)
-	vec2 := batch.ColVec(p.col2Idx)
-	col1 := vec1._L_TYP()
-	col2 := vec2._R_TYP()
-	if vec1.Nulls().MaybeHasNulls() || vec2.Nulls().MaybeHasNulls() {
-		_SET_PROJECTION(true)
-	} else {
-		_SET_PROJECTION(false)
-	}
-
-	// Although we didn't change the length of the batch, it is necessary to set
-	// the length anyway (this helps maintaining the invariant of flat bytes).
-	batch.SetLength(n)
+	p.allocator.PerformOperation([]coldata.Vec{projVec}, func() {
+		if projVec.MaybeHasNulls() {
+			// We need to make sure that there are no left over null values in the
+			// output vector.
+			projVec.Nulls().UnsetNulls()
+		}
+		projCol := projVec._RET_TYP()
+		vec1 := batch.ColVec(p.col1Idx)
+		vec2 := batch.ColVec(p.col2Idx)
+		col1 := vec1._L_TYP()
+		col2 := vec2._R_TYP()
+		// Some operators can result in NULL with non-NULL inputs, like the JSON
+		// fetch value operator, ->. Therefore, _outNulls is defined to allow
+		// updating the output Nulls from within _ASSIGN functions when the result
+		// of a projection is Null.
+		_outNulls := projVec.Nulls()
+		if vec1.Nulls().MaybeHasNulls() || vec2.Nulls().MaybeHasNulls() {
+			_SET_PROJECTION(true)
+		} else {
+			_SET_PROJECTION(false)
+		}
+		// Although we didn't change the length of the batch, it is necessary to set
+		// the length anyway (this helps maintaining the invariant of flat bytes).
+		batch.SetLength(n)
+	})
 	return batch
 }
 
@@ -155,8 +162,13 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
 		}
 	}
+	// _outNulls has been updated from within the _ASSIGN function to include
+	// any NULLs that resulted from the projection.
+	// If _HAS_NULLS is true, union _outNulls with the set of input Nulls.
+	// If _HAS_NULLS is false, then there are no input Nulls. _outNulls is
+	// projVec.Nulls() so there is no need to call projVec.SetNulls().
 	// {{if _HAS_NULLS}}
-	projVec.SetNulls(col1Nulls.Or(col2Nulls))
+	projVec.SetNulls(_outNulls.Or(col1Nulls).Or(col2Nulls))
 	// {{end}}
 	// {{end}}
 	// {{end}}
@@ -238,7 +250,7 @@ func GetProjectionOperator(
 		col1Idx:        col1Idx,
 		col2Idx:        col2Idx,
 		outputIdx:      outputIdx,
-		overloadHelper: overloadHelper{binFn: binFn, evalCtx: evalCtx},
+		overloadHelper: execgen.OverloadHelper{BinFn: binFn, EvalCtx: evalCtx},
 	}
 
 	leftType, rightType := inputTypes[col1Idx], inputTypes[col2Idx]
@@ -305,8 +317,8 @@ func GetProjectionOperator(
 		return &defaultCmpProjOp{
 			projOpBase:          projOpBase,
 			adapter:             newComparisonExprAdapter(cmpExpr, evalCtx),
-			toDatumConverter:    newVecToDatumConverter(len(inputTypes), []int{col1Idx, col2Idx}),
-			datumToVecConverter: GetDatumToPhysicalFn(outputType),
+			toDatumConverter:    colconv.NewVecToDatumConverter(len(inputTypes), []int{col1Idx, col2Idx}),
+			datumToVecConverter: colconv.GetDatumToPhysicalFn(outputType),
 		}, nil
 	}
 	return nil, errors.Errorf("couldn't find overload for %s %s %s", leftType.Name(), op, rightType.Name())

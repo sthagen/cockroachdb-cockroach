@@ -14,10 +14,10 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -33,7 +33,7 @@ type deleteNode struct {
 	// columns is set if this DELETE is returning any rows, to be
 	// consumed by a renderNode upstream. This occurs when there is a
 	// RETURNING clause with some scalar expressions.
-	columns sqlbase.ResultColumns
+	columns colinfo.ResultColumns
 
 	run deleteRun
 }
@@ -63,12 +63,6 @@ type deleteRun struct {
 	rowIdxToRetIdx []int
 }
 
-// maxDeleteBatchSize is the max number of entries in the KV batch for
-// the delete operation (including secondary index updates, FK
-// cascading updates, etc), before the current KV batch is executed
-// and a new batch is started.
-const maxDeleteBatchSize = 10000
-
 func (d *deleteNode) startExec(params runParams) error {
 	// cache traceKV during execution, to avoid re-evaluating it for every row.
 	d.run.traceKV = params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
@@ -76,7 +70,7 @@ func (d *deleteNode) startExec(params runParams) error {
 	if d.run.rowsNeeded {
 		d.run.td.rows = rowcontainer.NewRowContainer(
 			params.EvalContext().Mon.MakeBoundAccount(),
-			sqlbase.ColTypeInfoFromResCols(d.columns), 0)
+			colinfo.ColTypeInfoFromResCols(d.columns))
 	}
 	return d.run.td.init(params.ctx, params.p.txn, params.EvalContext())
 }
@@ -124,7 +118,7 @@ func (d *deleteNode) BatchedNext(params runParams) (bool, error) {
 		}
 
 		// Are we done yet with the current batch?
-		if d.run.td.currentBatchSize >= maxDeleteBatchSize {
+		if d.run.td.currentBatchSize >= d.run.td.maxBatchSize {
 			break
 		}
 	}
@@ -149,7 +143,7 @@ func (d *deleteNode) BatchedNext(params runParams) (bool, error) {
 
 	// Possibly initiate a run of CREATE STATISTICS.
 	params.ExecCfg().StatsRefresher.NotifyMutation(
-		d.run.td.tableDesc().ID,
+		d.run.td.tableDesc().GetID(),
 		d.run.td.lastBatchSize,
 	)
 

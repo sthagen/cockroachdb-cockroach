@@ -30,6 +30,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/mutations"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -38,13 +40,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/jackc/pgx"
 	"github.com/lib/pq"
 	"github.com/pmezard/go-difflib/difflib"
@@ -72,23 +74,22 @@ INSERT INTO sensitive(super, sensible) VALUES('that', 'nobody', 'must', 'see')
 		t.Errorf("wanted: %s\ngot: %s", expMessage, actMessage)
 	}
 
-	const expSafeRedactedMessage = `...conn_executor_test.go:NN: *errors.errorString: <redacted>
-*safedetails.withSafeDetails: some error
-*withstack.withStack
-  (more details:)
-  github.com/cockroachdb/cockroach/pkg/sql_test.TestAnonymizeStatementsForReporting
-  	...conn_executor_test.go:NN
-  testing.tRunner
-  	...testing.go:NN
-  runtime.goexit
-  	...asm_amd64.s:NN
-*safedetails.withSafeDetails: format: "while executing: %s"
-  (more details:)
-  -- arg 1: INSERT INTO _(_, _) VALUES (_, _, __more2__)`
+	const expSafeRedactedMessage = `some error
+(1) while executing: INSERT INTO _(_, _) VALUES (_, _, __more2__)
+Wraps: (2) attached stack trace
+  -- stack trace:
+  | github.com/cockroachdb/cockroach/pkg/sql_test.TestAnonymizeStatementsForReporting
+  | 	...conn_executor_test.go:NN
+  | testing.tRunner
+  | 	...testing.go:NN
+  | runtime.goexit
+  | 	...asm_amd64.s:NN
+Wraps: (3) some error
+Error types: (1) *safedetails.withSafeDetails (2) *withstack.withStack (3) *errutil.leafError`
 
 	// Edit non-determinstic stack trace filenames from the message.
 	actSafeRedactedMessage := fileref.ReplaceAllString(
-		errors.Redact(safeErr), "...$2:NN")
+		redact.Sprintf("%+v", safeErr).Redact().StripMarkers(), "...$2:NN")
 
 	if actSafeRedactedMessage != expSafeRedactedMessage {
 		diff, _ := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
@@ -400,7 +401,8 @@ func TestHalloweenProblemAvoidance(t *testing.T) {
 	const smallerKvBatchSize = 10
 	defer row.TestingSetKVBatchSize(smallerKvBatchSize)()
 	const smallerInsertBatchSize = 5
-	defer sql.TestingSetInsertBatchSize(smallerInsertBatchSize)()
+	mutations.SetMaxBatchSizeForTests(smallerInsertBatchSize)
+	defer mutations.ResetMaxBatchSizeForTests()
 	numRows := smallerKvBatchSize + smallerInsertBatchSize + 10
 
 	params, _ := tests.CreateTestServerParams()
@@ -496,8 +498,6 @@ func TestQueryProgress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 51356)
-
 	const rows, kvBatchSize = 1000, 50
 
 	defer rowexec.TestingSetScannedRowProgressFrequency(rows / 60)()
@@ -550,7 +550,13 @@ func TestQueryProgress(t *testing.T) {
 	db.Exec(t, `CREATE STATISTICS __auto__ FROM t.test`)
 	const query = `SELECT count(*) FROM t.test WHERE x > $1 and x % 2 = 0`
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// Invalidate the stats cache so that we can be sure to get the latest stats.
+	var tableID descpb.ID
+	ctx := context.Background()
+	require.NoError(t, rawDB.QueryRow(`SELECT id FROM system.namespace WHERE name = 'test'`).Scan(&tableID))
+	s.ExecutorConfig().(sql.ExecutorConfig).TableStatsCache.InvalidateTableStats(ctx, tableID)
+
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	g := ctxgroup.WithContext(ctx)
@@ -835,61 +841,81 @@ func TestShowLastQueryStatistics(t *testing.T) {
 	s, sqlConn, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	if _, err := sqlConn.Exec("CREATE TABLE t(a INT)"); err != nil {
-		t.Fatal(err)
+	testCases := []struct {
+		stmt           string
+		usesExecEngine bool
+	}{
+		{
+			stmt:           "CREATE TABLE t(a INT, b INT)",
+			usesExecEngine: true,
+		},
+		{
+			stmt:           "SHOW SYNTAX 'SELECT * FROM t'",
+			usesExecEngine: false,
+		},
+		{
+			stmt:           "PREPARE stmt(INT) AS INSERT INTO t VALUES(1, $1)",
+			usesExecEngine: false,
+		},
 	}
 
-	rows, err := sqlConn.Query("SHOW LAST QUERY STATISTICS")
-	if err != nil {
-		t.Fatalf("show last query statistics failed: %v", err)
-	}
-	defer rows.Close()
+	for _, tc := range testCases {
+		if _, err := sqlConn.Exec(tc.stmt); err != nil {
+			t.Fatalf("executing %s. failed: %v ", tc.stmt, err)
+		}
 
-	var parseLatency string
-	var planLatency string
-	var execLatency string
-	var serviceLatency string
+		rows, err := sqlConn.Query("SHOW LAST QUERY STATISTICS")
+		if err != nil {
+			t.Fatalf("show last query statistics failed: %v", err)
+		}
+		defer rows.Close()
 
-	rows.Next()
-	if err := rows.Scan(&parseLatency, &planLatency, &execLatency, &serviceLatency); err != nil {
-		t.Fatalf("unexpected error while reading last query statistics: %v", err)
-	}
+		var parseLatency string
+		var planLatency string
+		var execLatency string
+		var serviceLatency string
 
-	parseInterval, err := tree.ParseDInterval(parseLatency)
-	if err != nil {
-		t.Fatal(err)
-	}
-	planInterval, err := tree.ParseDInterval(planLatency)
-	if err != nil {
-		t.Fatal(err)
-	}
-	execInterval, err := tree.ParseDInterval(execLatency)
-	if err != nil {
-		t.Fatal(err)
-	}
-	serviceInterval, err := tree.ParseDInterval(serviceLatency)
-	if err != nil {
-		t.Fatal(err)
-	}
+		rows.Next()
+		if err := rows.Scan(&parseLatency, &planLatency, &execLatency, &serviceLatency); err != nil {
+			t.Fatalf("unexpected error while reading last query statistics: %v", err)
+		}
 
-	if parseInterval.AsFloat64() <= 0 || parseInterval.AsFloat64() > 1 {
-		t.Fatalf("unexpected parse latency: %v", parseInterval.AsFloat64())
-	}
+		parseInterval, err := tree.ParseDInterval(parseLatency)
+		if err != nil {
+			t.Fatal(err)
+		}
+		planInterval, err := tree.ParseDInterval(planLatency)
+		if err != nil {
+			t.Fatal(err)
+		}
+		execInterval, err := tree.ParseDInterval(execLatency)
+		if err != nil {
+			t.Fatal(err)
+		}
+		serviceInterval, err := tree.ParseDInterval(serviceLatency)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	if planInterval.AsFloat64() <= 0 || planInterval.AsFloat64() > 1 {
-		t.Fatalf("unexpected plan latency: %v", planInterval.AsFloat64())
-	}
+		if parseInterval.AsFloat64() <= 0 || parseInterval.AsFloat64() > 1 {
+			t.Fatalf("unexpected parse latency: %v", parseInterval.AsFloat64())
+		}
 
-	if serviceInterval.AsFloat64() <= 0 || serviceInterval.AsFloat64() > 1 {
-		t.Fatalf("unexpected service latency: %v", serviceInterval.AsFloat64())
-	}
+		if tc.usesExecEngine && (planInterval.AsFloat64() <= 0 || planInterval.AsFloat64() > 1) {
+			t.Fatalf("unexpected plan latency: %v", planInterval.AsFloat64())
+		}
 
-	if execInterval.AsFloat64() <= 0 || execInterval.AsFloat64() > 1 {
-		t.Fatalf("unexpected execution latency: %v", execInterval.AsFloat64())
-	}
+		if serviceInterval.AsFloat64() <= 0 || serviceInterval.AsFloat64() > 1 {
+			t.Fatalf("unexpected service latency: %v", serviceInterval.AsFloat64())
+		}
 
-	if rows.Next() {
-		t.Fatalf("unexpected number of rows returned by last query statistics: %v", err)
+		if tc.usesExecEngine && (execInterval.AsFloat64() <= 0 || execInterval.AsFloat64() > 1) {
+			t.Fatalf("unexpected execution latency: %v", execInterval.AsFloat64())
+		}
+
+		if rows.Next() {
+			t.Fatalf("unexpected number of rows returned by last query statistics: %v", err)
+		}
 	}
 }
 

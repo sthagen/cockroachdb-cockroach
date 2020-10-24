@@ -79,22 +79,15 @@ var (
 	}...)
 )
 
-// createTestRocksDBEngine returns a new in-memory RocksDB engine with 1MB of
-// storage capacity.
-func createTestRocksDBEngine() Engine {
-	return newRocksDBInMem(roachpb.Attributes{}, 1<<20)
-}
-
 // createTestPebbleEngine returns a new in-memory Pebble storage engine.
 func createTestPebbleEngine() Engine {
-	return newPebbleInMem(context.Background(), roachpb.Attributes{}, 1<<20)
+	return newPebbleInMem(context.Background(), roachpb.Attributes{}, 1<<20, nil /* settings */)
 }
 
 var mvccEngineImpls = []struct {
 	name   string
 	create func() Engine
 }{
-	{"rocksdb", createTestRocksDBEngine},
 	{"pebble", createTestPebbleEngine},
 }
 
@@ -1874,9 +1867,9 @@ func TestMVCCDeleteRange(t *testing.T) {
 			kvs := []roachpb.KeyValue{}
 			if _, err = MVCCIterate(
 				ctx, engine, keyMin, keyMax, hlc.Timestamp{WallTime: 2}, MVCCScanOptions{Tombstones: true},
-				func(kv roachpb.KeyValue) (bool, error) {
+				func(kv roachpb.KeyValue) error {
 					kvs = append(kvs, kv)
-					return false, nil
+					return nil
 				},
 			); err != nil {
 				t.Fatal(err)
@@ -5243,6 +5236,46 @@ func TestResolveIntentWithLowerEpoch(t *testing.T) {
 			}
 			if !ok {
 				t.Fatal("intent should not be cleared by resolve intent request with lower epoch")
+			}
+		})
+	}
+}
+
+// TestTimeSeriesMVCCStats ensures that merge operations
+// result in an expected increase in timeseries data.
+func TestTimeSeriesMVCCStats(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	for _, engineImpl := range mvccEngineImpls {
+		t.Run(engineImpl.name, func(t *testing.T) {
+			engine := engineImpl.create()
+			defer engine.Close()
+			var ms = enginepb.MVCCStats{}
+
+			// Perform a sequence of merges on the same key
+			// and record the MVCC stats for it.
+			if err := MVCCMerge(ctx, engine, &ms, testKey1, hlc.Timestamp{Logical: 1}, tsvalue1); err != nil {
+				t.Fatal(err)
+			}
+			firstMS := ms
+
+			if err := MVCCMerge(ctx, engine, &ms, testKey1, hlc.Timestamp{Logical: 1}, tsvalue1); err != nil {
+				t.Fatal(err)
+			}
+			secondMS := ms
+
+			// Ensure timeseries metrics increase as expected.
+			expectedMS := firstMS
+			expectedMS.LiveBytes += int64(len(tsvalue1.RawBytes))
+			expectedMS.ValBytes += int64(len(tsvalue1.RawBytes))
+
+			if secondMS.LiveBytes != expectedMS.LiveBytes {
+				t.Fatalf("second merged LiveBytes value %v differed from expected LiveBytes value %v", secondMS.LiveBytes, expectedMS.LiveBytes)
+			}
+			if secondMS.ValBytes != expectedMS.ValBytes {
+				t.Fatalf("second merged ValBytes value %v differed from expected ValBytes value %v", secondMS.LiveBytes, expectedMS.LiveBytes)
 			}
 		})
 	}

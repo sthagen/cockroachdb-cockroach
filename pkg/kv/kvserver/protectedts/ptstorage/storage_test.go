@@ -30,8 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -150,6 +151,50 @@ var testCases = []testCase{
 						return s
 					}()),
 				expErr: "protectedts: limit exceeded: 8\\+1050 > 1024 bytes",
+			},
+			protectOp{
+				spans: tableSpans(1, 2),
+			},
+		},
+	},
+	{
+		name: "Protect - unlimited bytes",
+		ops: []op{
+			protectOp{spans: tableSpans(42)},
+			funcOp(func(ctx context.Context, t *testing.T, tCtx *testContext) {
+				_, err := tCtx.tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.protectedts.max_bytes = $1", 0)
+				require.NoError(t, err)
+			}),
+			protectOp{
+				spans: append(tableSpans(1, 2),
+					func() roachpb.Span {
+						s := tableSpan(3)
+						s.EndKey = append(s.EndKey, bytes.Repeat([]byte{'a'}, 2<<20 /* 2 MiB */)...)
+						return s
+					}()),
+			},
+			protectOp{
+				spans: tableSpans(1, 2),
+			},
+		},
+	},
+	{
+		name: "Protect - unlimited spans",
+		ops: []op{
+			protectOp{spans: tableSpans(42)},
+			funcOp(func(ctx context.Context, t *testing.T, tCtx *testContext) {
+				_, err := tCtx.tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.protectedts.max_spans = $1", 0)
+				require.NoError(t, err)
+			}),
+			protectOp{
+				spans: func() []roachpb.Span {
+					const lotsOfSpans = 1 << 15
+					spans := make([]roachpb.Span, lotsOfSpans)
+					for i := 0; i < lotsOfSpans; i++ {
+						spans[i] = tableSpan(uint32(i))
+					}
+					return spans
+				}(),
 			},
 			protectOp{
 				spans: tableSpans(1, 2),
@@ -446,7 +491,7 @@ func TestCorruptData(t *testing.T) {
 		ie := tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor)
 		affected, err := ie.ExecEx(
 			ctx, "corrupt-data", nil, /* txn */
-			sqlbase.InternalExecutorSessionDataOverride{User: security.NodeUser},
+			sessiondata.InternalExecutorOverride{User: security.NodeUser},
 			"UPDATE system.protected_ts_records SET spans = $1 WHERE id = $2",
 			[]byte("junk"), rec.ID.String())
 		require.NoError(t, err)
@@ -496,7 +541,7 @@ func TestCorruptData(t *testing.T) {
 		ie := tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor)
 		affected, err := ie.ExecEx(
 			ctx, "corrupt-data", nil, /* txn */
-			sqlbase.InternalExecutorSessionDataOverride{User: security.NodeUser},
+			sessiondata.InternalExecutorOverride{User: security.NodeUser},
 			"UPDATE system.protected_ts_records SET ts = $1 WHERE id = $2",
 			d.String(), rec.ID.String())
 		require.NoError(t, err)
@@ -603,7 +648,7 @@ func (ie *wrappedInternalExecutor) ExecEx(
 	ctx context.Context,
 	opName string,
 	txn *kv.Txn,
-	o sqlbase.InternalExecutorSessionDataOverride,
+	o sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
 ) (int, error) {
@@ -614,7 +659,7 @@ func (ie *wrappedInternalExecutor) QueryEx(
 	ctx context.Context,
 	opName string,
 	txn *kv.Txn,
-	session sqlbase.InternalExecutorSessionDataOverride,
+	session sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
 ) ([]tree.Datums, error) {
@@ -630,10 +675,10 @@ func (ie *wrappedInternalExecutor) QueryWithCols(
 	ctx context.Context,
 	opName string,
 	txn *kv.Txn,
-	o sqlbase.InternalExecutorSessionDataOverride,
+	o sessiondata.InternalExecutorOverride,
 	statement string,
 	qargs ...interface{},
-) ([]tree.Datums, sqlbase.ResultColumns, error) {
+) ([]tree.Datums, colinfo.ResultColumns, error) {
 	panic("unimplemented")
 }
 
@@ -641,7 +686,7 @@ func (ie *wrappedInternalExecutor) QueryRowEx(
 	ctx context.Context,
 	opName string,
 	txn *kv.Txn,
-	session sqlbase.InternalExecutorSessionDataOverride,
+	session sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
 ) (tree.Datums, error) {

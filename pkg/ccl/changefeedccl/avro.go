@@ -10,16 +10,16 @@ package changefeedccl
 
 import (
 	"encoding/json"
-	"fmt"
 	"math/big"
 	"time"
 
 	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
@@ -85,7 +85,7 @@ func avroUnionKey(t avroSchemaType) string {
 	case *avroRecord:
 		return s.Name
 	default:
-		panic(fmt.Sprintf(`unsupported type %T %v`, t, t))
+		panic(errors.AssertionFailedf(`unsupported type %T %v`, t, t))
 	}
 }
 
@@ -119,7 +119,7 @@ type avroDataRecord struct {
 
 	colIdxByFieldIdx map[int]int
 	fieldIdxByName   map[string]int
-	alloc            sqlbase.DatumAlloc
+	alloc            rowenc.DatumAlloc
 }
 
 // avroMetadata is the `avroEnvelopeRecord` metadata.
@@ -389,7 +389,7 @@ func columnDescToAvroSchema(colDesc *descpb.ColumnDescriptor) (*avroSchemaField,
 // indexToAvroSchema converts a column descriptor into its corresponding avro
 // record schema. The fields are kept in the same order as columns in the index.
 func indexToAvroSchema(
-	tableDesc sqlbase.TableDescriptor, indexDesc *descpb.IndexDescriptor,
+	tableDesc catalog.TableDescriptor, indexDesc *descpb.IndexDescriptor,
 ) (*avroDataRecord, error) {
 	schema := &avroDataRecord{
 		avroRecord: avroRecord{
@@ -436,7 +436,7 @@ const (
 // If a name suffix is provided (as opposed to avroSchemaNoSuffix), it will be
 // appended to the end of the avro record's name.
 func tableToAvroSchema(
-	tableDesc sqlbase.TableDescriptor, nameSuffix string,
+	tableDesc catalog.TableDescriptor, nameSuffix string,
 ) (*avroDataRecord, error) {
 	name := SQLNameToAvroName(tableDesc.GetName())
 	if nameSuffix != avroSchemaNoSuffix {
@@ -472,7 +472,7 @@ func tableToAvroSchema(
 }
 
 // textualFromRow encodes the given row data into avro's defined JSON format.
-func (r *avroDataRecord) textualFromRow(row sqlbase.EncDatumRow) ([]byte, error) {
+func (r *avroDataRecord) textualFromRow(row rowenc.EncDatumRow) ([]byte, error) {
 	native, err := r.nativeFromRow(row)
 	if err != nil {
 		return nil, err
@@ -481,7 +481,7 @@ func (r *avroDataRecord) textualFromRow(row sqlbase.EncDatumRow) ([]byte, error)
 }
 
 // BinaryFromRow encodes the given row data into avro's defined binary format.
-func (r *avroDataRecord) BinaryFromRow(buf []byte, row sqlbase.EncDatumRow) ([]byte, error) {
+func (r *avroDataRecord) BinaryFromRow(buf []byte, row rowenc.EncDatumRow) ([]byte, error) {
 	native, err := r.nativeFromRow(row)
 	if err != nil {
 		return nil, err
@@ -490,7 +490,7 @@ func (r *avroDataRecord) BinaryFromRow(buf []byte, row sqlbase.EncDatumRow) ([]b
 }
 
 // rowFromTextual decodes the given row data from avro's defined JSON format.
-func (r *avroDataRecord) rowFromTextual(buf []byte) (sqlbase.EncDatumRow, error) {
+func (r *avroDataRecord) rowFromTextual(buf []byte) (rowenc.EncDatumRow, error) {
 	native, newBuf, err := r.codec.NativeFromTextual(buf)
 	if err != nil {
 		return nil, err
@@ -502,7 +502,7 @@ func (r *avroDataRecord) rowFromTextual(buf []byte) (sqlbase.EncDatumRow, error)
 }
 
 // RowFromBinary decodes the given row data from avro's defined binary format.
-func (r *avroDataRecord) RowFromBinary(buf []byte) (sqlbase.EncDatumRow, error) {
+func (r *avroDataRecord) RowFromBinary(buf []byte) (rowenc.EncDatumRow, error) {
 	native, newBuf, err := r.codec.NativeFromBinary(buf)
 	if err != nil {
 		return nil, err
@@ -513,7 +513,7 @@ func (r *avroDataRecord) RowFromBinary(buf []byte) (sqlbase.EncDatumRow, error) 
 	return r.rowFromNative(native)
 }
 
-func (r *avroDataRecord) nativeFromRow(row sqlbase.EncDatumRow) (interface{}, error) {
+func (r *avroDataRecord) nativeFromRow(row rowenc.EncDatumRow) (interface{}, error) {
 	avroDatums := make(map[string]interface{}, len(row))
 	for fieldIdx, field := range r.Fields {
 		d := row[r.colIdxByFieldIdx[fieldIdx]]
@@ -528,7 +528,7 @@ func (r *avroDataRecord) nativeFromRow(row sqlbase.EncDatumRow) (interface{}, er
 	return avroDatums, nil
 }
 
-func (r *avroDataRecord) rowFromNative(native interface{}) (sqlbase.EncDatumRow, error) {
+func (r *avroDataRecord) rowFromNative(native interface{}) (rowenc.EncDatumRow, error) {
 	avroDatums, ok := native.(map[string]interface{})
 	if !ok {
 		return nil, errors.Errorf(`unknown avro native type: %T`, native)
@@ -537,7 +537,7 @@ func (r *avroDataRecord) rowFromNative(native interface{}) (sqlbase.EncDatumRow,
 		return nil, errors.Errorf(
 			`expected row with %d columns got %d`, len(r.Fields), len(avroDatums))
 	}
-	row := make(sqlbase.EncDatumRow, len(r.Fields))
+	row := make(rowenc.EncDatumRow, len(r.Fields))
 	for fieldName, avroDatum := range avroDatums {
 		fieldIdx := r.fieldIdxByName[fieldName]
 		field := r.Fields[fieldIdx]
@@ -545,7 +545,7 @@ func (r *avroDataRecord) rowFromNative(native interface{}) (sqlbase.EncDatumRow,
 		if err != nil {
 			return nil, err
 		}
-		row[r.colIdxByFieldIdx[fieldIdx]] = sqlbase.DatumToEncDatum(field.typ, decoded)
+		row[r.colIdxByFieldIdx[fieldIdx]] = rowenc.DatumToEncDatum(field.typ, decoded)
 	}
 	return row, nil
 }
@@ -612,7 +612,7 @@ func envelopeToAvroSchema(
 // BinaryFromRow encodes the given metadata and row data into avro's defined
 // binary format.
 func (r *avroEnvelopeRecord) BinaryFromRow(
-	buf []byte, meta avroMetadata, beforeRow, afterRow sqlbase.EncDatumRow,
+	buf []byte, meta avroMetadata, beforeRow, afterRow rowenc.EncDatumRow,
 ) ([]byte, error) {
 	native := map[string]interface{}{}
 	if r.opts.beforeField {

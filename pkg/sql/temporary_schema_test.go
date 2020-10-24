@@ -21,10 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -153,9 +153,9 @@ INSERT INTO perm_table VALUES (3, 4);
 
 	// Simulate 19.2 -> 20.1 upgrade by placing perm_table and perm_sequence in
 	// the old namespace table.
-	deprecatedTbKey := sqlbase.NewDeprecatedTableKey(
+	deprecatedTbKey := catalogkeys.NewDeprecatedTableKey(
 		namesToID["defaultdb"], "perm_table").Key(keys.SystemSQLCodec)
-	deprecatedSeqKey := sqlbase.NewDeprecatedTableKey(
+	deprecatedSeqKey := catalogkeys.NewDeprecatedTableKey(
 		namesToID["defaultdb"], "perm_sequence").Key(keys.SystemSQLCodec)
 	err = kvDB.CPut(ctx, deprecatedTbKey, namesToID["perm_table"], nil)
 	require.NoError(t, err)
@@ -219,7 +219,7 @@ func TestTemporaryObjectCleaner(t *testing.T) {
 			},
 		},
 	}
-	tc := serverutils.StartTestCluster(
+	tc := serverutils.StartNewTestCluster(
 		t,
 		numNodes,
 		base.TestClusterArgs{
@@ -290,7 +290,7 @@ func TestTemporarySchemaDropDatabase(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	numNodes := 3
-	tc := serverutils.StartTestCluster(
+	tc := serverutils.StartNewTestCluster(
 		t,
 		numNodes,
 		base.TestClusterArgs{
@@ -327,12 +327,17 @@ func TestTemporarySchemaDropDatabase(t *testing.T) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
 		sqlDB.Exec(t, `DROP DATABASE drop_me CASCADE`)
 
-		var tempObjectCount int
-		sqlDB.QueryRow(
-			t,
-			`SELECT count(1) FROM system.namespace WHERE name LIKE 'pg_temp%' OR name IN ('t', 't2')`,
-		).Scan(&tempObjectCount)
-		assert.Equal(t, 0, tempObjectCount)
+		testutils.SucceedsSoon(t, func() error {
+			var tempObjectCount int
+			sqlDB.QueryRow(
+				t,
+				`SELECT count(1) FROM system.namespace WHERE name LIKE 'pg_temp%' OR name IN ('t', 't2')`,
+			).Scan(&tempObjectCount)
+			if tempObjectCount == 0 {
+				return nil
+			}
+			return errors.AssertionFailedf("expected count 0, got %d", tempObjectCount)
+		})
 	}
 }
 

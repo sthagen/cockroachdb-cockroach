@@ -1,4 +1,4 @@
-# LogicTest: !3node-tenant(49854)
+ # LogicTest: !3node-tenant(49854)
 # Disable automatic stats to avoid flakiness (sometimes causes retry errors).
 statement ok
 SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
@@ -924,9 +924,9 @@ COMMIT
 query TTTTB
 SHOW CONSTRAINTS FROM check_table
 ----
-check_table  c_0      CHECK        CHECK ((c > 0:::INT8))  false
-check_table  d_0      CHECK        CHECK ((d > 0:::INT8))  true
-check_table  primary  PRIMARY KEY  PRIMARY KEY (k ASC)     true
+check_table  c_0      CHECK        CHECK ((c > 0))      false
+check_table  d_0      CHECK        CHECK ((d > 0))      true
+check_table  primary  PRIMARY KEY  PRIMARY KEY (k ASC)  true
 
 statement ok
 BEGIN
@@ -957,9 +957,9 @@ COMMIT
 query TTTTB
 SHOW CONSTRAINTS FROM check_table
 ----
-check_table  c_0      CHECK        CHECK ((c > 0:::INT8))  false
-check_table  d_0      CHECK        CHECK ((d > 0:::INT8))  true
-check_table  primary  PRIMARY KEY  PRIMARY KEY (k ASC)     true
+check_table  c_0      CHECK        CHECK ((c > 0))      false
+check_table  d_0      CHECK        CHECK ((d > 0))      true
+check_table  primary  PRIMARY KEY  PRIMARY KEY (k ASC)  true
 
 # Adding column e was rolled back
 query TTBTTTB
@@ -1142,8 +1142,8 @@ COMMIT
 query TTTTB
 SHOW CONSTRAINTS FROM check_table
 ----
-check_table  ck_a  CHECK  CHECK ((a = 0:::INT8))  true
-check_table  ck_b  CHECK  CHECK ((b > 0:::INT8))  true
+check_table  ck_a  CHECK  CHECK ((a = 0))  true
+check_table  ck_b  CHECK  CHECK ((b > 0))  true
 check_table  ck_c  CHECK  CHECK ((c > b))  true
 
 # Also test insert/update to ensure constraint was added in a valid state (with correct column IDs, etc.)
@@ -1700,25 +1700,26 @@ COMMIT;
 
 # Test that deleting an index on a table that gets dropped in the same
 # transaction is allowed.
-subtest delete_index_and_table_in_txn
-
-statement ok
-CREATE TABLE people (id INT PRIMARY KEY, name STRING);
-
-statement ok
-CREATE INDEX people_name_index ON people (name);
-
-statement ok
-BEGIN;
-
-statement ok
-DROP INDEX people@people_name_index;
-
-statement ok
-DROP TABLE people;
-
-statement ok
-COMMIT;
+# Skipped due to #53724.
+#subtest delete_index_and_table_in_txn
+#
+#statement ok
+#CREATE TABLE people (id INT PRIMARY KEY, name STRING);
+#
+#statement ok
+#CREATE INDEX people_name_index ON people (name);
+#
+#statement ok
+#BEGIN;
+#
+#statement ok
+#DROP INDEX people@people_name_index;
+#
+#statement ok
+#DROP TABLE people;
+#
+#statement ok
+#COMMIT;
 
 subtest add_column_default_sequence_op
 
@@ -1830,3 +1831,69 @@ SELECT * FROM self_ref_fk;
 
 statement ok
 DROP TABLE self_ref_fk;
+
+# Test that NOT NULL constraints can be created and validated on a newly created
+# table.
+subtest 52501
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE t_52501_valid(a INT)
+
+statement ok
+INSERT INTO t_52501_valid VALUES (1)
+
+statement ok
+ALTER TABLE t_52501_valid ALTER COLUMN a SET NOT NULL
+
+statement ok
+COMMIT
+
+query TTTTB
+SHOW CONSTRAINTS FROM t_52501_valid
+----
+t_52501_valid  a_auto_not_null  CHECK  CHECK ((a IS NOT NULL))  true
+
+statement ok
+DROP TABLE t_52501_valid
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE t_52501_invalid(a INT)
+
+statement ok
+INSERT INTO t_52501_invalid VALUES (NULL)
+
+statement error pgcode 23514 validation of CHECK "a IS NOT NULL" failed
+ALTER TABLE t_52501_invalid ALTER COLUMN a SET NOT NULL
+
+statement ok
+ROLLBACK
+
+# Test that NOT VALID foreign keys can be added in the same transaction as the
+# table.
+subtest 54265
+
+statement ok
+CREATE TABLE parent_54265 (a INT PRIMARY KEY)
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE child_54265 (a INT)
+
+statement ok
+ALTER TABLE child_54265 ADD FOREIGN KEY (a) REFERENCES parent_54265 NOT VALID
+
+statement ok
+COMMIT
+
+query TTTTB
+SHOW CONSTRAINTS FROM child_54265
+----
+child_54265  fk_a_ref_parent_54265  FOREIGN KEY  FOREIGN KEY (a) REFERENCES parent_54265(a)  false

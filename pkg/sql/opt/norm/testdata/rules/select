@@ -38,15 +38,6 @@ values
  └── fd: ()-->(1-5)
 
 norm expect=SimplifyJoinFilters
-SELECT * FROM a INNER JOIN xy ON NULL
-----
-values
- ├── columns: k:1!null i:2!null f:3!null s:4!null j:5!null x:7!null y:8!null
- ├── cardinality: [0 - 0]
- ├── key: ()
- └── fd: ()-->(1-5,7,8)
-
-norm expect=SimplifyJoinFilters
 SELECT * FROM a INNER JOIN xy ON x=1 OR NULL
 ----
 inner-join (cross)
@@ -402,6 +393,25 @@ scan a
  ├── key: (1)
  └── fd: (1)-->(2-5)
 
+exec-ddl
+CREATE INDEX partial_idx ON a (s) WHERE true
+----
+
+# Building the partial index predicate should trigger the rule.
+norm expect=EliminateSelect
+SELECT * FROM a
+----
+scan a
+ ├── columns: k:1!null i:2 f:3 s:4 j:5
+ ├── partial index predicates
+ │    └── partial_idx: filters (true)
+ ├── key: (1)
+ └── fd: (1)-->(2-5)
+
+exec-ddl
+DROP INDEX partial_idx
+----
+
 # --------------------------------------------------
 # MergeSelects
 # --------------------------------------------------
@@ -529,6 +539,7 @@ SELECT f, f+1.1 AS r FROM (SELECT f, i FROM a GROUP BY f, i HAVING sum(f)=10.0) 
 project
  ├── columns: f:3 r:8
  ├── immutable
+ ├── fd: (3)-->(8)
  ├── select
  │    ├── columns: i:2 f:3 sum:7!null
  │    ├── key: (2,3)
@@ -1344,27 +1355,24 @@ project
       └── filters
            └── (i:2 + k:1) IS NOT NULL [outer=(1,2), immutable]
 
-# --------------------------------------------------
-# DetectSelectContradiction
-# --------------------------------------------------
-
-norm expect=DetectSelectContradiction
-SELECT k FROM b WHERE k<1 AND k>2
+exec-ddl
+CREATE INDEX partial_idx ON b (f) WHERE s IS NOT NULL
 ----
-values
- ├── columns: k:1!null
- ├── cardinality: [0 - 0]
- ├── key: ()
- └── fd: ()-->(1)
 
-norm expect=DetectSelectContradiction
-SELECT k FROM b WHERE i=5 AND k<1 AND k>2 AND s='foo'
+# Building the partial index predicate should trigger the rule.
+norm expect=RemoveNotNullCondition
+SELECT * FROM b
 ----
-values
- ├── columns: k:1!null
- ├── cardinality: [0 - 0]
- ├── key: ()
- └── fd: ()-->(1)
+scan b
+ ├── columns: k:1!null i:2 f:3 s:4!null j:5
+ ├── partial index predicates
+ │    └── partial_idx: filters (true)
+ ├── key: (1)
+ └── fd: (1)-->(2-5)
+
+exec-ddl
+DROP INDEX partial_idx
+----
 
 # --------------------------------------------------
 # PushSelectIntoProjectSet
@@ -1877,8 +1885,9 @@ except
       └── filters
            └── (1 / 0) > 0 [immutable]
 
-norm
-SELECT * FROM ((values (1.0::decimal)) EXCEPT (values (1.00::decimal))) WHERE column1::string != '1.00';
+# The filter is composite-sensitive.
+norm expect-not=PushFilterIntoSetOp
+SELECT * FROM ((VALUES (1.0::DECIMAL)) EXCEPT (VALUES (1.00::DECIMAL))) WHERE column1::STRING != '1.00';
 ----
 select
  ├── columns: column1:1!null
@@ -1905,3 +1914,26 @@ select
  │         └── (1.00,)
  └── filters
       └── column1:1::STRING != '1.00' [outer=(1), immutable]
+
+# The filter is not composite-sensitive (even if it involves decimals) and can be pushed down.
+norm expect=PushFilterIntoSetOp
+SELECT * FROM ((VALUES (1.0::DECIMAL)) EXCEPT (VALUES (1.00::DECIMAL))) WHERE column1 > 0;
+----
+except
+ ├── columns: column1:1!null
+ ├── left columns: column1:1!null
+ ├── right columns: column1:2
+ ├── cardinality: [0 - 1]
+ ├── key: (1)
+ ├── values
+ │    ├── columns: column1:1!null
+ │    ├── cardinality: [1 - 1]
+ │    ├── key: ()
+ │    ├── fd: ()-->(1)
+ │    └── (1.0,)
+ └── values
+      ├── columns: column1:2!null
+      ├── cardinality: [1 - 1]
+      ├── key: ()
+      ├── fd: ()-->(2)
+      └── (1.00,)

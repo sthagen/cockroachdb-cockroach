@@ -15,6 +15,7 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -40,17 +42,19 @@ import (
 )
 
 // TestCluster represents a set of TestServers. The hope is that it can be used
-// analoguous to TestServer, but with control over range replication.
+// analogous to TestServer, but with control over range replication and join
+// flags.
 type TestCluster struct {
 	Servers         []*server.TestServer
 	Conns           []*gosql.DB
 	stopper         *stop.Stopper
-	replicationMode base.TestClusterReplicationMode
-	scratchRangeID  roachpb.RangeID
+	scratchRangeKey roachpb.Key
 	mu              struct {
 		syncutil.Mutex
 		serverStoppers []*stop.Stopper
 	}
+	serverArgs  []base.TestServerArgs
+	clusterArgs base.TestClusterArgs
 }
 
 var _ serverutils.TestClusterInterface = &TestCluster{}
@@ -116,64 +120,59 @@ func (tc *TestCluster) StopServer(idx int) {
 	}
 }
 
-// StartTestCluster starts up a TestCluster made up of `nodes` in-memory testing
-// servers.
+// StartTestCluster creates and starts up a TestCluster made up of `nodes`
+// in-memory testing servers.
 // The cluster should be stopped using TestCluster.Stopper().Stop().
 func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestCluster {
+	cluster := NewTestCluster(t, nodes, args)
+	cluster.Start(t)
+	return cluster
+}
+
+// NewTestCluster initializes a TestCluster made up of `nodes` in-memory testing
+// servers. It needs to be started separately using the return type.
+func NewTestCluster(t testing.TB, nodes int, clusterArgs base.TestClusterArgs) *TestCluster {
 	if nodes < 1 {
 		t.Fatal("invalid cluster size: ", nodes)
 	}
 
 	if err := checkServerArgsForCluster(
-		args.ServerArgs, args.ReplicationMode, disallowJoinAddr,
+		clusterArgs.ServerArgs, clusterArgs.ReplicationMode, disallowJoinAddr,
 	); err != nil {
 		t.Fatal(err)
 	}
-	for _, sargs := range args.ServerArgsPerNode {
+	for _, sargs := range clusterArgs.ServerArgsPerNode {
 		if err := checkServerArgsForCluster(
-			sargs, args.ReplicationMode, disallowJoinAddr,
+			sargs, clusterArgs.ReplicationMode, allowJoinAddr,
 		); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	tc := &TestCluster{
-		stopper:         stop.NewStopper(),
-		replicationMode: args.ReplicationMode,
+		stopper:     stop.NewStopper(),
+		clusterArgs: clusterArgs,
 	}
 
 	// Check if any of the args have a locality set.
 	noLocalities := true
-	for _, arg := range args.ServerArgsPerNode {
+	for _, arg := range tc.clusterArgs.ServerArgsPerNode {
 		if len(arg.Locality.Tiers) > 0 {
 			noLocalities = false
 			break
 		}
 	}
-	if len(args.ServerArgs.Locality.Tiers) > 0 {
+	if len(tc.clusterArgs.ServerArgs.Locality.Tiers) > 0 {
 		noLocalities = false
 	}
 
-	// Pre-bind a listener for node zero so the kernel can go ahead and
-	// assign its address for use in the other nodes' join flags.
-	// The Server becomes responsible for closing this.
-	firstListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var errCh chan error
-	if args.ParallelStart {
-		errCh = make(chan error, nodes)
-	}
-
-	disableLBS := false
+	var firstListener net.Listener
 	for i := 0; i < nodes; i++ {
 		var serverArgs base.TestServerArgs
-		if perNodeServerArgs, ok := args.ServerArgsPerNode[i]; ok {
+		if perNodeServerArgs, ok := tc.clusterArgs.ServerArgsPerNode[i]; ok {
 			serverArgs = perNodeServerArgs
 		} else {
-			serverArgs = args.ServerArgs
+			serverArgs = tc.clusterArgs.ServerArgs
 		}
 
 		// If no localities are specified in the args, we'll generate some
@@ -187,58 +186,83 @@ func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestC
 		}
 
 		if i == 0 {
-			if serverArgs.Knobs.Server == nil {
-				serverArgs.Knobs.Server = &server.TestingKnobs{}
+			if serverArgs.Listener != nil {
+				// If the test installed a listener for us, use that.
+				firstListener = serverArgs.Listener
 			} else {
-				// Copy the knobs so the struct with the listener is not
-				// reused for other nodes.
-				knobs := *serverArgs.Knobs.Server.(*server.TestingKnobs)
-				serverArgs.Knobs.Server = &knobs
+				// Pre-bind a listener for node zero so the kernel can go ahead and
+				// assign its address for use in the other nodes' join flags.
+				// The Server becomes responsible for closing this.
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				firstListener = listener
+				serverArgs.Listener = listener
 			}
-			serverArgs.Knobs.Server.(*server.TestingKnobs).RPCListener = firstListener
-			serverArgs.Addr = firstListener.Addr().String()
 		} else {
-			serverArgs.JoinAddr = firstListener.Addr().String()
+			if serverArgs.JoinAddr == "" {
+				// Point to the first listener unless told explicitly otherwise.
+				serverArgs.JoinAddr = firstListener.Addr().String()
+			}
 			serverArgs.NoAutoInitializeCluster = true
 		}
 
+		if _, err := tc.AddServer(serverArgs); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return tc
+}
+
+// Start is the companion method to NewTestCluster, and is responsible for
+// actually starting up the cluster. Start waits for each server to be fully up
+// and running.
+//
+// If looking to test initialization/bootstrap behavior, Start should be invoked
+// in a separate thread and with ParallelStart enabled (otherwise it'll block
+// on waiting for init for the first server).
+func (tc *TestCluster) Start(t testing.TB) {
+	nodes := len(tc.Servers)
+	var errCh chan error
+	if tc.clusterArgs.ParallelStart {
+		errCh = make(chan error, nodes)
+	}
+
+	disableLBS := false
+	for i := 0; i < nodes; i++ {
 		// Disable LBS if any server has a very low scan interval.
-		if serverArgs.ScanInterval > 0 && serverArgs.ScanInterval <= 100*time.Millisecond {
+		if tc.serverArgs[i].ScanInterval > 0 && tc.serverArgs[i].ScanInterval <= 100*time.Millisecond {
 			disableLBS = true
 		}
 
-		// Note: uncomment to have the testcluster stored on disk which can aid
-		// post-mortem debugging.
-		//
-		// serverArgs.StoreSpecs = []base.StoreSpec{{
-		// 	Path: fmt.Sprintf("cluster/%d", i+1),
-		// }}
-
-		if args.ParallelStart {
-			go func() {
-				errCh <- tc.doAddServer(t, serverArgs)
-			}()
+		if tc.clusterArgs.ParallelStart {
+			go func(i int) {
+				errCh <- tc.StartServer(tc.Server(i), tc.serverArgs[i])
+			}(i)
 		} else {
-			if err := tc.doAddServer(t, serverArgs); err != nil {
+			if err := tc.StartServer(tc.Server(i), tc.serverArgs[i]); err != nil {
 				t.Fatal(err)
 			}
 			// We want to wait for stores for each server in order to have predictable
 			// store IDs. Otherwise, stores can be asynchronously bootstrapped in an
 			// unexpected order (#22342).
-			tc.WaitForStores(t, tc.Servers[0].Gossip())
+			tc.WaitForNStores(t, i+1, tc.Servers[0].Gossip())
 		}
 	}
 
-	if args.ParallelStart {
+	if tc.clusterArgs.ParallelStart {
 		for i := 0; i < nodes; i++ {
 			if err := <-errCh; err != nil {
 				t.Fatal(err)
 			}
 		}
-		tc.WaitForStores(t, tc.Servers[0].Gossip())
+
+		tc.WaitForNStores(t, tc.NumServers(), tc.Servers[0].Gossip())
 	}
 
-	if tc.replicationMode == base.ReplicationManual {
+	if tc.clusterArgs.ReplicationMode == base.ReplicationManual {
 		// We've already disabled the merge queue via testing knobs above, but ALTER
 		// TABLE ... SPLIT AT will throw an error unless we also disable merges via
 		// the cluster setting.
@@ -260,7 +284,7 @@ func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestC
 	// cluster stopper is stopped.
 	tc.stopper.AddCloser(stop.CloserFn(tc.stopServers))
 
-	if tc.replicationMode == base.ReplicationAuto {
+	if tc.clusterArgs.ReplicationMode == base.ReplicationAuto {
 		if err := tc.WaitForFullReplication(); err != nil {
 			t.Fatal(err)
 		}
@@ -268,7 +292,6 @@ func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestC
 
 	// Wait until a NodeStatus is persisted for every node (see #25488, #25649, #31574).
 	tc.WaitForNodeStatuses(t)
-	return tc
 }
 
 type checkType bool
@@ -305,39 +328,45 @@ func checkServerArgsForCluster(
 	return nil
 }
 
-// AddServer creates a server with the specified arguments and appends it to
-// the TestCluster.
+// AddAndStartServer creates a server with the specified arguments and appends it to
+// the TestCluster. It also starts it.
 //
 // The new Server's copy of serverArgs might be changed according to the
 // cluster's ReplicationMode.
-func (tc *TestCluster) AddServer(t testing.TB, serverArgs base.TestServerArgs) {
+func (tc *TestCluster) AddAndStartServer(t testing.TB, serverArgs base.TestServerArgs) {
 	if serverArgs.JoinAddr == "" && len(tc.Servers) > 0 {
 		serverArgs.JoinAddr = tc.Servers[0].ServingRPCAddr()
 	}
-	if err := tc.doAddServer(t, serverArgs); err != nil {
+	serv, err := tc.AddServer(serverArgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := tc.StartServer(serv, serverArgs); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func (tc *TestCluster) doAddServer(t testing.TB, serverArgs base.TestServerArgs) error {
+// AddServer is like AddAndStartServer, except it does not start it.
+func (tc *TestCluster) AddServer(serverArgs base.TestServerArgs) (*server.TestServer, error) {
 	serverArgs.PartOfCluster = true
 	if serverArgs.JoinAddr != "" {
 		serverArgs.NoAutoInitializeCluster = true
 	}
-	// Check args even though they might have been checked in StartTestCluster;
+	// Check args even though they might have been checked in StartNewTestCluster;
 	// this method might be called for servers being added after the cluster was
 	// started, in which case the check has not been performed.
 	if err := checkServerArgsForCluster(
 		serverArgs,
-		tc.replicationMode,
+		tc.clusterArgs.ReplicationMode,
 		// Allow JoinAddr here; servers being added after the TestCluster has been
 		// started should have a JoinAddr filled in at this point.
 		allowJoinAddr,
 	); err != nil {
-		return err
+		return nil, err
 	}
 	serverArgs.Stopper = stop.NewStopper()
-	if tc.replicationMode == base.ReplicationManual {
+	if tc.clusterArgs.ReplicationMode == base.ReplicationManual {
 		var stkCopy kvserver.StoreTestingKnobs
 		if stk := serverArgs.Knobs.Store; stk != nil {
 			stkCopy = *stk.(*kvserver.StoreTestingKnobs)
@@ -348,22 +377,56 @@ func (tc *TestCluster) doAddServer(t testing.TB, serverArgs base.TestServerArgs)
 		serverArgs.Knobs.Store = &stkCopy
 	}
 
-	s, conn, _ := serverutils.StartServer(t, serverArgs)
+	// Install listener, if non-empty.
+	if serverArgs.Listener != nil {
+		// Instantiate the server testing knobs if non-empty.
+		if serverArgs.Knobs.Server == nil {
+			serverArgs.Knobs.Server = &server.TestingKnobs{}
+		} else {
+			// Copy the knobs so the struct with the listener is not
+			// reused for other nodes.
+			knobs := *serverArgs.Knobs.Server.(*server.TestingKnobs)
+			serverArgs.Knobs.Server = &knobs
+		}
+
+		// Install the provided listener.
+		serverArgs.Knobs.Server.(*server.TestingKnobs).RPCListener = serverArgs.Listener
+		serverArgs.Addr = serverArgs.Listener.Addr().String()
+	}
+
+	s := serverutils.NewServer(serverArgs).(*server.TestServer)
+
+	tc.Servers = append(tc.Servers, s)
+	tc.serverArgs = append(tc.serverArgs, serverArgs)
+	return s, nil
+}
+
+// StartServer is the companion method to AddServer, and is responsible for
+// actually starting the server.
+func (tc *TestCluster) StartServer(
+	server serverutils.TestServerInterface, serverArgs base.TestServerArgs,
+) error {
+	if err := server.Start(); err != nil {
+		return err
+	}
+
+	dbConn, err := serverutils.OpenDBConnE(server, serverArgs, server.Stopper())
+	if err != nil {
+		return err
+	}
 
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
-	tc.Servers = append(tc.Servers, s.(*server.TestServer))
-	tc.Conns = append(tc.Conns, conn)
-	tc.mu.serverStoppers = append(tc.mu.serverStoppers, serverArgs.Stopper)
+	tc.Conns = append(tc.Conns, dbConn)
+	tc.mu.serverStoppers = append(tc.mu.serverStoppers, server.Stopper())
 	return nil
 }
 
-// WaitForStores waits for all of the store descriptors to be gossiped. Servers
-// other than the first "bootstrap" their stores asynchronously, but we'd like
-// to wait for all of the stores to be initialized before returning the
-// TestCluster.
-func (tc *TestCluster) WaitForStores(t testing.TB, g *gossip.Gossip) {
+// WaitForNStores waits for N store descriptors to be gossiped. Servers other
+// than the first "bootstrap" their stores asynchronously, but we'd like to have
+// control over when stores get initialized before returning the TestCluster.
+func (tc *TestCluster) WaitForNStores(t testing.TB, n int, g *gossip.Gossip) {
 	// Register a gossip callback for the store descriptors.
 	var storesMu syncutil.Mutex
 	stores := map[roachpb.StoreID]struct{}{}
@@ -384,7 +447,7 @@ func (tc *TestCluster) WaitForStores(t testing.TB, g *gossip.Gossip) {
 			}
 
 			stores[desc.StoreID] = struct{}{}
-			if len(stores) == len(tc.Servers) {
+			if len(stores) == n {
 				close(storesDoneOnce)
 				storesDoneOnce = nil
 			}
@@ -685,15 +748,14 @@ func (tc *TestCluster) FindRangeLeaseHolder(
 // kv scratch space (it doesn't overlap system spans or SQL tables). The range
 // is lazily split off on the first call to ScratchRange.
 func (tc *TestCluster) ScratchRange(t testing.TB) roachpb.Key {
-	scratchKey := keys.TableDataMax
-	if tc.scratchRangeID > 0 {
-		return scratchKey
+	if tc.scratchRangeKey != nil {
+		return tc.scratchRangeKey
 	}
-	_, right, err := tc.SplitRange(scratchKey)
+	scratchKey, err := tc.Servers[0].ScratchRange()
 	if err != nil {
 		t.Fatal(err)
 	}
-	tc.scratchRangeID = right.RangeID
+	tc.scratchRangeKey = scratchKey
 	return scratchKey
 }
 
@@ -874,7 +936,7 @@ func (tc *TestCluster) WaitForNodeLiveness(t testing.TB) {
 
 // ReplicationMode implements TestClusterInterface.
 func (tc *TestCluster) ReplicationMode() base.TestClusterReplicationMode {
-	return tc.replicationMode
+	return tc.clusterArgs.ReplicationMode
 }
 
 // ToggleReplicateQueues activates or deactivates the replication queues on all
@@ -888,14 +950,67 @@ func (tc *TestCluster) ToggleReplicateQueues(active bool) {
 	}
 }
 
+// readIntFromStores reads the current integer value at the given key
+// from all configured engines, filling in zeros when the value is not
+// found.
+func (tc *TestCluster) readIntFromStores(key roachpb.Key) []int64 {
+	results := make([]int64, 0, len(tc.Servers))
+	for _, server := range tc.Servers {
+		err := server.Stores().VisitStores(func(s *kvserver.Store) error {
+			val, _, err := storage.MVCCGet(context.Background(), s.Engine(), key,
+				server.Clock().Now(), storage.MVCCGetOptions{})
+			if err != nil {
+				log.VEventf(context.Background(), 1, "store %d: error reading from key %s: %s", s.StoreID(), key, err)
+			} else if val == nil {
+				log.VEventf(context.Background(), 1, "store %d: missing key %s", s.StoreID(), key)
+			} else {
+				result, err := val.GetInt()
+				if err != nil {
+					log.Errorf(context.Background(), "store %d: error decoding %s from key %s: %+v", s.StoreID(), val, key, err)
+				}
+				results = append(results, result)
+			}
+			return nil
+		})
+		if err != nil {
+			log.VEventf(context.Background(), 1, "node %d: error reading from key %s: %s", server.NodeID(), key, err)
+		}
+	}
+	return results
+}
+
+// WaitForValues waits up to the given duration for the integer values
+// at the given key to match the expected slice (across all stores).
+// Fails the test if they do not match.
+func (tc *TestCluster) WaitForValues(t testing.TB, key roachpb.Key, expected []int64) {
+	t.Helper()
+	testutils.SucceedsSoon(t, func() error {
+		actual := tc.readIntFromStores(key)
+		if !reflect.DeepEqual(expected, actual) {
+			return errors.Errorf("expected %v, got %v", expected, actual)
+		}
+		return nil
+	})
+}
+
+// GetFirstStoreFromServer get the first store from the specified server.
+func (tc *TestCluster) GetFirstStoreFromServer(t testing.TB, server int) *kvserver.Store {
+	ts := tc.Servers[server]
+	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+	if pErr != nil {
+		t.Fatal(pErr)
+	}
+	return store
+}
+
 type testClusterFactoryImpl struct{}
 
 // TestClusterFactory can be passed to serverutils.InitTestClusterFactory
 var TestClusterFactory serverutils.TestClusterFactory = testClusterFactoryImpl{}
 
-// StartTestCluster is part of TestClusterFactory interface.
-func (testClusterFactoryImpl) StartTestCluster(
+// NewTestCluster is part of the TestClusterFactory interface.
+func (testClusterFactoryImpl) NewTestCluster(
 	t testing.TB, numNodes int, args base.TestClusterArgs,
 ) serverutils.TestClusterInterface {
-	return StartTestCluster(t, numNodes, args)
+	return NewTestCluster(t, numNodes, args)
 }

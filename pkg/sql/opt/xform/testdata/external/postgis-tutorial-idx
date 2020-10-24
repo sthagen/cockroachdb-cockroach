@@ -22,33 +22,34 @@ WHERE
 ORDER BY
     name, boroname
 ----
-project
+sort
  ├── columns: name:3 boroname:2
  ├── immutable
  ├── ordering: +3,+2
- └── select
-      ├── columns: boroname:2 name:3 geom:4
+ └── project
+      ├── columns: boroname:2 name:3
       ├── immutable
-      ├── ordering: +3,+2
-      ├── sort
-      │    ├── columns: boroname:2 name:3 geom:4
-      │    ├── ordering: +3,+2
-      │    └── index-join nyc_neighborhoods
-      │         ├── columns: boroname:2 name:3 geom:4
-      │         └── inverted-filter
-      │              ├── columns: gid:1!null
-      │              ├── inverted expression: /6
-      │              │    ├── tight: false
-      │              │    └── union spans: ["\x87\xff", "\x87\xff"]
-      │              ├── key: (1)
-      │              └── scan nyc_neighborhoods@nyc_neighborhoods_geom_idx
-      │                   ├── columns: gid:1!null geom_inverted_key:6!null
-      │                   ├── inverted constraint: /6/1
-      │                   │    └── spans: ["\x87\xff", "\x87\xff"]
-      │                   ├── key: (1)
-      │                   └── fd: (1)-->(6)
-      └── filters
-           └── st_intersects(geom:4, '0101000020266900000000000026CF21410000008016315141') [outer=(4), immutable]
+      └── select
+           ├── columns: boroname:2 name:3 geom:4!null
+           ├── immutable
+           ├── index-join nyc_neighborhoods
+           │    ├── columns: boroname:2 name:3 geom:4
+           │    └── inverted-filter
+           │         ├── columns: gid:1!null
+           │         ├── inverted expression: /6
+           │         │    ├── tight: false
+           │         │    └── union spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
+           │         ├── pre-filterer expression
+           │         │    └── st_intersects('0101000020266900000000000026CF21410000008016315141', geom:4)
+           │         ├── key: (1)
+           │         └── scan nyc_neighborhoods@nyc_neighborhoods_geom_idx
+           │              ├── columns: gid:1!null geom_inverted_key:6!null
+           │              ├── inverted constraint: /6/1
+           │              │    └── spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
+           │              ├── key: (1)
+           │              └── fd: (1)-->(6)
+           └── filters
+                └── st_intersects(geom:4, '0101000020266900000000000026CF21410000008016315141') [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 # 11.6
 opt
@@ -65,33 +66,34 @@ WHERE
 ORDER BY
     name ASC
 ----
-project
+sort
  ├── columns: name:3
  ├── immutable
  ├── ordering: +3
- └── select
-      ├── columns: name:3 geom:6
+ └── project
+      ├── columns: name:3
       ├── immutable
-      ├── ordering: +3
-      ├── sort
-      │    ├── columns: name:3 geom:6
-      │    ├── ordering: +3
-      │    └── index-join nyc_streets
-      │         ├── columns: name:3 geom:6
-      │         └── inverted-filter
-      │              ├── columns: gid:1!null
-      │              ├── inverted expression: /8
-      │              │    ├── tight: false
-      │              │    └── union spans: ["\x87\xff", "\x87\xff"]
-      │              ├── key: (1)
-      │              └── scan nyc_streets@nyc_streets_geom_idx
-      │                   ├── columns: gid:1!null geom_inverted_key:8!null
-      │                   ├── inverted constraint: /8/1
-      │                   │    └── spans: ["\x87\xff", "\x87\xff"]
-      │                   ├── key: (1)
-      │                   └── fd: (1)-->(8)
-      └── filters
-           └── st_dwithin(geom:6, '0101000020266900000000000026CF21410000008016315141', 10.0) [outer=(6), immutable]
+      └── select
+           ├── columns: name:3 geom:6!null
+           ├── immutable
+           ├── index-join nyc_streets
+           │    ├── columns: name:3 geom:6
+           │    └── inverted-filter
+           │         ├── columns: gid:1!null
+           │         ├── inverted expression: /8
+           │         │    ├── tight: false
+           │         │    └── union spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
+           │         ├── pre-filterer expression
+           │         │    └── st_dwithin('0101000020266900000000000026CF21410000008016315141', geom:6, 10.0)
+           │         ├── key: (1)
+           │         └── scan nyc_streets@nyc_streets_geom_idx
+           │              ├── columns: gid:1!null geom_inverted_key:8!null
+           │              ├── inverted constraint: /8/1
+           │              │    └── spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
+           │              ├── key: (1)
+           │              └── fd: (1)-->(8)
+           └── filters
+                └── st_dwithin(geom:6, '0101000020266900000000000026CF21410000008016315141', 10.0) [outer=(6), immutable, constraints=(/6: (/NULL - ])]
 
 # 12.1.2
 opt
@@ -110,33 +112,34 @@ WHERE
 ORDER BY
     name, boroname
 ----
-project
+sort
  ├── columns: name:3 boroname:2
  ├── immutable
  ├── ordering: +3,+2
- └── select
-      ├── columns: boroname:2 name:3 geom:4
+ └── project
+      ├── columns: boroname:2 name:3
       ├── immutable
-      ├── ordering: +3,+2
-      ├── sort
-      │    ├── columns: boroname:2 name:3 geom:4
-      │    ├── ordering: +3,+2
-      │    └── index-join nyc_neighborhoods
-      │         ├── columns: boroname:2 name:3 geom:4
-      │         └── inverted-filter
-      │              ├── columns: gid:1!null
-      │              ├── inverted expression: /6
-      │              │    ├── tight: false
-      │              │    └── union spans: ["\x87\xff", "\x87\xff"]
-      │              ├── key: (1)
-      │              └── scan nyc_neighborhoods@nyc_neighborhoods_geom_idx
-      │                   ├── columns: gid:1!null geom_inverted_key:6!null
-      │                   ├── inverted constraint: /6/1
-      │                   │    └── spans: ["\x87\xff", "\x87\xff"]
-      │                   ├── key: (1)
-      │                   └── fd: (1)-->(6)
-      └── filters
-           └── st_intersects(geom:4, '01020000202669000002000000000000003CE8214100000080A22E514100000000E0E8214100000000A62E5141') [outer=(4), immutable]
+      └── select
+           ├── columns: boroname:2 name:3 geom:4!null
+           ├── immutable
+           ├── index-join nyc_neighborhoods
+           │    ├── columns: boroname:2 name:3 geom:4
+           │    └── inverted-filter
+           │         ├── columns: gid:1!null
+           │         ├── inverted expression: /6
+           │         │    ├── tight: false
+           │         │    └── union spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
+           │         ├── pre-filterer expression
+           │         │    └── st_intersects('01020000202669000002000000000000003CE8214100000080A22E514100000000E0E8214100000000A62E5141', geom:4)
+           │         ├── key: (1)
+           │         └── scan nyc_neighborhoods@nyc_neighborhoods_geom_idx
+           │              ├── columns: gid:1!null geom_inverted_key:6!null
+           │              ├── inverted constraint: /6/1
+           │              │    └── spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
+           │              ├── key: (1)
+           │              └── fd: (1)-->(6)
+           └── filters
+                └── st_intersects(geom:4, '01020000202669000002000000000000003CE8214100000080A22E514100000000E0E8214100000000A62E5141') [outer=(4), immutable, constraints=(/4: (/NULL - ])]
 
 # 12.2.3
 opt
@@ -156,33 +159,34 @@ WHERE
 ORDER BY
     name
 ----
-project
+sort
  ├── columns: name:3
  ├── immutable
  ├── ordering: +3
- └── select
-      ├── columns: name:3 geom:6
+ └── project
+      ├── columns: name:3
       ├── immutable
-      ├── ordering: +3
-      ├── sort
-      │    ├── columns: name:3 geom:6
-      │    ├── ordering: +3
-      │    └── index-join nyc_streets
-      │         ├── columns: name:3 geom:6
-      │         └── inverted-filter
-      │              ├── columns: gid:1!null
-      │              ├── inverted expression: /8
-      │              │    ├── tight: false
-      │              │    └── union spans: ["\x87\xff", "\x87\xff"]
-      │              ├── key: (1)
-      │              └── scan nyc_streets@nyc_streets_geom_idx
-      │                   ├── columns: gid:1!null geom_inverted_key:8!null
-      │                   ├── inverted constraint: /8/1
-      │                   │    └── spans: ["\x87\xff", "\x87\xff"]
-      │                   ├── key: (1)
-      │                   └── fd: (1)-->(8)
-      └── filters
-           └── st_dwithin(geom:6, '01020000202669000002000000000000003CE8214100000080A22E514100000000E0E8214100000000A62E5141', 0.1) [outer=(6), immutable]
+      └── select
+           ├── columns: name:3 geom:6!null
+           ├── immutable
+           ├── index-join nyc_streets
+           │    ├── columns: name:3 geom:6
+           │    └── inverted-filter
+           │         ├── columns: gid:1!null
+           │         ├── inverted expression: /8
+           │         │    ├── tight: false
+           │         │    └── union spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
+           │         ├── pre-filterer expression
+           │         │    └── st_dwithin('01020000202669000002000000000000003CE8214100000080A22E514100000000E0E8214100000000A62E5141', geom:6, 0.1)
+           │         ├── key: (1)
+           │         └── scan nyc_streets@nyc_streets_geom_idx
+           │              ├── columns: gid:1!null geom_inverted_key:8!null
+           │              ├── inverted constraint: /8/1
+           │              │    └── spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
+           │              ├── key: (1)
+           │              └── fd: (1)-->(8)
+           └── filters
+                └── st_dwithin(geom:6, '01020000202669000002000000000000003CE8214100000080A22E514100000000E0E8214100000000A62E5141', 0.1) [outer=(6), immutable, constraints=(/6: (/NULL - ])]
 
 # 12.2.4
 opt
@@ -207,7 +211,7 @@ scalar-group-by
  ├── key: ()
  ├── fd: ()-->(13)
  ├── select
- │    ├── columns: popn_total:3 geom:10
+ │    ├── columns: popn_total:3 geom:10!null
  │    ├── immutable
  │    ├── index-join nyc_census_blocks
  │    │    ├── columns: popn_total:3 geom:10
@@ -215,16 +219,18 @@ scalar-group-by
  │    │         ├── columns: gid:1!null
  │    │         ├── inverted expression: /12
  │    │         │    ├── tight: false
- │    │         │    └── union spans: ["\x87\xff", "\x87\xff"]
+ │    │         │    └── union spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
+ │    │         ├── pre-filterer expression
+ │    │         │    └── st_dwithin('01020000202669000002000000000000003CE8214100000080A22E514100000000E0E8214100000000A62E5141', geom:10, 50.0)
  │    │         ├── key: (1)
  │    │         └── scan nyc_census_blocks@nyc_census_blocks_geom_idx
  │    │              ├── columns: gid:1!null geom_inverted_key:12!null
  │    │              ├── inverted constraint: /12/1
- │    │              │    └── spans: ["\x87\xff", "\x87\xff"]
+ │    │              │    └── spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
  │    │              ├── key: (1)
  │    │              └── fd: (1)-->(12)
  │    └── filters
- │         └── st_dwithin(geom:10, '01020000202669000002000000000000003CE8214100000080A22E514100000000E0E8214100000000A62E5141', 50.0) [outer=(10), immutable]
+ │         └── st_dwithin(geom:10, '01020000202669000002000000000000003CE8214100000080A22E514100000000E0E8214100000000A62E5141', 50.0) [outer=(10), immutable, constraints=(/10: (/NULL - ])]
  └── aggregations
       └── sum [as=sum:13, outer=(3)]
            └── popn_total:3
@@ -254,7 +260,7 @@ sort
       ├── immutable
       ├── fd: ()-->(10)
       └── inner-join (lookup nyc_neighborhoods)
-           ├── columns: boroname:2 neighborhoods.name:3 neighborhoods.geom:4 subways.name:10!null subways.geom:22
+           ├── columns: boroname:2 neighborhoods.name:3 neighborhoods.geom:4!null subways.name:10!null subways.geom:22!null
            ├── key columns: [1] = [1]
            ├── lookup columns are key
            ├── immutable
@@ -273,7 +279,7 @@ sort
            │    │         └── subways.name:10 = 'Broad St' [outer=(10), constraints=(/10: [/'Broad St' - /'Broad St']; tight), fd=()-->(10)]
            │    └── filters (true)
            └── filters
-                └── st_contains(neighborhoods.geom:4, subways.geom:22) [outer=(4,22), immutable]
+                └── st_contains(neighborhoods.geom:4, subways.geom:22) [outer=(4,22), immutable, constraints=(/4: (/NULL - ]; /22: (/NULL - ])]
 
 # 13.1a
 opt
@@ -313,7 +319,7 @@ sort
       │    ├── key: (3)
       │    ├── fd: (3)-->(19-21)
       │    ├── inner-join (lookup nyc_census_blocks)
-      │    │    ├── columns: neighborhoods.boroname:2!null name:3 neighborhoods.geom:4 popn_total:9 popn_white:10 popn_black:11 census.geom:16
+      │    │    ├── columns: neighborhoods.boroname:2!null name:3 neighborhoods.geom:4!null popn_total:9 popn_white:10 popn_black:11 census.geom:16!null
       │    │    ├── key columns: [7] = [7]
       │    │    ├── lookup columns are key
       │    │    ├── immutable
@@ -332,7 +338,7 @@ sort
       │    │    │    │         └── neighborhoods.boroname:2 = 'Manhattan' [outer=(2), constraints=(/2: [/'Manhattan' - /'Manhattan']; tight), fd=()-->(2)]
       │    │    │    └── filters (true)
       │    │    └── filters
-      │    │         └── st_intersects(neighborhoods.geom:4, census.geom:16) [outer=(4,16), immutable]
+      │    │         └── st_intersects(neighborhoods.geom:4, census.geom:16) [outer=(4,16), immutable, constraints=(/4: (/NULL - ]; /16: (/NULL - ])]
       │    └── aggregations
       │         ├── sum [as=sum:19, outer=(9)]
       │         │    └── popn_total:9
@@ -370,7 +376,7 @@ project
  │    ├── key: ()
  │    ├── fd: ()-->(31-33)
  │    ├── inner-join (lookup nyc_census_blocks)
- │    │    ├── columns: popn_total:3 popn_white:4 popn_black:5 census.geom:10 routes:23 subways.geom:28
+ │    │    ├── columns: popn_total:3 popn_white:4 popn_black:5 census.geom:10!null routes:23 subways.geom:28!null
  │    │    ├── key columns: [1] = [1]
  │    │    ├── lookup columns are key
  │    │    ├── immutable
@@ -388,7 +394,7 @@ project
  │    │    │    │         └── strpos(routes:23, 'A') > 0 [outer=(23), immutable]
  │    │    │    └── filters (true)
  │    │    └── filters
- │    │         └── st_dwithin(census.geom:10, subways.geom:28, 200.0) [outer=(10,28), immutable]
+ │    │         └── st_dwithin(census.geom:10, subways.geom:28, 200.0) [outer=(10,28), immutable, constraints=(/10: (/NULL - ]; /28: (/NULL - ])]
  │    └── aggregations
  │         ├── sum [as=sum:31, outer=(4)]
  │         │    └── popn_white:4
@@ -438,10 +444,10 @@ sort
       │    ├── key: (31)
       │    ├── fd: (31)-->(34-36)
       │    ├── inner-join (cross)
-      │    │    ├── columns: popn_total:3 popn_white:4 popn_black:5 census.geom:10 routes:23 subways.geom:28 route:31
+      │    │    ├── columns: popn_total:3 popn_white:4 popn_black:5 census.geom:10!null routes:23 subways.geom:28!null route:31
       │    │    ├── immutable
       │    │    ├── inner-join (lookup nyc_census_blocks)
-      │    │    │    ├── columns: popn_total:3 popn_white:4 popn_black:5 census.geom:10 routes:23 subways.geom:28
+      │    │    │    ├── columns: popn_total:3 popn_white:4 popn_black:5 census.geom:10!null routes:23 subways.geom:28!null
       │    │    │    ├── key columns: [1] = [1]
       │    │    │    ├── lookup columns are key
       │    │    │    ├── immutable
@@ -453,7 +459,7 @@ sort
       │    │    │    │    │    └── columns: routes:23 subways.geom:28
       │    │    │    │    └── filters (true)
       │    │    │    └── filters
-      │    │    │         └── st_dwithin(census.geom:10, subways.geom:28, 200.0) [outer=(10,28), immutable]
+      │    │    │         └── st_dwithin(census.geom:10, subways.geom:28, 200.0) [outer=(10,28), immutable, constraints=(/10: (/NULL - ]; /28: (/NULL - ])]
       │    │    ├── scan lines
       │    │    │    └── columns: route:31
       │    │    └── filters
@@ -484,7 +490,7 @@ project
  ├── columns: name:4 routes:11
  ├── immutable
  └── inner-join (lookup nyc_subway_stations)
-      ├── columns: s.name:4 routes:11 s.geom:16 n.name:21!null n.geom:22
+      ├── columns: s.name:4 routes:11 s.geom:16!null n.name:21!null n.geom:22!null
       ├── key columns: [1] = [1]
       ├── lookup columns are key
       ├── immutable
@@ -503,7 +509,7 @@ project
       │    │         └── n.name:21 = 'Little Italy' [outer=(21), constraints=(/21: [/'Little Italy' - /'Little Italy']; tight), fd=()-->(21)]
       │    └── filters (true)
       └── filters
-           └── st_contains(n.geom:22, s.geom:16) [outer=(16,22), immutable]
+           └── st_contains(n.geom:22, s.geom:16) [outer=(16,22), immutable, constraints=(/16: (/NULL - ]; /22: (/NULL - ])]
 
 # 14.2b
 opt
@@ -529,7 +535,7 @@ sort
       ├── immutable
       ├── key: (20,21)
       └── inner-join (lookup nyc_neighborhoods)
-           ├── columns: routes:11 s.geom:16 boroname:20 n.name:21 n.geom:22
+           ├── columns: routes:11 s.geom:16!null boroname:20 n.name:21 n.geom:22!null
            ├── key columns: [19] = [19]
            ├── lookup columns are key
            ├── immutable
@@ -547,7 +553,7 @@ sort
            │    │         └── strpos(routes:11, '6') > 0 [outer=(11), immutable]
            │    └── filters (true)
            └── filters
-                └── st_contains(n.geom:22, s.geom:16) [outer=(16,22), immutable]
+                └── st_contains(n.geom:22, s.geom:16) [outer=(16,22), immutable, constraints=(/16: (/NULL - ]; /22: (/NULL - ])]
 
 # 14.2c
 opt
@@ -567,7 +573,7 @@ scalar-group-by
  ├── key: ()
  ├── fd: ()-->(19)
  ├── inner-join (lookup nyc_census_blocks)
- │    ├── columns: name:3!null n.geom:4 popn_total:9 c.geom:16
+ │    ├── columns: name:3!null n.geom:4!null popn_total:9 c.geom:16!null
  │    ├── key columns: [7] = [7]
  │    ├── lookup columns are key
  │    ├── immutable
@@ -586,7 +592,7 @@ scalar-group-by
  │    │    │         └── name:3 = 'Battery Park' [outer=(3), constraints=(/3: [/'Battery Park' - /'Battery Park']; tight), fd=()-->(3)]
  │    │    └── filters (true)
  │    └── filters
- │         └── st_intersects(n.geom:4, c.geom:16) [outer=(4,16), immutable]
+ │         └── st_intersects(n.geom:4, c.geom:16) [outer=(4,16), immutable, constraints=(/4: (/NULL - ]; /16: (/NULL - ])]
  └── aggregations
       └── sum [as=sum:19, outer=(9)]
            └── popn_total:9
@@ -608,42 +614,45 @@ GROUP BY
 ORDER BY
     n.name
 ----
-sort
+project
  ├── columns: name:15!null popn_per_sqkm:20
  ├── immutable
  ├── ordering: +15
- └── project
-      ├── columns: popn_per_sqkm:20 name:15!null
-      ├── immutable
-      ├── group-by
-      │    ├── columns: name:15!null n.geom:16 sum:19
-      │    ├── grouping columns: name:15!null n.geom:16
-      │    ├── immutable
-      │    ├── key: (15,16)
-      │    ├── fd: (15,16)-->(19)
-      │    ├── inner-join (lookup nyc_census_blocks)
-      │    │    ├── columns: popn_total:3 c.geom:10 name:15!null n.geom:16
-      │    │    ├── key columns: [1] = [1]
-      │    │    ├── lookup columns are key
-      │    │    ├── immutable
-      │    │    ├── inner-join (inverted-lookup nyc_census_blocks@nyc_census_blocks_geom_idx)
-      │    │    │    ├── columns: c.gid:1!null name:15!null n.geom:16
-      │    │    │    ├── inverted-expr
-      │    │    │    │    └── st_intersects(n.geom:16, c.geom:10)
-      │    │    │    ├── select
-      │    │    │    │    ├── columns: name:15!null n.geom:16
-      │    │    │    │    ├── scan n
-      │    │    │    │    │    └── columns: name:15 n.geom:16
-      │    │    │    │    └── filters
-      │    │    │    │         └── (name:15 = 'Upper West Side') OR (name:15 = 'Upper East Side') [outer=(15), constraints=(/15: [/'Upper East Side' - /'Upper East Side'] [/'Upper West Side' - /'Upper West Side']; tight)]
-      │    │    │    └── filters (true)
-      │    │    └── filters
-      │    │         └── st_intersects(c.geom:10, n.geom:16) [outer=(10,16), immutable]
-      │    └── aggregations
-      │         └── sum [as=sum:19, outer=(3)]
-      │              └── popn_total:3
-      └── projections
-           └── sum:19 / (st_area(n.geom:16) / 1e+06) [as=popn_per_sqkm:20, outer=(16,19), immutable]
+ ├── group-by
+ │    ├── columns: name:15!null n.geom:16!null sum:19
+ │    ├── grouping columns: name:15!null n.geom:16!null
+ │    ├── immutable
+ │    ├── key: (15,16)
+ │    ├── fd: (15,16)-->(19)
+ │    ├── ordering: +15
+ │    ├── inner-join (lookup nyc_census_blocks)
+ │    │    ├── columns: popn_total:3 c.geom:10!null name:15!null n.geom:16!null
+ │    │    ├── key columns: [1] = [1]
+ │    │    ├── lookup columns are key
+ │    │    ├── immutable
+ │    │    ├── ordering: +15
+ │    │    ├── inner-join (inverted-lookup nyc_census_blocks@nyc_census_blocks_geom_idx)
+ │    │    │    ├── columns: c.gid:1!null name:15!null n.geom:16
+ │    │    │    ├── inverted-expr
+ │    │    │    │    └── st_intersects(n.geom:16, c.geom:10)
+ │    │    │    ├── ordering: +15
+ │    │    │    ├── sort
+ │    │    │    │    ├── columns: name:15!null n.geom:16
+ │    │    │    │    ├── ordering: +15
+ │    │    │    │    └── select
+ │    │    │    │         ├── columns: name:15!null n.geom:16
+ │    │    │    │         ├── scan n
+ │    │    │    │         │    └── columns: name:15 n.geom:16
+ │    │    │    │         └── filters
+ │    │    │    │              └── (name:15 = 'Upper West Side') OR (name:15 = 'Upper East Side') [outer=(15), constraints=(/15: [/'Upper East Side' - /'Upper East Side'] [/'Upper West Side' - /'Upper West Side']; tight)]
+ │    │    │    └── filters (true)
+ │    │    └── filters
+ │    │         └── st_intersects(c.geom:10, n.geom:16) [outer=(10,16), immutable, constraints=(/10: (/NULL - ]; /16: (/NULL - ])]
+ │    └── aggregations
+ │         └── sum [as=sum:19, outer=(3)]
+ │              └── popn_total:3
+ └── projections
+      └── sum:19 / (st_area(n.geom:16) / 1e+06) [as=popn_per_sqkm:20, outer=(16,19), immutable]
 
 # 15.0
 opt
@@ -660,7 +669,7 @@ project
  ├── columns: blkid:2
  ├── immutable
  └── inner-join (lookup nyc_census_blocks)
-      ├── columns: blkid:2 blocks.geom:10 name:16!null subways.geom:28
+      ├── columns: blkid:2 blocks.geom:10!null name:16!null subways.geom:28!null
       ├── key columns: [1] = [1]
       ├── lookup columns are key
       ├── immutable
@@ -679,4 +688,4 @@ project
       │    │         └── name:16 = 'Broad St' [outer=(16), constraints=(/16: [/'Broad St' - /'Broad St']; tight), fd=()-->(16)]
       │    └── filters (true)
       └── filters
-           └── st_contains(blocks.geom:10, subways.geom:28) [outer=(10,28), immutable]
+           └── st_contains(blocks.geom:10, subways.geom:28) [outer=(10,28), immutable, constraints=(/10: (/NULL - ]; /28: (/NULL - ])]

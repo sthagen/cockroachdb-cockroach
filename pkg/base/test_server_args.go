@@ -12,6 +12,7 @@ package base
 
 import (
 	"context"
+	"net"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -43,6 +44,13 @@ type TestServerArgs struct {
 	// tests don't get log spam about ranges not being replicated enough. This
 	// is always set to true when the server is started via a TestCluster.
 	PartOfCluster bool
+
+	// Listener (if nonempty) is the listener to use for all incoming RPCs.
+	// If a listener is installed, it informs the RPC `Addr` used below. The
+	// Server itself knows to close it out. This is useful for when a test wants
+	// manual control over how the join flags (`JoinAddr`) are populated, and
+	// installs listeners manually to know which addresses to point to.
+	Listener net.Listener
 
 	// Addr (if nonempty) is the RPC address to use for the test server.
 	Addr string
@@ -117,6 +125,9 @@ type TestServerArgs struct {
 	// If set, web session authentication will be disabled, even if the server
 	// is running in secure mode.
 	DisableWebSessionAuthentication bool
+
+	// If set, testing specific descriptor validation will be disabled. even if the server
+	DisableTestingDescriptorValidation bool
 }
 
 // TestClusterArgs contains the parameters one can set when creating a test
@@ -141,6 +152,8 @@ type TestClusterArgs struct {
 	// map. The map's key is an index within TestCluster.Servers. If there is
 	// no entry in the map for a particular server, the default ServerArgs are
 	// used.
+	//
+	// These are indexes: the key 0 corresponds to the first node.
 	//
 	// A copy of an entry from this map will be copied to each individual server
 	// and potentially adjusted according to ReplicationMode.
@@ -180,6 +193,7 @@ func DefaultTestTempStorageConfigWithSize(
 	return TempStorageConfig{
 		InMemory: true,
 		Mon:      monitor,
+		Settings: st,
 	}
 }
 
@@ -207,9 +221,6 @@ const (
 // TestServer.
 type TestTenantArgs struct {
 	TenantID roachpb.TenantID
-
-	// TenantInfo is the metadata used if creating a tenant.
-	TenantInfo []byte
 
 	// Existing, if true, indicates an existing tenant, rather than a new tenant
 	// to be created by StartTenant.

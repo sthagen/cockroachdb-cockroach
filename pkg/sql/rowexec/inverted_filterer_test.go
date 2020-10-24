@@ -19,20 +19,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func intToEncodedInvertedVal(v int64) []byte {
-	dint := tree.DInt(v)
-	encoded, err := sqlbase.EncodeTableKey(nil, &dint, encoding.Ascending)
-	if err != nil {
-		panic("unable to encode int")
-	}
-	return encoded
+	return encoding.EncodeVarintAscending(nil, v)
 }
 
 func intSpanToEncodedSpan(start, end int64) invertedexpr.SpanExpressionProto_Span {
@@ -67,7 +61,7 @@ func TestInvertedFilterer(t *testing.T) {
 					{3, 50},
 					{3, 51},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
@@ -75,7 +69,7 @@ func TestInvertedFilterer(t *testing.T) {
 					{nil, 41},
 					{nil, 50},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				InvertedFilterer: &execinfrapb.InvertedFiltererSpec{},
@@ -92,14 +86,14 @@ func TestInvertedFilterer(t *testing.T) {
 					{12, 3, 41},
 					{14, 3, 43},
 				},
-				Types: sqlbase.MakeIntCols(3),
+				Types: rowenc.MakeIntCols(3),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{12, nil, 41},
 					{14, nil, 43},
 				},
-				Types: sqlbase.MakeIntCols(3),
+				Types: rowenc.MakeIntCols(3),
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				InvertedFilterer: &execinfrapb.InvertedFiltererSpec{

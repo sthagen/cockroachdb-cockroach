@@ -17,7 +17,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/mutations"
+	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -178,6 +179,17 @@ func (f *FlowBase) Setup(
 	ctx, f.ctxCancel = contextutil.WithCancel(ctx)
 	f.ctxDone = ctx.Done()
 	f.spec = spec
+
+	mutationsTestingMaxBatchSize := int64(0)
+	if f.FlowCtx.Cfg.Settings != nil {
+		mutationsTestingMaxBatchSize = mutations.MutationsTestingMaxBatchSize.Get(&f.FlowCtx.Cfg.Settings.SV)
+	}
+	if mutationsTestingMaxBatchSize != 0 {
+		mutations.SetMaxBatchSizeForTests(int(mutationsTestingMaxBatchSize))
+	} else {
+		mutations.ResetMaxBatchSizeForTests()
+	}
+
 	return ctx, nil
 }
 
@@ -478,7 +490,7 @@ func (f *FlowBase) cancel() {
 		go func(receiver InboundStreamHandler) {
 			// Stream has yet to be started; send an error to its
 			// receiver and prevent it from being connected.
-			receiver.Timeout(sqlbase.QueryCanceledError)
+			receiver.Timeout(cancelchecker.QueryCanceledError)
 		}(receiver)
 	}
 }

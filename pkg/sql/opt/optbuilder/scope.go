@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -24,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -226,10 +227,10 @@ func (s *scope) appendOrdinaryColumnsFromTable(tabMeta *opt.TableMeta, alias *tr
 		s.cols = make([]scopeColumn, 0, tab.ColumnCount())
 	}
 	for i, n := 0, tab.ColumnCount(); i < n; i++ {
-		if tab.ColumnKind(i) != cat.Ordinary {
+		tabCol := tab.Column(i)
+		if tabCol.Kind() != cat.Ordinary {
 			continue
 		}
-		tabCol := tab.Column(i)
 		s.cols = append(s.cols, scopeColumn{
 			name:   tabCol.ColName(),
 			table:  *alias,
@@ -310,6 +311,17 @@ func (s *scope) getColumn(col opt.ColumnID) *scopeColumn {
 	for i := range s.extraCols {
 		if s.extraCols[i].id == col {
 			return &s.extraCols[i]
+		}
+	}
+	return nil
+}
+
+// getColumnForTableOrdinal returns the column with a specific tableOrdinal
+// value, or nil if it doesn't exist.
+func (s *scope) getColumnForTableOrdinal(tabOrd int) *scopeColumn {
+	for i := range s.cols {
+		if s.cols[i].tableOrdinal == tabOrd {
+			return &s.cols[i]
 		}
 	}
 	return nil
@@ -598,7 +610,7 @@ func (s *scope) findExistingCol(expr tree.TypedExpr, allowSideEffects bool) *sco
 // will be transferred to the correct scope by buildAggregateFunction.
 func (s *scope) startAggFunc() *scope {
 	if s.inAgg {
-		panic(sqlbase.NewAggInAggError())
+		panic(sqlerrors.NewAggInAggError())
 	}
 	s.inAgg = true
 
@@ -641,7 +653,7 @@ func (s *scope) endAggFunc(cols opt.ColSet) (g *groupby) {
 // aggregate functions.
 func (s *scope) verifyAggregateContext() {
 	if s.inAgg {
-		panic(sqlbase.NewAggInAggError())
+		panic(sqlerrors.NewAggInAggError())
 	}
 
 	switch s.context {
@@ -766,7 +778,7 @@ func (s *scope) FindSourceProvidingColumn(
 	if reportBackfillError {
 		return nil, nil, -1, makeBackfillError(tmpName)
 	}
-	return nil, nil, -1, sqlbase.NewUndefinedColumnError(tree.ErrString(&tmpName))
+	return nil, nil, -1, colinfo.NewUndefinedColumnError(tree.ErrString(&tmpName))
 }
 
 // FindSourceMatchingName is part of the tree.ColumnItemResolver interface.
@@ -854,7 +866,7 @@ func (s *scope) Resolve(
 		}
 	}
 
-	return nil, sqlbase.NewUndefinedColumnError(tree.ErrString(tree.NewColumnItem(prefix, colName)))
+	return nil, colinfo.NewUndefinedColumnError(tree.ErrString(tree.NewColumnItem(prefix, colName)))
 }
 
 func makeUntypedTuple(labels []string, texprs []tree.TypedExpr) *tree.Tuple {

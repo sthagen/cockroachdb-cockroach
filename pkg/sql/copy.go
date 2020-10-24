@@ -21,13 +21,14 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -54,9 +55,13 @@ type copyMachineInterface interface {
 type copyMachine struct {
 	table         tree.TableExpr
 	columns       tree.NameList
-	resultColumns sqlbase.ResultColumns
+	resultColumns colinfo.ResultColumns
 	format        tree.CopyFormat
 	binaryState   binaryState
+	// forceNotNull disables converting values matching the null string to
+	// NULL. The spec says this is only supported for CSV, and also must specify
+	// which columns it applies to.
+	forceNotNull bool
 	// buf is used to parse input data into rows. It also accumulates a partial
 	// row between protocol messages.
 	buf bytes.Buffer
@@ -110,7 +115,7 @@ func newCopyMachine(
 		format:  n.Options.CopyFormat,
 		txnOpt:  txnOpt,
 		// The planner will be prepared before use.
-		p:              planner{execCfg: execCfg, alloc: &sqlbase.DatumAlloc{}},
+		p:              planner{execCfg: execCfg, alloc: &rowenc.DatumAlloc{}},
 		execInsertPlan: execInsertPlan,
 	}
 
@@ -130,14 +135,14 @@ func newCopyMachine(
 	if err := c.p.CheckPrivilege(ctx, tableDesc, privilege.INSERT); err != nil {
 		return nil, err
 	}
-	cols, err := sqlbase.ProcessTargetColumns(tableDesc, n.Columns,
+	cols, err := colinfo.ProcessTargetColumns(tableDesc, n.Columns,
 		true /* ensureColumns */, false /* allowMutations */)
 	if err != nil {
 		return nil, err
 	}
-	c.resultColumns = make(sqlbase.ResultColumns, len(cols))
+	c.resultColumns = make(colinfo.ResultColumns, len(cols))
 	for i := range cols {
-		c.resultColumns[i] = sqlbase.ResultColumn{
+		c.resultColumns[i] = colinfo.ResultColumn{
 			Name:           cols[i].Name,
 			Typ:            cols[i].Type,
 			TableID:        tableDesc.GetID(),
@@ -180,12 +185,20 @@ func (c *copyMachine) run(ctx context.Context) error {
 	}
 
 	// Read from the connection until we see an ClientMsgCopyDone.
-	readBuf := pgwirebase.ReadBuffer{}
-
+	readBuf := pgwirebase.MakeReadBuffer(
+		pgwirebase.ReadBufferOptionWithClusterSettings(&c.p.execCfg.Settings.SV),
+	)
 Loop:
 	for {
 		typ, _, err := readBuf.ReadTypedMsg(c.conn.Rd())
 		if err != nil {
+			if pgwirebase.IsMessageTooBigError(err) && typ == pgwirebase.ClientMsgCopyData {
+				// Slurp the remaining bytes.
+				_, slurpErr := readBuf.SlurpBytes(c.conn.Rd(), pgwirebase.GetMessageTooBigSize(err))
+				if slurpErr != nil {
+					return errors.CombineErrors(err, errors.Wrapf(slurpErr, "error slurping remaining bytes in COPY"))
+				}
+			}
 			return err
 		}
 
@@ -317,7 +330,7 @@ func (c *copyMachine) readBinaryData(ctx context.Context, final bool) (brk bool,
 		}
 	case binaryStateFoundTrailer:
 		if !final {
-			return false, pgerror.New(pgcode.ProtocolViolation,
+			return false, pgerror.New(pgcode.BadCopyFileFormat,
 				"copy data present after trailer")
 		}
 		return true, nil
@@ -341,7 +354,7 @@ func (c *copyMachine) readBinaryTuple(ctx context.Context) error {
 		return nil
 	}
 	if fieldCount < 1 {
-		return pgerror.Newf(pgcode.ProtocolViolation,
+		return pgerror.Newf(pgcode.BadCopyFileFormat,
 			"unexpected field count: %d", fieldCount)
 	}
 	exprs := make(tree.Exprs, fieldCount)
@@ -359,13 +372,15 @@ func (c *copyMachine) readBinaryTuple(ctx context.Context) error {
 			return errors.Newf("partial copy data row")
 		}
 		d, err := pgwirebase.DecodeOidDatum(
+			ctx,
 			c.parsingEvalCtx,
 			c.resultColumns[i].Typ.Oid(),
 			pgwirebase.FormatBinary,
 			data,
+			&c.p,
 		)
 		if err != nil {
-			return pgerror.Wrapf(err, pgcode.ProtocolViolation,
+			return pgerror.Wrapf(err, pgcode.BadCopyFileFormat,
 				"decode datum as %s: %s", c.resultColumns[i].Typ.SQLString(), data)
 		}
 		sz := d.Size()
@@ -391,7 +406,7 @@ func (c *copyMachine) readBinarySignature() error {
 		return err
 	}
 	if !bytes.Equal(sig[:], []byte(binarySignature)) {
-		return pgerror.New(pgcode.ProtocolViolation,
+		return pgerror.New(pgcode.BadCopyFileFormat,
 			"unrecognized binary copy signature")
 	}
 	c.binaryState = binaryStateRead
@@ -418,7 +433,8 @@ func (p *planner) preparePlannerForCopy(
 	stmtTs := txnOpt.stmtTimestamp
 	autoCommit := false
 	if txn == nil {
-		txn = kv.NewTxnWithSteppingEnabled(ctx, p.execCfg.DB, p.execCfg.NodeID.Get())
+		nodeID, _ := p.execCfg.NodeID.OptionalNodeID()
+		txn = kv.NewTxnWithSteppingEnabled(ctx, p.execCfg.DB, nodeID)
 		txnTs = p.execCfg.Clock.PhysicalTime()
 		stmtTs = txnTs
 		autoCommit = true
@@ -500,13 +516,15 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 func (c *copyMachine) readTextTuple(ctx context.Context, line []byte) error {
 	parts := bytes.Split(line, fieldDelim)
 	if len(parts) != len(c.resultColumns) {
-		return pgerror.Newf(pgcode.ProtocolViolation,
+		return pgerror.Newf(pgcode.BadCopyFileFormat,
 			"expected %d values, got %d", len(c.resultColumns), len(parts))
 	}
 	exprs := make(tree.Exprs, len(parts))
 	for i, part := range parts {
 		s := string(part)
-		if s == nullString {
+		// Although the spec says this is only supported for CSV, we need it here to
+		// disable NULL conversion during file uploads.
+		if !c.forceNotNull && s == nullString {
 			exprs[i] = tree.DNull
 			continue
 		}
@@ -521,7 +539,7 @@ func (c *copyMachine) readTextTuple(ctx context.Context, line []byte) error {
 			types.UuidFamily:
 			s = decodeCopy(s)
 		}
-		d, err := sqlbase.ParseDatumStringAsWithRawBytes(c.resultColumns[i].Typ, s, c.parsingEvalCtx)
+		d, err := rowenc.ParseDatumStringAsWithRawBytes(c.resultColumns[i].Typ, s, c.parsingEvalCtx)
 		if err != nil {
 			return err
 		}

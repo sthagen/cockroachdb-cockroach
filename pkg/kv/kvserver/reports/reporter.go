@@ -26,9 +26,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -434,7 +435,7 @@ func visitAncestors(
 ) (bool, error) {
 	// Check to see if it's a table. If so, inherit from the database.
 	// For all other cases, inherit from the default.
-	descVal := cfg.GetValue(sqlbase.MakeDescMetadataKey(keys.TODOSQLCodec, descpb.ID(id)))
+	descVal := cfg.GetValue(catalogkeys.MakeDescMetadataKey(keys.TODOSQLCodec, descpb.ID(id)))
 	if descVal == nil {
 		// Couldn't find a descriptor. This is not expected to happen.
 		// Let's just look at the default zone config.
@@ -447,7 +448,7 @@ func visitAncestors(
 	if err := descVal.GetProto(&desc); err != nil {
 		return false, err
 	}
-	tableDesc := sqlbase.TableFromDescriptor(&desc, descVal.Timestamp)
+	tableDesc := descpb.TableFromDescriptor(&desc, descVal.Timestamp)
 	// If it's a database, the parent is the default zone.
 	if tableDesc == nil {
 		return visitDefaultZone(ctx, cfg, visitor), nil
@@ -783,7 +784,7 @@ func getReportGenerationTime(
 		ctx,
 		"get-previous-timestamp",
 		txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.NodeUser},
+		sessiondata.InternalExecutorOverride{User: security.NodeUser},
 		"select generated from system.reports_meta where id = $1",
 		rid,
 	)

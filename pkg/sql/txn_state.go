@@ -53,6 +53,10 @@ type txnState struct {
 
 		// txnStart records the time that txn started.
 		txnStart time.Time
+
+		// stmtCount keeps track of the number of statements that the transaction
+		// has executed.
+		stmtCount int
 	}
 
 	// connCtx is the connection's context. This is the parent of Ctx.
@@ -129,10 +133,12 @@ const (
 // sqlTimestamp: The timestamp to report for current_timestamp(), now() etc.
 // historicalTimestamp: If non-nil indicates that the transaction is historical
 //   and should be fixed to this timestamp.
-// priority: The transaction's priority.
+// priority: The transaction's priority. Pass roachpb.UnspecifiedUserPriority if the txn arg is
+//   not nil.
 // readOnly: The read-only character of the new txn.
 // txn: If not nil, this txn will be used instead of creating a new txn. If so,
-//      all the other arguments need to correspond to the attributes of this txn.
+//   all the other arguments need to correspond to the attributes of this txn
+//   (unless otherwise specified).
 // tranCtx: A bag of extra execution context.
 func (ts *txnState) resetForNewSQLTxn(
 	connCtx context.Context,
@@ -170,6 +176,8 @@ func (ts *txnState) resetForNewSQLTxn(
 		)
 	} else {
 		// Create a root span for this SQL txn.
+		// TODO(tbg): this is the only use of RecordableSpan. Can we instead interchange
+		// the span when we decide that it needs to be traced?
 		sp = tranCtx.tracer.(*tracing.Tracer).StartRootSpan(
 			opName, logtags.FromContext(connCtx), tracing.RecordableSpan)
 	}
@@ -198,19 +206,23 @@ func (ts *txnState) resetForNewSQLTxn(
 
 	ts.mon.Start(ts.Ctx, tranCtx.connMon, mon.BoundAccount{} /* reserved */)
 	ts.mu.Lock()
+	ts.mu.stmtCount = 0
 	if txn == nil {
 		ts.mu.txn = kv.NewTxnWithSteppingEnabled(ts.Ctx, tranCtx.db, tranCtx.nodeIDOrZero)
 		ts.mu.txn.SetDebugName(opName)
+		if err := ts.setPriorityLocked(priority); err != nil {
+			panic(err)
+		}
 	} else {
+		if priority != roachpb.UnspecifiedUserPriority {
+			panic(errors.AssertionFailedf("unexpected priority when using an existing txn: %s", priority))
+		}
 		ts.mu.txn = txn
 	}
 	ts.mu.txnStart = timeutil.Now()
 	ts.mu.Unlock()
 	if historicalTimestamp != nil {
 		ts.setHistoricalTimestamp(ts.Ctx, *historicalTimestamp)
-	}
-	if err := ts.setPriority(priority); err != nil {
-		panic(err)
 	}
 	if err := ts.setReadOnlyMode(readOnly); err != nil {
 		panic(err)
@@ -227,7 +239,7 @@ func (ts *txnState) finishSQLTxn() {
 		ts.cancel = nil
 	}
 	if ts.sp == nil {
-		panic("No span in context? Was resetForNewSQLTxn() called previously?")
+		panic(errors.AssertionFailedf("No span in context? Was resetForNewSQLTxn() called previously?"))
 	}
 
 	if ts.recordingThreshold > 0 {
@@ -240,7 +252,7 @@ func (ts *txnState) finishSQLTxn() {
 				}
 			}
 		} else {
-			log.Warning(ts.Ctx, "Missing trace when sampled was enabled.")
+			log.Warning(ts.Ctx, "missing trace when sampled was enabled")
 		}
 	}
 
@@ -294,9 +306,12 @@ func (ts *txnState) getReadTimestamp() hlc.Timestamp {
 
 func (ts *txnState) setPriority(userPriority roachpb.UserPriority) error {
 	ts.mu.Lock()
-	err := ts.mu.txn.SetUserPriority(userPriority)
-	ts.mu.Unlock()
-	if err != nil {
+	defer ts.mu.Unlock()
+	return ts.setPriorityLocked(userPriority)
+}
+
+func (ts *txnState) setPriorityLocked(userPriority roachpb.UserPriority) error {
+	if err := ts.mu.txn.SetUserPriority(userPriority); err != nil {
 		return err
 	}
 	ts.priority = userPriority

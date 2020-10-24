@@ -785,7 +785,7 @@ func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *FunctionDefinitio
 	if def.UnsupportedWithIssue != 0 {
 		// Note: no need to embed the function name in the message; the
 		// caller will add the function name as prefix.
-		const msg = "this function is not supported"
+		const msg = "this function is not yet supported"
 		if def.UnsupportedWithIssue < 0 {
 			return unimplemented.New(def.Name+"()", msg)
 		}
@@ -837,6 +837,17 @@ func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *FunctionDefinitio
 	return nil
 }
 
+// NewContextDependentOpsNotAllowedError creates an error for the case when
+// context-dependent operators are not allowed in the given context.
+func NewContextDependentOpsNotAllowedError(context string) error {
+	// The code FeatureNotSupported is a bit misleading here,
+	// because we probably can't support the feature at all. However
+	// this error code matches PostgreSQL's in the same conditions.
+	return pgerror.Newf(pgcode.FeatureNotSupported,
+		"context-dependent operators are not allowed in %s", context,
+	)
+}
+
 // checkVolatility checks whether an operator with the given volatility is
 // allowed in the current context.
 func (sc *SemaContext) checkVolatility(v Volatility) error {
@@ -854,13 +865,7 @@ func (sc *SemaContext) checkVolatility(v Volatility) error {
 		}
 	case VolatilityStable:
 		if sc.Properties.required.rejectFlags&RejectStableOperators != 0 {
-			// The code FeatureNotSupported is a bit misleading here,
-			// because we probably can't support the feature at all. However
-			// this error code matches PostgreSQL's in the same conditions.
-			return pgerror.Newf(pgcode.FeatureNotSupported,
-				"context-dependent operators are not allowed in %s",
-				sc.Properties.required.context,
-			)
+			return NewContextDependentOpsNotAllowedError(sc.Properties.required.context)
 		}
 	}
 	return nil
@@ -1732,6 +1737,7 @@ const (
 	compSignatureWithSubOpFmt = "<%s> %s %s <%s>"
 	compExprsFmt              = "%s %s %s: %v"
 	compExprsWithSubOpFmt     = "%s %s %s %s: %v"
+	invalidCompErrFmt         = "invalid comparison between different %s types: %s"
 	unsupportedCompErrFmt     = "unsupported comparison operator: %s"
 	unsupportedUnaryOpErrFmt  = "unsupported unary operator: %s"
 	unsupportedBinaryOpErrFmt = "unsupported binary operator: %s"
@@ -2019,6 +2025,13 @@ func typeCheckComparisonOp(
 	if len(fns) != 1 || typeMismatch {
 		sig := fmt.Sprintf(compSignatureFmt, leftReturn, op, rightReturn)
 		if len(fns) == 0 || typeMismatch {
+			// For some typeMismatch errors, we want to emit a more specific error
+			// message than "unknown comparison". In particular, comparison between
+			// two different enum types is invalid, rather than just unsupported.
+			if typeMismatch && leftFamily == types.EnumFamily && rightFamily == types.EnumFamily {
+				return nil, nil, nil, false,
+					pgerror.Newf(pgcode.InvalidParameterValue, invalidCompErrFmt, "enum", sig)
+			}
 			return nil, nil, nil, false,
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sig)
 		}

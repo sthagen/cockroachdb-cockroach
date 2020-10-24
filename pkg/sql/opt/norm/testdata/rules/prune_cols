@@ -308,6 +308,7 @@ SELECT f, f+1.1 AS r FROM (SELECT f, k FROM a GROUP BY f, k HAVING sum(k)=100) a
 project
  ├── columns: f:3 r:7
  ├── immutable
+ ├── fd: (3)-->(7)
  ├── select
  │    ├── columns: k:1!null f:3 sum:6!null
  │    ├── immutable
@@ -436,6 +437,7 @@ project
  ├── columns: f:3 r:6
  ├── cardinality: [0 - 5]
  ├── immutable
+ ├── fd: (3)-->(6)
  ├── limit
  │    ├── columns: f:3 s:4
  │    ├── cardinality: [0 - 5]
@@ -678,6 +680,7 @@ project
  ├── columns: f:3 r:6
  ├── cardinality: [0 - 5]
  ├── immutable
+ ├── fd: (3)-->(6)
  ├── offset
  │    ├── columns: f:3 s:4
  │    ├── cardinality: [0 - 5]
@@ -1696,17 +1699,17 @@ SELECT ntile(i) OVER () FROM a
 project
  ├── columns: ntile:6(int)
  ├── stats: [rows=1000]
- ├── cost: 1060.04
+ ├── cost: 1064.04
  ├── prune: (6)
  └── window partition=()
       ├── columns: t.public.a.i:2(int) ntile:6(int)
       ├── stats: [rows=1000]
-      ├── cost: 1050.03
+      ├── cost: 1054.03
       ├── prune: (6)
       ├── scan t.public.a
       │    ├── columns: t.public.a.i:2(int)
       │    ├── stats: [rows=1000]
-      │    ├── cost: 1050.02
+      │    ├── cost: 1054.02
       │    └── prune: (2)
       └── windows
            └── ntile [as=ntile:6, type=int, outer=(2)]
@@ -1814,17 +1817,17 @@ SELECT x FROM (SELECT ntile(i) OVER () x, ntile(f::int) OVER () y FROM a)
 project
  ├── columns: x:6(int)
  ├── stats: [rows=1000]
- ├── cost: 1060.04
+ ├── cost: 1064.04
  ├── prune: (6)
  └── window partition=()
       ├── columns: t.public.a.i:2(int) ntile:6(int)
       ├── stats: [rows=1000]
-      ├── cost: 1050.03
+      ├── cost: 1054.03
       ├── prune: (6)
       ├── scan t.public.a
       │    ├── columns: t.public.a.i:2(int)
       │    ├── stats: [rows=1000]
-      │    ├── cost: 1050.02
+      │    ├── cost: 1054.02
       │    └── prune: (2)
       └── windows
            └── ntile [as=ntile:6, type=int, outer=(2)]
@@ -1948,18 +1951,18 @@ update partial_indexes
  ├── fetch columns: a:5 b:6 c:7
  ├── update-mapping:
  │    └── b_new:10 => b:2
- ├── partial index put columns: column11:11
- ├── partial index del columns: column9:9
+ ├── partial index put columns: partial_index_put1:11
+ ├── partial index del columns: partial_index_del1:9
  ├── cardinality: [0 - 0]
  ├── volatile, mutations
  └── project
-      ├── columns: column11:11 a:5!null b:6 c:7 column9:9 b_new:10
+      ├── columns: partial_index_put1:11 a:5!null b:6 c:7 partial_index_del1:9 b_new:10
       ├── cardinality: [0 - 1]
       ├── immutable
       ├── key: ()
       ├── fd: ()-->(5-7,9-11)
       ├── project
-      │    ├── columns: b_new:10 column9:9 a:5!null b:6 c:7
+      │    ├── columns: b_new:10 partial_index_del1:9 a:5!null b:6 c:7
       │    ├── cardinality: [0 - 1]
       │    ├── immutable
       │    ├── key: ()
@@ -1980,9 +1983,9 @@ update partial_indexes
       │    │         └── a:5 = 1 [outer=(5), constraints=(/5: [/1 - /1]; tight), fd=()-->(5)]
       │    └── projections
       │         ├── b:6 + 1 [as=b_new:10, outer=(6), immutable]
-      │         └── b:6 > 1 [as=column9:9, outer=(6)]
+      │         └── b:6 > 1 [as=partial_index_del1:9, outer=(6)]
       └── projections
-           └── b_new:10 > 1 [as=column11:11, outer=(10)]
+           └── b_new:10 > 1 [as=partial_index_put1:11, outer=(10)]
 
 # Prune secondary family column not needed for the update.
 norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
@@ -2068,7 +2071,8 @@ INSERT INTO a (k, s) VALUES (1, 'foo') ON CONFLICT (k) DO UPDATE SET i=a.i+1
 ----
 upsert a
  ├── columns: <none>
- ├── canary column: 10
+ ├── arbiter indexes: primary
+ ├── canary column: k:10
  ├── fetch columns: k:10 i:11 f:12 s:13
  ├── insert-mapping:
  │    ├── column1:6 => k:1
@@ -2119,7 +2123,8 @@ INSERT INTO a (k, s) VALUES (1, 'foo') ON CONFLICT (k) DO UPDATE SET i=a.i+1 RET
 ----
 upsert a
  ├── columns: k:1!null i:2 f:3 s:4
- ├── canary column: 10
+ ├── arbiter indexes: primary
+ ├── canary column: k:10
  ├── fetch columns: k:10 i:11 f:12 s:13
  ├── insert-mapping:
  │    ├── column1:6 => k:1
@@ -2179,7 +2184,8 @@ UPSERT INTO family (a, b) VALUES (1, 2)
 ----
 upsert "family"
  ├── columns: <none>
- ├── canary column: 10
+ ├── arbiter indexes: primary
+ ├── canary column: a:10
  ├── fetch columns: a:10 b:11
  ├── insert-mapping:
  │    ├── column1:7 => a:1
@@ -2227,7 +2233,8 @@ project
  ├── fd: ()-->(5)
  └── upsert "family"
       ├── columns: a:1!null e:5
-      ├── canary column: 12
+      ├── arbiter indexes: primary
+      ├── canary column: a:12
       ├── fetch columns: a:12 c:14 d:15 e:16
       ├── insert-mapping:
       │    ├── column1:7 => a:1
@@ -2285,7 +2292,8 @@ INSERT INTO family VALUES (1, 2, 3, 4) ON CONFLICT (a) DO UPDATE SET d=10
 ----
 upsert "family"
  ├── columns: <none>
- ├── canary column: 12
+ ├── arbiter indexes: primary
+ ├── canary column: a:12
  ├── fetch columns: a:12 c:14 d:15
  ├── insert-mapping:
  │    ├── column1:7 => a:1
@@ -2335,7 +2343,8 @@ INSERT INTO mutation VALUES (1, 2, 3) ON CONFLICT (a) DO UPDATE SET b=10
 ----
 upsert mutation
  ├── columns: <none>
- ├── canary column: 11
+ ├── arbiter indexes: primary
+ ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 d:14 e:15
  ├── insert-mapping:
  │    ├── column1:7 => a:1
@@ -2677,7 +2686,8 @@ project
  ├── fd: ()-->(1-3)
  └── upsert returning_test
       ├── columns: a:1 b:2 c:3 rowid:8!null
-      ├── canary column: 22
+      ├── arbiter indexes: secondary
+      ├── canary column: rowid:22
       ├── fetch columns: a:15 b:16 c:17 rowid:22
       ├── insert-mapping:
       │    ├── column1:10 => a:1
@@ -2774,7 +2784,8 @@ project
  ├── fd: ()-->(1-4)
  └── upsert returning_test
       ├── columns: a:1!null b:2!null c:3!null d:4 rowid:8!null
-      ├── canary column: 22
+      ├── arbiter indexes: primary
+      ├── canary column: rowid:22
       ├── fetch columns: a:15 b:16 c:17 d:18 rowid:22
       ├── insert-mapping:
       │    ├── column1:10 => a:1
@@ -3043,12 +3054,12 @@ WITH foo AS (SELECT * FROM a)
 with &1 (foo)
  ├── columns: i:7(int)
  ├── stats: [rows=1000]
- ├── cost: 1080.04
+ ├── cost: 1084.04
  ├── prune: (7)
  ├── scan t.public.a
  │    ├── columns: t.public.a.k:1(int!null) t.public.a.i:2(int) t.public.a.f:3(float) t.public.a.s:4(string)
  │    ├── stats: [rows=1000]
- │    ├── cost: 1080.02
+ │    ├── cost: 1084.02
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-4)
  │    ├── prune: (1-4)

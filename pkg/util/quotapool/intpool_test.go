@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -821,7 +822,7 @@ func TestLogSlowAcquisition(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	t0 := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
-	mt := quotapool.NewManualTime(t0)
+	mt := timeutil.NewManualTime(t0)
 	var called, calledAfter int64
 	qp := quotapool.NewIntPool("test", 10,
 		quotapool.OnSlowAcquisition(time.Second, func(
@@ -878,4 +879,26 @@ func TestLogSlowAcquisition(t *testing.T) {
 	acq2.Release()
 	require.NoError(t, <-errCh)
 	require.Equal(t, int64(1), atomic.LoadInt64(&calledAfter))
+}
+
+// TestCloser tests that the WithCloser option works.
+func TestCloser(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	t0 := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	mt := timeutil.NewManualTime(t0)
+	closer := make(chan struct{})
+	qp := quotapool.NewIntPool("test", 10,
+		quotapool.WithCloser(closer),
+		quotapool.WithTimeSource(mt))
+	ctx := context.Background()
+	_, err := qp.Acquire(ctx, 10)
+	require.NoError(t, err)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := qp.Acquire(ctx, 1)
+		errCh <- err
+	}()
+	close(closer)
+	require.True(t, quotapool.HasErrClosed(<-errCh))
 }

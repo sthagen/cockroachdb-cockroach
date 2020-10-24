@@ -409,20 +409,21 @@ const (
 var _ = NumComparisonOperators
 
 var comparisonOpName = [...]string{
-	EQ:                "=",
-	LT:                "<",
-	GT:                ">",
-	LE:                "<=",
-	GE:                ">=",
-	NE:                "!=",
-	In:                "IN",
-	NotIn:             "NOT IN",
-	Like:              "LIKE",
-	NotLike:           "NOT LIKE",
-	ILike:             "ILIKE",
-	NotILike:          "NOT ILIKE",
-	SimilarTo:         "SIMILAR TO",
-	NotSimilarTo:      "NOT SIMILAR TO",
+	EQ:           "=",
+	LT:           "<",
+	GT:           ">",
+	LE:           "<=",
+	GE:           ">=",
+	NE:           "!=",
+	In:           "IN",
+	NotIn:        "NOT IN",
+	Like:         "LIKE",
+	NotLike:      "NOT LIKE",
+	ILike:        "ILIKE",
+	NotILike:     "NOT ILIKE",
+	SimilarTo:    "SIMILAR TO",
+	NotSimilarTo: "NOT SIMILAR TO",
+	// TODO(otan): come up with a better name than RegMatch, as it also covers GeoContains.
 	RegMatch:          "~",
 	NotRegMatch:       "!~",
 	RegIMatch:         "~*",
@@ -1242,7 +1243,7 @@ func newBinExprIfValidOverload(op BinaryOperator, left TypedExpr, right TypedExp
 			Right:    right,
 			Fn:       fn,
 		}
-		expr.typ = returnTypeToFixedType(fn.returnType())
+		expr.typ = returnTypeToFixedType(fn.returnType(), []TypedExpr{left, right})
 		return expr
 	}
 	return nil
@@ -1645,18 +1646,6 @@ type AnnotateTypeExpr struct {
 
 // Format implements the NodeFormatter interface.
 func (node *AnnotateTypeExpr) Format(ctx *FmtCtx) {
-	if ctx.HasFlags(FmtPGAttrdefAdbin) {
-		ctx.FormatNode(node.Expr)
-		if typ, ok := GetStaticallyKnownType(node.Type); ok {
-			switch typ.Family() {
-			case types.StringFamily, types.CollatedStringFamily:
-				// Postgres formats strings using a cast afterward. Let's do the same.
-				ctx.WriteString("::")
-				ctx.WriteString(typ.SQLString())
-			}
-		}
-		return
-	}
 	switch node.SyntaxMode {
 	case AnnotateShort:
 		exprFmtWithParen(ctx, node.Expr)

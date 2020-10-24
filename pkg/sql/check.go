@@ -18,13 +18,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -39,18 +40,18 @@ func validateCheckExpr(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
 	exprStr string,
-	tableDesc *sqlbase.MutableTableDescriptor,
+	tableDesc *tabledesc.Mutable,
 	ie *InternalExecutor,
 	txn *kv.Txn,
 ) error {
-	expr, err := schemaexpr.FormatExprForDisplay(ctx, tableDesc, exprStr, semaCtx)
+	expr, err := schemaexpr.FormatExprForDisplay(ctx, tableDesc, exprStr, semaCtx, tree.FmtParsable)
 	if err != nil {
 		return err
 	}
-	colSelectors := sqlbase.ColumnsSelectors(tableDesc.Columns)
+	colSelectors := tabledesc.ColumnsSelectors(tableDesc.Columns)
 	columns := tree.AsStringWithFlags(&colSelectors, tree.FmtSerializable)
 	queryStr := fmt.Sprintf(`SELECT %s FROM [%d AS t] WHERE NOT (%s) LIMIT 1`, columns, tableDesc.GetID(), exprStr)
-	log.Infof(ctx, "Validating check constraint %q with query %q", expr, queryStr)
+	log.Infof(ctx, "validating check constraint %q with query %q", expr, queryStr)
 
 	rows, err := ie.QueryRow(ctx, "validate check constraint", txn, queryStr)
 	if err != nil {
@@ -77,7 +78,7 @@ func validateCheckExpr(
 //   (a_id IS NULL OR b_id IS NULL) AND (a_id IS NOT NULL OR b_id IS NOT NULL)
 // LIMIT 1;
 func matchFullUnacceptableKeyQuery(
-	srcTbl sqlbase.TableDescriptor, fk *descpb.ForeignKeyConstraint, limitResults bool,
+	srcTbl catalog.TableDescriptor, fk *descpb.ForeignKeyConstraint, limitResults bool,
 ) (sql string, colNames []string, _ error) {
 	nCols := len(fk.OriginColumnIDs)
 	srcCols := make([]string, nCols)
@@ -148,9 +149,9 @@ func matchFullUnacceptableKeyQuery(
 // TODO(radu): change this to a query which executes as an anti-join when we
 // remove the heuristic planner.
 func nonMatchingRowQuery(
-	srcTbl sqlbase.TableDescriptor,
+	srcTbl catalog.TableDescriptor,
 	fk *descpb.ForeignKeyConstraint,
-	targetTbl sqlbase.TableDescriptor,
+	targetTbl catalog.TableDescriptor,
 	limitResults bool,
 ) (sql string, originColNames []string, _ error) {
 	originColNames, err := srcTbl.NamesForColumnIDs(fk.OriginColumnIDs)
@@ -228,7 +229,7 @@ func nonMatchingRowQuery(
 // reuse an existing client.Txn safely.
 func validateForeignKey(
 	ctx context.Context,
-	srcTable *sqlbase.MutableTableDescriptor,
+	srcTable *tabledesc.Mutable,
 	fk *descpb.ForeignKeyConstraint,
 	ie *InternalExecutor,
 	txn *kv.Txn,
@@ -239,7 +240,7 @@ func validateForeignKey(
 	if err != nil {
 		return err
 	}
-	targetTable := desc.(sqlbase.TableDescriptor)
+	targetTable := desc.(catalog.TableDescriptor)
 	nCols := len(fk.OriginColumnIDs)
 
 	referencedColumnNames, err := targetTable.NamesForColumnIDs(fk.ReferencedColumnIDs)
@@ -258,7 +259,7 @@ func validateForeignKey(
 			return err
 		}
 
-		log.Infof(ctx, "Validating MATCH FULL FK %q (%q [%v] -> %q [%v]) with query %q",
+		log.Infof(ctx, "validating MATCH FULL FK %q (%q [%v] -> %q [%v]) with query %q",
 			fk.Name,
 			srcTable.Name, colNames,
 			targetTable.GetName(), referencedColumnNames,
@@ -270,10 +271,10 @@ func validateForeignKey(
 			return err
 		}
 		if values.Len() > 0 {
-			return pgerror.Newf(pgcode.ForeignKeyViolation,
+			return pgerror.WithConstraintName(pgerror.Newf(pgcode.ForeignKeyViolation,
 				"foreign key violation: MATCH FULL does not allow mixing of null and nonnull values %s for %s",
 				formatValues(colNames, values), fk.Name,
-			)
+			), fk.Name)
 		}
 	}
 	query, colNames, err := nonMatchingRowQuery(
@@ -284,7 +285,7 @@ func validateForeignKey(
 		return err
 	}
 
-	log.Infof(ctx, "Validating FK %q (%q [%v] -> %q [%v]) with query %q",
+	log.Infof(ctx, "validating FK %q (%q [%v] -> %q [%v]) with query %q",
 		fk.Name,
 		srcTable.Name, colNames, targetTable.GetName(), referencedColumnNames,
 		query,
@@ -295,9 +296,9 @@ func validateForeignKey(
 		return err
 	}
 	if values.Len() > 0 {
-		return pgerror.Newf(pgcode.ForeignKeyViolation,
+		return pgerror.WithConstraintName(pgerror.Newf(pgcode.ForeignKeyViolation,
 			"foreign key violation: %q row %s has no match in %q",
-			srcTable.Name, formatValues(colNames, values), targetTable.GetName())
+			srcTable.Name, formatValues(colNames, values), targetTable.GetName()), fk.Name)
 	}
 	return nil
 }
@@ -314,7 +315,7 @@ func formatValues(colNames []string, values tree.Datums) string {
 }
 
 // checkSet contains a subset of checks, as ordinals into
-// ImmutableTableDescriptor.ActiveChecks. These checks have boolean columns
+// Immutable.ActiveChecks. These checks have boolean columns
 // produced as input to mutations, indicating the result of evaluating the
 // check.
 //
@@ -335,7 +336,7 @@ type checkSet = util.FastIntSet
 func checkMutationInput(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
-	tabDesc *sqlbase.ImmutableTableDescriptor,
+	tabDesc catalog.TableDescriptor,
 	checkOrds checkSet,
 	checkVals tree.Datums,
 ) error {
@@ -356,15 +357,15 @@ func checkMutationInput(
 		} else if !res && checkVals[colIdx] != tree.DNull {
 			// Failed to satisfy CHECK constraint, so unwrap the serialized
 			// check expression to display to the user.
-			expr, err := schemaexpr.FormatExprForDisplay(ctx, tabDesc, checks[i].Expr, semaCtx)
+			expr, err := schemaexpr.FormatExprForDisplay(ctx, tabDesc, checks[i].Expr, semaCtx, tree.FmtParsable)
 			if err != nil {
 				// If we ran into an error trying to read the check constraint, wrap it
 				// and return.
-				return errors.Wrapf(err, "failed to satisfy CHECK constraint (%s)", checks[i].Expr)
+				return pgerror.WithConstraintName(errors.Wrapf(err, "failed to satisfy CHECK constraint (%s)", checks[i].Expr), checks[i].Name)
 			}
-			return pgerror.Newf(
+			return pgerror.WithConstraintName(pgerror.Newf(
 				pgcode.CheckViolation, "failed to satisfy CHECK constraint (%s)", expr,
-			)
+			), checks[i].Name)
 		}
 		colIdx++
 	}

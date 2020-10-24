@@ -12,7 +12,6 @@ package colexec
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
@@ -20,8 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 // Columnarizer turns an execinfra.RowSource input into an Operator output, by
@@ -33,10 +33,10 @@ type Columnarizer struct {
 
 	allocator  *colmem.Allocator
 	input      execinfra.RowSource
-	da         sqlbase.DatumAlloc
+	da         rowenc.DatumAlloc
 	initStatus OperatorInitStatus
 
-	buffered        sqlbase.EncDatumRows
+	buffered        rowenc.EncDatumRows
 	batch           coldata.Batch
 	accumulatedMeta []execinfrapb.ProducerMetadata
 	ctx             context.Context
@@ -93,13 +93,13 @@ func (c *Columnarizer) Next(context.Context) coldata.Batch {
 	c.batch, reallocated = c.allocator.ResetMaybeReallocate(c.typs, c.batch, 1 /* minCapacity */)
 	if reallocated {
 		oldRows := c.buffered
-		c.buffered = make(sqlbase.EncDatumRows, c.batch.Capacity())
+		c.buffered = make(rowenc.EncDatumRows, c.batch.Capacity())
 		for i := range c.buffered {
 			if len(oldRows) > 0 {
 				c.buffered[i] = oldRows[0]
 				oldRows = oldRows[1:]
 			} else {
-				c.buffered[i] = make(sqlbase.EncDatumRow, len(c.typs))
+				c.buffered[i] = make(rowenc.EncDatumRow, len(c.typs))
 			}
 		}
 	}
@@ -147,13 +147,13 @@ func (c *Columnarizer) Next(context.Context) coldata.Batch {
 // Columnarizers are not expected to be Run, so we prohibit calling this method
 // on them.
 func (c *Columnarizer) Run(context.Context) {
-	colexecerror.InternalError("Columnarizer should not be Run")
+	colexecerror.InternalError(errors.AssertionFailedf("Columnarizer should not be Run"))
 }
 
 var (
 	_ colexecbase.Operator       = &Columnarizer{}
 	_ execinfrapb.MetadataSource = &Columnarizer{}
-	_ Closer                     = &Columnarizer{}
+	_ colexecbase.Closer         = &Columnarizer{}
 )
 
 // DrainMeta is part of the MetadataSource interface.
@@ -189,9 +189,9 @@ func (c *Columnarizer) Child(nth int, verbose bool) execinfra.OpNode {
 		if n, ok := c.input.(execinfra.OpNode); ok {
 			return n
 		}
-		colexecerror.InternalError("input to Columnarizer is not an execinfra.OpNode")
+		colexecerror.InternalError(errors.AssertionFailedf("input to Columnarizer is not an execinfra.OpNode"))
 	}
-	colexecerror.InternalError(fmt.Sprintf("invalid index %d", nth))
+	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }

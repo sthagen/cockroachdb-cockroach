@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -78,7 +78,7 @@ func (p *storage) Protect(ctx context.Context, txn *kv.Txn, r *ptpb.Record) erro
 	}
 	s := makeSettings(p.settings)
 	rows, err := p.ex.QueryEx(ctx, "protectedts-protect", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.NodeUser},
+		sessiondata.InternalExecutorOverride{User: security.NodeUser},
 		protectQuery,
 		s.maxSpans, s.maxBytes, len(r.Spans),
 		r.ID.GetBytesMut(), r.Timestamp.AsOfSystemTime(),
@@ -91,14 +91,18 @@ func (p *storage) Protect(ctx context.Context, txn *kv.Txn, r *ptpb.Record) erro
 	if failed := *row[0].(*tree.DBool); failed {
 		curNumSpans := int64(*row[1].(*tree.DInt))
 		if curNumSpans+int64(len(r.Spans)) > s.maxSpans {
-			return errors.Errorf("protectedts: limit exceeded: %d+%d > %d spans",
-				curNumSpans, len(r.Spans), s.maxSpans)
+			return errors.WithHint(
+				errors.Errorf("protectedts: limit exceeded: %d+%d > %d spans", curNumSpans,
+					len(r.Spans), s.maxSpans),
+				"SET CLUSTER SETTING kv.protectedts.max_spans to a higher value")
 		}
 		curBytes := int64(*row[2].(*tree.DInt))
 		recordBytes := int64(len(encodedSpans) + len(r.Meta) + len(r.MetaType))
 		if curBytes+recordBytes > s.maxBytes {
-			return errors.Errorf("protectedts: limit exceeded: %d+%d > %d bytes",
-				curBytes, recordBytes, s.maxBytes)
+			return errors.WithHint(
+				errors.Errorf("protectedts: limit exceeded: %d+%d > %d bytes", curBytes, recordBytes,
+					s.maxBytes),
+				"SET CLUSTER SETTING kv.protectedts.max_bytes to a higher value")
 		}
 		return protectedts.ErrExists
 	}
@@ -110,7 +114,7 @@ func (p *storage) GetRecord(ctx context.Context, txn *kv.Txn, id uuid.UUID) (*pt
 		return nil, errNoTxn
 	}
 	row, err := p.ex.QueryRowEx(ctx, "protectedts-GetRecord", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.NodeUser},
+		sessiondata.InternalExecutorOverride{User: security.NodeUser},
 		getRecordQuery, id.GetBytesMut())
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to read record %v", id)
@@ -130,7 +134,7 @@ func (p *storage) MarkVerified(ctx context.Context, txn *kv.Txn, id uuid.UUID) e
 		return errNoTxn
 	}
 	rows, err := p.ex.QueryEx(ctx, "protectedts-MarkVerified", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.NodeUser},
+		sessiondata.InternalExecutorOverride{User: security.NodeUser},
 		markVerifiedQuery, id.GetBytesMut())
 	if err != nil {
 		return errors.Wrapf(err, "failed to mark record %v as verified", id)
@@ -146,7 +150,7 @@ func (p *storage) Release(ctx context.Context, txn *kv.Txn, id uuid.UUID) error 
 		return errNoTxn
 	}
 	rows, err := p.ex.QueryEx(ctx, "protectedts-Release", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.NodeUser},
+		sessiondata.InternalExecutorOverride{User: security.NodeUser},
 		releaseQuery, id.GetBytesMut())
 	if err != nil {
 		return errors.Wrapf(err, "failed to release record %v", id)
@@ -162,7 +166,7 @@ func (p *storage) GetMetadata(ctx context.Context, txn *kv.Txn) (ptpb.Metadata, 
 		return ptpb.Metadata{}, errNoTxn
 	}
 	row, err := p.ex.QueryRowEx(ctx, "protectedts-GetMetadata", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.NodeUser},
+		sessiondata.InternalExecutorOverride{User: security.NodeUser},
 		getMetadataQuery)
 	if err != nil {
 		return ptpb.Metadata{}, errors.Wrap(err, "failed to read metadata")
@@ -195,7 +199,7 @@ func (p *storage) GetState(ctx context.Context, txn *kv.Txn) (ptpb.State, error)
 
 func (p *storage) getRecords(ctx context.Context, txn *kv.Txn) ([]ptpb.Record, error) {
 	rows, err := p.ex.QueryEx(ctx, "protectedts-GetRecords", txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.NodeUser},
+		sessiondata.InternalExecutorOverride{User: security.NodeUser},
 		getRecordsQuery)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read records")

@@ -17,11 +17,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -590,7 +591,8 @@ type ClientComm interface {
 		descOpt RowDescOpt,
 		pos CmdPos,
 		formatCodes []pgwirebase.FormatCode,
-		conv sessiondata.DataConversionConfig,
+		conv sessiondatapb.DataConversionConfig,
+		location *time.Location,
 		limit int,
 		portalName string,
 		implicitTxn bool,
@@ -688,19 +690,19 @@ type CommandResultClose interface {
 type RestrictedCommandResult interface {
 	CommandResultErrBase
 
-	// AppendParamStatusUpdate appends a parameter status update to the result.
+	// BufferParamStatusUpdate buffers a parameter status update to the result.
 	// This gets flushed only when the CommandResult is closed.
-	AppendParamStatusUpdate(string, string)
+	BufferParamStatusUpdate(string, string)
 
-	// AppendNotice appends a notice to the result.
+	// BufferNotice appends a notice to the result.
 	// This gets flushed only when the CommandResult is closed.
-	AppendNotice(noticeErr error)
+	BufferNotice(notice pgnotice.Notice)
 
 	// SetColumns informs the client about the schema of the result. The columns
 	// can be nil.
 	//
 	// This needs to be called (once) before AddRow.
-	SetColumns(context.Context, sqlbase.ResultColumns)
+	SetColumns(context.Context, colinfo.ResultColumns)
 
 	// ResetStmtType allows a client to change the statement type of the current
 	// result, from the original one set when the result was created trough
@@ -740,10 +742,10 @@ type DescribeResult interface {
 	SetNoDataRowDescription()
 	// SetPrepStmtOutput tells the client about the results schema of a prepared
 	// statement.
-	SetPrepStmtOutput(context.Context, sqlbase.ResultColumns)
+	SetPrepStmtOutput(context.Context, colinfo.ResultColumns)
 	// SetPortalOutput tells the client about the results schema and formatting of
 	// a portal.
-	SetPortalOutput(context.Context, sqlbase.ResultColumns, []pgwirebase.FormatCode)
+	SetPortalOutput(context.Context, colinfo.ResultColumns, []pgwirebase.FormatCode)
 }
 
 // ParseResult represents the result of a Parse command.
@@ -862,7 +864,7 @@ type bufferedCommandResult struct {
 	err          error
 	rows         []tree.Datums
 	rowsAffected int
-	cols         sqlbase.ResultColumns
+	cols         colinfo.ResultColumns
 
 	// errOnly, if set, makes AddRow() panic. This can be used when the execution
 	// of the query is not expected to produce any results.
@@ -876,20 +878,20 @@ var _ RestrictedCommandResult = &bufferedCommandResult{}
 var _ CommandResultClose = &bufferedCommandResult{}
 
 // SetColumns is part of the RestrictedCommandResult interface.
-func (r *bufferedCommandResult) SetColumns(_ context.Context, cols sqlbase.ResultColumns) {
+func (r *bufferedCommandResult) SetColumns(_ context.Context, cols colinfo.ResultColumns) {
 	if r.errOnly {
 		panic("SetColumns() called when errOnly is set")
 	}
 	r.cols = cols
 }
 
-// AppendParamStatusUpdate is part of the RestrictedCommandResult interface.
-func (r *bufferedCommandResult) AppendParamStatusUpdate(key string, val string) {
+// BufferParamStatusUpdate is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) BufferParamStatusUpdate(key string, val string) {
 	panic("unimplemented")
 }
 
-// AppendNotice is part of the RestrictedCommandResult interface.
-func (r *bufferedCommandResult) AppendNotice(noticeErr error) {
+// BufferNotice is part of the RestrictedCommandResult interface.
+func (r *bufferedCommandResult) BufferNotice(notice pgnotice.Notice) {
 	panic("unimplemented")
 }
 
@@ -954,10 +956,10 @@ func (r *bufferedCommandResult) SetInferredTypes([]oid.Oid) {}
 func (r *bufferedCommandResult) SetNoDataRowDescription() {}
 
 // SetPrepStmtOutput is part of the DescribeResult interface.
-func (r *bufferedCommandResult) SetPrepStmtOutput(context.Context, sqlbase.ResultColumns) {}
+func (r *bufferedCommandResult) SetPrepStmtOutput(context.Context, colinfo.ResultColumns) {}
 
 // SetPortalOutput is part of the DescribeResult interface.
 func (r *bufferedCommandResult) SetPortalOutput(
-	context.Context, sqlbase.ResultColumns, []pgwirebase.FormatCode,
+	context.Context, colinfo.ResultColumns, []pgwirebase.FormatCode,
 ) {
 }

@@ -18,11 +18,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -51,7 +54,7 @@ func (t *truncateNode) startExec(params runParams) error {
 	toTruncate := make(map[descpb.ID]string, len(n.Tables))
 	// toTraverse is the list of tables whose references need to be traversed
 	// while constructing the list of tables that should be truncated.
-	toTraverse := make([]sqlbase.MutableTableDescriptor, 0, len(n.Tables))
+	toTraverse := make([]tabledesc.Mutable, 0, len(n.Tables))
 
 	// Collect copies of each interleaved descriptor being truncated before any
 	// modification has been done to them. We need this in order to truncate
@@ -60,7 +63,7 @@ func (t *truncateNode) startExec(params runParams) error {
 	// to delete. Once changes have been made, the index spans where k/v data for
 	// the table reside are no longer accessible from the table.
 	interleaveCopies := make(map[descpb.ID]*descpb.TableDescriptor)
-	maybeAddInterleave := func(desc sqlbase.TableDescriptor) {
+	maybeAddInterleave := func(desc catalog.TableDescriptor) {
 		if !desc.IsInterleaved() {
 			return
 		}
@@ -209,7 +212,7 @@ func (p *planner) truncateTable(
 		tableDesc.Indexes[i].ID = descpb.IndexID(0)
 	}
 	// Create new ID's for all of the indexes in the table.
-	if err := tableDesc.AllocateIDs(); err != nil {
+	if err := tableDesc.AllocateIDs(ctx); err != nil {
 		return err
 	}
 
@@ -273,7 +276,7 @@ func (p *planner) truncateTable(
 	// Reassign any self references.
 	if err := p.reassignInterleaveIndexReferences(
 		ctx,
-		[]*sqlbase.MutableTableDescriptor{tableDesc},
+		[]*tabledesc.Mutable{tableDesc},
 		tableDesc.ID,
 		indexIDMapping,
 	); err != nil {
@@ -317,15 +320,11 @@ func (p *planner) truncateTable(
 // can even eliminate the need to use a transaction for each chunk at a later
 // stage if it proves inefficient).
 func ClearTableDataInChunks(
-	ctx context.Context,
-	db *kv.DB,
-	codec keys.SQLCodec,
-	tableDesc *sqlbase.ImmutableTableDescriptor,
-	traceKV bool,
+	ctx context.Context, db *kv.DB, codec keys.SQLCodec, tableDesc *tabledesc.Immutable, traceKV bool,
 ) error {
 	const chunkSize = row.TableTruncateChunkSize
 	var resume roachpb.Span
-	alloc := &sqlbase.DatumAlloc{}
+	alloc := &rowenc.DatumAlloc{}
 	for rowIdx, done := 0, false; !done; rowIdx += chunkSize {
 		resumeAt := resume
 		if traceKV {
@@ -351,13 +350,13 @@ func ClearTableDataInChunks(
 // findAllReferencingInterleaves finds all tables that might interleave or
 // be interleaved by the input table.
 func (p *planner) findAllReferencingInterleaves(
-	ctx context.Context, table *sqlbase.MutableTableDescriptor,
-) ([]*sqlbase.MutableTableDescriptor, error) {
+	ctx context.Context, table *tabledesc.Mutable,
+) ([]*tabledesc.Mutable, error) {
 	refs, err := table.FindAllReferences()
 	if err != nil {
 		return nil, err
 	}
-	tables := make([]*sqlbase.MutableTableDescriptor, 0, len(refs))
+	tables := make([]*tabledesc.Mutable, 0, len(refs))
 	for id := range refs {
 		if id == table.ID {
 			continue
@@ -376,7 +375,7 @@ func (p *planner) findAllReferencingInterleaves(
 // interleave descriptor references according to indexIDMapping.
 func (p *planner) reassignInterleaveIndexReferences(
 	ctx context.Context,
-	tables []*sqlbase.MutableTableDescriptor,
+	tables []*tabledesc.Mutable,
 	truncatedID descpb.ID,
 	indexIDMapping map[descpb.IndexID]descpb.IndexID,
 ) error {
@@ -409,16 +408,14 @@ func (p *planner) reassignInterleaveIndexReferences(
 }
 
 func (p *planner) reassignIndexComments(
-	ctx context.Context,
-	table *sqlbase.MutableTableDescriptor,
-	indexIDMapping map[descpb.IndexID]descpb.IndexID,
+	ctx context.Context, table *tabledesc.Mutable, indexIDMapping map[descpb.IndexID]descpb.IndexID,
 ) error {
 	// Check if there are any index comments that need to be updated.
 	row, err := p.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRowEx(
 		ctx,
 		"update-table-comments",
 		p.txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUser},
 		`SELECT count(*) FROM system.comments WHERE object_id = $1 AND type = $2`,
 		table.ID,
 		keys.IndexCommentType,
@@ -432,7 +429,7 @@ func (p *planner) reassignIndexComments(
 				ctx,
 				"update-table-comments",
 				p.txn,
-				sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+				sessiondata.InternalExecutorOverride{User: security.RootUser},
 				`UPDATE system.comments SET sub_id=$1 WHERE sub_id=$2 AND object_id=$3 AND type=$4`,
 				new,
 				old,

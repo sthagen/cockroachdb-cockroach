@@ -27,10 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -45,6 +46,11 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
+
+var threeIntColsAndBoolCol = []*types.T{
+	types.Int, types.Int, types.Int, types.Bool}
+var sixIntColsAndStringCol = []*types.T{
+	types.Int, types.Int, types.Int, types.Int, types.Int, types.Int, types.String}
 
 func TestJoinReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -101,16 +107,17 @@ func TestJoinReader(t *testing.T) {
 	tdInterleaved := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t3")
 
 	testCases := []struct {
-		description string
-		indexIdx    uint32
-		post        execinfrapb.PostProcessSpec
-		onExpr      string
-		input       [][]tree.Datum
-		lookupCols  []uint32
-		joinType    descpb.JoinType
-		inputTypes  []*types.T
-		outputTypes []*types.T
-		expected    string
+		description    string
+		indexIdx       uint32
+		post           execinfrapb.PostProcessSpec
+		onExpr         string
+		input          [][]tree.Datum
+		lookupCols     []uint32
+		joinType       descpb.JoinType
+		inputTypes     []*types.T
+		outputTypes    []*types.T
+		leftJoinPaired bool
+		expected       string
 	}{
 		{
 			description: "Test selecting columns from second table",
@@ -125,8 +132,8 @@ func TestJoinReader(t *testing.T) {
 				{aFn(15), bFn(15)},
 			},
 			lookupCols:  []uint32{0, 1},
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.ThreeIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.ThreeIntCols,
 			expected:    "[[0 2 2] [0 5 5] [1 0 1] [1 5 6]]",
 		},
 		{
@@ -143,8 +150,8 @@ func TestJoinReader(t *testing.T) {
 				{aFn(15), bFn(15)},
 			},
 			lookupCols:  []uint32{0, 1},
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.ThreeIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.ThreeIntCols,
 			expected:    "[[0 2 2] [0 2 2] [0 5 5] [1 0 0] [1 5 5]]",
 		},
 		{
@@ -160,8 +167,8 @@ func TestJoinReader(t *testing.T) {
 				{aFn(15), bFn(15)},
 			},
 			lookupCols:  []uint32{0, 1},
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.FourIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.FourIntCols,
 			expected:    "[[0 2 2 2] [0 5 5 5] [1 0 0 1] [1 5 5 6]]",
 		},
 		{
@@ -178,8 +185,8 @@ func TestJoinReader(t *testing.T) {
 				{aFn(15), bFn(15)},
 			},
 			lookupCols:  []uint32{0, 1},
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.ThreeIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.ThreeIntCols,
 			expected:    "[[0 2 2] [0 5 5] [0 2 2] [1 0 0] [1 5 5]]",
 		},
 		{
@@ -195,8 +202,8 @@ func TestJoinReader(t *testing.T) {
 				{aFn(15), bFn(15)},
 			},
 			lookupCols:  []uint32{0, 1},
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.ThreeIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.ThreeIntCols,
 			onExpr:      "@2 < @5",
 			expected:    "[[1 0 1] [1 5 6]]",
 		},
@@ -212,8 +219,8 @@ func TestJoinReader(t *testing.T) {
 			},
 			lookupCols:  []uint32{0, 1},
 			joinType:    descpb.LeftOuterJoin,
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.ThreeIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.ThreeIntCols,
 			expected:    "[[10 0 NULL] [0 2 2]]",
 		},
 		{
@@ -227,8 +234,8 @@ func TestJoinReader(t *testing.T) {
 				{tree.NewDInt(0), tree.DNull},
 			},
 			lookupCols:  []uint32{0, 1},
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.OneIntCol,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.OneIntCol,
 			expected:    "[]",
 		},
 		{
@@ -243,8 +250,8 @@ func TestJoinReader(t *testing.T) {
 			},
 			lookupCols:  []uint32{0, 1},
 			joinType:    descpb.LeftOuterJoin,
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.TwoIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.TwoIntCols,
 			expected:    "[[0 NULL]]",
 		},
 		{
@@ -259,7 +266,7 @@ func TestJoinReader(t *testing.T) {
 			},
 			lookupCols:  []uint32{1, 2, 0},
 			inputTypes:  []*types.T{types.Int, types.Int, types.String},
-			outputTypes: sqlbase.OneIntCol,
+			outputTypes: rowenc.OneIntCol,
 			expected:    "[['two']]",
 		},
 		{
@@ -280,7 +287,7 @@ func TestJoinReader(t *testing.T) {
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftSemiJoin,
 			inputTypes:  []*types.T{types.Int, types.String},
-			outputTypes: sqlbase.TwoIntCols,
+			outputTypes: rowenc.TwoIntCols,
 			expected:    "[[1 'two'] [1 'two'] [6 'two'] [7 'two'] [1 'two']]",
 		},
 		{
@@ -295,8 +302,8 @@ func TestJoinReader(t *testing.T) {
 			},
 			lookupCols:  []uint32{0, 1},
 			joinType:    descpb.LeftSemiJoin,
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.OneIntCol,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.OneIntCol,
 			expected:    "[]",
 		},
 		{
@@ -317,8 +324,8 @@ func TestJoinReader(t *testing.T) {
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftSemiJoin,
 			onExpr:      "@2 > 2",
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.TwoIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.TwoIntCols,
 			expected:    "[[1 3] [7 3]]",
 		},
 		{
@@ -333,8 +340,8 @@ func TestJoinReader(t *testing.T) {
 			},
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftAntiJoin,
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.TwoIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.TwoIntCols,
 			expected:    "[[1234 1234]]",
 		},
 		{
@@ -354,8 +361,8 @@ func TestJoinReader(t *testing.T) {
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftAntiJoin,
 			onExpr:      "@2 > 2",
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.TwoIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.TwoIntCols,
 			expected:    "[[1 2] [6 2] [1 2]]",
 		},
 		{
@@ -370,8 +377,8 @@ func TestJoinReader(t *testing.T) {
 			},
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftAntiJoin,
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.OneIntCol,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.OneIntCol,
 			expected:    "[]",
 		},
 		{
@@ -386,13 +393,172 @@ func TestJoinReader(t *testing.T) {
 			},
 			lookupCols:  []uint32{0, 1},
 			joinType:    descpb.LeftAntiJoin,
-			inputTypes:  sqlbase.TwoIntCols,
-			outputTypes: sqlbase.TwoIntCols,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.TwoIntCols,
 			expected:    "[[0 NULL]]",
+		},
+		{
+			description: "Test paired join with outer join",
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 2, 4, 5, 6, 7},
+			},
+			input: [][]tree.Datum{
+				{tree.NewDInt(tree.DInt(12)), aFn(2), bFn(2), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(12)), aFn(5), bFn(5), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(105), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(23)), tree.DNull, tree.DNull, tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(26)), aFn(110), bFn(110), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(26)), aFn(7), bFn(7), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(34)), aFn(105), bFn(105), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(34)), aFn(110), bFn(110), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(34)), aFn(120), bFn(120), tree.DBoolTrue},
+			},
+			lookupCols:     []uint32{1, 2},
+			joinType:       descpb.LeftOuterJoin,
+			inputTypes:     threeIntColsAndBoolCol,
+			outputTypes:    sixIntColsAndStringCol,
+			leftJoinPaired: true,
+			expected: "[[12 0 2 0 2 2 'two'] [12 0 5 0 5 5 'five'] [23 NULL NULL NULL NULL NULL NULL] " +
+				"[26 0 7 0 7 7 'seven'] [34 12 0 NULL NULL NULL NULL]]",
+		},
+		{
+			description: "Test paired join with semi join",
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 2},
+			},
+			input: [][]tree.Datum{
+				{tree.NewDInt(tree.DInt(12)), aFn(2), bFn(2), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(12)), aFn(5), bFn(5), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(105), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(26)), aFn(110), bFn(110), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(26)), aFn(7), bFn(7), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(34)), aFn(105), bFn(105), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(34)), aFn(110), bFn(110), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(34)), aFn(120), bFn(120), tree.DBoolTrue},
+			},
+			lookupCols:     []uint32{1, 2},
+			joinType:       descpb.LeftSemiJoin,
+			inputTypes:     threeIntColsAndBoolCol,
+			outputTypes:    rowenc.ThreeIntCols,
+			leftJoinPaired: true,
+			expected:       "[[12 0 2] [26 0 7]]",
+		},
+		{
+			description: "Test paired join with anti join",
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 2},
+			},
+			input: [][]tree.Datum{
+				{tree.NewDInt(tree.DInt(12)), aFn(2), bFn(2), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(12)), aFn(5), bFn(5), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(105), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(23)), tree.DNull, tree.DNull, tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(26)), aFn(110), bFn(110), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(26)), aFn(7), bFn(7), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(34)), aFn(105), bFn(105), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(34)), aFn(110), bFn(110), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(34)), aFn(120), bFn(120), tree.DBoolTrue},
+			},
+			lookupCols:     []uint32{1, 2},
+			joinType:       descpb.LeftAntiJoin,
+			inputTypes:     threeIntColsAndBoolCol,
+			outputTypes:    rowenc.ThreeIntCols,
+			leftJoinPaired: true,
+			expected:       "[[23 NULL NULL] [34 12 0]]",
+		},
+		{
+			// Group will span batches when we SetBatchSizeBytes to ~2 rows below.
+			description: "Test paired join with outer join with group spanning batches",
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 2, 4, 5, 6, 7},
+			},
+			input: [][]tree.Datum{
+				{tree.NewDInt(tree.DInt(12)), aFn(2), bFn(2), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(12)), aFn(105), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(106), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(107), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(108), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(109), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(110), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(111), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(112), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(113), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(114), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(34)), aFn(5), bFn(5), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(43)), aFn(105), bFn(105), tree.DBoolFalse},
+			},
+			lookupCols:     []uint32{1, 2},
+			joinType:       descpb.LeftOuterJoin,
+			inputTypes:     threeIntColsAndBoolCol,
+			outputTypes:    sixIntColsAndStringCol,
+			leftJoinPaired: true,
+			expected:       "[[12 0 2 0 2 2 'two'] [34 0 5 0 5 5 'five'] [43 10 5 NULL NULL NULL NULL]]",
+		},
+		{
+			// Group will span batches when we SetBatchSizeBytes to ~2 rows below.
+			description: "Test paired join with semi join with group spanning batches",
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 2},
+			},
+			input: [][]tree.Datum{
+				{tree.NewDInt(tree.DInt(12)), aFn(2), bFn(2), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(12)), aFn(105), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(106), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(107), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(108), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(109), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(110), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(111), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(112), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(113), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(114), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(34)), aFn(5), bFn(5), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(43)), aFn(105), bFn(105), tree.DBoolFalse},
+			},
+			lookupCols:     []uint32{1, 2},
+			joinType:       descpb.LeftSemiJoin,
+			inputTypes:     threeIntColsAndBoolCol,
+			outputTypes:    rowenc.ThreeIntCols,
+			leftJoinPaired: true,
+			expected:       "[[12 0 2] [34 0 5]]",
+		},
+		{
+			// Group will span batches since we SetBatchSizeBytes to ~2 rows below.
+			description: "Test paired join with anti join with group spanning batches",
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 2},
+			},
+			input: [][]tree.Datum{
+				{tree.NewDInt(tree.DInt(12)), aFn(2), bFn(2), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(12)), aFn(105), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(106), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(107), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(108), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(109), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(110), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(111), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(112), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(113), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(12)), aFn(114), bFn(105), tree.DBoolTrue},
+				{tree.NewDInt(tree.DInt(34)), aFn(5), bFn(5), tree.DBoolFalse},
+				{tree.NewDInt(tree.DInt(43)), aFn(105), bFn(105), tree.DBoolFalse},
+			},
+			lookupCols:     []uint32{1, 2},
+			joinType:       descpb.LeftAntiJoin,
+			inputTypes:     threeIntColsAndBoolCol,
+			outputTypes:    rowenc.ThreeIntCols,
+			leftJoinPaired: true,
+			expected:       "[[43 10 5]]",
 		},
 	}
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(ctx, storage.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,100 +574,108 @@ func TestJoinReader(t *testing.T) {
 	)
 	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
-	for i, td := range []*sqlbase.ImmutableTableDescriptor{tdSecondary, tdFamily, tdInterleaved} {
+	for i, td := range []*tabledesc.Immutable{tdSecondary, tdFamily, tdInterleaved} {
 		for _, c := range testCases {
 			for _, reqOrdering := range []bool{true, false} {
-				t.Run(fmt.Sprintf("%d/reqOrdering=%t/%s", i, reqOrdering, c.description), func(t *testing.T) {
-					evalCtx := tree.MakeTestingEvalContext(st)
-					defer evalCtx.Stop(ctx)
-					flowCtx := execinfra.FlowCtx{
-						EvalCtx: &evalCtx,
-						Cfg: &execinfra.ServerConfig{
-							Settings:    st,
-							TempStorage: tempEngine,
-							DiskMonitor: diskMonitor,
-						},
-						Txn: kv.NewTxn(ctx, s.DB(), s.NodeID()),
-					}
-					encRows := make(sqlbase.EncDatumRows, len(c.input))
-					for rowIdx, row := range c.input {
-						encRow := make(sqlbase.EncDatumRow, len(row))
-						for i, d := range row {
-							encRow[i] = sqlbase.DatumToEncDatum(c.inputTypes[i], d)
+				// Small and large batches exercise different paths of interest for
+				// paired joins, so do both.
+				for _, smallBatch := range []bool{true, false} {
+					t.Run(fmt.Sprintf("%d/reqOrdering=%t/%s/smallBatch=%t", i, reqOrdering, c.description, smallBatch), func(t *testing.T) {
+						evalCtx := tree.MakeTestingEvalContext(st)
+						defer evalCtx.Stop(ctx)
+						flowCtx := execinfra.FlowCtx{
+							EvalCtx: &evalCtx,
+							Cfg: &execinfra.ServerConfig{
+								Settings:    st,
+								TempStorage: tempEngine,
+								DiskMonitor: diskMonitor,
+							},
+							Txn: kv.NewTxn(ctx, s.DB(), s.NodeID()),
 						}
-						encRows[rowIdx] = encRow
-					}
-					in := distsqlutils.NewRowBuffer(c.inputTypes, encRows, distsqlutils.RowBufferArgs{})
-
-					out := &distsqlutils.RowBuffer{}
-					jr, err := newJoinReader(
-						&flowCtx,
-						0, /* processorID */
-						&execinfrapb.JoinReaderSpec{
-							Table:            *td.TableDesc(),
-							IndexIdx:         c.indexIdx,
-							LookupColumns:    c.lookupCols,
-							OnExpr:           execinfrapb.Expression{Expr: c.onExpr},
-							Type:             c.joinType,
-							MaintainOrdering: reqOrdering,
-						},
-						in,
-						&c.post,
-						out,
-						lookupJoinReaderType,
-					)
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					// Set a lower batch size to force multiple batches.
-					jr.(*joinReader).SetBatchSizeBytes(int64(encRows[0].Size() * 3))
-
-					jr.Run(ctx)
-
-					if !in.Done {
-						t.Fatal("joinReader didn't consume all the rows")
-					}
-					if !out.ProducerClosed() {
-						t.Fatalf("output RowReceiver not closed")
-					}
-
-					var res sqlbase.EncDatumRows
-					for {
-						row, meta := out.Next()
-						if meta != nil && meta.Metrics == nil {
-							t.Fatalf("unexpected metadata %+v", meta)
+						encRows := make(rowenc.EncDatumRows, len(c.input))
+						for rowIdx, row := range c.input {
+							encRow := make(rowenc.EncDatumRow, len(row))
+							for i, d := range row {
+								encRow[i] = rowenc.DatumToEncDatum(c.inputTypes[i], d)
+							}
+							encRows[rowIdx] = encRow
 						}
-						if row == nil {
-							break
+						in := distsqlutils.NewRowBuffer(c.inputTypes, encRows, distsqlutils.RowBufferArgs{})
+
+						out := &distsqlutils.RowBuffer{}
+						jr, err := newJoinReader(
+							&flowCtx,
+							0, /* processorID */
+							&execinfrapb.JoinReaderSpec{
+								Table:                    *td.TableDesc(),
+								IndexIdx:                 c.indexIdx,
+								LookupColumns:            c.lookupCols,
+								OnExpr:                   execinfrapb.Expression{Expr: c.onExpr},
+								Type:                     c.joinType,
+								MaintainOrdering:         reqOrdering,
+								LeftJoinWithPairedJoiner: c.leftJoinPaired,
+							},
+							in,
+							&c.post,
+							out,
+							lookupJoinReaderType,
+						)
+						if err != nil {
+							t.Fatal(err)
 						}
-						res = append(res, row)
-					}
 
-					// processOutputRows is a helper function that takes a stringified
-					// EncDatumRows output (e.g. [[1 2] [3 1]]) and returns a slice of
-					// stringified rows without brackets (e.g. []string{"1 2", "3 1"}).
-					processOutputRows := func(output string) []string {
-						// Comma-separate the rows.
-						output = strings.ReplaceAll(output, "] [", ",")
-						// Remove leading and trailing bracket.
-						output = strings.Trim(output, "[]")
-						// Split on the commas that were introduced and return that.
-						return strings.Split(output, ",")
-					}
+						if smallBatch {
+							// Set a lower batch size to force multiple batches.
+							jr.(*joinReader).SetBatchSizeBytes(int64(encRows[0].Size() * 2))
+						}
+						// Else, use the default.
 
-					result := processOutputRows(res.String(c.outputTypes))
-					expected := processOutputRows(c.expected)
+						jr.Run(ctx)
 
-					if !reqOrdering {
-						// An ordering was not required, so sort both the result and
-						// expected slice to reuse equality comparison.
-						sort.Strings(result)
-						sort.Strings(expected)
-					}
+						if !in.Done {
+							t.Fatal("joinReader didn't consume all the rows")
+						}
+						if !out.ProducerClosed() {
+							t.Fatalf("output RowReceiver not closed")
+						}
 
-					require.Equal(t, expected, result)
-				})
+						var res rowenc.EncDatumRows
+						for {
+							row, meta := out.Next()
+							if meta != nil && meta.Metrics == nil {
+								t.Fatalf("unexpected metadata %+v", meta)
+							}
+							if row == nil {
+								break
+							}
+							res = append(res, row)
+						}
+
+						// processOutputRows is a helper function that takes a stringified
+						// EncDatumRows output (e.g. [[1 2] [3 1]]) and returns a slice of
+						// stringified rows without brackets (e.g. []string{"1 2", "3 1"}).
+						processOutputRows := func(output string) []string {
+							// Comma-separate the rows.
+							output = strings.ReplaceAll(output, "] [", ",")
+							// Remove leading and trailing bracket.
+							output = strings.Trim(output, "[]")
+							// Split on the commas that were introduced and return that.
+							return strings.Split(output, ",")
+						}
+
+						result := processOutputRows(res.String(c.outputTypes))
+						expected := processOutputRows(c.expected)
+
+						if !reqOrdering {
+							// An ordering was not required, so sort both the result and
+							// expected slice to reuse equality comparison.
+							sort.Strings(result)
+							sort.Strings(expected)
+						}
+
+						require.Equal(t, expected, result)
+					})
+				}
 			}
 		}
 	}
@@ -532,7 +706,7 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(ctx, storage.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,8 +741,8 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 	flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = mon.DefaultPoolAllocationSize
 
 	// Input row is just a single 0.
-	inputRows := sqlbase.EncDatumRows{
-		sqlbase.EncDatumRow{sqlbase.EncDatum{Datum: tree.NewDInt(tree.DInt(key))}},
+	inputRows := rowenc.EncDatumRows{
+		rowenc.EncDatumRow{rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(key))}},
 	}
 
 	out := &distsqlutils.RowBuffer{}
@@ -583,7 +757,7 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 			// Disk storage is only used when the input ordering must be maintained.
 			MaintainOrdering: true,
 		},
-		distsqlutils.NewRowBuffer(sqlbase.OneIntCol, inputRows, distsqlutils.RowBufferArgs{}),
+		distsqlutils.NewRowBuffer(rowenc.OneIntCol, inputRows, distsqlutils.RowBufferArgs{}),
 		&execinfrapb.PostProcessSpec{
 			Projection:    true,
 			OutputColumns: []uint32{2},
@@ -633,7 +807,7 @@ func TestJoinReaderDrain(t *testing.T) {
 	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	st := s.ClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(context.Background(), storage.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(context.Background(), base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,16 +820,7 @@ func TestJoinReaderDrain(t *testing.T) {
 
 	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
-	diskMonitor := mon.NewMonitor(
-		"test-disk",
-		mon.DiskResource,
-		nil, /* curCount */
-		nil, /* maxHist */
-		-1,  /* increment: use default block size */
-		math.MaxInt64,
-		st,
-	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	rootTxn := kv.NewTxn(ctx, s.DB(), s.NodeID())
@@ -672,25 +837,19 @@ func TestJoinReaderDrain(t *testing.T) {
 		Txn: leafTxn,
 	}
 
-	encRow := make(sqlbase.EncDatumRow, 1)
-	encRow[0] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(1))
+	encRow := make(rowenc.EncDatumRow, 1)
+	encRow[0] = rowenc.DatumToEncDatum(types.Int, tree.NewDInt(1))
 
-	// ConsumerClosed verifies that when a joinReader's consumer is closed, the
-	// joinReader finishes gracefully.
-	t.Run("ConsumerClosed", func(t *testing.T) {
-		in := distsqlutils.NewRowBuffer(sqlbase.OneIntCol, sqlbase.EncDatumRows{encRow}, distsqlutils.RowBufferArgs{})
-
-		out := &distsqlutils.RowBuffer{}
-		out.ConsumerClosed()
-		jr, err := newJoinReader(
-			&flowCtx, 0 /* processorID */, &execinfrapb.JoinReaderSpec{
-				Table: *td.TableDesc(),
-			}, in, &execinfrapb.PostProcessSpec{},
-			out, lookupJoinReaderType)
-		if err != nil {
-			t.Fatal(err)
-		}
-		jr.Run(ctx)
+	testReaderProcessorDrain(ctx, t, func(out execinfra.RowReceiver) (execinfra.Processor, error) {
+		return newJoinReader(
+			&flowCtx,
+			0, /* processorID */
+			&execinfrapb.JoinReaderSpec{Table: *td.TableDesc()},
+			distsqlutils.NewRowBuffer(rowenc.OneIntCol, nil /* rows */, distsqlutils.RowBufferArgs{}),
+			&execinfrapb.PostProcessSpec{},
+			out,
+			lookupJoinReaderType,
+		)
 	})
 
 	// ConsumerDone verifies that the producer drains properly by checking that
@@ -698,7 +857,7 @@ func TestJoinReaderDrain(t *testing.T) {
 	// called on the consumer.
 	t.Run("ConsumerDone", func(t *testing.T) {
 		expectedMetaErr := errors.New("dummy")
-		in := distsqlutils.NewRowBuffer(sqlbase.OneIntCol, nil /* rows */, distsqlutils.RowBufferArgs{})
+		in := distsqlutils.NewRowBuffer(rowenc.OneIntCol, nil /* rows */, distsqlutils.RowBufferArgs{})
 		if status := in.Push(encRow, &execinfrapb.ProducerMetadata{Err: expectedMetaErr}); status != execinfra.NeedMoreRows {
 			t.Fatalf("unexpected response: %d", status)
 		}
@@ -716,7 +875,7 @@ func TestJoinReaderDrain(t *testing.T) {
 		jr.Run(ctx)
 		row, meta := out.Next()
 		if row != nil {
-			t.Fatalf("row was pushed unexpectedly: %s", row.String(sqlbase.OneIntCol))
+			t.Fatalf("row was pushed unexpectedly: %s", row.String(rowenc.OneIntCol))
 		}
 		if !errors.Is(meta.Err, expectedMetaErr) {
 			t.Fatalf("unexpected error in metadata: %v", meta.Err)
@@ -727,7 +886,7 @@ func TestJoinReaderDrain(t *testing.T) {
 		for {
 			row, meta = out.Next()
 			if row != nil {
-				t.Fatalf("row was pushed unexpectedly: %s", row.String(sqlbase.OneIntCol))
+				t.Fatalf("row was pushed unexpectedly: %s", row.String(rowenc.OneIntCol))
 			}
 			if meta == nil {
 				break
@@ -783,18 +942,18 @@ func TestIndexJoiner(t *testing.T) {
 	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 	tdf := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t2")
 
-	v := [10]sqlbase.EncDatum{}
+	v := [10]rowenc.EncDatum{}
 	for i := range v {
-		v[i] = sqlbase.IntEncDatum(i)
+		v[i] = rowenc.IntEncDatum(i)
 	}
 
 	testCases := []struct {
 		description string
 		desc        *descpb.TableDescriptor
 		post        execinfrapb.PostProcessSpec
-		input       sqlbase.EncDatumRows
+		input       rowenc.EncDatumRows
 		outputTypes []*types.T
-		expected    sqlbase.EncDatumRows
+		expected    rowenc.EncDatumRows
 	}{
 		{
 			description: "Test selecting rows using the primary index",
@@ -803,14 +962,14 @@ func TestIndexJoiner(t *testing.T) {
 				Projection:    true,
 				OutputColumns: []uint32{0, 1, 2},
 			},
-			input: sqlbase.EncDatumRows{
+			input: rowenc.EncDatumRows{
 				{v[0], v[2]},
 				{v[0], v[5]},
 				{v[1], v[0]},
 				{v[1], v[5]},
 			},
-			outputTypes: sqlbase.ThreeIntCols,
-			expected: sqlbase.EncDatumRows{
+			outputTypes: rowenc.ThreeIntCols,
+			expected: rowenc.EncDatumRows{
 				{v[0], v[2], v[2]},
 				{v[0], v[5], v[5]},
 				{v[1], v[0], v[1]},
@@ -825,7 +984,7 @@ func TestIndexJoiner(t *testing.T) {
 				Projection:    true,
 				OutputColumns: []uint32{3},
 			},
-			input: sqlbase.EncDatumRows{
+			input: rowenc.EncDatumRows{
 				{v[0], v[1]},
 				{v[2], v[5]},
 				{v[0], v[5]},
@@ -836,12 +995,12 @@ func TestIndexJoiner(t *testing.T) {
 				{v[5], v[0]},
 			},
 			outputTypes: []*types.T{types.String},
-			expected: sqlbase.EncDatumRows{
-				{sqlbase.StrEncDatum("one")},
-				{sqlbase.StrEncDatum("five")},
-				{sqlbase.StrEncDatum("two-one")},
-				{sqlbase.StrEncDatum("one-three")},
-				{sqlbase.StrEncDatum("five-zero")},
+			expected: rowenc.EncDatumRows{
+				{rowenc.StrEncDatum("one")},
+				{rowenc.StrEncDatum("five")},
+				{rowenc.StrEncDatum("two-one")},
+				{rowenc.StrEncDatum("one-three")},
+				{rowenc.StrEncDatum("five-zero")},
 			},
 		},
 		{
@@ -851,14 +1010,14 @@ func TestIndexJoiner(t *testing.T) {
 				Projection:    true,
 				OutputColumns: []uint32{0, 1, 2},
 			},
-			input: sqlbase.EncDatumRows{
+			input: rowenc.EncDatumRows{
 				{v[0], v[2]},
 				{v[0], v[5]},
 				{v[1], v[0]},
 				{v[1], v[5]},
 			},
-			outputTypes: sqlbase.ThreeIntCols,
-			expected: sqlbase.EncDatumRows{
+			outputTypes: rowenc.ThreeIntCols,
+			expected: rowenc.EncDatumRows{
 				{v[0], v[2], v[2]},
 				{v[0], v[5], v[5]},
 				{v[1], v[0], v[1]},
@@ -878,7 +1037,7 @@ func TestIndexJoiner(t *testing.T) {
 				t,
 				execinfrapb.ProcessorCoreUnion{JoinReader: &spec},
 				c.post,
-				sqlbase.TwoIntCols,
+				rowenc.TwoIntCols,
 				c.input,
 				c.outputTypes,
 				c.expected,
@@ -928,7 +1087,7 @@ func BenchmarkJoinReader(b *testing.B) {
 	defer cleanupTempDir()
 	tempStoreSpec, err := base.NewStoreSpec(fmt.Sprintf("path=%s", tempStoragePath))
 	require.NoError(b, err)
-	tempEngine, _, err := storage.NewTempEngine(ctx, storage.DefaultStorageEngine, base.TempStorageConfig{Path: tempStoragePath, Mon: diskMonitor}, tempStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{Path: tempStoragePath, Mon: diskMonitor}, tempStoreSpec)
 	require.NoError(b, err)
 	defer tempEngine.Close()
 	flowCtx.Cfg.TempStorage = tempEngine
@@ -1044,7 +1203,7 @@ func BenchmarkJoinReader(b *testing.B) {
 							if indexIdx == 0 {
 								b.Fatalf("failed to find secondary index for column %s", columnDef.name)
 							}
-							input := newRowGeneratingSource(sqlbase.OneIntCol, sqlutils.ToRowFn(func(rowIdx int) tree.Datum {
+							input := newRowGeneratingSource(rowenc.OneIntCol, sqlutils.ToRowFn(func(rowIdx int) tree.Datum {
 								// Convert to 0-based.
 								return tree.NewDInt(tree.DInt(rowIdx - 1))
 							}), numLookupRows)

@@ -14,9 +14,13 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/errors"
 )
 
 // planDependencyInfo collects the dependencies related to a single
@@ -24,7 +28,7 @@ import (
 type planDependencyInfo struct {
 	// desc is a reference to the descriptor for the table being
 	// depended on.
-	desc *sqlbase.ImmutableTableDescriptor
+	desc *tabledesc.Immutable
 	// deps is the list of ways in which the current plan depends on
 	// that table. There can be more than one entries when the same
 	// table is used in different places. The entries can also be
@@ -56,4 +60,26 @@ func (d planDependencies) String() string {
 		buf.WriteByte('\n')
 	}
 	return buf.String()
+}
+
+// checkViewMatchesMaterialized ensures that if a view is required, then the view
+// is materialized or not as desired.
+func checkViewMatchesMaterialized(
+	desc catalog.TableDescriptor, requireView, wantMaterialized bool,
+) error {
+	if !requireView {
+		return nil
+	}
+	if !desc.IsView() {
+		return nil
+	}
+	isMaterialized := desc.MaterializedView()
+	if isMaterialized && !wantMaterialized {
+		err := pgerror.Newf(pgcode.WrongObjectType, "%q is a materialized view", desc.GetName())
+		return errors.WithHint(err, "use the corresponding MATERIALIZED VIEW command")
+	}
+	if !isMaterialized && wantMaterialized {
+		return pgerror.Newf(pgcode.WrongObjectType, "%q is not a materialized view", desc.GetName())
+	}
+	return nil
 }

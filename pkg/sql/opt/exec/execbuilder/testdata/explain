@@ -122,15 +122,14 @@ drop database  ·             ·
 query TTT
 SELECT * FROM [EXPLAIN SHOW JOBS] WHERE field != 'size' AND field != 'filter'
 ----
-·                                  distribution  local
-·                                  vectorized    false
-project                            ·             ·
- └── sort                          ·             ·
-      │                            order         -column18,-started
-      └── render                   ·             ·
-           └── filter              ·             ·
-                └── virtual table  ·             ·
-·                                  table         jobs@primary
+·                             distribution  local
+·                             vectorized    false
+sort                          ·             ·
+ │                            order         -column18,-started
+ └── render                   ·             ·
+      └── filter              ·             ·
+           └── virtual table  ·             ·
+·                             table         jobs@primary
 
 statement ok
 CREATE INDEX a ON foo(x)
@@ -180,263 +179,253 @@ sort                ·             ·
 query TTT
 SELECT * FROM [EXPLAIN SHOW TABLES] WHERE field != 'size'
 ----
-·                                                      distribution       local
-·                                                      vectorized         false
-project                                                ·                  ·
- └── sort                                              ·                  ·
-      │                                                order              +nspname,+relname
-      └── render                                       ·                  ·
-           └── hash join                               ·                  ·
-                │                                      type               right outer
-                │                                      equality           (table_id) = (column44)
-                ├── virtual table                      ·                  ·
-                │                                      table              table_row_statistics@primary
-                └── render                             ·                  ·
-                     └── hash join                     ·                  ·
-                          │                            type               inner
-                          │                            equality           (oid) = (relnamespace)
-                          ├── filter                   ·                  ·
-                          │    │                       filter             nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
-                          │    └── virtual table       ·                  ·
-                          │                            table              pg_namespace@primary
-                          └── hash join                ·                  ·
-                               │                       type               left outer
-                               │                       equality           (oid) = (objoid)
-                               │                       left cols are key  ·
-                               ├── filter              ·                  ·
-                               │    │                  filter             relkind IN ('S', 'r', 'v')
-                               │    └── virtual table  ·                  ·
-                               │                       table              pg_class@primary
-                               └── filter              ·                  ·
-                                    │                  filter             objsubid = 0
-                                    └── virtual table  ·                  ·
-·                                                      table              pg_description@primary
+·                                                      distribution  local
+·                                                      vectorized    false
+sort                                                   ·             ·
+ │                                                     order         +nspname,+relname
+ └── render                                            ·             ·
+      └── hash join (left outer)                       ·             ·
+           │                                           equality      (column59) = (table_id)
+           ├── render                                  ·             ·
+           │    └── hash join (right outer)            ·             ·
+           │         │                                 equality      (oid) = (relowner)
+           │         ├── virtual table                 ·             ·
+           │         │                                 table         pg_roles@primary
+           │         └── hash join                     ·             ·
+           │              │                            equality      (oid) = (relnamespace)
+           │              ├── filter                   ·             ·
+           │              │    │                       filter        nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
+           │              │    └── virtual table       ·             ·
+           │              │                            table         pg_namespace@primary
+           │              └── hash join (left outer)   ·             ·
+           │                   │                       equality      (oid) = (objoid)
+           │                   ├── filter              ·             ·
+           │                   │    │                  filter        relkind IN ('S', 'm', 'r', 'v')
+           │                   │    └── virtual table  ·             ·
+           │                   │                       table         pg_class@primary
+           │                   └── filter              ·             ·
+           │                        │                  filter        objsubid = 0
+           │                        └── virtual table  ·             ·
+           │                                           table         pg_description@primary
+           └── virtual table                           ·             ·
+·                                                      table         table_row_statistics@primary
 
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW TABLES WITH COMMENT] WHERE field != 'size'
 ----
-·                                                      distribution       local
-·                                                      vectorized         false
-project                                                ·                  ·
- └── sort                                              ·                  ·
-      │                                                order              +nspname,+relname
-      └── render                                       ·                  ·
-           └── hash join                               ·                  ·
-                │                                      type               right outer
-                │                                      equality           (table_id) = (column44)
-                ├── virtual table                      ·                  ·
-                │                                      table              table_row_statistics@primary
-                └── render                             ·                  ·
-                     └── hash join                     ·                  ·
-                          │                            type               inner
-                          │                            equality           (oid) = (relnamespace)
-                          ├── filter                   ·                  ·
-                          │    │                       filter             nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
-                          │    └── virtual table       ·                  ·
-                          │                            table              pg_namespace@primary
-                          └── hash join                ·                  ·
-                               │                       type               left outer
-                               │                       equality           (oid) = (objoid)
-                               │                       left cols are key  ·
-                               ├── filter              ·                  ·
-                               │    │                  filter             relkind IN ('S', 'r', 'v')
-                               │    └── virtual table  ·                  ·
-                               │                       table              pg_class@primary
-                               └── filter              ·                  ·
-                                    │                  filter             objsubid = 0
-                                    └── virtual table  ·                  ·
-·                                                      table              pg_description@primary
+·                                                      distribution  local
+·                                                      vectorized    false
+sort                                                   ·             ·
+ │                                                     order         +nspname,+relname
+ └── render                                            ·             ·
+      └── hash join (left outer)                       ·             ·
+           │                                           equality      (column59) = (table_id)
+           ├── render                                  ·             ·
+           │    └── hash join (right outer)            ·             ·
+           │         │                                 equality      (oid) = (relowner)
+           │         ├── virtual table                 ·             ·
+           │         │                                 table         pg_roles@primary
+           │         └── hash join                     ·             ·
+           │              │                            equality      (oid) = (relnamespace)
+           │              ├── filter                   ·             ·
+           │              │    │                       filter        nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
+           │              │    └── virtual table       ·             ·
+           │              │                            table         pg_namespace@primary
+           │              └── hash join (left outer)   ·             ·
+           │                   │                       equality      (oid) = (objoid)
+           │                   ├── filter              ·             ·
+           │                   │    │                  filter        relkind IN ('S', 'm', 'r', 'v')
+           │                   │    └── virtual table  ·             ·
+           │                   │                       table         pg_class@primary
+           │                   └── filter              ·             ·
+           │                        │                  filter        objsubid = 0
+           │                        └── virtual table  ·             ·
+           │                                           table         pg_description@primary
+           └── virtual table                           ·             ·
+·                                                      table         table_row_statistics@primary
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW DATABASE] WHERE field != 'size'
 ----
-·                        distribution  local
-·                        vectorized    false
-project                  ·             ·
- └── filter              ·             ·
-      │                  filter        variable = 'database'
-      └── virtual table  ·             ·
-·                        table         session_variables@primary
+·                   distribution  local
+·                   vectorized    false
+filter              ·             ·
+ │                  filter        variable = 'database'
+ └── virtual table  ·             ·
+·                   table         session_variables@primary
+
+query TTT
+SELECT * FROM [EXPLAIN SHOW SCHEMAS] WHERE field != 'size'
+----
+·                                  distribution  local
+·                                  vectorized    false
+sort                               ·             ·
+ │                                 order         +nspname
+ └── hash join (right outer)       ·             ·
+      │                            equality      (oid) = (nspowner)
+      ├── virtual table            ·             ·
+      │                            table         pg_roles@primary
+      └── hash join                ·             ·
+           │                       equality      (nspname) = (schema_name)
+           ├── virtual table       ·             ·
+           │                       table         pg_namespace@primary
+           └── filter              ·             ·
+                │                  filter        catalog_name = 'test'
+                └── virtual table  ·             ·
+·                                  table         schemata@primary
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW TIME ZONE] WHERE field != 'size'
 ----
-·                        distribution  local
-·                        vectorized    false
-project                  ·             ·
- └── filter              ·             ·
-      │                  filter        variable = 'timezone'
-      └── virtual table  ·             ·
-·                        table         session_variables@primary
+·                   distribution  local
+·                   vectorized    false
+filter              ·             ·
+ │                  filter        variable = 'timezone'
+ └── virtual table  ·             ·
+·                   table         session_variables@primary
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW DEFAULT_TRANSACTION_ISOLATION] WHERE field != 'size'
 ----
-·                        distribution  local
-·                        vectorized    false
-project                  ·             ·
- └── filter              ·             ·
-      │                  filter        variable = 'default_transaction_isolation'
-      └── virtual table  ·             ·
-·                        table         session_variables@primary
+·                   distribution  local
+·                   vectorized    false
+filter              ·             ·
+ │                  filter        variable = 'default_transaction_isolation'
+ └── virtual table  ·             ·
+·                   table         session_variables@primary
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW DEFAULT_TRANSACTION_PRIORITY] WHERE field != 'size'
 ----
-·                        distribution  local
-·                        vectorized    false
-project                  ·             ·
- └── filter              ·             ·
-      │                  filter        variable = 'default_transaction_priority'
-      └── virtual table  ·             ·
-·                        table         session_variables@primary
+·                   distribution  local
+·                   vectorized    false
+filter              ·             ·
+ │                  filter        variable = 'default_transaction_priority'
+ └── virtual table  ·             ·
+·                   table         session_variables@primary
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW TRANSACTION ISOLATION LEVEL] WHERE field != 'size'
 ----
-·                        distribution  local
-·                        vectorized    false
-project                  ·             ·
- └── filter              ·             ·
-      │                  filter        variable = 'transaction_isolation'
-      └── virtual table  ·             ·
-·                        table         session_variables@primary
+·                   distribution  local
+·                   vectorized    false
+filter              ·             ·
+ │                  filter        variable = 'transaction_isolation'
+ └── virtual table  ·             ·
+·                   table         session_variables@primary
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW TRANSACTION PRIORITY] WHERE field != 'size'
 ----
-·                        distribution  local
-·                        vectorized    false
-project                  ·             ·
- └── filter              ·             ·
-      │                  filter        variable = 'transaction_priority'
-      └── virtual table  ·             ·
-·                        table         session_variables@primary
+·                   distribution  local
+·                   vectorized    false
+filter              ·             ·
+ │                  filter        variable = 'transaction_priority'
+ └── virtual table  ·             ·
+·                   table         session_variables@primary
 
 query TTT
 EXPLAIN SHOW COLUMNS FROM foo
 ----
-·                                                 distribution  local
-·                                                 vectorized    false
-project                                           ·             ·
- └── render                                       ·             ·
-      └── group                                   ·             ·
-           │                                      aggregate 0   array_agg(index_name)
-           │                                      group by      column_name, ordinal_position, column_default, is_nullable, generation_expression, is_hidden, crdb_sql_type
-           │                                      ordered       +ordinal_position
-           └── project                            ·             ·
-                └── sort                          ·             ·
-                     │                            order         +ordinal_position
-                     └── hash join                ·             ·
-                          │                       type          left outer
-                          │                       equality      (column_name) = (column_name)
-                          ├── filter              ·             ·
-                          │    │                  filter        ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
-                          │    └── virtual table  ·             ·
-                          │                       table         columns@primary
-                          └── filter              ·             ·
-                               │                  filter        ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
-                               └── virtual table  ·             ·
-·                                                 table         statistics@primary
+·                                       distribution  local
+·                                       vectorized    false
+render                                  ·             ·
+ └── group                              ·             ·
+      │                                 group by      column_name, ordinal_position, column_default, is_nullable, generation_expression, is_hidden, crdb_sql_type
+      │                                 ordered       +ordinal_position
+      └── sort                          ·             ·
+           │                            order         +ordinal_position
+           └── hash join (left outer)   ·             ·
+                │                       equality      (column_name) = (column_name)
+                ├── filter              ·             ·
+                │    │                  filter        ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+                │    └── virtual table  ·             ·
+                │                       table         columns@primary
+                └── filter              ·             ·
+                     │                  filter        ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+                     └── virtual table  ·             ·
+·                                       table         statistics@primary
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW GRANTS ON foo] WHERE field != 'size'
 ----
-·                             distribution  local
-·                             vectorized    false
-project                       ·             ·
- └── sort                     ·             ·
-      │                       order         +grantee,+privilege_type
-      └── filter              ·             ·
-           │                  filter        (table_catalog, table_schema, table_name) IN (('test', 'public', 'foo'),)
-           └── virtual table  ·             ·
-·                             table         table_privileges@primary
+·                        distribution  local
+·                        vectorized    false
+sort                     ·             ·
+ │                       order         +grantee,+privilege_type
+ └── filter              ·             ·
+      │                  filter        (table_catalog, table_schema, table_name) IN (('test', 'public', 'foo'),)
+      └── virtual table  ·             ·
+·                        table         table_privileges@primary
 
 query TTT
 EXPLAIN SHOW INDEX FROM foo
 ----
-·                             distribution  local
-·                             vectorized    false
-project                       ·             ·
- └── render                   ·             ·
-      └── filter              ·             ·
-           │                  filter        ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
-           └── virtual table  ·             ·
-·                             table         statistics@primary
+·                        distribution  local
+·                        vectorized    false
+render                   ·             ·
+ └── filter              ·             ·
+      │                  filter        ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+      └── virtual table  ·             ·
+·                        table         statistics@primary
 
 query TTT
 EXPLAIN SHOW CONSTRAINTS FROM foo
 ----
-·                                              distribution           local
-·                                              vectorized             false
-project                                        ·                      ·
- └── sort                                      ·                      ·
-      │                                        order                  +conname
-      └── render                               ·                      ·
-           └── hash join                       ·                      ·
-                │                              type                   inner
-                │                              equality               (oid) = (relnamespace)
-                ├── filter                     ·                      ·
-                │    │                         filter                 nspname = 'public'
-                │    └── virtual table         ·                      ·
-                │                              table                  pg_namespace@primary
-                └── virtual table lookup join  ·                      ·
-                     │                         table                  pg_constraint@pg_constraint_conrelid_idx
-                     │                         type                   inner
-                     │                         equality               (oid) = (conrelid)
-                     │                         equality cols are key  ·
-                     │                         parallel               ·
-                     └── filter                ·                      ·
-                          │                    filter                 relname = 'foo'
-                          └── virtual table    ·                      ·
-·                                              table                  pg_class@primary
+·                                         distribution  local
+·                                         vectorized    false
+sort                                      ·             ·
+ │                                        order         +conname
+ └── render                               ·             ·
+      └── hash join                       ·             ·
+           │                              equality      (relnamespace) = (oid)
+           ├── virtual table lookup join  ·             ·
+           │    │                         table         pg_constraint@pg_constraint_conrelid_idx
+           │    │                         equality      (oid) = (conrelid)
+           │    └── filter                ·             ·
+           │         │                    filter        relname = 'foo'
+           │         └── virtual table    ·             ·
+           │                              table         pg_class@primary
+           └── filter                     ·             ·
+                │                         filter        nspname = 'public'
+                └── virtual table         ·             ·
+·                                         table         pg_namespace@primary
 
 query TTT
 EXPLAIN SHOW USERS
 ----
-·                                                                       distribution       local
-·                                                                       vectorized         true
-project                                                                 ·                  ·
- └── sort                                                               ·                  ·
-      │                                                                 order              +username
-      └── render                                                        ·                  ·
-           └── group                                                    ·                  ·
-                │                                                       aggregate 0        array_agg(role)
-                │                                                       aggregate 1        any_not_null(any_not_null)
-                │                                                       aggregate 2        any_not_null(role)
-                │                                                       group by           username
-                └── project                                             ·                  ·
-                     └── sort                                           ·                  ·
-                          │                                             order              +role
-                          └── hash join                                 ·                  ·
-                               │                                        type               left outer
-                               │                                        equality           (username) = (member)
-                               │                                        left cols are key  ·
-                               ├── group                                ·                  ·
-                               │    │                                   aggregate 0        any_not_null(string_agg)
-                               │    │                                   group by           username
-                               │    └── project                         ·                  ·
-                               │         └── window                     ·                  ·
-                               │              └── project               ·                  ·
-                               │                   └── render           ·                  ·
-                               │                        └── merge join  ·                  ·
-                               │                             │          type               left outer
-                               │                             │          equality           (username) = (username)
-                               │                             │          left cols are key  ·
-                               │                             │          mergeJoinOrder     +"(username=username)"
-                               │                             ├── scan   ·                  ·
-                               │                             │          missing stats      ·
-                               │                             │          table              users@primary
-                               │                             │          spans              FULL SCAN
-                               │                             └── scan   ·                  ·
-                               │                                        missing stats      ·
-                               │                                        table              role_options@primary
-                               │                                        spans              FULL SCAN
-                               └── scan                                 ·                  ·
-·                                                                       missing stats      ·
-·                                                                       table              role_members@role_members_role_idx
-·                                                                       spans              FULL SCAN
+·                                                                distribution       local
+·                                                                vectorized         true
+sort                                                             ·                  ·
+ │                                                               order              +username
+ └── render                                                      ·                  ·
+      └── group                                                  ·                  ·
+           │                                                     group by           username
+           └── sort                                              ·                  ·
+                │                                                order              +role
+                └── hash join (left outer)                       ·                  ·
+                     │                                           equality           (username) = (member)
+                     │                                           left cols are key  ·
+                     ├── group                                   ·                  ·
+                     │    │                                      group by           username
+                     │    └── window                             ·                  ·
+                     │         └── render                        ·                  ·
+                     │              └── merge join (left outer)  ·                  ·
+                     │                   │                       equality           (username) = (username)
+                     │                   │                       left cols are key  ·
+                     │                   ├── scan                ·                  ·
+                     │                   │                       missing stats      ·
+                     │                   │                       table              users@primary
+                     │                   │                       spans              FULL SCAN
+                     │                   └── scan                ·                  ·
+                     │                                           missing stats      ·
+                     │                                           table              role_options@primary
+                     │                                           spans              FULL SCAN
+                     └── scan                                    ·                  ·
+·                                                                missing stats      ·
+·                                                                table              role_members@role_members_role_idx
+·                                                                spans              FULL SCAN
 
 # EXPLAIN selecting from a sequence.
 statement ok
@@ -516,8 +505,7 @@ EXPLAIN SELECT * FROM t WHERE k = 1 OR k = 3
 scan  ·              ·
 ·     missing stats  ·
 ·     table          t@primary
-·     spans          /1-/1/# /3-/3/#
-·     parallel       ·
+·     spans          [/1 - /1] [/3 - /3]
 
 statement ok
 CREATE TABLE t2 (x INT PRIMARY KEY)
@@ -529,10 +517,8 @@ EXPLAIN (PLAN) SELECT * FROM t INNER LOOKUP JOIN t2 ON t.k = t2.x
 ·            vectorized             true
 lookup join  ·                      ·
  │           table                  t2@primary
- │           type                   inner
  │           equality               (k) = (x)
  │           equality cols are key  ·
- │           parallel               ·
  └── scan    ·                      ·
 ·            missing stats          ·
 ·            table                  t@primary
@@ -736,26 +722,25 @@ delete               ·                    ·                            ()     
 query TTTTT
 EXPLAIN (TYPES) UPDATE t SET v = k + 1 WHERE v > 123
 ----
-·                         distribution         local                          ·                          ·
-·                         vectorized           false                          ·                          ·
-update                    ·                    ·                              ()                         ·
- │                        estimated row count  0 (missing stats)              ·                          ·
- │                        table                t                              ·                          ·
- │                        set                  v                              ·                          ·
- │                        auto commit          ·                              ·                          ·
- └── project              ·                    ·                              (k int, v int, v_new int)  ·
-      └── render          ·                    ·                              (v_new int, k int, v int)  ·
-           │              estimated row count  333 (missing stats)            ·                          ·
-           │              render 0             ((k)[int] + (1)[int])[int]     ·                          ·
-           │              render 1             (k)[int]                       ·                          ·
-           │              render 2             (v)[int]                       ·                          ·
-           └── filter     ·                    ·                              (k int, v int)             ·
-                │         estimated row count  333 (missing stats)            ·                          ·
-                │         filter               ((v)[int] > (123)[int])[bool]  ·                          ·
-                └── scan  ·                    ·                              (k int, v int)             ·
-·                         estimated row count  1000 (missing stats)           ·                          ·
-·                         table                t@primary                      ·                          ·
-·                         spans                FULL SCAN                      ·                          ·
+·                    distribution         local                          ·                          ·
+·                    vectorized           false                          ·                          ·
+update               ·                    ·                              ()                         ·
+ │                   estimated row count  0 (missing stats)              ·                          ·
+ │                   table                t                              ·                          ·
+ │                   set                  v                              ·                          ·
+ │                   auto commit          ·                              ·                          ·
+ └── render          ·                    ·                              (k int, v int, v_new int)  ·
+      │              estimated row count  333 (missing stats)            ·                          ·
+      │              render 0             ((k)[int] + (1)[int])[int]     ·                          ·
+      │              render 1             (k)[int]                       ·                          ·
+      │              render 2             (v)[int]                       ·                          ·
+      └── filter     ·                    ·                              (k int, v int)             ·
+           │         estimated row count  333 (missing stats)            ·                          ·
+           │         filter               ((v)[int] > (123)[int])[bool]  ·                          ·
+           └── scan  ·                    ·                              (k int, v int)             ·
+·                    estimated row count  1000 (missing stats)           ·                          ·
+·                    table                t@primary                      ·                          ·
+·                    spans                FULL SCAN                      ·                          ·
 
 query TTTTT
 EXPLAIN (TYPES) VALUES (1) UNION VALUES (2)
@@ -895,7 +880,7 @@ EXPLAIN (OPT,VERBOSE) SELECT * FROM tc WHERE a = 10 ORDER BY b
 sort
  ├── columns: a:1 b:2
  ├── stats: [rows=10, distinct(1)=1, null(1)=0]
- ├── cost: 52.7943856
+ ├── cost: 76.5943856
  ├── fd: ()-->(1)
  ├── ordering: +2 opt(1) [actual: +2]
  ├── prune: (2)
@@ -903,7 +888,7 @@ sort
  └── index-join tc
       ├── columns: a:1 b:2
       ├── stats: [rows=10, distinct(1)=1, null(1)=0]
-      ├── cost: 51.92
+      ├── cost: 75.72
       ├── fd: ()-->(1)
       ├── prune: (2)
       ├── interesting orderings: (+1)
@@ -911,7 +896,7 @@ sort
            ├── columns: a:1 rowid:3
            ├── constraint: /1/3: [/10 - /10]
            ├── stats: [rows=10, distinct(1)=1, null(1)=0]
-           ├── cost: 10.81
+           ├── cost: 14.81
            ├── key: (3)
            └── fd: ()-->(1)
 
@@ -921,7 +906,7 @@ EXPLAIN (OPT,TYPES) SELECT * FROM tc WHERE a = 10 ORDER BY b
 sort
  ├── columns: a:1(int!null) b:2(int)
  ├── stats: [rows=10, distinct(1)=1, null(1)=0]
- ├── cost: 52.7943856
+ ├── cost: 76.5943856
  ├── fd: ()-->(1)
  ├── ordering: +2 opt(1) [actual: +2]
  ├── prune: (2)
@@ -929,7 +914,7 @@ sort
  └── index-join tc
       ├── columns: a:1(int!null) b:2(int)
       ├── stats: [rows=10, distinct(1)=1, null(1)=0]
-      ├── cost: 51.92
+      ├── cost: 75.72
       ├── fd: ()-->(1)
       ├── prune: (2)
       ├── interesting orderings: (+1)
@@ -937,7 +922,7 @@ sort
            ├── columns: a:1(int!null) rowid:3(int!null)
            ├── constraint: /1/3: [/10 - /10]
            ├── stats: [rows=10, distinct(1)=1, null(1)=0]
-           ├── cost: 10.81
+           ├── cost: 14.81
            ├── key: (3)
            └── fd: ()-->(1)
 
@@ -949,6 +934,7 @@ TABLE tc
  ├── b int
  ├── rowid int not null default (unique_rowid()) [hidden]
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
+ ├── tableoid oid [hidden] [system]
  ├── INDEX primary
  │    └── rowid int not null default (unique_rowid()) [hidden]
  └── INDEX c
@@ -967,6 +953,7 @@ TABLE tc
  ├── b int
  ├── rowid int not null default (unique_rowid()) [hidden]
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
+ ├── tableoid oid [hidden] [system]
  ├── INDEX primary
  │    └── rowid int not null default (unique_rowid()) [hidden]
  └── INDEX c
@@ -976,33 +963,34 @@ TABLE t
  ├── k int not null
  ├── v int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
+ ├── tableoid oid [hidden] [system]
  └── INDEX primary
       └── k int not null
 inner-join (hash)
- ├── columns: a:1 b:2 k:5 v:6
+ ├── columns: a:1 b:2 k:6 v:7
  ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
- ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(5)=99, null(5)=0]
- ├── cost: 2219.96
- ├── fd: (5)-->(6), (1)==(5), (5)==(1)
- ├── prune: (2,6)
+ ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(6)=99, null(6)=0]
+ ├── cost: 2227.96
+ ├── fd: (6)-->(7), (1)==(6), (6)==(1)
+ ├── prune: (2,7)
  ├── scan tc
  │    ├── columns: a:1 b:2
  │    ├── stats: [rows=1000, distinct(1)=100, null(1)=10]
- │    ├── cost: 1100.02
+ │    ├── cost: 1104.02
  │    ├── prune: (1,2)
  │    ├── interesting orderings: (+1)
- │    └── unfiltered-cols: (1-4)
+ │    └── unfiltered-cols: (1-5)
  ├── scan t
- │    ├── columns: k:5 v:6
- │    ├── stats: [rows=1000, distinct(5)=1000, null(5)=0]
- │    ├── cost: 1080.02
- │    ├── key: (5)
- │    ├── fd: (5)-->(6)
- │    ├── prune: (5,6)
- │    ├── interesting orderings: (+5)
- │    └── unfiltered-cols: (5-7)
+ │    ├── columns: k:6 v:7
+ │    ├── stats: [rows=1000, distinct(6)=1000, null(6)=0]
+ │    ├── cost: 1084.02
+ │    ├── key: (6)
+ │    ├── fd: (6)-->(7)
+ │    ├── prune: (6,7)
+ │    ├── interesting orderings: (+6)
+ │    └── unfiltered-cols: (6-9)
  └── filters
-      └── k:5 = a:1 [outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
+      └── k:6 = a:1 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
 
 query T
 EXPLAIN (OPT) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
@@ -1020,69 +1008,69 @@ query T
 EXPLAIN (OPT, VERBOSE) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
 ----
 sort
- ├── columns: a:1 b:2  [hidden: column5:5]
+ ├── columns: a:1 b:2  [hidden: column6:6]
  ├── immutable
  ├── stats: [rows=333.333333]
- ├── cost: 1179.26548
- ├── fd: (1,2)-->(5)
- ├── ordering: +5
- ├── prune: (1,2,5)
+ ├── cost: 1183.26548
+ ├── fd: (1,2)-->(6)
+ ├── ordering: +6
+ ├── prune: (1,2,6)
  ├── interesting orderings: (+1)
  └── project
-      ├── columns: column5:5 a:1 b:2
+      ├── columns: column6:6 a:1 b:2
       ├── immutable
       ├── stats: [rows=333.333333]
-      ├── cost: 1116.71667
-      ├── fd: (1,2)-->(5)
-      ├── prune: (1,2,5)
+      ├── cost: 1120.71667
+      ├── fd: (1,2)-->(6)
+      ├── prune: (1,2,6)
       ├── interesting orderings: (+1)
       ├── select
       │    ├── columns: a:1 b:2
       │    ├── immutable
       │    ├── stats: [rows=333.333333]
-      │    ├── cost: 1110.04
+      │    ├── cost: 1114.04
       │    ├── interesting orderings: (+1)
       │    ├── scan tc
       │    │    ├── columns: a:1 b:2
       │    │    ├── stats: [rows=1000]
-      │    │    ├── cost: 1100.02
+      │    │    ├── cost: 1104.02
       │    │    ├── prune: (1,2)
       │    │    └── interesting orderings: (+1)
       │    └── filters
       │         └── (a:1 + (b:2 * 2)) > 1 [outer=(1,2), immutable]
       └── projections
-           └── a:1 * b:2 [as=column5:5, outer=(1,2), immutable]
+           └── a:1 * b:2 [as=column6:6, outer=(1,2), immutable]
 
 query T
 EXPLAIN (OPT, TYPES) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
 ----
 sort
- ├── columns: a:1(int) b:2(int)  [hidden: column5:5(int)]
+ ├── columns: a:1(int) b:2(int)  [hidden: column6:6(int)]
  ├── immutable
  ├── stats: [rows=333.333333]
- ├── cost: 1179.26548
- ├── fd: (1,2)-->(5)
- ├── ordering: +5
- ├── prune: (1,2,5)
+ ├── cost: 1183.26548
+ ├── fd: (1,2)-->(6)
+ ├── ordering: +6
+ ├── prune: (1,2,6)
  ├── interesting orderings: (+1)
  └── project
-      ├── columns: column5:5(int) a:1(int) b:2(int)
+      ├── columns: column6:6(int) a:1(int) b:2(int)
       ├── immutable
       ├── stats: [rows=333.333333]
-      ├── cost: 1116.71667
-      ├── fd: (1,2)-->(5)
-      ├── prune: (1,2,5)
+      ├── cost: 1120.71667
+      ├── fd: (1,2)-->(6)
+      ├── prune: (1,2,6)
       ├── interesting orderings: (+1)
       ├── select
       │    ├── columns: a:1(int) b:2(int)
       │    ├── immutable
       │    ├── stats: [rows=333.333333]
-      │    ├── cost: 1110.04
+      │    ├── cost: 1114.04
       │    ├── interesting orderings: (+1)
       │    ├── scan tc
       │    │    ├── columns: a:1(int) b:2(int)
       │    │    ├── stats: [rows=1000]
-      │    │    ├── cost: 1100.02
+      │    │    ├── cost: 1104.02
       │    │    ├── prune: (1,2)
       │    │    └── interesting orderings: (+1)
       │    └── filters
@@ -1094,34 +1082,30 @@ sort
       │              │         └── const: 2 [type=int]
       │              └── const: 1 [type=int]
       └── projections
-           └── mult [as=column5:5, type=int, outer=(1,2), immutable]
+           └── mult [as=column6:6, type=int, outer=(1,2), immutable]
                 ├── variable: a:1 [type=int]
                 └── variable: b:2 [type=int]
 
 query TTT colnames
 EXPLAIN SELECT string_agg(x, y) FROM (VALUES ('foo', 'foo'), ('bar', 'bar')) t(x, y)
 ----
-tree         field         description
-·            distribution  local
-·            vectorized    false
-group        ·             ·
- │           aggregate 0   string_agg(column1, column2)
- │           scalar        ·
- └── values  ·             ·
-·            size          2 columns, 2 rows
+tree            field         description
+·               distribution  local
+·               vectorized    false
+group (scalar)  ·             ·
+ └── values     ·             ·
+·               size          2 columns, 2 rows
 
 query TTT
 EXPLAIN SELECT corr(a, b) FROM tc;
 ----
-·          distribution   local
-·          vectorized     true
-group      ·              ·
- │         aggregate 0    corr(a, b)
- │         scalar         ·
- └── scan  ·              ·
-·          missing stats  ·
-·          table          tc@primary
-·          spans          FULL SCAN
+·               distribution   local
+·               vectorized     true
+group (scalar)  ·              ·
+ └── scan       ·              ·
+·               missing stats  ·
+·               table          tc@primary
+·               spans          FULL SCAN
 
 # Verify that subqueries are handled correctly, namely that we can have
 # subqueries outside of the EXPLAINed query.
@@ -1154,3 +1138,68 @@ EXPLAIN (VERBOSE) EXPLAIN ANALYZE SELECT 1
 project       ·                    ·                   (automatic, url)        ·
  └── explain  ·                    ·                   (automatic, url, json)  ·
 ·             estimated row count  10 (missing stats)  ·                       ·
+
+# Test a case with many spans.
+query TTT
+EXPLAIN SELECT * FROM t WHERE k IN (10, 20, 30, 40, 50, 60, 70, 80)
+----
+·     distribution   local
+·     vectorized     true
+scan  ·              ·
+·     missing stats  ·
+·     table          t@primary
+·     spans          [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] … (4 more)
+
+
+# UPSERT and INSERT ON CONFLICT include arbiters.
+
+statement ok
+CREATE TABLE u (
+  k INT PRIMARY KEY,
+  v INT,
+  UNIQUE INDEX (v),
+  FAMILY "primary" (k, v)
+)
+
+query TTT
+EXPLAIN UPSERT INTO u VALUES (1, 1)
+----
+·                             distribution      local
+·                             vectorized        false
+upsert                        ·                 ·
+ │                            into              u(k, v)
+ │                            auto commit       ·
+ │                            arbiter indexes   primary
+ └── cross join (left outer)  ·                 ·
+      ├── values              ·                 ·
+      │                       size              2 columns, 1 row
+      └── scan                ·                 ·
+·                             missing stats     ·
+·                             table             u@primary
+·                             spans             [/1 - /1]
+·                             locking strength  for update
+
+query TTT
+EXPLAIN INSERT INTO u VALUES (1, 1) ON CONFLICT DO NOTHING
+----
+·                                            distribution           local
+·                                            vectorized             false
+insert                                       ·                      ·
+ │                                           into                   u(k, v)
+ │                                           auto commit            ·
+ │                                           arbiter indexes        primary, u_v_key
+ └── filter                                  ·                      ·
+      │                                      filter                 k IS NULL
+      └── lookup join (left outer)           ·                      ·
+           │                                 table                  u@u_v_key
+           │                                 equality               (column2) = (v)
+           │                                 equality cols are key  ·
+           └── filter                        ·                      ·
+                │                            filter                 k IS NULL
+                └── cross join (left outer)  ·                      ·
+                     ├── values              ·                      ·
+                     │                       size                   2 columns, 1 row
+                     └── scan                ·                      ·
+·                                            missing stats          ·
+·                                            table                  u@primary
+·                                            spans                  [/1 - /1]

@@ -388,7 +388,7 @@ func NewTestWithLocality(
 // AssertNotStarted fatals if the Gossip instance was already started.
 func (g *Gossip) AssertNotStarted(ctx context.Context) {
 	if g.started {
-		log.Fatalf(ctx, "Gossip instance was already started")
+		log.Fatalf(ctx, "gossip instance was already started")
 	}
 }
 
@@ -1646,8 +1646,8 @@ type OptionalGossip struct {
 //
 // Use of Gossip from within the SQL layer is **deprecated**. Please do not
 // introduce new uses of it.
-func (og OptionalGossip) OptionalErr(issueNos ...int) (*Gossip, error) {
-	v, err := og.w.OptionalErr(issueNos...)
+func (og OptionalGossip) OptionalErr(issue int) (*Gossip, error) {
+	v, err := og.w.OptionalErr(issue)
 	if err != nil {
 		return nil, err
 	}
@@ -1660,7 +1660,7 @@ func (og OptionalGossip) OptionalErr(issueNos ...int) (*Gossip, error) {
 //
 // Use of Gossip from within the SQL layer is **deprecated**. Please do not
 // introduce new uses of it.
-func (og OptionalGossip) Optional(issueNos ...int) (*Gossip, bool) {
+func (og OptionalGossip) Optional(issue int) (*Gossip, bool) {
 	v, ok := og.w.Optional()
 	if !ok {
 		return nil, false

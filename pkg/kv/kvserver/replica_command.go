@@ -71,7 +71,7 @@ func maybeDescriptorChangedError(
 		if !detail.ActualValue.IsPresent() {
 			return true, nil
 		} else if err := detail.ActualValue.GetProto(&actualDesc); err == nil &&
-			desc.RangeID == actualDesc.RangeID && !desc.Equal(actualDesc) {
+			desc.RangeID == actualDesc.RangeID && !desc.Equal(&actualDesc) {
 			return true, &actualDesc
 		}
 	}
@@ -206,7 +206,7 @@ func splitTxnAttempt(
 	{
 		b := txn.NewBatch()
 		leftDescKey := keys.RangeDescriptorKey(leftDesc.StartKey)
-		if err := updateRangeDescriptor(b, leftDescKey, dbDescValue, leftDesc); err != nil {
+		if err := updateRangeDescriptor(ctx, b, leftDescKey, dbDescValue, leftDesc); err != nil {
 			return err
 		}
 		// Commit this batch first to ensure that the transaction record
@@ -230,7 +230,7 @@ func splitTxnAttempt(
 
 	// Write range descriptor for right hand side of the split.
 	rightDescKey := keys.RangeDescriptorKey(rightDesc.StartKey)
-	if err := updateRangeDescriptor(b, rightDescKey, nil, rightDesc); err != nil {
+	if err := updateRangeDescriptor(ctx, b, rightDescKey, nil, rightDesc); err != nil {
 		return err
 	}
 
@@ -268,7 +268,7 @@ func splitTxnStickyUpdateAttempt(
 
 	b := txn.NewBatch()
 	descKey := keys.RangeDescriptorKey(desc.StartKey)
-	if err := updateRangeDescriptor(b, descKey, dbDescValue, &newDesc); err != nil {
+	if err := updateRangeDescriptor(ctx, b, descKey, dbDescValue, &newDesc); err != nil {
 		return err
 	}
 	if err := updateRangeAddressing(b, &newDesc); err != nil {
@@ -481,7 +481,7 @@ func (r *Replica) adminUnsplitWithDescriptor(
 		descKey := keys.RangeDescriptorKey(newDesc.StartKey)
 
 		b := txn.NewBatch()
-		if err := updateRangeDescriptor(b, descKey, dbDescValue, &newDesc); err != nil {
+		if err := updateRangeDescriptor(ctx, b, descKey, dbDescValue, &newDesc); err != nil {
 			return err
 		}
 		if err := updateRangeAddressing(b, &newDesc); err != nil {
@@ -678,7 +678,7 @@ func (r *Replica) AdminMerge(
 			b := txn.NewBatch()
 			leftDescKey := keys.RangeDescriptorKey(updatedLeftDesc.StartKey)
 			if err := updateRangeDescriptor(
-				b, leftDescKey, dbOrigLeftDescValue, &updatedLeftDesc,
+				ctx, b, leftDescKey, dbOrigLeftDescValue, &updatedLeftDesc,
 			); err != nil {
 				return err
 			}
@@ -707,7 +707,7 @@ func (r *Replica) AdminMerge(
 		}
 
 		// Remove the range descriptor for the deleted range.
-		if err := updateRangeDescriptor(b, rightDescKey,
+		if err := updateRangeDescriptor(ctx, b, rightDescKey,
 			dbRightDescKV.Value.TagAndDataBytes(), /* oldValue */
 			nil,                                   /* newDesc */
 		); err != nil {
@@ -1125,50 +1125,95 @@ func validateReplicationChanges(
 ) error {
 	// First make sure that the changes don't self-overlap (i.e. we're not adding
 	// a replica twice, or removing and immediately re-adding it).
-	byNodeID := make(map[roachpb.NodeID]roachpb.ReplicationChange, len(chgs))
+	byNodeAndStoreID := make(map[roachpb.NodeID]map[roachpb.StoreID]roachpb.ReplicationChange, len(chgs))
 	for _, chg := range chgs {
-		if _, ok := byNodeID[chg.Target.NodeID]; ok {
-			return fmt.Errorf("changes %+v refer to n%d twice", chgs, chg.Target.NodeID)
+		byStoreID, ok := byNodeAndStoreID[chg.Target.NodeID]
+		if !ok {
+			byStoreID = make(map[roachpb.StoreID]roachpb.ReplicationChange)
+			byNodeAndStoreID[chg.Target.NodeID] = byStoreID
+		} else {
+			// The only operation that is allowed within a node is an Add/Remove.
+			for _, prevChg := range byStoreID {
+				if prevChg.ChangeType == chg.ChangeType {
+					return fmt.Errorf("changes %+v refer to n%d twice for change %v",
+						chgs, chg.Target.NodeID, chg.ChangeType)
+				}
+				if prevChg.ChangeType != roachpb.ADD_REPLICA {
+					return fmt.Errorf("can only add-remove a replica within a node, but got %+v", chgs)
+				}
+			}
 		}
-		byNodeID[chg.Target.NodeID] = chg
+		if _, ok := byStoreID[chg.Target.StoreID]; ok {
+			return fmt.Errorf("changes %+v refer to n%d and s%d twice", chgs,
+				chg.Target.NodeID, chg.Target.StoreID)
+		}
+		byStoreID[chg.Target.StoreID] = chg
 	}
 
 	// Then, check that we're not adding a second replica on nodes that already
-	// have one, or "re-add" an existing replica. We delete from byNodeID so that
-	// after this loop, it contains only StoreIDs that we haven't seen in desc.
+	// have one, or "re-add" an existing replica. We delete from byNodeAndStoreID so that
+	// after this loop, it contains only Nodes that we haven't seen in desc.
 	for _, rDesc := range desc.Replicas().All() {
-		chg, ok := byNodeID[rDesc.NodeID]
-		delete(byNodeID, rDesc.NodeID)
-		if !ok || chg.ChangeType != roachpb.ADD_REPLICA {
+		byStoreID, ok := byNodeAndStoreID[rDesc.NodeID]
+		if !ok {
 			continue
 		}
-		// We're adding a replica that's already there. This isn't allowed, even
-		// when the newly added one would be on a different store.
-		if rDesc.StoreID != chg.Target.StoreID {
-			return errors.Errorf("unable to add replica %v; node already has a replica in %s", chg.Target.StoreID, desc)
+		delete(byNodeAndStoreID, rDesc.NodeID)
+		if len(byStoreID) == 2 {
+			chg, k := byStoreID[rDesc.StoreID]
+			// We should be removing the replica from the existing store during a
+			// rebalance within the node.
+			if !k || chg.ChangeType != roachpb.REMOVE_REPLICA {
+				return errors.Errorf(
+					"Expected replica to be removed from %v during a lateral rebalance %v within the node.", rDesc, chgs)
+			}
+			continue
+		}
+		chg, ok := byStoreID[rDesc.StoreID]
+		// There are two valid conditions here:
+		// (1) removal of an existing store.
+		// (2) add on the node, when we only have one replica.
+		// See https://github.com/cockroachdb/cockroach/issues/40333.
+		if ok {
+			if chg.ChangeType == roachpb.REMOVE_REPLICA {
+				continue
+			}
+			// Looks like we found a replica with the same store and node id. If the
+			// replica is already a learner, then either some previous leaseholder was
+			// trying to add it with the learner+snapshot+voter cycle and got
+			// interrupted or else we hit a race between the replicate queue and
+			// AdminChangeReplicas.
+			if rDesc.GetType() == roachpb.LEARNER {
+				return errors.Errorf(
+					"unable to add replica %v which is already present as a learner in %s", chg.Target, desc)
+			}
+
+			// Otherwise, we already had a full voter replica. Can't add another to
+			// this store.
+			return errors.Errorf("unable to add replica %v which is already present in %s", chg.Target, desc)
 		}
 
-		// Looks like we found a replica with the same store and node id. If the
-		// replica is already a learner, then either some previous leaseholder was
-		// trying to add it with the learner+snapshot+voter cycle and got
-		// interrupted or else we hit a race between the replicate queue and
-		// AdminChangeReplicas.
-		if rDesc.GetType() == roachpb.LEARNER {
-			return errors.Errorf(
-				"unable to add replica %v which is already present as a learner in %s", chg.Target, desc)
+		for _, c := range byStoreID {
+			// We're adding a replica that's already there. This isn't allowed, even
+			// when the newly added one would be on a different store.
+			if c.ChangeType == roachpb.ADD_REPLICA {
+				if len(desc.Replicas().All()) > 1 {
+					return errors.Errorf("unable to add replica %v; node already has a replica in %s", c.Target.StoreID, desc)
+				}
+			} else {
+				return errors.Errorf("removing %v which is not in %s", c.Target, desc)
+			}
 		}
-
-		// Otherwise, we already had a full voter replica. Can't add another to
-		// this store.
-		return errors.Errorf("unable to add replica %v which is already present in %s", chg.Target, desc)
 	}
 
 	// Any removals left in the map now refer to nonexisting replicas, and we refuse them.
-	for _, chg := range byNodeID {
-		if chg.ChangeType != roachpb.REMOVE_REPLICA {
-			continue
+	for _, byStoreID := range byNodeAndStoreID {
+		for _, chg := range byStoreID {
+			if chg.ChangeType != roachpb.REMOVE_REPLICA {
+				continue
+			}
+			return errors.Errorf("removing %v which is not in %s", chg.Target, desc)
 		}
-		return errors.Errorf("removing %v which is not in %s", chg.Target, desc)
 	}
 	return nil
 }
@@ -1613,7 +1658,7 @@ func execChangeReplicasTxn(
 
 			// Important: the range descriptor must be the first thing touched in the transaction
 			// so the transaction record is co-located with the range being modified.
-			if err := updateRangeDescriptor(b, descKey, dbDescValue, crt.Desc); err != nil {
+			if err := updateRangeDescriptor(ctx, b, descKey, dbDescValue, crt.Desc); err != nil {
 				return err
 			}
 
@@ -1883,11 +1928,10 @@ func (r *Replica) sendSnapshot(
 	}
 	if err := r.store.cfg.Transport.SendSnapshot(
 		ctx,
-		&r.store.cfg.RaftConfig,
 		r.store.allocator.storePool,
 		req,
 		snap,
-		r.store.Engine().NewBatch,
+		r.store.Engine().NewWriteOnlyBatch,
 		sent,
 	); err != nil {
 		if errors.Is(err, errMalformedSnapshot) {
@@ -1948,7 +1992,6 @@ func checkDescsEqual(desc *roachpb.RangeDescriptor) func(*roachpb.RangeDescripto
 		if desc2 != nil {
 			desc2.Replicas() // for sorting side-effect
 		}
-
 		return desc.Equal(desc2)
 	}
 }
@@ -2002,7 +2045,11 @@ func conditionalGetDescValueFromDB(
 // descriptor, a CommitTrigger must be used to update the in-memory
 // descriptor; it will not automatically be copied from newDesc.
 func updateRangeDescriptor(
-	b *kv.Batch, descKey roachpb.Key, oldValue []byte, newDesc *roachpb.RangeDescriptor,
+	ctx context.Context,
+	b *kv.Batch,
+	descKey roachpb.Key,
+	oldValue []byte,
+	newDesc *roachpb.RangeDescriptor,
 ) error {
 	// This is subtle: []byte(nil) != interface{}(nil). A []byte(nil) refers to
 	// an empty value. An interface{}(nil) refers to a non-existent value. So

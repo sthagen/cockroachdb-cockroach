@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -34,11 +35,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -210,7 +212,7 @@ func (t *leaseTest) node(nodeID uint32) *lease.Manager {
 	if mgr == nil {
 		var c base.NodeIDContainer
 		c.Set(context.Background(), roachpb.NodeID(nodeID))
-		nc := base.NewSQLIDContainer(0, &c, true /* exposed*/)
+		nc := base.NewSQLIDContainer(0, &c)
 		// Hack the ExecutorConfig that we pass to the Manager to have a
 		// different node id.
 		cfgCpy := t.server.ExecutorConfig().(sql.ExecutorConfig)
@@ -456,7 +458,7 @@ func TestLeaseManagerPublishIllegalVersionChange(testingT *testing.T) {
 
 	if _, err := t.node(1).Publish(
 		context.Background(), keys.LeaseTableID, func(desc catalog.MutableDescriptor) error {
-			table := desc.(*sqlbase.MutableTableDescriptor)
+			table := desc.(*tabledesc.Mutable)
 			table.Version++
 			return nil
 		}, nil); !testutils.IsError(err, "updated version") {
@@ -464,7 +466,7 @@ func TestLeaseManagerPublishIllegalVersionChange(testingT *testing.T) {
 	}
 	if _, err := t.node(1).Publish(
 		context.Background(), keys.LeaseTableID, func(desc catalog.MutableDescriptor) error {
-			table := desc.(*sqlbase.MutableTableDescriptor)
+			table := desc.(*tabledesc.Mutable)
 			table.Version--
 			return nil
 		}, nil); !testutils.IsError(err, "updated version") {
@@ -607,10 +609,10 @@ func TestLeasesOnDeletedTableAreReleasedImmediately(t *testing.T) {
 			TestingDescriptorRefreshedEvent: func(descriptor *descpb.Descriptor) {
 				mu.Lock()
 				defer mu.Unlock()
-				if waitTableID != sqlbase.GetDescriptorID(descriptor) {
+				if waitTableID != descpb.GetDescriptorID(descriptor) {
 					return
 				}
-				if sqlbase.GetDescriptorDropped(descriptor) {
+				if descpb.GetDescriptorState(descriptor) == descpb.DescriptorState_DROP {
 					close(deleted)
 					waitTableID = 0
 				}
@@ -1022,7 +1024,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 	// The transaction read at one timestamp and wrote at another so it
 	// has to be restarted because the spans read were modified by the backfill.
 	if err := txReadWrite.Commit(); !testutils.IsError(err,
-		"TransactionRetryError: retry txn \\(RETRY_SERIALIZABLE\\)") {
+		"TransactionRetryError: retry txn \\(RETRY_SERIALIZABLE - failed preemptive refresh\\)") {
 		t.Fatalf("err = %v", err)
 	}
 
@@ -1164,41 +1166,40 @@ COMMIT;
 	}
 
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-
-	tx, err := sqlDB.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Insert an entry so that the transaction is guaranteed to be
-	// assigned a timestamp.
-	if _, err := tx.Exec(`
+	var updated bool
+	if err := crdb.ExecuteTx(context.Background(), sqlDB, nil, func(tx *gosql.Tx) error {
+		// Insert an entry so that the transaction is guaranteed to be
+		// assigned a timestamp.
+		if _, err := tx.Exec(`
 INSERT INTO t.timestamp VALUES ('a', 'b');
 `); err != nil {
-		t.Fatal(err)
-	}
+			return errors.WithStack(err)
+		}
 
-	// Increment the table version after the txn has started.
-	leaseMgr := s.LeaseManager().(*lease.Manager)
-	if _, err := leaseMgr.Publish(
-		context.Background(), tableDesc.ID, func(catalog.MutableDescriptor) error {
-			// Do nothing: increments the version.
-			return nil
-		}, nil); err != nil {
-		t.Error(err)
-	}
+		// Increment the table version after the txn has started. Only do this once
+		// even if there's a retry.
+		if !updated {
+			leaseMgr := s.LeaseManager().(*lease.Manager)
+			if _, err := leaseMgr.Publish(
+				context.Background(), tableDesc.ID, func(catalog.MutableDescriptor) error {
+					// Do nothing: increments the version.
+					return nil
+				}, nil); err != nil {
+				t.Fatal(err)
+			}
+			updated = true
+		}
 
-	// This select will see version 1 of the table. It will first
-	// acquire a lease on version 2 and note that the table descriptor is
-	// invalid for the transaction, so it will read the previous version
-	// and use it.
-	rows, err := tx.Query(`SELECT * FROM t.kv`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rows.Close()
-
-	if err := tx.Commit(); err != nil {
+		// This select will see version 1 of the table. It will first
+		// acquire a lease on version 2 and note that the table descriptor is
+		// invalid for the transaction, so it will read the previous version
+		// and use it.
+		rows, err := tx.Query(`SELECT * FROM t.kv`)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		return errors.WithStack(rows.Close())
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1668,7 +1669,7 @@ CREATE TABLE t.test0 (k CHAR PRIMARY KEY, v CHAR);
 			if err != nil {
 				t.Fatalf("error while publishing: %v", err)
 			}
-			table := desc.(*sqlbase.ImmutableTableDescriptor)
+			table := desc.(*tabledesc.Immutable)
 
 			// Wait a little time to give a chance to other goroutines to
 			// race past.
@@ -1686,14 +1687,14 @@ CREATE TABLE t.test0 (k CHAR PRIMARY KEY, v CHAR);
 			txn.SetFixedTimestamp(ctx, table.ModificationTime)
 
 			// Look up the descriptor.
-			descKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, descID)
+			descKey := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, descID)
 			dbDesc := &descpb.Descriptor{}
 			ts, err := txn.GetProtoTs(ctx, descKey, dbDesc)
 			if err != nil {
 				t.Fatalf("error while reading proto: %v", err)
 			}
 			// Look at the descriptor that comes back from the database.
-			dbTable := sqlbase.TableFromDescriptor(dbDesc, ts)
+			dbTable := descpb.TableFromDescriptor(dbDesc, ts)
 
 			if dbTable.Version != table.Version || dbTable.ModificationTime != table.ModificationTime {
 				t.Fatalf("db has version %d at ts %s, expected version %d at ts %s",
@@ -1887,7 +1888,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 func TestTableCreationPushesTxnsInRecentPast(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
-	tc := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{
+	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs:      params,
 	})
@@ -2223,7 +2224,7 @@ func TestFinalizeVersionEnablesRangefeedUpdates(t *testing.T) {
 					DisableAutomaticVersionUpgrade: 1,
 					// Bootstrap the cluster at something below VersionRangefeedLeases so
 					// that we can test the upgrade.
-					BootstrapVersionOverride: clusterversion.VersionByKey(clusterversion.Version20_1),
+					BinaryVersionOverride: clusterversion.VersionByKey(clusterversion.Version20_1),
 				},
 			},
 		},
@@ -2293,8 +2294,8 @@ func TestRangefeedUpdatesHandledProperlyInTheFaceOfRaces(t *testing.T) {
 			// Use this testing knob to ensure that we see an update for the desc
 			// in question. We don't care about events to refresh the first version
 			// which can happen under rare stress scenarios.
-			if sqlbase.GetDescriptorID(descriptor) == interestingTable.Load().(descpb.ID) &&
-				sqlbase.GetDescriptorVersion(descriptor) >= 2 {
+			if descpb.GetDescriptorID(descriptor) == interestingTable.Load().(descpb.ID) &&
+				descpb.GetDescriptorVersion(descriptor) >= 2 {
 				select {
 				case descUpdateChan <- descriptor:
 				case <-unblockAll:
@@ -2320,7 +2321,7 @@ func TestRangefeedUpdatesHandledProperlyInTheFaceOfRaces(t *testing.T) {
 		},
 	}
 	// Start a second server with our knobs.
-	tc.AddServer(t, args)
+	tc.AddAndStartServer(t, args)
 	defer tc.Stopper().Stop(ctx)
 
 	db1 := tc.ServerConn(0)
@@ -2362,7 +2363,7 @@ func TestRangefeedUpdatesHandledProperlyInTheFaceOfRaces(t *testing.T) {
 	case err := <-selectDone:
 		t.Fatalf("select succeeded before expected: %v", err)
 	case desc := <-descUpdateChan:
-		require.Equal(t, descpb.DescriptorVersion(2), sqlbase.GetDescriptorVersion(desc))
+		require.Equal(t, descpb.DescriptorVersion(2), descpb.GetDescriptorVersion(desc))
 	}
 
 	// Allow the original lease acquisition to proceed.

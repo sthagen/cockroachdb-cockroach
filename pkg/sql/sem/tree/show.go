@@ -84,6 +84,7 @@ const (
 // ShowBackup represents a SHOW BACKUP statement.
 type ShowBackup struct {
 	Path                 Expr
+	InCollection         Expr
 	Details              BackupDetails
 	ShouldIncludeSchemas bool
 	Options              KVOptions
@@ -91,6 +92,11 @@ type ShowBackup struct {
 
 // Format implements the NodeFormatter interface.
 func (node *ShowBackup) Format(ctx *FmtCtx) {
+	if node.InCollection != nil && node.Path == nil {
+		ctx.WriteString("SHOW BACKUPS IN ")
+		ctx.FormatNode(node.InCollection)
+		return
+	}
 	ctx.WriteString("SHOW BACKUP ")
 	if node.Details == BackupRangeDetails {
 		ctx.WriteString("RANGES ")
@@ -101,6 +107,10 @@ func (node *ShowBackup) Format(ctx *FmtCtx) {
 		ctx.WriteString("SCHEMAS ")
 	}
 	ctx.FormatNode(node.Path)
+	if node.InCollection != nil {
+		ctx.WriteString(" IN ")
+		ctx.FormatNode(node.InCollection)
+	}
 	if len(node.Options) > 0 {
 		ctx.WriteString(" WITH ")
 		ctx.FormatNode(&node.Options)
@@ -143,6 +153,14 @@ type ShowEnums struct{}
 // Format implements the NodeFormatter interface.
 func (node *ShowEnums) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW ENUMS")
+}
+
+// ShowTypes represents a SHOW TYPES statement.
+type ShowTypes struct{}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowTypes) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW TYPES")
 }
 
 // ShowTraceType is an enum of SHOW TRACE variants.
@@ -260,6 +278,20 @@ func (node *ShowJobs) Format(ctx *FmtCtx) {
 	}
 }
 
+// ShowRegions represents a SHOW REGIONS statement
+type ShowRegions struct {
+	Database Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowRegions) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW REGIONS")
+	if node.Database != "" {
+		ctx.WriteString(" FROM DATABASE ")
+		node.Database.Format(ctx)
+	}
+}
+
 // ShowSessions represents a SHOW SESSIONS statement
 type ShowSessions struct {
 	All     bool
@@ -323,6 +355,25 @@ func (node *ShowTables) Format(ctx *FmtCtx) {
 
 	if node.WithComment {
 		ctx.WriteString(" WITH COMMENT")
+	}
+}
+
+// ShowTransactions represents a SHOW TRANSACTIONS statement
+type ShowTransactions struct {
+	All     bool
+	Cluster bool
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowTransactions) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW ")
+	if node.All {
+		ctx.WriteString("ALL ")
+	}
+	if node.Cluster {
+		ctx.WriteString("CLUSTER TRANSACTIONS")
+	} else {
+		ctx.WriteString("LOCAL TRANSACTIONS")
 	}
 }
 

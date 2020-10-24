@@ -117,6 +117,8 @@ func TestContextualHelp(t *testing.T) {
 		{`CREATE DATABASE IF NOT ??`, `CREATE DATABASE`},
 		{`CREATE DATABASE blih ??`, `CREATE DATABASE`},
 
+		{`CREATE EXTENSION ??`, `CREATE EXTENSION`},
+
 		{`CREATE USER blih ??`, `CREATE ROLE`},
 		{`CREATE USER blih WITH ??`, `CREATE ROLE`},
 
@@ -242,6 +244,10 @@ func TestContextualHelp(t *testing.T) {
 		{`PAUSE SCHEDULE ??`, `PAUSE SCHEDULES`},
 		{`PAUSE SCHEDULES ??`, `PAUSE SCHEDULES`},
 
+		{`REASSIGN OWNED BY ?? TO ??`, `REASSIGN OWNED BY`},
+		{`REASSIGN OWNED BY foo, bar TO ??`, `REASSIGN OWNED BY`},
+		{`DROP OWNED BY ??`, `DROP OWNED BY`},
+
 		{`RESUME ??`, `RESUME`},
 		{`RESUME JOB ??`, `RESUME JOBS`},
 		{`RESUME JOBS ??`, `RESUME JOBS`},
@@ -269,6 +275,9 @@ func TestContextualHelp(t *testing.T) {
 
 		{`SHOW SESSIONS ??`, `SHOW SESSIONS`},
 		{`SHOW LOCAL SESSIONS ??`, `SHOW SESSIONS`},
+
+		{`SHOW TRANSACTIONS ??`, `SHOW TRANSACTIONS`},
+		{`SHOW LOCAL TRANSACTIONS ??`, `SHOW TRANSACTIONS`},
 
 		{`SHOW STATISTICS ??`, `SHOW STATISTICS`},
 		{`SHOW STATISTICS FOR TABLE ??`, `SHOW STATISTICS`},
@@ -308,6 +317,7 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW DATABASES ??`, `SHOW DATABASES`},
 
 		{`SHOW ENUMS ??`, `SHOW ENUMS`},
+		{`SHOW TYPES ??`, `SHOW TYPES`},
 
 		{`SHOW GRANTS ON ??`, `SHOW GRANTS`},
 		{`SHOW GRANTS ON foo FOR ??`, `SHOW GRANTS`},
@@ -323,6 +333,8 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW INDEXES FROM blah ??`, `SHOW INDEXES`},
 
 		{`SHOW PARTITIONS FROM ??`, `SHOW PARTITIONS`},
+
+		{`SHOW REGIONS ??`, `SHOW REGIONS`},
 
 		{`SHOW ROLES ??`, `SHOW ROLES`},
 

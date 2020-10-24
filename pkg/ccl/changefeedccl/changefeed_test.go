@@ -45,7 +45,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -414,6 +413,55 @@ func TestChangefeedInitialScan(t *testing.T) {
 			assertPayloads(t, initialScan, []string{
 				`initial_scan: [4]->{"after": {"a": 4}}`,
 			})
+		})
+	}
+
+	t.Run(`sinkless`, sinklessTest(testFn))
+	t.Run(`enterprise`, enterpriseTest(testFn))
+}
+
+func TestChangefeedUserDefinedTypes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		// Set up a type and table.
+		sqlDB.Exec(t, `CREATE TYPE t AS ENUM ('hello', 'howdy', 'hi')`)
+		sqlDB.Exec(t, `CREATE TABLE tt (x INT PRIMARY KEY, y t)`)
+		sqlDB.Exec(t, `INSERT INTO tt VALUES (0, 'hello')`)
+
+		// Open up the changefeed.
+		cf := feed(t, f, `CREATE CHANGEFEED FOR tt`)
+		defer closeFeed(t, cf)
+
+		assertPayloads(t, cf, []string{
+			`tt: [0]->{"after": {"x": 0, "y": "hello"}}`,
+		})
+
+		sqlDB.Exec(t, `INSERT INTO tt VALUES (1, 'howdy'), (2, 'hi')`)
+		assertPayloads(t, cf, []string{
+			`tt: [1]->{"after": {"x": 1, "y": "howdy"}}`,
+			`tt: [2]->{"after": {"x": 2, "y": "hi"}}`,
+		})
+
+		// Alter the type and insert a new value.
+		sqlDB.Exec(t, `ALTER TYPE t ADD VALUE 'hiya'`)
+		sqlDB.Exec(t, `INSERT INTO tt VALUES (3, 'hiya')`)
+		assertPayloads(t, cf, []string{
+			`tt: [3]->{"after": {"x": 3, "y": "hiya"}}`,
+		})
+
+		// If we create a new type and add that type to tt, it should be picked
+		// up by the schema feed.
+		sqlDB.Exec(t, `CREATE TYPE t2 AS ENUM ('bye', 'cya')`)
+		sqlDB.Exec(t, `ALTER TABLE tt ADD COLUMN z t2 DEFAULT 'bye'`)
+		sqlDB.Exec(t, `INSERT INTO tt VALUES (4, 'hello', 'cya')`)
+
+		assertPayloads(t, cf, []string{
+			`tt: [0]->{"after": {"x": 0, "y": "hello", "z": "bye"}}`,
+			`tt: [1]->{"after": {"x": 1, "y": "howdy", "z": "bye"}}`,
+			`tt: [2]->{"after": {"x": 2, "y": "hi", "z": "bye"}}`,
+			`tt: [3]->{"after": {"x": 3, "y": "hiya", "z": "bye"}}`,
+			`tt: [4]->{"after": {"x": 4, "y": "hello", "z": "cya"}}`,
 		})
 	}
 
@@ -794,6 +842,58 @@ func TestChangefeedSchemaChangeAllowBackfill(t *testing.T) {
 	}
 }
 
+// Test schema changes that require a backfill on only some watched tables within a changefeed.
+func TestChangefeedSchemaChangeBackfillScope(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(db)
+
+		t.Run(`add column with default`, func(t *testing.T) {
+			sqlDB.Exec(t, `CREATE TABLE add_column_def (a INT PRIMARY KEY)`)
+			sqlDB.Exec(t, `CREATE TABLE no_def_change (a INT PRIMARY KEY)`)
+			sqlDB.Exec(t, `INSERT INTO add_column_def VALUES (1)`)
+			sqlDB.Exec(t, `INSERT INTO add_column_def VALUES (2)`)
+			sqlDB.Exec(t, `INSERT INTO no_def_change VALUES (3)`)
+			combinedFeed := feed(t, f, `CREATE CHANGEFEED FOR add_column_def, no_def_change WITH updated`)
+			defer closeFeed(t, combinedFeed)
+			assertPayloadsStripTs(t, combinedFeed, []string{
+				`add_column_def: [1]->{"after": {"a": 1}}`,
+				`add_column_def: [2]->{"after": {"a": 2}}`,
+				`no_def_change: [3]->{"after": {"a": 3}}`,
+			})
+			sqlDB.Exec(t, `ALTER TABLE add_column_def ADD COLUMN b STRING DEFAULT 'd'`)
+			ts := fetchDescVersionModificationTime(t, db, f, `add_column_def`, 4)
+			// Schema change backfill
+			assertPayloadsStripTs(t, combinedFeed, []string{
+				`add_column_def: [1]->{"after": {"a": 1}}`,
+				`add_column_def: [2]->{"after": {"a": 2}}`,
+			})
+			// Changefeed level backfill
+			assertPayloads(t, combinedFeed, []string{
+				fmt.Sprintf(`add_column_def: [1]->{"after": {"a": 1, "b": "d"}, "updated": "%s"}`,
+					ts.AsOfSystemTime()),
+				fmt.Sprintf(`add_column_def: [2]->{"after": {"a": 2, "b": "d"}, "updated": "%s"}`,
+					ts.AsOfSystemTime()),
+			})
+		})
+
+	}
+
+	t.Run(`sinkless`, sinklessTest(testFn))
+	t.Run(`enterprise`, enterpriseTest(testFn))
+	log.Flush()
+	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
+		regexp.MustCompile("cdc ux violation"), log.WithFlattenedSensitiveData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) > 0 {
+		t.Fatalf("Found violation of CDC's guarantees: %v", entries)
+	}
+}
+
 // fetchDescVersionModificationTime fetches the `ModificationTime` of the specified
 // `version` of `tableName`'s table descriptor.
 func fetchDescVersionModificationTime(
@@ -851,7 +951,7 @@ func fetchDescVersionModificationTime(
 			if err := value.GetProto(&desc); err != nil {
 				t.Fatal(err)
 			}
-			if tableDesc := sqlbase.TableFromDescriptor(&desc, k.Timestamp); tableDesc != nil {
+			if tableDesc := descpb.TableFromDescriptor(&desc, k.Timestamp); tableDesc != nil {
 				if int(tableDesc.Version) == version {
 					return tableDesc.ModificationTime
 				}
@@ -1307,8 +1407,26 @@ func TestChangefeedTruncateRenameDrop(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	assertFailuresCounter := func(t *testing.T, m *Metrics, exp int64) {
+		t.Helper()
+		// If this changefeed is running as a job, we anticipate that it will move
+		// through the failed state and will increment the metric. Sinkless feeds
+		// don't contribute to the failures counter.
+		if strings.Contains(t.Name(), `sinkless`) {
+			return
+		}
+		testutils.SucceedsSoon(t, func() error {
+			if got := m.Failures.Count(); got != exp {
+				return errors.Errorf("expected %d failures, got %d", exp, got)
+			}
+			return nil
+		})
+	}
+
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
+		registry := f.Server().JobRegistry().(*jobs.Registry)
+		metrics := registry.MetricsStruct().Changefeed.(*Metrics)
 
 		sqlDB.Exec(t, `CREATE TABLE truncate (a INT PRIMARY KEY)`)
 		sqlDB.Exec(t, `CREATE TABLE truncate_cascade (b INT PRIMARY KEY REFERENCES truncate (a))`)
@@ -1329,6 +1447,7 @@ func TestChangefeedTruncateRenameDrop(t *testing.T) {
 		) {
 			t.Fatalf(`expected ""truncate_cascade" was truncated" error got: %+v`, err)
 		}
+		assertFailuresCounter(t, metrics, 2)
 
 		sqlDB.Exec(t, `CREATE TABLE rename (a INT PRIMARY KEY)`)
 		sqlDB.Exec(t, `INSERT INTO rename VALUES (1)`)
@@ -1340,6 +1459,7 @@ func TestChangefeedTruncateRenameDrop(t *testing.T) {
 		if _, err := rename.Next(); !testutils.IsError(err, `"rename" was renamed to "renamed"`) {
 			t.Errorf(`expected ""rename" was renamed to "renamed"" error got: %+v`, err)
 		}
+		assertFailuresCounter(t, metrics, 3)
 
 		sqlDB.Exec(t, `CREATE TABLE drop (a INT PRIMARY KEY)`)
 		sqlDB.Exec(t, `INSERT INTO drop VALUES (1)`)
@@ -1350,6 +1470,7 @@ func TestChangefeedTruncateRenameDrop(t *testing.T) {
 		if _, err := drop.Next(); !testutils.IsError(err, `"drop" was dropped or truncated`) {
 			t.Errorf(`expected ""drop" was dropped or truncated" error got: %+v`, err)
 		}
+		assertFailuresCounter(t, metrics, 4)
 	}
 
 	t.Run(`sinkless`, sinklessTest(testFn))
@@ -1416,6 +1537,9 @@ func TestChangefeedMonitoring(t *testing.T) {
 			if c := s.MustGetSQLCounter(`changefeed.flushes`); c <= 0 {
 				return errors.Errorf(`expected > 0 got %d`, c)
 			}
+			if c := s.MustGetSQLCounter(`changefeed.running`); c != 1 {
+				return errors.Errorf(`expected 1 got %d`, c)
+			}
 			if c := s.MustGetSQLCounter(`changefeed.flush_nanos`); c <= 0 {
 				return errors.Errorf(`expected > 0 got %d`, c)
 			}
@@ -1481,11 +1605,15 @@ func TestChangefeedMonitoring(t *testing.T) {
 			return nil
 		})
 
-		// Cancel all the changefeeds and check that max_behind_nanos returns to 0.
+		// Cancel all the changefeeds and check that max_behind_nanos returns to 0
+		// and the number running returns to 0.
 		require.NoError(t, foo.Close())
 		require.NoError(t, fooCopy.Close())
 		testutils.SucceedsSoon(t, func() error {
 			if c := s.MustGetSQLCounter(`changefeed.max_behind_nanos`); c != 0 {
+				return errors.Errorf(`expected 0 got %d`, c)
+			}
+			if c := s.MustGetSQLCounter(`changefeed.running`); c != 0 {
 				return errors.Errorf(`expected 0 got %d`, c)
 			}
 			return nil
@@ -1752,7 +1880,7 @@ func TestChangefeedErrors(t *testing.T) {
 		t, `rangefeeds require the kv.rangefeed.enabled setting`,
 		`EXPERIMENTAL CHANGEFEED FOR rangefeed_off`,
 	)
-	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled TO DEFAULT`)
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
 
 	sqlDB.ExpectErr(
 		t, `unknown format: nope`,
@@ -1974,39 +2102,6 @@ func TestChangefeedErrors(t *testing.T) {
 	)
 }
 
-func TestChangefeedPermissions(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
-		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
-		sqlDB.Exec(t, `CREATE USER testuser`)
-
-		s := f.Server()
-		pgURL, cleanupFunc := sqlutils.PGUrl(
-			t, s.ServingSQLAddr(), "TestChangefeedPermissions-testuser", url.User("testuser"),
-		)
-		defer cleanupFunc()
-		testuser, err := gosql.Open("postgres", pgURL.String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer testuser.Close()
-
-		stmt := `EXPERIMENTAL CHANGEFEED FOR foo`
-		if strings.Contains(t.Name(), `enterprise`) {
-			stmt = `CREATE CHANGEFEED FOR foo`
-		}
-		if _, err := testuser.Exec(stmt); !testutils.IsError(err, `only users with the admin role`) {
-			t.Errorf(`expected 'only users with the admin role' error got: %+v`, err)
-		}
-	}
-
-	t.Run(`sinkless`, sinklessTest(testFn))
-	t.Run(`enterprise`, enterpriseTest(testFn))
-}
-
 func TestChangefeedDescription(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -2048,8 +2143,7 @@ func TestChangefeedPauseUnpause(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer func(i time.Duration) { jobs.DefaultAdoptInterval = i }(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 10 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(10*time.Millisecond, 10*time.Millisecond)()
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
@@ -2108,9 +2202,7 @@ func TestChangefeedPauseUnpause(t *testing.T) {
 func TestChangefeedPauseUnpauseCursorAndInitialScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	defer func(i time.Duration) { jobs.DefaultAdoptInterval = i }(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 10 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
@@ -2169,9 +2261,7 @@ func TestChangefeedPauseUnpauseCursorAndInitialScan(t *testing.T) {
 func TestChangefeedProtectedTimestamps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	defer func(i time.Duration) { jobs.DefaultAdoptInterval = i }(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 10 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	var (
 		ctx      = context.Background()
@@ -2337,9 +2427,7 @@ func TestChangefeedProtectedTimestamps(t *testing.T) {
 func TestChangefeedProtectedTimestampOnPause(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	defer func(i time.Duration) { jobs.DefaultAdoptInterval = i }(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 10 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	testutils.RunTrueAndFalse(t, "protect_on_pause", func(t *testing.T, shouldPause bool) {
 		t.Run(`enterprise`, enterpriseTest(func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
@@ -2418,8 +2506,7 @@ func TestChangefeedProtectedTimestampsVerificationFails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer func(i time.Duration) { jobs.DefaultAdoptInterval = i }(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 10 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	verifyRequestCh := make(chan *roachpb.AdminVerifyProtectedTimestampRequest, 1)
 	requestFilter := kvserverbase.ReplicaRequestFilter(func(
@@ -2554,10 +2641,7 @@ func TestChangefeedNodeShutdown(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	skip.WithIssue(t, 32232)
 
-	defer func(oldInterval time.Duration) {
-		jobs.DefaultAdoptInterval = oldInterval
-	}(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 100 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	flushCh := make(chan struct{}, 1)
 	defer close(flushCh)
@@ -2571,7 +2655,7 @@ func TestChangefeedNodeShutdown(t *testing.T) {
 		},
 	}}}
 
-	tc := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{
+	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			UseDatabase: "d",
 			Knobs:       knobs,
@@ -2719,9 +2803,7 @@ func TestChangefeedMemBufferCapacity(t *testing.T) {
 func TestChangefeedRestartDuringBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	defer func(i time.Duration) { jobs.DefaultAdoptInterval = i }(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 10 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(10*time.Millisecond, 10*time.Millisecond)()
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		knobs := f.Server().(*server.TestServer).Cfg.TestingKnobs.
@@ -2875,7 +2957,7 @@ func TestChangefeedHandlesDrainingNodes(t *testing.T) {
 	sinkDir, cleanupFn := testutils.TempDir(t)
 	defer cleanupFn()
 
-	tc := serverutils.StartTestCluster(t, 4, base.TestClusterArgs{
+	tc := serverutils.StartNewTestCluster(t, 4, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			UseDatabase:   "test",
 			Knobs:         knobs,

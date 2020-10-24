@@ -12,11 +12,12 @@ package sql
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/errors"
 )
 
@@ -25,7 +26,7 @@ func (p *planner) addColumnImpl(
 	params runParams,
 	n *alterTableNode,
 	tn *tree.TableName,
-	desc *sqlbase.MutableTableDescriptor,
+	desc *tabledesc.Mutable,
 	t *tree.AlterTableAddColumn,
 ) error {
 	d := t.ColumnDef
@@ -63,12 +64,13 @@ func (p *planner) addColumnImpl(
 		}
 	}
 	d = newDef
-	incTelemetryForNewColumn(d)
 
-	col, idx, expr, err := sqlbase.MakeColumnDefDescs(params.ctx, d, &params.p.semaCtx, params.EvalContext())
+	col, idx, expr, err := tabledesc.MakeColumnDefDescs(params.ctx, d, &params.p.semaCtx, params.EvalContext())
 	if err != nil {
 		return err
 	}
+	incTelemetryForNewColumn(d, col)
+
 	// If the new column has a DEFAULT expression that uses a sequence, add references between
 	// its descriptor and this column descriptor.
 	if d.HasDefaultExpr() {
@@ -96,7 +98,7 @@ func (p *planner) addColumnImpl(
 			return err
 		}
 		if len(kvs) > 0 {
-			return sqlbase.NewNonNullViolationError(col.Name)
+			return sqlerrors.NewNonNullViolationError(col.Name)
 		}
 	}
 	_, err = n.tableDesc.FindActiveColumnByName(string(d.Name))
@@ -121,7 +123,7 @@ func (p *planner) addColumnImpl(
 		if t.IfNotExists {
 			return nil
 		}
-		return sqlbase.NewColumnAlreadyExistsError(string(d.Name), n.tableDesc.Name)
+		return sqlerrors.NewColumnAlreadyExistsError(string(d.Name), n.tableDesc.Name)
 	}
 
 	n.tableDesc.AddColumnMutation(col, descpb.DescriptorMutation_ADD)

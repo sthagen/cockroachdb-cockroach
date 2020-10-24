@@ -15,26 +15,23 @@ CREATE TABLE child (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(p), FAMI
 query TTT
 EXPLAIN INSERT INTO child VALUES (1,1), (2,2)
 ----
-·                                     distribution           local
-·                                     vectorized             false
-root                                  ·                      ·
- ├── insert                           ·                      ·
- │    │                               into                   child(c, p)
- │    └── buffer                      ·                      ·
- │         │                          label                  buffer 1
- │         └── values                 ·                      ·
- │                                    size                   2 columns, 2 rows
- └── fk-check                         ·                      ·
-      └── error if rows               ·                      ·
-           └── lookup join            ·                      ·
-                │                     table                  parent@primary
-                │                     type                   anti
-                │                     equality               (column2) = (p)
-                │                     equality cols are key  ·
-                │                     parallel               ·
-                └── project           ·                      ·
-                     └── scan buffer  ·                      ·
-·                                     label                  buffer 1
+·                                  distribution           local
+·                                  vectorized             false
+root                               ·                      ·
+ ├── insert                        ·                      ·
+ │    │                            into                   child(c, p)
+ │    └── buffer                   ·                      ·
+ │         │                       label                  buffer 1
+ │         └── values              ·                      ·
+ │                                 size                   2 columns, 2 rows
+ └── fk-check                      ·                      ·
+      └── error if rows            ·                      ·
+           └── lookup join (anti)  ·                      ·
+                │                  table                  parent@primary
+                │                  equality               (column2) = (p)
+                │                  equality cols are key  ·
+                └── scan buffer    ·                      ·
+·                                  label                  buffer 1
 
 # Use data from a different table as input.
 statement ok
@@ -43,30 +40,28 @@ CREATE TABLE xy (x INT, y INT)
 query TTT
 EXPLAIN INSERT INTO child SELECT x,y FROM xy
 ----
-·                                     distribution        local
-·                                     vectorized          false
-root                                  ·                   ·
- ├── insert                           ·                   ·
- │    │                               into                child(c, p)
- │    └── buffer                      ·                   ·
- │         │                          label               buffer 1
- │         └── scan                   ·                   ·
- │                                    missing stats       ·
- │                                    table               xy@primary
- │                                    spans               FULL SCAN
- └── fk-check                         ·                   ·
-      └── error if rows               ·                   ·
-           └── hash join              ·                   ·
-                │                     type                anti
-                │                     equality            (y) = (p)
-                │                     right cols are key  ·
-                ├── project           ·                   ·
-                │    └── scan buffer  ·                   ·
-                │                     label               buffer 1
-                └── scan              ·                   ·
-·                                     missing stats       ·
-·                                     table               parent@primary
-·                                     spans               FULL SCAN
+·                                distribution        local
+·                                vectorized          false
+root                             ·                   ·
+ ├── insert                      ·                   ·
+ │    │                          into                child(c, p)
+ │    └── buffer                 ·                   ·
+ │         │                     label               buffer 1
+ │         └── scan              ·                   ·
+ │                               missing stats       ·
+ │                               table               xy@primary
+ │                               spans               FULL SCAN
+ └── fk-check                    ·                   ·
+      └── error if rows          ·                   ·
+           └── hash join (anti)  ·                   ·
+                │                equality            (y) = (p)
+                │                right cols are key  ·
+                ├── scan buffer  ·                   ·
+                │                label               buffer 1
+                └── scan         ·                   ·
+·                                missing stats       ·
+·                                table               parent@primary
+·                                spans               FULL SCAN
 
 statement ok
 CREATE TABLE child_nullable (c INT PRIMARY KEY, p INT REFERENCES parent(p), INDEX (p));
@@ -76,28 +71,25 @@ CREATE TABLE child_nullable (c INT PRIMARY KEY, p INT REFERENCES parent(p), INDE
 query TTT
 EXPLAIN INSERT INTO child_nullable VALUES (100, 1), (200, NULL)
 ----
-·                                          distribution           local
-·                                          vectorized             false
-root                                       ·                      ·
- ├── insert                                ·                      ·
- │    │                                    into                   child_nullable(c, p)
- │    └── buffer                           ·                      ·
- │         │                               label                  buffer 1
- │         └── values                      ·                      ·
- │                                         size                   2 columns, 2 rows
- └── fk-check                              ·                      ·
-      └── error if rows                    ·                      ·
-           └── lookup join                 ·                      ·
-                │                          table                  parent@primary
-                │                          type                   anti
-                │                          equality               (column2) = (p)
-                │                          equality cols are key  ·
-                │                          parallel               ·
-                └── filter                 ·                      ·
-                     │                     filter                 column2 IS NOT NULL
-                     └── project           ·                      ·
-                          └── scan buffer  ·                      ·
-·                                          label                  buffer 1
+·                                     distribution           local
+·                                     vectorized             false
+root                                  ·                      ·
+ ├── insert                           ·                      ·
+ │    │                               into                   child_nullable(c, p)
+ │    └── buffer                      ·                      ·
+ │         │                          label                  buffer 1
+ │         └── values                 ·                      ·
+ │                                    size                   2 columns, 2 rows
+ └── fk-check                         ·                      ·
+      └── error if rows               ·                      ·
+           └── lookup join (anti)     ·                      ·
+                │                     table                  parent@primary
+                │                     equality               (column2) = (p)
+                │                     equality cols are key  ·
+                └── filter            ·                      ·
+                     │                filter                 column2 IS NOT NULL
+                     └── scan buffer  ·                      ·
+·                                     label                  buffer 1
 
 # Tests with multicolumn FKs.
 statement ok
@@ -114,28 +106,25 @@ CREATE TABLE multi_col_child  (
 query TTT
 EXPLAIN INSERT INTO multi_col_child VALUES (2, NULL, 20, 20), (3, 20, NULL, 20)
 ----
-·                                          distribution           local
-·                                          vectorized             false
-root                                       ·                      ·
- ├── insert                                ·                      ·
- │    │                                    into                   multi_col_child(c, p, q, r)
- │    └── buffer                           ·                      ·
- │         │                               label                  buffer 1
- │         └── values                      ·                      ·
- │                                         size                   4 columns, 2 rows
- └── fk-check                              ·                      ·
-      └── error if rows                    ·                      ·
-           └── lookup join                 ·                      ·
-                │                          table                  multi_col_parent@primary
-                │                          type                   anti
-                │                          equality               (column2, column3, column4) = (p,q,r)
-                │                          equality cols are key  ·
-                │                          parallel               ·
-                └── filter                 ·                      ·
-                     │                     filter                 (column2 IS NOT NULL) AND (column3 IS NOT NULL)
-                     └── project           ·                      ·
-                          └── scan buffer  ·                      ·
-·                                          label                  buffer 1
+·                                     distribution           local
+·                                     vectorized             false
+root                                  ·                      ·
+ ├── insert                           ·                      ·
+ │    │                               into                   multi_col_child(c, p, q, r)
+ │    └── buffer                      ·                      ·
+ │         │                          label                  buffer 1
+ │         └── values                 ·                      ·
+ │                                    size                   4 columns, 2 rows
+ └── fk-check                         ·                      ·
+      └── error if rows               ·                      ·
+           └── lookup join (anti)     ·                      ·
+                │                     table                  multi_col_parent@primary
+                │                     equality               (column2, column3, column4) = (p,q,r)
+                │                     equality cols are key  ·
+                └── filter            ·                      ·
+                     │                filter                 (column2 IS NOT NULL) AND (column3 IS NOT NULL)
+                     └── scan buffer  ·                      ·
+·                                     label                  buffer 1
 
 statement ok
 CREATE TABLE multi_ref_parent_a (a INT PRIMARY KEY, other INT)
@@ -156,41 +145,35 @@ CREATE TABLE multi_ref_child (
 query TTT
 EXPLAIN INSERT INTO multi_ref_child VALUES (1, NULL, NULL, NULL), (2, 3, 4, 5)
 ----
-·                                          distribution           local
-·                                          vectorized             false
-root                                       ·                      ·
- ├── insert                                ·                      ·
- │    │                                    into                   multi_ref_child(k, a, b, c)
- │    └── buffer                           ·                      ·
- │         │                               label                  buffer 1
- │         └── values                      ·                      ·
- │                                         size                   4 columns, 2 rows
- ├── fk-check                              ·                      ·
- │    └── error if rows                    ·                      ·
- │         └── lookup join                 ·                      ·
- │              │                          table                  multi_ref_parent_a@primary
- │              │                          type                   anti
- │              │                          equality               (column2) = (a)
- │              │                          equality cols are key  ·
- │              │                          parallel               ·
- │              └── filter                 ·                      ·
- │                   │                     filter                 column2 IS NOT NULL
- │                   └── project           ·                      ·
- │                        └── scan buffer  ·                      ·
- │                                         label                  buffer 1
- └── fk-check                              ·                      ·
-      └── error if rows                    ·                      ·
-           └── lookup join                 ·                      ·
-                │                          table                  multi_ref_parent_bc@primary
-                │                          type                   anti
-                │                          equality               (column3, column4) = (b,c)
-                │                          equality cols are key  ·
-                │                          parallel               ·
-                └── filter                 ·                      ·
-                     │                     filter                 (column3 IS NOT NULL) AND (column4 IS NOT NULL)
-                     └── project           ·                      ·
-                          └── scan buffer  ·                      ·
-·                                          label                  buffer 1
+·                                     distribution           local
+·                                     vectorized             false
+root                                  ·                      ·
+ ├── insert                           ·                      ·
+ │    │                               into                   multi_ref_child(k, a, b, c)
+ │    └── buffer                      ·                      ·
+ │         │                          label                  buffer 1
+ │         └── values                 ·                      ·
+ │                                    size                   4 columns, 2 rows
+ ├── fk-check                         ·                      ·
+ │    └── error if rows               ·                      ·
+ │         └── lookup join (anti)     ·                      ·
+ │              │                     table                  multi_ref_parent_a@primary
+ │              │                     equality               (column2) = (a)
+ │              │                     equality cols are key  ·
+ │              └── filter            ·                      ·
+ │                   │                filter                 column2 IS NOT NULL
+ │                   └── scan buffer  ·                      ·
+ │                                    label                  buffer 1
+ └── fk-check                         ·                      ·
+      └── error if rows               ·                      ·
+           └── lookup join (anti)     ·                      ·
+                │                     table                  multi_ref_parent_bc@primary
+                │                     equality               (column3, column4) = (b,c)
+                │                     equality cols are key  ·
+                └── filter            ·                      ·
+                     │                filter                 (column3 IS NOT NULL) AND (column4 IS NOT NULL)
+                     └── scan buffer  ·                      ·
+·                                     label                  buffer 1
 
 # FK check can be omitted when we are inserting only NULLs.
 query TTT
@@ -209,35 +192,31 @@ insert       ·             ·
 query TTT
 EXPLAIN DELETE FROM parent WHERE p = 3
 ----
-·                                     distribution   local
-·                                     vectorized     false
-root                                  ·              ·
- ├── delete                           ·              ·
- │    │                               from           parent
- │    └── buffer                      ·              ·
- │         │                          label          buffer 1
- │         └── scan                   ·              ·
- │                                    missing stats  ·
- │                                    table          parent@primary
- │                                    spans          /3-/3/#
- ├── fk-check                         ·              ·
- │    └── error if rows               ·              ·
- │         └── lookup join            ·              ·
- │              │                     table          child@child_p_idx
- │              │                     type           semi
- │              │                     equality       (p) = (p)
- │              └── project           ·              ·
- │                   └── scan buffer  ·              ·
- │                                    label          buffer 1
- └── fk-check                         ·              ·
-      └── error if rows               ·              ·
-           └── lookup join            ·              ·
-                │                     table          child_nullable@child_nullable_p_idx
-                │                     type           semi
-                │                     equality       (p) = (p)
-                └── project           ·              ·
-                     └── scan buffer  ·              ·
-·                                     label          buffer 1
+·                                  distribution   local
+·                                  vectorized     false
+root                               ·              ·
+ ├── delete                        ·              ·
+ │    │                            from           parent
+ │    └── buffer                   ·              ·
+ │         │                       label          buffer 1
+ │         └── scan                ·              ·
+ │                                 missing stats  ·
+ │                                 table          parent@primary
+ │                                 spans          [/3 - /3]
+ ├── fk-check                      ·              ·
+ │    └── error if rows            ·              ·
+ │         └── lookup join (semi)  ·              ·
+ │              │                  table          child@child_p_idx
+ │              │                  equality       (p) = (p)
+ │              └── scan buffer    ·              ·
+ │                                 label          buffer 1
+ └── fk-check                      ·              ·
+      └── error if rows            ·              ·
+           └── lookup join (semi)  ·              ·
+                │                  table          child_nullable@child_nullable_p_idx
+                │                  equality       (p) = (p)
+                └── scan buffer    ·              ·
+·                                  label          buffer 1
 
 statement ok
 CREATE TABLE child2 (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(other), INDEX (p))
@@ -245,44 +224,38 @@ CREATE TABLE child2 (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(other),
 query TTT
 EXPLAIN DELETE FROM parent WHERE p = 3
 ----
-·                                     distribution   local
-·                                     vectorized     false
-root                                  ·              ·
- ├── delete                           ·              ·
- │    │                               from           parent
- │    └── buffer                      ·              ·
- │         │                          label          buffer 1
- │         └── scan                   ·              ·
- │                                    missing stats  ·
- │                                    table          parent@primary
- │                                    spans          /3-/3/#
- ├── fk-check                         ·              ·
- │    └── error if rows               ·              ·
- │         └── lookup join            ·              ·
- │              │                     table          child@child_p_idx
- │              │                     type           semi
- │              │                     equality       (p) = (p)
- │              └── project           ·              ·
- │                   └── scan buffer  ·              ·
- │                                    label          buffer 1
- ├── fk-check                         ·              ·
- │    └── error if rows               ·              ·
- │         └── lookup join            ·              ·
- │              │                     table          child_nullable@child_nullable_p_idx
- │              │                     type           semi
- │              │                     equality       (p) = (p)
- │              └── project           ·              ·
- │                   └── scan buffer  ·              ·
- │                                    label          buffer 1
- └── fk-check                         ·              ·
-      └── error if rows               ·              ·
-           └── lookup join            ·              ·
-                │                     table          child2@child2_p_idx
-                │                     type           semi
-                │                     equality       (other) = (p)
-                └── project           ·              ·
-                     └── scan buffer  ·              ·
-·                                     label          buffer 1
+·                                  distribution   local
+·                                  vectorized     false
+root                               ·              ·
+ ├── delete                        ·              ·
+ │    │                            from           parent
+ │    └── buffer                   ·              ·
+ │         │                       label          buffer 1
+ │         └── scan                ·              ·
+ │                                 missing stats  ·
+ │                                 table          parent@primary
+ │                                 spans          [/3 - /3]
+ ├── fk-check                      ·              ·
+ │    └── error if rows            ·              ·
+ │         └── lookup join (semi)  ·              ·
+ │              │                  table          child@child_p_idx
+ │              │                  equality       (p) = (p)
+ │              └── scan buffer    ·              ·
+ │                                 label          buffer 1
+ ├── fk-check                      ·              ·
+ │    └── error if rows            ·              ·
+ │         └── lookup join (semi)  ·              ·
+ │              │                  table          child_nullable@child_nullable_p_idx
+ │              │                  equality       (p) = (p)
+ │              └── scan buffer    ·              ·
+ │                                 label          buffer 1
+ └── fk-check                      ·              ·
+      └── error if rows            ·              ·
+           └── lookup join (semi)  ·              ·
+                │                  table          child2@child2_p_idx
+                │                  equality       (other) = (p)
+                └── scan buffer    ·              ·
+·                                  label          buffer 1
 
 statement ok
 CREATE TABLE doubleparent (p1 INT, p2 INT, other INT, PRIMARY KEY (p1, p2))
@@ -299,197 +272,173 @@ CREATE TABLE doublechild (
 query TTT
 EXPLAIN DELETE FROM doubleparent WHERE p1 = 10
 ----
-·                                distribution   local
-·                                vectorized     false
-root                             ·              ·
- ├── delete                      ·              ·
- │    │                          from           doubleparent
- │    └── buffer                 ·              ·
- │         │                     label          buffer 1
- │         └── scan              ·              ·
- │                               missing stats  ·
- │                               table          doubleparent@primary
- │                               spans          /10-/11
- └── fk-check                    ·              ·
-      └── error if rows          ·              ·
-           └── lookup join       ·              ·
-                │                table          doublechild@doublechild_p1_p2_idx
-                │                type           semi
-                │                equality       (p1, p2) = (p1,p2)
-                └── scan buffer  ·              ·
-·                                label          buffer 1
+·                                  distribution   local
+·                                  vectorized     false
+root                               ·              ·
+ ├── delete                        ·              ·
+ │    │                            from           doubleparent
+ │    └── buffer                   ·              ·
+ │         │                       label          buffer 1
+ │         └── scan                ·              ·
+ │                                 missing stats  ·
+ │                                 table          doubleparent@primary
+ │                                 spans          [/10 - /10]
+ └── fk-check                      ·              ·
+      └── error if rows            ·              ·
+           └── lookup join (semi)  ·              ·
+                │                  table          doublechild@doublechild_p1_p2_idx
+                │                  equality       (p1, p2) = (p1,p2)
+                └── scan buffer    ·              ·
+·                                  label          buffer 1
 
 # -- Tests with UPDATE --
 
 query TTT
 EXPLAIN UPDATE child SET p = 4
 ----
-·                                     distribution        local
-·                                     vectorized          false
-root                                  ·                   ·
- ├── update                           ·                   ·
- │    │                               table               child
- │    │                               set                 p
- │    └── buffer                      ·                   ·
- │         │                          label               buffer 1
- │         └── project                ·                   ·
- │              └── render            ·                   ·
- │                   └── scan         ·                   ·
- │                                    missing stats       ·
- │                                    table               child@primary
- │                                    spans               FULL SCAN
- │                                    locking strength    for update
- └── fk-check                         ·                   ·
-      └── error if rows               ·                   ·
-           └── hash join              ·                   ·
-                │                     type                anti
-                │                     equality            (p_new) = (p)
-                │                     right cols are key  ·
-                ├── project           ·                   ·
-                │    └── scan buffer  ·                   ·
-                │                     label               buffer 1
-                └── scan              ·                   ·
-·                                     missing stats       ·
-·                                     table               parent@primary
-·                                     spans               FULL SCAN
+·                                distribution        local
+·                                vectorized          false
+root                             ·                   ·
+ ├── update                      ·                   ·
+ │    │                          table               child
+ │    │                          set                 p
+ │    └── buffer                 ·                   ·
+ │         │                     label               buffer 1
+ │         └── render            ·                   ·
+ │              └── scan         ·                   ·
+ │                               missing stats       ·
+ │                               table               child@primary
+ │                               spans               FULL SCAN
+ │                               locking strength    for update
+ └── fk-check                    ·                   ·
+      └── error if rows          ·                   ·
+           └── hash join (anti)  ·                   ·
+                │                equality            (p_new) = (p)
+                │                right cols are key  ·
+                ├── scan buffer  ·                   ·
+                │                label               buffer 1
+                └── scan         ·                   ·
+·                                missing stats       ·
+·                                table               parent@primary
+·                                spans               FULL SCAN
 
 query TTT
 EXPLAIN UPDATE child SET p = 4 WHERE c = 10
 ----
-·                                     distribution           local
-·                                     vectorized             false
-root                                  ·                      ·
- ├── update                           ·                      ·
- │    │                               table                  child
- │    │                               set                    p
- │    └── buffer                      ·                      ·
- │         │                          label                  buffer 1
- │         └── project                ·                      ·
- │              └── render            ·                      ·
- │                   └── scan         ·                      ·
- │                                    missing stats          ·
- │                                    table                  child@primary
- │                                    spans                  /10-/10/#
- │                                    locking strength       for update
- └── fk-check                         ·                      ·
-      └── error if rows               ·                      ·
-           └── lookup join            ·                      ·
-                │                     table                  parent@primary
-                │                     type                   anti
-                │                     equality               (p_new) = (p)
-                │                     equality cols are key  ·
-                │                     parallel               ·
-                └── project           ·                      ·
-                     └── scan buffer  ·                      ·
-·                                     label                  buffer 1
+·                                  distribution           local
+·                                  vectorized             false
+root                               ·                      ·
+ ├── update                        ·                      ·
+ │    │                            table                  child
+ │    │                            set                    p
+ │    └── buffer                   ·                      ·
+ │         │                       label                  buffer 1
+ │         └── render              ·                      ·
+ │              └── scan           ·                      ·
+ │                                 missing stats          ·
+ │                                 table                  child@primary
+ │                                 spans                  [/10 - /10]
+ │                                 locking strength       for update
+ └── fk-check                      ·                      ·
+      └── error if rows            ·                      ·
+           └── lookup join (anti)  ·                      ·
+                │                  table                  parent@primary
+                │                  equality               (p_new) = (p)
+                │                  equality cols are key  ·
+                └── scan buffer    ·                      ·
+·                                  label                  buffer 1
 
 query TTT
 EXPLAIN UPDATE parent SET p = p+1
 ----
-·                                               distribution        local
-·                                               vectorized          false
-root                                            ·                   ·
- ├── update                                     ·                   ·
- │    │                                         table               parent
- │    │                                         set                 p
- │    └── buffer                                ·                   ·
- │         │                                    label               buffer 1
- │         └── project                          ·                   ·
- │              └── render                      ·                   ·
- │                   └── scan                   ·                   ·
- │                                              missing stats       ·
- │                                              table               parent@primary
- │                                              spans               FULL SCAN
- │                                              locking strength    for update
- ├── fk-check                                   ·                   ·
- │    └── error if rows                         ·                   ·
- │         └── project                          ·                   ·
- │              └── hash join                   ·                   ·
- │                   │                          type                inner
- │                   │                          equality            (p) = (p)
- │                   │                          left cols are key   ·
- │                   │                          right cols are key  ·
- │                   ├── union                  ·                   ·
- │                   │    ├── project           ·                   ·
- │                   │    │    └── scan buffer  ·                   ·
- │                   │    │                     label               buffer 1
- │                   │    └── project           ·                   ·
- │                   │         └── scan buffer  ·                   ·
- │                   │                          label               buffer 1
- │                   └── distinct               ·                   ·
- │                        │                     distinct on         p
- │                        │                     order key           p
- │                        └── scan              ·                   ·
- │                                              missing stats       ·
- │                                              table               child@child_p_idx
- │                                              spans               FULL SCAN
- └── fk-check                                   ·                   ·
-      └── error if rows                         ·                   ·
-           └── project                          ·                   ·
-                └── hash join                   ·                   ·
-                     │                          type                inner
-                     │                          equality            (p) = (p)
-                     │                          left cols are key   ·
-                     │                          right cols are key  ·
-                     ├── union                  ·                   ·
-                     │    ├── project           ·                   ·
-                     │    │    └── scan buffer  ·                   ·
-                     │    │                     label               buffer 1
-                     │    └── project           ·                   ·
-                     │         └── scan buffer  ·                   ·
-                     │                          label               buffer 1
-                     └── distinct               ·                   ·
-                          │                     distinct on         p
-                          │                     order key           p
-                          └── scan              ·                   ·
-·                                               missing stats       ·
-·                                               table               child_nullable@child_nullable_p_idx
-·                                               spans               FULL SCAN
+·                                     distribution        local
+·                                     vectorized          false
+root                                  ·                   ·
+ ├── update                           ·                   ·
+ │    │                               table               parent
+ │    │                               set                 p
+ │    └── buffer                      ·                   ·
+ │         │                          label               buffer 1
+ │         └── render                 ·                   ·
+ │              └── scan              ·                   ·
+ │                                    missing stats       ·
+ │                                    table               parent@primary
+ │                                    spans               FULL SCAN
+ │                                    locking strength    for update
+ ├── fk-check                         ·                   ·
+ │    └── error if rows               ·                   ·
+ │         └── hash join              ·                   ·
+ │              │                     equality            (p) = (p)
+ │              │                     left cols are key   ·
+ │              │                     right cols are key  ·
+ │              ├── except            ·                   ·
+ │              │    ├── scan buffer  ·                   ·
+ │              │    │                label               buffer 1
+ │              │    └── scan buffer  ·                   ·
+ │              │                     label               buffer 1
+ │              └── distinct          ·                   ·
+ │                   │                distinct on         p
+ │                   │                order key           p
+ │                   └── scan         ·                   ·
+ │                                    missing stats       ·
+ │                                    table               child@child_p_idx
+ │                                    spans               FULL SCAN
+ └── fk-check                         ·                   ·
+      └── error if rows               ·                   ·
+           └── hash join              ·                   ·
+                │                     equality            (p) = (p)
+                │                     left cols are key   ·
+                │                     right cols are key  ·
+                ├── except            ·                   ·
+                │    ├── scan buffer  ·                   ·
+                │    │                label               buffer 1
+                │    └── scan buffer  ·                   ·
+                │                     label               buffer 1
+                └── distinct          ·                   ·
+                     │                distinct on         p
+                     │                order key           p
+                     └── scan         ·                   ·
+·                                     missing stats       ·
+·                                     table               child_nullable@child_nullable_p_idx
+·                                     spans               FULL SCAN
 
 query TTT
 EXPLAIN UPDATE parent SET p = p+1 WHERE other = 10
 ----
-·                                          distribution      local
-·                                          vectorized        false
-root                                       ·                 ·
- ├── update                                ·                 ·
- │    │                                    table             parent
- │    │                                    set               p
- │    └── buffer                           ·                 ·
- │         │                               label             buffer 1
- │         └── project                     ·                 ·
- │              └── render                 ·                 ·
- │                   └── scan              ·                 ·
- │                                         missing stats     ·
- │                                         table             parent@parent_other_key
- │                                         spans             /10-/11
- │                                         locking strength  for update
- ├── fk-check                              ·                 ·
- │    └── error if rows                    ·                 ·
- │         └── lookup join                 ·                 ·
- │              │                          table             child@child_p_idx
- │              │                          type              semi
- │              │                          equality          (p) = (p)
- │              └── union                  ·                 ·
- │                   ├── project           ·                 ·
- │                   │    └── scan buffer  ·                 ·
- │                   │                     label             buffer 1
- │                   └── project           ·                 ·
- │                        └── scan buffer  ·                 ·
- │                                         label             buffer 1
- └── fk-check                              ·                 ·
-      └── error if rows                    ·                 ·
-           └── lookup join                 ·                 ·
-                │                          table             child_nullable@child_nullable_p_idx
-                │                          type              semi
-                │                          equality          (p) = (p)
-                └── union                  ·                 ·
-                     ├── project           ·                 ·
-                     │    └── scan buffer  ·                 ·
-                     │                     label             buffer 1
-                     └── project           ·                 ·
-                          └── scan buffer  ·                 ·
-·                                          label             buffer 1
+·                                     distribution      local
+·                                     vectorized        false
+root                                  ·                 ·
+ ├── update                           ·                 ·
+ │    │                               table             parent
+ │    │                               set               p
+ │    └── buffer                      ·                 ·
+ │         │                          label             buffer 1
+ │         └── render                 ·                 ·
+ │              └── scan              ·                 ·
+ │                                    missing stats     ·
+ │                                    table             parent@parent_other_key
+ │                                    spans             [/10 - /10]
+ │                                    locking strength  for update
+ ├── fk-check                         ·                 ·
+ │    └── error if rows               ·                 ·
+ │         └── lookup join (semi)     ·                 ·
+ │              │                     table             child@child_p_idx
+ │              │                     equality          (p) = (p)
+ │              └── except            ·                 ·
+ │                   ├── scan buffer  ·                 ·
+ │                   │                label             buffer 1
+ │                   └── scan buffer  ·                 ·
+ │                                    label             buffer 1
+ └── fk-check                         ·                 ·
+      └── error if rows               ·                 ·
+           └── lookup join (semi)     ·                 ·
+                │                     table             child_nullable@child_nullable_p_idx
+                │                     equality          (p) = (p)
+                └── except            ·                 ·
+                     ├── scan buffer  ·                 ·
+                     │                label             buffer 1
+                     └── scan buffer  ·                 ·
+·                                     label             buffer 1
 
 statement ok
 CREATE TABLE grandchild (g INT PRIMARY KEY, c INT NOT NULL REFERENCES child(c))
@@ -497,88 +446,15 @@ CREATE TABLE grandchild (g INT PRIMARY KEY, c INT NOT NULL REFERENCES child(c))
 query TTT
 EXPLAIN UPDATE child SET c = 4
 ----
-·                                               distribution        local
-·                                               vectorized          false
-root                                            ·                   ·
- ├── update                                     ·                   ·
- │    │                                         table               child
- │    │                                         set                 c
- │    └── buffer                                ·                   ·
- │         │                                    label               buffer 1
- │         └── project                          ·                   ·
- │              └── render                      ·                   ·
- │                   └── scan                   ·                   ·
- │                                              missing stats       ·
- │                                              table               child@primary
- │                                              spans               FULL SCAN
- │                                              locking strength    for update
- └── fk-check                                   ·                   ·
-      └── error if rows                         ·                   ·
-           └── project                          ·                   ·
-                └── hash join                   ·                   ·
-                     │                          type                inner
-                     │                          equality            (c) = (c)
-                     │                          left cols are key   ·
-                     │                          right cols are key  ·
-                     ├── union                  ·                   ·
-                     │    ├── project           ·                   ·
-                     │    │    └── scan buffer  ·                   ·
-                     │    │                     label               buffer 1
-                     │    └── project           ·                   ·
-                     │         └── scan buffer  ·                   ·
-                     │                          label               buffer 1
-                     └── distinct               ·                   ·
-                          │                     distinct on         c
-                          └── scan              ·                   ·
-·                                               missing stats       ·
-·                                               table               grandchild@primary
-·                                               spans               FULL SCAN
-
-# This update shouldn't emit checks for c, since it's unchanged.
-query TTT
-EXPLAIN UPDATE child SET p = 4
-----
 ·                                     distribution        local
 ·                                     vectorized          false
 root                                  ·                   ·
  ├── update                           ·                   ·
  │    │                               table               child
- │    │                               set                 p
+ │    │                               set                 c
  │    └── buffer                      ·                   ·
  │         │                          label               buffer 1
- │         └── project                ·                   ·
- │              └── render            ·                   ·
- │                   └── scan         ·                   ·
- │                                    missing stats       ·
- │                                    table               child@primary
- │                                    spans               FULL SCAN
- │                                    locking strength    for update
- └── fk-check                         ·                   ·
-      └── error if rows               ·                   ·
-           └── hash join              ·                   ·
-                │                     type                anti
-                │                     equality            (p_new) = (p)
-                │                     right cols are key  ·
-                ├── project           ·                   ·
-                │    └── scan buffer  ·                   ·
-                │                     label               buffer 1
-                └── scan              ·                   ·
-·                                     missing stats       ·
-·                                     table               parent@primary
-·                                     spans               FULL SCAN
-
-query TTT
-EXPLAIN UPDATE child SET p = p
-----
-·                                     distribution        local
-·                                     vectorized          false
-root                                  ·                   ·
- ├── update                           ·                   ·
- │    │                               table               child
- │    │                               set                 p
- │    └── buffer                      ·                   ·
- │         │                          label               buffer 1
- │         └── project                ·                   ·
+ │         └── render                 ·                   ·
  │              └── scan              ·                   ·
  │                                    missing stats       ·
  │                                    table               child@primary
@@ -587,69 +463,124 @@ root                                  ·                   ·
  └── fk-check                         ·                   ·
       └── error if rows               ·                   ·
            └── hash join              ·                   ·
-                │                     type                anti
-                │                     equality            (p) = (p)
+                │                     equality            (c) = (c)
+                │                     left cols are key   ·
                 │                     right cols are key  ·
-                ├── project           ·                   ·
+                ├── except            ·                   ·
+                │    ├── scan buffer  ·                   ·
+                │    │                label               buffer 1
                 │    └── scan buffer  ·                   ·
                 │                     label               buffer 1
-                └── scan              ·                   ·
+                └── distinct          ·                   ·
+                     │                distinct on         c
+                     └── scan         ·                   ·
 ·                                     missing stats       ·
-·                                     table               parent@primary
+·                                     table               grandchild@primary
 ·                                     spans               FULL SCAN
+
+# This update shouldn't emit checks for c, since it's unchanged.
+query TTT
+EXPLAIN UPDATE child SET p = 4
+----
+·                                distribution        local
+·                                vectorized          false
+root                             ·                   ·
+ ├── update                      ·                   ·
+ │    │                          table               child
+ │    │                          set                 p
+ │    └── buffer                 ·                   ·
+ │         │                     label               buffer 1
+ │         └── render            ·                   ·
+ │              └── scan         ·                   ·
+ │                               missing stats       ·
+ │                               table               child@primary
+ │                               spans               FULL SCAN
+ │                               locking strength    for update
+ └── fk-check                    ·                   ·
+      └── error if rows          ·                   ·
+           └── hash join (anti)  ·                   ·
+                │                equality            (p_new) = (p)
+                │                right cols are key  ·
+                ├── scan buffer  ·                   ·
+                │                label               buffer 1
+                └── scan         ·                   ·
+·                                missing stats       ·
+·                                table               parent@primary
+·                                spans               FULL SCAN
+
+query TTT
+EXPLAIN UPDATE child SET p = p
+----
+·                                distribution        local
+·                                vectorized          false
+root                             ·                   ·
+ ├── update                      ·                   ·
+ │    │                          table               child
+ │    │                          set                 p
+ │    └── buffer                 ·                   ·
+ │         │                     label               buffer 1
+ │         └── scan              ·                   ·
+ │                               missing stats       ·
+ │                               table               child@primary
+ │                               spans               FULL SCAN
+ │                               locking strength    for update
+ └── fk-check                    ·                   ·
+      └── error if rows          ·                   ·
+           └── hash join (anti)  ·                   ·
+                │                equality            (p) = (p)
+                │                right cols are key  ·
+                ├── scan buffer  ·                   ·
+                │                label               buffer 1
+                └── scan         ·                   ·
+·                                missing stats       ·
+·                                table               parent@primary
+·                                spans               FULL SCAN
 
 query TTT
 EXPLAIN UPDATE child SET p = p+1, c = c+1
 ----
-·                                               distribution        local
-·                                               vectorized          false
-root                                            ·                   ·
- ├── update                                     ·                   ·
- │    │                                         table               child
- │    │                                         set                 c, p
- │    └── buffer                                ·                   ·
- │         │                                    label               buffer 1
- │         └── project                          ·                   ·
- │              └── render                      ·                   ·
- │                   └── scan                   ·                   ·
- │                                              missing stats       ·
- │                                              table               child@primary
- │                                              spans               FULL SCAN
- │                                              locking strength    for update
- ├── fk-check                                   ·                   ·
- │    └── error if rows                         ·                   ·
- │         └── hash join                        ·                   ·
- │              │                               type                anti
- │              │                               equality            (p_new) = (p)
- │              │                               right cols are key  ·
- │              ├── project                     ·                   ·
- │              │    └── scan buffer            ·                   ·
- │              │                               label               buffer 1
- │              └── scan                        ·                   ·
- │                                              missing stats       ·
- │                                              table               parent@primary
- │                                              spans               FULL SCAN
- └── fk-check                                   ·                   ·
-      └── error if rows                         ·                   ·
-           └── project                          ·                   ·
-                └── hash join                   ·                   ·
-                     │                          type                inner
-                     │                          equality            (c) = (c)
-                     │                          left cols are key   ·
-                     │                          right cols are key  ·
-                     ├── union                  ·                   ·
-                     │    ├── project           ·                   ·
-                     │    │    └── scan buffer  ·                   ·
-                     │    │                     label               buffer 1
-                     │    └── project           ·                   ·
-                     │         └── scan buffer  ·                   ·
-                     │                          label               buffer 1
-                     └── distinct               ·                   ·
-                          │                     distinct on         c
-                          └── scan              ·                   ·
-·                                               missing stats       ·
-·                                               table               grandchild@primary
-·                                               spans               FULL SCAN
+·                                     distribution        local
+·                                     vectorized          false
+root                                  ·                   ·
+ ├── update                           ·                   ·
+ │    │                               table               child
+ │    │                               set                 c, p
+ │    └── buffer                      ·                   ·
+ │         │                          label               buffer 1
+ │         └── render                 ·                   ·
+ │              └── scan              ·                   ·
+ │                                    missing stats       ·
+ │                                    table               child@primary
+ │                                    spans               FULL SCAN
+ │                                    locking strength    for update
+ ├── fk-check                         ·                   ·
+ │    └── error if rows               ·                   ·
+ │         └── hash join (anti)       ·                   ·
+ │              │                     equality            (p_new) = (p)
+ │              │                     right cols are key  ·
+ │              ├── scan buffer       ·                   ·
+ │              │                     label               buffer 1
+ │              └── scan              ·                   ·
+ │                                    missing stats       ·
+ │                                    table               parent@primary
+ │                                    spans               FULL SCAN
+ └── fk-check                         ·                   ·
+      └── error if rows               ·                   ·
+           └── hash join              ·                   ·
+                │                     equality            (c) = (c)
+                │                     left cols are key   ·
+                │                     right cols are key  ·
+                ├── except            ·                   ·
+                │    ├── scan buffer  ·                   ·
+                │    │                label               buffer 1
+                │    └── scan buffer  ·                   ·
+                │                     label               buffer 1
+                └── distinct          ·                   ·
+                     │                distinct on         c
+                     └── scan         ·                   ·
+·                                     missing stats       ·
+·                                     table               grandchild@primary
+·                                     spans               FULL SCAN
 
 # Multiple grandchild tables
 statement ok
@@ -658,34 +589,31 @@ CREATE TABLE grandchild2 (g INT PRIMARY KEY, c INT NOT NULL REFERENCES child(c))
 query TTT
 EXPLAIN UPDATE child SET p = 4
 ----
-·                                     distribution        local
-·                                     vectorized          false
-root                                  ·                   ·
- ├── update                           ·                   ·
- │    │                               table               child
- │    │                               set                 p
- │    └── buffer                      ·                   ·
- │         │                          label               buffer 1
- │         └── project                ·                   ·
- │              └── render            ·                   ·
- │                   └── scan         ·                   ·
- │                                    missing stats       ·
- │                                    table               child@primary
- │                                    spans               FULL SCAN
- │                                    locking strength    for update
- └── fk-check                         ·                   ·
-      └── error if rows               ·                   ·
-           └── hash join              ·                   ·
-                │                     type                anti
-                │                     equality            (p_new) = (p)
-                │                     right cols are key  ·
-                ├── project           ·                   ·
-                │    └── scan buffer  ·                   ·
-                │                     label               buffer 1
-                └── scan              ·                   ·
-·                                     missing stats       ·
-·                                     table               parent@primary
-·                                     spans               FULL SCAN
+·                                distribution        local
+·                                vectorized          false
+root                             ·                   ·
+ ├── update                      ·                   ·
+ │    │                          table               child
+ │    │                          set                 p
+ │    └── buffer                 ·                   ·
+ │         │                     label               buffer 1
+ │         └── render            ·                   ·
+ │              └── scan         ·                   ·
+ │                               missing stats       ·
+ │                               table               child@primary
+ │                               spans               FULL SCAN
+ │                               locking strength    for update
+ └── fk-check                    ·                   ·
+      └── error if rows          ·                   ·
+           └── hash join (anti)  ·                   ·
+                │                equality            (p_new) = (p)
+                │                right cols are key  ·
+                ├── scan buffer  ·                   ·
+                │                label               buffer 1
+                └── scan         ·                   ·
+·                                missing stats       ·
+·                                table               parent@primary
+·                                spans               FULL SCAN
 
 statement ok
 CREATE TABLE self (x INT PRIMARY KEY, y INT NOT NULL REFERENCES self(x))
@@ -693,17 +621,45 @@ CREATE TABLE self (x INT PRIMARY KEY, y INT NOT NULL REFERENCES self(x))
 query TTT
 EXPLAIN UPDATE self SET y = 3
 ----
+·                                distribution        local
+·                                vectorized          false
+root                             ·                   ·
+ ├── update                      ·                   ·
+ │    │                          table               self
+ │    │                          set                 y
+ │    └── buffer                 ·                   ·
+ │         │                     label               buffer 1
+ │         └── render            ·                   ·
+ │              └── scan         ·                   ·
+ │                               missing stats       ·
+ │                               table               self@primary
+ │                               spans               FULL SCAN
+ │                               locking strength    for update
+ └── fk-check                    ·                   ·
+      └── error if rows          ·                   ·
+           └── hash join (anti)  ·                   ·
+                │                equality            (y_new) = (x)
+                │                right cols are key  ·
+                ├── scan buffer  ·                   ·
+                │                label               buffer 1
+                └── scan         ·                   ·
+·                                missing stats       ·
+·                                table               self@primary
+·                                spans               FULL SCAN
+
+query TTT
+EXPLAIN UPDATE self SET x = 3
+----
 ·                                     distribution        local
 ·                                     vectorized          false
 root                                  ·                   ·
  ├── update                           ·                   ·
  │    │                               table               self
- │    │                               set                 y
+ │    │                               set                 x
  │    └── buffer                      ·                   ·
  │         │                          label               buffer 1
- │         └── project                ·                   ·
- │              └── render            ·                   ·
- │                   └── scan         ·                   ·
+ │         └── render                 ·                   ·
+ │              └── scan              ·                   ·
  │                                    missing stats       ·
  │                                    table               self@primary
  │                                    spans               FULL SCAN
@@ -711,56 +667,20 @@ root                                  ·                   ·
  └── fk-check                         ·                   ·
       └── error if rows               ·                   ·
            └── hash join              ·                   ·
-                │                     type                anti
-                │                     equality            (y_new) = (x)
+                │                     equality            (x) = (y)
+                │                     left cols are key   ·
                 │                     right cols are key  ·
-                ├── project           ·                   ·
+                ├── except            ·                   ·
+                │    ├── scan buffer  ·                   ·
+                │    │                label               buffer 1
                 │    └── scan buffer  ·                   ·
                 │                     label               buffer 1
-                └── scan              ·                   ·
+                └── distinct          ·                   ·
+                     │                distinct on         y
+                     └── scan         ·                   ·
 ·                                     missing stats       ·
 ·                                     table               self@primary
 ·                                     spans               FULL SCAN
-
-query TTT
-EXPLAIN UPDATE self SET x = 3
-----
-·                                               distribution        local
-·                                               vectorized          false
-root                                            ·                   ·
- ├── update                                     ·                   ·
- │    │                                         table               self
- │    │                                         set                 x
- │    └── buffer                                ·                   ·
- │         │                                    label               buffer 1
- │         └── project                          ·                   ·
- │              └── render                      ·                   ·
- │                   └── scan                   ·                   ·
- │                                              missing stats       ·
- │                                              table               self@primary
- │                                              spans               FULL SCAN
- │                                              locking strength    for update
- └── fk-check                                   ·                   ·
-      └── error if rows                         ·                   ·
-           └── project                          ·                   ·
-                └── hash join                   ·                   ·
-                     │                          type                inner
-                     │                          equality            (x) = (y)
-                     │                          left cols are key   ·
-                     │                          right cols are key  ·
-                     ├── union                  ·                   ·
-                     │    ├── project           ·                   ·
-                     │    │    └── scan buffer  ·                   ·
-                     │    │                     label               buffer 1
-                     │    └── project           ·                   ·
-                     │         └── scan buffer  ·                   ·
-                     │                          label               buffer 1
-                     └── distinct               ·                   ·
-                          │                     distinct on         y
-                          └── scan              ·                   ·
-·                                               missing stats       ·
-·                                               table               self@primary
-·                                               spans               FULL SCAN
 
 # Tests for the insert fast path.
 statement ok
@@ -884,7 +804,7 @@ UPSERT INTO t46397_child(c) VALUES (2)
 
 # Verify that cascade information shows up in EXPLAIN.
 statement ok
-CREATE TABLE cascadeparent (p INT PRIMARY KEY);
+CREATE TABLE cascadeparent (p INT PRIMARY KEY, data INT);
 CREATE TABLE cascadechild (
   c INT PRIMARY KEY,
   p INT NOT NULL REFERENCES cascadeparent(p) ON DELETE CASCADE
@@ -893,21 +813,37 @@ CREATE TABLE cascadechild (
 query TTTTT
 EXPLAIN (VERBOSE) DELETE FROM cascadeparent WHERE p > 1
 ----
-·                    distribution         local                   ·    ·
-·                    vectorized           false                   ·    ·
-root                 ·                    ·                       ()   ·
- ├── delete          ·                    ·                       ()   ·
- │    │              estimated row count  0 (missing stats)       ·    ·
- │    │              from                 cascadeparent           ·    ·
- │    └── buffer     ·                    ·                       (p)  ·
- │         │         label                buffer 1                ·    ·
- │         └── scan  ·                    ·                       (p)  ·
- │                   estimated row count  333 (missing stats)     ·    ·
- │                   table                cascadeparent@primary   ·    ·
- │                   spans                /2-                     ·    ·
- └── fk-cascade      ·                    ·                       ·    ·
-·                    fk                   fk_p_ref_cascadeparent  ·    ·
-·                    input                buffer 1                ·    ·
+·                  distribution         local                   ·   ·
+·                  vectorized           false                   ·   ·
+root               ·                    ·                       ()  ·
+ ├── delete range  ·                    ·                       ()  ·
+ │                 estimated row count  0 (missing stats)       ·   ·
+ │                 from                 cascadeparent           ·   ·
+ │                 spans                /2-                     ·   ·
+ └── fk-cascade    ·                    ·                       ·   ·
+·                  fk                   fk_p_ref_cascadeparent  ·   ·
+
+query TTTTT
+EXPLAIN (VERBOSE) DELETE FROM cascadeparent WHERE p > 1 AND data > 0
+----
+·                         distribution         local                   ·          ·
+·                         vectorized           false                   ·          ·
+root                      ·                    ·                       ()         ·
+ ├── delete               ·                    ·                       ()         ·
+ │    │                   estimated row count  0 (missing stats)       ·          ·
+ │    │                   from                 cascadeparent           ·          ·
+ │    └── buffer          ·                    ·                       (p, data)  ·
+ │         │              label                buffer 1                ·          ·
+ │         └── filter     ·                    ·                       (p, data)  ·
+ │              │         estimated row count  311 (missing stats)     ·          ·
+ │              │         filter               data > 0                ·          ·
+ │              └── scan  ·                    ·                       (p, data)  ·
+ │                        estimated row count  333 (missing stats)     ·          ·
+ │                        table                cascadeparent@primary   ·          ·
+ │                        spans                /2-                     ·          ·
+ └── fk-cascade           ·                    ·                       ·          ·
+·                         fk                   fk_p_ref_cascadeparent  ·          ·
+·                         input                buffer 1                ·          ·
 
 statement ok
 CREATE TABLE a (
@@ -938,28 +874,24 @@ FROM
 WHERE
   t.z IS NULL
 ----
-tree                           field               description
-·                              distribution        local
-·                              vectorized          true
-project                        ·                   ·
- └── project                   ·                   ·
-      └── filter               ·                   ·
-           │                   filter              z IS NULL
-           └── merge join      ·                   ·
-                │              type                left outer
-                │              equality            (a_z, a_y, a_x) = (z, y, x)
-                │              right cols are key  ·
-                │              mergeJoinOrder      +"(a_z=z)",+"(a_y=y)",+"(a_x=x)"
-                ├── filter     ·                   ·
-                │    │         filter              (a_y IS NOT NULL) AND (a_x IS NOT NULL)
-                │    └── scan  ·                   ·
-                │              missing stats       ·
-                │              table               b@idx
-                │              spans               /!NULL-
-                └── scan       ·                   ·
-·                              missing stats       ·
-·                              table               a@primary
-·                              spans               FULL SCAN
+tree                          field               description
+·                             distribution        local
+·                             vectorized          true
+filter                        ·                   ·
+ │                            filter              z IS NULL
+ └── merge join (left outer)  ·                   ·
+      │                       equality            (a_z, a_y, a_x) = (z, y, x)
+      │                       right cols are key  ·
+      ├── filter              ·                   ·
+      │    │                  filter              (a_y IS NOT NULL) AND (a_x IS NOT NULL)
+      │    └── scan           ·                   ·
+      │                       missing stats       ·
+      │                       table               b@idx
+      │                       spans               (/NULL - ]
+      └── scan                ·                   ·
+·                             missing stats       ·
+·                             table               a@primary
+·                             spans               FULL SCAN
 
 statement ok
 ALTER TABLE b VALIDATE CONSTRAINT fk_ref
@@ -974,8 +906,243 @@ FROM
 WHERE
   t.z IS NULL
 ----
-tree         field         description
-·            distribution  local
-·            vectorized    true
-project      ·             ·
- └── norows  ·             ·
+tree    field         description
+·       distribution  local
+·       vectorized    true
+norows  ·             ·
+
+# Verify that prefer_lookup_joins_for_fks works as expected.
+statement ok
+CREATE TABLE p (p INT PRIMARY KEY);
+CREATE TABLE c (c INT PRIMARY KEY, p INT REFERENCES p(p), INDEX(p));
+
+statement ok
+ALTER TABLE p INJECT STATISTICS '[
+  {
+    "columns": ["p"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1,
+    "distinct_count": 1
+  }
+]'
+
+statement ok
+ALTER TABLE c INJECT STATISTICS '[
+  {
+    "columns": ["c"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1,
+    "distinct_count": 1
+  }
+]'
+
+# These queries should not be using lookup joins (we're inserting more rows
+# than exist in the tables).
+query TTT
+EXPLAIN INSERT INTO c VALUES (1,1), (2,2), (3,3);
+----
+·                                distribution         local
+·                                vectorized           false
+root                             ·                    ·
+ ├── insert                      ·                    ·
+ │    │                          into                 c(c, p)
+ │    └── buffer                 ·                    ·
+ │         │                     label                buffer 1
+ │         └── values            ·                    ·
+ │                               size                 2 columns, 3 rows
+ └── fk-check                    ·                    ·
+      └── error if rows          ·                    ·
+           └── hash join (anti)  ·                    ·
+                │                equality             (column2) = (p)
+                │                right cols are key   ·
+                ├── scan buffer  ·                    ·
+                │                label                buffer 1
+                └── scan         ·                    ·
+·                                estimated row count  1
+·                                table                p@primary
+·                                spans                FULL SCAN
+
+query TTT
+EXPLAIN UPDATE c SET p=p+c WHERE c > 0
+----
+·                                     distribution         local
+·                                     vectorized           false
+root                                  ·                    ·
+ ├── update                           ·                    ·
+ │    │                               table                c
+ │    │                               set                  p
+ │    └── buffer                      ·                    ·
+ │         │                          label                buffer 1
+ │         └── render                 ·                    ·
+ │              └── scan              ·                    ·
+ │                                    estimated row count  1
+ │                                    table                c@primary
+ │                                    spans                [/1 - ]
+ │                                    locking strength     for update
+ └── fk-check                         ·                    ·
+      └── error if rows               ·                    ·
+           └── hash join (anti)       ·                    ·
+                │                     equality             (p_new) = (p)
+                │                     right cols are key   ·
+                ├── filter            ·                    ·
+                │    │                filter               p_new IS NOT NULL
+                │    └── scan buffer  ·                    ·
+                │                     label                buffer 1
+                └── scan              ·                    ·
+·                                     estimated row count  1
+·                                     table                p@primary
+·                                     spans                FULL SCAN
+
+query TTT
+EXPLAIN UPDATE p SET p=p+1 WHERE p > 0
+----
+·                                     distribution         local
+·                                     vectorized           false
+root                                  ·                    ·
+ ├── update                           ·                    ·
+ │    │                               table                p
+ │    │                               set                  p
+ │    └── buffer                      ·                    ·
+ │         │                          label                buffer 1
+ │         └── render                 ·                    ·
+ │              └── scan              ·                    ·
+ │                                    estimated row count  1
+ │                                    table                p@primary
+ │                                    spans                [/1 - ]
+ │                                    locking strength     for update
+ └── fk-check                         ·                    ·
+      └── error if rows               ·                    ·
+           └── hash join (semi)       ·                    ·
+                │                     equality             (p) = (p)
+                │                     left cols are key    ·
+                ├── except            ·                    ·
+                │    ├── scan buffer  ·                    ·
+                │    │                label                buffer 1
+                │    └── scan buffer  ·                    ·
+                │                     label                buffer 1
+                └── scan              ·                    ·
+·                                     estimated row count  1
+·                                     table                c@primary
+·                                     spans                FULL SCAN
+
+query TTT
+EXPLAIN DELETE FROM p WHERE p > 0
+----
+·                                distribution         local
+·                                vectorized           false
+root                             ·                    ·
+ ├── delete                      ·                    ·
+ │    │                          from                 p
+ │    └── buffer                 ·                    ·
+ │         │                     label                buffer 1
+ │         └── scan              ·                    ·
+ │                               estimated row count  1
+ │                               table                p@primary
+ │                               spans                [/1 - ]
+ └── fk-check                    ·                    ·
+      └── error if rows          ·                    ·
+           └── hash join (semi)  ·                    ·
+                │                equality             (p) = (p)
+                │                left cols are key    ·
+                ├── scan buffer  ·                    ·
+                │                label                buffer 1
+                └── scan         ·                    ·
+·                                estimated row count  1
+·                                table                c@primary
+·                                spans                FULL SCAN
+
+statement ok
+SET prefer_lookup_joins_for_fks = true
+
+# Now we should be using lookup joins.
+query TTT
+EXPLAIN INSERT INTO c VALUES (1,1), (2,2), (3,3);
+----
+·                 distribution  local
+·                 vectorized    false
+insert fast path  ·             ·
+·                 into          c(c, p)
+·                 auto commit   ·
+·                 FK check      p@primary
+·                 size          2 columns, 3 rows
+
+query TTT
+EXPLAIN UPDATE c SET p=p+c WHERE c > 0
+----
+·                                     distribution           local
+·                                     vectorized             false
+root                                  ·                      ·
+ ├── update                           ·                      ·
+ │    │                               table                  c
+ │    │                               set                    p
+ │    └── buffer                      ·                      ·
+ │         │                          label                  buffer 1
+ │         └── render                 ·                      ·
+ │              └── scan              ·                      ·
+ │                                    estimated row count    1
+ │                                    table                  c@primary
+ │                                    spans                  [/1 - ]
+ │                                    locking strength       for update
+ └── fk-check                         ·                      ·
+      └── error if rows               ·                      ·
+           └── lookup join (anti)     ·                      ·
+                │                     table                  p@primary
+                │                     equality               (p_new) = (p)
+                │                     equality cols are key  ·
+                └── filter            ·                      ·
+                     │                filter                 p_new IS NOT NULL
+                     └── scan buffer  ·                      ·
+·                                     label                  buffer 1
+
+query TTT
+EXPLAIN UPDATE p SET p=p+1 WHERE p > 0
+----
+·                                     distribution         local
+·                                     vectorized           false
+root                                  ·                    ·
+ ├── update                           ·                    ·
+ │    │                               table                p
+ │    │                               set                  p
+ │    └── buffer                      ·                    ·
+ │         │                          label                buffer 1
+ │         └── render                 ·                    ·
+ │              └── scan              ·                    ·
+ │                                    estimated row count  1
+ │                                    table                p@primary
+ │                                    spans                [/1 - ]
+ │                                    locking strength     for update
+ └── fk-check                         ·                    ·
+      └── error if rows               ·                    ·
+           └── lookup join (semi)     ·                    ·
+                │                     table                c@c_p_idx
+                │                     equality             (p) = (p)
+                └── except            ·                    ·
+                     ├── scan buffer  ·                    ·
+                     │                label                buffer 1
+                     └── scan buffer  ·                    ·
+·                                     label                buffer 1
+
+query TTT
+EXPLAIN DELETE FROM p WHERE p > 0
+----
+·                                  distribution         local
+·                                  vectorized           false
+root                               ·                    ·
+ ├── delete                        ·                    ·
+ │    │                            from                 p
+ │    └── buffer                   ·                    ·
+ │         │                       label                buffer 1
+ │         └── scan                ·                    ·
+ │                                 estimated row count  1
+ │                                 table                p@primary
+ │                                 spans                [/1 - ]
+ └── fk-check                      ·                    ·
+      └── error if rows            ·                    ·
+           └── lookup join (semi)  ·                    ·
+                │                  table                c@c_p_idx
+                │                  equality             (p) = (p)
+                └── scan buffer    ·                    ·
+·                                  label                buffer 1
+
+statement ok
+SET prefer_lookup_joins_for_fks = false

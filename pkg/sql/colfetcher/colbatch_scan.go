@@ -16,7 +16,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
@@ -24,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
@@ -48,9 +49,9 @@ type ColBatchScan struct {
 	limitHint   int64
 	parallelize bool
 	ctx         context.Context
-	// rowsRead contains the number of total rows this colBatchScan has returned
+	// rowsRead contains the number of total rows this ColBatchScan has returned
 	// so far.
-	rowsRead int
+	rowsRead int64
 	// init is true after Init() has been called.
 	init bool
 	// ResultTypes is the slice of resulting column types from this operator.
@@ -59,13 +60,11 @@ type ColBatchScan struct {
 	ResultTypes []*types.T
 }
 
-var _ colexecbase.Operator = &ColBatchScan{}
+var _ execinfra.IOReader = &ColBatchScan{}
 
 // Init initializes a ColBatchScan.
 func (s *ColBatchScan) Init() {
-	s.ctx = context.Background()
 	s.init = true
-
 	limitBatches := !s.parallelize
 	if err := s.rf.StartScan(
 		s.ctx, s.flowCtx.Txn, s.spans,
@@ -82,9 +81,9 @@ func (s *ColBatchScan) Next(ctx context.Context) coldata.Batch {
 		colexecerror.InternalError(err)
 	}
 	if bat.Selection() != nil {
-		colexecerror.InternalError("unexpectedly a selection vector is set on the batch coming from CFetcher")
+		colexecerror.InternalError(errors.AssertionFailedf("unexpectedly a selection vector is set on the batch coming from CFetcher"))
 	}
-	s.rowsRead += bat.Length()
+	s.rowsRead += int64(bat.Length())
 	return bat
 }
 
@@ -111,14 +110,25 @@ func (s *ColBatchScan) DrainMeta(ctx context.Context) []execinfrapb.ProducerMeta
 	}
 	meta := execinfrapb.GetProducerMeta()
 	meta.Metrics = execinfrapb.GetMetricsMeta()
-	meta.Metrics.BytesRead = s.rf.fetcher.GetBytesRead()
-	meta.Metrics.RowsRead = int64(s.rowsRead)
+	meta.Metrics.BytesRead = s.GetBytesRead()
+	meta.Metrics.RowsRead = s.GetRowsRead()
 	trailingMeta = append(trailingMeta, *meta)
 	return trailingMeta
 }
 
+// GetBytesRead is part of the execinfra.IOReader interface.
+func (s *ColBatchScan) GetBytesRead() int64 {
+	return s.rf.fetcher.GetBytesRead()
+}
+
+// GetRowsRead is part of the execinfra.IOReader interface.
+func (s *ColBatchScan) GetRowsRead() int64 {
+	return s.rowsRead
+}
+
 // NewColBatchScan creates a new ColBatchScan operator.
 func NewColBatchScan(
+	ctx context.Context,
 	allocator *colmem.Allocator,
 	flowCtx *execinfra.FlowCtx,
 	spec *execinfrapb.TableReaderSpec,
@@ -132,20 +142,21 @@ func NewColBatchScan(
 	limitHint := execinfra.LimitHint(spec.LimitHint, post)
 
 	returnMutations := spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic
-	// TODO(ajwerner): The need to construct an ImmutableTableDescriptor here
+	// TODO(ajwerner): The need to construct an Immutable here
 	// indicates that we're probably doing this wrong. Instead we should be
 	// just seting the ID and Version in the spec or something like that and
-	// retrieving the hydrated ImmutableTableDescriptor from cache.
-	table := sqlbase.NewImmutableTableDescriptor(spec.Table)
+	// retrieving the hydrated Immutable from cache.
+	table := tabledesc.NewImmutable(spec.Table)
 	typs := table.ColumnTypesWithMutations(returnMutations)
 	columnIdxMap := table.ColumnIdxMapWithMutations(returnMutations)
+
 	// Add all requested system columns to the output.
-	sysColTypes, sysColDescs, err := sqlbase.GetSystemColumnTypesAndDescriptors(&spec.Table, spec.SystemColumns)
-	if err != nil {
-		return nil, err
+	var sysColDescs []descpb.ColumnDescriptor
+	if spec.HasSystemColumns {
+		sysColDescs = colinfo.AllSystemColumnDescs
 	}
-	typs = append(typs, sysColTypes...)
 	for i := range sysColDescs {
+		typs = append(typs, sysColDescs[i].Type)
 		columnIdxMap[sysColDescs[i].ID] = len(columnIdxMap)
 	}
 
@@ -179,8 +190,9 @@ func NewColBatchScan(
 		return nil, errors.AssertionFailedf("attempting to create a cFetcher with the IsCheck flag set")
 	}
 	if _, _, err := initCRowFetcher(
-		flowCtx.Codec(), allocator, &fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap,
-		spec.Reverse, neededColumns, spec.Visibility, spec.LockingStrength, sysColDescs,
+		flowCtx.Codec(), allocator, &fetcher, table, int(spec.IndexIdx), columnIdxMap,
+		spec.Reverse, neededColumns, spec.Visibility, spec.LockingStrength, spec.LockingWaitPolicy,
+		sysColDescs,
 	); err != nil {
 		return nil, err
 	}
@@ -191,6 +203,7 @@ func NewColBatchScan(
 		spans[i] = spec.Spans[i].Span
 	}
 	return &ColBatchScan{
+		ctx:       ctx,
 		spans:     spans,
 		flowCtx:   flowCtx,
 		rf:        &fetcher,
@@ -207,37 +220,39 @@ func initCRowFetcher(
 	codec keys.SQLCodec,
 	allocator *colmem.Allocator,
 	fetcher *cFetcher,
-	desc *descpb.TableDescriptor,
+	desc *tabledesc.Immutable,
 	indexIdx int,
 	colIdxMap map[descpb.ColumnID]int,
 	reverseScan bool,
 	valNeededForCol util.FastIntSet,
 	scanVisibility execinfrapb.ScanVisibility,
-	lockStr descpb.ScanLockingStrength,
+	lockStrength descpb.ScanLockingStrength,
+	lockWaitPolicy descpb.ScanLockingWaitPolicy,
 	systemColumnDescs []descpb.ColumnDescriptor,
 ) (index *descpb.IndexDescriptor, isSecondaryIndex bool, err error) {
-	immutDesc := sqlbase.NewImmutableTableDescriptor(*desc)
-	index, isSecondaryIndex, err = immutDesc.FindIndexByIndexIdx(indexIdx)
+	index, isSecondaryIndex, err = desc.FindIndexByIndexIdx(indexIdx)
 	if err != nil {
 		return nil, false, err
 	}
 
-	cols := immutDesc.Columns
+	cols := desc.Columns
 	if scanVisibility == execinfra.ScanVisibilityPublicAndNotPublic {
-		cols = immutDesc.ReadableColumns
+		cols = desc.ReadableColumns
 	}
 	// Add on any requested system columns. We slice cols to avoid modifying
 	// the underlying table descriptor.
 	cols = append(cols[:len(cols):len(cols)], systemColumnDescs...)
 	tableArgs := row.FetcherTableArgs{
-		Desc:             immutDesc,
+		Desc:             desc,
 		Index:            index,
 		ColIdxMap:        colIdxMap,
 		IsSecondaryIndex: isSecondaryIndex,
 		Cols:             cols,
 		ValNeededForCol:  valNeededForCol,
 	}
-	if err := fetcher.Init(codec, allocator, reverseScan, lockStr, tableArgs); err != nil {
+	if err := fetcher.Init(
+		codec, allocator, reverseScan, lockStrength, lockWaitPolicy, tableArgs,
+	); err != nil {
 		return nil, false, err
 	}
 

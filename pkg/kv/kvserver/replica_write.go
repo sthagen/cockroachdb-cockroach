@@ -12,7 +12,6 @@ package kvserver
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -31,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"go.etcd.io/etcd/raft"
 )
 
@@ -78,7 +78,8 @@ func (r *Replica) executeWriteBatch(
 	// at proposal time, not at application time, because the spanlatch manager
 	// will synchronize all requests (notably EndTxn with SplitTrigger) that may
 	// cause this condition to change.
-	if err := r.checkExecutionCanProceed(ctx, ba, g, &st); err != nil {
+	mergeInProgress, err := r.checkExecutionCanProceed(ctx, ba, g, &st)
+	if err != nil {
 		return nil, g, roachpb.NewError(err)
 	}
 
@@ -148,7 +149,7 @@ func (r *Replica) executeWriteBatch(
 	// cannot communicate under the lease's epoch. Instead the code calls EmitMLAI
 	// explicitly as a side effect of stepping up as leaseholder.
 	if maxLeaseIndex != 0 {
-		if r.mergeInProgress() {
+		if mergeInProgress {
 			// The correctness of range merges relies on the invariant that the
 			// LeaseAppliedIndex of the range is not bumped while a range is in its
 			// subsumed state. If this invariant is ever violated, the follower
@@ -157,7 +158,8 @@ func (r *Replica) executeWriteBatch(
 			// a serializability violation.
 			//
 			// See comment block in Subsume() in cmd_subsume.go for details.
-			log.Fatalf(ctx, "lease applied index bumped while the range was subsumed")
+			log.Fatalf(ctx,
+				"lease applied index bumped by %v while the range was subsumed", ba)
 		}
 		untrack(ctx, ctpb.Epoch(st.Lease.Epoch), r.RangeID, ctpb.LAI(maxLeaseIndex))
 	}
@@ -217,9 +219,10 @@ func (r *Replica) executeWriteBatch(
 			slowTimer.Read = true
 			r.store.metrics.SlowRaftRequests.Inc(1)
 
-			log.Errorf(ctx, "range unavailable: %v",
-				rangeUnavailableMessage(r.Desc(), r.store.cfg.NodeLiveness.GetIsLiveMap(),
-					r.RaftStatus(), ba, timeutil.Since(startPropTime)))
+			var s redact.StringBuilder
+			rangeUnavailableMessage(&s, r.Desc(), r.store.cfg.NodeLiveness.GetIsLiveMap(),
+				r.RaftStatus(), ba, timeutil.Since(startPropTime))
+			log.Errorf(ctx, "range unavailable: %v", s)
 		case <-ctxDone:
 			// If our context was canceled, return an AmbiguousResultError,
 			// which indicates to the caller that the command may have executed.
@@ -239,16 +242,13 @@ func (r *Replica) executeWriteBatch(
 }
 
 func rangeUnavailableMessage(
+	s *redact.StringBuilder,
 	desc *roachpb.RangeDescriptor,
 	lm IsLiveMap,
 	rs *raft.Status,
 	ba *roachpb.BatchRequest,
 	dur time.Duration,
-) string {
-	cpy := *desc
-	desc = &cpy
-	desc.StartKey, desc.EndKey = nil, nil // scrub PII
-
+) {
 	var liveReplicas, otherReplicas []roachpb.ReplicaDescriptor
 	for _, rDesc := range desc.Replicas().All() {
 		if lm[rDesc.NodeID].IsLive {
@@ -257,7 +257,13 @@ func rangeUnavailableMessage(
 			otherReplicas = append(otherReplicas, rDesc)
 		}
 	}
-	return fmt.Sprintf(`have been waiting %.2fs for proposing command %s.
+
+	// Ensure that these are going to redact nicely.
+	var _ redact.SafeFormatter = ba
+	var _ redact.SafeFormatter = desc
+	var _ redact.SafeFormatter = roachpb.ReplicaDescriptors{}
+
+	s.Printf(`have been waiting %.2fs for proposing command %s.
 This range is likely unavailable.
 Please submit this message to Cockroach Labs support along with the following information:
 
@@ -278,7 +284,7 @@ support contract. Otherwise, please open an issue at:
 		desc,
 		roachpb.MakeReplicaDescriptors(liveReplicas),
 		roachpb.MakeReplicaDescriptors(otherReplicas),
-		rs,
+		redact.Safe(rs), // raft status contains no PII
 		desc.RangeID,
 	)
 }
@@ -295,6 +301,27 @@ func (r *Replica) canAttempt1PCEvaluation(
 	if ba.Timestamp != ba.Txn.WriteTimestamp {
 		log.Fatalf(ctx, "unexpected 1PC execution with diverged timestamp. %s != %s",
 			ba.Timestamp, ba.Txn.WriteTimestamp)
+	}
+
+	// Check whether the txn record has already been created. If so, we can't
+	// perform a 1PC evaluation because we need to clean up the record during
+	// evaluation.
+	//
+	// We only perform this check if the transaction's EndTxn indicates that it
+	// has started its heartbeat loop. If not, the transaction cannot have an
+	// existing record. However, we perform it unconditionally under race to
+	// catch bugs.
+	arg, _ := ba.GetArg(roachpb.EndTxn)
+	etArg := arg.(*roachpb.EndTxnRequest)
+	if etArg.TxnHeartbeating || util.RaceEnabled {
+		if ok, err := batcheval.HasTxnRecord(ctx, r.store.Engine(), ba.Txn); err != nil {
+			return false, roachpb.NewError(err)
+		} else if ok {
+			if !etArg.TxnHeartbeating {
+				log.Fatalf(ctx, "non-heartbeating txn with txn record before EndTxn: %v", ba.Txn)
+			}
+			return false, nil
+		}
 	}
 
 	// The EndTxn checks whether the txn record can be created, but we're
@@ -425,11 +452,10 @@ func (r *Replica) evaluate1PC(
 
 	arg, _ := ba.GetArg(roachpb.EndTxn)
 	etArg := arg.(*roachpb.EndTxnRequest)
-	canFwdTimestamp := batcheval.CanForwardCommitTimestampWithoutRefresh(ba.Txn, etArg)
 
 	// Evaluate strippedBa. If the transaction allows, permit refreshes.
 	ms := new(enginepb.MVCCStats)
-	if canFwdTimestamp {
+	if ba.CanForwardReadTimestamp {
 		batch, br, res, pErr = r.evaluateWriteBatchWithServersideRefreshes(
 			ctx, idKey, rec, ms, &strippedBa, latchSpans, etArg.Deadline)
 	} else {
@@ -437,7 +463,7 @@ func (r *Replica) evaluate1PC(
 			ctx, idKey, rec, ms, &strippedBa, latchSpans)
 	}
 
-	if pErr != nil || (!canFwdTimestamp && ba.Timestamp != br.Timestamp) {
+	if pErr != nil || (!ba.CanForwardReadTimestamp && ba.Timestamp != br.Timestamp) {
 		if pErr != nil {
 			log.VEventf(ctx, 2,
 				"1PC execution failed, falling back to transactional execution. pErr: %v", pErr.String())
@@ -485,6 +511,11 @@ func (r *Replica) evaluate1PC(
 	// have acquired unreplicated locks, so inform the concurrency manager that
 	// it is finalized and than any unreplicated locks that it has acquired can
 	// be released.
+	//
+	// TODO(nvanbenschoten): once we can rely on EndTxn.TxnHeartbeating being
+	// correct in v21.1, we can gate these notifications on TxnHeartbeating
+	// because we know that a transaction hasn't acquired any unreplicated
+	// locks if it hasn't started heartbeating.
 	res.Local.UpdatedTxns = []*roachpb.Transaction{clonedTxn}
 	res.Local.ResolvedLocks = make([]roachpb.LockUpdate, len(etArg.LockSpans))
 	for i, sp := range etArg.LockSpans {

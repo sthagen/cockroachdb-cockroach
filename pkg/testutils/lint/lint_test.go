@@ -444,6 +444,7 @@ func TestLint(t *testing.T) {
 					":!ccl/backupccl/backup_test.go",
 					":!storage/cloudimpl",
 					":!ccl/workloadccl/fixture_test.go",
+					":!internal/gopath/gopath.go",
 					":!cmd",
 					":!nightly",
 					":!testutils/lint",
@@ -981,6 +982,7 @@ func TestLint(t *testing.T) {
 			":!*.pb.go",
 			":!util/protoutil/marshal.go",
 			":!util/protoutil/marshaler.go",
+			":!util/encoding/encoding.go",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -1018,8 +1020,10 @@ func TestLint(t *testing.T) {
 			"*.go",
 			":!*.pb.go",
 			":!*.pb.gw.go",
+			":!sql/pgwire/pgerror/constraint_name.go",
 			":!sql/pgwire/pgerror/severity.go",
 			":!sql/pgwire/pgerror/with_candidate_code.go",
+			":!sql/pgwire/pgwirebase/too_big_error.go",
 			":!sql/colexecbase/colexecerror/error.go",
 			":!util/protoutil/jsonpb_marshal.go",
 			":!util/protoutil/marshal.go",
@@ -1128,6 +1132,7 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`^workload/tpcds/tpcds.go$`),
 			stream.GrepNot(`^geo/geoprojbase/projections.go$`),
 			stream.GrepNot(`^sql/logictest/testdata/logic_test/pg_extension$`),
+			stream.GrepNot(`^sql/opt/testutils/opttester/testfixtures/.*`),
 			stream.Map(func(s string) string {
 				return filepath.Join(pkgDir, s)
 			}),
@@ -1818,6 +1823,10 @@ func TestLint(t *testing.T) {
 			// Ignore types that can change by system.
 			stream.GrepNot(`pkg/util/sysutil/sysutil_unix.go:`),
 
+			// Ignore jemalloc issues warnings.
+			stream.GrepNot(`In file included from.*(start|runtime)_jemalloc\.go`),
+			stream.GrepNot(`include/jemalloc/jemalloc\.h`),
+
 			stream.GrepNot(`declaration of "?(pE|e)rr"? shadows`),
 			stream.GrepNot(`\.pb\.gw\.go:[0-9:]+: declaration of "?ctx"? shadows`),
 			stream.GrepNot(`\.[eo]g\.go:[0-9:]+: declaration of ".*" shadows`),
@@ -1839,6 +1848,8 @@ func TestLint(t *testing.T) {
 			// error encode/decode, it can be dropped from the linter
 			// exception as well.
 			stream.GrepNot(`pkg/roachpb/errors\.go:.*invalid direct cast on error object`),
+			// Cast in decode handler.
+			stream.GrepNot(`pkg/sql/pgwire/pgerror/constraint_name\.go:.*invalid direct cast on error object`),
 			// pgerror's pgcode logic uses its own custom cause recursion
 			// algorithm and thus cannot use errors.If() which mandates a
 			// different recursion order.

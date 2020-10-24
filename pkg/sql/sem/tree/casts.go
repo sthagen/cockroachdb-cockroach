@@ -113,6 +113,8 @@ var validCasts = []castInfo{
 	{from: types.UnknownFamily, to: types.Box2DFamily, volatility: VolatilityImmutable},
 	{from: types.StringFamily, to: types.Box2DFamily, volatility: VolatilityImmutable},
 	{from: types.CollatedStringFamily, to: types.Box2DFamily, volatility: VolatilityImmutable},
+	{from: types.GeometryFamily, to: types.Box2DFamily, volatility: VolatilityImmutable},
+	{from: types.Box2DFamily, to: types.Box2DFamily, volatility: VolatilityImmutable},
 
 	// Casts to GeographyFamily.
 	{from: types.UnknownFamily, to: types.GeographyFamily, volatility: VolatilityImmutable},
@@ -125,6 +127,7 @@ var validCasts = []castInfo{
 
 	// Casts to GeometryFamily.
 	{from: types.UnknownFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
+	{from: types.Box2DFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
 	{from: types.BytesFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
 	{from: types.JsonFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
 	{from: types.StringFamily, to: types.GeometryFamily, volatility: VolatilityImmutable},
@@ -325,6 +328,7 @@ func init() {
 
 // lookupCast returns the information for a valid cast.
 // Returns nil if this is not a valid cast.
+// Does not handle array and tuple casts.
 func lookupCast(from, to types.Family) *castInfo {
 	return castsMap[castsMapKey{from: from, to: to}]
 }
@@ -336,6 +340,25 @@ func LookupCastVolatility(from, to *types.T) (_ Volatility, ok bool) {
 	// Special case for casting between arrays.
 	if fromFamily == types.ArrayFamily && toFamily == types.ArrayFamily {
 		return LookupCastVolatility(from.ArrayContents(), to.ArrayContents())
+	}
+	// Special case for casting between tuples.
+	if fromFamily == types.TupleFamily && toFamily == types.TupleFamily {
+		fromTypes := from.TupleContents()
+		toTypes := to.TupleContents()
+		if len(fromTypes) != len(toTypes) {
+			return 0, false
+		}
+		maxVolatility := VolatilityLeakProof
+		for i := range fromTypes {
+			v, ok := LookupCastVolatility(fromTypes[i], toTypes[i])
+			if !ok {
+				return 0, false
+			}
+			if v > maxVolatility {
+				maxVolatility = v
+			}
+		}
+		return maxVolatility, true
 	}
 	cast := lookupCast(fromFamily, toFamily)
 	if cast == nil {
@@ -593,7 +616,7 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			s = t.BitArray.String()
 		case *DFloat:
 			s = strconv.FormatFloat(float64(*t), 'g',
-				ctx.SessionData.DataConversion.GetFloatPrec(), 64)
+				ctx.SessionData.DataConversionConfig.GetFloatPrec(), 64)
 		case *DBool, *DInt, *DDecimal:
 			s = d.String()
 		case *DTimestamp, *DDate, *DTime, *DTimeTZ, *DGeography, *DGeometry, *DBox2D:
@@ -626,8 +649,11 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 		case *DCollatedString:
 			s = t.Contents
 		case *DBytes:
-			s = lex.EncodeByteArrayToRawBytes(string(*t),
-				ctx.SessionData.DataConversion.BytesEncodeFormat, false /* skipHexPrefix */)
+			s = lex.EncodeByteArrayToRawBytes(
+				string(*t),
+				ctx.SessionData.DataConversionConfig.BytesEncodeFormat,
+				false, /* skipHexPrefix */
+			)
 		case *DOid:
 			s = t.String()
 		case *DJSON:
@@ -709,6 +735,14 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			return ParseDBox2D(string(*d))
 		case *DCollatedString:
 			return ParseDBox2D(d.Contents)
+		case *DBox2D:
+			return d, nil
+		case *DGeometry:
+			bbox := d.CartesianBoundingBox()
+			if bbox == nil {
+				return DNull, nil
+			}
+			return NewDBox2D(*bbox), nil
 		}
 
 	case types.GeographyFamily:
@@ -718,8 +752,8 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 		case *DCollatedString:
 			return ParseDGeography(d.Contents)
 		case *DGeography:
-			if err := geo.GeospatialTypeFitsColumnMetadata(
-				d.Geography,
+			if err := geo.SpatialObjectFitsColumnMetadata(
+				d.Geography.SpatialObject(),
 				t.InternalType.GeoMetadata.SRID,
 				t.InternalType.GeoMetadata.ShapeType,
 			); err != nil {
@@ -731,8 +765,8 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			if err != nil {
 				return nil, err
 			}
-			if err := geo.GeospatialTypeFitsColumnMetadata(
-				g,
+			if err := geo.SpatialObjectFitsColumnMetadata(
+				g.SpatialObject(),
 				t.InternalType.GeoMetadata.SRID,
 				t.InternalType.GeoMetadata.ShapeType,
 			); err != nil {
@@ -763,8 +797,8 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 		case *DCollatedString:
 			return ParseDGeometry(d.Contents)
 		case *DGeometry:
-			if err := geo.GeospatialTypeFitsColumnMetadata(
-				d.Geometry,
+			if err := geo.SpatialObjectFitsColumnMetadata(
+				d.Geometry.SpatialObject(),
 				t.InternalType.GeoMetadata.SRID,
 				t.InternalType.GeoMetadata.ShapeType,
 			); err != nil {
@@ -772,8 +806,8 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			}
 			return d, nil
 		case *DGeography:
-			if err := geo.GeospatialTypeFitsColumnMetadata(
-				d.Geography,
+			if err := geo.SpatialObjectFitsColumnMetadata(
+				d.Geography.SpatialObject(),
 				t.InternalType.GeoMetadata.SRID,
 				t.InternalType.GeoMetadata.ShapeType,
 			); err != nil {
@@ -790,6 +824,12 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 				return nil, err
 			}
 			g, err := geo.ParseGeometryFromGeoJSON([]byte(*t))
+			if err != nil {
+				return nil, err
+			}
+			return &DGeometry{g}, nil
+		case *DBox2D:
+			g, err := geo.MakeGeometryFromGeomT(d.ToGeomT(geopb.DefaultGeometrySRID))
 			if err != nil {
 				return nil, err
 			}
@@ -1039,21 +1079,19 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			}
 		case *DString:
 			s := string(*v)
-			// Trim whitespace and unwrap outer quotes if necessary.
-			// This is required to mimic postgres.
-			s = strings.TrimSpace(s)
-			origS := s
-			if len(s) > 1 && s[0] == '"' && s[len(s)-1] == '"' {
-				s = s[1 : len(s)-1]
+
+			// If it is an integer in string form, convert it as an int.
+			if val, err := ParseDInt(strings.TrimSpace(s)); err == nil {
+				tmpOid := NewDOid(*val)
+				oid, err := queryOid(ctx, t, tmpOid)
+				if err != nil {
+					oid = tmpOid
+					oid.semanticType = t
+				}
+				return oid, nil
 			}
 
 			switch t.Oid() {
-			case oid.T_oid:
-				i, err := ParseDInt(s)
-				if err != nil {
-					return nil, err
-				}
-				return &DOid{semanticType: t, DInt: *i}, nil
 			case oid.T_regproc, oid.T_regprocedure:
 				// Trim procedure type parameters, e.g. `max(int)` becomes `max`.
 				// Postgres only does this when the cast is ::regprocedure, but we're
@@ -1061,8 +1099,11 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 				// We additionally do not yet implement disambiguation based on type
 				// parameters: we return the match iff there is exactly one.
 				s = pgSignatureRegexp.ReplaceAllString(s, "$1")
-				// Resolve function name.
-				substrs := strings.Split(s, ".")
+
+				substrs, err := splitIdentifierList(s)
+				if err != nil {
+					return nil, err
+				}
 				if len(substrs) > 3 {
 					// A fully qualified function name in pg's dialect can contain
 					// at most 3 parts: db.schema.funname.
@@ -1089,10 +1130,21 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 						name:         parsedTyp.SQLStandardName(),
 					}, nil
 				}
+
 				// Fall back to searching pg_type, since we don't provide syntax for
 				// every postgres type that we understand OIDs for.
+				// Note this section does *not* work if there is a schema in front of the
+				// type, e.g. "pg_catalog"."int4" (if int4 was not defined).
+
+				// Trim whitespace and unwrap outer quotes if necessary.
+				// This is required to mimic postgres.
+				s = strings.TrimSpace(s)
+				if len(s) > 1 && s[0] == '"' && s[len(s)-1] == '"' {
+					s = s[1 : len(s)-1]
+				}
 				// Trim type modifiers, e.g. `numeric(10,3)` becomes `numeric`.
 				s = pgSignatureRegexp.ReplaceAllString(s, "$1")
+
 				dOid, missingTypeErr := queryOid(ctx, t, NewDString(s))
 				if missingTypeErr == nil {
 					return dOid, missingTypeErr
@@ -1118,11 +1170,11 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 				}, nil
 
 			case oid.T_regclass:
-				tn, err := ctx.Planner.ParseQualifiedTableName(origS)
+				tn, err := castStringToRegClassTableName(s)
 				if err != nil {
 					return nil, err
 				}
-				id, err := ctx.Planner.ResolveTableName(ctx.Ctx(), tn)
+				id, err := ctx.Planner.ResolveTableName(ctx.Ctx(), &tn)
 				if err != nil {
 					return nil, err
 				}
@@ -1139,4 +1191,117 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 
 	return nil, pgerror.Newf(
 		pgcode.CannotCoerce, "invalid cast: %s -> %s", d.ResolvedType(), t)
+}
+
+// castStringToRegClassTableName normalizes a TableName from a string.
+func castStringToRegClassTableName(s string) (TableName, error) {
+	components, err := splitIdentifierList(s)
+	if err != nil {
+		return TableName{}, err
+	}
+
+	if len(components) > 3 {
+		return TableName{}, pgerror.Newf(
+			pgcode.InvalidName,
+			"too many components: %s",
+			s,
+		)
+	}
+	var retComponents [3]string
+	for i := 0; i < len(components); i++ {
+		retComponents[len(components)-1-i] = components[i]
+	}
+	u, err := NewUnresolvedObjectName(
+		len(components),
+		retComponents,
+		0,
+	)
+	if err != nil {
+		return TableName{}, err
+	}
+	return u.ToTableName(), nil
+}
+
+// splitIdentifierList splits identifiers to individual components, lower
+// casing non-quoted identifiers and escaping quoted identifiers as appropriate.
+// It is based on PostgreSQL's SplitIdentifier.
+func splitIdentifierList(in string) ([]string, error) {
+	var pos int
+	var ret []string
+	const separator = '.'
+
+	for pos < len(in) {
+		if isWhitespace(in[pos]) {
+			pos++
+			continue
+		}
+		if in[pos] == '"' {
+			var b strings.Builder
+			// Attempt to find the ending quote. If the quote is double "",
+			// fold it into a " character for the str (e.g. "a""" means a").
+			for {
+				pos++
+				endIdx := strings.IndexByte(in[pos:], '"')
+				if endIdx == -1 {
+					return nil, pgerror.Newf(
+						pgcode.InvalidName,
+						`invalid name: unclosed ": %s`,
+						in,
+					)
+				}
+				b.WriteString(in[pos : pos+endIdx])
+				pos += endIdx + 1
+				// If we reached the end, or the following character is not ",
+				// we can break and assume this is one identifier.
+				// There are checks below to ensure EOF or whitespace comes
+				// afterward.
+				if pos == len(in) || in[pos] != '"' {
+					break
+				}
+				b.WriteByte('"')
+			}
+			ret = append(ret, b.String())
+		} else {
+			var b strings.Builder
+			for pos < len(in) && in[pos] != separator && !isWhitespace(in[pos]) {
+				b.WriteByte(in[pos])
+				pos++
+			}
+			// Anything with no quotations should be lowered.
+			ret = append(ret, strings.ToLower(b.String()))
+		}
+
+		// Further ignore all white space.
+		for pos < len(in) && isWhitespace(in[pos]) {
+			pos++
+		}
+
+		// At this stage, we expect separator or end of string.
+		if pos == len(in) {
+			break
+		}
+
+		if in[pos] != separator {
+			return nil, pgerror.Newf(
+				pgcode.InvalidName,
+				"invalid name: expected separator %c: %s",
+				separator,
+				in,
+			)
+		}
+
+		pos++
+	}
+
+	return ret, nil
+}
+
+// isWhitespace returns true if the given character is a space.
+// This must match parser.SkipWhitespace above.
+func isWhitespace(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\r', '\f', '\n':
+		return true
+	}
+	return false
 }

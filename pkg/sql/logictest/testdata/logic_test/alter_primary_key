@@ -1,5 +1,3 @@
-# LogicTest: !3node-tenant(52558)
-
 statement ok
 SET experimental_enable_hash_sharded_indexes = true
 
@@ -127,7 +125,7 @@ filter     ·              ·
  └── scan  ·              ·
 ·          missing stats  ·
 ·          table          child@primary
-·          spans          /1/2/#/57/2-/4/6/#/57/3
+·          spans          [/1/2 - /4/6]
 
 query III rowsort
 SELECT * FROM child WHERE x >= 1 AND x < 5 AND y >= 2 AND y <= 6
@@ -180,7 +178,7 @@ SELECT * FROM [EXPLAIN SELECT * FROM child WHERE y >=2 AND y <= 6] OFFSET 2
 scan  ·              ·
 ·     missing stats  ·
 ·     table          child@primary
-·     spans          /2-/7
+·     spans          [/2 - /6]
 
 query III rowsort
 SELECT * FROM child WHERE y >=2 AND y <= 6
@@ -388,7 +386,6 @@ SELECT * FROM [EXPLAIN SELECT * FROM t@i1] OFFSET 2
 ----
 index join  ·              ·
  │          table          t@primary
- │          key columns    y
  └── scan   ·              ·
 ·           missing stats  ·
 ·           table          t@i1
@@ -404,7 +401,6 @@ SELECT * FROM [EXPLAIN SELECT * FROM t@i2] OFFSET 2
 ----
 index join  ·              ·
  │          table          t@primary
- │          key columns    y
  └── scan   ·              ·
 ·           missing stats  ·
 ·           table          t@i2
@@ -420,7 +416,6 @@ SELECT * FROM [EXPLAIN SELECT * FROM t@i3] OFFSET 2
 ----
 index join  ·              ·
  │          table          t@primary
- │          key columns    y
  └── scan   ·              ·
 ·           missing stats  ·
 ·           table          t@i3
@@ -436,7 +431,6 @@ SELECT * FROM [EXPLAIN SELECT * FROM t@i4] OFFSET 2
 ----
 index join  ·              ·
  │          table          t@primary
- │          key columns    y
  └── scan   ·              ·
 ·           missing stats  ·
 ·           table          t@i4
@@ -452,7 +446,6 @@ SELECT * FROM [EXPLAIN SELECT * FROM t@i5] OFFSET 2
 ----
 index join  ·              ·
  │          table          t@primary
- │          key columns    y
  └── scan   ·              ·
 ·           missing stats  ·
 ·           table          t@i5
@@ -468,7 +461,6 @@ SELECT * FROM [EXPLAIN SELECT * FROM t@i7] OFFSET 2
 ----
 index join  ·              ·
  │          table          t@primary
- │          key columns    y
  └── scan   ·              ·
 ·           missing stats  ·
 ·           table          t@i7

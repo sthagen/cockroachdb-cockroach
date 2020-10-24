@@ -25,13 +25,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -55,7 +56,7 @@ func runImport(
 		if err := flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			resolver := flowCtx.TypeResolverFactory.NewTypeResolver(txn)
 			for _, table := range spec.Tables {
-				if err := sqlbase.HydrateTypesInTableDescriptor(ctx, table.Desc, resolver); err != nil {
+				if err := typedesc.HydrateTypesInTableDescriptor(ctx, table.Desc, resolver); err != nil {
 					return err
 				}
 			}
@@ -393,13 +394,13 @@ func newImportRowError(err error, row string, num int64) error {
 
 // parallelImportContext describes state associated with the import.
 type parallelImportContext struct {
-	walltime   int64                             // Import time stamp.
-	numWorkers int                               // Parallelism
-	batchSize  int                               // Number of records to batch
-	evalCtx    *tree.EvalContext                 // Evaluation context.
-	tableDesc  *sqlbase.ImmutableTableDescriptor // Table descriptor we're importing into.
-	targetCols tree.NameList                     // List of columns to import.  nil if importing all columns.
-	kvCh       chan row.KVBatch                  // Channel for sending KV batches.
+	walltime   int64                // Import time stamp.
+	numWorkers int                  // Parallelism
+	batchSize  int                  // Number of records to batch
+	evalCtx    *tree.EvalContext    // Evaluation context.
+	tableDesc  *tabledesc.Immutable // Table descriptor we're importing into.
+	targetCols tree.NameList        // List of columns to import.  nil if importing all columns.
+	kvCh       chan row.KVBatch     // Channel for sending KV batches.
 }
 
 // importFileContext describes state specific to a file being imported.
@@ -607,6 +608,12 @@ func (p *parallelImporter) flush(ctx context.Context) error {
 	}
 }
 
+func timestampAfterEpoch(walltime int64) uint64 {
+	epoch := time.Date(2015, time.January, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+	const precision = uint64(10 * time.Microsecond)
+	return uint64(walltime-epoch) / precision
+}
+
 func (p *parallelImporter) importWorker(
 	ctx context.Context,
 	workerID int,
@@ -624,9 +631,7 @@ func (p *parallelImporter) importWorker(
 	}
 
 	var rowNum int64
-	epoch := time.Date(2015, time.January, 1, 0, 0, 0, 0, time.UTC).UnixNano()
-	const precision = uint64(10 * time.Microsecond)
-	timestamp := uint64(importCtx.walltime-epoch) / precision
+	timestamp := timestampAfterEpoch(importCtx.walltime)
 
 	conv.CompletedRowFn = func() int64 {
 		m := emittedRowLowWatermark(workerID, rowNum, minEmitted)

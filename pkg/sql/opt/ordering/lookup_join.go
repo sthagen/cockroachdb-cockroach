@@ -20,6 +20,12 @@ import (
 func lookupOrIndexJoinCanProvideOrdering(
 	expr memo.RelExpr, required *physical.OrderingChoice,
 ) bool {
+	if lookupJoin, ok := expr.(*memo.LookupJoinExpr); ok && lookupJoin.IsSecondJoinInPairedJoiner {
+		// Can only pass through ordering if the ordering can be provided by the
+		// child, since we don't want a sort to be interposed between the child
+		// and this join.
+		return CanProvide(expr.Child(0).(memo.RelExpr), required)
+	}
 	// LookupJoin and IndexJoin can pass through their ordering if the ordering
 	// depends only on columns present in the input.
 	inputCols := expr.Child(0).(memo.RelExpr).Relational().OutputCols
@@ -85,7 +91,7 @@ func lookupJoinBuildProvided(expr memo.RelExpr, required *physical.OrderingChoic
 	md := lookupJoin.Memo().Metadata()
 	index := md.Table(lookupJoin.Table).Index(lookupJoin.Index)
 	for i, colID := range lookupJoin.KeyCols {
-		indexColID := lookupJoin.Table.ColumnID(index.Column(i).Ordinal)
+		indexColID := lookupJoin.Table.ColumnID(index.Column(i).Ordinal())
 		fds.AddEquivalency(colID, indexColID)
 	}
 

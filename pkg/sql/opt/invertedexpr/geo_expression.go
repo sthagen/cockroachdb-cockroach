@@ -11,10 +11,11 @@
 package invertedexpr
 
 import (
+	"math"
+	"sort"
+
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/errors"
 )
@@ -27,24 +28,34 @@ import (
 //
 // TODO(sumeer): change geoindex to produce SpanExpressions directly.
 
-func geoKeyToEncInvertedVal(k geoindex.Key, end bool) EncInvertedVal {
-	dint := tree.DInt(k)
-	encoded, err := sqlbase.EncodeTableKey(nil, &dint, encoding.Ascending)
-	if err != nil {
-		panic(errors.NewAssertionErrorWithWrappedErrf(err, "unexpected encoding error: %d", k))
-	}
+func geoKeyToEncInvertedVal(k geoindex.Key, end bool, b []byte) (EncInvertedVal, []byte) {
+	// geoindex.KeySpan.End is inclusive, while InvertedSpan.end is exclusive.
+	// For all but k == math.MaxUint64, we can account for this before the key
+	// encoding. For k == math.MaxUint64, we must PrefixEnd after, which incurs
+	// a separate memory allocation.
+	prefixEnd := false
 	if end {
-		// geoindex.KeySpan.End is inclusive, while InvertedSpan.end is exclusive.
-		encoded = roachpb.Key(encoded).PrefixEnd()
+		if k < math.MaxUint64 {
+			k++
+		} else {
+			prefixEnd = true
+		}
 	}
-	return encoded
+	prev := len(b)
+	b = encoding.EncodeGeoInvertedAscending(b)
+	b = encoding.EncodeUvarintAscending(b, uint64(k))
+	// Set capacity so that the caller appending does not corrupt later keys.
+	enc := b[prev:len(b):len(b)]
+	if prefixEnd {
+		enc = roachpb.Key(enc).PrefixEnd()
+	}
+	return enc, b
 }
 
-func geoToSpan(span geoindex.KeySpan) InvertedSpan {
-	return InvertedSpan{
-		Start: geoKeyToEncInvertedVal(span.Start, false),
-		End:   geoKeyToEncInvertedVal(span.End, true),
-	}
+func geoToSpan(span geoindex.KeySpan, b []byte) (InvertedSpan, []byte) {
+	start, b := geoKeyToEncInvertedVal(span.Start, false, b)
+	end, b := geoKeyToEncInvertedVal(span.End, true, b)
+	return InvertedSpan{Start: start, End: end}, b
 }
 
 // GeoUnionKeySpansToSpanExpr converts geoindex.UnionKeySpans to a
@@ -53,9 +64,12 @@ func GeoUnionKeySpansToSpanExpr(ukSpans geoindex.UnionKeySpans) *SpanExpression 
 	if len(ukSpans) == 0 {
 		return nil
 	}
+	// Avoid per-span heap allocations. Each of the 2 keys in a span is the
+	// geoInvertedIndexMarker (1 byte) followed by a varint.
+	b := make([]byte, 0, len(ukSpans)*(2*encoding.MaxVarintLen+2))
 	spans := make([]InvertedSpan, len(ukSpans))
 	for i, ukSpan := range ukSpans {
-		spans[i] = geoToSpan(ukSpan)
+		spans[i], b = geoToSpan(ukSpan, b)
 	}
 	return &SpanExpression{
 		SpansToRead:        spans,
@@ -69,19 +83,17 @@ func GeoRPKeyExprToSpanExpr(rpExpr geoindex.RPKeyExpr) (*SpanExpression, error) 
 		return nil, nil
 	}
 	spansToRead := make([]InvertedSpan, 0, len(rpExpr))
-	for _, elem := range rpExpr {
-		// The keys in the RPKeyExpr are unique.
-		if key, ok := elem.(geoindex.Key); ok {
-			spansToRead = append(spansToRead, geoToSpan(geoindex.KeySpan{Start: key, End: key}))
-		}
-	}
+	var b []byte // avoid per-expr heap allocations
 	var stack []*SpanExpression
 	for _, elem := range rpExpr {
 		switch e := elem.(type) {
 		case geoindex.Key:
+			var span InvertedSpan
+			span, b = geoToSpan(geoindex.KeySpan{Start: e, End: e}, b)
+			// The keys in the RPKeyExpr are unique, so simply append to spansToRead.
+			spansToRead = append(spansToRead, span)
 			stack = append(stack, &SpanExpression{
-				FactoredUnionSpans: []InvertedSpan{
-					geoToSpan(geoindex.KeySpan{Start: e, End: e})},
+				FactoredUnionSpans: []InvertedSpan{span},
 			})
 		case geoindex.RPSetOperator:
 			if len(stack) < 2 {
@@ -92,24 +104,23 @@ func GeoRPKeyExprToSpanExpr(rpExpr geoindex.RPKeyExpr) (*SpanExpression, error) 
 			stack = stack[:len(stack)-2]
 			switch e {
 			case geoindex.RPSetIntersection:
-				node = &SpanExpression{
-					Operator: SetIntersection,
-					Left:     node0,
-					Right:    node1,
-				}
+				node = makeSpanExpression(SetIntersection, node0, node1)
 			case geoindex.RPSetUnion:
 				if node0.Operator == None {
 					node0, node1 = node1, node0
 				}
 				if node1.Operator == None {
+					// node1 can be discarded after unioning its FactoredUnionSpans.
 					node = node0
-					node.FactoredUnionSpans = append(node.FactoredUnionSpans, node1.FactoredUnionSpans...)
-				} else {
-					node = &SpanExpression{
-						Operator: SetUnion,
-						Left:     node0,
-						Right:    node1,
+					// Union into the one with the larger capacity. This optimizes
+					// the case of many unions. We will sort the spans later.
+					if cap(node.FactoredUnionSpans) < cap(node1.FactoredUnionSpans) {
+						node.FactoredUnionSpans = append(node1.FactoredUnionSpans, node.FactoredUnionSpans...)
+					} else {
+						node.FactoredUnionSpans = append(node.FactoredUnionSpans, node1.FactoredUnionSpans...)
 					}
+				} else {
+					node = makeSpanExpression(SetUnion, node0, node1)
 				}
 			}
 			stack = append(stack, node)
@@ -120,5 +131,19 @@ func GeoRPKeyExprToSpanExpr(rpExpr geoindex.RPKeyExpr) (*SpanExpression, error) 
 	}
 	spanExpr := *stack[0]
 	spanExpr.SpansToRead = spansToRead
+	sort.Sort(spanExpr.SpansToRead)
+	// Sort the FactoredUnionSpans of the root. The others are already sorted
+	// in makeSpanExpression.
+	sort.Sort(spanExpr.FactoredUnionSpans)
 	return &spanExpr, nil
+}
+
+func makeSpanExpression(op SetOperator, n0 *SpanExpression, n1 *SpanExpression) *SpanExpression {
+	sort.Sort(n0.FactoredUnionSpans)
+	sort.Sort(n1.FactoredUnionSpans)
+	return &SpanExpression{
+		Operator: op,
+		Left:     n0,
+		Right:    n1,
+	}
 }

@@ -67,9 +67,7 @@ type Factory struct {
 	mem *memo.Memo
 
 	// funcs is the struct used to call all custom match and replace functions
-	// used by the normalization rules. It wraps an unnamed xfunc.CustomFuncs,
-	// so it provides a clean interface for calling functions from both the norm
-	// and xfunc packages using the same prefix.
+	// used by the normalization rules.
 	funcs CustomFuncs
 
 	// matchedRule is the callback function that is invoked each time a normalize
@@ -292,42 +290,6 @@ func (f *Factory) onConstructRelational(rel memo.RelExpr) memo.RelExpr {
 // replacement code can be run.
 func (f *Factory) onConstructScalar(scalar opt.ScalarExpr) opt.ScalarExpr {
 	return scalar
-}
-
-// NormalizePartialIndexPredicate performs specific normalization functions to
-// normalize a partial index predicate. The goal is to mimic the normalizations
-// performed on filters with Selects as closely as possible. If a partial index
-// predicate and query filter are normalized differently, proving implication
-// can be difficult or impossible.
-func (f *Factory) NormalizePartialIndexPredicate(pred memo.FiltersExpr) memo.FiltersExpr {
-	// Run SimplifyFilters so that adjacent top-level AND expressions are
-	// flattened into individual FiltersItems, like they would be during
-	// normalization of a SELECT query. See the SimplifySelectFilters
-	// normalization rule.
-	//
-	// NOTE: We currently do not recursively simplify the filters like
-	// SimplifySelectFilters rule does. This could cause a false-negative when
-	// partialidx.Implicator tries to prove that a filter implies a partial
-	// index predicate. This trade-off avoids complexity until we find a
-	// real-world example that motivates the recursive normalization.
-	if !f.CustomFuncs().IsFilterFalse(pred) {
-		pred = f.CustomFuncs().SimplifyFilters(pred)
-	}
-
-	// Run ConsolidateFilters so that adjacent top-level FiltersItems that
-	// constrain a single variable are combined into a RangeExpr. See the
-	// ConsolidateSelectFilters normalization rule.
-	if f.CustomFuncs().CanConsolidateFilters(pred) {
-		pred = f.CustomFuncs().ConsolidateFilters(pred)
-	}
-
-	// Run InlineConstVar so that constant variables are inlined. See the
-	// InlineConstVar normalization rule.
-	if f.CustomFuncs().CanInlineConstVar(pred) {
-		pred = f.CustomFuncs().InlineConstVar(pred)
-	}
-
-	return pred
 }
 
 // ----------------------------------------------------------------------

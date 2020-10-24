@@ -23,8 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slstorage"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
@@ -96,14 +96,14 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 	newRegistry := func(id roachpb.NodeID) *jobs.Registry {
 		var c base.NodeIDContainer
 		c.Set(ctx, id)
-		idContainer := base.NewSQLIDContainer(0, &c, true /* exposed */)
+		idContainer := base.NewSQLIDContainer(0, &c)
 		ac := log.AmbientContext{Tracer: tracing.NewTracer()}
 		sqlStorage := slstorage.NewStorage(
 			s.Stopper(), clock, db, s.InternalExecutor().(sqlutil.InternalExecutor), s.ClusterSettings(),
 		)
 		sqlInstance := slinstance.NewSQLInstance(s.Stopper(), clock, sqlStorage, s.ClusterSettings())
 		r := jobs.MakeRegistry(
-			ac, s.Stopper(), clock, sqlbase.MakeOptionalNodeLiveness(nodeLiveness), db,
+			ac, s.Stopper(), clock, optionalnodeliveness.MakeContainer(nodeLiveness), db,
 			s.InternalExecutor().(sqlutil.InternalExecutor), idContainer, sqlInstance,
 			s.ClusterSettings(), base.DefaultHistogramWindowInterval(), jobs.FakePHS, "",
 		)
@@ -255,10 +255,7 @@ func TestRegistryResumeActiveLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer func(oldInterval time.Duration) {
-		jobs.DefaultAdoptInterval = oldInterval
-	}(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 100 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(10*time.Millisecond, 10*time.Millisecond)()
 
 	resumeCh := make(chan int64)
 	defer jobs.ResetConstructors()()

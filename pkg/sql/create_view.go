@@ -15,15 +15,19 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -40,8 +44,8 @@ type createViewNode struct {
 	replace      bool
 	persistence  tree.Persistence
 	materialized bool
-	dbDesc       *sqlbase.ImmutableDatabaseDescriptor
-	columns      sqlbase.ResultColumns
+	dbDesc       *dbdesc.Immutable
+	columns      colinfo.ResultColumns
 
 	// planDeps tracks which tables and views the view being created
 	// depends on. This is collected during the construction of
@@ -55,23 +59,39 @@ type createViewNode struct {
 func (n *createViewNode) ReadingOwnWrites() {}
 
 func (n *createViewNode) startExec(params runParams) error {
-	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("view"))
+	if n.replace {
+		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("or_replace_view"))
+	} else {
+		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("view"))
+	}
 
 	viewName := n.viewName.Object()
 	persistence := n.persistence
 	log.VEventf(params.ctx, 2, "dependencies for view %s:\n%s", viewName, n.planDeps.String())
 
+	// Check that the view does not contain references to other databases.
+	if !allowCrossDatabaseViews.Get(&params.p.execCfg.Settings.SV) {
+		for _, dep := range n.planDeps {
+			if dbID := dep.desc.ParentID; dbID != n.dbDesc.ID && dbID != keys.SystemDatabaseID {
+				return pgerror.Newf(pgcode.FeatureNotSupported,
+					"the view cannot refer to other databases; (see the '%s' cluster setting)",
+					allowCrossDatabaseViewsSetting,
+				)
+			}
+		}
+	}
+
 	// First check the backrefs and see if any of them are temporary.
 	// If so, promote this view to temporary.
-	backRefMutables := make(map[descpb.ID]*sqlbase.MutableTableDescriptor, len(n.planDeps))
+	backRefMutables := make(map[descpb.ID]*tabledesc.Mutable, len(n.planDeps))
 	for id, updated := range n.planDeps {
 		backRefMutable := params.p.Descriptors().GetUncommittedTableByID(id)
 		if backRefMutable == nil {
-			backRefMutable = sqlbase.NewMutableExistingTableDescriptor(*updated.desc.TableDesc())
+			backRefMutable = tabledesc.NewExistingMutable(*updated.desc.TableDesc())
 		}
 		if !persistence.IsTemporary() && backRefMutable.Temporary {
 			// This notice is sent from pg, let's imitate.
-			params.p.SendClientNotice(
+			params.p.BufferClientNotice(
 				params.ctx,
 				pgnotice.Newf(`view "%s" will be a temporary view`, viewName),
 			)
@@ -80,12 +100,12 @@ func (n *createViewNode) startExec(params runParams) error {
 		backRefMutables[id] = backRefMutable
 	}
 
-	var replacingDesc *sqlbase.MutableTableDescriptor
+	var replacingDesc *tabledesc.Mutable
 
 	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), persistence, n.viewName)
 	if err != nil {
 		switch {
-		case !sqlbase.IsRelationAlreadyExistsError(err):
+		case !sqlerrors.IsRelationAlreadyExistsError(err):
 			return err
 		case n.ifNotExists:
 			return nil
@@ -116,9 +136,9 @@ func (n *createViewNode) startExec(params runParams) error {
 		telemetry.Inc(sqltelemetry.CreateTempViewCounter)
 	}
 
-	privs := createInheritedPrivilegesFromDBDesc(n.dbDesc, params.SessionData().User)
+	privs := CreateInheritedPrivilegesFromDBDesc(n.dbDesc, params.SessionData().User)
 
-	var newDesc *sqlbase.MutableTableDescriptor
+	var newDesc *tabledesc.Mutable
 
 	// If replacingDesc != nil, we found an existing view while resolving
 	// the name for our view. So instead of creating a new view, replace
@@ -171,9 +191,9 @@ func (n *createViewNode) startExec(params runParams) error {
 			//   the view query
 			// * use AllocateIDs to give the view descriptor a primary key
 			desc.IsMaterializedView = true
-			desc.State = descpb.TableDescriptor_ADD
+			desc.State = descpb.DescriptorState_ADD
 			desc.CreateAsOfTime = params.p.Txn().ReadTimestamp()
-			if err := desc.AllocateIDs(); err != nil {
+			if err := desc.AllocateIDs(params.ctx); err != nil {
 				return err
 			}
 		}
@@ -230,7 +250,8 @@ func (n *createViewNode) startExec(params runParams) error {
 		return err
 	}
 
-	if err := newDesc.Validate(params.ctx, params.p.txn, params.ExecCfg().Codec); err != nil {
+	dg := catalogkv.NewOneLevelUncachedDescGetter(params.p.txn, params.ExecCfg().Codec)
+	if err := newDesc.Validate(params.ctx, dg); err != nil {
 		return err
 	}
 
@@ -272,14 +293,14 @@ func makeViewTableDesc(
 	parentID descpb.ID,
 	schemaID descpb.ID,
 	id descpb.ID,
-	resultColumns []sqlbase.ResultColumn,
+	resultColumns []colinfo.ResultColumn,
 	creationTime hlc.Timestamp,
 	privileges *descpb.PrivilegeDescriptor,
 	semaCtx *tree.SemaContext,
 	evalCtx *tree.EvalContext,
 	persistence tree.Persistence,
-) (sqlbase.MutableTableDescriptor, error) {
-	desc := sqlbase.InitTableDescriptor(
+) (tabledesc.Mutable, error) {
+	desc := tabledesc.InitTableDescriptor(
 		id,
 		parentID,
 		schemaID,
@@ -290,7 +311,7 @@ func makeViewTableDesc(
 	)
 	desc.ViewQuery = viewQuery
 	if err := addResultColumns(ctx, semaCtx, evalCtx, &desc, resultColumns); err != nil {
-		return sqlbase.MutableTableDescriptor{}, err
+		return tabledesc.Mutable{}, err
 	}
 
 	return desc, nil
@@ -304,9 +325,9 @@ func makeViewTableDesc(
 func (p *planner) replaceViewDesc(
 	ctx context.Context,
 	n *createViewNode,
-	toReplace *sqlbase.MutableTableDescriptor,
-	backRefMutables map[descpb.ID]*sqlbase.MutableTableDescriptor,
-) (*sqlbase.MutableTableDescriptor, error) {
+	toReplace *tabledesc.Mutable,
+	backRefMutables map[descpb.ID]*tabledesc.Mutable,
+) (*tabledesc.Mutable, error) {
 	// Set the query to the new query.
 	toReplace.ViewQuery = n.viewQuery
 	// Reset the columns to add the new result columns onto.
@@ -377,20 +398,20 @@ func addResultColumns(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
 	evalCtx *tree.EvalContext,
-	desc *sqlbase.MutableTableDescriptor,
-	resultColumns sqlbase.ResultColumns,
+	desc *tabledesc.Mutable,
+	resultColumns colinfo.ResultColumns,
 ) error {
 	for _, colRes := range resultColumns {
 		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colRes.Typ}
 		// The new types in the CREATE VIEW column specs never use
 		// SERIAL so we need not process SERIAL types here.
-		col, _, _, err := sqlbase.MakeColumnDefDescs(ctx, &columnTableDef, semaCtx, evalCtx)
+		col, _, _, err := tabledesc.MakeColumnDefDescs(ctx, &columnTableDef, semaCtx, evalCtx)
 		if err != nil {
 			return err
 		}
 		desc.AddColumn(col)
 	}
-	if err := desc.AllocateIDs(); err != nil {
+	if err := desc.AllocateIDs(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -440,8 +461,8 @@ func verifyReplacingViewColumns(oldColumns, newColumns []descpb.ColumnDescriptor
 	return nil
 }
 
-func overrideColumnNames(cols sqlbase.ResultColumns, newNames tree.NameList) sqlbase.ResultColumns {
-	res := append(sqlbase.ResultColumns(nil), cols...)
+func overrideColumnNames(cols colinfo.ResultColumns, newNames tree.NameList) colinfo.ResultColumns {
+	res := append(colinfo.ResultColumns(nil), cols...)
 	for i := range res {
 		res[i].Name = string(newNames[i])
 	}

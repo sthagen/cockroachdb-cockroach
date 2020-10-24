@@ -16,15 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
-
-func ResetConstructors() func() {
-	old := make(map[jobspb.Type]Constructor)
-	for k, v := range constructors {
-		old[k] = v
-	}
-	return func() { constructors = old }
-}
 
 // FakeResumer calls optional callbacks during the job lifecycle.
 type FakeResumer struct {
@@ -77,10 +70,12 @@ func (j *Job) Started(ctx context.Context) error {
 	return j.started(ctx)
 }
 
-// Created is a wrapper around the internal function that creates the initial
-// job state.
+// Created is a test only function that inserts a new jobs table row.
 func (j *Job) Created(ctx context.Context) error {
-	return j.created(ctx)
+	if j.ID() != nil {
+		return errors.Errorf("job already created with ID %v", *j.ID())
+	}
+	return j.deprecatedInsert(ctx, j.registry.makeJobID(), nil /* lease */, nil /* session */)
 }
 
 // Paused is a wrapper around the internal function that moves a job to the

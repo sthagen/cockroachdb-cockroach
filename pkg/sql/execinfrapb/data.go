@@ -15,18 +15,18 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
 
 // ConvertToColumnOrdering converts an Ordering type (as defined in data.proto)
 // to a sqlbase.ColumnOrdering type.
-func ConvertToColumnOrdering(specOrdering Ordering) sqlbase.ColumnOrdering {
-	ordering := make(sqlbase.ColumnOrdering, len(specOrdering.Columns))
+func ConvertToColumnOrdering(specOrdering Ordering) colinfo.ColumnOrdering {
+	ordering := make(colinfo.ColumnOrdering, len(specOrdering.Columns))
 	for i, c := range specOrdering.Columns {
 		ordering[i].ColIdx = int(c.ColIdx)
 		if c.Direction == Ordering_Column_ASC {
@@ -40,7 +40,7 @@ func ConvertToColumnOrdering(specOrdering Ordering) sqlbase.ColumnOrdering {
 
 // ConvertToSpecOrdering converts a sqlbase.ColumnOrdering type
 // to an Ordering type (as defined in data.proto).
-func ConvertToSpecOrdering(columnOrdering sqlbase.ColumnOrdering) Ordering {
+func ConvertToSpecOrdering(columnOrdering colinfo.ColumnOrdering) Ordering {
 	return ConvertToMappedSpecOrdering(columnOrdering, nil)
 }
 
@@ -48,7 +48,7 @@ func ConvertToSpecOrdering(columnOrdering sqlbase.ColumnOrdering) Ordering {
 // to an Ordering type (as defined in data.proto), using the column
 // indices contained in planToStreamColMap.
 func ConvertToMappedSpecOrdering(
-	columnOrdering sqlbase.ColumnOrdering, planToStreamColMap []int,
+	columnOrdering colinfo.ColumnOrdering, planToStreamColMap []int,
 ) Ordering {
 	specOrdering := Ordering{}
 	specOrdering.Columns = make([]Ordering_Column, len(columnOrdering))
@@ -179,7 +179,7 @@ type ProducerMetadata struct {
 	// TODO(vivek): change to type Error
 	Err error
 	// TraceData is sent if snowball tracing is enabled.
-	TraceData []tracing.RecordedSpan
+	TraceData []tracingpb.RecordedSpan
 	// LeafTxnFinalState contains the final state of the LeafTxn to be
 	// sent from leaf flows to the RootTxn held by the flow's ultimate
 	// receiver.

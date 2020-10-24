@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -96,24 +95,6 @@ func (c *CustomFuncs) SimplifyCoalesce(args memo.ScalarListExpr) opt.ScalarExpr 
 	// All operands up to the last were null (or the last is the only operand),
 	// so return the last operand without the wrapping COALESCE function.
 	return args[len(args)-1]
-}
-
-// IsJSONScalar returns if the JSON value is a number, string, true, false, or null.
-func (c *CustomFuncs) IsJSONScalar(value opt.ScalarExpr) bool {
-	v := value.(*memo.ConstExpr).Value.(*tree.DJSON)
-	return v.JSON.Type() != json.ObjectJSONType && v.JSON.Type() != json.ArrayJSONType
-}
-
-// MakeSingleKeyJSONObject returns a JSON object with one entry, mapping key to value.
-func (c *CustomFuncs) MakeSingleKeyJSONObject(key, value opt.ScalarExpr) opt.ScalarExpr {
-	k := key.(*memo.ConstExpr).Value.(*tree.DString)
-	v := value.(*memo.ConstExpr).Value.(*tree.DJSON)
-
-	builder := json.NewObjectBuilder(1)
-	builder.Add(string(*k), v.JSON)
-	j := builder.Build()
-
-	return c.f.ConstructConst(&tree.DJSON{JSON: j}, types.Jsonb)
 }
 
 // IsConstValueEqual returns whether const1 and const2 are equal.
@@ -307,8 +288,7 @@ func (c *CustomFuncs) InlineValues(v memo.RelExpr) *memo.TupleExpr {
 
 // IsTupleOfVars returns true if the given tuple contains Variables
 // corresponding to the given columns (in the same order).
-func (c *CustomFuncs) IsTupleOfVars(tuple opt.ScalarExpr, cols opt.ColList) bool {
-	t := tuple.(*memo.TupleExpr)
+func (c *CustomFuncs) IsTupleOfVars(t *memo.TupleExpr, cols opt.ColList) bool {
 	if len(t.Elems) != len(cols) {
 		return false
 	}
@@ -322,8 +302,6 @@ func (c *CustomFuncs) IsTupleOfVars(tuple opt.ScalarExpr, cols opt.ColList) bool
 }
 
 // VarsAreSame returns true if the two variables are the same.
-func (c *CustomFuncs) VarsAreSame(left, right opt.ScalarExpr) bool {
-	lv := left.(*memo.VariableExpr)
-	rv := right.(*memo.VariableExpr)
-	return lv.Col == rv.Col
+func (c *CustomFuncs) VarsAreSame(left, right *memo.VariableExpr) bool {
+	return left.Col == right.Col
 }

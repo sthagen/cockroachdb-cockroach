@@ -102,6 +102,21 @@ SELECT upper('roacH7')
 upper
 ROACH7
 
+query T
+SELECT unaccent(str) FROM ( VALUES 
+   ('no_special_CHARACTERS1!'),
+   ('Żółć'),
+   ('⃞h̀ＥＬＬＯ`̀́⃞'),
+   ('Softhyphen­separator'),
+   ('some ̂thing')
+) tbl(str)
+----
+no_special_CHARACTERS1!
+Zolc
+hELLO`
+Softhyphen-separator
+something
+
 statement error unknown signature: upper\(decimal\)
 SELECT upper(2.2)
 
@@ -393,9 +408,19 @@ SELECT sha1('abc')
 a9993e364706816aba3e25717850c26c9cd0d89d
 
 query T
+SELECT sha224('abc')
+----
+23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7
+
+query T
 SELECT sha256('abc')
 ----
 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+
+query T
+SELECT sha384('abc')
+----
+cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7
 
 query IIII
 SELECT fnv32('abc'), fnv32a('abc'), fnv64('abc'), fnv64a('abc')
@@ -429,7 +454,17 @@ SELECT sha1(NULL::STRING)
 NULL
 
 query T
+SELECT sha224(NULL::STRING)
+----
+NULL
+
+query T
 SELECT sha256(NULL::STRING)
+----
+NULL
+
+query T
+SELECT sha384(NULL::STRING)
 ----
 NULL
 
@@ -2064,12 +2099,32 @@ SELECT pg_catalog.pg_get_indexdef(0)
 NULL
 
 statement ok
-CREATE TABLE test.pg_indexdef_test (a INT, UNIQUE INDEX pg_indexdef_idx (a ASC), INDEX other (a DESC))
+CREATE TYPE testenum AS ENUM ('foo', 'bar', 'baz')
+
+statement ok
+CREATE TABLE test.pg_indexdef_test (
+    a INT,
+    e testenum,
+    UNIQUE INDEX pg_indexdef_idx (a ASC),
+    INDEX pg_indexdef_partial_idx (a) WHERE a > 0,
+    INDEX pg_indexdef_partial_enum_idx (a) WHERE e IN ('foo', 'bar'),
+    INDEX other (a DESC)
+)
 
 query T
 SELECT pg_catalog.pg_get_indexdef((SELECT oid from pg_class WHERE relname='pg_indexdef_idx'))
 ----
 CREATE UNIQUE INDEX pg_indexdef_idx ON test.public.pg_indexdef_test USING btree (a ASC)
+
+query T
+SELECT pg_catalog.pg_get_indexdef((SELECT oid from pg_class WHERE relname='pg_indexdef_partial_idx'))
+----
+CREATE INDEX pg_indexdef_partial_idx ON test.public.pg_indexdef_test USING btree (a ASC) WHERE (a > 0)
+
+query T
+SELECT pg_catalog.pg_get_indexdef((SELECT oid from pg_class WHERE relname='pg_indexdef_partial_enum_idx'))
+----
+CREATE INDEX pg_indexdef_partial_enum_idx ON test.public.pg_indexdef_test USING btree (a ASC) WHERE (e IN ('foo'::public.testenum, 'bar'::public.testenum))
 
 query T
 SELECT pg_catalog.pg_get_indexdef(0, 0, true)
@@ -2155,6 +2210,8 @@ CREATE TABLE test.pg_constraintdef_test (
   a int,
   b int unique,
   c int check (c > a),
+  d string,
+  UNIQUE INDEX (a) WHERE d = 'foo',
   FOREIGN KEY(a) REFERENCES test.pg_indexdef_test(a) ON DELETE CASCADE
 )
 
@@ -2164,6 +2221,7 @@ FROM pg_catalog.pg_constraint
 WHERE conrelid='pg_constraintdef_test'::regclass
 ----
 UNIQUE (b ASC)
+UNIQUE (a ASC) WHERE (d = 'foo'::STRING)
 FOREIGN KEY (a) REFERENCES pg_indexdef_test(a) ON DELETE CASCADE
 CHECK ((c > a))
 
@@ -2420,7 +2478,7 @@ SELECT width_bucket(now(), array['yesterday', 'today', 'tomorrow']::timestamptz[
 ----
 2
 
-query error pq: width_bucket\(\): Operand and thresholds must be of the same type
+query error pq: width_bucket\(\): operand and thresholds must be of the same type
 SELECT width_bucket(1, array['a', 'h', 'l', 'z']);
 
 # Regression for #40623
@@ -2543,12 +2601,12 @@ NULL
 query I
 SELECT crdb_internal.get_namespace_id(0, 'root_test')
 ----
-61
+63
 
 query I
 SELECT crdb_internal.get_namespace_id(crdb_internal.get_namespace_id(0, 'root_test'), 't')
 ----
-62
+64
 
 query T
 SELECT crdb_internal.get_zone_config(-1)::string
@@ -2598,12 +2656,12 @@ user testuser
 query I
 SELECT crdb_internal.get_namespace_id(0, 'root_test')
 ----
-61
+63
 
 query I
 SELECT crdb_internal.get_namespace_id(crdb_internal.get_namespace_id(0, 'root_test'), 't')
 ----
-62
+64
 
 query T
 SELECT crdb_internal.get_zone_config(crdb_internal.get_namespace_id(0, 'root_test'))::string

@@ -18,9 +18,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
@@ -34,15 +35,15 @@ var (
 
 	// ColumnFamilyMutator modifies a CREATE TABLE statement without any FAMILY
 	// definitions to have random FAMILY definitions.
-	ColumnFamilyMutator StatementMutator = sqlbase.ColumnFamilyMutator
+	ColumnFamilyMutator StatementMutator = rowenc.ColumnFamilyMutator
 
 	// IndexStoringMutator modifies the STORING clause of CREATE INDEX and
 	// indexes in CREATE TABLE.
-	IndexStoringMutator MultiStatementMutation = sqlbase.IndexStoringMutator
+	IndexStoringMutator MultiStatementMutation = rowenc.IndexStoringMutator
 
 	// PartialIndexMutator adds random partial index predicate expressions to
 	// indexes.
-	PartialIndexMutator MultiStatementMutation = sqlbase.PartialIndexMutator
+	PartialIndexMutator MultiStatementMutation = rowenc.PartialIndexMutator
 
 	// PostgresMutator modifies strings such that they execute identically
 	// in both Postgres and Cockroach (however this mutator does not remove
@@ -92,7 +93,7 @@ func (msm MultiStatementMutation) Mutate(
 // changed in place) statements and a boolean indicating whether any changes
 // were made.
 func Apply(
-	rng *rand.Rand, stmts []tree.Statement, mutators ...sqlbase.Mutator,
+	rng *rand.Rand, stmts []tree.Statement, mutators ...rowenc.Mutator,
 ) (mutated []tree.Statement, changed bool) {
 	var mc bool
 	for _, m := range mutators {
@@ -128,7 +129,7 @@ func (sm StatementStringMutator) MutateString(
 // ApplyString executes all mutators on input. A mutator can also be a
 // StringMutator which will operate after all other mutators.
 func ApplyString(
-	rng *rand.Rand, input string, mutators ...sqlbase.Mutator,
+	rng *rand.Rand, input string, mutators ...rowenc.Mutator,
 ) (output string, changed bool) {
 	parsed, err := parser.Parse(input)
 	if err != nil {
@@ -140,7 +141,7 @@ func ApplyString(
 		stmts[i] = p.AST
 	}
 
-	var normalMutators []sqlbase.Mutator
+	var normalMutators []rowenc.Mutator
 	var stringMutators []StringMutator
 	for _, m := range mutators {
 		if sm, ok := m.(StringMutator); ok {
@@ -212,11 +213,11 @@ func statisticsMutator(
 				ColumnType: colType,
 			}
 			for i := 0; i < n; i++ {
-				upper := sqlbase.RandDatumWithNullChance(rng, colType, 0)
+				upper := rowenc.RandDatumWithNullChance(rng, colType, 0)
 				if upper == tree.DNull {
 					continue
 				}
-				enc, err := sqlbase.EncodeTableKey(nil, upper, encoding.Ascending)
+				enc, err := rowenc.EncodeTableKey(nil, upper, encoding.Ascending)
 				if err != nil {
 					panic(err)
 				}
@@ -277,13 +278,15 @@ func statisticsMutator(
 					DistinctCount: distinctCount,
 					NullCount:     nullCount,
 				}
-				if def.Unique || def.PrimaryKey.IsPrimaryKey {
+				if (def.Unique.IsUnique && !def.Unique.WithoutIndex) || def.PrimaryKey.IsPrimaryKey {
 					makeHistogram(def)
 				}
 			case *tree.IndexTableDef:
 				makeHistogram(cols[def.Columns[0].Column])
 			case *tree.UniqueConstraintTableDef:
-				makeHistogram(cols[def.Columns[0].Column])
+				if !def.WithoutIndex {
+					makeHistogram(cols[def.Columns[0].Column])
+				}
 			}
 		}
 		if len(colStats) > 0 {
@@ -428,7 +431,7 @@ func foreignKeyMutator(
 				for refI, refCol := range availCols {
 					fkColType := tree.MustBeStaticallyKnownType(fkCol.Type)
 					refColType := tree.MustBeStaticallyKnownType(refCol.Type)
-					if fkColType.Equivalent(refColType) && sqlbase.ColumnTypeIsIndexable(refColType) {
+					if fkColType.Equivalent(refColType) && colinfo.ColumnTypeIsIndexable(refColType) {
 						usingCols = append(usingCols, refCol)
 						availCols = append(availCols[:refI], availCols[refI+1:]...)
 						found = true
@@ -568,6 +571,10 @@ var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts
 						def.Family.Create = false
 						changed = true
 					}
+					if def.Unique.WithoutIndex {
+						def.Unique.WithoutIndex = false
+						changed = true
+					}
 				case *tree.UniqueConstraintTableDef:
 					if def.Interleave != nil {
 						def.Interleave = nil
@@ -575,6 +582,10 @@ var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts
 					}
 					if def.PartitionBy != nil {
 						def.PartitionBy = nil
+						changed = true
+					}
+					if def.WithoutIndex {
+						def.WithoutIndex = false
 						changed = true
 					}
 				}

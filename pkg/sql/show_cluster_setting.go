@@ -22,8 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -52,7 +53,7 @@ func (p *planner) showStateMachineSetting(
 					datums, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
 						ctx, "read-setting",
 						txn,
-						sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+						sessiondata.InternalExecutorOverride{User: security.RootUser},
 						"SELECT value FROM system.settings WHERE name = $1", name,
 					)
 					if err != nil {
@@ -97,16 +98,15 @@ func (p *planner) showStateMachineSetting(
 func (p *planner) ShowClusterSetting(
 	ctx context.Context, n *tree.ShowClusterSetting,
 ) (planNode, error) {
-
-	if err := p.RequireAdminRole(ctx, "SHOW CLUSTER SETTING"); err != nil {
-		return nil, err
-	}
-
 	name := strings.ToLower(n.Name)
 	st := p.ExecCfg().Settings
 	val, ok := settings.Lookup(name, settings.LookupForLocalAccess)
 	if !ok {
 		return nil, errors.Errorf("unknown setting: %q", name)
+	}
+
+	if err := checkPrivilegesForSetting(ctx, p, name, "show"); err != nil {
+		return nil, err
 	}
 
 	var dType *types.T
@@ -127,7 +127,7 @@ func (p *planner) ShowClusterSetting(
 		return nil, errors.Errorf("unknown setting type for %s: %s", name, val.Typ())
 	}
 
-	columns := sqlbase.ResultColumns{{Name: name, Typ: dType}}
+	columns := colinfo.ResultColumns{{Name: name, Typ: dType}}
 	return &delayedNode{
 		name:    "SHOW CLUSTER SETTING " + name,
 		columns: columns,

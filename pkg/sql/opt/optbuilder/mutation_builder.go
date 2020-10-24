@@ -15,15 +15,16 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -127,6 +128,10 @@ type mutationBuilder struct {
 	// an insert; otherwise it's an update.
 	canaryColID opt.ColumnID
 
+	// arbiters stores the ordinals of indexes that are used to detect conflicts
+	// for UPSERT and INSERT ON CONFLICT statements.
+	arbiters cat.IndexOrdinals
+
 	// roundedDecimalCols is the set of columns that have already been rounded.
 	// Keeping this set avoids rounding the same column multiple times.
 	roundedDecimalCols opt.ColSet
@@ -136,9 +141,14 @@ type mutationBuilder struct {
 	// are joined into larger LEFT OUTER JOIN expressions.
 	subqueries []*scope
 
-	// parsedExprs is a cached set of parsed default and computed expressions
+	// parsedColExprs is a cached set of parsed default and computed expressions
 	// from the table schema. These are parsed once and cached for reuse.
-	parsedExprs []tree.Expr
+	parsedColExprs []tree.Expr
+
+	// parsedIndexExprs is a cached set of parsed partial index predicate
+	// expressions from the table schema. These are parsed once and cached for
+	// reuse.
+	parsedIndexExprs []tree.Expr
 
 	// checks contains foreign key check queries; see buildFK* methods.
 	checks memo.FKChecksExpr
@@ -244,9 +254,10 @@ func (mb *mutationBuilder) buildInputForUpdate(
 	scanScope := mb.b.buildScan(
 		mb.b.addTable(mb.tab, &mb.alias),
 		tableOrdinals(mb.tab, columnKinds{
-			includeMutations: true,
-			includeSystem:    true,
-			includeVirtual:   false,
+			includeMutations:       true,
+			includeSystem:          true,
+			includeVirtualInverted: false,
+			includeVirtualComputed: false,
 		}),
 		indexFlags,
 		noRowLocking,
@@ -305,12 +316,10 @@ func (mb *mutationBuilder) buildInputForUpdate(
 		// key columns.
 		primaryIndex := mb.tab.Index(cat.PrimaryIndex)
 		for i := 0; i < primaryIndex.KeyColumnCount(); i++ {
-			pkCol := mb.outScope.cols[primaryIndex.Column(i).Ordinal]
-
 			// If the primary key column is hidden, then we don't need to use it
 			// for the distinct on.
-			if !pkCol.hidden {
-				pkCols.Add(pkCol.id)
+			if col := primaryIndex.Column(i); !col.IsHidden() {
+				pkCols.Add(mb.fetchColIDs[col.Ordinal()])
 			}
 		}
 
@@ -356,9 +365,10 @@ func (mb *mutationBuilder) buildInputForDelete(
 	scanScope := mb.b.buildScan(
 		mb.b.addTable(mb.tab, &mb.alias),
 		tableOrdinals(mb.tab, columnKinds{
-			includeMutations: true,
-			includeSystem:    true,
-			includeVirtual:   false,
+			includeMutations:       true,
+			includeSystem:          true,
+			includeVirtualInverted: false,
+			includeVirtualComputed: false,
 		}),
 		indexFlags,
 		noRowLocking,
@@ -398,13 +408,13 @@ func (mb *mutationBuilder) addTargetColsByName(names tree.NameList) {
 		// add it as a target column.
 		if ord := findPublicTableColumnByName(mb.tab, name); ord != -1 {
 			// System columns are invalid target columns.
-			if cat.IsSystemColumn(mb.tab, ord) {
+			if mb.tab.Column(ord).Kind() == cat.System {
 				panic(pgerror.Newf(pgcode.InvalidColumnReference, "cannot modify system column %q", name))
 			}
 			mb.addTargetCol(ord)
 			continue
 		}
-		panic(sqlbase.NewUndefinedColumnError(string(name)))
+		panic(colinfo.NewUndefinedColumnError(string(name)))
 	}
 }
 
@@ -415,13 +425,13 @@ func (mb *mutationBuilder) addTargetCol(ord int) {
 	tabCol := mb.tab.Column(ord)
 
 	// Don't allow targeting of mutation columns.
-	if cat.IsMutationColumn(mb.tab, ord) {
+	if tabCol.IsMutation() {
 		panic(makeBackfillError(tabCol.ColName()))
 	}
 
 	// Computed columns cannot be targeted with input values.
 	if tabCol.IsComputed() {
-		panic(sqlbase.CannotWriteToComputedColError(string(tabCol.ColName())))
+		panic(schemaexpr.CannotWriteToComputedColError(string(tabCol.ColName())))
 	}
 
 	// Ensure that the name list does not contain duplicates.
@@ -547,14 +557,15 @@ func (mb *mutationBuilder) addSynthesizedCols(colIDs opt.ColList, addCol func(co
 	var projectionsScope *scope
 
 	for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
-		kind := mb.tab.ColumnKind(i)
+		tabCol := mb.tab.Column(i)
+		kind := tabCol.Kind()
 		// Skip delete-only mutation columns, since they are ignored by all
 		// mutation operators that synthesize columns.
 		if kind == cat.DeleteOnly {
 			continue
 		}
 		// Skip system and virtual columns.
-		if kind == cat.System || kind == cat.Virtual {
+		if kind == cat.System || kind.IsVirtual() {
 			continue
 		}
 		// Skip columns that are already specified.
@@ -574,7 +585,6 @@ func (mb *mutationBuilder) addSynthesizedCols(colIDs opt.ColList, addCol func(co
 			projectionsScope.appendColumnsFromScope(mb.outScope)
 		}
 		tabColID := mb.tabID.ColumnID(i)
-		tabCol := mb.tab.Column(i)
 		expr := mb.parseDefaultOrComputedExpr(tabColID)
 		texpr := mb.outScope.resolveAndRequireType(expr, tabCol.DatumType())
 		scopeCol := mb.b.addColumn(projectionsScope, "" /* alias */, texpr)
@@ -644,7 +654,17 @@ func (mb *mutationBuilder) roundDecimalValues(colIDs opt.ColList, roundComputedC
 
 		// Check whether the target column's type may require rounding of the
 		// input value.
-		props, overload := findRoundingFunction(col.DatumType(), col.ColTypePrecision())
+		colType := col.DatumType()
+		precision, width := colType.Precision(), colType.Width()
+		if colType.Family() == types.ArrayFamily {
+			innerType := colType.ArrayContents()
+			if innerType.Family() == types.ArrayFamily {
+				panic(errors.AssertionFailedf("column type should never be a nested array"))
+			}
+			precision, width = innerType.Precision(), innerType.Width()
+		}
+
+		props, overload := findRoundingFunction(colType, precision)
 		if props == nil {
 			continue
 		}
@@ -661,7 +681,7 @@ func (mb *mutationBuilder) roundDecimalValues(colIDs opt.ColList, roundComputedC
 			Overload:   overload,
 		}
 		variable := mb.b.factory.ConstructVariable(id)
-		scale := mb.b.factory.ConstructConstVal(tree.NewDInt(tree.DInt(col.ColTypeWidth())), types.Int)
+		scale := mb.b.factory.ConstructConstVal(tree.NewDInt(tree.DInt(width)), types.Int)
 		fn := mb.b.factory.ConstructFunction(memo.ScalarListExpr{variable, scale}, private)
 
 		// Lazily create new scope and update the scope column to be rounded.
@@ -695,7 +715,9 @@ func (mb *mutationBuilder) roundDecimalValues(colIDs opt.ColList, roundComputedC
 //
 // NOTE: CRDB does not allow nested array storage types, so only one level of
 // array nesting needs to be checked.
-func findRoundingFunction(typ *types.T, precision int) (*tree.FunctionProperties, *tree.Overload) {
+func findRoundingFunction(
+	typ *types.T, precision int32,
+) (*tree.FunctionProperties, *tree.Overload) {
 	if precision == 0 {
 		// Unlimited precision decimal target type never needs rounding.
 		return nil, nil
@@ -751,7 +773,7 @@ func (mb *mutationBuilder) addCheckConstraintCols() {
 // predScope is the scope of columns available to the partial index predicate
 // expression.
 func (mb *mutationBuilder) projectPartialIndexPutCols(predScope *scope) {
-	mb.projectPartialIndexCols(mb.partialIndexPutColIDs, predScope)
+	mb.projectPartialIndexCols(mb.partialIndexPutColIDs, predScope, "partial_index_put")
 }
 
 // projectPartialIndexPutCols builds a Project that synthesizes boolean output
@@ -762,12 +784,14 @@ func (mb *mutationBuilder) projectPartialIndexPutCols(predScope *scope) {
 // predScope is the scope of columns available to the partial index predicate
 // expression.
 func (mb *mutationBuilder) projectPartialIndexDelCols(predScope *scope) {
-	mb.projectPartialIndexCols(mb.partialIndexDelColIDs, predScope)
+	mb.projectPartialIndexCols(mb.partialIndexDelColIDs, predScope, "partial_index_del")
 }
 
 // projectPartialIndexCols builds a Project that synthesizes boolean output
 // columns for each partial index defined on the target table.
-func (mb *mutationBuilder) projectPartialIndexCols(colIDs opt.ColList, predScope *scope) {
+func (mb *mutationBuilder) projectPartialIndexCols(
+	colIDs opt.ColList, predScope *scope, aliasPrefix string,
+) {
 	if partialIndexCount(mb.tab) > 0 {
 		projectionScope := mb.outScope.replace()
 		projectionScope.appendColumnsFromScope(mb.outScope)
@@ -775,18 +799,14 @@ func (mb *mutationBuilder) projectPartialIndexCols(colIDs opt.ColList, predScope
 		ord := 0
 		for i, n := 0, mb.tab.DeletableIndexCount(); i < n; i++ {
 			index := mb.tab.Index(i)
-			predicate, ok := index.Predicate()
-			if !ok {
+			if _, isPartial := index.Predicate(); !isPartial {
 				continue
 			}
 
-			expr, err := parser.ParseExpr(predicate)
-			if err != nil {
-				panic(err)
-			}
-
+			expr := mb.parsePartialIndexPredicateExpr(i)
 			texpr := predScope.resolveAndRequireType(expr, types.Bool)
-			scopeCol := mb.b.addColumn(projectionScope, "", texpr)
+			alias := fmt.Sprintf("%s%d", aliasPrefix, ord+1)
+			scopeCol := mb.b.addColumn(projectionScope, alias, texpr)
 
 			mb.b.buildScalar(texpr, predScope, projectionScope, scopeCol, nil)
 			colIDs[ord] = scopeCol.id
@@ -840,6 +860,7 @@ func (mb *mutationBuilder) makeMutationPrivate(needResults bool) *memo.MutationP
 		FetchCols:           checkEmptyList(mb.fetchColIDs),
 		UpdateCols:          checkEmptyList(mb.updateColIDs),
 		CanaryCol:           mb.canaryColID,
+		Arbiters:            mb.arbiters,
 		CheckCols:           checkEmptyList(mb.checkColIDs),
 		PartialIndexPutCols: checkEmptyList(mb.partialIndexPutColIDs),
 		PartialIndexDelCols: checkEmptyList(mb.partialIndexDelColIDs),
@@ -854,7 +875,7 @@ func (mb *mutationBuilder) makeMutationPrivate(needResults bool) *memo.MutationP
 	if needResults {
 		private.ReturnCols = make(opt.ColList, mb.tab.ColumnCount())
 		for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
-			if mb.tab.ColumnKind(i) != cat.Ordinary {
+			if mb.tab.Column(i).Kind() != cat.Ordinary {
 				// Only non-mutation and non-system columns are output columns.
 				continue
 			}
@@ -962,14 +983,14 @@ func (mb *mutationBuilder) checkNumCols(expected, actual int) {
 // computed value expression for the given table column, and caches it for
 // reuse.
 func (mb *mutationBuilder) parseDefaultOrComputedExpr(colID opt.ColumnID) tree.Expr {
-	if mb.parsedExprs == nil {
-		mb.parsedExprs = make([]tree.Expr, mb.tab.ColumnCount())
+	if mb.parsedColExprs == nil {
+		mb.parsedColExprs = make([]tree.Expr, mb.tab.ColumnCount())
 	}
 
 	// Return expression from cache, if it was already parsed previously.
 	ord := mb.tabID.ColumnOrdinal(colID)
-	if mb.parsedExprs[ord] != nil {
-		return mb.parsedExprs[ord]
+	if mb.parsedColExprs[ord] != nil {
+		return mb.parsedColExprs[ord]
 	}
 
 	var exprStr string
@@ -979,19 +1000,16 @@ func (mb *mutationBuilder) parseDefaultOrComputedExpr(colID opt.ColumnID) tree.E
 		exprStr = tabCol.ComputedExprStr()
 	case tabCol.HasDefault():
 		exprStr = tabCol.DefaultExprStr()
-	case tabCol.IsNullable():
-		return tree.DNull
-	default:
+	case tabCol.IsMutation() && !tabCol.IsNullable():
 		// Synthesize default value for NOT NULL mutation column so that it can be
 		// set when in the write-only state. This is only used when no other value
 		// is possible (no default value available, NULL not allowed).
-		if cat.IsMutationColumn(mb.tab, ord) {
-			datum, err := tree.NewDefaultDatum(mb.b.evalCtx, tabCol.DatumType())
-			if err != nil {
-				panic(err)
-			}
-			return datum
+		datum, err := tree.NewDefaultDatum(mb.b.evalCtx, tabCol.DatumType())
+		if err != nil {
+			panic(err)
 		}
+		return datum
+	default:
 		return tree.DNull
 	}
 
@@ -1000,7 +1018,36 @@ func (mb *mutationBuilder) parseDefaultOrComputedExpr(colID opt.ColumnID) tree.E
 		panic(err)
 	}
 
-	mb.parsedExprs[ord] = expr
+	mb.parsedColExprs[ord] = expr
+	return expr
+}
+
+// parsePartialIndexPredicateExpr parses the partial index predicate for the
+// given index and caches it for reuse. This function panics if the index at the
+// given ordinal is not a partial index.
+func (mb *mutationBuilder) parsePartialIndexPredicateExpr(idx cat.IndexOrdinal) tree.Expr {
+	index := mb.tab.Index(idx)
+
+	predStr, isPartial := index.Predicate()
+	if !isPartial {
+		panic(errors.AssertionFailedf("index at ordinal %d is not a partial index", idx))
+	}
+
+	if mb.parsedIndexExprs == nil {
+		mb.parsedIndexExprs = make([]tree.Expr, mb.tab.DeletableIndexCount())
+	}
+
+	// Return expression from the cache, if it was already parsed previously.
+	if mb.parsedIndexExprs[idx] != nil {
+		return mb.parsedIndexExprs[idx]
+	}
+
+	expr, err := parser.ParseExpr(predStr)
+	if err != nil {
+		panic(err)
+	}
+
+	mb.parsedIndexExprs[idx] = expr
 	return expr
 }
 
@@ -1010,7 +1057,7 @@ func (mb *mutationBuilder) parseDefaultOrComputedExpr(colID opt.ColumnID) tree.E
 func getIndexLaxKeyOrdinals(index cat.Index) util.FastIntSet {
 	var keyOrds util.FastIntSet
 	for i, n := 0, index.LaxKeyColumnCount(); i < n; i++ {
-		keyOrds.Add(index.Column(i).Ordinal)
+		keyOrds.Add(index.Column(i).Ordinal())
 	}
 	return keyOrds
 }
@@ -1022,7 +1069,7 @@ func findNotNullIndexCol(index cat.Index) int {
 	for i, n := 0, index.KeyColumnCount(); i < n; i++ {
 		indexCol := index.Column(i)
 		if !indexCol.IsNullable() {
-			return indexCol.Ordinal
+			return indexCol.Ordinal()
 		}
 	}
 	panic(errors.AssertionFailedf("should have found not null column in index"))
@@ -1048,15 +1095,17 @@ func resultsNeeded(r tree.ReturningClause) bool {
 // be different (eg. TEXT and VARCHAR will fit the same scalar type String).
 //
 // This is used by the UPDATE, INSERT and UPSERT code.
-func checkDatumTypeFitsColumnType(col cat.Column, typ *types.T) {
+func checkDatumTypeFitsColumnType(col *cat.Column, typ *types.T) {
 	if typ.Equivalent(col.DatumType()) {
 		return
 	}
 
 	colName := string(col.ColName())
-	panic(pgerror.Newf(pgcode.DatatypeMismatch,
+	err := pgerror.Newf(pgcode.DatatypeMismatch,
 		"value type %s doesn't match type %s of column %q",
-		typ, col.DatumType(), tree.ErrNameString(colName)))
+		typ, col.DatumType(), tree.ErrNameString(colName))
+	err = errors.WithHint(err, "you will need to rewrite or cast the expression")
+	panic(err)
 }
 
 // partialIndexCount returns the number of public, write-only, and delete-only

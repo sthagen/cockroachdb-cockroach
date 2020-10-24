@@ -55,11 +55,6 @@ func (c *CustomFuncs) HasColType(scalar opt.ScalarExpr, dstTyp *types.T) bool {
 	return scalar.DataType().Identical(dstTyp)
 }
 
-// IsString returns true if the given scalar expression is of type String.
-func (c *CustomFuncs) IsString(scalar opt.ScalarExpr) bool {
-	return scalar.DataType().Family() == types.StringFamily
-}
-
 // IsTimestamp returns true if the given scalar expression is of type Timestamp.
 func (c *CustomFuncs) IsTimestamp(scalar opt.ScalarExpr) bool {
 	return scalar.DataType().Family() == types.TimestampFamily
@@ -135,6 +130,12 @@ func (c *CustomFuncs) IsConstJSON(expr opt.ScalarExpr) bool {
 		}
 	}
 	return false
+}
+
+// IsFloatDatum returns true if the given tree.Datum is a DFloat.
+func (c *CustomFuncs) IsFloatDatum(datum tree.Datum) bool {
+	_, ok := datum.(*tree.DFloat)
+	return ok
 }
 
 // ----------------------------------------------------------------------
@@ -1014,6 +1015,11 @@ func (c *CustomFuncs) IntConst(d *tree.DInt) opt.ScalarExpr {
 // second.
 func (c *CustomFuncs) IsGreaterThan(first, second tree.Datum) bool {
 	return first.Compare(c.f.evalCtx, second) == 1
+}
+
+// DatumsEqual returns true if the first datum compares as equal to the second.
+func (c *CustomFuncs) DatumsEqual(first, second tree.Datum) bool {
+	return first.Compare(c.f.evalCtx, second) == 0
 }
 
 // ----------------------------------------------------------------------

@@ -19,20 +19,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -144,7 +146,6 @@ var (
 	ignoreStatements = []*regexp.Regexp{
 		regexp.MustCompile("(?i)^alter function"),
 		regexp.MustCompile("(?i)^alter sequence .* owned by"),
-		regexp.MustCompile("(?i)^alter table .* owner to"),
 		regexp.MustCompile("(?i)^comment on"),
 		regexp.MustCompile("(?i)^create extension"),
 		regexp.MustCompile("(?i)^create function"),
@@ -224,7 +225,7 @@ func readPostgresCreateTable(
 	walltime int64,
 	fks fkHandler,
 	max int,
-) ([]*sqlbase.MutableTableDescriptor, error) {
+) ([]*tabledesc.Mutable, error) {
 	// Modify the CreateTable stmt with the various index additions. We do this
 	// instead of creating a full table descriptor first and adding indexes
 	// later because MakeSimpleTableDescriptor calls the sql package which calls
@@ -239,14 +240,15 @@ func readPostgresCreateTable(
 	for {
 		stmt, err := ps.Next()
 		if err == io.EOF {
-			ret := make([]*sqlbase.MutableTableDescriptor, 0, len(createTbl))
+			ret := make([]*tabledesc.Mutable, 0, len(createTbl))
 			owner := security.AdminRole
 			if params.SessionData() != nil {
 				owner = params.SessionData().User
 			}
 			for name, seq := range createSeq {
 				id := descpb.ID(int(defaultCSVTableID) + len(ret))
-				desc, err := sql.MakeSequenceTableDesc(
+				desc, err := sql.NewSequenceTableDesc(
+					ctx,
 					name,
 					seq.Options,
 					parentID,
@@ -260,10 +262,10 @@ func readPostgresCreateTable(
 				if err != nil {
 					return nil, err
 				}
-				fks.resolver[desc.Name] = &desc
-				ret = append(ret, &desc)
+				fks.resolver[desc.Name] = desc
+				ret = append(ret, desc)
 			}
-			backrefs := make(map[descpb.ID]*sqlbase.MutableTableDescriptor)
+			backrefs := make(map[descpb.ID]*tabledesc.Mutable)
 			for _, create := range createTbl {
 				if create == nil {
 					continue
@@ -290,7 +292,7 @@ func readPostgresCreateTable(
 						return nil, err
 					}
 				}
-				if err := fixDescriptorFKState(desc.TableDesc()); err != nil {
+				if err := fixDescriptorFKState(desc); err != nil {
 					return nil, err
 				}
 			}
@@ -337,6 +339,9 @@ func readPostgresStmt(
 			createTbl[name] = stmt
 		}
 	case *tree.CreateIndex:
+		if stmt.Predicate != nil {
+			return unimplemented.NewWithIssue(50225, "cannot import a table with partial indexes")
+		}
 		name, err := getTableName(&stmt.Table)
 		if err != nil {
 			return err
@@ -378,13 +383,21 @@ func readPostgresStmt(
 					create.Defs = append(create.Defs, cmd.ConstraintDef)
 				}
 			case *tree.AlterTableSetDefault:
+				found := false
 				for i, def := range create.Defs {
 					def, ok := def.(*tree.ColumnTableDef)
+					// If it's not a column definition, or the column name doesn't match,
+					// we're not interested in this column.
 					if !ok || def.Name != cmd.Column {
 						continue
 					}
 					def.DefaultExpr.Expr = cmd.Default
 					create.Defs[i] = def
+					found = true
+					break
+				}
+				if !found {
+					return colinfo.NewUndefinedColumnError(cmd.Column.String())
 				}
 			case *tree.AlterTableAddColumn:
 				if cmd.IfNotExists {
@@ -392,15 +405,25 @@ func readPostgresStmt(
 				}
 				create.Defs = append(create.Defs, cmd.ColumnDef)
 			case *tree.AlterTableSetNotNull:
+				found := false
 				for i, def := range create.Defs {
 					def, ok := def.(*tree.ColumnTableDef)
+					// If it's not a column definition, or the column name doesn't match,
+					// we're not interested in this column.
 					if !ok || def.Name != cmd.Column {
 						continue
 					}
 					def.Nullable.Nullability = tree.NotNull
 					create.Defs[i] = def
+					found = true
+					break
+				}
+				if !found {
+					return colinfo.NewUndefinedColumnError(cmd.Column.String())
 				}
 			case *tree.AlterTableValidateConstraint:
+				// ignore
+			case *tree.AlterTableOwner:
 				// ignore
 			default:
 				return errors.Errorf("unsupported statement: %s", stmt)
@@ -414,8 +437,7 @@ func readPostgresStmt(
 		if match == "" || match == name {
 			createSeq[name] = stmt
 		}
-	// Some SELECT statements mutate schema. Search for those here. If it is not exactly a SELECT that mutates
-	// schema, ignore it.
+	// Some SELECT statements mutate schema. Search for those here.
 	case *tree.Select:
 		switch sel := stmt.Select.(type) {
 		case *tree.SelectClause:
@@ -426,11 +448,10 @@ func readPostgresStmt(
 					semaCtx := tree.MakeSemaContext()
 					if _, err := expr.TypeCheck(ctx, &semaCtx, nil /* desired */); err != nil {
 						// If the expression does not type check, it may be a case of using
-						// a column that does not exist yet (as is the case of PGDUMP output
-						// from ogr2ogr).
-						// In this case, we can safely assume it is not a SELECT statement
-						// mutating a schema so we keep going.
-						if pgerror.GetPGCode(err) == pgcode.UndefinedColumn {
+						// a column that does not exist yet in a setval call (as is the case
+						// of PGDUMP output from ogr2ogr). We're not interested in setval
+						// calls during schema reading so it is safe to ignore this for now.
+						if f := expr.Func.String(); pgerror.GetPGCode(err) == pgcode.UndefinedColumn && f == "setval" {
 							continue
 						}
 						return err
@@ -439,8 +460,12 @@ func readPostgresStmt(
 					// Search for a SQLFn, which returns a SQL string to execute.
 					fn := ov.SQLFn
 					if fn == nil {
-						// This is some other function type, which we don't care about.
-						continue
+						switch f := expr.Func.String(); f {
+						case "set_config", "setval":
+							continue
+						default:
+							return errors.Errorf("unsupported function call: %s", expr.Func.String())
+						}
 					}
 					// Attempt to convert all func exprs to datums.
 					datums := make(tree.Datums, len(expr.Exprs))
@@ -475,9 +500,26 @@ func readPostgresStmt(
 							return errors.Errorf("unsupported statement: %s", stmt)
 						}
 					}
+				default:
+					return errors.Errorf("unsupported %T SELECT expr: %s", expr, expr)
 				}
 			}
+		default:
+			return errors.Errorf("unsupported %T SELECT: %s", sel, sel)
 		}
+	case *tree.BeginTransaction, *tree.CommitTransaction:
+		// ignore txns.
+	case *tree.SetVar, *tree.Insert, *tree.CopyFrom, copyData, *tree.Delete:
+		// ignore SETs and DMLs.
+	case *tree.Analyze:
+		// ANALYZE is syntatictic sugar for CreateStatistics. It can be ignored because
+		// the auto stats stuff will pick up the changes and run if needed.
+	case error:
+		if !errors.Is(stmt, errCopyDone) {
+			return stmt
+		}
+	default:
+		return errors.Errorf("unsupported %T statement: %s", stmt, stmt)
 	}
 	return nil
 }
@@ -506,11 +548,13 @@ func getTableName2(u *tree.UnresolvedObjectName) (string, error) {
 }
 
 type pgDumpReader struct {
-	tables map[string]*row.DatumRowConverter
-	descs  map[string]*execinfrapb.ReadImportDataSpec_ImportTable
-	kvCh   chan row.KVBatch
-	opts   roachpb.PgDumpOptions
-	colMap map[*row.DatumRowConverter](map[string]int)
+	tableDescs map[string]catalog.TableDescriptor
+	tables     map[string]*row.DatumRowConverter
+	descs      map[string]*execinfrapb.ReadImportDataSpec_ImportTable
+	kvCh       chan row.KVBatch
+	opts       roachpb.PgDumpOptions
+	walltime   int64
+	colMap     map[*row.DatumRowConverter](map[string]int)
 }
 
 var _ inputConverter = &pgDumpReader{}
@@ -520,14 +564,16 @@ func newPgDumpReader(
 	ctx context.Context,
 	kvCh chan row.KVBatch,
 	opts roachpb.PgDumpOptions,
+	walltime int64,
 	descs map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
 	evalCtx *tree.EvalContext,
 ) (*pgDumpReader, error) {
+	tableDescs := make(map[string]catalog.TableDescriptor, len(descs))
 	converters := make(map[string]*row.DatumRowConverter, len(descs))
 	colMap := make(map[*row.DatumRowConverter](map[string]int))
 	for name, table := range descs {
 		if table.Desc.IsTable() {
-			tableDesc := sqlbase.NewImmutableTableDescriptor(*table.Desc)
+			tableDesc := tabledesc.NewImmutable(*table.Desc)
 			colSubMap := make(map[string]int, len(table.TargetCols))
 			targetCols := make(tree.NameList, len(table.TargetCols))
 			for i, colName := range table.TargetCols {
@@ -542,14 +588,20 @@ func newPgDumpReader(
 			}
 			converters[name] = conv
 			colMap[conv] = colSubMap
+			tableDescs[name] = tableDesc
+		} else if table.Desc.IsSequence() {
+			seqDesc := tabledesc.NewImmutable(*table.Desc)
+			tableDescs[name] = seqDesc
 		}
 	}
 	return &pgDumpReader{
-		kvCh:   kvCh,
-		tables: converters,
-		descs:  descs,
-		opts:   opts,
-		colMap: colMap,
+		kvCh:       kvCh,
+		tableDescs: tableDescs,
+		tables:     converters,
+		descs:      descs,
+		opts:       opts,
+		walltime:   walltime,
+		colMap:     colMap,
 	}, nil
 }
 
@@ -613,6 +665,7 @@ func (m *pgDumpReader) readFile(
 				// the command "IMPORT INTO table (targetCols) PGDUMP DATA (filename)"
 				expectedColLen = len(conv.VisibleCols)
 			}
+			timestamp := timestampAfterEpoch(m.walltime)
 			values, ok := i.Rows.Select.(*tree.ValuesClause)
 			if !ok {
 				return errors.Errorf("unsupported: %s", i.Rows.Select)
@@ -658,7 +711,7 @@ func (m *pgDumpReader) readFile(
 					}
 					conv.Datums[idx] = converted
 				}
-				if err := conv.Row(ctx, inputIdx, count); err != nil {
+				if err := conv.Row(ctx, inputIdx, count+int64(timestamp)); err != nil {
 					return err
 				}
 			}
@@ -719,7 +772,7 @@ func (m *pgDumpReader) readFile(
 						if s == nil {
 							conv.Datums[idx] = tree.DNull
 						} else {
-							conv.Datums[idx], err = sqlbase.ParseDatumStringAs(conv.VisibleColTypes[idx], *s, conv.EvalCtx)
+							conv.Datums[idx], err = rowenc.ParseDatumStringAs(conv.VisibleColTypes[idx], *s, conv.EvalCtx)
 							if err != nil {
 								col := conv.VisibleCols[idx]
 								return wrapRowErr(err, "", count, pgcode.Syntax,
@@ -742,60 +795,90 @@ func (m *pgDumpReader) readFile(
 			// by pg_dump, and thus if it isn't, we don't try to figure out what to do.
 			sc, ok := i.Select.(*tree.SelectClause)
 			if !ok {
-				break
+				return errors.Errorf("unsupported %T Select: %v", i.Select, i.Select)
 			}
 			if len(sc.Exprs) != 1 {
-				break
+				return errors.Errorf("unsupported %d select args: %v", len(sc.Exprs), sc.Exprs)
 			}
 			fn, ok := sc.Exprs[0].Expr.(*tree.FuncExpr)
-			if !ok || len(fn.Exprs) < 2 {
-				break
-			}
-			if name := strings.ToLower(fn.Func.String()); name != "setval" && name != "pg_catalog.setval" {
-				break
-			}
-			seqname, ok := fn.Exprs[0].(*tree.StrVal)
 			if !ok {
-				break
+				return errors.Errorf("unsupported select arg %T: %v", sc.Exprs[0].Expr, sc.Exprs[0].Expr)
 			}
-			seqval, ok := fn.Exprs[1].(*tree.NumVal)
-			if !ok {
-				break
-			}
-			val, err := seqval.AsInt64()
-			if err != nil {
-				break
-			}
-			isCalled := false
-			if len(fn.Exprs) > 2 {
-				called, ok := fn.Exprs[2].(*tree.DBool)
+
+			switch funcName := strings.ToLower(fn.Func.String()); funcName {
+			case "search_path", "pg_catalog.set_config":
+				continue
+			case "setval", "pg_catalog.setval":
+				if args := len(fn.Exprs); args < 2 || args > 3 {
+					return errors.Errorf("unsupported %d fn args: %v", len(fn.Exprs), fn.Exprs)
+				}
+				seqname, ok := fn.Exprs[0].(*tree.StrVal)
 				if !ok {
+					if nested, nestedOk := fn.Exprs[0].(*tree.FuncExpr); nestedOk && nested.Func.String() == "pg_get_serial_sequence" {
+						// ogr2ogr dumps set the seq for the PK by a) looking up the seqname
+						// and then b) running an aggregate on the just-imported data to
+						// determine the max value. We're not going to do any of that, but
+						// we can just ignore all of this because we mapped their "serial"
+						// to our rowid anyway so there is no seq to maintain.
+						continue
+					}
+					return errors.Errorf("unsupported setval %T arg: %v", fn.Exprs[0], fn.Exprs[0])
+				}
+				seqval, ok := fn.Exprs[1].(*tree.NumVal)
+				if !ok {
+					return errors.Errorf("unsupported setval %T arg: %v", fn.Exprs[1], fn.Exprs[1])
+				}
+				val, err := seqval.AsInt64()
+				if err != nil {
+					return errors.Wrap(err, "unsupported setval arg")
+				}
+				isCalled := false
+				if len(fn.Exprs) == 3 {
+					called, ok := fn.Exprs[2].(*tree.DBool)
+					if !ok {
+						return errors.Errorf("unsupported setval %T arg: %v", fn.Exprs[2], fn.Exprs[2])
+					}
+					isCalled = bool(*called)
+				}
+				name, err := parser.ParseTableName(seqname.RawString())
+				if err != nil {
 					break
 				}
-				isCalled = bool(*called)
+				seq := m.tableDescs[name.Parts[0]]
+				if seq == nil {
+					break
+				}
+				key, val, err := sql.MakeSequenceKeyVal(keys.TODOSQLCodec, seq, val, isCalled)
+				if err != nil {
+					return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
+				}
+				kv := roachpb.KeyValue{Key: key}
+				kv.Value.SetInt(val)
+				m.kvCh <- row.KVBatch{
+					Source: inputIdx, KVs: []roachpb.KeyValue{kv}, Progress: input.ReadFraction(),
+				}
+			case "addgeometrycolumn":
+				// handled during schema extraction.
+			default:
+				return errors.Errorf("unsupported function: %s", funcName)
 			}
-			name, err := parser.ParseTableName(seqname.RawString())
-			if err != nil {
-				break
-			}
-			seq := m.descs[name.Parts[0]]
-			if seq == nil {
-				break
-			}
-			key, val, err := sql.MakeSequenceKeyVal(keys.TODOSQLCodec, seq.Desc, val, isCalled)
-			if err != nil {
-				return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
-			}
-			kv := roachpb.KeyValue{Key: key}
-			kv.Value.SetInt(val)
-			m.kvCh <- row.KVBatch{
-				Source: inputIdx, KVs: []roachpb.KeyValue{kv}, Progress: input.ReadFraction(),
+		case *tree.SetVar, *tree.BeginTransaction, *tree.CommitTransaction, *tree.Analyze:
+			// ignored.
+		case *tree.CreateTable, *tree.AlterTable, *tree.CreateIndex, *tree.CreateSequence:
+			// handled during schema extraction.
+		case *tree.Delete:
+			switch stmt := i.Table.(type) {
+			case *tree.AliasedTableExpr:
+				// ogr2ogr has `DELETE FROM geometry_columns / geography_columns ...` statements.
+				// We're not planning to support this functionality in CRDB, so it is safe to ignore it when countered in PGDUMP.
+				if tn, ok := stmt.Expr.(*tree.TableName); !(ok && (tn.Table() == "geometry_columns" || tn.Table() == "geography_columns")) {
+					return errors.Errorf("unsupported DELETE FROM %T statement: %s", stmt, stmt)
+				}
+			default:
+				return errors.Errorf("unsupported %T statement: %s", i, i)
 			}
 		default:
-			if log.V(3) {
-				log.Infof(ctx, "ignoring %T stmt: %v", i, i)
-			}
-			continue
+			return errors.Errorf("unsupported %T statement: %v", i, i)
 		}
 	}
 	for _, conv := range m.tables {

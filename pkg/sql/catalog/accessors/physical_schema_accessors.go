@@ -19,9 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/errors"
 )
 
@@ -70,46 +68,31 @@ func (a *CachedPhysicalAccessor) GetDatabaseDesc(
 	codec keys.SQLCodec,
 	name string,
 	flags tree.DatabaseLookupFlags,
-) (desc sqlbase.DatabaseDescriptor, err error) {
-	isSystemDB := name == sqlbase.SystemDatabaseName
-	if !(flags.AvoidCached || isSystemDB || lease.TestingTableLeasesAreDisabled()) {
-		refuseFurtherLookup, dbID, err := a.tc.GetUncommittedDatabaseID(name, flags.Required)
-		if refuseFurtherLookup || err != nil {
+) (desc catalog.DatabaseDescriptor, err error) {
+	if flags.RequireMutable {
+		db, err := a.tc.GetMutableDatabaseDescriptor(ctx, txn, name, flags)
+		if db == nil {
 			return nil, err
 		}
-
-		if dbID != descpb.InvalidID {
-			// Some database ID was found in the list of uncommitted DB changes.
-			// Use that to get the descriptor.
-			desc, err := a.tc.DatabaseCache().GetDatabaseDescByID(ctx, txn, dbID)
-			if desc == nil && flags.Required {
-				return nil, sqlbase.NewUndefinedDatabaseError(name)
-			} else if desc == nil {
-				// NB: We must return the actual value nil here as a typed nil will not
-				// be easily detectable by the caller.
-				return nil, nil
-			}
-			return desc, err
-		}
-
-		// The database was not known in the uncommitted list. Have the db
-		// cache look it up by name for us.
-		desc, err := a.tc.DatabaseCache().GetDatabaseDesc(ctx, a.tc.LeaseManager().DB().Txn, name, flags.Required)
-		if desc == nil || err != nil {
-			return nil, err
-		}
-		return desc, nil
+		return db, err
 	}
-
-	// We avoided the cache. Go lower.
-	return a.Accessor.GetDatabaseDesc(ctx, txn, codec, name, flags)
+	db, err := a.tc.GetDatabaseVersion(ctx, txn, name, flags)
+	if db == nil {
+		return nil, err
+	}
+	return db, err
 }
 
 // GetSchema implements the Accessor interface.
 func (a *CachedPhysicalAccessor) GetSchema(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, dbID descpb.ID, scName string,
-) (bool, sqlbase.ResolvedSchema, error) {
-	return a.tc.ResolveSchema(ctx, txn, dbID, scName)
+	ctx context.Context,
+	txn *kv.Txn,
+	codec keys.SQLCodec,
+	dbID descpb.ID,
+	scName string,
+	flags tree.SchemaLookupFlags,
+) (bool, catalog.ResolvedSchema, error) {
+	return a.tc.ResolveSchema(ctx, txn, dbID, scName, flags)
 }
 
 // GetObjectDesc implements the Accessor interface.

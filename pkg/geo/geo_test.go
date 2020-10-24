@@ -96,9 +96,9 @@ func mustDecodeEWKBFromString(t *testing.T, h string) geopb.EWKB {
 	return geopb.EWKB(decoded)
 }
 
-func TestGeospatialTypeFitsColumnMetadata(t *testing.T) {
+func TestSpatialObjectFitsColumnMetadata(t *testing.T) {
 	testCases := []struct {
-		t             GeospatialType
+		t             Geometry
 		srid          geopb.SRID
 		shape         geopb.ShapeType
 		errorContains string
@@ -113,7 +113,7 @@ func TestGeospatialTypeFitsColumnMetadata(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(fmt.Sprintf("%#v_fits_%d_%s", tc.t, tc.srid, tc.shape), func(t *testing.T) {
-			err := GeospatialTypeFitsColumnMetadata(tc.t, tc.srid, tc.shape)
+			err := SpatialObjectFitsColumnMetadata(tc.t.SpatialObject(), tc.srid, tc.shape)
 			if tc.errorContains != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tc.errorContains)
@@ -856,6 +856,126 @@ func TestValidateGeomT(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
+		})
+	}
+}
+
+func TestIsLinearRingCCW(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		ring     *geom.LinearRing
+		expected bool
+	}{
+		{
+			desc: "flat linear ring",
+			ring: geom.NewLinearRingFlat(geom.XY, []float64{
+				0, 0,
+				0, 0,
+				0, 0,
+				0, 0,
+			}),
+			expected: false,
+		},
+		{
+			desc: "invalid linear ring with duplicate points at end deemed CW",
+			ring: geom.NewLinearRingFlat(geom.XY, []float64{
+				0, 0,
+				0, 0,
+				0, 0,
+				0, 0,
+				1, 0,
+				1, 0,
+				1, 0,
+			}),
+			expected: false,
+		},
+		{
+			desc: "invalid linear ring with duplicate points at start deemed CW",
+			ring: geom.NewLinearRingFlat(geom.XY, []float64{
+				0, 0,
+				0, 0,
+				0, 0,
+				0, 0,
+				-1, 1,
+				-1, 1,
+				-1, 1,
+				0, 0,
+			}),
+			expected: false,
+		},
+
+		{
+			desc: "CW linear ring",
+			ring: geom.NewLinearRingFlat(geom.XY, []float64{
+				0, 0,
+				1, 1,
+				1, 0,
+				0, 0,
+			}),
+			expected: false,
+		},
+		{
+			desc: "CW linear ring, first point is bottom right",
+			ring: geom.NewLinearRingFlat(geom.XY, []float64{
+				1, 0,
+				0, 0,
+				1, 1,
+				1, 0,
+			}),
+			expected: false,
+		},
+		{
+			desc: "CW linear ring, duplicate points for bottom right",
+			ring: geom.NewLinearRingFlat(geom.XY, []float64{
+				0, 0,
+				1, 1,
+				1, 0,
+				1, 0,
+				1, 0,
+				0, 0,
+			}),
+			expected: false,
+		},
+		{
+			desc: "CCW linear ring",
+			ring: geom.NewLinearRingFlat(geom.XY, []float64{
+				0, 0,
+				1, 0,
+				1, 1,
+				0, 0,
+			}),
+			expected: true,
+		},
+		{
+			desc: "CCW linear ring, duplicate points for bottom right",
+			ring: geom.NewLinearRingFlat(geom.XY, []float64{
+				0, 0,
+				1, 0,
+				1, 0,
+				1, 0,
+				1, 0,
+				1, 0,
+				1, 1,
+				0, 0,
+			}),
+			expected: true,
+		},
+		{
+			desc: "CCW linear ring, first point is bottom right",
+			ring: geom.NewLinearRingFlat(geom.XY, []float64{
+				1, 0,
+				1, 0,
+				1, 1,
+				0, 0,
+				1, 0,
+			}),
+			expected: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			require.Equal(t, tc.expected, IsLinearRingCCW(tc.ring))
 		})
 	}
 }

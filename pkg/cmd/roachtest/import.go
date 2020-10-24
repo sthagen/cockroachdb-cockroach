@@ -35,12 +35,11 @@ func registerImportTPCC(r *testRegistry) {
 		hc := NewHealthChecker(c, c.All())
 		m.Go(hc.Runner)
 
+		workloadStr := `./cockroach workload fixtures import tpcc --warehouses=%d --csv-server='http://localhost:8081'`
 		m.Go(func(ctx context.Context) error {
 			defer dul.Done()
 			defer hc.Done()
-			cmd := fmt.Sprintf(
-				`./workload fixtures import tpcc --warehouses=%d --csv-server='http://localhost:8081'`,
-				warehouses)
+			cmd := fmt.Sprintf(workloadStr, warehouses)
 			c.Run(ctx, c.Node(1), cmd)
 			return nil
 		})

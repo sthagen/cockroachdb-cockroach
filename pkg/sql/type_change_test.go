@@ -16,8 +16,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -49,7 +49,6 @@ func TestDrainingNamesAreCleanedOnTypeChangeFailure(t *testing.T) {
 
 	// Create a type.
 	if _, err := sqlDB.Exec(`
-SET experimental_enable_enums = true;
 CREATE DATABASE d;
 CREATE TYPE d.t AS ENUM()
 `); err != nil {
@@ -93,7 +92,6 @@ func TestTypeSchemaChangeHandlesDeletedDescriptor(t *testing.T) {
 
 	// Create a type.
 	if _, err := sqlDB.Exec(`
-SET experimental_enable_enums = true;
 CREATE DATABASE d;
 CREATE TYPE d.t AS ENUM();
 `); err != nil {
@@ -104,7 +102,7 @@ CREATE TYPE d.t AS ENUM();
 	desc := catalogkv.TestingGetTypeDescriptor(kvDB, keys.SystemSQLCodec, "d", "t")
 	delTypeDesc = func() {
 		// Delete the descriptor.
-		if err := kvDB.Del(ctx, sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.ID)); err != nil {
+		if err := kvDB.Del(ctx, catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, desc.ID)); err != nil {
 			t.Error(err)
 		}
 	}
@@ -147,7 +145,6 @@ func TestTypeSchemaChangeRetriesTransparently(t *testing.T) {
 
 	// Create a type.
 	if _, err := sqlDB.Exec(`
-SET experimental_enable_enums = true;
 CREATE DATABASE d;
 CREATE TYPE d.t AS ENUM();
 `); err != nil {

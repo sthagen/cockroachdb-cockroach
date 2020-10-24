@@ -14,16 +14,17 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 type refreshMaterializedViewNode struct {
 	n    *tree.RefreshMaterializedView
-	desc *sqlbase.MutableTableDescriptor
+	desc *tabledesc.Mutable
 }
 
 func (p *planner) RefreshMaterializedView(
@@ -58,6 +59,14 @@ func (n *refreshMaterializedViewNode) startExec(params runParams) error {
 	// results of the view query into the new set of indexes, and then change the
 	// set of indexes over to the new set of indexes atomically.
 
+	// Inform the user that CONCURRENTLY is not needed.
+	if n.n.Concurrently {
+		params.p.BufferClientNotice(
+			params.ctx,
+			pgnotice.Newf("CONCURRENTLY is not required as views are refreshed concurrently"),
+		)
+	}
+
 	// Prepare the new set of indexes by cloning all existing indexes on the view.
 	newPrimaryIndex := protoutil.Clone(&n.desc.PrimaryIndex).(*descpb.IndexDescriptor)
 	newIndexes := make([]descpb.IndexDescriptor, len(n.desc.Indexes))
@@ -81,6 +90,7 @@ func (n *refreshMaterializedViewNode) startExec(params runParams) error {
 		NewPrimaryIndex: *newPrimaryIndex,
 		NewIndexes:      newIndexes,
 		AsOf:            params.p.Txn().ReadTimestamp(),
+		ShouldBackfill:  n.n.RefreshDataOption != tree.RefreshDataClear,
 	})
 
 	return params.p.writeSchemaChange(

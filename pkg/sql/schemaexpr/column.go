@@ -13,12 +13,13 @@ package schemaexpr
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -35,7 +36,7 @@ import (
 // or partial index predicates are created. If the table name was not stripped,
 // these expressions would become invalid if the table is renamed.
 func DequalifyColumnRefs(
-	ctx context.Context, source *sqlbase.DataSourceInfo, expr tree.Expr,
+	ctx context.Context, source *colinfo.DataSourceInfo, expr tree.Expr,
 ) (string, error) {
 	e, err := dequalifyColumnRefs(ctx, source, expr)
 	if err != nil {
@@ -47,9 +48,9 @@ func DequalifyColumnRefs(
 // dequalifyColumnRefs returns an expression with database and table names
 // stripped from qualified column names.
 func dequalifyColumnRefs(
-	ctx context.Context, source *sqlbase.DataSourceInfo, expr tree.Expr,
+	ctx context.Context, source *colinfo.DataSourceInfo, expr tree.Expr,
 ) (tree.Expr, error) {
-	resolver := sqlbase.ColumnResolver{Source: source}
+	resolver := colinfo.ColumnResolver{Source: source}
 	return tree.SimpleVisit(
 		expr,
 		func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
@@ -78,7 +79,7 @@ func dequalifyColumnRefs(
 // human-readable form.
 func FormatColumnForDisplay(
 	ctx context.Context,
-	tbl sqlbase.TableDescriptor,
+	tbl catalog.TableDescriptor,
 	desc *descpb.ColumnDescriptor,
 	semaCtx *tree.SemaContext,
 ) (string, error) {
@@ -93,7 +94,7 @@ func FormatColumnForDisplay(
 	}
 	if desc.DefaultExpr != nil {
 		f.WriteString(" DEFAULT ")
-		defExpr, err := FormatExprForDisplay(ctx, tbl, *desc.DefaultExpr, semaCtx)
+		defExpr, err := FormatExprForDisplay(ctx, tbl, *desc.DefaultExpr, semaCtx, tree.FmtParsable)
 		if err != nil {
 			return "", err
 		}
@@ -101,7 +102,7 @@ func FormatColumnForDisplay(
 	}
 	if desc.IsComputed() {
 		f.WriteString(" AS (")
-		compExpr, err := FormatExprForDisplay(ctx, tbl, *desc.ComputeExpr, semaCtx)
+		compExpr, err := FormatExprForDisplay(ctx, tbl, *desc.ComputeExpr, semaCtx, tree.FmtParsable)
 		if err != nil {
 			return "", err
 		}
@@ -149,7 +150,7 @@ func RenameColumn(expr string, from tree.Name, to tree.Name) (string, error) {
 // If the expression references a column that does not exist in the table
 // descriptor, iterColDescriptors errs with pgcode.UndefinedColumn.
 func iterColDescriptors(
-	desc *sqlbase.MutableTableDescriptor, rootExpr tree.Expr, f func(*descpb.ColumnDescriptor) error,
+	desc catalog.TableDescriptor, rootExpr tree.Expr, f func(*descpb.ColumnDescriptor) error,
 ) error {
 	_, err := tree.SimpleVisit(rootExpr, func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		vBase, ok := expr.(tree.VarName)
@@ -232,9 +233,9 @@ func (d *dummyColumn) ResolvedType() *types.T {
 // If the expression references a column that does not exist in the table
 // descriptor, replaceColumnVars errs with pgcode.UndefinedColumn.
 func replaceColumnVars(
-	desc sqlbase.TableDescriptor, rootExpr tree.Expr,
-) (tree.Expr, sqlbase.TableColSet, error) {
-	var colIDs sqlbase.TableColSet
+	desc catalog.TableDescriptor, rootExpr tree.Expr,
+) (tree.Expr, TableColSet, error) {
+	var colIDs TableColSet
 
 	newExpr, err := tree.SimpleVisit(rootExpr, func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		vBase, ok := expr.(tree.VarName)

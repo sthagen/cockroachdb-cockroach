@@ -17,8 +17,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/mutations"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // Setup generates a SQL query that can be executed to initialize a database
@@ -64,15 +64,19 @@ func randTables(r *rand.Rand) string {
 	sb.WriteString(`
 		SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;
 		SET CLUSTER SETTING sql.stats.histogram_collection.enabled = false;
-		SET experimental_enable_enums = true;
-		SET experimental_partial_indexes = true;
 	`)
 
 	// Create the random tables.
-	stmts := sqlbase.RandCreateTables(r, "table", r.Intn(5)+1,
-		mutations.ForeignKeyMutator,
+	stmts := rowenc.RandCreateTables(r, "table", r.Intn(5)+1,
 		mutations.StatisticsMutator,
+		// The PartialIndexMutator must be listed before the ForeignKeyMutator.
+		// A foreign key requires a unique index on the referenced column. These
+		// unique indexes are created by the ForeignKeyMutator. If the
+		// PartialIndexMutator is listed after the ForeignKeyMutator, it may
+		// mutate these unique indexes into partial unique indexes, which do not
+		// satisfy the requirements for creating the foreign key.
 		mutations.PartialIndexMutator,
+		mutations.ForeignKeyMutator,
 	)
 
 	for _, stmt := range stmts {
@@ -84,7 +88,7 @@ func randTables(r *rand.Rand) string {
 	numTypes := r.Intn(5) + 1
 	for i := 0; i < numTypes; i++ {
 		name := fmt.Sprintf("rand_typ_%d", i)
-		stmt := sqlbase.RandCreateType(r, name, letters)
+		stmt := rowenc.RandCreateType(r, name, letters)
 		sb.WriteString(stmt.String())
 		sb.WriteString(";\n")
 	}
@@ -96,7 +100,6 @@ func randTables(r *rand.Rand) string {
 
 const (
 	seedTable = `
-SET experimental_enable_enums = true;
 CREATE TYPE greeting AS ENUM ('hello', 'howdy', 'hi', 'good day', 'morning');
 CREATE TABLE IF NOT EXISTS seed AS
 	SELECT

@@ -57,6 +57,15 @@ CREATE TABLE index_tab
 ----
 
 exec-ddl
+CREATE TABLE partial_index_tab
+(
+    a INT,
+    b INT,
+    INDEX (a) WHERE b > 0
+)
+----
+
+exec-ddl
 ALTER TABLE index_tab INJECT STATISTICS '[
   {
     "columns": ["val"],
@@ -98,7 +107,7 @@ ALTER TABLE index_tab INJECT STATISTICS '[
 ----
 
 # ---------------------------------------------------
-# GenerateLimitedScans / PushLimitIntoConstrainedScan
+# GenerateLimitedScans / PushLimitIntoFilteredScan
 # ---------------------------------------------------
 
 opt
@@ -152,6 +161,37 @@ limit
  │         └── ordering: +4
  └── 1
 
+# Limit an unconstrained partial index scan.
+opt
+SELECT a FROM partial_index_tab where b > 0 LIMIT 1
+----
+project
+ ├── columns: a:1
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ ├── fd: ()-->(1)
+ └── scan partial_index_tab@secondary,partial
+      ├── columns: a:1 rowid:3!null
+      ├── limit: 1
+      ├── key: ()
+      └── fd: ()-->(1,3)
+
+# Limit a constrained partial index scan.
+opt
+SELECT a FROM partial_index_tab where b > 0 and a > 10 LIMIT 1
+----
+project
+ ├── columns: a:1!null
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ ├── fd: ()-->(1)
+ └── scan partial_index_tab@secondary,partial
+      ├── columns: a:1!null rowid:3!null
+      ├── constraint: /1/3: [/11 - ]
+      ├── limit: 1
+      ├── key: ()
+      └── fd: ()-->(1,3)
+
 # Don't push when scan doesn't satisfy limit's ordering.
 opt
 SELECT s FROM a ORDER BY f LIMIT 1
@@ -193,16 +233,16 @@ memo (optimized, ~7KB, required=[presentation: s:4])
  ├── G1: (limit G2 G3) (scan a@s_idx,cols=(4),constrained,lim=1) (scan a@si_idx,cols=(4),constrained,lim=1)
  │    └── [presentation: s:4]
  │         ├── best: (scan a@s_idx,cols=(4),constrained,lim=1)
- │         └── cost: 1.06
+ │         └── cost: 5.06
  ├── G2: (select G4 G5) (scan a@s_idx,cols=(4),constrained) (scan a@si_idx,cols=(4),constrained)
  │    └── [limit hint: 1.00]
  │         ├── best: (scan a@s_idx,cols=(4),constrained)
- │         └── cost: 2.11
+ │         └── cost: 6.11
  ├── G3: (const 1)
  ├── G4: (scan a,cols=(4)) (scan a@s_idx,cols=(4)) (scan a@si_idx,cols=(4))
  │    └── [limit hint: 100.00]
  │         ├── best: (scan a@s_idx,cols=(4))
- │         └── cost: 210.02
+ │         └── cost: 214.02
  ├── G5: (filters G6)
  ├── G6: (eq G7 G8)
  ├── G7: (variable s)
@@ -220,7 +260,7 @@ scan a
  ├── key: ()
  └── fd: ()-->(1-5)
 
-# PushLimitIntoConstrainedScan propagates row-level locking information.
+# PushLimitIntoFilteredScan propagates row-level locking information.
 opt
 SELECT s FROM a WHERE s='foo' LIMIT 1 FOR UPDATE
 ----
@@ -574,7 +614,7 @@ EliminateProject
               └── 5
 ================================================================================
 GenerateIndexScans
-  Cost: 5134.92
+  Cost: 4083.92
 ================================================================================
    explain
     ├── columns: tree:6 field:7 description:8
@@ -636,17 +676,17 @@ GenerateIndexScans
   +      │         └── (a:1 >= 20) AND (a:1 <= 30) [outer=(1), constraints=(/1: [/20 - /30]; tight)]
   +      └── 5
 --------------------------------------------------------------------------------
-GenerateZigzagJoins (no changes)
---------------------------------------------------------------------------------
---------------------------------------------------------------------------------
 GeneratePartialIndexScans (no changes)
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
 GenerateConstrainedScans (no changes)
 --------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+GenerateZigzagJoins (no changes)
+--------------------------------------------------------------------------------
 ================================================================================
 Final best expression
-  Cost: 5134.92
+  Cost: 4083.92
 ================================================================================
   explain
    ├── columns: tree:6 field:7 description:8
@@ -1164,7 +1204,7 @@ opt expect-not=SplitScanIntoUnionScans
 SELECT geom FROM index_tab WHERE ST_Intersects('POINT(3.0 3.0)'::geometry, geom)
 ----
 select
- ├── columns: geom:8
+ ├── columns: geom:8!null
  ├── immutable
  ├── index-join index_tab
  │    ├── columns: geom:8
@@ -1173,21 +1213,23 @@ select
  │         ├── inverted expression: /10
  │         │    ├── tight: false
  │         │    └── union spans
- │         │         ├── ["\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
- │         │         ├── ["\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
- │         │         └── ["\xfd\x14\x00\x00\x00\x00\x00\x00\x01", "\xfd\x16")
+ │         │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
+ │         │         ├── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
+ │         │         └── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x01", "B\xfd\x16\x00\x00\x00\x00\x00\x00\x00")
+ │         ├── pre-filterer expression
+ │         │    └── st_intersects('010100000000000000000008400000000000000840', geom:8)
  │         ├── key: (1)
  │         └── scan index_tab@geomidx
  │              ├── columns: id:1!null geom_inverted_key:10!null
  │              ├── inverted constraint: /10/1
  │              │    └── spans
- │              │         ├── ["\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
- │              │         ├── ["\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
- │              │         └── ["\xfd\x14\x00\x00\x00\x00\x00\x00\x01", "\xfd\x16")
+ │              │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
+ │              │         ├── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
+ │              │         └── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x01", "B\xfd\x16\x00\x00\x00\x00\x00\x00\x00")
  │              ├── key: (1)
  │              └── fd: (1)-->(10)
  └── filters
-      └── st_intersects('010100000000000000000008400000000000000840', geom:8) [outer=(8), immutable]
+      └── st_intersects('010100000000000000000008400000000000000840', geom:8) [outer=(8), immutable, constraints=(/8: (/NULL - ])]
 
 # No-op case because the multi-key span isn't countable.
 opt expect-not=SplitScanIntoUnionScans

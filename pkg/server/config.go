@@ -15,13 +15,13 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -54,7 +54,7 @@ const (
 	defaultScanMinIdleTime   = 10 * time.Millisecond
 	defaultScanMaxIdleTime   = 1 * time.Second
 
-	defaultStorePath = "cockroach-data"
+	DefaultStorePath = "cockroach-data"
 	// TempDirPrefix is the filename prefix of any temporary subdirectory
 	// created.
 	TempDirPrefix = "cockroach-temp"
@@ -76,7 +76,7 @@ const (
 
 var productionSettingsWebpage = fmt.Sprintf(
 	"please see %s for more details",
-	base.DocsURL("recommended-production-settings.html"),
+	docs.URL("recommended-production-settings.html"),
 )
 
 // MaxOffsetType stores the configured MaxOffset.
@@ -121,6 +121,14 @@ type BaseConfig struct {
 	// failures, and increase the frequency and impact of
 	// ReadWithinUncertaintyIntervalError.
 	MaxOffset MaxOffsetType
+
+	// GoroutineDumpDirName is the directory name for goroutine dumps using
+	// goroutinedumper.
+	GoroutineDumpDirName string
+
+	// HeapProfileDirName is the directory name for heap profiles using
+	// heapprofiler. If empty, no heap profiles will be collected.
+	HeapProfileDirName string
 
 	// DefaultZoneConfig is used to set the default zone config inside the server.
 	// It can be overridden during tests by setting the DefaultZoneConfigOverride
@@ -172,8 +180,9 @@ type KVConfig struct {
 	// in zone configs.
 	Attrs string
 
-	// JoinList is a list of node addresses that act as bootstrap hosts for
-	// connecting to the gossip network.
+	// JoinList is a list of node addresses that is used to form a network of KV
+	// servers. Assuming a connected graph, it suffices to initialize any server
+	// in the network.
 	JoinList base.JoinListType
 
 	// JoinPreferSRVRecords, if set, causes the lookup logic for the
@@ -193,14 +202,6 @@ type KVConfig struct {
 	// TimeSeriesServerConfig contains configuration specific to the time series
 	// server.
 	TimeSeriesServerConfig ts.ServerConfig
-
-	// GoroutineDumpDirName is the directory name for goroutine dumps using
-	// goroutinedumper.
-	GoroutineDumpDirName string
-
-	// HeapProfileDirName is the directory name for heap profiles using
-	// heapprofiler. If empty, no heap profiles will be collected.
-	HeapProfileDirName string
 
 	// Parsed values.
 
@@ -383,7 +384,7 @@ func SetOpenFileLimitForOneStore() (uint64, error) {
 
 // MakeConfig returns a Config for the system tenant with default values.
 func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
-	storeSpec, err := base.NewStoreSpec(defaultStorePath)
+	storeSpec, err := base.NewStoreSpec(DefaultStorePath)
 	if err != nil {
 		panic(err)
 	}
@@ -462,22 +463,9 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 		return Engines{}, errors.Errorf("engines already created")
 	}
 	cfg.enginesCreated = true
-
-	var details []string
-
-	var cache storage.RocksDBCache
-	var pebbleCache *pebble.Cache
-	if cfg.StorageEngine == enginepb.EngineTypeDefault ||
-		cfg.StorageEngine == enginepb.EngineTypePebble || cfg.StorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
-		details = append(details, fmt.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
-		pebbleCache = pebble.NewCache(cfg.CacheSize)
-		defer pebbleCache.Unref()
-	}
-	if cfg.StorageEngine == enginepb.EngineTypeRocksDB || cfg.StorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
-		details = append(details, fmt.Sprintf("RocksDB cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
-		cache = storage.NewRocksDBCache(cfg.CacheSize)
-		defer cache.Release()
-	}
+	details := []string{fmt.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize))}
+	pebbleCache := pebble.NewCache(cfg.CacheSize)
+	defer pebbleCache.Unref()
 
 	var physicalStores int
 	for _, spec := range cfg.Stores.Specs {
@@ -512,15 +500,13 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			details = append(details, fmt.Sprintf("store %d: in-memory, size %s",
 				i, humanizeutil.IBytes(sizeInBytes)))
 			if spec.StickyInMemoryEngineID != "" {
-				e, err := getOrCreateStickyInMemEngine(
-					ctx, spec.StickyInMemoryEngineID, cfg.StorageEngine, spec.Attributes, sizeInBytes,
-				)
+				e, err := getOrCreateStickyInMemEngine(ctx, spec.StickyInMemoryEngineID, spec.Attributes, sizeInBytes)
 				if err != nil {
 					return Engines{}, err
 				}
 				engines = append(engines, e)
 			} else {
-				engines = append(engines, storage.NewInMem(ctx, cfg.StorageEngine, spec.Attributes, sizeInBytes))
+				engines = append(engines, storage.NewInMem(ctx, spec.Attributes, sizeInBytes))
 			}
 		} else {
 			if spec.Size.Percent > 0 {
@@ -538,8 +524,6 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			details = append(details, fmt.Sprintf("store %d: RocksDB, max size %s, max open file limit %d",
 				i, humanizeutil.IBytes(sizeInBytes), openFileLimitPerStore))
 
-			var eng storage.Engine
-			var err error
 			storageConfig := base.StorageConfig{
 				Attrs:           spec.Attributes,
 				Dir:             spec.Path,
@@ -548,71 +532,23 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				UseFileRegistry: spec.UseFileRegistry,
 				ExtraOptions:    spec.ExtraOptions,
 			}
-			if cfg.StorageEngine == enginepb.EngineTypePebble || cfg.StorageEngine == enginepb.EngineTypeDefault {
-				pebbleConfig := storage.PebbleConfig{
-					StorageConfig: storageConfig,
-					Opts:          storage.DefaultPebbleOptions(),
-				}
-				pebbleConfig.Opts.Cache = pebbleCache
-				pebbleConfig.Opts.MaxOpenFiles = int(openFileLimitPerStore)
-				// If the spec contains Pebble options, set those too.
-				if len(spec.PebbleOptions) > 0 {
-					err = pebbleConfig.Opts.Parse(spec.PebbleOptions, &pebble.ParseHooks{})
-					if err != nil {
-						return nil, err
-					}
-				}
-				if len(spec.RocksDBOptions) > 0 {
-					return nil, errors.Errorf("store %d: using Pebble storage engine but StoreSpec provides RocksDB options", i)
-				}
-				eng, err = storage.NewPebble(ctx, pebbleConfig)
-			} else if cfg.StorageEngine == enginepb.EngineTypeRocksDB {
-				rocksDBConfig := storage.RocksDBConfig{
-					StorageConfig:           storageConfig,
-					MaxOpenFiles:            openFileLimitPerStore,
-					WarnLargeBatchThreshold: 500 * time.Millisecond,
-					RocksDBOptions:          spec.RocksDBOptions,
-				}
-				if len(spec.PebbleOptions) > 0 {
-					return nil, errors.Errorf("store %d: using RocksDB storage engine but StoreSpec provides Pebble options", i)
-				}
-				eng, err = storage.NewRocksDB(rocksDBConfig, cache)
-			} else {
-				// cfg.StorageEngine == enginepb.EngineTypeTeePebbleRocksDB
-				pebbleConfig := storage.PebbleConfig{
-					StorageConfig: storageConfig,
-					Opts:          storage.DefaultPebbleOptions(),
-				}
-				pebbleConfig.Dir = filepath.Join(pebbleConfig.Dir, "pebble")
-				pebbleConfig.Opts.Cache = pebbleCache
-				pebbleConfig.Opts.MaxOpenFiles = int(openFileLimitPerStore)
-				// If the spec contains Pebble options, set those too.
-				if len(spec.PebbleOptions) > 0 {
-					err = pebbleConfig.Opts.Parse(spec.PebbleOptions, nil)
-					if err != nil {
-						return nil, err
-					}
-				}
-				pebbleEng, err := storage.NewPebble(ctx, pebbleConfig)
-				if err != nil {
-					return nil, err
-				}
-
-				rocksDBConfig := storage.RocksDBConfig{
-					StorageConfig:           storageConfig,
-					MaxOpenFiles:            openFileLimitPerStore,
-					WarnLargeBatchThreshold: 500 * time.Millisecond,
-					RocksDBOptions:          spec.RocksDBOptions,
-				}
-				rocksDBConfig.Dir = filepath.Join(rocksDBConfig.Dir, "rocksdb")
-
-				rocksdbEng, err := storage.NewRocksDB(rocksDBConfig, cache)
-				if err != nil {
-					return nil, err
-				}
-
-				eng = storage.NewTee(ctx, rocksdbEng, pebbleEng)
+			pebbleConfig := storage.PebbleConfig{
+				StorageConfig: storageConfig,
+				Opts:          storage.DefaultPebbleOptions(),
 			}
+			pebbleConfig.Opts.Cache = pebbleCache
+			pebbleConfig.Opts.MaxOpenFiles = int(openFileLimitPerStore)
+			// If the spec contains Pebble options, set those too.
+			if len(spec.PebbleOptions) > 0 {
+				err := pebbleConfig.Opts.Parse(spec.PebbleOptions, &pebble.ParseHooks{})
+				if err != nil {
+					return nil, err
+				}
+			}
+			if len(spec.RocksDBOptions) > 0 {
+				return nil, errors.Errorf("store %d: using Pebble storage engine but StoreSpec provides RocksDB options", i)
+			}
+			eng, err := storage.NewPebble(ctx, pebbleConfig)
 			if err != nil {
 				return Engines{}, err
 			}
@@ -652,11 +588,13 @@ func (cfg *Config) InitNode(ctx context.Context) error {
 
 // FilterGossipBootstrapResolvers removes any gossip bootstrap resolvers which
 // match either this node's listen address or its advertised host address.
-func (cfg *Config) FilterGossipBootstrapResolvers(
-	ctx context.Context, listen, advert net.Addr,
-) []resolver.Resolver {
+func (cfg *Config) FilterGossipBootstrapResolvers(ctx context.Context) []resolver.Resolver {
+	var listen, advert net.Addr
+	listen = util.NewUnresolvedAddr("tcp", cfg.Addr)
+	advert = util.NewUnresolvedAddr("tcp", cfg.AdvertiseAddr)
 	filtered := make([]resolver.Resolver, 0, len(cfg.GossipBootstrapResolvers))
 	addrs := make([]string, 0, len(cfg.GossipBootstrapResolvers))
+
 	for _, r := range cfg.GossipBootstrapResolvers {
 		if r.Addr() == advert.String() || r.Addr() == listen.String() {
 			if log.V(1) {

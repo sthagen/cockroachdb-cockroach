@@ -71,7 +71,6 @@ select '''
 			f.Close()
 		}
 		_ = os.Remove(fname)
-		stdin = os.Stdin
 	}()
 
 	for _, test := range tests {
@@ -90,10 +89,7 @@ select '''
 			fmt.Fprintln(stderr, err)
 			return
 		}
-		// Override the standard input for runInteractive().
-		stdin = f
-
-		err := runInteractive(conn)
+		err := runInteractive(conn, f)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 		}
@@ -195,12 +191,15 @@ func TestIsEndOfStatement(t *testing.T) {
 func TestHandleCliCmdSqlAlias(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	initCLIDefaults()
+
 	clientSideCommandTestsTable := []struct {
 		commandString string
 		wantSQLStmt   string
 	}{
 		{`\l`, `SHOW DATABASES`},
 		{`\dt`, `SHOW TABLES`},
+		{`\dT`, `SHOW TYPES`},
 		{`\du`, `SHOW USERS`},
 		{`\d mytable`, `SHOW COLUMNS FROM mytable`},
 		{`\d`, `SHOW TABLES`},
@@ -220,6 +219,7 @@ func TestHandleCliCmdSqlAlias(t *testing.T) {
 func TestHandleCliCmdSlashDInvalidSyntax(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	initCLIDefaults()
 
 	clientSideCommandTests := []string{`\d goodarg badarg`, `\dz`}
 

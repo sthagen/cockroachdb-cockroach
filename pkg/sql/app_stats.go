@@ -34,34 +34,70 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// TODO(arul): The fields on stmtKey should really be immutable fields on
+// stmtStats which are set once (on first addition to the map). Instead, we
+// should use stmtID (which is a hashed string of the fields below) as the
+// stmtKey.
 type stmtKey struct {
-	stmt        string
-	failed      bool
-	distSQLUsed bool
-	vectorized  bool
-	implicitTxn bool
+	anonymizedStmt string
+	failed         bool
+	implicitTxn    bool
 }
+
+const invalidStmtID = 0
+
+// txnKey is the hashed string constructed using the individual statement IDs
+// that comprise the transaction.
+type txnKey uint64
 
 // appStats holds per-application statistics.
 type appStats struct {
+	// TODO(arul): This can be refactored to have a RWLock instead, and have all
+	// usages acquire a read lock whenever appropriate. See #55285.
 	syncutil.Mutex
 
-	st    *cluster.Settings
-	stmts map[stmtKey]*stmtStats
-	txns  transactionStats
+	st        *cluster.Settings
+	stmts     map[stmtKey]*stmtStats
+	txnCounts transactionCounts
+	txns      map[txnKey]*txnStats
+}
+
+type txnStats struct {
+	statementIDs []roachpb.StmtID
+
+	mu struct {
+		syncutil.Mutex
+
+		data roachpb.TransactionStatistics
+	}
 }
 
 // stmtStats holds per-statement statistics.
 type stmtStats struct {
-	syncutil.Mutex
+	// ID is the statementID constructed using the stmtKey fields.
+	ID roachpb.StmtID
 
-	data roachpb.StatementStatistics
-}
-
-// transactionStats holds per-application transaction statistics.
-type transactionStats struct {
+	// data contains all fields that are modified when new statements matching
+	// the stmtKey are executed, and therefore must be protected by a mutex.
 	mu struct {
 		syncutil.Mutex
+
+		// distSQLUsed records whether the last instance of this statement used
+		// distribution.
+		distSQLUsed bool
+
+		// vectorized records whether the last instance of this statement used
+		// vectorization.
+		vectorized bool
+
+		data roachpb.StatementStatistics
+	}
+}
+
+type transactionCounts struct {
+	mu struct {
+		syncutil.Mutex
+		// TODO(arul): Can we rename this without breaking stuff?
 		roachpb.TxnStats
 	}
 }
@@ -71,6 +107,14 @@ type transactionStats struct {
 var stmtStatsEnable = settings.RegisterPublicBoolSetting(
 	"sql.metrics.statement_details.enabled", "collect per-statement query statistics", true,
 )
+
+// TxnStatsNumStmtIDsToRecord limits the number of statementIDs stored for in
+// transactions statistics for a single transaction. This defaults to 1000, and
+// currently is non-configurable (hidden setting).
+var TxnStatsNumStmtIDsToRecord = settings.RegisterPositiveIntSetting(
+	"sql.metrics.transaction_details.max_statement_ids",
+	"max number of statement IDs to store for transaction statistics",
+	1000)
 
 // txnStatsEnable determines whether to collect per-application transaction
 // statistics.
@@ -105,23 +149,18 @@ var logicalPlanCollectionPeriod = settings.RegisterPublicNonNegativeDurationSett
 )
 
 func (s stmtKey) String() string {
-	return s.flags() + s.stmt
-}
-
-func (s stmtKey) flags() string {
-	var b bytes.Buffer
 	if s.failed {
-		b.WriteByte('!')
+		return "!" + s.anonymizedStmt
 	}
-	if s.distSQLUsed {
-		b.WriteByte('+')
-	}
-	return b.String()
+	return s.anonymizedStmt
 }
 
 // recordStatement saves per-statement statistics.
 //
-// samplePlanDescription can be nil, as these are only sampled periodically per unique fingerprint.
+// samplePlanDescription can be nil, as these are only sampled periodically
+// per unique fingerprint.
+// recordStatement always returns a valid stmtID corresponding to the given
+// stmt regardless of whether the statement is actually recorded or not.
 func (a *appStats) recordStatement(
 	stmt *Statement,
 	samplePlanDescription *roachpb.ExplainTreePlanNode,
@@ -133,85 +172,120 @@ func (a *appStats) recordStatement(
 	err error,
 	parseLat, planLat, runLat, svcLat, ovhLat float64,
 	stats topLevelQueryStats,
-) {
-	if !stmtStatsEnable.Get(&a.st.SV) {
-		return
-	}
-
-	if t := sqlStatsCollectionLatencyThreshold.Get(&a.st.SV); t > 0 && t.Seconds() >= svcLat {
-		return
+) roachpb.StmtID {
+	createIfNonExistent := true
+	// If the statement is below the latency threshold, or stats aren't being
+	// recorded we don't need to create an entry in the stmts map for it. We do
+	// still need stmtID for transaction level metrics tracking.
+	t := sqlStatsCollectionLatencyThreshold.Get(&a.st.SV)
+	if !stmtStatsEnable.Get(&a.st.SV) || (t > 0 && t.Seconds() >= svcLat) {
+		createIfNonExistent = false
 	}
 
 	// Get the statistics object.
-	s := a.getStatsForStmt(
-		stmt, distSQLUsed, vectorized, implicitTxn,
-		err, true, /* createIfNonexistent */
+	s, stmtID := a.getStatsForStmt(
+		stmt, implicitTxn,
+		err, createIfNonExistent,
 	)
 
+	// This statement was below the latency threshold or sql stats aren't being
+	// recorded. Either way, we don't need to record anything in the stats object
+	// for this statement, though we do need to return the statement ID for
+	// transaction level metrics collection.
+	if !createIfNonExistent {
+		return stmtID
+	}
+
 	// Collect the per-statement statistics.
-	s.Lock()
-	s.data.Count++
+	s.mu.Lock()
+	s.mu.data.Count++
 	if err != nil {
-		s.data.SensitiveInfo.LastErr = err.Error()
+		s.mu.data.SensitiveInfo.LastErr = err.Error()
 	}
 	// Only update MostRecentPlanDescription if we sampled a new PlanDescription.
 	if samplePlanDescription != nil {
-		s.data.SensitiveInfo.MostRecentPlanDescription = *samplePlanDescription
-		s.data.SensitiveInfo.MostRecentPlanTimestamp = timeutil.Now()
+		s.mu.data.SensitiveInfo.MostRecentPlanDescription = *samplePlanDescription
+		s.mu.data.SensitiveInfo.MostRecentPlanTimestamp = timeutil.Now()
 	}
 	if automaticRetryCount == 0 {
-		s.data.FirstAttemptCount++
-	} else if int64(automaticRetryCount) > s.data.MaxRetries {
-		s.data.MaxRetries = int64(automaticRetryCount)
+		s.mu.data.FirstAttemptCount++
+	} else if int64(automaticRetryCount) > s.mu.data.MaxRetries {
+		s.mu.data.MaxRetries = int64(automaticRetryCount)
 	}
-	s.data.NumRows.Record(s.data.Count, float64(numRows))
-	s.data.ParseLat.Record(s.data.Count, parseLat)
-	s.data.PlanLat.Record(s.data.Count, planLat)
-	s.data.RunLat.Record(s.data.Count, runLat)
-	s.data.ServiceLat.Record(s.data.Count, svcLat)
-	s.data.OverheadLat.Record(s.data.Count, ovhLat)
-	s.data.BytesRead.Record(s.data.Count, float64(stats.bytesRead))
-	s.data.RowsRead.Record(s.data.Count, float64(stats.rowsRead))
-	s.Unlock()
+	s.mu.data.NumRows.Record(s.mu.data.Count, float64(numRows))
+	s.mu.data.ParseLat.Record(s.mu.data.Count, parseLat)
+	s.mu.data.PlanLat.Record(s.mu.data.Count, planLat)
+	s.mu.data.RunLat.Record(s.mu.data.Count, runLat)
+	s.mu.data.ServiceLat.Record(s.mu.data.Count, svcLat)
+	s.mu.data.OverheadLat.Record(s.mu.data.Count, ovhLat)
+	s.mu.data.BytesRead.Record(s.mu.data.Count, float64(stats.bytesRead))
+	s.mu.data.RowsRead.Record(s.mu.data.Count, float64(stats.rowsRead))
+	s.mu.vectorized = vectorized
+	s.mu.distSQLUsed = distSQLUsed
+	s.mu.Unlock()
+
+	return s.ID
 }
 
-// getStatsForStmt retrieves the per-stmt stat object.
+// getStatsForStmt retrieves the per-stmt stat object. Regardless of if a valid
+// stat object is returned or not, we always return the correct stmtID
+// for the given stmt.
 func (a *appStats) getStatsForStmt(
-	stmt *Statement,
-	distSQLUsed bool,
-	vectorized bool,
-	implicitTxn bool,
-	err error,
-	createIfNonexistent bool,
-) *stmtStats {
+	stmt *Statement, implicitTxn bool, err error, createIfNonexistent bool,
+) (*stmtStats, roachpb.StmtID) {
 	// Extend the statement key with various characteristics, so
 	// that we use separate buckets for the different situations.
 	key := stmtKey{
 		failed:      err != nil,
-		distSQLUsed: distSQLUsed,
-		vectorized:  vectorized,
 		implicitTxn: implicitTxn,
 	}
 	if stmt.AnonymizedStr != "" {
 		// Use the cached anonymized string.
-		key.stmt = stmt.AnonymizedStr
+		key.anonymizedStmt = stmt.AnonymizedStr
 	} else {
-		key.stmt = anonymizeStmt(stmt.AST)
+		key.anonymizedStmt = anonymizeStmt(stmt.AST)
 	}
 
-	return a.getStatsForStmtWithKey(key, createIfNonexistent)
+	// We first try and see if we can get by without creating a new entry for this
+	// key, as this allows us to not construct the statementID from scratch (which
+	// is an expensive operation)
+	s := a.getStatsForStmtWithKey(key, invalidStmtID, false /* createIfNonexistent */)
+	if s == nil {
+		stmtID := constructStatementIDFromStmtKey(key)
+		return a.getStatsForStmtWithKey(key, stmtID, createIfNonexistent), stmtID
+	}
+	return s, s.ID
 }
 
-func (a *appStats) getStatsForStmtWithKey(key stmtKey, createIfNonexistent bool) *stmtStats {
+func (a *appStats) getStatsForStmtWithKey(
+	key stmtKey, stmtID roachpb.StmtID, createIfNonexistent bool,
+) *stmtStats {
 	a.Lock()
 	// Retrieve the per-statement statistic object, and create it if it
 	// doesn't exist yet.
 	s, ok := a.stmts[key]
 	if !ok && createIfNonexistent {
 		s = &stmtStats{}
+		s.ID = stmtID
 		a.stmts[key] = s
 	}
 	a.Unlock()
+	return s
+}
+
+func (a *appStats) getStatsForTxnWithKey(
+	key txnKey, stmtIDs []roachpb.StmtID, createIfNonexistent bool,
+) *txnStats {
+	a.Lock()
+	defer a.Unlock()
+	// Retrieve the per-transaction statistic object, and create it if it doesn't
+	// exist yet.
+	s, ok := a.txns[key]
+	if !ok && createIfNonexistent {
+		s = &txnStats{}
+		s.statementIDs = stmtIDs
+		a.txns[key] = s
+	}
 	return s
 }
 
@@ -227,38 +301,66 @@ func (a *appStats) Add(other *appStats) {
 
 	// Copy the statement stats for each statement key.
 	for k, v := range statMap {
-		v.Lock()
-		statCopy := &stmtStats{data: v.data}
-		v.Unlock()
+		v.mu.Lock()
+		statCopy := &stmtStats{}
+		statCopy.mu.data = v.mu.data
+		v.mu.Unlock()
+		statCopy.ID = v.ID
 		statMap[k] = statCopy
 	}
 
 	// Merge the statement stats.
 	for k, v := range statMap {
-		s := a.getStatsForStmtWithKey(k, true)
-		s.Lock()
+		s := a.getStatsForStmtWithKey(k, v.ID, true /* createIfNonexistent */)
+		s.mu.Lock()
 		// Note that we don't need to take a lock on v because
 		// no other thread knows about v yet.
-		s.data.Add(&v.data)
-		s.Unlock()
+		s.mu.data.Add(&v.mu.data)
+		s.mu.Unlock()
+	}
+
+	// Do what we did above for the statMap for the txn Map now.
+	other.Lock()
+	txnMap := make(map[txnKey]*txnStats)
+	for k, v := range other.txns {
+		txnMap[k] = v
+	}
+	other.Unlock()
+
+	// Copy the transaction stats for each txn key
+	for k, v := range txnMap {
+		v.mu.Lock()
+		txnCopy := &txnStats{}
+		txnCopy.mu.data = v.mu.data
+		v.mu.Unlock()
+		txnCopy.statementIDs = v.statementIDs
+		txnMap[k] = txnCopy
+	}
+
+	// Merge the txn stats
+	for k, v := range txnMap {
+		t := a.getStatsForTxnWithKey(k, v.statementIDs, true /* createIfNonExistent */)
+		t.mu.Lock()
+		t.mu.data.Add(&v.mu.data)
+		t.mu.Unlock()
 	}
 
 	// Create a copy of the other's transactions statistics.
-	other.txns.mu.Lock()
-	txnStats := other.txns.mu.TxnStats
-	other.txns.mu.Unlock()
+	other.txnCounts.mu.Lock()
+	txnStats := other.txnCounts.mu.TxnStats
+	other.txnCounts.mu.Unlock()
 
 	// Merge the transaction stats.
-	a.txns.mu.Lock()
-	a.txns.mu.TxnStats.Add(txnStats)
-	a.txns.mu.Unlock()
+	a.txnCounts.mu.Lock()
+	a.txnCounts.mu.TxnStats.Add(txnStats)
+	a.txnCounts.mu.Unlock()
 }
 
 func anonymizeStmt(ast tree.Statement) string {
 	return tree.AsStringWithFlags(ast, tree.FmtHideConstants)
 }
 
-func (s *transactionStats) getStats() (
+func (s *transactionCounts) getStats() (
 	txnCount int64,
 	txnTimeAvg float64,
 	txnTimeVar float64,
@@ -275,7 +377,9 @@ func (s *transactionStats) getStats() (
 	return txnCount, txnTimeAvg, txnTimeVar, committedCount, implicitCount
 }
 
-func (s *transactionStats) recordTransaction(txnTimeSec float64, ev txnEvent, implicit bool) {
+func (s *transactionCounts) recordTransactionCounts(
+	txnTimeSec float64, ev txnEvent, implicit bool,
+) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.mu.TxnCount++
@@ -288,36 +392,72 @@ func (s *transactionStats) recordTransaction(txnTimeSec float64, ev txnEvent, im
 	}
 }
 
-func (a *appStats) recordTransaction(txnTimeSec float64, ev txnEvent, implicit bool) {
+func (a *appStats) recordTransactionCounts(txnTimeSec float64, ev txnEvent, implicit bool) {
 	if !txnStatsEnable.Get(&a.st.SV) {
 		return
 	}
-	a.txns.recordTransaction(txnTimeSec, ev, implicit)
+	a.txnCounts.recordTransactionCounts(txnTimeSec, ev, implicit)
+}
+
+// recordTransaction saves per-transaction statistics
+func (a *appStats) recordTransaction(
+	key txnKey,
+	retryCount int64,
+	statementIDs []roachpb.StmtID,
+	serviceLat time.Duration,
+	retryLat time.Duration,
+	commitLat time.Duration,
+	numRows int,
+) {
+	if !txnStatsEnable.Get(&a.st.SV) {
+		return
+	}
+	// Only collect stats if the transaction service time is above the configured
+	// stats collection latency threshold.
+	t := sqlStatsCollectionLatencyThreshold.Get(&a.st.SV)
+	if t > 0 && t.Seconds() >= serviceLat.Seconds() {
+		return
+	}
+
+	// Get the statistics object.
+	s := a.getStatsForTxnWithKey(key, statementIDs, true /* createIfNonexistent */)
+
+	// Collect the per-transaction statistics.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.mu.data.Count++
+
+	s.mu.data.NumRows.Record(s.mu.data.Count, float64(numRows))
+	s.mu.data.ServiceLat.Record(s.mu.data.Count, serviceLat.Seconds())
+	s.mu.data.RetryLat.Record(s.mu.data.Count, retryLat.Seconds())
+	s.mu.data.CommitLat.Record(s.mu.data.Count, commitLat.Seconds())
+	if retryCount > s.mu.data.MaxRetries {
+		s.mu.data.MaxRetries = retryCount
+	}
 }
 
 // shouldSaveLogicalPlanDescription returns whether we should save this as a
 // sample logical plan for its corresponding fingerprint. We use
 // `logicalPlanCollectionPeriod` to assess how frequently to sample logical
 // plans.
-func (a *appStats) shouldSaveLogicalPlanDescription(
-	stmt *Statement, useDistSQL bool, vectorized bool, implicitTxn bool, err error,
-) bool {
+func (a *appStats) shouldSaveLogicalPlanDescription(stmt *Statement, implicitTxn bool) bool {
 	if !sampleLogicalPlans.Get(&a.st.SV) {
 		return false
 	}
-	stats := a.getStatsForStmt(
-		stmt, useDistSQL, vectorized, implicitTxn,
-		err, false, /* createIfNonexistent */
-	)
+	// We don't know yet if we will hit an error, so we assume we don't. The worst
+	// that can happen is that for statements that always error out, we will
+	// always save the tree plan.
+	stats, _ := a.getStatsForStmt(stmt, implicitTxn, nil /* error */, false /* createIfNonexistent */)
 	if stats == nil {
 		// Save logical plan the first time we see new statement fingerprint.
 		return true
 	}
 	now := timeutil.Now()
 	period := logicalPlanCollectionPeriod.Get(&a.st.SV)
-	stats.Lock()
-	defer stats.Unlock()
-	timeLastSampled := stats.data.SensitiveInfo.MostRecentPlanTimestamp
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	timeLastSampled := stats.mu.data.SensitiveInfo.MostRecentPlanTimestamp
 	return now.Sub(timeLastSampled) >= period
 }
 
@@ -341,14 +481,15 @@ func (s *sqlStats) getStatsForApplication(appName string) *appStats {
 	a := &appStats{
 		st:    s.st,
 		stmts: make(map[stmtKey]*stmtStats),
+		txns:  make(map[txnKey]*txnStats),
 	}
 	s.apps[appName] = a
 	return a
 }
 
-// resetAndMaybeDumpStats clears all the stored per-app and per-statement
-// statistics. If target s not nil, then the stats in s will be flushed
-// into target.
+// resetAndMaybeDumpStats clears all the stored per-app, per-statement and
+// per-transaction statistics. If target s not nil, then the stats in s will be
+// flushed into target.
 func (s *sqlStats) resetAndMaybeDumpStats(ctx context.Context, target *sqlStats) {
 	// Note: we do not clear the entire s.apps map here. We would need
 	// to do so to prevent problems with a runaway client running `SET
@@ -389,13 +530,14 @@ func (s *sqlStats) resetAndMaybeDumpStats(ctx context.Context, target *sqlStats)
 
 		// Only save a copy of a if we need to dump a copy of the stats.
 		if target != nil {
-			aCopy := &appStats{st: a.st, stmts: a.stmts}
+			aCopy := &appStats{st: a.st, stmts: a.stmts, txns: a.txns}
 			appStatsCopy[appName] = aCopy
 		}
 
 		// Clear the map, to release the memory; make the new map somewhat already
 		// large for the likely future workload.
 		a.stmts = make(map[stmtKey]*stmtStats, len(a.stmts)/2)
+		a.txns = make(map[txnKey]*txnStats, len(a.txns)/2)
 		a.Unlock()
 	}
 	s.lastReset = timeutil.Now()
@@ -424,16 +566,22 @@ func dumpStmtStats(ctx context.Context, appName string, stats map[stmtKey]*stmtS
 	}
 	var buf bytes.Buffer
 	for key, s := range stats {
-		s.Lock()
-		json, err := json.Marshal(s.data)
-		s.Unlock()
+		s.mu.Lock()
+		json, err := json.Marshal(s.mu.data)
+		s.mu.Unlock()
 		if err != nil {
 			log.Errorf(ctx, "error while marshaling stats for %q // %q: %v", appName, key.String(), err)
 			continue
 		}
 		fmt.Fprintf(&buf, "%q: %s\n", key.String(), json)
 	}
-	log.Infof(ctx, "Statistics for %q:\n%s", appName, buf.String())
+	log.Infof(ctx, "statistics for %q:\n%s", appName, buf.String())
+}
+
+func constructStatementIDFromStmtKey(key stmtKey) roachpb.StmtID {
+	return roachpb.ConstructStatementID(
+		key.anonymizedStmt, key.failed, key.implicitTxn,
+	)
 }
 
 func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
@@ -480,6 +628,32 @@ func (s *sqlStats) getUnscrubbedStmtStats(
 	return s.getStmtStats(vt, false /* scrub */)
 }
 
+func (s *sqlStats) getUnscrubbedTxnStats() []roachpb.CollectedTransactionStatistics {
+	s.Lock()
+	defer s.Unlock()
+	var ret []roachpb.CollectedTransactionStatistics
+	for appName, a := range s.apps {
+		a.Lock()
+		// guesstimate that we'll need apps*(transactions-per-app)
+		if cap(ret) == 0 {
+			ret = make([]roachpb.CollectedTransactionStatistics, 0, len(a.txns)*len(s.apps))
+		}
+		for _, stats := range a.txns {
+			stats.mu.Lock()
+			data := stats.mu.data
+			stats.mu.Unlock()
+
+			ret = append(ret, roachpb.CollectedTransactionStatistics{
+				StatementIDs: stats.statementIDs,
+				App:          appName,
+				Stats:        data,
+			})
+		}
+		a.Unlock()
+	}
+	return ret
+}
+
 func (s *sqlStats) getStmtStats(
 	vt *VirtualSchemaHolder, scrub bool,
 ) []roachpb.CollectedStatementStatistics {
@@ -494,28 +668,32 @@ func (s *sqlStats) getStmtStats(
 			ret = make([]roachpb.CollectedStatementStatistics, 0, len(a.stmts)*len(s.apps))
 		}
 		for q, stats := range a.stmts {
-			maybeScrubbed := q.stmt
+			maybeScrubbed := q.anonymizedStmt
 			maybeHashedAppName := appName
 			ok := true
 			if scrub {
-				maybeScrubbed, ok = scrubStmtStatKey(vt, q.stmt)
+				maybeScrubbed, ok = scrubStmtStatKey(vt, q.anonymizedStmt)
 				if !strings.HasPrefix(appName, catconstants.ReportableAppNamePrefix) {
 					maybeHashedAppName = HashForReporting(salt, appName)
 				}
 			}
+
 			if ok {
+				stats.mu.Lock()
+				data := stats.mu.data
+				distSQLUsed := stats.mu.distSQLUsed
+				vectorized := stats.mu.vectorized
+				stats.mu.Unlock()
+
 				k := roachpb.StatementStatisticsKey{
 					Query:       maybeScrubbed,
-					DistSQL:     q.distSQLUsed,
+					DistSQL:     distSQLUsed,
 					Opt:         true,
-					Vec:         q.vectorized,
+					Vec:         vectorized,
 					ImplicitTxn: q.implicitTxn,
 					Failed:      q.failed,
 					App:         maybeHashedAppName,
 				}
-				stats.Lock()
-				data := stats.data
-				stats.Unlock()
 
 				if scrub {
 					// Quantize the counts to avoid leaking information that way.
@@ -523,7 +701,11 @@ func (s *sqlStats) getStmtStats(
 					data.SensitiveInfo = data.SensitiveInfo.GetScrubbedCopy()
 				}
 
-				ret = append(ret, roachpb.CollectedStatementStatistics{Key: k, Stats: data})
+				ret = append(ret, roachpb.CollectedStatementStatistics{
+					Key:   k,
+					ID:    stats.ID,
+					Stats: data,
+				})
 			}
 		}
 		a.Unlock()

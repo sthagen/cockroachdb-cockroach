@@ -16,10 +16,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 )
 
 // prepareSetSchema verifies that a table/type can be set to the desired
@@ -29,7 +31,7 @@ func (p *planner) prepareSetSchema(
 ) (descpb.ID, error) {
 
 	switch t := desc.(type) {
-	case *MutableTableDescriptor, *MutableTypeDescriptor:
+	case *tabledesc.Mutable, *typedesc.Mutable:
 	default:
 		return 0, pgerror.Newf(
 			pgcode.InvalidParameterValue,
@@ -40,30 +42,19 @@ func (p *planner) prepareSetSchema(
 	schemaID := desc.GetParentSchemaID()
 
 	// Lookup the the schema we want to set to.
-	exists, res, err := p.LogicalSchemaAccessor().GetSchema(
-		ctx, p.txn,
-		p.ExecCfg().Codec,
-		databaseID,
-
-		schema,
-	)
+	_, res, err := p.ResolveUncachedSchemaDescriptor(ctx, databaseID, schema, true /* required */)
 	if err != nil {
 		return 0, err
 	}
 
-	if !exists {
-		return 0, pgerror.Newf(pgcode.InvalidSchemaName,
-			"schema %s does not exist", schema)
-	}
-
 	switch res.Kind {
-	case sqlbase.SchemaTemporary:
+	case catalog.SchemaTemporary:
 		return 0, pgerror.Newf(pgcode.FeatureNotSupported,
 			"cannot move objects into or out of temporary schemas")
-	case sqlbase.SchemaVirtual:
+	case catalog.SchemaVirtual:
 		return 0, pgerror.Newf(pgcode.FeatureNotSupported,
 			"cannot move objects into or out of virtual schemas")
-	case sqlbase.SchemaPublic:
+	case catalog.SchemaPublic:
 		// We do not need to check for privileges on the public schema.
 	default:
 		// The user needs CREATE privilege on the target schema to move an object
@@ -89,9 +80,9 @@ func (p *planner) prepareSetSchema(
 	if err == nil && exists {
 		collidingDesc, err := catalogkv.GetAnyDescriptorByID(ctx, p.txn, p.ExecCfg().Codec, id, catalogkv.Immutable)
 		if err != nil {
-			return 0, sqlbase.WrapErrorWhileConstructingObjectAlreadyExistsErr(err)
+			return 0, sqlerrors.WrapErrorWhileConstructingObjectAlreadyExistsErr(err)
 		}
-		return 0, sqlbase.MakeObjectAlreadyExistsError(collidingDesc.DescriptorProto(), desc.GetName())
+		return 0, sqlerrors.MakeObjectAlreadyExistsError(collidingDesc.DescriptorProto(), desc.GetName())
 	}
 
 	return desiredSchemaID, nil

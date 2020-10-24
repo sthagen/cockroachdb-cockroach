@@ -74,6 +74,7 @@ func (*AlterTableSetDefault) alterTableCmd()         {}
 func (*AlterTableValidateConstraint) alterTableCmd() {}
 func (*AlterTablePartitionBy) alterTableCmd()        {}
 func (*AlterTableInjectStats) alterTableCmd()        {}
+func (*AlterTableOwner) alterTableCmd()              {}
 
 var _ AlterTableCmd = &AlterTableAddColumn{}
 var _ AlterTableCmd = &AlterTableAddConstraint{}
@@ -90,6 +91,7 @@ var _ AlterTableCmd = &AlterTableSetDefault{}
 var _ AlterTableCmd = &AlterTableValidateConstraint{}
 var _ AlterTableCmd = &AlterTablePartitionBy{}
 var _ AlterTableCmd = &AlterTableInjectStats{}
+var _ AlterTableCmd = &AlterTableOwner{}
 
 // ColumnMutationCmd is the subset of AlterTableCmds that modify an
 // existing column.
@@ -177,6 +179,7 @@ func (node *AlterTable) HoistAddColumnConstraints() {
 				}
 				normalizedCmds = append(normalizedCmds, constraint)
 				d.References.Table = nil
+				telemetry.Inc(sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "add_column.references"))
 			}
 		}
 	}
@@ -547,17 +550,21 @@ func (node *AlterTableInjectStats) Format(ctx *FmtCtx) {
 
 // AlterTableSetSchema represents an ALTER TABLE SET SCHEMA command.
 type AlterTableSetSchema struct {
-	Name       *UnresolvedObjectName
-	Schema     string
-	IfExists   bool
-	IsView     bool
-	IsSequence bool
+	Name           *UnresolvedObjectName
+	Schema         Name
+	IfExists       bool
+	IsView         bool
+	IsMaterialized bool
+	IsSequence     bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *AlterTableSetSchema) Format(ctx *FmtCtx) {
 	ctx.WriteString("ALTER")
 	if node.IsView {
+		if node.IsMaterialized {
+			ctx.WriteString(" MATERIALIZED")
+		}
 		ctx.WriteString(" VIEW ")
 	} else if node.IsSequence {
 		ctx.WriteString(" SEQUENCE ")
@@ -569,5 +576,21 @@ func (node *AlterTableSetSchema) Format(ctx *FmtCtx) {
 	}
 	node.Name.Format(ctx)
 	ctx.WriteString(" SET SCHEMA ")
-	ctx.WriteString(node.Schema)
+	ctx.FormatNode(&node.Schema)
+}
+
+// AlterTableOwner represents an ALTER TABLE OWNER TO command.
+type AlterTableOwner struct {
+	Owner Name
+}
+
+// TelemetryCounter implements the AlterTableCmd interface.
+func (node *AlterTableOwner) TelemetryCounter() telemetry.Counter {
+	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "owner to")
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterTableOwner) Format(ctx *FmtCtx) {
+	ctx.WriteString(" OWNER TO ")
+	ctx.FormatNode(&node.Owner)
 }

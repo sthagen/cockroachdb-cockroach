@@ -152,3 +152,128 @@ func TestCastsFromUnknown(t *testing.T) {
 		}
 	}
 }
+
+func TestTupleCastVolatility(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		from, to []*types.T
+		exp      string
+	}{
+		{
+			from: nil,
+			to:   nil,
+			exp:  "leak-proof",
+		},
+		{
+			from: nil,
+			to:   []*types.T{types.Int},
+			exp:  "error",
+		},
+		{
+			from: []*types.T{types.Int},
+			to:   []*types.T{types.Int},
+			exp:  "immutable",
+		},
+		{
+			from: []*types.T{types.TimestampTZ},
+			to:   []*types.T{types.Date},
+			exp:  "stable",
+		},
+		{
+			from: []*types.T{types.Int, types.TimestampTZ},
+			to:   []*types.T{types.Int, types.Date},
+			exp:  "stable",
+		},
+	}
+
+	for _, tc := range testCases {
+		from := *types.EmptyTuple
+		from.InternalType.TupleContents = tc.from
+		to := *types.EmptyTuple
+		to.InternalType.TupleContents = tc.to
+		v, ok := LookupCastVolatility(&from, &to)
+		res := "error"
+		if ok {
+			res = v.String()
+		}
+		if res != tc.exp {
+			t.Errorf("from: %s  to: %s  expected: %s  got: %s", &from, &to, tc.exp, res)
+		}
+	}
+}
+
+func TestCastStringToRegClassTableName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		in       string
+		expected TableName
+	}{
+		{"a", MakeUnqualifiedTableName("a")},
+		{`a"`, MakeUnqualifiedTableName(`a"`)},
+		{`"a""".bB."cD" `, MakeTableNameWithSchema(`a"`, "bb", "cD")},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.in, func(t *testing.T) {
+			out, err := castStringToRegClassTableName(tc.in)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, out)
+		})
+	}
+
+	errorTestCases := []struct {
+		in            string
+		expectedError string
+	}{
+		{"a.b.c.d", "too many components: a.b.c.d"},
+		{"", `invalid table name: `},
+	}
+
+	for _, tc := range errorTestCases {
+		t.Run(tc.in, func(t *testing.T) {
+			_, err := castStringToRegClassTableName(tc.in)
+			require.EqualError(t, err, tc.expectedError)
+		})
+	}
+
+}
+
+func TestSplitIdentifierList(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		in       string
+		expected []string
+	}{
+		{`abc`, []string{"abc"}},
+		{`abc.dEf  `, []string{"abc", "def"}},
+		{` "aBc"  . d  ."HeLLo"""`, []string{"aBc", "d", `HeLLo"`}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.in, func(t *testing.T) {
+			out, err := splitIdentifierList(tc.in)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, out)
+		})
+	}
+
+	errorTestCases := []struct {
+		in            string
+		expectedError string
+	}{
+		{`"unclosed`, `invalid name: unclosed ": "unclosed`},
+		{`"unclosed""`, `invalid name: unclosed ": "unclosed""`},
+		{`hello !`, `invalid name: expected separator .: hello !`},
+	}
+
+	for _, tc := range errorTestCases {
+		t.Run(tc.in, func(t *testing.T) {
+			_, err := splitIdentifierList(tc.in)
+			require.EqualError(t, err, tc.expectedError)
+		})
+	}
+}

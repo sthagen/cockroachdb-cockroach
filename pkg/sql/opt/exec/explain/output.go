@@ -13,11 +13,14 @@ package explain
 import (
 	"bytes"
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
+	"github.com/cockroachdb/errors"
 )
 
 // OutputBuilder is used to build the output of an explain tree.
@@ -211,10 +214,11 @@ func (ob *OutputBuilder) BuildExplainRows() []tree.Datums {
 	return rows
 }
 
-// BuildString creates a string representation of the plan information.
-// The output string always ends in a newline.
-func (ob *OutputBuilder) BuildString() string {
-	var buf bytes.Buffer
+// BuildStringRows creates a string representation of the plan information and
+// returns it as a list of strings (one for each row). The strings do not end in
+// newline.
+func (ob *OutputBuilder) BuildStringRows() []string {
+	var result []string
 	tp := treeprinter.NewWithStyle(treeprinter.BulletStyle)
 	stack := []treeprinter.Node{tp}
 	entries := ob.entries
@@ -235,11 +239,10 @@ func (ob *OutputBuilder) BuildString() string {
 	// There may be some top-level non-node entries (like "distributed"). Print
 	// them separately, as they can't be part of the tree.
 	for e := popField(); e != nil; e = popField() {
-		buf.WriteString(e.fieldStr())
-		buf.WriteString("\n")
+		result = append(result, e.fieldStr())
 	}
-	if buf.Len() > 0 {
-		buf.WriteString("\n")
+	if len(result) > 0 {
+		result = append(result, "")
 	}
 
 	for len(entries) > 0 {
@@ -257,7 +260,19 @@ func (ob *OutputBuilder) BuildString() string {
 			child.AddLine(entry.fieldStr())
 		}
 	}
-	buf.WriteString(tp.String())
+	result = append(result, tp.FormattedRows()...)
+	return result
+}
+
+// BuildString creates a string representation of the plan information.
+// The output string always ends in a newline.
+func (ob *OutputBuilder) BuildString() string {
+	rows := ob.BuildStringRows()
+	var buf bytes.Buffer
+	for _, row := range rows {
+		buf.WriteString(row)
+		buf.WriteString("\n")
+	}
 	return buf.String()
 }
 
@@ -286,4 +301,50 @@ func (ob *OutputBuilder) BuildProtoTree() *roachpb.ExplainTreePlanNode {
 	}
 
 	return sentinel.Children[0]
+}
+
+// AddTopLevelField adds a top-level field. Cannot be called while inside a
+// node.
+func (ob *OutputBuilder) AddTopLevelField(key, value string) {
+	if ob.level != 0 {
+		panic(errors.AssertionFailedf("inside node"))
+	}
+	ob.AddField(key, value)
+}
+
+// AddDistribution adds a top-level distribution field. Cannot be called
+// while inside a node.
+func (ob *OutputBuilder) AddDistribution(value string) {
+	if ob.flags.MakeDeterministic {
+		value = "<hidden>"
+	}
+	ob.AddTopLevelField("distribution", value)
+}
+
+// AddVectorized adds a top-level vectorized field. Cannot be called
+// while inside a node.
+func (ob *OutputBuilder) AddVectorized(value bool) {
+	valueStr := fmt.Sprintf("%t", value)
+	if ob.flags.MakeDeterministic {
+		valueStr = "<hidden>"
+	}
+	ob.AddTopLevelField("vectorized", valueStr)
+}
+
+// AddPlanningTime adds a top-level planning time field. Cannot be called
+// while inside a node.
+func (ob *OutputBuilder) AddPlanningTime(delta time.Duration) {
+	if ob.flags.MakeDeterministic {
+		delta = 10 * time.Microsecond
+	}
+	ob.AddTopLevelField("planning time", humanizeutil.Duration(delta))
+}
+
+// AddExecutionTime adds a top-level execution time field. Cannot be called
+// while inside a node.
+func (ob *OutputBuilder) AddExecutionTime(delta time.Duration) {
+	if ob.flags.MakeDeterministic {
+		delta = 100 * time.Microsecond
+	}
+	ob.AddTopLevelField("execution time", humanizeutil.Duration(delta))
 }

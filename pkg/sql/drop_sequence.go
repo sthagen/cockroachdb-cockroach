@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -32,6 +33,14 @@ type dropSequenceNode struct {
 }
 
 func (p *planner) DropSequence(ctx context.Context, n *tree.DropSequence) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"DROP SEQUENCE",
+	); err != nil {
+		return nil, err
+	}
+
 	td := make([]toDelete, 0, len(n.Names))
 	for i := range n.Names {
 		tn := &n.Names[i]
@@ -81,18 +90,11 @@ func (n *dropSequenceNode) startExec(params runParams) error {
 		// Log a Drop Sequence event for this table. This is an auditable log event
 		// and is recorded in the same transaction as the table descriptor
 		// update.
-		if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			ctx,
-			params.p.txn,
-			EventLogDropSequence,
-			int32(droppedDesc.ID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				SequenceName string
-				Statement    string
-				User         string
-			}{toDel.tn.FQString(), n.n.String(), params.SessionData().User},
-		); err != nil {
+		if err := params.p.logEvent(params.ctx,
+			droppedDesc.ID,
+			&eventpb.DropSequence{
+				SequenceName: toDel.tn.FQString(),
+			}); err != nil {
 			return err
 		}
 	}

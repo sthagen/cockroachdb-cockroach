@@ -20,15 +20,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
-	opentracing "github.com/opentracing/opentracing-go"
 )
 
 // txnState contains state associated with an ongoing SQL txn; it constitutes
@@ -68,7 +65,7 @@ type txnState struct {
 
 	// sp is the span corresponding to the SQL txn. These are often root spans, as
 	// SQL txns are frequently the level at which we do tracing.
-	sp opentracing.Span
+	sp *tracing.Span
 	// recordingThreshold, is not zero, indicates that sp is recording and that
 	// the recording should be dumped to the log if execution of the transaction
 	// took more than this.
@@ -159,29 +156,8 @@ func (ts *txnState) resetForNewSQLTxn(
 	// (automatic or user-directed) retries. The span is closed by finishSQLTxn().
 	// TODO(andrei): figure out how to close these spans on server shutdown? Ties
 	// into a larger discussion about how to drain SQL and rollback open txns.
-	var sp opentracing.Span
 	opName := sqlTxnName
-
-	// Create a span for the new txn. The span is always Recordable to support the
-	// use of session tracing, which may start recording on it.
-	// TODO(andrei): We should use tracing.EnsureChildSpan() as that's much more
-	// efficient that StartSpan (and also it'd be simpler), but that interface
-	// doesn't current support the Recordable option.
-	if parentSp := opentracing.SpanFromContext(connCtx); parentSp != nil {
-		// Create a child span for this SQL txn.
-		sp = parentSp.Tracer().StartSpan(
-			opName,
-			opentracing.ChildOf(parentSp.Context()), tracing.Recordable,
-			tracing.LogTagsFromCtx(connCtx),
-		)
-	} else {
-		// Create a root span for this SQL txn.
-		// TODO(tbg): this is the only use of RecordableSpan. Can we instead interchange
-		// the span when we decide that it needs to be traced?
-		sp = tranCtx.tracer.(*tracing.Tracer).StartRootSpan(
-			opName, logtags.FromContext(connCtx), tracing.RecordableSpan)
-	}
-
+	txnCtx, sp := createRootOrChildSpan(connCtx, opName, tranCtx.tracer)
 	if txnType == implicitTxn {
 		sp.SetTag("implicit", "true")
 	}
@@ -189,16 +165,9 @@ func (ts *txnState) resetForNewSQLTxn(
 	alreadyRecording := tranCtx.sessionTracing.Enabled()
 	duration := traceTxnThreshold.Get(&tranCtx.settings.SV)
 	if !alreadyRecording && (duration > 0) {
-		tracing.StartRecording(sp, tracing.SnowballRecording)
+		sp.SetVerbose(true)
 		ts.recordingThreshold = duration
 		ts.recordingStart = timeutil.Now()
-	}
-
-	// Put the new span in the context.
-	txnCtx := opentracing.ContextWithSpan(connCtx, sp)
-
-	if !tracing.IsRecordable(sp) {
-		log.Fatalf(connCtx, "non-recordable transaction span of type: %T", sp)
 	}
 
 	ts.sp = sp
@@ -243,17 +212,7 @@ func (ts *txnState) finishSQLTxn() {
 	}
 
 	if ts.recordingThreshold > 0 {
-		if r := tracing.GetRecording(ts.sp); r != nil {
-			if elapsed := timeutil.Since(ts.recordingStart); elapsed >= ts.recordingThreshold {
-				dump := r.String()
-				if len(dump) > 0 {
-					log.Infof(ts.Ctx, "SQL txn took %s, exceeding tracing threshold of %s:\n%s",
-						elapsed, ts.recordingThreshold, dump)
-				}
-			}
-		} else {
-			log.Warning(ts.Ctx, "missing trace when sampled was enabled")
-		}
+		logTraceAboveThreshold(ts.Ctx, ts.sp.GetRecording(), "SQL txn", ts.recordingThreshold, timeutil.Since(ts.recordingStart))
 	}
 
 	ts.sp.Finish()
@@ -422,7 +381,7 @@ type transitionCtx struct {
 	connMon *mon.BytesMonitor
 	// The Tracer used to create root spans for new txns if the parent ctx doesn't
 	// have a span.
-	tracer opentracing.Tracer
+	tracer *tracing.Tracer
 	// sessionTracing provides access to the session's tracing interface. The
 	// state machine needs to see if session tracing is enabled.
 	sessionTracing *SessionTracing

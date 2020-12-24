@@ -13,6 +13,7 @@ package sql_test
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -59,8 +60,8 @@ CREATE INDEX bc ON test.t(b, c);
 			cID = c.ID
 		}
 	}
-	pkID := tableDesc.PrimaryIndex.ID
-	secID := tableDesc.Indexes[0].ID
+	pkID := tableDesc.GetPrimaryIndexID()
+	secID := tableDesc.GetPublicNonPrimaryIndexes()[0].ID
 
 	// Retrieve the numeric descriptors.
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "hidden")
@@ -119,7 +120,7 @@ ALTER TABLE test.t DROP COLUMN xx;
 
 	for i, d := range testData {
 		t.Run(d.tableExpr, func(t *testing.T) {
-			sql := `SELECT columns FROM [EXPLAIN(VERBOSE) SELECT * FROM ` + d.tableExpr + "] WHERE columns != ''"
+			sql := `SELECT info FROM [EXPLAIN(VERBOSE) SELECT * FROM ` + d.tableExpr + `] WHERE info LIKE '%columns:%'`
 			var columns string
 			if err := db.QueryRow(sql).Scan(&columns); err != nil {
 				if d.expectedError != "" {
@@ -130,7 +131,8 @@ ALTER TABLE test.t DROP COLUMN xx;
 					t.Fatalf("%d: %s: query failed: %v", i, d.tableExpr, err)
 				}
 			}
-
+			r := regexp.MustCompile("^.*columns: ")
+			columns = r.ReplaceAllString(columns, "")
 			if columns != d.expectedColumns {
 				t.Fatalf("%d: %s: expected: %s, got: %s", i, d.tableExpr, d.expectedColumns, columns)
 			}

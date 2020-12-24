@@ -22,7 +22,9 @@ package colexec
 import (
 	"context"
 
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
@@ -30,7 +32,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ apd.Context
+	_ duration.Duration
+	_ coldataext.Datum
 )
 
 // {{/*
@@ -83,6 +94,9 @@ func _SEL_CONST_LOOP(_HAS_NULLS bool) { // */}}
 		_ = col.Get(n - 1)
 		for i := 0; i < n; i++ {
 			var cmp bool
+			// {{if .Left.Sliceable}}
+			//gcassert:bce
+			// {{end}}
 			arg := col.Get(i)
 			_ASSIGN_CMP(cmp, arg, p.constArg, _, col, _)
 			// {{if _HAS_NULLS}}
@@ -130,7 +144,13 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 		_ = col2.Get(n - 1)
 		for i := 0; i < n; i++ {
 			var cmp bool
+			// {{if .Left.Sliceable}}
+			//gcassert:bce
+			// {{end}}
 			arg1 := col1.Get(i)
+			// {{if .Right.Sliceable}}
+			//gcassert:bce
+			// {{end}}
 			arg2 := col2.Get(i)
 			_ASSIGN_CMP(cmp, arg1, arg2, _, col1, col2)
 			// {{if _HAS_NULLS}}

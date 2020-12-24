@@ -22,13 +22,22 @@ package colexec
 import (
 	"context"
 
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ apd.Context
+	_ duration.Duration
 )
 
 // {{/*
@@ -115,9 +124,11 @@ func (c const_TYPEOp) Next(ctx context.Context) coldata.Batch {
 					execgen.SET(col, i, c.constVal)
 				}
 			} else {
-				col = execgen.SLICE(col, 0, n)
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					// {{if .Sliceable}}
+					//gcassert:bce
+					// {{end}}
 					execgen.SET(col, i, c.constVal)
 				}
 			}

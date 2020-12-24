@@ -104,49 +104,53 @@ type transactionCounts struct {
 
 // stmtStatsEnable determines whether to collect per-statement
 // statistics.
-var stmtStatsEnable = settings.RegisterPublicBoolSetting(
+var stmtStatsEnable = settings.RegisterBoolSetting(
 	"sql.metrics.statement_details.enabled", "collect per-statement query statistics", true,
-)
+).WithPublic()
 
 // TxnStatsNumStmtIDsToRecord limits the number of statementIDs stored for in
 // transactions statistics for a single transaction. This defaults to 1000, and
 // currently is non-configurable (hidden setting).
-var TxnStatsNumStmtIDsToRecord = settings.RegisterPositiveIntSetting(
+var TxnStatsNumStmtIDsToRecord = settings.RegisterIntSetting(
 	"sql.metrics.transaction_details.max_statement_ids",
 	"max number of statement IDs to store for transaction statistics",
-	1000)
+	1000,
+	settings.PositiveInt,
+)
 
 // txnStatsEnable determines whether to collect per-application transaction
 // statistics.
-var txnStatsEnable = settings.RegisterPublicBoolSetting(
+var txnStatsEnable = settings.RegisterBoolSetting(
 	"sql.metrics.transaction_details.enabled", "collect per-application transaction statistics", true,
-)
+).WithPublic()
 
 // sqlStatsCollectionLatencyThreshold specifies the minimum amount of time
 // consumed by a SQL statement before it is collected for statistics reporting.
-var sqlStatsCollectionLatencyThreshold = settings.RegisterPublicDurationSetting(
+var sqlStatsCollectionLatencyThreshold = settings.RegisterDurationSetting(
 	"sql.metrics.statement_details.threshold",
-	"minimum execution time to cause statistics to be collected",
+	"minimum execution time to cause statement statistics to be collected. "+
+		"If configured, no transaction stats are collected.",
 	0,
-)
+).WithPublic()
 
-var dumpStmtStatsToLogBeforeReset = settings.RegisterPublicBoolSetting(
+var dumpStmtStatsToLogBeforeReset = settings.RegisterBoolSetting(
 	"sql.metrics.statement_details.dump_to_logs",
 	"dump collected statement statistics to node logs when periodically cleared",
 	false,
-)
+).WithPublic()
 
-var sampleLogicalPlans = settings.RegisterPublicBoolSetting(
+var sampleLogicalPlans = settings.RegisterBoolSetting(
 	"sql.metrics.statement_details.plan_collection.enabled",
 	"periodically save a logical plan for each fingerprint",
 	true,
-)
+).WithPublic()
 
-var logicalPlanCollectionPeriod = settings.RegisterPublicNonNegativeDurationSetting(
+var logicalPlanCollectionPeriod = settings.RegisterDurationSetting(
 	"sql.metrics.statement_details.plan_collection.period",
 	"the time until a new logical plan is collected",
 	5*time.Minute,
-)
+	settings.NonNegativeDuration,
+).WithPublic()
 
 func (s stmtKey) String() string {
 	if s.failed {
@@ -184,7 +188,7 @@ func (a *appStats) recordStatement(
 
 	// Get the statistics object.
 	s, stmtID := a.getStatsForStmt(
-		stmt, implicitTxn,
+		stmt.AnonymizedStr, implicitTxn,
 		err, createIfNonExistent,
 	)
 
@@ -220,6 +224,11 @@ func (a *appStats) recordStatement(
 	s.mu.data.OverheadLat.Record(s.mu.data.Count, ovhLat)
 	s.mu.data.BytesRead.Record(s.mu.data.Count, float64(stats.bytesRead))
 	s.mu.data.RowsRead.Record(s.mu.data.Count, float64(stats.rowsRead))
+	// Note that some fields derived from tracing statements (such as
+	// BytesSentOverNetwork) are not updated here because they are collected
+	// on-demand.
+	// TODO(asubiotto): Record the aforementioned fields here when always-on
+	//  tracing is a thing.
 	s.mu.vectorized = vectorized
 	s.mu.distSQLUsed = distSQLUsed
 	s.mu.Unlock()
@@ -231,19 +240,14 @@ func (a *appStats) recordStatement(
 // stat object is returned or not, we always return the correct stmtID
 // for the given stmt.
 func (a *appStats) getStatsForStmt(
-	stmt *Statement, implicitTxn bool, err error, createIfNonexistent bool,
+	anonymizedStmt string, implicitTxn bool, err error, createIfNonexistent bool,
 ) (*stmtStats, roachpb.StmtID) {
 	// Extend the statement key with various characteristics, so
 	// that we use separate buckets for the different situations.
 	key := stmtKey{
-		failed:      err != nil,
-		implicitTxn: implicitTxn,
-	}
-	if stmt.AnonymizedStr != "" {
-		// Use the cached anonymized string.
-		key.anonymizedStmt = stmt.AnonymizedStr
-	} else {
-		key.anonymizedStmt = anonymizeStmt(stmt.AST)
+		anonymizedStmt: anonymizedStmt,
+		failed:         err != nil,
+		implicitTxn:    implicitTxn,
 	}
 
 	// We first try and see if we can get by without creating a new entry for this
@@ -357,6 +361,9 @@ func (a *appStats) Add(other *appStats) {
 }
 
 func anonymizeStmt(ast tree.Statement) string {
+	if ast == nil {
+		return ""
+	}
 	return tree.AsStringWithFlags(ast, tree.FmtHideConstants)
 }
 
@@ -412,10 +419,11 @@ func (a *appStats) recordTransaction(
 	if !txnStatsEnable.Get(&a.st.SV) {
 		return
 	}
-	// Only collect stats if the transaction service time is above the configured
-	// stats collection latency threshold.
+	// Do not collect transaction statistics if the stats collection latency
+	// threshold is set, since our transaction UI relies on having stats for every
+	// statement in the transaction.
 	t := sqlStatsCollectionLatencyThreshold.Get(&a.st.SV)
-	if t > 0 && t.Seconds() >= serviceLat.Seconds() {
+	if t > 0 {
 		return
 	}
 
@@ -441,14 +449,14 @@ func (a *appStats) recordTransaction(
 // sample logical plan for its corresponding fingerprint. We use
 // `logicalPlanCollectionPeriod` to assess how frequently to sample logical
 // plans.
-func (a *appStats) shouldSaveLogicalPlanDescription(stmt *Statement, implicitTxn bool) bool {
+func (a *appStats) shouldSaveLogicalPlanDescription(anonymizedStmt string, implicitTxn bool) bool {
 	if !sampleLogicalPlans.Get(&a.st.SV) {
 		return false
 	}
 	// We don't know yet if we will hit an error, so we assume we don't. The worst
 	// that can happen is that for statements that always error out, we will
 	// always save the tree plan.
-	stats, _ := a.getStatsForStmt(stmt, implicitTxn, nil /* error */, false /* createIfNonexistent */)
+	stats, _ := a.getStatsForStmt(anonymizedStmt, implicitTxn, nil /* error */, false /* createIfNonexistent */)
 	if stats == nil {
 		// Save logical plan the first time we see new statement fingerprint.
 		return true
@@ -596,7 +604,7 @@ func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
 
 	reformatFn := func(ctx *tree.FmtCtx, tn *tree.TableName) {
 		virtual, err := vt.getVirtualTableEntry(tn)
-		if err != nil || virtual.desc == nil {
+		if err != nil || virtual == nil {
 			ctx.WriteByte('_')
 			return
 		}

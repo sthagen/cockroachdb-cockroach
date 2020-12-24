@@ -34,7 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -215,7 +215,7 @@ func runDebugKeys(cmd *cobra.Command, args []string) error {
 	}
 
 	results := 0
-	return db.Iterate(debugCtx.startKey.Key, debugCtx.endKey.Key, func(kv storage.MVCCKeyValue) error {
+	return db.MVCCIterate(debugCtx.startKey.Key, debugCtx.endKey.Key, storage.MVCCKeyAndIntentsIterKind, func(kv storage.MVCCKeyValue) error {
 		done, err := printer(kv)
 		if err != nil {
 			return err
@@ -316,7 +316,7 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	iter := rditer.NewReplicaDataIterator(&desc, db, debugCtx.replicated, false /* seekEnd */)
+	iter := rditer.NewReplicaEngineDataIterator(&desc, db, debugCtx.replicated)
 	defer iter.Close()
 	results := 0
 	for ; ; iter.Next() {
@@ -325,10 +325,7 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 		} else if !ok {
 			break
 		}
-		kvserver.PrintKeyValue(storage.MVCCKeyValue{
-			Key:   iter.Key(),
-			Value: iter.Value(),
-		})
+		kvserver.PrintEngineKeyValue(iter.UnsafeKey(), iter.UnsafeValue())
 		results++
 		if results == debugCtx.maxResults {
 			break
@@ -352,7 +349,7 @@ func loadRangeDescriptor(
 ) (roachpb.RangeDescriptor, error) {
 	var desc roachpb.RangeDescriptor
 	handleKV := func(kv storage.MVCCKeyValue) error {
-		if kv.Key.Timestamp == (hlc.Timestamp{}) {
+		if kv.Key.Timestamp.IsEmpty() {
 			// We only want values, not MVCCMetadata.
 			return nil
 		}
@@ -380,7 +377,8 @@ func loadRangeDescriptor(
 	start := keys.LocalRangePrefix
 	end := keys.LocalRangeMax
 
-	if err := db.Iterate(start, end, handleKV); err != nil {
+	// NB: Range descriptor keys can have intents.
+	if err := db.MVCCIterate(start, end, storage.MVCCKeyAndIntentsIterKind, handleKV); err != nil {
 		return roachpb.RangeDescriptor{}, err
 	}
 	if desc.RangeID == rangeID {
@@ -401,7 +399,8 @@ func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 	start := keys.LocalRangePrefix
 	end := keys.LocalRangeMax
 
-	return db.Iterate(start, end, func(kv storage.MVCCKeyValue) error {
+	// NB: Range descriptor keys can have intents.
+	return db.MVCCIterate(start, end, storage.MVCCKeyAndIntentsIterKind, func(kv storage.MVCCKeyValue) error {
 		if kvserver.IsRangeDescriptorKey(kv.Key) != nil {
 			return nil
 		}
@@ -459,9 +458,14 @@ Decode and print a hexadecimal-encoded key-value pair.
 		isTS := bytes.HasPrefix(bs[0], keys.TimeseriesPrefix)
 		k, err := storage.DecodeMVCCKey(bs[0])
 		if err != nil {
-			// Older versions of the consistency checker give you diffs with a raw_key that
-			// is already a roachpb.Key, so make a half-assed attempt to support both.
+			// - Could be an EngineKey.
+			// - Older versions of the consistency checker give you diffs with a raw_key that
+			//   is already a roachpb.Key, so make a half-assed attempt to support both.
 			if !isTS {
+				if k, ok := storage.DecodeEngineKey(bs[0]); ok {
+					kvserver.PrintEngineKeyValue(k, bs[1])
+					return nil
+				}
 				fmt.Printf("unable to decode key: %v, assuming it's a roachpb.Key with fake timestamp;\n"+
 					"if the result below looks like garbage, then it likely is:\n\n", err)
 			}
@@ -480,6 +484,7 @@ Decode and print a hexadecimal-encoded key-value pair.
 }
 
 var debugDecodeProtoName string
+var debugDecodeProtoEmitDefaults bool
 var debugDecodeProtoCmd = &cobra.Command{
 	Use:   "decode-proto",
 	Short: "decode-proto <proto> --name=<fully qualified proto name>",
@@ -531,7 +536,8 @@ func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 		string(storage.EncodeKey(storage.MakeMVCCMetadataKey(start))),
 		string(storage.EncodeKey(storage.MakeMVCCMetadataKey(end))))
 
-	return db.Iterate(start, end, func(kv storage.MVCCKeyValue) error {
+	// NB: raft log does not have intents.
+	return db.MVCCIterate(start, end, storage.MVCCKeyIterKind, func(kv storage.MVCCKeyValue) error {
 		kvserver.PrintKeyValue(kv)
 		return nil
 	})
@@ -791,7 +797,7 @@ func parseGossipValues(gossipInfo *gossip.InfoStatus) (string, error) {
 			}
 			output = append(output, fmt.Sprintf("%q: %+v", key, desc))
 		} else if strings.HasPrefix(key, gossip.KeyNodeLivenessPrefix) {
-			var liveness kvserverpb.Liveness
+			var liveness livenesspb.Liveness
 			if err := protoutil.Unmarshal(bytes, &liveness); err != nil {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
@@ -1162,6 +1168,7 @@ var DebugCmdsForRocksDB = []*cobra.Command{
 // All other debug commands go here.
 var debugCmds = append(DebugCmdsForRocksDB,
 	debugBallastCmd,
+	debugCheckLogConfigCmd,
 	debugDecodeKeyCmd,
 	debugDecodeValueCmd,
 	debugDecodeProtoCmd,
@@ -1173,6 +1180,7 @@ var debugCmds = append(DebugCmdsForRocksDB,
 	debugEnvCmd,
 	debugZipCmd,
 	debugMergeLogsCommand,
+	debugResetQuorumCmd,
 )
 
 // DebugCmd is the root of all debug commands. Exported to allow modification by CCL code.
@@ -1207,7 +1215,8 @@ func init() {
 
 	// Note: we hook up FormatValue here in order to avoid a circular dependency
 	// between kvserver and storage.
-	storage.MVCCComparer.FormatValue = func(key, value []byte) fmt.Formatter {
+	// TODO(sumeer): fix this to also format EngineKey KVs.
+	storage.EngineComparer.FormatValue = func(key, value []byte) fmt.Formatter {
 		decoded, err := storage.DecodeMVCCKey(key)
 		if err != nil {
 			return mvccValueFormatter{err: err}
@@ -1219,7 +1228,7 @@ func init() {
 	// and merger functions must be specified to pebble that match the ones used
 	// to write those files.
 	pebbleTool := tool.New(tool.Mergers(storage.MVCCMerger),
-		tool.DefaultComparer(storage.MVCCComparer))
+		tool.DefaultComparer(storage.EngineComparer))
 	debugPebbleCmd.AddCommand(pebbleTool.Commands...)
 	DebugCmd.AddCommand(debugPebbleCmd)
 
@@ -1261,4 +1270,9 @@ func init() {
 	f = debugDecodeProtoCmd.Flags()
 	f.StringVar(&debugDecodeProtoName, "schema", "cockroach.sql.sqlbase.Descriptor",
 		"fully qualified name of the proto to decode")
+	f.BoolVar(&debugDecodeProtoEmitDefaults, "emit-defaults", true,
+		"encode default values for every field")
+
+	f = debugCheckLogConfigCmd.Flags()
+	f.Var(&debugLogChanSel, "only-channels", "selection of channels to include in the output diagram.")
 }

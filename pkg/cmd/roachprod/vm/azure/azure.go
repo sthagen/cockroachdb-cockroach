@@ -458,55 +458,16 @@ func (p *Provider) createVM(
 	name, sshKey string,
 	opts vm.CreateOpts,
 ) (vm compute.VirtualMachine, err error) {
-	// We can inject a cloud-init script into the VM creation to perform
-	// the necessary pre-flight configuration. By default, a
-	// locally-attached SSD is available at /mnt, so we just need to
-	// create the necessary directory and preflight.
-	//
-	// https://cloudinit.readthedocs.io/en/latest/
-	cloudConfig := `#cloud-config
-final_message: "roachprod init completed"
-`
-
-	var cmds []string
-	if opts.SSDOpts.UseLocalSSD {
-		cmds = []string{
-			"mkdir -p /mnt/data1",
-			"touch /mnt/data1/.roachprod-initialized",
-			fmt.Sprintf("chown -R %s /data1", remoteUser),
-		}
-		if opts.SSDOpts.NoExt4Barrier {
-			cmds = append(cmds, "mount -o remount,nobarrier /mnt/data")
-		}
-	} else {
+	startupArgs := azureStartupArgs{RemoteUser: remoteUser}
+	if !opts.SSDOpts.UseLocalSSD {
 		// We define lun42 explicitly in the data disk request below.
-		cloudConfig += `
-disk_setup:
-  /dev/disk/azure/scsi1/lun42:
-    table_type: gpt
-    layout: True
-    overwrite: True
-
-fs_setup:
-  - device: /dev/disk/azure/scsi1/lun42
-    partition: 1
-    filesystem: ext4
-
-mounts:
-  - ["/dev/disk/azure/scsi1/lun42-part1", "/data1", "auto", "defaults"]
-`
-		cmds = []string{
-			"ln -s /data1 /mnt/data1",
-			"touch /data1/.roachprod-initialized",
-			fmt.Sprintf("chown -R %s /data1", remoteUser),
-		}
+		lun := 42
+		startupArgs.AttachedDiskLun = &lun
 	}
-
-	cloudConfig += "runcmd:\n"
-	for _, cmd := range cmds {
-		cloudConfig += fmt.Sprintf(" - %q\n", cmd)
+	startupScript, err := evalStartupTemplate(startupArgs)
+	if err != nil {
+		return vm, err
 	}
-
 	sub, err := p.getSubscription(ctx)
 	if err != nil {
 		return
@@ -561,7 +522,7 @@ mounts:
 				AdminUsername: to.StringPtr(remoteUser),
 				// Per the docs, the cloud-init script should be uploaded already
 				// base64-encoded.
-				CustomData: to.StringPtr(base64.StdEncoding.EncodeToString([]byte(cloudConfig))),
+				CustomData: to.StringPtr(startupScript),
 				LinuxConfiguration: &compute.LinuxConfiguration{
 					SSH: &compute.SSHConfiguration{
 						PublicKeys: &[]compute.SSHPublicKey{
@@ -586,31 +547,58 @@ mounts:
 		},
 	}
 	if !opts.SSDOpts.UseLocalSSD {
-		var storageAccType compute.StorageAccountTypes
-		switch p.opts.networkDiskType {
-		case "premium-disk":
-			storageAccType = compute.StorageAccountTypesPremiumLRS
-		case "ultra-disk":
-			storageAccType = compute.StorageAccountTypesUltraSSDLRS
+		caching := compute.CachingTypesNone
+
+		switch p.opts.diskCaching {
+		case "read-only":
+			caching = compute.CachingTypesReadOnly
+		case "read-write":
+			caching = compute.CachingTypesReadWrite
+		case "none":
+			caching = compute.CachingTypesNone
 		default:
-			err = errors.Newf("unsuported network disk type: %s", p.opts.networkDiskType)
+			err = errors.Newf("unsupported caching behavior: %s", p.opts.diskCaching)
 			return
 		}
-		vm.VirtualMachineProperties.StorageProfile.DataDisks = &[]compute.DataDisk{
+		dataDisks := []compute.DataDisk{
 			{
-				CreateOption: compute.DiskCreateOptionTypesEmpty,
-				DiskSizeGB:   to.Int32Ptr(100),
-				Lun:          to.Int32Ptr(42),
-				ManagedDisk: &compute.ManagedDiskParameters{
-					StorageAccountType: storageAccType,
-				},
+				DiskSizeGB: to.Int32Ptr(p.opts.networkDiskSize),
+				Caching:    caching,
+				Lun:        to.Int32Ptr(42),
 			},
 		}
-		if storageAccType == compute.StorageAccountTypesUltraSSDLRS {
+
+		switch p.opts.networkDiskType {
+		case "ultra-disk":
+			var ultraDisk compute.Disk
+			ultraDisk, err = p.createUltraDisk(ctx, group, name+"-ultra-disk")
+			if err != nil {
+				return
+			}
+			// UltraSSD specific disk configurations.
+			dataDisks[0].CreateOption = compute.DiskCreateOptionTypesAttach
+			dataDisks[0].Name = ultraDisk.Name
+			dataDisks[0].ManagedDisk = &compute.ManagedDiskParameters{
+				StorageAccountType: compute.StorageAccountTypesUltraSSDLRS,
+				ID:                 ultraDisk.ID,
+			}
+
+			// UltraSSDs must be enabled separately.
 			vm.AdditionalCapabilities = &compute.AdditionalCapabilities{
 				UltraSSDEnabled: to.BoolPtr(true),
 			}
+		case "premium-disk":
+			// premium-disk specific disk configurations.
+			dataDisks[0].CreateOption = compute.DiskCreateOptionTypesEmpty
+			dataDisks[0].ManagedDisk = &compute.ManagedDiskParameters{
+				StorageAccountType: compute.StorageAccountTypesPremiumLRS,
+			}
+		default:
+			err = errors.Newf("unsupported network disk type: %s", p.opts.networkDiskType)
+			return
 		}
+
+		vm.StorageProfile.DataDisks = &dataDisks
 	}
 	future, err := client.CreateOrUpdate(ctx, *group.Name, name, vm)
 	if err != nil {
@@ -700,20 +688,6 @@ func (p *Provider) getOrCreateNetworkSecurityGroup(
 		return group, nil
 	}
 
-	// Check if the network security group already exists on Azure.
-	group, err = client.Get(ctx, *resourceGroup.Name, name, "" /* expand */)
-	if err == nil {
-		return cacheAndReturn(group)
-	}
-	var detail autorest.DetailedError
-	if errors.As(err, &detail) {
-		// It's okay if the network security group was not found, it will be created
-		// below.
-		if code, ok := detail.StatusCode.(int); ok && code != 404 {
-			return network.SecurityGroup{}, err
-		}
-	}
-
 	future, err := client.CreateOrUpdate(ctx, *resourceGroup.Name, name, network.SecurityGroup{
 		SecurityGroupPropertiesFormat: &network.SecurityGroupPropertiesFormat{
 			SecurityRules: &[]network.SecurityRule{
@@ -795,6 +769,32 @@ func (p *Provider) getOrCreateNetworkSecurityGroup(
 						DestinationPortRange:     to.StringPtr("*"),
 					},
 				},
+				{
+					Name: to.StringPtr("CockroachPG_Inbound"),
+					SecurityRulePropertiesFormat: &network.SecurityRulePropertiesFormat{
+						Priority:                 to.Int32Ptr(342),
+						Protocol:                 network.SecurityRuleProtocolTCP,
+						Access:                   network.SecurityRuleAccessAllow,
+						Direction:                network.SecurityRuleDirectionInbound,
+						SourceAddressPrefix:      to.StringPtr("*"),
+						SourcePortRange:          to.StringPtr("*"),
+						DestinationAddressPrefix: to.StringPtr("*"),
+						DestinationPortRange:     to.StringPtr("26257"),
+					},
+				},
+				{
+					Name: to.StringPtr("CockroachAdmin_Inbound"),
+					SecurityRulePropertiesFormat: &network.SecurityRulePropertiesFormat{
+						Priority:                 to.Int32Ptr(343),
+						Protocol:                 network.SecurityRuleProtocolTCP,
+						Access:                   network.SecurityRuleAccessAllow,
+						Direction:                network.SecurityRuleDirectionInbound,
+						SourceAddressPrefix:      to.StringPtr("*"),
+						SourcePortRange:          to.StringPtr("*"),
+						DestinationAddressPrefix: to.StringPtr("*"),
+						DestinationPortRange:     to.StringPtr("26258"),
+					},
+				},
 			},
 		},
 		Location: resourceGroup.Location,
@@ -809,6 +809,7 @@ func (p *Provider) getOrCreateNetworkSecurityGroup(
 	if err != nil {
 		return network.SecurityGroup{}, err
 	}
+
 	return cacheAndReturn(securityGroup)
 }
 
@@ -1203,6 +1204,48 @@ func (p *Provider) getOrCreateResourceGroup(
 		return resources.Group{}, err
 	}
 	return cacheAndReturn(group)
+}
+
+func (p *Provider) createUltraDisk(
+	ctx context.Context, group resources.Group, name string,
+) (compute.Disk, error) {
+	sub, err := p.getSubscription(ctx)
+	if err != nil {
+		return compute.Disk{}, err
+	}
+
+	client := compute.NewDisksClient(*sub.SubscriptionID)
+	if client.Authorizer, err = p.getAuthorizer(); err != nil {
+		return compute.Disk{}, err
+	}
+
+	future, err := client.CreateOrUpdate(ctx, *group.Name, name,
+		compute.Disk{
+			Zones:    to.StringSlicePtr([]string{p.opts.zone}),
+			Location: group.Location,
+			Sku: &compute.DiskSku{
+				Name: compute.UltraSSDLRS,
+			},
+			DiskProperties: &compute.DiskProperties{
+				CreationData: &compute.CreationData{
+					CreateOption: compute.Empty,
+				},
+				DiskSizeGB:        to.Int32Ptr(p.opts.networkDiskSize),
+				DiskIOPSReadWrite: to.Int64Ptr(p.opts.ultraDiskIOPS),
+			},
+		})
+	if err != nil {
+		return compute.Disk{}, err
+	}
+	if err := future.WaitForCompletionRef(ctx, client.Client); err != nil {
+		return compute.Disk{}, err
+	}
+	disk, err := future.Result(client)
+	if err != nil {
+		return compute.Disk{}, err
+	}
+	log.Printf("created ultra-disk: %s\n", *disk.Name)
+	return disk, err
 }
 
 // getSubscription chooses the first available subscription. The value

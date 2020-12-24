@@ -493,9 +493,9 @@ var charts = []sectionDescription{
 				Title: "Snapshots",
 				Metrics: []string{
 					"range.snapshots.generated",
-					"range.snapshots.normal-applied",
-					"range.snapshots.preemptive-applied",
-					"range.snapshots.learner-applied",
+					"range.snapshots.applied-voter",
+					"range.snapshots.applied-initial",
+					"range.snapshots.applied-non-voter",
 				},
 			},
 		},
@@ -1238,6 +1238,10 @@ var charts = []sectionDescription{
 				Title:   "Log Commit",
 				Metrics: []string{"raft.process.logcommit.latency"},
 			},
+			{
+				Title:   "Scheduler",
+				Metrics: []string{"raft.scheduler.latency"},
+			},
 		},
 	},
 	{
@@ -1604,6 +1608,10 @@ var charts = []sectionDescription{
 			{
 				Title:   "Total Queries",
 				Metrics: []string{"sql.distsql.queries.total"},
+			},
+			{
+				Title:   "Contended Queries",
+				Metrics: []string{"sql.distsql.contended_queries.count"},
 			},
 			{
 				Title:   "Vectorized Temporary Storage Open File Descriptors",
@@ -2021,6 +2029,17 @@ var charts = []sectionDescription{
 		},
 	},
 	{
+		Organization: [][]string{{SQLLayer, "SQL", "Feature Flag"}},
+		Charts: []chartDescription{
+			{
+				Title: "Feature Flag Denials",
+				Metrics: []string{
+					"sql.feature_flag_denial",
+				},
+			},
+		},
+	},
+	{
 		Organization: [][]string{{StorageLayer, "RocksDB", "Block Cache"}},
 		Charts: []chartDescription{
 			{
@@ -2118,35 +2137,6 @@ var charts = []sectionDescription{
 					"addsstable.delay.total",
 					"addsstable.delay.enginebackpressure",
 				},
-			},
-		},
-	},
-	{
-		Organization: [][]string{{StorageLayer, "Storage", "Compactor"}},
-		Charts: []chartDescription{
-			{
-				Title: "Overview",
-				Metrics: []string{
-					"compactor.suggestionbytes.compacted",
-					"compactor.suggestionbytes.skipped",
-				},
-			},
-			{
-				Title: "Queued",
-				Metrics: []string{
-					"compactor.suggestionbytes.queued",
-				},
-			},
-			{
-				Title: "Success",
-				Metrics: []string{
-					"compactor.compactions.failure",
-					"compactor.compactions.success",
-				},
-			},
-			{
-				Title:   "Time",
-				Metrics: []string{"compactor.compactingnanos"},
 			},
 		},
 	},

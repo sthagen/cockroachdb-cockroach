@@ -371,13 +371,11 @@ func (c *copyMachine) readBinaryTuple(ctx context.Context) error {
 		if len(data) != int(byteCount) {
 			return errors.Newf("partial copy data row")
 		}
-		d, err := pgwirebase.DecodeOidDatum(
-			ctx,
+		d, err := pgwirebase.DecodeDatum(
 			c.parsingEvalCtx,
-			c.resultColumns[i].Typ.Oid(),
+			c.resultColumns[i].Typ,
 			pgwirebase.FormatBinary,
 			data,
-			&c.p,
 		)
 		if err != nil {
 			return pgerror.Wrapf(err, pgcode.BadCopyFileFormat,
@@ -482,7 +480,7 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 	c.rows = c.rows[:0]
 	c.rowsMemAcc.Clear(ctx)
 
-	c.p.stmt = &Statement{}
+	c.p.stmt = Statement{}
 	c.p.stmt.AST = &tree.Insert{
 		Table:   c.table,
 		Columns: c.columns,

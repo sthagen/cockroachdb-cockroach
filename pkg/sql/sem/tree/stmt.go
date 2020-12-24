@@ -111,26 +111,6 @@ func CanWriteData(stmt Statement) bool {
 	return false
 }
 
-// IsStmtParallelized determines if a given statement's execution should be
-// parallelized. This means that its results should be mocked out, and that
-// it should be run asynchronously and in parallel with other statements that
-// are independent.
-func IsStmtParallelized(stmt Statement) bool {
-	parallelizedRetClause := func(ret ReturningClause) bool {
-		_, ok := ret.(*ReturningNothing)
-		return ok
-	}
-	switch s := stmt.(type) {
-	case *Delete:
-		return parallelizedRetClause(s.Returning)
-	case *Insert:
-		return parallelizedRetClause(s.Returning)
-	case *Update:
-		return parallelizedRetClause(s.Returning)
-	}
-	return false
-}
-
 // HiddenFromShowQueries is a pseudo-interface to be implemented
 // by statements that should not show up in SHOW QUERIES (and are hence
 // not cancellable using CANCEL QUERIES either). Usually implemented by
@@ -195,12 +175,20 @@ func (*AlterDatabaseDropRegion) StatementTag() string { return "ALTER DATABASE D
 func (*AlterDatabaseDropRegion) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
-func (*AlterDatabaseSurvive) StatementType() StatementType { return DDL }
+func (*AlterDatabasePrimaryRegion) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*AlterDatabaseSurvive) StatementTag() string { return "ALTER DATABASE SURVIVE" }
+func (*AlterDatabasePrimaryRegion) StatementTag() string { return "ALTER DATABASE PRIMARY REGION" }
 
-func (*AlterDatabaseSurvive) hiddenFromShowQueries() {}
+func (*AlterDatabasePrimaryRegion) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterDatabaseSurvivalGoal) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterDatabaseSurvivalGoal) StatementTag() string { return "ALTER DATABASE SURVIVE" }
+
+func (*AlterDatabaseSurvivalGoal) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
 func (*AlterIndex) StatementType() StatementType { return DDL }
@@ -217,6 +205,14 @@ func (*AlterTable) StatementType() StatementType { return DDL }
 func (*AlterTable) StatementTag() string { return "ALTER TABLE" }
 
 func (*AlterTable) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterTableLocality) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterTableLocality) StatementTag() string { return "ALTER TABLE REGIONAL AFFINITY" }
+
+func (*AlterTableLocality) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
 func (*AlterTableSetSchema) StatementType() StatementType { return DDL }
@@ -547,10 +543,10 @@ func (*Explain) StatementType() StatementType { return Rows }
 func (*Explain) StatementTag() string { return "EXPLAIN" }
 
 // StatementType implements the Statement interface.
-func (*ExplainAnalyzeDebug) StatementType() StatementType { return Rows }
+func (*ExplainAnalyze) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*ExplainAnalyzeDebug) StatementTag() string { return "EXPLAIN ANALYZE (DEBUG)" }
+func (*ExplainAnalyze) StatementTag() string { return "EXPLAIN ANALYZE" }
 
 // StatementType implements the Statement interface.
 func (*Export) StatementType() StatementType { return Rows }
@@ -970,6 +966,12 @@ func (*ShowRangeForRow) StatementType() StatementType { return Rows }
 func (*ShowRangeForRow) StatementTag() string { return "SHOW RANGE FOR ROW" }
 
 // StatementType implements the Statement interface.
+func (*ShowSurvivalGoal) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowSurvivalGoal) StatementTag() string { return "SHOW SURVIVAL GOAL" }
+
+// StatementType implements the Statement interface.
 func (*ShowRegions) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -1054,7 +1056,8 @@ func (n *AlterIndex) String() string                     { return AsString(n) }
 func (n *AlterDatabaseOwner) String() string             { return AsString(n) }
 func (n *AlterDatabaseAddRegion) String() string         { return AsString(n) }
 func (n *AlterDatabaseDropRegion) String() string        { return AsString(n) }
-func (n *AlterDatabaseSurvive) String() string           { return AsString(n) }
+func (n *AlterDatabaseSurvivalGoal) String() string      { return AsString(n) }
+func (n *AlterDatabasePrimaryRegion) String() string     { return AsString(n) }
 func (n *AlterSchema) String() string                    { return AsString(n) }
 func (n *AlterTable) String() string                     { return AsString(n) }
 func (n *AlterTableCmds) String() string                 { return AsString(n) }
@@ -1065,6 +1068,7 @@ func (n *AlterTableDropColumn) String() string           { return AsString(n) }
 func (n *AlterTableDropConstraint) String() string       { return AsString(n) }
 func (n *AlterTableDropNotNull) String() string          { return AsString(n) }
 func (n *AlterTableDropStored) String() string           { return AsString(n) }
+func (n *AlterTableLocality) String() string             { return AsString(n) }
 func (n *AlterTableSetDefault) String() string           { return AsString(n) }
 func (n *AlterTableSetNotNull) String() string           { return AsString(n) }
 func (n *AlterTableSetSchema) String() string            { return AsString(n) }
@@ -1109,7 +1113,7 @@ func (n *DropView) String() string                       { return AsString(n) }
 func (n *DropRole) String() string                       { return AsString(n) }
 func (n *Execute) String() string                        { return AsString(n) }
 func (n *Explain) String() string                        { return AsString(n) }
-func (n *ExplainAnalyzeDebug) String() string            { return AsString(n) }
+func (n *ExplainAnalyze) String() string                 { return AsString(n) }
 func (n *Export) String() string                         { return AsString(n) }
 func (n *Grant) String() string                          { return AsString(n) }
 func (n *GrantRole) String() string                      { return AsString(n) }
@@ -1162,6 +1166,7 @@ func (n *ShowJobs) String() string                       { return AsString(n) }
 func (n *ShowQueries) String() string                    { return AsString(n) }
 func (n *ShowRanges) String() string                     { return AsString(n) }
 func (n *ShowRangeForRow) String() string                { return AsString(n) }
+func (n *ShowSurvivalGoal) String() string               { return AsString(n) }
 func (n *ShowRegions) String() string                    { return AsString(n) }
 func (n *ShowRoleGrants) String() string                 { return AsString(n) }
 func (n *ShowRoles) String() string                      { return AsString(n) }

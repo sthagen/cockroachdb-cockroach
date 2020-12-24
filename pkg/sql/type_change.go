@@ -147,7 +147,9 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 	}
 
 	// If there are any read only enum members, promote them to writeable.
-	if typeDesc.Kind == descpb.TypeDescriptor_ENUM && enumHasNonPublic(typeDesc) {
+	if (typeDesc.Kind == descpb.TypeDescriptor_ENUM ||
+		typeDesc.Kind == descpb.TypeDescriptor_MULTIREGION_ENUM) &&
+		enumHasNonPublic(typeDesc) {
 		if fn := t.execCfg.TypeSchemaChangerTestingKnobs.RunBeforeEnumMemberPromotion; fn != nil {
 			fn()
 		}
@@ -265,27 +267,27 @@ type typeChangeResumer struct {
 
 // Resume implements the jobs.Resumer interface.
 func (t *typeChangeResumer) Resume(
-	ctx context.Context, phs interface{}, _ chan<- tree.Datums,
+	ctx context.Context, execCtx interface{}, _ chan<- tree.Datums,
 ) error {
-	p := phs.(*planner)
-	if p.execCfg.TypeSchemaChangerTestingKnobs.TypeSchemaChangeJobNoOp != nil {
-		if p.execCfg.TypeSchemaChangerTestingKnobs.TypeSchemaChangeJobNoOp() {
+	p := execCtx.(JobExecContext)
+	if p.ExecCfg().TypeSchemaChangerTestingKnobs.TypeSchemaChangeJobNoOp != nil {
+		if p.ExecCfg().TypeSchemaChangerTestingKnobs.TypeSchemaChangeJobNoOp() {
 			return nil
 		}
 	}
 	tc := &typeSchemaChanger{
 		typeID:  t.job.Details().(jobspb.TypeSchemaChangeDetails).TypeID,
-		execCfg: p.execCfg,
+		execCfg: p.ExecCfg(),
 	}
 	return tc.execWithRetry(ctx)
 }
 
 // OnFailOrCancel implements the jobs.Resumer interface.
-func (t *typeChangeResumer) OnFailOrCancel(ctx context.Context, phs interface{}) error {
+func (t *typeChangeResumer) OnFailOrCancel(ctx context.Context, execCtx interface{}) error {
 	// If the job failed, just try again to clean up any draining names.
 	tc := &typeSchemaChanger{
 		typeID:  t.job.Details().(jobspb.TypeSchemaChangeDetails).TypeID,
-		execCfg: phs.(*planner).ExecCfg(),
+		execCfg: execCtx.(JobExecContext).ExecCfg(),
 	}
 
 	return drainNamesForDescriptor(

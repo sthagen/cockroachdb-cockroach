@@ -23,15 +23,28 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ duration.Duration
+	_ coldataext.Datum
+	_ sqltelemetry.EnumTelemetryType
+	_ telemetry.Counter
 )
 
 // {{/*
@@ -146,20 +159,14 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 	if sel := batch.Selection(); sel != nil {
 		sel = sel[:n]
 		for _, i := range sel {
-			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
+			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS, true)
 		}
 	} else {
-		// {{if not (eq .Left.VecMethod "Bytes")}}
-		// {{/* Slice is a noop for Bytes type, so colLen below might contain an
-		// incorrect value. In order to keep bounds check elimination for all other
-		// types, we simply omit this code snippet for Bytes. */}}
-		col1 = execgen.SLICE(col1, 0, n)
-		colLen := col1.Len()
-		_ = projCol.Get(colLen - 1)
-		_ = col2.Get(colLen - 1)
-		// {{end}}
+		_ = projCol.Get(n - 1)
+		_ = col1.Get(n - 1)
+		_ = col2.Get(n - 1)
 		for i := 0; i < n; i++ {
-			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
+			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS, false)
 		}
 	}
 	// _outNulls has been updated from within the _ASSIGN function to include
@@ -178,16 +185,23 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 // */}}
 
 // {{/*
-func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
+func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool, _HAS_SEL bool) { // */}}
 	// {{define "setSingleTupleProjection" -}}
 	// {{$hasNulls := $.HasNulls}}
+	// {{$hasSel := $.HasSel}}
 	// {{with $.Overload}}
 	// {{if _HAS_NULLS}}
 	if !col1Nulls.NullAt(i) && !col2Nulls.NullAt(i) {
 		// We only want to perform the projection operation if both values are not
 		// null.
 		// {{end}}
+		// {{if and (.Left.Sliceable) (not _HAS_SEL)}}
+		//gcassert:bce
+		// {{end}}
 		arg1 := col1.Get(i)
+		// {{if and (.Right.Sliceable) (not _HAS_SEL)}}
+		//gcassert:bce
+		// {{end}}
 		arg2 := col2.Get(i)
 		_ASSIGN(projCol[i], arg1, arg2, projCol, col1, col2)
 		// {{if _HAS_NULLS}}

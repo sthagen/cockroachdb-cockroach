@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -27,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/logtags"
@@ -110,7 +110,7 @@ func makeImportReaderSpecs(
 	format roachpb.IOFileFormat,
 	nodes []roachpb.NodeID,
 	walltime int64,
-	user string,
+	user security.SQLUsername,
 ) []*execinfrapb.ReadImportDataSpec {
 
 	// For each input file, assign it to a node.
@@ -131,7 +131,7 @@ func makeImportReaderSpecs(
 				WalltimeNanos: walltime,
 				Uri:           make(map[int32]string),
 				ResumePos:     make(map[int32]int64),
-				User:          user,
+				UserProto:     user.EncodeProto(),
 			}
 			inputSpecs = append(inputSpecs, spec)
 		}
@@ -182,7 +182,7 @@ func presplitTableBoundaries(
 // returned.
 func DistIngest(
 	ctx context.Context,
-	phs PlanHookState,
+	execCtx JobExecContext,
 	job *jobs.Job,
 	tables map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
 	from []string,
@@ -192,21 +192,17 @@ func DistIngest(
 ) (roachpb.BulkOpSummary, error) {
 	ctx = logtags.AddTag(ctx, "import-distsql-ingest", nil)
 
-	dsp := phs.DistSQLPlanner()
-	evalCtx := phs.ExtendedEvalContext()
+	dsp := execCtx.DistSQLPlanner()
+	evalCtx := execCtx.ExtendedEvalContext()
 
-	planCtx, nodes, err := dsp.SetupAllNodesPlanning(ctx, evalCtx, phs.ExecCfg())
+	planCtx, nodes, err := dsp.SetupAllNodesPlanning(ctx, evalCtx, execCtx.ExecCfg())
 	if err != nil {
 		return roachpb.BulkOpSummary{}, err
 	}
 
-	inputSpecs := makeImportReaderSpecs(job, tables, from, format, nodes, walltime, phs.User())
+	inputSpecs := makeImportReaderSpecs(job, tables, from, format, nodes, walltime, execCtx.User())
 
-	gatewayNodeID, err := evalCtx.ExecCfg.NodeID.OptionalNodeIDErr(47970)
-	if err != nil {
-		return roachpb.BulkOpSummary{}, err
-	}
-	p := MakePhysicalPlan(gatewayNodeID)
+	p := planCtx.NewPhysicalPlan()
 
 	// Setup a one-stage plan with one proc per input spec.
 	corePlacement := make([]physicalplan.ProcessorCorePlacement, len(inputSpecs))
@@ -224,13 +220,20 @@ func DistIngest(
 
 	p.PlanToStreamColMap = []int{0, 1}
 
-	dsp.FinalizePlan(planCtx, &p)
+	dsp.FinalizePlan(planCtx, p)
 
 	if err := job.FractionProgressed(ctx,
 		func(ctx context.Context, details jobspb.ProgressDetails) float32 {
 			prog := details.(*jobspb.Progress_Import).Import
 			prog.ReadProgress = make([]float32, len(from))
 			prog.ResumePos = make([]int64, len(from))
+			if prog.SequenceDetails == nil {
+				prog.SequenceDetails = make([]*jobspb.SequenceDetails, len(from))
+				for i := range prog.SequenceDetails {
+					prog.SequenceDetails[i] = &jobspb.SequenceDetails{}
+				}
+			}
+
 			return 0.0
 		},
 	); err != nil {
@@ -284,8 +287,10 @@ func DistIngest(
 		return nil
 	})
 
-	if err := presplitTableBoundaries(ctx, phs.ExecCfg(), tables); err != nil {
-		return roachpb.BulkOpSummary{}, err
+	if evalCtx.Codec.ForSystemTenant() {
+		if err := presplitTableBoundaries(ctx, execCtx.ExecCfg(), tables); err != nil {
+			return roachpb.BulkOpSummary{}, err
+		}
 	}
 
 	recv := MakeDistSQLReceiver(
@@ -294,7 +299,7 @@ func DistIngest(
 		tree.Rows,
 		nil, /* rangeCache */
 		nil, /* txn - the flow does not read or write the database */
-		func(ts hlc.Timestamp) {},
+		nil, /* clockUpdater */
 		evalCtx.Tracing,
 	)
 	defer recv.Release()
@@ -323,7 +328,7 @@ func DistIngest(
 		defer close(stopProgress)
 		// Copy the evalCtx, as dsp.Run() might change it.
 		evalCtxCopy := *evalCtx
-		dsp.Run(planCtx, nil, &p, recv, &evalCtxCopy, nil /* finishedSetupFn */)()
+		dsp.Run(planCtx, nil, p, recv, &evalCtxCopy, nil /* finishedSetupFn */)()
 		return rowResultWriter.Err()
 	})
 

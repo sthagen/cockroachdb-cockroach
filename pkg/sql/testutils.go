@@ -54,7 +54,11 @@ func CreateTestTableDescriptor(
 			nil, /* affected */
 			&semaCtx,
 			&evalCtx,
-			&sessiondata.SessionData{}, /* sessionData */
+			&sessiondata.SessionData{
+				LocalOnlySessionData: sessiondata.LocalOnlySessionData{
+					EnableUniqueWithoutIndexConstraints: true,
+				},
+			}, /* sessionData */
 			tree.PersistencePermanent,
 		)
 		return desc, err
@@ -114,7 +118,7 @@ func (dsp *DistSQLPlanner) Exec(
 		return err
 	}
 	p := localPlanner.(*planner)
-	p.stmt = &Statement{Statement: stmt}
+	p.stmt = makeStatement(stmt, ClusterWideID{} /* queryID */)
 	if err := p.makeOptimizerPlan(ctx); err != nil {
 		return err
 	}
@@ -128,9 +132,7 @@ func (dsp *DistSQLPlanner) Exec(
 		stmt.AST.StatementType(),
 		execCfg.RangeDescriptorCache,
 		p.txn,
-		func(ts hlc.Timestamp) {
-			execCfg.Clock.Update(ts)
-		},
+		execCfg.Clock,
 		p.ExtendedEvalContext().Tracing,
 	)
 	defer recv.Release()

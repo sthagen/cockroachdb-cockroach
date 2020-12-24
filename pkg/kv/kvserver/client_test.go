@@ -41,7 +41,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -66,7 +68,7 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/v3"
 	"google.golang.org/grpc"
 )
 
@@ -305,7 +307,7 @@ type multiTestContext struct {
 	stores         []*kvserver.Store
 	stoppers       []*stop.Stopper
 	idents         []roachpb.StoreIdent
-	nodeLivenesses []*kvserver.NodeLiveness
+	nodeLivenesses []*liveness.NodeLiveness
 }
 
 func (m *multiTestContext) getNodeIDAddress(nodeID roachpb.NodeID) (net.Addr, error) {
@@ -349,7 +351,7 @@ func (m *multiTestContext) Start(t testing.TB, numStores int) {
 	m.idents = make([]roachpb.StoreIdent, numStores)
 	m.grpcServers = make([]*grpc.Server, numStores)
 	m.gossips = make([]*gossip.Gossip, numStores)
-	m.nodeLivenesses = make([]*kvserver.NodeLiveness, numStores)
+	m.nodeLivenesses = make([]*liveness.NodeLiveness, numStores)
 
 	if m.storeConfig != nil && m.storeConfig.Clock != nil {
 		require.Nil(t, m.manualClock, "can't use manual clock; storeConfig.Clock is set")
@@ -545,7 +547,7 @@ func (m *multiTestContext) initGossipNetwork() {
 type multiTestContextKVTransport struct {
 	mtc      *multiTestContext
 	idx      int
-	replicas []roachpb.ReplicaDescriptor
+	replicas kvcoord.ReplicaSlice
 	mu       struct {
 		syncutil.Mutex
 		pending map[roachpb.ReplicaID]struct{}
@@ -553,7 +555,7 @@ type multiTestContextKVTransport struct {
 }
 
 func (m *multiTestContext) kvTransportFactory(
-	_ kvcoord.SendOptions, _ *nodedialer.Dialer, replicas []roachpb.ReplicaDescriptor,
+	_ kvcoord.SendOptions, _ *nodedialer.Dialer, replicas kvcoord.ReplicaSlice,
 ) (kvcoord.Transport, error) {
 	t := &multiTestContextKVTransport{
 		mtc:      m,
@@ -609,7 +611,7 @@ func (t *multiTestContextKVTransport) SendNext(
 	}
 
 	// Clone txn of ba args for sending.
-	ba.Replica = rep
+	ba.Replica = rep.ReplicaDescriptor
 	if txn := ba.Txn; txn != nil {
 		ba.Txn = ba.Txn.Clone()
 	}
@@ -678,7 +680,7 @@ func (t *multiTestContextKVTransport) NextReplica() roachpb.ReplicaDescriptor {
 	if t.IsExhausted() {
 		return roachpb.ReplicaDescriptor{}
 	}
-	return t.replicas[t.idx]
+	return t.replicas[t.idx].ReplicaDescriptor
 }
 
 func (t *multiTestContextKVTransport) SkipReplica() {
@@ -695,7 +697,7 @@ func (t *multiTestContextKVTransport) MoveToFront(replica roachpb.ReplicaDescrip
 		return
 	}
 	for i := range t.replicas {
-		if t.replicas[i] == replica {
+		if t.replicas[i].ReplicaDescriptor == replica {
 			if i < t.idx {
 				t.idx--
 			}
@@ -705,6 +707,8 @@ func (t *multiTestContextKVTransport) MoveToFront(replica roachpb.ReplicaDescrip
 		}
 	}
 }
+
+func (t *multiTestContextKVTransport) Release() {}
 
 func (t *multiTestContextKVTransport) setPending(repID roachpb.ReplicaID, pending bool) {
 	t.mu.Lock()
@@ -787,10 +791,14 @@ func (m *multiTestContext) makeStoreConfig(i int) kvserver.StoreConfig {
 	cfg.TestingKnobs.DisableMergeQueue = true
 	cfg.TestingKnobs.DisableSplitQueue = true
 	cfg.TestingKnobs.ReplicateQueueAcceptsUnsplit = true
+	// The mtc does not populate the allocator's store pool well and so
+	// the check never sees any live replicas.
+	cfg.TestingKnobs.AllowDangerousReplicationChanges = true
+
 	return cfg
 }
 
-var _ kvcoord.RangeDescriptorDB = mtcRangeDescriptorDB{}
+var _ rangecache.RangeDescriptorDB = mtcRangeDescriptorDB{}
 
 type mtcRangeDescriptorDB struct {
 	*multiTestContext
@@ -835,7 +843,7 @@ func (m *multiTestContext) populateDB(idx int, st *cluster.Settings, stopper *st
 }
 
 func (m *multiTestContext) populateStorePool(
-	idx int, cfg kvserver.StoreConfig, nodeLiveness *kvserver.NodeLiveness,
+	idx int, cfg kvserver.StoreConfig, nodeLiveness *liveness.NodeLiveness,
 ) {
 	m.storePools[idx] = kvserver.NewStorePool(
 		cfg.AmbientCtx,
@@ -909,9 +917,11 @@ func (m *multiTestContext) addStore(idx int) {
 	nodeID := roachpb.NodeID(idx + 1)
 	cfg := m.makeStoreConfig(idx)
 	ambient := log.AmbientContext{Tracer: cfg.Settings.Tracer}
+	ambient.AddLogTag("n", nodeID)
+
 	m.populateDB(idx, cfg.Settings, stopper)
 	nlActive, nlRenewal := cfg.NodeLivenessDurations()
-	m.nodeLivenesses[idx] = kvserver.NewNodeLiveness(kvserver.NodeLivenessOptions{
+	m.nodeLivenesses[idx] = liveness.NewNodeLiveness(liveness.NodeLivenessOptions{
 		AmbientCtx: ambient, Clock: m.clocks[idx], DB: m.dbs[idx], Gossip: m.gossips[idx],
 		LivenessThreshold: nlActive, RenewalDuration: nlRenewal, Settings: cfg.Settings,
 		HistogramWindowInterval: metric.TestSampleInterval,
@@ -961,8 +971,9 @@ func (m *multiTestContext) addStore(idx int) {
 
 	sender := kvserver.NewStores(ambient, clock)
 	sender.AddStore(store)
-	perReplicaServer := kvserver.MakeServer(&roachpb.NodeDescriptor{NodeID: nodeID}, sender)
-	kvserver.RegisterPerReplicaServer(grpcServer, perReplicaServer)
+	server := kvserver.MakeServer(&roachpb.NodeDescriptor{NodeID: nodeID}, sender)
+	kvserver.RegisterPerReplicaServer(grpcServer, server)
+	kvserver.RegisterPerStoreServer(grpcServer, server)
 
 	ln, err := netutil.ListenAndServeGRPC(m.transportStopper, grpcServer, util.TestAddr)
 	if err != nil {
@@ -1025,7 +1036,7 @@ func (m *multiTestContext) addStore(idx int) {
 		}
 	}
 	m.nodeLivenesses[idx].Start(ctx,
-		kvserver.NodeLivenessStartOptions{
+		liveness.NodeLivenessStartOptions{
 			Stopper: stopper,
 			Engines: m.engines[idx : idx+1],
 			OnSelfLive: func(ctx context.Context) {
@@ -1105,7 +1116,7 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	cfg := m.makeStoreConfig(i)
 	m.populateDB(i, m.storeConfig.Settings, stopper)
 	nlActive, nlRenewal := cfg.NodeLivenessDurations()
-	m.nodeLivenesses[i] = kvserver.NewNodeLiveness(kvserver.NodeLivenessOptions{
+	m.nodeLivenesses[i] = liveness.NewNodeLiveness(liveness.NodeLivenessOptions{
 		AmbientCtx: log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}, Clock: m.clocks[i], DB: m.dbs[i],
 		Gossip: m.gossips[i], LivenessThreshold: nlActive, RenewalDuration: nlRenewal, Settings: cfg.Settings,
 		HistogramWindowInterval: metric.TestSampleInterval,
@@ -1126,7 +1137,7 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.DefaultClass).Reset()
 	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.SystemClass).Reset()
 	m.mu.Unlock()
-	cfg.NodeLiveness.Start(ctx, kvserver.NodeLivenessStartOptions{
+	cfg.NodeLiveness.Start(ctx, liveness.NodeLivenessStartOptions{
 		Stopper: stopper,
 		Engines: m.engines[i : i+1],
 		OnSelfLive: func(ctx context.Context) {
@@ -1172,24 +1183,6 @@ func (m *multiTestContext) findStartKeyLocked(rangeID roachpb.RangeID) roachpb.R
 	return nil // unreached, but the compiler can't tell.
 }
 
-// findMemberStoreLocked finds a non-stopped Store which is a member
-// of the given range.
-func (m *multiTestContext) findMemberStoreLocked(desc roachpb.RangeDescriptor) *kvserver.Store {
-	for _, s := range m.stores {
-		if s == nil {
-			// Store is stopped.
-			continue
-		}
-		for _, r := range desc.InternalReplicas {
-			if s.StoreID() == r.StoreID {
-				return s
-			}
-		}
-	}
-	m.t.Fatalf("couldn't find a live member of %s", &desc)
-	return nil // unreached, but the compiler can't tell.
-}
-
 // restart stops and restarts all stores but leaves the engines intact,
 // so the stores should contain the same persistent storage as before.
 func (m *multiTestContext) restart() {
@@ -1209,14 +1202,6 @@ func (m *multiTestContext) changeReplicas(
 ) (roachpb.ReplicaID, error) {
 	ctx := context.Background()
 
-	var alreadyDoneErr string
-	switch changeType {
-	case roachpb.ADD_REPLICA:
-		alreadyDoneErr = "unable to add replica .* which is already present"
-	case roachpb.REMOVE_REPLICA:
-		alreadyDoneErr = "unable to remove replica .* which is not present"
-	}
-
 	retryOpts := retry.Options{
 		InitialBackoff: time.Millisecond,
 		MaxBackoff:     50 * time.Millisecond,
@@ -1229,9 +1214,7 @@ func (m *multiTestContext) changeReplicas(
 		// the effects of any previous ChangeReplicas call. By the time
 		// ChangeReplicas returns the raft leader is guaranteed to have the
 		// updated version, but followers are not.
-		if err := m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc); err != nil {
-			return 0, err
-		}
+		require.NoError(m.t, m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc))
 
 		_, err := m.dbs[0].AdminChangeReplicas(
 			ctx, startKey.AsRawKey(),
@@ -1244,8 +1227,22 @@ func (m *multiTestContext) changeReplicas(
 				}),
 		)
 
-		if err == nil || testutils.IsError(err, alreadyDoneErr) {
+		if err == nil {
 			break
+		}
+
+		// There was an error. Refresh the range descriptor and check if we're already done.
+		//
+		// NB: this could get smarter around non-voters. Hasn't been necessary so far.
+		require.NoError(m.t, m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc))
+		if changeType == roachpb.ADD_VOTER {
+			if _, ok := desc.GetReplicaDescriptor(m.idents[dest].StoreID); ok {
+				break
+			}
+		} else if changeType == roachpb.REMOVE_VOTER {
+			if _, ok := desc.GetReplicaDescriptor(m.idents[dest].StoreID); !ok {
+				break
+			}
 		}
 
 		if errors.HasType(err, (*roachpb.AmbiguousResultError)(nil)) {
@@ -1255,20 +1252,19 @@ func (m *multiTestContext) changeReplicas(
 			continue
 		}
 
-		// We can't use storage.IsSnapshotError() because the original error object
-		// is lost. We could make a this into a roachpb.Error but it seems overkill
-		// for this one usage.
-		if testutils.IsError(err, "snapshot failed: .*|descriptor changed") {
+		if kvserver.IsRetriableReplicationChangeError(err) {
 			log.Infof(ctx, "%v", err)
 			continue
 		}
+
 		return 0, err
 	}
 
 	return desc.NextReplicaID, nil
 }
 
-// replicateRange replicates the given range onto the given stores.
+// replicateRange replicates the given range onto the given destination stores. The destinations
+// are indicated by indexes within m.stores.
 func (m *multiTestContext) replicateRange(rangeID roachpb.RangeID, dests ...int) {
 	m.t.Helper()
 	if err := m.replicateRangeNonFatal(rangeID, dests...); err != nil {
@@ -1285,7 +1281,7 @@ func (m *multiTestContext) replicateRangeNonFatal(rangeID roachpb.RangeID, dests
 	expectedReplicaIDs := make([]roachpb.ReplicaID, len(dests))
 	for i, dest := range dests {
 		var err error
-		expectedReplicaIDs[i], err = m.changeReplicas(startKey, dest, roachpb.ADD_REPLICA)
+		expectedReplicaIDs[i], err = m.changeReplicas(startKey, dest, roachpb.ADD_VOTER)
 		if err != nil {
 			return err
 		}
@@ -1331,7 +1327,7 @@ func (m *multiTestContext) unreplicateRangeNonFatal(rangeID roachpb.RangeID, des
 	startKey := m.findStartKeyLocked(rangeID)
 	m.mu.RUnlock()
 
-	_, err := m.changeReplicas(startKey, dest, roachpb.REMOVE_REPLICA)
+	_, err := m.changeReplicas(startKey, dest, roachpb.REMOVE_VOTER)
 	return err
 }
 
@@ -1385,9 +1381,9 @@ func (m *multiTestContext) waitForValuesT(t testing.TB, key roachpb.Key, expecte
 	})
 }
 
-// waitForValues waits up to the given duration for the integer values
-// at the given key to match the expected slice (across all engines).
-// Fails the test if they do not match.
+// waitForValues waits for the integer values at the given key to match the
+// expected slice (across all engines). Fails the test if they do not match
+// after the SucceedsSoon period.
 func (m *multiTestContext) waitForValues(key roachpb.Key, expected []int64) {
 	m.t.Helper()
 	m.waitForValuesT(m.t, key, expected)
@@ -1449,7 +1445,7 @@ func (m *multiTestContext) heartbeatLiveness(ctx context.Context, store int) err
 
 	var err error
 	for r := retry.StartWithCtx(ctx, retry.Options{MaxRetries: 5}); r.Next(); {
-		if err = nl.Heartbeat(ctx, l); !errors.Is(err, kvserver.ErrEpochIncremented) {
+		if err = nl.Heartbeat(ctx, l); !errors.Is(err, liveness.ErrEpochIncremented) {
 			break
 		}
 	}
@@ -1664,9 +1660,14 @@ func verifyRangeStats(
 func verifyRecomputedStats(
 	reader storage.Reader, d *roachpb.RangeDescriptor, expMS enginepb.MVCCStats, nowNanos int64,
 ) error {
-	if ms, err := rditer.ComputeStatsForRange(d, reader, nowNanos); err != nil {
+	ms, err := rditer.ComputeStatsForRange(d, reader, nowNanos)
+	if err != nil {
 		return err
-	} else if expMS != ms {
+	}
+	// When used with a real wall clock these will not be the same, since it
+	// takes time to load stats.
+	expMS.AgeTo(ms.LastUpdateNanos)
+	if expMS != ms {
 		return fmt.Errorf("expected range's stats to agree with recomputation: got\n%+v\nrecomputed\n%+v", expMS, ms)
 	}
 	return nil

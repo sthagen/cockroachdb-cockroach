@@ -22,13 +22,26 @@ package colexec
 import (
 	"context"
 
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ apd.Context
+	_ coldataext.Datum
+	_ duration.Duration
+	_ tree.AggType
 )
 
 // OrderedDistinctColsToOperators is a utility function that given an input and
@@ -36,7 +49,7 @@ import (
 // last distinct operator in that chain as well as its output column.
 func OrderedDistinctColsToOperators(
 	input colexecbase.Operator, distinctCols []uint32, typs []*types.T,
-) (colexecbase.Operator, []bool, error) {
+) (ResettableOperator, []bool, error) {
 	distinctCol := make([]bool, coldata.BatchSize())
 	// zero the boolean column on every iteration.
 	input = fnOp{
@@ -73,7 +86,7 @@ var _ ResettableOperator = &distinctChainOps{}
 // input columns with the given types.
 func NewOrderedDistinct(
 	input colexecbase.Operator, distinctCols []uint32, typs []*types.T,
-) (colexecbase.Operator, error) {
+) (ResettableOperator, error) {
 	op, outputCol, err := OrderedDistinctColsToOperators(input, distinctCols, typs)
 	if err != nil {
 		return nil, err
@@ -169,22 +182,23 @@ func newPartitioner(t *types.T) (partitioner, error) {
 // true to the resultant bool column for every value that differs from the
 // previous one.
 type distinct_TYPEOp struct {
+	// outputCol is the boolean output column. It is shared by all of the
+	// other distinct operators in a distinct operator set.
+	outputCol []bool
+
+	// lastVal is the last value seen by the operator, so that the distincting
+	// still works across batch boundaries.
+	lastVal _GOTYPE
+
 	OneInputNode
 
 	// distinctColIdx is the index of the column to distinct upon.
 	distinctColIdx int
 
-	// outputCol is the boolean output column. It is shared by all of the
-	// other distinct operators in a distinct operator set.
-	outputCol []bool
-
 	// Set to true at runtime when we've seen the first row. Distinct always
 	// outputs the first row that it sees.
 	foundFirstRow bool
 
-	// lastVal is the last value seen by the operator, so that the distincting
-	// still works across batch boundaries.
-	lastVal     _GOTYPE
 	lastValNull bool
 }
 
@@ -235,31 +249,27 @@ func (p *distinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
 				lastVal, lastValNull = checkDistinctWithNulls(idx, idx, lastVal, nulls, lastValNull, col, outputCol)
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				lastVal = checkDistinct(idx, idx, lastVal, col, outputCol)
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				lastVal, lastValNull = checkDistinctWithNulls(idx, idx, lastVal, nulls, lastValNull, col, outputCol)
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				lastVal = checkDistinct(idx, idx, lastVal, col, outputCol)
 			}
@@ -289,19 +299,19 @@ func (p partitioner_TYPE) partitionWithOrder(
 	}
 
 	col := colVec.TemplateType()
-	col = execgen.SLICE(col, 0, n)
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			lastVal, lastValNull = checkDistinctWithNulls(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			lastVal = checkDistinct(checkIdx, outputIdx, lastVal, col, outputCol)
 		}
 	}
@@ -320,6 +330,7 @@ func (p partitioner_TYPE) partition(colVec coldata.Vec, outputCol []bool, n int)
 	col := colVec.TemplateType()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {

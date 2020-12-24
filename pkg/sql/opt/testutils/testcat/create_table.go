@@ -12,14 +12,15 @@ package testcat
 
 import (
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -59,9 +60,11 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	// Update the table name to include catalog and schema if not provided.
 	tc.qualifyTableName(&stmt.Table)
 
-	// Assume that every table in the "system" or "information_schema" catalog
-	// is a virtual table. This is a simplified assumption for testing purposes.
-	if stmt.Table.CatalogName == "system" || stmt.Table.SchemaName == "information_schema" {
+	// Assume that every table in the "system", "information_schema" or
+	// "pg_catalog" catalog is a virtual table. This is a simplified assumption
+	// for testing purposes.
+	if stmt.Table.CatalogName == "system" || stmt.Table.SchemaName == "information_schema" ||
+		stmt.Table.SchemaName == "pg_catalog" {
 		return tc.createVirtualTable(stmt)
 	}
 
@@ -73,32 +76,39 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		tab.interleaved = true
 	}
 
+	// Find the PK columns; we have to force these to be non-nullable.
+	pkCols := make(map[tree.Name]struct{})
+	for _, def := range stmt.Defs {
+		switch def := def.(type) {
+		case *tree.ColumnTableDef:
+			if def.PrimaryKey.IsPrimaryKey {
+				pkCols[def.Name] = struct{}{}
+			}
+
+		case *tree.UniqueConstraintTableDef:
+			if def.PrimaryKey {
+				for i := range def.Columns {
+					pkCols[def.Columns[i].Column] = struct{}{}
+				}
+			}
+		}
+	}
+
 	// Add non-mutation columns.
 	for _, def := range stmt.Defs {
 		switch def := def.(type) {
 		case *tree.ColumnTableDef:
 			if !isMutationColumn(def) {
+				if _, isPKCol := pkCols[def.Name]; isPKCol {
+					def.Nullable.Nullability = tree.NotNull
+				}
 				tab.addColumn(def)
 			}
 		}
 	}
 
 	// If there is no primary index, add the hidden rowid column.
-	hasPrimaryIndex := false
-	for _, def := range stmt.Defs {
-		switch def := def.(type) {
-		case *tree.ColumnTableDef:
-			if def.PrimaryKey.IsPrimaryKey {
-				hasPrimaryIndex = true
-			}
-
-		case *tree.UniqueConstraintTableDef:
-			if def.PrimaryKey {
-				hasPrimaryIndex = true
-			}
-		}
-	}
-
+	hasPrimaryIndex := len(pkCols) > 0
 	if !hasPrimaryIndex {
 		var rowid cat.Column
 		ordinal := len(tab.Columns)
@@ -181,11 +191,8 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		switch def := def.(type) {
 		case *tree.UniqueConstraintTableDef:
 			if def.WithoutIndex {
-				panic(pgerror.New(pgcode.FeatureNotSupported,
-					"unique constraints without an index are not yet supported",
-				))
-			}
-			if !def.PrimaryKey {
+				tab.addUniqueConstraint(def.Name, def.Columns, def.WithoutIndex)
+			} else if !def.PrimaryKey {
 				tab.addIndex(&def.IndexTableDef, uniqueIndex)
 			}
 
@@ -196,19 +203,22 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 			tab.addFamily(def)
 
 		case *tree.ColumnTableDef:
-			if def.Unique.WithoutIndex {
-				panic(pgerror.New(pgcode.FeatureNotSupported,
-					"unique constraints without an index are not yet supported",
-				))
-			}
 			if def.Unique.IsUnique {
-				tab.addIndex(
-					&tree.IndexTableDef{
-						Name:    tree.Name(fmt.Sprintf("%s_%s_key", stmt.Table.ObjectName, def.Name)),
-						Columns: tree.IndexElemList{{Column: def.Name}},
-					},
-					uniqueIndex,
-				)
+				if def.Unique.WithoutIndex {
+					tab.addUniqueConstraint(
+						def.Unique.ConstraintName,
+						tree.IndexElemList{{Column: def.Name}},
+						def.Unique.WithoutIndex,
+					)
+				} else {
+					tab.addIndex(
+						&tree.IndexTableDef{
+							Name:    tree.Name(fmt.Sprintf("%s_%s_key", stmt.Table.ObjectName, def.Name)),
+							Columns: tree.IndexElemList{{Column: def.Name}},
+						},
+						uniqueIndex,
+					)
+				}
 			}
 		}
 	}
@@ -286,6 +296,18 @@ func (tc *Catalog) createVirtualTable(stmt *tree.CreateTable) *Table {
 	}
 
 	tab.addPrimaryColumnIndex(string(tab.Columns[0].ColName()))
+
+	// Search for index definitions.
+	for _, def := range stmt.Defs {
+		switch def := def.(type) {
+		case *tree.IndexTableDef:
+			tab.addIndex(def, nonUniqueIndex)
+		}
+	}
+
+	// Add the new table to the catalog.
+	tc.AddTable(tab)
+
 	return tab
 }
 
@@ -436,6 +458,33 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 	targetTable.inboundFKs = append(targetTable.inboundFKs, fk)
 }
 
+func (tt *Table) addUniqueConstraint(
+	name tree.Name, columns tree.IndexElemList, withoutIndex bool,
+) {
+	cols := make([]int, len(columns))
+	for i, c := range columns {
+		cols[i] = tt.FindOrdinal(string(c.Column))
+	}
+	sort.Ints(cols)
+
+	// Don't add duplicate constraints.
+	for _, c := range tt.uniqueConstraints {
+		if reflect.DeepEqual(c.columnOrdinals, cols) && c.withoutIndex == withoutIndex {
+			return
+		}
+	}
+
+	// We didn't find an existing constraint, so add a new one.
+	u := UniqueConstraint{
+		name:           string(name),
+		tabID:          tt.TabID,
+		columnOrdinals: cols,
+		withoutIndex:   withoutIndex,
+		validated:      true,
+	}
+	tt.uniqueConstraints = append(tt.uniqueConstraints, u)
+}
+
 func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 	ordinal := len(tt.Columns)
 	nullable := !def.PrimaryKey.IsPrimaryKey && def.Nullable.Nullability != tree.NotNull
@@ -465,21 +514,44 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 	}
 
 	var col cat.Column
-	col.InitNonVirtual(
-		ordinal,
-		cat.StableID(1+ordinal),
-		name,
-		kind,
-		typ,
-		nullable,
-		false, /* hidden */
-		defaultExpr,
-		computedExpr,
-	)
+	if def.Computed.Virtual {
+		col.InitVirtualComputed(
+			ordinal,
+			cat.StableID(1+ordinal),
+			name,
+			typ,
+			nullable,
+			false, /* hidden */
+			*computedExpr,
+		)
+	} else {
+		col.InitNonVirtual(
+			ordinal,
+			cat.StableID(1+ordinal),
+			name,
+			kind,
+			typ,
+			nullable,
+			false, /* hidden */
+			defaultExpr,
+			computedExpr,
+		)
+	}
 	tt.Columns = append(tt.Columns, col)
 }
 
 func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
+	return tt.addIndexWithVersion(def, typ, descpb.EmptyArraysInInvertedIndexesVersion)
+}
+
+func (tt *Table) addIndexWithVersion(
+	def *tree.IndexTableDef, typ indexType, version descpb.IndexDescriptorVersion,
+) *Index {
+	// Add a unique constraint if this is a primary or unique index.
+	if typ != nonUniqueIndex {
+		tt.addUniqueConstraint(def.Name, def.Columns, false /* withoutIndex */)
+	}
+
 	idx := &Index{
 		IdxName:     tt.makeIndexName(def.Name, typ),
 		Unique:      typ != nonUniqueIndex,
@@ -487,6 +559,7 @@ func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
 		IdxZone:     &zonepb.ZoneConfig{},
 		table:       tt,
 		partitionBy: def.PartitionBy,
+		version:     version,
 	}
 
 	// Look for name suffixes indicating this is a mutation index.
@@ -507,31 +580,6 @@ func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
 			idx.invertedOrd = i
 		}
 		col := idx.addColumn(tt, colDef, keyCol, isLastIndexCol)
-
-		if typ == primaryIndex && col.IsNullable() {
-			// Reinitialize the column to make it non-nullable.
-			// TODO(radu): this is very hacky
-			var defaultExpr, computedExpr *string
-			if col.HasDefault() {
-				e := col.DefaultExprStr()
-				defaultExpr = &e
-			}
-			if col.IsComputed() {
-				e := col.ComputedExprStr()
-				computedExpr = &e
-			}
-			col.InitNonVirtual(
-				col.Ordinal(),
-				col.ColID(),
-				col.ColName(),
-				col.Kind(),
-				col.DatumType(),
-				false, /* nullable */
-				col.IsHidden(),
-				defaultExpr,
-				computedExpr,
-			)
-		}
 
 		if col.IsNullable() {
 			notNullIndex = false
@@ -577,7 +625,7 @@ func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
 		}
 		// Add the rest of the columns in the table.
 		for i, col := range tt.Columns {
-			if !pkOrdinals.Contains(i) && !col.Kind().IsVirtual() {
+			if !pkOrdinals.Contains(i) && col.Kind() != cat.VirtualInverted && !col.IsVirtualComputed() {
 				idx.addColumnByOrdinal(tt, i, tree.Ascending, nonKeyCol)
 			}
 		}
@@ -643,6 +691,27 @@ func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
 				Direction: tree.Ascending,
 			}
 			idx.addColumn(tt, elem, nonKeyCol, false /* isLastIndexCol */)
+		}
+	}
+	if tt.IsVirtual {
+		// All indexes of virtual tables automatically STORE all other columns in
+		// the table.
+		idxCols := idx.Columns
+		for _, col := range tt.Columns {
+			found := false
+			for _, idxCol := range idxCols {
+				if col.ColName() == idxCol.ColName() {
+					found = true
+					break
+				}
+			}
+			if !found {
+				elem := tree.IndexElem{
+					Column:    col.ColName(),
+					Direction: tree.Ascending,
+				}
+				idx.addColumn(tt, elem, nonKeyCol, false /* isLastIndexCol */)
+			}
 		}
 	}
 
@@ -741,8 +810,7 @@ func columnForIndexElemExpr(tt *Table, expr tree.Expr) cat.Column {
 	exprStr := serializeTableDefExpr(expr)
 	// Find an existing virtual computed column with the same expression.
 	for _, col := range tt.Columns {
-		if col.Kind() == cat.VirtualComputed &&
-			col.ComputedExprStr() == exprStr {
+		if col.IsVirtualComputed() && col.ComputedExprStr() == exprStr {
 			return col
 		}
 	}
@@ -763,9 +831,11 @@ func columnForIndexElemExpr(tt *Table, expr tree.Expr) cat.Column {
 	var col cat.Column
 	col.InitVirtualComputed(
 		len(tt.Columns),
+		cat.StableID(1+len(tt.Columns)),
 		name,
 		typ,
 		true, /* nullable */
+		true, /* hidden */
 		exprStr,
 	)
 	tt.Columns = append(tt.Columns, col)

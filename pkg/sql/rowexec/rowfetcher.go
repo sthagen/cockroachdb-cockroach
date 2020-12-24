@@ -52,6 +52,7 @@ type rowFetcher interface {
 	PartialKey(int) (roachpb.Key, error)
 	Reset()
 	GetBytesRead() int64
+	GetContentionEvents() []roachpb.ContentionEvent
 	NextRowWithErrors(context.Context) (rowenc.EncDatumRow, error)
 	// Close releases any resources held by this fetcher.
 	Close(ctx context.Context)
@@ -63,7 +64,7 @@ func initRowFetcher(
 	fetcher *row.Fetcher,
 	desc *tabledesc.Immutable,
 	indexIdx int,
-	colIdxMap map[descpb.ColumnID]int,
+	colIdxMap catalog.TableColMap,
 	reverseScan bool,
 	valNeededForCol util.FastIntSet,
 	isCheck bool,
@@ -81,7 +82,7 @@ func initRowFetcher(
 
 	cols := desc.Columns
 	if scanVisibility == execinfra.ScanVisibilityPublicAndNotPublic {
-		cols = desc.ReadableColumns
+		cols = desc.ReadableColumns()
 	}
 	// Add on any requested system columns. We slice cols to avoid modifying
 	// the underlying table descriptor.
@@ -109,5 +110,19 @@ func initRowFetcher(
 		return nil, false, err
 	}
 
+	if flowCtx.Cfg.TestingKnobs.GenerateMockContentionEvents {
+		fetcher.TestingEnableMockContentionEventGeneration()
+	}
+
 	return index, isSecondaryIndex, nil
+}
+
+// getCumulativeContentionTime is a helper function to calculate the cumulative
+// contention time from a slice of roachpb.ContentionEvents.
+func getCumulativeContentionTime(events []roachpb.ContentionEvent) time.Duration {
+	var cumulativeContentionTime time.Duration
+	for _, e := range events {
+		cumulativeContentionTime += e.Duration
+	}
+	return cumulativeContentionTime
 }

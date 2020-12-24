@@ -28,7 +28,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/heapprofiler"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -61,6 +61,7 @@ requires the cluster to be live.
 
 // Tables containing cluster-wide info that are collected in a debug zip.
 var debugZipTablesPerCluster = []string{
+	"crdb_internal.cluster_database_privileges",
 	"crdb_internal.cluster_queries",
 	"crdb_internal.cluster_sessions",
 	"crdb_internal.cluster_settings",
@@ -385,7 +386,7 @@ func runDebugZip(cmd *cobra.Command, args []string) (retErr error) {
 		if cErr := z.createJSONOrError(livenessName+".json", nodes, err); cErr != nil {
 			return cErr
 		}
-		livenessByNodeID := map[roachpb.NodeID]kvserverpb.NodeLivenessStatus{}
+		livenessByNodeID := map[roachpb.NodeID]livenesspb.NodeLivenessStatus{}
 		if lresponse != nil {
 			livenessByNodeID = lresponse.Statuses
 		}
@@ -404,7 +405,7 @@ func runDebugZip(cmd *cobra.Command, args []string) (retErr error) {
 			// NB: this takes care not to produce non-deterministic log output.
 			resps := make([]profData, len(nodeList))
 			for i := range nodeList {
-				if livenessByNodeID[nodeList[i].Desc.NodeID] == kvserverpb.NodeLivenessStatus_DECOMMISSIONED {
+				if livenessByNodeID[nodeList[i].Desc.NodeID] == livenesspb.NodeLivenessStatus_DECOMMISSIONED {
 					continue
 				}
 				wg.Add(1)
@@ -456,7 +457,7 @@ func runDebugZip(cmd *cobra.Command, args []string) (retErr error) {
 			nodeID := node.Desc.NodeID
 
 			liveness := livenessByNodeID[nodeID]
-			if liveness == kvserverpb.NodeLivenessStatus_DECOMMISSIONED {
+			if liveness == livenesspb.NodeLivenessStatus_DECOMMISSIONED {
 				// Decommissioned + process terminated. Let's not waste time
 				// on this node.
 				//
@@ -645,7 +646,7 @@ func runDebugZip(cmd *cobra.Command, args []string) (retErr error) {
 						func(ctx context.Context) error {
 							entries, err = status.LogFile(
 								ctx, &serverpb.LogFileRequest{
-									NodeId: id, File: file.Name, Redact: zipCtx.redactLogs, KeepRedactable: true,
+									NodeId: id, File: file.Name, Redact: zipCtx.redactLogs,
 								})
 							return err
 						}); err != nil {
@@ -675,7 +676,7 @@ func runDebugZip(cmd *cobra.Command, args []string) (retErr error) {
 							// We're also going to print a warning at the end.
 							warnRedactLeak = true
 						}
-						if err := e.Format(logOut); err != nil {
+						if err := log.FormatEntry(e, logOut); err != nil {
 							return err
 						}
 					}

@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -41,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/errors"
 	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/assert"
@@ -71,7 +73,7 @@ func (t tuple) String() string {
 	return sb.String()
 }
 
-func (t tuple) less(other tuple, evalCtx *tree.EvalContext) bool {
+func (t tuple) less(other tuple, evalCtx *tree.EvalContext, tupleFromOtherSet tuple) bool {
 	for i := range t {
 		// If either side is nil, we short circuit the comparison. For nil, we
 		// define: nil < {any_none_nil}
@@ -137,7 +139,22 @@ func (t tuple) less(other tuple, evalCtx *tree.EvalContext) bool {
 		case "bool":
 			return lhsVal.Bool() == false && rhsVal.Bool() == true
 		case "string":
-			return lhsVal.String() < rhsVal.String()
+			lString, rString := lhsVal.String(), rhsVal.String()
+			if tupleFromOtherSet != nil && len(tupleFromOtherSet) > i {
+				if d, ok := tupleFromOtherSet[i].(tree.Datum); ok {
+					// The tuple from the other set has a datum value, so we
+					// will convert the string to datum. See the comment on
+					// tuples.sort for more details.
+					d1 := stringToDatum(lString, d.ResolvedType(), evalCtx)
+					d2 := stringToDatum(rString, d.ResolvedType(), evalCtx)
+					cmp := d1.Compare(evalCtx, d2)
+					if cmp == 0 {
+						continue
+					}
+					return cmp < 0
+				}
+			}
+			return lString < rString
 		default:
 			colexecerror.InternalError(errors.AssertionFailedf("Unhandled comparison type: %s", typ))
 		}
@@ -178,8 +195,15 @@ func (t tuples) String() string {
 	return sb.String()
 }
 
-// sort returns a copy of sorted tuples.
-func (t tuples) sort(evalCtx *tree.EvalContext) tuples {
+// sort returns a copy of sorted tuples. tupleFromOtherSet is any tuple that
+// comes from other tuples and is used to determine the desired types.
+//
+// Currently, this function is only used in order to speed up the comparison of
+// the expected tuple set with the actual one, and it is possible that we have
+// tree.Datum in the latter but strings in the former. In order to use the same
+// ordering when sorting the strings, we need to peek into the actual tuple to
+// determine whether we want to convert the string to datum before comparison.
+func (t tuples) sort(evalCtx *tree.EvalContext, tupleFromOtherSet tuple) tuples {
 	b := make(tuples, len(t))
 	for i := range b {
 		b[i] = make(tuple, len(t[i]))
@@ -188,7 +212,7 @@ func (t tuples) sort(evalCtx *tree.EvalContext) tuples {
 	sort.SliceStable(b, func(i, j int) bool {
 		lhs := b[i]
 		rhs := b[j]
-		return lhs.less(rhs, evalCtx)
+		return lhs.less(rhs, evalCtx, tupleFromOtherSet)
 	})
 	return b
 }
@@ -363,6 +387,13 @@ func runTestsWithoutAllNullsInjection(
 		out := newOpTestOutput(op, expected)
 		if err := verifyFn(out); err != nil {
 			t.Fatal(err)
+		}
+		if isOperatorChainResettable(op) {
+			log.Info(ctx, "reusing after reset")
+			out.reset(ctx)
+			if err := verifyFn(out); err != nil {
+				t.Fatal(err)
+			}
 		}
 	})
 
@@ -648,11 +679,14 @@ type opTestInput struct {
 
 	batchSize int
 	tuples    tuples
-	batch     coldata.Batch
-	useSel    bool
-	rng       *rand.Rand
-	selection []int
-	evalCtx   *tree.EvalContext
+	// initialTuples are tuples passed in into the constructor, and we keep the
+	// reference to them in order to be able to reset the operator.
+	initialTuples tuples
+	batch         coldata.Batch
+	useSel        bool
+	rng           *rand.Rand
+	selection     []int
+	evalCtx       *tree.EvalContext
 
 	// injectAllNulls determines whether opTestInput will replace all values in
 	// the input tuples with nulls.
@@ -663,29 +697,31 @@ type opTestInput struct {
 	injectRandomNulls bool
 }
 
-var _ colexecbase.Operator = &opTestInput{}
+var _ ResettableOperator = &opTestInput{}
 
 // newOpTestInput returns a new opTestInput with the given input tuples and the
 // given type schema. If typs is nil, the input tuples are translated into
 // types automatically, using simple rules (e.g. integers always become Int64).
 func newOpTestInput(batchSize int, tuples tuples, typs []*types.T) *opTestInput {
 	ret := &opTestInput{
-		batchSize: batchSize,
-		tuples:    tuples,
-		typs:      typs,
-		evalCtx:   tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
+		batchSize:     batchSize,
+		tuples:        tuples,
+		initialTuples: tuples,
+		typs:          typs,
+		evalCtx:       tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 	return ret
 }
 
 func newOpTestSelInput(rng *rand.Rand, batchSize int, tuples tuples, typs []*types.T) *opTestInput {
 	ret := &opTestInput{
-		useSel:    true,
-		rng:       rng,
-		batchSize: batchSize,
-		tuples:    tuples,
-		typs:      typs,
-		evalCtx:   tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
+		useSel:        true,
+		rng:           rng,
+		batchSize:     batchSize,
+		tuples:        tuples,
+		initialTuples: tuples,
+		typs:          typs,
+		evalCtx:       tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 	return ret
 }
@@ -766,7 +802,7 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 		}
 	}
 
-	rng := rand.New(rand.NewSource(123))
+	rng, _ := randutil.NewPseudoRand()
 
 	for i := range s.typs {
 		vec := s.batch.ColVec(i)
@@ -803,11 +839,22 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 						setColVal(vec, outputIdx, duration.MakeDuration(rng.Int63(), rng.Int63(), rng.Int63()), s.evalCtx)
 					case typeconv.DatumVecCanonicalTypeFamily:
 						switch vec.Type().Family() {
+						case types.CollatedStringFamily:
+							collatedStringType := types.MakeCollatedString(types.String, *rowenc.RandCollationLocale(rng))
+							randomBytes := make([]byte, rng.Intn(16)+1)
+							rng.Read(randomBytes)
+							d, err := tree.NewDCollatedString(string(randomBytes), collatedStringType.Locale(), &tree.CollationEnvironment{})
+							if err != nil {
+								colexecerror.InternalError(err)
+							}
+							setColVal(vec, outputIdx, d, s.evalCtx)
 						case types.JsonFamily:
 							newBytes := make([]byte, rng.Intn(16)+1)
 							rng.Read(newBytes)
 							j := json.FromString(string(newBytes))
 							setColVal(vec, outputIdx, j, s.evalCtx)
+						case types.TimeTZFamily:
+							setColVal(vec, outputIdx, tree.NewDTimeTZFromOffset(timeofday.FromInt(rng.Int63()), rng.Int31()), s.evalCtx)
 						case types.TupleFamily:
 							setColVal(vec, outputIdx, stringToDatum("(NULL)", vec.Type(), s.evalCtx), s.evalCtx)
 						default:
@@ -831,6 +878,10 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 	return s.batch
 }
 
+func (s *opTestInput) reset(context.Context) {
+	s.tuples = s.initialTuples
+}
+
 type opFixedSelTestInput struct {
 	colexecbase.ZeroInputNode
 
@@ -847,7 +898,7 @@ type opFixedSelTestInput struct {
 	idx int
 }
 
-var _ colexecbase.Operator = &opFixedSelTestInput{}
+var _ ResettableOperator = &opFixedSelTestInput{}
 
 // newOpFixedSelTestInput returns a new opFixedSelTestInput with the given
 // input tuples and selection vector. The input tuples are translated into
@@ -947,6 +998,10 @@ func (s *opFixedSelTestInput) Next(context.Context) coldata.Batch {
 	return s.batch
 }
 
+func (s *opFixedSelTestInput) reset(context.Context) {
+	s.idx = 0
+}
+
 // opTestOutput is a test verification struct that ensures its input batches
 // match some expected output tuples.
 type opTestOutput struct {
@@ -1014,6 +1069,14 @@ func (r *opTestOutput) next(ctx context.Context) tuple {
 	ret := getTupleFromBatch(r.batch, r.curIdx)
 	r.curIdx++
 	return ret
+}
+
+func (r *opTestOutput) reset(ctx context.Context) {
+	if r, ok := r.input.(resetter); ok {
+		r.reset(ctx)
+	}
+	r.curIdx = 0
+	r.batch = nil
 }
 
 // Verify ensures that the input to this opTestOutput produced the same results
@@ -1147,8 +1210,15 @@ func assertTuplesSetsEqual(expected tuples, actual tuples, evalCtx *tree.EvalCon
 	if len(expected) != len(actual) {
 		return makeError(expected, actual)
 	}
-	actual = actual.sort(evalCtx)
-	expected = expected.sort(evalCtx)
+	var tupleFromOtherSet tuple
+	if len(expected) > 0 {
+		tupleFromOtherSet = expected[0]
+	}
+	actual = actual.sort(evalCtx, tupleFromOtherSet)
+	if len(actual) > 0 {
+		tupleFromOtherSet = actual[0]
+	}
+	expected = expected.sort(evalCtx, tupleFromOtherSet)
 	return assertTuplesOrderedEqual(expected, actual, evalCtx)
 }
 
@@ -1412,10 +1482,13 @@ func (c *chunkingBatchSource) Next(context.Context) coldata.Batch {
 	if lastIdx > c.len {
 		lastIdx = c.len
 	}
-	for i, vec := range c.batch.ColVecs() {
-		vec.SetCol(c.cols[i].Window(c.curIdx, lastIdx).Col())
+	for i := range c.typs {
+		// Note that new vectors could be appended to the batch, but we are not
+		// responsible for updating those, so we iterate only up to len(c.typs)
+		// as per out initialization.
+		c.batch.ColVec(i).SetCol(c.cols[i].Window(c.curIdx, lastIdx).Col())
 		nullsSlice := c.cols[i].Nulls().Slice(c.curIdx, lastIdx)
-		vec.SetNulls(&nullsSlice)
+		c.batch.ColVec(i).SetNulls(&nullsSlice)
 	}
 	c.batch.SetLength(lastIdx - c.curIdx)
 	c.curIdx = lastIdx
@@ -1463,6 +1536,46 @@ func (tc *joinTestCase) init() {
 			tc.rightDirections[i] = execinfrapb.Ordering_Column_ASC
 		}
 	}
+}
+
+// mirror attempts to create a "mirror" test case of tc and returns nil if it
+// can't (a "mirror" test case is derived from the original one by swapping the
+// inputs and adjusting all of the corresponding fields accordingly). Currently
+// it works only for LEFT SEMI and LEFT ANTI join types.
+// TODO(yuzefovich): extend this to other join types when possible.
+func (tc *joinTestCase) mirror() *joinTestCase {
+	switch tc.joinType {
+	case descpb.LeftSemiJoin, descpb.LeftAntiJoin:
+	default:
+		return nil
+	}
+	mirroringCase := *tc
+	mirroringCase.description = strings.ReplaceAll(tc.description, "LEFT", "RIGHT")
+	if tc.joinType == descpb.LeftSemiJoin {
+		mirroringCase.joinType = descpb.RightSemiJoin
+	} else {
+		mirroringCase.joinType = descpb.RightAntiJoin
+	}
+	mirroringCase.leftTuples, mirroringCase.rightTuples = mirroringCase.rightTuples, mirroringCase.leftTuples
+	mirroringCase.leftTypes, mirroringCase.rightTypes = mirroringCase.rightTypes, mirroringCase.leftTypes
+	mirroringCase.leftOutCols, mirroringCase.rightOutCols = mirroringCase.rightOutCols, mirroringCase.leftOutCols
+	mirroringCase.leftEqCols, mirroringCase.rightEqCols = mirroringCase.rightEqCols, mirroringCase.leftEqCols
+	mirroringCase.leftDirections, mirroringCase.rightDirections = mirroringCase.rightDirections, mirroringCase.leftDirections
+	mirroringCase.leftEqColsAreKey, mirroringCase.rightEqColsAreKey = mirroringCase.rightEqColsAreKey, mirroringCase.leftEqColsAreKey
+	// TODO(yuzefovich): once we support ON expression in more join types, this
+	// method will need to update non-empty ON expressions as well.
+	return &mirroringCase
+}
+
+// withMirrors will add all "mirror" test cases.
+func withMirrors(testCases []*joinTestCase) []*joinTestCase {
+	numOrigTestCases := len(testCases)
+	for _, c := range testCases[:numOrigTestCases] {
+		if mirror := c.mirror(); mirror != nil {
+			testCases = append(testCases, mirror)
+		}
+	}
+	return testCases
 }
 
 // mutateTypes returns a slice of joinTestCases with varied types. Assumes
@@ -1526,7 +1639,7 @@ type sortTestCase struct {
 	typs        []*types.T
 	ordCols     []execinfrapb.Ordering_Column
 	matchLen    int
-	k           int
+	k           uint64
 }
 
 // Mock typing context for the typechecker.
@@ -1589,6 +1702,7 @@ func createTestProjectingOperator(
 		Post: execinfrapb.PostProcessSpec{
 			RenderExprs: renderExprs,
 		},
+		ResultTypes: append(inputTypes, typedExpr.ResolvedType()),
 	}
 	args := &NewColOperatorArgs{
 		Spec:                spec,
@@ -1598,7 +1712,6 @@ func createTestProjectingOperator(
 	if canFallbackToRowexec {
 		args.ProcessorConstructor = rowexec.NewProcessor
 	}
-	args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 	result, err := TestNewColOperator(ctx, flowCtx, args)
 	if err != nil {
 		return nil, err

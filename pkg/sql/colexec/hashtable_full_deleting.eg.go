@@ -22,6 +22,14 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ = typeconv.DatumVecCanonicalTypeFamily
+	_ coldataext.Datum
+	_ tree.AggType
+)
+
 // checkColDeleting determines if the current key column in the groupID buckets
 // matches the specified equality column key. If there is no match *or* the key
 // has been already used, then the key is added to differs. If the bucket has
@@ -8827,7 +8835,11 @@ func (ht *hashTable) check(probeVecs []coldata.Vec, nToCheck uint64, probeSel []
 	switch ht.probeMode {
 	case hashTableDefaultProbeMode:
 		if ht.same != nil {
-			for _, toCheck := range ht.probeScratch.toCheck[:nToCheck] {
+			toCheckSlice := ht.probeScratch.toCheck
+			_ = toCheckSlice[nToCheck-1]
+			for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+				//gcassert:bce
+				toCheck := toCheckSlice[toCheckPos]
 				if !ht.probeScratch.differs[toCheck] {
 					// If the current key matches with the probe key, we want to update headID
 					// with the current key if it has not been set yet.
@@ -8854,12 +8866,17 @@ func (ht *hashTable) check(probeVecs []coldata.Vec, nToCheck uint64, probeSel []
 				if ht.probeScratch.differs[toCheck] {
 					// Continue probing in this next chain for the probe key.
 					ht.probeScratch.differs[toCheck] = false
-					ht.probeScratch.toCheck[nDiffers] = toCheck
+					//gcassert:bce
+					toCheckSlice[nDiffers] = toCheck
 					nDiffers++
 				}
 			}
 		} else {
-			for _, toCheck := range ht.probeScratch.toCheck[:nToCheck] {
+			toCheckSlice := ht.probeScratch.toCheck
+			_ = toCheckSlice[nToCheck-1]
+			for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+				//gcassert:bce
+				toCheck := toCheckSlice[toCheckPos]
 				if !ht.probeScratch.differs[toCheck] {
 					// If the current key matches with the probe key, we want to update headID
 					// with the current key if it has not been set yet.
@@ -8871,14 +8888,19 @@ func (ht *hashTable) check(probeVecs []coldata.Vec, nToCheck uint64, probeSel []
 				if ht.probeScratch.differs[toCheck] {
 					// Continue probing in this next chain for the probe key.
 					ht.probeScratch.differs[toCheck] = false
-					ht.probeScratch.toCheck[nDiffers] = toCheck
+					//gcassert:bce
+					toCheckSlice[nDiffers] = toCheck
 					nDiffers++
 				}
 			}
 		}
 	case hashTableDeletingProbeMode:
 		if ht.same != nil {
-			for _, toCheck := range ht.probeScratch.toCheck[:nToCheck] {
+			toCheckSlice := ht.probeScratch.toCheck
+			_ = toCheckSlice[nToCheck-1]
+			for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+				//gcassert:bce
+				toCheck := toCheckSlice[toCheckPos]
 				if !ht.probeScratch.differs[toCheck] {
 					// If the current key matches with the probe key, we want to update headID
 					// with the current key if it has not been set yet.
@@ -8898,7 +8920,8 @@ func (ht *hashTable) check(probeVecs []coldata.Vec, nToCheck uint64, probeSel []
 						// It has been deleted, so we need to continue probing on the
 						// next chain if it's not the end of the chain already.
 						if keyID != 0 {
-							ht.probeScratch.toCheck[nDiffers] = toCheck
+							//gcassert:bce
+							toCheckSlice[nDiffers] = toCheck
 							nDiffers++
 						}
 					}
@@ -8907,12 +8930,17 @@ func (ht *hashTable) check(probeVecs []coldata.Vec, nToCheck uint64, probeSel []
 				if ht.probeScratch.differs[toCheck] {
 					// Continue probing in this next chain for the probe key.
 					ht.probeScratch.differs[toCheck] = false
-					ht.probeScratch.toCheck[nDiffers] = toCheck
+					//gcassert:bce
+					toCheckSlice[nDiffers] = toCheck
 					nDiffers++
 				}
 			}
 		} else {
-			for _, toCheck := range ht.probeScratch.toCheck[:nToCheck] {
+			toCheckSlice := ht.probeScratch.toCheck
+			_ = toCheckSlice[nToCheck-1]
+			for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+				//gcassert:bce
+				toCheck := toCheckSlice[toCheckPos]
 				if !ht.probeScratch.differs[toCheck] {
 					// If the current key matches with the probe key, we want to update headID
 					// with the current key if it has not been set yet.
@@ -8932,7 +8960,8 @@ func (ht *hashTable) check(probeVecs []coldata.Vec, nToCheck uint64, probeSel []
 						// It has been deleted, so we need to continue probing on the
 						// next chain if it's not the end of the chain already.
 						if keyID != 0 {
-							ht.probeScratch.toCheck[nDiffers] = toCheck
+							//gcassert:bce
+							toCheckSlice[nDiffers] = toCheck
 							nDiffers++
 						}
 					}
@@ -8941,7 +8970,8 @@ func (ht *hashTable) check(probeVecs []coldata.Vec, nToCheck uint64, probeSel []
 				if ht.probeScratch.differs[toCheck] {
 					// Continue probing in this next chain for the probe key.
 					ht.probeScratch.differs[toCheck] = false
-					ht.probeScratch.toCheck[nDiffers] = toCheck
+					//gcassert:bce
+					toCheckSlice[nDiffers] = toCheck
 					nDiffers++
 				}
 			}

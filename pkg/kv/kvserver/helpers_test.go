@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -41,7 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/v3"
 )
 
 func (s *Store) Transport() *RaftTransport {
@@ -51,9 +52,10 @@ func (s *Store) Transport() *RaftTransport {
 func (s *Store) FindTargetAndTransferLease(
 	ctx context.Context, repl *Replica, desc *roachpb.RangeDescriptor, zone *zonepb.ZoneConfig,
 ) (bool, error) {
-	return s.replicateQueue.findTargetAndTransferLease(
+	transferStatus, err := s.replicateQueue.shedLease(
 		ctx, repl, desc, zone, transferLeaseOptions{},
 	)
+	return transferStatus == transferOK, err
 }
 
 // AddReplica adds the replica to the store's replica map and to the sorted
@@ -197,6 +199,11 @@ func (s *Store) ReservationCount() int {
 	return len(s.snapshotApplySem)
 }
 
+// RaftSchedulerPriorityID returns the Raft scheduler's prioritized range.
+func (s *Store) RaftSchedulerPriorityID() roachpb.RangeID {
+	return s.scheduler.PriorityID()
+}
+
 // ClearClosedTimestampStorage clears the closed timestamp storage of all
 // knowledge about closed timestamps.
 func (s *Store) ClearClosedTimestampStorage() {
@@ -246,8 +253,8 @@ func NewTestStorePool(cfg StoreConfig) *StorePool {
 		func() int {
 			return 1
 		},
-		func(roachpb.NodeID, time.Time, time.Duration) kvserverpb.NodeLivenessStatus {
-			return kvserverpb.NodeLivenessStatus_LIVE
+		func(roachpb.NodeID, time.Time, time.Duration) livenesspb.NodeLivenessStatus {
+			return livenesspb.NodeLivenessStatus_LIVE
 		},
 		/* deterministic */ false,
 	)
@@ -505,18 +512,6 @@ func (r *Replica) ReadProtectedTimestamps(ctx context.Context) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	ts = r.readProtectedTimestampsRLocked(ctx, nil /* f */)
-}
-
-func (nl *NodeLiveness) SetDrainingInternal(
-	ctx context.Context, liveness LivenessRecord, drain bool,
-) error {
-	return nl.setDrainingInternal(ctx, liveness, drain, nil /* reporter */)
-}
-
-func (nl *NodeLiveness) SetDecommissioningInternal(
-	ctx context.Context, oldLivenessRec LivenessRecord, targetStatus kvserverpb.MembershipStatus,
-) (changeCommitted bool, err error) {
-	return nl.setMembershipStatusInternal(ctx, oldLivenessRec, targetStatus)
 }
 
 // GetCircuitBreaker returns the circuit breaker controlling

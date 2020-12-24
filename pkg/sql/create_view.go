@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 // createViewNode represents a CREATE VIEW statement.
@@ -136,7 +137,7 @@ func (n *createViewNode) startExec(params runParams) error {
 		telemetry.Inc(sqltelemetry.CreateTempViewCounter)
 	}
 
-	privs := CreateInheritedPrivilegesFromDBDesc(n.dbDesc, params.SessionData().User)
+	privs := CreateInheritedPrivilegesFromDBDesc(n.dbDesc, params.SessionData().User())
 
 	var newDesc *tabledesc.Mutable
 
@@ -180,7 +181,7 @@ func (n *createViewNode) startExec(params runParams) error {
 
 		if n.materialized {
 			// Ensure all nodes are the correct version.
-			if !params.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.VersionMaterializedViews) {
+			if !params.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.MaterializedViews) {
 				return pgerror.New(pgcode.FeatureNotSupported,
 					"all nodes are not the correct version to use materialized views")
 			}
@@ -257,22 +258,12 @@ func (n *createViewNode) startExec(params runParams) error {
 
 	// Log Create View event. This is an auditable log event and is
 	// recorded in the same transaction as the table descriptor update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogCreateView,
-		int32(newDesc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			ViewName  string
-			ViewQuery string
-			User      string
-		}{
+	return params.p.logEvent(params.ctx,
+		newDesc.ID,
+		&eventpb.CreateView{
 			ViewName:  n.viewName.FQString(),
 			ViewQuery: n.viewQuery,
-			User:      params.SessionData().User,
-		},
-	)
+		})
 }
 
 func (*createViewNode) Next(runParams) (bool, error) { return false, nil }
@@ -403,6 +394,9 @@ func addResultColumns(
 ) error {
 	for _, colRes := range resultColumns {
 		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colRes.Typ}
+		// Nullability constraints do not need to exist on the view, since they are
+		// already enforced on the source data.
+		columnTableDef.Nullable.Nullability = tree.SilentNull
 		// The new types in the CREATE VIEW column specs never use
 		// SERIAL so we need not process SERIAL types here.
 		col, _, _, err := tabledesc.MakeColumnDefDescs(ctx, &columnTableDef, semaCtx, evalCtx)

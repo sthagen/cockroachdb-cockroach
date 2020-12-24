@@ -14,10 +14,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/errors"
 )
 
 func (b *Builder) buildExplain(explain *tree.Explain, inScope *scope) (outScope *scope) {
@@ -30,28 +29,12 @@ func (b *Builder) buildExplain(explain *tree.Explain, inScope *scope) (outScope 
 	b.popWithFrame(stmtScope)
 	outScope = inScope.push()
 
-	var cols colinfo.ResultColumns
 	switch explain.Mode {
 	case tree.ExplainPlan:
 		telemetry.Inc(sqltelemetry.ExplainPlanUseCounter)
-		if explain.Flags[tree.ExplainFlagVerbose] || explain.Flags[tree.ExplainFlagTypes] {
-			cols = colinfo.ExplainPlanVerboseColumns
-		} else {
-			cols = colinfo.ExplainPlanColumns
-		}
 
 	case tree.ExplainDistSQL:
-		analyze := explain.Flags[tree.ExplainFlagAnalyze]
-		if analyze {
-			telemetry.Inc(sqltelemetry.ExplainAnalyzeUseCounter)
-		} else {
-			telemetry.Inc(sqltelemetry.ExplainDistSQLUseCounter)
-		}
-		if analyze && tree.IsStmtParallelized(explain.Statement) {
-			panic(pgerror.Newf(pgcode.FeatureNotSupported,
-				"EXPLAIN ANALYZE does not support RETURNING NOTHING statements"))
-		}
-		cols = colinfo.ExplainDistSQLColumns
+		telemetry.Inc(sqltelemetry.ExplainDistSQLUseCounter)
 
 	case tree.ExplainOpt:
 		if explain.Flags[tree.ExplainFlagVerbose] {
@@ -59,17 +42,14 @@ func (b *Builder) buildExplain(explain *tree.Explain, inScope *scope) (outScope 
 		} else {
 			telemetry.Inc(sqltelemetry.ExplainOptUseCounter)
 		}
-		cols = colinfo.ExplainOptColumns
 
 	case tree.ExplainVec:
 		telemetry.Inc(sqltelemetry.ExplainVecUseCounter)
-		cols = colinfo.ExplainVecColumns
 
 	default:
-		panic(pgerror.Newf(pgcode.FeatureNotSupported,
-			"EXPLAIN ANALYZE does not support RETURNING NOTHING statements"))
+		panic(errors.Errorf("EXPLAIN mode %s not supported", explain.Mode))
 	}
-	b.synthesizeResultColumns(outScope, cols)
+	b.synthesizeResultColumns(outScope, colinfo.ExplainPlanColumns)
 
 	input := stmtScope.expr.(memo.RelExpr)
 	private := memo.ExplainPrivate{

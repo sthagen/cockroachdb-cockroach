@@ -22,10 +22,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -576,7 +578,7 @@ func TestJobSchedulerDaemonUsesSystemTables(t *testing.T) {
 	// Create a one off job which writes some values into 'foo' table.
 	schedule := NewScheduledJob(scheduledjobs.ProdJobSchedulerEnv)
 	schedule.SetScheduleLabel("test schedule")
-	schedule.SetOwner("test")
+	schedule.SetOwner(security.TestUserName())
 	schedule.SetNextRun(timeutil.Now())
 	any, err := types.MarshalAny(
 		&jobspb.SqlStatementExecutionArg{Statement: "INSERT INTO defaultdb.foo VALUES (1), (2), (3)"})
@@ -599,6 +601,7 @@ func TestJobSchedulerDaemonUsesSystemTables(t *testing.T) {
 func TestTransientTxnErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderRace(t, "takes >1min under race")
 
 	h, cleanup := newTestHelper(t)
 	defer cleanup()
@@ -610,7 +613,7 @@ func TestTransientTxnErrors(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		schedule := NewScheduledJob(h.env)
 		schedule.SetScheduleLabel(fmt.Sprintf("test schedule: %d", i))
-		schedule.SetOwner("test")
+		schedule.SetOwner(security.TestUserName())
 		require.NoError(t, schedule.SetSchedule("*/1 * * * *"))
 		any, err := types.MarshalAny(&jobspb.SqlStatementExecutionArg{
 			Statement: fmt.Sprintf("UPSERT INTO defaultdb.foo (a, b) VALUES (%d, now())", i),

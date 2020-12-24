@@ -13,11 +13,13 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type alterDatabaseOwnerNode struct {
@@ -29,7 +31,16 @@ type alterDatabaseOwnerNode struct {
 func (p *planner) AlterDatabaseOwner(
 	ctx context.Context, n *tree.AlterDatabaseOwner,
 ) (planNode, error) {
-	dbDesc, err := p.ResolveMutableDatabaseDescriptor(ctx, n.Name.String(), true /* required */)
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER DATABASE",
+	); err != nil {
+		return nil, err
+	}
+
+	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, n.Name.String(),
+		tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return nil, err
 	}
@@ -41,8 +52,8 @@ func (n *alterDatabaseOwnerNode) startExec(params runParams) error {
 	privs := n.desc.GetPrivileges()
 
 	// If the owner we want to set to is the current owner, do a no-op.
-	newOwner := string(n.n.Owner)
-	if newOwner == privs.Owner {
+	newOwner := n.n.Owner
+	if newOwner == privs.Owner() {
 		return nil
 	}
 	if err := params.p.checkCanAlterDatabaseAndSetNewOwner(params.ctx, n.desc, newOwner); err != nil {
@@ -57,26 +68,13 @@ func (n *alterDatabaseOwnerNode) startExec(params runParams) error {
 		return err
 	}
 
-	// Log Alter Database Owner event. This is an auditable log event and is recorded
-	// in the same transaction as the table descriptor update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogAlterDatabaseOwner,
-		int32(n.desc.GetID()),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			DatabaseName string
-			Owner        string
-			User         string
-		}{n.n.Name.String(), newOwner, params.p.SessionData().User},
-	)
+	return nil
 }
 
 // checkCanAlterDatabaseAndSetNewOwner handles privilege checking and setting new owner.
 // Called in ALTER DATABASE and REASSIGN OWNED BY.
 func (p *planner) checkCanAlterDatabaseAndSetNewOwner(
-	ctx context.Context, desc catalog.MutableDescriptor, newOwner string,
+	ctx context.Context, desc catalog.MutableDescriptor, newOwner security.SQLUsername,
 ) error {
 	if err := p.checkCanAlterToNewOwner(ctx, desc, newOwner); err != nil {
 		return err
@@ -90,7 +88,14 @@ func (p *planner) checkCanAlterDatabaseAndSetNewOwner(
 	privs := desc.GetPrivileges()
 	privs.SetOwner(newOwner)
 
-	return nil
+	// Log Alter Database Owner event. This is an auditable log event and is recorded
+	// in the same transaction as the table descriptor update.
+	return p.logEvent(ctx,
+		desc.GetID(),
+		&eventpb.AlterDatabaseOwner{
+			DatabaseName: desc.GetName(),
+			Owner:        newOwner.Normalized(),
+		})
 }
 
 func (n *alterDatabaseOwnerNode) Next(runParams) (bool, error) { return false, nil }
@@ -101,6 +106,13 @@ func (n *alterDatabaseOwnerNode) Close(context.Context)        {}
 func (p *planner) AlterDatabaseAddRegion(
 	ctx context.Context, n *tree.AlterDatabaseAddRegion,
 ) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER DATABASE",
+	); err != nil {
+		return nil, err
+	}
 	return nil, unimplemented.New("alter database add region", "implementation pending")
 }
 
@@ -108,12 +120,33 @@ func (p *planner) AlterDatabaseAddRegion(
 func (p *planner) AlterDatabaseDropRegion(
 	ctx context.Context, n *tree.AlterDatabaseDropRegion,
 ) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER DATABASE",
+	); err != nil {
+		return nil, err
+	}
 	return nil, unimplemented.New("alter database drop region", "implementation pending")
 }
 
-// AlterDatabaseSurvive transforms a tree.AlterDatabaseSurvive into a plan node.
-func (p *planner) AlterDatabaseSurvive(
-	ctx context.Context, n *tree.AlterDatabaseSurvive,
+// AlterDatabasePrimaryRegion transforms a tree.AlterDatabasePrimaryRegion into a plan node.
+func (p *planner) AlterDatabasePrimaryRegion(
+	ctx context.Context, n *tree.AlterDatabasePrimaryRegion,
 ) (planNode, error) {
+	return nil, unimplemented.New("alter database primary region", "implementation pending")
+}
+
+// AlterDatabaseSurvivalGoal transforms a tree.AlterDatabaseSurvivalGoal into a plan node.
+func (p *planner) AlterDatabaseSurvivalGoal(
+	ctx context.Context, n *tree.AlterDatabaseSurvivalGoal,
+) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER DATABASE",
+	); err != nil {
+		return nil, err
+	}
 	return nil, unimplemented.New("alter database survive", "implementation pending")
 }

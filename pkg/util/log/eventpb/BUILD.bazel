@@ -1,0 +1,36 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "eventpb",
+    srcs = [
+        "cluster_events.pb.go",
+        "ddl_events.pb.go",
+        "doc.go",
+        "eventlog_channels_generated.go",
+        "events.go",
+        "events.pb.go",
+        "json_encode_generated.go",
+        "misc_sql_events.pb.go",
+        "privilege_events.pb.go",
+        "role_events.pb.go",
+        "zone_events.pb.go",
+    ],
+    importpath = "github.com/cockroachdb/cockroach/pkg/util/log/eventpb",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/util/jsonbytes",
+        "//pkg/util/log/logpb",
+        "@com_github_cockroachdb_redact//:redact",
+        "@com_github_gogo_protobuf//proto",
+    ],
+)
+
+go_test(
+    name = "eventpb_test",
+    srcs = ["event_test.go"],
+    embed = [":eventpb"],
+    deps = [
+        "@com_github_cockroachdb_redact//:redact",
+        "@com_github_stretchr_testify//assert",
+    ],
+)

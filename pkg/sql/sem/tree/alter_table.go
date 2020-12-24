@@ -13,7 +13,9 @@ package tree
 import (
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 )
 
@@ -237,7 +239,7 @@ func (node *AlterTableAlterColumnType) Format(ctx *FmtCtx) {
 	ctx.WriteString(node.ToType.SQLString())
 	if len(node.Collation) > 0 {
 		ctx.WriteString(" COLLATE ")
-		ctx.WriteString(node.Collation)
+		lex.EncodeLocaleName(&ctx.Buffer, node.Collation)
 	}
 	if node.Using != nil {
 		ctx.WriteString(" USING ")
@@ -255,6 +257,7 @@ type AlterTableAlterPrimaryKey struct {
 	Columns    IndexElemList
 	Interleave *InterleaveDef
 	Sharded    *ShardedIndexDef
+	Name       Name
 }
 
 // TelemetryCounter implements the AlterTableCmd interface.
@@ -548,6 +551,26 @@ func (node *AlterTableInjectStats) Format(ctx *FmtCtx) {
 	ctx.FormatNode(node.Stats)
 }
 
+// AlterTableLocality represents an ALTER TABLE SET REGIONAL AFFINITY command.
+type AlterTableLocality struct {
+	Name     *UnresolvedObjectName
+	IfExists bool
+	Locality *Locality
+}
+
+var _ Statement = &AlterTableLocality{}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterTableLocality) Format(ctx *FmtCtx) {
+	ctx.WriteString("ALTER TABLE ")
+	if node.IfExists {
+		ctx.WriteString("IF EXISTS ")
+	}
+	node.Name.Format(ctx)
+	ctx.WriteString(" SET ")
+	node.Locality.Format(ctx)
+}
+
 // AlterTableSetSchema represents an ALTER TABLE SET SCHEMA command.
 type AlterTableSetSchema struct {
 	Name           *UnresolvedObjectName
@@ -581,7 +604,9 @@ func (node *AlterTableSetSchema) Format(ctx *FmtCtx) {
 
 // AlterTableOwner represents an ALTER TABLE OWNER TO command.
 type AlterTableOwner struct {
-	Owner Name
+	// TODO(solon): Adjust this, see
+	// https://github.com/cockroachdb/cockroach/issues/54696
+	Owner security.SQLUsername
 }
 
 // TelemetryCounter implements the AlterTableCmd interface.
@@ -592,5 +617,5 @@ func (node *AlterTableOwner) TelemetryCounter() telemetry.Counter {
 // Format implements the NodeFormatter interface.
 func (node *AlterTableOwner) Format(ctx *FmtCtx) {
 	ctx.WriteString(" OWNER TO ")
-	ctx.FormatNode(&node.Owner)
+	ctx.FormatUsername(node.Owner)
 }

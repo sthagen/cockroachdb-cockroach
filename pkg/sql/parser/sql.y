@@ -31,11 +31,13 @@ import (
 
     "github.com/cockroachdb/cockroach/pkg/geo/geopb"
     "github.com/cockroachdb/cockroach/pkg/roachpb"
+    "github.com/cockroachdb/cockroach/pkg/security"
     "github.com/cockroachdb/cockroach/pkg/sql/lex"
     "github.com/cockroachdb/cockroach/pkg/sql/privilege"
     "github.com/cockroachdb/cockroach/pkg/sql/roleoption"
     "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
     "github.com/cockroachdb/cockroach/pkg/sql/types"
+    "github.com/cockroachdb/errors"
     "github.com/lib/pq/oid"
 )
 
@@ -139,6 +141,12 @@ func (u *sqlSymUnion) strPtr() *string {
 }
 func (u *sqlSymUnion) strs() []string {
     return u.val.([]string)
+}
+func (u *sqlSymUnion) user() security.SQLUsername {
+    return u.val.(security.SQLUsername)
+}
+func (u *sqlSymUnion) users() []security.SQLUsername {
+    return u.val.([]security.SQLUsername)
 }
 func (u *sqlSymUnion) newTableIndexName() *tree.TableIndexName {
     tn := u.val.(tree.TableIndexName)
@@ -555,8 +563,17 @@ func (u *sqlSymUnion) executorType() tree.ScheduledJobExecutorType {
 func (u *sqlSymUnion) refreshDataOption() tree.RefreshDataOption {
   return u.val.(tree.RefreshDataOption)
 }
-func (u *sqlSymUnion) survive() tree.Survive {
-    return u.val.(tree.Survive)
+func (u *sqlSymUnion) locality() *tree.Locality {
+  return u.val.(*tree.Locality)
+}
+func (u *sqlSymUnion) survivalGoal() tree.SurvivalGoal {
+  return u.val.(tree.SurvivalGoal)
+}
+func (u *sqlSymUnion) objectNamePrefix() tree.ObjectNamePrefix {
+	return u.val.(tree.ObjectNamePrefix)
+}
+func (u *sqlSymUnion) objectNamePrefixList() tree.ObjectNamePrefixList {
+    return u.val.(tree.ObjectNamePrefixList)
 }
 %}
 
@@ -577,9 +594,9 @@ func (u *sqlSymUnion) survive() tree.Survive {
 // below; search this file for "Keyword category lists".
 
 // Ordinary key words in alphabetical order.
-%token <str> ABORT ACCESS ACTION ADD ADMIN AFTER AGGREGATE
+%token <str> ABORT ACCESS ACTION ADD ADMIN AFFINITY AFTER AGGREGATE
 %token <str> ALL ALTER ALWAYS ANALYSE ANALYZE AND AND_AND ANY ANNOTATE_TYPE ARRAY AS ASC
-%token <str> ASYMMETRIC AT ATTRIBUTE AUTHORIZATION AUTOMATIC AVAILABILITY
+%token <str> ASYMMETRIC AT ATTRIBUTE AUTHORIZATION AUTOMATIC
 
 %token <str> BACKUP BACKUPS BEFORE BEGIN BETWEEN BIGINT BIGSERIAL BINARY BIT
 %token <str> BUCKET_COUNT
@@ -611,7 +628,7 @@ func (u *sqlSymUnion) survive() tree.Survive {
 
 %token <str> GENERATED GEOGRAPHY GEOMETRY GEOMETRYM GEOMETRYZ GEOMETRYZM
 %token <str> GEOMETRYCOLLECTION GEOMETRYCOLLECTIONM GEOMETRYCOLLECTIONZ GEOMETRYCOLLECTIONZM
-%token <str> GLOBAL GRANT GRANTS GREATEST GROUP GROUPING GROUPS
+%token <str> GLOBAL GOAL GRANT GRANTS GREATEST GROUP GROUPING GROUPS
 
 %token <str> HAVING HASH HIGH HISTOGRAM HOUR
 
@@ -629,7 +646,7 @@ func (u *sqlSymUnion) survive() tree.Survive {
 %token <str> LANGUAGE LAST LATERAL LATEST LC_CTYPE LC_COLLATE
 %token <str> LEADING LEASE LEAST LEFT LESS LEVEL LIKE LIMIT
 %token <str> LINESTRING LINESTRINGM LINESTRINGZ LINESTRINGZM
-%token <str> LIST LOCAL LOCALTIME LOCALTIMESTAMP LOCKED LOGIN LOOKUP LOW LSHIFT
+%token <str> LIST LOCAL LOCALITY LOCALTIME LOCALTIMESTAMP LOCKED LOGIN LOOKUP LOW LSHIFT
 
 %token <str> MATCH MATERIALIZED MERGE MINVALUE MAXVALUE METHOD MINUTE MODIFYCLUSTERSETTING MONTH
 %token <str> MULTILINESTRING MULTILINESTRINGM MULTILINESTRINGZ MULTILINESTRINGZM
@@ -651,7 +668,7 @@ func (u *sqlSymUnion) survive() tree.Survive {
 %token <str> QUERIES QUERY
 
 %token <str> RANGE RANGES READ REAL REASSIGN RECURSIVE RECURRING REF REFERENCES REFRESH
-%token <str> REGCLASS REGION REGIONS REGPROC REGPROCEDURE REGNAMESPACE REGTYPE REINDEX
+%token <str> REGCLASS REGION REGIONAL REGIONS REGPROC REGPROCEDURE REGNAMESPACE REGTYPE REINDEX
 %token <str> REMOVE_PATH RENAME REPEATABLE REPLACE
 %token <str> RELEASE RESET RESTORE RESTRICT RESUME RETURNING RETRY REVISION_HISTORY REVOKE RIGHT
 %token <str> ROLE ROLES ROLLBACK ROLLUP ROW ROWS RSHIFT RULE RUNNING
@@ -662,7 +679,7 @@ func (u *sqlSymUnion) survive() tree.Survive {
 %token <str> SKIP_MISSING_SEQUENCES SKIP_MISSING_SEQUENCE_OWNERS SKIP_MISSING_VIEWS SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
 
 %token <str> START STATISTICS STATUS STDIN STRICT STRING STORAGE STORE STORED STORING SUBSTRING
-%token <str> SURVIVE SYMMETRIC SYNTAX SYSTEM SQRT SUBSCRIPTION
+%token <str> SURVIVE SURVIVAL SYMMETRIC SYNTAX SYSTEM SQRT SUBSCRIPTION
 
 %token <str> TABLE TABLES TABLESPACE TEMP TEMPLATE TEMPORARY TENANT TESTING_RELOCATE EXPERIMENTAL_RELOCATE TEXT THEN
 %token <str> TIES TIME TIMETZ TIMESTAMP TIMESTAMPTZ TO THROTTLING TRAILING TRACE
@@ -729,6 +746,7 @@ func (u *sqlSymUnion) survive() tree.Survive {
 %type <tree.Statement> alter_relocate_lease_stmt
 %type <tree.Statement> alter_zone_table_stmt
 %type <tree.Statement> alter_table_set_schema_stmt
+%type <tree.Statement> alter_table_locality_stmt
 
 // ALTER PARTITION
 %type <tree.Statement> alter_zone_partition_stmt
@@ -738,7 +756,8 @@ func (u *sqlSymUnion) survive() tree.Survive {
 %type <tree.Statement> alter_database_to_schema_stmt
 %type <tree.Statement> alter_database_add_region_stmt
 %type <tree.Statement> alter_database_drop_region_stmt
-%type <tree.Statement> alter_database_survive_stmt
+%type <tree.Statement> alter_database_survival_goal_stmt
+%type <tree.Statement> alter_database_primary_region_stmt
 %type <tree.Statement> alter_zone_database_stmt
 %type <tree.Statement> alter_database_owner
 
@@ -870,6 +889,8 @@ func (u *sqlSymUnion) survive() tree.Survive {
 %type <tree.Statement> show_queries_stmt
 %type <tree.Statement> show_ranges_stmt
 %type <tree.Statement> show_range_for_row_stmt
+%type <tree.Statement> show_locality_stmt
+%type <tree.Statement> show_survival_goal_stmt
 %type <tree.Statement> show_regions_stmt
 %type <tree.Statement> show_roles_stmt
 %type <tree.Statement> show_schemas_stmt
@@ -936,7 +957,10 @@ func (u *sqlSymUnion) survive() tree.Survive {
 
 %type <str> opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause
 %type <tree.NameList> opt_regions_list
-%type <tree.Survive> survive_clause opt_survive_clause
+%type <str> region_name primary_region_clause opt_primary_region_clause
+%type <tree.NameList> region_name_list
+%type <tree.SurvivalGoal> survival_goal_clause opt_survival_goal_clause
+%type <*tree.Locality> locality opt_locality
 %type <int32> opt_connection_limit
 
 %type <tree.IsolationLevel> transaction_iso_level
@@ -956,7 +980,9 @@ func (u *sqlSymUnion) survive() tree.Survive {
 %type <str> db_object_name_component
 %type <*tree.UnresolvedObjectName> table_name standalone_index_name sequence_name type_name view_name db_object_name simple_db_object_name complex_db_object_name
 %type <[]*tree.UnresolvedObjectName> type_name_list
-%type <str> schema_name opt_schema_name
+%type <str> schema_name
+%type <tree.ObjectNamePrefix>  qualifiable_schema_name opt_schema_name
+%type <tree.ObjectNamePrefixList> schema_name_list
 %type <*tree.UnresolvedName> table_pattern complex_table_pattern
 %type <*tree.UnresolvedName> column_path prefixed_column_path column_path_with_star
 %type <tree.TableExpr> insert_target create_stats_target analyze_target
@@ -1114,8 +1140,11 @@ func (u *sqlSymUnion) survive() tree.Survive {
 %type <str> unrestricted_name type_function_name type_function_name_no_crdb_extra
 %type <str> non_reserved_word
 %type <str> non_reserved_word_or_sconst
-%type <str> role_spec
-%type <[]string> role_spec_list
+%type <security.SQLUsername> username_or_sconst
+// TODO(solon): The type for role_spec needs to be updated to fix
+// https://github.com/cockroachdb/cockroach/issues/54696
+%type <security.SQLUsername> role_spec
+%type <[]security.SQLUsername> role_spec_list
 %type <tree.Expr> zone_value
 %type <tree.Expr> string_or_placeholder
 %type <tree.Expr> string_or_placeholder_list
@@ -1327,6 +1356,7 @@ alter_ddl_stmt:
 //   ALTER TABLE ... PARTITION BY NOTHING
 //   ALTER TABLE ... CONFIGURE ZONE <zoneconfig>
 //   ALTER TABLE ... SET SCHEMA <newschemaname>
+//   ALTER TABLE ... SET LOCALITY [REGIONAL BY [TABLE IN <region> | ROW] | GLOBAL]
 //
 // Column qualifiers:
 //   [CONSTRAINT <constraintname>] {NULL | NOT NULL | UNIQUE [WITHOUT INDEX] | PRIMARY KEY | CHECK (<expr>) | DEFAULT <expr>}
@@ -1351,6 +1381,7 @@ alter_table_stmt:
 | alter_zone_table_stmt
 | alter_rename_table_stmt
 | alter_table_set_schema_stmt
+| alter_table_locality_stmt
 // ALTER TABLE has its error help token here because the ALTER TABLE
 // prefix is spread over multiple non-terminals.
 | ALTER TABLE error     // SHOW HELP: ALTER TABLE
@@ -1429,6 +1460,7 @@ alter_sequence_options_stmt:
 // ALTER DATABASE <name> CONVERT TO SCHEMA WITH PARENT <name>
 // ALTER DATABASE <name> ADD REGIONS <regions>
 // ALTER DATABASE <name> DROP REGIONS <regions>
+// ALTER DATABASE <name> SET PRIMARY REGION <region>
 // ALTER DATABASE <name> SURVIVE <failure type>
 // %SeeAlso: WEBDOCS/alter-database.html
 alter_database_stmt:
@@ -1438,47 +1470,53 @@ alter_database_stmt:
 | alter_database_to_schema_stmt
 | alter_database_add_region_stmt
 | alter_database_drop_region_stmt
-| alter_database_survive_stmt
+| alter_database_survival_goal_stmt
+| alter_database_primary_region_stmt
 // ALTER DATABASE has its error help token here because the ALTER DATABASE
 // prefix is spread over multiple non-terminals.
 | ALTER DATABASE error // SHOW HELP: ALTER DATABASE
 
 alter_database_owner:
-	ALTER DATABASE database_name OWNER TO role_spec
-	{
-		$$.val = &tree.AlterDatabaseOwner{Name: tree.Name($3), Owner: tree.Name($6)}
-	}
+  ALTER DATABASE database_name OWNER TO role_spec
+  {
+    $$.val = &tree.AlterDatabaseOwner{Name: tree.Name($3), Owner: $6.user()}
+  }
 
 alter_database_add_region_stmt:
-  ALTER DATABASE database_name ADD region_or_regions name_list
+  ALTER DATABASE database_name ADD REGION region_name
   {
     $$.val = &tree.AlterDatabaseAddRegion{
       Name: tree.Name($3),
-      Regions: $6.nameList(),
+      Region: tree.Name($6),
     }
   }
 
 alter_database_drop_region_stmt:
-  ALTER DATABASE database_name DROP region_or_regions name_list
+  ALTER DATABASE database_name DROP REGION region_name
   {
     $$.val = &tree.AlterDatabaseDropRegion{
       Name: tree.Name($3),
-      Regions: $6.nameList(),
+      Region: tree.Name($6),
     }
   }
 
-alter_database_survive_stmt:
-  ALTER DATABASE database_name survive_clause
+alter_database_survival_goal_stmt:
+  ALTER DATABASE database_name survival_goal_clause
   {
-    $$.val = &tree.AlterDatabaseSurvive{
+    $$.val = &tree.AlterDatabaseSurvivalGoal{
       Name: tree.Name($3),
-      Survive: $4.survive(),
+      SurvivalGoal: $4.survivalGoal(),
     }
   }
 
-region_or_regions:
-  REGION
-| REGIONS
+alter_database_primary_region_stmt:
+  ALTER DATABASE database_name primary_region_clause
+  {
+    $$.val = &tree.AlterDatabasePrimaryRegion{
+      Name: tree.Name($3),
+      PrimaryRegion: tree.Name($4),
+    }
+  }
 
 // %Help: ALTER RANGE - change the parameters of a range
 // %Category: DDL
@@ -1967,7 +2005,7 @@ alter_table_cmd:
 | OWNER TO role_spec
   {
     $$.val = &tree.AlterTableOwner{
-      Owner: tree.Name($3),
+      Owner: $3.user(),
     }
   }
 
@@ -2113,7 +2151,7 @@ alter_type_stmt:
     $$.val = &tree.AlterType{
       Type: $3.unresolvedObjectName(),
       Cmd: &tree.AlterTypeOwner{
-        Owner: tree.Name($6),
+        Owner: $6.user(),
       },
     }
   }
@@ -2148,18 +2186,44 @@ opt_add_val_placement:
   }
 
 role_spec_list:
-	role_spec {
-		$$.val = []string{$1}
-	}
+  role_spec
+  {
+    $$.val = []security.SQLUsername{$1.user()}
+  }
 | role_spec_list ',' role_spec
-	{
-		$$.val = append($1.strs(), $3)
-	}
+  {
+    $$.val = append($1.users(), $3.user())
+  }
 
 role_spec:
-  non_reserved_word_or_sconst
+  username_or_sconst { $$.val = $1.user() }
 | CURRENT_USER
+  {
+   // This is incorrect, see https://github.com/cockroachdb/cockroach/issues/54696
+   $$.val = security.MakeSQLUsernameFromPreNormalizedString($1)
+  }
 | SESSION_USER
+  {
+   // This is incorrect, see https://github.com/cockroachdb/cockroach/issues/54696
+     $$.val = security.MakeSQLUsernameFromPreNormalizedString($1)
+  }
+
+username_or_sconst:
+  non_reserved_word
+  {
+    // Username was entered as a SQL keyword, or as a SQL identifier
+    // already subject to case normalization and NFC reduction.
+    // (or is it? In fact, there is a bug here: https://github.com/cockroachdb/cockroach/issues/55396
+    // which needs to be fixed to make this fully correct.)
+    $$.val = security.MakeSQLUsernameFromPreNormalizedString($1)
+  }
+| SCONST
+  {
+    // We use UsernameValidation because username_or_sconst and role_spec
+    // are only used for usernames of existing accounts, not when
+    // creating new users or roles.	
+    $$.val, _ = security.MakeSQLUsernameFromUserInput($1, security.UsernameValidation)
+  }
 
 alter_attribute_action_list:
   alter_attribute_action
@@ -2508,6 +2572,16 @@ restore_stmt:
     From: $3.listOfStringOrPlaceholderOptList(),
     AsOf: $4.asOfClause(),
     Options: *($5.restoreOptions()),
+    }
+  }
+| RESTORE FROM string_or_placeholder IN list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
+  {
+    $$.val = &tree.Restore{
+    DescriptorCoverage: tree.AllDescriptors,
+		Subdir: $3.expr(),
+		From: $5.listOfStringOrPlaceholderOptList(),
+		AsOf: $6.asOfClause(),
+		Options: *($7.restoreOptions()),
     }
   }
 | RESTORE targets FROM list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
@@ -3442,18 +3516,18 @@ type_name_list:
 // %Category: DDL
 // %Text: DROP SCHEMA [IF EXISTS] <schema_name> [, ...] [CASCADE | RESTRICT]
 drop_schema_stmt:
-  DROP SCHEMA name_list opt_drop_behavior
+  DROP SCHEMA schema_name_list opt_drop_behavior
   {
     $$.val = &tree.DropSchema{
-      Names: $3.nameList(),
+      Names: $3.objectNamePrefixList(),
       IfExists: false,
       DropBehavior: $4.dropBehavior(),
     }
   }
-| DROP SCHEMA IF EXISTS name_list opt_drop_behavior
+| DROP SCHEMA IF EXISTS schema_name_list opt_drop_behavior
   {
     $$.val = &tree.DropSchema{
-      Names: $5.nameList(),
+      Names: $5.objectNamePrefixList(),
       IfExists: true,
       DropBehavior: $6.dropBehavior(),
     }
@@ -3520,8 +3594,9 @@ analyze_target:
 // %Text:
 // EXPLAIN <statement>
 // EXPLAIN ([PLAN ,] <planoptions...> ) <statement>
-// EXPLAIN [ANALYZE] (DISTSQL) <statement>
+// EXPLAIN (DISTSQL) <statement>
 // EXPLAIN ANALYZE [(DISTSQL)] <statement>
+// EXPLAIN ANALYZE (PLAN <planoptions...>) <statement>
 //
 // Explainable statements:
 //     SELECT, CREATE, DROP, ALTER, INSERT, UPSERT, UPDATE, DELETE,
@@ -3552,7 +3627,7 @@ explain_stmt:
 | EXPLAIN ANALYZE preparable_stmt
   {
     var err error
-    $$.val, err = tree.MakeExplain([]string{"DISTSQL", "ANALYZE"}, $3.stmt())
+    $$.val, err = tree.MakeExplain([]string{"ANALYZE"}, $3.stmt())
     if err != nil {
       return setErr(sqllex, err)
     }
@@ -3560,7 +3635,7 @@ explain_stmt:
 | EXPLAIN ANALYSE preparable_stmt
   {
     var err error
-    $$.val, err = tree.MakeExplain([]string{"DISTSQL", "ANALYZE"}, $3.stmt())
+    $$.val, err = tree.MakeExplain([]string{"ANALYZE"}, $3.stmt())
     if err != nil {
       return setErr(sqllex, err)
     }
@@ -3742,7 +3817,7 @@ deallocate_stmt:
 //   DATABASE <databasename> [, ...]
 //   [TABLE] [<databasename> .] { <tablename> | * } [, ...]
 //   TYPE <typename> [, <typename>]...
-//   SCHEMA <schemaname> [, <schemaname]...
+//   SCHEMA [<databasename> .]<schemaname> [, [<databasename> .]<schemaname>]...
 //
 // %SeeAlso: REVOKE, WEBDOCS/grant.html
 grant_stmt:
@@ -3762,12 +3837,12 @@ grant_stmt:
   {
     $$.val = &tree.Grant{Privileges: $2.privilegeList(), Targets: $5.targetList(), Grantees: $7.nameList()}
   }
-| GRANT privileges ON SCHEMA name_list TO name_list
+| GRANT privileges ON SCHEMA schema_name_list TO name_list
   {
     $$.val = &tree.Grant{
       Privileges: $2.privilegeList(),
       Targets: tree.TargetList{
-        Schemas: $5.nameList(),
+        Schemas: $5.objectNamePrefixList(),
       },
       Grantees: $7.nameList(),
     }
@@ -3789,7 +3864,7 @@ grant_stmt:
 //   DATABASE <databasename> [, <databasename>]...
 //   [TABLE] [<databasename> .] { <tablename> | * } [, ...]
 //   TYPE <typename> [, <typename>]...
-//   SCHEMA <schemaname> [, <schemaname]...
+//   SCHEMA [<databasename> .]<schemaname> [, [<databasename> .]<schemaname]...
 //
 // %SeeAlso: GRANT, WEBDOCS/revoke.html
 revoke_stmt:
@@ -3809,12 +3884,12 @@ revoke_stmt:
   {
     $$.val = &tree.Revoke{Privileges: $2.privilegeList(), Targets: $5.targetList(), Grantees: $7.nameList()}
   }
-| REVOKE privileges ON SCHEMA name_list FROM name_list
+| REVOKE privileges ON SCHEMA schema_name_list FROM name_list
   {
     $$.val = &tree.Revoke{
       Privileges: $2.privilegeList(),
       Targets: tree.TargetList{
-        Schemas: $5.nameList(),
+        Schemas: $5.objectNamePrefixList(),
       },
       Grantees: $7.nameList(),
     }
@@ -4044,7 +4119,7 @@ set_exprs_internal:
 // SET [SESSION] <var> { TO | = } <values...>
 // SET [SESSION] TIME ZONE <tz>
 // SET [SESSION] CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL { SNAPSHOT | SERIALIZABLE }
-// SET [SESSION] TRACING { TO | = } { on | off | cluster | local | kv | results } [,...]
+// SET [SESSION] TRACING { TO | = } { on | off | cluster | kv | results } [,...]
 //
 // %SeeAlso: SHOW SESSION, RESET, DISCARD, SHOW, SET CLUSTER SETTING, SET TRANSACTION,
 // WEBDOCS/set-vars.html
@@ -4125,7 +4200,7 @@ set_rest_more:
     /* SKIP DOC */
     $$.val = &tree.SetSessionAuthorizationDefault{}
   }
-| SESSION AUTHORIZATION non_reserved_word_or_sconst
+| SESSION AUTHORIZATION username_or_sconst
   {
     return unimplementedWithIssue(sqllex, 40283)
   }
@@ -4271,10 +4346,11 @@ zone_value:
 // %Text:
 // SHOW BACKUP, SHOW CLUSTER SETTING, SHOW COLUMNS, SHOW CONSTRAINTS,
 // SHOW CREATE, SHOW DATABASES, SHOW ENUMS, SHOW HISTOGRAM, SHOW INDEXES, SHOW
-// PARTITIONS, SHOW JOBS, SHOW QUERIES, SHOW RANGE, SHOW RANGES, SHOW REGIONS,
+// PARTITIONS, SHOW JOBS, SHOW QUERIES, SHOW RANGE, SHOW RANGES, SHOW REGIONS, SHOW SURVIVAL GOAL,
 // SHOW ROLES, SHOW SCHEMAS, SHOW SEQUENCES, SHOW SESSION, SHOW SESSIONS,
 // SHOW STATISTICS, SHOW SYNTAX, SHOW TABLES, SHOW TRACE, SHOW TRANSACTION,
-// SHOW TRANSACTIONS, SHOW TYPES, SHOW USERS, SHOW LAST QUERY STATISTICS, SHOW SCHEDULES
+// SHOW TRANSACTIONS, SHOW TYPES, SHOW USERS, SHOW LAST QUERY STATISTICS, SHOW SCHEDULES,
+// SHOW LOCALITY
 show_stmt:
   show_backup_stmt          // EXTEND WITH HELP: SHOW BACKUP
 | show_columns_stmt         // EXTEND WITH HELP: SHOW COLUMNS
@@ -4290,11 +4366,13 @@ show_stmt:
 | show_indexes_stmt         // EXTEND WITH HELP: SHOW INDEXES
 | show_partitions_stmt      // EXTEND WITH HELP: SHOW PARTITIONS
 | show_jobs_stmt            // EXTEND WITH HELP: SHOW JOBS
+| show_locality_stmt
 | show_schedules_stmt       // EXTEND WITH HELP: SHOW SCHEDULES
 | show_queries_stmt         // EXTEND WITH HELP: SHOW QUERIES
 | show_ranges_stmt          // EXTEND WITH HELP: SHOW RANGES
 | show_range_for_row_stmt
 | show_regions_stmt         // EXTEND WITH HELP: SHOW REGIONS
+| show_survival_goal_stmt   // EXTEND_WITH_HELP: SHOW SURVIVAL GOAL
 | show_roles_stmt           // EXTEND WITH HELP: SHOW ROLES
 | show_savepoint_stmt       // EXTEND WITH HELP: SHOW SAVEPOINT
 | show_schemas_stmt         // EXTEND WITH HELP: SHOW SCHEMAS
@@ -4310,7 +4388,7 @@ show_stmt:
 | show_users_stmt           // EXTEND WITH HELP: SHOW USERS
 | show_zone_stmt
 | SHOW error                // SHOW HELP: SHOW
-| show_last_query_stats_stmt // EXTEND WITH HELP: SHOW LAST QUERY STATISTICS
+| show_last_query_stats_stmt
 
 // Cursors are not yet supported by CockroachDB. CLOSE ALL is safe to no-op
 // since there will be no open cursors.
@@ -4554,6 +4632,26 @@ show_enums_stmt:
   {
     $$.val = &tree.ShowEnums{}
   }
+| SHOW ENUMS FROM name '.' name
+  {
+    $$.val = &tree.ShowEnums{ObjectNamePrefix:tree.ObjectNamePrefix{
+        CatalogName: tree.Name($4),
+        ExplicitCatalog: true,
+        SchemaName: tree.Name($6),
+        ExplicitSchema: true,
+      },
+    }
+  }
+| SHOW ENUMS FROM name
+{
+    $$.val = &tree.ShowEnums{ObjectNamePrefix:tree.ObjectNamePrefix{
+        // Note: the schema name may be interpreted as database name,
+        // see name_resolution.go.
+        SchemaName: tree.Name($4),
+        ExplicitSchema: true,
+      },
+    }
+}
 | SHOW ENUMS error // SHOW HELP: SHOW ENUMS
 
 // %Help: SHOW TYPES - list user defined types
@@ -4894,9 +4992,6 @@ show_syntax_stmt:
   }
 | SHOW SYNTAX error // SHOW HELP: SHOW SYNTAX
 
-// %Help: SHOW LAST QUERY STATISTICS - display statistics for the last query issued
-// %Category: Misc
-// %Text: SHOW LAST QUERY STATISTICS
 show_last_query_stats_stmt:
   SHOW LAST QUERY STATISTICS
   {
@@ -5030,8 +5125,8 @@ show_zone_stmt:
 // %Help: SHOW RANGE - show range information for a row
 // %Category: Misc
 // %Text:
-// SHOW RANGE FROM TABLE <tablename> FOR ROW (row, value, ...)
-// SHOW RANGE FROM INDEX [ <tablename> @ ] <indexname> FOR ROW (row, value, ...)
+// SHOW RANGE FROM TABLE <tablename> FOR ROW (value1, value2, ...)
+// SHOW RANGE FROM INDEX [ <tablename> @ ] <indexname> FOR ROW (value1, value2, ...)
 show_range_for_row_stmt:
   SHOW RANGE FROM TABLE table_name FOR ROW '(' expr_list ')'
   {
@@ -5071,21 +5166,62 @@ show_ranges_stmt:
   }
 | SHOW RANGES error // SHOW HELP: SHOW RANGES
 
+// %Help: SHOW SURVIVAL GOAL - shows survival goals
+// %Category: DDL
+// %Text:
+// SHOW SURVIVAL GOAL FROM DATABASE
+// SHOW SURVIVAL GOAL FROM DATABASE <database>
+show_survival_goal_stmt:
+  SHOW SURVIVAL GOAL FROM DATABASE
+  {
+    $$.val = &tree.ShowSurvivalGoal{}
+  }
+| SHOW SURVIVAL GOAL FROM DATABASE database_name
+  {
+    $$.val = &tree.ShowSurvivalGoal{
+      DatabaseName: tree.Name($6),
+    }
+  }
+
 // %Help: SHOW REGIONS - shows regions
 // %Category: DDL
 // %Text:
-// SHOW REGIONS
-// SHOW REGIONS FOR DATABASE <database>
+// SHOW REGIONS FROM ALL DATABASES
+// SHOW REGIONS FROM CLUSTER
+// SHOW REGIONS FROM DATABASE
+// SHOW REGIONS FROM DATABASE <database>
 show_regions_stmt:
-  SHOW REGIONS
+  SHOW REGIONS FROM CLUSTER
   {
-    $$.val = &tree.ShowRegions{}
+    $$.val = &tree.ShowRegions{
+      ShowRegionsFrom: tree.ShowRegionsFromCluster,
+    }
+  }
+| SHOW REGIONS FROM DATABASE
+  {
+    $$.val = &tree.ShowRegions{
+      ShowRegionsFrom: tree.ShowRegionsFromDatabase,
+    }
+  }
+| SHOW REGIONS FROM ALL DATABASES
+  {
+    $$.val = &tree.ShowRegions{
+      ShowRegionsFrom: tree.ShowRegionsFromAllDatabases,
+    }
   }
 | SHOW REGIONS FROM DATABASE database_name
   {
     $$.val = &tree.ShowRegions{
-      Database: tree.Name($5),
+      ShowRegionsFrom: tree.ShowRegionsFromDatabase,
+      DatabaseName: tree.Name($5),
     }
+  }
+| SHOW REGIONS error // SHOW HELP: SHOW REGIONS
+
+show_locality_stmt:
+  SHOW LOCALITY
+  {
+    $$.val = &tree.ShowVar{Name: "locality"}
   }
 
 show_fingerprints_stmt:
@@ -5302,9 +5438,9 @@ targets_roles:
   {
      $$.val = tree.TargetList{ForRoles: true, Roles: $2.nameList()}
   }
-| SCHEMA name_list
+| SCHEMA schema_name_list
   {
-     $$.val = tree.TargetList{Schemas: $2.nameList()}
+     $$.val = tree.TargetList{Schemas: $2.objectNamePrefixList()}
   }
 | TYPE type_name_list
   {
@@ -5417,34 +5553,34 @@ pause_schedules_stmt:
 // %Help: CREATE SCHEMA - create a new schema
 // %Category: DDL
 // %Text:
-// CREATE SCHEMA [IF NOT EXISTS] { <schemaname> | [<schemaname>] AUTHORIZATION <rolename> }
+// CREATE SCHEMA [IF NOT EXISTS] { [<databasename>.]<schemaname> | [[<databasename>.]<schemaname>] AUTHORIZATION <rolename> }
 create_schema_stmt:
-  CREATE SCHEMA schema_name
+  CREATE SCHEMA qualifiable_schema_name
   {
     $$.val = &tree.CreateSchema{
-      Schema: tree.Name($3),
+      Schema: $3.objectNamePrefix(),
     }
   }
-| CREATE SCHEMA IF NOT EXISTS schema_name
+| CREATE SCHEMA IF NOT EXISTS qualifiable_schema_name
   {
     $$.val = &tree.CreateSchema{
-      Schema: tree.Name($6),
+      Schema: $6.objectNamePrefix(),
       IfNotExists: true,
     }
   }
 | CREATE SCHEMA opt_schema_name AUTHORIZATION role_spec
   {
     $$.val = &tree.CreateSchema{
-      Schema: tree.Name($3),
-      AuthRole: $5,
+      Schema: $3.objectNamePrefix(),
+      AuthRole: $5.user(),
     }
   }
 | CREATE SCHEMA IF NOT EXISTS opt_schema_name AUTHORIZATION role_spec
   {
     $$.val = &tree.CreateSchema{
-      Schema: tree.Name($6),
+      Schema: $6.objectNamePrefix(),
       IfNotExists: true,
-      AuthRole: $8,
+      AuthRole: $8.user(),
     }
   }
 | CREATE SCHEMA error // SHOW HELP: CREATE SCHEMA
@@ -5457,21 +5593,21 @@ create_schema_stmt:
 //   ALTER SCHEMA ... RENAME TO <newschemaname>
 //   ALTER SCHEMA ... OWNER TO {<newowner> | CURRENT_USER | SESSION_USER }
 alter_schema_stmt:
-  ALTER SCHEMA schema_name RENAME TO schema_name
+  ALTER SCHEMA qualifiable_schema_name RENAME TO schema_name
   {
     $$.val = &tree.AlterSchema{
-      Schema: tree.Name($3),
+      Schema: $3.objectNamePrefix(),
       Cmd: &tree.AlterSchemaRename{
         NewName: tree.Name($6),
       },
     }
   }
-| ALTER SCHEMA schema_name OWNER TO role_spec
+| ALTER SCHEMA qualifiable_schema_name OWNER TO role_spec
   {
     $$.val = &tree.AlterSchema{
-      Schema: tree.Name($3),
+      Schema: $3.objectNamePrefix(),
       Cmd: &tree.AlterSchemaOwner{
-        Owner: tree.Name($6),
+        Owner: $6.user(),
       },
     }
   }
@@ -5513,7 +5649,7 @@ alter_schema_stmt:
 // WEBDOCS/create-table.html
 // WEBDOCS/create-table-as.html
 create_table_stmt:
-  CREATE opt_persistence_temp_table TABLE table_name '(' opt_table_elem_list ')' opt_create_table_inherits opt_interleave opt_partition_by opt_table_with opt_create_table_on_commit
+  CREATE opt_persistence_temp_table TABLE table_name '(' opt_table_elem_list ')' opt_create_table_inherits opt_interleave opt_partition_by opt_table_with opt_create_table_on_commit opt_locality
   {
     name := $4.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateTable{
@@ -5526,9 +5662,10 @@ create_table_stmt:
       Persistence: $2.persistence(),
       StorageParams: $11.storageParams(),
       OnCommit: $12.createTableOnCommitSetting(),
+      Locality: $13.locality(),
     }
   }
-| CREATE opt_persistence_temp_table TABLE IF NOT EXISTS table_name '(' opt_table_elem_list ')' opt_create_table_inherits opt_interleave opt_partition_by opt_table_with opt_create_table_on_commit
+| CREATE opt_persistence_temp_table TABLE IF NOT EXISTS table_name '(' opt_table_elem_list ')' opt_create_table_inherits opt_interleave opt_partition_by opt_table_with opt_create_table_on_commit opt_locality
   {
     name := $7.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateTable{
@@ -5541,7 +5678,18 @@ create_table_stmt:
       Persistence: $2.persistence(),
       StorageParams: $14.storageParams(),
       OnCommit: $15.createTableOnCommitSetting(),
+      Locality: $16.locality(),
     }
+  }
+
+opt_locality:
+  locality
+  {
+    $$.val = $1.locality()
+  }
+| /* EMPTY */
+  {
+    $$.val = (*tree.Locality)(nil)
   }
 
 opt_table_with:
@@ -5569,34 +5717,28 @@ opt_create_table_inherits:
   }
 
 opt_with_storage_parameter_list:
-  /* EMPTY */
   {
     $$.val = nil
   }
 | WITH '(' storage_parameter_list ')'
   {
-    /* SKIP DOC */
     $$.val = $3.storageParams()
   }
 
 opt_create_table_on_commit:
-  /* EMPTY */
   {
     $$.val = tree.CreateTableOnCommitUnset
   }
 | ON COMMIT PRESERVE ROWS
   {
-    /* SKIP DOC */
     $$.val = tree.CreateTableOnCommitPreserveRows
   }
 | ON COMMIT DELETE ROWS error
   {
-    /* SKIP DOC */
     return unimplementedWithIssueDetail(sqllex, 46556, "delete rows")
   }
 | ON COMMIT DROP error
   {
-    /* SKIP DOC */
     return unimplementedWithIssueDetail(sqllex, 46556, "drop")
   }
 
@@ -5707,9 +5849,18 @@ table_elem:
   }
 | index_def
 | family_def
-| table_constraint
+| table_constraint opt_validate_behavior
   {
-    $$.val = $1.constraintDef()
+    def := $1.constraintDef()
+    valBehavior := $2.validationBehavior()
+    if u, ok := def.(*tree.UniqueConstraintTableDef); ok && valBehavior == tree.ValidationSkip {
+      typ := "PRIMARY KEY"
+      if !u.PrimaryKey {
+        typ = "UNIQUE"
+      }
+      return purposelyUnimplemented(sqllex, "table constraint", typ + " constraints cannot be marked NOT VALID")
+    }
+    $$.val = def
   }
 | LIKE table_name like_table_option_list
   {
@@ -5972,11 +6123,11 @@ col_qualification_elem:
  }
 | generated_as '(' a_expr ')' STORED
  {
-    $$.val = &tree.ColumnComputedDef{Expr: $3.expr()}
+    $$.val = &tree.ColumnComputedDef{Expr: $3.expr(), Virtual: false}
  }
 | generated_as '(' a_expr ')' VIRTUAL
  {
-    return unimplemented(sqllex, "virtual computed columns")
+    $$.val = &tree.ColumnComputedDef{Expr: $3.expr(), Virtual: true}
  }
 | generated_as error
  {
@@ -6686,7 +6837,7 @@ opt_view_recursive:
 
 // %Help: CREATE TYPE -- create a type
 // %Category: DDL
-// %Text: CREATE TYPE <type_name> AS ENUM (...)
+// %Text: CREATE TYPE [IF NOT EXISTS] <type_name> AS ENUM (...)
 create_type_stmt:
   // Enum types.
   CREATE TYPE type_name AS ENUM '(' opt_enum_val_list ')'
@@ -6695,6 +6846,15 @@ create_type_stmt:
       TypeName: $3.unresolvedObjectName(),
       Variety: tree.Enum,
       EnumLabels: $7.enumValueList(),
+    }
+  }
+| CREATE TYPE IF NOT EXISTS type_name AS ENUM '(' opt_enum_val_list ')'
+  {
+    $$.val = &tree.CreateType{
+      TypeName: $6.unresolvedObjectName(),
+      Variety: tree.Enum,
+      EnumLabels: $10.enumValueList(),
+      IfNotExists: true,
     }
   }
 | CREATE TYPE error // SHOW HELP: CREATE TYPE
@@ -6976,6 +7136,132 @@ alter_table_set_schema_stmt:
   {
     $$.val = &tree.AlterTableSetSchema{
       Name: $5.unresolvedObjectName(), Schema: tree.Name($8), IfExists: true,
+    }
+  }
+
+alter_table_locality_stmt:
+  ALTER TABLE relation_expr SET locality
+  {
+    $$.val = &tree.AlterTableLocality{
+      Name: $3.unresolvedObjectName(),
+      Locality: $5.locality(),
+      IfExists: false,
+    }
+  }
+| ALTER TABLE IF EXISTS relation_expr SET locality
+  {
+    $$.val = &tree.AlterTableLocality{
+      Name: $5.unresolvedObjectName(),
+      Locality: $7.locality(),
+      IfExists: true,
+    }
+  }
+
+locality:
+  LOCALITY GLOBAL
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelGlobal,
+    }
+  }
+| LOCALITY REGIONAL BY TABLE IN region_name
+  {
+    $$.val = &tree.Locality{
+      TableRegion: tree.Name($6),
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| LOCALITY REGIONAL BY TABLE IN PRIMARY REGION
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| LOCALITY REGIONAL BY TABLE
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| LOCALITY REGIONAL BY ROW
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelRow,
+    }
+  }
+| REGIONAL AFFINITY TO NONE
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelGlobal,
+    }
+  }
+| REGIONAL AFFINITY TO region_name
+  {
+    $$.val = &tree.Locality{
+      TableRegion: tree.Name($4),
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| REGIONAL AFFINITY TO PRIMARY REGION
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| REGIONAL AFFINITY AT ROW LEVEL
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelRow,
+    }
+  }
+| REGIONAL AFFINITY NONE
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelGlobal,
+    }
+  }
+| REGIONAL AFFINITY region_name
+  {
+    $$.val = &tree.Locality{
+      TableRegion: tree.Name($3),
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| REGIONAL AFFINITY PRIMARY REGION
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| REGIONAL AFFINITY ROW LEVEL
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelRow,
+    }
+  }
+| NO REGIONAL AFFINITY
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelGlobal,
+    }
+  }
+| TABLE LEVEL REGIONAL AFFINITY TO region_name
+  {
+    $$.val = &tree.Locality{
+      TableRegion: tree.Name($6),
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| TABLE LEVEL REGIONAL AFFINITY TO PRIMARY REGION
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| ROW LEVEL REGIONAL AFFINITY
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelRow,
     }
   }
 
@@ -7387,7 +7673,7 @@ transaction_deferrable_mode:
 // %Text: CREATE DATABASE [IF NOT EXISTS] <name>
 // %SeeAlso: WEBDOCS/create-database.html
 create_database_stmt:
-  CREATE DATABASE database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_regions_list opt_survive_clause
+  CREATE DATABASE database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_primary_region_clause opt_regions_list opt_survival_goal_clause
   {
     $$.val = &tree.CreateDatabase{
       Name: tree.Name($3),
@@ -7396,11 +7682,12 @@ create_database_stmt:
       Collate: $7,
       CType: $8,
       ConnectionLimit: $9.int32(),
-      Regions: $10.nameList(),
-      Survive: $11.survive(),
+      PrimaryRegion: tree.Name($10),
+      Regions: $11.nameList(),
+      SurvivalGoal: $12.survivalGoal(),
     }
   }
-| CREATE DATABASE IF NOT EXISTS database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_regions_list opt_survive_clause
+| CREATE DATABASE IF NOT EXISTS database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_primary_region_clause opt_regions_list opt_survival_goal_clause
   {
     $$.val = &tree.CreateDatabase{
       IfNotExists: true,
@@ -7410,14 +7697,27 @@ create_database_stmt:
       Collate: $10,
       CType: $11,
       ConnectionLimit: $12.int32(),
-      Regions: $13.nameList(),
-      Survive: $14.survive(),
+      PrimaryRegion: tree.Name($13),
+      Regions: $14.nameList(),
+      SurvivalGoal: $15.survivalGoal(),
     }
   }
 | CREATE DATABASE error // SHOW HELP: CREATE DATABASE
 
+opt_primary_region_clause:
+  primary_region_clause
+| /* EMPTY */
+  {
+    $$ = ""
+  }
+
+primary_region_clause:
+  PRIMARY REGION opt_equal region_name {
+    $$ = $4
+  }
+
 opt_regions_list:
-  region_or_regions opt_equal name_list
+  region_or_regions opt_equal region_name_list
   {
     $$.val = $3.nameList()
   }
@@ -7426,25 +7726,28 @@ opt_regions_list:
     $$.val = tree.NameList(nil)
   }
 
-survive_clause:
-  SURVIVE REGION FAILURE
+region_or_regions:
+  REGION
   {
-    $$.val = tree.SurviveRegionFailure
+    /* SKIP DOC */
   }
-| SURVIVE AVAILABILITY ZONE FAILURE
+| REGIONS
+
+survival_goal_clause:
+  SURVIVE opt_equal REGION FAILURE
   {
-    $$.val = tree.SurviveAvailabilityZoneFailure
+    $$.val = tree.SurvivalGoalRegionFailure
   }
-| SURVIVE DEFAULT
+| SURVIVE opt_equal ZONE FAILURE
   {
-    $$.val = tree.SurviveDefault
+    $$.val = tree.SurvivalGoalZoneFailure
   }
 
-opt_survive_clause:
-  survive_clause
+opt_survival_goal_clause:
+  survival_goal_clause
 | /* EMPTY */
   {
-    $$.val = tree.SurviveDefault
+    $$.val = tree.SurvivalGoalDefault
   }
 
 opt_template_clause:
@@ -7727,13 +8030,13 @@ multiple_set_clause:
 // TO {<name> | CURRENT_USER | SESSION_USER}
 // %SeeAlso: DROP OWNED BY
 reassign_owned_by_stmt:
-	REASSIGN OWNED BY role_spec_list TO role_spec
-{
-	$$.val = &tree.ReassignOwnedBy{
-      OldRoles: $4.strs(),
-      NewRole: $6,
-	}
-}
+  REASSIGN OWNED BY role_spec_list TO role_spec
+  {
+    $$.val = &tree.ReassignOwnedBy{
+      OldRoles: $4.users(),
+      NewRole: $6.user(),
+    }
+  }
 | REASSIGN OWNED BY error // SHOW HELP: REASSIGN OWNED BY
 
 // %Help: DROP OWNED BY - remove database objects owned by role(s).
@@ -7742,13 +8045,13 @@ reassign_owned_by_stmt:
 // [RESTRICT | CASCADE]
 // %SeeAlso: REASSIGN OWNED BY
 drop_owned_by_stmt:
-	DROP OWNED BY role_spec_list opt_drop_behavior
-{
-	$$.val = &tree.DropOwnedBy{
-      Roles: $4.strs(),
+  DROP OWNED BY role_spec_list opt_drop_behavior
+  {
+    $$.val = &tree.DropOwnedBy{
+      Roles: $4.users(),
       DropBehavior: $5.dropBehavior(),
-	}
-}
+    }
+  }
 | DROP OWNED BY error // SHOW HELP: DROP OWNED BY
 
 // A complete SELECT statement looks like this.
@@ -8533,7 +8836,7 @@ opt_index_flags:
 //   '{' IGNORE_FOREIGN_KEYS [, ...] '}'
 //
 // Join types:
-//   { INNER | { LEFT | RIGHT | FULL } [OUTER] } [ { HASH | MERGE | LOOKUP } ]
+//   { INNER | { LEFT | RIGHT | FULL } [OUTER] } [ { HASH | MERGE | LOOKUP | INVERTED } ]
 //
 // %SeeAlso: WEBDOCS/table-expressions.html
 table_ref:
@@ -8792,6 +9095,9 @@ join_outer:
 //  - LOOKUP forces a lookup join into the right side; the right side must be
 //    a table with a suitable index. `LOOKUP` can only be used with INNER and
 //    LEFT joins (though this is not enforced by the syntax).
+//  - INVERTED forces an inverted join into the right side; the right side must
+//    be a table with a suitable inverted index. `INVERTED` can only be used
+//    with INNER and LEFT joins (though this is not enforced by the syntax).
 //  - If it is not possible to use the algorithm in the hint, an error is
 //    returned.
 //  - When a join hint is specified, the two tables will not be reordered
@@ -8808,6 +9114,10 @@ opt_join_hint:
 | LOOKUP
   {
     $$ = tree.AstLookup
+  }
+| INVERTED
+  {
+    $$ = tree.AstInverted
   }
 | /* EMPTY */
   {
@@ -11441,9 +11751,42 @@ type_name:             db_object_name
 
 sequence_name:         db_object_name
 
+region_name:           name
+
+region_name_list:      name_list
+  {
+    $$.val = $1.nameList()
+  }
+
 schema_name:           name
 
-opt_schema_name:       opt_name
+qualifiable_schema_name:
+	name
+	{
+		$$.val = tree.ObjectNamePrefix{SchemaName: tree.Name($1), ExplicitSchema: true}
+	}
+| name '.' name
+	{
+		$$.val = tree.ObjectNamePrefix{CatalogName: tree.Name($1), SchemaName: tree.Name($3), ExplicitCatalog: true, ExplicitSchema: true}
+	}
+
+schema_name_list:
+  qualifiable_schema_name
+  {
+    $$.val = tree.ObjectNamePrefixList{$1.objectNamePrefix()}
+  }
+| schema_name_list ',' qualifiable_schema_name
+  {
+    $$.val = append($1.objectNamePrefixList(), $3.objectNamePrefix())
+  }
+
+
+opt_schema_name:
+	qualifiable_schema_name
+| /* EMPTY */
+	{
+		$$.val = tree.ObjectNamePrefix{ExplicitSchema: false}
+	}
 
 table_name:            db_object_name
 
@@ -11652,6 +11995,7 @@ unreserved_keyword:
 | ACCESS
 | ADD
 | ADMIN
+| AFFINITY
 | AFTER
 | AGGREGATE
 | ALTER
@@ -11659,7 +12003,6 @@ unreserved_keyword:
 | AT
 | ATTRIBUTE
 | AUTOMATIC
-| AVAILABILITY
 | BACKUP
 | BACKUPS
 | BEFORE
@@ -11749,6 +12092,7 @@ unreserved_keyword:
 | GEOMETRYCOLLECTIONZ
 | GEOMETRYCOLLECTIONZM
 | GLOBAL
+| GOAL
 | GRANTS
 | GROUPS
 | HASH
@@ -11790,6 +12134,7 @@ unreserved_keyword:
 | LOCAL
 | LOCKED
 | LOGIN
+| LOCALITY
 | LOOKUP
 | LOW
 | MATCH
@@ -11878,6 +12223,7 @@ unreserved_keyword:
 | REF
 | REFRESH
 | REGION
+| REGIONAL
 | REGIONS
 | REINDEX
 | RELEASE
@@ -11939,6 +12285,7 @@ unreserved_keyword:
 | STRICT
 | SUBSCRIPTION
 | SURVIVE
+| SURVIVAL
 | SYNTAX
 | SYSTEM
 | TABLES

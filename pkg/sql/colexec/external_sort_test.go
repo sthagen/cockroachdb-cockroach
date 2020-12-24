@@ -80,16 +80,16 @@ func TestExternalSort(t *testing.T) {
 					tc.expected,
 					orderedVerifier,
 					func(input []colexecbase.Operator) (colexecbase.Operator, error) {
-						// A sorter should never exceed externalSorterMinPartitions, even
+						// A sorter should never exceed ExternalSorterMinPartitions, even
 						// during repartitioning. A panic will happen if a sorter requests
 						// more than this number of file descriptors.
-						sem := colexecbase.NewTestingSemaphore(externalSorterMinPartitions)
+						sem := colexecbase.NewTestingSemaphore(ExternalSorterMinPartitions)
 						// If a limit is satisfied before the sorter is drained of all its
 						// tuples, the sorter will not close its partitioner. During a
 						// flow this will happen in a downstream materializer/outbox,
 						// since there is no way to tell an operator that Next won't be
 						// called again.
-						if tc.k == 0 || tc.k >= len(tc.tuples) {
+						if tc.k == 0 || tc.k >= uint64(len(tc.tuples)) {
 							semsToCheck = append(semsToCheck, sem)
 						}
 						// TODO(asubiotto): Pass in the testing.T of the caller to this
@@ -166,7 +166,7 @@ func TestExternalSortRandomized(t *testing.T) {
 	// limit. With a maximum number of partitions of 2 this will result in
 	// repartitioning twice. To make this a total amount of memory, we also need
 	// to add the cache sizes of the queues.
-	partitionSize := int64(memoryToSort/4) + int64(externalSorterMinPartitions*queueCfg.BufferSizeBytes)
+	partitionSize := int64(memoryToSort/4) + int64(ExternalSorterMinPartitions*queueCfg.BufferSizeBytes)
 	for _, tk := range []execinfra.TestingKnobs{{ForceDiskSpill: true}, {MemoryLimitBytes: partitionSize}} {
 		flowCtx.Cfg.TestingKnobs = tk
 		for nCols := 1; nCols <= maxCols; nCols++ {
@@ -198,7 +198,7 @@ func TestExternalSortRandomized(t *testing.T) {
 					expected,
 					orderedVerifier,
 					func(input []colexecbase.Operator) (colexecbase.Operator, error) {
-						sem := colexecbase.NewTestingSemaphore(externalSorterMinPartitions)
+						sem := colexecbase.NewTestingSemaphore(ExternalSorterMinPartitions)
 						semsToCheck = append(semsToCheck, sem)
 						sorter, newAccounts, newMonitors, closers, err := createDiskBackedSorter(
 							ctx, flowCtx, input, typs[:nCols], ordCols,
@@ -317,7 +317,7 @@ func createDiskBackedSorter(
 	typs []*types.T,
 	ordCols []execinfrapb.Ordering_Column,
 	matchLen int,
-	k int,
+	k uint64,
 	spillingCallbackFn func(),
 	numForcedRepartitions int,
 	delegateFDAcquisitions bool,
@@ -334,8 +334,9 @@ func createDiskBackedSorter(
 			Sorter: sorterSpec,
 		},
 		Post: execinfrapb.PostProcessSpec{
-			Limit: uint64(k),
+			Limit: k,
 		},
+		ResultTypes: typs,
 	}
 	args := &NewColOperatorArgs{
 		Spec:                spec,

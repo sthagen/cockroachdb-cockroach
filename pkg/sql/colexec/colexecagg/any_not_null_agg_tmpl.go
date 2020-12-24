@@ -75,8 +75,6 @@ type anyNotNull_TYPE_AGGKINDAgg struct {
 	// {{else}}
 	hashAggregateFuncBase
 	// {{end}}
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         _GOTYPESLICE
 	curAgg                      _GOTYPE
 	foundNonNullForCurrentGroup bool
@@ -84,24 +82,13 @@ type anyNotNull_TYPE_AGGKINDAgg struct {
 
 var _ AggregateFunc = &anyNotNull_TYPE_AGGKINDAgg{}
 
-func (a *anyNotNull_TYPE_AGGKINDAgg) Init(groups []bool, vec coldata.Vec) {
+func (a *anyNotNull_TYPE_AGGKINDAgg) SetOutput(vec coldata.Vec) {
 	// {{if eq "_AGGKIND" "Ordered"}}
-	a.orderedAggregateFuncBase.Init(groups, vec)
+	a.orderedAggregateFuncBase.SetOutput(vec)
 	// {{else}}
-	a.hashAggregateFuncBase.Init(groups, vec)
+	a.hashAggregateFuncBase.SetOutput(vec)
 	// {{end}}
-	a.vec = vec
 	a.col = vec.TemplateType()
-	a.Reset()
-}
-
-func (a *anyNotNull_TYPE_AGGKINDAgg) Reset() {
-	// {{if eq "_AGGKIND" "Ordered"}}
-	a.orderedAggregateFuncBase.Reset()
-	// {{else}}
-	a.hashAggregateFuncBase.Reset()
-	// {{end}}
-	a.foundNonNullForCurrentGroup = false
 }
 
 func (a *anyNotNull_TYPE_AGGKINDAgg) Compute(
@@ -116,71 +103,52 @@ func (a *anyNotNull_TYPE_AGGKINDAgg) Compute(
 	}
 	// {{end}}
 
-	// {{if eq .VecMethod "Bytes"}}
-	oldCurAggSize := len(a.curAgg)
-	// {{end}}
-	// {{if eq .VecMethod "Datum"}}
-	var oldCurAggSize uintptr
-	if a.curAgg != nil {
-		oldCurAggSize = a.curAgg.(*coldataext.Datum).Size()
-	}
-	// {{end}}
+	execgen.SETVARIABLESIZE(oldCurAggSize, a.curAgg)
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.TemplateType(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// {{if eq "_AGGKIND" "Ordered"}}
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		// {{/*
+		// We don't need to check whether sel is non-nil when performing
+		// hash aggregation because the hash aggregator always uses non-nil
+		// sel to specify the tuples to be aggregated.
+		// */}}
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			// {{if eq "_AGGKIND" "Ordered"}}
-			groups := a.groups
-			// {{/*
-			// We don't need to check whether sel is non-nil when performing
-			// hash aggregation because the hash aggregator always uses non-nil
-			// sel to specify the tuples to be aggregated.
-			// */}}
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						_FIND_ANY_NOT_NULL(a, groups, nulls, i, true)
-					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						_FIND_ANY_NOT_NULL(a, groups, nulls, i, false)
-					}
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					_FIND_ANY_NOT_NULL(a, groups, nulls, i, true, false)
 				}
-			} else
-			// {{end}}
-			{
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						_FIND_ANY_NOT_NULL(a, groups, nulls, i, true)
-					}
-				} else {
-					for _, i := range sel {
-						_FIND_ANY_NOT_NULL(a, groups, nulls, i, false)
-					}
+			} else {
+				for i := 0; i < inputLen; i++ {
+					_FIND_ANY_NOT_NULL(a, groups, nulls, i, false, false)
 				}
 			}
-		},
+		} else
+		// {{end}}
+		{
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					_FIND_ANY_NOT_NULL(a, groups, nulls, i, true, true)
+				}
+			} else {
+				for _, i := range sel {
+					_FIND_ANY_NOT_NULL(a, groups, nulls, i, false, true)
+				}
+			}
+		}
+	},
 	)
-	// {{if eq .VecMethod "Bytes"}}
-	newCurAggSize := len(a.curAgg)
-	// {{end}}
-	// {{if eq .VecMethod "Datum"}}
-	var newCurAggSize uintptr
-	if a.curAgg != nil {
-		newCurAggSize = a.curAgg.(*coldataext.Datum).Size()
+	execgen.SETVARIABLESIZE(newCurAggSize, a.curAgg)
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
 	}
-	// {{end}}
-	// {{if or (eq .VecMethod "Bytes") (eq .VecMethod "Datum")}}
-	a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
-	// {{end}}
 }
 
 func (a *anyNotNull_TYPE_AGGKINDAgg) Flush(outputIdx int) {
@@ -208,6 +176,13 @@ func (a *anyNotNull_TYPE_AGGKINDAgg) Flush(outputIdx int) {
 	// {{end}}
 	a.curAgg = nil
 	// {{end}}
+}
+
+func (a *anyNotNull_TYPE_AGGKINDAgg) Reset() {
+	// {{if eq "_AGGKIND" "Ordered"}}
+	a.orderedAggregateFuncBase.Reset()
+	// {{end}}
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNull_TYPE_AGGKINDAggAlloc struct {
@@ -240,23 +215,34 @@ func (a *anyNotNull_TYPE_AGGKINDAggAlloc) newAggFunc() AggregateFunc {
 // the first row of a new group, and no non-nulls have been found for the
 // current group, then the output for the current group is set to null.
 func _FIND_ANY_NOT_NULL(
-	a *anyNotNull_TYPE_AGGKINDAgg, groups []bool, nulls *coldata.Nulls, i int, _HAS_NULLS bool,
+	a *anyNotNull_TYPE_AGGKINDAgg,
+	groups []bool,
+	nulls *coldata.Nulls,
+	i int,
+	_HAS_NULLS bool,
+	_HAS_SEL bool,
 ) { // */}}
 	// {{define "findAnyNotNull" -}}
 
 	// {{if eq "_AGGKIND" "Ordered"}}
+	// {{if not .HasSel}}
+	//gcassert:bce
+	// {{end}}
 	if groups[i] {
-		// If this is a new group, check if any non-nulls have been found for the
-		// current group.
-		if !a.foundNonNullForCurrentGroup {
-			a.nulls.SetNull(a.curIdx)
-		} else {
-			// {{with .Global}}
-			execgen.SET(a.col, a.curIdx, a.curAgg)
-			// {{end}}
+		if !a.isFirstGroup {
+			// If this is a new group, check if any non-nulls have been found for the
+			// current group.
+			if !a.foundNonNullForCurrentGroup {
+				a.nulls.SetNull(a.curIdx)
+			} else {
+				// {{with .Global}}
+				execgen.SET(a.col, a.curIdx, a.curAgg)
+				// {{end}}
+			}
+			a.curIdx++
+			a.foundNonNullForCurrentGroup = false
 		}
-		a.curIdx++
-		a.foundNonNullForCurrentGroup = false
+		a.isFirstGroup = false
 	}
 	// {{end}}
 
@@ -270,6 +256,9 @@ func _FIND_ANY_NOT_NULL(
 		// If we haven't seen any non-nulls for the current group yet, and the
 		// current value is non-null, then we can pick the current value to be
 		// the output.
+		// {{if and (.Sliceable) (not .HasSel)}}
+		//gcassert:bce
+		// {{end}}
 		// {{with .Global}}
 		val := col.Get(i)
 		execgen.COPYVAL(a.curAgg, val)

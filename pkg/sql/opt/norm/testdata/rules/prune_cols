@@ -55,6 +55,63 @@ CREATE TABLE partial_indexes (
 )
 ----
 
+exec-ddl
+CREATE TABLE multi_col_inv_idx (
+    a INT PRIMARY KEY,
+    b INT,
+    c STRING,
+    j JSON,
+    FAMILY (a),
+    FAMILY (b),
+    FAMILY (c),
+    FAMILY (j),
+    INVERTED INDEX (b, c, j)
+)
+----
+
+exec-ddl
+CREATE TABLE uniq (
+  k INT PRIMARY KEY,
+  v INT,
+  w INT UNIQUE WITHOUT INDEX,
+  x INT,
+  y INT,
+  z INT UNIQUE,
+  UNIQUE WITHOUT INDEX (x, y)
+)
+----
+
+exec-ddl
+CREATE TABLE computed (
+    a INT PRIMARY KEY,
+    b INT,
+    c INT,
+    d INT AS (c+1) STORED,
+    "x:write-only" INT AS (c+10) STORED,
+    FAMILY (a),
+    FAMILY (b),
+    FAMILY (c),
+    FAMILY (d)
+)
+----
+
+exec-ddl
+CREATE TABLE virt (
+  a INT PRIMARY KEY,
+  b INT,
+  v INT AS (a+b) VIRTUAL
+)
+----
+
+exec-ddl
+CREATE TABLE virt_idx (
+  a INT PRIMARY KEY,
+  b INT,
+  v INT AS (a+b) VIRTUAL,
+  INDEX (v)
+)
+----
+
 # --------------------------------------------------
 # PruneProjectCols
 # --------------------------------------------------
@@ -547,25 +604,7 @@ FROM
     OFFSET 1
 )
 ----
-offset
- ├── columns: tree:13 columns:18
- ├── internal-ordering: +13
- ├── sort
- │    ├── columns: tree:13 columns:18
- │    ├── ordering: +13
- │    └── project
- │         ├── columns: tree:13 columns:18
- │         ├── explain
- │         │    ├── columns: tree:6 level:7 node_type:8 field:9 description:10 columns:11 ordering:12
- │         │    ├── mode: verbose
- │         │    └── scan a
- │         │         ├── columns: k:1!null i:2 f:3 s:4
- │         │         ├── key: (1)
- │         │         └── fd: (1)-->(2-4)
- │         └── projections
- │              ├── tree:6 [as=tree:13, outer=(6)]
- │              └── columns:11 [as=columns:18, outer=(11)]
- └── 1
+error (42703): column "tree" does not exist
 
 # --------------------------------------------------
 # PruneLimitCols + PruneOffsetCols
@@ -1599,7 +1638,7 @@ norm expect=PruneExplainCols
 EXPLAIN SELECT a FROM abcde WHERE b=1 AND c IS NOT NULL ORDER BY c, d
 ----
 explain
- ├── columns: tree:7 field:8 description:9
+ ├── columns: info:7
  └── sort
       ├── columns: a:1!null  [hidden: c:3!null]
       ├── key: (1)
@@ -1941,6 +1980,84 @@ delete a
       ├── key: (6)
       └── fd: (6)-->(9)
 
+# We should not be producing a value for the computed column d, which is not
+# being changed. We should, however, produce a value for the write-only column
+# x even if the column it depends on hasn't changed.
+norm expect=PruneMutationInputCols
+UPDATE computed SET b = b*2 WHERE b = 1
+----
+update computed
+ ├── columns: <none>
+ ├── fetch columns: a:7 b:8 x:11
+ ├── update-mapping:
+ │    ├── b_new:13 => b:2
+ │    └── column15:15 => x:5
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: column15:15 b_new:13!null a:7!null b:8!null x:11
+      ├── immutable
+      ├── key: (7)
+      ├── fd: ()-->(8,13), (7)-->(11,15)
+      ├── select
+      │    ├── columns: a:7!null b:8!null c:9 x:11
+      │    ├── key: (7)
+      │    ├── fd: ()-->(8), (7)-->(9,11)
+      │    ├── scan computed
+      │    │    ├── columns: a:7!null b:8 c:9 x:11
+      │    │    ├── computed column expressions
+      │    │    │    └── d:10
+      │    │    │         └── c:9 + 1
+      │    │    ├── key: (7)
+      │    │    └── fd: (7)-->(8,9,11)
+      │    └── filters
+      │         └── b:8 = 1 [outer=(8), constraints=(/8: [/1 - /1]; tight), fd=()-->(8)]
+      └── projections
+           ├── c:9 + 10 [as=column15:15, outer=(9), immutable]
+           └── b:8 * 2 [as=b_new:13, outer=(8), immutable]
+
+# We should produce a value for the computed column d.
+norm expect=PruneMutationInputCols
+UPDATE computed SET c = c*2 WHERE b = 1
+----
+update computed
+ ├── columns: <none>
+ ├── fetch columns: a:7 c:9 d:10 x:11
+ ├── update-mapping:
+ │    ├── c_new:13 => c:3
+ │    ├── column14:14 => d:4
+ │    └── column15:15 => x:5
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: column14:14 column15:15 a:7!null c:9 d:10 x:11 c_new:13
+      ├── immutable
+      ├── key: (7)
+      ├── fd: (7)-->(9-11), (9)-->(13), (13)-->(14,15)
+      ├── project
+      │    ├── columns: c_new:13 a:7!null c:9 d:10 x:11
+      │    ├── immutable
+      │    ├── key: (7)
+      │    ├── fd: (7)-->(9-11), (9)-->(13)
+      │    ├── select
+      │    │    ├── columns: a:7!null b:8!null c:9 d:10 x:11
+      │    │    ├── key: (7)
+      │    │    ├── fd: ()-->(8), (7)-->(9-11)
+      │    │    ├── scan computed
+      │    │    │    ├── columns: a:7!null b:8 c:9 d:10 x:11
+      │    │    │    ├── computed column expressions
+      │    │    │    │    └── d:10
+      │    │    │    │         └── c:9 + 1
+      │    │    │    ├── key: (7)
+      │    │    │    └── fd: (7)-->(8-11)
+      │    │    └── filters
+      │    │         └── b:8 = 1 [outer=(8), constraints=(/8: [/1 - /1]; tight), fd=()-->(8)]
+      │    └── projections
+      │         └── c:9 * 2 [as=c_new:13, outer=(9), immutable]
+      └── projections
+           ├── c_new:13 + 1 [as=column14:14, outer=(13), immutable]
+           └── c_new:13 + 10 [as=column15:15, outer=(13), immutable]
+
 # Do not prune columns that are required for evaluating partial index
 # predicates.
 norm expect-not=PruneMutationFetchCols
@@ -1950,23 +2067,23 @@ update partial_indexes
  ├── columns: <none>
  ├── fetch columns: a:5 b:6 c:7
  ├── update-mapping:
- │    └── b_new:10 => b:2
- ├── partial index put columns: partial_index_put1:11
- ├── partial index del columns: partial_index_del1:9
+ │    └── b_new:9 => b:2
+ ├── partial index put columns: partial_index_put1:10
+ ├── partial index del columns: partial_index_del1:11
  ├── cardinality: [0 - 0]
  ├── volatile, mutations
  └── project
-      ├── columns: partial_index_put1:11 a:5!null b:6 c:7 partial_index_del1:9 b_new:10
+      ├── columns: partial_index_put1:10 partial_index_del1:11 a:5!null b:6 c:7 b_new:9
       ├── cardinality: [0 - 1]
       ├── immutable
       ├── key: ()
       ├── fd: ()-->(5-7,9-11)
       ├── project
-      │    ├── columns: b_new:10 partial_index_del1:9 a:5!null b:6 c:7
+      │    ├── columns: b_new:9 a:5!null b:6 c:7
       │    ├── cardinality: [0 - 1]
       │    ├── immutable
       │    ├── key: ()
-      │    ├── fd: ()-->(5-7,9,10)
+      │    ├── fd: ()-->(5-7,9)
       │    ├── select
       │    │    ├── columns: a:5!null b:6 c:7
       │    │    ├── cardinality: [0 - 1]
@@ -1982,16 +2099,16 @@ update partial_indexes
       │    │    └── filters
       │    │         └── a:5 = 1 [outer=(5), constraints=(/5: [/1 - /1]; tight), fd=()-->(5)]
       │    └── projections
-      │         ├── b:6 + 1 [as=b_new:10, outer=(6), immutable]
-      │         └── b:6 > 1 [as=partial_index_del1:9, outer=(6)]
+      │         └── b:6 + 1 [as=b_new:9, outer=(6), immutable]
       └── projections
-           └── b_new:10 > 1 [as=partial_index_put1:11, outer=(10)]
+           ├── b_new:9 > 1 [as=partial_index_put1:10, outer=(9)]
+           └── b:6 > 1 [as=partial_index_del1:11, outer=(6)]
 
 # Prune secondary family column not needed for the update.
 norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 UPDATE family SET b=c WHERE a > 100
 ----
-update "family"
+update family
  ├── columns: <none>
  ├── fetch columns: a:7 b:8
  ├── update-mapping:
@@ -2002,7 +2119,7 @@ update "family"
       ├── columns: a:7!null b:8 c:9
       ├── key: (7)
       ├── fd: (7)-->(8,9)
-      ├── scan "family"
+      ├── scan family
       │    ├── columns: a:7!null b:8 c:9
       │    ├── key: (7)
       │    └── fd: (7)-->(8,9)
@@ -2013,7 +2130,7 @@ update "family"
 norm expect-not=(PruneMutationFetchCols)
 UPDATE family SET a=a+1 WHERE a > 100
 ----
-update "family"
+update family
  ├── columns: <none>
  ├── fetch columns: a:7 b:8 c:9 d:10 e:11
  ├── update-mapping:
@@ -2029,7 +2146,7 @@ update "family"
       │    ├── columns: a:7!null b:8 c:9 d:10 e:11
       │    ├── key: (7)
       │    ├── fd: (7)-->(8-11)
-      │    ├── scan "family"
+      │    ├── scan family
       │    │    ├── columns: a:7!null b:8 c:9 d:10 e:11
       │    │    ├── key: (7)
       │    │    └── fd: (7)-->(8-11)
@@ -2045,7 +2162,7 @@ UPDATE family SET c=c+1 RETURNING b
 project
  ├── columns: b:2
  ├── volatile, mutations
- └── update "family"
+ └── update family
       ├── columns: a:1!null b:2
       ├── fetch columns: a:7 b:8 c:9 d:10
       ├── update-mapping:
@@ -2058,12 +2175,43 @@ project
            ├── immutable
            ├── key: (7)
            ├── fd: (7)-->(8-10), (9)-->(13)
-           ├── scan "family"
+           ├── scan family
            │    ├── columns: a:7!null b:8 c:9 d:10
            │    ├── key: (7)
            │    └── fd: (7)-->(8-10)
            └── projections
                 └── c:9 + 1 [as=c_new:13, outer=(9), immutable]
+
+# Do not prune columns that are required for encoding a multi-column inverted
+# index.
+norm expect-not=PruneMutationFetchCols
+UPDATE multi_col_inv_idx SET j = '[1]' WHERE a = 1
+----
+update multi_col_inv_idx
+ ├── columns: <none>
+ ├── fetch columns: a:7 b:8 c:9 j:10
+ ├── update-mapping:
+ │    └── j_new:13 => j:4
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: j_new:13!null a:7!null b:8 c:9 j:10
+      ├── cardinality: [0 - 1]
+      ├── key: ()
+      ├── fd: ()-->(7-10,13)
+      ├── select
+      │    ├── columns: a:7!null b:8 c:9 j:10
+      │    ├── cardinality: [0 - 1]
+      │    ├── key: ()
+      │    ├── fd: ()-->(7-10)
+      │    ├── scan multi_col_inv_idx
+      │    │    ├── columns: a:7!null b:8 c:9 j:10
+      │    │    ├── key: (7)
+      │    │    └── fd: (7)-->(8-10)
+      │    └── filters
+      │         └── a:7 = 1 [outer=(7), constraints=(/7: [/1 - /1]; tight), fd=()-->(7)]
+      └── projections
+           └── '[1]' [as=j_new:13]
 
 # Prune unused upsert columns.
 norm expect=PruneMutationInputCols
@@ -2182,7 +2330,7 @@ upsert a
 norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 UPSERT INTO family (a, b) VALUES (1, 2)
 ----
-upsert "family"
+upsert family
  ├── columns: <none>
  ├── arbiter indexes: primary
  ├── canary column: a:10
@@ -2214,7 +2362,7 @@ upsert "family"
       │    ├── cardinality: [0 - 1]
       │    ├── key: ()
       │    ├── fd: ()-->(10,11)
-      │    ├── scan "family"
+      │    ├── scan family
       │    │    ├── columns: a:10!null b:11
       │    │    ├── key: (10)
       │    │    └── fd: (10)-->(11)
@@ -2231,7 +2379,7 @@ project
  ├── volatile, mutations
  ├── key: ()
  ├── fd: ()-->(5)
- └── upsert "family"
+ └── upsert family
       ├── columns: a:1!null e:5
       ├── arbiter indexes: primary
       ├── canary column: a:12
@@ -2273,7 +2421,7 @@ project
            │    │    ├── cardinality: [0 - 1]
            │    │    ├── key: ()
            │    │    ├── fd: ()-->(12,14-16)
-           │    │    ├── scan "family"
+           │    │    ├── scan family
            │    │    │    ├── columns: a:12!null c:14 d:15 e:16
            │    │    │    ├── key: (12)
            │    │    │    └── fd: (12)-->(14-16)
@@ -2290,7 +2438,7 @@ project
 norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 INSERT INTO family VALUES (1, 2, 3, 4) ON CONFLICT (a) DO UPDATE SET d=10
 ----
-upsert "family"
+upsert family
  ├── columns: <none>
  ├── arbiter indexes: primary
  ├── canary column: a:12
@@ -2327,7 +2475,7 @@ upsert "family"
       │    │    ├── cardinality: [0 - 1]
       │    │    ├── key: ()
       │    │    ├── fd: ()-->(12,14,15)
-      │    │    ├── scan "family"
+      │    │    ├── scan family
       │    │    │    ├── columns: a:12!null c:14 d:15
       │    │    │    ├── key: (12)
       │    │    │    └── fd: (12)-->(14,15)
@@ -2387,6 +2535,339 @@ upsert mutation
       │    └── filters (true)
       └── projections
            └── CASE WHEN a:11 IS NULL THEN column2:8 ELSE 10 END [as=upsert_b:19, outer=(8,11)]
+
+exec-ddl
+CREATE TABLE checks (
+    a INT PRIMARY KEY,
+    b INT DEFAULT 20,
+    c INT,
+    d INT,
+    CHECK (a > 0),
+    CHECK (b > 10),
+    CHECK (c > b)
+)
+----
+
+# Prune all check columns when none of the referenced columns are updated.
+norm expect=PruneMutationInputCols
+UPDATE checks SET d = 0
+----
+update checks
+ ├── columns: <none>
+ ├── fetch columns: a:6 b:7 c:8 d:9
+ ├── update-mapping:
+ │    └── d_new:11 => d:4
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: d_new:11!null a:6!null b:7 c:8 d:9
+      ├── key: (6)
+      ├── fd: ()-->(11), (6)-->(7-9)
+      ├── scan checks
+      │    ├── columns: a:6!null b:7 c:8 d:9
+      │    ├── check constraint expressions
+      │    │    └── a:6 > 0 [outer=(6), constraints=(/6: [/1 - ]; tight)]
+      │    ├── key: (6)
+      │    └── fd: (6)-->(7-9)
+      └── projections
+           └── 0 [as=d_new:11]
+
+# Do not prune check columns when their referenced columns are updated.
+norm expect=PruneMutationInputCols
+UPDATE checks SET b = 5
+----
+update checks
+ ├── columns: <none>
+ ├── fetch columns: a:6 b:7 c:8 d:9
+ ├── update-mapping:
+ │    └── b_new:11 => b:2
+ ├── check columns: check2:13 check3:14
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: check2:13!null check3:14 b_new:11!null a:6!null b:7 c:8 d:9
+      ├── key: (6)
+      ├── fd: ()-->(11,13), (6)-->(7-9), (8)-->(14)
+      ├── scan checks
+      │    ├── columns: a:6!null b:7 c:8 d:9
+      │    ├── check constraint expressions
+      │    │    └── a:6 > 0 [outer=(6), constraints=(/6: [/1 - ]; tight)]
+      │    ├── key: (6)
+      │    └── fd: (6)-->(7-9)
+      └── projections
+           ├── false [as=check2:13]
+           ├── c:8 > 5 [as=check3:14, outer=(8)]
+           └── 5 [as=b_new:11]
+
+
+# Do not prune check columns for an insert.
+norm expect-not=PruneMutationInputCols
+INSERT INTO checks (a, c, d) VALUES (1, 3, 4)
+----
+insert checks
+ ├── columns: <none>
+ ├── insert-mapping:
+ │    ├── column1:6 => a:1
+ │    ├── column9:9 => b:2
+ │    ├── column2:7 => c:3
+ │    └── column3:8 => d:4
+ ├── check columns: check1:10 check2:11 check3:12
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── values
+      ├── columns: column1:6!null column2:7!null column3:8!null column9:9!null check1:10!null check2:11!null check3:12!null
+      ├── cardinality: [1 - 1]
+      ├── key: ()
+      ├── fd: ()-->(6-12)
+      └── (1, 3, 4, 20, true, true, false)
+
+# Do not prune check columns for an upsert that does not require a scan.
+norm expect-not=PruneMutationInputCols
+UPSERT INTO checks (a, b, c, d) VALUES (1, 2, 3, 4)
+----
+upsert checks
+ ├── columns: <none>
+ ├── upsert-mapping:
+ │    ├── column1:6 => a:1
+ │    ├── column2:7 => b:2
+ │    ├── column3:8 => c:3
+ │    └── column4:9 => d:4
+ ├── check columns: check1:10 check2:11 check3:12
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── values
+      ├── columns: column1:6!null column2:7!null column3:8!null column4:9!null check1:10!null check2:11!null check3:12!null
+      ├── cardinality: [1 - 1]
+      ├── key: ()
+      ├── fd: ()-->(6-12)
+      └── (1, 2, 3, 4, true, false, true)
+
+# Do not prune check columns for an upsert that requires a scan.
+norm
+UPSERT INTO checks (a, c, d) VALUES (1, 3, 4)
+----
+upsert checks
+ ├── columns: <none>
+ ├── arbiter indexes: primary
+ ├── canary column: a:10
+ ├── fetch columns: a:10 b:11 c:12 d:13
+ ├── insert-mapping:
+ │    ├── column1:6 => a:1
+ │    ├── column9:9 => b:2
+ │    ├── column2:7 => c:3
+ │    └── column3:8 => d:4
+ ├── update-mapping:
+ │    ├── column2:7 => c:3
+ │    └── column3:8 => d:4
+ ├── check columns: check1:17 check2:18 check3:19
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: check1:17 check2:18 check3:19 column1:6!null column2:7!null column3:8!null column9:9!null a:10 b:11 c:12 d:13
+      ├── cardinality: [1 - 1]
+      ├── key: ()
+      ├── fd: ()-->(6-13,17-19)
+      ├── project
+      │    ├── columns: upsert_a:15 upsert_b:16 column1:6!null column2:7!null column3:8!null column9:9!null a:10 b:11 c:12 d:13
+      │    ├── cardinality: [1 - 1]
+      │    ├── key: ()
+      │    ├── fd: ()-->(6-13,15,16)
+      │    ├── left-join (cross)
+      │    │    ├── columns: column1:6!null column2:7!null column3:8!null column9:9!null a:10 b:11 c:12 d:13
+      │    │    ├── cardinality: [1 - 1]
+      │    │    ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
+      │    │    ├── key: ()
+      │    │    ├── fd: ()-->(6-13)
+      │    │    ├── values
+      │    │    │    ├── columns: column1:6!null column2:7!null column3:8!null column9:9!null
+      │    │    │    ├── cardinality: [1 - 1]
+      │    │    │    ├── key: ()
+      │    │    │    ├── fd: ()-->(6-9)
+      │    │    │    └── (1, 3, 4, 20)
+      │    │    ├── select
+      │    │    │    ├── columns: a:10!null b:11 c:12 d:13
+      │    │    │    ├── cardinality: [0 - 1]
+      │    │    │    ├── key: ()
+      │    │    │    ├── fd: ()-->(10-13)
+      │    │    │    ├── scan checks
+      │    │    │    │    ├── columns: a:10!null b:11 c:12 d:13
+      │    │    │    │    ├── check constraint expressions
+      │    │    │    │    │    └── a:10 > 0 [outer=(10), constraints=(/10: [/1 - ]; tight)]
+      │    │    │    │    ├── key: (10)
+      │    │    │    │    └── fd: (10)-->(11-13)
+      │    │    │    └── filters
+      │    │    │         └── a:10 = 1 [outer=(10), constraints=(/10: [/1 - /1]; tight), fd=()-->(10)]
+      │    │    └── filters (true)
+      │    └── projections
+      │         ├── CASE WHEN a:10 IS NULL THEN column1:6 ELSE a:10 END [as=upsert_a:15, outer=(6,10)]
+      │         └── CASE WHEN a:10 IS NULL THEN column9:9 ELSE b:11 END [as=upsert_b:16, outer=(9-11)]
+      └── projections
+           ├── upsert_a:15 > 0 [as=check1:17, outer=(15)]
+           ├── upsert_b:16 > 10 [as=check2:18, outer=(16)]
+           └── column2:7 > upsert_b:16 [as=check3:19, outer=(7,16)]
+
+# Do not prune columns from updates that are needed for unique checks.
+norm expect=PruneMutationInputCols
+UPDATE uniq SET w = 1, x = 2 WHERE k = 3
+----
+update uniq
+ ├── columns: <none>
+ ├── fetch columns: uniq.k:8 v:9 w:10 x:11 uniq.y:12 z:13
+ ├── update-mapping:
+ │    ├── w_new:15 => w:3
+ │    └── x_new:16 => x:4
+ ├── input binding: &1
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ ├── project
+ │    ├── columns: w_new:15!null x_new:16!null uniq.k:8!null v:9 w:10 x:11 uniq.y:12 z:13
+ │    ├── cardinality: [0 - 1]
+ │    ├── key: ()
+ │    ├── fd: ()-->(8-13,15,16)
+ │    ├── select
+ │    │    ├── columns: uniq.k:8!null v:9 w:10 x:11 uniq.y:12 z:13
+ │    │    ├── cardinality: [0 - 1]
+ │    │    ├── key: ()
+ │    │    ├── fd: ()-->(8-13)
+ │    │    ├── scan uniq
+ │    │    │    ├── columns: uniq.k:8!null v:9 w:10 x:11 uniq.y:12 z:13
+ │    │    │    ├── key: (8)
+ │    │    │    └── fd: (8)-->(9-13), (13)~~>(8-12)
+ │    │    └── filters
+ │    │         └── uniq.k:8 = 3 [outer=(8), constraints=(/8: [/3 - /3]; tight), fd=()-->(8)]
+ │    └── projections
+ │         ├── 1 [as=w_new:15]
+ │         └── 2 [as=x_new:16]
+ └── unique-checks
+      ├── unique-checks-item: uniq(w)
+      │    └── semi-join (hash)
+      │         ├── columns: w_new:17!null k:18!null
+      │         ├── cardinality: [0 - 1]
+      │         ├── key: ()
+      │         ├── fd: ()-->(17,18)
+      │         ├── with-scan &1
+      │         │    ├── columns: w_new:17!null k:18!null
+      │         │    ├── mapping:
+      │         │    │    ├──  w_new:15 => w_new:17
+      │         │    │    └──  uniq.k:8 => k:18
+      │         │    ├── cardinality: [0 - 1]
+      │         │    ├── key: ()
+      │         │    └── fd: ()-->(17,18)
+      │         ├── scan uniq
+      │         │    ├── columns: uniq.k:19!null w:21
+      │         │    ├── key: (19)
+      │         │    └── fd: (19)-->(21)
+      │         └── filters
+      │              ├── w_new:17 = w:21 [outer=(17,21), constraints=(/17: (/NULL - ]; /21: (/NULL - ]), fd=(17)==(21), (21)==(17)]
+      │              └── k:18 != uniq.k:19 [outer=(18,19), constraints=(/18: (/NULL - ]; /19: (/NULL - ])]
+      └── unique-checks-item: uniq(x,y)
+           └── semi-join (hash)
+                ├── columns: x_new:26!null y:27 k:28!null
+                ├── cardinality: [0 - 1]
+                ├── key: ()
+                ├── fd: ()-->(26-28)
+                ├── with-scan &1
+                │    ├── columns: x_new:26!null y:27 k:28!null
+                │    ├── mapping:
+                │    │    ├──  x_new:16 => x_new:26
+                │    │    ├──  uniq.y:12 => y:27
+                │    │    └──  uniq.k:8 => k:28
+                │    ├── cardinality: [0 - 1]
+                │    ├── key: ()
+                │    └── fd: ()-->(26-28)
+                ├── scan uniq
+                │    ├── columns: uniq.k:29!null x:32 uniq.y:33
+                │    ├── key: (29)
+                │    └── fd: (29)-->(32,33)
+                └── filters
+                     ├── x_new:26 = x:32 [outer=(26,32), constraints=(/26: (/NULL - ]; /32: (/NULL - ]), fd=(26)==(32), (32)==(26)]
+                     ├── y:27 = uniq.y:33 [outer=(27,33), constraints=(/27: (/NULL - ]; /33: (/NULL - ]), fd=(27)==(33), (33)==(27)]
+                     └── k:28 != uniq.k:29 [outer=(28,29), constraints=(/28: (/NULL - ]; /29: (/NULL - ])]
+
+# We should be pruning the virtual column.
+norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
+DELETE FROM virt WHERE a > 1
+----
+delete virt
+ ├── columns: <none>
+ ├── fetch columns: a:5
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── select
+      ├── columns: a:5!null
+      ├── key: (5)
+      ├── scan virt
+      │    ├── columns: a:5!null
+      │    ├── computed column expressions
+      │    │    └── v:7
+      │    │         └── a:5 + b:6
+      │    └── key: (5)
+      └── filters
+           └── a:5 > 1 [outer=(5), constraints=(/5: [/2 - ]; tight)]
+
+# We should not be pruning the virtual column if it is used by RETURNING.
+norm
+DELETE FROM virt WHERE a > 1 RETURNING v
+----
+project
+ ├── columns: v:3
+ ├── volatile, mutations
+ └── delete virt
+      ├── columns: a:1!null v:3
+      ├── fetch columns: a:5 v:7
+      ├── volatile, mutations
+      ├── key: (1)
+      ├── fd: (1)-->(3)
+      └── project
+           ├── columns: v:7 a:5!null
+           ├── immutable
+           ├── key: (5)
+           ├── fd: (5)-->(7)
+           ├── select
+           │    ├── columns: a:5!null b:6
+           │    ├── key: (5)
+           │    ├── fd: (5)-->(6)
+           │    ├── scan virt
+           │    │    ├── columns: a:5!null b:6
+           │    │    ├── computed column expressions
+           │    │    │    └── v:7
+           │    │    │         └── a:5 + b:6
+           │    │    ├── key: (5)
+           │    │    └── fd: (5)-->(6)
+           │    └── filters
+           │         └── a:5 > 1 [outer=(5), constraints=(/5: [/2 - ]; tight)]
+           └── projections
+                └── a:5 + b:6 [as=v:7, outer=(5,6), immutable]
+
+# We should not be pruning the virtual column when it is part of an index.
+norm
+DELETE FROM virt_idx WHERE a > 1
+----
+delete virt_idx
+ ├── columns: <none>
+ ├── fetch columns: a:5 v:7
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: v:7 a:5!null
+      ├── immutable
+      ├── key: (5)
+      ├── fd: (5)-->(7)
+      ├── select
+      │    ├── columns: a:5!null b:6
+      │    ├── key: (5)
+      │    ├── fd: (5)-->(6)
+      │    ├── scan virt_idx
+      │    │    ├── columns: a:5!null b:6
+      │    │    ├── computed column expressions
+      │    │    │    └── v:7
+      │    │    │         └── a:5 + b:6
+      │    │    ├── key: (5)
+      │    │    └── fd: (5)-->(6)
+      │    └── filters
+      │         └── a:5 > 1 [outer=(5), constraints=(/5: [/2 - ]; tight)]
+      └── projections
+           └── a:5 + b:6 [as=v:7, outer=(5,6), immutable]
 
 # ------------------------------------------------------------------------------
 # PruneMutationReturnCols
@@ -2887,7 +3368,7 @@ update abcde
       │    ├── columns: abcde.a:7!null abcde.b:8 abcde.c:9 abcde.d:10 abcde.e:11
       │    ├── key: (7)
       │    └── fd: (7)-->(8-11), (8,9)~~>(7,10,11)
-      ├── scan "family"
+      ├── scan family
       │    ├── columns: "family".a:13!null "family".b:14 "family".c:15
       │    ├── key: (13)
       │    └── fd: (13)-->(14,15)
@@ -2910,7 +3391,7 @@ semi-join (hash)
  │    ├── columns: abcde.a:1!null abcde.b:2 abcde.c:3
  │    ├── key: (1)
  │    └── fd: (1)-->(2,3), (2,3)~~>(1)
- ├── scan "family"
+ ├── scan family
  │    ├── columns: "family".a:7!null
  │    └── key: (7)
  └── filters
@@ -2929,7 +3410,7 @@ semi-join (hash)
  │    ├── columns: abcde.a:1!null abcde.b:2 abcde.c:3
  │    ├── key: (1)
  │    └── fd: (1)-->(2,3), (2,3)~~>(1)
- ├── scan "family"
+ ├── scan family
  │    ├── columns: "family".a:7!null "family".b:8 "family".c:9
  │    ├── key: (7)
  │    └── fd: (7)-->(8,9)
@@ -2948,7 +3429,7 @@ anti-join (hash)
  │    ├── columns: abcde.a:1!null abcde.b:2 abcde.c:3
  │    ├── key: (1)
  │    └── fd: (1)-->(2,3), (2,3)~~>(1)
- ├── scan "family"
+ ├── scan family
  │    ├── columns: "family".a:7!null
  │    └── key: (7)
  └── filters
@@ -2982,7 +3463,7 @@ semi-join-apply
  │    ├── columns: "family".a:7!null
  │    ├── outer: (1)
  │    ├── key: (7)
- │    ├── scan "family"
+ │    ├── scan family
  │    │    ├── columns: "family".a:7!null
  │    │    └── key: (7)
  │    ├── scan a
@@ -3021,7 +3502,7 @@ anti-join-apply
  │    ├── columns: "family".a:7!null
  │    ├── outer: (1)
  │    ├── key: (7)
- │    ├── scan "family"
+ │    ├── scan family
  │    │    ├── columns: "family".a:7!null
  │    │    └── key: (7)
  │    ├── scan a

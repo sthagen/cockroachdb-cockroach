@@ -1,3 +1,5 @@
+# LogicTest: !fakedist-metadata
+
 statement ok
 CREATE TABLE users (
   uid    INT PRIMARY KEY,
@@ -74,12 +76,12 @@ query TTBITTBB colnames
 SHOW INDEXES FROM users
 ----
 table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit
-users       primary     false       1             id           ASC        false    false
+users       bar         false       1             id           ASC        false    false
+users       bar         false       2             username     ASC        false    false
 users       foo         true        1             username     ASC        false    false
 users       foo         true        2             species      N/A        true     false
 users       foo         true        3             id           ASC        false    true
-users       bar         false       1             id           ASC        false    false
-users       bar         false       2             username     ASC        false    false
+users       primary     false       1             id           ASC        false    false
 
 statement ok
 CREATE VIEW v1 AS SELECT id FROM users WHERE username = 'tom'
@@ -111,26 +113,33 @@ statement ok
 DROP VIEW v2
 
 query T
-SELECT column_name FROM [SHOW COLUMNS FROM users]
+SELECT column_name FROM [SHOW COLUMNS FROM users] ORDER BY column_name
 ----
 id
-username
 species
+username
 
-query TTT
+statement ok
+SET vectorize=on
+
+query T
 EXPLAIN ALTER TABLE users RENAME COLUMN species TO woo
 ----
-·            distribution  local
-·            vectorized    false
-alter table  ·             ·
+distribution: local
+vectorized: true
+·
+• alter table
+
+statement ok
+RESET vectorize
 
 # Verify that EXPLAIN did not actually rename the column
 query T
-SELECT column_name FROM [SHOW COLUMNS FROM users]
+SELECT column_name FROM [SHOW COLUMNS FROM users] ORDER BY column_name
 ----
 id
-username
 species
+username
 
 # Check that a column can be added and renamed in the same statement
 statement ok

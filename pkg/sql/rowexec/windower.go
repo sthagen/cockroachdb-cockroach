@@ -12,7 +12,6 @@ package rowexec
 
 import (
 	"context"
-	"fmt"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -27,12 +26,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/opentracing/opentracing-go"
 )
 
 // windowerState represents the state of the processor.
@@ -186,11 +184,7 @@ func newWindower(
 
 	w.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, "windower-disk")
 	w.allRowsPartitioned = rowcontainer.NewHashDiskBackedRowContainer(
-		nil, /* memRowContainer */
-		evalCtx,
-		w.MemMonitor,
-		w.diskMonitor,
-		flowCtx.Cfg.TempStorage,
+		evalCtx, w.MemMonitor, w.diskMonitor, flowCtx.Cfg.TempStorage,
 	)
 	if err := w.allRowsPartitioned.Init(
 		ctx,
@@ -207,9 +201,9 @@ func newWindower(
 	// them to reuse the same shared memory account with the windower.
 	evalCtx.SingleDatumAggMemAccount = &w.acc
 
-	if sp := opentracing.SpanFromContext(ctx); sp != nil && tracing.IsRecording(sp) {
+	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsVerbose() {
 		w.input = newInputStatCollector(w.input)
-		w.FinishTrace = w.outputStatsToTrace
+		w.ExecStatsForTrace = w.execStatsForTrace
 	}
 
 	return w, nil
@@ -844,49 +838,19 @@ func CreateWindowerSpecFunc(funcStr string) (execinfrapb.WindowerSpec_Func, erro
 	}
 }
 
-var _ execinfrapb.DistSQLSpanStats = &WindowerStats{}
-
-const windowerTagPrefix = "windower."
-
-// Stats implements the SpanStats interface.
-func (ws *WindowerStats) Stats() map[string]string {
-	inputStatsMap := ws.InputStats.Stats(windowerTagPrefix)
-	inputStatsMap[windowerTagPrefix+MaxMemoryTagSuffix] = humanizeutil.IBytes(ws.MaxAllocatedMem)
-	inputStatsMap[windowerTagPrefix+MaxDiskTagSuffix] = humanizeutil.IBytes(ws.MaxAllocatedDisk)
-	return inputStatsMap
-}
-
-// StatsForQueryPlan implements the DistSQLSpanStats interface.
-func (ws *WindowerStats) StatsForQueryPlan() []string {
-	stats := ws.InputStats.StatsForQueryPlan("" /* prefix */)
-
-	if ws.MaxAllocatedMem != 0 {
-		stats = append(stats,
-			fmt.Sprintf("%s: %s", MaxMemoryQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedMem)))
-	}
-
-	if ws.MaxAllocatedDisk != 0 {
-		stats = append(stats,
-			fmt.Sprintf("%s: %s", MaxDiskQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedDisk)))
-	}
-
-	return stats
-}
-
-func (w *windower) outputStatsToTrace() {
-	is, ok := getInputStats(w.FlowCtx, w.input)
+// execStatsForTrace implements ProcessorBase.ExecStatsForTrace.
+func (w *windower) execStatsForTrace() *execinfrapb.ComponentStats {
+	is, ok := getInputStats(w.input)
 	if !ok {
-		return
+		return nil
 	}
-	if sp := opentracing.SpanFromContext(w.Ctx); sp != nil {
-		tracing.SetSpanStats(
-			sp,
-			&WindowerStats{
-				InputStats:       is,
-				MaxAllocatedMem:  w.MemMonitor.MaximumBytes(),
-				MaxAllocatedDisk: w.diskMonitor.MaximumBytes(),
-			},
-		)
+	return &execinfrapb.ComponentStats{
+		Inputs: []execinfrapb.InputStats{is},
+		Exec: execinfrapb.ExecStats{
+			MaxAllocatedMem:  optional.MakeUint(uint64(w.MemMonitor.MaximumBytes())),
+			MaxAllocatedDisk: optional.MakeUint(uint64(w.diskMonitor.MaximumBytes())),
+		},
+		Output: w.Out.Stats(),
 	}
 }
 

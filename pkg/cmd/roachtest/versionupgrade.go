@@ -15,13 +15,13 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
@@ -94,7 +94,7 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster, buildVersion ve
 		// The version to create/update the fixture for. Must be released (i.e.
 		// can download it from the homepage); if that is not the case use the
 		// empty string which uses the local cockroach binary.
-		newV := "20.1.7"
+		newV := "20.1.10"
 		predV, err := PredecessorVersion(*version.MustParse("v" + newV))
 		if err != nil {
 			t.Fatal(err)
@@ -225,32 +225,30 @@ func (u *versionUpgradeTest) conn(ctx context.Context, t *test, i int) *gosql.DB
 func (u *versionUpgradeTest) uploadVersion(
 	ctx context.Context, t *test, nodes nodeListOption, newVersion string,
 ) option {
-	var binary string
 	if newVersion == "" {
-		binary = cockroach
-	} else {
-		var err error
-		binary, err = binfetcher.Download(ctx, binfetcher.Options{
-			Binary:  "cockroach",
-			Version: "v" + newVersion,
-			GOOS:    u.goOS,
-			GOARCH:  "amd64",
-		})
-		if err != nil {
+		binary := cockroach
+		target := "./cockroach"
+		u.c.Put(ctx, binary, target, nodes)
+		return startArgs("--binary=" + target)
+	}
+
+	newVersion = "v" + newVersion
+	dir := newVersion
+	target := filepath.Join(dir, "cockroach")
+	// Check if the cockroach binary already exists.
+	if err := u.c.RunE(ctx, nodes, "test", "-e", target); err != nil {
+		if err := u.c.RunE(ctx, nodes, "mkdir", "-p", dir); err != nil {
+			t.Fatal(err)
+		}
+		if err := u.c.Stage(ctx, u.c.l, "release", newVersion, dir, nodes); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	target := "./cockroach"
-	if newVersion != "" {
-		target += "-" + newVersion
-	}
-	u.c.Put(ctx, binary, target, nodes)
 	return startArgs("--binary=" + target)
 }
 
 // binaryVersion returns the binary running on the (one-indexed) node.
-// NB: version means major.minor[-unstable]; the patch level isn't returned. For example, a binary
+// NB: version means major.minor[-internal]; the patch level isn't returned. For example, a binary
 // of version 19.2.4 will return 19.2.
 func (u *versionUpgradeTest) binaryVersion(ctx context.Context, t *test, i int) roachpb.Version {
 	db := u.conn(ctx, t, i)
@@ -274,7 +272,7 @@ func (u *versionUpgradeTest) binaryVersion(ctx context.Context, t *test, i int) 
 // binaryVersion returns the cluster version active on the (one-indexed) node. Note that the
 // returned value might become stale due to the cluster auto-upgrading in the background plus
 // gossip asynchronicity.
-// NB: cluster versions are always major.minor[-unstable]; there isn't a patch level.
+// NB: cluster versions are always major.minor[-internal]; there isn't a patch level.
 func (u *versionUpgradeTest) clusterVersion(ctx context.Context, t *test, i int) roachpb.Version {
 	db := u.conn(ctx, t, i)
 

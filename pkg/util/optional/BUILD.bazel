@@ -1,0 +1,28 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "optional",
+    srcs = [
+        "duration.go",
+        "optional.pb.go",
+        "uint.go",
+    ],
+    importpath = "github.com/cockroachdb/cockroach/pkg/util/optional",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_gogo_protobuf//proto",
+        "@com_github_gogo_protobuf//types",
+    ],
+)
+
+go_test(
+    name = "optional_test",
+    srcs = [
+        "duration_test.go",
+        "uint_test.go",
+    ],
+    deps = [
+        ":optional",
+        "@com_github_stretchr_testify//require",
+    ],
+)

@@ -12,18 +12,20 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	hlc "github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -39,15 +41,17 @@ var (
 		"use experimental time-bound file filter when exporting in BACKUP",
 		true,
 	)
-	priorityAfter = settings.RegisterNonNegativeDurationSetting(
+	priorityAfter = settings.RegisterDurationSetting(
 		"bulkio.backup.read_with_priority_after",
 		"age of read-as-of time above which a BACKUP should read with priority",
 		time.Minute,
+		settings.NonNegativeDuration,
 	)
-	delayPerAttmpt = settings.RegisterNonNegativeDurationSetting(
+	delayPerAttmpt = settings.RegisterDurationSetting(
 		"bulkio.backup.read_retry_delay",
 		"amount of time since the read-as-of time, per-prior attempt, to wait before making another attempt",
 		time.Second*5,
+		settings.NonNegativeDuration,
 	)
 )
 
@@ -88,7 +92,7 @@ func newBackupDataProcessor(
 
 func (cp *backupDataProcessor) Run(ctx context.Context) {
 	ctx, span := tracing.ChildSpan(ctx, "backupDataProcessor")
-	defer tracing.FinishSpan(span)
+	defer span.Finish()
 	defer cp.output.ProducerDone()
 
 	progCh := make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress)
@@ -138,16 +142,17 @@ func runBackupProcessor(
 	// TODO(pbardea): Check to see if this benefits from any tuning (e.g. +1, or
 	//  *2). See #49798.
 	numSenders := int(kvserver.ExportRequestsLimit.Get(&settings.SV)) * 2
+	targetFileSize := storageccl.ExportRequestTargetFileSize.Get(&settings.SV)
 
 	// For all backups, partitioned or not, the main BACKUP manifest is stored at
 	// details.URI.
-	defaultConf, err := cloudimpl.ExternalStorageConfFromURI(spec.DefaultURI, spec.User)
+	defaultConf, err := cloudimpl.ExternalStorageConfFromURI(spec.DefaultURI, spec.User())
 	if err != nil {
 		return err
 	}
 	storageByLocalityKV := make(map[string]*roachpb.ExternalStorage)
 	for kv, uri := range spec.URIsByLocalityKV {
-		conf, err := cloudimpl.ExternalStorageConfFromURI(uri, spec.User)
+		conf, err := cloudimpl.ExternalStorageConfFromURI(uri, spec.User())
 		if err != nil {
 			return err
 		}
@@ -180,6 +185,7 @@ func runBackupProcessor(
 					EnableTimeBoundIteratorOptimization: useTBI.Get(&settings.SV),
 					MVCCFilter:                          spec.MVCCFilter,
 					Encryption:                          spec.Encryption,
+					TargetFileSize:                      targetFileSize,
 				}
 
 				// If we're doing re-attempts but are not yet in the priority regime,
@@ -221,7 +227,7 @@ func runBackupProcessor(
 					span.span, span.attempts+1, header.UserPriority.String())
 				rawRes, pErr := kv.SendWrappedWith(ctx, flowCtx.Cfg.DB.NonTransactionalSender(), header, req)
 				if pErr != nil {
-					if err := pErr.Detail.GetWriteIntent(); err != nil {
+					if _, ok := pErr.GetDetail().(*roachpb.WriteIntentError); ok {
 						span.lastTried = timeutil.Now()
 						span.attempts++
 						todo <- span
@@ -232,6 +238,13 @@ func runBackupProcessor(
 					return errors.Wrapf(pErr.GoError(), "exporting %s", span.span)
 				}
 				res := rawRes.(*roachpb.ExportResponse)
+
+				if backupKnobs, ok := flowCtx.TestingKnobs().BackupRestoreTestingKnobs.(*sql.BackupRestoreTestingKnobs); ok {
+					if backupKnobs.RunAfterExportingSpanEntry != nil {
+						backupKnobs.RunAfterExportingSpanEntry(ctx)
+					}
+				}
+
 				files := make([]BackupManifest_File, 0)
 				var prog execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
 				progDetails := BackupManifest_Progress{}

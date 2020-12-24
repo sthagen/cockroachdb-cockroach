@@ -131,7 +131,6 @@ func newCSVWriterProcessor(
 	input execinfra.RowSource,
 	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
-
 	c := &csvWriter{
 		flowCtx:     flowCtx,
 		processorID: processorID,
@@ -167,7 +166,7 @@ func (sp *csvWriter) OutputTypes() []*types.T {
 
 func (sp *csvWriter) Run(ctx context.Context) {
 	ctx, span := tracing.ChildSpan(ctx, "csvWriter")
-	defer tracing.FinishSpan(span)
+	defer span.Finish()
 
 	err := func() error {
 		typs := sp.input.OutputTypes()
@@ -234,7 +233,7 @@ func (sp *csvWriter) Run(ctx context.Context) {
 				return errors.Wrap(err, "failed to flush csv writer")
 			}
 
-			conf, err := cloudimpl.ExternalStorageConfFromURI(sp.spec.Destination, sp.spec.User)
+			conf, err := cloudimpl.ExternalStorageConfFromURI(sp.spec.Destination, sp.spec.User())
 			if err != nil {
 				return err
 			}

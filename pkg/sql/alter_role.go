@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -87,12 +88,12 @@ func (p *planner) AlterRoleNode(
 func (p *planner) checkPasswordOptionConstraints(
 	ctx context.Context, roleOptions roleoption.List, newUser bool,
 ) error {
-	if !p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.VersionCreateLoginPrivilege) {
+	if !p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.CreateLoginPrivilege) {
 		// TODO(knz): Remove this condition in 21.1.
 		if roleOptions.Contains(roleoption.CREATELOGIN) || roleOptions.Contains(roleoption.NOCREATELOGIN) {
 			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 				`granting CREATELOGIN or NOCREATELOGIN requires all nodes to be upgraded to %s`,
-				clusterversion.VersionByKey(clusterversion.VersionCreateLoginPrivilege))
+				clusterversion.ByKey(clusterversion.CreateLoginPrivilege))
 		}
 	}
 
@@ -146,7 +147,7 @@ func (n *alterRoleNode) startExec(params runParams) error {
 		params.ctx,
 		opName,
 		params.p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		fmt.Sprintf("SELECT 1 FROM %s WHERE username = $1", userTableName),
 		normalizedUsername,
 	)
@@ -236,7 +237,7 @@ func (n *alterRoleNode) startExec(params runParams) error {
 			params.ctx,
 			opName,
 			params.p.txn,
-			sessiondata.InternalExecutorOverride{User: security.RootUser},
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			stmt,
 			qargs...,
 		)
@@ -245,7 +246,17 @@ func (n *alterRoleNode) startExec(params runParams) error {
 		}
 	}
 
-	return nil
+	optStrs := make([]string, len(n.roleOptions))
+	for i := range optStrs {
+		optStrs[i] = n.roleOptions[i].String()
+	}
+
+	return params.p.logEvent(params.ctx,
+		0, /* no target */
+		&eventpb.AlterRole{
+			RoleName: normalizedUsername.Normalized(),
+			Options:  optStrs,
+		})
 }
 
 func (*alterRoleNode) Next(runParams) (bool, error) { return false, nil }

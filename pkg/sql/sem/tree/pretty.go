@@ -12,6 +12,7 @@ package tree
 
 import (
 	"bytes"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -1230,7 +1231,7 @@ func (node *CreateTable) doc(p *PrettyCfg) pretty.Doc {
 		)
 	}
 
-	clauses := make([]pretty.Doc, 0, 2)
+	clauses := make([]pretty.Doc, 0, 4)
 	if node.As() {
 		clauses = append(clauses, p.Doc(node.AsSource))
 	}
@@ -1239,6 +1240,9 @@ func (node *CreateTable) doc(p *PrettyCfg) pretty.Doc {
 	}
 	if node.PartitionBy != nil {
 		clauses = append(clauses, p.Doc(node.PartitionBy))
+	}
+	if node.Locality != nil {
+		clauses = append(clauses, p.Doc(node.Locality))
 	}
 	if len(clauses) == 0 {
 		return title
@@ -1431,6 +1435,32 @@ func (node *PartitionBy) doc(p *PrettyCfg) pretty.Doc {
 	return p.nestUnder(title,
 		p.bracket("(", p.commaSeparated(inner...), ")"),
 	)
+}
+
+func (node *Locality) doc(p *PrettyCfg) pretty.Doc {
+	// Final layout:
+	//
+	// LOCALITY [GLOBAL | REGIONAL BY [TABLE [IN [PRIMARY REGION|region]]|ROW]]
+	localityKW := pretty.Keyword("LOCALITY")
+	switch node.LocalityLevel {
+	case LocalityLevelGlobal:
+		return pretty.ConcatSpace(localityKW, pretty.Keyword("GLOBAL"))
+	case LocalityLevelRow:
+		return pretty.ConcatSpace(localityKW, pretty.Keyword("REGIONAL BY ROW"))
+	case LocalityLevelTable:
+		byTable := pretty.ConcatSpace(localityKW, pretty.Keyword("REGIONAL BY TABLE IN"))
+		if node.TableRegion == "" {
+			return pretty.ConcatSpace(
+				byTable,
+				pretty.Keyword("PRIMARY REGION"),
+			)
+		}
+		return pretty.ConcatSpace(
+			byTable,
+			p.Doc(&node.TableRegion),
+		)
+	}
+	panic(fmt.Sprintf("unknown locality: %v", *node))
 }
 
 func (node *ListPartition) doc(p *PrettyCfg) pretty.Doc {
@@ -1789,8 +1819,19 @@ func (node *ColumnTableDef) docRow(p *PrettyCfg) pretty.TableRow {
 
 	// Compute expression (for computed columns).
 	if node.IsComputed() {
-		clauses = append(clauses, pretty.ConcatSpace(pretty.Keyword("AS"),
-			p.bracket("(", p.Doc(node.Computed.Expr), ") STORED"),
+		var typ string
+		if node.Computed.Virtual {
+			typ = "VIRTUAL"
+		} else {
+			typ = "STORED"
+		}
+
+		clauses = append(clauses, pretty.ConcatSpace(
+			pretty.Keyword("AS"),
+			pretty.ConcatSpace(
+				p.bracket("(", p.Doc(node.Computed.Expr), ")"),
+				pretty.Keyword(typ),
+			),
 		))
 	}
 
@@ -2087,44 +2128,6 @@ func (node *Export) doc(p *PrettyCfg) pretty.Doc {
 	}
 	items = append(items, p.row("FROM", p.Doc(node.Query)))
 	return p.rlTable(items...)
-}
-
-func (node *Explain) doc(p *PrettyCfg) pretty.Doc {
-	d := pretty.Keyword("EXPLAIN")
-	showMode := node.Mode != ExplainPlan
-	// ANALYZE is a special case because it is a statement implemented as an
-	// option to EXPLAIN.
-	if node.Flags[ExplainFlagAnalyze] {
-		d = pretty.ConcatSpace(d, pretty.Keyword("ANALYZE"))
-		showMode = true
-	}
-	var opts []pretty.Doc
-	if showMode {
-		opts = append(opts, pretty.Keyword(node.Mode.String()))
-	}
-	for f := ExplainFlag(1); f <= numExplainFlags; f++ {
-		if f != ExplainFlagAnalyze && node.Flags[f] {
-			opts = append(opts, pretty.Keyword(f.String()))
-		}
-	}
-	if len(opts) > 0 {
-		d = pretty.ConcatSpace(
-			d,
-			p.bracket("(", p.commaSeparated(opts...), ")"),
-		)
-	}
-	return p.nestUnder(d, p.Doc(node.Statement))
-}
-
-func (node *ExplainAnalyzeDebug) doc(p *PrettyCfg) pretty.Doc {
-	d := pretty.ConcatSpace(
-		pretty.ConcatSpace(
-			pretty.Keyword("EXPLAIN"),
-			pretty.Keyword("ANALYZE"),
-		),
-		p.bracket("(", pretty.Keyword("DEBUG"), ")"),
-	)
-	return p.nestUnder(d, p.Doc(node.Statement))
 }
 
 func (node *NotExpr) doc(p *PrettyCfg) pretty.Doc {

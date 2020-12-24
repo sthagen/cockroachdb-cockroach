@@ -89,7 +89,7 @@ message BackupDetails {
   // URIsByLocalityKV is a map of locality KVs to store URIs, used for
   // partitioned backups.
   map<string, string> uris_by_locality_kv = 5 [(gogoproto.customname) = "URIsByLocalityKV"];
-  bytes backup_manifest = 4;
+  bytes deprecated_backup_manifest = 4;
   BackupEncryptionOptions encryption_options = 6;
   EncryptionInfo encryption_info = 9;
 
@@ -192,6 +192,8 @@ message ImportDetails {
   int64 sst_size = 4 [(gogoproto.customname) = "SSTSize"];
   int64 oversample = 9;
   bool skip_fks = 10 [(gogoproto.customname) = "SkipFKs"];
+
+  // walltime is the time at which an import job will write KVs.
   int64 walltime = 5;
   uint32 parent_id = 6 [
     (gogoproto.customname) = "ParentID",
@@ -214,6 +216,8 @@ message ImportDetails {
   bool prepare_complete = 12;
   bool tables_published = 13;
 
+  bool parse_bundle_schema = 14;
+
   // ProtectedTimestampRecord is the ID of the protected timestamp record
   // corresponding to this job. While the job ought to clean up the record
   // when it enters a terminal state, there may be cases where it cannot or
@@ -223,6 +227,33 @@ message ImportDetails {
     (gogoproto.customname) = "ProtectedTimestampRecord",
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
   ];
+}
+
+// SequenceValChunks represents a single chunk of sequence values allocated
+// during an IMPORT.
+message SequenceValChunk {
+  int64 chunk_start_val = 1;
+  int64 chunk_size = 2;
+
+  // The first row in the file being imported from which the current chunk of
+  // sequence values is being used.
+  int64 chunk_start_row = 3;
+  // The row in the file being imported at which the import will need to use a
+  // new chunk of sequence values.
+  int64 next_chunk_start_row = 4;
+}
+
+// SequenceDetails represents information about the sequences processed in a
+// single file during IMPORT.
+message SequenceDetails {
+  // SequenceChunks represents all the chunks reserved for a particular sequence
+  // during an IMPORT.
+  message SequenceChunks {
+    repeated SequenceValChunk chunks = 1;
+  }
+
+  // Mapping from sequence ID to allocated sequence chunks.
+  map<int32, SequenceChunks> seq_id_to_chunks = 1;
 }
 
 message ImportProgress {
@@ -238,6 +269,10 @@ message ImportProgress {
   // been flushed, we can advance the count here and then on resume skip over
   // that many rows without needing to convert/process them at all.
   repeated int64 resume_pos = 5; // Only set by direct import.
+
+  // Holds metadata related to sequences for every file processed during an
+  // IMPORT.
+  repeated SequenceDetails sequence_details = 6;
 }
 
 // TypeSchemaChangeDetails is the job detail information for a type schema change job.
@@ -299,7 +334,7 @@ message SchemaChangeGCDetails {
 
   // The below two fields are used only in the case of TRUNCATE operating on
   // tables with interleaved indexes. They are only set together.
-  
+
   // InterleavedTable is the table being truncated. In particular, it is the
   // TableDescriptor before any of the truncate modifications have been applied.
   sqlbase.TableDescriptor interleaved_table = 4;
@@ -491,7 +526,7 @@ message Payload {
   string description = 1;
   // If empty, the description is assumed to be the statement.
   string statement = 16;
-  string username = 2;
+  string username_proto = 2 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security.SQLUsernameProto"];
   // For consistency with the SQL timestamp type, which has microsecond
   // precision, we avoid the timestamp.Timestamp WKT, which has nanosecond
   // precision, and use microsecond integers directly.

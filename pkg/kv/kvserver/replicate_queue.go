@@ -18,11 +18,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -31,7 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/v3"
 )
 
 const (
@@ -51,14 +51,16 @@ const (
 // minLeaseTransferInterval controls how frequently leases can be transferred
 // for rebalancing. It does not prevent transferring leases in order to allow
 // a replica to be removed from a range.
-var minLeaseTransferInterval = settings.RegisterNonNegativeDurationSetting(
+var minLeaseTransferInterval = settings.RegisterDurationSetting(
 	"kv.allocator.min_lease_transfer_interval",
 	"controls how frequently leases can be transferred for rebalancing. "+
 		"It does not prevent transferring leases in order to allow a "+
 		"replica to be removed from a range.",
 	1*time.Second,
+	settings.NonNegativeDuration,
 )
 
+// TODO(aayush): Expand this metric set to include metrics about non-voting replicas.
 var (
 	metaReplicateQueueAddReplicaCount = metric.Metadata{
 		Name:        "queue.replicate.addreplica",
@@ -200,7 +202,7 @@ func newReplicateQueue(store *Store, g *gossip.Gossip, allocator Allocator) *rep
 		})
 	}
 	if nl := store.cfg.NodeLiveness; nl != nil { // node liveness is nil for some unittests
-		nl.RegisterCallback(func(_ kvserverpb.Liveness) {
+		nl.RegisterCallback(func(_ livenesspb.Liveness) {
 			updateFn()
 		})
 	}
@@ -270,7 +272,7 @@ func (rq *replicateQueue) process(
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		for {
 			requeue, err := rq.processOneChange(ctx, repl, rq.canTransferLease, false /* dryRun */)
-			if IsSnapshotError(err) {
+			if isSnapshotError(err) {
 				// If ChangeReplicas failed because the snapshot failed, we log the
 				// error but then return success indicating we should retry the
 				// operation. The most likely causes of the snapshot failing are a
@@ -321,23 +323,10 @@ func (rq *replicateQueue) processOneChange(
 	// quorum.
 	voterReplicas := desc.Replicas().Voters()
 	liveVoterReplicas, deadVoterReplicas := rq.allocator.storePool.liveAndDeadReplicas(voterReplicas)
-	{
-		unavailable := !desc.Replicas().CanMakeProgress(func(rDesc roachpb.ReplicaDescriptor) bool {
-			for _, inner := range liveVoterReplicas {
-				if inner.ReplicaID == rDesc.ReplicaID {
-					return true
-				}
-			}
-			return false
-		})
-		if unavailable {
-			return false, newQuorumError(
-				"range requires a replication change, but live replicas %v don't constitute a quorum for %v:",
-				liveVoterReplicas,
-				desc.Replicas().All(),
-			)
-		}
-	}
+
+	// NB: the replication layer ensures that the below operations don't cause
+	// unavailability; see:
+	_ = execChangeReplicasTxn
 
 	action, _ := rq.allocator.ComputeAction(ctx, zone, desc)
 	log.VEventf(ctx, 1, "next replica action: %s", action)
@@ -443,11 +432,6 @@ func (rq *replicateQueue) addOrReplace(
 		// a replica.
 		removeIdx = -1
 	}
-	st := rq.store.cfg.Settings
-	if !st.Version.IsActive(ctx, clusterversion.VersionAtomicChangeReplicas) {
-		// If we can't swap yet, don't.
-		removeIdx = -1
-	}
 
 	remainingLiveReplicas := liveVoterReplicas
 	if removeIdx >= 0 {
@@ -530,7 +514,7 @@ func (rq *replicateQueue) addOrReplace(
 		}
 	}
 	rq.metrics.AddReplicaCount.Inc(1)
-	ops := roachpb.MakeReplicationChanges(roachpb.ADD_REPLICA, newReplica)
+	ops := roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, newReplica)
 	if removeIdx < 0 {
 		log.VEventf(ctx, 1, "adding replica %+v: %s",
 			newReplica, rangeRaftProgress(repl.RaftStatus(), existingReplicas))
@@ -540,7 +524,7 @@ func (rq *replicateQueue) addOrReplace(
 		log.VEventf(ctx, 1, "replacing replica %s with %+v: %s",
 			removeReplica, newReplica, rangeRaftProgress(repl.RaftStatus(), existingReplicas))
 		ops = append(ops,
-			roachpb.MakeReplicationChanges(roachpb.REMOVE_REPLICA, roachpb.ReplicationTarget{
+			roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, roachpb.ReplicationTarget{
 				StoreID: removeReplica.StoreID,
 				NodeID:  removeReplica.NodeID,
 			})...)
@@ -669,7 +653,7 @@ func (rq *replicateQueue) maybeTransferLeaseAway(
 	// out of situations where this store is overfull and yet holds all the
 	// leases. The fullness checks need to be ignored for cases where
 	// a replica needs to be removed for constraint violations.
-	return rq.findTargetAndTransferLease(
+	transferred, err := rq.shedLease(
 		ctx,
 		repl,
 		desc,
@@ -678,6 +662,7 @@ func (rq *replicateQueue) maybeTransferLeaseAway(
 			dryRun: dryRun,
 		},
 	)
+	return transferred == transferOK, err
 }
 
 func (rq *replicateQueue) remove(
@@ -709,7 +694,7 @@ func (rq *replicateQueue) remove(
 	if err := rq.changeReplicas(
 		ctx,
 		repl,
-		roachpb.MakeReplicationChanges(roachpb.REMOVE_REPLICA, target),
+		roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, target),
 		desc,
 		SnapshotRequest_UNKNOWN, // unused
 		kvserverpb.ReasonRangeOverReplicated,
@@ -751,7 +736,7 @@ func (rq *replicateQueue) removeDecommissioning(
 	if err := rq.changeReplicas(
 		ctx,
 		repl,
-		roachpb.MakeReplicationChanges(roachpb.REMOVE_REPLICA, target),
+		roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, target),
 		desc,
 		SnapshotRequest_UNKNOWN, // unused
 		kvserverpb.ReasonStoreDecommissioning, "", dryRun,
@@ -783,7 +768,7 @@ func (rq *replicateQueue) removeDead(
 	if err := rq.changeReplicas(
 		ctx,
 		repl,
-		roachpb.MakeReplicationChanges(roachpb.REMOVE_REPLICA, target),
+		roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, target),
 		desc,
 		SnapshotRequest_UNKNOWN, // unused
 		kvserverpb.ReasonStoreDead,
@@ -818,7 +803,7 @@ func (rq *replicateQueue) removeLearner(
 	if err := rq.changeReplicas(
 		ctx,
 		repl,
-		roachpb.MakeReplicationChanges(roachpb.REMOVE_REPLICA, target),
+		roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, target),
 		desc,
 		SnapshotRequest_UNKNOWN,
 		kvserverpb.ReasonAbandonedLearner,
@@ -862,8 +847,8 @@ func (rq *replicateQueue) considerRebalance(
 				// atomic replication changes being turned off, the changes
 				// will be executed individually in the order in which they
 				// appear.
-				{Target: addTarget, ChangeType: roachpb.ADD_REPLICA},
-				{Target: removeTarget, ChangeType: roachpb.REMOVE_REPLICA},
+				{Target: addTarget, ChangeType: roachpb.ADD_VOTER},
+				{Target: removeTarget, ChangeType: roachpb.REMOVE_VOTER},
 			}
 
 			if len(existingReplicas) == 1 {
@@ -912,32 +897,26 @@ func (rq *replicateQueue) considerRebalance(
 		}
 	}
 
-	if canTransferLease() {
-		// We require the lease in order to process replicas, so
-		// repl.store.StoreID() corresponds to the lease-holder's store ID.
-		transferred, err := rq.findTargetAndTransferLease(
-			ctx,
-			repl,
-			desc,
-			zone,
-			transferLeaseOptions{
-				checkTransferLeaseSource: true,
-				checkCandidateFullness:   true,
-				dryRun:                   dryRun,
-			},
-		)
-		if err != nil {
-			return false, err
-		}
-		// Do not requeue as we transferred our lease away.
-		if transferred {
-			return false, nil
-		}
+	if !canTransferLease() {
+		// No action was necessary and no rebalance target was found. Return
+		// without re-queuing this replica.
+		return false, nil
 	}
 
-	// No action was necessary and no rebalance target was found. Return
-	// without re-queuing this replica.
-	return false, nil
+	// We require the lease in order to process replicas, so
+	// repl.store.StoreID() corresponds to the lease-holder's store ID.
+	_, err := rq.shedLease(
+		ctx,
+		repl,
+		desc,
+		zone,
+		transferLeaseOptions{
+			checkTransferLeaseSource: true,
+			checkCandidateFullness:   true,
+			dryRun:                   dryRun,
+		},
+	)
+	return false, err
 }
 
 type transferLeaseOptions struct {
@@ -946,13 +925,41 @@ type transferLeaseOptions struct {
 	dryRun                   bool
 }
 
-func (rq *replicateQueue) findTargetAndTransferLease(
+// leaseTransferOutcome represents the result of shedLease().
+type leaseTransferOutcome int
+
+const (
+	transferErr leaseTransferOutcome = iota
+	transferOK
+	noTransferDryRun
+	noSuitableTarget
+)
+
+func (o leaseTransferOutcome) String() string {
+	switch o {
+	case transferErr:
+		return "err"
+	case transferOK:
+		return "ok"
+	case noTransferDryRun:
+		return "no transfer; dry run"
+	case noSuitableTarget:
+		return "no suitable transfer target found"
+	default:
+		return fmt.Sprintf("unexpected status value: %d", o)
+	}
+}
+
+// shedLease takes in a leaseholder replica, looks for a target for transferring
+// the lease and, if a suitable target is found (e.g. alive, not draining),
+// transfers the lease away.
+func (rq *replicateQueue) shedLease(
 	ctx context.Context,
 	repl *Replica,
 	desc *roachpb.RangeDescriptor,
 	zone *zonepb.ZoneConfig,
 	opts transferLeaseOptions,
-) (bool, error) {
+) (leaseTransferOutcome, error) {
 	// Learner replicas aren't allowed to become the leaseholder or raft leader,
 	// so only consider the `Voters` replicas.
 	target := rq.allocator.TransferLeaseTarget(
@@ -966,20 +973,22 @@ func (rq *replicateQueue) findTargetAndTransferLease(
 		false, /* alwaysAllowDecisionWithoutStats */
 	)
 	if target == (roachpb.ReplicaDescriptor{}) {
-		return false, nil
+		return noSuitableTarget, nil
 	}
 
 	if opts.dryRun {
 		log.VEventf(ctx, 1, "transferring lease to s%d", target.StoreID)
-		return false, nil
+		return noTransferDryRun, nil
 	}
 
 	avgQPS, qpsMeasurementDur := repl.leaseholderStats.avgQPS()
 	if qpsMeasurementDur < MinStatsDuration {
 		avgQPS = 0
 	}
-	err := rq.transferLease(ctx, repl, target, avgQPS)
-	return err == nil, err
+	if err := rq.transferLease(ctx, repl, target, avgQPS); err != nil {
+		return transferErr, err
+	}
+	return transferOK, nil
 }
 
 func (rq *replicateQueue) transferLease(
@@ -1009,7 +1018,10 @@ func (rq *replicateQueue) changeReplicas(
 	if dryRun {
 		return nil
 	}
-	if _, err := repl.ChangeReplicas(ctx, desc, priority, reason, details, chgs); err != nil {
+	// NB: this calls the impl rather than ChangeReplicas because
+	// the latter traps tests that try to call it while the replication
+	// queue is active.
+	if _, err := repl.changeReplicasImpl(ctx, desc, priority, reason, details, chgs); err != nil {
 		return err
 	}
 	rangeUsageInfo := rangeUsageInfoForRepl(repl)

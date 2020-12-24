@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -28,14 +27,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/opentracing/opentracing-go"
 )
 
 type router interface {
@@ -104,7 +101,7 @@ type routerOutput struct {
 	// TODO(radu): add padding of size sys.CacheLineSize to ensure there is no
 	// false-sharing?
 
-	stats RouterOutputStats
+	stats execinfrapb.ComponentStats
 
 	// memoryMonitor and diskMonitor are mu.rowContainer's monitors.
 	memoryMonitor, diskMonitor *mon.BytesMonitor
@@ -115,6 +112,9 @@ type routerOutput struct {
 	// infrastructure of rowBufToPushFrom.
 	rowBufToPushFromMon *mon.BytesMonitor
 	rowBufToPushFromAcc *mon.BoundAccount
+	// rowBufToPushFromRowSize stores the size of the row that we have
+	// accounted for when adding it to rowBufToPushFrom buffer in ith position.
+	rowBufToPushFromRowSize [routerRowBufSize]int64
 }
 
 func (ro *routerOutput) addMetadataLocked(meta *execinfrapb.ProducerMetadata) {
@@ -147,6 +147,21 @@ func (ro *routerOutput) addRowLocked(ctx context.Context, row rowenc.EncDatumRow
 
 func (ro *routerOutput) popRowsLocked(ctx context.Context) ([]rowenc.EncDatumRow, error) {
 	n := 0
+	// addToRowBufToPushFrom adds row to nth position in rowBufToPushFrom. row
+	// *must* be safe from further modifications.
+	addToRowBufToPushFrom := func(row rowenc.EncDatumRow) error {
+		// We're reusing the same rowBufToPushFrom slice, so we can only
+		// release the memory under the "old" row once we overwrite it in
+		// rowBufToPushFrom which we're about to do for rowBufToPushFrom[n].
+		rowSize := int64(row.Size())
+		delta := rowSize - ro.rowBufToPushFromRowSize[n]
+		ro.rowBufToPushFromRowSize[n] = rowSize
+		if err := ro.rowBufToPushFromAcc.Grow(ctx, delta); err != nil {
+			return err
+		}
+		ro.rowBufToPushFrom[n] = row
+		return nil
+	}
 	// First try to get rows from the row container.
 	if ro.mu.rowContainer.Len() > 0 {
 		if err := func() error {
@@ -162,18 +177,9 @@ func (ro *routerOutput) popRowsLocked(ctx context.Context) ([]rowenc.EncDatumRow
 				if err != nil {
 					return err
 				}
-				// We're reusing the same rowBufToPushFrom slice, so we can
-				// only release the memory under the "old" row once we
-				// overwrite it in rowBufToPushFrom which we're about to do for
-				// rowBufToPushFrom[n].
-				prevSize := uintptr(0)
-				if ro.rowBufToPushFrom[n] != nil {
-					prevSize = ro.rowBufToPushFrom[n].Size()
-				}
-				if err := ro.rowBufToPushFromAcc.Grow(ctx, int64(row.Size()-prevSize)); err != nil {
+				if err = addToRowBufToPushFrom(ro.rowAlloc.CopyRow(row)); err != nil {
 					return err
 				}
-				ro.rowBufToPushFrom[n] = ro.rowAlloc.CopyRow(row)
 				n++
 			}
 			return nil
@@ -184,7 +190,9 @@ func (ro *routerOutput) popRowsLocked(ctx context.Context) ([]rowenc.EncDatumRow
 
 	// If the row container is empty, get more rows from the row buffer.
 	for ; n < len(ro.rowBufToPushFrom) && ro.mu.rowBufLen > 0; n++ {
-		ro.rowBufToPushFrom[n] = ro.mu.rowBuf[ro.mu.rowBufLeft]
+		if err := addToRowBufToPushFrom(ro.mu.rowBuf[ro.mu.rowBufLeft]); err != nil {
+			return nil, err
+		}
 		ro.mu.rowBufLeft = (ro.mu.rowBufLeft + 1) % routerRowBufSize
 		ro.mu.rowBufLen--
 	}
@@ -252,7 +260,7 @@ func (rb *routerBase) setupStreams(
 // init must be called after setupStreams but before Start.
 func (rb *routerBase) init(ctx context.Context, flowCtx *execinfra.FlowCtx, types []*types.T) {
 	// Check if we're recording stats.
-	if s := opentracing.SpanFromContext(ctx); s != nil && tracing.IsRecording(s) {
+	if s := tracing.SpanFromContext(ctx); s != nil && s.IsVerbose() {
 		rb.statsCollectionEnabled = true
 	}
 
@@ -299,10 +307,11 @@ func (rb *routerBase) Start(ctx context.Context, wg *sync.WaitGroup, ctxCancel c
 	wg.Add(len(rb.outputs))
 	for i := range rb.outputs {
 		go func(ctx context.Context, rb *routerBase, ro *routerOutput, wg *sync.WaitGroup) {
-			var span opentracing.Span
+			var span *tracing.Span
 			if rb.statsCollectionEnabled {
 				ctx, span = execinfra.ProcessorSpan(ctx, "router output")
 				span.SetTag(execinfrapb.StreamIDTagKey, ro.streamID)
+				ro.stats.Inputs = make([]execinfrapb.InputStats, 1)
 			}
 
 			drain := false
@@ -350,7 +359,7 @@ func (rb *routerBase) Start(ctx context.Context, wg *sync.WaitGroup, ctxCancel c
 						}
 						<-rb.semaphore
 						if rb.statsCollectionEnabled {
-							ro.stats.NumRows += int64(len(rows))
+							ro.stats.Inputs[0].NumTuples.Add(int64(len(rows)))
 						}
 						ro.mu.Lock()
 						ro.mu.streamStatus = streamStatus
@@ -361,10 +370,10 @@ func (rb *routerBase) Start(ctx context.Context, wg *sync.WaitGroup, ctxCancel c
 				// No rows or metadata buffered; see if the producer is done.
 				if ro.mu.producerDone {
 					if rb.statsCollectionEnabled {
-						ro.stats.MaxAllocatedMem = ro.memoryMonitor.MaximumBytes()
-						ro.stats.MaxAllocatedDisk = ro.diskMonitor.MaximumBytes()
-						tracing.SetSpanStats(span, &ro.stats)
-						tracing.FinishSpan(span)
+						ro.stats.Exec.MaxAllocatedMem.Set(uint64(ro.memoryMonitor.MaximumBytes()))
+						ro.stats.Exec.MaxAllocatedDisk.Set(uint64(ro.diskMonitor.MaximumBytes()))
+						span.SetSpanStats(&ro.stats)
+						span.Finish()
 						if trace := execinfra.GetTraceData(ctx); trace != nil {
 							ro.mu.Unlock()
 							rb.semaphore <- struct{}{}
@@ -439,6 +448,7 @@ func (rb *routerBase) updateStreamState(
 func (rb *routerBase) fwdMetadata(meta *execinfrapb.ProducerMetadata) {
 	if meta == nil {
 		log.Fatalf(context.TODO(), "asked to fwd empty metadata")
+		return
 	}
 
 	rb.semaphore <- struct{}{}
@@ -756,34 +766,4 @@ func (rr *rangeRouter) spanForData(data []byte) int {
 		return -1
 	}
 	return int(rr.spans[i].Stream)
-}
-
-const routerOutputTagPrefix = "routeroutput."
-
-// Stats implements the SpanStats interface.
-func (ros *RouterOutputStats) Stats() map[string]string {
-	statsMap := make(map[string]string)
-	statsMap[routerOutputTagPrefix+"rows_routed"] = strconv.FormatInt(ros.NumRows, 10)
-	statsMap[routerOutputTagPrefix+rowexec.MaxMemoryTagSuffix] = strconv.FormatInt(ros.MaxAllocatedMem, 10)
-	statsMap[routerOutputTagPrefix+rowexec.MaxDiskTagSuffix] = strconv.FormatInt(ros.MaxAllocatedDisk, 10)
-	return statsMap
-}
-
-// StatsForQueryPlan implements the DistSQLSpanStats interface.
-func (ros *RouterOutputStats) StatsForQueryPlan() []string {
-	stats := []string{
-		fmt.Sprintf("rows routed: %d", ros.NumRows),
-	}
-
-	if ros.MaxAllocatedMem != 0 {
-		stats = append(stats,
-			fmt.Sprintf("%s: %d", rowexec.MaxMemoryQueryPlanSuffix, ros.MaxAllocatedMem))
-	}
-
-	if ros.MaxAllocatedDisk != 0 {
-		stats = append(stats,
-			fmt.Sprintf("%s: %d", rowexec.MaxDiskQueryPlanSuffix, ros.MaxAllocatedDisk))
-	}
-
-	return stats
 }

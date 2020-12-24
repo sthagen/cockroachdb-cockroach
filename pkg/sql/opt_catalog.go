@@ -595,6 +595,8 @@ type optTable struct {
 	// one family.
 	families []optFamily
 
+	uniqueConstraints []optUniqueConstraint
+
 	outboundFKs []optForeignKeyConstraint
 	inboundFKs  []optForeignKeyConstraint
 
@@ -605,7 +607,7 @@ type optTable struct {
 
 	// colMap is a mapping from unique ColumnID to column ordinal within the
 	// table. This is a common lookup that needs to be fast.
-	colMap map[descpb.ColumnID]int
+	colMap catalog.TableColMap
 }
 
 var _ cat.Table = &optTable{}
@@ -637,30 +639,44 @@ func newOptTable(
 	ot.columns = make([]cat.Column, len(colDescs), numCols)
 	numOrdinary := len(ot.desc.Columns)
 	numWritable := len(ot.desc.WritableColumns())
-	for i := range colDescs {
-		desc := colDescs[i]
+	for ordinal := range colDescs {
+		desc := colDescs[ordinal]
 
 		var kind cat.ColumnKind
 		switch {
-		case i < numOrdinary:
+		case ordinal < numOrdinary:
 			kind = cat.Ordinary
-		case i < numWritable:
+		case ordinal < numWritable:
 			kind = cat.WriteOnly
 		default:
 			kind = cat.DeleteOnly
 		}
-
-		ot.columns[i].InitNonVirtual(
-			i,
-			cat.StableID(desc.ID),
-			tree.Name(desc.Name),
-			kind,
-			desc.Type,
-			desc.Nullable,
-			desc.Hidden,
-			desc.DefaultExpr,
-			desc.ComputeExpr,
-		)
+		if !desc.Virtual {
+			ot.columns[ordinal].InitNonVirtual(
+				ordinal,
+				cat.StableID(desc.ID),
+				tree.Name(desc.Name),
+				kind,
+				desc.Type,
+				desc.Nullable,
+				desc.Hidden,
+				desc.DefaultExpr,
+				desc.ComputeExpr,
+			)
+		} else {
+			if kind != cat.Ordinary {
+				return nil, errors.AssertionFailedf("virtual mutation column")
+			}
+			ot.columns[ordinal].InitVirtualComputed(
+				ordinal,
+				cat.StableID(desc.ID),
+				tree.Name(desc.Name),
+				desc.Type,
+				desc.Nullable,
+				desc.Hidden,
+				*desc.ComputeExpr,
+			)
+		}
 	}
 
 	newColumn := func() (col *cat.Column, ordinal int) {
@@ -676,7 +692,7 @@ func newOptTable(
 	// table has a column with this name for some reason.
 	for i := range colinfo.AllSystemColumnDescs {
 		sysCol := &colinfo.AllSystemColumnDescs[i]
-		if _, _, err := desc.FindColumnByName(tree.Name(sysCol.Name)); err != nil {
+		if c, _ := desc.HasColumnWithName(tree.Name(sysCol.Name)); c == nil {
 			col, ord := newColumn()
 			col.InitNonVirtual(
 				ord,
@@ -693,9 +709,8 @@ func newOptTable(
 	}
 
 	// Create the table's column mapping from descpb.ColumnID to column ordinal.
-	ot.colMap = make(map[descpb.ColumnID]int, ot.ColumnCount())
 	for i := range ot.columns {
-		ot.colMap[descpb.ColumnID(ot.columns[i].ColID())] = i
+		ot.colMap.Set(descpb.ColumnID(ot.columns[i].ColID()), i)
 	}
 
 	// Build the indexes.
@@ -704,7 +719,7 @@ func newOptTable(
 	for i := range ot.indexes {
 		var idxDesc *descpb.IndexDescriptor
 		if i == 0 {
-			idxDesc = &desc.PrimaryIndex
+			idxDesc = desc.GetPrimaryIndex()
 		} else {
 			idxDesc = &secondaryIndexes[i-1]
 		}
@@ -722,11 +737,12 @@ func newOptTable(
 			}
 		}
 		if idxDesc.Type == descpb.IndexDescriptor_INVERTED {
-			// The first column of an inverted index is special: in the descriptors,
-			// it looks as if the table column is part of the index; in fact the key
-			// contains values *derived* from that column. In the catalog, we refer to
-			// this key as a separate, virtual column.
-			invertedSourceColOrdinal, _ := ot.lookupColumnOrdinal(idxDesc.ColumnIDs[0])
+			// The last column of an inverted index is special: in the
+			// descriptors, it looks as if the table column is part of the
+			// index; in fact the key contains values *derived* from that
+			// column. In the catalog, we refer to this key as a separate,
+			// virtual column.
+			invertedSourceColOrdinal, _ := ot.lookupColumnOrdinal(idxDesc.ColumnIDs[len(idxDesc.ColumnIDs)-1])
 
 			// Add a virtual column that refers to the inverted index key.
 			virtualCol, virtualColOrd := newColumn()
@@ -748,6 +764,18 @@ func newOptTable(
 		} else {
 			ot.indexes[i].init(ot, i, idxDesc, idxZone, -1 /* virtualColOrd */)
 		}
+	}
+
+	ot.uniqueConstraints = make([]optUniqueConstraint, 0, len(ot.desc.UniqueWithoutIndexConstraints))
+	for i := range ot.desc.UniqueWithoutIndexConstraints {
+		u := &ot.desc.UniqueWithoutIndexConstraints[i]
+		ot.uniqueConstraints = append(ot.uniqueConstraints, optUniqueConstraint{
+			name:         u.Name,
+			table:        ot.ID(),
+			columns:      u.ColumnIDs,
+			withoutIndex: true,
+			validity:     u.Validity,
+		})
 	}
 
 	for i := range ot.desc.OutboundFKs {
@@ -965,7 +993,7 @@ func (ot *optTable) getColDesc(i int) *descpb.ColumnDescriptor {
 // IndexCount is part of the cat.Table interface.
 func (ot *optTable) IndexCount() int {
 	// Primary index is always present, so count is always >= 1.
-	return 1 + len(ot.desc.Indexes)
+	return 1 + len(ot.desc.GetPublicNonPrimaryIndexes())
 }
 
 // WritableIndexCount is part of the cat.Table interface.
@@ -1038,10 +1066,20 @@ func (ot *optTable) InboundForeignKey(i int) cat.ForeignKeyConstraint {
 	return &ot.inboundFKs[i]
 }
 
+// UniqueCount is part of the cat.Table interface.
+func (ot *optTable) UniqueCount() int {
+	return len(ot.uniqueConstraints)
+}
+
+// Unique is part of the cat.Table interface.
+func (ot *optTable) Unique(i int) cat.UniqueConstraint {
+	return &ot.uniqueConstraints[i]
+}
+
 // lookupColumnOrdinal returns the ordinal of the column with the given ID. A
 // cache makes the lookup O(1).
 func (ot *optTable) lookupColumnOrdinal(colID descpb.ColumnID) (int, error) {
-	col, ok := ot.colMap[colID]
+	col, ok := ot.colMap.Get(colID)
 	if ok {
 		return col, nil
 	}
@@ -1087,7 +1125,7 @@ func (oi *optIndex) init(
 	oi.zone = zone
 	oi.indexOrdinal = indexOrdinal
 	oi.invertedVirtualColOrd = invertedVirtualColOrd
-	if desc == &tab.desc.PrimaryIndex {
+	if desc == tab.desc.GetPrimaryIndex() {
 		// Although the primary index contains all columns in the table, the index
 		// descriptor does not contain columns that are not explicitly part of the
 		// primary key. Retrieve those columns from the table descriptor.
@@ -1097,12 +1135,13 @@ func (oi *optIndex) init(
 			pkCols.Add(int(desc.ColumnIDs[i]))
 		}
 		for i, n := 0, tab.ColumnCount(); i < n; i++ {
-			id := tab.Column(i).ColID()
-			if !pkCols.Contains(int(id)) {
-				oi.storedCols = append(oi.storedCols, descpb.ColumnID(id))
+			if col := tab.Column(i); col.Kind() != cat.VirtualInverted && !col.IsVirtualComputed() {
+				if id := col.ColID(); !pkCols.Contains(int(id)) {
+					oi.storedCols = append(oi.storedCols, descpb.ColumnID(id))
+				}
 			}
 		}
-		oi.numCols = tab.ColumnCount()
+		oi.numCols = len(desc.ColumnIDs) + len(oi.storedCols)
 	} else {
 		oi.storedCols = desc.StoreColumnIDs
 		oi.numCols = len(desc.ColumnIDs) + len(desc.ExtraColumnIDs) + len(desc.StoreColumnIDs)
@@ -1174,12 +1213,20 @@ func (oi *optIndex) LaxKeyColumnCount() int {
 	return oi.numLaxKeyCols
 }
 
+// NonInvertedPrefixColumnCount is part of the cat.Index interface.
+func (oi *optIndex) NonInvertedPrefixColumnCount() int {
+	if !oi.IsInverted() {
+		panic("non-inverted indexes do not have inverted prefix columns")
+	}
+	return len(oi.desc.ColumnIDs) - 1
+}
+
 // Column is part of the cat.Index interface.
 func (oi *optIndex) Column(i int) cat.IndexColumn {
 	length := len(oi.desc.ColumnIDs)
 	if i < length {
 		ord := 0
-		if i == 0 && oi.invertedVirtualColOrd != -1 {
+		if oi.IsInverted() && i == length-1 {
 			ord = oi.invertedVirtualColOrd
 		} else {
 			ord, _ = oi.tab.lookupColumnOrdinal(oi.desc.ColumnIDs[i])
@@ -1205,7 +1252,7 @@ func (oi *optIndex) Column(i int) cat.IndexColumn {
 // VirtualInvertedColumn is part of the cat.Index interface.
 func (oi *optIndex) VirtualInvertedColumn() cat.IndexColumn {
 	if !oi.IsInverted() {
-		panic("non-inverted indexes do not have inverted virtual columns")
+		panic(errors.AssertionFailedf("non-inverted indexes do not have inverted virtual columns"))
 	}
 	ord := len(oi.desc.ColumnIDs) - 1
 	return oi.Column(ord)
@@ -1300,6 +1347,11 @@ func (oi *optIndex) GeoConfig() *geoindex.Config {
 	return &oi.desc.GeoConfig
 }
 
+// Version is part of the cat.Index interface.
+func (oi *optIndex) Version() descpb.IndexDescriptorVersion {
+	return oi.desc.Version
+}
+
 type optTableStat struct {
 	stat           *stats.TableStatistic
 	columnOrdinals []int
@@ -1312,7 +1364,7 @@ func (os *optTableStat) init(tab *optTable, stat *stats.TableStatistic) (ok bool
 	os.columnOrdinals = make([]int, len(stat.ColumnIDs))
 	for i, c := range stat.ColumnIDs {
 		var ok bool
-		os.columnOrdinals[i], ok = tab.colMap[c]
+		os.columnOrdinals[i], ok = tab.colMap.Get(c)
 		if !ok {
 			// Column not in table (this is possible if the column was removed since
 			// the statistic was calculated).
@@ -1412,6 +1464,58 @@ func (oi *optFamily) Column(i int) cat.FamilyColumn {
 // Table is part of the cat.Family interface.
 func (oi *optFamily) Table() cat.Table {
 	return oi.tab
+}
+
+// optUniqueConstraint implements cat.UniqueConstraint and represents a
+// unique constraint.
+type optUniqueConstraint struct {
+	name string
+
+	table   cat.StableID
+	columns []descpb.ColumnID
+
+	withoutIndex bool
+	validity     descpb.ConstraintValidity
+}
+
+var _ cat.UniqueConstraint = &optUniqueConstraint{}
+
+// Name is part of the cat.UniqueConstraint interface.
+func (u *optUniqueConstraint) Name() string {
+	return u.name
+}
+
+// TableID is part of the cat.UniqueConstraint interface.
+func (u *optUniqueConstraint) TableID() cat.StableID {
+	return u.table
+}
+
+// ColumnCount is part of the cat.UniqueConstraint interface.
+func (u *optUniqueConstraint) ColumnCount() int {
+	return len(u.columns)
+}
+
+// ColumnOrdinal is part of the cat.UniqueConstraint interface.
+func (u *optUniqueConstraint) ColumnOrdinal(tab cat.Table, i int) int {
+	if tab.ID() != u.table {
+		panic(errors.AssertionFailedf(
+			"invalid table %d passed to ColumnOrdinal (expected %d)",
+			tab.ID(), u.table,
+		))
+	}
+	optTab := tab.(*optTable)
+	ord, _ := optTab.lookupColumnOrdinal(u.columns[i])
+	return ord
+}
+
+// WithoutIndex is part of the cat.UniqueConstraint interface.
+func (u *optUniqueConstraint) WithoutIndex() bool {
+	return u.withoutIndex
+}
+
+// Validated is part of the cat.UniqueConstraint interface.
+func (u *optUniqueConstraint) Validated() bool {
+	return u.validity == descpb.ConstraintValidity_Validated
 }
 
 // optForeignKeyConstraint implements cat.ForeignKeyConstraint and represents a
@@ -1537,7 +1641,7 @@ type optVirtualTable struct {
 
 	// colMap is a mapping from unique ColumnID to column ordinal within the
 	// table. This is a common lookup that needs to be fast.
-	colMap map[descpb.ColumnID]int
+	colMap catalog.TableColMap
 }
 
 var _ cat.Table = &optVirtualTable{}
@@ -1606,9 +1710,8 @@ func newOptVirtualTable(
 	}
 
 	// Create the table's column mapping from descpb.ColumnID to column ordinal.
-	ot.colMap = make(map[descpb.ColumnID]int, ot.ColumnCount())
 	for i := range ot.columns {
-		ot.colMap[descpb.ColumnID(ot.columns[i].ColID())] = i
+		ot.colMap.Set(descpb.ColumnID(ot.columns[i].ColID()), i)
 	}
 
 	ot.name.ExplicitSchema = true
@@ -1618,7 +1721,7 @@ func newOptVirtualTable(
 
 	// Build the indexes (add 1 to account for lack of primary index in
 	// indexes slice).
-	ot.indexes = make([]optVirtualIndex, 1+len(ot.desc.Indexes))
+	ot.indexes = make([]optVirtualIndex, 1+len(ot.desc.GetPublicNonPrimaryIndexes()))
 	// Set up the primary index.
 	ot.indexes[0] = optVirtualIndex{
 		tab:          ot,
@@ -1631,13 +1734,13 @@ func newOptVirtualTable(
 		},
 	}
 
-	for i := range ot.desc.Indexes {
-		idxDesc := &ot.desc.Indexes[i]
+	for i := range ot.desc.GetPublicNonPrimaryIndexes() {
+		idxDesc := &ot.desc.GetPublicNonPrimaryIndexes()[i]
 		if len(idxDesc.ColumnIDs) > 1 {
-			panic("virtual indexes with more than 1 col not supported")
+			panic(errors.AssertionFailedf("virtual indexes with more than 1 col not supported"))
 		}
 
-		// Add 1, since the 0th index will the the primary that we added above.
+		// Add 1, since the 0th index will the primary that we added above.
 		ot.indexes[i+1] = optVirtualIndex{
 			tab:          ot,
 			desc:         idxDesc,
@@ -1713,7 +1816,7 @@ func (ot *optVirtualTable) getColDesc(i int) *descpb.ColumnDescriptor {
 // IndexCount is part of the cat.Table interface.
 func (ot *optVirtualTable) IndexCount() int {
 	// Primary index is always present, so count is always >= 1.
-	return 1 + len(ot.desc.Indexes)
+	return 1 + len(ot.desc.GetPublicNonPrimaryIndexes())
 }
 
 // WritableIndexCount is part of the cat.Table interface.
@@ -1740,7 +1843,7 @@ func (ot *optVirtualTable) StatisticCount() int {
 
 // Statistic is part of the cat.Table interface.
 func (ot *optVirtualTable) Statistic(i int) cat.TableStatistic {
-	panic("no stats")
+	panic(errors.AssertionFailedf("no stats"))
 }
 
 // CheckCount is part of the cat.Table interface.
@@ -1774,7 +1877,7 @@ func (ot *optVirtualTable) OutboundForeignKeyCount() int {
 
 // OutboundForeignKeyCount is part of the cat.Table interface.
 func (ot *optVirtualTable) OutboundForeignKey(i int) cat.ForeignKeyConstraint {
-	panic("no FKs")
+	panic(errors.AssertionFailedf("no FKs"))
 }
 
 // InboundForeignKeyCount is part of the cat.Table interface.
@@ -1784,7 +1887,17 @@ func (ot *optVirtualTable) InboundForeignKeyCount() int {
 
 // InboundForeignKey is part of the cat.Table interface.
 func (ot *optVirtualTable) InboundForeignKey(i int) cat.ForeignKeyConstraint {
-	panic("no FKs")
+	panic(errors.AssertionFailedf("no FKs"))
+}
+
+// UniqueCount is part of the cat.Table interface.
+func (ot *optVirtualTable) UniqueCount() int {
+	return 0
+}
+
+// Unique is part of the cat.Table interface.
+func (ot *optVirtualTable) Unique(i int) cat.UniqueConstraint {
+	panic(errors.AssertionFailedf("no unique constraints"))
 }
 
 // optVirtualIndex is a dummy implementation of cat.Index for the indexes
@@ -1846,10 +1959,15 @@ func (oi *optVirtualIndex) LaxKeyColumnCount() int {
 	return 2
 }
 
+// NonInvertedPrefixColumnCount is part of the cat.Index interface.
+func (oi *optVirtualIndex) NonInvertedPrefixColumnCount() int {
+	panic("virtual indexes are not inverted")
+}
+
 // lookupColumnOrdinal returns the ordinal of the column with the given ID. A
 // cache makes the lookup O(1).
 func (ot *optVirtualTable) lookupColumnOrdinal(colID descpb.ColumnID) (int, error) {
-	col, ok := ot.colMap[colID]
+	col, ok := ot.colMap.Get(colID)
 	if ok {
 		return col, nil
 	}
@@ -1882,7 +2000,7 @@ func (oi *optVirtualIndex) Column(i int) cat.IndexColumn {
 
 // VirtualInvertedColumn is part of the cat.Index interface.
 func (oi *optVirtualIndex) VirtualInvertedColumn() cat.IndexColumn {
-	panic("virtual indexes do not have inverted virtual columns")
+	panic(errors.AssertionFailedf("virtual indexes are not inverted"))
 }
 
 // Predicate is part of the cat.Index interface.
@@ -1892,12 +2010,12 @@ func (oi *optVirtualIndex) Predicate() (string, bool) {
 
 // Zone is part of the cat.Index interface.
 func (oi *optVirtualIndex) Zone() cat.Zone {
-	panic("no zone")
+	panic(errors.AssertionFailedf("no zone"))
 }
 
 // Span is part of the cat.Index interface.
 func (oi *optVirtualIndex) Span() roachpb.Span {
-	panic("no span")
+	panic(errors.AssertionFailedf("no span"))
 }
 
 // Table is part of the cat.Index interface.
@@ -1922,7 +2040,7 @@ func (oi *optVirtualIndex) InterleaveAncestorCount() int {
 
 // InterleaveAncestor is part of the cat.Index interface.
 func (oi *optVirtualIndex) InterleaveAncestor(i int) (table, index cat.StableID, numKeyCols int) {
-	panic("no interleavings")
+	panic(errors.AssertionFailedf("no interleavings"))
 }
 
 // InterleavedByCount is part of the cat.Index interface.
@@ -1932,12 +2050,17 @@ func (oi *optVirtualIndex) InterleavedByCount() int {
 
 // InterleavedBy is part of the cat.Index interface.
 func (oi *optVirtualIndex) InterleavedBy(i int) (table, index cat.StableID) {
-	panic("no interleavings")
+	panic(errors.AssertionFailedf("no interleavings"))
 }
 
 // GeoConfig is part of the cat.Index interface.
 func (oi *optVirtualIndex) GeoConfig() *geoindex.Config {
 	return nil
+}
+
+// Version is part of the cat.Index interface.
+func (oi *optVirtualIndex) Version() descpb.IndexDescriptorVersion {
+	return 0
 }
 
 // optVirtualFamily is a dummy implementation of cat.Family for the only family

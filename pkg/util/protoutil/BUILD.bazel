@@ -1,0 +1,37 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "protoutil",
+    srcs = [
+        "clone.go",
+        "clone.pb.go",
+        "jsonpb_marshal.go",
+        "marshal.go",
+        "marshaler.go",
+    ],
+    importpath = "github.com/cockroachdb/cockroach/pkg/util/protoutil",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/util/syncutil",
+        "//pkg/util/uuid",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_gogo_protobuf//jsonpb",
+        "@com_github_gogo_protobuf//proto",
+        "@com_github_grpc_ecosystem_grpc_gateway//runtime:go_default_library",
+    ],
+)
+
+go_test(
+    name = "protoutil_test",
+    srcs = ["clone_test.go"],
+    deps = [
+        ":protoutil",
+        "//pkg/config/zonepb",
+        "//pkg/gossip",
+        "//pkg/kv/kvserver/kvserverpb",
+        "//pkg/roachpb",
+        "//pkg/sql/catalog/descpb",
+        "//pkg/storage/enginepb",
+        "@com_github_gogo_protobuf//proto",
+    ],
+)

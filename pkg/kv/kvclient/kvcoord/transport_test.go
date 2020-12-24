@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	opentracing "github.com/opentracing/opentracing-go"
 	"google.golang.org/grpc"
 )
 
@@ -98,7 +97,7 @@ func TestTransportMoveToFront(t *testing.T) {
 }
 
 // TestSpanImport tests that the gRPC transport ingests trace information that
-// came from gRPC responses (through the "snowball tracing" mechanism).
+// came from gRPC responses (via tracingpb.RecordedSpan on the batch responses).
 func TestSpanImport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -117,7 +116,7 @@ func TestSpanImport(t *testing.T) {
 	recCtx, getRec, cancel := tracing.ContextWithRecordingSpan(ctx, "test")
 	defer cancel()
 
-	server.tr = opentracing.SpanFromContext(recCtx).Tracer().(*tracing.Tracer)
+	server.tr = tracing.SpanFromContext(recCtx).Tracer()
 
 	br, err := gt.sendBatch(recCtx, roachpb.NodeID(1), &server, roachpb.BatchRequest{})
 	if err != nil {
@@ -141,19 +140,25 @@ type mockInternalClient struct {
 
 var _ roachpb.InternalClient = &mockInternalClient{}
 
+func (*mockInternalClient) ResetQuorum(
+	context.Context, *roachpb.ResetQuorumRequest, ...grpc.CallOption,
+) (*roachpb.ResetQuorumResponse, error) {
+	panic("unimplemented")
+}
+
 // Batch is part of the roachpb.InternalClient interface.
 func (m *mockInternalClient) Batch(
 	ctx context.Context, in *roachpb.BatchRequest, opts ...grpc.CallOption,
 ) (*roachpb.BatchResponse, error) {
-	sp := m.tr.StartRootSpan("mock", nil /* logTags */, tracing.RecordableSpan)
+	sp := m.tr.StartSpan("mock", tracing.WithForceRealSpan())
 	defer sp.Finish()
-	tracing.StartRecording(sp, tracing.SnowballRecording)
-	ctx = opentracing.ContextWithSpan(ctx, sp)
+	sp.SetVerbose(true)
+	ctx = tracing.ContextWithSpan(ctx, sp)
 
 	log.Eventf(ctx, "mockInternalClient processing batch")
 	br := &roachpb.BatchResponse{}
 	br.Error = m.pErr
-	if rec := tracing.GetRecording(sp); rec != nil {
+	if rec := sp.GetRecording(); rec != nil {
 		br.CollectedSpans = append(br.CollectedSpans, rec...)
 	}
 	return br, nil

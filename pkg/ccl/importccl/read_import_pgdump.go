@@ -15,7 +15,9 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -31,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -93,13 +96,14 @@ func (p *postgreStream) Next() (interface{}, error) {
 
 	for p.s.Scan() {
 		t := p.s.Text()
+		// Regardless if we can parse the statement, check that it's not something
+		// we want to ignore.
+		if isIgnoredStatement(t) {
+			continue
+		}
+
 		stmts, err := parser.Parse(t)
 		if err != nil {
-			// Something non-parseable may be something we don't yet parse but still
-			// want to ignore.
-			if isIgnoredStatement(t) {
-				continue
-			}
 			return nil, err
 		}
 		switch len(stmts) {
@@ -219,12 +223,13 @@ func readPostgresCreateTable(
 	ctx context.Context,
 	input io.Reader,
 	evalCtx *tree.EvalContext,
-	p sql.PlanHookState,
+	p sql.JobExecContext,
 	match string,
 	parentID descpb.ID,
 	walltime int64,
 	fks fkHandler,
 	max int,
+	owner security.SQLUsername,
 ) ([]*tabledesc.Mutable, error) {
 	// Modify the CreateTable stmt with the various index additions. We do this
 	// instead of creating a full table descriptor first and adding indexes
@@ -236,15 +241,10 @@ func readPostgresCreateTable(
 	createSeq := make(map[string]*tree.CreateSequence)
 	tableFKs := make(map[string][]*tree.ForeignKeyConstraintTableDef)
 	ps := newPostgreStream(input, max)
-	params := p.RunParams(ctx)
 	for {
 		stmt, err := ps.Next()
 		if err == io.EOF {
 			ret := make([]*tabledesc.Mutable, 0, len(createTbl))
-			owner := security.AdminRole
-			if params.SessionData() != nil {
-				owner = params.SessionData().User
-			}
 			for name, seq := range createSeq {
 				id := descpb.ID(int(defaultCSVTableID) + len(ret))
 				desc, err := sql.NewSequenceTableDesc(
@@ -257,7 +257,7 @@ func readPostgresCreateTable(
 					hlc.Timestamp{WallTime: walltime},
 					descpb.NewDefaultPrivilegeDescriptor(owner),
 					tree.PersistencePermanent,
-					&params,
+					nil, /* params */
 				)
 				if err != nil {
 					return nil, err
@@ -311,7 +311,7 @@ func readPostgresCreateTable(
 		if err != nil {
 			return nil, errors.Wrap(err, "postgres parse error")
 		}
-		if err := readPostgresStmt(ctx, evalCtx, match, fks, createTbl, createSeq, tableFKs, stmt); err != nil {
+		if err := readPostgresStmt(ctx, evalCtx, match, fks, createTbl, createSeq, tableFKs, stmt, p, parentID); err != nil {
 			return nil, err
 		}
 	}
@@ -326,6 +326,8 @@ func readPostgresStmt(
 	createSeq map[string]*tree.CreateSequence,
 	tableFKs map[string][]*tree.ForeignKeyConstraintTableDef,
 	stmt interface{},
+	p sql.JobExecContext,
+	parentID descpb.ID,
 ) error {
 	switch stmt := stmt.(type) {
 	case *tree.CreateTable:
@@ -492,7 +494,7 @@ func readPostgresStmt(
 					for _, fnStmt := range fnStmts {
 						switch ast := fnStmt.AST.(type) {
 						case *tree.AlterTable:
-							if err := readPostgresStmt(ctx, evalCtx, match, fks, createTbl, createSeq, tableFKs, ast); err != nil {
+							if err := readPostgresStmt(ctx, evalCtx, match, fks, createTbl, createSeq, tableFKs, ast, p, parentID); err != nil {
 								return err
 							}
 						default:
@@ -506,6 +508,32 @@ func readPostgresStmt(
 			}
 		default:
 			return errors.Errorf("unsupported %T SELECT: %s", sel, sel)
+		}
+	case *tree.DropTable:
+		names := stmt.Names
+
+		// If we find a table with the same name in the target DB we are importing
+		// into and same public schema, then we throw an error telling the user to
+		// drop the conflicting existing table to proceed.
+		// Otherwise, we silently ignore the drop statement and continue with the import.
+		for _, name := range names {
+			tableName := name.ToUnresolvedObjectName().String()
+			if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				err := backupccl.CheckObjectExists(
+					ctx,
+					txn,
+					p.ExecCfg().Codec,
+					parentID,
+					keys.PublicSchemaID,
+					tableName,
+				)
+				if err != nil {
+					return errors.Wrapf(err, `drop table "%s" and then retry the import`, tableName)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
 		}
 	case *tree.BeginTransaction, *tree.CommitTransaction:
 		// ignore txns.
@@ -555,6 +583,7 @@ type pgDumpReader struct {
 	opts       roachpb.PgDumpOptions
 	walltime   int64
 	colMap     map[*row.DatumRowConverter](map[string]int)
+	evalCtx    *tree.EvalContext
 }
 
 var _ inputConverter = &pgDumpReader{}
@@ -582,7 +611,8 @@ func newPgDumpReader(
 			for i, col := range tableDesc.VisibleColumns() {
 				colSubMap[col.Name] = i
 			}
-			conv, err := row.NewDatumRowConverter(ctx, tableDesc, targetCols, evalCtx, kvCh)
+			conv, err := row.NewDatumRowConverter(ctx, tableDesc, targetCols, evalCtx, kvCh,
+				nil /* seqChunkProvider */)
 			if err != nil {
 				return nil, err
 			}
@@ -602,6 +632,7 @@ func newPgDumpReader(
 		opts:       opts,
 		walltime:   walltime,
 		colMap:     colMap,
+		evalCtx:    evalCtx,
 	}, nil
 }
 
@@ -614,7 +645,7 @@ func (m *pgDumpReader) readFiles(
 	resumePos map[int32]int64,
 	format roachpb.IOFileFormat,
 	makeExternalStorage cloud.ExternalStorageFactory,
-	user string,
+	user security.SQLUsername,
 ) error {
 	return readInputFiles(ctx, dataFiles, resumePos, format, m.readFile, makeExternalStorage, user)
 }
@@ -622,7 +653,9 @@ func (m *pgDumpReader) readFiles(
 func (m *pgDumpReader) readFile(
 	ctx context.Context, input *fileReader, inputIdx int32, resumePos int64, rejected chan string,
 ) error {
+	tableNameToRowsProcessed := make(map[string]int64)
 	var inserts, count int64
+	rowLimit := m.opts.RowLimit
 	ps := newPostgreStream(input, int(m.opts.MaxRowSize))
 	semaCtx := tree.MakeSemaContext()
 	for _, conv := range m.tables {
@@ -675,21 +708,33 @@ func (m *pgDumpReader) readFile(
 			var targetColMapIdx []int
 			if len(i.Columns) != 0 {
 				targetColMapIdx = make([]int, len(i.Columns))
-				conv.IsTargetCol = make(map[int]struct{}, len(i.Columns))
+				conv.TargetColOrds = util.FastIntSet{}
 				for j := range i.Columns {
 					colName := string(i.Columns[j])
 					idx, ok := m.colMap[conv][colName]
 					if !ok {
 						return errors.Newf("targeted column %q not found", colName)
 					}
-					conv.IsTargetCol[idx] = struct{}{}
+					conv.TargetColOrds.Add(idx)
 					targetColMapIdx[j] = idx
+				}
+				// For any missing columns, fill those to NULL.
+				// These will get filled in with the correct default / computed expression
+				// provided conv.IsTargetCol is not set for the given column index.
+				for idx := range conv.VisibleCols {
+					if !conv.TargetColOrds.Contains(idx) {
+						conv.Datums[idx] = tree.DNull
+					}
 				}
 			}
 			for _, tuple := range values.Rows {
 				count++
+				tableNameToRowsProcessed[name]++
 				if count <= resumePos {
 					continue
+				}
+				if rowLimit != 0 && tableNameToRowsProcessed[name] > rowLimit {
+					break
 				}
 				if got := len(tuple); expectedColLen != got {
 					return errors.Errorf("expected %d values, got %d: %v", expectedColLen, got, tuple)
@@ -730,14 +775,14 @@ func (m *pgDumpReader) readFile(
 			var targetColMapIdx []int
 			if conv != nil {
 				targetColMapIdx = make([]int, len(i.Columns))
-				conv.IsTargetCol = make(map[int]struct{}, len(i.Columns))
+				conv.TargetColOrds = util.FastIntSet{}
 				for j := range i.Columns {
 					colName := string(i.Columns[j])
 					idx, ok := m.colMap[conv][colName]
 					if !ok {
 						return errors.Newf("targeted column %q not found", colName)
 					}
-					conv.IsTargetCol[idx] = struct{}{}
+					conv.TargetColOrds.Add(idx)
 					targetColMapIdx[j] = idx
 				}
 			}
@@ -752,6 +797,7 @@ func (m *pgDumpReader) readFile(
 					break
 				}
 				count++
+				tableNameToRowsProcessed[name]++
 				if err != nil {
 					return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 				}
@@ -763,9 +809,12 @@ func (m *pgDumpReader) readFile(
 				}
 				switch row := row.(type) {
 				case copyData:
-					if expected, got := len(conv.IsTargetCol), len(row); expected != got {
+					if expected, got := conv.TargetColOrds.Len(), len(row); expected != got {
 						return makeRowErr("", count, pgcode.Syntax,
 							"expected %d values, got %d", expected, got)
+					}
+					if rowLimit != 0 && tableNameToRowsProcessed[name] > rowLimit {
+						break
 					}
 					for i, s := range row {
 						idx := targetColMapIdx[i]
@@ -848,7 +897,7 @@ func (m *pgDumpReader) readFile(
 				if seq == nil {
 					break
 				}
-				key, val, err := sql.MakeSequenceKeyVal(keys.TODOSQLCodec, seq, val, isCalled)
+				key, val, err := sql.MakeSequenceKeyVal(m.evalCtx.Codec, seq, val, isCalled)
 				if err != nil {
 					return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 				}
@@ -864,7 +913,7 @@ func (m *pgDumpReader) readFile(
 			}
 		case *tree.SetVar, *tree.BeginTransaction, *tree.CommitTransaction, *tree.Analyze:
 			// ignored.
-		case *tree.CreateTable, *tree.AlterTable, *tree.CreateIndex, *tree.CreateSequence:
+		case *tree.CreateTable, *tree.AlterTable, *tree.CreateIndex, *tree.CreateSequence, *tree.DropTable:
 			// handled during schema extraction.
 		case *tree.Delete:
 			switch stmt := i.Table.(type) {

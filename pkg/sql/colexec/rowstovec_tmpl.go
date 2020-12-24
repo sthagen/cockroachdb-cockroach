@@ -20,11 +20,24 @@
 package colexec
 
 import (
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ = typeconv.DatumVecCanonicalTypeFamily
+	_ apd.Context
+	_ duration.Duration
+	_ encoding.Direction
 )
 
 // {{/*
@@ -34,22 +47,35 @@ func _ROWS_TO_COL_VEC(
 ) { // */}}
 	// {{define "rowsToColVec" -}}
 	col := vec.TemplateType()
-	var v interface{}
-	for i := range rows {
-		row := rows[i]
-		if row[columnIdx].Datum == nil {
-			if err = row[columnIdx].EnsureDecoded(t, alloc); err != nil {
-				return
+	if len(rows) > 0 {
+		_ = col.Get(len(rows) - 1)
+		var v interface{}
+		for i := range rows {
+			row := rows[i]
+			if row[columnIdx].Datum == nil {
+				if err = row[columnIdx].EnsureDecoded(t, alloc); err != nil {
+					return
+				}
 			}
-		}
-		datum := row[columnIdx].Datum
-		if datum == tree.DNull {
-			vec.Nulls().SetNull(i)
-		} else {
-			_PRELUDE(datum)
-			v = _CONVERT(datum)
-			castV := v.(_GOTYPE)
-			_SET(col, i, castV)
+			datum := row[columnIdx].Datum
+			if datum == tree.DNull {
+				vec.Nulls().SetNull(i)
+			} else {
+				_PRELUDE(datum)
+				v = _CONVERT(datum)
+				castV := v.(_GOTYPE)
+				// {{if .Sliceable}}
+				// {{if not (eq .VecMethod "Decimal")}}
+				// {{/*
+				//     For some reason, decimal vectors - although sliceable -
+				//     still have bounds checks.
+				//     TODO(yuzefovich): figure it out.
+				// */}}
+				//gcassert:bce
+				// {{end}}
+				// {{end}}
+				_SET(col, i, castV)
+			}
 		}
 	}
 	// {{end}}

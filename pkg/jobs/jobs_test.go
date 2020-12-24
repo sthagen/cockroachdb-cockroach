@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -95,7 +96,7 @@ func (expected *expectation) verify(id *int64, expectedStatus jobs.Status) error
 		Description:   payload.Description,
 		Details:       details,
 		DescriptorIDs: payload.DescriptorIDs,
-		Username:      payload.Username,
+		Username:      payload.UsernameProto.Decode(),
 		Progress:      progressDetail,
 	}); !reflect.DeepEqual(e, a) {
 		diff := strings.Join(pretty.Diff(e, a), "\n")
@@ -885,9 +886,10 @@ func TestJobLifecycle(t *testing.T) {
 
 	t.Run("valid job lifecycles succeed", func(t *testing.T) {
 		// Woody is a successful job.
+		woodyPride, _ := security.MakeSQLUsernameFromUserInput("Woody Pride", security.UsernameValidation)
 		woodyJob, woodyExp := createJob(jobs.Record{
 			Description:   "There's a snake in my boot!",
-			Username:      "Woody Pride",
+			Username:      woodyPride,
 			DescriptorIDs: []descpb.ID{1, 2, 3},
 			Details:       jobspb.RestoreDetails{},
 			Progress:      jobspb.RestoreProgress{},
@@ -943,9 +945,10 @@ func TestJobLifecycle(t *testing.T) {
 		}
 
 		// Buzz fails after it starts running.
+		buzzL, _ := security.MakeSQLUsernameFromUserInput("Buzz Lightyear", security.UsernameValidation)
 		buzzRecord := jobs.Record{
 			Description:   "To infinity and beyond!",
-			Username:      "Buzz Lightyear",
+			Username:      buzzL,
 			DescriptorIDs: []descpb.ID{3, 2, 1},
 			Details:       jobspb.BackupDetails{},
 			Progress:      jobspb.BackupProgress{},
@@ -994,9 +997,10 @@ func TestJobLifecycle(t *testing.T) {
 		}
 
 		// Sid fails before it starts running.
+		sidP, _ := security.MakeSQLUsernameFromUserInput("Sid Phillips", security.UsernameValidation)
 		sidJob, sidExp := createJob(jobs.Record{
 			Description:   "The toys! The toys are alive!",
-			Username:      "Sid Phillips",
+			Username:      sidP,
 			DescriptorIDs: []descpb.ID{6, 6, 6},
 			Details:       jobspb.RestoreDetails{},
 			Progress:      jobspb.RestoreProgress{},
@@ -1422,7 +1426,7 @@ func TestShowJobs(t *testing.T) {
 		typ               string
 		status            string
 		description       string
-		username          string
+		username          security.SQLUsername
 		err               string
 		created           time.Time
 		started           time.Time
@@ -1440,7 +1444,7 @@ func TestShowJobs(t *testing.T) {
 			typ:         "SCHEMA CHANGE",
 			status:      "superfailed",
 			description: "failjob",
-			username:    "failure",
+			username:    security.MakeSQLUsernameFromPreNormalizedString("failure"),
 			err:         "boom",
 			// lib/pq returns time.Time objects with goofy locations, which breaks
 			// reflect.DeepEqual without this time.FixedZone song and dance.
@@ -1458,7 +1462,7 @@ func TestShowJobs(t *testing.T) {
 			typ:         "CHANGEFEED",
 			status:      "running",
 			description: "persistent feed",
-			username:    "persistent",
+			username:    security.MakeSQLUsernameFromPreNormalizedString("persistent"),
 			err:         "",
 			// lib/pq returns time.Time objects with goofy locations, which breaks
 			// reflect.DeepEqual without this time.FixedZone song and dance.
@@ -1482,7 +1486,7 @@ func TestShowJobs(t *testing.T) {
 				Description:    in.description,
 				StartedMicros:  in.started.UnixNano() / time.Microsecond.Nanoseconds(),
 				FinishedMicros: in.finished.UnixNano() / time.Microsecond.Nanoseconds(),
-				Username:       in.username,
+				UsernameProto:  in.username.EncodeProto(),
 				Lease: &jobspb.Lease{
 					NodeID: 7,
 				},
@@ -1496,7 +1500,7 @@ func TestShowJobs(t *testing.T) {
 			progress := &jobspb.Progress{
 				ModifiedMicros: in.modified.UnixNano() / time.Microsecond.Nanoseconds(),
 			}
-			if in.highWater != (hlc.Timestamp{}) {
+			if !in.highWater.IsEmpty() {
 				progress.Progress = &jobspb.Progress_HighWater{
 					HighWater: &in.highWater,
 				}
@@ -1517,14 +1521,16 @@ func TestShowJobs(t *testing.T) {
 			var out row
 			var maybeFractionCompleted *float32
 			var decimalHighWater *apd.Decimal
+			var resultUsername string
 			sqlDB.QueryRow(t, `
       SELECT job_id, job_type, status, created, description, started, finished, modified,
              fraction_completed, high_water_timestamp, user_name, ifnull(error, ''), coordinator_id
         FROM crdb_internal.jobs WHERE job_id = $1`, in.id).Scan(
 				&out.id, &out.typ, &out.status, &out.created, &out.description, &out.started,
-				&out.finished, &out.modified, &maybeFractionCompleted, &decimalHighWater, &out.username,
+				&out.finished, &out.modified, &maybeFractionCompleted, &decimalHighWater, &resultUsername,
 				&out.err, &out.coordinatorID,
 			)
+			out.username = security.MakeSQLUsernameFromPreNormalizedString(resultUsername)
 
 			if decimalHighWater != nil {
 				var err error
@@ -1588,8 +1594,8 @@ func TestShowAutomaticJobs(t *testing.T) {
 		// system.jobs is part proper SQL columns, part protobuf, so we can't use the
 		// row struct directly.
 		inPayload, err := protoutil.Marshal(&jobspb.Payload{
-			Username: security.RootUser,
-			Details:  jobspb.WrapPayloadDetails(in.details),
+			UsernameProto: security.RootUserName().EncodeProto(),
+			Details:       jobspb.WrapPayloadDetails(in.details),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -1675,7 +1681,7 @@ func TestShowJobsWithError(t *testing.T) {
 	}
 	if _, err := sqlDB.Exec(`
      -- Create a corrupted progress field.
-     INSERT INTO system.jobs(id, status, payload, progress) SELECT id+2, status, payload, '\xaaaa'::BYTES FROM system.jobs WHERE id = $1; 
+     INSERT INTO system.jobs(id, status, payload, progress) SELECT id+2, status, payload, '\xaaaa'::BYTES FROM system.jobs WHERE id = $1;
 	`, jobID); err != nil {
 		t.Fatal(err)
 	}
@@ -1807,7 +1813,7 @@ func TestShowJobWhenComplete(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
 	mockJob := jobs.Record{
-		Username: security.RootUser,
+		Username: security.RootUserName(),
 		Details:  jobspb.ImportDetails{},
 		Progress: jobspb.ImportProgress{},
 	}
@@ -1951,7 +1957,7 @@ func TestJobInTxn(t *testing.T) {
 	defer sql.ClearPlanHooks()
 	// Piggy back on BACKUP to be able to create a succeeding test job.
 	sql.AddPlanHook(
-		func(_ context.Context, stmt tree.Statement, phs sql.PlanHookState,
+		func(_ context.Context, stmt tree.Statement, execCtx sql.PlanHookState,
 		) (sql.PlanHookRowFn, colinfo.ResultColumns, []sql.PlanNode, bool, error) {
 			st, ok := stmt.(*tree.Backup)
 			if !ok {
@@ -1959,7 +1965,7 @@ func TestJobInTxn(t *testing.T) {
 			}
 			fn := func(_ context.Context, _ []sql.PlanNode, _ chan<- tree.Datums) error {
 				var err error
-				job, err = phs.ExtendedEvalContext().QueueJob(
+				job, err = execCtx.ExtendedEvalContext().QueueJob(
 					jobs.Record{
 						Description: st.String(),
 						Details:     jobspb.BackupDetails{},
@@ -1986,7 +1992,7 @@ func TestJobInTxn(t *testing.T) {
 	})
 	// Piggy back on RESTORE to be able to create a failing test job.
 	sql.AddPlanHook(
-		func(_ context.Context, stmt tree.Statement, phs sql.PlanHookState,
+		func(_ context.Context, stmt tree.Statement, execCtx sql.PlanHookState,
 		) (sql.PlanHookRowFn, colinfo.ResultColumns, []sql.PlanNode, bool, error) {
 			_, ok := stmt.(*tree.Restore)
 			if !ok {
@@ -1994,7 +2000,7 @@ func TestJobInTxn(t *testing.T) {
 			}
 			fn := func(_ context.Context, _ []sql.PlanNode, _ chan<- tree.Datums) error {
 				var err error
-				job, err = phs.ExtendedEvalContext().QueueJob(
+				job, err = execCtx.ExtendedEvalContext().QueueJob(
 					jobs.Record{
 						Description: "RESTORE",
 						Details:     jobspb.RestoreDetails{},
@@ -2151,9 +2157,10 @@ func TestStartableJob(t *testing.T) {
 			},
 		}
 	})
+	woodyP, _ := security.MakeSQLUsernameFromUserInput("Woody Pride", security.UsernameValidation)
 	rec := jobs.Record{
 		Description:   "There's a snake in my boot!",
-		Username:      "Woody Pride",
+		Username:      woodyP,
 		DescriptorIDs: []descpb.ID{1, 2, 3},
 		Details:       jobspb.RestoreDetails{},
 		Progress:      jobspb.RestoreProgress{},
@@ -2635,4 +2642,57 @@ func TestMetrics(t *testing.T) {
 			int64EqSoon(t, importMetrics.FailOrCancelFailed.Count, 0)
 		}
 	})
+}
+
+// TestLoseLeaseDuringExecution tests that it is safe to call update during
+// job execution when the job has lost its lease and that that update operation
+// will fail.
+//
+// This is a regression test for #58049.
+func TestLoseLeaseDuringExecution(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	defer jobs.ResetConstructors()()
+
+	// Disable the loops from messing with the job execution.
+	defer jobs.TestingSetAdoptAndCancelIntervals(time.Hour, time.Hour)()
+
+	ctx := context.Background()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	registry := s.JobRegistry().(*jobs.Registry)
+
+	// The default FormatVersion value in SchemaChangeDetails corresponds to a
+	// pre-20.1 job.
+	rec := jobs.Record{
+		DescriptorIDs: []descpb.ID{1},
+		Details:       jobspb.BackupDetails{},
+		Progress:      jobspb.BackupProgress{},
+	}
+
+	defer jobs.ResetConstructors()()
+	resumed := make(chan error, 1)
+	jobs.RegisterConstructor(jobspb.TypeBackup, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
+		return jobs.FakeResumer{
+			OnResume: func(ctx context.Context, _ chan<- tree.Datums) error {
+				defer close(resumed)
+				_, err := s.InternalExecutor().(sqlutil.InternalExecutor).Exec(
+					ctx, "set-claim-null", nil, /* txn */
+					`UPDATE system.jobs SET claim_session_id = NULL WHERE id = $1`,
+					*j.ID())
+				assert.NoError(t, err)
+				err = j.WithTxn(nil).Update(ctx, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+					return nil
+				})
+				resumed <- err
+				return err
+			},
+		}
+	})
+
+	_, err := registry.CreateJobWithTxn(ctx, rec, nil /* txn */)
+	require.NoError(t, err)
+	registry.TestingNudgeAdoptionQueue()
+	require.Regexp(t, `expected session '\w+' but found NULL`, <-resumed)
 }

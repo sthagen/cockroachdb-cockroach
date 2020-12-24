@@ -31,6 +31,14 @@ type reassignOwnedByNode struct {
 }
 
 func (p *planner) ReassignOwnedBy(ctx context.Context, n *tree.ReassignOwnedBy) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"REASSIGN OWNED BY",
+	); err != nil {
+		return nil, err
+	}
+
 	// Check all roles in old roles exist. Checks in authorization.go will confirm that current user
 	// is a member of old roles and new roles and has CREATE privilege.
 	for _, oldRole := range n.OldRoles {
@@ -48,14 +56,15 @@ func (p *planner) ReassignOwnedBy(ctx context.Context, n *tree.ReassignOwnedBy) 
 func (n *reassignOwnedByNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.CreateReassignOwnedByCounter())
 
-	allDescs, err := params.p.Descriptors().GetAllDescriptors(params.ctx, params.p.txn, true /* validate */)
+	allDescs, err := params.p.Descriptors().GetAllDescriptors(params.ctx, params.p.txn)
 	if err != nil {
 		return err
 	}
 
 	// Filter for all objects in current database.
 	currentDatabase := params.p.CurrentDatabase()
-	currentDbDesc, err := params.p.ResolveMutableDatabaseDescriptor(params.ctx, currentDatabase, true)
+	_, currentDbDesc, err := params.p.Descriptors().GetMutableDatabaseByName(
+		params.ctx, params.p.txn, currentDatabase, tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return err
 	}

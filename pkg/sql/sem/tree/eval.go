@@ -418,9 +418,48 @@ func initArrayToArrayConcatenation() {
 	}
 }
 
+// initNonArrayToNonArrayConcatenation initializes string + nonarrayelement
+// and nonarrayelement + string concatenation.
+func initNonArrayToNonArrayConcatenation() {
+	addConcat := func(leftType, rightType *types.T, volatility Volatility) {
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
+			LeftType:     leftType,
+			RightType:    rightType,
+			ReturnType:   types.String,
+			NullableArgs: false,
+			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				if _, ok := left.(*DString); ok {
+					return NewDString(string(MustBeDString(left)) + AsStringWithFlags(right, FmtPgwireText)), nil
+				}
+				if _, ok := right.(*DString); ok {
+					return NewDString(AsStringWithFlags(left, FmtPgwireText) + string(MustBeDString(right))), nil
+				}
+				return nil, errors.New("neither LHS or RHS matched DString")
+			},
+			Volatility: volatility,
+		})
+	}
+	fromTypeToVolatility := make(map[types.Family]Volatility)
+	for _, cast := range validCasts {
+		if cast.to == types.StringFamily {
+			fromTypeToVolatility[cast.from] = cast.volatility
+		}
+	}
+	// We allow tuple + string concatenation, as well as any scalar types.
+	for _, t := range append([]*types.T{types.AnyTuple}, types.Scalar...) {
+		// Do not re-add String+String or String+Bytes, as they already exist
+		// and have predefined correct behavior.
+		if t != types.String && t != types.Bytes {
+			addConcat(t, types.String, fromTypeToVolatility[t.Family()])
+			addConcat(types.String, t, fromTypeToVolatility[t.Family()])
+		}
+	}
+}
+
 func init() {
 	initArrayElementConcatenation()
 	initArrayToArrayConcatenation()
+	initNonArrayToNonArrayConcatenation()
 }
 
 func init() {
@@ -999,7 +1038,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Interval,
 			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				nanos := left.(*DTimestamp).Sub(right.(*DTimestamp).Time).Nanoseconds()
-				return &DInterval{Duration: duration.MakeNormalizedDuration(nanos, 0, 0)}, nil
+				return &DInterval{Duration: duration.MakeDurationJustifyHours(nanos, 0, 0)}, nil
 			},
 			Volatility: VolatilityImmutable,
 		},
@@ -1009,7 +1048,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Interval,
 			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				nanos := left.(*DTimestampTZ).Sub(right.(*DTimestampTZ).Time).Nanoseconds()
-				return &DInterval{Duration: duration.MakeNormalizedDuration(nanos, 0, 0)}, nil
+				return &DInterval{Duration: duration.MakeDurationJustifyHours(nanos, 0, 0)}, nil
 			},
 			Volatility: VolatilityImmutable,
 		},
@@ -1025,7 +1064,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				nanos := left.(*DTimestamp).Sub(stripped.Time).Nanoseconds()
-				return &DInterval{Duration: duration.MakeNormalizedDuration(nanos, 0, 0)}, nil
+				return &DInterval{Duration: duration.MakeDurationJustifyHours(nanos, 0, 0)}, nil
 			},
 			Volatility: VolatilityStable,
 		},
@@ -1041,7 +1080,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				nanos := stripped.Sub(right.(*DTimestamp).Time).Nanoseconds()
-				return &DInterval{Duration: duration.MakeNormalizedDuration(nanos, 0, 0)}, nil
+				return &DInterval{Duration: duration.MakeDurationJustifyHours(nanos, 0, 0)}, nil
 			},
 			Volatility: VolatilityStable,
 		},
@@ -1916,41 +1955,27 @@ var BinOps = map[BinaryOperator]binOpOverload{
 	},
 }
 
-// timestampMinusBinOp is the implementation of the subtraction
-// between types.TimestampTZ operands.
-var timestampMinusBinOp *BinOp
-
-// TimestampDifference computes the interval difference between two
-// TimestampTZ datums. The result is a DInterval. The caller must
-// ensure that the arguments are of the proper Datum type.
-func TimestampDifference(ctx *EvalContext, start, end Datum) (Datum, error) {
-	return timestampMinusBinOp.Fn(ctx, start, end)
-}
-
-func init() {
-	timestampMinusBinOp, _ = BinOps[Minus].lookupImpl(types.TimestampTZ, types.TimestampTZ)
-}
-
 // CmpOp is a comparison operator.
 type CmpOp struct {
+	types TypeList
+
 	LeftType  *types.T
 	RightType *types.T
+
+	// Datum return type is a union between *DBool and dNull.
+	Fn TwoArgFn
+
+	// counter, if non-nil, should be incremented every time the
+	// operator is type checked.
+	counter telemetry.Counter
 
 	// If NullableArgs is false, the operator returns NULL
 	// whenever either argument is NULL.
 	NullableArgs bool
 
-	// Datum return type is a union between *DBool and dNull.
-	Fn TwoArgFn
-
 	Volatility Volatility
 
-	types       TypeList
 	isPreferred bool
-
-	// counter, if non-nil, should be incremented every time the
-	// operator is type checked.
-	counter telemetry.Counter
 }
 
 func (op *CmpOp) params() TypeList {
@@ -2545,11 +2570,11 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 
 const experimentalBox2DClusterSettingName = "sql.spatial.experimental_box2d_comparison_operators.enabled"
 
-var experimentalBox2DClusterSetting = settings.RegisterPublicBoolSetting(
+var experimentalBox2DClusterSetting = settings.RegisterBoolSetting(
 	experimentalBox2DClusterSettingName,
 	"enables the use of certain experimental box2d comparison operators",
 	false,
-)
+).WithPublic()
 
 func checkExperimentalBox2DComparisonOperatorEnabled(ctx *EvalContext) error {
 	if !experimentalBox2DClusterSetting.Get(&ctx.Settings.SV) {
@@ -3001,11 +3026,52 @@ type EvalDatabase interface {
 type EvalPlanner interface {
 	EvalDatabase
 	TypeReferenceResolver
-	// ParseType parses a column type.
-	ParseType(sql string) (*types.T, error)
+
+	// GetTypeFromValidSQLSyntax parses a column type when the input
+	// string uses the parseable SQL representation of a type name, e.g.
+	// `INT(13)`, `mytype`, `"mytype"`, `pg_catalog.int4` or `"public".mytype`.
+	GetTypeFromValidSQLSyntax(sql string) (*types.T, error)
 
 	// EvalSubquery returns the Datum for the given subquery node.
 	EvalSubquery(expr *Subquery) (Datum, error)
+
+	// UnsafeUpsertDescriptor is used to repair descriptors in dire
+	// circumstances. See the comment on the planner implementation.
+	UnsafeUpsertDescriptor(
+		ctx context.Context, descID int64, encodedDescriptor []byte, force bool,
+	) error
+
+	// UnsafeDeleteDescriptor is used to repair descriptors in dire
+	// circumstances. See the comment on the planner implementation.
+	UnsafeDeleteDescriptor(ctx context.Context, descID int64, force bool) error
+
+	// UnsafeUpsertNamespaceEntry is used to repair namespace entries in dire
+	// circumstances. See the comment on the planner implementation.
+	UnsafeUpsertNamespaceEntry(
+		ctx context.Context,
+		parentID, parentSchemaID int64,
+		name string,
+		descID int64,
+		force bool,
+	) error
+
+	// UnsafeDeleteNamespaceEntry is used to repair namespace entries in dire
+	// circumstances. See the comment on the planner implementation.
+	UnsafeDeleteNamespaceEntry(
+		ctx context.Context,
+		parentID, parentSchemaID int64,
+		name string,
+		descID int64,
+		force bool,
+	) error
+
+	// CompactEngineSpan is used to compact an engine key span at the given
+	// (nodeID, storeID). If we add more overloads to the compact_span builtin,
+	// this parameter list should be changed to a struct union to accommodate
+	// those overloads.
+	CompactEngineSpan(
+		ctx context.Context, nodeID int32, storeID int32, startKey []byte, endKey []byte,
+	) error
 }
 
 // EvalSessionAccessor is a limited interface to access session variables.
@@ -3120,6 +3186,11 @@ type TenantOperator interface {
 	// DestroyTenant attempts to uninstall an existing tenant from the system.
 	// It returns an error if the tenant does not exist.
 	DestroyTenant(ctx context.Context, tenantID uint64) error
+
+	// GCTenant attempts to garbage collect a DROP tenant from the system. Upon
+	// success it also removes the tenant record.
+	// It returns an error if the tenant does not exist.
+	GCTenant(ctx context.Context, tenantID uint64) error
 }
 
 // EvalContextTestingKnobs contains test knobs.
@@ -3362,7 +3433,7 @@ func (ctx *EvalContext) GetStmtTimestamp() time.Time {
 // the evaluation context. The timestamp is guaranteed to be nonzero.
 func (ctx *EvalContext) GetClusterTimestamp() *DDecimal {
 	ts := ctx.Txn.CommitTimestamp()
-	if ts == (hlc.Timestamp{}) {
+	if ts.IsEmpty() {
 		panic(errors.AssertionFailedf("zero cluster timestamp in txn"))
 	}
 	return TimestampToDecimalDatum(ts)
@@ -3867,6 +3938,24 @@ func (expr *FuncExpr) evalArgs(ctx *EvalContext) (bool, Datums, error) {
 	return false, args, nil
 }
 
+// MaybeWrapError updates non-nil error depending on the FuncExpr to provide
+// more context.
+func (expr *FuncExpr) MaybeWrapError(err error) error {
+	// If we are facing an explicit error, propagate it unchanged.
+	fName := expr.Func.String()
+	if fName == `crdb_internal.force_error` {
+		return err
+	}
+	// Otherwise, wrap it with context.
+	newErr := errors.Wrapf(err, "%s()", errors.Safe(fName))
+	// Count function errors as it flows out of the system. We need to handle
+	// them this way because if we are facing a retry error, in particular those
+	// generated by crdb_internal.force_retry(), Wrap() will propagate it as a
+	// non-pgerror error (so that the executor can see it with the right type).
+	newErr = errors.WithTelemetry(newErr, fName+"()")
+	return newErr
+}
+
 // Eval implements the TypedExpr interface.
 func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
 	nullResult, args, err := expr.evalArgs(ctx)
@@ -3879,21 +3968,7 @@ func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
 
 	res, err := expr.fn.Fn(ctx, args)
 	if err != nil {
-		// If we are facing an explicit error, propagate it unchanged.
-		fName := expr.Func.String()
-		if fName == `crdb_internal.force_error` {
-			return nil, err
-		}
-		// Otherwise, wrap it with context.
-		newErr := errors.Wrapf(err, "%s()", errors.Safe(fName))
-		// Count function errors as it flows out of the system.  We need
-		// to have this inside a if because if we are facing a retry
-		// error, in particular those generated by
-		// crdb_internal.force_retry(), Wrap() will propagate it as a
-		// non-pgerror error (so that the executor can see it with the
-		// right type).
-		newErr = errors.WithTelemetry(newErr, fName+"()")
-		return nil, newErr
+		return nil, expr.MaybeWrapError(err)
 	}
 	if ctx.TestingKnobs.AssertFuncExprReturnTypes {
 		if err := ensureExpectedType(expr.fn.FixedReturnType(), res); err != nil {
@@ -4339,6 +4414,12 @@ func (t *DOidWrapper) Eval(_ *EvalContext) (Datum, error) {
 	return t, nil
 }
 
+func makeNoValueProvidedForPlaceholderErr(pIdx PlaceholderIdx) error {
+	return pgerror.Newf(pgcode.UndefinedParameter,
+		"no value provided for placeholder: $%d", pIdx+1,
+	)
+}
+
 // Eval implements the TypedExpr interface.
 func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 	if !ctx.HasPlaceholders() {
@@ -4348,8 +4429,7 @@ func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 	}
 	e, ok := ctx.Placeholders.Value(t.Idx)
 	if !ok {
-		return nil, pgerror.Newf(pgcode.UndefinedParameter,
-			"no value provided for placeholder: %s", t)
+		return nil, makeNoValueProvidedForPlaceholderErr(t.Idx)
 	}
 	// Placeholder expressions cannot contain other placeholders, so we do
 	// not need to recurse.

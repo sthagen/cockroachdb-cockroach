@@ -96,7 +96,7 @@ func TestRangeLocalityBasedOnNodeIDs(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	assert.EqualValues(t, 1, tc.Servers[len(tc.Servers)-1].GetFirstStoreID())
 
-	// Set to 2 so the the next store id will be 3.
+	// Set to 2 so the next store id will be 3.
 	assert.NoError(t, tc.Servers[0].DB().Put(ctx, keys.StoreIDGenerator, 2))
 
 	// NodeID=2, StoreID=3
@@ -151,7 +151,7 @@ func TestGossipAlertsTable(t *testing.T) {
 
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
 	row, err := ie.QueryRowEx(ctx, "test", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		"SELECT * FROM crdb_internal.gossip_alerts WHERE store_id = 123")
 	if err != nil {
 		t.Fatal(err)

@@ -21,6 +21,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/errors"
 )
@@ -190,9 +191,24 @@ func initGEOS(dirs []string) (*C.CR_GEOS, string, error) {
 		)
 	}
 	if err != nil {
-		return nil, "", errors.Wrap(err, "geos: error during GEOS init")
+		return nil, "", wrapGEOSInitError(errors.Wrap(err, "geos: error during GEOS init"))
 	}
-	return nil, "", errors.Newf("geos: no locations to init GEOS")
+	return nil, "", wrapGEOSInitError(errors.Newf("geos: no locations to init GEOS"))
+}
+
+func wrapGEOSInitError(err error) error {
+	page := "linux"
+	switch runtime.GOOS {
+	case "darwin":
+		page = "mac"
+	case "windows":
+		page = "windows"
+	}
+	return errors.WithHintf(
+		err,
+		"Ensure you have the spatial libraries installed as per the instructions in %s",
+		docs.URL("install-cockroachdb-"+page),
+	)
 }
 
 // goToCSlice returns a CR_GEOS_Slice from a given Go byte slice.
@@ -504,6 +520,19 @@ func Intersection(a geopb.EWKB, b geopb.EWKB) (geopb.EWKB, error) {
 	return cStringToSafeGoBytes(cEWKB), nil
 }
 
+// UnaryUnion Returns an EWKB which is a union of input geometry components.
+func UnaryUnion(a geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var unionEWKB C.CR_GEOS_String
+	if err := statusToError(C.CR_GEOS_UnaryUnion(g, goToCSlice(a), &unionEWKB)); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(unionEWKB), nil
+}
+
 // Union returns an EWKB which is a union of shapes A and B.
 func Union(a geopb.EWKB, b geopb.EWKB) (geopb.EWKB, error) {
 	g, err := ensureInitInternal()
@@ -796,6 +825,21 @@ func HausdorffDistanceDensify(a, b geopb.EWKB, densifyFrac float64) (float64, er
 	return float64(distance), nil
 }
 
+// EqualsExact returns whether two geometry objects are equal with some epsilon
+func EqualsExact(lhs, rhs geopb.EWKB, epsilon float64) (bool, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return false, err
+	}
+	var ret C.char
+	if err := statusToError(
+		C.CR_GEOS_EqualsExact(g, goToCSlice(lhs), goToCSlice(rhs), C.double(epsilon), &ret),
+	); err != nil {
+		return false, err
+	}
+	return ret == 1, nil
+}
+
 //
 // DE-9IM related
 //
@@ -935,6 +979,54 @@ func SharedPaths(a geopb.EWKB, b geopb.EWKB) (geopb.EWKB, error) {
 	var cEWKB C.CR_GEOS_String
 	if err := statusToError(
 		C.CR_GEOS_SharedPaths(g, goToCSlice(a), goToCSlice(b), &cEWKB),
+	); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// Node returns a EWKB containing a set of linestrings using the least possible number of nodes while preserving all of the input ones.
+func Node(a geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	err = statusToError(C.CR_GEOS_Node(g, goToCSlice(a), &cEWKB))
+	if err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// VoronoiDiagram Computes the Voronoi Diagram from the vertices of the supplied EWKBs.
+func VoronoiDiagram(a, env geopb.EWKB, tolerance float64, onlyEdges bool) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	flag := 0
+	if onlyEdges {
+		flag = 1
+	}
+	if err := statusToError(
+		C.CR_GEOS_VoronoiDiagram(g, goToCSlice(a), goToCSlice(env), C.double(tolerance), C.int(flag), &cEWKB),
+	); err != nil {
+		return nil, err
+	}
+	return cStringToSafeGoBytes(cEWKB), nil
+}
+
+// MinimumRotatedRectangle Returns a minimum rotated rectangle enclosing a geometry
+func MinimumRotatedRectangle(ewkb geopb.EWKB) (geopb.EWKB, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return nil, err
+	}
+	var cEWKB C.CR_GEOS_String
+	if err := statusToError(
+		C.CR_GEOS_MinimumRotatedRectangle(g, goToCSlice(ewkb), &cEWKB),
 	); err != nil {
 		return nil, err
 	}

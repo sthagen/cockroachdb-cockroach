@@ -69,6 +69,11 @@ type testSpec struct {
 	// care about.
 	UseIOBarrier bool
 
+	// NonReleaseBlocker indicates that a test failure should not be tagged as a
+	// release blocker. Use this for tests that are not yet stable but should
+	// still be run regularly.
+	NonReleaseBlocker bool
+
 	// Run is the test function.
 	Run func(ctx context.Context, t *test, c *cluster)
 }
@@ -147,6 +152,8 @@ type test struct {
 		output     []byte
 	}
 }
+
+func (t *test) Helper() {}
 
 func (t *test) Name() string {
 	return t.spec.Name

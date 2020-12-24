@@ -30,7 +30,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/spf13/cobra"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -224,7 +224,7 @@ func checkStoreRaftState(
 		return err
 	}
 
-	// Iterate over the entire range-id-local space.
+	// MVCCIterate over the entire range-id-local space.
 	start := roachpb.Key(keys.LocalRangeIDPrefix)
 	end := start.PrefixEnd()
 

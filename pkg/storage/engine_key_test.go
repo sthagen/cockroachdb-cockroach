@@ -12,12 +12,15 @@ package storage
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/rand"
 	"testing"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -39,9 +42,19 @@ func TestLockTableKeyEncodeDecode(t *testing.T) {
 			Strength: lock.Exclusive,
 			TxnUUID:  uuid1[:]}},
 	}
-	for _, test := range testCases {
-		t.Run("", func(t *testing.T) {
-			eKey := test.key.ToEngineKey()
+	buf := make([]byte, 100)
+	for i, test := range testCases {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			eKey, buf2 := test.key.ToEngineKey(nil)
+			// buf2 should be larger than the non-versioned part.
+			require.Less(t, len(eKey.Key), cap(buf2))
+			eKey2, buf3 := test.key.ToEngineKey(buf)
+			// buf3 should be larger than the non-versioned part.
+			require.Less(t, len(eKey.Key), cap(buf3))
+			// buf is big enough for all keys we encode here, so buf3 should be the same as buf
+			require.True(t, unsafe.Pointer(&buf3[0]) == unsafe.Pointer(&buf[0]))
+			require.Equal(t, eKey, eKey2)
+
 			b1 := eKey.Encode()
 			require.Equal(t, len(b1), eKey.EncodedLen())
 			var b2 []byte
@@ -54,6 +67,9 @@ func TestLockTableKeyEncodeDecode(t *testing.T) {
 			require.False(t, eKey.IsMVCCKey())
 			eKeyDecoded, ok := DecodeEngineKey(b2)
 			require.True(t, ok)
+			keyPart, ok := GetKeyPartFromEngineKey(b2)
+			require.True(t, ok)
+			require.Equal(t, eKeyDecoded.Key, roachpb.Key(keyPart))
 			require.True(t, eKeyDecoded.IsLockTableKey())
 			require.False(t, eKeyDecoded.IsMVCCKey())
 			keyDecoded, err := eKeyDecoded.ToLockTableKey()
@@ -68,22 +84,30 @@ func TestMVCCAndEngineKeyEncodeDecode(t *testing.T) {
 	testCases := []struct {
 		key MVCCKey
 	}{
-		{key: MVCCKey{Key: roachpb.Key("foo"), Timestamp: hlc.Timestamp{WallTime: 99, Logical: 45}}},
-		{key: MVCCKey{Key: roachpb.Key("glue"), Timestamp: hlc.Timestamp{WallTime: 89999}}},
 		{key: MVCCKey{Key: roachpb.Key("a")}},
+		{key: MVCCKey{Key: roachpb.Key("glue"), Timestamp: hlc.Timestamp{WallTime: 89999}}},
+		{key: MVCCKey{Key: roachpb.Key("foo"), Timestamp: hlc.Timestamp{WallTime: 99, Logical: 45}}},
+		{key: MVCCKey{Key: roachpb.Key("flags"), Timestamp: hlc.Timestamp{WallTime: 99, Logical: 45, Flags: 3}}},
 	}
 	for _, test := range testCases {
 		t.Run("", func(t *testing.T) {
 			var encodedTS []byte
-			if !(test.key.Timestamp == hlc.Timestamp{}) {
-				if test.key.Timestamp.Logical == 0 {
-					encodedTS = make([]byte, 8)
+			if !test.key.Timestamp.IsEmpty() {
+				var size int
+				if test.key.Timestamp.Flags != 0 {
+					size = 13
+				} else if test.key.Timestamp.Logical != 0 {
+					size = 12
 				} else {
-					encodedTS = make([]byte, 12)
+					size = 8
 				}
+				encodedTS = make([]byte, size)
 				binary.BigEndian.PutUint64(encodedTS, uint64(test.key.Timestamp.WallTime))
 				if test.key.Timestamp.Logical != 0 {
 					binary.BigEndian.PutUint32(encodedTS[8:], uint32(test.key.Timestamp.Logical))
+				}
+				if test.key.Timestamp.Flags != 0 {
+					encodedTS[12] = uint8(test.key.Timestamp.Flags)
 				}
 			}
 			eKey := EngineKey{Key: test.key.Key, Version: encodedTS}
@@ -104,6 +128,15 @@ func TestMVCCAndEngineKeyEncodeDecode(t *testing.T) {
 			keyDecoded, err := eKeyDecoded.ToMVCCKey()
 			require.NoError(t, err)
 			require.Equal(t, test.key, keyDecoded)
+			keyPart, ok := GetKeyPartFromEngineKey(b2)
+			require.True(t, ok)
+			require.Equal(t, eKeyDecoded.Key, roachpb.Key(keyPart))
+			b3 := EncodeKey(test.key)
+			require.Equal(t, b3, b1)
+			k3, ts, ok := enginepb.SplitMVCCKey(b3)
+			require.True(t, ok)
+			require.Equal(t, k3, []byte(test.key.Key))
+			require.Equal(t, ts, encodedTS)
 		})
 	}
 }

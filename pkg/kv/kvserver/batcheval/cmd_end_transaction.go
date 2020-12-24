@@ -31,9 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 )
 
 func init() {
@@ -442,7 +440,7 @@ func resolveLocalLocks(
 		desc = &mergeTrigger.LeftDesc
 	}
 
-	iter := readWriter.NewIterator(storage.IterOptions{
+	iter := readWriter.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		UpperBound: desc.EndKey.AsRawKey(),
 	})
 	iterAndBuf := storage.GetBufUsingIter(iter)
@@ -635,7 +633,7 @@ func RunCommitTrigger(
 	}
 	if sbt := ct.GetStickyBitTrigger(); sbt != nil {
 		newDesc := *rec.Desc()
-		if sbt.StickyBit != (hlc.Timestamp{}) {
+		if !sbt.StickyBit.IsEmpty() {
 			newDesc.StickyBit = &sbt.StickyBit
 		} else {
 			newDesc.StickyBit = nil
@@ -811,11 +809,6 @@ func splitTrigger(
 	split *roachpb.SplitTrigger,
 	ts hlc.Timestamp,
 ) (enginepb.MVCCStats, result.Result, error) {
-	// TODO(andrei): should this span be a child of the ctx's (if any)?
-	sp := rec.ClusterSettings().Tracer.StartRootSpan(
-		"split", logtags.FromContext(ctx), tracing.NonRecordableSpan,
-	)
-	defer sp.Finish()
 	desc := rec.Desc()
 	if !bytes.Equal(desc.StartKey, split.LeftDesc.StartKey) ||
 		!bytes.Equal(desc.EndKey, split.RightDesc.EndKey) {
@@ -888,7 +881,7 @@ func splitTriggerHelper(
 		return enginepb.MVCCStats{}, result.Result{}, err
 	}
 
-	if !rec.ClusterSettings().Version.IsActive(ctx, clusterversion.VersionAbortSpanBytes) {
+	if !rec.ClusterSettings().Version.IsActive(ctx, clusterversion.AbortSpanBytes) {
 		// Since the stats here is used to seed the initial state for the RHS
 		// replicas, we need to be careful about zero-ing out the abort span
 		// bytes if the cluster version introducing it is not yet active. Not
@@ -948,7 +941,7 @@ func splitTriggerHelper(
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load GCThreshold")
 		}
-		if (*gcThreshold == hlc.Timestamp{}) {
+		if gcThreshold.IsEmpty() {
 			log.VEventf(ctx, 1, "LHS's GCThreshold of split is not set")
 		}
 
@@ -1023,9 +1016,6 @@ func splitTriggerHelper(
 	}
 
 	deltaPostSplitLeft := h.DeltaPostSplitLeft()
-	if !rec.ClusterSettings().Version.IsActive(ctx, clusterversion.VersionContainsEstimatesCounter) {
-		deltaPostSplitLeft.ContainsEstimates = 0
-	}
 	return deltaPostSplitLeft, pd, nil
 }
 
@@ -1063,7 +1053,8 @@ func mergeTrigger(
 	ms.Add(merge.RightMVCCStats)
 	{
 		ridPrefix := keys.MakeRangeIDReplicatedPrefix(merge.RightDesc.RangeID)
-		iter := batch.NewIterator(storage.IterOptions{UpperBound: ridPrefix.PrefixEnd()})
+		// NB: Range-ID local keys have no versions and no intents.
+		iter := batch.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{UpperBound: ridPrefix.PrefixEnd()})
 		defer iter.Close()
 		sysMS, err := iter.ComputeStats(ridPrefix, ridPrefix.PrefixEnd(), 0 /* nowNanos */)
 		if err != nil {
@@ -1099,20 +1090,8 @@ func changeReplicasTrigger(
 	// holding the lease.
 	pd.Local.GossipFirstRange = rec.IsFirstRange()
 
-	var desc roachpb.RangeDescriptor
-	if change.Desc != nil {
-		// Trigger proposed by a 19.2+ node (and we're a 19.2+ node as well).
-		desc = *change.Desc
-	} else {
-		// Trigger proposed by a 19.1 node. Reconstruct descriptor from deprecated
-		// fields.
-		desc = *rec.Desc()
-		desc.SetReplicas(roachpb.MakeReplicaDescriptors(change.DeprecatedUpdatedReplicas))
-		desc.NextReplicaID = change.DeprecatedNextReplicaID
-	}
-
 	pd.Replicated.State = &kvserverpb.ReplicaState{
-		Desc: &desc,
+		Desc: change.Desc,
 	}
 	pd.Replicated.ChangeReplicas = &kvserverpb.ChangeReplicas{
 		ChangeReplicasTrigger: *change,

@@ -73,7 +73,7 @@ func TestAllocateIDs(t *testing.T) {
 				return idx
 			}(),
 		},
-		Privileges:    descpb.NewDefaultPrivilegeDescriptor(security.AdminRole),
+		Privileges:    descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()),
 		FormatVersion: descpb.FamilyFormatVersion,
 	})
 	if err := desc.AllocateIDs(ctx); err != nil {
@@ -114,7 +114,7 @@ func TestAllocateIDs(t *testing.T) {
 				ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				EncodingType:     descpb.PrimaryIndexEncoding},
 		},
-		Privileges:     descpb.NewDefaultPrivilegeDescriptor(security.AdminRole),
+		Privileges:     descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()),
 		NextColumnID:   4,
 		NextFamilyID:   1,
 		NextIndexID:    5,
@@ -136,11 +136,73 @@ func TestAllocateIDs(t *testing.T) {
 		t.Fatalf("expected %s, but found %s", a, b)
 	}
 }
+func TestValidateDatabaseDesc(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testData := []struct {
+		err  string
+		desc *dbdesc.Immutable
+	}{
+		{`invalid database ID 0`,
+			dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+				Name:       "db",
+				ID:         0,
+				Privileges: &descpb.PrivilegeDescriptor{},
+			}),
+		},
+		{
+			`region "us-east-1" seen twice on db 200`,
+			dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+				Name: "multi-region-db",
+				ID:   200,
+				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
+					Regions:       descpb.Regions{"us-east-1", "us-east-1"},
+					PrimaryRegion: "us-east-1",
+				},
+				Privileges: &descpb.PrivilegeDescriptor{},
+			}),
+		},
+		{
+			`primary region unset on a multi-region db 200`,
+			dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+				Name: "multi-region-db",
+				ID:   200,
+				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
+					Regions: descpb.Regions{"us-east-1"},
+				},
+				Privileges: &descpb.PrivilegeDescriptor{},
+			}),
+		},
+		{
+			`primary region not found in list of regions on db 200`,
+			dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+				Name: "multi-region-db",
+				ID:   200,
+				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
+					Regions:       descpb.Regions{"us-east-1"},
+					PrimaryRegion: "us-east-2",
+				},
+				Privileges: &descpb.PrivilegeDescriptor{},
+			}),
+		},
+	}
+	for i, d := range testData {
+		t.Run(d.err, func(t *testing.T) {
+			if err := d.desc.Validate(); err == nil {
+				t.Errorf("%d: expected \"%s\", but found success: %+v", i, d.err, d.desc)
+			} else if d.err != err.Error() && "internal error: "+d.err != err.Error() {
+				t.Errorf("%d: expected \"%s\", but found \"%+v\"", i, d.err, err)
+			}
+		})
+	}
+}
 
 func TestValidateTableDesc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
+
+	computedExpr := "1 + 1"
 
 	testData := []struct {
 		err  string
@@ -171,6 +233,18 @@ func TestValidateTableDesc(t *testing.T) {
 					{ID: 0},
 				},
 				NextColumnID: 2,
+			}},
+		{`virtual column "virt" is not computed`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+					{ID: 2, Name: "virt", Virtual: true},
+				},
+				NextColumnID: 3,
 			}},
 		{`invalid column ID 0`,
 			descpb.TableDescriptor{
@@ -340,7 +414,7 @@ func TestValidateTableDesc(t *testing.T) {
 				NextColumnID: 2,
 				NextFamilyID: 1,
 			}},
-		{`column 1 is not in any column family`,
+		{`column "bar" is not in any column family`,
 			descpb.TableDescriptor{
 				ID:            2,
 				ParentID:      1,
@@ -369,6 +443,23 @@ func TestValidateTableDesc(t *testing.T) {
 					{ID: 1, Name: "qux", ColumnIDs: []descpb.ColumnID{1}, ColumnNames: []string{"bar"}},
 				},
 				NextColumnID: 2,
+				NextFamilyID: 2,
+			}},
+		{`virtual computed column "virt" cannot be part of a family`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+					{ID: 2, Name: "virt", ComputeExpr: &computedExpr, Virtual: true},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "fam1", ColumnIDs: []descpb.ColumnID{1}, ColumnNames: []string{"bar"}},
+					{ID: 1, Name: "fam2", ColumnIDs: []descpb.ColumnID{2}, ColumnNames: []string{"virt"}},
+				},
+				NextColumnID: 3,
 				NextFamilyID: 2,
 			}},
 		{`table must contain a primary key`,
@@ -579,6 +670,35 @@ func TestValidateTableDesc(t *testing.T) {
 				NextFamilyID: 1,
 				NextIndexID:  2,
 			}},
+		{`mismatched STORING column IDs (1) and names (0)`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "c1"},
+					{ID: 2, Name: "c2"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{
+						ID:          0,
+						Name:        "fam",
+						ColumnIDs:   []descpb.ColumnID{1, 2},
+						ColumnNames: []string{"c1", "c2"},
+					},
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID: 1, Name: "primary",
+					ColumnIDs:        []descpb.ColumnID{1},
+					ColumnNames:      []string{"c1"},
+					ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+					StoreColumnIDs:   []descpb.ColumnID{2},
+				},
+				NextColumnID: 3,
+				NextFamilyID: 1,
+				NextIndexID:  2,
+			}},
 		{`at least one of LIST or RANGE partitioning must be used`,
 			// Verify that validatePartitioning is hooked up. The rest of these
 			// tests are in TestValidatePartitionion.
@@ -645,6 +765,162 @@ func TestValidateTableDesc(t *testing.T) {
 				NextFamilyID: 1,
 				NextIndexID:  3,
 			}},
+		{`TableID mismatch for unique without index constraint "bar_unique": "1" doesn't match descriptor: "2"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"bar"},
+					},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+				UniqueWithoutIndexConstraints: []descpb.UniqueWithoutIndexConstraint{
+					{
+						TableID:   1,
+						ColumnIDs: []descpb.ColumnID{1},
+						Name:      "bar_unique",
+					},
+				},
+			}},
+		{`column-id "2" does not exist`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"bar"},
+					},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+				UniqueWithoutIndexConstraints: []descpb.UniqueWithoutIndexConstraint{
+					{
+						TableID:   2,
+						ColumnIDs: []descpb.ColumnID{1, 2},
+						Name:      "bar_unique",
+					},
+				},
+			}},
+		{`unique without index constraint "bar_unique" contains duplicate column "1"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"bar"},
+					},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+				UniqueWithoutIndexConstraints: []descpb.UniqueWithoutIndexConstraint{
+					{
+						TableID:   2,
+						ColumnIDs: []descpb.ColumnID{1, 1},
+						Name:      "bar_unique",
+					},
+				},
+			}},
+		{`empty unique without index constraint name`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"bar"},
+					},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+				UniqueWithoutIndexConstraints: []descpb.UniqueWithoutIndexConstraint{
+					{
+						TableID:   2,
+						ColumnIDs: []descpb.ColumnID{1},
+					},
+				},
+			}},
+		{`primary index column "v" cannot be virtual`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+					{ID: 2, Name: "v", ComputeExpr: &computedExpr, Virtual: true},
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID:          1,
+					Name:        "primary",
+					Unique:      true,
+					ColumnIDs:   []descpb.ColumnID{1, 2},
+					ColumnNames: []string{"bar", "v"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"bar"},
+					},
+				},
+				NextColumnID: 3,
+				NextFamilyID: 1,
+			}},
+		{`index "sec" cannot store virtual column "v"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "c1"},
+					{ID: 2, Name: "c2"},
+					{ID: 3, Name: "v", ComputeExpr: &computedExpr, Virtual: true},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary", ColumnIDs: []descpb.ColumnID{1, 2}, ColumnNames: []string{"c1", "c2"}},
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID: 1, Name: "pri", ColumnIDs: []descpb.ColumnID{1},
+					ColumnNames:      []string{"c1"},
+					ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+				},
+				Indexes: []descpb.IndexDescriptor{
+					{ID: 2, Name: "sec", ColumnIDs: []descpb.ColumnID{2},
+						ColumnNames:      []string{"c2"},
+						ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+						StoreColumnNames: []string{"v"},
+						StoreColumnIDs:   []descpb.ColumnID{3},
+					},
+				},
+				NextColumnID: 4,
+				NextFamilyID: 1,
+				NextIndexID:  3,
+			}},
 	}
 	for i, d := range testData {
 		t.Run(d.err, func(t *testing.T) {
@@ -672,7 +948,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 		otherDescs []descpb.TableDescriptor
 	}{
 		// Foreign keys
-		{
+		{ // 0
 			err: `invalid foreign key: missing table=52: descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -692,7 +968,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			},
 			otherDescs: nil,
 		},
-		{
+		{ // 1
 			err: `missing fk back reference "fk" to "foo" from "baz"`,
 			desc: descpb.TableDescriptor{
 				ID:                      51,
@@ -718,7 +994,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				FormatVersion:           descpb.InterleavedFormatVersion,
 			}},
 		},
-		{
+		{ // 2
 			err: `invalid foreign key backreference: missing table=52: descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -737,7 +1013,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				},
 			},
 		},
-		{
+		{ // 3
 			err: `missing fk forward reference "fk" to "foo" from "baz"`,
 			desc: descpb.TableDescriptor{
 				ID:                      51,
@@ -767,9 +1043,93 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				FormatVersion:           descpb.InterleavedFormatVersion,
 			}},
 		},
+		{ // 4
+			// Regression test for #57066: We can handle one of the referenced tables
+			// having a pre-19.2 foreign key reference.
+			err: "",
+			desc: descpb.TableDescriptor{
+				ID:                      51,
+				Name:                    "foo",
+				ParentID:                1,
+				UnexposedParentSchemaID: keys.PublicSchemaID,
+				FormatVersion:           descpb.InterleavedFormatVersion,
+				Indexes: []descpb.IndexDescriptor{
+					{
+						ID:        2,
+						ColumnIDs: []descpb.ColumnID{1, 2},
+					},
+				},
+				OutboundFKs: []descpb.ForeignKeyConstraint{
+					{
+						Name:                "fk",
+						ReferencedTableID:   52,
+						ReferencedColumnIDs: []descpb.ColumnID{1},
+						OriginTableID:       51,
+						OriginColumnIDs:     []descpb.ColumnID{1},
+					},
+				},
+			},
+			otherDescs: []descpb.TableDescriptor{{
+				ID:                      52,
+				Name:                    "baz",
+				ParentID:                1,
+				UnexposedParentSchemaID: keys.PublicSchemaID,
+				FormatVersion:           descpb.InterleavedFormatVersion,
+				Indexes: []descpb.IndexDescriptor{
+					{
+						Unique:       true,
+						ColumnIDs:    []descpb.ColumnID{1},
+						ReferencedBy: []descpb.ForeignKeyReference{{Table: 51, Index: 2}},
+					},
+				},
+			}},
+		},
+		{ // 5
+			// Regression test for #57066: We can handle one of the referenced tables
+			// having a pre-19.2 foreign key reference.
+			err: "",
+			desc: descpb.TableDescriptor{
+				ID:                      51,
+				Name:                    "foo",
+				ParentID:                1,
+				UnexposedParentSchemaID: keys.PublicSchemaID,
+				FormatVersion:           descpb.InterleavedFormatVersion,
+				Indexes: []descpb.IndexDescriptor{
+					{
+						ID:        2,
+						ColumnIDs: []descpb.ColumnID{7},
+						Unique:    true,
+					},
+				},
+				InboundFKs: []descpb.ForeignKeyConstraint{
+					{
+						Name:                "fk",
+						ReferencedTableID:   51,
+						ReferencedColumnIDs: []descpb.ColumnID{7},
+						OriginTableID:       52,
+						OriginColumnIDs:     []descpb.ColumnID{1},
+					},
+				},
+			},
+			otherDescs: []descpb.TableDescriptor{{
+				ID:                      52,
+				Name:                    "baz",
+				ParentID:                1,
+				UnexposedParentSchemaID: keys.PublicSchemaID,
+				FormatVersion:           descpb.InterleavedFormatVersion,
+				Indexes: []descpb.IndexDescriptor{
+					{
+						ID:         2,
+						Unique:     true,
+						ColumnIDs:  []descpb.ColumnID{1},
+						ForeignKey: descpb.ForeignKeyReference{Table: 51, Index: 2},
+					},
+				},
+			}},
+		},
 
 		// Interleaves
-		{
+		{ // 6
 			err: `invalid interleave: missing table=52 index=2: descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -786,7 +1146,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			},
 			otherDescs: nil,
 		},
-		{
+		{ // 7
 			err: `invalid interleave: missing table=baz index=2: index-id "2" does not exist`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -808,7 +1168,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				UnexposedParentSchemaID: keys.PublicSchemaID,
 			}},
 		},
-		{
+		{ // 8
 			err: `missing interleave back reference to "foo"@"bar" from "baz"@"qux"`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -834,7 +1194,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				},
 			}},
 		},
-		{
+		{ // 9
 			err: `invalid interleave backreference table=52 index=2: descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -847,7 +1207,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				},
 			},
 		},
-		{
+		{ // 10
 			err: `invalid interleave backreference table=baz index=2: index-id "2" does not exist`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -866,7 +1226,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				UnexposedParentSchemaID: keys.PublicSchemaID,
 			}},
 		},
-		{
+		{ // 11
 			err: `broken interleave backward reference from "foo"@"bar" to "baz"@"qux"`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -890,7 +1250,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				},
 			}},
 		},
-		{
+		{ // 12
 			err: `type ID 500 in descriptor not found: descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -913,7 +1273,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			},
 		},
 		// Add some expressions with invalid type references.
-		{
+		{ // 13
 			err: `type ID 500 in descriptor not found: descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -936,7 +1296,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				},
 			},
 		},
-		{
+		{ // 14
 			err: `type ID 500 in descriptor not found: descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -959,7 +1319,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				},
 			},
 		},
-		{
+		{ // 15
 			err: `type ID 500 in descriptor not found: descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
@@ -979,12 +1339,14 @@ func TestValidateCrossTableReferences(t *testing.T) {
 		descs := catalog.MapDescGetter{}
 		descs[1] = dbdesc.NewImmutable(descpb.DatabaseDescriptor{ID: 1})
 		for _, otherDesc := range test.otherDescs {
-			otherDesc.Privileges = descpb.NewDefaultPrivilegeDescriptor(security.AdminRole)
+			otherDesc.Privileges = descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName())
 			descs[otherDesc.ID] = NewImmutable(otherDesc)
 		}
 		desc := NewImmutable(test.desc)
 		if err := desc.ValidateCrossReferences(ctx, descs); err == nil {
-			t.Errorf("%d: expected \"%s\", but found success: %+v", i, test.err, test.desc)
+			if test.err != "" {
+				t.Errorf("%d: expected \"%s\", but found success: %+v", i, test.err, test.desc)
+			}
 		} else if test.err != err.Error() && "internal error: "+test.err != err.Error() {
 			t.Errorf("%d: expected \"%s\", but found \"%s\"", i, test.err, err.Error())
 		}
@@ -1326,7 +1688,7 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 				Columns: []descpb.ColumnDescriptor{
 					{ID: 1, Name: "foo"},
 				},
-				Privileges: descpb.NewDefaultPrivilegeDescriptor("root"),
+				Privileges: descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
 			},
 			expUpgrade: true,
 			verify: func(i int, desc *Immutable) {
@@ -1342,7 +1704,7 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 				Columns: []descpb.ColumnDescriptor{
 					{ID: 1, Name: "foo"},
 				},
-				Privileges: descpb.NewDefaultPrivilegeDescriptor("root"),
+				Privileges: descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
 			},
 			expUpgrade: false,
 			verify:     nil,
@@ -1373,7 +1735,7 @@ func TestUnvalidateConstraints(t *testing.T) {
 			{Name: "c", Type: types.Int}},
 		FormatVersion: descpb.FamilyFormatVersion,
 		Indexes:       []descpb.IndexDescriptor{makeIndexDescriptor("d", []string{"b", "a"})},
-		Privileges:    descpb.NewDefaultPrivilegeDescriptor(security.AdminRole),
+		Privileges:    descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()),
 		OutboundFKs: []descpb.ForeignKeyConstraint{
 			{
 				Name:              "fk",

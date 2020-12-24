@@ -18,7 +18,7 @@ import (
 	gosql "database/sql"
 	"flag"
 	"fmt"
-	"go/build"
+	gobuild "go/build"
 	"io"
 	"math"
 	"math/rand"
@@ -38,12 +38,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/mutations"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -60,12 +61,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
@@ -133,6 +134,10 @@ import (
 // A link to the issue will be printed out if the -print-blocklist-issues flag
 // is specified.
 //
+// There is a special blocklist directive '!metamorphic' that skips the whole
+// test when TAGS=metamorphic is specified for the logic test invocation.
+// NOTE: metamorphic directive takes precedence over all other directives.
+//
 // The Test-Script language is extended here for use with CockroachDB. The
 // supported directives are:
 //
@@ -142,6 +147,8 @@ import (
 //      statement ok
 //      CREATE TABLE kv (k INT PRIMARY KEY, v INT)
 //
+//  - statement notice <regexp>
+//    Like "statement ok" but expects a notice that matches the given regexp.
 //
 //  - statement count N
 //    Like "statement ok" but expect a final RowsAffected count of N.
@@ -356,6 +363,7 @@ import (
 
 var (
 	resultsRE = regexp.MustCompile(`^(\d+)\s+values?\s+hashing\s+to\s+([0-9A-Fa-f]+)$`)
+	noticeRE  = regexp.MustCompile(`^statement\s+notice\s+(.*)$`)
 	errorRE   = regexp.MustCompile(`^(?:statement|query)\s+error\s+(?:pgcode\s+([[:alnum:]]+)\s+)?(.*)$`)
 	varRE     = regexp.MustCompile(`\$[a-zA-Z][a-zA-Z_0-9]*`)
 
@@ -490,21 +498,6 @@ var logicTestConfigs = []testClusterConfig{
 		disableUpgrade:      true,
 	},
 	{
-		name:              "local-vec-auto",
-		numNodes:          1,
-		overrideAutoStats: "false",
-		overrideVectorize: "201auto",
-	},
-	{
-		name:                "local-mixed-19.2-20.1",
-		numNodes:            1,
-		overrideDistSQLMode: "off",
-		overrideAutoStats:   "false",
-		bootstrapVersion:    roachpb.Version{Major: 19, Minor: 2},
-		binaryVersion:       roachpb.Version{Major: 20, Minor: 1},
-		disableUpgrade:      true,
-	},
-	{
 		name:                "local-mixed-20.1-20.2",
 		numNodes:            1,
 		overrideDistSQLMode: "off",
@@ -534,24 +527,6 @@ var logicTestConfigs = []testClusterConfig{
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
 		overrideVectorize:   "off",
-	},
-	{
-		name:                "fakedist-vec-auto",
-		numNodes:            3,
-		useFakeSpanResolver: true,
-		overrideDistSQLMode: "on",
-		overrideAutoStats:   "false",
-		overrideVectorize:   "201auto",
-	},
-	{
-		name:                "fakedist-vec-auto-disk",
-		numNodes:            3,
-		useFakeSpanResolver: true,
-		overrideDistSQLMode: "on",
-		overrideAutoStats:   "false",
-		overrideVectorize:   "201auto",
-		sqlExecUseDisk:      true,
-		skipShort:           true,
 	},
 	{
 		name:                       "fakedist-metadata",
@@ -584,22 +559,6 @@ var logicTestConfigs = []testClusterConfig{
 		numNodes:            5,
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
-	},
-	{
-		name:                "5node-vec-auto",
-		numNodes:            5,
-		overrideDistSQLMode: "on",
-		overrideAutoStats:   "false",
-		overrideVectorize:   "201auto",
-	},
-	{
-		name:                "5node-vec-disk-auto",
-		numNodes:            5,
-		overrideDistSQLMode: "on",
-		overrideAutoStats:   "false",
-		overrideVectorize:   "201auto",
-		sqlExecUseDisk:      true,
-		skipShort:           true,
 	},
 	{
 		name:                       "5node-metadata",
@@ -733,12 +692,9 @@ var (
 	defaultConfigNames = []string{
 		"local",
 		"local-vec-off",
-		"local-vec-auto",
 		"local-spec-planning",
 		"fakedist",
 		"fakedist-vec-off",
-		"fakedist-vec-auto",
-		"fakedist-vec-auto-disk",
 		"fakedist-metadata",
 		"fakedist-disk",
 		"fakedist-spec-planning",
@@ -747,8 +703,6 @@ var (
 	fiveNodeDefaultConfigName  = "5node-default-configs"
 	fiveNodeDefaultConfigNames = []string{
 		"5node",
-		"5node-vec-auto",
-		"5node-vec-disk-auto",
 		"5node-metadata",
 		"5node-disk",
 		"5node-spec-planning",
@@ -798,6 +752,8 @@ type logicStatement struct {
 	pos string
 	// SQL string to be sent to the database.
 	sql string
+	// expected notice, if any.
+	expectNotice string
 	// expected error, if any. "" indicates the statement should
 	// succeed.
 	expectErr string
@@ -833,6 +789,12 @@ func (ls *logicStatement) readSQL(
 		}
 		if line == "----" {
 			separator = true
+			if ls.expectNotice != "" {
+				return false, errors.Errorf(
+					"%s: invalid ---- separator after a statement expecting a notice: %s",
+					ls.pos, ls.expectNotice,
+				)
+			}
 			if ls.expectErr != "" {
 				return false, errors.Errorf(
 					"%s: invalid ---- separator after a statement or query expecting an error: %s",
@@ -1150,16 +1112,11 @@ type logicTest struct {
 	curPath   string
 	curLineNo int
 
-	// randomizedVectorizedBatchSize stores the randomized batch size for
-	// vectorized engine if it is not turned off. The batch size will randomly be
-	// set to 1 with 25% probability, {2, 3} with 25% probability or default batch
-	// size with 50% probability.
-	randomizedVectorizedBatchSize int
-	// randomizedMutationsMaxBatchSize stores the randomized max batch size for
-	// the mutation operations. The max batch size will randomly be set to 1
-	// with 25% probability, a random value in [2, 100] range with 25%
-	// probability, or default max batch size with 50% probability.
-	randomizedMutationsMaxBatchSize int
+	// skipOnRetry is explicitly set to true by the skip_on_retry directive.
+	// If true, serializability violations in the test when unexpected cause the
+	// entire test to be skipped and the below skippedOnRetry to be set to true.
+	skipOnRetry    bool
+	skippedOnRetry bool
 }
 
 func (t *logicTest) t() *testing.T {
@@ -1330,6 +1287,9 @@ func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 					DisableOptimizerRuleProbability: *disableOptRuleProbability,
 					OptimizerCostPerturbation:       *optimizerCostPerturbation,
 				},
+				SQLExecutor: &sql.ExecutorTestingKnobs{
+					DeterministicExplainAnalyze: true,
+				},
 			},
 			ClusterName: "testclustername",
 			UseDatabase: "test",
@@ -1340,7 +1300,9 @@ func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 	}
 
 	distSQLKnobs := &execinfra.TestingKnobs{
-		MetadataTestLevel: execinfra.Off, DeterministicStats: true, CheckVectorizedFlowIsClosedCorrectly: true,
+		MetadataTestLevel:                    execinfra.Off,
+		GenerateMockContentionEvents:         true,
+		CheckVectorizedFlowIsClosedCorrectly: true,
 	}
 	if cfg.sqlExecUseDisk {
 		distSQLKnobs.ForceDiskSpill = true
@@ -1414,7 +1376,12 @@ func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 	connsForClusterSettingChanges := []*gosql.DB{t.cluster.ServerConn(0)}
 	if cfg.useTenant {
 		var err error
-		t.tenantAddr, _, err = t.cluster.Server(t.nodeIdx).StartTenant(base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10), AllowSettingClusterSettings: true})
+		tenantArgs := base.TestTenantArgs{
+			TenantID:                    roachpb.MakeTenantID(10),
+			AllowSettingClusterSettings: true,
+			DeterministicExplainAnalyze: true,
+		}
+		t.tenantAddr, _, err = t.cluster.Server(t.nodeIdx).StartTenant(tenantArgs)
 		if err != nil {
 			t.rootT.Fatalf("%+v", err)
 		}
@@ -1493,18 +1460,6 @@ func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 			t.Fatal(err)
 		}
 
-		if _, err := conn.Exec(
-			"SET CLUSTER SETTING sql.testing.vectorize.batch_size = $1", t.randomizedVectorizedBatchSize,
-		); err != nil {
-			t.Fatal(err)
-		}
-
-		if _, err := conn.Exec(
-			"SET CLUSTER SETTING sql.testing.mutations.max_batch_size = $1", t.randomizedMutationsMaxBatchSize,
-		); err != nil {
-			t.Fatal(err)
-		}
-
 		if cfg.overrideAutoStats != "" {
 			if _, err := conn.Exec(
 				"SET CLUSTER SETTING sql.stats.automatic_collection.enabled = $1::bool", cfg.overrideAutoStats,
@@ -1577,7 +1532,7 @@ CREATE DATABASE test;
 		t.Fatal(err)
 	}
 
-	if _, err := t.db.Exec(fmt.Sprintf("CREATE USER %s;", server.TestUser)); err != nil {
+	if _, err := t.db.Exec(fmt.Sprintf("CREATE USER %s;", security.TestUser)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1638,12 +1593,22 @@ func processConfigs(t *testing.T, path string, defaults configSet, configNames [
 
 		blockedConfig, issueNo := getBlocklistIssueNo(configName[1:])
 		if *printBlocklistIssues && issueNo != 0 {
-			t.Logf("will skip %s config in test %s due to issue: %s", blockedConfig, path, unimplemented.MakeURL(issueNo))
+			t.Logf("will skip %s config in test %s due to issue: %s", blockedConfig, path, build.MakeIssueURL(issueNo))
 		}
 		blocklist[blockedConfig] = issueNo
 	}
 
 	var configs configSet
+	if util.IsMetamorphicBuild() {
+		for c := range blocklist {
+			if c == "metamorphic" {
+				// We have a metamorphic build and the file has !metamorphic
+				// blocklist directive which effectively skips the file, so we
+				// simply return empty configSet.
+				return configs
+			}
+		}
+	}
 	if len(blocklist) != 0 && allConfigNamesAreBlocklistDirectives {
 		// No configs specified, this blocklist applies to the default configs.
 		return applyBlocklistToConfigs(defaults, blocklist)
@@ -1753,6 +1718,7 @@ func (t *logicTest) processTestFile(path string, config testClusterConfig) error
 					t.Error(err)
 				}
 			})
+			t.maybeSkipOnRetry(nil)
 		}
 	}
 
@@ -1870,6 +1836,8 @@ func (t *logicTest) processSubtest(
 				)
 			}
 			repeat = count
+		case "skip_on_retry":
+			t.skipOnRetry = true
 
 		case "sleep":
 			var err error
@@ -1892,8 +1860,10 @@ func (t *logicTest) processSubtest(
 				pos:         fmt.Sprintf("\n%s:%d", path, s.line+subtest.lineLineIndexIntoFile),
 				expectCount: -1,
 			}
-			// Parse "statement error <regexp>"
-			if m := errorRE.FindStringSubmatch(s.Text()); m != nil {
+			// Parse "statement (notice|error) <regexp>"
+			if m := noticeRE.FindStringSubmatch(s.Text()); m != nil {
+				stmt.expectNotice = m[1]
+			} else if m := errorRE.FindStringSubmatch(s.Text()); m != nil {
 				stmt.expectErrCode = m[1]
 				stmt.expectErr = m[2]
 			}
@@ -2325,22 +2295,44 @@ func (t *logicTest) processSubtest(
 	return s.Err()
 }
 
-// verifyError checks that either no error was found where none was
-// expected, or that an error was found when one was expected.
+// Some tests encounter serializability failures sometimes and indicate
+// that they want to just get skipped when that happens.
+func (t *logicTest) maybeSkipOnRetry(err error) {
+	if pqErr := (*pq.Error)(nil); t.skippedOnRetry ||
+		(t.skipOnRetry && errors.As(err, &pqErr) &&
+			pgcode.MakeCode(string(pqErr.Code)) == pgcode.SerializationFailure) {
+		t.skippedOnRetry = true
+		skip.WithIssue(t.t(), 53724)
+	}
+}
+
+// verifyError checks that either:
+// - no error was found when none was expected, or
+// - in case no error was found, a notice was found when one was expected, or
+// - an error was found when one was expected.
 // Returns a nil error to indicate the behavior was as expected.  If
 // non-nil, returns also true in the boolean flag whether it is safe
 // to continue (i.e. an error was expected, an error was obtained, and
 // the errors didn't match).
 func (t *logicTest) verifyError(
-	sql, pos, expectErr, expectErrCode string, err error,
+	sql, pos, expectNotice, expectErr, expectErrCode string, err error,
 ) (bool, error) {
 	if expectErr == "" && expectErrCode == "" && err != nil {
+		t.maybeSkipOnRetry(err)
 		cont := t.unexpectedError(sql, pos, err)
 		if cont {
 			// unexpectedError() already reported via t.Errorf. no need for more.
 			err = nil
 		}
 		return cont, err
+	}
+	if expectNotice != "" {
+		foundNotice := strings.Join(t.noticeBuffer, "\n")
+		match, _ := regexp.MatchString(expectNotice, foundNotice)
+		if !match {
+			return false, errors.Errorf("%s: %s\nexpected notice pattern:\n%s\n\ngot:\n%s", pos, sql, expectNotice, foundNotice)
+		}
+		return true, nil
 	}
 	if !testutils.IsError(err, expectErr) {
 		if err == nil {
@@ -2474,7 +2466,7 @@ func (t *logicTest) execStatement(stmt logicStatement) (bool, error) {
 	//   the database in an improper state, so we stop there;
 	// - error on expected error is worth going further, even
 	//   if the obtained error does not match the expected error.
-	cont, err := t.verifyError("", stmt.pos, stmt.expectErr, stmt.expectErrCode, err)
+	cont, err := t.verifyError("", stmt.pos, stmt.expectNotice, stmt.expectErr, stmt.expectErrCode, err)
 	if err != nil {
 		t.finishOne("OK")
 	}
@@ -2517,7 +2509,7 @@ func (t *logicTest) execQuery(query logicQuery) error {
 			err = rows.Err()
 		}
 	}
-	if _, err := t.verifyError(query.sql, query.pos, query.expectErr, query.expectErrCode, err); err != nil {
+	if _, err := t.verifyError(query.sql, query.pos, "", query.expectErr, query.expectErrCode, err); err != nil {
 		return err
 	}
 	if err != nil {
@@ -2678,33 +2670,7 @@ func (t *logicTest) execQuery(query logicQuery) error {
 		}
 	}
 
-	if *rewriteResultsInTestfiles || *rewriteSQL {
-		if query.expectedHash != "" {
-			if query.expectedValues == 1 {
-				t.emit(fmt.Sprintf("1 value hashing to %s", query.expectedHash))
-			} else {
-				t.emit(fmt.Sprintf("%d values hashing to %s", query.expectedValues, query.expectedHash))
-			}
-		}
-
-		if query.checkResults {
-			// If the results match or we're not rewriting, emit them the way they were originally
-			// formatted/ordered in the testfile. Otherwise, emit the actual results.
-			if !*rewriteResultsInTestfiles || reflect.DeepEqual(query.expectedResults, actualResults) {
-				for _, l := range query.expectedResultsRaw {
-					t.emit(l)
-				}
-			} else {
-				// Emit the actual results.
-				for _, line := range t.formatValues(actualResultsRaw, query.valsPerLine) {
-					t.emit(line)
-				}
-			}
-		}
-		return nil
-	}
-
-	if query.checkResults {
+	resultsMatch := func() error {
 		makeError := func() error {
 			var buf bytes.Buffer
 			fmt.Fprintf(&buf, "%s: %s\nexpected:\n", query.pos, query.sql)
@@ -2745,6 +2711,39 @@ func (t *logicTest) execQuery(query logicQuery) error {
 			if !resultMatches {
 				return makeError()
 			}
+		}
+		return nil
+	}
+
+	if *rewriteResultsInTestfiles || *rewriteSQL {
+		if query.expectedHash != "" {
+			if query.expectedValues == 1 {
+				t.emit(fmt.Sprintf("1 value hashing to %s", query.expectedHash))
+			} else {
+				t.emit(fmt.Sprintf("%d values hashing to %s", query.expectedValues, query.expectedHash))
+			}
+		}
+
+		if query.checkResults {
+			// If the results match or we're not rewriting, emit them the way they were originally
+			// formatted/ordered in the testfile. Otherwise, emit the actual results.
+			if !*rewriteResultsInTestfiles || resultsMatch() == nil {
+				for _, l := range query.expectedResultsRaw {
+					t.emit(l)
+				}
+			} else {
+				// Emit the actual results.
+				for _, line := range t.formatValues(actualResultsRaw, query.valsPerLine) {
+					t.emit(line)
+				}
+			}
+		}
+		return nil
+	}
+
+	if query.checkResults {
+		if err := resultsMatch(); err != nil {
+			return err
 		}
 	}
 
@@ -2814,7 +2813,10 @@ func floatsMatch(expectedString, actualString string) (bool, error) {
 	if expPower != actPower {
 		return false, nil
 	}
-	for i := 0; i < 15; i++ {
+	// TODO(yuzefovich): investigate why we can't always guarantee deterministic
+	// 15 significant digits and switch back from 14 to 15 digits comparison
+	// here. See #56446 for more details.
+	for i := 0; i < 14; i++ {
 		expDigit := int(expected)
 		actDigit := int(actual)
 		if expDigit != actDigit {
@@ -2912,6 +2914,36 @@ func (t *logicTest) validateAfterTestCompletion() error {
 		return errors.Errorf("descriptor validation failed:\n%s", invalidObjects)
 	}
 
+	// Ensure that all of the created descriptors can round-trip through json.
+	{
+		rows, err := t.db.Query(
+			`
+SELECT encode(descriptor, 'hex') AS descriptor
+  FROM system.descriptor
+ WHERE descriptor
+       != crdb_internal.json_to_pb(
+            'cockroach.sql.sqlbase.Descriptor',
+            crdb_internal.pb_to_json(
+                'cockroach.sql.sqlbase.Descriptor',
+                descriptor,
+                false -- emit_defaults
+            )
+        );
+`,
+		)
+		if err != nil {
+			return errors.Wrap(err, "failed to test for descriptor JSON round-trip")
+		}
+		rowsMat, err := sqlutils.RowsToStrMatrix(rows)
+		if err != nil {
+			return errors.Wrap(err, "failed read rows from descriptor JSON round-trip")
+		}
+		if len(rowsMat) > 0 {
+			return errors.Errorf("some descriptors did not round-trip:\n%s",
+				sqlutils.MatrixToStr(rowsMat))
+		}
+	}
+
 	// TODO(lucy): we should really drop all created databases in this test, not
 	// just the one we started with.
 	stmt := "SET sql_safe_updates=false; DROP DATABASE IF EXISTS test CASCADE"
@@ -2961,11 +2993,6 @@ type TestServerArgs struct {
 	// actually in-memory). If it is unset, then the default limit of 100MB
 	// will be used.
 	tempStorageDiskLimit int64
-	// DisableMutationsMaxBatchSizeRandomization determines whether the test
-	// runner should randomize the max batch size for mutation operations. This
-	// should only be set to 'true' when the tests expect to return different
-	// output when the KV batches of writes have different boundaries.
-	DisableMutationsMaxBatchSizeRandomization bool
 }
 
 // RunLogicTest is the main entry point for the logic test. The globs parameter
@@ -3068,23 +3095,6 @@ func RunLogicTestWithDefaultConfig(
 		}
 	}
 
-	// Determining whether or not to randomize vectorized batch size.
-	rng, _ := randutil.NewPseudoRand()
-	randomizedVectorizedBatchSize := randomValue(rng, []int{1, 2, 3}, []float64{0.25, 0.125, 0.125}, coldata.BatchSize())
-	if randomizedVectorizedBatchSize != coldata.BatchSize() {
-		t.Log(fmt.Sprintf("randomize coldata.BatchSize to %d", randomizedVectorizedBatchSize))
-	}
-	randomizedMutationsMaxBatchSize := mutations.MaxBatchSize()
-	// Temporarily disable this randomization because of #54948.
-	// TODO(yuzefovich): re-enable it once the issue is figured out.
-	serverArgs.DisableMutationsMaxBatchSizeRandomization = true
-	if !serverArgs.DisableMutationsMaxBatchSizeRandomization {
-		randomizedMutationsMaxBatchSize = randomValue(rng, []int{1, 2 + rng.Intn(99)}, []float64{0.25, 0.25}, mutations.MaxBatchSize())
-		if randomizedMutationsMaxBatchSize != mutations.MaxBatchSize() {
-			t.Log(fmt.Sprintf("randomize mutations.MaxBatchSize to %d", randomizedMutationsMaxBatchSize))
-		}
-	}
-
 	// The tests below are likely to run concurrently; `log` is shared
 	// between all the goroutines and thus all tests, so it doesn't make
 	// sense to try to use separate `log.Scope` instances for each test.
@@ -3138,12 +3148,10 @@ func RunLogicTestWithDefaultConfig(
 					}
 					rng, _ := randutil.NewPseudoRand()
 					lt := logicTest{
-						rootT:                           t,
-						verbose:                         verbose,
-						perErrorSummary:                 make(map[string][]string),
-						rng:                             rng,
-						randomizedVectorizedBatchSize:   randomizedVectorizedBatchSize,
-						randomizedMutationsMaxBatchSize: randomizedMutationsMaxBatchSize,
+						rootT:           t,
+						verbose:         verbose,
+						perErrorSummary: make(map[string][]string),
+						rng:             rng,
 					}
 					if *printErrorSummary {
 						defer lt.printErrorSummary()
@@ -3235,8 +3243,8 @@ func runSQLLiteLogicTest(t *testing.T, configOverride string, globs ...string) {
 		skip.IgnoreLint(t, "-bigtest flag must be specified to run this test")
 	}
 
-	logicTestPath := build.Default.GOPATH + "/src/github.com/cockroachdb/sqllogictest"
-	if _, err := os.Stat(logicTestPath); os.IsNotExist(err) {
+	logicTestPath := gobuild.Default.GOPATH + "/src/github.com/cockroachdb/sqllogictest"
+	if _, err := os.Stat(logicTestPath); oserror.IsNotExist(err) {
 		fullPath, err := filepath.Abs(logicTestPath)
 		if err != nil {
 			t.Fatal(err)
@@ -3441,30 +3449,4 @@ func (t *logicTest) printCompletion(path string, config testClusterConfig) {
 	}
 	t.outf("--- done: %s with config %s: %d tests, %d failures%s", path, config.name,
 		t.progress, t.failures, unsupportedMsg)
-}
-
-// randomValue randomly chooses one element from values according to
-// probabilities (the sum of which must not exceed 1.0). If the sum of
-// probabilities is less than 1.0, then defaultValue will be chosen in 1.0-sum
-// proportion of cases.
-func randomValue(rng *rand.Rand, values []int, probabilities []float64, defaultValue int) int {
-	if len(values) != len(probabilities) {
-		panic(errors.AssertionFailedf("mismatched number of values %d and probabilities %d", len(values), len(probabilities)))
-	}
-	probabilitiesSum := 0.0
-	for _, p := range probabilities {
-		probabilitiesSum += p
-	}
-	if probabilitiesSum > 1.0 {
-		panic(errors.AssertionFailedf("sum of probabilities %v is larger than 1.0", probabilities))
-	}
-	randVal := rng.Float64()
-	probabilitiesSum = 0
-	for i, p := range probabilities {
-		if randVal < probabilitiesSum+p {
-			return values[i]
-		}
-		probabilitiesSum += p
-	}
-	return defaultValue
 }

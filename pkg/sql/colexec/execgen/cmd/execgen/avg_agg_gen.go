@@ -16,6 +16,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -23,6 +24,7 @@ import (
 )
 
 type avgTmplInfo struct {
+	aggTmplInfoBase
 	NeedsHelper    bool
 	InputVecMethod string
 	RetGoType      string
@@ -85,8 +87,10 @@ func genAvgAgg(inputFileContents string, wr io.Writer) error {
 	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 6)
 	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.AssignAdd", 6))
 
-	accumulateAvg := makeFunctionRegex("_ACCUMULATE_AVG", 4)
-	s = accumulateAvg.ReplaceAllString(s, `{{template "accumulateAvg" buildDict "Global" . "HasNulls" $4}}`)
+	accumulateAvg := makeFunctionRegex("_ACCUMULATE_AVG", 5)
+	s = accumulateAvg.ReplaceAllString(s, `{{template "accumulateAvg" buildDict "Global" . "HasNulls" $4 "HasSel" $5}}`)
+
+	s = replaceManipulationFuncs(s)
 
 	tmpl, err := template.New("avg_agg").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
 	if err != nil {
@@ -113,6 +117,9 @@ func genAvgAgg(inputFileContents string, wr io.Writer) error {
 			retType = types.Decimal
 		}
 		tmplInfos = append(tmplInfos, avgTmplInfo{
+			aggTmplInfoBase: aggTmplInfoBase{
+				canonicalTypeFamily: typeconv.TypeFamilyToCanonicalTypeFamily(retType.Family()),
+			},
 			NeedsHelper:    needsHelper,
 			InputVecMethod: toVecMethod(inputType.Family(), inputType.Width()),
 			RetGoType:      toPhysicalRepresentation(retType.Family(), retType.Width()),

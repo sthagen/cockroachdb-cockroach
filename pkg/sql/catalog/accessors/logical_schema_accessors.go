@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -34,22 +35,45 @@ import (
 // NewLogicalAccessor constructs a new accessor given an underlying physical
 // accessor and VirtualSchemas.
 func NewLogicalAccessor(
-	physicalAccessor catalog.Accessor, vs catalog.VirtualSchemas,
+	descsCol *descs.Collection, vs catalog.VirtualSchemas,
 ) *LogicalSchemaAccessor {
 	return &LogicalSchemaAccessor{
-		Accessor: physicalAccessor,
-		vs:       vs,
+		tc: descsCol,
+		vs: vs,
 	}
 }
 
 // LogicalSchemaAccessor extends an existing DatabaseLister with the
 // ability to list tables in a virtual schema.
 type LogicalSchemaAccessor struct {
-	catalog.Accessor
+	tc *descs.Collection
 	vs catalog.VirtualSchemas
 }
 
-var _ catalog.Accessor = &LogicalSchemaAccessor{}
+// GetDatabaseDesc implements the Accessor interface.
+//
+// Warning: This method uses no virtual schema information and only exists to
+// accommodate the existing resolver.SchemaResolver interface (see #58228).
+// Use GetMutableDatabaseByName() and GetImmutableDatabaseByName() on
+// descs.Collection instead when possible.
+func (l *LogicalSchemaAccessor) GetDatabaseDesc(
+	ctx context.Context,
+	txn *kv.Txn,
+	codec keys.SQLCodec,
+	name string,
+	flags tree.DatabaseLookupFlags,
+) (desc catalog.DatabaseDescriptor, err error) {
+	var found bool
+	if flags.RequireMutable {
+		found, desc, err = l.tc.GetMutableDatabaseByName(ctx, txn, name, flags)
+	} else {
+		found, desc, err = l.tc.GetImmutableDatabaseByName(ctx, txn, name, flags)
+	}
+	if err != nil || !found {
+		return nil, err
+	}
+	return desc, err
+}
 
 // GetSchema implements the Accessor interface.
 func (l *LogicalSchemaAccessor) GetSchema(
@@ -65,7 +89,10 @@ func (l *LogicalSchemaAccessor) GetSchema(
 	}
 
 	// Fallthrough.
-	return l.Accessor.GetSchema(ctx, txn, codec, dbID, scName, flags)
+	if flags.RequireMutable {
+		return l.tc.GetMutableSchemaByName(ctx, txn, dbID, scName, flags)
+	}
+	return l.tc.GetImmutableSchemaByName(ctx, txn, dbID, scName, flags)
 }
 
 // GetObjectNames implements the DatabaseLister interface.
@@ -91,7 +118,7 @@ func (l *LogicalSchemaAccessor) GetObjectNames(
 	}
 
 	// Fallthrough.
-	return l.Accessor.GetObjectNames(ctx, txn, codec, dbDesc, scName, flags)
+	return l.tc.GetObjectNames(ctx, txn, dbDesc, scName, flags)
 }
 
 // GetObjectDesc implements the ObjectAccessor interface.
@@ -102,7 +129,7 @@ func (l *LogicalSchemaAccessor) GetObjectDesc(
 	codec keys.SQLCodec,
 	db, schema, object string,
 	flags tree.ObjectLookupFlags,
-) (catalog.Descriptor, error) {
+) (desc catalog.Descriptor, err error) {
 	if scEntry, ok := l.vs.GetVirtualSchema(schema); ok {
 		desc, err := scEntry.GetObjectByName(object, flags)
 		if err != nil {
@@ -132,8 +159,30 @@ func (l *LogicalSchemaAccessor) GetObjectDesc(
 		}
 	}
 
-	// Fallthrough.
-	return l.Accessor.GetObjectDesc(ctx, txn, settings, codec, db, schema, object, flags)
+	// Fall back to physical descriptor access.
+	var found bool
+	switch flags.DesiredObjectKind {
+	case tree.TypeObject:
+		typeName := tree.MakeNewQualifiedTypeName(db, schema, object)
+		if flags.RequireMutable {
+			found, desc, err = l.tc.GetMutableTypeByName(ctx, txn, &typeName, flags)
+		} else {
+			found, desc, err = l.tc.GetImmutableTypeByName(ctx, txn, &typeName, flags)
+		}
+	case tree.TableObject:
+		tableName := tree.MakeTableNameWithSchema(tree.Name(db), tree.Name(schema), tree.Name(object))
+		if flags.RequireMutable {
+			found, desc, err = l.tc.GetMutableTableByName(ctx, txn, &tableName, flags)
+		} else {
+			found, desc, err = l.tc.GetImmutableTableByName(ctx, txn, &tableName, flags)
+		}
+	default:
+		return nil, errors.AssertionFailedf("unknown desired object kind %d", flags.DesiredObjectKind)
+	}
+	if err != nil || !found {
+		return nil, err
+	}
+	return desc, nil
 }
 
 func newMutableAccessToVirtualSchemaError(entry catalog.VirtualSchema, object string) error {

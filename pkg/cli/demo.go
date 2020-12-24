@@ -48,9 +48,14 @@ environment variable "COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING" to true.
 `,
 	Example: `  cockroach demo`,
 	Args:    cobra.NoArgs,
-	RunE: MaybeDecorateGRPCError(func(cmd *cobra.Command, _ []string) error {
+	// Note: RunE is set in the init() function below to avoid an
+	// initialization cycle.
+}
+
+func init() {
+	demoCmd.RunE = MaybeDecorateGRPCError(func(cmd *cobra.Command, _ []string) error {
 		return runDemo(cmd, nil /* gen */)
-	}),
+	})
 }
 
 const demoOrg = "Cockroach Demo"
@@ -193,7 +198,7 @@ func checkDemoConfiguration(
 	}
 
 	demoCtx.disableTelemetry = cluster.TelemetryOptOut()
-	// disableLicenseAcquisition can also be set by the the user as an
+	// disableLicenseAcquisition can also be set by the user as an
 	// input flag, so make sure it include it when considering the final
 	// value of disableLicenseAcquisition.
 	demoCtx.disableLicenseAcquisition =
@@ -268,10 +273,6 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (err error) {
 		return err
 	}
 	defer c.cleanup(ctx)
-
-	if err := checkTzDatabaseAvailability(ctx); err != nil {
-		return err
-	}
 
 	loc, err := geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, startCtx.geoLibsDir)
 	if err != nil {

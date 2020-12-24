@@ -55,14 +55,18 @@ func buildOpaque(
 		plan, err = p.AlterDatabaseAddRegion(ctx, n)
 	case *tree.AlterDatabaseDropRegion:
 		plan, err = p.AlterDatabaseDropRegion(ctx, n)
-	case *tree.AlterDatabaseSurvive:
-		plan, err = p.AlterDatabaseSurvive(ctx, n)
+	case *tree.AlterDatabasePrimaryRegion:
+		plan, err = p.AlterDatabasePrimaryRegion(ctx, n)
+	case *tree.AlterDatabaseSurvivalGoal:
+		plan, err = p.AlterDatabaseSurvivalGoal(ctx, n)
 	case *tree.AlterIndex:
 		plan, err = p.AlterIndex(ctx, n)
 	case *tree.AlterSchema:
 		plan, err = p.AlterSchema(ctx, n)
 	case *tree.AlterTable:
 		plan, err = p.AlterTable(ctx, n)
+	case *tree.AlterTableLocality:
+		plan, err = p.AlterTableLocality(ctx, n)
 	case *tree.AlterTableSetSchema:
 		plan, err = p.AlterTableSetSchema(ctx, n)
 	case *tree.AlterType:
@@ -71,8 +75,6 @@ func buildOpaque(
 		plan, err = p.AlterRole(ctx, n)
 	case *tree.AlterSequence:
 		plan, err = p.AlterSequence(ctx, n)
-	case *tree.Analyze:
-		plan, err = p.Analyze(ctx, n)
 	case *tree.CommentOnColumn:
 		plan, err = p.CommentOnColumn(ctx, n)
 	case *tree.CommentOnDatabase:
@@ -93,8 +95,6 @@ func buildOpaque(
 		plan, err = p.CreateRole(ctx, n)
 	case *tree.CreateSequence:
 		plan, err = p.CreateSequence(ctx, n)
-	case *tree.CreateStats:
-		plan, err = p.CreateStatistics(ctx, n)
 	case *tree.CreateExtension:
 		plan, err = p.CreateExtension(ctx, n)
 	case *tree.Deallocate:
@@ -183,6 +183,9 @@ func buildOpaque(
 	if err != nil {
 		return nil, err
 	}
+	if plan == nil {
+		return nil, errors.AssertionFailedf("planNode cannot be nil for %T", stmt)
+	}
 	res := &opaqueMetadata{
 		info:    stmt.StatementTag(),
 		plan:    plan,
@@ -196,15 +199,16 @@ func init() {
 		&tree.AlterDatabaseAddRegion{},
 		&tree.AlterDatabaseDropRegion{},
 		&tree.AlterDatabaseOwner{},
-		&tree.AlterDatabaseSurvive{},
+		&tree.AlterDatabasePrimaryRegion{},
+		&tree.AlterDatabaseSurvivalGoal{},
 		&tree.AlterIndex{},
 		&tree.AlterSchema{},
 		&tree.AlterTable{},
+		&tree.AlterTableLocality{},
 		&tree.AlterTableSetSchema{},
 		&tree.AlterType{},
 		&tree.AlterSequence{},
 		&tree.AlterRole{},
-		&tree.Analyze{},
 		&tree.CommentOnColumn{},
 		&tree.CommentOnDatabase{},
 		&tree.CommentOnIndex{},
@@ -214,7 +218,6 @@ func init() {
 		&tree.CreateIndex{},
 		&tree.CreateSchema{},
 		&tree.CreateSequence{},
-		&tree.CreateStats{},
 		&tree.CreateType{},
 		&tree.CreateRole{},
 		&tree.Deallocate{},

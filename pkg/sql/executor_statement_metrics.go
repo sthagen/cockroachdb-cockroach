@@ -179,7 +179,7 @@ func (ex *connExecutor) recordStatementSummary(
 	// overhead latency: txn/retry management, error checking, etc
 	execOverhead := svcLat - processingLat
 
-	stmt := planner.stmt
+	stmt := &planner.stmt
 	flags := planner.curPlan.flags
 	if automaticRetryCount == 0 {
 		ex.updateOptCounters(flags)
@@ -196,7 +196,7 @@ func (ex *connExecutor) recordStatementSummary(
 	}
 
 	stmtID := ex.statsCollector.recordStatement(
-		stmt, planner.curPlan.planForStats,
+		stmt, planner.instrumentation.PlanForStats(ctx),
 		flags.IsDistributed(), flags.IsSet(planFlagVectorized),
 		flags.IsSet(planFlagImplicitTxn), automaticRetryCount, rowsAffected, err,
 		parseLat, planLat, runLat, svcLat, execOverhead, stats,

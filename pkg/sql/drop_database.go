@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -44,6 +45,14 @@ type dropDatabaseNode struct {
 //   Notes: postgres allows only the database owner to DROP a database.
 //          mysql requires the DROP privileges on the database.
 func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"DROP DATABASE",
+	); err != nil {
+		return nil, err
+	}
+
 	if n.Name == "" {
 		return nil, errEmptyDatabaseName
 	}
@@ -53,11 +62,12 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 	}
 
 	// Check that the database exists.
-	dbDesc, err := p.ResolveMutableDatabaseDescriptor(ctx, string(n.Name), !n.IfExists)
+	found, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
+		tree.DatabaseLookupFlags{Required: !n.IfExists})
 	if err != nil {
 		return nil, err
 	}
-	if dbDesc == nil {
+	if !found {
 		// IfExists was specified and database was not found.
 		return newZeroNode(nil /* columns */), nil
 	}
@@ -121,7 +131,8 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 	p := params.p
 
 	var schemasIDsToDelete []descpb.ID
-	for _, schemaToDelete := range n.d.schemasToDelete {
+	for _, schemaWithDbDesc := range n.d.schemasToDelete {
+		schemaToDelete := schemaWithDbDesc.schema
 		switch schemaToDelete.Kind {
 		case catalog.SchemaTemporary, catalog.SchemaPublic:
 			// The public schema and temporary schemas are cleaned up by just removing
@@ -186,19 +197,12 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 
 	// Log Drop Database event. This is an auditable log event and is recorded
 	// in the same transaction as the table descriptor update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		ctx,
-		p.txn,
-		EventLogDropDatabase,
-		int32(n.dbDesc.GetID()),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			DatabaseName         string
-			Statement            string
-			User                 string
-			DroppedSchemaObjects []string
-		}{n.n.Name.String(), n.n.String(), p.SessionData().User, n.d.droppedNames},
-	)
+	return p.logEvent(ctx,
+		n.dbDesc.GetID(),
+		&eventpb.DropDatabase{
+			DatabaseName:         n.n.Name.String(),
+			DroppedSchemaObjects: n.d.droppedNames,
+		})
 }
 
 func (*dropDatabaseNode) Next(runParams) (bool, error) { return false, nil }
@@ -308,7 +312,7 @@ func (p *planner) removeDbComment(ctx context.Context, dbID descpb.ID) error {
 		ctx,
 		"delete-db-comment",
 		p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=0",
 		keys.DatabaseCommentType,
 		dbID)

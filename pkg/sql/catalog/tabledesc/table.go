@@ -19,9 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -64,15 +64,11 @@ func MakeColumnDefDescs(
 		// Should never happen since `HoistConstraints` moves these to table level
 		return nil, nil, nil, errors.New("unexpected column REFERENCED constraint")
 	}
-	if d.Unique.WithoutIndex {
-		return nil, nil, nil, pgerror.New(pgcode.FeatureNotSupported,
-			"unique constraints without an index are not yet supported",
-		)
-	}
 
 	col := &descpb.ColumnDescriptor{
 		Name:     string(d.Name),
 		Nullable: d.Nullable.Nullability != tree.NotNull && !d.PrimaryKey.IsPrimaryKey,
+		Virtual:  d.IsVirtual(),
 	}
 
 	// Validate and assign column type.
@@ -180,7 +176,7 @@ func GetShardColumnName(colNames []string, buckets int32) string {
 }
 
 // GetConstraintInfo returns a summary of all constraints on the table.
-func (desc *Immutable) GetConstraintInfo(
+func (desc *wrapper) GetConstraintInfo(
 	ctx context.Context, dg catalog.DescGetter,
 ) (map[string]descpb.ConstraintDetail, error) {
 	var tableLookup catalog.TableLookupFn
@@ -194,7 +190,7 @@ func (desc *Immutable) GetConstraintInfo(
 
 // GetConstraintInfoWithLookup returns a summary of all constraints on the
 // table using the provided function to fetch a TableDescriptor from an ID.
-func (desc *Immutable) GetConstraintInfoWithLookup(
+func (desc *wrapper) GetConstraintInfoWithLookup(
 	tableLookup catalog.TableLookupFn,
 ) (map[string]descpb.ConstraintDetail, error) {
 	return desc.collectConstraintInfo(tableLookup)
@@ -202,19 +198,19 @@ func (desc *Immutable) GetConstraintInfoWithLookup(
 
 // CheckUniqueConstraints returns a non-nil error if a descriptor contains two
 // constraints with the same name.
-func (desc *Immutable) CheckUniqueConstraints() error {
+func (desc *wrapper) CheckUniqueConstraints() error {
 	_, err := desc.collectConstraintInfo(nil)
 	return err
 }
 
 // if `tableLookup` is non-nil, provide a full summary of constraints, otherwise just
 // check that constraints have unique names.
-func (desc *Immutable) collectConstraintInfo(
+func (desc *wrapper) collectConstraintInfo(
 	tableLookup catalog.TableLookupFn,
 ) (map[string]descpb.ConstraintDetail, error) {
 	info := make(map[string]descpb.ConstraintDetail)
 
-	// Indexes provide PK and Unique constraints.
+	// Indexes provide PK and Unique constraints that are enforced by an index.
 	indexes := desc.AllNonDropIndexes()
 	for _, index := range indexes {
 		if index.ID == desc.PrimaryIndex.ID {
@@ -254,6 +250,23 @@ func (desc *Immutable) collectConstraintInfo(
 			detail.Index = index
 			info[index.Name] = detail
 		}
+	}
+
+	// Get the unique constraints that are not enforced by an index.
+	ucs := desc.AllActiveAndInactiveUniqueWithoutIndexConstraints()
+	for _, uc := range ucs {
+		if _, ok := info[uc.Name]; ok {
+			return nil, pgerror.Newf(pgcode.DuplicateObject,
+				"duplicate constraint name: %q", uc.Name)
+		}
+		detail := descpb.ConstraintDetail{Kind: descpb.ConstraintTypeUnique}
+		var err error
+		detail.Columns, err = desc.NamesForColumnIDs(uc.ColumnIDs)
+		if err != nil {
+			return nil, err
+		}
+		detail.UniqueWithoutIndexConstraint = uc
+		info[uc.Name] = detail
 	}
 
 	fks := desc.AllActiveAndInactiveForeignKeys()
@@ -416,7 +429,7 @@ func InitTableDescriptor(
 	persistence tree.Persistence,
 ) Mutable {
 	return Mutable{
-		Immutable: Immutable{
+		wrapper: wrapper{
 			TableDescriptor: descpb.TableDescriptor{
 				ID:                      id,
 				Name:                    name,

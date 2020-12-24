@@ -36,7 +36,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/tracker"
+	"go.etcd.io/etcd/raft/v3/tracker"
 )
 
 func TestReplicateQueueRebalance(t *testing.T) {
@@ -225,7 +225,7 @@ func TestReplicateQueueUpReplicate(t *testing.T) {
 	})
 
 	infos, err := filterRangeLog(
-		tc.Conns[0], kvserverpb.RangeLogEventType_add, kvserverpb.ReasonRangeUnderReplicated,
+		tc.Conns[0], kvserverpb.RangeLogEventType_add_voter, kvserverpb.ReasonRangeUnderReplicated,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -240,6 +240,8 @@ func TestReplicateQueueUpReplicate(t *testing.T) {
 func TestReplicateQueueDownReplicate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderRace(t, "takes >1min under race")
+
 	ctx := context.Background()
 	const replicaCount = 3
 
@@ -286,7 +288,7 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 	})
 
 	infos, err := filterRangeLog(
-		tc.Conns[0], kvserverpb.RangeLogEventType_remove, kvserverpb.ReasonRangeOverReplicated,
+		tc.Conns[0], kvserverpb.RangeLogEventType_remove_voter, kvserverpb.ReasonRangeOverReplicated,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -496,6 +498,7 @@ func (h delayingRaftMessageHandler) HandleRaftRequest(
 func TestTransferLeaseToLaggingNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderRace(t, "takes >1min under race")
 
 	ctx := context.Background()
 	clusterArgs := base.TestClusterArgs{

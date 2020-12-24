@@ -97,20 +97,6 @@ func (n *twoInputNode) Child(nth int, verbose bool) execinfra.OpNode {
 	return nil
 }
 
-// TODO(yuzefovich): audit all Operators to make sure that all internal memory
-// is accounted for.
-
-// InternalMemoryOperator is an interface that operators which use internal
-// memory need to implement. "Internal memory" is defined as memory that is
-// "private" to the operator and is not exposed to the outside; notably, it
-// does *not* include any coldata.Batch'es and coldata.Vec's.
-type InternalMemoryOperator interface {
-	colexecbase.Operator
-	// InternalMemoryUsage reports the internal memory usage (in bytes) of an
-	// operator.
-	InternalMemoryUsage() int
-}
-
 // resetter is an interface that operators can implement if they can be reset
 // either for reusing (to keep the already allocated memory) or during tests.
 type resetter interface {
@@ -121,6 +107,20 @@ type resetter interface {
 type ResettableOperator interface {
 	colexecbase.Operator
 	resetter
+}
+
+// isOperatorChainResettable traverses the whole operator tree rooted at op and
+// returns true if all nodes are resetters.
+func isOperatorChainResettable(op execinfra.OpNode) bool {
+	if _, resettable := op.(resetter); !resettable {
+		return false
+	}
+	for i := 0; i < op.ChildCount(true /* verbose */); i++ {
+		if !isOperatorChainResettable(op.Child(i, true /* verbose */)) {
+			return false
+		}
+	}
+	return true
 }
 
 // CallbackCloser is a utility struct that implements the Closer interface by
@@ -228,53 +228,43 @@ func (s *zeroOperator) Next(ctx context.Context) coldata.Batch {
 	return coldata.ZeroBatch
 }
 
-type zeroOperatorNoInput struct {
+type fixedNumTuplesNoInputOp struct {
 	colexecbase.ZeroInputNode
 	NonExplainable
+	batch         coldata.Batch
+	numTuplesLeft int
 }
 
-var _ colexecbase.Operator = &zeroOperatorNoInput{}
+var _ colexecbase.Operator = &fixedNumTuplesNoInputOp{}
 
-// NewZeroOpNoInput creates a new operator which just returns an empty batch
-// and doesn't an input.
-func NewZeroOpNoInput() colexecbase.Operator {
-	return &zeroOperatorNoInput{}
-}
-
-func (s *zeroOperatorNoInput) Init() {}
-
-func (s *zeroOperatorNoInput) Next(ctx context.Context) coldata.Batch {
-	return coldata.ZeroBatch
-}
-
-type singleTupleNoInputOperator struct {
-	colexecbase.ZeroInputNode
-	NonExplainable
-	batch  coldata.Batch
-	nexted bool
-}
-
-var _ colexecbase.Operator = &singleTupleNoInputOperator{}
-
-// NewSingleTupleNoInputOp creates a new Operator which returns a batch of
-// length 1 with no actual columns on the first call to Next() and zero-length
-// batches on all consecutive calls.
-func NewSingleTupleNoInputOp(allocator *colmem.Allocator) colexecbase.Operator {
-	return &singleTupleNoInputOperator{
-		batch: allocator.NewMemBatchWithFixedCapacity(nil /* types */, 1 /* size */),
+// NewFixedNumTuplesNoInputOp creates a new Operator which returns batches with
+// no actual columns that have specified number of tuples as the sum of their
+// lengths.
+func NewFixedNumTuplesNoInputOp(allocator *colmem.Allocator, numTuples int) colexecbase.Operator {
+	capacity := numTuples
+	if capacity > coldata.BatchSize() {
+		capacity = coldata.BatchSize()
+	}
+	return &fixedNumTuplesNoInputOp{
+		batch:         allocator.NewMemBatchWithFixedCapacity(nil /* types */, capacity),
+		numTuplesLeft: numTuples,
 	}
 }
 
-func (s *singleTupleNoInputOperator) Init() {
+func (s *fixedNumTuplesNoInputOp) Init() {
 }
 
-func (s *singleTupleNoInputOperator) Next(ctx context.Context) coldata.Batch {
+func (s *fixedNumTuplesNoInputOp) Next(context.Context) coldata.Batch {
 	s.batch.ResetInternalBatch()
-	if s.nexted {
+	if s.numTuplesLeft == 0 {
 		return coldata.ZeroBatch
 	}
-	s.nexted = true
-	s.batch.SetLength(1)
+	length := s.numTuplesLeft
+	if length > coldata.BatchSize() {
+		length = coldata.BatchSize()
+	}
+	s.numTuplesLeft -= length
+	s.batch.SetLength(length)
 	return s.batch
 }
 

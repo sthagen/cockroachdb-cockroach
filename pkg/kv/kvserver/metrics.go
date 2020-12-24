@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 var (
@@ -443,15 +443,21 @@ var (
 		Measurement: "Snapshots",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaRangeSnapshotsNormalApplied = metric.Metadata{
-		Name:        "range.snapshots.normal-applied",
-		Help:        "Number of applied snapshots",
+	metaRangeSnapshotsAppliedByVoters = metric.Metadata{
+		Name:        "range.snapshots.applied-voter",
+		Help:        "Number of snapshots applied by voter replicas",
 		Measurement: "Snapshots",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaRangeSnapshotsLearnerApplied = metric.Metadata{
-		Name:        "range.snapshots.learner-applied",
-		Help:        "Number of applied learner snapshots",
+	metaRangeSnapshotsAppliedForInitialUpreplication = metric.Metadata{
+		Name:        "range.snapshots.applied-initial",
+		Help:        "Number of snapshots applied for initial upreplication",
+		Measurement: "Snapshots",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRangeSnapshotsAppliedByNonVoter = metric.Metadata{
+		Name:        "range.snapshots.applied-non-voter",
+		Help:        "Number of snapshots applied by non-voter replicas",
 		Measurement: "Snapshots",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -508,6 +514,12 @@ var (
 	metaRaftApplyCommittedLatency = metric.Metadata{
 		Name:        "raft.process.applycommitted.latency",
 		Help:        "Latency histogram for applying all committed Raft commands in a Raft ready",
+		Measurement: "Latency",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaRaftSchedulerLatency = metric.Metadata{
+		Name:        "raft.scheduler.latency",
+		Help:        "Nanoseconds spent waiting for a range to be processed by the Raft scheduler",
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
@@ -1101,14 +1113,15 @@ type StoreMetrics struct {
 	// accordingly.
 
 	// Range event metrics.
-	RangeSplits                  *metric.Counter
-	RangeMerges                  *metric.Counter
-	RangeAdds                    *metric.Counter
-	RangeRemoves                 *metric.Counter
-	RangeSnapshotsGenerated      *metric.Counter
-	RangeSnapshotsNormalApplied  *metric.Counter
-	RangeSnapshotsLearnerApplied *metric.Counter
-	RangeRaftLeaderTransfers     *metric.Counter
+	RangeSplits                                  *metric.Counter
+	RangeMerges                                  *metric.Counter
+	RangeAdds                                    *metric.Counter
+	RangeRemoves                                 *metric.Counter
+	RangeSnapshotsGenerated                      *metric.Counter
+	RangeSnapshotsAppliedByVoters                *metric.Counter
+	RangeSnapshotsAppliedForInitialUpreplication *metric.Counter
+	RangeSnapshotsAppliedByNonVoters             *metric.Counter
+	RangeRaftLeaderTransfers                     *metric.Counter
 
 	// Raft processing metrics.
 	RaftTicks                 *metric.Counter
@@ -1119,6 +1132,7 @@ type StoreMetrics struct {
 	RaftCommandCommitLatency  *metric.Histogram
 	RaftHandleReadyLatency    *metric.Histogram
 	RaftApplyCommittedLatency *metric.Histogram
+	RaftSchedulerLatency      *metric.Histogram
 
 	// Raft message metrics.
 	//
@@ -1465,14 +1479,15 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		DiskStalled: metric.NewGauge(metaDiskStalled),
 
 		// Range event metrics.
-		RangeSplits:                  metric.NewCounter(metaRangeSplits),
-		RangeMerges:                  metric.NewCounter(metaRangeMerges),
-		RangeAdds:                    metric.NewCounter(metaRangeAdds),
-		RangeRemoves:                 metric.NewCounter(metaRangeRemoves),
-		RangeSnapshotsGenerated:      metric.NewCounter(metaRangeSnapshotsGenerated),
-		RangeSnapshotsNormalApplied:  metric.NewCounter(metaRangeSnapshotsNormalApplied),
-		RangeSnapshotsLearnerApplied: metric.NewCounter(metaRangeSnapshotsLearnerApplied),
-		RangeRaftLeaderTransfers:     metric.NewCounter(metaRangeRaftLeaderTransfers),
+		RangeSplits:                   metric.NewCounter(metaRangeSplits),
+		RangeMerges:                   metric.NewCounter(metaRangeMerges),
+		RangeAdds:                     metric.NewCounter(metaRangeAdds),
+		RangeRemoves:                  metric.NewCounter(metaRangeRemoves),
+		RangeSnapshotsGenerated:       metric.NewCounter(metaRangeSnapshotsGenerated),
+		RangeSnapshotsAppliedByVoters: metric.NewCounter(metaRangeSnapshotsAppliedByVoters),
+		RangeSnapshotsAppliedForInitialUpreplication: metric.NewCounter(metaRangeSnapshotsAppliedForInitialUpreplication),
+		RangeSnapshotsAppliedByNonVoters:             metric.NewCounter(metaRangeSnapshotsAppliedByNonVoter),
+		RangeRaftLeaderTransfers:                     metric.NewCounter(metaRangeRaftLeaderTransfers),
 
 		// Raft processing metrics.
 		RaftTicks:                 metric.NewCounter(metaRaftTicks),
@@ -1483,6 +1498,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RaftCommandCommitLatency:  metric.NewLatency(metaRaftCommandCommitLatency, histogramWindow),
 		RaftHandleReadyLatency:    metric.NewLatency(metaRaftHandleReadyLatency, histogramWindow),
 		RaftApplyCommittedLatency: metric.NewLatency(metaRaftApplyCommittedLatency, histogramWindow),
+		RaftSchedulerLatency:      metric.NewLatency(metaRaftSchedulerLatency, histogramWindow),
 
 		// Raft message metrics.
 		RaftRcvdMessages: [...]*metric.Counter{

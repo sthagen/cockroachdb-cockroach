@@ -228,21 +228,21 @@ func TestIsNullSelOp(t *testing.T) {
 	for _, c := range testCases {
 		log.Infof(ctx, "%s", c.desc)
 		opConstructor := func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+			typs := []*types.T{types.Int}
 			spec := &execinfrapb.ProcessorSpec{
-				Input: []execinfrapb.InputSyncSpec{{ColumnTypes: []*types.T{types.Int}}},
+				Input: []execinfrapb.InputSyncSpec{{ColumnTypes: typs}},
 				Core: execinfrapb.ProcessorCoreUnion{
-					Noop: &execinfrapb.NoopCoreSpec{},
+					Filterer: &execinfrapb.FiltererSpec{
+						Filter: execinfrapb.Expression{Expr: fmt.Sprintf("@1 %s", c.selExpr)},
+					},
 				},
-				Post: execinfrapb.PostProcessSpec{
-					Filter: execinfrapb.Expression{Expr: fmt.Sprintf("@1 %s", c.selExpr)},
-				},
+				ResultTypes: typs,
 			}
 			args := &NewColOperatorArgs{
 				Spec:                spec,
 				Inputs:              input,
 				StreamingMemAccount: testMemAcc,
 			}
-			args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 			result, err := TestNewColOperator(ctx, flowCtx, args)
 			if err != nil {
 				return nil, err

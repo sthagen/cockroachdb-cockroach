@@ -123,6 +123,11 @@
 
 `GET /_status/nodes`
 
+Nodes returns status info for all commissioned nodes. Decommissioned nodes
+are not included, except in rare cases where the node doing the
+decommissioning crashed before completing the operation. In these cases,
+the decommission operation can be rerun to clean up the status entry.
+
 Don't introduce additional usages of this RPC. See #50707 for more details.
 The underlying response type is something we're looking to get rid of.
 
@@ -158,7 +163,7 @@ The underlying response type is something we're looking to get rid of.
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | key | [int32](#cockroach.server.serverpb.NodesResponse-int32) |  |  |
-| value | [cockroach.kv.kvserver.storagepb.NodeLivenessStatus](#cockroach.server.serverpb.NodesResponse-cockroach.kv.kvserver.storagepb.NodeLivenessStatus) |  |  |
+| value | [cockroach.kv.kvserver.liveness.livenesspb.NodeLivenessStatus](#cockroach.server.serverpb.NodesResponse-cockroach.kv.kvserver.liveness.livenesspb.NodeLivenessStatus) |  |  |
 
 
 
@@ -752,7 +757,7 @@ The underlying response type is something we're looking to get rid of.
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| username | [string](#cockroach.server.serverpb.ListSessionsRequest-string) |  | Username of the user making this request. |
+| username | [string](#cockroach.server.serverpb.ListSessionsRequest-string) |  | Username of the user making this request. The caller is responsible to normalize the username (= case fold and perform unicode NFC normalization). |
 
 
 
@@ -864,7 +869,7 @@ The underlying response type is something we're looking to get rid of.
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| username | [string](#cockroach.server.serverpb.ListSessionsRequest-string) |  | Username of the user making this request. |
+| username | [string](#cockroach.server.serverpb.ListSessionsRequest-string) |  | Username of the user making this request. The caller is responsible to normalize the username (= case fold and perform unicode NFC normalization). |
 
 
 
@@ -978,7 +983,7 @@ The underlying response type is something we're looking to get rid of.
 | ----- | ---- | ----- | ----------- |
 | node_id | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | ID of gateway node for the query to be canceled.<br><br>TODO(itsbilal): use [(gogoproto.customname) = "NodeID"] below. Need to figure out how to teach grpc-gateway about custom names.<br><br>node_id is a string so that "local" can be used to specify that no forwarding is necessary. |
 | query_id | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | ID of query to be canceled (converted to string). |
-| username | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | Username of the user making this cancellation request. This may be omitted if the user is the same as the one issuing the CancelQueryRequest. |
+| username | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | Username of the user making this cancellation request. This may be omitted if the user is the same as the one issuing the CancelQueryRequest. The caller is responsible for case-folding and NFC normalization. |
 
 
 
@@ -1017,7 +1022,7 @@ The underlying response type is something we're looking to get rid of.
 | ----- | ---- | ----- | ----------- |
 | node_id | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | TODO(abhimadan): use [(gogoproto.customname) = "NodeID"] below. Need to figure out how to teach grpc-gateway about custom names.<br><br>node_id is a string so that "local" can be used to specify that no forwarding is necessary. |
 | session_id | [bytes](#cockroach.server.serverpb.CancelSessionRequest-bytes) |  |  |
-| username | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | Username of the user making this cancellation request. This may be omitted if the user is the same as the one issuing the CancelSessionRequest. |
+| username | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | Username of the user making this cancellation request. This may be omitted if the user is the same as the one issuing the CancelSessionRequest. The caller is responsiblef or case-folding and NFC normalization. |
 
 
 
@@ -1300,7 +1305,6 @@ information about the resources on a node used by that table.
 | node_id | [string](#cockroach.server.serverpb.LogFileRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. |
 | file | [string](#cockroach.server.serverpb.LogFileRequest-string) |  |  |
 | redact | [bool](#cockroach.server.serverpb.LogFileRequest-bool) |  | redact, if true, requests redaction of sensitive data away from the retrieved log entries. Only admin users can send a request with redact = false. |
-| keep_redactable | [bool](#cockroach.server.serverpb.LogFileRequest-bool) |  | keep_redactable, if true, requests that retrieved entries preserve the redaction markers if any were present in the log files. If false, redaction markers are stripped away. Note that redact = false && redactable = false implies "flat" entries with all sensitive information enclosed and no markers; this is suitable for backward-compatibility with RPC clients from prior the introduction of redactable logs. |
 
 
 
@@ -1343,7 +1347,6 @@ information about the resources on a node used by that table.
 | max | [string](#cockroach.server.serverpb.LogsRequest-string) |  |  |
 | pattern | [string](#cockroach.server.serverpb.LogsRequest-string) |  |  |
 | redact | [bool](#cockroach.server.serverpb.LogsRequest-bool) |  | redact, if true, requests redaction of sensitive data away from the retrieved log entries. Only admin users can send a request with redact = false. |
-| keep_redactable | [bool](#cockroach.server.serverpb.LogsRequest-bool) |  | keep_redactable, if true, requests that retrieved entries preserve the redaction markers if any were present in the log files. If false, redaction markers are stripped away. Note that redact = false && redactable = false implies "flat" entries with all sensitive information enclosed and no markers; this is suitable for backward-compatibility with RPC clients from prior the introduction of redactable logs. |
 
 
 

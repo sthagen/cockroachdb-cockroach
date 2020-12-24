@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/encoding/encodingtype"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
@@ -27,14 +29,30 @@ import (
 type EditSensitiveData int
 
 const (
-	invalidEditMode EditSensitiveData = iota
+	// The 4 reference values below require the first bit to be
+	// set. This ensures the API is not mistakenly used with an
+	// uninitialized mode parameter.
+	confValid       = 1
+	withKeepMarkers = 2
+	withRedaction   = 4
+
+	// WithFlattenedSensitiveData is the log including sensitive data,
+	// but markers stripped.
+	WithFlattenedSensitiveData EditSensitiveData = confValid
 	// WithMarkedSensitiveData is the "raw" log with sensitive data markers included.
-	WithMarkedSensitiveData
-	// WithFlattenedSensitiveData is the log with markers stripped.
-	WithFlattenedSensitiveData
-	// WithoutSensitiveData is the log with the sensitive data redacted.
-	WithoutSensitiveData
+	WithMarkedSensitiveData EditSensitiveData = confValid | withKeepMarkers
+	// WithoutSensitiveDataNorMarkers is the log with the sensitive data
+	// redacted, and markers stripped.
+	WithoutSensitiveDataNorMarkers EditSensitiveData = confValid | withRedaction
+	// WithoutSensitiveData is the log with the sensitive data redacted,
+	// but markers included.
+	WithoutSensitiveData EditSensitiveData = confValid | withKeepMarkers | withRedaction
 )
+
+// KeepRedactable can be used as an argument to SelectEditMode to indicate that
+// the logs should retain their sensitive data markers so that they can be
+// redacted later.
+const KeepRedactable = true
 
 // SelectEditMode returns an EditSensitiveData value that's suitable
 // for use with NewDecoder depending on client-side desired
@@ -42,13 +60,14 @@ const (
 // (See the documentation for the Logs and LogFile RPCs
 // and that of the 'merge-logs' CLI command.)
 func SelectEditMode(redact, keepRedactable bool) EditSensitiveData {
-	editMode := WithMarkedSensitiveData
+	var editMode EditSensitiveData
 	if redact {
-		editMode = WithoutSensitiveData
+		editMode = editMode | withRedaction
 	}
-	if !keepRedactable && !redact {
-		editMode = WithFlattenedSensitiveData
+	if keepRedactable {
+		editMode = editMode | withKeepMarkers
 	}
+	editMode = editMode | confValid
 	return editMode
 }
 
@@ -82,11 +101,43 @@ func getEditor(editMode EditSensitiveData) redactEditor {
 			}
 			return r
 		}
-	case invalidEditMode:
-		fallthrough
+	case WithoutSensitiveDataNorMarkers:
+		return func(r redactablePackage) redactablePackage {
+			if r.redactable {
+				r.msg = redact.RedactableBytes(r.msg).Redact().StripMarkers()
+				r.redactable = false
+			} else {
+				r.msg = strippedMarker
+			}
+			return r
+		}
 	default:
 		panic(errors.AssertionFailedf("unrecognized mode: %v", editMode))
 	}
+}
+
+var strippedMarker = redact.RedactableBytes(redact.RedactedMarker()).StripMarkers()
+
+// maybeRedactEntry transforms a logpb.Entry to either strip
+// sensitive data or keep it, or strip the redaction markers or keep them,
+// or a combination of both. The specific behavior is selected
+// by the provided redactEditor.
+func maybeRedactEntry(entry logpb.Entry, editor redactEditor) logpb.Entry {
+	r := redactablePackage{
+		redactable: entry.Redactable,
+		msg:        []byte(entry.Message),
+	}
+	r = editor(r)
+	entry.Message = string(r.msg)
+	entry.Redactable = r.redactable
+
+	r = redactablePackage{
+		redactable: entry.Redactable,
+		msg:        []byte(entry.Tags),
+	}
+	r = editor(r)
+	entry.Tags = string(r.msg)
+	return entry
 }
 
 // Safe constructs a SafeFormatter / SafeMessager.
@@ -117,6 +168,10 @@ func init() {
 	// Times and durations too.
 	redact.RegisterSafeType(reflect.TypeOf(time.Time{}))
 	redact.RegisterSafeType(reflect.TypeOf(time.Duration(0)))
+	// Encoded types should always be safe to report.
+	redact.RegisterSafeType(reflect.TypeOf(encodingtype.T(0)))
+	// Channel names are safe to report.
+	redact.RegisterSafeType(reflect.TypeOf(Channel(0)))
 }
 
 type redactablePackage struct {
@@ -128,7 +183,7 @@ const redactableIndicator = "⋮"
 
 var redactableIndicatorBytes = []byte(redactableIndicator)
 
-func redactTags(ctx context.Context, buf *strings.Builder) {
+func renderTagsAsRedactable(ctx context.Context, buf *strings.Builder) {
 	tags := logtags.FromContext(ctx)
 	if tags == nil {
 		return
@@ -147,17 +202,26 @@ func redactTags(ctx context.Context, buf *strings.Builder) {
 	}
 }
 
-// TestingSetRedactable sets the redactable flag for usage in a test.
-// The caller is responsible for calling the cleanup function.  This
-// is exported for use in tests only -- it causes the logging
-// configuration to be at risk of leaking unsafe information due to
-// asynchronous direct writes to fd 2 / os.Stderr.
+// TestingSetRedactable sets the redactable flag on the file output of
+// the debug logger for usage in a test. The caller is responsible
+// for calling the cleanup function. This is exported for use in
+// tests only -- it causes the logging configuration to be at risk of
+// leaking unsafe information due to asynchronous direct writes to fd
+// 2 / os.Stderr.
 //
 // See the discussion on SetupRedactionAndStderrRedirects() for
 // details.
+//
+// This is not safe for concurrent use with logging operations.
 func TestingSetRedactable(redactableLogs bool) (cleanup func()) {
-	prev := mainLog.redactableLogs.Swap(redactableLogs)
+	prevEditors := make([]redactEditor, len(debugLog.sinkInfos))
+	for i := range debugLog.sinkInfos {
+		prevEditors[i] = debugLog.sinkInfos[i].editor
+		debugLog.sinkInfos[i].editor = getEditor(SelectEditMode(false /* redact */, redactableLogs))
+	}
 	return func() {
-		mainLog.redactableLogs.Set(prev)
+		for i, e := range prevEditors {
+			debugLog.sinkInfos[i].editor = e
+		}
 	}
 }

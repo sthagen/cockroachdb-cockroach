@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -358,14 +357,6 @@ func (sc *SchemaChanger) dropConstraints(
 		if err != nil {
 			return err
 		}
-		// TODO(ajwerner): The need to do this implies that we should cache all
-		// mutable descriptors inside of the collection when they are resolved
-		// such that all attempts to resolve a mutable descriptor from a
-		// collection will always give you the same exact pointer.
-		scTable.MaybeIncrementVersion()
-		if err := descsCol.AddUncommittedDescriptor(scTable); err != nil {
-			return err
-		}
 		b := txn.NewBatch()
 		for i := range constraints {
 			constraint := &constraints[i]
@@ -491,14 +482,7 @@ func (sc *SchemaChanger) addConstraints(
 		if err != nil {
 			return err
 		}
-		// TODO(ajwerner): The need to do this implies that we should cache all
-		// mutable descriptors inside of the collection when they are resolved
-		// such that all attempts to resolve a mutable descriptor from a
-		// collection will always give you the same exact pointer.
-		scTable.MaybeIncrementVersion()
-		if err := descsCol.AddUncommittedDescriptor(scTable); err != nil {
-			return err
-		}
+
 		b := txn.NewBatch()
 		for i := range constraints {
 			constraint := &constraints[i]
@@ -546,6 +530,14 @@ func (sc *SchemaChanger) addConstraints(
 				if !foundExisting {
 					scTable.OutboundFKs = append(scTable.OutboundFKs, constraint.ForeignKey)
 					backrefTable, err := descsCol.GetMutableTableVersionByID(ctx, constraint.ForeignKey.ReferencedTableID, txn)
+					if err != nil {
+						return err
+					}
+					// Check that a unique constraint for the FK still exists on the
+					// referenced table. It's possible for the unique index found during
+					// planning to have been dropped in the meantime, since only the
+					// presence of the backreference prevents it.
+					_, err = tabledesc.FindFKReferencedIndex(backrefTable, constraint.ForeignKey.ReferencedColumnIDs)
 					if err != nil {
 						return err
 					}
@@ -726,7 +718,7 @@ func TruncateInterleavedIndexes(
 			resumeAt := resume
 			// Make a new txn just to drop this chunk.
 			if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				rd := row.MakeDeleter(codec, table, nil)
+				rd := row.MakeDeleter(codec, table, nil /* requestedCols */)
 				td := tableDeleter{rd: rd, alloc: alloc}
 				if err := td.init(ctx, txn, nil /* *tree.EvalContext */); err != nil {
 					return err
@@ -797,7 +789,7 @@ func (sc *SchemaChanger) truncateIndexes(
 				if err != nil {
 					return err
 				}
-				rd := row.MakeDeleter(sc.execCfg.Codec, tableDesc, nil)
+				rd := row.MakeDeleter(sc.execCfg.Codec, tableDesc, nil /* requestedCols */)
 				td := tableDeleter{rd: rd, alloc: alloc}
 				if err := td.init(ctx, txn, nil /* *tree.EvalContext */); err != nil {
 					return err
@@ -900,8 +892,6 @@ func (sc *SchemaChanger) distBackfill(
 	filter backfill.MutationFilter,
 	targetSpans []roachpb.Span,
 ) error {
-	inMemoryStatusEnabled := sc.execCfg.Settings.Version.IsActive(
-		ctx, clusterversion.VersionAtomicChangeReplicasTrigger)
 	duration := checkpointInterval
 	if sc.testingKnobs.WriteCheckpointInterval > 0 {
 		duration = sc.testingKnobs.WriteCheckpointInterval
@@ -958,7 +948,7 @@ func (sc *SchemaChanger) distBackfill(
 		if err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			updatedTodoSpans = todoSpans
 			// Report schema change progress. We define progress at this point
-			// as the the fraction of fully-backfilled ranges of the primary index of
+			// as the fraction of fully-backfilled ranges of the primary index of
 			// the table being scanned. Since we may have already modified the
 			// fraction completed of our job from the 10% allocated to completing the
 			// schema change state machine or from a previous backfill attempt,
@@ -1002,9 +992,7 @@ func (sc *SchemaChanger) distBackfill(
 				tree.Rows, /* stmtType - doesn't matter here since no result are produced */
 				sc.rangeDescriptorCache,
 				nil, /* txn - the flow does not run wholly in a txn */
-				func(ts hlc.Timestamp) {
-					sc.clock.Update(ts)
-				},
+				sc.clock,
 				evalCtx.Tracing,
 			)
 			defer recv.Release()
@@ -1019,7 +1007,7 @@ func (sc *SchemaChanger) distBackfill(
 			sc.distSQLPlanner.Run(
 				planCtx,
 				nil, /* txn - the processors manage their own transactions */
-				&plan, recv, &evalCtx,
+				plan, recv, &evalCtx,
 				nil, /* finishedSetupFn */
 			)()
 			return cbw.Err()
@@ -1028,23 +1016,6 @@ func (sc *SchemaChanger) distBackfill(
 		}
 		todoSpans = updatedTodoSpans
 
-		if !inMemoryStatusEnabled {
-			var resumeSpans []roachpb.Span
-			// There is a worker node of older version that will communicate
-			// its done work by writing to the jobs table.
-			// In this case we intersect todoSpans with what the old node(s)
-			// have set in the jobs table not to overwrite their done work.
-			if err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				var err error
-				resumeSpans, _, _, err = rowexec.GetResumeSpans(
-					ctx, sc.jobRegistry, txn, sc.execCfg.Codec, sc.descID, sc.mutationID, filter)
-				return err
-			}); err != nil {
-				return err
-			}
-			// A \intersect B = A - (A - B)
-			todoSpans = roachpb.SubtractSpans(todoSpans, roachpb.SubtractSpans(todoSpans, resumeSpans))
-		}
 		// Record what is left to do for the job.
 		// TODO(spaskob): Execute this at a regular cadence.
 		if err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -1255,19 +1226,15 @@ func (sc *SchemaChanger) validateInvertedIndexes(
 			defer close(countReady[i])
 
 			start := timeutil.Now()
-			if len(idx.ColumnNames) != 1 {
-				panic(errors.AssertionFailedf("expected inverted index %s to have exactly 1 column, but found columns %+v",
-					idx.Name, idx.ColumnNames))
-			}
-			col := idx.ColumnNames[0]
+			col := idx.InvertedColumnName()
 
 			if err := runHistoricalTxn(ctx, func(ctx context.Context, txn *kv.Txn, evalCtx *extendedEvalContext) error {
 				ie := evalCtx.InternalExecutor.(*InternalExecutor)
 				var stmt string
 				if geoindex.IsEmptyConfig(&idx.GeoConfig) {
 					stmt = fmt.Sprintf(
-						`SELECT coalesce(sum_int(crdb_internal.num_inverted_index_entries(%q)), 0) FROM [%d AS t]`,
-						col, tableDesc.ID,
+						`SELECT coalesce(sum_int(crdb_internal.num_inverted_index_entries(%q, %d)), 0) FROM [%d AS t]`,
+						col, idx.Version, tableDesc.ID,
 					)
 				} else {
 					stmt = fmt.Sprintf(
@@ -1290,7 +1257,7 @@ func (sc *SchemaChanger) validateInvertedIndexes(
 			}); err != nil {
 				return err
 			}
-			log.Infof(ctx, "JSON column %s/%s expected inverted index count = %d, took %s",
+			log.Infof(ctx, "column %s/%s expected inverted index count = %d, took %s",
 				tableDesc.Name, col, expectedCount[i], timeutil.Since(start))
 			return nil
 		})
@@ -1439,7 +1406,7 @@ func (sc *SchemaChanger) validateForwardIndexes(
 
 			// Force the primary index so that the optimizer does not create a
 			// query plan that uses the indexes being backfilled.
-			query := fmt.Sprintf(`SELECT count(1)%s FROM [%d AS t]@[%d]`, partialIndexCounts, desc.ID, desc.PrimaryIndex.ID)
+			query := fmt.Sprintf(`SELECT count(1)%s FROM [%d AS t]@[%d]`, partialIndexCounts, desc.ID, desc.GetPrimaryIndexID())
 
 			cnt, err := ie.QueryRowEx(ctx, "VERIFY INDEX", txn, sessiondata.InternalExecutorOverride{}, query)
 			if err != nil {
@@ -1981,7 +1948,7 @@ func indexTruncateInTxn(
 	alloc := &rowenc.DatumAlloc{}
 	var sp roachpb.Span
 	for done := false; !done; done = sp.Key == nil {
-		rd := row.MakeDeleter(execCfg.Codec, tableDesc, nil)
+		rd := row.MakeDeleter(execCfg.Codec, tableDesc, nil /* requestedCols */)
 		td := tableDeleter{rd: rd, alloc: alloc}
 		if err := td.init(ctx, txn, evalCtx); err != nil {
 			return err

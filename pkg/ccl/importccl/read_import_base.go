@@ -25,6 +25,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -46,6 +47,7 @@ func runImport(
 	flowCtx *execinfra.FlowCtx,
 	spec *execinfrapb.ReadImportDataSpec,
 	progCh chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
+	seqChunkProvider *row.SeqChunkProvider,
 ) (*roachpb.BulkOpSummary, error) {
 	// Used to send ingested import rows to the KV layer.
 	kvCh := make(chan row.KVBatch, 10)
@@ -68,7 +70,11 @@ func runImport(
 		flowCtx.TypeResolverFactory.Descriptors.ReleaseAll(ctx)
 	}
 
-	conv, err := makeInputConverter(ctx, spec, flowCtx.NewEvalCtx(), kvCh)
+	evalCtx := flowCtx.NewEvalCtx()
+	// TODO(adityamaru): Should we just plumb the flowCtx instead of this
+	// assignment.
+	evalCtx.DB = flowCtx.Cfg.DB
+	conv, err := makeInputConverter(ctx, spec, evalCtx, kvCh, seqChunkProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +90,7 @@ func runImport(
 	group.GoCtx(func(ctx context.Context) error {
 		defer close(kvCh)
 		ctx, span := tracing.ChildSpan(ctx, "readImportFiles")
-		defer tracing.FinishSpan(span)
+		defer span.Finish()
 		var inputs map[int32]string
 		if spec.ResumePos != nil {
 			// Filter out files that were completely processed.
@@ -99,7 +105,7 @@ func runImport(
 		}
 
 		return conv.readFiles(ctx, inputs, spec.ResumePos, spec.Format, flowCtx.Cfg.ExternalStorage,
-			spec.User)
+			spec.User())
 	})
 
 	// Ingest the KVs that the producer group emitted to the chan and the row result
@@ -149,7 +155,7 @@ func readInputFiles(
 	format roachpb.IOFileFormat,
 	fileFunc readFileFunc,
 	makeExternalStorage cloud.ExternalStorageFactory,
-	user string,
+	user security.SQLUsername,
 ) error {
 	done := ctx.Done()
 
@@ -342,7 +348,19 @@ func (f fileReader) ReadFraction() float32 {
 type inputConverter interface {
 	start(group ctxgroup.Group)
 	readFiles(ctx context.Context, dataFiles map[int32]string, resumePos map[int32]int64,
-		format roachpb.IOFileFormat, makeExternalStorage cloud.ExternalStorageFactory, user string) error
+		format roachpb.IOFileFormat, makeExternalStorage cloud.ExternalStorageFactory, user security.SQLUsername) error
+}
+
+// formatHasNamedColumns returns true if the data in the input files can be
+// mapped specifically to a particular data column.
+func formatHasNamedColumns(format roachpb.IOFileFormat_FileFormat) bool {
+	switch format {
+	case roachpb.IOFileFormat_Avro,
+		roachpb.IOFileFormat_Mysqldump,
+		roachpb.IOFileFormat_PgDump:
+		return true
+	}
+	return false
 }
 
 func isMultiTableFormat(format roachpb.IOFileFormat_FileFormat) bool {
@@ -394,13 +412,14 @@ func newImportRowError(err error, row string, num int64) error {
 
 // parallelImportContext describes state associated with the import.
 type parallelImportContext struct {
-	walltime   int64                // Import time stamp.
-	numWorkers int                  // Parallelism
-	batchSize  int                  // Number of records to batch
-	evalCtx    *tree.EvalContext    // Evaluation context.
-	tableDesc  *tabledesc.Immutable // Table descriptor we're importing into.
-	targetCols tree.NameList        // List of columns to import.  nil if importing all columns.
-	kvCh       chan row.KVBatch     // Channel for sending KV batches.
+	walltime         int64                 // Import time stamp.
+	numWorkers       int                   // Parallelism.
+	batchSize        int                   // Number of records to batch.
+	evalCtx          *tree.EvalContext     // Evaluation context.
+	tableDesc        *tabledesc.Immutable  // Table descriptor we're importing into.
+	targetCols       tree.NameList         // List of columns to import.  nil if importing all columns.
+	kvCh             chan row.KVBatch      // Channel for sending KV batches.
+	seqChunkProvider *row.SeqChunkProvider // Used to reserve chunks of sequence values.
 }
 
 // importFileContext describes state specific to a file being imported.
@@ -408,6 +427,7 @@ type importFileContext struct {
 	source   int32       // Source is where the row data in the batch came from.
 	skip     int64       // Number of records to skip
 	rejected chan string // Channel for reporting corrupt "rows"
+	rowLimit int64       // Number of records to process before we stop importing from a file.
 }
 
 // handleCorruptRow reports an error encountered while processing a row
@@ -427,7 +447,8 @@ func makeDatumConverter(
 	ctx context.Context, importCtx *parallelImportContext, fileCtx *importFileContext,
 ) (*row.DatumRowConverter, error) {
 	conv, err := row.NewDatumRowConverter(
-		ctx, importCtx.tableDesc, importCtx.targetCols, importCtx.evalCtx, importCtx.kvCh)
+		ctx, importCtx.tableDesc, importCtx.targetCols, importCtx.evalCtx, importCtx.kvCh,
+		importCtx.seqChunkProvider)
 	if err == nil {
 		conv.KvBatch.Source = fileCtx.source
 	}
@@ -527,7 +548,7 @@ func runParallelImport(
 	minEmited := make([]int64, parallelism)
 	group.GoCtx(func(ctx context.Context) error {
 		ctx, span := tracing.ChildSpan(ctx, "inputconverter")
-		defer tracing.FinishSpan(span)
+		defer span.Finish()
 		return ctxgroup.GroupWorkers(ctx, parallelism, func(ctx context.Context, id int) error {
 			return importer.importWorker(ctx, id, consumer, importCtx, fileCtx, minEmited)
 		})
@@ -536,7 +557,7 @@ func runParallelImport(
 	// Read data from producer and send it to consumers.
 	group.GoCtx(func(ctx context.Context) error {
 		defer close(importer.recordCh)
-
+		var numSkipped int64
 		var count int64
 		for producer.Scan() {
 			// Skip rows if needed.
@@ -545,7 +566,14 @@ func runParallelImport(
 				if err := producer.Skip(); err != nil {
 					return err
 				}
+				numSkipped++
 				continue
+			}
+
+			// Stop when we have processed row limit number of rows.
+			rowBeingProcessedIdx := count - numSkipped
+			if fileCtx.rowLimit != 0 && rowBeingProcessedIdx > fileCtx.rowLimit {
+				break
 			}
 
 			// Batch parsed data.

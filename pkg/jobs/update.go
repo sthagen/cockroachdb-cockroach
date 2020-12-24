@@ -106,14 +106,15 @@ func (j *Job) Update(ctx context.Context, updateFn UpdateFn) error {
 	var payload *jobspb.Payload
 	var progress *jobspb.Progress
 	if err := j.runInTxn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		stmt := "SELECT status, payload, progress FROM system.jobs WHERE id = $1"
+		stmt := "SELECT status, payload, progress FROM system.jobs WHERE id = $1 FOR UPDATE"
 		if j.sessionID != "" {
-			stmt = "SELECT status, payload, progress, claim_session_id FROM system.jobs WHERE id = $1"
+			stmt = "SELECT status, payload, progress, claim_session_id FROM system." +
+				"jobs WHERE id = $1 FOR UPDATE"
 		}
 		var err error
 		var row tree.Datums
 		row, err = j.registry.ex.QueryRowEx(
-			ctx, "log-job", txn, sessiondata.InternalExecutorOverride{User: security.RootUser},
+			ctx, "log-job", txn, sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			stmt, *j.id,
 		)
 		if err != nil {
@@ -129,6 +130,11 @@ func (j *Job) Update(ctx context.Context, updateFn UpdateFn) error {
 		}
 
 		if j.sessionID != "" {
+			if row[3] == tree.DNull {
+				return errors.Errorf(
+					"job %d: with status '%s': expected session '%s' but found NULL",
+					*j.ID(), statusString, j.sessionID)
+			}
 			storedSession := []byte(*row[3].(*tree.DBytes))
 			if !bytes.Equal(storedSession, j.sessionID.UnsafeBytes()) {
 				return errors.Errorf(
@@ -155,7 +161,11 @@ func (j *Job) Update(ctx context.Context, updateFn UpdateFn) error {
 		if err := updateFn(txn, md, &ju); err != nil {
 			return err
 		}
-
+		if j.registry.knobs.BeforeUpdate != nil {
+			if err := j.registry.knobs.BeforeUpdate(md, ju.md); err != nil {
+				return err
+			}
+		}
 		if !ju.hasUpdates() {
 			return nil
 		}

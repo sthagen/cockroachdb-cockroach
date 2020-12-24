@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -41,6 +42,14 @@ type renameTableNode struct {
 //          mysql requires ALTER, DROP on the original table, and CREATE, INSERT
 //          on the new table (and does not copy privileges over).
 func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"RENAME TABLE/VIEW/SEQUENCE",
+	); err != nil {
+		return nil, err
+	}
+
 	oldTn := n.Name.ToTableName()
 	newTn := n.NewName.ToTableName()
 	toRequire := tree.ResolveRequireTableOrViewDesc
@@ -98,13 +107,20 @@ func (n *renameTableNode) startExec(params runParams) error {
 	prevDBID := tableDesc.ParentID
 
 	var targetDbDesc catalog.DatabaseDescriptor
+	var targetSchemaDesc catalog.ResolvedSchema
 	// If the target new name has no qualifications, then assume that the table
 	// is intended to be renamed into the same database and schema.
 	newTn := n.newTn
 	if !newTn.ExplicitSchema && !newTn.ExplicitCatalog {
 		newTn.ObjectNamePrefix = oldTn.ObjectNamePrefix
 		var err error
-		targetDbDesc, err = p.ResolveUncachedDatabaseByName(ctx, string(oldTn.CatalogName), true /* required */)
+		_, targetDbDesc, err = p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
+			string(oldTn.CatalogName), tree.DatabaseLookupFlags{Required: true})
+		if err != nil {
+			return err
+		}
+
+		_, targetSchemaDesc, err = p.ResolveUncachedSchemaDescriptor(ctx, targetDbDesc.GetID(), oldTn.Schema(), true)
 		if err != nil {
 			return err
 		}
@@ -125,7 +141,7 @@ func (n *renameTableNode) startExec(params runParams) error {
 		newUn := newTn.ToUnresolvedObjectName()
 		var prefix tree.ObjectNamePrefix
 		var err error
-		targetDbDesc, prefix, err = p.ResolveTargetObject(ctx, newUn)
+		targetDbDesc, targetSchemaDesc, prefix, err = p.ResolveTargetObject(ctx, newUn)
 		if err != nil {
 			return err
 		}
@@ -180,8 +196,8 @@ func (n *renameTableNode) startExec(params runParams) error {
 		return nil
 	}
 
-	exists, id, err := catalogkv.LookupPublicTableID(
-		params.ctx, params.p.txn, p.ExecCfg().Codec, targetDbDesc.GetID(), newTn.Table(),
+	exists, id, err := catalogkv.LookupObjectID(
+		params.ctx, params.p.txn, p.ExecCfg().Codec, targetDbDesc.GetID(), targetSchemaDesc.ID, newTn.Table(),
 	)
 	if err == nil && exists {
 		// Try and see what kind of object we collided with.
@@ -243,19 +259,12 @@ func (n *renameTableNode) startExec(params runParams) error {
 
 	// Log Rename Table event. This is an auditable log event and is recorded
 	// in the same transaction as the table descriptor update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogRenameTable,
-		int32(tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TableName    string
-			Statement    string
-			User         string
-			NewTableName string
-		}{oldTn.FQString(), n.n.String(), params.SessionData().User, newTn.FQString()},
-	)
+	return p.logEvent(ctx,
+		tableDesc.ID,
+		&eventpb.RenameTable{
+			TableName:    oldTn.FQString(),
+			NewTableName: newTn.FQString(),
+		})
 }
 
 func (n *renameTableNode) Next(runParams) (bool, error) { return false, nil }

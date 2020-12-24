@@ -61,46 +61,47 @@ type shadowTracer struct {
 	manager shadowTracerManager
 }
 
-func (st *shadowTracer) Typ() string {
-	return st.manager.Name()
+// Type returns the underlying type of the shadow tracer manager.
+// It is valid to call this on a nil shadowTracer; it will
+// return zero values in this case.
+func (st *shadowTracer) Type() (string, bool) {
+	if st == nil || st.manager == nil {
+		return "", false
+	}
+	return st.manager.Name(), true
 }
 
 func (st *shadowTracer) Close() {
 	st.manager.Close(st)
 }
 
-// linkShadowSpan creates and links a Shadow Span to the passed-in Span (i.e.
-// fills in s.shadowTr and s.shadowSpan). This should only be called when
-// shadow tracing is enabled.
+// makeShadowSpan creates an otSpan for construction of a Span.
+// This must be called with a non-nil shadowTr, which must have
+// been confirmed to be compatible with parentShadowCtx.
 //
-// The Shadow Span will have a parent if parentShadowCtx is not nil.
-// parentType is ignored if parentShadowCtx is nil.
-//
-// The tags (including logTags) from s are copied to the Shadow Span.
-func linkShadowSpan(
-	s *Span,
+// The span contained in `otSpan` will have a parent if parentShadowCtx
+// is not nil. parentType is ignored if parentShadowCtx is nil.
+func makeShadowSpan(
 	shadowTr *shadowTracer,
 	parentShadowCtx opentracing.SpanContext,
 	parentType opentracing.SpanReferenceType,
-) {
+	opName string,
+	startTime time.Time,
+) otSpan {
 	// Create the shadow lightstep Span.
-	var opts []opentracing.StartSpanOption
+	opts := make([]opentracing.StartSpanOption, 0, 2)
 	// Replicate the options, using the lightstep context in the reference.
-	opts = append(opts, opentracing.StartTime(s.crdb.startTime))
-	if s.crdb.logTags != nil {
-		opts = append(opts, LogTags(s.crdb.logTags))
-	}
-	if s.crdb.mu.tags != nil {
-		opts = append(opts, s.crdb.mu.tags)
-	}
+	opts = append(opts, opentracing.StartTime(startTime))
 	if parentShadowCtx != nil {
 		opts = append(opts, opentracing.SpanReference{
 			Type:              parentType,
 			ReferencedContext: parentShadowCtx,
 		})
 	}
-	s.ot.shadowTr = shadowTr
-	s.ot.shadowSpan = shadowTr.StartSpan(s.crdb.operation, opts...)
+	return otSpan{
+		shadowTr:   shadowTr,
+		shadowSpan: shadowTr.StartSpan(opName, opts...),
+	}
 }
 
 func createLightStepTracer(token string) (shadowTracerManager, opentracing.Tracer) {

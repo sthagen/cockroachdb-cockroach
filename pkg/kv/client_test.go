@@ -28,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -43,7 +43,7 @@ import (
 )
 
 // testUser has valid client certs.
-var testUser = server.TestUser
+var testUser = security.TestUser
 
 // checkKVs verifies that a KeyValue slice contains the expected keys and
 // values. The values can be either integers or strings; the expected results
@@ -313,7 +313,7 @@ func TestClientGetAndPutProto(t *testing.T) {
 	if err := db.GetProto(context.Background(), key, &readZoneConfig); err != nil {
 		t.Fatalf("unable to get proto: %s", err)
 	}
-	if !proto.Equal(&zoneConfig, &readZoneConfig) {
+	if !zoneConfig.Equal(&readZoneConfig) {
 		t.Errorf("expected %+v, but found %+v", zoneConfig, readZoneConfig)
 	}
 }
@@ -338,7 +338,7 @@ func TestClientGetAndPut(t *testing.T) {
 	if !bytes.Equal(value, gr.ValueBytes()) {
 		t.Errorf("expected values equal; %s != %s", value, gr.ValueBytes())
 	}
-	if gr.Value.Timestamp == (hlc.Timestamp{}) {
+	if gr.Value.Timestamp.IsEmpty() {
 		t.Fatalf("expected non-zero timestamp; got empty")
 	}
 }
@@ -361,8 +361,73 @@ func TestClientPutInline(t *testing.T) {
 	if !bytes.Equal(value, gr.ValueBytes()) {
 		t.Errorf("expected values equal; %s != %s", value, gr.ValueBytes())
 	}
-	if ts := gr.Value.Timestamp; ts != (hlc.Timestamp{}) {
+	if ts := gr.Value.Timestamp; !ts.IsEmpty() {
 		t.Fatalf("expected zero timestamp; got %s", ts)
+	}
+}
+
+func TestClientCPutInline(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+	db := createTestClient(t, s)
+	ctx := kv.CtxForCPutInline(context.Background())
+	key := testUser + "/key"
+	value := []byte("value")
+
+	// Should fail on non-existent key with expected value.
+	if err := db.CPutInline(ctx, key, value, []byte("foo")); err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	// Setting value when expecting nil should work.
+	if err := db.CPutInline(ctx, key, value, nil); err != nil {
+		t.Fatalf("unable to set value: %s", err)
+	}
+	gr, err := db.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("unable to get value: %s", err)
+	}
+	if !bytes.Equal(value, gr.ValueBytes()) {
+		t.Errorf("expected values equal; %s != %s", value, gr.ValueBytes())
+	}
+	if ts := gr.Value.Timestamp; !ts.IsEmpty() {
+		t.Fatalf("expected zero timestamp; got %s", ts)
+	}
+
+	// Updating existing value with nil expected value should fail.
+	if err := db.CPutInline(ctx, key, []byte("new"), nil); err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	// Updating value with other expected value should fail.
+	if err := db.CPutInline(ctx, key, []byte("new"), []byte("foo")); err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	// Updating when given correct value should work.
+	if err := db.CPutInline(ctx, key, []byte("new"), gr.Value.TagAndDataBytes()); err != nil {
+		t.Fatalf("unable to update value: %s", err)
+	}
+	gr, err = db.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("unable to get value: %s", err)
+	} else if !bytes.Equal([]byte("new"), gr.ValueBytes()) {
+		t.Errorf("expected values equal; %s != %s", []byte("new"), gr.ValueBytes())
+	} else if ts := gr.Value.Timestamp; !ts.IsEmpty() {
+		t.Fatalf("expected zero timestamp; got %s", ts)
+	}
+
+	// Deleting when given nil and correct expected value should work.
+	if err := db.CPutInline(ctx, key, nil, gr.Value.TagAndDataBytes()); err != nil {
+		t.Fatalf("unable to delete value: %s", err)
+	}
+	gr, err = db.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("unable to get value: %s", err)
+	} else if gr.Value != nil {
+		t.Fatalf("expected deleted value; got %s", gr.ValueBytes())
 	}
 }
 

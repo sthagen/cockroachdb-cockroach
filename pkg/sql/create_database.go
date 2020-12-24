@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type createDatabaseNode struct {
@@ -30,6 +31,14 @@ type createDatabaseNode struct {
 // CreateDatabase creates a database.
 // Privileges: superuser or CREATEDB
 func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"CREATE DATABASE",
+	); err != nil {
+		return nil, err
+	}
+
 	if n.Name == "" {
 		return nil, errEmptyDatabaseName
 	}
@@ -77,14 +86,6 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 		)
 	}
 
-	if n.Regions != nil {
-		return nil, unimplemented.New("create database with region", "implementation pending")
-	}
-
-	if n.Survive != tree.SurviveDefault {
-		return nil, unimplemented.New("create database survive", "implementation pending")
-	}
-
 	hasCreateDB, err := p.HasRoleOption(ctx, roleoption.CREATEDB)
 	if err != nil {
 		return nil, err
@@ -107,18 +108,10 @@ func (n *createDatabaseNode) startExec(params runParams) error {
 	if created {
 		// Log Create Database event. This is an auditable log event and is
 		// recorded in the same transaction as the table descriptor update.
-		if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			params.ctx,
-			params.p.txn,
-			EventLogCreateDatabase,
-			int32(desc.GetID()),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				DatabaseName string
-				Statement    string
-				User         string
-			}{n.n.Name.String(), n.n.String(), params.SessionData().User},
-		); err != nil {
+		if err := params.p.logEvent(params.ctx, desc.GetID(),
+			&eventpb.CreateDatabase{
+				DatabaseName: n.n.Name.String(),
+			}); err != nil {
 			return err
 		}
 	}
@@ -128,3 +121,9 @@ func (n *createDatabaseNode) startExec(params runParams) error {
 func (*createDatabaseNode) Next(runParams) (bool, error) { return false, nil }
 func (*createDatabaseNode) Values() tree.Datums          { return tree.Datums{} }
 func (*createDatabaseNode) Close(context.Context)        {}
+
+// ReadingOwnWrites implements the planNodeReadingOwnWrites Interface. This is
+// required because we create a type descriptor for multi-region databases,
+// which must be read during validation. We also call CONFIGURE ZONE which
+// perms multiple KV operations on descriptors and expects to see its own writes.
+func (*createDatabaseNode) ReadingOwnWrites() {}

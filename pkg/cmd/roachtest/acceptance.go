@@ -21,6 +21,7 @@ func registerAcceptance(r *testRegistry) {
 		fn         func(ctx context.Context, t *test, c *cluster)
 		skip       string
 		minVersion string
+		numNodes   int
 		timeout    time.Duration
 	}{
 		// Sorted. Please keep it that way.
@@ -36,6 +37,15 @@ func registerAcceptance(r *testRegistry) {
 		{name: "build-analyze", fn: runBuildAnalyze},
 		{name: "cli/node-status", fn: runCLINodeStatus},
 		{name: "cluster-init", fn: runClusterInit},
+		{name: "decommission-self",
+			fn: runDecommissionSelf,
+			// Decommissioning self was observed to hang, though not in this test
+			// when run locally. More investigation is needed; there is a small
+			// chance that the original observation was in error. However, it
+			// seems likely that the problem exists even if it is rarely reproduced,
+			// so this test is skipped.
+			skip: "https://github.com/cockroachdb/cockroach/issues/56718",
+		},
 		{name: "event-log", fn: runEventLog},
 		{name: "gossip/peerings", fn: runGossipPeerings},
 		{name: "gossip/restart", fn: runGossipRestart},
@@ -47,6 +57,7 @@ func registerAcceptance(r *testRegistry) {
 			fn:         runAcceptanceMultitenant,
 		},
 		{name: "rapid-restart", fn: runRapidRestart},
+		{name: "reset-quorum", fn: runResetQuorum, numNodes: 8},
 		{
 			name: "many-splits", fn: runManySplits,
 			minVersion: "v19.2.0", // SQL syntax unsupported on 19.1.x
@@ -67,7 +78,6 @@ func registerAcceptance(r *testRegistry) {
 		},
 	}
 	tags := []string{"default", "quick"}
-	const numNodes = 4
 	specTemplate := testSpec{
 		// NB: teamcity-post-failures.py relies on the acceptance tests
 		// being named acceptance/<testname> and will avoid posting a
@@ -79,12 +89,17 @@ func registerAcceptance(r *testRegistry) {
 		Owner:   OwnerKV,
 		Timeout: 10 * time.Minute,
 		Tags:    tags,
-		Cluster: makeClusterSpec(numNodes),
 	}
 
 	for _, tc := range testCases {
 		tc := tc // copy for closure
+		numNodes := 4
+		if tc.numNodes != 0 {
+			numNodes = tc.numNodes
+		}
+
 		spec := specTemplate
+		spec.Cluster = makeClusterSpec(numNodes)
 		spec.Skip = tc.skip
 		spec.Name = specTemplate.Name + "/" + tc.name
 		spec.MinVersion = tc.minVersion

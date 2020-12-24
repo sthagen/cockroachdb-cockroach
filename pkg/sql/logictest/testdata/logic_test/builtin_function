@@ -1,4 +1,4 @@
-# LogicTest: !3node-tenant(49854)
+# LogicTest: !3node-tenant(49854) !fakedist-spec-planning
 # TODO(asubiotto): Possibly split out the test that attempts to set a zone
 # config in order to run the other ones.
 
@@ -1962,6 +1962,7 @@ VALUES (format_type('anyelement'::regtype, -1)),
        (format_type('bool'::regtype, -1)),
        (format_type('bytea'::regtype, -1)),
        (format_type('char'::regtype, -1)),
+       (format_type('"char"'::regtype, -1)),
        (format_type('date'::regtype, -1)),
        (format_type('decimal'::regtype, -1)),
        (format_type('float'::regtype, -1)),
@@ -1995,13 +1996,16 @@ VALUES (format_type('anyelement'::regtype, -1)),
        (format_type('int[]'::regtype, -1)),
        (format_type('int2[]'::regtype, -1)),
        (format_type('string[]'::regtype, -1)),
-       (format_type('varchar[]'::regtype, -1))
+       (format_type('varchar[]'::regtype, -1)),
+       (format_type('pg_catalog.int4'::regtype, -1)),
+       (format_type('pg_catalog.int2'::regtype, -1))
 ----
 anyelement
 bit
 boolean
 bytea
 bpchar
+"char"
 date
 numeric
 double precision
@@ -2036,6 +2040,8 @@ bigint[]
 smallint[]
 text[]
 character varying[]
+integer
+smallint
 
 query T
 VALUES (format_type('anyelement'::regtype, NULL)),
@@ -2213,17 +2219,21 @@ CREATE TABLE test.pg_constraintdef_test (
   d string,
   UNIQUE INDEX (a) WHERE d = 'foo',
   FOREIGN KEY(a) REFERENCES test.pg_indexdef_test(a) ON DELETE CASCADE
-)
+);
+ALTER TABLE test.pg_constraintdef_test ADD CONSTRAINT c CHECK (c > 0) NOT VALID;
+ALTER TABLE test.pg_constraintdef_test ADD CONSTRAINT fk FOREIGN KEY (c) REFERENCES test.pg_indexdef_test(a) NOT VALID;
 
 query T rowsort
 SELECT pg_catalog.pg_get_constraintdef(oid)
 FROM pg_catalog.pg_constraint
 WHERE conrelid='pg_constraintdef_test'::regclass
 ----
+FOREIGN KEY (c) REFERENCES pg_indexdef_test(a) NOT VALID
+CHECK ((c > a))
+CHECK ((c > 0)) NOT VALID
 UNIQUE (b ASC)
 UNIQUE (a ASC) WHERE (d = 'foo'::STRING)
 FOREIGN KEY (a) REFERENCES pg_indexdef_test(a) ON DELETE CASCADE
-CHECK ((c > a))
 
 # These functions always return NULL since we don't support comments on vtable columns and databases.
 query TT

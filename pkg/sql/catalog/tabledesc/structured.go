@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -43,7 +44,7 @@ import (
 // Mutable is a custom type for TableDescriptors
 // going through schema mutations.
 type Mutable struct {
-	Immutable
+	wrapper
 
 	// ClusterVersion represents the version of the table descriptor read from the store.
 	ClusterVersion descpb.TableDescriptor
@@ -73,7 +74,7 @@ var ErrIndexGCMutationsList = errors.New("index in GC mutations list")
 // given TableDescriptor with the cluster version being the zero table. This
 // is for a table that is created in the transaction.
 func NewCreatedMutable(tbl descpb.TableDescriptor) *Mutable {
-	return &Mutable{Immutable: MakeImmutable(tbl)}
+	return &Mutable{wrapper: wrapper{TableDescriptor: tbl}}
 }
 
 // NewExistingMutable returns a Mutable from the
@@ -101,7 +102,7 @@ func NewFilledInExistingMutable(
 	if err != nil {
 		return nil, err
 	}
-	m := &Mutable{Immutable: desc}
+	m := &Mutable{wrapper: desc.wrapper}
 	m.ClusterVersion = *tbl
 	return m, nil
 }
@@ -113,7 +114,7 @@ func MakeImmutable(tbl descpb.TableDescriptor) Immutable {
 
 	readableCols := tbl.Columns
 
-	desc := Immutable{TableDescriptor: tbl}
+	desc := Immutable{wrapper: wrapper{TableDescriptor: tbl}}
 
 	if len(tbl.Mutations) > 0 {
 		publicAndNonPublicCols = make([]descpb.ColumnDescriptor, 0, len(tbl.Columns)+len(tbl.Mutations))
@@ -159,7 +160,7 @@ func MakeImmutable(tbl descpb.TableDescriptor) Immutable {
 		}
 	}
 
-	desc.ReadableColumns = readableCols
+	desc.readableColumns = readableCols
 	desc.publicAndNonPublicCols = publicAndNonPublicCols
 	desc.publicAndNonPublicIndexes = publicAndNonPublicIndexes
 
@@ -259,7 +260,7 @@ func FindIndexPartitionByName(
 }
 
 // TypeName returns the plain type of this descriptor.
-func (desc *Immutable) TypeName() string {
+func (desc *wrapper) TypeName() string {
 	return "relation"
 }
 
@@ -270,7 +271,7 @@ func (desc *Mutable) SetName(name string) {
 
 // GetPrimaryIndex returns a pointer to the primary index of the table
 // descriptor.
-func (desc *Immutable) GetPrimaryIndex() *descpb.IndexDescriptor {
+func (desc *wrapper) GetPrimaryIndex() *descpb.IndexDescriptor {
 	return &desc.PrimaryIndex
 }
 
@@ -278,7 +279,7 @@ func (desc *Immutable) GetPrimaryIndex() *descpb.IndexDescriptor {
 // one. If the descriptor was created before the field was added, then the
 // descriptor belongs to a table under the `public` physical schema. The static
 // public schema ID is returned in that case.
-func (desc *Immutable) GetParentSchemaID() descpb.ID {
+func (desc *wrapper) GetParentSchemaID() descpb.ID {
 	parentSchemaID := desc.GetUnexposedParentSchemaID()
 	if parentSchemaID == descpb.InvalidID {
 		parentSchemaID = keys.PublicSchemaID
@@ -292,16 +293,16 @@ func (desc *Immutable) GetParentSchemaID() descpb.ID {
 // primary keys, column families, and indexes (unlike virtual tables).
 // Sequences count as physical tables because their values are stored in
 // the KV layer.
-func (desc *Immutable) IsPhysicalTable() bool {
+func (desc *wrapper) IsPhysicalTable() bool {
 	return desc.IsSequence() || (desc.IsTable() && !desc.IsVirtualTable()) || desc.MaterializedView()
 }
 
 // FindIndexByID finds an index (active or inactive) with the specified ID.
 // Must return a pointer to the IndexDescriptor in the TableDescriptor, so that
 // callers can use returned values to modify the TableDesc.
-func (desc *Immutable) FindIndexByID(id descpb.IndexID) (*descpb.IndexDescriptor, error) {
+func (desc *wrapper) FindIndexByID(id descpb.IndexID) (*descpb.IndexDescriptor, error) {
 	if desc.PrimaryIndex.ID == id {
-		return desc.GetPrimaryIndex(), nil
+		return &desc.PrimaryIndex, nil
 	}
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
@@ -326,7 +327,7 @@ func (desc *Immutable) FindIndexByID(id descpb.IndexID) (*descpb.IndexDescriptor
 // given index. If a secondary index doesn't store any columns, then it only
 // has one k/v pair, but if it stores some columns, it can return up to one
 // k/v pair per family in the table, just like a primary index.
-func (desc *Immutable) KeysPerRow(indexID descpb.IndexID) (int, error) {
+func (desc *wrapper) KeysPerRow(indexID descpb.IndexID) (int, error) {
 	if desc.PrimaryIndex.ID == indexID {
 		return len(desc.Families), nil
 	}
@@ -342,7 +343,7 @@ func (desc *Immutable) KeysPerRow(indexID descpb.IndexID) (int, error) {
 
 // AllNonDropColumns returns all the columns, including those being added
 // in the mutations.
-func (desc *Immutable) AllNonDropColumns() []descpb.ColumnDescriptor {
+func (desc *wrapper) AllNonDropColumns() []descpb.ColumnDescriptor {
 	cols := make([]descpb.ColumnDescriptor, 0, len(desc.Columns)+len(desc.Mutations))
 	cols = append(cols, desc.Columns...)
 	for _, m := range desc.Mutations {
@@ -384,7 +385,7 @@ func allocateIndexName(tableDesc *Mutable, idx *descpb.IndexDescriptor) {
 
 // AllNonDropIndexes returns all the indexes, including those being added
 // in the mutations.
-func (desc *Immutable) AllNonDropIndexes() []*descpb.IndexDescriptor {
+func (desc *wrapper) AllNonDropIndexes() []*descpb.IndexDescriptor {
 	indexes := make([]*descpb.IndexDescriptor, 0, 1+len(desc.Indexes)+len(desc.Mutations))
 	if desc.IsPhysicalTable() {
 		indexes = append(indexes, &desc.PrimaryIndex)
@@ -405,7 +406,7 @@ func (desc *Immutable) AllNonDropIndexes() []*descpb.IndexDescriptor {
 // AllActiveAndInactiveChecks returns all check constraints, including both
 // "active" ones on the table descriptor which are being enforced for all
 // writes, and "inactive" ones queued in the mutations list.
-func (desc *Immutable) AllActiveAndInactiveChecks() []*descpb.TableDescriptor_CheckConstraint {
+func (desc *wrapper) AllActiveAndInactiveChecks() []*descpb.TableDescriptor_CheckConstraint {
 	// A check constraint could be both on the table descriptor and in the
 	// list of mutations while the constraint is validated for existing rows. In
 	// that case, the constraint is in the Validating state, and we avoid
@@ -446,12 +447,38 @@ func GetColumnFamilyForShard(desc *Mutable, idxColumns []string) string {
 	return ""
 }
 
+// AllActiveAndInactiveUniqueWithoutIndexConstraints returns all unique
+// constraints that are not enforced by an index, including both "active"
+// ones on the table descriptor which are being enforced for all writes, and
+// "inactive" ones queued in the mutations list.
+func (desc *wrapper) AllActiveAndInactiveUniqueWithoutIndexConstraints() []*descpb.UniqueWithoutIndexConstraint {
+	ucs := make([]*descpb.UniqueWithoutIndexConstraint, 0, len(desc.UniqueWithoutIndexConstraints))
+	for i := range desc.UniqueWithoutIndexConstraints {
+		uc := &desc.UniqueWithoutIndexConstraints[i]
+		// While a constraint is being validated for existing rows or being dropped,
+		// the constraint is present both on the table descriptor and in the
+		// mutations list in the Validating or Dropping state, so those constraints
+		// are excluded here to avoid double-counting.
+		if uc.Validity != descpb.ConstraintValidity_Validating &&
+			uc.Validity != descpb.ConstraintValidity_Dropping {
+			ucs = append(ucs, uc)
+		}
+	}
+	for i := range desc.Mutations {
+		if c := desc.Mutations[i].GetConstraint(); c != nil &&
+			c.ConstraintType == descpb.ConstraintToUpdate_UNIQUE_WITHOUT_INDEX {
+			ucs = append(ucs, &c.UniqueWithoutIndexConstraint)
+		}
+	}
+	return ucs
+}
+
 // AllActiveAndInactiveForeignKeys returns all foreign keys, including both
 // "active" ones on the index descriptor which are being enforced for all
 // writes, and "inactive" ones queued in the mutations list. An error is
 // returned if multiple foreign keys (including mutations) are found for the
 // same index.
-func (desc *Immutable) AllActiveAndInactiveForeignKeys() []*descpb.ForeignKeyConstraint {
+func (desc *wrapper) AllActiveAndInactiveForeignKeys() []*descpb.ForeignKeyConstraint {
 	fks := make([]*descpb.ForeignKeyConstraint, 0, len(desc.OutboundFKs))
 	for i := range desc.OutboundFKs {
 		fk := &desc.OutboundFKs[i]
@@ -472,7 +499,7 @@ func (desc *Immutable) AllActiveAndInactiveForeignKeys() []*descpb.ForeignKeyCon
 }
 
 // ForeachPublicColumn runs a function on all public columns.
-func (desc *Immutable) ForeachPublicColumn(f func(column *descpb.ColumnDescriptor) error) error {
+func (desc *wrapper) ForeachPublicColumn(f func(column *descpb.ColumnDescriptor) error) error {
 	for i := range desc.Columns {
 		if err := f(&desc.Columns[i]); err != nil {
 			return err
@@ -483,7 +510,7 @@ func (desc *Immutable) ForeachPublicColumn(f func(column *descpb.ColumnDescripto
 
 // ForeachNonDropColumn runs a function on all public columns and columns
 // currently being added.
-func (desc *Immutable) ForeachNonDropColumn(f func(column *descpb.ColumnDescriptor) error) error {
+func (desc *wrapper) ForeachNonDropColumn(f func(column *descpb.ColumnDescriptor) error) error {
 	if err := desc.ForeachPublicColumn(f); err != nil {
 		return err
 	}
@@ -502,7 +529,7 @@ func (desc *Immutable) ForeachNonDropColumn(f func(column *descpb.ColumnDescript
 
 // ForeachNonDropIndex runs a function on all indexes, including those being
 // added in the mutations.
-func (desc *Immutable) ForeachNonDropIndex(f func(*descpb.IndexDescriptor) error) error {
+func (desc *wrapper) ForeachNonDropIndex(f func(*descpb.IndexDescriptor) error) error {
 	if err := desc.ForeachIndex(catalog.IndexOpts{AddMutations: true}, func(idxDesc *descpb.IndexDescriptor, isPrimary bool) error {
 		return f(idxDesc)
 	}); err != nil {
@@ -512,7 +539,7 @@ func (desc *Immutable) ForeachNonDropIndex(f func(*descpb.IndexDescriptor) error
 }
 
 // ForeachIndex runs a function on the set of indexes as specified by opts.
-func (desc *Immutable) ForeachIndex(
+func (desc *wrapper) ForeachIndex(
 	opts catalog.IndexOpts, f func(idxDesc *descpb.IndexDescriptor, isPrimary bool) error,
 ) error {
 	if desc.IsPhysicalTable() || opts.NonPhysicalPrimaryIndex {
@@ -544,7 +571,7 @@ func (desc *Immutable) ForeachIndex(
 
 // ForeachDependedOnBy runs a function on all indexes, including those being
 // added in the mutations.
-func (desc *Immutable) ForeachDependedOnBy(
+func (desc *wrapper) ForeachDependedOnBy(
 	f func(dep *descpb.TableDescriptor_Reference) error,
 ) error {
 	for i := range desc.DependedOnBy {
@@ -557,7 +584,7 @@ func (desc *Immutable) ForeachDependedOnBy(
 
 // ForeachOutboundFK calls f for every outbound foreign key in desc until an
 // error is returned.
-func (desc *Immutable) ForeachOutboundFK(
+func (desc *wrapper) ForeachOutboundFK(
 	f func(constraint *descpb.ForeignKeyConstraint) error,
 ) error {
 	for i := range desc.OutboundFKs {
@@ -570,7 +597,7 @@ func (desc *Immutable) ForeachOutboundFK(
 
 // ForeachInboundFK calls f for every inbound foreign key in desc until an
 // error is returned.
-func (desc *Immutable) ForeachInboundFK(f func(fk *descpb.ForeignKeyConstraint) error) error {
+func (desc *wrapper) ForeachInboundFK(f func(fk *descpb.ForeignKeyConstraint) error) error {
 	for i := range desc.InboundFKs {
 		if err := f(&desc.InboundFKs[i]); err != nil {
 			return err
@@ -580,13 +607,13 @@ func (desc *Immutable) ForeachInboundFK(f func(fk *descpb.ForeignKeyConstraint) 
 }
 
 // NumFamilies returns the number of column families in the descriptor.
-func (desc *Immutable) NumFamilies() int {
+func (desc *wrapper) NumFamilies() int {
 	return len(desc.Families)
 }
 
 // ForeachFamily calls f for every column family key in desc until an
 // error is returned.
-func (desc *Immutable) ForeachFamily(f func(family *descpb.ColumnFamilyDescriptor) error) error {
+func (desc *wrapper) ForeachFamily(f func(family *descpb.ColumnFamilyDescriptor) error) error {
 	for i := range desc.Families {
 		if err := f(&desc.Families[i]); err != nil {
 			return err
@@ -852,9 +879,9 @@ func maybeUpgradeToFamilyFormatVersion(desc *descpb.TableDescriptor) bool {
 		return false
 	}
 
-	primaryIndexColumnIds := make(map[descpb.ColumnID]struct{}, len(desc.PrimaryIndex.ColumnIDs))
+	var primaryIndexColumnIDs catalog.TableColSet
 	for _, colID := range desc.PrimaryIndex.ColumnIDs {
-		primaryIndexColumnIds[colID] = struct{}{}
+		primaryIndexColumnIDs.Add(colID)
 	}
 
 	desc.Families = []descpb.ColumnFamilyDescriptor{
@@ -862,7 +889,7 @@ func maybeUpgradeToFamilyFormatVersion(desc *descpb.TableDescriptor) bool {
 	}
 	desc.NextFamilyID = desc.Families[0].ID + 1
 	addFamilyForCol := func(col *descpb.ColumnDescriptor) {
-		if _, ok := primaryIndexColumnIds[col.ID]; ok {
+		if primaryIndexColumnIDs.Contains(col.ID) {
 			desc.Families[0].ColumnNames = append(desc.Families[0].ColumnNames, col.Name)
 			desc.Families[0].ColumnIDs = append(desc.Families[0].ColumnIDs, col.ID)
 			return
@@ -900,13 +927,16 @@ func maybeUpgradeToFamilyFormatVersion(desc *descpb.TableDescriptor) bool {
 // within a TableDescriptor. The closure takes in a string pointer so that
 // it can mutate the TableDescriptor if desired.
 func ForEachExprStringInTableDesc(descI catalog.TableDescriptor, f func(expr *string) error) error {
-	desc, ok := descI.(*Immutable)
-	if !ok {
-		mut, ok := descI.(*Mutable)
-		if !ok {
-			return errors.AssertionFailedf("unexpected type of table %T", descI)
-		}
-		desc = &mut.Immutable
+	var desc *wrapper
+	switch descV := descI.(type) {
+	case *wrapper:
+		desc = descV
+	case *Immutable:
+		desc = &descV.wrapper
+	case *Mutable:
+		desc = &descV.wrapper
+	default:
+		return errors.AssertionFailedf("unexpected type of table %T", descI)
 	}
 	// Helpers for each schema element type that can contain an expression.
 	doCol := func(c *descpb.ColumnDescriptor) error {
@@ -981,7 +1011,7 @@ func ForEachExprStringInTableDesc(descI catalog.TableDescriptor, f func(expr *st
 // GetAllReferencedTypeIDs returns all user defined type descriptor IDs that
 // this table references. It takes in a function that returns the TypeDescriptor
 // with the desired ID.
-func (desc *Immutable) GetAllReferencedTypeIDs(
+func (desc *wrapper) GetAllReferencedTypeIDs(
 	getType func(descpb.ID) (catalog.TypeDescriptor, error),
 ) (descpb.IDs, error) {
 	// All serialized expressions within a table descriptor are serialized
@@ -1171,11 +1201,11 @@ func (desc *Mutable) allocateIndexIDs(columnNames map[string]descpb.ColumnID) er
 		allocateIndexName(desc, index)
 	}
 
-	isCompositeColumn := make(map[descpb.ColumnID]struct{})
+	var compositeColIDs catalog.TableColSet
 	for i := range desc.Columns {
 		col := &desc.Columns[i]
 		if colinfo.HasCompositeKeyEncoding(col.Type) {
-			isCompositeColumn[col.ID] = struct{}{}
+			compositeColIDs.Add(col.ID)
 		}
 	}
 
@@ -1239,12 +1269,12 @@ func (desc *Mutable) allocateIndexIDs(columnNames map[string]descpb.ColumnID) er
 
 		index.CompositeColumnIDs = nil
 		for _, colID := range index.ColumnIDs {
-			if _, ok := isCompositeColumn[colID]; ok {
+			if compositeColIDs.Contains(colID) {
 				index.CompositeColumnIDs = append(index.CompositeColumnIDs, colID)
 			}
 		}
 		for _, colID := range index.ExtraColumnIDs {
-			if _, ok := isCompositeColumn[colID]; ok {
+			if compositeColIDs.Contains(colID) {
 				index.CompositeColumnIDs = append(index.CompositeColumnIDs, colID)
 			}
 		}
@@ -1262,7 +1292,7 @@ func (desc *Mutable) allocateColumnFamilyIDs(columnNames map[string]descpb.Colum
 		desc.NextFamilyID = 1
 	}
 
-	columnsInFamilies := make(map[descpb.ColumnID]struct{}, len(desc.Columns))
+	var columnsInFamilies catalog.TableColSet
 	for i := range desc.Families {
 		family := &desc.Families[i]
 		if family.ID == 0 && i != 0 {
@@ -1277,22 +1307,26 @@ func (desc *Mutable) allocateColumnFamilyIDs(columnNames map[string]descpb.Colum
 			if family.ColumnIDs[j] == 0 {
 				family.ColumnIDs[j] = columnNames[colName]
 			}
-			columnsInFamilies[family.ColumnIDs[j]] = struct{}{}
+			columnsInFamilies.Add(family.ColumnIDs[j])
 		}
 
 		desc.Families[i] = *family
 	}
 
-	primaryIndexColIDs := make(map[descpb.ColumnID]struct{}, len(desc.PrimaryIndex.ColumnIDs))
+	var primaryIndexColIDs catalog.TableColSet
 	for _, colID := range desc.PrimaryIndex.ColumnIDs {
-		primaryIndexColIDs[colID] = struct{}{}
+		primaryIndexColIDs.Add(colID)
 	}
 
 	ensureColumnInFamily := func(col *descpb.ColumnDescriptor) {
-		if _, ok := columnsInFamilies[col.ID]; ok {
+		if col.Virtual {
+			// Virtual columns don't need to be part of families.
 			return
 		}
-		if _, ok := primaryIndexColIDs[col.ID]; ok {
+		if columnsInFamilies.Contains(col.ID) {
+			return
+		}
+		if primaryIndexColIDs.Contains(col.ID) {
 			// Primary index columns are required to be assigned to family 0.
 			desc.Families[0].ColumnNames = append(desc.Families[0].ColumnNames, col.Name)
 			desc.Families[0].ColumnIDs = append(desc.Families[0].ColumnIDs, col.ID)
@@ -1346,7 +1380,7 @@ func (desc *Mutable) allocateColumnFamilyIDs(columnNames map[string]descpb.Colum
 		if family.DefaultColumnID == 0 {
 			defaultColumnID := descpb.ColumnID(0)
 			for _, colID := range family.ColumnIDs {
-				if _, ok := primaryIndexColIDs[colID]; !ok {
+				if !primaryIndexColIDs.Contains(colID) {
 					if defaultColumnID == 0 {
 						defaultColumnID = colID
 					} else {
@@ -1435,7 +1469,7 @@ var PerformTestingDescriptorValidation testingDescriptorValidation = true
 
 // Validate validates that the table descriptor is well formed. Checks include
 // both single table and cross table invariants.
-func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) error {
+func (desc *wrapper) Validate(ctx context.Context, dg catalog.DescGetter) error {
 	err := desc.ValidateTable(ctx)
 	if err != nil {
 		return err
@@ -1451,7 +1485,7 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 // (dictated by ExecutorTestingKnobs). Any cross descriptor validations that may
 // fail in the wild due to known bugs that have now been fixed should be added
 // here instead of validateCrossReferences.
-func (desc *Immutable) validateTableIfTesting(ctx context.Context) error {
+func (desc *wrapper) validateTableIfTesting(ctx context.Context) error {
 	if isTesting := ctx.Value(PerformTestingDescriptorValidation); isTesting == nil {
 		return nil
 	}
@@ -1465,7 +1499,7 @@ func (desc *Immutable) validateTableIfTesting(ctx context.Context) error {
 // (dictated by ExecutorTestingKnobs). Any cross reference descriptor validation
 // that may fail in the wild due to known bugs that have now been fixed should
 // be added here instead of validateCrossReferences.
-func (desc *Immutable) validateCrossReferencesIfTesting(
+func (desc *wrapper) validateCrossReferencesIfTesting(
 	ctx context.Context, _ catalog.DescGetter,
 ) error {
 	if isTesting := ctx.Value(PerformTestingDescriptorValidation); isTesting == nil {
@@ -1477,15 +1511,23 @@ func (desc *Immutable) validateCrossReferencesIfTesting(
 
 // validateCrossReferences validates that each reference to another table is
 // resolvable and that the necessary back references exist.
-func (desc *Immutable) validateCrossReferences(ctx context.Context, dg catalog.DescGetter) error {
-	// Check that parent DB exists.
+func (desc *wrapper) validateCrossReferences(ctx context.Context, dg catalog.DescGetter) error {
 	{
-		db, err := dg.GetDesc(ctx, desc.ParentID)
+		// Check that parent DB exists.
+		dbDesc, err := dg.GetDesc(ctx, desc.ParentID)
 		if err != nil {
 			return err
 		}
-		if _, isDB := db.(catalog.DatabaseDescriptor); !isDB {
+		db, isDB := dbDesc.(catalog.DatabaseDescriptor)
+
+		if !isDB {
 			return errors.AssertionFailedf("parentID %d does not exist", errors.Safe(desc.ParentID))
+		}
+
+		if desc.LocalityConfig != nil {
+			if err := ValidateTableLocalityConfig(desc.Name, desc.LocalityConfig, db); err != nil {
+				return errors.AssertionFailedf("invalid locality config: %v", errors.Safe(err))
+			}
 		}
 	}
 
@@ -1531,10 +1573,72 @@ func (desc *Immutable) validateCrossReferences(ctx context.Context, dg catalog.D
 			}
 			return nil
 		})
-		if !found {
-			return errors.AssertionFailedf("missing fk back reference %q to %q from %q",
+		if found {
+			continue
+		}
+		// In 20.2 we introduced a bug where we fail to upgrade the FK references
+		// on the referenced descriptors from their pre-19.2 format when reading
+		// them during validation (#57032). So we account for the possibility of
+		// un-upgraded foreign key references on the other table. This logic
+		// somewhat parallels the logic in maybeUpgradeForeignKeyRepOnIndex.
+		unupgradedFKsPresent := false
+		if err := referencedTable.ForeachIndex(catalog.IndexOpts{}, func(
+			referencedIdx *descpb.IndexDescriptor, isPrimary bool,
+		) error {
+			if found {
+				// TODO (lucy): If we ever revisit the tabledesc.Immutable methods, add
+				// a way to break out of the index loop.
+				return nil
+			}
+			if len(referencedIdx.ReferencedBy) > 0 {
+				unupgradedFKsPresent = true
+			} else {
+				return nil
+			}
+			// Determine whether the index on the other table is a unique index that
+			// could support this FK constraint.
+			if !referencedIdx.IsValidReferencedIndex(fk.ReferencedColumnIDs) {
+				return nil
+			}
+			// Now check the backreferences. Backreferences in ReferencedBy only had
+			// Index and Table populated.
+			for i := range referencedIdx.ReferencedBy {
+				backref := &referencedIdx.ReferencedBy[i]
+				if backref.Table != desc.ID {
+					continue
+				}
+				// Look up the index that the un-upgraded reference refers to and
+				// see if that index could support the foreign key reference. (Note
+				// that it shouldn't be possible for this index to not exist. See
+				// planner.MaybeUpgradeDependentOldForeignKeyVersionTables, which is
+				// called from the drop index implementation.)
+				originalOriginIndex, err := desc.FindIndexByID(backref.Index)
+				if err != nil {
+					return errors.AssertionFailedf(
+						"missing index %d on %q from pre-19.2 foreign key "+
+							"backreference %q on %q",
+						backref.Index, desc.Name, fk.Name, referencedTable.GetName(),
+					)
+				}
+				if originalOriginIndex.IsValidOriginIndex(fk.OriginColumnIDs) {
+					found = true
+					break
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if found {
+			continue
+		}
+		if unupgradedFKsPresent {
+			return errors.AssertionFailedf("missing fk back reference %q to %q "+
+				"from %q (un-upgraded foreign key references present)",
 				fk.Name, desc.Name, referencedTable.GetName())
 		}
+		return errors.AssertionFailedf("missing fk back reference %q to %q from %q",
+			fk.Name, desc.Name, referencedTable.GetName())
 	}
 	for i := range desc.InboundFKs {
 		backref := &desc.InboundFKs[i]
@@ -1550,10 +1654,67 @@ func (desc *Immutable) validateCrossReferences(ctx context.Context, dg catalog.D
 			}
 			return nil
 		})
-		if !found {
-			return errors.AssertionFailedf("missing fk forward reference %q to %q from %q",
+		if found {
+			continue
+		}
+		// In 20.2 we introduced a bug where we fail to upgrade the FK references
+		// on the referenced descriptors from their pre-19.2 format when reading
+		// them during validation (#57032). So we account for the possibility of
+		// un-upgraded foreign key references on the other table. This logic
+		// somewhat parallels the logic in maybeUpgradeForeignKeyRepOnIndex.
+		unupgradedFKsPresent := false
+		if err := originTable.ForeachIndex(catalog.IndexOpts{}, func(
+			originIdx *descpb.IndexDescriptor, isPrimary bool,
+		) error {
+			if found {
+				// TODO (lucy): If we ever revisit the tabledesc.Immutable methods, add
+				// a way to break out of the index loop.
+				return nil
+			}
+			fk := originIdx.ForeignKey
+			if fk.IsSet() {
+				unupgradedFKsPresent = true
+			} else {
+				return nil
+			}
+			// Determine whether the index on the other table is a index that could
+			// support this FK constraint on the referencing side. Such an index would
+			// have been required in earlier versions.
+			if !originIdx.IsValidOriginIndex(backref.OriginColumnIDs) {
+				return nil
+			}
+			if fk.Table != desc.ID {
+				return nil
+			}
+			// Look up the index that the un-upgraded reference refers to and
+			// see if that index could support the foreign key reference. (Note
+			// that it shouldn't be possible for this index to not exist. See
+			// planner.MaybeUpgradeDependentOldForeignKeyVersionTables, which is
+			// called from the drop index implementation.)
+			originalReferencedIndex, err := desc.FindIndexByID(fk.Index)
+			if err != nil {
+				return errors.AssertionFailedf(
+					"missing index %d on %q from pre-19.2 foreign key forward reference %q on %q",
+					fk.Index, desc.Name, backref.Name, originTable.GetName(),
+				)
+			}
+			if originalReferencedIndex.IsValidReferencedIndex(backref.ReferencedColumnIDs) {
+				found = true
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if found {
+			continue
+		}
+		if unupgradedFKsPresent {
+			return errors.AssertionFailedf("missing fk forward reference %q to %q from %q "+
+				"(un-upgraded foreign key references present)",
 				backref.Name, desc.Name, originTable.GetName())
 		}
+		return errors.AssertionFailedf("missing fk forward reference %q to %q from %q",
+			backref.Name, desc.Name, originTable.GetName())
 	}
 
 	for _, index := range desc.AllNonDropIndexes() {
@@ -1642,8 +1803,91 @@ func (desc *Immutable) validateCrossReferences(ctx context.Context, dg catalog.D
 	return desc.validateCrossReferencesIfTesting(ctx, dg)
 }
 
+// FormatTableLocalityConfig formats the table locality.
+func FormatTableLocalityConfig(c *descpb.TableDescriptor_LocalityConfig, f *tree.FmtCtx) error {
+	switch v := c.Locality.(type) {
+	case *descpb.TableDescriptor_LocalityConfig_Global_:
+		f.WriteString("GLOBAL")
+	case *descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
+		f.WriteString("REGIONAL BY TABLE IN ")
+		if v.RegionalByTable.Region != nil {
+			region := tree.Name(*v.RegionalByTable.Region)
+			f.FormatNode(&region)
+		} else {
+			f.WriteString("PRIMARY REGION")
+		}
+	case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
+		f.WriteString("REGIONAL BY ROW")
+	default:
+		return errors.Newf("unknown locality: %T", v)
+	}
+	return nil
+}
+
+// ValidateTableLocalityConfig validates whether a given locality config is valid
+// under the given database.
+func ValidateTableLocalityConfig(
+	tblName string,
+	localityConfig *descpb.TableDescriptor_LocalityConfig,
+	db catalog.DatabaseDescriptor,
+) error {
+	if !db.IsMultiRegion() {
+		s := tree.NewFmtCtx(tree.FmtSimple)
+		var locality string
+		// This should never happen; if so, the error message is more clear if we
+		// return a dummy locality here.
+		if err := FormatTableLocalityConfig(localityConfig, s); err != nil {
+			locality = "INVALID LOCALITY"
+		}
+		locality = s.String()
+		return pgerror.Newf(
+			pgcode.InvalidTableDefinition,
+			"database %s is not multi-region enabled, but table %s has locality %s set",
+			db.DatabaseDesc().Name,
+			tblName,
+			locality,
+		)
+	}
+	switch lc := localityConfig.Locality.(type) {
+	case *descpb.TableDescriptor_LocalityConfig_Global_, *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
+	case *descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
+		if lc.RegionalByTable.Region != nil {
+			foundRegion := false
+			regions, err := db.Regions()
+			if err != nil {
+				return err
+			}
+			for _, r := range regions {
+				if *lc.RegionalByTable.Region == r {
+					foundRegion = true
+					break
+				}
+			}
+			if !foundRegion {
+				return errors.WithHintf(
+					pgerror.Newf(
+						pgcode.InvalidTableDefinition,
+						`region "%s" has not been added to database "%s"`,
+						*lc.RegionalByTable.Region,
+						db.DatabaseDesc().Name,
+					),
+					"available regions: %s",
+					strings.Join(regions.ToStrings(), ", "),
+				)
+			}
+		}
+	default:
+		return pgerror.Newf(
+			pgcode.InvalidTableDefinition,
+			"unknown locality level: %T",
+			lc,
+		)
+	}
+	return nil
+}
+
 // ValidateIndexNameIsUnique validates that the index name does not exist.
-func (desc *Immutable) ValidateIndexNameIsUnique(indexName string) error {
+func (desc *wrapper) ValidateIndexNameIsUnique(indexName string) error {
 	for _, index := range desc.AllNonDropIndexes() {
 		if indexName == index.Name {
 			return sqlerrors.NewRelationAlreadyExistsError(indexName)
@@ -1658,7 +1902,7 @@ func (desc *Immutable) ValidateIndexNameIsUnique(indexName string) error {
 // are consistent. Use Validate to validate that cross-table references are
 // correct.
 // If version is supplied, the descriptor is checked for version incompatibilities.
-func (desc *Immutable) ValidateTable(ctx context.Context) error {
+func (desc *wrapper) ValidateTable(ctx context.Context) error {
 	if err := catalog.ValidateName(desc.Name, "table"); err != nil {
 		return err
 	}
@@ -1707,41 +1951,9 @@ func (desc *Immutable) ValidateTable(ctx context.Context) error {
 	}
 
 	columnNames := make(map[string]descpb.ColumnID, len(desc.Columns))
-	columnIDs := make(map[descpb.ColumnID]string, len(desc.Columns))
-	for _, column := range desc.AllNonDropColumns() {
-		if err := catalog.ValidateName(column.Name, "column"); err != nil {
-			return err
-		}
-		if column.ID == 0 {
-			return errors.AssertionFailedf("invalid column ID %d", errors.Safe(column.ID))
-		}
-
-		if _, columnNameExists := columnNames[column.Name]; columnNameExists {
-			for i := range desc.Columns {
-				if desc.Columns[i].Name == column.Name {
-					return pgerror.Newf(pgcode.DuplicateColumn,
-						"duplicate column name: %q", column.Name)
-				}
-			}
-			return pgerror.Newf(pgcode.DuplicateColumn,
-				"duplicate: column %q in the middle of being added, not yet public", column.Name)
-		}
-		if colinfo.IsSystemColumnName(column.Name) {
-			return pgerror.Newf(pgcode.DuplicateColumn,
-				"column name %q conflicts with a system column name", column.Name)
-		}
-		columnNames[column.Name] = column.ID
-
-		if other, ok := columnIDs[column.ID]; ok {
-			return fmt.Errorf("column %q duplicate ID of column %q: %d",
-				column.Name, other, column.ID)
-		}
-		columnIDs[column.ID] = column.Name
-
-		if column.ID >= desc.NextColumnID {
-			return errors.AssertionFailedf("column %q invalid ID (%d) >= next column ID (%d)",
-				column.Name, errors.Safe(column.ID), errors.Safe(desc.NextColumnID))
-		}
+	columnIDs := make(map[descpb.ColumnID]*descpb.ColumnDescriptor, len(desc.Columns))
+	if err := desc.validateColumns(columnNames, columnIDs); err != nil {
+		return err
 	}
 
 	for _, m := range desc.Mutations {
@@ -1754,7 +1966,7 @@ func (desc *Immutable) ValidateTable(ctx context.Context) error {
 					"mutation in state %s, direction %s, col %q, id %v",
 					errors.Safe(m.State), errors.Safe(m.Direction), col.Name, errors.Safe(col.ID))
 			}
-			columnIDs[col.ID] = col.Name
+			columnIDs[col.ID] = col
 		case *descpb.DescriptorMutation_Index:
 			if unSetEnums {
 				idx := desc.Index
@@ -1792,16 +2004,25 @@ func (desc *Immutable) ValidateTable(ctx context.Context) error {
 
 	// TODO(dt): Validate each column only appears at-most-once in any FKs.
 
-	// Only validate column families and indexes if this is actually a table, not
-	// if it's just a view.
+	// Only validate column families, constraints, and indexes if this is
+	// actually a table, not if it's just a view.
 	if desc.IsPhysicalTable() {
 		if err := desc.validateColumnFamilies(columnIDs); err != nil {
+			return err
+		}
+
+		if err := desc.validateCheckConstraints(columnIDs); err != nil {
+			return err
+		}
+
+		if err := desc.validateUniqueWithoutIndexConstraints(columnIDs); err != nil {
 			return err
 		}
 
 		if err := desc.validateTableIndexes(columnNames); err != nil {
 			return err
 		}
+
 		if err := desc.validatePartitioning(); err != nil {
 			return err
 		}
@@ -1865,7 +2086,71 @@ func (desc *Immutable) ValidateTable(ctx context.Context) error {
 	return desc.Privileges.Validate(desc.GetID(), privilege.Table)
 }
 
-func (desc *Immutable) validateColumnFamilies(columnIDs map[descpb.ColumnID]string) error {
+func (desc *wrapper) validateColumns(
+	columnNames map[string]descpb.ColumnID, columnIDs map[descpb.ColumnID]*descpb.ColumnDescriptor,
+) error {
+	colDescs := desc.AllNonDropColumns()
+	for colIdx := range colDescs {
+		column := &colDescs[colIdx]
+
+		if err := catalog.ValidateName(column.Name, "column"); err != nil {
+			return err
+		}
+		if column.ID == 0 {
+			return errors.AssertionFailedf("invalid column ID %d", errors.Safe(column.ID))
+		}
+
+		if _, columnNameExists := columnNames[column.Name]; columnNameExists {
+			for i := range desc.Columns {
+				if desc.Columns[i].Name == column.Name {
+					return pgerror.Newf(pgcode.DuplicateColumn,
+						"duplicate column name: %q", column.Name)
+				}
+			}
+			return pgerror.Newf(pgcode.DuplicateColumn,
+				"duplicate: column %q in the middle of being added, not yet public", column.Name)
+		}
+		if colinfo.IsSystemColumnName(column.Name) {
+			return pgerror.Newf(pgcode.DuplicateColumn,
+				"column name %q conflicts with a system column name", column.Name)
+		}
+		columnNames[column.Name] = column.ID
+
+		if other, ok := columnIDs[column.ID]; ok {
+			return fmt.Errorf("column %q duplicate ID of column %q: %d",
+				column.Name, other.Name, column.ID)
+		}
+		columnIDs[column.ID] = column
+
+		if column.ID >= desc.NextColumnID {
+			return errors.AssertionFailedf("column %q invalid ID (%d) >= next column ID (%d)",
+				column.Name, errors.Safe(column.ID), errors.Safe(desc.NextColumnID))
+		}
+
+		if column.IsComputed() {
+			// Verify that the computed column expression is valid.
+			expr, err := parser.ParseExpr(*column.ComputeExpr)
+			if err != nil {
+				return err
+			}
+			valid, err := schemaexpr.HasValidColumnReferences(desc, expr)
+			if err != nil {
+				return err
+			}
+			if !valid {
+				return fmt.Errorf("computed column %q refers to unknown columns in expression: %s",
+					column.Name, *column.ComputeExpr)
+			}
+		} else if column.Virtual {
+			return fmt.Errorf("virtual column %q is not computed", column.Name)
+		}
+	}
+	return nil
+}
+
+func (desc *wrapper) validateColumnFamilies(
+	columnIDs map[descpb.ColumnID]*descpb.ColumnDescriptor,
+) error {
 	if len(desc.Families) < 1 {
 		return fmt.Errorf("at least 1 column family must be specified")
 	}
@@ -1913,13 +2198,16 @@ func (desc *Immutable) validateColumnFamilies(columnIDs map[descpb.ColumnID]stri
 		}
 
 		for i, colID := range family.ColumnIDs {
-			name, ok := columnIDs[colID]
+			col, ok := columnIDs[colID]
 			if !ok {
 				return fmt.Errorf("family %q contains unknown column \"%d\"", family.Name, colID)
 			}
-			if name != family.ColumnNames[i] {
+			if col.Name != family.ColumnNames[i] {
 				return fmt.Errorf("family %q column %d should have name %q, but found name %q",
-					family.Name, colID, name, family.ColumnNames[i])
+					family.Name, colID, col.Name, family.ColumnNames[i])
+			}
+			if col.Virtual {
+				return fmt.Errorf("virtual computed column %q cannot be part of a family", col.Name)
 			}
 		}
 
@@ -1930,11 +2218,85 @@ func (desc *Immutable) validateColumnFamilies(columnIDs map[descpb.ColumnID]stri
 			colIDToFamilyID[colID] = family.ID
 		}
 	}
-	for colID := range columnIDs {
-		if _, ok := colIDToFamilyID[colID]; !ok {
-			return fmt.Errorf("column %d is not in any column family", colID)
+	for colID, colDesc := range columnIDs {
+		if !colDesc.Virtual {
+			if _, ok := colIDToFamilyID[colID]; !ok {
+				return fmt.Errorf("column %q is not in any column family", colDesc.Name)
+			}
 		}
 	}
+	return nil
+}
+
+// validateCheckConstraints validates that check constraints are well formed.
+// Checks include validating the column IDs and verifying that check expressions
+// do not reference non-existent columns.
+func (desc *wrapper) validateCheckConstraints(
+	columnIDs map[descpb.ColumnID]*descpb.ColumnDescriptor,
+) error {
+	for _, chk := range desc.AllActiveAndInactiveChecks() {
+		// Verify that the check's column IDs are valid.
+		for _, colID := range chk.ColumnIDs {
+			_, ok := columnIDs[colID]
+			if !ok {
+				return fmt.Errorf("check constraint %q contains unknown column \"%d\"", chk.Name, colID)
+			}
+		}
+
+		// Verify that the check's expression is valid.
+		expr, err := parser.ParseExpr(chk.Expr)
+		if err != nil {
+			return err
+		}
+		valid, err := schemaexpr.HasValidColumnReferences(desc, expr)
+		if err != nil {
+			return err
+		}
+		if !valid {
+			return fmt.Errorf("check constraint %q refers to unknown columns in expression: %s",
+				chk.Name, chk.Expr)
+		}
+	}
+	return nil
+}
+
+// validateUniqueWithoutIndexConstraints validates that unique without index
+// constraints are well formed. Checks include validating the column IDs and
+// column names.
+func (desc *wrapper) validateUniqueWithoutIndexConstraints(
+	columnIDs map[descpb.ColumnID]*descpb.ColumnDescriptor,
+) error {
+	for _, c := range desc.AllActiveAndInactiveUniqueWithoutIndexConstraints() {
+		if err := catalog.ValidateName(c.Name, "unique without index constraint"); err != nil {
+			return err
+		}
+
+		// Verify that the table ID is valid.
+		if c.TableID != desc.ID {
+			return fmt.Errorf(
+				"TableID mismatch for unique without index constraint %q: \"%d\" doesn't match descriptor: \"%d\"",
+				c.Name, c.TableID, desc.ID,
+			)
+		}
+
+		// Verify that the constraint's column IDs are valid and unique.
+		var seen util.FastIntSet
+		for _, colID := range c.ColumnIDs {
+			_, ok := columnIDs[colID]
+			if !ok {
+				return fmt.Errorf(
+					"unique without index constraint %q contains unknown column \"%d\"", c.Name, colID,
+				)
+			}
+			if seen.Contains(int(colID)) {
+				return fmt.Errorf(
+					"unique without index constraint %q contains duplicate column \"%d\"", c.Name, colID,
+				)
+			}
+			seen.Add(int(colID))
+		}
+	}
+
 	return nil
 }
 
@@ -1943,9 +2305,23 @@ func (desc *Immutable) validateColumnFamilies(columnIDs map[descpb.ColumnID]stri
 // IDs are unique, and the family of the primary key is 0. This does not check
 // if indexes are unique (i.e. same set of columns, direction, and uniqueness)
 // as there are practical uses for them.
-func (desc *Immutable) validateTableIndexes(columnNames map[string]descpb.ColumnID) error {
+func (desc *wrapper) validateTableIndexes(columnNames map[string]descpb.ColumnID) error {
 	if len(desc.PrimaryIndex.ColumnIDs) == 0 {
 		return ErrMissingPrimaryKey
+	}
+
+	var virtualCols catalog.TableColSet
+	for i := range desc.Columns {
+		if desc.Columns[i].Virtual {
+			virtualCols.Add(desc.Columns[i].ID)
+		}
+	}
+
+	// Verify that the primary index columns are not virtual.
+	for i, col := range desc.PrimaryIndex.ColumnIDs {
+		if virtualCols.Contains(col) {
+			return fmt.Errorf("primary index column %q cannot be virtual", desc.PrimaryIndex.ColumnNames[i])
+		}
 	}
 
 	indexNames := map[string]struct{}{}
@@ -1990,12 +2366,18 @@ func (desc *Immutable) validateTableIndexes(columnNames map[string]descpb.Column
 			return fmt.Errorf("mismatched column IDs (%d) and directions (%d)",
 				len(index.ColumnIDs), len(index.ColumnDirections))
 		}
+		// In the old STORING encoding, stored columns are in ExtraColumnIDs;
+		// tolerate a longer list of column names.
+		if len(index.StoreColumnIDs) > len(index.StoreColumnNames) {
+			return fmt.Errorf("mismatched STORING column IDs (%d) and names (%d)",
+				len(index.StoreColumnIDs), len(index.StoreColumnNames))
+		}
 
 		if len(index.ColumnIDs) == 0 {
 			return fmt.Errorf("index %q must contain at least 1 column", index.Name)
 		}
 
-		validateIndexDup := make(map[descpb.ColumnID]struct{})
+		var validateIndexDup catalog.TableColSet
 		for i, name := range index.ColumnNames {
 			colID, ok := columnNames[name]
 			if !ok {
@@ -2005,10 +2387,10 @@ func (desc *Immutable) validateTableIndexes(columnNames map[string]descpb.Column
 				return fmt.Errorf("index %q column %q should have ID %d, but found ID %d",
 					index.Name, name, colID, index.ColumnIDs[i])
 			}
-			if _, ok := validateIndexDup[colID]; ok {
+			if validateIndexDup.Contains(colID) {
 				return fmt.Errorf("index %q contains duplicate column %q", index.Name, name)
 			}
-			validateIndexDup[colID] = struct{}{}
+			validateIndexDup.Add(colID)
 		}
 		if index.IsSharded() {
 			if err := desc.ensureShardedIndexNotComputed(index); err != nil {
@@ -2017,6 +2399,31 @@ func (desc *Immutable) validateTableIndexes(columnNames map[string]descpb.Column
 			if _, exists := columnNames[index.Sharded.Name]; !exists {
 				return fmt.Errorf("index %q refers to non-existent shard column %q",
 					index.Name, index.Sharded.Name)
+			}
+		}
+		if index.IsPartial() {
+			expr, err := parser.ParseExpr(index.Predicate)
+			if err != nil {
+				return err
+			}
+			valid, err := schemaexpr.HasValidColumnReferences(desc, expr)
+			if err != nil {
+				return err
+			}
+			if !valid {
+				return fmt.Errorf("partial index %q refers to unknown columns in predicate: %s",
+					index.Name, index.Predicate)
+			}
+		}
+		// Ensure that indexes do not STORE virtual columns.
+		for _, col := range index.ExtraColumnIDs {
+			if virtualCols.Contains(col) {
+				return fmt.Errorf("index %q cannot store virtual column %d", index.Name, col)
+			}
+		}
+		for i, col := range index.StoreColumnIDs {
+			if virtualCols.Contains(col) {
+				return fmt.Errorf("index %q cannot store virtual column %q", index.Name, index.StoreColumnNames[i])
 			}
 		}
 	}
@@ -2028,7 +2435,7 @@ func (desc *Immutable) validateTableIndexes(columnNames map[string]descpb.Column
 // column. This is because the sharded index is based on a hidden computed shard column
 // under the hood and we don't support transitively computed columns (computed column A
 // based on another computed column B).
-func (desc *Immutable) ensureShardedIndexNotComputed(index *descpb.IndexDescriptor) error {
+func (desc *wrapper) ensureShardedIndexNotComputed(index *descpb.IndexDescriptor) error {
 	for _, colName := range index.Sharded.ColumnNames {
 		col, _, err := desc.FindColumnByName(tree.Name(colName))
 		if err != nil {
@@ -2044,7 +2451,7 @@ func (desc *Immutable) ensureShardedIndexNotComputed(index *descpb.IndexDescript
 
 // PrimaryKeyString returns the pretty-printed primary key declaration for a
 // table descriptor.
-func (desc *Immutable) PrimaryKeyString() string {
+func (desc *wrapper) PrimaryKeyString() string {
 	var primaryKeyString strings.Builder
 	primaryKeyString.WriteString("PRIMARY KEY (%s)")
 	if desc.PrimaryIndex.IsSharded() {
@@ -2062,7 +2469,7 @@ func (desc *Immutable) PrimaryKeyString() string {
 // tuples match the corresponding column types, and that range partitions are
 // stored sorted by upper bound. colOffset is non-zero for subpartitions and
 // indicates how many index columns to skip over.
-func (desc *Immutable) validatePartitioningDescriptor(
+func (desc *wrapper) validatePartitioningDescriptor(
 	a *rowenc.DatumAlloc,
 	idxDesc *descpb.IndexDescriptor,
 	partDesc *descpb.PartitioningDescriptor,
@@ -2097,6 +2504,28 @@ func (desc *Immutable) validatePartitioningDescriptor(
 	}
 	if len(partDesc.List) > 0 && len(partDesc.Range) > 0 {
 		return fmt.Errorf("only one LIST or RANGE partitioning may used")
+	}
+
+	// Do not validate partitions which use unhydrated user-defined types.
+	// This should only happen at read time and descriptors should not become
+	// invalid at read time, only at write time.
+	{
+		numColumns := int(partDesc.NumColumns)
+		for i := colOffset; i < colOffset+numColumns; i++ {
+			// The partitioning descriptor may be invalid and refer to columns
+			// not stored in the index. In that case, skip this check as the
+			// validation will fail later.
+			if i >= len(idxDesc.ColumnIDs) {
+				continue
+			}
+			col, err := desc.FindColumnByID(idxDesc.ColumnIDs[i])
+			if err != nil {
+				return err
+			}
+			if col.Type.UserDefined() && !col.Type.IsHydrated() {
+				return nil
+			}
+		}
 	}
 
 	checkName := func(name string) error {
@@ -2208,7 +2637,7 @@ func (ps partitionInterval) Range() interval.Range {
 
 // FindIndexesWithPartition returns all IndexDescriptors (potentially including
 // the primary index) which have a partition with the given name.
-func (desc *Immutable) FindIndexesWithPartition(name string) []*descpb.IndexDescriptor {
+func (desc *wrapper) FindIndexesWithPartition(name string) []*descpb.IndexDescriptor {
 	var indexes []*descpb.IndexDescriptor
 	for _, idx := range desc.AllNonDropIndexes() {
 		if FindIndexPartitionByName(idx, name) != nil {
@@ -2220,7 +2649,7 @@ func (desc *Immutable) FindIndexesWithPartition(name string) []*descpb.IndexDesc
 
 // validatePartitioning validates that any PartitioningDescriptors contained in
 // table indexes are well-formed. See validatePartitioningDesc for details.
-func (desc *Immutable) validatePartitioning() error {
+func (desc *wrapper) validatePartitioning() error {
 	partitionNames := make(map[string]string)
 
 	a := &rowenc.DatumAlloc{}
@@ -2282,15 +2711,13 @@ func checkColumnsValidForIndex(tableDesc *Mutable, indexColNames []string) error
 }
 
 func checkColumnsValidForInvertedIndex(tableDesc *Mutable, indexColNames []string) error {
-	if len((indexColNames)) > 1 {
-		return unimplemented.NewWithIssue(48100,
-			"indexing more than one column with an inverted index is not supported")
-	}
 	invalidColumns := make([]descpb.ColumnDescriptor, 0, len(indexColNames))
-	for _, indexCol := range indexColNames {
+	for i, indexCol := range indexColNames {
 		for _, col := range tableDesc.AllNonDropColumns() {
 			if col.Name == indexCol {
-				if !colinfo.ColumnTypeIsInvertedIndexable(col.Type) {
+				lastCol := len(indexColNames) - 1
+				if i == lastCol && !colinfo.ColumnTypeIsInvertedIndexable(col.Type) ||
+					i < lastCol && !colinfo.ColumnTypeIsIndexable(col.Type) {
 					invalidColumns = append(invalidColumns, col)
 				}
 			}
@@ -2326,19 +2753,19 @@ func (desc *Mutable) AddIndex(idx descpb.IndexDescriptor, primary bool) error {
 					// Only override the index name if it hasn't been set by the user.
 					idx.Name = PrimaryKeyIndexName
 				}
-				desc.PrimaryIndex = idx
+				desc.SetPrimaryIndex(idx)
 			} else {
 				return fmt.Errorf("multiple primary keys for table %q are not allowed", desc.Name)
 			}
 		} else {
-			desc.Indexes = append(desc.Indexes, idx)
+			desc.AddPublicNonPrimaryIndex(idx)
 		}
 
 	} else {
 		if err := checkColumnsValidForInvertedIndex(desc, idx.ColumnNames); err != nil {
 			return err
 		}
-		desc.Indexes = append(desc.Indexes, idx)
+		desc.AddPublicNonPrimaryIndex(idx)
 	}
 
 	return nil
@@ -2440,7 +2867,7 @@ func (desc *Mutable) RenameColumnDescriptor(column *descpb.ColumnDescriptor, new
 
 // FindActiveColumnsByNames finds all requested columns (in the requested order)
 // or returns an error.
-func (desc *Immutable) FindActiveColumnsByNames(
+func (desc *wrapper) FindActiveColumnsByNames(
 	names tree.NameList,
 ) ([]descpb.ColumnDescriptor, error) {
 	cols := make([]descpb.ColumnDescriptor, len(names))
@@ -2454,25 +2881,35 @@ func (desc *Immutable) FindActiveColumnsByNames(
 	return cols, nil
 }
 
-// FindColumnByName finds the column with the specified name. It returns
-// an active column or a column from the mutation list. It returns true
-// if the column is being dropped.
-func (desc *Immutable) FindColumnByName(name tree.Name) (*descpb.ColumnDescriptor, bool, error) {
+// HasColumnWithName finds the column with the specified name. It returns
+// nil if there is no such column, and true if the column is being dropped.
+func (desc *wrapper) HasColumnWithName(name tree.Name) (*descpb.ColumnDescriptor, bool) {
 	for i := range desc.Columns {
 		c := &desc.Columns[i]
 		if c.Name == string(name) {
-			return c, false, nil
+			return c, false
 		}
 	}
 	for i := range desc.Mutations {
 		m := &desc.Mutations[i]
 		if c := m.GetColumn(); c != nil {
 			if c.Name == string(name) {
-				return c, m.Direction == descpb.DescriptorMutation_DROP, nil
+				return c, m.Direction == descpb.DescriptorMutation_DROP
 			}
 		}
 	}
-	return nil, false, colinfo.NewUndefinedColumnError(string(name))
+	return nil, false
+}
+
+// FindColumnByName finds the column with the specified name. It returns
+// an active column or a column from the mutation list. It returns true
+// if the column is being dropped.
+func (desc *wrapper) FindColumnByName(name tree.Name) (*descpb.ColumnDescriptor, bool, error) {
+	ret, ok := desc.HasColumnWithName(name)
+	if ret == nil {
+		return nil, false, colinfo.NewUndefinedColumnError(string(name))
+	}
+	return ret, ok, nil
 }
 
 // FindActiveOrNewColumnByName finds the column with the specified name.
@@ -2498,7 +2935,7 @@ func (desc *Mutable) FindActiveOrNewColumnByName(name tree.Name) (*descpb.Column
 }
 
 // FindColumnMutationByName finds the mutation on the specified column.
-func (desc *Immutable) FindColumnMutationByName(name tree.Name) *descpb.DescriptorMutation {
+func (desc *wrapper) FindColumnMutationByName(name tree.Name) *descpb.DescriptorMutation {
 	for i := range desc.Mutations {
 		m := &desc.Mutations[i]
 		if c := m.GetColumn(); c != nil {
@@ -2512,25 +2949,25 @@ func (desc *Immutable) FindColumnMutationByName(name tree.Name) *descpb.Descript
 
 // ColumnIdxMap returns a map from Column ID to the ordinal position of that
 // column.
-func (desc *Immutable) ColumnIdxMap() map[descpb.ColumnID]int {
+func (desc *wrapper) ColumnIdxMap() catalog.TableColMap {
 	return desc.ColumnIdxMapWithMutations(false)
 }
 
 // ColumnIdxMapWithMutations returns a map from Column ID to the ordinal
 // position of that column, optionally including mutation columns if the input
 // bool is true.
-func (desc *Immutable) ColumnIdxMapWithMutations(mutations bool) map[descpb.ColumnID]int {
-	colIdxMap := make(map[descpb.ColumnID]int, len(desc.Columns))
+func (desc *wrapper) ColumnIdxMapWithMutations(mutations bool) catalog.TableColMap {
+	var colIdxMap catalog.TableColMap
 	for i := range desc.Columns {
 		id := desc.Columns[i].ID
-		colIdxMap[id] = i
+		colIdxMap.Set(id, i)
 	}
 	if mutations {
 		idx := len(desc.Columns)
 		for i := range desc.Mutations {
 			col := desc.Mutations[i].GetColumn()
 			if col != nil {
-				colIdxMap[col.ID] = idx
+				colIdxMap.Set(col.ID, idx)
 				idx++
 			}
 		}
@@ -2539,7 +2976,7 @@ func (desc *Immutable) ColumnIdxMapWithMutations(mutations bool) map[descpb.Colu
 }
 
 // FindActiveColumnByName finds an active column with the specified name.
-func (desc *Immutable) FindActiveColumnByName(name string) (*descpb.ColumnDescriptor, error) {
+func (desc *wrapper) FindActiveColumnByName(name string) (*descpb.ColumnDescriptor, error) {
 	for i := range desc.Columns {
 		c := &desc.Columns[i]
 		if c.Name == name {
@@ -2550,7 +2987,7 @@ func (desc *Immutable) FindActiveColumnByName(name string) (*descpb.ColumnDescri
 }
 
 // FindColumnByID finds the column with specified ID.
-func (desc *Immutable) FindColumnByID(id descpb.ColumnID) (*descpb.ColumnDescriptor, error) {
+func (desc *wrapper) FindColumnByID(id descpb.ColumnID) (*descpb.ColumnDescriptor, error) {
 	for i := range desc.Columns {
 		c := &desc.Columns[i]
 		if c.ID == id {
@@ -2568,7 +3005,7 @@ func (desc *Immutable) FindColumnByID(id descpb.ColumnID) (*descpb.ColumnDescrip
 }
 
 // FindActiveColumnByID finds the active column with specified ID.
-func (desc *Immutable) FindActiveColumnByID(id descpb.ColumnID) (*descpb.ColumnDescriptor, error) {
+func (desc *wrapper) FindActiveColumnByID(id descpb.ColumnID) (*descpb.ColumnDescriptor, error) {
 	for i := range desc.Columns {
 		c := &desc.Columns[i]
 		if c.ID == id {
@@ -2580,8 +3017,8 @@ func (desc *Immutable) FindActiveColumnByID(id descpb.ColumnID) (*descpb.ColumnD
 
 // ContainsUserDefinedTypes returns whether or not this table descriptor has
 // any columns of user defined types.
-func (desc *Immutable) ContainsUserDefinedTypes() bool {
-	return len(desc.columnsWithUDTs) > 0
+func (desc *wrapper) ContainsUserDefinedTypes() bool {
+	return len(desc.GetColumnOrdinalsWithUserDefinedTypes()) > 0
 }
 
 // GetColumnOrdinalsWithUserDefinedTypes returns a slice of column ordinals
@@ -2594,9 +3031,11 @@ func (desc *Immutable) GetColumnOrdinalsWithUserDefinedTypes() []int {
 // with user defined type metadata have the same versions of metadata as in the
 // other descriptor. Note that this function is only valid on two descriptors
 // representing the same table at the same version.
-func (desc *Immutable) UserDefinedTypeColsHaveSameVersion(otherDesc *Immutable) bool {
-	for _, idx := range desc.columnsWithUDTs {
-		this, other := desc.publicAndNonPublicCols[idx].Type, otherDesc.publicAndNonPublicCols[idx].Type
+func (desc *wrapper) UserDefinedTypeColsHaveSameVersion(otherDesc catalog.TableDescriptor) bool {
+	thisCols := desc.DeletableColumns()
+	otherCols := otherDesc.DeletableColumns()
+	for _, idx := range desc.GetColumnOrdinalsWithUserDefinedTypes() {
+		this, other := thisCols[idx].Type, otherCols[idx].Type
 		if this.TypeMeta.Version != other.TypeMeta.Version {
 			return false
 		}
@@ -2611,17 +3050,16 @@ func (desc *Immutable) UserDefinedTypeColsHaveSameVersion(otherDesc *Immutable) 
 func (desc *Immutable) FindReadableColumnByID(
 	id descpb.ColumnID,
 ) (*descpb.ColumnDescriptor, bool, error) {
-	for i := range desc.ReadableColumns {
-		c := &desc.ReadableColumns[i]
+	for i, c := range desc.ReadableColumns() {
 		if c.ID == id {
-			return c, i >= len(desc.Columns), nil
+			return &c, i >= len(desc.Columns), nil
 		}
 	}
 	return nil, false, fmt.Errorf("column-id \"%d\" does not exist", id)
 }
 
 // FindFamilyByID finds the family with specified ID.
-func (desc *Immutable) FindFamilyByID(id descpb.FamilyID) (*descpb.ColumnFamilyDescriptor, error) {
+func (desc *wrapper) FindFamilyByID(id descpb.FamilyID) (*descpb.ColumnFamilyDescriptor, error) {
 	for i := range desc.Families {
 		family := &desc.Families[i]
 		if family.ID == id {
@@ -2633,7 +3071,7 @@ func (desc *Immutable) FindFamilyByID(id descpb.FamilyID) (*descpb.ColumnFamilyD
 
 // FindIndexByName finds the index with the specified name in the active
 // list or the mutations list. It returns true if the index is being dropped.
-func (desc *Immutable) FindIndexByName(
+func (desc *wrapper) FindIndexByName(
 	name string,
 ) (_ *descpb.IndexDescriptor, dropped bool, _ error) {
 	if desc.IsPhysicalTable() && desc.PrimaryIndex.Name == name {
@@ -2658,7 +3096,7 @@ func (desc *Immutable) FindIndexByName(
 // NamesForColumnIDs returns the names for the given column ids, or an error
 // if one or more column ids was missing. Note - this allocates! It's not for
 // hot path code.
-func (desc *Immutable) NamesForColumnIDs(ids descpb.ColumnIDs) ([]string, error) {
+func (desc *wrapper) NamesForColumnIDs(ids descpb.ColumnIDs) ([]string, error) {
 	names := make([]string, len(ids))
 	for i, id := range ids {
 		col, err := desc.FindColumnByID(id)
@@ -2674,12 +3112,15 @@ func (desc *Immutable) NamesForColumnIDs(ids descpb.ColumnIDs) ([]string, error)
 func (desc *Mutable) RenameIndexDescriptor(index *descpb.IndexDescriptor, name string) error {
 	id := index.ID
 	if id == desc.PrimaryIndex.ID {
-		desc.PrimaryIndex.Name = name
+		idx := desc.PrimaryIndex
+		idx.Name = name
+		desc.SetPrimaryIndex(idx)
 		return nil
 	}
-	for i := range desc.Indexes {
-		if desc.Indexes[i].ID == id {
-			desc.Indexes[i].Name = name
+	for i, idx := range desc.Indexes {
+		if idx.ID == id {
+			idx.Name = name
+			desc.SetPublicNonPrimaryIndex(i+1, idx)
 			return nil
 		}
 	}
@@ -2703,13 +3144,55 @@ func (desc *Mutable) DropConstraint(
 ) error {
 	switch detail.Kind {
 	case descpb.ConstraintTypePK:
-		desc.PrimaryIndex.Disabled = true
+		{
+			primaryIndex := desc.PrimaryIndex
+			primaryIndex.Disabled = true
+			desc.SetPrimaryIndex(primaryIndex)
+		}
 		return nil
 
 	case descpb.ConstraintTypeUnique:
-		return unimplemented.NewWithIssueDetailf(42840, "drop-constraint-unique",
-			"cannot drop UNIQUE constraint %q using ALTER TABLE DROP CONSTRAINT, use DROP INDEX CASCADE instead",
-			tree.ErrNameStringP(&detail.Index.Name))
+		if detail.Index != nil {
+			return unimplemented.NewWithIssueDetailf(42840, "drop-constraint-unique",
+				"cannot drop UNIQUE constraint %q using ALTER TABLE DROP CONSTRAINT, use DROP INDEX CASCADE instead",
+				tree.ErrNameStringP(&detail.Index.Name))
+		}
+		if detail.UniqueWithoutIndexConstraint == nil {
+			return errors.AssertionFailedf(
+				"Index or UniqueWithoutIndexConstraint must be non-nil for a unique constraint",
+			)
+		}
+		if detail.UniqueWithoutIndexConstraint.Validity == descpb.ConstraintValidity_Validating {
+			return unimplemented.NewWithIssueDetailf(42844,
+				"drop-constraint-unique-validating",
+				"constraint %q in the middle of being added, try again later", name)
+		}
+		if detail.UniqueWithoutIndexConstraint.Validity == descpb.ConstraintValidity_Dropping {
+			return unimplemented.NewWithIssueDetailf(42844,
+				"drop-constraint-unique-mutation",
+				"constraint %q in the middle of being dropped", name)
+		}
+		// Search through the descriptor's unique constraints and delete the
+		// one that we're supposed to be deleting.
+		for i := range desc.UniqueWithoutIndexConstraints {
+			ref := &desc.UniqueWithoutIndexConstraints[i]
+			if ref.Name == name {
+				// If the constraint is unvalidated, there's no assumption that it must
+				// hold for all rows, so it can be dropped immediately.
+				if detail.UniqueWithoutIndexConstraint.Validity == descpb.ConstraintValidity_Unvalidated {
+					desc.UniqueWithoutIndexConstraints = append(
+						desc.UniqueWithoutIndexConstraints[:i], desc.UniqueWithoutIndexConstraints[i+1:]...,
+					)
+					return nil
+				}
+				// TODO(rytaft): set validity to Dropping and call AddUniqueMutation
+				// once supported.
+				return pgerror.New(pgcode.FeatureNotSupported,
+					"dropping valid unique constraints without an index is not yet supported",
+				)
+			}
+		}
+		return errors.AssertionFailedf("constraint %q not found on table %q", name, desc.Name)
 
 	case descpb.ConstraintTypeCheck:
 		if detail.CheckConstraint.Validity == descpb.ConstraintValidity_Validating {
@@ -2786,7 +3269,7 @@ func (desc *Mutable) RenameConstraint(
 	renameFK func(*Mutable, *descpb.ForeignKeyConstraint, string) error,
 ) error {
 	switch detail.Kind {
-	case descpb.ConstraintTypePK, descpb.ConstraintTypeUnique:
+	case descpb.ConstraintTypePK:
 		for _, tableRef := range desc.DependedOnBy {
 			if tableRef.IndexID != detail.Index.ID {
 				continue
@@ -2794,6 +3277,32 @@ func (desc *Mutable) RenameConstraint(
 			return dependentViewRenameError("index", tableRef.ID)
 		}
 		return desc.RenameIndexDescriptor(detail.Index, newName)
+
+	case descpb.ConstraintTypeUnique:
+		if detail.Index != nil {
+			for _, tableRef := range desc.DependedOnBy {
+				if tableRef.IndexID != detail.Index.ID {
+					continue
+				}
+				return dependentViewRenameError("index", tableRef.ID)
+			}
+			if err := desc.RenameIndexDescriptor(detail.Index, newName); err != nil {
+				return err
+			}
+		} else if detail.UniqueWithoutIndexConstraint != nil {
+			if detail.UniqueWithoutIndexConstraint.Validity == descpb.ConstraintValidity_Validating {
+				return unimplemented.NewWithIssueDetailf(42844,
+					"rename-constraint-unique-mutation",
+					"constraint %q in the middle of being added, try again later",
+					tree.ErrNameStringP(&detail.UniqueWithoutIndexConstraint.Name))
+			}
+			detail.UniqueWithoutIndexConstraint.Name = newName
+		} else {
+			return errors.AssertionFailedf(
+				"Index or UniqueWithoutIndexConstraint must be non-nil for a unique constraint",
+			)
+		}
+		return nil
 
 	case descpb.ConstraintTypeFK:
 		if detail.FK.Validity == descpb.ConstraintValidity_Validating {
@@ -2832,7 +3341,7 @@ func (desc *Mutable) RenameConstraint(
 
 // FindActiveIndexByID returns the index with the specified ID, or nil if it
 // does not exist. It only searches active indexes.
-func (desc *Immutable) FindActiveIndexByID(id descpb.IndexID) *descpb.IndexDescriptor {
+func (desc *wrapper) FindActiveIndexByID(id descpb.IndexID) *descpb.IndexDescriptor {
 	if desc.PrimaryIndex.ID == id {
 		return &desc.PrimaryIndex
 	}
@@ -2850,7 +3359,7 @@ func (desc *Immutable) FindActiveIndexByID(id descpb.IndexID) *descpb.IndexDescr
 // the index is a secondary index.
 // The primary index has an index of 0 and the first secondary index
 // (if it exists) has an index of 1.
-func (desc *Immutable) FindIndexByIndexIdx(
+func (desc *wrapper) FindIndexByIndexIdx(
 	indexIdx int,
 ) (index *descpb.IndexDescriptor, isSecondary bool, err error) {
 	// indexIdx is 0 for the primary index, or 1 to <num-indexes> for a
@@ -2869,7 +3378,7 @@ func (desc *Immutable) FindIndexByIndexIdx(
 // GetIndexMutationCapabilities returns:
 // 1. Whether the index is a mutation
 // 2. if so, is it in state DELETE_AND_WRITE_ONLY
-func (desc *Immutable) GetIndexMutationCapabilities(id descpb.IndexID) (bool, bool) {
+func (desc *wrapper) GetIndexMutationCapabilities(id descpb.IndexID) (bool, bool) {
 	for _, mutation := range desc.Mutations {
 		if mutationIndex := mutation.GetIndex(); mutationIndex != nil {
 			if mutationIndex.ID == id {
@@ -2884,7 +3393,7 @@ func (desc *Immutable) GetIndexMutationCapabilities(id descpb.IndexID) (bool, bo
 // FindFKByName returns the FK constraint on the table with the given name.
 // Must return a pointer to the FK in the TableDescriptor, so that
 // callers can use returned values to modify the TableDesc.
-func (desc *Immutable) FindFKByName(name string) (*descpb.ForeignKeyConstraint, error) {
+func (desc *wrapper) FindFKByName(name string) (*descpb.ForeignKeyConstraint, error) {
 	for i := range desc.OutboundFKs {
 		fk := &desc.OutboundFKs[i]
 		if fk.Name == name {
@@ -2896,7 +3405,7 @@ func (desc *Immutable) FindFKByName(name string) (*descpb.ForeignKeyConstraint, 
 
 // IsInterleaved returns true if any part of this this table is interleaved with
 // another table's data.
-func (desc *Immutable) IsInterleaved() bool {
+func (desc *wrapper) IsInterleaved() bool {
 	for _, index := range desc.AllNonDropIndexes() {
 		if index.IsInterleaved() {
 			return true
@@ -2907,7 +3416,7 @@ func (desc *Immutable) IsInterleaved() bool {
 
 // IsPrimaryIndexDefaultRowID returns whether or not the table's primary
 // index is the default primary key on the hidden rowid column.
-func (desc *Immutable) IsPrimaryIndexDefaultRowID() bool {
+func (desc *wrapper) IsPrimaryIndexDefaultRowID() bool {
 	if len(desc.PrimaryIndex.ColumnIDs) != 1 {
 		return false
 	}
@@ -2997,7 +3506,7 @@ func (desc *Mutable) MakeMutationComplete(m descpb.DescriptorMutation) error {
 			getIndexIdxByID := func(id descpb.IndexID) (int, error) {
 				for i, idx := range desc.Indexes {
 					if idx.ID == id {
-						return i, nil
+						return i + 1, nil
 					}
 				}
 				return 0, errors.New("index was not in list of indexes")
@@ -3034,16 +3543,25 @@ func (desc *Mutable) MakeMutationComplete(m descpb.DescriptorMutation) error {
 			if err != nil {
 				return err
 			}
-			newIndex.Name = "primary"
-			desc.PrimaryIndex = *protoutil.Clone(newIndex).(*descpb.IndexDescriptor)
-			// The primary index "implicitly" stores all columns in the table.
-			// Explicitly including them in the stored columns list is incorrect.
-			desc.PrimaryIndex.StoreColumnNames, desc.PrimaryIndex.StoreColumnIDs = nil, nil
+			if args.NewPrimaryIndexName == "" {
+				newIndex.Name = PrimaryKeyIndexName
+			} else {
+				newIndex.Name = args.NewPrimaryIndexName
+			}
+
+			{
+				primaryIndex := *protoutil.Clone(newIndex).(*descpb.IndexDescriptor)
+				// The primary index "implicitly" stores all columns in the table.
+				// Explicitly including them in the stored columns list is incorrect.
+				primaryIndex.StoreColumnNames, primaryIndex.StoreColumnIDs = nil, nil
+				desc.SetPrimaryIndex(primaryIndex)
+			}
+
 			idx, err := getIndexIdxByID(newIndex.ID)
 			if err != nil {
 				return err
 			}
-			desc.Indexes = append(desc.Indexes[:idx], desc.Indexes[idx+1:]...)
+			desc.RemovePublicNonPrimaryIndex(idx)
 
 			// Swap out the old indexes with their rewritten versions.
 			for j := range args.OldIndexes {
@@ -3055,17 +3573,21 @@ func (desc *Mutable) MakeMutationComplete(m descpb.DescriptorMutation) error {
 				if err != nil {
 					return err
 				}
-				oldIndexIndex, err := getIndexIdxByID(oldID)
+				oldIndexIdx, err := getIndexIdxByID(oldID)
 				if err != nil {
 					return err
 				}
-				oldIndex := protoutil.Clone(&desc.Indexes[oldIndexIndex]).(*descpb.IndexDescriptor)
-				newIndex.Name = oldIndex.Name
+				oldIndex, _, err := desc.FindIndexByIndexIdx(oldIndexIdx)
+				if err != nil {
+					return err
+				}
+				oldIndexCopy := protoutil.Clone(oldIndex).(*descpb.IndexDescriptor)
+				newIndex.Name = oldIndexCopy.Name
 				// Splice out old index from the indexes list.
-				desc.Indexes = append(desc.Indexes[:oldIndexIndex], desc.Indexes[oldIndexIndex+1:]...)
+				desc.RemovePublicNonPrimaryIndex(oldIndexIdx)
 				// Add a drop mutation for the old index. The code that calls this function will schedule
 				// a schema change job to pick up all of these index drop mutations.
-				if err := desc.AddIndexMutation(oldIndex, descpb.DescriptorMutation_DROP); err != nil {
+				if err := desc.AddIndexMutation(oldIndexCopy, descpb.DescriptorMutation_DROP); err != nil {
 					return err
 				}
 			}
@@ -3077,8 +3599,8 @@ func (desc *Mutable) MakeMutationComplete(m descpb.DescriptorMutation) error {
 		case *descpb.DescriptorMutation_MaterializedViewRefresh:
 			// Completing a refresh mutation just means overwriting the table's
 			// indexes with the new indexes that have been backfilled already.
-			desc.PrimaryIndex = t.MaterializedViewRefresh.NewPrimaryIndex
-			desc.Indexes = t.MaterializedViewRefresh.NewIndexes
+			desc.SetPrimaryIndex(t.MaterializedViewRefresh.NewPrimaryIndex)
+			desc.SetPublicNonPrimaryIndexes(t.MaterializedViewRefresh.NewIndexes)
 		}
 
 	case descpb.DescriptorMutation_DROP:
@@ -3385,7 +3907,7 @@ const IncludeConstraints = true
 // This is super valuable when trying to run SQL over data associated
 // with a schema mutation that is still not yet public: Data validation,
 // error reporting.
-func (desc *Immutable) MakeFirstMutationPublic(includeConstraints bool) (*Mutable, error) {
+func (desc *wrapper) MakeFirstMutationPublic(includeConstraints bool) (*Mutable, error) {
 	// Clone the ImmutableTable descriptor because we want to create an ImmutableCopy one.
 	table := NewExistingMutable(*protoutil.Clone(desc.TableDesc()).(*descpb.TableDescriptor))
 	mutationID := desc.Mutations[0].MutationID
@@ -3418,13 +3940,13 @@ func ColumnNeedsBackfill(desc *descpb.ColumnDescriptor) bool {
 }
 
 // HasPrimaryKey returns true if the table has a primary key.
-func (desc *Immutable) HasPrimaryKey() bool {
+func (desc *wrapper) HasPrimaryKey() bool {
 	return !desc.PrimaryIndex.Disabled
 }
 
 // HasColumnBackfillMutation returns whether the table has any queued column
 // mutations that require a backfill.
-func (desc *Immutable) HasColumnBackfillMutation() bool {
+func (desc *wrapper) HasColumnBackfillMutation() bool {
 	for _, m := range desc.Mutations {
 		col := m.GetColumn()
 		if col == nil {
@@ -3448,7 +3970,7 @@ func (desc *Mutable) IsNew() bool {
 }
 
 // VisibleColumns returns all non hidden columns.
-func (desc *Immutable) VisibleColumns() []descpb.ColumnDescriptor {
+func (desc *wrapper) VisibleColumns() []descpb.ColumnDescriptor {
 	var cols []descpb.ColumnDescriptor
 	for i := range desc.Columns {
 		col := &desc.Columns[i]
@@ -3460,13 +3982,13 @@ func (desc *Immutable) VisibleColumns() []descpb.ColumnDescriptor {
 }
 
 // ColumnTypes returns the types of all columns.
-func (desc *Immutable) ColumnTypes() []*types.T {
+func (desc *wrapper) ColumnTypes() []*types.T {
 	return desc.ColumnTypesWithMutations(false)
 }
 
 // ColumnsWithMutations returns all column descriptors, optionally including
 // mutation columns.
-func (desc *Immutable) ColumnsWithMutations(includeMutations bool) []descpb.ColumnDescriptor {
+func (desc *wrapper) ColumnsWithMutations(includeMutations bool) []descpb.ColumnDescriptor {
 	n := len(desc.Columns)
 	columns := desc.Columns[:n:n] // immutable on append
 	if includeMutations {
@@ -3481,7 +4003,7 @@ func (desc *Immutable) ColumnsWithMutations(includeMutations bool) []descpb.Colu
 
 // ColumnTypesWithMutations returns the types of all columns, optionally
 // including mutation columns, which will be returned if the input bool is true.
-func (desc *Immutable) ColumnTypesWithMutations(mutations bool) []*types.T {
+func (desc *wrapper) ColumnTypesWithMutations(mutations bool) []*types.T {
 	columns := desc.ColumnsWithMutations(mutations)
 	types := make([]*types.T, len(columns))
 	for i := range columns {
@@ -3502,7 +4024,7 @@ func ColumnsSelectors(cols []descpb.ColumnDescriptor) tree.SelectExprs {
 }
 
 // InvalidateFKConstraints sets all FK constraints to un-validated.
-func (desc *Immutable) InvalidateFKConstraints() {
+func (desc *wrapper) InvalidateFKConstraints() {
 	// We don't use GetConstraintInfo because we want to edit the passed desc.
 	for i := range desc.OutboundFKs {
 		fk := &desc.OutboundFKs[i]
@@ -3512,7 +4034,7 @@ func (desc *Immutable) InvalidateFKConstraints() {
 
 // AllIndexSpans returns the Spans for each index in the table, including those
 // being added in the mutations.
-func (desc *Immutable) AllIndexSpans(codec keys.SQLCodec) roachpb.Spans {
+func (desc *wrapper) AllIndexSpans(codec keys.SQLCodec) roachpb.Spans {
 	var spans roachpb.Spans
 	err := desc.ForeachNonDropIndex(func(index *descpb.IndexDescriptor) error {
 		spans = append(spans, desc.IndexSpan(codec, index.ID))
@@ -3526,19 +4048,19 @@ func (desc *Immutable) AllIndexSpans(codec keys.SQLCodec) roachpb.Spans {
 
 // PrimaryIndexSpan returns the Span that corresponds to the entire primary
 // index; can be used for a full table scan.
-func (desc *Immutable) PrimaryIndexSpan(codec keys.SQLCodec) roachpb.Span {
+func (desc *wrapper) PrimaryIndexSpan(codec keys.SQLCodec) roachpb.Span {
 	return desc.IndexSpan(codec, desc.PrimaryIndex.ID)
 }
 
 // IndexSpan returns the Span that corresponds to an entire index; can be used
 // for a full index scan.
-func (desc *Immutable) IndexSpan(codec keys.SQLCodec, indexID descpb.IndexID) roachpb.Span {
+func (desc *wrapper) IndexSpan(codec keys.SQLCodec, indexID descpb.IndexID) roachpb.Span {
 	prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(codec, desc, indexID))
 	return roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
 }
 
 // TableSpan returns the Span that corresponds to the entire table.
-func (desc *Immutable) TableSpan(codec keys.SQLCodec) roachpb.Span {
+func (desc *wrapper) TableSpan(codec keys.SQLCodec) roachpb.Span {
 	// TODO(jordan): Why does IndexSpan consider interleaves but TableSpan does
 	// not? Should it?
 	prefix := codec.TablePrefix(uint32(desc.ID))
@@ -3552,7 +4074,7 @@ func (desc *Immutable) TableSpan(codec keys.SQLCodec) roachpb.Span {
 // TODO(nvanbenschoten): we can remove this in v2.1 and replace it with a sql
 // migration to backfill all descpb.TableDescriptor_CheckConstraint.ColumnIDs slices.
 // See #22322.
-func (desc *Immutable) ColumnsUsed(
+func (desc *wrapper) ColumnsUsed(
 	cc *descpb.TableDescriptor_CheckConstraint,
 ) ([]descpb.ColumnID, error) {
 	if len(cc.ColumnIDs) > 0 {
@@ -3566,7 +4088,7 @@ func (desc *Immutable) ColumnsUsed(
 			"could not parse check constraint %s", cc.Expr)
 	}
 
-	colIDsUsed := make(map[descpb.ColumnID]struct{})
+	var colIDsUsed catalog.TableColSet
 	visitFn := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		if vBase, ok := expr.(tree.VarName); ok {
 			v, err := vBase.NormalizeVarName()
@@ -3580,7 +4102,7 @@ func (desc *Immutable) ColumnsUsed(
 						"column %q not found for constraint %q",
 						c.ColumnName, parsed.String())
 				}
-				colIDsUsed[col.ID] = struct{}{}
+				colIDsUsed.Add(col.ID)
 			}
 			return false, v, nil
 		}
@@ -3590,8 +4112,8 @@ func (desc *Immutable) ColumnsUsed(
 		return nil, err
 	}
 
-	cc.ColumnIDs = make([]descpb.ColumnID, 0, len(colIDsUsed))
-	for colID := range colIDsUsed {
+	cc.ColumnIDs = make([]descpb.ColumnID, 0, colIDsUsed.Len())
+	for colID, ok := colIDsUsed.Next(0); ok; colID, ok = colIDsUsed.Next(colID + 1) {
 		cc.ColumnIDs = append(cc.ColumnIDs, colID)
 	}
 	sort.Sort(descpb.ColumnIDs(cc.ColumnIDs))
@@ -3600,7 +4122,7 @@ func (desc *Immutable) ColumnsUsed(
 
 // CheckConstraintUsesColumn returns whether the check constraint uses the
 // specified column.
-func (desc *Immutable) CheckConstraintUsesColumn(
+func (desc *wrapper) CheckConstraintUsesColumn(
 	cc *descpb.TableDescriptor_CheckConstraint, colID descpb.ColumnID,
 ) (bool, error) {
 	colsUsed, err := desc.ColumnsUsed(cc)
@@ -3615,7 +4137,7 @@ func (desc *Immutable) CheckConstraintUsesColumn(
 
 // GetFamilyOfColumn returns the ColumnFamilyDescriptor for the
 // the family the column is part of.
-func (desc *Immutable) GetFamilyOfColumn(
+func (desc *wrapper) GetFamilyOfColumn(
 	colID descpb.ColumnID,
 ) (*descpb.ColumnFamilyDescriptor, error) {
 	for _, fam := range desc.Families {
@@ -3631,7 +4153,7 @@ func (desc *Immutable) GetFamilyOfColumn(
 
 // PartitionNames returns a slice containing the name of every partition and
 // subpartition in an arbitrary order.
-func (desc *Immutable) PartitionNames() []string {
+func (desc *wrapper) PartitionNames() []string {
 	var names []string
 	for _, index := range desc.AllNonDropIndexes() {
 		names = append(names, index.Partitioning.PartitionNames()...)
@@ -3655,7 +4177,7 @@ func (desc *Mutable) SetAuditMode(mode tree.AuditMode) (bool, error) {
 }
 
 // FindAllReferences returns all the references from a table.
-func (desc *Immutable) FindAllReferences() (map[descpb.ID]struct{}, error) {
+func (desc *wrapper) FindAllReferences() (map[descpb.ID]struct{}, error) {
 	refs := map[descpb.ID]struct{}{}
 	for i := range desc.OutboundFKs {
 		fk := &desc.OutboundFKs[i]
@@ -3748,7 +4270,7 @@ func (desc *Mutable) IsShardColumn(col *descpb.ColumnDescriptor) bool {
 }
 
 // TableDesc implements the TableDescriptor interface.
-func (desc *Immutable) TableDesc() *descpb.TableDescriptor {
+func (desc *wrapper) TableDesc() *descpb.TableDescriptor {
 	return &desc.TableDescriptor
 }
 
@@ -3791,10 +4313,4 @@ func (desc *Mutable) SetDropped() {
 func (desc *Mutable) SetOffline(reason string) {
 	desc.State = descpb.DescriptorState_OFFLINE
 	desc.OfflineReason = reason
-}
-
-// GetPostDeserializationChanges returns the set of changes which occurred to
-// this descriptor post deserialization.
-func (desc *Immutable) GetPostDeserializationChanges() PostDeserializationTableDescriptorChanges {
-	return desc.postDeserializationChanges
 }

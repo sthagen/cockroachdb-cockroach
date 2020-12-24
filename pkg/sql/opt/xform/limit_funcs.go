@@ -54,7 +54,8 @@ func (c *CustomFuncs) CanLimitFilteredScan(
 		return false
 	}
 
-	if scanPrivate.Constraint == nil && !scanPrivate.UsesPartialIndex(c.e.mem.Metadata()) {
+	md := c.e.mem.Metadata()
+	if scanPrivate.Constraint == nil && scanPrivate.PartialIndexPredicate(md) == nil {
 		// This is not a constrained scan nor a partial index scan, so skip it.
 		// The GenerateLimitedScans rule is responsible for limited
 		// unconstrained scans on non-partial indexes.
@@ -98,7 +99,7 @@ func (c *CustomFuncs) GenerateLimitedScans(
 	// Iterate over all non-inverted, non-partial indexes, looking for those
 	// that can be limited.
 	var iter scanIndexIter
-	iter.init(c.e.mem, &c.im, scanPrivate, nil /* originalFilters */, rejectInvertedIndexes|rejectPartialIndexes)
+	iter.Init(c.e.mem, &c.im, scanPrivate, nil /* filters */, rejectInvertedIndexes|rejectPartialIndexes)
 	iter.ForEach(func(index cat.Index, filters memo.FiltersExpr, indexCols opt.ColSet, isCovering bool) {
 		newScanPrivate := *scanPrivate
 		newScanPrivate.Index = index.Ordinal()
@@ -230,13 +231,13 @@ func (c *CustomFuncs) SplitScanIntoUnionScans(
 
 	// Construct a new ScanExpr for each span and union them all together. We
 	// output the old ColumnIDs from each union.
-	oldColList := opt.ColSetToList(scan.Relational().OutputCols)
+	oldColList := scan.Relational().OutputCols.ToList()
 	last := c.makeNewScan(sp, cons.Columns, newHardLimit, newSpans.Get(0))
 	for i, cnt := 1, newSpans.Count(); i < cnt; i++ {
 		newScan := c.makeNewScan(sp, cons.Columns, newHardLimit, newSpans.Get(i))
 		last = c.e.f.ConstructUnion(last, newScan, &memo.SetPrivate{
-			LeftCols:  opt.ColSetToList(last.Relational().OutputCols),
-			RightCols: opt.ColSetToList(newScan.Relational().OutputCols),
+			LeftCols:  last.Relational().OutputCols.ToList(),
+			RightCols: newScan.Relational().OutputCols.ToList(),
 			OutCols:   oldColList,
 		})
 	}

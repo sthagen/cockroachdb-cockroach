@@ -25,14 +25,12 @@ import (
 
 type defaultHashAgg struct {
 	hashAggregateFuncBase
-	allocator *colmem.Allocator
-	fn        tree.AggregateFunc
-	ctx       context.Context
+	fn  tree.AggregateFunc
+	ctx context.Context
 	// inputArgsConverter is managed by the aggregator, and this function can
 	// simply call GetDatumColumn.
 	inputArgsConverter *colconv.VecToDatumConverter
 	resultConverter    func(tree.Datum) interface{}
-	vec                coldata.Vec
 	scratch            struct {
 		// Note that this scratch space is shared among all aggregate function
 		// instances created by the same alloc object.
@@ -42,15 +40,8 @@ type defaultHashAgg struct {
 
 var _ AggregateFunc = &defaultHashAgg{}
 
-func (a *defaultHashAgg) Init(groups []bool, vec coldata.Vec) {
-	a.hashAggregateFuncBase.Init(groups, vec)
-	a.vec = vec
-	a.Reset()
-}
-
-func (a *defaultHashAgg) Reset() {
-	a.hashAggregateFuncBase.Reset()
-	a.fn.Reset(a.ctx)
+func (a *defaultHashAgg) SetOutput(vec coldata.Vec) {
+	a.hashAggregateFuncBase.SetOutput(vec)
 }
 
 func (a *defaultHashAgg) Compute(
@@ -78,7 +69,6 @@ func (a *defaultHashAgg) Compute(
 				if err := a.fn.Add(a.ctx, firstArg, a.scratch.otherArgs...); err != nil {
 					colexecerror.ExpectedError(err)
 				}
-
 			}
 		}
 	})
@@ -94,6 +84,10 @@ func (a *defaultHashAgg) Flush(outputIdx int) {
 	} else {
 		coldata.SetValueAt(a.vec, a.resultConverter(res), outputIdx)
 	}
+}
+
+func (a *defaultHashAgg) Reset() {
+	a.fn.Reset(a.ctx)
 }
 
 func newDefaultHashAggAlloc(
@@ -169,12 +163,12 @@ func (a *defaultHashAggAlloc) newAggFunc() AggregateFunc {
 	}
 	f := &a.aggFuncs[0]
 	*f = defaultHashAgg{
-		allocator:          a.allocator,
 		fn:                 a.constructor(a.evalCtx, a.arguments),
 		ctx:                a.evalCtx.Context,
 		inputArgsConverter: a.inputArgsConverter,
 		resultConverter:    a.resultConverter,
 	}
+	f.allocator = a.allocator
 	f.scratch.otherArgs = a.otherArgsScratch
 	a.allocator.AdjustMemoryUsage(f.fn.Size())
 	a.aggFuncs = a.aggFuncs[1:]

@@ -16,6 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -82,6 +84,11 @@ type DatabaseDescriptor interface {
 	// schemas.
 	tree.SchemaMeta
 	DatabaseDesc() *descpb.DatabaseDescriptor
+
+	Regions() (descpb.Regions, error)
+	IsMultiRegion() bool
+	PrimaryRegion() (descpb.Region, error)
+	Validate() error
 }
 
 // SchemaDescriptor will eventually be called schemadesc.Descriptor.
@@ -118,7 +125,9 @@ type TableDescriptor interface {
 	GetIndexMutationCapabilities(id descpb.IndexID) (isMutation, isWriteOnly bool)
 	KeysPerRow(id descpb.IndexID) (int, error)
 	PartialIndexOrds() util.FastIntSet
+	WritableIndexes() []descpb.IndexDescriptor
 	DeletableIndexes() []descpb.IndexDescriptor
+	DeleteOnlyIndexes() []descpb.IndexDescriptor
 
 	HasPrimaryKey() bool
 	PrimaryKeyString() string
@@ -130,13 +139,17 @@ type TableDescriptor interface {
 	FindColumnByName(name tree.Name) (*descpb.ColumnDescriptor, bool, error)
 	FindActiveColumnByID(id descpb.ColumnID) (*descpb.ColumnDescriptor, error)
 	FindColumnByID(id descpb.ColumnID) (*descpb.ColumnDescriptor, error)
-	ColumnIdxMap() map[descpb.ColumnID]int
+	ColumnIdxMap() TableColMap
 	GetColumnAtIdx(idx int) *descpb.ColumnDescriptor
 	AllNonDropColumns() []descpb.ColumnDescriptor
 	VisibleColumns() []descpb.ColumnDescriptor
 	ColumnsWithMutations(includeMutations bool) []descpb.ColumnDescriptor
-	ColumnIdxMapWithMutations(includeMutations bool) map[descpb.ColumnID]int
+	ColumnIdxMapWithMutations(includeMutations bool) TableColMap
 	DeletableColumns() []descpb.ColumnDescriptor
+	MutationColumns() []descpb.ColumnDescriptor
+	ContainsUserDefinedTypes() bool
+	GetColumnOrdinalsWithUserDefinedTypes() []int
+	UserDefinedTypeColsHaveSameVersion(otherDesc TableDescriptor) bool
 
 	GetFamilies() []descpb.ColumnFamilyDescriptor
 	NumFamilies() int
@@ -168,6 +181,7 @@ type TableDescriptor interface {
 	GetChecks() []*descpb.TableDescriptor_CheckConstraint
 	AllActiveAndInactiveChecks() []*descpb.TableDescriptor_CheckConstraint
 	ActiveChecks() []descpb.TableDescriptor_CheckConstraint
+	AllActiveAndInactiveUniqueWithoutIndexConstraints() []*descpb.UniqueWithoutIndexConstraint
 	ForeachInboundFK(f func(fk *descpb.ForeignKeyConstraint) error) error
 	FindActiveColumnByName(s string) (*descpb.ColumnDescriptor, error)
 	WritableColumns() []descpb.ColumnDescriptor
@@ -182,6 +196,9 @@ type TypeDescriptor interface {
 	MakeTypesT(ctx context.Context, name *tree.TypeName, res TypeDescriptorResolver) (*types.T, error)
 	HasPendingSchemaChanges() bool
 	GetIDClosure() map[descpb.ID]struct{}
+
+	PrimaryRegion() (descpb.Region, error)
+	Validate(ctx context.Context, dg DescGetter) error
 }
 
 // TypeDescriptorResolver is an interface used during hydration of type
@@ -208,7 +225,9 @@ func FilterDescriptorState(desc Descriptor, flags tree.CommonLookupFlags) error 
 		}
 		return NewInactiveDescriptorError(err)
 	case desc.Adding():
-		return errTableAdding
+		// Only table descriptors can be in the adding state.
+		return pgerror.WithCandidateCode(newAddingTableError(desc.(TableDescriptor)),
+			pgcode.ObjectNotInPrerequisiteState)
 	default:
 		return nil
 	}

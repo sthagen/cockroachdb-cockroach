@@ -27,8 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft"
-	"go.etcd.io/etcd/raft/tracker"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/tracker"
 )
 
 const (
@@ -69,11 +69,11 @@ var MinLeaseTransferStatsDuration = 30 * time.Second
 // enableLoadBasedLeaseRebalancing controls whether lease rebalancing is done
 // via the new heuristic based on request load and latency or via the simpler
 // approach that purely seeks to balance the number of leases per node evenly.
-var enableLoadBasedLeaseRebalancing = settings.RegisterPublicBoolSetting(
+var enableLoadBasedLeaseRebalancing = settings.RegisterBoolSetting(
 	"kv.allocator.load_based_lease_rebalancing.enabled",
 	"set to enable rebalancing of range leases based on load and latency",
 	true,
-)
+).WithPublic()
 
 // leaseRebalancingAggressiveness enables users to tweak how aggressive their
 // cluster is at moving leases towards the localities where the most requests
@@ -83,11 +83,12 @@ var enableLoadBasedLeaseRebalancing = settings.RegisterPublicBoolSetting(
 //
 // Setting this to 0 effectively disables load-based lease rebalancing, and
 // settings less than 0 are disallowed.
-var leaseRebalancingAggressiveness = settings.RegisterNonNegativeFloatSetting(
+var leaseRebalancingAggressiveness = settings.RegisterFloatSetting(
 	"kv.allocator.lease_rebalancing_aggressiveness",
 	"set greater than 1.0 to rebalance leases toward load more aggressively, "+
 		"or between 0 and 1.0 to be more conservative about rebalancing leases",
 	1.0,
+	settings.NonNegativeFloat,
 )
 
 // AllocatorAction enumerates the various replication adjustments that may be
@@ -502,8 +503,11 @@ func (a *Allocator) allocateTargetFromList(
 	analyzedConstraints := constraint.AnalyzeConstraints(
 		ctx, a.storePool.getStoreDescriptor, candidateReplicas, zone)
 	candidates := allocateCandidates(
+		ctx,
 		sl, analyzedConstraints, candidateReplicas,
-		a.storePool.getLocalitiesByStore(candidateReplicas), options,
+		a.storePool.getLocalitiesByStore(candidateReplicas),
+		a.storePool.isNodeReadyForRoutineReplicaTransfer,
+		options,
 	)
 	log.VEventf(ctx, 3, "allocate candidates: %s", candidates)
 	if target := candidates.selectGood(a.randGen); target != nil {
@@ -532,9 +536,9 @@ func (a Allocator) simulateRemoveTarget(
 	// but as of October 2017 calls to the Allocator are mostly serialized by the ReplicateQueue
 	// (with the main exceptions being Scatter and the status server's allocator debug endpoint).
 	// Try to make this interfere less with other callers.
-	a.storePool.updateLocalStoreAfterRebalance(targetStore, rangeUsageInfo, roachpb.ADD_REPLICA)
+	a.storePool.updateLocalStoreAfterRebalance(targetStore, rangeUsageInfo, roachpb.ADD_VOTER)
 	defer func() {
-		a.storePool.updateLocalStoreAfterRebalance(targetStore, rangeUsageInfo, roachpb.REMOVE_REPLICA)
+		a.storePool.updateLocalStoreAfterRebalance(targetStore, rangeUsageInfo, roachpb.REMOVE_VOTER)
 	}()
 	log.VEventf(ctx, 3, "simulating which replica would be removed after adding s%d", targetStore)
 	return a.RemoveTarget(ctx, zone, candidates, existingReplicas)
@@ -664,6 +668,7 @@ func (a Allocator) RebalanceTarget(
 		analyzedConstraints,
 		existingReplicas,
 		a.storePool.getLocalitiesByStore(existingReplicas),
+		a.storePool.isNodeReadyForRoutineReplicaTransfer,
 		options,
 	)
 
@@ -765,6 +770,17 @@ func (a *Allocator) scorerOptions() scorerOptions {
 // TransferLeaseTarget returns a suitable replica to transfer the range lease
 // to from the provided list. It excludes the current lease holder replica
 // unless asked to do otherwise by the checkTransferLeaseSource parameter.
+//
+// Returns an empty descriptor if no target is found.
+//
+// TODO(aayush, andrei): If a draining leaseholder doesn't see any other voters
+// in its locality, but sees a learner, rather than allowing the lease to be
+// transferred outside of its current locality (likely violating leaseholder
+// preferences, at least temporarily), it would be nice to promote the existing
+// learner to a voter. This could be further extended to cases where we have a
+// dead voter in a given locality along with a live learner. In such cases, we
+// would want to promote the live learner to a voter and demote the dead voter
+// to a learner.
 func (a *Allocator) TransferLeaseTarget(
 	ctx context.Context,
 	zone *zonepb.ZoneConfig,

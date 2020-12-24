@@ -18,6 +18,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 )
 
 // NewStdLogger creates a *stdLog.Logger that forwards messages to the
@@ -45,7 +48,7 @@ type logBridge Severity
 // Valid names are "INFO", "WARNING", "ERROR", and "FATAL".  If the name is not
 // recognized, copyStandardLogTo panics.
 func copyStandardLogTo(severityName string) {
-	sev, ok := SeverityByName(severityName)
+	sev, ok := logpb.SeverityByName(severityName)
 	if !ok {
 		panic(fmt.Sprintf("copyStandardLogTo(%q): unrecognized Severity name", severityName))
 	}
@@ -73,7 +76,13 @@ func (lb logBridge) Write(b []byte) (n int, err error) {
 	}
 
 	entry := MakeEntry(context.Background(),
-		Severity(lb), &mainLog.logCounter, 0, /* depth */
+		Severity(lb),
+		// Note: because the caller is using the stdLog interface, we don't
+		// really know what is being logged. Therefore we must use the
+		// DEV channel because we can't assume anything about the sensitivity
+		// of the information.
+		channel.DEV,
+		0, /* depth */
 		// Note: because the caller is using the stdLog interface, they are
 		// bypassing all the log marker logic. This means that the entire
 		// log message should be assumed to contain confidential
@@ -94,6 +103,6 @@ func (lb logBridge) Write(b []byte) (n int, err error) {
 			entry.Line = 1
 		}
 	}
-	mainLog.outputLogEntry(entry)
+	debugLog.outputLogEntry(entry)
 	return len(b), nil
 }

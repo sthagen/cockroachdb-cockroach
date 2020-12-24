@@ -15,12 +15,14 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	opentracing "github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
 	"golang.org/x/net/trace"
 )
@@ -52,7 +54,7 @@ func embedCtxEventLog(ctx context.Context, el *ctxEventLog) context.Context {
 // logging and event calls to go to the EventLog. The current context must not
 // have an existing open span.
 func withEventLogInternal(ctx context.Context, eventLog trace.EventLog) context.Context {
-	if opentracing.SpanFromContext(ctx) != nil {
+	if tracing.SpanFromContext(ctx) != nil {
 		panic("event log under span")
 	}
 	return embedCtxEventLog(ctx, &ctxEventLog{eventLog: eventLog})
@@ -90,9 +92,9 @@ func FinishEventLog(ctx context.Context) {
 // getSpanOrEventLog returns the current Span. If there is no Span, it returns
 // the current ctxEventLog. If neither (or the Span is "black hole"), returns
 // false.
-func getSpanOrEventLog(ctx context.Context) (opentracing.Span, *ctxEventLog, bool) {
-	if sp := opentracing.SpanFromContext(ctx); sp != nil {
-		if tracing.IsBlackHoleSpan(sp) {
+func getSpanOrEventLog(ctx context.Context) (*tracing.Span, *ctxEventLog, bool) {
+	if sp := tracing.SpanFromContext(ctx); sp != nil {
+		if sp.IsBlackHole() {
 			return nil, nil, false
 		}
 		return sp, nil, true
@@ -110,7 +112,7 @@ func getSpanOrEventLog(ctx context.Context) (opentracing.Span, *ctxEventLog, boo
 // message as input after introduction of redaction markers.  This
 // means the message may or may not contain markers already depending
 // of the configuration of --redactable-logs.
-func eventInternal(sp opentracing.Span, el *ctxEventLog, isErr bool, entry Entry) {
+func eventInternal(sp *tracing.Span, el *ctxEventLog, isErr bool, entry logpb.Entry) {
 	var msg string
 	if len(entry.Tags) == 0 && len(entry.File) == 0 && !entry.Redactable {
 		// Shortcut.
@@ -137,7 +139,7 @@ func eventInternal(sp opentracing.Span, el *ctxEventLog, isErr bool, entry Entry
 		msg = buf.String()
 
 		if entry.Redactable {
-			// This is true when eventInternal is called from addStructured(),
+			// This is true when eventInternal is called from logfDepth(),
 			// ie. a regular log call. In this case, the tags and message may contain
 			// redaction markers. We remove them here.
 			msg = redact.RedactableString(msg).StripMarkers()
@@ -197,8 +199,8 @@ func Event(ctx context.Context, msg string) {
 
 	// Format the tracing event and add it to the trace.
 	entry := MakeEntry(ctx,
-		Severity_INFO, /* unused for trace events */
-		nil,           /* logCounter, unused for trace events */
+		severity.INFO, /* unused for trace events */
+		channel.DEV,   /* unused for trace events */
 		1,             /* depth */
 		// redactable is false because we want to flatten the data in traces
 		// -- we don't have infrastructure yet for trace redaction.
@@ -220,8 +222,8 @@ func Eventf(ctx context.Context, format string, args ...interface{}) {
 
 	// Format the tracing event and add it to the trace.
 	entry := MakeEntry(ctx,
-		Severity_INFO, /* unused for trace events */
-		nil,           /* logCounter, unused for trace events */
+		severity.INFO, /* unused for trace events */
+		channel.DEV,   /* unused for trace events */
 		1,             /* depth */
 		// redactable is false because we want to flatten the data in traces
 		// -- we don't have infrastructure yet for trace redaction.
@@ -235,11 +237,11 @@ func vEventf(
 ) {
 	if VDepth(level, 1+depth) {
 		// Log the message (which also logs an event).
-		sev := Severity_INFO
+		sev := severity.INFO
 		if isErr {
-			sev = Severity_ERROR
+			sev = severity.ERROR
 		}
-		logDepth(ctx, 1+depth, sev, format, args)
+		logfDepth(ctx, 1+depth, sev, channel.DEV, format, args...)
 	} else {
 		sp, el, ok := getSpanOrEventLog(ctx)
 		if !ok {
@@ -247,8 +249,8 @@ func vEventf(
 			return
 		}
 		entry := MakeEntry(ctx,
-			Severity_INFO, /* unused for trace events */
-			nil,           /* logCounter, unused for trace events */
+			severity.INFO, /* unused for trace events */
+			channel.DEV,   /* unused for trace events */
 			depth+1,
 			// redactable is false because we want to flatten the data in traces
 			// -- we don't have infrastructure yet for trace redaction.
@@ -258,14 +260,14 @@ func vEventf(
 	}
 }
 
-// VEvent either logs a message to the log files (which also outputs to the
+// VEvent either logs a message to the DEV channel (which also outputs to the
 // active trace or event log) or to the trace/event log alone, depending on
 // whether the specified verbosity level is active.
 func VEvent(ctx context.Context, level Level, msg string) {
 	vEventf(ctx, false /* isErr */, 1, level, msg)
 }
 
-// VEventf either logs a message to the log files (which also outputs to the
+// VEventf either logs a message to the DEV channel (which also outputs to the
 // active trace or event log) or to the trace/event log alone, depending on
 // whether the specified verbosity level is active.
 func VEventf(ctx context.Context, level Level, format string, args ...interface{}) {
@@ -278,14 +280,14 @@ func VEventfDepth(ctx context.Context, depth int, level Level, format string, ar
 	vEventf(ctx, false /* isErr */, 1+depth, level, format, args...)
 }
 
-// VErrEvent either logs an error message to the log files (which also outputs
+// VErrEvent either logs an error message to the DEV channel (which also outputs
 // to the active trace or event log) or to the trace/event log alone, depending
 // on whether the specified verbosity level is active.
 func VErrEvent(ctx context.Context, level Level, msg string) {
 	vEventf(ctx, true /* isErr */, 1, level, msg)
 }
 
-// VErrEventf either logs an error message to the log files (which also outputs
+// VErrEventf either logs an error message to the DEV Channel (which also outputs
 // to the active trace or event log) or to the trace/event log alone, depending
 // on whether the specified verbosity level is active.
 func VErrEventf(ctx context.Context, level Level, format string, args ...interface{}) {

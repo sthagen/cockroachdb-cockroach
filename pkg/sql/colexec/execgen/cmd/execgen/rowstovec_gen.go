@@ -62,10 +62,15 @@ func (i rowsToVecWidthTmplInfo) Set(col, idx, castV string) string {
 	return set(i.canonicalTypeFamily, col, idx, castV)
 }
 
+func (i rowsToVecWidthTmplInfo) Sliceable() bool {
+	return sliceable(i.canonicalTypeFamily)
+}
+
 // Remove unused warnings.
 var _ = rowsToVecWidthTmplInfo{}.Prelude
 var _ = rowsToVecWidthTmplInfo{}.Convert
 var _ = rowsToVecWidthTmplInfo{}.Set
+var _ = rowsToVecWidthTmplInfo{}.Sliceable
 
 type familyWidthPair struct {
 	family types.Family
@@ -90,7 +95,6 @@ var rowsToVecConversionTmpls = map[familyWidthPair]string{
 	{types.IntFamily, anyWidth}:                      `int64(*%[1]s.(*tree.DInt))`,
 	{types.DateFamily, anyWidth}:                     `%[1]s.(*tree.DDate).UnixEpochDaysWithOrig()`,
 	{types.FloatFamily, anyWidth}:                    `float64(*%[1]s.(*tree.DFloat))`,
-	{types.OidFamily, anyWidth}:                      `int64(%[1]s.(*tree.DOid).DInt)`,
 	{types.StringFamily, anyWidth}:                   `encoding.UnsafeConvertStringToBytes(string(*%[1]s.(*tree.DString)))`,
 	{types.DecimalFamily, anyWidth}:                  `%[1]s.(*tree.DDecimal).Decimal`,
 	{types.UuidFamily, anyWidth}:                     `%[1]s.(*tree.DUuid).UUID.GetBytesMut()`,

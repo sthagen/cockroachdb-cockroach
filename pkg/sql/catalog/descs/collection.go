@@ -13,6 +13,7 @@
 package descs
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -22,6 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -38,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -59,12 +63,6 @@ type leasedDescriptors struct {
 
 func (ld *leasedDescriptors) add(desc catalog.Descriptor) {
 	ld.descs = append(ld.descs, desc)
-}
-
-func (ld *leasedDescriptors) releaseAll() (toRelease []catalog.Descriptor) {
-	toRelease = append(toRelease, ld.descs...)
-	ld.descs = ld.descs[:0]
-	return toRelease
 }
 
 func (ld *leasedDescriptors) release(ids []descpb.ID) (toRelease []catalog.Descriptor) {
@@ -169,7 +167,12 @@ type Collection struct {
 	// own transaction to read the descriptor and will hang waiting for the
 	// uncommitted changes to the descriptor. These descriptors are local to this
 	// Collection and invisible to other transactions.
-	uncommittedDescriptors []uncommittedDescriptor
+	// TODO (lucy): Replace this with a data structure for faster lookups.
+	// Currently, the order in which descriptors are inserted matters, since we
+	// look at the draining names to account for descriptors being renamed. Any
+	// replacement data structure may have to store the name information in some
+	// different, more explicit way.
+	uncommittedDescriptors []*uncommittedDescriptor
 
 	// allDescriptors is a slice of all available descriptors. The descriptors
 	// are cached to avoid repeated lookups by users like virtual tables. The
@@ -218,7 +221,9 @@ func (tc *Collection) getLeasedDescriptorByName(
 	// continue to use N to refer to X even if N is renamed during the
 	// transaction.
 	if desc = tc.leasedDescriptors.getByName(parentID, parentSchemaID, name); desc != nil {
-		log.VEventf(ctx, 2, "found descriptor in collection for '%s'", name)
+		if log.V(2) {
+			log.Eventf(ctx, "found descriptor in collection for '%s'", name)
+		}
 		return desc, false, nil
 	}
 
@@ -242,7 +247,9 @@ func (tc *Collection) getLeasedDescriptorByName(
 	}
 
 	tc.leasedDescriptors.add(desc)
-	log.VEventf(ctx, 2, "added descriptor '%s' to collection: %+v", name, desc)
+	if log.V(2) {
+		log.Eventf(ctx, "added descriptor '%s' to collection: %+v", name, desc)
+	}
 
 	// If the descriptor we just acquired expires before the txn's deadline,
 	// reduce the deadline. We use ReadTimestamp() that doesn't return the commit
@@ -252,251 +259,496 @@ func (tc *Collection) getLeasedDescriptorByName(
 	return desc, false, nil
 }
 
-// GetMutableDatabaseDescriptor returns a mutable database descriptor.
-func (tc *Collection) GetMutableDatabaseDescriptor(
-	ctx context.Context, txn *kv.Txn, name string, flags tree.DatabaseLookupFlags,
-) (*dbdesc.Mutable, error) {
-	if log.V(2) {
-		log.Infof(ctx, "reading mutable descriptor on '%s'", name)
-	}
-	// First try the uncommitted descriptors.
-	if refuseFurtherLookup, desc, err := tc.getUncommittedDescriptor(
-		keys.RootNamespaceID, keys.RootNamespaceID, name, flags,
-	); refuseFurtherLookup || err != nil {
-		return nil, err
-	} else if mut := desc.mutable; mut != nil {
-		db, ok := mut.(*dbdesc.Mutable)
-		if !ok {
-			return nil, nil
+// getDescriptorFromStore gets a descriptor from its namespace entry. It does
+// not return the descriptor if the name is being drained.
+func (tc *Collection) getDescriptorFromStore(
+	ctx context.Context,
+	txn *kv.Txn,
+	codec keys.SQLCodec,
+	parentID descpb.ID,
+	parentSchemaID descpb.ID,
+	name string,
+	mutable bool,
+) (found bool, desc catalog.Descriptor, err error) {
+	// Bypass the namespace lookup from the store for system tables.
+	descID := bootstrap.LookupSystemTableDescriptorID(ctx, tc.settings, tc.codec(), parentID, name)
+	if descID == descpb.InvalidID {
+		var found bool
+		var err error
+		found, descID, err = catalogkv.LookupObjectID(ctx, txn, codec, parentID, parentSchemaID, name)
+		if err != nil || !found {
+			return found, nil, err
 		}
-		log.VEventf(ctx, 2, "found uncommitted descriptor %d", db.GetID())
-		return db, nil
 	}
-
-	phyAccessor := catalogkv.UncachedPhysicalAccessor{}
-	db, err := phyAccessor.GetDatabaseDesc(ctx, txn, tc.codec(), name, flags)
-	if err != nil || db == nil {
-		return nil, err
+	// Always pick up a mutable copy so it can be cached.
+	desc, err = catalogkv.GetAnyDescriptorByID(ctx, txn, codec, descID, catalogkv.Mutable)
+	if err != nil {
+		return false, nil, err
+	} else if desc == nil {
+		// Having done the namespace lookup, the descriptor must exist.
+		return false, nil, errors.AssertionFailedf("descriptor %d not found", descID)
 	}
-	mutDesc, ok := db.(*dbdesc.Mutable)
-	if !ok {
-		// TODO (lucy): Here and elsewhere in the Collection, we return a nil
-		// descriptor with a nil error if the type cast doesn't succeed, regardless
-		// of whether flags.Required is true. This seems like a potential source
-		// of bugs.
-		return nil, nil
+	isNamespace2 := parentID == keys.SystemDatabaseID && name == systemschema.NamespaceTableName
+	// Immediately after a RENAME an old name still points to the descriptor
+	// during the drain phase for the name. Do not return a descriptor during
+	// draining.
+	if desc.GetName() != name && !isNamespace2 {
+		// Special case for the namespace table, whose name is namespace2 in its
+		// descriptor and namespace entry.
+		return false, nil, nil
 	}
-	return mutDesc, nil
+	ud, err := tc.addUncommittedDescriptor(desc.(catalog.MutableDescriptor))
+	if err != nil {
+		return false, nil, err
+	}
+	if !mutable {
+		desc = ud.immutable
+	}
+	return true, desc, nil
 }
 
-// GetMutableTableDescriptor returns a mutable table descriptor.
-//
-// If flags.required is false, GetMutableTableDescriptor() will gracefully
-// return a nil descriptor and no error if the table does not exist.
-// If flags.RequireMutable is false, nil will be returned.
-func (tc *Collection) GetMutableTableDescriptor(
-	ctx context.Context, txn *kv.Txn, tn *tree.TableName, flags tree.ObjectLookupFlags,
-) (*tabledesc.Mutable, error) {
-	desc, err := tc.getMutableObjectDescriptor(ctx, txn, tn, flags)
-	if err != nil {
-		return nil, err
+// GetMutableDatabaseByName returns a mutable database descriptor with
+// properties according to the provided lookup flags. RequireMutable is ignored.
+func (tc *Collection) GetMutableDatabaseByName(
+	ctx context.Context, txn *kv.Txn, name string, flags tree.DatabaseLookupFlags,
+) (found bool, _ *dbdesc.Mutable, _ error) {
+	found, desc, err := tc.getDatabaseByName(ctx, txn, name, flags, true /* mutable */)
+	if err != nil || !found {
+		return false, nil, err
 	}
-	mutDesc, ok := desc.(*tabledesc.Mutable)
-	if !ok {
-		return nil, nil
-	}
-	hydrated, err := tc.hydrateTypesInTableDesc(ctx, txn, mutDesc)
-	if err != nil {
-		return nil, err
-	}
-	return hydrated.(*tabledesc.Mutable), nil
+	return true, desc.(*dbdesc.Mutable), nil
 }
 
-func (tc *Collection) getMutableObjectDescriptor(
-	ctx context.Context, txn *kv.Txn, name tree.ObjectName, flags tree.ObjectLookupFlags,
-) (catalog.MutableDescriptor, error) {
-	if log.V(2) {
-		log.Infof(ctx, "reading mutable descriptor on '%s'", name)
+// GetImmutableDatabaseByName returns an immutable database descriptor with
+// properties according to the provided lookup flags. RequireMutable is ignored.
+func (tc *Collection) GetImmutableDatabaseByName(
+	ctx context.Context, txn *kv.Txn, name string, flags tree.DatabaseLookupFlags,
+) (found bool, _ *dbdesc.Immutable, _ error) {
+	found, desc, err := tc.getDatabaseByName(ctx, txn, name, flags, false /* mutable */)
+	if err != nil || !found {
+		return false, nil, err
+	}
+	return true, desc.(*dbdesc.Immutable), nil
+}
+
+// getDatabaseByName returns a database descriptor with properties according to
+// the provided lookup flags.
+func (tc *Collection) getDatabaseByName(
+	ctx context.Context, txn *kv.Txn, name string, flags tree.DatabaseLookupFlags, mutable bool,
+) (bool, catalog.DatabaseDescriptor, error) {
+	if name == systemschema.SystemDatabaseName {
+		// The system database descriptor should never actually be mutated, which is
+		// why we return the same hard-coded descriptor every time. It's assumed
+		// that callers of this method will check the privileges on the descriptor
+		// (like any other database) and return an error.
+		if mutable {
+			return true, dbdesc.NewExistingMutable(
+				*systemschema.MakeSystemDatabaseDesc().DatabaseDesc()), nil
+		}
+		return true, systemschema.MakeSystemDatabaseDesc(), nil
 	}
 
+	getDatabaseByName := func() (found bool, _ catalog.Descriptor, err error) {
+		if refuseFurtherLookup, desc := tc.getUncommittedDescriptor(
+			keys.RootNamespaceID, keys.RootNamespaceID, name,
+		); refuseFurtherLookup {
+			return false, nil, nil
+		} else if desc != nil {
+			log.VEventf(ctx, 2, "found uncommitted descriptor %d", desc.immutable.GetID())
+			if mutable {
+				return true, desc.mutable, nil
+			}
+			return true, desc.immutable, nil
+		}
+
+		if flags.AvoidCached || mutable || lease.TestingTableLeasesAreDisabled() {
+			return tc.getDescriptorFromStore(
+				ctx, txn, tc.codec(), keys.RootNamespaceID, keys.RootNamespaceID, name, mutable)
+		}
+
+		desc, shouldReadFromStore, err := tc.getLeasedDescriptorByName(
+			ctx, txn, keys.RootNamespaceID, keys.RootNamespaceID, name)
+		if err != nil {
+			return false, nil, err
+		}
+		if shouldReadFromStore {
+			return tc.getDescriptorFromStore(
+				ctx, txn, tc.codec(), keys.RootNamespaceID, keys.RootNamespaceID, name, mutable)
+		}
+		return true, desc, nil
+	}
+
+	found, desc, err := getDatabaseByName()
+	if err != nil {
+		return false, nil, err
+	} else if !found {
+		if flags.Required {
+			return false, nil, sqlerrors.NewUndefinedDatabaseError(name)
+		}
+		return false, nil, nil
+	}
+	db, ok := desc.(catalog.DatabaseDescriptor)
+	if !ok {
+		if flags.Required {
+			return false, nil, sqlerrors.NewUndefinedDatabaseError(name)
+		}
+		return false, nil, nil
+	}
+	if dropped, err := filterDescriptorState(db, flags); err != nil || dropped {
+		return false, nil, err
+	}
+	return true, db, nil
+}
+
+func (tc *Collection) getObjectByName(
+	ctx context.Context,
+	txn *kv.Txn,
+	catalogName, schemaName, objectName string,
+	flags tree.ObjectLookupFlags,
+	mutable bool,
+) (found bool, _ catalog.Descriptor, err error) {
+
+	// If we're reading the object descriptor from the store,
+	// we should read its parents from the store too to ensure
+	// that subsequent name resolution finds the latest name
+	// in the face of a concurrent rename.
+	avoidCachedForParent := flags.AvoidCached || mutable
 	// Resolve the database.
-	db, err := tc.GetDatabaseVersion(ctx, txn, name.Catalog(),
+	found, db, err := tc.GetImmutableDatabaseByName(ctx, txn, catalogName,
 		tree.DatabaseLookupFlags{
 			Required:       flags.Required,
-			AvoidCached:    flags.AvoidCached,
+			AvoidCached:    avoidCachedForParent,
 			IncludeDropped: flags.IncludeDropped,
 			IncludeOffline: flags.IncludeOffline,
 		})
-	if err != nil || db == nil {
-		return nil, err
+	if err != nil || !found {
+		return false, nil, err
 	}
 	dbID := db.GetID()
 
-	// Resolve the schema to the ID of the schema.
-	foundSchema, resolvedSchema, err := tc.ResolveSchema(ctx, txn, dbID, name.Schema(),
+	// Resolve the schema.
+	foundSchema, resolvedSchema, err := tc.GetImmutableSchemaByName(ctx, txn, dbID, schemaName,
 		tree.SchemaLookupFlags{
 			Required:       flags.Required,
-			AvoidCached:    flags.AvoidCached,
+			AvoidCached:    avoidCachedForParent,
 			IncludeDropped: flags.IncludeDropped,
 			IncludeOffline: flags.IncludeOffline,
 		})
 	if err != nil || !foundSchema {
-		return nil, err
+		return false, nil, err
 	}
+	schemaID := resolvedSchema.ID
 
-	if refuseFurtherLookup, desc, err := tc.getUncommittedDescriptor(
-		dbID,
-		resolvedSchema.ID,
-		name.Object(),
-		flags.CommonLookupFlags,
-	); refuseFurtherLookup || err != nil {
-		return nil, err
-	} else if mut := desc.mutable; mut != nil {
-		log.VEventf(ctx, 2, "found uncommitted descriptor %d", mut.GetID())
-		return mut, nil
-	}
-
-	phyAccessor := catalogkv.UncachedPhysicalAccessor{}
-	obj, err := phyAccessor.GetObjectDesc(
-		ctx,
-		txn,
-		tc.settings,
-		tc.codec(),
-		name.Catalog(),
-		name.Schema(),
-		name.Object(),
-		flags,
-	)
-	if err != nil || obj == nil {
-		return nil, err
-	}
-	mutDesc, ok := obj.(catalog.MutableDescriptor)
-	if !ok {
-		return nil, nil
-	}
-	return mutDesc, nil
-}
-
-func (tc *Collection) getMutableUserDefinedSchemaDescriptor(
-	ctx context.Context, txn *kv.Txn, dbID descpb.ID, schemaName string, flags tree.SchemaLookupFlags,
-) (*schemadesc.Mutable, error) {
-	log.VEventf(ctx, 2, "reading mutable descriptor on '%s'", schemaName)
-	// First try the uncommitted descriptors.
-	if refuseFurtherLookup, desc, err := tc.getUncommittedDescriptor(
-		dbID, keys.RootNamespaceID, schemaName, flags,
-	); refuseFurtherLookup || err != nil {
-		return nil, err
-	} else if mut := desc.mutable; mut != nil {
-		schema, ok := mut.(*schemadesc.Mutable)
-		if !ok {
-			return nil, nil
+	if refuseFurtherLookup, desc := tc.getUncommittedDescriptor(
+		dbID, schemaID, objectName,
+	); refuseFurtherLookup {
+		return false, nil, nil
+	} else if desc != nil {
+		log.VEventf(ctx, 2, "found uncommitted descriptor %d", desc.immutable.GetID())
+		if mutable {
+			return true, desc.mutable, nil
 		}
-		log.VEventf(ctx, 2, "found uncommitted descriptor %d", schema.GetID())
-		return schema, nil
+		return true, desc.immutable, nil
 	}
 
-	phyAccessor := catalogkv.UncachedPhysicalAccessor{}
-	found, schema, err := phyAccessor.GetSchema(ctx, txn, tc.codec(), dbID, schemaName, flags)
-	if err != nil || !found {
-		return nil, err
-	}
-	return schema.Desc.(*schemadesc.Mutable), nil
-}
-
-func (tc *Collection) getUserDefinedSchemaVersion(
-	ctx context.Context, txn *kv.Txn, dbID descpb.ID, schemaName string, flags tree.SchemaLookupFlags,
-) (*schemadesc.Immutable, error) {
-	readFromStore := func() (*schemadesc.Immutable, error) {
-		phyAccessor := catalogkv.UncachedPhysicalAccessor{}
-		exists, schema, err := phyAccessor.GetSchema(ctx, txn, tc.codec(), dbID, schemaName, flags)
-		if err != nil || !exists || schema.Kind != catalog.SchemaUserDefined {
-			return nil, err
-		}
-		return schema.Desc.(*schemadesc.Immutable), nil
-	}
-
-	if refuseFurtherLookup, desc, err := tc.getUncommittedDescriptor(
-		dbID,
-		keys.RootNamespaceID,
-		schemaName,
-		flags,
-	); refuseFurtherLookup || err != nil {
-		return nil, err
-	} else if immut := desc.immutable; immut != nil {
-		log.VEventf(ctx, 2, "found uncommitted descriptor %d", immut.GetID())
-		desc, ok := immut.(*schemadesc.Immutable)
-		if !ok {
-			if flags.Required {
-				return nil, sqlerrors.NewUndefinedSchemaError(schemaName)
-			}
-			return nil, nil
-		}
-		return desc, nil
-	}
-
-	avoidCache := flags.AvoidCached || lease.TestingTableLeasesAreDisabled()
+	// TODO(vivek): Ideally we'd avoid caching for only the
+	// system.descriptor and system.lease tables, because they are
+	// used for acquiring leases, creating a chicken&egg problem.
+	// But doing so turned problematic and the tests pass only by also
+	// disabling caching of system.eventlog, system.rangelog, and
+	// system.users. For now we're sticking to disabling caching of
+	// all system descriptors except the role-members-desc.
+	// TODO (lucy): Reevaluate the above. We have many more system tables now and
+	// should be able to lease most of them.
+	avoidCache := flags.AvoidCached || mutable || lease.TestingTableLeasesAreDisabled() ||
+		(catalogName == systemschema.SystemDatabaseName && objectName != systemschema.RoleMembersTable.Name)
 	if avoidCache {
-		return readFromStore()
+		return tc.getDescriptorFromStore(
+			ctx, txn, tc.codec(), dbID, schemaID, objectName, mutable)
 	}
 
-	// Look up whether the schema is on the database descriptor and return early
-	// if it's not.
-	// TODO (lucy): It's unfortunate that our current API (where we look up
-	// schemas by database ID and name) forces us to look up the leased database
-	// descriptor here, since we'll already have done this lookup when we're
-	// resolving the schema by name. Arguably we should be doing this at a higher
-	// level.
-	dbDesc, err := tc.GetDatabaseVersionByID(ctx, txn, dbID, tree.DatabaseLookupFlags{Required: true})
+	desc, shouldReadFromStore, err := tc.getLeasedDescriptorByName(
+		ctx, txn, dbID, schemaID, objectName)
 	if err != nil {
-		return nil, err
+		return false, nil, err
 	}
-	schemaInfo, found := dbDesc.LookupSchema(schemaName)
-	if !found {
-		if flags.Required {
-			return nil, sqlerrors.NewUndefinedSchemaError(schemaName)
-		}
-		return nil, nil
-	} else if schemaInfo.Dropped {
-		if flags.Required {
-			return nil, pgerror.New(pgcode.InvalidSchemaName, "schema %s is being dropped")
-		}
-		return nil, nil
+	if shouldReadFromStore {
+		return tc.getDescriptorFromStore(
+			ctx, txn, tc.codec(), dbID, schemaID, objectName, mutable)
 	}
+	return true, desc, nil
+}
 
-	// If we have a schema ID from the database, get the schema descriptor. Since
-	// the schema and database descriptors are updated in the same transaction,
-	// their leased "versions" (not the descriptor version, but the state in the
-	// abstract sequence of states in adding, renaming, or dropping a schema) can
-	// differ by at most 1 while waiting for old leases to drain. So false
-	// negatives can occur from the database lookup, in some sense, if we have a
-	// lease on the latest version of the schema and on the previous version of
-	// the database which doesn't reflect the changes to the schema. But this
-	// isn't a problem for correctness; it can only happen on other sessions
-	// before the schema change has returned results.
-	desc, err := tc.getDescriptorVersionByID(ctx, txn, schemaInfo.ID, flags, true /* setTxnDeadline */)
-	if err != nil {
-		if errors.Is(err, catalog.ErrDescriptorNotFound) {
-			return nil, sqlerrors.NewUndefinedSchemaError(schemaName)
-		}
-		return nil, err
+// GetMutableTableByName returns a mutable table descriptor with properties
+// according to the provided lookup flags. RequireMutable is ignored.
+func (tc *Collection) GetMutableTableByName(
+	ctx context.Context, txn *kv.Txn, name tree.ObjectName, flags tree.ObjectLookupFlags,
+) (found bool, _ *tabledesc.Mutable, _ error) {
+	found, desc, err := tc.getTableByName(ctx, txn, name, flags, true /* mutable */)
+	if err != nil || !found {
+		return false, nil, err
 	}
-	schema, ok := desc.(*schemadesc.Immutable)
+	return true, desc.(*tabledesc.Mutable), nil
+}
+
+// GetImmutableTableByName returns a mutable table descriptor with properties
+// according to the provided lookup flags. RequireMutable is ignored.
+func (tc *Collection) GetImmutableTableByName(
+	ctx context.Context, txn *kv.Txn, name tree.ObjectName, flags tree.ObjectLookupFlags,
+) (found bool, _ *tabledesc.Immutable, _ error) {
+	found, desc, err := tc.getTableByName(ctx, txn, name, flags, false /* mutable */)
+	if err != nil || !found {
+		return false, nil, err
+	}
+	return true, desc.(*tabledesc.Immutable), nil
+}
+
+// getTableByName returns a table descriptor with properties according to the
+// provided lookup flags.
+func (tc *Collection) getTableByName(
+	ctx context.Context,
+	txn *kv.Txn,
+	name tree.ObjectName,
+	flags tree.ObjectLookupFlags,
+	mutable bool,
+) (found bool, _ catalog.TableDescriptor, err error) {
+	found, desc, err := tc.getObjectByName(
+		ctx, txn, name.Catalog(), name.Schema(), name.Object(), flags, mutable)
+	if err != nil {
+		return false, nil, err
+	} else if !found {
+		if flags.Required {
+			return false, nil, sqlerrors.NewUndefinedRelationError(name)
+		}
+		return false, nil, nil
+	}
+	table, ok := desc.(catalog.TableDescriptor)
 	if !ok {
-		return nil, sqlerrors.NewUndefinedSchemaError(schemaName)
+		if flags.Required {
+			return false, nil, sqlerrors.NewUndefinedRelationError(name)
+		}
+		return false, nil, nil
+	}
+	if table.Adding() && table.IsUncommittedVersion() &&
+		(mutable || flags.CommonLookupFlags.AvoidCached) {
+		// Special case: We always return tables in the adding state if they were
+		// created in the same transaction and a descriptor (effectively) read in
+		// the same transaction is requested. What this basically amounts to is
+		// resolving adding descriptors only for DDLs (etc.).
+		// TODO (lucy): I'm not sure where this logic should live. We could add an
+		// IncludeAdding flag and pull the special case handling up into the
+		// callers. Figure that out after we clean up the name resolution layers
+		// and it becomes more clear what the callers should be.
+		return true, table, nil
+	}
+	if dropped, err := filterDescriptorState(table, flags.CommonLookupFlags); err != nil || dropped {
+		return false, nil, err
+	}
+	hydrated, err := tc.hydrateTypesInTableDesc(ctx, txn, table)
+	if err != nil {
+		return false, nil, err
+	}
+	return true, hydrated, nil
+}
+
+// GetMutableTypeByName returns a mutable type descriptor with properties
+// according to the provided lookup flags. RequireMutable is ignored.
+func (tc *Collection) GetMutableTypeByName(
+	ctx context.Context, txn *kv.Txn, name tree.ObjectName, flags tree.ObjectLookupFlags,
+) (found bool, _ *typedesc.Mutable, _ error) {
+	found, desc, err := tc.getTypeByName(ctx, txn, name, flags, true /* mutable */)
+	if err != nil || !found {
+		return false, nil, err
+	}
+	return true, desc.(*typedesc.Mutable), nil
+}
+
+// GetImmutableTypeByName returns a mutable type descriptor with properties
+// according to the provided lookup flags. RequireMutable is ignored.
+func (tc *Collection) GetImmutableTypeByName(
+	ctx context.Context, txn *kv.Txn, name tree.ObjectName, flags tree.ObjectLookupFlags,
+) (found bool, _ *typedesc.Immutable, _ error) {
+	found, desc, err := tc.getTypeByName(ctx, txn, name, flags, false /* mutable */)
+	if err != nil || !found {
+		return false, nil, err
+	}
+	return true, desc.(*typedesc.Immutable), nil
+}
+
+// getTypeByName returns a type descriptor with properties according to the
+// provided lookup flags.
+func (tc *Collection) getTypeByName(
+	ctx context.Context,
+	txn *kv.Txn,
+	name tree.ObjectName,
+	flags tree.ObjectLookupFlags,
+	mutable bool,
+) (found bool, _ catalog.TypeDescriptor, err error) {
+	found, desc, err := tc.getObjectByName(
+		ctx, txn, name.Catalog(), name.Schema(), name.Object(), flags, mutable)
+	if err != nil {
+		return false, nil, err
+	} else if !found {
+		if flags.Required {
+			return false, nil, sqlerrors.NewUndefinedTypeError(name)
+		}
+		return false, nil, nil
+	}
+	typ, ok := desc.(catalog.TypeDescriptor)
+	if !ok {
+		if flags.Required {
+			return false, nil, sqlerrors.NewUndefinedTypeError(name)
+		}
+		return false, nil, nil
+	}
+	if dropped, err := filterDescriptorState(
+		typ, flags.CommonLookupFlags,
+	); err != nil || dropped {
+		return false, nil, err
+	}
+	return true, typ, nil
+}
+
+// TODO (lucy): Should this just take a database name? We're separately
+// resolving the database name in lots of places where we (indirectly) call
+// this.
+func (tc *Collection) getUserDefinedSchemaByName(
+	ctx context.Context,
+	txn *kv.Txn,
+	dbID descpb.ID,
+	schemaName string,
+	flags tree.SchemaLookupFlags,
+	mutable bool,
+) (catalog.SchemaDescriptor, error) {
+	getSchemaByName := func() (found bool, _ catalog.Descriptor, err error) {
+		if refuseFurtherLookup, desc := tc.getUncommittedDescriptor(
+			dbID, keys.RootNamespaceID, schemaName,
+		); refuseFurtherLookup {
+			return false, nil, nil
+		} else if desc != nil {
+			log.VEventf(ctx, 2, "found uncommitted descriptor %d", desc.immutable.GetID())
+			if mutable {
+				return true, desc.mutable, nil
+			}
+			return true, desc.immutable, nil
+		}
+
+		if flags.AvoidCached || mutable || lease.TestingTableLeasesAreDisabled() {
+			return tc.getDescriptorFromStore(
+				ctx, txn, tc.codec(), dbID, keys.RootNamespaceID, schemaName, mutable)
+		}
+
+		// Look up whether the schema is on the database descriptor and return early
+		// if it's not.
+		dbDesc, err := tc.GetDatabaseVersionByID(ctx, txn, dbID, tree.DatabaseLookupFlags{Required: true})
+		if err != nil {
+			return false, nil, err
+		}
+		schemaInfo, found := dbDesc.LookupSchema(schemaName)
+		if !found {
+			return false, nil, nil
+		} else if schemaInfo.Dropped {
+			// If there's another schema name entry with the same ID as this one, then
+			// the schema has been renamed, so don't return anything.
+			for name, info := range dbDesc.GetSchemas() {
+				if name != schemaName && info.ID == schemaInfo.ID {
+					return false, nil, nil
+				}
+			}
+			// Otherwise, the schema has been dropped. Return early, except in the
+			// specific case where flags.Required and flags.IncludeDropped are both
+			// true, which forces us to look up the dropped descriptor and return it.
+			if !flags.Required {
+				return false, nil, nil
+			}
+			if !flags.IncludeDropped {
+				return false, nil, catalog.NewInactiveDescriptorError(catalog.ErrDescriptorDropped)
+			}
+		}
+
+		// If we have a schema ID from the database, get the schema descriptor. Since
+		// the schema and database descriptors are updated in the same transaction,
+		// their leased "versions" (not the descriptor version, but the state in the
+		// abstract sequence of states in adding, renaming, or dropping a schema) can
+		// differ by at most 1 while waiting for old leases to drain. So false
+		// negatives can occur from the database lookup, in some sense, if we have a
+		// lease on the latest version of the schema and on the previous version of
+		// the database which doesn't reflect the changes to the schema. But this
+		// isn't a problem for correctness; it can only happen on other sessions
+		// before the schema change has returned results.
+		desc, err := tc.getDescriptorVersionByID(ctx, txn, schemaInfo.ID, flags, true /* setTxnDeadline */)
+		if err != nil {
+			if errors.Is(err, catalog.ErrDescriptorNotFound) {
+				return false, nil, nil
+			}
+			return false, nil, err
+		}
+		return true, desc, nil
+	}
+
+	found, desc, err := getSchemaByName()
+	if err != nil {
+		return nil, err
+	} else if !found {
+		if flags.Required {
+			return nil, sqlerrors.NewUndefinedSchemaError(schemaName)
+		}
+		return nil, nil
+	}
+	schema, ok := desc.(catalog.SchemaDescriptor)
+	if !ok {
+		if flags.Required {
+			return nil, sqlerrors.NewUndefinedSchemaError(schemaName)
+		}
+		return nil, nil
+	}
+	if dropped, err := filterDescriptorState(schema, flags); dropped || err != nil {
+		return nil, err
 	}
 	return schema, nil
 }
 
-// ResolveSchema resolves the schema and, if applicable, returns a descriptor
-// usable by the transaction.
-// This method departs from the pattern for the other descriptor types: there
-// are no separate methods for mutable and immutable descriptors. The only
-// reasons for this are that both paths require special handling for the public
-// schema and temp schemas, and currently the only user of the descriptor
-// collection for schemas is the CachedPhysicalAccessor, which needs access to
-// both variants anyway.
-func (tc *Collection) ResolveSchema(
+// filterDescriptorState wraps the more general catalog function to swallow
+// the error if the descriptor is being dropped and the descriptor is not
+// required. In that case, dropped will be true. A return value of false, nil
+// means this descriptor is okay given the flags.
+func filterDescriptorState(
+	desc catalog.Descriptor, flags tree.CommonLookupFlags,
+) (dropped bool, _ error) {
+	if err := catalog.FilterDescriptorState(desc, flags); err != nil {
+		if flags.Required || !errors.Is(err, catalog.ErrDescriptorDropped) {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// GetMutableSchemaByName resolves the schema and, if applicable, returns a
+// mutable descriptor usable by the transaction. RequireMutable is ignored.
+func (tc *Collection) GetMutableSchemaByName(
 	ctx context.Context, txn *kv.Txn, dbID descpb.ID, schemaName string, flags tree.SchemaLookupFlags,
+) (bool, catalog.ResolvedSchema, error) {
+	return tc.getSchemaByName(ctx, txn, dbID, schemaName, flags, true /* mutable */)
+}
+
+// GetImmutableSchemaByName resolves the schema and, if applicable, returns an
+// immutable descriptor usable by the transaction. RequireMutable is ignored.
+func (tc *Collection) GetImmutableSchemaByName(
+	ctx context.Context, txn *kv.Txn, dbID descpb.ID, schemaName string, flags tree.SchemaLookupFlags,
+) (bool, catalog.ResolvedSchema, error) {
+	return tc.getSchemaByName(ctx, txn, dbID, schemaName, flags, false /* mutable */)
+}
+
+// getSchemaByName resolves the schema and, if applicable, returns a descriptor
+// usable by the transaction.
+func (tc *Collection) getSchemaByName(
+	ctx context.Context,
+	txn *kv.Txn,
+	dbID descpb.ID,
+	schemaName string,
+	flags tree.SchemaLookupFlags,
+	mutable bool,
 ) (bool, catalog.ResolvedSchema, error) {
 	// Fast path public schema, as it is always found.
 	if schemaName == tree.PublicSchema {
@@ -522,28 +774,27 @@ func (tc *Collection) ResolveSchema(
 				}
 			}
 		}
-
-		exists, resolved, err := (catalogkv.UncachedPhysicalAccessor{}).GetSchema(ctx, txn, tc.codec(), dbID, schemaName, flags)
-		if err != nil || !exists {
-			return exists, catalog.ResolvedSchema{}, err
+		exists, schemaID, err := catalogkv.ResolveSchemaID(ctx, txn, tc.codec(), dbID, schemaName)
+		if err != nil {
+			return false, catalog.ResolvedSchema{}, err
+		} else if !exists {
+			if flags.Required {
+				return false, catalog.ResolvedSchema{}, sqlerrors.NewUndefinedSchemaError(schemaName)
+			}
+			return false, catalog.ResolvedSchema{}, nil
 		}
-		return exists, resolved, err
+		schema := catalog.ResolvedSchema{
+			Kind: catalog.SchemaTemporary,
+			Name: schemaName,
+			ID:   schemaID,
+		}
+		return true, schema, nil
 	}
 
 	// Otherwise, the schema is user-defined. Get the descriptor.
-	var desc catalog.SchemaDescriptor
-	if flags.RequireMutable {
-		mutDesc, err := tc.getMutableUserDefinedSchemaDescriptor(ctx, txn, dbID, schemaName, flags)
-		if err != nil || mutDesc == nil {
-			return false, catalog.ResolvedSchema{}, err
-		}
-		desc = mutDesc
-	} else {
-		immutDesc, err := tc.getUserDefinedSchemaVersion(ctx, txn, dbID, schemaName, flags)
-		if err != nil || immutDesc == nil {
-			return false, catalog.ResolvedSchema{}, err
-		}
-		desc = immutDesc
+	desc, err := tc.getUserDefinedSchemaByName(ctx, txn, dbID, schemaName, flags, mutable)
+	if err != nil || desc == nil {
+		return false, catalog.ResolvedSchema{}, err
 	}
 	return true, catalog.ResolvedSchema{
 		Kind: catalog.SchemaUserDefined,
@@ -551,190 +802,6 @@ func (tc *Collection) ResolveSchema(
 		ID:   desc.GetID(),
 		Desc: desc,
 	}, nil
-}
-
-// GetDatabaseVersion returns a database descriptor with a version suitable for
-// the transaction: table.ModificationTime <= txn.Timestamp < expirationTime.
-// The table must be released by calling tc.ReleaseAll().
-//
-// If flags.required is false, GetTableVersion() will gracefully
-// return a nil descriptor and no error if the table does not exist.
-//
-// It might also add a transaction deadline to the transaction that is
-// enforced at the KV layer to ensure that the transaction doesn't violate
-// the validity window of the table descriptor version returned.
-func (tc *Collection) GetDatabaseVersion(
-	ctx context.Context, txn *kv.Txn, name string, flags tree.DatabaseLookupFlags,
-) (*dbdesc.Immutable, error) {
-	readFromStore := func() (*dbdesc.Immutable, error) {
-		phyAccessor := catalogkv.UncachedPhysicalAccessor{}
-		desc, err := phyAccessor.GetDatabaseDesc(ctx, txn, tc.codec(), name, flags)
-		if err != nil || desc == nil {
-			return nil, err
-		}
-		return desc.(*dbdesc.Immutable), nil
-	}
-
-	if refuseFurtherLookup, desc, err := tc.getUncommittedDescriptor(
-		keys.RootNamespaceID,
-		keys.RootNamespaceID,
-		name,
-		flags,
-	); refuseFurtherLookup || err != nil {
-		return nil, err
-	} else if immut := desc.immutable; immut != nil {
-		log.VEventf(ctx, 2, "found uncommitted descriptor %d", immut.GetID())
-		db, ok := immut.(*dbdesc.Immutable)
-		if !ok {
-			if flags.Required {
-				return nil, sqlerrors.NewUndefinedDatabaseError(name)
-			}
-			return nil, nil
-		}
-		return db, nil
-	}
-
-	avoidCache := flags.AvoidCached || lease.TestingTableLeasesAreDisabled() ||
-		name == systemschema.SystemDatabaseName
-	if avoidCache {
-		return readFromStore()
-	}
-
-	desc, shouldReadFromStore, err := tc.getLeasedDescriptorByName(
-		ctx, txn, keys.RootNamespaceID, keys.RootNamespaceID, name)
-	if err != nil {
-		return nil, err
-	}
-	if shouldReadFromStore {
-		return readFromStore()
-	}
-	db, ok := desc.(*dbdesc.Immutable)
-	if !ok {
-		if flags.Required {
-			return nil, sqlerrors.NewUndefinedDatabaseError(name)
-		}
-		return nil, nil
-	}
-	return db, nil
-}
-
-// GetTableVersion returns a table descriptor with a version suitable for
-// the transaction: table.ModificationTime <= txn.Timestamp < expirationTime.
-// The table must be released by calling tc.ReleaseAll().
-//
-// If flags.required is false, GetTableVersion() will gracefully
-// return a nil descriptor and no error if the table does not exist.
-//
-// It might also add a transaction deadline to the transaction that is
-// enforced at the KV layer to ensure that the transaction doesn't violate
-// the validity window of the table descriptor version returned.
-//
-func (tc *Collection) GetTableVersion(
-	ctx context.Context, txn *kv.Txn, tn *tree.TableName, flags tree.ObjectLookupFlags,
-) (*tabledesc.Immutable, error) {
-	desc, err := tc.getObjectVersion(ctx, txn, tn, flags)
-	if err != nil {
-		return nil, err
-	}
-	table, ok := desc.(*tabledesc.Immutable)
-	if !ok {
-		if flags.Required {
-			return nil, sqlerrors.NewUndefinedRelationError(tn)
-		}
-		return nil, nil
-	}
-	hydrated, err := tc.hydrateTypesInTableDesc(ctx, txn, table)
-	if err != nil {
-		return nil, err
-	}
-	return hydrated.(*tabledesc.Immutable), nil
-}
-
-func (tc *Collection) getObjectVersion(
-	ctx context.Context, txn *kv.Txn, name tree.ObjectName, flags tree.ObjectLookupFlags,
-) (catalog.Descriptor, error) {
-	readObjectFromStore := func() (catalog.Descriptor, error) {
-		phyAccessor := catalogkv.UncachedPhysicalAccessor{}
-		return phyAccessor.GetObjectDesc(
-			ctx,
-			txn,
-			tc.settings,
-			tc.codec(),
-			name.Catalog(),
-			name.Schema(),
-			name.Object(),
-			flags,
-		)
-	}
-
-	// Resolve the database.
-	db, err := tc.GetDatabaseVersion(ctx, txn, name.Catalog(),
-		tree.DatabaseLookupFlags{
-			Required:       flags.Required,
-			AvoidCached:    flags.AvoidCached,
-			IncludeDropped: flags.IncludeDropped,
-			IncludeOffline: flags.IncludeOffline,
-		})
-	if err != nil || db == nil {
-		return nil, err
-	}
-	dbID := db.GetID()
-
-	// Resolve the schema to the ID of the schema.
-	foundSchema, resolvedSchema, err := tc.ResolveSchema(ctx, txn, dbID, name.Schema(),
-		tree.SchemaLookupFlags{
-			Required:       flags.Required,
-			AvoidCached:    flags.AvoidCached,
-			IncludeDropped: flags.IncludeDropped,
-			IncludeOffline: flags.IncludeOffline,
-		})
-	if err != nil || !foundSchema {
-		return nil, err
-	}
-	schemaID := resolvedSchema.ID
-
-	// TODO(vivek): Ideally we'd avoid caching for only the
-	// system.descriptor and system.lease tables, because they are
-	// used for acquiring leases, creating a chicken&egg problem.
-	// But doing so turned problematic and the tests pass only by also
-	// disabling caching of system.eventlog, system.rangelog, and
-	// system.users. For now we're sticking to disabling caching of
-	// all system descriptors except the role-members-desc.
-	avoidCache := flags.AvoidCached || lease.TestingTableLeasesAreDisabled() ||
-		(name.Catalog() == systemschema.SystemDatabaseName && name.Object() != systemschema.RoleMembersTable.Name)
-
-	if refuseFurtherLookup, desc, err := tc.getUncommittedDescriptor(
-		dbID,
-		schemaID,
-		name.Object(),
-		flags.CommonLookupFlags,
-	); refuseFurtherLookup || err != nil {
-		return nil, err
-	} else if immut := desc.immutable; immut != nil {
-		// If not forcing to resolve using KV, tables being added aren't visible.
-		if immut.Adding() && !avoidCache {
-			if !flags.Required {
-				return nil, nil
-			}
-			return nil, catalog.FilterDescriptorState(immut, flags.CommonLookupFlags)
-		}
-
-		log.VEventf(ctx, 2, "found uncommitted descriptor %d", immut.GetID())
-		return immut, nil
-	}
-
-	if avoidCache {
-		return readObjectFromStore()
-	}
-
-	desc, shouldReadFromStore, err := tc.getLeasedDescriptorByName(ctx, txn, dbID, schemaID, name.Object())
-	if err != nil {
-		return nil, err
-	}
-	if shouldReadFromStore {
-		return readObjectFromStore()
-	}
-	return desc, nil
 }
 
 // GetDatabaseVersionByID returns a database descriptor valid for the
@@ -789,7 +856,7 @@ func (tc *Collection) getDescriptorVersionByID(
 		if err != nil {
 			return nil, err
 		}
-		if err := catalog.FilterDescriptorState(desc, flags); err != nil {
+		if dropped, err := filterDescriptorState(desc, flags); err != nil || dropped {
 			return nil, err
 		}
 		return desc, nil
@@ -871,7 +938,11 @@ func (tc *Collection) GetMutableDescriptorByID(
 	if err != nil {
 		return nil, err
 	}
-	return desc.(catalog.MutableDescriptor), nil
+	mut := desc.(catalog.MutableDescriptor)
+	if err := tc.AddUncommittedDescriptor(mut); err != nil {
+		return nil, err
+	}
+	return mut, nil
 }
 
 // ResolveSchemaByID looks up a schema by ID.
@@ -881,13 +952,11 @@ func (tc *Collection) GetMutableDescriptorByID(
 func (tc *Collection) ResolveSchemaByID(
 	ctx context.Context, txn *kv.Txn, schemaID descpb.ID,
 ) (catalog.ResolvedSchema, error) {
-	return tc.resolveSchemaByID(ctx, txn, schemaID, tree.SchemaLookupFlags{
-		Required: true,
-	})
+	return tc.resolveSchemaByID(ctx, txn, schemaID, false /* mutable */, false /* includeOffline */)
 }
 
 func (tc *Collection) resolveSchemaByID(
-	ctx context.Context, txn *kv.Txn, schemaID descpb.ID, flags tree.SchemaLookupFlags,
+	ctx context.Context, txn *kv.Txn, schemaID descpb.ID, mutable, includeOffline bool,
 ) (catalog.ResolvedSchema, error) {
 	if schemaID == keys.PublicSchemaID {
 		return catalog.ResolvedSchema{
@@ -916,15 +985,21 @@ func (tc *Collection) resolveSchemaByID(
 			Name: tc.sessionData.SearchPath.GetTemporarySchemaName(),
 		}, nil
 	}
-
+	// Map the valid option passed to this function into flags.
+	flags := tree.SchemaLookupFlags{
+		Required:       true,
+		RequireMutable: mutable,
+		IncludeOffline: includeOffline,
+	}
 	// Otherwise, fall back to looking up the descriptor with the desired ID.
 	var desc catalog.Descriptor
 	var err error
 	if flags.RequireMutable {
-		// Note that this throws away the flags in general.
 		desc, err = tc.GetMutableDescriptorByID(ctx, schemaID, txn)
 		if err == nil {
-			err = catalog.FilterDescriptorState(desc, flags)
+			// Required is always true so there's no dealing with the dropped
+			// bool.
+			_, err = filterDescriptorState(desc, flags)
 		}
 	} else {
 		desc, err = tc.getDescriptorVersionByID(
@@ -977,11 +1052,8 @@ func (tc *Collection) hydrateTypesInTableDesc(
 			if err != nil {
 				return tree.TypeName{}, nil, err
 			}
-			sc, err := tc.resolveSchemaByID(ctx, txn, desc.ParentSchemaID, tree.SchemaLookupFlags{
-				Required:       true,
-				RequireMutable: true,
-				IncludeOffline: true,
-			})
+			sc, err := tc.resolveSchemaByID(ctx, txn, desc.ParentSchemaID,
+				true /* requireMutable */, true /* includeOffline */)
 			if err != nil {
 				return tree.TypeName{}, nil, err
 			}
@@ -1062,12 +1134,12 @@ func (tc *Collection) ReleaseSpecifiedLeases(ctx context.Context, descs []lease.
 // ReleaseLeases releases all leases. Errors are logged but ignored.
 func (tc *Collection) ReleaseLeases(ctx context.Context) {
 	log.VEventf(ctx, 2, "releasing %d descriptors", tc.leasedDescriptors.numDescriptors())
-	toRelease := tc.leasedDescriptors.releaseAll()
-	for _, desc := range toRelease {
+	for _, desc := range tc.leasedDescriptors.descs {
 		if err := tc.leaseMgr.Release(desc); err != nil {
 			log.Warningf(ctx, "%v", err)
 		}
 	}
+	tc.leasedDescriptors.descs = tc.leasedDescriptors.descs[:0]
 }
 
 // ReleaseAll releases all state currently held by the Collection.
@@ -1105,26 +1177,46 @@ var _ = (*Collection).HasUncommittedTypes
 
 // AddUncommittedDescriptor adds an uncommitted descriptor modified in the
 // transaction to the Collection. The descriptor must either be a new descriptor
-// or carry the subsequent version to the original version.
+// or carry the original version or carry the subsequent version to the original
+// version.
+//
+// Subsequent attempts to resolve this descriptor mutably, either by name or ID
+// will return this exact object. Subsequent attempts to resolve this descriptor
+// immutably will return a copy of the descriptor in the current state. A deep
+// copy is performed in this call.
 func (tc *Collection) AddUncommittedDescriptor(desc catalog.MutableDescriptor) error {
-	if desc.GetVersion() != desc.OriginalVersion()+1 {
-		return errors.AssertionFailedf(
-			"descriptor version %d not incremented from cluster version %d",
-			desc.GetVersion(), desc.OriginalVersion())
+	_, err := tc.addUncommittedDescriptor(desc)
+	return err
+}
+
+func (tc *Collection) addUncommittedDescriptor(
+	desc catalog.MutableDescriptor,
+) (*uncommittedDescriptor, error) {
+	version := desc.GetVersion()
+	origVersion := desc.OriginalVersion()
+	if version != origVersion && version != origVersion+1 {
+		return nil, errors.AssertionFailedf(
+			"descriptor %d version %d not compatible with cluster version %d",
+			desc.GetID(), version, origVersion)
 	}
-	tbl := uncommittedDescriptor{
+
+	ud := &uncommittedDescriptor{
 		mutable:   desc,
 		immutable: desc.ImmutableCopy(),
 	}
+
+	var found bool
 	for i, d := range tc.uncommittedDescriptors {
 		if d.mutable.GetID() == desc.GetID() {
-			tc.uncommittedDescriptors[i] = tbl
-			return nil
+			tc.uncommittedDescriptors[i], found = ud, true
+			break
 		}
 	}
-	tc.uncommittedDescriptors = append(tc.uncommittedDescriptors, tbl)
+	if !found {
+		tc.uncommittedDescriptors = append(tc.uncommittedDescriptors, ud)
+	}
 	tc.releaseAllDescriptors()
-	return nil
+	return ud, nil
 }
 
 // WriteDescToBatch calls MaybeIncrementVersion, adds the descriptor to the
@@ -1158,7 +1250,7 @@ func (tc *Collection) WriteDesc(
 func (tc *Collection) GetDescriptorsWithNewVersion() []lease.IDVersion {
 	var descs []lease.IDVersion
 	for _, desc := range tc.uncommittedDescriptors {
-		if mut := desc.mutable; !mut.IsNew() {
+		if mut := desc.mutable; !mut.IsNew() && mut.IsUncommittedVersion() {
 			descs = append(descs, lease.NewIDVersionPrev(mut.OriginalName(), mut.OriginalID(), mut.OriginalVersion()))
 		}
 	}
@@ -1169,7 +1261,8 @@ func (tc *Collection) GetDescriptorsWithNewVersion() []lease.IDVersion {
 // transaction.
 func (tc *Collection) GetUncommittedTables() (tables []*tabledesc.Immutable) {
 	for _, desc := range tc.uncommittedDescriptors {
-		if table, ok := desc.immutable.(*tabledesc.Immutable); ok {
+		table, ok := desc.immutable.(*tabledesc.Immutable)
+		if ok && desc.immutable.IsUncommittedVersion() {
 			tables = append(tables, table)
 		}
 	}
@@ -1178,53 +1271,16 @@ func (tc *Collection) GetUncommittedTables() (tables []*tabledesc.Immutable) {
 
 // User defined type accessors.
 
-// GetMutableTypeDescriptor is the equivalent of GetMutableTableDescriptor but
-// for accessing types.
-func (tc *Collection) GetMutableTypeDescriptor(
-	ctx context.Context, txn *kv.Txn, tn *tree.TypeName, flags tree.ObjectLookupFlags,
-) (*typedesc.Mutable, error) {
-	desc, err := tc.getMutableObjectDescriptor(ctx, txn, tn, flags)
-	if err != nil {
-		return nil, err
-	}
-	mutDesc, ok := desc.(*typedesc.Mutable)
-	if !ok {
-		if flags.Required {
-			return nil, sqlerrors.NewUndefinedTypeError(tn)
-		}
-		return nil, nil
-	}
-	return mutDesc, nil
-}
-
 // GetMutableTypeVersionByID is the equivalent of GetMutableTableDescriptorByID
 // but for accessing types.
 func (tc *Collection) GetMutableTypeVersionByID(
 	ctx context.Context, txn *kv.Txn, typeID descpb.ID,
 ) (*typedesc.Mutable, error) {
 	desc, err := tc.GetMutableDescriptorByID(ctx, typeID, txn)
-	if err != nil {
+	if err != nil || desc == nil {
 		return nil, err
 	}
 	return desc.(*typedesc.Mutable), nil
-}
-
-// GetTypeVersion is the equivalent of GetTableVersion but for accessing types.
-func (tc *Collection) GetTypeVersion(
-	ctx context.Context, txn *kv.Txn, tn *tree.TypeName, flags tree.ObjectLookupFlags,
-) (*typedesc.Immutable, error) {
-	desc, err := tc.getObjectVersion(ctx, txn, tn, flags)
-	if err != nil {
-		return nil, err
-	}
-	typ, ok := desc.(*typedesc.Immutable)
-	if !ok {
-		if flags.Required {
-			return nil, sqlerrors.NewUndefinedTypeError(tn)
-		}
-		return nil, nil
-	}
-	return typ, nil
 }
 
 // GetTypeVersionByID is the equivalent of GetTableVersionByID but for accessing
@@ -1250,15 +1306,14 @@ func (tc *Collection) GetTypeVersionByID(
 
 // getUncommittedDescriptor returns a descriptor for the requested name
 // if the requested name is for a descriptor modified within the transaction
-// affiliated with the LeaseCollection.
+// affiliated with the Collection.
 //
-// The first return value "refuseFurtherLookup" is true when there is
-// a known deletion of that descriptor, so it would be invalid to miss the
-// cache and go to KV (where the descriptor prior to the DROP may
-// still exist).
+// The first return value "refuseFurtherLookup" is true when there is a known
+// rename of that descriptor, so it would be invalid to miss the cache and go to
+// KV (where the descriptor prior to the rename may still exist).
 func (tc *Collection) getUncommittedDescriptor(
-	dbID descpb.ID, schemaID descpb.ID, name string, flags tree.CommonLookupFlags,
-) (refuseFurtherLookup bool, desc uncommittedDescriptor, err error) {
+	dbID descpb.ID, schemaID descpb.ID, name string,
+) (refuseFurtherLookup bool, desc *uncommittedDescriptor) {
 	// Walk latest to earliest so that a DROP followed by a CREATE with the same
 	// name will result in the CREATE being seen.
 	for i := len(tc.uncommittedDescriptors) - 1; i >= 0; i-- {
@@ -1273,36 +1328,19 @@ func (tc *Collection) getUncommittedDescriptor(
 			if drain.Name == name &&
 				drain.ParentID == dbID &&
 				drain.ParentSchemaID == schemaID {
-				// Name has gone away.
-				if flags.Required {
-					// If it's required here, say it doesn't exist.
-					err = sqlerrors.NewUndefinedRelationError(tree.NewUnqualifiedTableName(tree.Name(name)))
-				}
-				// The desc collection knows better; the caller has to avoid
-				// going to KV in any case: refuseFurtherLookup = true
-				return true, uncommittedDescriptor{}, err
+				return true, nil
 			}
 		}
 
-		// Do we know about a descriptor with this name?
+		// Otherwise, if the name matches, we return it. It's up to the caller to
+		// filter descriptors in non-public states.
+		// TODO (lucy): Is it possible to return dropped descriptors at this point,
+		// after the previous draining names check?
 		if lease.NameMatchesDescriptor(mutDesc, dbID, schemaID, name) {
-			// Right state?
-			if err = catalog.FilterDescriptorState(mutDesc, flags); err != nil &&
-				!catalog.HasAddingTableError(err) {
-				if !flags.Required {
-					// If it's not required here, we simply say we don't have it.
-					err = nil
-				}
-				// The desc collection knows better; the caller has to avoid
-				// going to KV in any case: refuseFurtherLookup = true
-				return true, uncommittedDescriptor{}, err
-			}
-
-			// Got a descriptor.
-			return false, desc, nil
+			return false, desc
 		}
 	}
-	return false, uncommittedDescriptor{}, nil
+	return false, nil
 }
 
 // GetUncommittedTableByID returns an uncommitted table by its ID.
@@ -1317,8 +1355,7 @@ func (tc *Collection) GetUncommittedTableByID(id descpb.ID) *tabledesc.Mutable {
 }
 
 func (tc *Collection) getUncommittedDescriptorByID(id descpb.ID) catalog.MutableDescriptor {
-	for i := range tc.uncommittedDescriptors {
-		desc := &tc.uncommittedDescriptors[i]
+	for _, desc := range tc.uncommittedDescriptors {
 		if desc.mutable.GetID() == id {
 			return desc.mutable
 		}
@@ -1330,10 +1367,10 @@ func (tc *Collection) getUncommittedDescriptorByID(id descpb.ID) catalog.Mutable
 // first checking the Collection's cached descriptors for validity if validate
 // is set to true before defaulting to a key-value scan, if necessary.
 func (tc *Collection) GetAllDescriptors(
-	ctx context.Context, txn *kv.Txn, validate bool,
+	ctx context.Context, txn *kv.Txn,
 ) ([]catalog.Descriptor, error) {
 	if tc.allDescriptors == nil {
-		descs, err := catalogkv.GetAllDescriptors(ctx, txn, tc.codec(), validate)
+		descs, err := catalogkv.GetAllDescriptors(ctx, txn, tc.codec())
 		if err != nil {
 			return nil, err
 		}
@@ -1429,7 +1466,7 @@ func HydrateGivenDescriptors(ctx context.Context, descs []catalog.Descriptor) er
 // If the argument allowMissingDesc is true, the function will return nil-s for
 // missing database descriptors.
 func (tc *Collection) GetAllDatabaseDescriptors(
-	ctx context.Context, txn *kv.Txn, allowMissingDesc bool,
+	ctx context.Context, txn *kv.Txn,
 ) ([]*dbdesc.Immutable, error) {
 	if tc.allDatabaseDescriptors == nil {
 		dbDescIDs, err := catalogkv.GetAllDatabaseDescriptorIDs(ctx, txn, tc.codec())
@@ -1437,7 +1474,7 @@ func (tc *Collection) GetAllDatabaseDescriptors(
 			return nil, err
 		}
 		dbDescs, err := catalogkv.GetDatabaseDescriptorsFromIDs(
-			ctx, txn, tc.codec(), dbDescIDs, allowMissingDesc,
+			ctx, txn, tc.codec(), dbDescIDs,
 		)
 		if err != nil {
 			return nil, err
@@ -1464,6 +1501,104 @@ func (tc *Collection) GetSchemasForDatabase(
 		}
 	}
 	return tc.allSchemasForDatabase[dbID], nil
+}
+
+// GetObjectNames returns the names of all objects in a database and schema.
+func (tc *Collection) GetObjectNames(
+	ctx context.Context,
+	txn *kv.Txn,
+	dbDesc catalog.DatabaseDescriptor,
+	scName string,
+	flags tree.DatabaseListFlags,
+) (tree.TableNames, error) {
+	schemaFlags := tree.SchemaLookupFlags{
+		Required:       flags.Required,
+		AvoidCached:    flags.RequireMutable || flags.AvoidCached,
+		IncludeDropped: flags.IncludeDropped,
+		IncludeOffline: flags.IncludeOffline,
+	}
+	ok, schema, err := tc.GetImmutableSchemaByName(ctx, txn, dbDesc.GetID(), scName, schemaFlags)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		if flags.Required {
+			tn := tree.MakeTableNameWithSchema(tree.Name(dbDesc.GetName()), tree.Name(scName), "")
+			return nil, sqlerrors.NewUnsupportedSchemaUsageError(tree.ErrString(&tn.ObjectNamePrefix))
+		}
+		return nil, nil
+	}
+
+	log.Eventf(ctx, "fetching list of objects for %q", dbDesc.GetName())
+	prefix := catalogkeys.NewTableKey(dbDesc.GetID(), schema.ID, "").Key(tc.codec())
+	sr, err := txn.Scan(ctx, prefix, prefix.PrefixEnd(), 0)
+	if err != nil {
+		return nil, err
+	}
+
+	alreadySeen := make(map[string]bool)
+	var tableNames tree.TableNames
+
+	for _, row := range sr {
+		_, tableName, err := encoding.DecodeUnsafeStringAscending(bytes.TrimPrefix(
+			row.Key, prefix), nil)
+		if err != nil {
+			return nil, err
+		}
+		alreadySeen[tableName] = true
+		tn := tree.MakeTableNameWithSchema(tree.Name(dbDesc.GetName()), tree.Name(scName), tree.Name(tableName))
+		tn.ExplicitCatalog = flags.ExplicitPrefix
+		tn.ExplicitSchema = flags.ExplicitPrefix
+		tableNames = append(tableNames, tn)
+	}
+
+	// When constructing the list of entries under the `public` schema (and only
+	// when constructing the list for the `public` schema), We scan both the
+	// deprecated and new system.namespace table to get the complete list of
+	// tables. Duplicate entries may be present in both the tables, so we filter
+	// those out. If a duplicate entry is present, it doesn't matter which table
+	// it is read from -- system.namespace entries are never modified, they are
+	// only added/deleted. Entries are written to only one table, so duplicate
+	// entries must have been copied over during migration. Thus, it doesn't
+	// matter which table (newer/deprecated) the value is read from.
+	//
+	// It may seem counter-intuitive to read both tables if we have found data in
+	// the newer version. The migration copied all entries from the deprecated
+	// system.namespace and all new entries after the cluster version bump are added
+	// to the new system.namespace. Why do we do this then?
+	// This is to account the scenario where a table was created before
+	// the cluster version was bumped, but after the older system.namespace was
+	// copied into the newer system.namespace. Objects created in this window
+	// will only be present in the older system.namespace. To account for this
+	// scenario, we must do this filtering logic.
+	// TODO(solon): This complexity can be removed in  20.2.
+	if scName != tree.PublicSchema {
+		return tableNames, nil
+	}
+
+	dprefix := catalogkeys.NewDeprecatedTableKey(dbDesc.GetID(), "").Key(tc.codec())
+	dsr, err := txn.Scan(ctx, dprefix, dprefix.PrefixEnd(), 0)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, row := range dsr {
+		// Decode using the deprecated key prefix.
+		_, tableName, err := encoding.DecodeUnsafeStringAscending(
+			bytes.TrimPrefix(row.Key, dprefix), nil)
+		if err != nil {
+			return nil, err
+		}
+		if alreadySeen[tableName] {
+			continue
+		}
+		tn := tree.MakeTableNameWithSchema(tree.Name(dbDesc.GetName()), tree.Name(scName), tree.Name(tableName))
+		tn.ExplicitCatalog = flags.ExplicitPrefix
+		tn.ExplicitSchema = flags.ExplicitPrefix
+		tableNames = append(tableNames, tn)
+	}
+
+	return tableNames, nil
 }
 
 // releaseAllDescriptors releases the cached slice of all descriptors
@@ -1515,9 +1650,9 @@ type DistSQLTypeResolverFactory struct {
 
 // NewTypeResolver creates a new TypeResolver that is bound under the input
 // transaction. It returns a nil resolver if the factory itself is nil.
-func (df *DistSQLTypeResolverFactory) NewTypeResolver(txn *kv.Txn) *DistSQLTypeResolver {
+func (df *DistSQLTypeResolverFactory) NewTypeResolver(txn *kv.Txn) DistSQLTypeResolver {
 	if df == nil {
-		return nil
+		return DistSQLTypeResolver{}
 	}
 	return NewDistSQLTypeResolver(df.Descriptors, txn)
 }
@@ -1538,24 +1673,22 @@ type DistSQLTypeResolver struct {
 }
 
 // NewDistSQLTypeResolver creates a new DistSQLTypeResolver.
-func NewDistSQLTypeResolver(descs *Collection, txn *kv.Txn) *DistSQLTypeResolver {
-	return &DistSQLTypeResolver{
+func NewDistSQLTypeResolver(descs *Collection, txn *kv.Txn) DistSQLTypeResolver {
+	return DistSQLTypeResolver{
 		descriptors: descs,
 		txn:         txn,
 	}
 }
 
 // ResolveType implements the tree.TypeReferenceResolver interface.
-func (dt *DistSQLTypeResolver) ResolveType(
+func (dt DistSQLTypeResolver) ResolveType(
 	context.Context, *tree.UnresolvedObjectName,
 ) (*types.T, error) {
 	return nil, errors.AssertionFailedf("cannot resolve types in DistSQL by name")
 }
 
 // ResolveTypeByOID implements the tree.TypeReferenceResolver interface.
-func (dt *DistSQLTypeResolver) ResolveTypeByOID(
-	ctx context.Context, oid oid.Oid,
-) (*types.T, error) {
+func (dt DistSQLTypeResolver) ResolveTypeByOID(ctx context.Context, oid oid.Oid) (*types.T, error) {
 	name, desc, err := dt.GetTypeDescriptor(ctx, typedesc.UserDefinedTypeOIDToID(oid))
 	if err != nil {
 		return nil, err
@@ -1564,7 +1697,7 @@ func (dt *DistSQLTypeResolver) ResolveTypeByOID(
 }
 
 // GetTypeDescriptor implements the sqlbase.TypeDescriptorResolver interface.
-func (dt *DistSQLTypeResolver) GetTypeDescriptor(
+func (dt DistSQLTypeResolver) GetTypeDescriptor(
 	ctx context.Context, id descpb.ID,
 ) (tree.TypeName, catalog.TypeDescriptor, error) {
 	desc, err := dt.descriptors.getDescriptorVersionByID(
@@ -1582,7 +1715,7 @@ func (dt *DistSQLTypeResolver) GetTypeDescriptor(
 }
 
 // HydrateTypeSlice installs metadata into a slice of types.T's.
-func (dt *DistSQLTypeResolver) HydrateTypeSlice(ctx context.Context, typs []*types.T) error {
+func (dt DistSQLTypeResolver) HydrateTypeSlice(ctx context.Context, typs []*types.T) error {
 	for _, t := range typs {
 		if t.UserDefined() {
 			name, desc, err := dt.GetTypeDescriptor(ctx, typedesc.GetTypeDescID(t))

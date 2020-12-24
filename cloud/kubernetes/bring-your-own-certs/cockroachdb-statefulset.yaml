@@ -23,7 +23,7 @@ metadata:
   labels:
     app: cockroachdb
 ---
-apiVersion: rbac.authorization.k8s.io/v1beta1
+apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: cockroachdb
@@ -37,7 +37,7 @@ rules:
   verbs:
   - get
 ---
-apiVersion: rbac.authorization.k8s.io/v1beta1
+apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: cockroachdb
@@ -152,8 +152,19 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: cockroachdb
-        image: cockroachdb/cockroach:v20.1.8
+        image: cockroachdb/cockroach:v20.2.3
         imagePullPolicy: IfNotPresent
+        # TODO: Change these to appropriate values for the hardware that you're running. You can see
+        # the resources that can be allocated on each of your Kubernetes nodes by running:
+        #   kubectl describe nodes
+        # Note that requests and limits should have identical values.
+        # resources:
+        #   requests:
+        #     cpu: "16"
+        #     memory: "8Gi"
+        #   limits:
+        #     cpu: "16"
+        #     memory: "8Gi" 
         ports:
         - containerPort: 26257
           name: grpc

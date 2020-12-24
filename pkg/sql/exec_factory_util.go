@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -93,46 +94,21 @@ func makeScanColumnsConfig(table cat.Table, cols exec.TableColumnOrdinalSet) sca
 	// include (or not include). Note that when wantedColumns is non-empty,
 	// the visibility flag will never trigger the addition of more columns.
 	colCfg := scanColumnsConfig{
-		wantedColumns: make([]tree.ColumnID, 0, cols.Len()),
-		visibility:    execinfra.ScanVisibilityPublicAndNotPublic,
+		wantedColumns:         make([]tree.ColumnID, 0, cols.Len()),
+		wantedColumnsOrdinals: make([]uint32, 0, cols.Len()),
+		visibility:            execinfra.ScanVisibilityPublicAndNotPublic,
 	}
 	for ord, ok := cols.Next(0); ok; ord, ok = cols.Next(ord + 1) {
 		col := table.Column(ord)
+		colOrd := ord
 		if col.Kind() == cat.VirtualInverted {
-			col = table.Column(col.InvertedSourceColumnOrdinal())
+			colOrd = col.InvertedSourceColumnOrdinal()
+			col = table.Column(colOrd)
 		}
 		colCfg.wantedColumns = append(colCfg.wantedColumns, tree.ColumnID(col.ColID()))
+		colCfg.wantedColumnsOrdinals = append(colCfg.wantedColumnsOrdinals, uint32(colOrd))
 	}
 	return colCfg
-}
-
-func constructExplainDistSQLOrVecNode(
-	options *tree.ExplainOptions, stmtType tree.StatementType, p *planComponents, planner *planner,
-) (exec.Node, error) {
-	analyzeSet := options.Flags[tree.ExplainFlagAnalyze]
-
-	if options.Flags[tree.ExplainFlagEnv] {
-		return nil, errors.New("ENV only supported with (OPT) option")
-	}
-
-	switch options.Mode {
-	case tree.ExplainDistSQL:
-		return &explainDistSQLNode{
-			options:  options,
-			plan:     *p,
-			analyze:  analyzeSet,
-			stmtType: stmtType,
-		}, nil
-
-	case tree.ExplainVec:
-		return &explainVecNode{
-			options: options,
-			plan:    *p,
-		}, nil
-
-	default:
-		panic(errors.AssertionFailedf("unsupported explain mode %v", options.Mode))
-	}
 }
 
 // getResultColumnsForSimpleProject populates result columns for a simple
@@ -308,4 +284,12 @@ func constructOpaque(metadata opt.OpaqueMetadata) (planNode, error) {
 		return nil, errors.AssertionFailedf("unexpected OpaqueMetadata object type %T", metadata)
 	}
 	return o.plan, nil
+}
+
+func convertFastIntSetToUint32Slice(colIdxs util.FastIntSet) []uint32 {
+	cols := make([]uint32, 0, colIdxs.Len())
+	for i, ok := colIdxs.Next(0); ok; i, ok = colIdxs.Next(i + 1) {
+		cols = append(cols, uint32(i))
+	}
+	return cols
 }

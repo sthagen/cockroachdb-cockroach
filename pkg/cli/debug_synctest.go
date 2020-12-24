@@ -144,7 +144,7 @@ func runSyncer(
 	}
 
 	fmt.Fprintf(stderr, "verifying existing sequence numbers...")
-	if err := db.Iterate(roachpb.KeyMin, roachpb.KeyMax, check); err != nil {
+	if err := db.MVCCIterate(roachpb.KeyMin, roachpb.KeyMax, storage.MVCCKeyAndIntentsIterKind, check); err != nil {
 		return 0, err
 	}
 	// We must not lose writes, but sometimes we get extra ones (i.e. we caught an
@@ -184,10 +184,10 @@ func runSyncer(
 			}
 		}()
 
-		k, v := storage.MakeMVCCMetadataKey(key()), []byte("payload")
+		k, v := key(), []byte("payload")
 		switch seq % 2 {
 		case 0:
-			if err := db.Put(k, v); err != nil {
+			if err := db.PutUnversioned(k, v); err != nil {
 				seq--
 				return seq, err
 			}
@@ -197,7 +197,7 @@ func runSyncer(
 			}
 		default:
 			b := db.NewBatch()
-			if err := b.Put(k, v); err != nil {
+			if err := b.PutUnversioned(k, v); err != nil {
 				seq--
 				return seq, err
 			}

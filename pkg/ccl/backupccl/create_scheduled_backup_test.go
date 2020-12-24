@@ -140,7 +140,7 @@ func (h *testHelper) createBackupSchedule(
 		// Query system.scheduled_job table and load those schedules.
 		datums, cols, err := h.cfg.InternalExecutor.QueryWithCols(
 			context.Background(), "sched-load", nil,
-			sessiondata.InternalExecutorOverride{User: security.RootUser},
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			"SELECT * FROM system.scheduled_jobs WHERE schedule_id = $1",
 			id,
 		)
@@ -482,6 +482,11 @@ INSERT INTO t1 values (-1), (10), (-100);
 		return res
 	}
 
+	expectedSystemTables := make([]string, 0)
+	for systemTableName := range getSystemTablesToIncludeInClusterBackup() {
+		expectedSystemTables = append(expectedSystemTables, systemTableName)
+	}
+
 	testCases := []struct {
 		name         string
 		schedule     string
@@ -493,7 +498,7 @@ INSERT INTO t1 values (-1), (10), (-100);
 			verifyTables: expectBackupTables(
 				dbTables{"db", []string{"t1", "t2", "t3"}},
 				dbTables{"other_db", []string{"t1"}},
-				dbTables{"system", fullClusterSystemTables},
+				dbTables{"system", expectedSystemTables},
 			),
 		},
 		{
@@ -746,7 +751,7 @@ INSERT INTO t values (1), (10), (100);
 		ex, _, err := jobs.GetScheduledJobExecutor(tree.ScheduledBackupExecutor.InternalName())
 		require.NoError(t, err)
 		require.NotNil(t, ex.Metrics())
-		return &ex.Metrics().(*backupMetrics).ExecutorMetrics
+		return ex.Metrics().(*backupMetrics).ExecutorMetrics
 	}()
 
 	t.Run("retry", func(t *testing.T) {

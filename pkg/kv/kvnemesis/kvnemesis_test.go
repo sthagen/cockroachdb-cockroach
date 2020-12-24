@@ -57,7 +57,7 @@ func TestKVNemesisMultiNode(t *testing.T) {
 	// 4 nodes so we have somewhere to move 3x replicated ranges to.
 	const numNodes = 4
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{})
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{ReplicationMode: base.ReplicationManual})
 	defer tc.Stopper().Stop(ctx)
 	dbs, sqlDBs := make([]*kv.DB, numNodes), make([]*gosql.DB, numNodes)
 	for i := 0; i < numNodes; i++ {
@@ -98,7 +98,7 @@ func (x sqlClosedTimestampTargetInterval) Set(ctx context.Context, d time.Durati
 func (x sqlClosedTimestampTargetInterval) ResetToDefault(ctx context.Context) error {
 	var err error
 	for i, sqlDB := range x.sqlDBs {
-		q := fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration TO DEFAULT`)
+		q := `SET CLUSTER SETTING kv.closed_timestamp.target_duration TO DEFAULT`
 		if _, err = sqlDB.Exec(q); err == nil {
 			return nil
 		}

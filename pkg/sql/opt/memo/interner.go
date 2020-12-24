@@ -437,6 +437,15 @@ func (h *hasher) HashColList(val opt.ColList) {
 	h.hash = hash
 }
 
+func (h *hasher) HashOptionalColList(val opt.OptionalColList) {
+	hash := h.hash
+	for _, id := range val {
+		hash ^= internHash(id)
+		hash *= prime64
+	}
+	h.hash = hash
+}
+
 func (h *hasher) HashOrdering(val opt.Ordering) {
 	hash := h.hash
 	for _, id := range val {
@@ -645,6 +654,12 @@ func (h *hasher) HashFKChecksExpr(val FKChecksExpr) {
 	}
 }
 
+func (h *hasher) HashUniqueChecksExpr(val UniqueChecksExpr) {
+	for i := range val {
+		h.HashRelExpr(val[i].Check)
+	}
+}
+
 func (h *hasher) HashKVOptionsExpr(val KVOptionsExpr) {
 	for i := range val {
 		h.HashString(val[i].Key)
@@ -827,6 +842,10 @@ func (h *hasher) IsColSetEqual(l, r opt.ColSet) bool {
 }
 
 func (h *hasher) IsColListEqual(l, r opt.ColList) bool {
+	return l.Equals(r)
+}
+
+func (h *hasher) IsOptionalColListEqual(l, r opt.OptionalColList) bool {
 	return l.Equals(r)
 }
 
@@ -1039,6 +1058,18 @@ func (h *hasher) IsZipExprEqual(l, r ZipExpr) bool {
 }
 
 func (h *hasher) IsFKChecksExprEqual(l, r FKChecksExpr) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	for i := range l {
+		if l[i].Check != r[i].Check {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *hasher) IsUniqueChecksExprEqual(l, r UniqueChecksExpr) bool {
 	if len(l) != len(r) {
 		return false
 	}

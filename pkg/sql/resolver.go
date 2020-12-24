@@ -39,33 +39,14 @@ import (
 var _ resolver.SchemaResolver = &planner{}
 
 // ResolveUncachedDatabaseByName looks up a database name from the store.
+// TODO (lucy): See if we can rework the PlanHookState interface to just use
+// the desc.Collection methods directly.
 func (p *planner) ResolveUncachedDatabaseByName(
 	ctx context.Context, dbName string, required bool,
 ) (res *dbdesc.Immutable, err error) {
-	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		var desc catalog.DatabaseDescriptor
-		desc, err = p.LogicalSchemaAccessor().GetDatabaseDesc(
-			ctx, p.txn, p.ExecCfg().Codec, dbName, p.CommonLookupFlags(required),
-		)
-		if desc != nil {
-			res = desc.(*dbdesc.Immutable)
-		}
-	})
+	_, res, err = p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn, dbName,
+		tree.DatabaseLookupFlags{Required: required, AvoidCached: true})
 	return res, err
-}
-
-func (p *planner) ResolveMutableDatabaseDescriptor(
-	ctx context.Context, name string, required bool,
-) (*dbdesc.Mutable, error) {
-	desc, err := p.LogicalSchemaAccessor().GetDatabaseDesc(
-		ctx, p.txn, p.ExecCfg().Codec, name, tree.DatabaseLookupFlags{
-			Required:       required,
-			RequireMutable: true,
-		})
-	if err != nil || desc == nil {
-		return nil, err
-	}
-	return desc.(*dbdesc.Mutable), nil
 }
 
 // ResolveUncachedSchemaDescriptor looks up a schema from the store.
@@ -167,26 +148,32 @@ func (p *planner) ResolveUncachedTableDescriptor(
 
 func (p *planner) ResolveTargetObject(
 	ctx context.Context, un *tree.UnresolvedObjectName,
-) (res catalog.DatabaseDescriptor, namePrefix tree.ObjectNamePrefix, err error) {
+) (
+	db catalog.DatabaseDescriptor,
+	schema catalog.ResolvedSchema,
+	namePrefix tree.ObjectNamePrefix,
+	err error,
+) {
 	var prefix *catalog.ResolvedObjectPrefix
 	p.runWithOptions(resolveFlags{skipCache: true}, func() {
 		prefix, namePrefix, err = resolver.ResolveTargetObject(ctx, p, un)
 	})
 	if err != nil {
-		return nil, namePrefix, err
+		return nil, catalog.ResolvedSchema{}, namePrefix, err
 	}
-	return prefix.Database, namePrefix, err
+	return prefix.Database, prefix.Schema, namePrefix, err
 }
 
 // LookupSchema implements the tree.ObjectNameTargetResolver interface.
 func (p *planner) LookupSchema(
 	ctx context.Context, dbName, scName string,
 ) (found bool, scMeta tree.SchemaMeta, err error) {
-	sc := p.LogicalSchemaAccessor()
-	dbDesc, err := sc.GetDatabaseDesc(ctx, p.txn, p.ExecCfg().Codec, dbName, p.CommonLookupFlags(false /* required */))
-	if err != nil || dbDesc == nil {
+	found, dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn, dbName,
+		tree.DatabaseLookupFlags{AvoidCached: p.avoidCachedDescriptors})
+	if err != nil || !found {
 		return false, nil, err
 	}
+	sc := p.LogicalSchemaAccessor()
 	var resolvedSchema catalog.ResolvedSchema
 	found, resolvedSchema, err = sc.GetSchema(ctx, p.txn, p.ExecCfg().Codec, dbDesc.GetID(), scName,
 		p.CommonLookupFlags(false /* required */))
@@ -301,7 +288,8 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 		}
 		descs := make([]catalog.Descriptor, 0, len(targets.Databases))
 		for _, database := range targets.Databases {
-			descriptor, err := p.ResolveMutableDatabaseDescriptor(ctx, string(database), true /*required*/)
+			_, descriptor, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn,
+				string(database), tree.DatabaseLookupFlags{Required: true})
 			if err != nil {
 				return nil, err
 			}
@@ -338,14 +326,29 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 			return nil, errNoSchema
 		}
 		descs := make([]catalog.Descriptor, 0, len(targets.Schemas))
-		// Resolve the current database.
-		curDB, err := p.ResolveMutableDatabaseDescriptor(ctx, p.CurrentDatabase(), true /* required */)
-		if err != nil {
-			return nil, err
+
+		// Resolve the databases being changed
+		type schemaWithDBDesc struct {
+			schema string
+			dbDesc *dbdesc.Mutable
 		}
+		var targetSchemas []schemaWithDBDesc
 		for _, sc := range targets.Schemas {
+			dbName := p.CurrentDatabase()
+			if sc.ExplicitCatalog {
+				dbName = sc.Catalog()
+			}
+			_, db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, dbName,
+				tree.DatabaseLookupFlags{Required: true})
+			if err != nil {
+				return nil, err
+			}
+			targetSchemas = append(targetSchemas, schemaWithDBDesc{schema: sc.Schema(), dbDesc: db})
+		}
+
+		for _, sc := range targetSchemas {
 			_, resSchema, err := p.ResolveMutableSchemaDescriptor(
-				ctx, curDB.ID, string(sc), true /* required */)
+				ctx, sc.dbDesc.ID, sc.schema, true /* required */)
 			if err != nil {
 				return nil, err
 			}
@@ -613,7 +616,7 @@ func (r *fkSelfResolver) LookupObject(
 		if lookupFlags.RequireMutable {
 			return true, table, nil
 		}
-		return true, &table.Immutable, nil
+		return true, table.ImmutableCopy(), nil
 	}
 	lookupFlags.IncludeOffline = false
 	return r.SchemaResolver.LookupObject(ctx, lookupFlags, dbName, scName, tbName)
@@ -638,6 +641,7 @@ type internalLookupCtx struct {
 	dbIDs       []descpb.ID
 	dbDescs     map[descpb.ID]*dbdesc.Immutable
 	schemaDescs map[descpb.ID]*schemadesc.Immutable
+	schemaNames map[descpb.ID]string
 	schemaIDs   []descpb.ID
 	tbDescs     map[descpb.ID]*tabledesc.Immutable
 	tbIDs       []descpb.ID
@@ -724,6 +728,9 @@ func newInternalLookupCtx(
 	dbNames := make(map[descpb.ID]string)
 	dbDescs := make(map[descpb.ID]*dbdesc.Immutable)
 	schemaDescs := make(map[descpb.ID]*schemadesc.Immutable)
+	schemaNames := map[descpb.ID]string{
+		keys.PublicSchemaID: tree.PublicSchema,
+	}
 	tbDescs := make(map[descpb.ID]*tabledesc.Immutable)
 	typDescs := make(map[descpb.ID]*typedesc.Immutable)
 	var tbIDs, typIDs, dbIDs, schemaIDs []descpb.ID
@@ -754,6 +761,7 @@ func newInternalLookupCtx(
 			if prefix == nil || prefix.GetID() == desc.ParentID {
 				// Only make the schema visible for iteration if the prefix was included.
 				schemaIDs = append(schemaIDs, desc.GetID())
+				schemaNames[desc.GetID()] = desc.GetName()
 			}
 		}
 	}
@@ -762,6 +770,7 @@ func newInternalLookupCtx(
 		dbNames:     dbNames,
 		dbDescs:     dbDescs,
 		schemaDescs: schemaDescs,
+		schemaNames: schemaNames,
 		schemaIDs:   schemaIDs,
 		tbDescs:     tbDescs,
 		typDescs:    typDescs,

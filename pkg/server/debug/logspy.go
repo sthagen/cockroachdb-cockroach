@@ -22,6 +22,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -158,9 +161,10 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 		if err == nil {
 			if dropped := atomic.LoadInt32(&countDropped); dropped > 0 {
 				entry := log.MakeEntry(
-					ctx, log.Severity_WARNING, nil /* LogCounter */, 0 /* depth */, false, /* redactable */
+					ctx, severity.WARNING, channel.DEV,
+					0 /* depth */, false, /* redactable */
 					"%d messages were dropped", log.Safe(dropped))
-				err = entry.Format(w) // modify return value
+				err = log.FormatEntry(entry, w) // modify return value
 			}
 		}
 	}()
@@ -169,16 +173,17 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 	// because we don't know when that is safe. This is sketchy in general but
 	// OK here since we don't have to guarantee that the channel is fully
 	// consumed.
-	entries := make(chan log.Entry, logSpyChanCap)
+	entries := make(chan logpb.Entry, logSpyChanCap)
 
 	{
 		entry := log.MakeEntry(
-			ctx, log.Severity_INFO, nil /* LogCounter */, 0 /* depth */, false, /* redactable */
+			ctx, severity.INFO, channel.DEV,
+			0 /* depth */, false, /* redactable */
 			"intercepting logs with options %+v", opts)
 		entries <- entry
 	}
 
-	spy.setIntercept(ctx, func(entry log.Entry) {
+	spy.setIntercept(ctx, func(entry logpb.Entry) {
 		if re := opts.Grep.re; re != nil {
 			switch {
 			case re.MatchString(entry.Tags):
@@ -210,10 +215,10 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 	for {
 		select {
 		case <-done:
-
 			return
+
 		case entry := <-entries:
-			if err := entry.Format(w); err != nil {
+			if err := log.FormatEntry(entry, w); err != nil {
 				return errors.Wrapf(err, "while writing entry %v", entry)
 			}
 			count++
@@ -223,6 +228,7 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 			if done == nil {
 				done = ctx.Done()
 			}
+
 		case <-flushTimer.C:
 			flushTimer.Read = true
 			flushTimer.Reset(flushInterval)

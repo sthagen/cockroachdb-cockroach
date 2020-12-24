@@ -49,6 +49,9 @@ const (
 // while DWithinExclusive == (Distance < x).
 type FnExclusivity bool
 
+// MaxAllowedSplitPoints is the maximum number of points any spatial function may split to.
+const MaxAllowedSplitPoints = 65336
+
 const (
 	// FnExclusive indicates that the corresponding geo function should have
 	// exclusive semantics.
@@ -181,7 +184,9 @@ func MustParseGeometryFromEWKB(ewkb geopb.EWKB) Geometry {
 
 // ParseGeometryFromGeoJSON parses the GeoJSON into a given Geometry.
 func ParseGeometryFromGeoJSON(json []byte) (Geometry, error) {
-	g, err := parseGeoJSON(geopb.SpatialObjectType_GeometryType, json, geopb.DefaultGeometrySRID)
+	// Note we set SRID to 4326 from here, to match PostGIS's behavior as per
+	// RFC7946 (https://tools.ietf.org/html/rfc7946#section-4).
+	g, err := parseGeoJSON(geopb.SpatialObjectType_GeometryType, json, geopb.DefaultGeographySRID)
 	if err != nil {
 		return Geometry{}, err
 	}

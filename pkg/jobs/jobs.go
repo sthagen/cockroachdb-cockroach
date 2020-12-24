@@ -30,9 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"github.com/opentracing/opentracing-go"
 )
 
 // Job manages logging the progress of long-running system processes, like
@@ -65,7 +65,7 @@ type CreatedByInfo struct {
 type Record struct {
 	Description   string
 	Statement     string
-	Username      string
+	Username      security.SQLUsername
 	DescriptorIDs descpb.IDs
 	Details       jobspb.Details
 	Progress      jobspb.ProgressDetails
@@ -89,7 +89,7 @@ type StartableJob struct {
 	resumerCtx context.Context
 	cancel     context.CancelFunc
 	resultsCh  chan<- tree.Datums
-	span       opentracing.Span
+	span       *tracing.Span
 	starts     int64 // used to detect multiple calls to Start()
 }
 
@@ -499,9 +499,9 @@ func (j *Job) pauseRequested(ctx context.Context, fn onPauseRequestFunc) error {
 			return fmt.Errorf("job with status %s cannot be requested to be paused", md.Status)
 		}
 		if fn != nil {
-			phs, cleanup := j.registry.planFn("pause request", j.Payload().Username)
+			execCtx, cleanup := j.registry.execCtx("pause request", j.Payload().UsernameProto.Decode())
 			defer cleanup()
-			if err := fn(ctx, phs, txn, md.Progress); err != nil {
+			if err := fn(ctx, execCtx, txn, md.Progress); err != nil {
 				return err
 			}
 			ju.UpdateProgress(md.Progress)
@@ -716,13 +716,13 @@ func (j *Job) load(ctx context.Context) error {
 	if err := j.runInTxn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		const newStmt = "SELECT payload, progress, created_by_type, created_by_id FROM system.jobs WHERE id = $1"
 		const oldStmt = "SELECT payload, progress FROM system.jobs WHERE id = $1"
-		hasCreatedBy := j.registry.settings.Version.IsActive(ctx, clusterversion.VersionAlterSystemJobsAddCreatedByColumns)
+		hasCreatedBy := j.registry.settings.Version.IsActive(ctx, clusterversion.AlterSystemJobsAddCreatedByColumns)
 		stmt := oldStmt
 		if hasCreatedBy {
 			stmt = newStmt
 		}
 		row, err := j.registry.ex.QueryRowEx(
-			ctx, "load-job-query", txn, sessiondata.InternalExecutorOverride{User: security.RootUser},
+			ctx, "load-job-query", txn, sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			stmt, *j.ID())
 		if err != nil {
 			return err

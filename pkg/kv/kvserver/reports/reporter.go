@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -41,12 +42,13 @@ import (
 
 // ReporterInterval is the interval between two generations of the reports.
 // When set to zero - disables the report generation.
-var ReporterInterval = settings.RegisterPublicNonNegativeDurationSetting(
+var ReporterInterval = settings.RegisterDurationSetting(
 	"kv.replication_reports.interval",
 	"the frequency for generating the replication_constraint_stats, replication_stats_report and "+
 		"replication_critical_localities reports (set to 0 to disable)",
 	time.Minute,
-)
+	settings.NonNegativeDuration,
+).WithPublic()
 
 // Reporter periodically produces a couple of reports on the cluster's data
 // distribution: the system tables: replication_constraint_stats,
@@ -60,7 +62,7 @@ type Reporter struct {
 	latestConfig *config.SystemConfig
 
 	db        *kv.DB
-	liveness  *kvserver.NodeLiveness
+	liveness  *liveness.NodeLiveness
 	settings  *cluster.Settings
 	storePool *kvserver.StorePool
 	executor  sqlutil.InternalExecutor
@@ -78,7 +80,7 @@ func NewReporter(
 	localStores *kvserver.Stores,
 	storePool *kvserver.StorePool,
 	st *cluster.Settings,
-	liveness *kvserver.NodeLiveness,
+	liveness *liveness.NodeLiveness,
 	executor sqlutil.InternalExecutor,
 ) *Reporter {
 	r := Reporter{
@@ -784,7 +786,7 @@ func getReportGenerationTime(
 		ctx,
 		"get-previous-timestamp",
 		txn,
-		sessiondata.InternalExecutorOverride{User: security.NodeUser},
+		sessiondata.InternalExecutorOverride{User: security.NodeUserName()},
 		"select generated from system.reports_meta where id = $1",
 		rid,
 	)

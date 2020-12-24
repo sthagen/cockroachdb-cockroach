@@ -22,11 +22,11 @@ import (
 func ComputeStatsForRange(
 	d *roachpb.RangeDescriptor, reader storage.Reader, nowNanos int64,
 ) (enginepb.MVCCStats, error) {
-	iter := reader.NewIterator(storage.IterOptions{UpperBound: d.EndKey.AsRawKey()})
+	iter := reader.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: d.EndKey.AsRawKey()})
 	defer iter.Close()
 
 	ms := enginepb.MVCCStats{}
-	for _, keyRange := range MakeReplicatedKeyRanges(d) {
+	for _, keyRange := range MakeReplicatedKeyRangesExceptLockTable(d) {
 		msDelta, err := iter.ComputeStats(keyRange.Start.Key, keyRange.End.Key, nowNanos)
 		if err != nil {
 			return enginepb.MVCCStats{}, err

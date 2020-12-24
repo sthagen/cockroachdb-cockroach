@@ -567,20 +567,6 @@ func execCmdWithBuffer(ctx context.Context, l *logger, args ...string) ([]byte, 
 	return out, nil
 }
 
-// execCmdWithStdout executes the given command and returns its stdout
-// output. If the return code is not 0, an error is also returned.
-// l is used to log the command before running it. No output is logged.
-func execCmdWithStdout(ctx context.Context, l *logger, args ...string) ([]byte, error) {
-	l.Printf("> %s\n", strings.Join(args, " "))
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-
-	out, err := cmd.Output()
-	if err != nil {
-		return out, errors.Wrapf(err, `%s`, strings.Join(args, ` `))
-	}
-	return out, nil
-}
-
 func makeGCEClusterName(name string) string {
 	name = strings.ToLower(name)
 	name = regexp.MustCompile(`[^-a-z0-9]+`).ReplaceAllString(name, "-")
@@ -1983,6 +1969,28 @@ func (c *cluster) PutLibraries(ctx context.Context, libraryDir string) error {
 	return nil
 }
 
+// Stage stages a binary to the cluster.
+func (c *cluster) Stage(
+	ctx context.Context, l *logger, application, versionOrSHA, dir string, opts ...option,
+) error {
+	if ctx.Err() != nil {
+		return errors.Wrap(ctx.Err(), "cluster.Stage")
+	}
+
+	c.status("staging binary")
+	defer c.status("")
+
+	args := []string{roachprod, "stage", c.makeNodes(opts...), application, versionOrSHA}
+	if dir != "" {
+		args = append(args, fmt.Sprintf("--dir='%s'", dir))
+	}
+	err := execCmd(ctx, c.l, args...)
+	if err != nil {
+		return errors.Wrap(err, "cluster.Stage")
+	}
+	return nil
+}
+
 // Get gets files from remote hosts.
 func (c *cluster) Get(ctx context.Context, l *logger, src, dest string, opts ...option) error {
 	if ctx.Err() != nil {
@@ -2306,18 +2314,6 @@ func (c *cluster) RunWithBuffer(
 		append([]string{roachprod, "run", c.makeNodes(node), "--"}, args...)...)
 }
 
-// RunWithStdout runs a command on the specified node, returning the resulting
-// stdout.
-func (c *cluster) RunWithStdout(
-	ctx context.Context, l *logger, node nodeListOption, args ...string,
-) ([]byte, error) {
-	if err := errors.Wrap(ctx.Err(), "cluster.RunWithStdout"); err != nil {
-		return nil, err
-	}
-	return execCmdWithStdout(ctx, l,
-		append([]string{roachprod, "run", c.makeNodes(node), "--"}, args...)...)
-}
-
 // pgURL returns the Postgres endpoint for the specified node. It accepts a flag
 // specifying whether the URL should include the node's internal or external IP
 // address. In general, inter-cluster communication and should use internal IPs
@@ -2534,8 +2530,12 @@ func getDiskUsageInBytes(
 		// TODO(bdarnell): Refactor this stack to not combine stdout and
 		// stderr so we don't need to do this (and the Warning check
 		// below).
-		out, err = c.RunWithBuffer(ctx, logger, c.Node(nodeIdx),
-			fmt.Sprint("du -sk {store-dir} 2>/dev/null | grep -oE '^[0-9]+'"))
+		out, err = c.RunWithBuffer(
+			ctx,
+			logger,
+			c.Node(nodeIdx),
+			"du -sk {store-dir} 2>/dev/null | grep -oE '^[0-9]+'",
+		)
 		if err != nil {
 			if ctx.Err() != nil {
 				return 0, ctx.Err()

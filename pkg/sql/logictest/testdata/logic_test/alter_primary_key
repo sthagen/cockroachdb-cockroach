@@ -117,15 +117,17 @@ SELECT * FROM parent
 1 2
 4 5
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM child WHERE x >= 1 AND x < 5 AND y >= 2 AND y <= 6] OFFSET 2
 ----
-filter     ·              ·
- │         filter         (y >= 2) AND (y <= 6)
- └── scan  ·              ·
-·          missing stats  ·
-·          table          child@primary
-·          spans          [/1/2 - /4/6]
+·
+• filter
+│ filter: (y >= 2) AND (y <= 6)
+│
+└── • scan
+      missing stats
+      table: child@primary
+      spans: [/1/2 - /4/6]
 
 query III rowsort
 SELECT * FROM child WHERE x >= 1 AND x < 5 AND y >= 2 AND y <= 6
@@ -172,13 +174,14 @@ child  CREATE TABLE public.child (
        FAMILY fam_0_x_y_z (x, y, z)
 )
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM child WHERE y >=2 AND y <= 6] OFFSET 2
 ----
-scan  ·              ·
-·     missing stats  ·
-·     table          child@primary
-·     spans          [/2 - /6]
+·
+• scan
+  missing stats
+  table: child@primary
+  spans: [/2 - /6]
 
 query III rowsort
 SELECT * FROM child WHERE y >=2 AND y <= 6
@@ -220,13 +223,14 @@ child                                     CREATE TABLE public.child (
 
 # If child@i was not properly rewritten, we wouldn't be able to select
 # all columns in child from it without an index join
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM child@i] OFFSET 2
 ----
-scan  ·              ·
-·     missing stats  ·
-·     table          child@i
-·     spans          FULL SCAN
+·
+• scan
+  missing stats
+  table: child@i
+  spans: FULL SCAN
 
 query IIII
 SELECT * FROM child@i
@@ -381,90 +385,102 @@ SELECT index_id, index_name FROM crdb_internal.table_indexes WHERE descriptor_na
 
 # Make sure that each index can index join against the new primary key;
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i1] OFFSET 2
 ----
-index join  ·              ·
- │          table          t@primary
- └── scan   ·              ·
-·           missing stats  ·
-·           table          t@i1
-·           spans          FULL SCAN
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i1
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i1
 ----
 1 2 3 4 {}
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i2] OFFSET 2
 ----
-index join  ·              ·
- │          table          t@primary
- └── scan   ·              ·
-·           missing stats  ·
-·           table          t@i2
-·           spans          FULL SCAN
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i2
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i2
 ----
 1 2 3 4 {}
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i3] OFFSET 2
 ----
-index join  ·              ·
- │          table          t@primary
- └── scan   ·              ·
-·           missing stats  ·
-·           table          t@i3
-·           spans          FULL SCAN
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i3
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i3
 ----
 1 2 3 4 {}
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i4] OFFSET 2
 ----
-index join  ·              ·
- │          table          t@primary
- └── scan   ·              ·
-·           missing stats  ·
-·           table          t@i4
-·           spans          FULL SCAN
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i4
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i4
 ----
 1 2 3 4 {}
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i5] OFFSET 2
 ----
-index join  ·              ·
- │          table          t@primary
- └── scan   ·              ·
-·           missing stats  ·
-·           table          t@i5
-·           spans          FULL SCAN
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i5
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i5
 ----
 1 2 3 4 {}
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i7] OFFSET 2
 ----
-index join  ·              ·
- │          table          t@primary
- └── scan   ·              ·
-·           missing stats  ·
-·           table          t@i7
-·           spans          FULL SCAN
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i7
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i5
@@ -498,13 +514,14 @@ t  CREATE TABLE public.t (
    FAMILY fam_0_x_y_z_crdb_internal_z_shard_5 (x, y, z, crdb_internal_z_shard_5, crdb_internal_y_shard_10)
 )
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN INSERT INTO t VALUES (4, 5, 6)] OFFSET 2
 ----
-insert fast path  ·            ·
-·                 into         t(x, y, z, crdb_internal_z_shard_5, crdb_internal_y_shard_10)
-·                 auto commit  ·
-·                 size         7 columns, 1 row
+·
+• insert fast path
+  into: t(x, y, z, crdb_internal_z_shard_5, crdb_internal_y_shard_10)
+  auto commit
+  size: 7 columns, 1 row
 
 # Ensure that all of the indexes have been rewritten.
 query IT
@@ -709,16 +726,22 @@ t  CREATE TABLE public.t (
 statement ok
 DROP TABLE IF EXISTS t;
 CREATE TABLE t (x INT NOT NULL);
-ALTER TABLE t ADD CONSTRAINT "primary" PRIMARY KEY (x)
+ALTER TABLE t ADD CONSTRAINT "my_pk" PRIMARY KEY (x)
 
 query TT
 SHOW CREATE t
 ----
 t  CREATE TABLE public.t (
    x INT8 NOT NULL,
-   CONSTRAINT "primary" PRIMARY KEY (x ASC),
+   CONSTRAINT my_pk PRIMARY KEY (x ASC),
    FAMILY "primary" (x, rowid)
 )
+
+statement ok
+CREATE INDEX i ON t (x);
+
+statement error pq: constraint with name i already exists
+ALTER TABLE t DROP CONSTRAINT "my_pk", ADD CONSTRAINT "i" PRIMARY KEY (x);
 
 # Regression for #45362.
 statement ok
@@ -1175,3 +1198,18 @@ CREATE TABLE t (x INT, y INT, z INT, PRIMARY KEY (x, y));
 ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y);
 SET sql_safe_updates=false;
 ALTER TABLE t DROP COLUMN z
+
+# Regression for #54629.
+statement ok
+CREATE TABLE t54629 (c INT NOT NULL, UNIQUE INDEX (c));
+ALTER TABLE t54629 ALTER PRIMARY KEY USING COLUMNS (c);
+INSERT INTO t54629 VALUES (1);
+DELETE FROM t54629 WHERE c = 1
+
+statement ok
+DROP TABLE t54629;
+CREATE TABLE t54629(a INT PRIMARY KEY, c INT NOT NULL, UNIQUE INDEX (c));
+ALTER TABLE t54629 ALTER PRIMARY KEY USING COLUMNS (c);
+DROP INDEX t54629_a_key CASCADE;
+INSERT INTO t54629 VALUES (1, 1);
+DELETE FROM t54629 WHERE c = 1;

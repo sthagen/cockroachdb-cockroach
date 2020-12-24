@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -36,6 +37,14 @@ type dropTypeNode struct {
 var _ planNode = &dropTypeNode{n: nil}
 
 func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"DROP TYPE",
+	); err != nil {
+		return nil, err
+	}
+
 	node := &dropTypeNode{
 		n:  n,
 		td: make(map[descpb.ID]*typedesc.Mutable),
@@ -64,6 +73,15 @@ func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, err
 				"%q is an implicit array type and cannot be modified",
 				name,
 			)
+		case descpb.TypeDescriptor_MULTIREGION_ENUM:
+			// Multi-region enums are not directly droppable.
+			return nil, errors.WithHintf(
+				pgerror.Newf(
+					pgcode.DependentObjectsStillExist,
+					"%q is a multi-region enum and cannot be modified directly",
+					name,
+				),
+				"try ALTER DATABASE DROP REGION %s", name)
 		case descpb.TypeDescriptor_ENUM:
 			sqltelemetry.IncrementEnumCounter(sqltelemetry.EnumDrop)
 		}
@@ -125,18 +143,9 @@ func (n *dropTypeNode) startExec(params runParams) error {
 			return err
 		}
 		// Log a Drop Type event.
-		if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			params.ctx,
-			params.p.txn,
-			EventLogDropType,
-			int32(typ.ID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				TypeName  string
-				Statement string
-				User      string
-			}{typ.Name, tree.AsStringWithFQNames(n.n, params.Ann()), params.SessionData().User},
-		); err != nil {
+		// TODO(knz): This logging is imperfect, see this issue:
+		// https://github.com/cockroachdb/cockroach/issues/57734
+		if err := params.p.logEvent(params.ctx, typ.ID, &eventpb.DropType{TypeName: typ.Name}); err != nil {
 			return err
 		}
 	}

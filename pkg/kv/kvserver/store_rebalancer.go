@@ -26,7 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"go.etcd.io/etcd/raft"
+	"github.com/cockroachdb/redact"
+	"go.etcd.io/etcd/raft/v3"
 )
 
 const (
@@ -73,7 +74,7 @@ func makeStoreRebalancerMetrics() StoreRebalancerMetrics {
 // LoadBasedRebalancingMode controls whether range rebalancing takes
 // additional variables such as write load and disk usage into account.
 // If disabled, rebalancing is done purely based on replica count.
-var LoadBasedRebalancingMode = settings.RegisterPublicEnumSetting(
+var LoadBasedRebalancingMode = settings.RegisterEnumSetting(
 	"kv.allocator.load_based_rebalancing",
 	"whether to rebalance based on the distribution of QPS across stores",
 	"leases and replicas",
@@ -82,7 +83,7 @@ var LoadBasedRebalancingMode = settings.RegisterPublicEnumSetting(
 		int64(LBRebalancingLeasesOnly):        "leases",
 		int64(LBRebalancingLeasesAndReplicas): "leases and replicas",
 	},
-)
+).WithPublic()
 
 // qpsRebalanceThreshold is much like rangeRebalanceThreshold, but for
 // QPS rather than range count. This should be set higher than
@@ -90,10 +91,11 @@ var LoadBasedRebalancingMode = settings.RegisterPublicEnumSetting(
 // workloads change and clients come and go, so we need to be a little more
 // forgiving to avoid thrashing.
 var qpsRebalanceThreshold = func() *settings.FloatSetting {
-	s := settings.RegisterNonNegativeFloatSetting(
+	s := settings.RegisterFloatSetting(
 		"kv.allocator.qps_rebalance_threshold",
 		"minimum fraction away from the mean a store's QPS (such as queries per second) can be before it is considered overfull or underfull",
 		0.25,
+		settings.NonNegativeFloat,
 	)
 	s.SetVisibility(settings.Public)
 	return s
@@ -417,7 +419,7 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 			}
 
 			meanQPS := storeList.candidateQueriesPerSecond.mean
-			if shouldNotMoveTo(ctx, storeMap, replWithStats, candidate.StoreID, meanQPS, minQPS, maxQPS) {
+			if sr.shouldNotMoveTo(ctx, storeMap, replWithStats, candidate.StoreID, meanQPS, minQPS, maxQPS) {
 				continue
 			}
 
@@ -521,6 +523,13 @@ func (sr *StoreRebalancer) chooseReplicaToRebalance(
 			// could cause mass evictions if the storePool gets out of sync.
 			storeDesc, ok := storeMap[currentReplicas[i].StoreID]
 			if !ok || storeDesc.Capacity.QueriesPerSecond < maxQPS {
+				if log.V(3) {
+					var reason redact.RedactableString
+					if ok {
+						reason = redact.Sprintf(" (qps %.2f vs max %.2f)", storeDesc.Capacity.QueriesPerSecond, maxQPS)
+					}
+					log.VEventf(ctx, 3, "keeping r%d/%d on s%d%s", desc.RangeID, currentReplicas[i].ReplicaID, currentReplicas[i].StoreID, reason)
+				}
 				targets = append(targets, roachpb.ReplicationTarget{
 					NodeID:  currentReplicas[i].NodeID,
 					StoreID: currentReplicas[i].StoreID,
@@ -553,7 +562,7 @@ func (sr *StoreRebalancer) chooseReplicaToRebalance(
 			}
 
 			meanQPS := storeList.candidateQueriesPerSecond.mean
-			if shouldNotMoveTo(ctx, storeMap, replWithStats, target.StoreID, meanQPS, minQPS, maxQPS) {
+			if sr.shouldNotMoveTo(ctx, storeMap, replWithStats, target.StoreID, meanQPS, minQPS, maxQPS) {
 				break
 			}
 
@@ -634,7 +643,7 @@ func shouldNotMoveAway(
 	return false
 }
 
-func shouldNotMoveTo(
+func (sr *StoreRebalancer) shouldNotMoveTo(
 	ctx context.Context,
 	storeMap map[roachpb.StoreID]*roachpb.StoreDescriptor,
 	replWithStats replicaWithStats,
@@ -664,6 +673,16 @@ func shouldNotMoveTo(
 		return true
 	}
 
+	// If the target store is on a separate node, we will also care
+	// about node liveness.
+	targetNodeID := storeDesc.Node.NodeID
+	if targetNodeID != sr.rq.store.Ident.NodeID {
+		if !sr.rq.store.cfg.StorePool.isNodeReadyForRoutineReplicaTransfer(ctx, targetNodeID) {
+			log.VEventf(ctx, 3,
+				"refusing to transfer replica to n%d/s%d", targetNodeID, storeDesc.StoreID)
+			return true
+		}
+	}
 	return false
 }
 

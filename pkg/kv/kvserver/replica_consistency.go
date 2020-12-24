@@ -15,10 +15,8 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
-	"math"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -34,9 +32,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -235,10 +233,10 @@ func (r *Replica) CheckConsistency(
 			// are consistent. Verify this only for clusters that started out on 19.1 or
 			// higher.
 			if !v.Less(roachpb.Version{Major: 19, Minor: 1}) {
-				// If version >= 19.1 but < VersionAbortSpanBytes, we want to ignore any delta
+				// If version >= 19.1 but < AbortSpanBytes, we want to ignore any delta
 				// in AbortSpanBytes when comparing stats since older versions will not be
 				// tracking abort span bytes.
-				if v.Less(clusterversion.VersionByKey(clusterversion.VersionAbortSpanBytes)) {
+				if v.Less(clusterversion.ByKey(clusterversion.AbortSpanBytes)) {
 					delta.AbortSpanBytes = 0
 					haveDelta = delta != enginepb.MVCCStats{}
 				}
@@ -294,15 +292,13 @@ func (r *Replica) CheckConsistency(
 		log.Errorf(ctx, "consistency check failed; fetching details and shutting down minority %v", tmp)
 	}
 
-	// We've noticed in practice that if the snapshot diff is large, the log
-	// file in it is promptly rotated away, so up the limits while the diff
-	// printing occurs.
+	// We've noticed in practice that if the snapshot diff is large, the
+	// log file to which it is printed is promptly rotated away, so up
+	// the limits while the diff printing occurs.
 	//
 	// See:
 	// https://github.com/cockroachdb/cockroach/issues/36861
-	oldLogLimit := atomic.LoadInt64(&log.LogFilesCombinedMaxSize)
-	atomic.CompareAndSwapInt64(&log.LogFilesCombinedMaxSize, oldLogLimit, math.MaxInt64)
-	defer atomic.CompareAndSwapInt64(&log.LogFilesCombinedMaxSize, math.MaxInt64, oldLogLimit)
+	defer log.TemporarilyDisableFileGCForMainLogger()()
 
 	if _, pErr := r.CheckConsistency(ctx, args); pErr != nil {
 		log.Errorf(ctx, "replica inconsistency detected; could not obtain actual diff: %s", pErr)
@@ -570,12 +566,12 @@ func (r *Replica) sha512(
 	snap storage.Reader,
 	snapshot *roachpb.RaftSnapshotData,
 	mode roachpb.ChecksumMode,
-	limiter *limit.LimiterBurstDisabled,
+	limiter *quotapool.RateLimiter,
 ) (*replicaHash, error) {
 	statsOnly := mode == roachpb.ChecksumMode_CHECK_STATS
 
 	// Iterate over all the data in the range.
-	iter := snap.NewIterator(storage.IterOptions{UpperBound: desc.EndKey.AsRawKey()})
+	iter := snap.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: desc.EndKey.AsRawKey()})
 	defer iter.Close()
 
 	var alloc bufalloc.ByteAllocator
@@ -586,7 +582,7 @@ func (r *Replica) sha512(
 
 	visitor := func(unsafeKey storage.MVCCKey, unsafeValue []byte) error {
 		// Rate Limit the scan through the range
-		if err := limiter.WaitN(ctx, len(unsafeKey.Key)+len(unsafeValue)); err != nil {
+		if err := limiter.WaitN(ctx, int64(len(unsafeKey.Key)+len(unsafeValue))); err != nil {
 			return err
 		}
 
@@ -612,7 +608,7 @@ func (r *Replica) sha512(
 		if _, err := hasher.Write(unsafeKey.Key); err != nil {
 			return err
 		}
-		legacyTimestamp = hlc.LegacyTimestamp(unsafeKey.Timestamp)
+		legacyTimestamp = unsafeKey.Timestamp.ToLegacyTimestamp()
 		if size := legacyTimestamp.Size(); size > cap(timestampBuf) {
 			timestampBuf = make([]byte, size)
 		} else {
@@ -632,8 +628,14 @@ func (r *Replica) sha512(
 	// In statsOnly mode, we hash only the RangeAppliedState. In regular mode, hash
 	// all of the replicated key space.
 	if !statsOnly {
-		for _, span := range rditer.MakeReplicatedKeyRanges(&desc) {
-			spanMS, err := storage.ComputeStatsGo(
+		// Do not want the lock table ranges since the iter has been constructed
+		// using MVCCKeyAndIntentsIterKind.
+		//
+		// TODO(sumeer): When we have replicated locks other than exclusive locks,
+		// we will probably not have any interleaved intents so we could stop
+		// using MVCCKeyAndIntentsIterKind and consider all locks here.
+		for _, span := range rditer.MakeReplicatedKeyRangesExceptLockTable(&desc) {
+			spanMS, err := storage.ComputeStatsForRange(
 				iter, span.Start.Key, span.End.Key, 0 /* nowNanos */, visitor,
 			)
 			if err != nil {

@@ -65,12 +65,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-const (
-	// TestUser is a fixed user used in unittests.
-	// It has valid embedded client certs.
-	TestUser = "testuser"
-)
-
 // makeTestConfig returns a config for testing. It overrides the
 // Certs with the test certs directory.
 // We need to override the certs loader.
@@ -105,7 +99,7 @@ func makeTestBaseConfig(st *cluster.Settings) BaseConfig {
 	baseCfg.SplitListenSQL = true
 	baseCfg.HTTPAddr = util.TestAddr.String()
 	// Set standard user for intra-cluster traffic.
-	baseCfg.User = security.NodeUser
+	baseCfg.User = security.NodeUserName()
 	return baseCfg
 }
 
@@ -210,6 +204,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.SQLAddr != "" {
 		cfg.SQLAddr = params.SQLAddr
 		cfg.SQLAdvertiseAddr = params.SQLAddr
+		cfg.SplitListenSQL = true
 	}
 	if params.HTTPAddr != "" {
 		cfg.HTTPAddr = params.HTTPAddr
@@ -347,10 +342,10 @@ func (ts *TestServer) JobRegistry() interface{} {
 	return nil
 }
 
-// MigrationManager returns the *sqlmigrations.Manager as an interface{}.
-func (ts *TestServer) MigrationManager() interface{} {
+// SQLMigrationsManager returns the *sqlmigrations.Manager as an interface{}.
+func (ts *TestServer) SQLMigrationsManager() interface{} {
 	if ts != nil {
-		return ts.sqlServer.migMgr
+		return ts.sqlServer.sqlmigrationsMgr
 	}
 	return nil
 }
@@ -531,6 +526,18 @@ func makeSQLServerArgs(
 	runtime := status.NewRuntimeStatSampler(context.Background(), clock)
 	registry.AddMetricStruct(runtime)
 
+	esb := &externalStorageBuilder{}
+	externalStorage := func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.
+		ExternalStorage, error) {
+		return esb.makeExternalStorage(ctx, dest)
+	}
+	externalStorageFromURI := func(ctx context.Context, uri string,
+		user security.SQLUsername) (cloud.ExternalStorage, error) {
+		return esb.makeExternalStorageFromURI(ctx, uri, user)
+	}
+
+	esb.init(base.ExternalIODirConfig{}, baseCfg.Settings, nil, circularInternalExecutor, db)
+
 	// We don't need this for anything except some services that want a gRPC
 	// server to register against (but they'll never get RPCs at the time of
 	// writing): the blob service and DistSQL.
@@ -545,14 +552,9 @@ func makeSQLServerArgs(
 			isMeta1Leaseholder: func(_ context.Context, timestamp hlc.Timestamp) (bool, error) {
 				return false, errors.New("isMeta1Leaseholder is not available to secondary tenants")
 			},
-			nodeIDContainer: idContainer,
-			externalStorage: func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
-				return nil, errors.New("external storage is not available to secondary tenants")
-			},
-			externalStorageFromURI: func(ctx context.Context,
-				uri, user string) (cloud.ExternalStorage, error) {
-				return nil, errors.New("external uri storage is not available to secondary tenants")
-			},
+			nodeIDContainer:        idContainer,
+			externalStorage:        externalStorage,
+			externalStorageFromURI: externalStorageFromURI,
 		},
 		sqlServerOptionalTenantArgs: sqlServerOptionalTenantArgs{
 			tenantConnect: tenantConnect,
@@ -604,13 +606,21 @@ func (ts *TestServer) StartTenant(
 			ClusterSettingsUpdater: st.MakeUpdater(),
 		}
 	}
-	return StartTenant(
+	baseCfg.TestingKnobs.SQLExecutor = &sql.ExecutorTestingKnobs{
+		DeterministicExplainAnalyze: params.DeterministicExplainAnalyze,
+	}
+	stopper := params.Stopper
+	if stopper == nil {
+		stopper = ts.Stopper()
+	}
+	addr, httpAddr, _, err := StartTenant(
 		ctx,
-		ts.Stopper(),
+		stopper,
 		ts.Cfg.ClusterName,
 		baseCfg,
 		sqlCfg,
 	)
+	return addr, httpAddr, err
 }
 
 // StartTenant starts a stand-alone SQL server against a KV backend.
@@ -620,14 +630,14 @@ func StartTenant(
 	kvClusterName string, // NB: gone after https://github.com/cockroachdb/cockroach/issues/42519
 	baseCfg BaseConfig,
 	sqlCfg SQLConfig,
-) (pgAddr string, httpAddr string, _ error) {
+) (pgAddr string, httpAddr string, instanceID base.SQLInstanceID, _ error) {
 	args, err := makeSQLServerArgs(stopper, kvClusterName, baseCfg, sqlCfg)
 	if err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	s, err := newSQLServer(ctx, args)
 	if err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 
 	// TODO(asubiotto): remove this. Right now it is needed to initialize the
@@ -644,7 +654,7 @@ func StartTenant(
 
 	pgL, err := listen(ctx, &args.Config.SQLAddr, &args.Config.SQLAdvertiseAddr, "sql")
 	if err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 
 	args.stopper.RunWorker(ctx, func(ctx context.Context) {
@@ -658,7 +668,7 @@ func StartTenant(
 
 	httpL, err := listen(ctx, &args.Config.HTTPAddr, &args.Config.HTTPAdvertiseAddr, "http")
 	if err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 
 	args.stopper.RunWorker(ctx, func(ctx context.Context) {
@@ -688,7 +698,7 @@ func StartTenant(
 				return
 			}
 		})
-		f := varsHandler{metricSource: args.recorder}.handleVars
+		f := varsHandler{metricSource: args.recorder, st: args.Settings}.handleVars
 		mux.Handle(statusVars, http.HandlerFunc(f))
 		_ = http.Serve(httpL, mux)
 	})
@@ -708,8 +718,10 @@ func StartTenant(
 		heapProfileDirName:   args.HeapProfileDirName,
 		runtime:              args.runtime,
 	}); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
+
+	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: roachpb.NodeID(args.nodeIDContainer.SQLInstanceID())})
 
 	if err := s.preStart(ctx,
 		args.stopper,
@@ -719,17 +731,18 @@ func StartTenant(
 		socketFile,
 		orphanedLeasesTimeThresholdNanos,
 	); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
+
 	if err := s.startServeSQL(ctx,
 		args.stopper,
 		s.connManager,
 		s.pgL,
 		socketFile); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 
-	return pgLAddr, httpLAddr, nil
+	return pgLAddr, httpLAddr, args.nodeIDContainer.SQLInstanceID(), nil
 }
 
 // ExpectedInitialRangeCount returns the expected number of ranges that should
@@ -825,7 +838,7 @@ func (ts *TestServer) DrainClients(ctx context.Context) error {
 
 // WriteSummaries implements TestServerInterface.
 func (ts *TestServer) WriteSummaries() error {
-	return ts.node.writeNodeStatus(context.TODO(), time.Hour)
+	return ts.node.writeNodeStatus(context.TODO(), time.Hour, false)
 }
 
 // AdminURL implements TestServerInterface.
@@ -838,27 +851,37 @@ func (ts *TestServer) GetHTTPClient() (http.Client, error) {
 	return ts.Server.rpcContext.GetHTTPClient()
 }
 
-const authenticatedUserName = "authentic_user"
-const authenticatedUserNameNoAdmin = "authentic_user_noadmin"
+const authenticatedUser = "authentic_user"
+
+func authenticatedUserName() security.SQLUsername {
+	return security.MakeSQLUsernameFromPreNormalizedString(authenticatedUser)
+}
+
+const authenticatedUserNoAdmin = "authentic_user_noadmin"
+
+func authenticatedUserNameNoAdmin() security.SQLUsername {
+	return security.MakeSQLUsernameFromPreNormalizedString(authenticatedUserNoAdmin)
+}
 
 // GetAdminAuthenticatedHTTPClient implements the TestServerInterface.
 func (ts *TestServer) GetAdminAuthenticatedHTTPClient() (http.Client, error) {
-	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authenticatedUserName, true)
+	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(
+		authenticatedUserName(), true)
 	return httpClient, err
 }
 
 // GetAuthenticatedHTTPClient implements the TestServerInterface.
 func (ts *TestServer) GetAuthenticatedHTTPClient(isAdmin bool) (http.Client, error) {
-	authUser := authenticatedUserName
+	authUser := authenticatedUserName()
 	if !isAdmin {
-		authUser = authenticatedUserNameNoAdmin
+		authUser = authenticatedUserNameNoAdmin()
 	}
 	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authUser, isAdmin)
 	return httpClient, err
 }
 
 func (ts *TestServer) getAuthenticatedHTTPClientAndCookie(
-	authUser string, isAdmin bool,
+	authUser security.SQLUsername, isAdmin bool,
 ) (http.Client, *serverpb.SessionCookie, error) {
 	authIdx := 0
 	if isAdmin {
@@ -909,11 +932,11 @@ func (ts *TestServer) getAuthenticatedHTTPClientAndCookie(
 	return authClient.httpClient, authClient.cookie, authClient.err
 }
 
-func (ts *TestServer) createAuthUser(userName string, isAdmin bool) error {
+func (ts *TestServer) createAuthUser(userName security.SQLUsername, isAdmin bool) error {
 	if _, err := ts.Server.sqlServer.internalExecutor.ExecEx(context.TODO(),
 		"create-auth-user", nil,
-		sessiondata.InternalExecutorOverride{User: security.RootUser},
-		"CREATE USER $1", userName,
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		"CREATE USER $1", userName.Normalized(),
 	); err != nil {
 		return err
 	}
@@ -922,8 +945,8 @@ func (ts *TestServer) createAuthUser(userName string, isAdmin bool) error {
 		// to rely on CCL code.
 		if _, err := ts.Server.sqlServer.internalExecutor.ExecEx(context.TODO(),
 			"grant-admin", nil,
-			sessiondata.InternalExecutorOverride{User: security.RootUser},
-			"INSERT INTO system.role_members (role, member, \"isAdmin\") VALUES ('admin', $1, true)", userName,
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			"INSERT INTO system.role_members (role, member, \"isAdmin\") VALUES ('admin', $1, true)", userName.Normalized(),
 		); err != nil {
 			return err
 		}
@@ -1005,6 +1028,11 @@ func (ts *TestServer) DistSenderI() interface{} {
 // interface{}.
 func (ts *TestServer) DistSender() *kvcoord.DistSender {
 	return ts.DistSenderI().(*kvcoord.DistSender)
+}
+
+// MigrationServer is part of TestServerInterface.
+func (ts *TestServer) MigrationServer() interface{} {
+	return ts.migrationServer
 }
 
 // SQLServer is part of TestServerInterface.
@@ -1220,7 +1248,7 @@ func (ts *TestServer) ForceTableGC(
  `
 	row, err := ts.sqlServer.internalExecutor.QueryRowEx(
 		ctx, "resolve-table-id", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		tableIDQuery, database, table)
 	if err != nil {
 		return err
@@ -1244,18 +1272,28 @@ func (ts *TestServer) ForceTableGC(
 	return pErr.GoError()
 }
 
-// ScratchRange splits off a range suitable to be used as KV scratch space. (it
-// doesn't overlap system spans or SQL tables).
+// ScratchRangeEx splits off a range suitable to be used as KV scratch space.
+// (it doesn't overlap system spans or SQL tables).
 //
 // Calling this multiple times is undefined (but see TestCluster.ScratchRange()
 // which is idempotent).
-func (ts *TestServer) ScratchRange() (roachpb.Key, error) {
+func (ts *TestServer) ScratchRangeEx() (roachpb.RangeDescriptor, error) {
 	scratchKey := keys.TableDataMax
-	_, _, err := ts.SplitRange(scratchKey)
+	_, rngDesc, err := ts.SplitRange(scratchKey)
+	if err != nil {
+		return roachpb.RangeDescriptor{}, err
+	}
+	return rngDesc, nil
+}
+
+// ScratchRange is like ScratchRangeEx, but only returns the start key of the
+// new range instead of the range descriptor.
+func (ts *TestServer) ScratchRange() (roachpb.Key, error) {
+	desc, err := ts.ScratchRangeEx()
 	if err != nil {
 		return nil, err
 	}
-	return scratchKey, nil
+	return desc.StartKey.AsRawKey(), nil
 }
 
 type testServerFactoryImpl struct{}
@@ -1264,7 +1302,7 @@ type testServerFactoryImpl struct{}
 var TestServerFactory = testServerFactoryImpl{}
 
 // New is part of TestServerFactory interface.
-func (testServerFactoryImpl) New(params base.TestServerArgs) interface{} {
+func (testServerFactoryImpl) New(params base.TestServerArgs) (interface{}, error) {
 	cfg := makeTestConfigFromParams(params)
 	ts := &TestServer{Cfg: &cfg, params: params}
 
@@ -1279,13 +1317,15 @@ func (testServerFactoryImpl) New(params base.TestServerArgs) interface{} {
 	// Needs to be called before NewServer to ensure resolvers are initialized.
 	ctx := context.Background()
 	if err := ts.Cfg.InitNode(ctx); err != nil {
-		return err
+		params.Stopper.Stop(ctx)
+		return nil, err
 	}
 
 	var err error
 	ts.Server, err = NewServer(*ts.Cfg, params.Stopper)
 	if err != nil {
-		return err
+		params.Stopper.Stop(ctx)
+		return nil, err
 	}
 
 	// Create a breaker which never trips and never backs off to avoid
@@ -1299,5 +1339,5 @@ func (testServerFactoryImpl) New(params base.TestServerArgs) interface{} {
 	// Our context must be shared with our server.
 	ts.Cfg = &ts.Server.cfg
 
-	return ts
+	return ts, nil
 }

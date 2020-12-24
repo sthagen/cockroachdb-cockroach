@@ -124,12 +124,12 @@ func TestPebbleIterReuse(t *testing.T) {
 	batch := eng.NewBatch()
 	for i := 0; i < 100; i++ {
 		key := MVCCKey{[]byte{byte(i)}, hlc.Timestamp{WallTime: 100}}
-		if err := batch.Put(key, []byte("foo")); err != nil {
+		if err := batch.PutMVCC(key, []byte("foo")); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	iter1 := batch.NewIterator(IterOptions{LowerBound: []byte{40}, UpperBound: []byte{50}})
+	iter1 := batch.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{LowerBound: []byte{40}, UpperBound: []byte{50}})
 	valuesCount := 0
 	// Seek to a value before the lower bound. Identical to seeking to the lower bound.
 	iter1.SeekGE(MVCCKey{Key: []byte{30}})
@@ -152,16 +152,17 @@ func TestPebbleIterReuse(t *testing.T) {
 		t.Fatalf("expected 10 values, got %d", valuesCount)
 	}
 	iter1.Close()
+	iter1 = nil
 
 	// Create another iterator, with no lower bound but an upper bound that
 	// is lower than the previous iterator's lower bound. This should still result
 	// in the right amount of keys being returned; the lower bound from the
 	// previous iterator should get zeroed.
-	iter2 := batch.NewIterator(IterOptions{UpperBound: []byte{10}})
+	iter2 := batch.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{UpperBound: []byte{10}})
 	valuesCount = 0
-	iter1.SeekGE(MVCCKey{Key: []byte{0}})
+	iter2.SeekGE(MVCCKey{Key: []byte{0}})
 	for ; ; iter2.Next() {
-		ok, err := iter1.Valid()
+		ok, err := iter2.Valid()
 		if err != nil {
 			t.Fatal(err)
 		} else if !ok {
@@ -234,7 +235,7 @@ func TestPebbleSeparatorSuccessor(t *testing.T) {
 	}
 	for _, tc := range sepCases {
 		t.Run("", func(t *testing.T) {
-			got := string(MVCCComparer.Separator(nil, EncodeKey(tc.a), EncodeKey(tc.b)))
+			got := string(EngineComparer.Separator(nil, EncodeKey(tc.a), EncodeKey(tc.b)))
 			if got != string(EncodeKey(tc.want)) {
 				t.Errorf("a, b = %q, %q: got %q, want %q", tc.a, tc.b, got, tc.want)
 			}
@@ -269,7 +270,7 @@ func TestPebbleSeparatorSuccessor(t *testing.T) {
 	}
 	for _, tc := range succCases {
 		t.Run("", func(t *testing.T) {
-			got := string(MVCCComparer.Successor(nil, EncodeKey(tc.a)))
+			got := string(EngineComparer.Successor(nil, EncodeKey(tc.a)))
 			if got != string(EncodeKey(tc.want)) {
 				t.Errorf("a = %q: got %q, want %q", tc.a, got, tc.want)
 			}
@@ -313,7 +314,7 @@ func BenchmarkMVCCKeyCompare(b *testing.B) {
 	b.ResetTimer()
 	var c int
 	for i, j := 0, 0; i < b.N; i, j = i+1, j+3 {
-		c = MVCCKeyCompare(keys[i%len(keys)], keys[j%len(keys)])
+		c = EngineKeyCompare(keys[i%len(keys)], keys[j%len(keys)])
 	}
 	if testing.Verbose() {
 		fmt.Fprint(ioutil.Discard, c)

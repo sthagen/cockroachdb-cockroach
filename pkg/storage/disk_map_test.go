@@ -114,7 +114,7 @@ func runTestForEngine(ctx context.Context, t *testing.T, filename string, engine
 				switch parts[0] {
 				case "put":
 					if len(parts) != 3 {
-						return fmt.Sprintf("put <key> <value>\n")
+						return "put <key> <value>\n"
 					}
 					err := batch.Put([]byte(strings.TrimSpace(parts[1])), []byte(strings.TrimSpace(parts[2])))
 					if err != nil {
@@ -144,7 +144,7 @@ func runTestForEngine(ctx context.Context, t *testing.T, filename string, engine
 
 				case "seek":
 					if len(parts) != 2 {
-						return fmt.Sprintf("seek <key>\n")
+						return "seek <key>\n"
 					}
 					iter.SeekGE([]byte(strings.TrimSpace(parts[1])))
 				default:
@@ -235,7 +235,10 @@ func TestPebbleMapClose(t *testing.T) {
 
 	// Force it to a lower-level. This is done so as to avoid the automatic
 	// compactions out of L0 that would normally occur.
-	if err := e.db.Compact(diskMap.makeKey([]byte{'a'}), diskMap.makeKey([]byte{'z'})); err != nil {
+	startKey := diskMap.makeKey([]byte{'a'})
+	startKeyCopy := make([]byte, len(startKey))
+	copy(startKeyCopy, startKey)
+	if err := e.db.Compact(startKeyCopy, diskMap.makeKey([]byte{'z'})); err != nil {
 		t.Fatal(err)
 	}
 

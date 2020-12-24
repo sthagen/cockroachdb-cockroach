@@ -129,7 +129,7 @@ func MakeObjectNameKey(
 	name string,
 ) catalogkeys.DescriptorKey {
 	// TODO(solon): This if condition can be removed in 20.2
-	if !settings.Version.IsActive(ctx, clusterversion.VersionNamespaceTableWithSchemas) {
+	if !settings.Version.IsActive(ctx, clusterversion.NamespaceTableWithSchemas) {
 		return catalogkeys.NewDeprecatedTableKey(parentID, name)
 	}
 	var key catalogkeys.DescriptorKey
@@ -216,13 +216,6 @@ func LookupObjectID(
 		return true, descpb.ID(res.ValueInt()), nil
 	}
 	return false, descpb.InvalidID, nil
-}
-
-// LookupPublicTableID is a wrapper around LookupObjectID for public tables.
-func LookupPublicTableID(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, parentID descpb.ID, name string,
-) (bool, descpb.ID, error) {
-	return LookupObjectID(ctx, txn, codec, parentID, keys.PublicSchemaID, name)
 }
 
 // LookupDatabaseID is  a wrapper around LookupObjectID for databases.

@@ -182,7 +182,7 @@ func TestMakeTableDescColumns(t *testing.T) {
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (a " + d.sqlType + " PRIMARY KEY, b " + d.sqlType + ")"
 		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s,
-			descpb.NewDefaultPrivilegeDescriptor(security.AdminRole))
+			descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()))
 		if err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}
@@ -216,7 +216,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				ColumnNames:      []string{"a"},
 				ColumnIDs:        []descpb.ColumnID{1},
 				ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
-				Version:          descpb.SecondaryIndexFamilyFormatVersion,
+				Version:          descpb.EmptyArraysInInvertedIndexesVersion,
 			},
 			[]descpb.IndexDescriptor{},
 		},
@@ -229,7 +229,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				ColumnNames:      []string{"b"},
 				ColumnIDs:        []descpb.ColumnID{2},
 				ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
-				Version:          descpb.SecondaryIndexFamilyFormatVersion,
+				Version:          descpb.EmptyArraysInInvertedIndexesVersion,
 			},
 			[]descpb.IndexDescriptor{
 				{
@@ -240,7 +240,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 					ColumnIDs:        []descpb.ColumnID{1},
 					ExtraColumnIDs:   []descpb.ColumnID{2},
 					ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
-					Version:          descpb.SecondaryIndexFamilyFormatVersion,
+					Version:          descpb.EmptyArraysInInvertedIndexesVersion,
 				},
 			},
 		},
@@ -253,7 +253,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				ColumnNames:      []string{"a", "b"},
 				ColumnIDs:        []descpb.ColumnID{1, 2},
 				ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
-				Version:          descpb.SecondaryIndexFamilyFormatVersion,
+				Version:          descpb.EmptyArraysInInvertedIndexesVersion,
 			},
 			[]descpb.IndexDescriptor{},
 		},
@@ -266,7 +266,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				ColumnNames:      []string{"a", "b"},
 				ColumnIDs:        []descpb.ColumnID{1, 2},
 				ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
-				Version:          descpb.SecondaryIndexFamilyFormatVersion,
+				Version:          descpb.EmptyArraysInInvertedIndexesVersion,
 			},
 			[]descpb.IndexDescriptor{
 				{
@@ -277,7 +277,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 					ColumnIDs:        []descpb.ColumnID{2},
 					ExtraColumnIDs:   []descpb.ColumnID{1},
 					ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
-					Version:          descpb.SecondaryIndexFamilyFormatVersion,
+					Version:          descpb.EmptyArraysInInvertedIndexesVersion,
 				},
 			},
 		},
@@ -290,7 +290,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				ColumnNames:      []string{"a", "b"},
 				ColumnIDs:        []descpb.ColumnID{1, 2},
 				ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
-				Version:          descpb.SecondaryIndexFamilyFormatVersion,
+				Version:          descpb.EmptyArraysInInvertedIndexesVersion,
 			},
 			[]descpb.IndexDescriptor{},
 		},
@@ -298,17 +298,81 @@ func TestMakeTableDescIndexes(t *testing.T) {
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (" + d.sql + ")"
 		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s,
-			descpb.NewDefaultPrivilegeDescriptor(security.AdminRole))
+			descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()))
 		if err != nil {
 			t.Fatalf("%d (%s): %v", i, d.sql, err)
 		}
-		if !reflect.DeepEqual(d.primary, schema.PrimaryIndex) {
-			t.Fatalf("%d (%s): primary mismatch: expected %+v, but got %+v", i, d.sql, d.primary, schema.PrimaryIndex)
+		if !reflect.DeepEqual(d.primary, *schema.GetPrimaryIndex()) {
+			t.Fatalf("%d (%s): primary mismatch: expected %+v, but got %+v", i, d.sql, d.primary, schema.GetPrimaryIndex())
 		}
-		if !reflect.DeepEqual(d.indexes, append([]descpb.IndexDescriptor{}, schema.Indexes...)) {
-			t.Fatalf("%d (%s): index mismatch: expected %+v, but got %+v", i, d.sql, d.indexes, schema.Indexes)
+		if !reflect.DeepEqual(d.indexes, append([]descpb.IndexDescriptor{}, schema.GetPublicNonPrimaryIndexes()...)) {
+			t.Fatalf("%d (%s): index mismatch: expected %+v, but got %+v", i, d.sql, d.indexes, schema.GetPublicNonPrimaryIndexes())
 		}
 
+	}
+}
+
+func TestMakeTableDescUniqueConstraints(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testData := []struct {
+		sql         string
+		constraints []descpb.UniqueWithoutIndexConstraint
+	}{
+		{
+			"a INT UNIQUE",
+			nil,
+		},
+		{
+			"a INT UNIQUE WITHOUT INDEX, b INT PRIMARY KEY",
+			[]descpb.UniqueWithoutIndexConstraint{
+				{
+					TableID:   100,
+					ColumnIDs: []descpb.ColumnID{1},
+					Name:      "unique_a",
+				},
+			},
+		},
+		{
+			"a INT, b INT, CONSTRAINT c UNIQUE WITHOUT INDEX (b), UNIQUE (a, b)",
+			[]descpb.UniqueWithoutIndexConstraint{
+				{
+					TableID:   100,
+					ColumnIDs: []descpb.ColumnID{2},
+					Name:      "c",
+				},
+			},
+		},
+		{
+			"a INT, b INT, c INT, UNIQUE WITHOUT INDEX (a, b), UNIQUE WITHOUT INDEX (c)",
+			[]descpb.UniqueWithoutIndexConstraint{
+				{
+					TableID:   100,
+					ColumnIDs: []descpb.ColumnID{1, 2},
+					Name:      "unique_a_b",
+				},
+				{
+					TableID:   100,
+					ColumnIDs: []descpb.ColumnID{3},
+					Name:      "unique_c",
+				},
+			},
+		},
+	}
+	for i, d := range testData {
+		s := "CREATE TABLE foo.test (" + d.sql + ")"
+		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s,
+			descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()))
+		if err != nil {
+			t.Fatalf("%d (%s): %v", i, d.sql, err)
+		}
+		if !reflect.DeepEqual(d.constraints, schema.UniqueWithoutIndexConstraints) {
+			t.Fatalf(
+				"%d (%s): constraints mismatch: expected %+v, but got %+v",
+				i, d.sql, d.constraints, schema.UniqueWithoutIndexConstraints,
+			)
+		}
 	}
 }
 
@@ -318,11 +382,11 @@ func TestPrimaryKeyUnspecified(t *testing.T) {
 	s := "CREATE TABLE foo.test (a INT, b INT, CONSTRAINT c UNIQUE (b))"
 	ctx := context.Background()
 	desc, err := CreateTestTableDescriptor(ctx, 1, 100, s,
-		descpb.NewDefaultPrivilegeDescriptor(security.AdminRole))
+		descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	desc.PrimaryIndex = descpb.IndexDescriptor{}
+	desc.SetPrimaryIndex(descpb.IndexDescriptor{})
 
 	err = desc.ValidateTable(ctx)
 	if !testutils.IsError(err, tabledesc.ErrMissingPrimaryKey.Error()) {

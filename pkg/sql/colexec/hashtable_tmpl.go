@@ -21,9 +21,20 @@ package colexec
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ = typeconv.DatumVecCanonicalTypeFamily
+	_ coldataext.Datum
+	_ tree.AggType
 )
 
 // {{/*
@@ -41,7 +52,7 @@ const _RIGHT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
 const _RIGHT_TYPE_WIDTH = 0
 
 // _ASSIGN_NE is the template equality function for assigning the first input
-// to the result of the the second input != the third input.
+// to the result of the second input != the third input.
 func _ASSIGN_NE(_, _, _, _, _, _ interface{}) int {
 	colexecerror.InternalError(errors.AssertionFailedf(""))
 }
@@ -369,7 +380,11 @@ func (ht *hashTable) checkColForDistinctTuples(
 // {{/*
 func _CHECK_BODY(_SELECT_SAME_TUPLES bool, _DELETING_PROBE_MODE bool) { // */}}
 	// {{define "checkBody" -}}
-	for _, toCheck := range ht.probeScratch.toCheck[:nToCheck] {
+	toCheckSlice := ht.probeScratch.toCheck
+	_ = toCheckSlice[nToCheck-1]
+	for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+		//gcassert:bce
+		toCheck := toCheckSlice[toCheckPos]
 		if !ht.probeScratch.differs[toCheck] {
 			// If the current key matches with the probe key, we want to update headID
 			// with the current key if it has not been set yet.
@@ -390,7 +405,8 @@ func _CHECK_BODY(_SELECT_SAME_TUPLES bool, _DELETING_PROBE_MODE bool) { // */}}
 				// It has been deleted, so we need to continue probing on the
 				// next chain if it's not the end of the chain already.
 				if keyID != 0 {
-					ht.probeScratch.toCheck[nDiffers] = toCheck
+					//gcassert:bce
+					toCheckSlice[nDiffers] = toCheck
 					nDiffers++
 				}
 			}
@@ -421,7 +437,8 @@ func _CHECK_BODY(_SELECT_SAME_TUPLES bool, _DELETING_PROBE_MODE bool) { // */}}
 		if ht.probeScratch.differs[toCheck] {
 			// Continue probing in this next chain for the probe key.
 			ht.probeScratch.differs[toCheck] = false
-			ht.probeScratch.toCheck[nDiffers] = toCheck
+			//gcassert:bce
+			toCheckSlice[nDiffers] = toCheck
 			nDiffers++
 		}
 	}
@@ -486,10 +503,18 @@ func (ht *hashTable) checkProbeForDistinct(vecs []coldata.Vec, nToCheck uint64, 
 func _UPDATE_SEL_BODY(_USE_SEL bool) { // */}}
 	// {{define "updateSelBody" -}}
 	batchLength := b.Length()
+	// Capture the slices in order for BCE to occur.
+	headIDs := ht.probeScratch.headID
+	hashBuffer := ht.probeScratch.hashBuffer
+	_ = headIDs[batchLength-1]
+	_ = hashBuffer[batchLength-1]
 	// Reuse the buffer allocated for distinct.
 	visited := ht.probeScratch.distinct
 	copy(visited, zeroBoolColumn)
-	for i, headID := range ht.probeScratch.headID[:batchLength] {
+	distinctCount := 0
+	for i := 0; i < batchLength && distinctCount < batchLength; i++ {
+		//gcassert:bce
+		headID := headIDs[i]
 		if headID != 0 {
 			if hasVisited := visited[headID-1]; !hasVisited {
 				// {{if .UseSel}}
@@ -499,11 +524,13 @@ func _UPDATE_SEL_BODY(_USE_SEL bool) { // */}}
 				// {{end}}
 				visited[headID-1] = true
 				// Compacting and deduplicating hash buffer.
-				ht.probeScratch.hashBuffer[distinctCount] = ht.probeScratch.hashBuffer[i]
+				//gcassert:bce
+				hashBuffer[distinctCount] = hashBuffer[i]
 				distinctCount++
 			}
 		}
 	}
+	b.SetLength(distinctCount)
 	// {{end}}
 	// {{/*
 } // */}}
@@ -518,7 +545,9 @@ func _UPDATE_SEL_BODY(_USE_SEL bool) { // */}}
 // key index will be used. The duplicated keyIDs will be discarded. The
 // hashBuffer will also compact and discard hash values of duplicated keys.
 func (ht *hashTable) updateSel(b coldata.Batch) {
-	distinctCount := 0
+	if b.Length() == 0 {
+		return
+	}
 	if sel := b.Selection(); sel != nil {
 		_UPDATE_SEL_BODY(true)
 	} else {
@@ -526,7 +555,6 @@ func (ht *hashTable) updateSel(b coldata.Batch) {
 		sel = b.Selection()
 		_UPDATE_SEL_BODY(false)
 	}
-	b.SetLength(distinctCount)
 }
 
 // distinctCheck determines if the current key in the groupID bucket matches the
@@ -538,10 +566,15 @@ func (ht *hashTable) distinctCheck(nToCheck uint64, probeSel []int) uint64 {
 	ht.checkCols(ht.keys, nToCheck, probeSel)
 	// Select the indices that differ and put them into toCheck.
 	nDiffers := uint64(0)
-	for _, toCheck := range ht.probeScratch.toCheck[:nToCheck] {
+	toCheckSlice := ht.probeScratch.toCheck
+	_ = toCheckSlice[nToCheck-1]
+	for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+		//gcassert:bce
+		toCheck := toCheckSlice[toCheckPos]
 		if ht.probeScratch.differs[toCheck] {
 			ht.probeScratch.differs[toCheck] = false
-			ht.probeScratch.toCheck[nDiffers] = toCheck
+			//gcassert:bce
+			toCheckSlice[nDiffers] = toCheck
 			nDiffers++
 		}
 	}

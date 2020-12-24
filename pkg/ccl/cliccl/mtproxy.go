@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl"
 	"github.com/cockroachdb/cockroach/pkg/cli"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgproto3/v2"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 )
@@ -141,23 +142,31 @@ Uuwb2FVdh76ZK0AVd3Jh3KJs4+hr2u9syHaa7UPKXTcZsFWlGwZuu6X5A+0SO0S2
 	httpLn := mux.Match(cmux.HTTP1Fast())
 	proxyLn := mux.Match(cmux.Any())
 
+	outgoingConf := &tls.Config{
+		InsecureSkipVerify: true,
+	}
 	server := sqlproxyccl.NewServer(sqlproxyccl.Options{
-		IncomingTLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cer},
+		FrontendAdmitter: func(incoming net.Conn) (net.Conn, *pgproto3.StartupMessage, error) {
+			return sqlproxyccl.FrontendAdmit(
+				incoming,
+				&tls.Config{
+					Certificates: []tls.Certificate{cer},
+				},
+			)
 		},
-		OutgoingTLSConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-		OutgoingAddrFromParams: func(params map[string]string) (addr string, clientErr error) {
+		BackendDialer: func(msg *pgproto3.StartupMessage) (net.Conn, error) {
+			params := msg.Parameters
 			const magic = "prancing-pony"
 			if strings.HasPrefix(params["database"], magic+".") {
 				params["database"] = params["database"][len(magic)+1:]
-				return sqlProxyTargetAddr, nil
+			} else if params["options"] != "--cluster="+magic {
+				return nil, errors.Errorf("client failed to pass '%s' via database or options", magic)
 			}
-			if params["options"] == "--cluster="+magic {
-				return sqlProxyTargetAddr, nil
+			conn, err := sqlproxyccl.BackendDial(msg, sqlProxyTargetAddr, outgoingConf)
+			if err != nil {
+				return nil, err
 			}
-			return "", errors.Errorf("client failed to pass '%s' via database or options", magic)
+			return conn, nil
 		},
 	})
 

@@ -19,7 +19,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -44,26 +45,28 @@ const (
 // DeclinedReservationsTimeout specifies a duration during which the local
 // replicate queue will not consider stores which have rejected a reservation a
 // viable target.
-var DeclinedReservationsTimeout = settings.RegisterNonNegativeDurationSetting(
+var DeclinedReservationsTimeout = settings.RegisterDurationSetting(
 	"server.declined_reservation_timeout",
 	"the amount of time to consider the store throttled for up-replication after a reservation was declined",
 	1*time.Second,
+	settings.NonNegativeDuration,
 )
 
 // FailedReservationsTimeout specifies a duration during which the local
 // replicate queue will not consider stores which have failed a reservation a
 // viable target.
-var FailedReservationsTimeout = settings.RegisterNonNegativeDurationSetting(
+var FailedReservationsTimeout = settings.RegisterDurationSetting(
 	"server.failed_reservation_timeout",
 	"the amount of time to consider the store throttled for up-replication after a failed reservation call",
 	5*time.Second,
+	settings.NonNegativeDuration,
 )
 
 const timeUntilStoreDeadSettingName = "server.time_until_store_dead"
 
 // TimeUntilStoreDead wraps "server.time_until_store_dead".
 var TimeUntilStoreDead = func() *settings.DurationSetting {
-	s := settings.RegisterValidatedDurationSetting(
+	s := settings.RegisterDurationSetting(
 		timeUntilStoreDeadSettingName,
 		"the time after which if there is no new gossiped information about a store, it is considered dead",
 		5*time.Minute,
@@ -94,18 +97,18 @@ type NodeCountFunc func() int
 // expired by more than TimeUntilStoreDead.
 type NodeLivenessFunc func(
 	nid roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration,
-) kvserverpb.NodeLivenessStatus
+) livenesspb.NodeLivenessStatus
 
 // MakeStorePoolNodeLivenessFunc returns a function which determines
 // the status of a node based on information provided by the specified
 // NodeLiveness.
-func MakeStorePoolNodeLivenessFunc(nodeLiveness *NodeLiveness) NodeLivenessFunc {
+func MakeStorePoolNodeLivenessFunc(nodeLiveness *liveness.NodeLiveness) NodeLivenessFunc {
 	return func(
 		nodeID roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration,
-	) kvserverpb.NodeLivenessStatus {
+	) livenesspb.NodeLivenessStatus {
 		liveness, ok := nodeLiveness.GetLiveness(nodeID)
 		if !ok {
-			return kvserverpb.NodeLivenessStatus_UNAVAILABLE
+			return livenesspb.NodeLivenessStatus_UNAVAILABLE
 		}
 		return LivenessStatus(liveness.Liveness, now, timeUntilStoreDead)
 	}
@@ -140,24 +143,24 @@ func MakeStorePoolNodeLivenessFunc(nodeLiveness *NodeLiveness) NodeLivenessFunc 
 // ideally we should remove usage of NodeLivenessStatus altogether. See #50707
 // for more details.
 func LivenessStatus(
-	l kvserverpb.Liveness, now time.Time, deadThreshold time.Duration,
-) kvserverpb.NodeLivenessStatus {
+	l livenesspb.Liveness, now time.Time, deadThreshold time.Duration,
+) livenesspb.NodeLivenessStatus {
 	if l.IsDead(now, deadThreshold) {
 		if !l.Membership.Active() {
-			return kvserverpb.NodeLivenessStatus_DECOMMISSIONED
+			return livenesspb.NodeLivenessStatus_DECOMMISSIONED
 		}
-		return kvserverpb.NodeLivenessStatus_DEAD
+		return livenesspb.NodeLivenessStatus_DEAD
 	}
 	if !l.Membership.Active() {
-		return kvserverpb.NodeLivenessStatus_DECOMMISSIONING
+		return livenesspb.NodeLivenessStatus_DECOMMISSIONING
 	}
 	if l.Draining {
-		return kvserverpb.NodeLivenessStatus_UNAVAILABLE
+		return livenesspb.NodeLivenessStatus_UNAVAILABLE
 	}
 	if l.IsLive(now) {
-		return kvserverpb.NodeLivenessStatus_LIVE
+		return livenesspb.NodeLivenessStatus_LIVE
 	}
-	return kvserverpb.NodeLivenessStatus_UNAVAILABLE
+	return livenesspb.NodeLivenessStatus_UNAVAILABLE
 }
 
 type storeDetail struct {
@@ -220,11 +223,11 @@ func (sd *storeDetail) status(
 	// Even if the store has been updated via gossip, we still rely on
 	// the node liveness to determine whether it is considered live.
 	switch nl(sd.desc.Node.NodeID, now, threshold) {
-	case kvserverpb.NodeLivenessStatus_DEAD, kvserverpb.NodeLivenessStatus_DECOMMISSIONED:
+	case livenesspb.NodeLivenessStatus_DEAD, livenesspb.NodeLivenessStatus_DECOMMISSIONED:
 		return storeStatusDead
-	case kvserverpb.NodeLivenessStatus_DECOMMISSIONING:
+	case livenesspb.NodeLivenessStatus_DECOMMISSIONING:
 		return storeStatusDecommissioning
-	case kvserverpb.NodeLivenessStatus_UNKNOWN, kvserverpb.NodeLivenessStatus_UNAVAILABLE:
+	case livenesspb.NodeLivenessStatus_UNKNOWN, livenesspb.NodeLivenessStatus_UNAVAILABLE:
 		return storeStatusUnknown
 	}
 
@@ -269,6 +272,12 @@ type StorePool struct {
 		syncutil.RWMutex
 		nodeLocalities map[roachpb.NodeID]localityWithString
 	}
+
+	// isNodeReadyForRoutineReplicaTransferInternal returns true iff the
+	// node is live and thus a good candidate to receive a replica.
+	// This is defined as a closure reference here instead
+	// of a regular method so it can be overridden in tests.
+	isNodeReadyForRoutineReplicaTransfer func(context.Context, roachpb.NodeID) bool
 }
 
 // NewStorePool creates a StorePool and registers the store updating callback
@@ -292,6 +301,7 @@ func NewStorePool(
 		startTime:      clock.PhysicalTime(),
 		deterministic:  deterministic,
 	}
+	sp.isNodeReadyForRoutineReplicaTransfer = sp.isNodeReadyForRoutineReplicaTransferInternal
 	sp.detailsMu.storeDetails = make(map[roachpb.StoreID]*storeDetail)
 	sp.localitiesMu.nodeLocalities = make(map[roachpb.NodeID]localityWithString)
 
@@ -374,11 +384,11 @@ func (sp *StorePool) updateLocalStoreAfterRebalance(
 		return
 	}
 	switch changeType {
-	case roachpb.ADD_REPLICA:
+	case roachpb.ADD_VOTER:
 		detail.desc.Capacity.RangeCount++
 		detail.desc.Capacity.LogicalBytes += rangeUsageInfo.LogicalBytes
 		detail.desc.Capacity.WritesPerSecond += rangeUsageInfo.WritesPerSecond
-	case roachpb.REMOVE_REPLICA:
+	case roachpb.REMOVE_VOTER:
 		detail.desc.Capacity.RangeCount--
 		if detail.desc.Capacity.LogicalBytes <= rangeUsageInfo.LogicalBytes {
 			detail.desc.Capacity.LogicalBytes = 0
@@ -810,4 +820,25 @@ func (sp *StorePool) getNodeLocalityString(nodeID roachpb.NodeID) string {
 		return ""
 	}
 	return locality.str
+}
+
+func (sp *StorePool) isNodeReadyForRoutineReplicaTransferInternal(
+	ctx context.Context, targetNodeID roachpb.NodeID,
+) bool {
+	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
+	// We use Now().GoTime() instead of PhysicalTime() as per the
+	// comment on top of IsLive().
+	now := sp.clock.Now().GoTime()
+
+	liveness := sp.nodeLivenessFn(
+		targetNodeID, now, timeUntilStoreDead)
+	res := liveness == livenesspb.NodeLivenessStatus_LIVE
+	if res {
+		log.VEventf(ctx, 3,
+			"n%d is a live target, candidate for rebalancing", targetNodeID)
+	} else {
+		log.VEventf(ctx, 3,
+			"not considering non-live node n%d (%s)", targetNodeID, liveness)
+	}
+	return res
 }

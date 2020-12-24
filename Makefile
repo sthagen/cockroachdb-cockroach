@@ -185,7 +185,7 @@ help: ## Print help for targets with comments.
 	@grep -Eh '^[a-zA-Z._-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(cyan)%-30s$(term-reset) %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Useful variables:"
-	@awk 'BEGIN { FS = ":=" } /^## /{x = substr($$0, 4); getline; if (NF >= 2) printf "  $(cyan)%-30s$(term-reset) %s\n", $$1, x}' $(MAKEFILE_LIST) | sort
+	@awk 'BEGIN { RS = "" ; FS = "\n" } /^## /{split($$NF, a, ":="); printf "  $(cyan)%-30s$(term-reset)", a[1]; x=1; while ( x<NF ) { c = substr($$x, 4); printf "  %-30s", c; x++} print ""}' $(MAKEFILE_LIST) | sort
 	@echo ""
 	@echo "Typical usage:"
 	@printf "  $(cyan)%s$(term-reset)\n    %s\n\n" \
@@ -290,11 +290,6 @@ override make-lazy = $(eval $1 = $$(eval $1 := $(value $1))$$($1))
 TAR_XFORM_FLAG = $(shell $(TAR) --version | grep -q GNU && echo "--xform='flags=r;s'" || echo "-s")
 $(call make-lazy,TAR_XFORM_FLAG)
 
-# To edit in-place without creating a backup file, GNU sed requires a bare -i,
-# while BSD sed requires an empty string as the following argument.
-SED_INPLACE = sed $(shell sed --version 2>&1 | grep -q GNU && echo -i || echo "-i ''")
-$(call make-lazy,SED_INPLACE)
-
 # MAKE_TERMERR is set automatically in Make v4.1+, but macOS is still shipping
 # v3.81.
 MAKE_TERMERR ?= $(shell [[ -t 2 ]] && echo true)
@@ -315,10 +310,19 @@ ifeq (, $(shell which ccache))
 $(info $(yellow)Warning: 'ccache' not found, consider installing it for faster builds$(term-reset))
 endif
 
+# Warn maintainers if bazel is not found.
+#
+# TODO(irfansharif): Assert here instead, on a fixed version of bazel (3.7.0). Something like:
+#
+#   $(error $(yellow)'bazel' not found (`brew install bazel` for macs)$(term-reset))
+ifeq (, $(shell which bazel))
+$(info $(yellow)Warning: 'bazel' not found (`brew install bazel` for macs)$(term-reset))
+endif
+
 # Force vendor directory to rebuild.
 .PHONY: vendor_rebuild
 vendor_rebuild: bin/.submodules-initialized
-	$(GO_INSTALL) -v github.com/goware/modvendor
+	$(GO_INSTALL) -v -mod=mod github.com/goware/modvendor
 	./build/vendor_rebuild.sh
 
 # Tell Make to delete the target if its recipe fails. Otherwise, if a recipe
@@ -366,7 +370,7 @@ pkg/ui/yarn.installed: pkg/ui/package.json pkg/ui/yarn.lock pkg/ui/yarn.protobuf
 # Update the git hooks and install commands from dependencies whenever they
 # change.
 # These should be synced with `./pkg/cmd/import-tools/main.go`.
-bin/.bootstrap: $(GITHOOKS) | bin/.submodules-initialized
+bin/.bootstrap: $(GITHOOKS) vendor/modules.txt | bin/.submodules-initialized
 	@$(GO_INSTALL) -v \
 		github.com/client9/misspell/cmd/misspell \
 		github.com/cockroachdb/crlfmt \
@@ -796,17 +800,30 @@ COCKROACH      := ./cockroach$(SUFFIX)
 COCKROACHOSS   := ./cockroachoss$(SUFFIX)
 COCKROACHSHORT := ./cockroachshort$(SUFFIX)
 
+LOG_TARGETS = \
+	pkg/util/log/severity/severity_generated.go \
+	pkg/util/log/channel/channel_generated.go \
+	pkg/util/log/eventpb/eventlog_channels_generated.go \
+	pkg/util/log/eventpb/json_encode_generated.go \
+	pkg/util/log/log_channels_generated.go
+
 SQLPARSER_TARGETS = \
 	pkg/sql/parser/sql.go \
 	pkg/sql/parser/helpmap_test.go \
 	pkg/sql/parser/help_messages.go \
 	pkg/sql/lex/tokens.go \
 	pkg/sql/lex/keywords.go \
-	pkg/sql/lex/reserved_keywords.go
+	pkg/sql/lexbase/reserved_keywords.go
 
 PROTOBUF_TARGETS := bin/.go_protobuf_sources bin/.gw_protobuf_sources
 
-DOCGEN_TARGETS := bin/.docgen_bnfs bin/.docgen_functions docs/generated/redact_safe.md bin/.docgen_http
+DOCGEN_TARGETS := \
+	bin/.docgen_bnfs \
+	bin/.docgen_functions \
+	docs/generated/redact_safe.md \
+	bin/.docgen_http \
+	docs/generated/logging.md \
+	docs/generated/eventlog.md
 
 EXECGEN_TARGETS = \
   pkg/col/coldata/vec.eg.go \
@@ -835,7 +852,9 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/mergejoiner_leftanti.eg.go \
   pkg/sql/colexec/mergejoiner_leftouter.eg.go \
   pkg/sql/colexec/mergejoiner_leftsemi.eg.go \
+  pkg/sql/colexec/mergejoiner_rightanti.eg.go \
   pkg/sql/colexec/mergejoiner_rightouter.eg.go \
+  pkg/sql/colexec/mergejoiner_rightsemi.eg.go \
   pkg/sql/colexec/ordered_synchronizer.eg.go \
   pkg/sql/colexec/proj_const_left_ops.eg.go \
   pkg/sql/colexec/proj_const_right_ops.eg.go \
@@ -881,6 +900,11 @@ OPTGEN_TARGETS = \
 	pkg/sql/opt/exec/factory.og.go \
 	pkg/sql/opt/exec/explain/explain_factory.og.go
 
+test-targets := \
+	check test testshort testslow testrace testraceslow testbuild \
+	stress stressrace \
+	roachprod-stress roachprod-stressrace
+
 go-targets-ccl := \
 	$(COCKROACH) \
 	bin/workload \
@@ -913,6 +937,9 @@ $(COCKROACHSHORT): BUILDTARGET = ./pkg/cmd/cockroach-short
 $(COCKROACHSHORT): TAGS += short
 $(COCKROACHSHORT): $(C_LIBS_SHORT)
 
+# For test targets, add a tag (used to enable extra assertions).
+$(test-targets): TAGS += crdb_test
+
 $(go-targets-ccl): $(C_LIBS_CCL)
 
 BUILDINFO = .buildinfo/tag .buildinfo/rev
@@ -922,7 +949,7 @@ BUILD_TAGGED_RELEASE =
 BUILDINFO_TAG :=
 
 $(go-targets): bin/.bootstrap $(BUILDINFO) $(CGO_FLAGS_FILES) $(PROTOBUF_TARGETS) $(LIBPROJ)
-$(go-targets): $(SQLPARSER_TARGETS) $(OPTGEN_TARGETS)
+$(go-targets): $(LOG_TARGETS) $(SQLPARSER_TARGETS) $(OPTGEN_TARGETS)
 $(go-targets): override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.tag=$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))" \
 	-X "github.com/cockroachdb/cockroach/pkg/build.rev=$(shell cat .buildinfo/rev)" \
@@ -1104,7 +1131,7 @@ dupl: bin/.bootstrap
 
 .PHONY: generate
 generate: ## Regenerate generated code.
-generate: protobuf $(DOCGEN_TARGETS) $(OPTGEN_TARGETS) $(SQLPARSER_TARGETS) $(SETTINGS_DOC_PAGE) bin/langgen bin/terraformgen
+generate: protobuf $(DOCGEN_TARGETS) $(OPTGEN_TARGETS) $(LOG_TARGETS) $(SQLPARSER_TARGETS) $(SETTINGS_DOC_PAGE) bin/langgen bin/terraformgen
 	$(GO) generate $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
 	$(MAKE) execgen
 
@@ -1246,15 +1273,6 @@ bin/.go_protobuf_sources: $(PROTOC) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PRO
 	set -e; for dir in $(sort $(dir $(GO_PROTOS))); do \
 	  build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH):$(ERRORS_PATH) --gogoroach_out=$(PROTO_MAPPINGS),plugins=grpc,import_prefix=github.com/cockroachdb/cockroach/pkg/:./pkg $$dir/*.proto; \
 	done
-	$(SED_INPLACE) -E \
-		-e '/import _ /d' \
-		-e 's!import (fmt|math) "github.com/cockroachdb/cockroach/pkg/(fmt|math)"! !g' \
-		-e 's!github\.com/cockroachdb/cockroach/pkg/(etcd)!go.etcd.io/\1!g' \
-		-e 's!github.com/cockroachdb/cockroach/pkg/((bytes|encoding/binary|errors|fmt|io|math|github\.com|(google\.)?golang\.org)([^a-z]|$$))!\1!g' \
-        -e 's!github.com/cockroachdb/cockroach/pkg/errorspb!github.com/cockroachdb/errors/errorspb!g' \
-		-e 's!golang.org/x/net/context!context!g' \
-		$(GO_SOURCES)
-	@# TODO(benesch): Remove the last sed command after https://github.com/grpc/grpc-go/issues/711.
 	gofmt -s -w $(GO_SOURCES)
 	touch $@
 
@@ -1262,8 +1280,6 @@ bin/.gw_protobuf_sources: $(PROTOC) $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PRO
 	$(FIND_RELEVANT) -type f -name '*.pb.gw.go' -exec rm {} +
 	build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(ERRORS_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_SERVER_PROTOS)
 	build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(ERRORS_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_TS_PROTOS)
-	@# TODO(benesch): Remove after https://github.com/grpc/grpc-go/issues/711.
-	$(SED_INPLACE) -E 's!golang.org/x/net/context!context!g' $(GW_SOURCES)
 	gofmt -s -w $(GW_SOURCES)
 	@# TODO(jordan,benesch) This can be removed along with the above TODO.
 	goimports -w $(GW_SOURCES)
@@ -1462,13 +1478,13 @@ pkg/sql/parser/gen/sql-gen.y: pkg/sql/parser/sql.y pkg/sql/parser/replace_help_r
 	mv -f $@.tmp $@
 	rm pkg/sql/parser/gen/types_regex.tmp
 
-pkg/sql/lex/reserved_keywords.go: pkg/sql/parser/sql.y pkg/sql/parser/reserved_keywords.awk | bin/.bootstrap
+pkg/sql/lexbase/reserved_keywords.go: pkg/sql/parser/sql.y pkg/sql/parser/reserved_keywords.awk | bin/.bootstrap
 	awk -f pkg/sql/parser/reserved_keywords.awk < $< > $@.tmp || rm $@.tmp
 	mv -f $@.tmp $@
 	gofmt -s -w $@
 
-pkg/sql/lex/keywords.go: pkg/sql/parser/sql.y pkg/sql/lex/all_keywords.go | bin/.bootstrap
-	go run -tags all-keywords pkg/sql/lex/all_keywords.go < $< > $@.tmp || rm $@.tmp
+pkg/sql/lex/keywords.go: pkg/sql/parser/sql.y pkg/sql/lex/allkeywords/main.go | bin/.bootstrap
+	go run -tags all-keywords pkg/sql/lex/allkeywords/main.go < $< > $@.tmp || rm $@.tmp
 	mv -f $@.tmp $@
 	gofmt -s -w $@
 
@@ -1520,6 +1536,43 @@ docs/generated/redact_safe.md:
 	  grep -v '^vendor/github.com/cockroachdb/redact' | \
 	  sed -E -e 's/^([^:]*):[0-9]+:.*redact\.RegisterSafeType\((.*)\).*/\1 | \`\2\`/g' >>$@.tmp || { rm -f $@.tmp; exit 1; }
 	@mv -f $@.tmp $@
+
+EVENTLOG_PROTOS = \
+	pkg/util/log/eventpb/events.proto \
+	pkg/util/log/eventpb/ddl_events.proto \
+	pkg/util/log/eventpb/misc_sql_events.proto \
+	pkg/util/log/eventpb/privilege_events.proto \
+	pkg/util/log/eventpb/role_events.proto \
+	pkg/util/log/eventpb/zone_events.proto \
+	pkg/util/log/eventpb/cluster_events.proto
+
+docs/generated/eventlog.md: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
+	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $< eventlog.md $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	mv -f $@.tmp $@
+
+pkg/util/log/eventpb/eventlog_channels_generated.go: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
+	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $< eventlog_channels_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	mv -f $@.tmp $@
+
+pkg/util/log/eventpb/json_encode_generated.go: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
+	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $< json_encode_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	mv -f $@.tmp $@
+
+docs/generated/logging.md: pkg/util/log/gen.go pkg/util/log/logpb/log.proto
+	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $^ logging.md $@.tmp || { rm -f $@.tmp; exit 1; }
+	mv -f $@.tmp $@
+
+pkg/util/log/severity/severity_generated.go: pkg/util/log/gen.go pkg/util/log/logpb/log.proto
+	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $^ severity.go $@.tmp || { rm -f $@.tmp; exit 1; }
+	mv -f $@.tmp $@
+
+pkg/util/log/channel/channel_generated.go: pkg/util/log/gen.go pkg/util/log/logpb/log.proto
+	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $^ channel.go $@.tmp || { rm -f $@.tmp; exit 1; }
+	mv -f $@.tmp $@
+
+pkg/util/log/log_channels_generated.go: pkg/util/log/gen.go pkg/util/log/logpb/log.proto
+	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $^ log_channels.go $@.tmp || { rm -f $@.tmp; exit 1; }
+	mv -f $@.tmp $@
 
 settings-doc-gen := $(if $(filter buildshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),$(COCKROACH))
 
@@ -1610,7 +1663,7 @@ clean: cleanshort clean-c-deps
 .PHONY: maintainer-clean
 maintainer-clean: ## Like clean, but also remove some auto-generated SQL parser, optgen, and UI protos code.
 maintainer-clean: clean ui-maintainer-clean
-	rm -f $(SQLPARSER_TARGETS) $(OPTGEN_TARGETS) $(UI_PROTOS_OSS) $(UI_PROTOS_CCL)
+	rm -f $(SQLPARSER_TARGETS) $(LOG_TARGETS) $(OPTGEN_TARGETS) $(UI_PROTOS_OSS) $(UI_PROTOS_CCL)
 
 .PHONY: unsafe-clean
 unsafe-clean: ## Like maintainer-clean, but also remove all untracked/ignored files.
@@ -1674,7 +1727,7 @@ logictest-bins := bin/logictest bin/logictestopt bin/logictestccl
 # Additional dependencies for binaries that depend on generated code.
 #
 # TODO(benesch): Derive this automatically. This is getting out of hand.
-bin/workload bin/docgen bin/execgen bin/roachtest $(logictest-bins): $(SQLPARSER_TARGETS) $(PROTOBUF_TARGETS)
+bin/workload bin/docgen bin/execgen bin/roachtest $(logictest-bins): $(SQLPARSER_TARGETS) $(LOG_TARGETS) $(PROTOBUF_TARGETS)
 bin/workload bin/docgen bin/roachtest $(logictest-bins): $(LIBPROJ) $(CGO_FLAGS_FILES)
 bin/roachtest $(logictest-bins): $(C_LIBS_CCL) $(CGO_FLAGS_FILES) $(OPTGEN_TARGETS)
 
@@ -1699,6 +1752,11 @@ fuzz: ## Run fuzz tests.
 fuzz: bin/fuzz
 	bin/fuzz $(TESTFLAGS) -tests $(TESTS) -timeout $(TESTTIMEOUT) $(PKG)
 
+# Short hand to re-generate all bazel BUILD files.
+bazel-generate: ## Generate all bazel BUILD files.
+	@echo 'Generating DEPS.bzl and BUILD files using gazelle'
+	@bazel run //:gazelle -- update-repos -from_file=go.mod -build_file_proto_mode=disable -to_macro=DEPS.bzl%go_deps
+	@bazel run //:gazelle -- -index=false
 
 # No need to include all the dependency files if the user is just
 # requesting help or cleanup.
@@ -1749,3 +1807,4 @@ build/variables.mk: Makefile build/archive/contents/Makefile pkg/ui/Makefile bui
 include build/variables.mk
 $(foreach v,$(filter-out $(strip $(VALID_VARS)),$(.VARIABLES)),\
 	$(if $(findstring command line,$(origin $v)),$(error Variable '$v' is not recognized by this Makefile)))
+

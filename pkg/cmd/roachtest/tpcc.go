@@ -18,13 +18,11 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
-	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/search"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
@@ -71,9 +69,9 @@ type tpccOptions struct {
 // specify pgurl to ensure that it is run on a node with a running cockroach
 // instance to ensure that the workload version matches the gateway version in a
 // mixed version cluster.
-func tpccImportCmd(t *test, warehouses int, extraArgs string) string {
+func tpccImportCmd(warehouses int, extraArgs ...string) string {
 	return fmt.Sprintf("./cockroach workload fixtures import tpcc --warehouses=%d %s",
-		warehouses, extraArgs)
+		warehouses, strings.Join(extraArgs, " "))
 }
 
 func setupTPCC(
@@ -97,17 +95,9 @@ func setupTPCC(
 			if v == "" {
 				regularNodes = append(regularNodes, c.Node(i+1))
 			} else {
-				// NB: binfetcher caches the downloaded files.
-				binary, err := binfetcher.Download(ctx, binfetcher.Options{
-					Binary:  "cockroach",
-					Version: v,
-					GOOS:    ifLocal(runtime.GOOS, "linux"),
-					GOARCH:  "amd64",
-				})
-				if err != nil {
-					t.Fatalf("while fetching %s: %s", v, err)
+				if err := c.Stage(ctx, c.l, "release", v, "", c.Node(i+1)); err != nil {
+					t.Fatal(err)
 				}
-				c.Put(ctx, binary, "./cockroach", c.Node(i+1))
 			}
 		}
 		c.Put(ctx, cockroach, "./cockroach", regularNodes...)
@@ -125,7 +115,7 @@ func setupTPCC(
 		switch opts.SetupType {
 		case usingImport:
 			t.Status("loading fixture")
-			c.Run(ctx, crdbNodes[:1], tpccImportCmd(t, opts.Warehouses, opts.ExtraSetupArgs))
+			c.Run(ctx, crdbNodes[:1], tpccImportCmd(opts.Warehouses, opts.ExtraSetupArgs))
 		case usingInit:
 			t.Status("initializing tables")
 			extraArgs := opts.ExtraSetupArgs
@@ -351,7 +341,7 @@ func registerTPCC(r *testRegistry) {
 				// bottleneck on initialization which is significantly slower than import.
 				Warehouses:     500,
 				Duration:       time.Minute * 15,
-				ExtraSetupArgs: fmt.Sprintf("--interleaved=true"),
+				ExtraSetupArgs: "--interleaved=true",
 				SetupType:      usingInit,
 			})
 		},
@@ -623,13 +613,13 @@ func loadTPCCBench(
 	var rebalanceWait time.Duration
 	switch b.LoadConfig {
 	case singleLoadgen:
-		loadArgs = `--scatter --checks=false`
+		loadArgs = `--checks=false`
 		rebalanceWait = time.Duration(b.LoadWarehouses/250) * time.Minute
 	case singlePartitionedLoadgen:
-		loadArgs = fmt.Sprintf(`--scatter --checks=false --partitions=%d`, b.partitions())
+		loadArgs = fmt.Sprintf(`--checks=false --partitions=%d`, b.partitions())
 		rebalanceWait = time.Duration(b.LoadWarehouses/125) * time.Minute
 	case multiLoadgen:
-		loadArgs = fmt.Sprintf(`--scatter --checks=false --partitions=%d --zones="%s"`,
+		loadArgs = fmt.Sprintf(`--checks=false --partitions=%d --zones="%s"`,
 			b.partitions(), strings.Join(b.Distribution.zones(), ","))
 		rebalanceWait = time.Duration(b.LoadWarehouses/50) * time.Minute
 	default:
@@ -639,7 +629,7 @@ func loadTPCCBench(
 	// Load the corresponding fixture.
 	t.l.Printf("restoring tpcc fixture\n")
 	waitForFullReplication(t, db)
-	cmd := tpccImportCmd(t, b.LoadWarehouses, loadArgs)
+	cmd := tpccImportCmd(b.LoadWarehouses, loadArgs)
 	if err := c.RunE(ctx, roachNodes[:1], cmd); err != nil {
 		return err
 	}
@@ -656,15 +646,9 @@ func loadTPCCBench(
 	// Split and scatter the tables. Ramp up to the expected load in the desired
 	// distribution. This should allow for load-based rebalancing to help
 	// distribute load. Optionally pass some load configuration-specific flags.
-	method := ""
-	if b.Chaos {
-		// For chaos tests, we don't want to use the default method because it
-		// involves preparing statements on all connections (see #51785).
-		method = "--method=simple"
-	}
 	cmd = fmt.Sprintf("./workload run tpcc --warehouses=%d --workers=%d --max-rate=%d "+
-		"--wait=false --duration=%s --scatter --tolerate-errors %s {pgurl%s}",
-		b.LoadWarehouses, b.LoadWarehouses, b.LoadWarehouses/2, rebalanceWait, method, roachNodes)
+		"--wait=false --duration=%s --scatter --tolerate-errors {pgurl%s}",
+		b.LoadWarehouses, b.LoadWarehouses, b.LoadWarehouses/2, rebalanceWait, roachNodes)
 	if out, err := c.RunWithBuffer(ctx, c.l, loadNode, cmd); err != nil {
 		return errors.Wrapf(err, "failed with output %q", string(out))
 	}
@@ -824,10 +808,9 @@ func runTPCCBench(ctx context.Context, t *test, c *cluster, b tpccBenchSpec) {
 				t.Status(fmt.Sprintf("running benchmark, warehouses=%d", warehouses))
 				histogramsPath := fmt.Sprintf("%s/warehouses=%d/stats.json", perfArtifactsDir, activeWarehouses)
 				cmd := fmt.Sprintf("./workload run tpcc --warehouses=%d --active-warehouses=%d "+
-					"--tolerate-errors --scatter --ramp=%s --duration=%s%s {pgurl%s} "+
-					"--histograms=%s",
+					"--tolerate-errors --ramp=%s --duration=%s%s --histograms=%s {pgurl%s}",
 					b.LoadWarehouses, activeWarehouses, rampDur,
-					loadDur, extraFlags, sqlGateways, histogramsPath)
+					loadDur, extraFlags, histogramsPath, sqlGateways)
 				err := c.RunE(ctx, group.loadNodes, cmd)
 				loadDone <- timeutil.Now()
 				if err != nil {

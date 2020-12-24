@@ -1,0 +1,39 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "clusterversion",
+    srcs = [
+        "cluster_version.pb.go",
+        "clusterversion.go",
+        "cockroach_versions.go",
+        "key_string.go",
+        "keyed_versions.go",
+        "setting.go",
+        "testutils.go",
+    ],
+    importpath = "github.com/cockroachdb/cockroach/pkg/clusterversion",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/roachpb",
+        "//pkg/settings",
+        "//pkg/util/log",
+        "//pkg/util/protoutil",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
+        "@com_github_gogo_protobuf//proto",
+        "@com_github_kr_pretty//:pretty",
+    ],
+)
+
+go_test(
+    name = "clusterversion_test",
+    srcs = ["cockroach_versions_test.go"],
+    embed = [":clusterversion"],
+    deps = [
+        "//pkg/roachpb",
+        "//pkg/util/leaktest",
+        "@com_github_cockroachdb_redact//:redact",
+        "@com_github_dustin_go_humanize//:go-humanize",
+        "@com_github_stretchr_testify//require",
+    ],
+)

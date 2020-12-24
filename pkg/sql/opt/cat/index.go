@@ -13,6 +13,7 @@ package cat
 import (
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -121,6 +122,13 @@ type Index interface {
 	// columns is data-dependent, not schema-dependent.
 	LaxKeyColumnCount() int
 
+	// NonInvertedPrefixColumnCount returns the number of non-inverted columns
+	// in the inverted index. An inverted index only has non-inverted columns if
+	// it is a multi-column inverted index. Therefore, a non-zero value is only
+	// returned for multi-column inverted indexes. This function panics if the
+	// index is not an inverted index.
+	NonInvertedPrefixColumnCount() int
+
 	// Column returns the ith IndexColumn within the index definition, where
 	// i < ColumnCount.
 	Column(i int) IndexColumn
@@ -227,6 +235,9 @@ type Index interface {
 	// GeoConfig returns a geospatial index configuration. If non-nil, it
 	// describes the configuration for this geospatial inverted index.
 	GeoConfig() *geoindex.Config
+
+	// Version returns the IndexDescriptorVersion of the index.
+	Version() descpb.IndexDescriptorVersion
 }
 
 // IndexColumn describes a single column that is part of an index definition.

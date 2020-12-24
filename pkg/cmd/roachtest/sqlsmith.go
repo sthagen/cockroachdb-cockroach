@@ -98,15 +98,6 @@ func registerSQLSmith(r *testRegistry) {
 		setup := setupFunc(rng)
 		setting := settingFunc(rng)
 
-		// We will enable panic injection on this connection in the vectorized
-		// engine (and will ignore the injected errors) in order to test that
-		// the panic-catching mechanism of error propagation works as expected.
-		// TODO(yuzefovich): this setting is only supported on master (i.e.
-		// after 20.2 version), so we need to gate it, yet we can't do so
-		// because 21.1 version hasn't been minted yet. We skip this check for
-		// now.
-		//setup += "SET testing_vectorize_inject_panics=true;"
-
 		conn := c.Conn(ctx, 1)
 		t.Status("executing setup")
 		c.l.Printf("setup:\n%s", setup)
@@ -124,6 +115,27 @@ func registerSQLSmith(r *testRegistry) {
 			t.Fatal(err)
 		}
 		logStmt(setStmtTimeout)
+
+		versionString, err := fetchCockroachVersion(ctx, c, c.Node(1)[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		crdbVersion, err := toCRDBVersion(versionString)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if crdbVersion >= crdbVersion21_1 {
+			// We will enable panic injection on this connection in the
+			// vectorized engine (and will ignore the injected errors) in order
+			// to test that the panic-catching mechanism of error propagation
+			// works as expected.
+			// Note: it is important to enable this testing knob only after all
+			// other setup queries have already completed (otherwise, the setup
+			// might fail because of the injected panics).
+			if _, err := conn.Exec("SET testing_vectorize_inject_panics=true;"); err != nil {
+				t.Fatal(err)
+			}
+		}
 
 		smither, err := sqlsmith.NewSmither(conn, rng, setting.Options...)
 		if err != nil {

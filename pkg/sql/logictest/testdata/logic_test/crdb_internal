@@ -11,51 +11,52 @@ CREATE TABLE crdb_internal.t (x INT)
 query error database "crdb_internal" does not exist
 DROP DATABASE crdb_internal
 
-query TTTTI
+query TTTTIT
 SHOW TABLES FROM crdb_internal
 ----
-crdb_internal  backward_dependencies        table  NULL  NULL
-crdb_internal  builtin_functions            table  NULL  NULL
-crdb_internal  cluster_queries              table  NULL  NULL
-crdb_internal  cluster_sessions             table  NULL  NULL
-crdb_internal  cluster_settings             table  NULL  NULL
-crdb_internal  cluster_transactions         table  NULL  NULL
-crdb_internal  create_statements            table  NULL  NULL
-crdb_internal  create_type_statements       table  NULL  NULL
-crdb_internal  databases                    table  NULL  NULL
-crdb_internal  feature_usage                table  NULL  NULL
-crdb_internal  forward_dependencies         table  NULL  NULL
-crdb_internal  gossip_alerts                table  NULL  NULL
-crdb_internal  gossip_liveness              table  NULL  NULL
-crdb_internal  gossip_network               table  NULL  NULL
-crdb_internal  gossip_nodes                 table  NULL  NULL
-crdb_internal  index_columns                table  NULL  NULL
-crdb_internal  invalid_objects              table  NULL  NULL
-crdb_internal  jobs                         table  NULL  NULL
-crdb_internal  kv_node_status               table  NULL  NULL
-crdb_internal  kv_store_status              table  NULL  NULL
-crdb_internal  leases                       table  NULL  NULL
-crdb_internal  node_build_info              table  NULL  NULL
-crdb_internal  node_metrics                 table  NULL  NULL
-crdb_internal  node_queries                 table  NULL  NULL
-crdb_internal  node_runtime_info            table  NULL  NULL
-crdb_internal  node_sessions                table  NULL  NULL
-crdb_internal  node_statement_statistics    table  NULL  NULL
-crdb_internal  node_transaction_statistics  table  NULL  NULL
-crdb_internal  node_transactions            table  NULL  NULL
-crdb_internal  node_txn_stats               table  NULL  NULL
-crdb_internal  partitions                   table  NULL  NULL
-crdb_internal  predefined_comments          table  NULL  NULL
-crdb_internal  ranges                       view   NULL  NULL
-crdb_internal  ranges_no_leases             table  NULL  NULL
-crdb_internal  schema_changes               table  NULL  NULL
-crdb_internal  session_trace                table  NULL  NULL
-crdb_internal  session_variables            table  NULL  NULL
-crdb_internal  table_columns                table  NULL  NULL
-crdb_internal  table_indexes                table  NULL  NULL
-crdb_internal  table_row_statistics         table  NULL  NULL
-crdb_internal  tables                       table  NULL  NULL
-crdb_internal  zones                        table  NULL  NULL
+crdb_internal  backward_dependencies        table  NULL  NULL  NULL
+crdb_internal  builtin_functions            table  NULL  NULL  NULL
+crdb_internal  cluster_database_privileges  table  NULL  NULL  NULL
+crdb_internal  cluster_queries              table  NULL  NULL  NULL
+crdb_internal  cluster_sessions             table  NULL  NULL  NULL
+crdb_internal  cluster_settings             table  NULL  NULL  NULL
+crdb_internal  cluster_transactions         table  NULL  NULL  NULL
+crdb_internal  create_statements            table  NULL  NULL  NULL
+crdb_internal  create_type_statements       table  NULL  NULL  NULL
+crdb_internal  databases                    table  NULL  NULL  NULL
+crdb_internal  feature_usage                table  NULL  NULL  NULL
+crdb_internal  forward_dependencies         table  NULL  NULL  NULL
+crdb_internal  gossip_alerts                table  NULL  NULL  NULL
+crdb_internal  gossip_liveness              table  NULL  NULL  NULL
+crdb_internal  gossip_network               table  NULL  NULL  NULL
+crdb_internal  gossip_nodes                 table  NULL  NULL  NULL
+crdb_internal  index_columns                table  NULL  NULL  NULL
+crdb_internal  invalid_objects              table  NULL  NULL  NULL
+crdb_internal  jobs                         table  NULL  NULL  NULL
+crdb_internal  kv_node_status               table  NULL  NULL  NULL
+crdb_internal  kv_store_status              table  NULL  NULL  NULL
+crdb_internal  leases                       table  NULL  NULL  NULL
+crdb_internal  node_build_info              table  NULL  NULL  NULL
+crdb_internal  node_metrics                 table  NULL  NULL  NULL
+crdb_internal  node_queries                 table  NULL  NULL  NULL
+crdb_internal  node_runtime_info            table  NULL  NULL  NULL
+crdb_internal  node_sessions                table  NULL  NULL  NULL
+crdb_internal  node_statement_statistics    table  NULL  NULL  NULL
+crdb_internal  node_transaction_statistics  table  NULL  NULL  NULL
+crdb_internal  node_transactions            table  NULL  NULL  NULL
+crdb_internal  node_txn_stats               table  NULL  NULL  NULL
+crdb_internal  partitions                   table  NULL  NULL  NULL
+crdb_internal  predefined_comments          table  NULL  NULL  NULL
+crdb_internal  ranges                       view   NULL  NULL  NULL
+crdb_internal  ranges_no_leases             table  NULL  NULL  NULL
+crdb_internal  schema_changes               table  NULL  NULL  NULL
+crdb_internal  session_trace                table  NULL  NULL  NULL
+crdb_internal  session_variables            table  NULL  NULL  NULL
+crdb_internal  table_columns                table  NULL  NULL  NULL
+crdb_internal  table_indexes                table  NULL  NULL  NULL
+crdb_internal  table_row_statistics         table  NULL  NULL  NULL
+crdb_internal  tables                       table  NULL  NULL  NULL
+crdb_internal  zones                        table  NULL  NULL  NULL
 
 statement ok
 CREATE DATABASE testdb; CREATE TABLE testdb.foo(x INT)
@@ -512,17 +513,22 @@ RESET application_name
 # reset to 0 between statements - a naive implementation could make
 # the counter increase forever, even between statements.
 #
+# TODO(radu): there should be a single fingerprint, with ::INTERVAL. The
+# different fingerprint on retries is caused by in-place mutation of the AST
+# (#22847).
+#
 query TIB
 SELECT key, max_retries, flags LIKE '!%' AS f
   FROM crdb_internal.node_statement_statistics
  WHERE application_name = 'test_max_retry'
 ORDER BY key, f
 ----
-CREATE SEQUENCE s                                           0  false
-DROP SEQUENCE s                                             0  false
-SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)  2  false
-SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)  1  true
-SET application_name = DEFAULT                              0  false
+CREATE SEQUENCE s                                                     0  false
+DROP SEQUENCE s                                                       0  false
+SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)            2  false
+SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)            1  true
+SELECT IF(nextval(_) < _, crdb_internal.force_retry(_::INTERVAL), _)  0  true
+SET application_name = DEFAULT                                        0  false
 
 
 # Testing split_enforced_until when truncating and dropping.
@@ -629,6 +635,32 @@ SELECT
 FROM
 	table41834;
 
+# Compact a range at this node, store.
+query II colnames
+SELECT node_id, store_id FROM crdb_internal.kv_store_status ORDER BY (node_id, store_id) LIMIT 1
+----
+node_id  store_id
+1        1
+
+# Do the compaction.
+query B colnames
+SELECT crdb_internal.compact_engine_span(1, 1, start_key, end_key)
+FROM crdb_internal.ranges_no_leases WHERE table_name = 'foo' LIMIT 1
+----
+crdb_internal.compact_engine_span
+true
+
+# Failed compaction due to unknown node.
+query error could not dial node ID 153
+SELECT crdb_internal.compact_engine_span(153, 1, decode('c08989', 'hex'), decode('c0898a', 'hex'))
+
+# Failed compaction due to unknown store.
+query error store 23 was not found
+SELECT crdb_internal.compact_engine_span(1, 23, decode('c08989', 'hex'), decode('c0898a', 'hex'))
+
+# Failed compaction due to invalid range.
+query error is not less than end
+SELECT crdb_internal.compact_engine_span(1, 1, decode('c0898a', 'hex'), decode('c08989', 'hex'))
 
 subtest builtin_is_admin
 
@@ -691,3 +723,32 @@ node_id  application_name     key                   statement_ids               
 1        test_txn_statistics  7134109142904971730   {14727561584397653517}                                            1
 1        test_txn_statistics  7134109142904971742   {14727561584397653505}                                            1
 1        test_txn_statistics  10166963080898232577  {2484845987516053214}                                             1
+
+## crdb_internal.cluster_database_privileges
+subtest cluster_database_privileges
+
+statement ok
+CREATE DATABASE other_db; SET DATABASE = other_db
+
+query TTT colnames
+SELECT * FROM crdb_internal.cluster_database_privileges
+----
+database_name  grantee  privilege_type
+other_db       admin    ALL
+other_db       root     ALL
+
+statement ok
+GRANT SELECT ON DATABASE other_db TO testuser;
+GRANT DROP ON DATABASE other_db TO testuser
+
+query TTT colnames
+SELECT * FROM crdb_internal.cluster_database_privileges
+----
+database_name  grantee   privilege_type
+other_db       admin     ALL
+other_db       root      ALL
+other_db       testuser  DROP
+other_db       testuser  SELECT
+
+statement ok
+SET DATABASE = test

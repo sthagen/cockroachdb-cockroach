@@ -35,26 +35,86 @@ SET vectorize = on
 statement ok
 SET distsql = on
 
+query T
+EXPLAIN ANALYZE (DISTSQL) SELECT a FROM a
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+·
+• scan
+  actual row count: 2,001
+  KV rows read: 2,001
+  KV bytes read: 16 KiB
+  missing stats
+  table: a@primary
+  spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyMkMFKKzEUhvf3KcK_zuXO3IWLrIpSoVSttMWNzCKdHGpgmsScM2Ap81i-gE8mM6mCiODy__6Z7-ScE_i5g8FmfjO_2iqrrterW2WhEaKjO3sghnlEjUYj5dgSc8wjOk0fLNwLTKXhQ-plxI1GGzPBnCBeOoLB1u46WpN1lP9V0HAk1neT1s5S9gebj9DYJBvYqL_QWPVi1KyGxvJBiT-QUdXbK5fcxiAUxMfwrZI-dcQqk3VG_ddVdVbsjvKJ6wu19JfQ2Flpn4hV7CWN88annQUfqCiaQaOQ84Isdk8w9aB_f4Q1cYqB6cv-P5mrodEgt6dyaI59buk-x3YaU-Jq-m8CjlhKW5ewCKUamuHPewAAAP__3R6a_g==
+·
+WARNING: this statement is experimental!
+
+query T
+EXPLAIN ANALYZE (DISTSQL) SELECT c.a FROM c JOIN d ON d.b = c.b
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+·
+• lookup join
+│ actual row count: 2
+│ KV rows read: 1
+│ table: d@primary
+│ equality: (b) = (b)
+│
+└── • scan
+      actual row count: 2
+      KV rows read: 2
+      KV bytes read: 16 B
+      estimated row count: 1
+      table: c@sec
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJykUk2LFDEUvPsrHnWO43QfPASERllh1nVaZhcv0od08lijPUlM0rDL0D_LP-Avk-604joofhyrXurVqyInpE8DJK4vri5e3JDeKHp5aF-Tpst2tydD7Z7MpqdnpDc9BJw3vFdHTpDvUKETCNFrTsnHmTotD3bmDnIrYF0Y80x3AtpHhjwh2zwwJG5UP_CBleH4ZAsBw1nZYVmrm8QaAtdBuSTpMQTaMUtqKtHUEHj1lrI9sqTtl8-pYO1dZpetd2ejPIaBE0VWRtIq7-_zd6p6Ss8h0Kus33MiP-Ywm803rdJvVI1uEihoTZWyumXIahJ_nvzSW7cGrx4GN02I9qjiPQSuvP84BvrgrSPvJC3J1xqwGqzZSqzCpKyG4byDf6xrduI71uP50__qq_6bvg6cgneJH3T1q83bqRNgc8vlNyY_Rs1voteLTYHtolsIwymXaVXAzpXRfOCP4uq34voncTc9-hoAAP__oYoXgA==
+·
+WARNING: this statement is experimental!
+
+query T
+EXPLAIN ANALYZE (DISTSQL) SELECT c.a FROM c INNER MERGE JOIN d ON c.a = d.b
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+·
+• merge join
+│ actual row count: 2
+│ equality: (a) = (b)
+│
+├── • scan
+│     actual row count: 2
+│     KV rows read: 2
+│     KV bytes read: 16 B
+│     estimated row count: 1
+│     table: c@primary
+│     spans: FULL SCAN
+│
+└── • scan
+      actual row count: 2
+      KV rows read: 2
+      KV bytes read: 16 B
+      missing stats
+      table: d@primary
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzMks9u1DAQxu88xWhOIEybpBIHS5VWoIC2sAlKKy4oB689bC0SO9iOtKvVPhYvwJOh2OVPuqWocOGW-WY-O9_Ps0f_uUOOl-Xb8uUVyBMBr5p6BRKWVVU2sCqb1yVc1MsKFNRVHDgHdbJGhsYqqkRPHvkHzLFlODgryXvrJmkfB5ZqizxjqM0whkluGUrrCPkegw4dIccrse6oIaHInWbIUFEQuovHysXgdC_cDhleDsJ4Ds-QYT0GDoscGb55D0H3xCH7-sWnWloTyARtzVErjENHHhwJxaFI2noXfkj5c3iBDNciyGvyYMcwTDdNP3Vj_S4V2B4Ypuomlg9iQ8jzA_u76Pk8urovevFfRi9-G_1n4tFYp8iRmqVtJ-efRu7gtyK3oQurDbnTYs6vo4_h8SJ_-uTc6c11-pytDm1JjseserGFnnrrdiC6zkoRSHHIIp2p56WbGIHS_tPxxD_xO3vI6jTkB2s83eZ458nZBI_UhtJjeDs6Se-clfGaVNbRFwVFPqRukYqlia2427-a8weYi9vm4l7z2cycHdrDo28BAAD__50-hdw=
+·
+WARNING: this statement is experimental!
+
 statement ok
-SET vectorize_row_count_threshold = 0
-
-query T
-SELECT url FROM [EXPLAIN ANALYZE SELECT a FROM a]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html#eJyMkDFPwzAQhXd-hfUmkIxIGD21giBFCk1pOgBVBjc-lUhpbHyOAFX57yhxBxiQGO9775397gR-76BQZUV2txWD78TDpnwUu-x5XSzzlViulsXLayYu7_NqWz0VV-Js1dGoa0j01tBKH4mhdkhRSzhvG2K2fkKn2ZCbT6hEou3dECZcSzTWE9QJoQ0dQWGr9x1tSBvyNwkkDAXddvNavXC-PWr_BYnK6Z6VuIZEOQQlFikk9jo0b8TCDsFNcMqHwXU_0G2STM68FKE9khIJQ8LbDxaetDnr9SgRA-dPctAHgkpH-f8iG2Jne6ZfHf7anIy1BJkDxWOxHXxDa2-b-Zk4lnNuBoY4RDWNQ95HaazHi-8AAAD___mlk0w=
-
-query T
-SELECT url FROM [EXPLAIN ANALYZE SELECT c.a FROM c JOIN d ON d.b = c.b]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html#eJyUUsuOEzEQvPMVrT6BZEImR0tIiSBIsxpmliQHYDUHx24tBsc2foigaP4dzUMwu2hROHZ1Vbuq5AvG7wY57rfV9s0BcjDwbte8h7vtx9tqU9awqTfVp89beP623B_2H6oXMFHlQoxUCTdNWYOCpga1OMJrkItjiwytU1SLE0Xkd1hgy9AHJylGF3roMhBKdUa-ZKitz6mHW4bSBUJ-waSTIeR4EEdDOxKKwqslMlSUhDbDWbmOJJHh3gsbObxEhk1OHNYFW6-Q4VEk-YUiuJx8j_fylL2ZQT2tbCDpE3FYRmQY3I8IgYTql23HcKRO7mIS94S86Nj1CW6ctlOA4mEAtfZBn0T4iQwr575lD1-dtuAshyHBFOexrcGHMXPb2io6w4xV_Ab_4l7ZC51J5qSd_aN9qo_V__Sxo-idjfSgi6cuL7uWIal7Gn9NdDlIug1ODs-MYzPoBkBRTOO2GIfSjqve4Fxc_FO8eiRuu2e_AgAA__-drQNm
-
-query T
-SELECT url FROM [EXPLAIN ANALYZE SELECT c.a FROM c INNER MERGE JOIN d ON c.a = d.b]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html#eJy0UsFq20AQvfcrhjkldJtIym0hYNOqRcGWUtmHtkGH9e7UEchadXZFU4z_vWgVSBSSlBh607x5bzTvze7R_WpQ4ipdpB_X0HMDn8tiCTfpt-vFPMthns8X33-kcPIpW61XXxencE_VZ2qkasjyPC1hmZZfUrgqshwMFHkgXII521QosLWGcrUjh_IGY6wEdmw1OWd5gPaBkJk7lJHAuu16P8CVQG2ZUO7R174hlLhWm4ZKUob4PEKBhryqmzBWzzqud4r_oMBVp1on4QMKLHovYRajwI3y-pYc2N53Azjofd81j6AEBWYF-HpHEiKHAtn-dsCkzNCsDgJH6v16zqstoYwP4jgL8dSCec1C8l8tJC9aeNi8by0bYjKTratB-S_KMzksibd0ZeuW-DyZ5tDQT38yi9-fXnK9vR0_jzkl3ZHufW3bhzhe8n_xlhOW5DrbOnqaw7OTo8E8mS2NYTrbs6Zrtjr8ZiyLoAuAIefHbjIWWRta4Y09FsdvECdPxcmr4ouJODpUh3d_AwAA___sOVZe
-
-statement ok
-RESET vectorize; RESET distsql; RESET vectorize_row_count_threshold
+RESET vectorize; RESET distsql
 
 statement ok
 SET tracing=off
@@ -104,7 +164,9 @@ EXPLAIN (VEC) SELECT stddev(0) FROM t46123 WHERE ('' COLLATE en)::BOOL
 └ Node 1
   └ *colexec.orderedAggregator
     └ *colexec.distinctChainOps
-      └ *rowexec.tableReader
+      └ *colexec.constInt64Op
+        └ *rowexec.filtererProcessor
+          └ *colfetcher.ColBatchScan
 
 # Regression test for #46122 (checking that we gracefully fallback to row
 # execution on cross joins).

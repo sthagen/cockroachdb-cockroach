@@ -137,6 +137,12 @@ func NewProcessor(
 		}
 		return newTableReader(flowCtx, processorID, core.TableReader, post, outputs[0])
 	}
+	if core.Filterer != nil {
+		if err := checkNumInOut(inputs, outputs, 1, 1); err != nil {
+			return nil, err
+		}
+		return newFiltererProcessor(flowCtx, processorID, core.Filterer, inputs[0], post, outputs[0])
+	}
 	if core.JoinReader != nil {
 		if err := checkNumInOut(inputs, outputs, 1, 1); err != nil {
 			return nil, err
@@ -192,8 +198,7 @@ func NewProcessor(
 			return nil, err
 		}
 		return newHashJoiner(
-			flowCtx, processorID, core.HashJoiner, inputs[0], inputs[1], post,
-			outputs[0], false, /* disableTempStorage */
+			flowCtx, processorID, core.HashJoiner, inputs[0], inputs[1], post, outputs[0],
 		)
 	}
 	if core.InvertedJoiner != nil {
@@ -233,7 +238,7 @@ func NewProcessor(
 		if NewReadImportDataProcessor == nil {
 			return nil, errors.New("ReadImportData processor unimplemented")
 		}
-		return NewReadImportDataProcessor(flowCtx, processorID, *core.ReadImport, outputs[0])
+		return NewReadImportDataProcessor(flowCtx, processorID, *core.ReadImport, post, outputs[0])
 	}
 	if core.BackupData != nil {
 		if err := checkNumInOut(inputs, outputs, 0, 1); err != nil {
@@ -304,14 +309,11 @@ func NewProcessor(
 		return newWindower(flowCtx, processorID, core.Windower, inputs[0], post, outputs[0])
 	}
 	if core.LocalPlanNode != nil {
-		numInputs := 0
-		if core.LocalPlanNode.NumInputs != nil {
-			numInputs = int(*core.LocalPlanNode.NumInputs)
-		}
+		numInputs := int(core.LocalPlanNode.NumInputs)
 		if err := checkNumInOut(inputs, outputs, numInputs, 1); err != nil {
 			return nil, err
 		}
-		processor := localProcessors[*core.LocalPlanNode.RowSourceIdx]
+		processor := localProcessors[core.LocalPlanNode.RowSourceIdx]
 		if err := processor.InitWithOutput(flowCtx, post, outputs[0]); err != nil {
 			return nil, err
 		}
@@ -352,7 +354,7 @@ func NewProcessor(
 }
 
 // NewReadImportDataProcessor is implemented in the non-free (CCL) codebase and then injected here via runtime initialization.
-var NewReadImportDataProcessor func(*execinfra.FlowCtx, int32, execinfrapb.ReadImportDataSpec, execinfra.RowReceiver) (execinfra.Processor, error)
+var NewReadImportDataProcessor func(*execinfra.FlowCtx, int32, execinfrapb.ReadImportDataSpec, *execinfrapb.PostProcessSpec, execinfra.RowReceiver) (execinfra.Processor, error)
 
 // NewBackupDataProcessor is implemented in the non-free (CCL) codebase and then injected here via runtime initialization.
 var NewBackupDataProcessor func(*execinfra.FlowCtx, int32, execinfrapb.BackupDataSpec, execinfra.RowReceiver) (execinfra.Processor, error)

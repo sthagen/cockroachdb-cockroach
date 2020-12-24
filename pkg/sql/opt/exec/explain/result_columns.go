@@ -15,7 +15,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/errors"
@@ -163,29 +162,10 @@ func getResultColumns(
 		return colinfo.SequenceSelectColumns, nil
 
 	case explainOp:
-		switch o := args.(*explainArgs).Options; o.Mode {
-		case tree.ExplainPlan:
-			if o.Flags[tree.ExplainFlagVerbose] || o.Flags[tree.ExplainFlagTypes] {
-				return colinfo.ExplainPlanVerboseColumns, nil
-			}
-			return colinfo.ExplainPlanColumns, nil
-		case tree.ExplainDistSQL:
-			return colinfo.ExplainDistSQLColumns, nil
-		case tree.ExplainVec:
-			return colinfo.ExplainVecColumns, nil
-		default:
-			return nil, errors.AssertionFailedf("unknown explain mode %v", o.Mode)
-		}
-
-	case explainPlanOp:
-		o := args.(*explainPlanArgs).Options
-		if o.Flags[tree.ExplainFlagVerbose] || o.Flags[tree.ExplainFlagTypes] {
-			return colinfo.ExplainPlanVerboseColumns, nil
-		}
 		return colinfo.ExplainPlanColumns, nil
 
 	case explainOptOp:
-		return colinfo.ExplainOptColumns, nil
+		return colinfo.ExplainPlanColumns, nil
 
 	case showTraceOp:
 		if args.(*showTraceArgs).Compact {
@@ -194,7 +174,7 @@ func getResultColumns(
 		return colinfo.ShowTraceColumns, nil
 
 	case createTableOp, createTableAsOp, createViewOp, controlJobsOp, controlSchedulesOp,
-		cancelQueriesOp, cancelSessionsOp, errorIfRowsOp, deleteRangeOp:
+		cancelQueriesOp, cancelSessionsOp, createStatisticsOp, errorIfRowsOp, deleteRangeOp:
 		// These operations produce no columns.
 		return nil, nil
 
@@ -218,6 +198,9 @@ func tableColumns(table cat.Table, ordinals exec.TableColumnOrdinalSet) colinfo.
 func joinColumns(
 	joinType descpb.JoinType, left, right colinfo.ResultColumns,
 ) colinfo.ResultColumns {
+	if !joinType.ShouldIncludeLeftColsInOutput() {
+		return right
+	}
 	if !joinType.ShouldIncludeRightColsInOutput() {
 		return left
 	}

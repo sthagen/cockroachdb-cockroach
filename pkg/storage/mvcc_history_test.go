@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -37,7 +38,7 @@ import (
 //
 // The input files use the following DSL:
 //
-// txn_begin      t=<name> [ts=<int>[,<int>]]
+// txn_begin      t=<name> [ts=<int>[,<int>]] [maxTs=<int>[,<int>]]
 // txn_remove     t=<name>
 // txn_restart    t=<name>
 // txn_update     t=<name> t2=<name>
@@ -50,6 +51,7 @@ import (
 //
 // cput      [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> v=<string> [raw] [cond=<string>]
 // del       [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key>
+// del_range [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [end=<key>] [max=<max>] [returnKeys]
 // get       [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [inconsistent] [tombstones] [failOnMoreRecent]
 // increment [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [inc=<val>]
 // put       [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> v=<string> [raw]
@@ -87,34 +89,36 @@ func TestMVCCHistories(t *testing.T) {
 		t.Run(engineImpl.name, func(t *testing.T) {
 
 			// Everything reads/writes under the same prefix.
-			key := roachpb.Key("")
-			span := roachpb.Span{Key: key, EndKey: key.PrefixEnd()}
+			span := roachpb.Span{Key: keys.LocalMax, EndKey: roachpb.KeyMax}
 
 			datadriven.Walk(t, "testdata/mvcc_histories", func(t *testing.T, path string) {
+				if strings.Contains(path, "_disallow_separated") && !DisallowSeparatedIntents {
+					return
+				}
+				if strings.Contains(path, "_allow_separated") && DisallowSeparatedIntents {
+					return
+				}
 				// We start from a clean slate in every test file.
 				engine := engineImpl.create()
 				defer engine.Close()
 
 				reportDataEntries := func(buf *bytes.Buffer) error {
 					hasData := false
-					err := engine.Iterate(
-						span.Key,
-						span.EndKey,
-						func(r MVCCKeyValue) error {
-							hasData = true
-							if r.Key.Timestamp.IsEmpty() {
-								// Meta is at timestamp zero.
-								meta := enginepb.MVCCMetadata{}
-								if err := protoutil.Unmarshal(r.Value, &meta); err != nil {
-									fmt.Fprintf(buf, "meta: %v -> error decoding proto from %v: %v\n", r.Key, r.Value, err)
-								} else {
-									fmt.Fprintf(buf, "meta: %v -> %+v\n", r.Key, &meta)
-								}
+					err := engine.MVCCIterate(span.Key, span.EndKey, MVCCKeyAndIntentsIterKind, func(r MVCCKeyValue) error {
+						hasData = true
+						if r.Key.Timestamp.IsEmpty() {
+							// Meta is at timestamp zero.
+							meta := enginepb.MVCCMetadata{}
+							if err := protoutil.Unmarshal(r.Value, &meta); err != nil {
+								fmt.Fprintf(buf, "meta: %v -> error decoding proto from %v: %v\n", r.Key, r.Value, err)
 							} else {
-								fmt.Fprintf(buf, "data: %v -> %s\n", r.Key, roachpb.Value{RawBytes: r.Value}.PrettyPrint())
+								fmt.Fprintf(buf, "meta: %v -> %+v\n", r.Key, &meta)
 							}
-							return nil
-						})
+						} else {
+							fmt.Fprintf(buf, "data: %v -> %s\n", r.Key, roachpb.Value{RawBytes: r.Value}.PrettyPrint())
+						}
+						return nil
+					})
 					if !hasData {
 						buf.WriteString("<no data>\n")
 					}
@@ -169,6 +173,7 @@ func TestMVCCHistories(t *testing.T) {
 						// output.
 						var buf bytes.Buffer
 						e.results.buf = &buf
+						e.results.traceIntentWrites = trace
 
 						// foundErr remembers which error was last encountered while
 						// executing the script under "run".
@@ -387,6 +392,7 @@ var commands = map[string]cmd{
 	"clear_range": {typDataUpdate, cmdClearRange},
 	"cput":        {typDataUpdate, cmdCPut},
 	"del":         {typDataUpdate, cmdDelete},
+	"del_range":   {typDataUpdate, cmdDeleteRange},
 	"get":         {typReadOnly, cmdGet},
 	"increment":   {typDataUpdate, cmdIncrement},
 	"merge":       {typDataUpdate, cmdMerge},
@@ -410,11 +416,12 @@ func cmdTxnBegin(e *evalCtx) error {
 	var txnName string
 	e.scanArg("t", &txnName)
 	ts := e.getTs(nil)
+	maxTs := e.getTsWithName(nil, "maxTs")
 	key := roachpb.KeyMin
 	if e.hasArg("k") {
 		key = e.getKey()
 	}
-	txn, err := e.newTxn(txnName, ts, key)
+	txn, err := e.newTxn(txnName, ts, maxTs, key)
 	e.results.txn = txn
 	return err
 }
@@ -497,11 +504,43 @@ func cmdTxnUpdate(e *evalCtx) error {
 	return nil
 }
 
+type intentPrintingReadWriter struct {
+	ReadWriter
+	buf io.Writer
+}
+
+func (rw intentPrintingReadWriter) PutIntent(
+	key roachpb.Key,
+	value []byte,
+	state PrecedingIntentState,
+	txnDidNotUpdateMeta bool,
+	txnUUID uuid.UUID,
+) error {
+	fmt.Fprintf(rw.buf, "called PutIntent(%v, _, %v, TDNUM(%t), %v)\n",
+		key, state, txnDidNotUpdateMeta, txnUUID)
+	return rw.ReadWriter.PutIntent(key, value, state, txnDidNotUpdateMeta, txnUUID)
+}
+
+func (rw intentPrintingReadWriter) ClearIntent(
+	key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
+) error {
+	fmt.Fprintf(rw.buf, "called ClearIntent(%v, %v, TDNUM(%t), %v)\n",
+		key, state, txnDidNotUpdateMeta, txnUUID)
+	return rw.ReadWriter.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID)
+}
+
+func (e *evalCtx) tryWrapForIntentPrinting(rw ReadWriter) ReadWriter {
+	if e.results.traceIntentWrites {
+		return intentPrintingReadWriter{ReadWriter: rw, buf: e.results.buf}
+	}
+	return rw
+}
+
 func cmdResolveIntent(e *evalCtx) error {
 	txn := e.getTxn(mandatory)
 	key := e.getKey()
 	status := e.getTxnStatus()
-	return e.resolveIntent(e.engine, key, txn, status)
+	return e.resolveIntent(e.tryWrapForIntentPrinting(e.engine), key, txn, status)
 }
 
 func (e *evalCtx) resolveIntent(
@@ -521,7 +560,7 @@ func cmdCheckIntent(e *evalCtx) error {
 	}
 	metaKey := mvccKey(key)
 	var meta enginepb.MVCCMetadata
-	ok, _, _, err := e.engine.GetProto(metaKey, &meta)
+	ok, _, _, err := e.engine.MVCCGetProto(metaKey, &meta)
 	if err != nil {
 		return err
 	}
@@ -539,10 +578,7 @@ func cmdCheckIntent(e *evalCtx) error {
 
 func cmdClearRange(e *evalCtx) error {
 	key, endKey := e.getKeyRange()
-	return e.engine.ClearRange(
-		MVCCKey{Key: key},
-		MVCCKey{Key: endKey},
-	)
+	return e.engine.ClearMVCCRangeAndIntents(key, endKey)
 }
 
 func cmdCPut(e *evalCtx) error {
@@ -583,6 +619,37 @@ func cmdDelete(e *evalCtx) error {
 		if err := MVCCDelete(e.ctx, rw, nil, key, ts, txn); err != nil {
 			return err
 		}
+		if resolve {
+			return e.resolveIntent(rw, key, txn, resolveStatus)
+		}
+		return nil
+	})
+}
+
+func cmdDeleteRange(e *evalCtx) error {
+	txn := e.getTxn(optional)
+	key, endKey := e.getKeyRange()
+	ts := e.getTs(txn)
+	returnKeys := e.hasArg("returnKeys")
+	max := 0
+	if e.hasArg("max") {
+		e.scanArg("max", &max)
+	}
+
+	resolve, resolveStatus := e.getResolve()
+	return e.withWriter("del_range", func(rw ReadWriter) error {
+		deleted, resumeSpan, num, err := MVCCDeleteRange(e.ctx, rw, nil, key, endKey, int64(max), ts, txn, returnKeys)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(e.results.buf, "del_range: %v-%v -> deleted %d key(s)\n", key, endKey, num)
+		for _, key := range deleted {
+			fmt.Fprintf(e.results.buf, "del_range: returned %v\n", key)
+		}
+		if resumeSpan != nil {
+			fmt.Fprintf(e.results.buf, "del_range: resume span [%s,%s)\n", resumeSpan.Key, resumeSpan.EndKey)
+		}
+
 		if resolve {
 			return e.resolveIntent(rw, key, txn, resolveStatus)
 		}
@@ -737,8 +804,9 @@ func cmdScan(e *evalCtx) error {
 // script.
 type evalCtx struct {
 	results struct {
-		buf io.Writer
-		txn *roachpb.Transaction
+		buf               io.Writer
+		txn               *roachpb.Transaction
+		traceIntentWrites bool
 	}
 	ctx        context.Context
 	engine     Engine
@@ -799,15 +867,19 @@ func (e *evalCtx) getResolve() (bool, roachpb.TransactionStatus) {
 }
 
 func (e *evalCtx) getTs(txn *roachpb.Transaction) hlc.Timestamp {
+	return e.getTsWithName(txn, "ts")
+}
+
+func (e *evalCtx) getTsWithName(txn *roachpb.Transaction, name string) hlc.Timestamp {
 	var ts hlc.Timestamp
 	if txn != nil {
 		ts = txn.ReadTimestamp
 	}
-	if !e.hasArg("ts") {
+	if !e.hasArg(name) {
 		return ts
 	}
 	var tsS string
-	e.scanArg("ts", &tsS)
+	e.scanArg(name, &tsS)
 	parts := strings.Split(tsS, ",")
 
 	// Find the wall time part.
@@ -869,6 +941,7 @@ func (e *evalCtx) withWriter(cmd string, fn func(_ ReadWriter) error) error {
 		defer batch.Close()
 		rw = batch
 	}
+	rw = e.tryWrapForIntentPrinting(rw)
 	origErr := fn(rw)
 	if batch != nil {
 		batchStatus := "non-empty"
@@ -921,7 +994,7 @@ func (e *evalCtx) getKeyRange() (sk, ek roachpb.Key) {
 }
 
 func (e *evalCtx) newTxn(
-	txnName string, ts hlc.Timestamp, key roachpb.Key,
+	txnName string, ts, maxTs hlc.Timestamp, key roachpb.Key,
 ) (*roachpb.Transaction, error) {
 	if _, ok := e.txns[txnName]; ok {
 		e.Fatalf("txn %s already open", txnName)
@@ -935,6 +1008,7 @@ func (e *evalCtx) newTxn(
 		},
 		Name:          txnName,
 		ReadTimestamp: ts,
+		MaxTimestamp:  maxTs,
 		Status:        roachpb.PENDING,
 	}
 	e.txnCounter = e.txnCounter.Add(1)

@@ -39,10 +39,11 @@ type EngineKey struct {
 }
 
 const (
-	engineKeyNoVersion                    = 0
-	engineKeyVersionWallTimeLen           = 8
-	engineKeyVersionWallAndLogicalTimeLen = 12
-	engineKeyVersionLockTableLen          = 17
+	engineKeyNoVersion                         = 0
+	engineKeyVersionWallTimeLen                = 8
+	engineKeyVersionWallAndLogicalTimeLen      = 12
+	engineKeyVersionWallLogicalAndFlagsTimeLen = 13
+	engineKeyVersionLockTableLen               = 17
 )
 
 // Format implements the fmt.Formatter interface
@@ -51,7 +52,7 @@ func (k EngineKey) Format(f fmt.State, c rune) {
 }
 
 // Encoding:
-// Key + \x00 (sentinel) [+ Version + <byte representing length of Version>]
+// Key + \x00 (sentinel) [+ Version + <byte representing length of Version + 1>]
 //
 // The motivation for the sentinel is that we configure the underlying storage
 // engine (Pebble) with a Split function that can be used for constructing
@@ -62,6 +63,19 @@ const (
 	sentinelLen            = 1
 	suffixEncodedLengthLen = 1
 )
+
+// Copy makes a copy of the key.
+func (k EngineKey) Copy() EngineKey {
+	buf := make([]byte, len(k.Key)+len(k.Version))
+	copy(buf, k.Key)
+	k.Key = buf[:len(k.Key)]
+	if len(k.Version) > 0 {
+		versionCopy := buf[len(k.Key):]
+		copy(versionCopy, k.Version)
+		k.Version = versionCopy
+	}
+	return k
+}
 
 // EncodedLen returns the encoded length of k.
 func (k EngineKey) EncodedLen() int {
@@ -97,7 +111,11 @@ func (k EngineKey) EncodeToBuf(buf []byte) []byte {
 func (k EngineKey) encodeToSizedBuf(buf []byte) {
 	copy(buf, k.Key)
 	pos := len(k.Key)
-	suffixLen := len(k.Version)
+	// The length of the suffix is the full encoded length (len(buf)) minus the
+	// length of the key minus the length of the sentinel. Note that the
+	// suffixLen is 0 when Version is empty, and when Version is non-empty, it
+	// is len(Version)+1. That is, it includes the length byte at the end.
+	suffixLen := len(buf) - pos - 1
 	if suffixLen > 0 {
 		buf[pos] = 0
 		pos += sentinelLen
@@ -110,8 +128,10 @@ func (k EngineKey) encodeToSizedBuf(buf []byte) {
 // This includes the case of an empty timestamp.
 func (k EngineKey) IsMVCCKey() bool {
 	l := len(k.Version)
-	return l == engineKeyNoVersion || l == engineKeyVersionWallTimeLen ||
-		l == engineKeyVersionWallAndLogicalTimeLen
+	return l == engineKeyNoVersion ||
+		l == engineKeyVersionWallTimeLen ||
+		l == engineKeyVersionWallAndLogicalTimeLen ||
+		l == engineKeyVersionWallLogicalAndFlagsTimeLen
 }
 
 // IsLockTableKey returns true if the key can be decoded as a LockTableKey.
@@ -130,6 +150,10 @@ func (k EngineKey) ToMVCCKey() (MVCCKey, error) {
 	case engineKeyVersionWallAndLogicalTimeLen:
 		key.Timestamp.WallTime = int64(binary.BigEndian.Uint64(k.Version[0:8]))
 		key.Timestamp.Logical = int32(binary.BigEndian.Uint32(k.Version[8:12]))
+	case engineKeyVersionWallLogicalAndFlagsTimeLen:
+		key.Timestamp.WallTime = int64(binary.BigEndian.Uint64(k.Version[0:8]))
+		key.Timestamp.Logical = int32(binary.BigEndian.Uint32(k.Version[8:12]))
+		key.Timestamp.Flags = uint32(k.Version[12])
 	default:
 		return MVCCKey{}, errors.Errorf("version is not an encoded timestamp %x", k.Version)
 	}
@@ -163,13 +187,11 @@ func DecodeEngineKey(b []byte) (key EngineKey, ok bool) {
 	if len(b) == 0 {
 		return EngineKey{}, false
 	}
-	// Last byte is the version length.
+	// Last byte is the version length + 1 when there is a version,
+	// else it is 0.
 	versionLen := int(b[len(b)-1])
 	// keyPartEnd points to the sentinel byte.
-	keyPartEnd := len(b) - 1
-	if versionLen > 0 {
-		keyPartEnd = len(b) - 1 - versionLen - 1
-	}
+	keyPartEnd := len(b) - 1 - versionLen
 	if keyPartEnd < 0 {
 		return EngineKey{}, false
 	}
@@ -181,6 +203,25 @@ func DecodeEngineKey(b []byte) (key EngineKey, ok bool) {
 		key.Version = b[keyPartEnd+1 : len(b)-1]
 	}
 	return key, true
+}
+
+// GetKeyPartFromEngineKey is a specialization of DecodeEngineKey which avoids
+// constructing a slice for the version part of the key, since the caller does
+// not need it.
+func GetKeyPartFromEngineKey(engineKey []byte) (key []byte, ok bool) {
+	if len(engineKey) == 0 {
+		return nil, false
+	}
+	// Last byte is the version length + 1 when there is a version,
+	// else it is 0.
+	versionLen := int(engineKey[len(engineKey)-1])
+	// keyPartEnd points to the sentinel byte.
+	keyPartEnd := len(engineKey) - 1 - versionLen
+	if keyPartEnd < 0 {
+		return nil, false
+	}
+	// Key excludes the sentinel byte.
+	return engineKey[:keyPartEnd], true
 }
 
 // EngineKeyFormatter is a fmt.Formatter for EngineKeys.
@@ -204,22 +245,32 @@ type LockTableKey struct {
 	TxnUUID []byte
 }
 
-// ToEngineKey converts a lock table key to an EngineKey.
-//
-// TODO(sumeer): if this function is needed for non-test code, change
-// it to use a buffer passed in by the caller, to avoid the allocation.
-func (lk LockTableKey) ToEngineKey() EngineKey {
+// ToEngineKey converts a lock table key to an EngineKey. buf is used as
+// scratch-space to avoid allocations -- its contents will be overwritten and
+// not appended to.
+func (lk LockTableKey) ToEngineKey(buf []byte) (EngineKey, []byte) {
 	if len(lk.TxnUUID) != uuid.Size {
 		panic("invalid TxnUUID")
 	}
 	if lk.Strength != lock.Exclusive {
 		panic("unsupported lock strength")
 	}
-	k := EngineKey{
-		Key:     keys.LockTableSingleKey(lk.Key),
-		Version: make([]byte, engineKeyVersionLockTableLen),
+	// The first term in estimatedLen is for LockTableSingleKey.
+	estimatedLen :=
+		(len(keys.LocalRangeLockTablePrefix) + len(keys.LockTableSingleKeyInfix) + len(lk.Key) + 3) +
+			engineKeyVersionLockTableLen
+	if len(buf) < estimatedLen {
+		buf = make([]byte, estimatedLen)
+	}
+	ltKey, buf := keys.LockTableSingleKey(lk.Key, buf)
+	k := EngineKey{Key: ltKey}
+	if cap(buf)-len(buf) >= engineKeyVersionLockTableLen {
+		k.Version = buf[len(buf) : len(buf)+engineKeyVersionLockTableLen]
+	} else {
+		// estimatedLen was an underestimate.
+		k.Version = make([]byte, engineKeyVersionLockTableLen)
 	}
 	k.Version[0] = byte(lk.Strength)
 	copy(k.Version[1:], lk.TxnUUID)
-	return k
+	return k, buf
 }

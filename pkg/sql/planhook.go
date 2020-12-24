@@ -13,6 +13,8 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -42,7 +44,7 @@ type planHookFn func(
 // channel argument is used to return results to the plan's runner. It's
 // a blocking channel, so implementors should be careful to only use blocking
 // sends on it when necessary. Any subplans returned by the hook when initially
-// called are passed back, planned and started, for the the RowFn's use.
+// called are passed back, planned and started, for the RowFn's use.
 //
 //TODO(dt): should this take runParams like a normal planNode.Next?
 type PlanHookRowFn func(context.Context, []planNode, chan<- tree.Datums) error
@@ -85,11 +87,11 @@ type PlanHookState interface {
 	TypeAsStringOpts(
 		ctx context.Context, opts tree.KVOptions, optsValidate map[string]KVStringOptValidate,
 	) (func() (map[string]string, error), error)
-	User() string
+	User() security.SQLUsername
 	AuthorizationAccessor
 	// The role create/drop call into OSS code to reuse plan nodes.
 	// TODO(mberhault): it would be easier to just pass a planner to plan hooks.
-	GetAllRoles(ctx context.Context) (map[string]bool, error)
+	GetAllRoles(ctx context.Context) (map[security.SQLUsername]bool, error)
 	BumpRoleMembershipTableVersion(ctx context.Context) error
 	EvalAsOfTimestamp(ctx context.Context, asOf tree.AsOfClause) (hlc.Timestamp, error)
 	ResolveUncachedDatabaseByName(
@@ -100,6 +102,8 @@ type PlanHookState interface {
 	ShowCreate(
 		ctx context.Context, dbPrefix string, allDescs []descpb.Descriptor, desc *tabledesc.Immutable, displayOptions ShowCreateDisplayOptions,
 	) (string, error)
+	CreateSchemaNamespaceEntry(ctx context.Context, schemaNameKey roachpb.Key,
+		schemaID descpb.ID) error
 }
 
 // AddPlanHook adds a hook used to short-circuit creating a planNode from a

@@ -34,9 +34,11 @@ apt-get install --yes \
   docker-ce \
   docker-compose \
   gnome-keyring \
+  gnupg2 \
   git \
   golang-go \
   openjdk-11-jre-headless \
+  pass \
   unzip
 # Installing gnome-keyring prevents the error described in
 # https://github.com/moby/moby/issues/34048
@@ -87,7 +89,7 @@ do
   git clean -dxf
 
   git checkout "$branch"
-  COCKROACH_BUILDER_CCACHE=1 build/builder.sh make test testrace TESTS=-
+  COCKROACH_BUILDER_CCACHE=1 build/builder.sh make test testrace TESTTIMEOUT=45m TESTS=-
   # TODO(benesch): store the acceptanceversion somewhere more accessible.
   docker pull $(git grep cockroachdb/acceptance -- '*.go' | sed -E 's/.*"([^"]*).*"/\1/') || true
 done

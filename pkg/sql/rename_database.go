@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/sequence"
 	"github.com/cockroachdb/errors"
 )
@@ -42,6 +43,14 @@ type renameDatabaseNode struct {
 // Privileges: superuser + DROP or ownership + CREATEDB privileges
 //   Notes: mysql >= 5.1.23 does not allow database renames.
 func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER DATABASE",
+	); err != nil {
+		return nil, err
+	}
+
 	if n.Name == "" || n.NewName == "" {
 		return nil, errEmptyDatabaseName
 	}
@@ -50,7 +59,8 @@ func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (p
 		return nil, pgerror.DangerousStatementf("RENAME DATABASE on current database")
 	}
 
-	dbDesc, err := p.ResolveMutableDatabaseDescriptor(ctx, string(n.Name), true /*required*/)
+	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
+		tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +124,6 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 	// Rather than trying to rewrite them with the changed DB name, we
 	// simply disallow such renames for now.
 	// See #34416.
-	phyAccessor := p.PhysicalSchemaAccessor()
 	lookupFlags := p.CommonLookupFlags(true /*required*/)
 	// DDL statements bypass the cache.
 	lookupFlags.AvoidCached = true
@@ -123,10 +132,9 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 		return err
 	}
 	for _, schema := range schemas {
-		tbNames, err := phyAccessor.GetObjectNames(
+		tbNames, err := p.Descriptors().GetObjectNames(
 			ctx,
 			p.txn,
-			p.ExecCfg().Codec,
 			dbDesc,
 			schema,
 			tree.DatabaseListFlags{
@@ -139,26 +147,15 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 		}
 		lookupFlags.Required = false
 		for i := range tbNames {
-			objDesc, err := phyAccessor.GetObjectDesc(
-				ctx,
-				p.txn,
-				p.ExecCfg().Settings,
-				p.ExecCfg().Codec,
-				tbNames[i].Catalog(),
-				tbNames[i].Schema(),
-				tbNames[i].Table(),
-				tree.ObjectLookupFlags{
-					CommonLookupFlags: lookupFlags,
-					DesiredObjectKind: tree.TableObject,
-				},
+			found, tbDesc, err := p.Descriptors().GetImmutableTableByName(
+				ctx, p.txn, &tbNames[i], tree.ObjectLookupFlags{CommonLookupFlags: lookupFlags},
 			)
 			if err != nil {
 				return err
 			}
-			if objDesc == nil {
+			if !found {
 				continue
 			}
-			tbDesc := objDesc.(catalog.TableDescriptor)
 
 			if err := tbDesc.ForeachDependedOnBy(func(dependedOn *descpb.TableDescriptor_Reference) error {
 				dependentDesc, err := catalogkv.MustGetTableDescByID(ctx, p.txn, p.ExecCfg().Codec, dependedOn.ID)
@@ -247,19 +244,12 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 
 	// Log Rename Database event. This is an auditable log event and is recorded
 	// in the same transaction as the table descriptor update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		ctx,
-		p.txn,
-		EventLogRenameDatabase,
-		int32(n.dbDesc.GetID()),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			DatabaseName    string
-			Statement       string
-			User            string
-			NewDatabaseName string
-		}{n.n.Name.String(), n.n.String(), p.SessionData().User, n.newName},
-	)
+	return p.logEvent(ctx,
+		n.dbDesc.GetID(),
+		&eventpb.RenameDatabase{
+			DatabaseName:    n.n.Name.String(),
+			NewDatabaseName: n.newName,
+		})
 }
 
 // isAllowedDependentDescInRename determines when rename database is allowed with

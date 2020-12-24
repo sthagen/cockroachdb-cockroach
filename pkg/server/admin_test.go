@@ -41,7 +41,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -335,7 +334,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 		"GRANT %s ON DATABASE %s TO %s",
 		strings.Join(privileges, ", "),
 		testdb,
-		authenticatedUserNameNoAdmin,
+		authenticatedUserNameNoAdmin().SQLIdentifier(),
 	)
 	if _, err := db.Exec(query); err != nil {
 		t.Fatal(err)
@@ -382,14 +381,14 @@ func TestAdminAPIDatabases(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if a, e := len(details.Grants), 2; a != e {
+			if a, e := len(details.Grants), 4; a != e {
 				t.Fatalf("# of grants %d != expected %d", a, e)
 			}
 
 			userGrants := make(map[string][]string)
 			for _, grant := range details.Grants {
 				switch grant.User {
-				case security.AdminRole, security.RootUser, authenticatedUserNameNoAdmin:
+				case security.AdminRole, security.RootUser, authenticatedUserNoAdmin:
 					userGrants[grant.User] = append(userGrants[grant.User], grant.Privileges...)
 				default:
 					t.Fatalf("unknown grant to user %s", grant.User)
@@ -405,7 +404,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 					if !reflect.DeepEqual(p, []string{"ALL"}) {
 						t.Fatalf("privileges %v != expected %v", p, privileges)
 					}
-				case authenticatedUserNameNoAdmin:
+				case authenticatedUserNoAdmin:
 					sort.Strings(p)
 					if !reflect.DeepEqual(p, privileges) {
 						t.Fatalf("privileges %v != expected %v", p, privileges)
@@ -416,7 +415,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 			}
 
 			// Verify Descriptor ID.
-			databaseID, err := ts.admin.queryDatabaseID(ctx, security.RootUser, testdb)
+			databaseID, err := ts.admin.queryDatabaseID(ctx, security.RootUserName(), testdb)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -660,8 +659,8 @@ func TestAdminAPITableDetails(t *testing.T) {
 				fmt.Sprintf("CREATE DATABASE %s", escDBName),
 				fmt.Sprintf("CREATE SCHEMA %s", schemaName),
 				fmt.Sprintf(`CREATE TABLE %s.%s (%s)`, escDBName, tblName, tableSchema),
-				fmt.Sprintf("CREATE USER readonly"),
-				fmt.Sprintf("CREATE USER app"),
+				"CREATE USER readonly",
+				"CREATE USER app",
 				fmt.Sprintf("GRANT SELECT ON %s.%s TO readonly", escDBName, tblName),
 				fmt.Sprintf("GRANT SELECT,UPDATE,DELETE ON %s.%s TO app", escDBName, tblName),
 			}
@@ -767,7 +766,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 			}
 
 			// Verify Descriptor ID.
-			tableID, err := ts.admin.queryTableID(ctx, security.RootUser, tc.dbName, tc.tblName)
+			tableID, err := ts.admin.queryTableID(ctx, security.RootUserName(), tc.dbName, tc.tblName)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -810,7 +809,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 		if err := getAdminJSONProto(s, "databases/test/tables/tbl", &resp); err != nil {
 			t.Fatal(err)
 		}
-		if a, e := &resp.ZoneConfig, &expectedZone; !proto.Equal(a, e) {
+		if a, e := &resp.ZoneConfig, &expectedZone; !a.Equal(e) {
 			t.Errorf("actual table zone config %v did not match expected value %v", a, e)
 		}
 		if a, e := resp.ZoneConfigLevel, expectedLevel; a != e {
@@ -830,7 +829,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 		if err := getAdminJSONProto(s, "databases/test", &resp); err != nil {
 			t.Fatal(err)
 		}
-		if a, e := &resp.ZoneConfig, &expectedZone; !proto.Equal(a, e) {
+		if a, e := &resp.ZoneConfig, &expectedZone; !a.Equal(e) {
 			t.Errorf("actual db zone config %v did not match expected value %v", a, e)
 		}
 		if a, e := resp.ZoneConfigLevel, expectedLevel; a != e {
@@ -857,11 +856,11 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	verifyDbZone(s.(*TestServer).Cfg.DefaultZoneConfig, serverpb.ZoneConfigurationLevel_CLUSTER)
 	verifyTblZone(s.(*TestServer).Cfg.DefaultZoneConfig, serverpb.ZoneConfigurationLevel_CLUSTER)
 
-	databaseID, err := ts.admin.queryDatabaseID(ctx, security.RootUser, "test")
+	databaseID, err := ts.admin.queryDatabaseID(ctx, security.RootUserName(), "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tableID, err := ts.admin.queryTableID(ctx, security.RootUser, "test", "tbl")
+	tableID, err := ts.admin.queryTableID(ctx, security.RootUserName(), "test", "tbl")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -943,26 +942,26 @@ func TestAdminAPIEvents(t *testing.T) {
 
 	const allEvents = ""
 	type testcase struct {
-		eventType  sql.EventLogType
+		eventType  string
 		hasLimit   bool
 		limit      int
 		unredacted bool
 		expCount   int
 	}
 	testcases := []testcase{
-		{sql.EventLogNodeJoin, false, 0, false, 1},
-		{sql.EventLogNodeRestart, false, 0, false, 0},
-		{sql.EventLogDropDatabase, false, 0, false, 0},
-		{sql.EventLogCreateDatabase, false, 0, false, 3},
-		{sql.EventLogDropTable, false, 0, false, 2},
-		{sql.EventLogCreateTable, false, 0, false, 3},
-		{sql.EventLogSetClusterSetting, false, 0, false, 4},
+		{"node_join", false, 0, false, 1},
+		{"node_restart", false, 0, false, 0},
+		{"drop_database", false, 0, false, 0},
+		{"create_database", false, 0, false, 3},
+		{"drop_table", false, 0, false, 2},
+		{"create_table", false, 0, false, 3},
+		{"set_cluster_setting", false, 0, false, 4},
 		// We use limit=true with no limit here because otherwise the
 		// expCount will mess up the expected total count below.
-		{sql.EventLogSetClusterSetting, true, 0, true, 4},
-		{sql.EventLogCreateTable, true, 0, false, 3},
-		{sql.EventLogCreateTable, true, -1, false, 3},
-		{sql.EventLogCreateTable, true, 2, false, 2},
+		{"set_cluster_setting", true, 0, true, 4},
+		{"create_table", true, 0, false, 3},
+		{"create_table", true, -1, false, 3},
+		{"create_table", true, 2, false, 2},
 	}
 	minTotalEvents := 0
 	for _, tc := range testcases {
@@ -975,12 +974,12 @@ func TestAdminAPIEvents(t *testing.T) {
 	for i, tc := range testcases {
 		url := "events"
 		if tc.eventType != allEvents {
-			url += "?type=" + string(tc.eventType)
+			url += "?type=" + tc.eventType
 			if tc.hasLimit {
 				url += fmt.Sprintf("&limit=%d", tc.limit)
 			}
 			if tc.unredacted {
-				url += fmt.Sprintf("&unredacted_events=true")
+				url += "&unredacted_events=true"
 			}
 		}
 
@@ -1009,7 +1008,7 @@ func TestAdminAPIEvents(t *testing.T) {
 				}
 
 				if len(tc.eventType) > 0 {
-					if a, e := e.EventType, string(tc.eventType); a != e {
+					if a, e := e.EventType, tc.eventType; a != e {
 						t.Errorf("%d: event type %s != expected %s", i, a, e)
 					}
 				} else {
@@ -1018,9 +1017,12 @@ func TestAdminAPIEvents(t *testing.T) {
 					}
 				}
 
-				isSettingChange := e.EventType == string(sql.EventLogSetClusterSetting)
+				isSettingChange := e.EventType == "set_cluster_setting"
+				isRoleChange := e.EventType == "create_role" ||
+					e.EventType == "drop_role" ||
+					e.EventType == "alter_role"
 
-				if e.TargetID == 0 && !isSettingChange {
+				if e.TargetID == 0 && !isSettingChange && !isRoleChange {
 					t.Errorf("%d: missing/empty TargetID", i)
 				}
 				if e.ReportingID == 0 {
@@ -1367,7 +1369,7 @@ func TestHealthAPI(t *testing.T) {
 	defer ts.nodeLiveness.PauseAllHeartbeatsForTest()()
 	self, ok := ts.nodeLiveness.Self()
 	assert.True(t, ok)
-	s.Clock().Update(hlc.Timestamp(self.Expiration).Add(1, 0))
+	s.Clock().Update(self.Expiration.ToTimestamp().Add(1, 0))
 
 	var resp serverpb.HealthResponse
 	testutils.SucceedsSoon(t, func() error {
@@ -1422,16 +1424,16 @@ func TestAdminAPIJobs(t *testing.T) {
 		status   jobs.Status
 		details  jobspb.Details
 		progress jobspb.ProgressDetails
-		username string
+		username security.SQLUsername
 	}{
-		{1, jobs.StatusRunning, jobspb.RestoreDetails{}, jobspb.RestoreProgress{}, security.RootUser},
-		{2, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUser},
-		{3, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUser},
-		{4, jobs.StatusRunning, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUser},
-		{5, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}, authenticatedUserNameNoAdmin},
+		{1, jobs.StatusRunning, jobspb.RestoreDetails{}, jobspb.RestoreProgress{}, security.RootUserName()},
+		{2, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName()},
+		{3, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName()},
+		{4, jobs.StatusRunning, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName()},
+		{5, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}, authenticatedUserNameNoAdmin()},
 	}
 	for _, job := range testJobs {
-		payload := jobspb.Payload{Username: job.username, Details: jobspb.WrapPayloadDetails(job.details)}
+		payload := jobspb.Payload{UsernameProto: job.username.EncodeProto(), Details: jobspb.WrapPayloadDetails(job.details)}
 		payloadBytes, err := protoutil.Marshal(&payload)
 		if err != nil {
 			t.Fatal(err)
@@ -1608,7 +1610,7 @@ func TestAdminAPIRangeLogByRangeID(t *testing.T) {
           )`,
 			rangeID, otherRangeID,
 			1, // storeID
-			kvserverpb.RangeLogEventType_add.String(),
+			kvserverpb.RangeLogEventType_add_voter.String(),
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -1681,7 +1683,7 @@ func TestAdminAPIFullRangeLog(t *testing.T) {
              timestamp, "rangeID", "storeID", "eventType"
            ) VALUES (now(), $1, 1, $2)`,
 			rangeID,
-			kvserverpb.RangeLogEventType_add.String(),
+			kvserverpb.RangeLogEventType_add_voter.String(),
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -1739,6 +1741,8 @@ func TestAdminAPIDataDistribution(t *testing.T) {
 		post_id INT REFERENCES roachblog.posts,
 		body text
 	)`)
+	sqlDB.Exec(t, `CREATE SCHEMA roachblog."foo bar"`)
+	sqlDB.Exec(t, `CREATE TABLE roachblog."foo bar".other_stuff(id INT PRIMARY KEY, body TEXT)`)
 	// Test special characters in DB and table names.
 	sqlDB.Exec(t, `CREATE DATABASE "sp'ec\ch""ars"`)
 	sqlDB.Exec(t, `CREATE TABLE "sp'ec\ch""ars"."more\spec'chars" (id INT PRIMARY KEY)`)
@@ -1749,14 +1753,21 @@ func TestAdminAPIDataDistribution(t *testing.T) {
 	expectedDatabaseInfo := map[string]serverpb.DataDistributionResponse_DatabaseInfo{
 		"roachblog": {
 			TableInfo: map[string]serverpb.DataDistributionResponse_TableInfo{
-				"posts": {
+				"public.posts": {
 					ReplicaCountByNodeId: map[roachpb.NodeID]int64{
 						1: 1,
 						2: 1,
 						3: 1,
 					},
 				},
-				"comments": {
+				"public.comments": {
+					ReplicaCountByNodeId: map[roachpb.NodeID]int64{
+						1: 1,
+						2: 1,
+						3: 1,
+					},
+				},
+				`"foo bar".other_stuff`: {
 					ReplicaCountByNodeId: map[roachpb.NodeID]int64{
 						1: 1,
 						2: 1,
@@ -1767,7 +1778,7 @@ func TestAdminAPIDataDistribution(t *testing.T) {
 		},
 		`sp'ec\ch"ars`: {
 			TableInfo: map[string]serverpb.DataDistributionResponse_TableInfo{
-				`more\spec'chars`: {
+				`public."more\spec'chars"`: {
 					ReplicaCountByNodeId: map[roachpb.NodeID]int64{
 						1: 1,
 						2: 1,
@@ -1807,7 +1818,7 @@ func TestAdminAPIDataDistribution(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if resp.DatabaseInfo["roachblog"].TableInfo["comments"].DroppedAt == nil {
+	if resp.DatabaseInfo["roachblog"].TableInfo["public.comments"].DroppedAt == nil {
 		t.Fatal("expected roachblog.comments to have dropped_at set but it's nil")
 	}
 
@@ -1858,8 +1869,8 @@ func TestEnqueueRange(t *testing.T) {
 
 	// Up-replicate r1 to all 3 nodes. We use manual replication to avoid lease
 	// transfers causing temporary conditions in which no store is the
-	// leaseholder, which can break the the tests below.
-	_, err := testCluster.AddReplicas(roachpb.KeyMin, testCluster.Target(1), testCluster.Target(2))
+	// leaseholder, which can break the tests below.
+	_, err := testCluster.AddVoters(roachpb.KeyMin, testCluster.Target(1), testCluster.Target(2))
 	if err != nil {
 		t.Fatal(err)
 	}

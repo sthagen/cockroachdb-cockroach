@@ -16,12 +16,15 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
@@ -79,10 +82,33 @@ const exportFilePatternPart = "%part%"
 const exportFilePatternDefault = exportFilePatternPart + ".csv"
 const exportCompressionCodec = "gzip"
 
+// featureExportEnabled is used to enable and disable the EXPORT feature.
+var featureExportEnabled = settings.RegisterBoolSetting(
+	"feature.export.enabled",
+	"set to true to enable exports, false to disable; default is true",
+	featureflag.FeatureFlagEnabledDefault,
+).WithPublic()
+
 // ConstructExport is part of the exec.Factory interface.
 func (ef *execFactory) ConstructExport(
 	input exec.Node, fileName tree.TypedExpr, fileFormat string, options []exec.KVOption,
 ) (exec.Node, error) {
+	if !featureExportEnabled.Get(&ef.planner.ExecCfg().Settings.SV) {
+		return nil, pgerror.Newf(
+			pgcode.OperatorIntervention,
+			"feature EXPORT was disabled by the database administrator",
+		)
+	}
+
+	if err := featureflag.CheckEnabled(
+		ef.planner.EvalContext().Context,
+		ef.planner.execCfg,
+		featureExportEnabled,
+		"EXPORT",
+	); err != nil {
+		return nil, err
+	}
+
 	if !ef.planner.ExtendedEvalContext().TxnImplicit {
 		return nil, errors.Errorf("EXPORT cannot be used inside a transaction")
 	}
@@ -99,6 +125,21 @@ func (ef *execFactory) ConstructExport(
 	destination, ok := destinationDatum.(*tree.DString)
 	if !ok {
 		return nil, errors.Errorf("expected string value for the file location")
+	}
+	admin, err := ef.planner.HasAdminRole(ef.planner.EvalContext().Context)
+	if err != nil {
+		panic(err)
+	}
+	if !admin {
+		hasExplicitAuth, _, err := cloud.AccessIsWithExplicitAuth(string(*destination))
+		if err != nil {
+			panic(err)
+		}
+		if !hasExplicitAuth {
+			panic(pgerror.Newf(
+				pgcode.InsufficientPrivilege,
+				"only users with the admin role are allowed to EXPORT to the specified URI"))
+		}
 	}
 
 	optVals, err := evalStringOptions(ef.planner.EvalContext(), options, exportOptionExpectValues)
@@ -142,7 +183,7 @@ func (ef *execFactory) ConstructExport(
 		}
 	}
 
-	exportID := ef.planner.stmt.queryID.String()
+	exportID := ef.planner.stmt.QueryID.String()
 	namePattern := fmt.Sprintf("export%s-%s", exportID, exportFilePatternDefault)
 
 	return &exportNode{

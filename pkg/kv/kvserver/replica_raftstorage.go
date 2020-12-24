@@ -36,8 +36,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/etcd/raft"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // replicaRaftStorage implements the raft.Storage interface.
@@ -464,10 +464,10 @@ type OutgoingSnapshot struct {
 	// The RocksDB snapshot that will be streamed from.
 	EngineSnap storage.Reader
 	// The complete range iterator for the snapshot to stream.
-	Iter *rditer.ReplicaDataIterator
+	Iter *rditer.ReplicaEngineDataIterator
 	// The replica state within the snapshot.
 	State kvserverpb.ReplicaState
-	// Allows access the the original Replica's sideloaded storage. Note that
+	// Allows access the original Replica's sideloaded storage. Note that
 	// this isn't a snapshot of the sideloaded storage congruent with EngineSnap
 	// or RaftSnap -- a log truncation could have removed files from the
 	// sideloaded storage in the meantime.
@@ -570,8 +570,7 @@ func snapshot(
 
 	// Intentionally let this iterator and the snapshot escape so that the
 	// streamer can send chunks from it bit by bit.
-	iter := rditer.NewReplicaDataIterator(&desc, snap,
-		true /* replicatedOnly */, false /* seekEnd */)
+	iter := rditer.NewReplicaEngineDataIterator(&desc, snap, true /* replicatedOnly */)
 
 	return OutgoingSnapshot{
 		RaftEntryCache: eCache,
@@ -723,7 +722,7 @@ func clearRangeData(
 	var clearRangeFn func(storage.Reader, storage.Writer, roachpb.Key, roachpb.Key) error
 	if mustClearRange {
 		clearRangeFn = func(reader storage.Reader, writer storage.Writer, start, end roachpb.Key) error {
-			return writer.ClearRange(storage.MakeMVCCMetadataKey(start), storage.MakeMVCCMetadataKey(end))
+			return writer.ClearRawRange(start, end)
 		}
 	} else {
 		clearRangeFn = storage.ClearRangeWithHeuristic
@@ -764,14 +763,29 @@ func (r *Replica) applySnapshot(
 		log.Fatalf(ctx, "unexpected range ID %d", s.Desc.RangeID)
 	}
 
-	snapType := inSnap.snapType
+	isInitialSnap := !r.IsInitialized()
 	defer func() {
 		if err == nil {
-			switch snapType {
-			case SnapshotRequest_RAFT:
-				r.store.metrics.RangeSnapshotsNormalApplied.Inc(1)
-			case SnapshotRequest_LEARNER:
-				r.store.metrics.RangeSnapshotsLearnerApplied.Inc(1)
+			desc, err := r.GetReplicaDescriptor()
+			if err != nil {
+				log.Fatalf(ctx, "could not fetch replica descriptor for range after applying snapshot")
+			}
+			if isInitialSnap {
+				r.store.metrics.RangeSnapshotsAppliedForInitialUpreplication.Inc(1)
+			} else {
+				switch typ := desc.GetType(); typ {
+				// NB: A replica of type LEARNER can receive a non-initial snapshot (via
+				// the snapshot queue) if we end up truncating the raft log before it
+				// gets promoted to a voter. We count such snapshot applications as
+				// "applied by voters" here.
+				case roachpb.VOTER_FULL, roachpb.VOTER_INCOMING, roachpb.VOTER_DEMOTING,
+					roachpb.VOTER_OUTGOING, roachpb.LEARNER:
+					r.store.metrics.RangeSnapshotsAppliedByVoters.Inc(1)
+				case roachpb.NON_VOTER:
+					r.store.metrics.RangeSnapshotsAppliedByNonVoters.Inc(1)
+				default:
+					log.Fatalf(ctx, "unexpected replica type %s while applying snapshot", typ)
+				}
 			}
 		}
 	}()
@@ -803,8 +817,8 @@ func (r *Replica) applySnapshot(
 		// Time to ingest SSTs.
 		ingestion time.Time
 	}
-	log.Infof(ctx, "applying %s snapshot [id=%s index=%d]",
-		snapType, inSnap.SnapUUID.Short(), snap.Metadata.Index)
+	log.Infof(ctx, "applying snapshot of type %s [id=%s index=%d]", inSnap.snapType,
+		inSnap.SnapUUID.Short(), snap.Metadata.Index)
 	defer func(start time.Time) {
 		now := timeutil.Now()
 		totalLog := fmt.Sprintf(
@@ -824,9 +838,10 @@ func (r *Replica) applySnapshot(
 			len(inSnap.SSTStorageScratch.SSTs()),
 			stats.ingestion.Sub(stats.subsumedReplicas).Seconds()*1000,
 		)
-		log.Infof(ctx, "applied %s snapshot [%s%s%sid=%s index=%d]",
-			snapType, totalLog, subsumedReplicasLog, ingestionLog,
-			inSnap.SnapUUID.Short(), snap.Metadata.Index)
+		log.Infof(
+			ctx, "applied snapshot of type %s [%s%s%sid=%s index=%d]", inSnap.snapType, totalLog,
+			subsumedReplicasLog, ingestionLog, inSnap.SnapUUID.Short(), snap.Metadata.Index,
+		)
 	}(timeutil.Now())
 
 	unreplicatedSSTFile := &storage.MemFile{}
@@ -835,9 +850,9 @@ func (r *Replica) applySnapshot(
 
 	// Clearing the unreplicated state.
 	unreplicatedPrefixKey := keys.MakeRangeIDUnreplicatedPrefix(r.RangeID)
-	unreplicatedStart := storage.MakeMVCCMetadataKey(unreplicatedPrefixKey)
-	unreplicatedEnd := storage.MakeMVCCMetadataKey(unreplicatedPrefixKey.PrefixEnd())
-	if err = unreplicatedSST.ClearRange(unreplicatedStart, unreplicatedEnd); err != nil {
+	unreplicatedStart := unreplicatedPrefixKey
+	unreplicatedEnd := unreplicatedPrefixKey.PrefixEnd()
+	if err = unreplicatedSST.ClearRawRange(unreplicatedStart, unreplicatedEnd); err != nil {
 		return errors.Wrapf(err, "error clearing range of unreplicated SST writer")
 	}
 
@@ -931,7 +946,7 @@ func (r *Replica) applySnapshot(
 
 	// Ingest all SSTs atomically.
 	if fn := r.store.cfg.TestingKnobs.BeforeSnapshotSSTIngestion; fn != nil {
-		if err := fn(inSnap, snapType, inSnap.SSTStorageScratch.SSTs()); err != nil {
+		if err := fn(inSnap, inSnap.snapType, inSnap.SSTStorageScratch.SSTs()); err != nil {
 			return err
 		}
 	}
@@ -1023,14 +1038,11 @@ func (r *Replica) clearSubsumedReplicaDiskData(
 	subsumedRepls []*Replica,
 	subsumedNextReplicaID roachpb.ReplicaID,
 ) error {
-	getKeyRanges := func(desc *roachpb.RangeDescriptor) [2]rditer.KeyRange {
-		return [...]rditer.KeyRange{
-			rditer.MakeRangeLocalKeyRange(desc),
-			rditer.MakeUserKeyRange(desc),
-		}
-	}
+	// NB: we don't clear RangeID local key ranges here. That happens
+	// via the call to preDestroyRaftMuLocked.
+	getKeyRanges := rditer.MakeReplicatedKeyRangesExceptRangeID
 	keyRanges := getKeyRanges(desc)
-	totalKeyRanges := append([]rditer.KeyRange(nil), keyRanges[:]...)
+	totalKeyRanges := append([]rditer.KeyRange(nil), keyRanges...)
 	for _, sr := range subsumedRepls {
 		// We mark the replica as destroyed so that new commands are not
 		// accepted. This destroy status will be detected after the batch
@@ -1083,10 +1095,10 @@ func (r *Replica) clearSubsumedReplicaDiskData(
 		}
 	}
 
-	// We might have to create SSTs for the range local keys and user keys
-	// depending on if the subsumed replicas are not fully contained by the
-	// replica in our snapshot. The following is an example to this case
-	// happening.
+	// We might have to create SSTs for the range local keys, lock table keys,
+	// and user keys depending on if the subsumed replicas are not fully
+	// contained by the replica in our snapshot. The following is an example to
+	// this case happening.
 	//
 	// a       b       c       d
 	// |---1---|-------2-------|  S1

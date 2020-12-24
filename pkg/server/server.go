@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,11 +36,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/container"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptreconcile"
@@ -47,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/goroutinedumper"
 	"github.com/cockroachdb/cockroach/pkg/server/heapprofiler"
@@ -70,12 +74,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -84,7 +88,6 @@ import (
 	"github.com/cockroachdb/redact"
 	"github.com/cockroachdb/sentry-go"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"github.com/opentracing/opentracing-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -95,13 +98,13 @@ var (
 	// Allocation pool for gzipResponseWriters.
 	gzipResponseWriterPool sync.Pool
 
-	forwardClockJumpCheckEnabled = settings.RegisterPublicBoolSetting(
+	forwardClockJumpCheckEnabled = settings.RegisterBoolSetting(
 		"server.clock.forward_jump_check_enabled",
 		"if enabled, forward clock jumps > max_offset/2 will cause a panic",
 		false,
-	)
+	).WithPublic()
 
-	persistHLCUpperBoundInterval = settings.RegisterPublicDurationSetting(
+	persistHLCUpperBoundInterval = settings.RegisterDurationSetting(
 		"server.clock.persist_upper_bound_interval",
 		"the interval between persisting the wall time upper bound of the clock. The clock "+
 			"does not generate a wall time greater than the persisted timestamp and will panic if "+
@@ -110,7 +113,7 @@ var (
 			"time across server restarts. Not setting this or setting a value of 0 disables this "+
 			"feature.",
 		0,
-	)
+	).WithPublic()
 )
 
 // Server is the cockroach server node.
@@ -128,7 +131,7 @@ type Server struct {
 	grpc         *grpcServer
 	gossip       *gossip.Gossip
 	nodeDialer   *nodedialer.Dialer
-	nodeLiveness *kvserver.NodeLiveness
+	nodeLiveness *liveness.NodeLiveness
 	storePool    *kvserver.StorePool
 	tcsFactory   *kvcoord.TxnCoordSenderFactory
 	distSender   *kvcoord.DistSender
@@ -138,14 +141,15 @@ type Server struct {
 	recorder     *status.MetricsRecorder
 	runtime      *status.RuntimeStatSampler
 
-	admin          *adminServer
-	status         *statusServer
-	authentication *authenticationServer
-	oidc           OIDC
-	tsDB           *ts.DB
-	tsServer       *ts.Server
-	raftTransport  *kvserver.RaftTransport
-	stopper        *stop.Stopper
+	admin           *adminServer
+	status          *statusServer
+	authentication  *authenticationServer
+	migrationServer *migrationServer
+	oidc            OIDC
+	tsDB            *ts.DB
+	tsServer        *ts.Server
+	raftTransport   *kvserver.RaftTransport
+	stopper         *stop.Stopper
 
 	debug *debug.Server
 
@@ -202,7 +206,7 @@ func (e *externalStorageBuilder) makeExternalStorage(
 }
 
 func (e *externalStorageBuilder) makeExternalStorageFromURI(
-	ctx context.Context, uri string, user string,
+	ctx context.Context, uri string, user security.SQLUsername,
 ) (cloud.ExternalStorage, error) {
 	if !e.initCalled {
 		return nil, errors.New("cannot create external storage before init")
@@ -234,9 +238,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	registry := metric.NewRegistry()
 	// If the tracer has a Close function, call it after the server stops.
-	if tr, ok := cfg.AmbientCtx.Tracer.(stop.Closer); ok {
-		stopper.AddCloser(tr)
-	}
+	stopper.AddCloser(cfg.AmbientCtx.Tracer)
 
 	// Add a dynamic log tag value for the node ID.
 	//
@@ -303,7 +305,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	rpcContext.HeartbeatCB = func() {
 		if err := rpcContext.RemoteClocks.VerifyClockOffset(ctx); err != nil {
-			log.Fatalf(ctx, "%v", err)
+			log.Ops.Fatalf(ctx, "%v", err)
 		}
 	}
 	registry.AddMetricStruct(rpcContext.Metrics())
@@ -407,8 +409,17 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	db := kv.NewDBWithContext(cfg.AmbientCtx, tcsFactory, clock, dbCtx)
 
 	nlActive, nlRenewal := cfg.NodeLivenessDurations()
+	if knobs := cfg.TestingKnobs.NodeLiveness; knobs != nil {
+		nlKnobs := knobs.(kvserver.NodeLivenessTestingKnobs)
+		if duration := nlKnobs.LivenessDuration; duration != 0 {
+			nlActive = duration
+		}
+		if duration := nlKnobs.RenewalDuration; duration != 0 {
+			nlRenewal = duration
+		}
+	}
 
-	nodeLiveness := kvserver.NewNodeLiveness(kvserver.NodeLivenessOptions{
+	nodeLiveness := liveness.NewNodeLiveness(liveness.NodeLivenessOptions{
 		AmbientCtx:              cfg.AmbientCtx,
 		Clock:                   clock,
 		DB:                      db,
@@ -417,7 +428,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		RenewalDuration:         nlRenewal,
 		Settings:                st,
 		HistogramWindowInterval: cfg.HistogramWindowInterval(),
-		OnNodeDecommissioned: func(liveness kvserverpb.Liveness) {
+		OnNodeDecommissioned: func(liveness livenesspb.Liveness) {
 			if knobs, ok := cfg.TestingKnobs.Server.(*TestingKnobs); ok && knobs.OnDecommissionedCallback != nil {
 				knobs.OnDecommissionedCallback(liveness)
 			}
@@ -467,7 +478,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		return externalStorageBuilder.makeExternalStorage(ctx, dest)
 	}
 	externalStorageFromURI := func(ctx context.Context, uri string,
-		user string) (cloud.ExternalStorage, error) {
+		user security.SQLUsername) (cloud.ExternalStorage, error) {
 		return externalStorageBuilder.makeExternalStorageFromURI(ctx, uri, user)
 	}
 
@@ -544,6 +555,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	lateBoundNode = node
 	roachpb.RegisterInternalServer(grpcServer.Server, node)
 	kvserver.RegisterPerReplicaServer(grpcServer.Server, node.perReplicaServer)
+	kvserver.RegisterPerStoreServer(grpcServer.Server, node.perReplicaServer)
 	node.storeCfg.ClosedTimestamp.RegisterClosedTimestampServer(grpcServer.Server)
 	replicationReporter := reports.NewReporter(
 		db, node.stores, storePool, st, nodeLiveness, internalExecutor)
@@ -685,7 +697,7 @@ func (s *Server) AnnotateCtx(ctx context.Context) context.Context {
 // AnnotateCtxWithSpan is a convenience wrapper; see AmbientContext.
 func (s *Server) AnnotateCtxWithSpan(
 	ctx context.Context, opName string,
-) (context.Context, opentracing.Span) {
+) (context.Context, *tracing.Span) {
 	return s.cfg.AmbientCtx.AnnotateCtxWithSpan(ctx, opName)
 }
 
@@ -731,50 +743,69 @@ func (l *ListenError) Error() string { return l.cause.Error() }
 // Unwrap is because ListenError is a wrapper.
 func (l *ListenError) Unwrap() error { return l.cause }
 
-// inspectEngines goes through engines and populates in initDiskState. It also
-// calls SynthesizeClusterVersionFromEngines, which selects and backfills the
-// cluster version to all initialized engines.
-//
-// The initDiskState returned by this method will reflect a zero NodeID if none
-// has been assigned yet (i.e. if none of the engines is initialized).
+// inspectEngines goes through engines and constructs an initState. The
+// initState returned by this method will reflect a zero NodeID if none has
+// been assigned yet (i.e. if none of the engines is initialized). See
+// commentary on initState for the intended usage of inspectEngines.
 func inspectEngines(
 	ctx context.Context,
 	engines []storage.Engine,
 	binaryVersion, binaryMinSupportedVersion roachpb.Version,
-) (*initDiskState, error) {
-	state := &initDiskState{}
+) (*initState, error) {
+	var clusterID uuid.UUID
+	var nodeID roachpb.NodeID
+	var initializedEngines, uninitializedEngines []storage.Engine
+	var initialSettingsKVs []roachpb.KeyValue
 
 	for _, eng := range engines {
+		// Once cached settings are loaded from any engine we can stop.
+		if len(initialSettingsKVs) == 0 {
+			var err error
+			initialSettingsKVs, err = loadCachedSettingsKVs(ctx, eng)
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		storeIdent, err := kvserver.ReadStoreIdent(ctx, eng)
 		if errors.HasType(err, (*kvserver.NotBootstrappedError)(nil)) {
-			state.newEngines = append(state.newEngines, eng)
+			uninitializedEngines = append(uninitializedEngines, eng)
 			continue
 		} else if err != nil {
 			return nil, err
 		}
 
-		if state.clusterID != uuid.Nil && state.clusterID != storeIdent.ClusterID {
-			return nil, errors.Errorf("conflicting store ClusterIDs: %s, %s", storeIdent.ClusterID, state.clusterID)
+		if clusterID != uuid.Nil && clusterID != storeIdent.ClusterID {
+			return nil, errors.Errorf("conflicting store ClusterIDs: %s, %s", storeIdent.ClusterID, clusterID)
 		}
-		state.clusterID = storeIdent.ClusterID
+		clusterID = storeIdent.ClusterID
 
 		if storeIdent.StoreID == 0 || storeIdent.NodeID == 0 || storeIdent.ClusterID == uuid.Nil {
 			return nil, errors.Errorf("partially initialized store: %+v", storeIdent)
 		}
 
-		if state.nodeID != 0 && state.nodeID != storeIdent.NodeID {
-			return nil, errors.Errorf("conflicting store NodeIDs: %s, %s", storeIdent.NodeID, state.nodeID)
+		if nodeID != 0 && nodeID != storeIdent.NodeID {
+			return nil, errors.Errorf("conflicting store NodeIDs: %s, %s", storeIdent.NodeID, nodeID)
 		}
-		state.nodeID = storeIdent.NodeID
+		nodeID = storeIdent.NodeID
 
-		state.initializedEngines = append(state.initializedEngines, eng)
+		initializedEngines = append(initializedEngines, eng)
 	}
-
-	cv, err := kvserver.SynthesizeClusterVersionFromEngines(ctx, state.initializedEngines, binaryVersion, binaryMinSupportedVersion)
+	clusterVersion, err := kvserver.SynthesizeClusterVersionFromEngines(
+		ctx, initializedEngines, binaryVersion, binaryMinSupportedVersion,
+	)
 	if err != nil {
 		return nil, err
 	}
-	state.clusterVersion = cv
+
+	state := &initState{
+		clusterID:            clusterID,
+		nodeID:               nodeID,
+		initializedEngines:   initializedEngines,
+		uninitializedEngines: uninitializedEngines,
+		clusterVersion:       clusterVersion,
+		initialSettingsKVs:   initialSettingsKVs,
+	}
 	return state, nil
 }
 
@@ -820,7 +851,7 @@ func (s *Server) startMonitoringForwardClockJumps(ctx context.Context) error {
 		return errors.Wrap(err, "monitoring forward clock jumps")
 	}
 
-	log.Info(ctx, "monitoring forward clock jumps based on server.clock.forward_jump_check_enabled")
+	log.Ops.Info(ctx, "monitoring forward clock jumps based on server.clock.forward_jump_check_enabled")
 	return nil
 }
 
@@ -866,7 +897,7 @@ func ensureClockMonotonicity(
 	currentWallTime := currentWallTimeFn()
 	delta := time.Duration(sleepUntil - currentWallTime)
 	if delta > 0 {
-		log.Infof(
+		log.Ops.Infof(
 			ctx,
 			"Sleeping till wall time %v to catches up to %v to ensure monotonicity. Delta: %v",
 			currentWallTime,
@@ -910,7 +941,7 @@ func periodicallyPersistHLCUpperBound(
 			persistHLCUpperBoundFn,
 			int64(persistInterval*3), /* delta to compute upper bound */
 		); err != nil {
-			log.Fatalf(
+			log.Ops.Fatalf(
 				context.Background(),
 				"error persisting HLC upper bound: %v",
 				err,
@@ -929,16 +960,16 @@ func periodicallyPersistHLCUpperBound(
 			if persistInterval > 0 {
 				ticker = tickerFn(persistInterval)
 				persistHLCUpperBound()
-				log.Info(context.Background(), "persisting HLC upper bound is enabled")
+				log.Ops.Info(context.Background(), "persisting HLC upper bound is enabled")
 			} else {
 				if err := clock.ResetHLCUpperBound(persistHLCUpperBoundFn); err != nil {
-					log.Fatalf(
+					log.Ops.Fatalf(
 						context.Background(),
 						"error resetting hlc upper bound: %v",
 						err,
 					)
 				}
-				log.Info(context.Background(), "persisting HLC upper bound is disabled")
+				log.Ops.Info(context.Background(), "persisting HLC upper bound is disabled")
 			}
 
 		case <-ticker.C:
@@ -1110,7 +1141,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		}
 
 		initConfig := newInitServerConfig(s.cfg, dialOpts)
-		inspectState, err := inspectEngines(
+		inspectedDiskState, err := inspectEngines(
 			ctx,
 			s.engines,
 			s.cfg.Settings.Version.BinaryVersion(),
@@ -1120,90 +1151,59 @@ func (s *Server) PreStart(ctx context.Context) error {
 			return err
 		}
 
-		initServer, err = newInitServer(s.cfg.AmbientCtx, inspectState, initConfig)
-		if err != nil {
-			return err
-		}
+		initServer = newInitServer(s.cfg.AmbientCtx, inspectedDiskState, initConfig)
 	}
 
+	initialDiskClusterVersion := initServer.DiskClusterVersion()
 	{
-		// Set up the callback that persists gossiped version bumps to the
-		// engines. The invariant we uphold here is that the bump needs to be
+		// The invariant we uphold here is that any version bump needs to be
 		// persisted on all engines before it becomes "visible" to the version
-		// setting. To this end,
+		// setting. To this end, we:
 		//
-		// a) make sure Gossip is not started yet, and
-		// b) set up the BeforeChange callback on the version setting to persist
-		//    incoming updates to all engines.
-		// c) write back the disk-loaded cluster version to all engines,
-		// d) initialize the version setting (with the disk-loaded version).
+		// a) write back the disk-loaded cluster version to all engines,
+		// b) initialize the version setting (using the disk-loaded version).
 		//
 		// Note that "all engines" means "all engines", not "all initialized
 		// engines". We cannot initialize engines this early in the boot
 		// sequence.
-		s.gossip.AssertNotStarted(ctx)
-
-		// Serialize the callback through a mutex to make sure we're not
-		// clobbering the disk state if callback gets fired off concurrently.
-		var mu syncutil.Mutex
-		cb := func(ctx context.Context, newCV clusterversion.ClusterVersion) {
-			mu.Lock()
-			defer mu.Unlock()
-			v := s.cfg.Settings.Version
-			prevCV, err := kvserver.SynthesizeClusterVersionFromEngines(
-				ctx, s.engines, v.BinaryVersion(), v.BinaryMinSupportedVersion(),
-			)
-			if err != nil {
-				log.Fatalf(ctx, "%v", err)
-			}
-			if !prevCV.Version.Less(newCV.Version) {
-				// If nothing needs to be updated, don't do anything. The
-				// callbacks fire async (or at least we want to assume the worst
-				// case in which they do) and so an old update might happen
-				// after a new one.
-				return
-			}
-			if err := kvserver.WriteClusterVersionToEngines(ctx, s.engines, newCV); err != nil {
-				log.Fatalf(ctx, "%v", err)
-			}
-			log.Infof(ctx, "active cluster version is now %s (up from %s)", newCV, prevCV)
-		}
-		clusterversion.SetBeforeChange(ctx, &s.cfg.Settings.SV, cb)
-
-		diskClusterVersion := initServer.DiskClusterVersion()
+		//
 		// The version setting loaded from disk is the maximum cluster version
 		// seen on any engine. If new stores are being added to the server right
 		// now, or if the process crashed earlier half-way through the callback,
 		// that version won't be on all engines. For that reason, we backfill
 		// once.
 		if err := kvserver.WriteClusterVersionToEngines(
-			ctx, s.engines, diskClusterVersion,
+			ctx, s.engines, initialDiskClusterVersion,
 		); err != nil {
 			return err
 		}
 
-		// NB: if we bootstrap a new server (in initServer.ServeAndWait below)
-		// we will call Initialize a second time, to eagerly move it to the
-		// bootstrap version (from the min supported version). Initialize()
-		// tolerates that. Note that in that case we know that the callback
-		// has not fired yet, since Gossip won't connect (to itself) until
-		// the server starts and so the callback will never fire prior to
-		// that second Initialize() call. Note also that at this point in
-		// the code we don't know if we'll bootstrap or join an existing
-		// cluster, so we have to conservatively go with the version from
-		// disk, which in the case of no initialized engines is the binary
-		// min supported version.
-		if err := clusterversion.Initialize(ctx, diskClusterVersion.Version, &s.cfg.Settings.SV); err != nil {
+		// Note that at this point in the code we don't know if we'll bootstrap
+		// or join an existing cluster, so we have to conservatively go with the
+		// version from disk. If there are no initialized engines, this is the
+		// binary min supported version.
+		if err := clusterversion.Initialize(ctx, initialDiskClusterVersion.Version, &s.cfg.Settings.SV); err != nil {
 			return err
 		}
 
 		// At this point, we've established the invariant: all engines hold the
-		// version currently visible to the setting. And we have the callback in
-		// place that will persist an incoming updated version on all engines
-		// before making it visible to the setting.
+		// version currently visible to the setting. Going forward whenever we
+		// set an active cluster version (`SetActiveClusterVersion`), we'll
+		// persist it to all the engines first (`WriteClusterVersionToEngines`).
+		// This happens at two places:
+		//
+		// - Right below, if we learn that we're the bootstrapping node, given
+		//   we'll be setting the active cluster version as the binary version.
+		// - Within the BumpClusterVersion RPC, when we're informed by another
+		//   node what our new active cluster version should be.
 	}
 
 	serverpb.RegisterInitServer(s.grpc.Server, initServer)
+
+	// Register the Migration service, to power internal crdb migrations.
+	migrationServer := &migrationServer{server: s}
+	serverpb.RegisterMigrationServer(s.grpc.Server, migrationServer)
+	s.migrationServer = migrationServer // only for testing via TestServer
 
 	// Pebble does its own engine health checks, that call back into an event
 	// handler registered in storage/pebble.go when a slow disk event is
@@ -1294,7 +1294,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 	s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
 		<-s.stopper.ShouldQuiesce()
 		if err := conn.Close(); err != nil {
-			log.Fatalf(workersCtx, "%v", err)
+			log.Ops.Fatalf(workersCtx, "%v", err)
 		}
 	})
 
@@ -1319,9 +1319,13 @@ func (s *Server) PreStart(ctx context.Context) error {
 		listenHTTP:   s.cfg.HTTPAdvertiseAddr,
 	}.Iter()
 
+	encryptedStore := false
 	for _, storeSpec := range s.cfg.Stores.Specs {
 		if storeSpec.InMemory {
 			continue
+		}
+		if len(storeSpec.ExtraOptions) > 0 {
+			encryptedStore = true
 		}
 
 		for name, val := range listenerFiles {
@@ -1337,37 +1341,13 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// provided.
 	advAddrU := util.NewUnresolvedAddr("tcp", s.cfg.AdvertiseAddr)
 
-	// As of 21.1, we will no longer need gossip to start before the init
-	// server. We need it in 20.2 for backwards compatibility with 20.1 servers
-	// that use gossip connectivity to distribute the cluster ID. In 20.2 we
-	// introduced a dedicated Join RPC to do exactly this, and so we can defer
-	// gossip start to after bootstrap/initialization.
-	//
-	// In order to defer starting gossip until absolutely needed, we wrap up
-	// gossip start in an idempotent function that's provided to the init
-	// server. It'll get invoked if we detect we're in a mixed-version cluster.
-	// If we're starting off at 20.2, we'll start gossip later.
-	//
-	// TODO(irfansharif): Remove this callback in 21.1.
-	var startGossipFn func() *gossip.Gossip
-	{
-		var once sync.Once
-		startGossipFn = func() *gossip.Gossip {
-			once.Do(func() {
-				s.gossip.Start(advAddrU, filtered)
-				log.Event(ctx, "started gossip")
-			})
-			return s.gossip
-		}
-	}
-
 	if s.cfg.DelayedBootstrapFn != nil {
 		defer time.AfterFunc(30*time.Second, s.cfg.DelayedBootstrapFn).Stop()
 	}
 
 	// We self bootstrap for when we're configured to do so, which should only
 	// happen during tests and for `cockroach start-single-node`.
-	selfBootstrap := s.cfg.AutoInitializeCluster && initServer.NeedsInit()
+	selfBootstrap := s.cfg.AutoInitializeCluster && initServer.NeedsBootstrap()
 	if selfBootstrap {
 		if _, err := initServer.Bootstrap(ctx, &serverpb.BootstrapRequest{}); err != nil {
 			return err
@@ -1385,7 +1365,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		if s.cfg.ReadyFn != nil {
 			readyFn = s.cfg.ReadyFn
 		}
-		if !initServer.NeedsInit() || selfBootstrap {
+		if !initServer.NeedsBootstrap() || selfBootstrap {
 			onSuccessfulReturnFn = func() { readyFn(false /* waitForInit */) }
 			onInitServerReady = func() {}
 		} else {
@@ -1400,20 +1380,47 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// incoming connections.
 	startRPCServer(workersCtx)
 	onInitServerReady()
-	state, initialStart, err := initServer.ServeAndWait(ctx, s.stopper, &s.cfg.Settings.SV, startGossipFn)
+	state, initialStart, err := initServer.ServeAndWait(ctx, s.stopper, &s.cfg.Settings.SV)
 	if err != nil {
 		return errors.Wrap(err, "during init")
 	}
+	if err := state.validate(); err != nil {
+		return errors.Wrap(err, "invalid init state")
+	}
+
+	// Apply any cached initial settings (and start the gossip listener) as early
+	// as possible, to avoid spending time with stale settings.
+	if err := s.refreshSettings(state.initialSettingsKVs); err != nil {
+		return errors.Wrap(err, "during initializing settings updater")
+	}
+
+	// TODO(irfansharif): Let's make this unconditional. We could avoid
+	// persisting + initializing the cluster version in response to being
+	// bootstrapped (within `ServeAndWait` above) and simply do it here, in the
+	// same way we're doing for when we join an existing cluster.
+	if state.clusterVersion != initialDiskClusterVersion {
+		// We just learned about a cluster version different from the one we
+		// found on/synthesized from disk. This indicates that we're either the
+		// bootstrapping node (and are using the binary version as the cluster
+		// version), or we're joining an existing cluster that just informed us
+		// to activate the given cluster version.
+		//
+		// Either way, we'll do so by first persisting the cluster version
+		// itself, and then informing the version setting about it (an invariant
+		// we must up hold whenever setting a new active version).
+		if err := kvserver.WriteClusterVersionToEngines(
+			ctx, s.engines, state.clusterVersion,
+		); err != nil {
+			return err
+		}
+
+		if err := s.ClusterSettings().Version.SetActiveVersion(ctx, state.clusterVersion); err != nil {
+			return err
+		}
+	}
 
 	s.rpcContext.ClusterID.Set(ctx, state.clusterID)
-	// If there's no NodeID here, then we didn't just bootstrap. The Node will
-	// read its ID from the stores or request a new one via KV.
-	//
-	// TODO(irfansharif): Make this unconditional once 20.2 is cut. This only
-	// exists to be compatible with 20.1 clusters.
-	if state.nodeID != 0 {
-		s.rpcContext.NodeID.Set(ctx, state.nodeID)
-	}
+	s.rpcContext.NodeID.Set(ctx, state.nodeID)
 
 	// TODO(irfansharif): Now that we have our node ID, we should run another
 	// check here to make sure we've not been decommissioned away (if we're here
@@ -1449,36 +1456,6 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// initState -- and everything after it is actually starting the server,
 	// using the listeners and init state.
 
-	// Defense in depth: set up an eager sanity check that we're not
-	// accidentally being pointed at a different cluster. We have checks for
-	// this in the RPC layer, but since the RPC layer gets set up before the
-	// clusterID is known, early connections won't validate the clusterID (at
-	// least not until the next Ping).
-	//
-	// The check is simple: listen for clusterID changes from Gossip. If we see
-	// one, make sure it's the clusterID we already know (and are guaranteed to
-	// know) at this point. If it's not the same, explode.
-	//
-	// TODO(irfansharif): The above is no longer applicable; in 21.1 we can
-	// always assume that the RPC layer will always get set up after having
-	// found out what the cluster ID is. The checks below can be removed then.
-	{
-		// We populated this above, so it should still be set. This is just to
-		// demonstrate that we're not doing anything functional here (and to
-		// prevent bugs during further refactors).
-		if s.rpcContext.ClusterID.Get() == uuid.Nil {
-			return errors.AssertionFailedf("expected cluster ID to be populated in rpc context")
-		}
-		unregister := s.gossip.RegisterCallback(gossip.KeyClusterID, func(string, roachpb.Value) {
-			clusterID, err := s.gossip.GetClusterID()
-			if err != nil {
-				log.Fatalf(ctx, "unable to read ClusterID: %v", err)
-			}
-			s.rpcContext.ClusterID.Set(ctx, clusterID) // fatals on mismatch
-		})
-		defer unregister()
-	}
-
 	// Spawn a goroutine that will print a nice message when Gossip connects.
 	// Note that we already know the clusterID, but we don't know that Gossip
 	// has connected. The pertinent case is that of restarting an entire
@@ -1486,16 +1463,16 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// but this gossip only happens once the first range has a leaseholder, i.e.
 	// when a quorum of nodes has gone fully operational.
 	_ = s.stopper.RunAsyncTask(ctx, "connect-gossip", func(ctx context.Context) {
-		log.Infof(ctx, "connecting to gossip network to verify cluster ID %q", state.clusterID)
+		log.Ops.Infof(ctx, "connecting to gossip network to verify cluster ID %q", state.clusterID)
 		select {
 		case <-s.gossip.Connected:
-			log.Infof(ctx, "node connected via gossip")
+			log.Ops.Infof(ctx, "node connected via gossip")
 		case <-ctx.Done():
 		case <-s.stopper.ShouldQuiesce():
 		}
 	})
 
-	// NB: if this store is freshly bootstrapped (or no upper bound was
+	// NB: if this store is freshly initialized (or no upper bound was
 	// persisted), hlcUpperBound will be zero.
 	hlcUpperBound, err := kvserver.ReadMaxHLCUpperBound(ctx, s.engines)
 	if err != nil {
@@ -1522,10 +1499,11 @@ func (s *Server) PreStart(ctx context.Context) error {
 	onSuccessfulReturnFn()
 
 	// We're going to need to start gossip before we spin up Node below.
-	startGossipFn()
+	s.gossip.Start(advAddrU, filtered)
+	log.Event(ctx, "started gossip")
 
 	// Now that we have a monotonic HLC wrt previous incarnations of the process,
-	// init all the replicas. At this point *some* store has been bootstrapped or
+	// init all the replicas. At this point *some* store has been initialized or
 	// we're joining an existing cluster for the first time.
 	advSQLAddrU := util.NewUnresolvedAddr("tcp", s.cfg.SQLAdvertiseAddr)
 	if err := s.node.start(
@@ -1556,14 +1534,13 @@ func (s *Server) PreStart(ctx context.Context) error {
 	}
 	s.replicationReporter.Start(ctx, s.stopper)
 
-	s.refreshSettings()
-
 	sentry.ConfigureScope(func(scope *sentry.Scope) {
 		scope.SetTags(map[string]string{
-			"cluster":     s.ClusterID().String(),
-			"node":        s.NodeID().String(),
-			"server_id":   fmt.Sprintf("%s-%s", s.ClusterID().Short(), s.NodeID()),
-			"engine_type": s.cfg.StorageEngine.String(),
+			"cluster":         s.ClusterID().String(),
+			"node":            s.NodeID().String(),
+			"server_id":       fmt.Sprintf("%s-%s", s.ClusterID().Short(), s.NodeID()),
+			"engine_type":     s.cfg.StorageEngine.String(),
+			"encrypted_store": strconv.FormatBool(encryptedStore),
 		})
 	})
 
@@ -1604,33 +1581,34 @@ func (s *Server) PreStart(ctx context.Context) error {
 	})
 
 	// After setting modeOperational, we can block until all stores are fully
-	// bootstrapped.
+	// initialized.
 	s.grpc.setMode(modeOperational)
 
-	// We'll block here until all stores are fully bootstrapped. We do this here for
-	// two reasons:
-	// - some of the components below depend on all stores being fully bootstrapped
-	// (like the debug server registration for e.g.)
-	// - we'll need to do it after having opened up the RPC floodgates (due to the
-	// hazard described in Node.start, around bootstrapping additional stores)
-	s.node.waitForBootstrapNewStores()
+	// We'll block here until all stores are fully initialized. We do this here
+	// for two reasons:
+	// - some of the components below depend on all stores being fully
+	//   initialized (like the debug server registration for e.g.)
+	// - we'll need to do it after having opened up the RPC floodgates (due to
+	//   the hazard described in Node.start, around initializing additional
+	//   stores)
+	s.node.waitForAdditionalStoreInit()
 
-	log.Infof(ctx, "starting %s server at %s (use: %s)",
+	log.Ops.Infof(ctx, "starting %s server at %s (use: %s)",
 		redact.Safe(s.cfg.HTTPRequestScheme()), s.cfg.HTTPAddr, s.cfg.HTTPAdvertiseAddr)
 	rpcConnType := redact.SafeString("grpc/postgres")
 	if s.cfg.SplitListenSQL {
 		rpcConnType = "grpc"
-		log.Infof(ctx, "starting postgres server at %s (use: %s)", s.cfg.SQLAddr, s.cfg.SQLAdvertiseAddr)
+		log.Ops.Infof(ctx, "starting postgres server at %s (use: %s)", s.cfg.SQLAddr, s.cfg.SQLAdvertiseAddr)
 	}
-	log.Infof(ctx, "starting %s server at %s", rpcConnType, s.cfg.Addr)
-	log.Infof(ctx, "advertising CockroachDB node at %s", s.cfg.AdvertiseAddr)
+	log.Ops.Infof(ctx, "starting %s server at %s", rpcConnType, s.cfg.Addr)
+	log.Ops.Infof(ctx, "advertising CockroachDB node at %s", s.cfg.AdvertiseAddr)
 
 	log.Event(ctx, "accepting connections")
 
 	// Begin the node liveness heartbeat. Add a callback which records the local
 	// store "last up" timestamp for every store whenever the liveness record is
 	// updated.
-	s.nodeLiveness.Start(ctx, kvserver.NodeLivenessStartOptions{
+	s.nodeLiveness.Start(ctx, liveness.NodeLivenessStartOptions{
 		Stopper: s.stopper,
 		Engines: s.engines,
 		OnSelfLive: func(ctx context.Context) {
@@ -1638,13 +1616,15 @@ func (s *Server) PreStart(ctx context.Context) error {
 			if err := s.node.stores.VisitStores(func(s *kvserver.Store) error {
 				return s.WriteLastUpTimestamp(ctx, now)
 			}); err != nil {
-				log.Warningf(ctx, "writing last up timestamp: %v", err)
+				log.Ops.Warningf(ctx, "writing last up timestamp: %v", err)
 			}
 		},
 	})
 
 	// Begin recording status summaries.
-	s.node.startWriteNodeStatus(base.DefaultMetricsSampleInterval)
+	if err := s.node.startWriteNodeStatus(base.DefaultMetricsSampleInterval); err != nil {
+		return err
+	}
 
 	// Start the protected timestamp subsystem.
 	if err := s.protectedtsProvider.Start(ctx, s.stopper); err != nil {
@@ -1664,7 +1644,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 
 	// OIDC Configuration must happen prior to the UI Handler being defined below so that we have
 	// the system settings initialized for it to pick up from the oidcAuthenticationServer.
-	oidc, err := ConfigureOIDC(ctx, s.ClusterSettings(), &s.mux, s.authentication.UserLoginFromSSO, s.cfg.AmbientCtx, s.ClusterID(), s.nodeDialer, s.NodeID())
+	oidc, err := ConfigureOIDC(ctx, s.ClusterSettings(), &s.mux, s.authentication.UserLoginFromSSO, s.cfg.AmbientCtx, s.ClusterID())
 	if err != nil {
 		return err
 	}
@@ -1728,7 +1708,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 					http.Error(w, "admin privilege required", http.StatusUnauthorized)
 					return
 				} else if err != nil {
-					log.Infof(authCtx, "web session error: %s", err)
+					log.Ops.Infof(authCtx, "web session error: %s", err)
 					http.Error(w, "error checking authentication", http.StatusInternalServerError)
 					return
 				}
@@ -1757,7 +1737,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 
 	// Record that this node joined the cluster in the event log. Since this
 	// executes a SQL query, this must be done after the SQL layer is ready.
-	s.node.recordJoinEvent()
+	s.node.recordJoinEvent(ctx)
 
 	if err := s.sqlServer.preStart(
 		workersCtx,
@@ -1840,7 +1820,7 @@ func (s *Server) startListenRPCAndSQL(
 		s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
 			<-s.stopper.ShouldQuiesce()
 			if err := pgL.Close(); err != nil {
-				log.Fatalf(workersCtx, "%v", err)
+				log.Ops.Fatalf(workersCtx, "%v", err)
 			}
 		})
 		log.Eventf(ctx, "listening on sql port %s", s.cfg.SQLAddr)
@@ -1921,7 +1901,7 @@ func (s *Server) startServeUI(
 	s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
 		<-s.stopper.ShouldQuiesce()
 		if err := httpLn.Close(); err != nil {
-			log.Fatalf(workersCtx, "%v", err)
+			log.Ops.Fatalf(workersCtx, "%v", err)
 		}
 	})
 
@@ -1973,7 +1953,7 @@ func (s *sqlServer) startServeSQL(
 	pgL net.Listener,
 	socketFile string,
 ) error {
-	log.Info(ctx, "serving sql connections")
+	log.Ops.Info(ctx, "serving sql connections")
 	// Start servicing SQL connections.
 
 	pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())
@@ -1987,14 +1967,14 @@ func (s *sqlServer) startServeSQL(
 			tcpKeepAlive.configure(connCtx, conn)
 
 			if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketTCP); err != nil {
-				log.Errorf(connCtx, "serving SQL client conn: %v", err)
+				log.Ops.Errorf(connCtx, "serving SQL client conn: %v", err)
 			}
 		}))
 	})
 
 	// If a unix socket was requested, start serving there too.
 	if len(socketFile) != 0 {
-		log.Infof(ctx, "starting postgres server at unix:%s", socketFile)
+		log.Ops.Infof(ctx, "starting postgres server at unix:%s", socketFile)
 
 		// Unix socket enabled: postgres protocol only.
 		unixLn, err := net.Listen("unix", socketFile)
@@ -2005,7 +1985,7 @@ func (s *sqlServer) startServeSQL(
 		stopper.RunWorker(ctx, func(workersCtx context.Context) {
 			<-stopper.ShouldQuiesce()
 			if err := unixLn.Close(); err != nil {
-				log.Fatalf(workersCtx, "%v", err)
+				log.Ops.Fatalf(workersCtx, "%v", err)
 			}
 		})
 
@@ -2013,7 +1993,7 @@ func (s *sqlServer) startServeSQL(
 			netutil.FatalIfUnexpected(connManager.ServeWith(pgCtx, stopper, unixLn, func(conn net.Conn) {
 				connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
 				if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketUnix); err != nil {
-					log.Errorf(connCtx, "%v", err)
+					log.Ops.Errorf(connCtx, "%v", err)
 				}
 			}))
 		})
@@ -2023,40 +2003,52 @@ func (s *sqlServer) startServeSQL(
 
 // Decommission idempotently sets the decommissioning flag for specified nodes.
 func (s *Server) Decommission(
-	ctx context.Context, targetStatus kvserverpb.MembershipStatus, nodeIDs []roachpb.NodeID,
+	ctx context.Context, targetStatus livenesspb.MembershipStatus, nodeIDs []roachpb.NodeID,
 ) error {
-	if !s.st.Version.IsActive(ctx, clusterversion.VersionNodeMembershipStatus) {
+	if !s.st.Version.IsActive(ctx, clusterversion.NodeMembershipStatus) {
 		if targetStatus.Decommissioned() {
 			// In mixed-version cluster settings, we need to ensure that we're
 			// on-the-wire compatible with nodes only familiar with the boolean
 			// representation of membership state. We do the simple thing and
 			// simply disallow the setting of the fully decommissioned state until
 			// we're guaranteed to be on v20.2.
-			targetStatus = kvserverpb.MembershipStatus_DECOMMISSIONING
+			targetStatus = livenesspb.MembershipStatus_DECOMMISSIONING
 		}
 	}
 
-	eventLogger := sql.MakeEventLogger(s.sqlServer.execCfg)
-	var eventType sql.EventLogType
+	var event eventpb.EventPayload
+	var nodeDetails *eventpb.CommonNodeDecommissionDetails
 	if targetStatus.Decommissioning() {
-		eventType = sql.EventLogNodeDecommissioning
+		ev := &eventpb.NodeDecommissioning{}
+		nodeDetails = &ev.CommonNodeDecommissionDetails
+		event = ev
 	} else if targetStatus.Decommissioned() {
-		eventType = sql.EventLogNodeDecommissioned
+		ev := &eventpb.NodeDecommissioned{}
+		nodeDetails = &ev.CommonNodeDecommissionDetails
+		event = ev
 	} else if targetStatus.Active() {
-		eventType = sql.EventLogNodeRecommissioned
+		ev := &eventpb.NodeRecommissioned{}
+		nodeDetails = &ev.CommonNodeDecommissionDetails
+		event = ev
 	} else {
 		panic("unexpected target membership status")
 	}
+	event.CommonDetails().Timestamp = timeutil.Now().UnixNano()
+	nodeDetails.RequestingNodeID = int32(s.NodeID())
 
 	for _, nodeID := range nodeIDs {
 		statusChanged, err := s.nodeLiveness.SetMembershipStatus(ctx, nodeID, targetStatus)
 		if err != nil {
-			if errors.Is(err, kvserver.ErrMissingLivenessRecord) {
-				return grpcstatus.Error(codes.NotFound, kvserver.ErrMissingLivenessRecord.Error())
+			if errors.Is(err, liveness.ErrMissingRecord) {
+				return grpcstatus.Error(codes.NotFound, liveness.ErrMissingRecord.Error())
 			}
 			return err
 		}
 		if statusChanged {
+			nodeDetails.TargetNodeID = int32(nodeID)
+			// Ensure an entry is produced in the external log in all cases.
+			log.StructuredEvent(ctx, event)
+
 			// If we die right now or if this transaction fails to commit, the
 			// membership event will not be recorded to the event log. While we
 			// could insert the event record in the same transaction as the liveness
@@ -2064,11 +2056,27 @@ func (s *Server) Decommission(
 			// the node liveness range. Better to make the event logging best effort
 			// than to slow down future node liveness transactions.
 			if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				return eventLogger.InsertEventRecord(
-					ctx, txn, eventType, int32(nodeID), int32(s.NodeID()), struct{}{},
-				)
+				return sql.InsertEventRecord(
+					ctx,
+					s.sqlServer.execCfg.InternalExecutor,
+					txn,
+					int32(nodeID), int32(s.NodeID()),
+					true, /* skipExternalLog - we already call log.StructuredEvent above */
+					event)
 			}); err != nil {
-				log.Errorf(ctx, "unable to record %s event for node %d: %s", eventType, nodeID, err)
+				log.Ops.Errorf(ctx, "unable to record event: %+v: %+v", event, err)
+			}
+		}
+
+		// Similarly to the log event above, we may not be able to clean up the
+		// status entry if we crash or fail -- the status entry is inline, and
+		// thus cannot be transactional. However, since decommissioning is
+		// idempotent, we can attempt to remove the key regardless of whether
+		// the status changed, such that a stale key can be removed by
+		// decommissioning the node again.
+		if targetStatus.Decommissioned() {
+			if err := s.db.PutInline(ctx, keys.NodeStatusKey(nodeID), nil); err != nil {
+				log.Errorf(ctx, "unable to clean up node status data for node %d: %s", nodeID, err)
 			}
 		}
 	}
@@ -2239,7 +2247,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// which results in a 304 Not Modified.
 			if err := gzw.Close(); err != nil && !errors.Is(err, http.ErrBodyNotAllowed) {
 				ctx := s.AnnotateCtx(r.Context())
-				log.Warningf(ctx, "error closing gzip response writer: %v", err)
+				log.Ops.Warningf(ctx, "error closing gzip response writer: %v", err)
 			}
 		}()
 		w = gzw
@@ -2337,14 +2345,14 @@ func (k *tcpKeepAliveManager) configure(ctx context.Context, conn net.Conn) {
 	doLog := atomic.CompareAndSwapInt32(&k.loggedKeepAliveStatus, 0, 1)
 	if err := tcpConn.SetKeepAlive(true); err != nil {
 		if doLog {
-			log.Warningf(ctx, "failed to enable TCP keep-alive for pgwire: %v", err)
+			log.Ops.Warningf(ctx, "failed to enable TCP keep-alive for pgwire: %v", err)
 		}
 		return
 
 	}
 	if err := tcpConn.SetKeepAlivePeriod(k.tcpKeepAlive); err != nil {
 		if doLog {
-			log.Warningf(ctx, "failed to set TCP keep-alive duration for pgwire: %v", err)
+			log.Ops.Warningf(ctx, "failed to set TCP keep-alive duration for pgwire: %v", err)
 		}
 		return
 	}

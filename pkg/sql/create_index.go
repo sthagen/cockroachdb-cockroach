@@ -13,23 +13,25 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -43,6 +45,13 @@ type createIndexNode struct {
 //   notes: postgres requires CREATE on the table.
 //          mysql requires INDEX on the table.
 func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"CREATE INDEX",
+	); err != nil {
+		return nil, err
+	}
 	tableDesc, err := p.ResolveMutableTableDescriptor(
 		ctx, &n.Table, true /*required*/, tree.ResolveRequireTableOrViewDesc,
 	)
@@ -175,8 +184,12 @@ func MakeIndexDescriptor(
 		if n.Unique {
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes can't be unique")
 		}
+
+		if !params.SessionData().EnableMultiColumnInvertedIndexes && len(n.Columns) > 1 {
+			return nil, pgerror.New(pgcode.FeatureNotSupported, "indexing more than one column with an inverted index is not supported")
+		}
 		indexDesc.Type = descpb.IndexDescriptor_INVERTED
-		columnDesc, _, err := tableDesc.FindColumnByName(n.Columns[0].Column)
+		columnDesc, _, err := tableDesc.FindColumnByName(n.Columns[len(n.Columns)-1].Column)
 		if err != nil {
 			return nil, err
 		}
@@ -273,9 +286,6 @@ func validateIndexColumnsExist(desc *tabledesc.Mutable, columns tree.IndexElemLi
 // and expects to see its own writes.
 func (n *createIndexNode) ReadingOwnWrites() {}
 
-var invalidClusterForShardedIndexError = pgerror.Newf(pgcode.FeatureNotSupported,
-	"hash sharded indexes can only be created on a cluster that has fully migrated to version 20.1")
-
 var hashShardedIndexesDisabledError = pgerror.Newf(pgcode.FeatureNotSupported,
 	"hash sharded indexes require the experimental_enable_hash_sharded_indexes session variable")
 
@@ -290,10 +300,6 @@ func setupShardedIndex(
 	indexDesc *descpb.IndexDescriptor,
 	isNewTable bool,
 ) (shard *descpb.ColumnDescriptor, newColumn bool, err error) {
-	st := evalCtx.Settings
-	if !st.Version.IsActive(ctx, clusterversion.VersionHashShardedIndexes) {
-		return nil, false, invalidClusterForShardedIndexError
-	}
 	if !shardedIndexEnabled {
 		return nil, false, hashShardedIndexesDisabledError
 	}
@@ -385,12 +391,22 @@ func (n *createIndexNode) startExec(params runParams) error {
 
 	// Warn against creating a non-partitioned index on a partitioned table,
 	// which is undesirable in most cases.
-	if n.n.PartitionBy == nil && n.tableDesc.PrimaryIndex.Partitioning.NumColumns > 0 {
+	if n.n.PartitionBy == nil && n.tableDesc.GetPrimaryIndex().Partitioning.NumColumns > 0 {
 		params.p.BufferClientNotice(
 			params.ctx,
 			errors.WithHint(
 				pgnotice.Newf("creating non-partitioned index on partitioned table may not be performant"),
 				"Consider modifying the index such that it is also partitioned.",
+			),
+		)
+	}
+
+	if n.n.Interleave != nil {
+		params.p.BufferClientNotice(
+			params.ctx,
+			errors.WithIssueLink(
+				pgnotice.Newf("interleaved tables and indexes are deprecated in 20.2 and will be removed in 21.2"),
+				errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
 			),
 		)
 	}
@@ -405,11 +421,9 @@ func (n *createIndexNode) startExec(params runParams) error {
 		telemetry.Inc(sqltelemetry.SecondaryIndexColumnFamiliesCounter)
 	}
 
-	// If all nodes in the cluster know how to handle secondary indexes with column families,
-	// write the new version into the index descriptor.
-	encodingVersion := descpb.BaseIndexFormatVersion
-	if params.p.EvalContext().Settings.Version.IsActive(params.ctx, clusterversion.VersionSecondaryIndexColumnFamilies) {
-		encodingVersion = descpb.SecondaryIndexFamilyFormatVersion
+	encodingVersion := descpb.SecondaryIndexFamilyFormatVersion
+	if params.p.EvalContext().Settings.Version.IsActive(params.ctx, clusterversion.EmptyArraysInInvertedIndexes) {
+		encodingVersion = descpb.EmptyArraysInInvertedIndexesVersion
 	}
 	indexDesc.Version = encodingVersion
 
@@ -458,23 +472,13 @@ func (n *createIndexNode) startExec(params runParams) error {
 	// Record index creation in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogCreateIndex,
-		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TableName  string
-			IndexName  string
-			Statement  string
-			User       string
-			MutationID uint32
-		}{
-			n.n.Table.FQString(), indexName, n.n.String(),
-			params.SessionData().User, uint32(mutationID),
-		},
-	)
+	return params.p.logEvent(params.ctx,
+		n.tableDesc.ID,
+		&eventpb.CreateIndex{
+			TableName:  n.n.Table.FQString(),
+			IndexName:  indexName,
+			MutationID: uint32(mutationID),
+		})
 }
 
 func (*createIndexNode) Next(runParams) (bool, error) { return false, nil }

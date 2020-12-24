@@ -47,11 +47,11 @@ query TTBITTBB colnames
 SHOW INDEXES FROM t
 ----
 table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit
+t           foo         false       1             b            ASC        false    false
+t           foo         false       2             a            ASC        false    true
 t           primary     false       1             a            ASC        false    false
 t           t_f_idx     true        1             f            ASC        false    false
 t           t_f_idx     true        2             a            ASC        false    true
-t           foo         false       1             b            ASC        false    false
-t           foo         false       2             a            ASC        false    true
 
 query III
 SELECT * FROM t
@@ -66,6 +66,9 @@ INSERT INTO t VALUES (2, 9, 1, 1), (3, 9, 2, 1)
 
 statement error pgcode 23505 violates unique constraint "bar"
 ALTER TABLE t ADD CONSTRAINT bar UNIQUE (c)
+
+statement error pgcode 42703 column "dne" does not exist
+ALTER TABLE t ADD CONSTRAINT dne_unique UNIQUE (dne)
 
 # Test that rollback was successful
 query TTTTTR
@@ -223,7 +226,7 @@ ALTER TABLE t ADD d INT UNIQUE
 statement ok
 INSERT INTO t VALUES (4, 9, 1)
 
-statement error duplicate key value \(d\)=\(1\) violates unique constraint \"t_d_key\"
+statement error duplicate key value violates unique constraint \"t_d_key\"\nDETAIL: Key \(d\)=\(1\) already exists\.
 INSERT INTO t VALUES (5, 9, 1)
 
 # Add a column with no default value
@@ -356,9 +359,9 @@ query TTBITTBB colnames
 SHOW INDEXES FROM o
 ----
 table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit
-o           primary     false       1             rowid        ASC        false    false
 o           oi          true        1             i            ASC        false    false
 o           oi          true        2             rowid        ASC        false    true
+o           primary     false       1             rowid        ASC        false    false
 
 statement ok
 ALTER TABLE t ADD f INT CHECK (f > 1)
@@ -478,6 +481,9 @@ INSERT INTO add_default (a) VALUES (2)
 
 statement ok
 ALTER TABLE add_default ALTER COLUMN b SET DEFAULT 10
+
+statement error pgcode 42804 expected DEFAULT expression to have type int, but ''i'::STRING' has type string
+ALTER TABLE add_default ALTER COLUMN b SET DEFAULT 'i'::string
 
 statement ok
 INSERT INTO add_default (a) VALUES (3)
@@ -671,7 +677,7 @@ query TTBTTTB colnames
 SHOW COLUMNS FROM privs
 ----
 column_name  data_type  is_nullable  column_default  generation_expression  indices        is_hidden
-a            INT8       false        NULL            ·                      {primary,foo}  false
+a            INT8       false        NULL            ·                      {foo,primary}  false
 b            INT8       true         NULL            ·                      {foo}          false
 c            INT8       true         NULL            ·                      {}             false
 
@@ -978,8 +984,8 @@ ALTER TABLE t ADD CHECK (a < 16) NOT VALID
 query TTTTB
 SHOW CONSTRAINTS FROM t
 ----
-t  check_a   CHECK  CHECK ((a < 100))  true
-t  check_a1  CHECK  CHECK ((a < 16))   false
+t  check_a   CHECK  CHECK ((a < 100))           true
+t  check_a1  CHECK  CHECK ((a < 16)) NOT VALID  false
 
 query error pq: failed to satisfy CHECK constraint \(a < 16:::INT8\)
 INSERT INTO t VALUES (20)
@@ -1201,7 +1207,7 @@ SHOW CREATE t2
 t2  CREATE TABLE public.t2 (
     y INT8 NULL,
     x INT8 NULL,
-    CONSTRAINT fk_x_ref_t1 FOREIGN KEY (x) REFERENCES public.t1(x),
+    CONSTRAINT fk_x_ref_t1 FOREIGN KEY (x) REFERENCES public.t1(x) NOT VALID,
     FAMILY "primary" (y, rowid, x)
 )
 
@@ -1223,7 +1229,7 @@ SHOW CREATE t2
 t2  CREATE TABLE public.t2 (
     y INT8 NULL,
     x INT8 NULL,
-    CONSTRAINT fk_x_ref_t1 FOREIGN KEY (x) REFERENCES public.t1(x),
+    CONSTRAINT fk_x_ref_t1 FOREIGN KEY (x) REFERENCES public.t1(x) NOT VALID,
     FAMILY "primary" (y, rowid, x)
 )
 
@@ -1248,7 +1254,7 @@ SHOW CREATE t2
 t2  CREATE TABLE public.t2 (
     y INT8 NULL,
     x INT8 NULL,
-    CONSTRAINT fk_x_ref_t1 FOREIGN KEY (x) REFERENCES public.t1(x),
+    CONSTRAINT fk_x_ref_t1 FOREIGN KEY (x) REFERENCES public.t1(x) NOT VALID,
     INDEX t2_x_idx (x ASC),
     FAMILY "primary" (y, rowid, x)
 )
@@ -1405,13 +1411,87 @@ ALTER TABLE t_cannot_rename_constraint_over_index RENAME CONSTRAINT "primary" TO
 subtest unique_without_index
 
 statement ok
+SET experimental_enable_unique_without_index_constraints = true
+
+statement ok
 CREATE TABLE unique_without_index (
   a INT,
-  b INT
+  b INT UNIQUE WITHOUT INDEX,
+  c INT UNIQUE,
+  UNIQUE WITHOUT INDEX (b),
+  UNIQUE WITHOUT INDEX (a, b),
+  UNIQUE WITHOUT INDEX (c)
 )
 
-statement error unique constraints without an index are not yet supported
-ALTER TABLE unique_without_index ADD COLUMN c INT UNIQUE WITHOUT INDEX
+# We don't yet support adding unique constraints without an index after a table
+# is created.
+statement error pgcode 0A000 unique constraints without an index are not yet supported
+ALTER TABLE unique_without_index ADD COLUMN d INT UNIQUE WITHOUT INDEX
 
-statement error unique constraints without an index are not yet supported
-ALTER TABLE unique_without_index ADD CONSTRAINT ab UNIQUE WITHOUT INDEX (a, b)
+statement error pgcode 0A000 unique constraints without an index are not yet supported
+ALTER TABLE unique_without_index ADD CONSTRAINT ab UNIQUE WITHOUT INDEX (a, c) NOT VALID
+
+# All constraints are already valid, so validation should succeed.
+statement ok
+ALTER TABLE unique_without_index VALIDATE CONSTRAINT unique_b;
+ALTER TABLE unique_without_index VALIDATE CONSTRAINT unique_a_b;
+ALTER TABLE unique_without_index VALIDATE CONSTRAINT unique_without_index_c_key
+
+query TTTTB
+SHOW CONSTRAINTS FROM unique_without_index
+----
+unique_without_index  unique_a_b                  UNIQUE  UNIQUE WITHOUT INDEX (a, b)  true
+unique_without_index  unique_b                    UNIQUE  UNIQUE WITHOUT INDEX (b)     true
+unique_without_index  unique_b_1                  UNIQUE  UNIQUE WITHOUT INDEX (b)     true
+unique_without_index  unique_c                    UNIQUE  UNIQUE WITHOUT INDEX (c)     true
+unique_without_index  unique_without_index_c_key  UNIQUE  UNIQUE (c ASC)               true
+
+statement ok
+ALTER TABLE unique_without_index RENAME COLUMN a TO aa
+
+statement error pgcode 42704 constraint \"unique_b_2\" does not exist
+ALTER TABLE unique_without_index RENAME CONSTRAINT unique_b_2 TO unique_b_3
+
+statement error pgcode 42710 duplicate constraint name: \"unique_b_1\"
+ALTER TABLE unique_without_index RENAME CONSTRAINT unique_b TO unique_b_1
+
+statement ok
+ALTER TABLE unique_without_index RENAME CONSTRAINT unique_b TO unique_b_2
+
+query TTTTB
+SHOW CONSTRAINTS FROM unique_without_index
+----
+unique_without_index  unique_a_b                  UNIQUE  UNIQUE WITHOUT INDEX (aa, b)  true
+unique_without_index  unique_b_1                  UNIQUE  UNIQUE WITHOUT INDEX (b)      true
+unique_without_index  unique_b_2                  UNIQUE  UNIQUE WITHOUT INDEX (b)      true
+unique_without_index  unique_c                    UNIQUE  UNIQUE WITHOUT INDEX (c)      true
+unique_without_index  unique_without_index_c_key  UNIQUE  UNIQUE (c ASC)                true
+
+statement error pgcode 0A000 cannot drop UNIQUE constraint \"unique_without_index_c_key\"
+ALTER TABLE unique_without_index DROP CONSTRAINT unique_without_index_c_key
+
+statement error pgcode 42704 constraint \"unique_b\" does not exist
+ALTER TABLE unique_without_index DROP CONSTRAINT unique_b
+
+statement error pgcode 0A000 dropping valid unique constraints without an index is not yet supported
+ALTER TABLE unique_without_index DROP CONSTRAINT unique_b_2
+
+# Dropping a column in a unique constraint drops the constraint.
+statement ok
+ALTER TABLE unique_without_index DROP COLUMN b
+
+query TTTTB
+SHOW CONSTRAINTS FROM unique_without_index
+----
+unique_without_index  unique_c                    UNIQUE  UNIQUE WITHOUT INDEX (c)  true
+unique_without_index  unique_without_index_c_key  UNIQUE  UNIQUE (c ASC)            true
+
+# TODO(rytaft): Add test cases for dropping both a valid and not-valid
+# unique constraint once supported.
+
+# Regression for #54629.
+statement ok
+CREATE TABLE t54629 (c INT NOT NULL, UNIQUE INDEX (c));
+ALTER TABLE t54629 ADD CONSTRAINT pk PRIMARY KEY (c);
+INSERT INTO t54629 VALUES (1);
+DELETE FROM t54629 WHERE c = 1;

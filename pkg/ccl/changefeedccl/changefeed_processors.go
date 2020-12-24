@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
@@ -41,6 +42,7 @@ import (
 
 type changeAggregator struct {
 	execinfra.ProcessorBase
+	execinfra.StreamingProcessor
 
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.ChangeAggregatorSpec
@@ -161,7 +163,7 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 
 	if ca.sink, err = getSink(
 		ctx, ca.spec.Feed.SinkURI, nodeID, ca.spec.Feed.Opts, ca.spec.Feed.Targets,
-		ca.flowCtx.Cfg.Settings, timestampOracle, ca.flowCtx.Cfg.ExternalStorageFromURI, ca.spec.User,
+		ca.flowCtx.Cfg.Settings, timestampOracle, ca.flowCtx.Cfg.ExternalStorageFromURI, ca.spec.User(),
 	); err != nil {
 		err = MarkRetryableError(err)
 		// Early abort in the case that there is an error creating the sink.
@@ -406,6 +408,7 @@ const (
 
 type changeFrontier struct {
 	execinfra.ProcessorBase
+	execinfra.StreamingProcessor
 
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.ChangeFrontierSpec
@@ -545,7 +548,7 @@ func (cf *changeFrontier) Start(ctx context.Context) context.Context {
 	var nilOracle timestampLowerBoundOracle
 	if cf.sink, err = getSink(
 		ctx, cf.spec.Feed.SinkURI, nodeID, cf.spec.Feed.Opts, cf.spec.Feed.Targets,
-		cf.flowCtx.Cfg.Settings, nilOracle, cf.flowCtx.Cfg.ExternalStorageFromURI, cf.spec.User,
+		cf.flowCtx.Cfg.Settings, nilOracle, cf.flowCtx.Cfg.ExternalStorageFromURI, cf.spec.User(),
 	); err != nil {
 		err = MarkRetryableError(err)
 		cf.MoveToDraining(err)
@@ -715,7 +718,7 @@ func (cf *changeFrontier) noteResolvedSpan(d rowenc.EncDatum) error {
 	// job progress update closure, but it currently doesn't pass along the info
 	// we'd need to do it that way.
 	if !resolved.Timestamp.IsEmpty() && resolved.Timestamp.Less(cf.highWaterAtStart) {
-		log.ReportOrPanic(cf.Ctx, &cf.flowCtx.Cfg.Settings.SV,
+		logcrash.ReportOrPanic(cf.Ctx, &cf.flowCtx.Cfg.Settings.SV,
 			`got a span level timestamp %s for %s that is less than the initial high-water %s`,
 			log.Safe(resolved.Timestamp), resolved.Span, log.Safe(cf.highWaterAtStart))
 		return nil
@@ -852,7 +855,7 @@ func (cf *changeFrontier) maybeProtectTimestamp(
 
 	jobID := cf.spec.JobID
 	targets := cf.spec.Feed.Targets
-	return createProtectedTimestampRecord(ctx, pts, txn, jobID, targets, resolved, progress)
+	return createProtectedTimestampRecord(ctx, cf.flowCtx.Codec(), pts, txn, jobID, targets, resolved, progress)
 }
 
 func (cf *changeFrontier) maybeEmitResolved(newResolved hlc.Timestamp) error {

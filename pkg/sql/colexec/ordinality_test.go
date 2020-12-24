@@ -111,13 +111,13 @@ func createTestOrdinalityOperator(
 		Core: execinfrapb.ProcessorCoreUnion{
 			Ordinality: &execinfrapb.OrdinalitySpec{},
 		},
+		ResultTypes: append(inputTypes, types.Int),
 	}
 	args := &NewColOperatorArgs{
 		Spec:                spec,
 		Inputs:              []colexecbase.Operator{input},
 		StreamingMemAccount: testMemAcc,
 	}
-	args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 	result, err := TestNewColOperator(ctx, flowCtx, args)
 	if err != nil {
 		return nil, err

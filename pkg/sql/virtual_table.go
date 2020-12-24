@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
@@ -39,7 +40,7 @@ type cleanupFunc func()
 // and then suspend until the next row has been requested.
 type rowPusher interface {
 	// pushRow pushes the input row to the receiver of the generator. It doesn't
-	// mutate the input row. It will block until the the data has been received
+	// mutate the input row. It will block until the data has been received
 	// and more data has been requested. Once pushRow returns, the caller is free
 	// to mutate the slice passed as input. The caller is not allowed to perform
 	// operations on a transaction while blocked on a call to pushRow.
@@ -70,7 +71,11 @@ func setupGenerator(
 ) (next virtualTableGenerator, cleanup cleanupFunc) {
 	var cancel func()
 	ctx, cancel = context.WithCancel(ctx)
-	cleanup = cancel
+	var wg sync.WaitGroup
+	cleanup = func() {
+		cancel()
+		wg.Wait()
+	}
 
 	// comm is the channel to manage communication between the row receiver
 	// and the generator. The row receiver notifies the worker to begin
@@ -101,7 +106,9 @@ func setupGenerator(
 		return nil
 	}
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		// We wait until a call to next before starting the worker. This prevents
 		// concurrent transaction usage during the startup phase. We also have to
 		// wait on done here if cleanup is called before any calls to next() to
@@ -201,7 +208,7 @@ type vTableLookupJoinNode struct {
 	// eqCol is the single equality column ordinal into the lookup table. Virtual
 	// indexes only support a single indexed column currently.
 	eqCol             int
-	virtualTableEntry virtualDefEntry
+	virtualTableEntry *virtualDefEntry
 
 	joinType descpb.JoinType
 
@@ -247,10 +254,9 @@ func (v *vTableLookupJoinNode) startExec(params runParams) error {
 	)
 	v.run.indexKeyDatums = make(tree.Datums, len(v.columns))
 	var err error
-	db, err := params.p.LogicalSchemaAccessor().GetDatabaseDesc(
+	_, db, err := params.p.Descriptors().GetImmutableDatabaseByName(
 		params.ctx,
 		params.p.txn,
-		params.p.ExecCfg().Codec,
 		v.dbName,
 		tree.DatabaseLookupFlags{
 			Required: true, AvoidCached: params.p.avoidCachedDescriptors,
@@ -259,7 +265,7 @@ func (v *vTableLookupJoinNode) startExec(params runParams) error {
 	if err != nil {
 		return err
 	}
-	v.db = db.(*dbdesc.Immutable)
+	v.db = db
 	return err
 }
 

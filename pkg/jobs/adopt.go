@@ -21,9 +21,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/opentracing/opentracing-go"
 )
+
+const claimableStatusTupleString = `(` +
+	`'` + string(StatusRunning) + `', ` +
+	`'` + string(StatusPending) + `', ` +
+	`'` + string(StatusCancelRequested) + `', ` +
+	`'` + string(StatusPauseRequested) + `', ` +
+	`'` + string(StatusReverting) + `'` +
+	`)`
 
 // claimJobs places a claim with the given SessionID to job rows that are
 // available.
@@ -31,8 +39,13 @@ func (r *Registry) claimJobs(ctx context.Context, s sqlliveness.Session) error {
 	return r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		rows, err := r.ex.Query(
 			ctx, "claim-jobs", txn, `
-UPDATE system.jobs SET claim_session_id = $1, claim_instance_id = $2
-WHERE claim_session_id IS NULL ORDER BY created DESC LIMIT $3 RETURNING id`,
+   UPDATE system.jobs
+      SET claim_session_id = $1, claim_instance_id = $2
+    WHERE claim_session_id IS NULL
+      AND status IN `+claimableStatusTupleString+`
+ ORDER BY created DESC
+    LIMIT $3
+RETURNING id;`,
 			s.ID().UnsafeBytes(), r.ID(), maxAdoptionsPerLoop,
 		)
 		if err != nil {
@@ -49,7 +62,7 @@ WHERE claim_session_id IS NULL ORDER BY created DESC LIMIT $3 RETURNING id`,
 func (r *Registry) processClaimedJobs(ctx context.Context, s sqlliveness.Session) error {
 	rows, err := r.ex.QueryEx(
 		ctx, "select-running/get-claimed-jobs", nil,
-		sessiondata.InternalExecutorOverride{User: security.NodeUser}, `
+		sessiondata.InternalExecutorOverride{User: security.NodeUserName()}, `
 SELECT id FROM system.jobs
 WHERE (status = $1 OR status = $2) AND (claim_session_id = $3 AND claim_instance_id = $4)`,
 		StatusRunning, StatusReverting, s.ID().UnsafeBytes(), r.ID(),
@@ -124,7 +137,7 @@ func (r *Registry) resumeJob(ctx context.Context, jobID int64, s sqlliveness.Ses
 	log.Infof(ctx, "job %d: resuming execution", jobID)
 	row, err := r.ex.QueryRowEx(
 		ctx, "get-job-row", nil,
-		sessiondata.InternalExecutorOverride{User: security.NodeUser}, `
+		sessiondata.InternalExecutorOverride{User: security.NodeUserName()}, `
 SELECT status, payload, progress, crdb_internal.sql_liveness_is_alive(claim_session_id)
 FROM system.jobs WHERE id = $1 AND claim_session_id = $2`,
 		jobID, s.ID().UnsafeBytes(),
@@ -229,30 +242,24 @@ func (r *Registry) runJob(
 	if job.mu.payload.FinalResumeError != nil {
 		finalResumeError = errors.DecodeError(ctx, *job.mu.payload.FinalResumeError)
 	}
-	username := job.mu.payload.Username
+	username := job.mu.payload.UsernameProto.Decode()
 	typ := job.mu.payload.Type()
 	job.mu.Unlock()
 
 	// Bookkeeping.
-	phs, cleanup := r.planFn("resume-"+taskName, username)
+	execCtx, cleanup := r.execCtx("resume-"+taskName, username)
 	defer cleanup()
 	spanName := fmt.Sprintf(`%s-%d`, typ, *job.ID())
-	var span opentracing.Span
+	var span *tracing.Span
 	ctx, span = r.ac.AnnotateCtxWithSpan(ctx, spanName)
 	defer span.Finish()
 
 	// Run the actual job.
-	err := r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, status, finalResumeError)
-	if err != nil {
-		// TODO (lucy): This needs to distinguish between assertion errors in
-		// the job registry and assertion errors in job execution returned from
-		// Resume() or OnFailOrCancel(), and only fail on the former. We have
-		// tests that purposely introduce bad state in order to produce
-		// assertion errors, which shouldn't cause the test to panic. For now,
-		// comment this out.
-		// if errors.HasAssertionFailure(err) {
-		// 	log.ReportOrPanic(ctx, nil, err.Error())
-		// }
+	err := r.stepThroughStateMachine(ctx, execCtx, resumer, resultsCh, job, status, finalResumeError)
+	// If the context has been canceled, disregard errors for the sake of logging
+	// as presumably they are due to the context cancellation which commonly
+	// happens during shutdown.
+	if err != nil && ctx.Err() == nil {
 		log.Errorf(ctx, "job %d: adoption completed with error %v", *job.ID(), err)
 	}
 	r.unregister(*job.ID())
@@ -262,14 +269,14 @@ func (r *Registry) runJob(
 func (r *Registry) servePauseAndCancelRequests(ctx context.Context, s sqlliveness.Session) error {
 	return r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		rows, err := r.ex.QueryEx(
-			ctx, "cancel/pause-requested", txn, sessiondata.InternalExecutorOverride{User: security.NodeUser}, `
+			ctx, "cancel/pause-requested", txn, sessiondata.InternalExecutorOverride{User: security.NodeUserName()}, `
 UPDATE system.jobs
 SET status =
 		CASE
 			WHEN status = $1 THEN $2
 			WHEN status = $3 THEN $4
 			ELSE status
-		END 
+		END
 WHERE (status IN ($1, $3)) AND (claim_session_id = $5 AND claim_instance_id = $6)
 RETURNING id, status`,
 			StatusPauseRequested, StatusPaused,
@@ -282,7 +289,8 @@ RETURNING id, status`,
 		for _, row := range rows {
 			id := int64(*row[0].(*tree.DInt))
 			job := &Job{id: &id, registry: r}
-			switch Status(*row[1].(*tree.DString)) {
+			statusString := *row[1].(*tree.DString)
+			switch Status(statusString) {
 			case StatusPaused:
 				r.unregister(id)
 				log.Infof(ctx, "job %d, session %s: paused", id, s.ID())
@@ -300,7 +308,7 @@ RETURNING id, status`,
 				log.Infof(ctx, "job %d, session id: %s canceled: the job is now reverting",
 					id, s.ID())
 			default:
-				log.ReportOrPanic(ctx, nil, "unexpected job status")
+				return errors.AssertionFailedf("unexpected job status %s: %v", statusString, job)
 			}
 		}
 		return nil

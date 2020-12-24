@@ -58,19 +58,34 @@ const (
 	// CodeClientDisconnected indicates that the client disconnected unexpectedly
 	// (with a connection error) while in a session with backend SQL server.
 	CodeClientDisconnected
+
+	// CodeProxyRefusedConnection indicates that the proxy refused the connection
+	// request due to high load or too many connection attempts.
+	CodeProxyRefusedConnection
+
+	// CodeExpiredClientConnection indicates that proxy connection to the client
+	// has expired and should be closed.
+	CodeExpiredClientConnection
+
+	// CodeIdleDisconnect indicates that the connection was disconnected for
+	// being idle for longer than the specified timeout.
+	CodeIdleDisconnect
 )
 
-type codeError struct {
+// CodeError is combines an error with one of the above codes to ease
+// the processing of the errors.
+type CodeError struct {
 	code ErrorCode
 	err  error
 }
 
-func (e *codeError) Error() string {
+func (e *CodeError) Error() string {
 	return fmt.Sprintf("%s: %s", e.code, e.err)
 }
 
-func newErrorf(code ErrorCode, format string, args ...interface{}) error {
-	return &codeError{
+// NewErrorf returns a new CodeError out of the supplied args.
+func NewErrorf(code ErrorCode, format string, args ...interface{}) error {
+	return &CodeError{
 		code: code,
 		err:  errors.Errorf(format, args...),
 	}

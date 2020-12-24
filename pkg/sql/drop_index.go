@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -43,6 +43,14 @@ type dropIndexNode struct {
 //   Notes: postgres allows only the index owner to DROP an index.
 //          mysql requires the INDEX privilege on the table.
 func (p *planner) DropIndex(ctx context.Context, n *tree.DropIndex) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"DROP INDEX",
+	); err != nil {
+		return nil, err
+	}
+
 	// Keep a track of the indexes that exist to check. When the IF EXISTS
 	// options are provided, we will simply not include any indexes that
 	// don't exist and continue execution.
@@ -245,7 +253,7 @@ func (p *planner) dropIndexByName(
 			return nil
 		}
 		// Index does not exist, but we want it to: error out.
-		return err
+		return pgerror.WithCandidateCode(err, pgcode.UndefinedObject)
 	}
 	if dropped {
 		return nil
@@ -306,10 +314,10 @@ func (p *planner) dropIndexByName(
 	// Construct a list of all the remaining indexes, so that we can see if there
 	// is another index that could replace the one we are deleting for a given
 	// foreign key constraint.
-	remainingIndexes := make([]*descpb.IndexDescriptor, 0, len(tableDesc.Indexes)+1)
-	remainingIndexes = append(remainingIndexes, &tableDesc.PrimaryIndex)
-	for i := range tableDesc.Indexes {
-		index := &tableDesc.Indexes[i]
+	remainingIndexes := make([]*descpb.IndexDescriptor, 0, len(tableDesc.GetPublicNonPrimaryIndexes())+1)
+	remainingIndexes = append(remainingIndexes, tableDesc.GetPrimaryIndex())
+	for i := range tableDesc.GetPublicNonPrimaryIndexes() {
+		index := &tableDesc.GetPublicNonPrimaryIndexes()[i]
 		if index.ID != idx.ID {
 			remainingIndexes = append(remainingIndexes, index)
 		}
@@ -326,14 +334,6 @@ func (p *planner) dropIndexByName(
 			}
 		}
 		return foundReplacement
-	}
-	// If we aren't at the cluster version where we have removed explicit foreign key IDs
-	// from the foreign key descriptors, fall back to the existing drop index logic.
-	// That means we pretend that we can never find replacements for any indexes.
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.VersionNoExplicitForeignKeyIndexIDs) {
-		indexHasReplacementCandidate = func(func(*descpb.IndexDescriptor) bool) bool {
-			return false
-		}
 	}
 
 	// Check for foreign key mutations referencing this index.
@@ -358,7 +358,7 @@ func (p *planner) dropIndexByName(
 
 	// If the we aren't at a high enough version to drop indexes on the origin
 	// side then we have to attempt to delete them.
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.VersionNoOriginFKIndexes) {
+	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.NoOriginFKIndexes) {
 		// Index for updating the FK slices in place when removing FKs.
 		sliceIdx := 0
 		for i := range tableDesc.OutboundFKs {
@@ -449,8 +449,18 @@ func (p *planner) dropIndexByName(
 	idxCopy := *idx
 	idx = &idxCopy
 
+	// Currently, a replacement primary index must be specified when dropping the primary index,
+	// and this cannot be done with DROP INDEX.
+	if idx.ID == tableDesc.GetPrimaryIndexID() {
+		return errors.WithHint(
+			pgerror.Newf(pgcode.FeatureNotSupported, "cannot drop the primary index of a table using DROP INDEX"),
+			"instead, use ALTER TABLE ... ALTER PRIMARY KEY or"+
+				"use DROP CONSTRAINT ... PRIMARY KEY followed by ADD CONSTRAINT ... PRIMARY KEY in a transaction",
+		)
+	}
+
 	found := false
-	for i, idxEntry := range tableDesc.Indexes {
+	for i, idxEntry := range tableDesc.GetPublicNonPrimaryIndexes() {
 		if idxEntry.ID == idx.ID {
 			// Unsplit all manually split ranges in the index so they can be
 			// automatically merged by the merge queue. Gate this on being the
@@ -470,7 +480,7 @@ func (p *planner) dropIndexByName(
 					// We have to explicitly check that the range descriptor's start key
 					// lies within the span of the index since ScanMetaKVs returns all
 					// intersecting spans.
-					if (desc.GetStickyBit() != hlc.Timestamp{}) && span.Key.Compare(desc.StartKey.AsRawKey()) <= 0 {
+					if !desc.GetStickyBit().IsEmpty() && span.Key.Compare(desc.StartKey.AsRawKey()) <= 0 {
 						// Swallow "key is not the start of a range" errors because it would
 						// mean that the sticky bit was removed and merged concurrently. DROP
 						// INDEX should not fail because of this.
@@ -488,7 +498,7 @@ func (p *planner) dropIndexByName(
 			if err := tableDesc.AddIndexMutation(&idxEntry, descpb.DescriptorMutation_DROP); err != nil {
 				return err
 			}
-			tableDesc.Indexes = append(tableDesc.Indexes[:i], tableDesc.Indexes[i+1:]...)
+			tableDesc.RemovePublicNonPrimaryIndex(i + 1)
 			found = true
 			break
 		}
@@ -524,20 +534,14 @@ func (p *planner) dropIndexByName(
 	// Record index drop in the event log. This is an auditable log event
 	// and is recorded in the same transaction as the table descriptor
 	// update.
-	return MakeEventLogger(p.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		ctx,
-		p.txn,
-		EventLogDropIndex,
-		int32(tableDesc.ID),
-		int32(p.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TableName           string
-			IndexName           string
-			Statement           string
-			User                string
-			MutationID          uint32
-			CascadeDroppedViews []string
-		}{tn.FQString(), string(idxName), jobDesc, p.SessionData().User, uint32(mutationID),
-			droppedViews},
-	)
+	return p.logEvent(ctx,
+		tableDesc.ID,
+		&eventpb.DropIndex{
+			TableName:  tn.FQString(),
+			IndexName:  string(idxName),
+			MutationID: uint32(mutationID),
+			// TODO(knz): the dropped views are improperly qualified.
+			// See: https://github.com/cockroachdb/cockroach/issues/57735
+			CascadeDroppedViews: droppedViews,
+		})
 }

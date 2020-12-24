@@ -12,7 +12,6 @@ package server
 
 import (
 	"context"
-	"os"
 	"strings"
 	"time"
 
@@ -27,18 +26,18 @@ import (
 )
 
 var (
-	queryWait = settings.RegisterPublicDurationSetting(
+	queryWait = settings.RegisterDurationSetting(
 		"server.shutdown.query_wait",
 		"the server will wait for at least this amount of time for active queries to finish",
 		10*time.Second,
-	)
+	).WithPublic()
 
-	drainWait = settings.RegisterPublicDurationSetting(
+	drainWait = settings.RegisterDurationSetting(
 		"server.shutdown.drain_wait",
 		"the amount of time a server waits in an unready state before proceeding with the rest "+
 			"of the shutdown process",
 		0*time.Second,
-	)
+	).WithPublic()
 )
 
 // Drain puts the node into the specified drain mode(s) and optionally
@@ -55,13 +54,13 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 
 	doDrain := req.DoDrain
 
-	log.Infof(ctx, "drain request received with doDrain = %v, shutdown = %v", doDrain, req.Shutdown)
+	log.Ops.Infof(ctx, "drain request received with doDrain = %v, shutdown = %v", doDrain, req.Shutdown)
 
 	res := serverpb.DrainResponse{}
 	if doDrain {
 		remaining, info, err := s.server.Drain(ctx)
 		if err != nil {
-			log.Errorf(ctx, "drain failed: %v", err)
+			log.Ops.Errorf(ctx, "drain failed: %v", err)
 			return err
 		}
 		res.DrainRemainingIndicator = remaining
@@ -79,7 +78,7 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 		if doDrain {
 			// The condition "if doDrain" is because we don't need an info
 			// message for just a probe.
-			log.Infof(ctx, "drain request completed without server shutdown")
+			log.Ops.Infof(ctx, "drain request completed without server shutdown")
 		}
 		return nil
 	}
@@ -113,7 +112,7 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 		// The signal-based shutdown path uses a similar time-based escape hatch.
 		// Until we spend (potentially lots of time to) understand and fix this
 		// issue, this will serve us well.
-		os.Exit(1)
+		log.Fatal(ctx, "timeout after drain")
 		return errors.New("unreachable")
 	}
 }
@@ -155,9 +154,9 @@ func (s *Server) Drain(
 			comma = ", "
 		}
 		info = redact.RedactableString(descBuf.String())
-		log.Infof(ctx, "drain remaining: %d", remaining)
+		log.Ops.Infof(ctx, "drain remaining: %d", remaining)
 		if info != "" {
-			log.Infof(ctx, "drain details: %s", info)
+			log.Ops.Infof(ctx, "drain details: %s", info)
 		}
 	}()
 

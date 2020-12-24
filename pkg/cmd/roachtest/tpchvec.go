@@ -17,7 +17,6 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math"
-	"math/rand"
 	"regexp"
 	"runtime"
 	"sort"
@@ -33,19 +32,23 @@ import (
 type crdbVersion int
 
 const (
-	tpchVecVersion19_2 crdbVersion = iota
-	tpchVecVersion20_1
-	tpchVecVersion20_2
+	crdbVersion19_2 crdbVersion = iota
+	crdbVersion20_1
+	crdbVersion20_2
+	crdbVersion21_1
 )
 
 func toCRDBVersion(v string) (crdbVersion, error) {
-	if strings.HasPrefix(v, "v19.2") {
-		return tpchVecVersion19_2, nil
-	} else if strings.HasPrefix(v, "v20.1") {
-		return tpchVecVersion20_1, nil
-	} else if strings.HasPrefix(v, "v20.2") {
-		return tpchVecVersion20_2, nil
-	} else {
+	switch {
+	case strings.HasPrefix(v, "v19.2"):
+		return crdbVersion19_2, nil
+	case strings.HasPrefix(v, "v20.1"):
+		return crdbVersion20_1, nil
+	case strings.HasPrefix(v, "v20.2"):
+		return crdbVersion20_2, nil
+	case strings.HasPrefix(v, "v21.1"):
+		return crdbVersion21_1, nil
+	default:
 		return 0, errors.Errorf("unrecognized version: %s", v)
 	}
 }
@@ -55,7 +58,7 @@ func vectorizeOptionToSetting(vectorize bool, version crdbVersion) string {
 		return "off"
 	}
 	switch version {
-	case tpchVecVersion19_2:
+	case crdbVersion19_2:
 		return "experimental_on"
 	default:
 		return "on"
@@ -66,7 +69,7 @@ func vectorizeOptionToSetting(vectorize bool, version crdbVersion) string {
 // to be skipped for the given version (as well as the reasons for why they are
 // skipped).
 var queriesToSkipByVersion = map[crdbVersion]map[int]string{
-	tpchVecVersion19_2: {
+	crdbVersion19_2: {
 		5:  "can cause OOM",
 		7:  "can cause OOM",
 		8:  "can cause OOM",
@@ -75,20 +78,7 @@ var queriesToSkipByVersion = map[crdbVersion]map[int]string{
 	},
 }
 
-// getSlownessThreshold returns the threshold at which we fail the test if vec
-// ON is slower that vec OFF, meaning that if
-//   vec_on_time >= slownessThreshold * vec_off_time
-// the test is failed. This will help catch any regressions.
-func getSlownessThreshold(version crdbVersion) float64 {
-	switch version {
-	// Note that for 19.2 version the threshold is higher in order to reduce
-	// the noise.
-	case tpchVecVersion19_2:
-		return 1.5
-	default:
-		return 1.2
-	}
-}
+const tpchVecPerfSlownessThreshold = 1.5
 
 var tpchTables = []string{
 	"nation", "region", "part", "supplier",
@@ -155,11 +145,6 @@ func (b tpchVecTestCaseBase) getRunConfig(
 		}},
 		setupNames: []string{"default"},
 	}
-	if version != tpchVecVersion19_2 {
-		runConfig.clusterSetups[0] = append(runConfig.clusterSetups[0],
-			"RESET CLUSTER SETTING sql.testing.vectorize.batch_size",
-		)
-	}
 	for queryNum := 1; queryNum <= tpch.NumQueries; queryNum++ {
 		if _, shouldSkip := queriesToSkip[queryNum]; !shouldSkip {
 			runConfig.queriesToRun = append(runConfig.queriesToRun, queryNum)
@@ -169,14 +154,12 @@ func (b tpchVecTestCaseBase) getRunConfig(
 }
 
 func (b tpchVecTestCaseBase) preTestRunHook(
-	_ context.Context,
-	t *test,
-	_ *cluster,
-	conn *gosql.DB,
-	version crdbVersion,
-	clusterSetup []string,
+	t *test, conn *gosql.DB, clusterSetup []string, createStats bool,
 ) {
 	performClusterSetup(t, conn, clusterSetup)
+	if createStats {
+		createStatsFromTables(t, conn, tpchTables)
+	}
 }
 
 func (b tpchVecTestCaseBase) postQueryRunHook(*test, []byte, int) {}
@@ -277,10 +260,7 @@ func (p tpchVecPerfTest) preTestRunHook(
 	version crdbVersion,
 	clusterSetup []string,
 ) {
-	p.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version, clusterSetup)
-	if !p.disableStatsCreation {
-		createStatsFromTables(t, conn, tpchTables)
-	}
+	p.tpchVecTestCaseBase.preTestRunHook(t, conn, clusterSetup, !p.disableStatsCreation /* createStats */)
 }
 
 func (p *tpchVecPerfTest) postQueryRunHook(t *test, output []byte, setupIdx int) {
@@ -324,7 +304,7 @@ func (p *tpchVecPerfTest) postTestRunHook(
 					queryNum, 100*(vecOffTime-vecOnTime)/vecOnTime,
 					vecOnTime, vecOffTime, vecOnTimes, vecOffTimes))
 		}
-		if vecOnTime >= getSlownessThreshold(version)*vecOffTime {
+		if vecOnTime >= tpchVecPerfSlownessThreshold*vecOffTime {
 			// For some reason, the vectorized engine executed the query a lot
 			// slower than the row-by-row engine which is unexpected. In order
 			// to understand where the slowness comes from, we will run EXPLAIN
@@ -441,6 +421,12 @@ func (b tpchVecBenchTest) getRunConfig(version crdbVersion, _ map[int]string) tp
 	return runConfig
 }
 
+func (b tpchVecBenchTest) preTestRunHook(
+	_ context.Context, t *test, _ *cluster, conn *gosql.DB, _ crdbVersion, clusterSetup []string,
+) {
+	b.tpchVecTestCaseBase.preTestRunHook(t, conn, clusterSetup, true /* createStats */)
+}
+
 func (b *tpchVecBenchTest) postQueryRunHook(t *test, output []byte, setupIdx int) {
 	b.tpchVecPerfHelper.parseQueryOutput(t, output, setupIdx)
 }
@@ -512,8 +498,7 @@ func (d tpchVecDiskTest) preTestRunHook(
 	version crdbVersion,
 	clusterSetup []string,
 ) {
-	d.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version, clusterSetup)
-	createStatsFromTables(t, conn, tpchTables)
+	d.tpchVecTestCaseBase.preTestRunHook(t, conn, clusterSetup, true /* createStats */)
 	// In order to stress the disk spilling of the vectorized
 	// engine, we will set workmem limit to a random value in range
 	// [16KiB, 256KiB).
@@ -524,34 +509,6 @@ func (d tpchVecDiskTest) preTestRunHook(
 	if _, err := conn.Exec(fmt.Sprintf("SET CLUSTER SETTING sql.distsql.temp_storage.workmem='%s'", workmem)); err != nil {
 		t.Fatal(err)
 	}
-}
-
-// setSmallBatchSize sets a cluster setting to override the batch size to be in
-// [1, 5) range.
-func setSmallBatchSize(t *test, conn *gosql.DB, rng *rand.Rand) {
-	batchSize := 1 + rng.Intn(4)
-	t.Status(fmt.Sprintf("setting sql.testing.vectorize.batch_size to %d", batchSize))
-	if _, err := conn.Exec(fmt.Sprintf("SET CLUSTER SETTING sql.testing.vectorize.batch_size=%d", batchSize)); err != nil {
-		t.Fatal(err)
-	}
-}
-
-type tpchVecSmallBatchSizeTest struct {
-	tpchVecTestCaseBase
-}
-
-func (b tpchVecSmallBatchSizeTest) preTestRunHook(
-	ctx context.Context,
-	t *test,
-	c *cluster,
-	conn *gosql.DB,
-	version crdbVersion,
-	clusterSetup []string,
-) {
-	b.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version, clusterSetup)
-	createStatsFromTables(t, conn, tpchTables)
-	rng, _ := randutil.NewPseudoRand()
-	setSmallBatchSize(t, conn, rng)
 }
 
 func baseTestRun(
@@ -596,8 +553,7 @@ func (s tpchVecSmithcmpTest) preTestRunHook(
 	version crdbVersion,
 	clusterSetup []string,
 ) {
-	s.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version, clusterSetup)
-	createStatsFromTables(t, conn, tpchTables)
+	s.tpchVecTestCaseBase.preTestRunHook(t, conn, clusterSetup, true /* createStats */)
 	const smithcmpSHA = "a3f41f5ba9273249c5ecfa6348ea8ee3ac4b77e3"
 	node := c.Node(1)
 	if local && runtime.GOOS != "linux" {
@@ -618,12 +574,6 @@ func (s tpchVecSmithcmpTest) preTestRunHook(
 		t.Fatal(err)
 	}
 	c.Put(ctx, smithcmp, "./"+tpchVecSmithcmp, node)
-	// To increase test coverage, we will be randomizing the batch size in 50%
-	// of the runs.
-	rng, _ := randutil.NewPseudoRand()
-	if rng.Float64() < 0.5 {
-		setSmallBatchSize(t, conn, rng)
-	}
 }
 
 func smithcmpTestRun(
@@ -658,9 +608,6 @@ func runTPCHVec(
 	c.Start(ctx, t)
 
 	conn := c.Conn(ctx, 1)
-	// We will disable range merges in order to remove a possible source of
-	// random query latency spikes during perf runs.
-	disableRangeMerges(t, conn)
 	disableAutoStats(t, conn)
 	disableVectorizeRowCountThresholdHeuristic(t, conn)
 	t.Status("restoring TPCH dataset for Scale Factor 1")
@@ -713,18 +660,6 @@ func registerTPCHVec(r *testRegistry) {
 	})
 
 	r.Add(testSpec{
-		Name:    "tpchvec/smallbatchsize",
-		Owner:   OwnerSQLExec,
-		Cluster: makeClusterSpec(tpchVecNodeCount),
-		// 19.2 version doesn't have the testing cluster setting to change the batch
-		// size, so only run on versions >= 20.1.0.
-		MinVersion: "v20.1.0",
-		Run: func(ctx context.Context, t *test, c *cluster) {
-			runTPCHVec(ctx, t, c, tpchVecSmallBatchSizeTest{}, baseTestRun)
-		},
-	})
-
-	r.Add(testSpec{
 		Name:       "tpchvec/smithcmp",
 		Owner:      OwnerSQLExec,
 		Cluster:    makeClusterSpec(tpchVecNodeCount),
@@ -756,6 +691,8 @@ func registerTPCHVec(r *testRegistry) {
 			// that modify the cluster settings for all configs to benchmark
 			// like in the example below. The example benchmarks three values
 			// of coldata.BatchSize() variable against each other.
+			// NOTE: the setting has been removed since the example was written,
+			// but it still serves the purpose of showing how to use the config.
 			var clusterSetups [][]string
 			var setupNames []string
 			for _, batchSize := range []int{512, 1024, 1536} {

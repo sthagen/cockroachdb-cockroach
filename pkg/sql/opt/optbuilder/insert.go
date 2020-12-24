@@ -373,8 +373,8 @@ func (mb *mutationBuilder) needExistingRows() bool {
 			// #1: Don't consider key columns.
 			continue
 		}
-		if kind := mb.tab.Column(i).Kind(); kind == cat.System || kind.IsVirtual() {
-			// #2: Don't consider system or virtual columns.
+		if kind := mb.tab.Column(i).Kind(); kind == cat.System || kind == cat.VirtualInverted {
+			// #2: Don't consider system or virtual inverted columns.
 			continue
 		}
 		insertColID := mb.insertColIDs[i]
@@ -615,20 +615,14 @@ func (mb *mutationBuilder) addSynthesizedColsForInsert() {
 	// Start by adding non-computed columns that have not already been explicitly
 	// specified in the query. Do this before adding computed columns, since those
 	// may depend on non-computed columns.
-	mb.addSynthesizedCols(
-		mb.insertColIDs,
-		func(colOrd int) bool { return !mb.tab.Column(colOrd).IsComputed() },
-	)
+	mb.addSynthesizedDefaultCols(mb.insertColIDs, true /* includeOrdinary */)
 
 	// Possibly round DECIMAL-related columns containing insertion values (whether
 	// synthesized or not).
 	mb.roundDecimalValues(mb.insertColIDs, false /* roundComputedCols */)
 
 	// Now add all computed columns.
-	mb.addSynthesizedCols(
-		mb.insertColIDs,
-		func(colOrd int) bool { return mb.tab.Column(colOrd).IsComputed() },
-	)
+	mb.addSynthesizedComputedCols(mb.insertColIDs, false /* restrict */)
 
 	// Possibly round DECIMAL-related computed columns.
 	mb.roundDecimalValues(mb.insertColIDs, true /* roundComputedCols */)
@@ -649,13 +643,17 @@ func (mb *mutationBuilder) buildInsert(returning tree.ReturningExprs) {
 	// Add any check constraint boolean columns to the input.
 	mb.addCheckConstraintCols()
 
-	// Add any partial index put boolean columns to the input.
+	// Project partial index PUT boolean columns.
 	mb.projectPartialIndexPutCols(preCheckScope)
+
+	mb.buildUniqueChecksForInsert()
 
 	mb.buildFKChecksForInsert()
 
 	private := mb.makeMutationPrivate(returning != nil)
-	mb.outScope.expr = mb.b.factory.ConstructInsert(mb.outScope.expr, mb.checks, private)
+	mb.outScope.expr = mb.b.factory.ConstructInsert(
+		mb.outScope.expr, mb.uniqueChecks, mb.fkChecks, private,
+	)
 
 	mb.buildReturning(returning)
 }
@@ -901,7 +899,7 @@ func (mb *mutationBuilder) buildInputForUpsert(
 	// NOTE: Include mutation columns, but be careful to never use them for any
 	//       reason other than as "fetch columns". See buildScan comment.
 	// TODO(andyk): Why does execution engine need mutation columns for Insert?
-	fetchScope := mb.b.buildScan(
+	mb.fetchScope = mb.b.buildScan(
 		mb.b.addTable(mb.tab, &mb.alias),
 		tableOrdinals(mb.tab, columnKinds{
 			includeMutations:       true,
@@ -919,10 +917,10 @@ func (mb *mutationBuilder) buildInputForUpsert(
 	// the scan on the right side of the left outer join with the partial index
 	// predicate expression as the filter.
 	if isPartial {
-		texpr := fetchScope.resolveAndRequireType(predExpr, types.Bool)
-		predScalar := mb.b.buildScalar(texpr, fetchScope, nil, nil, nil)
-		fetchScope.expr = mb.b.factory.ConstructSelect(
-			fetchScope.expr,
+		texpr := mb.fetchScope.resolveAndRequireType(predExpr, types.Bool)
+		predScalar := mb.b.buildScalar(texpr, mb.fetchScope, nil, nil, nil)
+		mb.fetchScope.expr = mb.b.factory.ConstructSelect(
+			mb.fetchScope.expr,
 			memo.FiltersExpr{mb.b.factory.ConstructFiltersItem(predScalar)},
 		)
 	}
@@ -930,16 +928,16 @@ func (mb *mutationBuilder) buildInputForUpsert(
 	// Record a not-null "canary" column. After the left-join, this will be null
 	// if no conflict has been detected, or not null otherwise. At least one not-
 	// null column must exist, since primary key columns are not-null.
-	canaryScopeCol := &fetchScope.cols[findNotNullIndexCol(index)]
+	canaryScopeCol := &mb.fetchScope.cols[findNotNullIndexCol(index)]
 	mb.canaryColID = canaryScopeCol.id
 
 	// Set fetchColIDs to reference the columns created for the fetch values.
-	mb.setFetchColIDs(fetchScope.cols)
+	mb.setFetchColIDs(mb.fetchScope.cols)
 
 	// Add the fetch columns to the current scope. It's OK to modify the current
 	// scope because it contains only INSERT columns that were added by the
 	// mutationBuilder, and which aren't needed for any other purpose.
-	mb.outScope.appendColumnsFromScope(fetchScope)
+	mb.outScope.appendColumnsFromScope(mb.fetchScope)
 
 	// Build the join condition by creating a conjunction of equality conditions
 	// that test each conflict column:
@@ -947,12 +945,12 @@ func (mb *mutationBuilder) buildInputForUpsert(
 	//   ON ins.x = scan.a AND ins.y = scan.b
 	//
 	var on memo.FiltersExpr
-	for i := range fetchScope.cols {
+	for i := range mb.fetchScope.cols {
 		// Include fetch columns with ordinal positions in conflictOrds.
 		if conflictOrds.Contains(i) {
 			condition := mb.b.factory.ConstructEq(
 				mb.b.factory.ConstructVariable(mb.insertColIDs[i]),
-				mb.b.factory.ConstructVariable(fetchScope.cols[i].id),
+				mb.b.factory.ConstructVariable(mb.fetchScope.cols[i].id),
 			)
 			on = append(on, mb.b.factory.ConstructFiltersItem(condition))
 		}
@@ -971,7 +969,7 @@ func (mb *mutationBuilder) buildInputForUpsert(
 	// Construct the left join.
 	mb.outScope.expr = mb.b.factory.ConstructLeftJoin(
 		mb.outScope.expr,
-		fetchScope.expr,
+		mb.fetchScope.expr,
 		on,
 		memo.EmptyJoinPrivate,
 	)
@@ -994,9 +992,6 @@ func (mb *mutationBuilder) buildInputForUpsert(
 
 	mb.targetColList = make(opt.ColList, 0, mb.tab.ColumnCount())
 	mb.targetColSet = opt.ColSet{}
-
-	// Add any partial index del boolean columns to the input for UPSERTs.
-	mb.projectPartialIndexDelCols(fetchScope)
 }
 
 // setUpsertCols sets the list of columns to be updated in case of conflict.
@@ -1066,30 +1061,25 @@ func (mb *mutationBuilder) buildUpsert(returning tree.ReturningExprs) {
 	// Add any check constraint boolean columns to the input.
 	mb.addCheckConstraintCols()
 
-	// Add any partial index put boolean columns. The variables in these partial
-	// index predicates must resolve to the new column values of the row which
-	// are either the existing values of the columns or new values provided in
-	// the upsert. Therefore, the variables must resolve to the upsert CASE
-	// expression columns, so the project must be added after the upsert columns
-	// are.
+	// Project partial index PUT and DEL boolean columns.
 	//
-	// For example, consider the table and upsert:
-	//
-	//   CREATE TABLE t (a INT PRIMARY KEY, b INT, INDEX (b) WHERE a > 1)
-	//   INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE a = t.a + 1
-	//
-	// An entry in the partial index should only be added when a > 1. The
-	// resulting value of a is dependent on whether or not there is a conflict.
-	// In the case of no conflict, the (1, 2) is inserted into the table, and no
-	// partial index entry should be added. But if there is a conflict, The
-	// existing row where a = 1 has a incremented to 2, and an entry should be
-	// added to the partial index.
-	mb.projectPartialIndexPutCols(preCheckScope)
+	// In some cases existing rows may not be fetched for an UPSERT (see
+	// mutationBuilder.needExistingRows for more details). In theses cases
+	// there is no need to project partial index DEL columns and
+	// mb.fetchScope will be nil. Therefore, we only project partial index
+	// PUT columns.
+	if mb.needExistingRows() {
+		mb.projectPartialIndexPutAndDelCols(preCheckScope, mb.fetchScope)
+	} else {
+		mb.projectPartialIndexPutCols(preCheckScope)
+	}
 
 	mb.buildFKChecksForUpsert()
 
 	private := mb.makeMutationPrivate(returning != nil)
-	mb.outScope.expr = mb.b.factory.ConstructUpsert(mb.outScope.expr, mb.checks, private)
+	mb.outScope.expr = mb.b.factory.ConstructUpsert(
+		mb.outScope.expr, mb.uniqueChecks, mb.fkChecks, private,
+	)
 
 	mb.buildReturning(returning)
 }
@@ -1217,6 +1207,7 @@ func (mb *mutationBuilder) arbiterIndexes(
 	tabMeta := mb.md.TableMeta(mb.tabID)
 	var tableScope *scope
 	var im *partialidx.Implicator
+	var arbiterFilters memo.FiltersExpr
 	for idx, idxCount := 0, mb.tab.IndexCount(); idx < idxCount; idx++ {
 		index := mb.tab.Index(idx)
 
@@ -1284,16 +1275,20 @@ func (mb *mutationBuilder) arbiterIndexes(
 				im.Init(mb.b.factory, mb.md, mb.b.evalCtx)
 			}
 
-			arbiterFilter, err := mb.b.buildPartialIndexPredicate(
-				tableScope, arbiterPredicate, "arbiter predicate",
-			)
-			if err != nil {
-				// The error is due to a non-immutable operator in the arbiter
-				// predicate. Continue on to see if a matching non-partial or
-				// pseudo-partial index exists.
-				continue
+			// Build the arbiter filters once.
+			if arbiterFilters == nil {
+				arbiterFilters, err = mb.b.buildPartialIndexPredicate(
+					tableScope, arbiterPredicate, "arbiter predicate",
+				)
+				if err != nil {
+					// The error is due to a non-immutable operator in the arbiter
+					// predicate. Continue on to see if a matching non-partial or
+					// pseudo-partial index exists.
+					continue
+				}
 			}
-			if _, ok := im.FiltersImplyPredicate(arbiterFilter, predFilter); ok {
+
+			if _, ok := im.FiltersImplyPredicate(arbiterFilters, predFilter); ok {
 				arbiters.Add(idx)
 			}
 		}
@@ -1351,7 +1346,7 @@ func (mb *mutationBuilder) projectPartialIndexDistinctColumn(
 	texpr := insertScope.resolveAndRequireType(expr, types.Bool)
 
 	alias := fmt.Sprintf("upsert_partial_index_distinct%d", idx)
-	scopeCol := mb.b.addColumn(projectionScope, alias, texpr)
+	scopeCol := projectionScope.addColumn(alias, texpr)
 	mb.b.buildScalar(texpr, mb.outScope, projectionScope, scopeCol, nil)
 
 	mb.b.constructProjectForScope(mb.outScope, projectionScope)

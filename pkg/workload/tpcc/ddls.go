@@ -29,10 +29,10 @@ const (
 		w_state     char(2)       not null,
 		w_zip       char(9)       not null,
 		w_tax       decimal(4,4)  not null,
-		w_ytd       decimal(12,2) not null,
+		w_ytd       decimal(12,2) not null`
+	tpccWarehouseColumnFamiliesSuffix = `, 
 		family      f1 (w_id, w_name, w_street_1, w_street_2, w_city, w_state, w_zip, w_ytd),
-		family      f2 (w_tax)
-	)`
+		family      f2 (w_tax)`
 
 	// DISTRICT table.
 	tpccDistrictSchemaBase = `(
@@ -47,11 +47,11 @@ const (
 		d_tax        decimal(4,4)  not null,
 		d_ytd        decimal(12,2) not null,
 		d_next_o_id  integer       not null,
-		primary key  (d_w_id, d_id),
+		primary key  (d_w_id, d_id)`
+	tpccDistrictColumnFamiliesSuffix = `,
 		family       static    (d_w_id, d_id, d_name, d_street_1, d_street_2, d_city, d_state, d_zip),
 		family       dynamic_1 (d_ytd),
-		family       dynamic_2 (d_next_o_id, d_tax)
-	)`
+		family       dynamic_2 (d_next_o_id, d_tax)`
 	tpccDistrictSchemaInterleaveSuffix = `
 		interleave in parent warehouse (d_w_id)`
 
@@ -79,13 +79,13 @@ const (
 		c_delivery_cnt integer       not null,
 		c_data         varchar(500)  not null,
 		primary key        (c_w_id, c_d_id, c_id),
-		index customer_idx (c_w_id, c_d_id, c_last, c_first),
+		index customer_idx (c_w_id, c_d_id, c_last, c_first)`
+	tpccCustomerColumnFamiliesSuffix = `, 
 		family static      (
 			c_id, c_d_id, c_w_id, c_first, c_middle, c_last, c_street_1, c_street_2,
 			c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, c_discount
 		),
-		family dynamic (c_balance, c_ytd_payment, c_payment_cnt, c_data, c_delivery_cnt)
-	)`
+		family dynamic (c_balance, c_ytd_payment, c_payment_cnt, c_data, c_delivery_cnt)`
 	tpccCustomerSchemaInterleaveSuffix = `
 		interleave in parent district (c_w_id, c_d_id)`
 
@@ -186,14 +186,22 @@ const (
 		index order_line_stock_fk_idx (ol_supply_w_id, ol_i_id)`
 	tpccOrderLineSchemaInterleaveSuffix = `
 		interleave in parent "order" (ol_w_id, ol_d_id, ol_o_id)`
+
+	endSchema = "\n\t)"
 )
 
 func maybeAddFkSuffix(fks bool, base, suffix string) string {
-	const endSchema = "\n\t)"
 	if !fks {
 		return base + endSchema
 	}
 	return base + "," + suffix + endSchema
+}
+
+func maybeAddColumnFamiliesSuffix(separateColumnFamilies bool, base, suffix string) string {
+	if !separateColumnFamilies {
+		return base + endSchema
+	}
+	return base + suffix + endSchema
 }
 
 func maybeAddInterleaveSuffix(interleave bool, base, suffix string) string {
@@ -218,8 +226,8 @@ func scatterRanges(db *gosql.DB) error {
 
 	var g errgroup.Group
 	for _, table := range tables {
+		sql := fmt.Sprintf(`ALTER TABLE %s SCATTER`, table)
 		g.Go(func() error {
-			sql := fmt.Sprintf(`ALTER TABLE %s SCATTER`, table)
 			if _, err := db.Exec(sql); err != nil {
 				return errors.Wrapf(err, "Couldn't exec %q", sql)
 			}

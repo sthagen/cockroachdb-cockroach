@@ -33,12 +33,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 type indexKeyTest struct {
@@ -49,22 +51,26 @@ type indexKeyTest struct {
 	secondaryValues      []tree.Datum // len must be at least secondaryInterleaveComponents+1
 }
 
-func makeTableDescForTest(test indexKeyTest) (*tabledesc.Immutable, map[descpb.ColumnID]int) {
+func makeTableDescForTest(test indexKeyTest) (*tabledesc.Immutable, catalog.TableColMap) {
 	primaryColumnIDs := make([]descpb.ColumnID, len(test.primaryValues))
 	secondaryColumnIDs := make([]descpb.ColumnID, len(test.secondaryValues))
 	columns := make([]descpb.ColumnDescriptor, len(test.primaryValues)+len(test.secondaryValues))
-	colMap := make(map[descpb.ColumnID]int, len(test.secondaryValues))
+	var colMap catalog.TableColMap
+	secondaryType := descpb.IndexDescriptor_FORWARD
 	for i := range columns {
 		columns[i] = descpb.ColumnDescriptor{
-			ID:   descpb.ColumnID(i + 1),
-			Type: types.Int,
+			ID: descpb.ColumnID(i + 1),
 		}
-		colMap[columns[i].ID] = i
+		colMap.Set(columns[i].ID, i)
 		if i < len(test.primaryValues) {
+			columns[i].Type = test.primaryValues[i].ResolvedType()
 			primaryColumnIDs[i] = columns[i].ID
 		} else {
+			columns[i].Type = test.secondaryValues[i-len(test.primaryValues)].ResolvedType()
+			if colinfo.ColumnTypeIsInvertedIndexable(columns[i].Type) {
+				secondaryType = descpb.IndexDescriptor_INVERTED
+			}
 			secondaryColumnIDs[i-len(test.primaryValues)] = columns[i].ID
-
 		}
 	}
 
@@ -97,6 +103,7 @@ func makeTableDescForTest(test indexKeyTest) (*tabledesc.Immutable, map[descpb.C
 			Unique:           true,
 			ColumnDirections: make([]descpb.IndexDescriptor_Direction, len(secondaryColumnIDs)),
 			Interleave:       makeInterleave(2, test.secondaryInterleaves),
+			Type:             secondaryType,
 		}},
 	}
 	return tabledesc.NewImmutable(tableDesc), colMap
@@ -105,7 +112,7 @@ func makeTableDescForTest(test indexKeyTest) (*tabledesc.Immutable, map[descpb.C
 func decodeIndex(
 	codec keys.SQLCodec, tableDesc *tabledesc.Immutable, index *descpb.IndexDescriptor, key []byte,
 ) ([]tree.Datum, error) {
-	types, err := colinfo.GetColumnTypes(tableDesc, index.ColumnIDs)
+	types, err := colinfo.GetColumnTypes(tableDesc, index.ColumnIDs, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -217,8 +224,8 @@ func TestIndexKey(t *testing.T) {
 		testValues := append(test.primaryValues, test.secondaryValues...)
 
 		codec := keys.SystemSQLCodec
-		primaryKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc, tableDesc.PrimaryIndex.ID)
-		primaryKey, _, err := EncodeIndexKey(tableDesc, &tableDesc.PrimaryIndex, colMap, testValues, primaryKeyPrefix)
+		primaryKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc, tableDesc.GetPrimaryIndexID())
+		primaryKey, _, err := EncodeIndexKey(tableDesc, tableDesc.GetPrimaryIndex(), colMap, testValues, primaryKeyPrefix)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -226,7 +233,7 @@ func TestIndexKey(t *testing.T) {
 		primaryIndexKV := kv.KeyValue{Key: primaryKey, Value: &primaryValue}
 
 		secondaryIndexEntry, err := EncodeSecondaryIndex(
-			codec, tableDesc, &tableDesc.Indexes[0], colMap, testValues, true /* includeEmpty */)
+			codec, tableDesc, &tableDesc.GetPublicNonPrimaryIndexes()[0], colMap, testValues, true /* includeEmpty */)
 		if len(secondaryIndexEntry) != 1 {
 			t.Fatalf("expected 1 index entry, got %d. got %#v", len(secondaryIndexEntry), secondaryIndexEntry)
 		}
@@ -245,7 +252,7 @@ func TestIndexKey(t *testing.T) {
 			}
 
 			for j, value := range values {
-				testValue := testValues[colMap[index.ColumnIDs[j]]]
+				testValue := testValues[colMap.GetDefault(index.ColumnIDs[j])]
 				if value.Compare(evalCtx, testValue) != 0 {
 					t.Fatalf("%d: value %d got %q but expected %q", i, j, value, testValue)
 				}
@@ -268,8 +275,272 @@ func TestIndexKey(t *testing.T) {
 			}
 		}
 
-		checkEntry(&tableDesc.PrimaryIndex, primaryIndexKV)
-		checkEntry(&tableDesc.Indexes[0], secondaryIndexKV)
+		checkEntry(tableDesc.GetPrimaryIndex(), primaryIndexKV)
+		checkEntry(&tableDesc.GetPublicNonPrimaryIndexes()[0], secondaryIndexKV)
+	}
+}
+
+func TestInvertedIndexKey(t *testing.T) {
+	parseJSON := func(s string) *tree.DJSON {
+		j, err := json.ParseJSON(s)
+		if err != nil {
+			t.Fatalf("Failed to parse %s: %v", s, err)
+		}
+		return tree.NewDJSON(j)
+	}
+
+	tests := []struct {
+		value                           tree.Datum
+		expectedKeys                    int
+		expectedKeysExcludingEmptyArray int
+	}{
+		{
+			value: &tree.DArray{
+				ParamTyp: types.Int,
+				Array:    tree.Datums{},
+			},
+			expectedKeys:                    1,
+			expectedKeysExcludingEmptyArray: 0,
+		},
+		{
+			value: &tree.DArray{
+				ParamTyp: types.Int,
+				Array:    tree.Datums{tree.NewDInt(1)},
+			},
+			expectedKeys:                    1,
+			expectedKeysExcludingEmptyArray: 1,
+		},
+		{
+			value: &tree.DArray{
+				ParamTyp: types.Int,
+				Array:    tree.Datums{tree.NewDString("foo")},
+			},
+			expectedKeys:                    1,
+			expectedKeysExcludingEmptyArray: 1,
+		},
+		{
+			value: &tree.DArray{
+				ParamTyp: types.Int,
+				Array:    tree.Datums{tree.NewDInt(1), tree.NewDInt(2), tree.NewDInt(1)},
+			},
+			// The keys should be deduplicated.
+			expectedKeys:                    2,
+			expectedKeysExcludingEmptyArray: 2,
+		},
+		{
+			value:                           parseJSON(`{}`),
+			expectedKeys:                    1,
+			expectedKeysExcludingEmptyArray: 1,
+		},
+		{
+			value:                           parseJSON(`[]`),
+			expectedKeys:                    1,
+			expectedKeysExcludingEmptyArray: 1,
+		},
+		{
+			value: parseJSON(`[1, 2, 2]`),
+			// The keys should be deduplicated.
+			expectedKeys:                    2,
+			expectedKeysExcludingEmptyArray: 2,
+		},
+		{
+			value:                           parseJSON(`true`),
+			expectedKeys:                    1,
+			expectedKeysExcludingEmptyArray: 1,
+		},
+		{
+			value:                           parseJSON(`null`),
+			expectedKeys:                    1,
+			expectedKeysExcludingEmptyArray: 1,
+		},
+		{
+			value:                           parseJSON(`1`),
+			expectedKeys:                    1,
+			expectedKeysExcludingEmptyArray: 1,
+		},
+		{
+			value:                           parseJSON(`{"a": "b"}`),
+			expectedKeys:                    1,
+			expectedKeysExcludingEmptyArray: 1,
+		},
+		{
+			value:                           parseJSON(`{"a": "b", "c": {"d": "e", "f": "g"}}`),
+			expectedKeys:                    3,
+			expectedKeysExcludingEmptyArray: 3,
+		},
+	}
+
+	runTest := func(value tree.Datum, expectedKeys int, version descpb.IndexDescriptorVersion) {
+		primaryValues := []tree.Datum{tree.NewDInt(10)}
+		secondaryValues := []tree.Datum{value}
+		tableDesc, colMap := makeTableDescForTest(
+			indexKeyTest{50, nil, nil,
+				primaryValues, secondaryValues,
+			})
+		for i := range tableDesc.GetPublicNonPrimaryIndexes() {
+			tableDesc.GetPublicNonPrimaryIndexes()[i].Version = version
+		}
+
+		testValues := append(primaryValues, secondaryValues...)
+
+		codec := keys.SystemSQLCodec
+
+		secondaryIndexEntries, err := EncodeSecondaryIndex(
+			codec, tableDesc, &tableDesc.GetPublicNonPrimaryIndexes()[0], colMap, testValues, true /* includeEmpty */)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(secondaryIndexEntries) != expectedKeys {
+			t.Fatalf("For %s expected %d index entries, got %d. got %#v",
+				value, expectedKeys, len(secondaryIndexEntries), secondaryIndexEntries,
+			)
+		}
+	}
+
+	for i, test := range tests {
+		t.Run(fmt.Sprintf("TestInvertedIndexKey %d", i), func(t *testing.T) {
+			runTest(test.value, test.expectedKeys, descpb.EmptyArraysInInvertedIndexesVersion)
+			runTest(test.value, test.expectedKeysExcludingEmptyArray, descpb.SecondaryIndexFamilyFormatVersion)
+		})
+	}
+}
+
+func TestEncodeContainingArrayInvertedIndexSpans(t *testing.T) {
+	testCases := []struct {
+		value    string
+		contains string
+		expected bool
+		unique   bool
+	}{
+		// This test uses EncodeInvertedIndexTableKeys and EncodeContainingInvertedIndexSpans
+		// to determine whether the first Array value contains the second. If the first
+		// value contains the second, expected is true. Otherwise it is false.
+		//
+		// If EncodeContainingInvertedIndexSpans produces spans that are guaranteed not to
+		// contain duplicate primary keys, unique is true. Otherwise it is false.
+		{`{}`, `{}`, true, false},
+		{`{}`, `{1}`, false, true},
+		{`{1}`, `{}`, true, false},
+		{`{1}`, `{1}`, true, true},
+		{`{1}`, `{1, 2}`, false, false},
+		{`{1, 2}`, `{1}`, true, true},
+		{`{1, 2}`, `{2}`, true, true},
+		{`{1, 2}`, `{1, 2}`, true, false},
+		{`{1, 2}`, `{1, 2, 1}`, true, false},
+		{`{1, 2}`, `{1, 1}`, true, true},
+		{`{1, 2, 3}`, `{1, 2, 4}`, false, false},
+		{`{1, 2, 3}`, `{}`, true, false},
+		{`{}`, `{NULL}`, false, true},
+		{`{NULL}`, `{}`, true, false},
+		{`{NULL}`, `{NULL}`, false, true},
+		// unique is true in the case below since any array containing a NULL must
+		// return empty spans, which are trivially unique.
+		{`{2, NULL}`, `{2, NULL}`, false, true},
+		{`{2, NULL}`, `{2}`, true, true},
+		{`{2, NULL}`, `{NULL}`, false, true},
+	}
+
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	parseArray := func(s string) tree.Datum {
+		arr, _, err := tree.ParseDArrayFromString(&evalCtx, s, types.Int)
+		if err != nil {
+			t.Fatalf("Failed to parse array %s: %v", s, err)
+		}
+		return arr
+	}
+
+	version := descpb.EmptyArraysInInvertedIndexesVersion
+	runTest := func(left, right tree.Datum, expected, expectUnique bool) {
+		keys, err := EncodeInvertedIndexTableKeys(left, nil, version)
+		require.NoError(t, err)
+
+		spansSlice, tight, unique, err := EncodeContainingInvertedIndexSpans(&evalCtx, right, nil, version)
+		require.NoError(t, err)
+
+		// Array spans are always tight.
+		if tight != true {
+			t.Errorf("For %s, expected tight=%v, but got %v", right, true, tight)
+		}
+
+		if unique != expectUnique {
+			t.Errorf("For %s, expected unique=%v, but got %v", right, expectUnique, unique)
+		}
+
+		// The spans returned by EncodeContainingInvertedIndexSpans represent the
+		// intersection of unions. So the below logic is performing a union on the
+		// inner loop (any span in the slice can contain any of the keys), and an
+		// intersection on the outer loop (all of the span slices must contain at
+		// least one key).
+		actual := len(spansSlice) > 0
+		for _, spans := range spansSlice {
+			found := false
+			for _, span := range spans {
+				for _, key := range keys {
+					if span.ContainsKey(key) {
+						found = true
+						break
+					}
+				}
+				if found == true {
+					break
+				}
+			}
+			actual = actual && found
+		}
+
+		if actual != expected {
+			if expected {
+				t.Errorf("expected %s to contain %s but it did not", left, right)
+			} else {
+				t.Errorf("expected %s not to contain %s but it did", left, right)
+			}
+		}
+	}
+
+	// Run pre-defined test cases from above.
+	for _, c := range testCases {
+		value, contains := parseArray(c.value), parseArray(c.contains)
+
+		// First check that evaluating `value @> contains` matches the expected
+		// result.
+		res, err := tree.ArrayContains(&evalCtx, value.(*tree.DArray), contains.(*tree.DArray))
+		require.NoError(t, err)
+		if bool(*res) != c.expected {
+			t.Fatalf(
+				"expected value of %s @> %s did not match actual value. Expected: %v. Got: %s",
+				c.value, c.contains, c.expected, res.String(),
+			)
+		}
+
+		// Now check that we get the same result with the inverted index spans.
+		runTest(value, contains, c.expected, c.unique)
+	}
+
+	// Run a set of randomly generated test cases.
+	rng, _ := randutil.NewPseudoRand()
+	for i := 0; i < 100; i++ {
+		typ := RandArrayType(rng)
+
+		// Generate two random arrays and evaluate the result of `left @> right`.
+		left := RandArray(rng, typ, 0 /* nullChance */)
+		right := RandArray(rng, typ, 0 /* nullChance */)
+
+		res, err := tree.ArrayContains(&evalCtx, left.(*tree.DArray), right.(*tree.DArray))
+		require.NoError(t, err)
+
+		// The spans should not have duplicate values if there is exactly one
+		// element after de-duplication.
+		arr := right.(*tree.DArray).Array
+		expectUnique := len(arr) > 0
+		for i := range arr {
+			if i > 0 && arr[i].Compare(&evalCtx, arr[0]) != 0 {
+				expectUnique = false
+				break
+			}
+		}
+
+		// Now check that we get the same result with the inverted index spans.
+		runTest(left, right, bool(*res), expectUnique)
 	}
 }
 
@@ -668,9 +939,9 @@ func TestIndexKeyEquivSignature(t *testing.T) {
 			tc.table.indexKeyArgs.primaryValues = tc.table.values
 			// Setup descriptors and form an index key.
 			desc, colMap := makeTableDescForTest(tc.table.indexKeyArgs)
-			primaryKeyPrefix := MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.PrimaryIndex.ID)
+			primaryKeyPrefix := MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.GetPrimaryIndexID())
 			primaryKey, _, err := EncodeIndexKey(
-				desc, &desc.PrimaryIndex, colMap, tc.table.values, primaryKeyPrefix)
+				desc, desc.GetPrimaryIndex(), colMap, tc.table.values, primaryKeyPrefix)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -691,7 +962,7 @@ func TestIndexKeyEquivSignature(t *testing.T) {
 
 			// Column values should be at the beginning of the
 			// remaining bytes of the key.
-			colVals, null, err := EncodeColumns(desc.PrimaryIndex.ColumnIDs, desc.PrimaryIndex.ColumnDirections, colMap, tc.table.values, nil /*key*/)
+			colVals, null, err := EncodeColumns(desc.GetPrimaryIndex().ColumnIDs, desc.GetPrimaryIndex().ColumnDirections, colMap, tc.table.values, nil /*key*/)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -726,7 +997,7 @@ func TestTableEquivSignatures(t *testing.T) {
 			tc.table.indexKeyArgs.primaryValues = tc.table.values
 			// Setup descriptors and form an index key.
 			desc, _ := makeTableDescForTest(tc.table.indexKeyArgs)
-			equivSigs, err := TableEquivSignatures(&desc.TableDescriptor, &desc.PrimaryIndex)
+			equivSigs, err := TableEquivSignatures(&desc.TableDescriptor, desc.GetPrimaryIndex())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -809,15 +1080,15 @@ func TestEquivSignature(t *testing.T) {
 
 				// Setup descriptors and form an index key.
 				desc, colMap := makeTableDescForTest(table.indexKeyArgs)
-				primaryKeyPrefix := MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.PrimaryIndex.ID)
+				primaryKeyPrefix := MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.GetPrimaryIndexID())
 				primaryKey, _, err := EncodeIndexKey(
-					desc, &desc.PrimaryIndex, colMap, table.values, primaryKeyPrefix)
+					desc, desc.GetPrimaryIndex(), colMap, table.values, primaryKeyPrefix)
 				if err != nil {
 					t.Fatal(err)
 				}
 
 				// Extract out the table's equivalence signature.
-				tempEquivSigs, err := TableEquivSignatures(&desc.TableDescriptor, &desc.PrimaryIndex)
+				tempEquivSigs, err := TableEquivSignatures(&desc.TableDescriptor, desc.GetPrimaryIndex())
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -976,7 +1247,7 @@ func ExtractIndexKey(
 	}
 
 	// Extract the values for index.ColumnIDs.
-	indexTypes, err := colinfo.GetColumnTypes(tableDesc, index.ColumnIDs)
+	indexTypes, err := colinfo.GetColumnTypes(tableDesc, index.ColumnIDs, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1002,7 +1273,7 @@ func ExtractIndexKey(
 	}
 
 	// Extract the values for index.ExtraColumnIDs
-	extraTypes, err := colinfo.GetColumnTypes(tableDesc, index.ExtraColumnIDs)
+	extraTypes, err := colinfo.GetColumnTypes(tableDesc, index.ExtraColumnIDs, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1025,12 +1296,12 @@ func ExtractIndexKey(
 	}
 
 	// Encode the index key from its components.
-	colMap := make(map[descpb.ColumnID]int)
+	var colMap catalog.TableColMap
 	for i, columnID := range index.ColumnIDs {
-		colMap[columnID] = i
+		colMap.Set(columnID, i)
 	}
 	for i, columnID := range index.ExtraColumnIDs {
-		colMap[columnID] = i + len(index.ColumnIDs)
+		colMap.Set(columnID, i+len(index.ColumnIDs))
 	}
 	indexKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc, tableDesc.GetPrimaryIndexID())
 

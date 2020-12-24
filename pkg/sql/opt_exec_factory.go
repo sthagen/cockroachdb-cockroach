@@ -19,10 +19,13 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -31,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
@@ -44,6 +46,9 @@ import (
 
 type execFactory struct {
 	planner *planner
+	// isExplain is true if this factory is used to build a statement inside
+	// EXPLAIN or EXPLAIN ANALYZE.
+	isExplain bool
 }
 
 var _ exec.Factory = &execFactory{}
@@ -107,7 +112,7 @@ func (ef *execFactory) ConstructScan(
 	scan.reverse = params.Reverse
 	scan.parallelize = params.Parallelize
 	var err error
-	scan.spans, err = generateScanSpans(ef.planner.ExecCfg().Codec, tabDesc, indexDesc, params)
+	scan.spans, err = generateScanSpans(ef.planner.EvalContext(), ef.planner.ExecCfg().Codec, tabDesc, indexDesc, params)
 	if err != nil {
 		return nil, err
 	}
@@ -128,14 +133,15 @@ func (ef *execFactory) ConstructScan(
 }
 
 func generateScanSpans(
+	evalCtx *tree.EvalContext,
 	codec keys.SQLCodec,
 	tabDesc *tabledesc.Immutable,
 	indexDesc *descpb.IndexDescriptor,
 	params exec.ScanParams,
 ) (roachpb.Spans, error) {
-	sb := span.MakeBuilder(codec, tabDesc, indexDesc)
+	sb := span.MakeBuilder(evalCtx, codec, tabDesc, indexDesc)
 	if params.InvertedConstraint != nil {
-		return GenerateInvertedSpans(params.InvertedConstraint, sb)
+		return sb.SpansFromInvertedSpans(params.InvertedConstraint, params.IndexConstraint)
 	}
 	return sb.SpansFromConstraint(params.IndexConstraint, params.NeededCols, false /* forDelete */)
 }
@@ -717,7 +723,7 @@ func (ef *execFactory) ConstructInvertedJoin(
 	// Build the result columns.
 	inputCols := planColumns(input.(planNode))
 	var scanCols colinfo.ResultColumns
-	if joinType != descpb.LeftSemiJoin && joinType != descpb.LeftAntiJoin {
+	if joinType.ShouldIncludeRightColsInOutput() {
 		scanCols = planColumns(tableScan)
 	}
 	numCols := len(inputCols) + len(scanCols)
@@ -1085,7 +1091,7 @@ func (ef *execFactory) showEnv(plan string, envOpts exec.ExplainEnvData) (exec.N
 		return nil, err
 	}
 	return &valuesNode{
-		columns:          colinfo.ExplainOptColumns,
+		columns:          append(colinfo.ResultColumns(nil), colinfo.ExplainPlanColumns...),
 		tuples:           [][]tree.TypedExpr{{tree.NewDString(url.String())}},
 		specifiedInQuery: true,
 	}, nil
@@ -1108,17 +1114,10 @@ func (ef *execFactory) ConstructExplainOpt(
 	}
 
 	return &valuesNode{
-		columns:          colinfo.ExplainOptColumns,
+		columns:          append(colinfo.ResultColumns(nil), colinfo.ExplainPlanColumns...),
 		tuples:           rows,
 		specifiedInQuery: true,
 	}, nil
-}
-
-// ConstructExplain is part of the exec.Factory interface.
-func (ef *execFactory) ConstructExplain(
-	options *tree.ExplainOptions, stmtType tree.StatementType, plan exec.Plan,
-) (exec.Node, error) {
-	return constructExplainDistSQLOrVecNode(options, stmtType, plan.(*planComponents), ef.planner)
 }
 
 // ConstructShowTrace is part of the exec.Factory interface.
@@ -1331,16 +1330,12 @@ func (ef *execFactory) ConstructUpdate(
 		return nil, err
 	}
 
-	// Truncate any FetchCols added by MakeUpdater. The optimizer has already
-	// computed a correct set that can sometimes be smaller.
-	ru.FetchCols = ru.FetchCols[:len(fetchColDescs)]
-
 	// updateColsIdx inverts the mapping of UpdateCols to FetchCols. See
 	// the explanatory comments in updateRun.
-	updateColsIdx := make(map[descpb.ColumnID]int, len(ru.UpdateCols))
+	var updateColsIdx catalog.TableColMap
 	for i := range ru.UpdateCols {
 		id := ru.UpdateCols[i].ID
-		updateColsIdx[id] = i
+		updateColsIdx.Set(id, i)
 	}
 
 	upd := updateNodePool.Get().(*updateNode)
@@ -1449,18 +1444,6 @@ func (ef *execFactory) ConstructUpsert(
 		return nil, err
 	}
 
-	// Truncate any FetchCols added by MakeUpdater. The optimizer has already
-	// computed a correct set that can sometimes be smaller.
-	ru.FetchCols = ru.FetchCols[:len(fetchColDescs)]
-
-	// updateColsIdx inverts the mapping of UpdateCols to FetchCols. See
-	// the explanatory comments in updateRun.
-	updateColsIdx := make(map[descpb.ColumnID]int, len(ru.UpdateCols))
-	for i := range ru.UpdateCols {
-		id := ru.UpdateCols[i].ID
-		updateColsIdx[id] = i
-	}
-
 	// Instantiate the upsert node.
 	ups := upsertNodePool.Get().(*upsertNode)
 	*ups = upsertNode{
@@ -1529,10 +1512,6 @@ func (ef *execFactory) ConstructDelete(
 	// those sets into the deleter (which will basically be a no-op).
 	rd := row.MakeDeleter(ef.planner.ExecCfg().Codec, tabDesc, fetchColDescs)
 
-	// Truncate any FetchCols added by MakeUpdater. The optimizer has already
-	// computed a correct set that can sometimes be smaller.
-	rd.FetchCols = rd.FetchCols[:len(fetchColDescs)]
-
 	// Now make a delete node. We use a pool.
 	del := deleteNodePool.Get().(*deleteNode)
 	*del = deleteNode{
@@ -1578,8 +1557,8 @@ func (ef *execFactory) ConstructDeleteRange(
 	autoCommit bool,
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
-	indexDesc := &tabDesc.PrimaryIndex
-	sb := span.MakeBuilder(ef.planner.ExecCfg().Codec, tabDesc, indexDesc)
+	indexDesc := tabDesc.GetPrimaryIndex()
+	sb := span.MakeBuilder(ef.planner.EvalContext(), ef.planner.ExecCfg().Codec, tabDesc, indexDesc)
 
 	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
 		return nil, err
@@ -1613,6 +1592,13 @@ func (ef *execFactory) ConstructDeleteRange(
 func (ef *execFactory) ConstructCreateTable(
 	schema cat.Schema, ct *tree.CreateTable,
 ) (exec.Node, error) {
+	if err := checkSchemaChangeEnabled(
+		ef.planner.EvalContext().Context,
+		ef.planner.ExecCfg(),
+		"CREATE TABLE",
+	); err != nil {
+		return nil, err
+	}
 	return &createTableNode{
 		n:      ct,
 		dbDesc: schema.(*optSchema).database,
@@ -1623,6 +1609,14 @@ func (ef *execFactory) ConstructCreateTable(
 func (ef *execFactory) ConstructCreateTableAs(
 	input exec.Node, schema cat.Schema, ct *tree.CreateTable,
 ) (exec.Node, error) {
+	if err := checkSchemaChangeEnabled(
+		ef.planner.EvalContext().Context,
+		ef.planner.ExecCfg(),
+		"CREATE TABLE",
+	); err != nil {
+		return nil, err
+	}
+
 	return &createTableNode{
 		n:          ct,
 		dbDesc:     schema.(*optSchema).database,
@@ -1642,6 +1636,14 @@ func (ef *execFactory) ConstructCreateView(
 	columns colinfo.ResultColumns,
 	deps opt.ViewDeps,
 ) (exec.Node, error) {
+
+	if err := checkSchemaChangeEnabled(
+		ef.planner.EvalContext().Context,
+		ef.planner.ExecCfg(),
+		"CREATE VIEW",
+	); err != nil {
+		return nil, err
+	}
 
 	planDeps := make(planDependencies, len(deps))
 	for _, d := range deps {
@@ -1710,6 +1712,14 @@ func (ef *execFactory) ConstructOpaque(metadata opt.OpaqueMetadata) (exec.Node, 
 func (ef *execFactory) ConstructAlterTableSplit(
 	index cat.Index, input exec.Node, expiration tree.TypedExpr,
 ) (exec.Node, error) {
+	if err := checkSchemaChangeEnabled(
+		ef.planner.EvalContext().Context,
+		ef.planner.ExecCfg(),
+		"ALTER TABLE/INDEX SPLIT AT",
+	); err != nil {
+		return nil, err
+	}
+
 	if !ef.planner.ExecCfg().Codec.ForSystemTenant() {
 		return nil, errorutil.UnsupportedWithMultiTenancy(54254)
 	}
@@ -1731,6 +1741,14 @@ func (ef *execFactory) ConstructAlterTableSplit(
 func (ef *execFactory) ConstructAlterTableUnsplit(
 	index cat.Index, input exec.Node,
 ) (exec.Node, error) {
+	if err := checkSchemaChangeEnabled(
+		ef.planner.EvalContext().Context,
+		ef.planner.ExecCfg(),
+		"ALTER TABLE/INDEX UNSPLIT AT",
+	); err != nil {
+		return nil, err
+	}
+
 	if !ef.planner.ExecCfg().Codec.ForSystemTenant() {
 		return nil, errorutil.UnsupportedWithMultiTenancy(54254)
 	}
@@ -1744,6 +1762,14 @@ func (ef *execFactory) ConstructAlterTableUnsplit(
 
 // ConstructAlterTableUnsplitAll is part of the exec.Factory interface.
 func (ef *execFactory) ConstructAlterTableUnsplitAll(index cat.Index) (exec.Node, error) {
+	if err := checkSchemaChangeEnabled(
+		ef.planner.EvalContext().Context,
+		ef.planner.ExecCfg(),
+		"ALTER TABLE/INDEX UNSPLIT ALL",
+	); err != nil {
+		return nil, err
+	}
+
 	if !ef.planner.ExecCfg().Codec.ForSystemTenant() {
 		return nil, errorutil.UnsupportedWithMultiTenancy(54254)
 	}
@@ -1806,28 +1832,56 @@ func (ef *execFactory) ConstructCancelSessions(input exec.Node, ifExists bool) (
 	}, nil
 }
 
-func (ef *execFactory) ConstructExplainPlan(
-	options *tree.ExplainOptions, buildFn exec.BuildPlanForExplainFn,
+// ConstructCreateStatistics is part of the exec.Factory interface.
+func (ef *execFactory) ConstructCreateStatistics(cs *tree.CreateStats) (exec.Node, error) {
+	ctx := ef.planner.extendedEvalCtx.Context
+	if err := featureflag.CheckEnabled(
+		ctx,
+		ef.planner.ExecCfg(),
+		featureStatsEnabled,
+		"ANALYZE/CREATE STATISTICS",
+	); err != nil {
+		return nil, err
+	}
+	// Don't run as a job if we are inside an EXPLAIN / EXPLAIN ANALYZE. That will
+	// allow us to get insight into the actual execution.
+	runAsJob := !ef.isExplain && ef.planner.instrumentation.ShouldUseJobForCreateStats()
+
+	return &createStatsNode{
+		CreateStats: *cs,
+		p:           ef.planner,
+		runAsJob:    runAsJob,
+	}, nil
+}
+
+// ConstructExplain is part of the exec.Factory interface.
+func (ef *execFactory) ConstructExplain(
+	options *tree.ExplainOptions, stmtType tree.StatementType, buildFn exec.BuildPlanForExplainFn,
 ) (exec.Node, error) {
 	if options.Flags[tree.ExplainFlagEnv] {
 		return nil, errors.New("ENV only supported with (OPT) option")
 	}
 
-	flags := explain.MakeFlags(options)
-
-	explainFactory := explain.NewFactory(ef)
+	explainFactory := explain.NewFactory(&execFactory{
+		planner:   ef.planner,
+		isExplain: true,
+	})
 	plan, err := buildFn(explainFactory)
 	if err != nil {
 		return nil, err
 	}
-	n := &explainPlanNode{
-		flags: flags,
-		plan:  plan.(*explain.Plan),
+	if options.Mode == tree.ExplainVec {
+		wrappedPlan := plan.(*explain.Plan).WrappedPlan.(*planComponents)
+		return &explainVecNode{
+			options: options,
+			plan:    *wrappedPlan,
+		}, nil
 	}
-	if flags.Verbose {
-		n.columns = colinfo.ExplainPlanVerboseColumns
-	} else {
-		n.columns = colinfo.ExplainPlanColumns
+	flags := explain.MakeFlags(options)
+	n := &explainPlanNode{
+		options: options,
+		flags:   flags,
+		plan:    plan.(*explain.Plan),
 	}
 	return n, nil
 }

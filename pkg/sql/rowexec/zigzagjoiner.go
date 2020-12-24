@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -300,6 +301,7 @@ func newZigzagJoiner(
 		spec.OnExpr,
 		leftEqCols,
 		rightEqCols,
+		false, /* outputContinuationColumn */
 		post,
 		output,
 		execinfra.ProcStateOpts{
@@ -418,9 +420,9 @@ func (z *zigzagJoiner) setupInfo(
 	info.eqColumns = spec.EqColumns[side].Columns
 	indexOrdinal := spec.IndexOrdinals[side]
 	if indexOrdinal == 0 {
-		info.index = &info.table.PrimaryIndex
+		info.index = info.table.GetPrimaryIndex()
 	} else {
-		info.index = &info.table.Indexes[indexOrdinal-1]
+		info.index = &info.table.GetPublicNonPrimaryIndexes()[indexOrdinal-1]
 	}
 
 	var columnIDs []descpb.ColumnID
@@ -429,7 +431,7 @@ func (z *zigzagJoiner) setupInfo(
 	columnTypes := info.table.ColumnTypes()
 	colIdxMap := info.table.ColumnIdxMap()
 	for i, columnID := range columnIDs {
-		info.indexTypes[i] = columnTypes[colIdxMap[columnID]]
+		info.indexTypes[i] = columnTypes[colIdxMap.GetDefault(columnID)]
 	}
 
 	// Add the outputted columns.
@@ -442,7 +444,7 @@ func (z *zigzagJoiner) setupInfo(
 
 	// Add the fixed columns.
 	for i := 0; i < len(info.fixedValues); i++ {
-		neededCols.Add(colIdxMap[columnIDs[i]])
+		neededCols.Add(colIdxMap.GetDefault(columnIDs[i]))
 	}
 
 	// Add the equality columns.
@@ -453,7 +455,7 @@ func (z *zigzagJoiner) setupInfo(
 	// Setup the RowContainers.
 	info.container.Reset()
 
-	info.spanBuilder = span.MakeBuilder(flowCtx.Codec(), info.table, info.index)
+	info.spanBuilder = span.MakeBuilder(flowCtx.EvalCtx, flowCtx.Codec(), info.table, info.index)
 
 	// Setup the Fetcher.
 	_, _, err := initRowFetcher(
@@ -559,7 +561,7 @@ func (z *zigzagJoiner) produceInvertedIndexKey(
 	// EncodeInvertedIndexKeys to generate the prefix. The rest of the
 	// index key containing the remaining neededDatums can be generated
 	// and appended using EncodeColumns.
-	colMap := make(map[descpb.ColumnID]int)
+	var colMap catalog.TableColMap
 	decodedDatums := make([]tree.Datum, len(datums))
 
 	// Ensure all EncDatums have been decoded.
@@ -571,11 +573,11 @@ func (z *zigzagJoiner) produceInvertedIndexKey(
 
 		decodedDatums[i] = encDatum.Datum
 		if i < len(info.index.ColumnIDs) {
-			colMap[info.index.ColumnIDs[i]] = i
+			colMap.Set(info.index.ColumnIDs[i], i)
 		} else {
 			// This column's value will be encoded in the second part (i.e.
 			// EncodeColumns).
-			colMap[info.index.ExtraColumnIDs[i-len(info.index.ColumnIDs)]] = i
+			colMap.Set(info.index.ExtraColumnIDs[i-len(info.index.ColumnIDs)], i)
 		}
 	}
 
@@ -648,8 +650,8 @@ func (zi *zigzagJoinerInfo) eqOrdering() (colinfo.ColumnOrdering, error) {
 			if err != nil {
 				return nil, err
 			}
-		} else if idx := findColumnID(zi.table.PrimaryIndex.ColumnIDs, colID); idx != -1 {
-			direction, err = zi.table.PrimaryIndex.ColumnDirections[idx].ToEncodingDirection()
+		} else if idx := findColumnID(zi.table.GetPrimaryIndex().ColumnIDs, colID); idx != -1 {
+			direction, err = zi.table.GetPrimaryIndex().ColumnDirections[idx].ToEncodingDirection()
 			if err != nil {
 				return nil, err
 			}

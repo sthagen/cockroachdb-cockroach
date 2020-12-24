@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // TestParse verifies that we can parse the supplied SQL and regenerate the SQL
@@ -73,7 +72,8 @@ func TestParse(t *testing.T) {
 		{`CREATE DATABASE a CONNECTION LIMIT = 13`},
 		{`CREATE DATABASE a REGIONS = "us-west-1", "us-west-2"`},
 		{`CREATE DATABASE a SURVIVE REGION FAILURE`},
-		{`CREATE DATABASE a SURVIVE AVAILABILITY ZONE FAILURE`},
+		{`CREATE DATABASE a SURVIVE ZONE FAILURE`},
+		{`CREATE DATABASE a PRIMARY REGION "us-west-1"`},
 		{`CREATE DATABASE IF NOT EXISTS a`},
 		{`CREATE DATABASE IF NOT EXISTS a TEMPLATE = 'template0'`},
 		{`CREATE DATABASE IF NOT EXISTS a TEMPLATE = 'invalid'`},
@@ -86,12 +86,17 @@ func TestParse(t *testing.T) {
 		{`CREATE DATABASE IF NOT EXISTS a TEMPLATE = 'template0' ENCODING = 'UTF8' LC_COLLATE = 'C.UTF-8' LC_CTYPE = 'INVALID'`},
 		{`CREATE DATABASE IF NOT EXISTS a REGIONS = "us-west-1", "us-west-2"`},
 		{`CREATE DATABASE IF NOT EXISTS a SURVIVE REGION FAILURE`},
-		{`CREATE DATABASE IF NOT EXISTS a SURVIVE AVAILABILITY ZONE FAILURE`},
+		{`CREATE DATABASE IF NOT EXISTS a SURVIVE ZONE FAILURE`},
+		{`CREATE DATABASE IF NOT EXISTS a PRIMARY REGION "us-west-1"`},
 
 		{`CREATE SCHEMA IF NOT EXISTS foo`},
 		{`CREATE SCHEMA foo`},
+		{`CREATE SCHEMA IF NOT EXISTS foo.bar`},
+		{`CREATE SCHEMA foo.bar`},
 		{`CREATE SCHEMA IF NOT EXISTS foo AUTHORIZATION foobar`},
+		{`CREATE SCHEMA IF NOT EXISTS foo.bar AUTHORIZATION foobar`},
 		{`CREATE SCHEMA foo AUTHORIZATION foobar`},
+		{`CREATE SCHEMA foo.bar AUTHORIZATION foobar`},
 		{`CREATE SCHEMA IF NOT EXISTS AUTHORIZATION foobar`},
 		{`CREATE SCHEMA AUTHORIZATION foobar`},
 
@@ -275,6 +280,7 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a.b (b INT8)`},
 		{`CREATE TABLE IF NOT EXISTS a (b INT8)`},
 		{`CREATE TABLE a (b INT8 AS (a + b) STORED)`},
+		{`CREATE TABLE a (b INT8 AS (a + b) VIRTUAL)`},
 		{`CREATE TABLE view (view INT8)`},
 
 		{`CREATE TABLE a (b INT8 CONSTRAINT c PRIMARY KEY)`},
@@ -335,12 +341,17 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b STRING COLLATE de)`},
 		{`CREATE TABLE a (b STRING(3) COLLATE de)`},
 		{`CREATE TABLE a (b STRING[] COLLATE de)`},
-		{`CREATE TABLE a (b STRING(3)[] COLLATE de)`},
+		{`CREATE TABLE a (b STRING(3)[] COLLATE en_US)`},
 
 		{`CREATE TABLE a (LIKE b)`},
 		{`CREATE TABLE a (LIKE b, c INT8)`},
 		{`CREATE TABLE a (LIKE b EXCLUDING INDEXES INCLUDING INDEXES)`},
 		{`CREATE TABLE a (LIKE b INCLUDING ALL EXCLUDING INDEXES, c INT8)`},
+
+		{`CREATE TABLE a (a INT4) LOCALITY GLOBAL`},
+		{`CREATE TABLE a (a INT4) LOCALITY REGIONAL BY TABLE IN "us-west1"`},
+		{`CREATE TABLE a (a INT4) LOCALITY REGIONAL BY TABLE IN PRIMARY REGION`},
+		{`CREATE TABLE a (a INT4) LOCALITY REGIONAL BY ROW`},
 
 		{`CREATE VIEW a AS SELECT * FROM b`},
 		{`CREATE OR REPLACE VIEW a AS SELECT * FROM b`},
@@ -400,6 +411,7 @@ func TestParse(t *testing.T) {
 		{`ANALYZE db.sc.t`},
 
 		{`CREATE TYPE a AS ENUM ()`},
+		{`CREATE TYPE IF NOT EXISTS a AS ENUM ()`},
 		{`CREATE TYPE a AS ENUM ('a')`},
 		{`CREATE TYPE a AS ENUM ('a', 'b', 'c')`},
 		{`CREATE TYPE a.b AS ENUM ('a', 'b', 'c')`},
@@ -411,6 +423,17 @@ func TestParse(t *testing.T) {
 		{`DROP SCHEMA IF EXISTS a, b CASCADE`},
 		{`DROP SCHEMA IF EXISTS a, b RESTRICT`},
 		{`DROP SCHEMA a RESTRICT`},
+
+		{`DROP SCHEMA a.a`},
+		{`DROP SCHEMA a.a, b.b, c.c`},
+		{`DROP SCHEMA a, b.b, c`},
+		{`DROP SCHEMA IF EXISTS a.a, b.b, c.c`},
+		{`DROP SCHEMA IF EXISTS a, b, c.c`},
+		{`DROP SCHEMA IF EXISTS a.a, b.b CASCADE`},
+		{`DROP SCHEMA IF EXISTS a.a, b CASCADE`},
+		{`DROP SCHEMA IF EXISTS a.a, b.c RESTRICT`},
+		{`DROP SCHEMA IF EXISTS a, b.b RESTRICT`},
+		{`DROP SCHEMA a.a RESTRICT`},
 
 		{`DROP TYPE a`},
 		{`DROP TYPE a, b, c`},
@@ -530,9 +553,12 @@ func TestParse(t *testing.T) {
 
 		{`EXPLAIN SELECT 1`},
 		{`EXPLAIN EXPLAIN SELECT 1`},
+		{`EXPLAIN (DISTSQL) SELECT 1`},
+		{`EXPLAIN (DISTSQL, JSON) SELECT 1`},
 		{`EXPLAIN (OPT, VERBOSE) SELECT 1`},
 		{`EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
 		{`EXPLAIN ANALYZE (DEBUG) SELECT 1`},
+		{`EXPLAIN ANALYZE SELECT 1`},
 		{`SELECT * FROM [EXPLAIN SELECT 1]`},
 		{`SELECT * FROM [SHOW TRANSACTION STATUS]`},
 
@@ -630,8 +656,12 @@ func TestParse(t *testing.T) {
 		{`SHOW RANGES FROM INDEX t@i`},
 		{`SHOW RANGES FROM INDEX d.i`},
 		{`SHOW RANGES FROM INDEX i`},
-		{`SHOW REGIONS`},
+		{`SHOW REGIONS FROM CLUSTER`},
+		{`SHOW REGIONS FROM ALL DATABASES`},
+		{`SHOW REGIONS FROM DATABASE`},
 		{`SHOW REGIONS FROM DATABASE d`},
+		{`SHOW SURVIVAL GOAL FROM DATABASE`},
+		{`SHOW SURVIVAL GOAL FROM DATABASE d`},
 		{`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE d.t`},
 		{`SHOW ZONE CONFIGURATIONS`},
 		{`EXPLAIN SHOW ZONE CONFIGURATIONS`},
@@ -653,7 +683,9 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN SHOW GRANTS`},
 		{`SHOW GRANTS ON TABLE foo`},
 		{`SHOW GRANTS ON SCHEMA foo`},
+		{`SHOW GRANTS ON SCHEMA foo.bar`},
 		{`SHOW GRANTS ON SCHEMA foo, bar`},
+		{`SHOW GRANTS ON SCHEMA foo.bar, bar.baz`},
 		{`SHOW GRANTS ON TYPE typ1`},
 		{`SHOW GRANTS ON TYPE typ1, schema2.typ2, db.schema.typ`},
 		{`SHOW GRANTS ON TABLE foo, db.foo`},
@@ -744,8 +776,11 @@ func TestParse(t *testing.T) {
 
 		// GRANT ON SCHEMA.
 		{`GRANT USAGE ON SCHEMA foo TO root`},
+		{`GRANT USAGE ON SCHEMA foo.bar TO root`},
 		{`GRANT USAGE, GRANT, CREATE ON SCHEMA foo TO root`},
+		{`GRANT USAGE, GRANT, CREATE ON SCHEMA foo.bar TO root`},
 		{`GRANT ALL ON SCHEMA foo, bar, baz TO root`},
+		{`GRANT ALL ON SCHEMA a.b, c.d, e.f TO root`},
 
 		// Tables are the default, but can also be specified with
 		// REVOKE x ON TABLE y. However, the stringer does not output TABLE.
@@ -765,8 +800,11 @@ func TestParse(t *testing.T) {
 
 		// REVOKE ON SCHEMA.
 		{`REVOKE USAGE ON SCHEMA foo FROM root`},
+		{`REVOKE USAGE ON SCHEMA foo.bar FROM root`},
 		{`REVOKE USAGE, GRANT, CREATE ON SCHEMA foo FROM root`},
+		{`REVOKE USAGE, GRANT, CREATE ON SCHEMA foo.bar FROM root`},
 		{`REVOKE ALL ON SCHEMA foo, bar, baz FROM root`},
+		{`REVOKE ALL ON SCHEMA a.b, c.d, e.f FROM root`},
 
 		{`INSERT INTO a VALUES (1)`},
 		{`EXPLAIN INSERT INTO a VALUES (1)`},
@@ -1200,11 +1238,13 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t1 INNER MERGE JOIN t2 USING (a)`},
 		{`SELECT a FROM t1 LEFT JOIN t2 ON a = b`},
 		{`SELECT a FROM t1 LEFT LOOKUP JOIN t2 ON a = b`},
+		{`SELECT a FROM t1 LEFT INVERTED JOIN t2 ON a @> b`},
 		{`SELECT a FROM t1 RIGHT JOIN t2 ON a = b`},
 		{`SELECT a FROM t1 INNER JOIN t2 ON a = b`},
 		{`SELECT a FROM t1 INNER HASH JOIN t2 ON a = b`},
 		{`SELECT a FROM t1 CROSS JOIN t2`},
 		{`SELECT a FROM t1 CROSS LOOKUP JOIN t2`},
+		{`SELECT a FROM t1 CROSS INVERTED JOIN t2`},
 		{`SELECT a FROM t1 NATURAL JOIN t2`},
 		{`SELECT a FROM t1 NATURAL INNER MERGE JOIN t2`},
 		{`SELECT a FROM t1 INNER JOIN t2 USING (a)`},
@@ -1334,9 +1374,10 @@ func TestParse(t *testing.T) {
 		{`SELECT * FROM "0" JOIN "0" USING (id, "0")`}, // last "0" lost its quotes.
 
 		{`ALTER DATABASE a RENAME TO b`},
-		{`ALTER DATABASE a ADD REGION "us-west-1", "us-west-2"`},
-		{`ALTER DATABASE a DROP REGION "us-west-1", "us-west-2"`},
+		{`ALTER DATABASE a ADD REGION "us-west-1"`},
+		{`ALTER DATABASE a DROP REGION "us-west-1"`},
 		{`ALTER DATABASE a SURVIVE REGION FAILURE`},
+		{`ALTER DATABASE a PRIMARY REGION "us-west-3"`},
 		{`EXPLAIN ALTER DATABASE a RENAME TO b`},
 
 		{`ALTER DATABASE a OWNER TO foo`},
@@ -1351,6 +1392,8 @@ func TestParse(t *testing.T) {
 
 		{`ALTER SCHEMA s RENAME TO s2`},
 		{`ALTER SCHEMA s OWNER TO foo`},
+		{`ALTER SCHEMA db.s RENAME TO s2`},
+		{`ALTER SCHEMA db.s OWNER TO foo`},
 
 		{`ALTER TABLE a RENAME TO b`},
 		{`EXPLAIN ALTER TABLE a RENAME TO b`},
@@ -1360,6 +1403,10 @@ func TestParse(t *testing.T) {
 		{`ALTER TABLE a RENAME CONSTRAINT c1 TO c2`},
 		{`ALTER TABLE IF EXISTS a RENAME CONSTRAINT c1 TO c2`},
 		{`ALTER TABLE a RENAME CONSTRAINT c TO d, RENAME COLUMN e TO f`},
+		{`ALTER TABLE a SET LOCALITY GLOBAL`},
+		{`ALTER TABLE a SET LOCALITY REGIONAL BY TABLE IN region_name`},
+		{`ALTER TABLE a SET LOCALITY REGIONAL BY TABLE IN PRIMARY REGION`},
+		{`ALTER TABLE a SET LOCALITY REGIONAL BY ROW`},
 
 		{`ALTER TABLE a ADD COLUMN b INT8, ADD CONSTRAINT a_idx UNIQUE (a)`},
 		{`EXPLAIN ALTER TABLE a ADD COLUMN b INT8`},
@@ -1657,6 +1704,14 @@ func TestParse(t *testing.T) {
 		{`RESTORE DATABASE foo FROM ($1, $2), ($3, $4)`},
 		{`RESTORE DATABASE foo FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1'`},
 
+		{`RESTORE FROM ($1, $2)`},
+		{`RESTORE FROM ($1, $2), $3`},
+		{`RESTORE FROM $1, ($2, $3)`},
+		{`RESTORE FROM ($1, $2), ($3, $4)`},
+		{`RESTORE FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1'`},
+		{`RESTORE FROM $4 IN $1, $2, 'bar'`},
+		{`RESTORE FROM $4 IN $1, $2, 'bar' AS OF SYSTEM TIME '1' WITH skip_missing_foreign_keys`},
+
 		{`RESTORE TENANT 36 FROM ($1, $2) AS OF SYSTEM TIME '1'`},
 
 		{`BACKUP TABLE foo TO 'bar' WITH revision_history, detached`},
@@ -1740,12 +1795,20 @@ func TestParse2(t *testing.T) {
 			`CREATE DATABASE a`,
 		},
 		{
+			`CREATE DATABASE IF NOT EXISTS a SURVIVE = ZONE FAILURE`,
+			`CREATE DATABASE IF NOT EXISTS a SURVIVE ZONE FAILURE`,
+		},
+		{
+			`CREATE DATABASE IF NOT EXISTS a SURVIVE = REGION FAILURE`,
+			`CREATE DATABASE IF NOT EXISTS a SURVIVE REGION FAILURE`,
+		},
+		{
 			`CREATE DATABASE a REGION "us-west-1"`,
 			`CREATE DATABASE a REGIONS = "us-west-1"`,
 		},
 		{
-			`CREATE DATABASE IF NOT EXISTS a SURVIVE DEFAULT`,
-			`CREATE DATABASE IF NOT EXISTS a`,
+			`CREATE DATABASE a PRIMARY REGION = "us-west-1"`,
+			`CREATE DATABASE a PRIMARY REGION "us-west-1"`,
 		},
 		{`CREATE TABLE a (b INT) WITH (fillfactor=100)`,
 			`CREATE TABLE a (b INT8)`},
@@ -1797,6 +1860,11 @@ func TestParse2(t *testing.T) {
 			`CREATE TABLE a (b VARCHAR, c VARCHAR(3))`},
 		{`CREATE TABLE a (b BIT VARYING(2), c BIT(1))`,
 			`CREATE TABLE a (b VARBIT(2), c BIT)`},
+
+		{`CREATE TABLE a (b INT, CHECK (b > 0) NOT VALID)`,
+			`CREATE TABLE a (b INT8, CHECK (b > 0))`},
+		{`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other (b) NOT VALID)`,
+			`CREATE TABLE a (b INT8, FOREIGN KEY (b) REFERENCES other (b))`},
 
 		{`CREATE STATISTICS a ON col1 FROM t AS OF SYSTEM TIME '2016-01-01'`,
 			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
@@ -2334,14 +2402,6 @@ $function$`,
 			`ALTER RANGE meta CONFIGURE ZONE USING "foo.bar" = yay`},
 		{`ALTER DATABASE db CONFIGURE ZONE USING foo.bar = yay`,
 			`ALTER DATABASE db CONFIGURE ZONE USING "foo.bar" = yay`},
-		{
-			`ALTER DATABASE a ADD REGIONS "us-west-1", "us-west-2"`,
-			`ALTER DATABASE a ADD REGION "us-west-1", "us-west-2"`,
-		},
-		{
-			`ALTER DATABASE a DROP REGIONS "us-west-1", "us-west-2"`,
-			`ALTER DATABASE a DROP REGION "us-west-1", "us-west-2"`,
-		},
 		{`ALTER TABLE db.t CONFIGURE ZONE USING foo.bar = yay`,
 			`ALTER TABLE db.t CONFIGURE ZONE USING "foo.bar" = yay`},
 		{`ALTER PARTITION p OF TABLE db.t CONFIGURE ZONE USING foo.bar = yay`,
@@ -2358,6 +2418,58 @@ $function$`,
 			`ALTER INDEX i CONFIGURE ZONE USING "foo.bar" = yay`},
 		{`ALTER INDEX i CONFIGURE ZONE USING foo = COPY FROM PARENT`,
 			`ALTER INDEX i CONFIGURE ZONE USING foo = COPY FROM PARENT`},
+		{
+			`ALTER TABLE a SET LOCALITY REGIONAL BY TABLE`,
+			`ALTER TABLE a SET LOCALITY REGIONAL BY TABLE IN PRIMARY REGION`,
+		},
+		{
+			`ALTER TABLE a SET REGIONAL AFFINITY TO NONE`,
+			`ALTER TABLE a SET LOCALITY GLOBAL`,
+		},
+		{
+			`ALTER TABLE a SET REGIONAL AFFINITY TO "us-west-1"`,
+			`ALTER TABLE a SET LOCALITY REGIONAL BY TABLE IN "us-west-1"`,
+		},
+		{
+			`ALTER TABLE a SET REGIONAL AFFINITY TO PRIMARY REGION`,
+			`ALTER TABLE a SET LOCALITY REGIONAL BY TABLE IN PRIMARY REGION`,
+		},
+		{
+			`ALTER TABLE a SET REGIONAL AFFINITY AT ROW LEVEL`,
+			`ALTER TABLE a SET LOCALITY REGIONAL BY ROW`,
+		},
+		{
+			`ALTER TABLE a SET REGIONAL AFFINITY NONE`,
+			`ALTER TABLE a SET LOCALITY GLOBAL`,
+		},
+		{
+			`ALTER TABLE a SET REGIONAL AFFINITY "us-west-1"`,
+			`ALTER TABLE a SET LOCALITY REGIONAL BY TABLE IN "us-west-1"`,
+		},
+		{
+			`ALTER TABLE a SET REGIONAL AFFINITY PRIMARY REGION`,
+			`ALTER TABLE a SET LOCALITY REGIONAL BY TABLE IN PRIMARY REGION`,
+		},
+		{
+			`ALTER TABLE a SET REGIONAL AFFINITY ROW LEVEL`,
+			`ALTER TABLE a SET LOCALITY REGIONAL BY ROW`,
+		},
+		{
+			`ALTER TABLE a SET NO REGIONAL AFFINITY`,
+			`ALTER TABLE a SET LOCALITY GLOBAL`,
+		},
+		{
+			`ALTER TABLE a SET TABLE LEVEL REGIONAL AFFINITY TO "us-west-1"`,
+			`ALTER TABLE a SET LOCALITY REGIONAL BY TABLE IN "us-west-1"`,
+		},
+		{
+			`ALTER TABLE a SET TABLE LEVEL REGIONAL AFFINITY TO PRIMARY REGION`,
+			`ALTER TABLE a SET LOCALITY REGIONAL BY TABLE IN PRIMARY REGION`,
+		},
+		{
+			`ALTER TABLE a SET ROW LEVEL REGIONAL AFFINITY`,
+			`ALTER TABLE a SET LOCALITY REGIONAL BY ROW`,
+		},
 
 		// Alternative forms for table patterns.
 
@@ -2621,6 +2733,7 @@ SKIP_MISSING_FOREIGN_KEYS, SKIP_MISSING_SEQUENCES, SKIP_MISSING_SEQUENCE_OWNERS,
 			`CREATE TABLE a (b INT8, c STRING, FOREIGN KEY (b, c) REFERENCES other (x, y) ON DELETE CASCADE ON UPDATE SET NULL)`,
 		},
 		{`CREATE TABLE a (b INT8 GENERATED ALWAYS AS (a + b) STORED)`, `CREATE TABLE a (b INT8 AS (a + b) STORED)`},
+		{`CREATE TABLE a (b INT8 GENERATED ALWAYS AS (a + b) VIRTUAL)`, `CREATE TABLE a (b INT8 AS (a + b) VIRTUAL)`},
 
 		{`ALTER TABLE a ALTER b DROP STORED`, `ALTER TABLE a ALTER COLUMN b DROP STORED`},
 		{`ALTER TABLE a ADD b INT8`, `ALTER TABLE a ADD COLUMN b INT8`},
@@ -2630,10 +2743,10 @@ SKIP_MISSING_FOREIGN_KEYS, SKIP_MISSING_SEQUENCES, SKIP_MISSING_SEQUENCE_OWNERS,
 		{`ALTER TABLE a ALTER b DROP NOT NULL`, `ALTER TABLE a ALTER COLUMN b DROP NOT NULL`},
 		{`ALTER TABLE a ALTER b TYPE INT8`, `ALTER TABLE a ALTER COLUMN b SET DATA TYPE INT8`},
 
-		{`EXPLAIN ANALYZE SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
+		{`EXPLAIN ANALYZE (PLAN) SELECT 1`, `EXPLAIN ANALYZE SELECT 1`},
 		// Check the alternate spelling.
-		{`EXPLAIN ANALYSE SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
-		{`EXPLAIN ANALYSE (DISTSQL) SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
+		{`EXPLAIN ANALYSE SELECT 1`, `EXPLAIN ANALYZE SELECT 1`},
+		{`EXPLAIN ANALYSE (PLAN) SELECT 1`, `EXPLAIN ANALYZE SELECT 1`},
 		{`EXPLAIN (VERBOSE, OPT) SELECT 1`, `EXPLAIN (OPT, VERBOSE) SELECT 1`},
 
 		{`SET a = INDEX`, `SET a = "index"`},
@@ -2684,9 +2797,22 @@ SKIP_MISSING_FOREIGN_KEYS, SKIP_MISSING_SEQUENCES, SKIP_MISSING_SEQUENCE_OWNERS,
 		{`GRANT ALL PRIVILEGES ON DATABASE foo TO root`, `GRANT ALL ON DATABASE foo TO root`},
 		{`GRANT ALL PRIVILEGES ON TABLE foo TO root`, `GRANT ALL ON TABLE foo TO root`},
 		{`GRANT ALL PRIVILEGES ON SCHEMA foo TO root`, `GRANT ALL ON SCHEMA foo TO root`},
+		{`GRANT ALL PRIVILEGES ON SCHEMA foo.bar TO root`, `GRANT ALL ON SCHEMA foo.bar TO root`},
+		{`GRANT ALL PRIVILEGES ON SCHEMA a.b, c.d TO root`, `GRANT ALL ON SCHEMA a.b, c.d TO root`},
 		{`REVOKE ALL PRIVILEGES ON DATABASE foo FROM root`, `REVOKE ALL ON DATABASE foo FROM root`},
 		{`REVOKE ALL PRIVILEGES ON TABLE foo FROM root`, `REVOKE ALL ON TABLE foo FROM root`},
 		{`REVOKE ALL PRIVILEGES ON SCHEMA foo FROM root`, `REVOKE ALL ON SCHEMA foo FROM root`},
+		{`REVOKE ALL PRIVILEGES ON SCHEMA foo.bar FROM root`, `REVOKE ALL ON SCHEMA foo.bar FROM root`},
+		{`REVOKE ALL PRIVILEGES ON SCHEMA a.b, c.d FROM root`, `REVOKE ALL ON SCHEMA a.b, c.d FROM root`},
+
+		// Check rules for normalizing collation names.
+		{`CREATE TABLE a (b STRING COLLATE "en-us")`, `CREATE TABLE a (b STRING COLLATE en_US)`},
+		{`CREATE TABLE a (b STRING COLLATE en_us)`, `CREATE TABLE a (b STRING COLLATE en_US)`},
+
+		{
+			`CREATE TABLE a (a INT4) LOCALITY REGIONAL BY TABLE`,
+			`CREATE TABLE a (a INT4) LOCALITY REGIONAL BY TABLE IN PRIMARY REGION`,
+		},
 	}
 	for _, d := range testData {
 		t.Run(d.sql, func(t *testing.T) {
@@ -2786,23 +2912,6 @@ func TestParseDatadriven(t *testing.T) {
 			return ""
 		})
 	})
-}
-
-func TestParseTableNameWithQualifiedNames(t *testing.T) {
-	testdata := []struct {
-		name     string
-		expected string
-	}{
-		{"unique", `"unique"`},
-		{"unique.index", `"unique".index`},
-		{"table.index.primary", `"table".index.primary`},
-	}
-
-	for _, tc := range testdata {
-		name, err := parser.ParseTableNameWithQualifiedNames(tc.name)
-		require.NoError(t, err)
-		require.Equal(t, tc.expected, name.String())
-	}
 }
 
 func TestParsePanic(t *testing.T) {
@@ -3091,7 +3200,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 
 		{`CREATE TABLE a AS SELECT b WITH NO DATA`, 0, `create table as with no data`, ``},
 
-		{`CREATE TABLE a(b INT8 AS (123) VIRTUAL)`, 0, `virtual computed columns`, ``},
 		{`CREATE TABLE a(b INT8 REFERENCES c(x) MATCH PARTIAL`, 20305, `match partial`, ``},
 		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) MATCH PARTIAL)`, 20305, `match partial`, ``},
 
@@ -3193,6 +3301,11 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(b TSVECTOR)`, 7821, `tsvector`, ``},
 		{`CREATE TABLE a(b TXID_SNAPSHOT)`, 0, `txid_snapshot`, ``},
 		{`CREATE TABLE a(b XML)`, 0, `xml`, ``},
+
+		{`CREATE TABLE a(a INT, PRIMARY KEY (a) NOT VALID)`, 0, `table constraint`,
+			`PRIMARY KEY constraints cannot be marked NOT VALID`},
+		{`CREATE TABLE a(a INT, UNIQUE (a) NOT VALID)`, 0, `table constraint`,
+			`UNIQUE constraints cannot be marked NOT VALID`},
 
 		{`UPDATE foo SET (a, a.b) = (1, 2)`, 27792, ``, ``},
 		{`UPDATE foo SET a.b = 1`, 27792, ``, ``},

@@ -31,6 +31,7 @@ type Column struct {
 	datumType                   *types.T
 	nullable                    bool
 	hidden                      bool
+	virtualComputed             bool
 	defaultExpr                 string
 	computedExpr                string
 	invertedSourceColumnOrdinal int
@@ -49,11 +50,11 @@ func (c *Column) Ordinal() int {
 // dropped and then re-added with the same name; the new column will have a
 // different ID. See the comment for StableID for more detail.
 //
-// Virtual columns don't have stable IDs; for these columns ColID() must not be
-// called.
+// Virtual inverted columns don't have stable IDs; for these columns ColID()
+// must not be called.
 func (c *Column) ColID() StableID {
-	if c.kind.IsVirtual() {
-		panic(errors.AssertionFailedf("virtual columns have no StableID"))
+	if c.kind == VirtualInverted {
+		panic(errors.AssertionFailedf("virtual inverted columns have no StableID"))
 	}
 	return c.stableID
 }
@@ -124,6 +125,11 @@ func (c *Column) ComputedExprStr() string {
 	return c.computedExpr
 }
 
+// IsVirtualComputed returns true if this is a virtual computed column.
+func (c *Column) IsVirtualComputed() bool {
+	return c.virtualComputed
+}
+
 // InvertedSourceColumnOrdinal is used for virtual columns that are part
 // of inverted indexes. It returns the ordinal of the table column from which
 // the inverted column is derived.
@@ -145,7 +151,7 @@ type ColumnKind uint8
 
 const (
 	// Ordinary columns are "regular" table columns (including hidden columns
-	// like `rowid`).
+	// like `rowid` and virtual computed columns).
 	Ordinary ColumnKind = iota
 	// WriteOnly columns are mutation columns that have to be updated on writes
 	// (inserts, updates, deletes) and cannot be otherwise accessed.
@@ -161,16 +167,7 @@ const (
 	// VirtualInverted columns are implicit columns that are used by inverted
 	// indexes.
 	VirtualInverted
-	// VirtualComputed columns are non-stored computed columns that are used by
-	// expression-based indexes.
-	VirtualComputed
 )
-
-// IsVirtual returns true if the column kind is VirtualInverted or
-// VirtualComputed.
-func (k ColumnKind) IsVirtual() bool {
-	return k == VirtualInverted || k == VirtualComputed
-}
 
 // InitNonVirtual is used by catalog implementations to populate a non-virtual
 // Column. It should not be used anywhere else.
@@ -185,7 +182,7 @@ func (c *Column) InitNonVirtual(
 	defaultExpr *string,
 	computedExpr *string,
 ) {
-	if kind.IsVirtual() {
+	if kind == VirtualInverted {
 		panic(errors.AssertionFailedf("incorrect init method"))
 	}
 	c.ordinal = ordinal
@@ -226,21 +223,25 @@ func (c *Column) InitVirtualInverted(
 }
 
 // InitVirtualComputed is used by catalog implementations to populate a
-// VirtualComputed Column. It should not be used anywhere else.
+// virtual computed Column. It should not be used anywhere else.
 func (c *Column) InitVirtualComputed(
-	ordinal int, name tree.Name, datumType *types.T, nullable bool, computedExpr string,
+	ordinal int,
+	stableID StableID,
+	name tree.Name,
+	datumType *types.T,
+	nullable bool,
+	hidden bool,
+	computedExpr string,
 ) {
 	c.ordinal = ordinal
-	c.stableID = 0
+	c.stableID = stableID
 	c.name = name
-	c.kind = VirtualComputed
+	c.kind = Ordinary
 	c.datumType = datumType
 	c.nullable = nullable
-	c.hidden = true
+	c.hidden = hidden
 	c.defaultExpr = ""
 	c.computedExpr = computedExpr
+	c.virtualComputed = true
 	c.invertedSourceColumnOrdinal = -1
 }
-
-// Quiet the linter until this is used.
-var _ = (*Column).InitVirtualComputed

@@ -24,6 +24,22 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// columnarizerMode indicates the mode of operation of the Columnarizer.
+type columnarizerMode int
+
+const (
+	// columnarizerBufferingMode is the mode of operation in which the
+	// Columnarizer will be buffering up rows (dynamically, up to
+	// coldata.BatchSize()) before emitting the output batch.
+	// TODO(jordan): evaluate whether it's more efficient to skip the buffer
+	// phase.
+	columnarizerBufferingMode columnarizerMode = iota
+	// columnarizerStreamingMode is the mode of operation in which the
+	// Columnarizer will always emit batches with a single tuple (until it is
+	// done).
+	columnarizerStreamingMode
+)
+
 // Columnarizer turns an execinfra.RowSource input into an Operator output, by
 // reading the input in chunks of size coldata.BatchSize() and converting each
 // chunk into a coldata.Batch column by column.
@@ -31,6 +47,7 @@ type Columnarizer struct {
 	execinfra.ProcessorBase
 	NonExplainable
 
+	mode       columnarizerMode
 	allocator  *colmem.Allocator
 	input      execinfra.RowSource
 	da         rowenc.DatumAlloc
@@ -45,19 +62,50 @@ type Columnarizer struct {
 
 var _ colexecbase.Operator = &Columnarizer{}
 
-// NewColumnarizer returns a new Columnarizer.
-func NewColumnarizer(
+// NewBufferingColumnarizer returns a new Columnarizer that will be buffering up
+// rows before emitting them as output batches.
+func NewBufferingColumnarizer(
 	ctx context.Context,
 	allocator *colmem.Allocator,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	input execinfra.RowSource,
 ) (*Columnarizer, error) {
+	return newColumnarizer(ctx, allocator, flowCtx, processorID, input, columnarizerBufferingMode)
+}
+
+// NewStreamingColumnarizer returns a new Columnarizer that emits every input
+// row as a separate batch.
+func NewStreamingColumnarizer(
+	ctx context.Context,
+	allocator *colmem.Allocator,
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
+	input execinfra.RowSource,
+) (*Columnarizer, error) {
+	return newColumnarizer(ctx, allocator, flowCtx, processorID, input, columnarizerStreamingMode)
+}
+
+// newColumnarizer returns a new Columnarizer.
+func newColumnarizer(
+	ctx context.Context,
+	allocator *colmem.Allocator,
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
+	input execinfra.RowSource,
+	mode columnarizerMode,
+) (*Columnarizer, error) {
 	var err error
+	switch mode {
+	case columnarizerBufferingMode, columnarizerStreamingMode:
+	default:
+		return nil, errors.AssertionFailedf("unexpected columnarizerMode %d", mode)
+	}
 	c := &Columnarizer{
 		allocator: allocator,
 		input:     input,
 		ctx:       ctx,
+		mode:      mode,
 	}
 	if err = c.ProcessorBase.Init(
 		nil,
@@ -90,22 +138,35 @@ func (c *Columnarizer) Init() {
 // Next is part of the Operator interface.
 func (c *Columnarizer) Next(context.Context) coldata.Batch {
 	var reallocated bool
-	c.batch, reallocated = c.allocator.ResetMaybeReallocate(c.typs, c.batch, 1 /* minCapacity */)
-	if reallocated {
-		oldRows := c.buffered
-		c.buffered = make(rowenc.EncDatumRows, c.batch.Capacity())
-		for i := range c.buffered {
-			if len(oldRows) > 0 {
-				c.buffered[i] = oldRows[0]
-				oldRows = oldRows[1:]
-			} else {
-				c.buffered[i] = make(rowenc.EncDatumRow, len(c.typs))
-			}
+	switch c.mode {
+	case columnarizerBufferingMode:
+		c.batch, reallocated = c.allocator.ResetMaybeReallocate(c.typs, c.batch, 1 /* minCapacity */)
+	case columnarizerStreamingMode:
+		// Note that we're not using ResetMaybeReallocate because we will
+		// always have at most one tuple in the batch.
+		if c.batch == nil {
+			c.batch = c.allocator.NewMemBatchWithFixedCapacity(c.typs, 1 /* minCapacity */)
+			reallocated = true
+		} else {
+			c.batch.ResetInternalBatch()
 		}
 	}
-	// Buffer up n rows.
+	if reallocated {
+		oldRows := c.buffered
+		newRows := make(rowenc.EncDatumRows, c.batch.Capacity())
+		_ = newRows[len(oldRows)]
+		for i := 0; i < len(oldRows); i++ {
+			//gcassert:bce
+			newRows[i] = oldRows[i]
+		}
+		for i := len(oldRows); i < len(newRows); i++ {
+			//gcassert:bce
+			newRows[i] = make(rowenc.EncDatumRow, len(c.typs))
+		}
+		c.buffered = newRows
+	}
+	// Buffer up rows up to the capacity of the batch.
 	nRows := 0
-	columnTypes := c.OutputTypes()
 	for ; nRows < c.batch.Capacity(); nRows++ {
 		row, meta := c.input.Next()
 		if meta != nil {
@@ -120,8 +181,6 @@ func (c *Columnarizer) Next(context.Context) coldata.Batch {
 		if row == nil {
 			break
 		}
-		// TODO(jordan): evaluate whether it's more efficient to skip the buffer
-		// phase.
 		copy(c.buffered[nRows], row)
 	}
 
@@ -132,8 +191,9 @@ func (c *Columnarizer) Next(context.Context) coldata.Batch {
 	}
 
 	// Write each column into the output batch.
-	for idx, ct := range columnTypes {
-		err := EncDatumRowsToColVec(c.allocator, c.buffered[:nRows], c.batch.ColVec(idx), idx, ct, &c.da)
+	outputRows := c.buffered[:nRows]
+	for idx, ct := range c.typs {
+		err := EncDatumRowsToColVec(c.allocator, outputRows, c.batch.ColVec(idx), idx, ct, &c.da)
 		if err != nil {
 			colexecerror.InternalError(err)
 		}

@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -347,6 +348,19 @@ func (tc *Catalog) ExecuteMultipleDDL(sql string) error {
 // ExecuteDDL parses the given DDL SQL statement and creates objects in the test
 // catalog. This is used to test without spinning up a cluster.
 func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
+	return tc.ExecuteDDLWithIndexVersion(sql, descpb.EmptyArraysInInvertedIndexesVersion)
+}
+
+// ExecuteDDLWithIndexVersion parses the given DDL SQL statement and creates
+// objects in the test catalog. This is used to test without spinning up a
+// cluster.
+//
+// Any indexes created with CREATE INDEX will have the provided index
+// descriptor version (the version is ignored for indexes created as part of
+// a CREATE TABLE statement).
+func (tc *Catalog) ExecuteDDLWithIndexVersion(
+	sql string, indexVersion descpb.IndexDescriptorVersion,
+) (string, error) {
 	stmt, err := parser.ParseOne(sql)
 	if err != nil {
 		return "", err
@@ -358,7 +372,7 @@ func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
 		return "", nil
 
 	case *tree.CreateIndex:
-		tc.CreateIndex(stmt)
+		tc.CreateIndex(stmt, indexVersion)
 		return "", nil
 
 	case *tree.CreateView:
@@ -581,6 +595,8 @@ type Table struct {
 
 	outboundFKs []ForeignKeyConstraint
 	inboundFKs  []ForeignKeyConstraint
+
+	uniqueConstraints []UniqueConstraint
 }
 
 var _ cat.Table = &Table{}
@@ -710,6 +726,16 @@ func (tt *Table) InboundForeignKey(i int) cat.ForeignKeyConstraint {
 	return &tt.inboundFKs[i]
 }
 
+// UniqueCount is part of the cat.Table interface.
+func (tt *Table) UniqueCount() int {
+	return len(tt.uniqueConstraints)
+}
+
+// Unique is part of the cat.Table interface.
+func (tt *Table) Unique(i int) cat.UniqueConstraint {
+	return &tt.uniqueConstraints[i]
+}
+
 // FindOrdinal returns the ordinal of the column with the given name.
 func (tt *Table) FindOrdinal(name string) int {
 	for i, col := range tt.Columns {
@@ -769,6 +795,9 @@ type Index struct {
 	// geoConfig is the geospatial index configuration, if this is a geospatial
 	// inverted index. Otherwise geoConfig is nil.
 	geoConfig *geoindex.Config
+
+	// version is the index descriptor version of the index.
+	version descpb.IndexDescriptorVersion
 }
 
 // ID is part of the cat.Index interface.
@@ -814,6 +843,14 @@ func (ti *Index) KeyColumnCount() int {
 // LaxKeyColumnCount is part of the cat.Index interface.
 func (ti *Index) LaxKeyColumnCount() int {
 	return ti.LaxKeyCount
+}
+
+// NonInvertedPrefixColumnCount is part of the cat.Index interface.
+func (ti *Index) NonInvertedPrefixColumnCount() int {
+	if !ti.IsInverted() {
+		panic("not supported for non-inverted indexes")
+	}
+	return ti.invertedOrd
 }
 
 // Column is part of the cat.Index interface.
@@ -932,6 +969,11 @@ func (ti *Index) GeoConfig() *geoindex.Config {
 	return ti.geoConfig
 }
 
+// Version is part of the cat.Index interface.
+func (ti *Index) Version() descpb.IndexDescriptorVersion {
+	return ti.version
+}
+
 // TableStat implements the cat.TableStatistic interface for testing purposes.
 type TableStat struct {
 	js stats.JSONStatistic
@@ -980,7 +1022,7 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 	if ts.js.HistogramColumnType == "" || ts.js.HistogramBuckets == nil {
 		return nil
 	}
-	colTypeRef, err := parser.ParseType(ts.js.HistogramColumnType)
+	colTypeRef, err := parser.GetTypeFromValidSQLSyntax(ts.js.HistogramColumnType)
 	if err != nil {
 		panic(err)
 	}
@@ -1098,6 +1140,54 @@ func (fk *ForeignKeyConstraint) DeleteReferenceAction() tree.ReferenceAction {
 // UpdateReferenceAction is part of the cat.ForeignKeyConstraint interface.
 func (fk *ForeignKeyConstraint) UpdateReferenceAction() tree.ReferenceAction {
 	return fk.updateAction
+}
+
+// UniqueConstraint implements cat.UniqueConstraint. See that interface
+// for more information on the fields.
+type UniqueConstraint struct {
+	name           string
+	tabID          cat.StableID
+	columnOrdinals []int
+	withoutIndex   bool
+	validated      bool
+}
+
+var _ cat.UniqueConstraint = &UniqueConstraint{}
+
+// Name is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) Name() string {
+	return u.name
+}
+
+// TableID is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) TableID() cat.StableID {
+	return u.tabID
+}
+
+// ColumnCount is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) ColumnCount() int {
+	return len(u.columnOrdinals)
+}
+
+// ColumnOrdinal is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) ColumnOrdinal(tab cat.Table, i int) int {
+	if tab.ID() != u.tabID {
+		panic(errors.AssertionFailedf(
+			"invalid table %d passed to ColumnOrdinal (expected %d)",
+			tab.ID(), u.tabID,
+		))
+	}
+	return u.columnOrdinals[i]
+}
+
+// WithoutIndex is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) WithoutIndex() bool {
+	return u.withoutIndex
+}
+
+// Validated is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) Validated() bool {
+	return u.validated
 }
 
 // Sequence implements the cat.Sequence interface for testing purposes.

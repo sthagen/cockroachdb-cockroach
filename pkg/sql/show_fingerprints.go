@@ -103,7 +103,7 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 		}
 	}
 
-	if index.ID == n.tableDesc.PrimaryIndex.ID {
+	if index.ID == n.tableDesc.GetPrimaryIndexID() {
 		for i := range n.tableDesc.Columns {
 			addColumn(&n.tableDesc.Columns[i])
 		}
@@ -146,7 +146,7 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	fingerprintCols, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRowEx(
 		params.ctx, "hash-fingerprint",
 		params.p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		sql,
 	)
 	if err != nil {

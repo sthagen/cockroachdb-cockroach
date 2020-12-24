@@ -66,7 +66,6 @@ update abcde
  ├── fetch columns: a:8 b:9 c:10 d:11 e:12 rowid:13
  ├── update-mapping:
  │    ├── a_new:15 => a:1
- │    ├── column16:16 => d:4
  │    └── a_new:15 => e:5
  └── project
       ├── columns: column16:16 a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14 a_new:15!null
@@ -221,7 +220,7 @@ update abcde
 build
 UPDATE abcde AS foo SET a=foo.b, b=foo.c
 ----
-update foo
+update abcde [as=foo]
  ├── columns: <none>
  ├── fetch columns: a:8 b:9 c:10 d:11 e:12 rowid:13
  ├── update-mapping:
@@ -231,7 +230,7 @@ update foo
  │    └── b:9 => e:5
  └── project
       ├── columns: column15:15 a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14
-      ├── scan foo
+      ├── scan abcde [as=foo]
       │    ├── columns: a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14
       │    └── computed column expressions
       │         ├── d:11
@@ -250,8 +249,7 @@ update abcde
  ├── fetch columns: a:8 b:9 c:10 d:11 e:12 rowid:13
  ├── update-mapping:
  │    ├── b_new:15 => b:2
- │    ├── column16:16 => d:4
- │    └── a:8 => e:5
+ │    └── column16:16 => d:4
  └── project
       ├── columns: column16:16 a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14 b_new:15!null
       ├── project
@@ -574,7 +572,6 @@ project
       ├── fetch columns: a:8 b:9 c:10 d:11 e:12 rowid:13
       ├── update-mapping:
       │    ├── a_new:15 => a:1
-      │    ├── column16:16 => d:4
       │    └── a_new:15 => e:5
       └── project
            ├── columns: column16:16 a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14 a_new:15!null
@@ -602,12 +599,11 @@ UPDATE abcde AS foo SET a=2 WHERE a=1 RETURNING foo.a+1, foo.b * foo.d
 ----
 project
  ├── columns: "?column?":17!null "?column?":18
- ├── update foo
+ ├── update abcde [as=foo]
  │    ├── columns: a:1!null b:2 c:3 d:4 e:5!null rowid:6!null
  │    ├── fetch columns: a:8 b:9 c:10 d:11 e:12 rowid:13
  │    ├── update-mapping:
  │    │    ├── a_new:15 => a:1
- │    │    ├── column16:16 => d:4
  │    │    └── a_new:15 => e:5
  │    └── project
  │         ├── columns: column16:16 a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14 a_new:15!null
@@ -615,7 +611,7 @@ project
  │         │    ├── columns: a_new:15!null a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14
  │         │    ├── select
  │         │    │    ├── columns: a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14
- │         │    │    ├── scan foo
+ │         │    │    ├── scan abcde [as=foo]
  │         │    │    │    ├── columns: a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14
  │         │    │    │    └── computed column expressions
  │         │    │    │         ├── d:11
@@ -645,7 +641,6 @@ with &1
  │         ├── fetch columns: abcde.a:8 abcde.b:9 abcde.c:10 abcde.d:11 abcde.e:12 rowid:13
  │         ├── update-mapping:
  │         │    ├── a_new:15 => abcde.a:1
- │         │    ├── column16:16 => abcde.d:4
  │         │    └── a_new:15 => abcde.e:5
  │         └── project
  │              ├── columns: column16:16 abcde.a:8!null abcde.b:9 abcde.c:10 abcde.d:11 abcde.e:12 rowid:13!null crdb_internal_mvcc_timestamp:14 a_new:15!null
@@ -692,11 +687,9 @@ UPDATE abcde SET rowid=rowid+1 RETURNING rowid
 project
  ├── columns: rowid:6!null
  └── update abcde
-      ├── columns: a:1!null b:2 c:3 d:4 e:5!null rowid:6!null
+      ├── columns: a:1!null b:2 c:3 d:4 e:5 rowid:6!null
       ├── fetch columns: a:8 b:9 c:10 d:11 e:12 rowid:13
       ├── update-mapping:
-      │    ├── column16:16 => d:4
-      │    ├── a:8 => e:5
       │    └── rowid_new:15 => rowid:6
       └── project
            ├── columns: column16:16 a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14 rowid_new:15!null
@@ -740,8 +733,7 @@ update abcde
  ├── update-mapping:
  │    ├── b_new:15 => b:2
  │    ├── c_new:16 => c:3
- │    ├── column17:17 => d:4
- │    └── a:8 => e:5
+ │    └── column17:17 => d:4
  └── project
       ├── columns: column17:17 a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14 b_new:15 c_new:16!null
       ├── project
@@ -769,7 +761,6 @@ update abcde
  ├── fetch columns: a:8 b:9 c:10 d:11 e:12 rowid:13
  ├── update-mapping:
  │    ├── a_new:15 => a:1
- │    ├── column16:16 => d:4
  │    └── a_new:15 => e:5
  └── project
       ├── columns: column16:16 a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14 a_new:15
@@ -866,8 +857,7 @@ update abcde
  ├── update-mapping:
  │    ├── b_new:15 => b:2
  │    ├── c_new:16 => c:3
- │    ├── column17:17 => d:4
- │    └── a:8 => e:5
+ │    └── column17:17 => d:4
  └── project
       ├── columns: column17:17 a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14 b_new:15 c_new:16!null
       ├── project
@@ -946,7 +936,6 @@ update abcde
  ├── fetch columns: a:8 b:9 c:10 d:11 e:12 rowid:13
  ├── update-mapping:
  │    ├── one:15 => a:1
- │    ├── column16:16 => d:4
  │    └── one:15 => e:5
  └── project
       ├── columns: column16:16 a:8!null b:9 c:10 d:11 e:12 rowid:13!null crdb_internal_mvcc_timestamp:14 one:15
@@ -1178,19 +1167,18 @@ build
 UPDATE abcde AS abcde1 SET b=(SELECT b FROM abcde AS abcde2 WHERE abcde2.rowid=abcde1.a) RETURNING *
 ----
 project
- ├── columns: a:1!null b:2 c:3 d:4 e:5!null
- └── update abcde1
-      ├── columns: abcde1.a:1!null abcde1.b:2 abcde1.c:3 abcde1.d:4 abcde1.e:5!null abcde1.rowid:6!null
+ ├── columns: a:1!null b:2 c:3 d:4 e:5
+ └── update abcde [as=abcde1]
+      ├── columns: abcde1.a:1!null abcde1.b:2 abcde1.c:3 abcde1.d:4 abcde1.e:5 abcde1.rowid:6!null
       ├── fetch columns: abcde1.a:8 abcde1.b:9 abcde1.c:10 abcde1.d:11 abcde1.e:12 abcde1.rowid:13
       ├── update-mapping:
       │    ├── b_new:22 => abcde1.b:2
-      │    ├── column23:23 => abcde1.d:4
-      │    └── abcde1.a:8 => abcde1.e:5
+      │    └── column23:23 => abcde1.d:4
       └── project
            ├── columns: column23:23 abcde1.a:8!null abcde1.b:9 abcde1.c:10 abcde1.d:11 abcde1.e:12 abcde1.rowid:13!null abcde1.crdb_internal_mvcc_timestamp:14 b_new:22
            ├── project
            │    ├── columns: b_new:22 abcde1.a:8!null abcde1.b:9 abcde1.c:10 abcde1.d:11 abcde1.e:12 abcde1.rowid:13!null abcde1.crdb_internal_mvcc_timestamp:14
-           │    ├── scan abcde1
+           │    ├── scan abcde [as=abcde1]
            │    │    ├── columns: abcde1.a:8!null abcde1.b:9 abcde1.c:10 abcde1.d:11 abcde1.e:12 abcde1.rowid:13!null abcde1.crdb_internal_mvcc_timestamp:14
            │    │    └── computed column expressions
            │    │         ├── abcde1.d:11
@@ -1205,7 +1193,7 @@ project
            │                        ├── columns: abcde2.b:16
            │                        └── select
            │                             ├── columns: abcde2.a:15!null abcde2.b:16 abcde2.c:17 abcde2.d:18 abcde2.e:19 abcde2.rowid:20!null abcde2.crdb_internal_mvcc_timestamp:21
-           │                             ├── scan abcde2
+           │                             ├── scan abcde [as=abcde2]
            │                             │    ├── columns: abcde2.a:15!null abcde2.b:16 abcde2.c:17 abcde2.d:18 abcde2.e:19 abcde2.rowid:20!null abcde2.crdb_internal_mvcc_timestamp:21
            │                             │    └── computed column expressions
            │                             │         ├── abcde2.d:18
@@ -1514,9 +1502,8 @@ update checks
  ├── columns: <none>
  ├── fetch columns: a:6 b:7 c:8 d:9
  ├── update-mapping:
- │    ├── a_new:11 => a:1
- │    └── column12:12 => d:4
- ├── check columns: check1:13 check2:14
+ │    └── a_new:11 => a:1
+ ├── check columns: check2:14
  └── project
       ├── columns: check1:13 check2:14!null a:6!null b:7 c:8 d:9 crdb_internal_mvcc_timestamp:10 a_new:11!null column12:12
       ├── project
@@ -1535,7 +1522,7 @@ update checks
       │    └── projections
       │         └── c:8 + 1 [as=column12:12]
       └── projections
-           ├── b:7 < column12:12 [as=check1:13]
+           ├── b:7 < d:9 [as=check1:13]
            └── a_new:11 > 0 [as=check2:14]
 
 # Update one column in constraint, but not the other.
@@ -1546,9 +1533,8 @@ update checks
  ├── columns: <none>
  ├── fetch columns: a:6 b:7 c:8 d:9
  ├── update-mapping:
- │    ├── b_new:11 => b:2
- │    └── column12:12 => d:4
- ├── check columns: check1:13 check2:14
+ │    └── b_new:11 => b:2
+ ├── check columns: check1:13
  └── project
       ├── columns: check1:13 check2:14!null a:6!null b:7 c:8 d:9 crdb_internal_mvcc_timestamp:10 b_new:11!null column12:12
       ├── project
@@ -1567,7 +1553,7 @@ update checks
       │    └── projections
       │         └── c:8 + 1 [as=column12:12]
       └── projections
-           ├── b_new:11 < column12:12 [as=check1:13]
+           ├── b_new:11 < d:9 [as=check1:13]
            └── a:6 > 0 [as=check2:14]
 
 # Update using tuple and subquery.
@@ -1579,8 +1565,7 @@ update checks
  ├── fetch columns: checks.a:6 checks.b:7 checks.c:8 checks.d:9
  ├── update-mapping:
  │    ├── abcde.a:11 => checks.a:1
- │    ├── abcde.b:12 => checks.b:2
- │    └── column18:18 => checks.d:4
+ │    └── abcde.b:12 => checks.b:2
  ├── check columns: check1:19 check2:20
  └── project
       ├── columns: check1:19 check2:20 checks.a:6!null checks.b:7 checks.c:8 checks.d:9 checks.crdb_internal_mvcc_timestamp:10 abcde.a:11 abcde.b:12 column18:18
@@ -1614,7 +1599,7 @@ update checks
       │    └── projections
       │         └── checks.c:8 + 1 [as=column18:18]
       └── projections
-           ├── abcde.b:12 < column18:18 [as=check1:19]
+           ├── abcde.b:12 < checks.d:9 [as=check1:19]
            └── abcde.a:11 > 0 [as=check2:20]
 
 # ------------------------------------------------------------------------------
@@ -1685,31 +1670,28 @@ update partial_indexes
  ├── columns: <none>
  ├── fetch columns: a:5 b:6 c:7
  ├── update-mapping:
- │    └── a_new:13 => a:1
- ├── partial index put columns: partial_index_del1:9 partial_index_put2:14 partial_index_del3:11 partial_index_del4:12
- ├── partial index del columns: partial_index_del1:9 partial_index_del2:10 partial_index_del3:11 partial_index_del4:12
+ │    └── a_new:9 => a:1
+ ├── partial index put columns: partial_index_put1:10 partial_index_put2:11 partial_index_put3:13 partial_index_put4:14
+ ├── partial index del columns: partial_index_put1:10 partial_index_del2:12 partial_index_put3:13 partial_index_put4:14
  └── project
-      ├── columns: partial_index_put2:14 a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8 partial_index_del1:9 partial_index_del2:10 partial_index_del3:11 partial_index_del4:12 a_new:13!null
+      ├── columns: partial_index_put1:10 partial_index_put2:11 partial_index_del2:12 partial_index_put3:13 partial_index_put4:14 a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8 a_new:9!null
       ├── project
-      │    ├── columns: a_new:13!null a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8 partial_index_del1:9 partial_index_del2:10 partial_index_del3:11 partial_index_del4:12
-      │    ├── project
-      │    │    ├── columns: partial_index_del1:9 partial_index_del2:10 partial_index_del3:11 partial_index_del4:12 a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8
-      │    │    ├── scan partial_indexes
-      │    │    │    ├── columns: a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8
-      │    │    │    └── partial index predicates
-      │    │    │         ├── secondary: filters
-      │    │    │         │    └── c:7 = 'foo'
-      │    │    │         └── secondary: filters
-      │    │    │              └── (a:5 > b:6) AND (c:7 = 'bar')
-      │    │    └── projections
-      │    │         ├── c:7 = 'foo' [as=partial_index_del1:9]
-      │    │         ├── (a:5 > b:6) AND (c:7 = 'bar') [as=partial_index_del2:10]
-      │    │         ├── c:7 = 'delete-only' [as=partial_index_del3:11]
-      │    │         └── c:7 = 'write-only' [as=partial_index_del4:12]
+      │    ├── columns: a_new:9!null a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8
+      │    ├── scan partial_indexes
+      │    │    ├── columns: a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8
+      │    │    └── partial index predicates
+      │    │         ├── secondary: filters
+      │    │         │    └── c:7 = 'foo'
+      │    │         └── secondary: filters
+      │    │              └── (a:5 > b:6) AND (c:7 = 'bar')
       │    └── projections
-      │         └── 1 [as=a_new:13]
+      │         └── 1 [as=a_new:9]
       └── projections
-           └── (a_new:13 > b:6) AND (c:7 = 'bar') [as=partial_index_put2:14]
+           ├── c:7 = 'foo' [as=partial_index_put1:10]
+           ├── (a_new:9 > b:6) AND (c:7 = 'bar') [as=partial_index_put2:11]
+           ├── (a:5 > b:6) AND (c:7 = 'bar') [as=partial_index_del2:12]
+           ├── c:7 = 'delete-only' [as=partial_index_put3:13]
+           └── c:7 = 'write-only' [as=partial_index_put4:14]
 
 build
 UPDATE partial_indexes SET a = a + 5 RETURNING *
@@ -1718,31 +1700,28 @@ update partial_indexes
  ├── columns: a:1!null b:2 c:3
  ├── fetch columns: a:5 b:6 c:7
  ├── update-mapping:
- │    └── a_new:13 => a:1
- ├── partial index put columns: partial_index_del1:9 partial_index_put2:14 partial_index_del3:11 partial_index_del4:12
- ├── partial index del columns: partial_index_del1:9 partial_index_del2:10 partial_index_del3:11 partial_index_del4:12
+ │    └── a_new:9 => a:1
+ ├── partial index put columns: partial_index_put1:10 partial_index_put2:11 partial_index_put3:13 partial_index_put4:14
+ ├── partial index del columns: partial_index_put1:10 partial_index_del2:12 partial_index_put3:13 partial_index_put4:14
  └── project
-      ├── columns: partial_index_put2:14 a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8 partial_index_del1:9 partial_index_del2:10 partial_index_del3:11 partial_index_del4:12 a_new:13!null
+      ├── columns: partial_index_put1:10 partial_index_put2:11 partial_index_del2:12 partial_index_put3:13 partial_index_put4:14 a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8 a_new:9!null
       ├── project
-      │    ├── columns: a_new:13!null a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8 partial_index_del1:9 partial_index_del2:10 partial_index_del3:11 partial_index_del4:12
-      │    ├── project
-      │    │    ├── columns: partial_index_del1:9 partial_index_del2:10 partial_index_del3:11 partial_index_del4:12 a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8
-      │    │    ├── scan partial_indexes
-      │    │    │    ├── columns: a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8
-      │    │    │    └── partial index predicates
-      │    │    │         ├── secondary: filters
-      │    │    │         │    └── c:7 = 'foo'
-      │    │    │         └── secondary: filters
-      │    │    │              └── (a:5 > b:6) AND (c:7 = 'bar')
-      │    │    └── projections
-      │    │         ├── c:7 = 'foo' [as=partial_index_del1:9]
-      │    │         ├── (a:5 > b:6) AND (c:7 = 'bar') [as=partial_index_del2:10]
-      │    │         ├── c:7 = 'delete-only' [as=partial_index_del3:11]
-      │    │         └── c:7 = 'write-only' [as=partial_index_del4:12]
+      │    ├── columns: a_new:9!null a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8
+      │    ├── scan partial_indexes
+      │    │    ├── columns: a:5!null b:6 c:7 crdb_internal_mvcc_timestamp:8
+      │    │    └── partial index predicates
+      │    │         ├── secondary: filters
+      │    │         │    └── c:7 = 'foo'
+      │    │         └── secondary: filters
+      │    │              └── (a:5 > b:6) AND (c:7 = 'bar')
       │    └── projections
-      │         └── a:5 + 5 [as=a_new:13]
+      │         └── a:5 + 5 [as=a_new:9]
       └── projections
-           └── (a_new:13 > b:6) AND (c:7 = 'bar') [as=partial_index_put2:14]
+           ├── c:7 = 'foo' [as=partial_index_put1:10]
+           ├── (a_new:9 > b:6) AND (c:7 = 'bar') [as=partial_index_put2:11]
+           ├── (a:5 > b:6) AND (c:7 = 'bar') [as=partial_index_del2:12]
+           ├── c:7 = 'delete-only' [as=partial_index_put3:13]
+           └── c:7 = 'write-only' [as=partial_index_put4:14]
 
 # Do not error with "column reference is ambiguous" when table column names
 # match synthesized column names.
@@ -1761,29 +1740,26 @@ update t
  ├── columns: <none>
  ├── fetch columns: t.partial_index_put1:5 t.partial_index_del1:6 rowid:7
  ├── update-mapping:
- │    ├── partial_index_put1_new:10 => t.partial_index_put1:1
- │    └── partial_index_del1_new:11 => t.partial_index_del1:2
- ├── partial index put columns: partial_index_put1:12
- ├── partial index del columns: partial_index_del1:9
+ │    ├── partial_index_put1_new:9 => t.partial_index_put1:1
+ │    └── partial_index_del1_new:10 => t.partial_index_del1:2
+ ├── partial index put columns: partial_index_put1:11
+ ├── partial index del columns: partial_index_del1:12
  └── project
-      ├── columns: partial_index_put1:12!null t.partial_index_put1:5!null t.partial_index_del1:6!null rowid:7!null crdb_internal_mvcc_timestamp:8 partial_index_del1:9!null partial_index_put1_new:10!null partial_index_del1_new:11!null
+      ├── columns: partial_index_put1:11!null partial_index_del1:12!null t.partial_index_put1:5!null t.partial_index_del1:6!null rowid:7!null crdb_internal_mvcc_timestamp:8 partial_index_put1_new:9!null partial_index_del1_new:10!null
       ├── project
-      │    ├── columns: partial_index_put1_new:10!null partial_index_del1_new:11!null t.partial_index_put1:5!null t.partial_index_del1:6!null rowid:7!null crdb_internal_mvcc_timestamp:8 partial_index_del1:9!null
-      │    ├── project
-      │    │    ├── columns: partial_index_del1:9!null t.partial_index_put1:5!null t.partial_index_del1:6!null rowid:7!null crdb_internal_mvcc_timestamp:8
-      │    │    ├── select
-      │    │    │    ├── columns: t.partial_index_put1:5!null t.partial_index_del1:6!null rowid:7!null crdb_internal_mvcc_timestamp:8
-      │    │    │    ├── scan t
-      │    │    │    │    ├── columns: t.partial_index_put1:5 t.partial_index_del1:6 rowid:7!null crdb_internal_mvcc_timestamp:8
-      │    │    │    │    └── partial index predicates
-      │    │    │    │         └── secondary: filters
-      │    │    │    │              └── (t.partial_index_put1:5 > 0) AND (t.partial_index_del1:6 > 0)
-      │    │    │    └── filters
-      │    │    │         └── (t.partial_index_put1:5 = 10) AND (t.partial_index_del1:6 = 20)
-      │    │    └── projections
-      │    │         └── (t.partial_index_put1:5 > 0) AND (t.partial_index_del1:6 > 0) [as=partial_index_del1:9]
+      │    ├── columns: partial_index_put1_new:9!null partial_index_del1_new:10!null t.partial_index_put1:5!null t.partial_index_del1:6!null rowid:7!null crdb_internal_mvcc_timestamp:8
+      │    ├── select
+      │    │    ├── columns: t.partial_index_put1:5!null t.partial_index_del1:6!null rowid:7!null crdb_internal_mvcc_timestamp:8
+      │    │    ├── scan t
+      │    │    │    ├── columns: t.partial_index_put1:5 t.partial_index_del1:6 rowid:7!null crdb_internal_mvcc_timestamp:8
+      │    │    │    └── partial index predicates
+      │    │    │         └── secondary: filters
+      │    │    │              └── (t.partial_index_put1:5 > 0) AND (t.partial_index_del1:6 > 0)
+      │    │    └── filters
+      │    │         └── (t.partial_index_put1:5 = 10) AND (t.partial_index_del1:6 = 20)
       │    └── projections
-      │         ├── 1 [as=partial_index_put1_new:10]
-      │         └── 2 [as=partial_index_del1_new:11]
+      │         ├── 1 [as=partial_index_put1_new:9]
+      │         └── 2 [as=partial_index_del1_new:10]
       └── projections
-           └── (partial_index_put1_new:10 > 0) AND (partial_index_del1_new:11 > 0) [as=partial_index_put1:12]
+           ├── (partial_index_put1_new:9 > 0) AND (partial_index_del1_new:10 > 0) [as=partial_index_put1:11]
+           └── (t.partial_index_put1:5 > 0) AND (t.partial_index_del1:6 > 0) [as=partial_index_del1:12]

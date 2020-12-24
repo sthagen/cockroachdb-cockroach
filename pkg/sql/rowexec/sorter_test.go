@@ -138,34 +138,6 @@ func TestSorter(t *testing.T) {
 				{v[3], v[3], v[0]},
 			},
 		}, {
-			name: "SortFilterExpr",
-			// No specified input ordering but specified postprocess filter expression.
-			spec: execinfrapb.SorterSpec{
-				OutputOrdering: execinfrapb.ConvertToSpecOrdering(
-					colinfo.ColumnOrdering{
-						{ColIdx: 0, Direction: asc},
-						{ColIdx: 1, Direction: asc},
-						{ColIdx: 2, Direction: asc},
-					}),
-			},
-			post:  execinfrapb.PostProcessSpec{Filter: execinfrapb.Expression{Expr: "@1 + @2 < 7"}},
-			types: rowenc.ThreeIntCols,
-			input: rowenc.EncDatumRows{
-				{v[3], v[3], v[0]},
-				{v[3], v[4], v[1]},
-				{v[1], v[0], v[4]},
-				{v[0], v[0], v[0]},
-				{v[4], v[4], v[4]},
-				{v[4], v[4], v[5]},
-				{v[3], v[2], v[0]},
-			},
-			expected: rowenc.EncDatumRows{
-				{v[0], v[0], v[0]},
-				{v[1], v[0], v[4]},
-				{v[3], v[2], v[0]},
-				{v[3], v[3], v[0]},
-			},
-		}, {
 			name: "SortMatchOrderingNoLimit",
 			// Specified match ordering length but no specified limit.
 			spec: execinfrapb.SorterSpec{
@@ -382,14 +354,33 @@ func TestSortInvalidLimit(t *testing.T) {
 	spec := execinfrapb.SorterSpec{}
 
 	t.Run("KTooLarge", func(t *testing.T) {
+		ctx := context.Background()
+		st := cluster.MakeTestingClusterSettings()
+		evalCtx := tree.MakeTestingEvalContext(st)
+		defer evalCtx.Stop(ctx)
+		diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
+		defer diskMonitor.Stop(ctx)
+		flowCtx := execinfra.FlowCtx{
+			EvalCtx: &evalCtx,
+			Cfg: &execinfra.ServerConfig{
+				Settings:    st,
+				DiskMonitor: diskMonitor,
+			},
+		}
+
 		post := execinfrapb.PostProcessSpec{}
-		post.Limit = math.MaxInt64
-		post.Offset = math.MaxInt64 + 1
-		// All arguments apart from spec and post are not necessary.
-		if _, err := newSorter(
-			context.Background(), nil, 0, &spec, nil, &post, nil,
-		); !testutils.IsError(err, "too large") {
-			t.Fatalf("unexpected error %v, expected k too large", err)
+		post.Limit = math.MaxUint64 - 1000
+		post.Offset = 2000
+		in := distsqlutils.NewRowBuffer([]*types.T{types.Int}, rowenc.EncDatumRows{}, distsqlutils.RowBufferArgs{})
+		out := &distsqlutils.RowBuffer{}
+		proc, err := newSorter(
+			context.Background(), &flowCtx, 0, &spec, in, &post, out,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, sortAll := proc.(*sortAllProcessor); !sortAll {
+			t.Fatalf("expected *sortAllProcessor, got %T", proc)
 		}
 	})
 

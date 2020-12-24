@@ -27,8 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/opentracing/opentracing-go"
 )
 
 // Functions deprecated in release 20.2 that should be removed in release 21.1.
@@ -352,10 +352,10 @@ func (r *Registry) deprecatedResume(
 		}
 		// Bookkeeping.
 		payload := job.Payload()
-		phs, cleanup := r.planFn("resume-"+job.taskName(), payload.Username)
+		execCtx, cleanup := r.execCtx("resume-"+job.taskName(), payload.UsernameProto.Decode())
 		defer cleanup()
 		spanName := fmt.Sprintf(`%s-%d`, payload.Type(), *job.ID())
-		var span opentracing.Span
+		var span *tracing.Span
 		ctx, span = r.ac.AnnotateCtxWithSpan(ctx, spanName)
 		defer span.Finish()
 
@@ -366,17 +366,8 @@ func (r *Registry) deprecatedResume(
 			if job.Payload().FinalResumeError != nil {
 				finalResumeError = errors.DecodeError(ctx, *job.Payload().FinalResumeError)
 			}
-			err = r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, status, finalResumeError)
+			err = r.stepThroughStateMachine(ctx, execCtx, resumer, resultsCh, job, status, finalResumeError)
 			if err != nil {
-				// TODO (lucy): This needs to distinguish between assertion errors in
-				// the job registry and assertion errors in job execution returned from
-				// Resume() or OnFailOrCancel(), and only fail on the former. We have
-				// tests that purposely introduce bad state in order to produce
-				// assertion errors, which shouldn't cause the test to panic. For now,
-				// comment this out.
-				// if errors.HasAssertionFailure(err) {
-				// 	log.ReportOrPanic(ctx, nil, err.Error())
-				// }
 				log.Errorf(ctx, "job %d: adoption completed with error %v", *job.ID(), err)
 			}
 			status, err := job.CurrentStatus(ctx)

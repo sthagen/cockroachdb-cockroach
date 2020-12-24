@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -35,6 +37,14 @@ type alterTypeNode struct {
 var _ planNode = &alterTypeNode{n: nil}
 
 func (p *planner) AlterType(ctx context.Context, n *tree.AlterType) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER TYPE",
+	); err != nil {
+		return nil, err
+	}
+
 	// Resolve the type.
 	desc, err := p.ResolveMutableTypeDescriptor(ctx, n.Type, true /* required */)
 	if err != nil {
@@ -54,6 +64,14 @@ func (p *planner) AlterType(ctx context.Context, n *tree.AlterType) (planNode, e
 			"%q is an implicit array type and cannot be modified",
 			tree.AsStringWithFQNames(n.Type, &p.semaCtx.Annotations),
 		)
+	case descpb.TypeDescriptor_MULTIREGION_ENUM:
+		// Multi-region enums can't be directly modified.
+		return nil, errors.WithHint(
+			pgerror.Newf(
+				pgcode.WrongObjectType,
+				"%q is a multi-region enum and can't be modified using the alter type command",
+				tree.AsStringWithFQNames(n.Type, &p.semaCtx.Annotations)),
+			"try adding/removing the region using ALTER DATABASE")
 	case descpb.TypeDescriptor_ENUM:
 		sqltelemetry.IncrementEnumCounter(sqltelemetry.EnumAlter)
 	}
@@ -66,6 +84,8 @@ func (p *planner) AlterType(ctx context.Context, n *tree.AlterType) (planNode, e
 
 func (n *alterTypeNode) startExec(params runParams) error {
 	telemetry.Inc(n.n.Cmd.TelemetryCounter())
+
+	eventLogDone := false
 	var err error
 	switch t := n.n.Cmd.(type) {
 	case *tree.AlterTypeAddValue:
@@ -73,11 +93,25 @@ func (n *alterTypeNode) startExec(params runParams) error {
 	case *tree.AlterTypeRenameValue:
 		err = params.p.renameTypeValue(params.ctx, n, string(t.OldVal), string(t.NewVal))
 	case *tree.AlterTypeRename:
-		err = params.p.renameType(params.ctx, n, string(t.NewName))
+		if err = params.p.renameType(params.ctx, n, string(t.NewName)); err != nil {
+			return err
+		}
+		err = params.p.logEvent(params.ctx, n.desc.ID, &eventpb.RenameType{
+			// TODO(knz): This name is insufficiently qualified.
+			// See: https://github.com/cockroachdb/cockroach/issues/57734
+			TypeName:    n.desc.Name,
+			NewTypeName: string(t.NewName),
+		})
+		eventLogDone = true
 	case *tree.AlterTypeSetSchema:
+		// TODO(knz): this is missing dedicated logging,
+		// See https://github.com/cockroachdb/cockroach/issues/57741
 		err = params.p.setTypeSchema(params.ctx, n, string(t.Schema))
 	case *tree.AlterTypeOwner:
-		err = params.p.alterTypeOwner(params.ctx, n, string(t.Owner))
+		if err = params.p.alterTypeOwner(params.ctx, n, t.Owner); err != nil {
+			return err
+		}
+		eventLogDone = true // done inside alterTypeOwner().
 	default:
 		err = errors.AssertionFailedf("unknown alter type cmd %s", t)
 	}
@@ -91,19 +125,17 @@ func (n *alterTypeNode) startExec(params runParams) error {
 		return err
 	}
 
-	// Write a log event.
-	return MakeEventLogger(params.p.ExecCfg()).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogAlterType,
-		int32(n.desc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TypeName  string
-			Statement string
-			User      string
-		}{n.desc.Name, tree.AsStringWithFQNames(n.n, params.Ann()), params.p.User()},
-	)
+	if !eventLogDone {
+		// Write a log event.
+		if err := params.p.logEvent(params.ctx,
+			n.desc.ID,
+			&eventpb.AlterType{
+				TypeName: n.desc.Name,
+			}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *planner) addEnumValue(
@@ -297,13 +329,15 @@ func (p *planner) setTypeSchema(ctx context.Context, n *alterTypeNode, schema st
 	)
 }
 
-func (p *planner) alterTypeOwner(ctx context.Context, n *alterTypeNode, newOwner string) error {
+func (p *planner) alterTypeOwner(
+	ctx context.Context, n *alterTypeNode, newOwner security.SQLUsername,
+) error {
 	typeDesc := n.desc
 
 	privs := typeDesc.GetPrivileges()
 
 	// If the owner we want to set to is the current owner, do a no-op.
-	if newOwner == privs.Owner {
+	if newOwner == privs.Owner() {
 		return nil
 	}
 
@@ -330,9 +364,11 @@ func (p *planner) alterTypeOwner(ctx context.Context, n *alterTypeNode, newOwner
 // checkCanAlterTypeAndSetNewOwner handles privilege checking and setting new owner.
 // Called in ALTER TYPE and REASSIGN OWNED BY.
 func (p *planner) checkCanAlterTypeAndSetNewOwner(
-	ctx context.Context, typeDesc *typedesc.Mutable, arrayTypeDesc *typedesc.Mutable, newOwner string,
+	ctx context.Context,
+	typeDesc *typedesc.Mutable,
+	arrayTypeDesc *typedesc.Mutable,
+	newOwner security.SQLUsername,
 ) error {
-
 	if err := p.checkCanAlterToNewOwner(ctx, typeDesc, newOwner); err != nil {
 		return err
 	}
@@ -349,7 +385,24 @@ func (p *planner) checkCanAlterTypeAndSetNewOwner(
 	// Also have to change the owner of the implicit array type.
 	arrayTypeDesc.Privileges.SetOwner(newOwner)
 
-	return nil
+	if err := p.logEvent(ctx,
+		typeDesc.GetID(),
+		&eventpb.AlterTypeOwner{
+			// TODO(knz): This name is insufficiently qualified.
+			// See: https://github.com/cockroachdb/cockroach/issues/57734
+			TypeName: typeDesc.GetName(),
+			Owner:    newOwner.Normalized(),
+		}); err != nil {
+		return err
+	}
+	return p.logEvent(ctx,
+		arrayTypeDesc.GetID(),
+		&eventpb.AlterTypeOwner{
+			// TODO(knz): This name is insufficiently qualified.
+			// See: https://github.com/cockroachdb/cockroach/issues/57734
+			TypeName: arrayTypeDesc.GetName(),
+			Owner:    newOwner.Normalized(),
+		})
 }
 
 func (n *alterTypeNode) Next(params runParams) (bool, error) { return false, nil }

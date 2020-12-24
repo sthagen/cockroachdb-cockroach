@@ -342,7 +342,7 @@ func TestAddSSTableMVCCStats(t *testing.T) {
 				{"e", 1, "e"},
 				{"z", 2, "zzzzzz"},
 			}) {
-				if err := e.Put(kv.Key, kv.Value); err != nil {
+				if err := e.PutMVCC(kv.Key, kv.Value); err != nil {
 					t.Fatalf("%+v", err)
 				}
 			}
@@ -390,9 +390,9 @@ func TestAddSSTableMVCCStats(t *testing.T) {
 			// stats. Make sure recomputing from scratch gets the same answer as
 			// applying the diff to the stats
 			beforeStats := func() enginepb.MVCCStats {
-				iter := e.NewIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
+				iter := e.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
 				defer iter.Close()
-				beforeStats, err := storage.ComputeStatsGo(iter, roachpb.KeyMin, roachpb.KeyMax, 10)
+				beforeStats, err := storage.ComputeStatsForRange(iter, keys.LocalMax, roachpb.KeyMax, 10)
 				if err != nil {
 					t.Fatalf("%+v", err)
 				}
@@ -441,9 +441,9 @@ func TestAddSSTableMVCCStats(t *testing.T) {
 			}
 
 			afterStats := func() enginepb.MVCCStats {
-				iter := e.NewIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
+				iter := e.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
 				defer iter.Close()
-				afterStats, err := storage.ComputeStatsGo(iter, roachpb.KeyMin, roachpb.KeyMax, 10)
+				afterStats, err := storage.ComputeStatsForRange(iter, keys.LocalMax, roachpb.KeyMax, 10)
 				if err != nil {
 					t.Fatalf("%+v", err)
 				}
@@ -499,7 +499,7 @@ func TestAddSSTableDisallowShadowing(t *testing.T) {
 				{"y", 5, "yyy"},
 				{"z", 2, "zz"},
 			}) {
-				if err := e.Put(kv.Key, kv.Value); err != nil {
+				if err := e.PutMVCC(kv.Key, kv.Value); err != nil {
 					t.Fatalf("%+v", err)
 				}
 			}
@@ -526,7 +526,7 @@ func TestAddSSTableDisallowShadowing(t *testing.T) {
 				}
 				defer dataIter.Close()
 
-				stats, err := storage.ComputeStatsGo(dataIter, startKey, endKey, 0)
+				stats, err := storage.ComputeStatsForRange(dataIter, startKey, endKey, 0)
 				if err != nil {
 					t.Fatalf("%+v", err)
 				}
@@ -974,7 +974,7 @@ func TestAddSSTableDisallowShadowing(t *testing.T) {
 				// ingesting the perfectly shadowing KVs (same ts and same value) in the
 				// second SST.
 				for _, kv := range sstKVs {
-					if err := e.Put(kv.Key, kv.Value); err != nil {
+					if err := e.PutMVCC(kv.Key, kv.Value); err != nil {
 						t.Fatalf("%+v", err)
 					}
 				}

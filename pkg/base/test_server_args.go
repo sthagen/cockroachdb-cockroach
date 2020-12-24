@@ -68,7 +68,7 @@ type TestServerArgs struct {
 	// JoinAddr is the address of a node we are joining.
 	//
 	// If left empty and the TestServer is being added to a nonempty cluster, this
-	// will be set to the the address of the cluster's first node.
+	// will be set to the address of the cluster's first node.
 	JoinAddr string
 
 	// StoreSpecs define the stores for this server. If you want more than
@@ -209,9 +209,9 @@ const (
 	// If ReplicationAuto is used, StartTestCluster() blocks until the initial
 	// ranges are fully replicated.
 	ReplicationAuto TestClusterReplicationMode = iota
-	// ReplicationManual means that the split and replication queues of all
-	// servers are stopped, and the test must manually control splitting and
-	// replication through the TestServer.
+	// ReplicationManual means that the split, merge and replication queues of all
+	// servers are stopped, and the test must manually control splitting, merging
+	// and  replication through the TestServer.
 	// Note that the server starts with a number of system ranges,
 	// all with a single replica on node 1.
 	ReplicationManual
@@ -233,4 +233,12 @@ type TestTenantArgs struct {
 	// TenantIDCodecOverride overrides the tenant ID used to construct the SQL
 	// server's codec, but nothing else (e.g. its certs). Used for testing.
 	TenantIDCodecOverride roachpb.TenantID
+
+	// Stopper, if not nil, is used to stop the tenant manually otherwise the
+	// TestServer stopper will be used.
+	Stopper *stop.Stopper
+
+	// DeterministicExplainAnalyze, if set, will result in overriding fields in
+	// EXPLAIN ANALYZE (PLAN) that can vary between runs (like elapsed times).
+	DeterministicExplainAnalyze bool
 }

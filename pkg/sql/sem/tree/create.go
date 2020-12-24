@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -43,8 +44,9 @@ type CreateDatabase struct {
 	Collate         string
 	CType           string
 	ConnectionLimit int32
+	PrimaryRegion   Name
 	Regions         NameList
-	Survive         Survive
+	SurvivalGoal    SurvivalGoal
 }
 
 // Format implements the NodeFormatter interface.
@@ -74,13 +76,17 @@ func (node *CreateDatabase) Format(ctx *FmtCtx) {
 		ctx.WriteString(" CONNECTION LIMIT = ")
 		ctx.WriteString(strconv.Itoa(int(node.ConnectionLimit)))
 	}
+	if node.PrimaryRegion != "" {
+		ctx.WriteString(" PRIMARY REGION ")
+		node.PrimaryRegion.Format(ctx)
+	}
 	if node.Regions != nil {
 		ctx.WriteString(" REGIONS = ")
 		node.Regions.Format(ctx)
 	}
-	if node.Survive != SurviveDefault {
+	if node.SurvivalGoal != SurvivalGoalDefault {
 		ctx.WriteString(" ")
-		node.Survive.Format(ctx)
+		node.SurvivalGoal.Format(ctx)
 	}
 }
 
@@ -303,6 +309,8 @@ type CreateType struct {
 	Variety  CreateTypeVariety
 	// EnumLabels is set when this represents a CREATE TYPE ... AS ENUM statement.
 	EnumLabels EnumValueList
+	// IfNotExists is true if IF NOT EXISTS was requested.
+	IfNotExists bool
 }
 
 var _ Statement = &CreateType{}
@@ -310,6 +318,9 @@ var _ Statement = &CreateType{}
 // Format implements the NodeFormatter interface.
 func (node *CreateType) Format(ctx *FmtCtx) {
 	ctx.WriteString("CREATE TYPE ")
+	if node.IfNotExists {
+		ctx.WriteString("IF NOT EXISTS ")
+	}
 	ctx.FormatNode(node.TypeName)
 	ctx.WriteString(" ")
 	switch node.Variety {
@@ -399,6 +410,7 @@ type ColumnTableDef struct {
 	Computed struct {
 		Computed bool
 		Expr     Expr
+		Virtual  bool
 	}
 	Family struct {
 		Name        Name
@@ -459,15 +471,21 @@ func NewColumnTableDef(
 		switch t := c.Qualification.(type) {
 		case ColumnCollation:
 			locale := string(t)
-			_, err := language.Parse(locale)
-			if err != nil {
-				return nil, pgerror.Wrapf(err, pgcode.Syntax, "invalid locale %s", locale)
+			// In postgres, all strings have collations defaulting to "default".
+			// In CRDB, collated strings are treated separately to string family types.
+			// To most behave like postgres, set the CollatedString type if a non-"default"
+			// collation is used.
+			if locale != DefaultCollationTag {
+				_, err := language.Parse(locale)
+				if err != nil {
+					return nil, pgerror.Wrapf(err, pgcode.Syntax, "invalid locale %s", locale)
+				}
+				collatedTyp, err := processCollationOnType(name, d.Type, t)
+				if err != nil {
+					return nil, err
+				}
+				d.Type = collatedTyp
 			}
-			collatedTyp, err := processCollationOnType(name, d.Type, t)
-			if err != nil {
-				return nil, err
-			}
-			d.Type = collatedTyp
 		case *ColumnDefault:
 			if d.HasDefaultExpr() {
 				return nil, pgerror.Newf(pgcode.Syntax,
@@ -520,6 +538,7 @@ func NewColumnTableDef(
 		case *ColumnComputedDef:
 			d.Computed.Computed = true
 			d.Computed.Expr = t.Expr
+			d.Computed.Virtual = t.Virtual
 		case *ColumnFamilyConstraint:
 			if d.HasColumnFamily() {
 				return nil, pgerror.Newf(pgcode.InvalidTableDefinition,
@@ -548,6 +567,11 @@ func (node *ColumnTableDef) HasFKConstraint() bool {
 // IsComputed returns if the ColumnTableDef is a computed column.
 func (node *ColumnTableDef) IsComputed() bool {
 	return node.Computed.Computed
+}
+
+// IsVirtual returns if the ColumnTableDef is a virtual column.
+func (node *ColumnTableDef) IsVirtual() bool {
+	return node.Computed.Virtual
 }
 
 // HasColumnFamily returns if the ColumnTableDef has a column family.
@@ -632,7 +656,11 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	if node.IsComputed() {
 		ctx.WriteString(" AS (")
 		ctx.FormatNode(node.Computed.Expr)
-		ctx.WriteString(") STORED")
+		if node.Computed.Virtual {
+			ctx.WriteString(") VIRTUAL")
+		} else {
+			ctx.WriteString(") STORED")
+		}
 	}
 	if node.HasColumnFamily() {
 		if node.Family.Create {
@@ -736,7 +764,8 @@ type ColumnFKConstraint struct {
 
 // ColumnComputedDef represents the description of a computed column.
 type ColumnComputedDef struct {
-	Expr Expr
+	Expr    Expr
+	Virtual bool
 }
 
 // ColumnFamilyConstraint represents FAMILY on a column.
@@ -1193,6 +1222,7 @@ type CreateTable struct {
 	// these columns.
 	Defs     TableDefs
 	AsSource *Select
+	Locality *Locality
 }
 
 // As returns true if this table represents a CREATE TABLE ... AS statement,
@@ -1256,6 +1286,10 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 		}
 		// No storage parameters are implemented, so we never list the storage
 		// parameters in the output format.
+		if node.Locality != nil {
+			ctx.WriteString(" ")
+			node.Locality.Format(ctx)
+		}
 	}
 }
 
@@ -1321,8 +1355,10 @@ func (node *CreateTable) HoistConstraints() {
 // CreateSchema represents a CREATE SCHEMA statement.
 type CreateSchema struct {
 	IfNotExists bool
-	Schema      Name
-	AuthRole    string
+	// TODO(solon): Adjust this, see
+	// https://github.com/cockroachdb/cockroach/issues/54696
+	AuthRole security.SQLUsername
+	Schema   ObjectNamePrefix
 }
 
 // Format implements the NodeFormatter interface.
@@ -1333,14 +1369,14 @@ func (node *CreateSchema) Format(ctx *FmtCtx) {
 		ctx.WriteString(" IF NOT EXISTS")
 	}
 
-	if node.Schema != "" {
+	if node.Schema.ExplicitSchema {
 		ctx.WriteString(" ")
 		ctx.FormatNode(&node.Schema)
 	}
 
-	if node.AuthRole != "" {
+	if !node.AuthRole.Undefined() {
 		ctx.WriteString(" AUTHORIZATION ")
-		ctx.WriteString(node.AuthRole)
+		ctx.FormatUsername(node.AuthRole)
 	}
 }
 

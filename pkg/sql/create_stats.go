@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -22,13 +23,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -37,31 +38,25 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
 // createStatsPostEvents controls the cluster setting for logging
 // automatic table statistics collection to the event log.
-var createStatsPostEvents = settings.RegisterPublicBoolSetting(
+var createStatsPostEvents = settings.RegisterBoolSetting(
 	"sql.stats.post_events.enabled",
 	"if set, an event is logged for every CREATE STATISTICS job",
 	false,
-)
+).WithPublic()
 
-func (p *planner) CreateStatistics(ctx context.Context, n *tree.CreateStats) (planNode, error) {
-	return &createStatsNode{
-		CreateStats: *n,
-		p:           p,
-	}, nil
-}
-
-// Analyze is syntactic sugar for CreateStatistics.
-func (p *planner) Analyze(ctx context.Context, n *tree.Analyze) (planNode, error) {
-	return &createStatsNode{
-		CreateStats: tree.CreateStats{Table: n.Table},
-		p:           p,
-	}, nil
-}
+// featureStatsEnabled is used to enable and disable the CREATE STATISTICS and
+// ANALYZE features.
+var featureStatsEnabled = settings.RegisterBoolSetting(
+	"feature.stats.enabled",
+	"set to true to enable CREATE STATISTICS/ANALYZE, false to disable; default is true",
+	featureflag.FeatureFlagEnabledDefault,
+).WithPublic()
 
 const defaultHistogramBuckets = 200
 const nonIndexColHistogramBuckets = 2
@@ -73,6 +68,13 @@ const nonIndexColHistogramBuckets = 2
 type createStatsNode struct {
 	tree.CreateStats
 	p *planner
+
+	// runAsJob is true by default, and causes the code below to be executed,
+	// which sets up a job and waits for it.
+	//
+	// If it is false, the flow for create statistics is planned directly; this
+	// is used when the statement is under EXPLAIN or EXPLAIN ANALYZE.
+	runAsJob bool
 
 	run createStatsRun
 }
@@ -249,6 +251,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 
 	// Create a job to run statistics creation.
 	statement := tree.AsStringWithFQNames(n, n.p.EvalContext().Annotations)
+	eventLogStatement := statement
 	var description string
 	if n.Name == stats.AutoStatsName {
 		// Use a user-friendly description for automatic statistics.
@@ -268,7 +271,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 			FQTableName:     fqTableName,
 			Table:           tableDesc.TableDescriptor,
 			ColumnStats:     colStats,
-			Statement:       n.String(),
+			Statement:       eventLogStatement,
 			AsOf:            asOf,
 			MaxFractionIdle: n.Options.Throttling,
 		},
@@ -300,7 +303,7 @@ const maxNonIndexCols = 100
 func createStatsDefaultColumns(
 	desc *tabledesc.Immutable, multiColEnabled bool,
 ) ([]jobspb.CreateStatsDetails_ColStat, error) {
-	colStats := make([]jobspb.CreateStatsDetails_ColStat, 0, len(desc.Indexes)+1)
+	colStats := make([]jobspb.CreateStatsDetails_ColStat, 0, len(desc.GetPublicNonPrimaryIndexes())+1)
 
 	requestedStats := make(map[string]struct{})
 
@@ -347,16 +350,16 @@ func createStatsDefaultColumns(
 	}
 
 	// Add column stats for the primary key.
-	for i := range desc.PrimaryIndex.ColumnIDs {
+	for i := range desc.GetPrimaryIndex().ColumnIDs {
 		// Generate stats for each column in the primary key.
-		addIndexColumnStatsIfNotExists(desc.PrimaryIndex.ColumnIDs[i], false /* isInverted */)
+		addIndexColumnStatsIfNotExists(desc.GetPrimaryIndex().ColumnIDs[i], false /* isInverted */)
 
 		// Only collect multi-column stats if enabled.
 		if i == 0 || !multiColEnabled {
 			continue
 		}
 
-		colIDs := desc.PrimaryIndex.ColumnIDs[: i+1 : i+1]
+		colIDs := desc.GetPrimaryIndex().ColumnIDs[: i+1 : i+1]
 
 		// Remember the requested stats so we don't request duplicates.
 		trackStatsIfNotExists(colIDs)
@@ -369,19 +372,19 @@ func createStatsDefaultColumns(
 	}
 
 	// Add column stats for each secondary index.
-	for i := range desc.Indexes {
-		isInverted := desc.Indexes[i].Type == descpb.IndexDescriptor_INVERTED
+	for i := range desc.GetPublicNonPrimaryIndexes() {
+		isInverted := desc.GetPublicNonPrimaryIndexes()[i].Type == descpb.IndexDescriptor_INVERTED
 
-		for j := range desc.Indexes[i].ColumnIDs {
+		for j := range desc.GetPublicNonPrimaryIndexes()[i].ColumnIDs {
 			// Generate stats for each indexed column.
-			addIndexColumnStatsIfNotExists(desc.Indexes[i].ColumnIDs[j], isInverted)
+			addIndexColumnStatsIfNotExists(desc.GetPublicNonPrimaryIndexes()[i].ColumnIDs[j], isInverted)
 
 			// Only collect multi-column stats if enabled.
 			if j == 0 || !multiColEnabled {
 				continue
 			}
 
-			colIDs := desc.Indexes[i].ColumnIDs[: j+1 : j+1]
+			colIDs := desc.GetPublicNonPrimaryIndexes()[i].ColumnIDs[: j+1 : j+1]
 
 			// Check for existing stats and remember the requested stats.
 			if !trackStatsIfNotExists(colIDs) {
@@ -396,8 +399,8 @@ func createStatsDefaultColumns(
 		}
 
 		// Add columns referenced in partial index predicate expressions.
-		if desc.Indexes[i].IsPartial() {
-			expr, err := parser.ParseExpr(desc.Indexes[i].Predicate)
+		if desc.GetPublicNonPrimaryIndexes()[i].IsPartial() {
+			expr, err := parser.ParseExpr(desc.GetPublicNonPrimaryIndexes()[i].Predicate)
 			if err != nil {
 				return nil, err
 			}
@@ -454,20 +457,6 @@ func makeColStatKey(cols []descpb.ColumnID) string {
 	return colSet.String()
 }
 
-// newPlanForExplainDistSQL is part of the distSQLExplainable interface.
-func (n *createStatsNode) newPlanForExplainDistSQL(
-	planCtx *PlanningCtx, distSQLPlanner *DistSQLPlanner,
-) (*PhysicalPlan, error) {
-	// Create a job record but don't actually start the job.
-	record, err := n.makeJobRecord(planCtx.ctx)
-	if err != nil {
-		return nil, err
-	}
-	job := n.p.ExecCfg().JobRegistry.NewJob(*record)
-
-	return distSQLPlanner.createPlanForCreateStats(planCtx, job)
-}
-
 // createStatsResumer implements the jobs.Resumer interface for CreateStats
 // jobs. A new instance is created for each job.
 type createStatsResumer struct {
@@ -479,9 +468,9 @@ var _ jobs.Resumer = &createStatsResumer{}
 
 // Resume is part of the jobs.Resumer interface.
 func (r *createStatsResumer) Resume(
-	ctx context.Context, phs interface{}, resultsCh chan<- tree.Datums,
+	ctx context.Context, execCtx interface{}, resultsCh chan<- tree.Datums,
 ) error {
-	p := phs.(*planner)
+	p := execCtx.(JobExecContext)
 	details := r.job.Details().(jobspb.CreateStatsDetails)
 	if details.Name == stats.AutoStatsName {
 		// We want to make sure there is only one automatic CREATE STATISTICS job
@@ -509,12 +498,12 @@ func (r *createStatsResumer) Resume(
 		evalCtx.Txn = txn
 
 		if details.AsOf != nil {
-			p.semaCtx.AsOfTimestamp = details.AsOf
-			p.extendedEvalCtx.SetTxnTimestamp(details.AsOf.GoTime())
+			p.SemaCtx().AsOfTimestamp = details.AsOf
+			p.ExtendedEvalContext().SetTxnTimestamp(details.AsOf.GoTime())
 			txn.SetFixedTimestamp(ctx, *details.AsOf)
 		}
 
-		planCtx := dsp.NewPlanningCtx(ctx, evalCtx, p, txn, true /* distribute */)
+		planCtx := dsp.NewPlanningCtx(ctx, evalCtx, nil /* planner */, txn, true /* distribute */)
 		if err := dsp.planAndRunCreateStats(
 			ctx, evalCtx, planCtx, txn, r.job, NewRowResultWriter(rows),
 		); err != nil {
@@ -562,19 +551,19 @@ func (r *createStatsResumer) Resume(
 	// because that transaction must be read-only. In the future we may want
 	// to use the transaction that inserted the new stats into the
 	// system.table_statistics table, but that would require calling
-	// MakeEventLogger from the distsqlrun package.
+	// logEvent() from the distsqlrun package.
+	//
+	// TODO(knz): figure out why this is not triggered for a regular
+	// CREATE STATISTICS statement.
+	// See: https://github.com/cockroachdb/cockroach/issues/57739
 	return evalCtx.ExecCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		return MakeEventLogger(evalCtx.ExecCfg).InsertEventRecord(
-			ctx,
-			txn,
-			EventLogCreateStatistics,
-			int32(details.Table.ID),
-			int32(evalCtx.NodeID.SQLInstanceID()),
-			struct {
-				TableName string
-				Statement string
-			}{details.FQTableName, details.Statement},
-		)
+		return logEventInternalForSQLStatements(ctx, evalCtx.ExecCfg, txn,
+			details.Table.ID,
+			evalCtx.SessionData.User(),
+			details.Statement,
+			&eventpb.CreateStatistics{
+				TableName: details.FQTableName,
+			})
 	})
 }
 
@@ -582,7 +571,7 @@ func (r *createStatsResumer) Resume(
 // pending, running, or paused status that started earlier than this one. If
 // there are, checkRunningJobs returns an error. If job is nil, checkRunningJobs
 // just checks if there are any pending, running, or paused CreateStats jobs.
-func checkRunningJobs(ctx context.Context, job *jobs.Job, p *planner) error {
+func checkRunningJobs(ctx context.Context, job *jobs.Job, p JobExecContext) error {
 	var jobID int64
 	if job != nil {
 		jobID = *job.ID()

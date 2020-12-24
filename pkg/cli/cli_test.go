@@ -159,7 +159,7 @@ func newCLITest(params cliTestParams) cliTest {
 		log.Infof(context.Background(), "SQL listener at %s", c.ServingSQLAddr())
 	}
 
-	baseCfg.User = security.NodeUser
+	baseCfg.User = security.NodeUserName()
 
 	// Ensure that CLI error messages and anything meant for the
 	// original stderr is redirected to stdout, where it can be
@@ -419,6 +419,9 @@ func Example_demo() {
 	c := newCLITest(cliTestParams{noServer: true})
 	defer c.cleanup()
 
+	defer func(b bool) { testingForceRandomizeDemoPorts = b }(testingForceRandomizeDemoPorts)
+	testingForceRandomizeDemoPorts = true
+
 	testData := [][]string{
 		{`demo`, `-e`, `show database`},
 		{`demo`, `-e`, `show database`, `--empty`},
@@ -427,8 +430,8 @@ func Example_demo() {
 		{`demo`, `-e`, `select 1 as "1"`, `-e`, `select 3 as "3"`},
 		{`demo`, `--echo-sql`, `-e`, `select 1 as "1"`},
 		{`demo`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`},
-		{`demo`, `startrek`, `-e`, `show databases`},
-		{`demo`, `startrek`, `-e`, `show databases`, `--format=table`},
+		{`demo`, `startrek`, `-e`, `SELECT database_name, owner FROM [show databases]`},
+		{`demo`, `startrek`, `-e`, `SELECT database_name, owner FROM [show databases]`, `--format=table`},
 		// Test that if we start with --insecure we cannot perform
 		// commands that require a secure cluster.
 		{`demo`, `-e`, `CREATE USER test WITH PASSWORD 'testpass'`},
@@ -477,13 +480,13 @@ func Example_demo() {
 	// SQLSTATE: 42703
 	// 123
 	// 123
-	// demo startrek -e show databases
+	// demo startrek -e SELECT database_name, owner FROM [show databases]
 	// database_name	owner
 	// defaultdb	root
 	// postgres	root
 	// startrek	demo
 	// system	node
-	// demo startrek -e show databases --format=table
+	// demo startrek -e SELECT database_name, owner FROM [show databases] --format=table
 	//   database_name | owner
 	// ----------------+--------
 	//   defaultdb     | root
@@ -509,7 +512,7 @@ func Example_sql() {
 	c.RunWithArgs([]string{`sql`, `-e`, `select 3 as "3"`, `-e`, `select * from t.f`})
 	c.RunWithArgs([]string{`sql`, `-e`, `begin`, `-e`, `select 3 as "3"`, `-e`, `commit`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select * from t.f`})
-	c.RunWithArgs([]string{`sql`, `--execute=show databases`})
+	c.RunWithArgs([]string{`sql`, `--execute=SELECT database_name, owner FROM [show databases]`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "2"`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "@" where false`})
 	// CREATE TABLE AS returns a SELECT tag with a row count, check this.
@@ -527,8 +530,12 @@ func Example_sql() {
 	c.RunWithArgs([]string{`sql`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`})
 	c.RunWithArgs([]string{`sql`, `--set`, `echo=true`, `-e`, `select 123 as "123"`})
 	c.RunWithArgs([]string{`sql`, `--set`, `unknownoption`, `-e`, `select 123 as "123"`})
-	// Check that partial results + error get reported together.
-	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(@1-3) from generate_series(1,4)`})
+	// Check that partial results + error get reported together. The query will
+	// run via the vectorized execution engine which operates on the batches of
+	// growing capacity starting at 1 (the batch sizes will be 1, 2, 4, ...),
+	// and with the query below the division by zero error will occur after the
+	// first batch consisting of 1 row has been returned to the client.
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(@1-2) from generate_series(1,3)`})
 
 	// Output:
 	// sql -e show application_name
@@ -549,7 +556,7 @@ func Example_sql() {
 	// sql -e select * from t.f
 	// x	y
 	// 42	69
-	// sql --execute=show databases
+	// sql --execute=SELECT database_name, owner FROM [show databases]
 	// database_name	owner
 	// defaultdb	root
 	// postgres	root
@@ -586,9 +593,8 @@ func Example_sql() {
 	// sql --set unknownoption -e select 123 as "123"
 	// invalid syntax: \set unknownoption. Try \? for help.
 	// ERROR: invalid syntax
-	// sql -e select 1/(@1-3) from generate_series(1,4)
+	// sql -e select 1/(@1-2) from generate_series(1,3)
 	// ?column?
-	// -0.5
 	// -1
 	// (error encountered after some results were delivered)
 	// ERROR: division by zero
@@ -1365,16 +1371,18 @@ func Example_misc_table() {
 	//     hai
 	// (1 row)
 	// sql --format=table -e explain select s, 'foo' from t.t
-	//     tree    |     field     | description
-	// ------------+---------------+--------------
-	//             | distribution  | full
-	//             | vectorized    | false
-	//   render    |               |
-	//    └── scan |               |
-	//             | missing stats |
-	//             | table         | t@primary
-	//             | spans         | FULL SCAN
-	// (7 rows)
+	//            info
+	// --------------------------
+	//   distribution: full
+	//   vectorized: true
+	//
+	//   • render
+	//   │
+	//   └── • scan
+	//         missing stats
+	//         table: t@primary
+	//         spans: FULL SCAN
+	// (9 rows)
 }
 
 func Example_cert() {
@@ -1391,8 +1399,7 @@ func Example_cert() {
 	// cert create-client Ομηρος
 	// cert create-client 0foo
 	// cert create-client ,foo
-	// ERROR: failed to generate client certificate and key: username ",foo" invalid
-	// SQLSTATE: 42602
+	// ERROR: failed to generate client certificate and key: username is invalid
 	// HINT: Usernames are case insensitive, must start with a letter, digit or underscore, may contain letters, digits, dashes, periods, or underscores, and must not exceed 63 characters.
 }
 
@@ -1417,6 +1424,7 @@ Available Commands:
 
   nodelocal         upload and delete nodelocal files
   userfile          upload, list and delete user scoped files
+  import            import a db or table from a local PGDUMP or MYSQLDUMP file
   demo              open a demo sql shell
   gen               generate auxiliary files
   version           output version information
@@ -1427,9 +1435,10 @@ Available Commands:
   help              Help about any command
 
 Flags:
-  -h, --help                             help for cockroach
-      --logtostderr Severity[=DEFAULT]   logs at or above this threshold go to stderr (default NONE)
-      --no-color                         disable standard error log colorization
+  -h, --help                 help for cockroach
+      --log <string>         
+                                     Logging configuration. See the documentation for details.
+                                    
 
 Use "cockroach [command] --help" for more information about a command.
 `
@@ -2035,21 +2044,6 @@ func Example_sqlfmt() {
 	// SELECT 1 + 2 + 3
 	// sqlfmt --no-simplify -e select (1+2)+3
 	// SELECT (1 + 2) + 3
-}
-
-func Example_dump_no_visible_columns() {
-	c := newCLITest(cliTestParams{})
-	defer c.cleanup()
-
-	c.RunWithArgs([]string{"sql", "-e", "create table t(x int); set sql_safe_updates=false; alter table t drop x"})
-	c.RunWithArgs([]string{"dump", "defaultdb"})
-
-	// Output:
-	// sql -e create table t(x int); set sql_safe_updates=false; alter table t drop x
-	// ALTER TABLE
-	// dump defaultdb
-	// CREATE TABLE public.t (FAMILY "primary" (rowid)
-	// );
 }
 
 // Example_read_from_file tests the -f parameter.

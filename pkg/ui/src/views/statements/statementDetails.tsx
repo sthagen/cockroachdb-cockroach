@@ -32,7 +32,7 @@ import { FixLong } from "src/util/fixLong";
 import {Bytes, Duration} from "src/util/format";
 import { intersperse } from "src/util/intersperse";
 import { Pick } from "src/util/pick";
-import Loading from "src/views/shared/components/loading";
+import { Loading } from "@cockroachlabs/admin-ui-components";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import SqlBox from "src/views/shared/components/sql/box";
 import { formatNumberForDisplay } from "src/views/shared/components/summaryBar";
@@ -224,7 +224,13 @@ export class StatementDetails extends React.Component<StatementDetailsProps, Sta
     this.props.refreshStatementDiagnosticsRequests();
   }
 
-  prevPage = () => this.props.history.goBack();
+  backToStatementsPage = () => {
+    const { history, location } = this.props;
+    history.push({
+      ...location,
+      pathname: "/statements",
+    });
+  }
 
   onTabChange = (tabId: string) => {
     const { history } = this.props;
@@ -247,7 +253,7 @@ export class StatementDetails extends React.Component<StatementDetailsProps, Sta
         <Helmet title={`Details | ${(app ? `${app} App |` : "")} Statements`} />
         <div className={cx("section", "page--header")}>
           <Button
-            onClick={this.prevPage}
+            onClick={this.backToStatementsPage}
             type="unstyled-link"
             size="small"
             icon={<ArrowLeft fontSize={"10px"} />}
@@ -500,7 +506,17 @@ export class StatementDetails extends React.Component<StatementDetailsProps, Sta
                 { name: "Disk Bytes Read", value: stats.bytes_read, bar: genericBarChart(stats.bytes_read, stats.count, Bytes),
                   format: Bytes,
                 },
-              ].filter(r => r.value)}
+                {
+                  name: "Network Bytes Sent", value: stats.bytes_sent_over_network, bar: genericBarChart(stats.bytes_sent_over_network, stats.count, Bytes),
+                  format: Bytes,
+                },
+              ].filter(function (r) {
+                if (r.name === "Network Bytes Sent" && r.value && r.value.mean === 0) {
+                  // Omit if empty.
+                  return false;
+                }
+                return r.value;
+              })}
             />
           </SummaryCard>
           <SummaryCard>

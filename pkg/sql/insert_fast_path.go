@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -90,7 +91,7 @@ type insertFastPathFKCheck struct {
 	tabDesc     *tabledesc.Immutable
 	idxDesc     *descpb.IndexDescriptor
 	keyPrefix   []byte
-	colMap      map[descpb.ColumnID]int
+	colMap      catalog.TableColMap
 	spanBuilder *span.Builder
 }
 
@@ -101,14 +102,13 @@ func (c *insertFastPathFKCheck) init(params runParams) error {
 
 	codec := params.ExecCfg().Codec
 	c.keyPrefix = rowenc.MakeIndexKeyPrefix(codec, c.tabDesc, c.idxDesc.ID)
-	c.spanBuilder = span.MakeBuilder(codec, c.tabDesc, c.idxDesc)
+	c.spanBuilder = span.MakeBuilder(params.EvalContext(), codec, c.tabDesc, c.idxDesc)
 
 	if len(c.InsertCols) > idx.numLaxKeyCols {
 		return errors.AssertionFailedf(
 			"%d FK cols, only %d cols in index", len(c.InsertCols), idx.numLaxKeyCols,
 		)
 	}
-	c.colMap = make(map[descpb.ColumnID]int, len(c.InsertCols))
 	for i, ord := range c.InsertCols {
 		var colID descpb.ColumnID
 		if i < len(c.idxDesc.ColumnIDs) {
@@ -117,7 +117,7 @@ func (c *insertFastPathFKCheck) init(params runParams) error {
 			colID = c.idxDesc.ExtraColumnIDs[i-len(c.idxDesc.ColumnIDs)]
 		}
 
-		c.colMap[colID] = int(ord)
+		c.colMap.Set(colID, int(ord))
 	}
 	return nil
 }

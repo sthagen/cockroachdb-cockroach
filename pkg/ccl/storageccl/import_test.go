@@ -102,15 +102,24 @@ func slurpSSTablesLatestKey(
 			v := roachpb.Value{RawBytes: newKv.Value}
 			v.ClearChecksum()
 			v.InitChecksum(newKv.Key.Key)
-			if err := batch.Put(newKv.Key, v.RawBytes); err != nil {
-				t.Fatal(err)
+			// TODO(sumeer): this will not be correct with the separated
+			// lock table. We should iterate using EngineKey on the sst,
+			// and expose a PutEngine method to write directly.
+			if newKv.Key.Timestamp.IsEmpty() {
+				if err := batch.PutUnversioned(newKv.Key.Key, v.RawBytes); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := batch.PutMVCC(newKv.Key, v.RawBytes); err != nil {
+					t.Fatal(err)
+				}
 			}
 			sst.Next()
 		}
 	}
 
 	var kvs []storage.MVCCKeyValue
-	it := batch.NewIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
+	it := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
 	defer it.Close()
 	for it.SeekGE(start); ; it.NextKey() {
 		if ok, err := it.Valid(); err != nil {
@@ -234,7 +243,7 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 	defer s.Stopper().Stop(ctx)
 	init(s.ClusterSettings())
 
-	storage, err := cloudimpl.ExternalStorageConfFromURI("nodelocal://0/foo", security.RootUser)
+	storage, err := cloudimpl.ExternalStorageConfFromURI("nodelocal://0/foo", security.RootUserName())
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -288,10 +297,10 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 	} {
 		t.Run(fmt.Sprintf("%d-%v", i, testCase), func(t *testing.T) {
 			newID := descpb.ID(100 + i)
-			kr := prefixRewriter{{
+			kr := prefixRewriter{rewrites: []prefixRewrite{{
 				OldPrefix: srcPrefix,
 				NewPrefix: makeKeyRewriterPrefixIgnoringInterleaved(newID, indexID),
-			}}
+			}}}
 			rekeys := []roachpb.ImportRequest_TableRekey{
 				{
 					OldID: oldID,

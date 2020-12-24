@@ -244,6 +244,16 @@ func (is InvertedSpans) Swap(i, j int) {
 	is[i], is[j] = is[j], is[i]
 }
 
+// Start implements the span.KeyableInvertedSpans interface.
+func (is InvertedSpans) Start(i int) []byte {
+	return is[i].Start
+}
+
+// End implements the span.KeyableInvertedSpans interface.
+func (is InvertedSpans) End(i int) []byte {
+	return is[i].End
+}
+
 // InvertedExpression is the interface representing an expression or sub-expression
 // to be evaluated on the inverted index. Any implementation can be used in the
 // builder functions And() and Or(), but in practice there are two useful
@@ -350,6 +360,12 @@ type SpanExpression struct {
 	// Tight mirrors the definition of IsTight().
 	Tight bool
 
+	// Unique is true if the spans are guaranteed not to produce duplicate
+	// primary keys. Otherwise, Unique is false. Unique may be true for certain
+	// JSON or Array SpanExpressions, but it does not hold when these
+	// SpanExpressions are combined with And or Or.
+	Unique bool
+
 	// SpansToRead are the spans to read from the inverted index
 	// to evaluate this SpanExpression. These are non-overlapping
 	// and sorted. If left or right contains a non-SpanExpression,
@@ -410,6 +426,7 @@ func (s *SpanExpression) SetNotTight() {
 func (s *SpanExpression) Copy() InvertedExpression {
 	res := &SpanExpression{
 		Tight:              s.Tight,
+		Unique:             s.Unique,
 		SpansToRead:        s.SpansToRead,
 		FactoredUnionSpans: s.FactoredUnionSpans,
 		Operator:           s.Operator,
@@ -432,7 +449,7 @@ func (s *SpanExpression) String() string {
 
 // Format pretty-prints the SpanExpression.
 func (s *SpanExpression) Format(tp treeprinter.Node, includeSpansToRead bool) {
-	tp.Childf("tight: %t", s.Tight)
+	tp.Childf("tight: %t, unique: %t", s.Tight, s.Unique)
 	if includeSpansToRead {
 		s.SpansToRead.Format(tp, "to read")
 	}
@@ -513,6 +530,24 @@ func (n NonInvertedColExpression) SetNotTight() {}
 // Copy implements the InvertedExpression interface.
 func (n NonInvertedColExpression) Copy() InvertedExpression {
 	return NonInvertedColExpression{}
+}
+
+// SpanExpressionProtoSpans is a slice of SpanExpressionProto_Span.
+type SpanExpressionProtoSpans []SpanExpressionProto_Span
+
+// Len implements the span.KeyableInvertedSpans interface.
+func (s SpanExpressionProtoSpans) Len() int {
+	return len(s)
+}
+
+// Start implements the span.KeyableInvertedSpans interface.
+func (s SpanExpressionProtoSpans) Start(i int) []byte {
+	return s[i].Start
+}
+
+// End implements the span.KeyableInvertedSpans interface.
+func (s SpanExpressionProtoSpans) End(i int) []byte {
+	return s[i].End
 }
 
 // ExprForInvertedSpan constructs a leaf-level SpanExpression

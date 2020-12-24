@@ -1,0 +1,26 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "jobspb",
+    srcs = [
+        "jobs.pb.go",
+        "schedule.pb.go",
+        "wrap.go",
+    ],
+    importpath = "github.com/cockroachdb/cockroach/pkg/jobs/jobspb",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/roachpb",
+        "//pkg/security",
+        "//pkg/sql/catalog/descpb",
+        "//pkg/sql/sem/tree",
+        "//pkg/sql/stats",
+        "//pkg/util/hlc",
+        "//pkg/util/uuid",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_errors//errorspb",
+        "@com_github_gogo_protobuf//proto",
+        "@com_github_gogo_protobuf//sortkeys",
+        "@com_github_gogo_protobuf//types",
+    ],
+)

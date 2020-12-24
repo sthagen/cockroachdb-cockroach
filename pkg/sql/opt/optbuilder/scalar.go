@@ -91,7 +91,7 @@ func (b *Builder) buildScalar(
 			// Note that normalization rules will trim down the list of grouping
 			// columns based on FDs, so this is only for the purposes of building a
 			// valid operator.
-			aggInCol := b.addColumn(g.aggInScope, "" /* alias */, t)
+			aggInCol := g.aggInScope.addColumn("" /* alias */, t)
 			b.finishBuildScalarRef(t, inScope, g.aggInScope, aggInCol, nil)
 			g.groupStrs[symbolicExprStr(t)] = aggInCol
 
@@ -522,7 +522,7 @@ func (b *Builder) buildFunction(
 		}
 		if name != nil {
 			tn := tree.MakeUnqualifiedTableName(tree.Name(*name))
-			ds, _ := b.resolveDataSource(&tn, privilege.SELECT)
+			ds, _, _ := b.resolveDataSource(&tn, privilege.SELECT)
 
 			b.viewDeps = append(b.viewDeps, opt.ViewDep{
 				DataSource: ds,

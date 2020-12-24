@@ -23,17 +23,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/logtags"
-	"github.com/opentracing/opentracing-go"
 	"github.com/stretchr/testify/require"
 )
 
 func TestTrace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderRace(t, "does too much work under race, see: "+
+		"https://github.com/cockroachdb/cockroach/pull/56343#issuecomment-733577377")
+
 	defer log.Scope(t).Close(t)
 
 	// These are always appended, even without the test specifying it.
@@ -107,7 +110,7 @@ func TestTrace(t *testing.T) {
 				// stat value is 0.
 				rows, err := sqlDB.Query(
 					"SELECT count(message) FROM crdb_internal.session_trace " +
-						"WHERE message LIKE '%cockroach.stat.tablereader.input.rows: 0%'",
+						"WHERE message LIKE '%cockroach.stat.kv.tuples.read: 0%'",
 				)
 				if err != nil {
 					t.Fatal(err)
@@ -588,9 +591,9 @@ func TestTraceDistSQL(t *testing.T) {
 			UseDatabase: "test",
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &sql.ExecutorTestingKnobs{
-					WithStatementTrace: func(sp opentracing.Span, stmt string) {
+					WithStatementTrace: func(trace tracing.Recording, stmt string) {
 						if stmt == countStmt {
-							recCh <- tracing.GetRecording(sp)
+							recCh <- trace
 						}
 					},
 				},
@@ -600,6 +603,10 @@ func TestTraceDistSQL(t *testing.T) {
 	defer cluster.Stopper().Stop(ctx)
 
 	r := sqlutils.MakeSQLRunner(cluster.ServerConn(0))
+	// TODO(yuzefovich): tracing in the vectorized engine is very limited since
+	// only wrapped processors and the materializers use it outside of the
+	// stats information propagation. We should fix that (#55821).
+	r.Exec(t, "SET vectorize=off")
 	r.Exec(t, "CREATE DATABASE test")
 	r.Exec(t, "CREATE TABLE test.a (a INT PRIMARY KEY)")
 	// Put the table on the 2nd node so that the flow is planned on the 2nd node

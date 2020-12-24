@@ -13,7 +13,6 @@ package sql
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -25,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -58,15 +58,24 @@ func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
 		return nil, err
 	}
 
+	// TODO(solon): there are SQL identifiers (tree.Name) in n.Grantees,
+	// but we want SQL usernames. Do we normalize or not? For reference,
+	// REASSIGN / OWNER TO do normalize.
+	// Related: https://github.com/cockroachdb/cockroach/issues/54696
+	grantees := make([]security.SQLUsername, len(n.Grantees))
+	for i, grantee := range n.Grantees {
+		grantees[i] = security.MakeSQLUsernameFromPreNormalizedString(string(grantee))
+	}
+
 	return &changePrivilegesNode{
+		isGrant:      true,
 		targets:      n.Targets,
-		grantees:     n.Grantees,
+		grantees:     grantees,
 		desiredprivs: n.Privileges,
-		changePrivilege: func(privDesc *descpb.PrivilegeDescriptor, grantee string) {
+		changePrivilege: func(privDesc *descpb.PrivilegeDescriptor, grantee security.SQLUsername) {
 			privDesc.Grant(grantee, n.Privileges)
 		},
-		grantOn:      grantOn,
-		eventLogType: EventLogGrantPrivilege,
+		grantOn: grantOn,
 	}, nil
 }
 
@@ -100,25 +109,34 @@ func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) 
 		return nil, err
 	}
 
+	// TODO(solon): there are SQL identifiers (tree.Name) in n.Grantees,
+	// but we want SQL usernames. Do we normalize or not? For reference,
+	// REASSIGN / OWNER TO do normalize.
+	// Related: https://github.com/cockroachdb/cockroach/issues/54696
+	grantees := make([]security.SQLUsername, len(n.Grantees))
+	for i, grantee := range n.Grantees {
+		grantees[i] = security.MakeSQLUsernameFromPreNormalizedString(string(grantee))
+	}
+
 	return &changePrivilegesNode{
+		isGrant:      false,
 		targets:      n.Targets,
-		grantees:     n.Grantees,
+		grantees:     grantees,
 		desiredprivs: n.Privileges,
-		changePrivilege: func(privDesc *descpb.PrivilegeDescriptor, grantee string) {
+		changePrivilege: func(privDesc *descpb.PrivilegeDescriptor, grantee security.SQLUsername) {
 			privDesc.Revoke(grantee, n.Privileges, grantOn)
 		},
-		grantOn:      grantOn,
-		eventLogType: EventLogRevokePrivilege,
+		grantOn: grantOn,
 	}, nil
 }
 
 type changePrivilegesNode struct {
+	isGrant         bool
 	targets         tree.TargetList
-	grantees        tree.NameList
+	grantees        []security.SQLUsername
 	desiredprivs    privilege.List
-	changePrivilege func(*descpb.PrivilegeDescriptor, string)
+	changePrivilege func(*descpb.PrivilegeDescriptor, security.SQLUsername)
 	grantOn         privilege.ObjectType
-	eventLogType    EventLogType
 }
 
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
@@ -137,11 +155,12 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 
 	// We're allowed to grant/revoke privileges to/from the "public" role even though
 	// it does not exist: add it to the list of all users and roles.
-	users[security.PublicRole] = true // isRole
+	users[security.PublicRoleName()] = true // isRole
 
-	for _, grantee := range n.grantees {
-		if _, ok := users[string(grantee)]; !ok {
-			return errors.Errorf("user or role %s does not exist", &grantee)
+	for i, grantee := range n.grantees {
+		if _, ok := users[grantee]; !ok {
+			sqlName := tree.Name(n.grantees[i].Normalized())
+			return errors.Errorf("user or role %s does not exist", &sqlName)
 		}
 	}
 
@@ -154,6 +173,13 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 	if err != nil {
 		return err
 	}
+
+	// The events to log at the end.
+	type eventEntry struct {
+		descID descpb.ID
+		event  eventpb.EventPayload
+	}
+	var events []eventEntry
 
 	// First, update the descriptors. We want to catch all errors before
 	// we update them in KV below.
@@ -173,13 +199,20 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 
 		privileges := descriptor.GetPrivileges()
 		for _, grantee := range n.grantees {
-			n.changePrivilege(privileges, string(grantee))
+			n.changePrivilege(privileges, grantee)
 		}
 
 		// Validate privilege descriptors directly as the db/table level Validate
 		// may fix up the descriptor.
 		if err := privileges.Validate(descriptor.GetID(), n.grantOn); err != nil {
 			return err
+		}
+
+		eventDetails := eventpb.CommonSQLPrivilegeEventDetails{}
+		if n.isGrant {
+			eventDetails.GrantedPrivileges = n.desiredprivs.SortedNames()
+		} else {
+			eventDetails.RevokedPrivileges = n.desiredprivs.SortedNames()
 		}
 
 		switch d := descriptor.(type) {
@@ -191,6 +224,15 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 				fmt.Sprintf("updating privileges for database %d", d.ID),
 			); err != nil {
 				return err
+			}
+			for _, grantee := range n.grantees {
+				privs := eventDetails // copy the granted/revoked privilege list.
+				privs.Grantee = grantee.Normalized()
+				events = append(events, eventEntry{d.ID,
+					&eventpb.ChangeDatabasePrivilege{
+						CommonSQLPrivilegeEventDetails: privs,
+						DatabaseName:                   (*tree.Name)(&d.Name).String(),
+					}})
 			}
 
 		case *tabledesc.Mutable:
@@ -208,10 +250,28 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 					return err
 				}
 			}
+			for _, grantee := range n.grantees {
+				privs := eventDetails // copy the granted/revoked privilege list.
+				privs.Grantee = grantee.Normalized()
+				events = append(events, eventEntry{d.ID,
+					&eventpb.ChangeTablePrivilege{
+						CommonSQLPrivilegeEventDetails: privs,
+						TableName:                      d.Name, // FIXME
+					}})
+			}
 		case *typedesc.Mutable:
 			err := p.writeTypeSchemaChange(ctx, d, fmt.Sprintf("updating privileges for type %d", d.ID))
 			if err != nil {
 				return err
+			}
+			for _, grantee := range n.grantees {
+				privs := eventDetails // copy the granted/revoked privilege list.
+				privs.Grantee = grantee.Normalized()
+				events = append(events, eventEntry{d.ID,
+					&eventpb.ChangeTypePrivilege{
+						CommonSQLPrivilegeEventDetails: privs,
+						TypeName:                       d.Name, // FIXME
+					}})
 			}
 		case *schemadesc.Mutable:
 			if err := p.writeSchemaDescChange(
@@ -221,6 +281,15 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			); err != nil {
 				return err
 			}
+			for _, grantee := range n.grantees {
+				privs := eventDetails // copy the granted/revoked privilege list.
+				privs.Grantee = grantee.Normalized()
+				events = append(events, eventEntry{d.ID,
+					&eventpb.ChangeSchemaPrivilege{
+						CommonSQLPrivilegeEventDetails: privs,
+						SchemaName:                     d.Name, // FIXME
+					}})
+			}
 		}
 	}
 
@@ -229,25 +298,15 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 		return err
 	}
 
-	// Record this index alteration in the event log. This is an auditable log
-	// event and is recorded in the same transaction as the table descriptor
-	// update.
-	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
-	n.targets.Format(fmtCtx)
-	targets := fmtCtx.CloseAndGetString()
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		n.eventLogType,
-		0, /* no target */
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			Target     string
-			User       string
-			Grantees   string
-			Privileges string
-		}{targets, p.SessionData().User, strings.Join(n.grantees.ToStrings(), ","), n.desiredprivs.String()},
-	)
+	// Record the privilege changes in the event log. This is an
+	// auditable log event and is recorded in the same transaction as
+	// the table descriptor update.
+	for _, ev := range events {
+		if err := params.p.logEvent(params.ctx, ev.descID, ev.event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (*changePrivilegesNode) Next(runParams) (bool, error) { return false, nil }

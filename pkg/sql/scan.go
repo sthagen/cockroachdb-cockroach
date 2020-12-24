@@ -63,9 +63,6 @@ type scanNode struct {
 	// There is a 1-1 correspondence between cols and resultColumns.
 	resultColumns colinfo.ResultColumns
 
-	// Map used to get the index for columns in cols.
-	colIdxMap map[descpb.ColumnID]int
-
 	spans   []roachpb.Span
 	reverse bool
 
@@ -113,6 +110,10 @@ type scanColumnsConfig struct {
 	// can add more columns). Non public columns can only be added if allowed
 	// by the visibility flag below.
 	wantedColumns []tree.ColumnID
+	// wantedColumnsOrdinals contains the ordinals of all columns in
+	// wantedColumns. Note that if addUnwantedAsHidden flag is set, the hidden
+	// columns are not included here.
+	wantedColumnsOrdinals []uint32
 
 	// When set, the columns that are not in the wantedColumns list are added to
 	// the list of columns as hidden columns.
@@ -221,12 +222,12 @@ func (n *scanNode) lookupSpecifiedIndex(indexFlags *tree.IndexFlags) error {
 	if indexFlags.Index != "" {
 		// Search index by name.
 		indexName := string(indexFlags.Index)
-		if indexName == n.desc.PrimaryIndex.Name {
-			n.specifiedIndex = &n.desc.PrimaryIndex
+		if indexName == n.desc.GetPrimaryIndex().Name {
+			n.specifiedIndex = n.desc.GetPrimaryIndex()
 		} else {
-			for i := range n.desc.Indexes {
-				if indexName == n.desc.Indexes[i].Name {
-					n.specifiedIndex = &n.desc.Indexes[i]
+			for i := range n.desc.GetPublicNonPrimaryIndexes() {
+				if indexName == n.desc.GetPublicNonPrimaryIndexes()[i].Name {
+					n.specifiedIndex = &n.desc.GetPublicNonPrimaryIndexes()[i]
 					break
 				}
 			}
@@ -236,12 +237,12 @@ func (n *scanNode) lookupSpecifiedIndex(indexFlags *tree.IndexFlags) error {
 		}
 	} else if indexFlags.IndexID != 0 {
 		// Search index by ID.
-		if n.desc.PrimaryIndex.ID == descpb.IndexID(indexFlags.IndexID) {
-			n.specifiedIndex = &n.desc.PrimaryIndex
+		if n.desc.GetPrimaryIndexID() == descpb.IndexID(indexFlags.IndexID) {
+			n.specifiedIndex = n.desc.GetPrimaryIndex()
 		} else {
-			for i := range n.desc.Indexes {
-				if n.desc.Indexes[i].ID == descpb.IndexID(indexFlags.IndexID) {
-					n.specifiedIndex = &n.desc.Indexes[i]
+			for i := range n.desc.GetPublicNonPrimaryIndexes() {
+				if n.desc.GetPublicNonPrimaryIndexes()[i].ID == descpb.IndexID(indexFlags.IndexID) {
+					n.specifiedIndex = &n.desc.GetPublicNonPrimaryIndexes()[i]
 					break
 				}
 			}
@@ -261,7 +262,7 @@ func initColsForScan(
 		return nil, errors.AssertionFailedf("unexpectedly wantedColumns is nil")
 	}
 
-	cols = make([]*descpb.ColumnDescriptor, 0, len(desc.ReadableColumns))
+	cols = make([]*descpb.ColumnDescriptor, 0, len(desc.ReadableColumns()))
 	for _, wc := range colCfg.wantedColumns {
 		var c *descpb.ColumnDescriptor
 		var err error
@@ -314,7 +315,7 @@ func initColsForScan(
 // Initializes the column structures.
 func (n *scanNode) initDescDefaults(colCfg scanColumnsConfig) error {
 	n.colCfg = colCfg
-	n.index = &n.desc.PrimaryIndex
+	n.index = n.desc.GetPrimaryIndex()
 
 	var err error
 	n.cols, err = initColsForScan(n.desc, n.colCfg)
@@ -324,9 +325,5 @@ func (n *scanNode) initDescDefaults(colCfg scanColumnsConfig) error {
 
 	// Set up the rest of the scanNode.
 	n.resultColumns = colinfo.ResultColumnsFromColDescPtrs(n.desc.GetID(), n.cols)
-	n.colIdxMap = make(map[descpb.ColumnID]int, len(n.cols))
-	for i, c := range n.cols {
-		n.colIdxMap[c.ID] = i
-	}
 	return nil
 }

@@ -10,10 +10,14 @@
 
 package tree
 
+import "github.com/cockroachdb/cockroach/pkg/security"
+
 // AlterDatabaseOwner represents a ALTER DATABASE OWNER TO statement.
 type AlterDatabaseOwner struct {
-	Name  Name
-	Owner Name
+	Name Name
+	// TODO(solon): Adjust this, see
+	// https://github.com/cockroachdb/cockroach/issues/54696
+	Owner security.SQLUsername
 }
 
 // Format implements the NodeFormatter interface.
@@ -21,13 +25,13 @@ func (node *AlterDatabaseOwner) Format(ctx *FmtCtx) {
 	ctx.WriteString("ALTER DATABASE ")
 	ctx.FormatNode(&node.Name)
 	ctx.WriteString(" OWNER TO ")
-	ctx.FormatNode(&node.Owner)
+	ctx.FormatUsername(node.Owner)
 }
 
-// AlterDatabaseAddRegion represents a ALTER DATABASE ADD REGION(S) statement.
+// AlterDatabaseAddRegion represents a ALTER DATABASE ADD REGION statement.
 type AlterDatabaseAddRegion struct {
-	Name    Name
-	Regions NameList
+	Name   Name
+	Region Name
 }
 
 var _ Statement = &AlterDatabaseAddRegion{}
@@ -37,13 +41,13 @@ func (node *AlterDatabaseAddRegion) Format(ctx *FmtCtx) {
 	ctx.WriteString("ALTER DATABASE ")
 	ctx.FormatNode(&node.Name)
 	ctx.WriteString(" ADD REGION ")
-	node.Regions.Format(ctx)
+	ctx.FormatNode(&node.Region)
 }
 
-// AlterDatabaseDropRegion represents a ALTER DATABASE DROP REGION(S) statement.
+// AlterDatabaseDropRegion represents a ALTER DATABASE DROP REGION statement.
 type AlterDatabaseDropRegion struct {
-	Name    Name
-	Regions NameList
+	Name   Name
+	Region Name
 }
 
 var _ Statement = &AlterDatabaseDropRegion{}
@@ -53,21 +57,37 @@ func (node *AlterDatabaseDropRegion) Format(ctx *FmtCtx) {
 	ctx.WriteString("ALTER DATABASE ")
 	ctx.FormatNode(&node.Name)
 	ctx.WriteString(" DROP REGION ")
-	node.Regions.Format(ctx)
+	ctx.FormatNode(&node.Region)
 }
 
-// AlterDatabaseSurvive represents a ALTER DATABASE SURVIVE ... statement.
-type AlterDatabaseSurvive struct {
-	Name    Name
-	Survive Survive
+// AlterDatabasePrimaryRegion represents a ALTER DATABASE PRIMARY REGION ... statement.
+type AlterDatabasePrimaryRegion struct {
+	Name          Name
+	PrimaryRegion Name
 }
 
-var _ Statement = &AlterDatabaseSurvive{}
+var _ Statement = &AlterDatabasePrimaryRegion{}
 
 // Format implements the NodeFormatter interface.
-func (node *AlterDatabaseSurvive) Format(ctx *FmtCtx) {
+func (node *AlterDatabasePrimaryRegion) Format(ctx *FmtCtx) {
+	ctx.WriteString("ALTER DATABASE ")
+	ctx.FormatNode(&node.Name)
+	ctx.WriteString(" PRIMARY REGION ")
+	node.PrimaryRegion.Format(ctx)
+}
+
+// AlterDatabaseSurvivalGoal represents a ALTER DATABASE SURVIVE ... statement.
+type AlterDatabaseSurvivalGoal struct {
+	Name         Name
+	SurvivalGoal SurvivalGoal
+}
+
+var _ Statement = &AlterDatabaseSurvivalGoal{}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterDatabaseSurvivalGoal) Format(ctx *FmtCtx) {
 	ctx.WriteString("ALTER DATABASE ")
 	ctx.FormatNode(&node.Name)
 	ctx.WriteString(" ")
-	node.Survive.Format(ctx)
+	node.SurvivalGoal.Format(ctx)
 }

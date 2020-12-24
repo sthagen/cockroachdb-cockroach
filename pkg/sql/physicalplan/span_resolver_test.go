@@ -57,7 +57,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 	// Replicate the row ranges on all of the first 3 nodes. Save the 4th node in
 	// a pristine state, with empty caches.
 	for i := 0; i < 3; i++ {
-		rowRanges[i] = tc.AddReplicasOrFatal(
+		rowRanges[i] = tc.AddVotersOrFatal(
 			t, rowRanges[i].StartKey.AsRawKey(), tc.Target(1), tc.Target(2))
 	}
 
@@ -169,7 +169,7 @@ func populateCache(db *gosql.DB, expectedNumRows int) error {
 func splitRangeAtVal(
 	ts *server.TestServer, tableDesc *tabledesc.Immutable, pk int,
 ) (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
-	if len(tableDesc.Indexes) != 0 {
+	if len(tableDesc.GetPublicNonPrimaryIndexes()) != 0 {
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
 			errors.AssertionFailedf("expected table with just a PK, got: %+v", tableDesc)
 	}

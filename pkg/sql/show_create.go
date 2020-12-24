@@ -15,10 +15,11 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catformat"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 )
@@ -160,7 +161,7 @@ func ShowCreateTable(
 		if idx.ID != desc.GetPrimaryIndex().ID && includeInterleaveClause {
 			// Showing the primary index is handled above.
 			f.WriteString(",\n\t")
-			idxStr, err := schemaexpr.FormatIndexForDisplay(ctx, desc, &descpb.AnonymousTable, idx, &p.RunParams(ctx).p.semaCtx)
+			idxStr, err := catformat.IndexForDisplay(ctx, desc, &descpb.AnonymousTable, idx, &p.RunParams(ctx).p.semaCtx)
 			if err != nil {
 				return "", err
 			}
@@ -195,6 +196,10 @@ func ShowCreateTable(
 	if err := ShowCreatePartitioning(
 		a, p.ExecCfg().Codec, desc, desc.GetPrimaryIndex(), &desc.GetPrimaryIndex().Partitioning, &f.Buffer, 0 /* indent */, 0, /* colOffset */
 	); err != nil {
+		return "", err
+	}
+
+	if err := showCreateLocality(desc, f); err != nil {
 		return "", err
 	}
 

@@ -22,7 +22,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -214,20 +213,18 @@ func (c *conn) serveImpl(
 ) {
 	defer func() { _ = c.conn.Close() }()
 
-	if c.sessionArgs.User == security.RootUser || c.sessionArgs.User == security.NodeUser {
+	if c.sessionArgs.User.IsRootUser() || c.sessionArgs.User.IsNodeUser() {
 		ctx = logtags.AddTag(ctx, "user", log.Safe(c.sessionArgs.User))
 	} else {
 		ctx = logtags.AddTag(ctx, "user", c.sessionArgs.User)
 	}
 
 	inTestWithoutSQL := sqlServer == nil
-	var authLogger *log.SecondaryLogger
 	if !inTestWithoutSQL {
-		authLogger = sqlServer.GetExecutorConfig().AuthLogger
 		sessionStart := timeutil.Now()
 		defer func() {
 			if c.authLogEnabled() {
-				authLogger.Logf(ctx, "session terminated; duration: %s", timeutil.Now().Sub(sessionStart))
+				log.Sessions.Infof(ctx, "session terminated; duration: %s", timeutil.Now().Sub(sessionStart))
 			}
 		}()
 	}
@@ -260,13 +257,10 @@ func (c *conn) serveImpl(
 
 	// the authPipe below logs authentication messages iff its auth
 	// logger is non-nil. We define this here.
-	var sessionAuthLogger *log.SecondaryLogger
-	if !inTestWithoutSQL && c.authLogEnabled() {
-		sessionAuthLogger = authLogger
-	}
+	logAuthn := !inTestWithoutSQL && c.authLogEnabled()
 
 	// We'll build an authPipe to communicate with the authentication process.
-	authPipe := newAuthPipe(c, sessionAuthLogger)
+	authPipe := newAuthPipe(c, logAuthn)
 	var authenticator authenticatorIO = authPipe
 
 	// procCh is the channel on which we'll receive the termination signal from
@@ -673,14 +667,14 @@ func (c *conn) sendInitialConnData(
 	}
 	// The two following status parameters have no equivalent session
 	// variable.
-	if err := c.sendParamStatus("session_authorization", c.sessionArgs.User); err != nil {
+	if err := c.sendParamStatus("session_authorization", c.sessionArgs.User.Normalized()); err != nil {
 		return sql.ConnectionHandler{}, err
 	}
 
 	// TODO(knz): this should retrieve the admin status during
 	// authentication using the roles table, instead of using a
 	// simple/naive username match.
-	isSuperUser := c.sessionArgs.User == security.RootUser
+	isSuperUser := c.sessionArgs.User.IsRootUser()
 	superUserVal := "off"
 	if isSuperUser {
 		superUserVal = "on"

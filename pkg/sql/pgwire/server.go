@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -29,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -51,7 +51,7 @@ import (
 //
 // The "results_buffer_size" connection parameter can be used to override this
 // default for an individual connection.
-var connResultsBufferSize = settings.RegisterPublicByteSizeSetting(
+var connResultsBufferSize = settings.RegisterByteSizeSetting(
 	"sql.defaults.results_buffer.size",
 	"default size of the buffer that accumulates results for a statement or a batch "+
 		"of statements before they are sent to the client. This can be overridden on "+
@@ -63,17 +63,17 @@ var connResultsBufferSize = settings.RegisterPublicByteSizeSetting(
 		"Updating the setting only affects new connections. "+
 		"Setting to 0 disables any buffering.",
 	16<<10, // 16 KiB
-)
+).WithPublic()
 
-var logConnAuth = settings.RegisterPublicBoolSetting(
+var logConnAuth = settings.RegisterBoolSetting(
 	sql.ConnAuditingClusterSettingName,
 	"if set, log SQL client connect and disconnect events (note: may hinder performance on loaded nodes)",
-	false)
+	false).WithPublic()
 
-var logSessionAuth = settings.RegisterPublicBoolSetting(
+var logSessionAuth = settings.RegisterBoolSetting(
 	sql.AuthAuditingClusterSettingName,
 	"if set, log SQL session login/disconnection events (note: may hinder performance on loaded nodes)",
-	false)
+	false).WithPublic()
 
 const (
 	// ErrSSLRequired is returned when a client attempts to connect to a
@@ -494,7 +494,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	// This registers the connection to the authentication log.
 	connStart := timeutil.Now()
 	if s.connLogEnabled() {
-		s.execCfg.AuthLogger.Logf(ctx, "received connection")
+		log.Sessions.Infof(ctx, "received connection")
 	}
 	defer func() {
 		// The duration of the session is logged at the end so that the
@@ -502,7 +502,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 		// to find when the connection was opened. This is important
 		// because the log files may have been rotated since.
 		if s.connLogEnabled() {
-			s.execCfg.AuthLogger.Logf(ctx, "disconnected; duration: %s", timeutil.Now().Sub(connStart))
+			log.Sessions.Infof(ctx, "disconnected; duration: %s", timeutil.Now().Sub(connStart))
 		}
 	}()
 
@@ -644,7 +644,7 @@ func parseClientProvidedSessionParameters(
 			// case-insensitive. Therefore we need to normalize the username
 			// here, so that further lookups for authentication have the correct
 			// identifier.
-			args.User = tree.Name(value).Normalize()
+			args.User, _ = security.MakeSQLUsernameFromUserInput(value, security.UsernameValidation)
 
 		case "results_buffer_size":
 			if args.ConnResultsBufferSize, err = humanizeutil.ParseBytes(value); err != nil {

@@ -1,0 +1,41 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "types",
+    srcs = [
+        "alias.go",
+        "oid.go",
+        "types.go",
+        "types.pb.go",
+        "types_jsonpb.go",
+    ],
+    importpath = "github.com/cockroachdb/cockroach/pkg/sql/types",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/geo/geopb",
+        "//pkg/sql/lex",
+        "//pkg/sql/oidext",
+        "//pkg/sql/pgwire/pgcode",
+        "//pkg/sql/pgwire/pgerror",
+        "//pkg/util/errorutil/unimplemented",
+        "//pkg/util/protoutil",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_gogo_protobuf//jsonpb",
+        "@com_github_gogo_protobuf//proto",
+        "@com_github_lib_pq//oid",
+    ],
+)
+
+go_test(
+    name = "types_test",
+    srcs = ["types_test.go"],
+    embed = [":types"],
+    deps = [
+        "//pkg/geo/geopb",
+        "//pkg/sql/oidext",
+        "//pkg/util/protoutil",
+        "@com_github_lib_pq//oid",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

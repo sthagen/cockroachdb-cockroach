@@ -24,20 +24,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
-	"github.com/gogo/protobuf/proto"
 )
 
 type alterTableNode struct {
@@ -54,6 +54,14 @@ type alterTableNode struct {
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER TABLE",
+	); err != nil {
+		return nil, err
+	}
+
 	tableDesc, err := p.ResolveMutableTableDescriptorEx(
 		ctx, n.Table, !n.IfExists, tree.ResolveRequireTableDesc,
 	)
@@ -153,6 +161,11 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 		switch t := cmd.(type) {
 		case *tree.AlterTableAddColumn:
+			if t.ColumnDef.Unique.WithoutIndex {
+				return pgerror.New(pgcode.FeatureNotSupported,
+					"unique constraints without an index are not yet supported",
+				)
+			}
 			var err error
 			params.p.runWithOptions(resolveFlags{contextDatabaseID: n.tableDesc.ParentID}, func() {
 				err = params.p.addColumnImpl(params, n, tn, n.tableDesc, t)
@@ -183,12 +196,21 @@ func (n *alterTableNode) startExec(params runParams) error {
 						Columns:    d.Columns,
 						Sharded:    d.Sharded,
 						Interleave: d.Interleave,
+						Name:       d.Name,
 					}
 					if err := params.p.AlterPrimaryKey(params.ctx, n.tableDesc, alterPK); err != nil {
 						return err
 					}
 					continue
 				}
+
+				// Check if the columns exist on the table.
+				for _, column := range d.Columns {
+					if _, _, err := n.tableDesc.FindColumnByName(column.Column); err != nil {
+						return err
+					}
+				}
+
 				idx := descpb.IndexDescriptor{
 					Name:             string(d.Name),
 					Unique:           true,
@@ -221,7 +243,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				var err error
 				params.p.runWithOptions(resolveFlags{contextDatabaseID: n.tableDesc.ParentID}, func() {
 					info, infoErr := n.tableDesc.GetConstraintInfo(params.ctx, nil)
-					if err != nil {
+					if infoErr != nil {
 						err = infoErr
 						return
 					}
@@ -274,7 +296,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 						err = scanErr
 						return
 					}
-					var tableState FKTableState
+					var tableState TableState
 					if len(kvs) == 0 {
 						tableState = EmptyTable
 					} else {
@@ -414,7 +436,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 
-			if n.tableDesc.PrimaryIndex.ContainsColumnID(colToDrop.ID) {
+			if n.tableDesc.GetPrimaryIndex().ContainsColumnID(colToDrop.ID) {
 				return pgerror.Newf(pgcode.InvalidColumnReference,
 					"column %q is referenced by the primary key", colToDrop.Name)
 			}
@@ -436,7 +458,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 				if !containsThisColumn {
 					for _, id := range idx.ExtraColumnIDs {
-						if n.tableDesc.PrimaryIndex.ContainsColumnID(id) {
+						if n.tableDesc.GetPrimaryIndex().ContainsColumnID(id) {
 							// All secondary indices necessary contain the PK
 							// columns, too. (See the comments on the definition of
 							// IndexDescriptor). The presence of a PK column in the
@@ -498,6 +520,18 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 			}
 
+			// Drop unique constraints that reference the column.
+			sliceIdx := 0
+			for i := range n.tableDesc.UniqueWithoutIndexConstraints {
+				constraint := &n.tableDesc.UniqueWithoutIndexConstraints[i]
+				n.tableDesc.UniqueWithoutIndexConstraints[sliceIdx] = *constraint
+				sliceIdx++
+				if descpb.ColumnIDs(constraint.ColumnIDs).Contains(colToDrop.ID) {
+					sliceIdx--
+				}
+			}
+			n.tableDesc.UniqueWithoutIndexConstraints = n.tableDesc.UniqueWithoutIndexConstraints[:sliceIdx]
+
 			// Drop check constraints which reference the column.
 			validChecks := n.tableDesc.Checks[:0]
 			for _, check := range n.tableDesc.AllActiveAndInactiveChecks() {
@@ -528,7 +562,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			// Since we are able to drop indexes used by foreign keys on the origin side,
 			// the drop index codepaths aren't going to remove dependent FKs, so we
 			// need to do that here.
-			if params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.VersionNoOriginFKIndexes) {
+			if params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.NoOriginFKIndexes) {
 				// We update the FK's slice in place here.
 				sliceIdx := 0
 				for i := range n.tableDesc.OutboundFKs {
@@ -614,7 +648,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 				found := false
 				var ck *descpb.TableDescriptor_CheckConstraint
 				for _, c := range n.tableDesc.Checks {
-					// If the constraint is still being validated, don't allow VALIDATE CONSTRAINT to run
+					// If the constraint is still being validated, don't allow
+					// VALIDATE CONSTRAINT to run.
 					if c.Name == name && c.Validity != descpb.ConstraintValidity_Validating {
 						found = true
 						ck = c
@@ -636,7 +671,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 				var foundFk *descpb.ForeignKeyConstraint
 				for i := range n.tableDesc.OutboundFKs {
 					fk := &n.tableDesc.OutboundFKs[i]
-					// If the constraint is still being validated, don't allow VALIDATE CONSTRAINT to run
+					// If the constraint is still being validated, don't allow
+					// VALIDATE CONSTRAINT to run.
 					if fk.Name == name && fk.Validity != descpb.ConstraintValidity_Validating {
 						foundFk = fk
 						break
@@ -653,10 +689,36 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 				foundFk.Validity = descpb.ConstraintValidity_Validated
 
+			case descpb.ConstraintTypeUnique:
+				if constraint.Index == nil {
+					var foundUnique *descpb.UniqueWithoutIndexConstraint
+					for i := range n.tableDesc.UniqueWithoutIndexConstraints {
+						uc := &n.tableDesc.UniqueWithoutIndexConstraints[i]
+						// If the constraint is still being validated, don't allow
+						// VALIDATE CONSTRAINT to run.
+						if uc.Name == name && uc.Validity != descpb.ConstraintValidity_Validating {
+							foundUnique = uc
+							break
+						}
+					}
+					if foundUnique == nil {
+						return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+							"constraint %q in the middle of being added, try again later", t.Constraint)
+					}
+					// TODO(rytaft): Call validateUniqueConstraint once supported.
+					return pgerror.New(pgcode.FeatureNotSupported,
+						"validation of unique constraints without an index are not yet supported",
+					)
+				}
+
+				// This unique constraint is enforced by an index, so fall through to
+				// the error below.
+				fallthrough
+
 			default:
 				return pgerror.Newf(pgcode.WrongObjectType,
-					"constraint %q of relation %q is not a foreign key or check constraint",
-					tree.ErrString(&t.Constraint), tree.ErrString(n.n.Table))
+					"constraint %q of relation %q is not a foreign key, check, or unique without index"+
+						" constraint", tree.ErrString(&t.Constraint), tree.ErrString(n.n.Table))
 			}
 			descriptorChanged = true
 
@@ -680,23 +742,24 @@ func (n *alterTableNode) startExec(params runParams) error {
 			partitioning, err := CreatePartitioning(
 				params.ctx, params.p.ExecCfg().Settings,
 				params.EvalContext(),
-				n.tableDesc, &n.tableDesc.PrimaryIndex, t.PartitionBy)
+				n.tableDesc, n.tableDesc.GetPrimaryIndex(), t.PartitionBy)
 			if err != nil {
 				return err
 			}
-			descriptorChanged = descriptorChanged || !proto.Equal(
-				&n.tableDesc.PrimaryIndex.Partitioning,
-				&partitioning,
-			)
+			descriptorChanged = descriptorChanged || !n.tableDesc.GetPrimaryIndex().Partitioning.Equal(&partitioning)
 			err = deleteRemovedPartitionZoneConfigs(
 				params.ctx, params.p.txn,
-				n.tableDesc, &n.tableDesc.PrimaryIndex, &n.tableDesc.PrimaryIndex.Partitioning,
+				n.tableDesc, n.tableDesc.GetPrimaryIndex(), &n.tableDesc.GetPrimaryIndex().Partitioning,
 				&partitioning, params.extendedEvalCtx.ExecCfg,
 			)
 			if err != nil {
 				return err
 			}
-			n.tableDesc.PrimaryIndex.Partitioning = partitioning
+			{
+				primaryIndex := *n.tableDesc.GetPrimaryIndex()
+				primaryIndex.Partitioning = partitioning
+				n.tableDesc.SetPrimaryIndex(primaryIndex)
+			}
 
 		case *tree.AlterTableSetAudit:
 			changed, err := params.p.setAuditMode(params.ctx, n.tableDesc, t.Mode)
@@ -782,7 +845,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 			descriptorChanged = true
 		case *tree.AlterTableOwner:
-			changed, err := params.p.alterTableOwner(params.p.EvalContext().Context, n, string(t.Owner))
+			changed, err := params.p.alterTableOwner(params.p.EvalContext().Context, n, t.Owner)
 			if err != nil {
 				return err
 			}
@@ -826,21 +889,15 @@ func (n *alterTableNode) startExec(params runParams) error {
 	// Record this table alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogAlterTable,
-		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TableName           string
-			Statement           string
-			User                string
-			MutationID          uint32
-			CascadeDroppedViews []string
-		}{params.p.ResolvedName(n.n.Table).FQString(), n.n.String(),
-			params.SessionData().User, uint32(mutationID), droppedViews},
-	)
+	return params.p.logEvent(params.ctx,
+		n.tableDesc.ID,
+		&eventpb.AlterTable{
+			TableName:  params.p.ResolvedName(n.n.Table).FQString(),
+			MutationID: uint32(mutationID),
+			// TODO(knz): This is missing some qualification, see
+			// https://github.com/cockroachdb/cockroach/issues/57735
+			CascadeDroppedViews: droppedViews,
+		})
 }
 
 func (p *planner) setAuditMode(
@@ -922,7 +979,7 @@ func applyColumnMutation(
 				params.ctx, t.Default, colDatumType, "DEFAULT", &params.p.semaCtx, tree.VolatilityVolatile,
 			)
 			if err != nil {
-				return err
+				return pgerror.WithCandidateCode(err, pgcode.DatatypeMismatch)
 			}
 			s := tree.Serialize(expr)
 			col.DefaultExpr = &s
@@ -980,7 +1037,7 @@ func applyColumnMutation(
 		}
 
 		// Prevent a column in a primary key from becoming non-null.
-		if tableDesc.PrimaryIndex.ContainsColumnID(col.ID) {
+		if tableDesc.GetPrimaryIndex().ContainsColumnID(col.ID) {
 			return pgerror.Newf(pgcode.InvalidTableDefinition,
 				`column "%s" is in a primary index`, col.Name)
 		}
@@ -1146,7 +1203,7 @@ func (p *planner) removeColumnComment(
 		ctx,
 		"delete-column-comment",
 		p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3",
 		keys.ColumnCommentType,
 		tableID,
@@ -1199,12 +1256,12 @@ func (p *planner) updateFKBackReferenceName(
 // alterTableOwner sets the owner of the table to newOwner and returns true if the descriptor
 // was updated.
 func (p *planner) alterTableOwner(
-	ctx context.Context, n *alterTableNode, newOwner string,
+	ctx context.Context, n *alterTableNode, newOwner security.SQLUsername,
 ) (bool, error) {
 	privs := n.tableDesc.GetPrivileges()
 
 	// If the owner we want to set to is the current owner, do a no-op.
-	if newOwner == privs.Owner {
+	if newOwner == privs.Owner() {
 		return false, nil
 	}
 
@@ -1218,7 +1275,7 @@ func (p *planner) alterTableOwner(
 // checkCanAlterTableAndSetNewOwner handles privilege checking and setting new owner.
 // Called in ALTER TABLE and REASSIGN OWNED BY.
 func (p *planner) checkCanAlterTableAndSetNewOwner(
-	ctx context.Context, desc *tabledesc.Mutable, newOwner string,
+	ctx context.Context, desc *tabledesc.Mutable, newOwner security.SQLUsername,
 ) error {
 	if err := p.checkCanAlterToNewOwner(ctx, desc, newOwner); err != nil {
 		return err
@@ -1233,5 +1290,12 @@ func (p *planner) checkCanAlterTableAndSetNewOwner(
 	privs := desc.GetPrivileges()
 	privs.SetOwner(newOwner)
 
-	return nil
+	return p.logEvent(ctx,
+		desc.ID,
+		&eventpb.AlterTableOwner{
+			// TODO(knz): Properly qualify this.
+			// See: https://github.com/cockroachdb/cockroach/issues/57960
+			TableName: desc.Name,
+			Owner:     newOwner.Normalized(),
+		})
 }

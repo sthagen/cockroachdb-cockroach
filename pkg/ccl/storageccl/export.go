@@ -76,7 +76,7 @@ func evalExport(
 	reply := resp.(*roachpb.ExportResponse)
 
 	ctx, span := tracing.ChildSpan(ctx, fmt.Sprintf("Export [%s,%s)", args.Key, args.EndKey))
-	defer tracing.FinishSpan(span)
+	defer span.Finish()
 
 	// For MVCC_All backups with no start time, they'll only be capturing the
 	// *revisions* since the gc threshold, so noting that in the reply allows the
@@ -98,6 +98,17 @@ func evalExport(
 	} else {
 		// Requests that don't write to export storage are expected to be small.
 		log.Eventf(ctx, "export [%s,%s)", args.Key, args.EndKey)
+	}
+
+	if makeExternalStorage {
+		// TODO(dt): this blanket ban means we must do all uploads from the caller
+		// which is nice and simple but imposes extra copies/overhead/cost. We might
+		// want to instead allow *some* forms of external storage for *some* tenants
+		// e.g. allow some tenants to dial out to s3 directly -- if we do though we
+		// would need to continue to restrict unsafe ones like userfile here.
+		if _, ok := roachpb.TenantFromContext(ctx); ok {
+			return result.Result{}, errors.Errorf("requests on behalf of tenants are not allowed to contact external storage")
+		}
 	}
 
 	// To get the store to export to, first try to match the locality of this node
@@ -156,7 +167,7 @@ func evalExport(
 		maxSize = targetSize + uint64(allowedOverage)
 	}
 	for start := args.Key; start != nil; {
-		data, summary, resume, err := e.ExportToSst(start, args.EndKey, args.StartTime,
+		data, summary, resume, err := e.ExportMVCCToSst(start, args.EndKey, args.StartTime,
 			h.Timestamp, exportAllRevisions, targetSize, maxSize, io)
 		if err != nil {
 			return result.Result{}, err

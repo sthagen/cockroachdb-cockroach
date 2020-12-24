@@ -29,7 +29,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder" // for ExprFmtHideScalars.
@@ -148,10 +150,6 @@ type Flags struct {
 	// to pass.
 	UnexpectedRules RuleSet
 
-	// ExpectedMatchOnlyRules is a set of exploration rules which must match but
-	// not generate new expressions for the test to pass.
-	ExpectedMatchOnlyRules RuleSet
-
 	// ColStats is a list of ColSets for which a column statistic is requested.
 	ColStats []opt.ColSet
 
@@ -203,6 +201,16 @@ type Flags struct {
 	// NoStableFolds controls whether constant folding for normalization includes
 	// stable operators.
 	NoStableFolds bool
+
+	// IndexVersion controls the version of the index descriptor created in the
+	// test catalog. This field is only used by the exec-ddl command for CREATE
+	// INDEX statements.
+	IndexVersion descpb.IndexDescriptorVersion
+
+	// OptStepsSplitDiff, if true, replaces the unified diff output of the
+	// optsteps command with a split diff where the before and after expressions
+	// are printed in their entirety. The default value is false.
+	OptStepsSplitDiff bool
 }
 
 // New constructs a new instance of the OptTester for the given SQL statement.
@@ -223,7 +231,7 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 
 	// Set any OptTester-wide session flags here.
 
-	ot.evalCtx.SessionData.User = "opttester"
+	ot.evalCtx.SessionData.UserProto = security.MakeSQLUsernameFromPreNormalizedString("opttester").EncodeProto()
 	ot.evalCtx.SessionData.Database = "defaultdb"
 	ot.evalCtx.SessionData.ZigzagJoinEnabled = true
 	ot.evalCtx.SessionData.OptimizerUseHistograms = true
@@ -395,6 +403,14 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //  - cascade-levels: used to limit the depth of recursive cascades for
 //    build-cascades.
 //
+//  - index-version: controls the version of the index descriptor created in
+//    the test catalog. This is used by the exec-ddl command for CREATE INDEX
+//    statements.
+//
+//  - split-diff: replaces the unified diff output of the optsteps command with
+//    a split diff where the before and after expressions are printed in their
+//    entirety. This is only used by the optsteps command.
+//
 func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 	// Allow testcases to override the flags.
 	for _, a := range d.CmdArgs {
@@ -417,7 +433,13 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		if !ok {
 			d.Fatalf(tb, "exec-ddl can only be used with TestCatalog")
 		}
-		s, err := testCatalog.ExecuteDDL(d.Input)
+		var s string
+		var err error
+		if ot.Flags.IndexVersion != 0 {
+			s, err = testCatalog.ExecuteDDLWithIndexVersion(d.Input, ot.Flags.IndexVersion)
+		} else {
+			s, err = testCatalog.ExecuteDDL(d.Input)
+		}
 		if err != nil {
 			d.Fatalf(tb, "%v", err)
 		}
@@ -841,6 +863,19 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 		}
 		f.CascadeLevels = int(levels)
 
+	case "index-version":
+		if len(arg.Vals) != 1 {
+			return fmt.Errorf("index-version requires one argument")
+		}
+		version, err := strconv.ParseInt(arg.Vals[0], 10, 64)
+		if err != nil {
+			return err
+		}
+		f.IndexVersion = descpb.IndexDescriptorVersion(version)
+
+	case "split-diff":
+		f.OptStepsSplitDiff = true
+
 	default:
 		return fmt.Errorf("unknown argument: %s", arg.Key)
 	}
@@ -1153,7 +1188,6 @@ func (ot *OptTester) optStepsDisplay(before string, after string, os *optSteps) 
 		return
 	}
 
-	var diff difflib.UnifiedDiff
 	if os.IsBetter() {
 		// New expression is better than the previous expression. Diff
 		// it against the previous *best* expression (might not be the
@@ -1163,15 +1197,23 @@ func (ot *OptTester) optStepsDisplay(before string, after string, os *optSteps) 
 		altHeader("%s (higher cost)\n", os.LastRuleName())
 	}
 
-	diff = difflib.UnifiedDiff{
-		A:       difflib.SplitLines(before),
-		B:       difflib.SplitLines(after),
-		Context: 100,
+	if ot.Flags.OptStepsSplitDiff {
+		ot.output("<<<<<<< before\n")
+		ot.indent(before)
+		ot.output("=======\n")
+		ot.indent(after)
+		ot.output(">>>>>>> after\n")
+	} else {
+		diff := difflib.UnifiedDiff{
+			A:       difflib.SplitLines(before),
+			B:       difflib.SplitLines(after),
+			Context: 100,
+		}
+		text, _ := difflib.GetUnifiedDiffString(diff)
+		// Skip the "@@ ... @@" header (first line).
+		text = strings.SplitN(text, "\n", 2)[1]
+		ot.indent(text)
 	}
-	text, _ := difflib.GetUnifiedDiffString(diff)
-	// Skip the "@@ ... @@" header (first line).
-	text = strings.SplitN(text, "\n", 2)[1]
-	ot.indent(text)
 }
 
 // ExploreTrace steps through exploration transformations performed by the

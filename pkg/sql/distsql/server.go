@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
@@ -40,9 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	"github.com/opentracing/opentracing-go"
 )
 
 // minFlowDrainWait is the minimum amount of time a draining server allows for
@@ -88,6 +87,14 @@ func NewServer(ctx context.Context, cfg execinfra.ServerConfig) *ServerImpl {
 		),
 	}
 	ds.memMonitor.Start(ctx, cfg.ParentMemoryMonitor, mon.BoundAccount{})
+
+	testingGenerateMockContentionEvents.SetOnChange(&cfg.Settings.SV, func() {
+		// Note: If a race occurs with this line, this setting is being improperly
+		// used. Mock contention events should be generated either using the cluster
+		// setting or programmatically using the testing knob, but not both.
+		cfg.TestingKnobs.GenerateMockContentionEvents = testingGenerateMockContentionEvents.Get(&cfg.Settings.SV)
+	})
+
 	return ds
 }
 
@@ -179,7 +186,7 @@ func FlowVerIsCompatible(
 // must be finished through Flow.Cleanup.
 func (ds *ServerImpl) setupFlow(
 	ctx context.Context,
-	parentSpan opentracing.Span,
+	parentSpan *tracing.Span,
 	parentMonitor *mon.BytesMonitor,
 	req *execinfrapb.SetupFlowRequest,
 	syncFlowConsumer execinfra.RowReceiver,
@@ -195,32 +202,25 @@ func (ds *ServerImpl) setupFlow(
 	}
 
 	const opName = "flow"
-	var sp opentracing.Span
+	var sp *tracing.Span // will be Finish()ed by Flow.Cleanup()
 	if parentSpan == nil {
-		sp = ds.Tracer.(*tracing.Tracer).StartRootSpan(
-			opName, logtags.FromContext(ctx), tracing.NonRecordableSpan)
+		ctx, sp = ds.Tracer.StartSpanCtx(ctx, opName)
 	} else if localState.IsLocal {
 		// If we're a local flow, we don't need a "follows from" relationship: we're
 		// going to run this flow synchronously.
 		// TODO(andrei): localState.IsLocal is not quite the right thing to use.
 		//  If that field is unset, we might still want to create a child span if
 		//  this flow is run synchronously.
-		sp = ds.Tracer.(*tracing.Tracer).StartChildSpan(
-			opName, parentSpan.(*tracing.Span).SpanContext(), logtags.FromContext(ctx), tracing.NonRecordableSpan,
-			false /* separateRecording */)
+		ctx, sp = ds.Tracer.StartSpanCtx(ctx, opName, tracing.WithParentAndAutoCollection(parentSpan))
 	} else {
 		// We use FollowsFrom because the flow's span outlives the SetupFlow request.
-		// TODO(andrei): We should use something more efficient than StartSpan; we
-		// should use AmbientContext.AnnotateCtxWithSpan() but that interface
-		// doesn't currently support FollowsFrom relationships.
-		sp = ds.Tracer.StartSpan(
+		ctx, sp = ds.Tracer.StartSpanCtx(
+			ctx,
 			opName,
-			opentracing.FollowsFrom(parentSpan.Context()),
-			tracing.LogTagsFromCtx(ctx),
+			tracing.WithParentAndAutoCollection(parentSpan),
+			tracing.WithFollowsFrom(),
 		)
 	}
-	// sp will be Finish()ed by Flow.Cleanup().
-	ctx = opentracing.ContextWithSpan(ctx, sp)
 
 	// The monitor opened here is closed in Flow.Cleanup().
 	monitor := mon.NewMonitor(
@@ -263,7 +263,7 @@ func (ds *ServerImpl) setupFlow(
 
 		sd, err := sessiondata.UnmarshalNonLocal(req.EvalContext.SessionData)
 		if err != nil {
-			tracing.FinishSpan(sp)
+			sp.Finish()
 			return ctx, nil, err
 		}
 		ie := &lazyInternalExecutor{
@@ -329,8 +329,8 @@ func (ds *ServerImpl) setupFlow(
 		// Flow.Cleanup will not be called, so we have to close the memory monitor
 		// and finish the span manually.
 		monitor.Stop(ctx)
-		tracing.FinishSpan(sp)
-		ctx = opentracing.ContextWithSpan(ctx, nil)
+		sp.Finish()
+		ctx = tracing.ContextWithSpan(ctx, nil)
 		return ctx, nil, err
 	}
 	if !f.IsLocal() {
@@ -371,6 +371,18 @@ func (ds *ServerImpl) setupFlow(
 
 	return ctx, f, nil
 }
+
+// testingGenerateMockContentionEvents is a testing cluster setting that
+// produces mock contention events. Refer to
+// KVFetcher.TestingEnableMockContentionEventGeneration for a more in-depth
+// description of these contention events. This setting is currently used to
+// test SQL Execution contention observability.
+// TODO(asubiotto): Remove once KV layer produces real contention events.
+var testingGenerateMockContentionEvents = settings.RegisterBoolSetting(
+	"sql.testing.mock_contention.enabled",
+	"whether the KV layer should generate mock contention events",
+	false,
+)
 
 // NewFlowContext creates a new FlowCtx that can be used during execution of
 // a flow.
@@ -441,7 +453,7 @@ func (ds *ServerImpl) SetupSyncFlow(
 	output execinfra.RowReceiver,
 ) (context.Context, flowinfra.Flow, error) {
 	ctx, f, err := ds.setupFlow(
-		ds.AnnotateCtx(ctx), opentracing.SpanFromContext(ctx), parentMonitor, req, output, LocalState{},
+		ds.AnnotateCtx(ctx), tracing.SpanFromContext(ctx), parentMonitor, req, output, LocalState{},
 	)
 	if err != nil {
 		return nil, nil, err
@@ -484,7 +496,7 @@ func (ds *ServerImpl) SetupLocalSyncFlow(
 	localState LocalState,
 ) (context.Context, flowinfra.Flow, error) {
 	ctx, f, err := ds.setupFlow(
-		ctx, opentracing.SpanFromContext(ctx), parentMonitor, req, output, localState,
+		ctx, tracing.SpanFromContext(ctx), parentMonitor, req, output, localState,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -533,7 +545,7 @@ func (ds *ServerImpl) SetupFlow(
 	ctx context.Context, req *execinfrapb.SetupFlowRequest,
 ) (*execinfrapb.SimpleResponse, error) {
 	log.VEventf(ctx, 1, "received SetupFlow request from n%v for flow %v", req.Flow.Gateway, req.Flow.FlowID)
-	parentSpan := opentracing.SpanFromContext(ctx)
+	parentSpan := tracing.SpanFromContext(ctx)
 
 	// Note: the passed context will be canceled when this RPC completes, so we
 	// can't associate it with the flow.

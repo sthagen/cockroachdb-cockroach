@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -149,10 +150,11 @@ var rangeDescriptorCacheSize = settings.RegisterIntSetting(
 	1e6,
 )
 
-var senderConcurrencyLimit = settings.RegisterNonNegativeIntSetting(
+var senderConcurrencyLimit = settings.RegisterIntSetting(
 	"kv.dist_sender.concurrency_limit",
 	"maximum number of asynchronous send requests",
 	max(defaultSenderConcurrency, int64(64*runtime.NumCPU())),
+	settings.NonNegativeInt,
 )
 
 func max(a, b int64) int64 {
@@ -246,7 +248,7 @@ type DistSender struct {
 	// metrics stored DistSender-related metrics.
 	metrics DistSenderMetrics
 	// rangeCache caches replica metadata for key ranges.
-	rangeCache *RangeDescriptorCache
+	rangeCache *rangecache.RangeCache
 	// firstRangeProvider provides the range descriptor for range one.
 	// This is not required if a RangeDescriptorDB is supplied.
 	firstRangeProvider FirstRangeProvider
@@ -310,7 +312,7 @@ type DistSenderConfig struct {
 	// will be delegated to the RangeDescriptorDB but FirstRangeProvider will
 	// still be used to listen for updates to the first range's descriptor.
 	FirstRangeProvider FirstRangeProvider
-	RangeDescriptorDB  RangeDescriptorDB
+	RangeDescriptorDB  rangecache.RangeDescriptorDB
 
 	TestingKnobs ClientTestingKnobs
 }
@@ -338,7 +340,7 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 	if cfg.nodeDescriptor != nil {
 		atomic.StorePointer(&ds.nodeDescriptor, unsafe.Pointer(cfg.nodeDescriptor))
 	}
-	var rdb RangeDescriptorDB
+	var rdb rangecache.RangeDescriptorDB
 	if cfg.FirstRangeProvider != nil {
 		ds.firstRangeProvider = cfg.FirstRangeProvider
 		rdb = ds
@@ -352,7 +354,7 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 	getRangeDescCacheSize := func() int64 {
 		return rangeDescriptorCacheSize.Get(&ds.st.SV)
 	}
-	ds.rangeCache = NewRangeDescriptorCache(ds.st, rdb, getRangeDescCacheSize, cfg.RPCContext.Stopper)
+	ds.rangeCache = rangecache.NewRangeCache(ds.st, rdb, getRangeDescCacheSize, cfg.RPCContext.Stopper)
 	if tf := cfg.TestingKnobs.TransportFactory; tf != nil {
 		ds.transportFactory = tf
 	} else {
@@ -418,7 +420,7 @@ func (ds *DistSender) Metrics() DistSenderMetrics {
 }
 
 // RangeDescriptorCache gives access to the DistSender's range cache.
-func (ds *DistSender) RangeDescriptorCache() *RangeDescriptorCache {
+func (ds *DistSender) RangeDescriptorCache() *rangecache.RangeCache {
 	return ds.rangeCache
 }
 
@@ -458,6 +460,11 @@ func (ds *DistSender) FirstRange() (*roachpb.RangeDescriptor, error) {
 		panic("with `nil` firstRangeProvider, DistSender must not use itself as RangeDescriptorDB")
 	}
 	return ds.firstRangeProvider.GetFirstRangeDescriptor()
+}
+
+// NodeDialer returns a Dialer.
+func (ds *DistSender) NodeDialer() *nodedialer.Dialer {
+	return ds.nodeDialer
 }
 
 // getNodeID attempts to return the local node ID. It returns 0 if the DistSender
@@ -537,13 +544,16 @@ func (ds *DistSender) CountRanges(ctx context.Context, rs roachpb.RSpan) (int64,
 // only with consuming cached information (the descriptor and lease info come
 // from the cache), but also with updating the cache.
 func (ds *DistSender) getRoutingInfo(
-	ctx context.Context, descKey roachpb.RKey, evictToken EvictionToken, useReverseScan bool,
-) (EvictionToken, error) {
+	ctx context.Context,
+	descKey roachpb.RKey,
+	evictToken rangecache.EvictionToken,
+	useReverseScan bool,
+) (rangecache.EvictionToken, error) {
 	returnToken, err := ds.rangeCache.LookupWithEvictionToken(
 		ctx, descKey, evictToken, useReverseScan,
 	)
 	if err != nil {
-		return EvictionToken{}, err
+		return rangecache.EvictionToken{}, err
 	}
 
 	// Sanity check: the descriptor we're about to return must include the key
@@ -574,7 +584,7 @@ func (ds *DistSender) initAndVerifyBatch(
 
 	// In the event that timestamp isn't set and read consistency isn't
 	// required, set the timestamp using the local clock.
-	if ba.ReadConsistency != roachpb.CONSISTENT && ba.Timestamp == (hlc.Timestamp{}) {
+	if ba.ReadConsistency != roachpb.CONSISTENT && ba.Timestamp.IsEmpty() {
 		ba.Timestamp = ds.clock.Now()
 	}
 
@@ -1049,7 +1059,7 @@ func (ds *DistSender) detectIntentMissingDueToIntentResolution(
 		// finalized as committed and already had its transaction record GCed. Both
 		// these cases return an ABORTED txn; in the GC case the record has been
 		// synthesized.
-		// If the the record has been GC'ed, then we can't distinguish between the
+		// If the record has been GC'ed, then we can't distinguish between the
 		// two cases, and so we're forced to return an ambiguous error. On the other
 		// hand, if the record exists, then we know that the transaction did not
 		// commit because a committed record cannot be GC'ed and the recreated as
@@ -1354,7 +1364,7 @@ func (ds *DistSender) sendPartialBatchAsync(
 	ctx context.Context,
 	ba roachpb.BatchRequest,
 	rs roachpb.RSpan,
-	routing EvictionToken,
+	routing rangecache.EvictionToken,
 	withCommit bool,
 	batchIdx int,
 	responseCh chan response,
@@ -1411,7 +1421,7 @@ func (ds *DistSender) sendPartialBatch(
 	ctx context.Context,
 	ba roachpb.BatchRequest,
 	rs roachpb.RSpan,
-	routingTok EvictionToken,
+	routingTok rangecache.EvictionToken,
 	withCommit bool,
 	batchIdx int,
 	needsTruncate bool,
@@ -1451,7 +1461,7 @@ func (ds *DistSender) sendPartialBatch(
 	// this descriptor are done at a lower level.
 	tBegin, attempts := timeutil.Now(), int64(0) // for slow log message
 	// prevTok maintains the EvictionToken used on the previous iteration.
-	var prevTok EvictionToken
+	var prevTok rangecache.EvictionToken
 	for r := retry.StartWithCtx(ctx, ds.rpcRetryOptions); r.Next(); {
 		attempts++
 		pErr = nil
@@ -1469,7 +1479,7 @@ func (ds *DistSender) sendPartialBatch(
 				// We set pErr if we encountered an error getting the descriptor in
 				// order to return the most recent error when we are out of retries.
 				pErr = roachpb.NewError(err)
-				if !isRangeLookupErrorRetryable(err) {
+				if !rangecache.IsRangeLookupErrorRetryable(err) {
 					return response{pErr: roachpb.NewError(err)}
 				}
 				continue
@@ -1549,7 +1559,7 @@ func (ds *DistSender) sendPartialBatch(
 			// the br.
 			if ba.ReturnRangeInfo &&
 				len(reply.RangeInfos) == 0 &&
-				!ds.st.Version.IsActive(ctx, clusterversion.VersionClientRangeInfosOnBatchResponse) {
+				!ds.st.Version.IsActive(ctx, clusterversion.ClientRangeInfosOnBatchResponse) {
 				// All the responses have the same RangeInfos in them, so just look at the
 				// first one.
 				firstRes := reply.Responses[0].GetInner()
@@ -1769,7 +1779,7 @@ func noMoreReplicasErr(ambiguousErr, lastAttemptErr error) error {
 // that do not definitively rule out the possibility that the batch could have
 // succeeded are transformed into AmbiguousResultErrors.
 func (ds *DistSender) sendToReplicas(
-	ctx context.Context, ba roachpb.BatchRequest, routing EvictionToken, withCommit bool,
+	ctx context.Context, ba roachpb.BatchRequest, routing rangecache.EvictionToken, withCommit bool,
 ) (*roachpb.BatchResponse, error) {
 	desc := routing.Desc()
 	ba.RangeID = desc.RangeID
@@ -1805,10 +1815,11 @@ func (ds *DistSender) sendToReplicas(
 		class:   rpc.ConnectionClassForKey(desc.RSpan().Key),
 		metrics: &ds.metrics,
 	}
-	transport, err := ds.transportFactory(opts, ds.nodeDialer, replicas.Descriptors())
+	transport, err := ds.transportFactory(opts, ds.nodeDialer, replicas)
 	if err != nil {
 		return nil, err
 	}
+	defer transport.Release()
 
 	// inTransferRetry is used to slow down retries in cases where an ongoing
 	// lease transfer is suspected.
@@ -1954,24 +1965,29 @@ func (ds *DistSender) sendToReplicas(
 			// If the reply contains a timestamp, update the local HLC with it.
 			if br.Error != nil {
 				log.VErrEventf(ctx, 2, "%v", br.Error)
-				if br.Error.Now != (hlc.Timestamp{}) {
+				if !br.Error.Now.IsEmpty() {
 					ds.clock.Update(br.Error.Now)
 				}
-			} else if br.Now != (hlc.Timestamp{}) {
+			} else if !br.Now.IsEmpty() {
 				ds.clock.Update(br.Now)
+			}
+
+			if br.Error == nil {
+				// If the server gave us updated range info, lets update our cache with it.
+				//
+				// TODO(andreimatei): shouldn't we do this unconditionally? Our cache knows how
+				// to disregard stale information.
+				if len(br.RangeInfos) > 0 {
+					log.VEventf(ctx, 2, "received updated range info: %s", br.RangeInfos)
+					routing.EvictAndReplace(ctx, br.RangeInfos...)
+				}
+				return br, nil
 			}
 
 			// TODO(andrei): There are errors below that cause us to move to a
 			// different replica without updating our caches. This means that future
 			// requests will attempt the same useless replicas.
 			switch tErr := br.Error.GetDetail().(type) {
-			case nil:
-				// If the server gave us updated range info, lets update our cache with it.
-				if len(br.RangeInfos) > 0 {
-					log.VEventf(ctx, 2, "received updated range info: %s", br.RangeInfos)
-					routing.EvictAndReplace(ctx, br.RangeInfos...)
-				}
-				return br, nil
 			case *roachpb.StoreNotFoundError, *roachpb.NodeUnavailableError:
 				// These errors are likely to be unique to the replica that reported
 				// them, so no action is required before the next retry.
@@ -2064,7 +2080,11 @@ func (ds *DistSender) maybeIncrementErrCounters(br *roachpb.BatchResponse, err e
 	if err != nil {
 		ds.metrics.ErrCounts[roachpb.CommunicationErrType].Inc(1)
 	} else {
-		ds.metrics.ErrCounts[br.Error.GetDetail().Type()].Inc(1)
+		typ := roachpb.InternalErrType
+		if detail := br.Error.GetDetail(); detail != nil {
+			typ = detail.Type()
+		}
+		ds.metrics.ErrCounts[typ].Inc(1)
 	}
 }
 
@@ -2078,7 +2098,7 @@ func (ds *DistSender) maybeIncrementErrCounters(br *roachpb.BatchResponse, err e
 //
 // Returns an error if the transport is exhausted.
 func skipStaleReplicas(
-	transport Transport, routing EvictionToken, ambiguousError error, lastErr error,
+	transport Transport, routing rangecache.EvictionToken, ambiguousError error, lastErr error,
 ) error {
 	// Check whether the range cache told us that the routing info we had is
 	// very out-of-date. If so, there's not much point in trying the other

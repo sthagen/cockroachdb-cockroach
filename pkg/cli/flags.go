@@ -20,14 +20,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/errors"
@@ -54,7 +53,6 @@ var serverSQLAddr, serverSQLPort string
 var serverSQLAdvertiseAddr, serverSQLAdvertisePort string
 var serverHTTPAddr, serverHTTPPort string
 var localityAdvertiseHosts localityList
-var sqlAuditLogDir log.DirName
 var startBackground bool
 
 // initPreFlagsDefaults initializes the values of the global variables
@@ -76,10 +74,6 @@ func initPreFlagsDefaults() {
 	serverHTTPPort = base.DefaultHTTPPort
 
 	localityAdvertiseHosts = localityList{}
-
-	if err := sqlAuditLogDir.Set(""); err != nil {
-		panic(err)
-	}
 
 	startBackground = false
 }
@@ -256,23 +250,15 @@ func init() {
 
 	// Every command but start will inherit the following setting.
 	AddPersistentPreRunE(cockroachCmd, func(cmd *cobra.Command, _ []string) error {
-		if err := extraClientFlagInit(); err != nil {
-			return err
-		}
-		return setDefaultStderrVerbosity(cmd, log.Severity_WARNING)
+		return extraClientFlagInit()
 	})
 
 	// Add a pre-run command for `start` and `start-single-node`, as well as the
 	// multi-tenancy related commands that start long-running servers.
-	allStartCmds := append([]*cobra.Command(nil), StartCmds...)
-	allStartCmds = append(allStartCmds, mtStartSQLCmd)
-	for _, cmd := range allStartCmds {
+	for _, cmd := range serverCmds {
 		AddPersistentPreRunE(cmd, func(cmd *cobra.Command, _ []string) error {
-			// Finalize the configuration of network and logging settings.
-			if err := extraServerFlagInit(cmd); err != nil {
-				return err
-			}
-			return setDefaultStderrVerbosity(cmd, log.Severity_INFO)
+			// Finalize the configuration of network settings.
+			return extraServerFlagInit(cmd)
 		})
 	}
 
@@ -295,43 +281,54 @@ func init() {
 			// Same as httptest, but for the datadriven package.
 			flag.Hidden = true
 		}
-		switch flag.Name {
-		case logflags.DeprecatedLogFilesCombinedMaxSizeName:
-			flag.Deprecated = "use --" + logflags.LogFilesCombinedMaxSizeName + " instead"
-			fallthrough
-		case logflags.ShowLogsName, // test-only flag
-			logflags.RedactableLogsName: // support-only flag
+		if flag.Name == logflags.ShowLogsName {
+			// test-only flag
 			flag.Hidden = true
-		case logflags.LogToStderrName:
-			// The actual default value for --logtostderr is overridden in
-			// cli.Main. We don't override it here as doing so would affect all of
-			// the cli tests and any package which depends on cli. The following line
-			// is only overriding the default value for the pflag package (and what
-			// is visible in help text), not the stdlib flag value.
-			flag.DefValue = "NONE"
-		case logflags.LogDirName,
-			logflags.LogFileMaxSizeName,
-			logflags.LogFilesCombinedMaxSizeName,
-			logflags.LogFileVerbosityThresholdName:
-			// The --log-dir* and --log-file* flags are specified only for the
-			// `start` and `demo` commands.
-			return
 		}
 		pf.AddFlag(flag)
 	})
 
-	// When a flag is specified but without a value, pflag assigns its
-	// NoOptDefVal to it via Set(). This is also the value used to
-	// generate the implicit assigned value in the usage text
-	// (e.g. "--logtostderr[=XXXXX]"). We can't populate a real default
-	// unfortunately, because the default depends on which command is
-	// run (`start` vs. the rest), and pflag does not support
-	// per-command NoOptDefVals. So we need some sentinel value here
-	// that we can recognize when setDefaultStderrVerbosity() is called
-	// after argument parsing. We could use UNKNOWN, but to ensure that
-	// the usage text is somewhat less confusing to the user, we use the
-	// special severity value DEFAULT instead.
-	pf.Lookup(logflags.LogToStderrName).NoOptDefVal = log.Severity_DEFAULT.String()
+	// Logging flags common to all commands.
+	{
+		// Logging configuration.
+		varFlag(pf, &cliCtx.logConfigInput, cliflags.Log)
+
+		// Pre-v21.1 overrides. Deprecated.
+		// TODO(knz): Remove this.
+		varFlag(pf, &cliCtx.deprecatedLogOverrides.stderrThreshold, cliflags.DeprecatedStderrThreshold)
+		_ = pf.MarkDeprecated(cliflags.DeprecatedStderrThreshold.Name,
+			"use --"+cliflags.Log.Name+" instead to specify sinks.stderr.filter.")
+		// This flag can also be specified without an explicit argument.
+		pf.Lookup(cliflags.DeprecatedStderrThreshold.Name).NoOptDefVal = "DEFAULT"
+
+		varFlag(pf, &cliCtx.deprecatedLogOverrides.stderrNoColor, cliflags.DeprecatedStderrNoColor)
+		_ = pf.MarkDeprecated(cliflags.DeprecatedStderrNoColor.Name,
+			"use --"+cliflags.Log.Name+" instead to specify sinks.stderr.no-color.")
+
+		varFlag(pf, &cliCtx.deprecatedLogOverrides.logDir, cliflags.DeprecatedLogDir)
+		_ = pf.MarkDeprecated(cliflags.DeprecatedLogDir.Name,
+			"use --"+cliflags.Log.Name+" instead to specify file-defaults.dir.")
+
+		varFlag(pf, cliCtx.deprecatedLogOverrides.fileMaxSizeVal, cliflags.DeprecatedLogFileMaxSize)
+		_ = pf.MarkDeprecated(cliflags.DeprecatedLogFileMaxSize.Name,
+			"use --"+cliflags.Log.Name+" instead to specify file-defaults.max-file-size.")
+
+		varFlag(pf, cliCtx.deprecatedLogOverrides.maxGroupSizeVal, cliflags.DeprecatedLogGroupMaxSize)
+		_ = pf.MarkDeprecated(cliflags.DeprecatedLogGroupMaxSize.Name,
+			"use --"+cliflags.Log.Name+" instead to specify file-defaults.max-group-size.")
+
+		varFlag(pf, &cliCtx.deprecatedLogOverrides.fileThreshold, cliflags.DeprecatedFileThreshold)
+		_ = pf.MarkDeprecated(cliflags.DeprecatedFileThreshold.Name,
+			"use --"+cliflags.Log.Name+" instead to specify file-defaults.filter.")
+
+		varFlag(pf, &cliCtx.deprecatedLogOverrides.redactableLogs, cliflags.DeprecatedRedactableLogs)
+		_ = pf.MarkDeprecated(cliflags.DeprecatedRedactableLogs.Name,
+			"use --"+cliflags.Log.Name+" instead to specify file-defaults:redactable-logs.")
+
+		varFlag(pf, &cliCtx.deprecatedLogOverrides.sqlAuditLogDir, cliflags.DeprecatedSQLAuditLogDir)
+		_ = pf.MarkDeprecated(cliflags.DeprecatedSQLAuditLogDir.Name,
+			"use --"+cliflags.Log.Name+" instead to specify sinks:file-groups:sql-audit.")
+	}
 
 	// Remember we are starting in the background as the `start` command will
 	// avoid printing some messages to standard output in that case.
@@ -442,29 +439,15 @@ func init() {
 		stringFlag(f, &startCtx.tempDir, cliflags.TempDir)
 		stringFlag(f, &startCtx.externalIODir, cliflags.ExternalIODir)
 
-		varFlag(f, serverCfg.AuditLogDirName, cliflags.SQLAuditLogDirName)
-
 		if backgroundFlagDefined {
 			boolFlag(f, &startBackground, cliflags.Background)
 		}
 	}
 
 	// Flags that apply to commands that start servers.
-	serverCmds := append(StartCmds, demoCmd)
-	serverCmds = append(serverCmds, demoCmd.Commands()...)
-	for _, cmd := range serverCmds {
-		f := cmd.Flags()
-		varFlag(f, &startCtx.logDir, cliflags.LogDir)
-		varFlag(f,
-			pflag.PFlagFromGoFlag(flag.Lookup(logflags.LogFilesCombinedMaxSizeName)).Value,
-			cliflags.LogDirMaxSize)
-		varFlag(f,
-			pflag.PFlagFromGoFlag(flag.Lookup(logflags.LogFileMaxSizeName)).Value,
-			cliflags.LogFileMaxSize)
-		varFlag(f,
-			pflag.PFlagFromGoFlag(flag.Lookup(logflags.LogFileVerbosityThresholdName)).Value,
-			cliflags.LogFileVerbosity)
-
+	telemetryEnabledCmds := append(serverCmds, demoCmd)
+	telemetryEnabledCmds = append(telemetryEnabledCmds, demoCmd.Commands()...)
+	for _, cmd := range telemetryEnabledCmds {
 		// Report flag usage for server commands in telemetry. We do this
 		// only for server commands, as there is no point in accumulating
 		// telemetry if there's no telemetry reporting loop being started.
@@ -542,7 +525,6 @@ func init() {
 		debugTimeSeriesDumpCmd,
 		debugZipCmd,
 		doctorClusterCmd,
-		dumpCmd,
 		genHAProxyCmd,
 		initCmd,
 		quitCmd,
@@ -553,8 +535,10 @@ func init() {
 	clientCmds = append(clientCmds, nodeCmds...)
 	clientCmds = append(clientCmds, systemBenchCmds...)
 	clientCmds = append(clientCmds, nodeLocalCmds...)
+	clientCmds = append(clientCmds, importCmds...)
 	clientCmds = append(clientCmds, userFileCmds...)
 	clientCmds = append(clientCmds, stmtDiagCmds...)
+	clientCmds = append(clientCmds, debugResetQuorumCmd)
 	for _, cmd := range clientCmds {
 		f := cmd.PersistentFlags()
 		varFlag(f, addrSetter{&cliCtx.clientConnHost, &cliCtx.clientConnPort}, cliflags.ClientHost)
@@ -661,14 +645,9 @@ func init() {
 		boolFlag(f, &sqlCtx.debugMode, cliflags.CliDebugMode)
 	}
 
-	varFlag(dumpCmd.Flags(), &dumpCtx.dumpMode, cliflags.DumpMode)
-	stringFlag(dumpCmd.Flags(), &dumpCtx.asOf, cliflags.DumpTime)
-	boolFlag(dumpCmd.Flags(), &dumpCtx.dumpAll, cliflags.DumpAll)
-
 	// Commands that establish a SQL connection.
 	sqlCmds := []*cobra.Command{
 		sqlShellCmd,
-		dumpCmd,
 		demoCmd,
 		doctorClusterCmd,
 		lsNodesCmd,
@@ -678,6 +657,7 @@ func init() {
 	sqlCmds = append(sqlCmds, demoCmd.Commands()...)
 	sqlCmds = append(sqlCmds, stmtDiagCmds...)
 	sqlCmds = append(sqlCmds, nodeLocalCmds...)
+	sqlCmds = append(sqlCmds, importCmds...)
 	sqlCmds = append(sqlCmds, userFileCmds...)
 	for _, cmd := range sqlCmds {
 		f := cmd.Flags()
@@ -756,7 +736,7 @@ func init() {
 		// NB: Insecure for `cockroach demo` is deprecated. See #53404.
 		_ = f.MarkDeprecated(cliflags.ServerInsecure.Name,
 			"to start a test server without any security, run start-single-node --insecure\n"+
-				"For details, see: "+unimplemented.MakeURL(53404))
+				"For details, see: "+build.MakeIssueURL(53404))
 
 		boolFlag(f, &demoCtx.disableLicenseAcquisition, cliflags.DemoNoLicense)
 		// Mark the --global flag as hidden until we investigate it more.
@@ -770,12 +750,26 @@ func init() {
 		// variables from startCtx, this is one case where we afford
 		// sharing a variable between both.
 		stringFlag(f, &startCtx.geoLibsDir, cliflags.GeoLibsDir)
+
+		intFlag(f, &demoCtx.sqlPort, cliflags.DemoSQLPort)
+		intFlag(f, &demoCtx.httpPort, cliflags.DemoHTTPPort)
 	}
 
 	// statement-diag command.
 	{
 		boolFlag(stmtDiagDeleteCmd.Flags(), &stmtDiagCtx.all, cliflags.StmtDiagDeleteAll)
 		boolFlag(stmtDiagCancelCmd.Flags(), &stmtDiagCtx.all, cliflags.StmtDiagCancelAll)
+	}
+
+	// import dump command.
+	{
+		d := importDumpFileCmd.Flags()
+		boolFlag(d, &importCtx.skipForeignKeys, cliflags.ImportSkipForeignKeys)
+		intFlag(d, &importCtx.maxRowSize, cliflags.ImportMaxRowSize)
+
+		t := importDumpTableCmd.Flags()
+		boolFlag(t, &importCtx.skipForeignKeys, cliflags.ImportSkipForeignKeys)
+		intFlag(t, &importCtx.maxRowSize, cliflags.ImportMaxRowSize)
 	}
 
 	// sqlfmt command.
@@ -798,6 +792,10 @@ func init() {
 		boolFlag(f, &debugCtx.values, cliflags.Values)
 		boolFlag(f, &debugCtx.sizes, cliflags.Sizes)
 		stringFlag(f, &debugCtx.decodeAsTableDesc, cliflags.DecodeAsTable)
+	}
+	{
+		f := debugCheckLogConfigCmd.Flags()
+		varFlag(f, &serverCfg.Stores, cliflags.Store)
 	}
 	{
 		f := debugRangeDataCmd.Flags()
@@ -830,7 +828,6 @@ func init() {
 		varFlag(f, addrSetter{&serverHTTPAddr, &serverHTTPPort}, cliflags.ListenHTTPAddr)
 
 		stringSliceFlag(f, &serverCfg.SQLConfig.TenantKVAddrs, cliflags.KVAddrs)
-		varFlag(f, &startCtx.logDir, cliflags.LogDir)
 	}
 }
 
@@ -928,7 +925,7 @@ func extraServerFlagInit(cmd *cobra.Command) error {
 	if err := security.SetCertPrincipalMap(startCtx.serverCertPrincipalMap); err != nil {
 		return err
 	}
-	serverCfg.User = security.NodeUser
+	serverCfg.User = security.NodeUserName()
 	serverCfg.Insecure = startCtx.serverInsecure
 	serverCfg.SSLCertsDir = startCtx.serverSSLCertsDir
 
@@ -1059,23 +1056,6 @@ func extraClientFlagInit() error {
 	if sqlCtx.debugMode {
 		sqlCtx.echo = true
 	}
-	return nil
-}
-
-func setDefaultStderrVerbosity(cmd *cobra.Command, defaultSeverity log.Severity) error {
-	vf := flagSetForCmd(cmd).Lookup(logflags.LogToStderrName)
-
-	// if `--logtostderr` was not specified and no log directory was
-	// set, or `--logtostderr` was specified but without explicit level,
-	// then set stderr logging to the level considered default by the
-	// specific command.
-	if (!vf.Changed && !log.DirSet()) ||
-		(vf.Changed && vf.Value.String() == log.Severity_DEFAULT.String()) {
-		if err := vf.Value.Set(defaultSeverity.String()); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -596,26 +597,6 @@ func (sr *ReverseScanResponse) Verify(req Request) error {
 	return nil
 }
 
-// MustSetInner sets the Request contained in the union. It panics if the
-// request is not recognized by the union type. The RequestUnion is reset
-// before being repopulated.
-func (ru *RequestUnion) MustSetInner(args Request) {
-	ru.Reset()
-	if !ru.SetInner(args) {
-		panic(errors.AssertionFailedf("%T excludes %T", ru, args))
-	}
-}
-
-// MustSetInner sets the Response contained in the union. It panics if the
-// response is not recognized by the union type. The ResponseUnion is reset
-// before being repopulated.
-func (ru *ResponseUnion) MustSetInner(reply Response) {
-	ru.Reset()
-	if !ru.SetInner(reply) {
-		panic(errors.AssertionFailedf("%T excludes %T", ru, reply))
-	}
-}
-
 // Method implements the Request interface.
 func (*GetRequest) Method() Method { return Get }
 
@@ -1083,6 +1064,37 @@ func NewConditionalPut(key Key, value Value, expValue []byte, allowNotExist bool
 	}
 }
 
+// NewConditionalPutInline returns a Request initialized to put an inline value
+// at key if the existing value at key equals expValue.
+//
+// The callee takes ownership of value's underlying bytes and it will mutate
+// them. The caller retains ownership of expVal; NewConditionalPut will copy it
+// into the request.
+//
+// Callers should check the version gate clusterversion.CPutInline to make
+// sure this is supported.
+func NewConditionalPutInline(key Key, value Value, expValue []byte, allowNotExist bool) Request {
+	value.InitChecksum(key)
+	// Compatibility with 20.1 servers.
+	var expValueVal *Value
+	if expValue != nil {
+		expValueVal = &Value{}
+		expValueVal.SetTagAndData(expValue)
+		// The expected value does not need a checksum, so we don't initialize it.
+	}
+
+	return &ConditionalPutRequest{
+		RequestHeader: RequestHeader{
+			Key: key,
+		},
+		Value:               value,
+		DeprecatedExpValue:  expValueVal,
+		ExpBytes:            expValue,
+		AllowIfDoesNotExist: allowNotExist,
+		Inline:              true,
+	}
+}
+
 // NewInitPut returns a Request initialized to put the value at key, as long as
 // the key doesn't exist, returning a ConditionFailedError if the key exists and
 // the existing value is different from value. If failOnTombstones is set to
@@ -1208,14 +1220,15 @@ func (drr *DeleteRangeRequest) flags() int {
 	// This workaround does not preclude us from creating a separate
 	// "DeleteInlineRange" command at a later date.
 	if drr.Inline {
-		return isWrite | isRange | isAlone
+		return isRead | isWrite | isRange | isAlone
 	}
 	// DeleteRange updates the timestamp cache as it doesn't leave intents or
-	// tombstones for keys which don't yet exist, but still wants to prevent
-	// anybody from writing under it. Note that, even if we didn't update the ts
-	// cache, deletes of keys that exist would not be lost (since the DeleteRange
-	// leaves intents on those keys), but deletes of "empty space" would.
-	return isWrite | isTxn | isLocking | isIntentWrite | isRange | consultsTSCache | updatesTSCache | needsRefresh | canBackpressure
+	// tombstones for keys which don't yet exist or keys that already have
+	// tombstones on them, but still wants to prevent anybody from writing under
+	// it. Note that, even if we didn't update the ts cache, deletes of keys
+	// that exist would not be lost (since the DeleteRange leaves intents on
+	// those keys), but deletes of "empty space" would.
+	return isRead | isWrite | isTxn | isLocking | isIntentWrite | isRange | consultsTSCache | updatesTSCache | needsRefresh | canBackpressure
 }
 
 // Note that ClearRange commands cannot be part of a transaction as
@@ -1418,14 +1431,26 @@ func (rc ReplicationChanges) byType(typ ReplicaChangeType) []ReplicationTarget {
 	return sl
 }
 
-// Additions returns a slice of all contained replication changes that add replicas.
-func (rc ReplicationChanges) Additions() []ReplicationTarget {
-	return rc.byType(ADD_REPLICA)
+// VoterAdditions returns a slice of all contained replication changes that add replicas.
+func (rc ReplicationChanges) VoterAdditions() []ReplicationTarget {
+	return rc.byType(ADD_VOTER)
 }
 
-// Removals returns a slice of all contained replication changes that remove replicas.
-func (rc ReplicationChanges) Removals() []ReplicationTarget {
-	return rc.byType(REMOVE_REPLICA)
+// VoterRemovals returns a slice of all contained replication changes that remove replicas.
+func (rc ReplicationChanges) VoterRemovals() []ReplicationTarget {
+	return rc.byType(REMOVE_VOTER)
+}
+
+// NonVoterAdditions returns a slice of all contained replication
+// changes that add non-voters.
+func (rc ReplicationChanges) NonVoterAdditions() []ReplicationTarget {
+	return rc.byType(ADD_NON_VOTER)
+}
+
+// NonVoterRemovals returns a slice of all contained replication changes
+// that remove non-voters.
+func (rc ReplicationChanges) NonVoterRemovals() []ReplicationTarget {
+	return rc.byType(REMOVE_NON_VOTER)
 }
 
 // Changes returns the changes requested by this AdminChangeReplicasRequest, taking
@@ -1465,4 +1490,22 @@ func (rirr *ResolveIntentRangeRequest) AsLockUpdate() LockUpdate {
 		Status:         rirr.Status,
 		IgnoredSeqNums: rirr.IgnoredSeqNums,
 	}
+}
+
+// CreateStoreIdent creates a store identifier out of the details captured
+// within the join node response (the join node RPC is used to allocate a store
+// ID for the client's first store).
+func (r *JoinNodeResponse) CreateStoreIdent() (StoreIdent, error) {
+	nodeID, storeID := NodeID(r.NodeID), StoreID(r.StoreID)
+	clusterID, err := uuid.FromBytes(r.ClusterID)
+	if err != nil {
+		return StoreIdent{}, err
+	}
+
+	sIdent := StoreIdent{
+		ClusterID: clusterID,
+		NodeID:    nodeID,
+		StoreID:   storeID,
+	}
+	return sIdent, nil
 }

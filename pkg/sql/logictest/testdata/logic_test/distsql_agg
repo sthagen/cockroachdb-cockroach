@@ -572,10 +572,30 @@ CREATE TABLE statistics_agg_test (y INT, x INT)
 statement ok
 INSERT INTO statistics_agg_test SELECT y, y%10 FROM generate_series(1, 100) AS y
 
-query F
-SELECT corr(y, x)::decimal FROM statistics_agg_test
+query FFF
+SELECT corr(y, x)::decimal, covar_pop(y, x)::decimal, covar_samp(y, x)::decimal FROM statistics_agg_test
 ----
-0.045228963191363145
+0.045228963191363145 3.75 3.787878787878788
+
+query FFF
+SELECT regr_intercept(y, x), regr_r2(y, x), regr_slope(y, x) FROM statistics_agg_test
+----
+48.4545454545455 0.00204565911136568 0.454545454545455
+
+query FFF
+SELECT regr_sxx(y, x), regr_sxy(y, x), regr_syy(y, x) FROM statistics_agg_test
+----
+825 375 83325
+
+query I
+SELECT regr_count(y, x) FROM statistics_agg_test
+----
+100
+
+query FF
+SELECT regr_avgx(y, x), regr_avgy(y, x) FROM statistics_agg_test
+----
+4.5 50.5
 
 # Regression test for #37211 (incorrect ordering between aggregator stages).
 statement ok

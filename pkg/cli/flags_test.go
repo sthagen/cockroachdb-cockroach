@@ -31,23 +31,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/spf13/cobra"
 )
 
 func TestStdFlagToPflag(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	cf := cockroachCmd.PersistentFlags()
 	flag.VisitAll(func(f *flag.Flag) {
 		if strings.HasPrefix(f.Name, "test.") {
-			return
-		}
-		switch f.Name {
-		case logflags.LogDirName,
-			logflags.LogFileMaxSizeName,
-			logflags.LogFilesCombinedMaxSizeName,
-			logflags.LogFileVerbosityThresholdName:
 			return
 		}
 		if pf := cf.Lookup(f.Name); pf == nil {
@@ -59,6 +52,7 @@ func TestStdFlagToPflag(t *testing.T) {
 func TestNoLinkForbidden(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	// Verify that the cockroach binary doesn't depend on certain packages.
 	buildutil.VerifyNoImports(t,
 		"github.com/cockroachdb/cockroach/pkg/cmd/cockroach", true,
@@ -242,9 +236,9 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 
 	anyCmd := []string{"sql", "quit"}
 	anyNonSQL := []string{"quit", "init"}
-	anySQL := []string{"sql", "dump"}
+	anySQL := []string{"sql"}
 	sqlShell := []string{"sql"}
-	anyNonSQLShell := []string{"dump", "quit"}
+	anyNonSQLShell := []string{"quit"}
 
 	testData := []struct {
 		cmds       []string

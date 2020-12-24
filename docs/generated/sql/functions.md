@@ -330,9 +330,13 @@
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
-<tr><td><a name="age"></a><code>age(end: <a href="timestamp.html">timestamptz</a>, begin: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Calculates the interval between <code>begin</code> and <code>end</code>.</p>
+<tr><td><a name="age"></a><code>age(end: <a href="timestamp.html">timestamptz</a>, begin: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Calculates the interval between <code>begin</code> and <code>end</code>, normalized into years, months and days.</p>
+<pre><code>		Note this may not be an accurate time span since years and months are normalized from days, and years and months are out of context.
+		To avoid normalizing days into months and years, use the timestamptz subtraction operator.</code></pre>
 </span></td></tr>
-<tr><td><a name="age"></a><code>age(val: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Calculates the interval between <code>val</code> and the current time.</p>
+<tr><td><a name="age"></a><code>age(val: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Calculates the interval between <code>val</code> and the current time, normalized into years, months and days.</p>
+<pre><code>		Note this may not be an accurate time span since years and months are normalized from days, and years and months are out of context.
+		To avoid normalizing days into months and years, use `now() - timestamptz`.</code></pre>
 </span></td></tr>
 <tr><td><a name="clock_timestamp"></a><code>clock_timestamp() &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Returns the current system time on one of the cluster nodes.</p>
 </span></td></tr>
@@ -707,6 +711,8 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="unique_rowid"></a><code>unique_rowid() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns a unique ID used by CockroachDB to generate unique row IDs if a Primary Key isn’t defined for the table. The value is a combination of the insert timestamp and the ID of the node executing the statement, which guarantees this combination is globally unique. However, there can be gaps and the order is not completely guaranteed.</p>
 </span></td></tr>
+<tr><td><a name="uuid_generate_v4"></a><code>uuid_generate_v4() &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Generates a random UUID and returns it as a value of UUID type.</p>
+</span></td></tr>
 <tr><td><a name="uuid_v4"></a><code>uuid_v4() &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Returns a UUID.</p>
 </span></td></tr></tbody>
 </table>
@@ -773,6 +779,10 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="fnv64a"></a><code>fnv64a(<a href="string.html">string</a>...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the 64-bit FNV-1a hash value of a set of values.</p>
 </span></td></tr>
+<tr><td><a name="levenshtein"></a><code>levenshtein(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the Levenshtein distance between two strings. Maximum input length is 255 characters.</p>
+</span></td></tr>
+<tr><td><a name="levenshtein"></a><code>levenshtein(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>, ins_cost: <a href="int.html">int</a>, del_cost: <a href="int.html">int</a>, sub_cost: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the Levenshtein distance between two strings. The cost parameters specify how much to charge for each edit operation. Maximum input length is 255 characters.</p>
+</span></td></tr>
 <tr><td><a name="width_bucket"></a><code>width_bucket(operand: <a href="decimal.html">decimal</a>, b1: <a href="decimal.html">decimal</a>, b2: <a href="decimal.html">decimal</a>, count: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>return the bucket number to which operand would be assigned in a histogram having count equal-width buckets spanning the range b1 to b2.</p>
 </span></td></tr>
 <tr><td><a name="width_bucket"></a><code>width_bucket(operand: <a href="int.html">int</a>, b1: <a href="int.html">int</a>, b2: <a href="int.html">int</a>, count: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>return the bucket number to which operand would be assigned in a histogram having count equal-width buckets spanning the range b1 to b2.</p>
@@ -793,6 +803,8 @@ has no relationship with the commit order of concurrent transactions.</p>
 <tr><td><a name="crdb_internal.json_to_pb"></a><code>crdb_internal.json_to_pb(pbname: <a href="string.html">string</a>, json: jsonb) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Convert JSONB data to protocol message bytes</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.pb_to_json"></a><code>crdb_internal.pb_to_json(pbname: <a href="string.html">string</a>, data: <a href="bytes.html">bytes</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Converts protocol message to its JSONB representation.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.pb_to_json"></a><code>crdb_internal.pb_to_json(pbname: <a href="string.html">string</a>, data: <a href="bytes.html">bytes</a>, emit_defaults: <a href="bool.html">bool</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Converts protocol message to its JSONB representation.</p>
 </span></td></tr>
 <tr><td><a name="json_array_length"></a><code>json_array_length(json: jsonb) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of elements in the outermost JSON or JSONB array.</p>
 </span></td></tr>
@@ -1671,6 +1683,7 @@ Bottom Left.</p>
 <p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_frechetdistance"></a><code>st_frechetdistance(geometry_a: geometry, geometry_b: geometry, densify_frac: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the Frechet distance between the given geometries, with the given segment densification (range 0.0-1.0, -1 to disable).</p>
+<p>Smaller densify_frac gives a more accurate Fréchet distance. However, the computation time and memory usage increases with the square of the number of subsegments.</p>
 <p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_geogfromewkb"></a><code>st_geogfromewkb(val: <a href="bytes.html">bytes</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns the Geography from an EWKB representation.</p>
@@ -1966,6 +1979,8 @@ calculated, the result is transformed back into a Geography with SRID 4326.</p>
 </span></td></tr>
 <tr><td><a name="st_ndims"></a><code>st_ndims(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of coordinate dimensions of a given Geometry.</p>
 </span></td></tr>
+<tr><td><a name="st_node"></a><code>st_node(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Adds a node on a geometry for each intersection. Resulting geometry is always a MultiLineString.</p>
+</span></td></tr>
 <tr><td><a name="st_normalize"></a><code>st_normalize(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the geometry in its normalized form.</p>
 <p>This function utilizes the GEOS module.</p>
 </span></td></tr>
@@ -1982,6 +1997,10 @@ calculated, the result is transformed back into a Geography with SRID 4326.</p>
 <tr><td><a name="st_numpoints"></a><code>st_numpoints(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of points in a LineString. Returns NULL if the Geometry is not a LineString.</p>
 </span></td></tr>
 <tr><td><a name="st_orderingequals"></a><code>st_orderingequals(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a is exactly equal to geometry_b, having all coordinates in the same order, as well as the same type, SRID, bounding box, and so on.</p>
+</span></td></tr>
+<tr><td><a name="st_orientedenvelope"></a><code>st_orientedenvelope(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a minimum rotated rectangle enclosing a geometry.
+Note that more than one minimum rotated rectangle may exist.
+May return a Point or LineString in the case of degenerate inputs.</p>
 </span></td></tr>
 <tr><td><a name="st_overlaps"></a><code>st_overlaps(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a intersects but does not completely contain geometry_b, or vice versa. “Does not completely” implies ST_Within(geometry_a, geometry_b) = ST_Within(geometry_b, geometry_a) = false.</p>
 <p>This function utilizes the GEOS module.</p>
@@ -2135,6 +2154,10 @@ The paths themselves are given in the direction of the first geometry.</p>
 </span></td></tr>
 <tr><td><a name="st_startpoint"></a><code>st_startpoint(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the first point of a geometry which has shape LineString. Returns NULL if the geometry is not a LineString.</p>
 </span></td></tr>
+<tr><td><a name="st_subdivide"></a><code>st_subdivide(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a geometry divided into parts, where each part contains no more than 256 vertices.</p>
+</span></td></tr>
+<tr><td><a name="st_subdivide"></a><code>st_subdivide(geometry: geometry, max_vertices: int4) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a geometry divided into parts, where each part contains no more than the number of vertices provided.</p>
+</span></td></tr>
 <tr><td><a name="st_summary"></a><code>st_summary(geography: geography) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns a text summary of the contents of the geography.</p>
 <p>Flags shown square brackets after the geometry type have the following meaning:</p>
 <ul>
@@ -2181,6 +2204,22 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 <p>This function utilizes the PROJ library for coordinate projections.</p>
 </span></td></tr>
 <tr><td><a name="st_translate"></a><code>st_translate(g: geometry, delta_x: <a href="float.html">float</a>, delta_y: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry translated by the given deltas.</p>
+</span></td></tr>
+<tr><td><a name="st_transscale"></a><code>st_transscale(geometry: geometry, delta_x: <a href="float.html">float</a>, delta_y: <a href="float.html">float</a>, x_factor: <a href="float.html">float</a>, y_factor: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Translates the geometry using the deltaX and deltaY args, then scales it using the XFactor, YFactor args, working in 2D only.</p>
+</span></td></tr>
+<tr><td><a name="st_unaryunion"></a><code>st_unaryunion(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a union of the components for any geometry or geometry collection provided. Dissolves boundaries of a multipolygon.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoilines"></a><code>st_voronoilines(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry asthe boundaries between cells in that diagram as a MultiLineString.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoilines"></a><code>st_voronoilines(geometry: geometry, tolerance: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry asthe boundaries between cells in that diagram as a MultiLineString.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoilines"></a><code>st_voronoilines(geometry: geometry, tolerance: <a href="float.html">float</a>, extend_to: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry asthe boundaries between cells in that diagram as a MultiLineString.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoipolygons"></a><code>st_voronoipolygons(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoipolygons"></a><code>st_voronoipolygons(geometry: geometry, tolerance: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoipolygons"></a><code>st_voronoipolygons(geometry: geometry, tolerance: <a href="float.html">float</a>, extend_to: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry.</p>
 </span></td></tr>
 <tr><td><a name="st_within"></a><code>st_within(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a is completely inside geometry_b.</p>
 <p>This function utilizes the GEOS module.</p>
@@ -2234,6 +2273,8 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 <tr><td><a name="convert_to"></a><code>convert_to(str: <a href="string.html">string</a>, enc: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Encode the string <code>str</code> as a byte array using encoding <code>enc</code>. Supports encodings ‘UTF8’ and ‘LATIN1’.</p>
 </span></td></tr>
 <tr><td><a name="decode"></a><code>decode(text: <a href="string.html">string</a>, format: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Decodes <code>data</code> using <code>format</code> (<code>hex</code> / <code>escape</code> / <code>base64</code>).</p>
+</span></td></tr>
+<tr><td><a name="difference"></a><code>difference(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert two strings to their Soundex codes and then reports the number of matching code positions.</p>
 </span></td></tr>
 <tr><td><a name="encode"></a><code>encode(data: <a href="bytes.html">bytes</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Encodes <code>data</code> using <code>format</code> (<code>hex</code> / <code>escape</code> / <code>base64</code>).</p>
 </span></td></tr>
@@ -2415,6 +2456,8 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td></tr>
 <tr><td><a name="sha512"></a><code>sha512(<a href="string.html">string</a>...) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Calculates the SHA512 hash value of a set of values.</p>
 </span></td></tr>
+<tr><td><a name="soundex"></a><code>soundex(source: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert a string to its Soundex code.</p>
+</span></td></tr>
 <tr><td><a name="split_part"></a><code>split_part(input: <a href="string.html">string</a>, delimiter: <a href="string.html">string</a>, return_index_pos: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Splits <code>input</code> on <code>delimiter</code> and return the value in the <code>return_index_pos</code>  position (starting at 1).</p>
 <p>For example, <code>split_part('123.456.789.0','.',3)</code>returns <code>789</code>.</p>
 </span></td></tr>
@@ -2540,7 +2583,11 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.num_inverted_index_entries"></a><code>crdb_internal.num_inverted_index_entries(val: anyelement[]) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.num_inverted_index_entries"></a><code>crdb_internal.num_inverted_index_entries(val: anyelement[], version: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.num_inverted_index_entries"></a><code>crdb_internal.num_inverted_index_entries(val: jsonb) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.num_inverted_index_entries"></a><code>crdb_internal.num_inverted_index_entries(val: jsonb, version: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.pretty_key"></a><code>crdb_internal.pretty_key(raw_key: <a href="bytes.html">bytes</a>, skip_fields: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>

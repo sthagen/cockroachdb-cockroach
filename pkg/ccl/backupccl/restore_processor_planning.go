@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
@@ -38,7 +39,7 @@ import (
 // This method also closes the given progCh.
 func distRestore(
 	ctx context.Context,
-	phs sql.PlanHookState,
+	execCtx sql.JobExecContext,
 	chunks [][]execinfrapb.RestoreSpanEntry,
 	pkIDs map[uint64]bool,
 	encryption *jobspb.BackupEncryptionOptions,
@@ -50,13 +51,13 @@ func distRestore(
 	defer close(progCh)
 	var noTxn *kv.Txn
 
-	dsp := phs.DistSQLPlanner()
-	evalCtx := phs.ExtendedEvalContext()
+	dsp := execCtx.DistSQLPlanner()
+	evalCtx := execCtx.ExtendedEvalContext()
 
 	if encryption != nil && encryption.Mode == jobspb.EncryptionMode_KMS {
 		kms, err := cloud.KMSFromURI(encryption.KMSInfo.Uri, &backupKMSEnv{
-			settings: phs.ExecCfg().Settings,
-			conf:     &phs.ExecCfg().ExternalIODirConfig,
+			settings: execCtx.ExecCfg().Settings,
+			conf:     &execCtx.ExecCfg().ExternalIODirConfig,
 		})
 		if err != nil {
 			return err
@@ -69,18 +70,16 @@ func distRestore(
 		}
 	}
 	// Wrap the relevant BackupEncryptionOptions to be used by the Restore
-	// processor and KV ImportRequest.
+	// processor.
 	var fileEncryption *roachpb.FileEncryptionOptions
 	if encryption != nil {
 		fileEncryption = &roachpb.FileEncryptionOptions{Key: encryption.Key}
 	}
 
-	planCtx, _, err := dsp.SetupAllNodesPlanning(ctx, evalCtx, phs.ExecCfg())
+	planCtx, nodes, err := dsp.SetupAllNodesPlanning(ctx, evalCtx, execCtx.ExecCfg())
 	if err != nil {
 		return err
 	}
-
-	nodes := getAllCompatibleNodes(planCtx)
 
 	splitAndScatterSpecs, err := makeSplitAndScatterSpecs(nodes, chunks, rekeys)
 	if err != nil {
@@ -100,11 +99,7 @@ func distRestore(
 		return nil
 	}
 
-	gatewayNodeID, err := evalCtx.ExecCfg.NodeID.OptionalNodeIDErr(47970)
-	if err != nil {
-		return err
-	}
-	p := sql.MakePhysicalPlan(gatewayNodeID)
+	p := planCtx.NewPhysicalPlan()
 
 	// Plan SplitAndScatter in a round-robin fashion.
 	splitAndScatterStageID := p.NewStageOnNodes(nodes)
@@ -159,7 +154,8 @@ func distRestore(
 						RangeRouterSpec: rangeRouterSpec,
 					},
 				},
-				StageID: splitAndScatterStageID,
+				StageID:     splitAndScatterStageID,
+				ResultTypes: splitAndScatterOutputTypes,
 			},
 		}
 		pIdx := p.AddProcessor(proc)
@@ -176,10 +172,11 @@ func distRestore(
 				Input: []execinfrapb.InputSyncSpec{
 					{ColumnTypes: splitAndScatterOutputTypes},
 				},
-				Core:    execinfrapb.ProcessorCoreUnion{RestoreData: &restoreDataSpec},
-				Post:    execinfrapb.PostProcessSpec{},
-				Output:  []execinfrapb.OutputRouterSpec{{Type: execinfrapb.OutputRouterSpec_PASS_THROUGH}},
-				StageID: restoreDataStageID,
+				Core:        execinfrapb.ProcessorCoreUnion{RestoreData: &restoreDataSpec},
+				Post:        execinfrapb.PostProcessSpec{},
+				Output:      []execinfrapb.OutputRouterSpec{{Type: execinfrapb.OutputRouterSpec_PASS_THROUGH}},
+				StageID:     restoreDataStageID,
+				ResultTypes: []*types.T{},
 			},
 		}
 		pIdx := p.AddProcessor(proc)
@@ -200,7 +197,7 @@ func distRestore(
 		}
 	}
 
-	dsp.FinalizePlan(planCtx, &p)
+	dsp.FinalizePlan(planCtx, p)
 
 	metaFn := func(_ context.Context, meta *execinfrapb.ProducerMetadata) error {
 		if meta.BulkProcessorProgress != nil {
@@ -218,27 +215,15 @@ func distRestore(
 		tree.Rows,
 		nil,   /* rangeCache */
 		noTxn, /* txn - the flow does not read or write the database */
-		func(ts hlc.Timestamp) {},
+		nil,   /* clockUpdater */
 		evalCtx.Tracing,
 	)
 	defer recv.Release()
 
 	// Copy the evalCtx, as dsp.Run() might change it.
 	evalCtxCopy := *evalCtx
-	dsp.Run(planCtx, noTxn, &p, recv, &evalCtxCopy, nil /* finishedSetupFn */)()
+	dsp.Run(planCtx, noTxn, p, recv, &evalCtxCopy, nil /* finishedSetupFn */)()
 	return rowResultWriter.Err()
-}
-
-// getAllCompatibleNodes returns all nodes that are OK to use in the DistSQL
-// plan.
-func getAllCompatibleNodes(planCtx *sql.PlanningCtx) []roachpb.NodeID {
-	nodes := make([]roachpb.NodeID, 0, len(planCtx.NodeStatuses))
-	for node, status := range planCtx.NodeStatuses {
-		if status == sql.NodeOK {
-			nodes = append(nodes, node)
-		}
-	}
-	return nodes
 }
 
 // makeSplitAndScatterSpecs returns a map from nodeID to the SplitAndScatter

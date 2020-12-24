@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -27,8 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
-	"go.etcd.io/etcd/raft"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // replica_application_*.go files provide concrete implementations of
@@ -261,10 +260,11 @@ func checkForcedErr(
 		// We return a NotLeaseHolderError so that the DistSender retries.
 		// NB: we set proposerStoreID to 0 because we don't know who proposed the
 		// Raft command. This is ok, as this is only used for debug information.
-		nlhe := newNotLeaseHolderError(replicaState.Lease, 0 /* proposerStoreID */, replicaState.Desc)
-		nlhe.CustomMsg = fmt.Sprintf(
-			"stale proposal: command was proposed under lease #%d but is being applied "+
-				"under lease: %s", raftCmd.ProposerLeaseSequence, replicaState.Lease)
+		nlhe := newNotLeaseHolderError(
+			replicaState.Lease, 0 /* proposerStoreID */, replicaState.Desc,
+			fmt.Sprintf(
+				"stale proposal: command was proposed under lease #%d but is being applied "+
+					"under lease: %s", raftCmd.ProposerLeaseSequence, replicaState.Lease))
 		return leaseIndex, proposalNoReevaluation, roachpb.NewError(nlhe)
 	}
 
@@ -551,7 +551,7 @@ func changeRemovesStore(
 	// a new range descriptor. Check first if this is 19.1 or earlier command which
 	// uses DeprecatedChangeType and DeprecatedReplica
 	if change.Desc == nil {
-		return change.DeprecatedChangeType == roachpb.REMOVE_REPLICA && change.DeprecatedReplica.ReplicaID == curReplica.ReplicaID
+		return change.DeprecatedChangeType == roachpb.REMOVE_VOTER && change.DeprecatedReplica.ReplicaID == curReplica.ReplicaID
 	}
 	// In 19.2 and beyond we supply the new range descriptor in the change.
 	// We know we're removed if we do not appear in the new descriptor.
@@ -795,46 +795,12 @@ func (b *replicaAppBatch) stageTrivialReplicatedEvalResult(
 	}
 	res := cmd.replicatedResult()
 
-	// Detect whether the incoming stats contain estimates that resulted from the
-	// evaluation of a command under the 19.1 cluster version. These were either
-	// evaluated on a 19.1 node (where ContainsEstimates is a bool, which maps
-	// to 0 and 1 in 19.2+) or on a 19.2 node which hadn't yet had its cluster
-	// version bumped.
-	//
-	// 19.2 nodes will never emit a ContainsEstimates outside of 0 or 1 until
-	// the cluster version is active (during command evaluation). When the
-	// version is active, they will never emit odd positive numbers (1, 3, ...).
-	//
-	// As a result, we can pinpoint exactly when the proposer of this command
-	// has used the old cluster version: it's when the incoming
-	// ContainsEstimates is 1. If so, we need to assume that an old node is processing
-	// the same commands (as `true + true = true`), so make sure that `1 + 1 = 1`.
-	_ = clusterversion.VersionContainsEstimatesCounter // see for info on ContainsEstimates migration
-	deltaStats := res.Delta.ToStats()
-	if deltaStats.ContainsEstimates == 1 && b.state.Stats.ContainsEstimates == 1 {
-		deltaStats.ContainsEstimates = 0
-	}
-
 	// Special-cased MVCC stats handling to exploit commutativity of stats delta
 	// upgrades. Thanks to commutativity, the spanlatch manager does not have to
 	// serialize on the stats key.
+	deltaStats := res.Delta.ToStats()
 	b.state.Stats.Add(deltaStats)
-	// Exploit the fact that a split will result in a full stats
-	// recomputation to reset the ContainsEstimates flag.
-	// If we were running the new VersionContainsEstimatesCounter cluster version,
-	// the consistency checker will be able to reset the stats itself, and splits
-	// will as a side effect also remove estimates from both the resulting left and right hand sides.
-	//
-	// TODO(tbg): this can be removed in v20.2 and not earlier.
-	// Consider the following scenario:
-	// - all nodes are running 19.2
-	// - all nodes rebooted into 20.1
-	// - cluster version bumped, but node1 doesn't receive the gossip update for that
-	// node1 runs a split that should emit ContainsEstimates=-1, but it clamps it to 0/1 because it
-	// doesn't know that 20.1 is active.
-	if res.Split != nil && deltaStats.ContainsEstimates == 0 {
-		b.state.Stats.ContainsEstimates = 0
-	}
+
 	if res.State != nil && res.State.UsingAppliedStateKey && !b.state.UsingAppliedStateKey {
 		b.migrateToAppliedStateKey = true
 	}
@@ -1070,7 +1036,7 @@ func (sm *replicaStateMachine) ApplySideEffects(
 			sm.r.mu.Unlock()
 			sm.stats.stateAssertions++
 		}
-	} else if res := cmd.replicatedResult(); !res.Equal(kvserverpb.ReplicatedEvalResult{}) {
+	} else if res := cmd.replicatedResult(); !res.IsZero() {
 		log.Fatalf(ctx, "failed to handle all side-effects of ReplicatedEvalResult: %v", res)
 	}
 
@@ -1126,7 +1092,7 @@ func (sm *replicaStateMachine) handleNonTrivialReplicatedEvalResult(
 	ctx context.Context, rResult *kvserverpb.ReplicatedEvalResult,
 ) (shouldAssert, isRemoved bool) {
 	// Assert that this replicatedResult implies at least one side-effect.
-	if rResult.Equal(kvserverpb.ReplicatedEvalResult{}) {
+	if rResult.IsZero() {
 		log.Fatalf(ctx, "zero-value ReplicatedEvalResult passed to handleNonTrivialReplicatedEvalResult")
 	}
 
@@ -1156,15 +1122,10 @@ func (sm *replicaStateMachine) handleNonTrivialReplicatedEvalResult(
 		rResult.RaftLogDelta = 0
 	}
 
-	if rResult.SuggestedCompactions != nil {
-		sm.r.handleSuggestedCompactionsResult(ctx, rResult.SuggestedCompactions)
-		rResult.SuggestedCompactions = nil
-	}
-
 	// The rest of the actions are "nontrivial" and may have large effects on the
 	// in-memory and on-disk ReplicaStates. If any of these actions are present,
 	// we want to assert that these two states do not diverge.
-	shouldAssert = !rResult.Equal(kvserverpb.ReplicatedEvalResult{})
+	shouldAssert = !rResult.IsZero()
 	if !shouldAssert {
 		return false, false
 	}
@@ -1205,7 +1166,7 @@ func (sm *replicaStateMachine) handleNonTrivialReplicatedEvalResult(
 		rResult.ComputeChecksum = nil
 	}
 
-	if !rResult.Equal(kvserverpb.ReplicatedEvalResult{}) {
+	if !rResult.IsZero() {
 		log.Fatalf(ctx, "unhandled field in ReplicatedEvalResult: %s", pretty.Diff(rResult, kvserverpb.ReplicatedEvalResult{}))
 	}
 	return true, isRemoved

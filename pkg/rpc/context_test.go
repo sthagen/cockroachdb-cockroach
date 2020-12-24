@@ -244,6 +244,12 @@ func (*internalServer) GossipSubscription(
 	panic("unimplemented")
 }
 
+func (*internalServer) ResetQuorum(
+	context.Context, *roachpb.ResetQuorumRequest,
+) (*roachpb.ResetQuorumResponse, error) {
+	panic("unimplemented")
+}
+
 func (*internalServer) Join(
 	context.Context, *roachpb.JoinNodeRequest,
 ) (*roachpb.JoinNodeResponse, error) {
@@ -651,7 +657,7 @@ func TestHeartbeatHealthTransport(t *testing.T) {
 	if err := stopper.RunAsyncTask(ctx, "busyloop-closer", func(ctx context.Context) {
 		for {
 			if _, err := closeConns(); err != nil {
-				log.Warningf(ctx, "%v", err)
+				log.Health.Warningf(ctx, "%v", err)
 			}
 			select {
 			case <-done:

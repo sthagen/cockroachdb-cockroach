@@ -77,6 +77,8 @@ var (
 				ppFunc: localRangeIDKeyPrint, PSFunc: localRangeIDKeyParse},
 			{Name: "/Range", prefix: LocalRangePrefix, ppFunc: localRangeKeyPrint,
 				PSFunc: parseUnsupported},
+			{Name: "/Lock", prefix: LocalRangeLockTablePrefix, ppFunc: localRangeLockTablePrint,
+				PSFunc: parseUnsupported},
 		}},
 		{Name: "/Meta1", start: Meta1Prefix, end: Meta1KeyMax, Entries: []DictEntry{
 			{Name: "", prefix: Meta1Prefix, ppFunc: print,
@@ -191,14 +193,7 @@ var constSubKeyDict = []struct {
 	{"/clusterVersion", localStoreClusterVersionSuffix},
 	{"/nodeTombstone", localStoreNodeTombstoneSuffix},
 	{"/suggestedCompaction", localStoreSuggestedCompactionSuffix},
-}
-
-func suggestedCompactionKeyPrint(key roachpb.Key) string {
-	start, end, err := DecodeStoreSuggestedCompactionKey(key)
-	if err != nil {
-		return fmt.Sprintf("<invalid: %s>", err)
-	}
-	return fmt.Sprintf("{%s-%s}", start, end)
+	{"/cachedSettings", localStoreCachedSettingsSuffix},
 }
 
 func nodeTombstoneKeyPrint(key roachpb.Key) string {
@@ -209,15 +204,23 @@ func nodeTombstoneKeyPrint(key roachpb.Key) string {
 	return fmt.Sprint("n", nodeID)
 }
 
+func cachedSettingsKeyPrint(key roachpb.Key) string {
+	settingKey, err := DecodeStoreCachedSettingsKey(key)
+	if err != nil {
+		return fmt.Sprintf("<invalid: %s>", err)
+	}
+	return settingKey.String()
+}
+
 func localStoreKeyPrint(_ []encoding.Direction, key roachpb.Key) string {
 	for _, v := range constSubKeyDict {
 		if bytes.HasPrefix(key, v.key) {
-			if v.key.Equal(localStoreSuggestedCompactionSuffix) {
-				return v.name + "/" + suggestedCompactionKeyPrint(
+			if v.key.Equal(localStoreNodeTombstoneSuffix) {
+				return v.name + "/" + nodeTombstoneKeyPrint(
 					append(roachpb.Key(nil), append(localStorePrefix, key...)...),
 				)
-			} else if v.key.Equal(localStoreNodeTombstoneSuffix) {
-				return v.name + "/" + nodeTombstoneKeyPrint(
+			} else if v.key.Equal(localStoreCachedSettingsSuffix) {
+				return v.name + "/" + cachedSettingsKeyPrint(
 					append(roachpb.Key(nil), append(localStorePrefix, key...)...),
 				)
 			}
@@ -231,8 +234,13 @@ func localStoreKeyPrint(_ []encoding.Direction, key roachpb.Key) string {
 func localStoreKeyParse(input string) (remainder string, output roachpb.Key) {
 	for _, s := range constSubKeyDict {
 		if strings.HasPrefix(input, s.name) {
-			if s.key.Equal(localStoreSuggestedCompactionSuffix) || s.key.Equal(localStoreNodeTombstoneSuffix) {
+			switch {
+			case
+				s.key.Equal(localStoreSuggestedCompactionSuffix),
+				s.key.Equal(localStoreNodeTombstoneSuffix),
+				s.key.Equal(localStoreCachedSettingsSuffix):
 				panic(&ErrUglifyUnsupported{errors.Errorf("cannot parse local store key with suffix %s", s.key)})
+			default:
 			}
 			output = MakeStoreKey(s.key, nil)
 			return
@@ -517,6 +525,27 @@ func localRangeKeyPrint(valDirs []encoding.Direction, key roachpb.Key) string {
 	return buf.String()
 }
 
+// lockTablePrintLockedKey is initialized to prettyPrintInternal in init() to break an
+// initialization loop.
+var lockTablePrintLockedKey func(valDirs []encoding.Direction, key roachpb.Key, quoteRawKeys bool) string
+
+func localRangeLockTablePrint(valDirs []encoding.Direction, key roachpb.Key) string {
+	var buf bytes.Buffer
+	if !bytes.HasPrefix(key, LockTableSingleKeyInfix) {
+		fmt.Fprintf(&buf, "/\"%x\"", key)
+		return buf.String()
+	}
+	buf.WriteString("/Intent")
+	key = key[len(LockTableSingleKeyInfix):]
+	b, lockedKey, err := encoding.DecodeBytesAscending(key, nil)
+	if err != nil || len(b) != 0 {
+		fmt.Fprintf(&buf, "/\"%x\"", key)
+		return buf.String()
+	}
+	buf.WriteString(lockTablePrintLockedKey(valDirs, lockedKey, true))
+	return buf.String()
+}
+
 // ErrUglifyUnsupported is returned when UglyPrint doesn't know how to process a
 // key.
 type ErrUglifyUnsupported struct {
@@ -669,6 +698,7 @@ func PrettyPrint(valDirs []encoding.Direction, key roachpb.Key) string {
 func init() {
 	roachpb.PrettyPrintKey = PrettyPrint
 	roachpb.PrettyPrintRange = PrettyPrintRange
+	lockTablePrintLockedKey = prettyPrintInternal
 }
 
 // PrettyPrintRange pretty prints a compact representation of a key range. The

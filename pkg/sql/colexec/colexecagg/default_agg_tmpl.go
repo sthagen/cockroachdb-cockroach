@@ -39,14 +39,12 @@ type default_AGGKINDAgg struct {
 	// {{else}}
 	hashAggregateFuncBase
 	// {{end}}
-	allocator *colmem.Allocator
-	fn        tree.AggregateFunc
-	ctx       context.Context
+	fn  tree.AggregateFunc
+	ctx context.Context
 	// inputArgsConverter is managed by the aggregator, and this function can
 	// simply call GetDatumColumn.
 	inputArgsConverter *colconv.VecToDatumConverter
 	resultConverter    func(tree.Datum) interface{}
-	vec                coldata.Vec
 	scratch            struct {
 		// Note that this scratch space is shared among all aggregate function
 		// instances created by the same alloc object.
@@ -56,23 +54,12 @@ type default_AGGKINDAgg struct {
 
 var _ AggregateFunc = &default_AGGKINDAgg{}
 
-func (a *default_AGGKINDAgg) Init(groups []bool, vec coldata.Vec) {
+func (a *default_AGGKINDAgg) SetOutput(vec coldata.Vec) {
 	// {{if eq "_AGGKIND" "Ordered"}}
-	a.orderedAggregateFuncBase.Init(groups, vec)
+	a.orderedAggregateFuncBase.SetOutput(vec)
 	// {{else}}
-	a.hashAggregateFuncBase.Init(groups, vec)
+	a.hashAggregateFuncBase.SetOutput(vec)
 	// {{end}}
-	a.vec = vec
-	a.Reset()
-}
-
-func (a *default_AGGKINDAgg) Reset() {
-	// {{if eq "_AGGKIND" "Ordered"}}
-	a.orderedAggregateFuncBase.Reset()
-	// {{else}}
-	a.hashAggregateFuncBase.Reset()
-	// {{end}}
-	a.fn.Reset(a.ctx)
 }
 
 func (a *default_AGGKINDAgg) Compute(
@@ -83,9 +70,13 @@ func (a *default_AGGKINDAgg) Compute(
 	// function itself does the latter.
 	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
 		// {{if eq "_AGGKIND" "Ordered"}}
+		// Capture groups to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
 		if sel == nil {
+			_ = groups[inputLen-1]
 			for tupleIdx := 0; tupleIdx < inputLen; tupleIdx++ {
-				_ADD_TUPLE(a, a.groups, a.nulls, tupleIdx)
+				_ADD_TUPLE(a, groups, a.nulls, tupleIdx, false)
 			}
 		} else
 		// {{end}}
@@ -99,7 +90,7 @@ func (a *default_AGGKINDAgg) Compute(
 			// deselection - so converted values are at the same positions as
 			// the original ones.
 			for _, tupleIdx := range sel[:inputLen] {
-				_ADD_TUPLE(a, a.groups, a.nulls, tupleIdx)
+				_ADD_TUPLE(a, a.groups, a.nulls, tupleIdx, true)
 			}
 		}
 	})
@@ -112,15 +103,22 @@ func (a *default_AGGKINDAgg) Flush(outputIdx int) {
 	outputIdx = a.curIdx
 	a.curIdx++
 	// {{end}}
-	res, err := a.fn.Result()
-	if err != nil {
-		colexecerror.ExpectedError(err)
-	}
-	if res == tree.DNull {
-		a.nulls.SetNull(outputIdx)
-	} else {
-		coldata.SetValueAt(a.vec, a.resultConverter(res), outputIdx)
-	}
+	_SET_RESULT(a, outputIdx)
+}
+
+// {{if eq "_AGGKIND" "Ordered"}}
+func (a *default_AGGKINDAgg) HandleEmptyInputScalar() {
+	outputIdx := 0
+	_SET_RESULT(a, outputIdx)
+}
+
+// {{end}}
+
+func (a *default_AGGKINDAgg) Reset() {
+	// {{if eq "_AGGKIND" "Ordered"}}
+	a.orderedAggregateFuncBase.Reset()
+	// {{end}}
+	a.fn.Reset(a.ctx)
 }
 
 func newDefault_AGGKINDAggAlloc(
@@ -196,12 +194,12 @@ func (a *default_AGGKINDAggAlloc) newAggFunc() AggregateFunc {
 	}
 	f := &a.aggFuncs[0]
 	*f = default_AGGKINDAgg{
-		allocator:          a.allocator,
 		fn:                 a.constructor(a.evalCtx, a.arguments),
 		ctx:                a.evalCtx.Context,
 		inputArgsConverter: a.inputArgsConverter,
 		resultConverter:    a.resultConverter,
 	}
+	f.allocator = a.allocator
 	f.scratch.otherArgs = a.otherArgsScratch
 	a.allocator.AdjustMemoryUsage(f.fn.Size())
 	a.aggFuncs = a.aggFuncs[1:]
@@ -220,22 +218,30 @@ func (a *default_AGGKINDAggAlloc) Close(ctx context.Context) error {
 // {{/*
 // _ADD_TUPLE aggregates the tuple that is at position 'tupleIdx' in the
 // original batch and has the converted tree.Datum values at the same position.
-func _ADD_TUPLE(a *default_AGGKINDAgg, groups []bool, nulls *coldata.Nulls, tupleIdx int) { // */}}
+func _ADD_TUPLE(
+	a *default_AGGKINDAgg, groups []bool, nulls *coldata.Nulls, tupleIdx int, _HAS_SEL bool,
+) { // */}}
 	// {{define "addTuple" -}}
 
 	// {{if eq "_AGGKIND" "Ordered"}}
-	if a.groups[tupleIdx] {
-		res, err := a.fn.Result()
-		if err != nil {
-			colexecerror.ExpectedError(err)
+	// {{if not .HasSel}}
+	//gcassert:bce
+	// {{end}}
+	if groups[tupleIdx] {
+		if !a.isFirstGroup {
+			res, err := a.fn.Result()
+			if err != nil {
+				colexecerror.ExpectedError(err)
+			}
+			if res == tree.DNull {
+				a.nulls.SetNull(a.curIdx)
+			} else {
+				coldata.SetValueAt(a.vec, a.resultConverter(res), a.curIdx)
+			}
+			a.curIdx++
+			a.fn.Reset(a.ctx)
 		}
-		if res == tree.DNull {
-			a.nulls.SetNull(a.curIdx)
-		} else {
-			coldata.SetValueAt(a.vec, a.resultConverter(res), a.curIdx)
-		}
-		a.curIdx++
-		a.fn.Reset(a.ctx)
+		a.isFirstGroup = false
 	}
 	// {{end}}
 	// Note that the only function that takes no arguments is COUNT_ROWS, and
@@ -248,7 +254,27 @@ func _ADD_TUPLE(a *default_AGGKINDAgg, groups []bool, nulls *coldata.Nulls, tupl
 	if err := a.fn.Add(a.ctx, firstArg, a.scratch.otherArgs...); err != nil {
 		colexecerror.ExpectedError(err)
 	}
-
 	// {{end}}
+
+	// {{/*
+} // */}}
+
+// {{/*
+// _SET_RESULT is a code snippet that sets the result obtained from a.fn in
+// position outputIdx of the output.
+func _SET_RESULT(a *default_AGGKINDAgg, outputIdx int) { // */}}
+	// {{define "setResult" -}}
+
+	res, err := a.fn.Result()
+	if err != nil {
+		colexecerror.ExpectedError(err)
+	}
+	if res == tree.DNull {
+		a.nulls.SetNull(outputIdx)
+	} else {
+		coldata.SetValueAt(a.vec, a.resultConverter(res), outputIdx)
+	}
+	// {{end}}
+
 	// {{/*
 } // */}}

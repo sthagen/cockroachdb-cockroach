@@ -15,11 +15,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/errors"
@@ -37,6 +37,14 @@ type renameColumnNode struct {
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) RenameColumn(ctx context.Context, n *tree.RenameColumn) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"RENAME COLUMN",
+	); err != nil {
+		return nil, err
+	}
+
 	// Check if table exists.
 	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &n.Table, !n.IfExists, tree.ResolveRequireTableDesc)
 	if err != nil {
@@ -170,8 +178,8 @@ func (p *planner) renameColumn(
 	}
 
 	// Rename the column in partial index predicates.
-	for i := range tableDesc.Indexes {
-		if index := &tableDesc.Indexes[i]; index.IsPartial() {
+	for i := range tableDesc.GetPublicNonPrimaryIndexes() {
+		if index := &tableDesc.GetPublicNonPrimaryIndexes()[i]; index.IsPartial() {
 			newExpr, err := schemaexpr.RenameColumn(index.Predicate, *oldName, *newName)
 			if err != nil {
 				return false, err

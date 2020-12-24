@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -151,18 +152,11 @@ func (t *truncateNode) startExec(params runParams) error {
 		}
 
 		// Log a Truncate Table event for this table.
-		if err := MakeEventLogger(p.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			ctx,
-			p.txn,
-			EventLogTruncateTable,
-			int32(id),
-			int32(p.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				TableName string
-				Statement string
-				User      string
-			}{name, n.String(), p.SessionData().User},
-		); err != nil {
+		if err := params.p.logEvent(ctx,
+			id,
+			&eventpb.TruncateTable{
+				TableName: name,
+			}); err != nil {
 			return err
 		}
 	}
@@ -200,16 +194,22 @@ func (p *planner) truncateTable(
 	}
 
 	// Collect all of the old indexes.
-	oldIndexes := make([]descpb.IndexDescriptor, len(tableDesc.Indexes)+1)
-	oldIndexes[0] = *protoutil.Clone(&tableDesc.PrimaryIndex).(*descpb.IndexDescriptor)
-	for i := range tableDesc.Indexes {
-		oldIndexes[i+1] = *protoutil.Clone(&tableDesc.Indexes[i]).(*descpb.IndexDescriptor)
+	oldIndexes := make([]descpb.IndexDescriptor, len(tableDesc.GetPublicNonPrimaryIndexes())+1)
+	oldIndexes[0] = *protoutil.Clone(tableDesc.GetPrimaryIndex()).(*descpb.IndexDescriptor)
+	for i := range tableDesc.GetPublicNonPrimaryIndexes() {
+		oldIndexes[i+1] = *protoutil.Clone(&tableDesc.GetPublicNonPrimaryIndexes()[i]).(*descpb.IndexDescriptor)
 	}
 
 	// Reset all of the index IDs.
-	tableDesc.PrimaryIndex.ID = descpb.IndexID(0)
-	for i := range tableDesc.Indexes {
-		tableDesc.Indexes[i].ID = descpb.IndexID(0)
+	{
+		primaryIndex := *tableDesc.GetPrimaryIndex()
+		primaryIndex.ID = descpb.IndexID(0)
+		tableDesc.SetPrimaryIndex(primaryIndex)
+	}
+
+	for i, index := range tableDesc.GetPublicNonPrimaryIndexes() {
+		index.ID = descpb.IndexID(0)
+		tableDesc.SetPublicNonPrimaryIndex(i+1, index)
 	}
 	// Create new ID's for all of the indexes in the table.
 	if err := tableDesc.AllocateIDs(ctx); err != nil {
@@ -218,9 +218,9 @@ func (p *planner) truncateTable(
 
 	// Construct a mapping from old index ID's to new index ID's.
 	indexIDMapping := make(map[descpb.IndexID]descpb.IndexID, len(oldIndexes))
-	indexIDMapping[oldIndexes[0].ID] = tableDesc.PrimaryIndex.ID
-	for i := range tableDesc.Indexes {
-		indexIDMapping[oldIndexes[i+1].ID] = tableDesc.Indexes[i].ID
+	indexIDMapping[oldIndexes[0].ID] = tableDesc.GetPrimaryIndexID()
+	for i := range tableDesc.GetPublicNonPrimaryIndexes() {
+		indexIDMapping[oldIndexes[i+1].ID] = tableDesc.GetPublicNonPrimaryIndexes()[i].ID
 	}
 
 	// Resolve all outstanding mutations. Make all new schema elements
@@ -288,14 +288,14 @@ func (p *planner) truncateTable(
 	for i := range oldIndexIDs {
 		oldIndexIDs[i] = oldIndexes[i+1].ID
 	}
-	newIndexIDs := make([]descpb.IndexID, len(tableDesc.Indexes))
+	newIndexIDs := make([]descpb.IndexID, len(tableDesc.GetPublicNonPrimaryIndexes()))
 	for i := range newIndexIDs {
-		newIndexIDs[i] = tableDesc.Indexes[i].ID
+		newIndexIDs[i] = tableDesc.GetPublicNonPrimaryIndexes()[i].ID
 	}
 	swapInfo := &descpb.PrimaryKeySwap{
 		OldPrimaryIndexId: oldIndexes[0].ID,
 		OldIndexes:        oldIndexIDs,
-		NewPrimaryIndexId: tableDesc.PrimaryIndex.ID,
+		NewPrimaryIndexId: tableDesc.GetPrimaryIndexID(),
 		NewIndexes:        newIndexIDs,
 	}
 	if err := maybeUpdateZoneConfigsForPKChange(ctx, p.txn, p.ExecCfg(), tableDesc, swapInfo); err != nil {
@@ -331,7 +331,7 @@ func ClearTableDataInChunks(
 			log.VEventf(ctx, 2, "table %s truncate at row: %d, span: %s", tableDesc.Name, rowIdx, resume)
 		}
 		if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			rd := row.MakeDeleter(codec, tableDesc, nil)
+			rd := row.MakeDeleter(codec, tableDesc, nil /* requestedCols */)
 			td := tableDeleter{rd: rd, alloc: alloc}
 			if err := td.init(ctx, txn, nil /* *tree.EvalContext */); err != nil {
 				return err
@@ -415,7 +415,7 @@ func (p *planner) reassignIndexComments(
 		ctx,
 		"update-table-comments",
 		p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		`SELECT count(*) FROM system.comments WHERE object_id = $1 AND type = $2`,
 		table.ID,
 		keys.IndexCommentType,
@@ -429,7 +429,7 @@ func (p *planner) reassignIndexComments(
 				ctx,
 				"update-table-comments",
 				p.txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUser},
+				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 				`UPDATE system.comments SET sub_id=$1 WHERE sub_id=$2 AND object_id=$3 AND type=$4`,
 				new,
 				old,

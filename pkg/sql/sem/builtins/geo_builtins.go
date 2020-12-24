@@ -409,6 +409,52 @@ func (m *minimumBoundRadiusGen) Values() (tree.Datums, error) {
 
 func (m *minimumBoundRadiusGen) Close() {}
 
+func makeSubdividedGeometriesGeneratorFactory(expectMaxVerticesArg bool) tree.GeneratorFactory {
+	return func(
+		ctx *tree.EvalContext, args tree.Datums,
+	) (tree.ValueGenerator, error) {
+		geometry := tree.MustBeDGeometry(args[0])
+		var maxVertices int
+		if expectMaxVerticesArg {
+			maxVertices = int(tree.MustBeDInt(args[1]))
+		} else {
+			maxVertices = 256
+		}
+		results, err := geomfn.Subdivide(geometry.Geometry, maxVertices)
+		if err != nil {
+			return nil, err
+		}
+		return &subdividedGeometriesGen{
+			geometries: results,
+			curr:       -1,
+		}, nil
+	}
+}
+
+// subdividedGeometriesGen implements the tree.ValueGenerator interface
+type subdividedGeometriesGen struct {
+	geometries []geo.Geometry
+	curr       int
+}
+
+func (s *subdividedGeometriesGen) ResolvedType() *types.T { return types.Geometry }
+
+func (s *subdividedGeometriesGen) Close() {}
+
+func (s *subdividedGeometriesGen) Start(_ context.Context, _ *kv.Txn) error {
+	s.curr = -1
+	return nil
+}
+
+func (s *subdividedGeometriesGen) Values() (tree.Datums, error) {
+	return tree.Datums{tree.NewDGeometry(s.geometries[s.curr])}, nil
+}
+
+func (s *subdividedGeometriesGen) Next(_ context.Context) (bool, error) {
+	s.curr++
+	return s.curr < len(s.geometries), nil
+}
+
 var geoBuiltins = map[string]builtinDefinition{
 	//
 	// Meta builtins.
@@ -1935,21 +1981,7 @@ Flags shown square brackets after the geometry type have the following meaning:
 				if err != nil {
 					return nil, err
 				}
-				var nPoints func(t geom.T) int
-				nPoints = func(t geom.T) int {
-					switch t := t.(type) {
-					case *geom.GeometryCollection:
-						// FlatCoords() does not work on GeometryCollection.
-						numPoints := 0
-						for _, g := range t.Geoms() {
-							numPoints += nPoints(g)
-						}
-						return numPoints
-					default:
-						return len(t.FlatCoords()) / t.Stride()
-					}
-				}
-				return tree.NewDInt(tree.DInt(nPoints(t))), nil
+				return tree.NewDInt(tree.DInt(geomfn.CountVertices(t))), nil
 			},
 			types.Int,
 			infoBuilder{
@@ -2959,8 +2991,10 @@ The azimuth is angle is referenced from north, and is positive clockwise: North 
 				return tree.NewDFloat(tree.DFloat(*ret)), nil
 			},
 			Info: infoBuilder{
-				info: `Returns the Frechet distance between the given geometries, with the given ` +
-					`segment densification (range 0.0-1.0, -1 to disable).`,
+				info: "Returns the Frechet distance between the given geometries, with the given " +
+					"segment densification (range 0.0-1.0, -1 to disable).\n\n" +
+					"Smaller densify_frac gives a more accurate Fréchet distance. However, the computation " +
+					"time and memory usage increases with the square of the number of subsegments.",
 				libraryUsage: usesGEOS,
 			}.String(),
 			Volatility: tree.VolatilityImmutable,
@@ -4980,6 +5014,62 @@ See http://developers.google.com/maps/documentation/utilities/polylinealgorithm`
 			Volatility: tree.VolatilityImmutable,
 		},
 	),
+	"st_unaryunion": makeBuiltin(
+		defProps(),
+		geometryOverload1(
+			func(_ *tree.EvalContext, g *tree.DGeometry) (tree.Datum, error) {
+				res, err := geomfn.UnaryUnion(g.Geometry)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(res), nil
+			},
+			types.Geometry,
+			infoBuilder{
+				info: "Returns a union of the components for any geometry or geometry collection provided. Dissolves boundaries of a multipolygon.",
+			},
+			tree.VolatilityImmutable,
+		),
+	),
+	"st_node": makeBuiltin(
+		defProps(),
+		geometryOverload1(
+			func(_ *tree.EvalContext, g *tree.DGeometry) (tree.Datum, error) {
+				res, err := geomfn.Node(g.Geometry)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(res), nil
+			},
+			types.Geometry,
+			infoBuilder{
+				info: "Adds a node on a geometry for each intersection. Resulting geometry is always a MultiLineString.",
+			},
+			tree.VolatilityImmutable,
+		),
+	),
+	"st_subdivide": makeBuiltin(
+		genProps(),
+		makeGeneratorOverload(
+			tree.ArgTypes{
+				{"geometry", types.Geometry},
+			},
+			types.Geometry,
+			makeSubdividedGeometriesGeneratorFactory(false /* expectMaxVerticesArg */),
+			"Returns a geometry divided into parts, where each part contains no more than 256 vertices.",
+			tree.VolatilityImmutable,
+		),
+		makeGeneratorOverload(
+			tree.ArgTypes{
+				{"geometry", types.Geometry},
+				{"max_vertices", types.Int4},
+			},
+			types.Geometry,
+			makeSubdividedGeometriesGeneratorFactory(true /* expectMaxVerticesArg */),
+			"Returns a geometry divided into parts, where each part contains no more than the number of vertices provided.",
+			tree.VolatilityImmutable,
+		),
+	),
 
 	//
 	// BoundingBox
@@ -5582,6 +5672,189 @@ See http://developers.google.com/maps/documentation/utilities/polylinealgorithm`
 			},
 		},
 	),
+	"st_transscale": makeBuiltin(defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+				{"delta_x", types.Float},
+				{"delta_y", types.Float},
+				{"x_factor", types.Float},
+				{"y_factor", types.Float},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Volatility: tree.VolatilityImmutable,
+			Info: infoBuilder{
+				info: "Translates the geometry using the deltaX and deltaY args, then scales it using the XFactor, YFactor args, working in 2D only.",
+			}.String(),
+			Fn: func(_ *tree.EvalContext, datums tree.Datums) (tree.Datum, error) {
+				g := tree.MustBeDGeometry(datums[0])
+				deltaX := float64(tree.MustBeDFloat(datums[1]))
+				deltaY := float64(tree.MustBeDFloat(datums[2]))
+				xFactor := float64(tree.MustBeDFloat(datums[3]))
+				yFactor := float64(tree.MustBeDFloat(datums[4]))
+				geometry, err := geomfn.TransScale(g.Geometry, deltaX, deltaY, xFactor, yFactor)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(geometry), nil
+			},
+		}),
+	"st_voronoipolygons": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := tree.MustBeDGeometry(args[0])
+				var env *geo.Geometry
+				ret, err := geomfn.VoronoiDiagram(g.Geometry, env, 0.0, false /* onlyEdges */)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry.`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+				{"tolerance", types.Float},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := tree.MustBeDGeometry(args[0])
+				tolerance := tree.MustBeDFloat(args[1])
+				var env *geo.Geometry
+				ret, err := geomfn.VoronoiDiagram(g.Geometry, env, float64(tolerance), false /* onlyEdges */)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry.`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+				{"tolerance", types.Float},
+				{"extend_to", types.Geometry},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := tree.MustBeDGeometry(args[0])
+				tolerance := tree.MustBeDFloat(args[1])
+				env := tree.MustBeDGeometry(args[2])
+				ret, err := geomfn.VoronoiDiagram(g.Geometry, &env.Geometry, float64(tolerance), false /* onlyEdges */)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry.`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
+	"st_voronoilines": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := tree.MustBeDGeometry(args[0])
+				var env *geo.Geometry
+				ret, err := geomfn.VoronoiDiagram(g.Geometry, env, 0.0, true /* onlyEdges */)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry as` +
+					`the boundaries between cells in that diagram as a MultiLineString.`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+				{"tolerance", types.Float},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := tree.MustBeDGeometry(args[0])
+				tolerance := tree.MustBeDFloat(args[1])
+				var env *geo.Geometry
+				ret, err := geomfn.VoronoiDiagram(g.Geometry, env, float64(tolerance), true /* onlyEdges */)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry as` +
+					`the boundaries between cells in that diagram as a MultiLineString.`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+				{"tolerance", types.Float},
+				{"extend_to", types.Geometry},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := tree.MustBeDGeometry(args[0])
+				tolerance := tree.MustBeDFloat(args[1])
+				env := tree.MustBeDGeometry(args[2])
+				ret, err := geomfn.VoronoiDiagram(g.Geometry, &env.Geometry, float64(tolerance), true /* onlyEdges */)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry as` +
+					`the boundaries between cells in that diagram as a MultiLineString.`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
+	"st_orientedenvelope": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"geometry", types.Geometry},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := tree.MustBeDGeometry(args[0])
+				ret, err := geomfn.MinimumRotatedRectangle(g.Geometry)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Returns a minimum rotated rectangle enclosing a geometry.
+Note that more than one minimum rotated rectangle may exist.
+May return a Point or LineString in the case of degenerate inputs.`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
 
 	//
 	// Unimplemented.
@@ -5612,8 +5885,6 @@ See http://developers.google.com/maps/documentation/utilities/polylinealgorithm`
 	"st_lengthspheroid":        makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 48968}),
 	"st_linecrossingdirection": makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 48969}),
 	"st_linesubstring":         makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 48975}),
-	"st_node":                  makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 48993}),
-	"st_orientedenvelope":      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49003}),
 	"st_polygonize":            makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49011}),
 	"st_quantizecoordinates":   makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49012}),
 	"st_seteffectivearea":      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49030}),
@@ -5621,12 +5892,7 @@ See http://developers.google.com/maps/documentation/utilities/polylinealgorithm`
 	"st_simplifyvw":            makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49039}),
 	"st_snap":                  makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49040}),
 	"st_split":                 makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49045}),
-	"st_subdivide":             makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49048}),
 	"st_tileenvelope":          makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49053}),
-	"st_transscale":            makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49061}),
-	"st_unaryunion":            makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49062}),
-	"st_voronoilines":          makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49065}),
-	"st_voronoipolygons":       makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49066}),
 	"st_wrapx":                 makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49068}),
 	"st_bdpolyfromtext":        makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 48801}),
 	"st_geomfromgml":           makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 48807}),
@@ -5647,7 +5913,7 @@ func returnCompatibilityFixedStringBuiltin(ret string) builtinDefinition {
 				return tree.NewDString(ret), nil
 			},
 			Info: infoBuilder{
-				info: fmt.Sprintf("Compatibility placeholder function with PostGIS. Returns a fixed string based on PostGIS 3.0.1, with minor edits."),
+				info: "Compatibility placeholder function with PostGIS. Returns a fixed string based on PostGIS 3.0.1, with minor edits.",
 			}.String(),
 			Volatility: tree.VolatilityImmutable,
 		},

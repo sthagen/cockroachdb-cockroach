@@ -147,10 +147,17 @@ func TestDefaultAggregateFunc(t *testing.T) {
 				require.NoError(t, err)
 				runTestsWithTyps(t, []tuples{tc.input}, [][]*types.T{tc.typs}, tc.expected, unorderedVerifier,
 					func(input []colexecbase.Operator) (colexecbase.Operator, error) {
-						return agg.new(
-							testAllocator, testMemAcc, input[0], tc.typs, tc.spec, &evalCtx,
-							constructors, constArguments, outputTypes, false, /* isScalar */
-						)
+						return agg.new(&colexecagg.NewAggregatorArgs{
+							Allocator:      testAllocator,
+							MemAccount:     testMemAcc,
+							Input:          input[0],
+							InputTypes:     tc.typs,
+							Spec:           tc.spec,
+							EvalCtx:        &evalCtx,
+							Constructors:   constructors,
+							ConstArguments: constArguments,
+							OutputTypes:    outputTypes,
+						})
 					})
 			})
 		}
@@ -158,14 +165,13 @@ func TestDefaultAggregateFunc(t *testing.T) {
 }
 
 func BenchmarkDefaultAggregateFunction(b *testing.B) {
-	const numInputBatches = 64
 	aggFn := execinfrapb.AggregatorSpec_STRING_AGG
 	for _, agg := range aggTypes {
-		for _, groupSize := range []int{1, 2, 32, 128, coldata.BatchSize() / 2, coldata.BatchSize()} {
-			for _, nullProb := range []float64{0.0, nullProbability} {
+		for _, numInputRows := range []int{32, 32 * coldata.BatchSize()} {
+			for _, groupSize := range []int{1, 2, 32, 128, coldata.BatchSize()} {
 				benchmarkAggregateFunction(
 					b, agg, aggFn, []*types.T{types.String, types.String}, groupSize,
-					0 /* distinctProb */, nullProb, numInputBatches,
+					0 /* distinctProb */, numInputRows,
 				)
 			}
 		}

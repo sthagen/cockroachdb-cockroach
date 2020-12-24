@@ -19,8 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -214,6 +215,9 @@ func showForeignKeyConstraint(
 		buf.WriteString(" ON UPDATE ")
 		buf.WriteString(fk.OnUpdate.String())
 	}
+	if fk.Validity != descpb.ConstraintValidity_Validated {
+		buf.WriteString(" NOT VALID")
+	}
 	return nil
 }
 
@@ -260,6 +264,16 @@ func showFamilyClause(desc catalog.TableDescriptor, f *tree.FmtCtx) {
 		formatQuoteNames(&f.Buffer, activeColumnNames...)
 		f.WriteString(")")
 	}
+}
+
+// showCreateLocality creates the LOCALITY clauses for a CREATE statement, writing them
+// to tree.FmtCtx f.
+func showCreateLocality(desc catalog.TableDescriptor, f *tree.FmtCtx) error {
+	if c := desc.TableDesc().LocalityConfig; c != nil {
+		f.WriteString(" LOCALITY ")
+		return tabledesc.FormatTableLocalityConfig(c, f)
+	}
+	return nil
 }
 
 // showCreateInterleave returns an INTERLEAVE IN PARENT clause for the specified
@@ -424,6 +438,27 @@ func showConstraintClause(
 		}
 		f.WriteString(expr)
 		f.WriteString(")")
+		if e.Validity != descpb.ConstraintValidity_Validated {
+			f.WriteString(" NOT VALID")
+		}
+	}
+	for _, c := range desc.AllActiveAndInactiveUniqueWithoutIndexConstraints() {
+		f.WriteString(",\n\t")
+		if len(c.Name) > 0 {
+			f.WriteString("CONSTRAINT ")
+			formatQuoteNames(&f.Buffer, c.Name)
+			f.WriteString(" ")
+		}
+		f.WriteString("UNIQUE WITHOUT INDEX (")
+		colNames, err := desc.NamesForColumnIDs(c.ColumnIDs)
+		if err != nil {
+			return err
+		}
+		f.WriteString(strings.Join(colNames, ", "))
+		f.WriteString(")")
+		if c.Validity != descpb.ConstraintValidity_Validated {
+			f.WriteString(" NOT VALID")
+		}
 	}
 	f.WriteString("\n)")
 	return nil

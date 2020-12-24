@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -29,12 +30,13 @@ import (
 
 // Updater abstracts the key/value operations for updating table rows.
 type Updater struct {
-	Helper                rowHelper
-	DeleteHelper          *rowHelper
-	FetchCols             []descpb.ColumnDescriptor
-	FetchColIDtoRowIndex  map[descpb.ColumnID]int
+	Helper       rowHelper
+	DeleteHelper *rowHelper
+	FetchCols    []descpb.ColumnDescriptor
+	// FetchColIDtoRowIndex must be kept in sync with FetchCols.
+	FetchColIDtoRowIndex  catalog.TableColMap
 	UpdateCols            []descpb.ColumnDescriptor
-	UpdateColIDtoRowIndex map[descpb.ColumnID]int
+	UpdateColIDtoRowIndex catalog.TableColMap
 	primaryKeyColChange   bool
 
 	// rd and ri are used when the update this Updater is created for modifies
@@ -76,8 +78,9 @@ var returnTruePseudoError error = returnTrue{}
 // that will be passed to UpdateRow.
 //
 // The returned Updater contains a FetchCols field that defines the
-// expectation of which values are passed as oldValues to UpdateRow. All the columns
-// passed in requestedCols will be included in FetchCols at the beginning.
+// expectation of which values are passed as oldValues to UpdateRow.
+// requestedCols must be non-nil and define the schema that determines
+// FetchCols.
 func MakeUpdater(
 	ctx context.Context,
 	txn *kv.Txn,
@@ -88,16 +91,20 @@ func MakeUpdater(
 	updateType rowUpdaterType,
 	alloc *rowenc.DatumAlloc,
 ) (Updater, error) {
+	if requestedCols == nil {
+		return Updater{}, errors.AssertionFailedf("requestedCols is nil in MakeUpdater")
+	}
+
 	updateColIDtoRowIndex := ColIDtoRowIndexFromCols(updateCols)
 
-	primaryIndexCols := make(map[descpb.ColumnID]struct{}, len(tableDesc.PrimaryIndex.ColumnIDs))
-	for _, colID := range tableDesc.PrimaryIndex.ColumnIDs {
-		primaryIndexCols[colID] = struct{}{}
+	var primaryIndexCols catalog.TableColSet
+	for _, colID := range tableDesc.GetPrimaryIndex().ColumnIDs {
+		primaryIndexCols.Add(colID)
 	}
 
 	var primaryKeyColChange bool
 	for _, c := range updateCols {
-		if _, ok := primaryIndexCols[c.ID]; ok {
+		if primaryIndexCols.Contains(c.ID) {
 			primaryKeyColChange = true
 			break
 		}
@@ -127,7 +134,7 @@ func MakeUpdater(
 			return true
 		}
 		return index.RunOverAllColumns(func(id descpb.ColumnID) error {
-			if _, ok := updateColIDtoRowIndex[id]; ok {
+			if _, ok := updateColIDtoRowIndex.Get(id); ok {
 				return returnTruePseudoError
 			}
 			return nil
@@ -193,12 +200,12 @@ func MakeUpdater(
 		// maybeAddCol adds the provided column to ru.FetchCols and
 		// ru.FetchColIDtoRowIndex if it isn't already present.
 		maybeAddCol := func(colID descpb.ColumnID) error {
-			if _, ok := ru.FetchColIDtoRowIndex[colID]; !ok {
+			if _, ok := ru.FetchColIDtoRowIndex.Get(colID); !ok {
 				col, _, err := tableDesc.FindReadableColumnByID(colID)
 				if err != nil {
 					return err
 				}
-				ru.FetchColIDtoRowIndex[col.ID] = len(ru.FetchCols)
+				ru.FetchColIDtoRowIndex.Set(col.ID, len(ru.FetchCols))
 				ru.FetchCols = append(ru.FetchCols, *col)
 			}
 			return nil
@@ -206,7 +213,7 @@ func MakeUpdater(
 
 		// Fetch all columns in the primary key so that we can construct the
 		// keys when writing out the new kvs to the primary index.
-		for _, colID := range tableDesc.PrimaryIndex.ColumnIDs {
+		for _, colID := range tableDesc.GetPrimaryIndex().ColumnIDs {
 			if err := maybeAddCol(colID); err != nil {
 				return Updater{}, err
 			}
@@ -219,7 +226,7 @@ func MakeUpdater(
 			family := &tableDesc.Families[i]
 			familyBeingUpdated := false
 			for _, colID := range family.ColumnIDs {
-				if _, ok := ru.UpdateColIDtoRowIndex[colID]; ok {
+				if _, ok := ru.UpdateColIDtoRowIndex.Get(colID); ok {
 					familyBeingUpdated = true
 					break
 				}
@@ -310,7 +317,7 @@ func (ru *Updater) UpdateRow(
 	// Update the row values.
 	copy(ru.newValues, oldValues)
 	for i, updateCol := range ru.UpdateCols {
-		ru.newValues[ru.FetchColIDtoRowIndex[updateCol.ID]] = updateValues[i]
+		ru.newValues[ru.FetchColIDtoRowIndex.GetDefault(updateCol.ID)] = updateValues[i]
 	}
 
 	rowPrimaryKeyChanged := false

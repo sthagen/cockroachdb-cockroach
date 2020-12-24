@@ -93,14 +93,18 @@ var PrintLeakedStoppers = func(t testing.TB) {}
 // function to be run at the end of tests to see whether any
 // goroutines leaked.
 func AfterTest(t testing.TB) func() {
-	if atomic.LoadUint32(&leakDetectorDisabled) != 0 {
-		return func() {}
-	}
 	orig := interestingGoroutines()
 	return func() {
+		t.Helper()
 		// If there was a panic, "leaked" goroutines are expected.
 		if r := recover(); r != nil {
-			panic(r)
+			atomic.StoreUint32(&leakDetectorDisabled, 1)
+			t.Fatalf("panic: %+v", r)
+			return
+		}
+
+		if atomic.LoadUint32(&leakDetectorDisabled) != 0 {
+			return
 		}
 
 		// If the test already failed, we don't pile on any more errors but we check
@@ -112,8 +116,6 @@ func AfterTest(t testing.TB) func() {
 			return
 		}
 
-		// TODO(tbg): make this call 't.Error' instead of 't.Logf' once there is
-		// enough Stopper discipline.
 		PrintLeakedStoppers(t)
 
 		// Loop, waiting for goroutines to shut down.

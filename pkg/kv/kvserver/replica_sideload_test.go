@@ -16,7 +16,6 @@ import (
 	"io"
 	"math"
 	"math/rand"
-	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -43,9 +42,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble"
 	"github.com/kr/pretty"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 	"golang.org/x/time/rate"
 )
 
@@ -312,7 +312,7 @@ func testSideloadingSideloadedStorage(
 			t.Fatalf("expected %q to be removed after truncating full range", ss.(*diskSideloadStorage).dir)
 		}
 		if err != nil {
-			if !os.IsNotExist(err) {
+			if !oserror.IsNotExist(err) {
 				t.Fatalf("expected %q to be removed: %+v", ss.(*diskSideloadStorage).dir, err)
 			}
 		}
@@ -336,7 +336,7 @@ func testSideloadingSideloadedStorage(
 			t.Fatalf("expected %q to be removed after truncating full range", ss.(*diskSideloadStorage).dir)
 		}
 		if err != nil {
-			if !os.IsNotExist(err) {
+			if !oserror.IsNotExist(err) {
 				t.Fatalf("expected %q to be removed: %+v", ss.(*diskSideloadStorage).dir, err)
 			}
 		}
@@ -819,7 +819,7 @@ func TestRaftSSTableSideloadingSnapshot(t *testing.T) {
 	// Run a happy case snapshot. Check that it properly inlines the payload in
 	// the contained log entries.
 	inlinedEntry := func() raftpb.Entry {
-		os, err := tc.repl.GetSnapshot(ctx, SnapshotRequest_RAFT, tc.store.StoreID())
+		os, err := tc.repl.GetSnapshot(ctx, SnapshotRequest_VIA_SNAPSHOT_QUEUE, tc.store.StoreID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -929,7 +929,7 @@ func TestRaftSSTableSideloadingSnapshot(t *testing.T) {
 	// (engine) snapshot. We didn't run this before because we wanted the file
 	// to stay in sideloaded storage for the previous test.
 	func() {
-		failingOS, err := tc.repl.GetSnapshot(ctx, SnapshotRequest_RAFT, tc.store.StoreID())
+		failingOS, err := tc.repl.GetSnapshot(ctx, SnapshotRequest_VIA_SNAPSHOT_QUEUE, tc.store.StoreID())
 		if err != nil {
 			t.Fatal(err)
 		}

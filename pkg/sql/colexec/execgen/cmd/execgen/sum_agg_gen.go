@@ -15,6 +15,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -22,6 +23,7 @@ import (
 )
 
 type sumTmplInfo struct {
+	aggTmplInfoBase
 	SumKind        string
 	NeedsHelper    bool
 	InputVecMethod string
@@ -88,8 +90,10 @@ func genSumAgg(inputFileContents string, wr io.Writer, isSumInt bool) error {
 	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 6)
 	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.AssignAdd", 6))
 
-	accumulateSum := makeFunctionRegex("_ACCUMULATE_SUM", 4)
-	s = accumulateSum.ReplaceAllString(s, `{{template "accumulateSum" buildDict "Global" . "HasNulls" $4}}`)
+	accumulateSum := makeFunctionRegex("_ACCUMULATE_SUM", 5)
+	s = accumulateSum.ReplaceAllString(s, `{{template "accumulateSum" buildDict "Global" . "HasNulls" $4 "HasSel" $5}}`)
+
+	s = replaceManipulationFuncs(s)
 
 	tmpl, err := template.New("sum_agg").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
 	if err != nil {
@@ -132,6 +136,9 @@ func genSumAgg(inputFileContents string, wr io.Writer, isSumInt bool) error {
 			}
 		}
 		tmplInfos = append(tmplInfos, sumTmplInfo{
+			aggTmplInfoBase: aggTmplInfoBase{
+				canonicalTypeFamily: typeconv.TypeFamilyToCanonicalTypeFamily(retType.Family()),
+			},
 			SumKind:        sumKind,
 			NeedsHelper:    needsHelper,
 			InputVecMethod: toVecMethod(inputType.Family(), inputType.Width()),

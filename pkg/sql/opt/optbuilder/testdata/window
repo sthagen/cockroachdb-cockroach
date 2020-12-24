@@ -132,7 +132,7 @@ project
       │         │              ├── columns: kv2.k:9!null
       │         │              └── select
       │         │                   ├── columns: kv2.k:9!null kv2.v:10 kv2.w:11 kv2.f:12 kv2.d:13 kv2.s:14 kv2.b:15 kv2.crdb_internal_mvcc_timestamp:16
-      │         │                   ├── scan kv2
+      │         │                   ├── scan kv [as=kv2]
       │         │                   │    └── columns: kv2.k:9!null kv2.v:10 kv2.w:11 kv2.f:12 kv2.d:13 kv2.s:14 kv2.b:15 kv2.crdb_internal_mvcc_timestamp:16
       │         │                   └── filters
       │         │                        └── kv2.k:9 = kv.k:1
@@ -1464,3 +1464,12 @@ GROUP BY
     tab_536191.col8, tab_536191.col5
 ----
 error (42P10): argument of ROWS must not contain variables
+
+# Regression test for #57441.
+build
+SELECT rank() OVER w FROM kv WINDOW w AS (ORDER BY v)
+UNION ALL SELECT rank() OVER w FROM kv WINDOW w AS (ORDER BY v)
+ORDER BY
+  rank() OVER()
+----
+error (42P20): rank(): window functions are not allowed in ORDER BY

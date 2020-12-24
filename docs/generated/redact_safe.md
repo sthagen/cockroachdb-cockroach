@@ -2,6 +2,7 @@ The following types are considered always safe for reporting:
 
 File | Type
 --|--
+pkg/cli/exit/exit.go | `Code`
 pkg/jobs/jobspb/wrap.go | `Type`
 pkg/kv/kvserver/concurrency/lock/locking.go | `WaitPolicy`
 pkg/kv/kvserver/raft.go | `SnapshotRequest_Type`
@@ -47,3 +48,5 @@ pkg/util/log/redact.go | `reflect.TypeOf(complex128(0))`
 pkg/util/log/redact.go | `reflect.TypeOf(os.Interrupt)`
 pkg/util/log/redact.go | `reflect.TypeOf(time.Time{})`
 pkg/util/log/redact.go | `reflect.TypeOf(time.Duration(0))`
+pkg/util/log/redact.go | `reflect.TypeOf(encodingtype.T(0))`
+pkg/util/log/redact.go | `reflect.TypeOf(Channel(0))`

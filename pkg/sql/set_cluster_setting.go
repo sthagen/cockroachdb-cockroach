@@ -17,7 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -34,6 +36,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/hintdetail"
@@ -46,6 +50,10 @@ type setClusterSettingNode struct {
 	setting settings.WritableSetting
 	// If value is nil, the setting should be reset.
 	value tree.TypedExpr
+	// versionUpgradeHook is called after validating a `SET CLUSTER SETTING
+	// version` but before executing it. It can carry out arbitrary migrations
+	// that allow us to eventually remove legacy code.
+	versionUpgradeHook func(ctx context.Context, from, to clusterversion.ClusterVersion) error
 }
 
 func checkPrivilegesForSetting(ctx context.Context, p *planner, name string, action string) error {
@@ -91,10 +99,10 @@ func (p *planner) SetClusterSetting(
 		return nil, errors.AssertionFailedf("expected writable setting, got %T", v)
 	}
 
-	if _, ok := setting.(*settings.StateMachineSetting); ok && p.execCfg.TenantTestingKnobs.CanSetClusterSettings() {
-		// A tenant that is allowed to set in-memory cluster settings is attempting
-		// to set a state machine setting, which is disallowed due to complexity.
-		return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "only the system tenant can set state machine settings")
+	if _, ok := setting.(*settings.VersionSetting); ok && p.execCfg.TenantTestingKnobs.CanSetClusterSettings() {
+		// A tenant that is allowed to set in-memory cluster settings is
+		// attempting to set the cluster version setting, which is disallowed.
+		return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "only the system tenant can set version settings")
 	}
 
 	var value tree.TypedExpr
@@ -108,7 +116,7 @@ func (p *planner) SetClusterSetting(
 			var dummyHelper tree.IndexedVarHelper
 
 			switch setting.(type) {
-			case *settings.StringSetting, *settings.StateMachineSetting, *settings.ByteSizeSetting:
+			case *settings.StringSetting, *settings.VersionSetting, *settings.ByteSizeSetting:
 				requiredType = types.String
 			case *settings.BoolSetting:
 				requiredType = types.Bool
@@ -150,12 +158,16 @@ func (p *planner) SetClusterSetting(
 			}
 
 			value = typed
-		} else if _, isStateMachineSetting := setting.(*settings.StateMachineSetting); isStateMachineSetting {
-			return nil, errors.New("cannot RESET this cluster setting")
+		} else if _, isVersionSetting := setting.(*settings.VersionSetting); isVersionSetting {
+			return nil, errors.New("cannot RESET cluster version setting")
 		}
 	}
 
-	return &setClusterSettingNode{name: name, st: st, setting: setting, value: value}, nil
+	csNode := setClusterSettingNode{
+		name: name, st: st, setting: setting, value: value,
+		versionUpgradeHook: p.execCfg.VersionUpgradeHook,
+	}
+	return &csNode, nil
 }
 
 func (n *setClusterSettingNode) startExec(params runParams) error {
@@ -176,8 +188,8 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			if err != nil {
 				return err
 			}
-			if _, ok := n.setting.(*settings.StateMachineSetting); ok {
-				return errors.Errorf("tenants cannot change state machine settings, this should've been checked at plan time")
+			if _, ok := n.setting.(*settings.VersionSetting); ok {
+				return errors.Errorf("tenants cannot change cluster version setting, this should've been checked at plan time")
 			}
 			encodedValue, err = toSettingString(params.ctx, n.st, n.name, n.setting, value, nil /* prev */)
 			if err != nil {
@@ -196,7 +208,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			expectedEncodedValue = n.setting.EncodedDefault()
 			if _, err := execCfg.InternalExecutor.ExecEx(
 				ctx, "reset-setting", txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUser},
+				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 				"DELETE FROM system.settings WHERE name = $1", n.name,
 			); err != nil {
 				return err
@@ -208,10 +220,11 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			}
 			reportedValue = tree.AsStringWithFlags(value, tree.FmtBareStrings)
 			var prev tree.Datum
-			if _, ok := n.setting.(*settings.StateMachineSetting); ok {
+			_, isSetVersion := n.setting.(*settings.VersionSetting)
+			if isSetVersion {
 				datums, err := execCfg.InternalExecutor.QueryRowEx(
 					ctx, "retrieve-prev-setting", txn,
-					sessiondata.InternalExecutorOverride{User: security.RootUser},
+					sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 					"SELECT value FROM system.settings WHERE name = $1", n.name,
 				)
 				if err != nil {
@@ -231,9 +244,29 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			if err != nil {
 				return err
 			}
+
+			if isSetVersion {
+				var from, to clusterversion.ClusterVersion
+
+				fromVersionVal := []byte(string(*prev.(*tree.DString)))
+				if err := protoutil.Unmarshal(fromVersionVal, &from); err != nil {
+					return err
+				}
+
+				targetVersionStr := string(*value.(*tree.DString))
+				to.Version = roachpb.MustParseVersion(targetVersionStr)
+
+				// toSettingString already validated the input, and checked to
+				// see that we are allowed to transition. Let's call into our
+				// upgrade hook to run migrations, if any.
+				if err := n.versionUpgradeHook(ctx, from, to); err != nil {
+					return err
+				}
+			}
+
 			if _, err = execCfg.InternalExecutor.ExecEx(
 				ctx, "update-setting", txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUser},
+				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 				`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
 				n.name, encoded, n.setting.Typ(),
 			); err != nil {
@@ -283,21 +316,19 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			telemetry.Inc(sqltelemetry.VecModeCounter(validatedExecMode.String()))
 		}
 
-		return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			ctx,
-			txn,
-			EventLogSetClusterSetting,
+		return params.p.logEvent(ctx,
 			0, /* no target */
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			EventLogSetClusterSettingDetail{n.name, reportedValue, params.SessionData().User},
-		)
+			&eventpb.SetClusterSetting{
+				SettingName: n.name,
+				Value:       reportedValue,
+			})
 	}); err != nil {
 		return err
 	}
 
-	if _, ok := n.setting.(*settings.StateMachineSetting); ok && n.value == nil {
-		// The "version" setting doesn't have a well defined "default" since it is
-		// set in a startup migration.
+	if _, ok := n.setting.(*settings.VersionSetting); ok && n.value == nil {
+		// The "version" setting doesn't have a well defined "default" since it
+		// is set in a startup migration.
 		return nil
 	}
 	errNotReady := errors.New("setting updated but timed out waiting to read new value")
@@ -341,14 +372,20 @@ func toSettingString(
 			return string(*s), nil
 		}
 		return "", errors.Errorf("cannot use %s %T value for string setting", d.ResolvedType(), d)
-	case *settings.StateMachineSetting:
+	case *settings.VersionSetting:
 		if s, ok := d.(*tree.DString); ok {
 			dStr, ok := prev.(*tree.DString)
 			if !ok {
 				return "", errors.New("the existing value is not a string")
 			}
+
 			prevRawVal := []byte(string(*dStr))
-			newBytes, err := setting.Validate(ctx, &st.SV, prevRawVal, string(*s))
+			newRawVal, err := clusterversion.EncodingFromVersionStr(string(*s))
+			if err != nil {
+				return "", err
+			}
+
+			newBytes, err := setting.Validate(ctx, &st.SV, prevRawVal, newRawVal)
 			if err != nil {
 				return "", err
 			}

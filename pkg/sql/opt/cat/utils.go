@@ -161,6 +161,18 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 		formatCatalogFKRef(cat, true /* inbound */, tab.InboundForeignKey(i), child)
 	}
 
+	for i := 0; i < tab.UniqueCount(); i++ {
+		var withoutIndexStr string
+		if tab.Unique(i).WithoutIndex() {
+			withoutIndexStr = "WITHOUT INDEX "
+		}
+		child.Childf(
+			"UNIQUE %s%s",
+			withoutIndexStr,
+			formatCols(tab, tab.Unique(i).ColumnCount(), tab.Unique(i).ColumnOrdinal),
+		)
+	}
+
 	// TODO(radu): show stats.
 }
 
@@ -294,7 +306,11 @@ func formatColumn(col *Column, buf *bytes.Buffer) {
 		fmt.Fprintf(buf, " not null")
 	}
 	if col.IsComputed() {
-		fmt.Fprintf(buf, " as (%s) stored", col.ComputedExprStr())
+		if col.IsVirtualComputed() {
+			fmt.Fprintf(buf, " as (%s) virtual", col.ComputedExprStr())
+		} else {
+			fmt.Fprintf(buf, " as (%s) stored", col.ComputedExprStr())
+		}
 	}
 	if col.HasDefault() {
 		fmt.Fprintf(buf, " default (%s)", col.DefaultExprStr())
@@ -309,8 +325,6 @@ func formatColumn(col *Column, buf *bytes.Buffer) {
 		fmt.Fprintf(buf, " [system]")
 	case VirtualInverted:
 		fmt.Fprintf(buf, " [virtual-inverted]")
-	case VirtualComputed:
-		fmt.Fprintf(buf, " [virtual-computed]")
 	}
 }
 

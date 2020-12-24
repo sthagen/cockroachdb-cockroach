@@ -261,7 +261,7 @@ func (tf *SchemaFeed) primeInitialTableDescs(ctx context.Context) error {
 		txn.SetFixedTimestamp(ctx, initialTableDescTs)
 		// Note that all targets are currently guaranteed to be tables.
 		for tableID := range tf.targets {
-			tableDesc, err := catalogkv.MustGetTableDescByID(ctx, txn, keys.SystemSQLCodec, tableID)
+			tableDesc, err := catalogkv.MustGetTableDescByID(ctx, txn, tf.leaseMgr.Codec(), tableID)
 			if err != nil {
 				return err
 			}
@@ -303,7 +303,7 @@ func (tf *SchemaFeed) updateTableHistory(ctx context.Context, endTS hlc.Timestam
 	if endTS.LessEq(startTS) {
 		return nil
 	}
-	descs, err := tf.fetchDescriptorVersions(ctx, tf.db, startTS, endTS)
+	descs, err := tf.fetchDescriptorVersions(ctx, tf.leaseMgr.Codec(), tf.db, startTS, endTS)
 	if err != nil {
 		return err
 	}
@@ -369,7 +369,7 @@ func (tf *SchemaFeed) waitForTS(ctx context.Context, ts hlc.Timestamp) error {
 	tf.mu.Lock()
 	highWater := tf.mu.highWater
 	var err error
-	if tf.mu.errTS != (hlc.Timestamp{}) && tf.mu.errTS.LessEq(ts) {
+	if !tf.mu.errTS.IsEmpty() && tf.mu.errTS.LessEq(ts) {
 		err = tf.mu.err
 	}
 	fastPath := err != nil || ts.LessEq(highWater)
@@ -437,7 +437,7 @@ func (tf *SchemaFeed) adjustTimestamps(startTS, endTS hlc.Timestamp, validateErr
 
 	if validateErr != nil {
 		// don't care about startTS in the invalid case
-		if tf.mu.errTS == (hlc.Timestamp{}) || endTS.Less(tf.mu.errTS) {
+		if tf.mu.errTS.IsEmpty() || endTS.Less(tf.mu.errTS) {
 			tf.mu.errTS = endTS
 			tf.mu.err = validateErr
 			newWaiters := make([]tableHistoryWaiter, 0, len(tf.mu.waiters))
@@ -553,13 +553,13 @@ func (tf *SchemaFeed) validateDescriptor(
 }
 
 func (tf *SchemaFeed) fetchDescriptorVersions(
-	ctx context.Context, db *kv.DB, startTS, endTS hlc.Timestamp,
+	ctx context.Context, codec keys.SQLCodec, db *kv.DB, startTS, endTS hlc.Timestamp,
 ) ([]catalog.Descriptor, error) {
 	if log.V(2) {
 		log.Infof(ctx, `fetching table descs (%s,%s]`, startTS, endTS)
 	}
 	start := timeutil.Now()
-	span := roachpb.Span{Key: keys.TODOSQLCodec.TablePrefix(keys.DescriptorTableID)}
+	span := roachpb.Span{Key: codec.TablePrefix(keys.DescriptorTableID)}
 	span.EndKey = span.Key.PrefixEnd()
 	header := roachpb.Header{Timestamp: endTS}
 	req := &roachpb.ExportRequest{
@@ -596,7 +596,7 @@ func (tf *SchemaFeed) fetchDescriptorVersions(
 					return nil
 				}
 				k := it.UnsafeKey()
-				remaining, _, _, err := keys.TODOSQLCodec.DecodeIndexPrefix(k.Key)
+				remaining, _, _, err := codec.DecodeIndexPrefix(k.Key)
 				if err != nil {
 					return err
 				}

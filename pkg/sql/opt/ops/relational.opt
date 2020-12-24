@@ -50,7 +50,8 @@ define ScanPrivate {
     Cols ColSet
 
     # If set, the scan is a constrained scan; the constraint contains the spans
-    # that need to be scanned.
+    # that need to be scanned. If InvertedConstraint is also set, Constraint
+    # contains non-ranging spans that constrain the non-inverted prefix columns.
     Constraint Constraint
 
     # If set, the scan is a constrained scan of an inverted index; the
@@ -391,10 +392,21 @@ define InvertedJoinPrivate {
     # IsFirstJoinInPairedJoiner is true.
     ContinuationCol ColumnID
 
+    # PrefixKeyCols are the columns (produced by the input) used to create
+    # lookup keys for the non-inverted prefix columns if the index is a
+    # multi-column inverted index. There must be a key column for each prefix
+    # column.
+    PrefixKeyCols ColList
+
     # Cols is the set of columns produced by the inverted join. This set can
     # contain columns from the input and columns from the index. Any columns
     # not in the input are retrieved from the index.
     Cols ColSet
+
+    # ConstFilters contains the constant filters that are represented as
+    # equality conditions on the PrefixKeyCols. These filters are needed by the
+    # statistics code to correctly estimate selectivity.
+    ConstFilters FiltersExpr
     _ JoinPrivate
 }
 

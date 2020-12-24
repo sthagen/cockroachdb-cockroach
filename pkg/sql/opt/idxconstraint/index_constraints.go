@@ -1271,10 +1271,11 @@ type Instance struct {
 	// need to generate remaining filters (see Instance.Init()).
 	allFilters memo.FiltersExpr
 
-	constraint   constraint.Constraint
-	consolidated constraint.Constraint
-	tight        bool
-	initialized  bool
+	constraint             constraint.Constraint
+	consolidatedConstraint constraint.Constraint
+	tight                  bool
+	initialized            bool
+	consolidated           bool
 }
 
 // Init processes the filters and calculates the spans.
@@ -1288,7 +1289,9 @@ func (ic *Instance) Init(
 	optionalFilters memo.FiltersExpr,
 	columns []opt.OrderingColumn,
 	notNullCols opt.ColSet,
+	computedCols map[opt.ColumnID]opt.ScalarExpr,
 	isInverted bool,
+	consolidate bool,
 	evalCtx *tree.EvalContext,
 	factory *norm.Factory,
 ) {
@@ -1302,7 +1305,7 @@ func (ic *Instance) Init(
 		ic.allFilters = requiredFilters[:len(requiredFilters):len(requiredFilters)]
 		ic.allFilters = append(ic.allFilters, optionalFilters...)
 	}
-	ic.indexConstraintCtx.init(columns, notNullCols, isInverted, evalCtx, factory)
+	ic.indexConstraintCtx.init(columns, notNullCols, computedCols, isInverted, evalCtx, factory)
 	if isInverted {
 		tight, constraints := ic.makeInvertedIndexSpansForExpr(
 			&ic.allFilters, nil /* constraints */, false,
@@ -1314,8 +1317,8 @@ func (ic *Instance) Init(
 	} else {
 		ic.tight = ic.makeSpansForExpr(0 /* offset */, &ic.allFilters, &ic.constraint)
 	}
-	// Note: we only consolidate spans at the end; consolidating partial results
-	// can lead to worse spans, for example:
+	// Note: If consolidate is true, we only consolidate spans at the
+	// end; consolidating partial results can lead to worse spans, for example:
 	//   a IN (1, 2) AND b = 4
 	//
 	// We want this to be:
@@ -1331,18 +1334,34 @@ func (ic *Instance) Init(
 	// The filter simplification code is able to simplify both expressions
 	// if we have the spans [/1/1 - /1/1], [/1/2 - /1/2] but not if
 	// we have [/1/1 - /1/2].
-	ic.consolidated = ic.constraint
-	ic.consolidated.ConsolidateSpans(evalCtx)
+	if consolidate {
+		ic.consolidatedConstraint = ic.constraint
+		ic.consolidatedConstraint.ConsolidateSpans(evalCtx)
+		ic.consolidated = true
+	}
 	ic.initialized = true
 }
 
-// Constraint returns the constraint created by Init. If Init wasn't called,
-// the result is nil.
+// Constraint returns the constraint created by Init. Panics if Init wasn't
+// called, or if a consolidated constraint was not built because
+// consolidate=false was passed as an argument to Init.
 func (ic *Instance) Constraint() *constraint.Constraint {
 	if !ic.initialized {
-		return nil
+		panic(errors.AssertionFailedf("Init was not called"))
 	}
-	return &ic.consolidated
+	if !ic.consolidated {
+		panic(errors.AssertionFailedf("Init was called with consolidate=false"))
+	}
+	return &ic.consolidatedConstraint
+}
+
+// UnconsolidatedConstraint returns the constraint created by Init before it was
+// consolidated. Panics if Init wasn't called.
+func (ic *Instance) UnconsolidatedConstraint() *constraint.Constraint {
+	if !ic.initialized {
+		panic(errors.AssertionFailedf("Init was not called"))
+	}
+	return &ic.constraint
 }
 
 // AllInvertedIndexConstraints returns all constraints that can be created on
@@ -1384,6 +1403,8 @@ type indexConstraintCtx struct {
 
 	notNullCols opt.ColSet
 
+	computedCols map[opt.ColumnID]opt.ScalarExpr
+
 	// isInverted indicates if the index is an inverted index (e.g. JSONB).
 	// An inverted index behaves differently than a normal index because a PK
 	// can appear in multiple index entries. For example, `a @> x AND a @> y` is
@@ -1402,6 +1423,7 @@ type indexConstraintCtx struct {
 func (c *indexConstraintCtx) init(
 	columns []opt.OrderingColumn,
 	notNullCols opt.ColSet,
+	computedCols map[opt.ColumnID]opt.ScalarExpr,
 	isInverted bool,
 	evalCtx *tree.EvalContext,
 	factory *norm.Factory,
@@ -1409,6 +1431,7 @@ func (c *indexConstraintCtx) init(
 	c.md = factory.Metadata()
 	c.columns = columns
 	c.notNullCols = notNullCols
+	c.computedCols = computedCols
 	c.isInverted = isInverted
 	c.evalCtx = evalCtx
 	c.factory = factory
@@ -1420,10 +1443,17 @@ func (c *indexConstraintCtx) init(
 	}
 }
 
-// isIndexColumn returns true if ev is a variable on the n indexed var that
-// corresponds to index column <offset>.
-func (c *indexConstraintCtx) isIndexColumn(nd opt.Expr, offset int) bool {
-	if v, ok := nd.(*memo.VariableExpr); ok && v.Col == c.columns[offset].ID() {
+// isIndexColumn returns true if e is an expression that corresponds to index
+// column <offset>. The expression can be either
+//  - a variable on the index column, or
+//  - an expression that matches the computed column expression (if the index
+//    column is computed).
+//
+func (c *indexConstraintCtx) isIndexColumn(e opt.Expr, offset int) bool {
+	if v, ok := e.(*memo.VariableExpr); ok && v.Col == c.columns[offset].ID() {
+		return true
+	}
+	if c.computedCols != nil && e == c.computedCols[c.columns[offset].ID()] {
 		return true
 	}
 	return false

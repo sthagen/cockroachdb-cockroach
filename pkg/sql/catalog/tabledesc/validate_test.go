@@ -83,9 +83,7 @@ var validationMap = []struct {
 			"FormatVersion": {status: thisFieldReferencesNoObjects},
 			"State":         {status: thisFieldReferencesNoObjects},
 			"OfflineReason": {status: thisFieldReferencesNoObjects},
-			"Checks": {
-				status: todoIAmKnowinglyAddingTechDebt,
-				reason: "initial import: TODO(features): add validation"},
+			"Checks":        {status: iSolemnlySwearThisFieldIsValidated},
 			"ViewQuery": {
 				status: todoIAmKnowinglyAddingTechDebt,
 				reason: "initial import: TODO(features): add validation"},
@@ -106,11 +104,13 @@ var validationMap = []struct {
 			"DropJobID": {status: thisFieldReferencesNoObjects},
 			"GCMutations": {status: todoIAmKnowinglyAddingTechDebt,
 				reason: "initial import: TODO(schema): add validation"},
-			"CreateQuery":    {status: thisFieldReferencesNoObjects},
-			"CreateAsOfTime": {status: thisFieldReferencesNoObjects},
-			"OutboundFKs":    {status: iSolemnlySwearThisFieldIsValidated},
-			"InboundFKs":     {status: iSolemnlySwearThisFieldIsValidated},
-			"Temporary":      {status: thisFieldReferencesNoObjects},
+			"CreateQuery":                   {status: thisFieldReferencesNoObjects},
+			"CreateAsOfTime":                {status: thisFieldReferencesNoObjects},
+			"OutboundFKs":                   {status: iSolemnlySwearThisFieldIsValidated},
+			"InboundFKs":                    {status: iSolemnlySwearThisFieldIsValidated},
+			"UniqueWithoutIndexConstraints": {status: iSolemnlySwearThisFieldIsValidated},
+			"Temporary":                     {status: thisFieldReferencesNoObjects},
+			"LocalityConfig":                {status: iSolemnlySwearThisFieldIsValidated},
 		},
 	},
 	{
@@ -148,9 +148,7 @@ var validationMap = []struct {
 			"Sharded":           {status: iSolemnlySwearThisFieldIsValidated},
 			"Disabled":          {status: thisFieldReferencesNoObjects},
 			"GeoConfig":         {status: thisFieldReferencesNoObjects},
-			"Predicate": {
-				status: todoIAmKnowinglyAddingTechDebt,
-				reason: "initial import: TODO(mgartner): add validation"},
+			"Predicate":         {status: iSolemnlySwearThisFieldIsValidated},
 		},
 	},
 	{
@@ -170,9 +168,8 @@ var validationMap = []struct {
 			"OwnsSequenceIds": {
 				status: todoIAmKnowinglyAddingTechDebt,
 				reason: "initial import: TODO(features): add validation"},
-			"ComputeExpr": {
-				status: todoIAmKnowinglyAddingTechDebt,
-				reason: "initial import: TODO(features): add validation"},
+			"ComputeExpr": {status: iSolemnlySwearThisFieldIsValidated},
+			"Virtual":     {status: iSolemnlySwearThisFieldIsValidated},
 			"PGAttributeNum": {
 				status: todoIAmKnowinglyAddingTechDebt,
 				reason: "initial import: TODO(features): add validation"},
@@ -216,6 +213,7 @@ var validationMap = []struct {
 			"ReferencingDescriptorIDs": {status: iSolemnlySwearThisFieldIsValidated},
 			"Privileges":               {status: iSolemnlySwearThisFieldIsValidated},
 			"OfflineReason":            {status: thisFieldReferencesNoObjects},
+			"RegionConfig":             {status: iSolemnlySwearThisFieldIsValidated},
 		},
 	},
 }

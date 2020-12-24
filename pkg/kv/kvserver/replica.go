@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -56,7 +57,7 @@ import (
 	"github.com/cockroachdb/redact"
 	"github.com/google/btree"
 	"github.com/kr/pretty"
-	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/v3"
 )
 
 const (
@@ -98,7 +99,7 @@ var UseAtomicReplicationChanges = settings.RegisterBoolSetting(
 const MaxCommandSizeFloor = 4 << 20 // 4MB
 
 // MaxCommandSize wraps "kv.raft.command.max_size".
-var MaxCommandSize = settings.RegisterValidatedByteSizeSetting(
+var MaxCommandSize = settings.RegisterByteSizeSetting(
 	"kv.raft.command.max_size",
 	"maximum size of a raft command",
 	64<<20,
@@ -221,6 +222,9 @@ type Replica struct {
 
 	// connectionClass controls the ConnectionClass used to send raft messages.
 	connectionClass atomicConnectionClass
+
+	// schedulerCtx is a cached instance of an annotated Raft scheduler context.
+	schedulerCtx atomic.Value // context.Context
 
 	// raftMu protects Raft processing the replica.
 	//
@@ -483,11 +487,6 @@ type Replica struct {
 		// depending on which lock is being held.
 		stateLoader stateloader.StateLoader
 
-		// draining specifies whether this replica is draining. Raft leadership
-		// transfers due to a lease change will be attempted even if the target does
-		// not have all the log entries.
-		draining bool
-
 		// cachedProtectedTS provides the state of the protected timestamp
 		// subsystem as used on the request serving path to determine the effective
 		// gc threshold given the current TTL when using strict GC enforcement.
@@ -723,7 +722,7 @@ func (r *Replica) descRLocked() *roachpb.RangeDescriptor {
 
 // NodeID returns the ID of the node this replica belongs to.
 func (r *Replica) NodeID() roachpb.NodeID {
-	return r.store.nodeDesc.NodeID
+	return r.store.NodeID()
 }
 
 // GetNodeLocality returns the locality of the node this replica belongs to.
@@ -912,7 +911,7 @@ func (r *Replica) getFreezeStartRLocked() hlc.Timestamp {
 	return r.mu.freezeStart
 }
 
-// setLastReplicaDescriptors sets the the most recently seen replica
+// setLastReplicaDescriptors sets the most recently seen replica
 // descriptors to those contained in the *RaftMessageRequest, acquiring r.mu
 // to do so.
 func (r *Replica) setLastReplicaDescriptors(req *RaftMessageRequest) {
@@ -1606,7 +1605,7 @@ func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(ctx context.Con
 	}
 	lhReplicaID := uint64(lease.Replica.ReplicaID)
 	lhProgress, ok := raftStatus.Progress[lhReplicaID]
-	if (ok && lhProgress.Match >= raftStatus.Commit) || r.mu.draining {
+	if (ok && lhProgress.Match >= raftStatus.Commit) || r.store.IsDraining() {
 		log.VEventf(ctx, 1, "transferring raft leadership to replica ID %v", lhReplicaID)
 		r.store.metrics.RangeRaftLeaderTransfers.Inc(1)
 		r.mu.internalRaftGroup.TransferLeader(lhReplicaID)
@@ -1692,7 +1691,7 @@ func (r *Replica) GetExternalStorage(
 
 // GetExternalStorageFromURI returns an ExternalStorage object, based on the given URI.
 func (r *Replica) GetExternalStorageFromURI(
-	ctx context.Context, uri string, user string,
+	ctx context.Context, uri string, user security.SQLUsername,
 ) (cloud.ExternalStorage, error) {
 	return r.store.cfg.ExternalStorageFromURI(ctx, uri, user)
 }

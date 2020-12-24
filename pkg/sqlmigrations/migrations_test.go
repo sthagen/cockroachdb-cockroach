@@ -19,9 +19,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -33,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations/leasemanager"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -41,10 +39,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
-	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/require"
 )
 
@@ -431,7 +427,7 @@ func TestLeaseExpiration(t *testing.T) {
 	defer func() { leaseRefreshInterval = oldLeaseRefreshInterval }()
 
 	exitCalled := make(chan bool)
-	log.SetExitFunc(true /* hideStack */, func(int) { exitCalled <- true })
+	log.SetExitFunc(true /* hideStack */, func(exit.Code) { exitCalled <- true })
 	defer log.ResetExitFunc()
 	// Disable stack traces to make the test output in teamcity less deceiving.
 	defer log.DisableTracebacks()()
@@ -604,7 +600,7 @@ func TestCreateSystemTable(t *testing.T) {
 	var descriptor descpb.Descriptor
 	if err := mt.kvDB.GetProto(ctx, descKey, &descriptor); err != nil {
 		t.Error(err)
-	} else if !proto.Equal(descVal, &descriptor) {
+	} else if !descVal.Equal(&descriptor) {
 		t.Errorf("expected %v for key %q, got %v", descVal, descKey, descriptor)
 	}
 
@@ -897,7 +893,7 @@ CREATE TABLE system.jobs (
 	require.NoError(t, mt.runMigration(ctx, migration))
 	newJobsTableAgain := catalogkv.TestingGetTableDescriptor(
 		mt.kvDB, keys.SystemSQLCodec, "system", "jobs")
-	require.True(t, proto.Equal(newJobsTable.TableDesc(), newJobsTableAgain.TableDesc()))
+	require.True(t, newJobsTable.TableDesc().Equal(newJobsTableAgain.TableDesc()))
 }
 
 func TestVersionAlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable(t *testing.T) {
@@ -981,83 +977,4 @@ func TestVersionAlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable
 	newJobsTableAgain := catalogkv.TestingGetTableDescriptor(
 		mt.kvDB, keys.SystemSQLCodec, "system", "jobs")
 	require.Equal(t, newJobsTable, newJobsTableAgain)
-}
-
-func TestMarkDeprecatedSchemaChangeJobsFailed(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-
-	mt := makeMigrationTest(ctx, t)
-	defer mt.close(ctx)
-
-	migration := mt.pop(t, "mark non-terminal schema change jobs with a pre-20.1 format version as failed")
-	mt.start(t, base.TestServerArgs{})
-
-	// Write some fake job records for schema changes with a pre-20.1 format
-	// version. Due to their format version, they will never be adopted. We just
-	// verify that the migration marks them as failed if in a non-terminal state,
-	// and otherwise leaves them alone.
-
-	payload := jobspb.Payload{
-		Details: jobspb.WrapPayloadDetails(jobspb.SchemaChangeDetails{
-			FormatVersion: jobspb.BaseFormatVersion,
-		}),
-	}
-	payloadBytes, err := protoutil.Marshal(&payload)
-	require.NoError(t, err)
-
-	testCases := []struct {
-		initialState        jobs.Status
-		expectedFinalStatus jobs.Status
-		expectedErrorPrefix string
-		jobID               int64
-	}{
-		{
-			initialState:        jobs.StatusRunning,
-			expectedFinalStatus: jobs.StatusFailed,
-			expectedErrorPrefix: "schema change jobs started prior to v20.1",
-			jobID:               int64(builtins.GenerateUniqueInt(base.SQLInstanceID(mt.server.NodeID()))),
-		},
-		{
-			initialState:        jobs.StatusReverting,
-			expectedFinalStatus: jobs.StatusFailed,
-			expectedErrorPrefix: "schema change jobs started prior to v20.1",
-			jobID:               int64(builtins.GenerateUniqueInt(base.SQLInstanceID(mt.server.NodeID()))),
-		},
-		{
-			initialState:        jobs.StatusSucceeded,
-			expectedFinalStatus: jobs.StatusSucceeded,
-			jobID:               int64(builtins.GenerateUniqueInt(base.SQLInstanceID(mt.server.NodeID()))),
-		},
-		{
-			initialState:        jobs.StatusCanceled,
-			expectedFinalStatus: jobs.StatusCanceled,
-			jobID:               int64(builtins.GenerateUniqueInt(base.SQLInstanceID(mt.server.NodeID()))),
-		},
-	}
-
-	insertStmt := `INSERT INTO system.jobs (id, status, payload) VALUES ($1, $2, $3)`
-	for _, testCase := range testCases {
-		mt.sqlDB.Exec(t, insertStmt, testCase.jobID, testCase.initialState, payloadBytes)
-	}
-
-	require.NoError(t, mt.runMigration(ctx, migration))
-
-	query := `SELECT status, payload FROM system.jobs WHERE id = $1`
-	for _, testCase := range testCases {
-		var status string
-		var payloadBytes []byte
-		row := mt.sqlDB.QueryRow(t, query, testCase.jobID)
-		row.Scan(&status, &payloadBytes)
-
-		require.Equal(t, status, string(testCase.expectedFinalStatus))
-
-		var payload jobspb.Payload
-		require.NoError(t, protoutil.Unmarshal(payloadBytes, &payload))
-		if testCase.expectedErrorPrefix != "" {
-			require.Regexp(t, testCase.expectedErrorPrefix, payload.Error)
-		} else {
-			require.Empty(t, payload.Error)
-		}
-	}
 }

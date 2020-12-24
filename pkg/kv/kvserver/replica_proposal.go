@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"time"
 	"unsafe"
 
@@ -34,13 +33,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
-	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	opentracing "github.com/opentracing/opentracing-go"
 	"golang.org/x/time/rate"
@@ -58,7 +54,7 @@ type ProposalData struct {
 
 	// An optional tracing span bound to the proposal. Will be cleaned
 	// up when the proposal finishes.
-	sp opentracing.Span
+	sp *tracing.Span
 
 	// idKey uniquely identifies this proposal.
 	// TODO(andreimatei): idKey is legacy at this point: We could easily key
@@ -138,7 +134,7 @@ func (proposal *ProposalData) finishApplication(ctx context.Context, pr proposal
 	proposal.ec.done(ctx, proposal.Request, pr.Reply, pr.Err)
 	proposal.signalProposalResult(pr)
 	if proposal.sp != nil {
-		tracing.FinishSpan(proposal.sp)
+		proposal.sp.Finish()
 		proposal.sp = nil
 	}
 }
@@ -228,8 +224,6 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc kvserverpb.Co
 		}
 	}
 
-	limiter := limit.NewLimiter(rate.Limit(consistencyCheckRate.Get(&r.store.ClusterSettings().SV)))
-
 	// Compute SHA asynchronously and store it in a map by UUID.
 	if err := stopper.RunAsyncTask(ctx, "storage.Replica: computing checksum", func(ctx context.Context) {
 		func() {
@@ -239,7 +233,7 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc kvserverpb.Co
 				snapshot = &roachpb.RaftSnapshotData{}
 			}
 
-			result, err := r.sha512(ctx, desc, snap, snapshot, cc.Mode, limiter)
+			result, err := r.sha512(ctx, desc, snap, snapshot, cc.Mode, r.store.consistencyLimiter)
 			if err != nil {
 				log.Errorf(ctx, "%v", err)
 				result = nil
@@ -265,7 +259,7 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc kvserverpb.Co
 			_ = r.store.engine.MkdirAll(auxDir)
 			path := base.PreventedStartupFile(auxDir)
 
-			preventStartupMsg := fmt.Sprintf(`ATTENTION:
+			const attentionFmt = `ATTENTION:
 
 this node is terminating because a replica inconsistency was detected between %s
 and its other replicas. Please check your cluster-wide log files for more
@@ -277,8 +271,8 @@ A checkpoints directory to aid (expert) debugging should be present in:
 
 A file preventing this node from restarting was placed at:
 %s
-`, r, auxDir, path)
-
+`
+			preventStartupMsg := fmt.Sprintf(attentionFmt, r, auxDir, path)
 			if err := fs.WriteFile(r.store.engine, path, []byte(preventStartupMsg)); err != nil {
 				log.Warningf(ctx, "%v", err)
 			}
@@ -287,7 +281,7 @@ A file preventing this node from restarting was placed at:
 				p(*r.store.Ident)
 			} else {
 				time.Sleep(10 * time.Second)
-				log.Fatalf(r.AnnotateCtx(context.Background()), preventStartupMsg)
+				log.Fatalf(r.AnnotateCtx(context.Background()), attentionFmt, r, auxDir, path)
 			}
 		}
 
@@ -509,64 +503,24 @@ func addSSTablePreApply(
 	if eng.InMem() {
 		path = fmt.Sprintf("%x", checksum)
 		if err := eng.WriteFile(path, sst.Data); err != nil {
-			panic(err)
+			log.Fatalf(ctx, "unable to write sideloaded SSTable at term %d, index %d: %s", term, index, err)
 		}
 	} else {
 		ingestPath := path + ".ingested"
 
-		canLinkToRaftFile := false
-		// The SST may already be on disk, thanks to the sideloading mechanism.  If
-		// so we can try to add that file directly, via a new hardlink if the file-
-		// system support it, rather than writing a new copy of it. However, this is
-		// only safe if we can do so without modifying the file since it is still
-		// part of an immutable raft log message, but in some cases, described in
-		// DBIngestExternalFile, RocksDB would modify the file. Fortunately we can
-		// tell Rocks that it is not allowed to modify the file, in which case it
-		// will return and error if it would have tried to do so, at which point we
-		// can fall back to writing a new copy for Rocks to ingest.
-		if _, links, err := sysutil.StatAndLinkCount(path); err == nil {
-			// HACK: RocksDB does not like ingesting the same file (by inode) twice.
-			// See facebook/rocksdb#5133. We can tell that we have tried to ingest
-			// this file already if it has more than one link – one from the file raft
-			// wrote and one from rocks. In that case, we should not try to give
-			// rocks a link to the same file again.
-			if links == 1 {
-				canLinkToRaftFile = true
-			} else {
-				log.Warningf(ctx, "SSTable at index %d term %d may have already been ingested (link count %d) -- falling back to ingesting a copy",
-					index, term, links)
+		// The SST may already be on disk, thanks to the sideloading
+		// mechanism.  If so we can try to add that file directly, via a new
+		// hardlink if the filesystem supports it, rather than writing a new
+		// copy of it.  We cannot pass it the path in the sideload store as
+		// the engine deletes the passed path on success.
+		if linkErr := eng.Link(path, ingestPath); linkErr == nil {
+			ingestErr := eng.IngestExternalFiles(ctx, []string{ingestPath})
+			if ingestErr != nil {
+				log.Fatalf(ctx, "while ingesting %s: %v", ingestPath, ingestErr)
 			}
-		}
-
-		if canLinkToRaftFile {
-			// If the fs supports it, make a hard-link for rocks to ingest. We cannot
-			// pass it the path in the sideload store as it deletes the passed path on
-			// success.
-			if linkErr := eng.Link(path, ingestPath); linkErr == nil {
-				ingestErr := eng.IngestExternalFiles(ctx, []string{ingestPath})
-				if ingestErr == nil {
-					// Adding without modification succeeded, no copy necessary.
-					log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
-					return false
-				}
-				if rmErr := eng.Remove(ingestPath); rmErr != nil {
-					log.Fatalf(ctx, "failed to move ingest sst: %v", rmErr)
-				}
-				const seqNoMsg = "Global seqno is required, but disabled"
-				const seqNoOnReIngest = "external file have non zero sequence number"
-				// Repeated ingestion is still possible even with the link count checked
-				// above, since rocks might have already compacted away the file.
-				// However it does not flush compacted files from its cache, so it can
-				// still react poorly to attempting to ingest again. If we get an error
-				// that indicates we can't ingest, we'll make a copy and try again. That
-				// attempt must succeed or we'll fatal, so any persistent error is still
-				// going to be surfaced.
-				ingestErrMsg := ingestErr.Error()
-				isSeqNoErr := strings.Contains(ingestErrMsg, seqNoMsg) || strings.Contains(ingestErrMsg, seqNoOnReIngest)
-				if ingestErr := (*storage.Error)(nil); !errors.As(err, &ingestErr) || !isSeqNoErr {
-					log.Fatalf(ctx, "while ingesting %s: %v", ingestPath, ingestErr)
-				}
-			}
+			// Adding without modification succeeded, no copy necessary.
+			log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
+			return false
 		}
 
 		path = ingestPath
@@ -581,8 +535,8 @@ func addSSTablePreApply(
 		if _, err := eng.Stat(path); err == nil {
 			// The file we want to ingest exists. This can happen since the
 			// ingestion may apply twice (we ingest before we mark the Raft
-			// command as committed). Just unlink the file (RocksDB created a
-			// hard link); after that we're free to write it again.
+			// command as committed). Just unlink the file (the storage engine
+			// created a hard link); after that we're free to write it again.
 			if err := eng.Remove(path); err != nil {
 				log.Fatalf(ctx, "while removing existing file during ingestion of %s: %+v", path, err)
 			}
@@ -729,7 +683,7 @@ func (r *Replica) evaluateProposal(
 	ba *roachpb.BatchRequest,
 	latchSpans *spanset.SpanSet,
 ) (*result.Result, bool, *roachpb.Error) {
-	if ba.Timestamp == (hlc.Timestamp{}) {
+	if ba.Timestamp.IsEmpty() {
 		return nil, false, roachpb.NewErrorf("can't propose Raft command with zero timestamp")
 	}
 
@@ -780,7 +734,7 @@ func (r *Replica) evaluateProposal(
 	// 3. the request has replicated side-effects.
 	needConsensus := !batch.Empty() ||
 		ms != (enginepb.MVCCStats{}) ||
-		!res.Replicated.Equal(kvserverpb.ReplicatedEvalResult{})
+		!res.Replicated.IsZero()
 
 	if needConsensus {
 		// Set the proposal's WriteBatch, which is the serialized representation of
@@ -795,32 +749,15 @@ func (r *Replica) evaluateProposal(
 		res.Replicated.Timestamp = ba.Timestamp
 		res.Replicated.Delta = ms.ToStatsDelta()
 
-		_ = clusterversion.VersionContainsEstimatesCounter // see for info on ContainsEstimates migration
-		if r.ClusterSettings().Version.IsActive(ctx, clusterversion.VersionContainsEstimatesCounter) {
-			// Encode that this command (and any that follow) uses regular arithmetic for ContainsEstimates
-			// by making sure ContainsEstimates is > 1.
-			// This will be interpreted during command application.
-			if res.Replicated.Delta.ContainsEstimates > 0 {
-				res.Replicated.Delta.ContainsEstimates *= 2
-			}
-		} else {
-			// This range may still need to have its commands processed by nodes which treat ContainsEstimates
-			// as a bool, so clamp it to {0,1}. This enables use of bool semantics in command application.
-			if res.Replicated.Delta.ContainsEstimates > 1 {
-				res.Replicated.Delta.ContainsEstimates = 1
-			} else if res.Replicated.Delta.ContainsEstimates < 0 {
-				// The caller should have checked the cluster version. At the
-				// time of writing, this is only RecomputeStats and the split
-				// trigger, which both have the check, but better safe than sorry.
-				log.Fatalf(ctx, "cannot propose negative ContainsEstimates "+
-					"without VersionContainsEstimatesCounter in %s", ba.Summary())
-			}
+		// This is the result of a migration. See the field for more details.
+		if res.Replicated.Delta.ContainsEstimates > 0 {
+			res.Replicated.Delta.ContainsEstimates *= 2
 		}
 
 		// If the cluster version doesn't track abort span size in MVCCStats, we
 		// zero it out to prevent inconsistencies in MVCCStats across nodes in a
 		// possibly mixed-version cluster.
-		if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.VersionAbortSpanBytes) {
+		if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.AbortSpanBytes) {
 			res.Replicated.Delta.AbortSpanBytes = 0
 		}
 
@@ -888,20 +825,20 @@ func (r *Replica) requestToProposal(
 	return proposal, pErr
 }
 
-// getTraceData extracts the SpanContext of the current span.
+// getTraceData extracts the SpanMeta of the current span.
 func (r *Replica) getTraceData(ctx context.Context) opentracing.TextMapCarrier {
-	sp := opentracing.SpanFromContext(ctx)
+	sp := tracing.SpanFromContext(ctx)
 	if sp == nil {
 		return nil
 	}
-	if tracing.IsBlackHoleSpan(sp) {
+	if sp.IsBlackHole() {
 		return nil
 	}
 	traceData := opentracing.TextMapCarrier{}
 	if err := r.AmbientContext.Tracer.Inject(
-		sp.Context(), opentracing.TextMap, traceData,
+		sp.Meta(), opentracing.TextMap, traceData,
 	); err != nil {
-		log.Errorf(ctx, "failed to inject sp context (%+v) as trace data: %s", sp.Context(), err)
+		log.Errorf(ctx, "failed to inject sp context (%+v) as trace data: %s", sp.Meta(), err)
 		return nil
 	}
 	return traceData

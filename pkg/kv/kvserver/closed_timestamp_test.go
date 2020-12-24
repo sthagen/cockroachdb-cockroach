@@ -499,10 +499,7 @@ func TestClosedTimestampInactiveAfterSubsumption(t *testing.T) {
 			callback: nil,
 		},
 		{
-			name: "with intervening lease transfer",
-			// TODO(aayush): Maybe allowlist `TransferLease` requests while a range is
-			// subsumed and use that here, instead of forcing a lease transfer by
-			// pausing heartbeats.
+			name:     "with intervening lease transfer",
 			callback: forceLeaseTransferOnSubsumedRange,
 		},
 	}
@@ -549,42 +546,25 @@ func TestClosedTimestampInactiveAfterSubsumption(t *testing.T) {
 							return nil
 						},
 						DisableMergeQueue: true,
+						// A subtest wants to force a lease change by stopping the liveness
+						// heartbeats on the old leaseholder and sending a request to
+						// another replica. If we didn't use this knob, we'd have to
+						// architect a Raft leadership change too in order to let the
+						// replica get the lease.
+						AllowLeaseRequestProposalsWhenNotLeader: true,
 					},
 				},
 			},
 		}
-		// If the initial phase of the merge txn takes longer than the closed
-		// timestamp target duration, its initial CPuts can have their write
-		// timestamps bumped due to an intervening closed timestamp update. This
-		// causes the entire merge txn to retry. So we use a long closed timestamp
-		// duration at the beginning of the test until we have the merge txn
-		// suspended at its commit trigger, and then change it back down to
-		// `testingTargetDuration`.
-		tc, db, leftDesc, rightDesc := initClusterWithSplitRanges(ctx, t, 5*time.Second,
+		tc, _, leftDesc, rightDesc := initClusterWithSplitRanges(ctx, t, testingTargetDuration,
 			testingCloseFraction, clusterArgs)
 		defer tc.Stopper().Stop(ctx)
 
 		leftLeaseholder := getCurrentLeaseholder(t, tc, leftDesc)
 		rightLeaseholder := getCurrentLeaseholder(t, tc, rightDesc)
-		if leftLeaseholder.StoreID == rightLeaseholder.StoreID {
-			// In this test, we may pause the heartbeats of the store that holds the
-			// lease for the right hand side range, in order to force a lease
-			// transfer. If the LHS and RHS share a leaseholder, this may cause a
-			// lease transfer for the left hand range as well. This can cause a merge
-			// txn retry and we'd like to avoid that, so we ensure that LHS and RHS
-			// have different leaseholders before beginning the test.
-			target := pickRandomTarget(tc, rightLeaseholder, leftDesc)
-			if err := tc.TransferRangeLease(leftDesc, target); err != nil {
-				t.Fatal(err)
-			}
-			leftLeaseholder = target
-		}
-		// Make sure that the new leaseholder for the left hand side range learns
-		// that it is indeed the leaseholder.
-		require.NoError(t, tc.(*testcluster.TestCluster).WaitForFullReplication())
 
 		g, ctx := errgroup.WithContext(ctx)
-		// Merge the ranges back together. The LHS rightLeaseholder should block right
+		// Merge the ranges back together. The LHS leaseholder should block right
 		// before the merge trigger request is sent.
 		leftLeaseholderStore := getTargetStoreOrFatal(t, tc, leftLeaseholder)
 		blocker := st.BlockNextMerge()
@@ -610,12 +590,6 @@ func TestClosedTimestampInactiveAfterSubsumption(t *testing.T) {
 			t.Fatal(err)
 		case <-time.After(45 * time.Second):
 			t.Fatal("did not receive merge commit trigger as expected")
-		}
-		// Reduce the closed timestamp target duration in order to make the rest of
-		// the test faster.
-		if _, err := db.Exec(fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s';`,
-			testingTargetDuration)); err != nil {
-			t.Fatal(err)
 		}
 		// inactiveClosedTSBoundary indicates the low water mark for closed
 		// timestamp updates beyond which we expect none of the followers to be able
@@ -699,7 +673,7 @@ func forceLeaseTransferOnSubsumedRange(
 	})
 	restartHeartbeats := oldLeaseholderStore.NodeLiveness().PauseAllHeartbeatsForTest()
 	defer restartHeartbeats()
-	log.Infof(ctx, "paused RHS rightLeaseholder's liveness heartbeats")
+	log.Infof(ctx, "test: paused RHS rightLeaseholder's liveness heartbeats")
 	time.Sleep(oldLeaseholderStore.NodeLiveness().GetLivenessThreshold())
 
 	// Send a read request from one of the followers of RHS so that it notices
@@ -710,7 +684,8 @@ func forceLeaseTransferOnSubsumedRange(
 		log.Infof(ctx,
 			"sending a read request from a follower of RHS (store %d) in order to trigger lease acquisition",
 			newRightLeaseholder.StoreID())
-		newRightLeaseholder.Send(ctx, leaseAcquisitionRequest)
+		_, pErr := newRightLeaseholder.Send(ctx, leaseAcquisitionRequest)
+		log.Infof(ctx, "test: RHS read returned err: %v", pErr)
 		// After the merge commits, the RHS will cease to exist and this read
 		// request will return a RangeNotFoundError. But we cannot guarantee that
 		// the merge will always successfully commit on its first attempt
@@ -1035,7 +1010,7 @@ func countNotLeaseHolderErrors(ba roachpb.BatchRequest, repls []*kvserver.Replic
 					atomic.AddInt64(&notLeaseholderErrs, 1)
 					return nil
 				}
-				return pErr.GetDetail()
+				return pErr.GoError()
 			}
 			return nil
 		})
@@ -1239,12 +1214,12 @@ func retryOnError(f func(*roachpb.Error) bool) respFunc {
 }
 
 var retryOnRangeKeyMismatch = retryOnError(func(pErr *roachpb.Error) bool {
-	_, isRangeKeyMismatch := pErr.Detail.Value.(*roachpb.ErrorDetail_RangeKeyMismatch)
+	_, isRangeKeyMismatch := pErr.GetDetail().(*roachpb.RangeKeyMismatchError)
 	return isRangeKeyMismatch
 })
 
 var retryOnRangeNotFound = retryOnError(func(pErr *roachpb.Error) bool {
-	_, isRangeNotFound := pErr.Detail.Value.(*roachpb.ErrorDetail_RangeNotFound)
+	_, isRangeNotFound := pErr.GetDetail().(*roachpb.RangeNotFoundError)
 	return isRangeNotFound
 })
 

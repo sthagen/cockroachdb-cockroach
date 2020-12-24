@@ -40,8 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
-	opentracing "github.com/opentracing/opentracing-go"
 	"golang.org/x/sync/syncmap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
@@ -91,29 +89,6 @@ var sourceAddr = func() net.Addr {
 }()
 
 var enableRPCCompression = envutil.EnvOrDefaultBool("COCKROACH_ENABLE_RPC_COMPRESSION", true)
-
-// spanInclusionFuncForServer is used as a SpanInclusionFunc for the server-side
-// of RPCs, deciding for which operations the gRPC opentracing interceptor should
-// create a span.
-func spanInclusionFuncForServer(
-	t *tracing.Tracer, parentSpanCtx opentracing.SpanContext, method string, req, resp interface{},
-) bool {
-	// Is client tracing?
-	return (parentSpanCtx != nil && !tracing.IsNoopContext(parentSpanCtx)) ||
-		// Should we trace regardless of the client? This is useful for calls coming
-		// through the HTTP->RPC gateway (i.e. the AdminUI), where client is never
-		// tracing.
-		t.AlwaysTrace()
-}
-
-// spanInclusionFuncForClient is used as a SpanInclusionFunc for the client-side
-// of RPCs, deciding for which operations the gRPC opentracing interceptor should
-// create a span.
-func spanInclusionFuncForClient(
-	parentSpanCtx opentracing.SpanContext, method string, req, resp interface{},
-) bool {
-	return parentSpanCtx != nil && !tracing.IsNoopContext(parentSpanCtx)
-}
 
 type serverOpts struct {
 	interceptor func(fullMethod string) error
@@ -212,23 +187,8 @@ func NewServer(ctx *Context, opts ...ServerOption) *grpc.Server {
 	}
 
 	if tracer := ctx.AmbientCtx.Tracer; tracer != nil {
-		// We use a SpanInclusionFunc to save a bit of unnecessary work when
-		// tracing is disabled.
-		inclusionOpt := otgrpc.IncludingSpans(func(
-			parentSpanCtx opentracing.SpanContext,
-			method string,
-			req, resp interface{}) bool {
-			// This anonymous func serves to bind the tracer for
-			// spanInclusionFuncForServer.
-			return spanInclusionFuncForServer(
-				tracer.(*tracing.Tracer), parentSpanCtx, method, req, resp)
-		})
-		unaryInterceptor = append(unaryInterceptor, otgrpc.OpenTracingServerInterceptor(
-			tracer, inclusionOpt,
-		))
-		streamInterceptor = append(streamInterceptor, otgrpc.OpenTracingStreamServerInterceptor(
-			tracer, inclusionOpt,
-		))
+		unaryInterceptor = append(unaryInterceptor, tracing.ServerInterceptor(tracer))
+		streamInterceptor = append(streamInterceptor, tracing.StreamServerInterceptor(tracer))
 	}
 
 	grpcOpts = append(grpcOpts, grpc.ChainUnaryInterceptor(unaryInterceptor...))
@@ -516,6 +476,12 @@ func (a internalClientAdapter) Join(
 	return a.InternalServer.Join(ctx, req)
 }
 
+func (a internalClientAdapter) ResetQuorum(
+	ctx context.Context, req *roachpb.ResetQuorumRequest, _ ...grpc.CallOption,
+) (*roachpb.ResetQuorumResponse, error) {
+	return a.InternalServer.ResetQuorum(ctx, req)
+}
+
 type respStreamClientAdapter struct {
 	ctx   context.Context
 	respC chan interface{}
@@ -676,12 +642,12 @@ func (ctx *Context) removeConn(conn *Connection, keys ...connKey) {
 		ctx.conns.Delete(key)
 	}
 	if log.V(1) {
-		log.Infof(ctx.masterCtx, "closing %+v", keys)
+		log.Health.Infof(ctx.masterCtx, "closing %+v", keys)
 	}
 	if grpcConn := conn.grpcConn; grpcConn != nil {
 		if err := grpcConn.Close(); err != nil && !grpcutil.IsClosedConnection(err) {
 			if log.V(1) {
-				log.Errorf(ctx.masterCtx, "failed to close client connection: %v", err)
+				log.Health.Errorf(ctx.masterCtx, "failed to close client connection: %v", err)
 			}
 		}
 	}
@@ -749,11 +715,8 @@ func (ctx *Context) grpcDialOptions(
 	var streamInterceptors []grpc.StreamClientInterceptor
 
 	if tracer := ctx.AmbientCtx.Tracer; tracer != nil {
-		var opts []otgrpc.Option
-		// We use a SpanInclusionFunc to circumvent the interceptor's work when
-		// tracing is disabled. Otherwise, the interceptor causes an increase in
-		// the number of packets (even with an empty context!). See #17177.
-		opts = append(opts, otgrpc.IncludingSpans(spanInclusionFuncForClient))
+		// TODO(tbg): re-write all of this for our tracer.
+
 		// We use a decorator to set the "node" tag. All other spans get the
 		// node tag from context log tags.
 		//
@@ -762,13 +725,14 @@ func (ctx *Context) grpcDialOptions(
 		// interceptor runs too late - after a traced RPC's recording had
 		// already been collected. So, on the server-side, the equivalent code
 		// is in setupSpanForIncomingRPC().
-		opts = append(opts, otgrpc.SpanDecorator(func(span opentracing.Span, _ string, _, _ interface{}, _ error) {
+		//
+		tagger := func(span *tracing.Span) {
 			span.SetTag("node", ctx.NodeID.String())
-		}))
+		}
 		unaryInterceptors = append(unaryInterceptors,
-			otgrpc.OpenTracingClientInterceptor(tracer, opts...))
+			tracing.ClientInterceptor(tracer, tagger))
 		streamInterceptors = append(streamInterceptors,
-			otgrpc.OpenTracingStreamClientInterceptor(tracer, opts...))
+			tracing.StreamClientInterceptor(tracer, tagger))
 	}
 	if ctx.Knobs.UnaryClientInterceptor != nil {
 		testingUnaryInterceptor := ctx.Knobs.UnaryClientInterceptor(target, class)
@@ -998,7 +962,7 @@ func (ctx *Context) grpcDialRaw(
 	dialOpts = append(dialOpts, ctx.testingDialOpts...)
 
 	if log.V(1) {
-		log.Infof(ctx.masterCtx, "dialing %s", target)
+		log.Health.Infof(ctx.masterCtx, "dialing %s", target)
 	}
 	conn, err := grpc.DialContext(ctx.masterCtx, target, dialOpts...)
 	return conn, dialer.redialChan, err
@@ -1023,7 +987,7 @@ func (ctx *Context) GRPCDialNode(
 	target string, remoteNodeID roachpb.NodeID, class ConnectionClass,
 ) *Connection {
 	if remoteNodeID == 0 && !ctx.TestingAllowNamedRPCToAnonymousServer {
-		log.Fatalf(context.TODO(), "invalid node ID 0 in GRPCDialNode()")
+		log.Fatalf(context.TODO(), "%v", errors.AssertionFailedf("invalid node ID 0 in GRPCDialNode()"))
 	}
 	return ctx.grpcDialNodeInternal(target, remoteNodeID, class)
 }
@@ -1071,7 +1035,7 @@ func (ctx *Context) grpcDialNodeInternal(
 					ctx.Stopper.RunWorker(masterCtx, func(masterCtx context.Context) {
 						err := ctx.runHeartbeat(conn, target, redialChan)
 						if err != nil && !grpcutil.IsClosedConnection(err) {
-							log.Errorf(masterCtx, "removing connection to %s due to error: %s", target, err)
+							log.Health.Errorf(masterCtx, "removing connection to %s due to error: %s", target, err)
 						}
 						ctx.removeConn(conn, thisConnKeys...)
 					})

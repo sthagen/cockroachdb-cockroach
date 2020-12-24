@@ -117,18 +117,16 @@ func newMax_AGGKINDAggAlloc(
 type _AGG_TYPE_AGGKINDAgg struct {
 	// {{if eq "_AGGKIND" "Ordered"}}
 	orderedAggregateFuncBase
-	// {{else}}
+	// {{end}}
+	// col points to the output vector we are updating.
+	col _GOTYPESLICE
+	// {{if eq "_AGGKIND" "Hash"}}
 	hashAggregateFuncBase
 	// {{end}}
-	allocator *colmem.Allocator
 	// curAgg holds the running min/max, so we can index into the slice once per
 	// group, instead of on each iteration.
 	// NOTE: if foundNonNullForCurrentGroup is false, curAgg is undefined.
 	curAgg _GOTYPE
-	// col points to the output vector we are updating.
-	col _GOTYPESLICE
-	// vec is the same as col before conversion from coldata.Vec.
-	vec coldata.Vec
 	// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 	// for the group that is currently being aggregated.
 	foundNonNullForCurrentGroup bool
@@ -136,90 +134,64 @@ type _AGG_TYPE_AGGKINDAgg struct {
 
 var _ AggregateFunc = &_AGG_TYPE_AGGKINDAgg{}
 
-func (a *_AGG_TYPE_AGGKINDAgg) Init(groups []bool, vec coldata.Vec) {
+func (a *_AGG_TYPE_AGGKINDAgg) SetOutput(vec coldata.Vec) {
 	// {{if eq "_AGGKIND" "Ordered"}}
-	a.orderedAggregateFuncBase.Init(groups, vec)
+	a.orderedAggregateFuncBase.SetOutput(vec)
 	// {{else}}
-	a.hashAggregateFuncBase.Init(groups, vec)
+	a.hashAggregateFuncBase.SetOutput(vec)
 	// {{end}}
-	a.vec = vec
 	a.col = vec._TYPE()
-	a.Reset()
-}
-
-func (a *_AGG_TYPE_AGGKINDAgg) Reset() {
-	// {{if eq "_AGGKIND" "Ordered"}}
-	a.orderedAggregateFuncBase.Reset()
-	// {{else}}
-	a.hashAggregateFuncBase.Reset()
-	// {{end}}
-	a.foundNonNullForCurrentGroup = false
 }
 
 func (a *_AGG_TYPE_AGGKINDAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
-	// {{if eq .VecMethod "Bytes"}}
-	oldCurAggSize := len(a.curAgg)
-	// {{end}}
-	// {{if eq .VecMethod "Datum"}}
-	var oldCurAggSize uintptr
-	if a.curAgg != nil {
-		oldCurAggSize = a.curAgg.(*coldataext.Datum).Size()
-	}
-	// {{end}}
+	execgen.SETVARIABLESIZE(oldCurAggSize, a.curAgg)
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec._TYPE(), vec.Nulls()
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// {{if eq "_AGGKIND" "Ordered"}}
-			groups := a.groups
-			// {{/*
-			// We don't need to check whether sel is non-nil when performing
-			// hash aggregation because the hash aggregator always uses non-nil
-			// sel to specify the tuples to be aggregated.
-			// */}}
-			if sel == nil {
-				_ = groups[inputLen-1]
-				col = execgen.SLICE(col, 0, inputLen)
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						_ACCUMULATE_MINMAX(a, nulls, i, true)
-					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						_ACCUMULATE_MINMAX(a, nulls, i, false)
-					}
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// {{if eq "_AGGKIND" "Ordered"}}
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		// {{/*
+		// We don't need to check whether sel is non-nil when performing
+		// hash aggregation because the hash aggregator always uses non-nil
+		// sel to specify the tuples to be aggregated.
+		// */}}
+		if sel == nil {
+			_ = groups[inputLen-1]
+			_ = col.Get(inputLen - 1)
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					_ACCUMULATE_MINMAX(a, nulls, i, true, false)
 				}
-			} else
-			// {{end}}
-			{
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						_ACCUMULATE_MINMAX(a, nulls, i, true)
-					}
-				} else {
-					for _, i := range sel {
-						_ACCUMULATE_MINMAX(a, nulls, i, false)
-					}
+			} else {
+				for i := 0; i < inputLen; i++ {
+					_ACCUMULATE_MINMAX(a, nulls, i, false, false)
 				}
 			}
-		},
+		} else
+		// {{end}}
+		{
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					_ACCUMULATE_MINMAX(a, nulls, i, true, true)
+				}
+			} else {
+				for _, i := range sel {
+					_ACCUMULATE_MINMAX(a, nulls, i, false, true)
+				}
+			}
+		}
+	},
 	)
-	// {{if eq .VecMethod "Bytes"}}
-	newCurAggSize := len(a.curAgg)
-	// {{end}}
-	// {{if eq .VecMethod "Datum"}}
-	var newCurAggSize uintptr
-	if a.curAgg != nil {
-		newCurAggSize = a.curAgg.(*coldataext.Datum).Size()
+	execgen.SETVARIABLESIZE(newCurAggSize, a.curAgg)
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
 	}
-	// {{end}}
-	// {{if or (eq .VecMethod "Bytes") (eq .VecMethod "Datum")}}
-	a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
-	// {{end}}
 }
 
 func (a *_AGG_TYPE_AGGKINDAgg) Flush(outputIdx int) {
@@ -248,6 +220,13 @@ func (a *_AGG_TYPE_AGGKINDAgg) Flush(outputIdx int) {
 	// {{end}}
 	a.curAgg = nil
 	// {{end}}
+}
+
+func (a *_AGG_TYPE_AGGKINDAgg) Reset() {
+	// {{if eq "_AGGKIND" "Ordered"}}
+	a.orderedAggregateFuncBase.Reset()
+	// {{end}}
+	a.foundNonNullForCurrentGroup = false
 }
 
 type _AGG_TYPE_AGGKINDAggAlloc struct {
@@ -280,22 +259,30 @@ func (a *_AGG_TYPE_AGGKINDAggAlloc) newAggFunc() AggregateFunc {
 // the ith row if it is smaller/larger than the current result. If this is the
 // first row of a new group, and no non-nulls have been found for the current
 // group, then the output for the current group is set to null.
-func _ACCUMULATE_MINMAX(a *_AGG_TYPE_AGGKINDAgg, nulls *coldata.Nulls, i int, _HAS_NULLS bool) { // */}}
+func _ACCUMULATE_MINMAX(
+	a *_AGG_TYPE_AGGKINDAgg, nulls *coldata.Nulls, i int, _HAS_NULLS bool, _HAS_SEL bool,
+) { // */}}
 	// {{define "accumulateMinMax"}}
 
 	// {{if eq "_AGGKIND" "Ordered"}}
+	// {{if not .HasSel}}
+	//gcassert:bce
+	// {{end}}
 	if groups[i] {
-		// If we encounter a new group, and we haven't found any non-nulls for the
-		// current group, the output for this group should be null.
-		if !a.foundNonNullForCurrentGroup {
-			a.nulls.SetNull(a.curIdx)
-		} else {
-			// {{with .Global}}
-			execgen.SET(a.col, a.curIdx, a.curAgg)
-			// {{end}}
+		if !a.isFirstGroup {
+			// If we encounter a new group, and we haven't found any non-nulls for the
+			// current group, the output for this group should be null.
+			if !a.foundNonNullForCurrentGroup {
+				a.nulls.SetNull(a.curIdx)
+			} else {
+				// {{with .Global}}
+				execgen.SET(a.col, a.curIdx, a.curAgg)
+				// {{end}}
+			}
+			a.curIdx++
+			a.foundNonNullForCurrentGroup = false
 		}
-		a.curIdx++
-		a.foundNonNullForCurrentGroup = false
+		a.isFirstGroup = false
 	}
 	// {{end}}
 
@@ -305,22 +292,30 @@ func _ACCUMULATE_MINMAX(a *_AGG_TYPE_AGGKINDAgg, nulls *coldata.Nulls, i int, _H
 	// {{else}}
 	isNull = false
 	// {{end}}
-	// {{with .Global}}
 	if !isNull {
 		if !a.foundNonNullForCurrentGroup {
+			// {{if and (.Sliceable) (not .HasSel)}}
+			//gcassert:bce
+			// {{end}}
 			val := col.Get(i)
+			// {{with .Global}}
 			execgen.COPYVAL(a.curAgg, val)
+			// {{end}}
 			a.foundNonNullForCurrentGroup = true
 		} else {
 			var cmp bool
+			// {{if and (.Sliceable) (not .HasSel)}}
+			//gcassert:bce
+			// {{end}}
 			candidate := col.Get(i)
+			// {{with .Global}}
 			_ASSIGN_CMP(cmp, candidate, a.curAgg, _, col, _)
 			if cmp {
 				execgen.COPYVAL(a.curAgg, candidate)
 			}
+			// {{end}}
 		}
 	}
-	// {{end}}
 	// {{end}}
 
 	// {{/*

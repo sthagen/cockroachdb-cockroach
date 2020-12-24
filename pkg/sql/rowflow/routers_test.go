@@ -15,7 +15,7 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -39,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/opentracing/opentracing-go"
 )
 
 // setupRouter creates and starts a router. Returns the router and a WaitGroup
@@ -753,9 +752,9 @@ func TestRouterDiskSpill(t *testing.T) {
 
 	// Enable stats recording.
 	tracer := tracing.NewTracer()
-	sp := tracer.StartSpan("root", tracing.Recordable)
-	tracing.StartRecording(sp, tracing.SnowballRecording)
-	ctx := opentracing.ContextWithSpan(context.Background(), sp)
+	sp := tracer.StartSpan("root", tracing.WithForceRealSpan())
+	sp.SetVerbose(true)
+	ctx := tracing.ContextWithSpan(context.Background(), sp)
 
 	st := cluster.MakeTestingClusterSettings()
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
@@ -871,28 +870,25 @@ func TestRouterDiskSpill(t *testing.T) {
 					}
 					traceMetaSeen = true
 					span := meta.TraceData[0]
-					getIntTagValue := func(key string) int {
+					getTagValue := func(key string) string {
 						strValue, ok := span.Tags[key]
 						if !ok {
 							t.Errorf("missing tag: %s", key)
 						}
-						intValue, err := strconv.Atoi(strValue)
-						if err != nil {
-							t.Error(err)
-						}
-						return intValue
+						return strValue
 					}
-					rowsRouted := getIntTagValue("cockroach.stat.routeroutput.rows_routed")
-					memMax := getIntTagValue("cockroach.stat.routeroutput.mem.max")
-					diskMax := getIntTagValue("cockroach.stat.routeroutput.disk.max")
-					if rowsRouted != numRows {
-						t.Errorf("expected %d rows routed, got %d", numRows, rowsRouted)
+					t.Logf("tags: %v\n", span.Tags)
+					rowsRouted := getTagValue("cockroach.stat.input.tuples")
+					memMax := getTagValue("cockroach.stat.max.memory.allocated")
+					diskMax := getTagValue("cockroach.stat.max.scratch.disk.allocated")
+					if rowsRouted != fmt.Sprintf("%d", numRows) {
+						t.Errorf("expected %d rows routed, got %s", numRows, rowsRouted)
 					}
-					if memMax <= 0 {
-						t.Errorf("expected memMax > 0, got %d", memMax)
+					if strings.HasPrefix(memMax, `"0"`) {
+						t.Errorf("expected memMax > 0, got %s", memMax)
 					}
-					if diskMax <= 0 {
-						t.Errorf("expected diskMax > 0, got %d", diskMax)
+					if strings.HasPrefix(diskMax, `"0"`) {
+						t.Errorf("expected diskMax > 0, got %s", diskMax)
 					}
 				}
 				continue

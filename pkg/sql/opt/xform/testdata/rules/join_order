@@ -280,7 +280,7 @@ New expression 3 of 3:
 memo join-limit=0 expect-not=ReorderJoins
 SELECT * FROM bx, cy, abc WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
-memo (optimized, ~23KB, required=[presentation: b:1,x:2,c:4,y:5,a:7,b:8,c:9,d:10])
+memo (optimized, ~24KB, required=[presentation: b:1,x:2,c:4,y:5,a:7,b:8,c:9,d:10])
  ├── G1: (inner-join G2 G3 G4) (merge-join G2 G3 G5 inner-join,+1,+8)
  │    └── [presentation: b:1,x:2,c:4,y:5,a:7,b:8,c:9,d:10]
  │         ├── best: (merge-join G2="[ordering: +1]" G3 G5 inner-join,+1,+8)
@@ -333,7 +333,7 @@ memo (optimized, ~23KB, required=[presentation: b:1,x:2,c:4,y:5,a:7,b:8,c:9,d:10
 memo join-limit=2
 SELECT * FROM bx, cy, abc WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
-memo (optimized, ~35KB, required=[presentation: b:1,x:2,c:4,y:5,a:7,b:8,c:9,d:10])
+memo (optimized, ~37KB, required=[presentation: b:1,x:2,c:4,y:5,a:7,b:8,c:9,d:10])
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (inner-join G5 G6 G7) (inner-join G6 G5 G7) (merge-join G2 G3 G8 inner-join,+1,+8) (lookup-join G3 G8 bx,keyCols=[8],outCols=(1,2,4,5,7-10)) (merge-join G5 G6 G8 inner-join,+4,+9) (lookup-join G6 G8 cy,keyCols=[9],outCols=(1,2,4,5,7-10))
  │    └── [presentation: b:1,x:2,c:4,y:5,a:7,b:8,c:9,d:10]
  │         ├── best: (lookup-join G3 G8 bx,keyCols=[8],outCols=(1,2,4,5,7-10))
@@ -750,13 +750,13 @@ project
  │    │    ├── multiplicity: left-rows(zero-or-more), right-rows(zero-or-one)
  │    │    ├── key: (5)
  │    │    ├── fd: ()-->(3,11), (1)==(5), (5)==(1)
- │    │    ├── scan a2
+ │    │    ├── scan a [as=a2]
  │    │    │    ├── columns: a2.id:3!null
  │    │    │    ├── constraint: /3: [/1 - /1]
  │    │    │    ├── cardinality: [0 - 1]
  │    │    │    ├── key: ()
  │    │    │    └── fd: ()-->(3)
- │    │    ├── inner-join (lookup a)
+ │    │    ├── inner-join (lookup a [as=a3])
  │    │    │    ├── columns: a1.id:1!null a3.id:5!null bool:11!null
  │    │    │    ├── key columns: [1] = [5]
  │    │    │    ├── lookup columns are key
@@ -774,7 +774,7 @@ project
  │    │    │    │    │    ├── fd: (1)-->(11)
  │    │    │    │    │    ├── left-join (cross)
  │    │    │    │    │    │    ├── columns: a1.id:1!null bool:11
- │    │    │    │    │    │    ├── scan a1
+ │    │    │    │    │    │    ├── scan a [as=a1]
  │    │    │    │    │    │    │    ├── columns: a1.id:1!null
  │    │    │    │    │    │    │    └── key: (1)
  │    │    │    │    │    │    ├── project
@@ -792,7 +792,7 @@ project
  │    │    │    │         └── bool:11 [outer=(11), constraints=(/11: [/true - /true]; tight), fd=()-->(11)]
  │    │    │    └── filters (true)
  │    │    └── filters (true)
- │    ├── scan a4
+ │    ├── scan a [as=a4]
  │    │    ├── columns: a4.id:7!null
  │    │    ├── constraint: /7: [/1 - /1]
  │    │    ├── cardinality: [0 - 1]
@@ -2170,17 +2170,17 @@ WHERE EXISTS (SELECT * FROM abc AS a5 WHERE a2.c = a5.c)
 --------------------------------------------------------------------------------
 ----Join Tree #1----
 semi-join (hash)
- ├── scan a2
- ├── scan a5
+ ├── scan abc [as=a2]
+ ├── scan abc [as=a5]
  └── filters
       └── a2.c = a5.c
 
 ----Vertexes----
 A:
-scan a2
+scan abc [as=a2]
 
 B:
-scan a5
+scan abc [as=a5]
 
 ----Edges----
 a2.c = a5.c [semi]
@@ -2192,19 +2192,19 @@ Joins Considered: 1
 --------------------------------------------------------------------------------
 ----Join Tree #2----
 inner-join (hash)
- ├── scan a2
+ ├── scan abc [as=a2]
  ├── distinct-on
- │    └── scan a5
+ │    └── scan abc [as=a5]
  └── filters
       └── a2.c = a5.c
 
 ----Vertexes----
 A:
-scan a2
+scan abc [as=a2]
 
 B:
 distinct-on
- └── scan a5
+ └── scan abc [as=a5]
 
 ----Edges----
 a2.c = a5.c [inner]
@@ -2217,10 +2217,10 @@ Joins Considered: 2
 --------------------------------------------------------------------------------
 ----Join Tree #3----
 inner-join (hash)
- ├── scan a1
+ ├── scan abc [as=a1]
  ├── semi-join (hash)
- │    ├── scan a2
- │    ├── scan a5
+ │    ├── scan abc [as=a2]
+ │    ├── scan abc [as=a5]
  │    └── filters
  │         └── a2.c = a5.c
  └── filters
@@ -2228,13 +2228,13 @@ inner-join (hash)
 
 ----Vertexes----
 C:
-scan a1
+scan abc [as=a1]
 
 A:
-scan a2
+scan abc [as=a2]
 
 B:
-scan a5
+scan abc [as=a5]
 
 ----Edges----
 a2.c = a5.c [semi]
@@ -2255,25 +2255,25 @@ Joins Considered: 6
 ----Join Tree #4----
 inner-join (hash)
  ├── inner-join (hash)
- │    ├── scan a1
- │    ├── scan a2
+ │    ├── scan abc [as=a1]
+ │    ├── scan abc [as=a2]
  │    └── filters
  │         └── a1.a = a2.a
  ├── distinct-on
- │    └── scan a5
+ │    └── scan abc [as=a5]
  └── filters
       └── a2.c = a5.c
 
 ----Vertexes----
 C:
-scan a1
+scan abc [as=a1]
 
 A:
-scan a2
+scan abc [as=a2]
 
 B:
 distinct-on
- └── scan a5
+ └── scan abc [as=a5]
 
 ----Edges----
 a1.a = a2.a [inner]
@@ -2296,31 +2296,31 @@ Joins Considered: 8
 ----Join Tree #5----
 inner-join (hash)
  ├── inner-join (hash)
- │    ├── scan a1
+ │    ├── scan abc [as=a1]
  │    ├── semi-join (hash)
- │    │    ├── scan a2
- │    │    ├── scan a5
+ │    │    ├── scan abc [as=a2]
+ │    │    ├── scan abc [as=a5]
  │    │    └── filters
  │    │         └── a2.c = a5.c
  │    └── filters
  │         └── a1.a = a2.a
- ├── scan a3
+ ├── scan abc [as=a3]
  └── filters
       └── a2.b = a3.b
 
 ----Vertexes----
 C:
-scan a1
+scan abc [as=a1]
 
 A:
 semi-join (hash)
- ├── scan a2
- ├── scan a5
+ ├── scan abc [as=a2]
+ ├── scan abc [as=a5]
  └── filters
       └── a2.c = a5.c
 
 D:
-scan a3
+scan abc [as=a3]
 
 ----Edges----
 a1.a = a2.a [inner]
@@ -2344,38 +2344,38 @@ Joins Considered: 8
 inner-join (hash)
  ├── inner-join (hash)
  │    ├── inner-join (hash)
- │    │    ├── scan a1
+ │    │    ├── scan abc [as=a1]
  │    │    ├── semi-join (hash)
- │    │    │    ├── scan a2
- │    │    │    ├── scan a5
+ │    │    │    ├── scan abc [as=a2]
+ │    │    │    ├── scan abc [as=a5]
  │    │    │    └── filters
  │    │    │         └── a2.c = a5.c
  │    │    └── filters
  │    │         └── a1.a = a2.a
- │    ├── scan a3
+ │    ├── scan abc [as=a3]
  │    └── filters
  │         └── a2.b = a3.b
- ├── scan a4
+ ├── scan abc [as=a4]
  └── filters
       └── a3.a = a4.a
 
 ----Vertexes----
 C:
 inner-join (hash)
- ├── scan a1
+ ├── scan abc [as=a1]
  ├── semi-join (hash)
- │    ├── scan a2
- │    ├── scan a5
+ │    ├── scan abc [as=a2]
+ │    ├── scan abc [as=a5]
  │    └── filters
  │         └── a2.c = a5.c
  └── filters
       └── a1.a = a2.a
 
 D:
-scan a3
+scan abc [as=a3]
 
 E:
-scan a4
+scan abc [as=a4]
 
 ----Edges----
 a2.b = a3.b [inner]
@@ -2400,16 +2400,16 @@ inner-join (hash)
  ├── project
  │    └── inner-join (hash)
  │         ├── inner-join (merge)
- │         │    ├── scan a1
- │         │    ├── scan a2
+ │         │    ├── scan abc [as=a1]
+ │         │    ├── scan abc [as=a2]
  │         │    └── filters (true)
  │         ├── distinct-on
- │         │    └── scan a5
+ │         │    └── scan abc [as=a5]
  │         └── filters
  │              └── a2.c = a5.c
  ├── inner-join (merge)
- │    ├── scan a3
- │    ├── scan a4
+ │    ├── scan abc [as=a3]
+ │    ├── scan abc [as=a4]
  │    └── filters (true)
  └── filters
       └── a2.b = a3.b

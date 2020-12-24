@@ -11,14 +11,17 @@
 package status
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"runtime"
 	"runtime/debug"
+	"text/template"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/util/cgroups"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -325,11 +328,11 @@ func NewRuntimeStatSampler(ctx context.Context, clock *hlc.Clock) *RuntimeStatSa
 
 	diskCounters, err := getSummedDiskCounters(ctx)
 	if err != nil {
-		log.Errorf(ctx, "could not get initial disk IO counters: %v", err)
+		log.Ops.Errorf(ctx, "could not get initial disk IO counters: %v", err)
 	}
 	netCounters, err := getSummedNetStats(ctx)
 	if err != nil {
-		log.Errorf(ctx, "could not get initial disk IO counters: %v", err)
+		log.Ops.Errorf(ctx, "could not get initial disk IO counters: %v", err)
 	}
 
 	rsr := &RuntimeStatSampler{
@@ -386,9 +389,9 @@ type GoMemStats struct {
 // CGoMemStats reports what has been allocated outside of Go.
 type CGoMemStats struct {
 	// CGoAllocated represents allocated bytes.
-	CGoAllocatedBytes int64
+	CGoAllocatedBytes uint64
 	// CGoTotal represents total bytes (allocated + metadata etc).
-	CGoTotalBytes int64
+	CGoTotalBytes uint64
 }
 
 // GetCGoMemStats collects non-Go memory statistics.
@@ -402,10 +405,22 @@ func GetCGoMemStats(ctx context.Context) *CGoMemStats {
 		}
 	}
 	return &CGoMemStats{
-		CGoAllocatedBytes: int64(cgoAllocated),
-		CGoTotalBytes:     int64(cgoTotal),
+		CGoAllocatedBytes: uint64(cgoAllocated),
+		CGoTotalBytes:     uint64(cgoTotal),
 	}
 }
+
+var statsTemplate = template.Must(template.New("runtime stats").Funcs(template.FuncMap{
+	"iBytes":            func(i uint64) string { return humanize.IBytes(i) },
+	"oneDecimal":        func(f float64) string { return fmt.Sprintf("%.1f", f) },
+	"oneDecimalPercent": func(f float64) string { return fmt.Sprintf("%.1f", f*100) },
+	"sub":               func(a, b uint64) string { return humanize.IBytes(a - b) },
+}).Parse(`runtime stats: {{iBytes .Mem.Resident}} RSS, {{.NumGoroutines}} goroutines (stacks: {{iBytes .MS.StackSys}}), ` +
+	`{{iBytes .MS.HeapAlloc}}/{{iBytes .GoTotal}} Go alloc/total{{.StaleMsg}} ` +
+	`(heap fragmentation: {{sub .MS.HeapInuse .MS.HeapAlloc}}, heap reserved: {{sub .MS.HeapIdle .MS.HeapReleased}}, heap released: {{iBytes .MS.HeapReleased}}), ` +
+	`{{iBytes .CS.CGoAllocatedBytes}}/{{iBytes .CS.CGoTotalBytes}} CGO alloc/total ({{oneDecimal .CGORate}} CGO/sec), ` +
+	`{{oneDecimalPercent .URate}}/{{oneDecimalPercent .SRate}} %%(u/s)time, {{oneDecimalPercent .GCPauseRatio}} %%gc ({{.GCCount}}x), ` +
+	`{{iBytes .DeltaNet.BytesRecv}}/{{iBytes .DeltaNet.BytesSent}} (r/w)net`))
 
 // SampleEnvironment queries the runtime system for various interesting metrics,
 // storing the resulting values in the set of metric gauges maintained by
@@ -434,29 +449,31 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 	pid := os.Getpid()
 	mem := gosigar.ProcMem{}
 	if err := mem.Get(pid); err != nil {
-		log.Errorf(ctx, "unable to get mem usage: %v", err)
+		log.Ops.Errorf(ctx, "unable to get mem usage: %v", err)
 	}
 	cpuTime := gosigar.ProcTime{}
 	if err := cpuTime.Get(pid); err != nil {
-		log.Errorf(ctx, "unable to get cpu usage: %v", err)
+		log.Ops.Errorf(ctx, "unable to get cpu usage: %v", err)
 	}
+	cgroupCPU, _ := cgroups.GetCgroupCPU()
+	cpuShare := cgroupCPU.CPUShares()
 
 	fds := gosigar.ProcFDUsage{}
 	if err := fds.Get(pid); err != nil {
 		if gosigar.IsNotImplemented(err) {
 			if !rsr.fdUsageNotImplemented {
 				rsr.fdUsageNotImplemented = true
-				log.Warningf(ctx, "unable to get file descriptor usage (will not try again): %s", err)
+				log.Ops.Warningf(ctx, "unable to get file descriptor usage (will not try again): %s", err)
 			}
 		} else {
-			log.Errorf(ctx, "unable to get file descriptor usage: %s", err)
+			log.Ops.Errorf(ctx, "unable to get file descriptor usage: %s", err)
 		}
 	}
 
 	var deltaDisk diskStats
 	diskCounters, err := getSummedDiskCounters(ctx)
 	if err != nil {
-		log.Warningf(ctx, "problem fetching disk stats: %s; disk stats will be empty.", err)
+		log.Ops.Warningf(ctx, "problem fetching disk stats: %s; disk stats will be empty.", err)
 	} else {
 		deltaDisk = diskCounters
 		subtractDiskCounters(&deltaDisk, rsr.last.disk)
@@ -477,7 +494,7 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 	var deltaNet net.IOCountersStat
 	netCounters, err := getSummedNetStats(ctx)
 	if err != nil {
-		log.Warningf(ctx, "problem fetching net stats: %s; net stats will be empty.", err)
+		log.Ops.Warningf(ctx, "problem fetching net stats: %s; net stats will be empty.", err)
 	} else {
 		deltaNet = netCounters
 		subtractNetworkCounters(&deltaNet, rsr.last.net)
@@ -498,10 +515,10 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 	// cpuTime.{User,Sys} are in milliseconds, convert to nanoseconds.
 	utime := int64(cpuTime.User) * 1e6
 	stime := int64(cpuTime.Sys) * 1e6
-	uPerc := float64(utime-rsr.last.utime) / dur
-	sPerc := float64(stime-rsr.last.stime) / dur
-	combinedNormalizedPerc := (sPerc + uPerc) / float64(runtime.NumCPU())
-	gcPausePercent := float64(uint64(gc.PauseTotal)-rsr.last.gcPauseTime) / dur
+	urate := float64(utime-rsr.last.utime) / dur
+	srate := float64(stime-rsr.last.stime) / dur
+	combinedNormalizedPerc := (srate + urate) / cpuShare
+	gcPauseRatio := float64(uint64(gc.PauseTotal)-rsr.last.gcPauseTime) / dur
 	rsr.last.now = now
 	rsr.last.utime = utime
 	rsr.last.stime = stime
@@ -516,19 +533,25 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 	}
 	goTotal := ms.Sys - ms.HeapReleased
 
-	// TODO(knz): make utility wrapper around humanize.IBytes that
-	// returns a safe value and collapse the entire log.Infof -> Safe ->
-	// Sprintf sequence as a flat Infof call.
-	log.Infof(ctx, "%s", redact.Safe(fmt.Sprintf("runtime stats: %s RSS, %d goroutines, %s/%s/%s GO alloc/idle/total%s, "+
-		"%s/%s CGO alloc/total, %.1f CGO/sec, %.1f/%.1f %%(u/s)time, %.1f %%gc (%dx), "+
-		"%s/%s (r/w)net",
-		humanize.IBytes(mem.Resident), numGoroutine,
-		humanize.IBytes(ms.HeapAlloc), humanize.IBytes(ms.HeapIdle), humanize.IBytes(goTotal),
-		staleMsg,
-		humanize.IBytes(uint64(cs.CGoAllocatedBytes)), humanize.IBytes(uint64(cs.CGoTotalBytes)),
-		cgoRate, 100*uPerc, 100*sPerc, 100*gcPausePercent, gc.NumGC-rsr.last.gcCount,
-		humanize.IBytes(deltaNet.BytesRecv), humanize.IBytes(deltaNet.BytesSent),
-	)))
+	var buf bytes.Buffer
+	if err := statsTemplate.Execute(&buf,
+		struct {
+			MS                                  *GoMemStats
+			Mem                                 gosigar.ProcMem
+			DeltaNet                            net.IOCountersStat
+			CS                                  *CGoMemStats
+			GoTotal                             uint64
+			NumGoroutines, GCCount              int
+			CGORate, URate, SRate, GCPauseRatio float64
+			StaleMsg                            string
+		}{
+			MS: ms, Mem: mem, DeltaNet: deltaNet, CS: cs, GoTotal: goTotal, NumGoroutines: numGoroutine,
+			CGORate: cgoRate, URate: urate, SRate: srate, GCPauseRatio: gcPauseRatio, StaleMsg: staleMsg,
+		}); err != nil {
+		log.Warningf(ctx, "failed to render runtime stats: %s", err)
+	}
+	log.Health.Infof(ctx, "%s", redact.Safe(buf.String()))
+
 	rsr.last.cgoCall = numCgoCall
 	rsr.last.gcCount = gc.NumGC
 
@@ -536,15 +559,15 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 	rsr.GoTotalBytes.Update(int64(goTotal))
 	rsr.CgoCalls.Update(numCgoCall)
 	rsr.Goroutines.Update(int64(numGoroutine))
-	rsr.CgoAllocBytes.Update(cs.CGoAllocatedBytes)
-	rsr.CgoTotalBytes.Update(cs.CGoTotalBytes)
+	rsr.CgoAllocBytes.Update(int64(cs.CGoAllocatedBytes))
+	rsr.CgoTotalBytes.Update(int64(cs.CGoTotalBytes))
 	rsr.GcCount.Update(gc.NumGC)
 	rsr.GcPauseNS.Update(int64(gc.PauseTotal))
-	rsr.GcPausePercent.Update(gcPausePercent)
+	rsr.GcPausePercent.Update(gcPauseRatio)
 	rsr.CPUUserNS.Update(utime)
-	rsr.CPUUserPercent.Update(uPerc)
+	rsr.CPUUserPercent.Update(urate)
 	rsr.CPUSysNS.Update(stime)
-	rsr.CPUSysPercent.Update(sPerc)
+	rsr.CPUSysPercent.Update(srate)
 	rsr.CPUCombinedPercentNorm.Update(combinedNormalizedPerc)
 	rsr.FDOpen.Update(int64(fds.Open))
 	rsr.FDSoftLimit.Update(int64(fds.SoftLimit))

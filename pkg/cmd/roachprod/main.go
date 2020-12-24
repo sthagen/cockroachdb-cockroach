@@ -80,7 +80,10 @@ var (
 	listMine          bool
 	clusterType       = "cockroach"
 	secure            = false
-	nodeEnv           = []string{"COCKROACH_ENABLE_RPC_COMPRESSION=false"}
+	nodeEnv           = []string{
+		"COCKROACH_ENABLE_RPC_COMPRESSION=false",
+		"COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED=true",
+	}
 	nodeArgs          []string
 	tag               string
 	external          = false
@@ -94,6 +97,7 @@ var (
 	sig               = 9
 	waitFlag          = false
 	stageOS           string
+	stageDir          string
 	logsDir           string
 	logsFilter        string
 	logsProgramFilter string
@@ -1324,6 +1328,11 @@ Some examples of usage:
 			return errors.Errorf("cannot stage binary on %s", os)
 		}
 
+		dir := "."
+		if stageDir != "" {
+			dir = stageDir
+		}
+
 		applicationName := args[1]
 		versionArg := ""
 		if len(args) == 3 {
@@ -1332,7 +1341,7 @@ Some examples of usage:
 		switch applicationName {
 		case "cockroach":
 			sha, err := install.StageRemoteBinary(
-				c, applicationName, "cockroach/cockroach", versionArg, debugArch,
+				c, applicationName, "cockroach/cockroach", versionArg, debugArch, dir,
 			)
 			if err != nil {
 				return err
@@ -1347,6 +1356,7 @@ Some examples of usage:
 					sha,
 					debugArch,
 					libExt,
+					dir,
 				); err != nil {
 					return err
 				}
@@ -1354,11 +1364,11 @@ Some examples of usage:
 			return nil
 		case "workload":
 			_, err := install.StageRemoteBinary(
-				c, applicationName, "cockroach/workload", versionArg, "", /* arch */
+				c, applicationName, "cockroach/workload", versionArg, "" /* arch */, dir,
 			)
 			return err
 		case "release":
-			return install.StageCockroachRelease(c, versionArg, releaseArch)
+			return install.StageCockroachRelease(c, versionArg, releaseArch, dir)
 		default:
 			return fmt.Errorf("unknown application %s", applicationName)
 		}
@@ -1736,6 +1746,7 @@ func main() {
 	putCmd.Flags().BoolVar(&useTreeDist, "treedist", useTreeDist, "use treedist copy algorithm")
 
 	stageCmd.Flags().StringVar(&stageOS, "os", "", "operating system override for staged binaries")
+	stageCmd.Flags().StringVar(&stageDir, "dir", "", "destination for staged binaries")
 
 	logsCmd.Flags().StringVar(
 		&logsFilter, "filter", "", "re to filter log messages")

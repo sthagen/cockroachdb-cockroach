@@ -73,6 +73,8 @@ var retiredSettings = map[string]struct{}{
 	"sql.parallel_scans.enabled":                                       {},
 	// removed as of 21.1.
 	"sql.distsql.interleaved_joins.enabled": {},
+	"sql.testing.vectorize.batch_size":      {},
+	"sql.testing.mutations.max_batch_size":  {},
 }
 
 // register adds a setting to the registry.
@@ -144,7 +146,8 @@ var ReadableTypes = map[string]string{
 	"z": "byte size",
 	"d": "duration",
 	"e": "enumeration",
-	"m": "custom validation",
+	// This is named "m" (instead of "v") for backwards compatibility reasons.
+	"m": "version",
 }
 
 // RedactedValue returns a string representation of the value for settings

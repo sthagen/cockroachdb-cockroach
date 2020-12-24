@@ -30,12 +30,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 )
 
 // TestServerInterface defines test server functionality that tests need; it is
@@ -100,6 +102,9 @@ type TestServerInterface interface {
 	// The real return type is *kv.DistSender.
 	DistSenderI() interface{}
 
+	// MigrationServer returns the internal *migrationServer as in interface{}
+	MigrationServer() interface{}
+
 	// SQLServer returns the *sql.Server as an interface{}.
 	SQLServer() interface{}
 
@@ -112,8 +117,8 @@ type TestServerInterface interface {
 	// JobRegistry returns the *jobs.Registry as an interface{}.
 	JobRegistry() interface{}
 
-	// MigrationManager returns the *jobs.Registry as an interface{}.
-	MigrationManager() interface{}
+	// SQLMigrationsManager returns the *sqlmigrations.Manager as an interface{}.
+	SQLMigrationsManager() interface{}
 
 	// NodeLiveness exposes the NodeLiveness instance used by the TestServer as an
 	// interface{}.
@@ -216,13 +221,16 @@ type TestServerInterface interface {
 	// Calling this multiple times is undefined (but see
 	// TestCluster.ScratchRange() which is idempotent).
 	ScratchRange() (roachpb.Key, error)
+
+	// Engines returns the TestServer's engines.
+	Engines() []storage.Engine
 }
 
 // TestServerFactory encompasses the actual implementation of the shim
 // service.
 type TestServerFactory interface {
 	// New instantiates a test server.
-	New(params base.TestServerArgs) interface{}
+	New(params base.TestServerArgs) (interface{}, error)
 }
 
 var srvFactoryImpl TestServerFactory
@@ -240,7 +248,10 @@ func InitTestServerFactory(impl TestServerFactory) {
 func StartServer(
 	t testing.TB, params base.TestServerArgs,
 ) (TestServerInterface, *gosql.DB, *kv.DB) {
-	server := NewServer(params)
+	server, err := NewServer(params)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
 	if err := server.Start(); err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -249,13 +260,17 @@ func StartServer(
 }
 
 // NewServer creates a test server.
-func NewServer(params base.TestServerArgs) TestServerInterface {
+func NewServer(params base.TestServerArgs) (TestServerInterface, error) {
 	if srvFactoryImpl == nil {
-		panic("TestServerFactory not initialized. One needs to be injected " +
+		return nil, errors.AssertionFailedf("TestServerFactory not initialized. One needs to be injected " +
 			"from the package's TestMain()")
 	}
 
-	return srvFactoryImpl.New(params).(TestServerInterface)
+	srv, err := srvFactoryImpl.New(params)
+	if err != nil {
+		return nil, err
+	}
+	return srv.(TestServerInterface), nil
 }
 
 // OpenDBConnE is like OpenDBConn, but returns an error.
@@ -300,7 +315,10 @@ func OpenDBConn(
 // Generally StartServer() should be used. However this function can be used
 // directly when opening a connection to the server is not desired.
 func StartServerRaw(args base.TestServerArgs) (TestServerInterface, error) {
-	server := NewServer(args)
+	server, err := NewServer(args)
+	if err != nil {
+		return nil, err
+	}
 	if err := server.Start(); err != nil {
 		return nil, err
 	}
@@ -323,7 +341,11 @@ func StartTenant(t testing.TB, ts TestServerInterface, params base.TestTenantArg
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts.Stopper().AddCloser(stop.CloserFn(func() {
+	stopper := params.Stopper
+	if stopper == nil {
+		stopper = ts.Stopper()
+	}
+	stopper.AddCloser(stop.CloserFn(func() {
 		cleanupGoDB()
 	}))
 	return db

@@ -18,7 +18,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/logtags"
-	opentracing "github.com/opentracing/opentracing-go"
 	"golang.org/x/net/trace"
 )
 
@@ -66,10 +65,9 @@ func TestTrace(t *testing.T) {
 	Event(ctx, "should-not-show-up")
 
 	tracer := tracing.NewTracer()
-	tracer.SetForceRealSpans(true)
-	sp := tracer.StartSpan("s")
-	tracing.StartRecording(sp, tracing.SingleNodeRecording)
-	ctxWithSpan := opentracing.ContextWithSpan(ctx, sp)
+	sp := tracer.StartSpan("s", tracing.WithForceRealSpan())
+	sp.SetVerbose(true)
+	ctxWithSpan := tracing.ContextWithSpan(ctx, sp)
 	Event(ctxWithSpan, "test1")
 	VEvent(ctxWithSpan, noLogV(), "test2")
 	VErrEvent(ctxWithSpan, noLogV(), "testerr")
@@ -80,8 +78,9 @@ func TestTrace(t *testing.T) {
 
 	sp.Finish()
 
-	if err := tracing.TestingCheckRecordedSpans(tracing.GetRecording(sp), `
+	if err := tracing.TestingCheckRecordedSpans(sp.GetRecording(), `
 		Span s:
+		  tags: _verbose=1
 		  event: test1
 		  event: test2
 		  event: testerr
@@ -96,10 +95,9 @@ func TestTraceWithTags(t *testing.T) {
 	ctx = logtags.AddTag(ctx, "tag", 1)
 
 	tracer := tracing.NewTracer()
-	tracer.SetForceRealSpans(true)
-	sp := tracer.StartSpan("s")
-	ctxWithSpan := opentracing.ContextWithSpan(ctx, sp)
-	tracing.StartRecording(sp, tracing.SingleNodeRecording)
+	sp := tracer.StartSpan("s", tracing.WithForceRealSpan())
+	ctxWithSpan := tracing.ContextWithSpan(ctx, sp)
+	sp.SetVerbose(true)
 
 	Event(ctxWithSpan, "test1")
 	VEvent(ctxWithSpan, noLogV(), "test2")
@@ -107,8 +105,9 @@ func TestTraceWithTags(t *testing.T) {
 	Info(ctxWithSpan, "log")
 
 	sp.Finish()
-	if err := tracing.TestingCheckRecordedSpans(tracing.GetRecording(sp), `
+	if err := tracing.TestingCheckRecordedSpans(sp.GetRecording(), `
 		Span s:
+		  tags: _verbose=1
 		  event: [tag=1] test1
 		  event: [tag=1] test2
 		  event: [tag=1] testerr
@@ -183,10 +182,9 @@ func TestEventLogAndTrace(t *testing.T) {
 	VErrEvent(ctxWithEventLog, noLogV(), "testerr")
 
 	tracer := tracing.NewTracer()
-	tracer.SetForceRealSpans(true)
-	sp := tracer.StartSpan("s")
-	tracing.StartRecording(sp, tracing.SingleNodeRecording)
-	ctxWithBoth := opentracing.ContextWithSpan(ctxWithEventLog, sp)
+	sp := tracer.StartSpan("s", tracing.WithForceRealSpan())
+	sp.SetVerbose(true)
+	ctxWithBoth := tracing.ContextWithSpan(ctxWithEventLog, sp)
 	// Events should only go to the trace.
 	Event(ctxWithBoth, "test3")
 	VEventf(ctxWithBoth, noLogV(), "test4")
@@ -198,8 +196,9 @@ func TestEventLogAndTrace(t *testing.T) {
 	sp.Finish()
 	el.Finish()
 
-	if err := tracing.TestingCheckRecordedSpans(tracing.GetRecording(sp), `
+	if err := tracing.TestingCheckRecordedSpans(sp.GetRecording(), `
 		Span s:
+		  tags: _verbose=1
 		  event: test3
 		  event: test4
 		  event: test5err

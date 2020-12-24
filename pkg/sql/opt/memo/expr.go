@@ -192,7 +192,7 @@ func (n FiltersExpr) IsFalse() bool {
 
 // OuterCols returns the set of outer columns needed by any of the filter
 // condition expressions.
-func (n FiltersExpr) OuterCols(mem *Memo) opt.ColSet {
+func (n FiltersExpr) OuterCols() opt.ColSet {
 	var colSet opt.ColSet
 	for i := range n {
 		colSet.UnionWith(n[i].ScalarProps().OuterCols)
@@ -247,6 +247,9 @@ func (n FiltersExpr) RemoveFiltersItem(search *FiltersItem) FiltersExpr {
 
 // RemoveCommonFilters removes the filters found in other from n.
 func (n *FiltersExpr) RemoveCommonFilters(other FiltersExpr) {
+	if len(other) == 0 {
+		return
+	}
 	// TODO(ridwanmsharif): Faster intersection using a map
 	common := (*n)[:0]
 	for _, filter := range *n {
@@ -364,7 +367,7 @@ func (sf *ScanFlags) Empty() bool {
 //
 // The zero value indicates that any join is allowed and there are no special
 // preferences.
-type JoinFlags uint8
+type JoinFlags uint16
 
 // Each flag indicates if a certain type of join is disallowed.
 const (
@@ -389,6 +392,14 @@ const (
 	// table is on the right side.
 	DisallowLookupJoinIntoRight
 
+	// DisallowInvertedJoinIntoLeft corresponds to an inverted join where the
+	// inverted index is on the left side.
+	DisallowInvertedJoinIntoLeft
+
+	// DisallowInvertedJoinIntoRight corresponds to an inverted join where the
+	// inverted index is on the right side.
+	DisallowInvertedJoinIntoRight
+
 	// PreferLookupJoinIntoLeft reduces the cost of a lookup join where the lookup
 	// table is on the left side.
 	PreferLookupJoinIntoLeft
@@ -403,7 +414,9 @@ const (
 		DisallowHashJoinStoreRight |
 		DisallowMergeJoin |
 		DisallowLookupJoinIntoLeft |
-		DisallowLookupJoinIntoRight)
+		DisallowLookupJoinIntoRight |
+		DisallowInvertedJoinIntoLeft |
+		DisallowInvertedJoinIntoRight)
 
 	// AllowOnlyHashJoinStoreRight has all "disallow" flags set except
 	// DisallowHashJoinStoreRight.
@@ -413,16 +426,22 @@ const (
 	// DisallowLookupJoinIntoRight.
 	AllowOnlyLookupJoinIntoRight JoinFlags = disallowAll ^ DisallowLookupJoinIntoRight
 
+	// AllowOnlyInvertedJoinIntoRight has all "disallow" flags set except
+	// DisallowInvertedJoinIntoRight.
+	AllowOnlyInvertedJoinIntoRight JoinFlags = disallowAll ^ DisallowInvertedJoinIntoRight
+
 	// AllowOnlyMergeJoin has all "disallow" flags set except DisallowMergeJoin.
 	AllowOnlyMergeJoin JoinFlags = disallowAll ^ DisallowMergeJoin
 )
 
 var joinFlagStr = map[JoinFlags]string{
-	DisallowHashJoinStoreLeft:   "hash join (store left side)",
-	DisallowHashJoinStoreRight:  "hash join (store right side)",
-	DisallowMergeJoin:           "merge join",
-	DisallowLookupJoinIntoLeft:  "lookup join (into left side)",
-	DisallowLookupJoinIntoRight: "lookup join (into right side)",
+	DisallowHashJoinStoreLeft:     "hash join (store left side)",
+	DisallowHashJoinStoreRight:    "hash join (store right side)",
+	DisallowMergeJoin:             "merge join",
+	DisallowLookupJoinIntoLeft:    "lookup join (into left side)",
+	DisallowLookupJoinIntoRight:   "lookup join (into right side)",
+	DisallowInvertedJoinIntoLeft:  "inverted join (into left side)",
+	DisallowInvertedJoinIntoRight: "inverted join (into right side)",
 
 	PreferLookupJoinIntoLeft:  "lookup join (into left side)",
 	PreferLookupJoinIntoRight: "lookup join (into right side)",
@@ -454,6 +473,8 @@ func (jf JoinFlags) String() string {
 		b.WriteString("force hash join (store right side)")
 	case AllowOnlyLookupJoinIntoRight:
 		b.WriteString("force lookup join (into right side)")
+	case AllowOnlyInvertedJoinIntoRight:
+		b.WriteString("force inverted join (into right side)")
 	case AllowOnlyMergeJoin:
 		b.WriteString("force merge join")
 
@@ -621,7 +642,7 @@ func (s *ScanPrivate) IsUnfiltered(md *opt.Metadata) bool {
 	return (s.Constraint == nil || s.Constraint.IsUnconstrained()) &&
 		s.InvertedConstraint == nil &&
 		s.HardLimit == 0 &&
-		!s.UsesPartialIndex(md)
+		s.PartialIndexPredicate(md) == nil
 }
 
 // IsLocking returns true if the ScanPrivate is configured to use a row-level
@@ -632,34 +653,20 @@ func (s *ScanPrivate) IsLocking() bool {
 	return s.Locking != nil
 }
 
-// UsesPartialIndex returns true if the ScanPrivate indicates a scan over a
-// partial index.
-func (s *ScanPrivate) UsesPartialIndex(md *opt.Metadata) bool {
-	if s.Index == cat.PrimaryIndex {
-		// Primary index is always non-partial; skip making the catalog calls.
-		return false
-	}
-	_, isPartialIndex := md.Table(s.Table).Index(s.Index).Predicate()
-	return isPartialIndex
-}
-
 // PartialIndexPredicate returns the FiltersExpr representing the predicate of
 // the partial index that the scan uses. If the scan does not use a partial
-// index or if a partial index predicate was not built for this index, this
-// function panics. UsesPartialIndex should be called first to determine if the
-// scan operates over a partial index.
+// index, nil is returned.
 func (s *ScanPrivate) PartialIndexPredicate(md *opt.Metadata) FiltersExpr {
 	tabMeta := md.TableMeta(s.Table)
 	p, ok := tabMeta.PartialIndexPredicates[s.Index]
 	if !ok {
-		// A partial index predicate expression was not built for the
-		// partial index.
-		panic(errors.AssertionFailedf("partial index predicate not found for %s", tabMeta.Table.Index(s.Index).Name()))
+		// The index is not a partial index.
+		return nil
 	}
 	return *p.(*FiltersExpr)
 }
 
-// UsesPartialIndex returns true if the the LookupJoinPrivate looks-up via a
+// UsesPartialIndex returns true if the LookupJoinPrivate looks-up via a
 // partial index.
 func (lj *LookupJoinPrivate) UsesPartialIndex(md *opt.Metadata) bool {
 	_, isPartialIndex := md.Table(lj.Table).Index(lj.Index).Predicate()

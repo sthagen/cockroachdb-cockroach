@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding/encodingtype"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
@@ -99,6 +100,8 @@ const (
 
 	box2DMarker            = arrayKeyDescendingMarker + 1
 	geoInvertedIndexMarker = box2DMarker + 1
+
+	emptyArray = geoInvertedIndexMarker + 1
 
 	arrayKeyTerminator           byte = 0x00
 	arrayKeyDescendingTerminator byte = 0xFF
@@ -310,17 +313,17 @@ func getVarintLen(b []byte) (int, error) {
 	return length, nil
 }
 
-// DecodeVarintAscending decodes a value encoded by EncodeVaringAscending.
+// DecodeVarintAscending decodes a value encoded by EncodeVarintAscending.
 func DecodeVarintAscending(b []byte) ([]byte, int64, error) {
 	if len(b) == 0 {
-		return nil, 0, errors.Errorf("insufficient bytes to decode uvarint value")
+		return nil, 0, errors.Errorf("insufficient bytes to decode varint value")
 	}
 	length := int(b[0]) - intZero
 	if length < 0 {
 		length = -length
 		remB := b[1:]
 		if len(remB) < length {
-			return nil, 0, errors.Errorf("insufficient bytes to decode uvarint value: %q", remB)
+			return nil, 0, errors.Errorf("insufficient bytes to decode varint value: %q", remB)
 		}
 		var v int64
 		// Use the ones-complement of each encoded byte in order to build
@@ -342,7 +345,7 @@ func DecodeVarintAscending(b []byte) ([]byte, int64, error) {
 	return remB, int64(v), nil
 }
 
-// DecodeVarintDescending decodes a uint64 value which was encoded
+// DecodeVarintDescending decodes a int64 value which was encoded
 // using EncodeVarintDescending.
 func DecodeVarintDescending(b []byte) ([]byte, int64, error) {
 	leftover, v, err := DecodeVarintAscending(b)
@@ -453,7 +456,7 @@ func EncLenUvarintDescending(v uint64) int {
 	return 2 + highestByteIndex(v)
 }
 
-// DecodeUvarintAscending decodes a varint encoded uint64 from the input
+// DecodeUvarintAscending decodes a uint64 encoded uint64 from the input
 // buffer. The remainder of the input buffer and the decoded uint64
 // are returned.
 func DecodeUvarintAscending(b []byte) ([]byte, uint64, error) {
@@ -770,6 +773,11 @@ func EncodeJSONEmptyObject(b []byte) []byte {
 	return append(b, escape, escapedTerm, jsonEmptyObject)
 }
 
+// EncodeEmptyArray returns a byte array b with a byte to signify an empty array.
+func EncodeEmptyArray(b []byte) []byte {
+	return append(b, emptyArray)
+}
+
 // EncodeStringDescending is the descending version of EncodeStringAscending.
 func EncodeStringDescending(b []byte, s string) []byte {
 	if len(s) == 0 {
@@ -932,6 +940,14 @@ func EncodeNullDescending(b []byte) []byte {
 // EncodeFloat, EncodeBytes or EncodeString.
 func EncodeNotNullAscending(b []byte) []byte {
 	return append(b, encodedNotNull)
+}
+
+// EncodeJSONObjectSpanStartAscending encodes the first possible value for JSON
+// objects, which is \x00\xff. Non-objects (i.e., scalars and arrays) will
+// start with \x00\x01 or \x00\x03 (see AddJSONPathTerminator and
+// EncodeArrayAscending), so all objects will be ordered after them.
+func EncodeJSONObjectSpanStartAscending(b []byte) []byte {
+	return append(b, escape, escaped00)
 }
 
 // EncodeArrayAscending encodes a value used to signify membership of an array for JSON objects.
@@ -1533,7 +1549,7 @@ func DecodeBitArrayDescending(b []byte) ([]byte, bitarray.BitArray, error) {
 // Type represents the type of a value encoded by
 // Encode{Null,NotNull,Varint,Uvarint,Float,Bytes}.
 //go:generate stringer -type=Type
-type Type int
+type Type encodingtype.T
 
 // Type values.
 // TODO(dan, arjun): Make this into a proto enum.
@@ -1725,7 +1741,8 @@ func PeekLength(b []byte) (int, error) {
 	m := b[0]
 	switch m {
 	case encodedNull, encodedNullDesc, encodedNotNull, encodedNotNullDesc,
-		floatNaN, floatNaNDesc, floatZero, decimalZero, byte(True), byte(False):
+		floatNaN, floatNaNDesc, floatZero, decimalZero, byte(True), byte(False),
+		emptyArray:
 		// interleavedSentinel also falls into this path. Since it
 		// contains the same byte value as encodedNotNullDesc, it
 		// cannot be included explicitly in the case statement.
@@ -2076,6 +2093,8 @@ func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 				return b[1:], "[]", nil
 			case jsonEmptyObject:
 				return b[1:], "{}", nil
+			case emptyArray:
+				return b[1:], "[]", nil
 			}
 		}
 		// This shouldn't ever happen, but if it does, return an empty slice.

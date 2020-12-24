@@ -23,7 +23,7 @@ import (
 // analyzeOrderBy analyzes an Ordering physical property from the ORDER BY
 // clause and adds the resulting typed expressions to orderByScope.
 func (b *Builder) analyzeOrderBy(
-	orderBy tree.OrderBy, inScope, projectionsScope *scope,
+	orderBy tree.OrderBy, inScope, projectionsScope *scope, rejectFlags tree.SemaRejectFlags,
 ) (orderByScope *scope) {
 	if orderBy == nil {
 		return nil
@@ -36,7 +36,7 @@ func (b *Builder) analyzeOrderBy(
 	// semaCtx in case we are recursively called within a subquery
 	// context.
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
-	b.semaCtx.Properties.Require(exprKindOrderBy.String(), tree.RejectGenerators)
+	b.semaCtx.Properties.Require(exprKindOrderBy.String(), rejectFlags)
 	inScope.context = exprKindOrderBy
 
 	for i := range orderBy {
@@ -146,7 +146,7 @@ func (b *Builder) analyzeOrderByIndex(
 
 		colItem := tree.NewColumnItem(&tn, col.ColName())
 		expr := inScope.resolveType(colItem, types.Any)
-		outCol := b.addColumn(orderByScope, "" /* alias */, expr)
+		outCol := orderByScope.addColumn("" /* alias */, expr)
 		outCol.descending = desc
 	}
 }
@@ -252,7 +252,7 @@ func (b *Builder) analyzeExtraArgument(
 	for _, e := range exprs {
 		// Ensure we can order on the given column(s).
 		ensureColumnOrderable(e)
-		b.addColumn(extraColsScope, "" /* alias */, e)
+		extraColsScope.addColumn("" /* alias */, e)
 	}
 }
 

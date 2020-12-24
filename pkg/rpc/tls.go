@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/errors"
 )
 
@@ -235,8 +236,8 @@ func (ctx *SecurityContext) GetHTTPClient() (http.Client, error) {
 
 // getClientCertPaths returns the paths to the client cert and key. This uses
 // the node certs for the NodeUser, and the actual client certs for all others.
-func (ctx *SecurityContext) getClientCertPaths(user string) (string, string) {
-	if user == security.NodeUser {
+func (ctx *SecurityContext) getClientCertPaths(user security.SQLUsername) (string, string) {
+	if user.IsNodeUser() {
 		return ctx.NodeCertPath(), ctx.NodeKeyPath()
 	}
 	return ctx.ClientCertPath(user), ctx.ClientKeyPath(user)
@@ -260,34 +261,34 @@ func (ctx *SecurityContext) CheckCertificateAddrs(cctx context.Context) {
 	// with the provided certificate.
 	certInfo := cm.NodeCert()
 	if certInfo.Error != nil {
-		log.Shoutf(cctx, log.Severity_ERROR,
+		log.Ops.Shoutf(cctx, severity.ERROR,
 			"invalid node certificate: %v", certInfo.Error)
 	} else {
 		cert := certInfo.ParsedCertificates[0]
 		addrInfo := certAddrs(cert)
 
 		// Log the certificate details in any case. This will aid during troubleshooting.
-		log.Infof(cctx, "server certificate addresses: %s", addrInfo)
+		log.Ops.Infof(cctx, "server certificate addresses: %s", addrInfo)
 
 		var msg bytes.Buffer
 		// Verify the compatibility. This requires that ValidateAddrs() has
 		// been called already.
 		host, _, err := net.SplitHostPort(ctx.config.AdvertiseAddr)
 		if err != nil {
-			panic("programming error: call ValidateAddrs() first")
+			panic(errors.AssertionFailedf("programming error: call ValidateAddrs() first"))
 		}
 		if err := cert.VerifyHostname(host); err != nil {
 			fmt.Fprintf(&msg, "advertise address %q not in node certificate (%s)\n", host, addrInfo)
 		}
 		host, _, err = net.SplitHostPort(ctx.config.SQLAdvertiseAddr)
 		if err != nil {
-			panic("programming error: call ValidateAddrs() first")
+			panic(errors.AssertionFailedf("programming error: call ValidateAddrs() first"))
 		}
 		if err := cert.VerifyHostname(host); err != nil {
 			fmt.Fprintf(&msg, "advertise SQL address %q not in node certificate (%s)\n", host, addrInfo)
 		}
 		if msg.Len() > 0 {
-			log.Shoutf(cctx, log.Severity_WARNING,
+			log.Ops.Shoutf(cctx, severity.WARNING,
 				"%s"+
 					"Secure client connections are likely to fail.\n"+
 					"Consider extending the node certificate or tweak --listen-addr/--advertise-addr/--sql-addr/--advertise-sql-addr.",
@@ -308,7 +309,7 @@ func (ctx *SecurityContext) CheckCertificateAddrs(cctx context.Context) {
 		certInfo = cm.NodeCert()
 	}
 	if certInfo.Error != nil {
-		log.Shoutf(cctx, log.Severity_ERROR,
+		log.Ops.Shoutf(cctx, severity.ERROR,
 			"invalid UI certificate: %v", certInfo.Error)
 	} else {
 		cert := certInfo.ParsedCertificates[0]
@@ -316,7 +317,7 @@ func (ctx *SecurityContext) CheckCertificateAddrs(cctx context.Context) {
 
 		// Log the certificate details in any case. This will aid during
 		// troubleshooting.
-		log.Infof(cctx, "web UI certificate addresses: %s", addrInfo)
+		log.Ops.Infof(cctx, "web UI certificate addresses: %s", addrInfo)
 	}
 }
 

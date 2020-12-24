@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/docs"
+	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -49,8 +51,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	crdberrors "github.com/cockroachdb/errors"
 )
+
+// featureChangefeedEnabled is used to enable and disable the CHANGEFEED feature.
+var featureChangefeedEnabled = settings.RegisterBoolSetting(
+	"feature.changefeed.enabled",
+	"set to true to enable changefeeds, false to disable; default is true",
+	featureflag.FeatureFlagEnabledDefault,
+).WithPublic()
 
 func init() {
 	sql.AddPlanHook(changefeedPlanHook)
@@ -69,6 +77,15 @@ func changefeedPlanHook(
 	changefeedStmt, ok := stmt.(*tree.CreateChangefeed)
 	if !ok {
 		return nil, nil, nil, false, nil
+	}
+
+	if err := featureflag.CheckEnabled(
+		ctx,
+		p.ExecCfg(),
+		featureChangefeedEnabled,
+		"CHANGEFEED",
+	); err != nil {
+		return nil, nil, nil, false, err
 	}
 
 	var sinkURIFn func() (string, error)
@@ -108,7 +125,7 @@ func changefeedPlanHook(
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
-		defer tracing.FinishSpan(span)
+		defer span.Finish()
 
 		ok, err := p.HasRoleOption(ctx, roleoption.CONTROLCHANGEFEED)
 		if err != nil {
@@ -319,7 +336,7 @@ func changefeedPlanHook(
 			var spansToProtect []roachpb.Span
 			if hasInitialScan := initialScanFromOptions(details.Opts); hasInitialScan {
 				protectedTimestampID = uuid.MakeV4()
-				spansToProtect = makeSpansToProtect(details.Targets)
+				spansToProtect = makeSpansToProtect(p.ExecCfg().Codec, details.Targets)
 				progress.GetChangefeed().ProtectedTimestampRecord = protectedTimestampID
 			}
 
@@ -576,10 +593,10 @@ func generateChangefeedSessionID() string {
 
 // Resume is part of the jobs.Resumer interface.
 func (b *changefeedResumer) Resume(
-	ctx context.Context, planHookState interface{}, startedCh chan<- tree.Datums,
+	ctx context.Context, exec interface{}, startedCh chan<- tree.Datums,
 ) error {
-	phs := planHookState.(sql.PlanHookState)
-	execCfg := phs.ExecCfg()
+	jobExec := exec.(sql.JobExecContext)
+	execCfg := jobExec.ExecCfg()
 	jobID := *b.job.ID()
 	details := b.job.Details().(jobspb.ChangefeedDetails)
 	progress := b.job.Progress()
@@ -595,7 +612,7 @@ func (b *changefeedResumer) Resume(
 	}
 	var err error
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
-		if err = distChangefeedFlow(ctx, phs, jobID, details, progress, startedCh); err == nil {
+		if err = distChangefeedFlow(ctx, jobExec, jobID, details, progress, startedCh); err == nil {
 			return nil
 		}
 		if !IsRetryableError(err) {
@@ -646,9 +663,9 @@ func (b *changefeedResumer) Resume(
 }
 
 // OnFailOrCancel is part of the jobs.Resumer interface.
-func (b *changefeedResumer) OnFailOrCancel(ctx context.Context, planHookState interface{}) error {
-	phs := planHookState.(sql.PlanHookState)
-	execCfg := phs.ExecCfg()
+func (b *changefeedResumer) OnFailOrCancel(ctx context.Context, jobExec interface{}) error {
+	exec := jobExec.(sql.JobExecContext)
+	execCfg := exec.ExecCfg()
 	progress := b.job.Progress()
 	b.maybeCleanUpProtectedTimestamp(ctx, execCfg.DB, execCfg.ProtectedTimestampProvider,
 		progress.GetChangefeed().ProtectedTimestampRecord)
@@ -660,7 +677,7 @@ func (b *changefeedResumer) OnFailOrCancel(ctx context.Context, planHookState in
 		telemetry.Count(`changefeed.enterprise.cancel`)
 	} else {
 		telemetry.Count(`changefeed.enterprise.fail`)
-		phs.ExecCfg().JobRegistry.MetricsStruct().Changefeed.(*Metrics).Failures.Inc(1)
+		exec.ExecCfg().JobRegistry.MetricsStruct().Changefeed.(*Metrics).Failures.Inc(1)
 	}
 	return nil
 }
@@ -674,7 +691,7 @@ func (b *changefeedResumer) maybeCleanUpProtectedTimestamp(
 	}
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		return pts.Release(ctx, txn, ptsID)
-	}); err != nil && !crdberrors.Is(err, protectedts.ErrNotExists) {
+	}); err != nil && !errors.Is(err, protectedts.ErrNotExists) {
 		// NB: The record should get cleaned up by the reconciliation loop.
 		// No good reason to cause more trouble by returning an error here.
 		// Log and move on.
@@ -688,7 +705,7 @@ var _ jobs.PauseRequester = (*changefeedResumer)(nil)
 // paused, we want to install a protected timestamp at the most recent high
 // watermark if there isn't already one.
 func (b *changefeedResumer) OnPauseRequest(
-	ctx context.Context, planHookState interface{}, txn *kv.Txn, progress *jobspb.Progress,
+	ctx context.Context, jobExec interface{}, txn *kv.Txn, progress *jobspb.Progress,
 ) error {
 	details := b.job.Details().(jobspb.ChangefeedDetails)
 	if _, shouldPause := details.Opts[changefeedbase.OptProtectDataFromGCOnPause]; !shouldPause {
@@ -713,7 +730,8 @@ func (b *changefeedResumer) OnPauseRequest(
 		return nil
 	}
 
-	pts := planHookState.(sql.PlanHookState).ExecCfg().ProtectedTimestampProvider
-	return createProtectedTimestampRecord(ctx, pts, txn, *b.job.ID(),
+	execCfg := jobExec.(sql.JobExecContext).ExecCfg()
+	pts := execCfg.ProtectedTimestampProvider
+	return createProtectedTimestampRecord(ctx, execCfg.Codec, pts, txn, *b.job.ID(),
 		details.Targets, *resolved, cp)
 }

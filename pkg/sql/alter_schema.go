@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -38,20 +40,33 @@ type alterSchemaNode struct {
 var _ planNode = &alterSchemaNode{n: nil}
 
 func (p *planner) AlterSchema(ctx context.Context, n *tree.AlterSchema) (planNode, error) {
-	db, err := p.ResolveMutableDatabaseDescriptor(ctx, p.CurrentDatabase(), true /* required */)
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER SCHEMA",
+	); err != nil {
+		return nil, err
+	}
+
+	dbName := p.CurrentDatabase()
+	if n.Schema.ExplicitCatalog {
+		dbName = n.Schema.Catalog()
+	}
+	_, db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, dbName,
+		tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return nil, err
 	}
-	found, schema, err := p.ResolveMutableSchemaDescriptor(ctx, db.ID, string(n.Schema), true /* required */)
+	found, schema, err := p.ResolveMutableSchemaDescriptor(ctx, db.ID, string(n.Schema.SchemaName), true /* required */)
 	if err != nil {
 		return nil, err
 	}
 	if !found {
-		return nil, pgerror.Newf(pgcode.InvalidSchemaName, "schema %q does not exist", n.Schema)
+		return nil, pgerror.Newf(pgcode.InvalidSchemaName, "schema %q does not exist", n.Schema.String())
 	}
 	switch schema.Kind {
 	case catalog.SchemaPublic, catalog.SchemaVirtual, catalog.SchemaTemporary:
-		return nil, pgerror.Newf(pgcode.InvalidSchemaName, "cannot modify schema %q", n.Schema)
+		return nil, pgerror.Newf(pgcode.InvalidSchemaName, "cannot modify schema %q", n.Schema.String())
 	case catalog.SchemaUserDefined:
 		desc := schema.Desc.(*schemadesc.Mutable)
 		// The user must be a superuser or the owner of the schema to modify it.
@@ -85,36 +100,16 @@ func (n *alterSchemaNode) startExec(params runParams) error {
 		); err != nil {
 			return err
 		}
-		return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			params.ctx,
-			params.p.txn,
-			EventLogRenameSchema,
-			int32(n.desc.ID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				SchemaName    string
-				NewSchemaName string
-				User          string
-			}{oldName, newName, params.p.SessionData().User},
-		)
+		return params.p.logEvent(params.ctx, n.desc.ID, &eventpb.RenameSchema{
+			// TODO(knz): This name is insufficiently qualified.
+			// See: https://github.com/cockroachdb/cockroach/issues/57738
+			SchemaName:    oldName,
+			NewSchemaName: newName,
+		})
 	case *tree.AlterSchemaOwner:
-		newOwner := string(t.Owner)
-		if err := params.p.alterSchemaOwner(
+		newOwner := t.Owner
+		return params.p.alterSchemaOwner(
 			params.ctx, n.desc, newOwner, tree.AsStringWithFQNames(n.n, params.Ann()),
-		); err != nil {
-			return err
-		}
-		return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			params.ctx,
-			params.p.txn,
-			EventLogAlterSchemaOwner,
-			int32(n.desc.ID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				SchemaName string
-				Owner      string
-				User       string
-			}{n.desc.Name, newOwner, params.p.SessionData().User},
 		)
 	default:
 		return errors.AssertionFailedf("unknown schema cmd %T", t)
@@ -122,12 +117,15 @@ func (n *alterSchemaNode) startExec(params runParams) error {
 }
 
 func (p *planner) alterSchemaOwner(
-	ctx context.Context, scDesc *schemadesc.Mutable, newOwner string, jobDescription string,
+	ctx context.Context,
+	scDesc *schemadesc.Mutable,
+	newOwner security.SQLUsername,
+	jobDescription string,
 ) error {
 	privs := scDesc.GetPrivileges()
 
 	// If the owner we want to set to is the current owner, do a no-op.
-	if newOwner == privs.Owner {
+	if newOwner == privs.Owner() {
 		return nil
 	}
 
@@ -141,7 +139,7 @@ func (p *planner) alterSchemaOwner(
 // checkCanAlterSchemaAndSetNewOwner handles privilege checking and setting new owner.
 // Called in ALTER SCHEMA and REASSIGN OWNED BY.
 func (p *planner) checkCanAlterSchemaAndSetNewOwner(
-	ctx context.Context, scDesc *schemadesc.Mutable, newOwner string,
+	ctx context.Context, scDesc *schemadesc.Mutable, newOwner security.SQLUsername,
 ) error {
 	if err := p.checkCanAlterToNewOwner(ctx, scDesc, newOwner); err != nil {
 		return err
@@ -160,7 +158,14 @@ func (p *planner) checkCanAlterSchemaAndSetNewOwner(
 	privs := scDesc.GetPrivileges()
 	privs.SetOwner(newOwner)
 
-	return nil
+	return p.logEvent(ctx,
+		scDesc.GetID(),
+		&eventpb.AlterSchemaOwner{
+			// TODO(knz): This name is insufficiently qualified.
+			// See: https://github.com/cockroachdb/cockroach/issues/57738
+			SchemaName: scDesc.GetName(),
+			Owner:      newOwner.Normalized(),
+		})
 }
 
 func (p *planner) renameSchema(

@@ -553,7 +553,13 @@ func (c *CustomFuncs) ExtractJoinEquality(
 	)
 
 	// Project away the synthesized columns.
-	return c.f.ConstructProject(join, memo.EmptyProjectionsExpr, leftCols.Union(rightCols))
+	outputCols := leftCols
+	if joinOp != opt.SemiJoinOp && joinOp != opt.AntiJoinOp {
+		// Semi/Anti join only produce the left side columns. All other join types
+		// produce columns from both sides.
+		outputCols = leftCols.Union(rightCols)
+	}
+	return c.f.ConstructProject(join, memo.EmptyProjectionsExpr, outputCols)
 }
 
 // CommuteJoinFlags returns a join private for the commuted join (where the left
@@ -574,6 +580,7 @@ func (c *CustomFuncs) CommuteJoinFlags(p *memo.JoinPrivate) *memo.JoinPrivate {
 	}
 	f := p.Flags
 	f = swap(f, memo.DisallowLookupJoinIntoLeft, memo.DisallowLookupJoinIntoRight)
+	f = swap(f, memo.DisallowInvertedJoinIntoLeft, memo.DisallowInvertedJoinIntoRight)
 	f = swap(f, memo.DisallowHashJoinStoreLeft, memo.DisallowHashJoinStoreRight)
 	f = swap(f, memo.PreferLookupJoinIntoLeft, memo.PreferLookupJoinIntoRight)
 	if p.Flags == f {
@@ -582,4 +589,19 @@ func (c *CustomFuncs) CommuteJoinFlags(p *memo.JoinPrivate) *memo.JoinPrivate {
 	res := *p
 	res.Flags = f
 	return &res
+}
+
+// MakeProjectionsFromValues converts single-row values into projections, for
+// use when transforming inner joins with a values operator into a projection.
+func (c *CustomFuncs) MakeProjectionsFromValues(values *memo.ValuesExpr) memo.ProjectionsExpr {
+	if len(values.Rows) != 1 {
+		panic(errors.AssertionFailedf("MakeProjectionsFromValues expects 1 row, got %d",
+			len(values.Rows)))
+	}
+	projections := make(memo.ProjectionsExpr, 0, len(values.Cols))
+	elems := values.Rows[0].(*memo.TupleExpr).Elems
+	for i, col := range values.Cols {
+		projections = append(projections, c.f.ConstructProjectionsItem(elems[i], col))
+	}
+	return projections
 }

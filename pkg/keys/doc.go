@@ -125,7 +125,8 @@
 // be the target of KV operations, unaddressable keys can only be written as a
 // side-effect of other KV operations. This can often makes the choice between
 // the two clear (range descriptor keys needing to be addressable, and therefore
-// being a range local key is one example of this).
+// being a range local key is one example of this). Not being addressable also
+// implies not having multiple versions, and therefore never having intents.
 //
 // The "behavioral" difference between range local keys and range-id local keys
 // is that range local keys split and merge along range boundaries while
@@ -204,10 +205,9 @@ var _ = [...]interface{}{
 	//   as a whole. They are replicated and addressable. Typical examples are
 	//   the range descriptor and transaction records. They all share
 	//   `LocalRangePrefix`.
-	QueueLastProcessedKey,   // "qlpt"
-	RangeDescriptorJointKey, // "rdjt"
-	RangeDescriptorKey,      // "rdsc"
-	TransactionKey,          // "txn-"
+	QueueLastProcessedKey, // "qlpt"
+	RangeDescriptorKey,    // "rdsc"
+	TransactionKey,        // "txn-"
 
 	//   4. Range lock keys for all replicated locks. All range locks share
 	//   LocalRangeLockTablePrefix. Locks can be acquired on global keys and on
@@ -222,13 +222,13 @@ var _ = [...]interface{}{
 	//   5. Store local keys: These contain metadata about an individual store.
 	//   They are unreplicated and unaddressable. The typical example is the
 	//   store 'ident' record. They all share `localStorePrefix`.
-	StoreSuggestedCompactionKey, // "comp"
-	StoreClusterVersionKey,      // "cver"
-	StoreGossipKey,              // "goss"
-	StoreHLCUpperBoundKey,       // "hlcu"
-	StoreIdentKey,               // "iden"
-	StoreNodeTombstoneKey,       // "ntmb"
-	StoreLastUpKey,              // "uptm"
+	StoreClusterVersionKey, // "cver"
+	StoreGossipKey,         // "goss"
+	StoreHLCUpperBoundKey,  // "hlcu"
+	StoreIdentKey,          // "iden"
+	StoreNodeTombstoneKey,  // "ntmb"
+	StoreLastUpKey,         // "uptm"
+	StoreCachedSettingsKey, // "stng"
 
 	// The global keyspace includes the meta{1,2}, system, system tenant SQL
 	// keys, and non-system tenant SQL keys.

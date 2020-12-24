@@ -14,6 +14,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
@@ -29,7 +30,7 @@ type sqlForeignKeyCheckOperation struct {
 	constraint          *descpb.ConstraintDetail
 	asOf                hlc.Timestamp
 
-	colIDToRowIdx map[descpb.ColumnID]int
+	colIDToRowIdx catalog.TableColMap
 
 	run sqlForeignKeyConstraintCheckRun
 }
@@ -113,7 +114,7 @@ func (o *sqlForeignKeyCheckOperation) Start(params runParams) error {
 	// Get primary key columns not included in the FK.
 	var colIDs []descpb.ColumnID
 	colIDs = append(colIDs, o.constraint.FK.OriginColumnIDs...)
-	for _, pkColID := range o.tableDesc.PrimaryIndex.ColumnIDs {
+	for _, pkColID := range o.tableDesc.GetPrimaryIndex().ColumnIDs {
 		found := false
 		for _, id := range o.constraint.FK.OriginColumnIDs {
 			if pkColID == id {
@@ -126,9 +127,8 @@ func (o *sqlForeignKeyCheckOperation) Start(params runParams) error {
 		}
 	}
 
-	o.colIDToRowIdx = make(map[descpb.ColumnID]int, len(colIDs))
 	for i, id := range colIDs {
-		o.colIDToRowIdx[id] = i
+		o.colIDToRowIdx.Set(id, i)
 	}
 
 	o.run.started = true
@@ -147,23 +147,23 @@ func (o *sqlForeignKeyCheckOperation) Next(params runParams) (tree.Datums, error
 
 	// Collect the primary index values for generating the primary key
 	// pretty string.
-	primaryKeyDatums := make(tree.Datums, 0, len(o.tableDesc.PrimaryIndex.ColumnIDs))
-	for _, id := range o.tableDesc.PrimaryIndex.ColumnIDs {
-		idx := o.colIDToRowIdx[id]
+	primaryKeyDatums := make(tree.Datums, 0, len(o.tableDesc.GetPrimaryIndex().ColumnIDs))
+	for _, id := range o.tableDesc.GetPrimaryIndex().ColumnIDs {
+		idx := o.colIDToRowIdx.GetDefault(id)
 		primaryKeyDatums = append(primaryKeyDatums, row[idx])
 	}
 
 	// Collect all of the values fetched from the index to generate a
 	// pretty JSON dictionary for row_data.
 	for _, id := range o.constraint.FK.OriginColumnIDs {
-		idx := o.colIDToRowIdx[id]
+		idx := o.colIDToRowIdx.GetDefault(id)
 		col, err := o.tableDesc.FindActiveColumnByID(id)
 		if err != nil {
 			return nil, err
 		}
 		rowDetails[col.Name] = row[idx].String()
 	}
-	for _, id := range o.tableDesc.PrimaryIndex.ColumnIDs {
+	for _, id := range o.tableDesc.GetPrimaryIndex().ColumnIDs {
 		found := false
 		for _, fkID := range o.constraint.FK.OriginColumnIDs {
 			if id == fkID {
@@ -172,7 +172,7 @@ func (o *sqlForeignKeyCheckOperation) Next(params runParams) (tree.Datums, error
 			}
 		}
 		if !found {
-			idx := o.colIDToRowIdx[id]
+			idx := o.colIDToRowIdx.GetDefault(id)
 			col, err := o.tableDesc.FindActiveColumnByID(id)
 			if err != nil {
 				return nil, err

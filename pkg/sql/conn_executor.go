@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -38,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
@@ -46,6 +48,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -481,7 +485,7 @@ func (s *Server) ServeConn(
 func (s *Server) newSessionData(args SessionArgs) *sessiondata.SessionData {
 	sd := &sessiondata.SessionData{
 		SessionData: sessiondatapb.SessionData{
-			User: args.User,
+			UserProto: args.User.EncodeProto(),
 		},
 		LocalOnlySessionData: sessiondata.LocalOnlySessionData{
 			RemoteAddr:        args.RemoteAddr,
@@ -513,7 +517,7 @@ func (s *Server) populateMinimalSessionData(sd *sessiondata.SessionData) {
 		sd.Location = time.UTC
 	}
 	if len(sd.SearchPath.GetPathArray()) == 0 {
-		sd.SearchPath = sessiondata.DefaultSearchPathForUser(sd.User)
+		sd.SearchPath = sessiondata.DefaultSearchPathForUser(sd.User())
 	}
 }
 
@@ -702,23 +706,23 @@ func (s *Server) newConnExecutorWithTxn(
 
 // SQLStatReset is the cluster setting that controls at what interval SQL
 // statement statistics should be reset.
-var SQLStatReset = settings.RegisterPublicNonNegativeDurationSettingWithMaximum(
+var SQLStatReset = settings.RegisterDurationSetting(
 	"diagnostics.sql_stat_reset.interval",
 	"interval controlling how often SQL statement statistics should "+
 		"be reset (should be less than diagnostics.forced_sql_stat_reset.interval). It has a max value of 24H.",
 	time.Hour,
-	time.Hour*24,
-)
+	settings.NonNegativeDurationWithMaximum(time.Hour*24),
+).WithPublic()
 
 // MaxSQLStatReset is the cluster setting that controls at what interval SQL
 // statement statistics must be flushed within.
-var MaxSQLStatReset = settings.RegisterPublicNonNegativeDurationSettingWithMaximum(
+var MaxSQLStatReset = settings.RegisterDurationSetting(
 	"diagnostics.forced_sql_stat_reset.interval",
 	"interval after which SQL statement statistics are refreshed even "+
 		"if not collected (should be more than diagnostics.sql_stat_reset.interval). It has a max value of 24H.",
 	time.Hour*2, // 2 x diagnostics.sql_stat_reset.interval
-	time.Hour*24,
-)
+	settings.NonNegativeDurationWithMaximum(time.Hour*24),
+).WithPublic()
 
 // PeriodicallyClearSQLStats spawns a loop to reset stats based on the setting
 // of a given duration settings variable. We take in a function to actually do
@@ -768,24 +772,24 @@ const (
 
 func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{}) {
 	if recovered != nil {
-		panicErr := log.PanicAsError(1, recovered)
+		panicErr := logcrash.PanicAsError(1, recovered)
 
 		// If there's a statement currently being executed, we'll report
 		// on it.
-		if ex.curStmt != nil {
+		if ex.curStmtAST != nil {
 			// A warning header guaranteed to go to stderr.
-			log.Shoutf(ctx, log.Severity_ERROR,
+			log.SqlExec.Shoutf(ctx, severity.ERROR,
 				"a SQL panic has occurred while executing the following statement:\n%s",
 				// For the log message, the statement is not anonymized.
-				truncateStatementStringForTelemetry(ex.curStmt.String()))
+				truncateStatementStringForTelemetry(ex.curStmtAST.String()))
 
 			// Embed the statement in the error object for the telemetry
 			// report below. The statement gets anonymized.
-			panicErr = WithAnonymizedStatement(panicErr, ex.curStmt)
+			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST)
 		}
 
 		// Report the panic to telemetry in any case.
-		log.ReportPanic(ctx, &ex.server.cfg.Settings.SV, panicErr, 1 /* depth */)
+		logcrash.ReportPanic(ctx, &ex.server.cfg.Settings.SV, panicErr, 1 /* depth */)
 
 		// Close the executor before propagating the panic further.
 		ex.close(ctx, panicClose)
@@ -828,6 +832,7 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 		err := cleanupSessionTempObjects(
 			ctx,
 			ex.server.cfg.Settings,
+			ex.server.cfg.LeaseManager,
 			ex.server.cfg.DB,
 			ex.server.cfg.Codec,
 			&ie,
@@ -1093,9 +1098,9 @@ type connExecutor struct {
 		IdleInTransactionSessionTimeout timeout
 	}
 
-	// curStmt is the statement that's currently being prepared or executed, if
+	// curStmtAST is the statement that's currently being prepared or executed, if
 	// any. This is printed by high-level panic recovery.
-	curStmt tree.Statement
+	curStmtAST tree.Statement
 
 	sessionID ClusterWideID
 
@@ -1117,7 +1122,7 @@ type connExecutor struct {
 
 	// stmtDiagnosticsRecorder is used to track which queries need to have
 	// information collected.
-	stmtDiagnosticsRecorder StmtDiagnosticsRecorder
+	stmtDiagnosticsRecorder *stmtdiagnostics.Registry
 }
 
 // ctxHolder contains a connection's context and, while session tracing is
@@ -1297,7 +1302,7 @@ func (ex *connExecutor) activate(
 			remoteStr = ex.sessionData.RemoteAddr.String()
 		}
 		ex.eventLog = trace.NewEventLog(
-			fmt.Sprintf("sql session [%s]", ex.sessionData.User), remoteStr)
+			fmt.Sprintf("sql session [%s]", ex.sessionData.User()), remoteStr)
 	}
 
 	ex.activated = true
@@ -1358,7 +1363,7 @@ func (ex *connExecutor) run(
 	defer ex.server.cfg.SessionRegistry.deregister(ex.sessionID)
 
 	for {
-		ex.curStmt = nil
+		ex.curStmtAST = nil
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -1422,7 +1427,7 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 				res = ex.clientComm.CreateEmptyQueryResult(pos)
 				return nil
 			}
-			ex.curStmt = tcmd.AST
+			ex.curStmtAST = tcmd.AST
 
 			stmtRes := ex.clientComm.CreateStatementResult(
 				tcmd.AST,
@@ -1436,10 +1441,8 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 				ex.implicitTxn(),
 			)
 			res = stmtRes
-			curStmt := Statement{Statement: tcmd.Statement}
 
-			stmtCtx := withStatement(ctx, ex.curStmt)
-			ev, payload, err = ex.execStmt(stmtCtx, curStmt, stmtRes, nil /* pinfo */)
+			ev, payload, err = ex.execStmt(ctx, tcmd.Statement, nil /* prepared */, nil /* pinfo */, stmtRes)
 			return err
 		}()
 		// Note: we write to ex.statsCollector.phaseTimes, instead of ex.phaseTimes,
@@ -1485,7 +1488,7 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 			if log.ExpensiveLogEnabled(ctx, 2) {
 				log.VEventf(ctx, 2, "portal resolved to: %s", portal.Stmt.AST.String())
 			}
-			ex.curStmt = portal.Stmt.AST
+			ex.curStmtAST = portal.Stmt.AST
 
 			pinfo := &tree.PlaceholderInfo{
 				PlaceholderTypesInfo: tree.PlaceholderTypesInfo{
@@ -1523,9 +1526,9 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 		}
 
 	case PrepareStmt:
-		ex.curStmt = tcmd.AST
+		ex.curStmtAST = tcmd.AST
 		res = ex.clientComm.CreatePrepareResult(pos)
-		stmtCtx := withStatement(ctx, ex.curStmt)
+		stmtCtx := withStatement(ctx, ex.curStmtAST)
 		ev, payload = ex.execPrepare(stmtCtx, tcmd)
 	case DescribeStmt:
 		descRes := ex.clientComm.CreateDescribeResult(pos)
@@ -1784,9 +1787,8 @@ func (ex *connExecutor) setTxnRewindPos(ctx context.Context, pos CmdPos) {
 // stmtDoesntNeedRetry returns true if the given statement does not need to be
 // retried when performing automatic retries. This means that the results of the
 // statement do not change with retries.
-func (ex *connExecutor) stmtDoesntNeedRetry(stmt tree.Statement) bool {
-	wrap := Statement{Statement: parser.Statement{AST: stmt}}
-	return isSavepoint(wrap) || isSetTransaction(wrap)
+func (ex *connExecutor) stmtDoesntNeedRetry(ast tree.Statement) bool {
+	return isSavepoint(ast) || isSetTransaction(ast)
 }
 
 func stateToTxnStatusIndicator(s fsm.State) TransactionStatusIndicator {
@@ -2018,10 +2020,10 @@ func (ex *connExecutor) setTransactionModes(
 			"unknown isolation level: %s", errors.Safe(modes.Isolation))
 	}
 	rwMode := modes.ReadWriteMode
-	if modes.AsOf.Expr != nil && (asOfTs == hlc.Timestamp{}) {
+	if modes.AsOf.Expr != nil && asOfTs.IsEmpty() {
 		return errors.AssertionFailedf("expected an evaluated AS OF timestamp")
 	}
-	if (asOfTs != hlc.Timestamp{}) {
+	if !asOfTs.IsEmpty() {
 		ex.state.setHistoricalTimestamp(ex.Ctx(), asOfTs)
 		ex.state.sqlTimestamp = asOfTs.GoTime()
 		if rwMode == tree.UnspecifiedReadWriteMode {
@@ -2059,12 +2061,31 @@ func (ex *connExecutor) readWriteModeWithSessionDefault(
 	mode tree.ReadWriteMode,
 ) tree.ReadWriteMode {
 	if mode == tree.UnspecifiedReadWriteMode {
-		if ex.sessionData.DefaultReadOnly {
+		if ex.sessionData.DefaultTxnReadOnly {
 			return tree.ReadOnly
 		}
 		return tree.ReadWrite
 	}
 	return mode
+}
+
+// followerReadTimestampExpr is the function which can be used with AOST clauses
+// to generate a timestamp likely to be safe for follower reads.
+//
+// NOTE: this cannot live in pkg/sql/sem/tree due to the call to WrapFunction,
+// which fails before the pkg/sql/sem/builtins package has been initialized.
+var followerReadTimestampExpr = &tree.FuncExpr{
+	Func: tree.WrapFunction(tree.FollowerReadTimestampFunctionName),
+}
+
+func (ex *connExecutor) asOfClauseWithSessionDefault(expr tree.AsOfClause) tree.AsOfClause {
+	if expr.Expr == nil {
+		if ex.sessionData.DefaultTxnUseFollowerReads {
+			return tree.AsOfClause{Expr: followerReadTimestampExpr}
+		}
+		return tree.AsOfClause{}
+	}
+	return expr
 }
 
 // initEvalCtx initializes the fields of an extendedEvalContext that stay the
@@ -2178,7 +2199,8 @@ func (ex *connExecutor) resetPlanner(
 	ctx context.Context, p *planner, txn *kv.Txn, stmtTS time.Time,
 ) {
 	p.txn = txn
-	p.stmt = nil
+	p.stmt = Statement{}
+	p.instrumentation = instrumentationHelper{}
 
 	p.cancelChecker.Reset(ctx)
 
@@ -2193,8 +2215,6 @@ func (ex *connExecutor) resetPlanner(
 	p.autoCommit = false
 	p.isPreparing = false
 	p.avoidCachedDescriptors = false
-	p.discardRows = false
-	p.collectBundle = false
 }
 
 // txnStateTransitionsApplyWrapper is a wrapper on top of Machine built with the
@@ -2211,7 +2231,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		implicitTxn = os.ImplicitTxn.Get()
 	}
 
-	err := ex.machine.ApplyWithPayload(withStatement(ex.Ctx(), ex.curStmt), ev, payload)
+	err := ex.machine.ApplyWithPayload(withStatement(ex.Ctx(), ex.curStmtAST), ev, payload)
 	if err != nil {
 		if errors.HasType(err, (*fsm.TransitionNotFoundError)(nil)) {
 			panic(err)
@@ -2308,14 +2328,14 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 //
 // If an error is returned, it is to be considered a query execution error.
 func (ex *connExecutor) initStatementResult(
-	ctx context.Context, res RestrictedCommandResult, stmt *Statement, cols colinfo.ResultColumns,
+	ctx context.Context, res RestrictedCommandResult, ast tree.Statement, cols colinfo.ResultColumns,
 ) error {
 	for _, c := range cols {
 		if err := checkResultType(c.Typ); err != nil {
 			return err
 		}
 	}
-	if stmt.AST.StatementType() == tree.Rows {
+	if ast.StatementType() == tree.Rows {
 		// Note that this call is necessary even if cols is nil.
 		res.SetColumns(ctx, cols)
 	}
@@ -2349,8 +2369,8 @@ func (ex *connExecutor) cancelSession() {
 }
 
 // user is part of the registrySession interface.
-func (ex *connExecutor) user() string {
-	return ex.sessionData.User
+func (ex *connExecutor) user() security.SQLUsername {
+	return ex.sessionData.User()
 }
 
 // serialize is part of the registrySession interface.
@@ -2431,7 +2451,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 	}
 
 	return serverpb.Session{
-		Username:        ex.sessionData.User,
+		Username:        ex.sessionData.User().Normalized(),
 		ClientAddress:   remoteStr,
 		ApplicationName: ex.applicationName.Load().(string),
 		Start:           ex.phaseTimes[sessionInit].UTC(),
@@ -2695,7 +2715,7 @@ func statementFromCtx(ctx context.Context) tree.Statement {
 
 func init() {
 	// Register a function to include the anonymized statement in crash reports.
-	log.RegisterTagFn("statement", func(ctx context.Context) string {
+	logcrash.RegisterTagFn("statement", func(ctx context.Context) string {
 		stmt := statementFromCtx(ctx)
 		if stmt == nil {
 			return ""

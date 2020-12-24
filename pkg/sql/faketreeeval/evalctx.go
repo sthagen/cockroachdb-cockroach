@@ -87,6 +87,41 @@ func (so *DummySequenceOperators) SetSequenceValue(
 // errors.
 type DummyEvalPlanner struct{}
 
+// UnsafeUpsertDescriptor is part of the EvalPlanner interface.
+func (ep *DummyEvalPlanner) UnsafeUpsertDescriptor(
+	ctx context.Context, descID int64, encodedDescriptor []byte, force bool,
+) error {
+	return errors.WithStack(errEvalPlanner)
+}
+
+// UnsafeDeleteDescriptor is part of the EvalPlanner interface.
+func (ep *DummyEvalPlanner) UnsafeDeleteDescriptor(
+	ctx context.Context, descID int64, force bool,
+) error {
+	return errors.WithStack(errEvalPlanner)
+}
+
+// UnsafeUpsertNamespaceEntry is part of the EvalPlanner interface.
+func (ep *DummyEvalPlanner) UnsafeUpsertNamespaceEntry(
+	ctx context.Context, parentID, parentSchemaID int64, name string, descID int64, force bool,
+) error {
+	return errors.WithStack(errEvalPlanner)
+}
+
+// UnsafeDeleteNamespaceEntry is part of the EvalPlanner interface.
+func (ep *DummyEvalPlanner) UnsafeDeleteNamespaceEntry(
+	ctx context.Context, parentID, parentSchemaID int64, name string, descID int64, force bool,
+) error {
+	return errors.WithStack(errEvalPlanner)
+}
+
+// CompactEngineSpan is part of the EvalPlanner interface.
+func (ep *DummyEvalPlanner) CompactEngineSpan(
+	ctx context.Context, nodeID int32, storeID int32, startKey []byte, endKey []byte,
+) error {
+	return errors.WithStack(errEvalPlanner)
+}
+
 var _ tree.EvalPlanner = &DummyEvalPlanner{}
 
 var errEvalPlanner = pgerror.New(pgcode.ScalarOperationCannotRunWithoutFullSessionContext,
@@ -111,8 +146,8 @@ func (ep *DummyEvalPlanner) ResolveTableName(
 	return 0, errors.WithStack(errEvalPlanner)
 }
 
-// ParseType is part of the tree.EvalPlanner interface.
-func (ep *DummyEvalPlanner) ParseType(sql string) (*types.T, error) {
+// GetTypeFromValidSQLSyntax is part of the tree.EvalPlanner interface.
+func (ep *DummyEvalPlanner) GetTypeFromValidSQLSyntax(sql string) (*types.T, error) {
 	return nil, errors.WithStack(errEvalPlanner)
 }
 
@@ -210,5 +245,10 @@ func (c *DummyTenantOperator) CreateTenant(_ context.Context, _ uint64) error {
 
 // DestroyTenant is part of the tree.TenantOperator interface.
 func (c *DummyTenantOperator) DestroyTenant(_ context.Context, _ uint64) error {
+	return errors.WithStack(errEvalTenant)
+}
+
+// GCTenant is part of the tree.TenantOperator interface.
+func (c *DummyTenantOperator) GCTenant(_ context.Context, _ uint64) error {
 	return errors.WithStack(errEvalTenant)
 }

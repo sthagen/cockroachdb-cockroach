@@ -12,7 +12,9 @@ package main
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -28,11 +30,14 @@ func registerSchemaChangeRandomLoad(r *testRegistry) {
 		Owner:      OwnerSQLSchema,
 		Cluster:    makeClusterSpec(3),
 		MinVersion: "v20.1.0",
+		// This is set while development is still happening on the workload and we
+		// fix (or bypass) minor schema change bugs that are discovered.
+		NonReleaseBlocker: true,
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			maxOps := 5000
 			concurrency := 20
 			if local {
-				maxOps = 1000
+				maxOps = 200
 				concurrency = 2
 			}
 			runSchemaChangeRandomLoad(ctx, t, c, maxOps, concurrency)
@@ -68,6 +73,9 @@ func registerRandomLoadBenchSpec(r *testRegistry, b randomLoadBenchSpec) {
 		Owner:      OwnerSQLSchema,
 		Cluster:    makeClusterSpec(b.Nodes),
 		MinVersion: "v20.1.0",
+		// This is set while development is still happening on the workload and we
+		// fix (or bypass) minor schema change bugs that are discovered.
+		NonReleaseBlocker: true,
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runSchemaChangeRandomLoad(ctx, t, c, b.Ops, b.Concurrency)
 		},
@@ -75,6 +83,37 @@ func registerRandomLoadBenchSpec(r *testRegistry, b randomLoadBenchSpec) {
 }
 
 func runSchemaChangeRandomLoad(ctx context.Context, t *test, c *cluster, maxOps, concurrency int) {
+	validate := func(db *gosql.DB) {
+		var (
+			id           int
+			databaseName string
+			schemaName   string
+			objName      string
+			objError     string
+		)
+		numInvalidObjects := 0
+		rows, err := db.QueryContext(ctx, `SELECT id, database_name, schema_name, obj_name, error FROM crdb_internal.invalid_objects`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			numInvalidObjects++
+			if err := rows.Scan(&id, &databaseName, &schemaName, &objName, &objError); err != nil {
+				t.Fatal(err)
+			}
+			t.logger().Errorf(
+				"invalid object found: id: %d, database_name: %s, schema_name: %s, obj_name: %s, error: %s",
+				id, databaseName, schemaName, objName, objError,
+			)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if numInvalidObjects > 0 {
+			t.Fatalf("found %d invalid objects", numInvalidObjects)
+		}
+	}
+
 	loadNode := c.Node(1)
 	roachNodes := c.Range(1, c.spec.NodeCount)
 	t.Status("copying binaries")
@@ -85,19 +124,73 @@ func runSchemaChangeRandomLoad(ctx context.Context, t *test, c *cluster, maxOps,
 	c.Start(ctx, t, roachNodes)
 	c.Run(ctx, loadNode, "./workload init schemachange")
 
+	storeDirectory, err := c.RunWithBuffer(ctx, c.l, c.Node(1), "echo", "-n", "{store-dir}")
+	if err != nil {
+		c.l.Printf("Failed to retrieve store directory from node 1: %v\n", err.Error())
+	}
+
 	runCmd := []string{
 		"./workload run schemachange --verbose=1",
-		// The workload is still in development and occasionally discovers schema
-		// change errors so for now we don't fail on them but only on panics, server
-		// crashes, deadlocks, etc.
-		// TODO(spaskob): remove when https://github.com/cockroachdb/cockroach/issues/47430
-		// is closed.
-		"--tolerate-errors=true",
+		"--tolerate-errors=false",
 		// Save the histograms so that they can be reported to https://roachperf.crdb.dev/.
 		" --histograms=" + perfArtifactsDir + "/stats.json",
 		fmt.Sprintf("--max-ops %d", maxOps),
 		fmt.Sprintf("--concurrency %d", concurrency),
+		fmt.Sprintf("--txn-log %s", filepath.Join(string(storeDirectory), "transactions.json")),
 	}
 	t.Status("running schemachange workload")
-	c.Run(ctx, loadNode, runCmd...)
+	err = c.RunE(ctx, loadNode, runCmd...)
+	if err != nil {
+		saveArtifacts(ctx, c, string(storeDirectory))
+		c.t.Fatal(err)
+	}
+
+	// Drop the database to test the correctness of DROP DATABASE CASCADE, which
+	// has been a source of schema change bugs (mostly orphaned descriptors) in
+	// the past.
+	// TODO (lucy): When the workload supports multiple databases and running
+	// schema changes on them, we may want to push this into the post-run hook for
+	// the workload itself (if we even still want it, considering that the
+	// workload itself would be running DROP DATABASE CASCADE).
+
+	db := c.Conn(ctx, 1)
+	defer db.Close()
+
+	t.Status("performing validation after workload")
+	validate(db)
+	t.Status("dropping database")
+	_, err = db.ExecContext(ctx, `USE defaultdb; DROP DATABASE schemachange CASCADE;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Status("performing validation after dropping database")
+	validate(db)
+}
+
+// saveArtifacts saves important test artifacts in the artifacts directory.
+func saveArtifacts(ctx context.Context, c *cluster, storeDirectory string) {
+	db := c.Conn(ctx, 1)
+
+	// Save a backup file called schemachange to the store directory.
+	_, err := db.Exec("BACKUP DATABASE schemachange to 'nodelocal://1/schemachange'")
+	if err != nil {
+		c.l.Printf("Failed execute backup command on node 1: %v\n", err.Error())
+	}
+
+	remoteBackupFilePath := filepath.Join(storeDirectory, "extern", "schemachange")
+	localBackupFilePath := filepath.Join(c.t.ArtifactsDir(), "backup")
+	remoteTransactionsFilePath := filepath.Join(storeDirectory, "transactions.ndjson")
+	localTransactionsFilePath := filepath.Join(c.t.ArtifactsDir(), "transactions.ndjson")
+
+	// Copy the backup from the store directory to the artifacts directory.
+	err = c.Get(ctx, c.l, remoteBackupFilePath, localBackupFilePath, c.Node(1))
+	if err != nil {
+		c.l.Printf("Failed to copy backup file from node 1 to artifacts directory: %v\n", err.Error())
+	}
+
+	// Copy the txn log from the store directory to the artifacts directory.
+	err = c.Get(ctx, c.l, remoteTransactionsFilePath, localTransactionsFilePath, c.Node(1))
+	if err != nil {
+		c.l.Printf("Failed to copy txn log file from node 1 to artifacts directory: %v\n", err.Error())
+	}
 }

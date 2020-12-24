@@ -21,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -179,7 +180,7 @@ func (f *cloudStorageSinkFile) Write(p []byte) (int, error) {
 //
 // The resolved timestamp files are named `<timestamp>.RESOLVED`. This is
 // carefully done so that we can offer the following external guarantee: At any
-// given time, if the the files are iterated in lexicographic filename order,
+// given time, if the files are iterated in lexicographic filename order,
 // then encountering any filename containing `RESOLVED` means that everything
 // before it is finalized (and thus can be ingested into some other system and
 // deleted, included in hive queries, etc). A typical user of cloudStorageSink
@@ -306,7 +307,7 @@ func makeCloudStorageSink(
 	opts map[string]string,
 	timestampOracle timestampLowerBoundOracle,
 	makeExternalStorageFromURI cloud.ExternalStorageFromURIFactory,
-	user string,
+	user security.SQLUsername,
 ) (Sink, error) {
 	// Date partitioning is pretty standard, so no override for now, but we could
 	// plumb one down if someone needs it.

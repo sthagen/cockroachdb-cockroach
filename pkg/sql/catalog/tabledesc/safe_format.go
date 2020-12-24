@@ -107,14 +107,13 @@ func formatSafeColumn(
 }
 
 func formatSafeTableIndexes(w *redact.StringBuilder, desc catalog.TableDescriptor) {
-	td := desc.TableDesc()
-	w.Printf(", PrimaryIndex: %d", td.PrimaryIndex.ID)
-	w.Printf(", NextIndexID: %d", td.NextIndexID)
+	w.Printf(", PrimaryIndex: %d", desc.GetPrimaryIndexID())
+	w.Printf(", NextIndexID: %d", desc.TableDesc().NextIndexID)
 	w.Printf(", Indexes: [")
-	formatSafeIndex(w, &td.PrimaryIndex, nil)
-	for i := range td.Indexes {
+	formatSafeIndex(w, desc.GetPrimaryIndex(), nil)
+	for i := range desc.GetPublicNonPrimaryIndexes() {
 		w.Printf(", ")
-		formatSafeIndex(w, &td.Indexes[i], nil)
+		formatSafeIndex(w, &desc.GetPublicNonPrimaryIndexes()[i], nil)
 	}
 	w.Printf("]")
 }
@@ -175,6 +174,7 @@ func formatSafeIndex(
 func formatSafeTableConstraints(w *redact.StringBuilder, desc catalog.TableDescriptor) {
 	td := desc.TableDesc()
 	formatSafeTableChecks(w, td.Checks)
+	formatSafeTableUniqueWithoutIndexConstraints(w, td.UniqueWithoutIndexConstraints)
 	formatSafeTableFKs(w, "InboundFKs", td.InboundFKs)
 	formatSafeTableFKs(w, "OutboundFKs", td.OutboundFKs)
 }
@@ -224,6 +224,23 @@ func formatSafeTableChecks(
 		formatSafeCheck(w, c, nil)
 	}
 	if len(checks) > 0 {
+		w.Printf("]")
+	}
+}
+
+func formatSafeTableUniqueWithoutIndexConstraints(
+	w *redact.StringBuilder, constraints []descpb.UniqueWithoutIndexConstraint,
+) {
+	for i := range constraints {
+		c := &constraints[i]
+		if i == 0 {
+			w.Printf(", Unique Without Index Constraints: [")
+		} else {
+			w.Printf(", ")
+		}
+		formatSafeUniqueWithoutIndexConstraint(w, c, nil)
+	}
+	if len(constraints) > 0 {
 		w.Printf("]")
 	}
 }
@@ -347,6 +364,21 @@ func formatSafeCheck(
 	if c.Hidden {
 		w.Printf(", Hidden: true")
 	}
+	if m != nil {
+		w.Printf(", State: %s, MutationID: %d", m.Direction, m.MutationID)
+	}
+	w.Printf("}")
+}
+
+func formatSafeUniqueWithoutIndexConstraint(
+	w *redact.StringBuilder, c *descpb.UniqueWithoutIndexConstraint, m *descpb.DescriptorMutation,
+) {
+	// TODO(ajwerner): expose OID hashing to get the OID for the
+	// constraint.
+	w.Printf("{TableID: %d", c.TableID)
+	w.Printf(", Columns: ")
+	formatSafeColumnIDs(w, c.ColumnIDs)
+	w.Printf(", Validity: %s", c.Validity.String())
 	if m != nil {
 		w.Printf(", State: %s, MutationID: %d", m.Direction, m.MutationID)
 	}

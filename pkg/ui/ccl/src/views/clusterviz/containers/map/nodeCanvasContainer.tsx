@@ -28,10 +28,10 @@ import {
 import { AdminUIState } from "src/redux/state";
 import { CLUSTERVIZ_ROOT } from "src/routes/visualization";
 import { getLocality } from "src/util/localities";
-import Loading from "src/views/shared/components/loading";
+import { Loading } from "@cockroachlabs/admin-ui-components";
 import { NodeCanvas } from "./nodeCanvas";
 
-type Liveness = cockroach.kv.kvserver.storagepb.ILiveness;
+type Liveness = cockroach.kv.kvserver.liveness.livenesspb.ILiveness;
 
 interface NodeCanvasContainerProps {
   nodesSummary: NodesSummary;

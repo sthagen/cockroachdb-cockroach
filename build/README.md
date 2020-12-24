@@ -67,9 +67,10 @@ which may or may not work (and are not officially supported).
 Please copy this checklist (based on [Basic Process](#basic-process)) into the relevant commit message, with a link
 back to this document and perform these steps:
 
-* [ ] Adjust the Pebble tests to run in 1.14.
+* [ ] Adjust the Pebble tests to run in new version.
 * [ ] Adjust version in Docker image ([source](./builder/Dockerfile#L199-L200)).
 * [ ] Rebuild and push the Docker image (following [Basic Process](#basic-process))
+* [ ] Bump the version in `WORKSPACE` under `go_register_toolchains`. You may need to bump [rules_go](https://github.com/bazelbuild/rules_go/releases).
 * [ ] Bump the version in `builder.sh` accordingly ([source](./builder.sh#L6)).
 * [ ] Bump the version in `go-version-check.sh` ([source](./go-version-check.sh)), unless bumping to a new patch release.
 * [ ] Bump the go version in `go.mod`. You may also need to rerun `make vendor_rebuild` if vendoring has changed.

@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
@@ -120,7 +121,7 @@ func (c *rowFetcherCache) TableDescForKey(
 		}
 
 		// Skip over the column data.
-		for ; skippedCols < len(tableDesc.PrimaryIndex.ColumnIDs); skippedCols++ {
+		for ; skippedCols < len(tableDesc.GetPrimaryIndex().ColumnIDs); skippedCols++ {
 			l, err := encoding.PeekLength(remaining)
 			if err != nil {
 				return nil, err
@@ -152,10 +153,10 @@ func (c *rowFetcherCache) RowFetcherForTableDesc(
 		return rf, nil
 	}
 	// TODO(dan): Allow for decoding a subset of the columns.
-	colIdxMap := make(map[descpb.ColumnID]int)
+	var colIdxMap catalog.TableColMap
 	var valNeededForCol util.FastIntSet
 	for colIdx := range tableDesc.Columns {
-		colIdxMap[tableDesc.Columns[colIdx].ID] = colIdx
+		colIdxMap.Set(tableDesc.Columns[colIdx].ID, colIdx)
 		valNeededForCol.Add(colIdx)
 	}
 
@@ -172,7 +173,7 @@ func (c *rowFetcherCache) RowFetcherForTableDesc(
 		row.FetcherTableArgs{
 			Spans:            tableDesc.AllIndexSpans(c.codec),
 			Desc:             tableDesc,
-			Index:            &tableDesc.PrimaryIndex,
+			Index:            tableDesc.GetPrimaryIndex(),
 			ColIdxMap:        colIdxMap,
 			IsSecondaryIndex: false,
 			Cols:             tableDesc.Columns,

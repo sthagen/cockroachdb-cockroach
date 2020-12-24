@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
 	"time"
@@ -44,17 +45,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/logtags"
-	opentracing "github.com/opentracing/opentracing-go"
 )
 
 const defaultLeniencySetting = 60 * time.Second
 
 var (
-	gcSetting = settings.RegisterPublicDurationSetting(
+	gcSetting = settings.RegisterDurationSetting(
 		"jobs.retention_time",
 		"the amount of time to retain records for completed jobs before",
-		time.Hour*24*14)
+		time.Hour*24*14,
+	).WithPublic()
 )
 
 // adoptedJobs represents a the epoch and cancelation of a job id being run
@@ -108,8 +110,9 @@ type Registry struct {
 	clock    *hlc.Clock
 	nodeID   *base.SQLIDContainer
 	settings *cluster.Settings
-	planFn   planHookMaker
+	execCtx  jobExecCtxMaker
 	metrics  Metrics
+	knobs    TestingKnobs
 
 	// adoptionChan is used to nudge the registry to resume claimed jobs and
 	// potentially attempt to claim jobs.
@@ -118,7 +121,7 @@ type Registry struct {
 
 	// sessionBoundInternalExecutorFactory provides a way for jobs to create
 	// internal executors. This is rarely needed, and usually job resumers should
-	// use the internal executor from the PlanHookState. The intended user of this
+	// use the internal executor from the JobExecCtx. The intended user of this
 	// interface is the schema change job resumer, which needs to set the
 	// tableCollectionModifier on the internal executor to different values in
 	// multiple concurrent queries. This situation is an exception to the internal
@@ -167,26 +170,26 @@ type Registry struct {
 	TestingResumerCreationKnobs map[jobspb.Type]func(Resumer) Resumer
 }
 
-// planHookMaker is a wrapper around sql.NewInternalPlanner. It returns an
+// jobExecCtxMaker is a wrapper around sql.NewInternalPlanner. It returns an
 // *sql.planner as an interface{} due to package dependency cycles. It should
 // be cast to that type in the sql package when it is used. Returns a cleanup
 // function that must be called once the caller is done with the planner.
 //
 // TODO(mjibson): Can we do something to avoid passing an interface{} here
 // that must be type casted in a Resumer? It cannot be done here because
-// PlanHookState lives in the sql package, which would create a dependency
-// cycle if listed here. Furthermore, moving PlanHookState into a common
+// JobExecContext lives in the sql package, which would create a dependency
+// cycle if listed here. Furthermore, moving JobExecContext into a common
 // subpackage like sqlbase is difficult because of the amount of sql-only
-// stuff that PlanHookState exports. One other choice is to merge this package
+// stuff that JobExecContext exports. One other choice is to merge this package
 // back into the sql package. There's maybe a better way that I'm unaware of.
-type planHookMaker func(opName, user string) (interface{}, func())
+type jobExecCtxMaker func(opName string, user security.SQLUsername) (interface{}, func())
 
 // PreventAdoptionFile is the name of the file which, if present in the first
 // on-disk store, will prevent the adoption of background jobs by that node.
 const PreventAdoptionFile = "DISABLE_STARTING_BACKGROUND_JOBS"
 
 // MakeRegistry creates a new Registry. planFn is a wrapper around
-// sql.newInternalPlanner. It returns a sql.PlanHookState, but must be
+// sql.newInternalPlanner. It returns a sql.JobExecCtx, but must be
 // coerced into that in the Resumer functions.
 func MakeRegistry(
 	ac log.AmbientContext,
@@ -199,8 +202,9 @@ func MakeRegistry(
 	sqlInstance sqlliveness.Instance,
 	settings *cluster.Settings,
 	histogramWindowInterval time.Duration,
-	planFn planHookMaker,
+	execCtxFn jobExecCtxMaker,
 	preventAdoptionFile string,
+	knobs *TestingKnobs,
 ) *Registry {
 	r := &Registry{
 		ac:                  ac,
@@ -212,9 +216,12 @@ func MakeRegistry(
 		nodeID:              nodeID,
 		sqlInstance:         sqlInstance,
 		settings:            settings,
-		planFn:              planFn,
+		execCtx:             execCtxFn,
 		preventAdoptionFile: preventAdoptionFile,
 		adoptionCh:          make(chan adoptionNotice),
+	}
+	if knobs != nil {
+		r.knobs = *knobs
 	}
 	r.mu.deprecatedEpoch = 1
 	r.mu.deprecatedJobs = make(map[int64]context.CancelFunc)
@@ -348,7 +355,7 @@ func (r *Registry) Run(ctx context.Context, ex sqlutil.InternalExecutor, jobs []
 			ctx,
 			"poll-show-jobs",
 			nil, /* txn */
-			sessiondata.InternalExecutorOverride{User: security.RootUser},
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			query,
 		)
 		if err != nil {
@@ -389,7 +396,7 @@ func (r *Registry) NewJob(record Record) *Job {
 	job.mu.payload = jobspb.Payload{
 		Description:   record.Description,
 		Statement:     record.Statement,
-		Username:      record.Username,
+		UsernameProto: record.Username.EncodeProto(),
 		DescriptorIDs: record.DescriptorIDs,
 		Details:       jobspb.WrapPayloadDetails(record.Details),
 		Noncancelable: record.NonCancelable,
@@ -506,11 +513,12 @@ func (r *Registry) CreateStartableJobWithTxn(
 	}
 	// Construct a context which contains a tracing span that follows from the
 	// span in the parent context. We don't directly use the parent span because
-	// we want independent lifetimes and cancellation.
+	// we want independent lifetimes and cancellation. For the same reason, we
+	// don't use the Context returned by ForkCtxSpan.
 	resumerCtx, cancel := r.makeCtx()
 	_, span := tracing.ForkCtxSpan(ctx, "job")
 	if span != nil {
-		resumerCtx = opentracing.ContextWithSpan(resumerCtx, span)
+		resumerCtx = tracing.ContextWithSpan(resumerCtx, span)
 	}
 
 	if r.startUsingSQLLivenessAdoption(ctx) {
@@ -557,6 +565,19 @@ func (r *Registry) LoadJobWithTxn(ctx context.Context, jobID int64, txn *kv.Txn)
 		return nil, err
 	}
 	return j, nil
+}
+
+// UpdateJobWithTxn calls the Update method on an existing job with jobID, using
+// a transaction passed in the txn argument. Passing a nil transaction means
+// that a txn will be automatically created.
+func (r *Registry) UpdateJobWithTxn(
+	ctx context.Context, jobID int64, txn *kv.Txn, updateFunc UpdateFn,
+) error {
+	j := &Job{
+		id:       &jobID,
+		registry: r,
+	}
+	return j.WithTxn(txn).Update(ctx, updateFunc)
 }
 
 // DefaultCancelInterval is a reasonable interval at which to poll this node
@@ -620,12 +641,14 @@ func (r *Registry) Start(
 	removeClaimsFromDeadSessions := func(ctx context.Context, s sqlliveness.Session) {
 		if _, err := r.ex.QueryRowEx(
 			ctx, "expire-sessions", nil,
-			sessiondata.InternalExecutorOverride{User: security.RootUser}, `
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()}, `
 UPDATE system.jobs
    SET claim_session_id = NULL
  WHERE claim_session_id <> $1
+   AND status IN `+claimableStatusTupleString+`
    AND NOT crdb_internal.sql_liveness_is_alive(claim_session_id)`,
-			s.ID().UnsafeBytes()); err != nil {
+			s.ID().UnsafeBytes(),
+		); err != nil {
 			log.Errorf(ctx, "error expiring job sessions: %s", err)
 		}
 	}
@@ -703,7 +726,13 @@ UPDATE system.jobs
 		}
 		timer := timeutil.NewTimer()
 		lastGC := timeutil.Now()
-		timer.Reset(gcInterval())
+		// We'll jitter the first cleanup run to avoid contention in case multiple
+		// nodes restart at once.
+
+		const jitter = 1 / 6
+		jitterFraction := 1 + (2*rand.Float64()-1)*jitter // 1 + [-1/6, +1/6)
+		jitterredDuration := float64(gcInterval()) * jitterFraction
+		timer.Reset(time.Duration(jitterredDuration))
 		defer cancel()
 		for {
 			select {
@@ -847,13 +876,44 @@ func (r *Registry) isOrphaned(ctx context.Context, payload *jobspb.Payload) (boo
 	return true, nil
 }
 
+const cleanupPageSize = 100
+
 func (r *Registry) cleanupOldJobs(ctx context.Context, olderThan time.Time) error {
-	const stmt = `SELECT id, payload, status, created FROM system.jobs WHERE created < $1
-		      ORDER BY created LIMIT 1000`
-	rows, err := r.ex.Query(ctx, "gc-jobs", nil /* txn */, stmt, olderThan)
-	if err != nil {
-		return err
+	var maxID int64
+	for {
+		var done bool
+		var err error
+		done, maxID, err = r.cleanupOldJobsPage(ctx, olderThan, maxID, cleanupPageSize)
+		if err != nil || done {
+			return err
+		}
 	}
+}
+
+// cleanupOldJobsPage deletes up to cleanupPageSize job rows with ID > minID.
+// minID is supposed to be the maximum ID returned by the previous page (0 if no
+// previous page).
+func (r *Registry) cleanupOldJobsPage(
+	ctx context.Context, olderThan time.Time, minID int64, pageSize int,
+) (done bool, maxID int64, _ error) {
+	const stmt = "SELECT id, payload, status, created FROM system.jobs " +
+		"WHERE created < $1 AND id > $2 " +
+		"ORDER BY id " + // the ordering is important as we keep track of the maximum ID we've seen
+		"LIMIT $3"
+	rows, err := r.ex.Query(ctx, "gc-jobs", nil /* txn */, stmt, olderThan, minID, pageSize)
+	if err != nil {
+		return false, 0, err
+	}
+	log.VEventf(ctx, 2, "read potentially expired jobs: %d", len(rows))
+
+	if len(rows) == 0 {
+		return true, 0, nil
+	}
+	// Track the highest ID we encounter, so it can serve as the bottom of the
+	// next page.
+	maxID = int64(*(rows[len(rows)-1][0].(*tree.DInt)))
+	// If we got as many rows as we asked for, there might be more.
+	morePages := len(rows) == pageSize
 
 	toDelete := tree.NewDArray(types.Int)
 	toDelete.Array = make(tree.Datums, 0, len(rows))
@@ -861,14 +921,14 @@ func (r *Registry) cleanupOldJobs(ctx context.Context, olderThan time.Time) erro
 	for _, row := range rows {
 		payload, err := UnmarshalPayload(row[1])
 		if err != nil {
-			return err
+			return false, 0, err
 		}
 		remove := false
 		switch Status(*row[2].(*tree.DString)) {
 		case StatusRunning, StatusPending:
 			done, err := r.isOrphaned(ctx, payload)
 			if err != nil {
-				return err
+				return false, 0, err
 			}
 			remove = done && row[3].(*tree.DTimestamp).Time.Before(olderThan)
 		case StatusSucceeded, StatusCanceled, StatusFailed:
@@ -879,20 +939,20 @@ func (r *Registry) cleanupOldJobs(ctx context.Context, olderThan time.Time) erro
 		}
 	}
 	if len(toDelete.Array) > 0 {
-		log.Infof(ctx, "cleaning up %d expired job records", len(toDelete.Array))
+		log.Infof(ctx, "cleaning up expired job records: %d", len(toDelete.Array))
 		const stmt = `DELETE FROM system.jobs WHERE id = ANY($1)`
 		var nDeleted int
 		if nDeleted, err = r.ex.Exec(
 			ctx, "gc-jobs", nil /* txn */, stmt, toDelete,
 		); err != nil {
-			return errors.Wrap(err, "deleting old jobs")
+			return false, 0, errors.Wrap(err, "deleting old jobs")
 		}
 		if nDeleted != len(toDelete.Array) {
-			return errors.Errorf("asked to delete %d rows but %d were actually deleted",
+			return false, 0, errors.AssertionFailedf("asked to delete %d rows but %d were actually deleted",
 				len(toDelete.Array), nDeleted)
 		}
 	}
-	return nil
+	return !morePages, maxID, nil
 }
 
 // getJobFn attempts to get a resumer from the given job id. If the job id
@@ -984,9 +1044,9 @@ func (r *Registry) Unpause(ctx context.Context, txn *kv.Txn, id int64) error {
 //
 type Resumer interface {
 	// Resume is called when a job is started or resumed. Sending results on the
-	// chan will return them to a user, if a user's session is connected. phs
-	// is a sql.PlanHookState.
-	Resume(ctx context.Context, phs interface{}, resultsCh chan<- tree.Datums) error
+	// chan will return them to a user, if a user's session is connected. execCtx
+	// is a sql.JobExecCtx.
+	Resume(ctx context.Context, execCtx interface{}, resultsCh chan<- tree.Datums) error
 
 	// OnFailOrCancel is called when a job fails or is cancel-requested.
 	//
@@ -994,7 +1054,7 @@ type Resumer interface {
 	// which is not guaranteed to run on the node where the job is running. So it
 	// cannot assume that any other methods have been called on this Resumer
 	// object.
-	OnFailOrCancel(ctx context.Context, phs interface{}) error
+	OnFailOrCancel(ctx context.Context, execCtx interface{}) error
 }
 
 // PauseRequester is an extension of Resumer which allows job implementers to inject
@@ -1003,9 +1063,9 @@ type PauseRequester interface {
 	Resumer
 
 	// OnPauseRequest is called in the transaction that moves a job to PauseRequested.
-	// If an error is returned, the pause request will fail. phs is a
-	// sql.PlanHookState.
-	OnPauseRequest(ctx context.Context, phs interface{}, txn *kv.Txn, details *jobspb.Progress) error
+	// If an error is returned, the pause request will fail. execCtx is a
+	// sql.JobExecCtx.
+	OnPauseRequest(ctx context.Context, execCtx interface{}, txn *kv.Txn, details *jobspb.Progress) error
 }
 
 // Constructor creates a resumable job of a certain type. The Resumer is
@@ -1059,7 +1119,7 @@ func (r retryJobError) Error() string {
 // the job was not completed with success. status is the current job status.
 func (r *Registry) stepThroughStateMachine(
 	ctx context.Context,
-	phs interface{},
+	execCtx interface{},
 	resumer Resumer,
 	resultsCh chan<- tree.Datums,
 	job *Job,
@@ -1086,11 +1146,11 @@ func (r *Registry) stepThroughStateMachine(
 		func() {
 			jm.CurrentlyRunning.Inc(1)
 			defer jm.CurrentlyRunning.Dec(1)
-			err = resumer.Resume(resumeCtx, phs, resultsCh)
+			err = resumer.Resume(resumeCtx, execCtx, resultsCh)
 		}()
 		if err == nil {
 			jm.ResumeCompleted.Inc(1)
-			return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, StatusSucceeded, nil)
+			return r.stepThroughStateMachine(ctx, execCtx, resumer, resultsCh, job, StatusSucceeded, nil)
 		}
 		if resumeCtx.Err() != nil {
 			// The context was canceled. Tell the user, but don't attempt to
@@ -1116,7 +1176,7 @@ func (r *Registry) stepThroughStateMachine(
 			}
 			return sErr
 		}
-		return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, StatusReverting, err)
+		return r.stepThroughStateMachine(ctx, execCtx, resumer, resultsCh, job, StatusReverting, err)
 	case StatusPauseRequested:
 		return errors.Errorf("job %s", status)
 	case StatusCancelRequested:
@@ -1142,7 +1202,7 @@ func (r *Registry) stepThroughStateMachine(
 			// TODO(spaskob): this is silly, we should remove the OnSuccess hooks and
 			// execute them in resume so that the client can handle these errors
 			// better.
-			return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, StatusReverting, errors.Wrapf(err, "could not mark job %d as succeeded", *job.ID()))
+			return r.stepThroughStateMachine(ctx, execCtx, resumer, resultsCh, job, StatusReverting, errors.Wrapf(err, "could not mark job %d as succeeded", *job.ID()))
 		}
 		return nil
 	case StatusReverting:
@@ -1156,7 +1216,7 @@ func (r *Registry) stepThroughStateMachine(
 		func() {
 			jm.CurrentlyRunning.Inc(1)
 			defer jm.CurrentlyRunning.Dec(1)
-			err = resumer.OnFailOrCancel(onFailOrCancelCtx, phs)
+			err = resumer.OnFailOrCancel(onFailOrCancelCtx, execCtx)
 		}()
 		if successOnFailOrCancel := err == nil; successOnFailOrCancel {
 			jm.FailOrCancelCompleted.Inc(1)
@@ -1166,7 +1226,7 @@ func (r *Registry) stepThroughStateMachine(
 			if HasErrJobCanceled(jobErr) {
 				nextStatus = StatusCanceled
 			}
-			return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, nextStatus, jobErr)
+			return r.stepThroughStateMachine(ctx, execCtx, resumer, resultsCh, job, nextStatus, jobErr)
 		}
 		if onFailOrCancelCtx.Err() != nil {
 			jm.FailOrCancelRetryError.Inc(1)
@@ -1186,7 +1246,7 @@ func (r *Registry) stepThroughStateMachine(
 			}
 			return sErr
 		}
-		return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, StatusFailed,
+		return r.stepThroughStateMachine(ctx, execCtx, resumer, resultsCh, job, StatusFailed,
 			errors.Wrapf(err, "job %d: cannot be reverted, manual cleanup may be required", *job.ID()))
 	case StatusFailed:
 		if jobErr == nil {
@@ -1208,7 +1268,7 @@ func (r *Registry) stepThroughStateMachine(
 func (r *Registry) adoptionDisabled(ctx context.Context) bool {
 	if r.preventAdoptionFile != "" {
 		if _, err := os.Stat(r.preventAdoptionFile); err != nil {
-			if !os.IsNotExist(err) {
+			if !oserror.IsNotExist(err) {
 				log.Warningf(ctx, "error checking if job adoption is currently disabled: %v", err)
 			}
 			return false

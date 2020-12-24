@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
@@ -103,6 +104,14 @@ func loadYAML(dst interface{}, yamlString string) {
 }
 
 func (p *planner) SetZoneConfig(ctx context.Context, n *tree.SetZoneConfig) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"CONFIGURE ZONE",
+	); err != nil {
+		return nil, err
+	}
+
 	if err := checkPrivilegeForSetZoneConfig(ctx, p, n.ZoneSpecifier); err != nil {
 		return nil, err
 	}
@@ -192,7 +201,8 @@ func checkPrivilegeForSetZoneConfig(ctx context.Context, p *planner, zs tree.Zon
 		if zs.Database == "system" {
 			return p.RequireAdminRole(ctx, "alter the system database")
 		}
-		dbDesc, err := p.ResolveUncachedDatabaseByName(ctx, string(zs.Database), true)
+		_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
+			string(zs.Database), tree.DatabaseLookupFlags{Required: true})
 		if err != nil {
 			return err
 		}
@@ -206,7 +216,7 @@ func checkPrivilegeForSetZoneConfig(ctx context.Context, p *planner, zs tree.Zon
 
 		return pgerror.Newf(pgcode.InsufficientPrivilege,
 			"user %s does not have %s or %s privilege on %s %s",
-			p.SessionData().User, privilege.ZONECONFIG, privilege.CREATE, dbDesc.TypeName(), dbDesc.GetName())
+			p.SessionData().User(), privilege.ZONECONFIG, privilege.CREATE, dbDesc.TypeName(), dbDesc.GetName())
 	}
 	tableDesc, err := p.resolveTableForZone(ctx, &zs)
 	if err != nil {
@@ -229,7 +239,7 @@ func checkPrivilegeForSetZoneConfig(ctx context.Context, p *planner, zs tree.Zon
 
 	return pgerror.Newf(pgcode.InsufficientPrivilege,
 		"user %s does not have %s or %s privilege on %s %s",
-		p.SessionData().User, privilege.ZONECONFIG, privilege.CREATE, tableDesc.TypeName(), tableDesc.GetName())
+		p.SessionData().User(), privilege.ZONECONFIG, privilege.CREATE, tableDesc.TypeName(), tableDesc.GetName())
 }
 
 // setZoneConfigRun contains the run-time state of setZoneConfigNode during local execution.
@@ -266,7 +276,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		// We'll add back the missing newline below.
 		yamlConfig = strings.TrimSpace(yamlConfig)
 	}
-	var optionStr strings.Builder
+	var optionsStr []string
 	var copyFromParentList []tree.Name
 	if n.options != nil {
 		// Set from var = value attributes.
@@ -288,10 +298,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 			inheritVal, expr := val.inheritValue, val.explicitValue
 			if inheritVal {
 				copyFromParentList = append(copyFromParentList, *name)
-				if optionStr.Len() > 0 {
-					optionStr.WriteString(", ")
-				}
-				fmt.Fprintf(&optionStr, "%s = COPY FROM PARENT", name)
+				optionsStr = append(optionsStr, fmt.Sprintf("%s = COPY FROM PARENT", name))
 				continue
 			}
 			datum, err := expr.Eval(params.EvalContext())
@@ -304,11 +311,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 			}
 			setter := supportedZoneConfigOptions[*name].setter
 			setters = append(setters, func(c *zonepb.ZoneConfig) { setter(c, datum) })
-			if optionStr.Len() > 0 {
-				optionStr.WriteString(", ")
-			}
-			fmt.Fprintf(&optionStr, "%s = %s", name, datum)
-
+			optionsStr = append(optionsStr, fmt.Sprintf("%s = %s", name, datum))
 		}
 	}
 
@@ -669,31 +672,18 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		}
 
 		// Record that the change has occurred for auditing.
-		var eventLogType EventLogType
-		info := struct {
-			Target  string
-			Config  string `json:",omitempty"`
-			Options string `json:",omitempty"`
-			User    string
-		}{
+		eventDetails := eventpb.CommonZoneConfigDetails{
 			Target:  tree.AsStringWithFQNames(&zs, params.Ann()),
 			Config:  strings.TrimSpace(yamlConfig),
-			Options: optionStr.String(),
-			User:    params.SessionData().User,
+			Options: optionsStr,
 		}
+		var info eventpb.EventPayload
 		if deleteZone {
-			eventLogType = EventLogRemoveZoneConfig
+			info = &eventpb.RemoveZoneConfig{CommonZoneConfigDetails: eventDetails}
 		} else {
-			eventLogType = EventLogSetZoneConfig
+			info = &eventpb.SetZoneConfig{CommonZoneConfigDetails: eventDetails}
 		}
-		return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			params.ctx,
-			params.p.txn,
-			eventLogType,
-			int32(targetID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			info,
-		)
+		return params.p.logEvent(params.ctx, targetID, info)
 	}
 	for _, zs := range specifiers {
 		// Note(solon): Currently the zone configurations are applied serially for

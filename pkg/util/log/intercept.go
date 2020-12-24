@@ -10,7 +10,13 @@
 
 package log
 
-import "context"
+import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
+)
 
 // Intercept diverts log traffic to the given function `f`. When `f` is not nil,
 // the logging package begins operating at full verbosity (i.e. `V(n) == true`
@@ -24,13 +30,13 @@ func Intercept(ctx context.Context, f InterceptorFn) {
 	// TODO(tschottdorf): restore sanity so that all methods have a *loggingT
 	// receiver.
 	if f != nil {
-		logDepth(ctx, 0, Severity_WARNING, "log traffic is now intercepted; log files will be incomplete", nil)
+		logfDepth(ctx, 1, severity.WARNING, channel.DEV, "log traffic is now intercepted; log files will be incomplete")
 	}
 	logging.interceptor.Store(f) // intentionally also when f == nil
 	if f == nil {
-		logDepth(ctx, 0, Severity_INFO, "log interception is now stopped; normal logging resumes", nil)
+		logfDepth(ctx, 1, severity.INFO, channel.DEV, "log interception is now stopped; normal logging resumes")
 	}
 }
 
 // InterceptorFn is the type of function accepted by Intercept().
-type InterceptorFn func(entry Entry)
+type InterceptorFn func(entry logpb.Entry)

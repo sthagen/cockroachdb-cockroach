@@ -59,7 +59,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	crdberrors "github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -375,6 +374,7 @@ func TestChangefeedResolvedFrequency(t *testing.T) {
 // operation.
 func TestChangefeedInitialScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderRaceWithIssue(t, 57754, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
@@ -474,6 +474,7 @@ func TestChangefeedUserDefinedTypes(t *testing.T) {
 func TestChangefeedSchemaChangeNoBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderRace(t, "takes >1 min under race")
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
@@ -1882,6 +1883,16 @@ func TestChangefeedErrors(t *testing.T) {
 	)
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
 
+	// Feature flag for changefeeds is off — test that CREATE CHANGEFEED and
+	// EXPERIMENTAL CHANGEFEED FOR surface error.
+	sqlDB.Exec(t, `SET CLUSTER SETTING feature.changefeed.enabled = false`)
+	sqlDB.ExpectErr(t, `feature CHANGEFEED was disabled by the database administrator`,
+		`CREATE CHANGEFEED FOR foo`)
+	sqlDB.ExpectErr(t, `feature CHANGEFEED was disabled by the database administrator`,
+		`EXPERIMENTAL CHANGEFEED FOR foo`)
+
+	sqlDB.Exec(t, `SET CLUSTER SETTING feature.changefeed.enabled = true`)
+
 	sqlDB.ExpectErr(
 		t, `unknown format: nope`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH format=nope`,
@@ -1971,6 +1982,12 @@ func TestChangefeedErrors(t *testing.T) {
 		`CREATE CHANGEFEED FOR foo INTO 'kafka://nope'`,
 	)
 
+	// Test that a well-formed URI gets as far as unavailable kafka error.
+	sqlDB.ExpectErr(
+		t, `client has run out of available brokers`,
+		`CREATE CHANGEFEED FOR foo INTO 'kafka://nope/?tls_enabled=true&insecure_tls_skip_verify=true'`,
+	)
+
 	// kafka_topic_prefix was referenced by an old version of the RFC, it's
 	// "topic_prefix" now.
 	sqlDB.ExpectErr(
@@ -1988,6 +2005,10 @@ func TestChangefeedErrors(t *testing.T) {
 	sqlDB.ExpectErr(
 		t, `param tls_enabled must be a bool`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?tls_enabled=foo`,
+	)
+	sqlDB.ExpectErr(
+		t, `param insecure_tls_skip_verify must be a bool`,
+		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?tls_enabled=true&insecure_tls_skip_verify=foo`,
 	)
 	sqlDB.ExpectErr(
 		t, `param ca_cert must be base 64 encoded`,
@@ -2547,7 +2568,7 @@ func TestChangefeedProtectedTimestampsVerificationFails(t *testing.T) {
 				if err == nil {
 					return errors.Errorf("expected record to be removed")
 				}
-				if crdberrors.Is(err, protectedts.ErrNotExists) {
+				if errors.Is(err, protectedts.ErrNotExists) {
 					return nil
 				}
 				return err

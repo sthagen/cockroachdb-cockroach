@@ -55,8 +55,8 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 	"golang.org/x/time/rate"
 )
 
@@ -520,7 +520,7 @@ func TestInitializeEngineErrors(t *testing.T) {
 	require.NoError(t, WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
 
 	// Put some random garbage into the engine.
-	require.NoError(t, eng.Put(storage.MakeMVCCMetadataKey(roachpb.Key("foo")), []byte("bar")))
+	require.NoError(t, eng.PutUnversioned(roachpb.Key("foo"), []byte("bar")))
 
 	cfg := TestStoreConfig(nil)
 	cfg.Transport = NewDummyRaftTransport(cfg.Settings)
@@ -1134,19 +1134,13 @@ func TestStoreObservedTimestamp(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	badKey := []byte("a")
 	goodKey := []byte("b")
-	desc := roachpb.ReplicaDescriptor{
-		NodeID: 5,
-		// not relevant
-		StoreID:   1,
-		ReplicaID: 2,
-	}
 
 	testCases := []struct {
 		key   roachpb.Key
-		check func(int64, roachpb.Response, *roachpb.Error)
+		check func(int64, roachpb.NodeID, roachpb.Response, *roachpb.Error)
 	}{
 		{badKey,
-			func(wallNanos int64, _ roachpb.Response, pErr *roachpb.Error) {
+			func(wallNanos int64, nodeID roachpb.NodeID, _ roachpb.Response, pErr *roachpb.Error) {
 				if pErr == nil {
 					t.Fatal("expected an error")
 				}
@@ -1154,18 +1148,18 @@ func TestStoreObservedTimestamp(t *testing.T) {
 				if txn == nil || txn.ID == (uuid.UUID{}) {
 					t.Fatalf("expected nontrivial transaction in %s", pErr)
 				}
-				if ts, _ := txn.GetObservedTimestamp(desc.NodeID); ts.WallTime != wallNanos {
+				if ts, _ := txn.GetObservedTimestamp(nodeID); ts.WallTime != wallNanos {
 					t.Fatalf("unexpected observed timestamps, expected %d->%d but got map %+v",
-						desc.NodeID, wallNanos, txn.ObservedTimestamps)
+						nodeID, wallNanos, txn.ObservedTimestamps)
 				}
-				if pErr.OriginNode != desc.NodeID {
+				if pErr.OriginNode != nodeID {
 					t.Fatalf("unexpected OriginNode %d, expected %d",
-						pErr.OriginNode, desc.NodeID)
+						pErr.OriginNode, nodeID)
 				}
 
 			}},
 		{goodKey,
-			func(wallNanos int64, pReply roachpb.Response, pErr *roachpb.Error) {
+			func(wallNanos int64, nodeID roachpb.NodeID, pReply roachpb.Response, pErr *roachpb.Error) {
 				if pErr != nil {
 					t.Fatal(pErr)
 				}
@@ -1173,7 +1167,7 @@ func TestStoreObservedTimestamp(t *testing.T) {
 				if txn == nil || txn.ID == (uuid.UUID{}) {
 					t.Fatal("expected transactional response")
 				}
-				obs, _ := txn.GetObservedTimestamp(desc.NodeID)
+				obs, _ := txn.GetObservedTimestamp(nodeID)
 				if act, exp := obs.WallTime, wallNanos; exp != act {
 					t.Fatalf("unexpected observed wall time: %d, wanted %d", act, exp)
 				}
@@ -1196,14 +1190,11 @@ func TestStoreObservedTimestamp(t *testing.T) {
 			store := createTestStoreWithConfig(t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 			txn := newTransaction("test", test.key, 1, store.cfg.Clock)
 			txn.MaxTimestamp = hlc.MaxTimestamp
+			h := roachpb.Header{Txn: txn}
 			pArgs := putArgs(test.key, []byte("value"))
-			h := roachpb.Header{
-				Txn:     txn,
-				Replica: desc,
-			}
 			assignSeqNumsForReqs(txn, &pArgs)
 			pReply, pErr := kv.SendWrappedWith(context.Background(), store.TestSender(), h, &pArgs)
-			test.check(manual.UnixNano(), pReply, pErr)
+			test.check(manual.UnixNano(), store.NodeID(), pReply, pErr)
 		}()
 	}
 }
@@ -1231,7 +1222,7 @@ func TestStoreAnnotateNow(t *testing.T) {
 				if pErr == nil {
 					t.Fatal("expected an error")
 				}
-				if pErr.Now == (hlc.Timestamp{}) {
+				if pErr.Now.IsEmpty() {
 					t.Fatal("timestamp not annotated on error")
 				}
 			}},
@@ -1240,7 +1231,7 @@ func TestStoreAnnotateNow(t *testing.T) {
 				if pErr != nil {
 					t.Fatal(pErr)
 				}
-				if pReply.Now == (hlc.Timestamp{}) {
+				if pReply.Now.IsEmpty() {
 					t.Fatal("timestamp not annotated on batch response")
 				}
 			}},
@@ -1433,10 +1424,7 @@ func splitTestRange(store *Store, key, splitKey roachpb.RKey, t *testing.T) *Rep
 		rangeID, splitKey, repl.Desc().EndKey, repl.Desc().Replicas())
 	// Minimal amount of work to keep this deprecated machinery working: Write
 	// some required Raft keys.
-	_, err = stateloader.WriteInitialState(
-		ctx, store.engine, enginepb.MVCCStats{}, *rhsDesc, roachpb.Lease{},
-		hlc.Timestamp{}, stateloader.TruncatedStateUnreplicated,
-	)
+	err = stateloader.WriteInitialRangeState(ctx, store.engine, *rhsDesc)
 	require.NoError(t, err)
 	newRng, err := newReplica(ctx, rhsDesc, store, repl.ReplicaID())
 	require.NoError(t, err)
@@ -2941,10 +2929,7 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 	}
 
 	uninitDesc := roachpb.RangeDescriptor{RangeID: repl1.Desc().RangeID}
-	if _, err := stateloader.WriteInitialState(
-		ctx, s.Engine(), enginepb.MVCCStats{}, uninitDesc, roachpb.Lease{},
-		hlc.Timestamp{}, stateloader.TruncatedStateUnreplicated,
-	); err != nil {
+	if err := stateloader.WriteInitialRangeState(ctx, s.Engine(), uninitDesc); err != nil {
 		t.Fatal(err)
 	}
 	uninitRepl1, err := newReplica(ctx, &uninitDesc, s, 2)

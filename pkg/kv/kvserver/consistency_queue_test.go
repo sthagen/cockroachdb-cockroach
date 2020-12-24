@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -439,10 +440,12 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 		assert.NoError(t, err)
 		defer cpEng.Close()
 
-		iter := cpEng.NewIterator(storage.IterOptions{UpperBound: []byte("\xff")})
+		iter := cpEng.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: []byte("\xff")})
 		defer iter.Close()
 
-		ms, err := storage.ComputeStatsGo(iter, roachpb.KeyMin, roachpb.KeyMax, 0 /* nowNanos */)
+		// The range is specified using only global keys, since the implementation
+		// may use an intentInterleavingIter.
+		ms, err := storage.ComputeStatsForRange(iter, keys.LocalMax, roachpb.KeyMax, 0 /* nowNanos */)
 		assert.NoError(t, err)
 
 		assert.NotZero(t, ms.KeyBytes)
@@ -645,7 +648,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 	for i := 1; i < numNodes; i++ {
 		targets = append(targets, tc.Target(i))
 	}
-	if _, err := tc.AddReplicas(key, targets...); err != nil {
+	if _, err := tc.AddVoters(key, targets...); err != nil {
 		t.Fatal(err)
 	}
 

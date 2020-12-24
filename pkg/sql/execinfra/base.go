@@ -21,11 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/opentracing/opentracing-go"
 )
 
 // RowChannelBufSize is the default buffer size of a RowChannel.
@@ -236,8 +236,8 @@ func DrainAndForwardMetadata(ctx context.Context, src RowSource, dst RowReceiver
 
 // GetTraceData returns the trace data.
 func GetTraceData(ctx context.Context) []tracingpb.RecordedSpan {
-	if sp := opentracing.SpanFromContext(ctx); sp != nil {
-		return tracing.GetRecording(sp)
+	if sp := tracing.SpanFromContext(ctx); sp != nil {
+		return sp.GetRecording()
 	}
 	return nil
 }
@@ -395,7 +395,7 @@ func (rb *rowSourceBase) consumerDone() {
 func (rb *rowSourceBase) consumerClosed(name string) {
 	status := ConsumerStatus(atomic.LoadUint32((*uint32)(&rb.ConsumerStatus)))
 	if status == ConsumerClosed {
-		log.ReportOrPanic(context.Background(), nil, "%s already closed", log.Safe(name))
+		logcrash.ReportOrPanic(context.Background(), nil, "%s already closed", log.Safe(name))
 	}
 	atomic.StoreUint32((*uint32)(&rb.ConsumerStatus), uint32(ConsumerClosed))
 }
@@ -403,8 +403,6 @@ func (rb *rowSourceBase) consumerClosed(name string) {
 // RowChannel is a thin layer over a RowChannelMsg channel, which can be used to
 // transfer rows between goroutines.
 type RowChannel struct {
-	rowSourceBase
-
 	types []*types.T
 
 	// The channel on which rows are delivered.
@@ -412,6 +410,8 @@ type RowChannel struct {
 
 	// dataChan is the same channel as C.
 	dataChan chan RowChannelMsg
+
+	rowSourceBase
 
 	// numSenders is an atomic counter that keeps track of how many senders have
 	// yet to call ProducerDone().

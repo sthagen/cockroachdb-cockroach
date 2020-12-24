@@ -225,16 +225,6 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			n.plan = v.visit(n.plan)
 		}
 
-	case *explainDistSQLNode:
-		// We check whether planNode is nil because the plan might be
-		// represented physically. We don't yet have a walker over such
-		// representation, so we simply short-circuit.
-		// TODO(yuzefovich): implement that walker and use it here.
-		if n.plan.main.planNode == nil {
-			return
-		}
-		n.plan.main.planNode = v.visit(n.plan.main.planNode)
-
 	case *explainVecNode:
 		// We check whether planNode is nil because the plan might be
 		// represented physically. We don't yet have a walker over such
@@ -375,7 +365,6 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&DropRoleNode{}):                "drop user/role",
 	reflect.TypeOf(&dropViewNode{}):                "drop view",
 	reflect.TypeOf(&errorIfRowsNode{}):             "error if rows",
-	reflect.TypeOf(&explainDistSQLNode{}):          "explain distsql",
 	reflect.TypeOf(&explainPlanNode{}):             "explain plan",
 	reflect.TypeOf(&explainVecNode{}):              "explain vectorized",
 	reflect.TypeOf(&exportNode{}):                  "export",
@@ -403,7 +392,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&renameDatabaseNode{}):          "rename database",
 	reflect.TypeOf(&renameIndexNode{}):             "rename index",
 	reflect.TypeOf(&renameTableNode{}):             "rename table",
-	reflect.TypeOf(&reparentDatabaseNode{}):        "TODO (rohany): fill out",
+	reflect.TypeOf(&reparentDatabaseNode{}):        "reparent database",
 	reflect.TypeOf(&renderNode{}):                  "render",
 	reflect.TypeOf(&RevokeRoleNode{}):              "revoke role",
 	reflect.TypeOf(&rowCountNode{}):                "count",

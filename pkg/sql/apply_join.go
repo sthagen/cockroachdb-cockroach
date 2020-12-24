@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -86,6 +85,8 @@ func newApplyJoinNode(
 		return nil, errors.AssertionFailedf("unsupported right outer apply join: %d", log.Safe(joinType))
 	case descpb.ExceptAllJoin, descpb.IntersectAllJoin:
 		return nil, errors.AssertionFailedf("unsupported apply set op: %d", log.Safe(joinType))
+	case descpb.RightSemiJoin, descpb.RightAntiJoin:
+		return nil, errors.AssertionFailedf("unsupported right semi/anti apply join: %d", log.Safe(joinType))
 	}
 
 	return &applyJoinNode{
@@ -236,9 +237,7 @@ func runPlanInsidePlan(
 		params.ctx, rowResultWriter, tree.Rows,
 		params.extendedEvalCtx.ExecCfg.RangeDescriptorCache,
 		params.p.Txn(),
-		func(ts hlc.Timestamp) {
-			params.extendedEvalCtx.ExecCfg.Clock.Update(ts)
-		},
+		params.extendedEvalCtx.ExecCfg.Clock,
 		params.p.extendedEvalCtx.Tracing,
 	)
 	defer recv.Release()

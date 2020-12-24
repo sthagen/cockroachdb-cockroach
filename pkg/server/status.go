@@ -40,7 +40,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -56,6 +57,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -63,12 +65,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	grpcstatus "google.golang.org/grpc/status"
 )
 
 const (
@@ -102,7 +103,7 @@ var (
 
 	// Error used to convey that remote debugging is needs to be enabled for an
 	// endpoint to be usable.
-	remoteDebuggingErr = grpcstatus.Error(
+	remoteDebuggingErr = status.Error(
 		codes.PermissionDenied, "not allowed (due to the 'server.remote_debugging.mode' setting)")
 
 	// Counter to count accesses to the prometheus vars endpoint /_status/vars .
@@ -151,31 +152,36 @@ func (b *baseStatusServer) getLocalSessions(
 		return nil, err
 	}
 
+	reqUsername, err := security.MakeSQLUsernameFromPreNormalizedStringChecked(req.Username)
+	if err != nil {
+		return nil, err
+	}
+
 	if !isAdmin && !hasViewActivity {
 		// For non-superusers, requests with an empty username is
 		// implicitly a request for the client's own sessions.
-		if req.Username == "" {
-			req.Username = sessionUser
+		if reqUsername.Undefined() {
+			reqUsername = sessionUser
 		}
 
 		// Non-superusers are not allowed to query sessions others than their own.
-		if sessionUser != req.Username {
-			return nil, grpcstatus.Errorf(
+		if sessionUser != reqUsername {
+			return nil, status.Errorf(
 				codes.PermissionDenied,
 				"client user %q does not have permission to view sessions from user %q",
-				sessionUser, req.Username)
+				sessionUser, reqUsername)
 		}
 	}
 
 	// The empty username means "all sessions".
-	showAll := req.Username == ""
+	showAll := reqUsername.Undefined()
 
 	registry := b.sessionRegistry
 	sessions := registry.SerializeAll()
 	userSessions := make([]serverpb.Session, 0, len(sessions))
 
 	for _, session := range sessions {
-		if req.Username != session.Username && !showAll {
+		if reqUsername.Normalized() != session.Username && !showAll {
 			continue
 		}
 
@@ -221,18 +227,18 @@ func findSessionByQueryID(queryID string) sessionFinder {
 }
 
 func (b *baseStatusServer) checkCancelPrivilege(
-	ctx context.Context, username string, findSession sessionFinder,
+	ctx context.Context, username security.SQLUsername, findSession sessionFinder,
 ) error {
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = b.AnnotateCtx(ctx)
 	// reqUser is the user who made the cancellation request.
-	var reqUser string
+	var reqUser security.SQLUsername
 	{
 		sessionUser, isAdmin, err := b.privilegeChecker.getUserAndRole(ctx)
 		if err != nil {
 			return err
 		}
-		if username == "" || username == sessionUser {
+		if username.Undefined() || username == sessionUser {
 			reqUser = sessionUser
 		} else {
 			// When CANCEL QUERY is run as a SQL statement, sessionUser is always root
@@ -256,7 +262,8 @@ func (b *baseStatusServer) checkCancelPrivilege(
 			return err
 		}
 
-		if session.Username != reqUser {
+		sessionUser := security.MakeSQLUsernameFromPreNormalizedString(session.Username)
+		if sessionUser != reqUser {
 			// Must have CANCELQUERY privilege to cancel other users'
 			// sessions/queries.
 			ok, err := b.privilegeChecker.hasRoleOption(ctx, reqUser, roleoption.CANCELQUERY)
@@ -267,7 +274,7 @@ func (b *baseStatusServer) checkCancelPrivilege(
 				return errRequiresRoleOption(roleoption.CANCELQUERY)
 			}
 			// Non-admins cannot cancel admins' sessions/queries.
-			isAdminSession, err := b.privilegeChecker.hasAdminRole(ctx, session.Username)
+			isAdminSession, err := b.privilegeChecker.hasAdminRole(ctx, sessionUser)
 			if err != nil {
 				return err
 			}
@@ -290,7 +297,7 @@ type statusServer struct {
 	db                       *kv.DB
 	gossip                   *gossip.Gossip
 	metricSource             metricMarshaler
-	nodeLiveness             *kvserver.NodeLiveness
+	nodeLiveness             *liveness.NodeLiveness
 	storePool                *kvserver.StorePool
 	rpcCtx                   *rpc.Context
 	stores                   *kvserver.Stores
@@ -320,7 +327,7 @@ func newStatusServer(
 	db *kv.DB,
 	gossip *gossip.Gossip,
 	metricSource metricMarshaler,
-	nodeLiveness *kvserver.NodeLiveness,
+	nodeLiveness *liveness.NodeLiveness,
 	storePool *kvserver.StorePool,
 	rpcCtx *rpc.Context,
 	stores *kvserver.Stores,
@@ -420,7 +427,7 @@ func (s *statusServer) Gossip(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if local {
@@ -446,7 +453,7 @@ func (s *statusServer) EngineStats(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
@@ -493,7 +500,7 @@ func (s *statusServer) Allocator(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
@@ -557,7 +564,7 @@ func (s *statusServer) Allocator(
 		return nil
 	})
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 	return output, nil
 }
@@ -643,7 +650,7 @@ func (s *statusServer) AllocatorRange(
 					return nil
 				})
 			}); err != nil {
-			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+			return nil, status.Errorf(codes.Internal, err.Error())
 		}
 	}
 
@@ -662,7 +669,7 @@ func (s *statusServer) AllocatorRange(
 				}, nil
 			}
 		case <-ctx.Done():
-			return nil, grpcstatus.Errorf(codes.DeadlineExceeded, "request timed out")
+			return nil, status.Errorf(codes.DeadlineExceeded, "request timed out")
 		}
 	}
 
@@ -677,7 +684,7 @@ func (s *statusServer) AllocatorRange(
 			}
 			fmt.Fprintf(&buf, "n%d: %s", nodeID, err)
 		}
-		return nil, grpcstatus.Errorf(codes.Internal, buf.String())
+		return nil, status.Errorf(codes.Internal, buf.String())
 	}
 	return &serverpb.AllocatorRangeResponse{}, nil
 }
@@ -695,7 +702,7 @@ func (s *statusServer) Certificates(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if s.cfg.Insecure {
@@ -815,7 +822,7 @@ func (s *statusServer) Details(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
@@ -858,7 +865,7 @@ func (s *statusServer) GetFiles(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
@@ -877,19 +884,19 @@ func (s *statusServer) GetFiles(
 	case serverpb.FileType_GOROUTINES: // Requesting for saved Goroutine dumps.
 		dir = s.admin.server.cfg.GoroutineDumpDirName
 	default:
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "unknown file type: %s", req.Type)
+		return nil, status.Errorf(codes.InvalidArgument, "unknown file type: %s", req.Type)
 	}
 	if dir == "" {
-		return nil, grpcstatus.Errorf(codes.Unimplemented, "dump directory not configured: %s", req.Type)
+		return nil, status.Errorf(codes.Unimplemented, "dump directory not configured: %s", req.Type)
 	}
 	var resp serverpb.GetFilesResponse
 	for _, pattern := range req.Patterns {
 		if err := checkFilePattern(pattern); err != nil {
-			return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+			return nil, status.Errorf(codes.InvalidArgument, err.Error())
 		}
 		filepaths, err := filepath.Glob(filepath.Join(dir, pattern))
 		if err != nil {
-			return nil, grpcstatus.Errorf(codes.InvalidArgument, "bad pattern: %s", pattern)
+			return nil, status.Errorf(codes.InvalidArgument, "bad pattern: %s", pattern)
 		}
 
 		for _, path := range filepaths {
@@ -898,7 +905,7 @@ func (s *statusServer) GetFiles(
 			if !req.ListOnly {
 				contents, err = ioutil.ReadFile(path)
 				if err != nil {
-					return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+					return nil, status.Errorf(codes.Internal, err.Error())
 				}
 			}
 			resp.Files = append(resp.Files,
@@ -930,7 +937,7 @@ func (s *statusServer) LogFilesList(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
@@ -964,7 +971,7 @@ func (s *statusServer) LogFile(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
@@ -975,7 +982,7 @@ func (s *statusServer) LogFile(
 	}
 
 	// Determine how to redact.
-	inputEditMode := log.SelectEditMode(req.Redact, req.KeepRedactable)
+	inputEditMode := log.SelectEditMode(req.Redact, log.KeepRedactable)
 
 	// Ensure that the latest log entries are available in files.
 	log.Flush()
@@ -987,10 +994,10 @@ func (s *statusServer) LogFile(
 	}
 	defer reader.Close()
 
-	var entry log.Entry
 	var resp serverpb.LogEntriesResponse
 	decoder := log.NewEntryDecoder(reader, inputEditMode)
 	for {
+		var entry logpb.Entry
 		if err := decoder.Decode(&entry); err != nil {
 			if err == io.EOF {
 				break
@@ -998,13 +1005,6 @@ func (s *statusServer) LogFile(
 			return nil, err
 		}
 		resp.Entries = append(resp.Entries, entry)
-	}
-
-	// Erase the redactable bit if requested by client.
-	if !req.KeepRedactable {
-		for i := range resp.Entries {
-			resp.Entries[i].Redactable = false
-		}
 	}
 
 	return &resp, nil
@@ -1057,7 +1057,7 @@ func (s *statusServer) Logs(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
@@ -1068,37 +1068,37 @@ func (s *statusServer) Logs(
 	}
 
 	// Determine how to redact.
-	inputEditMode := log.SelectEditMode(req.Redact, req.KeepRedactable)
+	inputEditMode := log.SelectEditMode(req.Redact, log.KeepRedactable)
 
 	// Select the time interval.
 	startTimestamp, err := parseInt64WithDefault(
 		req.StartTime,
 		timeutil.Now().AddDate(0, 0, -1).UnixNano())
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "StartTime could not be parsed: %s", err)
+		return nil, status.Errorf(codes.InvalidArgument, "StartTime could not be parsed: %s", err)
 	}
 
 	endTimestamp, err := parseInt64WithDefault(req.EndTime, timeutil.Now().UnixNano())
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "EndTime could not be parsed: %s", err)
+		return nil, status.Errorf(codes.InvalidArgument, "EndTime could not be parsed: %s", err)
 	}
 
 	if startTimestamp > endTimestamp {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "StartTime: %d should not be greater than endtime: %d", startTimestamp, endTimestamp)
+		return nil, status.Errorf(codes.InvalidArgument, "StartTime: %d should not be greater than endtime: %d", startTimestamp, endTimestamp)
 	}
 
 	maxEntries, err := parseInt64WithDefault(req.Max, defaultMaxLogEntries)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "Max could not be parsed: %s", err)
+		return nil, status.Errorf(codes.InvalidArgument, "Max could not be parsed: %s", err)
 	}
 	if maxEntries < 1 {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "Max: %d should be set to a value greater than 0", maxEntries)
+		return nil, status.Errorf(codes.InvalidArgument, "Max: %d should be set to a value greater than 0", maxEntries)
 	}
 
 	var regex *regexp.Regexp
 	if len(req.Pattern) > 0 {
 		if regex, err = regexp.Compile(req.Pattern); err != nil {
-			return nil, grpcstatus.Errorf(codes.InvalidArgument, "regex pattern could not be compiled: %s", err)
+			return nil, status.Errorf(codes.InvalidArgument, "regex pattern could not be compiled: %s", err)
 		}
 	}
 
@@ -1110,13 +1110,6 @@ func (s *statusServer) Logs(
 		startTimestamp, endTimestamp, int(maxEntries), regex, inputEditMode)
 	if err != nil {
 		return nil, err
-	}
-
-	// Erase the redactable bit if requested by client.
-	if !req.KeepRedactable {
-		for i := range entries {
-			entries[i].Redactable = false
-		}
 	}
 
 	return &serverpb.LogEntriesResponse{Entries: entries}, nil
@@ -1138,7 +1131,7 @@ func (s *statusServer) Stacks(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
@@ -1166,7 +1159,7 @@ func (s *statusServer) Stacks(
 	case serverpb.StacksType_THREAD_STACKS:
 		return &serverpb.JSONResponse{Data: []byte(storage.ThreadStacks())}, nil
 	default:
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "unknown stacks type: %s", req.Type)
+		return nil, status.Errorf(codes.InvalidArgument, "unknown stacks type: %s", req.Type)
 	}
 }
 
@@ -1186,7 +1179,7 @@ func (s *statusServer) Profile(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
@@ -1201,11 +1194,11 @@ func (s *statusServer) Profile(
 	case serverpb.ProfileRequest_HEAP:
 		p := pprof.Lookup("heap")
 		if p == nil {
-			return nil, grpcstatus.Errorf(codes.InvalidArgument, "unable to find profile: heap")
+			return nil, status.Errorf(codes.InvalidArgument, "unable to find profile: heap")
 		}
 		var buf bytes.Buffer
 		if err := p.WriteTo(&buf, 0); err != nil {
-			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+			return nil, status.Errorf(codes.Internal, err.Error())
 		}
 		return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
 	case serverpb.ProfileRequest_CPU:
@@ -1230,7 +1223,7 @@ func (s *statusServer) Profile(
 		}
 		return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
 	default:
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "unknown profile: %s", req.Type)
+		return nil, status.Errorf(codes.InvalidArgument, "unknown profile: %s", req.Type)
 	}
 }
 
@@ -1253,7 +1246,7 @@ func (s *statusServer) Nodes(
 	b.Scan(startKey, endKey)
 	if err := s.db.Run(ctx, b); err != nil {
 		log.Errorf(ctx, "%v", err)
-		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 	rows := b.Results[0].Rows
 
@@ -1263,7 +1256,7 @@ func (s *statusServer) Nodes(
 	for i, row := range rows {
 		if err := row.ValueProto(&resp.Nodes[i]); err != nil {
 			log.Errorf(ctx, "%v", err)
-			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+			return nil, status.Errorf(codes.Internal, err.Error())
 		}
 	}
 
@@ -1288,7 +1281,7 @@ func (s *statusServer) nodesStatusWithLiveness(
 	for _, node := range nodes.Nodes {
 		nodeID := node.Desc.NodeID
 		livenessStatus := statusMap[nodeID]
-		if livenessStatus == kvserverpb.NodeLivenessStatus_DECOMMISSIONED {
+		if livenessStatus == livenesspb.NodeLivenessStatus_DECOMMISSIONED {
 			// Skip over removed nodes.
 			continue
 		}
@@ -1303,7 +1296,7 @@ func (s *statusServer) nodesStatusWithLiveness(
 // nodeStatusWithLiveness combines a NodeStatus with a NodeLivenessStatus.
 type nodeStatusWithLiveness struct {
 	statuspb.NodeStatus
-	livenessStatus kvserverpb.NodeLivenessStatus
+	livenessStatus livenesspb.NodeLivenessStatus
 }
 
 // handleNodeStatus handles GET requests for a single node's status.
@@ -1314,7 +1307,7 @@ func (s *statusServer) Node(
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, _, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	key := keys.NodeStatusKey(nodeID)
@@ -1322,14 +1315,14 @@ func (s *statusServer) Node(
 	b.Get(key)
 	if err := s.db.Run(ctx, b); err != nil {
 		log.Errorf(ctx, "%v", err)
-		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 
 	var nodeStatus statuspb.NodeStatus
 	if err := b.Results[0].Rows[0].ValueProto(&nodeStatus); err != nil {
 		err = errors.Errorf("could not unmarshal NodeStatus from %s: %s", key, err)
 		log.Errorf(ctx, "%v", err)
-		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 	return &nodeStatus, nil
 }
@@ -1342,7 +1335,7 @@ func (s *statusServer) Metrics(
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
@@ -1452,20 +1445,46 @@ func (s *statusServer) RaftDebug(
 
 type varsHandler struct {
 	metricSource metricMarshaler
+	st           *cluster.Settings
 }
 
 func (h varsHandler) handleVars(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
 	w.Header().Set(httputil.ContentTypeHeader, httputil.PlaintextContentType)
 	err := h.metricSource.PrintAsText(w)
 	if err != nil {
-		log.Errorf(r.Context(), "%v", err)
+		log.Errorf(ctx, "%v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+
+	h.appendLicenseExpiryMetric(ctx, w)
 	telemetry.Inc(telemetryPrometheusVars)
 }
 
+// appendLicenseExpiryMetric computes the seconds until the enterprise licence
+// expires on this clusters. the license expiry metric is computed on-demand
+// since it's not regularly computed as part of running the cluster unless
+// enterprise features are accessed.
+func (h varsHandler) appendLicenseExpiryMetric(ctx context.Context, w io.Writer) {
+	durationToExpiry, err := base.TimeToEnterpriseLicenseExpiry(ctx, h.st, timeutil.Now())
+	if err != nil {
+		log.Errorf(ctx, "unable to generate time to license expiry: %v", err)
+		return
+	}
+
+	secondsToExpiry := int64(durationToExpiry / time.Second)
+
+	_, err = w.Write([]byte(
+		fmt.Sprintf("seconds_until_enterprise_license_expiry %d\n", secondsToExpiry),
+	))
+	if err != nil {
+		log.Errorf(ctx, "problem writing license expiry metric: %v", err)
+	}
+}
+
 func (s *statusServer) handleVars(w http.ResponseWriter, r *http.Request) {
-	varsHandler{s.metricSource}.handleVars(w, r)
+	varsHandler{s.metricSource, s.st}.handleVars(w, r)
 }
 
 // Ranges returns range info for the specified node.
@@ -1481,7 +1500,7 @@ func (s *statusServer) Ranges(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
@@ -1626,7 +1645,7 @@ func (s *statusServer) Ranges(
 		return nil
 	})
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 	return &output, nil
 }
@@ -1918,7 +1937,7 @@ func (s *statusServer) CancelSession(
 ) (*serverpb.CancelSessionResponse, error) {
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
@@ -1929,7 +1948,12 @@ func (s *statusServer) CancelSession(
 		return status.CancelSession(ctx, req)
 	}
 
-	if err := s.checkCancelPrivilege(ctx, req.Username, findSessionBySessionID(req.SessionID)); err != nil {
+	reqUsername, err := security.MakeSQLUsernameFromPreNormalizedStringChecked(req.Username)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.checkCancelPrivilege(ctx, reqUsername, findSessionBySessionID(req.SessionID)); err != nil {
 		return nil, err
 	}
 
@@ -1943,7 +1967,7 @@ func (s *statusServer) CancelQuery(
 ) (*serverpb.CancelQueryResponse, error) {
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 	if !local {
 		// This request needs to be forwarded to another node.
@@ -1956,7 +1980,12 @@ func (s *statusServer) CancelQuery(
 		return status.CancelQuery(ctx, req)
 	}
 
-	if err := s.checkCancelPrivilege(ctx, req.Username, findSessionByQueryID(req.QueryID)); err != nil {
+	reqUsername, err := security.MakeSQLUsernameFromPreNormalizedStringChecked(req.Username)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.checkCancelPrivilege(ctx, reqUsername, findSessionByQueryID(req.QueryID)); err != nil {
 		return nil, err
 	}
 
@@ -1982,7 +2011,7 @@ func (s *statusServer) SpanStats(
 
 	nodeID, local, err := s.parseNodeID(req.NodeID)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
@@ -2019,7 +2048,7 @@ func (s *statusServer) Diagnostics(
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
@@ -2046,7 +2075,7 @@ func (s *statusServer) Stores(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
@@ -2121,25 +2150,28 @@ func marshalJSONResponse(value interface{}) (*serverpb.JSONResponse, error) {
 	return &serverpb.JSONResponse{Data: data}, nil
 }
 
-func userFromContext(ctx context.Context) (string, error) {
+func userFromContext(ctx context.Context) (res security.SQLUsername, err error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		// If the incoming context has metadata but no attached web session user,
 		// it's a gRPC / internal SQL connection which has root on the cluster.
-		return security.RootUser, nil
+		return security.RootUserName(), nil
 	}
 	usernames, ok := md[webSessionUserKeyStr]
 	if !ok {
 		// If the incoming context has metadata but no attached web session user,
 		// it's a gRPC / internal SQL connection which has root on the cluster.
-		return security.RootUser, nil
+		return security.RootUserName(), nil
 	}
 	if len(usernames) != 1 {
 		log.Warningf(ctx, "context's incoming metadata contains unexpected number of usernames: %+v ", md)
-		return "", fmt.Errorf(
+		return res, fmt.Errorf(
 			"context's incoming metadata contains unexpected number of usernames: %+v ", md)
 	}
-	return usernames[0], nil
+	// At this point the user is already logged in, so we can assume
+	// the username has been normalized already.
+	username := security.MakeSQLUsernameFromPreNormalizedString(usernames[0])
+	return username, nil
 }
 
 type systemInfoOnce struct {
@@ -2193,7 +2225,7 @@ func (s *statusServer) JobRegistryStatus(
 
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)

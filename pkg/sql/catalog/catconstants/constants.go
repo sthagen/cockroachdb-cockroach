@@ -75,10 +75,14 @@ const (
 	CrdbInternalTxnStatsTableID
 	CrdbInternalZonesTableID
 	CrdbInternalInvalidDescriptorsTableID
+	CrdbInternalClusterDatabasePrivilegesTableID
 	InformationSchemaID
 	InformationSchemaAdministrableRoleAuthorizationsID
 	InformationSchemaApplicableRolesID
+	InformationSchemaCharacterSets
 	InformationSchemaCheckConstraints
+	InformationSchemaCollationCharacterSetApplicability
+	InformationSchemaCollations
 	InformationSchemaColumnPrivilegesID
 	InformationSchemaColumnsTableID
 	InformationSchemaColumnUDTUsageID
@@ -91,6 +95,7 @@ const (
 	InformationSchemaRoutineTableID
 	InformationSchemaSchemataTableID
 	InformationSchemaSchemataTablePrivilegesID
+	InformationSchemaSessionVariables
 	InformationSchemaSequencesID
 	InformationSchemaStatisticsTableID
 	InformationSchemaTableConstraintTableID
@@ -130,6 +135,7 @@ const (
 	PgCatalogLocksTableID
 	PgCatalogMatViewsTableID
 	PgCatalogNamespaceTableID
+	PgCatalogOpclassTableID
 	PgCatalogOperatorTableID
 	PgCatalogPreparedStatementsTableID
 	PgCatalogPreparedXactsTableID

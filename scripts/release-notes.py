@@ -157,7 +157,7 @@ relnotetitles = {
     'cli change': "Command-line changes",
     'sql change': "SQL language changes",
     'api change': "API endpoint changes",
-    'admin ui change': "Admin UI changes",
+    'ui change': "DB Console changes",
     'general change': "General changes",
     'build change': "Build changes",
     'enterprise change': "Enterprise edition changes",
@@ -176,7 +176,7 @@ relnote_sec_order = [
     'sql change',
     'cli change',
     'api change',
-    'admin ui change',
+    'ui change',
     'bug fix',
     'performance improvement',
     'build change',
@@ -190,7 +190,8 @@ cat_misspells = {
     'bugfix': 'bug fix',
     'performance change': 'performance improvement',
     'performance': 'performance improvement',
-    'ui': 'admin ui change',
+    'ui': 'ui change',
+    'admin ui': 'ui change',
     'api': 'api change',
     'http': 'api change',
     'backwards-incompatible change': 'backward-incompatible change',
@@ -269,6 +270,8 @@ parser.add_option("--exclude-until", dest="exclude_until_commit",
                   help="exclude history ending at COMMIT", metavar="COMMIT")
 parser.add_option("--one-line", dest="one_line", action="store_true", default=False,
                   help="unwrap release notes on a single line")
+parser.add_option("--prod-release", dest="prod_release", action="store_true", default=False,
+                  help="identify release as production (e.g., v20.2.x) and omit '-unstable' from docker pull command")
 
 (options, args) = parser.parse_args()
 
@@ -832,6 +835,13 @@ if not hideheader:
 
 # Print the release notes sign-up and Downloads section.
 
+if options.prod_release:
+    print("""DOCS WRITER: PLEASE UPDATE THE VERSIONS AND LINKS IN THIS INTRO: This page lists additions and changes in <current release> since <previous_version>.
+
+- For a comprehensive summary of features in v20.2, see the [v20.2 GA release notes](v20.2.0.html).
+- To upgrade to v20.2, see [Upgrade to CockroachDB v20.2](../v20.2/upgrade-cockroach-version.html).
+""")
+
 if not hidedownloads:
     print("""Get future release notes emailed to you:
 
@@ -863,7 +873,7 @@ if not hidedownloads:
 
 {% include copy-clipboard.html %}
 ~~~shell
-$ docker pull cockroachdb/cockroach""" + ("-unstable:" if "-" in current_version else ":") + current_version + """
+$ docker pull cockroachdb/cockroach""" + (":" if options.prod_release else "-unstable:") + current_version + """
 ~~~
 """)
     print()

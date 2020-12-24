@@ -49,11 +49,11 @@ var validTableDesc = &descpb.Descriptor{
 				ColumnNames:      []string{"col"},
 				ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				ColumnIDs:        []descpb.ColumnID{1},
-				Version:          descpb.SecondaryIndexFamilyFormatVersion,
+				Version:          descpb.EmptyArraysInInvertedIndexesVersion,
 			},
 			NextIndexID: 2,
 			Privileges: descpb.NewCustomSuperuserPrivilegeDescriptor(
-				descpb.SystemAllowedPrivileges[keys.SqllivenessID], security.NodeUser),
+				descpb.SystemAllowedPrivileges[keys.SqllivenessID], security.NodeUserName()),
 			FormatVersion:  descpb.InterleavedFormatVersion,
 			NextMutationID: 1,
 		},

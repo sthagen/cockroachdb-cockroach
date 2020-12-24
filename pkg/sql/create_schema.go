@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
@@ -37,6 +38,14 @@ func (n *createSchemaNode) startExec(params runParams) error {
 }
 
 func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema) error {
+	if err := checkSchemaChangeEnabled(
+		p.EvalContext().Context,
+		p.ExecCfg(),
+		"CREATE SCHEMA",
+	); err != nil {
+		return err
+	}
+
 	// Users can't create a schema without being connected to a DB.
 	if p.CurrentDatabase() == "" {
 		return pgerror.New(pgcode.UndefinedDatabase,
@@ -44,8 +53,13 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 	}
 
 	sqltelemetry.IncrementUserDefinedSchemaCounter(sqltelemetry.UserDefinedSchemaCreate)
+	dbName := p.CurrentDatabase()
+	if n.Schema.ExplicitCatalog {
+		dbName = n.Schema.Catalog()
+	}
 
-	db, err := p.ResolveMutableDatabaseDescriptor(params.ctx, p.CurrentDatabase(), true /* required */)
+	_, db, err := p.Descriptors().GetMutableDatabaseByName(params.ctx, p.txn, dbName,
+		tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return err
 	}
@@ -59,9 +73,11 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 		return err
 	}
 
-	schemaName := string(n.Schema)
-	if n.Schema == "" {
-		schemaName = n.AuthRole
+	var schemaName string
+	if !n.Schema.ExplicitSchema {
+		schemaName = n.AuthRole.Normalized()
+	} else {
+		schemaName = n.Schema.Schema()
 	}
 
 	// Ensure there aren't any name collisions.
@@ -83,10 +99,10 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 	}
 
 	// Ensure that the cluster version is high enough to create the schema.
-	if !params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.VersionUserDefinedSchemas) {
+	if !params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.UserDefinedSchemas) {
 		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 			`creating schemas requires all nodes to be upgraded to %s`,
-			clusterversion.VersionByKey(clusterversion.VersionUserDefinedSchemas))
+			clusterversion.ByKey(clusterversion.UserDefinedSchemas))
 	}
 
 	// Create the ID.
@@ -102,7 +118,7 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 		privs.Users[i].Privileges &= privilege.SchemaPrivileges.ToBitField()
 	}
 
-	if n.AuthRole != "" {
+	if !n.AuthRole.Undefined() {
 		exists, err := p.RoleExists(params.ctx, n.AuthRole)
 		if err != nil {
 			return err
@@ -112,7 +128,7 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 		}
 		privs.SetOwner(n.AuthRole)
 	} else {
-		privs.SetOwner(params.SessionData().User)
+		privs.SetOwner(params.SessionData().User())
 	}
 
 	// Create the SchemaDescriptor.
@@ -151,18 +167,14 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 	); err != nil {
 		return err
 	}
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogCreateSchema,
-		int32(desc.GetID()),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			SchemaName string
-			Owner      string
-			User       string
-		}{schemaName, privs.Owner, params.SessionData().User},
-	)
+	return params.p.logEvent(params.ctx,
+		desc.GetID(),
+		// TODO(knz): This is missing some details about the database.
+		// See: https://github.com/cockroachdb/cockroach/issues/57738
+		&eventpb.CreateSchema{
+			SchemaName: schemaName,
+			Owner:      privs.Owner().Normalized(),
+		})
 }
 
 func (*createSchemaNode) Next(runParams) (bool, error) { return false, nil }
@@ -171,6 +183,14 @@ func (n *createSchemaNode) Close(ctx context.Context)  {}
 
 // CreateSchema creates a schema.
 func (p *planner) CreateSchema(ctx context.Context, n *tree.CreateSchema) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"CREATE SCHEMA",
+	); err != nil {
+		return nil, err
+	}
+
 	return &createSchemaNode{
 		n: n,
 	}, nil

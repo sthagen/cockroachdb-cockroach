@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors/oserror"
 )
 
 // Note: most benchmarks in this package have an engine-specific Benchmark
@@ -166,7 +167,7 @@ func loadTestData(dir string, numKeys, numBatches, batchTimeSpan, valueBytes int
 	ctx := context.Background()
 
 	exists := true
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
+	if _, err := os.Stat(dir); oserror.IsNotExist(err) {
 		exists = false
 	}
 
@@ -262,7 +263,7 @@ func setupMVCCData(
 	}
 
 	exists := true
-	if _, err := os.Stat(loc); os.IsNotExist(err) {
+	if _, err := os.Stat(loc); oserror.IsNotExist(err) {
 		exists = false
 	} else if err != nil {
 		b.Fatal(err)
@@ -408,7 +409,7 @@ func runMVCCScan(ctx context.Context, b *testing.B, emk engineMaker, opts benchS
 		// Pull all of the sstables into the RocksDB cache in order to make the
 		// timings more stable. Otherwise, the first run will be penalized pulling
 		// data into the cache while later runs will not.
-		iter := eng.NewIterator(IterOptions{UpperBound: roachpb.KeyMax})
+		iter := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{UpperBound: roachpb.KeyMax})
 		_, _ = iter.ComputeStats(roachpb.KeyMin, roachpb.KeyMax, 0)
 		iter.Close()
 	}
@@ -829,7 +830,7 @@ func runClearRange(
 	//
 	// TODO(benesch): when those hacks are removed, don't bother computing the
 	// first key and simply ClearRange(NilKey, MVCCKeyMax).
-	iter := eng.NewIterator(IterOptions{UpperBound: roachpb.KeyMax})
+	iter := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{UpperBound: roachpb.KeyMax})
 	defer iter.Close()
 	iter.SeekGE(NilKey)
 	if ok, err := iter.Valid(); !ok {
@@ -872,7 +873,7 @@ func runMVCCComputeStats(ctx context.Context, b *testing.B, emk engineMaker, val
 	var stats enginepb.MVCCStats
 	var err error
 	for i := 0; i < b.N; i++ {
-		iter := eng.NewIterator(IterOptions{UpperBound: roachpb.KeyMax})
+		iter := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{UpperBound: roachpb.KeyMax})
 		stats, err = iter.ComputeStats(roachpb.KeyMin, roachpb.KeyMax, 0)
 		iter.Close()
 		if err != nil {
@@ -1047,7 +1048,7 @@ func runExportToSst(
 		key = encoding.EncodeUint32Ascending(key, uint32(i))
 
 		for j := 0; j < numRevisions; j++ {
-			err := batch.Put(MVCCKey{Key: key, Timestamp: hlc.Timestamp{WallTime: int64(j + 1), Logical: 0}}, []byte("foobar"))
+			err := batch.PutMVCC(MVCCKey{Key: key, Timestamp: hlc.Timestamp{WallTime: int64(j + 1), Logical: 0}}, []byte("foobar"))
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -1065,7 +1066,7 @@ func runExportToSst(
 	for i := 0; i < b.N; i++ {
 		startTS := hlc.Timestamp{WallTime: int64(numRevisions / 2)}
 		endTS := hlc.Timestamp{WallTime: int64(numRevisions + 2)}
-		_, _, _, err := engine.ExportToSst(roachpb.KeyMin, roachpb.KeyMax, startTS, endTS, exportAllRevisions, 0 /* targetSize */, 0 /* maxSize */, IterOptions{
+		_, _, _, err := engine.ExportMVCCToSst(roachpb.KeyMin, roachpb.KeyMax, startTS, endTS, exportAllRevisions, 0 /* targetSize */, 0 /* maxSize */, IterOptions{
 			LowerBound: roachpb.KeyMin,
 			UpperBound: roachpb.KeyMax,
 		})

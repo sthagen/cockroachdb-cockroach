@@ -19,8 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
-	"github.com/gogo/protobuf/proto"
 )
 
 type alterIndexNode struct {
@@ -32,6 +32,14 @@ type alterIndexNode struct {
 // AlterIndex applies a schema change on an index.
 // Privileges: CREATE on table.
 func (p *planner) AlterIndex(ctx context.Context, n *tree.AlterIndex) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER INDEX",
+	); err != nil {
+		return nil, err
+	}
+
 	tableDesc, indexDesc, err := p.getTableAndIndex(ctx, &n.Index, privilege.CREATE)
 	if err != nil {
 		return nil, err
@@ -70,10 +78,7 @@ func (n *alterIndexNode) startExec(params runParams) error {
 			if err != nil {
 				return err
 			}
-			descriptorChanged = !proto.Equal(
-				&n.indexDesc.Partitioning,
-				&partitioning,
-			)
+			descriptorChanged = !n.indexDesc.Partitioning.Equal(&partitioning)
 			err = deleteRemovedPartitionZoneConfigs(
 				params.ctx, params.p.txn,
 				n.tableDesc, n.indexDesc,
@@ -112,23 +117,13 @@ func (n *alterIndexNode) startExec(params runParams) error {
 	// Record this index alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogAlterIndex,
-		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TableName  string
-			IndexName  string
-			Statement  string
-			User       string
-			MutationID uint32
-		}{
-			n.n.Index.Table.FQString(), n.indexDesc.Name, n.n.String(),
-			params.SessionData().User, uint32(mutationID),
-		},
-	)
+	return params.p.logEvent(params.ctx,
+		n.tableDesc.ID,
+		&eventpb.AlterIndex{
+			TableName:  n.n.Index.Table.FQString(),
+			IndexName:  n.indexDesc.Name,
+			MutationID: uint32(mutationID),
+		})
 }
 
 func (n *alterIndexNode) Next(runParams) (bool, error) { return false, nil }

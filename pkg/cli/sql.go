@@ -64,6 +64,9 @@ Query Buffer
   \r                during a multi-line statement, erase all the SQL entered so far.
   \| CMD            run an external command and run its output as SQL statements.
 
+Connection
+  \c, \connect [DB] connect to a new database
+
 Input/Output
   \echo [STRING]    write the provided string to standard output.
   \i                execute commands from the specified file.
@@ -75,6 +78,9 @@ Informational
   \dT               show the user defined types of the current database.
   \du               list the users for all databases.
   \d [TABLE]        show details about columns in the specified table, or alias for '\dt' if no table is specified.
+
+Formatting
+  \x [on|off]       toggle records display format.
 
 Operating System
   \! CMD            run an external command and print its results on standard output.
@@ -95,6 +101,7 @@ Commands specific to the demo shell (EXPERIMENTAL):
   \demo restart <nodeid>       restart a stopped demo node.
   \demo decommission <nodeid>  decommission a node.
   \demo recommission <nodeid>  recommission a node.
+  \demo add <locality>         add a node (locality specified as "region=<region>,zone=<zone>").
 `
 
 	defaultPromptPattern = "%n@%M/%/%x>"
@@ -306,15 +313,13 @@ var options = map[string]struct {
 		isBoolean:                 false,
 		validDuringMultilineEntry: false,
 		set: func(val string) error {
-			val = strings.ToLower(strings.TrimSpace(val))
-			switch val {
-			case "false", "0", "off":
-				sqlCtx.autoTrace = ""
-			case "true", "1":
-				val = "on"
-				fallthrough
-			default:
+			b, err := parseBool(val)
+			if err != nil {
 				sqlCtx.autoTrace = "on, " + val
+			} else if b {
+				sqlCtx.autoTrace = "on, on"
+			} else {
+				sqlCtx.autoTrace = ""
 			}
 			return nil
 		},
@@ -478,15 +483,12 @@ func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cl
 	var err error
 	if !opt.isBoolean {
 		err = opt.set(val)
+	} else if b, e := parseBool(val); e != nil {
+		return c.invalidOptSet(errState, args)
+	} else if b {
+		err = opt.set("true")
 	} else {
-		switch val {
-		case "true", "1", "on":
-			err = opt.set("true")
-		case "false", "0", "off":
-			err = opt.reset()
-		default:
-			return c.invalidOptSet(errState, args)
-		}
+		err = opt.reset()
 	}
 
 	if err != nil {
@@ -528,6 +530,13 @@ func (c *cliState) handleDemo(cmd []string, nextState, errState cliStateEnum) cl
 		return c.invalidSyntax(errState, `\demo can only be run with cockroach demo`)
 	}
 
+	// The \demo command has one of three patterns:
+	//
+	//	- A lone command (currently, only ls)
+	//	- A command followed by a string (add followed by locality string)
+	//	- A command followed by a node number (shutdown, restart, decommission, recommission)
+	//
+	// We parse these commands separately, in the following blocks.
 	if len(cmd) == 1 && cmd[0] == "ls" {
 		demoCtx.transientCluster.listDemoNodes(os.Stdout, false /* justOne */)
 		return nextState
@@ -537,6 +546,40 @@ func (c *cliState) handleDemo(cmd []string, nextState, errState cliStateEnum) cl
 		return c.invalidSyntax(errState, `\demo expects 2 parameters`)
 	}
 
+	// Special case the add command it takes a string instead of a node number.
+	if cmd[0] == "add" {
+		return c.handleDemoAddNode(cmd, nextState, errState)
+	}
+
+	// If we've made it down here, we're handling the remaining demo node commands.
+	return c.handleDemoNodeCommands(cmd, nextState, errState)
+}
+
+// handleDemoAddNode handles the `add` node command in demo.
+func (c *cliState) handleDemoAddNode(cmd []string, nextState, errState cliStateEnum) cliStateEnum {
+	if cmd[0] != "add" {
+		return c.internalServerError(errState, fmt.Errorf("bad call to handleDemoAddNode"))
+	}
+
+	if demoCtx.simulateLatency {
+		fmt.Printf("add command is not supported in --global configurations")
+		return nextState
+	}
+
+	if err := demoCtx.transientCluster.AddNode(cmd[1]); err != nil {
+		return c.internalServerError(errState, err)
+	}
+	addedNodeID := len(demoCtx.transientCluster.servers)
+	fmt.Printf("node %v has been added with locality \"%s\"\n",
+		addedNodeID, demoCtx.localities[addedNodeID-1].String())
+	return nextState
+}
+
+// handleDemoNodeCommands handles the node commands in demo (with the exception of `add` which is handled
+// with handleDemoAddNode.
+func (c *cliState) handleDemoNodeCommands(
+	cmd []string, nextState, errState cliStateEnum,
+) cliStateEnum {
 	nodeID, err := strconv.ParseInt(cmd[1], 10, 32)
 	if err != nil {
 		return c.invalidSyntax(
@@ -1112,6 +1155,36 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 			return cliRunStatement
 		}
 		return c.invalidSyntax(errState, `%s. Try \? for help.`, c.lastInputLine)
+
+	case `\connect`, `\c`:
+		if len(cmd) == 2 {
+			c.concatLines = `USE ` + cmd[1]
+			return cliRunStatement
+
+		}
+		return c.invalidSyntax(errState, `%s. Try \? for help`, c.lastInputLine)
+
+	case `\x`:
+		format := tableDisplayRecords
+		switch len(cmd) {
+		case 1:
+			if cliCtx.tableDisplayFormat == tableDisplayRecords {
+				format = tableDisplayTable
+			}
+		case 2:
+			b, err := parseBool(cmd[1])
+			if err != nil {
+				return c.invalidSyntax(errState, `%s. Try \? for help.`, c.lastInputLine)
+			} else if b {
+				format = tableDisplayRecords
+			} else {
+				format = tableDisplayTable
+			}
+		default:
+			return c.invalidSyntax(errState, `%s. Try \? for help.`, c.lastInputLine)
+		}
+		cliCtx.tableDisplayFormat = format
+		return loopState
 
 	case `\demo`:
 		return c.handleDemo(cmd[1:], loopState, errState)

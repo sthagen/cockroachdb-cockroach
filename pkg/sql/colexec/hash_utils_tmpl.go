@@ -23,11 +23,20 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ = typeconv.DatumVecCanonicalTypeFamily
+	_ coldataext.Datum
 )
 
 // {{/*
@@ -65,12 +74,13 @@ func _REHASH_BODY(
 	_ = buckets[nKeys-1]
 	// {{if .HasSel}}
 	_ = sel[nKeys-1]
-	// {{else}}
+	// {{else if .Sliceable}}
 	_ = keys.Get(nKeys - 1)
 	// {{end}}
 	var selIdx int
 	for i := 0; i < nKeys; i++ {
 		// {{if .HasSel}}
+		//gcassert:bce
 		selIdx = sel[i]
 		// {{else}}
 		selIdx = i
@@ -80,9 +90,14 @@ func _REHASH_BODY(
 			continue
 		}
 		// {{end}}
+		// {{if .Sliceable}}
+		//gcassert:bce
+		// {{end}}
 		v := keys.Get(selIdx)
+		//gcassert:bce
 		p := uintptr(buckets[i])
 		_ASSIGN_HASH(p, v, _, keys)
+		//gcassert:bce
 		buckets[i] = uint64(p)
 	}
 	cancelChecker.checkEveryCall(ctx)

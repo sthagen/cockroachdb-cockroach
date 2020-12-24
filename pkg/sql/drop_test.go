@@ -200,7 +200,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	// TODO (lucy): Maybe this test API should use an offset starting
 	// from the most recent job instead.
 	if err := jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
-		Username:    security.RootUser,
+		Username:    security.RootUserName(),
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: descpb.IDs{
 			tbDesc.ID,
@@ -316,7 +316,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	const migrationJobOffset = 0
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	if err := jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
-		Username:    security.RootUser,
+		Username:    security.RootUserName(),
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: descpb.IDs{
 			tbDesc.ID, tb2Desc.ID,
@@ -350,7 +350,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 
 	testutils.SucceedsSoon(t, func() error {
 		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StatusRunning, jobs.Record{
-			Username:    security.RootUser,
+			Username:    security.RootUserName(),
 			Description: "GC for DROP DATABASE t CASCADE",
 			DescriptorIDs: descpb.IDs{
 				tbDesc.ID, tb2Desc.ID,
@@ -377,7 +377,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	tests.CheckKeyCount(t, kvDB, table2Span, 0)
 
 	if err := jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
-		Username:    security.RootUser,
+		Username:    security.RootUserName(),
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: descpb.IDs{
 			tbDesc.ID, tb2Desc.ID,
@@ -448,7 +448,7 @@ func TestDropIndex(t *testing.T) {
 	const migrationJobOffset = 0
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	if err := jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset+1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
-		Username:    security.RootUser,
+		Username:    security.RootUserName(),
 		Description: `DROP INDEX t.public.kv@foo`,
 		DescriptorIDs: descpb.IDs{
 			tableDesc.ID,
@@ -478,7 +478,7 @@ func TestDropIndex(t *testing.T) {
 
 	testutils.SucceedsSoon(t, func() error {
 		return jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset+1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
-			Username:    security.RootUser,
+			Username:    security.RootUserName(),
 			Description: `DROP INDEX t.public.kv@foo`,
 			DescriptorIDs: descpb.IDs{
 				tableDesc.ID,
@@ -488,7 +488,7 @@ func TestDropIndex(t *testing.T) {
 
 	testutils.SucceedsSoon(t, func() error {
 		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
-			Username:    security.RootUser,
+			Username:    security.RootUserName(),
 			Description: `GC for DROP INDEX t.public.kv@foo`,
 			DescriptorIDs: descpb.IDs{
 				tableDesc.ID,
@@ -538,7 +538,7 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	// required" error.
 	zoneConfig := zonepb.ZoneConfig{
 		Subzones: []zonepb.Subzone{
-			{IndexID: uint32(tableDesc.PrimaryIndex.ID), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
+			{IndexID: uint32(tableDesc.GetPrimaryIndexID()), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
 			{IndexID: uint32(indexDesc.ID), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
 		},
 	}
@@ -663,7 +663,7 @@ func TestDropTable(t *testing.T) {
 	// Job still running, waiting for GC.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	if err := jobutils.VerifySystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
-		Username:    security.RootUser,
+		Username:    security.RootUserName(),
 		Description: `DROP TABLE t.public.kv`,
 		DescriptorIDs: descpb.IDs{
 			tableDesc.ID,
@@ -749,7 +749,7 @@ func TestDropTableDeleteData(t *testing.T) {
 		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
 
 		if err := jobutils.VerifySystemJob(t, sqlRun, 2*i+1+migrationJobOffset, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
-			Username:    security.RootUser,
+			Username:    security.RootUserName(),
 			Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
 			DescriptorIDs: descpb.IDs{
 				descs[i].ID,
@@ -779,7 +779,7 @@ func TestDropTableDeleteData(t *testing.T) {
 
 		// Ensure that the job is marked as succeeded.
 		if err := jobutils.VerifySystemJob(t, sqlRun, 2*i+1+migrationJobOffset, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
-			Username:    security.RootUser,
+			Username:    security.RootUserName(),
 			Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
 			DescriptorIDs: descpb.IDs{
 				descs[i].ID,
@@ -791,7 +791,7 @@ func TestDropTableDeleteData(t *testing.T) {
 		// Ensure that the job is marked as succeeded.
 		testutils.SucceedsSoon(t, func() error {
 			return jobutils.VerifySystemJob(t, sqlRun, i, jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
-				Username:    security.RootUser,
+				Username:    security.RootUserName(),
 				Description: fmt.Sprintf(`GC for DROP TABLE t.public.%s`, descs[i].GetName()),
 				DescriptorIDs: descpb.IDs{
 					descs[i].ID,
@@ -1035,7 +1035,7 @@ func TestDropDatabaseAfterDropTable(t *testing.T) {
 	if err := jobutils.VerifySystemJob(
 		t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.StatusSucceeded,
 		jobs.Record{
-			Username:    security.RootUser,
+			Username:    security.RootUserName(),
 			Description: "DROP TABLE t.public.kv",
 			DescriptorIDs: descpb.IDs{
 				tableDesc.ID,
@@ -1384,4 +1384,70 @@ CREATE TABLE t.child(k INT PRIMARY KEY REFERENCES t.parent);
 	// Check that the data was cleaned up.
 	tests.CheckKeyCount(t, kvDB, parentDesc.TableSpan(keys.SystemSQLCodec), 0)
 	tests.CheckKeyCount(t, kvDB, childDesc.TableSpan(keys.SystemSQLCodec), 0)
+}
+
+// Test that non-physical table deletions like DROP VIEW are immediate instead
+// of via a GC job.
+func TestDropPhysicalTableGC(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	params, _ := tests.CreateTestServerParams()
+
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+
+	_, err := sqlDB.Exec(`CREATE DATABASE test;`)
+	require.NoError(t, err)
+	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+
+	type tableInstance struct {
+		name         string
+		sqlType      string
+		isPhysical   bool
+		createClause string
+	}
+
+	for _, table := range [4]tableInstance{
+		{name: "t", sqlType: "TABLE", isPhysical: true, createClause: `(a INT PRIMARY KEY)`},
+		{name: "mv", sqlType: "MATERIALIZED VIEW", isPhysical: true, createClause: `AS SELECT 1`},
+		{name: "s", sqlType: "SEQUENCE", isPhysical: true, createClause: `START 1`},
+		{name: "v", sqlType: "VIEW", isPhysical: false, createClause: `AS SELECT 1`},
+	} {
+		// Create table.
+		_, err := sqlDB.Exec(fmt.Sprintf(`CREATE %s test.%s %s;`, table.sqlType, table.name, table.createClause))
+		require.NoError(t, err)
+		// Fetch table descriptor ID for future system table lookups.
+		tableDescriptor := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", table.name)
+		require.NotNil(t, tableDescriptor)
+		tableDescriptorId := tableDescriptor.GetID()
+		// Create a new zone config for the table to test its proper deletion.
+		_, err = sqlDB.Exec(fmt.Sprintf(`ALTER TABLE test.%s CONFIGURE ZONE USING gc.ttlseconds = 123456;`, table.name))
+		require.NoError(t, err)
+		// Drop table.
+		_, err = sqlDB.Exec(fmt.Sprintf(`DROP %s test.%s;`, table.sqlType, table.name))
+		require.NoError(t, err)
+		// Check for GC job kickoff.
+		var actualGCJobs int
+		countSql := fmt.Sprintf(
+			`SELECT sum(CASE description WHEN 'GC for DROP %s test.public.%s' THEN 1 ELSE 0 END) FROM [SHOW JOBS]`,
+			table.sqlType,
+			table.name)
+		sqlRun.QueryRow(t, countSql).Scan(&actualGCJobs)
+		if table.isPhysical {
+			// GC job should be created.
+			require.Equalf(t, 1, actualGCJobs, "Expected one GC job for DROP %s.", table.name, actualGCJobs)
+		} else {
+			// GC job should not be created.
+			require.Zerof(t, actualGCJobs, "Expected no GC job for DROP %s.", actualGCJobs, table.name)
+			// Test deletion of non-physical table descriptor.
+			const idCountSqlFmt = `SELECT sum(CASE id WHEN %d THEN 1 ELSE 0 END) FROM system.%s`
+			var actualDescriptors int
+			sqlRun.QueryRow(t, fmt.Sprintf(idCountSqlFmt, tableDescriptorId, "descriptor")).Scan(&actualDescriptors)
+			require.Zerof(t, actualDescriptors, "Descriptor for '%s' was not deleted as expected.", table.name)
+			// Test deletion of non-physical table zone config.
+			var actualZoneConfigs int
+			sqlRun.QueryRow(t, fmt.Sprintf(idCountSqlFmt, tableDescriptorId, "zones")).Scan(&actualZoneConfigs)
+			require.Zerof(t, actualZoneConfigs, "Zone config for '%s' was not deleted as expected.", table.name)
+		}
+	}
 }

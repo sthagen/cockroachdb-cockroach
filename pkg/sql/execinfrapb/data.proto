@@ -108,6 +108,10 @@ message StreamEndpointSpec {
   optional int32 target_node_id = 4 [(gogoproto.nullable) = false,
                                      (gogoproto.customname) = "TargetNodeID",
                                      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+  // Node ID of the origin node, only used for REMOTE streams.
+  optional int32 origin_node_id = 5 [(gogoproto.nullable) = false,
+                                    (gogoproto.customname) = "OriginNodeID",
+                                    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
   reserved 3;
 }
 
@@ -283,6 +287,11 @@ message RemoteProducerMetadata {
     // Total number of rows read while executing a statement.
     optional int64 rows_read = 2 [(gogoproto.nullable) = false];
   }
+  // ContentionEvents are any contention events that occurred during query
+  // execution.
+  message ContentionEvents {
+    repeated roachpb.ContentionEvent contention_events = 1 [(gogoproto.nullable) = false];
+  }
   oneof value {
     RangeInfos range_info = 1;
     Error error = 2;
@@ -292,6 +301,7 @@ message RemoteProducerMetadata {
     SamplerProgress sampler_progress = 7;
     Metrics metrics = 8;
     BulkProcessorProgress bulk_processor_progress = 9;
+    ContentionEvents contention_events = 10;
   }
   reserved 6;
 }

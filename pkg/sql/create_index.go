@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -22,10 +23,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -169,7 +172,7 @@ func MakeIndexDescriptor(
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support interleaved tables")
 		}
 
-		if n.PartitionBy != nil {
+		if n.PartitionByIndex.ContainsPartitions() {
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support partitioning")
 		}
 
@@ -209,7 +212,7 @@ func MakeIndexDescriptor(
 	}
 
 	if n.Sharded != nil {
-		if n.PartitionBy != nil {
+		if n.PartitionByIndex.ContainsPartitions() {
 			return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
 		}
 		if n.Interleave != nil {
@@ -371,9 +374,9 @@ func maybeCreateAndAddShardCol(
 
 func (n *createIndexNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("index"))
-	_, dropped, err := n.tableDesc.FindIndexByName(string(n.n.Name))
+	foundIndex, err := n.tableDesc.FindIndexWithName(string(n.n.Name))
 	if err == nil {
-		if dropped {
+		if foundIndex.Dropped() {
 			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 				"index %q being dropped, try again later", string(n.n.Name))
 		}
@@ -391,7 +394,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 
 	// Warn against creating a non-partitioned index on a partitioned table,
 	// which is undesirable in most cases.
-	if n.n.PartitionBy == nil && n.tableDesc.GetPrimaryIndex().Partitioning.NumColumns > 0 {
+	if n.n.PartitionByIndex == nil && n.tableDesc.GetPrimaryIndex().GetPartitioning().NumColumns > 0 {
 		params.p.BufferClientNotice(
 			params.ctx,
 			errors.WithHint(
@@ -427,9 +430,61 @@ func (n *createIndexNode) startExec(params runParams) error {
 	}
 	indexDesc.Version = encodingVersion
 
-	if n.n.PartitionBy != nil {
-		partitioning, err := CreatePartitioning(params.ctx, params.p.ExecCfg().Settings,
-			params.EvalContext(), n.tableDesc, indexDesc, n.n.PartitionBy)
+	var partitionByAll *tree.PartitionBy
+	if n.tableDesc.IsPartitionAllBy() {
+		// Convert the PartitioningDescriptor back into tree.PartitionBy by
+		// re-parsing the SHOW CREATE partitioning statement.
+		// TODO(#multiregion): clean this up by translating the descriptor back into
+		// tree.PartitionBy directly.
+		a := &rowenc.DatumAlloc{}
+		f := tree.NewFmtCtx(tree.FmtSimple)
+		if err := ShowCreatePartitioning(
+			a,
+			params.p.ExecCfg().Codec,
+			n.tableDesc,
+			n.tableDesc.GetPrimaryIndex().IndexDesc(),
+			&n.tableDesc.GetPrimaryIndex().IndexDesc().Partitioning,
+			&f.Buffer,
+			0, /* indent */
+			0, /* colOffset */
+		); err != nil {
+			return errors.Wrap(err, "error recreating PARTITION BY clause for PARTITION ALL BY affected index")
+		}
+		stmt, err := parser.ParseOne(fmt.Sprintf("ALTER TABLE t %s", f.CloseAndGetString()))
+		if err != nil {
+			return errors.Wrap(err, "error recreating PARTITION BY clause for PARTITION ALL BY affected index")
+		}
+		partitionByAll = stmt.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTablePartitionByTable).PartitionByTable.PartitionBy
+	}
+	if n.n.PartitionByIndex.ContainsPartitions() || partitionByAll != nil {
+		partitionBy := partitionByAll
+		if partitionByAll == nil {
+			partitionBy = n.n.PartitionByIndex.PartitionBy
+		} else if n.n.PartitionByIndex.ContainsPartitions() {
+			return pgerror.New(
+				pgcode.FeatureNotSupported,
+				"cannot define PARTITION BY on an index if the table has a PARTITION ALL BY definition",
+			)
+		}
+		newIndexDesc, numImplicitColumns, err := detectImplicitPartitionColumns(
+			params.p.EvalContext(),
+			n.tableDesc,
+			*indexDesc,
+			partitionBy,
+		)
+		if err != nil {
+			return err
+		}
+		indexDesc = &newIndexDesc
+		partitioning, err := CreatePartitioning(
+			params.ctx,
+			params.p.ExecCfg().Settings,
+			params.EvalContext(),
+			n.tableDesc,
+			indexDesc,
+			numImplicitColumns,
+			partitionBy,
+		)
 		if err != nil {
 			return err
 		}

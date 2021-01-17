@@ -17,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -210,15 +209,17 @@ func (p *planner) CommonLookupFlags(required bool) tree.CommonLookupFlags {
 func (p *planner) GetTypeDescriptor(
 	ctx context.Context, id descpb.ID,
 ) (tree.TypeName, catalog.TypeDescriptor, error) {
-	desc, err := p.Descriptors().GetTypeVersionByID(ctx, p.txn, id, tree.ObjectLookupFlagsWithRequired())
+	desc, err := p.Descriptors().GetImmutableTypeByID(ctx, p.txn, id, tree.ObjectLookupFlags{})
 	if err != nil {
 		return tree.TypeName{}, nil, err
 	}
-	dbDesc, err := p.Descriptors().GetDatabaseVersionByID(ctx, p.txn, desc.ParentID, p.CommonLookupFlags(true /* required */))
+	// Note that the value of required doesn't matter for lookups by ID.
+	dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.ParentID, p.CommonLookupFlags(true /* required */))
 	if err != nil {
 		return tree.TypeName{}, nil, err
 	}
-	sc, err := p.Descriptors().ResolveSchemaByID(ctx, p.txn, desc.ParentSchemaID)
+	sc, err := p.Descriptors().GetImmutableSchemaByID(
+		ctx, p.txn, desc.ParentSchemaID, tree.SchemaLookupFlags{})
 	if err != nil {
 		return tree.TypeName{}, nil, err
 	}
@@ -403,18 +404,20 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 func (p *planner) getQualifiedTableName(
 	ctx context.Context, desc catalog.TableDescriptor,
 ) (*tree.TableName, error) {
-	dbDesc, err := catalogkv.MustGetDatabaseDescByID(ctx, p.txn, p.ExecCfg().Codec, desc.GetParentID())
+	dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.GetParentID(),
+		tree.DatabaseLookupFlags{})
 	if err != nil {
 		return nil, err
 	}
 	schemaID := desc.GetParentSchemaID()
-	schemaName, err := resolver.ResolveSchemaNameByID(ctx, p.txn, p.ExecCfg().Codec, desc.GetParentID(), schemaID)
+	resolvedSchema, err := p.Descriptors().GetImmutableSchemaByID(ctx, p.txn, schemaID,
+		tree.SchemaLookupFlags{})
 	if err != nil {
 		return nil, err
 	}
 	tbName := tree.MakeTableNameWithSchema(
 		tree.Name(dbDesc.GetName()),
-		tree.Name(schemaName),
+		tree.Name(resolvedSchema.Name),
 		tree.Name(desc.GetName()),
 	)
 	return &tbName, nil
@@ -460,8 +463,8 @@ func findTableContainingIndex(
 			continue
 		}
 
-		_, dropped, err := tableDesc.FindIndexByName(string(idxName))
-		if err != nil || dropped {
+		idx, err := tableDesc.FindIndexWithName(string(idxName))
+		if err != nil || idx.Dropped() {
 			// err is nil if the index does not exist on the table.
 			continue
 		}

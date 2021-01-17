@@ -18,10 +18,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -87,7 +87,7 @@ func TestResetQuorum(t *testing.T) {
 		require.NoError(t, tc.TransferRangeLease(desc, tc.Target(n2)))
 		desc, err = tc.RemoveVoters(k, tc.Target(n1))
 		require.NoError(t, err)
-		require.Len(t, desc.Replicas().All(), 3)
+		require.Len(t, desc.Replicas().Descriptors(), 3)
 
 		srv := tc.Server(n1)
 
@@ -135,7 +135,7 @@ func TestResetQuorum(t *testing.T) {
 
 		var updatedDesc roachpb.RangeDescriptor
 		require.NoError(t, store.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			kvs, err := sql.ScanMetaKVs(ctx, txn, roachpb.Span{
+			kvs, err := kvclient.ScanMetaKVs(ctx, txn, roachpb.Span{
 				Key:    roachpb.KeyMin,
 				EndKey: roachpb.KeyMax,
 			})
@@ -153,11 +153,11 @@ func TestResetQuorum(t *testing.T) {
 			}
 			return errors.Errorf("range id %v not found after resetting quorum", rangeID)
 		}))
-		if len(updatedDesc.Replicas().All()) != 1 {
-			t.Fatalf("found %v replicas found after resetting quorum, expected 1", len(updatedDesc.Replicas().All()))
+		if len(updatedDesc.Replicas().Descriptors()) != 1 {
+			t.Fatalf("found %v replicas found after resetting quorum, expected 1", len(updatedDesc.Replicas().Descriptors()))
 		}
-		if updatedDesc.Replicas().All()[0].NodeID != srv.NodeID() {
-			t.Fatalf("replica found after resetting quorum is on node id %v, expected node id %v", updatedDesc.Replicas().All()[0].NodeID, srv.NodeID())
+		if updatedDesc.Replicas().Descriptors()[0].NodeID != srv.NodeID() {
+			t.Fatalf("replica found after resetting quorum is on node id %v, expected node id %v", updatedDesc.Replicas().Descriptors()[0].NodeID, srv.NodeID())
 		}
 	}
 

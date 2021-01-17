@@ -601,7 +601,7 @@ func (ds *DistSender) initAndVerifyBatch(
 			inner := req.GetInner()
 			switch inner.(type) {
 			case *roachpb.ScanRequest, *roachpb.ResolveIntentRangeRequest,
-				*roachpb.DeleteRangeRequest, *roachpb.RevertRangeRequest:
+				*roachpb.DeleteRangeRequest, *roachpb.RevertRangeRequest, *roachpb.ExportRequest:
 				// Accepted forward range requests.
 				if isReverse {
 					return roachpb.NewErrorf("batch with limit contains both forward and reverse scans")
@@ -717,7 +717,6 @@ func unsetCanForwardReadTimestampFlag(ctx context.Context, ba *roachpb.BatchRequ
 func (ds *DistSender) Send(
 	ctx context.Context, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
-	tracing.AnnotateTrace()
 	ds.incrementBatchCounters(&ba)
 
 	// TODO(nvanbenschoten): This causes ba to escape to the heap. Either

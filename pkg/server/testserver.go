@@ -53,9 +53,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -212,6 +214,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	cfg.DisableTLSForHTTP = params.DisableTLSForHTTP
 	if params.DisableWebSessionAuthentication {
 		cfg.EnableWebSessionAuthentication = false
+	}
+	if params.EnableDemoLoginEndpoint {
+		cfg.EnableDemoLoginEndpoint = true
 	}
 
 	// Ensure we have the correct number of engines. Add in-memory ones where
@@ -582,45 +587,73 @@ func makeSQLServerArgs(
 	}, nil
 }
 
+// TestTenant is an in-memory instantiation of the SQL-only process created for
+// each active Cockroach tenant. TestTenant provides tests with access to
+// internal methods and state on SQLServer. It is typically started in tests by
+// calling the TestServerInterface.StartTenant method or by calling the wrapper
+// serverutils.StartTenant method.
+type TestTenant struct {
+	*SQLServer
+	sqlAddr  string
+	httpAddr string
+}
+
+// SQLAddr is part of the TestTenantInterface interface.
+func (t *TestTenant) SQLAddr() string {
+	return t.sqlAddr
+}
+
+// HTTPAddr is part of the TestTenantInterface interface.
+func (t *TestTenant) HTTPAddr() string {
+	return t.httpAddr
+}
+
+// PGServer is part of the TestTenantInterface interface.
+func (t *TestTenant) PGServer() interface{} {
+	return t.pgServer
+}
+
+// DiagnosticsReporter is part of the TestTenantInterface interface.
+func (t *TestTenant) DiagnosticsReporter() interface{} {
+	return t.diagnosticsReporter
+}
+
 // StartTenant starts a SQL tenant communicating with this TestServer.
 func (ts *TestServer) StartTenant(
 	params base.TestTenantArgs,
-) (pgAddr string, httpAddr string, _ error) {
+) (serverutils.TestTenantInterface, error) {
 	ctx := context.Background()
 
 	if !params.Existing {
 		if _, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(
 			ctx, "testserver-create-tenant", nil /* txn */, "SELECT crdb_internal.create_tenant($1)", params.TenantID.ToUint64(),
 		); err != nil {
-			return "", "", err
+			return nil, err
 		}
 	}
 
 	st := cluster.MakeTestingClusterSettings()
 	sqlCfg := makeTestSQLConfig(st, params.TenantID)
 	sqlCfg.TenantKVAddrs = []string{ts.ServingRPCAddr()}
-	sqlCfg.TenantIDCodecOverride = params.TenantIDCodecOverride
 	baseCfg := makeTestBaseConfig(st)
+	baseCfg.TestingKnobs = params.TestingKnobs
 	if params.AllowSettingClusterSettings {
 		baseCfg.TestingKnobs.TenantTestingKnobs = &sql.TenantTestingKnobs{
 			ClusterSettingsUpdater: st.MakeUpdater(),
 		}
 	}
-	baseCfg.TestingKnobs.SQLExecutor = &sql.ExecutorTestingKnobs{
-		DeterministicExplainAnalyze: params.DeterministicExplainAnalyze,
-	}
 	stopper := params.Stopper
 	if stopper == nil {
 		stopper = ts.Stopper()
 	}
-	addr, httpAddr, _, err := StartTenant(
+	sqlServer, addr, httpAddr, err := StartTenant(
 		ctx,
 		stopper,
 		ts.Cfg.ClusterName,
 		baseCfg,
 		sqlCfg,
 	)
-	return addr, httpAddr, err
+	return &TestTenant{SQLServer: sqlServer, sqlAddr: addr, httpAddr: httpAddr}, err
 }
 
 // StartTenant starts a stand-alone SQL server against a KV backend.
@@ -630,14 +663,14 @@ func StartTenant(
 	kvClusterName string, // NB: gone after https://github.com/cockroachdb/cockroach/issues/42519
 	baseCfg BaseConfig,
 	sqlCfg SQLConfig,
-) (pgAddr string, httpAddr string, instanceID base.SQLInstanceID, _ error) {
+) (sqlServer *SQLServer, pgAddr string, httpAddr string, _ error) {
 	args, err := makeSQLServerArgs(stopper, kvClusterName, baseCfg, sqlCfg)
 	if err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 	s, err := newSQLServer(ctx, args)
 	if err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 
 	// TODO(asubiotto): remove this. Right now it is needed to initialize the
@@ -654,7 +687,7 @@ func StartTenant(
 
 	pgL, err := listen(ctx, &args.Config.SQLAddr, &args.Config.SQLAdvertiseAddr, "sql")
 	if err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 
 	args.stopper.RunWorker(ctx, func(ctx context.Context) {
@@ -668,7 +701,7 @@ func StartTenant(
 
 	httpL, err := listen(ctx, &args.Config.HTTPAddr, &args.Config.HTTPAdvertiseAddr, "http")
 	if err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 
 	args.stopper.RunWorker(ctx, func(ctx context.Context) {
@@ -718,7 +751,7 @@ func StartTenant(
 		heapProfileDirName:   args.HeapProfileDirName,
 		runtime:              args.runtime,
 	}); err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 
 	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: roachpb.NodeID(args.nodeIDContainer.SQLInstanceID())})
@@ -731,18 +764,27 @@ func StartTenant(
 		socketFile,
 		orphanedLeasesTimeThresholdNanos,
 	); err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
+
+	// Register the server's identifiers so that log events are
+	// decorated with the server's identity. This helps when gathering
+	// log events from multiple servers into the same log collector.
+	//
+	// We do this only here, as the identifiers may not be known before this point.
+	clusterID := args.rpcContext.ClusterID.Get().String()
+	log.SetNodeIDs(clusterID, 0 /* nodeID is not known for a SQL-only server. */)
+	log.SetTenantIDs(args.TenantID.String(), int32(s.SQLInstanceID()))
 
 	if err := s.startServeSQL(ctx,
 		args.stopper,
 		s.connManager,
 		s.pgL,
 		socketFile); err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 
-	return pgLAddr, httpLAddr, args.nodeIDContainer.SQLInstanceID(), nil
+	return s, pgLAddr, httpLAddr, nil
 }
 
 // ExpectedInitialRangeCount returns the expected number of ranges that should
@@ -1094,15 +1136,16 @@ func (ts *TestServer) MergeRanges(leftKey roachpb.Key) (roachpb.RangeDescriptor,
 	return ts.LookupRange(leftKey)
 }
 
-// SplitRange splits the range containing splitKey.
+// SplitRangeWithExpiration splits the range containing splitKey with a sticky
+// bit expiring at expirationTime.
 // The right range created by the split starts at the split key and extends to the
 // original range's end key.
 // Returns the new descriptors of the left and right ranges.
 //
 // splitKey must correspond to a SQL table key (it must end with a family ID /
 // col ID).
-func (ts *TestServer) SplitRange(
-	splitKey roachpb.Key,
+func (ts *TestServer) SplitRangeWithExpiration(
+	splitKey roachpb.Key, expirationTime hlc.Timestamp,
 ) (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
 	ctx := context.Background()
 	splitRKey, err := keys.Addr(splitKey)
@@ -1114,7 +1157,7 @@ func (ts *TestServer) SplitRange(
 			Key: splitKey,
 		},
 		SplitKey:       splitKey,
-		ExpirationTime: hlc.MaxTimestamp,
+		ExpirationTime: expirationTime,
 	}
 	_, pErr := kv.SendWrapped(ctx, ts.DB().NonTransactionalSender(), &splitReq)
 	if pErr != nil {
@@ -1186,6 +1229,14 @@ func (ts *TestServer) SplitRange(
 	}
 
 	return leftRangeDesc, rightRangeDesc, nil
+}
+
+// SplitRange is exactly like SplitRangeWithExpiration, except that it creates a
+// split with a sticky bit that never expires.
+func (ts *TestServer) SplitRange(
+	splitKey roachpb.Key,
+) (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
+	return ts.SplitRangeWithExpiration(splitKey, hlc.MaxTimestamp)
 }
 
 // GetRangeLease returns the current lease for the range containing key, and a
@@ -1294,6 +1345,11 @@ func (ts *TestServer) ScratchRange() (roachpb.Key, error) {
 		return nil, err
 	}
 	return desc.StartKey.AsRawKey(), nil
+}
+
+// MetricsRecorder periodically records node-level and store-level metrics.
+func (ts *TestServer) MetricsRecorder() *status.MetricsRecorder {
+	return ts.node.recorder
 }
 
 type testServerFactoryImpl struct{}

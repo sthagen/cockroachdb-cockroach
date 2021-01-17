@@ -862,6 +862,16 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr></tbody>
 </table>
 
+### Multi-region functions
+
+<table>
+<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a name="gateway_region"></a><code>gateway_region() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the region of the connection’s current node as defined by
+the locality flag on node startup. Returns an error if no region is set.</p>
+</span></td></tr></tbody>
+</table>
+
 ### Multi-tenancy functions
 
 <table>
@@ -1685,6 +1695,10 @@ Bottom Left.</p>
 <tr><td><a name="st_frechetdistance"></a><code>st_frechetdistance(geometry_a: geometry, geometry_b: geometry, densify_frac: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the Frechet distance between the given geometries, with the given segment densification (range 0.0-1.0, -1 to disable).</p>
 <p>Smaller densify_frac gives a more accurate Fréchet distance. However, the computation time and memory usage increases with the square of the number of subsegments.</p>
 <p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_generatepoints"></a><code>st_generatepoints(geometry: geometry, npoints: int4) &rarr; geometry</code></td><td><span class="funcdesc"><p>Generates pseudo-random points until the requested number are found within the input area. Uses system time as a seed.</p>
+</span></td></tr>
+<tr><td><a name="st_generatepoints"></a><code>st_generatepoints(geometry: geometry, npoints: int4, seed: int4) &rarr; geometry</code></td><td><span class="funcdesc"><p>Generates pseudo-random points until the requested number are found within the input area.</p>
 </span></td></tr>
 <tr><td><a name="st_geogfromewkb"></a><code>st_geogfromewkb(val: <a href="bytes.html">bytes</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns the Geography from an EWKB representation.</p>
 </span></td></tr>
@@ -2564,6 +2578,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="crdb_internal.is_admin"></a><code>crdb_internal.is_admin() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Retrieves the current user’s admin status.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.lease_holder"></a><code>crdb_internal.lease_holder(key: <a href="bytes.html">bytes</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used to fetch the leaseholder corresponding to a request key</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.list_sql_keys_in_range"></a><code>crdb_internal.list_sql_keys_in_range(range_id: <a href="int.html">int</a>) &rarr; tuple{string AS key, string AS value}</code></td><td><span class="funcdesc"><p>Returns all SQL K/V pairs within the requested range.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.locality_value"></a><code>crdb_internal.locality_value(key: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the value of the specified locality key.</p>
 </span></td></tr>

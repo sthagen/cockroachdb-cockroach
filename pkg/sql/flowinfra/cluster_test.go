@@ -71,7 +71,7 @@ func TestClusterFlow(t *testing.T) {
 	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 	makeIndexSpan := func(start, end int) execinfrapb.TableReaderSpan {
 		var span roachpb.Span
-		prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.GetPublicNonPrimaryIndexes()[0].ID))
+		prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.PublicNonPrimaryIndexes()[0].GetID()))
 		span.Key = append(prefix, encoding.EncodeVarintAscending(nil, int64(start))...)
 		span.EndKey = append(span.EndKey, prefix...)
 		span.EndKey = append(span.EndKey, encoding.EncodeVarintAscending(nil, int64(end))...)
@@ -90,12 +90,12 @@ func TestClusterFlow(t *testing.T) {
 	ctx := tracing.ContextWithSpan(context.Background(), sp)
 	defer sp.Finish()
 
-	now := tc.Server(0).Clock().Now()
+	now := tc.Server(0).Clock().NowAsClockTimestamp()
 	txnProto := roachpb.MakeTransaction(
 		"cluster-test",
 		nil, // baseKey
 		roachpb.NormalUserPriority,
-		now,
+		now.ToTimestamp(),
 		0, // maxOffset
 	)
 	txn := kv.NewTxnFromProto(ctx, kvDB, tc.Server(0).NodeID(), now, kv.RootTxn, &txnProto)
@@ -416,12 +416,12 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		Type: descpb.InnerJoin,
 	}
 
-	now := tc.Server(0).Clock().Now()
+	now := tc.Server(0).Clock().NowAsClockTimestamp()
 	txnProto := roachpb.MakeTransaction(
 		"deadlock-test",
 		nil, // baseKey
 		roachpb.NormalUserPriority,
-		now,
+		now.ToTimestamp(),
 		0, // maxOffset
 	)
 	txn := kv.NewTxnFromProto(
@@ -736,12 +736,12 @@ func BenchmarkInfrastructure(b *testing.B) {
 						}
 						return execinfrapb.StreamEndpointSpec_REMOTE
 					}
-					now := tc.Server(0).Clock().Now()
+					now := tc.Server(0).Clock().NowAsClockTimestamp()
 					txnProto := roachpb.MakeTransaction(
 						"cluster-test",
 						nil, // baseKey
 						roachpb.NormalUserPriority,
-						now,
+						now.ToTimestamp(),
 						0, // maxOffset
 					)
 					txn := kv.NewTxnFromProto(

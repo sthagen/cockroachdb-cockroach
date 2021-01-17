@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
@@ -734,11 +735,6 @@ type StoreConfig struct {
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval
 	HistogramWindowInterval time.Duration
 
-	// GossipWhenCapacityDeltaExceedsFraction specifies the fraction from the last
-	// gossiped store capacity values which need be exceeded before the store will
-	// gossip immediately without waiting for the periodic gossip interval.
-	GossipWhenCapacityDeltaExceedsFraction float64
-
 	// ExternalStorage creates ExternalStorage objects which allows access to external files
 	ExternalStorage        cloud.ExternalStorageFactory
 	ExternalStorageFromURI cloud.ExternalStorageFromURIFactory
@@ -790,8 +786,8 @@ func (sc *StoreConfig) SetDefaults() {
 			envutil.EnvOrDefaultInt("COCKROACH_CONCURRENT_SNAPSHOT_APPLY_LIMIT", 1)
 	}
 
-	if sc.GossipWhenCapacityDeltaExceedsFraction == 0 {
-		sc.GossipWhenCapacityDeltaExceedsFraction = defaultGossipWhenCapacityDeltaExceedsFraction
+	if sc.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction == 0 {
+		sc.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction = defaultGossipWhenCapacityDeltaExceedsFraction
 	}
 }
 
@@ -1118,7 +1114,7 @@ func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString)) {
 
 					// Learner replicas aren't allowed to become the leaseholder or raft
 					// leader, so only consider the `Voters` replicas.
-					needsLeaseTransfer := len(r.Desc().Replicas().Voters()) > 1 &&
+					needsLeaseTransfer := len(r.Desc().Replicas().VoterDescriptors()) > 1 &&
 						drainingLease.OwnedBy(s.StoreID()) &&
 						r.IsLeaseValid(ctx, drainingLease, s.Clock().Now())
 
@@ -1918,9 +1914,9 @@ func (s *Store) GossipStore(ctx context.Context, useCached bool) error {
 	// the usual periodic interval. Re-gossip more rapidly for RangeCount
 	// changes because allocators with stale information are much more
 	// likely to make bad decisions.
-	rangeCountdown := float64(storeDesc.Capacity.RangeCount) * s.cfg.GossipWhenCapacityDeltaExceedsFraction
+	rangeCountdown := float64(storeDesc.Capacity.RangeCount) * s.cfg.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction
 	atomic.StoreInt32(&s.gossipRangeCountdown, int32(math.Ceil(math.Min(rangeCountdown, 3))))
-	leaseCountdown := float64(storeDesc.Capacity.LeaseCount) * s.cfg.GossipWhenCapacityDeltaExceedsFraction
+	leaseCountdown := float64(storeDesc.Capacity.LeaseCount) * s.cfg.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction
 	atomic.StoreInt32(&s.gossipLeaseCountdown, int32(math.Ceil(math.Max(leaseCountdown, 1))))
 	syncutil.StoreFloat64(&s.gossipQueriesPerSecondVal, storeDesc.Capacity.QueriesPerSecond)
 	syncutil.StoreFloat64(&s.gossipWritesPerSecondVal, storeDesc.Capacity.WritesPerSecond)
@@ -2795,6 +2791,58 @@ func (s *Store) ManuallyEnqueue(
 	processed, processErr := queue.process(ctx, repl, sysCfg)
 	log.Eventf(ctx, "processed: %t", processed)
 	return collect(), processErr, nil
+}
+
+// PurgeOutdatedReplicas purges all replicas with a version less than the one
+// specified. This entails clearing out replicas in the replica GC queue that
+// fit the bill.
+func (s *Store) PurgeOutdatedReplicas(ctx context.Context, version roachpb.Version) error {
+	if interceptor := s.TestingKnobs().PurgeOutdatedReplicasInterceptor; interceptor != nil {
+		interceptor()
+	}
+
+	// Let's set a reasonable bound on the number of replicas being processed in
+	// parallel.
+	qp := quotapool.NewIntPool("purge-outdated-replicas", 50)
+	g := ctxgroup.WithContext(ctx)
+	s.VisitReplicas(func(repl *Replica) (wantMore bool) {
+		if !repl.Version().Less(version) {
+			// Nothing to do here.
+			return true
+		}
+
+		alloc, err := qp.Acquire(ctx, 1)
+		if err != nil {
+			g.GoCtx(func(ctx context.Context) error {
+				return err
+			})
+			return false
+		}
+
+		g.GoCtx(func(ctx context.Context) error {
+			defer alloc.Release()
+
+			processed, err := s.replicaGCQueue.process(ctx, repl, nil)
+			if err != nil {
+				return errors.Wrapf(err, "on %s", repl.Desc())
+			}
+			if !processed {
+				// We're either still part of the raft group, in which same
+				// something has gone horribly wrong, or more likely (though
+				// still very unlikely in practice): this range has been merged
+				// away, and this store has the replica of the subsuming range
+				// where we're unable to determine if it has applied the merge
+				// trigger. See replicaGCQueue.process for more details. Either
+				// way, we error out.
+				return errors.Newf("unable to gc %s", repl.Desc())
+			}
+			return nil
+		})
+
+		return true
+	})
+
+	return g.Wait()
 }
 
 // WriteClusterVersion writes the given cluster version to the store-local

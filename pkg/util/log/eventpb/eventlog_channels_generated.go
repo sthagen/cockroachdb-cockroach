@@ -23,6 +23,15 @@ func (m *NodeRestart) LoggingChannel() logpb.Channel { return logpb.Channel_OPS 
 func (m *SetClusterSetting) LoggingChannel() logpb.Channel { return logpb.Channel_DEV }
 
 // LoggingChannel implements the EventPayload interface.
+func (m *AlterDatabaseAddRegion) LoggingChannel() logpb.Channel { return logpb.Channel_SQL_SCHEMA }
+
+// LoggingChannel implements the EventPayload interface.
+func (m *AlterDatabasePrimaryRegion) LoggingChannel() logpb.Channel { return logpb.Channel_SQL_SCHEMA }
+
+// LoggingChannel implements the EventPayload interface.
+func (m *AlterDatabaseSurvivalGoal) LoggingChannel() logpb.Channel { return logpb.Channel_SQL_SCHEMA }
+
+// LoggingChannel implements the EventPayload interface.
 func (m *AlterIndex) LoggingChannel() logpb.Channel { return logpb.Channel_SQL_SCHEMA }
 
 // LoggingChannel implements the EventPayload interface.
@@ -153,6 +162,24 @@ func (m *ChangeTablePrivilege) LoggingChannel() logpb.Channel { return logpb.Cha
 
 // LoggingChannel implements the EventPayload interface.
 func (m *ChangeTypePrivilege) LoggingChannel() logpb.Channel { return logpb.Channel_PRIVILEGES }
+
+// LoggingChannel implements the EventPayload interface.
+func (m *ClientAuthenticationFailed) LoggingChannel() logpb.Channel { return logpb.Channel_SESSIONS }
+
+// LoggingChannel implements the EventPayload interface.
+func (m *ClientAuthenticationInfo) LoggingChannel() logpb.Channel { return logpb.Channel_SESSIONS }
+
+// LoggingChannel implements the EventPayload interface.
+func (m *ClientAuthenticationOk) LoggingChannel() logpb.Channel { return logpb.Channel_SESSIONS }
+
+// LoggingChannel implements the EventPayload interface.
+func (m *ClientConnectionEnd) LoggingChannel() logpb.Channel { return logpb.Channel_SESSIONS }
+
+// LoggingChannel implements the EventPayload interface.
+func (m *ClientConnectionStart) LoggingChannel() logpb.Channel { return logpb.Channel_SESSIONS }
+
+// LoggingChannel implements the EventPayload interface.
+func (m *ClientSessionEnd) LoggingChannel() logpb.Channel { return logpb.Channel_SESSIONS }
 
 // LoggingChannel implements the EventPayload interface.
 func (m *AlterRole) LoggingChannel() logpb.Channel { return logpb.Channel_USER_ADMIN }

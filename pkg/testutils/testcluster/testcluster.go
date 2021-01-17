@@ -422,7 +422,8 @@ func (tc *TestCluster) startServer(idx int, serverArgs base.TestServerArgs) erro
 		return err
 	}
 
-	dbConn, err := serverutils.OpenDBConnE(server, serverArgs, server.Stopper())
+	dbConn, err := serverutils.OpenDBConnE(
+		server.ServingSQLAddr(), serverArgs.UseDatabase, serverArgs.Insecure, server.Stopper())
 	if err != nil {
 		return err
 	}
@@ -485,6 +486,20 @@ func (tc *TestCluster) LookupRangeOrFatal(t testing.TB, key roachpb.Key) roachpb
 		t.Fatalf(`looking up range for %s: %+v`, key, err)
 	}
 	return desc
+}
+
+// SplitRangeWithExpiration splits the range containing splitKey with a sticky
+// bit expiring at expirationTime.
+// The right range created by the split starts at the split key and extends to the
+// original range's end key.
+// Returns the new descriptors of the left and right ranges.
+//
+// splitKey must correspond to a SQL table key (it must end with a family ID /
+// col ID).
+func (tc *TestCluster) SplitRangeWithExpiration(
+	splitKey roachpb.Key, expirationTime hlc.Timestamp,
+) (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
+	return tc.Servers[0].SplitRangeWithExpiration(splitKey, expirationTime)
 }
 
 // SplitRange splits the range containing splitKey.
@@ -580,6 +595,17 @@ func (tc *TestCluster) AddNonVoters(
 	startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
 ) (roachpb.RangeDescriptor, error) {
 	return tc.addReplica(startKey, roachpb.ADD_NON_VOTER, targets...)
+}
+
+// AddNonVotersOrFatal is part of TestClusterInterface.
+func (tc *TestCluster) AddNonVotersOrFatal(
+	t testing.TB, startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
+) roachpb.RangeDescriptor {
+	desc, err := tc.addReplica(startKey, roachpb.ADD_NON_VOTER, targets...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return desc
 }
 
 // AddVotersMulti is part of TestClusterInterface.
@@ -704,6 +730,18 @@ func (tc *TestCluster) RemoveNonVoters(
 	return tc.changeReplicas(roachpb.REMOVE_NON_VOTER, keys.MustAddr(startKey), targets...)
 }
 
+// RemoveNonVotersOrFatal is part of TestClusterInterface.
+func (tc *TestCluster) RemoveNonVotersOrFatal(
+	t testing.TB, startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
+) roachpb.RangeDescriptor {
+	desc, err := tc.RemoveNonVoters(startKey, targets...)
+	if err != nil {
+		t.Fatalf(`could not remove %v replicas from range containing %s: %+v`,
+			targets, startKey, err)
+	}
+	return desc
+}
+
 // TransferRangeLease is part of the TestServerInterface.
 func (tc *TestCluster) TransferRangeLease(
 	rangeDesc roachpb.RangeDescriptor, dest roachpb.ReplicationTarget,
@@ -739,8 +777,8 @@ func (tc *TestCluster) FindRangeLease(
 		}
 	} else {
 		hint = &roachpb.ReplicationTarget{
-			NodeID:  rangeDesc.Replicas().All()[0].NodeID,
-			StoreID: rangeDesc.Replicas().All()[0].StoreID}
+			NodeID:  rangeDesc.Replicas().Descriptors()[0].NodeID,
+			StoreID: rangeDesc.Replicas().Descriptors()[0].StoreID}
 	}
 
 	// Find the server indicated by the hint and send a LeaseInfoRequest through
@@ -815,7 +853,7 @@ func (tc *TestCluster) WaitForSplitAndInitialization(startKey roachpb.Key) error
 				startKey, desc.StartKey)
 		}
 		// Once we've verified the split, make sure that replicas exist.
-		for _, rDesc := range desc.Replicas().All() {
+		for _, rDesc := range desc.Replicas().Descriptors() {
 			store, err := tc.findMemberStore(rDesc.StoreID)
 			if err != nil {
 				return err
@@ -898,6 +936,10 @@ func (tc *TestCluster) WaitForFullReplication() error {
 				}
 				if n := s.Metrics().UnderReplicatedRangeCount.Value(); n > 0 {
 					log.Infof(context.TODO(), "%s has %d underreplicated ranges", s, n)
+					notReplicated = true
+				}
+				if n := s.Metrics().OverReplicatedRangeCount.Value(); n > 0 {
+					log.Infof(context.TODO(), "%s has %d overreplicated ranges", s, n)
 					notReplicated = true
 				}
 				return nil
@@ -1040,6 +1082,81 @@ func (tc *TestCluster) GetFirstStoreFromServer(t testing.TB, server int) *kvserv
 		t.Fatal(pErr)
 	}
 	return store
+}
+
+// Restart stops and then starts all the servers in the cluster.
+func (tc *TestCluster) Restart() error {
+	for i := range tc.Servers {
+		tc.StopServer(i)
+		if err := tc.RestartServer(i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RestartServer uses the cached ServerArgs to restart a Server specified by
+// the passed index.
+func (tc *TestCluster) RestartServer(idx int) error {
+	if !tc.serverStopped(idx) {
+		return errors.Errorf("server %d must be stopped before attempting to restart", idx)
+	}
+	serverArgs := tc.serverArgs[idx]
+
+	if idx == 0 {
+		// If it's the first server, then we need to restart the RPC listener by hand.
+		// Look at NewTestCluster for more details.
+		listener, err := net.Listen("tcp", serverArgs.Listener.Addr().String())
+		if err != nil {
+			return err
+		}
+		serverArgs.Listener = listener
+		serverArgs.Knobs.Server.(*server.TestingKnobs).RPCListener = serverArgs.Listener
+	} else {
+		serverArgs.Addr = ""
+		// Try and point the server to a live server in the cluster to join.
+		for i := range tc.Servers {
+			if !tc.serverStopped(i) {
+				serverArgs.JoinAddr = tc.Servers[i].ServingRPCAddr()
+			}
+		}
+	}
+
+	for i, specs := range serverArgs.StoreSpecs {
+		if specs.StickyInMemoryEngineID == "" {
+			return errors.Errorf("failed to restart Server %d, because a restart can only be used on a server with a sticky engine", i)
+		}
+	}
+	srv, err := serverutils.NewServer(serverArgs)
+	if err != nil {
+		return err
+	}
+	s := srv.(*server.TestServer)
+
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	tc.Servers[idx] = s
+	tc.mu.serverStoppers[idx] = s.Stopper()
+
+	if err := srv.Start(); err != nil {
+		return err
+	}
+
+	dbConn, err := serverutils.OpenDBConnE(srv.ServingSQLAddr(),
+		serverArgs.UseDatabase, serverArgs.Insecure, srv.Stopper())
+	if err != nil {
+		return err
+	}
+	tc.Conns[idx] = dbConn
+	return nil
+}
+
+// serverStopped determines if a server has been explicitly
+// stopped by StopServer(s).
+func (tc *TestCluster) serverStopped(idx int) bool {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.mu.serverStoppers[idx] == nil
 }
 
 type testClusterFactoryImpl struct{}

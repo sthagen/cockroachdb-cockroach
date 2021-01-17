@@ -3,10 +3,11 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "tracing",
     srcs = [
-        "annotate.go",
-        "annotate_nocgo.go",
         "context.go",
+        "crdbspan.go",
+        "doc.go",
         "grpc_interceptor.go",
+        "otspan.go",
         "recording.go",
         "shadow.go",
         "span.go",
@@ -15,7 +16,6 @@ go_library(
         "test_utils.go",
         "tracer.go",
     ],
-    cgo = True,
     importpath = "github.com/cockroachdb/cockroach/pkg/util/tracing",
     visibility = ["//visibility:public"],
     deps = [
@@ -37,7 +37,7 @@ go_library(
         "@com_github_opentracing_opentracing_go//ext",
         "@com_github_opentracing_opentracing_go//log",
         "@com_github_openzipkin_contrib_zipkin_go_opentracing//:zipkin-go-opentracing",
-        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//:go_default_library",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//metadata",
         "@org_golang_google_grpc//status",
@@ -57,7 +57,6 @@ go_test(
     embed = [":tracing"],
     deps = [
         "//pkg/settings",
-        "//pkg/util/tracing/tracingpb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
         "@com_github_gogo_protobuf//types",

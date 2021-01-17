@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -258,10 +259,14 @@ func bootstrapCluster(
 				return splits[i].Less(splits[j])
 			})
 
+			var storeKnobs kvserver.StoreTestingKnobs
+			if kn, ok := initCfg.testingKnobs.Store.(*kvserver.StoreTestingKnobs); ok {
+				storeKnobs = *kn
+			}
 			if err := kvserver.WriteInitialClusterData(
 				ctx, eng, initialValues,
 				bootstrapVersion.Version, len(engines), splits,
-				hlc.UnixNano(),
+				hlc.UnixNano(), storeKnobs,
 			); err != nil {
 				return nil, err
 			}
@@ -1025,7 +1030,7 @@ func (n *Node) ResetQuorum(
 		if txnTries > 1 {
 			log.Infof(ctx, "failed to retrieve range descriptor for r%d, retrying...", req.RangeID)
 		}
-		kvs, err := sql.ScanMetaKVs(ctx, txn, roachpb.Span{
+		kvs, err := kvclient.ScanMetaKVs(ctx, txn, roachpb.Span{
 			Key:    roachpb.KeyMin,
 			EndKey: roachpb.KeyMax,
 		})
@@ -1063,7 +1068,7 @@ func (n *Node) ResetQuorum(
 	}
 
 	// Update the range descriptor and update meta ranges for the descriptor, removing all replicas.
-	deadReplicas := append([]roachpb.ReplicaDescriptor(nil), desc.Replicas().All()...)
+	deadReplicas := append([]roachpb.ReplicaDescriptor(nil), desc.Replicas().Descriptors()...)
 	for _, rd := range deadReplicas {
 		desc.RemoveReplica(rd.NodeID, rd.StoreID)
 	}

@@ -84,7 +84,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/cockroachdb/sentry-go"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -157,7 +156,7 @@ type Server struct {
 	protectedtsProvider   protectedts.Provider
 	protectedtsReconciler *ptreconcile.Reconciler
 
-	sqlServer *sqlServer
+	sqlServer *SQLServer
 
 	// Created in NewServer but initialized (made usable) in `(*Server).Start`.
 	externalStorageBuilder *externalStorageBuilder
@@ -1689,6 +1688,10 @@ func (s *Server) PreStart(ctx context.Context) error {
 	s.mux.Handle(loginPath, gwMux)
 	s.mux.Handle(logoutPath, authHandler)
 
+	if s.cfg.EnableDemoLoginEndpoint {
+		s.mux.Handle(DemoLoginPath, http.HandlerFunc(s.authentication.demoLogin))
+	}
+
 	// The /_status/vars endpoint is not authenticated either. Useful for monitoring.
 	s.mux.Handle(statusVars, http.HandlerFunc(s.status.handleVars))
 
@@ -1946,7 +1949,7 @@ func (s *Server) startServeUI(
 }
 
 // TODO(tbg): move into server_sql.go.
-func (s *sqlServer) startServeSQL(
+func (s *SQLServer) startServeSQL(
 	ctx context.Context,
 	stopper *stop.Stopper,
 	connManager netutil.Server,
@@ -1963,7 +1966,7 @@ func (s *sqlServer) startServeSQL(
 
 	stopper.RunWorker(pgCtx, func(pgCtx context.Context) {
 		netutil.FatalIfUnexpected(connManager.ServeWith(pgCtx, stopper, pgL, func(conn net.Conn) {
-			connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
+			connCtx := s.pgServer.AnnotateCtxForIncomingConn(pgCtx, conn)
 			tcpKeepAlive.configure(connCtx, conn)
 
 			if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketTCP); err != nil {
@@ -1991,7 +1994,7 @@ func (s *sqlServer) startServeSQL(
 
 		stopper.RunWorker(pgCtx, func(pgCtx context.Context) {
 			netutil.FatalIfUnexpected(connManager.ServeWith(pgCtx, stopper, unixLn, func(conn net.Conn) {
-				connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
+				connCtx := s.pgServer.AnnotateCtxForIncomingConn(pgCtx, conn)
 				if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketUnix); err != nil {
 					log.Ops.Errorf(connCtx, "%v", err)
 				}

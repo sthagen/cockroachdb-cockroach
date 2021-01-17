@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
@@ -773,7 +774,7 @@ func (s *adminServer) statsForSpan(
 		if err := kv.Value.GetProto(&rng); err != nil {
 			return nil, s.serverError(err)
 		}
-		for _, repl := range rng.Replicas().All() {
+		for _, repl := range rng.Replicas().Descriptors() {
 			nodeIDs[repl.NodeID] = struct{}{}
 		}
 	}
@@ -1703,7 +1704,7 @@ func (s *adminServer) DecommissionStatus(
 					if err := row.ValueProto(&rangeDesc); err != nil {
 						return errors.Wrapf(err, "%s: unable to unmarshal range descriptor", row.Key)
 					}
-					for _, r := range rangeDesc.Replicas().All() {
+					for _, r := range rangeDesc.Replicas().Descriptors() {
 						if _, ok := replicaCounts[r.NodeID]; ok {
 							replicaCounts[r.NodeID]++
 						}
@@ -1867,7 +1868,7 @@ func (s *adminServer) DataDistribution(
 		acct := s.memMonitor.MakeBoundAccount()
 		defer acct.Close(txnCtx)
 
-		kvs, err := sql.ScanMetaKVs(ctx, txn, roachpb.Span{
+		kvs, err := kvclient.ScanMetaKVs(ctx, txn, roachpb.Span{
 			Key:    keys.UserTableDataMin,
 			EndKey: keys.MaxKey,
 		})
@@ -1890,7 +1891,7 @@ func (s *adminServer) DataDistribution(
 				return err
 			}
 
-			for _, replicaDesc := range rangeDesc.Replicas().All() {
+			for _, replicaDesc := range rangeDesc.Replicas().Descriptors() {
 				tableInfo, ok := tableInfosByTableID[tableID]
 				if !ok {
 					// This is a database, skip.

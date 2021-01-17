@@ -16,7 +16,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -200,8 +199,7 @@ func (s storage) acquire(
 		if err := txn.SetUserPriority(roachpb.MaxUserPriority); err != nil {
 			return err
 		}
-		expiration := txn.ReadTimestamp()
-		expiration.WallTime += int64(s.jitteredLeaseDuration())
+		expiration := txn.ReadTimestamp().Add(int64(s.jitteredLeaseDuration()), 0)
 		if expiration.LessEq(minExpiration) {
 			// In the rare circumstances where expiration <= minExpiration
 			// use an expiration based on the minExpiration to guarantee
@@ -1642,11 +1640,6 @@ func (m *Manager) findDescriptorState(id descpb.ID, create bool) *descriptorStat
 	t := m.mu.descriptors[id]
 	if t == nil && create {
 		t = &descriptorState{id: id, stopper: m.stopper}
-		if id >= 4294867200 {
-			stack := debug.Stack()
-			log.Warningf(context.TODO(), "adding questionable descriptor %d to lease manager: %v %s",
-				id, t, string(stack))
-		}
 		m.mu.descriptors[id] = t
 	}
 	return t

@@ -1043,7 +1043,7 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 		}
 
 		referencedTypeIDs, err = scTable.GetAllReferencedTypeIDs(func(id descpb.ID) (catalog.TypeDescriptor, error) {
-			desc, err := descsCol.GetTypeVersionByID(ctx, txn, id, tree.ObjectLookupFlagsWithRequired())
+			desc, err := descsCol.GetImmutableTypeByID(ctx, txn, id, tree.ObjectLookupFlags{})
 			if err != nil {
 				return nil, err
 			}
@@ -1070,12 +1070,12 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 				// If any old indexes (including the old primary index) being rewritten are interleaved
 				// children, we will have to update their parents as well.
 				for _, idxID := range append([]descpb.IndexID{swap.OldPrimaryIndexId}, swap.OldIndexes...) {
-					oldIndex, err := scTable.FindIndexByID(idxID)
+					oldIndex, err := scTable.FindIndexWithID(idxID)
 					if err != nil {
 						return err
 					}
-					if len(oldIndex.Interleave.Ancestors) != 0 {
-						ancestor := oldIndex.Interleave.Ancestors[len(oldIndex.Interleave.Ancestors)-1]
+					if oldIndex.NumInterleaveAncestors() != 0 {
+						ancestor := oldIndex.GetInterleaveAncestor(oldIndex.NumInterleaveAncestors() - 1)
 						if ancestor.TableID != scTable.ID {
 							interleaveParents[ancestor.TableID] = struct{}{}
 						}
@@ -1176,13 +1176,13 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 				// existing indexes on the table.
 				if mutation.Direction == descpb.DescriptorMutation_ADD {
 					desc := fmt.Sprintf("REFRESH MATERIALIZED VIEW %q cleanup", scTable.Name)
-					pkJob, err := sc.createIndexGCJob(ctx, scTable.GetPrimaryIndex(), txn, desc)
+					pkJob, err := sc.createIndexGCJob(ctx, scTable.GetPrimaryIndex().IndexDesc(), txn, desc)
 					if err != nil {
 						return err
 					}
 					childJobs = append(childJobs, pkJob)
-					for i := range scTable.GetPublicNonPrimaryIndexes() {
-						idxJob, err := sc.createIndexGCJob(ctx, &scTable.GetPublicNonPrimaryIndexes()[i], txn, desc)
+					for _, idx := range scTable.PublicNonPrimaryIndexes() {
+						idxJob, err := sc.createIndexGCJob(ctx, idx.IndexDesc(), txn, desc)
 						if err != nil {
 							return err
 						}
@@ -1222,27 +1222,28 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 				// corresponding piece in runSchemaChangesInTxn.
 				for _, idxID := range append(
 					[]descpb.IndexID{pkSwap.OldPrimaryIndexId}, pkSwap.OldIndexes...) {
-					oldIndex, err := scTable.FindIndexByID(idxID)
+					oldIndex, err := scTable.FindIndexWithID(idxID)
 					if err != nil {
 						return err
 					}
-					if len(oldIndex.Interleave.Ancestors) != 0 {
-						ancestorInfo := oldIndex.Interleave.Ancestors[len(oldIndex.Interleave.Ancestors)-1]
+					if oldIndex.NumInterleaveAncestors() != 0 {
+						ancestorInfo := oldIndex.GetInterleaveAncestor(oldIndex.NumInterleaveAncestors() - 1)
 						ancestor, err := descsCol.GetMutableTableVersionByID(ctx, ancestorInfo.TableID, txn)
 						if err != nil {
 							return err
 						}
-						ancestorIdx, err := ancestor.FindIndexByID(ancestorInfo.IndexID)
+						ancestorIdxI, err := ancestor.FindIndexWithID(ancestorInfo.IndexID)
 						if err != nil {
 							return err
 						}
+						ancestorIdx := ancestorIdxI.IndexDesc()
 						foundAncestor := false
 						for k, ref := range ancestorIdx.InterleavedBy {
-							if ref.Table == scTable.ID && ref.Index == oldIndex.ID {
+							if ref.Table == scTable.ID && ref.Index == oldIndex.GetID() {
 								if foundAncestor {
 									return errors.AssertionFailedf(
 										"ancestor entry in %s for %s@%s found more than once",
-										ancestor.Name, scTable.Name, oldIndex.Name)
+										ancestor.Name, scTable.Name, oldIndex.GetName())
 								}
 								ancestorIdx.InterleavedBy = append(
 									ancestorIdx.InterleavedBy[:k], ancestorIdx.InterleavedBy[k+1:]...)
@@ -1941,9 +1942,18 @@ type SchemaChangerTestingKnobs struct {
 	// BackfillChunkSize is to be used for all backfill chunked operations.
 	BackfillChunkSize int64
 
-	// TwoVersionLeaseViolation is called whenever a schema change
-	// transaction is unable to commit because it is violating the two
-	// version lease invariant.
+	// AlwaysUpdateIndexBackfillDetails indicates whether the index backfill
+	// schema change job details should be updated everytime the coordinator
+	// receives an update from the backfill processor.
+	AlwaysUpdateIndexBackfillDetails bool
+
+	// AlwaysUpdateIndexBackfillProgress indicates whether the index backfill
+	// schema change job fraction completed should be updated everytime the
+	// coordinator receives an update from the backfill processor.
+	AlwaysUpdateIndexBackfillProgress bool
+
+	// TwoVersionLeaseViolation is called whenever a schema change transaction is
+	// unable to commit because it is violating the two version lease invariant.
 	TwoVersionLeaseViolation func()
 }
 

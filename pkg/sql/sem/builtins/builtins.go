@@ -105,6 +105,7 @@ const (
 	categoryFuzzyStringMatching = "Fuzzy String Matching"
 	categoryIDGeneration        = "ID generation"
 	categoryJSON                = "JSONB"
+	categoryMultiRegion         = "Multi-region"
 	categoryMultiTenancy        = "Multi-tenancy"
 	categorySequences           = "Sequence"
 	categorySpatial             = "Spatial"
@@ -3639,6 +3640,12 @@ may increase either contention or retry errors, or both.`,
 				}
 				return args[0], nil
 			},
+			// TODO(spaskob): this built-in currently does not actually delete the
+			// data but just marks it as DROP. This is for done for safety in case we
+			// would like to restore the tenant later. If data in needs to be removed
+			// use gc_tenant built-in.
+			// We should just add a new built-in called `drop_tenant` instead and use
+			// this one to really destroy the tenant.
 			Info:       "Destroys a tenant with the provided ID. Must be run by the System tenant.",
 			Volatility: tree.VolatilityVolatile,
 		},
@@ -3672,10 +3679,11 @@ may increase either contention or retry errors, or both.`,
 				if err != nil {
 					return nil, err
 				}
-				indexDesc, err := tableDesc.FindIndexByID(descpb.IndexID(indexID))
+				index, err := tableDesc.FindIndexWithID(descpb.IndexID(indexID))
 				if err != nil {
 					return nil, err
 				}
+				indexDesc := index.IndexDesc()
 				// Collect the index columns. If the index is a non-unique secondary
 				// index, it might have some extra key columns.
 				indexColIDs := indexDesc.ColumnIDs
@@ -4135,14 +4143,14 @@ may increase either contention or retry errors, or both.`,
 				if err != nil {
 					return nil, err
 				}
-				indexDesc, err := tableDesc.FindIndexByID(descpb.IndexID(indexID))
+				index, err := tableDesc.FindIndexWithID(descpb.IndexID(indexID))
 				if err != nil {
 					return nil, err
 				}
-				if indexDesc.GeoConfig.S2Geography == nil {
+				if index.GetGeoConfig().S2Geography == nil {
 					return nil, errors.Errorf("index_id %d is not a geography inverted index", indexID)
 				}
-				keys, err := rowenc.EncodeGeoInvertedIndexTableKeys(g, nil, indexDesc)
+				keys, err := rowenc.EncodeGeoInvertedIndexTableKeys(g, nil, index.IndexDesc())
 				if err != nil {
 					return nil, err
 				}
@@ -4169,14 +4177,14 @@ may increase either contention or retry errors, or both.`,
 				if err != nil {
 					return nil, err
 				}
-				indexDesc, err := tableDesc.FindIndexByID(descpb.IndexID(indexID))
+				index, err := tableDesc.FindIndexWithID(descpb.IndexID(indexID))
 				if err != nil {
 					return nil, err
 				}
-				if indexDesc.GeoConfig.S2Geometry == nil {
+				if index.GetGeoConfig().S2Geometry == nil {
 					return nil, errors.Errorf("index_id %d is not a geometry inverted index", indexID)
 				}
-				keys, err := rowenc.EncodeGeoInvertedIndexTableKeys(g, nil, indexDesc)
+				keys, err := rowenc.EncodeGeoInvertedIndexTableKeys(g, nil, index.IndexDesc())
 				if err != nil {
 					return nil, err
 				}
@@ -4711,6 +4719,27 @@ may increase either contention or retry errors, or both.`,
 			},
 			Info:       "Returns the number of nonnull arguments.",
 			Volatility: tree.VolatilityImmutable,
+		},
+	),
+
+	"gateway_region": makeBuiltin(
+		tree.FunctionProperties{Category: categoryMultiRegion},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(evalCtx *tree.EvalContext, arg tree.Datums) (tree.Datum, error) {
+				region, found := evalCtx.Locality.Find("region")
+				if !found {
+					return nil, pgerror.Newf(
+						pgcode.ConfigFile,
+						"no region set on the locality flag on this node",
+					)
+				}
+				return tree.NewDString(region), nil
+			},
+			Info: `Returns the region of the connection's current node as defined by
+the locality flag on node startup. Returns an error if no region is set.`,
+			Volatility: tree.VolatilityStable,
 		},
 	),
 }

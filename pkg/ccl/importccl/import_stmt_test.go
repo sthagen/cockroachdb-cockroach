@@ -6258,6 +6258,7 @@ func TestDisallowsInvalidFormatOptions(t *testing.T) {
 
 func TestImportInTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	baseDir := filepath.Join("testdata")
@@ -6268,12 +6269,15 @@ func TestImportInTenant(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
 	// Setup a few tenants, each with a different table.
-	conn10 := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+	_, conn10 := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
 	defer conn10.Close()
 	t10 := sqlutils.MakeSQLRunner(conn10)
 
+	// Prevent a logging assertion that the server ID is initialized multiple times.
+	log.TestingClearServerIdentifiers()
+
 	// Setup a few tenants, each with a different table.
-	conn11 := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MakeTenantID(11)})
+	_, conn11 := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MakeTenantID(11)})
 	defer conn11.Close()
 	t11 := sqlutils.MakeSQLRunner(conn11)
 

@@ -136,7 +136,7 @@ func showComments(
 	}
 
 	for _, indexComment := range tc.indexes {
-		idx, err := table.FindIndexByID(descpb.IndexID(indexComment.subID))
+		idx, err := table.FindIndexWithID(descpb.IndexID(indexComment.subID))
 		if err != nil {
 			return err
 		}
@@ -145,7 +145,7 @@ func showComments(
 		f.FormatNode(&tree.CommentOnIndex{
 			Index: tree.TableIndexName{
 				Table: *tn,
-				Index: tree.UnrestrictedName(idx.Name),
+				Index: tree.UnrestrictedName(idx.GetName()),
 			},
 			Comment: &indexComment.comment,
 		})
@@ -331,6 +331,11 @@ func ShowCreatePartitioning(
 	if partDesc.NumColumns == 0 {
 		return nil
 	}
+	// Do not print PARTITION BY clauses of non-primary indexes belonging to a table
+	// that is PARTITION BY ALL. The ALL will be printed for the PRIMARY INDEX clause.
+	if tableDesc.IsPartitionAllBy() && tableDesc.GetPrimaryIndexID() != idxDesc.ID {
+		return nil
+	}
 
 	// We don't need real prefixes in the DecodePartitionTuple calls because we
 	// only use the tree.Datums part of the output.
@@ -340,7 +345,11 @@ func ShowCreatePartitioning(
 	}
 
 	indentStr := strings.Repeat("\t", indent)
-	buf.WriteString(` PARTITION BY `)
+	buf.WriteString(` PARTITION `)
+	if tableDesc.IsPartitionAllBy() && tableDesc.GetPrimaryIndexID() == idxDesc.ID {
+		buf.WriteString(`ALL `)
+	}
+	buf.WriteString(`BY `)
 	if len(partDesc.List) > 0 {
 		buf.WriteString(`LIST`)
 	} else if len(partDesc.Range) > 0 {

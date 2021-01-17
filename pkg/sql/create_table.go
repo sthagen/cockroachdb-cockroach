@@ -251,10 +251,10 @@ func (n *createTableNode) startExec(params runParams) error {
 
 	// Warn against creating non-partitioned indexes on a partitioned table,
 	// which is undesirable in most cases.
-	if n.n.PartitionBy != nil {
+	if n.n.PartitionByTable.ContainsPartitions() {
 		for _, def := range n.n.Defs {
 			if d, ok := def.(*tree.IndexTableDef); ok {
-				if d.PartitionBy == nil {
+				if d.PartitionByIndex == nil {
 					params.p.BufferClientNotice(
 						params.ctx,
 						errors.WithHint(
@@ -350,9 +350,9 @@ func (n *createTableNode) startExec(params runParams) error {
 		}
 	}
 
-	for _, index := range desc.AllNonDropIndexes() {
-		if len(index.Interleave.Ancestors) > 0 {
-			if err := params.p.finalizeInterleave(params.ctx, desc, index); err != nil {
+	for _, index := range desc.NonDropIndexes() {
+		if index.NumInterleaveAncestors() > 0 {
+			if err := params.p.finalizeInterleave(params.ctx, desc, index.IndexDesc()); err != nil {
 				return err
 			}
 		}
@@ -366,11 +366,11 @@ func (n *createTableNode) startExec(params runParams) error {
 	// TODO(otan): for MR databases with no locality set, set a default locality
 	// and add a notice.
 	if desc.LocalityConfig != nil {
-		dbDesc, err := params.p.Descriptors().GetDatabaseVersionByID(
+		dbDesc, err := params.p.Descriptors().GetImmutableDatabaseByID(
 			params.ctx,
 			params.p.txn,
 			desc.ParentID,
-			tree.DatabaseLookupFlags{Required: true},
+			tree.DatabaseLookupFlags{},
 		)
 		if err != nil {
 			return errors.Wrap(err, "error resolving database for multi-region")
@@ -785,9 +785,9 @@ func ResolveFK(
 	referencedColNames := d.ToCols
 	// If no columns are specified, attempt to default to PK.
 	if len(referencedColNames) == 0 {
-		referencedColNames = make(tree.NameList, len(target.GetPrimaryIndex().ColumnNames))
-		for i, n := range target.GetPrimaryIndex().ColumnNames {
-			referencedColNames[i] = tree.Name(n)
+		referencedColNames = make(tree.NameList, target.GetPrimaryIndex().NumColumns())
+		for i := range referencedColNames {
+			referencedColNames[i] = tree.Name(target.GetPrimaryIndex().GetColumnName(i))
 		}
 	}
 
@@ -907,8 +907,8 @@ func ResolveFK(
 		}
 	}
 
-	// Ensure that there is an index on the referenced side to use.
-	_, err = tabledesc.FindFKReferencedIndex(target, targetColIDs)
+	// Ensure that there is a unique constraint on the referenced side to use.
+	_, err = tabledesc.FindFKReferencedUniqueConstraint(target, targetColIDs)
 	if err != nil {
 		return err
 	}
@@ -977,8 +977,8 @@ func addIndexForFK(
 		if err := tbl.AllocateIDs(ctx); err != nil {
 			return 0, err
 		}
-		added := tbl.GetPublicNonPrimaryIndexes()[len(tbl.GetPublicNonPrimaryIndexes())-1]
-		return added.ID, nil
+		added := tbl.PublicNonPrimaryIndexes()[len(tbl.PublicNonPrimaryIndexes())-1]
+		return added.GetID(), nil
 	}
 
 	// TODO (lucy): In the EmptyTable case, we add an index mutation, making this
@@ -1035,12 +1035,12 @@ func addInterleave(
 		typeOfIndex = "index"
 	}
 
-	if len(interleave.Fields) != len(parentIndex.ColumnIDs) {
+	if len(interleave.Fields) != parentIndex.NumColumns() {
 		return pgerror.Newf(
 			pgcode.InvalidSchemaDefinition,
 			"declared interleaved columns (%s) must match the parent's primary index (%s)",
 			&interleave.Fields,
-			strings.Join(parentIndex.ColumnNames, ", "),
+			strings.Join(parentIndex.IndexDesc().ColumnNames, ", "),
 		)
 	}
 	if len(interleave.Fields) > len(index.ColumnIDs) {
@@ -1053,7 +1053,8 @@ func addInterleave(
 		)
 	}
 
-	for i, targetColID := range parentIndex.ColumnIDs {
+	for i := 0; i < parentIndex.NumColumns(); i++ {
+		targetColID := parentIndex.GetColumnID(i)
 		targetCol, err := parentTable.FindColumnByID(targetColID)
 		if err != nil {
 			return err
@@ -1071,22 +1072,25 @@ func addInterleave(
 				strings.Join(index.ColumnNames, ", "),
 			)
 		}
-		if !col.Type.Identical(targetCol.Type) || index.ColumnDirections[i] != parentIndex.ColumnDirections[i] {
+		if !col.Type.Identical(targetCol.Type) || index.ColumnDirections[i] != parentIndex.GetColumnDirection(i) {
 			return pgerror.Newf(
 				pgcode.InvalidSchemaDefinition,
 				"declared interleaved columns (%s) must match type and sort direction of the parent's primary index (%s)",
 				&interleave.Fields,
-				strings.Join(parentIndex.ColumnNames, ", "),
+				strings.Join(parentIndex.IndexDesc().ColumnNames, ", "),
 			)
 		}
 	}
 
-	ancestorPrefix := append(
-		[]descpb.InterleaveDescriptor_Ancestor(nil), parentIndex.Interleave.Ancestors...)
+	ancestorPrefix := make([]descpb.InterleaveDescriptor_Ancestor, parentIndex.NumInterleaveAncestors())
+	for i := range ancestorPrefix {
+		ancestorPrefix[i] = parentIndex.GetInterleaveAncestor(i)
+	}
+
 	intl := descpb.InterleaveDescriptor_Ancestor{
 		TableID:         parentTable.ID,
-		IndexID:         parentIndex.ID,
-		SharedPrefixLen: uint32(len(parentIndex.ColumnIDs)),
+		IndexID:         parentIndex.GetID(),
+		SharedPrefixLen: uint32(parentIndex.NumColumns()),
 	}
 	for _, ancestor := range ancestorPrefix {
 		intl.SharedPrefixLen -= ancestor.SharedPrefixLen
@@ -1118,11 +1122,11 @@ func (p *planner) finalizeInterleave(
 			return err
 		}
 	}
-	ancestorIndex, err := ancestorTable.FindIndexByID(ancestor.IndexID)
+	ancestorIndex, err := ancestorTable.FindIndexWithID(ancestor.IndexID)
 	if err != nil {
 		return err
 	}
-	ancestorIndex.InterleavedBy = append(ancestorIndex.InterleavedBy,
+	ancestorIndex.IndexDesc().InterleavedBy = append(ancestorIndex.IndexDesc().InterleavedBy,
 		descpb.ForeignKeyReference{Table: desc.ID, Index: index.ID})
 
 	if err := p.writeSchemaChange(
@@ -1157,13 +1161,16 @@ func CreatePartitioning(
 	evalCtx *tree.EvalContext,
 	tableDesc *tabledesc.Mutable,
 	indexDesc *descpb.IndexDescriptor,
+	numImplicitColumns int,
 	partBy *tree.PartitionBy,
 ) (descpb.PartitioningDescriptor, error) {
 	if partBy == nil {
 		// No CCL necessary if we're looking at PARTITION BY NOTHING.
 		return descpb.PartitioningDescriptor{}, nil
 	}
-	return CreatePartitioningCCL(ctx, st, evalCtx, tableDesc, indexDesc, partBy)
+	return CreatePartitioningCCL(
+		ctx, st, evalCtx, tableDesc, indexDesc, numImplicitColumns, partBy,
+	)
 }
 
 // CreatePartitioningCCL is the public hook point for the CCL-licensed
@@ -1174,6 +1181,7 @@ var CreatePartitioningCCL = func(
 	evalCtx *tree.EvalContext,
 	tableDesc *tabledesc.Mutable,
 	indexDesc *descpb.IndexDescriptor,
+	numImplicitColumns int,
 	partBy *tree.PartitionBy,
 ) (descpb.PartitioningDescriptor, error) {
 	return descpb.PartitioningDescriptor{}, sqlerrors.NewCCLRequiredError(errors.New(
@@ -1372,7 +1380,7 @@ func NewTableDesc(
 				if !sessionData.HashShardedIndexesEnabled {
 					return nil, hashShardedIndexesDisabledError
 				}
-				if n.PartitionBy != nil {
+				if n.PartitionByTable.ContainsPartitions() {
 					return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
 				}
 				if n.Interleave != nil {
@@ -1473,7 +1481,7 @@ func NewTableDesc(
 
 	var primaryIndexColumnSet map[string]struct{}
 	setupShardedIndexForNewTable := func(d *tree.IndexTableDef, idx *descpb.IndexDescriptor) error {
-		if n.PartitionBy != nil {
+		if n.PartitionByTable.ContainsPartitions() {
 			return pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
 		}
 		shardCol, newColumn, err := setupShardedIndex(
@@ -1503,6 +1511,22 @@ func NewTableDesc(
 		}
 		return nil
 	}
+
+	var partitionByAll *tree.PartitionBy
+	if n.PartitionByTable != nil && n.PartitionByTable.All {
+		if !evalCtx.SessionData.ImplicitColumnPartitioningEnabled {
+			return nil, errors.WithHint(
+				pgerror.New(
+					pgcode.FeatureNotSupported,
+					"PARTITION ALL BY LIST/RANGE is currently experimental",
+				),
+				"to enable, use SET experimental_enable_implicit_column_partitioning = true",
+			)
+		}
+		desc.PartitionAllBy = true
+		partitionByAll = n.PartitionByTable.PartitionBy
+	}
+
 	idxValidator := schemaexpr.MakeIndexPredicateValidator(ctx, n.Table, &desc, semaCtx)
 	for _, def := range n.Defs {
 		switch d := def.(type) {
@@ -1510,6 +1534,11 @@ func NewTableDesc(
 			// pass, handled above.
 
 		case *tree.IndexTableDef:
+			// If the index is named, ensure that the name is unique.
+			// Unnamed indexes will be given a unique auto-generated name later on.
+			if d.Name != "" && desc.ValidateIndexNameIsUnique(d.Name.String()) != nil {
+				return nil, pgerror.Newf(pgcode.DuplicateRelation, "duplicate index name: %q", d.Name)
+			}
 			idx := descpb.IndexDescriptor{
 				Name:             string(d.Name),
 				StoreColumnNames: d.Storing.ToStrings(),
@@ -1548,8 +1577,36 @@ func NewTableDesc(
 					idx.GeoConfig = *geoindex.DefaultGeographyIndexConfig()
 				}
 			}
-			if d.PartitionBy != nil {
-				partitioning, err := CreatePartitioning(ctx, st, evalCtx, &desc, &idx, d.PartitionBy)
+			if d.PartitionByIndex.ContainsPartitions() || partitionByAll != nil {
+				partitionBy := partitionByAll
+				if partitionByAll == nil {
+					partitionBy = d.PartitionByIndex.PartitionBy
+				} else if d.PartitionByIndex.ContainsPartitions() {
+					return nil, pgerror.New(
+						pgcode.FeatureNotSupported,
+						"cannot define PARTITION BY on an index if the table has a PARTITION ALL BY definition",
+					)
+				}
+				var numImplicitColumns int
+				var err error
+				idx, numImplicitColumns, err = detectImplicitPartitionColumns(
+					evalCtx,
+					&desc,
+					idx,
+					partitionBy,
+				)
+				if err != nil {
+					return nil, err
+				}
+				partitioning, err := CreatePartitioning(
+					ctx,
+					st,
+					evalCtx,
+					&desc,
+					&idx,
+					numImplicitColumns,
+					partitionBy,
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -1601,8 +1658,37 @@ func NewTableDesc(
 			if err := idx.FillColumns(d.Columns); err != nil {
 				return nil, err
 			}
-			if d.PartitionBy != nil {
-				partitioning, err := CreatePartitioning(ctx, st, evalCtx, &desc, &idx, d.PartitionBy)
+			if d.PartitionByIndex.ContainsPartitions() || partitionByAll != nil {
+				partitionBy := partitionByAll
+				if partitionByAll == nil {
+					partitionBy = d.PartitionByIndex.PartitionBy
+				} else if d.PartitionByIndex.ContainsPartitions() {
+					return nil, pgerror.New(
+						pgcode.FeatureNotSupported,
+						"cannot define PARTITION BY on an unique constraint if the table has a PARTITION ALL BY definition",
+					)
+				}
+
+				var numImplicitColumns int
+				var err error
+				idx, numImplicitColumns, err = detectImplicitPartitionColumns(
+					evalCtx,
+					&desc,
+					idx,
+					partitionBy,
+				)
+				if err != nil {
+					return nil, err
+				}
+				partitioning, err := CreatePartitioning(
+					ctx,
+					st,
+					evalCtx,
+					&desc,
+					&idx,
+					numImplicitColumns,
+					partitionBy,
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -1643,7 +1729,7 @@ func NewTableDesc(
 	}
 
 	// If explicit primary keys are required, error out since a primary key was not supplied.
-	if len(desc.GetPrimaryIndex().ColumnNames) == 0 && desc.IsPhysicalTable() && evalCtx != nil &&
+	if desc.GetPrimaryIndex().NumColumns() == 0 && desc.IsPhysicalTable() && evalCtx != nil &&
 		evalCtx.SessionData != nil && evalCtx.SessionData.RequireExplicitPrimaryKeys {
 		return nil, errors.Errorf(
 			"no primary key specified for table %s (require_explicit_primary_keys = true)", desc.Name)
@@ -1677,14 +1763,14 @@ func NewTableDesc(
 
 	// Assign any implicitly added shard columns to the column family of the first column
 	// in their corresponding set of index columns.
-	for _, index := range desc.AllNonDropIndexes() {
-		if index.IsSharded() && !columnsInExplicitFamilies[index.Sharded.Name] {
+	for _, index := range desc.NonDropIndexes() {
+		if index.IsSharded() && !columnsInExplicitFamilies[index.GetShardColumnName()] {
 			// Ensure that the shard column wasn't explicitly assigned a column family
 			// during table creation (this will happen when a create statement is
 			// "roundtripped", for example).
-			family := tabledesc.GetColumnFamilyForShard(&desc, index.Sharded.ColumnNames)
+			family := tabledesc.GetColumnFamilyForShard(&desc, index.GetSharded().ColumnNames)
 			if family != "" {
-				if err := desc.AddColumnToFamilyMaybeCreate(index.Sharded.Name, family, false, false); err != nil {
+				if err := desc.AddColumnToFamilyMaybeCreate(index.GetShardColumnName(), family, false, false); err != nil {
 					return nil, err
 				}
 			}
@@ -1695,31 +1781,43 @@ func NewTableDesc(
 		return nil, err
 	}
 
-	for i := range desc.GetPublicNonPrimaryIndexes() {
-		idx := &desc.GetPublicNonPrimaryIndexes()[i]
+	for _, idx := range desc.PublicNonPrimaryIndexes() {
 		// Increment the counter if this index could be storing data across multiple column families.
-		if len(idx.StoreColumnNames) > 1 && len(desc.Families) > 1 {
+		if idx.NumStoredColumns() > 1 && len(desc.Families) > 1 {
 			telemetry.Inc(sqltelemetry.SecondaryIndexColumnFamiliesCounter)
 		}
 	}
 
 	if n.Interleave != nil {
-		if err := addInterleave(ctx, txn, vt, &desc, desc.GetPrimaryIndex(), n.Interleave); err != nil {
+		if err := addInterleave(ctx, txn, vt, &desc, desc.GetPrimaryIndex().IndexDesc(), n.Interleave); err != nil {
 			return nil, err
 		}
 	}
 
-	if n.PartitionBy != nil {
-		partitioning, err := CreatePartitioning(
-			ctx, st, evalCtx, &desc, desc.GetPrimaryIndex(), n.PartitionBy)
+	if n.PartitionByTable.ContainsPartitions() {
+		newPrimaryIndex, numImplicitColumns, err := detectImplicitPartitionColumns(
+			evalCtx,
+			&desc,
+			*desc.GetPrimaryIndex().IndexDesc(),
+			n.PartitionByTable.PartitionBy,
+		)
 		if err != nil {
 			return nil, err
 		}
-		{
-			newPrimaryIndex := *desc.GetPrimaryIndex()
-			newPrimaryIndex.Partitioning = partitioning
-			desc.SetPrimaryIndex(newPrimaryIndex)
+		partitioning, err := CreatePartitioning(
+			ctx,
+			st,
+			evalCtx,
+			&desc,
+			&newPrimaryIndex,
+			numImplicitColumns,
+			n.PartitionByTable.PartitionBy,
+		)
+		if err != nil {
+			return nil, err
 		}
+		newPrimaryIndex.Partitioning = partitioning
+		desc.SetPrimaryIndex(newPrimaryIndex)
 	}
 
 	// Once all the IDs have been allocated, we can add the Sequence dependencies
@@ -1804,7 +1902,7 @@ func NewTableDesc(
 						"interleaved unique constraints without an index are not supported",
 					)
 				}
-				if d.PartitionBy != nil {
+				if d.PartitionByIndex.ContainsPartitions() {
 					return nil, pgerror.New(pgcode.FeatureNotSupported,
 						"partitioned unique constraints without an index are not supported",
 					)
@@ -1862,9 +1960,15 @@ func NewTableDesc(
 		switch d := def.(type) {
 		case *tree.ColumnTableDef:
 			if d.IsComputed() {
-				if err := computedColValidator.Validate(d); err != nil {
+				serializedExpr, err := computedColValidator.Validate(d)
+				if err != nil {
 					return nil, err
 				}
+				col, _, err := desc.FindColumnByName(d.Name)
+				if err != nil {
+					return nil, err
+				}
+				col.ComputeExpr = &serializedExpr
 			}
 		}
 	}
@@ -1878,16 +1982,17 @@ func NewTableDesc(
 	}
 
 	// Record the types of indexes that the table has.
-	if err := desc.ForeachNonDropIndex(func(idx *descpb.IndexDescriptor) error {
+	if err := catalog.ForEachNonDropIndex(&desc, func(idx catalog.Index) error {
 		if idx.IsSharded() {
 			telemetry.Inc(sqltelemetry.HashShardedIndexCounter)
 		}
-		if idx.Type == descpb.IndexDescriptor_INVERTED {
+		if idx.GetType() == descpb.IndexDescriptor_INVERTED {
 			telemetry.Inc(sqltelemetry.InvertedIndexCounter)
-			if !geoindex.IsEmptyConfig(&idx.GeoConfig) {
-				if geoindex.IsGeographyConfig(&idx.GeoConfig) {
+			geoConfig := idx.GetGeoConfig()
+			if !geoindex.IsEmptyConfig(&geoConfig) {
+				if geoindex.IsGeographyConfig(&geoConfig) {
 					telemetry.Inc(sqltelemetry.GeographyInvertedIndexCounter)
-				} else if geoindex.IsGeometryConfig(&idx.GeoConfig) {
+				} else if geoindex.IsGeometryConfig(&geoConfig) {
 					telemetry.Inc(sqltelemetry.GeometryInvertedIndexCounter)
 				}
 			}
@@ -1914,13 +2019,19 @@ func NewTableDesc(
 				RegionalByTable: &descpb.TableDescriptor_LocalityConfig_RegionalByTable{},
 			}
 			if n.Locality.TableRegion != "" {
-				region := descpb.Region(n.Locality.TableRegion)
+				region := descpb.RegionName(n.Locality.TableRegion)
 				l.RegionalByTable.Region = &region
 			}
 			desc.LocalityConfig.Locality = l
 		case tree.LocalityLevelRow:
 			desc.LocalityConfig.Locality = &descpb.TableDescriptor_LocalityConfig_RegionalByRow_{
 				RegionalByRow: &descpb.TableDescriptor_LocalityConfig_RegionalByRow{},
+			}
+			if n.Locality.RegionalByRowColumn != "" {
+				return nil, unimplemented.New(
+					"REGIONAL BY ROW AS",
+					"REGIONAL BY ROW AS is not yet supported",
+				)
 			}
 		default:
 			return nil, errors.Newf("unknown locality level: %v", n.Locality.LocalityLevel)
@@ -2129,47 +2240,50 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 			}
 		}
 		if opts.Has(tree.LikeTableOptIndexes) {
-			for _, idx := range td.AllNonDropIndexes() {
+			for _, idx := range td.NonDropIndexes() {
 				indexDef := tree.IndexTableDef{
-					Name:     tree.Name(idx.Name),
-					Inverted: idx.Type == descpb.IndexDescriptor_INVERTED,
-					Storing:  make(tree.NameList, 0, len(idx.StoreColumnNames)),
-					Columns:  make(tree.IndexElemList, 0, len(idx.ColumnNames)),
+					Name:     tree.Name(idx.GetName()),
+					Inverted: idx.GetType() == descpb.IndexDescriptor_INVERTED,
+					Storing:  make(tree.NameList, 0, idx.NumStoredColumns()),
+					Columns:  make(tree.IndexElemList, 0, idx.NumColumns()),
 				}
-				columnNames := idx.ColumnNames
+				numColumns := idx.NumColumns()
 				if idx.IsSharded() {
 					indexDef.Sharded = &tree.ShardedIndexDef{
-						ShardBuckets: tree.NewDInt(tree.DInt(idx.Sharded.ShardBuckets)),
+						ShardBuckets: tree.NewDInt(tree.DInt(idx.GetSharded().ShardBuckets)),
 					}
-					columnNames = idx.Sharded.ColumnNames
+					numColumns = len(idx.GetSharded().ColumnNames)
 				}
-				for i, name := range columnNames {
+				for j := 0; j < numColumns; j++ {
+					name := idx.GetColumnName(j)
+					if idx.IsSharded() {
+						name = idx.GetSharded().ColumnNames[j]
+					}
 					elem := tree.IndexElem{
 						Column:    tree.Name(name),
 						Direction: tree.Ascending,
 					}
-					if idx.ColumnDirections[i] == descpb.IndexDescriptor_DESC {
+					if idx.GetColumnDirection(j) == descpb.IndexDescriptor_DESC {
 						elem.Direction = tree.Descending
 					}
 					indexDef.Columns = append(indexDef.Columns, elem)
 				}
-				for _, name := range idx.StoreColumnNames {
-					indexDef.Storing = append(indexDef.Storing, tree.Name(name))
+				for j := 0; j < idx.NumStoredColumns(); j++ {
+					indexDef.Storing = append(indexDef.Storing, tree.Name(idx.GetStoredColumnName(j)))
 				}
 				var def tree.TableDef = &indexDef
-				if idx.Unique {
-					isPK := idx.ID == td.GetPrimaryIndexID()
-					if isPK && td.IsPrimaryIndexDefaultRowID() {
+				if idx.IsUnique() {
+					if idx.Primary() && td.IsPrimaryIndexDefaultRowID() {
 						continue
 					}
 
 					def = &tree.UniqueConstraintTableDef{
 						IndexTableDef: indexDef,
-						PrimaryKey:    isPK,
+						PrimaryKey:    idx.Primary(),
 					}
 				}
 				if idx.IsPartial() {
-					indexDef.Predicate, err = parser.ParseExpr(idx.Predicate)
+					indexDef.Predicate, err = parser.ParseExpr(idx.GetPredicate())
 					if err != nil {
 						return nil, err
 					}
@@ -2326,4 +2440,53 @@ func CreateInheritedPrivilegesFromDBDesc(
 	privs.SetOwner(user)
 
 	return privs
+}
+
+// detectImplicitPartitionColumns detects implicit partitioning columns
+// and returns a new index descriptor with the implicit columns modified
+// on the index descriptor and the number of implicit columns prepended.
+func detectImplicitPartitionColumns(
+	evalCtx *tree.EvalContext,
+	tableDesc *tabledesc.Mutable,
+	indexDesc descpb.IndexDescriptor,
+	partBy *tree.PartitionBy,
+) (descpb.IndexDescriptor, int, error) {
+	if !evalCtx.SessionData.ImplicitColumnPartitioningEnabled {
+		return indexDesc, 0, nil
+	}
+	seenImplicitColumnNames := map[string]struct{}{}
+	var implicitColumnIDs []descpb.ColumnID
+	var implicitColumns []string
+	var implicitColumnDirections []descpb.IndexDescriptor_Direction
+	// Iterate over each field in the PARTITION BY until it matches the start
+	// of the actual explicitly indexed columns.
+	for _, field := range partBy.Fields {
+		// As soon as the fields match, we have no implicit columns to add.
+		if string(field) == indexDesc.ColumnNames[0] {
+			break
+		}
+
+		col, err := tableDesc.FindActiveColumnByName(string(field))
+		if err != nil {
+			return indexDesc, 0, err
+		}
+		if _, ok := seenImplicitColumnNames[col.Name]; ok {
+			return indexDesc, 0, pgerror.Newf(
+				pgcode.InvalidObjectDefinition,
+				`found multiple definitions in partition using column "%s"`,
+				col.Name,
+			)
+		}
+		seenImplicitColumnNames[col.Name] = struct{}{}
+		implicitColumns = append(implicitColumns, col.Name)
+		implicitColumnIDs = append(implicitColumnIDs, col.ID)
+		implicitColumnDirections = append(implicitColumnDirections, descpb.IndexDescriptor_ASC)
+	}
+
+	if len(implicitColumns) > 0 {
+		indexDesc.ColumnNames = append(implicitColumns, indexDesc.ColumnNames...)
+		indexDesc.ColumnIDs = append(implicitColumnIDs, indexDesc.ColumnIDs...)
+		indexDesc.ColumnDirections = append(implicitColumnDirections, indexDesc.ColumnDirections...)
+	}
+	return indexDesc, len(implicitColumns), nil
 }

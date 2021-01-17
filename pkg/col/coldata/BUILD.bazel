@@ -37,7 +37,6 @@ go_test(
     ],
     embed = [":coldata"],
     deps = [
-        "//pkg/col/coldata",
         "//pkg/col/coldatatestutils",
         "//pkg/sql/types",
         "//pkg/testutils/buildutil",
@@ -56,10 +55,10 @@ genrule(
     cmd = """
       $(location //pkg/sql/colexec/execgen/cmd/execgen) \
         -fmt=false pkg/col/coldata/$@ > $@
-      $(location //vendor/github.com/cockroachdb/gostdlib/x/tools/cmd/goimports) -w $@
+      $(location @com_github_cockroachdb_gostdlib//x/tools/cmd/goimports) -w $@
     """,
     tools = [
         "//pkg/sql/colexec/execgen/cmd/execgen",
-        "//vendor/github.com/cockroachdb/gostdlib/x/tools/cmd/goimports",
+        "@com_github_cockroachdb_gostdlib//x/tools/cmd/goimports",
     ],
 )

@@ -597,22 +597,24 @@ var logicTestConfigs = []testClusterConfig{
 		useTenant:         true,
 		isCCLConfig:       true,
 	},
+	// Regions and zones below are named deliberately, and contain "-"'s to be reflective
+	// of the naming convention in public clouds.  "-"'s are handled differently in SQL
+	// (they're double double quoted) so we explicitly test them here to ensure that
+	// the multi-region code handles them correctly.
+
 	{
-		name:              "multiregion-9node-3region-3azs",
-		numNodes:          9,
+		name:              "multiregion-invalid-locality",
+		numNodes:          3,
 		overrideAutoStats: "false",
 		localities: map[int]roachpb.Locality{
 			1: {
 				Tiers: []roachpb.Tier{
-					{Key: "region", Value: "test1"},
+					{Key: "invalid-region-setup", Value: "test1"},
 					{Key: "availability-zone", Value: "test1-az1"},
 				},
 			},
 			2: {
-				Tiers: []roachpb.Tier{
-					{Key: "region", Value: "test1"},
-					{Key: "availability-zone", Value: "test1-az2"},
-				},
+				Tiers: []roachpb.Tier{},
 			},
 			3: {
 				Tiers: []roachpb.Tier{
@@ -620,40 +622,65 @@ var logicTestConfigs = []testClusterConfig{
 					{Key: "availability-zone", Value: "test1-az3"},
 				},
 			},
+		},
+	},
+	{
+		name:              "multiregion-9node-3region-3azs",
+		numNodes:          9,
+		overrideAutoStats: "false",
+		localities: map[int]roachpb.Locality{
+			1: {
+				Tiers: []roachpb.Tier{
+					{Key: "region", Value: "ap-southeast-2"},
+					{Key: "availability-zone", Value: "ap-az1"},
+				},
+			},
+			2: {
+				Tiers: []roachpb.Tier{
+					{Key: "region", Value: "ap-southeast-2"},
+					{Key: "availability-zone", Value: "ap-az2"},
+				},
+			},
+			3: {
+				Tiers: []roachpb.Tier{
+					{Key: "region", Value: "ap-southeast-2"},
+					{Key: "availability-zone", Value: "ap-az3"},
+				},
+			},
 			4: {
 				Tiers: []roachpb.Tier{
-					{Key: "region", Value: "test2"},
-					{Key: "availability-zone", Value: "test2-az1"},
+					{Key: "region", Value: "ca-central-1"},
+					{Key: "availability-zone", Value: "ca-az1"},
 				},
 			},
 			5: {
 				Tiers: []roachpb.Tier{
-					{Key: "region", Value: "test2"},
-					{Key: "availability-zone", Value: "test2-az2"},
+					{Key: "region", Value: "ca-central-1"},
+					{Key: "availability-zone", Value: "ca-az2"},
 				},
 			},
 			6: {
 				Tiers: []roachpb.Tier{
-					{Key: "region", Value: "test2"},
-					{Key: "availability-zone", Value: "test2-az3"},
+					{Key: "region", Value: "ca-central-1"},
+					{Key: "availability-zone", Value: "ca-az3"},
 				},
 			},
 			7: {
 				Tiers: []roachpb.Tier{
-					{Key: "region", Value: "test3"},
-					{Key: "availability-zone", Value: "test3-az1"},
+					{Key: "region", Value: "us-east-1"},
+					{Key: "availability-zone", Value: "us-az1"},
 				},
 			},
 			8: {
 				Tiers: []roachpb.Tier{
-					{Key: "region", Value: "test3"},
-					{Key: "availability-zone", Value: "test3-az2"},
+					{Key: "region", Value: "us-east-1"},
+					{Key: "availability-zone", Value: "us-az2"},
 				},
 			},
 			9: {
 				Tiers: []roachpb.Tier{
-					{Key: "region", Value: "test3"},
-					{Key: "availability-zone", Value: "test3-az3"},
+					{Key: "region", Value: "us-east-1"},
+					{Key: "availability-zone", Value: "us-az3"},
 				},
 			},
 		},
@@ -1022,6 +1049,9 @@ type logicQuery struct {
 	kvOpTypes        []string
 	keyPrefixFilters []string
 
+	// nodeIdx determines which node on the cluster to execute a query on for the given query.
+	nodeIdx int
+
 	// noticetrace indicates we're comparing the output of a notice trace.
 	noticetrace bool
 
@@ -1061,8 +1091,13 @@ type logicTest struct {
 	subtestT *testing.T
 	rng      *rand.Rand
 	cfg      testClusterConfig
-	// the number of nodes in the cluster.
+	// cluster is the test cluster against which we are testing. This cluster
+	// may be reset during the lifetime of the test.
 	cluster serverutils.TestClusterInterface
+	// sharedIODir is the ExternalIO directory that is shared between all clusters
+	// created in the same logicTest. It is populated during setup() of the logic
+	// test.
+	sharedIODir string
 	// the index of the node (within the cluster) against which we run the test
 	// statements.
 	nodeIdx int
@@ -1075,9 +1110,18 @@ type logicTest struct {
 	// client currently in use. This can change during processing
 	// of a test input file when encountering the "user" directive.
 	// see setUser() for details.
-	user         string
-	db           *gosql.DB
-	cleanupFuncs []func()
+	user string
+	db   *gosql.DB
+	// clusterCleanupFuncs contains the cleanup methods that are specific to a
+	// cluster. These will be called during cluster tear-down. Note that 1 logic
+	// test may reset its cluster throughout a test. Cleanup methods that should
+	// be stored here include PGUrl connections for the users for a cluster.
+	clusterCleanupFuncs []func()
+	// testCleanupFuncs are cleanup methods that are only called when closing a
+	// test (rather than a specific cluster). One test may reset a cluster with a
+	// new one, but keep some shared resources across the entire test. An example
+	// would be an IO directory used throughout the test.
+	testCleanupFuncs []func()
 	// progress holds the number of tests executed so far.
 	progress int
 	// failures holds the number of tests failed so far, when
@@ -1175,22 +1219,12 @@ func (t *logicTest) emit(line string) {
 func (t *logicTest) close() {
 	t.traceStop()
 
-	for _, cleanup := range t.cleanupFuncs {
+	t.shutdownCluster()
+
+	for _, cleanup := range t.testCleanupFuncs {
 		cleanup()
 	}
-	t.cleanupFuncs = nil
-
-	if t.cluster != nil {
-		t.cluster.Stopper().Stop(context.TODO())
-		t.cluster = nil
-	}
-	if t.clients != nil {
-		for _, c := range t.clients {
-			c.Close()
-		}
-		t.clients = nil
-	}
-	t.db = nil
+	t.testCleanupFuncs = nil
 }
 
 // out emits a message both on stdout and the log files if
@@ -1224,22 +1258,7 @@ func (t *logicTest) setUser(user string) func() {
 	}
 	pgURL, cleanupFunc := sqlutils.PGUrl(t.rootT, addr, "TestLogic", url.User(user))
 	pgURL.Path = "test"
-
-	base, err := pq.NewConnector(pgURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	connector := pq.ConnectorWithNoticeHandler(base, func(notice *pq.Error) {
-		t.noticeBuffer = append(t.noticeBuffer, notice.Severity+": "+notice.Message)
-		if notice.Detail != "" {
-			t.noticeBuffer = append(t.noticeBuffer, "DETAIL: "+notice.Detail)
-		}
-		if notice.Hint != "" {
-			t.noticeBuffer = append(t.noticeBuffer, "HINT: "+notice.Hint)
-		}
-	})
-	db := gosql.OpenDB(connector)
+	db := t.openDB(pgURL)
 
 	// The default value for extra_float_digits assumed by tests is
 	// 0. However, lib/pq by default configures this to 2 during
@@ -1255,10 +1274,30 @@ func (t *logicTest) setUser(user string) func() {
 	return cleanupFunc
 }
 
-func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
-	t.cfg = cfg
-	// TODO(pmattis): Add a flag to make it easy to run the tests against a local
-	// MySQL or Postgres instance.
+func (t *logicTest) openDB(pgURL url.URL) *gosql.DB {
+	base, err := pq.NewConnector(pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	connector := pq.ConnectorWithNoticeHandler(base, func(notice *pq.Error) {
+		t.noticeBuffer = append(t.noticeBuffer, notice.Severity+": "+notice.Message)
+		if notice.Detail != "" {
+			t.noticeBuffer = append(t.noticeBuffer, "DETAIL: "+notice.Detail)
+		}
+		if notice.Hint != "" {
+			t.noticeBuffer = append(t.noticeBuffer, "HINT: "+notice.Hint)
+		}
+	})
+
+	return gosql.OpenDB(connector)
+}
+
+// newCluster creates a new cluster. It should be called after the logic tests's
+// server args are configured. That is, either during setup() when creating the
+// initial cluster to be used in a test, or when creating additional test
+// clusters, after logicTest.setup() has been called.
+func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 	// TODO(andrei): if createTestServerParams() is used here, the command filter
 	// it installs detects a transaction that doesn't have
 	// modifiedSystemConfigSpan set even though it should, for
@@ -1269,6 +1308,7 @@ func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 	} else {
 		tempStorageConfig = base.DefaultTestTempStorageConfigWithSize(cluster.MakeTestingClusterSettings(), serverArgs.tempStorageDiskLimit)
 	}
+
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			// Specify a fixed memory limit (some test cases verify OOM conditions; we
@@ -1291,8 +1331,8 @@ func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 					DeterministicExplainAnalyze: true,
 				},
 			},
-			ClusterName: "testclustername",
-			UseDatabase: "test",
+			ClusterName:   "testclustername",
+			ExternalIODir: t.sharedIODir,
 		},
 		// For distributed SQL tests, we use the fake span resolver; it doesn't
 		// matter where the data really is.
@@ -1304,6 +1344,7 @@ func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 		GenerateMockContentionEvents:         true,
 		CheckVectorizedFlowIsClosedCorrectly: true,
 	}
+	cfg := t.cfg
 	if cfg.sqlExecUseDisk {
 		distSQLKnobs.ForceDiskSpill = true
 	}
@@ -1379,12 +1420,21 @@ func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 		tenantArgs := base.TestTenantArgs{
 			TenantID:                    roachpb.MakeTenantID(10),
 			AllowSettingClusterSettings: true,
-			DeterministicExplainAnalyze: true,
+			TestingKnobs: base.TestingKnobs{
+				SQLExecutor: &sql.ExecutorTestingKnobs{
+					DeterministicExplainAnalyze: true,
+				},
+			},
 		}
-		t.tenantAddr, _, err = t.cluster.Server(t.nodeIdx).StartTenant(tenantArgs)
+
+		// Prevent a logging assertion that the server ID is initialized multiple times.
+		log.TestingClearServerIdentifiers()
+
+		tenant, err := t.cluster.Server(t.nodeIdx).StartTenant(tenantArgs)
 		if err != nil {
 			t.rootT.Fatalf("%+v", err)
 		}
+		t.tenantAddr = tenant.SQLAddr()
 
 		// Open a connection to this tenant to set any cluster settings specified
 		// by the test config.
@@ -1524,10 +1574,48 @@ func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 
 	// db may change over the lifetime of this function, with intermediate
 	// values cached in t.clients and finally closed in t.close().
-	t.cleanupFuncs = append(t.cleanupFuncs, t.setUser(security.RootUser))
+	t.clusterCleanupFuncs = append(t.clusterCleanupFuncs, t.setUser(security.RootUser))
+}
 
+// shutdownCluster performs the necessary cleanup to shutdown the current test
+// cluster.
+func (t *logicTest) shutdownCluster() {
+	for _, cleanup := range t.clusterCleanupFuncs {
+		cleanup()
+	}
+	t.clusterCleanupFuncs = nil
+
+	if t.cluster != nil {
+		t.cluster.Stopper().Stop(context.TODO())
+		t.cluster = nil
+	}
+	if t.clients != nil {
+		for _, c := range t.clients {
+			c.Close()
+		}
+		t.clients = nil
+	}
+	t.db = nil
+}
+
+// setup creates the initial cluster for the logic test and populates the
+// relevant fields on logicTest. It is expected to be called only once, and
+// before processing any test files - unless a mock logicTest is created (see
+// parallelTest.processTestFile).
+func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
+	t.cfg = cfg
+	// TODO(pmattis): Add a flag to make it easy to run the tests against a local
+	// MySQL or Postgres instance.
+	tempExternalIODir, tempExternalIODirCleanup := testutils.TempDir(t.rootT)
+	t.sharedIODir = tempExternalIODir
+	t.testCleanupFuncs = append(t.testCleanupFuncs, tempExternalIODirCleanup)
+
+	t.newCluster(serverArgs)
+
+	// Only create the test database on the initial cluster, since cluster restore
+	// expects an empty cluster.
 	if _, err := t.db.Exec(`
-CREATE DATABASE test;
+CREATE DATABASE test; USE test;
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -1598,22 +1686,19 @@ func processConfigs(t *testing.T, path string, defaults configSet, configNames [
 		blocklist[blockedConfig] = issueNo
 	}
 
-	var configs configSet
-	if util.IsMetamorphicBuild() {
-		for c := range blocklist {
-			if c == "metamorphic" {
-				// We have a metamorphic build and the file has !metamorphic
-				// blocklist directive which effectively skips the file, so we
-				// simply return empty configSet.
-				return configs
-			}
-		}
+	if _, ok := blocklist["metamorphic"]; ok && util.IsMetamorphicBuild() {
+		// We have a metamorphic build and the file has !metamorphic
+		// blocklist directive which effectively skips the file, so we
+		// simply return empty configSet.
+		t.Logf("will skip test %s because it cannot run in a metamorphic build; pass TAGS=crdb_test_off to disable metamorphic builds", path)
+		return configSet{}
 	}
 	if len(blocklist) != 0 && allConfigNamesAreBlocklistDirectives {
 		// No configs specified, this blocklist applies to the default configs.
 		return applyBlocklistToConfigs(defaults, blocklist)
 	}
 
+	var configs configSet
 	for _, configName := range configNames {
 		if configName[0] == blocklistChar {
 			continue
@@ -2012,6 +2097,15 @@ func (t *logicTest) processSubtest(
 							query.noticetrace = true
 
 						default:
+							if strings.HasPrefix(opt, "nodeidx=") {
+								idx, err := strconv.ParseInt(strings.SplitN(opt, "=", 2)[1], 10, 64)
+								if err != nil {
+									return errors.Wrapf(err, "error parsing nodeidx")
+								}
+								query.nodeIdx = int(idx)
+								break
+							}
+
 							return errors.Errorf("%s: unknown sort mode: %s", query.pos, opt)
 						}
 					}
@@ -2492,7 +2586,21 @@ func (t *logicTest) execQuery(query logicQuery) error {
 
 	t.noticeBuffer = nil
 
-	rows, err := t.db.Query(query.sql)
+	db := t.db
+	if query.nodeIdx != 0 {
+		addr := t.cluster.Server(query.nodeIdx).ServingSQLAddr()
+		pgURL, cleanupFunc := sqlutils.PGUrl(t.rootT, addr, "TestLogic", url.User(t.user))
+		defer cleanupFunc()
+		pgURL.Path = "test"
+
+		db = t.openDB(pgURL)
+		defer func() {
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+	}
+	rows, err := db.Query(query.sql)
 	if err == nil {
 		sqlutils.VerifyStatementPrettyRoundtrip(t.t(), query.sql)
 
@@ -3138,9 +3246,14 @@ func RunLogicTestWithDefaultConfig(
 					//  - we're generating testfiles, or
 					//  - we are in race mode (where we can hit a limit on alive
 					//    goroutines).
-					if !*showSQL && !*rewriteResultsInTestfiles && !*rewriteSQL && !util.RaceEnabled {
+					if !*showSQL && !*rewriteResultsInTestfiles && !*rewriteSQL && !util.RaceEnabled && !cfg.useTenant {
 						// Skip parallelizing tests that use the kv-batch-size directive since
 						// the batch size is a global variable.
+						//
+						// We also cannot parallelise tests that use tenant servers
+						// because they change shared state in the logging configuration
+						// and there is an assertion against conflicting changes.
+						//
 						// TODO(jordan, radu): make sqlbase.kvBatchSize non-global to fix this.
 						if filepath.Base(path) != "select_index_span_ranges" {
 							t.Parallel() // SAFE FOR TESTING (this comments satisfies the linter)

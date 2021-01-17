@@ -720,6 +720,7 @@ func TestLint(t *testing.T) {
 			":!util/timeutil/time.go",
 			":!util/timeutil/zoneinfo.go",
 			":!util/tracing/span.go",
+			":!util/tracing/crdbspan.go",
 			":!util/tracing/tracer.go",
 		)
 		if err != nil {
@@ -1020,6 +1021,7 @@ func TestLint(t *testing.T) {
 			":!util/protoutil/marshal.go",
 			":!util/protoutil/marshaler.go",
 			":!util/encoding/encoding.go",
+			":!util/hlc/timestamp.go",
 			":!sql/types/types_jsonpb.go",
 		)
 		if err != nil {
@@ -1836,6 +1838,7 @@ func TestLint(t *testing.T) {
 			"../../sql/colconv",
 			"../../sql/colexec",
 			"../../sql/colexec/colexecagg",
+			"../../sql/colfetcher",
 		); err != nil {
 			t.Fatal(err)
 		}

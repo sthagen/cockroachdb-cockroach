@@ -142,6 +142,8 @@ type uniqueCheckHelper struct {
 // Returns false if the constraint should be ignored (e.g. because the new
 // values for the unique columns are known to be always NULL).
 func (h *uniqueCheckHelper) init(mb *mutationBuilder, uniqueOrdinal int) bool {
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
 	*h = uniqueCheckHelper{
 		mb:            mb,
 		unique:        mb.tab.Unique(uniqueOrdinal),
@@ -233,7 +235,7 @@ func (h *uniqueCheckHelper) buildInsertionCheck() memo.UniqueChecksItem {
 	}
 	semiJoinFilters = append(semiJoinFilters, f.ConstructFiltersItem(pkFilter))
 
-	semiJoin := f.ConstructSemiJoin(checkInput, scanScope.expr, semiJoinFilters, &memo.JoinPrivate{})
+	semiJoin := f.ConstructSemiJoin(checkInput, scanScope.expr, semiJoinFilters, memo.EmptyJoinPrivate)
 
 	return f.ConstructUniqueChecksItem(semiJoin, &memo.UniqueChecksItemPrivate{
 		Table:        h.mb.tabID,

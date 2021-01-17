@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/logtags"
 	opentracing "github.com/opentracing/opentracing-go"
 	"golang.org/x/net/trace"
@@ -140,6 +141,25 @@ type Tracer struct {
 
 	// Pointer to shadowTracer, if using one.
 	shadowTracer unsafe.Pointer
+
+	// activeSpans is a map that references all non-Finish'ed local root spans
+	// (i.e. those for which no WithLocalParent(<non-nil>) option was supplied).
+	//
+	// In normal operation, a local root Span is inserted on creation and
+	// removed on .Finish().
+	//
+	// The map can be introspected by `Tracer.VisitSpans`.
+	activeSpans struct {
+		// NB: it might be tempting to use a sync.Map here, but
+		// this incurs an allocation per Span (sync.Map does
+		// not use a sync.Pool for its internal *entry type).
+		//
+		// The bare map approach is essentially allocation-free once the map
+		// has grown to accommodate the usual number of active local root spans,
+		// and the critical sections of the mutex are very small.
+		syncutil.Mutex
+		m map[*Span]struct{}
+	}
 }
 
 // NewTracer creates a Tracer. It initially tries to run with minimal overhead
@@ -147,6 +167,7 @@ type Tracer struct {
 // backends.
 func NewTracer() *Tracer {
 	t := &Tracer{}
+	t.activeSpans.m = map[*Span]struct{}{}
 	t.noopSpan = &Span{tracer: t}
 	return t
 }
@@ -242,7 +263,7 @@ func (t *Tracer) AlwaysTrace() bool {
 
 // startSpanGeneric is the implementation of StartSpanCtx and StartSpan. In
 // the latter case, ctx == noCtx and the returned Context is the supplied one;
-// otherwise the returned Context reflects the returned Span.
+// otherwise the returned Context embeds the returned Span.
 func (t *Tracer) startSpanGeneric(
 	ctx context.Context, opName string, opts spanOptions,
 ) (context.Context, *Span) {
@@ -397,16 +418,26 @@ func (t *Tracer) startSpanGeneric(
 	// spans contained in Span.
 	//
 	// NB: this could be optimized.
-	if opts.Parent != nil && !opts.Parent.isNoop() {
-		opts.Parent.crdb.mu.Lock()
-		m := opts.Parent.crdb.mu.Baggage
-		for k, v := range m {
-			s.SetBaggageItem(k, v)
+	if opts.Parent != nil {
+		if !opts.Parent.isNoop() {
+			opts.Parent.crdb.mu.Lock()
+			m := opts.Parent.crdb.mu.baggage
+			for k, v := range m {
+				s.SetBaggageItem(k, v)
+			}
+			opts.Parent.crdb.mu.Unlock()
 		}
-		opts.Parent.crdb.mu.Unlock()
-	} else if opts.RemoteParent != nil {
-		for k, v := range opts.RemoteParent.Baggage {
-			s.SetBaggageItem(k, v)
+	} else {
+		// Local root span - put it into the registry of active local root spans.
+		// `Span.Finish` takes care of deleting it again.
+		t.activeSpans.Lock()
+		t.activeSpans.m[s] = struct{}{}
+		t.activeSpans.Unlock()
+
+		if opts.RemoteParent != nil {
+			for k, v := range opts.RemoteParent.Baggage {
+				s.SetBaggageItem(k, v)
+			}
 		}
 	}
 
@@ -465,15 +496,6 @@ func (t *Tracer) Inject(sc *SpanMeta, format interface{}, carrier interface{}) e
 	}
 
 	return nil
-}
-
-type textMapReaderFn func(handler func(key, val string) error) error
-
-var _ opentracing.TextMapReader = textMapReaderFn(nil)
-
-// ForeachKey is part of the opentracing.TextMapReader interface.
-func (fn textMapReaderFn) ForeachKey(handler func(key, val string) error) error {
-	return fn(handler)
 }
 
 var noopSpanContext = &SpanMeta{}
@@ -575,6 +597,20 @@ func (t *Tracer) Extract(format interface{}, carrier interface{}) (*SpanMeta, er
 		recordingType:    recordingType,
 		Baggage:          baggage,
 	}, nil
+}
+
+// VisitSpans invokes the visitor with all active Spans.
+func (t *Tracer) VisitSpans(visitor func(*Span)) {
+	t.activeSpans.Lock()
+	sl := make([]*Span, 0, len(t.activeSpans.m))
+	for sp := range t.activeSpans.m {
+		sl = append(sl, sp)
+	}
+	t.activeSpans.Unlock()
+
+	for _, sp := range sl {
+		visitor(sp)
+	}
 }
 
 // ForkCtxSpan checks if ctx has a Span open; if it does, it creates a new Span

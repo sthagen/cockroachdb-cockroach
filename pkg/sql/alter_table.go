@@ -163,13 +163,20 @@ func (n *alterTableNode) startExec(params runParams) error {
 		switch t := cmd.(type) {
 		case *tree.AlterTableAddColumn:
 			if t.ColumnDef.Unique.WithoutIndex {
-				return pgerror.New(pgcode.FeatureNotSupported,
-					"unique constraints without an index are not yet supported",
+				// TODO(rytaft): add support for this in the future if we want to expose
+				// UNIQUE WITHOUT INDEX to users.
+				return errors.WithHint(
+					pgerror.New(
+						pgcode.FeatureNotSupported,
+						"adding a column marked as UNIQUE WITHOUT INDEX is unsupported",
+					),
+					"add the column first, then run ALTER TABLE ... ADD CONSTRAINT to add a "+
+						"UNIQUE WITHOUT INDEX constraint on the column",
 				)
 			}
 			var err error
 			params.p.runWithOptions(resolveFlags{contextDatabaseID: n.tableDesc.ParentID}, func() {
-				err = params.p.addColumnImpl(params, n, tn, n.tableDesc, t)
+				err = params.p.addColumnImpl(params, n, tn, n.tableDesc, t, params.SessionData())
 			})
 			if err != nil {
 				return err
@@ -178,10 +185,20 @@ func (n *alterTableNode) startExec(params runParams) error {
 			switch d := t.ConstraintDef.(type) {
 			case *tree.UniqueConstraintTableDef:
 				if d.WithoutIndex {
-					return pgerror.New(pgcode.FeatureNotSupported,
-						"unique constraints without an index are not yet supported",
-					)
+					if err := addUniqueWithoutIndexTableDef(
+						params.ctx,
+						params.EvalContext(),
+						params.SessionData(),
+						d,
+						n.tableDesc,
+						NonEmptyTable,
+						t.ValidationBehavior,
+					); err != nil {
+						return err
+					}
+					continue
 				}
+
 				if d.PrimaryKey {
 					// We only support "adding" a primary key when we are using the
 					// default rowid primary index or if a DROP PRIMARY KEY statement
@@ -220,31 +237,16 @@ func (n *alterTableNode) startExec(params runParams) error {
 				if err := idx.FillColumns(d.Columns); err != nil {
 					return err
 				}
-				if d.PartitionByIndex.ContainsPartitions() {
-					var numImplicitColumns int
-					var err error
-					idx, numImplicitColumns, err = detectImplicitPartitionColumns(
-						params.EvalContext(),
-						n.tableDesc,
-						idx,
-						d.PartitionByIndex.PartitionBy,
-					)
-					if err != nil {
-						return err
-					}
-					partitioning, err := CreatePartitioning(
-						params.ctx,
-						params.p.ExecCfg().Settings,
-						params.EvalContext(),
-						n.tableDesc,
-						&idx,
-						numImplicitColumns,
-						d.PartitionByIndex.PartitionBy,
-					)
-					if err != nil {
-						return err
-					}
-					idx.Partitioning = partitioning
+
+				var err error
+				idx, err = params.p.configureIndexDescForNewIndexPartitioning(
+					params.ctx,
+					n.tableDesc,
+					idx,
+					d.PartitionByIndex,
+				)
+				if err != nil {
+					return err
 				}
 				foundIndex, err := n.tableDesc.FindIndexWithName(string(d.Name))
 				if err == nil {
@@ -257,6 +259,18 @@ func (n *alterTableNode) startExec(params runParams) error {
 					return err
 				}
 
+				// We need to allocate IDs upfront in the event we need to update the zone config
+				// in the same transaction.
+				if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
+					return err
+				}
+				if err := params.p.configureZoneConfigForNewIndexPartitioning(
+					params.ctx,
+					n.tableDesc,
+					idx,
+				); err != nil {
+					return err
+				}
 			case *tree.CheckConstraintTableDef:
 				var err error
 				params.p.runWithOptions(resolveFlags{contextDatabaseID: n.tableDesc.ParentID}, func() {
@@ -437,10 +451,17 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 				jobDesc := fmt.Sprintf("removing view %q dependent on column %q which is being dropped",
 					viewDesc.Name, colToDrop.ColName())
-				droppedViews, err = params.p.removeDependentView(params.ctx, n.tableDesc, viewDesc, jobDesc)
+				cascadedViews, err := params.p.removeDependentView(params.ctx, n.tableDesc, viewDesc, jobDesc)
 				if err != nil {
 					return err
 				}
+				qualifiedView, err := params.p.getQualifiedTableName(params.ctx, viewDesc)
+				if err != nil {
+					return err
+				}
+
+				droppedViews = append(droppedViews, cascadedViews...)
+				droppedViews = append(droppedViews, qualifiedView.FQString())
 			}
 
 			// We cannot remove this column if there are computed columns that use it.
@@ -734,10 +755,13 @@ func (n *alterTableNode) startExec(params runParams) error {
 						return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 							"constraint %q in the middle of being added, try again later", t.Constraint)
 					}
-					// TODO(rytaft): Call validateUniqueConstraint once supported.
-					return pgerror.New(pgcode.FeatureNotSupported,
-						"validation of unique constraints without an index are not yet supported",
-					)
+					if err := validateUniqueConstraintInTxn(
+						params.ctx, params.p.LeaseMgr(), params.EvalContext(), n.tableDesc, params.EvalContext().Txn, name,
+					); err != nil {
+						return err
+					}
+					foundUnique.Validity = descpb.ConstraintValidity_Validated
+					break
 				}
 
 				// This unique constraint is enforced by an index, so fall through to
@@ -778,29 +802,36 @@ func (n *alterTableNode) startExec(params runParams) error {
 					"cannot ALTER TABLE PARTITION BY on table which already has implicit column partitioning",
 				)
 			}
-			newPartitioning, err := CreatePartitioning(
+			newPrimaryIndex, err := CreatePartitioning(
 				params.ctx, params.p.ExecCfg().Settings,
 				params.EvalContext(),
 				n.tableDesc,
-				n.tableDesc.GetPrimaryIndex().IndexDesc(),
-				0, /* numImplicitColumns */
+				*n.tableDesc.GetPrimaryIndex().IndexDesc(),
 				t.PartitionBy,
 			)
 			if err != nil {
 				return err
 			}
-			descriptorChanged = descriptorChanged || !oldPartitioning.Equal(&newPartitioning)
+			if newPrimaryIndex.Partitioning.NumImplicitColumns > 0 {
+				return unimplemented.New(
+					"ALTER TABLE PARTITION BY",
+					"cannot ALTER TABLE and change the partitioning to contain implicit columns",
+				)
+			}
+			descriptorChanged = descriptorChanged || !n.tableDesc.GetPrimaryIndex().IndexDesc().Equal(&newPrimaryIndex)
 			err = deleteRemovedPartitionZoneConfigs(
-				params.ctx, params.p.txn,
-				n.tableDesc, n.tableDesc.GetPrimaryIndex().IndexDesc(), &oldPartitioning,
-				&newPartitioning, params.extendedEvalCtx.ExecCfg,
+				params.ctx,
+				params.p.txn,
+				n.tableDesc,
+				n.tableDesc.GetPrimaryIndex().IndexDesc(),
+				&oldPartitioning,
+				&newPrimaryIndex.Partitioning,
+				params.extendedEvalCtx.ExecCfg,
 			)
 			if err != nil {
 				return err
 			}
 			{
-				newPrimaryIndex := *n.tableDesc.GetPrimaryIndex().IndexDesc()
-				newPrimaryIndex.Partitioning = newPartitioning
 				n.tableDesc.SetPrimaryIndex(newPrimaryIndex)
 			}
 
@@ -882,12 +913,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 			descriptorChanged = true
-		case *tree.AlterTableOwner:
-			changed, err := params.p.alterTableOwner(params.p.EvalContext().Context, n, t.Owner)
-			if err != nil {
-				return err
-			}
-			descriptorChanged = descriptorChanged || changed
 		default:
 			return errors.AssertionFailedf("unsupported alter command: %T", cmd)
 		}
@@ -930,10 +955,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 	return params.p.logEvent(params.ctx,
 		n.tableDesc.ID,
 		&eventpb.AlterTable{
-			TableName:  params.p.ResolvedName(n.n.Table).FQString(),
-			MutationID: uint32(mutationID),
-			// TODO(knz): This is missing some qualification, see
-			// https://github.com/cockroachdb/cockroach/issues/57735
+			TableName:           params.p.ResolvedName(n.n.Table).FQString(),
+			MutationID:          uint32(mutationID),
 			CascadeDroppedViews: droppedViews,
 		})
 }
@@ -1289,56 +1312,6 @@ func (p *planner) updateFKBackReferenceName(
 		}
 	}
 	return errors.Errorf("missing backreference for foreign key %s", ref.Name)
-}
-
-// alterTableOwner sets the owner of the table to newOwner and returns true if the descriptor
-// was updated.
-func (p *planner) alterTableOwner(
-	ctx context.Context, n *alterTableNode, newOwner security.SQLUsername,
-) (bool, error) {
-	privs := n.tableDesc.GetPrivileges()
-
-	// If the owner we want to set to is the current owner, do a no-op.
-	if newOwner == privs.Owner() {
-		return false, nil
-	}
-
-	if err := p.checkCanAlterTableAndSetNewOwner(ctx, n.tableDesc, newOwner); err != nil {
-		return false, err
-	}
-
-	return true, nil
-}
-
-// checkCanAlterTableAndSetNewOwner handles privilege checking and setting new owner.
-// Called in ALTER TABLE and REASSIGN OWNED BY.
-func (p *planner) checkCanAlterTableAndSetNewOwner(
-	ctx context.Context, desc *tabledesc.Mutable, newOwner security.SQLUsername,
-) error {
-	if err := p.checkCanAlterToNewOwner(ctx, desc, newOwner); err != nil {
-		return err
-	}
-
-	// Ensure the new owner has CREATE privilege on the table's schema.
-	if err := p.canCreateOnSchema(
-		ctx, desc.GetParentSchemaID(), desc.ParentID, newOwner, checkPublicSchema); err != nil {
-		return err
-	}
-
-	privs := desc.GetPrivileges()
-	privs.SetOwner(newOwner)
-
-	tn, err := p.getQualifiedTableName(ctx, desc)
-	if err != nil {
-		return err
-	}
-
-	return p.logEvent(ctx,
-		desc.ID,
-		&eventpb.AlterTableOwner{
-			TableName: tn.String(),
-			Owner:     newOwner.Normalized(),
-		})
 }
 
 // tryRemoveFKBackReferences determines whether the provided unique constraint

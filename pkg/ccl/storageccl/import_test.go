@@ -9,8 +9,10 @@
 package storageccl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -37,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMaxImportBatchSize(t *testing.T) {
@@ -65,7 +68,7 @@ func TestMaxImportBatchSize(t *testing.T) {
 func slurpSSTablesLatestKey(
 	t *testing.T, dir string, paths []string, kr prefixRewriter,
 ) []storage.MVCCKeyValue {
-	start, end := storage.MVCCKey{Key: keys.MinKey}, storage.MVCCKey{Key: keys.MaxKey}
+	start, end := storage.MVCCKey{Key: keys.LocalMax}, storage.MVCCKey{Key: keys.MaxKey}
 
 	e := storage.NewDefaultInMem()
 	defer e.Close()
@@ -108,9 +111,9 @@ func slurpSSTablesLatestKey(
 			v := roachpb.Value{RawBytes: newKv.Value}
 			v.ClearChecksum()
 			v.InitChecksum(newKv.Key.Key)
-			// TODO(sumeer): this will not be correct with the separated
-			// lock table. We should iterate using EngineKey on the sst,
-			// and expose a PutEngine method to write directly.
+			// NB: import data does not contain intents, so data with no timestamps
+			// is inline meta and not intents. Therefore this is not affected by the
+			// choice of interleaved or separated intents.
 			if newKv.Key.Timestamp.IsEmpty() {
 				if err := batch.PutUnversioned(newKv.Key.Key, v.RawBytes); err != nil {
 					t.Fatal(err)
@@ -394,4 +397,60 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 			}
 		})
 	}
+}
+
+func TestSSTReaderCache(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var openCalls, expectedOpenCalls int
+	const sz, suffix = 100, 10
+	raw := &sstReader{
+		sz:   sizeStat(sz),
+		body: ioutil.NopCloser(bytes.NewReader(nil)),
+		openAt: func(offset int64) (io.ReadCloser, error) {
+			openCalls++
+			return ioutil.NopCloser(bytes.NewReader(make([]byte, sz-int(offset)))), nil
+		},
+	}
+
+	require.Equal(t, 0, openCalls)
+	_ = raw.readAndCacheSuffix(suffix)
+	expectedOpenCalls++
+
+	discard := make([]byte, 5)
+
+	// Reading in the suffix doesn't make another call.
+	_, _ = raw.ReadAt(discard, 90)
+	require.Equal(t, expectedOpenCalls, openCalls)
+
+	// Reading in the suffix again doesn't make another call.
+	_, _ = raw.ReadAt(discard, 95)
+	require.Equal(t, expectedOpenCalls, openCalls)
+
+	// Reading outside the suffix makes a new call.
+	_, _ = raw.ReadAt(discard, 85)
+	expectedOpenCalls++
+	require.Equal(t, expectedOpenCalls, openCalls)
+
+	// Reading at same offset, outside the suffix, does make a new call to rewind.
+	_, _ = raw.ReadAt(discard, 85)
+	expectedOpenCalls++
+	require.Equal(t, expectedOpenCalls, openCalls)
+
+	// Read at new pos does makes a new call.
+	_, _ = raw.ReadAt(discard, 0)
+	expectedOpenCalls++
+	require.Equal(t, expectedOpenCalls, openCalls)
+
+	// Read at cur pos (where last read stopped) does not reposition.
+	_, _ = raw.ReadAt(discard, 5)
+	require.Equal(t, expectedOpenCalls, openCalls)
+
+	// Read at in suffix between non-suffix reads does not make a call.
+	_, _ = raw.ReadAt(discard, 92)
+	require.Equal(t, expectedOpenCalls, openCalls)
+
+	// Read at where prior non-suffix read finished does not make a new call.
+	_, _ = raw.ReadAt(discard, 10)
+	require.Equal(t, expectedOpenCalls, openCalls)
 }

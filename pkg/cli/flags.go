@@ -783,6 +783,12 @@ func init() {
 		boolFlag(f, &sqlfmtCtx.align, cliflags.SQLFmtAlign)
 	}
 
+	// version command.
+	{
+		f := versionCmd.Flags()
+		boolFlag(f, &cliCtx.showVersionUsingOnlyBuildTag, cliflags.BuildTag)
+	}
+
 	// Debug commands.
 	{
 		f := debugKeysCmd.Flags()
@@ -826,6 +832,8 @@ func init() {
 		// NB: this also gets PreRun treatment via extraServerFlagInit to populate BaseCfg.SQLAddr.
 		varFlag(f, addrSetter{&serverSQLAddr, &serverSQLPort}, cliflags.ListenSQLAddr)
 		varFlag(f, addrSetter{&serverHTTPAddr, &serverHTTPPort}, cliflags.ListenHTTPAddr)
+
+		stringFlag(f, &startCtx.geoLibsDir, cliflags.GeoLibsDir)
 
 		stringSliceFlag(f, &serverCfg.SQLConfig.TenantKVAddrs, cliflags.KVAddrs)
 	}

@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/oauth2/google"
@@ -172,70 +171,6 @@ func (g *gcsStorage) WriteFile(ctx context.Context, basename string, content io.
 	return errors.Wrap(err, "write to google cloud")
 }
 
-// resumingGoogleStorageReader is a GS reader which retries
-// reads in case of a transient connection reset by peer error.
-type resumingGoogleStorageReader struct {
-	ctx    context.Context   // Reader context
-	bucket *gcs.BucketHandle // Bucket to read the data from
-	object string            // Object to read
-	data   *gcs.Reader       // Currently opened object data stream
-	pos    int64             // How much data was received so far
-}
-
-var _ io.ReadCloser = &resumingGoogleStorageReader{}
-
-func (r *resumingGoogleStorageReader) openStream() error {
-	return delayedRetry(r.ctx, func() error {
-		var readErr error
-		r.data, readErr = r.bucket.Object(r.object).NewRangeReader(r.ctx, r.pos, -1)
-		return readErr
-	})
-}
-
-func (r *resumingGoogleStorageReader) Read(p []byte) (int, error) {
-	var lastErr error
-	for retries := 0; lastErr == nil; retries++ {
-		if r.data == nil {
-			lastErr = r.openStream()
-		}
-
-		if lastErr == nil {
-			n, readErr := r.data.Read(p)
-			if readErr == nil || readErr == io.EOF {
-				r.pos += int64(n)
-				return n, readErr
-			}
-			lastErr = readErr
-		}
-
-		if !errors.IsAny(lastErr, io.EOF, io.ErrUnexpectedEOF) {
-			log.Errorf(r.ctx, "GCS:Read err: %s", lastErr)
-		}
-
-		if isResumableHTTPError(lastErr) {
-			if retries >= maxNoProgressReads {
-				return 0, errors.Wrap(lastErr, "multiple Read calls return no data")
-			}
-			log.Errorf(r.ctx, "GCS:Retry: error %s", lastErr)
-			lastErr = nil
-			r.data = nil
-		}
-	}
-
-	// NB: Go says Read() callers need to expect n > 0 *and* non-nil error, and do
-	// something with what was read before the error, but this mostly applies to
-	// err = EOF case which we handle above, so likely OK that we're discarding n
-	// here and pretending it was zero.
-	return 0, lastErr
-}
-
-func (r *resumingGoogleStorageReader) Close() error {
-	if r.data != nil {
-		return r.data.Close()
-	}
-	return nil
-}
-
 // ReadFile is shorthand for ReadFileAt with offset 0.
 func (g *gcsStorage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
 	reader, _, err := g.ReadFileAt(ctx, basename, 0)
@@ -245,25 +180,26 @@ func (g *gcsStorage) ReadFile(ctx context.Context, basename string) (io.ReadClos
 func (g *gcsStorage) ReadFileAt(
 	ctx context.Context, basename string, offset int64,
 ) (io.ReadCloser, int64, error) {
-	// https://github.com/cockroachdb/cockroach/issues/23859
-	reader := &resumingGoogleStorageReader{
-		ctx:    ctx,
-		bucket: g.bucket,
-		object: path.Join(g.prefix, basename),
+	object := path.Join(g.prefix, basename)
+	r := &resumingReader{
+		ctx: ctx,
+		opener: func(ctx context.Context, pos int64) (io.ReadCloser, error) {
+			return g.bucket.Object(object).NewRangeReader(ctx, pos, -1)
+		},
+		pos: offset,
 	}
-	reader.pos = offset
 
-	if err := reader.openStream(); err != nil {
-		// The Google SDK has a specialized ErrBucketDoesNotExist error, but
-		// the code path from this method first triggers an ErrObjectNotExist in
-		// both scenarios - when a Bucket does not exist or an Object does not
-		// exist.
+	if err := r.openStream(); err != nil {
 		if errors.Is(err, gcs.ErrObjectNotExist) {
-			return nil, 0, errors.Wrapf(ErrFileDoesNotExist, "gcs object does not exist: %s", err.Error())
+			// Callers of this method sometimes look at the returned error to determine
+			// if file does not exist.  Regardless why we couldn't open the stream
+			// (whether its invalid bucket or file doesn't exist),
+			// return our internal ErrFileDoesNotExist.
+			err = errors.Wrapf(ErrFileDoesNotExist, "gcs object does not exist: %s", err.Error())
 		}
 		return nil, 0, err
 	}
-	return reader, reader.data.Attrs.Size, nil
+	return r.reader, r.reader.(*gcs.Reader).Attrs.Size, nil
 }
 
 func (g *gcsStorage) ListFiles(ctx context.Context, patternSuffix string) ([]string, error) {

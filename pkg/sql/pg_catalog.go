@@ -855,6 +855,9 @@ func populateTableConstraints(
 				}
 				f.WriteString(strings.Join(colNames, ", "))
 				f.WriteByte(')')
+				if con.UniqueWithoutIndexConstraint.Validity != descpb.ConstraintValidity_Validated {
+					f.WriteString(" NOT VALID")
+				}
 			} else {
 				return errors.AssertionFailedf(
 					"Index or UniqueWithoutIndexConstraint must be non-nil for a unique constraint",
@@ -1159,8 +1162,8 @@ https://www.postgresql.org/docs/9.5/catalog-pg-depend.html`,
 			table catalog.TableDescriptor,
 			tableLookup tableLookupFn,
 		) error {
-			pgConstraintTableOid := tableOid(pgConstraintsDesc.ID)
-			pgClassTableOid := tableOid(pgClassDesc.ID)
+			pgConstraintTableOid := tableOid(pgConstraintsDesc.GetID())
+			pgClassTableOid := tableOid(pgClassDesc.GetID())
 			if table.IsSequence() &&
 				!table.GetSequenceOpts().SequenceOwner.Equal(descpb.TableDescriptor_SequenceOpts_SequenceOwner{}) {
 				refObjID := tableOid(table.GetSequenceOpts().SequenceOwner.OwnerTableID)
@@ -1682,7 +1685,7 @@ https://www.postgresql.org/docs/9.6/view-pg-matviews.html`,
 					tree.NewDName(desc.GetName()), // matviewname
 					getOwnerName(desc),            // matviewowner
 					tree.DNull,                    // tablespace
-					tree.MakeDBool(len(desc.TableDesc().Indexes) > 0), // hasindexes
+					tree.MakeDBool(len(desc.PublicNonPrimaryIndexes()) > 0), // hasindexes
 					tree.DBoolTrue,                       // ispopulated,
 					tree.NewDString(desc.GetViewQuery()), // definition
 				)
@@ -2315,7 +2318,7 @@ func addPGTypeRow(
 			typElem = tree.NewDOid(tree.DInt(typ.ArrayContents().Oid()))
 		}
 	default:
-		typArray = tree.NewDOid(tree.DInt(types.MakeArray(typ).Oid()))
+		typArray = tree.NewDOid(tree.DInt(types.CalcArrayOid(typ)))
 	}
 	if typ.Family() == types.EnumFamily {
 		builtinPrefix = "enum_"

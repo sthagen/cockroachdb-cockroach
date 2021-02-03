@@ -25,6 +25,7 @@ go_library(
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/sem/builtins",
@@ -40,6 +41,8 @@ go_library(
         "//pkg/util/retry",
         "//pkg/util/tracing",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_pebble//sstable",
+        "@com_github_cockroachdb_pebble//vfs",
         "@org_golang_x_crypto//pbkdf2",
     ],
 )

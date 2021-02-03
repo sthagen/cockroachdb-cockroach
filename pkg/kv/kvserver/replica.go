@@ -55,7 +55,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"github.com/google/btree"
 	"github.com/kr/pretty"
 	"go.etcd.io/etcd/raft/v3"
 )
@@ -589,19 +588,6 @@ type Replica struct {
 
 var _ batcheval.EvalContext = &Replica{}
 
-// KeyRange is an interface type for the replicasByKey BTree, to compare
-// Replica and ReplicaPlaceholder.
-type KeyRange interface {
-	Desc() *roachpb.RangeDescriptor
-	rangeKeyItem
-	btree.Item
-	fmt.Stringer
-}
-
-var _ KeyRange = &Replica{}
-
-var _ kv.Sender = &Replica{}
-
 // String returns the string representation of the replica using an
 // inconsistent copy of the range descriptor. Therefore, String does not
 // require a lock and its output may not be atomic with other ongoing work in
@@ -678,6 +664,10 @@ func (r *Replica) SetZoneConfig(zone *zonepb.ZoneConfig) {
 
 			r.mu.largestPreviousMaxRangeSizeBytes = 0
 		}
+
+		// TODO(nvanbenschoten): use the new zone.GlobalReads field to configure
+		// closed timestamp lead/lag, once we have per-range closed timestamp
+		// trackers.
 	}
 	r.mu.zone = zone
 }
@@ -802,6 +792,11 @@ func (r *Replica) GetGCThreshold() hlc.Timestamp {
 func (r *Replica) Version() roachpb.Version {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
+	if r.mu.state.Version == nil {
+		// TODO(irfansharif): This is a stop-gap for #58523.
+		return roachpb.Version{}
+	}
 	return *r.mu.state.Version
 }
 
@@ -830,11 +825,11 @@ func (r *Replica) getImpliedGCThresholdRLocked(
 	// user experience win; it's always safe to allow reads to continue so long
 	// as they are after the GC threshold.
 	c := r.mu.cachedProtectedTS
-	if st.State != kvserverpb.LeaseState_VALID || c.readAt.Less(st.Lease.Start) {
+	if st.State != kvserverpb.LeaseState_VALID || c.readAt.Less(st.Lease.Start.ToTimestamp()) {
 		return threshold
 	}
 
-	impliedThreshold := gc.CalculateThreshold(st.Timestamp, *r.mu.zone.GC)
+	impliedThreshold := gc.CalculateThreshold(st.Now.ToTimestamp(), *r.mu.zone.GC)
 	threshold.Forward(impliedThreshold)
 
 	// If we have a protected timestamp record which precedes the implied
@@ -1164,10 +1159,10 @@ func (r *Replica) checkExecutionCanProceed(
 func (r *Replica) checkExecutionCanProceedForRangeFeed(
 	ctx context.Context, rSpan roachpb.RSpan, ts hlc.Timestamp,
 ) error {
-	now := r.Clock().Now()
+	now := r.Clock().NowAsClockTimestamp()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	status := r.leaseStatus(ctx, *r.mu.state.Lease, now, r.mu.minLeaseProposedTS)
+	status := r.leaseStatusForRequestRLocked(ctx, now, ts)
 	if _, err := r.isDestroyedRLocked(); err != nil {
 		return err
 	} else if err := r.checkSpanInRangeRLocked(ctx, rSpan); err != nil {
@@ -1602,15 +1597,15 @@ func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(ctx context.Con
 	if r.store.TestingKnobs().DisableLeaderFollowsLeaseholder {
 		return
 	}
-	lease := *r.mu.state.Lease
-	if lease.OwnedBy(r.StoreID()) || !r.isLeaseValidRLocked(ctx, lease, r.Clock().Now()) {
+	status := r.leaseStatusAtRLocked(ctx, r.Clock().NowAsClockTimestamp())
+	if !status.IsValid() || status.OwnedBy(r.StoreID()) {
 		return
 	}
 	raftStatus := r.raftStatusRLocked()
 	if raftStatus == nil || raftStatus.RaftState != raft.StateLeader {
 		return
 	}
-	lhReplicaID := uint64(lease.Replica.ReplicaID)
+	lhReplicaID := uint64(status.Lease.Replica.ReplicaID)
 	lhProgress, ok := raftStatus.Progress[lhReplicaID]
 	if (ok && lhProgress.Match >= raftStatus.Commit) || r.store.IsDraining() {
 		log.VEventf(ctx, 1, "transferring raft leadership to replica ID %v", lhReplicaID)
@@ -1662,11 +1657,6 @@ func checkIfTxnAborted(
 
 func (r *Replica) startKey() roachpb.RKey {
 	return r.Desc().StartKey
-}
-
-// Less implements the btree.Item interface.
-func (r *Replica) Less(i btree.Item) bool {
-	return r.startKey().Less(i.(rangeKeyItem).startKey())
 }
 
 // GetLeaseHistory returns the lease history stored on this replica.

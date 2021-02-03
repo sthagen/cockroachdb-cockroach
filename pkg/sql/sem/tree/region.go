@@ -27,12 +27,28 @@ const (
 	LocalityLevelRow
 )
 
+const (
+	// RegionEnum is the name of the per-database region enum required for
+	// multi-region.
+	RegionEnum string = "crdb_internal_region"
+	// RegionalByRowRegionDefaultCol is the default name of the REGIONAL BY ROW
+	// column name if the AS field is not populated.
+	RegionalByRowRegionDefaultCol string = "crdb_region"
+	// RegionalByRowRegionDefaultColName is the same, typed as Name.
+	RegionalByRowRegionDefaultColName Name = Name(RegionalByRowRegionDefaultCol)
+	// PrimaryRegionLocalityName is the string denoting the primary region in the
+	// locality config.
+	// TODO(#59455): clean this up to use something nicer,
+	PrimaryRegionLocalityName Name = ""
+)
+
 // Locality defines the locality for a given table.
 type Locality struct {
 	LocalityLevel LocalityLevel
 	// TableRegion is set if is LocalityLevelTable and a non-primary region is set.
 	TableRegion Name
-	// RegionalByRowColumn is set if col_name on REGIONAL BY ROW ON <col_name> is set.
+	// RegionalByRowColumn is set if col_name on REGIONAL BY ROW ON <col_name> is
+	// set.
 	RegionalByRowColumn Name
 }
 

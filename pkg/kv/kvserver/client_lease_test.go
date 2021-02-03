@@ -216,7 +216,7 @@ func TestGossipNodeLivenessOnLeaseChange(t *testing.T) {
 	// liveness are not triggering gossiping.
 	for _, s := range tc.Servers {
 		pErr := s.Stores().VisitStores(func(store *kvserver.Store) error {
-			store.NodeLiveness().PauseHeartbeatLoopForTest()
+			store.GetStoreConfig().NodeLiveness.PauseHeartbeatLoopForTest()
 			return nil
 		})
 		if pErr != nil {
@@ -341,7 +341,7 @@ func TestCannotTransferLeaseToVoterOutgoing(t *testing.T) {
 			require.Error(t, err)
 			require.Regexp(t,
 				// The error generated during evaluation.
-				"replica.*of type VOTER_DEMOTING cannot hold lease|"+
+				"replica cannot hold lease|"+
 					// If the lease transfer request has not yet made it to the latching
 					// phase by the time we close(ch) below, we can receive the following
 					// error due to the sanity checking which happens in

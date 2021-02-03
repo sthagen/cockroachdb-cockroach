@@ -21,23 +21,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
+func init() {
+	RegisterReadWriteCommand(roachpb.TransferLease, declareKeysTransferLease, TransferLease)
+}
+
 func declareKeysTransferLease(
-	desc *roachpb.RangeDescriptor,
-	header roachpb.Header,
-	req roachpb.Request,
-	latchSpans, _ *spanset.SpanSet,
+	rs ImmutableRangeState, _ roachpb.Header, _ roachpb.Request, latchSpans, _ *spanset.SpanSet,
 ) {
-	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeLeaseKey(header.RangeID)})
-	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(desc.StartKey)})
+	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeLeaseKey(rs.GetRangeID())})
+	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
 	// Cover the entire addressable key space with a latch to prevent any writes
 	// from overlapping with lease transfers. In principle we could just use the
 	// current range descriptor (desc) but it could potentially change due to an
 	// as of yet unapplied merge.
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.LocalMax, EndKey: keys.MaxKey})
-}
-
-func init() {
-	RegisterReadWriteCommand(roachpb.TransferLease, declareKeysTransferLease, TransferLease)
 }
 
 // TransferLease sets the lease holder for the range.
@@ -52,22 +49,18 @@ func TransferLease(
 	// a newFailedLeaseTrigger() to satisfy stats.
 	args := cArgs.Args.(*roachpb.TransferLeaseRequest)
 
-	// For now, don't allow replicas of type LEARNER to be leaseholders. There's
-	// no reason this wouldn't work in principle, but it seems inadvisable. In
-	// particular, learners can't become raft leaders, so we wouldn't be able to
-	// co-locate the leaseholder + raft leader, which is going to affect tail
-	// latencies. Additionally, as of the time of writing, learner replicas are
-	// only used for a short time in replica addition, so it's not worth working
-	// out the edge cases. If we decide to start using long-lived learners at some
-	// point, that math may change.
-	//
+	// NOTE: we use the range's current lease as prevLease instead of
+	// args.PrevLease so that we can detect lease transfers that will
+	// inevitably fail early and reject them with a detailed
+	// LeaseRejectedError before going through Raft.
+	prevLease, _ := cArgs.EvalCtx.GetLease()
+
 	// If this check is removed at some point, the filtering of learners on the
 	// sending side would have to be removed as well.
-	if err := checkCanReceiveLease(&args.Lease, cArgs.EvalCtx); err != nil {
+	if err := roachpb.CheckCanReceiveLease(args.Lease.Replica, cArgs.EvalCtx.Desc()); err != nil {
 		return newFailedLeaseTrigger(true /* isTransfer */), err
 	}
 
-	prevLease, _ := cArgs.EvalCtx.GetLease()
 	log.VEventf(ctx, 2, "lease transfer: prev lease: %+v, new lease: %+v", prevLease, args.Lease)
 	return evalNewLease(ctx, cArgs.EvalCtx, readWriter, cArgs.Stats,
 		args.Lease, prevLease, false /* isExtension */, true /* isTransfer */)

@@ -131,6 +131,7 @@ type EngineMetrics struct {
 	DistSQLServiceLatency *metric.Histogram
 	SQLServiceLatency     *metric.Histogram
 	SQLTxnLatency         *metric.Histogram
+	SQLTxnsOpen           *metric.Gauge
 
 	// TxnAbortCount counts transactions that were aborted, either due
 	// to non-retriable errors, or retriable errors when the client-side
@@ -139,6 +140,9 @@ type EngineMetrics struct {
 
 	// FailureCount counts non-retriable errors in open transactions.
 	FailureCount *metric.Counter
+
+	// FullTableOrIndexScanCount counts the number of full table or index scans.
+	FullTableOrIndexScanCount *metric.Counter
 }
 
 // EngineMetrics implements the metric.Struct interface

@@ -11,7 +11,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
@@ -60,6 +62,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -264,6 +267,10 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.TestingKnobs.SQLExecutor.(*sql.ExecutorTestingKnobs).TestingDescriptorValidation = true
 	}
 
+	// For test servers, leave interleaved tables enabled by default. We'll remove
+	// this when we remove interleaved tables altogether.
+	sql.InterleavedTablesEnabled.Override(&cfg.Settings.SV, true)
+
 	return cfg
 }
 
@@ -400,6 +407,14 @@ func (ts *TestServer) PGServer() *pgwire.Server {
 func (ts *TestServer) RaftTransport() *kvserver.RaftTransport {
 	if ts != nil {
 		return ts.raftTransport
+	}
+	return nil
+}
+
+// NodeDialer returns the NodeDialer used by the TestServer.
+func (ts *TestServer) NodeDialer() *nodedialer.Dialer {
+	if ts != nil {
+		return ts.nodeDialer
 	}
 	return nil
 }
@@ -554,7 +569,7 @@ func makeSQLServerArgs(
 			nodeLiveness:      optionalnodeliveness.MakeContainer(nil),
 			gossip:            gossip.MakeOptionalGossip(nil),
 			grpcServer:        dummyRPCServer,
-			isMeta1Leaseholder: func(_ context.Context, timestamp hlc.Timestamp) (bool, error) {
+			isMeta1Leaseholder: func(_ context.Context, _ hlc.ClockTimestamp) (bool, error) {
 				return false, errors.New("isMeta1Leaseholder is not available to secondary tenants")
 			},
 			nodeIDContainer:        idContainer,
@@ -690,24 +705,36 @@ func StartTenant(
 		return nil, "", "", err
 	}
 
-	args.stopper.RunWorker(ctx, func(ctx context.Context) {
-		<-args.stopper.ShouldQuiesce()
-		// NB: we can't do this as a Closer because (*Server).ServeWith is
-		// running in a worker and usually sits on accept(pgL) which unblocks
-		// only when pgL closes. In other words, pgL needs to close when
-		// quiescing starts to allow that worker to shut down.
-		_ = pgL.Close()
-	})
+	{
+		waitQuiesce := func(ctx context.Context) {
+			<-args.stopper.ShouldQuiesce()
+			// NB: we can't do this as a Closer because (*Server).ServeWith is
+			// running in a worker and usually sits on accept(pgL) which unblocks
+			// only when pgL closes. In other words, pgL needs to close when
+			// quiescing starts to allow that worker to shut down.
+			_ = pgL.Close()
+		}
+		if err := args.stopper.RunAsyncTask(ctx, "wait-quiesce-pgl", waitQuiesce); err != nil {
+			waitQuiesce(ctx)
+			return nil, "", "", err
+		}
+	}
 
 	httpL, err := listen(ctx, &args.Config.HTTPAddr, &args.Config.HTTPAdvertiseAddr, "http")
 	if err != nil {
 		return nil, "", "", err
 	}
 
-	args.stopper.RunWorker(ctx, func(ctx context.Context) {
-		<-args.stopper.ShouldQuiesce()
-		_ = httpL.Close()
-	})
+	{
+		waitQuiesce := func(ctx context.Context) {
+			<-args.stopper.ShouldQuiesce()
+			_ = httpL.Close()
+		}
+		if err := args.stopper.RunAsyncTask(ctx, "wait-quiesce-http", waitQuiesce); err != nil {
+			waitQuiesce(ctx)
+			return nil, "", "", err
+		}
+	}
 
 	pgLAddr := pgL.Addr().String()
 	httpLAddr := httpL.Addr().String()
@@ -720,7 +747,7 @@ func StartTenant(
 		pgLAddr,   // sql addr
 	)
 
-	args.stopper.RunWorker(ctx, func(ctx context.Context) {
+	if err := args.stopper.RunAsyncTask(ctx, "serve-http", func(ctx context.Context) {
 		mux := http.NewServeMux()
 		debugServer := debug.NewServer(args.Settings, s.pgServer.HBADebugFn())
 		mux.Handle("/", debugServer)
@@ -734,7 +761,9 @@ func StartTenant(
 		f := varsHandler{metricSource: args.recorder, st: args.Settings}.handleVars
 		mux.Handle(statusVars, http.HandlerFunc(f))
 		_ = http.Serve(httpL, mux)
-	})
+	}); err != nil {
+		return nil, "", "", err
+	}
 
 	const (
 		socketFile = "" // no unix socket
@@ -893,6 +922,16 @@ func (ts *TestServer) GetHTTPClient() (http.Client, error) {
 	return ts.Server.rpcContext.GetHTTPClient()
 }
 
+// UpdateChecker implements TestServerInterface.
+func (ts *TestServer) UpdateChecker() interface{} {
+	return ts.Server.updates
+}
+
+// DiagnosticsReporter implements TestServerInterface.
+func (ts *TestServer) DiagnosticsReporter() interface{} {
+	return ts.Server.sqlServer.diagnosticsReporter
+}
+
 const authenticatedUser = "authentic_user"
 
 func authenticatedUserName() security.SQLUsername {
@@ -907,8 +946,7 @@ func authenticatedUserNameNoAdmin() security.SQLUsername {
 
 // GetAdminAuthenticatedHTTPClient implements the TestServerInterface.
 func (ts *TestServer) GetAdminAuthenticatedHTTPClient() (http.Client, error) {
-	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(
-		authenticatedUserName(), true)
+	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authenticatedUserName(), true)
 	return httpClient, err
 }
 
@@ -920,6 +958,17 @@ func (ts *TestServer) GetAuthenticatedHTTPClient(isAdmin bool) (http.Client, err
 	}
 	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authUser, isAdmin)
 	return httpClient, err
+}
+
+type v2AuthDecorator struct {
+	http.RoundTripper
+
+	session string
+}
+
+func (v *v2AuthDecorator) RoundTrip(r *http.Request) (*http.Response, error) {
+	r.Header.Add(apiV2AuthHeader, v.session)
+	return v.RoundTripper.RoundTrip(r)
 }
 
 func (ts *TestServer) getAuthenticatedHTTPClientAndCookie(
@@ -964,6 +1013,14 @@ func (ts *TestServer) getAuthenticatedHTTPClientAndCookie(
 			authClient.httpClient, err = ts.rpcContext.GetHTTPClient()
 			if err != nil {
 				return err
+			}
+			rawCookieBytes, err := protoutil.Marshal(rawCookie)
+			if err != nil {
+				return err
+			}
+			authClient.httpClient.Transport = &v2AuthDecorator{
+				RoundTripper: authClient.httpClient.Transport,
+				session:      base64.StdEncoding.EncodeToString(rawCookieBytes),
 			}
 			authClient.httpClient.Jar = cookieJar
 			authClient.cookie = rawCookie
@@ -1245,7 +1302,7 @@ func (ts *TestServer) SplitRange(
 // The lease is returned regardless of its status.
 func (ts *TestServer) GetRangeLease(
 	ctx context.Context, key roachpb.Key,
-) (_ roachpb.Lease, now hlc.Timestamp, _ error) {
+) (_ roachpb.Lease, now hlc.ClockTimestamp, _ error) {
 	leaseReq := roachpb.LeaseInfoRequest{
 		RequestHeader: roachpb.RequestHeader{
 			Key: key,
@@ -1263,15 +1320,20 @@ func (ts *TestServer) GetRangeLease(
 		&leaseReq,
 	)
 	if pErr != nil {
-		return roachpb.Lease{}, hlc.Timestamp{}, pErr.GoError()
+		return roachpb.Lease{}, hlc.ClockTimestamp{}, pErr.GoError()
 	}
-	return leaseResp.(*roachpb.LeaseInfoResponse).Lease, ts.Clock().Now(), nil
+	return leaseResp.(*roachpb.LeaseInfoResponse).Lease, ts.Clock().NowAsClockTimestamp(), nil
 
 }
 
 // ExecutorConfig is part of the TestServerInterface.
 func (ts *TestServer) ExecutorConfig() interface{} {
 	return *ts.sqlServer.execCfg
+}
+
+// Tracer is part of the TestServerInterface
+func (ts *TestServer) Tracer() interface{} {
+	return ts.node.storeCfg.AmbientCtx.Tracer
 }
 
 // GCSystemLog deletes entries in the given system log table between
@@ -1325,9 +1387,6 @@ func (ts *TestServer) ForceTableGC(
 
 // ScratchRangeEx splits off a range suitable to be used as KV scratch space.
 // (it doesn't overlap system spans or SQL tables).
-//
-// Calling this multiple times is undefined (but see TestCluster.ScratchRange()
-// which is idempotent).
 func (ts *TestServer) ScratchRangeEx() (roachpb.RangeDescriptor, error) {
 	scratchKey := keys.TableDataMax
 	_, rngDesc, err := ts.SplitRange(scratchKey)
@@ -1345,6 +1404,28 @@ func (ts *TestServer) ScratchRange() (roachpb.Key, error) {
 		return nil, err
 	}
 	return desc.StartKey.AsRawKey(), nil
+}
+
+// ScratchRangeWithExpirationLease is like ScratchRangeWithExpirationLeaseEx but
+// returns a key for the RHS ranges, instead of both descriptors from the split.
+func (ts *TestServer) ScratchRangeWithExpirationLease() (roachpb.Key, error) {
+	_, desc, err := ts.ScratchRangeWithExpirationLeaseEx()
+	if err != nil {
+		return nil, err
+	}
+	return desc.StartKey.AsRawKey(), nil
+}
+
+// ScratchRangeWithExpirationLeaseEx is like ScratchRange but creates a range with
+// an expiration based lease.
+func (ts *TestServer) ScratchRangeWithExpirationLeaseEx() (
+	roachpb.RangeDescriptor,
+	roachpb.RangeDescriptor,
+	error,
+) {
+	scratchKey := roachpb.Key(bytes.Join([][]byte{keys.SystemPrefix,
+		roachpb.RKey("\x00aaa-testing")}, nil))
+	return ts.SplitRange(scratchKey)
 }
 
 // MetricsRecorder periodically records node-level and store-level metrics.

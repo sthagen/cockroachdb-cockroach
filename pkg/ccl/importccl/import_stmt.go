@@ -884,7 +884,7 @@ func importPlanHook(
 
 		var sj *jobs.StartableJob
 		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-			sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn, resultsCh)
+			sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn)
 			if err != nil {
 				return err
 			}
@@ -907,13 +907,14 @@ func importPlanHook(
 			return err
 		}
 
-		err = sj.Run(ctx)
-		if err != nil {
+		if err := sj.Start(ctx); err != nil {
 			return err
 		}
 		addToFileFormatTelemetry(format.Format.String(), "started")
-
-		return nil
+		if err := sj.AwaitCompletion(ctx); err != nil {
+			return err
+		}
+		return sj.ReportExecutionResults(ctx, resultsCh)
 	}
 	return fn, utilccl.BulkJobExecutionResultHeader, nil, false, nil
 }
@@ -1231,6 +1232,23 @@ func (r *importResumer) prepareTableDescsForIngestion(
 	return err
 }
 
+// ReportResults implements JobResultsReporter interface.
+func (r *importResumer) ReportResults(ctx context.Context, resultsCh chan<- tree.Datums) error {
+	select {
+	case resultsCh <- tree.Datums{
+		tree.NewDInt(tree.DInt(*r.job.ID())),
+		tree.NewDString(string(jobs.StatusSucceeded)),
+		tree.NewDFloat(tree.DFloat(1.0)),
+		tree.NewDInt(tree.DInt(r.res.Rows)),
+		tree.NewDInt(tree.DInt(r.res.IndexEntries)),
+		tree.NewDInt(tree.DInt(r.res.DataSize)),
+	}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // parseAndCreateBundleTableDescs parses and creates the table
 // descriptors for bundle formats.
 func parseAndCreateBundleTableDescs(
@@ -1353,9 +1371,7 @@ func (r *importResumer) parseBundleSchemaIfNeeded(ctx context.Context, phs inter
 }
 
 // Resume is part of the jobs.Resumer interface.
-func (r *importResumer) Resume(
-	ctx context.Context, execCtx interface{}, resultsCh chan<- tree.Datums,
-) error {
+func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	p := execCtx.(sql.JobExecContext)
 	if err := r.parseBundleSchemaIfNeeded(ctx, p); err != nil {
 		return err
@@ -1493,15 +1509,6 @@ func (r *importResumer) Resume(
 		telemetry.CountBucketed("import.speed-mbps.over10mb", mbps)
 	}
 
-	resultsCh <- tree.Datums{
-		tree.NewDInt(tree.DInt(*r.job.ID())),
-		tree.NewDString(string(jobs.StatusSucceeded)),
-		tree.NewDFloat(tree.DFloat(1.0)),
-		tree.NewDInt(tree.DInt(r.res.Rows)),
-		tree.NewDInt(tree.DInt(r.res.IndexEntries)),
-		tree.NewDInt(tree.DInt(r.res.DataSize)),
-	}
-
 	return nil
 }
 
@@ -1634,15 +1641,15 @@ func (r *importResumer) dropTables(
 		return nil
 	}
 
-	var revert []*tabledesc.Immutable
-	var empty []*tabledesc.Immutable
+	var revert []catalog.TableDescriptor
+	var empty []catalog.TableDescriptor
 	for _, tbl := range details.Tables {
 		if !tbl.IsNew {
 			desc, err := descsCol.GetMutableTableVersionByID(ctx, tbl.Desc.ID, txn)
 			if err != nil {
 				return err
 			}
-			imm := desc.ImmutableCopy().(*tabledesc.Immutable)
+			imm := desc.ImmutableCopy().(catalog.TableDescriptor)
 			if tbl.WasEmpty {
 				empty = append(empty, imm)
 			} else {
@@ -1651,19 +1658,22 @@ func (r *importResumer) dropTables(
 		}
 	}
 
-	// NB: if a revert fails it will abort the rest of this failure txn, which is
-	// also what brings tables back online. We _could_ change the error handling
-	// or just move the revert into Resume()'s error return path, however it isn't
-	// clear that just bringing a table back online with partially imported data
-	// that may or may not be partially reverted is actually a good idea. It seems
-	// better to do the revert here so that the table comes back if and only if,
-	// it was rolled back to its pre-IMPORT state, and instead provide a manual
-	// admin knob (e.g. ALTER TABLE REVERT TO SYSTEM TIME) if anything goes wrong.
-	if len(revert) > 0 {
-		// Sanity check Walltime so it doesn't become a TRUNCATE if there's a bug.
-		if details.Walltime == 0 {
-			return errors.Errorf("invalid pre-IMPORT time to rollback")
-		}
+	// The walltime can be 0 if there is a failure between publishing the tables
+	// as OFFLINE and then choosing a ingestion timestamp. This might happen
+	// while waiting for the descriptor version to propagate across the cluster
+	// for example.
+	//
+	// In this case, we don't want to rollback the data since data ingestion has
+	// not yet begun (since we have not chosen a timestamp at which to ingest.)
+	if details.Walltime != 0 && len(revert) > 0 {
+		// NB: if a revert fails it will abort the rest of this failure txn, which is
+		// also what brings tables back online. We _could_ change the error handling
+		// or just move the revert into Resume()'s error return path, however it isn't
+		// clear that just bringing a table back online with partially imported data
+		// that may or may not be partially reverted is actually a good idea. It seems
+		// better to do the revert here so that the table comes back if and only if,
+		// it was rolled back to its pre-IMPORT state, and instead provide a manual
+		// admin knob (e.g. ALTER TABLE REVERT TO SYSTEM TIME) if anything goes wrong.
 		ts := hlc.Timestamp{WallTime: details.Walltime}.Prev()
 		if err := sql.RevertTables(ctx, txn.DB(), execCfg, revert, ts, sql.RevertTableDefaultBatchSize); err != nil {
 			return errors.Wrap(err, "rolling back partially completed IMPORT")
@@ -1672,7 +1682,7 @@ func (r *importResumer) dropTables(
 
 	for i := range empty {
 		if err := gcjob.ClearTableData(ctx, execCfg.DB, execCfg.DistSender, execCfg.Codec, empty[i]); err != nil {
-			return errors.Wrapf(err, "clearing data for table %d", empty[i].ID)
+			return errors.Wrapf(err, "clearing data for table %d", empty[i].GetID())
 		}
 	}
 

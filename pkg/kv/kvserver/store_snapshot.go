@@ -524,7 +524,7 @@ func (s *Store) reserveSnapshot(
 		case s.snapshotApplySem <- struct{}{}:
 		case <-ctx.Done():
 			return nil, "", ctx.Err()
-		case <-s.stopper.ShouldStop():
+		case <-s.stopper.ShouldQuiesce():
 			return nil, "", errors.Errorf("stopped")
 		default:
 			return nil, snapshotApplySemBusyMsg, nil
@@ -534,7 +534,7 @@ func (s *Store) reserveSnapshot(
 		case s.snapshotApplySem <- struct{}{}:
 		case <-ctx.Done():
 			return nil, "", ctx.Err()
-		case <-s.stopper.ShouldStop():
+		case <-s.stopper.ShouldQuiesce():
 			return nil, "", errors.Errorf("stopped")
 		}
 	}
@@ -653,11 +653,11 @@ func (s *Store) checkSnapshotOverlapLocked(
 
 	// TODO(benesch): consider discovering and GC'ing *all* overlapping ranges,
 	// not just the first one that getOverlappingKeyRangeLocked happens to return.
-	if exRange := s.getOverlappingKeyRangeLocked(&desc); exRange != nil {
+	if it := s.getOverlappingKeyRangeLocked(&desc); it.item != nil {
 		// We have a conflicting range, so we must block the snapshot.
 		// When such a conflict exists, it will be resolved by one range
 		// either being split or garbage collected.
-		exReplica, err := s.GetReplica(exRange.Desc().RangeID)
+		exReplica, err := s.GetReplica(it.Desc().RangeID)
 		msg := IntersectingSnapshotMsg
 		if err != nil {
 			log.Warningf(ctx, "unable to look up overlapping replica on %s: %v", exReplica, err)
@@ -666,16 +666,14 @@ func (s *Store) checkSnapshotOverlapLocked(
 				if r.RaftStatus() == nil {
 					return true
 				}
-				// TODO(benesch): this check does detect inactivity on replicas with
-				// epoch-based leases. Since the validity of an epoch-based lease is
-				// tied to the owning node's liveness, the lease can be valid well after
-				// the leader of the range has cut off communication with this replica.
-				// Expiration based leases, by contrast, will expire quickly if the
-				// leader of the range stops sending this replica heartbeats.
-				lease, pendingLease := r.GetLease()
-				now := s.Clock().Now()
-				return !r.IsLeaseValid(ctx, lease, now) &&
-					(pendingLease.Empty() || !r.IsLeaseValid(ctx, pendingLease, now))
+				// TODO(benesch): this check does not detect inactivity on
+				// replicas with epoch-based leases. Since the validity of an
+				// epoch-based lease is tied to the owning node's liveness, the
+				// lease can be valid well after the leader of the range has cut
+				// off communication with this replica. Expiration based leases,
+				// by contrast, will expire quickly if the leader of the range
+				// stops sending this replica heartbeats.
+				return !r.CurrentLeaseStatus(ctx).IsValid()
 			}
 			// We unconditionally send this replica through the GC queue. It's
 			// reasonably likely that the GC queue will do nothing because the replica

@@ -14,7 +14,8 @@ import (
 	"bytes"
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/errors"
 )
 
@@ -100,16 +101,16 @@ func intersectSetContainers(a, b setContainer) setContainer {
 
 // setExpression follows the structure of SpanExpression.
 type setExpression struct {
-	op invertedexpr.SetOperator
+	op inverted.SetOperator
 	// The index in invertedExprEvaluator.sets
 	unionSetIndex int
 	left          *setExpression
 	right         *setExpression
 }
 
-type invertedSpan = invertedexpr.SpanExpressionProto_Span
-type invertedSpans = invertedexpr.SpanExpressionProtoSpans
-type spanExpression = invertedexpr.SpanExpressionProto_Node
+type invertedSpan = inverted.SpanExpressionProto_Span
+type invertedSpans = inverted.SpanExpressionProtoSpans
+type spanExpression = inverted.SpanExpressionProto_Node
 
 // The spans in a SpanExpression.FactoredUnionSpans and the corresponding index
 // in invertedExprEvaluator.sets. Only populated when FactoredUnionsSpans is
@@ -204,9 +205,9 @@ func (ev *invertedExprEvaluator) evaluateSetExpr(sx *setExpression) setContainer
 	}
 	var childrenSet setContainer
 	switch sx.op {
-	case invertedexpr.SetUnion:
+	case inverted.SetUnion:
 		childrenSet = unionSetContainers(left, right)
-	case invertedexpr.SetIntersection:
+	case inverted.SetIntersection:
 		childrenSet = intersectSetContainers(left, right)
 	}
 	return unionSetContainers(ev.sets[sx.unionSetIndex], childrenSet)
@@ -258,7 +259,7 @@ func (s invertedSpanRoutingInfosByEndKey) Less(i, j int) bool {
 
 // preFilterer is the single method from DatumsToInvertedExpr that is relevant here.
 type preFilterer interface {
-	PreFilter(enc invertedexpr.EncInvertedVal, preFilters []interface{}, result []bool) (bool, error)
+	PreFilter(enc inverted.EncVal, preFilters []interface{}, result []bool) (bool, error)
 }
 
 // batchedInvertedExprEvaluator is for evaluating one or more expressions. The
@@ -269,7 +270,7 @@ type preFilterer interface {
 // fragmentedSpans used for routing the added rows.
 type batchedInvertedExprEvaluator struct {
 	filterer preFilterer
-	exprs    []*invertedexpr.SpanExpressionProto
+	exprs    []*inverted.SpanExpressionProto
 
 	// The pre-filtering state for each expression. When pre-filtering, this
 	// is the same length as exprs.
@@ -281,6 +282,10 @@ type batchedInvertedExprEvaluator struct {
 
 	// The evaluators for all the exprs.
 	exprEvals []*invertedExprEvaluator
+	// The keys that constrain the non-inverted prefix columns, if the index is
+	// a multi-column inverted index. For multi-column inverted indexes, these
+	// keys are in one-to-one correspondence with exprEvals.
+	nonInvertedPrefixes []roachpb.Key
 	// Spans here are in sorted order and non-overlapping.
 	fragmentedSpans []invertedSpanRoutingInfo
 	// The routing index computed by prepareAddIndexRow
@@ -324,7 +329,7 @@ type batchedInvertedExprEvaluator struct {
 //    c-e-f            f-i
 //    c-e
 func (b *batchedInvertedExprEvaluator) fragmentPendingSpans(
-	pendingSpans []invertedSpanRoutingInfo, fragmentUntil invertedexpr.EncInvertedVal,
+	pendingSpans []invertedSpanRoutingInfo, fragmentUntil inverted.EncVal,
 ) []invertedSpanRoutingInfo {
 	// The start keys are the same, so this only sorts in increasing order of
 	// end keys. Assign slice to a field on the receiver before sorting to avoid
@@ -339,9 +344,9 @@ func (b *batchedInvertedExprEvaluator) fragmentPendingSpans(
 		// the next fragment is constructed.
 		var removeSize int
 		// The end of the next fragment.
-		var end invertedexpr.EncInvertedVal
+		var end inverted.EncVal
 		// The start of the fragment after the next fragment.
-		var nextStart invertedexpr.EncInvertedVal
+		var nextStart inverted.EncVal
 		if fragmentUntil != nil && bytes.Compare(fragmentUntil, pendingSpans[0].span.End) < 0 {
 			// Can't completely remove any spans from pendingSpans, but a prefix
 			// of these spans will be removed
@@ -409,7 +414,10 @@ func (b *batchedInvertedExprEvaluator) pendingLenWithSameEnd(
 // init fragments the spans for later routing of rows and returns spans
 // representing a union of all the spans (for executing the scan). The
 // returned slice is only valid until the next call to reset.
-func (b *batchedInvertedExprEvaluator) init() invertedSpans {
+func (b *batchedInvertedExprEvaluator) init() (invertedSpans, error) {
+	if len(b.nonInvertedPrefixes) > 0 && len(b.nonInvertedPrefixes) != len(b.exprs) {
+		return nil, errors.AssertionFailedf("length of non-empty nonInvertedPrefixes must equal length of exprs")
+	}
 	if cap(b.exprEvals) < len(b.exprs) {
 		b.exprEvals = make([]*invertedExprEvaluator, len(b.exprs))
 	} else {
@@ -421,10 +429,22 @@ func (b *batchedInvertedExprEvaluator) init() invertedSpans {
 			b.exprEvals[i] = nil
 			continue
 		}
+		var prefixKey roachpb.Key
+		if len(b.nonInvertedPrefixes) > 0 {
+			prefixKey = b.nonInvertedPrefixes[i]
+		}
 		b.exprEvals[i] = newInvertedExprEvaluator(&expr.Node)
 		exprSpans := b.exprEvals[i].getSpansAndSetIndex()
 		for _, spans := range exprSpans {
 			for _, span := range spans.spans {
+				if len(prefixKey) > 0 {
+					// TODO(mgartner/sumeer): It may be possible to reduce
+					// allocations and memory usage by adding a level of
+					// indirection for prefix keys (like a map of prefixes to
+					// routingSpans), rather than prepending prefix keys to each
+					// span.
+					span = prefixInvertedSpan(prefixKey, span)
+				}
 				b.routingSpans = append(b.routingSpans,
 					invertedSpanRoutingInfo{
 						span:                span,
@@ -435,7 +455,7 @@ func (b *batchedInvertedExprEvaluator) init() invertedSpans {
 		}
 	}
 	if len(b.routingSpans) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Sort the routingSpans in increasing order of start key, and for equal
@@ -477,24 +497,37 @@ func (b *batchedInvertedExprEvaluator) init() invertedSpans {
 	}
 	b.fragmentPendingSpans(pendingSpans, nil)
 	b.coveringSpans = append(b.coveringSpans, currentCoveringSpan)
-	return b.coveringSpans
+	return b.coveringSpans, nil
 }
 
 // prepareAddIndexRow must be called prior to addIndexRow to do any
 // pre-filtering. The return value indicates whether addIndexRow should be
-// called.
+// called. encFull should include the entire index key, including non-inverted
+// prefix columns. It should be nil if the index is not a multi-column inverted
+// index.
 // TODO(sumeer): if this will be called in non-decreasing order of enc,
 // use that to optimize the binary search.
 func (b *batchedInvertedExprEvaluator) prepareAddIndexRow(
-	enc invertedexpr.EncInvertedVal,
+	enc inverted.EncVal, encFull inverted.EncVal,
 ) (bool, error) {
+	routingEnc := enc
+	if encFull != nil {
+		routingEnc = encFull
+	}
 	i := sort.Search(len(b.fragmentedSpans), func(i int) bool {
-		return bytes.Compare(b.fragmentedSpans[i].span.Start, enc) > 0
+		return bytes.Compare(b.fragmentedSpans[i].span.Start, routingEnc) > 0
 	})
 	i--
 	b.routingIndex = i
+	return b.prefilter(enc)
+}
+
+// prefilter applies b.filterer, if it exists, returning true if addIndexRow
+// should be called for the row corresponding to the encoded value.
+// prepareAddIndexRow or prepareAddMultiColumnIndexRow must be called first.
+func (b *batchedInvertedExprEvaluator) prefilter(enc inverted.EncVal) (bool, error) {
 	if b.filterer != nil {
-		exprIndexList := b.fragmentedSpans[i].exprIndexList
+		exprIndexList := b.fragmentedSpans[b.routingIndex].exprIndexList
 		if len(exprIndexList) > cap(b.tempPreFilters) {
 			b.tempPreFilters = make([]interface{}, len(exprIndexList))
 			b.tempPreFilterResult = make([]bool, len(exprIndexList))
@@ -559,4 +592,20 @@ func (b *batchedInvertedExprEvaluator) reset() {
 	b.fragmentedSpans = b.fragmentedSpans[:0]
 	b.routingSpans = b.routingSpans[:0]
 	b.coveringSpans = b.coveringSpans[:0]
+	b.nonInvertedPrefixes = b.nonInvertedPrefixes[:0]
+}
+
+// prefixInvertedSpan returns a new invertedSpan with prefix prepended to the
+// input span's Start and End keys. This is similar to the internals of
+// rowenc.appendEncDatumsToKey.
+func prefixInvertedSpan(prefix roachpb.Key, span invertedSpan) invertedSpan {
+	newSpan := invertedSpan{
+		Start: make(roachpb.Key, 0, len(prefix)+len(span.Start)),
+		End:   make(roachpb.Key, 0, len(prefix)+len(span.End)),
+	}
+	newSpan.Start = append(newSpan.Start, prefix...)
+	newSpan.Start = append(newSpan.Start, span.Start...)
+	newSpan.End = append(newSpan.End, prefix...)
+	newSpan.End = append(newSpan.End, span.End...)
+	return newSpan
 }

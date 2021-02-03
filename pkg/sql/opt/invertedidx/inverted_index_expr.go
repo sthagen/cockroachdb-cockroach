@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
@@ -72,8 +73,9 @@ func TryFilterInvertedIndex(
 	optionalFilters memo.FiltersExpr,
 	tabID opt.TableID,
 	index cat.Index,
+	computedColumns map[opt.ColumnID]opt.ScalarExpr,
 ) (
-	spanExpr *invertedexpr.SpanExpression,
+	spanExpr *inverted.SpanExpression,
 	constraint *constraint.Constraint,
 	remainingFilters memo.FiltersExpr,
 	preFiltererState *invertedexpr.PreFiltererStateForInvertedFilterer,
@@ -109,14 +111,15 @@ func TryFilterInvertedIndex(
 		typ = types.Geometry
 	} else {
 		filterPlanner = &jsonOrArrayFilterPlanner{
-			tabID: tabID,
-			index: index,
+			tabID:           tabID,
+			index:           index,
+			computedColumns: computedColumns,
 		}
 		col := index.VirtualInvertedColumn().InvertedSourceColumnOrdinal()
 		typ = factory.Metadata().Table(tabID).Column(col).DatumType()
 	}
 
-	var invertedExpr invertedexpr.InvertedExpression
+	var invertedExpr inverted.Expression
 	var pfState *invertedexpr.PreFiltererStateForInvertedFilterer
 	for i := range filters {
 		invertedExprLocal, remFiltersLocal, pfStateLocal := extractInvertedFilterCondition(
@@ -126,7 +129,7 @@ func TryFilterInvertedIndex(
 			invertedExpr = invertedExprLocal
 			pfState = pfStateLocal
 		} else {
-			invertedExpr = invertedexpr.And(invertedExpr, invertedExprLocal)
+			invertedExpr = inverted.And(invertedExpr, invertedExprLocal)
 			// Do pre-filtering using the first of the conjuncts that provided
 			// non-nil pre-filtering state.
 			if pfState == nil {
@@ -142,7 +145,7 @@ func TryFilterInvertedIndex(
 		return nil, nil, nil, nil, false
 	}
 
-	spanExpr, ok = invertedExpr.(*invertedexpr.SpanExpression)
+	spanExpr, ok = invertedExpr.(*inverted.SpanExpression)
 	if !ok {
 		return nil, nil, nil, nil, false
 	}
@@ -306,13 +309,11 @@ func getInvertedExpr(
 }
 
 // evalInvertedExpr evaluates a TypedExpr tree consisting of And, Or and leaf
-// expressions, and returns the resulting invertedexpr.InvertedExpression.
-// Delegates evaluation of leaf expressions to the given evalInvertedExprLeaf
-// function.
+// expressions, and returns the resulting inverted.Expression. Delegates
+// evaluation of leaf expressions to the given evalInvertedExprLeaf function.
 func evalInvertedExpr(
-	expr tree.TypedExpr,
-	evalInvertedExprLeaf func(expr tree.TypedExpr) (invertedexpr.InvertedExpression, error),
-) (invertedexpr.InvertedExpression, error) {
+	expr tree.TypedExpr, evalInvertedExprLeaf func(expr tree.TypedExpr) (inverted.Expression, error),
+) (inverted.Expression, error) {
 	switch t := expr.(type) {
 	case *tree.AndExpr:
 		leftExpr, err := evalInvertedExpr(t.TypedLeft(), evalInvertedExprLeaf)
@@ -326,7 +327,7 @@ func evalInvertedExpr(
 		if leftExpr == nil || rightExpr == nil {
 			return nil, nil
 		}
-		return invertedexpr.And(leftExpr, rightExpr), nil
+		return inverted.And(leftExpr, rightExpr), nil
 
 	case *tree.OrExpr:
 		leftExpr, err := evalInvertedExpr(t.TypedLeft(), evalInvertedExprLeaf)
@@ -343,7 +344,7 @@ func evalInvertedExpr(
 		if rightExpr == nil {
 			return leftExpr, nil
 		}
-		return invertedexpr.Or(leftExpr, rightExpr), nil
+		return inverted.Or(leftExpr, rightExpr), nil
 
 	default:
 		return evalInvertedExprLeaf(expr)
@@ -409,7 +410,6 @@ func constrainPrefixColumns(
 	ic.Init(
 		filters, optionalFilters,
 		prefixColumns, notNullCols, tabMeta.ComputedCols,
-		false, /* isInverted */
 		false, /* consolidate */
 		evalCtx, factory,
 	)
@@ -431,7 +431,7 @@ type invertedFilterPlanner interface {
 	// extractInvertedFilterConditionFromLeaf extracts an inverted filter
 	// condition from the given expression, which represents a leaf of an
 	// expression tree in which the internal nodes are And and/or Or expressions.
-	// Returns an empty InvertedExpression if no inverted filter condition could
+	// Returns an empty inverted.Expression if no inverted filter condition could
 	// be extracted.
 	//
 	// Additionally, returns:
@@ -439,22 +439,22 @@ type invertedFilterPlanner interface {
 	//   tight, and
 	// - pre-filterer state that can be used to reduce false positives.
 	extractInvertedFilterConditionFromLeaf(evalCtx *tree.EvalContext, expr opt.ScalarExpr) (
-		invertedExpr invertedexpr.InvertedExpression,
+		invertedExpr inverted.Expression,
 		remainingFilters opt.ScalarExpr,
 		_ *invertedexpr.PreFiltererStateForInvertedFilterer,
 	)
 }
 
-// extractInvertedFilterCondition extracts an InvertedExpression from the given
-// filter condition, where the InvertedExpression represents an inverted filter
-// over the given inverted index. Returns an empty InvertedExpression if no
+// extractInvertedFilterCondition extracts an inverted.Expression from the given
+// filter condition, where the inverted.Expression represents an inverted filter
+// over the given inverted index. Returns an empty inverted.Expression if no
 // inverted filter condition could be extracted.
 //
 // The filter condition should be an expression tree of And, Or, and leaf
-// expressions. Extraction of the InvertedExpression from the leaves is
+// expressions. Extraction of the inverted.Expression from the leaves is
 // delegated to the given invertedFilterPlanner.
 //
-// In addition to the InvertedExpression, returns:
+// In addition to the inverted.Expression, returns:
 // - remaining filters that must be applied if the inverted expression is not
 //   tight, and
 // - pre-filterer state that can be used to reduce false positives. This is
@@ -465,7 +465,7 @@ func extractInvertedFilterCondition(
 	filterCond opt.ScalarExpr,
 	filterPlanner invertedFilterPlanner,
 ) (
-	invertedExpr invertedexpr.InvertedExpression,
+	invertedExpr inverted.Expression,
 	remainingFilters opt.ScalarExpr,
 	_ *invertedexpr.PreFiltererStateForInvertedFilterer,
 ) {
@@ -480,7 +480,7 @@ func extractInvertedFilterCondition(
 		} else {
 			remainingFilters = factory.ConstructAnd(remLeft, remRight)
 		}
-		return invertedexpr.And(l, r), remainingFilters, nil
+		return inverted.And(l, r), remainingFilters, nil
 
 	case *memo.OrExpr:
 		l, remLeft, _ := extractInvertedFilterCondition(evalCtx, factory, t.Left, filterPlanner)
@@ -491,9 +491,28 @@ func extractInvertedFilterCondition(
 			// only part of the original condition.
 			remainingFilters = filterCond
 		}
-		return invertedexpr.Or(l, r), remainingFilters, nil
+		return inverted.Or(l, r), remainingFilters, nil
 
 	default:
 		return filterPlanner.extractInvertedFilterConditionFromLeaf(evalCtx, filterCond)
 	}
+}
+
+// isIndexColumn returns true if e is an expression that corresponds to an
+// inverted index column. The expression can be either:
+//  - a variable on the index column, or
+//  - an expression that matches the computed column expression (if the index
+//    column is computed).
+//
+func isIndexColumn(
+	tabID opt.TableID, index cat.Index, e opt.Expr, computedColumns map[opt.ColumnID]opt.ScalarExpr,
+) bool {
+	invertedSourceCol := tabID.ColumnID(index.VirtualInvertedColumn().InvertedSourceColumnOrdinal())
+	if v, ok := e.(*memo.VariableExpr); ok && v.Col == invertedSourceCol {
+		return true
+	}
+	if computedColumns != nil && e == computedColumns[invertedSourceCol] {
+		return true
+	}
+	return false
 }

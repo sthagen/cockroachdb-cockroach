@@ -14,7 +14,6 @@ import (
 	"context"
 	"reflect"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -126,39 +125,17 @@ func (r *Replica) sendWithRangeID(
 	return br, pErr
 }
 
+// maybeAddRangeInfoToResponse populates br.RangeInfo if the client doesn't
+// have up-to-date info about the range's descriptor and lease.
 func (r *Replica) maybeAddRangeInfoToResponse(
 	ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse,
 ) {
-	if ba.ReturnRangeInfo {
-		desc, lease := r.GetDescAndLease(ctx)
-		br.RangeInfos = []roachpb.RangeInfo{{Desc: desc, Lease: lease}}
-
-		if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.ClientRangeInfosOnBatchResponse) {
-			// Also set the RangeInfo on the individual responses, for compatibility
-			// with 20.1.
-			for _, r := range br.Responses {
-				reply := r.GetInner()
-				header := reply.Header()
-				header.DeprecatedRangeInfos = br.RangeInfos
-				reply.SetHeader(header)
-			}
-		}
-	} else if ba.ClientRangeInfo != nil {
-		returnRangeInfoIfClientStale(ctx, br, r, *ba.ClientRangeInfo)
-	}
-}
-
-// returnRangeInfoIfClientStale populates br.RangeInfos if the client doesn't
-// have up-to-date info about the range's descriptor and lease.
-func returnRangeInfoIfClientStale(
-	ctx context.Context, br *roachpb.BatchResponse, r *Replica, cinfo roachpb.ClientRangeInfo,
-) {
-	desc, lease := r.GetDescAndLease(ctx)
 	// Compare the client's info with the replica's info to detect if the client
 	// has stale knowledge. Note that the client can have more recent knowledge
 	// than the replica in case this is a follower.
-	needInfo := (cinfo.LeaseSequence < lease.Sequence) ||
-		(cinfo.DescriptorGeneration < desc.Generation)
+	cinfo := &ba.ClientRangeInfo
+	desc, lease := r.GetDescAndLease(ctx)
+	needInfo := (cinfo.LeaseSequence < lease.Sequence) || (cinfo.DescriptorGeneration < desc.Generation)
 	if !needInfo {
 		return
 	}
@@ -179,8 +156,8 @@ func returnRangeInfoIfClientStale(
 		return
 	}
 
-	maybeAddRange := func(rr KeyRange) {
-		if rr.Desc().Generation != desc.Generation {
+	maybeAddRange := func(repl *Replica) {
+		if repl.Desc().Generation != desc.Generation {
 			// The next range does not look like it came from a split that produced
 			// both r and this next range. Of course, this has false negatives (e.g.
 			// if either the LHS or the RHS split multiple times since the client's
@@ -192,33 +169,18 @@ func returnRangeInfoIfClientStale(
 		}
 
 		var rangeInfo roachpb.RangeInfo
-		if rep, ok := rr.(*Replica); ok {
-			// Note that we return the lease even if it's expired. The kvclient can
-			// use it as it sees fit.
-			rangeInfo.Desc, rangeInfo.Lease = rep.GetDescAndLease(ctx)
-		} else {
-			rangeInfo.Desc = *rr.Desc()
-		}
+		// Note that we return the lease even if it's expired. The kvclient can
+		// use it as it sees fit.
+		rangeInfo.Desc, rangeInfo.Lease = repl.GetDescAndLease(ctx)
 		br.RangeInfos = append(br.RangeInfos, rangeInfo)
 	}
 
-	r.store.VisitReplicasByKey(ctx, roachpb.RKeyMin, desc.StartKey, DescendingKeyOrder, func(ctx context.Context, prevR KeyRange) bool {
-		if !prevR.Desc().EndKey.Equal(desc.StartKey) {
-			// The next range does not correspond to the range immediately preceding r.
-			return false
-		}
-		maybeAddRange(prevR)
-		return false
-	})
-
-	r.store.VisitReplicasByKey(ctx, desc.EndKey, roachpb.RKeyMax, AscendingKeyOrder, func(ctx context.Context, nextR KeyRange) bool {
-		if !nextR.Desc().StartKey.Equal(desc.EndKey) {
-			// The next range does not correspond to the range immediately after r.
-			return false
-		}
-		maybeAddRange(nextR)
-		return false
-	})
+	if repl := r.store.lookupPrecedingReplica(desc.StartKey); repl != nil {
+		maybeAddRange(repl)
+	}
+	if repl := r.store.LookupReplica(desc.EndKey); repl != nil {
+		maybeAddRange(repl)
+	}
 }
 
 // batchExecutionFn is a method on Replica that is able to execute a
@@ -289,15 +251,15 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 		var status kvserverpb.LeaseStatus
 		if !ba.ReadConsistency.RequiresReadLease() {
 			// Get a clock reading for checkExecutionCanProceed.
-			status.Timestamp = r.Clock().Now()
+			status.Now = r.Clock().NowAsClockTimestamp()
 		} else if ba.IsSingleSkipLeaseCheckRequest() {
 			// For lease commands, use the provided previous lease for verification.
 			status.Lease = ba.GetPrevLeaseForLeaseRequest()
-			status.Timestamp = r.Clock().Now()
+			status.Now = r.Clock().NowAsClockTimestamp()
 		} else {
 			// If the request is a write or a consistent read, it requires the
 			// range lease or permission to serve via follower reads.
-			if status, pErr = r.redirectOnOrAcquireLease(ctx); pErr != nil {
+			if status, pErr = r.redirectOnOrAcquireLeaseForRequest(ctx, ba.Timestamp); pErr != nil {
 				if nErr := r.canServeFollowerRead(ctx, ba, pErr); nErr != nil {
 					return nil, nErr
 				}

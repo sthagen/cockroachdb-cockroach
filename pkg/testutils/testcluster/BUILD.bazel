@@ -10,6 +10,7 @@ go_library(
         "//pkg/gossip",
         "//pkg/keys",
         "//pkg/kv/kvserver",
+        "//pkg/kv/kvserver/liveness",
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/roachpb",
         "//pkg/rpc",
@@ -24,8 +25,10 @@ go_library(
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
+        "//pkg/util/tracing",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
+        "@io_etcd_go_etcd_raft_v3//:raft",
     ],
 )
 

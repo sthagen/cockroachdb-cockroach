@@ -187,14 +187,7 @@ func (c *cliTest) stopServer() {
 	if c.TestServer != nil {
 		log.Infof(context.Background(), "stopping server at %s / %s",
 			c.ServingRPCAddr(), c.ServingSQLAddr())
-		select {
-		case <-c.Stopper().ShouldStop():
-			// If ShouldStop() doesn't block, that means someone has already
-			// called Stop(). We just need to wait.
-			<-c.Stopper().IsStopped()
-		default:
-			c.Stopper().Stop(context.Background())
-		}
+		c.Stopper().Stop(context.Background())
 	}
 }
 
@@ -1439,10 +1432,14 @@ Flags:
       --log <string>         
                                      Logging configuration. See the documentation for details.
                                     
+      --version              version for cockroach
 
 Use "cockroach [command] --help" for more information about a command.
 `
-	helpExpected := fmt.Sprintf("CockroachDB command-line interface and server.\n\n%s", expUsage)
+	helpExpected := fmt.Sprintf("CockroachDB command-line interface and server.\n\n%s",
+		// Due to a bug in spf13/cobra, 'cockroach help' does not include the --version
+		// flag. Strangely, 'cockroach --help' does, as well as usage error messages.
+		strings.ReplaceAll(expUsage, "      --version              version for cockroach\n", ""))
 	badFlagExpected := fmt.Sprintf("%s\nError: unknown flag: --foo\n", expUsage)
 
 	testCases := []struct {

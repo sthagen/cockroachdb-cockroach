@@ -25,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -552,7 +552,7 @@ func checkSupportForInvertedFilterNode(n *invertedFilterNode) (distRecommendatio
 	// arbitrary order, and de-duplicate the PKs at the next stage.
 	// The expression is a union of inverted spans iff all the spans have been
 	// promoted to FactoredUnionSpans, in which case the Left and Right
-	// InvertedExpressions are nil.
+	// inverted.Expressions are nil.
 	//
 	// TODO(sumeer): Even if the filtering cannot be distributed, the
 	// placement of the inverted filter could be optimized. Specifically, when
@@ -627,6 +627,9 @@ type PlanningCtx struct {
 	// If set, we will record the mapping from planNode to tracing metadata to
 	// later allow associating statistics with the planNode.
 	traceMetadata execNodeTraceMetadata
+
+	// If set, statement execution stats should be collected.
+	collectExecStats bool
 }
 
 var _ physicalplan.ExprContext = &PlanningCtx{}
@@ -964,12 +967,12 @@ func (dsp *DistSQLPlanner) nodeVersionIsCompatible(nodeID roachpb.NodeID) bool {
 	return distsql.FlowVerIsCompatible(dsp.planVersion, v.MinAcceptedVersion, v.Version)
 }
 
-func getIndexIdx(index *descpb.IndexDescriptor, desc *tabledesc.Immutable) (uint32, error) {
+func getIndexIdx(index *descpb.IndexDescriptor, desc catalog.TableDescriptor) (uint32, error) {
 	foundIndex, _ := desc.FindIndexWithID(index.ID)
 	if foundIndex != nil && foundIndex.Public() {
 		return uint32(foundIndex.Ordinal()), nil
 	}
-	return 0, errors.Errorf("invalid index %v (table %s)", index, desc.Name)
+	return 0, errors.Errorf("invalid index %v (table %s)", index, desc.GetName())
 }
 
 // initTableReaderSpec initializes a TableReaderSpec/PostProcessSpec that
@@ -1036,15 +1039,15 @@ func getVirtualColumn(
 
 // tableOrdinal returns the index of a column with the given ID.
 func tableOrdinal(
-	desc *tabledesc.Immutable, colID descpb.ColumnID, visibility execinfrapb.ScanVisibility,
+	desc catalog.TableDescriptor, colID descpb.ColumnID, visibility execinfrapb.ScanVisibility,
 ) int {
-	for i := range desc.Columns {
-		if desc.Columns[i].ID == colID {
+	for i := range desc.GetPublicColumns() {
+		if desc.GetPublicColumns()[i].ID == colID {
 			return i
 		}
 	}
 	if visibility == execinfra.ScanVisibilityPublicAndNotPublic {
-		offset := len(desc.Columns)
+		offset := len(desc.GetPublicColumns())
 		mutationColumns := desc.MutationColumns()
 		for i := range mutationColumns {
 			if mutationColumns[i].ID == colID {
@@ -1058,16 +1061,16 @@ func tableOrdinal(
 	// different for each system column kind. MVCCTimestampColumnID is the
 	// largest column ID, and all system columns are decreasing from it.
 	if colinfo.IsColIDSystemColumn(colID) {
-		return len(desc.Columns) + len(desc.MutationColumns()) + int(colinfo.MVCCTimestampColumnID-colID)
+		return len(desc.GetPublicColumns()) + len(desc.MutationColumns()) + int(colinfo.MVCCTimestampColumnID-colID)
 	}
 
 	panic(errors.AssertionFailedf("column %d not in desc.Columns", colID))
 }
 
-func highestTableOrdinal(desc *tabledesc.Immutable, visibility execinfrapb.ScanVisibility) int {
-	highest := len(desc.Columns) - 1
+func highestTableOrdinal(desc catalog.TableDescriptor, visibility execinfrapb.ScanVisibility) int {
+	highest := len(desc.GetPublicColumns()) - 1
 	if visibility == execinfra.ScanVisibilityPublicAndNotPublic {
-		highest = len(desc.Columns) + len(desc.MutationColumns()) - 1
+		highest = len(desc.GetPublicColumns()) + len(desc.MutationColumns()) - 1
 	}
 	return highest
 }
@@ -1075,7 +1078,9 @@ func highestTableOrdinal(desc *tabledesc.Immutable, visibility execinfrapb.ScanV
 // toTableOrdinals returns a mapping from column ordinals in cols to table
 // reader column ordinals.
 func toTableOrdinals(
-	cols []*descpb.ColumnDescriptor, desc *tabledesc.Immutable, visibility execinfrapb.ScanVisibility,
+	cols []*descpb.ColumnDescriptor,
+	desc catalog.TableDescriptor,
+	visibility execinfrapb.ScanVisibility,
 ) []int {
 	res := make([]int, len(cols))
 	for i := range res {
@@ -1231,7 +1236,7 @@ func (dsp *DistSQLPlanner) createTableReaders(
 type tableReaderPlanningInfo struct {
 	spec                  *execinfrapb.TableReaderSpec
 	post                  execinfrapb.PostProcessSpec
-	desc                  *tabledesc.Immutable
+	desc                  catalog.TableDescriptor
 	spans                 []roachpb.Span
 	reverse               bool
 	scanVisibility        execinfrapb.ScanVisibility
@@ -1318,8 +1323,8 @@ func (dsp *DistSQLPlanner) planTableReaders(
 	planToStreamColMap := make([]int, len(info.cols))
 	var descColumnIDs util.FastIntMap
 	colID := 0
-	for i := range info.desc.Columns {
-		descColumnIDs.Set(colID, int(info.desc.Columns[i].ID))
+	for i := range info.desc.GetPublicColumns() {
+		descColumnIDs.Set(colID, int(info.desc.GetPublicColumns()[i].ID))
 		colID++
 	}
 	if returnMutations {
@@ -2203,6 +2208,14 @@ func (dsp *DistSQLPlanner) createPlanForInvertedJoin(
 	numInputNodeCols, planToStreamColMap, post, types :=
 		mappingHelperForLookupJoins(plan, n.input, n.table, n.isFirstJoinInPairedJoiner)
 
+	invertedJoinerSpec.PrefixEqualityColumns = make([]uint32, len(n.prefixEqCols))
+	for i, col := range n.prefixEqCols {
+		if plan.PlanToStreamColMap[col] == -1 {
+			panic("lookup column not in planToStreamColMap")
+		}
+		invertedJoinerSpec.PrefixEqualityColumns[i] = uint32(plan.PlanToStreamColMap[col])
+	}
+
 	indexVarMap := makeIndexVarMapForLookupJoins(numInputNodeCols, n.table, plan, &post)
 	if invertedJoinerSpec.InvertedExpr, err = physicalplan.MakeExpression(
 		n.invertedExpr, planCtx, indexVarMap,
@@ -2256,7 +2269,7 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 			cols[i].Columns[j] = uint32(col)
 		}
 
-		numStreamCols += len(side.scan.desc.Columns)
+		numStreamCols += len(side.scan.desc.GetPublicColumns())
 	}
 
 	// The zigzag join node only represents inner joins, so hardcode Type to
@@ -2313,7 +2326,7 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 			i++
 		}
 
-		colOffset += len(side.scan.desc.Columns)
+		colOffset += len(side.scan.desc.GetPublicColumns())
 	}
 
 	// Set the ON condition.
@@ -2785,7 +2798,7 @@ func (dsp *DistSQLPlanner) wrapPlan(planCtx *PlanningCtx, n planNode) (*Physical
 	if err := walkPlan(planCtx.ctx, n, planObserver{
 		enterNode: func(ctx context.Context, nodeName string, plan planNode) (bool, error) {
 			switch plan.(type) {
-			case *explainVecNode, *explainPlanNode:
+			case *explainVecNode, *explainPlanNode, *explainDDLNode:
 				// Don't continue recursing into explain nodes - they need to be left
 				// alone since they handle their own planning later.
 				return false, nil

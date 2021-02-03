@@ -69,6 +69,7 @@ func MakeColumnDefDescs(
 		Name:     string(d.Name),
 		Nullable: d.Nullable.Nullability != tree.NotNull && !d.PrimaryKey.IsPrimaryKey,
 		Virtual:  d.IsVirtual(),
+		Hidden:   d.Hidden,
 	}
 
 	// Validate and assign column type.
@@ -260,6 +261,9 @@ func (desc *wrapper) collectConstraintInfo(
 				"duplicate constraint name: %q", uc.Name)
 		}
 		detail := descpb.ConstraintDetail{Kind: descpb.ConstraintTypeUnique}
+		// Constraints in the Validating state are considered Unvalidated for this
+		// purpose.
+		detail.Unvalidated = uc.Validity != descpb.ConstraintValidity_Validated
 		var err error
 		detail.Columns, err = desc.NamesForColumnIDs(uc.ColumnIDs)
 		if err != nil {
@@ -276,7 +280,8 @@ func (desc *wrapper) collectConstraintInfo(
 				"duplicate constraint name: %q", fk.Name)
 		}
 		detail := descpb.ConstraintDetail{Kind: descpb.ConstraintTypeFK}
-		// Constraints in the Validating state are considered Unvalidated for this purpose
+		// Constraints in the Validating state are considered Unvalidated for this
+		// purpose.
 		detail.Unvalidated = fk.Validity != descpb.ConstraintValidity_Validated
 		var err error
 		detail.Columns, err = desc.NamesForColumnIDs(fk.OriginColumnIDs)
@@ -308,7 +313,8 @@ func (desc *wrapper) collectConstraintInfo(
 				"duplicate constraint name: %q", c.Name)
 		}
 		detail := descpb.ConstraintDetail{Kind: descpb.ConstraintTypeCheck}
-		// Constraints in the Validating state are considered Unvalidated for this purpose
+		// Constraints in the Validating state are considered Unvalidated for this
+		// purpose.
 		detail.Unvalidated = c.Validity != descpb.ConstraintValidity_Validated
 		detail.CheckConstraint = c
 		detail.Details = c.Expr

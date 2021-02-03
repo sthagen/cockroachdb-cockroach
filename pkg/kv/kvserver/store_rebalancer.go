@@ -177,7 +177,7 @@ func (sr *StoreRebalancer) Start(ctx context.Context, stopper *stop.Stopper) {
 
 	// Start a goroutine that watches and proactively renews certain
 	// expiration-based leases.
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "store-rebalancer", func(ctx context.Context) {
 		timer := timeutil.NewTimer()
 		defer timer.Stop()
 		timer.Reset(jitteredInterval(storeRebalancerTimerDuration))
@@ -363,7 +363,7 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 	maxQPS float64,
 ) (replicaWithStats, roachpb.ReplicaDescriptor, []replicaWithStats) {
 	var considerForRebalance []replicaWithStats
-	now := sr.rq.store.Clock().Now()
+	now := sr.rq.store.Clock().NowAsClockTimestamp()
 	for {
 		if len(*hottestRanges) == 0 {
 			return replicaWithStats{}, roachpb.ReplicaDescriptor{}, considerForRebalance
@@ -471,7 +471,7 @@ func (sr *StoreRebalancer) chooseReplicaToRebalance(
 	minQPS float64,
 	maxQPS float64,
 ) (replicaWithStats, []roachpb.ReplicationTarget) {
-	now := sr.rq.store.Clock().Now()
+	now := sr.rq.store.Clock().NowAsClockTimestamp()
 	for {
 		if len(*hottestRanges) == 0 {
 			return replicaWithStats{}, nil
@@ -629,7 +629,7 @@ func shouldNotMoveAway(
 	ctx context.Context,
 	replWithStats replicaWithStats,
 	localDesc *roachpb.StoreDescriptor,
-	now hlc.Timestamp,
+	now hlc.ClockTimestamp,
 	minQPS float64,
 ) bool {
 	if !replWithStats.repl.OwnsValidLease(ctx, now) {

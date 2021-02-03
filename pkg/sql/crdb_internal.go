@@ -58,11 +58,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -100,6 +102,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalGossipLivenessTableID:            crdbInternalGossipLivenessTable,
 		catconstants.CrdbInternalGossipNetworkTableID:             crdbInternalGossipNetworkTable,
 		catconstants.CrdbInternalIndexColumnsTableID:              crdbInternalIndexColumnsTable,
+		catconstants.CrdbInternalInflightTraceSpanTableID:         crdbInternalInflightTraceSpanTable,
 		catconstants.CrdbInternalJobsTableID:                      crdbInternalJobsTable,
 		catconstants.CrdbInternalKVNodeStatusTableID:              crdbInternalKVNodeStatusTable,
 		catconstants.CrdbInternalKVStoreStatusTableID:             crdbInternalKVStoreStatusTable,
@@ -333,7 +336,7 @@ CREATE TABLE crdb_internal.tables (
 					}
 				}
 				locality := tree.DNull
-				if c := table.TableDesc().LocalityConfig; c != nil {
+				if c := table.GetLocalityConfig(); c != nil {
 					f := tree.NewFmtCtx(tree.FmtSimple)
 					if err := tabledesc.FormatTableLocalityConfig(c, f); err != nil {
 						return err
@@ -365,7 +368,7 @@ CREATE TABLE crdb_internal.tables (
 			// Note: we do not use forEachTableDesc() here because we want to
 			// include added and dropped descriptors.
 			for _, desc := range descs {
-				table, ok := desc.(*tabledesc.Immutable)
+				table, ok := desc.(catalog.TableDescriptor)
 				if !ok || p.CheckAnyPrivilege(ctx, table) != nil {
 					continue
 				}
@@ -484,14 +487,14 @@ CREATE TABLE crdb_internal.schema_changes (
 		// Note: we do not use forEachTableDesc() here because we want to
 		// include added and dropped descriptors.
 		for _, desc := range descs {
-			table, ok := desc.(*tabledesc.Immutable)
+			table, ok := desc.(catalog.TableDescriptor)
 			if !ok || p.CheckAnyPrivilege(ctx, table) != nil {
 				continue
 			}
-			tableID := tree.NewDInt(tree.DInt(int64(table.ID)))
+			tableID := tree.NewDInt(tree.DInt(int64(table.GetID())))
 			parentID := tree.NewDInt(tree.DInt(int64(table.GetParentID())))
-			tableName := tree.NewDString(table.Name)
-			for _, mut := range table.Mutations {
+			tableName := tree.NewDString(table.GetName())
+			for _, mut := range table.GetMutations() {
 				mutType := "UNKNOWN"
 				targetID := tree.DNull
 				targetName := tree.DNull
@@ -542,7 +545,7 @@ CREATE TABLE crdb_internal.leases (
 		ctx context.Context, p *planner, _ *dbdesc.Immutable, addRow func(...tree.Datum) error,
 	) (err error) {
 		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
-		p.LeaseMgr().VisitLeases(func(desc catalog.Descriptor, dropped bool, _ int, expiration tree.DTimestamp) (wantMore bool) {
+		p.LeaseMgr().VisitLeases(func(desc catalog.Descriptor, takenOffline bool, _ int, expiration tree.DTimestamp) (wantMore bool) {
 			if p.CheckAnyPrivilege(ctx, desc) != nil {
 				// TODO(ajwerner): inspect what type of error got returned.
 				return true
@@ -554,7 +557,7 @@ CREATE TABLE crdb_internal.leases (
 				tree.NewDString(desc.GetName()),
 				tree.NewDInt(tree.DInt(int64(desc.GetParentID()))),
 				&expiration,
-				tree.MakeDBool(tree.DBool(dropped)),
+				tree.MakeDBool(tree.DBool(takenOffline)),
 			)
 			return err == nil
 		})
@@ -1128,6 +1131,56 @@ CREATE TABLE crdb_internal.session_trace (
 			}
 		}
 		return nil
+	},
+}
+
+// crdbInternalInflightTraceSpanTable exposes the node-local registry of in-flight spans.
+var crdbInternalInflightTraceSpanTable = virtualSchemaTable{
+	comment: `in-flight spans (RAM; local node only)`,
+	schema: `
+CREATE TABLE crdb_internal.node_inflight_trace_spans (
+  trace_id       INT NOT NULL,    -- The trace's ID.
+  parent_span_id INT NOT NULL,    -- The span's parent ID.
+  span_id        INT NOT NULL,    -- The span's ID.
+  goroutine_id   INT NOT NULL,    -- The ID of the goroutine on which the span was created.
+  start_time     TIMESTAMPTZ,     -- The span's start time.
+  duration       INTERVAL,        -- The span's duration, measured by time of 
+                                  -- collection - start time for all in-flight spans.
+  operation      STRING NULL      -- The span's operation.
+)`,
+	populate: func(ctx context.Context, p *planner, _ *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
+		return p.ExecCfg().Settings.Tracer.VisitSpans(func(span *tracing.Span) error {
+			for _, rec := range span.GetRecording() {
+				traceID := rec.TraceID
+				parentSpanID := rec.ParentSpanID
+				spanID := rec.SpanID
+				goroutineID := rec.GoroutineID
+
+				startTime, err := tree.MakeDTimestampTZ(rec.StartTime, time.Microsecond)
+				if err != nil {
+					return err
+				}
+
+				spanDuration := rec.Duration
+				operation := rec.Operation
+
+				if err := addRow(
+					tree.NewDInt(tree.DInt(traceID)),
+					tree.NewDInt(tree.DInt(parentSpanID)),
+					tree.NewDInt(tree.DInt(spanID)),
+					tree.NewDInt(tree.DInt(goroutineID)),
+					startTime,
+					tree.NewDInterval(
+						duration.MakeDuration(spanDuration.Nanoseconds(), 0, 0),
+						types.DefaultIntervalTypeMetadata,
+					),
+					tree.NewDString(operation),
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 	},
 }
 
@@ -2509,8 +2562,8 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 		for _, desc := range descs {
 			id := uint32(desc.GetID())
 			switch desc := desc.(type) {
-			case *tabledesc.Immutable:
-				parents[id] = uint32(desc.ParentID)
+			case catalog.TableDescriptor:
+				parents[id] = uint32(desc.GetParentID())
 				tableNames[id] = desc.GetName()
 				indexNames[id] = make(map[uint32]string)
 				for _, idx := range desc.PublicNonPrimaryIndexes() {
@@ -2776,7 +2829,7 @@ CREATE TABLE crdb_internal.zones (
 				return err
 			}
 
-			var table *tabledesc.Immutable
+			var table catalog.TableDescriptor
 			if zs.Database != "" {
 				database, err := catalogkv.MustGetDatabaseDescByID(ctx, p.txn, p.ExecCfg().Codec, descpb.ID(id))
 				if err != nil {
@@ -3703,7 +3756,7 @@ CREATE TABLE crdb_internal.predefined_comments (
 				if vTableEntry.comment != "" {
 					if err := addRow(
 						tableCommentKey,
-						tree.NewDInt(tree.DInt(table.ID)),
+						tree.NewDInt(tree.DInt(table.GetID())),
 						zeroVal,
 						tree.NewDString(vTableEntry.comment)); err != nil {
 						return err

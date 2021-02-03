@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
-	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -64,7 +63,9 @@ import (
 //    variant outputs only the names of the counters that changed; the second
 //    variant outputs the counts as well. It is necessary to use
 //    feature-allowlist before these commands to avoid test flakes (e.g. because
-//    of counters that are changed by looking up descriptors)
+//    of counters that are changed by looking up descriptors).
+//    TODO(yuzefovich): counters currently don't really work because they are
+//    reset before executing every statement by reporter.ReportDiagnostics.
 //
 //  - schema
 //
@@ -94,7 +95,8 @@ func TestTelemetry(t *testing.T) {
 		t.Run("server", func(t *testing.T) {
 			datadriven.RunTest(t, path, func(t *testing.T, td *datadriven.TestData) string {
 				sqlServer := test.server.SQLServer().(*sql.Server)
-				return test.RunTest(td, test.serverDB, test.server.ReportDiagnostics, sqlServer)
+				reporter := test.server.DiagnosticsReporter().(*diagnostics.Reporter)
+				return test.RunTest(td, test.serverDB, reporter.ReportDiagnostics, sqlServer)
 			})
 		})
 
@@ -136,7 +138,7 @@ func (tt *telemetryTest) Start(t *testing.T) {
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
-				DiagnosticsTestingKnobs: diagnosticspb.TestingKnobs{
+				DiagnosticsTestingKnobs: diagnostics.TestingKnobs{
 					OverrideReportingURL: &diagSrvURL,
 				},
 			},

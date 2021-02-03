@@ -932,7 +932,7 @@ func TestValidateTableDesc(t *testing.T) {
 	for i, d := range testData {
 		t.Run(d.err, func(t *testing.T) {
 			desc := NewImmutable(d.desc)
-			if err := desc.ValidateTable(ctx); err == nil {
+			if err := ValidateTable(ctx, desc); err == nil {
 				t.Errorf("%d: expected \"%s\", but found success: %+v", i, d.err, d.desc)
 			} else if d.err != err.Error() && "internal error: "+d.err != err.Error() {
 				t.Errorf("%d: expected \"%s\", but found \"%+v\"", i, d.err, err)
@@ -1350,7 +1350,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			descs[otherDesc.ID] = NewImmutable(otherDesc)
 		}
 		desc := NewImmutable(test.desc)
-		if err := desc.ValidateCrossReferences(ctx, descs); err == nil {
+		if err := ValidateCrossReferences(ctx, descs, desc); err == nil {
 			if test.err != "" {
 				t.Errorf("%d: expected \"%s\", but found success: %+v", i, test.err, test.desc)
 			}
@@ -1561,7 +1561,7 @@ func TestValidatePartitioning(t *testing.T) {
 	for i, test := range tests {
 		t.Run(test.err, func(t *testing.T) {
 			desc := NewImmutable(test.desc)
-			err := desc.ValidatePartitioning()
+			err := ValidatePartitioning(desc)
 			if !testutils.IsError(err, test.err) {
 				t.Errorf(`%d: got "%v" expected "%v"`, i, err, test.err)
 			}
@@ -1687,7 +1687,7 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 	tests := []struct {
 		desc       descpb.TableDescriptor
 		expUpgrade bool
-		verify     func(int, *Immutable) // nil means no extra verification.
+		verify     func(int, catalog.TableDescriptor) // nil means no extra verification.
 	}{
 		{
 			desc: descpb.TableDescriptor{
@@ -1698,8 +1698,8 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 				Privileges: descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
 			},
 			expUpgrade: true,
-			verify: func(i int, desc *Immutable) {
-				if len(desc.Families) == 0 {
+			verify: func(i int, desc catalog.TableDescriptor) {
+				if len(desc.GetFamilies()) == 0 {
 					t.Errorf("%d: expected families to be set, but it was empty", i)
 				}
 			},
@@ -1720,7 +1720,9 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 	for i, test := range tests {
 		desc, err := NewFilledInImmutable(context.Background(), nil, &test.desc)
 		require.NoError(t, err)
-		upgraded := desc.GetPostDeserializationChanges().UpgradedFormatVersion
+		changes, err := GetPostDeserializationChanges(desc)
+		require.NoError(t, err)
+		upgraded := changes.UpgradedFormatVersion
 		if upgraded != test.expUpgrade {
 			t.Fatalf("%d: expected upgraded=%t, but got upgraded=%t", i, test.expUpgrade, upgraded)
 		}
@@ -1823,32 +1825,66 @@ func TestColumnNeedsBackfill(t *testing.T) {
 	// Define variable strings here such that we can pass their address below.
 	null := "NULL"
 	four := "4:::INT8"
+
 	// Create Column Descriptors that reflect the definition of a column with a
 	// default value of NULL that was set implicitly, one that was set explicitly,
 	// and one that has an INT default value, respectively.
-	implicitNull := &descpb.ColumnDescriptor{
-		Name: "im", ID: 2, Type: types.Int, DefaultExpr: nil, Nullable: true, ComputeExpr: nil,
+	testCases := []struct {
+		info string
+		desc descpb.ColumnDescriptor
+		// add is true of we expect backfill when adding this column.
+		add bool
+		// drop is true of we expect backfill when adding this column.
+		drop bool
+	}{
+		{
+			info: "implicit SET DEFAULT NULL",
+			desc: descpb.ColumnDescriptor{
+				Name: "am", ID: 2, Type: types.Int, DefaultExpr: nil, Nullable: true, ComputeExpr: nil,
+			},
+			add:  false,
+			drop: true,
+		}, {
+			info: "explicit SET DEFAULT NULL",
+			desc: descpb.ColumnDescriptor{
+				Name: "ex", ID: 3, Type: types.Int, DefaultExpr: &null, Nullable: true, ComputeExpr: nil,
+			},
+			add:  false,
+			drop: true,
+		},
+		{
+			info: "explicit SET DEFAULT non-NULL",
+			desc: descpb.ColumnDescriptor{
+				Name: "four", ID: 4, Type: types.Int, DefaultExpr: &four, Nullable: true, ComputeExpr: nil,
+			},
+			add:  true,
+			drop: true,
+		},
+		{
+			info: "computed stored",
+			desc: descpb.ColumnDescriptor{
+				Name: "stored", ID: 5, Type: types.Int, DefaultExpr: nil, ComputeExpr: &four,
+			},
+			add:  true,
+			drop: true,
+		},
+		{
+			info: "computed virtual",
+			desc: descpb.ColumnDescriptor{
+				Name: "virtual", ID: 6, Type: types.Int, DefaultExpr: nil, ComputeExpr: &four, Virtual: true,
+			},
+			add:  false,
+			drop: false,
+		},
 	}
-	explicitNull := &descpb.ColumnDescriptor{
-		Name: "ex", ID: 3, Type: types.Int, DefaultExpr: &null, Nullable: true, ComputeExpr: nil,
-	}
-	defaultNotNull := &descpb.ColumnDescriptor{
-		Name: "four", ID: 4, Type: types.Int, DefaultExpr: &four, Nullable: true, ComputeExpr: nil,
-	}
-	// Verify that a backfill doesn't occur according to the ColumnNeedsBackfill
-	// function for the default NULL values, and that it does occur for an INT
-	// default value.
-	if ColumnNeedsBackfill(implicitNull) != false {
-		t.Fatal("Expected implicit SET DEFAULT NULL to not require a backfill," +
-			" ColumnNeedsBackfill states that it does.")
-	}
-	if ColumnNeedsBackfill(explicitNull) != false {
-		t.Fatal("Expected explicit SET DEFAULT NULL to not require a backfill," +
-			" ColumnNeedsBackfill states that it does.")
-	}
-	if ColumnNeedsBackfill(defaultNotNull) != true {
-		t.Fatal("Expected explicit SET DEFAULT NULL to require a backfill," +
-			" ColumnNeedsBackfill states that it does not.")
+
+	for _, tc := range testCases {
+		if ColumnNeedsBackfill(descpb.DescriptorMutation_ADD, &tc.desc) != tc.add {
+			t.Errorf("expected ColumnNeedsBackfill to be %v for adding %s", tc.add, tc.info)
+		}
+		if ColumnNeedsBackfill(descpb.DescriptorMutation_DROP, &tc.desc) != tc.drop {
+			t.Errorf("expected ColumnNeedsBackfill to be %v for dropping %s", tc.drop, tc.info)
+		}
 	}
 }
 

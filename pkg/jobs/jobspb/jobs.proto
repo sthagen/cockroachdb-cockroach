@@ -19,6 +19,7 @@ import "roachpb/io-formats.proto";
 import "sql/catalog/descpb/structured.proto";
 import "sql/catalog/descpb/tenant.proto";
 import "util/hlc/timestamp.proto";
+import "sql/schemachanger/scpb/scpb.proto";
 
 message Lease {
   option (gogoproto.equal) = true;
@@ -78,10 +79,16 @@ message EncryptionInfo {
 }
 
 message StreamIngestionDetails {
-  // StreamAddress is the location of the stream which the ingestion job will
-  // read from.
-  string stream_address = 1 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient.StreamAddress"];
+  // StreamAddress locates the stream. It enables the client to find the
+  // addresses of the stream's partitions.
+  string stream_address = 1 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl.StreamAddress"];
+  // Span is the keyspan into which this job will ingest KVs.
+  //
+  // The stream should emit all changes for a given span, and no changes outside
+  // a span. Note that KVs received from the stream may need to be re-keyed into
+  // this span.
   roachpb.Span span = 2 [(gogoproto.nullable) = false];
+  // The job will ingest events from StartTime onwards.
   util.hlc.Timestamp start_time = 3 [(gogoproto.nullable) = false];
 }
 
@@ -294,6 +301,16 @@ message TypeSchemaChangeDetails {
 // TypeSchemaChangeProgress is the persisted progress for a type schema change job.
 message TypeSchemaChangeProgress {
 
+}
+
+// TypeSchemaChangeDetails is the job detail information for the new schema change job.
+message NewSchemaChangeDetails {
+  repeated cockroach.sql.schemachanger.scpb.Target targets = 1;
+}
+
+// NewSchemaChangeProgress is the persisted progress for the new schema change job.
+message NewSchemaChangeProgress {
+  repeated cockroach.sql.schemachanger.scpb.State states = 1;
 }
 
 message ResumeSpanList {
@@ -592,6 +609,7 @@ message Payload {
     SchemaChangeGCDetails schemaChangeGC = 21;
     TypeSchemaChangeDetails typeSchemaChange = 22;
     StreamIngestionDetails streamIngestion = 23;
+    NewSchemaChangeDetails newSchemaChange = 24;
   }
 }
 
@@ -613,6 +631,7 @@ message Progress {
     SchemaChangeGCProgress schemaChangeGC = 16;
     TypeSchemaChangeProgress typeSchemaChange = 17;
     StreamIngestionProgress streamIngest = 18;
+    NewSchemaChangeProgress newSchemaChange = 19;
   }
 }
 
@@ -633,6 +652,7 @@ enum Type {
   // names for this enum, which cause a conflict with the SCHEMA_CHANGE entry.
   TYPEDESC_SCHEMA_CHANGE = 9 [(gogoproto.enumvalue_customname) = "TypeTypeSchemaChange"];
   STREAM_INGESTION = 10 [(gogoproto.enumvalue_customname) = "TypeStreamIngestion"];
+  NEW_SCHEMA_CHANGE = 11 [(gogoproto.enumvalue_customname) = "TypeNewSchemaChange"];
 }
 
 message Job {

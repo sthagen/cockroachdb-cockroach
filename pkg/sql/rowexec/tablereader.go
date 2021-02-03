@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -159,7 +158,7 @@ func newTableReader(
 		tr.spans[i] = s.Span
 	}
 
-	if sp := tracing.SpanFromContext(flowCtx.EvalCtx.Ctx()); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
 		tr.fetcher = newRowFetcherStatCollector(&fetcher)
 		tr.ExecStatsForTrace = tr.execStatsForTrace
 	} else {
@@ -188,15 +187,16 @@ func (tr *tableReader) Start(ctx context.Context) context.Context {
 	var err error
 	if tr.maxTimestampAge == 0 {
 		err = tr.fetcher.StartScan(
-			ctx, tr.FlowCtx.Txn, tr.spans,
-			limitBatches, tr.limitHint, tr.FlowCtx.TraceKV,
+			ctx, tr.FlowCtx.Txn, tr.spans, limitBatches, tr.limitHint,
+			tr.FlowCtx.TraceKV,
+			tr.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 		)
 	} else {
 		initialTS := tr.FlowCtx.Txn.ReadTimestamp()
 		err = tr.fetcher.StartInconsistentScan(
-			ctx, tr.FlowCtx.Cfg.DB, initialTS,
-			tr.maxTimestampAge, tr.spans,
+			ctx, tr.FlowCtx.Cfg.DB, initialTS, tr.maxTimestampAge, tr.spans,
 			limitBatches, tr.limitHint, tr.FlowCtx.TraceKV,
+			tr.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 		)
 	}
 

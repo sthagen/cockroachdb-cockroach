@@ -15,12 +15,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -334,7 +334,7 @@ func (e *distSQLSpecExecFactory) ConstructFilter(
 // ConstructInvertedFilter is part of the exec.Factory interface.
 func (e *distSQLSpecExecFactory) ConstructInvertedFilter(
 	n exec.Node,
-	invFilter *invertedexpr.SpanExpression,
+	invFilter *inverted.SpanExpression,
 	preFiltererExpr tree.TypedExpr,
 	preFiltererType *types.T,
 	invColumn exec.NodeColumnOrdinal,
@@ -641,12 +641,13 @@ func (e *distSQLSpecExecFactory) ConstructInvertedJoin(
 	input exec.Node,
 	table cat.Table,
 	index cat.Index,
+	prefixEqCols []exec.NodeColumnOrdinal,
 	lookupCols exec.TableColumnOrdinalSet,
 	onCond tree.TypedExpr,
 	isFirstJoinInPairedJoiner bool,
 	reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
-	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: geo lookup join")
+	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: inverted join")
 }
 
 func (e *distSQLSpecExecFactory) ConstructZigzagJoin(
@@ -766,6 +767,11 @@ func (e *distSQLSpecExecFactory) ConstructExplain(
 			options: options,
 			plan:    *p,
 		}
+	} else if options.Mode == tree.ExplainDDL {
+		explainNode = &explainDDLNode{
+			options: options,
+			plan:    *p,
+		}
 	} else {
 		explainNode = &explainPlanNode{
 			options: options,
@@ -796,7 +802,8 @@ func (e *distSQLSpecExecFactory) ConstructShowTrace(
 func (e *distSQLSpecExecFactory) ConstructInsert(
 	input exec.Node,
 	table cat.Table,
-	arbiters cat.IndexOrdinals,
+	arbiterIndexes cat.IndexOrdinals,
+	arbiterConstraints cat.UniqueOrdinals,
 	insertCols exec.TableColumnOrdinalSet,
 	returnCols exec.TableColumnOrdinalSet,
 	checkCols exec.CheckOrdinalSet,
@@ -833,7 +840,8 @@ func (e *distSQLSpecExecFactory) ConstructUpdate(
 func (e *distSQLSpecExecFactory) ConstructUpsert(
 	input exec.Node,
 	table cat.Table,
-	arbiters cat.IndexOrdinals,
+	arbiterIndexes cat.IndexOrdinals,
+	arbiterConstraints cat.UniqueOrdinals,
 	canaryCol exec.NodeColumnOrdinal,
 	insertCols exec.TableColumnOrdinalSet,
 	fetchCols exec.TableColumnOrdinalSet,

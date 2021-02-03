@@ -75,6 +75,7 @@ ALTER TABLE a CONFIGURE ZONE USING
   range_min_bytes = 200000 + 1,
   range_max_bytes = 300000 + 1,
   gc.ttlseconds = 3000 + 600,
+  global_reads = true,
   num_replicas = floor(1.2)::int,
   constraints = '[+region=test]',
   lease_preferences = '[[+region=test]]'
@@ -86,12 +87,14 @@ WHERE feature_name IN (
   'sql.schema.zone_config.table.range_min_bytes',
   'sql.schema.zone_config.table.range_max_bytes',
   'sql.schema.zone_config.table.gc.ttlseconds',
+  'sql.schema.zone_config.table.global_reads',
   'sql.schema.zone_config.table.num_replicas',
   'sql.schema.zone_config.table.constraints'
 ) AND usage_count > 0 ORDER BY feature_name
 ----
 sql.schema.zone_config.table.constraints
 sql.schema.zone_config.table.gc.ttlseconds
+sql.schema.zone_config.table.global_reads
 sql.schema.zone_config.table.num_replicas
 sql.schema.zone_config.table.range_max_bytes
 sql.schema.zone_config.table.range_min_bytes
@@ -103,6 +106,7 @@ SELECT zone_id, raw_config_sql FROM [SHOW ZONE CONFIGURATION FOR TABLE a]
     range_min_bytes = 200001,
     range_max_bytes = 300001,
     gc.ttlseconds = 3600,
+    global_reads = true,
     num_replicas = 1,
     constraints = '[+region=test]',
     lease_preferences = '[[+region=test]]'
@@ -118,6 +122,7 @@ SELECT zone_id, raw_config_sql FROM [SHOW ZONE CONFIGURATION FOR TABLE a]
     range_min_bytes = 200001,
     range_max_bytes = 400000,
     gc.ttlseconds = 3600,
+    global_reads = true,
     num_replicas = 1,
     constraints = '[+region=test]',
     lease_preferences = '[[+region=test]]'
@@ -154,6 +159,7 @@ SELECT zone_id, raw_config_sql FROM [SHOW ZONE CONFIGURATION FOR TABLE a]
     range_min_bytes = 200001,
     range_max_bytes = 400000,
     gc.ttlseconds = 3600,
+    global_reads = true,
     num_replicas = 1,
     constraints = '[+region=test]',
     lease_preferences = '[[+region=test]]'
@@ -195,3 +201,67 @@ ORDER BY feature_name
 ----
 sql.schema.alter_range.configure_zone
 sql.schema.alter_table.configure_zone
+
+
+# Check that configuring num_voters separately from num_replicas behaves as
+# expected, across setting them directly and through inheritance.
+#
+# 1. Check that voter_constraints cannot be set without setting num_voters as
+# well.
+statement error pq: could not validate zone config: when voter_constraints are set, num_voters must be set as well
+ALTER TABLE a CONFIGURE ZONE USING voter_constraints = '{"+region=test": 3}'
+
+# 2. Check that num_voters and voter_constraints show up in tandem once
+# num_voters is explicitly set.
+statement ok
+ALTER TABLE a CONFIGURE ZONE USING num_replicas = 3;
+
+query IT
+SELECT zone_id, raw_config_sql FROM [SHOW ZONE CONFIGURATION FOR TABLE a]
+----
+53  ALTER TABLE a CONFIGURE ZONE USING
+    range_min_bytes = 1234567,
+    range_max_bytes = 536870912,
+    gc.ttlseconds = 90000,
+    num_replicas = 3,
+    constraints = '[]',
+    lease_preferences = '[]'
+
+statement ok
+ALTER TABLE a CONFIGURE ZONE USING num_voters = 1;
+
+query IT
+SELECT zone_id, raw_config_sql FROM [SHOW ZONE CONFIGURATION FOR TABLE a]
+----
+53  ALTER TABLE a CONFIGURE ZONE USING
+    range_min_bytes = 1234567,
+    range_max_bytes = 536870912,
+    gc.ttlseconds = 90000,
+    num_replicas = 3,
+    num_voters = 1,
+    constraints = '[]',
+    voter_constraints = '[]',
+    lease_preferences = '[]'
+
+# 3. Sanity check that `voter_constraints` can be reset.
+statement ok
+ALTER TABLE a CONFIGURE ZONE USING voter_constraints = '{"+region=test": 1}'
+
+statement error pq: constraint "\+region=shouldFail" matches no existing nodes within the cluster - did you enter it correctly\?
+ALTER TABLE a CONFIGURE ZONE USING voter_constraints = '{"+region=shouldFail": 1}'
+
+statement error pq: could not validate zone config: when voter_constraints are set, num_voters must be set as well
+ALTER TABLE a CONFIGURE ZONE USING num_voters = COPY FROM PARENT
+
+query IT
+SELECT zone_id, raw_config_sql FROM [SHOW ZONE CONFIGURATION FOR TABLE a]
+----
+53  ALTER TABLE a CONFIGURE ZONE USING
+    range_min_bytes = 1234567,
+    range_max_bytes = 536870912,
+    gc.ttlseconds = 90000,
+    num_replicas = 3,
+    num_voters = 1,
+    constraints = '[]',
+    voter_constraints = '{+region=test: 1}',
+    lease_preferences = '[]'

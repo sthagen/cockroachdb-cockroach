@@ -32,8 +32,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -65,7 +65,7 @@ import (
 // TODO(radu): we should verify that the queries in tests using SplitTable
 // are indeed distributed as intended.
 func SplitTable(
-	t *testing.T, tc serverutils.TestClusterInterface, desc *tabledesc.Immutable, sps []SplitPoint,
+	t *testing.T, tc serverutils.TestClusterInterface, desc catalog.TableDescriptor, sps []SplitPoint,
 ) {
 	if tc.ReplicationMode() != base.ReplicationManual {
 		t.Fatal("SplitTable called on a test cluster that was not in manual replication mode")
@@ -152,12 +152,12 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 	)
 
 	// Start a worker that continuously performs splits in the background.
-	tc.Stopper().RunWorker(context.Background(), func(ctx context.Context) {
+	_ = tc.Stopper().RunAsyncTask(context.Background(), "splitter", func(ctx context.Context) {
 		rng, _ := randutil.NewPseudoRand()
 		cdb := tc.Server(0).DB()
 		for {
 			select {
-			case <-tc.Stopper().ShouldStop():
+			case <-tc.Stopper().ShouldQuiesce():
 				return
 			default:
 				// Split the table at a random row.
@@ -284,7 +284,7 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 				Desc: descs[0],
 				Lease: roachpb.Lease{
 					Replica:  roachpb.ReplicaDescriptor{NodeID: 1, StoreID: 1, ReplicaID: 1},
-					Start:    hlc.MinTimestamp,
+					Start:    hlc.MinClockTimestamp,
 					Sequence: 1,
 				},
 			},
@@ -292,7 +292,7 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 				Desc: descs[1],
 				Lease: roachpb.Lease{
 					Replica:  roachpb.ReplicaDescriptor{NodeID: 2, StoreID: 2, ReplicaID: 2},
-					Start:    hlc.MinTimestamp,
+					Start:    hlc.MinClockTimestamp,
 					Sequence: 1,
 				},
 			},
@@ -306,7 +306,7 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 				Desc: descs[2],
 				Lease: roachpb.Lease{
 					Replica:  roachpb.ReplicaDescriptor{NodeID: 3, StoreID: 3, ReplicaID: 3},
-					Start:    hlc.MinTimestamp,
+					Start:    hlc.MinClockTimestamp,
 					Sequence: 1,
 				},
 			},

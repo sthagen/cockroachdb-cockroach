@@ -169,11 +169,16 @@ func (n *dropSchemaNode) startExec(params runParams) error {
 	// in the same transaction as table descriptor update.
 	for _, schemaToDelete := range n.d.schemasToDelete {
 		sc := schemaToDelete.schema
+		qualifiedSchemaName, err := p.getQualifiedSchemaName(params.ctx, sc.Desc)
+		if err != nil {
+			return err
+		}
+
 		if err := params.p.logEvent(params.ctx,
 			sc.ID,
-			// TODO(knz): This is missing some details about the database.
-			// See: https://github.com/cockroachdb/cockroach/issues/57738
-			&eventpb.DropSchema{SchemaName: sc.Name}); err != nil {
+			&eventpb.DropSchema{
+				SchemaName: qualifiedSchemaName.String(),
+			}); err != nil {
 			return err
 		}
 	}
@@ -215,7 +220,7 @@ func (p *planner) createDropSchemaJob(
 		typeIDs = append(typeIDs, t.ID)
 	}
 
-	_, err := p.extendedEvalCtx.QueueJob(jobs.Record{
+	_, err := p.extendedEvalCtx.QueueJob(p.EvalContext().Ctx(), jobs.Record{
 		Description:   jobDesc,
 		Username:      p.User(),
 		DescriptorIDs: schemas,

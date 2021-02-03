@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
@@ -200,14 +199,12 @@ func GetResumeSpans(
 	// Find the index of the first mutation that is being worked on.
 	const noIndex = -1
 	mutationIdx := noIndex
-	if len(tableDesc.Mutations) > 0 {
-		for i, m := range tableDesc.Mutations {
-			if m.MutationID != mutationID {
-				break
-			}
-			if mutationIdx == noIndex && filter(m) {
-				mutationIdx = i
-			}
+	for i, m := range tableDesc.GetMutations() {
+		if m.MutationID != mutationID {
+			break
+		}
+		if mutationIdx == noIndex && filter(m) {
+			mutationIdx = i
 		}
 	}
 
@@ -218,12 +215,12 @@ func GetResumeSpans(
 
 	// Find the job.
 	var jobID int64
-	if len(tableDesc.MutationJobs) > 0 {
+	if len(tableDesc.GetMutationJobs()) > 0 {
 		// TODO (lucy): We need to get rid of MutationJobs. This is the only place
 		// where we need to get the job where it's not completely straightforward to
 		// remove the use of MutationJobs, since the backfiller doesn't otherwise
 		// know which job it's associated with.
-		for _, job := range tableDesc.MutationJobs {
+		for _, job := range tableDesc.GetMutationJobs() {
 			if job.MutationID == mutationID {
 				jobID = job.JobID
 				break
@@ -260,33 +257,4 @@ func SetResumeSpansInJob(
 	}
 	details.ResumeSpanList[mutationIdx].ResumeSpans = spans
 	return job.WithTxn(txn).SetDetails(ctx, details)
-}
-
-// WriteResumeSpan writes a checkpoint for the backfill work on origSpan.
-// origSpan is the span of keys that were assigned to be backfilled,
-// resume is the left over work from origSpan.
-func WriteResumeSpan(
-	ctx context.Context,
-	db *kv.DB,
-	codec keys.SQLCodec,
-	id descpb.ID,
-	mutationID descpb.MutationID,
-	filter backfill.MutationFilter,
-	finished roachpb.Spans,
-	jobsRegistry *jobs.Registry,
-) error {
-	ctx, traceSpan := tracing.ChildSpan(ctx, "checkpoint")
-	defer traceSpan.Finish()
-
-	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		resumeSpans, job, mutationIdx, error := GetResumeSpans(
-			ctx, jobsRegistry, txn, codec, id, mutationID, filter,
-		)
-		if error != nil {
-			return error
-		}
-
-		resumeSpans = roachpb.SubtractSpans(resumeSpans, finished)
-		return SetResumeSpansInJob(ctx, resumeSpans, mutationIdx, txn, job)
-	})
 }

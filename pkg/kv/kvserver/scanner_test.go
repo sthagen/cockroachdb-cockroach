@@ -61,7 +61,7 @@ func newTestRangeSet(count int, t *testing.T) *testRangeSet {
 			LiveCount: 1,
 		}
 		repl.mu.state.Desc = desc
-		if exRngItem := rs.replicasByKey.ReplaceOrInsert(repl); exRngItem != nil {
+		if exRngItem := rs.replicasByKey.ReplaceOrInsert((*btreeReplica)(repl)); exRngItem != nil {
 			t.Fatalf("failed to insert range %s", repl)
 		}
 	}
@@ -76,7 +76,7 @@ func (rs *testRangeSet) Visit(visitor func(*Replica) bool) {
 		rs.visited++
 		rs.Unlock()
 		defer rs.Lock()
-		return visitor(i.(*Replica))
+		return visitor((*Replica)(i.(*btreeReplica)))
 	})
 }
 
@@ -99,7 +99,7 @@ func (rs *testRangeSet) remove(index int, t *testing.T) *Replica {
 	if repl == nil {
 		t.Fatalf("failed to delete range of end key %s", endKey)
 	}
-	return repl.(*Replica)
+	return (*Replica)(repl.(*btreeReplica))
 }
 
 // Test implementation of a range queue which adds range to an
@@ -120,7 +120,13 @@ func (tq *testQueue) setDisabled(d bool) {
 }
 
 func (tq *testQueue) Start(stopper *stop.Stopper) {
-	stopper.RunWorker(context.Background(), func(context.Context) {
+	done := func() {
+		tq.Lock()
+		tq.done = true
+		tq.Unlock()
+	}
+
+	if err := stopper.RunAsyncTask(context.Background(), "testqueue", func(context.Context) {
 		for {
 			select {
 			case <-time.After(1 * time.Millisecond):
@@ -130,18 +136,20 @@ func (tq *testQueue) Start(stopper *stop.Stopper) {
 					tq.processed++
 				}
 				tq.Unlock()
-			case <-stopper.ShouldStop():
-				tq.Lock()
-				tq.done = true
-				tq.Unlock()
+			case <-stopper.ShouldQuiesce():
+				done()
 				return
 			}
 		}
-	})
+	}); err != nil {
+		done()
+	}
 }
 
 // NB: MaybeAddAsync on a testQueue is actually synchronous.
-func (tq *testQueue) MaybeAddAsync(ctx context.Context, replI replicaInQueue, now hlc.Timestamp) {
+func (tq *testQueue) MaybeAddAsync(
+	ctx context.Context, replI replicaInQueue, now hlc.ClockTimestamp,
+) {
 	repl := replI.(*Replica)
 
 	tq.Lock()

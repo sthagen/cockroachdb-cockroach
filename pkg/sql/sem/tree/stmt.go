@@ -69,6 +69,7 @@ const (
 type Statement interface {
 	fmt.Stringer
 	NodeFormatter
+
 	StatementType() StatementType
 	// StatementTag is a short string identifying the type of statement
 	// (usually a single verb). This is different than the Stringer output,
@@ -149,6 +150,7 @@ var _ CCLOnlyStatement = &CreateChangefeed{}
 var _ CCLOnlyStatement = &Import{}
 var _ CCLOnlyStatement = &Export{}
 var _ CCLOnlyStatement = &ScheduledBackup{}
+var _ CCLOnlyStatement = &StreamIngestion{}
 
 // StatementType implements the Statement interface.
 func (*AlterDatabaseOwner) StatementType() StatementType { return DDL }
@@ -210,9 +212,17 @@ func (*AlterTable) hiddenFromShowQueries() {}
 func (*AlterTableLocality) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*AlterTableLocality) StatementTag() string { return "ALTER TABLE REGIONAL AFFINITY" }
+func (*AlterTableLocality) StatementTag() string { return "ALTER TABLE SET LOCALITY" }
 
 func (*AlterTableLocality) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterTableOwner) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterTableOwner) StatementTag() string { return "ALTER TABLE OWNER" }
+
+func (*AlterTableOwner) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
 func (*AlterTableSetSchema) StatementType() StatementType { return DDL }
@@ -1020,6 +1030,14 @@ func (*Split) StatementType() StatementType { return Rows }
 func (*Split) StatementTag() string { return "SPLIT" }
 
 // StatementType implements the Statement interface.
+func (*StreamIngestion) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*StreamIngestion) StatementTag() string { return "RESTORE FROM REPLICATION STREAM" }
+
+func (*StreamIngestion) cclOnlyStatement() {}
+
+// StatementType implements the Statement interface.
 func (*Unsplit) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -1071,6 +1089,7 @@ func (n *AlterTableDropStored) String() string           { return AsString(n) }
 func (n *AlterTableLocality) String() string             { return AsString(n) }
 func (n *AlterTableSetDefault) String() string           { return AsString(n) }
 func (n *AlterTableSetNotNull) String() string           { return AsString(n) }
+func (n *AlterTableOwner) String() string                { return AsString(n) }
 func (n *AlterTableSetSchema) String() string            { return AsString(n) }
 func (n *AlterType) String() string                      { return AsString(n) }
 func (n *AlterRole) String() string                      { return AsString(n) }
@@ -1187,6 +1206,7 @@ func (n *ShowVar) String() string                        { return AsString(n) }
 func (n *ShowZoneConfig) String() string                 { return AsString(n) }
 func (n *ShowFingerprints) String() string               { return AsString(n) }
 func (n *Split) String() string                          { return AsString(n) }
+func (n *StreamIngestion) String() string                { return AsString(n) }
 func (n *Unsplit) String() string                        { return AsString(n) }
 func (n *Truncate) String() string                       { return AsString(n) }
 func (n *UnionClause) String() string                    { return AsString(n) }

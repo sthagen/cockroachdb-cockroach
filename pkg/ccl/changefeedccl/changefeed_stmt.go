@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -35,8 +34,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -87,7 +88,6 @@ func changefeedPlanHook(
 	); err != nil {
 		return nil, nil, nil, false, err
 	}
-
 	var sinkURIFn func() (string, error)
 	var header colinfo.ResultColumns
 	unspecifiedSink := changefeedStmt.SinkURI == nil
@@ -199,10 +199,15 @@ func changefeedPlanHook(
 		targets := make(jobspb.ChangefeedTargets, len(targetDescs))
 		for _, desc := range targetDescs {
 			if table, isTable := desc.(catalog.TableDescriptor); isTable {
-				targets[table.GetID()] = jobspb.ChangefeedTarget{
-					StatementTimeName: table.GetName(),
+				_, qualified := opts[changefeedbase.OptFullTableName]
+				name, err := getChangefeedTargetName(ctx, table, *p.ExecCfg(), p.Txn(), qualified)
+				if err != nil {
+					return err
 				}
-				if err := validateChangefeedTable(targets, table); err != nil {
+				targets[table.GetID()] = jobspb.ChangefeedTarget{
+					StatementTimeName: name,
+				}
+				if err := changefeedbase.ValidateTable(targets, table); err != nil {
 					return err
 				}
 			}
@@ -254,7 +259,7 @@ func changefeedPlanHook(
 			return err
 		}
 
-		if _, err := getEncoder(details.Opts); err != nil {
+		if _, err := getEncoder(details.Opts, details.Targets); err != nil {
 			return err
 		}
 		if isCloudStorageSink(parsedSink) {
@@ -313,11 +318,6 @@ func changefeedPlanHook(
 			}
 		}
 
-		// Make a channel for runChangefeedFlow to signal once everything has
-		// been setup okay. This intentionally abuses what would normally be
-		// hooked up to resultsCh to avoid a bunch of extra plumbing.
-		startedCh := make(chan tree.Datums)
-
 		// The below block creates the job and if there's an initial scan, protects
 		// the data required for that scan. We protect the data here rather than in
 		// Resume to shorten the window that data may be GC'd. The protected
@@ -349,7 +349,7 @@ func changefeedPlanHook(
 				Progress: *progress.GetChangefeed(),
 			}
 			createJobAndProtectedTS := func(ctx context.Context, txn *kv.Txn) (err error) {
-				sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn, startedCh)
+				sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn)
 				if err != nil {
 					return err
 				}
@@ -383,23 +383,20 @@ func changefeedPlanHook(
 			}
 		}
 
-		// Start the job and wait for it to signal on startedCh.
-		errCh, err := sj.Start(ctx)
-		if err != nil {
+		// Start the job.
+		if err := sj.Start(ctx); err != nil {
 			return err
 		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-errCh:
-			return err
-		case <-startedCh:
-			// The feed set up without error, return control to the user.
-		}
-		resultsCh <- tree.Datums{
+		case resultsCh <- tree.Datums{
 			tree.NewDInt(tree.DInt(*sj.ID())),
+		}:
+			return nil
 		}
-		return nil
+
 	}
 	return fn, header, nil, avoidBuffering, nil
 }
@@ -509,52 +506,6 @@ func validateDetails(details jobspb.ChangefeedDetails) (jobspb.ChangefeedDetails
 	return details, nil
 }
 
-func validateChangefeedTable(
-	targets jobspb.ChangefeedTargets, tableDesc catalog.TableDescriptor,
-) error {
-	t, ok := targets[tableDesc.GetID()]
-	if !ok {
-		return errors.Errorf(`unwatched table: %s`, tableDesc.GetName())
-	}
-
-	// Technically, the only non-user table known not to work is system.jobs
-	// (which creates a cycle since the resolved timestamp high-water mark is
-	// saved in it), but there are subtle differences in the way many of them
-	// work and this will be under-tested, so disallow them all until demand
-	// dictates.
-	if tableDesc.GetID() < keys.MinUserDescID {
-		return errors.Errorf(`CHANGEFEEDs are not supported on system tables`)
-	}
-	if tableDesc.IsView() {
-		return errors.Errorf(`CHANGEFEED cannot target views: %s`, tableDesc.GetName())
-	}
-	if tableDesc.IsVirtualTable() {
-		return errors.Errorf(`CHANGEFEED cannot target virtual tables: %s`, tableDesc.GetName())
-	}
-	if tableDesc.IsSequence() {
-		return errors.Errorf(`CHANGEFEED cannot target sequences: %s`, tableDesc.GetName())
-	}
-	if families := tableDesc.GetFamilies(); len(families) != 1 {
-		return errors.Errorf(
-			`CHANGEFEEDs are currently supported on tables with exactly 1 column family: %s has %d`,
-			tableDesc.GetName(), len(families))
-	}
-
-	if tableDesc.GetState() == descpb.DescriptorState_DROP {
-		return errors.Errorf(`"%s" was dropped or truncated`, t.StatementTimeName)
-	}
-	if tableDesc.GetName() != t.StatementTimeName {
-		return errors.Errorf(`"%s" was renamed to "%s"`, t.StatementTimeName, tableDesc.GetName())
-	}
-
-	// TODO(mrtracy): re-enable this when allow-backfill option is added.
-	// if tableDesc.HasColumnBackfillMutation() {
-	// 	return errors.Errorf(`CHANGEFEEDs cannot operate on tables being backfilled`)
-	// }
-
-	return nil
-}
-
 type changefeedResumer struct {
 	job *jobs.Job
 }
@@ -588,10 +539,8 @@ func generateChangefeedSessionID() string {
 }
 
 // Resume is part of the jobs.Resumer interface.
-func (b *changefeedResumer) Resume(
-	ctx context.Context, exec interface{}, startedCh chan<- tree.Datums,
-) error {
-	jobExec := exec.(sql.JobExecContext)
+func (b *changefeedResumer) Resume(ctx context.Context, execCtx interface{}) error {
+	jobExec := execCtx.(sql.JobExecContext)
 	execCfg := jobExec.ExecCfg()
 	jobID := *b.job.ID()
 	details := b.job.Details().(jobspb.ChangefeedDetails)
@@ -607,7 +556,14 @@ func (b *changefeedResumer) Resume(
 		MaxBackoff:     10 * time.Second,
 	}
 	var err error
+
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
+		// startedCh is normally used to signal back to the creator of the job that
+		// the job has started; however, in this case nothing will ever receive
+		// on the channel, causing the changefeed flow to block. Replace it with
+		// a dummy channel.
+		startedCh := make(chan tree.Datums, 1)
+
 		if err = distChangefeedFlow(ctx, jobExec, jobID, details, progress, startedCh); err == nil {
 			return nil
 		}
@@ -646,12 +602,6 @@ func (b *changefeedResumer) Resume(
 		} else {
 			progress = reloadedJob.Progress()
 		}
-
-		// startedCh is normally used to signal back to the creator of the job that
-		// the job has started; however, in this case nothing will ever receive
-		// on the channel, causing the changefeed flow to block. Replace it with
-		// a dummy channel.
-		startedCh = make(chan tree.Datums, 1)
 	}
 	// We only hit this if `r.Next()` returns false, which right now only happens
 	// on context cancellation.
@@ -730,4 +680,40 @@ func (b *changefeedResumer) OnPauseRequest(
 	pts := execCfg.ProtectedTimestampProvider
 	return createProtectedTimestampRecord(ctx, execCfg.Codec, pts, txn, *b.job.ID(),
 		details.Targets, *resolved, cp)
+}
+
+// getQualifiedTableName returns the database-qualified name of the table
+// or view represented by the provided descriptor.
+func getQualifiedTableName(
+	ctx context.Context, execCfg sql.ExecutorConfig, txn *kv.Txn, desc catalog.TableDescriptor,
+) (string, error) {
+	dbDesc, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, execCfg.Codec, desc.GetParentID())
+	if err != nil {
+		return "", err
+	}
+	schemaID := desc.GetParentSchemaID()
+	schemaName, err := resolver.ResolveSchemaNameByID(ctx, txn, execCfg.Codec, desc.GetParentID(), schemaID)
+	if err != nil {
+		return "", err
+	}
+	tbName := tree.MakeTableNameWithSchema(
+		tree.Name(dbDesc.GetName()),
+		tree.Name(schemaName),
+		tree.Name(desc.GetName()),
+	)
+	return tbName.String(), nil
+}
+
+// getChangefeedTargetName gets a table name with or without the dots
+func getChangefeedTargetName(
+	ctx context.Context,
+	desc catalog.TableDescriptor,
+	execCfg sql.ExecutorConfig,
+	txn *kv.Txn,
+	qualified bool,
+) (string, error) {
+	if qualified {
+		return getQualifiedTableName(ctx, execCfg, txn, desc)
+	}
+	return desc.GetName(), nil
 }

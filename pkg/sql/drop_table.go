@@ -143,9 +143,7 @@ func (n *dropTableNode) startExec(params runParams) error {
 		if err := params.p.logEvent(params.ctx,
 			droppedDesc.ID,
 			&eventpb.DropTable{
-				TableName: toDel.tn.FQString(),
-				// TODO(knz): the droppedViews are insufficiently qualified
-				// See: https://github.com/cockroachdb/cockroach/issues/57735
+				TableName:           toDel.tn.FQString(),
 				CascadeDroppedViews: droppedViews,
 			}); err != nil {
 			return err
@@ -270,7 +268,7 @@ func (p *planner) removeInterleave(ctx context.Context, ref descpb.ForeignKeyRef
 // dropTableImpl does the work of dropping a table (and everything that depends
 // on it if `cascade` is enabled). It returns a list of view names that were
 // dropped due to `cascade` behavior. droppingParent indicates whether this
-// table's parent (either database or schema) is being dropped.
+// table's parent (either database or schema) is being dropped
 func (p *planner) dropTableImpl(
 	ctx context.Context, tableDesc *tabledesc.Mutable, droppingParent bool, jobDesc string,
 ) ([]string, error) {
@@ -348,8 +346,14 @@ func (p *planner) dropTableImpl(
 		if err != nil {
 			return droppedViews, err
 		}
+
+		qualifiedView, err := p.getQualifiedTableName(ctx, viewDesc)
+		if err != nil {
+			return droppedViews, err
+		}
+
 		droppedViews = append(droppedViews, cascadedViews...)
-		droppedViews = append(droppedViews, viewDesc.Name)
+		droppedViews = append(droppedViews, qualifiedView.FQString())
 	}
 
 	err := p.removeTableComments(ctx, tableDesc)
@@ -357,13 +361,20 @@ func (p *planner) dropTableImpl(
 		return droppedViews, err
 	}
 
-	// Remove any references to types that this table has if a job is meant to be
-	// queued. If not, then the job that is handling the drop table will also
-	// clean up all of the types to be dropped.
-	if !droppingParent {
-		if err := p.removeBackRefsFromAllTypesInTable(ctx, tableDesc); err != nil {
-			return droppedViews, err
-		}
+	// Remove any references to types.
+	//
+	// Note: In some historical context this attempted to defer these removals to
+	// the asynchronous schema change in the case that the parent was being
+	// dropped. This optimization was, as I understand it, to avoid creating
+	// so many descriptor writes if the type was definitely being dropped. This
+	// would be the case if the database were being dropped as theoretically cross
+	// database types have never been permitted. Unfortunately, the droppingParent
+	// flag does not indicate whether it's the schema or parent being dropped.
+	//
+	// TODO(ajwerner): Consider adding a flag to indicate what is actually being
+	// dropped and to omit this step if it is the database rather than the schema.
+	if err := p.removeBackRefsFromAllTypesInTable(ctx, tableDesc); err != nil {
+		return droppedViews, err
 	}
 
 	err = p.initiateDropTable(ctx, tableDesc, !droppingParent, jobDesc, true /* drain name */)

@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -216,7 +217,7 @@ func MakeSpanFromEncDatums(
 	alloc *DatumAlloc,
 	keyPrefix []byte,
 ) (_ roachpb.Span, containsNull bool, _ error) {
-	startKey, complete, containsNull, err := makeKeyFromEncDatums(values, types, dirs, tableDesc, index, alloc, keyPrefix)
+	startKey, complete, containsNull, err := MakeKeyFromEncDatums(values, types, dirs, tableDesc, index, alloc, keyPrefix)
 	if err != nil {
 		return roachpb.Span{}, false, err
 	}
@@ -400,7 +401,7 @@ func SplitSpanIntoSeparateFamilies(
 	return appendTo
 }
 
-// makeKeyFromEncDatums creates an index key by concatenating keyPrefix with the
+// MakeKeyFromEncDatums creates an index key by concatenating keyPrefix with the
 // encodings of the given EncDatum values. The values, types, and dirs
 // parameters should be specified in the same order as the index key columns and
 // may be a prefix. The complete return value is true if the resultant key
@@ -410,7 +411,7 @@ func SplitSpanIntoSeparateFamilies(
 // in place of the family id (a varint) to signal the next component of the
 // key.  An example of one level of interleaving (a parent):
 // /<parent_table_id>/<parent_index_id>/<field_1>/<field_2>/NullDesc/<table_id>/<index_id>/<field_3>/<family>
-func makeKeyFromEncDatums(
+func MakeKeyFromEncDatums(
 	values EncDatumRow,
 	types []*types.T,
 	dirs []descpb.IndexDescriptor_Direction,
@@ -755,6 +756,28 @@ func (a byID) Less(i, j int) bool { return a[i].id < a[j].id }
 func EncodeInvertedIndexKeys(
 	index *descpb.IndexDescriptor, colMap catalog.TableColMap, values []tree.Datum, keyPrefix []byte,
 ) (key [][]byte, err error) {
+	keyPrefix, err = EncodeInvertedIndexPrefixKeys(index, colMap, values, keyPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	var val tree.Datum
+	if i, ok := colMap.Get(index.InvertedColumnID()); ok {
+		val = values[i]
+	} else {
+		val = tree.DNull
+	}
+	if !geoindex.IsEmptyConfig(&index.GeoConfig) {
+		return EncodeGeoInvertedIndexTableKeys(val, keyPrefix, index)
+	}
+	return EncodeInvertedIndexTableKeys(val, keyPrefix, index.Version)
+}
+
+// EncodeInvertedIndexPrefixKeys encodes the non-inverted prefix columns if
+// the given index is a multi-column inverted index.
+func EncodeInvertedIndexPrefixKeys(
+	index *descpb.IndexDescriptor, colMap catalog.TableColMap, values []tree.Datum, keyPrefix []byte,
+) (_ []byte, err error) {
 	numColumns := len(index.ColumnIDs)
 
 	// If the index is a multi-column inverted index, we encode the non-inverted
@@ -774,17 +797,7 @@ func EncodeInvertedIndexKeys(
 			return nil, err
 		}
 	}
-
-	var val tree.Datum
-	if i, ok := colMap.Get(index.ColumnIDs[numColumns-1]); ok {
-		val = values[i]
-	} else {
-		val = tree.DNull
-	}
-	if !geoindex.IsEmptyConfig(&index.GeoConfig) {
-		return EncodeGeoInvertedIndexTableKeys(val, keyPrefix, index)
-	}
-	return EncodeInvertedIndexTableKeys(val, keyPrefix, index.Version)
+	return keyPrefix, nil
 }
 
 // EncodeInvertedIndexTableKeys produces one inverted index key per element in
@@ -827,54 +840,25 @@ func EncodeInvertedIndexTableKeys(
 // x @> y, this function should use the value of y to find the spans to scan
 // in an inverted index on x.
 //
-// The spans returned by EncodeContainingInvertedIndexSpans represent the
-// intersection of unions. For example, if the returned results are:
-//
-//   { {["a", "b"), ["c", "d")}, {["e", "f")} }
-//
-// the expression should be evaluated as:
-//
-//             INTERSECTION
-//              /        \
-//           UNION    ["e", "f")
-//          /     \
-//   ["a", "b") ["c", "d")
+// The spans are returned in an inverted.SpanExpression, which represents the
+// set operations that must be applied on the spans read during execution. See
+// comments in the SpanExpression definition for details.
 //
 // The input inKey is prefixed to the keys in all returned spans.
-//
-// Returns tight=true if the returned spans are tight and cannot produce false
-// positives. Otherwise, returns tight=false.
-//
-// Returns unique=true if the spans are guaranteed not to produce duplicate
-// primary keys. Otherwise, returns unique=false. This distinction is important
-// for the case where the length of spans is 1, and the single element has
-// length greater than 0. Per the above description, this would represent a
-// UNION over the returned spans, with no INTERSECTION. If unique is true, that
-// allows the optimizer to remove the UNION altogether (implemented
-// with the invertedFilterer), and simply return the results of the constrained
-// scan. unique is always false if the length of spans is greater than 1.
-//
-// The spans are not guaranteed to be sorted, so the caller must sort them if
-// needed.
 func EncodeContainingInvertedIndexSpans(
 	evalCtx *tree.EvalContext, val tree.Datum, inKey []byte, version descpb.IndexDescriptorVersion,
-) (spans []roachpb.Spans, tight, unique bool, err error) {
+) (invertedExpr inverted.Expression, err error) {
 	if val == tree.DNull {
-		return nil, false, false, nil
+		return nil, nil
 	}
 	datum := tree.UnwrapDatum(evalCtx, val)
 	switch val.ResolvedType().Family() {
 	case types.JsonFamily:
 		return json.EncodeContainingInvertedIndexSpans(inKey, val.(*tree.DJSON).JSON)
 	case types.ArrayFamily:
-		spans, unique, err := encodeContainingArrayInvertedIndexSpans(val.(*tree.DArray), inKey, version)
-		if err != nil {
-			return nil, false, false, err
-		}
-		// Spans for array inverted indexes are always tight.
-		return spans, true /* tight */, unique, err
+		return encodeContainingArrayInvertedIndexSpans(val.(*tree.DArray), inKey, version)
 	}
-	return nil, false, false, errors.AssertionFailedf(
+	return nil, errors.AssertionFailedf(
 		"trying to apply inverted index to unsupported type %s", datum.ResolvedType(),
 	)
 }
@@ -923,32 +907,38 @@ func encodeArrayInvertedIndexTableKeys(
 // duplicate primary keys. Otherwise, returns unique=false.
 func encodeContainingArrayInvertedIndexSpans(
 	val *tree.DArray, inKey []byte, version descpb.IndexDescriptorVersion,
-) (spans []roachpb.Spans, unique bool, err error) {
+) (invertedExpr inverted.Expression, err error) {
 	if val.Array.Len() == 0 {
-		// All arrays contain the empty array.
-		endKey := roachpb.Key(inKey).PrefixEnd()
-		return []roachpb.Spans{{roachpb.Span{Key: inKey, EndKey: endKey}}}, false, nil
+		// All arrays contain the empty array. Return a SpanExpression that
+		// requires a full scan of the inverted index.
+		invertedExpr = inverted.ExprForSpan(
+			inverted.MakeSingleValSpan(inKey), true, /* tight */
+		)
+		return invertedExpr, nil
 	}
 
 	if val.HasNulls {
 		// If there are any nulls, return empty spans. This is needed to ensure
 		// that `SELECT ARRAY[NULL, 2] @> ARRAY[NULL, 2]` is false.
-		return nil, true, nil
+		return &inverted.SpanExpression{Tight: true, Unique: true}, nil
 	}
 
 	keys, err := encodeArrayInvertedIndexTableKeys(val, inKey, version)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	spans = make([]roachpb.Spans, len(keys))
-	for i, key := range keys {
-		endKey := roachpb.Key(key).PrefixEnd()
-		spans[i] = roachpb.Spans{{Key: key, EndKey: endKey}}
+	for _, key := range keys {
+		spanExpr := inverted.ExprForSpan(
+			inverted.MakeSingleValSpan(key), true, /* tight */
+		)
+		spanExpr.Unique = true
+		if invertedExpr == nil {
+			invertedExpr = spanExpr
+		} else {
+			invertedExpr = inverted.And(invertedExpr, spanExpr)
+		}
 	}
-	// More than 1 key means that there could be duplicate primary keys in an
-	// inverted index.
-	unique = len(keys) == 1
-	return spans, unique, nil
+	return invertedExpr, nil
 }
 
 // EncodeGeoInvertedIndexTableKeys is the equivalent of EncodeInvertedIndexTableKeys

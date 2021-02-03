@@ -250,6 +250,14 @@ var preferLookupJoinsForFKs = settings.RegisterBoolSetting(
 	false,
 )
 
+// InterleavedTablesEnabled is the setting that controls whether it's possible
+// to create interleaved indexes or tables.
+var InterleavedTablesEnabled = settings.RegisterBoolSetting(
+	"sql.defaults.interleaved_tables.enabled",
+	"allows creation of interleaved tables or indexes",
+	false,
+)
+
 // optUseHistogramsClusterMode controls the cluster default for whether
 // histograms are used by the optimizer for cardinality estimation.
 // Note that it does not control histogram collection; regardless of the
@@ -302,15 +310,6 @@ var clusterIdleInSessionTimeout = settings.RegisterDurationSetting(
 	settings.NonNegativeDuration,
 )
 
-// TODO(mgartner): remove this once multi-column inverted indexes are fully
-// supported.
-var experimentalMultiColumnInvertedIndexesMode = settings.RegisterBoolSetting(
-	"sql.defaults.experimental_multi_column_inverted_indexes.enabled",
-	"default value for experimental_enable_multi_column_inverted_indexes session setting;"+
-		"disables multi column inverted indexes by default",
-	false,
-)
-
 // TODO(rytaft): remove this once unique without index constraints are fully
 // supported.
 var experimentalUniqueWithoutIndexConstraintsMode = settings.RegisterBoolSetting(
@@ -318,6 +317,19 @@ var experimentalUniqueWithoutIndexConstraintsMode = settings.RegisterBoolSetting
 	"default value for experimental_enable_unique_without_index_constraints session setting;"+
 		"disables unique without index constraints by default",
 	false,
+)
+
+// DistSQLClusterExecMode controls the cluster default for when DistSQL is used.
+var experimentalUseNewSchemaChanger = settings.RegisterEnumSetting(
+	"sql.defaults.experimental_new_schema_changer.enabled",
+	"default value for experimental_use_new_schema_changer session setting;"+
+		"disables new schema changer by default",
+	"off",
+	map[int64]string{
+		int64(sessiondata.UseNewSchemaChangerOff):          "off",
+		int64(sessiondata.UseNewSchemaChangerOn):           "on",
+		int64(sessiondata.UseNewSchemaChangerUnsafeAlways): "unsafe_always",
+	},
 )
 
 // ExperimentalDistSQLPlanningClusterSettingName is the name for the cluster
@@ -474,9 +486,20 @@ var (
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
+	MetaSQLTxnsOpen = metric.Metadata{
+		Name:        "sql.txns.open",
+		Help:        "Number of currently open SQL transactions",
+		Measurement: "Open SQL Transactions",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaFullTableOrIndexScan = metric.Metadata{
+		Name:        "sql.full.scan.count",
+		Help:        "Number of full table or index scans",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
 
 	// Below are the metadata for the statement started counters.
-
 	MetaQueryStarted = metric.Metadata{
 		Name:        "sql.query.started.count",
 		Help:        "Number of SQL queries started",
@@ -772,6 +795,10 @@ type ExecutorConfig struct {
 	// version` but before executing it. It can carry out arbitrary migrations
 	// that allow us to eventually remove legacy code.
 	VersionUpgradeHook func(ctx context.Context, from, to clusterversion.ClusterVersion) error
+
+	// IndexBackfiller is used to backfill indexes. It is another rather circular
+	// object which mostly just holds on to an ExecConfig.
+	IndexBackfiller *IndexBackfillPlanner
 }
 
 // Organization returns the value of cluster.organization.
@@ -2214,12 +2241,6 @@ func (m *sessionDataMutator) SetAlterColumnTypeGeneral(val bool) {
 	m.data.AlterColumnTypeGeneralEnabled = val
 }
 
-// TODO(mgartner): remove this once multi-column inverted indexes are fully
-// supported.
-func (m *sessionDataMutator) SetMutliColumnInvertedIndexes(val bool) {
-	m.data.EnableMultiColumnInvertedIndexes = val
-}
-
 // TODO(radu): remove this once the feature is stable.
 func (m *sessionDataMutator) SetVirtualColumnsEnabled(val bool) {
 	m.data.VirtualColumnsEnabled = val
@@ -2229,6 +2250,10 @@ func (m *sessionDataMutator) SetVirtualColumnsEnabled(val bool) {
 // supported.
 func (m *sessionDataMutator) SetUniqueWithoutIndexConstraints(val bool) {
 	m.data.EnableUniqueWithoutIndexConstraints = val
+}
+
+func (m *sessionDataMutator) SetUseNewSchemaChanger(val sessiondata.NewSchemaChangerMode) {
+	m.data.NewSchemaChangerMode = val
 }
 
 // RecordLatestSequenceValue records that value to which the session incremented

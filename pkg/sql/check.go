@@ -134,17 +134,18 @@ func matchFullUnacceptableKeyQuery(
 // values in the key are excluded from matching (for both MATCH FULL and MATCH
 // SIMPLE).
 //
-// For example, a FK constraint on columns (a_id, b_id) with an index c_id on
-// the table "child", referencing columns (a, b) with an index p_id on the table
-// "parent", would require the following query:
+// For example, a FK constraint on columns (a_id, b_id) on the table "child",
+// referencing columns (a, b) on the table "parent", would require the following
+// query:
 //
-// SELECT
-//   s.a_id, s.b_id, s.pk1, s.pk2
-// FROM
-//   (SELECT * FROM child@c_idx WHERE a_id IS NOT NULL AND b_id IS NOT NULL) AS s
-//   LEFT OUTER JOIN parent@p_idx AS t ON s.a_id = t.a AND s.b_id = t.b
-// WHERE
-//   t.a IS NULL
+// SELECT s.a_id, s.b_id, s.rowid
+//  FROM (
+//        SELECT a_id, b_id, rowid
+//          FROM [<ID of child> AS src]@{IGNORE_FOREIGN_KEYS}
+//         WHERE a_id IS NOT NULL AND b_id IS NOT NULL
+//       ) AS s
+//       LEFT JOIN [<id of parent> AS target] AS t ON s.a_id = t.a AND s.b_id = t.b
+// WHERE t.a IS NULL
 // LIMIT 1  -- if limitResults is set
 //
 // TODO(radu): change this to a query which executes as an anti-join when we
@@ -209,7 +210,7 @@ func nonMatchingRowQuery(
 		`SELECT %[1]s FROM 
 		  (SELECT %[2]s FROM [%[3]d AS src]@{IGNORE_FOREIGN_KEYS} WHERE %[4]s) AS s
 			LEFT OUTER JOIN
-			(SELECT * FROM [%[5]d AS target]) AS t
+			[%[5]d AS target] AS t
 			ON %[6]s
 		 WHERE %[7]s IS NULL %[8]s`,
 		strings.Join(qualifiedSrcCols, ", "), // 1
@@ -228,7 +229,7 @@ func nonMatchingRowQuery(
 // have a matching row in their referenced table.
 //
 // It operates entirely on the current goroutine and is thus able to
-// reuse an existing client.Txn safely.
+// reuse an existing kv.Txn safely.
 func validateForeignKey(
 	ctx context.Context,
 	srcTable *tabledesc.Mutable,
@@ -305,6 +306,100 @@ func validateForeignKey(
 	return nil
 }
 
+// duplicateRowQuery generates and returns a query for column values that
+// violate the specified unique constraint. Rows in the table with any null
+// values in the key are excluded from matching.
+//
+// For example, a unique constraint on columns (a, b) on the table "tbl" would
+// require the following query:
+//
+// SELECT a, b
+// FROM tbl
+// WHERE a IS NOT NULL AND b IS NOT NULL
+// GROUP BY a, b
+// HAVING count(*) > 1
+// LIMIT 1  -- if limitResults is set
+//
+func duplicateRowQuery(
+	srcTbl catalog.TableDescriptor, uc *descpb.UniqueWithoutIndexConstraint, limitResults bool,
+) (sql string, colNames []string, _ error) {
+	colNames, err := srcTbl.NamesForColumnIDs(uc.ColumnIDs)
+	if err != nil {
+		return "", nil, err
+	}
+
+	srcCols := make([]string, len(colNames))
+	for i, n := range colNames {
+		srcCols[i] = tree.NameString(n)
+	}
+
+	srcWhere := make([]string, len(uc.ColumnIDs))
+	for i := range srcWhere {
+		srcWhere[i] = fmt.Sprintf("%s IS NOT NULL", srcCols[i])
+	}
+
+	limit := ""
+	if limitResults {
+		limit = " LIMIT 1"
+	}
+	return fmt.Sprintf(
+		`SELECT %[1]s FROM [%[2]d AS tbl] WHERE %[3]s GROUP BY %[1]s HAVING count(*) > 1 %[4]s`,
+		strings.Join(srcCols, ", "),     // 1
+		srcTbl.GetID(),                  // 2
+		strings.Join(srcWhere, " AND "), // 3
+		limit,                           // 4
+	), colNames, nil
+}
+
+// validateUniqueConstraint verifies that all the rows in the srcTable
+// have unique values for the given unique constraint.
+//
+// It operates entirely on the current goroutine and is thus able to
+// reuse an existing kv.Txn safely.
+func validateUniqueConstraint(
+	ctx context.Context,
+	srcTable *tabledesc.Mutable,
+	uc *descpb.UniqueWithoutIndexConstraint,
+	ie *InternalExecutor,
+	txn *kv.Txn,
+) error {
+	query, colNames, err := duplicateRowQuery(
+		srcTable, uc, true, /* limitResults */
+	)
+	if err != nil {
+		return err
+	}
+
+	log.Infof(ctx, "validating unique constraint %q (%q [%v]) with query %q",
+		uc.Name,
+		srcTable.Name, colNames,
+		query,
+	)
+
+	values, err := ie.QueryRow(ctx, "validate unique constraint", txn, query)
+	if err != nil {
+		return err
+	}
+	if values.Len() > 0 {
+		valuesStr := make([]string, len(values))
+		for i := range values {
+			valuesStr[i] = values[i].String()
+		}
+		// Note: this error message mirrors the message produced by Postgres
+		// when it fails to add a unique index due to duplicated keys.
+		return errors.WithDetail(
+			pgerror.WithConstraintName(
+				pgerror.Newf(pgcode.UniqueViolation, "could not create unique constraint %q", uc.Name),
+				uc.Name,
+			),
+			fmt.Sprintf(
+				"Key (%s)=(%s) is duplicated.", strings.Join(colNames, ","), strings.Join(valuesStr, ","),
+			),
+		)
+	}
+	return nil
+}
+
 func formatValues(colNames []string, values tree.Datums) string {
 	var pairs bytes.Buffer
 	for i := range values {
@@ -317,7 +412,7 @@ func formatValues(colNames []string, values tree.Datums) string {
 }
 
 // checkSet contains a subset of checks, as ordinals into
-// Immutable.ActiveChecks. These checks have boolean columns
+// immutable.ActiveChecks. These checks have boolean columns
 // produced as input to mutations, indicating the result of evaluating the
 // check.
 //

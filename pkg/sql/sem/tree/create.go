@@ -25,10 +25,12 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
@@ -381,6 +383,7 @@ type ColumnTableDef struct {
 	Name     Name
 	Type     ResolvableTypeReference
 	IsSerial bool
+	Hidden   bool
 	Nullable struct {
 		Nullability    Nullability
 		ConstraintName Name
@@ -493,6 +496,8 @@ func NewColumnTableDef(
 			}
 			d.DefaultExpr.Expr = t.Expr
 			d.DefaultExpr.ConstraintName = c.Name
+		case HiddenConstraint:
+			d.Hidden = true
 		case NotNullConstraint:
 			if d.Nullable.Nullability == Null {
 				return nil, pgerror.Newf(pgcode.Syntax,
@@ -593,6 +598,9 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	if node.Nullable.Nullability != SilentNull && node.Nullable.ConstraintName != "" {
 		ctx.WriteString(" CONSTRAINT ")
 		ctx.FormatNode(&node.Nullable.ConstraintName)
+	}
+	if node.Hidden {
+		ctx.WriteString(" NOT VISIBLE")
 	}
 	switch node.Nullable.Nullability {
 	case Null:
@@ -712,6 +720,7 @@ func (ColumnCollation) columnQualification()             {}
 func (*ColumnDefault) columnQualification()              {}
 func (NotNullConstraint) columnQualification()           {}
 func (NullConstraint) columnQualification()              {}
+func (HiddenConstraint) columnQualification()            {}
 func (PrimaryKeyConstraint) columnQualification()        {}
 func (ShardedPrimaryKeyConstraint) columnQualification() {}
 func (UniqueConstraint) columnQualification()            {}
@@ -733,6 +742,9 @@ type NotNullConstraint struct{}
 
 // NullConstraint represents NULL on a column.
 type NullConstraint struct{}
+
+// HiddenConstraint represents HIDDEN on a column.
+type HiddenConstraint struct{}
 
 // PrimaryKeyConstraint represents PRIMARY KEY on a column.
 type PrimaryKeyConstraint struct{}
@@ -1107,6 +1119,12 @@ func (node *PartitionByIndex) ContainsPartitions() bool {
 	return node != nil && node.PartitionBy != nil
 }
 
+// ContainsPartitioningClause determines if the partition by table contains
+// a partitioning clause, including PARTITION BY NOTHING.
+func (node *PartitionByIndex) ContainsPartitioningClause() bool {
+	return node != nil
+}
+
 // PartitionByTable represents a PARTITION [ALL] BY definition within
 // a CREATE/ALTER TABLE statement.
 type PartitionByTable struct {
@@ -1134,6 +1152,12 @@ func (node *PartitionByTable) Format(ctx *FmtCtx) {
 // a partition clause which is not PARTITION BY NOTHING.
 func (node *PartitionByTable) ContainsPartitions() bool {
 	return node != nil && node.PartitionBy != nil
+}
+
+// ContainsPartitioningClause determines if the partition by table contains
+// a partitioning clause, including PARTITION BY NOTHING.
+func (node *PartitionByTable) ContainsPartitioningClause() bool {
+	return node != nil
 }
 
 // PartitionBy represents an PARTITION BY definition within a CREATE/ALTER
@@ -1784,6 +1808,12 @@ type RefreshMaterializedView struct {
 	Name              *UnresolvedObjectName
 	Concurrently      bool
 	RefreshDataOption RefreshDataOption
+}
+
+// TelemetryCounter returns the telemetry counter to increment
+// when this command is used.
+func (node *RefreshMaterializedView) TelemetryCounter() telemetry.Counter {
+	return sqltelemetry.SchemaRefreshMaterializedView
 }
 
 // RefreshDataOption corresponds to arguments for the REFRESH MATERIALIZED VIEW

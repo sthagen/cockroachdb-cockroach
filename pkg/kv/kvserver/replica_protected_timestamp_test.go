@@ -62,9 +62,9 @@ func TestProtectedTimestampRecordApplies(t *testing.T) {
 		{
 			name: "lease started after",
 			test: func(t *testing.T, r *Replica, mt *manualCache) {
-				r.mu.state.Lease.Start = r.store.Clock().Now()
+				r.mu.state.Lease.Start = r.store.Clock().NowAsClockTimestamp()
 				l, _ := r.GetLease()
-				aliveAt := l.Start.Prev()
+				aliveAt := l.Start.ToTimestamp().Prev()
 				ts := aliveAt.Prev()
 				args := makeArgs(r, ts, aliveAt)
 				willApply, err := r.protectedTimestampRecordApplies(ctx, &args)
@@ -122,8 +122,8 @@ func TestProtectedTimestampRecordApplies(t *testing.T) {
 						Timestamp: ts,
 						Spans: []roachpb.Span{
 							{
-								Key:    roachpb.Key(r.startKey()),
-								EndKey: roachpb.Key(r.startKey().Next()),
+								Key:    roachpb.Key(r.Desc().StartKey),
+								EndKey: roachpb.Key(r.Desc().StartKey.Next()),
 							},
 						},
 					})
@@ -314,7 +314,7 @@ func TestCheckProtectedTimestampsForGC(t *testing.T) {
 		{
 			name: "lease is too new",
 			test: func(t *testing.T, r *Replica, mt *manualCache) {
-				r.mu.state.Lease.Start = r.store.Clock().Now()
+				r.mu.state.Lease.Start = r.store.Clock().NowAsClockTimestamp()
 				canGC, _, gcTimestamp, _ := r.checkProtectedTimestampsForGC(ctx, makePolicy(10))
 				require.False(t, canGC)
 				require.Zero(t, gcTimestamp)

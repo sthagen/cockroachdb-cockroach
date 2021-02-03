@@ -595,6 +595,31 @@ func (s *adminServer) TableDetails(
 		resp.CreateTableStatement = createStmt
 	}
 
+	// Marshal SHOW ZONE CONFIGURATION result.
+	rows, cols, err = s.server.sqlServer.internalExecutor.QueryWithCols(
+		ctx, "admin-show-zone-config", nil, /* txn */
+		sessiondata.InternalExecutorOverride{User: userName},
+		fmt.Sprintf("SHOW ZONE CONFIGURATION FOR TABLE %s", escQualTable))
+	if s.isNotFoundError(err) {
+		return nil, status.Errorf(codes.NotFound, "%s", err)
+	}
+	if err != nil {
+		return nil, s.serverError(err)
+	}
+	{
+		const rawConfigSQLColName = "raw_config_sql"
+		if len(rows) == 1 {
+			scanner := makeResultScanner(cols)
+			var configureZoneStmt string
+			if err := scanner.Scan(rows[0], rawConfigSQLColName, &configureZoneStmt); err != nil {
+				return nil, err
+			}
+			resp.ConfigureZoneStatement = configureZoneStmt
+		} else {
+			resp.ConfigureZoneStatement = ""
+		}
+	}
+
 	var tableID descpb.ID
 	// Query the descriptor ID and zone configuration for this table.
 	{
@@ -1358,13 +1383,13 @@ func (s *adminServer) Health(
 		return resp, nil
 	}
 
-	if err := s.checkReadinessForHealthCheck(); err != nil {
+	if err := s.checkReadinessForHealthCheck(ctx); err != nil {
 		return nil, err
 	}
 	return resp, nil
 }
 
-func (s *adminServer) checkReadinessForHealthCheck() error {
+func (s *adminServer) checkReadinessForHealthCheck(ctx context.Context) error {
 	serveMode := s.server.grpc.mode.get()
 	switch serveMode {
 	case modeInitializing:
@@ -1395,6 +1420,10 @@ func (s *adminServer) checkReadinessForHealthCheck() error {
 		// grpc.mode being modeDraining, if a RPC client
 		// has requested DrainMode_LEASES but not DrainMode_CLIENT.
 		return status.Errorf(codes.Unavailable, "node is shutting down")
+	}
+
+	if !s.server.sqlServer.acceptingClients.Get() {
+		return status.Errorf(codes.Unavailable, "node is not accepting SQL clients")
 	}
 
 	return nil
@@ -1653,7 +1682,7 @@ func (s *adminServer) getStatementBundle(ctx context.Context, id int64, w http.R
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if row == nil {
+		if chunkRow == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
@@ -2424,6 +2453,9 @@ func (s *adminServer) queryTableID(
 	)
 	if err != nil {
 		return descpb.InvalidID, err
+	}
+	if row == nil {
+		return descpb.InvalidID, errors.Newf("failed to resolve %q as a table name", tableName)
 	}
 	return descpb.ID(tree.MustBeDOid(row[0]).DInt), nil
 }

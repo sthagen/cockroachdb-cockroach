@@ -307,20 +307,22 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			remainingFilters: "j @> '1'",
 		},
 		{
-			// We cannot guarantee unique primary keys when there are multiple paths.
+			// We can guarantee unique primary keys when there are multiple paths
+			// that are each unique.
 			filters:  "j @> '[1, 2]'",
 			indexOrd: jsonOrd,
 			ok:       true,
 			tight:    true,
-			unique:   false,
+			unique:   true,
 		},
 		{
-			// We cannot guarantee unique primary keys when there are multiple paths.
+			// We can guarantee unique primary keys when there are multiple paths
+			// that are each unique.
 			filters:  "a @> '{1, 2}'",
 			indexOrd: arrayOrd,
 			ok:       true,
 			tight:    true,
-			unique:   false,
+			unique:   true,
 		},
 		{
 			// We cannot guarantee that the span expression is tight when there is a
@@ -330,7 +332,7 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			indexOrd:         jsonOrd,
 			ok:               true,
 			tight:            false,
-			unique:           false,
+			unique:           true,
 			remainingFilters: "j @> '[[1, 2]]'",
 		},
 		{
@@ -378,7 +380,7 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			indexOrd:         jsonOrd,
 			ok:               true,
 			tight:            false,
-			unique:           false,
+			unique:           true,
 			remainingFilters: "j @> '{\"a\": [1, 2]}' AND j @> '[[3, 4]]'",
 		},
 		{
@@ -388,7 +390,101 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			indexOrd:         jsonOrd,
 			ok:               true,
 			tight:            false,
-			unique:           false,
+			unique:           true,
+			remainingFilters: "j @> '[[1, 2]]'",
+		},
+		{
+			filters:  "j->'a' = '1'",
+			indexOrd: jsonOrd,
+			ok:       true,
+			tight:    true,
+			unique:   true,
+		},
+		{
+			// Integer indexes are not yet supported.
+			filters:  "j->0 = '1'",
+			indexOrd: jsonOrd,
+			ok:       false,
+		},
+		{
+			// Arrays on the right side of the equality are not yet supported.
+			filters:  "j->'a' = '[1]'",
+			indexOrd: jsonOrd,
+			ok:       false,
+		},
+		{
+			// Objects on the right side of the equality are not yet supported.
+			filters:  `j->'a' = '{"b": "c"}'`,
+			indexOrd: jsonOrd,
+			ok:       false,
+		},
+		{
+			// Wrong index ordinal.
+			filters:  "j->'a' = '1'",
+			indexOrd: arrayOrd,
+			ok:       false,
+		},
+		{
+			filters:  "j->'a'->'b' = '1'",
+			indexOrd: jsonOrd,
+			ok:       true,
+			tight:    true,
+			unique:   true,
+		},
+		{
+			filters:  "j->'a'->'b'->'c' = '1'",
+			indexOrd: jsonOrd,
+			ok:       true,
+			tight:    true,
+			unique:   true,
+		},
+		{
+			// Integer indexes are not yet supported.
+			filters:  "j->0->'b' = '1'",
+			indexOrd: jsonOrd,
+			ok:       false,
+		},
+		{
+			// The inner most expression is not a fetch val expression with an
+			// indexed column on the left.
+			filters:  "(j-'c')->'a'->'b' = '1'",
+			indexOrd: jsonOrd,
+			ok:       false,
+		},
+		{
+			filters:  "j->'a' = '1' AND j->'b' = '2'",
+			indexOrd: jsonOrd,
+			ok:       true,
+			tight:    true,
+			unique:   true,
+		},
+		{
+			filters:  "j->'a' = '1' OR j->'b' = '2'",
+			indexOrd: jsonOrd,
+			ok:       true,
+			tight:    true,
+			unique:   false,
+		},
+		{
+			filters:  `j->'a' = '1' AND j @> '{"b": "c"}'`,
+			indexOrd: jsonOrd,
+			ok:       true,
+			tight:    true,
+			unique:   true,
+		},
+		{
+			filters:  `j->'a' = '1' OR j @> '{"b": "c"}'`,
+			indexOrd: jsonOrd,
+			ok:       true,
+			tight:    true,
+			unique:   false,
+		},
+		{
+			filters:          `j->'a' = '1' AND j @> '[[1, 2]]'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
 			remainingFilters: "j @> '[[1, 2]]'",
 		},
 	}
@@ -402,7 +498,13 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 		// the index when we expect to and we have the correct values for tight,
 		// unique, and remainingFilters.
 		spanExpr, _, remainingFilters, _, ok := invertedidx.TryFilterInvertedIndex(
-			evalCtx, &f, filters, nil /* optionalFilters */, tab, md.Table(tab).Index(tc.indexOrd),
+			evalCtx,
+			&f,
+			filters,
+			nil, /* optionalFilters */
+			tab,
+			md.Table(tab).Index(tc.indexOrd),
+			nil, /* computedColumns */
 		)
 		if tc.ok != ok {
 			t.Fatalf("expected %v, got %v", tc.ok, ok)

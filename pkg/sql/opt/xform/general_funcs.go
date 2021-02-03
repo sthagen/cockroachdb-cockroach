@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/partialidx"
+	"github.com/cockroachdb/errors"
 )
 
 // CustomFuncs contains all the custom match and replace functions used by the
@@ -58,6 +59,44 @@ func (c *CustomFuncs) HasInvertedIndexes(scanPrivate *memo.ScanPrivate) bool {
 		}
 	}
 	return false
+}
+
+// MapFilterCols returns a new FiltersExpr with all the src column IDs in
+// the input expression replaced with column IDs in dst.
+//
+// NOTE: Every ColumnID in src must map to the a ColumnID in dst with the same
+// relative position in the ColSets. For example, if src and dst are (1, 5, 6)
+// and (7, 12, 15), then the following mapping would be applied:
+//
+//   1 => 7
+//   5 => 12
+//   6 => 15
+func (c *CustomFuncs) MapFilterCols(
+	filters memo.FiltersExpr, src, dst opt.ColSet,
+) memo.FiltersExpr {
+	newFilters := c.mapScalarExprCols(&filters, src, dst).(*memo.FiltersExpr)
+	return *newFilters
+}
+
+func (c *CustomFuncs) mapScalarExprCols(scalar opt.ScalarExpr, src, dst opt.ColSet) opt.ScalarExpr {
+	if src.Len() != dst.Len() {
+		panic(errors.AssertionFailedf(
+			"src and dst must have the same number of columns, src: %v, dst: %v",
+			src,
+			dst,
+		))
+	}
+
+	// Map each column in src to a column in dst based on the relative position
+	// of both the src and dst ColumnIDs in the ColSet.
+	var colMap opt.ColMap
+	dstCol, _ := dst.Next(0)
+	for srcCol, ok := src.Next(0); ok; srcCol, ok = src.Next(srcCol + 1) {
+		colMap.Set(int(srcCol), int(dstCol))
+		dstCol, _ = dst.Next(dstCol + 1)
+	}
+
+	return c.RemapCols(scalar, colMap)
 }
 
 // checkConstraintFilters generates all filters that we can derive from the
@@ -114,10 +153,7 @@ func (c *CustomFuncs) checkConstraintFilters(tabID opt.TableID) memo.FiltersExpr
 }
 
 func (c *CustomFuncs) initIdxConstraintForIndex(
-	requiredFilters, optionalFilters memo.FiltersExpr,
-	tabID opt.TableID,
-	indexOrd int,
-	isInverted bool,
+	requiredFilters, optionalFilters memo.FiltersExpr, tabID opt.TableID, indexOrd int,
 ) (ic *idxconstraint.Instance) {
 	ic = &idxconstraint.Instance{}
 
@@ -135,14 +171,6 @@ func (c *CustomFuncs) initIdxConstraintForIndex(
 		col := index.Column(i)
 		ordinal := col.Ordinal()
 		nullable := col.IsNullable()
-		if isInverted && col == index.VirtualInvertedColumn() {
-			// We pass the real column to the index constraint generator (instead of
-			// the virtual column).
-			// TODO(radu): improve the inverted index constraint generator to handle
-			// this internally.
-			ordinal = col.InvertedSourceColumnOrdinal()
-			nullable = col.IsNullable()
-		}
 		colID := tabID.ColumnID(ordinal)
 		columns[i] = opt.MakeOrderingColumn(colID, col.Descending)
 		if !nullable {
@@ -154,7 +182,7 @@ func (c *CustomFuncs) initIdxConstraintForIndex(
 	ic.Init(
 		requiredFilters, optionalFilters,
 		columns, notNullCols, tabMeta.ComputedCols,
-		isInverted, true /* consolidate */, c.e.evalCtx, c.e.f,
+		true /* consolidate */, c.e.evalCtx, c.e.f,
 	)
 	return ic
 }

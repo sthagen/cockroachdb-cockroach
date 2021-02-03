@@ -269,7 +269,7 @@ func showFamilyClause(desc catalog.TableDescriptor, f *tree.FmtCtx) {
 // showCreateLocality creates the LOCALITY clauses for a CREATE statement, writing them
 // to tree.FmtCtx f.
 func showCreateLocality(desc catalog.TableDescriptor, f *tree.FmtCtx) error {
-	if c := desc.TableDesc().LocalityConfig; c != nil {
+	if c := desc.GetLocalityConfig(); c != nil {
 		f.WriteString(" LOCALITY ")
 		return tabledesc.FormatTableLocalityConfig(c, f)
 	}
@@ -328,13 +328,23 @@ func ShowCreatePartitioning(
 	indent int,
 	colOffset int,
 ) error {
-	if partDesc.NumColumns == 0 {
+	isPrimaryKeyOfPartitionAllByTable :=
+		tableDesc.IsPartitionAllBy() && tableDesc.GetPrimaryIndexID() == idxDesc.ID && colOffset == 0
+
+	if partDesc.NumColumns == 0 && !isPrimaryKeyOfPartitionAllByTable {
 		return nil
 	}
 	// Do not print PARTITION BY clauses of non-primary indexes belonging to a table
 	// that is PARTITION BY ALL. The ALL will be printed for the PRIMARY INDEX clause.
 	if tableDesc.IsPartitionAllBy() && tableDesc.GetPrimaryIndexID() != idxDesc.ID {
 		return nil
+	}
+	// Do not print PARTITION ALL BY if we are a REGIONAL BY ROW table.
+	if c := tableDesc.GetLocalityConfig(); c != nil {
+		switch c.Locality.(type) {
+		case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
+			return nil
+		}
 	}
 
 	// We don't need real prefixes in the DecodePartitionTuple calls because we
@@ -346,7 +356,7 @@ func ShowCreatePartitioning(
 
 	indentStr := strings.Repeat("\t", indent)
 	buf.WriteString(` PARTITION `)
-	if tableDesc.IsPartitionAllBy() && tableDesc.GetPrimaryIndexID() == idxDesc.ID {
+	if isPrimaryKeyOfPartitionAllByTable {
 		buf.WriteString(`ALL `)
 	}
 	buf.WriteString(`BY `)
@@ -354,6 +364,9 @@ func ShowCreatePartitioning(
 		buf.WriteString(`LIST`)
 	} else if len(partDesc.Range) > 0 {
 		buf.WriteString(`RANGE`)
+	} else if isPrimaryKeyOfPartitionAllByTable {
+		buf.WriteString(`NOTHING`)
+		return nil
 	} else {
 		return errors.Errorf(`invalid partition descriptor: %v`, partDesc)
 	}

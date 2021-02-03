@@ -32,6 +32,7 @@ type crdbSpan struct {
 	traceID      uint64 // probabilistically unique.
 	spanID       uint64 // probabilistically unique.
 	parentSpanID uint64
+	goroutineID  uint64
 
 	operation string
 	startTime time.Time
@@ -98,12 +99,16 @@ func (s *crdbSpan) recordingType() RecordingType {
 // If separate recording is specified, the child is not registered with the
 // parent. Thus, the parent's recording will not include this child.
 func (s *crdbSpan) enableRecording(parent *crdbSpan, recType RecordingType) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mu.recording.recordingType.swap(recType)
 	if parent != nil {
 		parent.addChild(s)
 	}
+	if recType == RecordingOff {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.recording.recordingType.swap(recType)
 	if recType == RecordingVerbose {
 		s.setBaggageItemLocked(verboseTracingBaggageKey, "1")
 	}
@@ -237,9 +242,17 @@ func (s *crdbSpan) getRecordingLocked(m mode) tracingpb.RecordedSpan {
 		TraceID:      s.traceID,
 		SpanID:       s.spanID,
 		ParentSpanID: s.parentSpanID,
+		GoroutineID:  s.goroutineID,
 		Operation:    s.operation,
 		StartTime:    s.startTime,
 		Duration:     s.mu.duration,
+	}
+
+	if rs.Duration == -1 {
+		// -1 indicates an unfinished Span. For a recording it's better to put some
+		// duration in it, otherwise tools get confused. For example, we export
+		// recordings to Jaeger, and spans with a zero duration don't look nice.
+		rs.Duration = timeutil.Now().Sub(rs.StartTime)
 	}
 
 	addTag := func(k, v string) {
@@ -253,11 +266,7 @@ func (s *crdbSpan) getRecordingLocked(m mode) tracingpb.RecordedSpan {
 	// related to Span UX improvements.
 	onlyBackgroundTracing := m == modeBackground && s.recordingType() == RecordingOff
 	if !onlyBackgroundTracing {
-		if rs.Duration == -1 {
-			// -1 indicates an unfinished Span. For a recording it's better to put some
-			// duration in it, otherwise tools get confused. For example, we export
-			// recordings to Jaeger, and spans with a zero duration don't look nice.
-			rs.Duration = timeutil.Now().Sub(rs.StartTime)
+		if s.mu.duration == -1 {
 			addTag("_unfinished", "1")
 		}
 		if s.mu.recording.recordingType.load() == RecordingVerbose {
@@ -320,7 +329,10 @@ func (s *crdbSpan) getRecordingLocked(m mode) tracingpb.RecordedSpan {
 
 func (s *crdbSpan) addChild(child *crdbSpan) {
 	s.mu.Lock()
-	s.mu.recording.children = append(s.mu.recording.children, child)
+	// Only record the child if the parent still has room.
+	if len(s.mu.recording.children) < maxChildrenPerSpan {
+		s.mu.recording.children = append(s.mu.recording.children, child)
+	}
 	s.mu.Unlock()
 }
 

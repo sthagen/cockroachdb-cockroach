@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -82,12 +83,12 @@ type Encoder interface {
 	EncodeResolvedTimestamp(context.Context, string, hlc.Timestamp) ([]byte, error)
 }
 
-func getEncoder(opts map[string]string) (Encoder, error) {
+func getEncoder(opts map[string]string, targets jobspb.ChangefeedTargets) (Encoder, error) {
 	switch changefeedbase.FormatType(opts[changefeedbase.OptFormat]) {
 	case ``, changefeedbase.OptFormatJSON:
 		return makeJSONEncoder(opts)
 	case changefeedbase.OptFormatAvro:
-		return newConfluentAvroEncoder(opts)
+		return newConfluentAvroEncoder(opts, targets)
 	default:
 		return nil, errors.Errorf(`unknown %s: %s`, changefeedbase.OptFormat, opts[changefeedbase.OptFormat])
 	}
@@ -274,7 +275,9 @@ func (e *jsonEncoder) EncodeResolvedTimestamp(
 // columns in a record.
 type confluentAvroEncoder struct {
 	registryURL                        string
+	schemaPrefix                       string
 	updatedField, beforeField, keyOnly bool
+	targets                            jobspb.ChangefeedTargets
 
 	keyCache      map[tableIDAndVersion]confluentRegisteredKeySchema
 	valueCache    map[tableIDAndVersionPair]confluentRegisteredEnvelopeSchema
@@ -300,8 +303,13 @@ type confluentRegisteredEnvelopeSchema struct {
 
 var _ Encoder = &confluentAvroEncoder{}
 
-func newConfluentAvroEncoder(opts map[string]string) (*confluentAvroEncoder, error) {
+func newConfluentAvroEncoder(
+	opts map[string]string, targets jobspb.ChangefeedTargets,
+) (*confluentAvroEncoder, error) {
 	e := &confluentAvroEncoder{registryURL: opts[changefeedbase.OptConfluentSchemaRegistry]}
+
+	e.schemaPrefix = opts[changefeedbase.OptAvroSchemaPrefix]
+	e.targets = targets
 
 	switch opts[changefeedbase.OptEnvelope] {
 	case string(changefeedbase.OptEnvelopeKeyOnly):
@@ -331,27 +339,34 @@ func newConfluentAvroEncoder(opts map[string]string) (*confluentAvroEncoder, err
 		return nil, errors.Errorf(`WITH option %s is required for %s=%s`,
 			changefeedbase.OptConfluentSchemaRegistry, changefeedbase.OptFormat, changefeedbase.OptFormatAvro)
 	}
-
 	e.keyCache = make(map[tableIDAndVersion]confluentRegisteredKeySchema)
 	e.valueCache = make(map[tableIDAndVersionPair]confluentRegisteredEnvelopeSchema)
 	e.resolvedCache = make(map[string]confluentRegisteredEnvelopeSchema)
 	return e, nil
 }
 
+// Get the raw SQL-formatted string for a table name
+// and apply full_table_name and avro_schema_prefix options
+func (e *confluentAvroEncoder) rawTableName(desc catalog.TableDescriptor) string {
+	return e.schemaPrefix + e.targets[desc.GetID()].StatementTimeName
+}
+
 // EncodeKey implements the Encoder interface.
 func (e *confluentAvroEncoder) EncodeKey(ctx context.Context, row encodeRow) ([]byte, error) {
 	cacheKey := makeTableIDAndVersion(row.tableDesc.GetID(), row.tableDesc.GetVersion())
+
 	registered, ok := e.keyCache[cacheKey]
 	if !ok {
 		var err error
-		registered.schema, err = indexToAvroSchema(row.tableDesc, row.tableDesc.GetPrimaryIndex().IndexDesc())
+		tableName := e.rawTableName(row.tableDesc)
+		registered.schema, err = indexToAvroSchema(row.tableDesc, row.tableDesc.GetPrimaryIndex().IndexDesc(), tableName)
 		if err != nil {
 			return nil, err
 		}
 
 		// NB: This uses the kafka name escaper because it has to match the name
 		// of the kafka topic.
-		subject := SQLNameToKafkaName(row.tableDesc.GetName()) + confluentSubjectSuffixKey
+		subject := SQLNameToKafkaName(tableName) + confluentSubjectSuffixKey
 		registered.registryID, err = e.register(ctx, &registered.schema.avroRecord, subject)
 		if err != nil {
 			return nil, err
@@ -404,7 +419,7 @@ func (e *confluentAvroEncoder) EncodeValue(ctx context.Context, row encodeRow) (
 
 		// NB: This uses the kafka name escaper because it has to match the name
 		// of the kafka topic.
-		subject := SQLNameToKafkaName(row.tableDesc.GetName()) + confluentSubjectSuffixValue
+		subject := SQLNameToKafkaName(e.rawTableName(row.tableDesc)) + confluentSubjectSuffixValue
 		registered.registryID, err = e.register(ctx, &registered.schema.avroRecord, subject)
 		if err != nil {
 			return nil, err

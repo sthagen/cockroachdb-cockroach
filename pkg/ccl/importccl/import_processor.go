@@ -135,16 +135,15 @@ func (idp *readImportDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Pro
 	// Once the import is done, send back to the controller the serialized
 	// summary of the import operation. For more info see roachpb.BulkOpSummary.
 	countsBytes, err := protoutil.Marshal(idp.summary)
+	idp.MoveToDraining(err)
 	if err != nil {
-		idp.MoveToDraining(err)
 		return nil, idp.DrainHelper()
 	}
 
-	idp.MoveToDraining(nil /* err */)
 	return rowenc.EncDatumRow{
 		rowenc.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(countsBytes))),
 		rowenc.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes([]byte{}))),
-	}, idp.DrainHelper()
+	}, nil
 }
 
 // ConsumerDone is part of the RowSource interface.
@@ -174,7 +173,7 @@ func makeInputConverter(
 	seqChunkProvider *row.SeqChunkProvider,
 ) (inputConverter, error) {
 	injectTimeIntoEvalCtx(evalCtx, spec.WalltimeNanos)
-	var singleTable *tabledesc.Immutable
+	var singleTable catalog.TableDescriptor
 	var singleTableTargetCols tree.NameList
 	if len(spec.Tables) == 1 {
 		for _, table := range spec.Tables {

@@ -16,7 +16,6 @@ import (
 	"math"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -131,7 +130,7 @@ func (mq *mergeQueue) enabled() bool {
 }
 
 func (mq *mergeQueue) shouldQueue(
-	ctx context.Context, now hlc.Timestamp, repl *Replica, sysCfg *config.SystemConfig,
+	ctx context.Context, now hlc.ClockTimestamp, repl *Replica, sysCfg *config.SystemConfig,
 ) (shouldQ bool, priority float64) {
 	if !mq.enabled() {
 		return false, 0
@@ -181,28 +180,12 @@ func (mq *mergeQueue) requestRangeStats(
 		RequestHeader: roachpb.RequestHeader{Key: key},
 	})
 
-	if !mq.store.ClusterSettings().Version.IsActive(ctx, clusterversion.RangeStatsRespHasDesc) {
-		ba.Header.ReturnRangeInfo = true
-	}
-
 	br, pErr := mq.db.NonTransactionalSender().Send(ctx, ba)
 	if pErr != nil {
 		return nil, enginepb.MVCCStats{}, 0, pErr.GoError()
 	}
 	res := br.Responses[0].GetInner().(*roachpb.RangeStatsResponse)
-
-	var desc *roachpb.RangeDescriptor
-	if res.RangeInfo != nil {
-		desc = &res.RangeInfo.Desc
-	} else {
-		if len(br.RangeInfos) != 1 {
-			return nil, enginepb.MVCCStats{}, 0, errors.AssertionFailedf(
-				"mergeQueue.requestRangeStats: response had %d range infos but exactly one was expected",
-				len(br.RangeInfos))
-		}
-		desc = &br.RangeInfos[0].Desc
-	}
-	return desc, res.MVCCStats, res.QueriesPerSecond, nil
+	return &res.RangeInfo.Desc, res.MVCCStats, res.QueriesPerSecond, nil
 }
 
 func (mq *mergeQueue) process(
@@ -234,8 +217,8 @@ func (mq *mergeQueue) process(
 	}
 
 	// Range was manually split and not expired, so skip merging.
-	now := mq.store.Clock().Now()
-	if now.Less(rhsDesc.GetStickyBit()) {
+	now := mq.store.Clock().NowAsClockTimestamp()
+	if now.ToTimestamp().Less(rhsDesc.GetStickyBit()) {
 		log.VEventf(ctx, 2, "skipping merge: ranges were manually split and sticky bit was not expired")
 		// TODO(jeffreyxiao): Consider returning a purgatory error to avoid
 		// repeatedly processing ranges that cannot be merged.

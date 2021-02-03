@@ -602,7 +602,7 @@ func (u *sqlSymUnion) objectNamePrefixList() tree.ObjectNamePrefixList {
 // Ordinary key words in alphabetical order.
 %token <str> ABORT ACCESS ACTION ADD ADMIN AFFINITY AFTER AGGREGATE
 %token <str> ALL ALTER ALWAYS ANALYSE ANALYZE AND AND_AND ANY ANNOTATE_TYPE ARRAY AS ASC
-%token <str> ASYMMETRIC AT ATTRIBUTE AUTHORIZATION AUTOMATIC
+%token <str> ASYMMETRIC AT ATTRIBUTE AUTHORIZATION AUTOMATIC AVAILABILITY
 
 %token <str> BACKUP BACKUPS BEFORE BEGIN BETWEEN BIGINT BIGSERIAL BINARY BIT
 %token <str> BUCKET_COUNT
@@ -675,7 +675,7 @@ func (u *sqlSymUnion) objectNamePrefixList() tree.ObjectNamePrefixList {
 
 %token <str> RANGE RANGES READ REAL REASSIGN RECURSIVE RECURRING REF REFERENCES REFRESH
 %token <str> REGCLASS REGION REGIONAL REGIONS REGPROC REGPROCEDURE REGNAMESPACE REGTYPE REINDEX
-%token <str> REMOVE_PATH RENAME REPEATABLE REPLACE
+%token <str> REMOVE_PATH RENAME REPEATABLE REPLACE REPLICATION
 %token <str> RELEASE RESET RESTORE RESTRICT RESUME RETURNING RETRY REVISION_HISTORY REVOKE RIGHT
 %token <str> ROLE ROLES ROLLBACK ROLLUP ROW ROWS RSHIFT RULE RUNNING
 
@@ -684,7 +684,7 @@ func (u *sqlSymUnion) objectNamePrefixList() tree.ObjectNamePrefixList {
 %token <str> SHARE SHOW SIMILAR SIMPLE SKIP SKIP_MISSING_FOREIGN_KEYS
 %token <str> SKIP_MISSING_SEQUENCES SKIP_MISSING_SEQUENCE_OWNERS SKIP_MISSING_VIEWS SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
 
-%token <str> START STATISTICS STATUS STDIN STRICT STRING STORAGE STORE STORED STORING SUBSTRING
+%token <str> START STATISTICS STATUS STDIN STRICT STRING STORAGE STORE STORED STORING STREAM SUBSTRING
 %token <str> SURVIVE SURVIVAL SYMMETRIC SYNTAX SYSTEM SQRT SUBSCRIPTION STATEMENTS
 
 %token <str> TABLE TABLES TABLESPACE TEMP TEMPLATE TEMPORARY TENANT TESTING_RELOCATE EXPERIMENTAL_RELOCATE TEXT THEN
@@ -696,7 +696,7 @@ func (u *sqlSymUnion) objectNamePrefixList() tree.ObjectNamePrefixList {
 %token <str> UNBOUNDED UNCOMMITTED UNION UNIQUE UNKNOWN UNLOGGED UNSPLIT
 %token <str> UPDATE UPSERT UNTIL USE USER USERS USING UUID
 
-%token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VIEW VARYING VIEWACTIVITY VIRTUAL
+%token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VIEW VARYING VIEWACTIVITY VIRTUAL VISIBLE
 
 %token <str> WHEN WHERE WINDOW WITH WITHIN WITHOUT WORK WRITE
 
@@ -753,6 +753,7 @@ func (u *sqlSymUnion) objectNamePrefixList() tree.ObjectNamePrefixList {
 %type <tree.Statement> alter_zone_table_stmt
 %type <tree.Statement> alter_table_set_schema_stmt
 %type <tree.Statement> alter_table_locality_stmt
+%type <tree.Statement> alter_table_owner_stmt
 
 // ALTER PARTITION
 %type <tree.Statement> alter_zone_partition_stmt
@@ -780,11 +781,13 @@ func (u *sqlSymUnion) objectNamePrefixList() tree.ObjectNamePrefixList {
 // ALTER VIEW
 %type <tree.Statement> alter_rename_view_stmt
 %type <tree.Statement> alter_view_set_schema_stmt
+%type <tree.Statement> alter_view_owner_stmt
 
 // ALTER SEQUENCE
 %type <tree.Statement> alter_rename_sequence_stmt
 %type <tree.Statement> alter_sequence_options_stmt
 %type <tree.Statement> alter_sequence_set_schema_stmt
+%type <tree.Statement> alter_sequence_owner_stmt
 
 %type <tree.Statement> backup_stmt
 %type <tree.Statement> begin_stmt
@@ -1392,6 +1395,7 @@ alter_table_stmt:
 | alter_rename_table_stmt
 | alter_table_set_schema_stmt
 | alter_table_locality_stmt
+| alter_table_owner_stmt
 // ALTER TABLE has its error help token here because the ALTER TABLE
 // prefix is spread over multiple non-terminals.
 | ALTER TABLE error     // SHOW HELP: ALTER TABLE
@@ -1431,6 +1435,7 @@ alter_partition_stmt:
 alter_view_stmt:
   alter_rename_view_stmt
 | alter_view_set_schema_stmt
+| alter_view_owner_stmt
 // ALTER VIEW has its error help token here because the ALTER VIEW
 // prefix is spread over multiple non-terminals.
 | ALTER VIEW error // SHOW HELP: ALTER VIEW
@@ -1450,6 +1455,7 @@ alter_sequence_stmt:
   alter_rename_sequence_stmt
 | alter_sequence_options_stmt
 | alter_sequence_set_schema_stmt
+| alter_sequence_owner_stmt
 | ALTER SEQUENCE error // SHOW HELP: ALTER SEQUENCE
 
 alter_sequence_options_stmt:
@@ -2009,13 +2015,6 @@ alter_table_cmd:
     /* SKIP DOC */
     $$.val = &tree.AlterTableInjectStats{
       Stats: $3.expr(),
-    }
-  }
-  // ALTER TABLE <name> OWNER TO <newowner>
-| OWNER TO role_spec
-  {
-    $$.val = &tree.AlterTableOwner{
-      Owner: $3.user(),
     }
   }
 
@@ -2612,6 +2611,13 @@ restore_stmt:
       AsOf: $7.asOfClause(),
       Options: *($8.restoreOptions()),
     }
+  }
+| RESTORE targets FROM REPLICATION STREAM FROM string_or_placeholder_opt_list
+  {
+   $$.val = &tree.StreamIngestion{
+     Targets: $2.targetList(),
+     From: $7.stringOrPlaceholderOptList(),
+   }
   }
 | RESTORE error // SHOW HELP: RESTORE
 
@@ -5091,15 +5097,15 @@ show_roles_stmt:
 | SHOW ROLES error // SHOW HELP: SHOW ROLES
 
 show_zone_stmt:
-  SHOW ZONE CONFIGURATION for_or_from RANGE zone_name
+  SHOW ZONE CONFIGURATION from_with_implicit_for_alias RANGE zone_name
   {
     $$.val = &tree.ShowZoneConfig{ZoneSpecifier: tree.ZoneSpecifier{NamedZone: tree.UnrestrictedName($6)}}
   }
-| SHOW ZONE CONFIGURATION for_or_from DATABASE database_name
+| SHOW ZONE CONFIGURATION from_with_implicit_for_alias DATABASE database_name
   {
     $$.val = &tree.ShowZoneConfig{ZoneSpecifier: tree.ZoneSpecifier{Database: tree.Name($6)}}
   }
-| SHOW ZONE CONFIGURATION for_or_from TABLE table_name opt_partition
+| SHOW ZONE CONFIGURATION from_with_implicit_for_alias TABLE table_name opt_partition
   {
     name := $6.unresolvedObjectName().ToTableName()
     $$.val = &tree.ShowZoneConfig{ZoneSpecifier: tree.ZoneSpecifier{
@@ -5107,7 +5113,7 @@ show_zone_stmt:
         Partition: tree.Name($7),
     }}
   }
-| SHOW ZONE CONFIGURATION for_or_from PARTITION partition_name OF TABLE table_name
+| SHOW ZONE CONFIGURATION from_with_implicit_for_alias PARTITION partition_name OF TABLE table_name
   {
     name := $9.unresolvedObjectName().ToTableName()
     $$.val = &tree.ShowZoneConfig{ZoneSpecifier: tree.ZoneSpecifier{
@@ -5115,14 +5121,14 @@ show_zone_stmt:
       Partition: tree.Name($6),
     }}
   }
-| SHOW ZONE CONFIGURATION for_or_from INDEX table_index_name opt_partition
+| SHOW ZONE CONFIGURATION from_with_implicit_for_alias INDEX table_index_name opt_partition
   {
     $$.val = &tree.ShowZoneConfig{ZoneSpecifier: tree.ZoneSpecifier{
       TableOrIndex: $6.tableIndexName(),
       Partition: tree.Name($7),
     }}
   }
-| SHOW ZONE CONFIGURATION for_or_from PARTITION partition_name OF INDEX table_index_name
+| SHOW ZONE CONFIGURATION from_with_implicit_for_alias PARTITION partition_name OF INDEX table_index_name
   {
     $$.val = &tree.ShowZoneConfig{ZoneSpecifier: tree.ZoneSpecifier{
       TableOrIndex: $9.tableIndexName(),
@@ -5138,9 +5144,9 @@ show_zone_stmt:
     $$.val = &tree.ShowZoneConfig{}
   }
 
-for_or_from:
-  FOR
-| FROM
+from_with_implicit_for_alias:
+  FROM
+| FOR { /* SKIP DOC */ }
 
 // %Help: SHOW RANGE - show range information for a row
 // %Category: Misc
@@ -5660,7 +5666,7 @@ alter_schema_stmt:
 //    CHECK ( <expr> )
 //
 // Column qualifiers:
-//   [CONSTRAINT <constraintname>] {NULL | NOT NULL | UNIQUE [WITHOUT INDEX] | PRIMARY KEY | CHECK (<expr>) | DEFAULT <expr>}
+//   [CONSTRAINT <constraintname>] {NULL | NOT NULL | NOT VISIBLE |UNIQUE [WITHOUT INDEX] | PRIMARY KEY | CHECK (<expr>) | DEFAULT <expr>}
 //   FAMILY <familyname>, CREATE [IF NOT EXISTS] FAMILY [<familyname>]
 //   REFERENCES <tablename> [( <colnames...> )] [ON DELETE {NO ACTION | RESTRICT}] [ON UPDATE {NO ACTION | RESTRICT}]
 //   COLLATE <collationname>
@@ -6160,6 +6166,10 @@ col_qualification_elem:
 | NULL
   {
     $$.val = tree.NullConstraint{}
+  }
+| NOT VISIBLE
+  {
+    $$.val = tree.HiddenConstraint{}
   }
 | UNIQUE opt_without_index
   {
@@ -7368,6 +7378,24 @@ locality:
     }
   }
 
+alter_table_owner_stmt:
+  ALTER TABLE relation_expr OWNER TO role_spec
+  {
+    $$.val = &tree.AlterTableOwner{
+      Name: $3.unresolvedObjectName(),
+      Owner: $6.user(),
+      IfExists: false,
+    }
+  }
+| ALTER TABLE IF EXISTS relation_expr OWNER TO role_spec
+  {
+    $$.val = &tree.AlterTableOwner{
+      Name: $5.unresolvedObjectName(),
+      Owner: $8.user(),
+      IfExists: true,
+    }
+  }
+
 alter_view_set_schema_stmt:
 	ALTER VIEW relation_expr SET SCHEMA schema_name
 	 {
@@ -7402,6 +7430,46 @@ alter_view_set_schema_stmt:
 		}
 	}
 
+alter_view_owner_stmt:
+	ALTER VIEW relation_expr OWNER TO role_spec
+  {
+    $$.val = &tree.AlterTableOwner{
+      Name: $3.unresolvedObjectName(),
+      Owner: $6.user(),
+      IfExists: false,
+      IsView: true,
+    }
+  }
+| ALTER MATERIALIZED VIEW relation_expr OWNER TO role_spec
+  {
+    $$.val = &tree.AlterTableOwner{
+      Name: $4.unresolvedObjectName(),
+      Owner: $7.user(),
+      IfExists: false,
+      IsView: true,
+      IsMaterialized: true,
+    }
+  }
+| ALTER VIEW IF EXISTS relation_expr OWNER TO role_spec
+  {
+    $$.val = &tree.AlterTableOwner{
+      Name: $5.unresolvedObjectName(),
+      Owner: $8.user(),
+      IfExists: true,
+      IsView: true,
+    }
+  }
+| ALTER MATERIALIZED VIEW IF EXISTS relation_expr OWNER TO role_spec
+  {
+    $$.val = &tree.AlterTableOwner{
+      Name: $6.unresolvedObjectName(),
+      Owner: $9.user(),
+      IfExists: true,
+      IsView: true,
+      IsMaterialized: true,
+    }
+  }
+
 alter_sequence_set_schema_stmt:
 	ALTER SEQUENCE relation_expr SET SCHEMA schema_name
 	 {
@@ -7413,6 +7481,26 @@ alter_sequence_set_schema_stmt:
 	{
 		$$.val = &tree.AlterTableSetSchema{
 			Name: $5.unresolvedObjectName(), Schema: tree.Name($8), IfExists: true, IsSequence: true,
+		}
+	}
+
+alter_sequence_owner_stmt:
+	ALTER SEQUENCE relation_expr OWNER TO role_spec
+	{
+		$$.val = &tree.AlterTableOwner{
+			Name: $3.unresolvedObjectName(),
+			Owner: $6.user(),
+			IfExists: false,
+			IsSequence: true,
+		}
+	}
+| ALTER SEQUENCE IF EXISTS relation_expr OWNER TO role_spec
+	{
+		$$.val = &tree.AlterTableOwner{
+			Name: $5.unresolvedObjectName(),
+			Owner: $8.user(),
+			IfExists: true,
+			IsSequence: true,
 		}
 	}
 
@@ -7845,6 +7933,12 @@ survival_goal_clause:
   {
     $$.val = tree.SurvivalGoalZoneFailure
   }
+| SURVIVE opt_equal AVAILABILITY ZONE FAILURE
+  {
+    /* SKIP DOC */
+    $$.val = tree.SurvivalGoalZoneFailure
+  }
+
 
 opt_survival_goal_clause:
   survival_goal_clause
@@ -11363,7 +11457,7 @@ array_expr_list:
 extract_list:
   extract_arg FROM a_expr
   {
-    $$.val = tree.Exprs{tree.NewStrVal($1), $3.expr()}
+    $$.val = tree.Exprs{tree.NewStrVal(strings.ToLower($1)), $3.expr()}
   }
 | expr_list
   {
@@ -12106,6 +12200,7 @@ unreserved_keyword:
 | AT
 | ATTRIBUTE
 | AUTOMATIC
+| AVAILABILITY
 | BACKUP
 | BACKUPS
 | BEFORE
@@ -12333,6 +12428,7 @@ unreserved_keyword:
 | RENAME
 | REPEATABLE
 | REPLACE
+| REPLICATION
 | RESET
 | RESTORE
 | RESTRICT
@@ -12386,6 +12482,7 @@ unreserved_keyword:
 | STORE
 | STORED
 | STORING
+| STREAM
 | STRICT
 | SUBSCRIPTION
 | SURVIVE
@@ -12630,6 +12727,7 @@ reserved_keyword:
 | USER
 | USING
 | VARIADIC
+| VISIBLE
 | WHEN
 | WHERE
 | WINDOW

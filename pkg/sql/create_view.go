@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/errors"
 )
 
 // createViewNode represents a CREATE VIEW statement.
@@ -60,10 +62,13 @@ type createViewNode struct {
 func (n *createViewNode) ReadingOwnWrites() {}
 
 func (n *createViewNode) startExec(params runParams) error {
+	tableType := tree.GetTableType(
+		false /* isSequence */, true /* isView */, n.materialized,
+	)
 	if n.replace {
-		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("or_replace_view"))
+		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter(fmt.Sprintf("or_replace_%s", tableType)))
 	} else {
-		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("view"))
+		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter(tableType))
 	}
 
 	viewName := n.viewName.Object()
@@ -73,10 +78,12 @@ func (n *createViewNode) startExec(params runParams) error {
 	// Check that the view does not contain references to other databases.
 	if !allowCrossDatabaseViews.Get(&params.p.execCfg.Settings.SV) {
 		for _, dep := range n.planDeps {
-			if dbID := dep.desc.ParentID; dbID != n.dbDesc.ID && dbID != keys.SystemDatabaseID {
-				return pgerror.Newf(pgcode.FeatureNotSupported,
-					"the view cannot refer to other databases; (see the '%s' cluster setting)",
-					allowCrossDatabaseViewsSetting,
+			if dbID := dep.desc.GetParentID(); dbID != n.dbDesc.ID && dbID != keys.SystemDatabaseID {
+				return errors.WithHintf(
+					pgerror.Newf(pgcode.FeatureNotSupported,
+						"the view cannot refer to other databases; (see the '%s' cluster setting)",
+						allowCrossDatabaseViewsSetting),
+					crossDBReferenceDeprecationHint(),
 				)
 			}
 		}
@@ -239,7 +246,7 @@ func (n *createViewNode) startExec(params runParams) error {
 			backRefMutable,
 			descpb.InvalidMutationID,
 			fmt.Sprintf("updating view reference %q in table %s(%d)", n.viewName,
-				updated.desc.Name, updated.desc.ID,
+				updated.desc.GetName(), updated.desc.GetID(),
 			),
 		); err != nil {
 			return err
@@ -461,4 +468,9 @@ func overrideColumnNames(cols colinfo.ResultColumns, newNames tree.NameList) col
 		res[i].Name = string(newNames[i])
 	}
 	return res
+}
+
+func crossDBReferenceDeprecationHint() string {
+	return fmt.Sprintf("Note that cross-database references will be removed in future releases. See: %s",
+		docs.ReleaseNotesURL(`#deprecations`))
 }

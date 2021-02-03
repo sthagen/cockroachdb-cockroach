@@ -17,7 +17,6 @@ import (
 	"io"
 	"io/ioutil"
 	"math/rand"
-	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -50,6 +49,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -334,8 +334,7 @@ func TestBackupRestoreStatementResult(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		fileType := http.DetectContentType(backupManifestBytes)
-		require.Equal(t, ZipType, fileType)
+		require.True(t, isGZipped(backupManifestBytes))
 	})
 
 	sqlDB.Exec(t, "CREATE DATABASE data2")
@@ -467,8 +466,7 @@ func TestBackupRestorePartitioned(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					fileType := http.DetectContentType(backupPartitionBytes)
-					require.Equal(t, ZipType, fileType)
+					require.True(t, isGZipped(backupPartitionBytes))
 				}
 			}
 		}
@@ -1570,7 +1568,7 @@ func TestBackupRestoreResume(t *testing.T) {
 			t.Fatal(err)
 		}
 		createAndWaitForJob(
-			t, sqlDB, []descpb.ID{backupTableDesc.ID},
+			t, sqlDB, []descpb.ID{backupTableDesc.GetID()},
 			jobspb.BackupDetails{
 				EndTime: tc.Servers[0].Clock().Now(),
 				URI:     "nodelocal://0/backup",
@@ -1585,8 +1583,7 @@ func TestBackupRestoreResume(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		fileType := http.DetectContentType(backupManifestBytes)
-		if fileType == ZipType {
+		if isGZipped(backupManifestBytes) {
 			backupManifestBytes, err = decompressData(backupManifestBytes)
 			require.NoError(t, err)
 		}
@@ -1619,7 +1616,7 @@ func TestBackupRestoreResume(t *testing.T) {
 			t, sqlDB, []descpb.ID{restoreTableID},
 			jobspb.RestoreDetails{
 				DescriptorRewrites: map[descpb.ID]*jobspb.RestoreDetails_DescriptorRewrite{
-					backupTableDesc.ID: {
+					backupTableDesc.GetID(): {
 						ParentID: descpb.ID(restoreDatabaseID),
 						ID:       restoreTableID,
 					},
@@ -3414,7 +3411,7 @@ func TestBackupRestoreWithConcurrentWrites(t *testing.T) {
 	var allowErrors int32
 	for task := 0; task < numBackgroundTasks; task++ {
 		taskNum := task
-		tc.Stopper().RunWorker(context.Background(), func(context.Context) {
+		_ = tc.Stopper().RunAsyncTask(context.Background(), "bg-task", func(context.Context) {
 			conn := tc.Conns[taskNum%len(tc.Conns)]
 			// Use different sql gateways to make sure leasing is right.
 			if err := startBackgroundWrites(tc.Stopper(), conn, rows, bgActivity, &allowErrors); err != nil {
@@ -3945,8 +3942,7 @@ func TestBackupRestoreChecksum(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%+v", err)
 		}
-		fileType := http.DetectContentType(backupManifestBytes)
-		if fileType == ZipType {
+		if isGZipped(backupManifestBytes) {
 			backupManifestBytes, err = decompressData(backupManifestBytes)
 			require.NoError(t, err)
 		}
@@ -5211,17 +5207,17 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "t")
 		seqDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "seq")
 
-		require.True(t, seqDesc.SequenceOpts.HasOwner(), "no sequence owner after restore")
-		require.Equal(t, tableDesc.ID, seqDesc.SequenceOpts.SequenceOwner.OwnerTableID,
+		require.True(t, seqDesc.GetSequenceOpts().HasOwner(), "no sequence owner after restore")
+		require.Equal(t, tableDesc.GetID(), seqDesc.GetSequenceOpts().SequenceOwner.OwnerTableID,
 			"unexpected table is sequence owner after restore",
 		)
-		require.Equal(t, tableDesc.GetColumns()[0].ID, seqDesc.SequenceOpts.SequenceOwner.OwnerColumnID,
+		require.Equal(t, tableDesc.GetPublicColumns()[0].ID, seqDesc.GetSequenceOpts().SequenceOwner.OwnerColumnID,
 			"unexpected column is sequence owner after restore",
 		)
-		require.Equal(t, 1, len(tableDesc.GetColumns()[0].OwnsSequenceIds),
+		require.Equal(t, 1, len(tableDesc.GetPublicColumns()[0].OwnsSequenceIds),
 			"unexpected number of sequences owned by d.t after restore",
 		)
-		require.Equal(t, seqDesc.ID, tableDesc.GetColumns()[0].OwnsSequenceIds[0],
+		require.Equal(t, seqDesc.GetID(), tableDesc.GetPublicColumns()[0].OwnsSequenceIds[0],
 			"unexpected ID of sequence owned by table d.t after restore",
 		)
 	})
@@ -5242,7 +5238,7 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 
 		newDB.Exec(t, `RESTORE TABLE seq FROM $1 WITH skip_missing_sequence_owners`, backupLoc)
 		seqDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "seq")
-		require.False(t, seqDesc.SequenceOpts.HasOwner(), "unexpected owner of restored sequence.")
+		require.False(t, seqDesc.GetSequenceOpts().HasOwner(), "unexpected owner of restored sequence.")
 	})
 
 	// When just the table is restored by itself, the ownership dependency is
@@ -5268,7 +5264,7 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 
 			tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "t")
 
-			require.Equal(t, 0, len(tableDesc.GetColumns()[0].OwnsSequenceIds),
+			require.Equal(t, 0, len(tableDesc.GetPublicColumns()[0].OwnsSequenceIds),
 				"expected restored table to own 0 sequences",
 			)
 
@@ -5277,7 +5273,7 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 			newDB.Exec(t, `RESTORE TABLE seq FROM $1 WITH skip_missing_sequence_owners`, backupLoc)
 
 			seqDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "seq")
-			require.False(t, seqDesc.SequenceOpts.HasOwner(), "unexpected sequence owner after restore")
+			require.False(t, seqDesc.GetSequenceOpts().HasOwner(), "unexpected sequence owner after restore")
 		})
 
 	// Ownership dependencies should be preserved and remapped when restoring
@@ -5295,17 +5291,17 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "restore_db", "t")
 		seqDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "restore_db", "seq")
 
-		require.True(t, seqDesc.SequenceOpts.HasOwner(), "no sequence owner after restore")
-		require.Equal(t, tableDesc.ID, seqDesc.SequenceOpts.SequenceOwner.OwnerTableID,
+		require.True(t, seqDesc.GetSequenceOpts().HasOwner(), "no sequence owner after restore")
+		require.Equal(t, tableDesc.GetID(), seqDesc.GetSequenceOpts().SequenceOwner.OwnerTableID,
 			"unexpected table is sequence owner after restore",
 		)
-		require.Equal(t, tableDesc.GetColumns()[0].ID, seqDesc.SequenceOpts.SequenceOwner.OwnerColumnID,
+		require.Equal(t, tableDesc.GetPublicColumns()[0].ID, seqDesc.GetSequenceOpts().SequenceOwner.OwnerColumnID,
 			"unexpected column is sequence owner after restore",
 		)
-		require.Equal(t, 1, len(tableDesc.GetColumns()[0].OwnsSequenceIds),
+		require.Equal(t, 1, len(tableDesc.GetPublicColumns()[0].OwnsSequenceIds),
 			"unexpected number of sequences owned by d.t after restore",
 		)
-		require.Equal(t, seqDesc.ID, tableDesc.GetColumns()[0].OwnsSequenceIds[0],
+		require.Equal(t, seqDesc.GetID(), tableDesc.GetPublicColumns()[0].OwnsSequenceIds[0],
 			"unexpected ID of sequence owned by table d.t after restore",
 		)
 	})
@@ -5344,7 +5340,7 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 			newDB.Exec(t, `RESTORE DATABASE d2 FROM $1 WITH skip_missing_sequence_owners`, backupLocD2D3)
 
 			tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d2", "t")
-			require.Equal(t, 0, len(tableDesc.GetColumns()[0].OwnsSequenceIds),
+			require.Equal(t, 0, len(tableDesc.GetPublicColumns()[0].OwnsSequenceIds),
 				"expected restored table to own no sequences.",
 			)
 
@@ -5354,22 +5350,22 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 			newDB.Exec(t, `RESTORE DATABASE d3 FROM $1 WITH skip_missing_sequence_owners`, backupLocD2D3)
 
 			seqDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "seq")
-			require.False(t, seqDesc.SequenceOpts.HasOwner(), "unexpected sequence owner after restore")
+			require.False(t, seqDesc.GetSequenceOpts().HasOwner(), "unexpected sequence owner after restore")
 
 			// Sequence dependencies inside the database should still be preserved.
 			sd := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "seq2")
 			td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "t")
 
-			require.True(t, sd.SequenceOpts.HasOwner(), "no owner found for seq2")
-			require.Equal(t, td.ID, sd.SequenceOpts.SequenceOwner.OwnerTableID,
+			require.True(t, sd.GetSequenceOpts().HasOwner(), "no owner found for seq2")
+			require.Equal(t, td.GetID(), sd.GetSequenceOpts().SequenceOwner.OwnerTableID,
 				"unexpected table owner for sequence seq2 after restore",
 			)
-			require.Equal(t, td.GetColumns()[0].ID, sd.SequenceOpts.SequenceOwner.OwnerColumnID,
+			require.Equal(t, td.GetPublicColumns()[0].ID, sd.GetSequenceOpts().SequenceOwner.OwnerColumnID,
 				"unexpected column owner for sequence seq2 after restore")
-			require.Equal(t, 1, len(td.GetColumns()[0].OwnsSequenceIds),
+			require.Equal(t, 1, len(td.GetPublicColumns()[0].OwnsSequenceIds),
 				"unexpected number of sequences owned by d3.t after restore",
 			)
-			require.Equal(t, sd.ID, td.GetColumns()[0].OwnsSequenceIds[0],
+			require.Equal(t, sd.GetID(), td.GetPublicColumns()[0].OwnsSequenceIds[0],
 				"unexpected ID of sequences owned by d3.t",
 			)
 		})
@@ -5389,17 +5385,17 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d2", "t")
 		seqDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "seq")
 
-		require.True(t, seqDesc.SequenceOpts.HasOwner(), "no sequence owner after restore")
-		require.Equal(t, tableDesc.ID, seqDesc.SequenceOpts.SequenceOwner.OwnerTableID,
+		require.True(t, seqDesc.GetSequenceOpts().HasOwner(), "no sequence owner after restore")
+		require.Equal(t, tableDesc.GetID(), seqDesc.GetSequenceOpts().SequenceOwner.OwnerTableID,
 			"unexpected table is sequence owner after restore",
 		)
-		require.Equal(t, tableDesc.GetColumns()[0].ID, seqDesc.SequenceOpts.SequenceOwner.OwnerColumnID,
+		require.Equal(t, tableDesc.GetPublicColumns()[0].ID, seqDesc.GetSequenceOpts().SequenceOwner.OwnerColumnID,
 			"unexpected column is sequence owner after restore",
 		)
-		require.Equal(t, 1, len(tableDesc.GetColumns()[0].OwnsSequenceIds),
+		require.Equal(t, 1, len(tableDesc.GetPublicColumns()[0].OwnsSequenceIds),
 			"unexpected number of sequences owned by d.t after restore",
 		)
-		require.Equal(t, seqDesc.ID, tableDesc.GetColumns()[0].OwnsSequenceIds[0],
+		require.Equal(t, seqDesc.GetID(), tableDesc.GetPublicColumns()[0].OwnsSequenceIds[0],
 			"unexpected ID of sequence owned by table d.t after restore",
 		)
 
@@ -5408,30 +5404,30 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 		sd := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d2", "seq")
 		sdSeq2 := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "seq2")
 
-		require.True(t, sd.SequenceOpts.HasOwner(), "no sequence owner after restore")
-		require.True(t, sdSeq2.SequenceOpts.HasOwner(), "no sequence owner after restore")
+		require.True(t, sd.GetSequenceOpts().HasOwner(), "no sequence owner after restore")
+		require.True(t, sdSeq2.GetSequenceOpts().HasOwner(), "no sequence owner after restore")
 
-		require.Equal(t, td.ID, sd.SequenceOpts.SequenceOwner.OwnerTableID,
+		require.Equal(t, td.GetID(), sd.GetSequenceOpts().SequenceOwner.OwnerTableID,
 			"unexpected table is sequence owner of d3.seq after restore",
 		)
-		require.Equal(t, td.ID, sdSeq2.SequenceOpts.SequenceOwner.OwnerTableID,
+		require.Equal(t, td.GetID(), sdSeq2.GetSequenceOpts().SequenceOwner.OwnerTableID,
 			"unexpected table is sequence owner of d3.seq2 after restore",
 		)
 
-		require.Equal(t, td.GetColumns()[0].ID, sd.SequenceOpts.SequenceOwner.OwnerColumnID,
+		require.Equal(t, td.GetPublicColumns()[0].ID, sd.GetSequenceOpts().SequenceOwner.OwnerColumnID,
 			"unexpected column is sequence owner of d2.seq after restore",
 		)
-		require.Equal(t, td.GetColumns()[0].ID, sdSeq2.SequenceOpts.SequenceOwner.OwnerColumnID,
+		require.Equal(t, td.GetPublicColumns()[0].ID, sdSeq2.GetSequenceOpts().SequenceOwner.OwnerColumnID,
 			"unexpected column is sequence owner of d3.seq2 after restore",
 		)
 
-		require.Equal(t, 2, len(td.GetColumns()[0].OwnsSequenceIds),
+		require.Equal(t, 2, len(td.GetPublicColumns()[0].OwnsSequenceIds),
 			"unexpected number of sequences owned by d3.t after restore",
 		)
-		require.Equal(t, sd.ID, td.GetColumns()[0].OwnsSequenceIds[0],
+		require.Equal(t, sd.GetID(), td.GetPublicColumns()[0].OwnsSequenceIds[0],
 			"unexpected ID of sequence owned by table d3.t after restore",
 		)
-		require.Equal(t, sdSeq2.ID, td.GetColumns()[0].OwnsSequenceIds[1],
+		require.Equal(t, sdSeq2.GetID(), td.GetPublicColumns()[0].OwnsSequenceIds[1],
 			"unexpected ID of sequence owned by table d3.t after restore",
 		)
 	})
@@ -5885,14 +5881,13 @@ func getMockIndexDesc(indexID descpb.IndexID) descpb.IndexDescriptor {
 
 func getMockTableDesc(
 	tableID descpb.ID, pkIndex descpb.IndexDescriptor, indexes []descpb.IndexDescriptor,
-) tabledesc.Immutable {
+) catalog.TableDescriptor {
 	mockTableDescriptor := descpb.TableDescriptor{
 		ID:           tableID,
 		PrimaryIndex: pkIndex,
 		Indexes:      indexes,
 	}
-	mockImmutableTableDesc := tabledesc.MakeImmutable(mockTableDescriptor)
-	return mockImmutableTableDesc
+	return tabledesc.NewImmutable(mockTableDescriptor)
 }
 
 // Unit tests for the getLogicallyMergedTableSpans() method.
@@ -5986,7 +5981,7 @@ func TestLogicallyMergedTableSpans(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
 			tableDesc := getMockTableDesc(test.tableID, test.pkIndex, test.indexes)
-			spans, err := getLogicallyMergedTableSpans(&tableDesc, unusedMap, codec,
+			spans, err := getLogicallyMergedTableSpans(tableDesc, unusedMap, codec,
 				hlc.Timestamp{}, test.checkForKVInBoundsOverride)
 			var mergedSpans []string
 			for _, span := range spans {
@@ -6673,7 +6668,7 @@ ALTER TYPE sc.typ ADD VALUE 'hi';
 	require.EqualValues(t, 2, schemaDesc.Version)
 
 	tableDesc := catalogkv.TestingGetTableDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "d", "sc", "tb")
-	require.EqualValues(t, 2, tableDesc.Version)
+	require.EqualValues(t, 2, tableDesc.GetVersion())
 
 	typeDesc := catalogkv.TestingGetTypeDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "d", "sc", "typ")
 	require.EqualValues(t, 2, typeDesc.Version)
@@ -6768,7 +6763,7 @@ CREATE TYPE sc.typ AS ENUM ('hello');
 		require.Equal(t, descpb.DescriptorState_OFFLINE, schemaDesc.State)
 
 		tableDesc := catalogkv.TestingGetTableDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "d", "sc", "tb")
-		require.Equal(t, descpb.DescriptorState_OFFLINE, tableDesc.State)
+		require.Equal(t, descpb.DescriptorState_OFFLINE, tableDesc.GetState())
 
 		typeDesc := catalogkv.TestingGetTypeDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "d", "sc", "typ")
 		require.Equal(t, descpb.DescriptorState_OFFLINE, typeDesc.State)
@@ -6862,10 +6857,10 @@ CREATE TYPE sc.typ AS ENUM ('hello');
 		require.Equal(t, descpb.DescriptorState_OFFLINE, schemaDesc.State)
 
 		publicTableDesc := catalogkv.TestingGetTableDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "newdb", "public", "tb")
-		require.Equal(t, descpb.DescriptorState_OFFLINE, publicTableDesc.State)
+		require.Equal(t, descpb.DescriptorState_OFFLINE, publicTableDesc.GetState())
 
 		scTableDesc := catalogkv.TestingGetTableDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "newdb", "sc", "tb")
-		require.Equal(t, descpb.DescriptorState_OFFLINE, scTableDesc.State)
+		require.Equal(t, descpb.DescriptorState_OFFLINE, scTableDesc.GetState())
 
 		typeDesc := catalogkv.TestingGetTypeDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "newdb", "sc", "typ")
 		require.Equal(t, descpb.DescriptorState_OFFLINE, typeDesc.State)

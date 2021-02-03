@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
@@ -96,27 +95,31 @@ type extendedEvalContext struct {
 	schemaAccessors *schemaInterface
 
 	sqlStatsCollector *sqlStatsCollector
+
+	SchemaChangerState *SchemaChangerState
 }
 
 // copy returns a deep copy of ctx.
-func (ctx *extendedEvalContext) copy() *extendedEvalContext {
-	cpy := *ctx
-	cpy.EvalContext = *ctx.EvalContext.Copy()
+func (evalCtx *extendedEvalContext) copy() *extendedEvalContext {
+	cpy := *evalCtx
+	cpy.EvalContext = *evalCtx.EvalContext.Copy()
 	return &cpy
 }
 
 // QueueJob creates a new job from record and queues it for execution after
 // the transaction commits.
-func (ctx *extendedEvalContext) QueueJob(record jobs.Record) (*jobs.Job, error) {
-	job, err := ctx.ExecCfg.JobRegistry.CreateJobWithTxn(
-		ctx.Context,
+func (evalCtx *extendedEvalContext) QueueJob(
+	ctx context.Context, record jobs.Record,
+) (*jobs.Job, error) {
+	job, err := evalCtx.ExecCfg.JobRegistry.CreateJobWithTxn(
+		ctx,
 		record,
-		ctx.Txn,
+		evalCtx.Txn,
 	)
 	if err != nil {
 		return nil, err
 	}
-	*ctx.Jobs = append(*ctx.Jobs, *job.ID())
+	*evalCtx.Jobs = append(*evalCtx.Jobs, *job.ID())
 	return job, nil
 }
 
@@ -221,8 +224,8 @@ type planner struct {
 	contextDatabaseID descpb.ID
 }
 
-func (ctx *extendedEvalContext) setSessionID(sessionID ClusterWideID) {
-	ctx.SessionID = sessionID
+func (evalCtx *extendedEvalContext) setSessionID(sessionID ClusterWideID) {
+	evalCtx.SessionID = sessionID
 }
 
 // noteworthyInternalMemoryUsageBytes is the minimum size tracked by each
@@ -496,7 +499,7 @@ func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tre
 	if err != nil {
 		return 0, err
 	}
-	return tree.ID(desc.ID), nil
+	return tree.ID(desc.GetID()), nil
 }
 
 // LookupTableByID looks up a table, by the given descriptor ID. Based on the
@@ -506,7 +509,7 @@ func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tre
 //  of having its own logic for lookups.
 func (p *planner) LookupTableByID(
 	ctx context.Context, tableID descpb.ID,
-) (*tabledesc.Immutable, error) {
+) (catalog.TableDescriptor, error) {
 	if entry, err := p.getVirtualTabler().getVirtualTableEntryByID(tableID); err == nil {
 		return entry.desc, nil
 	}

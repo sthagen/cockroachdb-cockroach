@@ -69,6 +69,17 @@ func (*sqlSmith) Meta() workload.Meta { return sqlSmithMeta }
 // Flags implements the Flagser interface.
 func (g *sqlSmith) Flags() workload.Flags { return g.flags }
 
+func (g *sqlSmith) Hooks() workload.Hooks {
+	return workload.Hooks{
+		PreCreate: func(db *gosql.DB) error {
+			if _, err := db.Exec(`SET CLUSTER SETTING sql.defaults.interleaved_tables.enabled = true`); err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+}
+
 // Tables implements the Generator interface.
 func (g *sqlSmith) Tables() []workload.Table {
 	rng := rand.New(rand.NewSource(g.seed))

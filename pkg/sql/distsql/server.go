@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -93,6 +94,12 @@ func NewServer(ctx context.Context, cfg execinfra.ServerConfig) *ServerImpl {
 		// used. Mock contention events should be generated either using the cluster
 		// setting or programmatically using the testing knob, but not both.
 		cfg.TestingKnobs.GenerateMockContentionEvents = testingGenerateMockContentionEvents.Get(&cfg.Settings.SV)
+	})
+
+	colexec.HashAggregationDiskSpillingEnabled.SetOnChange(&cfg.Settings.SV, func() {
+		if !colexec.HashAggregationDiskSpillingEnabled.Get(&cfg.Settings.SV) {
+			telemetry.Inc(sqltelemetry.HashAggregationDiskSpillingDisabled)
+		}
 	})
 
 	return ds
@@ -306,7 +313,9 @@ func (ds *ServerImpl) setupFlow(
 	}
 
 	// Create the FlowCtx for the flow.
-	flowCtx := ds.NewFlowContext(ctx, req.Flow.FlowID, evalCtx, req.TraceKV, localState)
+	flowCtx := ds.NewFlowContext(
+		ctx, req.Flow.FlowID, evalCtx, req.TraceKV, req.CollectStats, localState, req.Flow.Gateway == roachpb.NodeID(ds.NodeID.SQLInstanceID()),
+	)
 
 	// req always contains the desired vectorize mode, regardless of whether we
 	// have non-nil localState.EvalContext. We don't want to update EvalContext
@@ -391,7 +400,9 @@ func (ds *ServerImpl) NewFlowContext(
 	id execinfrapb.FlowID,
 	evalCtx *tree.EvalContext,
 	traceKV bool,
+	collectStats bool,
 	localState LocalState,
+	isGatewayNode bool,
 ) execinfra.FlowCtx {
 	// TODO(radu): we should sanity check some of these fields.
 	flowCtx := execinfra.FlowCtx{
@@ -401,7 +412,9 @@ func (ds *ServerImpl) NewFlowContext(
 		EvalCtx:        evalCtx,
 		NodeID:         ds.ServerConfig.NodeID,
 		TraceKV:        traceKV,
+		CollectStats:   collectStats,
 		Local:          localState.IsLocal,
+		Gateway:        isGatewayNode,
 	}
 
 	if localState.IsLocal && localState.Collection != nil {

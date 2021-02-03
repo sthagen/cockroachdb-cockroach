@@ -24,7 +24,8 @@ import { SortSetting } from "src/views/shared/components/sortabletable";
 import { LocalSetting } from "src/redux/localsettings";
 
 import "./decommissionedNodeHistory.styl";
-import { ColumnsConfig, Table, Text } from "src/components";
+import { Text } from "src/components";
+import { ColumnsConfig, Table } from "@cockroachlabs/cluster-ui";
 import { createSelector } from "reselect";
 
 const decommissionedNodesSortSetting = new LocalSetting<

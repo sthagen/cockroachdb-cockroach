@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -162,12 +161,12 @@ type FetcherTableArgs struct {
 
 // InitCols initializes the columns in FetcherTableArgs.
 func (fta *FetcherTableArgs) InitCols(
-	desc *tabledesc.Immutable,
+	desc catalog.TableDescriptor,
 	scanVisibility execinfrapb.ScanVisibility,
 	systemColumns []descpb.ColumnDescriptor,
 	virtualColumn *descpb.ColumnDescriptor,
 ) {
-	cols := desc.Columns
+	cols := desc.GetPublicColumns()
 	if scanVisibility == execinfra.ScanVisibilityPublicAndNotPublic {
 		cols = desc.ReadableColumns()
 	}
@@ -569,6 +568,7 @@ func (rf *Fetcher) StartScan(
 	limitBatches bool,
 	limitHint int64,
 	traceKV bool,
+	forceProductionKVBatchSize bool,
 ) error {
 	if len(spans) == 0 {
 		return errors.AssertionFailedf("no spans")
@@ -584,6 +584,7 @@ func (rf *Fetcher) StartScan(
 		rf.lockStrength,
 		rf.lockWaitPolicy,
 		rf.mon,
+		forceProductionKVBatchSize,
 	)
 	if err != nil {
 		return err
@@ -609,6 +610,7 @@ func (rf *Fetcher) StartInconsistentScan(
 	limitBatches bool,
 	limitHint int64,
 	traceKV bool,
+	forceProductionKVBatchSize bool,
 ) error {
 	if len(spans) == 0 {
 		return errors.AssertionFailedf("no spans")
@@ -665,6 +667,7 @@ func (rf *Fetcher) StartInconsistentScan(
 		rf.lockStrength,
 		rf.lockWaitPolicy,
 		rf.mon,
+		forceProductionKVBatchSize,
 	)
 	if err != nil {
 		return err

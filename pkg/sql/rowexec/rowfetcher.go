@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -26,13 +25,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 )
 
 // rowFetcher is an interface used to abstract a row fetcher so that a stat
 // collector wrapper can be plugged in.
 type rowFetcher interface {
 	StartScan(
-		_ context.Context, _ *kv.Txn, _ roachpb.Spans, limitBatches bool, limitHint int64, traceKV bool,
+		_ context.Context, _ *kv.Txn, _ roachpb.Spans, limitBatches bool,
+		limitHint int64, traceKV bool, forceProductionKVBatchSize bool,
 	) error
 	StartInconsistentScan(
 		_ context.Context,
@@ -43,6 +44,7 @@ type rowFetcher interface {
 		limitBatches bool,
 		limitHint int64,
 		traceKV bool,
+		forceProductionKVBatchSize bool,
 	) error
 
 	NextRow(ctx context.Context) (
@@ -62,7 +64,7 @@ type rowFetcher interface {
 func initRowFetcher(
 	flowCtx *execinfra.FlowCtx,
 	fetcher *row.Fetcher,
-	desc *tabledesc.Immutable,
+	desc catalog.TableDescriptor,
 	indexIdx int,
 	colIdxMap catalog.TableColMap,
 	reverseScan bool,
@@ -76,10 +78,12 @@ func initRowFetcher(
 	systemColumns []descpb.ColumnDescriptor,
 	virtualColumn *descpb.ColumnDescriptor,
 ) (index *descpb.IndexDescriptor, isSecondaryIndex bool, err error) {
-	index, isSecondaryIndex, err = desc.FindIndexByIndexIdx(indexIdx)
-	if err != nil {
-		return nil, false, err
+	if indexIdx >= len(desc.ActiveIndexes()) {
+		return nil, false, errors.Errorf("invalid indexIdx %d", indexIdx)
 	}
+	indexI := desc.ActiveIndexes()[indexIdx]
+	index = indexI.IndexDesc()
+	isSecondaryIndex = !indexI.Primary()
 
 	tableArgs := row.FetcherTableArgs{
 		Desc:             desc,

@@ -139,44 +139,57 @@ func TestTraceAnalyzer(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
+		name                string
 		analyzer            *execstats.TraceAnalyzer
 		expectedMaxMemUsage int64
 	}{
 		{
+			name:                "RowExec",
 			analyzer:            rowexecTraceAnalyzer,
 			expectedMaxMemUsage: int64(20480),
 		},
 		{
+			name:                "ColExec",
 			analyzer:            colexecTraceAnalyzer,
-			expectedMaxMemUsage: int64(30720),
+			expectedMaxMemUsage: int64(51200),
 		},
 	} {
-		nodeLevelStats := tc.analyzer.GetNodeLevelStats()
-		require.Equal(
-			t, numNodes-1, len(nodeLevelStats.NetworkBytesSentGroupedByNode), "expected all nodes minus the gateway node to have sent bytes",
-		)
+		t.Run(tc.name, func(t *testing.T) {
+			nodeLevelStats := tc.analyzer.GetNodeLevelStats()
+			require.Equal(
+				t, numNodes-1, len(nodeLevelStats.NetworkBytesSentGroupedByNode), "expected all nodes minus the gateway node to have sent bytes",
+			)
+			require.Equal(
+				t, numNodes, len(nodeLevelStats.MaxMemoryUsageGroupedByNode), "expected all nodes to have specified maximum memory usage",
+			)
 
-		queryLevelStats := tc.analyzer.GetQueryLevelStats()
+			queryLevelStats := tc.analyzer.GetQueryLevelStats()
 
-		// The stats don't count the actual bytes, but they are a synthetic value
-		// based on the number of tuples. In this test 21 tuples flow over the
-		// network.
-		require.Equal(t, int64(21*8), queryLevelStats.NetworkBytesSent)
+			// The stats don't count the actual bytes, but they are a synthetic value
+			// based on the number of tuples. In this test 21 tuples flow over the
+			// network.
+			require.Equal(t, int64(21*8), queryLevelStats.NetworkBytesSent)
 
-		require.Equal(t, tc.expectedMaxMemUsage, queryLevelStats.MaxMemUsage)
+			require.Equal(t, tc.expectedMaxMemUsage, queryLevelStats.MaxMemUsage)
 
-		require.Equal(t, int64(30), queryLevelStats.KVRowsRead)
-		// For tests, the bytes read is based on the number of rows read, rather
-		// than actual bytes read.
-		require.Equal(t, int64(30*8), queryLevelStats.KVBytesRead)
+			require.Equal(t, int64(30), queryLevelStats.KVRowsRead)
+			// For tests, the bytes read is based on the number of rows read, rather
+			// than actual bytes read.
+			require.Equal(t, int64(30*8), queryLevelStats.KVBytesRead)
 
-		// For tests, network messages is a synthetic value based on the number of
-		// network tuples. In this test 21 tuples flow over the network.
-		require.Equal(t, int64(21/2), queryLevelStats.NetworkMessages)
+			// For tests, network messages is a synthetic value based on the number of
+			// network tuples. In this test 21 tuples flow over the network.
+			require.Equal(t, int64(21/2), queryLevelStats.NetworkMessages)
+		})
 	}
 }
 
 func TestTraceAnalyzerProcessStats(t *testing.T) {
+	const (
+		node1Time      = 3 * time.Second
+		node2Time      = 5 * time.Second
+		cumulativeTime = node1Time + node2Time
+	)
 	a := &execstats.TraceAnalyzer{FlowMetadata: &execstats.FlowMetadata{}}
 	a.AddComponentStats(
 		1, /* nodeID */
@@ -186,7 +199,8 @@ func TestTraceAnalyzerProcessStats(t *testing.T) {
 				1, /* processorID */
 			),
 			KV: execinfrapb.KVStats{
-				KVTime: optional.MakeTimeValue(3 * time.Second),
+				KVTime:         optional.MakeTimeValue(node1Time),
+				ContentionTime: optional.MakeTimeValue(node1Time),
 			},
 		},
 	)
@@ -199,12 +213,16 @@ func TestTraceAnalyzerProcessStats(t *testing.T) {
 				2, /* processorID */
 			),
 			KV: execinfrapb.KVStats{
-				KVTime: optional.MakeTimeValue(5 * time.Second),
+				KVTime:         optional.MakeTimeValue(node2Time),
+				ContentionTime: optional.MakeTimeValue(node2Time),
 			},
 		},
 	)
 
-	expected := execstats.QueryLevelStats{KVTime: 8 * time.Second}
+	expected := execstats.QueryLevelStats{
+		KVTime:         cumulativeTime,
+		ContentionTime: cumulativeTime,
+	}
 
 	assert.NoError(t, a.ProcessStats())
 	if got := a.GetQueryLevelStats(); !reflect.DeepEqual(got, expected) {

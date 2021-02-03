@@ -351,6 +351,8 @@ func TestTableReaderDrain(t *testing.T) {
 // we properly set the limit on the underlying Fetcher/KVFetcher).
 func TestLimitScans(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
@@ -394,6 +396,7 @@ func TestLimitScans(t *testing.T) {
 	sp.SetVerbose(true)
 	ctx = tracing.ContextWithSpan(ctx, sp)
 	flowCtx.EvalCtx.Context = ctx
+	flowCtx.CollectStats = true
 
 	tr, err := newTableReader(&flowCtx, 0 /* processorID */, &spec, &post, nil /* output */)
 	if err != nil {
@@ -430,7 +433,7 @@ func TestLimitScans(t *testing.T) {
 	// specific so that we don't count range resolving requests, and we dedupe
 	// scans from the same key as the DistSender retries scans when it detects
 	// splits.
-	re := regexp.MustCompile(fmt.Sprintf(`querying next range at /Table/%d/1(\S.*)?`, tableDesc.ID))
+	re := regexp.MustCompile(fmt.Sprintf(`querying next range at /Table/%d/1(\S.*)?`, tableDesc.GetID()))
 	spans := sp.GetRecording()
 	ranges := make(map[string]struct{})
 	for _, span := range spans {

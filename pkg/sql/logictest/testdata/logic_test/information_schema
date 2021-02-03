@@ -301,6 +301,7 @@ crdb_internal       kv_node_status
 crdb_internal       kv_store_status
 crdb_internal       leases
 crdb_internal       node_build_info
+crdb_internal       node_inflight_trace_spans
 crdb_internal       node_metrics
 crdb_internal       node_queries
 crdb_internal       node_runtime_info
@@ -461,6 +462,7 @@ kv_node_status
 kv_store_status
 leases
 node_build_info
+node_inflight_trace_spans
 node_metrics
 node_queries
 node_runtime_info
@@ -640,6 +642,7 @@ system         crdb_internal       kv_node_status                         SYSTEM
 system         crdb_internal       kv_store_status                        SYSTEM VIEW  NO                  1
 system         crdb_internal       leases                                 SYSTEM VIEW  NO                  1
 system         crdb_internal       node_build_info                        SYSTEM VIEW  NO                  1
+system         crdb_internal       node_inflight_trace_spans              SYSTEM VIEW  NO                  1
 system         crdb_internal       node_metrics                           SYSTEM VIEW  NO                  1
 system         crdb_internal       node_queries                           SYSTEM VIEW  NO                  1
 system         crdb_internal       node_runtime_info                      SYSTEM VIEW  NO                  1
@@ -1644,6 +1647,54 @@ time_prec   rowid        64                 2                        0          
 statement ok
 DROP TABLE time_prec
 
+statement ok
+CREATE TABLE t1 (
+  id INT8 NULL,
+  name STRING NULL,
+  class STRING NULL,
+  FAMILY "primary" (id, name, rowid)
+)
+
+query TTTTT colnames
+SELECT table_catalog, table_schema, table_name, column_name, column_comment
+FROM information_schema.columns
+WHERE table_name = 't1'
+----
+table_catalog  table_schema  table_name  column_name    column_comment
+test           public        t1          id             ·
+test           public        t1          name           ·
+test           public        t1          class          ·
+test           public        t1          rowid          ·
+
+statement ok
+COMMENT ON COLUMN public.t1.id IS 'identification'
+
+statement ok
+COMMENT ON COLUMN public.t1.name IS 'character'
+
+query TTTTT colnames
+SELECT table_catalog, table_schema, table_name, column_name, column_comment
+FROM information_schema.columns
+WHERE table_name = 't1'
+----
+table_catalog  table_schema  table_name  column_name    column_comment
+test           public        t1          id             'identification'
+test           public        t1          name           'character'
+test           public        t1          class          ·
+test           public        t1          rowid          ·
+
+query TTTTT colnames
+SELECT table_catalog, table_schema, table_name, column_name, column_comment
+FROM information_schema.columns
+WHERE table_name = 't1' AND column_comment != ''
+----
+table_catalog  table_schema  table_name  column_name    column_comment
+test           public        t1          id             'identification'
+test           public        t1          name           'character'
+
+statement ok
+DROP TABLE t1
+
 ## information_schema.key_column_usage
 ## information_schema.referential_constraints
 
@@ -1832,6 +1883,7 @@ NULL     public   system         crdb_internal       kv_node_status             
 NULL     public   system         crdb_internal       kv_store_status                        SELECT          NULL          YES
 NULL     public   system         crdb_internal       leases                                 SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_build_info                        SELECT          NULL          YES
+NULL     public   system         crdb_internal       node_inflight_trace_spans              SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_metrics                           SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_queries                           SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_runtime_info                      SELECT          NULL          YES
@@ -2217,6 +2269,7 @@ NULL     public   system         crdb_internal       kv_node_status             
 NULL     public   system         crdb_internal       kv_store_status                        SELECT          NULL          YES
 NULL     public   system         crdb_internal       leases                                 SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_build_info                        SELECT          NULL          YES
+NULL     public   system         crdb_internal       node_inflight_trace_spans              SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_metrics                           SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_queries                           SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_runtime_info                      SELECT          NULL          YES
@@ -3353,12 +3406,13 @@ enable_implicit_select_for_update                     on
 enable_insert_fast_path                               on
 enable_seqscan                                        on
 enable_zigzag_join                                    on
+escape_string_warning                                 on
 experimental_enable_hash_sharded_indexes              off
 experimental_enable_implicit_column_partitioning      off
-experimental_enable_multi_column_inverted_indexes     off
 experimental_enable_temp_tables                       off
 experimental_enable_unique_without_index_constraints  on
 experimental_enable_virtual_columns                   off
+experimental_use_new_schema_changer                   off
 extra_float_digits                                    0
 force_savepoint_restart                               off
 foreign_key_cascades_limit                            10000

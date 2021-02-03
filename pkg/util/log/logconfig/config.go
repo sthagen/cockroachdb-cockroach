@@ -24,11 +24,11 @@ import (
 
 // DefaultFileFormat is the entry format for file sinks when not
 // specified in a configuration.
-const DefaultFileFormat = `crdb-v1`
+const DefaultFileFormat = `crdb-v2`
 
 // DefaultStderrFormat is the entry format for stderr sinks
 // when not specified in a configuration.
-const DefaultStderrFormat = `crdb-v1-tty`
+const DefaultStderrFormat = `crdb-v2-tty`
 
 // DefaultConfig returns a suitable default configuration when logging
 // is meant to primarily go to files.
@@ -43,6 +43,7 @@ file-defaults:
     max-file-size: 10mib
     max-group-size: 100mib
     exit-on-error: true
+    buffered-writes: true
 sinks:
   stderr:
     filter: NONE
@@ -111,35 +112,6 @@ type CaptureFd2Config struct {
 	MaxGroupSize *ByteSize `yaml:"max-group-size,omitempty"`
 }
 
-// SinkConfig represents the sink configurations.
-type SinkConfig struct {
-	// FileGroups represents the list of configured file sinks.
-	FileGroups map[string]*FileConfig `yaml:"file-groups,omitempty"`
-	// Stderr represents the configuration for the stderr sink.
-	Stderr StderrConfig `yaml:",omitempty"`
-
-	// sortedFileGroupNames is used internally to
-	// make the Export() function deterministic.
-	sortedFileGroupNames []string
-}
-
-// StderrConfig represents the configuration for the stderr sink.
-type StderrConfig struct {
-	// Channels is the list of logging channels that use this sink.
-	Channels ChannelList `yaml:",omitempty"`
-
-	// NoColor forces the omission of VT color codes in the output even
-	// when stderr is a terminal.
-	NoColor bool `yaml:"no-color,omitempty"`
-
-	// CommonSinkConfig is the configuration common to all sinks. Note
-	// that although the idiom in Go is to place embedded fields at the
-	// beginning of a struct, we purposefully deviate from the idiom
-	// here to ensure that "general" options appear after the
-	// sink-specific options in YAML config dumps.
-	CommonSinkConfig `yaml:",inline"`
-}
-
 // CommonSinkConfig represents the common configuration shared across all sinks.
 type CommonSinkConfig struct {
 	// Filter indicates the minimum severity for log events to be
@@ -166,9 +138,75 @@ type CommonSinkConfig struct {
 
 	// Auditable is translated to tweaks to the other settings
 	// for this sink during validation. For example,
-	// it enables exit-on-error and changes the format of files
-	// from crdb-v1 to crdb-v1-count.
+	// it enables `exit-on-error` and changes the format of files
+	// from `crdb-v1` to `crdb-v1-count`.
 	Auditable *bool `yaml:",omitempty"`
+}
+
+// SinkConfig represents the sink configurations.
+type SinkConfig struct {
+	// FileGroups represents the list of configured file sinks.
+	FileGroups map[string]*FileSinkConfig `yaml:"file-groups,omitempty"`
+	// Stderr represents the configuration for the stderr sink.
+	Stderr StderrSinkConfig `yaml:",omitempty"`
+
+	// sortedFileGroupNames is used internally to
+	// make the Export() function deterministic.
+	sortedFileGroupNames []string
+}
+
+// StderrSinkConfig represents the configuration for the stderr sink.
+//
+// User-facing documentation follows.
+// TITLE: standard error stream
+//
+// The standard error output stream of the running `cockroach`
+// process.
+//
+// The configuration key under the `sinks` key in the YAML configuration
+// is `stderr`. Example configuration:
+//
+//     sinks:
+//        stderr:           # standard error sink configuration starts here
+//           channels: DEV
+//
+// Note: the server start-up messages are still emitted at the start
+// of the standard error stream even when logging to stderr is
+// enabled.  This makes it generally difficult to automate integration
+// with log analyzers. Generally, we recommend operators to either use
+// file logging or native network logging instead of using standard
+// error when integrating with automated monitoring software.
+//
+// Note: it is not possible to enable the "redactable" parameter on
+// the stderr sink if the "capture-stray-errors" functionality
+// (i.e. capturing stray error information to files) is disabled.
+//
+// This is because when "capture-stray-errors" is disabled, the
+// process' standard error stream can contain an arbitrary
+// interleaving of logging events and stray errors; in particular, it
+// is possible for stray error output to interfere with redaction
+// markers and remove the guarantees that information outside of
+// redaction markers does not contain sensitive information.
+//
+// Note: for a similar reason, no guarantees of parsability of the output
+// format is available when the "capture-stray-errors" functionality
+// is disabled, since the standard error stream can then contain an
+// arbitrary interleaving of non-formatted error data.
+//
+type StderrSinkConfig struct {
+	// Channels is the list of logging channels that use this sink.
+	Channels ChannelList `yaml:",omitempty,flow"`
+
+	// NoColor forces the omission of VT color codes in the output even
+	// when stderr is a terminal.
+	NoColor bool `yaml:"no-color,omitempty"`
+
+	// CommonSinkConfig is the configuration common to all sinks. Note
+	// that although the idiom in Go is to place embedded fields at the
+	// beginning of a struct, we purposefully deviate from the idiom
+	// here to ensure that "general" options appear after the
+	// sink-specific options in YAML config dumps.
+	CommonSinkConfig `yaml:",inline"`
 }
 
 // FileDefaults represent configuration defaults for file sinks.
@@ -188,9 +226,10 @@ type FileDefaults struct {
 	// If zero, old files are not removed.
 	MaxGroupSize ByteSize `yaml:"max-group-size,omitempty"`
 
-	// SyncWrites stores the default setting for sync-writes on file
-	// sinks, which implies synchronization on every log write.
-	SyncWrites bool `yaml:"sync-writes,omitempty"`
+	// BufferedWrites stores the default setting for buffered-writes on
+	// file sinks, which implies keeping a buffer of log entries in memory.
+	// Conversely, setting this to false flushes log writes upon every entry.
+	BufferedWrites *bool `yaml:"buffered-writes,omitempty"`
 
 	// CommonSinkConfig is the configuration common to all sinks. Note
 	// that although the idiom in Go is to place embedded fields at the
@@ -200,28 +239,84 @@ type FileDefaults struct {
 	CommonSinkConfig `yaml:",inline"`
 }
 
-// FileConfig represents the configuration for one file sink.
-type FileConfig struct {
+// FileSinkConfig represents the configuration for one file sink.
+//
+// User-facing documentation follows.
+// TITLE: output to files
+//
+// Files under a configurable logging directory.
+//
+// This sink type causes logging data to be captured into *file groups*,
+// one group per configured sink.
+//
+// The configuration key under the `sinks` key in the YAML
+// configuration is `file-groups`. Example configuration:
+//
+//     sinks:
+//        file-groups:           # file group configurations start here
+//           health:             # defines one group called "health"
+//              channels: HEALTH
+//
+// Each generated log file is prefixed by the name of the process,
+// followed by the name of the group, separated by a hyphen.  For
+// example, the group `health` will generate files named
+// `cockroach-health.XXX.log`, assuming the process is named
+// `cockroach`. (A user can influence the prefix by renaming the
+// program executable.)
+//
+// The files are named so that a lexicographical sort of the
+// directory contents presents the file in creation order.
+//
+// Additionally, every time a new log file is generated,
+// a shorthand symbolic link (e.g. `cockroach-health.log`)
+// is maintain to point to the latest file.
+//
+// Regarding configuration, a cascading defaults mechanism is
+// available: every new file group sink configured automatically
+// inherits the configurations set in the `file-defaults` section.
+//
+// For example:
+//
+//      file-defaults:
+//          redactable: false # default: disable redaction markers
+//          dir: logs
+//      sinks:
+//        file-groups:
+//          health:
+//             channels: HEALTH
+//             # This sink has redactable set to false,
+//             # as the setting is inherited from file-defaults
+//             # unless overridden here.
+//             #
+//             # Example override:
+//             dir: health-logs # override the default 'logs'
+//
+// Users are invited to peruse the `check-log-config` tool to
+// verify the effect of defaults inheritance.
+//
+type FileSinkConfig struct {
 	// Channels is the list of logging channels that use this sink.
-	Channels ChannelList `yaml:",omitempty"`
+	Channels ChannelList `yaml:",omitempty,flow"`
 
 	// Dir specifies the output directory for files generated by this
-	// sink. Inherited from FileDefaults.Dir if not specified.
+	// sink. Inherited from `file-defaults.dir` if not specified.
 	Dir *string `yaml:",omitempty"`
 
 	// MaxFileSize indicates the approximate maximum size of
 	// individual files generated by this sink.
-	// Inherited from FileDefaults.MaxFileSize if not specified.
+	// Inherited from `file-defaults.max-file-size` if not specified.
 	MaxFileSize *ByteSize `yaml:"max-file-size,omitempty"`
 
 	// MaxGroupSize indicates the approximate maximum combined size
 	// of all files to be preserved for this sink. An asynchronous
 	// garbage collection removes files that cause the file set to grow
 	// beyond this specified size.
+	// Inherited from `file-defaults.max-group-size` if not specified.
 	MaxGroupSize *ByteSize `yaml:"max-group-size,omitempty"`
 
-	// SyncWrites specifies whether to sync on every log write.
-	SyncWrites *bool `yaml:"sync-writes,omitempty"`
+	// BufferedWrites specifies whether to flush on every log write.
+	// Inherited from `file-defaults.buffered-writes` if not specified.
+	BufferedWrites *bool `yaml:"buffered-writes,omitempty"`
 
 	// CommonSinkConfig is the configuration common to all sinks. Note
 	// that although the idiom in Go is to place embedded fields at the
@@ -306,17 +401,36 @@ func (c ChannelList) HasChannel(ch logpb.Channel) bool {
 
 // MarshalYAML implements the yaml.Marshaler interface.
 func (c ChannelList) MarshalYAML() (interface{}, error) {
-	return c.String(), nil
+	if reflect.DeepEqual(c.Channels, channelValues) {
+		return "all", nil
+	}
+	a := make([]string, len(c.Channels))
+	for i, ch := range c.Channels {
+		a[i] = ch.String()
+	}
+	return a, nil
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
 func (c *ChannelList) UnmarshalYAML(fn func(interface{}) error) error {
-	// Expand the YAML input into a raw string.
+	// We recognize two formats here: YAML arrays,
+	// and a simple string-based format.
+	var a []string
+	if err := fn(&a); err == nil /* no error: it's an array */ {
+		ch, err := selectChannels(false /* invert */, a)
+		if err != nil {
+			return err
+		}
+		c.Channels = ch
+		return nil
+	}
+
+	// It was not an array. Is it a string?
 	var s string
 	if err := fn(&s); err != nil {
 		return err
 	}
-
+	// It was a string: use the string configuration format.
 	return c.Set(s)
 }
 
@@ -332,31 +446,55 @@ func (c *ChannelList) Sort() {
 	}
 }
 
+// parseChannelList recognizes the following formats:
+//     all
+//     X,Y,Z
+//     [all]
+//     [X,Y,Z]
+//     all except X,Y,Z
+//     all except [X,Y,Z]
 func parseChannelList(s string) ([]logpb.Channel, error) {
 	// We accept mixed case -- normalize everything.
 	s = strings.ToUpper(strings.TrimSpace(s))
 
 	// Special case: "ALL" selects all channels.
 	if s == "ALL" {
-		// Copy the default in case the code that uses a Config overwrites
-		// its channel list in-place.
-		chans := make([]logpb.Channel, 0, len(channelValues))
-		return append(chans, channelValues...), nil
+		return selectAllChannels(), nil
 	}
 
 	// If channels starts with "all except", we invert the selection.
 	invert := false
 	if strings.HasPrefix(s, "ALL EXCEPT ") {
 		invert = true
-		s = strings.TrimPrefix(s, "ALL EXCEPT ")
+		s = strings.TrimSpace(strings.TrimPrefix(s, "ALL EXCEPT "))
+	}
+
+	// Strip the enclosing [...] if present.
+	if len(s) > 0 && s[0] == '[' {
+		if s[len(s)-1] != ']' {
+			return nil, errors.New("unbalanced brackets")
+		}
+		s = s[1 : len(s)-1]
 	}
 
 	// Extract the selection.
 	parts := strings.Split(s, ",")
+	return selectChannels(invert, parts)
+}
+
+func selectChannels(invert bool, parts []string) ([]logpb.Channel, error) {
 	chans := make([]logpb.Channel, 0, len(parts))
 	for _, p := range parts {
 		// Remove stray spaces around the separating comma.
-		p = strings.TrimSpace(p)
+		p = strings.ToUpper(strings.TrimSpace(p))
+
+		if p == "ALL" {
+			if len(parts) != 1 {
+				return nil, errors.New("cannot use ALL if there are other channel names present in the list")
+			}
+			return selectAllChannels(), nil
+		}
+
 		// Verify the channel name is known.
 		c, ok := logpb.Channel_value[p]
 		if !ok {
@@ -391,6 +529,15 @@ func parseChannelList(s string) ([]logpb.Channel, error) {
 		}
 	}
 	return selected, nil
+}
+
+// selectAllChannels returns a copy of channelValues,
+// for use in the ALL configuration.
+func selectAllChannels() []logpb.Channel {
+	// Copy the default in case the code that uses a Config overwrites
+	// its channel list in-place.
+	chans := make([]logpb.Channel, 0, len(channelValues))
+	return append(chans, channelValues...)
 }
 
 // channelValues contains the sorted list of channel identifiers. We

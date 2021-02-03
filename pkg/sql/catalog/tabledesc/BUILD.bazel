@@ -38,6 +38,7 @@ go_library(
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_lib_pq//oid",
+        "@org_golang_google_protobuf//proto",
     ],
 )
 
@@ -74,6 +75,7 @@ go_test(
         "//pkg/util/leaktest",
         "//pkg/util/protoutil",
         "//pkg/util/randutil",
+        "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_stretchr_testify//require",
         "@in_gopkg_yaml_v2//:yaml_v2",

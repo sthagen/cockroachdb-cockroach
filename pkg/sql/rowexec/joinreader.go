@@ -33,7 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -77,7 +76,7 @@ type joinReader struct {
 
 	diskMonitor *mon.BytesMonitor
 
-	desc             tabledesc.Immutable
+	desc             catalog.TableDescriptor
 	index            *descpb.IndexDescriptor
 	colIdxMap        catalog.TableColMap
 	maintainOrdering bool
@@ -90,8 +89,7 @@ type joinReader struct {
 	shouldLimitBatches bool
 	readerType         joinReaderType
 
-	input      execinfra.RowSource
-	inputTypes []*types.T
+	input execinfra.RowSource
 	// Column indexes in the input stream specifying the columns which match with
 	// the index columns. These are the equality columns of the join.
 	lookupCols []uint32
@@ -171,6 +169,9 @@ func newJoinReader(
 		if spec.Type != descpb.InnerJoin {
 			return nil, errors.AssertionFailedf("only inner index joins are supported, %s requested", spec.Type)
 		}
+		if !spec.OnExpr.Empty() {
+			return nil, errors.AssertionFailedf("non-empty ON expressions are not supported for index joins")
+		}
 	}
 
 	var lookupCols []uint32
@@ -187,22 +188,29 @@ func newJoinReader(
 		return nil, errors.Errorf("unsupported joinReaderType")
 	}
 	jr := &joinReader{
-		desc:                              tabledesc.MakeImmutable(spec.Table),
+		desc:                              tabledesc.NewImmutable(spec.Table),
 		maintainOrdering:                  spec.MaintainOrdering,
 		input:                             input,
-		inputTypes:                        input.OutputTypes(),
 		lookupCols:                        lookupCols,
 		outputGroupContinuationForLeftRow: spec.OutputGroupContinuationForLeftRow,
+		// If the lookup columns form a key, there is only one result per
+		// lookup, so the fetcher should parallelize the key lookups it
+		// performs.
+		shouldLimitBatches: !spec.LookupColumnsAreKey && readerType == lookupJoinReaderType,
+		readerType:         readerType,
 	}
 	if readerType != indexJoinReaderType {
 		jr.groupingState = &inputBatchGroupingState{doGrouping: spec.LeftJoinWithPairedJoiner}
 	}
 	var err error
 	var isSecondary bool
-	jr.index, isSecondary, err = jr.desc.FindIndexByIndexIdx(int(spec.IndexIdx))
-	if err != nil {
-		return nil, err
+	indexIdx := int(spec.IndexIdx)
+	if indexIdx >= len(jr.desc.ActiveIndexes()) {
+		return nil, errors.Errorf("invalid indexIdx %d", indexIdx)
 	}
+	indexI := jr.desc.ActiveIndexes()[indexIdx]
+	jr.index = indexI.IndexDesc()
+	isSecondary = !indexI.Primary()
 	returnMutations := spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic
 	jr.colIdxMap = jr.desc.ColumnIdxMapWithMutations(returnMutations)
 
@@ -213,19 +221,14 @@ func newJoinReader(
 		indexCols[i] = uint32(columnID)
 	}
 
-	// If the lookup columns form a key, there is only one result per lookup, so the fetcher
-	// should parallelize the key lookups it performs.
-	jr.shouldLimitBatches = !spec.LookupColumnsAreKey && readerType == lookupJoinReaderType
-	jr.readerType = readerType
-
 	// Add all requested system columns to the output.
 	var sysColDescs []descpb.ColumnDescriptor
 	if spec.HasSystemColumns {
 		sysColDescs = colinfo.AllSystemColumnDescs
-	}
-	for i := range sysColDescs {
-		columnTypes = append(columnTypes, sysColDescs[i].Type)
-		jr.colIdxMap.Set(sysColDescs[i].ID, jr.colIdxMap.Len())
+		for i := range sysColDescs {
+			columnTypes = append(columnTypes, sysColDescs[i].Type)
+			jr.colIdxMap.Set(sysColDescs[i].ID, jr.colIdxMap.Len())
+		}
 	}
 
 	var leftTypes []*types.T
@@ -272,32 +275,24 @@ func newJoinReader(
 	}
 
 	collectingStats := false
-	if sp := tracing.SpanFromContext(flowCtx.EvalCtx.Ctx()); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
 		collectingStats = true
 	}
 
-	neededRightCols := jr.neededRightCols()
-	set, err := getIndexColSet(jr.index, jr.colIdxMap)
-	if err != nil {
-		return nil, err
-	}
-	if isSecondary && !neededRightCols.SubsetOf(set) {
-		return nil, errors.Errorf("joinreader index does not cover all columns")
+	rightCols := jr.neededRightCols()
+	if isSecondary {
+		set, err := getIndexColSet(jr.index, jr.colIdxMap)
+		if err != nil {
+			return nil, err
+		}
+		if !rightCols.SubsetOf(set) {
+			return nil, errors.Errorf("joinreader index does not cover all columns")
+		}
 	}
 
 	var fetcher row.Fetcher
-	var rightCols util.FastIntSet
-	switch readerType {
-	case indexJoinReaderType:
-		rightCols = jr.Out.NeededColumns()
-	case lookupJoinReaderType:
-		rightCols = neededRightCols
-	default:
-		return nil, errors.Errorf("unsupported joinReaderType")
-	}
-
 	_, _, err = initRowFetcher(
-		flowCtx, &fetcher, &jr.desc, int(spec.IndexIdx), jr.colIdxMap, false, /* reverse */
+		flowCtx, &fetcher, jr.desc, int(spec.IndexIdx), jr.colIdxMap, false, /* reverse */
 		rightCols, false /* isCheck */, jr.EvalCtx.Mon, &jr.alloc, spec.Visibility, spec.LockingStrength,
 		spec.LockingWaitPolicy, sysColDescs, nil, /* virtualColumn */
 	)
@@ -327,7 +322,7 @@ func (jr *joinReader) initJoinReaderStrategy(
 	neededRightCols util.FastIntSet,
 	readerType joinReaderType,
 ) {
-	spanBuilder := span.MakeBuilder(flowCtx.EvalCtx, flowCtx.Codec(), &jr.desc, jr.index)
+	spanBuilder := span.MakeBuilder(flowCtx.EvalCtx, flowCtx.Codec(), jr.desc, jr.index)
 	spanBuilder.SetNeededColumns(neededRightCols)
 
 	var keyToInputRowIndices map[string][]int
@@ -420,22 +415,31 @@ func (jr *joinReader) Spilled() bool {
 func (jr *joinReader) neededRightCols() util.FastIntSet {
 	neededCols := jr.Out.NeededColumns()
 
+	if jr.readerType == indexJoinReaderType {
+		// For index joins, all columns from the left side are not output, so no
+		// shift is needed. Also, onCond is always empty for index joins, so
+		// there is no need to iterate over it either.
+		return neededCols
+	}
+
 	// Get the columns from the right side of the join and shift them over by
 	// the size of the left side so the right side starts at 0.
+	numInputTypes := len(jr.input.OutputTypes())
 	neededRightCols := util.MakeFastIntSet()
 	var lastCol int
-	for i, ok := neededCols.Next(len(jr.inputTypes)); ok; i, ok = neededCols.Next(i + 1) {
-		lastCol = i - len(jr.inputTypes)
+	for i, ok := neededCols.Next(numInputTypes); ok; i, ok = neededCols.Next(i + 1) {
+		lastCol = i - numInputTypes
 		neededRightCols.Add(lastCol)
 	}
 	if jr.outputGroupContinuationForLeftRow {
-		// The lastCol is the bool continuation column and not a right column.
+		// The lastCol is the bool continuation column and not a right
+		// column.
 		neededRightCols.Remove(lastCol)
 	}
 
 	// Add columns needed by OnExpr.
 	for _, v := range jr.onCond.Vars.GetIndexedVars() {
-		rightIdx := v.Idx - len(jr.inputTypes)
+		rightIdx := v.Idx - numInputTypes
 		if rightIdx >= 0 {
 			neededRightCols.Add(rightIdx)
 		}
@@ -577,7 +581,8 @@ func (jr *joinReader) readInput() (
 	log.VEventf(jr.Ctx, 1, "scanning %d spans", len(spans))
 	if err := jr.fetcher.StartScan(
 		jr.Ctx, jr.FlowCtx.Txn, spans, jr.shouldLimitBatches, 0, /* limitHint */
-		jr.FlowCtx.TraceKV); err != nil {
+		jr.FlowCtx.TraceKV, jr.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
+	); err != nil {
 		jr.MoveToDraining(err)
 		return jrStateUnknown, nil, jr.DrainHelper()
 	}

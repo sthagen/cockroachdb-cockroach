@@ -67,6 +67,7 @@ import (
 // - `=foo` means exactly key `foo`
 // - `+foo` means `Key(foo).Next()`
 // - `-foo` means `Key(foo).PrefixEnd()`
+// - `%foo` means `append(LocalRangePrefix, "foo")`
 //
 // Additionally, the pseudo-command `with` enables sharing
 // a group of arguments between multiple commands, for example:
@@ -95,7 +96,12 @@ func TestMVCCHistories(t *testing.T) {
 				if strings.Contains(path, "_disallow_separated") && !DisallowSeparatedIntents {
 					return
 				}
-				if strings.Contains(path, "_allow_separated") && DisallowSeparatedIntents {
+				if strings.Contains(path, "_allow_separated") &&
+					(DisallowSeparatedIntents || enabledSeparatedIntents) {
+					return
+				}
+				if strings.Contains(path, "_enable_separated") &&
+					(DisallowSeparatedIntents || !enabledSeparatedIntents) {
 					return
 				}
 				// We start from a clean slate in every test file.
@@ -1018,6 +1024,8 @@ func toKey(s string) roachpb.Key {
 		return roachpb.Key(s[1:])
 	case len(s) > 0 && s[0] == '-':
 		return roachpb.Key(s[1:]).PrefixEnd()
+	case len(s) > 0 && s[0] == '%':
+		return append(keys.LocalRangePrefix, s[1:]...)
 	default:
 		return roachpb.Key(s)
 	}

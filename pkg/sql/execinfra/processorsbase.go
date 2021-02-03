@@ -575,7 +575,7 @@ const (
 // returned from now on. In this state, the processor is expected to drain its
 // inputs (commonly by using DrainHelper()).
 //
-// If the processor has no input (ProcStateOpts.intputToDrain was not specified
+// If the processor has no input (ProcStateOpts.inputToDrain was not specified
 // at init() time), then we move straight to the StateTrailingMeta.
 //
 // An error can be optionally passed. It will be the first piece of metadata
@@ -893,6 +893,7 @@ func (pb *ProcessorBase) InternalClose() bool {
 		// Reset the context so that any incidental uses after this point do not
 		// access the finished span.
 		pb.Ctx = pb.origCtx
+		pb.EvalCtx.Context = pb.origCtx
 
 		// This prevents Next() from returning more rows.
 		pb.Out.consumerClosed()

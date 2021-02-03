@@ -12,42 +12,29 @@ package colexec
 
 import (
 	"context"
-	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
 )
 
-// spillingQueue is a Queue that uses a fixed-size in-memory circular buffer
-// and spills to disk if spillingQueue.items has no more slots available to hold
-// a reference to an enqueued batch or the allocator reports that more memory
-// than the caller-provided maxMemoryLimit is in use. spillingQueue.items is
-// growing dynamically until the estimated maximum of slots available to the
-// queue based on the memory limit.
-// When spilling to disk, a DiskQueue will be created. When spilling batches to
-// disk, their memory will first be released using the allocator. When batches
-// are read from disk back into memory, that memory will be reclaimed.
-// NOTE: When a batch is returned, that batch's memory will still be tracked
-// using the allocator. Since the memory in use is fixed, a previously returned
-// batch may be overwritten by a batch read from disk. This new batch's memory
-// footprint will replace the footprint of the previously returned batch. Since
-// batches are unsafe for reuse, it is assumed that the previously returned
-// batch is not kept around and thus its referenced memory will be GCed as soon
-// as the batch is updated.
+// spillingQueue is a Queue that uses a fixed-size in-memory circular buffer and
+// spills to disk if the allocator reports that more memory than the
+// caller-provided maxMemoryLimit is in use. spillingQueue.items is growing
+// dynamically.
 type spillingQueue struct {
 	unlimitedAllocator *colmem.Allocator
 	maxMemoryLimit     int64
 
 	typs             []*types.T
 	items            []coldata.Batch
-	maxItemsLen      int
 	curHeadIdx       int
 	curTailIdx       int
 	numInMemoryItems int
@@ -64,6 +51,17 @@ type spillingQueue struct {
 	diskQueueDeselectionScratch coldata.Batch
 	fdSemaphore                 semaphore.Semaphore
 	dequeueScratch              coldata.Batch
+	// lastDequeuedBatchMemUsage is the memory footprint of the last batch
+	// returned by dequeue().
+	//
+	// We track the size instead of the reference to the batch because it is
+	// possible that the caller appends new columns, and the memory footprint of
+	// those columns is registered with the caller's allocator; therefore, if
+	// after the columns have been appended to the last dequeued batch, its
+	// footprint would be higher than what the spilling queue's allocator was
+	// registered with, and we could mistakenly release excessive amount of
+	// memory.
+	lastDequeuedBatchMemUsage int64
 
 	rewindable      bool
 	rewindableState struct {
@@ -87,7 +85,10 @@ type spillingQueue struct {
 
 // spillingQueueInitialItemsLen is the initial capacity of the in-memory buffer
 // of the spilling queues (memory limit permitting).
-const spillingQueueInitialItemsLen = int64(64)
+var spillingQueueInitialItemsLen = int64(util.ConstantWithMetamorphicTestRange(
+	"spilling-queue-initial-len",
+	64 /* defaultValue */, 1 /* min */, 16, /* max */
+))
 
 // NewSpillingQueueArgs encompasses all necessary arguments to newSpillingQueue.
 type NewSpillingQueueArgs struct {
@@ -105,34 +106,15 @@ type NewSpillingQueueArgs struct {
 // If fdSemaphore is nil, no Acquire or Release calls will happen. The caller
 // may want to do this if requesting FDs up front.
 func newSpillingQueue(args *NewSpillingQueueArgs) *spillingQueue {
-	// Reduce the memory limit by what the DiskQueue may need to buffer
-	// writes/reads.
-	memoryLimit := args.MemoryLimit
-	memoryLimit -= int64(args.DiskQueueCfg.BufferSizeBytes)
-	if memoryLimit < 0 {
-		memoryLimit = 0
-	}
-	perItemMem := int64(colmem.EstimateBatchSizeBytes(args.Types, coldata.BatchSize()))
-	// Account for the size of items slice.
-	perItemMem += int64(unsafe.Sizeof(coldata.Batch(nil)))
-	maxItemsLen := memoryLimit / perItemMem
-	if maxItemsLen == 0 {
-		// Make items at least of length 1. Even though batches will spill to disk
-		// directly (this can only happen with a very low memory limit), it's nice
-		// to have at least one item in order to be able to deserialize from disk
-		// into this slice.
-		maxItemsLen = 1
-	}
-	itemsLen := spillingQueueInitialItemsLen
-	if itemsLen > maxItemsLen {
-		itemsLen = maxItemsLen
+	var items []coldata.Batch
+	if args.MemoryLimit > 0 {
+		items = make([]coldata.Batch, spillingQueueInitialItemsLen)
 	}
 	return &spillingQueue{
 		unlimitedAllocator: args.UnlimitedAllocator,
-		maxMemoryLimit:     memoryLimit,
+		maxMemoryLimit:     args.MemoryLimit,
 		typs:               args.Types,
-		items:              make([]coldata.Batch, itemsLen),
-		maxItemsLen:        int(maxItemsLen),
+		items:              items,
 		diskQueueCfg:       args.DiskQueueCfg,
 		fdSemaphore:        args.FDSemaphore,
 		diskAcc:            args.DiskAcc,
@@ -143,6 +125,10 @@ func newSpillingQueue(args *NewSpillingQueueArgs) *spillingQueue {
 // in order to dequeue all enqueued batches all over again. An unlimited
 // allocator must be passed in. The queue will use this allocator to check
 // whether memory usage exceeds the given memory limit and use disk if so.
+//
+// WARNING: when using a rewindable queue all enqueue() operations *must* occur
+// before any dequeue() calls (it is a limitation of
+// colcontainer.RewindableQueue interface).
 func newRewindableSpillingQueue(args *NewSpillingQueueArgs) *spillingQueue {
 	q := newSpillingQueue(args)
 	q.rewindable = true
@@ -152,11 +138,19 @@ func newRewindableSpillingQueue(args *NewSpillingQueueArgs) *spillingQueue {
 // enqueue adds the provided batch to the queue. Zero-length batch needs to be
 // added as the last one.
 //
-// Passed-in batch is deeply copied, so it can safely reused by the caller. The
-// spilling queue coalesces all input tuples into the batches of dynamically
+// Passed-in batch is deeply copied, so it can be safely reused by the caller.
+// The spilling queue coalesces all input tuples into the batches of dynamically
 // increasing capacity when those are kept in-memory. It also performs a
 // deselection step if necessary when adding the batch to the disk queue.
+//
+// The ownership of the batch still lies with the caller, so the caller is
+// responsible for accounting for the memory used by batch (although the
+// spilling queue will account for memory used by the in-memory copies).
 func (q *spillingQueue) enqueue(ctx context.Context, batch coldata.Batch) error {
+	if q.rewindable && q.rewindableState.numItemsDequeued > 0 {
+		return errors.Errorf("attempted to enqueue to rewindable spillingQueue after dequeue has been called")
+	}
+
 	n := batch.Length()
 	if n == 0 {
 		if q.diskQueue != nil {
@@ -169,24 +163,19 @@ func (q *spillingQueue) enqueue(ctx context.Context, batch coldata.Batch) error 
 	q.testingKnobs.numEnqueues++
 
 	alreadySpilled := q.numOnDiskItems > 0
-	memoryLimitReached := q.unlimitedAllocator.Used() > q.maxMemoryLimit
-	maxItemsLenReached := q.numInMemoryItems == len(q.items) && q.numInMemoryItems == q.maxItemsLen
+	memoryLimitReached := q.unlimitedAllocator.Used() > q.maxMemoryLimit || q.maxMemoryLimit <= 0
 	maxInMemEnqueuesExceeded := q.testingKnobs.maxNumBatchesEnqueuedInMemory != 0 && q.testingKnobs.numEnqueues > q.testingKnobs.maxNumBatchesEnqueuedInMemory
-	if alreadySpilled || memoryLimitReached || maxItemsLenReached || maxInMemEnqueuesExceeded {
+	if alreadySpilled || memoryLimitReached || maxInMemEnqueuesExceeded {
 		// In this case, one of the following conditions is true:
 		// 1. the tail of the queue might also already be on disk, in which case
 		//    that is where the batch must be enqueued to maintain order
 		// 2. there is not enough memory available to keep this batch in memory
-		// 3. the in-memory circular buffer has no slots available (we do an
-		//    initial estimate of how many batches would fit into the buffer,
-		//    which might be wrong)
-		// 4. we reached the testing limit on the number of items added to the
+		// 3. we reached the testing limit on the number of items added to the
 		//    in-memory buffer
 		// so we have to add batch to the disk queue.
 		if err := q.maybeSpillToDisk(ctx); err != nil {
 			return err
 		}
-		q.unlimitedAllocator.ReleaseBatch(batch)
 		if sel := batch.Selection(); sel != nil {
 			// We need to perform the deselection since the disk queue
 			// ignores the selection vectors.
@@ -217,13 +206,11 @@ func (q *spillingQueue) enqueue(ctx context.Context, batch coldata.Batch) error 
 	}
 
 	if q.numInMemoryItems == len(q.items) {
-		// We need to reallocate the items slice, and we still have the capacity
-		// for it (meaning q.numInMemoryItems < q.maxItemsLen).
-		newItemsLen := q.numInMemoryItems * 2
-		if newItemsLen > q.maxItemsLen {
-			newItemsLen = q.maxItemsLen
-		}
-		newItems := make([]coldata.Batch, newItemsLen)
+		// We need to reallocate the items slice. Note that actually we might
+		// reach the memory limit before we fill up the newly allocated slice,
+		// in which case we will start adding incoming batches to the disk queue
+		// (condition 2. from above).
+		newItems := make([]coldata.Batch, q.numInMemoryItems*2)
 		if q.curHeadIdx < q.curTailIdx {
 			copy(newItems, q.items[q.curHeadIdx:q.curTailIdx])
 		} else {
@@ -318,8 +305,25 @@ func (q *spillingQueue) enqueue(ctx context.Context, batch coldata.Batch) error 
 	return nil
 }
 
+// dequeue returns the next batch from the queue which is valid only until the
+// next call to dequeue(). The memory usage of the returned batch is still
+// retained by the spilling queue's allocator, so the caller doesn't have to be
+// concerned with memory management.
+//
+// If the spilling queue is rewindable, the batch *cannot* be modified
+// (otherwise, after rewind(), the queue will contain the corrupted data).
+//
+// If the spilling queue is not rewindable, the caller is free to modify the
+// batch.
 func (q *spillingQueue) dequeue(ctx context.Context) (coldata.Batch, error) {
 	if q.empty() {
+		if (!q.rewindable || q.numOnDiskItems != 0) && q.lastDequeuedBatchMemUsage != 0 {
+			// We need to release the memory used by the last dequeued batch in
+			// all cases except for when that batch came from the in-memory
+			// buffer of the rewindable queue.
+			q.unlimitedAllocator.ReleaseMemory(q.lastDequeuedBatchMemUsage)
+			q.lastDequeuedBatchMemUsage = 0
+		}
 		return coldata.ZeroBatch, nil
 	}
 
@@ -335,11 +339,17 @@ func (q *spillingQueue) dequeue(ctx context.Context) (coldata.Batch, error) {
 		// up until a new file region is loaded (which will overwrite the memory of
 		// the previous batches), but Dequeue calls are already amortized, so this
 		// is acceptable.
-		// Release a batch to make space for a new batch from disk.
-		if q.dequeueScratch != nil {
-			q.unlimitedAllocator.ReleaseBatch(q.dequeueScratch)
-		} else {
+		if q.dequeueScratch == nil {
+			// In order to have precise memory accounting, we use the following
+			// scheme for the newly allocated dequeueScratch.
+			// 1. a new batch is allocated, its estimated memory usage is
+			//    registered with the allocator
+			// 2. we release the batch's memory right away so that the estimate
+			//    is unregistered
+			// 3. once the actual data is dequeued from disk into the batch, we
+			//    update the allocator with the actual memory usage.
 			q.dequeueScratch = q.unlimitedAllocator.NewMemBatchWithFixedCapacity(q.typs, coldata.BatchSize())
+			q.unlimitedAllocator.ReleaseMemory(colmem.GetBatchMemSize(q.dequeueScratch))
 		}
 		ok, err := q.diskQueue.Dequeue(ctx, q.dequeueScratch)
 		if err != nil {
@@ -350,30 +360,44 @@ func (q *spillingQueue) dequeue(ctx context.Context) (coldata.Batch, error) {
 			// happen, as it should have been caught by the q.empty() check above.
 			colexecerror.InternalError(errors.AssertionFailedf("disk queue was not empty but failed to dequeue element in spillingQueue"))
 		}
-		// Account for this batch's memory.
-		q.unlimitedAllocator.RetainBatch(q.dequeueScratch)
+		// Release the memory used by the batch returned on the previous call
+		// to dequeue() since that batch is no longer valid. Note that it
+		// doesn't matter whether that previous batch came from the in-memory
+		// buffer or from the disk queue since in the former case the reference
+		// to the batch is lost and in the latter case we've just reused the
+		// batch to Dequeue() from disk into it.
+		q.unlimitedAllocator.ReleaseMemory(q.lastDequeuedBatchMemUsage)
+		q.lastDequeuedBatchMemUsage = colmem.GetBatchMemSize(q.dequeueScratch)
+		q.unlimitedAllocator.AdjustMemoryUsage(q.lastDequeuedBatchMemUsage)
 		if q.rewindable {
 			q.rewindableState.numItemsDequeued++
-			return q.dequeueScratch, nil
+		} else {
+			q.numOnDiskItems--
 		}
-		q.numOnDiskItems--
-		q.numInMemoryItems++
-		q.items[q.curTailIdx] = q.dequeueScratch
-		q.curTailIdx++
-		if q.curTailIdx == len(q.items) {
-			q.curTailIdx = 0
-		}
+		return q.dequeueScratch, nil
 	}
 
 	res := q.items[q.curHeadIdx]
+	if q.rewindable {
+		// Note that in case of a rewindable queue we do not update the memory
+		// accounting since all of the batches in the in-memory buffer are still
+		// kept.
+		q.rewindableState.numItemsDequeued++
+	} else {
+		// Release the reference to the batch eagerly.
+		q.items[q.curHeadIdx] = nil
+		// Release the memory used by the batch returned on the previous call
+		// to dequeue() since that batch is no longer valid. Since res came from
+		// the in-memory buffer, the previous batch must have come from the
+		// in-memory buffer too and we released the reference to it on the
+		// previous call.
+		q.unlimitedAllocator.ReleaseMemory(q.lastDequeuedBatchMemUsage)
+		q.lastDequeuedBatchMemUsage = colmem.GetBatchMemSize(res)
+		q.numInMemoryItems--
+	}
 	q.curHeadIdx++
 	if q.curHeadIdx == len(q.items) {
 		q.curHeadIdx = 0
-	}
-	if q.rewindable {
-		q.rewindableState.numItemsDequeued++
-	} else {
-		q.numInMemoryItems--
 	}
 	return res, nil
 }
@@ -413,6 +437,47 @@ func (q *spillingQueue) maybeSpillToDisk(ctx context.Context) error {
 	// Only assign q.diskQueue if there was no error, otherwise the returned value
 	// may be non-nil but invalid.
 	q.diskQueue = diskQueue
+	// Decrease the memory limit by the amount the disk queue will use to buffer
+	// writes/reads.
+	q.maxMemoryLimit -= int64(q.diskQueueCfg.BufferSizeBytes)
+	// We are definitely exceeding the memory limit now, so we will move as many
+	// batches from the tail of the in-memory buffer onto the disk queue as
+	// needed to satisfy the limit again.
+	//
+	// queueTailToMove will contain the batches from the tail of the queue to
+	// move to disk. The batches are in the reversed order (i.e the last, second
+	// to last, third to last, etc).
+	//
+	// Note that if the queue is rewindable, then dequeue() hasn't been called
+	// yet (otherwise, an assertion in enqueue() would have fired), so we don't
+	// need to concern ourselves with the rewindable state.
+	var queueTailToMove []coldata.Batch
+	for q.numInMemoryItems > 0 && q.unlimitedAllocator.Used() > q.maxMemoryLimit {
+		tailBatchIdx := q.curTailIdx - 1
+		if tailBatchIdx < 0 {
+			tailBatchIdx = len(q.items) - 1
+		}
+		tailBatch := q.items[tailBatchIdx]
+		queueTailToMove = append(queueTailToMove, tailBatch)
+		q.items[tailBatchIdx] = nil
+		// We will release the memory a bit early (before enqueueing to the disk
+		// queue) since it simplifies the calculation of how many batches should
+		// be moved.
+		q.unlimitedAllocator.ReleaseMemory(colmem.GetBatchMemSize(tailBatch))
+		q.numInMemoryItems--
+		q.curTailIdx--
+		if q.curTailIdx < 0 {
+			q.curTailIdx = len(q.items) - 1
+		}
+	}
+	for i := len(queueTailToMove) - 1; i >= 0; i-- {
+		// Note that these batches definitely do not have selection vectors
+		// since the deselection is performed during the copying in enqueue().
+		if err := q.diskQueue.Enqueue(ctx, queueTailToMove[i]); err != nil {
+			return err
+		}
+		q.numOnDiskItems++
+	}
 	return nil
 }
 
@@ -439,6 +504,7 @@ func (q *spillingQueue) close(ctx context.Context) error {
 		if q.fdSemaphore != nil {
 			q.fdSemaphore.Release(q.numFDsOpenAtAnyGivenTime())
 		}
+		q.maxMemoryLimit += int64(q.diskQueueCfg.BufferSizeBytes)
 		q.closed = true
 		return nil
 	}
@@ -455,6 +521,7 @@ func (q *spillingQueue) rewind() error {
 		}
 	}
 	q.curHeadIdx = 0
+	q.lastDequeuedBatchMemUsage = 0
 	q.rewindableState.numItemsDequeued = 0
 	return nil
 }
@@ -470,6 +537,7 @@ func (q *spillingQueue) reset(ctx context.Context) {
 	q.curHeadIdx = 0
 	q.curTailIdx = 0
 	q.nextInMemBatchCapacity = 0
+	q.lastDequeuedBatchMemUsage = 0
 	q.rewindableState.numItemsDequeued = 0
 	q.testingKnobs.numEnqueues = 0
 }

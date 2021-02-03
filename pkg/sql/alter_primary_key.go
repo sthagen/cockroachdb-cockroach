@@ -14,7 +14,6 @@ import (
 	"context"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -32,13 +31,9 @@ func (p *planner) AlterPrimaryKey(
 	ctx context.Context, tableDesc *tabledesc.Mutable, alterPKNode *tree.AlterTableAlterPrimaryKey,
 ) error {
 	if alterPKNode.Interleave != nil {
-		p.BufferClientNotice(
-			ctx,
-			errors.WithIssueLink(
-				pgnotice.Newf("interleaved tables and indexes are deprecated in 20.2 and will be removed in 21.2"),
-				errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
-			),
-		)
+		if err := interleavedTableDeprecationAction(p.RunParams(ctx)); err != nil {
+			return err
+		}
 	}
 
 	if alterPKNode.Sharded != nil {
@@ -109,7 +104,7 @@ func (p *planner) AlterPrimaryKey(
 			if err != nil {
 				return err
 			}
-			sb.WriteString(childTable.Name)
+			sb.WriteString(childTable.GetName())
 		}
 		sb.WriteString("]")
 		return errors.Newf(
@@ -217,6 +212,27 @@ func (p *planner) AlterPrimaryKey(
 	// date foreign key representations on old tables.
 	if err := p.MaybeUpgradeDependentOldForeignKeyVersionTables(ctx, tableDesc); err != nil {
 		return err
+	}
+
+	// If we are using PARTITION ALL BY, copy the partitioning over when inheriting the new index.
+	if tableDesc.IsPartitionAllBy() {
+		partitionBy, err := partitionByFromTableDesc(p.ExecCfg().Codec, tableDesc)
+		if err != nil {
+			return err
+		}
+		if partitionBy != nil {
+			*newPrimaryIndexDesc, err = CreatePartitioning(
+				ctx,
+				p.ExecCfg().Settings,
+				p.EvalContext(),
+				tableDesc,
+				*newPrimaryIndexDesc,
+				partitionBy,
+			)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	// Create a new index that indexes everything the old primary index

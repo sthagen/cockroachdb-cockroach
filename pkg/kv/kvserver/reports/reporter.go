@@ -115,7 +115,7 @@ func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
 		stats.frequencyMu.changeCh = make(chan struct{})
 		stats.frequencyMu.interval = ReporterInterval.Get(&stats.settings.SV)
 	})
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "stats-reporter", func(ctx context.Context) {
 		var timer timeutil.Timer
 		defer timer.Stop()
 		ctx = logtags.AddTag(ctx, "replication-reporter", nil /* value */)
@@ -265,7 +265,7 @@ func (stats *Reporter) meta1LeaseHolderStore(ctx context.Context) *kvserver.Stor
 	if err != nil {
 		log.Fatalf(ctx, "unexpected error when visiting stores: %s", err)
 	}
-	if repl.OwnsValidLease(ctx, store.Clock().Now()) {
+	if repl.OwnsValidLease(ctx, store.Clock().NowAsClockTimestamp()) {
 		return store
 	}
 	return nil

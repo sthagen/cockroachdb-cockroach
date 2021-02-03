@@ -23,6 +23,7 @@ import (
 // pick up the right packages when run within the bazel sandbox.
 var (
 	_ = typeconv.DatumVecCanonicalTypeFamily
+	_ = types.BoolFamily
 )
 
 // buildFromLeftInput builds part of the output of a cross join that comes from
@@ -1270,7 +1271,6 @@ func (b *crossJoinerBase) buildFromLeftInput(ctx context.Context, destStartIdx i
 				}
 				// We have processed all tuples in the current batch from the
 				// buffered group, so we need to dequeue the next one.
-				b.left.unlimitedAllocator.ReleaseBatch(currentBatch)
 				currentBatch, err = b.left.tuples.dequeue(ctx)
 				if err != nil {
 					colexecerror.InternalError(err)
@@ -1625,7 +1625,6 @@ func (b *crossJoinerBase) buildFromRightInput(ctx context.Context, destStartIdx 
 					}
 					// We have fully processed the current batch, so we need to
 					// get the next one.
-					b.right.unlimitedAllocator.ReleaseBatch(currentBatch)
 					currentBatch, err = b.right.tuples.dequeue(ctx)
 					if err != nil {
 						colexecerror.InternalError(err)

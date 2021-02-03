@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
+	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
 )
 
 // TestingKnobs groups testing knobs for the Server.
@@ -38,7 +38,7 @@ type TestingKnobs struct {
 	// ContextTestingKnobs allows customization of the RPC context testing knobs.
 	ContextTestingKnobs rpc.ContextTestingKnobs
 	// DiagnosticsTestingKnobs allows customization of diagnostics testing knobs.
-	DiagnosticsTestingKnobs diagnosticspb.TestingKnobs
+	DiagnosticsTestingKnobs diagnostics.TestingKnobs
 
 	// If set, use this listener for RPC (and possibly SQL, depending on
 	// the SplitListenSQL setting), instead of binding a new listener.
@@ -80,6 +80,9 @@ type TestingKnobs struct {
 	// StickyEngineRegistry manages the lifecycle of sticky in memory engines,
 	// which can be enabled via base.StoreSpec.StickyInMemoryEngineID.
 	StickyEngineRegistry StickyInMemEnginesRegistry
+	// Clock Source used to an inject a custom clock for testing the server. It is
+	// typically either an hlc.HybridManualClock or hlc.ManualClock.
+	ClockSource func() int64
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

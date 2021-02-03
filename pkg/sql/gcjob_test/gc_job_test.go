@@ -172,6 +172,7 @@ func TestSchemaChangeGCJob(t *testing.T) {
 				DescriptorIDs: descpb.IDs{myTableID},
 				Details:       details,
 				Progress:      jobspb.SchemaChangeGCProgress{},
+				RunningStatus: sql.RunningStatusWaitingGC,
 				NonCancelable: true,
 			}
 
@@ -184,14 +185,14 @@ func TestSchemaChangeGCJob(t *testing.T) {
 			}
 
 			resultsCh := make(chan tree.Datums)
-			job, _, err := jobRegistry.CreateAndStartJob(ctx, resultsCh, jobRecord)
+			job, err := jobRegistry.CreateAndStartJob(ctx, resultsCh, jobRecord)
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			// Check that the job started.
 			jobIDStr := strconv.Itoa(int(*job.ID()))
-			if err := jobutils.VerifySystemJob(t, sqlDB, 0, jobspb.TypeSchemaChangeGC, jobs.StatusRunning, lookupJR); err != nil {
+			if err := jobutils.VerifyRunningSystemJob(t, sqlDB, 0, jobspb.TypeSchemaChangeGC, sql.RunningStatusWaitingGC, lookupJR); err != nil {
 				t.Fatal(err)
 			}
 
@@ -280,12 +281,14 @@ SELECT parent_id, table_id
 	// Now we should be able to find our GC job
 	var jobID int64
 	var status jobs.Status
+	var runningStatus jobs.RunningStatus
 	sqlDB.QueryRow(t, `
-SELECT job_id, status
+SELECT job_id, status, running_status
   FROM crdb_internal.jobs
  WHERE description LIKE 'GC for DROP TABLE db.public.foo';
-`).Scan(&jobID, &status)
+`).Scan(&jobID, &status, &runningStatus)
 	require.Equal(t, jobs.StatusRunning, status)
+	require.Equal(t, sql.RunningStatusWaitingGC, runningStatus)
 
 	// Manually delete the table.
 	require.NoError(t, kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -341,9 +344,9 @@ func TestGCResumer(t *testing.T) {
 		}
 
 		resultsCh := make(chan tree.Datums)
-		sj, errCh, err := jobRegistry.CreateAndStartJob(ctx, resultsCh, record)
+		sj, err := jobRegistry.CreateAndStartJob(ctx, resultsCh, record)
 		require.NoError(t, err)
-		require.NoError(t, <-errCh)
+		require.NoError(t, sj.AwaitCompletion(ctx))
 		job, err := jobRegistry.LoadJob(ctx, *sj.ID())
 		require.NoError(t, err)
 		st, err := job.CurrentStatus(ctx)
@@ -368,12 +371,12 @@ func TestGCResumer(t *testing.T) {
 		}
 
 		resultsCh := make(chan tree.Datums)
-		sj, errCh, err := jobRegistry.CreateAndStartJob(ctx, resultsCh, record)
+		sj, err := jobRegistry.CreateAndStartJob(ctx, resultsCh, record)
 		require.NoError(t, err)
 
 		_, err = sqlDB.Exec("ALTER RANGE tenants CONFIGURE ZONE USING gc.ttlseconds = 1;")
 		require.NoError(t, err)
-		require.NoError(t, <-errCh)
+		require.NoError(t, sj.AwaitCompletion(ctx))
 
 		job, err := jobRegistry.LoadJob(ctx, *sj.ID())
 		require.NoError(t, err)
@@ -403,8 +406,8 @@ func TestGCResumer(t *testing.T) {
 		}
 
 		resultsCh := make(chan tree.Datums)
-		_, errCh, err := jobRegistry.CreateAndStartJob(ctx, resultsCh, record)
+		sj, err := jobRegistry.CreateAndStartJob(ctx, resultsCh, record)
 		require.NoError(t, err)
-		require.Error(t, <-errCh)
+		require.Error(t, sj.AwaitCompletion(ctx))
 	})
 }

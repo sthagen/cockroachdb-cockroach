@@ -1897,6 +1897,10 @@ calculated, the result is transformed back into a Geography with SRID 4326.</p>
 </span></td></tr>
 <tr><td><a name="st_linestringfromwkb"></a><code>st_linestringfromwkb(wkb: <a href="bytes.html">bytes</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB (or EWKB) representation with an SRID. If the shape underneath is not LineString, NULL is returned.</p>
 </span></td></tr>
+<tr><td><a name="st_linesubstring"></a><code>st_linesubstring(linestring: geometry, start_fraction: <a href="decimal.html">decimal</a>, end_fraction: <a href="decimal.html">decimal</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Return a linestring being a substring of the input one starting and ending at the given fractions of total 2D length. Second and third arguments are float8 values between 0 and 1.</p>
+</span></td></tr>
+<tr><td><a name="st_linesubstring"></a><code>st_linesubstring(linestring: geometry, start_fraction: <a href="float.html">float</a>, end_fraction: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Return a linestring being a substring of the input one starting and ending at the given fractions of total 2D length. Second and third arguments are float8 values between 0 and 1.</p>
+</span></td></tr>
 <tr><td><a name="st_longestline"></a><code>st_longestline(geometry_a: geometry, geometry_b: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the LineString corresponds to the max distance across every pair of points comprising the given geometries.</p>
 <p>Note if geometries are the same, it will return the LineString with the maximum distance between the geometry’s vertexes. The function will return the longest line that was discovered first when comparing maximum distances if more than one is found.</p>
 </span></td></tr>
@@ -2146,6 +2150,8 @@ SELECT ST_S2Covering(geometry, ‘s2_max_level=15,s2_level_mod=3’).</p>
 <p>Those going in the same direction are in the first element of the collection,
 those going in the opposite direction are in the second element.
 The paths themselves are given in the direction of the first geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_shiftlongitude"></a><code>st_shiftlongitude(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified version of a geometry in which the longitude (X coordinate) of each point is incremented by 360 if it is &lt;0 and decremented by 360 if it is &gt;180. The result is only meaningful if the coordinates are in longitude/latitude.</p>
 </span></td></tr>
 <tr><td><a name="st_shortestline"></a><code>st_shortestline(geometry_a: geometry, geometry_b: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the LineString corresponds to the minimum distance across every pair of points comprising the given geometries.</p>
 <p>Note if geometries are the same, it will return the LineString with the minimum distance between the geometry’s vertexes. The function will return the shortest line that was discovered first when comparing minimum distances if more than one is found.</p>

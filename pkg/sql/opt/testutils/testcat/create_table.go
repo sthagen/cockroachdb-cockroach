@@ -11,6 +11,7 @@
 package testcat
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"sort"
@@ -118,8 +119,8 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 			"rowid",
 			cat.Ordinary,
 			types.Int,
-			false,              /* nullable */
-			true,               /* hidden */
+			false, /* nullable */
+			cat.Hidden,
 			&uniqueRowIDString, /* defaultExpr */
 			nil,                /* computedExpr */
 		)
@@ -146,9 +147,9 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		cat.System,
 		colinfo.MVCCTimestampColumnType,
 		true, /* nullable */
-		true, /* hidden */
-		nil,  /* defaultExpr */
-		nil,  /* computedExpr */
+		cat.Hidden,
+		nil, /* defaultExpr */
+		nil, /* computedExpr */
 	)
 	tab.Columns = append(tab.Columns, mvcc)
 
@@ -275,9 +276,9 @@ func (tc *Catalog) createVirtualTable(stmt *tree.CreateTable) *Table {
 		cat.Ordinary,
 		types.Int,
 		false, /* nullable */
-		true,  /* hidden */
-		nil,   /* defaultExpr */
-		nil,   /* computedExpr */
+		cat.Hidden,
+		nil, /* defaultExpr */
+		nil, /* computedExpr */
 	)
 
 	tab.Columns = []cat.Column{pk}
@@ -330,8 +331,8 @@ func (tc *Catalog) CreateTableAs(name tree.TableName, columns []cat.Column) *Tab
 		"rowid",
 		cat.Ordinary,
 		types.Int,
-		false,              /* nullable */
-		true,               /* hidden */
+		false, /* nullable */
+		cat.Hidden,
 		&uniqueRowIDString, /* defaultExpr */
 		nil,                /* computedExpr */
 	)
@@ -500,7 +501,7 @@ func (tt *Table) addUniqueConstraint(
 
 	// We didn't find an existing constraint, so add a new one.
 	u := UniqueConstraint{
-		name:           string(name),
+		name:           tt.makeUniqueConstraintName(name, columns),
 		tabID:          tt.TabID,
 		columnOrdinals: cols,
 		withoutIndex:   withoutIndex,
@@ -516,14 +517,20 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 
 	name := def.Name
 	kind := cat.Ordinary
+	visibility := cat.Visible
 
-	// Look for name suffixes indicating this is a mutation column.
-	if n, ok := extractWriteOnlyColumn(def); ok {
+	// Look for name suffixes indicating this is a special column.
+	if n, ok := extractInaccessibleColumn(def); ok {
+		name = n
+		visibility = cat.Inaccessible
+	} else if n, ok := extractWriteOnlyColumn(def); ok {
 		name = n
 		kind = cat.WriteOnly
+		visibility = cat.Inaccessible
 	} else if n, ok := extractDeleteOnlyColumn(def); ok {
 		name = n
 		kind = cat.DeleteOnly
+		visibility = cat.Inaccessible
 	}
 
 	var defaultExpr, computedExpr *string
@@ -545,7 +552,7 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 			name,
 			typ,
 			nullable,
-			false, /* hidden */
+			visibility,
 			*computedExpr,
 		)
 	} else {
@@ -556,7 +563,7 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 			kind,
 			typ,
 			nullable,
-			false, /* hidden */
+			visibility,
 			defaultExpr,
 			computedExpr,
 		)
@@ -765,6 +772,20 @@ func (tt *Table) makeIndexName(defName tree.Name, typ indexType) string {
 	return name
 }
 
+func (tt *Table) makeUniqueConstraintName(defName tree.Name, columns tree.IndexElemList) string {
+	name := string(defName)
+	if name == "" {
+		var buf bytes.Buffer
+		buf.WriteString("unique")
+		for i := range columns {
+			buf.WriteRune('_')
+			buf.WriteString(string(columns[i].Column))
+		}
+		name = buf.String()
+	}
+	return name
+}
+
 func (tt *Table) addFamily(def *tree.FamilyTableDef) {
 	// Synthesize name if one was not provided.
 	name := string(def.Name)
@@ -862,7 +883,7 @@ func columnForIndexElemExpr(tt *Table, expr tree.Expr) cat.Column {
 		name,
 		typ,
 		true, /* nullable */
-		true, /* hidden */
+		cat.Hidden,
 		exprStr,
 	)
 	tt.Columns = append(tt.Columns, col)
@@ -912,6 +933,13 @@ func (tt *Table) addPrimaryColumnIndex(colName string) {
 		Columns: tree.IndexElemList{{Column: tree.Name(colName), Direction: tree.Ascending}},
 	}
 	tt.addIndex(&def, primaryIndex)
+}
+
+func extractInaccessibleColumn(def *tree.ColumnTableDef) (name tree.Name, ok bool) {
+	if !strings.HasSuffix(string(def.Name), ":inaccessible") {
+		return "", false
+	}
+	return tree.Name(strings.TrimSuffix(string(def.Name), ":inaccessible")), true
 }
 
 func extractWriteOnlyColumn(def *tree.ColumnTableDef) (name tree.Name, ok bool) {

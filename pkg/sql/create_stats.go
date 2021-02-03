@@ -21,10 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -135,12 +135,12 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 		telemetry.Inc(sqltelemetry.CreateStatisticsUseCounter)
 	}
 
-	job, errCh, err := n.p.ExecCfg().JobRegistry.CreateAndStartJob(ctx, resultsCh, *record)
+	job, err := n.p.ExecCfg().JobRegistry.CreateAndStartJob(ctx, resultsCh, *record)
 	if err != nil {
 		return err
 	}
 
-	if err = <-errCh; err != nil {
+	if err := job.AwaitCompletion(ctx); err != nil {
 		if errors.Is(err, stats.ConcurrentCreateStatsError) {
 			// Delete the job so users don't see it and get confused by the error.
 			const stmt = `DELETE FROM system.jobs WHERE id = $1`
@@ -150,14 +150,15 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 				log.Warningf(ctx, "failed to delete job: %v", delErr)
 			}
 		}
+		return err
 	}
-	return err
+	return nil
 }
 
 // makeJobRecord creates a CreateStats job record which can be used to plan and
 // execute statistics creation.
 func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, error) {
-	var tableDesc *tabledesc.Immutable
+	var tableDesc catalog.TableDescriptor
 	var fqTableName string
 	var err error
 	switch t := n.Table.(type) {
@@ -269,7 +270,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		Details: jobspb.CreateStatsDetails{
 			Name:            string(n.Name),
 			FQTableName:     fqTableName,
-			Table:           tableDesc.TableDescriptor,
+			Table:           *tableDesc.TableDesc(),
 			ColumnStats:     colStats,
 			Statement:       eventLogStatement,
 			AsOf:            asOf,
@@ -301,7 +302,7 @@ const maxNonIndexCols = 100
 // other columns from the table. We only collect histograms for index columns,
 // plus any other boolean or enum columns (where the "histogram" is tiny).
 func createStatsDefaultColumns(
-	desc *tabledesc.Immutable, multiColEnabled bool,
+	desc catalog.TableDescriptor, multiColEnabled bool,
 ) ([]jobspb.CreateStatsDetails_ColStat, error) {
 	colStats := make([]jobspb.CreateStatsDetails_ColStat, 0, len(desc.ActiveIndexes()))
 
@@ -426,8 +427,8 @@ func createStatsDefaultColumns(
 
 	// Add all remaining columns in the table, up to maxNonIndexCols.
 	nonIdxCols := 0
-	for i := 0; i < len(desc.Columns) && nonIdxCols < maxNonIndexCols; i++ {
-		col := &desc.Columns[i]
+	for i := 0; i < len(desc.GetPublicColumns()) && nonIdxCols < maxNonIndexCols; i++ {
+		col := &desc.GetPublicColumns()[i]
 		colList := []descpb.ColumnID{col.ID}
 
 		if !trackStatsIfNotExists(colList) {
@@ -473,9 +474,7 @@ type createStatsResumer struct {
 var _ jobs.Resumer = &createStatsResumer{}
 
 // Resume is part of the jobs.Resumer interface.
-func (r *createStatsResumer) Resume(
-	ctx context.Context, execCtx interface{}, resultsCh chan<- tree.Datums,
-) error {
+func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	p := execCtx.(JobExecContext)
 	details := r.job.Details().(jobspb.CreateStatsDetails)
 	if details.Name == stats.AutoStatsName {
@@ -568,9 +567,12 @@ func (r *createStatsResumer) Resume(
 			evalCtx.SessionData.User(),
 			evalCtx.SessionData.ApplicationName,
 			details.Statement,
+			nil, /* no placeholders known at this point */
 			&eventpb.CreateStatistics{
 				TableName: details.FQTableName,
-			})
+			},
+			true, /* writeToEventLog */
+		)
 	})
 }
 

@@ -70,6 +70,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
@@ -111,6 +112,10 @@ type SQLServer struct {
 	// connManager is the connection manager to use to set up additional
 	// SQL listeners in AcceptClients().
 	connManager netutil.Server
+
+	// set to true when the server has started accepting client conns.
+	// Used by health checks.
+	acceptingClients syncutil.AtomicBool
 }
 
 // sqlServerOptionalKVArgs are the arguments supplied to newSQLServer which are
@@ -132,7 +137,7 @@ type sqlServerOptionalKVArgs struct {
 	// To register blob and DistSQL servers.
 	grpcServer *grpc.Server
 	// For the temporaryObjectCleaner.
-	isMeta1Leaseholder func(context.Context, hlc.Timestamp) (bool, error)
+	isMeta1Leaseholder func(context.Context, hlc.ClockTimestamp) (bool, error)
 	// DistSQL, lease management, and others want to know the node they're on.
 	nodeIDContainer *base.SQLIDContainer
 
@@ -295,6 +300,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		cfg.stopper,
 		cfg.LeaseManagerConfig,
 	)
+	cfg.registry.AddMetricStruct(leaseMgr.MetricsStruct())
 
 	rootSQLMetrics := sql.MakeBaseMemMetrics("root", cfg.HistogramWindowInterval())
 	cfg.registry.AddMetricStruct(rootSQLMetrics)
@@ -374,10 +380,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		Executor:       cfg.circularInternalExecutor,
 		RPCContext:     cfg.rpcContext,
 		Stopper:        cfg.stopper,
-
-		LatencyGetter: &serverpb.LatencyGetter{
-			NodesStatusServer: &cfg.nodesStatusServer,
-		},
 
 		TempStorage:     tempEngine,
 		TempStoragePath: cfg.TempStorageConfig.Path,
@@ -598,6 +600,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	}
 	distSQLServer.ServerConfig.SessionBoundInternalExecutorFactory = ieFactory
 	jobRegistry.SetSessionBoundInternalExecutorFactory(ieFactory)
+	execCfg.IndexBackfiller = sql.NewIndexBackfiller(execCfg, ieFactory)
 
 	distSQLServer.ServerConfig.ProtectedTimestampProvider = execCfg.ProtectedTimestampProvider
 
@@ -643,25 +646,22 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		leaseMgr,
 	)
 
-	var reporter *diagnostics.Reporter
-	if cfg.tenantConnect != nil {
-		reporter = &diagnostics.Reporter{
-			StartTime:     timeutil.Now(),
-			AmbientCtx:    &cfg.AmbientCtx,
-			Config:        cfg.BaseConfig.Config,
-			Settings:      cfg.Settings,
-			ClusterID:     cfg.rpcContext.ClusterID.Get,
-			TenantID:      cfg.rpcContext.TenantID,
-			SQLInstanceID: cfg.nodeIDContainer.SQLInstanceID,
-			SQLServer:     pgServer.SQLServer,
-			InternalExec:  cfg.circularInternalExecutor,
-			DB:            cfg.db,
-			Recorder:      cfg.recorder,
-			Locality:      cfg.Locality,
-		}
-		if cfg.TestingKnobs.Server != nil {
-			reporter.TestingKnobs = &cfg.TestingKnobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs
-		}
+	reporter := &diagnostics.Reporter{
+		StartTime:     timeutil.Now(),
+		AmbientCtx:    &cfg.AmbientCtx,
+		Config:        cfg.BaseConfig.Config,
+		Settings:      cfg.Settings,
+		ClusterID:     cfg.rpcContext.ClusterID.Get,
+		TenantID:      cfg.rpcContext.TenantID,
+		SQLInstanceID: cfg.nodeIDContainer.SQLInstanceID,
+		SQLServer:     pgServer.SQLServer,
+		InternalExec:  cfg.circularInternalExecutor,
+		DB:            cfg.db,
+		Recorder:      cfg.recorder,
+		Locality:      cfg.Locality,
+	}
+	if cfg.TestingKnobs.Server != nil {
+		reporter.TestingKnobs = &cfg.TestingKnobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs
 	}
 
 	return &SQLServer{

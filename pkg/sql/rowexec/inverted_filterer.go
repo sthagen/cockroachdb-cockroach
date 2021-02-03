@@ -15,7 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedidx"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -82,7 +81,7 @@ func newInvertedFilterer(
 		input:          input,
 		invertedColIdx: spec.InvertedColIdx,
 		invertedEval: batchedInvertedExprEvaluator{
-			exprs: []*invertedexpr.SpanExpressionProto{&spec.InvertedExpr},
+			exprs: []*inverted.SpanExpressionProto{&spec.InvertedExpr},
 		},
 	}
 
@@ -124,7 +123,7 @@ func newInvertedFilterer(
 		ifr.diskMonitor,
 	)
 
-	if sp := tracing.SpanFromContext(flowCtx.EvalCtx.Ctx()); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
 		ifr.input = newInputStatCollector(ifr.input)
 		ifr.ExecStatsForTrace = ifr.execStatsForTrace
 	}
@@ -149,7 +148,10 @@ func newInvertedFilterer(
 	// de-duping. It will reduce the container memory/disk by 2x.
 
 	// Prepare inverted evaluator for later evaluation.
-	ifr.invertedEval.init()
+	_, err := ifr.invertedEval.init()
+	if err != nil {
+		return nil, err
+	}
 
 	return ifr, nil
 }
@@ -245,7 +247,7 @@ func (ifr *invertedFilterer) readInput() (invertedFiltererState, *execinfrapb.Pr
 		}
 		enc = []byte(*row[ifr.invertedColIdx].Datum.(*tree.DBytes))
 	}
-	if _, err = ifr.invertedEval.prepareAddIndexRow(enc); err != nil {
+	if _, err = ifr.invertedEval.prepareAddIndexRow(enc, nil /* encFull */); err != nil {
 		ifr.MoveToDraining(err)
 		return ifrStateUnknown, ifr.DrainHelper()
 	}

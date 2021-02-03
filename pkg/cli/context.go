@@ -125,11 +125,17 @@ type cliContext struct {
 	// is, the commands executed are extremely likely to be *input* from
 	// a human user: the standard input is a terminal and `-e` was not
 	// used (the shell has a prompt).
+	//
+	// Refer to README.md to understand the general design guidelines for
+	// CLI utilities with interactive vs non-interactive input.
 	isInteractive bool
 
 	// terminalOutput indicates whether output is going to a terminal,
 	// that is, it is not going to a file, another program for automated
 	// processing, etc.: the standard output is a terminal.
+	//
+	// Refer to README.md to understand the general design guidelines for
+	// CLI utilities with terminal vs non-terminal output.
 	terminalOutput bool
 
 	// tableDisplayFormat indicates how to format result tables.
@@ -180,6 +186,9 @@ type cliContext struct {
 	// that no log directory was specified and there were multiple
 	// on-disk stores.
 	ambiguousLogDir bool
+
+	// For `cockroach version --build-tag`.
+	showVersionUsingOnlyBuildTag bool
 }
 
 // cliCtx captures the command-line parameters common to most CLI utilities.
@@ -220,6 +229,7 @@ func setCliContextDefaults() {
 	cliCtx.ambiguousLogDir = false
 	// TODO(knz): Deprecated in v21.1. Remove this.
 	cliCtx.deprecatedLogOverrides.reset()
+	cliCtx.showVersionUsingOnlyBuildTag = false
 }
 
 // sqlCtx captures the configuration of the `sql` command.

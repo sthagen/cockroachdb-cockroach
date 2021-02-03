@@ -732,7 +732,7 @@ func (tt *Table) UniqueCount() int {
 }
 
 // Unique is part of the cat.Table interface.
-func (tt *Table) Unique(i int) cat.UniqueConstraint {
+func (tt *Table) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
 	return &tt.uniqueConstraints[i]
 }
 
@@ -942,6 +942,11 @@ func (ti *Index) PartitionByListPrefixes() []tree.Datums {
 		}
 	}
 	return res
+}
+
+// ImplicitPartitioningColumnCount is part of the cat.Index interface.
+func (ti *Index) ImplicitPartitioningColumnCount() int {
+	return 0
 }
 
 // InterleaveAncestorCount is part of the cat.Index interface.

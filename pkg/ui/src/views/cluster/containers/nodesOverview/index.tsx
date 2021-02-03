@@ -28,15 +28,8 @@ import { LocalSetting } from "src/redux/localsettings";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import { LongToMoment } from "src/util/convert";
 import { INodeStatus, MetricConstants } from "src/util/proto";
-import {
-  ColumnsConfig,
-  Table,
-  Text,
-  TextTypes,
-  Tooltip,
-  Badge,
-  BadgeProps,
-} from "src/components";
+import { Text, TextTypes, Tooltip, Badge, BadgeProps } from "src/components";
+import { ColumnsConfig, Table } from "@cockroachlabs/cluster-ui";
 import { Percentage } from "src/util/format";
 import { FixLong } from "src/util/fixLong";
 import { getNodeLocalityTiers } from "src/util/localities";
@@ -160,6 +153,14 @@ const getBadgeTypeByNodeStatus = (
     default:
       return switchExhaustiveCheck(status);
   }
+};
+
+// getLivenessStatusName truncates the prefix for status name to keep only
+// status name ("NODE_STATUS_LIVE" -> "LIVE").
+export const getLivenessStatusName = (status: LivenessStatus): string => {
+  const prefix = "NODE_STATUS_";
+  const statusKey = LivenessStatus[status];
+  return statusKey.replace(prefix, "");
 };
 
 const NodeNameColumn: React.FC<{
@@ -290,7 +291,7 @@ export class NodeList extends React.Component<LiveNodeListProps> {
     },
     {
       key: "numCpus",
-      title: <CPUsTooltip>CPUs</CPUsTooltip>,
+      title: <CPUsTooltip>vCPUs</CPUsTooltip>,
       dataIndex: "numCpus",
       sorter: true,
       className: "column--align-right",
@@ -329,7 +330,7 @@ export class NodeList extends React.Component<LiveNodeListProps> {
             tooltipText = getStatusDescription(record.status);
             break;
           default:
-            badgeText = LivenessStatus[record.status];
+            badgeText = getLivenessStatusName(record.status);
             tooltipText = getStatusDescription(record.status);
             break;
         }

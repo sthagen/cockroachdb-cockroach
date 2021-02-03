@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -222,13 +223,9 @@ func (n *createTableNode) startExec(params runParams) error {
 
 	if n.n.Interleave != nil {
 		telemetry.Inc(sqltelemetry.CreateInterleavedTableCounter)
-		params.p.BufferClientNotice(
-			params.ctx,
-			errors.WithIssueLink(
-				pgnotice.Newf("interleaved tables and indexes are deprecated in 20.2 and will be removed in 21.2"),
-				errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
-			),
-		)
+		if err := interleavedTableDeprecationAction(params); err != nil {
+			return err
+		}
 	}
 	if n.n.Persistence.IsTemporary() {
 		telemetry.Inc(sqltelemetry.CreateTempTableCounter)
@@ -251,10 +248,12 @@ func (n *createTableNode) startExec(params runParams) error {
 
 	// Warn against creating non-partitioned indexes on a partitioned table,
 	// which is undesirable in most cases.
+	// Avoid the warning if we have PARTITION ALL BY as all indexes will implicitly
+	// have relevant partitioning columns prepended at the front.
 	if n.n.PartitionByTable.ContainsPartitions() {
 		for _, def := range n.n.Defs {
 			if d, ok := def.(*tree.IndexTableDef); ok {
-				if d.PartitionByIndex == nil {
+				if d.PartitionByIndex == nil && !n.n.PartitionByTable.All {
 					params.p.BufferClientNotice(
 						params.ctx,
 						errors.WithHint(
@@ -363,8 +362,6 @@ func (n *createTableNode) startExec(params runParams) error {
 		return err
 	}
 
-	// TODO(otan): for MR databases with no locality set, set a default locality
-	// and add a notice.
 	if desc.LocalityConfig != nil {
 		dbDesc, err := params.p.Descriptors().GetImmutableDatabaseByID(
 			params.ctx,
@@ -375,11 +372,13 @@ func (n *createTableNode) startExec(params runParams) error {
 		if err != nil {
 			return errors.Wrap(err, "error resolving database for multi-region")
 		}
-		if err := params.p.applyZoneConfigFromTableLocalityConfig(
+		if err := applyZoneConfigForMultiRegionTable(
 			params.ctx,
-			n.n.Table,
-			*desc.LocalityConfig,
+			params.p.txn,
+			params.p.ExecCfg(),
 			*dbDesc.RegionConfig,
+			desc,
+			applyZoneConfigForMultiRegionTableOptionTableAndIndexes,
 		); err != nil {
 			return err
 		}
@@ -419,7 +418,7 @@ func (n *createTableNode) startExec(params runParams) error {
 				params.ctx,
 				params.p.txn,
 				params.ExecCfg().Codec,
-				desc.ImmutableCopy().(*tabledesc.Immutable),
+				desc.ImmutableCopy().(catalog.TableDescriptor),
 				desc.Columns,
 				params.p.alloc)
 			if err != nil {
@@ -597,6 +596,94 @@ func (p *planner) MaybeUpgradeDependentOldForeignKeyVersionTables(
 	return nil
 }
 
+// addUniqueWithoutIndexColumnTableDef runs various checks on the given
+// ColumnTableDef before adding it as a UNIQUE WITHOUT INDEX constraint to the
+// given table descriptor.
+func addUniqueWithoutIndexColumnTableDef(
+	ctx context.Context,
+	evalCtx *tree.EvalContext,
+	sessionData *sessiondata.SessionData,
+	d *tree.ColumnTableDef,
+	desc *tabledesc.Mutable,
+	ts TableState,
+	validationBehavior tree.ValidationBehavior,
+) error {
+	if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.UniqueWithoutIndexConstraints) {
+		return pgerror.Newf(pgcode.FeatureNotSupported,
+			"version %v must be finalized to use UNIQUE WITHOUT INDEX",
+			clusterversion.UniqueWithoutIndexConstraints)
+	}
+	if !sessionData.EnableUniqueWithoutIndexConstraints {
+		return pgerror.New(pgcode.FeatureNotSupported,
+			"unique constraints without an index are not yet supported",
+		)
+	}
+	// Add a unique constraint.
+	if err := ResolveUniqueWithoutIndexConstraint(
+		ctx, desc, string(d.Unique.ConstraintName), []string{string(d.Name)}, ts, validationBehavior,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+// addUniqueWithoutIndexTableDef runs various checks on the given
+// UniqueConstraintTableDef before adding it as a UNIQUE WITHOUT INDEX
+// constraint to the given table descriptor.
+func addUniqueWithoutIndexTableDef(
+	ctx context.Context,
+	evalCtx *tree.EvalContext,
+	sessionData *sessiondata.SessionData,
+	d *tree.UniqueConstraintTableDef,
+	desc *tabledesc.Mutable,
+	ts TableState,
+	validationBehavior tree.ValidationBehavior,
+) error {
+	if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.UniqueWithoutIndexConstraints) {
+		return pgerror.Newf(pgcode.FeatureNotSupported,
+			"version %v must be finalized to use UNIQUE WITHOUT INDEX",
+			clusterversion.UniqueWithoutIndexConstraints)
+	}
+	if !sessionData.EnableUniqueWithoutIndexConstraints {
+		return pgerror.New(pgcode.FeatureNotSupported,
+			"unique constraints without an index are not yet supported",
+		)
+	}
+	if len(d.Storing) > 0 {
+		return pgerror.New(pgcode.FeatureNotSupported,
+			"unique constraints without an index cannot store columns",
+		)
+	}
+	if d.Interleave != nil {
+		return pgerror.New(pgcode.FeatureNotSupported,
+			"interleaved unique constraints without an index are not supported",
+		)
+	}
+	if d.PartitionByIndex.ContainsPartitions() {
+		return pgerror.New(pgcode.FeatureNotSupported,
+			"partitioned unique constraints without an index are not supported",
+		)
+	}
+	if d.Predicate != nil {
+		// TODO(rytaft): It may be necessary to support predicates so that partial
+		// unique indexes will work correctly in multi-region deployments.
+		return pgerror.New(pgcode.FeatureNotSupported,
+			"unique constraints with a predicate but without an index are not supported",
+		)
+	}
+	// Add a unique constraint.
+	colNames := make([]string, len(d.Columns))
+	for i := range colNames {
+		colNames[i] = string(d.Columns[i].Column)
+	}
+	if err := ResolveUniqueWithoutIndexConstraint(
+		ctx, desc, string(d.Name), colNames, ts, validationBehavior,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
 // ResolveUniqueWithoutIndexConstraint looks up the columns mentioned in a
 // UNIQUE WITHOUT INDEX constraint and adds metadata representing that
 // constraint to the descriptor.
@@ -671,11 +758,7 @@ func ResolveUniqueWithoutIndexConstraint(
 	if ts == NewTable {
 		tbl.UniqueWithoutIndexConstraints = append(tbl.UniqueWithoutIndexConstraints, uc)
 	} else {
-		// TODO(rytaft): call AddUniqueConstraintMutation and remove the error
-		//  below.
-		return errors.AssertionFailedf(
-			"resolving unique constraints on existing tables not yet supported",
-		)
+		tbl.AddUniqueWithoutIndexMutation(&uc, descpb.DescriptorMutation_ADD)
 	}
 
 	return nil
@@ -742,9 +825,11 @@ func ResolveFK(
 	}
 	if target.ParentID != tbl.ParentID {
 		if !allowCrossDatabaseFKs.Get(&evalCtx.Settings.SV) {
-			return pgerror.Newf(pgcode.InvalidForeignKey,
-				"foreign references between databases are not allowed (see the '%s' cluster setting)",
-				allowCrossDatabaseFKsSetting,
+			return errors.WithHintf(
+				pgerror.Newf(pgcode.InvalidForeignKey,
+					"foreign references between databases are not allowed (see the '%s' cluster setting)",
+					allowCrossDatabaseFKsSetting),
+				crossDBReferenceDeprecationHint(),
 			)
 		}
 	}
@@ -783,11 +868,19 @@ func ResolveFK(
 	}
 
 	referencedColNames := d.ToCols
-	// If no columns are specified, attempt to default to PK.
+	// If no columns are specified, attempt to default to PK, ignoring implicit columns.
 	if len(referencedColNames) == 0 {
-		referencedColNames = make(tree.NameList, target.GetPrimaryIndex().NumColumns())
-		for i := range referencedColNames {
-			referencedColNames[i] = tree.Name(target.GetPrimaryIndex().GetColumnName(i))
+		numImplicitCols := int(target.GetPrimaryIndex().GetPartitioning().NumImplicitColumns)
+		referencedColNames = make(
+			tree.NameList,
+			0,
+			target.GetPrimaryIndex().NumColumns()-numImplicitCols,
+		)
+		for i := numImplicitCols; i < target.GetPrimaryIndex().NumColumns(); i++ {
+			referencedColNames = append(
+				referencedColNames,
+				tree.Name(target.GetPrimaryIndex().GetColumnName(i)),
+			)
 		}
 	}
 
@@ -1088,7 +1181,7 @@ func addInterleave(
 	}
 
 	intl := descpb.InterleaveDescriptor_Ancestor{
-		TableID:         parentTable.ID,
+		TableID:         parentTable.GetID(),
 		IndexID:         parentIndex.GetID(),
 		SharedPrefixLen: uint32(parentIndex.NumColumns()),
 	}
@@ -1153,23 +1246,30 @@ func (p *planner) finalizeInterleave(
 	return nil
 }
 
-// CreatePartitioning constructs the partitioning descriptor for an index that
-// is partitioned into ranges, each addressable by zone configs.
+// CreatePartitioning returns a new index descriptor with partitioning fields
+// populated to align with the tree.PartitionBy clause.
 func CreatePartitioning(
 	ctx context.Context,
 	st *cluster.Settings,
 	evalCtx *tree.EvalContext,
 	tableDesc *tabledesc.Mutable,
-	indexDesc *descpb.IndexDescriptor,
-	numImplicitColumns int,
+	indexDesc descpb.IndexDescriptor,
 	partBy *tree.PartitionBy,
-) (descpb.PartitioningDescriptor, error) {
+) (descpb.IndexDescriptor, error) {
 	if partBy == nil {
-		// No CCL necessary if we're looking at PARTITION BY NOTHING.
-		return descpb.PartitioningDescriptor{}, nil
+		if indexDesc.Partitioning.NumImplicitColumns > 0 {
+			return indexDesc, unimplemented.Newf(
+				"ALTER ... PARTITION BY NOTHING",
+				"cannot alter to PARTITION BY NOTHING if the object has implicit column partitioning",
+			)
+		}
+		// No CCL necessary if we're looking at PARTITION BY NOTHING - we can
+		// set the partitioning to nothing.
+		indexDesc.Partitioning = descpb.PartitioningDescriptor{}
+		return indexDesc, nil
 	}
 	return CreatePartitioningCCL(
-		ctx, st, evalCtx, tableDesc, indexDesc, numImplicitColumns, partBy,
+		ctx, st, evalCtx, tableDesc, indexDesc, partBy,
 	)
 }
 
@@ -1180,11 +1280,10 @@ var CreatePartitioningCCL = func(
 	st *cluster.Settings,
 	evalCtx *tree.EvalContext,
 	tableDesc *tabledesc.Mutable,
-	indexDesc *descpb.IndexDescriptor,
-	numImplicitColumns int,
+	indexDesc descpb.IndexDescriptor,
 	partBy *tree.PartitionBy,
-) (descpb.PartitioningDescriptor, error) {
-	return descpb.PartitioningDescriptor{}, sqlerrors.NewCCLRequiredError(errors.New(
+) (descpb.IndexDescriptor, error) {
+	return descpb.IndexDescriptor{}, sqlerrors.NewCCLRequiredError(errors.New(
 		"creating or manipulating partitions requires a CCL binary"))
 }
 
@@ -1257,7 +1356,11 @@ func newTableDescIfAs(
 		for _, colRes := range resultColumns {
 			var d *tree.ColumnTableDef
 			var ok bool
-			var tableDef tree.TableDef = &tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colRes.Typ}
+			var tableDef tree.TableDef = &tree.ColumnTableDef{
+				Name:   tree.Name(colRes.Name),
+				Type:   colRes.Typ,
+				Hidden: colRes.Hidden,
+			}
 			if d, ok = tableDef.(*tree.ColumnTableDef); !ok {
 				return nil, errors.Errorf("failed to cast type to ColumnTableDef\n")
 			}
@@ -1313,6 +1416,7 @@ func NewTableDesc(
 	st *cluster.Settings,
 	n *tree.CreateTable,
 	parentID, parentSchemaID, id descpb.ID,
+	regionEnumID descpb.ID,
 	creationTime hlc.Timestamp,
 	privileges *descpb.PrivilegeDescriptor,
 	affected map[descpb.ID]*tabledesc.Mutable,
@@ -1347,6 +1451,163 @@ func NewTableDesc(
 		if version.IsActive(clusterversion.EmptyArraysInInvertedIndexes) {
 			indexEncodingVersion = descpb.EmptyArraysInInvertedIndexesVersion
 		}
+	}
+
+	// Add implied columns under REGIONAL BY ROW.
+	locality := n.Locality
+	var partitionAllBy *tree.PartitionBy
+	if locality != nil && locality.LocalityLevel == tree.LocalityLevelRow {
+		// TODO(#59629): consider decoupling implicit column partitioning from the
+		// REGIONAL BY ROW experimental flag.
+		if !evalCtx.SessionData.ImplicitColumnPartitioningEnabled {
+			return nil, errors.WithHint(
+				pgerror.New(
+					pgcode.FeatureNotSupported,
+					"REGIONAL BY ROW is currently experimental",
+				),
+				"to enable, use SET experimental_enable_implicit_column_partitioning = true",
+			)
+		}
+
+		// Check the table is multi-region enabled.
+		dbDesc, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, evalCtx.Codec, parentID)
+		if err != nil {
+			return nil, err
+		}
+		if !dbDesc.IsMultiRegion() {
+			return nil, pgerror.Newf(
+				pgcode.InvalidTableDefinition,
+				"cannot set LOCALITY on a database that is not multi-region enabled",
+			)
+		}
+
+		regionalByRowCol := tree.RegionalByRowRegionDefaultColName
+		if n.Locality.RegionalByRowColumn != "" {
+			regionalByRowCol = n.Locality.RegionalByRowColumn
+		}
+
+		// Check PARTITION BY is not set on any column definition.
+		if n.PartitionByTable.ContainsPartitioningClause() {
+			return nil, pgerror.New(
+				pgcode.FeatureNotSupported,
+				"REGIONAL BY ROW on a TABLE containing PARTITION BY is not supported",
+			)
+		}
+
+		// Check PARTITION BY is not set on anything partitionable, and also check
+		// for the existence of the column to partition by.
+		regionalByRowColExists := false
+		for _, def := range n.Defs {
+			switch d := def.(type) {
+			case *tree.ColumnTableDef:
+				if d.Name == regionalByRowCol {
+					regionalByRowColExists = true
+					t, err := tree.ResolveType(ctx, d.Type, vt)
+					if err != nil {
+						return nil, errors.Wrap(err, "error resolving REGIONAL BY ROW column type")
+					}
+					if t.Oid() != typedesc.TypeIDToOID(dbDesc.RegionConfig.RegionEnumID) {
+						err = pgerror.Newf(
+							pgcode.InvalidTableDefinition,
+							"cannot use column %s which has type %s in REGIONAL BY ROW AS",
+							d.Name,
+							t.SQLString(),
+						)
+						if t, terr := vt.ResolveTypeByOID(
+							ctx,
+							typedesc.TypeIDToOID(dbDesc.RegionConfig.RegionEnumID),
+						); terr == nil {
+							err = errors.WithDetailf(
+								err,
+								"REGIONAL BY ROW AS must reference a column of type %s.",
+								t.Name(),
+							)
+						}
+						return nil, err
+					}
+				}
+			case *tree.IndexTableDef:
+				if d.PartitionByIndex.ContainsPartitioningClause() {
+					return nil, pgerror.New(
+						pgcode.FeatureNotSupported,
+						"REGIONAL BY ROW on a table with an INDEX containing PARTITION BY is not supported",
+					)
+				}
+			case *tree.UniqueConstraintTableDef:
+				if d.PartitionByIndex.ContainsPartitioningClause() {
+					return nil, pgerror.New(
+						pgcode.FeatureNotSupported,
+						"REGIONAL BY ROW on a table with an UNIQUE constraint containing PARTITION BY is not supported",
+					)
+				}
+			}
+		}
+
+		if n.Locality.RegionalByRowColumn == "" {
+			// Implicitly create REGIONAL BY ROW column if no AS ... was defined.
+			if regionalByRowColExists {
+				return nil, errors.WithHintf(
+					pgerror.Newf(
+						pgcode.InvalidTableDefinition,
+						`cannot specify %s column in REGIONAL BY ROW table as the column is implicitly created by the system`,
+						regionalByRowCol.String(),
+					),
+					"Use LOCALITY REGIONAL BY ROW AS %s instead.",
+					regionalByRowCol.String(),
+				)
+			}
+			oid := typedesc.TypeIDToOID(dbDesc.RegionConfig.RegionEnumID)
+			// TODO(#59630): set the column visibility to be hidden.
+			c := &tree.ColumnTableDef{
+				Name: tree.RegionalByRowRegionDefaultColName,
+				Type: &tree.OIDTypeReference{OID: oid},
+			}
+			c.Nullable.Nullability = tree.NotNull
+			c.DefaultExpr.Expr = &tree.CastExpr{
+				Expr: &tree.FuncExpr{
+					Func: tree.WrapFunction("gateway_region"),
+				},
+				Type:       &tree.OIDTypeReference{OID: oid},
+				SyntaxMode: tree.CastShort,
+			}
+			n.Defs = append(n.Defs, c)
+			columnDefaultExprs = append(columnDefaultExprs, nil)
+		} else if !regionalByRowColExists {
+			return nil, pgerror.Newf(
+				pgcode.UndefinedColumn,
+				"column %s in REGIONAL BY ROW AS does not exist",
+				regionalByRowCol.String(),
+			)
+		}
+
+		// Construct the partitioning for the PARTITION ALL BY.
+		listPartition := make([]tree.ListPartition, len(dbDesc.RegionConfig.Regions))
+		for i, region := range dbDesc.RegionConfig.Regions {
+			listPartition[i] = tree.ListPartition{
+				Name:  tree.UnrestrictedName(region.Name),
+				Exprs: tree.Exprs{tree.NewStrVal(string(region.Name))},
+			}
+		}
+
+		desc.PartitionAllBy = true
+		partitionAllBy = &tree.PartitionBy{
+			Fields: tree.NameList{regionalByRowCol},
+			List:   listPartition,
+		}
+	}
+
+	if n.PartitionByTable.ContainsPartitioningClause() && n.PartitionByTable.All {
+		if !evalCtx.SessionData.ImplicitColumnPartitioningEnabled {
+			return nil, errors.WithHint(
+				pgerror.New(
+					pgcode.FeatureNotSupported,
+					"PARTITION ALL BY LIST/RANGE is currently experimental",
+				),
+				"to enable, use SET experimental_enable_implicit_column_partitioning = true",
+			)
+		}
+		desc.PartitionAllBy = true
+		partitionAllBy = n.PartitionByTable.PartitionBy
 	}
 
 	for i, def := range n.Defs {
@@ -1512,21 +1773,6 @@ func NewTableDesc(
 		return nil
 	}
 
-	var partitionByAll *tree.PartitionBy
-	if n.PartitionByTable != nil && n.PartitionByTable.All {
-		if !evalCtx.SessionData.ImplicitColumnPartitioningEnabled {
-			return nil, errors.WithHint(
-				pgerror.New(
-					pgcode.FeatureNotSupported,
-					"PARTITION ALL BY LIST/RANGE is currently experimental",
-				),
-				"to enable, use SET experimental_enable_implicit_column_partitioning = true",
-			)
-		}
-		desc.PartitionAllBy = true
-		partitionByAll = n.PartitionByTable.PartitionBy
-	}
-
 	idxValidator := schemaexpr.MakeIndexPredicateValidator(ctx, n.Table, &desc, semaCtx)
 	for _, def := range n.Defs {
 		switch d := def.(type) {
@@ -1545,9 +1791,6 @@ func NewTableDesc(
 				Version:          indexEncodingVersion,
 			}
 			if d.Inverted {
-				if !sessionData.EnableMultiColumnInvertedIndexes && len(d.Columns) > 1 {
-					return nil, pgerror.New(pgcode.FeatureNotSupported, "indexing more than one column with an inverted index is not supported")
-				}
 				idx.Type = descpb.IndexDescriptor_INVERTED
 			}
 			if d.Sharded != nil {
@@ -1577,40 +1820,33 @@ func NewTableDesc(
 					idx.GeoConfig = *geoindex.DefaultGeographyIndexConfig()
 				}
 			}
-			if d.PartitionByIndex.ContainsPartitions() || partitionByAll != nil {
-				partitionBy := partitionByAll
-				if partitionByAll == nil {
-					partitionBy = d.PartitionByIndex.PartitionBy
-				} else if d.PartitionByIndex.ContainsPartitions() {
+			if d.PartitionByIndex.ContainsPartitioningClause() || desc.PartitionAllBy {
+				partitionBy := partitionAllBy
+				if !desc.PartitionAllBy {
+					if d.PartitionByIndex.ContainsPartitions() {
+						partitionBy = d.PartitionByIndex.PartitionBy
+					}
+				} else if d.PartitionByIndex.ContainsPartitioningClause() {
 					return nil, pgerror.New(
 						pgcode.FeatureNotSupported,
 						"cannot define PARTITION BY on an index if the table has a PARTITION ALL BY definition",
 					)
 				}
-				var numImplicitColumns int
-				var err error
-				idx, numImplicitColumns, err = detectImplicitPartitionColumns(
-					evalCtx,
-					&desc,
-					idx,
-					partitionBy,
-				)
-				if err != nil {
-					return nil, err
+
+				if partitionBy != nil {
+					var err error
+					idx, err = CreatePartitioning(
+						ctx,
+						st,
+						evalCtx,
+						&desc,
+						idx,
+						partitionBy,
+					)
+					if err != nil {
+						return nil, err
+					}
 				}
-				partitioning, err := CreatePartitioning(
-					ctx,
-					st,
-					evalCtx,
-					&desc,
-					&idx,
-					numImplicitColumns,
-					partitionBy,
-				)
-				if err != nil {
-					return nil, err
-				}
-				idx.Partitioning = partitioning
 			}
 			if d.Predicate != nil {
 				expr, err := idxValidator.Validate(d.Predicate)
@@ -1658,41 +1894,33 @@ func NewTableDesc(
 			if err := idx.FillColumns(d.Columns); err != nil {
 				return nil, err
 			}
-			if d.PartitionByIndex.ContainsPartitions() || partitionByAll != nil {
-				partitionBy := partitionByAll
-				if partitionByAll == nil {
-					partitionBy = d.PartitionByIndex.PartitionBy
-				} else if d.PartitionByIndex.ContainsPartitions() {
+			if d.PartitionByIndex.ContainsPartitioningClause() || desc.PartitionAllBy {
+				partitionBy := partitionAllBy
+				if !desc.PartitionAllBy {
+					if d.PartitionByIndex.ContainsPartitions() {
+						partitionBy = d.PartitionByIndex.PartitionBy
+					}
+				} else if d.PartitionByIndex.ContainsPartitioningClause() {
 					return nil, pgerror.New(
 						pgcode.FeatureNotSupported,
 						"cannot define PARTITION BY on an unique constraint if the table has a PARTITION ALL BY definition",
 					)
 				}
 
-				var numImplicitColumns int
-				var err error
-				idx, numImplicitColumns, err = detectImplicitPartitionColumns(
-					evalCtx,
-					&desc,
-					idx,
-					partitionBy,
-				)
-				if err != nil {
-					return nil, err
+				if partitionBy != nil {
+					var err error
+					idx, err = CreatePartitioning(
+						ctx,
+						st,
+						evalCtx,
+						&desc,
+						idx,
+						partitionBy,
+					)
+					if err != nil {
+						return nil, err
+					}
 				}
-				partitioning, err := CreatePartitioning(
-					ctx,
-					st,
-					evalCtx,
-					&desc,
-					&idx,
-					numImplicitColumns,
-					partitionBy,
-				)
-				if err != nil {
-					return nil, err
-				}
-				idx.Partitioning = partitioning
 			}
 			if d.Predicate != nil {
 				expr, err := idxValidator.Validate(d.Predicate)
@@ -1794,30 +2022,48 @@ func NewTableDesc(
 		}
 	}
 
-	if n.PartitionByTable.ContainsPartitions() {
-		newPrimaryIndex, numImplicitColumns, err := detectImplicitPartitionColumns(
-			evalCtx,
-			&desc,
-			*desc.GetPrimaryIndex().IndexDesc(),
-			n.PartitionByTable.PartitionBy,
-		)
-		if err != nil {
-			return nil, err
+	if n.PartitionByTable.ContainsPartitions() || desc.PartitionAllBy {
+		partitionBy := partitionAllBy
+		if partitionBy == nil {
+			partitionBy = n.PartitionByTable.PartitionBy
 		}
-		partitioning, err := CreatePartitioning(
-			ctx,
-			st,
-			evalCtx,
-			&desc,
-			&newPrimaryIndex,
-			numImplicitColumns,
-			n.PartitionByTable.PartitionBy,
-		)
-		if err != nil {
-			return nil, err
+		// At this point, we could have PARTITION ALL BY NOTHING, so check it is != nil.
+		if partitionBy != nil {
+			newPrimaryIndex, err := CreatePartitioning(
+				ctx,
+				st,
+				evalCtx,
+				&desc,
+				*desc.GetPrimaryIndex().IndexDesc(),
+				partitionBy,
+			)
+			if err != nil {
+				return nil, err
+			}
+			// During CreatePartitioning, implicitly partitioned columns may be
+			// created. AllocateIDs which allocates ExtraColumnIDs to each index
+			// needs to be called before CreatePartitioning as CreatePartitioning
+			// requires IDs to be allocated.
+			//
+			// As such, do a post check for implicitly partitioned columns, and
+			// if they are detected, ensure each index contains the implicitly
+			// partitioned column.
+			if numImplicitCols := newPrimaryIndex.Partitioning.NumImplicitColumns; numImplicitCols > 0 {
+				for _, idx := range desc.AllIndexes() {
+					if idx.GetEncodingType() == descpb.SecondaryIndexEncoding {
+						for _, implicitPrimaryColID := range newPrimaryIndex.ColumnIDs[:numImplicitCols] {
+							if !idx.ContainsColumnID(implicitPrimaryColID) {
+								idx.IndexDesc().ExtraColumnIDs = append(
+									idx.IndexDesc().ExtraColumnIDs,
+									implicitPrimaryColID,
+								)
+							}
+						}
+					}
+				}
+			}
+			desc.SetPrimaryIndex(newPrimaryIndex)
 		}
-		newPrimaryIndex.Partitioning = partitioning
-		desc.SetPrimaryIndex(newPrimaryIndex)
 	}
 
 	// Once all the IDs have been allocated, we can add the Sequence dependencies
@@ -1861,20 +2107,8 @@ func NewTableDesc(
 		switch d := def.(type) {
 		case *tree.ColumnTableDef:
 			if d.Unique.WithoutIndex {
-				if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.UniqueWithoutIndexConstraints) {
-					return nil, pgerror.Newf(pgcode.FeatureNotSupported,
-						"version %v must be finalized to use UNIQUE WITHOUT INDEX",
-						clusterversion.UniqueWithoutIndexConstraints)
-				}
-				if !sessionData.EnableUniqueWithoutIndexConstraints {
-					return nil, pgerror.New(pgcode.FeatureNotSupported,
-						"unique constraints without an index are not yet supported",
-					)
-				}
-				// Add a unique constraint.
-				if err := ResolveUniqueWithoutIndexConstraint(
-					ctx, &desc, string(d.Unique.ConstraintName), []string{string(d.Name)}, NewTable,
-					tree.ValidationDefault,
+				if err := addUniqueWithoutIndexColumnTableDef(
+					ctx, evalCtx, sessionData, d, &desc, NewTable, tree.ValidationDefault,
 				); err != nil {
 					return nil, err
 				}
@@ -1882,45 +2116,8 @@ func NewTableDesc(
 
 		case *tree.UniqueConstraintTableDef:
 			if d.WithoutIndex {
-				if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.UniqueWithoutIndexConstraints) {
-					return nil, pgerror.Newf(pgcode.FeatureNotSupported,
-						"version %v must be finalized to use UNIQUE WITHOUT INDEX",
-						clusterversion.UniqueWithoutIndexConstraints)
-				}
-				if !sessionData.EnableUniqueWithoutIndexConstraints {
-					return nil, pgerror.New(pgcode.FeatureNotSupported,
-						"unique constraints without an index are not yet supported",
-					)
-				}
-				if len(d.Storing) > 0 {
-					return nil, pgerror.New(pgcode.FeatureNotSupported,
-						"unique constraints without an index cannot store columns",
-					)
-				}
-				if d.Interleave != nil {
-					return nil, pgerror.New(pgcode.FeatureNotSupported,
-						"interleaved unique constraints without an index are not supported",
-					)
-				}
-				if d.PartitionByIndex.ContainsPartitions() {
-					return nil, pgerror.New(pgcode.FeatureNotSupported,
-						"partitioned unique constraints without an index are not supported",
-					)
-				}
-				if d.Predicate != nil {
-					// TODO(rytaft): It may be necessary to support predicates so that partial
-					// unique indexes will work correctly in multi-region deployments.
-					return nil, pgerror.New(pgcode.FeatureNotSupported,
-						"unique constraints with a predicate but without an index are not supported",
-					)
-				}
-				// Add a unique constraint.
-				colNames := make([]string, len(d.Columns))
-				for i := range colNames {
-					colNames[i] = string(d.Columns[i].Column)
-				}
-				if err := ResolveUniqueWithoutIndexConstraint(
-					ctx, &desc, string(d.Name), colNames, NewTable, tree.ValidationDefault,
+				if err := addUniqueWithoutIndexTableDef(
+					ctx, evalCtx, sessionData, d, &desc, NewTable, tree.ValidationDefault,
 				); err != nil {
 					return nil, err
 				}
@@ -2002,46 +2199,23 @@ func NewTableDesc(
 		return nil, err
 	}
 
-	if n.Locality != nil {
-		db, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, evalCtx.Codec, parentID)
-		if err != nil {
-			return nil, errors.Wrap(err, "error fetching database descriptor for locality checks")
-		}
-
-		desc.LocalityConfig = &descpb.TableDescriptor_LocalityConfig{}
-		switch n.Locality.LocalityLevel {
-		case tree.LocalityLevelGlobal:
-			desc.LocalityConfig.Locality = &descpb.TableDescriptor_LocalityConfig_Global_{
-				Global: &descpb.TableDescriptor_LocalityConfig_Global{},
-			}
-		case tree.LocalityLevelTable:
-			l := &descpb.TableDescriptor_LocalityConfig_RegionalByTable_{
-				RegionalByTable: &descpb.TableDescriptor_LocalityConfig_RegionalByTable{},
-			}
-			if n.Locality.TableRegion != "" {
-				region := descpb.RegionName(n.Locality.TableRegion)
-				l.RegionalByTable.Region = &region
-			}
-			desc.LocalityConfig.Locality = l
-		case tree.LocalityLevelRow:
-			desc.LocalityConfig.Locality = &descpb.TableDescriptor_LocalityConfig_RegionalByRow_{
-				RegionalByRow: &descpb.TableDescriptor_LocalityConfig_RegionalByRow{},
-			}
-			if n.Locality.RegionalByRowColumn != "" {
-				return nil, unimplemented.New(
-					"REGIONAL BY ROW AS",
-					"REGIONAL BY ROW AS is not yet supported",
-				)
-			}
-		default:
+	if regionEnumID != descpb.InvalidID || n.Locality != nil {
+		if n.Locality == nil {
+			// The absence of a locality on the AST node indicates that the table must
+			// be homed in the primary region.
+			desc.SetTableLocalityRegionalByTable(tree.PrimaryRegionLocalityName)
+		} else if n.Locality.LocalityLevel == tree.LocalityLevelTable {
+			desc.SetTableLocalityRegionalByTable(n.Locality.TableRegion)
+		} else if n.Locality.LocalityLevel == tree.LocalityLevelGlobal {
+			desc.SetTableLocalityGlobal()
+		} else if n.Locality.LocalityLevel == tree.LocalityLevelRow {
+			desc.SetTableLocalityRegionalByRow(n.Locality.RegionalByRowColumn)
+		} else {
 			return nil, errors.Newf("unknown locality level: %v", n.Locality.LocalityLevel)
 		}
 
-		if err := tabledesc.ValidateTableLocalityConfig(
-			n.Table.Table(),
-			desc.LocalityConfig,
-			db,
-		); err != nil {
+		dg := catalogkv.NewOneLevelUncachedDescGetter(txn, evalCtx.Codec)
+		if err := desc.ValidateTableLocalityConfig(ctx, dg); err != nil {
 			return nil, err
 		}
 	}
@@ -2110,6 +2284,20 @@ func newTableDesc(
 		}
 	}
 
+	regionEnumID := descpb.InvalidID
+	dbDesc, err := params.p.Descriptors().GetImmutableDatabaseByID(
+		params.ctx, params.p.txn, parentID, tree.DatabaseLookupFlags{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if dbDesc.IsMultiRegion() {
+		regionEnumID, err = dbDesc.MultiRegionEnumID()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// We need to run NewTableDesc with caching disabled, because
 	// it needs to pull in descriptors from FK depended-on tables
 	// and interleaved parents using their current state in KV.
@@ -2124,6 +2312,7 @@ func newTableDesc(
 			parentID,
 			parentSchemaID,
 			id,
+			regionEnumID,
 			creationTime,
 			privileges,
 			affected,
@@ -2440,53 +2629,4 @@ func CreateInheritedPrivilegesFromDBDesc(
 	privs.SetOwner(user)
 
 	return privs
-}
-
-// detectImplicitPartitionColumns detects implicit partitioning columns
-// and returns a new index descriptor with the implicit columns modified
-// on the index descriptor and the number of implicit columns prepended.
-func detectImplicitPartitionColumns(
-	evalCtx *tree.EvalContext,
-	tableDesc *tabledesc.Mutable,
-	indexDesc descpb.IndexDescriptor,
-	partBy *tree.PartitionBy,
-) (descpb.IndexDescriptor, int, error) {
-	if !evalCtx.SessionData.ImplicitColumnPartitioningEnabled {
-		return indexDesc, 0, nil
-	}
-	seenImplicitColumnNames := map[string]struct{}{}
-	var implicitColumnIDs []descpb.ColumnID
-	var implicitColumns []string
-	var implicitColumnDirections []descpb.IndexDescriptor_Direction
-	// Iterate over each field in the PARTITION BY until it matches the start
-	// of the actual explicitly indexed columns.
-	for _, field := range partBy.Fields {
-		// As soon as the fields match, we have no implicit columns to add.
-		if string(field) == indexDesc.ColumnNames[0] {
-			break
-		}
-
-		col, err := tableDesc.FindActiveColumnByName(string(field))
-		if err != nil {
-			return indexDesc, 0, err
-		}
-		if _, ok := seenImplicitColumnNames[col.Name]; ok {
-			return indexDesc, 0, pgerror.Newf(
-				pgcode.InvalidObjectDefinition,
-				`found multiple definitions in partition using column "%s"`,
-				col.Name,
-			)
-		}
-		seenImplicitColumnNames[col.Name] = struct{}{}
-		implicitColumns = append(implicitColumns, col.Name)
-		implicitColumnIDs = append(implicitColumnIDs, col.ID)
-		implicitColumnDirections = append(implicitColumnDirections, descpb.IndexDescriptor_ASC)
-	}
-
-	if len(implicitColumns) > 0 {
-		indexDesc.ColumnNames = append(implicitColumns, indexDesc.ColumnNames...)
-		indexDesc.ColumnIDs = append(implicitColumnIDs, indexDesc.ColumnIDs...)
-		indexDesc.ColumnDirections = append(implicitColumnDirections, indexDesc.ColumnDirections...)
-	}
-	return indexDesc, len(implicitColumns), nil
 }

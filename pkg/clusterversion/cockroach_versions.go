@@ -158,14 +158,9 @@ const (
 	// NoOriginFKIndexes allows for foreign keys to no longer need indexes on
 	// the origin side of the relationship.
 	NoOriginFKIndexes
-	// ClientRangeInfosOnBatchResponse moves the response RangeInfos from
-	// individual response headers to the batch header.
-	ClientRangeInfosOnBatchResponse
 	// NodeMembershipStatus gates the usage of the MembershipStatus enum in the
 	// Liveness proto. See comment on proto definition for more details.
 	NodeMembershipStatus
-	// RangeStatsRespHasDesc adds the RangeStatsResponse.RangeInfo field.
-	RangeStatsRespHasDesc
 	// MinPasswordLength adds the server.user_login.min_password_length setting.
 	MinPasswordLength
 	// AbortSpanBytes adds a field to MVCCStats
@@ -222,6 +217,8 @@ const (
 	// using the replicated legacy TruncatedState. It's also used in asserting
 	// that no replicated truncated state representation is found.
 	PostTruncatedAndRangeAppliedStateMigration
+	// NewSchemaChanger enables the new schema changer.
+	NewSchemaChanger
 
 	// Step (1): Add new versions here.
 )
@@ -287,16 +284,8 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Version: roachpb.Version{Major: 20, Minor: 1, Internal: 9},
 	},
 	{
-		Key:     ClientRangeInfosOnBatchResponse,
-		Version: roachpb.Version{Major: 20, Minor: 1, Internal: 10},
-	},
-	{
 		Key:     NodeMembershipStatus,
 		Version: roachpb.Version{Major: 20, Minor: 1, Internal: 11},
-	},
-	{
-		Key:     RangeStatsRespHasDesc,
-		Version: roachpb.Version{Major: 20, Minor: 1, Internal: 12},
 	},
 	{
 		Key:     MinPasswordLength,
@@ -368,7 +357,10 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Key:     PostTruncatedAndRangeAppliedStateMigration,
 		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 16},
 	},
-
+	{
+		Key:     NewSchemaChanger,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 18},
+	},
 	// Step (2): Add new versions here.
 })
 

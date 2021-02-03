@@ -59,8 +59,14 @@ type FlowCtx struct {
 	// TraceKV is true if KV tracing was requested by the session.
 	TraceKV bool
 
+	// CollectStats is true if execution stats collection was requested.
+	CollectStats bool
+
 	// Local is true if this flow is being run as part of a local-only query.
 	Local bool
+
+	// Gateway is true if this flow is being run on the gateway node.
+	Gateway bool
 
 	// TypeResolverFactory is used to construct transaction bound TypeResolvers
 	// to resolve type references during flow setup. It is not safe for concurrent

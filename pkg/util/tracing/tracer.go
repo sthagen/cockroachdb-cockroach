@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/logtags"
 	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/petermattis/goid"
 	"golang.org/x/net/trace"
 )
 
@@ -37,8 +38,12 @@ import (
 // and since this string goes on the wire, it's a hassle to change it now.
 const verboseTracingBaggageKey = "sb"
 
-// maxLogsPerSpan limits the number of logs in a Span; use a comfortable limit.
-const maxLogsPerSpan = 1000
+const (
+	// maxLogsPerSpan limits the number of logs in a Span; use a comfortable limit.
+	maxLogsPerSpan = 1000
+	// maxChildrenPerSpan limits the number of (direct) child spans in a Span.
+	maxChildrenPerSpan = 1000
+)
 
 // These constants are used to form keys to represent tracing context
 // information in carriers supporting opentracing.HTTPHeaders format.
@@ -62,31 +67,29 @@ const (
 	modeBackground
 )
 
-// tracingMode informs the creation of noop spans
-// and the default recording mode of created spans.
+// tracingMode informs the creation of noop spans and the default recording mode
+// of created spans.
+//
+// If set to 'background', trace spans will be created for all operations, but
+// these will record sparse structured information, unless an operation
+// explicitly requests the verbose from. It's optimized for low overhead, and
+// powers fine-grained statistics and alerts.
+//
+// If set to 'legacy', trace spans will not be created by default. This is
+// unless an internal code path explicitly requests for it, or if an auxiliary
+// tracer (such as lightstep or zipkin) is configured. This tracing mode always
+// records in the verbose form. Using this mode has two effects: the
+// observability of the cluster may be degraded (as most trace spans are elided)
+// and where trace spans are created, they may consume large amounts of memory.
+//
+// Note that regardless of this setting, configuring an auxiliary trace sink
+// will cause verbose traces to be created for all operations, which may lead to
+// high memory consumption. It is not currently possible to send non-verbose
+// traces to auxiliary sinks.
 var tracingMode = settings.RegisterEnumSetting(
 	"trace.mode",
-	`configures the CockroachDB-internal tracing subsystem.
-
-If set to 'background', trace spans will be created for all operations, but
-these trace spans will only be recording sparse structured information,
-unless an operation explicitly requests verbose recording. This is
-optimized for low overhead, and powers fine-grained statistics and alerts.
-
-If set to 'legacy', trace spans will not be created (unless an
-auxiliary tracer such as Lightstep or Zipkin, is configured, or an
-internal code path explicitly requests a trace to be created) but
-when they are, they record verbose information. This has two effects:
-the observability of the cluster may be degraded (as some trace spans
-are elided) and where trace spans are created, they may consume large
-amounts of memory. This mode should not be used with auxiliary tracing
-sinks as that leads to expensive trace spans being created throughout.
-
-Note that regardless of this setting, configuring an auxiliary
-trace sink will cause verbose traces to be created for all
-operations, which may lead to high memory consumption. It is not
-currently possible to send non-verbose traces to auxiliary sinks.
-`,
+	"if set to 'background', traces will be created for all operations (in"+
+		"'legacy' mode it's created when explicitly requested or when auxiliary tracers are configured)",
 	"legacy",
 	map[int64]string{
 		int64(modeLegacy):     "legacy",
@@ -142,8 +145,9 @@ type Tracer struct {
 	// Pointer to shadowTracer, if using one.
 	shadowTracer unsafe.Pointer
 
-	// activeSpans is a map that references all non-Finish'ed local root spans
-	// (i.e. those for which no WithLocalParent(<non-nil>) option was supplied).
+	// activeSpans is a map that references all non-Finish'ed local root spans,
+	// i.e. those for which no WithLocalParent(<non-nil>) option was supplied.
+	// It also elides spans created using WithBypassRegistry.
 	//
 	// In normal operation, a local root Span is inserted on creation and
 	// removed on .Finish().
@@ -361,6 +365,7 @@ func (t *Tracer) startSpanGeneric(
 		traceID = uint64(rand.Int63())
 	}
 	spanID := uint64(rand.Int63())
+	goroutineID := uint64(goid.Get())
 
 	// Now allocate the main *Span and contained crdbSpan.
 	// Allocate these together to save on individual allocs.
@@ -377,6 +382,7 @@ func (t *Tracer) startSpanGeneric(
 	helper.crdbSpan = crdbSpan{
 		traceID:      traceID,
 		spanID:       spanID,
+		goroutineID:  goroutineID,
 		operation:    opName,
 		startTime:    startTime,
 		parentSpanID: opts.parentSpanID(),
@@ -394,16 +400,16 @@ func (t *Tracer) startSpanGeneric(
 
 	s := &helper.span
 
-	// Start recording if necessary. We inherit the recording type of the local parent, if any,
-	// over the remote parent, if any. If neither are specified, we're not recording.
-	recordingType := opts.recordingType()
-
-	if recordingType != RecordingOff {
+	{
+		// Link the newly created span to the parent, if necessary,
+		// and start recording, if requested.
+		// We inherit the recording type of the local parent, if any,
+		// over the remote parent, if any. If neither are specified, we're not recording.
 		var p *crdbSpan
 		if opts.Parent != nil {
 			p = opts.Parent.crdb
 		}
-		s.crdb.enableRecording(p, recordingType)
+		s.crdb.enableRecording(p, opts.recordingType())
 	}
 
 	// Set initial tags. These will propagate to the crdbSpan, ot, and netTr
@@ -428,11 +434,13 @@ func (t *Tracer) startSpanGeneric(
 			opts.Parent.crdb.mu.Unlock()
 		}
 	} else {
-		// Local root span - put it into the registry of active local root spans.
-		// `Span.Finish` takes care of deleting it again.
-		t.activeSpans.Lock()
-		t.activeSpans.m[s] = struct{}{}
-		t.activeSpans.Unlock()
+		if !opts.BypassRegistry {
+			// Local root span - put it into the registry of active local root
+			// spans. `Span.Finish` takes care of deleting it again.
+			t.activeSpans.Lock()
+			t.activeSpans.m[s] = struct{}{}
+			t.activeSpans.Unlock()
+		}
 
 		if opts.RemoteParent != nil {
 			for k, v := range opts.RemoteParent.Baggage {
@@ -600,7 +608,7 @@ func (t *Tracer) Extract(format interface{}, carrier interface{}) (*SpanMeta, er
 }
 
 // VisitSpans invokes the visitor with all active Spans.
-func (t *Tracer) VisitSpans(visitor func(*Span)) {
+func (t *Tracer) VisitSpans(visitor func(*Span) error) error {
 	t.activeSpans.Lock()
 	sl := make([]*Span, 0, len(t.activeSpans.m))
 	for sp := range t.activeSpans.m {
@@ -609,8 +617,11 @@ func (t *Tracer) VisitSpans(visitor func(*Span)) {
 	t.activeSpans.Unlock()
 
 	for _, sp := range sl {
-		visitor(sp)
+		if err := visitor(sp); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // ForkCtxSpan checks if ctx has a Span open; if it does, it creates a new Span

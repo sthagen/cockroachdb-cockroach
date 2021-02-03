@@ -253,6 +253,7 @@ type zigzagJoiner struct {
 // matched rows are grouped together, but increasing this too much will result
 // in fetching too many rows and therefore skipping less rows.
 var zigzagJoinerBatchSize = int64(util.ConstantWithMetamorphicTestValue(
+	"zig-zag-joiner-batch-size",
 	5, /* defaultValue */
 	1, /* metamorphicValue */
 ))
@@ -283,9 +284,9 @@ func newZigzagJoiner(
 	z := &zigzagJoiner{}
 
 	// TODO(ajwerner): Utilize a cached copy of these tables.
-	tables := make([]tabledesc.Immutable, len(spec.Tables))
+	tables := make([]catalog.TableDescriptor, len(spec.Tables))
 	for i := range spec.Tables {
-		tables[i] = tabledesc.MakeImmutable(spec.Tables[i])
+		tables[i] = tabledesc.NewImmutable(spec.Tables[i])
 	}
 	leftColumnTypes := tables[0].ColumnTypes()
 	rightColumnTypes := tables[1].ColumnTypes()
@@ -337,7 +338,7 @@ func newZigzagJoiner(
 		if err := z.setupInfo(flowCtx, spec, i, colOffset, tables); err != nil {
 			return nil, err
 		}
-		colOffset += len(z.infos[i].table.Columns)
+		colOffset += len(z.infos[i].table.GetPublicColumns())
 	}
 	z.side = 0
 	return z, nil
@@ -373,7 +374,7 @@ func (z *zigzagJoiner) Start(ctx context.Context) context.Context {
 type zigzagJoinerInfo struct {
 	fetcher    row.Fetcher
 	alloc      *rowenc.DatumAlloc
-	table      *tabledesc.Immutable
+	table      catalog.TableDescriptor
 	index      *descpb.IndexDescriptor
 	indexTypes []*types.T
 	indexDirs  []descpb.IndexDescriptor_Direction
@@ -410,13 +411,13 @@ func (z *zigzagJoiner) setupInfo(
 	spec *execinfrapb.ZigzagJoinerSpec,
 	side int,
 	colOffset int,
-	tables []tabledesc.Immutable,
+	tables []catalog.TableDescriptor,
 ) error {
 	z.side = side
 	info := z.infos[side]
 
 	info.alloc = &rowenc.DatumAlloc{}
-	info.table = &tables[side]
+	info.table = tables[side]
 	info.eqColumns = spec.EqColumns[side].Columns
 	indexOrdinal := spec.IndexOrdinals[side]
 	info.index = info.table.ActiveIndexes()[indexOrdinal].IndexDesc()
@@ -427,13 +428,19 @@ func (z *zigzagJoiner) setupInfo(
 	columnTypes := info.table.ColumnTypes()
 	colIdxMap := info.table.ColumnIdxMap()
 	for i, columnID := range columnIDs {
-		info.indexTypes[i] = columnTypes[colIdxMap.GetDefault(columnID)]
+		if info.index.Type == descpb.IndexDescriptor_INVERTED &&
+			columnID == info.index.InvertedColumnID() {
+			// Inverted key columns have type Bytes.
+			info.indexTypes[i] = types.Bytes
+		} else {
+			info.indexTypes[i] = columnTypes[colIdxMap.GetDefault(columnID)]
+		}
 	}
 
 	// Add the outputted columns.
 	neededCols := util.MakeFastIntSet()
 	outCols := z.Out.NeededColumns()
-	maxCol := colOffset + len(info.table.Columns)
+	maxCol := colOffset + len(info.table.GetPublicColumns())
 	for i, ok := outCols.Next(colOffset); ok && i < maxCol; i, ok = outCols.Next(i + 1) {
 		neededCols.Add(i - colOffset)
 	}
@@ -578,7 +585,8 @@ func (z *zigzagJoiner) produceInvertedIndexKey(
 		}
 	}
 
-	keys, err := rowenc.EncodeInvertedIndexKeys(
+	// First encode datums for any non-inverted prefix columns.
+	keyPrefix, err := rowenc.EncodeInvertedIndexPrefixKeys(
 		info.index,
 		colMap,
 		decodedDatums,
@@ -587,9 +595,17 @@ func (z *zigzagJoiner) produceInvertedIndexKey(
 	if err != nil {
 		return roachpb.Span{}, err
 	}
-	if len(keys) != 1 {
-		return roachpb.Span{}, errors.Errorf("%d fixed values passed in for inverted index", len(keys))
+
+	// Add the inverted key, which is already encoded as a DBytes.
+	invOrd, ok := colMap.Get(info.index.InvertedColumnID())
+	if !ok {
+		return roachpb.Span{}, errors.AssertionFailedf("inverted column not found in colMap")
 	}
+	invertedKey, ok := decodedDatums[invOrd].(*tree.DBytes)
+	if !ok {
+		return roachpb.Span{}, errors.AssertionFailedf("inverted key must be type DBytes")
+	}
+	keyPrefix = append(keyPrefix, []byte(*invertedKey)...)
 
 	// Append remaining (non-JSON) datums to the key.
 	keyBytes, _, err := rowenc.EncodeColumns(
@@ -597,7 +613,7 @@ func (z *zigzagJoiner) produceInvertedIndexKey(
 		info.indexDirs[1:],
 		colMap,
 		decodedDatums,
-		keys[0],
+		keyPrefix,
 	)
 	key := roachpb.Key(keyBytes)
 	return roachpb.Span{Key: key, EndKey: key.PrefixEnd()}, err
@@ -637,7 +653,7 @@ func (zi *zigzagJoinerInfo) eqColTypes() []*types.T {
 func (zi *zigzagJoinerInfo) eqOrdering() (colinfo.ColumnOrdering, error) {
 	ordering := make(colinfo.ColumnOrdering, len(zi.eqColumns))
 	for i := range zi.eqColumns {
-		colID := zi.table.Columns[zi.eqColumns[i]].ID
+		colID := zi.table.GetPublicColumns()[zi.eqColumns[i]].ID
 		// Search the index columns, then the primary keys to find an ordering for
 		// the current column, 'colID'.
 		var direction encoding.Direction
@@ -764,6 +780,7 @@ func (z *zigzagJoiner) nextRow(ctx context.Context, txn *kv.Txn) (rowenc.EncDatu
 			true, /* batch limit */
 			zigzagJoinerBatchSize,
 			z.FlowCtx.TraceKV,
+			z.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 		)
 		if err != nil {
 			return nil, err
@@ -908,6 +925,7 @@ func (z *zigzagJoiner) maybeFetchInitialRow() error {
 			true, /* batch limit */
 			zigzagJoinerBatchSize,
 			z.FlowCtx.TraceKV,
+			z.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 		)
 		if err != nil {
 			log.Errorf(z.Ctx, "scan error: %s", err)

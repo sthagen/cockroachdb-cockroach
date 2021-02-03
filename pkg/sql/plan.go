@@ -140,6 +140,7 @@ var _ planNode = &alterIndexNode{}
 var _ planNode = &alterSchemaNode{}
 var _ planNode = &alterSequenceNode{}
 var _ planNode = &alterTableNode{}
+var _ planNode = &alterTableOwnerNode{}
 var _ planNode = &alterTableSetSchemaNode{}
 var _ planNode = &alterTypeNode{}
 var _ planNode = &bufferNode{}
@@ -479,7 +480,7 @@ func startExec(params runParams, plan planNode) error {
 	o := planObserver{
 		enterNode: func(ctx context.Context, _ string, p planNode) (bool, error) {
 			switch p.(type) {
-			case *explainVecNode:
+			case *explainVecNode, *explainDDLNode:
 				// Do not recurse: we're not starting the plan if we just show its structure with EXPLAIN.
 				return false, nil
 			case *showTraceNode:

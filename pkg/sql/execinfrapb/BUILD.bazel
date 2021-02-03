@@ -41,7 +41,6 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
-        "//pkg/ccl/streamingccl/streamclient",  # keep
         "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/security",
@@ -120,7 +119,7 @@ proto_library(
         "//pkg/jobs/jobspb:jobspb_proto",
         "//pkg/roachpb:roachpb_proto",
         "//pkg/sql/catalog/descpb:descpb_proto",
-        "//pkg/sql/opt/invertedexpr:invertedexpr_proto",
+        "//pkg/sql/inverted:inverted_proto",
         "//pkg/sql/pgwire/pgerror:pgerror_proto",
         "//pkg/sql/sessiondatapb:sessiondatapb_proto",
         "//pkg/sql/types:types_proto",
@@ -141,10 +140,11 @@ go_proto_library(
     proto = ":execinfrapb_proto",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/ccl/streamingccl",  # keep
         "//pkg/jobs/jobspb",
         "//pkg/roachpb",
         "//pkg/sql/catalog/descpb",
-        "//pkg/sql/opt/invertedexpr",
+        "//pkg/sql/inverted",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/sessiondatapb",
         "//pkg/sql/types",

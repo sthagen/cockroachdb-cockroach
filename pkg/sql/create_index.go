@@ -12,7 +12,6 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -23,12 +22,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -188,9 +185,6 @@ func MakeIndexDescriptor(
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes can't be unique")
 		}
 
-		if !params.SessionData().EnableMultiColumnInvertedIndexes && len(n.Columns) > 1 {
-			return nil, pgerror.New(pgcode.FeatureNotSupported, "indexing more than one column with an inverted index is not supported")
-		}
 		indexDesc.Type = descpb.IndexDescriptor_INVERTED
 		columnDesc, _, err := tableDesc.FindColumnByName(n.Columns[len(n.Columns)-1].Column)
 		if err != nil {
@@ -372,6 +366,32 @@ func maybeCreateAndAddShardCol(
 	return shardCol, created, nil
 }
 
+var interleavedTableDeprecationError = errors.WithIssueLink(
+	pgnotice.Newf("interleaved tables and interleaved indexes are deprecated in 20.2 and will be removed in 21.2"),
+	errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
+)
+
+var interleavedTableDisabledError = errors.WithIssueLink(
+	pgerror.New(pgcode.WarningDeprecatedFeature,
+		"interleaved tables and interleaved indexes are disabled due to the sql.defaults."+
+			"interleaved_tables.enabled cluster setting. Note that interleaved tables and interleaved indexes will be "+
+			"removed in a future release. For details, see https://www.cockroachlabs.com/docs/releases/v20.2.0#deprecations"),
+	errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
+)
+
+// interleavedTableDeprecationAction either returns an error, if interleaved
+// tables are disabled, or sends a notice, if they're not.
+func interleavedTableDeprecationAction(params runParams) error {
+	if !InterleavedTablesEnabled.Get(params.p.execCfg.SV()) {
+		return interleavedTableDisabledError
+	}
+	params.p.BufferClientNotice(
+		params.ctx,
+		interleavedTableDeprecationError,
+	)
+	return nil
+}
+
 func (n *createIndexNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("index"))
 	foundIndex, err := n.tableDesc.FindIndexWithName(string(n.n.Name))
@@ -394,7 +414,11 @@ func (n *createIndexNode) startExec(params runParams) error {
 
 	// Warn against creating a non-partitioned index on a partitioned table,
 	// which is undesirable in most cases.
-	if n.n.PartitionByIndex == nil && n.tableDesc.GetPrimaryIndex().GetPartitioning().NumColumns > 0 {
+	// Avoid the warning if we have PARTITION ALL BY as all indexes will implicitly
+	// have relevant partitioning columns prepended at the front.
+	if n.n.PartitionByIndex == nil &&
+		n.tableDesc.GetPrimaryIndex().GetPartitioning().NumColumns > 0 &&
+		!n.tableDesc.IsPartitionAllBy() {
 		params.p.BufferClientNotice(
 			params.ctx,
 			errors.WithHint(
@@ -405,13 +429,9 @@ func (n *createIndexNode) startExec(params runParams) error {
 	}
 
 	if n.n.Interleave != nil {
-		params.p.BufferClientNotice(
-			params.ctx,
-			errors.WithIssueLink(
-				pgnotice.Newf("interleaved tables and indexes are deprecated in 20.2 and will be removed in 21.2"),
-				errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
-			),
-		)
+		if err := interleavedTableDeprecationAction(params); err != nil {
+			return err
+		}
 	}
 
 	indexDesc, err := MakeIndexDescriptor(params, n.n, n.tableDesc)
@@ -430,65 +450,14 @@ func (n *createIndexNode) startExec(params runParams) error {
 	}
 	indexDesc.Version = encodingVersion
 
-	var partitionByAll *tree.PartitionBy
-	if n.tableDesc.IsPartitionAllBy() {
-		// Convert the PartitioningDescriptor back into tree.PartitionBy by
-		// re-parsing the SHOW CREATE partitioning statement.
-		// TODO(#multiregion): clean this up by translating the descriptor back into
-		// tree.PartitionBy directly.
-		a := &rowenc.DatumAlloc{}
-		f := tree.NewFmtCtx(tree.FmtSimple)
-		if err := ShowCreatePartitioning(
-			a,
-			params.p.ExecCfg().Codec,
-			n.tableDesc,
-			n.tableDesc.GetPrimaryIndex().IndexDesc(),
-			&n.tableDesc.GetPrimaryIndex().IndexDesc().Partitioning,
-			&f.Buffer,
-			0, /* indent */
-			0, /* colOffset */
-		); err != nil {
-			return errors.Wrap(err, "error recreating PARTITION BY clause for PARTITION ALL BY affected index")
-		}
-		stmt, err := parser.ParseOne(fmt.Sprintf("ALTER TABLE t %s", f.CloseAndGetString()))
-		if err != nil {
-			return errors.Wrap(err, "error recreating PARTITION BY clause for PARTITION ALL BY affected index")
-		}
-		partitionByAll = stmt.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTablePartitionByTable).PartitionByTable.PartitionBy
-	}
-	if n.n.PartitionByIndex.ContainsPartitions() || partitionByAll != nil {
-		partitionBy := partitionByAll
-		if partitionByAll == nil {
-			partitionBy = n.n.PartitionByIndex.PartitionBy
-		} else if n.n.PartitionByIndex.ContainsPartitions() {
-			return pgerror.New(
-				pgcode.FeatureNotSupported,
-				"cannot define PARTITION BY on an index if the table has a PARTITION ALL BY definition",
-			)
-		}
-		newIndexDesc, numImplicitColumns, err := detectImplicitPartitionColumns(
-			params.p.EvalContext(),
-			n.tableDesc,
-			*indexDesc,
-			partitionBy,
-		)
-		if err != nil {
-			return err
-		}
-		indexDesc = &newIndexDesc
-		partitioning, err := CreatePartitioning(
-			params.ctx,
-			params.p.ExecCfg().Settings,
-			params.EvalContext(),
-			n.tableDesc,
-			indexDesc,
-			numImplicitColumns,
-			partitionBy,
-		)
-		if err != nil {
-			return err
-		}
-		indexDesc.Partitioning = partitioning
+	*indexDesc, err = params.p.configureIndexDescForNewIndexPartitioning(
+		params.ctx,
+		n.tableDesc,
+		*indexDesc,
+		n.n.PartitionByIndex,
+	)
+	if err != nil {
+		return err
 	}
 
 	mutationIdx := len(n.tableDesc.Mutations)
@@ -498,6 +467,14 @@ func (n *createIndexNode) startExec(params runParams) error {
 	if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
 		return err
 	}
+	if err := params.p.configureZoneConfigForNewIndexPartitioning(
+		params.ctx,
+		n.tableDesc,
+		*indexDesc,
+	); err != nil {
+		return err
+	}
+
 	// The index name may have changed as a result of
 	// AllocateIDs(). Retrieve it for the event log below.
 	index := n.tableDesc.Mutations[mutationIdx].GetIndex()
@@ -539,3 +516,80 @@ func (n *createIndexNode) startExec(params runParams) error {
 func (*createIndexNode) Next(runParams) (bool, error) { return false, nil }
 func (*createIndexNode) Values() tree.Datums          { return tree.Datums{} }
 func (*createIndexNode) Close(context.Context)        {}
+
+// configureIndexDescForNewIndexPartitioning returns a new copy of an index descriptor
+// containing modifications needed if partitioning is configured.
+func (p *planner) configureIndexDescForNewIndexPartitioning(
+	ctx context.Context,
+	tableDesc *tabledesc.Mutable,
+	indexDesc descpb.IndexDescriptor,
+	partitionByIndex *tree.PartitionByIndex,
+) (descpb.IndexDescriptor, error) {
+	var err error
+	if partitionByIndex.ContainsPartitioningClause() || tableDesc.IsPartitionAllBy() {
+		var partitionBy *tree.PartitionBy
+		if !tableDesc.IsPartitionAllBy() {
+			if partitionByIndex.ContainsPartitions() {
+				partitionBy = partitionByIndex.PartitionBy
+			}
+		} else if partitionByIndex.ContainsPartitioningClause() {
+			return indexDesc, pgerror.New(
+				pgcode.FeatureNotSupported,
+				"cannot define PARTITION BY on an index if the table has a PARTITION ALL BY definition",
+			)
+		} else {
+			partitionBy, err = partitionByFromTableDesc(p.ExecCfg().Codec, tableDesc)
+			if err != nil {
+				return indexDesc, err
+			}
+		}
+
+		if partitionBy != nil {
+			if indexDesc, err = CreatePartitioning(
+				ctx,
+				p.ExecCfg().Settings,
+				p.EvalContext(),
+				tableDesc,
+				indexDesc,
+				partitionBy,
+			); err != nil {
+				return indexDesc, err
+			}
+		}
+	}
+	return indexDesc, nil
+}
+
+// configureZoneConfigForNewIndexPartitioning configures the zone config for any new index
+// in a REGIONAL BY ROW table.
+// This *must* be done after the index ID has been allocated.
+func (p *planner) configureZoneConfigForNewIndexPartitioning(
+	ctx context.Context, tableDesc *tabledesc.Mutable, indexDesc descpb.IndexDescriptor,
+) error {
+	if indexDesc.ID == 0 {
+		return errors.AssertionFailedf("index %s does not have id", indexDesc.Name)
+	}
+	// For REGIONAL BY ROW tables, correctly configure relevant zone configurations.
+	if tableDesc.IsLocalityRegionalByRow() {
+		dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
+			ctx,
+			p.txn,
+			tableDesc.ParentID,
+			tree.DatabaseLookupFlags{},
+		)
+		if err != nil {
+			return err
+		}
+		if err := applyZoneConfigForMultiRegionTable(
+			ctx,
+			p.txn,
+			p.ExecCfg(),
+			*dbDesc.RegionConfig,
+			tableDesc,
+			applyZoneConfigForMultiRegionTableOptionNewIndex(indexDesc.ID),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}

@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -383,7 +384,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	var needFinish bool
 	ctx, needFinish = ih.Setup(
 		ctx, ex.server.cfg, ex.appStats, p, ex.stmtDiagnosticsRecorder,
-		stmt.AnonymizedStr, os.ImplicitTxn.Get(),
+		stmt.AnonymizedStr, os.ImplicitTxn.Get(), ex.rng,
 	)
 	if needFinish {
 		sql := stmt.SQL
@@ -682,6 +683,7 @@ func (ex *connExecutor) execStmtInOpenState(
 		}
 		log.VEventf(ctx, 2, "push detected for non-refreshable txn but auto-retry not possible")
 	}
+
 	// No event was generated.
 	return nil, nil, nil
 }
@@ -730,6 +732,12 @@ func (ex *connExecutor) commitSQLTransaction(
 func (ex *connExecutor) commitSQLTransactionInternal(
 	ctx context.Context, ast tree.Statement,
 ) error {
+	if ex.extraTxnState.schemaChangerState.mode != sessiondata.UseNewSchemaChangerOff {
+		if err := ex.runPreCommitStages(ctx); err != nil {
+			return err
+		}
+	}
+
 	if err := validatePrimaryKeys(&ex.extraTxnState.descCollection); err != nil {
 		return err
 	}
@@ -760,7 +768,7 @@ func validatePrimaryKeys(tc *descs.Collection) error {
 		if !table.HasPrimaryKey() {
 			return unimplemented.NewWithIssuef(48026,
 				"primary key of table %s dropped without subsequent addition of new primary key",
-				table.Name,
+				table.GetName(),
 			)
 		}
 	}
@@ -914,17 +922,19 @@ func (ex *connExecutor) makeExecPlan(ctx context.Context, planner *planner) erro
 
 	flags := planner.curPlan.flags
 
-	// We don't execute the statement if:
-	// - plan contains a full table or full index scan.
-	// - the session setting disallows full table/index scans.
-	// - the query is not an internal query.
-	if (flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan)) &&
-		planner.EvalContext().SessionData.DisallowFullTableScans && ex.executorType == executorTypeExec {
-		return errors.WithHint(
-			pgerror.Newf(pgcode.TooManyRows,
-				"query `%s` contains a full table/index scan which is explicitly disallowed",
-				planner.stmt.SQL),
-			"try overriding the `disallow_full_table_scans` cluster/session setting")
+	if flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan) {
+		if ex.executorType == executorTypeExec && planner.EvalContext().SessionData.DisallowFullTableScans {
+			// We don't execute the statement if:
+			// - plan contains a full table or full index scan.
+			// - the session setting disallows full table/index scans.
+			// - the query is not an internal query.
+			return errors.WithHint(
+				pgerror.Newf(pgcode.TooManyRows,
+					"query `%s` contains a full table/index scan which is explicitly disallowed",
+					planner.stmt.SQL),
+				"try overriding the `disallow_full_table_scans` cluster/session setting")
+		}
+		ex.metrics.EngineMetrics.FullTableOrIndexScanCount.Inc(1)
 	}
 
 	// TODO(knz): Remove this accounting if/when savepoint rollbacks
@@ -975,6 +985,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 		planCtx.saveFlows = planCtx.getDefaultSaveFlowsFunc(ctx, planner, planComponentTypeMainQuery)
 	}
 	planCtx.traceMetadata = planner.instrumentation.traceMetadata
+	planCtx.collectExecStats = planner.instrumentation.ShouldCollectExecStats()
 
 	var evalCtxFactory func() *extendedEvalContext
 	if len(planner.curPlan.subqueryPlans) != 0 ||
@@ -1455,6 +1466,8 @@ func (ex *connExecutor) recordTransactionStart() (onTxnFinish func(txnEvent), on
 	ex.extraTxnState.transactionStatementIDs = nil
 	ex.extraTxnState.numRows = 0
 
+	ex.metrics.EngineMetrics.SQLTxnsOpen.Inc(1)
+
 	onTxnFinish = func(ev txnEvent) {
 		ex.phaseTimes[sessionEndExecTransaction] = timeutil.Now()
 		ex.recordTransaction(ev, implicit, txnStart)
@@ -1471,6 +1484,7 @@ func (ex *connExecutor) recordTransactionStart() (onTxnFinish func(txnEvent), on
 func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool, txnStart time.Time) {
 	txnEnd := timeutil.Now()
 	txnTime := txnEnd.Sub(txnStart)
+	ex.metrics.EngineMetrics.SQLTxnsOpen.Dec(1)
 	ex.metrics.EngineMetrics.SQLTxnLatency.RecordValue(txnTime.Nanoseconds())
 
 	txnServiceLat := ex.phaseTimes.getTransactionServiceLatency()
@@ -1496,11 +1510,12 @@ func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool, txnStart t
 // child span if one is found. A context derived from parentCtx which
 // additionally contains the new span is also returned.
 func createRootOrChildSpan(
-	parentCtx context.Context, opName string, tr *tracing.Tracer,
+	parentCtx context.Context, opName string, tr *tracing.Tracer, os ...tracing.SpanOption,
 ) (context.Context, *tracing.Span) {
 	// WithForceRealSpan is used to support the use of session tracing, which
 	// may start recording on this span.
-	return tracing.EnsureChildSpan(parentCtx, tr, opName, tracing.WithForceRealSpan())
+	os = append(os, tracing.WithForceRealSpan())
+	return tracing.EnsureChildSpan(parentCtx, tr, opName, os...)
 }
 
 // logTraceAboveThreshold logs a span's recording if the duration is above a

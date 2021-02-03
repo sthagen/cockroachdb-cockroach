@@ -26,6 +26,7 @@ proto_library(
     deps = [
         "//pkg/roachpb:roachpb_proto",
         "//pkg/sql/catalog/descpb:descpb_proto",
+        "//pkg/sql/schemachanger/scpb:scpb_proto",
         "//pkg/util/hlc:hlc_proto",
         "@com_github_cockroachdb_errors//errorspb:errorspb_proto",
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
@@ -40,10 +41,11 @@ go_proto_library(
     proto = ":jobspb_proto",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/ccl/streamingccl/streamclient",  # keep
+        "//pkg/ccl/streamingccl",  # keep
         "//pkg/roachpb",
         "//pkg/security",  # keep
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/schemachanger/scpb",
         "//pkg/sql/sem/tree",  # keep
         "//pkg/util/hlc",
         "@com_github_cockroachdb_errors//errorspb",

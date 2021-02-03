@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
-	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
@@ -117,7 +116,7 @@ type ServerConfig struct {
 	// JobRegistry manages jobs being used by this Server.
 	JobRegistry *jobs.Registry
 
-	// LeaseManager is a *sql.LeaseManager. It's stored as an `interface{}` due
+	// LeaseManager is a *lease.Manager. It's stored as an `interface{}` due
 	// to package dependency cycles
 	LeaseManager interface{}
 
@@ -149,8 +148,6 @@ type ServerConfig struct {
 	// HydratedTables is a node-level cache of table descriptors which utilize
 	// user-defined types.
 	HydratedTables *hydratedtables.Cache
-
-	LatencyGetter *serverpb.LatencyGetter
 }
 
 // RuntimeStats is an interface through which the rowexec layer can get

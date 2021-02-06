@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -208,20 +209,20 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 			return nil, err
 		}
 	} else {
-		columns, err := tableDesc.FindActiveColumnsByNames(n.ColumnNames)
+		columns, err := tabledesc.FindPublicColumnsWithNames(tableDesc, n.ColumnNames)
 		if err != nil {
 			return nil, err
 		}
 
 		columnIDs := make([]descpb.ColumnID, len(columns))
 		for i := range columns {
-			columnIDs[i] = columns[i].ID
+			columnIDs[i] = columns[i].GetID()
 		}
-		col, err := tableDesc.FindColumnByID(columnIDs[0])
+		col, err := tableDesc.FindColumnWithID(columnIDs[0])
 		if err != nil {
 			return nil, err
 		}
-		isInvIndex := colinfo.ColumnTypeIsInvertedIndexable(col.Type)
+		isInvIndex := colinfo.ColumnTypeIsInvertedIndexable(col.GetType())
 		colStats = []jobspb.CreateStatsDetails_ColStat{{
 			ColumnIDs: columnIDs,
 			// By default, create histograms on all explicitly requested column stats
@@ -377,11 +378,12 @@ func createStatsDefaultColumns(
 
 	// Add column stats for each secondary index.
 	for _, idx := range desc.PublicNonPrimaryIndexes() {
-		isInverted := idx.GetType() == descpb.IndexDescriptor_INVERTED
+		for j, n := 0, idx.NumColumns(); j < n; j++ {
+			colID := idx.GetColumnID(j)
+			isInverted := idx.GetType() == descpb.IndexDescriptor_INVERTED && colID == idx.InvertedColumnID()
 
-		for j := 0; j < idx.NumColumns(); j++ {
 			// Generate stats for each indexed column.
-			addIndexColumnStatsIfNotExists(idx.GetColumnID(j), isInverted)
+			addIndexColumnStatsIfNotExists(colID, isInverted)
 
 			// Only collect multi-column stats if enabled.
 			if j == 0 || !multiColEnabled {
@@ -420,6 +422,11 @@ func createStatsDefaultColumns(
 
 			// Generate stats for each column individually.
 			for _, colID := range colIDs.Ordered() {
+				col, err := desc.FindColumnWithID(colID)
+				if err != nil {
+					return nil, err
+				}
+				isInverted := colinfo.ColumnTypeIsInvertedIndexable(col.GetType())
 				addIndexColumnStatsIfNotExists(colID, isInverted)
 			}
 		}
@@ -427,9 +434,9 @@ func createStatsDefaultColumns(
 
 	// Add all remaining columns in the table, up to maxNonIndexCols.
 	nonIdxCols := 0
-	for i := 0; i < len(desc.GetPublicColumns()) && nonIdxCols < maxNonIndexCols; i++ {
-		col := &desc.GetPublicColumns()[i]
-		colList := []descpb.ColumnID{col.ID}
+	for i := 0; i < len(desc.PublicColumns()) && nonIdxCols < maxNonIndexCols; i++ {
+		col := desc.PublicColumns()[i]
+		colList := []descpb.ColumnID{col.GetID()}
 
 		if !trackStatsIfNotExists(colList) {
 			continue
@@ -440,12 +447,12 @@ func createStatsDefaultColumns(
 		// enum types only have a few values anyway, include all possible values
 		// for those types, up to defaultHistogramBuckets.
 		maxHistBuckets := uint32(nonIndexColHistogramBuckets)
-		if col.Type.Family() == types.BoolFamily || col.Type.Family() == types.EnumFamily {
+		if col.GetType().Family() == types.BoolFamily || col.GetType().Family() == types.EnumFamily {
 			maxHistBuckets = defaultHistogramBuckets
 		}
 		colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
 			ColumnIDs:           colList,
-			HasHistogram:        !colinfo.ColumnTypeIsInvertedIndexable(col.Type),
+			HasHistogram:        !colinfo.ColumnTypeIsInvertedIndexable(col.GetType()),
 			HistogramMaxBuckets: maxHistBuckets,
 		})
 		nonIdxCols++

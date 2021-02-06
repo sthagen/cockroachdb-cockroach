@@ -48,9 +48,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob/gcjobnotifier"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -799,6 +801,10 @@ type ExecutorConfig struct {
 	// IndexBackfiller is used to backfill indexes. It is another rather circular
 	// object which mostly just holds on to an ExecConfig.
 	IndexBackfiller *IndexBackfillPlanner
+
+	// ContentionRegistry is a node-level registry of contention events used for
+	// contention observability.
+	ContentionRegistry *contention.Registry
 }
 
 // Organization returns the value of cluster.organization.
@@ -2327,9 +2333,16 @@ func (s *sqlStatsCollector) recordTransaction(
 	retryLat time.Duration,
 	commitLat time.Duration,
 	numRows int,
+	collectedExecStats bool,
+	execStats execstats.QueryLevelStats,
+	rowsRead int64,
+	bytesRead int64,
 ) {
 	s.appStats.recordTransactionCounts(txnTimeSec, ev, implicit)
-	s.appStats.recordTransaction(key, int64(retryCount), statementIDs, serviceLat, retryLat, commitLat, numRows)
+	s.appStats.recordTransaction(
+		key, int64(retryCount), statementIDs, serviceLat, retryLat, commitLat,
+		numRows, collectedExecStats, execStats, rowsRead, bytesRead,
+	)
 }
 
 func (s *sqlStatsCollector) reset(sqlStats *sqlStats, appStats *appStats, phaseTimes *phaseTimes) {

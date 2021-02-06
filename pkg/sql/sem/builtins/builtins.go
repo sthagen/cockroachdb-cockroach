@@ -1841,6 +1841,20 @@ var builtins = map[string]builtinDefinition{
 			Info:       "Advances the given sequence and returns its new value.",
 			Volatility: tree.VolatilityVolatile,
 		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{SequenceNameArg, types.RegClass}},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				oid := tree.MustBeDOid(args[0])
+				res, err := evalCtx.Sequence.IncrementSequenceByID(evalCtx.Ctx(), int64(oid.DInt))
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDInt(tree.DInt(res)), nil
+			},
+			Info:       "Advances the given sequence and returns its new value.",
+			Volatility: tree.VolatilityVolatile,
+		},
 	),
 
 	"currval": makeBuiltin(
@@ -1859,6 +1873,20 @@ var builtins = map[string]builtinDefinition{
 					return nil, err
 				}
 				res, err := evalCtx.Sequence.GetLatestValueInSessionForSequence(evalCtx.Ctx(), qualifiedName)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDInt(tree.DInt(res)), nil
+			},
+			Info:       "Returns the latest value obtained with nextval for this sequence in this session.",
+			Volatility: tree.VolatilityVolatile,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{SequenceNameArg, types.RegClass}},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				oid := tree.MustBeDOid(args[0])
+				res, err := evalCtx.Sequence.GetLatestValueInSessionForSequenceByID(evalCtx.Ctx(), int64(oid.DInt))
 				if err != nil {
 					return nil, err
 				}
@@ -1947,6 +1975,22 @@ var builtins = map[string]builtinDefinition{
 			Volatility: tree.VolatilityVolatile,
 		},
 		tree.Overload{
+			Types:      tree.ArgTypes{{SequenceNameArg, types.RegClass}, {"value", types.Int}},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				oid := tree.MustBeDOid(args[0])
+				newVal := tree.MustBeDInt(args[1])
+				if err := evalCtx.Sequence.SetSequenceValueByID(
+					evalCtx.Ctx(), int64(oid.DInt), int64(newVal), true); err != nil {
+					return nil, err
+				}
+				return args[1], nil
+			},
+			Info: "Set the given sequence's current value. The next call to nextval will return " +
+				"`value + Increment`",
+			Volatility: tree.VolatilityVolatile,
+		},
+		tree.Overload{
 			Types: tree.ArgTypes{
 				{SequenceNameArg, types.String}, {"value", types.Int}, {"is_called", types.Bool},
 			},
@@ -1963,6 +2007,26 @@ var builtins = map[string]builtinDefinition{
 				newVal := tree.MustBeDInt(args[1])
 				if err := evalCtx.Sequence.SetSequenceValue(
 					evalCtx.Ctx(), qualifiedName, int64(newVal), isCalled); err != nil {
+					return nil, err
+				}
+				return args[1], nil
+			},
+			Info: "Set the given sequence's current value. If is_called is false, the next call to " +
+				"nextval will return `value`; otherwise `value + Increment`.",
+			Volatility: tree.VolatilityVolatile,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{SequenceNameArg, types.RegClass}, {"value", types.Int}, {"is_called", types.Bool},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				oid := tree.MustBeDOid(args[0])
+				isCalled := bool(tree.MustBeDBool(args[2]))
+
+				newVal := tree.MustBeDInt(args[1])
+				if err := evalCtx.Sequence.SetSequenceValueByID(
+					evalCtx.Ctx(), int64(oid.DInt), int64(newVal), isCalled); err != nil {
 					return nil, err
 				}
 				return args[1], nil
@@ -3702,19 +3766,19 @@ may increase either contention or retry errors, or both.`,
 					if indexDesc.ID != tableDesc.GetPrimaryIndexID() && !indexDesc.Unique && len(indexDesc.ExtraColumnIDs) > 0 {
 						var extraColNames []string
 						for _, id := range indexDesc.ExtraColumnIDs {
-							col, colErr := tableDesc.FindColumnByID(id)
+							col, colErr := tableDesc.FindColumnWithID(id)
 							if colErr != nil {
 								return nil, errors.CombineErrors(err, colErr)
 							}
-							extraColNames = append(extraColNames, col.Name)
+							extraColNames = append(extraColNames, col.GetName())
 						}
 						var allColNames []string
 						for _, id := range indexColIDs {
-							col, colErr := tableDesc.FindColumnByID(id)
+							col, colErr := tableDesc.FindColumnWithID(id)
 							if colErr != nil {
 								return nil, errors.CombineErrors(err, colErr)
 							}
-							allColNames = append(allColNames, col.Name)
+							allColNames = append(allColNames, col.GetName())
 						}
 						return nil, errors.WithHintf(
 							err,
@@ -3736,17 +3800,17 @@ may increase either contention or retry errors, or both.`,
 					// types of the index columns. So, try to cast the input datums to
 					// the types of the index columns here.
 					var newDatum tree.Datum
-					col, err := tableDesc.FindColumnByID(indexColIDs[i])
+					col, err := tableDesc.FindColumnWithID(indexColIDs[i])
 					if err != nil {
 						return nil, err
 					}
 					if d.ResolvedType() == types.Unknown {
-						if !col.Nullable {
+						if !col.IsNullable() {
 							return nil, pgerror.Newf(pgcode.NotNullViolation, "NULL provided as a value for a non-nullable column")
 						}
 						newDatum = tree.DNull
 					} else {
-						expectedTyp := col.Type
+						expectedTyp := col.GetType()
 						newDatum, err = tree.PerformCast(ctx, d, expectedTyp)
 						if err != nil {
 							return nil, errors.WithHint(err, "try to explicitly cast each value to the corresponding column type")
@@ -4671,6 +4735,25 @@ may increase either contention or retry errors, or both.`,
 				"formatted bytea, one can use decode(<key string>, 'hex'|'escape') as the parameter. " +
 				"The compaction is run synchronously, so this function may take a long time to return. " +
 				"One can use the logs at the node to confirm that a compaction has started.",
+			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
+	"crdb_internal.increment_feature_counter": makeBuiltin(
+		tree.FunctionProperties{
+			Category:     categorySystemInfo,
+			Undocumented: true,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"feature", types.String}},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				feature := string(*args[0].(*tree.DString))
+				telemetry.Inc(sqltelemetry.HashedFeatureCounter(feature))
+				return tree.DBoolTrue, nil
+			},
+			Info: "This function can be used to report the usage of an arbitrary feature. The " +
+				"feature name is hashed for privacy purposes.",
 			Volatility: tree.VolatilityVolatile,
 		},
 	),

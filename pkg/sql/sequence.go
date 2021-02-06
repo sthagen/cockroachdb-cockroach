@@ -44,7 +44,7 @@ func (p *planner) GetSerialSequenceNameFromColumn(
 	if err != nil {
 		return nil, err
 	}
-	for _, col := range tableDesc.GetPublicColumns() {
+	for _, col := range tableDesc.PublicColumns() {
 		if col.ColName() == columnName {
 			// Seems like we have no way of detecting whether this was done using "SERIAL".
 			// Guess by assuming it is SERIAL it it uses only one sequence.
@@ -53,11 +53,11 @@ func (p *planner) GetSerialSequenceNameFromColumn(
 			//       which have not been thought about (e.g. implication for backup and restore,
 			//       as well as backward compatibility) so we're using this heuristic for now.
 			// TODO(#52487): fix this up.
-			if len(col.UsesSequenceIds) == 1 {
+			if col.NumUsesSequences() == 1 {
 				seq, err := p.Descriptors().GetImmutableTableByID(
 					ctx,
 					p.txn,
-					col.UsesSequenceIds[0],
+					col.GetUsesSequenceID(0),
 					tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc),
 				)
 				if err != nil {
@@ -82,12 +82,34 @@ func (p *planner) IncrementSequence(ctx context.Context, seqName *tree.TableName
 	if err != nil {
 		return 0, err
 	}
+	return incrementSequenceHelper(ctx, p, descriptor)
+}
+
+// IncrementSequenceByID implements the tree.SequenceOperators interface.
+func (p *planner) IncrementSequenceByID(ctx context.Context, seqID int64) (int64, error) {
+	if p.EvalContext().TxnReadOnly {
+		return 0, readOnlyError("nextval()")
+	}
+	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc)
+	descriptor, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, descpb.ID(seqID), flags)
+	if err != nil {
+		return 0, err
+	}
+	return incrementSequenceHelper(ctx, p, descriptor)
+}
+
+// incrementSequenceHelper is shared by IncrementSequence and IncrementSequenceByID
+// to increment the given sequence.
+func incrementSequenceHelper(
+	ctx context.Context, p *planner, descriptor catalog.TableDescriptor,
+) (int64, error) {
 	if err := p.CheckPrivilege(ctx, descriptor, privilege.UPDATE); err != nil {
 		return 0, err
 	}
 
 	seqOpts := descriptor.GetSequenceOpts()
 	var val int64
+	var err error
 	if seqOpts.Virtual {
 		rowid := builtins.GenerateUniqueInt(p.EvalContext().NodeID.SQLInstanceID())
 		val = int64(rowid)
@@ -140,7 +162,31 @@ func (p *planner) GetLatestValueInSessionForSequence(
 	if err != nil {
 		return 0, err
 	}
+	return getLatestValueInSessionForSequenceHelper(p, descriptor, seqName)
+}
 
+// GetLatestValueInSessionForSequenceByID implements the tree.SequenceOperators interface.
+func (p *planner) GetLatestValueInSessionForSequenceByID(
+	ctx context.Context, seqID int64,
+) (int64, error) {
+	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc)
+	descriptor, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, descpb.ID(seqID), flags)
+	if err != nil {
+		return 0, err
+	}
+	seqName, err := p.getQualifiedTableName(ctx, descriptor)
+	if err != nil {
+		return 0, err
+	}
+	return getLatestValueInSessionForSequenceHelper(p, descriptor, seqName)
+}
+
+// getLatestValueInSessionForSequenceHelper is shared by
+// GetLatestValueInSessionForSequence and GetLatestValueInSessionForSequenceByID
+// to get the latest value for the given sequence.
+func getLatestValueInSessionForSequenceHelper(
+	p *planner, descriptor catalog.TableDescriptor, seqName *tree.TableName,
+) (int64, error) {
 	val, ok := p.SessionData().SequenceState.GetLastValueByID(uint32(descriptor.GetID()))
 	if !ok {
 		return 0, pgerror.Newf(
@@ -164,6 +210,39 @@ func (p *planner) SetSequenceValue(
 	if err != nil {
 		return err
 	}
+	return setSequenceValueHelper(ctx, p, descriptor, newVal, isCalled, seqName)
+}
+
+// SetSequenceValueByID implements the tree.SequenceOperators interface.
+func (p *planner) SetSequenceValueByID(
+	ctx context.Context, seqID int64, newVal int64, isCalled bool,
+) error {
+	if p.EvalContext().TxnReadOnly {
+		return readOnlyError("setval()")
+	}
+
+	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireSequenceDesc)
+	descriptor, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, descpb.ID(seqID), flags)
+	if err != nil {
+		return err
+	}
+	seqName, err := p.getQualifiedTableName(ctx, descriptor)
+	if err != nil {
+		return err
+	}
+	return setSequenceValueHelper(ctx, p, descriptor, newVal, isCalled, seqName)
+}
+
+// setSequenceValueHelper is shared by SetSequenceValue and SetSequenceValueByID
+// to set the given sequence to a new given value.
+func setSequenceValueHelper(
+	ctx context.Context,
+	p *planner,
+	descriptor catalog.TableDescriptor,
+	newVal int64,
+	isCalled bool,
+	seqName *tree.TableName,
+) error {
 	if err := p.CheckPrivilege(ctx, descriptor, privilege.UPDATE); err != nil {
 		return err
 	}
@@ -398,13 +477,14 @@ func removeSequenceOwnerIfExists(
 	if tableDesc.Dropped() {
 		return nil
 	}
-	col, err := tableDesc.FindColumnByID(opts.SequenceOwner.OwnerColumnID)
+	col, err := tableDesc.FindColumnWithID(opts.SequenceOwner.OwnerColumnID)
 	if err != nil {
 		return err
 	}
 	// Find an item in colDesc.OwnsSequenceIds which references SequenceID.
 	refIdx := -1
-	for i, id := range col.OwnsSequenceIds {
+	for i := 0; i < col.NumOwnsSequences(); i++ {
+		id := col.GetOwnsSequenceID(i)
 		if id == sequenceID {
 			refIdx = i
 		}
@@ -412,7 +492,7 @@ func removeSequenceOwnerIfExists(
 	if refIdx == -1 {
 		return errors.AssertionFailedf("couldn't find reference from column to this sequence")
 	}
-	col.OwnsSequenceIds = append(col.OwnsSequenceIds[:refIdx], col.OwnsSequenceIds[refIdx+1:]...)
+	col.ColumnDesc().OwnsSequenceIds = append(col.ColumnDesc().OwnsSequenceIds[:refIdx], col.ColumnDesc().OwnsSequenceIds[refIdx+1:]...)
 	if err := p.writeSchemaChange(
 		ctx, tableDesc, descpb.InvalidMutationID,
 		fmt.Sprintf("removing sequence owner %s(%d) for sequence %d",
@@ -438,11 +518,11 @@ func resolveColumnItemToDescriptors(
 	if err != nil {
 		return nil, nil, err
 	}
-	col, _, err := tableDesc.FindColumnByName(columnItem.ColumnName)
+	col, err := tableDesc.FindColumnWithName(columnItem.ColumnName)
 	if err != nil {
 		return nil, nil, err
 	}
-	return tableDesc, col, nil
+	return tableDesc, col.ColumnDesc(), nil
 }
 
 func addSequenceOwner(

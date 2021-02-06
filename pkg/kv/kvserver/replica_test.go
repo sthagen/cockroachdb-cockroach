@@ -86,7 +86,7 @@ var allSpans = func() spanset.SpanSet {
 		Key:    roachpb.KeyMin,
 		EndKey: roachpb.KeyMax,
 	})
-	// Local keys (see `keys.localPrefix`).
+	// Local keys (see `keys.LocalPrefix`).
 	ss.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{
 		Key:    append([]byte("\x01"), roachpb.KeyMin...),
 		EndKey: append([]byte("\x01"), roachpb.KeyMax...),
@@ -705,8 +705,8 @@ func TestReplicaReadConsistency(t *testing.T) {
 }
 
 // Test the behavior of a replica while a range lease transfer is in progress:
-// - while the transfer is in progress, reads should return errors pointing to
-// the transfer target.
+// - while the transfer is in progress, reads should block while attempting to
+// acquire latches.
 // - if a transfer fails, the pre-existing lease does not start being used
 // again. Instead, a new lease needs to be obtained. This is because, even
 // though the transfer got an error, that error is considered ambiguous as the
@@ -714,140 +714,152 @@ func TestReplicaReadConsistency(t *testing.T) {
 func TestBehaviorDuringLeaseTransfer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	manual := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manual.UnixNano, 100*time.Millisecond)
-	tc := testContext{manualClock: manual}
-	tsc := TestStoreConfig(clock)
-	var leaseAcquisitionTrap atomic.Value
-	tsc.TestingKnobs.DisableAutomaticLeaseRenewal = true
-	tsc.TestingKnobs.LeaseRequestEvent = func(ts hlc.Timestamp, _ roachpb.StoreID, _ roachpb.RangeID) *roachpb.Error {
-		val := leaseAcquisitionTrap.Load()
-		if val == nil {
-			return nil
-		}
-		trapCallback := val.(func(ts hlc.Timestamp))
-		if trapCallback != nil {
-			trapCallback(ts)
-		}
-		return nil
-	}
-	transferSem := make(chan struct{})
-	tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-			if _, ok := filterArgs.Req.(*roachpb.TransferLeaseRequest); ok {
-				// Notify the test that the transfer has been trapped.
-				transferSem <- struct{}{}
-				// Wait for the test to unblock the transfer.
-				<-transferSem
-				// Return an error, so that the pendingLeaseRequest considers the
-				// transfer failed.
-				return roachpb.NewErrorf("injected transfer error")
+
+	testutils.RunTrueAndFalse(t, "transferSucceeds", func(t *testing.T, transferSucceeds bool) {
+		manual := hlc.NewManualClock(123)
+		clock := hlc.NewClock(manual.UnixNano, 100*time.Millisecond)
+		tc := testContext{manualClock: manual}
+		tsc := TestStoreConfig(clock)
+		var leaseAcquisitionTrap atomic.Value
+		tsc.TestingKnobs.DisableAutomaticLeaseRenewal = true
+		tsc.TestingKnobs.LeaseRequestEvent = func(ts hlc.Timestamp, _ roachpb.StoreID, _ roachpb.RangeID) *roachpb.Error {
+			val := leaseAcquisitionTrap.Load()
+			if val == nil {
+				return nil
+			}
+			trapCallback := val.(func(ts hlc.Timestamp))
+			if trapCallback != nil {
+				trapCallback(ts)
 			}
 			return nil
 		}
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	tc.StartWithStoreConfig(t, stopper, tsc)
-	secondReplica, err := tc.addBogusReplicaToRangeDesc(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Do a read to acquire the lease.
-	gArgs := getArgs(roachpb.Key("a"))
-	if _, err := tc.SendWrapped(&gArgs); err != nil {
-		t.Fatal(err)
-	}
-
-	// Advance the clock so that the transfer we're going to perform sets a higher
-	// minLeaseProposedTS.
-	tc.manualClock.Increment((500 * time.Nanosecond).Nanoseconds())
-
-	// Initiate a transfer (async) and wait for it to be blocked.
-	transferResChan := make(chan error)
-	go func() {
-		err := tc.repl.AdminTransferLease(context.Background(), secondReplica.StoreID)
-		if !testutils.IsError(err, "injected") {
-			transferResChan <- err
-		} else {
-			transferResChan <- nil
+		transferSem := make(chan struct{})
+		tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
+			func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
+				if _, ok := filterArgs.Req.(*roachpb.TransferLeaseRequest); ok {
+					// Notify the test that the transfer has been trapped.
+					transferSem <- struct{}{}
+					// Wait for the test to unblock the transfer.
+					<-transferSem
+					if !transferSucceeds {
+						// Return an error, so that the pendingLeaseRequest
+						// considers the transfer failed.
+						return roachpb.NewErrorf("injected transfer error")
+					}
+					return nil
+				}
+				return nil
+			}
+		stopper := stop.NewStopper()
+		defer stopper.Stop(context.Background())
+		tc.StartWithStoreConfig(t, stopper, tsc)
+		secondReplica, err := tc.addBogusReplicaToRangeDesc(context.Background())
+		if err != nil {
+			t.Fatal(err)
 		}
-	}()
-	<-transferSem
-	// Check that a transfer is indeed on-going.
-	tc.repl.mu.Lock()
-	repDesc, err := tc.repl.getReplicaDescriptorRLocked()
-	if err != nil {
-		tc.repl.mu.Unlock()
-		t.Fatal(err)
-	}
-	_, pending := tc.repl.mu.pendingLeaseRequest.TransferInProgress(repDesc.ReplicaID)
-	tc.repl.mu.Unlock()
-	if !pending {
-		t.Fatalf("expected transfer to be in progress, and it wasn't")
-	}
 
-	// Check that, while the transfer is on-going, the replica redirects to the
-	// transfer target.
-	_, pErr := tc.SendWrapped(&gArgs)
-	nlhe, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError)
-	if !ok || nlhe.LeaseHolder.StoreID != secondReplica.StoreID {
-		t.Fatalf("expected not lease holder error pointing to store %d, got %v",
-			secondReplica.StoreID, pErr)
-	}
+		// Do a read to acquire the lease.
+		gArgs := getArgs(roachpb.Key("a"))
+		if _, err := tc.SendWrapped(&gArgs); err != nil {
+			t.Fatal(err)
+		}
 
-	// Unblock the transfer and wait for the pendingLeaseRequest to clear the
-	// transfer state.
-	transferSem <- struct{}{}
-	if err := <-transferResChan; err != nil {
-		t.Fatal(err)
-	}
+		// Advance the clock so that the transfer we're going to perform sets a higher
+		// minLeaseProposedTS.
+		tc.manualClock.Increment((500 * time.Nanosecond).Nanoseconds())
 
-	testutils.SucceedsSoon(t, func() error {
+		// Initiate a transfer (async) and wait for it to be blocked.
+		transferResChan := make(chan error)
+		go func() {
+			err := tc.repl.AdminTransferLease(context.Background(), secondReplica.StoreID)
+			if !testutils.IsError(err, "injected") {
+				transferResChan <- err
+			} else {
+				transferResChan <- nil
+			}
+		}()
+		<-transferSem
+		// Check that a transfer is indeed on-going.
 		tc.repl.mu.Lock()
-		defer tc.repl.mu.Unlock()
-		_, pending := tc.repl.mu.pendingLeaseRequest.TransferInProgress(repDesc.ReplicaID)
-		if pending {
-			return errors.New("transfer pending")
+		repDesc, err := tc.repl.getReplicaDescriptorRLocked()
+		if err != nil {
+			tc.repl.mu.Unlock()
+			t.Fatal(err)
 		}
-		return nil
-	})
+		pending := tc.repl.mu.pendingLeaseRequest.TransferInProgress(repDesc.ReplicaID)
+		tc.repl.mu.Unlock()
+		if !pending {
+			t.Fatalf("expected transfer to be in progress, and it wasn't")
+		}
 
-	// Check that the replica doesn't use its lease, even though there's no longer
-	// a transfer in progress. This is because, even though the transfer got an
-	// error, that error is considered ambiguous as the transfer might still
-	// apply.
-	// Concretely, we're going to check that a read triggers a new lease
-	// acquisition.
-	tc.repl.mu.Lock()
-	minLeaseProposedTS := tc.repl.mu.minLeaseProposedTS
-	leaseStartTS := tc.repl.mu.state.Lease.Start
-	tc.repl.mu.Unlock()
-	if minLeaseProposedTS.LessEq(leaseStartTS) {
-		t.Fatalf("expected minLeaseProposedTS > lease start. minLeaseProposedTS: %s, "+
-			"leas start: %s", minLeaseProposedTS, leaseStartTS)
-	}
-	expectedLeaseStartTS := tc.manualClock.UnixNano()
-	leaseAcquisitionCh := make(chan error)
-	leaseAcquisitionTrap.Store(func(ts hlc.Timestamp) {
-		if ts.WallTime == expectedLeaseStartTS {
-			close(leaseAcquisitionCh)
+		// Check that, while the transfer is on-going, reads are blocked.
+		readResChan := make(chan error)
+		go func() {
+			_, pErr := tc.SendWrapped(&gArgs)
+			readResChan <- pErr.GoError()
+		}()
+		select {
+		case err := <-readResChan:
+			t.Fatalf("expected read to block, completed with err=%v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+
+		// Set up a hook to detect lease requests, in case this transfer fails.
+		expectedLeaseStartTS := tc.manualClock.UnixNano()
+		leaseAcquisitionCh := make(chan error)
+		leaseAcquisitionTrap.Store(func(ts hlc.Timestamp) {
+			if ts.WallTime == expectedLeaseStartTS {
+				close(leaseAcquisitionCh)
+			} else {
+				leaseAcquisitionCh <- errors.Errorf(
+					"expected acquisition of lease with start: %d but got start: %s",
+					expectedLeaseStartTS, ts)
+			}
+		})
+
+		// Unblock the transfer and wait for the pendingLeaseRequest to clear
+		// the transfer state.
+		transferSem <- struct{}{}
+		if err := <-transferResChan; err != nil {
+			t.Fatal(err)
+		}
+
+		testutils.SucceedsSoon(t, func() error {
+			tc.repl.mu.Lock()
+			defer tc.repl.mu.Unlock()
+			pending := tc.repl.mu.pendingLeaseRequest.TransferInProgress(repDesc.ReplicaID)
+			if pending {
+				return errors.New("transfer pending")
+			}
+			return nil
+		})
+
+		if transferSucceeds {
+			// Check that the read is rejected and redirected to the transfer
+			// target.
+			err = <-readResChan
+			require.Error(t, err)
+			var lErr *roachpb.NotLeaseHolderError
+			require.True(t, errors.As(err, &lErr))
+			require.Equal(t, secondReplica.StoreID, lErr.LeaseHolder.StoreID)
 		} else {
-			leaseAcquisitionCh <- errors.Errorf(
-				"expected acquisition of lease with start: %d but got start: %s",
-				expectedLeaseStartTS, ts)
+			// Check that the replica doesn't use its lease, even though there's
+			// no longer a transfer in progress. This is because, even though
+			// the transfer got an error, that error is considered ambiguous as
+			// the transfer might still apply.
+			//
+			// Concretely, we're going to check that a read triggered a new
+			// lease acquisition and that is then succeeds.
+			select {
+			case <-leaseAcquisitionCh:
+			case <-time.After(time.Second):
+				t.Fatalf("read did not acquire a new lease")
+			}
+
+			err = <-readResChan
+			require.NoError(t, err)
 		}
 	})
-	// We expect this call to succeed, but after acquiring a new lease.
-	if _, err := tc.SendWrapped(&gArgs); err != nil {
-		t.Fatal(err)
-	}
-	// Check that the Send above triggered a lease acquisition.
-	select {
-	case <-leaseAcquisitionCh:
-	case <-time.After(time.Second):
-		t.Fatalf("read did not acquire a new lease")
-	}
 }
 
 // TestApplyCmdLeaseError verifies that when during application of a Raft
@@ -1458,12 +1470,10 @@ func TestReplicaDrainLease(t *testing.T) {
 	// expired already.
 
 	// Stop n1's heartbeats and wait for the lease to expire.
-
 	log.Infof(ctx, "test: suspending heartbeats for n1")
 	cleanup := s1.NodeLiveness().(*liveness.NodeLiveness).PauseAllHeartbeatsForTest()
 	defer cleanup()
 
-	require.NoError(t, err)
 	testutils.SucceedsSoon(t, func() error {
 		status := r1.CurrentLeaseStatus(ctx)
 		require.True(t, status.Lease.OwnedBy(store1.StoreID()), "someone else got the lease: %s", status)
@@ -1480,6 +1490,25 @@ func TestReplicaDrainLease(t *testing.T) {
 
 	require.Equal(t, r1.RaftStatus().Lead, uint64(r1.ReplicaID()),
 		"expected leadership to still be on the first replica")
+
+	// Wait until n1 has heartbeat its liveness record (epoch >= 1) and n2
+	// knows about it. Otherwise, the following could occur:
+	//
+	// - n1's heartbeats to epoch 1 and acquires lease
+	// - n2 doesn't receive this yet (gossip)
+	// - when n2 is asked to acquire the lease, it uses a lease with epoch 1
+	//   but the liveness record with epoch zero
+	// - lease status is ERROR, lease acquisition (and thus test) fails.
+	testutils.SucceedsSoon(t, func() error {
+		nl, ok := s2.NodeLiveness().(*liveness.NodeLiveness).GetLiveness(s1.NodeID())
+		if !ok {
+			return errors.New("no liveness record for n1")
+		}
+		if nl.Epoch < 1 {
+			return errors.New("epoch for n1 still zero")
+		}
+		return nil
+	})
 
 	// Mark the stores as draining. We'll then start checking how acquiring leases
 	// behaves while draining.
@@ -12982,10 +13011,12 @@ func TestRangeInfoReturned(t *testing.T) {
 	key := roachpb.Key("a")
 	gArgs := getArgs(key)
 
-	desc, lease := tc.repl.GetDescAndLease(ctx)
-	ri := &roachpb.RangeInfo{Desc: desc, Lease: lease}
-	staleDescGen := desc.Generation - 1
-	staleLeaseSeq := lease.Sequence - 1
+	ri := tc.repl.GetRangeInfo(ctx)
+	require.False(t, ri.Lease.Empty())
+	require.Equal(t, roachpb.LAG_BY_CLUSTER_SETTING, ri.ClosedTimestampPolicy)
+	staleDescGen := ri.Desc.Generation - 1
+	staleLeaseSeq := ri.Lease.Sequence - 1
+	wrongCTPolicy := roachpb.LEAD_FOR_GLOBAL_READS
 
 	for _, test := range []struct {
 		req roachpb.ClientRangeInfo
@@ -12994,53 +13025,69 @@ func TestRangeInfoReturned(t *testing.T) {
 		{
 			// Empty client info. This case shouldn't happen.
 			req: roachpb.ClientRangeInfo{},
-			exp: ri,
+			exp: &ri,
 		},
 		{
-			// Correct descriptor, missing lease.
+			// Correct descriptor, missing lease, correct closedts policy.
 			req: roachpb.ClientRangeInfo{
-				DescriptorGeneration: ri.Desc.Generation,
+				DescriptorGeneration:  ri.Desc.Generation,
+				ClosedTimestampPolicy: ri.ClosedTimestampPolicy,
 			},
-			exp: ri,
+			exp: &ri,
 		},
 		{
-			// Correct descriptor, stale lease.
+			// Correct descriptor, stale lease, correct closedts policy.
 			req: roachpb.ClientRangeInfo{
-				DescriptorGeneration: ri.Desc.Generation,
-				LeaseSequence:        staleLeaseSeq,
+				DescriptorGeneration:  ri.Desc.Generation,
+				LeaseSequence:         staleLeaseSeq,
+				ClosedTimestampPolicy: ri.ClosedTimestampPolicy,
 			},
-			exp: ri,
+			exp: &ri,
 		},
 		{
-			// Correct descriptor, correct lease.
+			// Correct descriptor, correct lease, incorrect closedts policy.
 			req: roachpb.ClientRangeInfo{
-				DescriptorGeneration: ri.Desc.Generation,
-				LeaseSequence:        ri.Lease.Sequence,
+				DescriptorGeneration:  ri.Desc.Generation,
+				LeaseSequence:         ri.Lease.Sequence,
+				ClosedTimestampPolicy: wrongCTPolicy,
+			},
+			exp: &ri,
+		},
+		{
+			// Correct descriptor, correct lease, correct closedts policy.
+			req: roachpb.ClientRangeInfo{
+				DescriptorGeneration:  ri.Desc.Generation,
+				LeaseSequence:         ri.Lease.Sequence,
+				ClosedTimestampPolicy: ri.ClosedTimestampPolicy,
 			},
 			exp: nil, // No update should be returned.
 		},
 		{
-			// Stale descriptor, no lease.
+			// Stale descriptor, no lease, correct closedts policy.
 			req: roachpb.ClientRangeInfo{
-				DescriptorGeneration: staleDescGen,
+				DescriptorGeneration:  staleDescGen,
+				ClosedTimestampPolicy: ri.ClosedTimestampPolicy,
 			},
-			exp: ri,
+			exp: &ri,
 		},
 		{
-			// Stale descriptor, stale lease.
+			// Stale descriptor, stale lease, incorrect closedts policy.
 			req: roachpb.ClientRangeInfo{
-				DescriptorGeneration: staleDescGen,
-				LeaseSequence:        staleLeaseSeq,
+				DescriptorGeneration:  staleDescGen,
+				LeaseSequence:         staleLeaseSeq,
+				ClosedTimestampPolicy: wrongCTPolicy,
 			},
-			exp: ri,
+			exp: &ri,
 		},
 		{
-			// Stale desc, good lease. This case shouldn't happen.
+			// Stale desc, good lease, correct closedts policy. This case
+			// shouldn't happen.
 			req: roachpb.ClientRangeInfo{
-				DescriptorGeneration: staleDescGen,
-				LeaseSequence:        staleLeaseSeq,
+				DescriptorGeneration:  staleDescGen,
+				LeaseSequence:         staleLeaseSeq,
+				ClosedTimestampPolicy: ri.ClosedTimestampPolicy,
 			},
-			exp: ri,
+			exp: &ri,
 		},
 	} {
 		t.Run("", func(t *testing.T) {

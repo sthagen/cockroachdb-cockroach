@@ -884,6 +884,9 @@ func MakeTransaction(
 	name string, baseKey Key, userPriority UserPriority, now hlc.Timestamp, maxOffsetNs int64,
 ) Transaction {
 	u := uuid.FastMakeV4()
+	// TODO(nvanbenschoten): technically, maxTS should be a synthetic timestamp.
+	// Make this change in v21.2 when all nodes in a cluster are guaranteed to
+	// be aware of synthetic timestamps by addressing the TODO in Timestamp.Add.
 	maxTS := now.Add(maxOffsetNs, 0)
 
 	return Transaction{
@@ -2388,5 +2391,6 @@ func init() {
 func (ReplicaChangeType) SafeValue() {}
 
 func (ri RangeInfo) String() string {
-	return fmt.Sprintf("desc: %s lease: %s", ri.Desc, ri.Lease)
+	return fmt.Sprintf("desc: %s, lease: %s, closed_timestamp_policy: %s",
+		ri.Desc, ri.Lease, ri.ClosedTimestampPolicy)
 }

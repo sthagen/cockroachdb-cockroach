@@ -824,6 +824,7 @@ unreserved_keyword ::=
 	| 'CREATEDB'
 	| 'CREATELOGIN'
 	| 'CREATEROLE'
+	| 'CSV'
 	| 'CUBE'
 	| 'CURRENT'
 	| 'CYCLE'
@@ -836,6 +837,7 @@ unreserved_keyword ::=
 	| 'DELETE'
 	| 'DEFAULTS'
 	| 'DEFERRED'
+	| 'DELIMITER'
 	| 'DESTINATION'
 	| 'DETACHED'
 	| 'DISCARD'
@@ -1278,6 +1280,7 @@ alter_schema_stmt ::=
 alter_type_stmt ::=
 	'ALTER' 'TYPE' type_name 'ADD' 'VALUE' 'SCONST' opt_add_val_placement
 	| 'ALTER' 'TYPE' type_name 'ADD' 'VALUE' 'IF' 'NOT' 'EXISTS' 'SCONST' opt_add_val_placement
+	| 'ALTER' 'TYPE' type_name 'DROP' 'VALUE' 'SCONST'
 	| 'ALTER' 'TYPE' type_name 'RENAME' 'VALUE' 'SCONST' 'TO' 'SCONST'
 	| 'ALTER' 'TYPE' type_name 'RENAME' 'TO' name
 	| 'ALTER' 'TYPE' type_name 'SET' 'SCHEMA' schema_name
@@ -1571,6 +1574,9 @@ complex_db_object_name ::=
 copy_options ::=
 	'DESTINATION' '=' string_or_placeholder
 	| 'BINARY'
+	| 'CSV'
+	| 'DELIMITER' string_or_placeholder
+	| 'NULL' string_or_placeholder
 
 db_object_name_component ::=
 	name

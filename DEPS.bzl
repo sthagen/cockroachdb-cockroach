@@ -406,8 +406,8 @@ def go_deps():
         name = "com_github_cockroachdb_crlfmt",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/cockroachdb/crlfmt",
-        sum = "h1:O4yb+RtkmDaXFlHSBpZodXaghfTd3Prdea0nk0eZCT4=",
-        version = "v0.0.0-20200116191136-a78e1c207bc0",
+        sum = "h1:4s0GWs4NXFK4JEeUc0Q1pRbL4oMbqh1DK70qeQ+viOA=",
+        version = "v0.0.0-20210128092314-b3eff0b87c79",
     )
     go_repository(
         name = "com_github_cockroachdb_datadriven",
@@ -452,8 +452,8 @@ def go_deps():
         name = "com_github_cockroachdb_pebble",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/cockroachdb/pebble",
-        sum = "h1:B1/hB6T+hU0IbvuaHWqEwraZbUx1xwgsOXngIRf4lQs=",
-        version = "v0.0.0-20210108212919-48f55301c5c4",
+        sum = "h1:akHzBD0xt67DdAbtvSTPEgZM583K226mMhXc6i2UKoY=",
+        version = "v0.0.0-20210201233136-12ffb4e9273f",
     )
     go_repository(
         name = "com_github_cockroachdb_redact",
@@ -2930,8 +2930,8 @@ def go_deps():
         name = "org_golang_x_exp",
         build_file_proto_mode = "disable_global",
         importpath = "golang.org/x/exp",
-        sum = "h1:XlAInxBYX5nBofPaY51uv/x9xmRgZGr/lDOsePd2AcE=",
-        version = "v0.0.0-20201229011636-eab1b5eb1a03",
+        sum = "h1:sZS6jzvbihmmQSPcU1iZSROTVMAjCXPEnd/ZCSyKsjA=",
+        version = "v0.0.0-20210201131500-d352d2db2ceb",
     )
     go_repository(
         name = "org_golang_x_image",
@@ -2990,20 +2990,12 @@ def go_deps():
         version = "v0.0.0-20201020160332-67f06af15bc9",
     )
     go_repository(
-        name = "org_golang_x_sys",
-        build_file_proto_mode = "disable_global",
-        importpath = "golang.org/x/sys",
-        sum = "h1:wHn06sgWHMO1VsQ8F+KzDJx/JzqfsNLnc+oEi07qD7s=",
-        version = "v0.0.0-20210108172913-0df2131ae363",
-    )
-    go_repository(
         name = "org_golang_x_term",
         build_file_proto_mode = "disable_global",
         importpath = "golang.org/x/term",
         sum = "h1:/ZHdbVpdR/jk3g30/d4yUL0JU9kksj8+F/bnQUVLGDM=",
         version = "v0.0.0-20201117132131-f5c789dd3221",
     )
-
     go_repository(
         name = "org_golang_x_text",
         build_file_proto_mode = "disable_global",

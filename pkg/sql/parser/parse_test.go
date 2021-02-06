@@ -1484,6 +1484,8 @@ func TestParse(t *testing.T) {
 		{`COPY crdb_internal.file_upload FROM STDIN WITH destination = 'filename'`},
 		{`COPY t (a, b, c) FROM STDIN WITH BINARY`},
 		{`COPY crdb_internal.file_upload FROM STDIN WITH BINARY destination = 'filename'`},
+		{`COPY t (a, b, c) FROM STDIN WITH CSV DELIMITER ',' NULL 'NUL'`},
+		{`COPY t (a, b, c) FROM STDIN WITH CSV DELIMITER ',' destination = 'filename'`},
 
 		{`ALTER TABLE a SPLIT AT VALUES (1)`},
 		{`EXPLAIN ALTER TABLE a SPLIT AT VALUES (1)`},
@@ -1602,6 +1604,7 @@ func TestParse(t *testing.T) {
 		{`ALTER TYPE db.s.t ADD VALUE 'hi'`},
 		{`ALTER TYPE s.t ADD VALUE 'hi' BEFORE 'hello'`},
 		{`ALTER TYPE t ADD VALUE 'hi' AFTER 'howdy'`},
+		{`ALTER TYPE t DROP VALUE 'hi'`},
 		{`ALTER TYPE s.t ADD VALUE IF NOT EXISTS 'hi' BEFORE 'hello'`},
 		{`ALTER TYPE t RENAME VALUE 'value1' TO 'value2'`},
 		{`ALTER TYPE t RENAME TO t2`},
@@ -2422,6 +2425,8 @@ $function$`,
 			`COPY t (a, b, c) FROM STDIN WITH BINARY`},
 		{`COPY t (a, b, c) FROM STDIN destination = 'filename' BINARY`,
 			`COPY t (a, b, c) FROM STDIN WITH BINARY destination = 'filename'`},
+		{`COPY t (a, b, c) FROM STDIN destination = 'filename' CSV DELIMITER ' '`,
+			`COPY t (a, b, c) FROM STDIN WITH CSV DELIMITER ' ' destination = 'filename'`},
 
 		// Identifier handling for zone configs.
 

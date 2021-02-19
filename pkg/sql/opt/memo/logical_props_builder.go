@@ -1689,6 +1689,52 @@ func MakeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 			fd.AddStrictKey(keyCols, allCols)
 		}
 	}
+
+	if !md.TableMeta(tabID).IgnoreUniqueWithoutIndexKeys {
+		for i := 0; i < tab.UniqueCount(); i++ {
+			unique := tab.Unique(i)
+
+			if !unique.Validated() {
+				// This unique constraint has not been validated, so we cannot use it
+				// as a key.
+				continue
+			}
+
+			if _, isPartial := unique.Predicate(); isPartial {
+				// Partial constraints cannot be considered while building functional
+				// dependency keys for the table because their keys are only unique
+				// for a subset of the rows in the table.
+				continue
+			}
+
+			// If any of the columns are nullable, add a lax key FD. Otherwise, add a
+			// strict key.
+			var keyCols opt.ColSet
+			hasNulls := false
+			for i := 0; i < unique.ColumnCount(); i++ {
+				ord := unique.ColumnOrdinal(tab, i)
+				keyCols.Add(tabID.ColumnID(ord))
+				if tab.Column(ord).IsNullable() {
+					hasNulls = true
+				}
+			}
+
+			if excludeColumn != 0 && keyCols.Contains(excludeColumn) {
+				// See comment above where excludeColumn is set.
+				// (Virtual tables currently do not have UNIQUE WITHOUT INDEX constraints
+				// or implicitly partitioned UNIQUE indexes, but we add this check in case
+				// of future changes.)
+				continue
+			}
+
+			if hasNulls {
+				fd.AddLaxKey(keyCols, allCols)
+			} else {
+				fd.AddStrictKey(keyCols, allCols)
+			}
+		}
+	}
+
 	md.SetTableAnnotation(tabID, fdAnnID, fd)
 	return fd
 }
@@ -1723,17 +1769,24 @@ func (b *logicalPropsBuilder) makeSetCardinality(
 	return card
 }
 
-// rejectNullCols returns the set of all columns that are inferred to be not-
-// null, based on the filter conditions.
-func (b *logicalPropsBuilder) rejectNullCols(filters FiltersExpr) opt.ColSet {
+// NullColsRejectedByFilter returns a set of columns that are "null rejected"
+// by the filters. An input row with a NULL value on any of these columns will
+// not pass the filter.
+func NullColsRejectedByFilter(evalCtx *tree.EvalContext, filters FiltersExpr) opt.ColSet {
 	var notNullCols opt.ColSet
 	for i := range filters {
 		filterProps := filters[i].ScalarProps()
 		if filterProps.Constraints != nil {
-			notNullCols.UnionWith(filterProps.Constraints.ExtractNotNullCols(b.evalCtx))
+			notNullCols.UnionWith(filterProps.Constraints.ExtractNotNullCols(evalCtx))
 		}
 	}
 	return notNullCols
+}
+
+// rejectNullCols returns the set of all columns that are inferred to be not-
+// null, based on the filter conditions.
+func (b *logicalPropsBuilder) rejectNullCols(filters FiltersExpr) opt.ColSet {
+	return NullColsRejectedByFilter(b.evalCtx, filters)
 }
 
 // addFiltersToFuncDep returns the union of all functional dependencies from
@@ -1829,6 +1882,15 @@ func ensureLookupJoinInputProps(join *LookupJoinExpr, sb *statisticsBuilder) *pr
 		for i := range join.KeyCols {
 			indexColID := join.Table.ColumnID(index.Column(i).Ordinal())
 			relational.OutputCols.Add(indexColID)
+		}
+
+		// Include columns from the join condition in the output columns.
+		lookupExprCols := join.LookupExpr.OuterCols()
+		for i, n := 0, index.KeyColumnCount(); i < n; i++ {
+			indexColID := join.Table.ColumnID(index.Column(i).Ordinal())
+			if lookupExprCols.Contains(indexColID) {
+				relational.OutputCols.Add(indexColID)
+			}
 		}
 
 		relational.NotNullCols = tableNotNullCols(md, join.Table)
@@ -1962,7 +2024,7 @@ func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 		ensureLookupJoinInputProps(join, &b.sb)
 		h.joinType = join.JoinType
 		h.rightProps = &join.lookupProps
-		h.filters = join.On
+		h.filters = append(join.On, join.LookupExpr...)
 		b.addFiltersToFuncDep(h.filters, &h.filtersFD)
 		h.filterNotNullCols = b.rejectNullCols(h.filters)
 

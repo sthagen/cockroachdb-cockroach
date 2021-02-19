@@ -113,6 +113,11 @@ message UniqueWithoutIndexConstraint {
                                         (gogoproto.casttype) = "ColumnID"];
   optional string name = 3 [(gogoproto.nullable) = false];
   optional ConstraintValidity validity = 4 [(gogoproto.nullable) = false];
+
+  // Predicate, if it's not empty, indicates that the constraint is a partial
+  // unique constraint with Predicate as the expression. Columns are referred to
+  // in the expression by their name.
+  optional string predicate = 5 [(gogoproto.nullable) = false];
 }
 
 message ColumnDescriptor {
@@ -565,6 +570,21 @@ message PrimaryKeySwap {
     option (gogoproto.equal) = true;
     optional TableDescriptor.LocalityConfig old_locality_config = 1 [(gogoproto.nullable) = false];
     optional TableDescriptor.LocalityConfig new_locality_config = 2 [(gogoproto.nullable) = false];
+
+    // NewRegionalByRowColumnID is set when we are creating a new column for a
+    // REGIONAL BY ROW table. It is used by NewRegionalByRowColumnDefaultExpr
+    // to identify the column we may have to change DefaultExpr for.
+    optional uint32 new_regional_by_row_column_id = 3 [(gogoproto.casttype) = "ColumnID", (gogoproto.customname) = "NewRegionalByRowColumnID"];
+    // NewRegionalByRowColumnDefaultExpr is the default expression to set when a
+    // REGIONAL BY ROW involving a new crdb_region column is required.
+    // This is required so that the backfill uses a well-known value, but after
+    // the backfill is complete we can set it to use the gateway_region.
+    //
+    // This must be set at mutation creation time, as the schema changer loses
+    // context on what the database is. The default expression should be already
+    // serialized in the same internal format as default_expr on the
+    // ColumnDescriptor.
+    optional string new_regional_by_row_column_default_expr = 4;
   }
   // LocalityConfigSwap is set for ALTER TABLE SET LOCALITY when the command
   // requires PK changes. If set, additional zone configurations are set to
@@ -949,6 +969,12 @@ message TableDescriptor {
     // relation.
     repeated uint32 column_ids = 3 [(gogoproto.customname) = "ColumnIDs",
              (gogoproto.casttype) = "ColumnID"];
+    // ByID indicates whether the relation is referenced via its name or its ID.
+    // For example, nextval('foo.public.seq') vs. nextval(12345::REGCLASS),
+    // where 12345 is the ID of foo.public.seq
+    // Sequences referenced only by its ID have the ability to be renamed.
+    optional bool by_id = 4 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "ByID"];
   }
 
   // All references to this table/view from other views and sequences in the system,
@@ -999,6 +1025,10 @@ message TableDescriptor {
     }
 
     optional SequenceOwner sequence_owner = 6 [(gogoproto.nullable) = false];
+
+    // The number of values (which have already been created in KV)
+    // that a node can cache locally.
+    optional int64 cache_size = 7 [(gogoproto.nullable) = false];
   }
 
   // The presence of sequence_opts indicates that this descriptor is for a sequence.
@@ -1096,6 +1126,20 @@ message TableDescriptor {
 
   message LocalityConfig {
     option (gogoproto.equal) = true;
+    // REGIONAL BY TABLE tables have an "implicit" bidirectional dependency with
+    // the multi-region enum. The dependency is described "implicit" because
+    // even though no column on the table uses the multi-region type descriptor
+    // to store the homing region, a value from the type descriptor is stored in
+    // the locality config below (when the table is homed in the non-primary
+    // region).
+    // This changes how type dependencies are constructed for table descriptors.
+    // After the introduction of REGIONAL BY TABLE tables, a column on the table
+    // descriptor using a type is no longer a necessary (note it is still a
+    // sufficient) condition to establish a type dependency. As is the case with
+    // adding and dropping columns, this type dependency must be negotiated. As
+    // such, switching locality patterns or adding new locality configs must be
+    // done so that back references to the multi-region type descriptor are
+    // kept sane.
     message RegionalByTable {
       option (gogoproto.equal) = true;
       // Region is set if the table has an affinity with a non-primary region.

@@ -714,12 +714,12 @@ func (s *vectorizedFlowCreator) setupRouter(
 		allocators[i] = colmem.NewAllocator(ctx, &acc, factory)
 		s.accounts = append(s.accounts, &acc)
 	}
-	limit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
-	if flowCtx.Cfg.TestingKnobs.ForceDiskSpill {
-		limit = 1
-	}
 	diskMon, diskAccounts := s.createDiskAccounts(ctx, flowCtx, mmName, len(output.Streams))
-	router, outputs := colexec.NewHashRouter(allocators, input, outputTyps, output.HashColumns, limit, s.diskQueueCfg, s.fdSemaphore, diskAccounts, metadataSourcesQueue, toClose)
+	router, outputs := colexec.NewHashRouter(
+		allocators, input, outputTyps, output.HashColumns,
+		execinfra.GetWorkMemLimit(flowCtx.Cfg), s.diskQueueCfg, s.fdSemaphore,
+		diskAccounts, metadataSourcesQueue, toClose,
+	)
 	runRouter := func(ctx context.Context, _ context.CancelFunc) {
 		router.Run(logtags.AddTag(ctx, "hashRouterID", strings.Join(streamIDs, ",")))
 	}
@@ -851,7 +851,8 @@ func (s *vectorizedFlowCreator) setupInput(
 		if input.Type == execinfrapb.InputSyncSpec_ORDERED {
 			os, err := colexec.NewOrderedSynchronizer(
 				colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx), factory),
-				inputStreamOps, input.ColumnTypes, execinfrapb.ConvertToColumnOrdering(input.Ordering),
+				execinfra.GetWorkMemLimit(flowCtx.Cfg), inputStreamOps,
+				input.ColumnTypes, execinfrapb.ConvertToColumnOrdering(input.Ordering),
 			)
 			if err != nil {
 				return nil, nil, nil, err

@@ -15,9 +15,11 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -29,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/sequence"
@@ -95,6 +98,13 @@ func (p *planner) IncrementSequenceByID(ctx context.Context, seqID int64) (int64
 	if err != nil {
 		return 0, err
 	}
+	if !descriptor.IsSequence() {
+		seqName, err := p.getQualifiedTableName(ctx, descriptor)
+		if err != nil {
+			return 0, err
+		}
+		return 0, sqlerrors.NewWrongObjectTypeError(seqName, "sequence")
+	}
 	return incrementSequenceHelper(ctx, p, descriptor)
 }
 
@@ -108,28 +118,88 @@ func incrementSequenceHelper(
 	}
 
 	seqOpts := descriptor.GetSequenceOpts()
+
 	var val int64
 	var err error
 	if seqOpts.Virtual {
 		rowid := builtins.GenerateUniqueInt(p.EvalContext().NodeID.SQLInstanceID())
 		val = int64(rowid)
 	} else {
-		seqValueKey := p.ExecCfg().Codec.SequenceKey(uint32(descriptor.GetID()))
-		val, err = kv.IncrementValRetryable(
-			ctx, p.txn.DB(), seqValueKey, seqOpts.Increment)
-		if err != nil {
-			if errors.HasType(err, (*roachpb.IntegerOverflowError)(nil)) {
-				return 0, boundsExceededError(descriptor)
-			}
-			return 0, err
-		}
-		if val > seqOpts.MaxValue || val < seqOpts.MinValue {
-			return 0, boundsExceededError(descriptor)
-		}
+		val, err = p.incrementSequenceUsingCache(ctx, descriptor)
+	}
+	if err != nil {
+		return 0, err
 	}
 
 	p.ExtendedEvalContext().SessionMutator.RecordLatestSequenceVal(uint32(descriptor.GetID()), val)
 
+	return val, nil
+}
+
+// incrementSequenceUsingCache fetches the next value of the sequence
+// represented by the passed catalog.TableDescriptor. If the sequence has a
+// cache size of greater than 1, then this function will read cached values
+// from the session data and repopulate these values when the cache is empty.
+func (p *planner) incrementSequenceUsingCache(
+	ctx context.Context, descriptor catalog.TableDescriptor,
+) (int64, error) {
+	seqOpts := descriptor.GetSequenceOpts()
+
+	cacheSize := seqOpts.EffectiveCacheSize()
+
+	fetchNextValues := func() (currentValue, incrementAmount, sizeOfCache int64, err error) {
+		seqValueKey := p.ExecCfg().Codec.SequenceKey(uint32(descriptor.GetID()))
+
+		endValue, err := kv.IncrementValRetryable(
+			ctx, p.txn.DB(), seqValueKey, seqOpts.Increment*cacheSize)
+
+		if err != nil {
+			if errors.HasType(err, (*roachpb.IntegerOverflowError)(nil)) {
+				return 0, 0, 0, boundsExceededError(descriptor)
+			}
+			return 0, 0, 0, err
+		}
+
+		// This sequence has exceeded its bounds after performing this increment.
+		if endValue > seqOpts.MaxValue || endValue < seqOpts.MinValue {
+			// If the sequence exceeded its bounds prior to the increment, then return an error.
+			if (seqOpts.Increment > 0 && endValue-seqOpts.Increment*cacheSize >= seqOpts.MaxValue) ||
+				(seqOpts.Increment < 0 && endValue-seqOpts.Increment*cacheSize <= seqOpts.MinValue) {
+				return 0, 0, 0, boundsExceededError(descriptor)
+			}
+			// Otherwise, values between the limit and the value prior to incrementing can be cached.
+			limit := seqOpts.MaxValue
+			if seqOpts.Increment < 0 {
+				limit = seqOpts.MinValue
+			}
+			abs := func(i int64) int64 {
+				if i < 0 {
+					return -i
+				}
+				return i
+			}
+			currentValue = endValue - seqOpts.Increment*(cacheSize-1)
+			incrementAmount = seqOpts.Increment
+			sizeOfCache = abs(limit-(endValue-seqOpts.Increment*cacheSize)) / abs(seqOpts.Increment)
+			return currentValue, incrementAmount, sizeOfCache, nil
+		}
+
+		return endValue - seqOpts.Increment*(cacheSize-1), seqOpts.Increment, cacheSize, nil
+	}
+
+	var val int64
+	var err error
+	if cacheSize == 1 {
+		val, _, _, err = fetchNextValues()
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		val, err = p.GetOrInitSequenceCache().NextValue(uint32(descriptor.GetID()), uint32(descriptor.GetVersion()), fetchNextValues)
+		if err != nil {
+			return 0, err
+		}
+	}
 	return val, nil
 }
 
@@ -177,6 +247,9 @@ func (p *planner) GetLatestValueInSessionForSequenceByID(
 	seqName, err := p.getQualifiedTableName(ctx, descriptor)
 	if err != nil {
 		return 0, err
+	}
+	if !descriptor.IsSequence() {
+		return 0, sqlerrors.NewWrongObjectTypeError(seqName, "sequence")
 	}
 	return getLatestValueInSessionForSequenceHelper(p, descriptor, seqName)
 }
@@ -229,6 +302,9 @@ func (p *planner) SetSequenceValueByID(
 	seqName, err := p.getQualifiedTableName(ctx, descriptor)
 	if err != nil {
 		return err
+	}
+	if !descriptor.IsSequence() {
+		return sqlerrors.NewWrongObjectTypeError(seqName, "sequence")
 	}
 	return setSequenceValueHelper(ctx, p, descriptor, newVal, isCalled, seqName)
 }
@@ -342,6 +418,8 @@ func assignSequenceOptions(
 			opts.MaxValue = -1
 			opts.Start = opts.MaxValue
 		}
+		// No Caching
+		opts.CacheSize = 1
 	}
 
 	// Fill in all other options.
@@ -369,8 +447,7 @@ func assignSequenceOptions(
 			case v == 1:
 				// Do nothing; this is the default.
 			case v > 1:
-				return unimplemented.NewWithIssuef(32567,
-					"CACHE values larger than 1 are not supported, found %d", v)
+				opts.CacheSize = *option.IntVal
 			}
 		case tree.SeqOptIncrement:
 			// Do nothing; this has already been set.
@@ -509,11 +586,11 @@ func removeSequenceOwnerIfExists(
 func resolveColumnItemToDescriptors(
 	ctx context.Context, p *planner, columnItem *tree.ColumnItem,
 ) (*tabledesc.Mutable, *descpb.ColumnDescriptor, error) {
-	var tableName tree.TableName
-	if columnItem.TableName != nil {
-		tableName = columnItem.TableName.ToTableName()
+	if columnItem.TableName == nil {
+		err := pgerror.New(pgcode.Syntax, "invalid OWNED BY option")
+		return nil, nil, errors.WithHint(err, "Specify OWNED BY table.column or OWNED BY NONE.")
 	}
-
+	tableName := columnItem.TableName.ToTableName()
 	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &tableName, true /* required */, tree.ResolveRequireTableDesc)
 	if err != nil {
 		return nil, nil, err
@@ -554,23 +631,38 @@ func addSequenceOwner(
 // The passed-in column descriptor is mutated, and the modified sequence descriptors are returned.
 func maybeAddSequenceDependencies(
 	ctx context.Context,
+	st *cluster.Settings,
 	sc resolver.SchemaResolver,
 	tableDesc *tabledesc.Mutable,
 	col *descpb.ColumnDescriptor,
 	expr tree.TypedExpr,
 	backrefs map[descpb.ID]*tabledesc.Mutable,
 ) ([]*tabledesc.Mutable, error) {
-	seqNames, err := sequence.GetUsedSequenceNames(expr)
+	seqIdentifiers, err := sequence.GetUsedSequences(expr)
 	if err != nil {
 		return nil, err
 	}
+	version := st.Version.ActiveVersionOrEmpty(ctx)
+	byID := version != (clusterversion.ClusterVersion{}) &&
+		version.IsActive(clusterversion.SequencesRegclass)
+
 	var seqDescs []*tabledesc.Mutable
-	for _, seqName := range seqNames {
-		parsedSeqName, err := parser.ParseTableName(seqName)
-		if err != nil {
-			return nil, err
+	var tn tree.TableName
+	seqNameToID := make(map[string]int64)
+	for _, seqIdentifier := range seqIdentifiers {
+		if seqIdentifier.IsByID() {
+			name, err := sc.GetQualifiedTableNameByID(ctx, seqIdentifier.SeqID, tree.ResolveRequireSequenceDesc)
+			if err != nil {
+				return nil, err
+			}
+			tn = *name
+		} else {
+			parsedSeqName, err := parser.ParseTableName(seqIdentifier.SeqName)
+			if err != nil {
+				return nil, err
+			}
+			tn = parsedSeqName.ToTableName()
 		}
-		tn := parsedSeqName.ToTableName()
 
 		var seqDesc *tabledesc.Mutable
 		p, ok := sc.(*planner)
@@ -586,6 +678,8 @@ func maybeAddSequenceDependencies(
 				return nil, err
 			}
 		}
+		seqNameToID[seqIdentifier.SeqName] = int64(seqDesc.ID)
+
 		// If we had already modified this Sequence as part of this transaction,
 		// we only want to modify a single instance of it instead of overwriting it.
 		// So replace seqDesc with the descriptor that was previously modified.
@@ -604,12 +698,25 @@ func maybeAddSequenceDependencies(
 			seqDesc.DependedOnBy = append(seqDesc.DependedOnBy, descpb.TableDescriptor_Reference{
 				ID:        tableDesc.ID,
 				ColumnIDs: []descpb.ColumnID{col.ID},
+				ByID:      byID,
 			})
 		} else {
 			seqDesc.DependedOnBy[refIdx].ColumnIDs = append(seqDesc.DependedOnBy[refIdx].ColumnIDs, col.ID)
 		}
 		seqDescs = append(seqDescs, seqDesc)
 	}
+
+	// If sequences are present in the expr (and the cluster is the right version),
+	// walk the expr tree and replace any sequences names with their IDs.
+	if len(seqIdentifiers) > 0 && byID {
+		newExpr, err := sequence.ReplaceSequenceNamesWithIDs(expr, seqNameToID)
+		if err != nil {
+			return nil, err
+		}
+		s := tree.Serialize(newExpr)
+		col.DefaultExpr = &s
+	}
+
 	return seqDescs, nil
 }
 

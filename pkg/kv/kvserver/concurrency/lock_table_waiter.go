@@ -600,9 +600,9 @@ func (w *lockTableWaiterImpl) pushHeader(req Request) roachpb.Header {
 		// need to push again, but expect to eventually succeed in reading,
 		// either after lease movement subsides or after the reader's read
 		// timestamp surpasses its global uncertainty limit.
-		localMaxTS := req.Txn.MaxTimestamp
-		localMaxTS.Backward(w.clock.Now())
-		h.Timestamp.Forward(localMaxTS)
+		localUncertaintyLimit := req.Txn.GlobalUncertaintyLimit
+		localUncertaintyLimit.Backward(w.clock.Now())
+		h.Timestamp.Forward(localUncertaintyLimit)
 	}
 	return h
 }
@@ -713,11 +713,11 @@ func (h *contentionEventHelper) emit() {
 	}
 	h.ev.Duration = timeutil.Since(h.tBegin)
 	if h.onEvent != nil {
-		// NB: this is intentionally above the call to LogStructured so that
+		// NB: this is intentionally above the call to RecordStructured so that
 		// this interceptor gets to mutate the event (used for test determinism).
 		h.onEvent(h.ev)
 	}
-	h.sp.LogStructured(h.ev)
+	h.sp.RecordStructured(h.ev)
 	h.ev = nil
 }
 

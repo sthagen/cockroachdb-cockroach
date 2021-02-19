@@ -22,11 +22,13 @@ go_library(
 
 go_test(
     name = "invertedexpr_test",
+    size = "small",
     srcs = ["geo_expression_test.go"],
     data = glob(["testdata/**"]),
     embed = [":invertedexpr"],
     deps = [
         "//pkg/geo/geoindex",
+        "//pkg/sql/inverted",
         "//pkg/util/leaktest",
         "@com_github_stretchr_testify//require",
     ],

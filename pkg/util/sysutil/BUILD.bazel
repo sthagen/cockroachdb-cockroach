@@ -62,6 +62,7 @@ go_library(
 
 go_test(
     name = "sysutil_test",
+    size = "small",
     srcs = [
         "large_file_test.go",
         "sysutil_test.go",
@@ -70,6 +71,7 @@ go_test(
     embed = [":sysutil"],
     deps = [
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_errors//oserror",
     ] + select({
         "@io_bazel_rules_go//go/platform:aix": [
             "@org_golang_x_sys//unix",

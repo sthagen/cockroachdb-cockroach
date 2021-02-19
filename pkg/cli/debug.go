@@ -279,8 +279,13 @@ func runDebugBallast(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 	ballastSize := targetUsage - used
+
+	// Note: CreateLargeFile fails if the target file already
+	// exists. This is a feature; we have seen users mistakenly applying
+	// the `ballast` command directly to block devices, thereby trashing
+	// their filesystem.
 	if err := sysutil.CreateLargeFile(ballastFile, ballastSize); err != nil {
-		return errors.Wrap(err, "failed to fallocate to ballast file")
+		return errors.Wrap(err, "error allocating ballast file")
 	}
 	return nil
 }
@@ -1195,7 +1200,7 @@ process that has failed and cannot restart.
 	RunE: usageAndErr,
 }
 
-// mvccValueFormatter is an fmt.Formatter for MVCC values.
+// mvccValueFormatter is a fmt.Formatter for MVCC values.
 type mvccValueFormatter struct {
 	kv  storage.MVCCKeyValue
 	err error
@@ -1210,18 +1215,34 @@ func (m mvccValueFormatter) Format(f fmt.State, c rune) {
 	fmt.Fprint(f, kvserver.SprintKeyValue(m.kv, false /* printKey */))
 }
 
+// lockValueFormatter is a fmt.Formatter for lock values.
+type lockValueFormatter struct {
+	value []byte
+}
+
+// Format implements the fmt.Formatter interface.
+func (m lockValueFormatter) Format(f fmt.State, c rune) {
+	fmt.Fprint(f, kvserver.SprintIntent(m.value))
+}
+
 func init() {
 	DebugCmd.AddCommand(debugCmds...)
 
 	// Note: we hook up FormatValue here in order to avoid a circular dependency
 	// between kvserver and storage.
-	// TODO(sumeer): fix this to also format EngineKey KVs.
 	storage.EngineComparer.FormatValue = func(key, value []byte) fmt.Formatter {
-		decoded, err := storage.DecodeMVCCKey(key)
-		if err != nil {
-			return mvccValueFormatter{err: err}
+		decoded, ok := storage.DecodeEngineKey(key)
+		if !ok {
+			return mvccValueFormatter{err: errors.Errorf("invalid encoded engine key: %x", key)}
 		}
-		return mvccValueFormatter{kv: storage.MVCCKeyValue{Key: decoded, Value: value}}
+		if decoded.IsMVCCKey() {
+			mvccKey, err := decoded.ToMVCCKey()
+			if err != nil {
+				return mvccValueFormatter{err: err}
+			}
+			return mvccValueFormatter{kv: storage.MVCCKeyValue{Key: mvccKey, Value: value}}
+		}
+		return lockValueFormatter{value: value}
 	}
 
 	// To be able to read Cockroach-written RocksDB manifests/SSTables, comparator

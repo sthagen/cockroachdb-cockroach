@@ -342,7 +342,7 @@ memo (optimized, ~37KB, required=[presentation: pid1:1,cid1:2,gcid1:3,gca1:4,ca1
  ├── G8: (inner-join G10 G5 G14) (inner-join G5 G10 G14) (merge-join G10 G5 G12 inner-join,+6,+10) (lookup-join G10 G12 parent1,keyCols=[6],outCols=(6-8,10,11)) (merge-join G5 G10 G12 inner-join,+10,+6) (lookup-join G5 G12 child1,keyCols=[10],outCols=(6-8,10,11))
  │    ├── [ordering: +(6|10),+7]
  │    │    ├── best: (sort G8)
- │    │    └── cost: 2368.34
+ │    │    └── cost: 2418.34
  │    ├── [ordering: +(6|10)]
  │    │    ├── best: (merge-join G10="[ordering: +6]" G5="[ordering: +10]" G12 inner-join,+6,+10)
  │    │    └── cost: 2138.05
@@ -363,7 +363,7 @@ memo (optimized, ~37KB, required=[presentation: pid1:1,cid1:2,gcid1:3,gca1:4,ca1
  ├── G11: (inner-join G7 G5 G6) (inner-join G5 G7 G6) (merge-join G7 G5 G12 inner-join,+1,+10) (lookup-join G7 G12 parent1,keyCols=[1],outCols=(1-4,10,11)) (merge-join G5 G7 G12 inner-join,+10,+1) (lookup-join G5 G12 grandchild1,keyCols=[10],outCols=(1-4,10,11))
  │    ├── [ordering: +(1|10),+2]
  │    │    ├── best: (sort G11)
- │    │    └── cost: 2388.34
+ │    │    └── cost: 2448.34
  │    ├── [ordering: +(1|10)]
  │    │    ├── best: (merge-join G7="[ordering: +1]" G5="[ordering: +10]" G12 inner-join,+1,+10)
  │    │    └── cost: 2158.05
@@ -543,7 +543,7 @@ memo (optimized, ~14KB, required=[presentation: a:1,b:2,c:3,v:6,s:7,t:8,u:9])
  ├── G5: (values G10 id=v1)
  │    ├── [ordering: +6]
  │    │    ├── best: (sort G5)
- │    │    └── cost: 0.12
+ │    │    └── cost: 0.14
  │    └── []
  │         ├── best: (values G10 id=v1)
  │         └── cost: 0.03
@@ -1534,7 +1534,7 @@ memo (optimized, ~11KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G3: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    ├── [ordering: +8]
  │    │    ├── best: (sort G3)
- │    │    └── cost: 1293.35
+ │    │    └── cost: 1323.35
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
  │         └── cost: 1074.02
@@ -1562,7 +1562,7 @@ memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G3: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    ├── [ordering: +8]
  │    │    ├── best: (sort G3)
- │    │    └── cost: 1293.35
+ │    │    └── cost: 1323.35
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
  │         └── cost: 1074.02
@@ -1633,7 +1633,7 @@ full-join (hash)
 memo expect=ReorderJoins
 SELECT * FROM abc INNER LOOKUP JOIN xyz ON a=x
 ----
-memo (optimized, ~9KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
+memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G1: (inner-join G2 G3 G4) (lookup-join G2 G5 xyz@xy,keyCols=[1],outCols=(1-3,6-8))
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (lookup-join G2 G5 xyz@xy,keyCols=[1],outCols=(1-3,6-8))
@@ -1752,7 +1752,7 @@ memo (optimized, ~10KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G3: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    ├── [ordering: +8]
  │    │    ├── best: (sort G3)
- │    │    └── cost: 1293.35
+ │    │    └── cost: 1323.35
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
  │         └── cost: 1074.02
@@ -1792,7 +1792,7 @@ memo (optimized, ~12KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G2: (scan xyz,cols=(6-8)) (scan xyz@xy,cols=(6-8)) (scan xyz@yz,cols=(6-8))
  │    ├── [ordering: +8]
  │    │    ├── best: (sort G2)
- │    │    └── cost: 1293.35
+ │    │    └── cost: 1323.35
  │    └── []
  │         ├── best: (scan xyz,cols=(6-8))
  │         └── cost: 1074.02
@@ -2068,7 +2068,7 @@ inner-join (merge)
 memo
 SELECT * FROM abc JOIN xyz ON a=x
 ----
-memo (optimized, ~13KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
+memo (optimized, ~14KB, required=[presentation: a:1,b:2,c:3,x:6,y:7,z:8])
  ├── G1: (inner-join G2 G3 G4) (inner-join G2 G3 G4) (inner-join G3 G2 G4) (merge-join G2 G3 G5 inner-join,+1,+6) (lookup-join G2 G5 xyz@xy,keyCols=[1],outCols=(1-3,6-8)) (merge-join G2 G3 G5 inner-join,+1,+6) (lookup-join G2 G5 xyz@xy,keyCols=[1],outCols=(1-3,6-8)) (merge-join G3 G2 G5 inner-join,+6,+1) (lookup-join G3 G5 abc@ab,keyCols=[6],outCols=(1-3,6-8))
  │    └── [presentation: a:1,b:2,c:3,x:6,y:7,z:8]
  │         ├── best: (merge-join G2="[ordering: +1]" G3="[ordering: +6]" G5 inner-join,+1,+6)
@@ -2171,7 +2171,7 @@ inner-join (hash)
 memo
 SELECT * FROM stu AS l JOIN stu AS r ON (l.s, l.t, l.u) = (r.s, r.t, r.u)
 ----
-memo (optimized, ~18KB, required=[presentation: s:1,t:2,u:3,s:5,t:6,u:7])
+memo (optimized, ~19KB, required=[presentation: s:1,t:2,u:3,s:5,t:6,u:7])
  ├── G1: (inner-join G2 G3 G4) (inner-join G2 G3 G4) (inner-join G3 G2 G4) (merge-join G2 G3 G5 inner-join,+1,+2,+3,+5,+6,+7) (merge-join G2 G3 G5 inner-join,+3,+2,+1,+7,+6,+5) (lookup-join G2 G5 stu [as=r],keyCols=[1 2 3],outCols=(1-3,5-7)) (lookup-join G2 G5 stu@uts [as=r],keyCols=[3 2 1],outCols=(1-3,5-7)) (merge-join G2 G3 G5 inner-join,+1,+2,+3,+5,+6,+7) (merge-join G2 G3 G5 inner-join,+3,+2,+1,+7,+6,+5) (lookup-join G2 G5 stu [as=r],keyCols=[1 2 3],outCols=(1-3,5-7)) (lookup-join G2 G5 stu@uts [as=r],keyCols=[3 2 1],outCols=(1-3,5-7)) (merge-join G3 G2 G5 inner-join,+5,+6,+7,+1,+2,+3) (merge-join G3 G2 G5 inner-join,+7,+6,+5,+3,+2,+1) (lookup-join G3 G5 stu [as=l],keyCols=[5 6 7],outCols=(1-3,5-7)) (lookup-join G3 G5 stu@uts [as=l],keyCols=[7 6 5],outCols=(1-3,5-7))
  │    └── [presentation: s:1,t:2,u:3,s:5,t:6,u:7]
  │         ├── best: (merge-join G2="[ordering: +1,+2,+3]" G3="[ordering: +5,+6,+7]" G5 inner-join,+1,+2,+3,+5,+6,+7)
@@ -3133,46 +3133,262 @@ CREATE TABLE t59615 (
 )
 ----
 
-opt expect-not=GenerateLookupJoins
+opt expect=GenerateLookupJoins
 SELECT * FROM (VALUES (1), (2)) AS u(y) LEFT JOIN t59615 t ON u.y = t.y
 ----
-right-join (hash)
+left-join (lookup t59615 [as=t])
  ├── columns: y:1!null x:2 y:3 z:4
+ ├── lookup expression
+ │    └── filters
+ │         ├── column1:1 = y:3 [outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
+ │         └── x:2 IN (1, 3) [outer=(2), constraints=(/2: [/1 - /1] [/3 - /3]; tight)]
  ├── cardinality: [2 - ]
  ├── fd: (2,3)-->(4)
- ├── scan t59615 [as=t]
- │    ├── columns: x:2!null y:3!null z:4
- │    ├── check constraint expressions
- │    │    └── x:2 IN (1, 3) [outer=(2), constraints=(/2: [/1 - /1] [/3 - /3]; tight)]
- │    ├── key: (2,3)
- │    └── fd: (2,3)-->(4)
  ├── values
  │    ├── columns: column1:1!null
  │    ├── cardinality: [2 - 2]
  │    ├── (1,)
  │    └── (2,)
- └── filters
-      └── column1:1 = y:3 [outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
+ └── filters (true)
 
-opt expect-not=GenerateLookupJoins
+opt expect=GenerateLookupJoins
 SELECT * FROM (VALUES (1), (2)) AS u(y) WHERE NOT EXISTS (
   SELECT * FROM t59615 t WHERE u.y = t.y
 )
 ----
-anti-join (hash)
+anti-join (lookup t59615 [as=t])
  ├── columns: y:1!null
+ ├── lookup expression
+ │    └── filters
+ │         ├── column1:1 = y:3 [outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
+ │         └── x:2 IN (1, 3) [outer=(2), constraints=(/2: [/1 - /1] [/3 - /3]; tight)]
  ├── cardinality: [0 - 2]
  ├── values
  │    ├── columns: column1:1!null
  │    ├── cardinality: [2 - 2]
  │    ├── (1,)
  │    └── (2,)
- ├── scan t59615 [as=t]
- │    ├── columns: y:3!null
- │    └── check constraint expressions
- │         └── x:2 IN (1, 3) [outer=(2), constraints=(/2: [/1 - /1] [/3 - /3]; tight)]
+ └── filters (true)
+
+exec-ddl
+CREATE TABLE lookup_expr (
+  r STRING NOT NULL CHECK (r IN ('east', 'west')),
+  k INT NOT NULL,
+  u INT,
+  v INT,
+  w INT,
+  x INT,
+  y INT NOT NULL CHECK (y IN (10, 20)),
+  z INT NOT NULL CHECK (z = 5),
+  PRIMARY KEY (r, k),
+  INDEX idx_x_etc (r, x, y, z, w),
+  INDEX idx_u_etc (r, u, y, v, z, w),
+  INDEX idx_vrw (v, r, w)
+)
+----
+
+# The filters in the lookup expression should constrain the primary index.
+# The left lookup join is wrapped in a Project since r was not one of the
+# original output columns of the join.
+opt expect=GenerateLookupJoins
+SELECT t.k FROM (VALUES (1, 10), (2, 20), (3, NULL)) AS q(k, v) LEFT JOIN lookup_expr t
+ON q.k = t.k
+----
+project
+ ├── columns: k:4
+ ├── cardinality: [3 - ]
+ └── project
+      ├── columns: column1:1!null k:4
+      ├── cardinality: [3 - ]
+      └── left-join (lookup lookup_expr [as=t])
+           ├── columns: column1:1!null r:3 k:4
+           ├── lookup expression
+           │    └── filters
+           │         ├── column1:1 = k:4 [outer=(1,4), constraints=(/1: (/NULL - ]; /4: (/NULL - ]), fd=(1)==(4), (4)==(1)]
+           │         └── r:3 IN ('east', 'west') [outer=(3), constraints=(/3: [/'east' - /'east'] [/'west' - /'west']; tight)]
+           ├── cardinality: [3 - ]
+           ├── values
+           │    ├── columns: column1:1!null
+           │    ├── cardinality: [3 - 3]
+           │    ├── (1,)
+           │    ├── (2,)
+           │    └── (3,)
+           └── filters (true)
+
+# The filters in the lookup expression should constrain the primary index.
+opt expect=GenerateLookupJoins
+SELECT q.k FROM (VALUES (1, 10), (2, 20), (3, NULL)) AS q(k, v) WHERE NOT EXISTS (
+  SELECT * FROM lookup_expr t WHERE q.k = t.k
+)
+----
+anti-join (lookup lookup_expr [as=t])
+ ├── columns: k:1!null
+ ├── lookup expression
+ │    └── filters
+ │         ├── column1:1 = k:4 [outer=(1,4), constraints=(/1: (/NULL - ]; /4: (/NULL - ]), fd=(1)==(4), (4)==(1)]
+ │         └── r:3 IN ('east', 'west') [outer=(3), constraints=(/3: [/'east' - /'east'] [/'west' - /'west']; tight)]
+ ├── cardinality: [0 - 3]
+ ├── values
+ │    ├── columns: column1:1!null
+ │    ├── cardinality: [3 - 3]
+ │    ├── (1,)
+ │    ├── (2,)
+ │    └── (3,)
+ └── filters (true)
+
+# The filters in the lookup expression should constrain all columns in
+# idx_x_etc.
+opt expect=GenerateLookupJoins
+SELECT * FROM (VALUES (1, 10), (2, 20), (3, NULL)) AS q(w, x) LEFT JOIN lookup_expr t
+ON q.w = t.w AND q.x = t.x
+----
+left-join (lookup lookup_expr [as=t])
+ ├── columns: w:1!null x:2 r:3 k:4 u:5 v:6 w:7 x:8 y:9 z:10
+ ├── key columns: [3 4] = [3 4]
+ ├── lookup columns are key
+ ├── cardinality: [3 - ]
+ ├── fd: (3,4)-->(5-9)
+ ├── left-join (lookup lookup_expr@idx_x_etc [as=t])
+ │    ├── columns: column1:1!null column2:2 r:3 k:4 w:7 x:8 y:9 z:10
+ │    ├── lookup expression
+ │    │    └── filters
+ │    │         ├── column2:2 = x:8 [outer=(2,8), constraints=(/2: (/NULL - ]; /8: (/NULL - ]), fd=(2)==(8), (8)==(2)]
+ │    │         ├── column1:1 = w:7 [outer=(1,7), constraints=(/1: (/NULL - ]; /7: (/NULL - ]), fd=(1)==(7), (7)==(1)]
+ │    │         ├── r:3 IN ('east', 'west') [outer=(3), constraints=(/3: [/'east' - /'east'] [/'west' - /'west']; tight)]
+ │    │         ├── y:9 IN (10, 20) [outer=(9), constraints=(/9: [/10 - /10] [/20 - /20]; tight)]
+ │    │         └── z:10 = 5 [outer=(10), constraints=(/10: [/5 - /5]; tight), fd=()-->(10)]
+ │    ├── cardinality: [3 - ]
+ │    ├── fd: (3,4)-->(7-10)
+ │    ├── values
+ │    │    ├── columns: column1:1!null column2:2
+ │    │    ├── cardinality: [3 - 3]
+ │    │    ├── (1, 10)
+ │    │    ├── (2, 20)
+ │    │    └── (3, NULL)
+ │    └── filters (true)
+ └── filters (true)
+
+# The filters in the lookup expression should constrain only the first 3 columns
+# of idx_u_etc.
+opt expect=GenerateLookupJoins
+SELECT * FROM (VALUES (1, 10), (2, 20), (3, NULL)) AS q(w, u) LEFT JOIN lookup_expr t
+ON q.w = t.w AND q.u = t.u
+----
+left-join (lookup lookup_expr [as=t])
+ ├── columns: w:1!null u:2 r:3 k:4 u:5 v:6 w:7 x:8 y:9 z:10
+ ├── key columns: [3 4] = [3 4]
+ ├── lookup columns are key
+ ├── cardinality: [3 - ]
+ ├── fd: (3,4)-->(5-9)
+ ├── left-join (lookup lookup_expr@idx_u_etc [as=t])
+ │    ├── columns: column1:1!null column2:2 r:3 k:4 u:5 v:6 w:7 y:9 z:10
+ │    ├── lookup expression
+ │    │    └── filters
+ │    │         ├── column2:2 = u:5 [outer=(2,5), constraints=(/2: (/NULL - ]; /5: (/NULL - ]), fd=(2)==(5), (5)==(2)]
+ │    │         ├── r:3 IN ('east', 'west') [outer=(3), constraints=(/3: [/'east' - /'east'] [/'west' - /'west']; tight)]
+ │    │         └── y:9 IN (10, 20) [outer=(9), constraints=(/9: [/10 - /10] [/20 - /20]; tight)]
+ │    ├── cardinality: [3 - ]
+ │    ├── fd: (3,4)-->(5-7,9,10)
+ │    ├── values
+ │    │    ├── columns: column1:1!null column2:2
+ │    │    ├── cardinality: [3 - 3]
+ │    │    ├── (1, 10)
+ │    │    ├── (2, 20)
+ │    │    └── (3, NULL)
+ │    └── filters
+ │         └── column1:1 = w:7 [outer=(1,7), constraints=(/1: (/NULL - ]; /7: (/NULL - ]), fd=(1)==(7), (7)==(1)]
+ └── filters (true)
+
+# Ensure that we constrain all columns in idx_vrw, not just v.
+opt expect=GenerateLookupJoins
+SELECT * FROM (VALUES (1, 10), (2, 20), (3, NULL)) AS q(v, w) LEFT JOIN lookup_expr t
+ON q.v = t.v AND q.w = t.w
+----
+left-join (lookup lookup_expr [as=t])
+ ├── columns: v:1!null w:2 r:3 k:4 u:5 v:6 w:7 x:8 y:9 z:10
+ ├── key columns: [3 4] = [3 4]
+ ├── lookup columns are key
+ ├── cardinality: [3 - ]
+ ├── fd: (3,4)-->(5-9)
+ ├── left-join (lookup lookup_expr@idx_vrw [as=t])
+ │    ├── columns: column1:1!null column2:2 r:3 k:4 v:6 w:7
+ │    ├── lookup expression
+ │    │    └── filters
+ │    │         ├── column1:1 = v:6 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
+ │    │         ├── column2:2 = w:7 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
+ │    │         └── r:3 IN ('east', 'west') [outer=(3), constraints=(/3: [/'east' - /'east'] [/'west' - /'west']; tight)]
+ │    ├── cardinality: [3 - ]
+ │    ├── fd: (3,4)-->(6,7)
+ │    ├── values
+ │    │    ├── columns: column1:1!null column2:2
+ │    │    ├── cardinality: [3 - 3]
+ │    │    ├── (1, 10)
+ │    │    ├── (2, 20)
+ │    │    └── (3, NULL)
+ │    └── filters (true)
+ └── filters (true)
+
+# The OR filter gets converted to an IN expression in the lookup expression
+# filters.
+# TODO(rytaft): The OR filter shouldn't get re-applied as an additional filter
+# in the ON expression.
+opt expect=GenerateLookupJoinsWithFilter
+SELECT * FROM (VALUES (1, 10), (2, 20), (3, NULL)) AS q(w, v) LEFT LOOKUP JOIN lookup_expr t
+ON (t.u = 1 OR t.u = 2) AND q.v = t.v
+----
+left-join (lookup lookup_expr [as=t])
+ ├── columns: w:1!null v:2 r:3 k:4 u:5 v:6 w:7 x:8 y:9 z:10
+ ├── key columns: [3 4] = [3 4]
+ ├── lookup columns are key
+ ├── cardinality: [3 - ]
+ ├── fd: (3,4)-->(5-9)
+ ├── left-join (lookup lookup_expr@idx_u_etc [as=t])
+ │    ├── columns: column1:1!null column2:2 r:3 k:4 u:5 v:6 w:7 y:9 z:10
+ │    ├── flags: force lookup join (into right side)
+ │    ├── lookup expression
+ │    │    └── filters
+ │    │         ├── column2:2 = v:6 [outer=(2,6), constraints=(/2: (/NULL - ]; /6: (/NULL - ]), fd=(2)==(6), (6)==(2)]
+ │    │         ├── r:3 IN ('east', 'west') [outer=(3), constraints=(/3: [/'east' - /'east'] [/'west' - /'west']; tight)]
+ │    │         ├── u:5 IN (1, 2) [outer=(5), constraints=(/5: [/1 - /1] [/2 - /2]; tight)]
+ │    │         ├── y:9 IN (10, 20) [outer=(9), constraints=(/9: [/10 - /10] [/20 - /20]; tight)]
+ │    │         └── z:10 = 5 [outer=(10), constraints=(/10: [/5 - /5]; tight), fd=()-->(10)]
+ │    ├── cardinality: [3 - ]
+ │    ├── fd: (3,4)-->(5-7,9,10)
+ │    ├── values
+ │    │    ├── columns: column1:1!null column2:2
+ │    │    ├── cardinality: [3 - 3]
+ │    │    ├── (1, 10)
+ │    │    ├── (2, 20)
+ │    │    └── (3, NULL)
+ │    └── filters
+ │         └── (u:5 = 1) OR (u:5 = 2) [outer=(5), constraints=(/5: [/1 - /1] [/2 - /2]; tight)]
+ └── filters (true)
+
+# We can't build a lookup join with any of the indexes.
+opt expect-not=GenerateLookupJoins
+SELECT * FROM (VALUES (1, 10), (2, 20), (3, NULL)) AS q(w, x) LEFT JOIN lookup_expr t
+ON q.w = t.w
+----
+right-join (hash)
+ ├── columns: w:1!null x:2 r:3 k:4 u:5 v:6 w:7 x:8 y:9 z:10
+ ├── cardinality: [3 - ]
+ ├── fd: (3,4)-->(5-9)
+ ├── scan lookup_expr [as=t]
+ │    ├── columns: r:3!null k:4!null u:5 v:6 w:7 x:8 y:9!null z:10!null
+ │    ├── check constraint expressions
+ │    │    ├── r:3 IN ('east', 'west') [outer=(3), constraints=(/3: [/'east' - /'east'] [/'west' - /'west']; tight)]
+ │    │    ├── y:9 IN (10, 20) [outer=(9), constraints=(/9: [/10 - /10] [/20 - /20]; tight)]
+ │    │    └── z:10 = 5 [outer=(10), constraints=(/10: [/5 - /5]; tight), fd=()-->(10)]
+ │    ├── key: (3,4)
+ │    └── fd: ()-->(10), (3,4)-->(5-9)
+ ├── values
+ │    ├── columns: column1:1!null column2:2
+ │    ├── cardinality: [3 - 3]
+ │    ├── (1, 10)
+ │    ├── (2, 20)
+ │    └── (3, NULL)
  └── filters
-      └── column1:1 = y:3 [outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
+      └── column1:1 = w:7 [outer=(1,7), constraints=(/1: (/NULL - ]; /7: (/NULL - ]), fd=(1)==(7), (7)==(1)]
 
 # Regression test for #59738. findConstantFilterCols should not panic when it
 # finds constant filters for columns that are not in the index of the lookup
@@ -6036,13 +6252,12 @@ project
       │    ├── inverted-expr
       │    │    └── t1.j:20 @> t2.j:3
       │    ├── key: (18)
-      │    ├── fd: (1)-->(2,3), (18)-->(19), (2)==(19), (19)==(2), (1)==(18), (18)==(1)
+      │    ├── fd: (1)-->(2,3), (18)-->(19), (1)==(18), (18)==(1), (2)==(19), (19)==(2)
       │    ├── scan json_arr2 [as=t2]
       │    │    ├── columns: t2.k:1!null l:2 t2.j:3
       │    │    ├── key: (1)
       │    │    └── fd: (1)-->(2,3)
-      │    └── filters
-      │         └── i:19 = l:2 [outer=(2,19), constraints=(/2: (/NULL - ]; /19: (/NULL - ]), fd=(2)==(19), (19)==(2)]
+      │    └── filters (true)
       └── filters
            └── t1.j:8 @> t2.j:3 [outer=(3,8), immutable]
 
@@ -6265,6 +6480,46 @@ anti-join (cross)
  │         └── x:2 IN (1, 3) [outer=(2), constraints=(/2: [/1 - /1] [/3 - /3]; tight)]
  └── filters
       └── y:3 @> column1:1 [outer=(1,3), immutable]
+
+# Regression test for #59859. Do not panic when the ON condition has a constant
+# filter to constrain the non-inverted prefix column and a variable equality
+# filter that does not constrain the prefix column.
+exec-ddl
+CREATE TABLE t59859_a (
+  k INT PRIMARY KEY,
+  j JSON
+)
+----
+
+exec-ddl
+CREATE TABLE t59859_b (
+  k INT PRIMARY KEY,
+  i INT,
+  j JSON,
+  INVERTED INDEX (k, j)
+)
+----
+
+opt expect=GenerateInvertedJoinsFromSelect format=hide-all
+SELECT a.k, b.k
+FROM t59859_a AS a INNER INVERTED JOIN t59859_b AS b
+ON b.k = 1 AND b.j @> a.j AND b.i = a.k
+----
+project
+ └── inner-join (lookup t59859_b [as=b])
+      ├── lookup columns are key
+      ├── inner-join (inverted t59859_b@secondary [as=b])
+      │    ├── flags: force inverted join (into right side)
+      │    ├── inverted-expr
+      │    │    └── b.j @> a.j
+      │    ├── project
+      │    │    ├── scan t59859_a [as=a]
+      │    │    └── projections
+      │    │         └── 1
+      │    └── filters (true)
+      └── filters
+           ├── b.j @> a.j
+           └── i = a.k
 
 # -------------------------------------------------------
 # GenerateInvertedJoinsFromSelect + Partial Indexes
@@ -6741,7 +6996,7 @@ inner-join (lookup abc@ab)
  └── filters (true)
 
 # No-op case because the right side of the InnerJoin has outer columns.
-opt expect-not=PushJoinIntoIndexJoin disable=(TryDecorrelateProject)
+opt expect-not=PushJoinIntoIndexJoin disable=(TryDecorrelateProject,HoistProjectFromInnerJoin)
 SELECT * 
 FROM stu
 INNER JOIN LATERAL (
@@ -7070,3 +7325,215 @@ union-all
       │    └── filters (true)
       └── projections
            └── 1 [as="?column?":6]
+
+# --------------------------------------------------
+# HoistProjectFromInnerJoin
+# --------------------------------------------------
+
+opt expect=HoistProjectFromInnerJoin
+SELECT * FROM small JOIN (SELECT a, a+b FROM abcd) ON a=m
+----
+project
+ ├── columns: m:1!null n:2 a:5!null "?column?":10
+ ├── immutable
+ ├── fd: (1)==(5), (5)==(1)
+ ├── inner-join (lookup abcd@secondary)
+ │    ├── columns: m:1!null n:2 a:5!null b:6
+ │    ├── key columns: [1] = [5]
+ │    ├── fd: (1)==(5), (5)==(1)
+ │    ├── scan small
+ │    │    └── columns: m:1 n:2
+ │    └── filters (true)
+ └── projections
+      └── a:5 + b:6 [as="?column?":10, outer=(5,6), immutable]
+
+# The rule works the other way too, thanks to join commuting.
+opt expect=HoistProjectFromInnerJoin
+SELECT * FROM (SELECT a, a+b FROM abcd) JOIN small ON a=m
+----
+project
+ ├── columns: a:1!null "?column?":6 m:7!null n:8
+ ├── immutable
+ ├── fd: (1)==(7), (7)==(1)
+ ├── inner-join (lookup abcd@secondary)
+ │    ├── columns: a:1!null b:2 m:7!null n:8
+ │    ├── key columns: [7] = [1]
+ │    ├── fd: (1)==(7), (7)==(1)
+ │    ├── scan small
+ │    │    └── columns: m:7 n:8
+ │    └── filters (true)
+ └── projections
+      └── a:1 + b:2 [as="?column?":6, outer=(1,2), immutable]
+
+# The rule should not fire when the ON condition uses a projection.
+# TODO(radu): we could inline the projection.
+opt expect-not=HoistProjectFromInnerJoin
+SELECT * FROM small JOIN (SELECT a, a+b FROM abcd) AS rhs(a,x) ON a=m AND x=n
+----
+inner-join (hash)
+ ├── columns: m:1!null n:2!null a:5!null x:10!null
+ ├── immutable
+ ├── fd: (1)==(5), (5)==(1), (2)==(10), (10)==(2)
+ ├── project
+ │    ├── columns: "?column?":10 a:5
+ │    ├── immutable
+ │    ├── scan abcd@secondary
+ │    │    └── columns: a:5 b:6
+ │    └── projections
+ │         └── a:5 + b:6 [as="?column?":10, outer=(5,6), immutable]
+ ├── scan small
+ │    └── columns: m:1 n:2
+ └── filters
+      ├── a:5 = m:1 [outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
+      └── "?column?":10 = n:2 [outer=(2,10), constraints=(/2: (/NULL - ]; /10: (/NULL - ]), fd=(2)==(10), (10)==(2)]
+
+# The rule should not fire when a projection is volatile.
+opt expect-not=HoistProjectFromInnerJoin
+SELECT * FROM small JOIN (SELECT a, a+b, random() FROM abcd) ON a=m
+----
+inner-join (merge)
+ ├── columns: m:1!null n:2 a:5!null "?column?":10 random:11
+ ├── left ordering: +5
+ ├── right ordering: +1
+ ├── volatile
+ ├── fd: (1)==(5), (5)==(1)
+ ├── project
+ │    ├── columns: "?column?":10 random:11 a:5
+ │    ├── volatile
+ │    ├── ordering: +5
+ │    ├── scan abcd@secondary
+ │    │    ├── columns: a:5 b:6
+ │    │    └── ordering: +5
+ │    └── projections
+ │         ├── a:5 + b:6 [as="?column?":10, outer=(5,6), immutable]
+ │         └── random() [as=random:11, volatile]
+ ├── sort
+ │    ├── columns: m:1 n:2
+ │    ├── ordering: +1
+ │    └── scan small
+ │         └── columns: m:1 n:2
+ └── filters (true)
+
+# --------------------------------------------------
+# HoistProjectFromLeftJoin
+# --------------------------------------------------
+
+# The rule should use p as the canary column.
+opt expect=HoistProjectFromLeftJoin
+SELECT * FROM small LEFT JOIN (SELECT p, p+q FROM pqr) ON p=m
+----
+project
+ ├── columns: m:1 n:2 p:5 "?column?":11
+ ├── immutable
+ ├── fd: (5)-->(11)
+ ├── left-join (lookup pqr)
+ │    ├── columns: m:1 n:2 p:5 q:6
+ │    ├── key columns: [1] = [5]
+ │    ├── lookup columns are key
+ │    ├── fd: (5)-->(6)
+ │    ├── scan small
+ │    │    └── columns: m:1 n:2
+ │    └── filters (true)
+ └── projections
+      └── CASE p:5 IS NULL WHEN true THEN CAST(NULL AS INT8) ELSE p:5 + q:6 END [as="?column?":11, outer=(5,6), immutable]
+
+# The rule should use a as the canary column, because it is null-rejected by
+# the ON condition.
+opt expect=HoistProjectFromLeftJoin
+SELECT * FROM small LEFT JOIN (SELECT a, a+b FROM abcd) ON a=m
+----
+project
+ ├── columns: m:1 n:2 a:5 "?column?":10
+ ├── immutable
+ ├── left-join (lookup abcd@secondary)
+ │    ├── columns: m:1 n:2 a:5 b:6
+ │    ├── key columns: [1] = [5]
+ │    ├── scan small
+ │    │    └── columns: m:1 n:2
+ │    └── filters (true)
+ └── projections
+      └── CASE a:5 IS NULL WHEN true THEN CAST(NULL AS INT8) ELSE a:5 + b:6 END [as="?column?":10, outer=(5,6), immutable]
+
+# The rule can use p as the canary column, because it is not-null in the right
+# input.
+opt expect=HoistProjectFromLeftJoin
+SELECT * FROM small LEFT JOIN (SELECT q, p+q FROM pqr) ON q=m
+----
+project
+ ├── columns: m:1 n:2 q:6 "?column?":11
+ ├── immutable
+ ├── left-join (lookup pqr@q)
+ │    ├── columns: m:1 n:2 p:5 q:6
+ │    ├── key columns: [1] = [6]
+ │    ├── fd: (5)-->(6)
+ │    ├── scan small
+ │    │    └── columns: m:1 n:2
+ │    └── filters (true)
+ └── projections
+      └── CASE p:5 IS NULL WHEN true THEN CAST(NULL AS INT8) ELSE p:5 + q:6 END [as="?column?":11, outer=(5,6), immutable]
+
+# We cannot find a canary column, so the rule should not fire.
+# TODO(radu): we could try adding a column to the input scan, similar to EnsureKey.
+opt expect-not=HoistProjectFromLeftJoin
+SELECT * FROM small LEFT JOIN (SELECT a, a+b FROM abcd) ON a=m OR m=1
+----
+right-join (cross)
+ ├── columns: m:1 n:2 a:5 "?column?":10
+ ├── immutable
+ ├── project
+ │    ├── columns: "?column?":10 a:5
+ │    ├── immutable
+ │    ├── scan abcd@secondary
+ │    │    └── columns: a:5 b:6
+ │    └── projections
+ │         └── a:5 + b:6 [as="?column?":10, outer=(5,6), immutable]
+ ├── scan small
+ │    └── columns: m:1 n:2
+ └── filters
+      └── (a:5 = m:1) OR (m:1 = 1) [outer=(1,5), constraints=(/1: (/NULL - ])]
+
+# The rule should not fire when the ON condition uses a projection.
+# TODO(radu): we could inline the projection.
+opt expect-not=HoistProjectFromLeftJoin
+SELECT * FROM small LEFT JOIN (SELECT a, a+b FROM abcd) AS rhs(a,x) ON a=m AND x=n
+----
+right-join (hash)
+ ├── columns: m:1 n:2 a:5 x:10
+ ├── immutable
+ ├── project
+ │    ├── columns: "?column?":10 a:5
+ │    ├── immutable
+ │    ├── scan abcd@secondary
+ │    │    └── columns: a:5 b:6
+ │    └── projections
+ │         └── a:5 + b:6 [as="?column?":10, outer=(5,6), immutable]
+ ├── scan small
+ │    └── columns: m:1 n:2
+ └── filters
+      ├── a:5 = m:1 [outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
+      └── "?column?":10 = n:2 [outer=(2,10), constraints=(/2: (/NULL - ]; /10: (/NULL - ]), fd=(2)==(10), (10)==(2)]
+
+# The rule should not fire when a projection is volatile.
+opt expect-not=HoistProjectFromLeftJoin
+SELECT * FROM small LEFT JOIN (SELECT p, p+q, random() FROM pqr) ON p=m
+----
+right-join (hash)
+ ├── columns: m:1 n:2 p:5 "?column?":11 random:12
+ ├── volatile
+ ├── fd: (5)-->(11,12)
+ ├── project
+ │    ├── columns: "?column?":11 random:12 p:5!null
+ │    ├── volatile
+ │    ├── key: (5)
+ │    ├── fd: (5)-->(11,12)
+ │    ├── scan pqr@q
+ │    │    ├── columns: p:5!null q:6
+ │    │    ├── key: (5)
+ │    │    └── fd: (5)-->(6)
+ │    └── projections
+ │         ├── p:5 + q:6 [as="?column?":11, outer=(5,6), immutable]
+ │         └── random() [as=random:12, volatile]
+ ├── scan small
+ │    └── columns: m:1 n:2
+ └── filters
+      └── p:5 = m:1 [outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]

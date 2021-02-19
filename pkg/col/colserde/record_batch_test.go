@@ -25,9 +25,11 @@ import (
 	"github.com/apache/arrow/go/arrow/array"
 	"github.com/apache/arrow/go/arrow/memory"
 	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -291,6 +293,46 @@ func TestRecordBatchSerializerSerializeDeserializeRandom(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestRecordBatchSerializerDeserializeMemoryEstimate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var err error
+	rng, _ := randutil.NewPseudoRand()
+
+	typs := []*types.T{types.Bytes}
+	b := testAllocator.NewMemBatchWithFixedCapacity(typs, coldata.BatchSize())
+	bytesVec := b.ColVec(0).Bytes()
+	maxValueLen := coldata.BytesInitialAllocationFactor * 8
+	value := make([]byte, maxValueLen)
+	for i := 0; i < coldata.BatchSize(); i++ {
+		value = value[:rng.Intn(maxValueLen)]
+		_, err = rng.Read(value)
+		require.NoError(t, err)
+		bytesVec.Set(i, value)
+	}
+	b.SetLength(coldata.BatchSize())
+
+	originalMemorySize := colmem.GetBatchMemSize(b)
+
+	c, err := colserde.NewArrowBatchConverter(typs)
+	require.NoError(t, err)
+	r, err := colserde.NewRecordBatchSerializer(typs)
+	require.NoError(t, err)
+	b, err = roundTripBatch(b, c, r, typs)
+	require.NoError(t, err)
+	newMemorySize := colmem.GetBatchMemSize(b)
+
+	// We expect that the original and the new memory sizes are relatively close
+	// to each other (do not differ by more than a third). We cannot guarantee
+	// more precise bound here because the capacities of the underlying []byte
+	// slices is unpredictable. However, this check is sufficient to ensure that
+	// we don't double count memory under `Bytes.data`.
+	const maxDeviation = float64(0.33)
+	deviation := math.Abs(float64(originalMemorySize-newMemorySize) / (float64(originalMemorySize)))
+	require.GreaterOrEqualf(t, maxDeviation, deviation,
+		"new memory size %d is too far away from original %d", newMemorySize, originalMemorySize)
 }
 
 func BenchmarkRecordBatchSerializerInt64(b *testing.B) {

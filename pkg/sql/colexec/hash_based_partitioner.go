@@ -120,8 +120,8 @@ type hashBasedPartitioner struct {
 	inputs                             []colexecbase.Operator
 	inputTypes                         [][]*types.T
 	hashCols                           [][]uint32
-	inMemMainOp                        ResettableOperator
-	diskBackedFallbackOp               ResettableOperator
+	inMemMainOp                        colexecbase.ResettableOperator
+	diskBackedFallbackOp               colexecbase.ResettableOperator
 	maxPartitionSizeToProcessUsingMain int64
 	// fdState is used to acquire file descriptors up front.
 	fdState struct {
@@ -208,12 +208,12 @@ func newHashBasedPartitioner(
 	inputs []colexecbase.Operator,
 	inputTypes [][]*types.T,
 	hashCols [][]uint32,
-	inMemMainOpConstructor func([]*partitionerToOperator) ResettableOperator,
+	inMemMainOpConstructor func([]*partitionerToOperator) colexecbase.ResettableOperator,
 	diskBackedFallbackOpConstructor func(
 		partitionedInputs []*partitionerToOperator,
 		maxNumberActivePartitions int,
 		fdSemaphore semaphore.Semaphore,
-	) ResettableOperator,
+	) colexecbase.ResettableOperator,
 	diskAcc *mon.BoundAccount,
 	numRequiredActivePartitions int,
 ) *hashBasedPartitioner {
@@ -239,12 +239,19 @@ func newHashBasedPartitioner(
 			inputTypes[i], diskQueueCfg, partitionedDiskQueueSemaphore, colcontainer.PartitionerStrategyDefault, diskAcc,
 		)
 		partitionedInputs[i] = newPartitionerToOperator(
-			unlimitedAllocator, inputTypes[i], partitioners[i], 0, /* partitionIdx */
+			unlimitedAllocator, inputTypes[i], partitioners[i],
 		)
 	}
 	maxNumberActivePartitions := calculateMaxNumberActivePartitions(flowCtx, args, numRequiredActivePartitions)
 	diskQueuesMemUsed := maxNumberActivePartitions * diskQueueCfg.BufferSizeBytes
-	maxPartitionSizeToProcessUsingMain := execinfra.GetWorkMemLimit(flowCtx.Cfg) - int64(diskQueuesMemUsed)
+	memoryLimit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
+	if memoryLimit == 1 {
+		// If memory limit is 1, we're likely in a "force disk spill"
+		// scenario, but we don't want to artificially limit batches when we
+		// have already spilled, so we'll use a larger limit.
+		memoryLimit = defaultMemoryLimit
+	}
+	maxPartitionSizeToProcessUsingMain := memoryLimit - int64(diskQueuesMemUsed)
 	if maxPartitionSizeToProcessUsingMain < hbpMinimalMaxPartitionSizeForMain {
 		maxPartitionSizeToProcessUsingMain = hbpMinimalMaxPartitionSizeForMain
 	}
@@ -454,9 +461,11 @@ StateChanged:
 					batch := op.recursiveScratch.batches[i]
 					partitioner := op.partitioners[i]
 					for {
-						if err := partitioner.Dequeue(ctx, parentPartitionIdx, batch); err != nil {
-							colexecerror.InternalError(err)
-						}
+						op.unlimitedAllocator.PerformOperation(batch.ColVecs(), func() {
+							if err := partitioner.Dequeue(ctx, parentPartitionIdx, batch); err != nil {
+								colexecerror.InternalError(err)
+							}
+						})
 						if batch.Length() == 0 {
 							break
 						}
@@ -520,7 +529,7 @@ StateChanged:
 					for i := range op.partitionedInputs {
 						op.partitionedInputs[i].partitionIdx = partitionIdx
 					}
-					op.inMemMainOp.reset(ctx)
+					op.inMemMainOp.Reset(ctx)
 					delete(op.partitionsToProcessUsingMain, partitionIdx)
 					op.state = hbpProcessingUsingMain
 					continue StateChanged
@@ -579,7 +588,7 @@ StateChanged:
 			for i := range op.partitionedInputs {
 				op.partitionedInputs[i].partitionIdx = partitionIdx
 			}
-			op.diskBackedFallbackOp.reset(ctx)
+			op.diskBackedFallbackOp.Reset(ctx)
 			op.state = hbpProcessingUsingFallback
 			continue
 

@@ -17,8 +17,6 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"regexp"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -52,7 +49,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -61,7 +58,6 @@ import (
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
 )
 
 type leaseTest struct {
@@ -229,6 +225,7 @@ func (t *leaseTest) node(nodeID uint32) *lease.Manager {
 			cfgCpy.Codec,
 			t.leaseManagerTestingKnobs,
 			t.server.Stopper(),
+			cfgCpy.RangeFeedFactory,
 			t.cfg,
 		)
 		ctx := logtags.AddTag(context.Background(), "leasemgr", nodeID)
@@ -1931,8 +1928,9 @@ INSERT INTO t.kv VALUES ('a', 'b');
 	}
 
 	// Not sure whether run in the past and so sees clock uncertainty push.
+	// Must be a DDL as a regular DML would use the lease and not get pushed.
 	if _, err := tx1.Exec(`
-INSERT INTO t.kv VALUES ('c', 'd');
+ALTER TABLE t.kv RENAME COLUMN v TO vv;
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -2310,72 +2308,6 @@ func TestRangefeedUpdatesHandledProperlyInTheFaceOfRaces(t *testing.T) {
 	require.Equal(t, gosql.ErrNoRows, db2.QueryRow("SELECT i, j FROM foo").Scan(&i, &j))
 }
 
-// TestBackoffOnRangefeedFailure ensures that the backoff occurs when a
-// rangefeed fails. It observes this indirectly by looking at logs.
-func TestBackoffOnRangefeedFailure(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	var called int64
-	const timesToFail = 3
-	rpcKnobs := rpc.ContextTestingKnobs{
-		StreamClientInterceptor: func(
-			target string, class rpc.ConnectionClass,
-		) grpc.StreamClientInterceptor {
-			return func(
-				ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn,
-				method string, streamer grpc.Streamer, opts ...grpc.CallOption,
-			) (stream grpc.ClientStream, err error) {
-				if strings.Contains(method, "RangeFeed") &&
-					atomic.AddInt64(&called, 1) <= timesToFail {
-					return nil, errors.Errorf("boom")
-				}
-				return streamer(ctx, desc, cc, method, opts...)
-			}
-		},
-	}
-	ctx := context.Background()
-	var seen struct {
-		syncutil.Mutex
-		entries []logpb.Entry
-	}
-	restartingRE := regexp.MustCompile("restarting rangefeed.*after.*")
-	log.Intercept(ctx, func(entry logpb.Entry) {
-		if !restartingRE.MatchString(entry.Message) {
-			return
-		}
-		seen.Lock()
-		defer seen.Unlock()
-		seen.entries = append(seen.entries, entry)
-	})
-	defer log.Intercept(ctx, nil)
-	tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				Server: &server.TestingKnobs{
-					ContextTestingKnobs: rpcKnobs,
-				},
-			},
-		},
-	})
-	defer tc.Stopper().Stop(ctx)
-	testutils.SucceedsSoon(t, func() error {
-		seen.Lock()
-		defer seen.Unlock()
-		if len(seen.entries) < timesToFail {
-			return errors.Errorf("seen %d, waiting for %d", len(seen.entries), timesToFail)
-		}
-		return nil
-	})
-	seen.Lock()
-	defer seen.Unlock()
-	minimumBackoff := 85 * time.Millisecond // initialBackoff less jitter
-	var totalBackoff time.Duration
-	for i := 1; i < len(seen.entries); i++ {
-		totalBackoff += time.Duration(seen.entries[i].Time - seen.entries[i-1].Time)
-	}
-	require.Greater(t, totalBackoff.Nanoseconds(), (3 * minimumBackoff).Nanoseconds())
-}
-
 // TestLeaseWithOfflineTables checks that leases on tables which had
 // previously gone offline at some point are not gratuitously dropped.
 // See #57834.
@@ -2526,4 +2458,99 @@ func TestOutstandingLeasesMetric(t *testing.T) {
 	if actual < 3 {
 		t.Errorf("expected at least 3 outstanding leases, found %d", actual)
 	}
+}
+
+// Test that attempts to use a descriptor at a timestamp that precedes when
+// a descriptor is dropped but follows the notification that that descriptor
+// was dropped will successfully acquire the lease.
+func TestLeaseAcquireAfterDropWithEarlierTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// descID is the ID of the table we're dropping.
+	var descID atomic.Value
+	descID.Store(descpb.ID(0))
+	type refreshEvent struct {
+		unblock chan struct{}
+		ts      hlc.Timestamp
+	}
+	refreshed := make(chan refreshEvent)
+	var stopper *stop.Stopper
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				SQLLeaseManager: &lease.ManagerTestingKnobs{
+					TestingDescriptorRefreshedEvent: func(descriptor *descpb.Descriptor) {
+						if descpb.GetDescriptorID(descriptor) != descID.Load().(descpb.ID) {
+							return
+						}
+						unblock := make(chan struct{})
+						select {
+						case refreshed <- refreshEvent{
+							unblock: unblock,
+							ts:      descpb.GetDescriptorModificationTime(descriptor),
+						}:
+						case <-stopper.ShouldQuiesce():
+						}
+						select {
+						case <-unblock:
+						case <-stopper.ShouldQuiesce():
+						}
+					},
+				},
+			},
+		},
+	})
+	stopper = tc.Stopper()
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
+	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+
+	// Create a schema, create a table in that schema, insert into it, drop it,
+	// detect the drop has made its way to the lease manager and thus the lease
+	// has been removed, and note the timestamp at which the drop occurred, then
+	// ensure that the descriptors can be read at the previous timestamp.
+	tdb.Exec(t, "CREATE SCHEMA sc")
+	tdb.Exec(t, "CREATE TABLE sc.foo (i INT PRIMARY KEY)")
+	tdb.Exec(t, "INSERT INTO sc.foo VALUES (1)")
+	{
+		var id descpb.ID
+		tdb.QueryRow(t, `SELECT id FROM system.namespace WHERE name = $1`, "sc").Scan(&id)
+		require.NotEqual(t, descpb.ID(0), id)
+		descID.Store(id)
+	}
+	dropErr := make(chan error, 1)
+	go func() {
+		_, err := tc.ServerConn(0).Exec("DROP SCHEMA sc CASCADE")
+		dropErr <- err
+	}()
+
+	// Observe that the lease manager has now marked the descriptor as dropped.
+	ev := <-refreshed
+
+	// Ensure that reads at the previous timestamp will succeed. Before the
+	// commit that introduced this test, they would fail because the fallback
+	// used to read the table descriptor from the store did not exist for the
+	// schema. After this commit, there is no fallback and the lease manager
+	// properly serves the right version for both.
+	tdb.CheckQueryResults(t,
+		"SELECT * FROM sc.foo AS OF SYSTEM TIME "+ev.ts.Prev().AsOfSystemTime(),
+		[][]string{{"1"}})
+
+	// Test that using a timestamp equal to the timestamp at which the descriptor
+	// is dropped results in the proper error.
+	tdb.ExpectErr(t, `relation "sc.foo" does not exist`,
+		"SELECT * FROM sc.foo AS OF SYSTEM TIME "+ev.ts.AsOfSystemTime())
+
+	// Also ensure that the subsequent timestamp gets the same error.
+	tdb.ExpectErr(t, `relation "sc.foo" does not exist`,
+		"SELECT * FROM sc.foo AS OF SYSTEM TIME "+ev.ts.Next().AsOfSystemTime())
+
+	// Allow everything to continue.
+	close(ev.unblock)
+	require.NoError(t, <-dropErr)
+
+	// Test again, after the namespace entry has been fully removed, that the
+	// query returns the exact same error.
+	tdb.ExpectErr(t, `relation "sc.foo" does not exist`,
+		"SELECT * FROM sc.foo AS OF SYSTEM TIME "+ev.ts.AsOfSystemTime())
 }

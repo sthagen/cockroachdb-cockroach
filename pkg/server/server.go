@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/container"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
@@ -425,6 +426,12 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		}
 	}
 
+	rangeFeedKnobs, _ := cfg.TestingKnobs.RangeFeed.(*rangefeed.TestingKnobs)
+	rangeFeedFactory, err := rangefeed.NewFactory(stopper, db, rangeFeedKnobs)
+	if err != nil {
+		return nil, err
+	}
+
 	nodeLiveness := liveness.NewNodeLiveness(liveness.NodeLivenessOptions{
 		AmbientCtx:              cfg.AmbientCtx,
 		Clock:                   clock,
@@ -657,6 +664,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		circularJobRegistry:      jobRegistry,
 		jobAdoptionStopFile:      jobAdoptionStopFile,
 		protectedtsProvider:      protectedtsProvider,
+		rangeFeedFactory:         rangeFeedFactory,
 		sqlStatusServer:          sStatus,
 	})
 	if err != nil {
@@ -1321,7 +1329,8 @@ func (s *Server) PreStart(ctx context.Context) error {
 			// running in a worker and usually sits on accept() which unblocks
 			// only when the listener closes. In other words, the listener needs
 			// to close when quiescing starts to allow that worker to shut down.
-			if err := conn.Close(); err != nil {
+			err := conn.Close() // nolint:grpcconnclose
+			if err != nil {
 				log.Ops.Fatalf(workersCtx, "%v", err)
 			}
 		}

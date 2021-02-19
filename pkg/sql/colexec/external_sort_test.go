@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -61,12 +63,12 @@ func TestExternalSort(t *testing.T) {
 	// Test the case in which the default memory is used as well as the case in
 	// which the joiner spills to disk.
 	for _, spillForced := range []bool{false, true} {
-		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
 		if spillForced {
-			// In order to increase test coverage of recursive merging, we have the
-			// lowest possible memory limit - this will force creating partitions
+			// In order to increase test coverage of recursive merging, we have
+			// the lowest possible memory limit (that will not be overridden by
+			// the external sorter) - this will force creating partitions
 			// consisting of a single batch.
-			flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = 1
+			flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = 2
 		} else {
 			flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = 0
 		}
@@ -74,12 +76,13 @@ func TestExternalSort(t *testing.T) {
 			for _, tc := range tcs {
 				log.Infof(context.Background(), "spillForced=%t/numRepartitions=%d/%s", spillForced, numForcedRepartitions, tc.description)
 				var semsToCheck []semaphore.Semaphore
-				runTestsWithTyps(
+				colexectestutils.RunTestsWithTyps(
 					t,
-					[]tuples{tc.tuples},
+					testAllocator,
+					[]colexectestutils.Tuples{tc.tuples},
 					[][]*types.T{tc.typs},
 					tc.expected,
-					orderedVerifier,
+					colexectestutils.OrderedVerifier,
 					func(input []colexecbase.Operator) (colexecbase.Operator, error) {
 						// A sorter should never exceed ExternalSorterMinPartitions, even
 						// during repartitioning. A panic will happen if a sorter requests
@@ -193,11 +196,12 @@ func TestExternalSortRandomized(t *testing.T) {
 				//  flow tracking open FDs and releasing any leftovers.
 				var semsToCheck []semaphore.Semaphore
 				tups, expected, ordCols := generateRandomDataForTestSort(rng, nTups, nCols, nOrderingCols)
-				runTests(
+				colexectestutils.RunTests(
 					t,
-					[]tuples{tups},
+					testAllocator,
+					[]colexectestutils.Tuples{tups},
 					expected,
-					orderedVerifier,
+					colexectestutils.OrderedVerifier,
 					func(input []colexecbase.Operator) (colexecbase.Operator, error) {
 						sem := colexecbase.NewTestingSemaphore(ExternalSorterMinPartitions)
 						semsToCheck = append(semsToCheck, sem)
@@ -223,6 +227,142 @@ func TestExternalSortRandomized(t *testing.T) {
 	}
 	for _, m := range monitors {
 		m.Stop(ctx)
+	}
+}
+
+// TestExternalSortMemoryAccounting is a sanity check for the memory accounting
+// done throughout the external sort operation. At the moment there are a lot of
+// known problems with the memory accounting, so the test is not very strict.
+// The goal of the test is to make sure that the total maximum reported memory
+// usage (as would have been collected as stats) is within reasonable range. It
+// additionally checks that the number of partitions created is as expected too.
+//
+// It is impossible to come up with the exact numbers here due to the randomness
+// of appends (which happen when setting values on Bytes vectors) and due to the
+// randomization of coldata.BatchSize() value.
+func TestExternalSortMemoryAccounting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderStress(t, "the test is very memory-intensive and is likely to OOM under stress")
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+	flowCtx := &execinfra.FlowCtx{
+		EvalCtx: &evalCtx,
+		Cfg: &execinfra.ServerConfig{
+			Settings:    st,
+			DiskMonitor: testDiskMonitor,
+		},
+	}
+	rng, _ := randutil.NewPseudoRand()
+
+	// Use the Bytes type because we can control the size of values with it
+	// easily.
+	typs := []*types.T{types.Bytes}
+	ordCols := []execinfrapb.Ordering_Column{{ColIdx: 0}}
+
+	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
+	defer cleanup()
+	queueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
+	queueCfg.SetDefaultBufferSizeBytesForCacheMode()
+
+	numInMemoryBufferedBatches := 8 + rng.Intn(4)
+	// numNewPartitions determines the expected number of partitions created as
+	// a result of consuming the input (i.e. not as a result of the repeated
+	// merging).
+	numNewPartitions := 4 + rng.Intn(3)
+	numTotalBatches := numInMemoryBufferedBatches * numNewPartitions
+	batchLength := coldata.BatchSize()
+	batch := testAllocator.NewMemBatchWithFixedCapacity(typs, batchLength)
+	// Use such a size for a single value that the memory footprint of a single
+	// batch is relatively large.
+	singleTupleSize := mon.DefaultPoolAllocationSize
+	singleTupleValue := make([]byte, singleTupleSize)
+	for i := 0; i < batchLength; i++ {
+		batch.ColVec(0).Bytes().Set(i, singleTupleValue)
+	}
+	batch.SetLength(batchLength)
+	numFDs := ExternalSorterMinPartitions + rng.Intn(3)
+	// The memory limit in the external sorter is divided as follows:
+	// - BufferSizeBytes for each of the disk queues is subtracted right away
+	// - the remaining part is divided evenly between the sorter and the merger.
+	memoryLimit := 2*colmem.GetBatchMemSize(batch)*int64(numInMemoryBufferedBatches) + int64(queueCfg.BufferSizeBytes*numFDs)
+	flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = memoryLimit
+	input := colexectestutils.NewFiniteBatchSource(testAllocator, batch, typs, numTotalBatches)
+
+	var spilled bool
+	sem := colexecbase.NewTestingSemaphore(numFDs)
+	sorter, accounts, monitors, closers, err := createDiskBackedSorter(
+		ctx, flowCtx, []colexecbase.Operator{input}, typs, ordCols,
+		0 /* matchLen */, 0 /* k */, func() { spilled = true },
+		0 /* numForcedRepartitions */, false, /* delegateFDAcquisition */
+		queueCfg, sem,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(closers))
+
+	sorter.Init()
+	for b := sorter.Next(ctx); b.Length() > 0; b = sorter.Next(ctx) {
+	}
+	for _, c := range closers {
+		require.NoError(t, c.Close(ctx))
+	}
+
+	require.True(t, spilled)
+	require.Zero(t, sem.GetCount(), "sem still reports open FDs")
+
+	externalSorter := sorter.(*diskSpillerBase).diskBackedOp.(*externalSorter)
+	numPartitionsCreated := externalSorter.firstPartitionIdx + externalSorter.numPartitions
+	// This maximum can be achieved when we have minimum required number of FDs
+	// as follows: we expect that each newly created partition contains about
+	// numInMemoryBufferedBatches number of batches with only the partition that
+	// is the result of the repeated merge growing with count as a multiple of
+	// numInMemoryBufferedBatches (first merge = 2x, second merge = 3x, third
+	// merge 4x, etc, so we expect 2*numNewPartitions-1 partitions).
+	expMaxTotalPartitionsCreated := 2*numNewPartitions - 1
+	// Because of our "after the fact" memory accounting, we might create less
+	// partitions than maximum defined above (e.g., if numNewPartitions is 5,
+	// then we will create 5 partitions when batch size is 3).
+	expMinTotalPartitionsCreated := numNewPartitions
+	require.GreaterOrEqualf(t, numPartitionsCreated, expMinTotalPartitionsCreated,
+		"didn't create enough partitions: actual %d, min expected %d",
+		numPartitionsCreated, expMinTotalPartitionsCreated,
+	)
+	require.GreaterOrEqualf(t, expMaxTotalPartitionsCreated, numPartitionsCreated,
+		"created too many partitions: actual %d, max expected %d",
+		numPartitionsCreated, expMaxTotalPartitionsCreated,
+	)
+
+	// Check that the monitor for the in-memory sorter reports lower than
+	// memoryLimit max usage (the allocation that would put the monitor over the
+	// limit must have been denied with OOM error).
+	require.Greater(t, memoryLimit, monitors[0].MaximumBytes())
+
+	// Use the same calculation as we have when computing stats (maximums are
+	// summed).
+	var totalMaxMemUsage int64
+	for i := range monitors {
+		totalMaxMemUsage += monitors[i].MaximumBytes()
+	}
+	// We cannot guarantee a fixed value, so we use an allowed range.
+	//
+	// In an ideal world the reported usage is very close to 2 x memoryLimit
+	// (the monitor for the in-memory sorter reports slightly below and the
+	// monitors for the external sorter report slightly above memoryLimit
+	// usage).
+	expMin := memoryLimit * 3 / 2
+	expMax := memoryLimit * 5 / 2
+	require.GreaterOrEqualf(t, totalMaxMemUsage, expMin, "minimum memory bound not satisfied: "+
+		"actual %d, expected min %d", totalMaxMemUsage, expMin)
+	require.GreaterOrEqualf(t, expMax, totalMaxMemUsage, "maximum memory bound not satisfied: "+
+		"actual %d, expected max %d", totalMaxMemUsage, expMax)
+
+	for i := range accounts {
+		accounts[i].Close(ctx)
+	}
+	for i := range monitors {
+		monitors[i].Stop(ctx)
 	}
 }
 
@@ -275,7 +415,7 @@ func BenchmarkExternalSort(b *testing.B) {
 					}
 					b.ResetTimer()
 					for n := 0; n < b.N; n++ {
-						source := newFiniteBatchSource(batch, typs, nBatches)
+						source := colexectestutils.NewFiniteBatchSource(testAllocator, batch, typs, nBatches)
 						var spilled bool
 						sorter, accounts, monitors, _, err := createDiskBackedSorter(
 							ctx, flowCtx, []colexecbase.Operator{source}, typs, ordCols,

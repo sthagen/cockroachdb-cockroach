@@ -12,6 +12,7 @@ go_library(
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/privilege",
         "//pkg/util/hlc",
+        "//pkg/util/iterutil",
         "//pkg/util/protoutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
@@ -20,6 +21,7 @@ go_library(
 
 go_test(
     name = "dbdesc_test",
+    size = "small",
     srcs = ["database_test.go"],
     embed = [":dbdesc"],
     deps = [

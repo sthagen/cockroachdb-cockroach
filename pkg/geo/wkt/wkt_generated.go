@@ -10,9 +10,10 @@ import __yyfmt__ "fmt"
 
 import "github.com/twpayne/go-geom"
 
+// TODO(ayang): move these into lex.go
 func isValidLineString(wktlex wktLexer, flatCoords []float64, stride int) bool {
 	if len(flatCoords) < 2*stride {
-		wktlex.(*wktLex).Error("syntax error: non-empty linestring with only one point")
+		wktlex.(*wktLex).setParseError("non-empty linestring with only one point", "minimum number of points is 2")
 		return false
 	}
 	return true
@@ -20,31 +21,81 @@ func isValidLineString(wktlex wktLexer, flatCoords []float64, stride int) bool {
 
 func isValidPolygonRing(wktlex wktLexer, flatCoords []float64, stride int) bool {
 	if len(flatCoords) < 4*stride {
-		wktlex.(*wktLex).Error("syntax error: polygon ring doesn't have enough points")
+		wktlex.(*wktLex).setParseError("polygon ring doesn't have enough points", "minimum number of points is 4")
 		return false
 	}
 	for i := 0; i < stride; i++ {
 		if flatCoords[i] != flatCoords[len(flatCoords)-stride+i] {
-			wktlex.(*wktLex).Error("syntax error: polygon ring not closed")
+			wktlex.(*wktLex).setParseError("polygon ring not closed", "ensure first and last point are the same")
 			return false
 		}
 	}
 	return true
 }
 
-type geomPair struct {
+type geomFlatCoordsRepr struct {
 	flatCoords []float64
 	ends       []int
 }
 
-//line wkt.y:46
+func makeGeomFlatCoordsRepr(flatCoords []float64) geomFlatCoordsRepr {
+	return geomFlatCoordsRepr{flatCoords: flatCoords, ends: []int{len(flatCoords)}}
+}
+
+func appendGeomFlatCoordsReprs(p1 geomFlatCoordsRepr, p2 geomFlatCoordsRepr) geomFlatCoordsRepr {
+	if len(p1.ends) > 0 {
+		p1LastEnd := p1.ends[len(p1.ends)-1]
+		for i, _ := range p2.ends {
+			p2.ends[i] += p1LastEnd
+		}
+	}
+	return geomFlatCoordsRepr{flatCoords: append(p1.flatCoords, p2.flatCoords...), ends: append(p1.ends, p2.ends...)}
+}
+
+type multiPolygonFlatCoordsRepr struct {
+	flatCoords []float64
+	endss      [][]int
+}
+
+func makeMultiPolygonFlatCoordsRepr(p geomFlatCoordsRepr) multiPolygonFlatCoordsRepr {
+	if p.flatCoords == nil {
+		return multiPolygonFlatCoordsRepr{flatCoords: nil, endss: [][]int{nil}}
+	}
+	return multiPolygonFlatCoordsRepr{flatCoords: p.flatCoords, endss: [][]int{p.ends}}
+}
+
+func appendMultiPolygonFlatCoordsRepr(
+	p1 multiPolygonFlatCoordsRepr, p2 multiPolygonFlatCoordsRepr,
+) multiPolygonFlatCoordsRepr {
+	p1LastEndsLastEnd := 0
+	for i := len(p1.endss) - 1; i >= 0; i-- {
+		if len(p1.endss[i]) > 0 {
+			p1LastEndsLastEnd = p1.endss[i][len(p1.endss[i])-1]
+			break
+		}
+	}
+	if p1LastEndsLastEnd > 0 {
+		for i, _ := range p2.endss {
+			for j, _ := range p2.endss[i] {
+				p2.endss[i][j] += p1LastEndsLastEnd
+			}
+		}
+	}
+	return multiPolygonFlatCoordsRepr{
+		flatCoords: append(p1.flatCoords, p2.flatCoords...), endss: append(p1.endss, p2.endss...),
+	}
+}
+
+//line wkt.y:95
 type wktSymType struct {
-	yys       int
-	str       string
-	geom      geom.T
-	coord     float64
-	coordList []float64
-	pair      geomPair
+	yys               int
+	str               string
+	geom              geom.T
+	coord             float64
+	coordList         []float64
+	flatRepr          geomFlatCoordsRepr
+	multiPolyFlatRepr multiPolygonFlatCoordsRepr
+	geomList          []geom.T
 }
 
 const POINT = 57346
@@ -59,8 +110,24 @@ const POLYGON = 57354
 const POLYGONM = 57355
 const POLYGONZ = 57356
 const POLYGONZM = 57357
-const EMPTY = 57358
-const NUM = 57359
+const MULTIPOINT = 57358
+const MULTIPOINTM = 57359
+const MULTIPOINTZ = 57360
+const MULTIPOINTZM = 57361
+const MULTILINESTRING = 57362
+const MULTILINESTRINGM = 57363
+const MULTILINESTRINGZ = 57364
+const MULTILINESTRINGZM = 57365
+const MULTIPOLYGON = 57366
+const MULTIPOLYGONM = 57367
+const MULTIPOLYGONZ = 57368
+const MULTIPOLYGONZM = 57369
+const GEOMETRYCOLLECTION = 57370
+const GEOMETRYCOLLECTIONM = 57371
+const GEOMETRYCOLLECTIONZ = 57372
+const GEOMETRYCOLLECTIONZM = 57373
+const EMPTY = 57374
+const NUM = 57375
 
 var wktToknames = [...]string{
 	"$end",
@@ -78,6 +145,22 @@ var wktToknames = [...]string{
 	"POLYGONM",
 	"POLYGONZ",
 	"POLYGONZM",
+	"MULTIPOINT",
+	"MULTIPOINTM",
+	"MULTIPOINTZ",
+	"MULTIPOINTZM",
+	"MULTILINESTRING",
+	"MULTILINESTRINGM",
+	"MULTILINESTRINGZ",
+	"MULTILINESTRINGZM",
+	"MULTIPOLYGON",
+	"MULTIPOLYGONM",
+	"MULTIPOLYGONZ",
+	"MULTIPOLYGONZM",
+	"GEOMETRYCOLLECTION",
+	"GEOMETRYCOLLECTIONM",
+	"GEOMETRYCOLLECTIONZ",
+	"GEOMETRYCOLLECTIONZM",
 	"EMPTY",
 	"NUM",
 	"'('",
@@ -100,90 +183,133 @@ var wktExca = [...]int{
 
 const wktPrivate = 57344
 
-const wktLast = 120
+const wktLast = 218
 
 var wktAct = [...]int{
-	67, 66, 65, 58, 56, 64, 63, 61, 57, 6,
-	7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-	17, 60, 97, 94, 88, 85, 49, 96, 92, 95,
-	92, 87, 54, 93, 94, 91, 92, 89, 90, 86,
-	48, 84, 51, 83, 53, 81, 80, 78, 71, 76,
-	72, 73, 75, 74, 46, 44, 45, 43, 42, 40,
-	41, 39, 37, 35, 38, 33, 32, 29, 33, 30,
-	25, 23, 24, 22, 21, 19, 20, 18, 59, 38,
-	33, 106, 30, 102, 110, 109, 55, 52, 100, 99,
-	98, 101, 104, 105, 107, 108, 103, 47, 82, 79,
-	77, 50, 70, 68, 1, 62, 69, 5, 4, 3,
-	2, 0, 0, 28, 26, 0, 36, 27, 31, 34,
+	66, 2, 116, 126, 131, 106, 65, 111, 128, 121,
+	60, 57, 137, 118, 155, 156, 61, 70, 58, 101,
+	75, 114, 81, 63, 87, 69, 63, 64, 104, 63,
+	61, 63, 90, 63, 62, 63, 107, 68, 63, 61,
+	72, 84, 77, 61, 83, 78, 89, 108, 59, 94,
+	58, 67, 153, 154, 71, 92, 74, 97, 80, 61,
+	86, 151, 152, 93, 149, 150, 147, 148, 145, 146,
+	143, 144, 141, 142, 139, 140, 57, 102, 138, 57,
+	61, 97, 58, 27, 113, 109, 26, 25, 70, 63,
+	24, 70, 23, 22, 136, 63, 56, 21, 123, 133,
+	20, 63, 19, 18, 17, 95, 124, 16, 15, 14,
+	13, 12, 134, 11, 99, 10, 1, 91, 119, 135,
+	88, 85, 130, 125, 129, 132, 127, 82, 79, 120,
+	115, 122, 117, 76, 73, 110, 103, 112, 105, 100,
+	98, 96, 9, 8, 7, 57, 6, 57, 5, 102,
+	4, 161, 113, 70, 160, 70, 163, 63, 165, 164,
+	162, 63, 158, 133, 123, 63, 3, 0, 0, 0,
+	0, 0, 124, 159, 0, 0, 134, 0, 0, 0,
+	0, 0, 0, 0, 0, 119, 0, 0, 157, 129,
+	28, 29, 30, 31, 32, 33, 34, 35, 36, 37,
+	38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+	48, 49, 50, 51, 52, 53, 54, 55,
 }
 
 var wktPact = [...]int{
-	5, -1000, -1000, -1000, -1000, -1000, 59, 58, 55, 54,
-	51, 50, 47, 46, 43, 42, 39, 38, 84, -1000,
-	70, -1000, 70, -1000, 69, -1000, -1000, -1000, -1000, -1000,
-	84, -1000, -1000, 70, -1000, -1000, -1000, -1000, 69, 64,
-	-1000, 62, -1000, 62, -1000, 61, -1000, 34, 33, 30,
-	83, 28, 82, 27, 26, 81, 24, 22, 6, 19,
-	11, 4, 18, 16, 14, -1000, -1000, -1000, -1000, -1000,
-	-1000, 10, 8, 3, -1000, -1000, -1000, 73, -1000, 72,
-	-1000, -1000, 71, -1000, -1000, -1000, 66, 70, 69, -1000,
-	63, -1000, 62, -1000, 61, -1000, -1000, -1000, 68, -1000,
-	68, -1000, 67, -1000, -1000, -1000, 66, -1000, -1000, -1000,
-	-1000,
+	186, -1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000,
+	16, 27, 27, 16, 27, 27, 16, 27, 27, -16,
+	11, -16, 7, -16, -2, 21, 27, 27, -1000, -1000,
+	-1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000,
+	-1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000,
+	-1000, -1000, -1000, -1000, -1000, -1000, -1000, 24, -1000, -1000,
+	-1000, -1000, -1000, -1000, -1000, -1000, 24, -1000, -1000, -1000,
+	16, -1000, -1000, -1000, -1000, 48, -1000, -1000, 48, -1000,
+	-1000, -16, -1000, -1000, -16, -1000, -1000, -16, -1000, -1000,
+	-16, -1000, 186, -1000, -1000, -23, 45, -1000, 39, -1000,
+	37, -1000, -1000, 35, -1000, -1000, -1000, -1000, -1000, -1000,
+	33, -1000, -1000, -1000, -1000, 31, -1000, -1000, -1000, -1000,
+	29, -1000, -1000, -1000, -1000, 26, -1000, -1000, -1000, -1000,
+	17, -1000, -1000, -1000, -1000, -21, -1000, -1000, -1000, -1000,
+	24, -1000, 16, -1000, 48, -1000, 48, -1000, -16, -1000,
+	-16, -1000, -16, -1000, -16, -1000, 186, -1000, -1000, -1000,
+	-1000, -1000, -1000, -1000, -1000, -1000,
 }
 
 var wktPgo = [...]int{
-	0, 110, 109, 108, 107, 78, 21, 7, 4, 8,
-	3, 103, 106, 102, 2, 1, 0, 105, 6, 5,
-	104,
+	0, 1, 166, 150, 148, 146, 144, 143, 142, 36,
+	21, 10, 141, 47, 85, 140, 6, 13, 19, 139,
+	8, 5, 138, 137, 28, 7, 136, 135, 134, 133,
+	132, 131, 2, 9, 130, 129, 128, 127, 126, 125,
+	3, 4, 123, 122, 121, 120, 119, 117, 116, 115,
+	113, 111, 110, 109, 108, 107, 104, 103, 102, 100,
+	97, 93, 92, 90, 87, 86, 83, 0,
 }
 
 var wktR1 = [...]int{
-	0, 20, 1, 1, 1, 2, 2, 2, 2, 2,
-	2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
-	3, 3, 3, 3, 3, 4, 4, 4, 4, 4,
-	4, 4, 4, 4, 4, 17, 17, 18, 18, 19,
-	19, 14, 15, 16, 11, 12, 13, 8, 8, 9,
-	9, 10, 10, 5, 6, 7,
+	0, 48, 1, 1, 1, 1, 1, 1, 1, 2,
+	2, 2, 49, 49, 50, 51, 51, 51, 3, 3,
+	3, 52, 52, 53, 54, 54, 54, 4, 4, 4,
+	55, 55, 56, 57, 57, 57, 5, 5, 5, 5,
+	58, 59, 59, 59, 6, 6, 6, 6, 60, 61,
+	61, 61, 7, 7, 7, 7, 62, 63, 63, 63,
+	8, 8, 8, 47, 46, 46, 64, 64, 65, 66,
+	66, 66, 67, 44, 45, 43, 43, 42, 42, 40,
+	41, 38, 38, 39, 39, 36, 37, 34, 34, 35,
+	35, 32, 33, 30, 30, 31, 31, 28, 29, 26,
+	26, 27, 27, 24, 25, 22, 22, 23, 23, 21,
+	21, 20, 19, 19, 18, 17, 16, 15, 15, 14,
+	13, 12, 12, 9, 10, 11,
 }
 
 var wktR2 = [...]int{
-	0, 1, 1, 1, 1, 4, 4, 4, 4, 4,
-	4, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-	2, 2, 2, 2, 2, 4, 4, 4, 4, 4,
-	4, 2, 2, 2, 2, 3, 1, 3, 1, 3,
-	1, 1, 1, 1, 3, 3, 3, 3, 1, 3,
-	1, 3, 1, 2, 3, 4,
+	0, 1, 1, 1, 1, 1, 1, 1, 1, 2,
+	2, 2, 1, 1, 1, 1, 1, 1, 2, 2,
+	2, 1, 1, 1, 1, 1, 1, 2, 2, 2,
+	1, 1, 1, 1, 1, 1, 2, 2, 2, 2,
+	1, 1, 1, 1, 2, 2, 2, 2, 1, 1,
+	1, 1, 2, 2, 2, 2, 1, 1, 1, 1,
+	2, 2, 2, 3, 3, 1, 1, 1, 1, 1,
+	1, 1, 1, 3, 3, 3, 1, 3, 1, 1,
+	1, 1, 1, 1, 1, 3, 3, 3, 1, 3,
+	1, 1, 1, 1, 1, 1, 1, 3, 3, 3,
+	1, 3, 1, 1, 1, 1, 1, 1, 1, 1,
+	1, 3, 3, 1, 1, 1, 3, 3, 1, 3,
+	1, 2, 1, 1, 1, 1,
 }
 
 var wktChk = [...]int{
-	-1000, -20, -1, -2, -3, -4, 4, 5, 6, 7,
-	8, 9, 10, 11, 12, 13, 14, 15, 18, 16,
-	18, 16, 18, 16, 18, 16, -11, -12, -13, 16,
-	18, -12, 16, 18, -12, 16, -13, 16, 18, 18,
-	16, 18, 16, 18, 16, 18, 16, -5, -6, -7,
-	17, -6, 17, -6, -7, 17, -8, -9, -10, -5,
-	-6, -7, -17, -18, -19, -14, -15, -16, -11, -12,
-	-13, -18, -18, -19, 19, 19, 19, 17, 19, 17,
-	19, 19, 17, 19, 19, 19, 20, 20, 20, 19,
-	20, 19, 20, 19, 20, 19, 19, 19, 17, 17,
-	17, -8, 17, -9, -10, -14, 18, -15, -16, 17,
-	17,
+	-1000, -48, -1, -2, -3, -4, -5, -6, -7, -8,
+	-49, -50, -51, -52, -53, -54, -55, -56, -57, -58,
+	-59, -60, -61, -62, -63, -64, -65, -66, 4, 5,
+	6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+	16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+	26, 27, 28, 29, 30, 31, -14, -67, 34, -9,
+	-11, 32, -10, -11, -17, -16, -67, -9, -10, -20,
+	-67, -9, -10, -28, -9, -67, -29, -10, 34, -36,
+	-9, -67, -37, -10, 34, -44, -9, -67, -45, -10,
+	34, -47, 34, -9, -10, -13, -12, 33, -15, -13,
+	-19, -18, -16, -26, -24, -22, -21, -9, -13, -14,
+	-27, -25, -23, -21, -10, -34, -32, -30, -17, -9,
+	-35, -33, -31, -17, -10, -42, -40, -38, -20, -9,
+	-43, -41, -39, -20, -10, -46, -1, 35, 33, 35,
+	36, 35, 36, 35, 36, 35, 36, 35, 36, 35,
+	36, 35, 36, 35, 36, 35, 36, -13, -18, -24,
+	-25, -32, -33, -40, -41, -1,
 }
 
 var wktDef = [...]int{
-	0, -2, 1, 2, 3, 4, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 11,
-	0, 12, 0, 13, 0, 14, 15, 16, 17, 21,
-	0, 18, 22, 0, 19, 23, 20, 24, 0, 0,
-	31, 0, 32, 0, 33, 0, 34, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 48,
-	50, 52, 0, 0, 0, 36, 38, 40, 41, 42,
-	43, 0, 0, 0, 5, 6, 7, 53, 8, 0,
-	9, 10, 0, 44, 45, 46, 0, 0, 0, 25,
-	0, 26, 0, 27, 0, 28, 29, 30, 54, 54,
-	0, 47, 0, 49, 51, 35, 0, 37, 39, 55,
-	53,
+	0, -2, 1, 2, 3, 4, 5, 6, 7, 8,
+	0, 12, 13, 0, 21, 22, 0, 30, 31, 0,
+	0, 0, 0, 0, 0, 0, 66, 67, 14, 15,
+	16, 17, 23, 24, 25, 26, 32, 33, 34, 35,
+	40, 41, 42, 43, 48, 49, 50, 51, 56, 57,
+	58, 59, 68, 69, 70, 71, 9, 0, 72, 10,
+	123, 125, 11, 124, 18, 115, 0, 19, 20, 27,
+	0, 28, 29, 36, 38, 0, 37, 39, 0, 44,
+	46, 0, 45, 47, 0, 52, 54, 0, 53, 55,
+	0, 60, 0, 61, 62, 0, 120, 122, 0, 118,
+	0, 113, 114, 0, 100, 103, 105, 106, 109, 110,
+	0, 102, 104, 107, 108, 0, 88, 91, 93, 94,
+	0, 90, 92, 95, 96, 0, 78, 79, 81, 82,
+	0, 76, 80, 83, 84, 0, 65, 119, 121, 116,
+	0, 111, 0, 97, 0, 98, 0, 85, 0, 86,
+	0, 73, 0, 74, 0, 63, 0, 117, 112, 99,
+	101, 87, 89, 77, 75, 64,
 }
 
 var wktTok1 = [...]int{
@@ -191,12 +317,14 @@ var wktTok1 = [...]int{
 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-	18, 19, 3, 3, 20,
+	34, 35, 3, 3, 36,
 }
 
 var wktTok2 = [...]int{
 	2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-	12, 13, 14, 15, 16, 17,
+	12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+	22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+	32, 33,
 }
 
 var wktTok3 = [...]int{
@@ -542,306 +670,667 @@ wktdefault:
 
 	case 1:
 		wktDollar = wktS[wktpt-1 : wktpt+1]
-//line wkt.y:73
+//line wkt.y:182
 		{
+			ok := wktlex.(*wktLex).validateLayoutStackAtEnd()
+			if !ok {
+				return 1
+			}
 			wktlex.(*wktLex).ret = wktDollar[1].geom
 		}
-	case 5:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:84
-		{
-			wktVAL.geom = geom.NewPointFlat(geom.XY, wktDollar[3].coordList)
-		}
-	case 6:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:88
-		{
-			wktVAL.geom = geom.NewPointFlat(geom.XYZ, wktDollar[3].coordList)
-		}
-	case 7:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:92
-		{
-			wktVAL.geom = geom.NewPointFlat(geom.XYZM, wktDollar[3].coordList)
-		}
 	case 8:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:96
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:198
 		{
-			wktVAL.geom = geom.NewPointFlat(geom.XYM, wktDollar[3].coordList)
+			ok := wktlex.(*wktLex).validateAndPopLayoutStackFrame()
+			if !ok {
+				return 1
+			}
 		}
 	case 9:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:100
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:207
 		{
-			wktVAL.geom = geom.NewPointFlat(geom.XYZ, wktDollar[3].coordList)
+			wktVAL.geom = geom.NewPointFlat(wktlex.(*wktLex).curLayout(), wktDollar[2].coordList)
 		}
 	case 10:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:104
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:211
 		{
-			wktVAL.geom = geom.NewPointFlat(geom.XYZM, wktDollar[3].coordList)
+			wktVAL.geom = geom.NewPointEmpty(wktlex.(*wktLex).curLayout())
 		}
 	case 11:
 		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:108
+//line wkt.y:215
 		{
-			wktVAL.geom = geom.NewPointEmpty(geom.XY)
-		}
-	case 12:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:112
-		{
-			wktVAL.geom = geom.NewPointEmpty(geom.XYM)
-		}
-	case 13:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:116
-		{
-			wktVAL.geom = geom.NewPointEmpty(geom.XYZ)
+			wktVAL.geom = geom.NewPointEmpty(wktlex.(*wktLex).curLayout())
 		}
 	case 14:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:120
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:225
 		{
-			wktVAL.geom = geom.NewPointEmpty(geom.XYZM)
+			ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+			if !ok {
+				return 1
+			}
 		}
 	case 15:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:126
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:234
 		{
-			if !isValidLineString(wktlex, wktDollar[2].coordList, 2) {
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+			if !ok {
 				return 1
 			}
-			wktVAL.geom = geom.NewLineStringFlat(geom.XY, wktDollar[2].coordList)
 		}
 	case 16:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:133
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:241
 		{
-			if !isValidLineString(wktlex, wktDollar[2].coordList, 3) {
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+			if !ok {
 				return 1
 			}
-			wktVAL.geom = geom.NewLineStringFlat(geom.XYZ, wktDollar[2].coordList)
 		}
 	case 17:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:140
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:248
 		{
-			if !isValidLineString(wktlex, wktDollar[2].coordList, 4) {
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+			if !ok {
 				return 1
 			}
-			wktVAL.geom = geom.NewLineStringFlat(geom.XYZM, wktDollar[2].coordList)
 		}
 	case 18:
 		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:147
+//line wkt.y:257
 		{
-			if !isValidLineString(wktlex, wktDollar[2].coordList, 3) {
-				return 1
-			}
-			wktVAL.geom = geom.NewLineStringFlat(geom.XYM, wktDollar[2].coordList)
+			wktVAL.geom = geom.NewLineStringFlat(wktlex.(*wktLex).curLayout(), wktDollar[2].coordList)
 		}
 	case 19:
 		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:154
+//line wkt.y:261
 		{
-			if !isValidLineString(wktlex, wktDollar[2].coordList, 3) {
-				return 1
-			}
-			wktVAL.geom = geom.NewLineStringFlat(geom.XYZ, wktDollar[2].coordList)
+			wktVAL.geom = geom.NewLineString(wktlex.(*wktLex).curLayout())
 		}
 	case 20:
 		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:161
+//line wkt.y:265
 		{
-			if !isValidLineString(wktlex, wktDollar[2].coordList, 4) {
-				return 1
-			}
-			wktVAL.geom = geom.NewLineStringFlat(geom.XYZM, wktDollar[2].coordList)
-		}
-	case 21:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:168
-		{
-			wktVAL.geom = geom.NewLineString(geom.XY)
-		}
-	case 22:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:172
-		{
-			wktVAL.geom = geom.NewLineString(geom.XYM)
+			wktVAL.geom = geom.NewLineString(wktlex.(*wktLex).curLayout())
 		}
 	case 23:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:176
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:275
 		{
-			wktVAL.geom = geom.NewLineString(geom.XYZ)
+			ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+			if !ok {
+				return 1
+			}
 		}
 	case 24:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:180
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:284
 		{
-			wktVAL.geom = geom.NewLineString(geom.XYZM)
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+			if !ok {
+				return 1
+			}
 		}
 	case 25:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:186
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:291
 		{
-			wktVAL.geom = geom.NewPolygonFlat(geom.XY, wktDollar[3].pair.flatCoords, wktDollar[3].pair.ends)
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+			if !ok {
+				return 1
+			}
 		}
 	case 26:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:190
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:298
 		{
-			wktVAL.geom = geom.NewPolygonFlat(geom.XYZ, wktDollar[3].pair.flatCoords, wktDollar[3].pair.ends)
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+			if !ok {
+				return 1
+			}
 		}
 	case 27:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:194
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:307
 		{
-			wktVAL.geom = geom.NewPolygonFlat(geom.XYZM, wktDollar[3].pair.flatCoords, wktDollar[3].pair.ends)
+			wktVAL.geom = geom.NewPolygonFlat(wktlex.(*wktLex).curLayout(), wktDollar[2].flatRepr.flatCoords, wktDollar[2].flatRepr.ends)
 		}
 	case 28:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:198
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:311
 		{
-			wktVAL.geom = geom.NewPolygonFlat(geom.XYM, wktDollar[3].pair.flatCoords, wktDollar[3].pair.ends)
+			wktVAL.geom = geom.NewPolygon(wktlex.(*wktLex).curLayout())
 		}
 	case 29:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:202
-		{
-			wktVAL.geom = geom.NewPolygonFlat(geom.XYZ, wktDollar[3].pair.flatCoords, wktDollar[3].pair.ends)
-		}
-	case 30:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:206
-		{
-			wktVAL.geom = geom.NewPolygonFlat(geom.XYZM, wktDollar[3].pair.flatCoords, wktDollar[3].pair.ends)
-		}
-	case 31:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:210
-		{
-			wktVAL.geom = geom.NewPolygon(geom.XY)
-		}
-	case 32:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:214
-		{
-			wktVAL.geom = geom.NewPolygon(geom.XYM)
-		}
-	case 33:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:218
-		{
-			wktVAL.geom = geom.NewPolygon(geom.XYZ)
-		}
-	case 34:
-		wktDollar = wktS[wktpt-2 : wktpt+1]
-//line wkt.y:222
-		{
-			wktVAL.geom = geom.NewPolygon(geom.XYZM)
-		}
-	case 35:
-		wktDollar = wktS[wktpt-3 : wktpt+1]
-//line wkt.y:228
-		{
-			wktVAL.pair = geomPair{append(wktDollar[1].pair.flatCoords, wktDollar[3].pair.flatCoords...), append(wktDollar[1].pair.ends, wktDollar[1].pair.ends[len(wktDollar[1].pair.ends)-1]+wktDollar[3].pair.ends[0])}
-		}
-	case 37:
-		wktDollar = wktS[wktpt-3 : wktpt+1]
-//line wkt.y:235
-		{
-			wktVAL.pair = geomPair{append(wktDollar[1].pair.flatCoords, wktDollar[3].pair.flatCoords...), append(wktDollar[1].pair.ends, wktDollar[1].pair.ends[len(wktDollar[1].pair.ends)-1]+wktDollar[3].pair.ends[0])}
-		}
-	case 39:
-		wktDollar = wktS[wktpt-3 : wktpt+1]
-//line wkt.y:242
-		{
-			wktVAL.pair = geomPair{append(wktDollar[1].pair.flatCoords, wktDollar[3].pair.flatCoords...), append(wktDollar[1].pair.ends, wktDollar[1].pair.ends[len(wktDollar[1].pair.ends)-1]+wktDollar[3].pair.ends[0])}
-		}
-	case 41:
-		wktDollar = wktS[wktpt-1 : wktpt+1]
-//line wkt.y:249
-		{
-			if !isValidPolygonRing(wktlex, wktDollar[1].coordList, 2) {
-				return 1
-			}
-			wktVAL.pair = geomPair{wktDollar[1].coordList, []int{len(wktDollar[1].coordList)}}
-		}
-	case 42:
-		wktDollar = wktS[wktpt-1 : wktpt+1]
-//line wkt.y:258
-		{
-			if !isValidPolygonRing(wktlex, wktDollar[1].coordList, 3) {
-				return 1
-			}
-			wktVAL.pair = geomPair{wktDollar[1].coordList, []int{len(wktDollar[1].coordList)}}
-		}
-	case 43:
-		wktDollar = wktS[wktpt-1 : wktpt+1]
-//line wkt.y:267
-		{
-			if !isValidPolygonRing(wktlex, wktDollar[1].coordList, 4) {
-				return 1
-			}
-			wktVAL.pair = geomPair{wktDollar[1].coordList, []int{len(wktDollar[1].coordList)}}
-		}
-	case 44:
-		wktDollar = wktS[wktpt-3 : wktpt+1]
-//line wkt.y:276
-		{
-			wktVAL.coordList = wktDollar[2].coordList
-		}
-	case 45:
-		wktDollar = wktS[wktpt-3 : wktpt+1]
-//line wkt.y:282
-		{
-			wktVAL.coordList = wktDollar[2].coordList
-		}
-	case 46:
-		wktDollar = wktS[wktpt-3 : wktpt+1]
-//line wkt.y:288
-		{
-			wktVAL.coordList = wktDollar[2].coordList
-		}
-	case 47:
-		wktDollar = wktS[wktpt-3 : wktpt+1]
-//line wkt.y:294
-		{
-			wktVAL.coordList = append(wktDollar[1].coordList, wktDollar[3].coordList...)
-		}
-	case 49:
-		wktDollar = wktS[wktpt-3 : wktpt+1]
-//line wkt.y:301
-		{
-			wktVAL.coordList = append(wktDollar[1].coordList, wktDollar[3].coordList...)
-		}
-	case 51:
-		wktDollar = wktS[wktpt-3 : wktpt+1]
-//line wkt.y:308
-		{
-			wktVAL.coordList = append(wktDollar[1].coordList, wktDollar[3].coordList...)
-		}
-	case 53:
 		wktDollar = wktS[wktpt-2 : wktpt+1]
 //line wkt.y:315
 		{
-			wktVAL.coordList = []float64{wktDollar[1].coord, wktDollar[2].coord}
+			wktVAL.geom = geom.NewPolygon(wktlex.(*wktLex).curLayout())
+		}
+	case 32:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:325
+		{
+			ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+			if !ok {
+				return 1
+			}
+		}
+	case 33:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:334
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+			if !ok {
+				return 1
+			}
+		}
+	case 34:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:341
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+			if !ok {
+				return 1
+			}
+		}
+	case 35:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:348
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+			if !ok {
+				return 1
+			}
+		}
+	case 36:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:357
+		{
+			wktVAL.geom = geom.NewMultiPointFlat(
+				wktlex.(*wktLex).curLayout(), wktDollar[2].flatRepr.flatCoords, geom.NewMultiPointFlatOptionWithEnds(wktDollar[2].flatRepr.ends),
+			)
+		}
+	case 37:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:363
+		{
+			wktVAL.geom = geom.NewMultiPointFlat(
+				wktlex.(*wktLex).curLayout(), wktDollar[2].flatRepr.flatCoords, geom.NewMultiPointFlatOptionWithEnds(wktDollar[2].flatRepr.ends),
+			)
+		}
+	case 38:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:369
+		{
+			wktVAL.geom = geom.NewMultiPoint(wktlex.(*wktLex).curLayout())
+		}
+	case 39:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:373
+		{
+			wktVAL.geom = geom.NewMultiPoint(wktlex.(*wktLex).curLayout())
+		}
+	case 40:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:379
+		{
+			ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+			if !ok {
+				return 1
+			}
+		}
+	case 41:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:388
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+			if !ok {
+				return 1
+			}
+		}
+	case 42:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:395
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+			if !ok {
+				return 1
+			}
+		}
+	case 43:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:402
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+			if !ok {
+				return 1
+			}
+		}
+	case 44:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:411
+		{
+			wktVAL.geom = geom.NewMultiLineStringFlat(wktlex.(*wktLex).curLayout(), wktDollar[2].flatRepr.flatCoords, wktDollar[2].flatRepr.ends)
+		}
+	case 45:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:415
+		{
+			wktVAL.geom = geom.NewMultiLineStringFlat(wktlex.(*wktLex).curLayout(), wktDollar[2].flatRepr.flatCoords, wktDollar[2].flatRepr.ends)
+		}
+	case 46:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:419
+		{
+			wktVAL.geom = geom.NewMultiLineString(wktlex.(*wktLex).curLayout())
+		}
+	case 47:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:423
+		{
+			wktVAL.geom = geom.NewMultiLineString(wktlex.(*wktLex).curLayout())
+		}
+	case 48:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:429
+		{
+			ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+			if !ok {
+				return 1
+			}
+		}
+	case 49:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:438
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+			if !ok {
+				return 1
+			}
+		}
+	case 50:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:445
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+			if !ok {
+				return 1
+			}
+		}
+	case 51:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:452
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+			if !ok {
+				return 1
+			}
+		}
+	case 52:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:461
+		{
+			wktVAL.geom = geom.NewMultiPolygonFlat(wktlex.(*wktLex).curLayout(), wktDollar[2].multiPolyFlatRepr.flatCoords, wktDollar[2].multiPolyFlatRepr.endss)
+		}
+	case 53:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:465
+		{
+			wktVAL.geom = geom.NewMultiPolygonFlat(wktlex.(*wktLex).curLayout(), wktDollar[2].multiPolyFlatRepr.flatCoords, wktDollar[2].multiPolyFlatRepr.endss)
 		}
 	case 54:
-		wktDollar = wktS[wktpt-3 : wktpt+1]
-//line wkt.y:321
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:469
 		{
-			wktVAL.coordList = []float64{wktDollar[1].coord, wktDollar[2].coord, wktDollar[3].coord}
+			wktVAL.geom = geom.NewMultiPolygon(wktlex.(*wktLex).curLayout())
 		}
 	case 55:
-		wktDollar = wktS[wktpt-4 : wktpt+1]
-//line wkt.y:327
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:473
 		{
-			wktVAL.coordList = []float64{wktDollar[1].coord, wktDollar[2].coord, wktDollar[3].coord, wktDollar[4].coord}
+			wktVAL.geom = geom.NewMultiPolygon(wktlex.(*wktLex).curLayout())
+		}
+	case 56:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:479
+		{
+			ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+			if !ok {
+				return 1
+			}
+		}
+	case 57:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:488
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+			if !ok {
+				return 1
+			}
+		}
+	case 58:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:495
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+			if !ok {
+				return 1
+			}
+		}
+	case 59:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:502
+		{
+			ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+			if !ok {
+				return 1
+			}
+		}
+	case 60:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:511
+		{
+			newCollection := geom.NewGeometryCollection()
+			err := newCollection.Push(wktDollar[2].geomList...)
+			if err != nil {
+				wktlex.(*wktLex).setError(err)
+				return 1
+			}
+			wktVAL.geom = newCollection
+		}
+	case 61:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:521
+		{
+			wktVAL.geom = geom.NewGeometryCollection()
+		}
+	case 62:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:525
+		{
+			wktVAL.geom = geom.NewGeometryCollection()
+		}
+	case 63:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:531
+		{
+			wktVAL.geomList = wktDollar[2].geomList
+		}
+	case 64:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:537
+		{
+			wktVAL.geomList = append(wktDollar[1].geomList, wktDollar[3].geom)
+		}
+	case 65:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:541
+		{
+			wktVAL.geomList = []geom.T{wktDollar[1].geom}
+		}
+	case 68:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:551
+		{
+			ok := wktlex.(*wktLex).validateAndPushLayoutStackFrame(geom.NoLayout)
+			if !ok {
+				return 1
+			}
+		}
+	case 69:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:560
+		{
+			ok := wktlex.(*wktLex).validateAndPushLayoutStackFrame(geom.XYM)
+			if !ok {
+				return 1
+			}
+		}
+	case 70:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:567
+		{
+			ok := wktlex.(*wktLex).validateAndPushLayoutStackFrame(geom.XYZ)
+			if !ok {
+				return 1
+			}
+		}
+	case 71:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:574
+		{
+			ok := wktlex.(*wktLex).validateAndPushLayoutStackFrame(geom.XYZM)
+			if !ok {
+				return 1
+			}
+		}
+	case 72:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:583
+		{
+			ok := wktlex.(*wktLex).validateNonEmptyGeometryAllowed()
+			if !ok {
+				return 1
+			}
+		}
+	case 73:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:592
+		{
+			wktVAL.multiPolyFlatRepr = wktDollar[2].multiPolyFlatRepr
+		}
+	case 74:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:598
+		{
+			wktVAL.multiPolyFlatRepr = wktDollar[2].multiPolyFlatRepr
+		}
+	case 75:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:604
+		{
+			wktVAL.multiPolyFlatRepr = appendMultiPolygonFlatCoordsRepr(wktDollar[1].multiPolyFlatRepr, wktDollar[3].multiPolyFlatRepr)
+		}
+	case 77:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:611
+		{
+			wktVAL.multiPolyFlatRepr = appendMultiPolygonFlatCoordsRepr(wktDollar[1].multiPolyFlatRepr, wktDollar[3].multiPolyFlatRepr)
+		}
+	case 79:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:618
+		{
+			wktVAL.multiPolyFlatRepr = makeMultiPolygonFlatCoordsRepr(wktDollar[1].flatRepr)
+		}
+	case 80:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:624
+		{
+			wktVAL.multiPolyFlatRepr = makeMultiPolygonFlatCoordsRepr(wktDollar[1].flatRepr)
+		}
+	case 82:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:631
+		{
+			wktVAL.flatRepr = makeGeomFlatCoordsRepr(wktDollar[1].coordList)
+		}
+	case 84:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:638
+		{
+			wktVAL.flatRepr = makeGeomFlatCoordsRepr(wktDollar[1].coordList)
+		}
+	case 85:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:644
+		{
+			wktVAL.flatRepr = wktDollar[2].flatRepr
+		}
+	case 86:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:650
+		{
+			wktVAL.flatRepr = wktDollar[2].flatRepr
+		}
+	case 87:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:656
+		{
+			wktVAL.flatRepr = appendGeomFlatCoordsReprs(wktDollar[1].flatRepr, wktDollar[3].flatRepr)
+		}
+	case 89:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:663
+		{
+			wktVAL.flatRepr = appendGeomFlatCoordsReprs(wktDollar[1].flatRepr, wktDollar[3].flatRepr)
+		}
+	case 91:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:670
+		{
+			wktVAL.flatRepr = makeGeomFlatCoordsRepr(wktDollar[1].coordList)
+		}
+	case 92:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:676
+		{
+			wktVAL.flatRepr = makeGeomFlatCoordsRepr(wktDollar[1].coordList)
+		}
+	case 97:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:690
+		{
+			wktVAL.flatRepr = wktDollar[2].flatRepr
+		}
+	case 98:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:696
+		{
+			wktVAL.flatRepr = wktDollar[2].flatRepr
+		}
+	case 99:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:702
+		{
+			wktVAL.flatRepr = appendGeomFlatCoordsReprs(wktDollar[1].flatRepr, wktDollar[3].flatRepr)
+		}
+	case 101:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:709
+		{
+			wktVAL.flatRepr = appendGeomFlatCoordsReprs(wktDollar[1].flatRepr, wktDollar[3].flatRepr)
+		}
+	case 103:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:716
+		{
+			wktVAL.flatRepr = makeGeomFlatCoordsRepr(wktDollar[1].coordList)
+		}
+	case 104:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:722
+		{
+			wktVAL.flatRepr = makeGeomFlatCoordsRepr(wktDollar[1].coordList)
+		}
+	case 111:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:739
+		{
+			wktVAL.flatRepr = wktDollar[2].flatRepr
+		}
+	case 112:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:745
+		{
+			wktVAL.flatRepr = appendGeomFlatCoordsReprs(wktDollar[1].flatRepr, wktDollar[3].flatRepr)
+		}
+	case 114:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:752
+		{
+			if !isValidPolygonRing(wktlex, wktDollar[1].coordList, wktlex.(*wktLex).curLayout().Stride()) {
+				return 1
+			}
+			wktVAL.flatRepr = makeGeomFlatCoordsRepr(wktDollar[1].coordList)
+		}
+	case 115:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:761
+		{
+			if !isValidLineString(wktlex, wktDollar[1].coordList, wktlex.(*wktLex).curLayout().Stride()) {
+				return 1
+			}
+		}
+	case 116:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:769
+		{
+			wktVAL.coordList = wktDollar[2].coordList
+		}
+	case 117:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:775
+		{
+			wktVAL.coordList = append(wktDollar[1].coordList, wktDollar[3].coordList...)
+		}
+	case 119:
+		wktDollar = wktS[wktpt-3 : wktpt+1]
+//line wkt.y:782
+		{
+			wktVAL.coordList = wktDollar[2].coordList
+		}
+	case 120:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:788
+		{
+			switch len(wktDollar[1].coordList) {
+			case 1:
+				wktlex.(*wktLex).setParseError("not enough coordinates", "each point needs at least 2 coords")
+				return 1
+			case 2, 3, 4:
+				ok := wktlex.(*wktLex).validateStrideAndSetDefaultLayoutIfNoLayout(len(wktDollar[1].coordList))
+				if !ok {
+					return 1
+				}
+			default:
+				wktlex.(*wktLex).setParseError("too many coordinates", "each point can have at most 4 coords")
+				return 1
+			}
+		}
+	case 121:
+		wktDollar = wktS[wktpt-2 : wktpt+1]
+//line wkt.y:806
+		{
+			wktVAL.coordList = append(wktDollar[1].coordList, wktDollar[2].coord)
+		}
+	case 122:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:810
+		{
+			wktVAL.coordList = []float64{wktDollar[1].coord}
+		}
+	case 123:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:816
+		{
+			ok := wktlex.(*wktLex).validateBaseTypeEmptyAllowed()
+			if !ok {
+				return 1
+			}
+		}
+	case 125:
+		wktDollar = wktS[wktpt-1 : wktpt+1]
+//line wkt.y:828
+		{
+			wktVAL.coordList = []float64(nil)
 		}
 	}
 	goto wktstack /* stack new state and value */

@@ -9465,7 +9465,9 @@ func (o *mergeJoinRightSemiOp) build(ctx context.Context) {
 }
 
 func (o *mergeJoinRightSemiOp) Next(ctx context.Context) coldata.Batch {
-	o.output, _ = o.unlimitedAllocator.ResetMaybeReallocate(o.outputTypes, o.output, 1 /* minCapacity */)
+	o.output, _ = o.unlimitedAllocator.ResetMaybeReallocate(
+		o.outputTypes, o.output, 1 /* minCapacity */, o.memoryLimit,
+	)
 	o.bufferedGroup.helper.output = o.output
 	for {
 		switch o.state {
@@ -9521,7 +9523,7 @@ func (o *mergeJoinRightSemiOp) Next(ctx context.Context) coldata.Batch {
 			// Note that resetting of buffered group will close disk queues
 			// (if there are any).
 			if o.bufferedGroup.needToReset {
-				o.bufferedGroup.helper.reset(ctx)
+				o.bufferedGroup.helper.Reset(ctx)
 				o.bufferedGroup.needToReset = false
 			}
 			return coldata.ZeroBatch

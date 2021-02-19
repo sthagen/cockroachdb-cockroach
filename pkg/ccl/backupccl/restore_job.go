@@ -15,6 +15,7 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -421,6 +422,13 @@ func WriteDescriptors(
 			if err := table.Validate(ctx, dg); err != nil {
 				return errors.Wrapf(err,
 					"validate table %d", errors.Safe(table.GetID()))
+			}
+		}
+
+		for _, db := range databases {
+			if err := db.Validate(ctx, dg); err != nil {
+				return errors.Wrapf(err,
+					"validate database %d", errors.Safe(db.GetID()))
 			}
 		}
 		return nil
@@ -880,7 +888,11 @@ func spansForAllRestoreTableIndexes(
 // createImportingDescriptors create the tables that we will restore into. It also
 // fetches the information from the old tables that we need for the restore.
 func createImportingDescriptors(
-	ctx context.Context, p sql.JobExecContext, sqlDescs []catalog.Descriptor, r *restoreResumer,
+	ctx context.Context,
+	p sql.JobExecContext,
+	backupCodec keys.SQLCodec,
+	sqlDescs []catalog.Descriptor,
+	r *restoreResumer,
 ) (tables []catalog.TableDescriptor, oldTableIDs []descpb.ID, spans []roachpb.Span, err error) {
 	details := r.job.Details().(jobspb.RestoreDetails)
 
@@ -925,7 +937,7 @@ func createImportingDescriptors(
 
 	// We get the spans of the restoring tables _as they appear in the backup_,
 	// that is, in the 'old' keyspace, before we reassign the table IDs.
-	spans = spansForAllRestoreTableIndexes(p.ExecCfg().Codec, tables, nil)
+	spans = spansForAllRestoreTableIndexes(backupCodec, tables, nil)
 
 	log.Eventf(ctx, "starting restore for %d tables", len(mutableTables))
 
@@ -1020,6 +1032,54 @@ func createImportingDescriptors(
 			p.ExecCfg().InternalExecutor, p.ExecCfg().DB, func(
 				ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
 			) error {
+				// A couple of pieces of cleanup are required for multi-region databases.
+				// First, we need to find all of the MULTIREGION_ENUMs types and remap the
+				// IDs stored in the corresponding database descriptors to match the type's
+				// new ID. Secondly, we need to rebuild the zone configuration for each
+				// multi-region database. We don't perform the zone configuration rebuild on
+				// cluster restores, as they will have the zone configurations restored as
+				// as the system tables are restored.
+				mrEnumsFound := make(map[descpb.ID]descpb.ID)
+				for _, t := range typesByID {
+					typeDesc := t.TypeDesc()
+					if typeDesc.GetKind() == descpb.TypeDescriptor_MULTIREGION_ENUM {
+						// Check to see if we've found more than one multi-region enum on any
+						// given database.
+						if id, ok := mrEnumsFound[typeDesc.ParentID]; ok {
+							return errors.AssertionFailedf(
+								"unexpectedly found more than one MULTIREGION_ENUM (IDs = %d, %d) "+
+									"on database %d during restore", id, typeDesc.ID, typeDesc.ParentID)
+						}
+						mrEnumsFound[typeDesc.ParentID] = typeDesc.ID
+
+						if db, ok := dbsByID[typeDesc.GetParentID()]; ok {
+							desc := db.DatabaseDesc()
+							if desc.RegionConfig == nil {
+								return errors.AssertionFailedf(
+									"found MULTIREGION_ENUM on non-multi-region database %s", desc.Name)
+							}
+
+							// Update the RegionEnumID to record the new multi-region enum ID.
+							desc.RegionConfig.RegionEnumID = t.GetID()
+
+							// If we're not in a cluster restore, rebuild the database-level zone
+							// configuration.
+							if details.DescriptorCoverage != tree.AllDescriptors {
+								log.Infof(ctx, "restoring zone configuration for database %d", desc.ID)
+								if err := sql.ApplyZoneConfigFromDatabaseRegionConfig(
+									ctx,
+									desc.GetID(),
+									*desc.RegionConfig,
+									txn,
+									p.ExecCfg(),
+								); err != nil {
+									return err
+								}
+							}
+						}
+					}
+				}
+
 				// Write the new descriptors which are set in the OFFLINE state.
 				if err := WriteDescriptors(
 					ctx, p.ExecCfg().Codec, txn, p.User(), descsCol, databases, writtenSchemas, tables, writtenTypes,
@@ -1065,7 +1125,16 @@ func createImportingDescriptors(
 				// to the new tables being restored.
 				for _, table := range mutableTables {
 					// Collect all types used by this table.
-					typeIDs, err := table.GetAllReferencedTypeIDs(func(id descpb.ID) (catalog.TypeDescriptor, error) {
+					_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
+						ctx, txn, table.GetParentID(), tree.DatabaseLookupFlags{
+							Required:       true,
+							AvoidCached:    true,
+							IncludeOffline: true,
+						})
+					if err != nil {
+						return err
+					}
+					typeIDs, err := table.GetAllReferencedTypeIDs(dbDesc, func(id descpb.ID) (catalog.TypeDescriptor, error) {
 						return typesByID[id], nil
 					})
 					if err != nil {
@@ -1095,6 +1164,52 @@ func createImportingDescriptors(
 					return err
 				}
 
+				// Now that all of the descriptors have been written to disk, rebuild
+				// the zone configurations for any multi-region tables. We only do this
+				// in cases where this is not a full cluster restore, because in cluster
+				// restore cases, the zone configurations will be restored when the
+				// system tables are restored.
+				if details.DescriptorCoverage != tree.AllDescriptors {
+					for _, table := range tableDescs {
+						if lc := table.GetLocalityConfig(); lc != nil {
+							_, desc, err := descsCol.GetImmutableDatabaseByID(
+								ctx,
+								txn,
+								table.ParentID,
+								tree.DatabaseLookupFlags{
+									Required:       true,
+									AvoidCached:    true,
+									IncludeOffline: true,
+								},
+							)
+							if err != nil {
+								return err
+							}
+							if desc.RegionConfig == nil {
+								return errors.AssertionFailedf(
+									"found multi-region table %d in non-multi-region database %d",
+									table.ID, table.ParentID)
+							}
+
+							mutTable, err := descsCol.GetMutableTableVersionByID(ctx, table.GetID(), txn)
+							if err != nil {
+								return err
+							}
+
+							if err := sql.ApplyZoneConfigForMultiRegionTable(
+								ctx,
+								txn,
+								p.ExecCfg(),
+								*desc.RegionConfig,
+								mutTable,
+								sql.ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes,
+							); err != nil {
+								return err
+							}
+						}
+					}
+				}
+
 				for _, tenant := range details.Tenants {
 					// Mark the tenant info as adding.
 					tenant.State = descpb.TenantInfo_ADD
@@ -1116,7 +1231,7 @@ func createImportingDescriptors(
 				}
 
 				// Update the job once all descs have been prepared for ingestion.
-				err := r.job.WithTxn(txn).SetDetails(ctx, details)
+				err := r.job.SetDetails(ctx, txn, details)
 
 				return err
 			})
@@ -1146,6 +1261,27 @@ func (r *restoreResumer) Resume(ctx context.Context, execCtx interface{}) error 
 	if err != nil {
 		return err
 	}
+	// backupCodec is the codec that was used to encode the keys in the backup. It
+	// is the tenant in which the backup was taken.
+	backupCodec := keys.SystemSQLCodec
+	if len(sqlDescs) != 0 {
+		if len(latestBackupManifest.Spans) != 0 && len(latestBackupManifest.Tenants) == 0 {
+			// If there are no tenant targets, then the entire keyspace covered by
+			// Spans must lie in 1 tenant.
+			_, backupTenantID, err := keys.DecodeTenantPrefix(latestBackupManifest.Spans[0].Key)
+			if err != nil {
+				return err
+			}
+			backupCodec = keys.MakeSQLCodec(backupTenantID)
+			if backupTenantID != roachpb.SystemTenantID && p.ExecCfg().Codec.ForSystemTenant() {
+				// TODO(pbardea): This is unsupported for now because the key-rewriter
+				// cannot distinguish between RESTORE TENANT and table restore from a
+				// backup taken in a tenant, into the system tenant.
+				return errors.New("cannot restore tenant backups into system tenant")
+			}
+		}
+	}
+
 	lastBackupIndex, err := getBackupIndexAtTime(backupManifests, details.EndTime)
 	if err != nil {
 		return err
@@ -1159,7 +1295,7 @@ func (r *restoreResumer) Resume(ctx context.Context, execCtx interface{}) error 
 		return err
 	}
 
-	tables, oldTableIDs, spans, err := createImportingDescriptors(ctx, p, sqlDescs, r)
+	tables, oldTableIDs, spans, err := createImportingDescriptors(ctx, p, backupCodec, sqlDescs, r)
 	if err != nil {
 		return err
 	}
@@ -1215,7 +1351,7 @@ func (r *restoreResumer) Resume(ctx context.Context, execCtx interface{}) error 
 
 	numClusterNodes, err := clusterNodeCount(p.ExecCfg().Gossip)
 	if err != nil {
-		if !build.IsRelease() {
+		if !build.IsRelease() && p.ExecCfg().Codec.ForSystemTenant() {
 			return err
 		}
 		log.Warningf(ctx, "unable to determine cluster node count: %v", err)
@@ -1353,7 +1489,7 @@ func insertStats(
 			return errors.Wrapf(err, "inserting stats from backup")
 		}
 		details.StatsInserted = true
-		if err := job.WithTxn(txn).SetDetails(ctx, details); err != nil {
+		if err := job.SetDetails(ctx, txn, details); err != nil {
 			return errors.Wrapf(err, "updating job marking stats insertion complete")
 		}
 		return nil
@@ -1515,11 +1651,10 @@ func (r *restoreResumer) publishDescriptors(
 	details.TypeDescs = newTypes
 	details.SchemaDescs = newSchemas
 	details.DatabaseDescs = newDBs
-	if err := r.job.WithTxn(txn).SetDetails(ctx, details); err != nil {
+	if err := r.job.SetDetails(ctx, txn, details); err != nil {
 		return newDescriptorChangeJobs, errors.Wrap(err,
 			"updating job details after publishing tables")
 	}
-	r.job.WithTxn(nil)
 
 	return newDescriptorChangeJobs, nil
 }
@@ -1793,8 +1928,18 @@ func (r *restoreResumer) removeExistingTypeBackReferences(
 			return typ, nil
 		}
 
+		_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
+			ctx, txn, tbl.GetParentID(), tree.DatabaseLookupFlags{
+				Required:       true,
+				AvoidCached:    true,
+				IncludeOffline: true,
+			})
+		if err != nil {
+			return err
+		}
+
 		// Get all types that this descriptor references.
-		referencedTypes, err := tbl.GetAllReferencedTypeIDs(lookup)
+		referencedTypes, err := tbl.GetAllReferencedTypeIDs(dbDesc, lookup)
 		if err != nil {
 			return err
 		}
@@ -1901,15 +2046,15 @@ func (r *restoreResumer) restoreSystemTables(
 
 		if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			txn.SetDebugName("system-restore-txn")
-			config, ok := systemTableBackupConfiguration[systemTableName]
+			config, ok := backupbase.SystemTableBackupConfiguration[systemTableName]
 			if !ok {
 				log.Warningf(ctx, "no configuration specified for table %s... skipping restoration",
 					systemTableName)
 			}
 
-			restoreFunc := defaultSystemTableRestoreFunc
-			if config.customRestoreFunc != nil {
-				restoreFunc = config.customRestoreFunc
+			restoreFunc := backupbase.DefaultSystemTableRestoreFunc
+			if config.CustomRestoreFunc != nil {
+				restoreFunc = config.CustomRestoreFunc
 				log.Eventf(ctx, "using custom restore function for table %s", systemTableName)
 			}
 

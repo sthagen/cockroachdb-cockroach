@@ -21,6 +21,7 @@ type ModuleTestingKnobs interface {
 type TestingKnobs struct {
 	Store                ModuleTestingKnobs
 	KVClient             ModuleTestingKnobs
+	RangeFeed            ModuleTestingKnobs
 	SQLExecutor          ModuleTestingKnobs
 	SQLLeaseManager      ModuleTestingKnobs
 	SQLSchemaChanger     ModuleTestingKnobs
@@ -36,4 +37,5 @@ type TestingKnobs struct {
 	TenantTestingKnobs   ModuleTestingKnobs
 	JobsTestingKnobs     ModuleTestingKnobs
 	BackupRestore        ModuleTestingKnobs
+	MigrationManager     ModuleTestingKnobs
 }

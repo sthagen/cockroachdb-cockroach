@@ -178,7 +178,7 @@ func TestDiskQueueCloseOnErr(t *testing.T) {
 	defer cleanup()
 
 	serverCfg := &execinfra.ServerConfig{}
-	serverCfg.TestingKnobs.MemoryLimitBytes = 1
+	serverCfg.TestingKnobs.ForceDiskSpill = true
 	diskMon := execinfra.NewLimitedMonitor(ctx, testDiskMonitor, serverCfg, t.Name())
 	defer diskMon.Stop(ctx)
 	diskAcc := diskMon.MakeBoundAccount()
@@ -189,7 +189,6 @@ func TestDiskQueueCloseOnErr(t *testing.T) {
 	require.NoError(t, err)
 
 	b := coldata.NewMemBatch(typs, coldata.StandardColumnFactory)
-	b.SetLength(0)
 
 	err = q.Enqueue(ctx, b)
 	require.Error(t, err, "expected Enqueue to produce an error given a disk limit of one byte")

@@ -314,8 +314,10 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a () INTERLEAVE IN PARENT b (c) PARTITION BY LIST (d) (PARTITION e VALUES IN (1))`},
 		{`CREATE TABLE IF NOT EXISTS a () PARTITION BY LIST (b) (PARTITION c VALUES IN (1))`},
 		{`CREATE TABLE a (INDEX (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1)))`},
+		{`CREATE TABLE a (INVERTED INDEX (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1)))`},
 		{`CREATE TABLE a (UNIQUE (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1)))`},
 		{`CREATE INDEX ON a (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1))`},
+		{`CREATE INVERTED INDEX ON a (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1))`},
 		{`CREATE INDEX IF NOT EXISTS a ON b (c) PARTITION BY LIST (d) (PARTITION e VALUES IN (1))`},
 		{`ALTER TABLE a PARTITION BY LIST (b) (PARTITION p1 VALUES IN (1))`},
 		{`ALTER TABLE a PARTITION ALL BY LIST (b) (PARTITION p1 VALUES IN (1))`},
@@ -1728,6 +1730,14 @@ func TestParse(t *testing.T) {
 		{`RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar'`},
 		{`RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1`},
 
+		// Currently, we only support TENANT as a target. We have grammar rules for
+		// all targets supported by RESTORE but these will error out during the
+		// planning phase.
+		{`RESTORE TABLE foo FROM REPLICATION STREAM FROM 'bar'`},
+		{`RESTORE TABLE foo FROM REPLICATION STREAM FROM $1`},
+		{`RESTORE DATABASE foodb FROM REPLICATION STREAM FROM 'baz'`},
+		{`RESTORE DATABASE foodb FROM REPLICATION STREAM FROM $1`},
+
 		{`BACKUP TABLE foo TO 'bar' WITH revision_history, detached`},
 		{`RESTORE TABLE foo FROM 'bar' WITH skip_missing_foreign_keys, skip_missing_sequences, detached`},
 
@@ -1759,6 +1769,13 @@ func TestParse(t *testing.T) {
 		// {`CREATE CHANGEFEED FOR TABLE foo PARTITION bar, baz INTO 'sink'`},
 		// {`CREATE CHANGEFEED FOR DATABASE foo INTO 'sink'`},
 		{`CREATE CHANGEFEED FOR TABLE foo INTO 'sink' WITH bar = 'baz'`},
+
+		{`CREATE REPLICATION STREAM FOR TENANT 1`},
+		{`CREATE REPLICATION STREAM FOR TENANT 1 WITH CURSOR='start'`},
+		{`CREATE REPLICATION STREAM FOR TENANT 1 INTO 'sink'`},
+		{`CREATE REPLICATION STREAM FOR TENANT 1 INTO 'sink' WITH CURSOR='start', DETACHED`},
+		{`CREATE REPLICATION STREAM FOR DATABASE a, b, c`},
+		{`CREATE REPLICATION STREAM FOR TABLE t`},
 
 		// Regression for #15926
 		{`SELECT * FROM ((t1 NATURAL JOIN t2 WITH ORDINALITY AS o1)) WITH ORDINALITY AS o2`},
@@ -1828,6 +1845,9 @@ func TestParse2(t *testing.T) {
 			`CREATE DATABASE a PRIMARY REGION = "us-west-1"`,
 			`CREATE DATABASE a PRIMARY REGION "us-west-1"`,
 		},
+		{`ALTER DATABASE a SET PRIMARY REGION "us-west-1"`,
+			`ALTER DATABASE a PRIMARY REGION "us-west-1"`},
+
 		{`CREATE TABLE a (b INT) WITH (fillfactor=100)`,
 			`CREATE TABLE a (b INT8)`},
 		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b))`,
@@ -2863,6 +2883,10 @@ SKIP_MISSING_FOREIGN_KEYS, SKIP_MISSING_SEQUENCES, SKIP_MISSING_SEQUENCE_OWNERS,
 			`CREATE TABLE a (a INT4) LOCALITY REGIONAL BY TABLE`,
 			`CREATE TABLE a (a INT4) LOCALITY REGIONAL BY TABLE IN PRIMARY REGION`,
 		},
+		{
+			`CREATE REPLICATION STREAM FOR a,b,c  INTO 'sink' WITH DETACHED, CURSOR='start'`,
+			`CREATE REPLICATION STREAM FOR TABLE a, b, c INTO 'sink' WITH CURSOR='start', DETACHED`,
+		},
 	}
 	for _, d := range testData {
 		t.Run(d.sql, func(t *testing.T) {
@@ -3190,8 +3214,11 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`ALTER TABLE a ADD CONSTRAINT foo EXCLUDE USING gist (bar WITH =)`, 46657, `add constraint exclude using`, ``},
 		{`ALTER TABLE a INHERITS b`, 22456, `alter table inherits`, ``},
 		{`ALTER TABLE a NO INHERITS b`, 22456, `alter table no inherits`, ``},
+		{`ALTER FUNCTION public.isnumeric(text) OWNER TO bob`, 0, `alter function`, ``},
 
 		{`CREATE ACCESS METHOD a`, 0, `create access method`, ``},
+
+		{`COMMENT ON EXTENSION plpgsql IS 'PL/pgSQL procedural language'`, 0, `comment on extension`, ``},
 
 		{`COPY x FROM STDIN WHERE a = b`, 54580, ``, ``},
 
@@ -3200,6 +3227,7 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE CONSTRAINT TRIGGER a`, 28296, `create constraint`, ``},
 		{`CREATE CONVERSION a`, 0, `create conversion`, ``},
 		{`CREATE DEFAULT CONVERSION a`, 0, `create def conv`, ``},
+		{`CREATE EXTENSION IF NOT EXISTS plpgsql WITH SCHEMA pg_catalog`, 0, `create extension if not exists with`, ``},
 		{`CREATE FOREIGN DATA WRAPPER a`, 0, `create fdw`, ``},
 		{`CREATE FOREIGN TABLE a`, 0, `create foreign table`, ``},
 		{`CREATE FUNCTION a`, 17511, `create`, ``},
@@ -3237,6 +3265,9 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`DISCARD SEQUENCES`, 0, `discard sequences`, ``},
 		{`DISCARD TEMP`, 0, `discard temp`, ``},
 		{`DISCARD TEMPORARY`, 0, `discard temp`, ``},
+
+		{`GRANT ALL ON SEQUENCE`, 0, `grant privileges on sequence`, ``},
+		{`REVOKE ALL ON SEQUENCE`, 0, `revoke privileges on sequence`, ``},
 
 		{`SET CONSTRAINTS foo`, 0, `set constraints`, ``},
 		{`SET LOCAL foo = bar`, 32562, ``, ``},

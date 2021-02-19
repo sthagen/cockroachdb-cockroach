@@ -12,17 +12,22 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
@@ -63,11 +68,11 @@ func (p *planner) AlterTableLocality(
 	}
 
 	// Ensure that the database is multi-region enabled.
-	dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
+	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
 		ctx,
 		p.txn,
 		tableDesc.GetParentID(),
-		tree.DatabaseLookupFlags{},
+		tree.DatabaseLookupFlags{Required: true},
 	)
 	if err != nil {
 		return nil, err
@@ -110,7 +115,23 @@ func (n *alterTableSetLocalityNode) alterTableLocalityGlobalToRegionalByTable(
 		)
 	}
 
-	n.tableDesc.SetTableLocalityRegionalByTable(n.n.Locality.TableRegion)
+	_, dbDesc, err := params.p.Descriptors().GetImmutableDatabaseByID(
+		params.ctx, params.p.txn, n.tableDesc.ParentID,
+		tree.DatabaseLookupFlags{Required: true})
+	if err != nil {
+		return err
+	}
+
+	regionEnumID, err := dbDesc.MultiRegionEnumID()
+	if err != nil {
+		return err
+	}
+
+	if err := params.p.alterTableDescLocalityToRegionalByTable(
+		params.ctx, n.n.Locality.TableRegion, n.tableDesc, regionEnumID,
+	); err != nil {
+		return err
+	}
 
 	// Finalize the alter by writing a new table descriptor and updating the zone
 	// configuration.
@@ -135,8 +156,14 @@ func (n *alterTableSetLocalityNode) alterTableLocalityRegionalByTableToGlobal(
 			n.tableDesc.LocalityConfig,
 		)
 	}
-
-	n.tableDesc.SetTableLocalityGlobal()
+	regionEnumID, err := n.dbDesc.MultiRegionEnumID()
+	if err != nil {
+		return err
+	}
+	err = params.p.alterTableDescLocalityToGlobal(params.ctx, n.tableDesc, regionEnumID)
+	if err != nil {
+		return err
+	}
 
 	// Finalize the alter by writing a new table descriptor and updating the zone
 	// configuration.
@@ -162,7 +189,23 @@ func (n *alterTableSetLocalityNode) alterTableLocalityRegionalByTableToRegionalB
 		)
 	}
 
-	n.tableDesc.SetTableLocalityRegionalByTable(n.n.Locality.TableRegion)
+	_, dbDesc, err := params.p.Descriptors().GetImmutableDatabaseByID(
+		params.ctx, params.p.txn, n.tableDesc.ParentID,
+		tree.DatabaseLookupFlags{Required: true})
+	if err != nil {
+		return err
+	}
+
+	regionEnumID, err := dbDesc.MultiRegionEnumID()
+	if err != nil {
+		return err
+	}
+
+	if err := params.p.alterTableDescLocalityToRegionalByTable(
+		params.ctx, n.n.Locality.TableRegion, n.tableDesc, regionEnumID,
+	); err != nil {
+		return err
+	}
 
 	// Finalize the alter by writing a new table descriptor and updating the zone configuration.
 	if err := n.validateAndWriteNewTableLocalityAndZoneConfig(
@@ -175,41 +218,188 @@ func (n *alterTableSetLocalityNode) alterTableLocalityRegionalByTableToRegionalB
 	return nil
 }
 
-func (n *alterTableSetLocalityNode) alterTableLocalityNonRegionalByRowToRegionalByRow(
-	params runParams,
-	existingLocality *descpb.TableDescriptor_LocalityConfig,
-	newLocality *tree.Locality,
+func (n *alterTableSetLocalityNode) alterTableLocalityToRegionalByRow(
+	params runParams, newLocality *tree.Locality,
 ) error {
-	if newLocality.RegionalByRowColumn == tree.RegionalByRowRegionNotSpecifiedName {
-		return unimplemented.NewWithIssue(59632, "implementation pending")
+	mayNeedImplicitCRDBRegionCol := false
+	var mutationIdxAllowedInSameTxn *int
+	var newColumnName *tree.Name
+
+	// Check if the region column exists already - if so, use it.
+	// Otherwise, if we have no name was specified, implicitly create the
+	// crdb_region column.
+	partColName := newLocality.RegionalByRowColumn
+
+	primaryIndexColIdxStart := 0
+	if n.tableDesc.IsLocalityRegionalByRow() {
+		as := n.tableDesc.LocalityConfig.GetRegionalByRow().As
+
+		// If the REGIONAL BY ROW (AS <col>) is exactly the same, do nothing.
+		defaultColumnSpecified := as == nil && partColName == tree.RegionalByRowRegionNotSpecifiedName
+		sameAsColumnSpecified := as != nil && *as == string(partColName)
+		if defaultColumnSpecified || sameAsColumnSpecified {
+			return nil
+		}
+
+		// Otherwise, signal that we have to omit the implicit partitioning columns
+		// when modifying the primary key.
+		primaryIndexColIdxStart = int(n.tableDesc.PrimaryIndex.Partitioning.NumImplicitColumns)
 	}
 
-	// Ensure column exists and is of the correct type.
-	partCol, err := n.tableDesc.FindColumnWithName(newLocality.RegionalByRowColumn)
-	if err != nil {
+	if newLocality.RegionalByRowColumn == tree.RegionalByRowRegionNotSpecifiedName {
+		partColName = tree.RegionalByRowRegionDefaultColName
+		mayNeedImplicitCRDBRegionCol = true
+	}
+
+	partCol, err := n.tableDesc.FindColumnWithName(partColName)
+	createDefaultRegionCol := mayNeedImplicitCRDBRegionCol && sqlerrors.IsUndefinedColumnError(err)
+	if err != nil && !createDefaultRegionCol {
 		return err
 	}
+
 	enumTypeID, err := n.dbDesc.MultiRegionEnumID()
 	if err != nil {
 		return err
 	}
-	if partCol.GetType().Oid() != typedesc.TypeIDToOID(enumTypeID) {
-		return pgerror.Newf(
-			pgcode.InvalidTableDefinition,
-			"cannot use column %s for REGIONAL BY ROW as it does not have the %s type",
-			newLocality.RegionalByRowColumn,
-			tree.RegionEnum,
-		)
-	}
+	enumOID := typedesc.TypeIDToOID(enumTypeID)
 
+	var newColumnID *descpb.ColumnID
+	var newColumnDefaultExpr *string
+
+	if !createDefaultRegionCol {
+		// If the column is not public, we cannot use it yet.
+		if !partCol.Public() {
+			return colinfo.NewUndefinedColumnError(string(partColName))
+		}
+
+		// If we already have a column with the given name, check it is compatible to be made
+		// a PRIMARY KEY.
+		if partCol.GetType().Oid() != typedesc.TypeIDToOID(enumTypeID) {
+			return pgerror.Newf(
+				pgcode.InvalidTableDefinition,
+				"cannot use column %s for REGIONAL BY ROW table as it does not have the %s type",
+				partColName,
+				tree.RegionEnum,
+			)
+		}
+
+		// Check whether the given row is NOT NULL.
+		if partCol.IsNullable() {
+			return errors.WithHintf(
+				pgerror.Newf(
+					pgcode.InvalidTableDefinition,
+					"cannot use column %s for REGIONAL BY ROW table as it may contain NULL values",
+					partColName,
+				),
+				"Add the NOT NULL constraint first using ALTER TABLE %s ALTER COLUMN %s SET NOT NULL.",
+				tree.Name(n.tableDesc.Name),
+				partColName,
+			)
+		}
+	} else {
+		// No crdb_region column is found so we are implicitly creating it.
+		// We insert the column definition before altering the primary key.
+
+		primaryRegion, err := n.dbDesc.PrimaryRegionName()
+		if err != nil {
+			return err
+		}
+		// No crdb_region column is found so we are implicitly creating it.
+		// We insert the column definition before altering the primary key.
+		//
+		// Note we initially set the default expression to be primary_region,
+		// so that it is backfilled this way. When the backfill is complete,
+		// we will change this to use gateway_region.
+		defaultColDef := &tree.AlterTableAddColumn{
+			ColumnDef: regionalByRowDefaultColDef(
+				enumOID,
+				regionalByRowRegionDefaultExpr(enumOID, tree.Name(primaryRegion)),
+			),
+		}
+		tn, err := params.p.getQualifiedTableName(params.ctx, n.tableDesc)
+		if err != nil {
+			return err
+		}
+		if err := params.p.addColumnImpl(
+			params,
+			&alterTableNode{
+				tableDesc: n.tableDesc,
+				n: &tree.AlterTable{
+					Cmds: []tree.AlterTableCmd{defaultColDef},
+				},
+			},
+			tn,
+			n.tableDesc,
+			defaultColDef,
+			params.SessionData(),
+		); err != nil {
+			return err
+		}
+
+		// Allow add column mutation to be on the same mutation ID in AlterPrimaryKey.
+		mutationIdx := len(n.tableDesc.GetMutations()) - 1
+		mutationIdxAllowedInSameTxn = &mutationIdx
+		newColumnName = &partColName
+
+		if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
+			return err
+		}
+
+		// On the AlterPrimaryKeyMutation, sanitize and form the correct default
+		// expression to replace the crdb_region column with when the mutation
+		// is finalized.
+		// NOTE: this is important, as the schema changer is NOT database aware.
+		// The primary_region default helps us also have a material value.
+		// This can be removed when the default_expr can serialize user defined
+		// functions.
+		col := n.tableDesc.GetMutations()[mutationIdx].GetColumn()
+		finalDefaultExpr, err := schemaexpr.SanitizeVarFreeExpr(
+			params.ctx,
+			regionalByRowGatewayRegionDefaultExpr(enumOID),
+			col.Type,
+			"REGIONAL BY ROW DEFAULT",
+			params.p.SemaCtx(),
+			tree.VolatilityVolatile,
+		)
+		if err != nil {
+			return err
+		}
+		s := tree.Serialize(finalDefaultExpr)
+		newColumnDefaultExpr = &s
+		newColumnID = &col.ID
+	}
+	return n.alterTableLocalityFromOrToRegionalByRow(
+		params,
+		tabledesc.LocalityConfigRegionalByRow(newLocality.RegionalByRowColumn),
+		mutationIdxAllowedInSameTxn,
+		newColumnName,
+		newColumnID,
+		newColumnDefaultExpr,
+		n.tableDesc.PrimaryIndex.ColumnNames[primaryIndexColIdxStart:],
+		n.tableDesc.PrimaryIndex.ColumnDirections[primaryIndexColIdxStart:],
+	)
+}
+
+// alterTableLocalityFromOrToRegionalByRow processes a change for any ALTER TABLE
+// SET LOCALITY where the before OR after state is REGIONAL BY ROW.
+func (n *alterTableSetLocalityNode) alterTableLocalityFromOrToRegionalByRow(
+	params runParams,
+	newLocalityConfig descpb.TableDescriptor_LocalityConfig,
+	mutationIdxAllowedInSameTxn *int,
+	newColumnName *tree.Name,
+	newColumnID *descpb.ColumnID,
+	newColumnDefaultExpr *string,
+	pkColumnNames []string,
+	pkColumnDirections []descpb.IndexDescriptor_Direction,
+) error {
 	// Preserve the same PK columns - implicit partitioning will be added in
 	// AlterPrimaryKey.
-	cols := make([]tree.IndexElem, len(n.tableDesc.PrimaryIndex.ColumnNames))
-	for i, col := range n.tableDesc.PrimaryIndex.ColumnNames {
+	cols := make([]tree.IndexElem, len(pkColumnNames))
+	for i, col := range pkColumnNames {
 		cols[i] = tree.IndexElem{
 			Column: tree.Name(col),
 		}
-		switch dir := n.tableDesc.PrimaryIndex.ColumnDirections[i]; dir {
+		switch dir := pkColumnDirections[i]; dir {
 		case descpb.IndexDescriptor_ASC:
 			cols[i].Direction = tree.Ascending
 		case descpb.IndexDescriptor_DESC:
@@ -225,8 +415,7 @@ func (n *alterTableSetLocalityNode) alterTableLocalityNonRegionalByRowToRegional
 	// add the implicit partitioning to the PK, with all indexes underneath
 	// being re-written to point to the correct PRIMARY KEY and also being
 	// implicitly partitioned. The AlterPrimaryKey will also set the relevant
-	// zone configurations appropriate stages of the newly re-created indexes
-	// on the table itself.
+	// zone configurations on the newly re-created indexes and table itself.
 	if err := params.p.AlterPrimaryKey(
 		params.ctx,
 		n.tableDesc,
@@ -234,11 +423,15 @@ func (n *alterTableSetLocalityNode) alterTableLocalityNonRegionalByRowToRegional
 			Name:    tree.Name(n.tableDesc.PrimaryIndex.Name),
 			Columns: cols,
 		},
-		&descpb.PrimaryKeySwap_LocalityConfigSwap{
-			OldLocalityConfig: *existingLocality,
-			NewLocalityConfig: tabledesc.LocalityConfigRegionalByRow(
-				newLocality.RegionalByRowColumn,
-			),
+		&alterPrimaryKeyLocalitySwap{
+			localityConfigSwap: descpb.PrimaryKeySwap_LocalityConfigSwap{
+				OldLocalityConfig:                 *n.tableDesc.LocalityConfig,
+				NewLocalityConfig:                 newLocalityConfig,
+				NewRegionalByRowColumnID:          newColumnID,
+				NewRegionalByRowColumnDefaultExpr: newColumnDefaultExpr,
+			},
+			mutationIdxAllowedInSameTxn: mutationIdxAllowedInSameTxn,
+			newColumnName:               newColumnName,
 		},
 	); err != nil {
 		return err
@@ -264,9 +457,8 @@ func (n *alterTableSetLocalityNode) startExec(params runParams) error {
 		case tree.LocalityLevelGlobal:
 			return nil
 		case tree.LocalityLevelRow:
-			if err := n.alterTableLocalityNonRegionalByRowToRegionalByRow(
+			if err := n.alterTableLocalityToRegionalByRow(
 				params,
-				existingLocality,
 				newLocality,
 			); err != nil {
 				return err
@@ -285,9 +477,8 @@ func (n *alterTableSetLocalityNode) startExec(params runParams) error {
 				return err
 			}
 		case tree.LocalityLevelRow:
-			if err := n.alterTableLocalityNonRegionalByRowToRegionalByRow(
+			if err := n.alterTableLocalityToRegionalByRow(
 				params,
-				existingLocality,
 				newLocality,
 			); err != nil {
 				return err
@@ -300,13 +491,37 @@ func (n *alterTableSetLocalityNode) startExec(params runParams) error {
 			return errors.AssertionFailedf("unknown table locality: %v", newLocality)
 		}
 	case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
+		explicitColStart := n.tableDesc.PrimaryIndex.Partitioning.NumImplicitColumns
 		switch newLocality.LocalityLevel {
 		case tree.LocalityLevelGlobal:
-			return unimplemented.NewWithIssue(59632, "implementation pending")
+			return n.alterTableLocalityFromOrToRegionalByRow(
+				params,
+				tabledesc.LocalityConfigGlobal(),
+				nil, /* mutationIdxAllowedInSameTxn */
+				nil, /* newColumnName */
+				nil, /*	newColumnID */
+				nil, /*	newColumnDefaultExpr */
+				n.tableDesc.PrimaryIndex.ColumnNames[explicitColStart:],
+				n.tableDesc.PrimaryIndex.ColumnDirections[explicitColStart:],
+			)
 		case tree.LocalityLevelRow:
-			return unimplemented.New("alter table locality from REGIONAL BY ROW", "implementation pending")
+			if err := n.alterTableLocalityToRegionalByRow(
+				params,
+				newLocality,
+			); err != nil {
+				return err
+			}
 		case tree.LocalityLevelTable:
-			return unimplemented.NewWithIssue(59632, "implementation pending")
+			return n.alterTableLocalityFromOrToRegionalByRow(
+				params,
+				tabledesc.LocalityConfigRegionalByTable(n.n.Locality.TableRegion),
+				nil, /* mutationIdxAllowedInSameTxn */
+				nil, /* newColumnName */
+				nil, /*	newColumnID */
+				nil, /*	newColumnDefaultExpr */
+				n.tableDesc.PrimaryIndex.ColumnNames[explicitColStart:],
+				n.tableDesc.PrimaryIndex.ColumnDirections[explicitColStart:],
+			)
 		default:
 			return errors.AssertionFailedf("unknown table locality: %v", newLocality)
 		}
@@ -350,16 +565,108 @@ func (n *alterTableSetLocalityNode) validateAndWriteNewTableLocalityAndZoneConfi
 	}
 
 	// Update the zone configuration.
-	if err := applyZoneConfigForMultiRegionTable(
+	if err := ApplyZoneConfigForMultiRegionTable(
 		params.ctx,
 		params.p.txn,
 		params.p.ExecCfg(),
 		*dbDesc.RegionConfig,
 		n.tableDesc,
-		applyZoneConfigForMultiRegionTableOptionTableAndIndexes,
+		ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes,
 	); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+// alterTableDescLocalityToRegionalByTable changes the locality of the given tableDesc
+// to Regional By Table homed in the specified region. It also handles the
+// dependency with the multi-region enum, if one exists.
+func (p *planner) alterTableDescLocalityToRegionalByTable(
+	ctx context.Context, region tree.Name, tableDesc *tabledesc.Mutable, regionEnumID descpb.ID,
+) error {
+	if tableDesc.GetMultiRegionEnumDependencyIfExists() {
+		if err := p.removeTypeBackReference(ctx, regionEnumID, tableDesc.GetID(),
+			fmt.Sprintf("remove back ref on mr-enum %d for table %d", regionEnumID, tableDesc.GetID()),
+		); err != nil {
+			return err
+		}
+	}
+	tableDesc.SetTableLocalityRegionalByTable(region)
+	if tableDesc.GetMultiRegionEnumDependencyIfExists() {
+		return p.addTypeBackReference(
+			ctx, regionEnumID, tableDesc.ID,
+			fmt.Sprintf("add back ref on mr-enum %d for table %d", regionEnumID, tableDesc.GetID()),
+		)
+	}
+	return nil
+}
+
+// alterTableDescLocalityToGlobal changes the locality of the given tableDesc to
+// global. It also removes the dependency on the multi-region enum, if it
+// existed before the locality switch.
+func (p *planner) alterTableDescLocalityToGlobal(
+	ctx context.Context, tableDesc *tabledesc.Mutable, regionEnumID descpb.ID,
+) error {
+	if tableDesc.GetMultiRegionEnumDependencyIfExists() {
+		if err := p.removeTypeBackReference(ctx, regionEnumID, tableDesc.GetID(),
+			fmt.Sprintf("remove back ref no mr-enum %d for table %d", regionEnumID, tableDesc.GetID()),
+		); err != nil {
+			return err
+		}
+	}
+	tableDesc.SetTableLocalityGlobal()
+	return nil
+}
+
+// setNewLocalityConfig sets the locality config of the given table descriptor to
+// the provided config. It also removes the dependency on the multi-region enum,
+// if it existed before the locality switch.
+func setNewLocalityConfig(
+	ctx context.Context,
+	desc *tabledesc.Mutable,
+	txn *kv.Txn,
+	b *kv.Batch,
+	config descpb.TableDescriptor_LocalityConfig,
+	kvTrace bool,
+	descsCol *descs.Collection,
+) error {
+	getMultiRegionTypeDesc := func() (*typedesc.Mutable, error) {
+		_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
+			ctx, txn, desc.GetParentID(), tree.DatabaseLookupFlags{Required: true})
+		if err != nil {
+			return nil, err
+		}
+
+		regionEnumID, err := dbDesc.MultiRegionEnumID()
+		if err != nil {
+			return nil, err
+		}
+		return descsCol.GetMutableTypeVersionByID(ctx, txn, regionEnumID)
+	}
+	// If there was a dependency before on the multi-region enum before the
+	// new locality is set, we must unlink the dependency.
+	if desc.GetMultiRegionEnumDependencyIfExists() {
+		typ, err := getMultiRegionTypeDesc()
+		if err != nil {
+			return err
+		}
+		typ.RemoveReferencingDescriptorID(desc.GetID())
+		if err := descsCol.WriteDescToBatch(ctx, kvTrace, typ, b); err != nil {
+			return err
+		}
+	}
+	desc.LocalityConfig = &config
+	// If there is a dependency after the new locality is set, we must add it.
+	if desc.GetMultiRegionEnumDependencyIfExists() {
+		typ, err := getMultiRegionTypeDesc()
+		if err != nil {
+			return err
+		}
+		typ.AddReferencingDescriptorID(desc.GetID())
+		if err := descsCol.WriteDescToBatch(ctx, kvTrace, typ, b); err != nil {
+			return err
+		}
+	}
 	return nil
 }

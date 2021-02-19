@@ -19,6 +19,7 @@ go_library(
         "locking.go",
         "misc_statements.go",
         "mutation_builder.go",
+        "mutation_builder_arbiter.go",
         "mutation_builder_fk.go",
         "mutation_builder_unique.go",
         "opaque.go",
@@ -78,9 +79,11 @@ go_library(
 
 go_test(
     name = "optbuilder_test",
+    size = "small",
     srcs = [
         "builder_test.go",
         "name_resolution_test.go",
+        "union_test.go",
     ],
     data = glob(["testdata/**"]),
     embed = [":optbuilder"],
@@ -95,6 +98,7 @@ go_test(
         "//pkg/sql/parser",
         "//pkg/sql/sem/builtins",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/types",
         "//pkg/testutils/sqlutils",
         "//pkg/util/leaktest",
         "@com_github_cockroachdb_datadriven//:datadriven",

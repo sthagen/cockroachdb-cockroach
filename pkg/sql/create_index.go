@@ -169,10 +169,6 @@ func MakeIndexDescriptor(
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support interleaved tables")
 		}
 
-		if n.PartitionByIndex.ContainsPartitions() {
-			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support partitioning")
-		}
-
 		if n.Sharded != nil {
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support hash sharding")
 		}
@@ -543,7 +539,8 @@ func (p *planner) configureIndexDescForNewIndexPartitioning(
 				return indexDesc, err
 			}
 		}
-
+		allowImplicitPartitioning := p.EvalContext().SessionData.ImplicitColumnPartitioningEnabled ||
+			tableDesc.IsLocalityRegionalByRow()
 		if partitionBy != nil {
 			if indexDesc, err = CreatePartitioning(
 				ctx,
@@ -552,6 +549,8 @@ func (p *planner) configureIndexDescForNewIndexPartitioning(
 				tableDesc,
 				indexDesc,
 				partitionBy,
+				nil, /* allowedNewColumnNames */
+				allowImplicitPartitioning,
 			); err != nil {
 				return indexDesc, err
 			}
@@ -571,16 +570,16 @@ func (p *planner) configureZoneConfigForNewIndexPartitioning(
 	}
 	// For REGIONAL BY ROW tables, correctly configure relevant zone configurations.
 	if tableDesc.IsLocalityRegionalByRow() {
-		dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
+		_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
 			ctx,
 			p.txn,
 			tableDesc.ParentID,
-			tree.DatabaseLookupFlags{},
+			tree.DatabaseLookupFlags{Required: true},
 		)
 		if err != nil {
 			return err
 		}
-		if err := applyZoneConfigForMultiRegionTable(
+		if err := ApplyZoneConfigForMultiRegionTable(
 			ctx,
 			p.txn,
 			p.ExecCfg(),

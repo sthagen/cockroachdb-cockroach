@@ -258,6 +258,8 @@ func (c *CustomFuncs) GenerateLookupJoins(
 		lookupJoin.KeyCols = make(opt.ColList, 0, numIndexKeyCols)
 		rightSideCols := make(opt.ColList, 0, numIndexKeyCols)
 
+		shouldBuildMultiSpanLookupJoin := false
+
 		// All the lookup conditions must apply to the prefix of the index and so
 		// the projected columns created must be created in order.
 		for j := 0; j < numIndexKeyCols; j++ {
@@ -278,13 +280,13 @@ func (c *CustomFuncs) GenerateLookupJoins(
 			}
 
 			if len(foundVals) > 1 && (joinType == opt.LeftJoinOp || joinType == opt.AntiJoinOp) {
-				// We cannot create a lookup join in this case, because constructing a
-				// cross join with foundVals will increase the size of the input. As a
-				// result, non-matching input rows will show up more than once in the
-				// output, which is incorrect (see #59615).
-				// TODO(rytaft,mgartner): find a way to create a lookup join for this
-				// case.
-				return
+				// We cannot use the method constructJoinWithConstants to create a cross
+				// join for left or anti joins, because constructing a cross join with
+				// foundVals will increase the size of the input. As a result,
+				// non-matching input rows will show up more than once in the output,
+				// which is incorrect (see #59615).
+				shouldBuildMultiSpanLookupJoin = true
+				break
 			}
 
 			// We will join these constant values with the input to make
@@ -308,7 +310,36 @@ func (c *CustomFuncs) GenerateLookupJoins(
 			constFilters = append(constFilters, allFilters[allIdx])
 		}
 
-		if len(lookupJoin.KeyCols) == 0 {
+		if shouldBuildMultiSpanLookupJoin {
+			// Some of the index columns were constrained to multiple constant values,
+			// and this is a left or anti join. As described above, we cannot use the
+			// method constructJoinWithConstants to create a cross join as the input
+			// for left or anti joins, since it would produce incorrect results.
+			//
+			// As an alternative, we store all the filters needed for the lookup in
+			// LookupExpr, which will be used to construct spans at execution time.
+			// The result is that each input row will generate multiple spans to
+			// lookup in the index. For example, if the index cols are (region, id)
+			// and the LookupExpr is `region in ('east', 'west') AND id = input.id`,
+			// each input row will generate two spans to be scanned in the lookup:
+			//   [/'east'/<id> - /'east'/<id>] [/'west'/<id> - /'west'/<id>]
+			// where <id> is the value of input.id for the current input row.
+			var eqFilters memo.FiltersExpr
+			extractEqualityFilter := func(leftCol, rightCol opt.ColumnID) memo.FiltersItem {
+				return memo.ExtractJoinEqualityFilter(
+					leftCol, rightCol, inputProps.OutputCols, scanPrivate.Cols, on,
+				)
+			}
+			eqFilters, constFilters, rightSideCols = c.findFiltersForIndexLookup(
+				allFilters, scanPrivate.Table, index, leftEq, rightEq, extractEqualityFilter,
+			)
+			lookupJoin.LookupExpr = append(eqFilters, constFilters...)
+
+			// Reset KeyCols since we're not using it anymore.
+			lookupJoin.KeyCols = opt.ColList{}
+		}
+
+		if len(lookupJoin.KeyCols) == 0 && len(lookupJoin.LookupExpr) == 0 {
 			// We couldn't find equality columns which we can lookup.
 			return
 		}
@@ -318,15 +349,43 @@ func (c *CustomFuncs) GenerateLookupJoins(
 		// is sufficient.
 		lookupJoin.LookupColsAreTableKey = tableFDs.ColsAreLaxKey(rightSideCols.ToSet())
 
-		// Remove the redundant filters and update the lookup condition.
-		lookupJoin.On = memo.ExtractRemainingJoinFilters(onFilters, lookupJoin.KeyCols, rightSideCols)
-		lookupJoin.On.RemoveCommonFilters(constFilters)
+		// Remove redundant filters from the ON condition if columns were
+		// constrained by equality filters or constant filters.
+		lookupJoin.On = onFilters
+		if len(lookupJoin.KeyCols) > 0 {
+			lookupJoin.On = memo.ExtractRemainingJoinFilters(lookupJoin.On, lookupJoin.KeyCols, rightSideCols)
+		}
+		lookupJoin.On = lookupJoin.On.Difference(lookupJoin.LookupExpr)
+		lookupJoin.On = lookupJoin.On.Difference(constFilters)
 		lookupJoin.ConstFilters = constFilters
+
+		// Add input columns and lookup expression columns, since these will be
+		// needed for all join types and cases.
+		lookupJoin.Cols = lookupJoin.LookupExpr.OuterCols()
+		lookupJoin.Cols.UnionWith(inputProps.OutputCols)
 
 		if isCovering {
 			// Case 1 (see function comment).
-			lookupJoin.Cols = scanPrivate.Cols.Union(inputProps.OutputCols)
-			c.e.mem.AddLookupJoinToGroup(&lookupJoin, grp)
+			lookupJoin.Cols.UnionWith(scanPrivate.Cols)
+
+			// If some optional filters were used to build the lookup expression, we may
+			// need to wrap the final expression with a project. We only need to do this
+			// for left joins, since anti joins have an implicit projection that removes
+			// all right-side columns.
+			needsProject := joinType == opt.LeftJoinOp &&
+				!lookupJoin.Cols.SubsetOf(grp.Relational().OutputCols)
+			if !needsProject {
+				c.e.mem.AddLookupJoinToGroup(&lookupJoin, grp)
+				return
+			}
+			var project memo.ProjectExpr
+			project.Input = c.e.f.ConstructLookupJoin(
+				lookupJoin.Input,
+				lookupJoin.On,
+				&lookupJoin.LookupJoinPrivate,
+			)
+			project.Passthrough = grp.Relational().OutputCols
+			c.e.mem.AddProjectToGroup(&project, grp)
 			return
 		}
 
@@ -360,7 +419,7 @@ func (c *CustomFuncs) GenerateLookupJoins(
 			// 2, see function comment).
 			filterColsFromRight := scanPrivate.Cols.Intersection(onFilters.OuterCols())
 			if filterColsFromRight.SubsetOf(indexCols) {
-				lookupJoin.Cols = filterColsFromRight.Union(inputProps.OutputCols)
+				lookupJoin.Cols.UnionWith(filterColsFromRight)
 				c.e.mem.AddLookupJoinToGroup(&lookupJoin, grp)
 				return
 			}
@@ -389,11 +448,10 @@ func (c *CustomFuncs) GenerateLookupJoins(
 
 		// The lower LookupJoin must return all PK columns (they are needed as key
 		// columns for the index join).
-		lookupJoin.Cols = scanPrivate.Cols.Intersection(indexCols)
+		lookupJoin.Cols.UnionWith(scanPrivate.Cols.Intersection(indexCols))
 		for i := range pkCols {
 			lookupJoin.Cols.Add(pkCols[i])
 		}
-		lookupJoin.Cols.UnionWith(inputProps.OutputCols)
 
 		var indexJoin memo.LookupJoinExpr
 
@@ -447,6 +505,104 @@ func (c *CustomFuncs) GenerateLookupJoins(
 	})
 }
 
+// findFiltersForIndexLookup finds the equality and constant filters in
+// filters that can be used to constrain the given index.
+func (c *CustomFuncs) findFiltersForIndexLookup(
+	filters memo.FiltersExpr,
+	tabID opt.TableID,
+	index cat.Index,
+	leftEq, rightEq opt.ColList,
+	extractEqualityFilter func(opt.ColumnID, opt.ColumnID) memo.FiltersItem,
+) (eqFilters, constFilters memo.FiltersExpr, rightSideCols opt.ColList) {
+	numIndexKeyCols := index.LaxKeyColumnCount()
+
+	eqFilters = make(memo.FiltersExpr, 0, len(filters))
+	rightSideCols = make(opt.ColList, 0, len(filters))
+
+	// All the lookup conditions must apply to the prefix of the index.
+	for j := 0; j < numIndexKeyCols; j++ {
+		idxCol := tabID.IndexColumnID(index, j)
+		if eqIdx, ok := rightEq.Find(idxCol); ok {
+			eqFilter := extractEqualityFilter(leftEq[eqIdx], rightEq[eqIdx])
+			eqFilters = append(eqFilters, eqFilter)
+			rightSideCols = append(rightSideCols, idxCol)
+			continue
+		}
+
+		// Try to find a filter that constrains this column to non-NULL
+		// constant values. We cannot use a NULL value because the lookup
+		// join implements logic equivalent to simple equality between
+		// columns (where NULL never equals anything).
+		values, allIdx, ok := c.findJoinFilterConstants(filters, idxCol)
+		if !ok {
+			break
+		}
+
+		if constFilters == nil {
+			constFilters = make(memo.FiltersExpr, 0, numIndexKeyCols-j)
+		}
+
+		// Ensure that the constant filter is either an equality or an IN expression.
+		// These are the only two types of expressions currently supported by the
+		// lookupJoiner for building lookup spans.
+		constFilter := filters[allIdx]
+		if !c.isCanonicalConstFilter(constFilter) {
+			constFilter = c.makeConstFilter(idxCol, values)
+		}
+		constFilters = append(constFilters, constFilter)
+	}
+
+	if len(eqFilters) == 0 {
+		// We couldn't find equality columns which we can lookup.
+		return nil, nil, nil
+	}
+
+	return eqFilters, constFilters, rightSideCols
+}
+
+// isCanonicalConstFilter checks that the given filter is a constant filter in
+// one of two possible canonical formats:
+//  1. It is an equality between a variable and a constant.
+//  2. It is an IN expression between a variable and a tuple of constants.
+// Returns true if the filter matches one of these two formats. Otherwise
+// returns false.
+func (c *CustomFuncs) isCanonicalConstFilter(filter memo.FiltersItem) bool {
+	switch t := filter.Condition.(type) {
+	case *memo.EqExpr:
+		if t.Left.Op() == opt.VariableOp && opt.IsConstValueOp(t.Right) {
+			return true
+		}
+	case *memo.InExpr:
+		if t.Left.Op() == opt.VariableOp && memo.CanExtractConstTuple(t.Right) {
+			return true
+		}
+	}
+	return false
+}
+
+// makeConstFilter builds a filter that constrains the given column to the given
+// set of constant values. This is performed by either constructing an equality
+// expression or an IN expression.
+func (c *CustomFuncs) makeConstFilter(col opt.ColumnID, values tree.Datums) memo.FiltersItem {
+	if len(values) == 1 {
+		return c.e.f.ConstructFiltersItem(c.e.f.ConstructEq(
+			c.e.f.ConstructVariable(col),
+			c.e.f.ConstructConstVal(values[0], values[0].ResolvedType()),
+		))
+	}
+	elems := make(memo.ScalarListExpr, len(values))
+	elemTypes := make([]*types.T, len(values))
+	for i := range values {
+		typ := values[i].ResolvedType()
+		elems[i] = c.e.f.ConstructConstVal(values[i], typ)
+		elemTypes[i] = typ
+	}
+	return c.e.f.ConstructFiltersItem(c.e.f.ConstructIn(
+		c.e.f.ConstructVariable(col),
+		c.e.f.ConstructTuple(elems, types.MakeTuple(elemTypes)),
+	))
+}
+
 // constructContinuationColumnForPairedJoin constructs a continuation column
 // ID for the paired-joiners used for left outer/semi/anti joins when the
 // first join generates false positives (due to an inverted index or
@@ -480,7 +636,6 @@ func (c *CustomFuncs) GenerateInvertedJoins(
 	eqColsAndOptionalFiltersCalculated := false
 	var leftEqCols opt.ColList
 	var rightEqCols opt.ColList
-	var rightSideCols opt.ColList
 	var optionalFilters memo.FiltersExpr
 
 	var iter scanIndexIter
@@ -523,6 +678,7 @@ func (c *CustomFuncs) GenerateInvertedJoins(
 		// values are joined with the input to create key columns for the
 		// InvertedJoin, similar to GenerateLookupJoins.
 		var constFilters memo.FiltersExpr
+		var rightSideCols opt.ColList
 		for i := 0; i < numPrefixCols; i++ {
 			prefixCol := scanPrivate.Table.IndexColumnID(index, i)
 
@@ -569,15 +725,14 @@ func (c *CustomFuncs) GenerateInvertedJoins(
 			invertedJoin.Input = join
 			invertedJoin.PrefixKeyCols = append(invertedJoin.PrefixKeyCols, constColID)
 			constFilters = append(constFilters, allFilters[allIdx])
+			rightSideCols = append(rightSideCols, prefixCol)
 		}
 
-		// Remove the redundant filters and update the ON condition if there are
-		// non-inverted prefix columns that have been constrained.
-		if len(rightSideCols) > 0 || len(constFilters) > 0 {
-			onFilters = memo.ExtractRemainingJoinFilters(onFilters, invertedJoin.PrefixKeyCols, rightSideCols)
-			onFilters.RemoveCommonFilters(constFilters)
-			invertedJoin.ConstFilters = constFilters
-		}
+		// Remove redundant filters from the ON condition if non-inverted prefix
+		// columns were constrained by equality filters or constant filters.
+		onFilters = memo.ExtractRemainingJoinFilters(onFilters, invertedJoin.PrefixKeyCols, rightSideCols)
+		onFilters = onFilters.Difference(constFilters)
+		invertedJoin.ConstFilters = constFilters
 
 		// Check whether the filter can constrain the inverted column.
 		invertedExpr := invertedidx.TryJoinInvertedIndex(
@@ -891,4 +1046,78 @@ func (c *CustomFuncs) ConvertIndexToLookupJoinPrivate(
 		ConstFilters:          nil,
 		JoinPrivate:           memo.JoinPrivate{},
 	}
+}
+
+// HasVolatileProjection returns true if any of the projection items of the
+// ProjectionsExpr contains a volatile expression.
+func (c *CustomFuncs) HasVolatileProjection(projections memo.ProjectionsExpr) bool {
+	for i := range projections {
+		if projections[i].ScalarProps().VolatilitySet.HasVolatile() {
+			return true
+		}
+	}
+	return false
+}
+
+// FindLeftJoinCanaryColumn tries to find a "canary" column from the right input
+// of a left join. This is a column that is NULL in the join output iff the row
+// is an "outer left" row that had no match in the join.
+//
+// Returns 0 if we couldn't find such a column.
+func (c *CustomFuncs) FindLeftJoinCanaryColumn(
+	right memo.RelExpr, on memo.FiltersExpr,
+) opt.ColumnID {
+	canaryCol, ok := right.Relational().NotNullCols.Next(0)
+	if ok {
+		// The right expression has a non-null column; we can use it as a canary
+		// column.
+		return canaryCol
+	}
+
+	// Find any column from the right which is null-rejected by the ON condition.
+	// right rows where such a column is NULL will never contribute to the join
+	// result.
+	nullRejectedCols := memo.NullColsRejectedByFilter(c.e.evalCtx, on)
+	nullRejectedCols.IntersectionWith(right.Relational().OutputCols)
+
+	canaryCol, ok = nullRejectedCols.Next(0)
+	if ok {
+		return canaryCol
+	}
+
+	return 0
+}
+
+// FoundCanaryColumn returns true if the given column returned by
+// FindLeftJoinCanaryColum indicates that we found a canary column.
+func (c *CustomFuncs) FoundCanaryColumn(canaryCol opt.ColumnID) bool {
+	return canaryCol != 0
+}
+
+// MakeProjectionsForOuterJoin takes a set of projections and wraps them in a
+// conditional which overrides them to NULL whenever the canary column is NULL.
+// TODO(radu): detect projections that evaluate to NULL on NULL inputs anyway,
+// and leave those alone.
+func (c *CustomFuncs) MakeProjectionsForOuterJoin(
+	canaryCol opt.ColumnID, proj memo.ProjectionsExpr,
+) memo.ProjectionsExpr {
+	result := make(memo.ProjectionsExpr, len(proj))
+
+	for i := range proj {
+		// Construct "IF(canaryCol IS NULL, NULL, <projection>)".
+		ifExpr := c.e.f.ConstructCase(
+			c.e.f.ConstructIs(
+				c.e.f.ConstructVariable(
+					canaryCol,
+				),
+				memo.NullSingleton,
+			),
+			memo.ScalarListExpr{
+				c.e.f.ConstructWhen(memo.TrueSingleton, c.e.f.ConstructNull(proj[i].Typ)),
+			},
+			proj[i].Element,
+		)
+		result[i] = c.e.f.ConstructProjectionsItem(ifExpr, proj[i].Col)
+	}
+	return result
 }

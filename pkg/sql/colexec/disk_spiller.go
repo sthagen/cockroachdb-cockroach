@@ -176,7 +176,7 @@ type diskSpillerBase struct {
 	spillingCallbackFn     func()
 }
 
-var _ ResettableOperator = &diskSpillerBase{}
+var _ colexecbase.ResettableOperator = &diskSpillerBase{}
 
 func (d *diskSpillerBase) Init() {
 	if d.inMemoryOpInitStatus == OperatorInitialized {
@@ -207,8 +207,13 @@ func (d *diskSpillerBase) Next(ctx context.Context) coldata.Batch {
 			if d.spillingCallbackFn != nil {
 				d.spillingCallbackFn()
 			}
-			d.diskBackedOp.Init()
-			d.distBackedOpInitStatus = OperatorInitialized
+			if d.distBackedOpInitStatus == OperatorNotInitialized {
+				// The disk spiller might be reset for reuse in which case the
+				// the disk-backed operator has already been initialized and we
+				// don't want to perform the initialization again.
+				d.diskBackedOp.Init()
+				d.distBackedOpInitStatus = OperatorInitialized
+			}
 			return d.diskBackedOp.Next(ctx)
 		}
 		// Either not an out of memory error or an OOM error coming from a
@@ -218,20 +223,20 @@ func (d *diskSpillerBase) Next(ctx context.Context) coldata.Batch {
 	return batch
 }
 
-func (d *diskSpillerBase) reset(ctx context.Context) {
+func (d *diskSpillerBase) Reset(ctx context.Context) {
 	for _, input := range d.inputs {
-		if r, ok := input.(resetter); ok {
-			r.reset(ctx)
+		if r, ok := input.(colexecbase.Resetter); ok {
+			r.Reset(ctx)
 		}
 	}
 	if d.inMemoryOpInitStatus == OperatorInitialized {
-		if r, ok := d.inMemoryOp.(resetter); ok {
-			r.reset(ctx)
+		if r, ok := d.inMemoryOp.(colexecbase.Resetter); ok {
+			r.Reset(ctx)
 		}
 	}
 	if d.distBackedOpInitStatus == OperatorInitialized {
-		if r, ok := d.diskBackedOp.(resetter); ok {
-			r.reset(ctx)
+		if r, ok := d.diskBackedOp.(colexecbase.Resetter); ok {
+			r.Reset(ctx)
 		}
 	}
 	d.spilled = false
@@ -302,7 +307,7 @@ type bufferExportingOperator struct {
 	firstSourceDone bool
 }
 
-var _ ResettableOperator = &bufferExportingOperator{}
+var _ colexecbase.ResettableOperator = &bufferExportingOperator{}
 
 func newBufferExportingOperator(
 	firstSource colexecbase.BufferingInMemoryOperator, secondSource colexecbase.Operator,
@@ -330,12 +335,12 @@ func (b *bufferExportingOperator) Next(ctx context.Context) coldata.Batch {
 	return batch
 }
 
-func (b *bufferExportingOperator) reset(ctx context.Context) {
-	if r, ok := b.firstSource.(resetter); ok {
-		r.reset(ctx)
+func (b *bufferExportingOperator) Reset(ctx context.Context) {
+	if r, ok := b.firstSource.(colexecbase.Resetter); ok {
+		r.Reset(ctx)
 	}
-	if r, ok := b.secondSource.(resetter); ok {
-		r.reset(ctx)
+	if r, ok := b.secondSource.(colexecbase.Resetter); ok {
+		r.Reset(ctx)
 	}
 	b.firstSourceDone = false
 }

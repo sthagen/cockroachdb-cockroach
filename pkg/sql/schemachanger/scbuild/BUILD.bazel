@@ -7,6 +7,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/clusterversion",
+        "//pkg/settings/cluster",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/resolver",
@@ -28,6 +29,7 @@ go_library(
 
 go_test(
     name = "scbuild_test",
+    size = "small",
     srcs = [
         "builder_test.go",
         "main_test.go",

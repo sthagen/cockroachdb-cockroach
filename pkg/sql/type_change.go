@@ -95,10 +95,10 @@ func (p *planner) writeTypeSchemaChange(
 			TypeID:               typeDesc.ID,
 			TransitioningMembers: transitioningMembers,
 		}
-		if err := job.WithTxn(p.txn).SetDetails(ctx, newDetails); err != nil {
+		if err := job.SetDetails(ctx, p.txn, newDetails); err != nil {
 			return err
 		}
-		if err := job.WithTxn(p.txn).SetDescription(ctx,
+		if err := job.SetDescription(ctx, p.txn,
 			func(ctx context.Context, description string) (string, error) {
 				return description + "; " + jobDesc, nil
 			},
@@ -162,6 +162,9 @@ type TypeSchemaChangerTestingKnobs struct {
 	// RunBeforeEnumMemberPromotion runs before enum members are promoted from
 	// readable to all permissions in the typeSchemaChanger.
 	RunBeforeEnumMemberPromotion func()
+	// RunAfterOnFailOrCancel runs after OnFailOrCancel completes, if
+	// OnFailOrCancel is triggered.
+	RunAfterOnFailOrCancel func() error
 }
 
 // ModuleTestingKnobs implements the ModuleTestingKnobs interface.
@@ -209,6 +212,14 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 		}
 	}
 
+	// Make sure all of the leases have dropped before attempting to validate.
+	if err := WaitToUpdateLeases(ctx, leaseMgr, t.typeID); err != nil {
+		if errors.Is(err, catalog.ErrDescriptorNotFound) {
+			return nil
+		}
+		return err
+	}
+
 	// For all the read only members the current job is responsible for, either
 	// promote them to writeable or remove them from the descriptor entirely,
 	// as dictated by the direction.
@@ -219,7 +230,7 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 			fn()
 		}
 
-		// First, we check if any of the enum labels that are being removed are in
+		// First, we check if any of the enum values that are being removed are in
 		// use and fail. This is done in a separate txn to the one that mutates the
 		// descriptor, as this validation can take arbitrarily long.
 		validateDrops := func(ctx context.Context, txn *kv.Txn, descsCol *descs.Collection) error {
@@ -229,7 +240,7 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 			}
 			for _, member := range typeDesc.EnumMembers {
 				if t.isTransitioningInCurrentJob(&member) && enumMemberIsRemoving(&member) {
-					if err := t.canRemoveEnumLabel(ctx, typeDesc, txn, &member, descsCol); err != nil {
+					if err := t.canRemoveEnumValue(ctx, typeDesc, txn, &member, descsCol); err != nil {
 						return err
 					}
 				}
@@ -243,7 +254,7 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 			return err
 		}
 
-		// Now that we've ascertained that the enum label can be removed, we can
+		// Now that we've ascertained that the enum values can be removed, we can
 		// actually go about modifying the type descriptor.
 
 		// The version of the array type needs to get bumped as well so that
@@ -262,17 +273,9 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 				}
 			}
 			// Next, deal with all the members that need to be removed from the slice.
-			idx := 0
-			for _, member := range typeDesc.EnumMembers {
-				if t.isTransitioningInCurrentJob(&member) && enumMemberIsRemoving(&member) {
-					// Truncation logic below will remove all members that need to be
-					// removed.
-					continue
-				}
-				typeDesc.EnumMembers[idx] = member
-				idx++
-			}
-			typeDesc.EnumMembers = typeDesc.EnumMembers[:idx]
+			applyFilterOnEnumMembers(typeDesc, func(member *descpb.TypeDescriptor_EnumMember) bool {
+				return t.isTransitioningInCurrentJob(member) && enumMemberIsRemoving(member)
+			})
 
 			b := txn.NewBatch()
 			if err := descsCol.WriteDescToBatch(
@@ -324,24 +327,99 @@ func (t *typeSchemaChanger) isTransitioningInCurrentJob(
 	return false
 }
 
-// cleanupEnumLabels performs cleanup if any of the enum label transitions
+// applyFilterOnEnumMembers modifies the supplied typeDesc by removing all enum
+// members as dictated by shouldRemove.
+func applyFilterOnEnumMembers(
+	typeDesc *typedesc.Mutable, shouldRemove func(member *descpb.TypeDescriptor_EnumMember) bool,
+) {
+	idx := 0
+	for _, member := range typeDesc.EnumMembers {
+		if shouldRemove(&member) {
+			// By not updating the index, the truncation logic below will remove
+			// this label from the list of members.
+			continue
+		}
+		typeDesc.EnumMembers[idx] = member
+		idx++
+	}
+	typeDesc.EnumMembers = typeDesc.EnumMembers[:idx]
+}
+
+// cleanupEnumValues performs cleanup if any of the enum value transitions
 // fails. In particular:
-// 1. If an enum label was being added as part of this txn, we remove it
+// 1. If an enum value was being added as part of this txn, we remove it
 // from the descriptor.
-// 2. If an enum label was being removed as part of this txn, we promote
+// 2. If an enum value was being removed as part of this txn, we promote
 // it back to writable.
-func (t *typeSchemaChanger) cleanupEnumLabels(ctx context.Context) error {
+func (t *typeSchemaChanger) cleanupEnumValues(ctx context.Context) error {
 	// Cleanup:
 	cleanup := func(ctx context.Context, txn *kv.Txn, descsCol *descs.Collection) error {
 		typeDesc, err := descsCol.GetMutableTypeVersionByID(ctx, txn, t.typeID)
 		if err != nil {
 			return err
 		}
+		b := txn.NewBatch()
 		// No cleanup required.
 		if !enumHasNonPublic(&typeDesc.Immutable) {
 			return nil
 		}
-		// First, deal with all members that we initially hoped to remove but
+
+		// First, we deal with cleanup specific to the multi-region enum.
+		// TODO(arul): This can go away once we stop copying regions on the dataabse
+		// descriptor.
+		if typeDesc.Kind == descpb.TypeDescriptor_MULTIREGION_ENUM {
+			for _, member := range typeDesc.EnumMembers {
+				if t.isTransitioningInCurrentJob(&member) {
+					_, dbDesc, err := descsCol.GetMutableDatabaseByID(
+						ctx, txn, typeDesc.ParentID, tree.DatabaseLookupFlags{Required: true})
+					if err != nil {
+						return err
+					}
+
+					// If the enum member was being removed, we need to add it back to the
+					// database region config.
+					if enumMemberIsRemoving(&member) {
+						err = addRegionToRegionConfig(dbDesc, descpb.RegionName(member.LogicalRepresentation))
+						if err != nil {
+							return err
+						}
+						if err := descsCol.WriteDescToBatch(ctx, true /* kvTrace */, dbDesc, b); err != nil {
+							return err
+						}
+					}
+
+					// If the enum member was being added, we must remove it from the
+					// database region config.
+					if enumMemberIsAdding(&member) {
+						idx := 0
+						found := false
+						for i, region := range dbDesc.RegionConfig.Regions {
+							if region.Name == descpb.RegionName(member.LogicalRepresentation) {
+								idx = i
+								found = true
+								break
+							}
+						}
+
+						if !found {
+							// This shouldn't happen and is simply a sanity check to ensure the
+							// database descriptor regions and multi-region enum regions are
+							// in sync.
+							return errors.AssertionFailedf(
+								"expected to find region on database %d during cleanup", dbDesc.GetID(),
+							)
+						}
+						dbDesc.RegionConfig.Regions = append(dbDesc.RegionConfig.Regions[:idx],
+							dbDesc.RegionConfig.Regions[idx+1:]...)
+						if err := descsCol.WriteDescToBatch(ctx, true /* kvTrace */, dbDesc, b); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+
+		// Next, deal with all members that we initially hoped to remove but
 		// now need to be promoted back to writable.
 		for i := range typeDesc.EnumMembers {
 			member := &typeDesc.EnumMembers[i]
@@ -352,19 +430,10 @@ func (t *typeSchemaChanger) cleanupEnumLabels(ctx context.Context) error {
 		}
 		// Now deal with all members that we initially hoped to add but now need
 		// to be removed from the descriptor.
-		idx := 0
-		for _, member := range typeDesc.EnumMembers {
-			if t.isTransitioningInCurrentJob(&member) && enumMemberIsAdding(&member) {
-				// By not updating the index, the truncation logic below will remove
-				// this label from the list of members.
-				continue
-			}
-			typeDesc.EnumMembers[idx] = member
-			idx++
-		}
-		typeDesc.EnumMembers = typeDesc.EnumMembers[:idx]
+		applyFilterOnEnumMembers(typeDesc, func(member *descpb.TypeDescriptor_EnumMember) bool {
+			return t.isTransitioningInCurrentJob(member) && enumMemberIsAdding(member)
+		})
 
-		b := txn.NewBatch()
 		if err := descsCol.WriteDescToBatch(
 			ctx, true /* kvTrace */, typeDesc, b,
 		); err != nil {
@@ -387,9 +456,9 @@ func (t *typeSchemaChanger) cleanupEnumLabels(ctx context.Context) error {
 	return nil
 }
 
-// canRemoveEnumLabel returns an error if the enum label is in use and therefore
+// canRemoveEnumValue returns an error if the enum value is in use and therefore
 // can't be removed.
-func (t *typeSchemaChanger) canRemoveEnumLabel(
+func (t *typeSchemaChanger) canRemoveEnumValue(
 	ctx context.Context,
 	typeDesc *typedesc.Mutable,
 	txn *kv.Txn,
@@ -420,6 +489,7 @@ func (t *typeSchemaChanger) canRemoveEnumLabel(
 		columns := tree.AsStringWithFlags(&colSelectors, tree.FmtSerializable)
 		query.WriteString(fmt.Sprintf("SELECT %s FROM [%d as t] WHERE", columns, ID))
 		firstClause := true
+		validationQueryConstructed := false
 		for _, col := range desc.PublicColumns() {
 			if typeDesc.ID == typedesc.GetTypeDescID(col.GetType()) {
 				if !firstClause {
@@ -428,36 +498,56 @@ func (t *typeSchemaChanger) canRemoveEnumLabel(
 				query.WriteString(fmt.Sprintf(" t.%s = %s", col.GetName(),
 					convertToSQLStringRepresentation(member.PhysicalRepresentation)))
 				firstClause = false
+				validationQueryConstructed = true
 			}
 		}
 		query.WriteString(" LIMIT 1")
 
-		// We need to override the internal executors current database (which would
-		// be unset by default) when executing the query constructed above. This is
-		// because the enum label may be used in a view expression, which is
-		// name resolved in the context of the type's database.
-		dbDesc, err := descsCol.GetImmutableDatabaseByID(
-			ctx, txn, typeDesc.ParentID, tree.DatabaseLookupFlags{})
-		if err != nil {
-			return errors.Wrapf(err,
-				"could not validate enum value removal for %q", member.LogicalRepresentation)
+		// NB: A type descriptor reference does not imply at-least one column in the
+		// table is of the type whose value is being removed. The notable exception
+		// being REGIONAL BY TABLE multi-region tables. In this case, no valid query
+		// is constructed and there's nothing to execute. Instead, their validation
+		// is handled as a special case below.
+		if validationQueryConstructed {
+			// We need to override the internal executor's current database (which would
+			// be unset by default) when executing the query constructed above. This is
+			// because the enum value may be used in a view expression, which is
+			// name resolved in the context of the type's database.
+			_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
+				ctx, txn, typeDesc.ParentID, tree.DatabaseLookupFlags{Required: true})
+			const validationErr = "could not validate removal of enum value %q"
+			if err != nil {
+				return errors.Wrapf(err, validationErr, member.LogicalRepresentation)
+			}
+			override := sessiondata.InternalExecutorOverride{
+				User:     security.RootUserName(),
+				Database: dbDesc.Name,
+			}
+			rows, err := t.execCfg.InternalExecutor.QueryRowEx(ctx, "count-value-usage", txn, override, query.String())
+			if err != nil {
+				return errors.Wrapf(err, validationErr, member.LogicalRepresentation)
+			}
+			// Check if the above query returned a result. If it did, then the
+			// enum value is being used by some place.
+			if len(rows) > 0 {
+				return pgerror.Newf(pgcode.DependentObjectsStillExist,
+					"could not remove enum value %q as it is being used by %q in row: %s",
+					member.LogicalRepresentation, desc.GetName(), labeledRowValues(desc.PublicColumns(), rows))
+			}
 		}
-		override := sessiondata.InternalExecutorOverride{
-			User:     security.RootUserName(),
-			Database: dbDesc.Name,
-		}
-		rows, err := t.execCfg.InternalExecutor.QueryRowEx(
-			ctx, "count-value-usage", txn, override, query.String())
-		if err != nil {
-			return errors.Wrapf(err,
-				"could not validate enum value removal for %q", member.LogicalRepresentation)
-		}
-		// Check if the above query returned a result. If it did, then the
-		// enum value is being used by some place.
-		if len(rows) > 0 {
-			return pgerror.Newf(pgcode.DependentObjectsStillExist,
-				"could not remove enum value %q as it is being used by %q in row: %s",
-				member.LogicalRepresentation, desc.GetName(), labeledRowValues(desc.PublicColumns(), rows))
+
+		// If the type descriptor is a multi-region enum and the table descriptor
+		// belongs to a regional (by table) table, we disallow dropping the region
+		// if it is being used as the homed region for that table.
+		if typeDesc.Kind == descpb.TypeDescriptor_MULTIREGION_ENUM && desc.IsLocalityRegionalByTable() {
+			homedRegion, err := desc.GetRegionalByTableRegion()
+			if err != nil {
+				return err
+			}
+			if descpb.RegionName(member.LogicalRepresentation) == homedRegion {
+				return errors.Newf("could not remove enum value %q as it is the home region for table %q",
+					member.LogicalRepresentation, desc.GetName())
+			}
 		}
 	}
 	// We have ascertained that the value is not in use, and can therefore be
@@ -562,14 +652,41 @@ func (t *typeChangeResumer) OnFailOrCancel(ctx context.Context, execCtx interfac
 		execCfg:              execCtx.(JobExecContext).ExecCfg(),
 	}
 
-	if err := tc.cleanupEnumLabels(ctx); err != nil {
-		return err
+	if rollbackErr := func() error {
+		if err := tc.cleanupEnumValues(ctx); err != nil {
+			return err
+		}
+
+		if err := drainNamesForDescriptor(
+			ctx, tc.execCfg.Settings, tc.typeID, tc.execCfg.DB,
+			tc.execCfg.InternalExecutor, tc.execCfg.LeaseManager, tc.execCfg.Codec, nil,
+		); err != nil {
+			return err
+		}
+
+		if fn := tc.execCfg.TypeSchemaChangerTestingKnobs.RunAfterOnFailOrCancel; fn != nil {
+			return fn()
+		}
+
+		return nil
+	}(); rollbackErr != nil {
+		switch {
+		case errors.Is(rollbackErr, catalog.ErrDescriptorNotFound):
+			// If the descriptor for the ID can't be found, we assume that another
+			// job executed already and dropped the type.
+			log.Infof(
+				ctx,
+				"descriptor %d not found for type change job; assuming it was dropped, and exiting",
+				tc.typeID,
+			)
+		case !isPermanentSchemaChangeError(rollbackErr):
+			return jobs.NewRetryJobError(rollbackErr.Error())
+		default:
+			return rollbackErr
+		}
 	}
 
-	return drainNamesForDescriptor(
-		ctx, tc.execCfg.Settings, tc.typeID, tc.execCfg.DB,
-		tc.execCfg.InternalExecutor, tc.execCfg.LeaseManager, tc.execCfg.Codec, nil,
-	)
+	return nil
 }
 
 func init() {

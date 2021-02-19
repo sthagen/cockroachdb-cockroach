@@ -42,7 +42,7 @@ type flowStreamClient interface {
 // be called with the necessary information to establish a connection to a
 // given remote endpoint.
 type Outbox struct {
-	colexec.OneInputNode
+	colexecbase.OneInputNode
 
 	typs []*types.T
 
@@ -84,7 +84,7 @@ func NewOutbox(
 	o := &Outbox{
 		// Add a deselector as selection vectors are not serialized (nor should they
 		// be).
-		OneInputNode:    colexec.NewOneInputNode(colexec.NewDeselectorOp(allocator, input, typs)),
+		OneInputNode:    colexecbase.NewOneInputNode(colexec.NewDeselectorOp(allocator, input, typs)),
 		typs:            typs,
 		converter:       c,
 		serializer:      s,
@@ -224,17 +224,20 @@ func (o *Outbox) sendBatches(
 	ctx context.Context, stream flowStreamClient, cancelFn context.CancelFunc,
 ) (terminatedGracefully bool, errToSend error) {
 	if o.runnerCtx == nil {
+		// In the non-testing path, runnerCtx has been set in Run() method;
+		// however, the tests might use runWithStream() directly in which case
+		// runnerCtx will remain unset, so we have this check.
 		o.runnerCtx = ctx
 	}
 	errToSend = colexecerror.CatchVectorizedRuntimeError(func() {
-		o.Input().Init()
+		o.Input.Init()
 		for {
 			if atomic.LoadUint32(&o.draining) == 1 {
 				terminatedGracefully = true
 				return
 			}
 
-			batch := o.Input().Next(o.runnerCtx)
+			batch := o.Input.Next(o.runnerCtx)
 			n := batch.Length()
 			if n == 0 {
 				terminatedGracefully = true

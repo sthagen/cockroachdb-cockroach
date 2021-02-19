@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/kr/pretty"
-	opentracing "github.com/opentracing/opentracing-go"
 	"golang.org/x/time/rate"
 )
 
@@ -293,24 +292,41 @@ A file preventing this node from restarting was placed at:
 	}
 }
 
+// leaseJumpOption controls what assertions leasePostApplyLocked can make.
+type leaseJumpOption bool
+
+const (
+	// assertNoLeaseJump means that the new lease must follow the old lease, with
+	// no gaps in the sequence number.
+	assertNoLeaseJump leaseJumpOption = false
+	// allowLeaseJump meanms that sequence number gaps must be tolerated. This is
+	// used when we've found out about the new lease through a snapshot and we
+	// don't know what other previous leases we haven't applied.
+	allowLeaseJump = true
+)
+
 // leasePostApplyLocked updates the Replica's internal state to reflect the
 // application of a new Range lease. The method is idempotent, so it can be
 // called repeatedly for the same lease safely. However, the method will panic
-// if passed a lease with a lower sequence number than the current lease. By
-// default, the method will also panic if passed a lease that indicates a
-// forward sequence number jump (i.e. a skipped lease). This behavior can
-// be disabled by passing permitJump as true.
+// if newLease has a lower sequence number than the current lease. Depending on
+// jumpOpt, we'll also panic if newLease indicates a forward sequence number
+// jump compared to prevLease (i.e. a skipped lease).
+//
+// prevLease represents the most recent lease this replica was aware of before
+// newLease came along. This is usually (but not necessarily) the latest lease
+// ever applied to the range. However, there's also the case when the replica
+// found out about newLease through a snapshot; in this case the replica might
+// not be aware of other lease changes that happened before the snapshot was
+// generated. This method thus tolerates prevLease being "stale" when
+// allowLeaseJump is passed. prevLease can also be the same as newLease; see below.
+//
+// newLease represents the lease being applied. Can be the same as prevLease.
+// This allows leasePostApplyLocked to be called for some of its side-effects
+// even if the lease in question has otherwise already been applied to the
+// range.
 func (r *Replica) leasePostApplyLocked(
-	ctx context.Context, newLease roachpb.Lease, permitJump bool,
+	ctx context.Context, prevLease *roachpb.Lease, newLease *roachpb.Lease, jumpOpt leaseJumpOption,
 ) {
-	// Pull out the last lease known to this Replica. It's possible that this is
-	// not actually the last lease in the Range's lease sequence because the
-	// Replica may have missed the application of a lease between prevLease and
-	// newLease. However, this should only be possible if a snapshot includes a
-	// lease update. All other forms of lease updates should be continuous
-	// without jumps (see permitJump).
-	prevLease := *r.mu.state.Lease
-
 	// Sanity check to make sure that the lease sequence is moving in the right
 	// direction.
 	if s1, s2 := prevLease.Sequence, newLease.Sequence; s1 != 0 {
@@ -324,13 +340,13 @@ func (r *Replica) leasePostApplyLocked(
 			// the same lease. This can happen when callers are using
 			// leasePostApply for some of its side effects, like with
 			// splitPostApply. It can also happen during lease extensions.
-			if !prevLease.Equivalent(newLease) {
+			if !prevLease.Equivalent(*newLease) {
 				log.Fatalf(ctx, "sequence identical for different leases, prevLease=%s, newLease=%s",
 					log.Safe(prevLease), log.Safe(newLease))
 			}
 		case s2 == s1+1:
 			// Lease sequence incremented by 1. Expected case.
-		case s2 > s1+1 && !permitJump:
+		case s2 > s1+1 && jumpOpt == assertNoLeaseJump:
 			log.Fatalf(ctx, "lease sequence jump, prevLease=%s, newLease=%s",
 				log.Safe(prevLease), log.Safe(newLease))
 		}
@@ -401,7 +417,7 @@ func (r *Replica) leasePostApplyLocked(
 	// ordering were reversed, it would be possible for requests to see the new
 	// lease but not the updated merge or timestamp cache state, which can result
 	// in serializability violations.
-	r.mu.state.Lease = &newLease
+	r.mu.state.Lease = newLease
 	expirationBasedLease := r.requiresExpiringLeaseRLocked()
 
 	// Gossip the first range whenever its lease is acquired. We check to make
@@ -474,7 +490,7 @@ func (r *Replica) leasePostApplyLocked(
 
 	// Mark the new lease in the replica's lease history.
 	if r.leaseHistory != nil {
-		r.leaseHistory.add(newLease)
+		r.leaseHistory.add(*newLease)
 	}
 }
 
@@ -686,6 +702,7 @@ func (r *Replica) evaluateProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
 	ba *roachpb.BatchRequest,
+	lul hlc.Timestamp,
 	latchSpans *spanset.SpanSet,
 ) (*result.Result, bool, *roachpb.Error) {
 	if ba.Timestamp.IsEmpty() {
@@ -697,7 +714,7 @@ func (r *Replica) evaluateProposal(
 	// important since evaluating a proposal is expensive.
 	// TODO(tschottdorf): absorb all returned values in `res` below this point
 	// in the call stack as well.
-	batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, latchSpans)
+	batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, lul, latchSpans)
 
 	// Note: reusing the proposer's batch when applying the command on the
 	// proposer was explored as an optimization but resulted in no performance
@@ -816,9 +833,10 @@ func (r *Replica) requestToProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
 	ba *roachpb.BatchRequest,
+	lul hlc.Timestamp,
 	latchSpans *spanset.SpanSet,
 ) (*ProposalData, *roachpb.Error) {
-	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, latchSpans)
+	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, lul, latchSpans)
 
 	// Fill out the results even if pErr != nil; we'll return the error below.
 	proposal := &ProposalData{
@@ -842,20 +860,21 @@ func (r *Replica) requestToProposal(
 }
 
 // getTraceData extracts the SpanMeta of the current span.
-func (r *Replica) getTraceData(ctx context.Context) opentracing.TextMapCarrier {
+func (r *Replica) getTraceData(ctx context.Context) map[string]string {
 	sp := tracing.SpanFromContext(ctx)
 	if sp == nil {
 		return nil
 	}
-	if sp.IsBlackHole() {
+	if !sp.IsVerbose() {
 		return nil
 	}
-	traceData := opentracing.TextMapCarrier{}
-	if err := r.AmbientContext.Tracer.Inject(
-		sp.Meta(), opentracing.TextMap, traceData,
-	); err != nil {
+
+	traceCarrier := tracing.MapCarrier{
+		Map: make(map[string]string),
+	}
+	if err := r.AmbientContext.Tracer.InjectMetaInto(sp.Meta(), traceCarrier); err != nil {
 		log.Errorf(ctx, "failed to inject sp context (%+v) as trace data: %s", sp.Meta(), err)
 		return nil
 	}
-	return traceData
+	return traceCarrier.Map
 }

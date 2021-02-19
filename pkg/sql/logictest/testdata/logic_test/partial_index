@@ -115,6 +115,8 @@ SHOW CREATE TABLE t6
 ----
 t6  CREATE TABLE public.t6 (
     a INT8 NULL,
+    rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+    CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
     INDEX t6_a_idx (a ASC) WHERE a > 0:::INT8,
     INDEX t6_a_idx1 (a ASC) WHERE a > 1:::INT8,
     INDEX t6_a_idx2 (a DESC) WHERE a > 2:::INT8,
@@ -137,6 +139,8 @@ SHOW CREATE TABLE t6
 ----
 t6  CREATE TABLE public.t6 (
     b INT8 NULL,
+    rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+    CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
     INDEX t6_a_idx (b ASC) WHERE b > 0:::INT8,
     INDEX t6_a_idx1 (b ASC) WHERE b > 1:::INT8,
     INDEX t6_a_idx2 (b DESC) WHERE b > 2:::INT8,
@@ -159,6 +163,8 @@ SHOW CREATE TABLE t7
 ----
 t7  CREATE TABLE public.t7 (
     b INT8 NULL,
+    rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+    CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
     INDEX t6_a_idx (b ASC) WHERE b > 0:::INT8,
     INDEX t6_a_idx1 (b ASC) WHERE b > 1:::INT8,
     INDEX t6_a_idx2 (b DESC) WHERE b > 2:::INT8,
@@ -192,6 +198,8 @@ SHOW CREATE TABLE t8
 t8  CREATE TABLE public.t8 (
     a INT8 NULL,
     b INT8 NULL,
+    rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+    CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
     INDEX t8_a_idx (a ASC) WHERE b > 0:::INT8,
     FAMILY fam_0_a_b_c_rowid (a, b, rowid)
 )
@@ -211,6 +219,8 @@ SHOW CREATE TABLE t10
 t10  CREATE TABLE public.t10 (
      a INT8 NULL,
      b INT8 NULL,
+     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+     CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
      INDEX t9_a_idx (a ASC) WHERE b > 1:::INT8,
      FAMILY "primary" (a, b, rowid)
 )
@@ -1141,6 +1151,8 @@ SHOW CREATE TABLE enum_table_show
 enum_table_show  CREATE TABLE public.enum_table_show (
                  a INT8 NULL,
                  b public.enum_type NULL,
+                 rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+                 CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
                  INDEX i (a ASC) WHERE b IN ('foo':::public.enum_type, 'bar':::public.enum_type),
                  FAMILY fam_0_a_b_rowid (a, b, rowid)
 )
@@ -1328,6 +1340,141 @@ query IIII rowsort
 SELECT * FROM prune@idx WHERE c > 0
 ----
 1  2  3  7
+
+# Tests for partial indexes with predicates that reference virtual computed
+# columns.
+subtest virtual
+
+statement ok
+SET experimental_enable_virtual_columns = true
+
+statement ok
+CREATE TABLE virt (
+    a INT PRIMARY KEY,
+    b INT,
+    c INT AS (b + 10) VIRTUAL,
+    INDEX idx (a) WHERE c = 10
+)
+
+statement ok
+INSERT INTO virt (a, b) VALUES
+    (1, 0),
+    (2, 2),
+    (3, 0)
+
+query III rowsort
+SELECT * FROM virt@idx WHERE c = 10
+----
+1  0  10
+3  0  10
+
+statement ok
+DELETE FROM virt WHERE a = 1
+
+query III rowsort
+SELECT * FROM virt@idx WHERE c = 10
+----
+3  0  10
+
+statement ok
+UPDATE virt SET b = 0 WHERE a = 2
+
+statement ok
+UPDATE virt SET b = 3 WHERE a = 3
+
+query III rowsort
+SELECT * FROM virt@idx WHERE c = 10
+----
+2  0  10
+
+statement ok
+UPDATE virt SET a = 4 WHERE a = 2
+
+query III rowsort
+SELECT * FROM virt@idx WHERE c = 10
+----
+4  0  10
+
+statement ok
+UPSERT INTO virt (a, b) VALUES (5, 5), (6, 6);
+UPSERT INTO virt (a, b) VALUES (5, 0);
+
+query III rowsort
+SELECT * FROM virt@idx WHERE c = 10
+----
+4  0  10
+5  0  10
+
+statement ok
+INSERT INTO virt (a, b) VALUES (7, 7), (8, 0) ON CONFLICT (a) DO NOTHING;
+INSERT INTO virt (a, b) VALUES (7, 0) ON CONFLICT (a) DO NOTHING;
+
+query III rowsort
+SELECT * FROM virt@idx WHERE c = 10
+----
+4  0  10
+5  0  10
+8  0  10
+
+statement ok
+INSERT INTO virt (a, b) VALUES (7, 0), (9, 9), (10, 0) ON CONFLICT (a) DO UPDATE SET b = 0
+
+query III rowsort
+SELECT * FROM virt@idx WHERE c = 10
+----
+4   0  10
+5   0  10
+7   0  10
+8   0  10
+10  0  10
+
+# Tests for unique partial indexes with predicates that reference virtual
+# computed columns.
+statement ok
+DELETE FROM virt;
+DROP INDEX virt@idx;
+CREATE UNIQUE INDEX idx ON virt (b) WHERE c > 10;
+
+statement ok
+INSERT INTO virt (a, b) VALUES (1, 1), (2, 2), (3, 1) ON CONFLICT DO NOTHING
+
+query III rowsort
+SELECT * FROM virt@idx WHERE c > 10
+----
+1  1  11
+2  2  12
+
+statement error pgcode 42P10 there is no unique or exclusion constraint matching the ON CONFLICT specification
+INSERT INTO virt (a, b) VALUES (4, 1), (5, 5) ON CONFLICT (b) DO NOTHING
+
+statement ok
+INSERT INTO virt (a, b) VALUES (4, 1), (5, 5) ON CONFLICT (b) WHERE c > 10 DO NOTHING
+
+query III rowsort
+SELECT * FROM virt@idx WHERE c > 10
+----
+1  1  11
+2  2  12
+5  5  15
+
+# Conflict with b=2 and the update to b=5 creates another conflict.
+statement error duplicate key value violates unique constraint "idx"\nDETAIL: Key \(b\)=\(5\) already exists\.
+INSERT INTO virt (a, b) VALUES (1, 2), (6, 6) ON CONFLICT (b) WHERE c > 10 DO UPDATE SET b = 5
+
+# Conflict with PK a=1 and no conflict with b.
+statement error duplicate key value violates unique constraint "primary"\nDETAIL: Key \(a\)=\(1\) already exists\.
+INSERT INTO virt (a, b) VALUES (1, 3), (7, 7) ON CONFLICT (b) WHERE c > 10 DO UPDATE SET b = 8
+
+statement ok
+INSERT INTO virt (a, b) VALUES (1, 2), (8, 8) ON CONFLICT (b) WHERE c > 10 DO UPDATE SET b = 9
+
+query III rowsort
+SELECT * FROM virt@idx WHERE c > 10
+----
+1  1  11
+2  9  19
+5  5  15
+8  8  18
 
 # Regression tests for #52318. Mutations on partial indexes in the
 # DELETE_AND_WRITE_ONLY state should update the indexes correctly.

@@ -21,11 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
@@ -96,8 +96,8 @@ func (p *planner) checkCanAlterDatabaseAndSetNewOwner(
 	privs := desc.GetPrivileges()
 	privs.SetOwner(newOwner)
 
-	// Log Alter Database Owner event. This is an auditable log event and is recorded
-	// in the same transaction as the table descriptor update.
+	// Log Alter Database Owner event. This is an auditable log event and is
+	// recorded in the same transaction as the table descriptor update.
 	return p.logEvent(ctx,
 		desc.GetID(),
 		&eventpb.AlterDatabaseOwner{
@@ -152,7 +152,7 @@ func (n *alterDatabaseAddRegionNode) startExec(params runParams) error {
 				n.n.Region.String(),
 				n.n.Name.String(),
 			),
-			"you must add a PRIMARY REGION first using ALTER DATABASE %s SET PRIMARY REGION %s",
+			"you must add a PRIMARY REGION first using ALTER DATABASE %s PRIMARY REGION %s",
 			n.n.Name.String(),
 			n.n.Region.String(),
 		)
@@ -161,7 +161,7 @@ func (n *alterDatabaseAddRegionNode) startExec(params runParams) error {
 	// Add the region to the database descriptor. This function validates that the region
 	// we're adding is an active member of the cluster and isn't already present in the
 	// RegionConfig.
-	if err := params.p.addRegionToRegionConfig(n.desc, n.n); err != nil {
+	if err := params.p.addActiveRegionToRegionConfig(params.ctx, n.desc, n.n); err != nil {
 		return err
 	}
 
@@ -227,16 +227,19 @@ func (n *alterDatabaseAddRegionNode) startExec(params runParams) error {
 	}
 
 	// Update the database's zone configuration.
-	if err := params.p.applyZoneConfigFromDatabaseRegionConfig(
+	if err := ApplyZoneConfigFromDatabaseRegionConfig(
 		params.ctx,
-		tree.Name(n.desc.Name),
-		*n.desc.RegionConfig); err != nil {
+		n.desc.ID,
+		*n.desc.RegionConfig,
+		params.p.txn,
+		params.p.execCfg,
+	); err != nil {
 		return err
 	}
 
-	// Log Alter Database Add Region event. This is an auditable log event and is recorded
-	// in the same transaction as the database descriptor, type descriptor, and zone
-	// configuration updates.
+	// Log Alter Database Add Region event. This is an auditable log event and is
+	// recorded in the same transaction as the database descriptor, type
+	// descriptor, and zone configuration updates.
 	return params.p.logEvent(params.ctx,
 		n.desc.GetID(),
 		&eventpb.AlterDatabaseAddRegion{
@@ -249,6 +252,13 @@ func (n *alterDatabaseAddRegionNode) Next(runParams) (bool, error) { return fals
 func (n *alterDatabaseAddRegionNode) Values() tree.Datums          { return tree.Datums{} }
 func (n *alterDatabaseAddRegionNode) Close(context.Context)        {}
 
+type alterDatabaseDropRegionNode struct {
+	n                     *tree.AlterDatabaseDropRegion
+	desc                  *dbdesc.Mutable
+	removingPrimaryRegion bool
+	toDrop                []*typedesc.Mutable
+}
+
 // AlterDatabaseDropRegion transforms a tree.AlterDatabaseDropRegion into a plan node.
 func (p *planner) AlterDatabaseDropRegion(
 	ctx context.Context, n *tree.AlterDatabaseDropRegion,
@@ -260,8 +270,191 @@ func (p *planner) AlterDatabaseDropRegion(
 	); err != nil {
 		return nil, err
 	}
-	return nil, unimplemented.NewWithIssue(58333, "implementation pending")
+
+	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, n.Name.String(),
+		tree.DatabaseLookupFlags{Required: true})
+	if err != nil {
+		return nil, err
+	}
+
+	// To drop the region, the user has to have CREATEDB privileges,
+	// or be an admin user.
+	if err := p.CheckRoleOption(ctx, roleoption.CREATEDB); err != nil {
+		return nil, err
+	}
+
+	if !dbDesc.IsMultiRegion() {
+		return nil, pgerror.New(pgcode.InvalidDatabaseDefinition, "database has no regions to drop")
+	}
+
+	removingPrimaryRegion := false
+	var toDrop []*typedesc.Mutable
+
+	if dbDesc.RegionConfig.PrimaryRegion == descpb.RegionName(n.Region) {
+		removingPrimaryRegion = true
+
+		typeID, err := dbDesc.MultiRegionEnumID()
+		if err != nil {
+			return nil, err
+		}
+		typeDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeID)
+		if err != nil {
+			return nil, err
+		}
+		regions, err := typeDesc.RegionNames()
+		if err != nil {
+			return nil, err
+		}
+		if len(regions) != 1 {
+			return nil, errors.WithHintf(
+				errors.Newf("cannot drop region %q", dbDesc.RegionConfig.PrimaryRegion),
+				"You must designate another region as the primary region using "+
+					"ALTER DATABASE %s PRIMARY REGION <region name> or remove all other regions before "+
+					"attempting to drop region %q", dbDesc.GetName(), n.Region,
+			)
+		}
+
+		// When the last region is removed from the database, we also clean up
+		// detritus multi-region type descriptor. This includes both the
+		// type descriptor and its array counterpart.
+		toDrop = append(toDrop, typeDesc)
+		arrayTypeDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeDesc.ArrayTypeID)
+		if err != nil {
+			return nil, err
+		}
+		toDrop = append(toDrop, arrayTypeDesc)
+		for _, desc := range toDrop {
+			// canDropTypeDesc ensures that there are no references to tables on the
+			// type descriptor. This is what we expect when dropping the final
+			// (primary) region from a database, as REGIONAL BY ROW tables and
+			// REGIONAL BY TABLE tables (homed explicitly in the final region) will
+			// store a reference on the type descriptor. It is sufficient to simply
+			// check for stored references and not go through the validation that
+			// happens in the type_schema changer in this scenario.
+			if err := p.canDropTypeDesc(ctx, desc, tree.DropRestrict); err != nil {
+				return nil, errors.Wrapf(
+					err, "error removing primary region from database %s", dbDesc.Name)
+			}
+		}
+	}
+
+	return &alterDatabaseDropRegionNode{
+		n,
+		dbDesc,
+		removingPrimaryRegion,
+		toDrop,
+	}, nil
 }
+
+// removeLocalityConfigFromAllTablesInDB removes the locality config from all
+// tables under the supplied database.
+func removeLocalityConfigFromAllTablesInDB(
+	ctx context.Context, p *planner, desc *dbdesc.Immutable,
+) error {
+	if !desc.IsMultiRegion() {
+		return errors.AssertionFailedf(
+			"cannot remove locality configs from tables in non multi-region database with ID %d",
+			desc.GetID(),
+		)
+	}
+	b := p.Txn().NewBatch()
+	if err := forEachTableDesc(ctx, p, desc, hideVirtual,
+		func(immutable *dbdesc.Immutable, _ string, desc catalog.TableDescriptor) error {
+			mutDesc, err := p.Descriptors().GetMutableTableByID(ctx, p.txn, desc.GetID(), tree.ObjectLookupFlags{})
+			if err != nil {
+				return err
+			}
+			mutDesc.LocalityConfig = nil
+			if err := p.writeSchemaChangeToBatch(ctx, mutDesc, b); err != nil {
+				return err
+			}
+			return nil
+		}); err != nil {
+		return err
+	}
+	return p.Txn().Run(ctx, b)
+}
+
+func (n *alterDatabaseDropRegionNode) startExec(params runParams) error {
+	typeDesc, err := params.p.Descriptors().GetMutableTypeVersionByID(
+		params.ctx,
+		params.p.txn,
+		n.desc.RegionConfig.RegionEnumID,
+	)
+	if err != nil {
+		return err
+	}
+
+	if n.removingPrimaryRegion {
+		for _, desc := range n.toDrop {
+			jobDesc := fmt.Sprintf("drop multi-region enum with ID %d", desc.ID)
+			err := params.p.dropTypeImpl(params.ctx, desc, jobDesc, true /* queueJob */)
+			if err != nil {
+				return err
+			}
+		}
+
+		err = removeLocalityConfigFromAllTablesInDB(params.ctx, params.p, &n.desc.Immutable)
+		if err != nil {
+			return errors.Wrap(err, "error removing locality configs from tables")
+		}
+
+		n.desc.UnsetMultiRegionConfig()
+	} else {
+		// dropEnumValue tries to remove the region value from the multi-region type
+		// descriptor. Among other things, it validates that the region is not in
+		// use by any tables. A region is considered "in use" if either a REGIONAL BY
+		// TABLE table is explicitly homed in that region or a row in a REGIONAL BY
+		// ROW table is homed in that region. The type schema changer is responsible
+		// for all the requisite validation.
+		if err := params.p.dropEnumValue(params.ctx, typeDesc, tree.EnumValue(n.n.Region)); err != nil {
+			return err
+		}
+
+		// Remove the region from the database descriptor as well.
+		idx := 0
+		found := false
+		for i, region := range n.desc.RegionConfig.Regions {
+			if region.Name == descpb.RegionName(n.n.Region) {
+				idx = i
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			// This shouldn't happen and is simply a sanity check to ensure the database
+			// descriptor regions and multi-region enum regions are indeed consistent.
+			return errors.AssertionFailedf(
+				"attempting to drop region %s not on database descriptor %d but found on type descriptor",
+				n.n.Region, n.desc.GetID(),
+			)
+		}
+		n.desc.RegionConfig.Regions = append(n.desc.RegionConfig.Regions[:idx],
+			n.desc.RegionConfig.Regions[idx+1:]...)
+	}
+
+	if err := params.p.writeNonDropDatabaseChange(
+		params.ctx,
+		n.desc,
+		tree.AsStringWithFQNames(n.n, params.Ann()),
+	); err != nil {
+		return err
+	}
+
+	// Log Alter Database Drop Region event. This is an auditable log event and is
+	// recorded in the same transaction as the table descriptor update.
+	return params.p.logEvent(params.ctx,
+		n.desc.GetID(),
+		&eventpb.AlterDatabaseDropRegion{
+			DatabaseName: n.desc.GetName(),
+			RegionName:   n.n.Region.String(),
+		})
+}
+
+func (n *alterDatabaseDropRegionNode) Next(runParams) (bool, error) { return false, nil }
+func (n *alterDatabaseDropRegionNode) Values() tree.Datums          { return tree.Datums{} }
+func (n *alterDatabaseDropRegionNode) Close(context.Context)        {}
 
 type alterDatabasePrimaryRegionNode struct {
 	n    *tree.AlterDatabasePrimaryRegion
@@ -349,22 +542,32 @@ func (n *alterDatabasePrimaryRegionNode) switchPrimaryRegion(params runParams) e
 	}
 
 	// Update the database's zone configuration.
-	if err := params.p.applyZoneConfigFromDatabaseRegionConfig(
+	if err := ApplyZoneConfigFromDatabaseRegionConfig(
 		params.ctx,
-		tree.Name(n.desc.Name),
-		*n.desc.RegionConfig); err != nil {
+		n.desc.ID,
+		*n.desc.RegionConfig,
+		params.p.txn,
+		params.p.execCfg,
+	); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// addDefaultLocalityConfigToAllTables adds a locality config representing
-// regional by table table's with affinity to the primary region to all table's
-// inside the supplied database.
+// addDefaultLocalityConfigToAllTables adds a default locality config to all
+// tables inside the supplied database. The default locality config indicates
+// that the table is a REGIONAL BY TABLE table homed in the primary region of
+// the database.
 func addDefaultLocalityConfigToAllTables(
-	ctx context.Context, p *planner, desc *dbdesc.Immutable,
+	ctx context.Context, p *planner, desc *dbdesc.Immutable, regionEnumID descpb.ID,
 ) error {
+	if !desc.IsMultiRegion() {
+		return errors.AssertionFailedf(
+			"cannot add locality config to tables in non multi-region database with ID %d",
+			desc.GetID(),
+		)
+	}
 	b := p.Txn().NewBatch()
 	if err := forEachTableDesc(ctx, p, desc, hideVirtual,
 		func(immutable *dbdesc.Immutable, _ string, desc catalog.TableDescriptor) error {
@@ -374,7 +577,13 @@ func addDefaultLocalityConfigToAllTables(
 			if err != nil {
 				return err
 			}
-			mutDesc.SetTableLocalityRegionalByTable(tree.PrimaryRegionLocalityName)
+
+			if err := p.alterTableDescLocalityToRegionalByTable(
+				ctx, tree.PrimaryRegionLocalityName, mutDesc, regionEnumID,
+			); err != nil {
+				return err
+			}
+
 			if err := p.writeSchemaChangeToBatch(ctx, mutDesc, b); err != nil {
 				return err
 			}
@@ -385,8 +594,8 @@ func addDefaultLocalityConfigToAllTables(
 	return p.Txn().Run(ctx, b)
 }
 
-// setInitialPrimaryRegion sets the primary region in cases where the database is already
-// a multi-region database.
+// setInitialPrimaryRegion sets the primary region in cases where the database
+// is already a multi-region database.
 func (n *alterDatabasePrimaryRegionNode) setInitialPrimaryRegion(params runParams) error {
 	// Create the region config structure to be added to the database descriptor.
 	regionConfig, err := params.p.createRegionConfig(
@@ -399,12 +608,19 @@ func (n *alterDatabasePrimaryRegionNode) setInitialPrimaryRegion(params runParam
 		return err
 	}
 
-	if err := addDefaultLocalityConfigToAllTables(params.ctx, params.p, &n.desc.Immutable); err != nil {
+	// Set the region config on the database descriptor.
+	n.desc.RegionConfig = regionConfig
+
+	if err := addDefaultLocalityConfigToAllTables(
+		params.ctx,
+		params.p,
+		&n.desc.Immutable,
+		regionConfig.RegionEnumID,
+	); err != nil {
 		return err
 	}
 
 	// Write the modified database descriptor.
-	n.desc.RegionConfig = regionConfig
 	if err := params.p.writeNonDropDatabaseChange(
 		params.ctx,
 		n.desc,
@@ -453,8 +669,9 @@ func (n *alterDatabasePrimaryRegionNode) startExec(params runParams) error {
 		}
 	}
 
-	// Log Alter Database Primary Region event. This is an auditable log event and is recorded
-	// in the same transaction as the database descriptor, and zone configuration updates.
+	// Log Alter Database Primary Region event. This is an auditable log event and
+	// is recorded in the same transaction as the database descriptor, and zone
+	// configuration updates.
 	return params.p.logEvent(params.ctx,
 		n.desc.GetID(),
 		&eventpb.AlterDatabasePrimaryRegion{
@@ -484,6 +701,7 @@ func (p *planner) AlterDatabaseSurvivalGoal(
 	); err != nil {
 		return nil, err
 	}
+
 	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, n.Name.String(),
 		tree.DatabaseLookupFlags{Required: true},
 	)
@@ -547,10 +765,13 @@ func (n *alterDatabaseSurvivalGoalNode) startExec(params runParams) error {
 	}
 
 	// Update the database's zone configuration.
-	if err := params.p.applyZoneConfigFromDatabaseRegionConfig(
+	if err := ApplyZoneConfigFromDatabaseRegionConfig(
 		params.ctx,
-		tree.Name(n.desc.Name),
-		*n.desc.RegionConfig); err != nil {
+		n.desc.ID,
+		*n.desc.RegionConfig,
+		params.p.txn,
+		params.p.execCfg,
+	); err != nil {
 		return err
 	}
 
@@ -560,8 +781,9 @@ func (n *alterDatabaseSurvivalGoalNode) startExec(params runParams) error {
 		return err
 	}
 
-	// Log Alter Database Survival Goal event. This is an auditable log event and is recorded
-	// in the same transaction as the database descriptor, and zone configuration updates.
+	// Log Alter Database Survival Goal event. This is an auditable log event and
+	// is recorded in the same transaction as the database descriptor, and zone
+	// configuration updates.
 	return params.p.logEvent(params.ctx,
 		n.desc.GetID(),
 		&eventpb.AlterDatabaseSurvivalGoal{

@@ -50,9 +50,10 @@ func NewCrossJoiner(
 			fdSemaphore,
 			diskAcc,
 		),
-		twoInputNode:       newTwoInputNode(left, right),
-		unlimitedAllocator: unlimitedAllocator,
-		outputTypes:        joinType.MakeOutputTypes(leftTypes, rightTypes),
+		twoInputNode:          newTwoInputNode(left, right),
+		unlimitedAllocator:    unlimitedAllocator,
+		outputTypes:           joinType.MakeOutputTypes(leftTypes, rightTypes),
+		maxOutputBatchMemSize: memoryLimit,
 	}
 }
 
@@ -60,11 +61,12 @@ type crossJoiner struct {
 	*crossJoinerBase
 	twoInputNode
 
-	unlimitedAllocator   *colmem.Allocator
-	inputsConsumed       bool
-	outputTypes          []*types.T
-	numTotalOutputTuples int
-	numAlreadyEmitted    int
+	unlimitedAllocator    *colmem.Allocator
+	inputsConsumed        bool
+	outputTypes           []*types.T
+	maxOutputBatchMemSize int64
+	numTotalOutputTuples  int
+	numAlreadyEmitted     int
 	// isLeftAllNulls and isRightAllNulls indicate whether the output vectors
 	// corresponding to the left and right inputs, respectively, should consist
 	// only of NULL values. This is the case when we have right or left,
@@ -73,7 +75,7 @@ type crossJoiner struct {
 }
 
 var _ closableOperator = &crossJoiner{}
-var _ ResettableOperator = &crossJoiner{}
+var _ colexecbase.ResettableOperator = &crossJoiner{}
 
 func (c *crossJoiner) Init() {
 	c.inputOne.Init()
@@ -91,11 +93,15 @@ func (c *crossJoiner) Next(ctx context.Context) coldata.Batch {
 		}
 		return coldata.ZeroBatch
 	}
+	// TODO(yuzefovich): refactor willEmit calculation when ResetMaybeReallocate
+	// is updated.
 	willEmit := c.numTotalOutputTuples - c.numAlreadyEmitted
 	if willEmit > coldata.BatchSize() {
 		willEmit = coldata.BatchSize()
 	}
-	c.output, _ = c.unlimitedAllocator.ResetMaybeReallocate(c.outputTypes, c.output, willEmit)
+	c.output, _ = c.unlimitedAllocator.ResetMaybeReallocate(
+		c.outputTypes, c.output, willEmit, c.maxOutputBatchMemSize,
+	)
 	if c.joinType.ShouldIncludeLeftColsInOutput() {
 		if c.isLeftAllNulls {
 			setAllNulls(c.output.ColVecs()[:len(c.left.types)], willEmit)
@@ -232,14 +238,14 @@ func setAllNulls(vecs []coldata.Vec, length int) {
 	}
 }
 
-func (c *crossJoiner) reset(ctx context.Context) {
-	if r, ok := c.inputOne.(resetter); ok {
-		r.reset(ctx)
+func (c *crossJoiner) Reset(ctx context.Context) {
+	if r, ok := c.inputOne.(colexecbase.Resetter); ok {
+		r.Reset(ctx)
 	}
-	if r, ok := c.inputTwo.(resetter); ok {
-		r.reset(ctx)
+	if r, ok := c.inputTwo.(colexecbase.Resetter); ok {
+		r.Reset(ctx)
 	}
-	c.crossJoinerBase.reset(ctx)
+	c.crossJoinerBase.Reset(ctx)
 	c.inputsConsumed = false
 	c.numTotalOutputTuples = 0
 	c.numAlreadyEmitted = 0
@@ -413,7 +419,7 @@ func (b *crossJoinerBase) calculateOutputCount() int {
 	}
 }
 
-func (b *crossJoinerBase) reset(ctx context.Context) {
+func (b *crossJoinerBase) Reset(ctx context.Context) {
 	if b.left.tuples != nil {
 		b.left.tuples.reset(ctx)
 	}

@@ -1143,18 +1143,29 @@ CREATE TABLE crdb_internal.node_inflight_trace_spans (
   parent_span_id INT NOT NULL,    -- The span's parent ID.
   span_id        INT NOT NULL,    -- The span's ID.
   goroutine_id   INT NOT NULL,    -- The ID of the goroutine on which the span was created.
+  finished       BOOL NOT NULL,   -- True if the span has been Finish()ed, false otherwise.
   start_time     TIMESTAMPTZ,     -- The span's start time.
-  duration       INTERVAL,        -- The span's duration, measured by time of 
-                                  -- collection - start time for all in-flight spans.
+  duration       INTERVAL,        -- The span's duration, measured from start to Finish().
+                                  -- A span whose recording is collected before it's finished will
+                                  -- have the duration set as the "time of collection - start time".
   operation      STRING NULL      -- The span's operation.
 )`,
 	populate: func(ctx context.Context, p *planner, _ *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
+		hasAdmin, err := p.HasAdminRole(ctx)
+		if err != nil {
+			return err
+		}
+		if !hasAdmin {
+			return pgerror.Newf(pgcode.InsufficientPrivilege,
+				"only users with the admin role are allowed to read crdb_internal.node_inflight_trace_spans")
+		}
 		return p.ExecCfg().Settings.Tracer.VisitSpans(func(span *tracing.Span) error {
 			for _, rec := range span.GetRecording() {
 				traceID := rec.TraceID
 				parentSpanID := rec.ParentSpanID
 				spanID := rec.SpanID
 				goroutineID := rec.GoroutineID
+				finished := rec.Finished
 
 				startTime, err := tree.MakeDTimestampTZ(rec.StartTime, time.Microsecond)
 				if err != nil {
@@ -1165,10 +1176,13 @@ CREATE TABLE crdb_internal.node_inflight_trace_spans (
 				operation := rec.Operation
 
 				if err := addRow(
+					// TODO(angelapwen): we're casting uint64s to int64 here,
+					// is that ok?
 					tree.NewDInt(tree.DInt(traceID)),
 					tree.NewDInt(tree.DInt(parentSpanID)),
 					tree.NewDInt(tree.DInt(spanID)),
 					tree.NewDInt(tree.DInt(goroutineID)),
+					tree.MakeDBool(tree.DBool(finished)),
 					startTime,
 					tree.NewDInterval(
 						duration.MakeDuration(spanDuration.Nanoseconds(), 0, 0),
@@ -2494,7 +2508,9 @@ CREATE VIEW crdb_internal.ranges AS SELECT
 	start_pretty,
 	end_key,
 	end_pretty,
+  table_id,
 	database_name,
+  schema_name,
 	table_name,
 	index_name,
 	replicas,
@@ -2512,7 +2528,9 @@ FROM crdb_internal.ranges_no_leases
 		{Name: "start_pretty", Typ: types.String},
 		{Name: "end_key", Typ: types.Bytes},
 		{Name: "end_pretty", Typ: types.String},
+		{Name: "table_id", Typ: types.Int},
 		{Name: "database_name", Typ: types.String},
+		{Name: "schema_name", Typ: types.String},
 		{Name: "table_name", Typ: types.String},
 		{Name: "index_name", Typ: types.String},
 		{Name: "replicas", Typ: types.Int2Vector},
@@ -2537,7 +2555,9 @@ CREATE TABLE crdb_internal.ranges_no_leases (
   start_pretty         STRING NOT NULL,
   end_key              BYTES NOT NULL,
   end_pretty           STRING NOT NULL,
+  table_id             INT NOT NULL,
   database_name        STRING NOT NULL,
+  schema_name          STRING NOT NULL,
   table_name           STRING NOT NULL,
   index_name           STRING NOT NULL,
   replicas             INT[] NOT NULL,
@@ -2557,13 +2577,16 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 		// TODO(knz): maybe this could use internalLookupCtx.
 		dbNames := make(map[uint32]string)
 		tableNames := make(map[uint32]string)
+		schemaNames := make(map[uint32]string)
 		indexNames := make(map[uint32]map[uint32]string)
+		schemaParents := make(map[uint32]uint32)
 		parents := make(map[uint32]uint32)
 		for _, desc := range descs {
 			id := uint32(desc.GetID())
 			switch desc := desc.(type) {
 			case catalog.TableDescriptor:
 				parents[id] = uint32(desc.GetParentID())
+				schemaParents[id] = uint32(desc.GetParentSchemaID())
 				tableNames[id] = desc.GetName()
 				indexNames[id] = make(map[uint32]string)
 				for _, idx := range desc.PublicNonPrimaryIndexes() {
@@ -2571,6 +2594,8 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				}
 			case *dbdesc.Immutable:
 				dbNames[id] = desc.GetName()
+			case *schemadesc.Immutable:
+				schemaNames[id] = desc.GetName()
 			}
 		}
 		ranges, err := kvclient.ScanMetaKVs(ctx, p.txn, roachpb.Span{
@@ -2637,8 +2662,18 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				}
 			}
 
-			var dbName, tableName, indexName string
-			if _, tableID, err := p.ExecCfg().Codec.DecodeTablePrefix(desc.StartKey.AsRawKey()); err == nil {
+			var dbName, schemaName, tableName, indexName string
+			var tableID uint32
+			if _, tableID, err = p.ExecCfg().Codec.DecodeTablePrefix(desc.StartKey.AsRawKey()); err == nil {
+				schemaParent := schemaParents[tableID]
+				if schemaParent != 0 {
+					schemaName = schemaNames[schemaParent]
+				} else {
+					// This case shouldn't happen - all schema ids should be available in the
+					// schemaParents map. If it's not, just assume the name of the schema
+					// is public to avoid problems.
+					schemaName = string(tree.PublicSchemaName)
+				}
 				parent := parents[tableID]
 				if parent != 0 {
 					tableName = tableNames[tableID]
@@ -2662,7 +2697,9 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				tree.NewDString(keys.PrettyPrint(nil /* valDirs */, desc.StartKey.AsRawKey())),
 				tree.NewDBytes(tree.DBytes(desc.EndKey)),
 				tree.NewDString(keys.PrettyPrint(nil /* valDirs */, desc.EndKey.AsRawKey())),
+				tree.NewDInt(tree.DInt(tableID)),
 				tree.NewDString(dbName),
+				tree.NewDString(schemaName),
 				tree.NewDString(tableName),
 				tree.NewDString(indexName),
 				votersArr,
@@ -3784,14 +3821,12 @@ CREATE TABLE crdb_internal.invalid_objects (
 	) error {
 		// The internalLookupContext will only have descriptors in the current
 		// database. To deal with this, we fall through.
-		// TODO(spaskob): we can also validate type descriptors. Add a new function
-		// `forEachTypeDescAllWithTableLookup` and the results to this table.
 		descs, err := catalogkv.GetAllDescriptorsUnvalidated(ctx, p.txn, p.extendedEvalCtx.Codec)
 		if err != nil {
 			return err
 		}
 		const allowAdding = true
-		return forEachTableDescWithTableLookupInternalFromDescriptors(
+		if err := forEachTableDescWithTableLookupInternalFromDescriptors(
 			ctx, p, dbContext, hideVirtual, allowAdding, descs, func(
 				dbDesc *dbdesc.Immutable, schema string, descriptor catalog.TableDescriptor, fn tableLookupFn,
 			) error {
@@ -3806,6 +3841,34 @@ CREATE TABLE crdb_internal.invalid_objects (
 				if dbDesc != nil {
 					dbName = dbDesc.GetName()
 				}
+				return addRow(
+					tree.NewDInt(tree.DInt(descriptor.GetID())),
+					tree.NewDString(dbName),
+					tree.NewDString(schema),
+					tree.NewDString(descriptor.GetName()),
+					tree.NewDString(err.Error()),
+				)
+			}); err != nil {
+			return err
+		}
+
+		// Validate type descriptors.
+		return forEachTypeDescWithTableLookupInternalFromDescriptors(
+			ctx, p, dbContext, allowAdding, descs, func(
+				dbDesc *dbdesc.Immutable, schema string, descriptor catalog.TypeDescriptor, fn tableLookupFn,
+			) error {
+				if descriptor == nil {
+					return nil
+				}
+				err = descriptor.Validate(ctx, fn)
+				if err == nil {
+					return nil
+				}
+				var dbName string
+				if dbDesc != nil {
+					dbName = dbDesc.GetName()
+				}
+
 				return addRow(
 					tree.NewDInt(tree.DInt(descriptor.GetID())),
 					tree.NewDString(dbName),

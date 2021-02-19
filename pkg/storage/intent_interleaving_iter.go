@@ -13,13 +13,16 @@ package storage
 import (
 	"bytes"
 	"fmt"
+	"math/rand"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -262,6 +265,32 @@ func (i *intentInterleavingIter) SeekGE(key MVCCKey) {
 		}
 	}
 	i.iter.SeekGE(key)
+	i.computePos()
+}
+
+func (i *intentInterleavingIter) SeekIntentGE(key roachpb.Key, txnUUID uuid.UUID) {
+	i.dir = +1
+	i.valid = true
+
+	if i.constraint != notConstrained {
+		i.checkConstraint(key, false)
+	}
+	var engineKey EngineKey
+	engineKey, i.intentKeyBuf = LockTableKey{
+		Key:      key,
+		Strength: lock.Exclusive,
+		TxnUUID:  txnUUID[:],
+	}.ToEngineKey(i.intentKeyBuf)
+	valid, err := i.intentIter.SeekEngineKeyGE(engineKey)
+	if err != nil {
+		i.err = err
+		i.valid = false
+		return
+	}
+	if err := i.tryDecodeLockKey(valid); err != nil {
+		return
+	}
+	i.iter.SeekGE(MVCCKey{Key: key})
 	i.computePos()
 }
 
@@ -836,4 +865,73 @@ func newMVCCIteratorByCloningEngineIter(iter EngineIterator, opts IterOptions) M
 		panic("couldn't create a new iterator")
 	}
 	return it
+}
+
+// unsageMVCCIterator is used in RaceEnabled test builds to randomly inject
+// changes to unsafe keys retrieved from MVCCIterators.
+type unsafeMVCCIterator struct {
+	MVCCIterator
+	keyBuf        []byte
+	rawKeyBuf     []byte
+	rawMVCCKeyBuf []byte
+}
+
+func wrapInUnsafeIter(iter MVCCIterator) MVCCIterator {
+	return &unsafeMVCCIterator{MVCCIterator: iter}
+}
+
+var _ MVCCIterator = &unsafeMVCCIterator{}
+
+func (i *unsafeMVCCIterator) SeekGE(key MVCCKey) {
+	i.mangleBufs()
+	i.MVCCIterator.SeekGE(key)
+}
+
+func (i *unsafeMVCCIterator) Next() {
+	i.mangleBufs()
+	i.MVCCIterator.Next()
+}
+
+func (i *unsafeMVCCIterator) NextKey() {
+	i.mangleBufs()
+	i.MVCCIterator.NextKey()
+}
+
+func (i *unsafeMVCCIterator) SeekLT(key MVCCKey) {
+	i.mangleBufs()
+	i.MVCCIterator.SeekLT(key)
+}
+
+func (i *unsafeMVCCIterator) Prev() {
+	i.mangleBufs()
+	i.MVCCIterator.Prev()
+}
+
+func (i *unsafeMVCCIterator) UnsafeKey() MVCCKey {
+	rv := i.MVCCIterator.UnsafeKey()
+	i.keyBuf = append(i.keyBuf[:0], rv.Key...)
+	rv.Key = i.keyBuf
+	return rv
+}
+
+func (i *unsafeMVCCIterator) UnsafeRawKey() []byte {
+	rv := i.MVCCIterator.UnsafeRawKey()
+	i.rawKeyBuf = append(i.rawKeyBuf[:0], rv...)
+	return i.rawKeyBuf
+}
+
+func (i *unsafeMVCCIterator) UnsafeRawMVCCKey() []byte {
+	rv := i.MVCCIterator.UnsafeRawMVCCKey()
+	i.rawMVCCKeyBuf = append(i.rawMVCCKeyBuf[:0], rv...)
+	return i.rawMVCCKeyBuf
+}
+
+func (i *unsafeMVCCIterator) mangleBufs() {
+	if rand.Intn(2) == 0 {
+		for _, b := range [3][]byte{i.keyBuf, i.rawKeyBuf, i.rawMVCCKeyBuf} {
+			for i := range b {
+				b[i] = 0
+			}
+		}
+	}
 }

@@ -24,6 +24,7 @@ go_library(
 
 go_test(
     name = "protoutil_test",
+    size = "small",
     srcs = ["clone_test.go"],
     deps = [
         ":protoutil",
@@ -51,5 +52,8 @@ go_proto_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/util/protoutil",
     proto = ":protoutil_proto",
     visibility = ["//visibility:public"],
-    deps = ["@com_github_gogo_protobuf//gogoproto"],
+    deps = [
+        "//pkg/util/uuid",  # keep
+        "@com_github_gogo_protobuf//gogoproto",
+    ],
 )

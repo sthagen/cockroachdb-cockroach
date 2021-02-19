@@ -592,9 +592,10 @@ func (s *Server) newConnExecutor(
 			nodeIDOrZero: nodeIDOrZero,
 			clock:        s.cfg.Clock,
 			// Future transaction's monitors will inherits from sessionRootMon.
-			connMon:  sessionRootMon,
-			tracer:   s.cfg.AmbientCtx.Tracer,
-			settings: s.cfg.Settings,
+			connMon:          sessionRootMon,
+			tracer:           s.cfg.AmbientCtx.Tracer,
+			settings:         s.cfg.Settings,
+			execTestingKnobs: s.GetExecutorConfig().TestingKnobs,
 		},
 		memMetrics: memMetrics,
 		planner:    planner{execCfg: s.cfg, alloc: &rowenc.DatumAlloc{}},
@@ -2239,6 +2240,7 @@ func (ex *connExecutor) resetPlanner(
 	p.semaCtx.AsOfTimestamp = nil
 	p.semaCtx.Annotations = nil
 	p.semaCtx.TypeResolver = p
+	p.semaCtx.TableNameResolver = p
 
 	ex.resetEvalCtx(&p.extendedEvalCtx, txn, stmtTS)
 
@@ -2713,7 +2715,13 @@ func (sc *StatementCounters) incrementCount(ex *connExecutor, stmt tree.Statemen
 	case *tree.CommitTransaction:
 		sc.TxnCommitCount.Inc()
 	case *tree.RollbackTransaction:
-		sc.TxnRollbackCount.Inc()
+		// The CommitWait state means that the transaction has already committed
+		// after a specially handled `RELEASE SAVEPOINT cockroach_restart` command.
+		if ex.getTransactionState() == CommitWaitStateStr {
+			sc.TxnCommitCount.Inc()
+		} else {
+			sc.TxnRollbackCount.Inc()
+		}
 	case *tree.Savepoint:
 		if ex.isCommitOnReleaseSavepoint(t.Name) {
 			sc.RestartSavepointCount.Inc()

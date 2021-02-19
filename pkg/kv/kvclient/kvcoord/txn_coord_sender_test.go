@@ -701,44 +701,63 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 	plus20 := origTS.Add(20, 0).WithSynthetic(false)
 	testCases := []struct {
 		// The test's name.
-		name             string
-		pErrGen          func(txn *roachpb.Transaction) *roachpb.Error
-		expEpoch         enginepb.TxnEpoch
-		expPri           enginepb.TxnPriority
-		expTS, expOrigTS hlc.Timestamp
+		name                  string
+		pErrGen               func(txn *roachpb.Transaction) *roachpb.Error
+		expEpoch              enginepb.TxnEpoch
+		expPri                enginepb.TxnPriority
+		expWriteTS, expReadTS hlc.Timestamp
 		// Is set, we're expecting that the Transaction proto is re-initialized (as
 		// opposed to just having the epoch incremented).
 		expNewTransaction bool
-		nodeSeen          bool
 	}{
 		{
 			// No error, so nothing interesting either.
-			name:      "nil",
-			pErrGen:   func(_ *roachpb.Transaction) *roachpb.Error { return nil },
-			expEpoch:  0,
-			expPri:    1,
-			expTS:     origTS,
-			expOrigTS: origTS,
+			name:       "nil",
+			pErrGen:    func(_ *roachpb.Transaction) *roachpb.Error { return nil },
+			expEpoch:   0,
+			expPri:     1,
+			expWriteTS: origTS,
+			expReadTS:  origTS,
 		},
 		{
-			// On uncertainty error, new epoch begins and node is seen.
-			// Timestamp moves ahead of the existing write.
-			name: "ReadWithinUncertaintyIntervalError",
+			// On uncertainty error, new epoch begins. Timestamp moves ahead of
+			// the existing write and LocalUncertaintyLimit, if one exists.
+			name: "ReadWithinUncertaintyIntervalError without LocalUncertaintyLimit",
 			pErrGen: func(txn *roachpb.Transaction) *roachpb.Error {
-				const nodeID = 1
-				txn.UpdateObservedTimestamp(nodeID, plus10.UnsafeToClockTimestamp())
 				pErr := roachpb.NewErrorWithTxn(
 					roachpb.NewReadWithinUncertaintyIntervalError(
-						hlc.Timestamp{}, hlc.Timestamp{}, nil),
+						origTS,          // readTS
+						plus10,          // existingTS
+						hlc.Timestamp{}, // localUncertaintyLimit
+						txn,
+					),
 					txn)
-				pErr.OriginNode = nodeID
 				return pErr
 			},
-			expEpoch:  1,
-			expPri:    1,
-			expTS:     plus10,
-			expOrigTS: plus10,
-			nodeSeen:  true,
+			expEpoch:   1,
+			expPri:     1,
+			expWriteTS: plus10.Next(),
+			expReadTS:  plus10.Next(),
+		},
+		{
+			// On uncertainty error, new epoch begins. Timestamp moves ahead of
+			// the existing write and LocalUncertaintyLimit, if one exists.
+			name: "ReadWithinUncertaintyIntervalError with LocalUncertaintyLimit",
+			pErrGen: func(txn *roachpb.Transaction) *roachpb.Error {
+				pErr := roachpb.NewErrorWithTxn(
+					roachpb.NewReadWithinUncertaintyIntervalError(
+						origTS, // readTS
+						plus10, // existingTS
+						plus20, // localUncertaintyLimit
+						txn,
+					),
+					txn)
+				return pErr
+			},
+			expEpoch:   1,
+			expPri:     1,
+			expWriteTS: plus20,
+			expReadTS:  plus20,
 		},
 		{
 			// On abort, nothing changes but we get a new priority to use for
@@ -751,8 +770,8 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 			},
 			expNewTransaction: true,
 			expPri:            10,
-			expTS:             plus20,
-			expOrigTS:         plus20,
+			expWriteTS:        plus20,
+			expReadTS:         plus20,
 		},
 		{
 			// On failed push, new epoch begins just past the pushed timestamp.
@@ -765,10 +784,10 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 					},
 				}, txn)
 			},
-			expEpoch:  1,
-			expPri:    9,
-			expTS:     plus10,
-			expOrigTS: plus10,
+			expEpoch:   1,
+			expPri:     9,
+			expWriteTS: plus10,
+			expReadTS:  plus10,
 		},
 		{
 			// On retry, restart with new epoch, timestamp and priority.
@@ -778,10 +797,10 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 				txn.Priority = 10
 				return roachpb.NewErrorWithTxn(&roachpb.TransactionRetryError{}, txn)
 			},
-			expEpoch:  1,
-			expPri:    10,
-			expTS:     plus10,
-			expOrigTS: plus10,
+			expEpoch:   1,
+			expPri:     10,
+			expWriteTS: plus10,
+			expReadTS:  plus10,
 		},
 	}
 
@@ -857,17 +876,13 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 				t.Errorf("expected priority = %d; got %d",
 					test.expPri, proto.Priority)
 			}
-			if proto.WriteTimestamp != test.expTS {
+			if proto.WriteTimestamp != test.expWriteTS {
 				t.Errorf("expected timestamp to be %s; got %s",
-					test.expTS, proto.WriteTimestamp)
+					test.expWriteTS, proto.WriteTimestamp)
 			}
-			if proto.ReadTimestamp != test.expOrigTS {
+			if proto.ReadTimestamp != test.expReadTS {
 				t.Errorf("expected orig timestamp to be %s; got %s",
-					test.expOrigTS, proto.ReadTimestamp)
-			}
-			if ns := proto.ObservedTimestamps; (len(ns) != 0) != test.nodeSeen {
-				t.Errorf("expected nodeSeen=%t, but list of hosts is %v",
-					test.nodeSeen, ns)
+					test.expReadTS, proto.ReadTimestamp)
 			}
 		})
 	}
@@ -1279,7 +1294,8 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 				// recorded on the origin.
 				txn.UpdateObservedTimestamp(nodeID, makeTS(123, 0).UnsafeToClockTimestamp())
 				return roachpb.NewErrorWithTxn(
-					roachpb.NewReadWithinUncertaintyIntervalError(hlc.Timestamp{}, hlc.Timestamp{}, nil),
+					roachpb.NewReadWithinUncertaintyIntervalError(
+						hlc.Timestamp{}, hlc.Timestamp{}, hlc.Timestamp{}, nil),
 					&txn)
 			},
 			asyncAbort: false},
@@ -2398,4 +2414,171 @@ func TestPutsInStagingTxn(t *testing.T) {
 	// Verify that the test isn't fooling itself by checking that we've indeed
 	// seen a batch with the STAGING status.
 	require.True(t, putInStagingSeen)
+}
+
+// TestTxnManualRefresh verifies that TxnCoordSender's ManualRefresh method
+// works as expected.
+func TestTxnManualRefresh(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Create some machinery to mock out the kvserver and allow the test to
+	// launch some requests from the client and then pass control flow of handling
+	// those requests back to the test.
+	type resp struct {
+		br   *roachpb.BatchResponse
+		pErr *roachpb.Error
+	}
+	type req struct {
+		ba     roachpb.BatchRequest
+		respCh chan resp
+	}
+	type testCase struct {
+		name string
+		run  func(
+			ctx context.Context,
+			t *testing.T,
+			db *kv.DB,
+			clock *hlc.ManualClock,
+			reqCh <-chan req,
+		)
+	}
+	var cases = []testCase{
+		{
+			name: "no-op",
+			run: func(
+				ctx context.Context, t *testing.T, db *kv.DB,
+				clock *hlc.ManualClock, reqCh <-chan req,
+			) {
+				txn := db.NewTxn(ctx, "test")
+				errCh := make(chan error)
+				go func() {
+					_, err := txn.Get(ctx, "foo")
+					errCh <- err
+				}()
+				{
+					r := <-reqCh
+					_, ok := r.ba.GetArg(roachpb.Get)
+					require.True(t, ok)
+					var br roachpb.BatchResponse
+					br.Txn = r.ba.Txn
+					br.Add(&roachpb.GetResponse{})
+					r.respCh <- resp{br: &br}
+				}
+				require.NoError(t, <-errCh)
+
+				// Now a refresh should be a no-op which is indicated by the fact that
+				// this call does not block to send requests.
+				require.NoError(t, txn.ManualRefresh(ctx))
+				require.NoError(t, txn.Commit(ctx))
+			},
+		},
+		{
+			name: "refresh occurs due to read",
+			run: func(
+				ctx context.Context, t *testing.T, db *kv.DB,
+				clock *hlc.ManualClock, reqCh <-chan req,
+			) {
+				txn := db.NewTxn(ctx, "test")
+				errCh := make(chan error)
+				go func() {
+					_, err := txn.Get(ctx, "foo")
+					errCh <- err
+				}()
+				{
+					r := <-reqCh
+					_, ok := r.ba.GetArg(roachpb.Get)
+					require.True(t, ok)
+					var br roachpb.BatchResponse
+					br.Txn = r.ba.Txn
+					br.Add(&roachpb.GetResponse{})
+					r.respCh <- resp{br: &br}
+				}
+				require.NoError(t, <-errCh)
+
+				go func() {
+					errCh <- txn.Put(ctx, "bar", "baz")
+				}()
+				{
+					r := <-reqCh
+					_, ok := r.ba.GetArg(roachpb.Put)
+					require.True(t, ok)
+					var br roachpb.BatchResponse
+					br.Txn = r.ba.Txn.Clone()
+					// Push the WriteTimestamp simulating an interaction with the
+					// timestamp cache.
+					br.Txn.WriteTimestamp =
+						br.Txn.WriteTimestamp.Add(time.Millisecond.Nanoseconds(), 0)
+					br.Add(&roachpb.PutResponse{})
+					r.respCh <- resp{br: &br}
+				}
+				require.NoError(t, <-errCh)
+
+				go func() {
+					errCh <- txn.ManualRefresh(ctx)
+				}()
+				{
+					r := <-reqCh
+					_, ok := r.ba.GetArg(roachpb.Refresh)
+					require.True(t, ok)
+					var br roachpb.BatchResponse
+					br.Txn = r.ba.Txn.Clone()
+					br.Add(&roachpb.RefreshResponse{})
+					r.respCh <- resp{br: &br}
+				}
+				require.NoError(t, <-errCh)
+
+				// Now a refresh should be a no-op which is indicated by the fact that
+				// this call does not block to send requests.
+				require.NoError(t, txn.ManualRefresh(ctx))
+			},
+		},
+	}
+	run := func(t *testing.T, tc testCase) {
+		stopper := stop.NewStopper()
+		manual := hlc.NewManualClock(123)
+		clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+		ctx := context.Background()
+		defer stopper.Stop(ctx)
+
+		reqCh := make(chan req)
+		var senderFn kv.SenderFunc = func(_ context.Context, ba roachpb.BatchRequest) (
+			*roachpb.BatchResponse, *roachpb.Error) {
+			r := req{
+				ba:     ba,
+				respCh: make(chan resp),
+			}
+			select {
+			case reqCh <- r:
+			case <-ctx.Done():
+				return nil, roachpb.NewError(ctx.Err())
+			}
+			select {
+			case rr := <-r.respCh:
+				return rr.br, rr.pErr
+			case <-ctx.Done():
+				return nil, roachpb.NewError(ctx.Err())
+			}
+		}
+		ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+		tsf := NewTxnCoordSenderFactory(
+			TxnCoordSenderFactoryConfig{
+				AmbientCtx:        ambient,
+				Clock:             clock,
+				Stopper:           stopper,
+				HeartbeatInterval: time.Hour,
+			},
+			senderFn,
+		)
+		db := kv.NewDB(ambient, tsf, clock, stopper)
+
+		cancelCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		tc.run(cancelCtx, t, db, manual, reqCh)
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run(t, tc)
+		})
+	}
 }

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -33,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -139,17 +141,17 @@ func (h *testHelper) createBackupSchedule(
 		var id int64
 		require.NoError(t, rows.Scan(&id, &unusedStr, &unusedStr, &unusedTS, &unusedStr, &unusedStr))
 		// Query system.scheduled_job table and load those schedules.
-		datums, cols, err := h.cfg.InternalExecutor.QueryWithCols(
+		datums, cols, err := h.cfg.InternalExecutor.QueryRowExWithCols(
 			context.Background(), "sched-load", nil,
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			"SELECT * FROM system.scheduled_jobs WHERE schedule_id = $1",
 			id,
 		)
 		require.NoError(t, err)
-		require.Equal(t, 1, len(datums))
+		require.NotNil(t, datums)
 
 		s := jobs.NewScheduledJob(h.env)
-		require.NoError(t, s.InitFromDatums(datums[0], cols))
+		require.NoError(t, s.InitFromDatums(datums, cols))
 		schedules = append(schedules, s)
 	}
 
@@ -179,6 +181,7 @@ func (t userType) String() string {
 // itself with the actual scheduling and the execution of those backups.
 func TestSerializesScheduledBackupExecutionArgs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderRaceWithIssue(t, 60718, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	th, cleanup := newTestHelper(t)
@@ -488,7 +491,7 @@ INSERT INTO t1 values (-1), (10), (-100);
 	}
 
 	expectedSystemTables := make([]string, 0)
-	for systemTableName := range getSystemTablesToIncludeInClusterBackup() {
+	for systemTableName := range backupbase.GetSystemTablesToIncludeInClusterBackup() {
 		expectedSystemTables = append(expectedSystemTables, systemTableName)
 	}
 

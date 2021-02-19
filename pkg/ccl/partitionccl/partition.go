@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -153,6 +154,7 @@ func createPartitioningImpl(
 	tableDesc *tabledesc.Mutable,
 	indexDesc *descpb.IndexDescriptor,
 	partBy *tree.PartitionBy,
+	allowedNewColumnNames []tree.Name,
 	numImplicitColumns int,
 	colOffset int,
 ) (descpb.PartitioningDescriptor, error) {
@@ -183,13 +185,13 @@ func createPartitioningImpl(
 		}
 		// Search by name because some callsites of this method have not
 		// allocated ids yet (so they are still all the 0 value).
-		name := indexDesc.ColumnNames[colOffset+i]
-		col, err := tableDesc.FindColumnWithName(tree.Name(name))
+		col, err := findColumnByNameOnTable(
+			tableDesc,
+			tree.Name(indexDesc.ColumnNames[colOffset+i]),
+			allowedNewColumnNames,
+		)
 		if err != nil {
 			return partDesc, err
-		}
-		if !col.Public() {
-			return partDesc, colinfo.NewUndefinedColumnError(name)
 		}
 		cols = append(cols, *col.ColumnDesc())
 		if string(partBy.Fields[i]) != col.GetName() {
@@ -223,7 +225,15 @@ func createPartitioningImpl(
 				)
 			}
 			subpartitioning, err := createPartitioningImpl(
-				ctx, evalCtx, tableDesc, indexDesc, l.Subpartition, 0 /* implicitColumnNames */, newColOffset)
+				ctx,
+				evalCtx,
+				tableDesc,
+				indexDesc,
+				l.Subpartition,
+				allowedNewColumnNames,
+				0, /* implicitColumnNames */
+				newColOffset,
+			)
 			if err != nil {
 				return partDesc, err
 			}
@@ -264,10 +274,8 @@ func detectImplicitPartitionColumns(
 	tableDesc *tabledesc.Mutable,
 	indexDesc descpb.IndexDescriptor,
 	partBy *tree.PartitionBy,
+	allowedNewColumnNames []tree.Name,
 ) (descpb.IndexDescriptor, int, error) {
-	if !evalCtx.SessionData.ImplicitColumnPartitioningEnabled {
-		return indexDesc, 0, nil
-	}
 	seenImplicitColumnNames := map[string]struct{}{}
 	var implicitColumnIDs []descpb.ColumnID
 	var implicitColumns []string
@@ -280,12 +288,13 @@ func detectImplicitPartitionColumns(
 			break
 		}
 
-		col, err := tableDesc.FindColumnWithName(field)
+		col, err := findColumnByNameOnTable(
+			tableDesc,
+			field,
+			allowedNewColumnNames,
+		)
 		if err != nil {
 			return indexDesc, 0, err
-		}
-		if !col.Public() {
-			return indexDesc, 0, colinfo.NewUndefinedColumnError(string(field))
 		}
 		if _, ok := seenImplicitColumnNames[col.GetName()]; ok {
 			return indexDesc, 0, pgerror.Newf(
@@ -308,6 +317,29 @@ func detectImplicitPartitionColumns(
 	return indexDesc, len(implicitColumns), nil
 }
 
+// findColumnByNameOnTable finds the given column from the table.
+// By default we only allow public columns on PARTITION BY clauses.
+// However, any columns appearing as allowedNewColumnNames is also
+// permitted provided the caller will ensure this column is backfilled
+// before the partitioning is active.
+func findColumnByNameOnTable(
+	tableDesc *tabledesc.Mutable, col tree.Name, allowedNewColumnNames []tree.Name,
+) (catalog.Column, error) {
+	ret, err := tableDesc.FindColumnWithName(col)
+	if err != nil {
+		return nil, err
+	}
+	if ret.Public() {
+		return ret, nil
+	}
+	for _, allowedNewColName := range allowedNewColumnNames {
+		if allowedNewColName == col {
+			return ret, nil
+		}
+	}
+	return nil, colinfo.NewUndefinedColumnError(string(col))
+}
+
 // createPartitioning constructs the partitioning descriptor for an index that
 // is partitioned into ranges, each addressable by zone configs.
 func createPartitioning(
@@ -317,17 +349,59 @@ func createPartitioning(
 	tableDesc *tabledesc.Mutable,
 	indexDesc descpb.IndexDescriptor,
 	partBy *tree.PartitionBy,
+	allowedNewColumnNames []tree.Name,
+	allowImplicitPartitioning bool,
 ) (descpb.IndexDescriptor, error) {
 	org := sql.ClusterOrganization.Get(&st.SV)
 	if err := utilccl.CheckEnterpriseEnabled(st, evalCtx.ClusterID, org, "partitions"); err != nil {
 		return indexDesc, err
 	}
 
+	// Truncate existing implicitly partitioned columns.
+	oldNumImplicitColumns := int(indexDesc.Partitioning.NumImplicitColumns)
+	oldImplicitColumnIDs := indexDesc.ColumnIDs[:oldNumImplicitColumns]
+
+	indexDesc.ColumnIDs = indexDesc.ColumnIDs[oldNumImplicitColumns:]
+	indexDesc.ColumnNames = indexDesc.ColumnNames[oldNumImplicitColumns:]
+	indexDesc.ColumnDirections = indexDesc.ColumnDirections[oldNumImplicitColumns:]
+
 	var numImplicitColumns int
 	var err error
-	indexDesc, numImplicitColumns, err = detectImplicitPartitionColumns(evalCtx, tableDesc, indexDesc, partBy)
-	if err != nil {
-		return indexDesc, err
+	if allowImplicitPartitioning {
+		indexDesc, numImplicitColumns, err = detectImplicitPartitionColumns(
+			evalCtx,
+			tableDesc,
+			indexDesc,
+			partBy,
+			allowedNewColumnNames,
+		)
+		if err != nil {
+			return indexDesc, err
+		}
+		if numImplicitColumns > 0 {
+			if err := checkClusterSupportsImplicitPartitioning(evalCtx); err != nil {
+				return indexDesc, err
+			}
+		}
+	}
+
+	// If we had implicit column partitioning beforehand, check we have the
+	// same implicitly partitioned columns.
+	// Having different implicitly partitioned columns requires rewrites,
+	// which is outside the scope of createPartitioning.
+	if oldNumImplicitColumns > 0 {
+		if numImplicitColumns != oldNumImplicitColumns {
+			return indexDesc, errors.AssertionFailedf(
+				"mismatching number of implicit columns: old %d vs new %d",
+				oldNumImplicitColumns,
+				numImplicitColumns,
+			)
+		}
+		for i, oldColID := range oldImplicitColumnIDs {
+			if oldColID != indexDesc.ColumnIDs[i] {
+				return indexDesc, errors.AssertionFailedf("found new implicit partitioning at index %d", i)
+			}
+		}
 	}
 
 	partitioning, err := createPartitioningImpl(
@@ -336,6 +410,7 @@ func createPartitioning(
 		tableDesc,
 		&indexDesc,
 		partBy,
+		allowedNewColumnNames,
 		numImplicitColumns,
 		0, /* colOffset */
 	)
@@ -554,4 +629,14 @@ func selectPartitionExprsByName(
 
 func init() {
 	sql.CreatePartitioningCCL = createPartitioning
+}
+
+func checkClusterSupportsImplicitPartitioning(evalCtx *tree.EvalContext) error {
+	if !evalCtx.Settings.Version.IsActive(evalCtx.Context, clusterversion.MultiRegionFeatures) {
+		return pgerror.Newf(
+			pgcode.ObjectNotInPrerequisiteState,
+			`cannot use implicit column partitioning until the cluster upgrade is finalized`,
+		)
+	}
+	return nil
 }

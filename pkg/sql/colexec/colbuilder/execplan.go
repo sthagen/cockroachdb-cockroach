@@ -270,12 +270,9 @@ var (
 	errChangeAggregatorWrap           = errors.New("core.ChangeAggregator is not supported")
 	errChangeFrontierWrap             = errors.New("core.ChangeFrontier is not supported")
 	errBackfillerWrap                 = errors.New("core.Backfiller is not supported (not an execinfra.RowSource)")
-	errReadImportWrap                 = errors.New("core.ReadImport is not supported (not an execinfra.RowSource)")
 	errCSVWriterWrap                  = errors.New("core.CSVWriter is not supported (not an execinfra.RowSource)")
 	errSamplerWrap                    = errors.New("core.Sampler is not supported (not an execinfra.RowSource)")
 	errSampleAggregatorWrap           = errors.New("core.SampleAggregator is not supported (not an execinfra.RowSource)")
-	errBackupDataWrap                 = errors.New("core.BackupData is not supported (not an execinfra.RowSource)")
-	errSplitAndScatterWrap            = errors.New("core.SplitAndScatter is not supported (not an execinfra.RowSource)")
 	errExperimentalWrappingProhibited = errors.New("wrapping for non-JoinReader and non-LocalPlanNode cores is prohibited in vectorize=experimental_always")
 )
 
@@ -286,7 +283,6 @@ func canWrap(mode sessiondatapb.VectorizeExecMode, spec *execinfrapb.ProcessorSp
 	switch {
 	case spec.Core.Noop != nil:
 	case spec.Core.TableReader != nil:
-	case spec.Core.Filterer != nil:
 	case spec.Core.JoinReader != nil:
 	case spec.Core.Sorter != nil:
 	case spec.Core.Aggregator != nil:
@@ -297,7 +293,6 @@ func canWrap(mode sessiondatapb.VectorizeExecMode, spec *execinfrapb.ProcessorSp
 	case spec.Core.Backfiller != nil:
 		return errBackfillerWrap
 	case spec.Core.ReadImport != nil:
-		return errReadImportWrap
 	case spec.Core.CSVWriter != nil:
 		return errCSVWriterWrap
 	case spec.Core.Sampler != nil:
@@ -331,10 +326,11 @@ func canWrap(mode sessiondatapb.VectorizeExecMode, spec *execinfrapb.ProcessorSp
 	case spec.Core.InvertedFilterer != nil:
 	case spec.Core.InvertedJoiner != nil:
 	case spec.Core.BackupData != nil:
-		return errBackupDataWrap
 	case spec.Core.SplitAndScatter != nil:
-		return errSplitAndScatterWrap
 	case spec.Core.RestoreData != nil:
+	case spec.Core.Filterer != nil:
+	case spec.Core.StreamIngestionData != nil:
+	case spec.Core.StreamIngestionFrontier != nil:
 	default:
 		return errors.AssertionFailedf("unexpected processor core %q", spec.Core)
 	}
@@ -448,26 +444,30 @@ func (r opResult) createDiskBackedSort(
 		sorterMemMonitorName,
 		func(input colexecbase.Operator) colexecbase.Operator {
 			monitorNamePrefix := fmt.Sprintf("%sexternal-sorter", memMonitorNamePrefix)
-			// We are using an unlimited memory monitor here because external
+			// We are using unlimited memory monitors here because external
 			// sort itself is responsible for making sure that we stay within
 			// the memory limit.
-			unlimitedAllocator := colmem.NewAllocator(
+			sortUnlimitedAllocator := colmem.NewAllocator(
 				ctx, r.createBufferingUnlimitedMemAccount(
-					ctx, flowCtx, monitorNamePrefix,
+					ctx, flowCtx, monitorNamePrefix+"-sort",
 				), factory)
-			standaloneMemAccount := r.createStandaloneMemAccount(
-				ctx, flowCtx, monitorNamePrefix,
-			)
+			mergeUnlimitedAllocator := colmem.NewAllocator(
+				ctx, r.createBufferingUnlimitedMemAccount(
+					ctx, flowCtx, monitorNamePrefix+"-merge",
+				), factory)
+			outputUnlimitedAllocator := colmem.NewAllocator(
+				ctx, r.createBufferingUnlimitedMemAccount(
+					ctx, flowCtx, monitorNamePrefix+"-output",
+				), factory)
 			diskAccount := r.createDiskAccount(ctx, flowCtx, monitorNamePrefix)
-			if args.TestingKnobs.NumForcedRepartitions != 0 {
-				maxNumberPartitions = args.TestingKnobs.NumForcedRepartitions
-			}
 			es := colexec.NewExternalSorter(
-				unlimitedAllocator,
-				standaloneMemAccount,
+				sortUnlimitedAllocator,
+				mergeUnlimitedAllocator,
+				outputUnlimitedAllocator,
 				input, inputTypes, ordering,
 				execinfra.GetWorkMemLimit(flowCtx.Cfg),
 				maxNumberPartitions,
+				args.TestingKnobs.NumForcedRepartitions,
 				args.TestingKnobs.DelegateFDAcquisitions,
 				args.DiskQueueCfg,
 				args.FDSemaphore,
@@ -737,6 +737,7 @@ func NewColOperator(
 			// cancellation check on their own while performing long operations.
 			result.Op = colexec.NewCancelChecker(result.Op)
 			result.ColumnTypes = scanOp.ResultTypes
+			result.ToClose = append(result.ToClose, scanOp)
 
 		case core.Filterer != nil:
 			if err := checkNumIn(inputs, 1); err != nil {
@@ -962,6 +963,7 @@ func NewColOperator(
 			rightTypes := make([]*types.T, len(spec.Input[1].ColumnTypes))
 			copy(rightTypes, spec.Input[1].ColumnTypes)
 
+			memoryLimit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
 			if len(core.HashJoiner.LeftEqColumns) == 0 {
 				// We are performing a cross-join, so we need to plan a
 				// specialized operator.
@@ -969,13 +971,6 @@ func NewColOperator(
 				crossJoinerMemAccount := result.createBufferingUnlimitedMemAccount(ctx, flowCtx, crossJoinerMemMonitorName)
 				crossJoinerDiskAcc := result.createDiskAccount(ctx, flowCtx, crossJoinerMemMonitorName)
 				unlimitedAllocator := colmem.NewAllocator(ctx, crossJoinerMemAccount, factory)
-				// TODO(yuzefovich): audit all usages of GetWorkMemLimit to see
-				// whether we should be paying attention to ForceDiskSpill knob
-				// there too.
-				memoryLimit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
-				if flowCtx.Cfg.TestingKnobs.ForceDiskSpill {
-					memoryLimit = 1
-				}
 				result.Op = colexec.NewCrossJoiner(
 					unlimitedAllocator,
 					memoryLimit,
@@ -1014,7 +1009,7 @@ func NewColOperator(
 				inMemoryHashJoiner := colexec.NewHashJoiner(
 					colmem.NewAllocator(ctx, hashJoinerMemAccount, factory),
 					hashJoinerUnlimitedAllocator, hjSpec, inputs[0], inputs[1],
-					colexec.HashJoinerInitialNumBuckets,
+					colexec.HashJoinerInitialNumBuckets, memoryLimit,
 				)
 				if args.TestingKnobs.DiskSpillingDisabled {
 					// We will not be creating a disk-backed hash joiner because
@@ -1514,31 +1509,6 @@ func (r opResult) createBufferingUnlimitedMemAccount(
 	bufferingMemAccount := bufferingOpUnlimitedMemMonitor.MakeBoundAccount()
 	r.OpAccounts = append(r.OpAccounts, &bufferingMemAccount)
 	return &bufferingMemAccount
-}
-
-// createStandaloneMemAccount instantiates an unlimited memory monitor and a
-// memory account that have a standalone budget. This means that the memory
-// registered with these objects is *not* reported to the root monitor (i.e.
-// it will not count towards max-sql-memory). Use it only when the memory in
-// use is accounted for with a different memory monitor. The receiver is
-// updated to have references to both objects.
-func (r opResult) createStandaloneMemAccount(
-	ctx context.Context, flowCtx *execinfra.FlowCtx, name string,
-) *mon.BoundAccount {
-	standaloneMemMonitor := mon.NewMonitor(
-		name+"-standalone",
-		mon.MemoryResource,
-		nil,           /* curCount */
-		nil,           /* maxHist */
-		-1,            /* increment: use default increment */
-		math.MaxInt64, /* noteworthy */
-		flowCtx.Cfg.Settings,
-	)
-	r.OpMonitors = append(r.OpMonitors, standaloneMemMonitor)
-	standaloneMemMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
-	standaloneMemAccount := standaloneMemMonitor.MakeBoundAccount()
-	r.OpAccounts = append(r.OpAccounts, &standaloneMemAccount)
-	return &standaloneMemAccount
 }
 
 // createDiskAccount instantiates an unlimited disk monitor and a disk account

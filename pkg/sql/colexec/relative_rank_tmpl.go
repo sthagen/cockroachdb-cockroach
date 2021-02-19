@@ -64,7 +64,7 @@ func NewRelativeRankOperator(
 	}
 	rrInitFields := relativeRankInitFields{
 		rankInitFields: rankInitFields{
-			OneInputNode:    NewOneInputNode(input),
+			OneInputNode:    colexecbase.NewOneInputNode(input),
 			allocator:       unlimitedAllocator,
 			outputColIdx:    outputColIdx,
 			partitionColIdx: partitionColIdx,
@@ -99,6 +99,14 @@ func NewRelativeRankOperator(
 		return nil, errors.Errorf("unsupported relative rank type %s", windowFn)
 	}
 }
+
+// relativeRankNumRequiredFDs is the minimum number of file descriptors that
+// might be needed for the machinery of the relative rank operators: the maximum
+// number is needed when CUME_DIST function with either PARTITION BY or ORDER BY
+// clause (or both) is used - we need 3 FDs for each of the spilling queues used
+// by the operator directly plus we use an external sort to handle PARTITION BY
+// and/or ORDER BY clauses.
+const relativeRankNumRequiredFDs = 3 + ExternalSorterMinPartitions
 
 // NOTE: in the context of window functions "partitions" mean a different thing
 // from "partition" in the context of external algorithms and some disk
@@ -268,7 +276,7 @@ type _RELATIVE_RANK_STRINGOp struct {
 var _ closableOperator = &_RELATIVE_RANK_STRINGOp{}
 
 func (r *_RELATIVE_RANK_STRINGOp) Init() {
-	r.Input().Init()
+	r.Input.Init()
 	r.state = relativeRankBuffering
 	usedMemoryLimitFraction := 0.0
 	// {{if .HasPartition}}
@@ -355,7 +363,7 @@ func (r *_RELATIVE_RANK_STRINGOp) Next(ctx context.Context) coldata.Batch {
 			// This example also shows why we need to use two different queues
 			// (since every partition can have multiple peer groups, the
 			// schedule of "flushing" is different).
-			batch := r.Input().Next(ctx)
+			batch := r.Input.Next(ctx)
 			n := batch.Length()
 			if n == 0 {
 				if err := r.bufferedTuples.enqueue(ctx, coldata.ZeroBatch); err != nil {

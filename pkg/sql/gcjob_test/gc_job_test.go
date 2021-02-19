@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -44,6 +45,7 @@ import (
 // TODO(pbardea): Add more testing around the timer calculations.
 func TestSchemaChangeGCJob(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 60664, "flaky test")
 	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	type DropItem int
@@ -62,7 +64,15 @@ func TestSchemaChangeGCJob(t *testing.T) {
 
 	for _, dropItem := range []DropItem{INDEX, TABLE, DATABASE} {
 		for _, ttlTime := range []TTLTime{PAST, SOON, FUTURE} {
-			s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+			params := base.TestServerArgs{}
+			blockGC := make(chan struct{}, 1)
+			params.Knobs.GCJob = &sql.GCJobTestingKnobs{
+				RunBeforePerformGC: func(_ int64) error {
+					<-blockGC
+					return nil
+				},
+			}
+			s, db, kvDB := serverutils.StartServer(t, params)
 			ctx := context.Background()
 			defer s.Stopper().Stop(ctx)
 			sqlDB := sqlutils.MakeSQLRunner(db)
@@ -107,6 +117,7 @@ func TestSchemaChangeGCJob(t *testing.T) {
 				dropTime = 1
 			}
 			var details jobspb.SchemaChangeGCDetails
+			var expectedRunningStatus string
 			switch dropItem {
 			case INDEX:
 				details = jobspb.SchemaChangeGCDetails{
@@ -122,6 +133,7 @@ func TestSchemaChangeGCJob(t *testing.T) {
 				myTableDesc.GCMutations = append(myTableDesc.GCMutations, descpb.TableDescriptor_GCDescriptorMutation{
 					IndexID: descpb.IndexID(2),
 				})
+				expectedRunningStatus = "performing garbage collection on index 2"
 			case TABLE:
 				details = jobspb.SchemaChangeGCDetails{
 					Tables: []jobspb.SchemaChangeGCDetails_DroppedID{
@@ -133,6 +145,7 @@ func TestSchemaChangeGCJob(t *testing.T) {
 				}
 				myTableDesc.State = descpb.DescriptorState_DROP
 				myTableDesc.DropTime = dropTime
+				expectedRunningStatus = fmt.Sprintf("performing garbage collection on table %d", myTableID)
 			case DATABASE:
 				details = jobspb.SchemaChangeGCDetails{
 					Tables: []jobspb.SchemaChangeGCDetails_DroppedID{
@@ -151,6 +164,7 @@ func TestSchemaChangeGCJob(t *testing.T) {
 				myTableDesc.DropTime = dropTime
 				myOtherTableDesc.State = descpb.DescriptorState_DROP
 				myOtherTableDesc.DropTime = dropTime
+				expectedRunningStatus = fmt.Sprintf("performing garbage collection on tables %d, %d", myTableID, myOtherTableID)
 			}
 
 			if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -195,6 +209,15 @@ func TestSchemaChangeGCJob(t *testing.T) {
 			if err := jobutils.VerifyRunningSystemJob(t, sqlDB, 0, jobspb.TypeSchemaChangeGC, sql.RunningStatusWaitingGC, lookupJR); err != nil {
 				t.Fatal(err)
 			}
+
+			if ttlTime != FUTURE {
+				// Check that the job eventually blocks right before performing GC, due to the testing knob.
+				sqlDB.CheckQueryResultsRetry(
+					t,
+					fmt.Sprintf("SELECT status, running_status FROM [SHOW JOBS] WHERE job_id = %s", jobIDStr),
+					[][]string{{"running", expectedRunningStatus}})
+			}
+			blockGC <- struct{}{}
 
 			if ttlTime == FUTURE {
 				time.Sleep(500 * time.Millisecond)
@@ -349,7 +372,7 @@ func TestGCResumer(t *testing.T) {
 		require.NoError(t, sj.AwaitCompletion(ctx))
 		job, err := jobRegistry.LoadJob(ctx, *sj.ID())
 		require.NoError(t, err)
-		st, err := job.CurrentStatus(ctx)
+		st, err := job.CurrentStatus(ctx, nil /* txn */)
 		require.NoError(t, err)
 		require.Equal(t, jobs.StatusSucceeded, st)
 		_, err = sql.GetTenantRecord(ctx, &execCfg, nil /* txn */, tenID)
@@ -380,7 +403,7 @@ func TestGCResumer(t *testing.T) {
 
 		job, err := jobRegistry.LoadJob(ctx, *sj.ID())
 		require.NoError(t, err)
-		st, err := job.CurrentStatus(ctx)
+		st, err := job.CurrentStatus(ctx, nil /* txn */)
 		require.NoError(t, err)
 		require.Equal(t, jobs.StatusSucceeded, st)
 		_, err = sql.GetTenantRecord(ctx, &execCfg, nil /* txn */, tenID)

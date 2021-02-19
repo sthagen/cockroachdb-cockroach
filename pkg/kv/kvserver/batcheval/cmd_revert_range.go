@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/errors"
 )
 
 func init() {
@@ -58,6 +57,8 @@ func isEmptyKeyTimeRange(
 	return !ok, err
 }
 
+const maxRevertRangeBatchBytes = 32 << 20
+
 // RevertRange wipes all MVCC versions more recent than TargetTime (up to the
 // command timestamp) of the keys covered by the specified span, adjusting the
 // MVCC stats accordingly.
@@ -68,7 +69,7 @@ func RevertRange(
 	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	if cArgs.Header.Txn != nil {
-		return result.Result{}, errors.New("cannot execute RevertRange within a transaction")
+		return result.Result{}, ErrTransactionUnsupported
 	}
 	log.VEventf(ctx, 2, "RevertRange %+v", cArgs.Args)
 
@@ -89,6 +90,7 @@ func RevertRange(
 
 	resume, err := storage.MVCCClearTimeRange(ctx, readWriter, cArgs.Stats, args.Key, args.EndKey,
 		args.TargetTime, cArgs.Header.Timestamp, cArgs.Header.MaxSpanRequestKeys,
+		maxRevertRangeBatchBytes,
 		args.EnableTimeBoundIteratorOptimization)
 	if err != nil {
 		return result.Result{}, err

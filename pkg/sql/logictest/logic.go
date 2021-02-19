@@ -39,7 +39,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/migration/migrationmanager"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -463,7 +465,8 @@ type testClusterConfig struct {
 	isCCLConfig bool
 	// localities is set if nodes should be set to a particular locality.
 	// Nodes are 1-indexed.
-	localities map[int]roachpb.Locality
+	localities          map[int]roachpb.Locality
+	pretend59315IsFixed bool
 }
 
 const threeNodeTenantConfigName = "3node-tenant"
@@ -498,12 +501,12 @@ var logicTestConfigs = []testClusterConfig{
 		disableUpgrade:      true,
 	},
 	{
-		name:                "local-mixed-20.1-20.2",
+		name:                "local-mixed-20.2-21.1",
 		numNodes:            1,
 		overrideDistSQLMode: "off",
 		overrideAutoStats:   "false",
-		bootstrapVersion:    roachpb.Version{Major: 20, Minor: 1},
-		binaryVersion:       roachpb.Version{Major: 20, Minor: 2},
+		bootstrapVersion:    roachpb.Version{Major: 20, Minor: 2},
+		binaryVersion:       roachpb.Version{Major: 21, Minor: 1},
 		disableUpgrade:      true,
 	},
 	{
@@ -559,6 +562,13 @@ var logicTestConfigs = []testClusterConfig{
 		numNodes:            5,
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
+	},
+	{
+		name:                "5node-pretend59315IsFixed",
+		numNodes:            5,
+		overrideDistSQLMode: "on",
+		overrideAutoStats:   "false",
+		pretend59315IsFixed: true,
 	},
 	{
 		name:                       "5node-metadata",
@@ -1330,6 +1340,7 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 				},
 				SQLExecutor: &sql.ExecutorTestingKnobs{
 					DeterministicExplainAnalyze: true,
+					Pretend59315IsFixed:         t.cfg.pretend59315IsFixed,
 				},
 			},
 			ClusterName:   "testclustername",
@@ -1342,7 +1353,6 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 
 	distSQLKnobs := &execinfra.TestingKnobs{
 		MetadataTestLevel:                    execinfra.Off,
-		GenerateMockContentionEvents:         true,
 		CheckVectorizedFlowIsClosedCorrectly: true,
 	}
 	cfg := t.cfg
@@ -1397,6 +1407,23 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 				binaryMinSupportedVersion,
 				false, /* initializeVersion */
 			)
+
+			// If we're injecting fake versions, hook up logic to simulate the end
+			// version existing.
+			from := clusterversion.ClusterVersion{Version: cfg.bootstrapVersion}
+			to := clusterversion.ClusterVersion{Version: cfg.binaryVersion}
+			if len(clusterversion.ListBetween(from, to)) == 0 {
+				mm, ok := nodeParams.Knobs.MigrationManager.(*migrationmanager.TestingKnobs)
+				if !ok {
+					mm = &migrationmanager.TestingKnobs{}
+					nodeParams.Knobs.MigrationManager = mm
+				}
+				mm.ListBetweenOverride = func(
+					from, to clusterversion.ClusterVersion,
+				) []clusterversion.ClusterVersion {
+					return []clusterversion.ClusterVersion{to}
+				}
+			}
 		}
 		paramsPerNode[i] = nodeParams
 	}

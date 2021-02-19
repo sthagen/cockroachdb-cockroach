@@ -36,6 +36,9 @@ type Operator interface {
 	// Init() doesn't succeed for bufferingInMemoryOperator - which should only
 	// happen when 'workmem' setting is too low - just bail, even if we have
 	// disk spilling for that operator.
+	// TODO(yuzefovich): we probably should move ctx argument from Next into
+	// Init, the operator will then capture the context and use it (or the one
+	// derived from it) in Next and DrainMeta (when applicable) calls.
 	Init()
 
 	// Next returns the next Batch from this operator. Once the operator is
@@ -71,6 +74,31 @@ func (ZeroInputNode) ChildCount(verbose bool) int {
 
 // Child implements the execinfra.OpNode interface.
 func (ZeroInputNode) Child(nth int, verbose bool) execinfra.OpNode {
+	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
+	// This code is unreachable, but the compiler cannot infer that.
+	return nil
+}
+
+// NewOneInputNode returns an execinfra.OpNode with a single Operator input.
+func NewOneInputNode(input Operator) OneInputNode {
+	return OneInputNode{Input: input}
+}
+
+// OneInputNode is an execinfra.OpNode with a single Operator input.
+type OneInputNode struct {
+	Input Operator
+}
+
+// ChildCount implements the execinfra.OpNode interface.
+func (OneInputNode) ChildCount(verbose bool) int {
+	return 1
+}
+
+// Child implements the execinfra.OpNode interface.
+func (n OneInputNode) Child(nth int, verbose bool) execinfra.OpNode {
+	if nth == 0 {
+		return n.Input
+	}
 	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
@@ -128,4 +156,17 @@ func (c Closers) Close(ctx context.Context) error {
 		}
 	}
 	return lastErr
+}
+
+// Resetter is an interface that operators can implement if they can be reset
+// either for reusing (to keep the already allocated memory) or during tests.
+type Resetter interface {
+	// Reset resets the operator for reuse.
+	Reset(ctx context.Context)
+}
+
+// ResettableOperator is an Operator that can be reset.
+type ResettableOperator interface {
+	Operator
+	Resetter
 }

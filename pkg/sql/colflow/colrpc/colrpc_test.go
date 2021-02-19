@@ -173,7 +173,8 @@ func TestOutboxInbox(t *testing.T) {
 	require.NoError(t, err)
 	if cancellationScenario != transportBreaks {
 		defer func() {
-			require.NoError(t, conn.Close())
+			err := conn.Close() // nolint:grpcconnclose
+			require.NoError(t, err)
 		}()
 	}
 
@@ -257,7 +258,8 @@ func TestOutboxInbox(t *testing.T) {
 			case readerCtxCancel:
 				readerCancelFn()
 			case transportBreaks:
-				_ = conn.Close()
+				err := conn.Close() // nolint:grpcconnclose
+				require.NoError(t, err)
 			}
 			wg.Done()
 		}()
@@ -388,7 +390,10 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 
 	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
 	require.NoError(t, err)
-	defer func() { require.NoError(t, conn.Close()) }()
+	defer func() {
+		err := conn.Close() // nolint:grpcconnclose
+		require.NoError(t, err)
+	}()
 
 	rng, _ := randutil.NewPseudoRand()
 	// numNextsBeforeDrain is used in ExplicitDrainRequest. This number is
@@ -551,7 +556,10 @@ func BenchmarkOutboxInbox(b *testing.B) {
 
 	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
 	require.NoError(b, err)
-	defer func() { require.NoError(b, conn.Close()) }()
+	defer func() {
+		err := conn.Close() // nolint:grpcconnclose
+		require.NoError(b, err)
+	}()
 
 	client := execinfrapb.NewDistSQLClient(conn)
 	clientStream, err := client.FlowStream(ctx)
@@ -624,7 +632,6 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 	nextDone := make(chan struct{})
 	input := &colexecbase.CallbackOperator{NextCb: func(ctx context.Context) coldata.Batch {
 		b := testAllocator.NewMemBatchWithFixedCapacity(typs, 0)
-		b.SetLength(0)
 		inTags = logtags.FromContext(ctx)
 		nextDone <- struct{}{}
 		return b

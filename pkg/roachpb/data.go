@@ -884,10 +884,10 @@ func MakeTransaction(
 	name string, baseKey Key, userPriority UserPriority, now hlc.Timestamp, maxOffsetNs int64,
 ) Transaction {
 	u := uuid.FastMakeV4()
-	// TODO(nvanbenschoten): technically, maxTS should be a synthetic timestamp.
+	// TODO(nvanbenschoten): technically, gul should be a synthetic timestamp.
 	// Make this change in v21.2 when all nodes in a cluster are guaranteed to
 	// be aware of synthetic timestamps by addressing the TODO in Timestamp.Add.
-	maxTS := now.Add(maxOffsetNs, 0)
+	gul := now.Add(maxOffsetNs, 0)
 
 	return Transaction{
 		TxnMeta: enginepb.TxnMeta{
@@ -898,10 +898,10 @@ func MakeTransaction(
 			Priority:       MakePriority(userPriority),
 			Sequence:       0, // 1-indexed, incremented before each Request
 		},
-		Name:          name,
-		LastHeartbeat: now,
-		ReadTimestamp: now,
-		MaxTimestamp:  maxTS,
+		Name:                   name,
+		LastHeartbeat:          now,
+		ReadTimestamp:          now,
+		GlobalUncertaintyLimit: gul,
 	}
 }
 
@@ -909,11 +909,44 @@ func MakeTransaction(
 // occurred, i.e. the maximum of ReadTimestamp and LastHeartbeat.
 func (t Transaction) LastActive() hlc.Timestamp {
 	ts := t.LastHeartbeat
-	// Only forward by the ReadTimestamp if it is a clock timestamp.
-	// TODO(nvanbenschoten): replace this with look at the Synthetic bool.
-	if readTS, ok := t.ReadTimestamp.TryToClockTimestamp(); ok {
-		ts.Forward(readTS.ToTimestamp())
+	if !t.ReadTimestamp.Synthetic {
+		ts.Forward(t.ReadTimestamp)
 	}
+	return ts
+}
+
+// RequiredFrontier returns the largest timestamp at which the transaction may
+// read values when performing a read-only operation. This is the maximum of the
+// transaction's read timestamp, its write timestamp, and its global uncertainty
+// limit.
+func (t *Transaction) RequiredFrontier() hlc.Timestamp {
+	// A transaction can observe committed values up to its read timestamp.
+	ts := t.ReadTimestamp
+	// Forward to the transaction's write timestamp. The transaction will read
+	// committed values at its read timestamp but may perform reads up to its
+	// intent timestamps if the transaction is reading its own intent writes,
+	// which we know to all be at timestamps <= its current write timestamp. See
+	// the ownIntent cases in pebbleMVCCScanner.getAndAdvance for more.
+	//
+	// There is a case where an intent written by a transaction is above the
+	// transaction's write timestamp — after a successful intent push. Such
+	// cases do allow a transaction to read values above its required frontier.
+	// However, this is fine for the purposes of follower reads because an
+	// intent that was pushed to a higher timestamp must have at some point been
+	// stored with its original write timestamp. The means that a follower with
+	// a closed timestamp above the original write timestamp but below the new
+	// pushed timestamp will either store the pre-pushed intent or the
+	// post-pushed intent, depending on whether replication of the push has
+	// completed yet. Either way, the intent will exist in some form on the
+	// follower, so either way, the transaction will be able to read its own
+	// write.
+	ts.Forward(t.WriteTimestamp)
+	// Forward to the transaction's global uncertainty limit, because the
+	// transaction may observe committed writes from other transactions up to
+	// this time and consider them to be "uncertain". When a transaction begins,
+	// this will be above its read timestamp, but the read timestamp can surpass
+	// the global uncertainty limit due to refreshes or retries.
+	ts.Forward(t.GlobalUncertaintyLimit)
 	return ts
 }
 
@@ -1151,7 +1184,7 @@ func (t *Transaction) Update(o *Transaction) {
 	// Forward each of the transaction timestamps.
 	t.WriteTimestamp.Forward(o.WriteTimestamp)
 	t.LastHeartbeat.Forward(o.LastHeartbeat)
-	t.MaxTimestamp.Forward(o.MaxTimestamp)
+	t.GlobalUncertaintyLimit.Forward(o.GlobalUncertaintyLimit)
 	t.ReadTimestamp.Forward(o.ReadTimestamp)
 
 	// On update, set lower bound timestamps to the minimum seen by either txn.
@@ -1205,8 +1238,8 @@ func (t Transaction) String() string {
 	if len(t.Name) > 0 {
 		fmt.Fprintf(&buf, "%q ", t.Name)
 	}
-	fmt.Fprintf(&buf, "meta={%s} lock=%t stat=%s rts=%s wto=%t max=%s",
-		t.TxnMeta, t.IsLocking(), t.Status, t.ReadTimestamp, t.WriteTooOld, t.MaxTimestamp)
+	fmt.Fprintf(&buf, "meta={%s} lock=%t stat=%s rts=%s wto=%t gul=%s",
+		t.TxnMeta, t.IsLocking(), t.Status, t.ReadTimestamp, t.WriteTooOld, t.GlobalUncertaintyLimit)
 	if ni := len(t.LockSpans); t.Status != PENDING && ni > 0 {
 		fmt.Fprintf(&buf, " int=%d", ni)
 	}
@@ -1228,8 +1261,8 @@ func (t Transaction) SafeMessage() string {
 	if len(t.Name) > 0 {
 		fmt.Fprintf(&buf, "%q ", t.Name)
 	}
-	fmt.Fprintf(&buf, "meta={%s} lock=%t stat=%s rts=%s wto=%t max=%s",
-		t.TxnMeta.SafeMessage(), t.IsLocking(), t.Status, t.ReadTimestamp, t.WriteTooOld, t.MaxTimestamp)
+	fmt.Fprintf(&buf, "meta={%s} lock=%t stat=%s rts=%s wto=%t gul=%s",
+		t.TxnMeta.SafeMessage(), t.IsLocking(), t.Status, t.ReadTimestamp, t.WriteTooOld, t.GlobalUncertaintyLimit)
 	if ni := len(t.LockSpans); t.Status != PENDING && ni > 0 {
 		fmt.Fprintf(&buf, " int=%d", ni)
 	}
@@ -1251,26 +1284,27 @@ func (t *Transaction) ResetObservedTimestamps() {
 // UpdateObservedTimestamp stores a timestamp off a node's clock for future
 // operations in the transaction. When multiple calls are made for a single
 // nodeID, the lowest timestamp prevails.
-func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS hlc.ClockTimestamp) {
+func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, timestamp hlc.ClockTimestamp) {
 	// Fast path optimization for either no observed timestamps or
 	// exactly one, for the same nodeID as we're updating.
 	if l := len(t.ObservedTimestamps); l == 0 {
-		t.ObservedTimestamps = []ObservedTimestamp{{NodeID: nodeID, Timestamp: maxTS}}
+		t.ObservedTimestamps = []ObservedTimestamp{{NodeID: nodeID, Timestamp: timestamp}}
 		return
 	} else if l == 1 && t.ObservedTimestamps[0].NodeID == nodeID {
-		if maxTS.Less(t.ObservedTimestamps[0].Timestamp) {
-			t.ObservedTimestamps = []ObservedTimestamp{{NodeID: nodeID, Timestamp: maxTS}}
+		if timestamp.Less(t.ObservedTimestamps[0].Timestamp) {
+			t.ObservedTimestamps = []ObservedTimestamp{{NodeID: nodeID, Timestamp: timestamp}}
 		}
 		return
 	}
 	s := observedTimestampSlice(t.ObservedTimestamps)
-	t.ObservedTimestamps = s.update(nodeID, maxTS)
+	t.ObservedTimestamps = s.update(nodeID, timestamp)
 }
 
-// GetObservedTimestamp returns the lowest HLC timestamp recorded from the
-// given node's clock during the transaction. The returned boolean is false if
-// no observation about the requested node was found. Otherwise, MaxTimestamp
-// can be lowered to the returned timestamp when reading from nodeID.
+// GetObservedTimestamp returns the lowest HLC timestamp recorded from the given
+// node's clock during the transaction. The returned boolean is false if no
+// observation about the requested node was found. Otherwise, the transaction's
+// uncertainty limit can be lowered to the returned timestamp when reading from
+// nodeID.
 func (t *Transaction) GetObservedTimestamp(nodeID NodeID) (hlc.ClockTimestamp, bool) {
 	s := observedTimestampSlice(t.ObservedTimestamps)
 	return s.get(nodeID)
@@ -1402,8 +1436,7 @@ func PrepareTransactionForRetry(
 		// Use the priority communicated back by the server.
 		txn.Priority = errTxnPri
 	case *ReadWithinUncertaintyIntervalError:
-		txn.WriteTimestamp.Forward(
-			readWithinUncertaintyIntervalRetryTimestamp(ctx, &txn, tErr, pErr.OriginNode))
+		txn.WriteTimestamp.Forward(readWithinUncertaintyIntervalRetryTimestamp(tErr))
 	case *TransactionPushError:
 		// Increase timestamp if applicable, ensuring that we're just ahead of
 		// the pushee.
@@ -1464,8 +1497,7 @@ func CanTransactionRefresh(ctx context.Context, pErr *Error) (bool, *Transaction
 		// to the key that generated the error.
 		timestamp.Forward(writeTooOldRetryTimestamp(err))
 	case *ReadWithinUncertaintyIntervalError:
-		timestamp.Forward(
-			readWithinUncertaintyIntervalRetryTimestamp(ctx, txn, err, pErr.OriginNode))
+		timestamp.Forward(readWithinUncertaintyIntervalRetryTimestamp(err))
 	default:
 		return false, nil
 	}
@@ -1473,21 +1505,35 @@ func CanTransactionRefresh(ctx context.Context, pErr *Error) (bool, *Transaction
 }
 
 func readWithinUncertaintyIntervalRetryTimestamp(
-	ctx context.Context, txn *Transaction, err *ReadWithinUncertaintyIntervalError, origin NodeID,
+	err *ReadWithinUncertaintyIntervalError,
 ) hlc.Timestamp {
-	// If the reader encountered a newer write within the uncertainty
-	// interval, we advance the txn's timestamp just past the last observed
-	// timestamp from the node.
-	clockTS, ok := txn.GetObservedTimestamp(origin)
-	if !ok {
-		log.Fatalf(ctx,
-			"missing observed timestamp for node %d found on uncertainty restart. "+
-				"err: %s. txn: %s. Observed timestamps: %v",
-			origin, err, txn, txn.ObservedTimestamps)
-	}
-	// Also forward by the existing timestamp.
-	ts := clockTS.ToTimestamp()
-	ts.Forward(err.ExistingTimestamp.Next())
+	// If the reader encountered a newer write within the uncertainty interval,
+	// we advance the txn's timestamp just past the uncertain value's timestamp.
+	// This ensures that we read above the uncertain value on a retry.
+	ts := err.ExistingTimestamp.Next()
+	// In addition to advancing past the uncertainty value's timestamp, we also
+	// advance the txn's timestamp up to the local uncertainty limit on the node
+	// which hit the error. This ensures that no future read after the retry on
+	// this node (ignoring lease complications in ComputeLocalUncertaintyLimit
+	// and values with synthetic timestamps) will throw an uncertainty error,
+	// even when reading other keys.
+	//
+	// Note that if the request was not able to establish a local uncertainty
+	// limit due to a missing observed timestamp (for instance, if the request
+	// was evaluated on a follower replica and the txn had never visited the
+	// leaseholder), then LocalUncertaintyLimit will be empty and the Forward
+	// will be a no-op. In this case, we could advance all the way past the
+	// global uncertainty limit, but this time would likely be in the future, so
+	// this would necessitate a commit-wait period after committing.
+	//
+	// In general, we expect the local uncertainty limit, if set, to be above
+	// the uncertainty value's timestamp. So we expect this Forward to advance
+	// ts. However, this is not always the case. The one exception is if the
+	// uncertain value had a synthetic timestamp, so it was compared against the
+	// global uncertainty limit to determine uncertainty (see IsUncertain). In
+	// such cases, we're ok advancing just past the value's timestamp. Either
+	// way, we won't see the same value in our uncertainty interval on a retry.
+	ts.Forward(err.LocalUncertaintyLimit)
 	return ts
 }
 

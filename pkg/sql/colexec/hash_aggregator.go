@@ -12,6 +12,7 @@ package colexec
 
 import (
 	"context"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
@@ -60,7 +61,7 @@ const (
 // Note that throughout this file "buckets" and "groups" mean the same thing
 // and are used interchangeably.
 type hashAggregator struct {
-	OneInputNode
+	colexecbase.OneInputNode
 
 	allocator *colmem.Allocator
 	spec      *execinfrapb.AggregatorSpec
@@ -110,8 +111,14 @@ type hashAggregator struct {
 		anotherIntSlice []int
 	}
 
-	allInputTuples *spillingQueue
-	output         coldata.Batch
+	// inputTrackingState tracks all the input tuples which is needed in order
+	// to fallback to the external hash aggregator.
+	inputTrackingState struct {
+		tuples            *spillingQueue
+		zeroBatchEnqueued bool
+	}
+
+	output coldata.Batch
 
 	aggFnsAlloc *colexecagg.AggregateFuncsAlloc
 	hashAlloc   aggBucketAlloc
@@ -119,7 +126,7 @@ type hashAggregator struct {
 	toClose     colexecbase.Closers
 }
 
-var _ ResettableOperator = &hashAggregator{}
+var _ colexecbase.ResettableOperator = &hashAggregator{}
 var _ colexecbase.BufferingInMemoryOperator = &hashAggregator{}
 var _ closableOperator = &hashAggregator{}
 
@@ -139,7 +146,7 @@ const hashAggregatorAllocSize = 128
 // tuples.
 func NewHashAggregator(
 	args *colexecagg.NewAggregatorArgs, newSpillingQueueArgs *NewSpillingQueueArgs,
-) (ResettableOperator, error) {
+) (colexecbase.ResettableOperator, error) {
 	aggFnsAlloc, inputArgsConverter, toClose, err := colexecagg.NewAggregateFuncsAlloc(
 		args, hashAggregatorAllocSize, true, /* isHashAgg */
 	)
@@ -154,7 +161,7 @@ func NewHashAggregator(
 		maxBuffered = coldata.MaxBatchSize
 	}
 	hashAgg := &hashAggregator{
-		OneInputNode:       NewOneInputNode(args.Input),
+		OneInputNode:       colexecbase.NewOneInputNode(args.Input),
 		allocator:          args.Allocator,
 		spec:               args.Spec,
 		state:              hashAggregatorBuffering,
@@ -170,13 +177,13 @@ func NewHashAggregator(
 	hashAgg.datumAlloc.AllocSize = hashAggregatorAllocSize
 	hashAgg.aggHelper = newAggregatorHelper(args, &hashAgg.datumAlloc, true /* isHashAgg */, hashAgg.maxBuffered)
 	if newSpillingQueueArgs != nil {
-		hashAgg.allInputTuples = newSpillingQueue(newSpillingQueueArgs)
+		hashAgg.inputTrackingState.tuples = newSpillingQueue(newSpillingQueueArgs)
 	}
 	return hashAgg, err
 }
 
 func (op *hashAggregator) Init() {
-	op.input.Init()
+	op.Input.Init()
 	// These numbers were chosen after running the micro-benchmarks and relevant
 	// TPCH queries using tpchvec/bench.
 	const hashTableLoadFactor = 0.1
@@ -204,13 +211,14 @@ func (op *hashAggregator) Next(ctx context.Context) coldata.Batch {
 					)
 				})
 			}
-			op.bufferingState.pendingBatch, op.bufferingState.unprocessedIdx = op.input.Next(ctx), 0
-			if op.allInputTuples != nil {
-				if err := op.allInputTuples.enqueue(ctx, op.bufferingState.pendingBatch); err != nil {
+			op.bufferingState.pendingBatch, op.bufferingState.unprocessedIdx = op.Input.Next(ctx), 0
+			n := op.bufferingState.pendingBatch.Length()
+			if op.inputTrackingState.tuples != nil {
+				if err := op.inputTrackingState.tuples.enqueue(ctx, op.bufferingState.pendingBatch); err != nil {
 					colexecerror.InternalError(err)
 				}
+				op.inputTrackingState.zeroBatchEnqueued = n == 0
 			}
-			n := op.bufferingState.pendingBatch.Length()
 			if n == 0 {
 				// This is the last input batch.
 				if op.bufferingState.tuples.Length() == 0 {
@@ -260,7 +268,6 @@ func (op *hashAggregator) Next(ctx context.Context) coldata.Batch {
 				continue
 			}
 			op.bufferingState.tuples.ResetInternalBatch()
-			op.bufferingState.tuples.SetLength(0)
 			op.state = hashAggregatorBuffering
 
 		case hashAggregatorOutputting:
@@ -268,7 +275,13 @@ func (op *hashAggregator) Next(ctx context.Context) coldata.Batch {
 			// at coldata.BatchSize(), so we can just try asking for
 			// len(op.buckets) capacity. Note that in hashAggregatorOutputting
 			// state we always have at least 1 bucket.
-			op.output, _ = op.allocator.ResetMaybeReallocate(op.outputTypes, op.output, len(op.buckets))
+			//
+			// For now, we don't enforce any footprint-based memory limit.
+			// TODO(yuzefovich): refactor this.
+			const maxBatchMemSize = math.MaxInt64
+			op.output, _ = op.allocator.ResetMaybeReallocate(
+				op.outputTypes, op.output, len(op.buckets), maxBatchMemSize,
+			)
 			curOutputIdx := 0
 			op.allocator.PerformOperation(op.output.ColVecs(), func() {
 				for curOutputIdx < op.output.Capacity() && curOutputIdx < len(op.buckets) {
@@ -464,30 +477,43 @@ func (op *hashAggregator) onlineAgg(ctx context.Context, b coldata.Batch) {
 func (op *hashAggregator) ExportBuffered(
 	ctx context.Context, _ colexecbase.Operator,
 ) coldata.Batch {
-	batch, err := op.allInputTuples.dequeue(ctx)
+	if !op.inputTrackingState.zeroBatchEnqueued {
+		// Per the contract of the spilling queue, we need to append a
+		// zero-length batch.
+		if err := op.inputTrackingState.tuples.enqueue(ctx, coldata.ZeroBatch); err != nil {
+			colexecerror.InternalError(err)
+		}
+		op.inputTrackingState.zeroBatchEnqueued = true
+	}
+	batch, err := op.inputTrackingState.tuples.dequeue(ctx)
 	if err != nil {
 		colexecerror.InternalError(err)
 	}
 	return batch
 }
 
-func (op *hashAggregator) reset(ctx context.Context) {
-	if r, ok := op.input.(resetter); ok {
-		r.reset(ctx)
+func (op *hashAggregator) Reset(ctx context.Context) {
+	if r, ok := op.Input.(colexecbase.Resetter); ok {
+		r.Reset(ctx)
 	}
 	op.bufferingState.tuples.ResetInternalBatch()
-	op.bufferingState.tuples.SetLength(0)
 	op.bufferingState.pendingBatch = nil
 	op.bufferingState.unprocessedIdx = 0
 	op.buckets = op.buckets[:0]
-	op.ht.reset(ctx)
+	op.ht.Reset(ctx)
+	if op.inputTrackingState.tuples != nil {
+		if err := op.inputTrackingState.tuples.close(ctx); err != nil {
+			colexecerror.InternalError(err)
+		}
+		op.inputTrackingState.zeroBatchEnqueued = false
+	}
 	op.state = hashAggregatorBuffering
 }
 
 func (op *hashAggregator) Close(ctx context.Context) error {
 	var retErr error
-	if op.allInputTuples != nil {
-		retErr = op.allInputTuples.close(ctx)
+	if op.inputTrackingState.tuples != nil {
+		retErr = op.inputTrackingState.tuples.close(ctx)
 	}
 	if err := op.toClose.Close(ctx); err != nil {
 		retErr = err

@@ -14,9 +14,10 @@ package wkt
 
 import "github.com/twpayne/go-geom"
 
+// TODO(ayang): move these into lex.go
 func isValidLineString(wktlex wktLexer, flatCoords []float64, stride int) bool {
 	if len(flatCoords) < 2 * stride {
-		wktlex.(*wktLex).Error("syntax error: non-empty linestring with only one point")
+		wktlex.(*wktLex).setParseError("non-empty linestring with only one point", "minimum number of points is 2")
 		return false
 	}
 	return true
@@ -24,53 +25,165 @@ func isValidLineString(wktlex wktLexer, flatCoords []float64, stride int) bool {
 
 func isValidPolygonRing(wktlex wktLexer, flatCoords []float64, stride int) bool {
 	if len(flatCoords) < 4 * stride {
-		wktlex.(*wktLex).Error("syntax error: polygon ring doesn't have enough points")
+		wktlex.(*wktLex).setParseError("polygon ring doesn't have enough points", "minimum number of points is 4")
 		return false
 	}
 	for i := 0; i < stride; i++ {
 		if flatCoords[i] != flatCoords[len(flatCoords)-stride+i] {
-			wktlex.(*wktLex).Error("syntax error: polygon ring not closed")
+			wktlex.(*wktLex).setParseError("polygon ring not closed", "ensure first and last point are the same")
 			return false
     }
 	}
 	return true
 }
 
-type geomPair struct {
+type geomFlatCoordsRepr struct {
 	flatCoords []float64
 	ends       []int
+}
+
+func makeGeomFlatCoordsRepr(flatCoords []float64) geomFlatCoordsRepr {
+	return geomFlatCoordsRepr{flatCoords: flatCoords, ends: []int{len(flatCoords)}}
+}
+
+func appendGeomFlatCoordsReprs(p1 geomFlatCoordsRepr, p2 geomFlatCoordsRepr) geomFlatCoordsRepr {
+	if len(p1.ends) > 0 {
+		p1LastEnd := p1.ends[len(p1.ends)-1]
+		for i, _ := range p2.ends {
+			p2.ends[i] += p1LastEnd
+		}
+	}
+	return geomFlatCoordsRepr{flatCoords: append(p1.flatCoords, p2.flatCoords...), ends: append(p1.ends, p2.ends...)}
+}
+
+type multiPolygonFlatCoordsRepr struct {
+	flatCoords []float64
+	endss      [][]int
+}
+
+func makeMultiPolygonFlatCoordsRepr(p geomFlatCoordsRepr) multiPolygonFlatCoordsRepr {
+	if p.flatCoords == nil {
+		return multiPolygonFlatCoordsRepr{flatCoords: nil, endss: [][]int{nil}}
+	}
+	return multiPolygonFlatCoordsRepr{flatCoords: p.flatCoords, endss: [][]int{p.ends}}
+}
+
+func appendMultiPolygonFlatCoordsRepr(
+	p1 multiPolygonFlatCoordsRepr, p2 multiPolygonFlatCoordsRepr,
+) multiPolygonFlatCoordsRepr {
+	p1LastEndsLastEnd := 0
+	for i := len(p1.endss) - 1; i >= 0; i-- {
+		if len(p1.endss[i]) > 0 {
+			p1LastEndsLastEnd = p1.endss[i][len(p1.endss[i])-1]
+			break
+		}
+	}
+	if p1LastEndsLastEnd > 0 {
+		for i, _ := range p2.endss {
+			for j, _ := range p2.endss[i] {
+				p2.endss[i][j] += p1LastEndsLastEnd
+			}
+		}
+	}
+	return multiPolygonFlatCoordsRepr{
+		flatCoords: append(p1.flatCoords, p2.flatCoords...), endss: append(p1.endss, p2.endss...),
+	}
 }
 
 %}
 
 %union {
-	str       string
-	geom      geom.T
-	coord     float64
-	coordList []float64
-	pair      geomPair
+	str               string
+	geom              geom.T
+	coord             float64
+	coordList         []float64
+	flatRepr          geomFlatCoordsRepr
+	multiPolyFlatRepr multiPolygonFlatCoordsRepr
+	geomList          []geom.T
 }
 
+// Tokens
 %token <str> POINT POINTM POINTZ POINTZM
 %token <str> LINESTRING LINESTRINGM LINESTRINGZ LINESTRINGZM
 %token <str> POLYGON POLYGONM POLYGONZ POLYGONZM
+%token <str> MULTIPOINT MULTIPOINTM MULTIPOINTZ MULTIPOINTZM
+%token <str> MULTILINESTRING MULTILINESTRINGM MULTILINESTRINGZ MULTILINESTRINGZM
+%token <str> MULTIPOLYGON MULTIPOLYGONM MULTIPOLYGONZ MULTIPOLYGONZM
+%token <str> GEOMETRYCOLLECTION GEOMETRYCOLLECTIONM GEOMETRYCOLLECTIONZ GEOMETRYCOLLECTIONZM
 %token <str> EMPTY
-//%token <str> MULTIPOINT MULTILINESTRING MULTIPOLYGON GEOMETRYCOLLECTION
 %token <coord> NUM
 
+// Geometries
 %type <geom> geometry
-%type <geom> point linestring polygon
-%type <coordList> two_coords three_coords four_coords
-%type <coordList> two_coords_list three_coords_list four_coords_list
-%type <coordList> two_coords_line three_coords_line four_coords_line
-%type <pair> two_coords_ring three_coords_ring four_coords_ring
-%type <pair> two_coords_ring_list three_coords_ring_list four_coords_ring_list
+%type <geom> point linestring polygon multipoint multilinestring multipolygon geometry_collection
+
+// Empty representations
+%type <coordList> empty_in_base_type
+%type <coordList> empty_in_non_base_type
+%type <coordList> flat_coords_empty
+
+// Points
+%type <coordList> flat_coords
+%type <coordList> flat_coords_point
+%type <coordList> flat_coords_point_with_parens
+
+// LineStrings
+%type <coordList> flat_coords_point_list
+%type <coordList> flat_coords_point_list_with_parens
+%type <coordList> flat_coords_linestring
+
+// Polygons
+%type <flatRepr> flat_coords_polygon_ring
+%type <flatRepr> flat_coords_polygon_ring_list
+%type <flatRepr> flat_coords_polygon_ring_list_with_parens
+
+// MultiPoints
+%type <coordList> multipoint_point
+%type <coordList> multipoint_base_type_point
+%type <coordList> multipoint_non_base_type_point
+
+%type <flatRepr> multipoint_base_type_point_flat_repr
+%type <flatRepr> multipoint_non_base_point_flat_repr
+%type <flatRepr> multipoint_base_type_point_list
+%type <flatRepr> multipoint_non_base_type_point_list
+%type <flatRepr> multipoint_base_type_point_list_with_parens
+%type <flatRepr> multipoint_non_base_type_point_list_with_parens
+
+// MultiLineStrings
+%type <coordList> multilinestring_base_type_linestring
+%type <coordList> multilinestring_non_base_type_linestring
+
+%type <flatRepr> multilinestring_base_type_linestring_flat_repr
+%type <flatRepr> multilinestring_non_base_type_linestring_flat_repr
+%type <flatRepr> multilinestring_base_type_linestring_list
+%type <flatRepr> multilinestring_non_base_type_linestring_list
+%type <flatRepr> multilinestring_base_type_linestring_list_with_parens
+%type <flatRepr> multilinestring_non_base_type_linestring_list_with_parens
+
+// MultiPolygons
+%type <flatRepr> multipolygon_base_type_polygon
+%type <flatRepr> multipolygon_non_base_type_polygon
+
+%type <multiPolyFlatRepr> multipolygon_base_type_polygon_multi_poly_repr
+%type <multiPolyFlatRepr> multipolygon_non_base_type_polygon_multi_poly_repr
+%type <multiPolyFlatRepr> multipolygon_base_type_polygon_list
+%type <multiPolyFlatRepr> multipolygon_non_base_type_polygon_list
+%type <multiPolyFlatRepr> multipolygon_base_type_polygon_list_with_parens
+%type <multiPolyFlatRepr> multipolygon_non_base_type_polygon_list_with_parens
+
+// GeometryCollections
+%type <geomList> geometry_list
+%type <geomList> geometry_list_with_parens
 
 %%
 
 start:
 	geometry
 	{
+		ok := wktlex.(*wktLex).validateLayoutStackAtEnd()
+		if !ok {
+			return 1
+		}
 		wktlex.(*wktLex).ret = $1
 	}
 
@@ -78,252 +191,640 @@ geometry:
 	point
 |	linestring
 |	polygon
+|	multipoint
+|	multilinestring
+|	multipolygon
+|	geometry_collection
+	{
+		ok := wktlex.(*wktLex).validateAndPopLayoutStackFrame()
+		if !ok {
+			return 1
+		}
+	}
 
 point:
-	POINT '(' two_coords ')'
+	point_type flat_coords_point_with_parens
 	{
-		$$ = geom.NewPointFlat(geom.XY, $3)
+		$$ = geom.NewPointFlat(wktlex.(*wktLex).curLayout(), $2)
 	}
-| POINT '(' three_coords ')'
+|	point_base_type empty_in_base_type
 	{
-		$$ = geom.NewPointFlat(geom.XYZ, $3)
+		$$ = geom.NewPointEmpty(wktlex.(*wktLex).curLayout())
 	}
-| POINT '(' four_coords ')'
+|	point_non_base_type empty_in_non_base_type
 	{
-		$$ = geom.NewPointFlat(geom.XYZM, $3)
+		$$ = geom.NewPointEmpty(wktlex.(*wktLex).curLayout())
 	}
-| POINTM '(' three_coords ')'
+
+point_type:
+	point_base_type
+|	point_non_base_type
+
+point_base_type:
+	POINT
 	{
-		$$ = geom.NewPointFlat(geom.XYM, $3)
+		ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+		if !ok {
+			return 1
+		}
 	}
-| POINTZ '(' three_coords ')'
+
+point_non_base_type:
+	POINTM
 	{
-		$$ = geom.NewPointFlat(geom.XYZ, $3)
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+		if !ok {
+			return 1
+		}
 	}
-| POINTZM '(' four_coords ')'
+|	POINTZ
 	{
-		$$ = geom.NewPointFlat(geom.XYZM, $3)
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+		if !ok {
+			return 1
+		}
 	}
-| POINT EMPTY
+|	POINTZM
 	{
-		$$ = geom.NewPointEmpty(geom.XY)
-	}
-| POINTM EMPTY
-	{
-		$$ = geom.NewPointEmpty(geom.XYM)
-	}
-| POINTZ EMPTY
-	{
-		$$ = geom.NewPointEmpty(geom.XYZ)
-	}
-| POINTZM EMPTY
-	{
-		$$ = geom.NewPointEmpty(geom.XYZM)
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+		if !ok {
+			return 1
+		}
 	}
 
 linestring:
-	LINESTRING two_coords_line
+	linestring_type flat_coords_linestring
 	{
-		if !isValidLineString(wktlex, $2, 2) {
+		$$ = geom.NewLineStringFlat(wktlex.(*wktLex).curLayout(), $2)
+	}
+|	linestring_base_type empty_in_base_type
+	{
+		$$ = geom.NewLineString(wktlex.(*wktLex).curLayout())
+	}
+|	linestring_non_base_type empty_in_non_base_type
+	{
+		$$ = geom.NewLineString(wktlex.(*wktLex).curLayout())
+	}
+
+linestring_type:
+	linestring_base_type
+|	linestring_non_base_type
+
+linestring_base_type:
+	LINESTRING
+	{
+		ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+		if !ok {
 			return 1
 		}
-		$$ = geom.NewLineStringFlat(geom.XY, $2)
 	}
-|	LINESTRING three_coords_line
+
+linestring_non_base_type:
+	LINESTRINGM
 	{
-		if !isValidLineString(wktlex, $2, 3) {
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+		if !ok {
 			return 1
 		}
-		$$ = geom.NewLineStringFlat(geom.XYZ, $2)
 	}
-|	LINESTRING four_coords_line
+|	LINESTRINGZ
 	{
-		if !isValidLineString(wktlex, $2, 4) {
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+		if !ok {
 			return 1
 		}
-		$$ = geom.NewLineStringFlat(geom.XYZM, $2)
 	}
-|	LINESTRINGM three_coords_line
+|	LINESTRINGZM
 	{
-		if !isValidLineString(wktlex, $2, 3) {
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+		if !ok {
 			return 1
 		}
-		$$ = geom.NewLineStringFlat(geom.XYM, $2)
-	}
-|	LINESTRINGZ three_coords_line
-	{
-		if !isValidLineString(wktlex, $2, 3) {
-			return 1
-		}
-		$$ = geom.NewLineStringFlat(geom.XYZ, $2)
-	}
-|	LINESTRINGZM four_coords_line
-	{
-		if !isValidLineString(wktlex, $2, 4) {
-			return 1
-		}
-		$$ = geom.NewLineStringFlat(geom.XYZM, $2)
-	}
-|	LINESTRING EMPTY
-	{
-		$$ = geom.NewLineString(geom.XY)
-	}
-|	LINESTRINGM EMPTY
-	{
-		$$ = geom.NewLineString(geom.XYM)
-	}
-|	LINESTRINGZ EMPTY
-	{
-		$$ = geom.NewLineString(geom.XYZ)
-	}
-|	LINESTRINGZM EMPTY
-	{
-		$$ = geom.NewLineString(geom.XYZM)
 	}
 
 polygon:
-	POLYGON '(' two_coords_ring_list ')'
+	polygon_type flat_coords_polygon_ring_list_with_parens
 	{
-		$$ = geom.NewPolygonFlat(geom.XY, $3.flatCoords, $3.ends)
+		$$ = geom.NewPolygonFlat(wktlex.(*wktLex).curLayout(), $2.flatCoords, $2.ends)
 	}
-|	POLYGON '(' three_coords_ring_list ')'
+|	polygon_base_type empty_in_base_type
 	{
-		$$ = geom.NewPolygonFlat(geom.XYZ, $3.flatCoords, $3.ends)
+		$$ = geom.NewPolygon(wktlex.(*wktLex).curLayout())
 	}
-|	POLYGON '(' four_coords_ring_list ')'
+|	polygon_non_base_type empty_in_non_base_type
 	{
-		$$ = geom.NewPolygonFlat(geom.XYZM, $3.flatCoords, $3.ends)
-	}
-|	POLYGONM '(' three_coords_ring_list ')'
-	{
-		$$ = geom.NewPolygonFlat(geom.XYM, $3.flatCoords, $3.ends)
-	}
-|	POLYGONZ '(' three_coords_ring_list ')'
-	{
-		$$ = geom.NewPolygonFlat(geom.XYZ, $3.flatCoords, $3.ends)
-	}
-|	POLYGONZM '(' four_coords_ring_list ')'
-	{
-		$$ = geom.NewPolygonFlat(geom.XYZM, $3.flatCoords, $3.ends)
-	}
-|	POLYGON EMPTY
-	{
-		$$ = geom.NewPolygon(geom.XY)
-	}
-|	POLYGONM EMPTY
-	{
-		$$ = geom.NewPolygon(geom.XYM)
-	}
-|	POLYGONZ EMPTY
-	{
-		$$ = geom.NewPolygon(geom.XYZ)
-	}
-|	POLYGONZM EMPTY
-	{
-		$$ = geom.NewPolygon(geom.XYZM)
+		$$ = geom.NewPolygon(wktlex.(*wktLex).curLayout())
 	}
 
-two_coords_ring_list:
-	two_coords_ring_list ',' two_coords_ring
-	{
-		$$ = geomPair{append($1.flatCoords, $3.flatCoords...), append($1.ends, $1.ends[len($1.ends)-1] + $3.ends[0])}
-	}
-|	two_coords_ring
+polygon_type:
+	polygon_base_type
+|	polygon_non_base_type
 
-three_coords_ring_list:
-	three_coords_ring_list ',' three_coords_ring
+polygon_base_type:
+	POLYGON
 	{
-		$$ = geomPair{append($1.flatCoords, $3.flatCoords...), append($1.ends, $1.ends[len($1.ends)-1] + $3.ends[0])}
-	}
-|	three_coords_ring
-
-four_coords_ring_list:
-	four_coords_ring_list ',' four_coords_ring
-	{
-		$$ = geomPair{append($1.flatCoords, $3.flatCoords...), append($1.ends, $1.ends[len($1.ends)-1] + $3.ends[0])}
-	}
-|	four_coords_ring
-
-two_coords_ring:
-	two_coords_line
-	{
-		if !isValidPolygonRing(wktlex, $1, 2) {
+		ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+		if !ok {
 			return 1
 		}
-		$$ = geomPair{$1, []int{len($1)}}
 	}
 
-three_coords_ring:
-	three_coords_line
+polygon_non_base_type:
+	POLYGONM
 	{
-		if !isValidPolygonRing(wktlex, $1, 3) {
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+		if !ok {
 			return 1
 		}
-		$$ = geomPair{$1, []int{len($1)}}
 	}
-
-four_coords_ring:
-	four_coords_line
+|	POLYGONZ
 	{
-		if !isValidPolygonRing(wktlex, $1, 4) {
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+		if !ok {
 			return 1
 		}
-		$$ = geomPair{$1, []int{len($1)}}
+	}
+|	POLYGONZM
+	{
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+		if !ok {
+			return 1
+		}
 	}
 
-two_coords_line:
-	'(' two_coords_list ')'
+multipoint:
+	multipoint_base_type multipoint_base_type_point_list_with_parens
+	{
+		$$ = geom.NewMultiPointFlat(
+			wktlex.(*wktLex).curLayout(), $2.flatCoords, geom.NewMultiPointFlatOptionWithEnds($2.ends),
+		)
+	}
+|	multipoint_non_base_type multipoint_non_base_type_point_list_with_parens
+	{
+		$$ = geom.NewMultiPointFlat(
+			wktlex.(*wktLex).curLayout(), $2.flatCoords, geom.NewMultiPointFlatOptionWithEnds($2.ends),
+		)
+	}
+|	multipoint_base_type empty_in_base_type
+	{
+		$$ = geom.NewMultiPoint(wktlex.(*wktLex).curLayout())
+	}
+|	multipoint_non_base_type empty_in_non_base_type
+	{
+		$$ = geom.NewMultiPoint(wktlex.(*wktLex).curLayout())
+	}
+
+multipoint_base_type:
+	MULTIPOINT
+	{
+		ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+		if !ok {
+			return 1
+		}
+	}
+
+multipoint_non_base_type:
+	MULTIPOINTM
+	{
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+		if !ok {
+			return 1
+		}
+	}
+|	MULTIPOINTZ
+	{
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+		if !ok {
+			return 1
+		}
+	}
+|	MULTIPOINTZM
+	{
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+		if !ok {
+			return 1
+		}
+	}
+
+multilinestring:
+	multilinestring_base_type multilinestring_base_type_linestring_list_with_parens
+	{
+		$$ = geom.NewMultiLineStringFlat(wktlex.(*wktLex).curLayout(), $2.flatCoords, $2.ends)
+	}
+|	multilinestring_non_base_type multilinestring_non_base_type_linestring_list_with_parens
+	{
+		$$ = geom.NewMultiLineStringFlat(wktlex.(*wktLex).curLayout(), $2.flatCoords, $2.ends)
+	}
+|	multilinestring_base_type empty_in_base_type
+	{
+		$$ = geom.NewMultiLineString(wktlex.(*wktLex).curLayout())
+	}
+|	multilinestring_non_base_type empty_in_non_base_type
+	{
+		$$ = geom.NewMultiLineString(wktlex.(*wktLex).curLayout())
+	}
+
+multilinestring_base_type:
+	MULTILINESTRING
+	{
+		ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+		if !ok {
+			return 1
+		}
+	}
+
+multilinestring_non_base_type:
+	MULTILINESTRINGM
+	{
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+		if !ok {
+			return 1
+		}
+	}
+|	MULTILINESTRINGZ
+	{
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+		if !ok {
+			return 1
+		}
+	}
+|	MULTILINESTRINGZM
+	{
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+		if !ok {
+			return 1
+		}
+	}
+
+multipolygon:
+	multipolygon_base_type multipolygon_base_type_polygon_list_with_parens
+	{
+		$$ = geom.NewMultiPolygonFlat(wktlex.(*wktLex).curLayout(), $2.flatCoords, $2.endss)
+	}
+|	multipolygon_non_base_type multipolygon_non_base_type_polygon_list_with_parens
+	{
+		$$ = geom.NewMultiPolygonFlat(wktlex.(*wktLex).curLayout(), $2.flatCoords, $2.endss)
+	}
+|	multipolygon_base_type empty_in_base_type
+	{
+		$$ = geom.NewMultiPolygon(wktlex.(*wktLex).curLayout())
+	}
+|	multipolygon_non_base_type empty_in_non_base_type
+	{
+		$$ = geom.NewMultiPolygon(wktlex.(*wktLex).curLayout())
+	}
+
+multipolygon_base_type:
+	MULTIPOLYGON
+	{
+		ok := wktlex.(*wktLex).validateBaseGeometryTypeAllowed()
+		if !ok {
+			return 1
+		}
+	}
+
+multipolygon_non_base_type:
+	MULTIPOLYGONM
+	{
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYM)
+		if !ok {
+			return 1
+		}
+	}
+|	MULTIPOLYGONZ
+	{
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZ)
+		if !ok {
+			return 1
+		}
+	}
+|	MULTIPOLYGONZM
+	{
+		ok := wktlex.(*wktLex).validateAndSetLayoutIfNoLayout(geom.XYZM)
+		if !ok {
+			return 1
+		}
+	}
+
+geometry_collection:
+	geometry_collection_type geometry_list_with_parens
+	{
+		newCollection := geom.NewGeometryCollection()
+		err := newCollection.Push($2...)
+		if err != nil {
+			wktlex.(*wktLex).setError(err)
+			return 1
+		}
+		$$ = newCollection
+	}
+|	geometry_collection_base_type empty_in_base_type
+	{
+		$$ = geom.NewGeometryCollection()
+	}
+|	geometry_collection_non_base_type empty_in_non_base_type
+	{
+		$$ = geom.NewGeometryCollection()
+	}
+
+geometry_list_with_parens:
+	'(' geometry_list ')'
 	{
 		$$ = $2
 	}
 
-three_coords_line:
-	'(' three_coords_list ')'
+geometry_list:
+	geometry_list ',' geometry
+	{
+		$$ = append($1, $3)
+	}
+|	geometry
+	{
+		$$ = []geom.T{$1}
+	}
+
+geometry_collection_type:
+	geometry_collection_base_type
+|	geometry_collection_non_base_type
+
+geometry_collection_base_type:
+	GEOMETRYCOLLECTION
+	{
+		ok := wktlex.(*wktLex).validateAndPushLayoutStackFrame(geom.NoLayout)
+		if !ok {
+			return 1
+		}
+	}
+
+geometry_collection_non_base_type:
+	GEOMETRYCOLLECTIONM
+	{
+		ok := wktlex.(*wktLex).validateAndPushLayoutStackFrame(geom.XYM)
+		if !ok {
+			return 1
+		}
+	}
+|	GEOMETRYCOLLECTIONZ
+	{
+		ok := wktlex.(*wktLex).validateAndPushLayoutStackFrame(geom.XYZ)
+		if !ok {
+			return 1
+		}
+	}
+|	GEOMETRYCOLLECTIONZM
+	{
+		ok := wktlex.(*wktLex).validateAndPushLayoutStackFrame(geom.XYZM)
+		if !ok {
+			return 1
+		}
+	}
+
+geometry_opening_lparen:
+	'('
+	{
+		ok := wktlex.(*wktLex).validateNonEmptyGeometryAllowed()
+		if !ok {
+			return 1
+		}
+	}
+
+multipolygon_base_type_polygon_list_with_parens:
+	geometry_opening_lparen multipolygon_base_type_polygon_list ')'
 	{
 		$$ = $2
 	}
 
-four_coords_line:
-	'(' four_coords_list ')'
+multipolygon_non_base_type_polygon_list_with_parens:
+	'(' multipolygon_non_base_type_polygon_list ')'
 	{
 		$$ = $2
 	}
 
-two_coords_list:
-	two_coords ',' two_coords_list
+multipolygon_non_base_type_polygon_list:
+	multipolygon_non_base_type_polygon_list ',' multipolygon_non_base_type_polygon_multi_poly_repr
+	{
+		$$ = appendMultiPolygonFlatCoordsRepr($1, $3)
+	}
+|	multipolygon_non_base_type_polygon_multi_poly_repr
+
+multipolygon_base_type_polygon_list:
+	multipolygon_base_type_polygon_list ',' multipolygon_base_type_polygon_multi_poly_repr
+	{
+		$$ = appendMultiPolygonFlatCoordsRepr($1, $3)
+	}
+|	multipolygon_base_type_polygon_multi_poly_repr
+
+multipolygon_base_type_polygon_multi_poly_repr:
+	multipolygon_base_type_polygon
+	{
+		$$ = makeMultiPolygonFlatCoordsRepr($1)
+	}
+
+multipolygon_non_base_type_polygon_multi_poly_repr:
+	multipolygon_non_base_type_polygon
+	{
+		$$ = makeMultiPolygonFlatCoordsRepr($1)
+	}
+
+multipolygon_base_type_polygon:
+	flat_coords_polygon_ring_list_with_parens
+|	empty_in_base_type
+	{
+		$$ = makeGeomFlatCoordsRepr($1)
+	}
+
+multipolygon_non_base_type_polygon:
+	flat_coords_polygon_ring_list_with_parens
+|	empty_in_non_base_type
+	{
+		$$ = makeGeomFlatCoordsRepr($1)
+	}
+
+multilinestring_base_type_linestring_list_with_parens:
+	geometry_opening_lparen multilinestring_base_type_linestring_list ')'
+	{
+		$$ = $2
+	}
+
+multilinestring_non_base_type_linestring_list_with_parens:
+	'(' multilinestring_non_base_type_linestring_list ')'
+	{
+		$$ = $2
+	}
+
+multilinestring_base_type_linestring_list:
+	multilinestring_base_type_linestring_list ',' multilinestring_base_type_linestring_flat_repr
+	{
+		$$ = appendGeomFlatCoordsReprs($1, $3)
+	}
+|	multilinestring_base_type_linestring_flat_repr
+
+multilinestring_non_base_type_linestring_list:
+	multilinestring_non_base_type_linestring_list ',' multilinestring_non_base_type_linestring_flat_repr
+	{
+		$$ = appendGeomFlatCoordsReprs($1, $3)
+	}
+|	multilinestring_non_base_type_linestring_flat_repr
+
+multilinestring_base_type_linestring_flat_repr:
+	multilinestring_base_type_linestring
+	{
+		$$ = makeGeomFlatCoordsRepr($1)
+	}
+
+multilinestring_non_base_type_linestring_flat_repr:
+	multilinestring_non_base_type_linestring
+	{
+		$$ = makeGeomFlatCoordsRepr($1)
+	}
+
+multilinestring_base_type_linestring:
+	flat_coords_linestring
+|	empty_in_base_type
+
+multilinestring_non_base_type_linestring:
+	flat_coords_linestring
+|	empty_in_non_base_type
+
+multipoint_base_type_point_list_with_parens:
+	geometry_opening_lparen multipoint_base_type_point_list ')'
+	{
+		$$ = $2
+	}
+
+multipoint_non_base_type_point_list_with_parens:
+	'(' multipoint_non_base_type_point_list ')'
+	{
+		$$ = $2
+	}
+
+multipoint_base_type_point_list:
+	multipoint_base_type_point_list ',' multipoint_base_type_point_flat_repr
+	{
+		$$ = appendGeomFlatCoordsReprs($1, $3)
+	}
+|	multipoint_base_type_point_flat_repr
+
+multipoint_non_base_type_point_list:
+	multipoint_non_base_type_point_list ',' multipoint_non_base_point_flat_repr
+	{
+		$$ = appendGeomFlatCoordsReprs($1, $3)
+	}
+|	multipoint_non_base_point_flat_repr
+
+multipoint_base_type_point_flat_repr:
+	multipoint_base_type_point
+	{
+		$$ = makeGeomFlatCoordsRepr($1)
+	}
+
+multipoint_non_base_point_flat_repr:
+	multipoint_non_base_type_point
+	{
+		$$ = makeGeomFlatCoordsRepr($1)
+	}
+
+multipoint_base_type_point:
+	multipoint_point
+|	empty_in_base_type
+
+multipoint_non_base_type_point:
+	multipoint_point
+|	empty_in_non_base_type
+multipoint_point:
+	flat_coords_point
+|	flat_coords_point_with_parens
+
+flat_coords_polygon_ring_list_with_parens:
+	geometry_opening_lparen flat_coords_polygon_ring_list ')'
+	{
+		$$ = $2
+	}
+
+flat_coords_polygon_ring_list:
+	flat_coords_polygon_ring_list ',' flat_coords_polygon_ring
+	{
+		$$ = appendGeomFlatCoordsReprs($1, $3)
+	}
+|	flat_coords_polygon_ring
+
+flat_coords_polygon_ring:
+	flat_coords_point_list_with_parens
+	{
+		if !isValidPolygonRing(wktlex, $1, wktlex.(*wktLex).curLayout().Stride()) {
+			return 1
+		}
+		$$ = makeGeomFlatCoordsRepr($1)
+	}
+
+flat_coords_linestring:
+	flat_coords_point_list_with_parens
+	{
+		if !isValidLineString(wktlex, $1, wktlex.(*wktLex).curLayout().Stride()) {
+			return 1
+		}
+	}
+
+flat_coords_point_list_with_parens:
+	geometry_opening_lparen flat_coords_point_list ')'
+	{
+		$$ = $2
+	}
+
+flat_coords_point_list:
+	flat_coords_point_list ',' flat_coords_point
 	{
 		$$ = append($1, $3...)
 	}
-|	two_coords
+|	flat_coords_point
 
-three_coords_list:
-	three_coords ',' three_coords_list
+flat_coords_point_with_parens:
+	geometry_opening_lparen flat_coords_point ')'
 	{
-		$$ = append($1, $3...)
-	}
-|	three_coords
-
-four_coords_list:
-	four_coords ',' four_coords_list
-	{
-		$$ = append($1, $3...)
-	}
-|	four_coords
-
-two_coords:
-	NUM NUM
-	{
-		$$ = []float64{$1, $2}
+		$$ = $2
 	}
 
-three_coords:
-	NUM NUM NUM
+flat_coords_point:
+	flat_coords
 	{
-		$$ = []float64{$1, $2, $3}
+		switch len($1) {
+		case 1:
+			wktlex.(*wktLex).setParseError("not enough coordinates", "each point needs at least 2 coords")
+			return 1
+		case 2, 3, 4:
+			ok := wktlex.(*wktLex).validateStrideAndSetDefaultLayoutIfNoLayout(len($1))
+			if !ok {
+				return 1
+			}
+		default:
+			wktlex.(*wktLex).setParseError("too many coordinates", "each point can have at most 4 coords")
+			return 1
+		}
 	}
 
-four_coords:
-	NUM NUM NUM NUM
+flat_coords:
+	flat_coords NUM
 	{
-		$$ = []float64{$1, $2, $3, $4}
+		$$ = append($1, $2)
+	}
+|	NUM
+	{
+		$$ = []float64{$1}
+	}
+
+empty_in_base_type:
+	flat_coords_empty
+	{
+		ok := wktlex.(*wktLex).validateBaseTypeEmptyAllowed()
+		if !ok {
+			return 1
+		}
+	}
+
+empty_in_non_base_type:
+	flat_coords_empty
+
+flat_coords_empty:
+	EMPTY
+	{
+		$$ = []float64(nil)
 	}

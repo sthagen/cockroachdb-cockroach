@@ -216,6 +216,41 @@ func (c *CustomFuncs) CanInline(scalar opt.ScalarExpr) bool {
 	return false
 }
 
+// VirtualColumns returns the set of columns in the scanPrivate's table that are
+// virtual computed columns.
+func (c *CustomFuncs) VirtualColumns(scanPrivate *memo.ScanPrivate) opt.ColSet {
+	tabMeta := c.mem.Metadata().TableMeta(scanPrivate.Table)
+	return tabMeta.VirtualComputedColumns()
+}
+
+// InlinableVirtualColumnFilters returns a new filters expression containing any
+// of the given filters that meet the criteria:
+//
+//   1. The filter has references to any of the columns in virtualColumns.
+//   2. The filter is not a correlated subquery.
+//
+func (c *CustomFuncs) InlinableVirtualColumnFilters(
+	filters memo.FiltersExpr, virtualColumns opt.ColSet,
+) (inlinableFilters memo.FiltersExpr) {
+	for i := range filters {
+		item := &filters[i]
+
+		// Do not inline a filter if it has a correlated subquery or it does not
+		// reference a virtual column.
+		if item.ScalarProps().HasCorrelatedSubquery || !item.ScalarProps().OuterCols.Intersects(virtualColumns) {
+			continue
+		}
+
+		// Initialize inlinableFilters lazily.
+		if inlinableFilters == nil {
+			inlinableFilters = make(memo.FiltersExpr, 0, len(filters)-i)
+		}
+
+		inlinableFilters = append(inlinableFilters, *item)
+	}
+	return inlinableFilters
+}
+
 // InlineSelectProject searches the filter conditions for any variable
 // references to columns from the given projections expression. Each variable is
 // replaced by the corresponding inlined projection expression.
@@ -244,6 +279,7 @@ func (c *CustomFuncs) InlineProjectProject(
 	newProjections := make(memo.ProjectionsExpr, len(projections))
 	for i := range projections {
 		item := &projections[i]
+
 		newProjections[i] = c.f.ConstructProjectionsItem(
 			c.inlineProjections(item.Element, innerProjections).(opt.ScalarExpr),
 			item.Col,

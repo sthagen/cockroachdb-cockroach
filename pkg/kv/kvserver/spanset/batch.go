@@ -11,6 +11,8 @@
 package spanset
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -83,6 +85,12 @@ func (i *MVCCIterator) Valid() (bool, error) {
 func (i *MVCCIterator) SeekGE(key storage.MVCCKey) {
 	i.i.SeekGE(key)
 	i.checkAllowed(roachpb.Span{Key: key.Key}, true)
+}
+
+// SeekIntentGE is part of the storage.MVCCIterator interface.
+func (i *MVCCIterator) SeekIntentGE(key roachpb.Key, txnUUID uuid.UUID) {
+	i.i.SeekIntentGE(key, txnUUID)
+	i.checkAllowed(roachpb.Span{Key: key}, true)
 }
 
 // SeekLT is part of the storage.MVCCIterator interface.
@@ -492,9 +500,9 @@ func (s spanSetWriter) ClearUnversioned(key roachpb.Key) error {
 
 func (s spanSetWriter) ClearIntent(
 	key roachpb.Key, state storage.PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-) error {
+) (int, error) {
 	if err := s.checkAllowed(key); err != nil {
-		return err
+		return 0, err
 	}
 	return s.w.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID)
 }
@@ -584,16 +592,17 @@ func (s spanSetWriter) PutUnversioned(key roachpb.Key, value []byte) error {
 }
 
 func (s spanSetWriter) PutIntent(
+	ctx context.Context,
 	key roachpb.Key,
 	value []byte,
 	state storage.PrecedingIntentState,
 	txnDidNotUpdateMeta bool,
 	txnUUID uuid.UUID,
-) error {
+) (int, error) {
 	if err := s.checkAllowed(key); err != nil {
-		return err
+		return 0, err
 	}
-	return s.w.PutIntent(key, value, state, txnDidNotUpdateMeta, txnUUID)
+	return s.w.PutIntent(ctx, key, value, state, txnDidNotUpdateMeta, txnUUID)
 }
 
 func (s spanSetWriter) PutEngineKey(key storage.EngineKey, value []byte) error {
@@ -604,6 +613,10 @@ func (s spanSetWriter) PutEngineKey(key storage.EngineKey, value []byte) error {
 		return err
 	}
 	return s.w.PutEngineKey(key, value)
+}
+
+func (s spanSetWriter) SafeToWriteSeparatedIntents(ctx context.Context) (bool, error) {
+	return s.w.SafeToWriteSeparatedIntents(ctx)
 }
 
 func (s spanSetWriter) LogData(data []byte) error {

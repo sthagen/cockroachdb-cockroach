@@ -14,7 +14,10 @@ go_library(
 
 go_test(
     name = "nocopy_test",
+    size = "small",
     srcs = ["nocopy_test.go"],
+    data = glob(["testdata/**"]),
+    tags = ["broken_in_bazel"],
     deps = [
         ":nocopy",
         "//pkg/testutils/skip",

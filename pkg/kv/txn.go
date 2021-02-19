@@ -309,6 +309,14 @@ func (txn *Txn) ProvisionalCommitTimestamp() hlc.Timestamp {
 	return txn.mu.sender.ProvisionalCommitTimestamp()
 }
 
+// RequiredFrontier returns the largest timestamp at which the transaction may
+// read values when performing a read-only operation.
+func (txn *Txn) RequiredFrontier() hlc.Timestamp {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.RequiredFrontier()
+}
+
 // SetSystemConfigTrigger sets the system db trigger to true on this transaction.
 // This will impact the EndTxnRequest. Note that this method takes a boolean
 // argument indicating whether this transaction is intended for the system
@@ -334,9 +342,7 @@ func (txn *Txn) SetSystemConfigTrigger(forSystemTenant bool) error {
 }
 
 // DisablePipelining instructs the transaction not to pipeline requests. It
-// should rarely be necessary to call this method. It is only recommended for
-// transactions that need extremely precise control over the request ordering,
-// like the transaction that merges ranges together.
+// should rarely be necessary to call this method.
 //
 // DisablePipelining must be called before any operations are performed on the
 // transaction.
@@ -1296,4 +1302,19 @@ func (txn *Txn) ReleaseSavepoint(ctx context.Context, s SavepointToken) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 	return txn.mu.sender.ReleaseSavepoint(ctx, s)
+}
+
+// ManualRefresh forces a refresh of the read timestamp of a transaction to
+// match that of its write timestamp. It is only recommended for transactions
+// that need extremely precise control over the request ordering, like the
+// transaction that merges ranges together. When combined with
+// DisablePipelining, this feature allows the range merge transaction to
+// prove that it will not be pushed between sending its SubsumeRequest and
+// committing. This enables that request to be pushed at earlier points in
+// its lifecycle.
+func (txn *Txn) ManualRefresh(ctx context.Context) error {
+	txn.mu.Lock()
+	sender := txn.mu.sender
+	txn.mu.Unlock()
+	return sender.ManualRefresh(ctx)
 }

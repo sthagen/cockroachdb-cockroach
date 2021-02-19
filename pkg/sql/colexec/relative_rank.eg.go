@@ -54,7 +54,7 @@ func NewRelativeRankOperator(
 	}
 	rrInitFields := relativeRankInitFields{
 		rankInitFields: rankInitFields{
-			OneInputNode:    NewOneInputNode(input),
+			OneInputNode:    colexecbase.NewOneInputNode(input),
 			allocator:       unlimitedAllocator,
 			outputColIdx:    outputColIdx,
 			partitionColIdx: partitionColIdx,
@@ -89,6 +89,14 @@ func NewRelativeRankOperator(
 		return nil, errors.Errorf("unsupported relative rank type %s", windowFn)
 	}
 }
+
+// relativeRankNumRequiredFDs is the minimum number of file descriptors that
+// might be needed for the machinery of the relative rank operators: the maximum
+// number is needed when CUME_DIST function with either PARTITION BY or ORDER BY
+// clause (or both) is used - we need 3 FDs for each of the spilling queues used
+// by the operator directly plus we use an external sort to handle PARTITION BY
+// and/or ORDER BY clauses.
+const relativeRankNumRequiredFDs = 3 + ExternalSorterMinPartitions
 
 // NOTE: in the context of window functions "partitions" mean a different thing
 // from "partition" in the context of external algorithms and some disk
@@ -173,7 +181,7 @@ type percentRankNoPartitionOp struct {
 var _ closableOperator = &percentRankNoPartitionOp{}
 
 func (r *percentRankNoPartitionOp) Init() {
-	r.Input().Init()
+	r.Input.Init()
 	r.state = relativeRankBuffering
 	usedMemoryLimitFraction := 0.0
 	r.bufferedTuples = newSpillingQueue(
@@ -226,7 +234,7 @@ func (r *percentRankNoPartitionOp) Next(ctx context.Context) coldata.Batch {
 			// This example also shows why we need to use two different queues
 			// (since every partition can have multiple peer groups, the
 			// schedule of "flushing" is different).
-			batch := r.Input().Next(ctx)
+			batch := r.Input.Next(ctx)
 			n := batch.Length()
 			if n == 0 {
 				if err := r.bufferedTuples.enqueue(ctx, coldata.ZeroBatch); err != nil {
@@ -375,7 +383,7 @@ type percentRankWithPartitionOp struct {
 var _ closableOperator = &percentRankWithPartitionOp{}
 
 func (r *percentRankWithPartitionOp) Init() {
-	r.Input().Init()
+	r.Input.Init()
 	r.state = relativeRankBuffering
 	usedMemoryLimitFraction := 0.0
 	r.partitionsState.spillingQueue = newSpillingQueue(
@@ -440,7 +448,7 @@ func (r *percentRankWithPartitionOp) Next(ctx context.Context) coldata.Batch {
 			// This example also shows why we need to use two different queues
 			// (since every partition can have multiple peer groups, the
 			// schedule of "flushing" is different).
-			batch := r.Input().Next(ctx)
+			batch := r.Input.Next(ctx)
 			n := batch.Length()
 			if n == 0 {
 				if err := r.bufferedTuples.enqueue(ctx, coldata.ZeroBatch); err != nil {
@@ -682,7 +690,7 @@ type cumeDistNoPartitionOp struct {
 var _ closableOperator = &cumeDistNoPartitionOp{}
 
 func (r *cumeDistNoPartitionOp) Init() {
-	r.Input().Init()
+	r.Input.Init()
 	r.state = relativeRankBuffering
 	usedMemoryLimitFraction := 0.0
 	r.peerGroupsState.spillingQueue = newSpillingQueue(
@@ -742,7 +750,7 @@ func (r *cumeDistNoPartitionOp) Next(ctx context.Context) coldata.Batch {
 			// This example also shows why we need to use two different queues
 			// (since every partition can have multiple peer groups, the
 			// schedule of "flushing" is different).
-			batch := r.Input().Next(ctx)
+			batch := r.Input.Next(ctx)
 			n := batch.Length()
 			if n == 0 {
 				if err := r.bufferedTuples.enqueue(ctx, coldata.ZeroBatch); err != nil {
@@ -974,7 +982,7 @@ type cumeDistWithPartitionOp struct {
 var _ closableOperator = &cumeDistWithPartitionOp{}
 
 func (r *cumeDistWithPartitionOp) Init() {
-	r.Input().Init()
+	r.Input.Init()
 	r.state = relativeRankBuffering
 	usedMemoryLimitFraction := 0.0
 	r.partitionsState.spillingQueue = newSpillingQueue(
@@ -1046,7 +1054,7 @@ func (r *cumeDistWithPartitionOp) Next(ctx context.Context) coldata.Batch {
 			// This example also shows why we need to use two different queues
 			// (since every partition can have multiple peer groups, the
 			// schedule of "flushing" is different).
-			batch := r.Input().Next(ctx)
+			batch := r.Input.Next(ctx)
 			n := batch.Length()
 			if n == 0 {
 				if err := r.bufferedTuples.enqueue(ctx, coldata.ZeroBatch); err != nil {

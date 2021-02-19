@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
@@ -34,7 +35,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/migration"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -402,9 +405,10 @@ var SerialNormalizationMode = settings.RegisterEnumSetting(
 	"default handling of SERIAL in table definitions",
 	"rowid",
 	map[int64]string{
-		int64(sessiondata.SerialUsesRowID):            "rowid",
-		int64(sessiondata.SerialUsesVirtualSequences): "virtual_sequence",
-		int64(sessiondata.SerialUsesSQLSequences):     "sql_sequence",
+		int64(sessiondata.SerialUsesRowID):              "rowid",
+		int64(sessiondata.SerialUsesVirtualSequences):   "virtual_sequence",
+		int64(sessiondata.SerialUsesSQLSequences):       "sql_sequence",
+		int64(sessiondata.SerialUsesCachedSQLSequences): "sql_sequence_cached",
 	},
 ).WithPublic()
 
@@ -793,10 +797,20 @@ type ExecutorConfig struct {
 
 	GCJobNotifier *gcjobnotifier.Notifier
 
+	RangeFeedFactory *rangefeed.Factory
+
 	// VersionUpgradeHook is called after validating a `SET CLUSTER SETTING
 	// version` but before executing it. It can carry out arbitrary migrations
-	// that allow us to eventually remove legacy code.
-	VersionUpgradeHook func(ctx context.Context, from, to clusterversion.ClusterVersion) error
+	// that allow us to eventually remove legacy code. It will only be populated
+	// on the system tenant.
+	//
+	// TODO(tbg,irfansharif,ajwerner): Hook up for secondary tenants.
+	VersionUpgradeHook func(ctx context.Context, user security.SQLUsername, from, to clusterversion.ClusterVersion) error
+
+	// MigrationJobDeps is used to drive migrations.
+	//
+	// TODO(tbg,irfansharif,ajwerner): Hook up for secondary tenants.
+	MigrationJobDeps migration.JobDeps
 
 	// IndexBackfiller is used to backfill indexes. It is another rather circular
 	// object which mostly just holds on to an ExecConfig.
@@ -910,6 +924,12 @@ type ExecutorTestingKnobs struct {
 	// DeterministicExplainAnalyze, if set, will result in overriding fields in
 	// EXPLAIN ANALYZE (PLAN) that can vary between runs (like elapsed times).
 	DeterministicExplainAnalyze bool
+
+	// Pretend59315IsFixed pretends that this issue is fixed:
+	// https://github.com/cockroachdb/cockroach/issues/59315
+	// which means that we don't need the WithBypassRegistry option
+	// in resetForNewSQLTxn.
+	Pretend59315IsFixed bool
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.
@@ -939,18 +959,17 @@ type TenantTestingKnobs struct {
 	// TenantIDCodecOverride overrides the tenant ID used to construct the SQL
 	// server's codec, but nothing else (e.g. its certs). Used for testing.
 	TenantIDCodecOverride roachpb.TenantID
+
+	// IdleExitCountdownDuration is set will overwrite the default countdown
+	// duration of the countdown timer that leads to shutdown in case of no SQL
+	// connections.
+	IdleExitCountdownDuration time.Duration
 }
 
 var _ base.ModuleTestingKnobs = &TenantTestingKnobs{}
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
 func (*TenantTestingKnobs) ModuleTestingKnobs() {}
-
-// CanSetClusterSettings is a helper method that returns whether the tenant can
-// set in-memory cluster settings.
-func (k *TenantTestingKnobs) CanSetClusterSettings() bool {
-	return k != nil && k.ClusterSettingsUpdater != nil
-}
 
 // BackupRestoreTestingKnobs contains knobs for backup and restore behavior.
 type BackupRestoreTestingKnobs struct {
@@ -976,6 +995,16 @@ var _ base.ModuleTestingKnobs = &BackupRestoreTestingKnobs{}
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
 func (*BackupRestoreTestingKnobs) ModuleTestingKnobs() {}
+
+// StreamIngestionTestingKnobs contains knobs for stream ingestion behavior.
+type StreamIngestionTestingKnobs struct {
+	Interceptors []func(event streamingccl.Event, pa streamingccl.PartitionAddress)
+}
+
+var _ base.ModuleTestingKnobs = &StreamIngestionTestingKnobs{}
+
+// ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
+func (*StreamIngestionTestingKnobs) ModuleTestingKnobs() {}
 
 func shouldDistributeGivenRecAndMode(
 	rec distRecommendation, mode sessiondata.DistSQLExecMode,
@@ -2271,6 +2300,11 @@ func (m *sessionDataMutator) RecordLatestSequenceVal(seqID uint32, val int64) {
 // SetNoticeDisplaySeverity sets the NoticeDisplaySeverity for the given session.
 func (m *sessionDataMutator) SetNoticeDisplaySeverity(severity pgnotice.DisplaySeverity) {
 	m.data.NoticeDisplaySeverity = severity
+}
+
+// initSequenceCache creates an empty sequence cache instance for the session.
+func (m *sessionDataMutator) initSequenceCache() {
+	m.data.SequenceCache = sessiondata.SequenceCache{}
 }
 
 type sqlStatsCollector struct {

@@ -255,7 +255,7 @@ func showFamilyClause(desc catalog.TableDescriptor, f *tree.FmtCtx) {
 				activeColumnNames = append(activeColumnNames, fam.ColumnNames[i])
 			}
 		}
-		if len(desc.VisibleColumns()) == 0 {
+		if len(desc.PublicColumns()) == 0 {
 			f.WriteString("FAMILY ")
 		} else {
 			f.WriteString(",\n\tFAMILY ")
@@ -479,6 +479,14 @@ func showConstraintClause(
 		}
 		f.WriteString(strings.Join(colNames, ", "))
 		f.WriteString(")")
+		if c.IsPartial() {
+			f.WriteString(" WHERE ")
+			pred, err := schemaexpr.FormatExprForDisplay(ctx, desc, c.Predicate, semaCtx, tree.FmtParsable)
+			if err != nil {
+				return err
+			}
+			f.WriteString(pred)
+		}
 		if c.Validity != descpb.ConstraintValidity_Validated {
 			f.WriteString(" NOT VALID")
 		}

@@ -65,16 +65,12 @@ func makeWindowIntoBatch(
 }
 
 func newPartitionerToOperator(
-	allocator *colmem.Allocator,
-	types []*types.T,
-	partitioner colcontainer.PartitionedQueue,
-	partitionIdx int,
+	allocator *colmem.Allocator, types []*types.T, partitioner colcontainer.PartitionedQueue,
 ) *partitionerToOperator {
 	return &partitionerToOperator{
-		allocator:    allocator,
-		types:        types,
-		partitioner:  partitioner,
-		partitionIdx: partitionIdx,
+		allocator:   allocator,
+		types:       types,
+		partitioner: partitioner,
 	}
 }
 
@@ -95,13 +91,22 @@ type partitionerToOperator struct {
 var _ colexecbase.Operator = &partitionerToOperator{}
 
 func (p *partitionerToOperator) Init() {
-	// We will be dequeuing the batches from disk into this batch, so we need to
-	// have enough capacity to support the batches of any size.
-	p.batch = p.allocator.NewMemBatchWithFixedCapacity(p.types, coldata.BatchSize())
+	if p.batch == nil {
+		// We will be dequeueing the batches from disk into this batch, so we
+		// need to have enough capacity to support the batches of any size.
+		p.batch = p.allocator.NewMemBatchWithFixedCapacity(p.types, coldata.BatchSize())
+	}
 }
 
 func (p *partitionerToOperator) Next(ctx context.Context) coldata.Batch {
-	if err := p.partitioner.Dequeue(ctx, p.partitionIdx, p.batch); err != nil {
+	var err error
+	// We need to perform the memory accounting on the dequeued batch. Note that
+	// such setup allows us to release the memory under the old p.batch (which
+	// is no longer valid) and to retain the memory under the just dequeued one.
+	p.allocator.PerformOperation(p.batch.ColVecs(), func() {
+		err = p.partitioner.Dequeue(ctx, p.partitionIdx, p.batch)
+	})
+	if err != nil {
 		colexecerror.InternalError(err)
 	}
 	return p.batch
@@ -128,7 +133,7 @@ func newAppendOnlyBufferedBatch(
 	}
 	batch := allocator.NewMemBatchWithFixedCapacity(typs, 0 /* capacity */)
 	return &appendOnlyBufferedBatch{
-		Batch:       batch,
+		batch:       batch,
 		colVecs:     batch.ColVecs(),
 		colsToStore: colsToStore,
 	}
@@ -146,7 +151,9 @@ func newAppendOnlyBufferedBatch(
 // using utility append() method); however, this batch prohibits appending and
 // replacing of the vectors themselves.
 type appendOnlyBufferedBatch struct {
-	coldata.Batch
+	// We intentionally do not simply embed the batch so that we have to think
+	// through the implementation of each method of coldata.Batch interface.
+	batch coldata.Batch
 
 	length      int
 	colVecs     []coldata.Vec
@@ -167,6 +174,18 @@ func (b *appendOnlyBufferedBatch) SetLength(n int) {
 	b.length = n
 }
 
+func (b *appendOnlyBufferedBatch) Capacity() int {
+	// We assume that the appendOnlyBufferedBatch has unlimited capacity, so all
+	// callers should use that assumption instead of calling Capacity().
+	colexecerror.InternalError(errors.AssertionFailedf("Capacity is prohibited on appendOnlyBufferedBatch"))
+	// This code is unreachable, but the compiler cannot infer that.
+	return 0
+}
+
+func (b *appendOnlyBufferedBatch) Width() int {
+	return b.batch.Width()
+}
+
 func (b *appendOnlyBufferedBatch) ColVec(i int) coldata.Vec {
 	return b.colVecs[i]
 }
@@ -176,14 +195,14 @@ func (b *appendOnlyBufferedBatch) ColVecs() []coldata.Vec {
 }
 
 func (b *appendOnlyBufferedBatch) Selection() []int {
-	if b.Batch.Selection() != nil {
+	if b.batch.Selection() != nil {
 		return b.sel
 	}
 	return nil
 }
 
 func (b *appendOnlyBufferedBatch) SetSelection(useSel bool) {
-	b.Batch.SetSelection(useSel)
+	b.batch.SetSelection(useSel)
 	if useSel {
 		// Make sure that selection vector is of the appropriate length.
 		if cap(b.sel) < b.length {
@@ -200,6 +219,22 @@ func (b *appendOnlyBufferedBatch) AppendCol(coldata.Vec) {
 
 func (b *appendOnlyBufferedBatch) ReplaceCol(coldata.Vec, int) {
 	colexecerror.InternalError(errors.AssertionFailedf("ReplaceCol is prohibited on appendOnlyBufferedBatch"))
+}
+
+func (b *appendOnlyBufferedBatch) Reset([]*types.T, int, coldata.ColumnFactory) {
+	colexecerror.InternalError(errors.AssertionFailedf("Reset is prohibited on appendOnlyBufferedBatch"))
+}
+
+func (b *appendOnlyBufferedBatch) ResetInternalBatch() {
+	b.SetLength(0 /* n */)
+	b.batch.ResetInternalBatch()
+}
+
+func (b *appendOnlyBufferedBatch) String() string {
+	// String should not be used in the fast paths, so we will set the length on
+	// the wrapped batch (which might be a bit expensive but is ok).
+	b.batch.SetLength(b.length)
+	return b.batch.String()
 }
 
 // append is a helper method that appends all tuples with indices in range

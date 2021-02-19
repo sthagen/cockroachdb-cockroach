@@ -13,6 +13,7 @@ package colexec
 import (
 	"container/heap"
 	"context"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
@@ -40,7 +41,7 @@ func NewTopKSorter(
 ) colexecbase.Operator {
 	return &topKSorter{
 		allocator:    allocator,
-		OneInputNode: NewOneInputNode(input),
+		OneInputNode: colexecbase.NewOneInputNode(input),
 		inputTypes:   inputTypes,
 		orderingCols: orderingCols,
 		k:            k,
@@ -65,7 +66,7 @@ const (
 )
 
 type topKSorter struct {
-	OneInputNode
+	colexecbase.OneInputNode
 
 	allocator    *colmem.Allocator
 	orderingCols []execinfrapb.Ordering_Column
@@ -97,7 +98,7 @@ type topKSorter struct {
 }
 
 func (t *topKSorter) Init() {
-	t.input.Init()
+	t.Input.Init()
 	t.topK = newAppendOnlyBufferedBatch(t.allocator, t.inputTypes, nil /* colsToStore */)
 	t.comparators = make([]vecComparator, len(t.inputTypes))
 	for i, typ := range t.inputTypes {
@@ -142,7 +143,7 @@ func (t *topKSorter) Next(ctx context.Context) coldata.Batch {
 // in sorted order.
 func (t *topKSorter) spool(ctx context.Context) {
 	// Fill up t.topK by spooling up to K rows from the input.
-	t.inputBatch = t.input.Next(ctx)
+	t.inputBatch = t.Input.Next(ctx)
 	remainingRows := t.k
 	for remainingRows > 0 && t.inputBatch.Length() > 0 {
 		fromLength := t.inputBatch.Length()
@@ -156,7 +157,7 @@ func (t *topKSorter) spool(ctx context.Context) {
 		})
 		remainingRows -= uint64(fromLength)
 		if fromLength == t.inputBatch.Length() {
-			t.inputBatch = t.input.Next(ctx)
+			t.inputBatch = t.Input.Next(ctx)
 			t.firstUnprocessedTupleIdx = 0
 		}
 	}
@@ -193,7 +194,7 @@ func (t *topKSorter) spool(ctx context.Context) {
 				t.firstUnprocessedTupleIdx = t.inputBatch.Length()
 			},
 		)
-		t.inputBatch = t.input.Next(ctx)
+		t.inputBatch = t.Input.Next(ctx)
 		t.firstUnprocessedTupleIdx = 0
 	}
 
@@ -216,7 +217,10 @@ func (t *topKSorter) emit() coldata.Batch {
 	if toEmit > coldata.BatchSize() {
 		toEmit = coldata.BatchSize()
 	}
-	t.output, _ = t.allocator.ResetMaybeReallocate(t.inputTypes, t.output, toEmit)
+	// For now, we don't enforce any footprint-based memory limit.
+	// TODO(yuzefovich): refactor this.
+	const maxBatchMemSize = math.MaxInt64
+	t.output, _ = t.allocator.ResetMaybeReallocate(t.inputTypes, t.output, toEmit, maxBatchMemSize)
 	for i := range t.inputTypes {
 		vec := t.output.ColVec(i)
 		// At this point, we have already fully sorted the input. It is ok to do

@@ -205,8 +205,9 @@ func (r *Replica) tryReproposeWithNewLeaseIndex(
 
 	minTS, untrack := r.store.cfg.ClosedTimestamp.Tracker.Track(ctx)
 	defer untrack(ctx, 0, 0, 0) // covers all error paths below
-	// NB: p.Request.Timestamp reflects the action of ba.SetActiveTimestamp.
-	if p.Request.Timestamp.Less(minTS) {
+	// The IsIntentWrite condition matches the similar logic for caring
+	// about the closed timestamp cache in applyTimestampCache().
+	if p.Request.IsIntentWrite() && p.Request.WriteTimestamp().LessEq(minTS) {
 		// The tracker wants us to forward the request timestamp, but we can't
 		// do that without re-evaluating, so give up. The error returned here
 		// will go to back to DistSender, so send something it can digest.
@@ -259,7 +260,10 @@ func (r *Replica) handleDescResult(ctx context.Context, desc *roachpb.RangeDescr
 func (r *Replica) handleLeaseResult(ctx context.Context, lease *roachpb.Lease) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.leasePostApplyLocked(ctx, *lease, false /* permitJump */)
+	r.leasePostApplyLocked(ctx,
+		r.mu.state.Lease, /* prevLease */
+		lease,            /* newLease */
+		assertNoLeaseJump)
 }
 
 func (r *Replica) handleTruncatedStateResult(

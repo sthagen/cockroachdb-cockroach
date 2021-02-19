@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -47,11 +46,23 @@ import (
 	"github.com/cockroachdb/logtags"
 )
 
+// TopicDescriptor describes topic emitted by the sink.
+type TopicDescriptor interface {
+	// GetName returns topic name.
+	GetName() string
+	// GetID returns topic identifier.
+	GetID() descpb.ID
+	// GetVersion returns topic version.
+	// For example, the underlying data source (e.g. table) may change, in which case
+	// we may want to emit same Name/ID, but a different version number.
+	GetVersion() descpb.DescriptorVersion
+}
+
 // Sink is an abstraction for anything that a changefeed may emit into.
 type Sink interface {
 	// EmitRow enqueues a row message for asynchronous delivery on the sink. An
 	// error may be returned if a previously enqueued message has failed.
-	EmitRow(ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp) error
+	EmitRow(ctx context.Context, topic TopicDescriptor, key, value []byte, updated hlc.Timestamp) error
 	// EmitResolvedTimestamp enqueues a resolved timestamp message for
 	// asynchronous delivery on every topic that has been seen by EmitRow. An
 	// error may be returned if a previously enqueued message has failed.
@@ -157,6 +168,23 @@ func getSink(
 			}
 			cfg.saslHandshake = b
 		}
+
+		cfg.saslMechanism = q.Get(changefeedbase.SinkParamSASLMechanism)
+		q.Del(changefeedbase.SinkParamSASLMechanism)
+		if cfg.saslMechanism != `` && !cfg.saslEnabled {
+			return nil, errors.Errorf(`%s must be enabled to configure SASL mechanism`, changefeedbase.SinkParamSASLEnabled)
+		}
+		if cfg.saslMechanism == `` {
+			cfg.saslMechanism = sarama.SASLTypePlaintext
+		}
+		switch cfg.saslMechanism {
+		case sarama.SASLTypeSCRAMSHA256, sarama.SASLTypeSCRAMSHA512, sarama.SASLTypePlaintext:
+		default:
+			return nil, errors.Errorf(`param %s must be one of %s, %s, or %s`,
+				changefeedbase.SinkParamSASLMechanism,
+				sarama.SASLTypeSCRAMSHA256, sarama.SASLTypeSCRAMSHA512, sarama.SASLTypePlaintext)
+		}
+
 		cfg.saslUser = q.Get(changefeedbase.SinkParamSASLUser)
 		q.Del(changefeedbase.SinkParamSASLUser)
 		cfg.saslPassword = q.Get(changefeedbase.SinkParamSASLPassword)
@@ -239,9 +267,9 @@ type errorWrapperSink struct {
 }
 
 func (s errorWrapperSink) EmitRow(
-	ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context, topicDescr TopicDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
-	if err := s.wrapped.EmitRow(ctx, table, key, value, updated); err != nil {
+	if err := s.wrapped.EmitRow(ctx, topicDescr, key, value, updated); err != nil {
 		return MarkRetryableError(err)
 	}
 	return nil
@@ -305,6 +333,7 @@ type kafkaSinkConfig struct {
 	saslHandshake    bool
 	saslUser         string
 	saslPassword     string
+	saslMechanism    string
 	targetNames      map[descpb.ID]string
 }
 
@@ -393,6 +422,13 @@ func makeKafkaSink(
 		config.Net.SASL.Handshake = cfg.saslHandshake
 		config.Net.SASL.User = cfg.saslUser
 		config.Net.SASL.Password = cfg.saslPassword
+		config.Net.SASL.Mechanism = sarama.SASLMechanism(cfg.saslMechanism)
+		switch config.Net.SASL.Mechanism {
+		case sarama.SASLTypeSCRAMSHA512:
+			config.Net.SASL.SCRAMClientGeneratorFunc = sha512ClientGenerator
+		case sarama.SASLTypeSCRAMSHA256:
+			config.Net.SASL.SCRAMClientGeneratorFunc = sha256ClientGenerator
+		}
 	}
 
 	// When we emit messages to sarama, they're placed in a queue (as does any
@@ -471,9 +507,9 @@ func (s *kafkaSink) Close() error {
 
 // EmitRow implements the Sink interface.
 func (s *kafkaSink) EmitRow(
-	ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context, topicDescr TopicDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
-	topic := s.cfg.kafkaTopicPrefix + SQLNameToKafkaName(s.cfg.targetNames[table.GetID()])
+	topic := s.cfg.kafkaTopicPrefix + SQLNameToKafkaName(s.cfg.targetNames[topicDescr.GetID()])
 	if _, ok := s.topics[topic]; !ok {
 		return errors.Errorf(`cannot emit to undeclared topic: %s`, topic)
 	}
@@ -709,9 +745,9 @@ func makeSQLSink(uri, tableName string, targets jobspb.ChangefeedTargets) (*sqlS
 
 // EmitRow implements the Sink interface.
 func (s *sqlSink) EmitRow(
-	ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context, topicDescr TopicDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
-	topic := s.targetNames[table.GetID()]
+	topic := s.targetNames[topicDescr.GetID()]
 	if _, ok := s.topics[topic]; !ok {
 		return errors.Errorf(`cannot emit to undeclared topic: %s`, topic)
 	}
@@ -823,17 +859,16 @@ type bufferSink struct {
 
 // EmitRow implements the Sink interface.
 func (s *bufferSink) EmitRow(
-	ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context, topic TopicDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
 	if s.closed {
 		return errors.New(`cannot EmitRow on a closed sink`)
 	}
-	topic := table.GetName()
 	s.buf.Push(rowenc.EncDatumRow{
 		{Datum: tree.DNull}, // resolved span
-		{Datum: s.alloc.NewDString(tree.DString(topic))}, // topic
-		{Datum: s.alloc.NewDBytes(tree.DBytes(key))},     // key
-		{Datum: s.alloc.NewDBytes(tree.DBytes(value))},   // value
+		{Datum: s.alloc.NewDString(tree.DString(topic.GetName()))}, // topic
+		{Datum: s.alloc.NewDBytes(tree.DBytes(key))},               // key
+		{Datum: s.alloc.NewDBytes(tree.DBytes(value))},             // value
 	})
 	return nil
 }

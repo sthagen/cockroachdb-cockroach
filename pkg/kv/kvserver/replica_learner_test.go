@@ -788,6 +788,7 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 	})
 	defer tc.Stopper().Stop(ctx)
 	db := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tr := tc.Server(0).Tracer().(*tracing.Tracer)
 	db.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s'`,
 		testingTargetDuration))
 	db.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.close_fraction = $1`, testingCloseFraction)
@@ -800,9 +801,12 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 	})
 
 	check := func() {
+		ts := tc.Server(0).Clock().Now()
+		txn := roachpb.MakeTransaction("txn", nil, 0, ts, 0)
 		req := roachpb.BatchRequest{Header: roachpb.Header{
 			RangeID:   scratchDesc.RangeID,
-			Timestamp: tc.Server(0).Clock().Now(),
+			Timestamp: ts,
+			Txn:       &txn,
 		}}
 		req.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
 			Key: scratchDesc.StartKey.AsRawKey(), EndKey: scratchDesc.EndKey.AsRawKey(),
@@ -812,7 +816,7 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			// Trace the Send call so we can verify that it hit the exact `learner
 			// replicas cannot serve follower reads` branch that we're trying to test.
-			sendCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, "manual read request")
+			sendCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "manual read request")
 			defer cancel()
 			_, pErr := repl.Send(sendCtx, req)
 			err := pErr.GoError()

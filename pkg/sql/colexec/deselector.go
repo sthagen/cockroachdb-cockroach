@@ -12,6 +12,7 @@ package colexec
 
 import (
 	"context"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
@@ -24,7 +25,7 @@ import (
 // or omitted according to the selection vector). If the batches come with no
 // selection vector, it is a noop.
 type deselectorOp struct {
-	OneInputNode
+	colexecbase.OneInputNode
 	NonExplainable
 	allocator  *colmem.Allocator
 	inputTypes []*types.T
@@ -40,29 +41,37 @@ func NewDeselectorOp(
 	allocator *colmem.Allocator, input colexecbase.Operator, typs []*types.T,
 ) colexecbase.Operator {
 	return &deselectorOp{
-		OneInputNode: NewOneInputNode(input),
+		OneInputNode: colexecbase.NewOneInputNode(input),
 		allocator:    allocator,
 		inputTypes:   typs,
 	}
 }
 
 func (p *deselectorOp) Init() {
-	p.input.Init()
+	p.Input.Init()
 }
 
 func (p *deselectorOp) Next(ctx context.Context) coldata.Batch {
+	// deselectorOp should *not* limit the capacities of the returned batches,
+	// so we don't use a memory limit here. It is up to the wrapped operator to
+	// limit the size of batches based on the memory footprint.
+	const maxBatchMemSize = math.MaxInt64
 	// TODO(yuzefovich): this allocation is only needed in order to appease the
 	// tests of the external sorter with forced disk spilling (if we don't do
 	// this, an OOM error occurs during ResetMaybeReallocate call below at
 	// which point we have already received a batch from the input and it'll
 	// get lost because deselectorOp doesn't support fall-over to the
 	// disk-backed infrastructure).
-	p.output, _ = p.allocator.ResetMaybeReallocate(p.inputTypes, p.output, 1 /* minCapacity */)
-	batch := p.input.Next(ctx)
+	p.output, _ = p.allocator.ResetMaybeReallocate(
+		p.inputTypes, p.output, 1 /* minCapacity */, maxBatchMemSize,
+	)
+	batch := p.Input.Next(ctx)
 	if batch.Selection() == nil {
 		return batch
 	}
-	p.output, _ = p.allocator.ResetMaybeReallocate(p.inputTypes, p.output, batch.Length())
+	p.output, _ = p.allocator.ResetMaybeReallocate(
+		p.inputTypes, p.output, batch.Length(), maxBatchMemSize,
+	)
 	sel := batch.Selection()
 	p.allocator.PerformOperation(p.output.ColVecs(), func() {
 		for i := range p.inputTypes {

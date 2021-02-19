@@ -94,7 +94,7 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster, buildVersion ve
 		// The version to create/update the fixture for. Must be released (i.e.
 		// can download it from the homepage); if that is not the case use the
 		// empty string which uses the local cockroach binary.
-		newV := "20.2.4"
+		newV := "20.2.5"
 		predV, err := PredecessorVersion(*version.MustParse("v" + newV))
 		if err != nil {
 			t.Fatal(err)
@@ -172,6 +172,14 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster, buildVersion ve
 		// schemaChangeStep,
 		backupStep,
 		waitForUpgradeStep(c.All()),
+		testFeaturesStep,
+		// schemaChangeStep,
+		backupStep,
+		// Turn tracing on globally to give it a fighting chance at exposing any
+		// crash-inducing incompatibilities or horrendous memory leaks. (It won't
+		// catch most memory leaks since this test doesn't run for too long or does
+		// too much work). Then, run the previous tests again.
+		enableTracingGloballyStep,
 		testFeaturesStep,
 		// schemaChangeStep,
 		backupStep,
@@ -351,6 +359,15 @@ func binaryUpgradeStep(nodes nodeListOption, newVersion string) versionStep {
 			// test? We could run logictests. We could add custom logic here. Maybe
 			// this should all be pushed to nightly migration tests instead.
 		}
+	}
+}
+
+func enableTracingGloballyStep(ctx context.Context, t *test, u *versionUpgradeTest) {
+	db := u.conn(ctx, t, 1)
+	// NB: this enables net/trace, and as a side effect creates verbose trace spans everywhere.
+	_, err := db.ExecContext(ctx, `SET CLUSTER SETTING trace.debug.enable = $1`, true)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

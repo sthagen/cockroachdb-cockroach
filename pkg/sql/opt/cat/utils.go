@@ -163,14 +163,18 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 
 	for i := 0; i < tab.UniqueCount(); i++ {
 		var withoutIndexStr string
-		if tab.Unique(i).WithoutIndex() {
+		uniq := tab.Unique(i)
+		if uniq.WithoutIndex() {
 			withoutIndexStr = "WITHOUT INDEX "
 		}
-		child.Childf(
+		c := child.Childf(
 			"UNIQUE %s%s",
 			withoutIndexStr,
 			formatCols(tab, tab.Unique(i).ColumnCount(), tab.Unique(i).ColumnOrdinal),
 		)
+		if pred, isPartial := uniq.Predicate(); isPartial {
+			c.Childf("WHERE %s", pred)
+		}
 	}
 
 	// TODO(radu): show stats.
@@ -180,15 +184,19 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 // debugging and testing.
 func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 	idx := tab.Index(ord)
-	inverted := ""
-	if idx.IsInverted() {
-		inverted = "INVERTED "
+	idxType := ""
+	if idx.Ordinal() == PrimaryIndex {
+		idxType = "PRIMARY "
+	} else if idx.IsUnique() {
+		idxType = "UNIQUE "
+	} else if idx.IsInverted() {
+		idxType = "INVERTED "
 	}
 	mutation := ""
 	if IsMutationIndex(tab, ord) {
 		mutation = " (mutation)"
 	}
-	child := tp.Childf("%sINDEX %s%s", inverted, idx.Name(), mutation)
+	child := tp.Childf("%sINDEX %s%s", idxType, idx.Name(), mutation)
 
 	var buf bytes.Buffer
 	colCount := idx.ColumnCount()
@@ -240,8 +248,7 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 		}
 	}
 	if pred, isPartial := idx.Predicate(); isPartial {
-		c := child.Child("WHERE")
-		c.Childf(pred)
+		child.Childf("WHERE %s", pred)
 	}
 }
 

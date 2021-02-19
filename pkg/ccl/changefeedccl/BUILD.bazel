@@ -13,6 +13,7 @@ go_library(
         "metrics.go",
         "name.go",
         "rowfetcher_cache.go",
+        "scram_client.go",
         "sink.go",
         "sink_cloudstorage.go",
         "testing_knobs.go",
@@ -21,8 +22,9 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
-        "//pkg/ccl/backupccl",
+        "//pkg/ccl/backupccl/backupbase",
         "//pkg/ccl/changefeedccl/changefeedbase",
+        "//pkg/ccl/changefeedccl/changefeeddist",
         "//pkg/ccl/changefeedccl/kvfeed",
         "//pkg/ccl/utilccl",
         "//pkg/docs",
@@ -56,7 +58,6 @@ go_library(
         "//pkg/sql/flowinfra",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
-        "//pkg/sql/physicalplan",
         "//pkg/sql/privilege",
         "//pkg/sql/roleoption",
         "//pkg/sql/row",
@@ -92,11 +93,13 @@ go_library(
         "@com_github_google_btree//:btree",
         "@com_github_linkedin_goavro_v2//:goavro",
         "@com_github_shopify_sarama//:sarama",
+        "@com_github_xdg_scram//:scram",
     ],
 )
 
 go_test(
     name = "changefeedccl_test",
+    size = "medium",
     srcs = [
         "avro_test.go",
         "bench_test.go",
@@ -111,6 +114,7 @@ go_test(
         "validations_test.go",
     ],
     embed = [":changefeedccl"],
+    tags = ["broken_in_bazel"],
     deps = [
         "//pkg/base",
         "//pkg/blobs",

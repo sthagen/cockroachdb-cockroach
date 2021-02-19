@@ -54,7 +54,6 @@ type rowFetcher interface {
 	PartialKey(int) (roachpb.Key, error)
 	Reset()
 	GetBytesRead() int64
-	GetContentionEvents() []roachpb.ContentionEvent
 	NextRowWithErrors(context.Context) (rowenc.EncDatumRow, error)
 	// Close releases any resources held by this fetcher.
 	Close(ctx context.Context)
@@ -75,8 +74,8 @@ func initRowFetcher(
 	scanVisibility execinfrapb.ScanVisibility,
 	lockStrength descpb.ScanLockingStrength,
 	lockWaitPolicy descpb.ScanLockingWaitPolicy,
-	systemColumns []descpb.ColumnDescriptor,
-	virtualColumn *descpb.ColumnDescriptor,
+	withSystemColumns bool,
+	virtualColumn catalog.Column,
 ) (index *descpb.IndexDescriptor, isSecondaryIndex bool, err error) {
 	if indexIdx >= len(desc.ActiveIndexes()) {
 		return nil, false, errors.Errorf("invalid indexIdx %d", indexIdx)
@@ -92,7 +91,7 @@ func initRowFetcher(
 		IsSecondaryIndex: isSecondaryIndex,
 		ValNeededForCol:  valNeededForCol,
 	}
-	tableArgs.InitCols(desc, scanVisibility, systemColumns, virtualColumn)
+	tableArgs.InitCols(desc, scanVisibility, withSystemColumns, virtualColumn)
 
 	if err := fetcher.Init(
 		flowCtx.EvalCtx.Context,
@@ -108,19 +107,5 @@ func initRowFetcher(
 		return nil, false, err
 	}
 
-	if flowCtx.Cfg.TestingKnobs.GenerateMockContentionEvents {
-		fetcher.TestingEnableMockContentionEventGeneration()
-	}
-
 	return index, isSecondaryIndex, nil
-}
-
-// getCumulativeContentionTime is a helper function to calculate the cumulative
-// contention time from a slice of roachpb.ContentionEvents.
-func getCumulativeContentionTime(events []roachpb.ContentionEvent) time.Duration {
-	var cumulativeContentionTime time.Duration
-	for _, e := range events {
-		cumulativeContentionTime += e.Duration
-	}
-	return cumulativeContentionTime
 }

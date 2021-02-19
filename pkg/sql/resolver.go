@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
@@ -205,6 +206,48 @@ func (p *planner) CommonLookupFlags(required bool) tree.CommonLookupFlags {
 	}
 }
 
+// IsTableVisible is part of the tree.EvalDatabase interface.
+func (p *planner) IsTableVisible(
+	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, tableID int64,
+) (isVisible, exists bool, err error) {
+	tableDesc, err := p.LookupTableByID(ctx, descpb.ID(tableID))
+	if err != nil {
+		// If an error happened here, it means the table doesn't exist, so we
+		// return "not exists" rather than the error.
+		return false, false, nil //nolint:returnerrcheck
+	}
+	schemaID := tableDesc.GetParentSchemaID()
+	schemaDesc, err := p.Descriptors().GetImmutableSchemaByID(ctx, p.Txn(), schemaID,
+		tree.SchemaLookupFlags{
+			Required:    true,
+			AvoidCached: p.avoidCachedDescriptors})
+	if err != nil {
+		return false, false, err
+	}
+	if schemaDesc.Kind != catalog.SchemaVirtual {
+		dbID := tableDesc.GetParentID()
+		_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.Txn(), dbID,
+			tree.DatabaseLookupFlags{
+				Required:    true,
+				AvoidCached: p.avoidCachedDescriptors})
+		if err != nil {
+			return false, false, err
+		}
+		if dbDesc.Name != curDB {
+			// If the table is in a different database, then it's considered to be
+			// "not existing" instead of just "not visible"; this matches PostgreSQL.
+			return false, false, nil
+		}
+	}
+	iter := searchPath.Iter()
+	for scName, ok := iter.Next(); ok; scName, ok = iter.Next() {
+		if schemaDesc.Name == scName {
+			return true, true, nil
+		}
+	}
+	return false, true, nil
+}
+
 // GetTypeDescriptor implements the descpb.TypeDescriptorResolver interface.
 func (p *planner) GetTypeDescriptor(
 	ctx context.Context, id descpb.ID,
@@ -214,7 +257,7 @@ func (p *planner) GetTypeDescriptor(
 		return tree.TypeName{}, nil, err
 	}
 	// Note that the value of required doesn't matter for lookups by ID.
-	dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.ParentID, p.CommonLookupFlags(true /* required */))
+	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.ParentID, p.CommonLookupFlags(true /* required */))
 	if err != nil {
 		return tree.TypeName{}, nil, err
 	}
@@ -429,8 +472,9 @@ func (p *planner) getFullyQualifiedTableNamesFromIDs(
 func (p *planner) getQualifiedTableName(
 	ctx context.Context, desc catalog.TableDescriptor,
 ) (*tree.TableName, error) {
-	dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.GetParentID(),
+	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.GetParentID(),
 		tree.DatabaseLookupFlags{
+			Required:       true,
 			IncludeOffline: true,
 			IncludeDropped: true,
 		})
@@ -454,14 +498,34 @@ func (p *planner) getQualifiedTableName(
 	return &tbName, nil
 }
 
+// GetQualifiedTableNameByID returns the qualified name of the table,
+// view or sequence represented by the provided ID and table kind.
+func (p *planner) GetQualifiedTableNameByID(
+	ctx context.Context, id int64, requiredType tree.RequiredTableKind,
+) (*tree.TableName, error) {
+	lookupFlags := tree.ObjectLookupFlags{
+		CommonLookupFlags:    tree.CommonLookupFlags{Required: true},
+		DesiredObjectKind:    tree.TableObject,
+		DesiredTableDescKind: requiredType,
+	}
+
+	table, err := p.Descriptors().GetImmutableTableByID(
+		ctx, p.txn, descpb.ID(id), lookupFlags)
+	if err != nil {
+		return nil, err
+	}
+	return p.getQualifiedTableName(ctx, table)
+}
+
 // getQualifiedSchemaName returns the database-qualified name of the
 // schema represented by the provided descriptor.
 func (p *planner) getQualifiedSchemaName(
 	ctx context.Context, desc catalog.SchemaDescriptor,
 ) (*tree.ObjectNamePrefix, error) {
-	dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.GetParentID(), tree.DatabaseLookupFlags{
-		Required: true,
-	})
+	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.GetParentID(),
+		tree.DatabaseLookupFlags{
+			Required: true,
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -478,9 +542,10 @@ func (p *planner) getQualifiedSchemaName(
 func (p *planner) getQualifiedTypeName(
 	ctx context.Context, desc catalog.TypeDescriptor,
 ) (*tree.TypeName, error) {
-	dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.GetParentID(), tree.DatabaseLookupFlags{
-		Required: true,
-	})
+	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.GetParentID(),
+		tree.DatabaseLookupFlags{
+			Required: true,
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -749,20 +814,6 @@ func (l *internalLookupCtx) GetDesc(ctx context.Context, id descpb.ID) (catalog.
 		return l.fallback.GetDesc(ctx, id)
 	}
 	return nil, nil
-}
-
-func (l *internalLookupCtx) GetDescs(
-	ctx context.Context, reqs []descpb.ID,
-) ([]catalog.Descriptor, error) {
-	ret := make([]catalog.Descriptor, len(reqs))
-	for i := 0; i < len(reqs); i++ {
-		var err error
-		ret[i], err = l.GetDesc(ctx, reqs[i])
-		if err != nil {
-			return nil, err
-		}
-	}
-	return ret, nil
 }
 
 // tableLookupFn can be used to retrieve a table descriptor and its corresponding

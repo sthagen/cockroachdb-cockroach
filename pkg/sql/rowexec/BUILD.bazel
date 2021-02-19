@@ -17,6 +17,7 @@ go_library(
         "inverted_joiner.go",
         "joinerbase.go",
         "joinreader.go",
+        "joinreader_span_generator.go",
         "joinreader_strategies.go",
         "mergejoiner.go",
         "noop.go",
@@ -95,6 +96,7 @@ go_library(
 
 go_test(
     name = "rowexec_test",
+    size = "medium",
     srcs = [
         "aggregator_test.go",
         "backfiller_test.go",
@@ -169,6 +171,7 @@ go_test(
         "//pkg/testutils/testcluster",
         "//pkg/util",
         "//pkg/util/encoding",
+        "//pkg/util/hlc",
         "//pkg/util/json",
         "//pkg/util/leaktest",
         "//pkg/util/log",

@@ -471,12 +471,12 @@ func (tc *TxnCoordSender) Send(
 	if tc.mu.txn.ID == (uuid.UUID{}) {
 		log.Fatalf(ctx, "cannot send transactional request through unbound TxnCoordSender")
 	}
-	if !sp.IsBlackHole() {
+	if sp.IsVerbose() {
 		sp.SetBaggageItem("txnID", tc.mu.txn.ID.String())
-	}
-	ctx = logtags.AddTag(ctx, "txn", uuid.ShortStringer(tc.mu.txn.ID))
-	if log.V(2) {
-		ctx = logtags.AddTag(ctx, "ts", tc.mu.txn.WriteTimestamp)
+		ctx = logtags.AddTag(ctx, "txn", uuid.ShortStringer(tc.mu.txn.ID))
+		if log.V(2) {
+			ctx = logtags.AddTag(ctx, "ts", tc.mu.txn.WriteTimestamp)
+		}
 	}
 
 	// It doesn't make sense to use inconsistent reads in a transaction. However,
@@ -923,12 +923,19 @@ func (tc *TxnCoordSender) SetFixedTimestamp(ctx context.Context, ts hlc.Timestam
 	defer tc.mu.Unlock()
 	tc.mu.txn.ReadTimestamp = ts
 	tc.mu.txn.WriteTimestamp = ts
-	tc.mu.txn.MaxTimestamp = ts
+	tc.mu.txn.GlobalUncertaintyLimit = ts
 	tc.mu.txn.CommitTimestampFixed = true
 
 	// Set the MinTimestamp to the minimum of the existing MinTimestamp and the fixed
 	// timestamp. This ensures that the MinTimestamp is always <= the other timestamps.
 	tc.mu.txn.MinTimestamp.Backward(ts)
+}
+
+// RequiredFrontier is part of the client.TxnSender interface.
+func (tc *TxnCoordSender) RequiredFrontier() hlc.Timestamp {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.mu.txn.RequiredFrontier()
 }
 
 // ManualRestart is part of the client.TxnSender interface.
@@ -1142,4 +1149,25 @@ func (tc *TxnCoordSender) GetSteppingMode(ctx context.Context) (curMode kv.Stepp
 		curMode = kv.SteppingEnabled
 	}
 	return curMode
+}
+
+// ManualRefresh is part of the TxnSender interface.
+func (tc *TxnCoordSender) ManualRefresh(ctx context.Context) error {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	// Hijack the pre-emptive refresh code path to perform the refresh but
+	// provide the force flag to ensure that the refresh occurs unconditionally.
+	var ba roachpb.BatchRequest
+	ba.Txn = tc.mu.txn.Clone()
+	const force = true
+	ba, pErr := tc.interceptorAlloc.txnSpanRefresher.maybeRefreshPreemptivelyLocked(ctx, ba, force)
+	if pErr != nil {
+		pErr = tc.updateStateLocked(ctx, ba, nil, pErr)
+	} else {
+		var br roachpb.BatchResponse
+		br.Txn = ba.Txn
+		pErr = tc.updateStateLocked(ctx, ba, &br, pErr)
+	}
+	return pErr.GoError()
 }

@@ -347,7 +347,7 @@ func (desc *Mutable) AddEnumValue(node *tree.AlterTypeAddValue) error {
 			}
 		}
 		if foundIndex == -1 {
-			return pgerror.Newf(pgcode.InvalidParameterValue, "%q is not an existing enum label", existing)
+			return pgerror.Newf(pgcode.InvalidParameterValue, "%q is not an existing enum value", existing)
 		}
 
 		pos = foundIndex
@@ -429,8 +429,13 @@ func (e EnumMembers) Less(i, j int) bool {
 }
 func (e EnumMembers) Swap(i, j int) { e[i], e[j] = e[j], e[i] }
 
-// Validate performs validation on the TypeDescriptor.
-func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) error {
+func isBeingDropped(member *descpb.TypeDescriptor_EnumMember) bool {
+	return member.Capability == descpb.TypeDescriptor_EnumMember_READ_ONLY &&
+		member.Direction == descpb.TypeDescriptor_EnumMember_REMOVE
+}
+
+// ValidateSelf performs validation on the TypeDescriptor.
+func (desc *Immutable) ValidateSelf(_ context.Context) error {
 	// Validate local properties of the descriptor.
 	if err := catalog.ValidateName(desc.Name, "type"); err != nil {
 		return err
@@ -469,7 +474,7 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 				return errors.AssertionFailedf("duplicate enum physical rep %v", desc.EnumMembers[i].PhysicalRepresentation)
 			}
 		}
-		// Ensure there are no duplicate enum labels.
+		// Ensure there are no duplicate enum values.
 		members := make(map[string]struct{}, len(desc.EnumMembers))
 		for i := range desc.EnumMembers {
 			_, ok := members[desc.EnumMembers[i].LogicalRepresentation]
@@ -519,8 +524,18 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 		}
 	}
 
+	return nil
+}
+
+// Validate performs ValidateSelf followed by
+// cross reference checks on the descriptor.
+func (desc *Immutable) Validate(ctx context.Context, descGetter catalog.DescGetter) error {
+	if err := desc.ValidateSelf(ctx); err != nil {
+		return err
+	}
+
 	// Don't validate cross-references for dropped descriptors.
-	if desc.Dropped() {
+	if desc.Dropped() || descGetter == nil {
 		return nil
 	}
 
@@ -560,7 +575,14 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 				return err
 			}
 
-			if len(desc.EnumMembers) != len(dbRegions) {
+			// Count the number of regions that aren't being dropped.
+			numRegions := 0
+			for _, member := range desc.EnumMembers {
+				if !isBeingDropped(&member) {
+					numRegions++
+				}
+			}
+			if numRegions != len(dbRegions) {
 				return errors.AssertionFailedf(
 					"unexpected number of regions on db desc: %d expected %d",
 					len(dbRegions), len(desc.EnumMembers))
@@ -571,8 +593,11 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 				regions[region] = struct{}{}
 			}
 
-			for i := range desc.EnumMembers {
-				enumRegion := descpb.RegionName(desc.EnumMembers[i].LogicalRepresentation)
+			for _, member := range desc.EnumMembers {
+				if isBeingDropped(&member) {
+					continue
+				}
+				enumRegion := descpb.RegionName(member.LogicalRepresentation)
 				if _, ok := regions[enumRegion]; !ok {
 					return errors.AssertionFailedf("did not find %q region on database descriptor", enumRegion)
 				}
@@ -636,21 +661,25 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 	// Validate that all of the referencing descriptors exist.
 	tableExists := func(id descpb.ID) func(got catalog.Descriptor) error {
 		return func(got catalog.Descriptor) error {
-			if _, isTable := got.(catalog.TableDescriptor); !isTable {
+			tableDesc, isTable := got.(catalog.TableDescriptor)
+			if !isTable {
 				return errors.AssertionFailedf("referencing descriptor %d does not exist", id)
+			}
+			if tableDesc.Dropped() {
+				return errors.AssertionFailedf(
+					"referencing descriptor %d was dropped without dependency unlinking", id)
 			}
 			return nil
 		}
 	}
 	if !desc.Dropped() {
-
 		for _, id := range desc.ReferencingDescriptorIDs {
 			reqs = append(reqs, id)
 			checks = append(checks, tableExists(id))
 		}
 	}
 
-	descs, err := dg.GetDescs(ctx, reqs)
+	descs, err := catalog.GetDescs(ctx, descGetter, reqs)
 	if err != nil {
 		return err
 	}
@@ -663,6 +692,11 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 	}
 
 	return nil
+}
+
+// ValidateTxnCommit punts to Validate.
+func (desc *Immutable) ValidateTxnCommit(ctx context.Context, descGetter catalog.DescGetter) error {
+	return desc.Validate(ctx, descGetter)
 }
 
 // TypeLookupFunc is a type alias for a function that looks up a type by ID.

@@ -198,16 +198,20 @@ func TestQueryIsAdminWithNoTxn(t *testing.T) {
 
 	for _, tc := range testData {
 		t.Run(tc.user.Normalized(), func(t *testing.T) {
-			rows, cols, err := ie.QueryWithCols(ctx, "test", nil, /* txn */
+			row, cols, err := ie.QueryRowExWithCols(ctx, "test", nil, /* txn */
 				sessiondata.InternalExecutorOverride{User: tc.user},
 				"SELECT crdb_internal.is_admin()")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(rows) != 1 || len(cols) != 1 {
-				t.Fatalf("unexpected result shape %d, %d", len(rows), len(cols))
+			if row == nil || len(cols) != 1 {
+				numRows := 0
+				if row != nil {
+					numRows = 1
+				}
+				t.Fatalf("unexpected result shape %d, %d", numRows, len(cols))
 			}
-			isAdmin := bool(*rows[0][0].(*tree.DBool))
+			isAdmin := bool(*row[0].(*tree.DBool))
 			if isAdmin != tc.expAdmin {
 				t.Fatalf("expected %q admin %v, got %v", tc.user, tc.expAdmin, isAdmin)
 			}
@@ -247,7 +251,7 @@ GRANT admin TO testadmin`
 		{"testadmin", "nonexistent", false, "unrecognized role option"},
 	} {
 		username := security.MakeSQLUsernameFromPreNormalizedString(tc.user)
-		rows, cols, err := ie.QueryWithCols(ctx, "test", nil, /* txn */
+		row, cols, err := ie.QueryRowExWithCols(ctx, "test", nil, /* txn */
 			sessiondata.InternalExecutorOverride{User: username},
 			"SELECT crdb_internal.has_role_option($1)", tc.option)
 		if tc.expectedErr != "" {
@@ -256,10 +260,14 @@ GRANT admin TO testadmin`
 			}
 			continue
 		}
-		if len(rows) != 1 || len(cols) != 1 {
-			t.Fatalf("unexpected result shape %d, %d", len(rows), len(cols))
+		if row == nil || len(cols) != 1 {
+			numRows := 0
+			if row != nil {
+				numRows = 1
+			}
+			t.Fatalf("unexpected result shape %d, %d", numRows, len(cols))
 		}
-		hasRoleOption := bool(*rows[0][0].(*tree.DBool))
+		hasRoleOption := bool(*row[0].(*tree.DBool))
 		if hasRoleOption != tc.expected {
 			t.Fatalf(
 				"expected %q has_role_option('%s') %v, got %v", tc.user, tc.option, tc.expected,
@@ -458,7 +466,7 @@ func testInternalExecutorAppNameInitialization(
 	}
 
 	// We'll want to look at statistics below, and finish the test with
-	// no goroutine leakage. To achieve this, cancel the query. and
+	// no goroutine leakage. To achieve this, cancel the query and
 	// drain the goroutine.
 	if _, err := ie.Exec(context.Background(), "cancel-query", nil, "CANCEL QUERY $1", queryID); err != nil {
 		t.Fatal(err)
@@ -511,7 +519,8 @@ func TestInternalExecutorPushDetectionInTxn(t *testing.T) {
 	txn.CommitTimestamp()
 	require.True(t, txn.IsSerializablePushAndRefreshNotPossible())
 
-	execCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, "test-recording")
+	tr := s.Tracer().(*tracing.Tracer)
+	execCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "test-recording")
 	defer cancel()
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
 	_, err = ie.Exec(execCtx, "test", txn, "select 42")

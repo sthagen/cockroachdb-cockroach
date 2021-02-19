@@ -79,7 +79,7 @@ func (p *planner) addColumnImpl(
 	// its descriptor and this column descriptor.
 	if d.HasDefaultExpr() {
 		changedSeqDescs, err := maybeAddSequenceDependencies(
-			params.ctx, params.p, n.tableDesc, col, expr, nil,
+			params.ctx, params.ExecCfg().Settings, params.p, n.tableDesc, col, expr, nil,
 		)
 		if err != nil {
 			return err
@@ -153,6 +153,11 @@ func checkColumnDoesNotExist(
 	col, _ := tableDesc.FindColumnWithName(name)
 	if col == nil {
 		return false, nil
+	}
+	if col.IsSystemColumn() {
+		return false, pgerror.Newf(pgcode.DuplicateColumn,
+			"column name %q conflicts with a system column name",
+			col.GetName())
 	}
 	if col.Public() {
 		return true, sqlerrors.NewColumnAlreadyExistsError(tree.ErrString(&name), tableDesc.GetName())

@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -185,6 +185,24 @@ func (s storage) jitteredLeaseDuration() time.Duration {
 		2*s.leaseJitterFraction*rand.Float64()))
 }
 
+// nonPublicDescriptorError is returned from the attempt to acquire a lease
+// when the descriptor is found to be in a non-public state. This means that
+// it cannot be leased, however, the Manager can utilize this to update
+// the descriptorState and to also guide calls to Acquire with a timestamp
+// preceding the drop.
+type nonPublicDescriptorError struct {
+	cause error
+	desc  catalog.Descriptor
+}
+
+func (e *nonPublicDescriptorError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *nonPublicDescriptorError) Cause() error {
+	return e.cause
+}
+
 // acquire a lease on the most recent version of a descriptor. If the lease
 // cannot be obtained because the descriptor is in the process of being dropped
 // or offline (currently only applicable to tables), the error will be of type
@@ -211,7 +229,7 @@ func (s storage) acquire(
 		}
 
 		// TODO (lucy): Previously this called getTableDescFromID followed by a call
-		// to ValidateTable() instead of Validate(), to avoid the cross-table
+		// to ValidateSelf() instead of Validate(), to avoid the cross-table
 		// checks. Does this actually matter? We already potentially do cross-table
 		// checks when populating pre-19.2 foreign keys.
 		desc, err := catalogkv.GetDescriptorByID(ctx, txn, s.codec, id, catalogkv.Immutable,
@@ -222,7 +240,7 @@ func (s storage) acquire(
 		if err := catalog.FilterDescriptorState(
 			desc, tree.CommonLookupFlags{}, // filter all non-public state
 		); err != nil {
-			return err
+			return &nonPublicDescriptorError{cause: err, desc: desc}
 		}
 		// Once the descriptor is set it is immutable and care must be taken
 		// to not modify it.
@@ -853,7 +871,21 @@ func (t *descriptorState) removeInactiveVersions() []*storedLease {
 // The boolean returned is true if this call was actually responsible for the
 // lease acquisition.
 func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, error) {
-	var toRelease *storedLease
+	upsertDescriptorAndMaybeDropLease := func(ctx context.Context, desc *descriptorVersionState, takenOffline bool) error {
+		t := m.findDescriptorState(id, false /* create */)
+		t.mu.Lock()
+		t.mu.takenOffline = takenOffline
+		defer t.mu.Unlock()
+		toRelease, err := t.upsertLocked(ctx, desc)
+		if err != nil {
+			return err
+		}
+		m.names.insert(desc)
+		if toRelease != nil {
+			releaseLease(toRelease, m)
+		}
+		return nil
+	}
 	resultChan, didAcquire := m.storage.group.DoChan(fmt.Sprintf("acquire%d", id), func() (interface{}, error) {
 		// Note that we use a new `context` here to avoid a situation where a cancellation
 		// of the first context cancels other callers to the `acquireNodeLease()` method,
@@ -870,20 +902,27 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 			minExpiration = newest.expiration
 		}
 		desc, err := m.storage.acquire(newCtx, minExpiration, id)
+		// Deal with the case where the descriptor has been taken offline.
+		// Queries attempting to use this descriptor at a historical timestamp
+		// prior to its having been dropped would not be able to if we just surfaced
+		// this error alone.
+		if e := new(nonPublicDescriptorError); errors.As(err, &e) {
+			if err := upsertDescriptorAndMaybeDropLease(ctx, &descriptorVersionState{
+				Descriptor: e.desc,
+				expiration: e.desc.GetModificationTime(),
+			}, true /* takenOffline */); err != nil {
+				return nil, errors.CombineErrors(e,
+					errors.Wrapf(err, "upserting non-public descriptor"))
+			}
+			return nil, err
+		}
 		if err != nil {
 			return nil, err
 		}
-		t := m.findDescriptorState(id, false /* create */)
-		t.mu.Lock()
-		t.mu.takenOffline = false
-		defer t.mu.Unlock()
-		toRelease, err = t.upsertLocked(newCtx, desc)
-		if err != nil {
+		if err := upsertDescriptorAndMaybeDropLease(
+			ctx, desc, false, /* takenOffline */
+		); err != nil {
 			return nil, err
-		}
-		m.names.insert(desc)
-		if toRelease != nil {
-			releaseLease(toRelease, m)
 		}
 		return leaseToken(desc), nil
 	})
@@ -1273,8 +1312,9 @@ func makeNameCacheKey(parentID descpb.ID, parentSchemaID descpb.ID, name string)
 // The locking order is:
 // Manager.mu > descriptorState.mu > nameCache.mu > descriptorVersionState.mu
 type Manager struct {
-	storage storage
-	mu      struct {
+	rangeFeedFactory *rangefeed.Factory
+	storage          storage
+	mu               struct {
 		syncutil.Mutex
 		descriptors map[descpb.ID]*descriptorState
 
@@ -1314,6 +1354,7 @@ func NewLeaseManager(
 	codec keys.SQLCodec,
 	testingKnobs ManagerTestingKnobs,
 	stopper *stop.Stopper,
+	rangeFeedFactory *rangefeed.Factory,
 	cfg *base.LeaseManagerConfig,
 ) *Manager {
 	lm := &Manager{
@@ -1336,7 +1377,8 @@ func NewLeaseManager(
 				Unit:        metric.Unit_COUNT,
 			}),
 		},
-		testingKnobs: testingKnobs,
+		rangeFeedFactory: rangeFeedFactory,
+		testingKnobs:     testingKnobs,
 		names: nameCache{
 			descriptors: make(map[nameCacheKey]*descriptorVersionState),
 		},
@@ -1377,17 +1419,6 @@ func (m *Manager) findNewest(id descpb.ID) *descriptorVersionState {
 // the returned descriptor. Renewal of a lease may begin in the
 // background. Renewal is done in order to prevent blocking on future
 // acquisitions.
-//
-// Known limitation: AcquireByName() calls Acquire() and therefore suffers
-// from the same limitation as Acquire (See Acquire). AcquireByName() is
-// unable to function correctly on a timestamp less than the timestamp
-// of a transaction with a DROP/TRUNCATE on the descriptor. The limitation in
-// the face of a DROP follows directly from the limitation on Acquire().
-// A TRUNCATE is implemented by changing the name -> id mapping
-// and by dropping the descriptor with the old id. While AcquireByName
-// can use the timestamp and get the correct name->id  mapping at a
-// timestamp, it uses Acquire() to get a descriptor with the corresponding
-// id and fails because the id has been dropped by the TRUNCATE.
 func (m *Manager) AcquireByName(
 	ctx context.Context,
 	timestamp hlc.Timestamp,
@@ -1536,12 +1567,6 @@ func (m *Manager) resolveName(
 // A transaction using this descriptor must ensure that its
 // commit-timestamp < expiration-time. Care must be taken to not modify
 // the returned descriptor.
-//
-// Known limitation: Acquire() can return an error after the descriptor with
-// the ID has been dropped. This is true even when using a timestamp
-// less than the timestamp of the DROP command. This is because Acquire
-// can only return an older version of a descriptor if the latest version
-// can be leased; as it stands a dropped descriptor cannot be leased.
 func (m *Manager) Acquire(
 	ctx context.Context, timestamp hlc.Timestamp, id descpb.ID,
 ) (catalog.Descriptor, hlc.Timestamp, error) {
@@ -1569,6 +1594,11 @@ func (m *Manager) Acquire(
 				_, errLease := acquireNodeLease(ctx, m, id)
 				return errLease
 			}(); err != nil {
+				// Go back around because now we know about a dropped descriptor.
+				if e := new(nonPublicDescriptorError); errors.As(err, &e) &&
+					timestamp.Less(e.desc.GetModificationTime()) {
+					continue
+				}
 				return nil, hlc.Timestamp{}, err
 			}
 
@@ -1811,54 +1841,14 @@ func (m *Manager) watchForRangefeedUpdates(
 	if log.V(1) {
 		log.Infof(ctx, "using rangefeeds for lease manager updates")
 	}
-	distSender := db.NonTransactionalSender().(*kv.CrossRangeTxnWrapperSender).Wrapped().(*kvcoord.DistSender)
-	eventCh := make(chan *roachpb.RangeFeedEvent)
-	ctx, _ = s.WithCancelOnQuiesce(ctx)
-	if err := s.RunAsyncTask(ctx, "lease rangefeed", func(ctx context.Context) {
-
-		// Run the rangefeed in a loop in the case of failure, likely due to node
-		// failures or general unavailability. We'll reset the retrier if the
-		// rangefeed runs for longer than the resetThreshold.
-		const resetThreshold = 30 * time.Second
-		restartLogEvery := log.Every(10 * time.Second)
-		for i, r := 1, retry.StartWithCtx(ctx, retry.Options{
-			InitialBackoff: 100 * time.Millisecond,
-			MaxBackoff:     2 * time.Second,
-			Closer:         s.ShouldQuiesce(),
-		}); r.Next(); i++ {
-			ts := m.getResolvedTimestamp()
-			descKeyPrefix := m.storage.codec.TablePrefix(uint32(systemschema.DescriptorTable.GetID()))
-			span := roachpb.Span{
-				Key:    descKeyPrefix,
-				EndKey: descKeyPrefix.PrefixEnd(),
-			}
-			// Note: We don't need to use withDiff to detect version changes because
-			// the Manager already stores the relevant version information.
-			const withDiff = false
-			log.VEventf(ctx, 1, "starting rangefeed from %v on %v", ts, span)
-			start := timeutil.Now()
-			err := distSender.RangeFeed(ctx, span, ts, withDiff, eventCh)
-			if err != nil && ctx.Err() == nil && restartLogEvery.ShouldLog() {
-				log.Warningf(ctx, "lease rangefeed failed %d times, restarting: %v",
-					log.Safe(i), log.Safe(err))
-			}
-			if ctx.Err() != nil {
-				log.VEventf(ctx, 1, "exiting rangefeed")
-				return
-			}
-			ranFor := timeutil.Since(start)
-			log.VEventf(ctx, 1, "restarting rangefeed for %v after %v",
-				log.Safe(span), ranFor)
-			if ranFor > resetThreshold {
-				i = 1
-				r.Reset()
-			}
-		}
-	}); err != nil {
-		// This will only fail if the stopper has been stopped.
-		return
+	descriptorTableStart := m.Codec().TablePrefix(keys.DescriptorTableID)
+	descriptorTableSpan := roachpb.Span{
+		Key:    descriptorTableStart,
+		EndKey: descriptorTableStart.PrefixEnd(),
 	}
-	handleEvent := func(ev *roachpb.RangeFeedValue) {
+	handleEvent := func(
+		ctx context.Context, ev *roachpb.RangeFeedValue,
+	) {
 		if len(ev.Value.RawBytes) == 0 {
 			return
 		}
@@ -1882,29 +1872,10 @@ func (m *Manager) watchForRangefeedUpdates(
 		case descUpdateCh <- &descriptor:
 		}
 	}
-	_ = s.RunAsyncTask(ctx, "lease-rangefeed", func(ctx context.Context) {
-		for {
-			select {
-			case <-m.stopper.ShouldQuiesce():
-				return
-			case <-ctx.Done():
-				return
-			case e := <-eventCh:
-				if e.Checkpoint != nil {
-					log.VEventf(ctx, 2, "got rangefeed checkpoint %v", e.Checkpoint)
-					m.setResolvedTimestamp(e.Checkpoint.ResolvedTS)
-					continue
-				}
-				if e.Error != nil {
-					log.Warningf(ctx, "got an error from a rangefeed: %v", e.Error.Error)
-					continue
-				}
-				if e.Val != nil {
-					handleEvent(e.Val)
-				}
-			}
-		}
-	})
+	// Ignore errors here because they indicate that the server is shutting down.
+	_, _ = m.rangeFeedFactory.RangeFeed(
+		ctx, "lease", descriptorTableSpan, m.getResolvedTimestamp(), handleEvent,
+	)
 }
 
 func (m *Manager) handleUpdatedSystemCfg(
@@ -2112,9 +2083,19 @@ SELECT "descID", version, expiration FROM system.public.lease AS OF SYSTEM TIME 
 		retryOptions.Closer = m.stopper.ShouldQuiesce()
 		// The retry is required because of errors caused by node restarts. Retry 30 times.
 		if err := retry.WithMaxAttempts(ctx, retryOptions, 30, func() error {
-			var err error
-			rows, err = m.storage.internalExecutor.Query(
-				ctx, "read orphaned leases", nil /*txn*/, sqlQuery)
+			it, err := m.storage.internalExecutor.QueryIterator(
+				ctx, "read orphaned leases", nil /*txn*/, sqlQuery,
+			)
+			if err != nil {
+				return err
+			}
+			rows = rows[:0]
+			// TODO(yuzefovich): use QueryBuffered method once it is added to
+			// sqlutil.InternalExecutor interface.
+			var ok bool
+			for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+				rows = append(rows, it.Cur())
+			}
 			return err
 		}); err != nil {
 			log.Warningf(ctx, "unable to read orphaned leases: %+v", err)

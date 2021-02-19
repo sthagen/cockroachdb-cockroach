@@ -3021,6 +3021,15 @@ type EvalDatabase interface {
 	// LookupSchema looks up the schema with the given name in the given
 	// database.
 	LookupSchema(ctx context.Context, dbName, scName string) (found bool, scMeta SchemaMeta, err error)
+
+	// IsTableVisible checks if the table with the given ID belongs to a schema
+	// on the given sessiondata.SearchPath.
+	IsTableVisible(
+		ctx context.Context,
+		curDB string,
+		searchPath sessiondata.SearchPath,
+		tableID int64,
+	) (isVisible bool, exists bool, err error)
 }
 
 // EvalPlanner is a limited planner that can be used from EvalContext.
@@ -3127,12 +3136,6 @@ type ClientNoticeSender interface {
 // this to sqlutil.InternalExecutor or sql.InternalExecutor, and use the
 // alternatives.
 type InternalExecutor interface {
-	// Query is part of the sqlutil.InternalExecutor interface.
-	Query(
-		ctx context.Context, opName string, txn *kv.Txn,
-		stmt string, qargs ...interface{},
-	) ([]Datums, error)
-
 	// QueryRow is part of the sqlutil.InternalExecutor interface.
 	QueryRow(
 		ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},

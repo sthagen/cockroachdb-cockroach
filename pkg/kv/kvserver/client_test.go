@@ -122,7 +122,7 @@ func createTestStoreWithOpts(
 	}
 	eng := opts.eng
 	if eng == nil {
-		eng = storage.NewDefaultInMem()
+		eng = storage.NewDefaultInMemForTesting()
 		stopper.AddCloser(eng)
 	}
 
@@ -832,7 +832,7 @@ func (m *multiTestContext) addStore(idx int) {
 	} else {
 		engineStopper := stop.NewStopper()
 		m.engineStoppers = append(m.engineStoppers, engineStopper)
-		eng = storage.NewDefaultInMem()
+		eng = storage.NewDefaultInMemForTesting()
 		engineStopper.AddCloser(eng)
 		m.engines = append(m.engines, eng)
 		needBootstrap = true
@@ -1648,4 +1648,30 @@ func waitForTombstone(
 		return nil
 	})
 	return tombstone
+}
+
+// This test is here to please the unused code linter, and will be removed in
+// the next commit.
+func TestDummyMultiTestContext(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	cfg := kvserver.TestStoreConfig(nil)
+	cfg.TestingKnobs.DisableReplicateQueue = true
+	mtc := &multiTestContext{storeConfig: &cfg}
+	defer mtc.Stop()
+	mtc.Start(t, 3)
+
+	key := []byte("a")
+	mtc.getRaftLeader(1)
+
+	incArgs := incrementArgs(key, 5)
+	if _, err := kv.SendWrapped(ctx, mtc.Store(0).TestSender(), incArgs); err != nil {
+		t.Fatal(err)
+	}
+
+	mtc.waitForValues(key, []int64{5, 0, 0})
+	mtc.stopStore(1)
+	mtc.restartStore(1)
 }

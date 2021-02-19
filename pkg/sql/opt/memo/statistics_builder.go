@@ -611,6 +611,13 @@ func (sb *statisticsBuilder) colStatTable(
 	return sb.colStatLeaf(colSet, tableStats, tableFD, tableNotNullCols)
 }
 
+// GetCachedTableStatistics returns the statistics for the given table, if they
+// were calculated already.
+func (m *Memo) GetCachedTableStatistics(tabID opt.TableID) (_ *props.Statistics, ok bool) {
+	stats, ok := m.metadata.TableAnnotation(tabID, statsAnnID).(*props.Statistics)
+	return stats, ok
+}
+
 // +------+
 // | Scan |
 // +------+
@@ -646,7 +653,7 @@ func (sb *statisticsBuilder) buildScan(scan *ScanExpr, relProps *props.Relationa
 				notNullCols.UnionWith(c.ExtractNotNullCols(sb.evalCtx))
 			}
 		}
-		sb.filterRelExpr(pred, scan, notNullCols, relProps, s, &scan.Relational().FuncDeps)
+		sb.filterRelExpr(pred, scan, notNullCols, relProps, s, MakeTableFuncDep(sb.md, scan.Table))
 		sb.finalizeFromCardinality(relProps)
 		return
 	}
@@ -780,7 +787,7 @@ func (sb *statisticsBuilder) constrainScan(
 		predUnappliedConjucts, predConstrainedCols, predHistCols := sb.applyFilter(pred, scan, relProps)
 		numUnappliedConjuncts += predUnappliedConjucts
 		constrainedCols.UnionWith(predConstrainedCols)
-		constrainedCols = sb.tryReduceCols(constrainedCols, s, &scan.Relational().FuncDeps)
+		constrainedCols = sb.tryReduceCols(constrainedCols, s, MakeTableFuncDep(sb.md, scan.Table))
 		histCols.UnionWith(predHistCols)
 	}
 
@@ -2726,14 +2733,6 @@ func max(a, b float64) float64 {
 	return b
 }
 
-// fraction returns a/b if a is less than b. Otherwise returns 1.
-func fraction(a, b float64) float64 {
-	if a < b {
-		return a / b
-	}
-	return 1
-}
-
 //////////////////////////////////////////////////
 // Helper functions for selectivity calculation //
 //////////////////////////////////////////////////
@@ -3624,8 +3623,8 @@ func (sb *statisticsBuilder) selectivityFromDistinctCount(
 	}
 
 	// Calculate the selectivity of the predicate.
-	nonNullSelectivity := props.MakeSelectivity(fraction(newDistinct, oldDistinct))
-	nullSelectivity := props.MakeSelectivity(fraction(colStat.NullCount, inputColStat.NullCount))
+	nonNullSelectivity := props.MakeSelectivityFromFraction(newDistinct, oldDistinct)
+	nullSelectivity := props.MakeSelectivityFromFraction(colStat.NullCount, inputColStat.NullCount)
 	return sb.predicateSelectivity(
 		nonNullSelectivity, nullSelectivity, inputColStat.NullCount, inputRowCount,
 	)
@@ -3658,8 +3657,8 @@ func (sb *statisticsBuilder) selectivityFromHistograms(
 		oldCount := oldHist.ValuesCount()
 
 		// Calculate the selectivity of the predicate.
-		nonNullSelectivity := props.MakeSelectivity(fraction(newCount, oldCount))
-		nullSelectivity := props.MakeSelectivity(fraction(colStat.NullCount, inputColStat.NullCount))
+		nonNullSelectivity := props.MakeSelectivityFromFraction(newCount, oldCount)
+		nullSelectivity := props.MakeSelectivityFromFraction(colStat.NullCount, inputColStat.NullCount)
 		selectivity.Multiply(sb.predicateSelectivity(
 			nonNullSelectivity, nullSelectivity, inputColStat.NullCount, inputStats.RowCount,
 		))
@@ -3749,7 +3748,7 @@ func (sb *statisticsBuilder) selectivityFromEquivalency(
 
 	// The selectivity of an equality condition var1=var2 is
 	// 1/max(distinct(var1), distinct(var2)).
-	return props.MakeSelectivity(fraction(1, maxDistinctCount))
+	return props.MakeSelectivityFromFraction(1, maxDistinctCount)
 }
 
 // selectivityFromEquivalenciesSemiJoin determines the selectivity of equality
@@ -3800,7 +3799,7 @@ func (sb *statisticsBuilder) selectivityFromEquivalencySemiJoin(
 		maxDistinctCountLeft = s.RowCount
 	}
 
-	return props.MakeSelectivity(fraction(minDistinctCountRight, maxDistinctCountLeft))
+	return props.MakeSelectivityFromFraction(minDistinctCountRight, maxDistinctCountLeft)
 }
 
 func (sb *statisticsBuilder) selectivityFromInvertedJoinCondition(

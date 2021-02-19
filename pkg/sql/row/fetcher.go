@@ -163,22 +163,30 @@ type FetcherTableArgs struct {
 func (fta *FetcherTableArgs) InitCols(
 	desc catalog.TableDescriptor,
 	scanVisibility execinfrapb.ScanVisibility,
-	systemColumns []descpb.ColumnDescriptor,
-	virtualColumn *descpb.ColumnDescriptor,
+	withSystemColumns bool,
+	virtualColumn catalog.Column,
 ) {
-	cols := desc.PublicColumns()
+	cols := make([]catalog.Column, 0, len(desc.AllColumns()))
 	if scanVisibility == execinfra.ScanVisibilityPublicAndNotPublic {
-		cols = desc.ReadableColumns()
+		cols = append(cols, desc.ReadableColumns()...)
+	} else {
+		cols = append(cols, desc.PublicColumns()...)
 	}
-	fta.Cols = make([]descpb.ColumnDescriptor, len(cols), len(cols)+len(systemColumns))
-	for i, col := range cols {
-		if virtualColumn != nil && col.GetID() == virtualColumn.ID {
-			fta.Cols[i] = *virtualColumn
-		} else {
-			fta.Cols[i] = *col.ColumnDesc()
+	if virtualColumn != nil {
+		for i, col := range cols {
+			if col.GetID() == virtualColumn.GetID() {
+				cols[i] = virtualColumn
+				break
+			}
 		}
 	}
-	fta.Cols = append(fta.Cols, systemColumns...)
+	if withSystemColumns {
+		cols = append(cols, desc.SystemColumns()...)
+	}
+	fta.Cols = make([]descpb.ColumnDescriptor, len(cols))
+	for i, col := range cols {
+		fta.Cols[i] = *col.ColumnDesc()
+	}
 }
 
 // Fetcher handles fetching kvs and forming table rows for an
@@ -250,14 +258,9 @@ type Fetcher struct {
 
 	// -- Fields updated during a scan --
 
-	// testingGenerateMockContentionEvents is a field that specifies whether
-	// a kvFetcher generates mock contention events. See
-	// kvFetcher.TestingEnableMockContentionEventGeneration.
-	// TODO(asubiotto): Remove once KV layer produces real contention events.
-	testingGenerateMockContentionEvents bool
-	kvFetcher                           *KVFetcher
-	indexKey                            []byte // the index key of the current row
-	prettyValueBuf                      *bytes.Buffer
+	kvFetcher      *KVFetcher
+	indexKey       []byte // the index key of the current row
+	prettyValueBuf *bytes.Buffer
 
 	valueColsFound int // how many needed cols we've found so far in the value
 
@@ -690,7 +693,6 @@ func (rf *Fetcher) StartScanFrom(ctx context.Context, f kvBatchFetcher) error {
 		rf.kvFetcher.Close(ctx)
 	}
 	rf.kvFetcher = newKVFetcher(f)
-	rf.kvFetcher.testingGenerateMockContentionEvents = rf.testingGenerateMockContentionEvents
 	// Retrieve the first key.
 	_, err := rf.NextKey(ctx)
 	return err
@@ -1141,7 +1143,7 @@ func (rf *Fetcher) processValueSingle(
 	if rf.traceKV || table.neededCols.Contains(int(colID)) {
 		if idx, ok := table.colIdxMap.Get(colID); ok {
 			if rf.traceKV {
-				prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.AllColumns()[idx].GetName())
+				prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.DeletableColumns()[idx].GetName())
 			}
 			if len(kv.Value.RawBytes) == 0 {
 				return prettyKey, "", nil
@@ -1216,7 +1218,7 @@ func (rf *Fetcher) processValueBytes(
 		idx := table.colIdxMap.GetDefault(colID)
 
 		if rf.traceKV {
-			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.AllColumns()[idx].GetName())
+			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.DeletableColumns()[idx].GetName())
 		}
 
 		var encValue rowenc.EncDatum
@@ -1626,23 +1628,6 @@ func (rf *Fetcher) GetBytesRead() int64 {
 	}
 	// Not yet initialized.
 	return 0
-}
-
-// TestingEnableMockContentionEventGeneration signals the underlying kv fetcher
-// to generate mock roachpb.ContentionEvents. Refer to the KVFetcher's method
-// of the same name for more information.
-func (rf *Fetcher) TestingEnableMockContentionEventGeneration() {
-	rf.testingGenerateMockContentionEvents = true
-}
-
-// GetContentionEvents returns a slice of contention events that occurred during
-// the lifetime of this Fetcher. A nil slice indicates that no contention
-// events occurred.
-func (rf *Fetcher) GetContentionEvents() []roachpb.ContentionEvent {
-	if f := rf.kvFetcher; f != nil {
-		return f.GetContentionEvents()
-	}
-	return nil
 }
 
 // Only unique secondary indexes have extra columns to decode (namely the

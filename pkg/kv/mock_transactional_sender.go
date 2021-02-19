@@ -116,12 +116,17 @@ func (m *MockTransactionalSender) CommitTimestampFixed() bool {
 func (m *MockTransactionalSender) SetFixedTimestamp(_ context.Context, ts hlc.Timestamp) {
 	m.txn.WriteTimestamp = ts
 	m.txn.ReadTimestamp = ts
-	m.txn.MaxTimestamp = ts
+	m.txn.GlobalUncertaintyLimit = ts
 	m.txn.CommitTimestampFixed = true
 
 	// Set the MinTimestamp to the minimum of the existing MinTimestamp and the fixed
 	// timestamp. This ensures that the MinTimestamp is always <= the other timestamps.
 	m.txn.MinTimestamp.Backward(ts)
+}
+
+// RequiredFrontier is part of the TxnSender interface.
+func (m *MockTransactionalSender) RequiredFrontier() hlc.Timestamp {
+	return m.txn.RequiredFrontier()
 }
 
 // ManualRestart is part of the TxnSender interface.
@@ -196,6 +201,11 @@ func (m *MockTransactionalSender) ConfigureStepping(context.Context, SteppingMod
 // GetSteppingMode is part of the TxnSender interface.
 func (m *MockTransactionalSender) GetSteppingMode(context.Context) SteppingMode {
 	return SteppingDisabled
+}
+
+// ManualRefresh is part of the TxnSender interface.
+func (m *MockTransactionalSender) ManualRefresh(ctx context.Context) error {
+	panic("unimplemented")
 }
 
 // MockTxnSenderFactory is a TxnSenderFactory producing MockTxnSenders.

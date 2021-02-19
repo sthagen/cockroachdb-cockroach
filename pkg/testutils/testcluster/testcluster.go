@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -130,9 +132,21 @@ func (tc *TestCluster) stopServers(ctx context.Context) {
 		// [1]: cleanupSessionTempObjects
 		tracer := tc.Server(i).Tracer().(*tracing.Tracer)
 		testutils.SucceedsSoon(tc.t, func() error {
-			return tracer.VisitSpans(func(span *tracing.Span) error {
-				return errors.Newf("expected to find no active spans, found %s", span.Meta())
+			var sps []*tracing.Span
+			_ = tracer.VisitSpans(func(span *tracing.Span) error {
+				sps = append(sps, span)
+				return nil
 			})
+			if len(sps) == 0 {
+				return nil
+			}
+			var buf strings.Builder
+			buf.WriteString("unexpectedly found active spans:\n")
+			for _, sp := range sps {
+				fmt.Fprintln(&buf, sp.GetRecording())
+				fmt.Fprintln(&buf)
+			}
+			return errors.Newf("%s", buf.String())
 		})
 	}
 }
@@ -1141,10 +1155,10 @@ func (tc *TestCluster) ToggleReplicateQueues(active bool) {
 	}
 }
 
-// readIntFromStores reads the current integer value at the given key
+// ReadIntFromStores reads the current integer value at the given key
 // from all configured engines, filling in zeros when the value is not
 // found.
-func (tc *TestCluster) readIntFromStores(key roachpb.Key) []int64 {
+func (tc *TestCluster) ReadIntFromStores(key roachpb.Key) []int64 {
 	results := make([]int64, len(tc.Servers))
 	for i, server := range tc.Servers {
 		err := server.Stores().VisitStores(func(s *kvserver.Store) error {
@@ -1175,7 +1189,7 @@ func (tc *TestCluster) readIntFromStores(key roachpb.Key) []int64 {
 func (tc *TestCluster) WaitForValues(t testing.TB, key roachpb.Key, expected []int64) {
 	t.Helper()
 	testutils.SucceedsSoon(t, func() error {
-		actual := tc.readIntFromStores(key)
+		actual := tc.ReadIntFromStores(key)
 		if !reflect.DeepEqual(expected, actual) {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
@@ -1213,7 +1227,7 @@ func (tc *TestCluster) RestartServer(idx int) error {
 // RestartServerWithInspect uses the cached ServerArgs to restart a Server
 // specified by the passed index. We allow an optional inspect function to be
 // passed in that can observe the server once its been re-created but before it's
-// bean started. This is useful for tests that want to capture that the startup
+// been started. This is useful for tests that want to capture that the startup
 // sequence performs the correct actions i.e. that on startup liveness is gossiped.
 func (tc *TestCluster) RestartServerWithInspect(idx int, inspect func(s *server.TestServer)) error {
 	if !tc.ServerStopped(idx) {
@@ -1251,26 +1265,68 @@ func (tc *TestCluster) RestartServerWithInspect(idx int, inspect func(s *server.
 	}
 	s := srv.(*server.TestServer)
 
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	tc.Servers[idx] = s
-	tc.mu.serverStoppers[idx] = s.Stopper()
+	if err := func() error {
+		tc.mu.Lock()
+		defer tc.mu.Unlock()
+		tc.Servers[idx] = s
+		tc.mu.serverStoppers[idx] = s.Stopper()
 
-	if inspect != nil {
-		inspect(s)
-	}
+		if inspect != nil {
+			inspect(s)
+		}
 
-	if err := srv.Start(); err != nil {
+		if err := srv.Start(); err != nil {
+			return err
+		}
+
+		dbConn, err := serverutils.OpenDBConnE(srv.ServingSQLAddr(),
+			serverArgs.UseDatabase, serverArgs.Insecure, srv.Stopper())
+		if err != nil {
+			return err
+		}
+		tc.Conns[idx] = dbConn
+		return nil
+	}(); err != nil {
 		return err
 	}
 
-	dbConn, err := serverutils.OpenDBConnE(srv.ServingSQLAddr(),
-		serverArgs.UseDatabase, serverArgs.Insecure, srv.Stopper())
-	if err != nil {
-		return err
-	}
-	tc.Conns[idx] = dbConn
-	return nil
+	// Wait until the other nodes can successfully connect to the newly restarted
+	// node. This is useful to avoid flakes: the newly restarted node is now on a
+	// different port, and a cycle of gossip is necessary to make all other nodes
+	// aware.
+	return contextutil.RunWithTimeout(
+		context.Background(), "check-conn", 15*time.Second,
+		func(ctx context.Context) error {
+			r := retry.StartWithCtx(ctx, retry.Options{
+				InitialBackoff: 1 * time.Millisecond,
+				MaxBackoff:     100 * time.Millisecond,
+			})
+			var err error
+			for r.Next() {
+				err = func() error {
+					for idx, s := range tc.Servers {
+						if tc.ServerStopped(idx) {
+							continue
+						}
+						for i := 0; i < rpc.NumConnectionClasses; i++ {
+							class := rpc.ConnectionClass(i)
+							if _, err := s.NodeDialer().Dial(ctx, srv.NodeID(), class); err != nil {
+								return errors.Wrapf(err, "connecting n%d->n%d (class %v)", s.NodeID(), srv.NodeID(), class)
+							}
+						}
+					}
+					return nil
+				}()
+				if err != nil {
+					continue
+				}
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			return ctx.Err()
+		})
 }
 
 // ServerStopped determines if a server has been explicitly

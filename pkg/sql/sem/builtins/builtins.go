@@ -58,8 +58,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/fuzzystrmatch"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -67,9 +69,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/unaccent"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	pbtypes "github.com/gogo/protobuf/types"
 	"github.com/knz/strtime"
 )
 
@@ -112,6 +116,7 @@ const (
 	categoryString              = "String and byte"
 	categorySystemInfo          = "System info"
 	categorySystemRepair        = "System repair"
+	categoryStreamIngestion     = "Stream Ingestion"
 )
 
 func categorizeType(t *types.T) string {
@@ -124,6 +129,16 @@ func categorizeType(t *types.T) string {
 		return strings.ToUpper(t.String())
 	}
 }
+
+const (
+	// GatewayRegionBuiltinName is the name for the builtin that returns the gateway
+	// region of the current node.
+	GatewayRegionBuiltinName = "gateway_region"
+	// DefaultToDatabasePrimaryRegionBuiltinName is the name for the builtin that
+	// takes in a region and returns it if it is a valid region on the database.
+	// Otherwise, it returns the primary region.
+	DefaultToDatabasePrimaryRegionBuiltinName = "default_to_database_primary_region"
+)
 
 var digitNames = [...]string{"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
 
@@ -3565,6 +3580,78 @@ may increase either contention or retry errors, or both.`,
 		},
 	),
 
+	// Get the current trace ID.
+	"crdb_internal.trace_id": makeBuiltin(
+		tree.FunctionProperties{Category: categorySystemInfo},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				// The user must be an admin to use this builtin.
+				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
+				if err != nil {
+					return nil, err
+				}
+				if !isAdmin {
+					return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "user needs the admin role to view trace ID")
+				}
+
+				sp := tracing.SpanFromContext(ctx.Context)
+				if sp == nil {
+					return tree.DNull, nil
+				}
+				return tree.NewDInt(tree.DInt(sp.GetRecording()[0].TraceID)), nil
+			},
+			Info: "Returns the current trace ID or an error if no trace is open.",
+			// NB: possibly this is or could be made stable, but it's not worth it.
+			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
+	"crdb_internal.payloads_for_span": makeBuiltin(
+		tree.FunctionProperties{Category: categorySystemInfo},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"span ID", types.Int}},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				// The user must be an admin to use this builtin.
+				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
+				if err != nil {
+					return nil, err
+				}
+				if !isAdmin {
+					return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "user needs the admin role to view payloads")
+				}
+
+				builder := json.NewArrayBuilder(len(args))
+
+				spanID := uint64(*(args[0].(*tree.DInt)))
+				span, found := ctx.Settings.Tracer.GetActiveSpanFromID(spanID)
+				// A span may not be found if its ID was surfaced previously but its
+				// corresponding trace has ended by the time this builtin was run.
+				if !found {
+					// Returns an empty JSON array.
+					return tree.NewDJSON(builder.Build()), nil
+				}
+
+				for _, rec := range span.GetRecording() {
+					rec.Structured(func(item *pbtypes.Any) {
+						payload, err := protoreflect.MessageToJSON(item, true /* emitDefaults */)
+						if err != nil {
+							return
+						}
+						if payload != nil {
+							builder.Add(payload)
+						}
+					})
+				}
+				return tree.NewDJSON(builder.Build()), nil
+			},
+			Info:       "Returns the payload(s) of the span whose ID is passed in the argument.",
+			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
 	"crdb_internal.locality_value": makeBuiltin(
 		tree.FunctionProperties{Category: categorySystemInfo},
 		tree.Overload{
@@ -4758,6 +4845,35 @@ may increase either contention or retry errors, or both.`,
 		},
 	),
 
+	"crdb_internal.complete_stream_ingestion_job": makeBuiltin(
+		tree.FunctionProperties{
+			Category: categoryStreamIngestion,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"job_id", types.Int},
+				{"cutover_ts", types.TimestampTZ},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				jobID := int(*args[0].(*tree.DInt))
+				cutoverTime := args[1].(*tree.DTimestampTZ).Time
+				cutoverTimestamp := hlc.Timestamp{WallTime: cutoverTime.UnixNano()}
+				err := streaming.CompleteIngestionHook(evalCtx, evalCtx.Txn, jobID, cutoverTimestamp)
+				return tree.NewDInt(tree.DInt(jobID)), err
+			},
+			Info: "This function can be used to signal a running stream ingestion job to complete. " +
+				"The job will eventually stop ingesting, revert to the specified timestamp and leave the " +
+				"cluster in a consistent state. The specified timestamp can only be specified up to the" +
+				" microsecond. " +
+				"This function does not wait for the job to reach a terminal state, " +
+				"but instead returns the job id as soon as it has signaled the job to complete. " +
+				"This builtin can be used in conjunction with SHOW JOBS WHEN COMPLETE to ensure that the" +
+				" job has left the cluster in a consistent state.",
+			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
 	"num_nulls": makeBuiltin(
 		tree.FunctionProperties{
 			Category:     categoryComparison,
@@ -4805,7 +4921,7 @@ may increase either contention or retry errors, or both.`,
 		},
 	),
 
-	"gateway_region": makeBuiltin(
+	GatewayRegionBuiltinName: makeBuiltin(
 		tree.FunctionProperties{Category: categoryMultiRegion},
 		tree.Overload{
 			Types:      tree.ArgTypes{},
@@ -4822,6 +4938,67 @@ may increase either contention or retry errors, or both.`,
 			},
 			Info: `Returns the region of the connection's current node as defined by
 the locality flag on node startup. Returns an error if no region is set.`,
+			Volatility: tree.VolatilityStable,
+		},
+	),
+	DefaultToDatabasePrimaryRegionBuiltinName: makeBuiltin(
+		tree.FunctionProperties{Category: categoryMultiRegion},
+		stringOverload1(
+			func(evalCtx *tree.EvalContext, s string) (tree.Datum, error) {
+				r, err := evalCtx.InternalExecutor.QueryRow(
+					evalCtx.Ctx(),
+					DefaultToDatabasePrimaryRegionBuiltinName,
+					evalCtx.Txn,
+					`SELECT regions @> array[$1::string], primary_region
+				FROM crdb_internal.databases WHERE name = $2`,
+					s,
+					evalCtx.SessionData.Database,
+				)
+				if err != nil {
+					return nil, err
+				}
+				if len(r) == 0 {
+					return nil, pgerror.Newf(
+						pgcode.InvalidDatabaseDefinition,
+						"current database %s does not exist",
+						evalCtx.SessionData.Database,
+					)
+				}
+				// If region has been added to the database.
+				if *(r[0].(*tree.DBool)) {
+					return tree.NewDString(s), nil
+				}
+				// Otherwise, return the primary region if it exists.
+				if r[1] != tree.DNull {
+					return r[1], nil
+				}
+
+				// Not seeing any rows means the database is not multi-region enabled.
+				return nil, pgerror.Newf(
+					pgcode.InvalidDatabaseDefinition,
+					"current database %s is not multi-region enabled",
+					evalCtx.SessionData.Database,
+				)
+			},
+			types.String,
+			`Returns the given region if the region has been added to the current database.
+	Otherwise, this will return the primary region of the current database.
+	This will error if the current database is not a multi-region database.`,
+			tree.VolatilityStable,
+		),
+	),
+
+	"crdb_internal.show_create_all_tables": makeBuiltin(
+		tree.FunctionProperties{},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"dbName", types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn:         showCreateAllTablesBuiltin,
+			Info: `Returns a flat log of CREATE table statements followed by
+ALTER table statements that add table constraints. The flat log can be used
+to recreate a database.'`,
 			Volatility: tree.VolatilityStable,
 		},
 	),

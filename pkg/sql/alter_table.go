@@ -191,8 +191,10 @@ func (n *alterTableNode) startExec(params runParams) error {
 						params.SessionData(),
 						d,
 						n.tableDesc,
+						*tn,
 						NonEmptyTable,
 						t.ValidationBehavior,
+						params.p.SemaCtx(),
 					); err != nil {
 						return err
 					}
@@ -393,6 +395,23 @@ func (n *alterTableNode) startExec(params runParams) error {
 					})
 				}
 				return err
+			}
+
+			if n.tableDesc.IsLocalityRegionalByRow() {
+				rbrColName, err := n.tableDesc.GetRegionalByRowTableRegionColumnName()
+				if err != nil {
+					return err
+				}
+				if rbrColName == t.Column {
+					return errors.WithHintf(
+						pgerror.Newf(
+							pgcode.InvalidColumnReference,
+							"cannot drop column %s as it is used to store the region in a REGIONAL BY ROW table",
+							t.Column,
+						),
+						"You must change the table locality before dropping this table or alter the table to use a different column to use for the region.",
+					)
+				}
 			}
 
 			colToDrop, err := n.tableDesc.FindColumnWithName(t.Column)
@@ -755,7 +774,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 						return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 							"constraint %q in the middle of being added, try again later", t.Constraint)
 					}
-					if err := validateUniqueConstraintInTxn(
+					if err := validateUniqueWithoutIndexConstraintInTxn(
 						params.ctx, params.p.LeaseMgr(), params.EvalContext(), n.tableDesc, params.EvalContext().Txn, name,
 					); err != nil {
 						return err
@@ -793,12 +812,15 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 		case *tree.AlterTablePartitionByTable:
 			if t.All {
-				return unimplemented.New("ALTER TABLE PARTITION ALL BY", "PARTITION ALL BY not yet implemented")
+				return unimplemented.NewWithIssue(58736, "PARTITION ALL BY not yet implemented")
+			}
+			if n.tableDesc.IsPartitionAllBy() {
+				return unimplemented.NewWithIssue(58736, "changing partition of table with PARTITION ALL BY not yet implemented")
 			}
 			oldPartitioning := n.tableDesc.GetPrimaryIndex().GetPartitioning()
 			if oldPartitioning.NumImplicitColumns > 0 {
-				return unimplemented.New(
-					"ALTER TABLE PARTITION BY",
+				return unimplemented.NewWithIssue(
+					58731,
 					"cannot ALTER TABLE PARTITION BY on table which already has implicit column partitioning",
 				)
 			}
@@ -808,13 +830,16 @@ func (n *alterTableNode) startExec(params runParams) error {
 				n.tableDesc,
 				*n.tableDesc.GetPrimaryIndex().IndexDesc(),
 				t.PartitionBy,
+				nil, /* allowedNewColumnNames */
+				params.p.EvalContext().SessionData.ImplicitColumnPartitioningEnabled ||
+					n.tableDesc.IsLocalityRegionalByRow(),
 			)
 			if err != nil {
 				return err
 			}
 			if newPrimaryIndex.Partitioning.NumImplicitColumns > 0 {
-				return unimplemented.New(
-					"ALTER TABLE PARTITION BY",
+				return unimplemented.NewWithIssue(
+					58731,
 					"cannot ALTER TABLE and change the partitioning to contain implicit columns",
 				)
 			}
@@ -1047,7 +1072,7 @@ func applyColumnMutation(
 
 			// Add references to the sequence descriptors this column is now using.
 			changedSeqDescs, err := maybeAddSequenceDependencies(
-				params.ctx, params.p, tableDesc, col, expr, nil, /* backrefs */
+				params.ctx, params.p.ExecCfg().Settings, params.p, tableDesc, col, expr, nil, /* backrefs */
 			)
 			if err != nil {
 				return err

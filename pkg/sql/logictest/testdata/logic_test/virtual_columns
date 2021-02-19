@@ -425,7 +425,149 @@ a   b   c    v   w
 8   80  800  88  801
 10  70  110  80  111
 
+# Verify that FK relations on virtual columns are disallowed.
+statement ok
+CREATE TABLE fk (
+  a INT PRIMARY KEY,
+  b INT,
+  c INT,
+  u INT UNIQUE AS (b+c) VIRTUAL
+)
+
+statement error virtual column "u" cannot be referenced by a foreign key
+CREATE TABLE fk2 (
+  p INT PRIMARY KEY,
+  c INT REFERENCES fk(u)
+)
+
+statement error virtual column "c" cannot reference a foreign key
+CREATE TABLE fk2 (
+  p INT PRIMARY KEY,
+  c INT AS (p+1) VIRTUAL REFERENCES fk(a)
+)
+
+statement error virtual column "u" cannot be referenced by a foreign key
+CREATE TABLE fk2 (
+  p INT PRIMARY KEY,
+  q INT,
+  r INT,
+  CONSTRAINT fk FOREIGN KEY (q,r) REFERENCES fk(a,u)
+)
+
+statement ok
+CREATE TABLE fk2 (
+  x INT PRIMARY KEY,
+  y INT,
+  v INT AS (x+y) VIRTUAL
+)
+
+statement error virtual column "u" cannot be referenced by a foreign key
+ALTER TABLE fk2 ADD CONSTRAINT foo FOREIGN KEY (x) REFERENCES fk(u)
+
+statement error virtual column "v" cannot reference a foreign key
+ALTER TABLE fk2 ADD CONSTRAINT foo FOREIGN KEY (v) REFERENCES fk(a)
+
+# Tests with not null virtual columns.
+subtest NotNull
+
+statement ok
+CREATE TABLE n (
+  a INT PRIMARY KEY,
+  b INT,
+  v INT NOT NULL AS (a+b) VIRTUAL
+)
+
+statement error null value in column "v" violates not-null constraint
+INSERT INTO n VALUES (1, NULL)
+
+statement ok
+INSERT INTO n VALUES (1, 1), (2, 2)
+
+statement error null value in column "v" violates not-null constraint
+UPDATE n SET b = NULL WHERE a > 0
+
+statement error null value in column "v" violates not-null constraint
+UPSERT INTO n VALUES (1, NULL)
+
+statement error null value in column "v" violates not-null constraint
+UPSERT INTO n VALUES (3, NULL)
+
+statement ok
+INSERT INTO n VALUES (1, NULL) ON CONFLICT DO NOTHING
+
+statement error null value in column "v" violates not-null constraint
+INSERT INTO n VALUES (3, NULL) ON CONFLICT DO NOTHING
+
+statement error null value in column "v" violates not-null constraint
+INSERT INTO n VALUES (1, 10) ON CONFLICT (a) DO UPDATE SET b = NULL
+
+statement error null value in column "v" violates not-null constraint
+INSERT INTO n VALUES (3, NULL) ON CONFLICT (a) DO UPDATE SET b = NULL
+
+# Tests with check constraints on virtual columns.
+subtest Checks
+
+statement ok
+CREATE TABLE t_check (
+  a INT PRIMARY KEY,
+  b INT,
+  v INT AS (a+b) VIRTUAL CHECK (v >= 10),
+  w INT AS (a*b) VIRTUAL,
+  CHECK (v < w)
+)
+
+statement error failed to satisfy CHECK constraint
+INSERT INTO t_check VALUES (1,1), (5,5)
+
+statement ok
+INSERT INTO t_check VALUES (5,5), (6,6)
+
+statement error failed to satisfy CHECK constraint
+UPDATE t_check SET b=b-1
+
+statement ok
+UPDATE t_check SET b=b+1
+
+query IIII colnames,rowsort
+SELECT * FROM t_check
+----
+a  b  v   w
+5  6  11  30
+6  7  13  42
+
+statement error failed to satisfy CHECK constraint
+UPSERT INTO t_check VALUES (5, 2), (8, 8)
+
+statement error failed to satisfy CHECK constraint
+UPSERT INTO t_check VALUES (5, 10), (8, 1)
+
+statement ok
+UPSERT INTO t_check VALUES (5, 10), (8, 8)
+
+query IIII colnames,rowsort
+SELECT * FROM t_check
+----
+a  b   v   w
+5  10  15  50
+6  7   13  42
+8  8   16  64
+
+statement error failed to satisfy CHECK constraint
+INSERT INTO t_check VALUES (5, 1) ON CONFLICT (a) DO UPDATE SET b=3
+
+statement ok
+INSERT INTO t_check VALUES (5, 1) ON CONFLICT (a) DO UPDATE SET b=5
+
+query IIII colnames,rowsort
+SELECT * FROM t_check
+----
+a  b  v   w
+5  5  10  25
+6  7  13  42
+8  8  16  64
+
 # Test schema changes with virtual columns.
+subtest SchemaChanges
 
 statement ok
 CREATE TABLE sc (a INT PRIMARY KEY, b INT)
@@ -501,44 +643,237 @@ a  b   v   w1  w2
 2  20  22  40  40
 3  30  33  90  60
 
-# Verify that FK relations on virtual columns are disallowed.
 statement ok
-CREATE TABLE fk (
-  a INT PRIMARY KEY,
-  b INT,
-  c INT,
-  u INT UNIQUE AS (b+c) VIRTUAL
-)
+ALTER TABLE sc DROP COLUMN w1, DROP COLUMN w2
 
-statement error virtual column "u" cannot be referenced by a foreign key
-CREATE TABLE fk2 (
-  p INT PRIMARY KEY,
-  c INT REFERENCES fk(u)
-)
+query III rowsort,colnames
+SELECT * FROM sc
+----
+a  b   v
+1  10  11
+2  20  22
+3  30  33
 
-statement error virtual column "c" cannot reference a foreign key
-CREATE TABLE fk2 (
-  p INT PRIMARY KEY,
-  c INT AS (p+1) VIRTUAL REFERENCES fk(a)
-)
+# Create an index on the virtual column and check that it works.
+statement ok
+CREATE INDEX v_idx ON sc(v)
 
-statement error virtual column "u" cannot be referenced by a foreign key
-CREATE TABLE fk2 (
-  p INT PRIMARY KEY,
-  q INT,
-  r INT,
-  CONSTRAINT fk FOREIGN KEY (q,r) REFERENCES fk(a,u)
+query I rowsort
+SELECT a FROM sc@v_idx
+----
+1
+2
+3
+
+query I rowsort
+SELECT a FROM sc WHERE v>20 AND v<40
+----
+2
+3
+
+statement ok
+DROP INDEX v_idx
+
+statement ok
+ALTER TABLE sc DROP COLUMN v
+
+# Add a column and an index on that column in the same transaction.
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE sc ADD COLUMN v INT AS (a+b) VIRTUAL
+
+statement ok
+CREATE INDEX v_idx ON sc(v)
+
+statement ok
+END
+
+query I rowsort
+SELECT a FROM sc@v_idx
+----
+1
+2
+3
+
+statement ok
+DROP INDEX v_idx
+
+statement ok
+ALTER TABLE sc DROP COLUMN v
+
+# Add a column and a partial index using that column in the predicate in the
+# same transaction.
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE sc ADD COLUMN v INT AS (a+b) VIRTUAL
+
+statement ok
+CREATE INDEX partial_idx ON sc(b) WHERE v > 20
+
+statement ok
+END
+
+query I rowsort
+SELECT a FROM sc@partial_idx WHERE v > 20
+----
+2
+3
+
+statement ok
+DROP INDEX partial_idx
+
+# Create a partial index on the virtual column and which uses the virtual column in the predicate.
+statement ok
+CREATE INDEX v_partial_idx ON sc(v) WHERE v > 20
+
+query I rowsort
+SELECT a FROM sc@v_partial_idx WHERE v > 20
+----
+2
+3
+
+statement ok
+INSERT INTO sc VALUES (10, 10), (11, 9)
+
+query III rowsort,colnames
+SELECT * FROM sc
+----
+a   b   v
+1   10  11
+2   20  22
+3   30  33
+10  10  20
+11  9   20
+
+# Create a partial unique index on v which should fail.
+statement error violates unique constraint
+CREATE UNIQUE INDEX v_partial_idx2 ON sc(v) WHERE v > 10
+
+# Create a check constraint which should fail.
+statement error validation.*failed on row
+ALTER TABLE sc ADD CONSTRAINT c CHECK (v < 30)
+
+statement ok
+ALTER TABLE sc ADD CONSTRAINT c CHECK (v < 40)
+
+statement error failed to satisfy CHECK constraint
+UPDATE sc SET b=b+10
+
+# Add a virtual column with a check constraint.
+statement error validation.*failed on row
+ALTER TABLE sc ADD COLUMN w INT AS (a*b) VIRTUAL CHECK (w < 100)
+
+statement ok
+ALTER TABLE sc ADD COLUMN w INT AS (a*b) VIRTUAL CHECK (w <= 100)
+
+statement error failed to satisfy CHECK constraint
+INSERT INTO sc VALUES (20, 20)
+
+# Test inverted indexes on virtual columns.
+subtest InvertedIndexes
+
+statement ok
+CREATE TABLE inv (
+  k INT PRIMARY KEY,
+  i INT,
+  j JSON,
+  iv INT AS (i + 10) VIRTUAL,
+  jv JSON AS (j->'a') VIRTUAL,
+  INVERTED INDEX jv_idx (jv),
+  INVERTED INDEX i_jv_idx (i, jv),
+  INVERTED INDEX iv_j_idx (iv, j),
+  INVERTED INDEX iv_jv_idx (iv, jv)
 )
 
 statement ok
-CREATE TABLE fk2 (
-  x INT PRIMARY KEY,
-  y INT,
-  v INT AS (x+y) VIRTUAL
-)
+INSERT INTO inv VALUES
+  (1, 10, NULL),
+  (2, 10, '1'),
+  (3, 10, '"a"'),
+  (4, 10, 'true'),
+  (5, 10, 'null'),
+  (6, 10, '{}'),
+  (7, 10, '[]'),
+  (8, 10, '{"a": "b"}'),
+  (9, 10, '{"a": "b", "c": "d"}'),
+  (10, 10, '{"a": {}, "b": "c"}'),
+  (11, 10, '{"a": {"b": "c"}, "d": "e"}'),
+  (12, 10, '{"a": {"b": "c", "d": "e"}}'),
+  (13, 10, '{"a": [], "d": "e"}'),
+  (14, 10, '{"a": ["b", "c"], "d": "e"}'),
+  (15, 10, '["a"]'),
+  (16, 10, '["a", "b", "c"]'),
+  (17, 10, '[{"a": "b"}, "c"]')
 
-statement error virtual column "u" cannot be referenced by a foreign key
-ALTER TABLE fk2 ADD CONSTRAINT foo FOREIGN KEY (x) REFERENCES fk(u)
+statement ok
+INSERT INTO inv
+SELECT k+17, 20, j FROM inv
 
-statement error virtual column "v" cannot reference a foreign key
-ALTER TABLE fk2 ADD CONSTRAINT foo FOREIGN KEY (v) REFERENCES fk(a)
+query IT
+SELECT k, jv FROM inv@jv_idx WHERE jv @> '{"b": "c"}' ORDER BY k
+----
+11  {"b": "c"}
+12  {"b": "c", "d": "e"}
+28  {"b": "c"}
+29  {"b": "c", "d": "e"}
+
+query IT
+SELECT k, jv FROM inv@jv_idx WHERE jv->'b' = '"c"' ORDER BY k
+----
+11  {"b": "c"}
+12  {"b": "c", "d": "e"}
+28  {"b": "c"}
+29  {"b": "c", "d": "e"}
+
+query IT
+SELECT k, jv FROM inv@jv_idx WHERE jv @> '"b"' ORDER BY k
+----
+8   "b"
+9   "b"
+14  ["b", "c"]
+25  "b"
+26  "b"
+31  ["b", "c"]
+
+query IIT
+SELECT k, i, jv FROM inv@i_jv_idx WHERE i IN (10, 20, 30) AND jv @> '{"b": "c"}' ORDER BY k
+----
+11  10  {"b": "c"}
+12  10  {"b": "c", "d": "e"}
+28  20  {"b": "c"}
+29  20  {"b": "c", "d": "e"}
+
+query IIT
+SELECT k, i, jv FROM inv@i_jv_idx WHERE i = 20 AND jv @> '{"b": "c"}' ORDER BY k
+----
+28  20  {"b": "c"}
+29  20  {"b": "c", "d": "e"}
+
+query IIT
+SELECT k, iv, j FROM inv@iv_j_idx WHERE iv IN (10, 20, 30) AND j @> '{"b": "c"}' ORDER BY k
+----
+10  20  {"a": {}, "b": "c"}
+27  30  {"a": {}, "b": "c"}
+
+query IIT
+SELECT k, iv, j FROM inv@iv_j_idx WHERE iv = 20 AND j @> '{"b": "c"}' ORDER BY k
+----
+10  20  {"a": {}, "b": "c"}
+
+query IIT
+SELECT k, iv, jv FROM inv@iv_jv_idx WHERE iv IN (10, 20, 30) AND jv @> '{"b": "c"}' ORDER BY k
+----
+11  20  {"b": "c"}
+12  20  {"b": "c", "d": "e"}
+28  30  {"b": "c"}
+29  30  {"b": "c", "d": "e"}
+
+query IIT
+SELECT k, iv, jv FROM inv@iv_jv_idx WHERE iv = 20 AND jv @> '{"b": "c"}' ORDER BY k
+----
+11  20  {"b": "c"}
+12  20  {"b": "c", "d": "e"}

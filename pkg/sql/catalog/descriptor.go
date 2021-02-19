@@ -72,6 +72,15 @@ type Descriptor interface {
 
 	// DescriptorProto prepares this descriptor for serialization.
 	DescriptorProto() *descpb.Descriptor
+
+	// ValidateSelf checks the internal consistency of the descriptor.
+	ValidateSelf(ctx context.Context) error
+
+	// Validate is like ValidateSelf but with additional cross-reference checks.
+	Validate(ctx context.Context, descGetter DescGetter) error
+
+	// ValidateTxnCommit is like Validate but with additional pre-commit checks.
+	ValidateTxnCommit(ctx context.Context, descGetter DescGetter) error
 }
 
 // DatabaseDescriptor will eventually be called dbdesc.Descriptor.
@@ -90,8 +99,8 @@ type DatabaseDescriptor interface {
 	RegionNames() (descpb.RegionNames, error)
 	IsMultiRegion() bool
 	PrimaryRegionName() (descpb.RegionName, error)
-	Validate() error
 	MultiRegionEnumID() (descpb.ID, error)
+	ForEachSchemaInfo(func(id descpb.ID, name string, isDropped bool) error) error
 }
 
 // SchemaDescriptor will eventually be called schemadesc.Descriptor.
@@ -203,10 +212,12 @@ type TableDescriptor interface {
 	AllColumns() []Column
 	PublicColumns() []Column
 	WritableColumns() []Column
+	DeletableColumns() []Column
 	NonDropColumns() []Column
 	VisibleColumns() []Column
 	ReadableColumns() []Column
 	UserDefinedTypeColumns() []Column
+	SystemColumns() []Column
 
 	FindColumnWithID(id descpb.ColumnID) (Column, error)
 	FindColumnWithName(name tree.Name) (Column, error)
@@ -240,10 +251,8 @@ type TableDescriptor interface {
 
 	GetReplacementOf() descpb.TableDescriptor_Replacement
 	GetAllReferencedTypeIDs(
-		getType func(descpb.ID) (TypeDescriptor, error),
+		databaseDesc DatabaseDescriptor, getType func(descpb.ID) (TypeDescriptor, error),
 	) (descpb.IDs, error)
-
-	Validate(ctx context.Context, txn DescGetter) error
 
 	ForeachDependedOnBy(f func(dep *descpb.TableDescriptor_Reference) error) error
 	GetDependsOn() []descpb.ID
@@ -264,6 +273,8 @@ type TableDescriptor interface {
 	IsLocalityRegionalByRow() bool
 	IsLocalityRegionalByTable() bool
 	IsLocalityGlobal() bool
+	GetRegionalByTableRegion() (descpb.RegionName, error)
+	GetRegionalByRowTableRegionColumnName() (tree.Name, error)
 }
 
 // Index is an interface around the index descriptor types.
@@ -376,6 +387,9 @@ type Column interface {
 	// ColumnDescDeepCopy returns a deep copy of the underlying proto.
 	ColumnDescDeepCopy() descpb.ColumnDescriptor
 
+	// DeepCopy returns a deep copy of the receiver.
+	DeepCopy() Column
+
 	// Ordinal returns the ordinal of the column in its parent table descriptor.
 	//
 	// The ordinal of a column in a `tableDesc descpb.TableDescriptor` is
@@ -469,6 +483,9 @@ type Column interface {
 	// if the PGAttributeNum is set (non-zero). Returns the ID of the
 	// column descriptor if the PGAttributeNum is not set.
 	GetPGAttributeNum() uint32
+
+	// IsSystemColumn returns true iff the column is a system column.
+	IsSystemColumn() bool
 }
 
 // TypeDescriptor will eventually be called typedesc.Descriptor.
@@ -483,7 +500,6 @@ type TypeDescriptor interface {
 
 	PrimaryRegionName() (descpb.RegionName, error)
 	RegionNames() (descpb.RegionNames, error)
-	Validate(ctx context.Context, dg DescGetter) error
 }
 
 // TypeDescriptorResolver is an interface used during hydration of type
@@ -749,12 +765,12 @@ func ColumnTypes(columns []Column) []*types.T {
 // ColumnTypesWithVirtualCol returns the types of all given columns,
 // If virtualCol is non-nil, substitutes the type of the virtual
 // column instead of the column with the same ID.
-func ColumnTypesWithVirtualCol(columns []Column, virtualCol *descpb.ColumnDescriptor) []*types.T {
+func ColumnTypesWithVirtualCol(columns []Column, virtualCol Column) []*types.T {
 	t := make([]*types.T, len(columns))
 	for i, col := range columns {
 		t[i] = col.GetType()
-		if virtualCol != nil && col.GetID() == virtualCol.ID {
-			t[i] = virtualCol.Type
+		if virtualCol != nil && col.GetID() == virtualCol.GetID() {
+			t[i] = virtualCol.GetType()
 		}
 	}
 	return t

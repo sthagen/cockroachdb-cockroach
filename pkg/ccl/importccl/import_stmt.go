@@ -9,6 +9,7 @@
 package importccl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io/ioutil"
@@ -80,6 +81,7 @@ const (
 	importOptionSkipFKs          = "skip_foreign_keys"
 	importOptionDisableGlobMatch = "disable_glob_matching"
 	importOptionSaveRejected     = "experimental_save_rejected"
+	importOptionDetached         = "detached"
 
 	pgCopyDelimiter = "delimiter"
 	pgCopyNull      = "nullif"
@@ -98,6 +100,12 @@ const (
 	// as either an inline JSON schema, or an external schema URI.
 	avroSchema    = "schema"
 	avroSchemaURI = "schema_uri"
+
+	pgDumpIgnoreAllUnsupported     = "ignore_unsupported"
+	pgDumpIgnoreShuntFileDest      = "ignored_stmt_log"
+	pgDumpUnsupportedSchemaStmtLog = "unsupported_schema_stmts"
+	pgDumpUnsupportedDataStmtLog   = "unsupported_data-_stmts"
+	pgDumpMaxLoggedStmts           = 10
 
 	// RunningStatusImportBundleParseSchema indicates to the user that a bundle format
 	// schema is being parsed
@@ -124,6 +132,7 @@ var importOptionExpectValues = map[string]sql.KVStringOptValidate{
 
 	importOptionSkipFKs:          sql.KVStringOptRequireNoValue,
 	importOptionDisableGlobMatch: sql.KVStringOptRequireNoValue,
+	importOptionDetached:         sql.KVStringOptRequireNoValue,
 
 	optMaxRowSize: sql.KVStringOptRequireValue,
 
@@ -133,6 +142,9 @@ var importOptionExpectValues = map[string]sql.KVStringOptValidate{
 	avroRecordsSeparatedBy: sql.KVStringOptRequireValue,
 	avroBinRecords:         sql.KVStringOptRequireNoValue,
 	avroJSONRecords:        sql.KVStringOptRequireNoValue,
+
+	pgDumpIgnoreAllUnsupported: sql.KVStringOptRequireNoValue,
+	pgDumpIgnoreShuntFileDest:  sql.KVStringOptRequireValue,
 }
 
 func makeStringSet(opts ...string) map[string]struct{} {
@@ -146,7 +158,7 @@ func makeStringSet(opts ...string) map[string]struct{} {
 // Options common to all formats.
 var allowedCommonOptions = makeStringSet(
 	importOptionSSTSize, importOptionDecompress, importOptionOversample,
-	importOptionSaveRejected, importOptionDisableGlobMatch)
+	importOptionSaveRejected, importOptionDisableGlobMatch, importOptionDetached)
 
 // Format specific allowed options.
 var avroAllowedOptions = makeStringSet(
@@ -162,7 +174,8 @@ var mysqlOutAllowedOptions = makeStringSet(
 )
 var mysqlDumpAllowedOptions = makeStringSet(importOptionSkipFKs, csvRowLimit)
 var pgCopyAllowedOptions = makeStringSet(pgCopyDelimiter, pgCopyNull, optMaxRowSize)
-var pgDumpAllowedOptions = makeStringSet(optMaxRowSize, importOptionSkipFKs, csvRowLimit)
+var pgDumpAllowedOptions = makeStringSet(optMaxRowSize, importOptionSkipFKs, csvRowLimit,
+	pgDumpIgnoreAllUnsupported, pgDumpIgnoreShuntFileDest)
 
 // DROP is required because the target table needs to be take offline during
 // IMPORT INTO.
@@ -296,6 +309,13 @@ func importPlanHook(
 		return nil, nil, nil, false, err
 	}
 
+	opts, optsErr := optsFn()
+
+	var isDetached bool
+	if _, ok := opts[importOptionDetached]; ok {
+		isDetached = true
+	}
+
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		// TODO(dan): Move this span into sql.
 		ctx, span := tracing.ChildSpan(ctx, importStmt.StatementTag())
@@ -303,13 +323,12 @@ func importPlanHook(
 
 		walltime := p.ExecCfg().Clock.Now().WallTime
 
-		if !p.ExtendedEvalContext().TxnImplicit {
-			return errors.Errorf("IMPORT cannot be used inside a transaction")
+		if !(p.ExtendedEvalContext().TxnImplicit || isDetached) {
+			return errors.Errorf("IMPORT cannot be used inside a transaction without DETACHED option")
 		}
 
-		opts, err := optsFn()
-		if err != nil {
-			return err
+		if optsErr != nil {
+			return optsErr
 		}
 
 		filenamePatterns, err := filesFn()
@@ -607,6 +626,16 @@ func importPlanHook(
 				maxRowSize = int32(sz)
 			}
 			format.PgDump.MaxRowSize = maxRowSize
+			if _, ok := opts[pgDumpIgnoreAllUnsupported]; ok {
+				format.PgDump.IgnoreUnsupported = true
+			}
+
+			if dest, ok := opts[pgDumpIgnoreShuntFileDest]; ok {
+				if !format.PgDump.IgnoreUnsupported {
+					return errors.New("cannot log unsupported PGDUMP stmts without `ignore_unsupported` option")
+				}
+				format.PgDump.IgnoreUnsupportedLog = dest
+			}
 
 			if override, ok := opts[csvRowLimit]; ok {
 				rowLimit, err := strconv.Atoi(override)
@@ -882,6 +911,25 @@ func importPlanHook(
 			Progress:    jobspb.ImportProgress{},
 		}
 
+		if isDetached {
+			// When running inside an explicit transaction, we simply create the job
+			// record. We do not wait for the job to finish.
+			aj, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
+				ctx, jr, p.ExtendedEvalContext().Txn)
+			if err != nil {
+				return err
+			}
+
+			if err = protectTimestampForImport(ctx, p, p.ExtendedEvalContext().Txn, *aj.ID(), spansToProtect,
+				walltime, importDetails); err != nil {
+				return err
+			}
+
+			addToFileFormatTelemetry(format.Format.String(), "started")
+			resultsCh <- tree.Datums{tree.NewDInt(tree.DInt(*aj.ID()))}
+			return nil
+		}
+
 		var sj *jobs.StartableJob
 		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
 			sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn)
@@ -889,15 +937,7 @@ func importPlanHook(
 				return err
 			}
 
-			if len(spansToProtect) > 0 {
-				// NB: We protect the timestamp preceding the import statement timestamp
-				// because that's the timestamp to which we want to revert.
-				tsToProtect := hlc.Timestamp{WallTime: walltime}.Prev()
-				rec := jobsprotectedts.MakeRecord(*importDetails.ProtectedTimestampRecord,
-					*sj.ID(), tsToProtect, spansToProtect)
-				return p.ExecCfg().ProtectedTimestampProvider.Protect(ctx, txn, rec)
-			}
-			return nil
+			return protectTimestampForImport(ctx, p, txn, *sj.ID(), spansToProtect, walltime, importDetails)
 		}); err != nil {
 			if sj != nil {
 				if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
@@ -915,6 +955,10 @@ func importPlanHook(
 			return err
 		}
 		return sj.ReportExecutionResults(ctx, resultsCh)
+	}
+
+	if isDetached {
+		return fn, utilccl.DetachedJobExecutionResultHeader, nil, false, nil
 	}
 	return fn, utilccl.BulkJobExecutionResultHeader, nil, false, nil
 }
@@ -1002,6 +1046,29 @@ func parseAvroOptions(
 				return errors.Errorf("%s out of range: %d", override, sz)
 			}
 			format.Avro.MaxRecordSize = int32(sz)
+		}
+	}
+	return nil
+}
+
+func protectTimestampForImport(
+	ctx context.Context,
+	p sql.PlanHookState,
+	txn *kv.Txn,
+	jobID int64,
+	spansToProtect []roachpb.Span,
+	walltime int64,
+	importDetails jobspb.ImportDetails,
+) error {
+	if len(spansToProtect) > 0 {
+		// NB: We protect the timestamp preceding the import statement timestamp
+		// because that's the timestamp to which we want to revert.
+		tsToProtect := hlc.Timestamp{WallTime: walltime}.Prev()
+		rec := jobsprotectedts.MakeRecord(*importDetails.ProtectedTimestampRecord,
+			jobID, tsToProtect, spansToProtect)
+		err := p.ExecCfg().ProtectedTimestampProvider.Protect(ctx, txn, rec)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1225,7 +1292,7 @@ func (r *importResumer) prepareTableDescsForIngestion(
 			}
 
 			// Update the job once all descs have been prepared for ingestion.
-			err = r.job.WithTxn(txn).SetDetails(ctx, importDetails)
+			err = r.job.SetDetails(ctx, txn, importDetails)
 
 			return err
 		})
@@ -1247,6 +1314,102 @@ func (r *importResumer) ReportResults(ctx context.Context, resultsCh chan<- tree
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+type loggerKind int
+
+const (
+	schemaParsing loggerKind = iota
+	dataIngestion
+)
+
+// unsupportedStmtLogger is responsible for handling unsupported PGDUMP SQL
+// statements seen during the import.
+type unsupportedStmtLogger struct {
+	// Values are initialized based on the options specified in the IMPORT PGDUMP
+	// stmt.
+	ignoreUnsupported        bool
+	ignoreUnsupportedLogDest string
+	externalStorage          cloud.ExternalStorageFactory
+
+	// logBuffer holds the string to be flushed to the ignoreUnsupportedLogDest.
+	logBuffer       *bytes.Buffer
+	numIgnoredStmts int
+
+	loggerType loggerKind
+}
+
+func makeUnsupportedStmtLogger(
+	ignoreUnsupported bool,
+	unsupportedLogDest string,
+	loggerType loggerKind,
+	externalStorage cloud.ExternalStorageFactory,
+) *unsupportedStmtLogger {
+	l := &unsupportedStmtLogger{
+		ignoreUnsupported:        ignoreUnsupported,
+		ignoreUnsupportedLogDest: unsupportedLogDest,
+		loggerType:               loggerType,
+		logBuffer:                new(bytes.Buffer),
+		externalStorage:          externalStorage,
+	}
+	header := "Unsupported statements during schema parse phase:\n\n"
+	if loggerType == dataIngestion {
+		header = "Unsupported statements during data ingestion phase:\n\n"
+	}
+	l.logBuffer.WriteString(header)
+	return l
+}
+
+func (u *unsupportedStmtLogger) log(logLine string, isParseError bool) {
+	// We have already logged parse errors during the schema ingestion phase, so
+	// skip them to avoid duplicate entries.
+	skipLoggingParseErr := isParseError && u.loggerType == dataIngestion
+	if u.ignoreUnsupportedLogDest == "" || skipLoggingParseErr {
+		return
+	}
+
+	if u.numIgnoredStmts < pgDumpMaxLoggedStmts {
+		if isParseError {
+			logLine = fmt.Sprintf("%s: could not be parsed\n", logLine)
+		} else {
+			logLine = fmt.Sprintf("%s: unsupported by IMPORT\n", logLine)
+		}
+		u.logBuffer.Write([]byte(logLine))
+	}
+	u.numIgnoredStmts++
+}
+
+func (u *unsupportedStmtLogger) flush(ctx context.Context, user security.SQLUsername) error {
+	if u.ignoreUnsupportedLogDest == "" {
+		return nil
+	}
+
+	numLoggedStmts := pgDumpMaxLoggedStmts
+	if u.numIgnoredStmts < pgDumpMaxLoggedStmts {
+		numLoggedStmts = u.numIgnoredStmts
+	}
+	u.logBuffer.WriteString(fmt.Sprintf("\nLogging %d out of %d ignored statements.\n",
+		numLoggedStmts, u.numIgnoredStmts))
+
+	conf, err := cloudimpl.ExternalStorageConfFromURI(u.ignoreUnsupportedLogDest, user)
+	if err != nil {
+		return errors.Wrap(err, "failed to log unsupported stmts during IMPORT PGDUMP")
+	}
+	var s cloud.ExternalStorage
+	if s, err = u.externalStorage(ctx, conf); err != nil {
+		return errors.New("failed to log unsupported stmts during IMPORT PGDUMP")
+	}
+	defer s.Close()
+
+	logFileName := pgDumpUnsupportedSchemaStmtLog
+	if u.loggerType == dataIngestion {
+		logFileName = pgDumpUnsupportedDataStmtLog
+	}
+	err = s.WriteFile(ctx, logFileName, bytes.NewReader(u.logBuffer.Bytes()))
+	if err != nil {
+		return errors.Wrap(err, "failed to log unsupported stmts to log during IMPORT PGDUMP")
+	}
+	return nil
 }
 
 // parseAndCreateBundleTableDescs parses and creates the table
@@ -1298,7 +1461,19 @@ func parseAndCreateBundleTableDescs(
 		tableDescs, err = readMysqlCreateTable(ctx, reader, evalCtx, p, defaultCSVTableID, parentID, tableName, fks, seqVals, owner, walltime)
 	case roachpb.IOFileFormat_PgDump:
 		evalCtx := &p.ExtendedEvalContext().EvalContext
-		tableDescs, err = readPostgresCreateTable(ctx, reader, evalCtx, p, tableName, parentID, walltime, fks, int(format.PgDump.MaxRowSize), owner)
+
+		// Setup a logger to handle unsupported DDL statements in the PGDUMP file.
+		unsupportedStmtLogger := makeUnsupportedStmtLogger(format.PgDump.IgnoreUnsupported,
+			format.PgDump.IgnoreUnsupportedLog, schemaParsing, p.ExecCfg().DistSQLSrv.ExternalStorage)
+
+		tableDescs, err = readPostgresCreateTable(ctx, reader, evalCtx, p, tableName, parentID,
+			walltime, fks, int(format.PgDump.MaxRowSize), owner, unsupportedStmtLogger)
+
+		logErr := unsupportedStmtLogger.flush(ctx, p.User())
+		if logErr != nil {
+			return nil, logErr
+		}
+
 	default:
 		return tableDescs, errors.Errorf("non-bundle format %q does not support reading schemas", format.Format.String())
 	}
@@ -1326,7 +1501,7 @@ func (r *importResumer) parseBundleSchemaIfNeeded(ctx context.Context, phs inter
 	owner := r.job.Payload().UsernameProto.Decode()
 
 	if details.ParseBundleSchema {
-		if err := r.job.RunningStatus(ctx, func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
+		if err := r.job.RunningStatus(ctx, nil /* txn */, func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
 			return runningStatusImportBundleParseSchema, nil
 		}); err != nil {
 			return errors.Wrapf(err, "failed to update running status of job %d", errors.Safe(*r.job.ID()))
@@ -1363,7 +1538,7 @@ func (r *importResumer) parseBundleSchemaIfNeeded(ctx context.Context, phs inter
 		// Prevent job from redoing schema parsing and table desc creation
 		// on subsequent resumptions.
 		details.ParseBundleSchema = false
-		if err := r.job.WithTxn(nil).SetDetails(ctx, details); err != nil {
+		if err := r.job.SetDetails(ctx, nil /* txn */, details); err != nil {
 			return err
 		}
 	}
@@ -1449,7 +1624,7 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			}
 		}
 
-		if err := r.job.WithTxn(nil).SetDetails(ctx, details); err != nil {
+		if err := r.job.SetDetails(ctx, nil /* txn */, details); err != nil {
 			return err
 		}
 	}
@@ -1569,7 +1744,7 @@ func (r *importResumer) publishTables(ctx context.Context, execCfg *sql.Executor
 
 		// Update job record to mark tables published state as complete.
 		details.TablesPublished = true
-		err := r.job.WithTxn(txn).SetDetails(ctx, details)
+		err := r.job.SetDetails(ctx, txn, details)
 		if err != nil {
 			return errors.Wrap(err, "updating job details after publishing tables")
 		}

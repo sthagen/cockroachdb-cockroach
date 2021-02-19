@@ -12,6 +12,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -211,7 +212,12 @@ func TestIntentDemuxWriter(t *testing.T) {
 			case "new-writer":
 				var separated bool
 				d.ScanArgs(t, "enable-separated", &separated)
-				w = intentDemuxWriter{w: &pw, enabledSeparatedIntents: separated}
+				// This is a low-level test that explicitly wraps the writer, so it
+				// doesn't matter how the original call to createTestPebbleEngine
+				// behaved in terms of separated intents config.
+				w = wrapIntentWriter(context.Background(), &pw,
+					makeSettingsForSeparatedIntents(false /* oldClusterVersion */, separated),
+					false /* isLongLived */)
 				return ""
 			case "put-intent":
 				pw.reset()
@@ -235,10 +241,13 @@ func TestIntentDemuxWriter(t *testing.T) {
 				}
 				state := readPrecedingIntentState(t, d)
 				txnDidNotUpdateMeta := readTxnDidNotUpdateMeta(t, d)
-				scratch, err = w.PutIntent(key, val, state, txnDidNotUpdateMeta, txnUUID, scratch)
+				var delta int
+				scratch, delta, err = w.PutIntent(
+					context.Background(), key, val, state, txnDidNotUpdateMeta, txnUUID, scratch)
 				if err != nil {
 					return err.Error()
 				}
+				fmt.Fprintf(&pw.b, "Return Value: separated-delta=%d\n", delta)
 				printEngContents(&pw.b, eng)
 				return pw.b.String()
 			case "clear-intent":
@@ -249,10 +258,12 @@ func TestIntentDemuxWriter(t *testing.T) {
 				txnUUID := uuid.FromUint128(uint128.FromInts(0, uint64(txn)))
 				state := readPrecedingIntentState(t, d)
 				txnDidNotUpdateMeta := readTxnDidNotUpdateMeta(t, d)
-				scratch, err = w.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID, scratch)
+				var delta int
+				scratch, delta, err = w.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID, scratch)
 				if err != nil {
 					return err.Error()
 				}
+				fmt.Fprintf(&pw.b, "Return Value: separated-delta=%d\n", delta)
 				printEngContents(&pw.b, eng)
 				return pw.b.String()
 			case "clear-range":

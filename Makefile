@@ -910,7 +910,8 @@ OPTGEN_TARGETS = \
 test-targets := \
 	check test testshort testslow testrace testraceslow testbuild \
 	stress stressrace \
-	roachprod-stress roachprod-stressrace
+	roachprod-stress roachprod-stressrace \
+	testlogic testbaselogic testccllogic testoptlogic
 
 go-targets-ccl := \
 	$(COCKROACH) \
@@ -970,7 +971,13 @@ $(go-targets): override LINKFLAGS += \
 $(COCKROACH) $(COCKROACHOSS) go-install: override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.utcTime=$(shell date -u '+%Y/%m/%d %H:%M:%S')"
 
-SETTINGS_DOC_PAGE := docs/generated/settings/settings.html
+docs/generated/settings/settings.html: $(settings-doc-gen)
+	@$(settings-doc-gen) gen settings-list --format=html > $@
+
+docs/generated/settings/settings-for-tenants.txt:  $(settings-doc-gen)
+	@$(settings-doc-gen) gen settings-list --without-system-only > $@
+
+SETTINGS_DOC_PAGES := docs/generated/settings/settings.html docs/generated/settings/settings-for-tenants.txt
 
 # Note: We pass `-v` to `go build` and `go test -i` so that warnings
 # from the linker aren't suppressed. The usage of `-v` also shows when
@@ -1001,7 +1008,7 @@ build: $(COCKROACH)
 buildoss: $(COCKROACHOSS)
 buildshort: $(COCKROACHSHORT)
 build buildoss buildshort: $(if $(is-cross-compile),,$(DOCGEN_TARGETS))
-build buildshort: $(if $(is-cross-compile),,$(SETTINGS_DOC_PAGE))
+build buildshort: $(if $(is-cross-compile),,$(SETTINGS_DOC_PAGES))
 
 # For historical reasons, symlink cockroach to cockroachshort.
 # TODO(benesch): see if it would break anyone's workflow to remove this.
@@ -1138,7 +1145,7 @@ dupl: bin/.bootstrap
 
 .PHONY: generate
 generate: ## Regenerate generated code.
-generate: protobuf $(DOCGEN_TARGETS) $(OPTGEN_TARGETS) $(LOG_TARGETS) $(SQLPARSER_TARGETS) $(WKTPARSER_TARGETS) $(SETTINGS_DOC_PAGE) bin/langgen bin/terraformgen
+generate: protobuf $(DOCGEN_TARGETS) $(OPTGEN_TARGETS) $(LOG_TARGETS) $(SQLPARSER_TARGETS) $(WKTPARSER_TARGETS) $(SETTINGS_DOC_PAGES) bin/langgen bin/terraformgen
 	$(GO) generate $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
 	$(MAKE) execgen
 
@@ -1592,9 +1599,6 @@ pkg/util/log/log_channels_generated.go: pkg/util/log/gen.go pkg/util/log/logpb/l
 
 settings-doc-gen := $(if $(filter buildshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),$(COCKROACH))
 
-$(SETTINGS_DOC_PAGE): $(settings-doc-gen)
-	@$(settings-doc-gen) gen settings-list --format=html > $@
-
 .PHONY: execgen
 execgen: ## Regenerate generated code for the vectorized execution engine.
 execgen: $(EXECGEN_TARGETS) bin/execgen
@@ -1706,7 +1710,6 @@ bins = \
   bin/github-pull-request-make \
   bin/gossipsim \
   bin/langgen \
-  bin/dev \
   bin/protoc-gen-gogoroach \
   bin/publish-artifacts \
   bin/publish-provisional-artifacts \
@@ -1722,8 +1725,12 @@ bins = \
   bin/uptodate \
   bin/urlcheck \
 	bin/whoownsit \
-  bin/workload \
   bin/zerosum
+
+# `xbins` contains binaries that should be compiled for the target architecture
+# (not the host), and should therefore be built with `xgo`.
+xbins = \
+  bin/workload
 
 testbins = \
   bin/logictest \
@@ -1754,6 +1761,12 @@ $(bins): bin/%: bin/%.d | bin/prereqs bin/.submodules-initialized
 	mv -f $@.d.tmp $@.d
 	@$(GO_INSTALL) -v $(if $($*-package),$($*-package),./pkg/cmd/$*)
 
+$(xbins): bin/%: bin/%.d | bin/prereqs bin/.submodules-initialized
+	@echo go build -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -o $@ $*
+	bin/prereqs $(if $($*-package),$($*-package),./pkg/cmd/$*) > $@.d.tmp
+	mv -f $@.d.tmp $@.d
+	$(xgo) build -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -o $@ $(if $($*-package),$($*-package),./pkg/cmd/$*)
+
 $(testbins): bin/%: bin/%.d | bin/prereqs $(SUBMODULES_TARGET)
 	@echo go test -c $($*-package)
 	bin/prereqs -bin-name=$* -test $($*-package) > $@.d.tmp
@@ -1772,8 +1785,7 @@ fuzz: bin/fuzz
 # Short hand to re-generate all bazel BUILD files.
 bazel-generate: ## Generate all bazel BUILD files.
 	@echo 'Generating DEPS.bzl and BUILD files using gazelle'
-	@bazel run //:gazelle -- update-repos -from_file=go.mod -build_file_proto_mode=disable_global -to_macro=DEPS.bzl%go_deps
-	@bazel run //:gazelle
+	./build/bazelutil/bazel-generate.sh
 
 # No need to include all the dependency files if the user is just
 # requesting help or cleanup.

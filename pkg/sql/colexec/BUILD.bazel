@@ -87,6 +87,7 @@ go_library(
         "//pkg/util/cancelchecker",
         "//pkg/util/duration",  # keep
         "//pkg/util/encoding",  # keep
+        "//pkg/util/humanizeutil",
         "//pkg/util/log",
         "//pkg/util/mon",
         "//pkg/util/randutil",
@@ -102,6 +103,7 @@ go_library(
 
 go_test(
     name = "colexec_test",
+    size = "medium",
     srcs = [
         "aggregators_test.go",
         "and_or_projection_test.go",
@@ -129,6 +131,7 @@ go_test(
         "hashjoiner_test.go",
         "inject_setup_test.go",
         "is_null_ops_test.go",
+        "joiner_utils_test.go",
         "like_ops_test.go",
         "limit_test.go",
         "main_test.go",
@@ -138,6 +141,7 @@ go_test(
         "ordered_synchronizer_test.go",
         "ordinality_test.go",
         "parallel_unordered_synchronizer_test.go",
+        "proj_utils_test.go",
         "projection_ops_test.go",
         "routers_test.go",
         "rowstovec_test.go",
@@ -147,11 +151,11 @@ go_test(
         "simple_project_test.go",
         "sort_chunks_test.go",
         "sort_test.go",
+        "sort_utils_test.go",
         "sorttopk_test.go",
         "spilling_queue_test.go",
         "stats_test.go",
         "types_integration_test.go",
-        "utils_test.go",
         "window_functions_test.go",
     ],
     embed = [":colexec"],
@@ -168,6 +172,7 @@ go_test(
         "//pkg/sql/colconv",
         "//pkg/sql/colexec/colbuilder",
         "//pkg/sql/colexec/colexecagg",
+        "//pkg/sql/colexec/colexectestutils",
         "//pkg/sql/colexec/execgen",
         "//pkg/sql/colexecbase",
         "//pkg/sql/colexecbase/colexecerror",
@@ -190,7 +195,6 @@ go_test(
         "//pkg/util/encoding",
         "//pkg/util/envutil",
         "//pkg/util/humanizeutil",
-        "//pkg/util/json",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/mon",
@@ -203,7 +207,6 @@ go_test(
         "@com_github_cockroachdb_apd_v2//:apd",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_marusama_semaphore//:semaphore",
-        "@com_github_pmezard_go_difflib//difflib",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],

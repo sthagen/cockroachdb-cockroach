@@ -186,20 +186,23 @@ func (p *planner) createDescriptorWithID(
 		}
 	case *tabledesc.Mutable:
 		isTable = true
-		if err := desc.ValidateTable(ctx); err != nil {
+		if err := desc.ValidateSelf(ctx); err != nil {
 			return err
 		}
 		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
 			return err
 		}
 	case *dbdesc.Mutable:
-		if err := desc.Validate(); err != nil {
+		if err := desc.ValidateSelf(ctx); err != nil {
 			return err
 		}
 		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
 			return err
 		}
 	case *schemadesc.Mutable:
+		if err := desc.ValidateSelf(ctx); err != nil {
+			return err
+		}
 		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
 			return err
 		}
@@ -258,23 +261,26 @@ func validateDatabaseRegionConfig(regionConfig descpb.DatabaseDescriptor_RegionC
 	return nil
 }
 
-// addRegionToRegionConfig adds the supplied region to the RegionConfig in the
-// supplied database descriptor.
-func (p *planner) addRegionToRegionConfig(
-	desc *dbdesc.Mutable, regionToAdd *tree.AlterDatabaseAddRegion,
+// addActiveRegionToRegionConfig adds the supplied region to the RegionConfig in
+// the supplied database descriptor if the region is currently active.
+func (p *planner) addActiveRegionToRegionConfig(
+	ctx context.Context, desc *dbdesc.Mutable, regionToAdd *tree.AlterDatabaseAddRegion,
 ) error {
-	liveRegions, err := p.getLiveClusterRegions()
+	liveRegions, err := p.getLiveClusterRegions(ctx)
 	if err != nil {
 		return err
 	}
-
-	regionConfig := desc.RegionConfig
 
 	// Ensure that the region we're adding is currently active.
 	region := descpb.RegionName(regionToAdd.Region)
 	if err := checkLiveClusterRegion(liveRegions, region); err != nil {
 		return err
 	}
+	return addRegionToRegionConfig(desc, region)
+}
+
+func addRegionToRegionConfig(desc *dbdesc.Mutable, region descpb.RegionName) error {
+	regionConfig := desc.RegionConfig
 
 	// Ensure that the region doesn't already exist in the database.
 	for _, r := range regionConfig.Regions {
@@ -305,6 +311,7 @@ func (p *planner) addRegionToRegionConfig(
 	}
 
 	return nil
+
 }
 
 // createRegionConfig creates a new region config from the given parameters.
@@ -314,13 +321,16 @@ func (p *planner) createRegionConfig(
 	if primaryRegion == "" && len(regions) == 0 {
 		return nil, nil
 	}
+	if err := checkClusterSupportsMultiRegion(p.EvalContext()); err != nil {
+		return nil, err
+	}
 	var regionConfig descpb.DatabaseDescriptor_RegionConfig
 	var err error
 	regionConfig.SurvivalGoal, err = translateSurvivalGoal(survivalGoal)
 	if err != nil {
 		return nil, err
 	}
-	liveRegions, err := p.getLiveClusterRegions()
+	liveRegions, err := p.getLiveClusterRegions(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -390,4 +400,14 @@ func (p *planner) createRegionConfig(
 		return nil, err
 	}
 	return &regionConfig, nil
+}
+
+func checkClusterSupportsMultiRegion(evalCtx *tree.EvalContext) error {
+	if !evalCtx.Settings.Version.IsActive(evalCtx.Context, clusterversion.MultiRegionFeatures) {
+		return pgerror.Newf(
+			pgcode.ObjectNotInPrerequisiteState,
+			`cannot add regions to a database until the cluster upgrade is finalized`,
+		)
+	}
+	return nil
 }

@@ -14,6 +14,19 @@ exec-ddl
 CREATE TABLE b (k INT PRIMARY KEY, i INT, f FLOAT, s STRING NOT NULL, j JSON)
 ----
 
+exec-ddl
+CREATE TABLE virt (
+  k INT PRIMARY KEY,
+  i INT,
+  s STRING,
+  j JSON,
+  v STRING AS (lower(s)) VIRTUAL,
+  x JSON AS (j->'x') VIRTUAL,
+  INDEX (v),
+  INVERTED INDEX (x)
+)
+----
+
 # --------------------------------------------------
 # InlineConstVar
 # --------------------------------------------------
@@ -699,6 +712,141 @@ project
       │              │    └── 1.0
       │              └── 1.0
       └── 107
+
+# --------------------------------------------------
+# InlineSelectVirtualColumns
+# --------------------------------------------------
+
+# Inline indexed virtual columns in a Select below the Project.
+norm expect=InlineSelectVirtualColumns
+SELECT * FROM virt WHERE v = 'foo'
+----
+project
+ ├── columns: k:1!null i:2 s:3 j:4 v:5 x:6
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)-->(5), (4)-->(6)
+ ├── select
+ │    ├── columns: k:1!null i:2 s:3 j:4
+ │    ├── immutable
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4)
+ │    ├── scan virt
+ │    │    ├── columns: k:1!null i:2 s:3 j:4
+ │    │    ├── computed column expressions
+ │    │    │    ├── v:5
+ │    │    │    │    └── lower(s:3)
+ │    │    │    └── x:6
+ │    │    │         └── j:4->'x'
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2-4)
+ │    └── filters
+ │         └── lower(s:3) = 'foo' [outer=(3), immutable]
+ └── projections
+      ├── lower(s:3) [as=v:5, outer=(3), immutable]
+      └── j:4->'x' [as=x:6, outer=(4), immutable]
+
+# Inline inverted-indexed virtual columns.
+norm expect=InlineSelectVirtualColumns
+SELECT * FROM virt WHERE x @> '1'
+----
+project
+ ├── columns: k:1!null i:2 s:3 j:4 v:5 x:6
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)-->(5), (4)-->(6)
+ ├── select
+ │    ├── columns: k:1!null i:2 s:3 j:4
+ │    ├── immutable
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4)
+ │    ├── scan virt
+ │    │    ├── columns: k:1!null i:2 s:3 j:4
+ │    │    ├── computed column expressions
+ │    │    │    ├── v:5
+ │    │    │    │    └── lower(s:3)
+ │    │    │    └── x:6
+ │    │    │         └── j:4->'x'
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2-4)
+ │    └── filters
+ │         └── (j:4->'x') @> '1' [outer=(4), immutable]
+ └── projections
+      ├── lower(s:3) [as=v:5, outer=(3), immutable]
+      └── j:4->'x' [as=x:6, outer=(4), immutable]
+
+# Split the filters and inline only virtual columns.
+norm expect=InlineSelectVirtualColumns
+SELECT * FROM (
+  SELECT i, v, upper(s) AS w FROM virt
+) WHERE v = 'foo' AND w = 'FOO' AND i = 10
+----
+select
+ ├── columns: i:2!null v:5 w:9!null
+ ├── immutable
+ ├── fd: ()-->(2,9)
+ ├── project
+ │    ├── columns: w:9 v:5 i:2!null
+ │    ├── immutable
+ │    ├── fd: ()-->(2)
+ │    ├── select
+ │    │    ├── columns: i:2!null s:3
+ │    │    ├── immutable
+ │    │    ├── fd: ()-->(2)
+ │    │    ├── scan virt
+ │    │    │    ├── columns: i:2 s:3
+ │    │    │    └── computed column expressions
+ │    │    │         ├── v:5
+ │    │    │         │    └── lower(s:3)
+ │    │    │         └── x:6
+ │    │    │              └── j:4->'x'
+ │    │    └── filters
+ │    │         ├── lower(s:3) = 'foo' [outer=(3), immutable]
+ │    │         └── i:2 = 10 [outer=(2), constraints=(/2: [/10 - /10]; tight), fd=()-->(2)]
+ │    └── projections
+ │         ├── upper(s:3) [as=w:9, outer=(3), immutable]
+ │         └── lower(s:3) [as=v:5, outer=(3), immutable]
+ └── filters
+      └── w:9 = 'FOO' [outer=(9), constraints=(/9: [/'FOO' - /'FOO']; tight), fd=()-->(9)]
+
+# Do not inline correlated subqueries.
+norm expect-not=InlineSelectVirtualColumns
+SELECT * FROM virt v1
+WHERE EXISTS (
+  SELECT * FROM virt v2 WHERE v1.v = v2.s
+)
+----
+semi-join (hash)
+ ├── columns: k:1!null i:2 s:3 j:4 v:5 x:6
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)-->(5), (4)-->(6)
+ ├── project
+ │    ├── columns: v:5 x:6 k:1!null i:2 s:3 j:4
+ │    ├── immutable
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4), (3)-->(5), (4)-->(6)
+ │    ├── scan virt
+ │    │    ├── columns: k:1!null i:2 s:3 j:4
+ │    │    ├── computed column expressions
+ │    │    │    ├── v:5
+ │    │    │    │    └── lower(s:3)
+ │    │    │    └── x:6
+ │    │    │         └── j:4->'x'
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2-4)
+ │    └── projections
+ │         ├── lower(s:3) [as=v:5, outer=(3), immutable]
+ │         └── j:4->'x' [as=x:6, outer=(4), immutable]
+ ├── scan virt
+ │    ├── columns: s:11
+ │    └── computed column expressions
+ │         ├── v:13
+ │         │    └── lower(s:11)
+ │         └── x:14
+ │              └── j:12->'x'
+ └── filters
+      └── v:5 = s:11 [outer=(5,11), constraints=(/5: (/NULL - ]; /11: (/NULL - ]), fd=(5)==(11), (11)==(5)]
 
 # --------------------------------------------------
 # InlineProjectInProject

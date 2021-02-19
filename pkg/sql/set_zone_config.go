@@ -213,7 +213,10 @@ func checkPrivilegeForSetZoneConfig(ctx context.Context, p *planner, zs tree.Zon
 			return p.RequireAdminRole(ctx, "alter the system database")
 		}
 		_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
-			string(zs.Database), tree.DatabaseLookupFlags{Required: true})
+			string(zs.Database), tree.DatabaseLookupFlags{
+				Required:    true,
+				AvoidCached: true,
+			})
 		if err != nil {
 			return err
 		}
@@ -337,6 +340,12 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 	table, err := params.p.resolveTableForZone(params.ctx, &n.zoneSpecifier)
 	if err != nil {
 		return err
+	}
+
+	// If the table descriptor is resolved but is not a
+	// physical table then return an error.
+	if table != nil && !table.IsPhysicalTable() {
+		return pgerror.Newf(pgcode.WrongObjectType, "cannot set a zone configuration on non-physical object %s", table.GetName())
 	}
 
 	if n.zoneSpecifier.TargetsPartition() && len(n.zoneSpecifier.TableOrIndex.Index) == 0 && !n.allIndexes {

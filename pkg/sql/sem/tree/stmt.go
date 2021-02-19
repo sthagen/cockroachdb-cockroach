@@ -151,6 +151,7 @@ var _ CCLOnlyStatement = &Import{}
 var _ CCLOnlyStatement = &Export{}
 var _ CCLOnlyStatement = &ScheduledBackup{}
 var _ CCLOnlyStatement = &StreamIngestion{}
+var _ CCLOnlyStatement = &ReplicationStream{}
 
 // StatementType implements the Statement interface.
 func (*AlterDatabaseOwner) StatementType() StatementType { return DDL }
@@ -677,6 +678,16 @@ func (n *Relocate) StatementTag() string {
 }
 
 // StatementType implements the Statement interface.
+func (*ReplicationStream) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ReplicationStream) StatementTag() string { return "CREATE REPLICATION STREAM" }
+
+func (*ReplicationStream) cclOnlyStatement() {}
+
+func (*ReplicationStream) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
 func (*Restore) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -814,6 +825,12 @@ func (*ShowCreate) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*ShowCreate) StatementTag() string { return "SHOW CREATE" }
+
+// StatementType implements the Statement interface.
+func (*ShowCreateAllTables) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowCreateAllTables) StatementTag() string { return "SHOW CREATE ALL TABLES" }
 
 // StatementType implements the Statement interface.
 func (*ShowBackup) StatementType() StatementType { return Rows }
@@ -1147,6 +1164,7 @@ func (n *RefreshMaterializedView) String() string        { return AsString(n) }
 func (n *RenameColumn) String() string                   { return AsString(n) }
 func (n *RenameDatabase) String() string                 { return AsString(n) }
 func (n *ReparentDatabase) String() string               { return AsString(n) }
+func (n *ReplicationStream) String() string              { return AsString(n) }
 func (n *RenameIndex) String() string                    { return AsString(n) }
 func (n *RenameTable) String() string                    { return AsString(n) }
 func (n *Restore) String() string                        { return AsString(n) }
@@ -1173,6 +1191,7 @@ func (n *ShowClusterSettingList) String() string         { return AsString(n) }
 func (n *ShowColumns) String() string                    { return AsString(n) }
 func (n *ShowConstraints) String() string                { return AsString(n) }
 func (n *ShowCreate) String() string                     { return AsString(n) }
+func (n *ShowCreateAllTables) String() string            { return AsString(n) }
 func (n *ShowDatabases) String() string                  { return AsString(n) }
 func (n *ShowDatabaseIndexes) String() string            { return AsString(n) }
 func (n *ShowEnums) String() string                      { return AsString(n) }

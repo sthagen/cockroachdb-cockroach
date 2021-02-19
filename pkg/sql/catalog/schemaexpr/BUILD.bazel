@@ -13,6 +13,7 @@ go_library(
         "expr_filter.go",
         "partial_index.go",
         "select_name_resolution.go",
+        "unique_contraint.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr",
     visibility = ["//visibility:public"],
@@ -28,11 +29,13 @@ go_library(
         "//pkg/sql/sessiondata",
         "//pkg/sql/types",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_lib_pq//oid",
     ],
 )
 
 go_test(
     name = "schemaexpr_test",
+    size = "small",
     srcs = [
         "check_constraint_test.go",
         "column_test.go",

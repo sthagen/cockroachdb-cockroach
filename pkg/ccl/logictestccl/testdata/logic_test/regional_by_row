@@ -3,12 +3,6 @@
 statement ok
 CREATE DATABASE multi_region_test_db PRIMARY REGION "ca-central-1" REGIONS "ap-southeast-2", "us-east-1" SURVIVE REGION FAILURE
 
-statement error REGIONAL BY ROW is currently experimental
-CREATE TABLE regional_by_row_table (pk int) LOCALITY REGIONAL BY ROW
-
-statement ok
-SET experimental_enable_implicit_column_partitioning = true
-
 statement error cannot set LOCALITY on a database that is not multi-region enabled
 CREATE TABLE regional_by_row_table (pk int) LOCALITY REGIONAL BY ROW
 
@@ -20,14 +14,6 @@ CREATE TABLE regional_by_row_table (
   pk int
 )
 PARTITION BY LIST (pk) (PARTITION one VALUES IN ((1)))
-LOCALITY REGIONAL BY ROW
-
-statement error cannot specify crdb_region column in REGIONAL BY ROW table as the column is implicitly created by the system
-CREATE TABLE regional_by_row_table (
-  pk int,
-  a int,
-  crdb_region crdb_internal_region
-)
 LOCALITY REGIONAL BY ROW
 
 statement error REGIONAL BY ROW on a TABLE containing PARTITION BY is not supported
@@ -53,6 +39,15 @@ CREATE TABLE regional_by_row_table (
 )
 LOCALITY REGIONAL BY ROW
 
+statement error REGIONAL BY ROW on a table with an INDEX containing PARTITION BY is not supported
+CREATE TABLE regional_by_row_table (
+  pk int,
+  a int,
+  j JSON,
+  INVERTED INDEX (a, j) PARTITION BY LIST (a) (PARTITION one VALUES IN ((1)))
+)
+LOCALITY REGIONAL BY ROW
+
 statement error REGIONAL BY ROW on a table with an UNIQUE constraint containing PARTITION BY is not supported
 CREATE TABLE regional_by_row_table (
   pk int,
@@ -69,6 +64,45 @@ CREATE TABLE regional_by_row_table (
 )
 LOCALITY REGIONAL BY ROW
 
+statement error cannot use column crdb_region which has type INT8 in REGIONAL BY ROW\nDETAIL: Column crdb_internal_region must be of type crdb_internal_region
+CREATE TABLE regional_by_row_table (
+  pk int,
+  a int,
+  crdb_region int
+)
+LOCALITY REGIONAL BY ROW
+
+statement ok
+CREATE TABLE regional_by_row_table_explicit_crdb_region_column (
+  pk int PRIMARY KEY,
+  a int,
+  crdb_region crdb_internal_region,
+  FAMILY (pk, a, crdb_region)
+)
+LOCALITY REGIONAL BY ROW
+
+query T
+SELECT create_statement FROM [SHOW CREATE TABLE regional_by_row_table_explicit_crdb_region_column]
+----
+CREATE TABLE public.regional_by_row_table_explicit_crdb_region_column (
+  pk INT8 NOT NULL,
+  a INT8 NULL,
+  crdb_region public.crdb_internal_region NOT NULL,
+  CONSTRAINT "primary" PRIMARY KEY (pk ASC),
+  FAMILY fam_0_pk_a_crdb_region (pk, a, crdb_region)
+) LOCALITY REGIONAL BY ROW;
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table_explicit_crdb_region_column@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table_explicit_crdb_region_column@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table_explicit_crdb_region_column@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]'
 
 statement ok
 CREATE TABLE regional_by_row_table (
@@ -76,13 +110,13 @@ CREATE TABLE regional_by_row_table (
   pk2 int NOT NULL,
   a int NOT NULL,
   b int NOT NULL,
+  j JSON,
   INDEX (a),
   UNIQUE (b),
+  INVERTED INDEX (j),
   FAMILY (pk, pk2, a, b)
 ) LOCALITY REGIONAL BY ROW
 
-# TODO(#59630): determine how we should display the presence of a crdb_region column
-# to the user.
 # TODO(#59362): ensure this CREATE TABLE statement round trips.
 query T
 SELECT create_statement FROM [SHOW CREATE TABLE regional_by_row_table]
@@ -92,11 +126,13 @@ CREATE TABLE public.regional_by_row_table (
   pk2 INT8 NOT NULL,
   a INT8 NOT NULL,
   b INT8 NOT NULL,
-  crdb_region public.crdb_internal_region NOT NULL DEFAULT gateway_region()::public.crdb_internal_region,
+  j JSONB NULL,
+  crdb_region public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::public.crdb_internal_region,
   CONSTRAINT "primary" PRIMARY KEY (pk ASC),
   INDEX regional_by_row_table_a_idx (a ASC),
   UNIQUE INDEX regional_by_row_table_b_key (b ASC),
-  FAMILY fam_0_pk_pk2_a_b_crdb_region (pk, pk2, a, b, crdb_region)
+  INVERTED INDEX regional_by_row_table_j_idx (j),
+  FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
 ) LOCALITY REGIONAL BY ROW;
 ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@primary CONFIGURE ZONE USING
   num_voters = 5,
@@ -107,6 +143,10 @@ ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_b
   voter_constraints = '{+region=ap-southeast-2: 2}',
   lease_preferences = '[[+region=ap-southeast-2]]';
 ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_b_key CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_j_idx CONFIGURE ZONE USING
   num_voters = 5,
   voter_constraints = '{+region=ap-southeast-2: 2}',
   lease_preferences = '[[+region=ap-southeast-2]]';
@@ -122,6 +162,10 @@ ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_
   num_voters = 5,
   voter_constraints = '{+region=ca-central-1: 2}',
   lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_j_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
 ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@primary CONFIGURE ZONE USING
   num_voters = 5,
   voter_constraints = '{+region=us-east-1: 2}',
@@ -131,6 +175,10 @@ ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row
   voter_constraints = '{+region=us-east-1: 2}',
   lease_preferences = '[[+region=us-east-1]]';
 ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_b_key CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_j_idx CONFIGURE ZONE USING
   num_voters = 5,
   voter_constraints = '{+region=us-east-1: 2}',
   lease_preferences = '[[+region=us-east-1]]'
@@ -147,20 +195,54 @@ regional_by_row_table_a_idx  a            false
 regional_by_row_table_a_idx  crdb_region  true
 regional_by_row_table_b_key  b            false
 regional_by_row_table_b_key  crdb_region  true
+regional_by_row_table_j_idx  crdb_region  true
+regional_by_row_table_j_idx  j            false
 
 query TTTTIT colnames
 SHOW TABLES
 ----
-schema_name  table_name             type   owner  estimated_row_count  locality
-public       regional_by_row_table  table  root   0                    REGIONAL BY ROW
+schema_name  table_name                                         type   owner  estimated_row_count  locality
+public       regional_by_row_table                              table  root   0                    REGIONAL BY ROW
+public       regional_by_row_table_explicit_crdb_region_column  table  root   0                    REGIONAL BY ROW
 
 query TI
-INSERT INTO regional_by_row_table (pk, pk2, a, b) VALUES
-(1, 1, 2, 3), (4, 4, 5, 6)
+INSERT INTO regional_by_row_table (pk, pk2, a, b, j) VALUES
+(1, 1, 2, 3, '{"a": "b"}'), (4, 4, 5, 6, '{"c": "d"}')
 RETURNING crdb_region, pk
 ----
 ap-southeast-2  1
 ap-southeast-2  4
+
+# Insert duplicate row for column a.
+statement ok
+INSERT INTO multi_region_test_db.regional_by_row_table (crdb_region, pk, pk2, a, b) VALUES ('ca-central-1', 5, 5, 5, 5)
+
+statement error could not create unique constraint "uniq_idx"\nDETAIL: Key \(a\)=\(5\) is duplicated
+CREATE UNIQUE INDEX uniq_idx ON regional_by_row_table(a)
+
+statement ok
+DELETE FROM regional_by_row_table WHERE pk = 5;
+CREATE UNIQUE INDEX uniq_idx ON regional_by_row_table(a)
+
+query TTB colnames
+SELECT index_name, column_name, implicit FROM crdb_internal.index_columns
+WHERE descriptor_name = 'regional_by_row_table' AND column_type = 'key'
+ORDER BY 1, 2
+----
+index_name                   column_name  implicit
+primary                      crdb_region  true
+primary                      pk           false
+regional_by_row_table_a_idx  a            false
+regional_by_row_table_a_idx  crdb_region  true
+regional_by_row_table_b_key  b            false
+regional_by_row_table_b_key  crdb_region  true
+regional_by_row_table_j_idx  crdb_region  true
+regional_by_row_table_j_idx  j            false
+uniq_idx                     a            false
+uniq_idx                     crdb_region  true
+
+statement ok
+DROP INDEX uniq_idx
 
 query TI
 INSERT INTO regional_by_row_table (crdb_region, pk, pk2, a, b) VALUES
@@ -170,14 +252,14 @@ RETURNING crdb_region, pk
 ca-central-1  7
 
 query TI nodeidx=3
-INSERT INTO multi_region_test_db.regional_by_row_table (pk, pk2, a, b) VALUES
+USE multi_region_test_db; INSERT INTO regional_by_row_table (pk, pk2, a, b) VALUES
 (10, 10, 11, 12)
 RETURNING crdb_region, pk
 ----
 ca-central-1  10
 
 query TI nodeidx=6
-INSERT INTO multi_region_test_db.regional_by_row_table (pk, pk2, a, b) VALUES
+USE multi_region_test_db; INSERT INTO regional_by_row_table (pk, pk2, a, b) VALUES
 (20, 20, 21, 22)
 RETURNING crdb_region, pk
 ----
@@ -201,6 +283,21 @@ ca-central-1    10  10  11  12
 us-east-1       20  20  21  22
 ap-southeast-2  23  23  24  25
 
+query IIIIT colnames
+SELECT * FROM regional_by_row_table ORDER BY pk
+----
+pk  pk2  a   b   j
+1   1    2   3   {"a": "b"}
+4   4    5   6   {"c": "d"}
+7   7    8   9   NULL
+10  10   11  12  NULL
+20  20   21  22  NULL
+23  23   24  25  NULL
+
+# Tests dropping a referenced column in REGIONAL BY ROW does not succeed.
+statement error cannot drop column crdb_region as it is used to store the region in a REGIONAL BY ROW table\nHINT: You must change the table locality before dropping this table
+ALTER TABLE regional_by_row_table DROP COLUMN crdb_region
+
 # Tests creating a index and a unique constraint on a REGIONAL BY ROW table.
 statement ok
 CREATE INDEX new_idx ON regional_by_row_table(a, b)
@@ -219,13 +316,13 @@ vectorized: true
 • root
 │
 ├── • insert
-│   │ into: regional_by_row_table(pk, pk2, a, b, crdb_region)
+│   │ into: regional_by_row_table(pk, pk2, a, b, j, crdb_region)
 │   │
 │   └── • buffer
 │       │ label: buffer 1
 │       │
 │       └── • values
-│             size: 6 columns, 1 row
+│             size: 7 columns, 1 row
 │
 ├── • constraint-check
 │   │
@@ -233,9 +330,9 @@ vectorized: true
 │       │
 │       └── • lookup join (semi)
 │           │ table: regional_by_row_table@primary
-│           │ equality: (lookup_join_const_col_@20, column1) = (crdb_region,pk)
+│           │ equality: (lookup_join_const_col_@22, column1) = (crdb_region,pk)
 │           │ equality cols are key
-│           │ pred: column12 != crdb_region
+│           │ pred: column15 != crdb_region
 │           │
 │           └── • cross join
 │               │
@@ -251,9 +348,9 @@ vectorized: true
 │       │
 │       └── • lookup join (semi)
 │           │ table: regional_by_row_table@regional_by_row_table_b_key
-│           │ equality: (lookup_join_const_col_@30, column4) = (crdb_region,b)
+│           │ equality: (lookup_join_const_col_@37, column4) = (crdb_region,b)
 │           │ equality cols are key
-│           │ pred: (column1 != pk) OR (column12 != crdb_region)
+│           │ pred: (column1 != pk) OR (column15 != crdb_region)
 │           │
 │           └── • cross join
 │               │
@@ -269,9 +366,9 @@ vectorized: true
         │
         └── • lookup join (semi)
             │ table: regional_by_row_table@new_idx
-            │ equality: (lookup_join_const_col_@41, column3, column4) = (crdb_region,a,b)
+            │ equality: (lookup_join_const_col_@52, column3, column4) = (crdb_region,a,b)
             │ equality cols are key
-            │ pred: (column1 != pk) OR (column12 != crdb_region)
+            │ pred: (column1 != pk) OR (column15 != crdb_region)
             │
             └── • cross join
                 │
@@ -295,7 +392,7 @@ vectorized: true
 • root
 │
 ├── • upsert
-│   │ into: regional_by_row_table(pk, pk2, a, b, crdb_region)
+│   │ into: regional_by_row_table(pk, pk2, a, b, j, crdb_region)
 │   │ arbiter constraints: primary
 │   │
 │   └── • buffer
@@ -303,15 +400,16 @@ vectorized: true
 │       │
 │       └── • render
 │           │
-│           └── • cross join (right outer)
+│           └── • cross join (left outer)
 │               │
-│               ├── • scan
-│               │     missing stats
-│               │     table: regional_by_row_table@primary
-│               │     spans: [/'ap-southeast-2'/2 - /'ap-southeast-2'/2] [/'ca-central-1'/2 - /'ca-central-1'/2] [/'us-east-1'/2 - /'us-east-1'/2]
+│               ├── • values
+│               │     size: 6 columns, 1 row
 │               │
-│               └── • values
-│                     size: 5 columns, 1 row
+│               └── • scan
+│                     missing stats
+│                     table: regional_by_row_table@primary
+│                     spans: [/'ap-southeast-2'/2 - /'ap-southeast-2'/2] [/'ca-central-1'/2 - /'ca-central-1'/2] [/'us-east-1'/2 - /'us-east-1'/2]
+│                     locking strength: for update
 │
 ├── • constraint-check
 │   │
@@ -319,17 +417,17 @@ vectorized: true
 │       │
 │       └── • lookup join (semi)
 │           │ table: regional_by_row_table@primary
-│           │ equality: (lookup_join_const_col_@28, upsert_pk) = (crdb_region,pk)
+│           │ equality: (lookup_join_const_col_@33, upsert_pk) = (crdb_region,pk)
 │           │ equality cols are key
 │           │ pred: column1 != crdb_region
 │           │
 │           └── • cross join
 │               │
-│               ├── • scan buffer
-│               │     label: buffer 1
+│               ├── • values
+│               │     size: 1 column, 3 rows
 │               │
-│               └── • values
-│                     size: 1 column, 3 rows
+│               └── • scan buffer
+│                     label: buffer 1
 │
 ├── • constraint-check
 │   │
@@ -337,17 +435,17 @@ vectorized: true
 │       │
 │       └── • lookup join (semi)
 │           │ table: regional_by_row_table@regional_by_row_table_b_key
-│           │ equality: (lookup_join_const_col_@38, column5) = (crdb_region,b)
+│           │ equality: (lookup_join_const_col_@48, column5) = (crdb_region,b)
 │           │ equality cols are key
 │           │ pred: (upsert_pk != pk) OR (column1 != crdb_region)
 │           │
 │           └── • cross join
 │               │
-│               ├── • scan buffer
-│               │     label: buffer 1
+│               ├── • values
+│               │     size: 1 column, 3 rows
 │               │
-│               └── • values
-│                     size: 1 column, 3 rows
+│               └── • scan buffer
+│                     label: buffer 1
 │
 └── • constraint-check
     │
@@ -355,21 +453,113 @@ vectorized: true
         │
         └── • lookup join (semi)
             │ table: regional_by_row_table@new_idx
-            │ equality: (lookup_join_const_col_@49, column4, column5) = (crdb_region,a,b)
+            │ equality: (lookup_join_const_col_@63, column4, column5) = (crdb_region,a,b)
             │ equality cols are key
             │ pred: (upsert_pk != pk) OR (column1 != crdb_region)
             │
             └── • cross join
                 │
-                ├── • scan buffer
-                │     label: buffer 1
+                ├── • values
+                │     size: 1 column, 3 rows
                 │
-                └── • values
-                      size: 1 column, 3 rows
+                └── • scan buffer
+                      label: buffer 1
+
+query T
+EXPLAIN UPSERT INTO regional_by_row_table (crdb_region, pk, pk2, a, b)
+VALUES ('us-east-1', 23, 24, 25, 26), ('ca-central-1', 30, 30, 31, 32)
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • upsert
+│   │ into: regional_by_row_table(pk, pk2, a, b, j, crdb_region)
+│   │ arbiter constraints: primary
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • render
+│           │
+│           └── • lookup join (left outer)
+│               │ table: regional_by_row_table@primary
+│               │ equality cols are key
+│               │ lookup condition: (column2 = pk) AND (crdb_region IN ('ap-southeast-2', 'ca-central-1', 'us-east-1'))
+│               │ locking strength: for update
+│               │
+│               └── • render
+│                   │
+│                   └── • values
+│                         size: 5 columns, 2 rows
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • lookup join (semi)
+│           │ table: regional_by_row_table@primary
+│           │ equality: (lookup_join_const_col_@33, upsert_pk) = (crdb_region,pk)
+│           │ equality cols are key
+│           │ pred: column1 != crdb_region
+│           │
+│           └── • cross join
+│               │
+│               ├── • values
+│               │     size: 1 column, 3 rows
+│               │
+│               └── • scan buffer
+│                     label: buffer 1
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • lookup join (semi)
+│           │ table: regional_by_row_table@regional_by_row_table_b_key
+│           │ equality: (lookup_join_const_col_@48, column5) = (crdb_region,b)
+│           │ equality cols are key
+│           │ pred: (upsert_pk != pk) OR (column1 != crdb_region)
+│           │
+│           └── • cross join
+│               │
+│               ├── • values
+│               │     size: 1 column, 3 rows
+│               │
+│               └── • scan buffer
+│                     label: buffer 1
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • lookup join (semi)
+            │ table: regional_by_row_table@new_idx
+            │ equality: (lookup_join_const_col_@63, column4, column5) = (crdb_region,a,b)
+            │ equality cols are key
+            │ pred: (upsert_pk != pk) OR (column1 != crdb_region)
+            │
+            └── • cross join
+                │
+                ├── • values
+                │     size: 1 column, 3 rows
+                │
+                └── • scan buffer
+                      label: buffer 1
+
+query TIIIIIIIIT colnames
+SELECT * FROM (VALUES ('us-east-1', 23, 24, 25, 26), ('ca-central-1', 30, 30, 31, 32)) AS v(crdb_region, pk, pk2, a, b)
+LEFT JOIN regional_by_row_table t ON v.pk = t.pk;
+----
+crdb_region   pk  pk2  a   b   pk    pk2   a     b     j
+us-east-1     23  24   25  26  23    23    24    25    NULL
+ca-central-1  30  30   31  32  NULL  NULL  NULL  NULL  NULL
 
 # One row already exists, one row is new.
 statement ok
-UPSERT INTO regional_by_row_table (crdb_region, pk, pk2, a, b) VALUES ('us-east-1', 23, 24, 25, 26), ('ca-central-1', 30, 30, 31, 32)
+UPSERT INTO regional_by_row_table (crdb_region, pk, pk2, a, b)
+VALUES ('us-east-1', 23, 24, 25, 26), ('ca-central-1', 30, 30, 31, 32)
 
 query TIIII colnames
 SELECT crdb_region, pk, pk2, a, b FROM regional_by_row_table
@@ -392,13 +582,15 @@ CREATE TABLE public.regional_by_row_table (
   pk2 INT8 NOT NULL,
   a INT8 NOT NULL,
   b INT8 NOT NULL,
-  crdb_region public.crdb_internal_region NOT NULL DEFAULT gateway_region()::public.crdb_internal_region,
+  j JSONB NULL,
+  crdb_region public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::public.crdb_internal_region,
   CONSTRAINT "primary" PRIMARY KEY (pk ASC),
   INDEX regional_by_row_table_a_idx (a ASC),
   UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+  INVERTED INDEX regional_by_row_table_j_idx (j),
   INDEX new_idx (a ASC, b ASC),
   UNIQUE INDEX unique_b_a (b ASC, a ASC),
-  FAMILY fam_0_pk_pk2_a_b_crdb_region (pk, pk2, a, b, crdb_region)
+  FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
 ) LOCALITY REGIONAL BY ROW;
 ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@new_idx CONFIGURE ZONE USING
   num_voters = 5,
@@ -413,6 +605,10 @@ ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_b
   voter_constraints = '{+region=ap-southeast-2: 2}',
   lease_preferences = '[[+region=ap-southeast-2]]';
 ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_b_key CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_j_idx CONFIGURE ZONE USING
   num_voters = 5,
   voter_constraints = '{+region=ap-southeast-2: 2}',
   lease_preferences = '[[+region=ap-southeast-2]]';
@@ -436,6 +632,10 @@ ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_
   num_voters = 5,
   voter_constraints = '{+region=ca-central-1: 2}',
   lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_j_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
 ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table@unique_b_a CONFIGURE ZONE USING
   num_voters = 5,
   voter_constraints = '{+region=ca-central-1: 2}',
@@ -453,6 +653,10 @@ ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row
   voter_constraints = '{+region=us-east-1: 2}',
   lease_preferences = '[[+region=us-east-1]]';
 ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_b_key CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_j_idx CONFIGURE ZONE USING
   num_voters = 5,
   voter_constraints = '{+region=us-east-1: 2}',
   lease_preferences = '[[+region=us-east-1]]';
@@ -476,6 +680,8 @@ regional_by_row_table_a_idx  a            false
 regional_by_row_table_a_idx  crdb_region  true
 regional_by_row_table_b_key  b            false
 regional_by_row_table_b_key  crdb_region  true
+regional_by_row_table_j_idx  crdb_region  true
+regional_by_row_table_j_idx  j            false
 unique_b_a                   a            false
 unique_b_a                   b            false
 unique_b_a                   crdb_region  true
@@ -507,14 +713,16 @@ CREATE TABLE public.regional_by_row_table (
                             pk2 INT8 NOT NULL,
                             a INT8 NOT NULL,
                             b INT8 NOT NULL,
-                            crdb_region public.crdb_internal_region NOT NULL DEFAULT gateway_region()::public.crdb_internal_region,
+                            j JSONB NULL,
+                            crdb_region public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::public.crdb_internal_region,
                             CONSTRAINT "primary" PRIMARY KEY (pk2 ASC),
                             UNIQUE INDEX regional_by_row_table_pk_key (pk ASC),
                             INDEX regional_by_row_table_a_idx (a ASC),
                             UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+                            INVERTED INDEX regional_by_row_table_j_idx (j),
                             INDEX new_idx (a ASC, b ASC),
                             UNIQUE INDEX unique_b_a (b ASC, a ASC),
-                            FAMILY fam_0_pk_pk2_a_b_crdb_region (pk, pk2, a, b, crdb_region)
+                            FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region)
 ) LOCALITY REGIONAL BY ROW
 
 query TT
@@ -543,8 +751,132 @@ PARTITION "ap-southeast-2" OF INDEX regional_by_row_table@unique_b_a  ALTER PART
                                                                       voter_constraints = '{+region=ap-southeast-2: 2}',
                                                                       lease_preferences = '[[+region=ap-southeast-2]]'
 
+# Tests renaming a referenced implicit column in REGIONAL BY ROW succeeds.
+statement ok
+ALTER TABLE regional_by_row_table RENAME COLUMN crdb_region TO crdb_region2
+
+query T
+SELECT create_statement FROM [SHOW CREATE TABLE regional_by_row_table]
+----
+CREATE TABLE public.regional_by_row_table (
+  pk INT8 NOT NULL,
+  pk2 INT8 NOT NULL,
+  a INT8 NOT NULL,
+  b INT8 NOT NULL,
+  j JSONB NULL,
+  crdb_region2 public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::public.crdb_internal_region,
+  CONSTRAINT "primary" PRIMARY KEY (pk2 ASC),
+  UNIQUE INDEX regional_by_row_table_pk_key (pk ASC),
+  INDEX regional_by_row_table_a_idx (a ASC),
+  UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+  INVERTED INDEX regional_by_row_table_j_idx (j),
+  INDEX new_idx (a ASC, b ASC),
+  UNIQUE INDEX unique_b_a (b ASC, a ASC),
+  FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region2)
+) LOCALITY REGIONAL BY ROW AS crdb_region2;
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@new_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_a_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_b_key CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_j_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table@unique_b_a CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table@new_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_a_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_b_key CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_j_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table@unique_b_a CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@new_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_a_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_b_key CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_j_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@unique_b_a CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]'
+
+statement ok
+CREATE TABLE regional_by_row_table_pk_defined_separately (
+  pk int,
+  CONSTRAINT "primary" PRIMARY KEY (pk ASC)
+) LOCALITY REGIONAL BY ROW
+
+query T
+SELECT create_statement FROM [SHOW CREATE TABLE regional_by_row_table_pk_defined_separately]
+----
+CREATE TABLE public.regional_by_row_table_pk_defined_separately (
+  pk INT8 NOT NULL,
+  crdb_region public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::public.crdb_internal_region,
+  CONSTRAINT "primary" PRIMARY KEY (pk ASC),
+  FAMILY "primary" (pk, crdb_region)
+) LOCALITY REGIONAL BY ROW;
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table_pk_defined_separately@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table_pk_defined_separately@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table_pk_defined_separately@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]'
+
 # Tests for REGIONAL BY TABLE AS
-statement error  cannot use column crdb_region_col which has type INT8 in REGIONAL BY ROW AS\nDETAIL:\s+REGIONAL BY ROW AS must reference a column of type crdb_internal_region.
+statement error cannot use column crdb_region_col which has type INT8 in REGIONAL BY ROW\nDETAIL: REGIONAL BY ROW AS must reference a column of type crdb_internal_region
 CREATE TABLE regional_by_row_table_as (
   pk int PRIMARY KEY,
   crdb_region_col int
@@ -578,7 +910,7 @@ CREATE TABLE public.regional_by_row_table_as (
   pk INT8 NOT NULL,
   a INT8 NULL,
   b INT8 NULL,
-  crdb_region_col public.crdb_internal_region NULL AS (CASE WHEN pk <= 10:::INT8 THEN 'us-east-1':::public.crdb_internal_region ELSE 'ap-southeast-2':::public.crdb_internal_region END) STORED,
+  crdb_region_col public.crdb_internal_region NOT NULL AS (CASE WHEN pk <= 10:::INT8 THEN 'us-east-1':::public.crdb_internal_region ELSE 'ap-southeast-2':::public.crdb_internal_region END) STORED,
   CONSTRAINT "primary" PRIMARY KEY (pk ASC),
   INDEX regional_by_row_table_as_a_idx (a ASC),
   UNIQUE INDEX regional_by_row_table_as_b_key (b ASC),
@@ -628,6 +960,72 @@ RETURNING crdb_region_col, pk
 us-east-1       1
 us-east-1       10
 ap-southeast-2  20
+
+query IIIT colnames
+SELECT * FROM regional_by_row_table_as ORDER BY pk
+----
+pk  a     b     crdb_region_col
+1   NULL  NULL  us-east-1
+10  NULL  NULL  us-east-1
+20  NULL  NULL  ap-southeast-2
+
+# Tests dropping a referenced column in REGIONAL BY ROW does not succeed.
+statement error cannot drop column crdb_region_col as it is used to store the region in a REGIONAL BY ROW table\nHINT: You must change the table locality before dropping this table
+ALTER TABLE regional_by_row_table_as DROP COLUMN crdb_region_col
+
+# Tests renaming a referenced explicit column in REGIONAL BY ROW succeeds.
+statement ok
+ALTER TABLE regional_by_row_table_as RENAME COLUMN crdb_region_col TO cr
+
+query T
+SELECT create_statement FROM [SHOW CREATE TABLE regional_by_row_table_as]
+----
+CREATE TABLE public.regional_by_row_table_as (
+  pk INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  cr public.crdb_internal_region NOT NULL AS (CASE WHEN pk <= 10:::INT8 THEN 'us-east-1':::public.crdb_internal_region ELSE 'ap-southeast-2':::public.crdb_internal_region END) STORED,
+  CONSTRAINT "primary" PRIMARY KEY (pk ASC),
+  INDEX regional_by_row_table_as_a_idx (a ASC),
+  UNIQUE INDEX regional_by_row_table_as_b_key (b ASC),
+  FAMILY fam_0_pk_a_b_crdb_region_col (pk, a, b, cr)
+) LOCALITY REGIONAL BY ROW AS cr;
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table_as@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table_as@regional_by_row_table_as_a_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ap-southeast-2" OF INDEX multi_region_test_db.public.regional_by_row_table_as@regional_by_row_table_as_b_key CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ap-southeast-2: 2}',
+  lease_preferences = '[[+region=ap-southeast-2]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table_as@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table_as@regional_by_row_table_as_a_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "ca-central-1" OF INDEX multi_region_test_db.public.regional_by_row_table_as@regional_by_row_table_as_b_key CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=ca-central-1: 2}',
+  lease_preferences = '[[+region=ca-central-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table_as@primary CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table_as@regional_by_row_table_as_a_idx CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]';
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table_as@regional_by_row_table_as_b_key CONFIGURE ZONE USING
+  num_voters = 5,
+  voter_constraints = '{+region=us-east-1: 2}',
+  lease_preferences = '[[+region=us-east-1]]'
 
 # Tests for altering the survivability of a REGIONAL BY ROW table.
 statement ok
@@ -711,3 +1109,34 @@ PARTITION "us-east-1" OF TABLE t_regional_by_row  ALTER PARTITION "us-east-1" OF
                                                   constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1, +region=us-east-1: 1}',
                                                   voter_constraints = '[+region=us-east-1]',
                                                   lease_preferences = '[[+region=us-east-1]]'
+
+
+statement ok
+CREATE DATABASE two_region_test_db PRIMARY REGION "ca-central-1" REGIONS "ap-southeast-2";
+USE two_region_test_db
+
+statement ok
+CREATE TABLE t (pk INT PRIMARY KEY) LOCALITY REGIONAL BY ROW
+
+query T
+INSERT INTO t VALUES (1) RETURNING (crdb_region)
+----
+ap-southeast-2
+
+query T nodeidx=3
+USE two_region_test_db; INSERT INTO t VALUES (3) RETURNING (crdb_region)
+----
+ca-central-1
+
+query T nodeidx=6
+USE two_region_test_db; INSERT INTO t VALUES (6) RETURNING (crdb_region)
+----
+ca-central-1
+
+query TI colnames
+SELECT crdb_region, pk FROM t ORDER BY pk
+----
+crdb_region     pk
+ap-southeast-2  1
+ca-central-1    3
+ca-central-1    6

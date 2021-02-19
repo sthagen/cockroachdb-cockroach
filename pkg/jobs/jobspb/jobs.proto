@@ -20,6 +20,7 @@ import "sql/catalog/descpb/structured.proto";
 import "sql/catalog/descpb/tenant.proto";
 import "util/hlc/timestamp.proto";
 import "sql/schemachanger/scpb/scpb.proto";
+import "clusterversion/cluster_version.proto";
 
 message Lease {
   option (gogoproto.equal) = true;
@@ -93,7 +94,11 @@ message StreamIngestionDetails {
 }
 
 message StreamIngestionProgress {
-
+  // CutoverTime is set to signal to the stream ingestion job to complete its
+  // ingestion. This involves stopping any subsequent ingestion, and rolling
+  // back any additional ingested data, to bring the ingested cluster to a
+  // consistent state as of the CutoverTime.
+  util.hlc.Timestamp cutover_time = 1 [(gogoproto.nullable) = false];
 }
 
 message BackupDetails {
@@ -322,6 +327,7 @@ message NewSchemaChangeProgress {
   repeated cockroach.sql.schemachanger.scpb.State states = 1;
 }
 
+
 message ResumeSpanList {
   repeated roachpb.Span resume_spans = 1 [(gogoproto.nullable) = false];
 }
@@ -520,6 +526,10 @@ message ResolvedSpan {
   bool boundary_reached = 3;
 }
 
+message ResolvedSpans {
+  repeated ResolvedSpan resolved_spans = 1 [(gogoproto.nullable) = false];
+}
+
 message ChangefeedProgress {
   reserved 1;
   repeated ResolvedSpan resolved_spans = 2 [(gogoproto.nullable) = false];
@@ -577,6 +587,14 @@ message CreateStatsProgress {
 
 }
 
+message MigrationDetails {
+  clusterversion.ClusterVersion cluster_version = 1;
+}
+
+message MigrationProgress {
+
+}
+
 message Payload {
   string description = 1;
   // If empty, the description is assumed to be the statement.
@@ -619,6 +637,7 @@ message Payload {
     TypeSchemaChangeDetails typeSchemaChange = 22;
     StreamIngestionDetails streamIngestion = 23;
     NewSchemaChangeDetails newSchemaChange = 24;
+    MigrationDetails migration = 25;
   }
 }
 
@@ -641,6 +660,7 @@ message Progress {
     TypeSchemaChangeProgress typeSchemaChange = 17;
     StreamIngestionProgress streamIngest = 18;
     NewSchemaChangeProgress newSchemaChange = 19;
+    MigrationProgress migration = 20;
   }
 }
 
@@ -662,6 +682,7 @@ enum Type {
   TYPEDESC_SCHEMA_CHANGE = 9 [(gogoproto.enumvalue_customname) = "TypeTypeSchemaChange"];
   STREAM_INGESTION = 10 [(gogoproto.enumvalue_customname) = "TypeStreamIngestion"];
   NEW_SCHEMA_CHANGE = 11 [(gogoproto.enumvalue_customname) = "TypeNewSchemaChange"];
+  MIGRATION = 12 [(gogoproto.enumvalue_customname) = "TypeMigration"];
 }
 
 message Job {

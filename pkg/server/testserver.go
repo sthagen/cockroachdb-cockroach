@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -33,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -130,6 +132,12 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	st := params.Settings
 	if params.Settings == nil {
 		st = cluster.MakeClusterSettings()
+		// TODO(sumeer): re-introduce this randomization.
+		// enabledSeparated := rand.Intn(2) == 0
+		// log.Infof(context.Background(),
+		//	"test Config is randomly setting enabledSeparated: %t",
+		//	enabledSeparated)
+		// storage.SeparatedIntentsEnabled.Override(&st.SV, enabledSeparated)
 	}
 	st.ExternalIODir = params.ExternalIODir
 	cfg := makeTestConfig(st)
@@ -544,6 +552,11 @@ func makeSQLServerArgs(
 		ds,
 	)
 	db := kv.NewDB(baseCfg.AmbientCtx, tcsFactory, clock, stopper)
+	rangeFeedKnobs, _ := baseCfg.TestingKnobs.RangeFeed.(*rangefeed.TestingKnobs)
+	rangeFeedFactory, err := rangefeed.NewFactory(stopper, db, rangeFeedKnobs)
+	if err != nil {
+		return sqlServerArgs{}, err
+	}
 
 	circularInternalExecutor := &sql.InternalExecutor{}
 	// Protected timestamps won't be available (at first) in multi-tenant
@@ -619,6 +632,7 @@ func makeSQLServerArgs(
 		circularInternalExecutor: circularInternalExecutor,
 		circularJobRegistry:      &jobs.Registry{},
 		protectedtsProvider:      protectedTSProvider,
+		rangeFeedFactory:         rangeFeedFactory,
 		sqlStatusServer: newTenantStatusServer(
 			baseCfg.AmbientCtx, &adminPrivilegeChecker{ie: circularInternalExecutor}, sessionRegistry, baseCfg.Settings,
 		),
@@ -656,6 +670,42 @@ func (t *TestTenant) DiagnosticsReporter() interface{} {
 	return t.diagnosticsReporter
 }
 
+// SetupIdleMonitor will monitor the active connections and if there are none,
+// will activate a `defaultCountdownDuration` countdown timer and terminate
+// the application. The monitoring will start after a warmup period
+// specified by warmupDuration. If the warmupDuration is zero, the idle
+// detection will be turned off.
+func SetupIdleMonitor(
+	ctx context.Context,
+	stopper *stop.Stopper,
+	warmupDuration time.Duration,
+	server netutil.Server,
+	countdownDuration ...time.Duration,
+) *IdleMonitor {
+	if warmupDuration != 0 {
+		log.VEventf(ctx, 2, "idle exit will activate after warmup duration of %s", warmupDuration)
+		oldConnStateHandler := server.ConnState
+		idleMonitor := MakeIdleMonitor(ctx, warmupDuration,
+			func() {
+				log.VEventf(ctx, 2, "idle exiting")
+				stopper.Stop(ctx)
+			},
+			countdownDuration...,
+		)
+		server.ConnState = func(conn net.Conn, state http.ConnState) {
+			if state == http.StateNew {
+				defer oldConnStateHandler(conn, state)
+				idleMonitor.NewConnection(ctx)
+			} else if state == http.StateClosed {
+				defer idleMonitor.CloseConnection(ctx)
+				oldConnStateHandler(conn, state)
+			}
+		}
+		return idleMonitor
+	}
+	return nil
+}
+
 // StartTenant starts a SQL tenant communicating with this TestServer.
 func (ts *TestServer) StartTenant(
 	params base.TestTenantArgs,
@@ -675,6 +725,7 @@ func (ts *TestServer) StartTenant(
 	sqlCfg.TenantKVAddrs = []string{ts.ServingRPCAddr()}
 	baseCfg := makeTestBaseConfig(st)
 	baseCfg.TestingKnobs = params.TestingKnobs
+	baseCfg.IdleExitAfter = params.IdleExitAfter
 	if params.AllowSettingClusterSettings {
 		baseCfg.TestingKnobs.TenantTestingKnobs = &sql.TenantTestingKnobs{
 			ClusterSettingsUpdater: st.MakeUpdater(),
@@ -722,6 +773,12 @@ func StartTenant(
 		nil, // tlsConfig
 		nil, // handler
 	)
+	knobs := baseCfg.TestingKnobs.TenantTestingKnobs
+	if tenantKnobs, ok := knobs.(*sql.TenantTestingKnobs); ok && tenantKnobs.IdleExitCountdownDuration != 0 {
+		SetupIdleMonitor(ctx, args.stopper, baseCfg.IdleExitAfter, connManager, tenantKnobs.IdleExitCountdownDuration)
+	} else {
+		SetupIdleMonitor(ctx, args.stopper, baseCfg.IdleExitAfter, connManager)
+	}
 
 	pgL, err := listen(ctx, &args.Config.SQLAddr, &args.Config.SQLAdvertiseAddr, "sql")
 	if err != nil {
@@ -1354,7 +1411,7 @@ func (ts *TestServer) ExecutorConfig() interface{} {
 	return *ts.sqlServer.execCfg
 }
 
-// Tracer is part of the TestServerInterface
+// Tracer is part of the TestServerInterface.
 func (ts *TestServer) Tracer() interface{} {
 	return ts.node.storeCfg.AmbientCtx.Tracer
 }

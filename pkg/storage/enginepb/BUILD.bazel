@@ -27,6 +27,7 @@ go_proto_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/util/hlc",
+        "//pkg/util/uuid",  # keep
         "@com_github_gogo_protobuf//gogoproto",
     ],
 )
@@ -51,6 +52,7 @@ go_library(
 
 go_test(
     name = "enginepb_test",
+    size = "small",
     srcs = [
         "decode_test.go",
         "mvcc_test.go",

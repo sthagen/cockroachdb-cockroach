@@ -58,7 +58,7 @@ inner-join (merge)
  ├── left ordering: +1
  ├── right ordering: +6
  ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(6)=99, null(6)=0]
- ├── cost: 2347.27569
+ ├── cost: 2357.27569
  ├── fd: (1)==(6), (6)==(1)
  ├── scan a
  │    ├── columns: k:1!null
@@ -69,7 +69,7 @@ inner-join (merge)
  ├── sort
  │    ├── columns: x:6
  │    ├── stats: [rows=1000, distinct(6)=100, null(6)=10]
- │    ├── cost: 1263.34569
+ │    ├── cost: 1273.34569
  │    ├── ordering: +6
  │    └── scan b
  │         ├── columns: x:6
@@ -793,16 +793,16 @@ insert c
  └── f-k-checks
       └── f-k-checks-item: c(p) -> p(p)
            └── anti-join (lookup p)
-                ├── columns: column2:6!null
+                ├── columns: p:6!null
                 ├── key columns: [6] = [7]
                 ├── lookup columns are key
                 ├── cardinality: [0 - 2]
                 ├── stats: [rows=1e-10]
                 ├── cost: 12.08
                 ├── with-scan &1
-                │    ├── columns: column2:6!null
+                │    ├── columns: p:6!null
                 │    ├── mapping:
-                │    │    └──  column2:5 => column2:6
+                │    │    └──  column2:5 => p:6
                 │    ├── cardinality: [2 - 2]
                 │    ├── stats: [rows=2, distinct(6)=2, null(6)=0]
                 │    └── cost: 0.01
@@ -832,7 +832,7 @@ insert c
  └── f-k-checks
       └── f-k-checks-item: c(p) -> p(p)
            └── anti-join (lookup p)
-                ├── columns: column2:6!null
+                ├── columns: p:6!null
                 ├── flags: prefer lookup join (into right side)
                 ├── key columns: [6] = [7]
                 ├── lookup columns are key
@@ -840,9 +840,9 @@ insert c
                 ├── stats: [rows=1e-10]
                 ├── cost: 0.02001206
                 ├── with-scan &1
-                │    ├── columns: column2:6!null
+                │    ├── columns: p:6!null
                 │    ├── mapping:
-                │    │    └──  column2:5 => column2:6
+                │    │    └──  column2:5 => p:6
                 │    ├── cardinality: [2 - 2]
                 │    ├── stats: [rows=2, distinct(6)=2, null(6)=0]
                 │    └── cost: 0.01
@@ -885,7 +885,7 @@ insert c
  └── f-k-checks
       └── f-k-checks-item: c(p) -> p(p)
            └── anti-join (lookup p)
-                ├── columns: column2:6!null
+                ├── columns: p:6!null
                 ├── key columns: [6] = [7]
                 ├── lookup columns are key
                 ├── cardinality: [0 - 1]
@@ -894,9 +894,9 @@ insert c
                 ├── key: ()
                 ├── fd: ()-->(6)
                 ├── with-scan &1
-                │    ├── columns: column2:6!null
+                │    ├── columns: p:6!null
                 │    ├── mapping:
-                │    │    └──  column2:5 => column2:6
+                │    │    └──  column2:5 => p:6
                 │    ├── cardinality: [1 - 1]
                 │    ├── stats: [rows=1, distinct(6)=1, null(6)=0]
                 │    ├── cost: 0.01
@@ -922,13 +922,13 @@ WHERE
 project
  ├── columns: attname:3!null atttypid:4!null typbasetype:50 typtype:32
  ├── stats: [rows=198]
- ├── cost: 2844.37877
+ ├── cost: 2844.77877
  └── inner-join (merge)
       ├── columns: attname:3!null atttypid:4!null oid:26!null typtype:32 typbasetype:50
       ├── left ordering: +26
       ├── right ordering: +4
       ├── stats: [rows=198, distinct(4)=17.2927193, null(4)=0, distinct(26)=17.2927193, null(26)=0]
-      ├── cost: 2842.38877
+      ├── cost: 2842.78877
       ├── fd: (4)==(26), (26)==(4)
       ├── scan pg_type@secondary [as=t]
       │    ├── columns: oid:26!null typtype:32 typbasetype:50
@@ -938,7 +938,7 @@ project
       ├── sort
       │    ├── columns: attname:3!null atttypid:4
       │    ├── stats: [rows=20, distinct(3)=2, null(3)=0, distinct(4)=18.2927193, null(4)=0.2]
-      │    ├── cost: 1376.17877
+      │    ├── cost: 1376.57877
       │    ├── ordering: +4
       │    └── select
       │         ├── columns: attname:3!null atttypid:4

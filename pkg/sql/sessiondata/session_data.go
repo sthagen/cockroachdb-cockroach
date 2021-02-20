@@ -178,6 +178,11 @@ type LocalOnlySessionData struct {
 	// OptimizerUseMultiColStats indicates whether we should use multi-column
 	// statistics for cardinality estimation in the optimizer.
 	OptimizerUseMultiColStats bool
+	// LocalityOptimizedSearch indicates that the optimizer will try to plan scans
+	// and lookup joins in which local nodes (i.e., nodes in the gateway region)
+	// are searched for matching rows before remote nodes, in the hope that the
+	// execution engine can avoid visiting remote nodes.
+	LocalityOptimizedSearch bool
 	// SafeUpdates causes errors when the client
 	// sends syntax that may have unwanted side effects.
 	SafeUpdates bool
@@ -222,11 +227,6 @@ type LocalOnlySessionData struct {
 	SynchronousCommit bool
 	// EnableSeqScan is a dummy setting for the enable_seqscan var.
 	EnableSeqScan bool
-
-	// VirtualColumnsEnabled indicates whether we allow virtual (non-stored)
-	// computed columns.
-	// TODO(radu): remove this once the feature is stable.
-	VirtualColumnsEnabled bool
 
 	// EnableUniqueWithoutIndexConstraints indicates whether creating unique
 	// constraints without an index is allowed.

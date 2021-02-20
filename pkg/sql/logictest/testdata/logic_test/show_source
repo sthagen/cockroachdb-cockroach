@@ -52,7 +52,6 @@ experimental_enable_hash_sharded_indexes              off
 experimental_enable_implicit_column_partitioning      off
 experimental_enable_temp_tables                       off
 experimental_enable_unique_without_index_constraints  off
-experimental_enable_virtual_columns                   off
 experimental_use_new_schema_changer                   off
 extra_float_digits                                    0
 force_savepoint_restart                               off
@@ -62,6 +61,7 @@ idle_in_transaction_session_timeout                   0
 integer_datetimes                                     on
 intervalstyle                                         postgres
 locality                                              region=test,dc=dc1
+locality_optimized_partitioned_index_scan             off
 lock_timeout                                          0
 max_identifier_length                                 128
 max_index_keys                                        32

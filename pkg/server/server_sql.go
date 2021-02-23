@@ -850,11 +850,6 @@ func (s *SQLServer) preStart(
 			clusterversion.AlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable))) {
 		s.sqlLivenessProvider.Start(ctx)
 	}
-	// Start the async migration to upgrade namespace entries from the old
-	// namespace table (id 2) to the new one (id 30).
-	if err := sqlmigrationsMgr.StartSystemNamespaceMigration(ctx, bootstrapVersion); err != nil {
-		return err
-	}
 
 	// Delete all orphaned table leases created by a prior instance of this
 	// node. This also uses SQL.
@@ -873,7 +868,14 @@ func (s *SQLServer) preStart(
 			PlanHookMaker: func(opName string, txn *kv.Txn, user security.SQLUsername) (interface{}, func()) {
 				// This is a hack to get around a Go package dependency cycle. See comment
 				// in sql/jobs/registry.go on planHookMaker.
-				return sql.NewInternalPlanner(opName, txn, user, &sql.MemoryMetrics{}, s.execCfg, sessiondatapb.SessionData{})
+				return sql.NewInternalPlanner(
+					opName,
+					txn,
+					user,
+					&sql.MemoryMetrics{},
+					s.execCfg,
+					sessiondatapb.SessionData{},
+				)
 			},
 		},
 		scheduledjobs.ProdJobSchedulerEnv,

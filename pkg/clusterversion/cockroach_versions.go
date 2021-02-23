@@ -255,6 +255,14 @@ const (
 	// ClosedTimestampsRaftTransport enables the Raft transport for closed
 	// timestamps and disables the previous per-node transport.
 	ClosedTimestampsRaftTransport
+	// ChangefeedsSupportPrimaryIndexChanges is used to indicate that all
+	// nodes support detecting and restarting on primary index changes.
+	ChangefeedsSupportPrimaryIndexChanges
+	// NamespaceTableWithSchemasMigration is for the migration which copies
+	// entries from the old namespace table to the new one (with schema IDs).
+	// Previously this was implemented as an async task with no guarantees about
+	// completion.
+	NamespaceTableWithSchemasMigration
 
 	// Step (1): Add new versions here.
 )
@@ -432,6 +440,14 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 	{
 		Key:     ClosedTimestampsRaftTransport,
 		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 36},
+	},
+	{
+		Key:     ChangefeedsSupportPrimaryIndexChanges,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 38},
+	},
+	{
+		Key:     NamespaceTableWithSchemasMigration,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 40},
 	},
 	// Step (2): Add new versions here.
 })

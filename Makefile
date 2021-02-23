@@ -850,7 +850,6 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/hash_aggregator.eg.go \
   pkg/sql/colexec/hash_utils.eg.go \
   pkg/sql/colexec/is_null_ops.eg.go \
-  pkg/sql/colexec/like_ops.eg.go \
   pkg/sql/colexec/mergejoinbase.eg.go \
   pkg/sql/colexec/mergejoiner_exceptall.eg.go \
   pkg/sql/colexec/mergejoiner_fullouter.eg.go \
@@ -865,6 +864,7 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/ordered_synchronizer.eg.go \
   pkg/sql/colexec/proj_const_left_ops.eg.go \
   pkg/sql/colexec/proj_const_right_ops.eg.go \
+  pkg/sql/colexec/proj_like_ops.eg.go \
   pkg/sql/colexec/proj_non_const_ops.eg.go \
   pkg/sql/colexec/quicksort.eg.go \
   pkg/sql/colexec/rank.eg.go \
@@ -873,6 +873,7 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/rowstovec.eg.go \
   pkg/sql/colexec/selection_ops.eg.go \
   pkg/sql/colexec/select_in.eg.go \
+  pkg/sql/colexec/sel_like_ops.eg.go \
   pkg/sql/colexec/sort.eg.go \
   pkg/sql/colexec/substring.eg.go \
   pkg/sql/colexec/values_differ.eg.go \
@@ -970,6 +971,8 @@ $(go-targets): override LINKFLAGS += \
 # busting the cache on every rebuild.
 $(COCKROACH) $(COCKROACHOSS) go-install: override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.utcTime=$(shell date -u '+%Y/%m/%d %H:%M:%S')"
+
+settings-doc-gen = $(if $(filter buildshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),$(COCKROACH))
 
 docs/generated/settings/settings.html: $(settings-doc-gen)
 	@$(settings-doc-gen) gen settings-list --format=html > $@
@@ -1596,8 +1599,6 @@ pkg/util/log/channel/channel_generated.go: pkg/util/log/gen.go pkg/util/log/logp
 pkg/util/log/log_channels_generated.go: pkg/util/log/gen.go pkg/util/log/logpb/log.proto
 	$(GO) run $(GOMODVENDORFLAGS) $^ log_channels.go $@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
-
-settings-doc-gen := $(if $(filter buildshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),$(COCKROACH))
 
 .PHONY: execgen
 execgen: ## Regenerate generated code for the vectorized execution engine.

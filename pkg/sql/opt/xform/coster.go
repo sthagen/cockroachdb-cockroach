@@ -466,7 +466,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		cost = c.computeZigzagJoinCost(candidate.(*memo.ZigzagJoinExpr))
 
 	case opt.UnionOp, opt.IntersectOp, opt.ExceptOp,
-		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp:
+		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp, opt.LocalityOptimizedSearchOp:
 		cost = c.computeSetCost(candidate)
 
 	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.EnsureDistinctOnOp,
@@ -608,8 +608,29 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 	// estimate turns out to be smaller than the actual row count.
 	if scan.IsUnfiltered(c.mem.Metadata()) {
 		baseCost += cpuCostFactor
+
+		// For tables with multiple partitions, add the cost of visiting each
+		// partition.
+		// TODO(rytaft): In the future we should take latency into account here.
+		index := c.mem.Metadata().Table(scan.Table).Index(scan.Index)
+		if partitionCount := index.PartitionCount(); partitionCount > 1 {
+			// Subtract 1 since we already accounted for the first partition when
+			// counting spans.
+			baseCost += memo.Cost(partitionCount-1) * randIOCostFactor
+		}
 	}
-	return baseCost + memo.Cost(rowCount)*(seqIOCostFactor+perRowCost)
+
+	cost := baseCost + memo.Cost(rowCount)*(seqIOCostFactor+perRowCost)
+
+	// If this scan is locality optimized, divide the cost in two in order to make
+	// the total cost of the two scans in the locality optimized plan less then
+	// the cost of the single scan in the non-locality optimized plan.
+	// TODO(rytaft): This is hacky. We should really be making this determination
+	// based on the latency between regions.
+	if scan.LocalityOptimized {
+		cost /= 2
+	}
+	return cost
 }
 
 func (c *coster) computeSelectCost(sel *memo.SelectExpr) memo.Cost {

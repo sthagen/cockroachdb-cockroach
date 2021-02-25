@@ -88,6 +88,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalBackwardDependenciesTableID:      crdbInternalBackwardDependenciesTable,
 		catconstants.CrdbInternalBuildInfoTableID:                 crdbInternalBuildInfoTable,
 		catconstants.CrdbInternalBuiltinFunctionsTableID:          crdbInternalBuiltinFunctionsTable,
+		catconstants.CrdbInternalClusterContentionEventsTableID:   crdbInternalClusterContentionEventsTable,
 		catconstants.CrdbInternalClusterQueriesTableID:            crdbInternalClusterQueriesTable,
 		catconstants.CrdbInternalClusterTransactionsTableID:       crdbInternalClusterTxnsTable,
 		catconstants.CrdbInternalClusterSessionsTableID:           crdbInternalClusterSessionsTable,
@@ -107,6 +108,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalKVNodeStatusTableID:              crdbInternalKVNodeStatusTable,
 		catconstants.CrdbInternalKVStoreStatusTableID:             crdbInternalKVStoreStatusTable,
 		catconstants.CrdbInternalLeasesTableID:                    crdbInternalLeasesTable,
+		catconstants.CrdbInternalLocalContentionEventsTableID:     crdbInternalLocalContentionEventsTable,
 		catconstants.CrdbInternalLocalQueriesTableID:              crdbInternalLocalQueriesTable,
 		catconstants.CrdbInternalLocalTransactionsTableID:         crdbInternalLocalTxnsTable,
 		catconstants.CrdbInternalLocalSessionsTableID:             crdbInternalLocalSessionsTable,
@@ -409,8 +411,17 @@ CREATE TABLE crdb_internal.tables (
 	},
 }
 
+// statsAsOfTimeClusterMode controls the cluster setting for the duration which
+// is used to define the AS OF time for querying the system.table_statistics
+// table when building crdb_internal.table_row_statistics.
+var statsAsOfTimeClusterMode = settings.RegisterDurationSetting(
+	"sql.crdb_internal.table_row_statistics.as_of_time",
+	"historical query time used to build the crdb_internal.table_row_statistics table",
+	-10*time.Second,
+)
+
 var crdbInternalTablesTableLastStats = virtualSchemaTable{
-	comment: "the latest stats for all tables accessible by current user in current database (KV scan)",
+	comment: "stats for all tables accessible by current user in current database as of 10s ago",
 	schema: `
 CREATE TABLE crdb_internal.table_row_statistics (
   table_id                   INT         NOT NULL,
@@ -418,8 +429,10 @@ CREATE TABLE crdb_internal.table_row_statistics (
   estimated_row_count        INT
 )`,
 	populate: func(ctx context.Context, p *planner, db *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
-		// Collect the latests statistics for all tables.
-		query := `
+		// Collect the statistics for all tables AS OF 10 seconds ago to avoid
+		// contention on the stats table. We pass a nil transaction so that the AS
+		// OF clause can be independent of any outer query.
+		query := fmt.Sprintf(`
            SELECT s."tableID", max(s."rowCount")
              FROM system.table_statistics AS s
              JOIN (
@@ -427,12 +440,20 @@ CREATE TABLE crdb_internal.table_row_statistics (
                       FROM system.table_statistics
                      GROUP BY "tableID"
                   ) AS l ON l."tableID" = s."tableID" AND l.last_dt = s."createdAt"
-            GROUP BY s."tableID"`
+            AS OF SYSTEM TIME '%s'
+            GROUP BY s."tableID"`, statsAsOfTimeClusterMode.String(&p.ExecCfg().Settings.SV))
 		statRows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryEx(
-			ctx, "crdb-internal-statistics-table", p.txn,
+			ctx, "crdb-internal-statistics-table", nil,
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			query)
 		if err != nil {
+			// This query is likely to cause errors due to SHOW TABLES being run less
+			// than 10 seconds after cluster startup (10s is the default AS OF time
+			// for the query), causing the error "descriptor not found". We should
+			// tolerate this error and return nil.
+			if errors.Is(err, catalog.ErrDescriptorNotFound) {
+				return nil
+			}
 			return err
 		}
 
@@ -1684,6 +1705,88 @@ func populateSessionsTable(
 	return nil
 }
 
+const contentionEventsSchemaPattern = `
+CREATE TABLE crdb_internal.%s (
+  table_id                   INT NOT NULL,
+  index_id                   INT NOT NULL,
+  num_contention_events      INT NOT NULL,
+  cumulative_contention_time INTERVAL NOT NULL,
+  key                        BYTES NOT NULL,
+  txn_id                     UUID NOT NULL,
+  count                      INT NOT NULL
+)
+`
+const contentionEventsCommentPattern = `contention information %s
+
+All of the contention information internally stored in three levels:
+- on the highest, it is grouped by tableID/indexID pair
+- on the middle, it is grouped by key
+- on the lowest, it is grouped by txnID.
+Each of the levels is maintained as an LRU cache with limited size, so
+it is possible that not all of the contention information ever observed
+is contained in this table.
+`
+
+// crdbInternalLocalContentionEventsTable exposes the list of contention events
+// on the current node.
+var crdbInternalLocalContentionEventsTable = virtualSchemaTable{
+	schema:  fmt.Sprintf(contentionEventsSchemaPattern, "node_contention_events"),
+	comment: fmt.Sprintf(contentionEventsCommentPattern, "(RAM; local node only)"),
+	populate: func(ctx context.Context, p *planner, _ *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
+		response, err := p.extendedEvalCtx.SQLStatusServer.ListLocalContentionEvents(ctx, &serverpb.ListContentionEventsRequest{})
+		if err != nil {
+			return err
+		}
+		return populateContentionEventsTable(ctx, addRow, response)
+	},
+}
+
+// crdbInternalClusterContentionEventsTable exposes the list of contention
+// events on the entire cluster.
+var crdbInternalClusterContentionEventsTable = virtualSchemaTable{
+	schema:  fmt.Sprintf(contentionEventsSchemaPattern, "cluster_contention_events"),
+	comment: fmt.Sprintf(contentionEventsCommentPattern, "(cluster RPC; expensive!)"),
+	populate: func(ctx context.Context, p *planner, _ *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
+		response, err := p.extendedEvalCtx.SQLStatusServer.ListContentionEvents(ctx, &serverpb.ListContentionEventsRequest{})
+		if err != nil {
+			return err
+		}
+		return populateContentionEventsTable(ctx, addRow, response)
+	},
+}
+
+func populateContentionEventsTable(
+	ctx context.Context,
+	addRow func(...tree.Datum) error,
+	response *serverpb.ListContentionEventsResponse,
+) error {
+	for _, ice := range response.Events {
+		for _, skc := range ice.Events {
+			for _, stc := range skc.Txns {
+				cumulativeContentionTime := tree.NewDInterval(
+					duration.MakeDuration(ice.CumulativeContentionTime.Nanoseconds(), 0 /* days */, 0 /* months */),
+					types.DefaultIntervalTypeMetadata,
+				)
+				if err := addRow(
+					tree.NewDInt(tree.DInt(ice.TableID)),             // table_id
+					tree.NewDInt(tree.DInt(ice.IndexID)),             // index_id
+					tree.NewDInt(tree.DInt(ice.NumContentionEvents)), // num_contention_events
+					cumulativeContentionTime,                         // cumulative_contention_time
+					tree.NewDBytes(tree.DBytes(skc.Key)),             // key
+					tree.NewDUuid(tree.DUuid{UUID: stc.TxnID}),       // txn_id
+					tree.NewDInt(tree.DInt(stc.Count)),               // count
+				); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for _, rpcErr := range response.Errors {
+		log.Warningf(ctx, "%v", rpcErr.Message)
+	}
+	return nil
+}
+
 // crdbInternalLocalMetricsTable exposes a snapshot of the metrics on the
 // current node.
 var crdbInternalLocalMetricsTable = virtualSchemaTable{
@@ -2014,7 +2117,9 @@ func showCreateIndexWithInterleave(
 	semaCtx *tree.SemaContext,
 ) error {
 	f.WriteString("CREATE ")
-	idxStr, err := catformat.IndexForDisplay(ctx, table, &tableName, idx, semaCtx)
+	idxStr, err := catformat.IndexForDisplay(
+		ctx, table, &tableName, idx, "" /* partition */, "" /* interleave */, semaCtx,
+	)
 	if err != nil {
 		return err
 	}

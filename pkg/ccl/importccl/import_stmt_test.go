@@ -819,7 +819,7 @@ END;
 			name: "fk",
 			typ:  "PGDUMP",
 			data: testPgdumpFk,
-			with: "WITH ignore_unsupported",
+			with: "WITH ignore_unsupported_statements",
 			query: map[string][][]string{
 				getTablesQuery: {
 					{"public", "cities", "table"},
@@ -898,7 +898,7 @@ END;
 			name: "fk-skip",
 			typ:  "PGDUMP",
 			data: testPgdumpFk,
-			with: `WITH skip_foreign_keys, ignore_unsupported`,
+			with: `WITH skip_foreign_keys, ignore_unsupported_statements`,
 			query: map[string][][]string{
 				getTablesQuery: {
 					{"public", "cities", "table"},
@@ -913,14 +913,14 @@ END;
 			name: "fk unreferenced",
 			typ:  "TABLE weather FROM PGDUMP",
 			data: testPgdumpFk,
-			with: "WITH ignore_unsupported",
-			err:  `table "cities" not found`,
+			with: "WITH ignore_unsupported_statements",
+			err:  `table "public.cities" not found`,
 		},
 		{
 			name: "fk unreferenced skipped",
 			typ:  "TABLE weather FROM PGDUMP",
 			data: testPgdumpFk,
-			with: `WITH skip_foreign_keys, ignore_unsupported`,
+			with: `WITH skip_foreign_keys, ignore_unsupported_statements`,
 			query: map[string][][]string{
 				getTablesQuery: {{"public", "weather", "table"}},
 			},
@@ -939,7 +939,7 @@ END;
 		{
 			name: "sequence",
 			typ:  "PGDUMP",
-			with: "WITH ignore_unsupported",
+			with: "WITH ignore_unsupported_statements",
 			data: `
 					CREATE TABLE t (a INT8);
 					CREATE SEQUENCE public.i_seq
@@ -968,7 +968,7 @@ END;
 					INSERT INTO "bob" ("c", "b") VALUES (3, 2);
 					COMMIT
 			`,
-			with: `WITH ignore_unsupported`,
+			with: `WITH ignore_unsupported_statements`,
 			query: map[string][][]string{
 				`SELECT * FROM bob`: {
 					{"1", "NULL", "2"},
@@ -1022,8 +1022,12 @@ END;
 		{
 			name: "non-public schema",
 			typ:  "PGDUMP",
-			data: "create table s.t (i INT8)",
-			err:  `non-public schemas unsupported: s`,
+			data: `
+        create schema s;
+        create table s.t (i INT8)`,
+			query: map[string][][]string{
+				getTablesQuery: {{"s", "t", "table"}},
+			},
 		},
 		{
 			name: "many tables",
@@ -1581,7 +1585,7 @@ func TestImportRowLimit(t *testing.T) {
 		expectedRowLimit := 4
 
 		// Import a single table `second` and verify number of rows imported.
-		importQuery := fmt.Sprintf(`IMPORT TABLE second FROM PGDUMP ($1) WITH row_limit="%d",ignore_unsupported`,
+		importQuery := fmt.Sprintf(`IMPORT TABLE second FROM PGDUMP ($1) WITH row_limit="%d",ignore_unsupported_statements`,
 			expectedRowLimit)
 		sqlDB.Exec(t, importQuery, second...)
 
@@ -1593,7 +1597,7 @@ func TestImportRowLimit(t *testing.T) {
 
 		// Import multiple tables including `simple` and `second`.
 		expectedRowLimit = 3
-		importQuery = fmt.Sprintf(`IMPORT PGDUMP ($1) WITH row_limit="%d",ignore_unsupported`, expectedRowLimit)
+		importQuery = fmt.Sprintf(`IMPORT PGDUMP ($1) WITH row_limit="%d",ignore_unsupported_statements`, expectedRowLimit)
 		sqlDB.Exec(t, importQuery, multitable...)
 		sqlDB.QueryRow(t, "SELECT count(*) FROM second").Scan(&numRows)
 		require.Equal(t, expectedRowLimit, numRows)
@@ -1694,7 +1698,7 @@ func TestImportCSVStmt(t *testing.T) {
 		SQLMemoryPoolSize: 256 << 20,
 		ExternalIODir:     baseDir,
 		Knobs: base.TestingKnobs{
-			GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { <-blockGC; return nil }},
+			GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error { <-blockGC; return nil }},
 		},
 	}})
 	defer tc.Stopper().Stop(ctx)
@@ -4196,8 +4200,8 @@ func TestImportDefaultWithResume(t *testing.T) {
 			sqlDB.Exec(t, fmt.Sprintf(`CREATE TABLE t (%s)`, test.create))
 
 			jobCtx, cancelImport := context.WithCancel(ctx)
-			jobIDCh := make(chan int64)
-			var jobID int64 = -1
+			jobIDCh := make(chan jobspb.JobID)
+			var jobID jobspb.JobID = -1
 
 			registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
 				// Arrange for our special job resumer to be
@@ -4831,7 +4835,7 @@ func TestImportWorkerFailure(t *testing.T) {
 	case err := <-errCh:
 		t.Fatalf("%s: query returned before expected: %s", err, query)
 	}
-	var jobID int64
+	var jobID jobspb.JobID
 	sqlDB.QueryRow(t, `SELECT id FROM system.jobs ORDER BY created DESC LIMIT 1`).Scan(&jobID)
 
 	// Shut down a node. This should force LoadCSV to fail in its current
@@ -4930,7 +4934,7 @@ func TestImportLivenessWithRestart(t *testing.T) {
 		}
 	}
 	// Fetch the new job ID and lease since we know it's running now.
-	var jobID int64
+	var jobID jobspb.JobID
 	originalLease := &jobspb.Progress{}
 	{
 		var expectedLeaseBytes []byte
@@ -5062,7 +5066,7 @@ func TestImportLivenessWithLeniency(t *testing.T) {
 		}
 	}
 	// Fetch the new job ID and lease since we know it's running now.
-	var jobID int64
+	var jobID jobspb.JobID
 	originalLease := &jobspb.Payload{}
 	{
 		var expectedLeaseBytes []byte
@@ -5516,14 +5520,14 @@ func TestImportPgDump(t *testing.T) {
 				CONSTRAINT simple_pkey PRIMARY KEY (i),
 				UNIQUE INDEX simple_b_s_idx (b, s),
 				INDEX simple_s_idx (s)
-			) PGDUMP DATA ($1) WITH ignore_unsupported`,
+			) PGDUMP DATA ($1) WITH ignore_unsupported_statements`,
 			simple,
 		},
-		{`single table dump`, expectSimple, `IMPORT TABLE simple FROM PGDUMP ($1) WITH ignore_unsupported`, simple},
-		{`second table dump`, expectSecond, `IMPORT TABLE second FROM PGDUMP ($1) WITH ignore_unsupported`, second},
-		{`simple from multi`, expectSimple, `IMPORT TABLE simple FROM PGDUMP ($1) WITH ignore_unsupported`, multitable},
-		{`second from multi`, expectSecond, `IMPORT TABLE second FROM PGDUMP ($1) WITH ignore_unsupported`, multitable},
-		{`all from multi`, expectAll, `IMPORT PGDUMP ($1) WITH ignore_unsupported`, multitable},
+		{`single table dump`, expectSimple, `IMPORT TABLE simple FROM PGDUMP ($1) WITH ignore_unsupported_statements`, simple},
+		{`second table dump`, expectSecond, `IMPORT TABLE second FROM PGDUMP ($1) WITH ignore_unsupported_statements`, second},
+		{`simple from multi`, expectSimple, `IMPORT TABLE simple FROM PGDUMP ($1) WITH ignore_unsupported_statements`, multitable},
+		{`second from multi`, expectSecond, `IMPORT TABLE second FROM PGDUMP ($1) WITH ignore_unsupported_statements`, multitable},
+		{`all from multi`, expectAll, `IMPORT PGDUMP ($1) WITH ignore_unsupported_statements`, multitable},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			sqlDB.Exec(t, `DROP TABLE IF EXISTS simple, second`)
@@ -5721,7 +5725,7 @@ func TestImportPgDumpIgnoredStmts(t *testing.T) {
 	defer srv.Close()
 	t.Run("ignore-unsupported", func(t *testing.T) {
 		sqlDB.Exec(t, "CREATE DATABASE foo; USE foo;")
-		sqlDB.Exec(t, "IMPORT PGDUMP ($1) WITH ignore_unsupported", srv.URL)
+		sqlDB.Exec(t, "IMPORT PGDUMP ($1) WITH ignore_unsupported_statements", srv.URL)
 		// Check that statements which are not expected to be ignored, are still
 		// processed.
 		sqlDB.CheckQueryResults(t, "SELECT * FROM foo", [][]string{{"1"}, {"2"}, {"3"}})
@@ -5735,14 +5739,14 @@ func TestImportPgDumpIgnoredStmts(t *testing.T) {
 	t.Run("require-both-unsupported-options", func(t *testing.T) {
 		sqlDB.Exec(t, "CREATE DATABASE foo2; USE foo2;")
 		ignoredLog := `userfile:///ignore.log`
-		sqlDB.ExpectErr(t, "cannot log unsupported PGDUMP stmts without `ignore_unsupported` option",
-			"IMPORT PGDUMP ($1) WITH ignored_stmt_log=$2", srv.URL, ignoredLog)
+		sqlDB.ExpectErr(t, "cannot log unsupported PGDUMP stmts without `ignore_unsupported_statements` option",
+			"IMPORT PGDUMP ($1) WITH log_ignored_statements=$2", srv.URL, ignoredLog)
 	})
 
 	t.Run("log-unsupported-stmts", func(t *testing.T) {
 		sqlDB.Exec(t, "CREATE DATABASE foo3; USE foo3;")
 		ignoredLog := `userfile:///ignore.log`
-		sqlDB.Exec(t, "IMPORT PGDUMP ($1) WITH ignore_unsupported, ignored_stmt_log=$2",
+		sqlDB.Exec(t, "IMPORT PGDUMP ($1) WITH ignore_unsupported_statements, log_ignored_statements=$2",
 			srv.URL, ignoredLog)
 		// Check that statements which are not expected to be ignored, are still
 		// processed.
@@ -5814,7 +5818,7 @@ func TestImportPgDumpGeo(t *testing.T) {
 		sqlDB := sqlutils.MakeSQLRunner(conn)
 
 		sqlDB.Exec(t, `CREATE DATABASE importdb; SET DATABASE = importdb`)
-		sqlDB.Exec(t, "IMPORT PGDUMP 'nodelocal://0/geo_shp2pgsql.sql' WITH ignore_unsupported")
+		sqlDB.Exec(t, "IMPORT PGDUMP 'nodelocal://0/geo_shp2pgsql.sql' WITH ignore_unsupported_statements")
 
 		sqlDB.Exec(t, `CREATE DATABASE execdb; SET DATABASE = execdb`)
 		geoSQL, err := ioutil.ReadFile(filepath.Join(baseDir, "geo_shp2pgsql.sql"))
@@ -5857,7 +5861,7 @@ func TestImportPgDumpGeo(t *testing.T) {
 		sqlDB := sqlutils.MakeSQLRunner(conn)
 
 		sqlDB.Exec(t, `CREATE DATABASE importdb; SET DATABASE = importdb`)
-		sqlDB.Exec(t, "IMPORT PGDUMP 'nodelocal://0/geo_ogr2ogr.sql' WITH ignore_unsupported")
+		sqlDB.Exec(t, "IMPORT PGDUMP 'nodelocal://0/geo_ogr2ogr.sql' WITH ignore_unsupported_statements")
 
 		sqlDB.Exec(t, `CREATE DATABASE execdb; SET DATABASE = execdb`)
 		geoSQL, err := ioutil.ReadFile(filepath.Join(baseDir, "geo_ogr2ogr.sql"))
@@ -5959,6 +5963,209 @@ func TestImportPgDumpDropTable(t *testing.T) {
 	})
 }
 
+func TestImportPgDumpSchemas(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const nodes = 1
+	ctx := context.Background()
+	baseDir := filepath.Join("testdata", "pgdump")
+	args := base.TestServerArgs{ExternalIODir: baseDir}
+
+	// Simple schema test which creates 3 schemas with a single `test` table in
+	// each schema.
+	t.Run("schema.sql", func(t *testing.T) {
+		tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: args})
+		defer tc.Stopper().Stop(ctx)
+		conn := tc.Conns[0]
+		sqlDB := sqlutils.MakeSQLRunner(conn)
+
+		sqlDB.Exec(t, `CREATE DATABASE schemadb; SET DATABASE = schemadb`)
+		sqlDB.Exec(t, "IMPORT PGDUMP 'nodelocal://0/schema.sql' WITH ignore_unsupported_statements")
+
+		// Check that we have imported 4 schemas.
+		expectedSchemaNames := [][]string{{"bar"}, {"baz"}, {"foo"}, {"public"}}
+		sqlDB.CheckQueryResults(t,
+			`SELECT schema_name FROM [SHOW SCHEMAS] WHERE owner IS NOT NULL ORDER BY schema_name`,
+			expectedSchemaNames)
+
+		// Check that we have a test table in each schema with the expected content.
+		expectedContent := [][]string{{"1", "abc"}, {"2", "def"}}
+		expectedTableName := "test"
+		expectedTableName2 := "test2"
+		expectedSeqName := "testseq"
+		sqlDB.CheckQueryResults(t, `SELECT schema_name, 
+table_name FROM [SHOW TABLES] ORDER BY (schema_name, table_name)`,
+			[][]string{{"bar", expectedTableName}, {"bar", expectedTableName2}, {"bar", expectedSeqName},
+				{"baz", expectedTableName}, {"foo", expectedTableName}, {"public", expectedTableName}})
+
+		for _, schemaCollection := range expectedSchemaNames {
+			for _, schema := range schemaCollection {
+				sqlDB.CheckQueryResults(t, fmt.Sprintf(`SELECT * FROM %s.%s`, schema, expectedTableName),
+					expectedContent)
+			}
+		}
+
+		// There should be two jobs, the import and a job updating the parent
+		// database descriptor.
+		sqlDB.CheckQueryResults(t, `SELECT job_type, status FROM [SHOW JOBS] ORDER BY job_type`,
+			[][]string{{"IMPORT", "succeeded"}, {"SCHEMA CHANGE", "succeeded"}})
+
+		// Attempt to rename one of the imported schema's so as to verify that
+		// parent database descriptor has been updated with information about the
+		// imported schemas.
+		sqlDB.Exec(t, `ALTER SCHEMA foo RENAME TO biz`)
+
+		// Ensure that FK relationship works fine with UDS.
+		sqlDB.Exec(t, `INSERT INTO bar.test VALUES (100, 'a')`)
+		sqlDB.ExpectErr(t, "violates foreign key constraint \"testfk\"", `INSERT INTO bar.test2 VALUES (101, 'a')`)
+	})
+
+	t.Run("target-table-schema.sql", func(t *testing.T) {
+		tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: args})
+		defer tc.Stopper().Stop(ctx)
+		conn := tc.Conns[0]
+		sqlDB := sqlutils.MakeSQLRunner(conn)
+
+		sqlDB.Exec(t, `CREATE DATABASE schemadb; SET DATABASE = schemadb`)
+		sqlDB.ExpectErr(t, "does not exist: \"schemadb.bar.test\"",
+			"IMPORT TABLE schemadb.bar.test FROM PGDUMP ('nodelocal://0/schema."+
+				"sql') WITH ignore_unsupported_statements")
+
+		// Create the user defined schema so that we can get past the "not found"
+		// error.
+		// We still expect an error as we do not support importing a target table in
+		// a UDS.
+		sqlDB.Exec(t, `CREATE SCHEMA bar`)
+		sqlDB.ExpectErr(t, "cannot use IMPORT with a user defined schema",
+			"IMPORT TABLE schemadb.bar.test FROM PGDUMP ('nodelocal://0/schema."+
+				"sql') WITH ignore_unsupported_statements")
+
+		// We expect the import of a target table in the public schema to work.
+		for _, target := range []string{"schemadb.public.test", "schemadb.test", "test"} {
+			sqlDB.Exec(t, fmt.Sprintf("IMPORT TABLE %s FROM PGDUMP ('nodelocal://0/schema."+
+				"sql') WITH ignore_unsupported_statements", target))
+
+			// Check that we have a test table in each schema with the expected content.
+			expectedContent := [][]string{{"1", "abc"}, {"2", "def"}}
+			expectedTableName := "test"
+			sqlDB.CheckQueryResults(t, `SELECT schema_name, 
+table_name FROM [SHOW TABLES] ORDER BY (schema_name, table_name)`,
+				[][]string{{"public", expectedTableName}})
+
+			// Check that the target table in the public schema was imported correctly.
+			sqlDB.CheckQueryResults(t, fmt.Sprintf(`SELECT * FROM %s`, expectedTableName), expectedContent)
+
+			sqlDB.Exec(t, `DROP TABLE schemadb.public.test`)
+		}
+		sqlDB.CheckQueryResults(t,
+			`SELECT schema_name FROM [SHOW SCHEMAS] WHERE owner <> 'NULL' ORDER BY schema_name`,
+			[][]string{{"bar"}, {"public"}})
+	})
+
+	t.Run("inject-error-ensure-cleanup", func(t *testing.T) {
+		defer gcjob.SetSmallMaxGCIntervalForTest()()
+		tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: args})
+		defer tc.Stopper().Stop(ctx)
+		conn := tc.Conns[0]
+		sqlDB := sqlutils.MakeSQLRunner(conn)
+		kvDB := tc.Server(0).DB()
+
+		beforeImport, err := tree.MakeDTimestampTZ(tc.Server(0).Clock().Now().GoTime(), time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for i := range tc.Servers {
+			tc.Servers[i].JobRegistry().(*jobs.Registry).TestingResumerCreationKnobs =
+				map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
+					jobspb.TypeImport: func(raw jobs.Resumer) jobs.Resumer {
+						r := raw.(*importResumer)
+						r.testingKnobs.afterImport = func(_ backupccl.RowCount) error {
+							return errors.New("testing injected failure")
+						}
+						return r
+					},
+				}
+		}
+
+		sqlDB.Exec(t, `CREATE DATABASE failedimportpgdump; SET DATABASE = failedimportpgdump`)
+		// Hit a failure during import.
+		sqlDB.ExpectErr(
+			t, `testing injected failure`, `IMPORT PGDUMP 'nodelocal://0/schema.sql' WITH ignore_unsupported_statements`,
+		)
+		// Nudge the registry to quickly adopt the job.
+		tc.Server(0).JobRegistry().(*jobs.Registry).TestingNudgeAdoptionQueue()
+
+		dbID := sqlutils.QueryDatabaseID(t, sqlDB.DB, "failedimportpgdump")
+		// In the case of the test, the ID of the 3 schemas that will be cleaned up
+		// due to the failed import will be consecutive IDs after the ID of the
+		// empty database it was created in.
+		schemaIDs := []descpb.ID{descpb.ID(dbID + 1), descpb.ID(dbID + 2), descpb.ID(dbID + 3)}
+		// The table IDs are allocated after the schemas are created. There is one
+		// extra table in the "public" schema.
+		tableIDs := []descpb.ID{descpb.ID(dbID + 4), descpb.ID(dbID + 5), descpb.ID(dbID + 6),
+			descpb.ID(dbID + 7)}
+
+		// At this point we expect to see three jobs related to the cleanup.
+		// - SCHEMA CHANGE GC job for the table cleanup.
+		// - SCHEMA CHANGE job to drop the schemas.
+		// - SCHEMA CHANGE job to update the database descriptor with dropped
+		// schemas.
+
+		// Ensure that a GC job was created, and wait for it to finish.
+		doneGCQuery := fmt.Sprintf(
+			"SELECT count(*) FROM [SHOW JOBS] WHERE job_type = '%s' AND status = '%s' AND created > %s",
+			"SCHEMA CHANGE GC", jobs.StatusSucceeded, beforeImport.String(),
+		)
+
+		doneSchemaDropQuery := fmt.Sprintf(
+			"SELECT count(*) FROM [SHOW JOBS] WHERE job_type = '%s' AND status = '%s' AND description"+
+				" LIKE '%s'", "SCHEMA CHANGE", jobs.StatusSucceeded, "dropping schemas%")
+
+		doneDatabaseUpdateQuery := fmt.Sprintf(
+			"SELECT count(*) FROM [SHOW JOBS] WHERE job_type = '%s' AND status = '%s' AND description"+
+				" LIKE '%s'", "SCHEMA CHANGE", jobs.StatusSucceeded, "updating parent database%")
+
+		sqlDB.CheckQueryResultsRetry(t, doneGCQuery, [][]string{{"1"}})
+		sqlDB.CheckQueryResultsRetry(t, doneSchemaDropQuery, [][]string{{"1"}})
+		sqlDB.CheckQueryResultsRetry(t, doneDatabaseUpdateQuery, [][]string{{"1"}})
+
+		for _, schemaID := range schemaIDs {
+			// Expect that the schema descriptor is deleted.
+			if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				_, err := catalogkv.MustGetTableDescByID(ctx, txn, keys.SystemSQLCodec, schemaID)
+				if !testutils.IsError(err, "descriptor not found") {
+					return err
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		for _, tableID := range tableIDs {
+			// Expect that the table descriptor is deleted.
+			if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				_, err := catalogkv.MustGetTableDescByID(ctx, txn, keys.SystemSQLCodec, tableID)
+				if !testutils.IsError(err, "descriptor not found") {
+					return err
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// As a final sanity check that the schemas have been removed.
+		sqlDB.CheckQueryResults(t, `SELECT schema_name FROM [SHOW SCHEMAS] WHERE owner IS NOT NULL`,
+			[][]string{{"public"}})
+
+		// Check that the database descriptor has been updated with the removed schemas.
+		sqlDB.ExpectErr(t, "unknown schema \"foo\"", `ALTER SCHEMA foo RENAME TO biz`)
+	})
+}
+
 func TestImportCockroachDump(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -5974,7 +6181,7 @@ func TestImportCockroachDump(t *testing.T) {
 	conn := tc.Conns[0]
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
-	sqlDB.Exec(t, "IMPORT PGDUMP ($1) WITH ignore_unsupported", "nodelocal://0/cockroachdump/dump.sql")
+	sqlDB.Exec(t, "IMPORT PGDUMP ($1) WITH ignore_unsupported_statements", "nodelocal://0/cockroachdump/dump.sql")
 	sqlDB.CheckQueryResults(t, "SELECT * FROM t ORDER BY i", [][]string{
 		{"1", "test"},
 		{"2", "other"},
@@ -6030,7 +6237,7 @@ func TestCreateStatsAfterImport(t *testing.T) {
 
 	sqlDB.Exec(t, `SET CLUSTER SETTING sql.stats.automatic_collection.enabled=true`)
 
-	sqlDB.Exec(t, "IMPORT PGDUMP ($1) WITH ignore_unsupported", "nodelocal://0/cockroachdump/dump.sql")
+	sqlDB.Exec(t, "IMPORT PGDUMP ($1) WITH ignore_unsupported_statements", "nodelocal://0/cockroachdump/dump.sql")
 
 	// Verify that statistics have been created.
 	sqlDB.CheckQueryResultsRetry(t,
@@ -6455,7 +6662,9 @@ func putUserfile(
 	return tx.Commit()
 }
 
-func waitForJobResult(t *testing.T, tc *testcluster.TestCluster, id int64, expected jobs.Status) {
+func waitForJobResult(
+	t *testing.T, tc *testcluster.TestCluster, id jobspb.JobID, expected jobs.Status,
+) {
 	// Force newly created job to be adopted and verify its result.
 	tc.Server(0).JobRegistry().(*jobs.Registry).TestingNudgeAdoptionQueue()
 	testutils.SucceedsSoon(t, func() error {
@@ -6491,7 +6700,7 @@ func TestDetachedImport(t *testing.T) {
 	importIntoQueryDetached := importIntoQuery + " WITH DETACHED"
 
 	// DETACHED import w/out transaction is okay.
-	var jobID int64
+	var jobID jobspb.JobID
 	sqlDB.QueryRow(t, importQueryDetached, simpleOcf).Scan(&jobID)
 	waitForJobResult(t, tc, jobID, jobs.StatusSucceeded)
 

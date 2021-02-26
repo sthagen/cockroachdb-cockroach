@@ -12,6 +12,7 @@ package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -20,6 +21,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
+
+// UniquenessChecksForGenRandomUUIDClusterMode controls the cluster setting for
+// enabling uniqueness checks for UUID columns set to gen_random_uuid().
+var UniquenessChecksForGenRandomUUIDClusterMode = settings.RegisterBoolSetting(
+	"sql.optimizer.uniqueness_checks_for_gen_random_uuid.enabled",
+	"if enabled, uniqueness checks may be planned for mutations of UUID columns updated with"+
+		" gen_random_uuid(); otherwise, uniqueness is assumed due to near-zero collision probability",
+	false,
+).WithPublic()
 
 // buildUniqueChecksForInsert builds uniqueness check queries for an insert.
 // These check queries are used to enforce UNIQUE WITHOUT INDEX constraints.
@@ -153,6 +163,11 @@ type uniqueCheckHelper struct {
 	// primaryKeyOrdinals includes the ordinals from any primary key columns
 	// that are not included in uniqueOrdinals.
 	primaryKeyOrdinals util.FastIntSet
+
+	// The scope and column ordinals of the scan that will serve as the right
+	// side of the semi join for the uniqueness checks.
+	scanScope    *scope
+	scanOrdinals []int
 }
 
 // init initializes the helper with a unique constraint.
@@ -179,7 +194,7 @@ func (h *uniqueCheckHelper) init(mb *mutationBuilder, uniqueOrdinal int) bool {
 	// with columns that are a subset of the unique constraint columns.
 	// Similarly, we don't need a check for a partial unique constraint if there
 	// exists a non-partial unique constraint with columns that are a subset of
-	// the partial unique constrain columns.
+	// the partial unique constraint columns.
 	primaryOrds := getIndexLaxKeyOrdinals(mb.tab.Index(cat.PrimaryIndex))
 	primaryOrds.DifferenceWith(uniqueOrds)
 	if primaryOrds.Empty() {
@@ -191,19 +206,60 @@ func (h *uniqueCheckHelper) init(mb *mutationBuilder, uniqueOrdinal int) bool {
 	h.uniqueOrdinals = uniqueOrds
 	h.primaryKeyOrdinals = primaryOrds
 
-	// Check if we are setting NULL values for the unique columns, like when this
-	// mutation is the result of a SET NULL cascade action.
-	numNullCols := 0
 	for tabOrd, ok := h.uniqueOrdinals.Next(0); ok; tabOrd, ok = h.uniqueOrdinals.Next(tabOrd + 1) {
 		colID := mb.mapToReturnColID(tabOrd)
+		// Check if we are setting NULL values for the unique columns, like when
+		// this mutation is the result of a SET NULL cascade action. If at least one
+		// unique column is getting a NULL value, unique check not needed.
 		if memo.OutputColumnIsAlwaysNull(mb.outScope.expr, colID) {
-			numNullCols++
+			return false
+		}
+
+		// If one of the columns is a UUID set to gen_random_uuid() and we don't
+		// require uniqueness checks for gen_random_uuid(), unique check not needed.
+		if mb.md.ColumnMeta(colID).Type.Family() == types.UuidFamily &&
+			columnIsGenRandomUUID(mb.outScope.expr, colID) {
+			requireCheck := UniquenessChecksForGenRandomUUIDClusterMode.Get(&mb.b.evalCtx.Settings.SV)
+			if !requireCheck {
+				return false
+			}
 		}
 	}
 
-	// If at least one unique column is getting a NULL value, unique check not
-	// needed.
-	return numNullCols == 0
+	// Build the scan that will serve as the right side of the semi join in the
+	// uniqueness check. We need to build the scan now so that we can use its
+	// FDs below.
+	h.scanScope, h.scanOrdinals = h.buildTableScan()
+
+	// Check that the columns in the unique constraint aren't already known to
+	// form a lax key. This can happen if there is a unique index on a superset of
+	// these columns, where all other columns are computed columns that depend
+	// only on our columns. This is especially important for multi-region tables
+	// when the region column is computed.
+	//
+	// For example:
+	//
+	//   CREATE TABLE tab (
+	//     k INT PRIMARY KEY,
+	//     region crdb_internal_region AS (
+	//       CASE WHEN k < 10 THEN 'us-east1' ELSE 'us-west1' END
+	//     ) STORED
+	//   ) LOCALITY REGIONAL BY ROW AS region
+	//
+	// Because this is a REGIONAL BY ROW table, the region column is implicitly
+	// added to the front of every index, including the primary index. As a
+	// result, we would normally need to add a uniqueness check to all mutations
+	// to ensure that the primary key column (k in this case) remains unique.
+	// However, because the region column is computed and depends only on k, the
+	// presence of the unique index on (region, k) (i.e., the primary index) is
+	// sufficient to guarantee the uniqueness of k.
+	var uniqueCols opt.ColSet
+	h.uniqueOrdinals.ForEach(func(ord int) {
+		colID := h.scanScope.cols[ord].id
+		uniqueCols.Add(colID)
+	})
+	fds := &h.scanScope.expr.Relational().FuncDeps
+	return !fds.ColsAreLaxKey(uniqueCols)
 }
 
 // buildInsertionCheck creates a unique check for rows which are added to a
@@ -214,10 +270,9 @@ func (h *uniqueCheckHelper) buildInsertionCheck() memo.UniqueChecksItem {
 
 	// Build a self semi-join, with the new values on the left and the
 	// existing values on the right.
-	scanScope, ordinals := h.buildTableScan()
 
 	withScanScope, _ := h.mb.buildCheckInputScan(
-		checkInputScanNewVals, ordinals,
+		checkInputScanNewVals, h.scanOrdinals,
 	)
 
 	// Build the join filters:
@@ -238,7 +293,7 @@ func (h *uniqueCheckHelper) buildInsertionCheck() memo.UniqueChecksItem {
 		semiJoinFilters = append(semiJoinFilters, f.ConstructFiltersItem(
 			f.ConstructEq(
 				f.ConstructVariable(withScanScope.cols[i].id),
-				f.ConstructVariable(scanScope.cols[i].id),
+				f.ConstructVariable(h.scanScope.cols[i].id),
 			),
 		))
 	}
@@ -255,8 +310,8 @@ func (h *uniqueCheckHelper) buildInsertionCheck() memo.UniqueChecksItem {
 		withScanPred := h.mb.b.buildScalar(typedPred, withScanScope, nil, nil, nil)
 		semiJoinFilters = append(semiJoinFilters, f.ConstructFiltersItem(withScanPred))
 
-		typedPred = scanScope.resolveAndRequireType(pred, types.Bool)
-		scanPred := h.mb.b.buildScalar(typedPred, scanScope, nil, nil, nil)
+		typedPred = h.scanScope.resolveAndRequireType(pred, types.Bool)
+		scanPred := h.mb.b.buildScalar(typedPred, h.scanScope, nil, nil, nil)
 		semiJoinFilters = append(semiJoinFilters, f.ConstructFiltersItem(scanPred))
 	}
 
@@ -268,7 +323,7 @@ func (h *uniqueCheckHelper) buildInsertionCheck() memo.UniqueChecksItem {
 	for i, ok := h.primaryKeyOrdinals.Next(0); ok; i, ok = h.primaryKeyOrdinals.Next(i + 1) {
 		pkFilterLocal := f.ConstructNe(
 			f.ConstructVariable(withScanScope.cols[i].id),
-			f.ConstructVariable(scanScope.cols[i].id),
+			f.ConstructVariable(h.scanScope.cols[i].id),
 		)
 		if pkFilter == nil {
 			pkFilter = pkFilterLocal
@@ -278,7 +333,7 @@ func (h *uniqueCheckHelper) buildInsertionCheck() memo.UniqueChecksItem {
 	}
 	semiJoinFilters = append(semiJoinFilters, f.ConstructFiltersItem(pkFilter))
 
-	semiJoin := f.ConstructSemiJoin(withScanScope.expr, scanScope.expr, semiJoinFilters, memo.EmptyJoinPrivate)
+	semiJoin := f.ConstructSemiJoin(withScanScope.expr, h.scanScope.expr, semiJoinFilters, memo.EmptyJoinPrivate)
 
 	// Collect the key columns that will be shown in the error message if there
 	// is a duplicate key violation resulting from this uniqueness check.
@@ -314,4 +369,45 @@ func (h *uniqueCheckHelper) buildTableScan() (outScope *scope, ordinals []int) {
 		noRowLocking,
 		h.mb.b.allocScope(),
 	), ordinals
+}
+
+// columnIsGenRandomUUID returns true if the expression returns the function
+// gen_random_uuid() for the given column.
+func columnIsGenRandomUUID(e memo.RelExpr, col opt.ColumnID) bool {
+	isGenRandomUUIDFunction := func(scalar opt.ScalarExpr) bool {
+		if function, ok := scalar.(*memo.FunctionExpr); ok {
+			if function.Name == "gen_random_uuid" {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch e.Op() {
+	case opt.ProjectOp:
+		p := e.(*memo.ProjectExpr)
+		if p.Passthrough.Contains(col) {
+			return columnIsGenRandomUUID(p.Input, col)
+		}
+		for i := range p.Projections {
+			if p.Projections[i].Col == col {
+				return isGenRandomUUIDFunction(p.Projections[i].Element)
+			}
+		}
+
+	case opt.ValuesOp:
+		v := e.(*memo.ValuesExpr)
+		colOrdinal, ok := v.Cols.Find(col)
+		if !ok {
+			return false
+		}
+		for i := range v.Rows {
+			if !isGenRandomUUIDFunction(v.Rows[i].(*memo.TupleExpr).Elems[colOrdinal]) {
+				return false
+			}
+		}
+		return true
+	}
+
+	return false
 }

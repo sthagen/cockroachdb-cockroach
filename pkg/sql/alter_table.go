@@ -439,7 +439,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 
-			if err := params.p.dropSequencesOwnedByCol(params.ctx, colToDrop.ColumnDesc(), true /* queueJob */); err != nil {
+			if err := params.p.dropSequencesOwnedByCol(params.ctx, colToDrop.ColumnDesc(), true /* queueJob */, t.DropBehavior); err != nil {
 				return err
 			}
 
@@ -775,7 +775,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 							"constraint %q in the middle of being added, try again later", t.Constraint)
 					}
 					if err := validateUniqueWithoutIndexConstraintInTxn(
-						params.ctx, params.p.LeaseMgr(), params.EvalContext(), n.tableDesc, params.EvalContext().Txn, name,
+						params.ctx, params.EvalContext(), n.tableDesc, params.EvalContext().Txn, name,
 					); err != nil {
 						return err
 					}

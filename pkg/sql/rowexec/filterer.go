@@ -71,12 +71,8 @@ func newFiltererProcessor(
 
 // Start is part of the RowSource interface.
 func (f *filtererProcessor) Start(ctx context.Context) {
-	f.input.Start(ctx)
 	ctx = f.StartInternal(ctx, filtererProcName)
-	// Go around "this value of ctx is never used" linter error. We do it this
-	// way instead of omitting the assignment to ctx above so that if in the
-	// future other initialization is added, the correct ctx is used.
-	_ = ctx
+	f.input.Start(ctx)
 }
 
 // Next is part of the RowSource interface.
@@ -108,12 +104,6 @@ func (f *filtererProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMet
 		}
 	}
 	return nil, f.DrainHelper()
-}
-
-// ConsumerClosed is part of the RowSource interface.
-func (f *filtererProcessor) ConsumerClosed() {
-	// The consumer is done, Next() will not be called again.
-	f.InternalClose()
 }
 
 // execStatsForTrace implements ProcessorBase.ExecStatsForTrace.

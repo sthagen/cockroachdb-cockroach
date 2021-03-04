@@ -274,9 +274,6 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.Knobs.SQLExecutor == nil {
 		cfg.TestingKnobs.SQLExecutor = &sql.ExecutorTestingKnobs{}
 	}
-	if !params.DisableTestingDescriptorValidation {
-		cfg.TestingKnobs.SQLExecutor.(*sql.ExecutorTestingKnobs).TestingDescriptorValidation = true
-	}
 
 	// For test servers, leave interleaved tables enabled by default. We'll remove
 	// this when we remove interleaved tables altogether.
@@ -784,7 +781,7 @@ func StartTenant(
 		SetupIdleMonitor(ctx, args.stopper, baseCfg.IdleExitAfter, connManager)
 	}
 
-	pgL, err := listen(ctx, &args.Config.SQLAddr, &args.Config.SQLAdvertiseAddr, "sql")
+	pgL, err := ListenAndUpdateAddrs(ctx, &args.Config.SQLAddr, &args.Config.SQLAdvertiseAddr, "sql")
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -804,7 +801,7 @@ func StartTenant(
 		}
 	}
 
-	httpL, err := listen(ctx, &args.Config.HTTPAddr, &args.Config.HTTPAdvertiseAddr, "http")
+	httpL, err := ListenAndUpdateAddrs(ctx, &args.Config.HTTPAddr, &args.Config.HTTPAdvertiseAddr, "http")
 	if err != nil {
 		return nil, "", "", err
 	}

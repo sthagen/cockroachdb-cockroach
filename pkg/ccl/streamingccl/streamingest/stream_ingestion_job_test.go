@@ -10,70 +10,123 @@ package streamingest
 
 import (
 	"context"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamingtest"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamproducer"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
-// TestStreamIngestionJobRollBack tests that the job rolls back the data to the
-// start time if there are no progress updates. This test should be expanded
-// after the job's progress field is updated as the job runs.
-func TestStreamIngestionJobRollBack(t *testing.T) {
+// TestTenantStreaming tests that tenants can stream changes end-to-end.
+func TestTenantStreaming(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
+	defer log.Scope(t).Close(t)
 	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
-	registry := tc.Server(0).JobRegistry().(*jobs.Registry)
-	sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	skip.UnderRace(t, "slow under race")
 
-	// Load some initial data in the table. We're going to rollback to this time.
-	sqlDB.Exec(t, `CREATE TABLE foo AS SELECT * FROM generate_series(0, 100);`)
-	var tableID uint32
-	sqlDB.QueryRow(t, `SELECT id FROM system.namespace WHERE name = 'foo'`).Scan(&tableID)
+	ctx := context.Background()
 
-	// Create the stream ingestion job.
-	descTableKey := keys.SystemSQLCodec.TablePrefix(tableID)
-	ingestionSpan := roachpb.Span{
-		Key:    descTableKey,
-		EndKey: descTableKey.PrefixEnd(),
-	}
-	startTimestamp := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+	// Start the source server.
+	source, sourceDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer source.Stopper().Stop(ctx)
 
-	streamIngestJobRecord := jobs.Record{
-		Description: "test stream ingestion",
-		Username:    security.RootUserName(),
-		Details: jobspb.StreamIngestionDetails{
-			StreamAddress: "some://address/here",
-			Span:          ingestionSpan,
-			StartTime:     startTimestamp,
-		},
-		Progress: jobspb.StreamIngestionProgress{},
-	}
-	j, err := jobs.TestingCreateAndStartJob(ctx, registry, tc.Server(0).DB(), streamIngestJobRecord)
+	// Start tenant server in the srouce cluster.
+	tenantID := roachpb.MakeTenantID(10)
+	_, tenantConn := serverutils.StartTenant(t, source, base.TestTenantArgs{TenantID: tenantID})
+	defer tenantConn.Close()
+	// sourceSQL refers to the tenant generating the data.
+	sourceSQL := sqlutils.MakeSQLRunner(tenantConn)
+
+	// Make changefeeds run faster.
+	resetFreq := changefeedbase.TestingSetDefaultFlushFrequency(50 * time.Millisecond)
+	defer resetFreq()
+	// Set required cluster settings.
+	_, err := sourceDB.Exec(`
+SET CLUSTER SETTING kv.rangefeed.enabled = true;
+SET CLUSTER SETTING kv.closed_timestamp.target_duration = '1s';
+SET CLUSTER SETTING changefeed.experimental_poll_interval = '10ms'
+`)
 	require.NoError(t, err)
 
-	// Insert more data in the table. These changes should be rollback during job
-	// cancellation.
-	sqlDB.CheckQueryResults(t, "SELECT count(*) FROM foo", [][]string{{"101"}})
-	sqlDB.Exec(t, `INSERT INTO foo SELECT * FROM generate_series(100, 200);`)
-	sqlDB.CheckQueryResults(t, "SELECT count(*) FROM foo", [][]string{{"202"}})
+	// Prevent a logging assertion that the server ID is initialized multiple times.
+	log.TestingClearServerIdentifiers()
 
-	// Cancel the job and expect the table to have the same number of rows as it
-	// did at the start.
-	sqlDB.Exec(t, "CANCEL JOB $1", j.ID())
-	sqlDB.CheckQueryResultsRetry(t, "SELECT count(*) FROM foo", [][]string{{"101"}})
+	// Start the destination server.
+	hDest, cleanupDest := streamingtest.NewReplicationHelper(t)
+	defer cleanupDest()
+	// destSQL refers to the system tenant as that's the one that's running the
+	// job.
+	destSQL := hDest.SysDB
+	destSQL.Exec(t, `
+SET CLUSTER SETTING bulkio.stream_ingestion.minimum_flush_interval = '5us';
+SET CLUSTER SETTING bulkio.stream_ingestion.cutover_signal_poll_interval = '100ms';
+SET enable_experimental_stream_replication = true;
+`)
+
+	// Sink to read data from.
+	pgURL, cleanupSink := sqlutils.PGUrl(t, source.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanupSink()
+
+	var ingestionJobID int
+	var startTime string
+	sourceSQL.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&startTime)
+	destSQL.QueryRow(t,
+		`RESTORE TENANT 10 FROM REPLICATION STREAM FROM $1 AS OF SYSTEM TIME `+startTime,
+		pgURL.String(),
+	).Scan(&ingestionJobID)
+
+	sourceSQL.Exec(t, `
+CREATE DATABASE d;
+CREATE TABLE d.t1(i int primary key, a string, b string);
+CREATE TABLE d.t2(i int primary key);
+INSERT INTO d.t1 (i) VALUES (42);
+INSERT INTO d.t2 VALUES (2);
+`)
+
+	// Pick a cutover time, then wait for the job to reach that time.
+	cutoverTime := timeutil.Now().Round(time.Microsecond)
+	testutils.SucceedsSoon(t, func() error {
+		progress := jobutils.GetJobProgress(t, destSQL, jobspb.JobID(ingestionJobID))
+		if progress.GetHighWater() == nil {
+			return errors.Newf("stream ingestion has not recorded any progress yet, waiting to advance pos %s",
+				cutoverTime.String())
+		}
+		highwater := timeutil.Unix(0, progress.GetHighWater().WallTime)
+		if highwater.Before(cutoverTime) {
+			return errors.Newf("waiting for stream ingestion job progress %s to advance beyond %s",
+				highwater.String(), cutoverTime.String())
+		}
+		return nil
+	})
+
+	destSQL.Exec(
+		t,
+		`SELECT crdb_internal.complete_stream_ingestion_job($1, $2)`,
+		ingestionJobID, cutoverTime)
+
+	jobutils.WaitForJob(t, destSQL, jobspb.JobID(ingestionJobID))
+
+	query := "SELECT * FROM d.t1"
+	sourceData := sourceSQL.QueryStr(t, query)
+	destData := hDest.Tenant.SQL.QueryStr(t, query)
+	require.Equal(t, sourceData, destData)
 }

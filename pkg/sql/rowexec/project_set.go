@@ -116,8 +116,8 @@ func newProjectSetProcessor(
 
 // Start is part of the RowSource interface.
 func (ps *projectSetProcessor) Start(ctx context.Context) {
-	ps.input.Start(ctx)
 	ctx = ps.StartInternal(ctx, projectSetProcName)
+	ps.input.Start(ctx)
 	ps.cancelChecker = cancelchecker.NewCancelChecker(ctx)
 }
 
@@ -276,12 +276,6 @@ func (ps *projectSetProcessor) toEncDatum(d tree.Datum, colIdx int) rowenc.EncDa
 	generatedColIdx := colIdx - len(ps.input.OutputTypes())
 	ctyp := ps.spec.GeneratedColumns[generatedColIdx]
 	return rowenc.DatumToEncDatum(ctyp, d)
-}
-
-// ConsumerClosed is part of the RowSource interface.
-func (ps *projectSetProcessor) ConsumerClosed() {
-	// The consumer is done, Next() will not be called again.
-	ps.InternalClose()
 }
 
 // ChildCount is part of the execinfra.OpNode interface.

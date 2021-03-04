@@ -128,9 +128,6 @@ type TestServerArgs struct {
 
 	// IF set, the demo login endpoint will be enabled.
 	EnableDemoLoginEndpoint bool
-
-	// If set, testing specific descriptor validation will be disabled. even if the server
-	DisableTestingDescriptorValidation bool
 }
 
 // TestClusterArgs contains the parameters one can set when creating a test
@@ -214,7 +211,7 @@ const (
 	ReplicationAuto TestClusterReplicationMode = iota
 	// ReplicationManual means that the split, merge and replication queues of all
 	// servers are stopped, and the test must manually control splitting, merging
-	// and  replication through the TestServer.
+	// and replication through the TestServer.
 	// Note that the server starts with a number of system ranges,
 	// all with a single replica on node 1.
 	ReplicationManual

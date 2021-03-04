@@ -49,6 +49,9 @@ const (
 	maxStructuredEventsPerSpan = 50
 	// maxChildrenPerSpan limits the number of (direct) child spans in a Span.
 	maxChildrenPerSpan = 1000
+	// maxSpanRegistrySize limits the number of local root spans tracked in
+	// a Tracer's registry.
+	maxSpanRegistrySize = 5000
 )
 
 // These constants are used to form keys to represent tracing context
@@ -78,7 +81,9 @@ var lightstepToken = settings.RegisterStringSetting(
 	envutil.EnvOrDefaultString("COCKROACH_TEST_LIGHTSTEP_TOKEN", ""),
 ).WithPublic()
 
-var zipkinCollector = settings.RegisterStringSetting(
+// ZipkinCollector is the cluster setting that specifies the Zipkin instance
+// to send traces to, if any.
+var ZipkinCollector = settings.RegisterStringSetting(
 	"trace.zipkin.collector",
 	"if set, traces go to the given Zipkin instance (example: '127.0.0.1:9411'); ignored if trace.lightstep.token is set",
 	envutil.EnvOrDefaultString("COCKROACH_TEST_ZIPKIN_COLLECTOR", ""),
@@ -162,7 +167,7 @@ func (t *Tracer) Configure(sv *settings.Values) {
 	reconfigure := func() {
 		if lsToken := lightstepToken.Get(sv); lsToken != "" {
 			t.setShadowTracer(createLightStepTracer(lsToken))
-		} else if zipkinAddr := zipkinCollector.Get(sv); zipkinAddr != "" {
+		} else if zipkinAddr := ZipkinCollector.Get(sv); zipkinAddr != "" {
 			t.setShadowTracer(createZipkinTracer(zipkinAddr))
 		} else {
 			t.setShadowTracer(nil, nil)
@@ -178,7 +183,13 @@ func (t *Tracer) Configure(sv *settings.Values) {
 
 	enableNetTrace.SetOnChange(sv, reconfigure)
 	lightstepToken.SetOnChange(sv, reconfigure)
-	zipkinCollector.SetOnChange(sv, reconfigure)
+	ZipkinCollector.SetOnChange(sv, reconfigure)
+}
+
+// HasExternalSink returns whether the tracer is configured to report
+// to an external tracing collector.
+func (t *Tracer) HasExternalSink() bool {
+	return t.getShadowTracer() != nil || t.useNetTrace()
 }
 
 func (t *Tracer) useNetTrace() bool {
@@ -193,7 +204,7 @@ func (t *Tracer) Close() {
 
 func (t *Tracer) setShadowTracer(manager shadowTracerManager, tr opentracing.Tracer) {
 	var shadow *shadowTracer
-	if manager != nil {
+	if manager != nil && tr != nil {
 		shadow = &shadowTracer{
 			Tracer:  tr,
 			manager: manager,
@@ -405,6 +416,20 @@ func (t *Tracer) startSpanGeneric(
 			// Local root span - put it into the registry of active local root
 			// spans. `Span.Finish` takes care of deleting it again.
 			t.activeSpans.Lock()
+
+			// Ensure that the registry does not grow unboundedly in case there
+			// is a leak. When the registry reaches max size, each new span added
+			// kicks out some old span. We rely on map iteration order here to
+			// make this cheap.
+			if toDelete := len(t.activeSpans.m) - maxSpanRegistrySize + 1; toDelete > 0 {
+				for k := range t.activeSpans.m {
+					delete(t.activeSpans.m, k)
+					toDelete--
+					if toDelete <= 0 {
+						break
+					}
+				}
+			}
 			t.activeSpans.m[spanID] = s
 			t.activeSpans.Unlock()
 		}

@@ -339,15 +339,16 @@ func (v *validator) processOp(txnID *string, op Operation) {
 			v.failIfError(op, t.Result)
 		}
 	case *TransferLeaseOperation:
-		if resultIsErrorStr(t.Result, `cannot transfer lease to replica of type (VOTER_INCOMING|VOTER_OUTGOING|VOTER_DEMOTING|LEARNER|NON_VOTER)`) {
+		if resultIsErrorStr(t.Result, `replica cannot hold lease`) {
 			// Only VOTER_FULL replicas can currently hold a range lease.
 			// Attempts to transfer to lease to any other replica type are
 			// rejected.
-		} else if resultIsErrorStr(t.Result, `replica cannot hold lease`) {
-			// Same case as above, but with a slightly different message.
 		} else if resultIsErrorStr(t.Result, `unable to find store \d+ in range`) {
 			// A lease transfer that races with a replica removal may find that
 			// the store it was targeting is no longer part of the range.
+		} else if resultIsErrorStr(t.Result, `cannot transfer lease while merge in progress`) {
+			// A lease transfer is not permitted while a range merge is in its
+			// critical phase.
 		} else if resultIsError(t.Result, liveness.ErrRecordCacheMiss) {
 			// If the existing leaseholder has not yet heard about the transfer
 			// target's liveness record through gossip, it will return an error.

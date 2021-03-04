@@ -331,12 +331,14 @@
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
 <tr><td><a name="age"></a><code>age(end: <a href="timestamp.html">timestamptz</a>, begin: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Calculates the interval between <code>begin</code> and <code>end</code>, normalized into years, months and days.</p>
-<pre><code>		Note this may not be an accurate time span since years and months are normalized from days, and years and months are out of context.
-		To avoid normalizing days into months and years, use the timestamptz subtraction operator.</code></pre>
+<p>Note this may not be an accurate time span since years and months are normalized
+from days, and years and months are out of context. To avoid normalizing days into
+months and years, use the timestamptz subtraction operator.</p>
 </span></td></tr>
 <tr><td><a name="age"></a><code>age(val: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Calculates the interval between <code>val</code> and the current time, normalized into years, months and days.</p>
-<pre><code>		Note this may not be an accurate time span since years and months are normalized from days, and years and months are out of context.
-		To avoid normalizing days into months and years, use `now() - timestamptz`.</code></pre>
+<p>Note this may not be an accurate time span since years and months are normalized
+from days, and years and months are out of context. To avoid normalizing days into
+months and years, use <code>now() - timestamptz</code>.</p>
 </span></td></tr>
 <tr><td><a name="clock_timestamp"></a><code>clock_timestamp() &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Returns the current system time on one of the cluster nodes.</p>
 </span></td></tr>
@@ -1273,6 +1275,13 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 </span></td></tr>
 <tr><td><a name="st_addpoint"></a><code>st_addpoint(line_string: geometry, point: geometry, index: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Adds a Point to a LineString at the given 0-based index (-1 to append).</p>
 </span></td></tr>
+<tr><td><a name="st_affine"></a><code>st_affine(geometry: geometry, a: <a href="float.html">float</a>, b: <a href="float.html">float</a>, c: <a href="float.html">float</a>, d: <a href="float.html">float</a>, e: <a href="float.html">float</a>, f: <a href="float.html">float</a>, g: <a href="float.html">float</a>, h: <a href="float.html">float</a>, i: <a href="float.html">float</a>, x_off: <a href="float.html">float</a>, y_off: <a href="float.html">float</a>, z_off: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Applies a 3D affine transformation to the given geometry.</p>
+<p>The matrix transformation will be applied as follows for each coordinate:
+/ a  b  c x_off \  / x <br />
+| d  e  f y_off |  | y |
+| g  h  i z_off |  | z |
+\ 0  0  0     1 /  \ 0 /</p>
+</span></td></tr>
 <tr><td><a name="st_affine"></a><code>st_affine(geometry: geometry, a: <a href="float.html">float</a>, b: <a href="float.html">float</a>, d: <a href="float.html">float</a>, e: <a href="float.html">float</a>, x_off: <a href="float.html">float</a>, y_off: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Applies a 2D affine transformation to the given geometry.</p>
 <p>The matrix transformation will be applied as follows for each coordinate:
 / a  b  x_off \  / x <br />
@@ -1693,7 +1702,25 @@ Bottom Left.</p>
 </span></td></tr>
 <tr><td><a name="st_flipcoordinates"></a><code>st_flipcoordinates(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a new geometry with the X and Y axes flipped.</p>
 </span></td></tr>
-<tr><td><a name="st_force2d"></a><code>st_force2d(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry which only contains X and Y coordinates.</p>
+<tr><td><a name="st_force2d"></a><code>st_force2d(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that is forced into XY layout with any Z or M dimensions discarded.</p>
+</span></td></tr>
+<tr><td><a name="st_force3d"></a><code>st_force3d(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that is forced into XYZ layout. If a Z coordinate doesn’t exist, it will be set to 0. If a M coordinate is present, it will be discarded.</p>
+</span></td></tr>
+<tr><td><a name="st_force3d"></a><code>st_force3d(geometry: geometry, defaultZ: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that is forced into XYZ layout. If a Z coordinate doesn’t exist, it will be set to the specified default Z value. If a M coordinate is present, it will be discarded.</p>
+</span></td></tr>
+<tr><td><a name="st_force3dm"></a><code>st_force3dm(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that is forced into XYM layout. If a M coordinate doesn’t exist, it will be set to 0. If a Z coordinate is present, it will be discarded.</p>
+</span></td></tr>
+<tr><td><a name="st_force3dm"></a><code>st_force3dm(geometry: geometry, defaultM: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that is forced into XYM layout. If a M coordinate doesn’t exist, it will be set to the specified default M value. If a Z coordinate is present, it will be discarded.</p>
+</span></td></tr>
+<tr><td><a name="st_force3dz"></a><code>st_force3dz(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that is forced into XYZ layout. If a Z coordinate doesn’t exist, it will be set to 0. If a M coordinate is present, it will be discarded.</p>
+</span></td></tr>
+<tr><td><a name="st_force3dz"></a><code>st_force3dz(geometry: geometry, defaultZ: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that is forced into XYZ layout. If a Z coordinate doesn’t exist, it will be set to the specified default Z value. If a M coordinate is present, it will be discarded.</p>
+</span></td></tr>
+<tr><td><a name="st_force4d"></a><code>st_force4d(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that is forced into XYZM layout. If a Z coordinate doesn’t exist, it will be set to 0. If a M coordinate doesn’t exist, it will be set to 0.</p>
+</span></td></tr>
+<tr><td><a name="st_force4d"></a><code>st_force4d(geometry: geometry, defaultZ: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that is forced into XYZ layout. If a Z coordinate doesn’t exist, it will be set to the specified default Z value. If a M coordinate doesn’t exist, it will be set to 0.</p>
+</span></td></tr>
+<tr><td><a name="st_force4d"></a><code>st_force4d(geometry: geometry, defaultZ: <a href="float.html">float</a>, defaultM: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Geometry that is forced into XYZ layout. If a Z coordinate doesn’t exist, it will be set to the specified Z value. If a M coordinate doesn’t exist, it will be set to the specified M value.</p>
 </span></td></tr>
 <tr><td><a name="st_forcecollection"></a><code>st_forcecollection(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Converts the geometry into a GeometryCollection.</p>
 </span></td></tr>
@@ -1918,6 +1945,8 @@ calculated, the result is transformed back into a Geography with SRID 4326.</p>
 <tr><td><a name="st_longestline"></a><code>st_longestline(geometry_a: geometry, geometry_b: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the LineString corresponds to the max distance across every pair of points comprising the given geometries.</p>
 <p>Note if geometries are the same, it will return the LineString with the maximum distance between the geometry’s vertexes. The function will return the longest line that was discovered first when comparing maximum distances if more than one is found.</p>
 </span></td></tr>
+<tr><td><a name="st_m"></a><code>st_m(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the M coordinate of a geometry if it is a Point.</p>
+</span></td></tr>
 <tr><td><a name="st_makebox2d"></a><code>st_makebox2d(geometry_a: geometry, geometry_b: geometry) &rarr; box2d</code></td><td><span class="funcdesc"><p>Creates a box2d from two points. Errors if arguments are not two non-empty points.</p>
 </span></td></tr>
 <tr><td><a name="st_makepoint"></a><code>st_makepoint(x: <a href="float.html">float</a>, y: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a new Point with the given X and Y coordinates.</p>
@@ -2132,6 +2161,12 @@ Negative azimuth values and values greater than 2π (360 degrees) are supported.
 </span></td></tr>
 <tr><td><a name="st_rotate"></a><code>st_rotate(g: geometry, angle_radians: <a href="float.html">float</a>, origin_x: <a href="float.html">float</a>, origin_y: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry whose coordinates are rotated around the provided origin by a rotation angle.</p>
 </span></td></tr>
+<tr><td><a name="st_rotatex"></a><code>st_rotatex(g: geometry, angle_radians: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry whose coordinates are rotated about the x axis by a rotation angle.</p>
+</span></td></tr>
+<tr><td><a name="st_rotatey"></a><code>st_rotatey(g: geometry, angle_radians: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry whose coordinates are rotated about the y axis by a rotation angle.</p>
+</span></td></tr>
+<tr><td><a name="st_rotatez"></a><code>st_rotatez(g: geometry, angle_radians: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry whose coordinates are rotated about the z axis by a rotation angle.</p>
+</span></td></tr>
 <tr><td><a name="st_s2covering"></a><code>st_s2covering(geography: geography) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns a geography which represents the S2 covering used by the index using the default index configuration.</p>
 </span></td></tr>
 <tr><td><a name="st_s2covering"></a><code>st_s2covering(geography: geography, settings: <a href="string.html">string</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns a geography which represents the S2 covering used by the index using the index configuration specified
@@ -2272,6 +2307,10 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 <tr><td><a name="st_x"></a><code>st_x(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the X coordinate of a geometry if it is a Point.</p>
 </span></td></tr>
 <tr><td><a name="st_y"></a><code>st_y(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the Y coordinate of a geometry if it is a Point.</p>
+</span></td></tr>
+<tr><td><a name="st_z"></a><code>st_z(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the Z coordinate of a geometry if it is a Point.</p>
+</span></td></tr>
+<tr><td><a name="st_zmflag"></a><code>st_zmflag(geometry: geometry) &rarr; int2</code></td><td><span class="funcdesc"><p>Returns a code based on the ZM coordinate dimension of a geometry (XY = 0, XYM = 1, XYZ = 2, XYZM = 3).</p>
 </span></td></tr></tbody>
 </table>
 

@@ -282,9 +282,13 @@ func newJoinReader(
 		output,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{jr.input},
-			TrailingMetaCallback: func(ctx context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
+				// We need to generate metadata before closing the processor
+				// because InternalClose() updates jr.Ctx to the "original"
+				// context.
+				trailingMeta := jr.generateMeta(jr.Ctx)
 				jr.close()
-				return jr.generateMeta(ctx)
+				return trailingMeta
 			},
 		},
 	); err != nil {
@@ -700,12 +704,8 @@ func (jr *joinReader) emitRow() (
 
 // Start is part of the RowSource interface.
 func (jr *joinReader) Start(ctx context.Context) {
-	jr.input.Start(ctx)
 	ctx = jr.StartInternal(ctx, joinReaderProcName)
-	// Go around "this value of ctx is never used" linter error. We do it this
-	// way instead of omitting the assignment to ctx above so that if in the
-	// future other initialization is added, the correct ctx is used.
-	_ = ctx
+	jr.input.Start(ctx)
 	jr.runningState = jrReadingInput
 }
 

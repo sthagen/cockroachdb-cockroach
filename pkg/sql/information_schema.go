@@ -497,13 +497,14 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 					dbNameStr,                                                 // udt_catalog
 					udtSchema,                                                 // udt_schema
 					tree.NewDString(column.GetType().PGName()), // udt_name
-					tree.DNull,                        // scope_catalog
-					tree.DNull,                        // scope_schema
-					tree.DNull,                        // scope_name
-					tree.DNull,                        // maximum_cardinality
-					tree.DNull,                        // dtd_identifier
-					tree.DNull,                        // is_self_referencing
-					tree.DNull,                        // is_identity
+					tree.DNull, // scope_catalog
+					tree.DNull, // scope_schema
+					tree.DNull, // scope_name
+					tree.DNull, // maximum_cardinality
+					tree.DNull, // dtd_identifier
+					tree.DNull, // is_self_referencing
+					//TODO: Need to update when supporting identiy columns (Issue #48532)
+					noString,                          // is_identity
 					tree.DNull,                        // identity_generation
 					tree.DNull,                        // identity_start
 					tree.DNull,                        // identity_increment
@@ -1957,8 +1958,8 @@ type virtualOpts int
 const (
 	// virtualMany iterates over virtual schemas in every catalog/database.
 	virtualMany virtualOpts = iota
-	// virtualOnce iterates over virtual schemas once, in the nil database.
-	virtualOnce
+	// virtualCurrentDB iterates over virtual schemas in the current database.
+	virtualCurrentDB
 	// hideVirtual completely hides virtual schemas during iteration.
 	hideVirtual
 )
@@ -2118,7 +2119,7 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 	lCtx := newInternalLookupCtx(ctx, descs, dbContext,
 		catalogkv.NewOneLevelUncachedDescGetter(p.txn, p.execCfg.Codec))
 
-	if virtualOpts == virtualMany || virtualOpts == virtualOnce {
+	if virtualOpts == virtualMany || virtualOpts == virtualCurrentDB {
 		// Virtual descriptors first.
 		vt := p.getVirtualTabler()
 		vEntries := vt.getEntries()
@@ -2137,8 +2138,8 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 		}
 
 		switch virtualOpts {
-		case virtualOnce:
-			if err := iterate(nil); err != nil {
+		case virtualCurrentDB:
+			if err := iterate(dbContext); err != nil {
 				return err
 			}
 		case virtualMany:
@@ -2223,10 +2224,13 @@ FROM
 			ro.username = u.username
 			AND option = 'VALID UNTIL';
 `
-	rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+	// For some reason, using the iterator API here causes privilege_builtins
+	// logic test fail in 3node-tenant config with 'txn already encountered an
+	// error' (because of the context cancellation), so we buffer all roles
+	// first.
+	rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryBuffered(
 		ctx, "read-roles", p.txn, query,
 	)
-
 	if err != nil {
 		return err
 	}
@@ -2259,16 +2263,21 @@ FROM
 
 func forEachRoleMembership(
 	ctx context.Context, p *planner, fn func(role, member security.SQLUsername, isAdmin bool) error,
-) error {
+) (retErr error) {
 	query := `SELECT "role", "member", "isAdmin" FROM system.role_members`
-	rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIterator(
 		ctx, "read-members", p.txn, query,
 	)
 	if err != nil {
 		return err
 	}
+	// We have to make sure to close the iterator since we might return from the
+	// for loop early (before Next() returns false).
+	defer func() { retErr = errors.CombineErrors(retErr, it.Close()) }()
 
-	for _, row := range rows {
+	var ok bool
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+		row := it.Cur()
 		roleName := tree.MustBeDString(row[0])
 		memberName := tree.MustBeDString(row[1])
 		isAdmin := row[2].(*tree.DBool)
@@ -2281,7 +2290,7 @@ func forEachRoleMembership(
 			return err
 		}
 	}
-	return nil
+	return err
 }
 
 func userCanSeeDescriptor(

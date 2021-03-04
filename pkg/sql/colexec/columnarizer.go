@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -59,6 +60,11 @@ type Columnarizer struct {
 	accumulatedMeta []execinfrapb.ProducerMetadata
 	ctx             context.Context
 	typs            []*types.T
+
+	// removedFromFlow marks this Columnarizer as having been removed from the
+	// flow. This renders all future calls to Init, Next, Close, and DrainMeta
+	// noops.
+	removedFromFlow bool
 }
 
 var _ colexecop.Operator = &Columnarizer{}
@@ -117,7 +123,18 @@ func newColumnarizer(
 		processorID,
 		nil, /* output */
 		nil, /* memMonitor */
-		execinfra.ProcStateOpts{InputsToDrain: []execinfra.RowSource{input}},
+		execinfra.ProcStateOpts{
+			InputsToDrain: []execinfra.RowSource{input},
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
+				// Close will call InternalClose(). Note that we don't return
+				// any trailing metadata here because the columnarizers
+				// propagate it in DrainMeta.
+				if err := c.Close(c.Ctx); util.CrdbTestBuild && err != nil {
+					// Close never returns an error.
+					colexecerror.InternalError(errors.AssertionFailedf("unexpected error %v from Columnarizer.Close", err))
+				}
+				return nil
+			}},
 	); err != nil {
 		return nil, err
 	}
@@ -127,11 +144,15 @@ func newColumnarizer(
 
 // Init is part of the Operator interface.
 func (c *Columnarizer) Init() {
+	if c.removedFromFlow {
+		return
+	}
 	// We don't want to call Start on the input to columnarizer and allocating
 	// internal objects several times if Init method is called more than once, so
 	// we have this check in place.
 	if c.initStatus == colexecop.OperatorNotInitialized {
 		c.accumulatedMeta = make([]execinfrapb.ProducerMetadata, 0, 1)
+		c.ctx = c.StartInternalNoSpan(c.ctx)
 		c.input.Start(c.ctx)
 		c.initStatus = colexecop.OperatorInitialized
 	}
@@ -139,6 +160,9 @@ func (c *Columnarizer) Init() {
 
 // Next is part of the Operator interface.
 func (c *Columnarizer) Next(context.Context) coldata.Batch {
+	if c.removedFromFlow {
+		return coldata.ZeroBatch
+	}
 	var reallocated bool
 	switch c.mode {
 	case columnarizerBufferingMode:
@@ -222,6 +246,9 @@ var (
 
 // DrainMeta is part of the MetadataSource interface.
 func (c *Columnarizer) DrainMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
+	if c.removedFromFlow {
+		return nil
+	}
 	c.MoveToDraining(nil /* err */)
 	for {
 		meta := c.DrainHelper()
@@ -233,9 +260,12 @@ func (c *Columnarizer) DrainMeta(ctx context.Context) []execinfrapb.ProducerMeta
 	return c.accumulatedMeta
 }
 
-// Close is part of the Operator interface.
-func (c *Columnarizer) Close(ctx context.Context) error {
-	c.input.ConsumerClosed()
+// Close is part of the colexecop.Operator interface.
+func (c *Columnarizer) Close(context.Context) error {
+	if c.removedFromFlow {
+		return nil
+	}
+	c.InternalClose()
 	return nil
 }
 
@@ -263,4 +293,14 @@ func (c *Columnarizer) Child(nth int, verbose bool) execinfra.OpNode {
 // Input returns the input of this columnarizer.
 func (c *Columnarizer) Input() execinfra.RowSource {
 	return c.input
+}
+
+// MarkAsRemovedFromFlow is called by planning code to make all future calls on
+// this columnarizer noops. It exists to support an execution optimization where
+// a Columnarizer is removed from a flow in cases where it would be the input to
+// a Materializer (which is redundant). Simply bypassing the Columnarizer is not
+// enough because it is added to a slice of Closers and MetadataSources that are
+// difficult to change once physical planning moves on from the Columnarizer.
+func (c *Columnarizer) MarkAsRemovedFromFlow() {
+	c.removedFromFlow = true
 }

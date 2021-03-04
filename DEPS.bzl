@@ -525,8 +525,8 @@ def go_deps():
         name = "com_github_cockroachdb_pebble",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/cockroachdb/pebble",
-        sum = "h1:EyzONynthydmrlGVcEiyNmbLwDejSGb9Rzyn1NcEtNw=",
-        version = "v0.0.0-20210217155127-444296cfa2bb",
+        sum = "h1:XdZUrLbpSS/DuvlJNlQh7ihh0OgrkxeR/bHKYaHXrKk=",
+        version = "v0.0.0-20210302221659-e755a0512369",
     )
     go_repository(
         name = "com_github_cockroachdb_redact",
@@ -1327,8 +1327,8 @@ def go_deps():
         name = "com_github_golang_snappy",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/golang/snappy",
-        sum = "h1:aeE13tS0IiQgFjYdoL8qN3K1N2bXXtI6Vi51/y7BpMw=",
-        version = "v0.0.2",
+        sum = "h1:fHPg5GQYlCeLIPB9BZqMVR5nR9A+IM5zcgeTdjMYmLA=",
+        version = "v0.0.3",
     )
     go_repository(
         name = "com_github_gomodule_redigo",
@@ -2086,8 +2086,8 @@ def go_deps():
         name = "com_github_klauspost_compress",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/klauspost/compress",
-        sum = "h1:0hzRabrMN4tSTvMfnL3SCv1ZGeAP23ynzodBgaHeMeg=",
-        version = "v1.11.7",
+        sum = "h1:5OCMOdde1TCT2sookEuVeEZzA8bmRSFV3AwPDZAG8AA=",
+        version = "v1.11.9",
     )
     go_repository(
         name = "com_github_klauspost_cpuid",
@@ -3240,8 +3240,8 @@ def go_deps():
         name = "com_github_twpayne_go_geom",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/twpayne/go-geom",
-        sum = "h1:yh2fcro1FLk9uTYi3OSXxtI3JRzaghtsNgaku2ASZbE=",
-        version = "v1.3.7-0.20210224233516-acd1d64d533a",
+        sum = "h1:SRMQNnhXCCgFBGAYFnM8iOSMYcOlOwkaTP3pwRCcuOY=",
+        version = "v1.3.7-0.20210228220813-9d9885b50d3e",
     )
     go_repository(
         name = "com_github_twpayne_go_kml",

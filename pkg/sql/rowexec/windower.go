@@ -168,7 +168,7 @@ func newWindower(
 		output,
 		limitedMon,
 		execinfra.ProcStateOpts{InputsToDrain: []execinfra.RowSource{w.input},
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				w.close()
 				return nil
 			}},
@@ -205,8 +205,8 @@ func newWindower(
 
 // Start is part of the RowSource interface.
 func (w *windower) Start(ctx context.Context) {
-	w.input.Start(ctx)
 	ctx = w.StartInternal(ctx, windowerProcName)
+	w.input.Start(ctx)
 	w.cancelChecker = cancelchecker.NewCancelChecker(ctx)
 	w.runningState = windowerAccumulating
 }

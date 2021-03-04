@@ -16,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -25,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
@@ -85,6 +84,16 @@ func ingestionPlanHook(
 			return errors.Newf("no tenant specified in ingestion query: %s", ingestionStmt.String())
 		}
 
+		streamAddress := streamingccl.StreamAddress(from[0])
+		url, err := streamAddress.URL()
+		if err != nil {
+			return err
+		}
+		q := url.Query()
+		q.Set("TENANT_ID", ingestionStmt.Targets.Tenant.String())
+		url.RawQuery = q.Encode()
+		streamAddress = streamingccl.StreamAddress(url.String())
+
 		if ingestionStmt.Targets.Types != nil || ingestionStmt.Targets.Databases != nil ||
 			ingestionStmt.Targets.Tables != nil || ingestionStmt.Targets.Schemas != nil {
 			return errors.Newf("unsupported target in ingestion query, "+
@@ -94,11 +103,19 @@ func ingestionPlanHook(
 		// TODO(adityamaru): Add privileges checks. Probably the same as RESTORE.
 
 		prefix := keys.MakeTenantPrefix(ingestionStmt.Targets.Tenant)
+		startTime := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+		if ingestionStmt.AsOf.Expr != nil {
+			var err error
+			startTime, err = p.EvalAsOfTimestamp(ctx, ingestionStmt.AsOf)
+			if err != nil {
+				return err
+			}
+		}
+
 		streamIngestionDetails := jobspb.StreamIngestionDetails{
-			StreamAddress: streamingccl.StreamAddress(from[0]),
+			StreamAddress: streamAddress,
 			Span:          roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()},
-			// TODO: Figure out what the initial ts should be.
-			StartTime: hlc.Timestamp{},
+			StartTime:     startTime,
 		}
 
 		jobDescription, err := streamIngestionJobDescription(p, ingestionStmt)
@@ -107,32 +124,24 @@ func ingestionPlanHook(
 		}
 
 		jr := jobs.Record{
-			Description: jobDescription,
-			Username:    p.User(),
-			Progress:    jobspb.StreamIngestionProgress{},
-			Details:     streamIngestionDetails,
+			Description:   jobDescription,
+			Username:      p.User(),
+			Progress:      jobspb.StreamIngestionProgress{},
+			Details:       streamIngestionDetails,
+			NonCancelable: true,
 		}
 
-		var sj *jobs.StartableJob
 		jobID := p.ExecCfg().JobRegistry.MakeJobID()
-		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			return p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, txn, jr)
-		}); err != nil {
-			if sj != nil {
-				if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
-					log.Warningf(ctx, "failed to cleanup StartableJob: %v", cleanupErr)
-				}
-			}
+		sj, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(ctx, jr,
+			jobID, p.ExtendedEvalContext().Txn)
+		if err != nil {
 			return err
 		}
-
-		if err := sj.Start(ctx); err != nil {
-			return err
-		}
-		return sj.AwaitCompletion(ctx)
+		resultsCh <- tree.Datums{tree.NewDInt(tree.DInt(sj.ID()))}
+		return nil
 	}
 
-	return fn, utilccl.BulkJobExecutionResultHeader, nil, false, nil
+	return fn, utilccl.DetachedJobExecutionResultHeader, nil, false, nil
 }
 
 func init() {

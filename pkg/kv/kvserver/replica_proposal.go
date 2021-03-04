@@ -396,13 +396,7 @@ func (r *Replica) leasePostApplyLocked(
 		// progress, as only the old leaseholder would have been explicitly notified
 		// of the merge. If there is a merge in progress, maybeWatchForMerge will
 		// arrange to block all traffic to this replica unless the merge aborts.
-		// NB: If the subsumed range changes leaseholders after subsumption,
-		// `freezeStart` will be zero and we will effectively be blocking all read
-		// requests.
-		// TODO(aayush): In the future, if we permit co-operative lease transfers
-		// when a range is subsumed, it should be relatively straightforward to
-		// allow historical reads on the subsumed RHS after such lease transfers.
-		if err := r.maybeWatchForMergeLocked(ctx, hlc.Timestamp{} /* freezeStart */); err != nil {
+		if _, err := r.maybeWatchForMergeLocked(ctx); err != nil {
 			// We were unable to determine whether a merge was in progress. We cannot
 			// safely proceed.
 			log.Fatalf(ctx, "failed checking for in-progress merge while installing new lease %s: %s",
@@ -448,7 +442,7 @@ func (r *Replica) leasePostApplyLocked(
 
 	// Inform the propBuf about the new lease so that it can initialize its closed
 	// timestamp tracking.
-	r.mu.proposalBuf.OnLeaseChangeLocked(iAmTheLeaseHolder, r.mu.state.ClosedTimestamp)
+	r.mu.proposalBuf.OnLeaseChangeLocked(iAmTheLeaseHolder, r.mu.state.RaftClosedTimestamp)
 
 	// Ordering is critical here. We only install the new lease after we've
 	// checked for an in-progress merge and updated the timestamp cache. If the
@@ -524,6 +518,13 @@ func (r *Replica) leasePostApplyLocked(
 			// This logging is useful to troubleshoot incomplete drains.
 			log.Info(ctx, "is now leaseholder")
 		}
+	}
+
+	// Inform the store of this lease.
+	if iAmTheLeaseHolder {
+		r.store.registerLeaseholder(ctx, r, newLease.Sequence)
+	} else {
+		r.store.unregisterLeaseholder(ctx, r)
 	}
 
 	// Mark the new lease in the replica's lease history.
@@ -628,9 +629,6 @@ func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult re
 	}
 	if lResult.EndTxns != nil {
 		log.Fatalf(ctx, "LocalEvalResult.EndTxns should be nil: %+v", lResult.EndTxns)
-	}
-	if !lResult.FreezeStart.IsEmpty() {
-		log.Fatalf(ctx, "LocalEvalResult.FreezeStart should have been handled and reset: %s", lResult.FreezeStart)
 	}
 
 	if lResult.AcquiredLocks != nil {

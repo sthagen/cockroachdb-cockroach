@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -89,7 +88,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	const numNodes = 3
+	const numNodes = 5
 	args := base.TestClusterArgs{
 		ReplicationMode:   base.ReplicationManual,
 		ServerArgsPerNode: make(map[int]base.TestServerArgs, numNodes),
@@ -117,6 +116,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	startKey := []byte("a")
 	tc.SplitRangeOrFatal(t, startKey)
 	tc.AddVotersOrFatal(t, startKey, tc.Target(1), tc.Target(2))
+	tc.AddNonVotersOrFatal(t, startKey, tc.Target(3), tc.Target(4))
 	if pErr := tc.WaitForVoters(startKey, tc.Target(1), tc.Target(2)); pErr != nil {
 		t.Fatalf("Unexpected error waiting for replication: %v", pErr)
 	}
@@ -129,13 +129,12 @@ func TestReplicaRangefeed(t *testing.T) {
 	if _, pErr := kv.SendWrappedWith(ctx, db, roachpb.Header{Timestamp: ts1}, incArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
-	tc.WaitForValues(t, roachpb.Key("b"), []int64{9, 9, 9})
+	tc.WaitForValues(t, roachpb.Key("b"), []int64{9, 9, 9, 9, 9})
 
-	replNum := 3
-	streams := make([]*testStream, replNum)
-	streamErrC := make(chan *roachpb.Error, replNum)
+	streams := make([]*testStream, numNodes)
+	streamErrC := make(chan *roachpb.Error, numNodes)
 	rangefeedSpan := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")}
-	for i := 0; i < replNum; i++ {
+	for i := 0; i < numNodes; i++ {
 		stream := newTestStream()
 		streams[i] = stream
 		ts := tc.Servers[i]
@@ -309,7 +308,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		for i := 0; i < replNum; i++ {
+		for i := 0; i < numNodes; i++ {
 			ts := tc.Servers[i]
 			store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
 			if pErr != nil {
@@ -369,7 +368,6 @@ func TestReplicaRangefeedExpiringLeaseError(t *testing.T) {
 func TestReplicaRangefeedRetryErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.UnderRaceWithIssue(t, 61120)
 
 	ctx := context.Background()
 	startKey := []byte("a")
@@ -775,7 +773,6 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 func TestReplicaRangefeedPushesTransactions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.UnderRaceWithIssue(t, 61120)
 
 	ctx := context.Background()
 	tc, db, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
@@ -890,7 +887,6 @@ func TestReplicaRangefeedPushesTransactions(t *testing.T) {
 func TestReplicaRangefeedNudgeSlowClosedTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.UnderRaceWithIssue(t, 61120)
 
 	ctx := context.Background()
 	tc, db, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,

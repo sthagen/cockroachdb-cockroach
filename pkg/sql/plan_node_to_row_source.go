@@ -30,8 +30,7 @@ type planNodeToRowSource struct {
 	execinfra.ProcessorBase
 	execinfra.StreamingProcessor
 
-	input   execinfra.RowSource
-	started bool
+	input execinfra.RowSource
 
 	fastPath bool
 
@@ -116,23 +115,12 @@ func (p *planNodeToRowSource) SetInput(ctx context.Context, input execinfra.RowS
 }
 
 func (p *planNodeToRowSource) Start(ctx context.Context) {
-	// We do not call p.StartInternal to avoid creating a span. Only the context
-	// needs to be set.
-	p.Ctx = ctx
+	ctx = p.StartInternalNoSpan(ctx)
 	p.params.ctx = ctx
-	if !p.started {
-		p.started = true
-		// This starts all of the nodes below this node.
-		if err := startExec(p.params, p.node); err != nil {
-			p.MoveToDraining(err)
-			return
-		}
+	// This starts all of the nodes below this node.
+	if err := startExec(p.params, p.node); err != nil {
+		p.MoveToDraining(err)
 	}
-}
-
-func (p *planNodeToRowSource) InternalClose() bool {
-	p.started = true
-	return p.ProcessorBase.InternalClose()
 }
 
 func (p *planNodeToRowSource) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
@@ -193,11 +181,6 @@ func (p *planNodeToRowSource) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerM
 		}
 	}
 	return nil, p.DrainHelper()
-}
-
-func (p *planNodeToRowSource) ConsumerClosed() {
-	// The consumer is done, Next() will not be called again.
-	p.InternalClose()
 }
 
 // forwardMetadata will be called by any upstream rowSourceToPlanNode processors

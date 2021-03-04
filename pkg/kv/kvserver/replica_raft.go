@@ -135,13 +135,6 @@ func (r *Replica) evalAndPropose(
 		// Fork the proposal's context span so that the proposal's context
 		// can outlive the original proposer's context.
 		proposal.ctx, proposal.sp = tracing.ForkSpan(ctx, "async consensus")
-		{
-			// This span sometimes leaks. Disable it for the time being.
-			//
-			// Tracked in: https://github.com/cockroachdb/cockroach/issues/60677
-			proposal.sp.Finish()
-			proposal.sp = nil
-		}
 
 		// Signal the proposal's response channel immediately.
 		reply := *proposal.Local.Reply
@@ -507,6 +500,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		unquiesceAndWakeLeader := hasReady || numFlushed > 0 || len(r.mu.proposals) > 0
 		return unquiesceAndWakeLeader, nil
 	})
+	r.mu.applyingEntries = len(rd.CommittedEntries) > 0
 	r.mu.Unlock()
 	if errors.Is(err, errRemoved) {
 		// If we've been removed then just return.
@@ -864,6 +858,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		}
 		return true, nil
 	})
+	r.mu.applyingEntries = false
 	r.mu.Unlock()
 	if err != nil {
 		return stats, expl, errors.Wrap(err, expl)

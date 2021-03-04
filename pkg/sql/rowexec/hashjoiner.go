@@ -122,7 +122,7 @@ func newHashJoiner(
 		output,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{h.leftSource, h.rightSource},
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				h.close()
 				return nil
 			},
@@ -158,9 +158,9 @@ func newHashJoiner(
 
 // Start is part of the RowSource interface.
 func (h *hashJoiner) Start(ctx context.Context) {
+	ctx = h.StartInternal(ctx, hashJoinerProcName)
 	h.leftSource.Start(ctx)
 	h.rightSource.Start(ctx)
-	ctx = h.StartInternal(ctx, hashJoinerProcName)
 	h.cancelChecker = cancelchecker.NewCancelChecker(ctx)
 	h.runningState = hjBuilding
 }

@@ -1096,6 +1096,67 @@ func TestStoreRangeMergeTxnFailure(t *testing.T) {
 	}
 }
 
+// TestStoreRangeMergeTxnRefresh verifies that in cases where the range merge
+// transaction's timestamp is bumped, it is able to refresh even after it has
+// entered the critical phase of the merge and subsumed the RHS.
+func TestStoreRangeMergeTxnRefresh(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	var sawMergeRefresh int32
+	testingResponseFilter := func(
+		ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse,
+	) *roachpb.Error {
+		switch v := ba.Requests[0].GetInner().(type) {
+		case *roachpb.ConditionalPutRequest:
+			// Detect the range merge's deletion of the local range descriptor
+			// and use it as an opportunity to bump the merge transaction's
+			// write timestamp. This will necessitate a refresh.
+			//
+			// Also mark as synthetic, while we're here, to simulate the
+			// behavior of a range merge across two ranges with the
+			// LEAD_FOR_GLOBAL_READS closed timestamp policy.
+			if !v.Value.IsPresent() && bytes.HasSuffix(v.Key, keys.LocalRangeDescriptorSuffix) {
+				br.Txn.WriteTimestamp = br.Txn.WriteTimestamp.
+					Add(100*time.Millisecond.Nanoseconds(), 0).
+					WithSynthetic(true)
+			}
+		case *roachpb.RefreshRequest:
+			if bytes.HasSuffix(v.Key, keys.LocalRangeDescriptorSuffix) {
+				atomic.AddInt32(&sawMergeRefresh, 1)
+			}
+		}
+		return nil
+	}
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 1,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						TestingResponseFilter: testingResponseFilter,
+					},
+				},
+			},
+		})
+	defer tc.Stopper().Stop(ctx)
+	store := tc.GetFirstStoreFromServer(t, 0)
+
+	// Create the ranges to be merged.
+	lhsDesc, _, err := tc.Servers[0].ScratchRangeEx()
+	require.NoError(t, err)
+
+	// Launch the merge.
+	args := adminMergeArgs(lhsDesc.StartKey.AsRawKey())
+	_, pErr := kv.SendWrapped(ctx, store.TestSender(), args)
+	require.Nil(t, pErr)
+
+	// Verify that the range merge refreshed.
+	require.Greater(t, atomic.LoadInt32(&sawMergeRefresh), int32(1))
+}
+
 // TestStoreRangeSplitMergeGeneration verifies that splits and merges both
 // update the range descriptor generations of the involved ranges according to
 // the comment on the RangeDescriptor.Generation field.
@@ -1854,6 +1915,91 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 	}
 }
 
+// TestStoreRangeMergeRHSLeaseTransfers verifies that in cases where a lease
+// transfer is triggered while a range merge is in progress, it is rejected
+// immediately and does not prevent the merge itself from completing by creating
+// a deadlock.
+func TestStoreRangeMergeRHSLeaseTransfers(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Install a hook to control when the merge transaction subsumes the RHS.
+	// Put this in a sync.Once to ignore retries.
+	var once sync.Once
+	subsumeReceived := make(chan struct{})
+	finishSubsume := make(chan struct{})
+	testingRequestFilter := func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+		if ba.IsSingleSubsumeRequest() {
+			once.Do(func() {
+				subsumeReceived <- struct{}{}
+				<-finishSubsume
+			})
+		}
+		return nil
+	}
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 2,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						TestingRequestFilter:                    testingRequestFilter,
+						AllowLeaseRequestProposalsWhenNotLeader: true,
+					},
+				},
+			},
+		})
+	defer tc.Stopper().Stop(ctx)
+	store := tc.GetFirstStoreFromServer(t, 0)
+
+	// Create the ranges to be merged. Put both ranges on both stores, but give
+	// the second store the lease on the RHS. The LHS is largely irrelevant. What
+	// matters is that the RHS exists on two stores so we can transfer its lease
+	// during the merge.
+	lhsDesc, rhsDesc, err := tc.Servers[0].ScratchRangeWithExpirationLeaseEx()
+	require.NoError(t, err)
+
+	tc.AddVotersOrFatal(t, lhsDesc.StartKey.AsRawKey(), tc.Target(1))
+	tc.AddVotersOrFatal(t, rhsDesc.StartKey.AsRawKey(), tc.Target(1))
+	tc.TransferRangeLeaseOrFatal(t, rhsDesc, tc.Target(1))
+
+	// Launch the merge.
+	mergeErr := make(chan error)
+	_ = tc.Stopper().RunAsyncTask(ctx, "merge", func(context.Context) {
+		args := adminMergeArgs(lhsDesc.StartKey.AsRawKey())
+		_, pErr := kv.SendWrapped(ctx, store.TestSender(), args)
+		mergeErr <- pErr.GoError()
+	})
+
+	// Wait for the merge transaction to send its Subsume request. It won't
+	// be able to complete just yet, thanks to the hook we installed above.
+	<-subsumeReceived
+
+	// Transfer the lease to store 0. Even though the Subsume request has not
+	// yet evaluated, the new leaseholder will notice the deletion intent on its
+	// local range descriptor (see maybeWatchForMergeLocked) and will begin
+	// blocking most operations.
+	tc.TransferRangeLeaseOrFatal(t, rhsDesc, tc.Target(0))
+
+	// Attempt to transfer the lease back to store 1. This will cause the
+	// current leaseholder to revoke its lease (see minLeaseProposedTS), which
+	// will cause the Subsume request to need to acquire a new range lease.
+	//
+	// In the past, this lease transfer would get blocked on the mergeComplete
+	// channel. While in this state, it would block the lease acquisition
+	// triggerred by the Subsume request because a replica only performs a
+	// single lease operation at a time. As a result, this would deadlock and
+	// neither the lease transfer nor the merge would ever complete.
+	err = tc.TransferRangeLease(rhsDesc, tc.Target(1))
+	require.Regexp(t, "cannot transfer lease while merge in progress", err)
+
+	// Finally, allow the merge to complete. It should complete successfully.
+	close(finishSubsume)
+	require.NoError(t, <-mergeErr)
+}
+
 // TestStoreRangeMergeCheckConsistencyAfterSubsumption verifies the following:
 // 1. While a range is subsumed, ComputeChecksum requests wait until the merge
 // is complete before proceeding.
@@ -1957,8 +2103,8 @@ func TestStoreRangeMergeConcurrentRequests(t *testing.T) {
 	testingResponseFilter := func(
 		ctx context.Context, ba roachpb.BatchRequest, _ *roachpb.BatchResponse,
 	) *roachpb.Error {
-		del := ba.Requests[0].GetDelete()
-		if del != nil && bytes.HasSuffix(del.Key, keys.LocalRangeDescriptorSuffix) && rand.Int()%4 == 0 {
+		cput := ba.Requests[0].GetConditionalPut()
+		if cput != nil && !cput.Value.IsPresent() && bytes.HasSuffix(cput.Key, keys.LocalRangeDescriptorSuffix) && rand.Int()%4 == 0 {
 			// After every few deletions of the local range descriptor, expire all
 			// range leases. This makes the following sequence of events quite likely:
 			//
@@ -4350,92 +4496,103 @@ func sendWithTxn(
 	return pErr.GoError()
 }
 
-// TestHistoricalReadsAfterSubsume tests that a subsumed right hand side range
-// can only serve read-only traffic for timestamps that precede the subsumption
-// time, but don't contain the subsumption time in their uncertainty interval.
-func TestHistoricalReadsAfterSubsume(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
+// TODO(nvanbenschoten): fix this test. In b192bba, we allowed historical reads
+// up to the freeze start time on subsumed ranges. This turned out not to be
+// quite the right idea, because we can now ship the timestamp cache to the LHS
+// and be more optimal about the resulting timestamp cache on the joint range.
+// However, since we started allowing reads up to the freeze time, we were
+// effectively closing this time for all future writes on the joint range, so we
+// couldn't take advantage of the new ability to ship the timestamp cache
+// around. But the change was very well intentioned and revealed that we should
+// have no problem allowing reads below the closed timestamp on subsumed ranges.
+// Add support for this and update this test.
+//
+// // TestHistoricalReadsAfterSubsume tests that a subsumed right hand side range
+// // can only serve read-only traffic for timestamps that precede the subsumption
+// // time, but don't contain the subsumption time in their uncertainty interval.
+// func TestHistoricalReadsAfterSubsume(t *testing.T) {
+// 	defer leaktest.AfterTest(t)()
+// 	defer log.Scope(t).Close(t)
+// 	ctx := context.Background()
 
-	maxOffset := 100 * time.Millisecond
-	preUncertaintyTs := func(ts hlc.Timestamp) hlc.Timestamp {
-		return hlc.Timestamp{
-			WallTime: ts.GoTime().Add(-maxOffset).UnixNano() - 1,
-			Logical:  ts.Logical,
-		}
-	}
+// 	maxOffset := 100 * time.Millisecond
+// 	preUncertaintyTs := func(ts hlc.Timestamp) hlc.Timestamp {
+// 		return hlc.Timestamp{
+// 			WallTime: ts.GoTime().Add(-maxOffset).UnixNano() - 1,
+// 			Logical:  ts.Logical,
+// 		}
+// 	}
 
-	type testCase struct {
-		name          string
-		queryTsFunc   func(freezeStart hlc.Timestamp) hlc.Timestamp
-		queryArgsFunc func(key roachpb.Key) roachpb.Request
-		shouldBlock   bool
-	}
+// 	type testCase struct {
+// 		name          string
+// 		queryTsFunc   func(freezeStart hlc.Timestamp) hlc.Timestamp
+// 		queryArgsFunc func(key roachpb.Key) roachpb.Request
+// 		shouldBlock   bool
+// 	}
 
-	tests := []testCase{
-		// Ensure that a read query for a timestamp older than freezeStart-MaxOffset
-		// is let through.
-		{
-			name:        "historical read",
-			queryTsFunc: preUncertaintyTs,
-			queryArgsFunc: func(key roachpb.Key) roachpb.Request {
-				return getArgs(key)
-			},
-			shouldBlock: false,
-		},
-		// Write queries for the same historical timestamp should block (and then
-		// eventually fail because the range no longer exists).
-		{
-			name:        "historical write",
-			queryTsFunc: preUncertaintyTs,
-			queryArgsFunc: func(key roachpb.Key) roachpb.Request {
-				return putArgs(key, []byte(`test value`))
-			},
-			shouldBlock: true,
-		},
-		// Read queries that contain the subsumption time in its uncertainty interval
-		// should block and eventually fail.
-		{
-			name: "historical read with uncertainty",
-			queryTsFunc: func(freezeStart hlc.Timestamp) hlc.Timestamp {
-				return freezeStart.Prev()
-			},
-			queryArgsFunc: func(key roachpb.Key) roachpb.Request {
-				return getArgs(key)
-			},
-			shouldBlock: true,
-		},
-	}
+// 	tests := []testCase{
+// 		// Ensure that a read query for a timestamp older than freezeStart-MaxOffset
+// 		// is let through.
+// 		{
+// 			name:        "historical read",
+// 			queryTsFunc: preUncertaintyTs,
+// 			queryArgsFunc: func(key roachpb.Key) roachpb.Request {
+// 				return getArgs(key)
+// 			},
+// 			shouldBlock: false,
+// 		},
+// 		// Write queries for the same historical timestamp should block (and then
+// 		// eventually fail because the range no longer exists).
+// 		{
+// 			name:        "historical write",
+// 			queryTsFunc: preUncertaintyTs,
+// 			queryArgsFunc: func(key roachpb.Key) roachpb.Request {
+// 				return putArgs(key, []byte(`test value`))
+// 			},
+// 			shouldBlock: true,
+// 		},
+// 		// Read queries that contain the subsumption time in its uncertainty interval
+// 		// should block and eventually fail.
+// 		{
+// 			name: "historical read with uncertainty",
+// 			queryTsFunc: func(freezeStart hlc.Timestamp) hlc.Timestamp {
+// 				return freezeStart.Prev()
+// 			},
+// 			queryArgsFunc: func(key roachpb.Key) roachpb.Request {
+// 				return getArgs(key)
+// 			},
+// 			shouldBlock: true,
+// 		},
+// 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			tc, store, rhsDesc, freezeStart, waitForBlocked, cleanupFunc :=
-				setupClusterWithSubsumedRange(ctx, t, 1 /* numNodes */, maxOffset)
-			defer tc.Stopper().Stop(ctx)
-			errCh := make(chan error)
-			go func() {
-				errCh <- sendWithTxn(store, rhsDesc, test.queryTsFunc(freezeStart), maxOffset,
-					test.queryArgsFunc(rhsDesc.StartKey.AsRawKey()))
-			}()
-			if test.shouldBlock {
-				waitForBlocked()
-				cleanupFunc()
-				// RHS should cease to exist once the merge completes but we cannot
-				// guarantee that the merge wasn't internally retried before it was able
-				// to successfully commit. If it did, requests blocked on the previous
-				// merge attempt might go through successfully. Thus, we cannot make any
-				// assertions about the result of these blocked requests.
-				<-errCh
-			} else {
-				require.NoError(t, <-errCh)
-				// We cleanup *after* the non-blocking read request succeeds to prevent
-				// it from racing with the merge commit trigger.
-				cleanupFunc()
-			}
-		})
-	}
-}
+// 	for _, test := range tests {
+// 		t.Run(test.name, func(t *testing.T) {
+// 			tc, store, rhsDesc, freezeStart, waitForBlocked, cleanupFunc :=
+// 				setupClusterWithSubsumedRange(ctx, t, 1 /* numNodes */, maxOffset)
+// 			defer tc.Stopper().Stop(ctx)
+// 			errCh := make(chan error)
+// 			go func() {
+// 				errCh <- sendWithTxn(store, rhsDesc, test.queryTsFunc(freezeStart), maxOffset,
+// 					test.queryArgsFunc(rhsDesc.StartKey.AsRawKey()))
+// 			}()
+// 			if test.shouldBlock {
+// 				waitForBlocked()
+// 				cleanupFunc()
+// 				// RHS should cease to exist once the merge completes but we cannot
+// 				// guarantee that the merge wasn't internally retried before it was able
+// 				// to successfully commit. If it did, requests blocked on the previous
+// 				// merge attempt might go through successfully. Thus, we cannot make any
+// 				// assertions about the result of these blocked requests.
+// 				<-errCh
+// 			} else {
+// 				require.NoError(t, <-errCh)
+// 				// We cleanup *after* the non-blocking read request succeeds to prevent
+// 				// it from racing with the merge commit trigger.
+// 				cleanupFunc()
+// 			}
+// 		})
+// 	}
+// }
 
 // TestStoreBlockTransferLeaseRequestAfterSubsumption tests that a
 // TransferLeaseRequest checks & waits for an ongoing merge before it can be

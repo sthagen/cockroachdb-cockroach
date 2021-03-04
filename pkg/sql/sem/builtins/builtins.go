@@ -2184,8 +2184,9 @@ var builtins = map[string]builtinDefinition{
 			},
 			Info: "Calculates the interval between `val` and the current time, normalized into years, months and days." + `
 
-			Note this may not be an accurate time span since years and months are normalized from days, and years and months are out of context.
-			To avoid normalizing days into months and years, use ` + "`now() - timestamptz`" + `.`,
+Note this may not be an accurate time span since years and months are normalized
+from days, and years and months are out of context. To avoid normalizing days into
+months and years, use ` + "`now() - timestamptz`" + `.`,
 			Volatility: tree.VolatilityStable,
 		},
 		tree.Overload{
@@ -2201,8 +2202,9 @@ var builtins = map[string]builtinDefinition{
 			},
 			Info: "Calculates the interval between `begin` and `end`, normalized into years, months and days." + `
 
-			Note this may not be an accurate time span since years and months are normalized from days, and years and months are out of context.
-			To avoid normalizing days into months and years, use the timestamptz subtraction operator.`,
+Note this may not be an accurate time span since years and months are normalized
+from days, and years and months are out of context. To avoid normalizing days into
+months and years, use the timestamptz subtraction operator.`,
 			Volatility: tree.VolatilityImmutable,
 		},
 	),
@@ -4842,6 +4844,9 @@ may increase either contention or retry errors, or both.`,
 				jobID := int(*args[0].(*tree.DInt))
 				cutoverTime := args[1].(*tree.DTimestampTZ).Time
 				cutoverTimestamp := hlc.Timestamp{WallTime: cutoverTime.UnixNano()}
+				if streaming.CompleteIngestionHook == nil {
+					return nil, errors.New("completing a stream ingestion job requires a CCL binary")
+				}
 				err := streaming.CompleteIngestionHook(evalCtx, evalCtx.Txn, jobID, cutoverTimestamp)
 				return tree.NewDInt(tree.DInt(jobID)), err
 			},

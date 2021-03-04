@@ -1310,6 +1310,7 @@ distribution: local
 vectorized: true
 ·
 • group (scalar)
+│ estimated row count: 1
 │
 └── • values
       size: 2 columns, 2 rows
@@ -1555,3 +1556,14 @@ vectorized: true
   estimated row count: 1 (<0.01% of the table)
   table: percent@primary
   spans: [/1 - /1]
+
+# Regression test for #61248: insert fast path with no rows.
+query T
+EXPLAIN INSERT INTO t2 SELECT x FROM t2 WHERE false
+----
+distribution: local
+vectorized: true
+·
+• insert fast path
+  into: t2(x)
+  auto commit

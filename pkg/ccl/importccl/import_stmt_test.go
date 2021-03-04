@@ -31,6 +31,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -1214,6 +1217,7 @@ func TestImportUserDefinedTypes(t *testing.T) {
 		intoCols    string
 		verifyQuery string
 		expected    [][]string
+		errString   string
 	}{
 		// Test CSV imports.
 		{
@@ -1251,6 +1255,14 @@ func TestImportUserDefinedTypes(t *testing.T) {
 			verifyQuery: "SELECT * FROM t ORDER BY a",
 			expected:    [][]string{{"hello", "hello"}, {"hi", "hi"}},
 		},
+		// Test table with default value
+		{
+			create:    "a greeting, b greeting default 'hi'",
+			intoCols:  "a, b",
+			typ:       "PGCOPY",
+			contents:  "hello\nhi\thi\n",
+			errString: "type OID 100052 does not exist",
+		},
 	}
 
 	// Test IMPORT INTO.
@@ -1263,11 +1275,18 @@ func TestImportUserDefinedTypes(t *testing.T) {
 		require.Equal(t, len(test.contents), n)
 		// Run the import statement.
 		sqlDB.Exec(t, fmt.Sprintf("CREATE TABLE t (%s)", test.create))
-		sqlDB.Exec(t,
-			fmt.Sprintf("IMPORT INTO t (%s) %s DATA ($1)", test.intoCols, test.typ),
-			fmt.Sprintf("nodelocal://0/%s", filepath.Base(f.Name())))
-		// Ensure that the table data is as we expect.
-		sqlDB.CheckQueryResults(t, test.verifyQuery, test.expected)
+
+		importStmt := fmt.Sprintf("IMPORT INTO t (%s) %s DATA ($1)", test.intoCols, test.typ)
+		importArgs := fmt.Sprintf("nodelocal://0/%s", filepath.Base(f.Name()))
+
+		if test.errString == "" {
+			sqlDB.Exec(t, importStmt, importArgs)
+			// Ensure that the table data is as we expect.
+			sqlDB.CheckQueryResults(t, test.verifyQuery, test.expected)
+		} else {
+			sqlDB.ExpectErr(t, test.errString, importStmt, importArgs)
+		}
+
 		// Clean up after the test.
 		sqlDB.Exec(t, "DROP TABLE t")
 	}
@@ -3968,7 +3987,7 @@ func TestImportDefault(t *testing.T) {
 
 		}
 	})
-	t.Run("random-related", func(t *testing.T) {
+	t.Run("random-functions", func(t *testing.T) {
 		testCases := []struct {
 			name       string
 			create     string
@@ -3978,19 +3997,19 @@ func TestImportDefault(t *testing.T) {
 		}{
 			{
 				name:       "random-multiple",
-				create:     "a INT, b FLOAT DEFAULT random(), c STRING, d FLOAT DEFAULT random()",
+				create:     "a INT, b FLOAT PRIMARY KEY DEFAULT random(), c STRING, d FLOAT DEFAULT random()",
 				targetCols: []string{"a", "c"},
 				randomCols: []string{selectNotNull("b"), selectNotNull("d")},
 			},
 			{
 				name:       "gen_random_uuid",
-				create:     "a INT, b STRING, c UUID DEFAULT gen_random_uuid()",
+				create:     "a INT, b STRING, c UUID PRIMARY KEY DEFAULT gen_random_uuid(), d UUID DEFAULT gen_random_uuid()",
 				targetCols: []string{"a", "b"},
-				randomCols: []string{selectNotNull("c")},
+				randomCols: []string{selectNotNull("c"), selectNotNull("d")},
 			},
 			{
 				name:       "mixed_random_uuid",
-				create:     "a INT, b STRING, c UUID DEFAULT gen_random_uuid(), d FLOAT DEFAULT random()",
+				create:     "a INT, b STRING, c UUID PRIMARY KEY DEFAULT gen_random_uuid(), d FLOAT DEFAULT random()",
 				targetCols: []string{"a", "b"},
 				randomCols: []string{selectNotNull("c")},
 			},
@@ -4031,6 +4050,50 @@ func TestImportDefault(t *testing.T) {
 			})
 		}
 	})
+}
+
+// This is a regression test for #61203. We test that the random() keys are
+// unique on a larger data set. This would previously fail with a primary key
+// collision error since we would generate duplicate UUIDs.
+//
+// Note: that although there is no guarantee that UUIDs do not collide, the
+// probability of such a collision is vanishingly low.
+func TestUniqueUUID(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This test is slow under race since it explicitly tried to import a large
+	// amount of data.
+	skip.UnderRace(t, "slow under race")
+
+	const (
+		nodes     = 3
+		dataDir   = "userfile://defaultdb.my_files/export"
+		dataFiles = dataDir + "/*"
+	)
+	ctx := context.Background()
+	args := base.TestServerArgs{}
+	tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: args})
+	defer tc.Stopper().Stop(ctx)
+	connDB := tc.Conns[0]
+	sqlDB := sqlutils.MakeSQLRunner(connDB)
+
+	dataSize := parallelImporterReaderBatchSize * 100
+
+	sqlDB.Exec(t, fmt.Sprintf(`CREATE TABLE data AS SELECT * FROM generate_series(1, %d);`, dataSize))
+	sqlDB.Exec(t, `EXPORT INTO CSV $1 FROM TABLE data;`, dataDir)
+
+	// Ensure that UUIDs do not collide when importing 20000 rows.
+	sqlDB.Exec(t, `CREATE TABLE r1 (a UUID PRIMARY KEY DEFAULT gen_random_uuid(), b INT);`)
+	sqlDB.Exec(t, `IMPORT INTO r1 (b) CSV DATA ($1);`, dataFiles)
+
+	// Ensure that UUIDs do not collide when importing into a table with several UUID calls.
+	sqlDB.Exec(t, `CREATE TABLE r2 (a UUID PRIMARY KEY DEFAULT gen_random_uuid(), b INT, c UUID DEFAULT gen_random_uuid());`)
+	sqlDB.Exec(t, `IMPORT INTO r2 (b) CSV DATA ($1);`, dataFiles)
+
+	// Ensure that random keys do not collide.
+	sqlDB.Exec(t, `CREATE TABLE r3 (a FLOAT PRIMARY KEY DEFAULT random(), b INT);`)
+	sqlDB.Exec(t, `IMPORT INTO r3 (b) CSV DATA ($1);`, dataFiles)
 }
 
 func TestImportDefaultNextVal(t *testing.T) {
@@ -6409,6 +6472,117 @@ func TestImportAvro(t *testing.T) {
 		sqlDB.QueryRow(t, `SELECT count(*) FROM myschema.simple`).Scan(&numRows)
 		require.True(t, numRows > 0)
 	})
+}
+
+func TestImportMultiRegion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	baseDir := filepath.Join("testdata", "avro")
+	_, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
+		t, 1 /* numServers */, base.TestingKnobs{}, &baseDir,
+	)
+	defer cleanup()
+
+	_, err := sqlDB.Exec(`SET CLUSTER SETTING kv.bulk_ingest.batch_size = '10KB'`)
+	require.NoError(t, err)
+
+	// Create the databases
+	_, err = sqlDB.Exec(`CREATE DATABASE foo`)
+	require.NoError(t, err)
+
+	_, err = sqlDB.Exec(`CREATE DATABASE multi_region PRIMARY REGION "us-east1"`)
+	require.NoError(t, err)
+
+	simpleOcf := fmt.Sprintf("nodelocal://0/%s", "simple.ocf")
+
+	// Table schemas for USING
+	tableSchemaMR := fmt.Sprintf("nodelocal://0/%s", "simple-schema-multi-region.sql")
+	tableSchemaMRRegionalByRow := fmt.Sprintf("nodelocal://0/%s",
+		"simple-schema-multi-region-regional-by-row.sql")
+
+	tests := []struct {
+		name      string
+		db        string
+		table     string
+		sql       string
+		create    string
+		args      []interface{}
+		errString string
+	}{
+		{
+			name:      "import-create-using-multi-region-to-non-multi-region-database",
+			db:        "foo",
+			table:     "simple",
+			sql:       "IMPORT TABLE simple CREATE USING $1 AVRO DATA ($2)",
+			args:      []interface{}{tableSchemaMR, simpleOcf},
+			errString: "cannot write descriptor for multi-region table",
+		},
+		{
+			name:  "import-create-using-multi-region-regional-by-table-to-multi-region-database",
+			db:    "multi_region",
+			table: "simple",
+			sql:   "IMPORT TABLE simple CREATE USING $1 AVRO DATA ($2)",
+			args:  []interface{}{tableSchemaMR, simpleOcf},
+		},
+		{
+			name:      "import-create-using-multi-region-regional-by-row-to-multi-region-database",
+			db:        "multi_region",
+			table:     "simple",
+			sql:       "IMPORT TABLE simple CREATE USING $1 AVRO DATA ($2)",
+			args:      []interface{}{tableSchemaMRRegionalByRow, simpleOcf},
+			errString: "IMPORT to REGIONAL BY ROW table not supported",
+		},
+		{
+			name:      "import-into-multi-region-regional-by-row-to-multi-region-database",
+			db:        "multi_region",
+			table:     "mr_regional_by_row",
+			create:    "CREATE TABLE mr_regional_by_row (i INT8 PRIMARY KEY, s text, b bytea) LOCALITY REGIONAL BY ROW",
+			sql:       "IMPORT INTO mr_regional_by_row AVRO DATA ($1)",
+			args:      []interface{}{simpleOcf},
+			errString: "IMPORT into REGIONAL BY ROW table not supported",
+		},
+		{
+			name:   "import-into-using-multi-region-global-to-multi-region-database",
+			db:     "multi_region",
+			table:  "mr_global",
+			create: "CREATE TABLE mr_global (i INT8 PRIMARY KEY, s text, b bytea) LOCALITY GLOBAL",
+			sql:    "IMPORT INTO mr_global AVRO DATA ($1)",
+			args:   []interface{}{simpleOcf},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err = sqlDB.Exec(fmt.Sprintf(`SET DATABASE = %q`, test.db))
+			require.NoError(t, err)
+
+			_, err = sqlDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %q CASCADE", test.table))
+			require.NoError(t, err)
+
+			if test.create != "" {
+				_, err = sqlDB.Exec(test.create)
+				require.NoError(t, err)
+			}
+
+			_, err = sqlDB.ExecContext(context.Background(), test.sql, test.args...)
+			if test.errString != "" {
+				testutils.IsError(err, test.errString)
+			} else {
+				require.NoError(t, err)
+				res := sqlDB.QueryRow(fmt.Sprintf("SELECT count(*) FROM %q", test.table))
+				require.NoError(t, res.Err())
+
+				var numRows int
+				err = res.Scan(&numRows)
+				require.NoError(t, err)
+
+				if numRows == 0 {
+					t.Error("expected some rows after import")
+				}
+			}
+		})
+	}
 }
 
 // TestImportClientDisconnect ensures that an import job can complete even if

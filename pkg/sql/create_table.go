@@ -406,6 +406,10 @@ func (n *createTableNode) startExec(params runParams) error {
 		return err
 	}
 
+	if err := validateDescriptor(params.ctx, params.p, desc); err != nil {
+		return err
+	}
+
 	if desc.LocalityConfig != nil {
 		_, dbDesc, err := params.p.Descriptors().GetImmutableDatabaseByID(
 			params.ctx,
@@ -444,11 +448,6 @@ func (n *createTableNode) startExec(params runParams) error {
 				return errors.Wrap(err, "error adding backreference to multi-region enum")
 			}
 		}
-	}
-
-	dg := catalogkv.NewOneLevelUncachedDescGetter(params.p.txn, params.ExecCfg().Codec)
-	if err := desc.Validate(params.ctx, dg); err != nil {
-		return err
 	}
 
 	// Log Create Table event. This is an auditable log event and is
@@ -793,7 +792,7 @@ func ResolveUniqueWithoutIndexConstraint(
 	}
 
 	// Verify we are not writing a constraint over the same name.
-	constraintInfo, err := tbl.GetConstraintInfo(ctx, nil)
+	constraintInfo, err := tbl.GetConstraintInfo()
 	if err != nil {
 		return err
 	}
@@ -992,7 +991,7 @@ func ResolveFK(
 	// or else we can hit other checks that break things with
 	// undesired error codes, e.g. #42858.
 	// It may be removable after #37255 is complete.
-	constraintInfo, err := tbl.GetConstraintInfo(ctx, nil)
+	constraintInfo, err := tbl.GetConstraintInfo()
 	if err != nil {
 		return err
 	}
@@ -1542,9 +1541,11 @@ func NewTableDesc(
 
 	// Add implied columns under REGIONAL BY ROW.
 	locality := n.Locality
+	isRegionalByRow := locality != nil && locality.LocalityLevel == tree.LocalityLevelRow
+
 	var partitionAllBy *tree.PartitionBy
 	primaryIndexColumnSet := make(map[string]struct{})
-	if locality != nil && locality.LocalityLevel == tree.LocalityLevelRow {
+	if isRegionalByRow {
 		// Check the table is multi-region enabled.
 		dbDesc, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, evalCtx.Codec, parentID)
 		if err != nil {
@@ -1719,6 +1720,9 @@ func NewTableDesc(
 				if !sessionData.HashShardedIndexesEnabled {
 					return nil, hashShardedIndexesDisabledError
 				}
+				if isRegionalByRow {
+					return nil, hashShardedIndexesOnRegionalByRowError()
+				}
 				if n.PartitionByTable.ContainsPartitions() {
 					return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
 				}
@@ -1891,6 +1895,9 @@ func NewTableDesc(
 				if d.Interleave != nil {
 					return nil, pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
 				}
+				if isRegionalByRow {
+					return nil, hashShardedIndexesOnRegionalByRowError()
+				}
 				if err := setupShardedIndexForNewTable(d, &idx); err != nil {
 					return nil, err
 				}
@@ -1982,6 +1989,9 @@ func NewTableDesc(
 			if d.Sharded != nil {
 				if n.Interleave != nil && d.PrimaryKey {
 					return nil, pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
+				}
+				if isRegionalByRow {
+					return nil, hashShardedIndexesOnRegionalByRowError()
 				}
 				if err := setupShardedIndexForNewTable(&d.IndexTableDef, &idx); err != nil {
 					return nil, err
@@ -2307,10 +2317,15 @@ func NewTableDesc(
 	}
 
 	if regionEnumID != descpb.InvalidID || n.Locality != nil {
+		localityTelemetryName := "unspecified"
+		if n.Locality != nil {
+			localityTelemetryName = n.Locality.TelemetryName()
+		}
+		telemetry.Inc(sqltelemetry.CreateTableLocalityCounter(localityTelemetryName))
 		if n.Locality == nil {
 			// The absence of a locality on the AST node indicates that the table must
 			// be homed in the primary region.
-			desc.SetTableLocalityRegionalByTable(tree.PrimaryRegionLocalityName)
+			desc.SetTableLocalityRegionalByTable(tree.PrimaryRegionNotSpecifiedName)
 		} else if n.Locality.LocalityLevel == tree.LocalityLevelTable {
 			desc.SetTableLocalityRegionalByTable(n.Locality.TableRegion)
 		} else if n.Locality.LocalityLevel == tree.LocalityLevelGlobal {
@@ -2319,11 +2334,6 @@ func NewTableDesc(
 			desc.SetTableLocalityRegionalByRow(n.Locality.RegionalByRowColumn)
 		} else {
 			return nil, errors.Newf("unknown locality level: %v", n.Locality.LocalityLevel)
-		}
-
-		dg := catalogkv.NewOneLevelUncachedDescGetter(txn, evalCtx.Codec)
-		if err := desc.ValidateTableLocalityConfig(ctx, dg); err != nil {
-			return nil, err
 		}
 	}
 
@@ -2783,6 +2793,10 @@ func regionalByRowDefaultColDef(oid oid.Oid, defaultExpr tree.Expr) *tree.Column
 	c.Nullable.Nullability = tree.NotNull
 	c.DefaultExpr.Expr = defaultExpr
 	return c
+}
+
+func hashShardedIndexesOnRegionalByRowError() error {
+	return pgerror.New(pgcode.FeatureNotSupported, "hash sharded indexes are not compatible with REGIONAL BY ROW tables")
 }
 
 func checkClusterSupportsPartitionByAll(evalCtx *tree.EvalContext) error {

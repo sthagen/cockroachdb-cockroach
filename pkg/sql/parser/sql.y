@@ -671,7 +671,7 @@ func (u *sqlSymUnion) objectNamePrefixList() tree.ObjectNamePrefixList {
 %token <str> OF OFF OFFSET OID OIDS OIDVECTOR ON ONLY OPT OPTION OPTIONS OR
 %token <str> ORDER ORDINALITY OTHERS OUT OUTER OVER OVERLAPS OVERLAY OWNED OWNER OPERATOR
 
-%token <str> PARENT PARTIAL PARTITION PARTITIONS PASSWORD PAUSE PAUSED PHYSICAL PLACING
+%token <str> PARENT PARTIAL PARTITION PARTITIONED PARTITIONS PASSWORD PAUSE PAUSED PHYSICAL PLACING
 %token <str> PLAN PLANS POINT POINTM POINTZ POINTZM POLYGON POLYGONM POLYGONZ POLYGONZM
 %token <str> POSITION PRECEDING PRECISION PREPARE PRESERVE PRIMARY PRIORITY PRIVILEGES
 %token <str> PROCEDURAL PUBLIC PUBLICATION
@@ -2639,11 +2639,12 @@ restore_stmt:
       Options: *($8.restoreOptions()),
     }
   }
-| RESTORE targets FROM REPLICATION STREAM FROM string_or_placeholder_opt_list
+| RESTORE targets FROM REPLICATION STREAM FROM string_or_placeholder_opt_list opt_as_of_clause
   {
    $$.val = &tree.StreamIngestion{
      Targets: $2.targetList(),
      From: $7.stringOrPlaceholderOptList(),
+     AsOf: $8.asOfClause(),
    }
   }
 | RESTORE error // SHOW HELP: RESTORE
@@ -4489,7 +4490,7 @@ zone_value:
 // SHOW ROLES, SHOW SCHEMAS, SHOW SEQUENCES, SHOW SESSION, SHOW SESSIONS,
 // SHOW STATISTICS, SHOW SYNTAX, SHOW TABLES, SHOW TRACE, SHOW TRANSACTION,
 // SHOW TRANSACTIONS, SHOW TYPES, SHOW USERS, SHOW LAST QUERY STATISTICS, SHOW SCHEDULES,
-// SHOW LOCALITY
+// SHOW LOCALITY, SHOW ZONE CONFIGURATION
 show_stmt:
   show_backup_stmt          // EXTEND WITH HELP: SHOW BACKUP
 | show_columns_stmt         // EXTEND WITH HELP: SHOW COLUMNS
@@ -4525,7 +4526,7 @@ show_stmt:
 | show_transaction_stmt     // EXTEND WITH HELP: SHOW TRANSACTION
 | show_transactions_stmt    // EXTEND WITH HELP: SHOW TRANSACTIONS
 | show_users_stmt           // EXTEND WITH HELP: SHOW USERS
-| show_zone_stmt
+| show_zone_stmt            // EXTEND WITH HELP: SHOW ZONE CONFIGURATION
 | SHOW error                // SHOW HELP: SHOW
 | show_last_query_stats_stmt
 
@@ -5225,6 +5226,12 @@ show_roles_stmt:
   }
 | SHOW ROLES error // SHOW HELP: SHOW ROLES
 
+// %Help: SHOW ZONE CONFIGURATION - display current zone configuration
+// %Category: Cfg
+// %Text: SHOW ZONE CONFIGURATION FROM [ RANGE | DATABASE | TABLE | INDEX ] <name>
+// SHOW ZONE CONFIGURATION FROM PARTITION OF [ INDEX | TABLE ] <name>
+// SHOW [ALL] ZONE CONFIGURATIONS
+// %SeeAlso: WEBDOCS/show-zone-configurations.html
 show_zone_stmt:
   SHOW ZONE CONFIGURATION from_with_implicit_for_alias RANGE zone_name
   {
@@ -5264,14 +5271,17 @@ show_zone_stmt:
       Partition: tree.Name($6),
     }}
   }
+| SHOW ZONE CONFIGURATION error // SHOW HELP: SHOW ZONE CONFIGURATION
 | SHOW ZONE CONFIGURATIONS
   {
     $$.val = &tree.ShowZoneConfig{}
   }
+| SHOW ZONE CONFIGURATIONS error // SHOW HELP: SHOW ZONE CONFIGURATION
 | SHOW ALL ZONE CONFIGURATIONS
   {
     $$.val = &tree.ShowZoneConfig{}
   }
+| SHOW ALL ZONE CONFIGURATIONS error // SHOW HELP: SHOW ZONE CONFIGURATION
 
 from_with_implicit_for_alias:
   FROM
@@ -7392,6 +7402,25 @@ locality:
       LocalityLevel: tree.LocalityLevelTable,
     }
   }
+| LOCALITY REGIONAL IN region_name
+  {
+    $$.val = &tree.Locality{
+      TableRegion: tree.Name($4),
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| LOCALITY REGIONAL IN PRIMARY REGION
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| LOCALITY REGIONAL
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
 | LOCALITY REGIONAL BY TABLE
   {
     $$.val = &tree.Locality{
@@ -7409,6 +7438,32 @@ locality:
     $$.val = &tree.Locality{
       LocalityLevel: tree.LocalityLevelRow,
       RegionalByRowColumn: tree.Name($6),
+    }
+  }
+| LOCALITY REGIONAL PARTITIONED
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelRow,
+    }
+  }
+| LOCALITY REGIONAL PARTITIONED AS name
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelRow,
+      RegionalByRowColumn: tree.Name($5),
+    }
+  }
+| LOCALITY PARTITIONED REGIONAL
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelRow,
+    }
+  }
+| LOCALITY PARTITIONED REGIONAL AS name
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelRow,
+      RegionalByRowColumn: tree.Name($5),
     }
   }
 | REGIONAL AFFINITY TO NONE
@@ -12523,6 +12578,7 @@ unreserved_keyword:
 | PARENT
 | PARTIAL
 | PARTITION
+| PARTITIONED
 | PARTITIONS
 | PASSWORD
 | PAUSE

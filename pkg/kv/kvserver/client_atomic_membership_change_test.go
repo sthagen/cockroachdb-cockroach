@@ -48,9 +48,6 @@ func TestAtomicReplicationChange(t *testing.T) {
 	tc := testcluster.StartTestCluster(t, 6, args)
 	defer tc.Stopper().Stop(ctx)
 
-	_, err := tc.ServerConn(0).Exec(`SET CLUSTER SETTING kv.atomic_replication_changes.enabled = true`)
-	require.NoError(t, err)
-
 	// Create a range and put it on n1, n2, n3. Intentionally do this one at a
 	// time so we're not using atomic replication changes yet.
 	k := tc.ScratchRange(t)
@@ -71,7 +68,7 @@ func TestAtomicReplicationChange(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			var sawStores []roachpb.StoreID
 			for _, s := range tc.Servers {
-				r, _, _ := s.Stores().GetReplicaForRangeID(desc.RangeID)
+				r, _, _ := s.Stores().GetReplicaForRangeID(ctx, desc.RangeID)
 				if r == nil {
 					continue
 				}

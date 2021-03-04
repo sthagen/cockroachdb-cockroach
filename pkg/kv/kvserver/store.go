@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/container"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/idalloc"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -102,14 +103,13 @@ const (
 
 var storeSchedulerConcurrency = envutil.EnvOrDefaultInt(
 	// For small machines, we scale the scheduler concurrency by the number of
-	// CPUs. 8*runtime.NumCPU() was determined in 9a68241 (April 2017) as the
-	// optimal concurrency level on 8 CPU machines. For larger machines, we've
-	// seen (#56851) that this scaling curve can be too aggressive and lead to
-	// too much contention in the Raft scheduler, so we cap the concurrency
-	// level at 96.
+	// CPUs. 8*NumCPU was determined in 9a68241 (April 2017) as the optimal
+	// concurrency level on 8 CPU machines. For larger machines, we've seen
+	// (#56851) that this scaling curve can be too aggressive and lead to too much
+	// contention in the Raft scheduler, so we cap the concurrency level at 96.
 	//
 	// As of November 2020, this default value could be re-tuned.
-	"COCKROACH_SCHEDULER_CONCURRENCY", min(8*runtime.NumCPU(), 96))
+	"COCKROACH_SCHEDULER_CONCURRENCY", min(8*runtime.GOMAXPROCS(0), 96))
 
 var logSSTInfoTicks = envutil.EnvOrDefaultInt(
 	"COCKROACH_LOG_SST_INFO_TICKS_INTERVAL", 60)
@@ -421,6 +421,7 @@ type Store struct {
 	txnWaitMetrics     *txnwait.Metrics
 	sstSnapshotStorage SSTSnapshotStorage
 	protectedtsCache   protectedts.Cache
+	ctSender           *sidetransport.Sender
 
 	// gossipRangeCountdown and leaseRangeCountdown are countdowns of
 	// changes to range and leaseholder counts, after which the store
@@ -648,7 +649,8 @@ type StoreConfig struct {
 	RPCContext              *rpc.Context
 	RangeDescriptorCache    *rangecache.RangeCache
 
-	ClosedTimestamp *container.Container
+	ClosedTimestamp       *container.Container
+	ClosedTimestampSender *sidetransport.Sender
 
 	// SQLExecutor is used by the store to execute SQL statements.
 	SQLExecutor sqlutil.InternalExecutor
@@ -801,6 +803,7 @@ func NewStore(
 		engine:   eng,
 		nodeDesc: nodeDesc,
 		metrics:  newStoreMetrics(cfg.HistogramWindowInterval),
+		ctSender: cfg.ClosedTimestampSender,
 	}
 	if cfg.RPCContext != nil {
 		s.allocator = MakeAllocator(cfg.StorePool, cfg.RPCContext.RemoteClocks.Latency)
@@ -871,7 +874,7 @@ func NewStore(
 
 	// On low-CPU instances, a default limit value may still allow ExportRequests
 	// to tie up all cores so cap limiter at cores-1 when setting value is higher.
-	exportCores := runtime.NumCPU() - 1
+	exportCores := runtime.GOMAXPROCS(0) - 1
 	if exportCores < 1 {
 		exportCores = 1
 	}
@@ -2163,11 +2166,21 @@ func checkCanInitializeEngine(ctx context.Context, eng storage.Engine) error {
 }
 
 // GetReplica fetches a replica by Range ID. Returns an error if no replica is found.
+//
+// See also GetReplicaIfExists for a more perfomant version.
 func (s *Store) GetReplica(rangeID roachpb.RangeID) (*Replica, error) {
-	if value, ok := s.mu.replicas.Load(int64(rangeID)); ok {
-		return (*Replica)(value), nil
+	if r := s.GetReplicaIfExists(rangeID); r != nil {
+		return r, nil
 	}
 	return nil, roachpb.NewRangeNotFoundError(rangeID, s.StoreID())
+}
+
+// GetReplicaIfExists returns the replica with the given RangeID or nil.
+func (s *Store) GetReplicaIfExists(rangeID roachpb.RangeID) *Replica {
+	if value, ok := s.mu.replicas.Load(int64(rangeID)); ok {
+		return (*Replica)(value)
+	}
+	return nil
 }
 
 // LookupReplica looks up the replica that contains the specified key. It
@@ -2760,6 +2773,31 @@ func (s *Store) PurgeOutdatedReplicas(ctx context.Context, version roachpb.Versi
 	})
 
 	return g.Wait()
+}
+
+// registerLeaseholder registers the provided replica as a leaseholder in the
+// node's closed timestamp side transport.
+func (s *Store) registerLeaseholder(
+	ctx context.Context, r *Replica, leaseSeq roachpb.LeaseSequence,
+) {
+	if s.ctSender != nil {
+		s.ctSender.RegisterLeaseholder(ctx, r, leaseSeq)
+	}
+}
+
+// unregisterLeaseholder unregisters the provided replica from node's closed
+// timestamp side transport if it had been previously registered as a
+// leaseholder.
+func (s *Store) unregisterLeaseholder(ctx context.Context, r *Replica) {
+	s.unregisterLeaseholderByID(ctx, r.RangeID)
+}
+
+// unregisterLeaseholderByID is like unregisterLeaseholder, but it accepts a
+// range ID instead of a replica.
+func (s *Store) unregisterLeaseholderByID(ctx context.Context, rangeID roachpb.RangeID) {
+	if s.ctSender != nil {
+		s.ctSender.UnregisterLeaseholder(ctx, s.StoreID(), rangeID)
+	}
 }
 
 // WriteClusterVersion writes the given cluster version to the store-local

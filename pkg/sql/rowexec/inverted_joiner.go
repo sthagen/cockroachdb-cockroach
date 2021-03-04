@@ -250,9 +250,13 @@ func newInvertedJoiner(
 		ij, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ij.input},
-			TrailingMetaCallback: func(ctx context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
+				// We need to generate metadata before closing the processor
+				// because InternalClose() updates ij.Ctx to the "original"
+				// context.
+				trailingMeta := ij.generateMeta(ij.Ctx)
 				ij.close()
-				return ij.generateMeta(ctx)
+				return trailingMeta
 			},
 		},
 	); err != nil {
@@ -734,12 +738,8 @@ func (ij *invertedJoiner) transformToTableRow(indexRow rowenc.EncDatumRow) {
 
 // Start is part of the RowSource interface.
 func (ij *invertedJoiner) Start(ctx context.Context) {
-	ij.input.Start(ctx)
 	ctx = ij.StartInternal(ctx, invertedJoinerProcName)
-	// Go around "this value of ctx is never used" linter error. We do it this
-	// way instead of omitting the assignment to ctx above so that if in the
-	// future other initialization is added, the correct ctx is used.
-	_ = ctx
+	ij.input.Start(ctx)
 	ij.runningState = ijReadingInput
 }
 

@@ -486,7 +486,7 @@ type ProcessorBase struct {
 	// other than what has otherwise been manually put in trailingMeta) and no
 	// closing other than InternalClose is needed, then no callback needs to be
 	// specified.
-	trailingMetaCallback func(context.Context) []execinfrapb.ProducerMetadata
+	trailingMetaCallback func() []execinfrapb.ProducerMetadata
 	// trailingMeta is scratch space where metadata is stored to be returned
 	// later.
 	trailingMeta []execinfrapb.ProducerMetadata
@@ -704,18 +704,27 @@ func (pb *ProcessorBase) moveToTrailingMeta() {
 		if pb.ExecStatsForTrace != nil {
 			if stats := pb.ExecStatsForTrace(); stats != nil {
 				stats.Component = pb.FlowCtx.ProcessorComponentID(pb.processorID)
-				pb.span.SetSpanStats(stats)
+				pb.span.RecordStructured(stats)
 			}
 		}
 		if trace := pb.span.GetRecording(); trace != nil {
 			pb.trailingMeta = append(pb.trailingMeta, execinfrapb.ProducerMetadata{TraceData: trace})
 		}
 	}
+
+	if util.CrdbTestBuild && pb.Ctx == nil {
+		panic(
+			errors.AssertionFailedf(
+				"unexpected nil ProcessorBase.Ctx when draining. Was StartInternal called?",
+			),
+		)
+	}
+
 	// trailingMetaCallback is called after reading the tracing data because it
 	// generally calls InternalClose, indirectly, which switches the context and
 	// the span.
 	if pb.trailingMetaCallback != nil {
-		pb.trailingMeta = append(pb.trailingMeta, pb.trailingMetaCallback(pb.Ctx)...)
+		pb.trailingMeta = append(pb.trailingMeta, pb.trailingMetaCallback()...)
 	} else {
 		pb.InternalClose()
 	}
@@ -771,7 +780,7 @@ func (pb *ProcessorBase) Run(ctx context.Context) {
 type ProcStateOpts struct {
 	// TrailingMetaCallback, if specified, is a callback to be called by
 	// moveToTrailingMeta(). See ProcessorBase.TrailingMetaCallback.
-	TrailingMetaCallback func(context.Context) []execinfrapb.ProducerMetadata
+	TrailingMetaCallback func() []execinfrapb.ProducerMetadata
 	// InputsToDrain, if specified, will be drained by DrainHelper().
 	// MoveToDraining() calls ConsumerDone() on them, InternalClose() calls
 	// ConsumerClosed() on them.
@@ -861,14 +870,34 @@ func ProcessorSpan(ctx context.Context, name string) (context.Context, *tracing.
 // It is likely that this method is called from RowSource.Start implementation,
 // and the recommended layout is the following:
 //   ctx = pb.StartInternal(ctx, name)
+//   < inputs >.Start(ctx) // if there are any inputs-RowSources to pb
 //   < other initialization >
 // so that the caller doesn't mistakenly use old ctx object.
 func (pb *ProcessorBase) StartInternal(ctx context.Context, name string) context.Context {
+	return pb.startImpl(ctx, true /* createSpan */, name)
+}
+
+// StartInternalNoSpan does the same as StartInternal except that it does not
+// start a span. This is used by pass-through components whose goal is to be a
+// silent translation layer for components that actually do work (e.g. a
+// planNodeToRowSource wrapping an insertNode, or a columnarizer wrapping a
+// rowexec flow).
+func (pb *ProcessorBase) StartInternalNoSpan(ctx context.Context) context.Context {
+	return pb.startImpl(ctx, false /* createSpan */, "")
+}
+
+func (pb *ProcessorBase) startImpl(
+	ctx context.Context, createSpan bool, spanName string,
+) context.Context {
 	pb.origCtx = ctx
-	pb.Ctx, pb.span = ProcessorSpan(ctx, name)
-	if pb.span != nil && pb.span.IsVerbose() {
-		pb.span.SetTag(execinfrapb.FlowIDTagKey, pb.FlowCtx.ID.String())
-		pb.span.SetTag(execinfrapb.ProcessorIDTagKey, pb.processorID)
+	if createSpan {
+		pb.Ctx, pb.span = ProcessorSpan(ctx, spanName)
+		if pb.span != nil && pb.span.IsVerbose() {
+			pb.span.SetTag(execinfrapb.FlowIDTagKey, pb.FlowCtx.ID.String())
+			pb.span.SetTag(execinfrapb.ProcessorIDTagKey, pb.processorID)
+		}
+	} else {
+		pb.Ctx = ctx
 	}
 	pb.EvalCtx.Context = pb.Ctx
 	return pb.Ctx
@@ -878,7 +907,8 @@ func (pb *ProcessorBase) StartInternal(ctx context.Context, name string) context
 // common close functionality. Returns true iff the processor was not already
 // closed.
 //
-// Notably, it calls ConsumerClosed() on all the inputsToDrain.
+// Notably, it calls ConsumerClosed() on all the inputsToDrain and updates
+// pb.Ctx to the context passed into StartInternal() call.
 //
 //   if pb.InternalClose() {
 //     // Perform processor specific close work.
@@ -910,6 +940,12 @@ func (pb *ProcessorBase) InternalClose() bool {
 // ConsumerDone is part of the RowSource interface.
 func (pb *ProcessorBase) ConsumerDone() {
 	pb.MoveToDraining(nil /* err */)
+}
+
+// ConsumerClosed is part of the RowSource interface.
+func (pb *ProcessorBase) ConsumerClosed() {
+	// The consumer is done, Next() will not be called again.
+	pb.InternalClose()
 }
 
 // NewMonitor is a utility function used by processors to create a new

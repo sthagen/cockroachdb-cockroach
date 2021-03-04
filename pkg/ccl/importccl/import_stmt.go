@@ -829,6 +829,14 @@ func importPlanHook(
 						)
 					}
 				}
+				if create.Locality != nil &&
+					create.Locality.LocalityLevel == tree.LocalityLevelRow {
+					return unimplemented.NewWithIssueDetailf(
+						61133,
+						"import.regional-by-row",
+						"IMPORT to REGIONAL BY ROW table not supported",
+					)
+				}
 				tbl, err := MakeSimpleTableDescriptor(
 					ctx, p.SemaCtx(), p.ExecCfg().Settings, create, parentID, parentSchemaID, defaultCSVTableID, NoFKs, walltime)
 				if err != nil {
@@ -1209,6 +1217,9 @@ func prepareExistingTableDescForIngestion(
 	if len(desc.Mutations) > 0 {
 		return nil, errors.Errorf("cannot IMPORT INTO a table with schema changes in progress -- try again later (pending mutation %s)", desc.Mutations[0].String())
 	}
+	if desc.LocalityConfig != nil && desc.LocalityConfig.GetRegionalByRow() != nil {
+		return nil, unimplemented.NewWithIssueDetailf(61133, "import.regional-by-row", "IMPORT into REGIONAL BY ROW table not supported")
+	}
 
 	// Note that desc is just used to verify that the version matches.
 	importing, err := descsCol.GetMutableTableVersionByID(ctx, desc.ID, txn)
@@ -1251,7 +1262,8 @@ func createNonDropDatabaseChangeJob(
 			DescID:        databaseID,
 			FormatVersion: jobspb.DatabaseJobFormatVersion,
 		},
-		Progress: jobspb.SchemaChangeProgress{},
+		Progress:      jobspb.SchemaChangeProgress{},
+		NonCancelable: true,
 	}
 
 	jobID := p.ExecCfg().JobRegistry.MakeJobID()
@@ -1279,10 +1291,6 @@ func writeNonDropDatabaseChange(
 
 	queuedJob := []jobspb.JobID{job.ID()}
 	b := txn.NewBatch()
-	dg := catalogkv.NewOneLevelUncachedDescGetter(txn, p.ExecCfg().Codec)
-	if err := desc.Validate(ctx, dg); err != nil {
-		return nil, err
-	}
 	err = descsCol.WriteDescToBatch(
 		ctx,
 		p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
@@ -2282,7 +2290,8 @@ func (r *importResumer) dropSchemas(
 			DroppedDatabaseID: descpb.InvalidID,
 			FormatVersion:     jobspb.DatabaseJobFormatVersion,
 		},
-		Progress: jobspb.SchemaChangeProgress{},
+		Progress:      jobspb.SchemaChangeProgress{},
+		NonCancelable: true,
 	}
 	jobID := p.ExecCfg().JobRegistry.MakeJobID()
 	job, err := execCfg.JobRegistry.CreateJobWithTxn(ctx, dropSchemaJobRecord, jobID, txn)

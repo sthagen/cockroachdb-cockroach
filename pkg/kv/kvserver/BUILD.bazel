@@ -116,6 +116,7 @@ go_library(
         "//pkg/kv/kvserver/closedts",
         "//pkg/kv/kvserver/closedts/container",
         "//pkg/kv/kvserver/closedts/ctpb",
+        "//pkg/kv/kvserver/closedts/sidetransport",
         "//pkg/kv/kvserver/closedts/storage",
         "//pkg/kv/kvserver/closedts/tracker",
         "//pkg/kv/kvserver/concurrency",
@@ -244,6 +245,7 @@ go_test(
         "replica_application_cmd_buf_test.go",
         "replica_application_state_machine_test.go",
         "replica_batch_updates_test.go",
+        "replica_closedts_test.go",
         "replica_command_test.go",
         "replica_consistency_test.go",
         "replica_evaluate_test.go",
@@ -283,6 +285,7 @@ go_test(
     data = glob(["testdata/**"]),
     embed = [":kvserver"],
     shard_count = 16,
+    tags = ["broken_in_bazel"],
     deps = [
         "//pkg/base",
         "//pkg/cli/exit",

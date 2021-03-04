@@ -535,6 +535,13 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 				return jobs.NewRetryJobError("node failure")
 			}
 
+			// We can't re-use the txn from above since it has a fixed timestamp set on
+			// it, and our write will be into the behind.
+			txnForJobProgress := txn
+			if details.AsOf != nil {
+				txnForJobProgress = nil
+			}
+
 			// If the job was canceled, any of the distsql processors could have been
 			// the first to encounter the .Progress error. This error's string is sent
 			// through distsql back here, so we can't examine the err type in this case
@@ -542,9 +549,8 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 			// job progress to coerce out the correct error type. If the update succeeds
 			// then return the original error, otherwise return this error instead so
 			// it can be cleaned up at a higher level.
-			// TODO: This job update should possibly use the txn (#60690).
 			if jobErr := r.job.FractionProgressed(
-				ctx, nil, /* txn */
+				ctx, txnForJobProgress,
 				func(ctx context.Context, _ jobspb.ProgressDetails) float32 {
 					// The job failed so the progress value here doesn't really matter.
 					return 0
@@ -599,14 +605,14 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 // pending, running, or paused status that started earlier than this one. If
 // there are, checkRunningJobs returns an error. If job is nil, checkRunningJobs
 // just checks if there are any pending, running, or paused CreateStats jobs.
-func checkRunningJobs(ctx context.Context, job *jobs.Job, p JobExecContext) error {
+func checkRunningJobs(ctx context.Context, job *jobs.Job, p JobExecContext) (retErr error) {
 	var jobID jobspb.JobID
 	if job != nil {
 		jobID = job.ID()
 	}
 	const stmt = `SELECT id, payload FROM system.jobs WHERE status IN ($1, $2, $3) ORDER BY created`
 
-	rows, err := p.ExecCfg().InternalExecutor.Query(
+	it, err := p.ExecCfg().InternalExecutor.QueryIterator(
 		ctx,
 		"get-jobs",
 		nil, /* txn */
@@ -618,8 +624,13 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p JobExecContext) erro
 	if err != nil {
 		return err
 	}
+	// We have to make sure to close the iterator since we might return from the
+	// for loop early (before Next() returns false).
+	defer func() { retErr = errors.CombineErrors(retErr, it.Close()) }()
 
-	for _, row := range rows {
+	var ok bool
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+		row := it.Cur()
 		payload, err := jobs.UnmarshalPayload(row[1])
 		if err != nil {
 			return err
@@ -636,7 +647,7 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p JobExecContext) erro
 			return stats.ConcurrentCreateStatsError
 		}
 	}
-	return nil
+	return err
 }
 
 // OnFailOrCancel is part of the jobs.Resumer interface.

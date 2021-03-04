@@ -363,7 +363,6 @@ func WriteDescriptors(
 						table.GetID(), table)
 				}
 			}
-
 			// If the table descriptor is being written to a multi-region database and
 			// the table does not have a locality config setup, set one up here. The
 			// table's locality config will be set to the default locality - REGIONAL
@@ -377,8 +376,20 @@ func WriteDescriptors(
 			if err != nil {
 				return err
 			}
-			if dbDesc.GetRegionConfig() != nil && table.GetLocalityConfig() == nil {
-				table.(*tabledesc.Mutable).SetTableLocalityRegionalByTable(tree.PrimaryRegionLocalityName)
+			if dbDesc.GetRegionConfig() != nil {
+				if table.GetLocalityConfig() == nil {
+					table.(*tabledesc.Mutable).SetTableLocalityRegionalByTable(tree.PrimaryRegionNotSpecifiedName)
+				}
+			} else {
+				// If the database is not multi-region enabled, ensure that we don't
+				// write any multi-region table descriptors into it.
+				if table.GetLocalityConfig() != nil {
+					return pgerror.Newf(pgcode.FeatureNotSupported,
+						"cannot write descriptor for multi-region table %s into non-multi-region database %s",
+						table.GetName(),
+						dbDesc.GetName(),
+					)
+				}
 			}
 
 			if err := descsCol.WriteDescToBatch(
@@ -433,23 +444,16 @@ func WriteDescriptors(
 			}
 			return err
 		}
-		// TODO(ajwerner): Utilize validation inside of the descs.Collection
-		// rather than reaching into the store.
-		dg := catalogkv.NewOneLevelUncachedDescGetter(txn, codec)
-		for _, table := range tables {
-			if err := table.Validate(ctx, dg); err != nil {
-				return errors.Wrapf(err,
-					"validate table %d", errors.Safe(table.GetID()))
-			}
-		}
 
-		for _, db := range databases {
-			if err := db.Validate(ctx, dg); err != nil {
-				return errors.Wrapf(err,
-					"validate database %d", errors.Safe(db.GetID()))
-			}
+		bdg := catalogkv.NewOneLevelUncachedDescGetter(txn, codec)
+		descs := make([]catalog.Descriptor, 0, len(databases)+len(tables))
+		for _, table := range tables {
+			descs = append(descs, table)
 		}
-		return nil
+		for _, db := range databases {
+			descs = append(descs, db)
+		}
+		return catalog.ValidateSelfAndCrossReferences(ctx, bdg, descs...)
 	}()
 	return errors.Wrapf(err, "restoring table desc and namespace entries")
 }

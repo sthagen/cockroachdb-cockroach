@@ -112,7 +112,7 @@ func (p *planner) setupFamilyAndConstraintForShard(
 	if err != nil {
 		return err
 	}
-	info, err := tableDesc.GetConstraintInfo(ctx, nil)
+	info, err := tableDesc.GetConstraintInfo()
 	if err != nil {
 		return err
 	}
@@ -204,6 +204,9 @@ func MakeIndexDescriptor(
 	if n.Sharded != nil {
 		if n.PartitionByIndex.ContainsPartitions() {
 			return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
+		}
+		if tableDesc.IsLocalityRegionalByRow() {
+			return nil, hashShardedIndexesOnRegionalByRowError()
 		}
 		if n.Interleave != nil {
 			return nil, pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
@@ -425,6 +428,10 @@ func (n *createIndexNode) startExec(params runParams) error {
 	}
 
 	if n.n.Interleave != nil {
+		if n.n.PartitionByIndex != nil {
+			return pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot be partitioned")
+		}
+
 		if err := interleavedTableDeprecationAction(params); err != nil {
 			return err
 		}

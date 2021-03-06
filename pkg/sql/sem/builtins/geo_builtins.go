@@ -2885,6 +2885,28 @@ The requested number of points must be not larger than 65336.`,
 			tree.VolatilityImmutable,
 		),
 	),
+	"st_addmeasure": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types:      tree.ArgTypes{{"geometry", types.Geometry}, {"start", types.Float}, {"end", types.Float}},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g := tree.MustBeDGeometry(args[0])
+				start := tree.MustBeDFloat(args[1])
+				end := tree.MustBeDFloat(args[2])
+
+				ret, err := geomfn.AddMeasure(g.Geometry, float64(start), float64(end))
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{info: "Returns a copy of a LineString or MultiLineString with measure coordinates " +
+				"linearly interpolated between the specified start and end values. " +
+				"Any existing M coordinates will be overwritten."}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
 	"st_lineinterpolatepoint": makeBuiltin(
 		defProps(),
 		lineInterpolatePointForRepeatOverload(
@@ -5011,6 +5033,33 @@ The calculations are done on a sphere.`,
 			Volatility: tree.VolatilityImmutable,
 		},
 	),
+	"st_snap": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"input", types.Geometry},
+				{"target", types.Geometry},
+				{"tolerance", types.Float},
+			},
+			ReturnType: tree.FixedReturnType(types.Geometry),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				g1 := tree.MustBeDGeometry(args[0])
+				g2 := tree.MustBeDGeometry(args[1])
+				tolerance := tree.MustBeDFloat(args[2])
+				ret, err := geomfn.Snap(g1.Geometry, g2.Geometry, float64(tolerance))
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDGeometry(ret), nil
+			},
+			Info: infoBuilder{
+				info: `Snaps the vertices and segments of input geometry the target geometry's vertices.
+Tolerance is used to control where snapping is performed. The result geometry is the input geometry with the vertices snapped. 
+If no snapping occurs then the input geometry is returned unchanged.`,
+			}.String(),
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
 	"st_buffer": makeBuiltin(
 		defProps(),
 		tree.Overload{
@@ -6404,7 +6453,6 @@ May return a Point or LineString in the case of degenerate inputs.`,
 	"st_quantizecoordinates":   makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49012}),
 	"st_seteffectivearea":      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49030}),
 	"st_simplifyvw":            makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49039}),
-	"st_snap":                  makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49040}),
 	"st_split":                 makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49045}),
 	"st_tileenvelope":          makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49053}),
 	"st_wrapx":                 makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 49068}),

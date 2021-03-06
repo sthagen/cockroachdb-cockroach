@@ -48,7 +48,7 @@ func (p *planner) AlterDatabaseOwner(
 		return nil, err
 	}
 
-	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, n.Name.String(),
+	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
 		tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return nil, err
@@ -129,7 +129,7 @@ func (p *planner) AlterDatabaseAddRegion(
 		return nil, err
 	}
 
-	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, n.Name.String(),
+	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
 		tree.DatabaseLookupFlags{Required: true},
 	)
 	if err != nil {
@@ -169,6 +169,18 @@ func (n *alterDatabaseAddRegionNode) startExec(params runParams) error {
 			n.n.Name.String(),
 			n.n.Region.String(),
 		)
+	}
+
+	if err := validateZoneConfigForMultiRegionDatabaseWasNotModifiedByUser(
+		params.ctx,
+		n.desc.ID,
+		n.desc.Name,
+		params.p.txn,
+		params.ExecCfg().Codec,
+		n.n.Force,
+		*n.desc.RegionConfig,
+	); err != nil {
+		return err
 	}
 
 	telemetry.Inc(sqltelemetry.AlterDatabaseAddRegionCounter)
@@ -260,7 +272,7 @@ func (p *planner) AlterDatabaseDropRegion(
 		return nil, err
 	}
 
-	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, n.Name.String(),
+	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
 		tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return nil, err
@@ -274,6 +286,18 @@ func (p *planner) AlterDatabaseDropRegion(
 
 	if !dbDesc.IsMultiRegion() {
 		return nil, pgerror.New(pgcode.InvalidDatabaseDefinition, "database has no regions to drop")
+	}
+
+	if err := validateZoneConfigForMultiRegionDatabaseWasNotModifiedByUser(
+		ctx,
+		dbDesc.ID,
+		dbDesc.Name,
+		p.txn,
+		p.ExecCfg().Codec,
+		n.Force,
+		*dbDesc.RegionConfig,
+	); err != nil {
+		return nil, err
 	}
 
 	removingPrimaryRegion := false
@@ -464,7 +488,7 @@ func (p *planner) AlterDatabasePrimaryRegion(
 		return nil, err
 	}
 
-	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, n.Name.String(),
+	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
 		tree.DatabaseLookupFlags{Required: true},
 	)
 	if err != nil {
@@ -546,21 +570,25 @@ func (n *alterDatabasePrimaryRegionNode) switchPrimaryRegion(params runParams) e
 // that the table is a REGIONAL BY TABLE table homed in the primary region of
 // the database.
 func addDefaultLocalityConfigToAllTables(
-	ctx context.Context, p *planner, desc *dbdesc.Immutable, regionEnumID descpb.ID,
+	ctx context.Context, p *planner, dbDesc *dbdesc.Immutable, regionEnumID descpb.ID,
 ) error {
-	if !desc.IsMultiRegion() {
+	if !dbDesc.IsMultiRegion() {
 		return errors.AssertionFailedf(
 			"cannot add locality config to tables in non multi-region database with ID %d",
-			desc.GetID(),
+			dbDesc.GetID(),
 		)
 	}
 	b := p.Txn().NewBatch()
-	if err := forEachTableDesc(ctx, p, desc, hideVirtual,
+	if err := forEachTableDesc(ctx, p, dbDesc, hideVirtual,
 		func(immutable *dbdesc.Immutable, _ string, desc catalog.TableDescriptor) error {
 			mutDesc, err := p.Descriptors().GetMutableTableByID(
 				ctx, p.txn, desc.GetID(), tree.ObjectLookupFlags{},
 			)
 			if err != nil {
+				return err
+			}
+
+			if err := checkCanConvertTableToMultiRegion(dbDesc, mutDesc); err != nil {
 				return err
 			}
 
@@ -578,6 +606,40 @@ func addDefaultLocalityConfigToAllTables(
 		return err
 	}
 	return p.Txn().Run(ctx, b)
+}
+
+// checkCanConvertTableToMultiRegion checks whether a given table can be converted
+// to a multi-region table.
+func checkCanConvertTableToMultiRegion(
+	dbDesc catalog.DatabaseDescriptor, tableDesc catalog.TableDescriptor,
+) error {
+	if tableDesc.GetPrimaryIndex().GetPartitioning().NumColumns > 0 {
+		return errors.WithDetailf(
+			pgerror.Newf(
+				pgcode.ObjectNotInPrerequisiteState,
+				"cannot convert database %s to a multi-region database",
+				dbDesc.GetName(),
+			),
+			"cannot convert table %s to a multi-region table as it is partitioned",
+			tableDesc.GetName(),
+		)
+	}
+	for _, idx := range tableDesc.NonDropIndexes() {
+		if idx.GetPartitioning().NumColumns > 0 {
+			return errors.WithDetailf(
+				pgerror.Newf(
+					pgcode.ObjectNotInPrerequisiteState,
+					"cannot convert database %s to a multi-region database",
+					dbDesc.GetName(),
+				),
+				"cannot convert table %s to a multi-region table as it has index/constraint %s with partitioning",
+				tableDesc.GetName(),
+				idx.GetName(),
+			)
+		}
+	}
+	// TODO(#57668): check zone configurations are not set here
+	return nil
 }
 
 // setInitialPrimaryRegion sets the primary region in cases where the database
@@ -636,20 +698,36 @@ func (n *alterDatabasePrimaryRegionNode) startExec(params runParams) error {
 		)
 	}
 
-	// There are two paths to consider here: either this is the first setting of the
-	// primary region, OR we're updating the primary region. In the case where this
-	// is the first setting of the primary region, the call will turn the database into
-	// a "multi-region" database. This requires creating a RegionConfig structure in the
-	// database descriptor, creating a multi-region enum, and setting up the database-level
-	// zone configuration. The second case is simpler, as the multi-region infrastructure
-	// is already setup. In this case we just need to update the database and type descriptor,
-	// and the zone config.
+	// There are two paths to consider here: either this is the first setting of
+	// the primary region, OR we're updating the primary region. In the case where
+	// this is the first setting of the primary region, the call will turn the
+	// database into a "multi-region" database. This requires creating a
+	// RegionConfig structure in the database descriptor, creating a multi-region
+	// enum, and setting up the database-level zone configuration. The second case
+	// is simpler, as the multi-region infrastructure is already setup. In this
+	// case we just need to update the database and type descriptor, and the zone
+	// config.
 	if !n.desc.IsMultiRegion() {
+		// No need for zone configuration validation here, as #59719 will block
+		// getting into this state if there are zone configurations applied at the
+		// database level.
 		err := n.setInitialPrimaryRegion(params)
 		if err != nil {
 			return err
 		}
 	} else {
+		if err := validateZoneConfigForMultiRegionDatabaseWasNotModifiedByUser(
+			params.ctx,
+			n.desc.ID,
+			n.desc.Name,
+			params.p.txn,
+			params.ExecCfg().Codec,
+			n.n.Force,
+			*n.desc.RegionConfig,
+		); err != nil {
+			return err
+		}
+
 		err := n.switchPrimaryRegion(params)
 		if err != nil {
 			return err
@@ -689,7 +767,7 @@ func (p *planner) AlterDatabaseSurvivalGoal(
 		return nil, err
 	}
 
-	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, n.Name.String(),
+	_, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
 		tree.DatabaseLookupFlags{Required: true},
 	)
 	if err != nil {
@@ -715,6 +793,18 @@ func (n *alterDatabaseSurvivalGoalNode) startExec(params runParams) error {
 				"ALTER DATABASE %s PRIMARY REGION <region_name>",
 			n.n.Name.String(),
 		)
+	}
+
+	if err := validateZoneConfigForMultiRegionDatabaseWasNotModifiedByUser(
+		params.ctx,
+		n.desc.ID,
+		n.desc.Name,
+		params.p.txn,
+		params.ExecCfg().Codec,
+		n.n.Force,
+		*n.desc.RegionConfig,
+	); err != nil {
+		return err
 	}
 
 	telemetry.Inc(
